@@ -857,6 +857,7 @@ impl OverlayManager {
         debug!("Broadcasting {} to {} peers", msg_type, target_peers.len());
 
         let mut sent = 0usize;
+        let mut dropped = 0usize;
         let num_targets = target_peers.len();
         let mut message = Some(message);
         for (i, peer_id) in target_peers.iter().enumerate() {
@@ -882,6 +883,7 @@ impl OverlayManager {
                 match entry.value().outbound_tx.try_send(outbound_msg) {
                     Ok(()) => sent += 1,
                     Err(mpsc::error::TrySendError::Full(_)) => {
+                        dropped += 1;
                         debug!("Outbound channel full for {}, dropping broadcast", peer_id);
                     }
                     Err(mpsc::error::TrySendError::Closed(_)) => {
@@ -889,6 +891,16 @@ impl OverlayManager {
                     }
                 }
             }
+        }
+
+        if dropped > 0 {
+            self.metrics.messages_dropped.add(dropped as u64);
+            warn!(
+                dropped,
+                sent,
+                msg_type,
+                "Broadcast backpressure: messages dropped due to full peer channels"
+            );
         }
 
         debug!("Broadcast {} to {} peers", msg_type, sent);
@@ -953,11 +965,14 @@ impl OverlayManager {
             OutboundMessage::Send(message)
         };
 
-        entry
-            .value()
-            .outbound_tx
-            .try_send(outbound)
-            .map_err(|_| OverlayError::ChannelSend)
+        entry.value().outbound_tx.try_send(outbound).map_err(|_| {
+            self.metrics.messages_dropped.add(1);
+            debug!(
+                peer = %peer_id,
+                "Outbound channel full, dropping targeted message"
+            );
+            OverlayError::ChannelSend
+        })
     }
 
     /// Get the number of connected peers.
@@ -1270,10 +1285,14 @@ impl OverlayManager {
         for entry in self.peers.iter() {
             // Update each peer's FlowControl byte capacity
             entry.value().flow_control.handle_tx_size_increase(increase);
-            let _ = entry
+            if entry
                 .value()
                 .outbound_tx
-                .try_send(OutboundMessage::Send(send_more.clone()));
+                .try_send(OutboundMessage::Send(send_more.clone()))
+                .is_err()
+            {
+                self.metrics.messages_dropped.add(1);
+            }
         }
 
         debug!(
@@ -3236,6 +3255,151 @@ mod tests {
         assert!(
             OverlayManager::try_accept_authenticated_peer(&peer_info, &shared, &pool),
             "key-preferred peer should be admitted under strict mode"
+        );
+    }
+
+    /// Helper: insert a peer with a specific channel capacity into the manager.
+    fn insert_peer_with_capacity(
+        manager: &OverlayManager,
+        peer_id: PeerId,
+        capacity: usize,
+    ) -> tokio::sync::mpsc::Receiver<OutboundMessage> {
+        use crate::flow_control::{FlowControl, FlowControlConfig};
+        use crate::peer::PeerStats;
+
+        let (outbound_tx, outbound_rx) = tokio::sync::mpsc::channel(capacity);
+        let handle = PeerHandle {
+            outbound_tx,
+            stats: Arc::new(PeerStats::default()),
+            flow_control: Arc::new(FlowControl::new(FlowControlConfig::default())),
+        };
+        manager.peers.insert(peer_id.clone(), handle);
+        manager.peer_info_cache.insert(
+            peer_id.clone(),
+            crate::peer::PeerInfo {
+                peer_id,
+                address: "127.0.0.1:11625".parse().unwrap(),
+                direction: crate::connection::ConnectionDirection::Inbound,
+                version_string: String::new(),
+                overlay_version: 0,
+                ledger_version: 0,
+                connected_at: std::time::Instant::now(),
+                original_address: None,
+            },
+        );
+        outbound_rx
+    }
+
+    fn make_hello_msg() -> StellarMessage {
+        StellarMessage::Hello(stellar_xdr::curr::Hello {
+            ledger_version: 0,
+            overlay_version: 0,
+            overlay_min_version: 0,
+            network_id: stellar_xdr::curr::Hash([0u8; 32]),
+            version_str: "test".try_into().unwrap(),
+            listening_port: 0,
+            peer_id: stellar_xdr::curr::NodeId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
+                stellar_xdr::curr::Uint256([0u8; 32]),
+            )),
+            cert: stellar_xdr::curr::AuthCert {
+                pubkey: stellar_xdr::curr::Curve25519Public { key: [0u8; 32] },
+                expiration: 0,
+                sig: stellar_xdr::curr::Signature::default(),
+            },
+            nonce: stellar_xdr::curr::Uint256([0u8; 32]),
+        })
+    }
+
+    #[tokio::test]
+    async fn test_broadcast_backpressure_increments_messages_dropped() {
+        let config = OverlayConfig::default();
+        let secret = SecretKey::generate();
+        let local_node = LocalNode::new_testnet(secret);
+
+        let manager = OverlayManager::new(config, local_node).unwrap();
+        manager.running.store(true, Ordering::SeqCst);
+
+        // Insert a peer with channel capacity of 1
+        let peer_id = PeerId::from_bytes([1u8; 32]);
+        let _rx = insert_peer_with_capacity(&manager, peer_id, 1);
+
+        // First broadcast fills the channel
+        let msg = make_hello_msg();
+        let sent = manager.broadcast(msg.clone()).await.unwrap();
+        assert_eq!(sent, 1);
+
+        // Second broadcast should drop (channel full)
+        let sent = manager.broadcast(msg.clone()).await.unwrap();
+        assert_eq!(sent, 0);
+
+        // Verify messages_dropped metric was incremented
+        let metrics = manager.metrics.snapshot();
+        assert_eq!(
+            metrics.messages_dropped, 1,
+            "messages_dropped should be 1 after one dropped broadcast"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_try_send_to_backpressure_increments_messages_dropped() {
+        let config = OverlayConfig::default();
+        let secret = SecretKey::generate();
+        let local_node = LocalNode::new_testnet(secret);
+
+        let manager = OverlayManager::new(config, local_node).unwrap();
+
+        // Insert a peer with channel capacity of 1
+        let peer_id = PeerId::from_bytes([2u8; 32]);
+        let _rx = insert_peer_with_capacity(&manager, peer_id.clone(), 1);
+
+        let msg = make_hello_msg();
+
+        // First send fills the channel
+        assert!(manager.try_send_to(&peer_id, msg.clone()).is_ok());
+
+        // Second send should fail with ChannelSend
+        let err = manager.try_send_to(&peer_id, msg.clone()).unwrap_err();
+        assert!(matches!(err, OverlayError::ChannelSend));
+
+        // Verify messages_dropped metric was incremented
+        let metrics = manager.metrics.snapshot();
+        assert_eq!(
+            metrics.messages_dropped, 1,
+            "messages_dropped should be 1 after one channel-full error"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_broadcast_backpressure_multiple_peers() {
+        let config = OverlayConfig::default();
+        let secret = SecretKey::generate();
+        let local_node = LocalNode::new_testnet(secret);
+
+        let manager = OverlayManager::new(config, local_node).unwrap();
+        manager.running.store(true, Ordering::SeqCst);
+
+        // Insert 3 peers each with capacity 1
+        let peer1 = PeerId::from_bytes([1u8; 32]);
+        let peer2 = PeerId::from_bytes([2u8; 32]);
+        let peer3 = PeerId::from_bytes([3u8; 32]);
+        let _rx1 = insert_peer_with_capacity(&manager, peer1, 1);
+        let _rx2 = insert_peer_with_capacity(&manager, peer2, 1);
+        let _rx3 = insert_peer_with_capacity(&manager, peer3, 1);
+
+        let msg = make_hello_msg();
+
+        // First broadcast fills all channels
+        let sent = manager.broadcast(msg.clone()).await.unwrap();
+        assert_eq!(sent, 3);
+
+        // Second broadcast drops for all 3 peers
+        let sent = manager.broadcast(msg.clone()).await.unwrap();
+        assert_eq!(sent, 0);
+
+        let metrics = manager.metrics.snapshot();
+        assert_eq!(
+            metrics.messages_dropped, 3,
+            "all 3 peers should have dropped the second broadcast"
         );
     }
 }
