@@ -274,10 +274,10 @@ pub struct LedgerSummary {
 pub struct AppInfo {
     /// Application version.
     pub version: String,
-    /// Git commit hash.
-    pub commit_hash: String,
-    /// Build timestamp (ISO 8601).
-    pub build_timestamp: String,
+    /// Git commit hash. `None` when build metadata is unavailable.
+    pub commit_hash: Option<String>,
+    /// Build timestamp (ISO 8601). `None` when build metadata is unavailable.
+    pub build_timestamp: Option<String>,
     /// Node name.
     pub node_name: String,
     /// Node public key.
@@ -420,11 +420,11 @@ impl std::fmt::Display for AppInfo {
             "{}",
             henyey_common::version::build_version_string(&self.version)
         )?;
-        if !self.commit_hash.is_empty() {
-            writeln!(f, "  Commit:     {}", self.commit_hash)?;
+        if let Some(hash) = &self.commit_hash {
+            writeln!(f, "  Commit:     {}", hash)?;
         }
-        if !self.build_timestamp.is_empty() {
-            writeln!(f, "  Built:      {}", self.build_timestamp)?;
+        if let Some(ts) = &self.build_timestamp {
+            writeln!(f, "  Built:      {}", ts)?;
         }
         writeln!(f)?;
         writeln!(f, "Node Information:")?;
@@ -1455,5 +1455,49 @@ mod tests {
             henyey_overlay::PeerEvent::Connected(addr.clone(), henyey_overlay::PeerType::Outbound);
         let result = update_peer_record(&db, event);
         assert!(result.is_ok(), "store_peer on existing peer should succeed");
+    }
+
+    #[test]
+    fn test_app_info_display_absent_metadata() {
+        let info = AppInfo {
+            version: "1.0.0".to_string(),
+            commit_hash: None,
+            build_timestamp: None,
+            node_name: "test-node".to_string(),
+            public_key: "GABCD".to_string(),
+            network_passphrase: "Test".to_string(),
+            is_validator: false,
+            database_path: std::path::PathBuf::from(":memory:"),
+            meta_stream_bytes_total: 0,
+            meta_stream_writes_total: 0,
+            scp_verify: Default::default(),
+            overlay_fetch_channel: Default::default(),
+            post_catchup_hard_reset_total: 0,
+        };
+        let output = format!("{}", info);
+        assert!(!output.contains("Commit:"));
+        assert!(!output.contains("Built:"));
+    }
+
+    #[test]
+    fn test_app_info_display_present_metadata() {
+        let info = AppInfo {
+            version: "1.0.0".to_string(),
+            commit_hash: Some("abc123".to_string()),
+            build_timestamp: Some("2024-01-01T00:00:00Z".to_string()),
+            node_name: "test-node".to_string(),
+            public_key: "GABCD".to_string(),
+            network_passphrase: "Test".to_string(),
+            is_validator: false,
+            database_path: std::path::PathBuf::from(":memory:"),
+            meta_stream_bytes_total: 0,
+            meta_stream_writes_total: 0,
+            scp_verify: Default::default(),
+            overlay_fetch_channel: Default::default(),
+            post_catchup_hard_reset_total: 0,
+        };
+        let output = format!("{}", info);
+        assert!(output.contains("Commit:     abc123"));
+        assert!(output.contains("Built:      2024-01-01T00:00:00Z"));
     }
 }

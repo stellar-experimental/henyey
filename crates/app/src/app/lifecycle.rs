@@ -1071,7 +1071,9 @@ impl App {
                 LocalNode::new_mainnet(self.keypair.clone())
             };
         local_node.listening_port = self.config.overlay.peer_port;
-        local_node.set_commit_hash(&self.config.build.commit_hash);
+        if let Some(hash) = self.config.build.commit_hash.as_deref() {
+            local_node.set_commit_hash(hash);
+        }
 
         // Start with testnet or mainnet defaults for seed peers, but only if
         // the app config doesn't explicitly set known_peers (which includes the

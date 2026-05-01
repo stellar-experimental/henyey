@@ -43,6 +43,8 @@ pub struct FakeRpcApp {
     state: AppState,
     submit_result: TxQueueResult,
     snapshot_ready: AtomicBool,
+    commit_hash: Option<String>,
+    build_timestamp: Option<String>,
 }
 
 impl Default for FakeRpcApp {
@@ -60,8 +62,8 @@ impl RpcAppHandle for FakeRpcApp {
     fn info(&self) -> AppInfo {
         AppInfo {
             version: "0.0.0-test".to_string(),
-            commit_hash: "deadbeef".to_string(),
-            build_timestamp: "2024-01-01T00:00:00Z".to_string(),
+            commit_hash: self.commit_hash.clone(),
+            build_timestamp: self.build_timestamp.clone(),
             node_name: "fake-rpc-test-node".to_string(),
             public_key: String::new(),
             network_passphrase: self.config.network.passphrase.clone(),
@@ -154,6 +156,8 @@ pub struct FakeRpcAppBuilder {
     max_event_load_bytes: Option<usize>,
     max_event_query_ops: Option<u32>,
     max_tx_query_ops: Option<u32>,
+    commit_hash: Option<String>,
+    build_timestamp: Option<String>,
 }
 
 impl Default for FakeRpcAppBuilder {
@@ -173,6 +177,8 @@ impl Default for FakeRpcAppBuilder {
             max_event_load_bytes: None,
             max_event_query_ops: None,
             max_tx_query_ops: None,
+            commit_hash: Some("deadbeef".to_string()),
+            build_timestamp: Some("2024-01-01T00:00:00Z".to_string()),
         }
     }
 }
@@ -267,6 +273,18 @@ impl FakeRpcAppBuilder {
         self
     }
 
+    #[allow(dead_code)]
+    pub fn commit_hash(mut self, hash: Option<String>) -> Self {
+        self.commit_hash = hash;
+        self
+    }
+
+    #[allow(dead_code)]
+    pub fn build_timestamp(mut self, ts: Option<String>) -> Self {
+        self.build_timestamp = ts;
+        self
+    }
+
     pub fn build(self) -> FakeRpcApp {
         let mut config = AppConfig::testnet();
         config.rpc.enabled = true;
@@ -331,6 +349,8 @@ impl FakeRpcAppBuilder {
             state: self.state,
             submit_result: self.submit_result,
             snapshot_ready: AtomicBool::new(self.snapshot_ready),
+            commit_hash: self.commit_hash,
+            build_timestamp: self.build_timestamp,
         }
     }
 }

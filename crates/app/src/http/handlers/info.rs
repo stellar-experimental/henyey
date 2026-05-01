@@ -67,11 +67,7 @@ pub(crate) async fn info_handler(State(state): State<Arc<ServerState>>) -> Json<
 
     Json(InfoResponse {
         build: henyey_common::version::build_version_string(&info.version),
-        commit_hash: if info.commit_hash.is_empty() {
-            None
-        } else {
-            Some(info.commit_hash)
-        },
+        commit_hash: info.commit_hash,
         protocol_version: ledger.version,
         state: format!("{}", app_state),
         started_on: state.started_on.clone(),
@@ -318,7 +314,11 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp dir");
         let db_path = dir.path().join("test.db");
         let mut config = ConfigBuilder::new().database_path(db_path).build();
-        config.build.commit_hash = commit_hash.to_string();
+        config.build.commit_hash = if commit_hash.is_empty() {
+            None
+        } else {
+            Some(commit_hash.to_string())
+        };
 
         let app = App::new(config).await.unwrap();
         let state = Arc::new(ServerState {

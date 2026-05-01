@@ -137,6 +137,35 @@ async fn fake_get_version_info() {
 }
 
 #[tokio::test]
+async fn fake_get_version_info_empty_metadata() {
+    let app = FakeRpcApp::builder()
+        .commit_hash(None)
+        .build_timestamp(None)
+        .build();
+    let h = FakeRpcTestHarness::start(app).await;
+    let id = json!("ver-empty");
+    let (status, resp) = h
+        .post_rpc(json!({"jsonrpc": "2.0", "id": id, "method": "getVersionInfo"}))
+        .await;
+
+    assert_eq!(status, 200);
+    assert_envelope(&resp, &id);
+    let result = &resp["result"];
+    assert!(
+        result["commitHash"].is_null(),
+        "commitHash should be null when metadata unavailable"
+    );
+    assert!(
+        result["buildTimestamp"].is_null(),
+        "buildTimestamp should be null when metadata unavailable"
+    );
+    // Other fields remain present
+    assert!(result["version"].is_string());
+    assert!(result["protocolVersion"].is_number());
+    assert!(result["captiveCoreVersion"].is_string());
+}
+
+#[tokio::test]
 async fn fake_get_fee_stats() {
     let h = FakeRpcTestHarness::start_default().await;
     let id = json!("fees");

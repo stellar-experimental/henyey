@@ -1265,10 +1265,8 @@ async fn main() -> anyhow::Result<()> {
     let mut config = load_config(&cli, local)?;
 
     // Inject build metadata from compile-time environment variables
-    config.build = henyey_app::BuildMetadata {
-        commit_hash: env!("HENYEY_COMMIT_HASH").to_string(),
-        build_timestamp: env!("HENYEY_BUILD_TIMESTAMP").to_string(),
-    };
+    config.build =
+        henyey_app::BuildMetadata::new(env!("HENYEY_COMMIT_HASH"), env!("HENYEY_BUILD_TIMESTAMP"));
 
     // Apply testing overrides early (before any checkpoint math).
     if config.testing.accelerate_time {

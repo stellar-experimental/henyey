@@ -78,7 +78,7 @@ Corresponds to: scoped read-only RPC metadata methods.
 | `getHealth` | `methods::health::handle()` | Full |
 | `getNetwork` | `methods::network::handle()` | Full |
 | `getLatestLedger` | `methods::latest_ledger::handle()` | Full |
-| `getVersionInfo` | `methods::version_info::handle()` | Full |
+| `getVersionInfo` | `methods::version_info::handle()` | Full | `commitHash` and `buildTimestamp` emit `null` when build metadata is unavailable. Upstream Soroban RPC types these as required (non-null) strings. Deliberate divergence: henyey builds without git may lack this metadata. |
 
 ### Fee statistics (`fee_window.rs`, `methods/fee_stats.rs`)
 
