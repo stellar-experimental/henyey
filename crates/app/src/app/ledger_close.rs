@@ -1847,6 +1847,26 @@ impl App {
             return None;
         }
 
+        // Parity: stellar-core calls prepareForApply before ledger application
+        // (LedgerManagerImpl.cpp:1542). This is defense-in-depth — the tx set
+        // should already be validated by SCP, but we re-validate here to match
+        // upstream and guard against any bypass of herder-layer validation.
+        let network_id = henyey_common::NetworkId(self.network_id());
+        if let Err(e) = tx_set.prepare_for_apply(network_id) {
+            tracing::error!(
+                ledger_seq = next_seq,
+                error = %e,
+                hash = %tx_set.hash().to_hex(),
+                "Buffered tx set failed prepare_for_apply validation"
+            );
+            let mut buffer =
+                tracked_lock::tracked_write("syncing_ledgers", &self.syncing_ledgers).await;
+            if let Some(entry) = buffer.get_mut(&next_seq) {
+                entry.tx_set = None;
+            }
+            return None;
+        }
+
         tracing::debug!(
             ledger_seq = next_seq,
             tx_count = tx_set.len(),
