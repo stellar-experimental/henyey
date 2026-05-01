@@ -74,7 +74,7 @@ pub use meta::*;
 pub use network::NetworkId;
 pub use protocol::*;
 pub use resource::*;
-pub use spawn::{await_blocking_logged, spawn_blocking_logged};
+pub use spawn::{await_blocking_logged, await_join_logged, spawn_blocking_logged, spawn_observed};
 pub use types::{deterministic_seed, *};
 pub use xdr_stream::{xdr_encoded_len, xdr_encoded_len_u32, xdr_to_bytes};
 

@@ -475,7 +475,7 @@ impl ArchiveCheckpointCache {
         };
 
         let this = Arc::clone(self);
-        tokio::spawn(async move {
+        henyey_common::spawn_observed("archive_checkpoint_refresh", async move {
             let _guard = guard;
             let fetcher = Arc::clone(&*this.background_fetcher.read());
             let fut = async { fetcher.fetch().await };
