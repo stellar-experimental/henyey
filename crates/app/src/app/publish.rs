@@ -157,6 +157,11 @@ impl App {
         checkpoint: u32,
         archives: &[&crate::config::HistoryArchiveEntry],
     ) -> anyhow::Result<()> {
+        #[cfg(test)]
+        if self.publish_panic_inject.swap(false, Ordering::SeqCst) {
+            panic!("injected publish panic for testing");
+        }
+
         use henyey_bucket::BucketList;
         use henyey_history::paths::root_has_path;
         use henyey_history::publish::{PublishConfig, PublishManager};
@@ -1143,5 +1148,235 @@ mod tests {
         let permit = PublishPermit::try_acquire(Arc::clone(&app));
         assert!(permit.is_some());
         drop(permit);
+    }
+
+    /// Wait for a publish attempt to start and finish (or panic).
+    /// Proves the spawned task actually ran by requiring the injection
+    /// flag was consumed before returning.
+    async fn wait_for_publish_attempt(app: &App) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            // The injection flag being consumed proves the task ran
+            if !app.publish_panic_inject.load(Ordering::SeqCst)
+                && !app.publish_in_progress.load(Ordering::SeqCst)
+            {
+                return;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                panic!(
+                    "publish attempt did not complete within 10s; \
+                     panic_inject={}, in_progress={}",
+                    app.publish_panic_inject.load(Ordering::SeqCst),
+                    app.publish_in_progress.load(Ordering::SeqCst),
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// End-to-end test: a panic inside `publish_single_checkpoint` (via
+    /// `spawn_blocking`) clears `publish_in_progress` (permit Drop during
+    /// unwind), keeps the checkpoint in the publish queue, and allows a
+    /// subsequent `maybe_publish_history` call to retry successfully.
+    ///
+    /// This validates RAII-drop-on-panic behavior under the test profile
+    /// (`panic = "unwind"`). The release profile uses `panic = "abort"`,
+    /// so this is not a production panic-recovery guarantee — it validates
+    /// the design principle that the permit guard correctly handles unwinding.
+    #[tokio::test]
+    async fn test_publish_panic_clears_flag_and_retains_queue() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_dir = dir.path().join("db");
+        let db_path = db_dir.join("henyey.sqlite");
+        let custom_bucket_dir = dir.path().join("custom-buckets");
+        let archive_dir = dir.path().join("archive");
+        std::fs::create_dir_all(&db_dir).unwrap();
+        std::fs::create_dir_all(&custom_bucket_dir).unwrap();
+        std::fs::create_dir_all(&archive_dir).unwrap();
+
+        let put_cmd = format!("cp {{0}} {{1}}");
+        let mkdir_cmd = "mkdir -p {0}".to_string();
+
+        let mut config = crate::config::ConfigBuilder::new()
+            .database_path(&db_path)
+            .bucket_directory(&custom_bucket_dir)
+            .validator(true)
+            .node_seed("SAFTEV5U6QDFE2DRMSD7HBE76XG7SQZJD6VIUTHIXTJGO77RUQYVURLA")
+            .build();
+        config.history.archives = vec![crate::config::HistoryArchiveEntry {
+            name: "panic-test".to_string(),
+            url: format!("file://{}", archive_dir.display()),
+            get_enabled: false,
+            put_enabled: true,
+            put: Some(put_cmd),
+            mkdir: Some(mkdir_cmd),
+        }];
+
+        let app = Arc::new(App::new(config.clone()).await.unwrap());
+        app.set_self_arc().await;
+
+        // Build genesis bucket list
+        let passphrase = app.config.network.passphrase.clone();
+        let genesis_entries = App::build_genesis_entries(&passphrase, 0, TOTAL_COINS);
+        let live_probe_header = make_header(
+            1,
+            Hash256::ZERO,
+            Hash256::ZERO,
+            Hash256::ZERO,
+            Hash256::ZERO,
+        );
+        let mut probe_bucket_list = BucketList::new();
+        probe_bucket_list.set_bucket_dir(custom_bucket_dir.clone());
+        probe_bucket_list
+            .add_batch(
+                1,
+                0,
+                stellar_xdr::curr::BucketListType::Live,
+                genesis_entries.clone(),
+                vec![],
+                vec![],
+            )
+            .unwrap();
+        let live_hash = probe_bucket_list.hash();
+        let hot_archive = HotArchiveBucketList::new();
+        let combined_hash = combined_bucket_hash(live_hash, hot_archive.hash());
+
+        let live_header = LedgerHeader {
+            bucket_list_hash: Hash(live_hash.0),
+            ..live_probe_header
+        };
+        let mut bucket_list =
+            App::create_genesis_bucket_list(&custom_bucket_dir, genesis_entries, &live_header)
+                .unwrap();
+        bucket_list.set_ledger_seq(CHECKPOINT);
+        let has = build_history_archive_state(
+            CHECKPOINT,
+            &bucket_list,
+            Some(&hot_archive),
+            Some(passphrase.clone()),
+        )
+        .unwrap();
+        let has_json = has.to_json().unwrap();
+
+        let empty_result = empty_tx_result(1);
+        let empty_result_hash = Hash256::hash(
+            &empty_result
+                .tx_result_set
+                .to_xdr(Limits::none())
+                .expect("empty result xdr"),
+        );
+
+        // Seed ledger headers, tx history, results for checkpoint
+        let mut previous_header_hash = Hash256::ZERO;
+        let mut checkpoint_header = None;
+        let mut checkpoint_header_hash = Hash256::ZERO;
+        let mut headers_and_history = Vec::new();
+        for seq in 1..=CHECKPOINT {
+            let tx_entry = empty_tx_history(seq, previous_header_hash);
+            let tx_hash = if seq == 1 {
+                Hash256::ZERO
+            } else {
+                henyey_history::verify::compute_tx_set_hash(&TransactionSetVariant::Classic(
+                    tx_entry.tx_set.clone(),
+                ))
+                .unwrap()
+            };
+            let result_entry = empty_tx_result(seq);
+            let result_hash = if seq == 1 {
+                Hash256::ZERO
+            } else {
+                empty_result_hash
+            };
+            let header = make_header(
+                seq,
+                previous_header_hash,
+                tx_hash,
+                result_hash,
+                combined_hash,
+            );
+            let header_xdr = header.to_xdr(Limits::none()).unwrap();
+            previous_header_hash = henyey_ledger::compute_header_hash(&header).unwrap();
+            if seq == CHECKPOINT {
+                checkpoint_header_hash = previous_header_hash;
+                checkpoint_header = Some(header.clone());
+            }
+            headers_and_history.push((header, header_xdr, tx_entry, result_entry));
+        }
+
+        app.db_blocking("seed-panic-test", {
+            let bucket_levels = bucket_levels(&bucket_list);
+            let has_json = has_json.clone();
+            let headers_and_history = headers_and_history.clone();
+            move |db| {
+                db.with_connection(|conn| {
+                    for (header, header_xdr, tx_entry, result_entry) in &headers_and_history {
+                        conn.store_ledger_header(header, header_xdr)?;
+                        conn.store_tx_history_entry(header.ledger_seq, tx_entry)?;
+                        conn.store_tx_result_entry(header.ledger_seq, result_entry)?;
+                    }
+                    conn.set_last_closed_ledger(CHECKPOINT)?;
+                    conn.store_bucket_list(CHECKPOINT, &bucket_levels)?;
+                    conn.set_state(state_keys::HISTORY_ARCHIVE_STATE, &has_json)?;
+                    conn.enqueue_publish(CHECKPOINT, &has_json)?;
+                    Ok::<_, henyey_db::DbError>(())
+                })
+                .map_err(Into::into)
+            }
+        })
+        .await
+        .unwrap();
+
+        app.ledger_manager
+            .initialize(
+                bucket_list,
+                hot_archive,
+                checkpoint_header.expect("checkpoint header"),
+                checkpoint_header_hash,
+            )
+            .unwrap();
+
+        // --- Phase 1: trigger panic ---
+        app.publish_panic_inject.store(true, Ordering::SeqCst);
+        app.maybe_publish_history().await;
+        wait_for_publish_attempt(&app).await;
+
+        // One-shot consumed → panic site was reached
+        assert!(
+            !app.publish_panic_inject.load(Ordering::SeqCst),
+            "panic injection flag should have been consumed"
+        );
+        // Permit released by Drop during unwind
+        assert!(
+            !app.publish_in_progress.load(Ordering::SeqCst),
+            "publish_in_progress should be cleared after panic"
+        );
+        // Checkpoint NOT dequeued (publish failed)
+        let queue = app
+            .db_blocking("check-queue-after-panic", |db| {
+                db.load_publish_queue(None).map_err(Into::into)
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            queue,
+            vec![CHECKPOINT],
+            "checkpoint should remain in queue after panic"
+        );
+
+        // --- Phase 2: retry succeeds ---
+        app.maybe_publish_history().await;
+        wait_for_publish_queue_to_drain(&app).await;
+
+        let queue = app
+            .db_blocking("check-queue-after-retry", |db| {
+                db.load_publish_queue(None).map_err(Into::into)
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            queue,
+            Vec::<u32>::new(),
+            "queue should be empty after successful retry"
+        );
     }
 }

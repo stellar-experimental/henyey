@@ -375,6 +375,10 @@ pub struct App {
     /// Prevent concurrent history publish operations.
     /// When set, a background task is publishing a checkpoint.
     publish_in_progress: AtomicBool,
+    /// One-shot panic injection for publish tests. When `true`, the next call
+    /// to `publish_single_checkpoint` will swap it to `false` and panic.
+    #[cfg(test)]
+    pub(crate) publish_panic_inject: AtomicBool,
     /// Buffered externalized ledgers waiting to apply.
     ///
     /// # Invariant (event-loop freeze guard rail)
@@ -979,6 +983,8 @@ impl App {
             catchup_fatal_failure: AtomicBool::new(false),
             catchup_needs_full_reset: AtomicBool::new(false),
             publish_in_progress: AtomicBool::new(false),
+            #[cfg(test)]
+            publish_panic_inject: AtomicBool::new(false),
             syncing_ledgers: RwLock::new(BTreeMap::new()),
             last_externalized_slot: AtomicU64::new(0),
             scp_messages_sent: AtomicU64::new(0),
