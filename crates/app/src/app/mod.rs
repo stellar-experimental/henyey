@@ -3464,6 +3464,87 @@ mod tests {
         app.set_applying_ledger(false);
     }
 
+    /// Regression test for #2172: `try_start_ledger_close` must reject a
+    /// buffered tx set that fails `prepare_for_apply` validation (defense-in-depth
+    /// added in #2167). Verifies that `None` is returned and the `tx_set` field
+    /// in the syncing_ledgers entry is cleared.
+    #[tokio::test]
+    async fn test_try_start_ledger_close_rejects_malformed_tx_set() {
+        use stellar_xdr::curr::{
+            GeneralizedTransactionSet, Hash, Limits, TransactionPhase, TransactionSetV1,
+            TxSetComponent, TxSetComponentTxsMaybeDiscountedFee, WriteXdr,
+        };
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-test.db");
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
+
+        let app = App::new(config).await.unwrap();
+
+        // Build a malformed GeneralizedTransactionSet with 3 phases (expects exactly 2).
+        // This triggers validate_generalized_tx_set_xdr_structure to fail.
+        let empty_phase = TransactionPhase::V0(
+            vec![TxSetComponent::TxsetCompTxsMaybeDiscountedFee(
+                TxSetComponentTxsMaybeDiscountedFee {
+                    base_fee: None,
+                    txs: Vec::new().try_into().unwrap(),
+                },
+            )]
+            .try_into()
+            .unwrap(),
+        );
+        let malformed_gen = GeneralizedTransactionSet::V1(TransactionSetV1 {
+            // previous_ledger_hash = ZERO matches the uninitialized app's current_header_hash
+            previous_ledger_hash: Hash([0u8; 32]),
+            phases: vec![empty_phase.clone(), empty_phase.clone(), empty_phase]
+                .try_into()
+                .unwrap(),
+        });
+
+        // Compute the real hash so it passes the tx_set_hash check.
+        let xdr_bytes = malformed_gen.to_xdr(Limits::none()).unwrap();
+        let hash = henyey_common::Hash256::hash(&xdr_bytes);
+
+        let tx_set = henyey_herder::TransactionSet::new_generalized(hash, malformed_gen);
+
+        // get_current_ledger() returns 0 for uninitialized app → next_seq = 1
+        let next_seq: u32 = 1;
+
+        // Insert into syncing_ledgers with matching hash and the malformed tx_set.
+        {
+            let mut buffer = app.syncing_ledgers.write().await;
+            buffer.insert(
+                next_seq,
+                henyey_herder::LedgerCloseInfo {
+                    slot: next_seq as u64,
+                    tx_set_hash: hash,
+                    tx_set: Some(tx_set),
+                    close_time: 1,
+                    upgrades: Vec::new(),
+                    stellar_value_ext: StellarValueExt::Basic,
+                },
+            );
+        }
+
+        // Act: try_start_ledger_close should detect the malformed tx_set via
+        // prepare_for_apply and return None.
+        let result = app.try_start_ledger_close().await;
+        assert!(
+            result.is_none(),
+            "should return None when buffered tx set fails prepare_for_apply"
+        );
+
+        // Verify: the entry still exists but tx_set has been cleared.
+        let buffer = app.syncing_ledgers.read().await;
+        let entry = buffer.get(&next_seq).expect("entry should still exist");
+        assert!(
+            entry.tx_set.is_none(),
+            "tx_set field should be cleared after prepare_for_apply failure"
+        );
+    }
+
     #[tokio::test]
     async fn test_try_apply_buffered_skips_when_already_applying() {
         let dir = tempfile::tempdir().expect("temp dir");
