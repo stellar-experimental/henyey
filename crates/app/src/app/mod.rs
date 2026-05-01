@@ -1575,34 +1575,40 @@ impl App {
 
     /// Load the current sequence number for an account from the bucket list.
     ///
-    /// Returns `None` if the account does not exist.
+    /// Returns `Ok(None)` if the account does not exist.
     /// Used by the simulation LoadGenerator to refresh cached sequence numbers.
-    pub fn load_account_sequence(&self, account_id: &stellar_xdr::curr::AccountId) -> Option<i64> {
-        let snapshot = self.ledger_manager.create_snapshot().ok()?;
-        let account = snapshot.get_account(account_id).ok()??;
-        Some(account.seq_num.0)
+    pub fn load_account_sequence(
+        &self,
+        account_id: &stellar_xdr::curr::AccountId,
+    ) -> henyey_ledger::Result<Option<i64>> {
+        let snapshot = self.ledger_manager.create_snapshot()?;
+        let Some(account) = snapshot.get_account(account_id)? else {
+            return Ok(None);
+        };
+        Ok(Some(account.seq_num.0))
     }
 
     /// Load a full account entry from the current bucket list snapshot.
     ///
-    /// Returns `None` if the account does not exist.
+    /// Returns `Ok(None)` if the account does not exist.
     /// Used by the compat HTTP `/testacc` endpoint.
     pub fn load_account(
         &self,
         account_id: &stellar_xdr::curr::AccountId,
-    ) -> Option<stellar_xdr::curr::AccountEntry> {
-        let snapshot = self.ledger_manager.create_snapshot().ok()?;
-        snapshot.get_account(account_id).ok()?
+    ) -> henyey_ledger::Result<Option<stellar_xdr::curr::AccountEntry>> {
+        let snapshot = self.ledger_manager.create_snapshot()?;
+        snapshot.get_account(account_id)
     }
 
     /// Check whether a ledger entry exists in the current bucket list.
     ///
     /// Used by the simulation LoadGenerator to verify Soroban state is synced.
-    pub fn has_ledger_entry(&self, key: &stellar_xdr::curr::LedgerKey) -> bool {
-        let Ok(snapshot) = self.ledger_manager.create_snapshot() else {
-            return false;
-        };
-        matches!(snapshot.get_entry(key), Ok(Some(_)))
+    pub fn has_ledger_entry(
+        &self,
+        key: &stellar_xdr::curr::LedgerKey,
+    ) -> henyey_ledger::Result<bool> {
+        let snapshot = self.ledger_manager.create_snapshot()?;
+        Ok(snapshot.get_entry(key)?.is_some())
     }
 
     /// Check whether the given account has any pending transactions in the

@@ -1023,20 +1023,25 @@ pub(super) struct LedgerFeeBalanceProvider {
 }
 
 impl FeeBalanceProvider for LedgerFeeBalanceProvider {
-    fn get_available_balance(&self, account_id: &stellar_xdr::curr::AccountId) -> Option<i64> {
-        let snapshot = self.ledger_manager.create_snapshot().ok()?;
+    fn get_available_balance(
+        &self,
+        account_id: &stellar_xdr::curr::AccountId,
+    ) -> henyey_ledger::Result<Option<i64>> {
+        let snapshot = self.ledger_manager.create_snapshot()?;
         let key = stellar_xdr::curr::LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
             account_id: account_id.clone(),
         });
-        let entry = snapshot.get_entry(&key).ok()??;
+        let Some(entry) = snapshot.get_entry(&key)? else {
+            return Ok(None);
+        };
         if let stellar_xdr::curr::LedgerEntryData::Account(acc) = &entry.data {
             let base_reserve = snapshot.header().base_reserve;
-            Some(henyey_ledger::reserves::available_to_send(
+            Ok(Some(henyey_ledger::reserves::available_to_send(
                 acc,
                 base_reserve,
-            ))
+            )))
         } else {
-            None
+            Ok(None)
         }
     }
 }
@@ -1055,12 +1060,12 @@ impl AccountProvider for LedgerAccountProvider {
     fn load_account(
         &self,
         account_id: &stellar_xdr::curr::AccountId,
-    ) -> Option<stellar_xdr::curr::AccountEntry> {
+    ) -> henyey_ledger::Result<Option<stellar_xdr::curr::AccountEntry>> {
         // Create a snapshot per call for the queue-admission path.
         // The SCP validation path uses SnapshotValidationProviders
         // which holds a single snapshot for the entire validation run.
-        let snapshot = self.ledger_manager.create_snapshot().ok()?;
-        snapshot.get_account(account_id).ok()?
+        let snapshot = self.ledger_manager.create_snapshot()?;
+        snapshot.get_account(account_id)
     }
 }
 
@@ -1110,13 +1115,16 @@ impl AccountProvider for SnapshotValidationProviders {
     fn load_account(
         &self,
         account_id: &stellar_xdr::curr::AccountId,
-    ) -> Option<stellar_xdr::curr::AccountEntry> {
+    ) -> henyey_ledger::Result<Option<stellar_xdr::curr::AccountEntry>> {
         self.inner.load_account(account_id)
     }
 }
 
 impl FeeBalanceProvider for SnapshotValidationProviders {
-    fn get_available_balance(&self, account_id: &stellar_xdr::curr::AccountId) -> Option<i64> {
+    fn get_available_balance(
+        &self,
+        account_id: &stellar_xdr::curr::AccountId,
+    ) -> henyey_ledger::Result<Option<i64>> {
         self.inner.get_available_balance(account_id)
     }
 }

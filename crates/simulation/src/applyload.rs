@@ -1105,9 +1105,15 @@ impl ApplyLoad {
             .collect();
 
         for (id, aid) in &account_info {
-            if let Some(seq) = self.app.load_account_sequence(aid) {
-                if let Some(account) = self.tx_gen.accounts_mut().get_mut(id) {
-                    account.sequence_number = seq;
+            match self.app.load_account_sequence(aid) {
+                Ok(Some(seq)) => {
+                    if let Some(account) = self.tx_gen.accounts_mut().get_mut(id) {
+                        account.sequence_number = seq;
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::warn!(error = ?e, "failed to refresh account sequence in applyload");
                 }
             }
         }

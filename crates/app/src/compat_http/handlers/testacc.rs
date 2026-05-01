@@ -73,7 +73,7 @@ pub(crate) async fn compat_testacc_handler(
 
     // Look up the account in the current ledger.
     match state.app.load_account(&account_id) {
-        Some(account) => {
+        Ok(Some(account)) => {
             let response = TestAccResponse {
                 name,
                 id: strkey,
@@ -82,9 +82,17 @@ pub(crate) async fn compat_testacc_handler(
             };
             Json(serde_json::to_value(&response).unwrap()).into_response()
         }
-        None => {
+        Ok(None) => {
             // stellar-core returns empty JSON object when account not found
             Json(serde_json::json!({})).into_response()
+        }
+        Err(e) => {
+            tracing::error!(error = ?e, "internal error loading account");
+            (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "internal error"})),
+            )
+                .into_response()
         }
     }
 }

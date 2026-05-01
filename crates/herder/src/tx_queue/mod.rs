@@ -130,9 +130,9 @@ const EXPECTED_CLOSE_TIME_MULT: u64 = 2;
 pub trait FeeBalanceProvider: Send + Sync {
     /// Get the available balance for an account that can be used for fees.
     ///
-    /// Returns the native asset balance minus any reserves or holds,
-    /// or None if the account doesn't exist.
-    fn get_available_balance(&self, account_id: &AccountId) -> Option<i64>;
+    /// Returns `Ok(None)` if the account doesn't exist, `Ok(Some(balance))`
+    /// on success, or `Err(...)` on I/O or snapshot failure.
+    fn get_available_balance(&self, account_id: &AccountId) -> henyey_ledger::Result<Option<i64>>;
 }
 
 /// Trait for providing account data to tx-set validation.
@@ -144,8 +144,9 @@ pub trait FeeBalanceProvider: Send + Sync {
 pub trait AccountProvider: Send + Sync {
     /// Load an account entry by account ID.
     ///
-    /// Returns `None` if the account does not exist in the ledger.
-    fn load_account(&self, account_id: &AccountId) -> Option<AccountEntry>;
+    /// Returns `Ok(None)` if the account does not exist, `Ok(Some(entry))`
+    /// on success, or `Err(...)` on I/O or snapshot failure.
+    fn load_account(&self, account_id: &AccountId) -> henyey_ledger::Result<Option<AccountEntry>>;
 }
 
 /// Single-snapshot provider for batch tx-set validation.
@@ -181,19 +182,21 @@ impl SnapshotProviders {
 }
 
 impl AccountProvider for SnapshotProviders {
-    fn load_account(&self, account_id: &AccountId) -> Option<AccountEntry> {
-        self.snapshot.get_account(account_id).ok().flatten()
+    fn load_account(&self, account_id: &AccountId) -> henyey_ledger::Result<Option<AccountEntry>> {
+        self.snapshot.get_account(account_id)
     }
 }
 
 impl FeeBalanceProvider for SnapshotProviders {
-    fn get_available_balance(&self, account_id: &AccountId) -> Option<i64> {
-        let acc = self.snapshot.get_account(account_id).ok().flatten()?;
+    fn get_available_balance(&self, account_id: &AccountId) -> henyey_ledger::Result<Option<i64>> {
+        let Some(acc) = self.snapshot.get_account(account_id)? else {
+            return Ok(None);
+        };
         let base_reserve = self.snapshot.header().base_reserve;
-        Some(henyey_ledger::reserves::available_to_send(
+        Ok(Some(henyey_ledger::reserves::available_to_send(
             &acc,
             base_reserve,
-        ))
+        )))
     }
 }
 
@@ -2272,16 +2275,27 @@ impl TransactionQueue {
                 .unwrap_or(0)
         };
 
-        if let Some(available) = provider.get_available_balance(&fee_source_id) {
-            if available.saturating_sub(net_new_fee) < current_total_fees {
+        match provider.get_available_balance(&fee_source_id) {
+            Ok(Some(available)) => {
+                if available.saturating_sub(net_new_fee) < current_total_fees {
+                    return Err(TxQueueResult::Invalid(Some(
+                        henyey_tx::TxResultCode::TxInsufficientBalance,
+                    )));
+                }
+            }
+            Ok(None) => {
                 return Err(TxQueueResult::Invalid(Some(
-                    henyey_tx::TxResultCode::TxInsufficientBalance,
+                    henyey_tx::TxResultCode::TxNoAccount,
                 )));
             }
-        } else {
-            return Err(TxQueueResult::Invalid(Some(
-                henyey_tx::TxResultCode::TxNoAccount,
-            )));
+            Err(e) => {
+                tracing::warn!(
+                    error = ?e,
+                    ?fee_source_id,
+                    "fee balance lookup failed during admission"
+                );
+                return Err(TxQueueResult::Invalid(None));
+            }
         }
 
         Ok(())
@@ -5203,8 +5217,11 @@ mod tests {
     fn test_audit_089_eviction_rollback_on_fee_rejection() {
         struct ZeroBalanceProvider;
         impl FeeBalanceProvider for ZeroBalanceProvider {
-            fn get_available_balance(&self, _account_id: &AccountId) -> Option<i64> {
-                Some(0) // zero balance → candidate will be rejected
+            fn get_available_balance(
+                &self,
+                _account_id: &AccountId,
+            ) -> henyey_ledger::Result<Option<i64>> {
+                Ok(Some(0)) // zero balance → candidate will be rejected
             }
         }
 
@@ -7858,10 +7875,13 @@ mod snapshot_providers_tests {
     }
 
     impl FeeBalanceProvider for CountingFeeProvider {
-        fn get_available_balance(&self, _account_id: &AccountId) -> Option<i64> {
+        fn get_available_balance(
+            &self,
+            _account_id: &AccountId,
+        ) -> henyey_ledger::Result<Option<i64>> {
             self.call_count.fetch_add(1, Ordering::Relaxed);
             // Return a large balance so no tx is trimmed for fee reasons.
-            Some(i64::MAX)
+            Ok(Some(i64::MAX))
         }
     }
 
@@ -7881,9 +7901,12 @@ mod snapshot_providers_tests {
     }
 
     impl AccountProvider for CountingAccountProvider {
-        fn load_account(&self, _account_id: &AccountId) -> Option<AccountEntry> {
+        fn load_account(
+            &self,
+            _account_id: &AccountId,
+        ) -> henyey_ledger::Result<Option<AccountEntry>> {
             self.call_count.fetch_add(1, Ordering::Relaxed);
-            None
+            Ok(None)
         }
     }
 
@@ -7892,7 +7915,10 @@ mod snapshot_providers_tests {
     struct PanicFeeProvider;
 
     impl FeeBalanceProvider for PanicFeeProvider {
-        fn get_available_balance(&self, _account_id: &AccountId) -> Option<i64> {
+        fn get_available_balance(
+            &self,
+            _account_id: &AccountId,
+        ) -> henyey_ledger::Result<Option<i64>> {
             panic!("Queue's stored FeeBalanceProvider should not be called when override is set");
         }
     }
@@ -7900,7 +7926,10 @@ mod snapshot_providers_tests {
     struct PanicAccountProvider;
 
     impl AccountProvider for PanicAccountProvider {
-        fn load_account(&self, _account_id: &AccountId) -> Option<AccountEntry> {
+        fn load_account(
+            &self,
+            _account_id: &AccountId,
+        ) -> henyey_ledger::Result<Option<AccountEntry>> {
             panic!("Queue's stored AccountProvider should not be called when override is set");
         }
     }

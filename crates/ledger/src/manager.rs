@@ -2140,7 +2140,7 @@ impl LedgerManager {
                 // Fall through to bucket list for entries not in in-memory state
             }
             // Non-Soroban types or Soroban cache miss: use bucket list snapshot
-            Ok(bls_for_lookup.get(key))
+            Ok(bls_for_lookup.get_result(key)?)
         });
 
         // Batch lookup function for loading multiple entries in a single pass.

@@ -325,9 +325,13 @@ fn validate_regular_for_tx_set(
     // Phase A: Load source account
     let source_id = frame.source_account_id();
     let source_account = match account_provider.load_account(&source_id) {
-        Some(acc) => acc,
-        None => {
+        Ok(Some(acc)) => acc,
+        Ok(None) => {
             debug!(?source_id, "tx-set validation: source account not found");
+            return false;
+        }
+        Err(e) => {
+            tracing::warn!(error = ?e, ?source_id, "tx-set validation: account lookup failed");
             return false;
         }
     };
@@ -398,11 +402,19 @@ fn validate_fee_bump_for_tx_set(
     // --- Outer validation ---
     let fee_source_id = frame.fee_source_account_id();
     let fee_source_account = match account_provider.load_account(&fee_source_id) {
-        Some(acc) => acc,
-        None => {
+        Ok(Some(acc)) => acc,
+        Ok(None) => {
             debug!(
                 ?fee_source_id,
                 "tx-set validation: fee-bump fee source not found"
+            );
+            return false;
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = ?e,
+                ?fee_source_id,
+                "tx-set validation: fee source lookup failed"
             );
             return false;
         }
@@ -427,11 +439,19 @@ fn validate_fee_bump_for_tx_set(
     // --- Inner validation ---
     let inner_source_id = frame.inner_source_account_id();
     let inner_source_account = match account_provider.load_account(&inner_source_id) {
-        Some(acc) => acc,
-        None => {
+        Ok(Some(acc)) => acc,
+        Ok(None) => {
             debug!(
                 ?inner_source_id,
                 "tx-set validation: fee-bump inner source not found"
+            );
+            return false;
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = ?e,
+                ?inner_source_id,
+                "tx-set validation: inner source lookup failed"
             );
             return false;
         }
@@ -651,7 +671,17 @@ fn validate_ops_auth(
                 // Same account, but must check at op-specific threshold
                 (id, Some(tx_source_account))
             } else {
-                loaded_account = account_provider.load_account(&id);
+                loaded_account = match account_provider.load_account(&id) {
+                    Ok(acc) => acc,
+                    Err(e) => {
+                        tracing::warn!(
+                            error = ?e,
+                            ?id,
+                            "tx-set validation: op source lookup failed"
+                        );
+                        return false;
+                    }
+                };
                 (id, loaded_account.as_ref())
             }
         } else {
@@ -915,7 +945,18 @@ fn get_invalid_hashed_core(
                 None => continue,
             };
 
-            let available = provider.get_available_balance(fee_source).unwrap_or(0);
+            let available = match provider.get_available_balance(fee_source) {
+                Ok(Some(v)) => v,
+                Ok(None) => 0,
+                Err(e) => {
+                    tracing::warn!(
+                        error = ?e,
+                        ?fee_source,
+                        "fee balance lookup failed during trim"
+                    );
+                    0
+                }
+            };
             let total_fee = account_fee_map.get(fee_source).copied().unwrap_or(0);
 
             if available < total_fee {
@@ -1670,8 +1711,11 @@ mod tests {
     }
 
     impl FeeBalanceProvider for MockFeeBalanceProvider {
-        fn get_available_balance(&self, account_id: &AccountId) -> Option<i64> {
-            self.balances.get(account_id).copied()
+        fn get_available_balance(
+            &self,
+            account_id: &AccountId,
+        ) -> henyey_ledger::Result<Option<i64>> {
+            Ok(self.balances.get(account_id).copied())
         }
     }
 
@@ -1707,8 +1751,11 @@ mod tests {
     }
 
     impl AccountProvider for MockAccountProvider {
-        fn load_account(&self, account_id: &AccountId) -> Option<AccountEntry> {
-            self.accounts.get(account_id).cloned()
+        fn load_account(
+            &self,
+            account_id: &AccountId,
+        ) -> henyey_ledger::Result<Option<AccountEntry>> {
+            Ok(self.accounts.get(account_id).cloned())
         }
     }
 

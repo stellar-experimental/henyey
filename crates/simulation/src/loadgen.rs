@@ -368,6 +368,10 @@ impl TxGenerator {
                 let seq = self
                     .app
                     .load_account_sequence(&aid)
+                    .unwrap_or_else(|e| {
+                        tracing::warn!(error = ?e, "failed to load root account sequence");
+                        None
+                    })
                     .unwrap_or((ledger_num as i64) << INITIAL_SEQ_LEDGER_SHIFT);
                 TestAccount {
                     secret_key: sk,
@@ -379,8 +383,12 @@ impl TxGenerator {
                 let initial_seq = (ledger_num as i64) << 32;
                 let mut account = TestAccount::from_name(&name, initial_seq);
                 // Try to load real sequence from DB
-                if let Some(seq) = self.app.load_account_sequence(&account.account_id) {
-                    account.sequence_number = seq;
+                match self.app.load_account_sequence(&account.account_id) {
+                    Ok(Some(seq)) => account.sequence_number = seq,
+                    Ok(None) => {}
+                    Err(e) => {
+                        tracing::warn!(error = ?e, "failed to refresh account sequence");
+                    }
                 }
                 account
             };
@@ -395,9 +403,15 @@ impl TxGenerator {
     /// Matches stellar-core `TxGenerator::loadAccount()`.
     pub fn load_account(&mut self, account_id: u64) -> bool {
         if let Some(account) = self.accounts.get_mut(&account_id) {
-            if let Some(seq) = self.app.load_account_sequence(&account.account_id) {
-                account.sequence_number = seq;
-                return true;
+            match self.app.load_account_sequence(&account.account_id) {
+                Ok(Some(seq)) => {
+                    account.sequence_number = seq;
+                    return true;
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::warn!(error = ?e, "failed to load account sequence");
+                }
             }
         }
         false
@@ -1366,15 +1380,25 @@ impl LoadGenerator {
 
         // Check all contract instance keys
         for key in &self.contract_instance_keys {
-            if !self.tx_generator.app.has_ledger_entry(key) {
-                missing.push(key.clone());
+            match self.tx_generator.app.has_ledger_entry(key) {
+                Ok(true) => {}
+                Ok(false) => missing.push(key.clone()),
+                Err(e) => {
+                    tracing::warn!(error = ?e, "entry lookup failed during sync check");
+                    missing.push(key.clone());
+                }
             }
         }
 
         // Check the WASM code key
         if let Some(ref code_key) = self.code_key {
-            if !self.tx_generator.app.has_ledger_entry(code_key) {
-                missing.push(code_key.clone());
+            match self.tx_generator.app.has_ledger_entry(code_key) {
+                Ok(true) => {}
+                Ok(false) => missing.push(code_key.clone()),
+                Err(e) => {
+                    tracing::warn!(error = ?e, "code key lookup failed during sync check");
+                    missing.push(code_key.clone());
+                }
             }
         }
 
@@ -1418,13 +1442,19 @@ impl LoadGenerator {
             if id == ROOT_ACCOUNT_ID {
                 continue;
             }
-            if let Some(db_seq) = self
+            match self
                 .tx_generator
                 .app
                 .load_account_sequence(&account.account_id)
             {
-                if db_seq != account.sequence_number {
-                    out_of_sync.push(id);
+                Ok(Some(db_seq)) => {
+                    if db_seq != account.sequence_number {
+                        out_of_sync.push(id);
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::warn!(error = ?e, "failed to check account sync");
                 }
             }
         }
