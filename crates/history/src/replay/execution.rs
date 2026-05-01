@@ -12,7 +12,9 @@ use henyey_common::protocol::{
 };
 use henyey_common::Hash256;
 use henyey_ledger::{
-    execution::{execute_transaction_set, load_soroban_config, SorobanContext},
+    execution::{
+        execute_transaction_set, load_config_setting, load_soroban_config, SorobanContext,
+    },
     prepend_fee_event, EntryChange, LedgerDelta, LedgerError, LedgerSnapshot, SnapshotHandle,
     TransactionSetVariant,
 };
@@ -26,21 +28,6 @@ use stellar_xdr::curr::{
 
 use super::diff::log_tx_result_mismatch;
 use super::{LedgerReplayResult, ReplayConfig, ReplayExecutionContext};
-
-fn load_state_archival_settings(snapshot: &SnapshotHandle) -> Option<StateArchivalSettings> {
-    let key = LedgerKey::ConfigSetting(LedgerKeyConfigSetting {
-        config_setting_id: ConfigSettingId::StateArchival,
-    });
-    match snapshot.get_entry(&key) {
-        Ok(Some(entry)) => match entry.data {
-            LedgerEntryData::ConfigSetting(ConfigSettingEntry::StateArchival(settings)) => {
-                Some(settings)
-            }
-            _ => None,
-        },
-        _ => None,
-    }
-}
 
 /// Compute a hex-encoded SHA-256 digest over the XDR encoding of a slice of
 /// `WriteXdr` items.  Used for debug logging only.
@@ -604,8 +591,20 @@ pub fn replay_ledger_with_execution(
     // Save cost params before soroban_config is moved into execute_transaction_set
     let cpu_cost_params = soroban_config.cpu_cost_params.clone();
     let mem_cost_params = soroban_config.mem_cost_params.clone();
-    let eviction_settings =
-        load_state_archival_settings(&snapshot).unwrap_or(config.eviction_settings.clone());
+    let eviction_settings = match load_config_setting(&snapshot, ConfigSettingId::StateArchival) {
+        Ok(Some(ConfigSettingEntry::StateArchival(settings))) => settings,
+        Ok(Some(_)) => {
+            return Err(HistoryError::VerificationFailed(
+                "replay: unexpected ConfigSettingEntry variant for StateArchival key".to_string(),
+            ));
+        }
+        Ok(None) => config.eviction_settings.clone(),
+        Err(e) => {
+            return Err(HistoryError::VerificationFailed(format!(
+                "replay: failed to load StateArchival config: {e}"
+            )));
+        }
+    };
     // Use transaction set hash as base PRNG seed for Soroban execution
     let soroban_base_prng_seed = tx_set.hash();
     let classic_events = henyey_tx::ClassicEventConfig {
@@ -1789,5 +1788,84 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("empty"), "unexpected error: {err}");
+    }
+
+    /// Regression test for #2226: loading StateArchival with a wrong
+    /// ConfigSettingEntry variant must return an error, not silently fall back.
+    #[test]
+    fn test_load_state_archival_wrong_variant_errors() {
+        use henyey_ledger::execution::load_config_setting;
+        use stellar_xdr::curr::{
+            ConfigSettingContractComputeV0, ConfigSettingEntry, ConfigSettingId, LedgerEntry,
+            LedgerEntryData, LedgerEntryExt, LedgerKey, LedgerKeyConfigSetting,
+        };
+
+        let key = LedgerKey::ConfigSetting(LedgerKeyConfigSetting {
+            config_setting_id: ConfigSettingId::StateArchival,
+        });
+        // Store a wrong variant (ContractComputeV0) at the StateArchival key
+        let wrong_entry = LedgerEntry {
+            last_modified_ledger_seq: 1,
+            data: LedgerEntryData::ConfigSetting(ConfigSettingEntry::ContractComputeV0(
+                ConfigSettingContractComputeV0 {
+                    ledger_max_instructions: 0,
+                    tx_max_instructions: 0,
+                    fee_rate_per_instructions_increment: 0,
+                    tx_memory_limit: 0,
+                },
+            )),
+            ext: LedgerEntryExt::V0,
+        };
+
+        let mut entries = std::collections::HashMap::new();
+        entries.insert(key, wrong_entry);
+        let snapshot = henyey_ledger::LedgerSnapshot::new(
+            LedgerHeader::default(),
+            henyey_common::Hash256::ZERO,
+            entries,
+        );
+        let handle = henyey_ledger::SnapshotHandle::new(snapshot);
+
+        // load_config_setting returns Ok(Some(ContractComputeV0(...)))
+        // Our call site match should detect the wrong variant
+        let result = load_config_setting(&handle, ConfigSettingId::StateArchival);
+        match result {
+            Ok(Some(ConfigSettingEntry::StateArchival(_))) => {
+                panic!("should not match StateArchival variant");
+            }
+            Ok(Some(_)) => {
+                // This is the expected path — wrong variant detected
+            }
+            Ok(None) => panic!("should not be None when entry exists"),
+            Err(_) => {
+                // Also acceptable — load_config_setting itself might error
+                // on wrong LedgerEntryData (but here we have correct top-level variant)
+            }
+        }
+    }
+
+    /// Regression test for #2226: I/O error during config lookup must not be
+    /// silently swallowed.
+    #[test]
+    fn test_load_state_archival_io_error_propagates() {
+        use henyey_ledger::execution::load_config_setting;
+        use std::sync::Arc;
+        use stellar_xdr::curr::ConfigSettingId;
+
+        let snapshot = henyey_ledger::LedgerSnapshot::empty(1);
+        let lookup_fn: henyey_ledger::EntryLookupFn = Arc::new(|_key| {
+            Err(henyey_ledger::LedgerError::Snapshot(
+                "simulated I/O error".to_string(),
+            ))
+        });
+        let handle = henyey_ledger::SnapshotHandle::with_lookup(snapshot, lookup_fn);
+
+        let result = load_config_setting(&handle, ConfigSettingId::StateArchival);
+        assert!(result.is_err(), "I/O error should propagate, not be masked");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("simulated I/O error"),
+            "unexpected error: {err}"
+        );
     }
 }

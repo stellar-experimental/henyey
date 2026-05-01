@@ -13,7 +13,7 @@ use super::*;
 /// occurred during lookup or if the entry exists but contains a non-ConfigSetting
 /// data variant (data corruption). This matches stellar-core's behavior where
 /// data invariant violations are never silently swallowed.
-pub(crate) fn load_config_setting(
+pub fn load_config_setting(
     reader: &impl crate::EntryReader,
     id: ConfigSettingId,
 ) -> Result<Option<ConfigSettingEntry>> {
