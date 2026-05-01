@@ -75,6 +75,7 @@ tap_not_ok() {
 TICK_SESSION_WIPE_CKSUM="9ecf2096243bd256b679ea19966dafb5b6e27881c1a0055031bf194f4ba2b891"
 LOOP_ATTACH_CKSUM="c4d145a4cd8454034d9cbc900d16a8bb7b1dfc17da8493b07db3f6165a994504"
 LOOP_CLEANUP_CKSUM="64b10e52552c7c4e95e1f49aa6d1edd61b146212f87dfb39accfe08022ac3be4"
+TICK_MAINNET_WIPE_CKSUM="c3cf982ec9974d9fe61d31c28774d8463d1bf3d61f1168e20ddbc9e657cb9904"
 
 extract_fenced_block() {
   # Extract the first fenced bash block from a line range of a file.
@@ -87,16 +88,18 @@ compute_checksums() {
   local tick_file="$REPO_ROOT/.claude/skills/monitor-tick/SKILL.md"
   local loop_file="$REPO_ROOT/.claude/skills/monitor-loop/SKILL.md"
 
-  local tick_hash loop_attach_hash loop_cleanup_hash
+  local tick_hash loop_attach_hash loop_cleanup_hash tick_mainnet_hash
   tick_hash=$(extract_fenced_block "$tick_file" 50 83 | sha256sum | cut -d' ' -f1)
   loop_attach_hash=$(extract_fenced_block "$loop_file" 466 486 | sha256sum | cut -d' ' -f1)
   loop_cleanup_hash=$(extract_fenced_block "$loop_file" 833 860 | sha256sum | cut -d' ' -f1)
+  tick_mainnet_hash=$(extract_fenced_block "$tick_file" 119 129 | sha256sum | cut -d' ' -f1)
 
   if [[ "$UPDATE_CHECKSUMS" == "true" ]]; then
     echo "# Updated checksums — paste into script:"
     echo "TICK_SESSION_WIPE_CKSUM=\"$tick_hash\""
     echo "LOOP_ATTACH_CKSUM=\"$loop_attach_hash\""
     echo "LOOP_CLEANUP_CKSUM=\"$loop_cleanup_hash\""
+    echo "TICK_MAINNET_WIPE_CKSUM=\"$tick_mainnet_hash\""
     exit 0
   fi
 
@@ -111,6 +114,10 @@ compute_checksums() {
   fi
   if [[ "$loop_cleanup_hash" != "$LOOP_CLEANUP_CKSUM" ]]; then
     echo "WARNING: monitor-loop:833-860 code block has changed (drift detected)" >&2
+    drift=true
+  fi
+  if [[ "$tick_mainnet_hash" != "$TICK_MAINNET_WIPE_CKSUM" ]]; then
+    echo "WARNING: monitor-tick:119-129 code block has changed (drift detected)" >&2
     drift=true
   fi
 
@@ -235,10 +242,11 @@ cleanup_guard() {
 }
 
 # Mirrors monitor-tick/SKILL.md:119-127
+# MAINNET_WIPED is independent of SESSION_WIPED (verified by truth table at :141-150)
 check_mainnet_wiped() {
-  local data_root="$1" session_wiped="$2"
+  local data_root="$1"
   MAINNET_WIPED=no
-  if [[ "$session_wiped" == "no" ]] && [[ ! -d "$data_root/mainnet" ]]; then
+  if [[ ! -d "$data_root/mainnet" ]]; then
     MAINNET_WIPED=yes
   fi
 }
@@ -513,21 +521,26 @@ run_tests() {
   fi
 
   # ── Test 16: MAINNET_WIPED detection ───────────────────────────────────
-  # Source: .claude/skills/monitor-tick/SKILL.md:119-127
+  # Source: .claude/skills/monitor-tick/SKILL.md:119-127,141-150
+  # MAINNET_WIPED is independent of SESSION_WIPED per truth table
   data="$TEST_ROOT/t16/data"
   mkdir -p "$data"
-  # No mainnet dir
-  check_mainnet_wiped "$data" "no"
-  if [[ "$MAINNET_WIPED" == "yes" ]]; then
-    # Also verify it does NOT trigger when SESSION_WIPED=yes
-    check_mainnet_wiped "$data" "yes"
-    if [[ "$MAINNET_WIPED" == "no" ]]; then
-      tap_ok "mainnet-wiped: detected when dir absent and session not wiped"
-    else
-      tap_not_ok "mainnet-wiped: detected when dir absent and session not wiped" "should not fire when SESSION_WIPED=yes"
-    fi
+  # No mainnet dir — should detect wipe regardless of SESSION_WIPED state
+  check_mainnet_wiped "$data"
+  local mainnet_result_alone="$MAINNET_WIPED"
+  # Also verify it fires even when SESSION_WIPED=yes (combined case #6-8)
+  SESSION_WIPED=yes
+  check_mainnet_wiped "$data"
+  local mainnet_result_combined="$MAINNET_WIPED"
+  # Verify it does NOT fire when mainnet dir exists
+  mkdir -p "$data/mainnet"
+  check_mainnet_wiped "$data"
+  local mainnet_result_present="$MAINNET_WIPED"
+
+  if [[ "$mainnet_result_alone" == "yes" && "$mainnet_result_combined" == "yes" && "$mainnet_result_present" == "no" ]]; then
+    tap_ok "mainnet-wiped: independent of SESSION_WIPED, detects missing dir"
   else
-    tap_not_ok "mainnet-wiped: detected when dir absent and session not wiped" "MAINNET_WIPED=$MAINNET_WIPED"
+    tap_not_ok "mainnet-wiped: independent of SESSION_WIPED, detects missing dir" "alone=$mainnet_result_alone combined=$mainnet_result_combined present=$mainnet_result_present"
   fi
 }
 
