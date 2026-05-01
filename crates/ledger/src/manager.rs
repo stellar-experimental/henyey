@@ -923,63 +923,71 @@ impl crate::EntryReader for PairsReader<'_> {
 
 /// Build a `SorobanRentConfig` from any entry reader.
 ///
-/// Returns `Ok(None)` if the config entries are absent (bucket list not yet
-/// populated with Soroban config — e.g. empty bucket list during test fixtures
-/// or initialization). Returns `Ok(Some(...))` when all three entries are
-/// present. Returns `Err(...)` on wrong-variant (data corruption) or
-/// inconsistent state (some entries present, others absent).
+/// Returns `Ok(None)` if all three config entries are absent (bucket list not
+/// yet populated with Soroban config — e.g. empty bucket list during test
+/// fixtures or initialization). Returns `Ok(Some(...))` when all three entries
+/// are present with correct variants. Returns `Err(...)` on:
+/// - Wrong `ConfigSettingEntry` variant (data corruption)
+/// - Inconsistent state: some entries present, others absent
 ///
 /// This mirrors the probe pattern in `load_soroban_network_info` (config.rs:396)
 /// where absence is distinguished from corruption.
 fn build_soroban_rent_config(
     reader: &impl crate::EntryReader,
 ) -> Result<Option<crate::soroban_state::SorobanRentConfig>> {
-    use crate::execution::{load_config_setting, require_config};
+    use crate::execution::load_config_setting;
 
-    // Probe: if the first key is absent, config is not populated yet.
-    if load_config_setting(reader, ConfigSettingId::ContractCostParamsCpuInstructions)?.is_none() {
-        return Ok(None);
+    const CTX: &str = "build_soroban_rent_config";
+
+    // Probe all three keys to distinguish all-absent from partial/corrupt state.
+    let cpu_raw = load_config_setting(reader, ConfigSettingId::ContractCostParamsCpuInstructions)?;
+    let mem_raw = load_config_setting(reader, ConfigSettingId::ContractCostParamsMemoryBytes)?;
+    let compute_raw = load_config_setting(reader, ConfigSettingId::ContractComputeV0)?;
+
+    match (&cpu_raw, &mem_raw, &compute_raw) {
+        (None, None, None) => return Ok(None),
+        (Some(_), Some(_), Some(_)) => { /* all present — extract below */ }
+        _ => {
+            return Err(LedgerError::Internal(format!(
+                "{CTX}: inconsistent config state — expected all three rent config entries \
+                 to be present or all absent (cpu={}, mem={}, compute={})",
+                cpu_raw.is_some(),
+                mem_raw.is_some(),
+                compute_raw.is_some(),
+            )));
+        }
     }
 
-    // First key exists — all three must be present (mixed state = corruption).
-    let cpu_params = require_config(
-        reader,
-        ConfigSettingId::ContractCostParamsCpuInstructions,
-        |cs| {
-            if let ConfigSettingEntry::ContractCostParamsCpuInstructions(p) = cs {
-                Some(p)
-            } else {
-                None
-            }
-        },
-        "build_soroban_rent_config",
-    )?;
+    // All three are present — extract the correct variants.
+    let cpu_params = match cpu_raw.unwrap() {
+        ConfigSettingEntry::ContractCostParamsCpuInstructions(p) => p,
+        _ => {
+            return Err(LedgerError::Internal(format!(
+                "{CTX}: unexpected ConfigSettingEntry variant for {:?}",
+                ConfigSettingId::ContractCostParamsCpuInstructions
+            )));
+        }
+    };
 
-    let mem_params = require_config(
-        reader,
-        ConfigSettingId::ContractCostParamsMemoryBytes,
-        |cs| {
-            if let ConfigSettingEntry::ContractCostParamsMemoryBytes(p) = cs {
-                Some(p)
-            } else {
-                None
-            }
-        },
-        "build_soroban_rent_config",
-    )?;
+    let mem_params = match mem_raw.unwrap() {
+        ConfigSettingEntry::ContractCostParamsMemoryBytes(p) => p,
+        _ => {
+            return Err(LedgerError::Internal(format!(
+                "{CTX}: unexpected ConfigSettingEntry variant for {:?}",
+                ConfigSettingId::ContractCostParamsMemoryBytes
+            )));
+        }
+    };
 
-    let compute = require_config(
-        reader,
-        ConfigSettingId::ContractComputeV0,
-        |cs| {
-            if let ConfigSettingEntry::ContractComputeV0(c) = cs {
-                Some(c)
-            } else {
-                None
-            }
-        },
-        "build_soroban_rent_config",
-    )?;
+    let compute = match compute_raw.unwrap() {
+        ConfigSettingEntry::ContractComputeV0(c) => c,
+        _ => {
+            return Err(LedgerError::Internal(format!(
+                "{CTX}: unexpected ConfigSettingEntry variant for {:?}",
+                ConfigSettingId::ContractComputeV0
+            )));
+        }
+    };
 
     Ok(Some(crate::soroban_state::SorobanRentConfig {
         cpu_cost_params: cpu_params,
@@ -8342,10 +8350,10 @@ mod tests {
     }
 
     #[test]
-    fn test_build_soroban_rent_config_partial_state_errors() {
+    fn test_build_soroban_rent_config_partial_state_cpu_only_errors() {
         use stellar_xdr::curr::ContractCostParams;
 
-        // Only the first key present, others missing — inconsistent state.
+        // Only CPU key present, others missing — inconsistent state.
         let mut map = std::collections::HashMap::new();
         map.insert(
             config_key(ConfigSettingId::ContractCostParamsCpuInstructions),
@@ -8359,17 +8367,52 @@ mod tests {
         assert!(result.is_err(), "partial state should error");
         let err_msg = format!("{}", result.unwrap_err());
         assert!(
-            err_msg.contains("required config setting"),
-            "Error should mention required config: {}",
+            err_msg.contains("inconsistent config state"),
+            "Error should mention inconsistent state: {}",
+            err_msg
+        );
+    }
+
+    #[test]
+    fn test_build_soroban_rent_config_partial_state_cpu_absent_errors() {
+        use stellar_xdr::curr::{ConfigSettingContractComputeV0, ContractCostParams};
+
+        // CPU absent but Memory + Compute present — inconsistent state (reverse case).
+        let mut map = std::collections::HashMap::new();
+        map.insert(
+            config_key(ConfigSettingId::ContractCostParamsMemoryBytes),
+            make_config_ledger_entry(ConfigSettingEntry::ContractCostParamsMemoryBytes(
+                ContractCostParams(stellar_xdr::curr::VecM::default()),
+            )),
+        );
+        map.insert(
+            config_key(ConfigSettingId::ContractComputeV0),
+            make_config_ledger_entry(ConfigSettingEntry::ContractComputeV0(
+                ConfigSettingContractComputeV0 {
+                    ledger_max_instructions: 100,
+                    tx_max_instructions: 50,
+                    fee_rate_per_instructions_increment: 1,
+                    tx_memory_limit: 1024,
+                },
+            )),
+        );
+
+        let reader = MapReader(map);
+        let result = build_soroban_rent_config(&reader);
+        assert!(result.is_err(), "partial state (cpu absent) should error");
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(
+            err_msg.contains("inconsistent config state"),
+            "Error should mention inconsistent state: {}",
             err_msg
         );
     }
 
     #[test]
     fn test_build_soroban_rent_config_wrong_variant_errors() {
-        use stellar_xdr::curr::ContractCostParams;
+        use stellar_xdr::curr::{ConfigSettingContractComputeV0, ContractCostParams};
 
-        // First key exists with correct variant, but second key has wrong variant.
+        // All three keys present, but MemoryBytes has the wrong variant.
         let mut map = std::collections::HashMap::new();
         map.insert(
             config_key(ConfigSettingId::ContractCostParamsCpuInstructions),
@@ -8382,6 +8425,17 @@ mod tests {
             config_key(ConfigSettingId::ContractCostParamsMemoryBytes),
             make_config_ledger_entry(ConfigSettingEntry::ContractCostParamsCpuInstructions(
                 ContractCostParams(stellar_xdr::curr::VecM::default()),
+            )),
+        );
+        map.insert(
+            config_key(ConfigSettingId::ContractComputeV0),
+            make_config_ledger_entry(ConfigSettingEntry::ContractComputeV0(
+                ConfigSettingContractComputeV0 {
+                    ledger_max_instructions: 100,
+                    tx_max_instructions: 50,
+                    fee_rate_per_instructions_increment: 1,
+                    tx_memory_limit: 1024,
+                },
             )),
         );
 
