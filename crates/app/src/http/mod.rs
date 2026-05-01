@@ -13,7 +13,7 @@ pub mod types;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use axum::{
     routing::{get, post},
@@ -48,6 +48,8 @@ pub(crate) struct ServerState {
     pub start_time: Instant,
     /// ISO 8601 UTC timestamp of when the server started.
     pub started_on: String,
+    /// Unix epoch timestamp of when the server started (seconds).
+    pub started_on_epoch: f64,
     pub log_handle: Option<crate::logging::LogLevelHandle>,
     /// Prometheus metrics handle for rendering `/metrics` output.
     pub prometheus_handle: Option<metrics_exporter_prometheus::PrometheusHandle>,
@@ -240,10 +242,15 @@ impl StatusServer {
     /// Start the server.
     pub async fn start(self) -> anyhow::Result<()> {
         let started_on = format_utc_now();
+        let started_on_epoch = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs_f64();
         let state = Arc::new(ServerState {
             app: self.app,
             start_time: self.start_time,
             started_on,
+            started_on_epoch,
             log_handle: self.log_handle,
             prometheus_handle: self.prometheus_handle,
             #[cfg(feature = "loadgen")]
@@ -355,5 +362,21 @@ mod tests {
         assert_eq!(civil_from_days(0), (1970, 1, 1));
         // Day 19723 = 2024-01-01 (1704067200 / 86400 = 19723)
         assert_eq!(civil_from_days(19723), (2024, 1, 1));
+    }
+
+    #[test]
+    fn test_started_on_epoch_is_reasonable() {
+        // Verify the epoch computation produces a reasonable value.
+        let epoch = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs_f64();
+        // Should be after 2024-01-01 and before 2030-01-01.
+        assert!(epoch > 1_704_067_200.0, "epoch too old: {}", epoch);
+        assert!(
+            epoch < 1_893_456_000.0,
+            "epoch too far in future: {}",
+            epoch
+        );
     }
 }

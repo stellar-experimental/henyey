@@ -1,0 +1,745 @@
+{
+  "uid": "henyey-monitoring-full",
+  "title": "Henyey Full (10334 Equivalent)",
+  "description": "Henyey equivalent of the Stellar Core Full dashboard (Grafana 10334). Covers Health Summary, Ledger, Quorum, SCP, Peers, Buckets, Herder, History, App, Database, Overlay. Panels marked N/A have an explanation; panels marked 'Coming in Stage X' are placeholders for future metrics.",
+  "tags": ["henyey", "monitoring", "stellar", "full"],
+  "timezone": "browser",
+  "editable": true,
+  "graphTooltip": 1,
+  "refresh": "30s",
+  "time": {
+    "from": "now-6h",
+    "to": "now"
+  },
+  "templating": {
+    "list": [
+      {
+        "name": "instance",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "000000001"
+        },
+        "query": "label_values(up{job=\"henyey\"}, instance)",
+        "refresh": 2,
+        "includeAll": true,
+        "multi": true,
+        "current": {
+          "selected": true,
+          "text": "All",
+          "value": "$__all"
+        }
+      }
+    ]
+  },
+  "panels": [
+    {
+      "type": "row",
+      "title": "Health Summary",
+      "collapsed": false,
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 0},
+      "id": 100,
+      "panels": []
+    },
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "Node Count",
+      "description": "Number of henyey instances reachable by Prometheus. Panel 1 of 10334.",
+      "gridPos": {"h": 3, "w": 3, "x": 0, "y": 1},
+      "datasource": {"type": "prometheus", "uid": "000000001"},
+      "targets": [{"expr": "count(up{job=\"henyey\", instance=~\"$instance\"} == 1)", "legendFormat": ""}],
+      "fieldConfig": {"defaults": {"unit": "short"}}
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Reachable Nodes %",
+      "description": "Percentage of henyey instances that are up. Panel 2 of 10334.",
+      "gridPos": {"h": 3, "w": 3, "x": 3, "y": 1},
+      "datasource": {"type": "prometheus", "uid": "000000001"},
+      "targets": [{"expr": "100 * count(up{job=\"henyey\", instance=~\"$instance\"} == 1) / count(up{job=\"henyey\", instance=~\"$instance\"})", "legendFormat": ""}],
+      "fieldConfig": {"defaults": {"unit": "percent"}}
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Quorum Fail At",
+      "description": "Peers that can fail before quorum is lost. Panel 3 of 10334.",
+      "gridPos": {"h": 3, "w": 3, "x": 6, "y": 1},
+      "datasource": {"type": "prometheus", "uid": "000000001"},
+      "targets": [{"expr": "stellar_quorum_fail_at{instance=~\"$instance\"}", "legendFormat": "{{instance}}"}],
+      "fieldConfig": {"defaults": {"unit": "short"}}
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "Quorum Missing Peers",
+      "description": "Quorum set nodes not responding. Panel 4 of 10334.",
+      "gridPos": {"h": 3, "w": 3, "x": 9, "y": 1},
+      "datasource": {"type": "prometheus", "uid": "000000001"},
+      "targets": [{"expr": "stellar_quorum_missing{instance=~\"$instance\"}", "legendFormat": "{{instance}}"}],
+      "fieldConfig": {"defaults": {"unit": "short"}}
+    },
+    {
+      "id": 5,
+      "type": "text",
+      "title": "Transitive Quorum Intersection (N/A)",
+      "description": "Panel 5 of 10334. N/A: Henyey does not implement transitive quorum analysis.",
+      "gridPos": {"h": 3, "w": 3, "x": 12, "y": 1},
+      "options": {"mode": "markdown", "content": "**N/A** — Transitive quorum intersection analysis is not implemented in henyey. This is a stellar-core-specific feature for multi-node fleet monitoring."}
+    },
+    {
+      "id": 6,
+      "type": "stat",
+      "title": "Quorum Delayed Peers",
+      "description": "Quorum set nodes lagging behind. Panel 6 of 10334.",
+      "gridPos": {"h": 3, "w": 3, "x": 15, "y": 1},
+      "datasource": {"type": "prometheus", "uid": "000000001"},
+      "targets": [{"expr": "stellar_quorum_delayed{instance=~\"$instance\"}", "legendFormat": "{{instance}}"}],
+      "fieldConfig": {"defaults": {"unit": "short"}}
+    },
+    {
+      "id": 7,
+      "type": "stat",
+      "title": "Node Start Time",
+      "description": "Unix epoch of process start. Panel 7-8 of 10334 (latest/oldest start).",
+      "gridPos": {"h": 3, "w": 3, "x": 18, "y": 1},
+      "datasource": {"type": "prometheus", "uid": "000000001"},
+      "targets": [{"expr": "stellar_started_on{instance=~\"$instance\"}", "legendFormat": "{{instance}}"}],
+      "fieldConfig": {"defaults": {"unit": "dateTimeFromNow"}}
+    },
+    {
+      "id": 8,
+      "type": "stat",
+      "title": "Oldest Ledger Age",
+      "description": "Seconds since last ledger close. Panel 9 of 10334.",
+      "gridPos": {"h": 3, "w": 3, "x": 21, "y": 1},
+      "datasource": {"type": "prometheus", "uid": "000000001"},
+      "targets": [{"expr": "stellar_ledger_age_current_seconds{instance=~\"$instance\"}", "legendFormat": "{{instance}}"}],
+      "fieldConfig": {"defaults": {"unit": "s"}}
+    },
+    {
+      "id": 9,
+      "type": "stat",
+      "title": "Ledger Version",
+      "description": "Current ledger header protocol version. Panel 10 of 10334.",
+      "gridPos": {"h": 3, "w": 3, "x": 0, "y": 4},
+      "datasource": {"type": "prometheus", "uid": "000000001"},
+      "targets": [{"expr": "stellar_ledger_version{instance=~\"$instance\"}", "legendFormat": "{{instance}}"}],
+      "fieldConfig": {"defaults": {"unit": "short"}}
+    },
+    {
+      "id": 10,
+      "type": "stat",
+      "title": "Available Protocol Update",
+      "description": "Configured max protocol vs current ledger version. Panel 11 of 10334.",
+      "gridPos": {"h": 3, "w": 3, "x": 3, "y": 4},
+      "datasource": {"type": "prometheus", "uid": "000000001"},
+      "targets": [{"expr": "stellar_protocol_version{instance=~\"$instance\"} - stellar_ledger_version{instance=~\"$instance\"}", "legendFormat": "available upgrade"}],
+      "fieldConfig": {"defaults": {"unit": "short"}}
+    },
+    {
+      "id": 11,
+      "type": "stat",
+      "title": "Out of Sync Nodes",
+      "description": "Nodes not in Tracking state. Panel 12 of 10334.",
+      "gridPos": {"h": 3, "w": 3, "x": 6, "y": 4},
+      "datasource": {"type": "prometheus", "uid": "000000001"},
+      "targets": [{"expr": "count(stellar_herder_state{instance=~\"$instance\"} != 2) or vector(0)", "legendFormat": ""}],
+      "fieldConfig": {"defaults": {"unit": "short"}}
+    },
+    {
+      "id": 12,
+      "type": "text",
+      "title": "Quorum Changes Last Hour (N/A)",
+      "description": "Panel 13 of 10334. N/A: transitive quorum not implemented.",
+      "gridPos": {"h": 3, "w": 3, "x": 9, "y": 4},
+      "options": {"mode": "markdown", "content": "**N/A** — Transitive quorum last-check-ledger tracking is not implemented in henyey."}
+    },
+    {
+      "id": 13,
+      "type": "text",
+      "title": "Transitive Critical Nodes (N/A)",
+      "description": "Panel 14 of 10334. N/A: transitive quorum not implemented.",
+      "gridPos": {"h": 3, "w": 3, "x": 12, "y": 4},
+      "options": {"mode": "markdown", "content": "**N/A** — Transitive quorum critical node analysis is not implemented in henyey."}
+    },
+    {
+      "id": 14,
+      "type": "text",
+      "title": "SLI (Ledger Age at Close) — Coming in Stage B",
+      "description": "Panels 15-17 of 10334. Requires stellar_ledger_age_closed_seconds histogram.",
+      "gridPos": {"h": 3, "w": 9, "x": 15, "y": 4},
+      "options": {"mode": "markdown", "content": "**Coming in Stage B** — SLI panels require a `stellar_ledger_age_closed_seconds` histogram (age of ledger when it closed). This metric will be added in a follow-up PR."}
+    },
+    {
+      "type": "row",
+      "title": "State Info / Version",
+      "collapsed": false,
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 7},
+      "id": 101,
+      "panels": []
+    },
+    {
+      "id": 15,
+      "type": "stat",
+      "title": "Stellar Core State",
+      "description": "Herder state enum (0=Booting, 1=Syncing, 2=Tracking). Panel 18 of 10334.",
+      "gridPos": {"h": 4, "w": 8, "x": 0, "y": 8},
+      "datasource": {"type": "prometheus", "uid": "000000001"},
+      "targets": [{"expr": "stellar_herder_state{instance=~\"$instance\"}", "legendFormat": "{{instance}}"}],
+      "fieldConfig": {"defaults": {"mappings": [{"type": "value", "options": {"0": {"text": "Booting"}, "1": {"text": "Syncing"}, "2": {"text": "Tracking"}}}]}}
+    },
+    {
+      "id": 16,
+      "type": "stat",
+      "title": "Protocol Version (Max Supported)",
+      "description": "Configured max protocol version. Panel 19 of 10334.",
+      "gridPos": {"h": 4, "w": 8, "x": 8, "y": 8},
+      "datasource": {"type": "prometheus", "uid": "000000001"},
+      "targets": [{"expr": "stellar_protocol_version{instance=~\"$instance\"}", "legendFormat": "{{instance}}"}],
+      "fieldConfig": {"defaults": {"unit": "short"}}
+    },
+    {
+      "id": 17,
+      "type": "stat",
+      "title": "Ledger Age",
+      "description": "Seconds since last ledger close. Panel 20 of 10334.",
+      "gridPos": {"h": 4, "w": 8, "x": 16, "y": 8},
+      "datasource": {"type": "prometheus", "uid": "000000001"},
+      "targets": [{"expr": "stellar_ledger_age_current_seconds{instance=~\"$instance\"}", "legendFormat": "{{instance}}"}],
+      "fieldConfig": {"defaults": {"unit": "s"}}
+    },
+    {
+      "type": "row",
+      "title": "Ledger",
+      "collapsed": false,
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 12},
+      "id": 102,
+      "panels": []
+    },
+    {
+      "id": 18,
+      "type": "text",
+      "title": "Ledger Age Close (1m avg) — Coming in Stage B",
+      "description": "Panel 21 of 10334. Requires stellar_ledger_age_closed_seconds histogram.",
+      "gridPos": {"h": 6, "w": 8, "x": 0, "y": 13},
+      "options": {"mode": "markdown", "content": "**Coming in Stage B** — Requires `stellar_ledger_age_closed_seconds` histogram (ledger age at close time)."}
+    },
+    {
+      "id": 19,
+      "type": "timeseries",
+      "title": "Ledger Age",
+      "description": "Seconds since last close. Panel 22 of 10334.",
+      "gridPos": {"h": 6, "w": 8, "x": 8, "y": 13},
+      "datasource": {"type": "prometheus", "uid": "000000001"},
+      "targets": [{"expr": "stellar_ledger_age_current_seconds{instance=~\"$instance\"}", "legendFormat": "{{instance}}"}],
+      "fieldConfig": {"defaults": {"unit": "s"}}
+    },
+    {
+      "id": 20,
+      "type": "text",
+      "title": "% Closed Within $le s — Coming in Stage B",
+      "description": "Panel 23 of 10334. Requires histogram.",
+      "gridPos": {"h": 6, "w": 8, "x": 16, "y": 13},
+      "options": {"mode": "markdown", "content": "**Coming in Stage B** — Requires `stellar_ledger_age_closed_seconds` histogram."}
+    },
+    {
+      "id": 21,
+      "type": "timeseries",
+      "title": "Operation Count",
+      "description": "Operations executed per close. Panel 24 of 10334.",
+      "gridPos": {"h": 6, "w": 8, "x": 0, "y": 19},
+      "datasource": {"type": "prometheus", "uid": "000000001"},
+      "targets": [{"expr": "stellar_ledger_op_count{instance=~\"$instance\"}", "legendFormat": "{{instance}}"}],
+      "fieldConfig": {"defaults": {"unit": "short"}}
+    },
+    {
+      "id": 22,
+      "type": "timeseries",
+      "title": "Transaction Count",
+      "description": "Transactions per close. Panel 25 of 10334.",
+      "gridPos": {"h": 6, "w": 8, "x": 8, "y": 19},
+      "datasource": {"type": "prometheus", "uid": "000000001"},
+      "targets": [{"expr": "stellar_ledger_tx_count{instance=~\"$instance\"}", "legendFormat": "{{instance}}"}],
+      "fieldConfig": {"defaults": {"unit": "short"}}
+    },
+    {
+      "id": 23,
+      "type": "timeseries",
+      "title": "Ledger Close Duration",
+      "description": "Ledger close wall-clock time. Panel 26 of 10334.",
+      "gridPos": {"h": 6, "w": 8, "x": 16, "y": 19},
+      "datasource": {"type": "prometheus", "uid": "000000001"},
+      "targets": [{"expr": "rate(stellar_ledger_close_duration_seconds_sum{instance=~\"$instance\"}[5m]) / rate(stellar_ledger_close_duration_seconds_count{instance=~\"$instance\"}[5m])", "legendFormat": "{{instance}} avg"}],
+      "fieldConfig": {"defaults": {"unit": "s"}}
+    },
+    {
+      "id": 24,
+      "type": "text",
+      "title": "Operation Apply Duration — Coming in Stage B",
+      "description": "Panel 27 of 10334. Per-op apply timing.",
+      "gridPos": {"h": 6, "w": 6, "x": 0, "y": 25},
+      "options": {"mode": "markdown", "content": "**Coming in Stage B** — Per-operation apply timing (`stellar_ledger_operation_apply_seconds`)."}
+    },
+    {
+      "id": 25,
+      "type": "text",
+      "title": "Transaction Apply Duration — Coming in Stage B",
+      "description": "Panel 28 of 10334. Per-tx apply timing.",
+      "gridPos": {"h": 6, "w": 6, "x": 6, "y": 25},
+      "options": {"mode": "markdown", "content": "**Coming in Stage B** — Per-transaction apply timing (`stellar_ledger_transaction_apply_seconds`)."}
+    },
+    {
+      "id": 26,
+      "type": "text",
+      "title": "Invariant Failure — Coming in Stage B",
+      "description": "Panel 29 of 10334. Invariant failure counter.",
+      "gridPos": {"h": 6, "w": 6, "x": 12, "y": 25},
+      "options": {"mode": "markdown", "content": "**Coming in Stage B** — `stellar_ledger_invariant_failure_total` counter."}
+    },
+    {
+      "id": 27,
+      "type": "text",
+      "title": "Memory Queued Ledgers / TX Error / Catchup — Coming in Stage B",
+      "description": "Panels 30-33 of 10334.",
+      "gridPos": {"h": 6, "w": 6, "x": 18, "y": 25},
+      "options": {"mode": "markdown", "content": "**Coming in Stage B** — `stellar_ledger_memory_queued_ledgers`, `stellar_ledger_transaction_internal_error_total`, `stellar_ledger_catchup_duration_seconds`."}
+    },
+    {
+      "id": 28,
+      "type": "timeseries",
+      "title": "Memory Prefetch Hit Rate",
+      "description": "Bucket/snapshot cache hit ratio. Panel 31 of 10334.",
+      "gridPos": {"h": 6, "w": 8, "x": 0, "y": 31},
+      "datasource": {"type": "prometheus", "uid": "000000001"},
+      "targets": [
+        {"expr": "henyey_ledger_bucket_cache_hit_ratio{instance=~\"$instance\"}", "legendFormat": "bucket cache"},
+        {"expr": "henyey_ledger_snapshot_cache_hit_ratio{instance=~\"$instance\"}", "legendFormat": "snapshot cache"}
+      ],
+      "fieldConfig": {"defaults": {"unit": "percentunit"}}
+    },
+    {
+      "type": "row",
+      "title": "Quorum",
+      "collapsed": false,
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 37},
+      "id": 103,
+      "panels": []
+    },
+    {
+      "id": 29,
+      "type": "text",
+      "title": "Transitive Critical (N/A)",
+      "description": "Panels 34-36, 38-39 of 10334. N/A: transitive quorum not implemented.",
+      "gridPos": {"h": 6, "w": 12, "x": 0, "y": 38},
+      "options": {"mode": "markdown", "content": "**N/A** — Transitive quorum analysis (critical nodes, node count, last check ledger) is not implemented in henyey. These panels (34-36, 38-39) track cross-validator quorum topology and are specific to stellar-core fleet monitoring."}
+    },
+    {
+      "id": 30,
+      "type": "text",
+      "title": "Quorum Phase — Coming in Stage C",
+      "description": "Panel 37 of 10334. SCP phase gauge.",
+      "gridPos": {"h": 6, "w": 6, "x": 12, "y": 38},
+      "options": {"mode": "markdown", "content": "**Coming in Stage C** — `stellar_scp_phase` enum gauge (unknown/prepare/confirm/externalize)."}
+    },
+    {
+      "id": 31,
+      "type": "timeseries",
+      "title": "Quorum Agree / Disagree",
+      "description": "Quorum set agreement. Panel 40 of 10334.",
+      "gridPos": {"h": 6, "w": 6, "x": 18, "y": 38},
+      "datasource": {"type": "prometheus", "uid": "000000001"},
+      "targets": [
+        {"expr": "stellar_quorum_agree{instance=~\"$instance\"}", "legendFormat": "agree"},
+        {"expr": "stellar_quorum_disagree{instance=~\"$instance\"}", "legendFormat": "disagree"}
+      ],
+      "fieldConfig": {"defaults": {"unit": "short"}}
+    },
+    {
+      "id": 32,
+      "type": "timeseries",
+      "title": "Quorum Delayed",
+      "description": "Nodes lagging behind. Panel 41 of 10334.",
+      "gridPos": {"h": 6, "w": 12, "x": 0, "y": 44},
+      "datasource": {"type": "prometheus", "uid": "000000001"},
+      "targets": [{"expr": "stellar_quorum_delayed{instance=~\"$instance\"}", "legendFormat": "{{instance}}"}],
+      "fieldConfig": {"defaults": {"unit": "short"}}
+    },
+    {
+      "id": 33,
+      "type": "timeseries",
+      "title": "Quorum Missing",
+      "description": "Nodes not responding. Panel 42 of 10334.",
+      "gridPos": {"h": 6, "w": 12, "x": 12, "y": 44},
+      "datasource": {"type": "prometheus", "uid": "000000001"},
+      "targets": [{"expr": "stellar_quorum_missing{instance=~\"$instance\"}", "legendFormat": "{{instance}}"}],
+      "fieldConfig": {"defaults": {"unit": "short"}}
+    },
+    {
+      "type": "row",
+      "title": "Stellar Consensus Protocol",
+      "collapsed": false,
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 50},
+      "id": 104,
+      "panels": []
+    },
+    {
+      "id": 34,
+      "type": "timeseries",
+      "title": "Timing Externalized",
+      "description": "Time from slot creation to externalize. Panel 43 of 10334.",
+      "gridPos": {"h": 6, "w": 8, "x": 0, "y": 51},
+      "datasource": {"type": "prometheus", "uid": "000000001"},
+      "targets": [{"expr": "stellar_scp_timing_externalized_seconds{instance=~\"$instance\"}", "legendFormat": "{{instance}}"}],
+      "fieldConfig": {"defaults": {"unit": "s"}}
+    },
+    {
+      "id": 35,
+      "type": "timeseries",
+      "title": "Timing Nominated",
+      "description": "Time from nomination to ballot protocol. Panel 44 of 10334.",
+      "gridPos": {"h": 6, "w": 8, "x": 8, "y": 51},
+      "datasource": {"type": "prometheus", "uid": "000000001"},
+      "targets": [{"expr": "stellar_scp_timing_nominated_seconds{instance=~\"$instance\"}", "legendFormat": "{{instance}}"}],
+      "fieldConfig": {"defaults": {"unit": "s"}}
+    },
+    {
+      "id": 36,
+      "type": "text",
+      "title": "SCP Timeouts / Envelope Signing / Fetch — Coming in Stage C",
+      "description": "Panels 45-49 of 10334.",
+      "gridPos": {"h": 6, "w": 8, "x": 16, "y": 51},
+      "options": {"mode": "markdown", "content": "**Coming in Stage C** — SCP timeout counters (`nominate`/`prepare`), envelope signing/validation counters, and fetch duration metrics."}
+    },
+    {
+      "id": 37,
+      "type": "text",
+      "title": "Consensus Combine/Valid/Invalid/Sync Lost — Coming in Stage C",
+      "description": "Panel 50 of 10334.",
+      "gridPos": {"h": 6, "w": 8, "x": 0, "y": 57},
+      "options": {"mode": "markdown", "content": "**Coming in Stage C** — Consensus metrics. Note: `stellar_herder_lost_sync_total` already exists."}
+    },
+    {
+      "id": 38,
+      "type": "timeseries",
+      "title": "Herder Pending Envelopes",
+      "description": "SCP envelopes queued. Panel 51 of 10334 (adapted).",
+      "gridPos": {"h": 6, "w": 8, "x": 8, "y": 57},
+      "datasource": {"type": "prometheus", "uid": "000000001"},
+      "targets": [
+        {"expr": "rate(stellar_herder_pending_received_total{instance=~\"$instance\"}[5m])", "legendFormat": "received/s"},
+        {"expr": "rate(stellar_herder_pending_added_total{instance=~\"$instance\"}[5m])", "legendFormat": "added/s"},
+        {"expr": "rate(stellar_herder_pending_released_total{instance=~\"$instance\"}[5m])", "legendFormat": "released/s"},
+        {"expr": "rate(stellar_herder_pending_duplicates_total{instance=~\"$instance\"}[5m])", "legendFormat": "duplicates/s"}
+      ],
+      "fieldConfig": {"defaults": {"unit": "ops"}}
+    },
+    {
+      "id": 39,
+      "type": "text",
+      "title": "SCP Memory Cumulative Statements — Coming in Stage C",
+      "description": "Panel 52 of 10334.",
+      "gridPos": {"h": 6, "w": 8, "x": 16, "y": 57},
+      "options": {"mode": "markdown", "content": "**Coming in Stage C** — `stellar_scp_memory_cumulative_statements` gauge."}
+    },
+    {
+      "type": "row",
+      "title": "Peers",
+      "collapsed": false,
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 63},
+      "id": 105,
+      "panels": []
+    },
+    {
+      "id": 40,
+      "type": "timeseries",
+      "title": "Peers (Authenticated + Pending)",
+      "description": "Connected peer counts. Panel 53 of 10334.",
+      "gridPos": {"h": 6, "w": 24, "x": 0, "y": 64},
+      "datasource": {"type": "prometheus", "uid": "000000001"},
+      "targets": [
+        {"expr": "stellar_overlay_inbound_authenticated{instance=~\"$instance\"} + stellar_overlay_outbound_authenticated{instance=~\"$instance\"}", "legendFormat": "authenticated"},
+        {"expr": "stellar_overlay_inbound_pending{instance=~\"$instance\"} + stellar_overlay_outbound_pending{instance=~\"$instance\"}", "legendFormat": "pending"}
+      ],
+      "fieldConfig": {"defaults": {"unit": "short"}}
+    },
+    {
+      "type": "row",
+      "title": "Crypto",
+      "collapsed": true,
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 70},
+      "id": 106,
+      "panels": [
+        {
+          "id": 41,
+          "type": "text",
+          "title": "Crypto Verify Cache (N/A)",
+          "description": "Panels 54-55 of 10334. N/A: henyey has no signature verification cache.",
+          "gridPos": {"h": 4, "w": 24, "x": 0, "y": 71},
+          "options": {"mode": "markdown", "content": "**N/A** — Henyey does not implement a signature verification cache (`crypto_verify_{hit,miss,total}`). SCP envelope verification is done fresh each time via the SCP verify pipeline. See `docs/metrics-mapping.md` §5 for details."}
+        }
+      ]
+    },
+    {
+      "type": "row",
+      "title": "Buckets",
+      "collapsed": false,
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 71},
+      "id": 107,
+      "panels": []
+    },
+    {
+      "id": 42,
+      "type": "timeseries",
+      "title": "Bucket Batch Addtime",
+      "description": "Time to add entries to bucket list. Panel 56 of 10334.",
+      "gridPos": {"h": 6, "w": 8, "x": 0, "y": 72},
+      "datasource": {"type": "prometheus", "uid": "000000001"},
+      "targets": [{"expr": "rate(henyey_ledger_close_bucket_add_seconds_sum{instance=~\"$instance\"}[5m]) / rate(henyey_ledger_close_bucket_add_seconds_count{instance=~\"$instance\"}[5m])", "legendFormat": "{{instance}} avg"}],
+      "fieldConfig": {"defaults": {"unit": "s"}}
+    },
+    {
+      "id": 43,
+      "type": "timeseries",
+      "title": "Bucket Merge Time",
+      "description": "Cumulative merge time. Panel 57 of 10334.",
+      "gridPos": {"h": 6, "w": 8, "x": 8, "y": 72},
+      "datasource": {"type": "prometheus", "uid": "000000001"},
+      "targets": [{"expr": "rate(stellar_bucket_merge_time_us_total{instance=~\"$instance\"}[5m]) / 1e6", "legendFormat": "{{instance}} merge s/s"}],
+      "fieldConfig": {"defaults": {"unit": "s"}}
+    },
+    {
+      "id": 44,
+      "type": "text",
+      "title": "Bucket Memory Shared (N/A)",
+      "description": "Panel 58 of 10334. N/A: different bucket sharing model.",
+      "gridPos": {"h": 6, "w": 4, "x": 16, "y": 72},
+      "options": {"mode": "markdown", "content": "**N/A** — Henyey uses a different bucket sharing model (no reference-counted shared bucket memory)."}
+    },
+    {
+      "id": 45,
+      "type": "timeseries",
+      "title": "Bucket Batch Objects Added",
+      "description": "New entries per merge. Panel 59 of 10334.",
+      "gridPos": {"h": 6, "w": 4, "x": 20, "y": 72},
+      "datasource": {"type": "prometheus", "uid": "000000001"},
+      "targets": [{"expr": "rate(stellar_bucket_merge_new_live_total{instance=~\"$instance\"}[5m]) + rate(stellar_bucket_merge_new_dead_total{instance=~\"$instance\"}[5m]) + rate(stellar_bucket_merge_new_init_total{instance=~\"$instance\"}[5m]) + rate(stellar_bucket_merge_new_meta_total{instance=~\"$instance\"}[5m])", "legendFormat": "objects/s"}],
+      "fieldConfig": {"defaults": {"unit": "ops"}}
+    },
+    {
+      "type": "row",
+      "title": "Herder",
+      "collapsed": false,
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 78},
+      "id": 108,
+      "panels": []
+    },
+    {
+      "id": 46,
+      "type": "text",
+      "title": "Pending TXs by Age — Coming in Stage D",
+      "description": "Panel 60 of 10334. TX queue age buckets.",
+      "gridPos": {"h": 6, "w": 24, "x": 0, "y": 79},
+      "options": {"mode": "markdown", "content": "**Coming in Stage D** — `stellar_herder_pending_txs_age{0,1,2,3}` gauges showing pending transaction count per slot age. The TX queue already tracks per-account age internally."}
+    },
+    {
+      "type": "row",
+      "title": "History",
+      "collapsed": true,
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 85},
+      "id": 109,
+      "panels": [
+        {
+          "id": 47,
+          "type": "text",
+          "title": "History Panels — Coming in Stage E",
+          "description": "Panels 61-72 of 10334. History publish/apply/verify/download metrics.",
+          "gridPos": {"h": 6, "w": 24, "x": 0, "y": 86},
+          "options": {"mode": "markdown", "content": "**Coming in Stage E** — History archive metrics:\n- `stellar_history_publish_{success,failure}_total`\n- `stellar_history_publish_time_seconds`\n- `stellar_history_apply_ledger_chain_{success,failure}_total`\n- `stellar_history_bucket_apply_{success,failure}_total`\n- `stellar_history_download_bucket_{success,failure}_total`\n- `stellar_history_verify_bucket_{success,failure}_total`\n\nAll hooked into `henyey-historywork` job completion paths."}
+        }
+      ]
+    },
+    {
+      "type": "row",
+      "title": "App",
+      "collapsed": false,
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 86},
+      "id": 110,
+      "panels": []
+    },
+    {
+      "id": 48,
+      "type": "stat",
+      "title": "App State",
+      "description": "Application state (same as herder state). Panel 73 of 10334.",
+      "gridPos": {"h": 6, "w": 8, "x": 0, "y": 87},
+      "datasource": {"type": "prometheus", "uid": "000000001"},
+      "targets": [{"expr": "stellar_herder_state{instance=~\"$instance\"}", "legendFormat": "{{instance}}"}],
+      "fieldConfig": {"defaults": {"mappings": [{"type": "value", "options": {"0": {"text": "Booting"}, "1": {"text": "Syncing"}, "2": {"text": "Tracking"}}}]}}
+    },
+    {
+      "id": 49,
+      "type": "text",
+      "title": "Thread Delays (N/A)",
+      "description": "Panels 74-76 of 10334. N/A: henyey uses tokio async runtime.",
+      "gridPos": {"h": 6, "w": 16, "x": 8, "y": 87},
+      "options": {"mode": "markdown", "content": "**N/A** — Stellar-core's `app_post_on_{main,background}_thread_delay_seconds` metrics measure queue-backed thread dispatch latency. Henyey uses the tokio async runtime with cooperative task scheduling — there is no main/background thread queue to measure. See `docs/metrics-mapping.md` §5."}
+    },
+    {
+      "type": "row",
+      "title": "Database",
+      "collapsed": true,
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 93},
+      "id": 111,
+      "panels": [
+        {
+          "id": 50,
+          "type": "text",
+          "title": "Per-Statement DB Timings (N/A)",
+          "description": "73 panels in 10334. N/A: henyey uses rusqlite without per-statement instrumentation.",
+          "gridPos": {"h": 6, "w": 24, "x": 0, "y": 94},
+          "options": {"mode": "markdown", "content": "**N/A** — Stellar-core exposes 73 `stellar_core_database_{operation}_seconds` metrics via SOCI per-statement instrumentation (e.g., `select_account`, `insert_ledgerheader`, `commit`). Henyey uses rusqlite directly without this instrumentation layer. A small set of representative DB metrics (`stellar_db_query_seconds{operation=...}`) may be added as a follow-up if operator demand materializes."}
+        }
+      ]
+    },
+    {
+      "type": "row",
+      "title": "Overlay",
+      "collapsed": false,
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 94},
+      "id": 112,
+      "panels": []
+    },
+    {
+      "id": 51,
+      "type": "text",
+      "title": "Byte Read/Write Rate — Coming in Stage F",
+      "description": "Panels 77-80 of 10334. Byte counters.",
+      "gridPos": {"h": 6, "w": 6, "x": 0, "y": 95},
+      "options": {"mode": "markdown", "content": "**Coming in Stage F** — `stellar_overlay_byte_{read,write}_total` and async I/O counters."}
+    },
+    {
+      "id": 52,
+      "type": "timeseries",
+      "title": "Message Read Rate",
+      "description": "Overlay messages read per second. Panel 81 of 10334.",
+      "gridPos": {"h": 6, "w": 6, "x": 6, "y": 95},
+      "datasource": {"type": "prometheus", "uid": "000000001"},
+      "targets": [{"expr": "rate(stellar_overlay_message_read_total{instance=~\"$instance\"}[5m])", "legendFormat": "{{instance}}"}],
+      "fieldConfig": {"defaults": {"unit": "ops"}}
+    },
+    {
+      "id": 53,
+      "type": "timeseries",
+      "title": "Message Write Rate",
+      "description": "Overlay messages written per second. Panel 82 of 10334.",
+      "gridPos": {"h": 6, "w": 6, "x": 12, "y": 95},
+      "datasource": {"type": "prometheus", "uid": "000000001"},
+      "targets": [{"expr": "rate(stellar_overlay_message_write_total{instance=~\"$instance\"}[5m])", "legendFormat": "{{instance}}"}],
+      "fieldConfig": {"defaults": {"unit": "ops"}}
+    },
+    {
+      "id": 54,
+      "type": "timeseries",
+      "title": "Message Broadcast Rate",
+      "description": "Messages broadcast to all peers. Panel 83 of 10334.",
+      "gridPos": {"h": 6, "w": 6, "x": 18, "y": 95},
+      "datasource": {"type": "prometheus", "uid": "000000001"},
+      "targets": [{"expr": "rate(stellar_overlay_message_broadcast_total{instance=~\"$instance\"}[5m])", "legendFormat": "{{instance}}"}],
+      "fieldConfig": {"defaults": {"unit": "ops"}}
+    },
+    {
+      "id": 55,
+      "type": "timeseries",
+      "title": "Read Error Rate",
+      "description": "Overlay read errors per second. Panel 84 of 10334.",
+      "gridPos": {"h": 6, "w": 6, "x": 0, "y": 101},
+      "datasource": {"type": "prometheus", "uid": "000000001"},
+      "targets": [{"expr": "rate(stellar_overlay_error_read_total{instance=~\"$instance\"}[5m])", "legendFormat": "{{instance}}"}],
+      "fieldConfig": {"defaults": {"unit": "ops"}}
+    },
+    {
+      "id": 56,
+      "type": "timeseries",
+      "title": "Write Error Rate",
+      "description": "Overlay write errors per second. Panel 85 of 10334.",
+      "gridPos": {"h": 6, "w": 6, "x": 6, "y": 101},
+      "datasource": {"type": "prometheus", "uid": "000000001"},
+      "targets": [{"expr": "rate(stellar_overlay_error_write_total{instance=~\"$instance\"}[5m])", "legendFormat": "{{instance}}"}],
+      "fieldConfig": {"defaults": {"unit": "ops"}}
+    },
+    {
+      "id": 57,
+      "type": "timeseries",
+      "title": "Pending Connections",
+      "description": "Pending inbound + outbound. Panel 86 of 10334.",
+      "gridPos": {"h": 6, "w": 6, "x": 12, "y": 101},
+      "datasource": {"type": "prometheus", "uid": "000000001"},
+      "targets": [
+        {"expr": "stellar_overlay_inbound_pending{instance=~\"$instance\"}", "legendFormat": "inbound pending"},
+        {"expr": "stellar_overlay_outbound_pending{instance=~\"$instance\"}", "legendFormat": "outbound pending"}
+      ],
+      "fieldConfig": {"defaults": {"unit": "short"}}
+    },
+    {
+      "id": 58,
+      "type": "timeseries",
+      "title": "Authenticated Connections",
+      "description": "Authenticated inbound + outbound. Panel 87 of 10334.",
+      "gridPos": {"h": 6, "w": 6, "x": 18, "y": 101},
+      "datasource": {"type": "prometheus", "uid": "000000001"},
+      "targets": [
+        {"expr": "stellar_overlay_inbound_authenticated{instance=~\"$instance\"}", "legendFormat": "inbound auth"},
+        {"expr": "stellar_overlay_outbound_authenticated{instance=~\"$instance\"}", "legendFormat": "outbound auth"}
+      ],
+      "fieldConfig": {"defaults": {"unit": "short"}}
+    },
+    {
+      "id": 59,
+      "type": "text",
+      "title": "Fetch/Flood/Item Fetcher/Send Counters — Coming in Stage F",
+      "description": "Panels 88-99 of 10334.",
+      "gridPos": {"h": 6, "w": 12, "x": 0, "y": 107},
+      "options": {"mode": "markdown", "content": "**Coming in Stage F** — Overlay counters:\n- `stellar_overlay_fetch_{duplicate,unique}_recv_total`\n- `stellar_overlay_flood_{broadcast,duplicate_recv,unique_recv}_total`\n- `stellar_overlay_item_fetcher_next_peer_total`\n- `stellar_overlay_memory_flood_known`\n- `stellar_overlay_send_total{type=...}` (14 message types)\n- `stellar_overlay_{inbound,outbound}_{attempt,drop,establish,reject}_total`"}
+    },
+    {
+      "id": 60,
+      "type": "timeseries",
+      "title": "Timeout Idle",
+      "description": "Peers dropped due to idle timeout. Panel 95 of 10334.",
+      "gridPos": {"h": 6, "w": 6, "x": 12, "y": 107},
+      "datasource": {"type": "prometheus", "uid": "000000001"},
+      "targets": [{"expr": "rate(stellar_overlay_timeout_idle_total{instance=~\"$instance\"}[5m])", "legendFormat": "{{instance}}"}],
+      "fieldConfig": {"defaults": {"unit": "ops"}}
+    },
+    {
+      "id": 61,
+      "type": "timeseries",
+      "title": "Timeout Straggler",
+      "description": "Peers dropped due to straggler timeout. Panel 96 of 10334.",
+      "gridPos": {"h": 6, "w": 6, "x": 18, "y": 107},
+      "datasource": {"type": "prometheus", "uid": "000000001"},
+      "targets": [{"expr": "rate(stellar_overlay_timeout_straggler_total{instance=~\"$instance\"}[5m])", "legendFormat": "{{instance}}"}],
+      "fieldConfig": {"defaults": {"unit": "ops"}}
+    },
+    {
+      "type": "row",
+      "title": "Overlay Operation Duration",
+      "collapsed": true,
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 113},
+      "id": 113,
+      "panels": [
+        {
+          "id": 62,
+          "type": "text",
+          "title": "Per-Message Wire Timing (N/A — Deferred)",
+          "description": "24 panels in 10334. Per-message-type overlay operation duration.",
+          "gridPos": {"h": 6, "w": 24, "x": 0, "y": 114},
+          "options": {"mode": "markdown", "content": "**N/A (Deferred)** — Stellar-core exposes 24 `stellar_core_overlay_{message_type}_seconds` metrics for per-message wire timing. Henyey does not currently expose per-message-type wire timings. These could be added as `stellar_overlay_message_duration_seconds{type=...}` histogram if operator demand materializes, but are considered lower-value than the counters in Stage F."}
+        }
+      ]
+    }
+  ]
+}

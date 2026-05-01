@@ -331,6 +331,7 @@ mod tests {
             app: Arc::new(app),
             start_time: Instant::now(),
             started_on: "2024-01-01T00:00:00Z".to_string(),
+            started_on_epoch: 1704067200.0,
             log_handle: None,
             prometheus_handle: None,
             #[cfg(feature = "loadgen")]

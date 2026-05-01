@@ -154,6 +154,14 @@ metric_catalog! {
         IS_VALIDATOR = "stellar_is_validator"
             => "Whether this node is a validator";
 
+        // Stage A: Health Summary & Version gauges (10334 dashboard).
+        STARTED_ON = "stellar_started_on"
+            => "Unix epoch timestamp of process start";
+        LEDGER_VERSION = "stellar_ledger_version"
+            => "Current ledger header protocol version";
+        PROTOCOL_VERSION = "stellar_protocol_version"
+            => "Max supported protocol version (configured)";
+
         // SCP verify pipeline gauges.
         SCP_VERIFY_INPUT_BACKLOG = "henyey_scp_verify_input_backlog"
             => "Current depth of the SCP signature-verify input channel (event-loop sampled)";
@@ -718,6 +726,11 @@ pub(crate) async fn refresh_gauges(state: &ServerState) {
         gauge!(LEDGER_AGE_CURRENT_SECONDS).set(age as f64);
     }
 
+    // Stage A (10334 dashboard): Health Summary & Version gauges.
+    gauge!(STARTED_ON).set(state.started_on_epoch);
+    gauge!(LEDGER_VERSION).set(ledger_info.protocol_version as f64);
+    gauge!(PROTOCOL_VERSION).set(state.app.config().network.max_protocol_version as f64);
+
     // Phase 3: Soroban config limits (gauges — snapshot values).
     if let Some(info) = state.app.soroban_network_info() {
         gauge!(SOROBAN_CONFIG_CONTRACT_MAX_RW_KEY_BYTE).set(info.max_contract_data_key_size as f64);
@@ -1156,5 +1169,45 @@ mod tests {
         for name in all_names {
             assert!(seen.insert(name), "duplicate metric name: {}", name);
         }
+    }
+
+    #[test]
+    fn test_stage_a_dashboard_gauges_in_catalog() {
+        // Stage A (10334 dashboard): verify the 3 new gauges are registered.
+        let gauge_names: HashSet<&str> = ALL_GAUGE_NAMES.iter().copied().collect();
+        assert!(
+            gauge_names.contains("stellar_started_on"),
+            "stellar_started_on missing from gauge catalog"
+        );
+        assert!(
+            gauge_names.contains("stellar_ledger_version"),
+            "stellar_ledger_version missing from gauge catalog"
+        );
+        assert!(
+            gauge_names.contains("stellar_protocol_version"),
+            "stellar_protocol_version missing from gauge catalog"
+        );
+    }
+
+    #[test]
+    fn test_stage_a_gauges_preregistered_at_zero() {
+        let handle = ensure_test_recorder();
+        describe_metrics();
+        register_label_series();
+        let output = handle.render();
+
+        // All 3 Stage A gauges should appear in the rendered output after pre-registration.
+        assert!(
+            output.contains("stellar_started_on"),
+            "stellar_started_on not found in rendered metrics"
+        );
+        assert!(
+            output.contains("stellar_ledger_version"),
+            "stellar_ledger_version not found in rendered metrics"
+        );
+        assert!(
+            output.contains("stellar_protocol_version"),
+            "stellar_protocol_version not found in rendered metrics"
+        );
     }
 }

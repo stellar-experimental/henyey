@@ -4,6 +4,10 @@ This document maps henyey's Prometheus metrics to their stellar-core counterpart
 and documents henyey-only metrics. All constants are defined in
 `crates/app/src/metrics.rs`.
 
+**Dashboards:** [`docs/henyey-monitoring.json`](henyey-monitoring.json) (21-panel overview,
+10603 equivalent) | [`docs/henyey-monitoring-full.json`](henyey-monitoring-full.json) (full
+drill-down, 10334 equivalent).
+
 ## 1. Exact Stellar-Core Equivalents
 
 Metrics with the `stellar_` prefix that directly mirror stellar-core Medida counters/timers/gauges.
@@ -15,6 +19,9 @@ Metrics with the `stellar_` prefix that directly mirror stellar-core Medida coun
 | `PENDING_TRANSACTIONS` | `stellar_pending_transactions` | gauge | `HerderImpl::mTransactionQueueSize` (`Herder.cpp`) |
 | `UPTIME_SECONDS` | `stellar_uptime_seconds` | gauge | Process uptime |
 | `IS_VALIDATOR` | `stellar_is_validator` | gauge | Node validator status |
+| `STARTED_ON` | `stellar_started_on` | gauge | Unix epoch of process start (`mStartedOn = time(nullptr)`, `ApplicationImpl.cpp:87`) |
+| `LEDGER_VERSION` | `stellar_ledger_version` | gauge | Current ledger header `ledgerVersion` (`LedgerHeaderHistoryEntry.header.ledgerVersion`) |
+| `PROTOCOL_VERSION` | `stellar_protocol_version` | gauge | Configured max protocol version (`getConfig().LEDGER_PROTOCOL_VERSION`, `ApplicationImpl.cpp:469`) |
 | `LEDGER_TX_COUNT` | `stellar_ledger_tx_count` | gauge | `LedgerCloseData.mStats.mTxCount` |
 | `LEDGER_OP_COUNT` | `stellar_ledger_op_count` | gauge | `LedgerCloseData.mStats.mOpCount` |
 | `LEDGER_TX_SUCCESS_COUNT` | `stellar_ledger_tx_success_count` | gauge | `LedgerCloseData.mStats.mTxSuccessCount` |
@@ -245,3 +252,8 @@ They reference concepts or architecture that don't exist in henyey.
 | `stellar_core_app_post_on_main_thread_delay_seconds` | Stellar-core's queue-backed main thread; henyey uses tokio async runtime instead. |
 | `stellar_core_app_post_on_background_thread_delay_seconds` | Same as above — no background thread queue. |
 | `stellar_core_crypto_verify_hit` / `_total` | Stellar-core's signature verification cache; henyey has no signature cache (SCP verify pipeline uses `henyey_scp_verify_*` metrics). |
+| `stellar_core_quorum_transitive_critical` | Transitive quorum critical node analysis not implemented in henyey. |
+| `stellar_core_quorum_transitive_node_count` | Transitive quorum node count not implemented. |
+| `stellar_core_database_{operation}_seconds` (73 metrics) | Per-SOCI-statement timings (e.g., `select_account`, `insert_ledgerheader`, `commit`). Henyey uses rusqlite directly without per-statement instrumentation. |
+| `stellar_core_overlay_{message_type}_seconds` (24 metrics) | Per-message-type overlay wire timing. Henyey does not expose per-message-type duration metrics; deferred pending operator demand. |
+| `stellar_core_app_post_on_main_thread_with_delay_delay_seconds` | Same as `app_post_on_main_thread_delay` — tokio async runtime. |
