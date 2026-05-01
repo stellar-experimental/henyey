@@ -2824,6 +2824,29 @@ fn cmd_check_config(path: &std::path::Path, validate: bool) -> anyhow::Result<()
     Ok(())
 }
 
+/// Like `cmd_check_config`, but accepts an injectable env-var lookup instead
+/// of reading from the process environment. Used by tests to avoid global
+/// state mutation.
+#[cfg(test)]
+fn cmd_check_config_from(
+    path: &std::path::Path,
+    validate: bool,
+    lookup: impl FnMut(&str) -> anyhow::Result<Option<String>>,
+) -> anyhow::Result<()> {
+    let mut config = load_config_file(path)
+        .with_context(|| format!("Failed to load config: {}", path.display()))?;
+    config.apply_env_overrides_from(lookup)?;
+
+    if validate {
+        config
+            .validate()
+            .with_context(|| format!("Config validation failed: {}", path.display()))?;
+    }
+
+    println!("OK: {}", path.display());
+    Ok(())
+}
+
 /// Prints information about bucket files.
 ///
 /// If given a directory, lists all bucket files with their sizes.
@@ -3408,39 +3431,6 @@ async fn cmd_http_command(command: &str, port: u16) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
-
-    /// Serializes tests that read or write `RS_STELLAR_CORE_*` env vars via
-    /// `cmd_check_config` → `apply_env_overrides`. Without this, parallel test
-    /// threads can observe each other's env mutations (see #2165).
-    static ENV_TEST_MUTEX: Mutex<()> = Mutex::new(());
-
-    /// RAII guard that restores env vars to their original state on drop.
-    /// Mirrors the pattern in `crates/app/src/config.rs`.
-    struct EnvGuard {
-        vars: Vec<(String, Option<String>)>,
-    }
-
-    impl EnvGuard {
-        fn new(names: &[&str]) -> Self {
-            let vars = names
-                .iter()
-                .map(|&name| (name.to_owned(), std::env::var(name).ok()))
-                .collect();
-            Self { vars }
-        }
-    }
-
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            for (name, original) in &self.vars {
-                match original {
-                    Some(val) => std::env::set_var(name, val),
-                    None => std::env::remove_var(name),
-                }
-            }
-        }
-    }
 
     // =========================================================================
     // CLI Parsing Tests
@@ -3774,7 +3764,6 @@ mod tests {
 
     #[test]
     fn test_check_config_shipped_config_parses() {
-        let _lock = ENV_TEST_MUTEX.lock().unwrap();
         let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .unwrap()
@@ -3785,7 +3774,9 @@ mod tests {
             config_path.exists(),
             "configs/validator-testnet.toml should exist"
         );
-        cmd_check_config(&config_path, false).expect("shipped config should parse");
+        // Use no-op lookup to isolate from ambient env vars.
+        cmd_check_config_from(&config_path, false, |_| Ok(None))
+            .expect("shipped config should parse");
     }
 
     #[test]
@@ -3801,7 +3792,7 @@ bogus_field_that_does_not_exist = true
         )
         .unwrap();
 
-        let err = cmd_check_config(&path, false).unwrap_err();
+        let err = cmd_check_config_from(&path, false, |_| Ok(None)).unwrap_err();
         let msg = format!("{:#}", err);
         assert!(
             msg.contains("unknown field"),
@@ -3811,7 +3802,6 @@ bogus_field_that_does_not_exist = true
 
     #[test]
     fn test_check_config_validate_pass() {
-        let _lock = ENV_TEST_MUTEX.lock().unwrap();
         // Minimal watcher config that passes both parse and validate.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("watcher.toml");
@@ -3837,12 +3827,12 @@ url = "https://history.stellar.org/prd/core-testnet/core_testnet_001"
         )
         .unwrap();
 
-        cmd_check_config(&path, true).expect("valid watcher config should pass validation");
+        cmd_check_config_from(&path, true, |_| Ok(None))
+            .expect("valid watcher config should pass validation");
     }
 
     #[test]
     fn test_check_config_validate_fail_empty_archives() {
-        let _lock = ENV_TEST_MUTEX.lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("no-archives.toml");
         std::fs::write(
@@ -3864,10 +3854,10 @@ passphrase = "Test SDF Network ; September 2015"
         .unwrap();
 
         // Parse-only should succeed (no semantic validation).
-        cmd_check_config(&path, false).expect("parse-only should succeed");
+        cmd_check_config_from(&path, false, |_| Ok(None)).expect("parse-only should succeed");
 
         // Validate should fail — no history archives.
-        let err = cmd_check_config(&path, true).unwrap_err();
+        let err = cmd_check_config_from(&path, true, |_| Ok(None)).unwrap_err();
         let msg = format!("{:#}", err);
         assert!(
             msg.contains("history archive"),
@@ -3877,9 +3867,6 @@ passphrase = "Test SDF Network ; September 2015"
 
     #[test]
     fn test_check_config_rejects_malformed_env_override() {
-        let _lock = ENV_TEST_MUTEX.lock().unwrap();
-        let _guard = EnvGuard::new(&["RS_STELLAR_CORE_NODE_VALIDATOR"]);
-
         // Regression test: cmd_check_config must apply env overrides and fail
         // on malformed values (caught in review-fix round 1 of #2145).
         let dir = tempfile::tempdir().unwrap();
@@ -3897,9 +3884,14 @@ url = "https://history.stellar.org/prd/core-testnet/core_testnet_001"
         )
         .unwrap();
 
-        std::env::set_var("RS_STELLAR_CORE_NODE_VALIDATOR", "not_a_bool");
-
-        let result = cmd_check_config(&path, false);
+        // Inject a malformed boolean via the lookup.
+        let result = cmd_check_config_from(&path, false, |name| {
+            if name == "RS_STELLAR_CORE_NODE_VALIDATOR" {
+                Ok(Some("not_a_bool".to_owned()))
+            } else {
+                Ok(None)
+            }
+        });
 
         let err = result.unwrap_err();
         let msg = format!("{err:#}");
@@ -3907,5 +3899,48 @@ url = "https://history.stellar.org/prd/core-testnet/core_testnet_001"
             msg.contains("RS_STELLAR_CORE_NODE_VALIDATOR"),
             "Expected env override error, got: {msg}"
         );
+    }
+
+    #[test]
+    fn test_check_config_from_valid_override_applied() {
+        // Positive test: a valid injected override is actually applied through
+        // the full cmd_check_config pipeline.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("non-validator.toml");
+        std::fs::write(
+            &path,
+            r#"
+[node]
+is_validator = false
+
+[node.quorum_set]
+threshold_percent = 67
+validators = [
+    "GDKXE2OZMJIPOSLNA6N6F2BVCI3O777I2OOC4BV7VOYUEHYX7RTRYA7Y",
+]
+
+[network]
+passphrase = "Test SDF Network ; September 2015"
+
+[[history.archives]]
+name = "sdf1"
+url = "https://history.stellar.org/prd/core-testnet/core_testnet_001"
+"#,
+        )
+        .unwrap();
+
+        // Inject is_validator=true override. The config file says false, but
+        // the override should flip it to true. Validation will then require
+        // a NODE_SEED for validators — which we also inject.
+        let result = cmd_check_config_from(&path, true, |name| match name {
+            "RS_STELLAR_CORE_NODE_VALIDATOR" => Ok(Some("true".to_owned())),
+            "RS_STELLAR_CORE_NODE_SEED" => Ok(Some(
+                "SCZANGBA5YHTNYVVV3C7CAZMCLXPILHSE6PGYAGPZAB3VCQWSXNMM463".to_owned(),
+            )),
+            _ => Ok(None),
+        });
+
+        // Should pass validation with the injected overrides.
+        result.expect("config with injected validator override should pass validation");
     }
 }

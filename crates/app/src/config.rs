@@ -1764,20 +1764,42 @@ impl AppConfig {
         Ok(config)
     }
 
-    /// Apply environment variable overrides.
+    /// Apply environment variable overrides from the process environment.
     ///
     /// Fails immediately with a descriptive error if any set env var contains
     /// a value that cannot be parsed into the expected type. Unset variables
     /// are silently skipped.
     pub fn apply_env_overrides(&mut self) -> anyhow::Result<()> {
+        self.apply_env_overrides_from(env_var_opt)
+    }
+
+    /// Apply configuration overrides from an arbitrary key→value source.
+    ///
+    /// The `lookup` function is called once per supported override key. It
+    /// must return:
+    /// - `Ok(Some(value))` — the override is applied
+    /// - `Ok(None)` — no override for this key (skipped)
+    /// - `Err(e)` — lookup failed (e.g., non-UTF-8 value); propagated immediately
+    ///
+    /// ## Contract
+    /// - Overrides are applied in a fixed order: node, network, database,
+    ///   buckets, overlay, logging. This matches the struct field layout.
+    /// - **Fail-fast**: on the first `Err` from `lookup` or the first parse
+    ///   failure, the method returns immediately. Fields processed before the
+    ///   error retain their overridden values (partial mutation).
+    /// - This is the same behavior as `apply_env_overrides()`.
+    pub fn apply_env_overrides_from(
+        &mut self,
+        mut lookup: impl FnMut(&str) -> anyhow::Result<Option<String>>,
+    ) -> anyhow::Result<()> {
         // Node overrides
-        if let Some(val) = env_var_opt("RS_STELLAR_CORE_NODE_NAME")? {
+        if let Some(val) = lookup("RS_STELLAR_CORE_NODE_NAME")? {
             self.node.name = val;
         }
-        if let Some(val) = env_var_opt("RS_STELLAR_CORE_NODE_SEED")? {
+        if let Some(val) = lookup("RS_STELLAR_CORE_NODE_SEED")? {
             self.node.node_seed = Some(val);
         }
-        if let Some(val) = env_var_opt("RS_STELLAR_CORE_NODE_VALIDATOR")? {
+        if let Some(val) = lookup("RS_STELLAR_CORE_NODE_VALIDATOR")? {
             self.node.is_validator = val.parse::<bool>().with_context(|| {
                 format!(
                     "RS_STELLAR_CORE_NODE_VALIDATOR: invalid boolean '{val}', \
@@ -1787,22 +1809,22 @@ impl AppConfig {
         }
 
         // Network overrides
-        if let Some(val) = env_var_opt("RS_STELLAR_CORE_NETWORK_PASSPHRASE")? {
+        if let Some(val) = lookup("RS_STELLAR_CORE_NETWORK_PASSPHRASE")? {
             self.network.passphrase = val;
         }
 
         // Database overrides
-        if let Some(val) = env_var_opt("RS_STELLAR_CORE_DATABASE_PATH")? {
+        if let Some(val) = lookup("RS_STELLAR_CORE_DATABASE_PATH")? {
             self.database.path = PathBuf::from(val);
         }
 
         // Bucket overrides
-        if let Some(val) = env_var_opt("RS_STELLAR_CORE_BUCKETS_DIRECTORY")? {
+        if let Some(val) = lookup("RS_STELLAR_CORE_BUCKETS_DIRECTORY")? {
             self.buckets.directory = PathBuf::from(val);
         }
 
         // Overlay overrides
-        if let Some(val) = env_var_opt("RS_STELLAR_CORE_OVERLAY_PEER_PORT")? {
+        if let Some(val) = lookup("RS_STELLAR_CORE_OVERLAY_PEER_PORT")? {
             self.overlay.peer_port = val.parse::<u16>().with_context(|| {
                 format!(
                     "RS_STELLAR_CORE_OVERLAY_PEER_PORT: invalid port '{val}', \
@@ -1812,10 +1834,10 @@ impl AppConfig {
         }
 
         // Logging overrides
-        if let Some(val) = env_var_opt("RS_STELLAR_CORE_LOG_LEVEL")? {
+        if let Some(val) = lookup("RS_STELLAR_CORE_LOG_LEVEL")? {
             self.logging.level = val;
         }
-        if let Some(val) = env_var_opt("RS_STELLAR_CORE_LOG_FORMAT")? {
+        if let Some(val) = lookup("RS_STELLAR_CORE_LOG_FORMAT")? {
             self.logging.format = val;
         }
 
@@ -4223,69 +4245,53 @@ name = "test"
 
     // --- Environment override tests ---
     //
-    // These tests mutate process-global env vars, so they use a mutex to
-    // serialize and a guard to restore original values on exit (including panic).
+    // These tests use `apply_env_overrides_from()` with synthetic HashMaps,
+    // eliminating the need for process-global env mutation, mutexes, or guards.
 
-    use std::sync::Mutex;
+    use std::collections::HashMap;
 
-    static ENV_TEST_MUTEX: Mutex<()> = Mutex::new(());
-
-    /// RAII guard that restores an env var to its original state on drop.
-    struct EnvGuard {
-        vars: Vec<(String, Option<String>)>,
-    }
-
-    impl EnvGuard {
-        fn new(names: &[&str]) -> Self {
-            let vars = names
-                .iter()
-                .map(|&name| (name.to_owned(), std::env::var(name).ok()))
-                .collect();
-            Self { vars }
-        }
-    }
-
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            for (name, original) in &self.vars {
-                match original {
-                    Some(val) => std::env::set_var(name, val),
-                    None => std::env::remove_var(name),
-                }
-            }
-        }
+    /// Helper: create a lookup closure from a HashMap.
+    fn map_lookup(map: HashMap<&str, &str>) -> impl FnMut(&str) -> anyhow::Result<Option<String>> {
+        let owned: HashMap<String, String> = map
+            .into_iter()
+            .map(|(k, v)| (k.to_owned(), v.to_owned()))
+            .collect();
+        move |name: &str| Ok(owned.get(name).cloned())
     }
 
     #[test]
     fn test_env_override_valid_bool_true() {
-        let _lock = ENV_TEST_MUTEX.lock().unwrap();
-        let _guard = EnvGuard::new(&["RS_STELLAR_CORE_NODE_VALIDATOR"]);
-
-        std::env::set_var("RS_STELLAR_CORE_NODE_VALIDATOR", "true");
         let mut config = AppConfig::default();
-        config.apply_env_overrides().unwrap();
+        config
+            .apply_env_overrides_from(map_lookup(HashMap::from([(
+                "RS_STELLAR_CORE_NODE_VALIDATOR",
+                "true",
+            )])))
+            .unwrap();
         assert!(config.node.is_validator);
     }
 
     #[test]
     fn test_env_override_valid_bool_false() {
-        let _lock = ENV_TEST_MUTEX.lock().unwrap();
-        let _guard = EnvGuard::new(&["RS_STELLAR_CORE_NODE_VALIDATOR"]);
-
-        std::env::set_var("RS_STELLAR_CORE_NODE_VALIDATOR", "false");
         let mut config = AppConfig::default();
-        config.apply_env_overrides().unwrap();
+        config
+            .apply_env_overrides_from(map_lookup(HashMap::from([(
+                "RS_STELLAR_CORE_NODE_VALIDATOR",
+                "false",
+            )])))
+            .unwrap();
         assert!(!config.node.is_validator);
     }
 
     #[test]
     fn test_env_override_invalid_bool() {
-        let _lock = ENV_TEST_MUTEX.lock().unwrap();
-        let _guard = EnvGuard::new(&["RS_STELLAR_CORE_NODE_VALIDATOR"]);
-
-        std::env::set_var("RS_STELLAR_CORE_NODE_VALIDATOR", "tru");
         let mut config = AppConfig::default();
-        let err = config.apply_env_overrides().unwrap_err();
+        let err = config
+            .apply_env_overrides_from(map_lookup(HashMap::from([(
+                "RS_STELLAR_CORE_NODE_VALIDATOR",
+                "tru",
+            )])))
+            .unwrap_err();
         let msg = format!("{err:#}");
         assert!(
             msg.contains("RS_STELLAR_CORE_NODE_VALIDATOR"),
@@ -4295,23 +4301,25 @@ name = "test"
 
     #[test]
     fn test_env_override_valid_port() {
-        let _lock = ENV_TEST_MUTEX.lock().unwrap();
-        let _guard = EnvGuard::new(&["RS_STELLAR_CORE_OVERLAY_PEER_PORT"]);
-
-        std::env::set_var("RS_STELLAR_CORE_OVERLAY_PEER_PORT", "8080");
         let mut config = AppConfig::default();
-        config.apply_env_overrides().unwrap();
+        config
+            .apply_env_overrides_from(map_lookup(HashMap::from([(
+                "RS_STELLAR_CORE_OVERLAY_PEER_PORT",
+                "8080",
+            )])))
+            .unwrap();
         assert_eq!(config.overlay.peer_port, 8080);
     }
 
     #[test]
     fn test_env_override_invalid_port() {
-        let _lock = ENV_TEST_MUTEX.lock().unwrap();
-        let _guard = EnvGuard::new(&["RS_STELLAR_CORE_OVERLAY_PEER_PORT"]);
-
-        std::env::set_var("RS_STELLAR_CORE_OVERLAY_PEER_PORT", "abc");
         let mut config = AppConfig::default();
-        let err = config.apply_env_overrides().unwrap_err();
+        let err = config
+            .apply_env_overrides_from(map_lookup(HashMap::from([(
+                "RS_STELLAR_CORE_OVERLAY_PEER_PORT",
+                "abc",
+            )])))
+            .unwrap_err();
         let msg = format!("{err:#}");
         assert!(
             msg.contains("RS_STELLAR_CORE_OVERLAY_PEER_PORT"),
@@ -4321,12 +4329,13 @@ name = "test"
 
     #[test]
     fn test_env_override_port_overflow() {
-        let _lock = ENV_TEST_MUTEX.lock().unwrap();
-        let _guard = EnvGuard::new(&["RS_STELLAR_CORE_OVERLAY_PEER_PORT"]);
-
-        std::env::set_var("RS_STELLAR_CORE_OVERLAY_PEER_PORT", "99999");
         let mut config = AppConfig::default();
-        let err = config.apply_env_overrides().unwrap_err();
+        let err = config
+            .apply_env_overrides_from(map_lookup(HashMap::from([(
+                "RS_STELLAR_CORE_OVERLAY_PEER_PORT",
+                "99999",
+            )])))
+            .unwrap_err();
         let msg = format!("{err:#}");
         assert!(
             msg.contains("RS_STELLAR_CORE_OVERLAY_PEER_PORT"),
@@ -4336,31 +4345,74 @@ name = "test"
 
     #[test]
     fn test_env_override_port_zero() {
-        let _lock = ENV_TEST_MUTEX.lock().unwrap();
-        let _guard = EnvGuard::new(&["RS_STELLAR_CORE_OVERLAY_PEER_PORT"]);
-
         // Port 0 is valid u16 — semantic validation happens in validate()
-        std::env::set_var("RS_STELLAR_CORE_OVERLAY_PEER_PORT", "0");
         let mut config = AppConfig::default();
-        config.apply_env_overrides().unwrap();
+        config
+            .apply_env_overrides_from(map_lookup(HashMap::from([(
+                "RS_STELLAR_CORE_OVERLAY_PEER_PORT",
+                "0",
+            )])))
+            .unwrap();
         assert_eq!(config.overlay.peer_port, 0);
     }
 
     #[test]
     fn test_env_override_unset_is_noop() {
-        let _lock = ENV_TEST_MUTEX.lock().unwrap();
-        let _guard = EnvGuard::new(&[
-            "RS_STELLAR_CORE_NODE_VALIDATOR",
-            "RS_STELLAR_CORE_OVERLAY_PEER_PORT",
-        ]);
-
-        std::env::remove_var("RS_STELLAR_CORE_NODE_VALIDATOR");
-        std::env::remove_var("RS_STELLAR_CORE_OVERLAY_PEER_PORT");
         let mut config = AppConfig::default();
         let original_validator = config.node.is_validator;
         let original_port = config.overlay.peer_port;
-        config.apply_env_overrides().unwrap();
+        // Empty map — no overrides
+        config.apply_env_overrides_from(|_| Ok(None)).unwrap();
         assert_eq!(config.node.is_validator, original_validator);
         assert_eq!(config.overlay.peer_port, original_port);
+    }
+
+    #[test]
+    fn test_env_override_from_error_propagation() {
+        // Verify that a lookup error (e.g., non-UTF-8) propagates immediately.
+        let mut config = AppConfig::default();
+        let err = config
+            .apply_env_overrides_from(|name| {
+                if name == "RS_STELLAR_CORE_NODE_NAME" {
+                    anyhow::bail!("{name}: value is not valid UTF-8")
+                }
+                Ok(None)
+            })
+            .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("not valid UTF-8"),
+            "error should mention UTF-8: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_env_override_from_multiple_overrides_compose() {
+        let mut config = AppConfig::default();
+        config
+            .apply_env_overrides_from(map_lookup(HashMap::from([
+                ("RS_STELLAR_CORE_NODE_VALIDATOR", "true"),
+                ("RS_STELLAR_CORE_OVERLAY_PEER_PORT", "9999"),
+                ("RS_STELLAR_CORE_LOG_LEVEL", "debug"),
+                ("RS_STELLAR_CORE_NETWORK_PASSPHRASE", "Test Network"),
+            ])))
+            .unwrap();
+        assert!(config.node.is_validator);
+        assert_eq!(config.overlay.peer_port, 9999);
+        assert_eq!(config.logging.level, "debug");
+        assert_eq!(config.network.passphrase, "Test Network");
+    }
+
+    #[test]
+    fn test_env_override_from_empty_map_is_noop() {
+        let mut config = AppConfig::default();
+        let original = AppConfig::default();
+        config
+            .apply_env_overrides_from(map_lookup(HashMap::new()))
+            .unwrap();
+        assert_eq!(config.node.is_validator, original.node.is_validator);
+        assert_eq!(config.overlay.peer_port, original.overlay.peer_port);
+        assert_eq!(config.logging.level, original.logging.level);
+        assert_eq!(config.network.passphrase, original.network.passphrase);
     }
 }
