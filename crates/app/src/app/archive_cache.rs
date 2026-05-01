@@ -469,18 +469,14 @@ impl ArchiveCheckpointCache {
     }
 
     fn maybe_spawn_refresh(self: &Arc<Self>) {
-        // CAS: exactly one refresh runs at a time.
-        if self
-            .refreshing
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
+        let Some(guard) = RefreshGuard::try_acquire(self) else {
             tracing::debug!("Archive checkpoint refresh already in flight; not spawning another");
             return;
-        }
+        };
 
         let this = Arc::clone(self);
         tokio::spawn(async move {
+            let _guard = guard;
             let fetcher = Arc::clone(&*this.background_fetcher.read());
             let fut = async { fetcher.fetch().await };
             let refresh_start = Instant::now();
@@ -518,9 +514,37 @@ impl ArchiveCheckpointCache {
                     );
                 }
             }
-
-            this.refreshing.store(false, Ordering::Release);
         });
+    }
+}
+
+/// RAII guard that clears the `refreshing` flag on drop, ensuring the flag is
+/// released even if the refresh task panics or is cancelled.
+struct RefreshGuard {
+    cache: Arc<ArchiveCheckpointCache>,
+}
+
+impl RefreshGuard {
+    /// Attempt to acquire the refresh permit via CAS. Returns `Some(Self)` if
+    /// the flag was successfully set from `false` to `true`.
+    fn try_acquire(cache: &Arc<ArchiveCheckpointCache>) -> Option<Self> {
+        if cache
+            .refreshing
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            Some(Self {
+                cache: Arc::clone(cache),
+            })
+        } else {
+            None
+        }
+    }
+}
+
+impl Drop for RefreshGuard {
+    fn drop(&mut self) {
+        self.cache.refreshing.store(false, Ordering::Release);
     }
 }
 
@@ -545,6 +569,8 @@ mod tests {
         BlockThenOk { gate: Arc<Notify>, checkpoint: u32 },
         /// Block forever. Use to exercise the refresh timeout.
         Hang,
+        /// Panic inside the fetch call. Use to exercise the RAII guard.
+        Panic,
     }
 
     #[async_trait]
@@ -563,6 +589,9 @@ mod tests {
                     let gate = Notify::new();
                     gate.notified().await;
                     unreachable!("gate should never fire")
+                }
+                MockResponse::Panic => {
+                    panic!("simulated panic in refresh task")
                 }
             }
         }
@@ -985,6 +1014,63 @@ mod tests {
             val,
             CacheResult::Stale(128),
             "seed_stale should populate a cold cache"
+        );
+    }
+
+    /// RefreshGuard clears the `refreshing` flag even when the refresh task
+    /// panics, and a subsequent refresh can run successfully.
+    #[tokio::test]
+    async fn test_refresh_guard_cleared_on_panic() {
+        let (cache, fetcher) = mk_cache(MockResponse::Panic);
+
+        // Trigger a refresh — the task will panic inside fetch().
+        cache.maybe_spawn_refresh();
+
+        // Wait for the spawned task to complete (panic + unwind + guard drop).
+        for _ in 0..200 {
+            if !cache.is_refreshing() {
+                break;
+            }
+            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            !cache.is_refreshing(),
+            "refreshing flag must be cleared after panic"
+        );
+        assert_eq!(
+            fetcher.call_count.load(Ordering::SeqCst),
+            1,
+            "first refresh task did execute"
+        );
+
+        // Replace the fetcher with one that succeeds.
+        let ok_fetcher = Arc::new(MockFetcher {
+            call_count: AtomicUsize::new(0),
+            response: Arc::new(MockResponse::Ok(42)),
+        });
+        cache.set_background_fetcher(ok_fetcher.clone() as Arc<dyn ArchiveCheckpointFetcher>);
+
+        // Trigger a second refresh — must succeed now that the flag is cleared.
+        cache.maybe_spawn_refresh();
+
+        for _ in 0..200 {
+            if !cache.is_refreshing() {
+                break;
+            }
+            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(!cache.is_refreshing(), "second refresh completed");
+        assert_eq!(
+            ok_fetcher.call_count.load(Ordering::SeqCst),
+            1,
+            "second refresh task executed"
+        );
+        assert_eq!(
+            cache.get_cached(),
+            CacheResult::Fresh(42),
+            "cache updated by second refresh"
         );
     }
 }
