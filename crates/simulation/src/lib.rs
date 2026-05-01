@@ -508,7 +508,7 @@ impl Simulation {
         timeout: Duration,
     ) -> anyhow::Result<()> {
         let deadline = tokio::time::Instant::now() + timeout;
-        while tokio::time::Instant::now() < deadline {
+        loop {
             let mut connected = true;
             for id in self.running_apps.keys() {
                 if self.app_peer_count(id).await.unwrap_or(0) < min_peers {
@@ -518,6 +518,9 @@ impl Simulation {
             }
             if connected {
                 return Ok(());
+            }
+            if tokio::time::Instant::now() >= deadline {
+                break;
             }
             tokio::time::sleep(
                 Duration::from_millis(100).min(deadline - tokio::time::Instant::now()),
@@ -562,7 +565,7 @@ impl Simulation {
         timeout: Duration,
     ) -> anyhow::Result<()> {
         let deadline = tokio::time::Instant::now() + timeout;
-        while tokio::time::Instant::now() < deadline {
+        loop {
             if let Err(err) = self.repair_app_tcp_connectivity().await {
                 if !err.to_string().contains("overlay not started") {
                     return Err(err);
@@ -576,6 +579,9 @@ impl Simulation {
                 .is_ok()
             {
                 return Ok(());
+            }
+            if tokio::time::Instant::now() >= deadline {
+                break;
             }
             let remaining = deadline.duration_since(tokio::time::Instant::now());
             tokio::time::sleep(Duration::from_millis(100).min(remaining)).await;
