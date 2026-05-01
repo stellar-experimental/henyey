@@ -1071,7 +1071,7 @@ impl App {
                 LocalNode::new_mainnet(self.keypair.clone())
             };
         local_node.listening_port = self.config.overlay.peer_port;
-        if let Some(hash) = self.config.build.commit_hash.as_deref() {
+        if let Some(hash) = self.config.build.commit_hash() {
             local_node.set_commit_hash(hash);
         }
 

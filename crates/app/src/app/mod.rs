@@ -2098,8 +2098,8 @@ impl App {
 
         AppInfo {
             version: env!("CARGO_PKG_VERSION").to_string(),
-            commit_hash: self.config.build.commit_hash.clone(),
-            build_timestamp: self.config.build.build_timestamp.clone(),
+            commit_hash: self.config.build.commit_hash().map(|s| s.to_string()),
+            build_timestamp: self.config.build.build_timestamp().map(|s| s.to_string()),
             node_name: self.config.node.name.clone(),
             public_key: self.keypair.public_key().to_strkey(),
             network_passphrase: self.config.network.passphrase.clone(),

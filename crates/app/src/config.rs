@@ -1450,10 +1450,10 @@ fn default_snapshot_frequency_secs() -> u64 {
 pub struct BuildMetadata {
     /// Git commit hash (from `git rev-parse HEAD`).
     /// `None` when the build system could not determine the commit.
-    pub commit_hash: Option<String>,
+    commit_hash: Option<String>,
     /// Build timestamp in ISO 8601 format.
     /// `None` when the build system did not record a timestamp.
-    pub build_timestamp: Option<String>,
+    build_timestamp: Option<String>,
 }
 
 impl BuildMetadata {
@@ -1470,6 +1470,16 @@ impl BuildMetadata {
             commit_hash: normalize(commit_hash.into()),
             build_timestamp: normalize(build_timestamp.into()),
         }
+    }
+
+    /// Returns the git commit hash, or `None` if unavailable.
+    pub fn commit_hash(&self) -> Option<&str> {
+        self.commit_hash.as_deref()
+    }
+
+    /// Returns the build timestamp, or `None` if unavailable.
+    pub fn build_timestamp(&self) -> Option<&str> {
+        self.build_timestamp.as_deref()
     }
 }
 
@@ -4438,31 +4448,28 @@ name = "test"
     #[test]
     fn test_build_metadata_default_is_none() {
         let meta = BuildMetadata::default();
-        assert_eq!(meta.commit_hash, None);
-        assert_eq!(meta.build_timestamp, None);
+        assert_eq!(meta.commit_hash(), None);
+        assert_eq!(meta.build_timestamp(), None);
     }
 
     #[test]
     fn test_build_metadata_new_normalizes_empty() {
         let meta = BuildMetadata::new("", "");
-        assert_eq!(meta.commit_hash, None);
-        assert_eq!(meta.build_timestamp, None);
+        assert_eq!(meta.commit_hash(), None);
+        assert_eq!(meta.build_timestamp(), None);
     }
 
     #[test]
     fn test_build_metadata_new_normalizes_whitespace() {
         let meta = BuildMetadata::new("   ", "\t\n");
-        assert_eq!(meta.commit_hash, None);
-        assert_eq!(meta.build_timestamp, None);
+        assert_eq!(meta.commit_hash(), None);
+        assert_eq!(meta.build_timestamp(), None);
     }
 
     #[test]
     fn test_build_metadata_new_preserves_values() {
         let meta = BuildMetadata::new("a".repeat(40), "2024-01-01T00:00:00Z");
-        assert_eq!(meta.commit_hash.as_deref(), Some("a".repeat(40).as_str()));
-        assert_eq!(
-            meta.build_timestamp.as_deref(),
-            Some("2024-01-01T00:00:00Z")
-        );
+        assert_eq!(meta.commit_hash(), Some("a".repeat(40).as_str()));
+        assert_eq!(meta.build_timestamp(), Some("2024-01-01T00:00:00Z"));
     }
 }

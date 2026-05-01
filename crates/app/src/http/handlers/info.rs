@@ -304,7 +304,7 @@ mod tests {
     use tower::ServiceExt;
 
     use crate::app::App;
-    use crate::config::ConfigBuilder;
+    use crate::config::{BuildMetadata, ConfigBuilder};
     use crate::http::{build_router, ServerState};
 
     /// Build a `ServerState` backed by a real (minimal) `App` with the given
@@ -314,10 +314,10 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp dir");
         let db_path = dir.path().join("test.db");
         let mut config = ConfigBuilder::new().database_path(db_path).build();
-        config.build.commit_hash = if commit_hash.is_empty() {
-            None
+        config.build = if commit_hash.is_empty() {
+            BuildMetadata::default()
         } else {
-            Some(commit_hash.to_string())
+            BuildMetadata::new(commit_hash, "")
         };
 
         let app = App::new(config).await.unwrap();
