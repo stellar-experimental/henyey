@@ -831,33 +831,6 @@ impl App {
             return;
         }
 
-        let base_fee_limit = self.ledger_manager.current_header().base_fee as i64;
-        let base_fee_ok = match &gen_tx_set {
-            GeneralizedTransactionSet::V1(v1) => {
-                let classic_ok = match &v1.phases[0] {
-                    TransactionPhase::V0(components) => components.iter().all(|component| {
-                        let TxSetComponent::TxsetCompTxsMaybeDiscountedFee(comp) = component;
-                        comp.base_fee.map_or(true, |fee| fee >= base_fee_limit)
-                    }),
-                    _ => false,
-                };
-                let soroban_ok = match &v1.phases[1] {
-                    TransactionPhase::V1(parallel) => {
-                        parallel.base_fee.map_or(true, |fee| fee >= base_fee_limit)
-                    }
-                    TransactionPhase::V0(components) => components.iter().all(|component| {
-                        let TxSetComponent::TxsetCompTxsMaybeDiscountedFee(comp) = component;
-                        comp.base_fee.map_or(true, |fee| fee >= base_fee_limit)
-                    }),
-                };
-                classic_ok && soroban_ok
-            }
-        };
-        if !base_fee_ok {
-            tracing::warn!(hash = %hash, base_fee = base_fee_limit, "GeneralizedTxSet base fee below ledger base fee");
-            return;
-        }
-
         let network_id = NetworkId(self.network_id());
         let mut classic_count = 0usize;
         let mut soroban_count = 0usize;
