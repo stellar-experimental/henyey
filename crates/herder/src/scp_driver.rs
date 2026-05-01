@@ -4713,8 +4713,7 @@ mod tests {
             .unwrap(),
         });
         let gen_hash = Hash256::hash_xdr(&gen);
-        let gen_set =
-            TransactionSet::with_generalized(Hash256::ZERO, gen_hash, fee_priority_order, gen);
+        let gen_set = TransactionSet::new_generalized(gen_hash, gen);
 
         // The generalized tx set has a generalized_tx_set field
         assert!(gen_set.generalized_tx_set().is_some());
@@ -5422,7 +5421,7 @@ mod compare_tx_sets_tests {
         });
 
         let hash = Hash256::hash_xdr(&gen);
-        TransactionSet::with_generalized(Hash256::ZERO, hash, vec![tx], gen)
+        TransactionSet::new_generalized(hash, gen)
     }
 
     // =========================================================================
@@ -5779,7 +5778,7 @@ mod compare_tx_sets_tests {
             .unwrap(),
         });
         let hash = Hash256::hash_xdr(&gen);
-        let tx_set = TransactionSet::with_generalized(Hash256::ZERO, hash, vec![tx1, tx2], gen);
+        let tx_set = TransactionSet::new_generalized(hash, gen);
 
         let total = ScpDriver::tx_set_total_fees(&tx_set);
         assert_eq!(

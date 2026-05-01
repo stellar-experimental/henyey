@@ -14,9 +14,7 @@ use henyey_common::Hash256;
 use henyey_herder::{AccountProvider, FeeBalanceProvider, Herder};
 use henyey_ledger::LedgerManager;
 use henyey_overlay::{PeerId, ScpQueueCallback};
-use stellar_xdr::curr::{
-    Hash, LedgerUpgrade, ReadXdr, TopologyResponseBodyV2, TransactionEnvelope, UpgradeType,
-};
+use stellar_xdr::curr::{Hash, LedgerUpgrade, ReadXdr, TopologyResponseBodyV2, UpgradeType};
 
 use crate::survey::SurveyPhase;
 
@@ -1121,42 +1119,6 @@ impl FeeBalanceProvider for SnapshotValidationProviders {
 }
 
 // ── Free functions ─────────────────────────────────────────────────────
-
-/// Extract the previous ledger hash and transactions from a `GeneralizedTransactionSet`.
-///
-/// This avoids duplicating the phase/component traversal in every call site
-/// that receives a `GeneralizedTransactionSet` from the network.
-pub(super) fn extract_txs_from_generalized(
-    gen_tx_set: &stellar_xdr::curr::GeneralizedTransactionSet,
-) -> (henyey_common::Hash256, Vec<TransactionEnvelope>) {
-    use stellar_xdr::curr::{GeneralizedTransactionSet, TransactionPhase, TxSetComponent};
-
-    let prev_hash = match gen_tx_set {
-        GeneralizedTransactionSet::V1(v1) => {
-            henyey_common::Hash256::from_bytes(v1.previous_ledger_hash.0)
-        }
-    };
-    let transactions = match gen_tx_set {
-        GeneralizedTransactionSet::V1(v1) => v1
-            .phases
-            .iter()
-            .flat_map(|phase| match phase {
-                TransactionPhase::V0(components) => components
-                    .iter()
-                    .flat_map(|component| match component {
-                        TxSetComponent::TxsetCompTxsMaybeDiscountedFee(comp) => comp.txs.to_vec(),
-                    })
-                    .collect::<Vec<_>>(),
-                TransactionPhase::V1(parallel) => parallel
-                    .execution_stages
-                    .iter()
-                    .flat_map(|stage| stage.0.iter().flat_map(|cluster| cluster.0.to_vec()))
-                    .collect(),
-            })
-            .collect(),
-    };
-    (prev_hash, transactions)
-}
 
 pub(super) fn decode_upgrades(upgrades: Vec<UpgradeType>) -> Vec<LedgerUpgrade> {
     upgrades

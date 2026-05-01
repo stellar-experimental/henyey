@@ -129,14 +129,11 @@ function build_generalized_tx_set_with_starting_seq(
 
   hash = SHA256(xdr_encode(gen_tx_set))
 
-  tx_set = TransactionSet.with_generalized(
-    previous_ledger_hash, hash,
-    selected.transactions, gen_tx_set
-  )
+  tx_set = TransactionSet.new_generalized(hash, gen_tx_set)
   → (tx_set, gen_tx_set)
 ```
 
-**Calls:** [`build_parallel_soroban_phase`](../parallel_tx_set_builder.pc.md#build_parallel_soroban_phase), [`stages_to_xdr_phase`](../parallel_tx_set_builder.pc.md#stages_to_xdr_phase), [`TransactionSet::new`](tx_set.pc.md#new), [`TransactionSet::with_generalized`](tx_set.pc.md#with_generalized)
+**Calls:** [`build_parallel_soroban_phase`](../parallel_tx_set_builder.pc.md#build_parallel_soroban_phase), [`stages_to_xdr_phase`](../parallel_tx_set_builder.pc.md#stages_to_xdr_phase), [`TransactionSet::new`](tx_set.pc.md#new), [`TransactionSet::new_generalized`](tx_set.pc.md#new_generalized)
 
 ### select_transactions_with_starting_seq
 

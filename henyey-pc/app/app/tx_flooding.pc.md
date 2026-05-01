@@ -351,8 +351,7 @@ for each tx in transactions:
 GUARD classic_count == phases[0] tx count → return
 GUARD soroban_count == phases[1] tx count → return
 
-internal_tx_set = TransactionSet.with_generalized(
-  prev_hash, hash, transactions, gen_tx_set)
+internal_tx_set = TransactionSet.new_generalized(hash, gen_tx_set)
 remove hash from tx_set_dont_have
 remove hash from tx_set_last_request
 

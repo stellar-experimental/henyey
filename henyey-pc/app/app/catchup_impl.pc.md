@@ -278,10 +278,7 @@ async function cache_messages_during_catchup_impl(message_rx):
   while msg = message_rx.recv():
     if msg is GeneralizedTxSet(gen_tx_set):
       hash = sha256(xdr_encode(gen_tx_set))
-      prev_hash = gen_tx_set.previous_ledger_hash
-      transactions = extract_transactions(gen_tx_set)
-      tx_set = TransactionSet.with_generalized(prev_hash, hash,
-                                                transactions, gen_tx_set)
+      tx_set = TransactionSet.new_generalized(hash, gen_tx_set)
       herder.cache_tx_set(tx_set)
       cached_tx_sets += 1
 

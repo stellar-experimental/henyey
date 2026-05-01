@@ -95,21 +95,14 @@ impl TransactionSet {
         }
     }
 
-    /// Build a generalized tx set from wire/archive data.
+    /// Construct a generalized transaction set from a precomputed hash and body.
     ///
-    /// Hash is the SHA-256 of the XDR encoding (caller-provided).
-    /// `previous_ledger_hash` is extracted from `GeneralizedTransactionSet::V1`.
-    pub(crate) fn from_wire_generalized(
-        hash: Hash256,
-        generalized_tx_set: GeneralizedTransactionSet,
-    ) -> Self {
-        Self {
-            hash,
-            body: TxSetBody::Generalized(generalized_tx_set),
-        }
-    }
-
-    /// Build a generalized tx set from selection (internal construction).
+    /// Stores the caller-provided hash/body pair without validating hash/body
+    /// consistency or structural well-formedness. Hash must be the SHA-256 of the
+    /// XDR-encoded `GeneralizedTransactionSet`.
+    ///
+    /// This follows "store first, validate later" semantics consistent with
+    /// the receive-layer parity model.
     pub fn new_generalized(hash: Hash256, generalized_tx_set: GeneralizedTransactionSet) -> Self {
         Self {
             hash,
@@ -133,18 +126,6 @@ impl TransactionSet {
         transactions: Vec<TransactionEnvelope>,
     ) -> Self {
         Self::from_wire_legacy(previous_ledger_hash, hash, transactions)
-    }
-
-    /// Alias for `from_wire_generalized` (ignores redundant previous_ledger_hash
-    /// and transactions args — they are derived from the generalized body).
-    #[doc(hidden)]
-    pub fn with_generalized(
-        _previous_ledger_hash: Hash256,
-        hash: Hash256,
-        _transactions: Vec<TransactionEnvelope>,
-        generalized_tx_set: GeneralizedTransactionSet,
-    ) -> Self {
-        Self::from_wire_generalized(hash, generalized_tx_set)
     }
 
     // ── Accessors ─────────────────────────────────────────────────────
@@ -1979,5 +1960,33 @@ mod tests {
             prepared.check_valid(&header, 0, NetworkId::testnet(), None, None, None),
             "legacy set on protocol 19 should pass check_valid"
         );
+    }
+
+    #[test]
+    fn test_new_generalized_stores_hash_and_body() {
+        let tx = make_tx_envelope(1, 100);
+        let gen = GeneralizedTransactionSet::V1(TransactionSetV1 {
+            previous_ledger_hash: Hash([0xAA; 32]),
+            phases: vec![TransactionPhase::V0(
+                vec![TxSetComponent::TxsetCompTxsMaybeDiscountedFee(
+                    TxSetComponentTxsMaybeDiscountedFee {
+                        base_fee: Some(100),
+                        txs: vec![tx].try_into().unwrap(),
+                    },
+                )]
+                .try_into()
+                .unwrap(),
+            )]
+            .try_into()
+            .unwrap(),
+        });
+        let hash = Hash256::hash_xdr(&gen);
+
+        let tx_set = TransactionSet::new_generalized(hash, gen.clone());
+
+        assert_eq!(tx_set.hash(), &hash);
+        assert!(tx_set.is_generalized());
+        assert_eq!(tx_set.generalized_tx_set(), Some(&gen));
+        assert!(tx_set.as_legacy_transactions().is_none());
     }
 }

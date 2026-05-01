@@ -1039,16 +1039,7 @@ impl App {
                     };
                     let hash = henyey_common::Hash256::hash(&xdr_bytes);
 
-                    // Extract transactions from the GeneralizedTxSet
-                    let (prev_hash, transactions) =
-                        super::extract_txs_from_generalized(&gen_tx_set);
-
-                    let tx_set = henyey_herder::TransactionSet::with_generalized(
-                        prev_hash,
-                        hash,
-                        transactions,
-                        gen_tx_set,
-                    );
+                    let tx_set = henyey_herder::TransactionSet::new_generalized(hash, gen_tx_set);
 
                     // Cache it in herder and drain ready envelopes off the
                     // event loop (this will be available after catchup).

@@ -61,14 +61,13 @@ function with_hash(previous_ledger_hash, hash, transactions):
     }
 ```
 
-### with_generalized
+### new_generalized
 
 ```
-function with_generalized(previous_ledger_hash, hash,
-                          transactions, gen_tx_set):
+function new_generalized(hash, gen_tx_set):
   → TransactionSet {
-      hash, previous_ledger_hash, transactions,
-      generalized_tx_set: gen_tx_set
+      hash,
+      body: Generalized(gen_tx_set)
     }
 ```
 
