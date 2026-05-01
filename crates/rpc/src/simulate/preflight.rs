@@ -62,7 +62,11 @@ pub(super) fn run_invoke_simulation(
                     &snapshot_rc,
                     &recording_result.ledger_changes,
                     &ledger_info,
-                );
+                )
+                .map_err(|e| {
+                    tracing::warn!(error = %e, "state diff extraction failed");
+                    "state diff extraction failed".to_string()
+                })?;
 
                 Ok(InvokeSimulationOutput {
                     recording_result,
@@ -89,7 +93,7 @@ fn extract_modified_entries(
     snapshot: &BucketListSnapshotSource,
     ledger_changes: &[soroban_host::e2e_invoke::LedgerEntryChange],
     ledger_info: &soroban_host::LedgerInfo,
-) -> Vec<LedgerEntryDiff> {
+) -> Result<Vec<LedgerEntryDiff>, String> {
     let mut diffs = Vec::new();
 
     for change in ledger_changes {
@@ -97,39 +101,34 @@ fn extract_modified_entries(
             continue;
         }
 
-        let key = match LedgerKey::from_xdr(&change.encoded_key, Limits::none()) {
-            Ok(k) => k,
-            Err(e) => {
-                tracing::warn!(error = ?e, "failed to decode LedgerKey from change, skipping");
-                continue;
-            }
-        };
+        let key = LedgerKey::from_xdr(&change.encoded_key, Limits::none())
+            .map_err(|e| format!("failed to decode LedgerKey from change: {e}"))?;
 
         // Get state before: re-query the snapshot for the entry
-        let state_before = if let Some((entry, live_until)) = snapshot.get_unfiltered(&key) {
-            // Check if entry is expired
-            if let Some(lu) = live_until {
-                if lu < ledger_info.sequence_number {
-                    None // expired = treated as non-existent
+        let state_before = match snapshot
+            .get_unfiltered(&key)
+            .map_err(|e| format!("bucket list lookup failed for state diff: {e}"))?
+        {
+            Some((entry, live_until)) => {
+                if let Some(lu) = live_until {
+                    if lu < ledger_info.sequence_number {
+                        None // expired = treated as non-existent
+                    } else {
+                        Some(entry)
+                    }
                 } else {
                     Some(entry)
                 }
-            } else {
-                Some(entry)
             }
-        } else {
-            None
+            None => None,
         };
 
         // Get state after: decode from encoded_new_value
         let state_after = match change.encoded_new_value.as_ref() {
-            Some(v) => match stellar_xdr::curr::LedgerEntry::from_xdr(v, Limits::none()) {
-                Ok(e) => Some(e),
-                Err(err) => {
-                    tracing::warn!(error = ?err, "failed to decode new LedgerEntry from change, skipping");
-                    continue;
-                }
-            },
+            Some(v) => Some(
+                stellar_xdr::curr::LedgerEntry::from_xdr(v, Limits::none())
+                    .map_err(|e| format!("failed to decode new LedgerEntry from change: {e}"))?,
+            ),
             None => None,
         };
 
@@ -145,7 +144,7 @@ fn extract_modified_entries(
         });
     }
 
-    diffs
+    Ok(diffs)
 }
 
 // ---------------------------------------------------------------------------
@@ -181,7 +180,11 @@ fn resolve_entry(
     let durability = get_key_durability(&p25_key)
         .ok_or_else(|| "only contract data/code entries have TTL".to_string())?;
 
-    let Some((entry, live_until)) = snapshot.get_unfiltered(key) else {
+    let Some((entry, live_until)) = snapshot.get_unfiltered(key).map_err(|e| {
+        tracing::warn!(error = %e, "bucket list lookup failed in resolve_entry");
+        "bucket list lookup failed".to_string()
+    })?
+    else {
         return Ok(None);
     };
 

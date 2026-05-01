@@ -49,11 +49,16 @@ impl BucketListSnapshotSource {
     /// Returns the entry and its TTL regardless of whether the entry is expired.
     /// Used for ExtendTTL and Restore simulation where we need access to
     /// archived/expired entries.
-    pub(crate) fn get_unfiltered(&self, key: &LedgerKey) -> Option<(LedgerEntry, Option<u32>)> {
-        let live_until = get_entry_ttl(&self.snapshot, key).ok()?;
-        let mut entry = self.snapshot.load_result(key).ok()??;
+    pub(crate) fn get_unfiltered(
+        &self,
+        key: &LedgerKey,
+    ) -> henyey_bucket::Result<Option<(LedgerEntry, Option<u32>)>> {
+        let live_until = get_entry_ttl(&self.snapshot, key)?;
+        let Some(mut entry) = self.snapshot.load_result(key)? else {
+            return Ok(None);
+        };
         normalize_entry(&mut entry);
-        Some((entry, live_until))
+        Ok(Some((entry, live_until)))
     }
 }
 
