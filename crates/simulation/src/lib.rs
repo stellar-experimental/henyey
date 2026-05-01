@@ -519,7 +519,10 @@ impl Simulation {
             if connected {
                 return Ok(());
             }
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            tokio::time::sleep(
+                Duration::from_millis(100).min(deadline - tokio::time::Instant::now()),
+            )
+            .await;
         }
         let mut counts = Vec::new();
         for id in self.running_apps.keys() {
