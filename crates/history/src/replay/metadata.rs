@@ -208,8 +208,11 @@ mod tests {
     use super::*;
     use henyey_common::Hash256;
     use stellar_xdr::curr::{
-        GeneralizedTransactionSet, Hash, StateArchivalSettings, TransactionResultSet,
-        TransactionSetV1, VecM, WriteXdr,
+        AccountEntry, AccountEntryExt, AccountId, ExtensionPoint, GeneralizedTransactionSet, Hash,
+        LedgerEntryChange, LedgerEntryChanges, LedgerEntryData, LedgerEntryExt, OperationMeta,
+        OperationMetaV2, PublicKey, SequenceNumber, StateArchivalSettings, String32, Thresholds,
+        TransactionMetaV1, TransactionMetaV2, TransactionMetaV3, TransactionMetaV4,
+        TransactionResultSet, TransactionSetV1, Uint256, VecM, WriteXdr,
     };
 
     use super::super::tests::{make_empty_tx_set, make_header_with_hashes, make_test_header};
@@ -315,5 +318,413 @@ mod tests {
         let result = replay_ledger(&header, &tx_set, &tx_results, &tx_metas, &config).unwrap();
         assert_eq!(result.tx_count, 0);
         assert_eq!(result.op_count, 0);
+    }
+
+    // --- Helpers for extract_ledger_changes tests ---
+
+    fn make_account_entry(id_byte: u8) -> LedgerEntry {
+        LedgerEntry {
+            last_modified_ledger_seq: 0,
+            data: LedgerEntryData::Account(AccountEntry {
+                account_id: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([id_byte; 32]))),
+                balance: 0,
+                seq_num: SequenceNumber(0),
+                num_sub_entries: 0,
+                inflation_dest: None,
+                flags: 0,
+                home_domain: String32::default(),
+                thresholds: Thresholds([0; 4]),
+                signers: vec![].try_into().unwrap(),
+                ext: AccountEntryExt::V0,
+            }),
+            ext: LedgerEntryExt::V0,
+        }
+    }
+
+    fn changes(entries: Vec<LedgerEntryChange>) -> LedgerEntryChanges {
+        entries.try_into().unwrap()
+    }
+
+    fn make_v0_meta(ops: Vec<Vec<LedgerEntryChange>>) -> TransactionMeta {
+        let op_metas: Vec<OperationMeta> = ops
+            .into_iter()
+            .map(|op_changes| OperationMeta {
+                changes: changes(op_changes),
+            })
+            .collect();
+        TransactionMeta::V0(op_metas.try_into().unwrap())
+    }
+
+    fn make_v1_meta(
+        tx_changes: Vec<LedgerEntryChange>,
+        ops: Vec<Vec<LedgerEntryChange>>,
+    ) -> TransactionMeta {
+        let op_metas: Vec<OperationMeta> = ops
+            .into_iter()
+            .map(|op_changes| OperationMeta {
+                changes: changes(op_changes),
+            })
+            .collect();
+        TransactionMeta::V1(TransactionMetaV1 {
+            tx_changes: changes(tx_changes),
+            operations: op_metas.try_into().unwrap(),
+        })
+    }
+
+    fn make_v2_meta(
+        before: Vec<LedgerEntryChange>,
+        ops: Vec<Vec<LedgerEntryChange>>,
+        after: Vec<LedgerEntryChange>,
+    ) -> TransactionMeta {
+        let op_metas: Vec<OperationMeta> = ops
+            .into_iter()
+            .map(|op_changes| OperationMeta {
+                changes: changes(op_changes),
+            })
+            .collect();
+        TransactionMeta::V2(TransactionMetaV2 {
+            tx_changes_before: changes(before),
+            operations: op_metas.try_into().unwrap(),
+            tx_changes_after: changes(after),
+        })
+    }
+
+    fn make_v3_meta(
+        before: Vec<LedgerEntryChange>,
+        ops: Vec<Vec<LedgerEntryChange>>,
+        after: Vec<LedgerEntryChange>,
+    ) -> TransactionMeta {
+        let op_metas: Vec<OperationMeta> = ops
+            .into_iter()
+            .map(|op_changes| OperationMeta {
+                changes: changes(op_changes),
+            })
+            .collect();
+        TransactionMeta::V3(TransactionMetaV3 {
+            ext: ExtensionPoint::V0,
+            tx_changes_before: changes(before),
+            operations: op_metas.try_into().unwrap(),
+            tx_changes_after: changes(after),
+            soroban_meta: None,
+        })
+    }
+
+    fn make_v4_meta(
+        before: Vec<LedgerEntryChange>,
+        ops: Vec<Vec<LedgerEntryChange>>,
+        after: Vec<LedgerEntryChange>,
+    ) -> TransactionMeta {
+        let op_metas: Vec<OperationMetaV2> = ops
+            .into_iter()
+            .map(|op_changes| OperationMetaV2 {
+                ext: ExtensionPoint::V0,
+                changes: changes(op_changes),
+                events: vec![].try_into().unwrap(),
+            })
+            .collect();
+        TransactionMeta::V4(TransactionMetaV4 {
+            ext: ExtensionPoint::V0,
+            tx_changes_before: changes(before),
+            operations: op_metas.try_into().unwrap(),
+            tx_changes_after: changes(after),
+            soroban_meta: None,
+            events: vec![].try_into().unwrap(),
+            diagnostic_events: vec![].try_into().unwrap(),
+        })
+    }
+
+    fn created(entry: LedgerEntry) -> LedgerEntryChange {
+        LedgerEntryChange::Created(entry)
+    }
+
+    fn updated(entry: LedgerEntry) -> LedgerEntryChange {
+        LedgerEntryChange::Updated(entry)
+    }
+
+    fn removed(key: LedgerKey) -> LedgerEntryChange {
+        LedgerEntryChange::Removed(key)
+    }
+
+    fn restored(entry: LedgerEntry) -> LedgerEntryChange {
+        LedgerEntryChange::Restored(entry)
+    }
+
+    fn state(entry: LedgerEntry) -> LedgerEntryChange {
+        LedgerEntryChange::State(entry)
+    }
+
+    fn key_for(entry: &LedgerEntry) -> LedgerKey {
+        henyey_common::entry_to_key(entry)
+    }
+
+    // --- Tests for extract_ledger_changes: categorization ---
+
+    #[test]
+    fn test_extract_ledger_changes_created_goes_to_init() {
+        let entry = make_account_entry(1);
+        let meta = make_v4_meta(vec![created(entry.clone())], vec![], vec![]);
+        let (init, live, dead) = extract_ledger_changes(&[meta]).unwrap();
+        assert_eq!(init, vec![entry]);
+        assert!(live.is_empty());
+        assert!(dead.is_empty());
+    }
+
+    #[test]
+    fn test_extract_ledger_changes_updated_goes_to_live() {
+        let entry = make_account_entry(1);
+        let meta = make_v4_meta(vec![updated(entry.clone())], vec![], vec![]);
+        let (init, live, dead) = extract_ledger_changes(&[meta]).unwrap();
+        assert!(init.is_empty());
+        assert_eq!(live, vec![entry]);
+        assert!(dead.is_empty());
+    }
+
+    #[test]
+    fn test_extract_ledger_changes_removed_goes_to_dead() {
+        let entry = make_account_entry(1);
+        let key = key_for(&entry);
+        let meta = make_v4_meta(vec![removed(key.clone())], vec![], vec![]);
+        let (init, live, dead) = extract_ledger_changes(&[meta]).unwrap();
+        assert!(init.is_empty());
+        assert!(live.is_empty());
+        assert_eq!(dead, vec![key]);
+    }
+
+    #[test]
+    fn test_extract_ledger_changes_restored_goes_to_live() {
+        let entry = make_account_entry(1);
+        let meta = make_v4_meta(vec![restored(entry.clone())], vec![], vec![]);
+        let (init, live, dead) = extract_ledger_changes(&[meta]).unwrap();
+        assert!(init.is_empty());
+        assert_eq!(live, vec![entry]);
+        assert!(dead.is_empty());
+    }
+
+    #[test]
+    fn test_extract_ledger_changes_state_is_ignored() {
+        let entry = make_account_entry(1);
+        let meta = make_v4_meta(vec![state(entry)], vec![], vec![]);
+        let (init, live, dead) = extract_ledger_changes(&[meta]).unwrap();
+        assert!(init.is_empty());
+        assert!(live.is_empty());
+        assert!(dead.is_empty());
+    }
+
+    // --- Tests for extract_ledger_changes: all 5 variants ---
+
+    #[test]
+    fn test_extract_ledger_changes_v0_operations() {
+        let entry_a = make_account_entry(1);
+        let entry_b = make_account_entry(2);
+        let meta = make_v0_meta(vec![
+            vec![created(entry_a.clone())],
+            vec![updated(entry_b.clone())],
+        ]);
+        let (init, live, dead) = extract_ledger_changes(&[meta]).unwrap();
+        assert_eq!(init, vec![entry_a]);
+        assert_eq!(live, vec![entry_b]);
+        assert!(dead.is_empty());
+    }
+
+    #[test]
+    fn test_extract_ledger_changes_v1_tx_changes_then_operations() {
+        let entry_tx = make_account_entry(1);
+        let entry_op = make_account_entry(2);
+        let meta = make_v1_meta(
+            vec![created(entry_tx.clone())],
+            vec![vec![updated(entry_op.clone())]],
+        );
+        let (init, live, _) = extract_ledger_changes(&[meta]).unwrap();
+        assert_eq!(init, vec![entry_tx]);
+        assert_eq!(live, vec![entry_op]);
+    }
+
+    #[test]
+    fn test_extract_ledger_changes_v2_before_ops_after() {
+        let entry_before = make_account_entry(1);
+        let entry_op = make_account_entry(2);
+        let entry_after = make_account_entry(3);
+        let meta = make_v2_meta(
+            vec![created(entry_before.clone())],
+            vec![vec![updated(entry_op.clone())]],
+            vec![created(entry_after.clone())],
+        );
+        let (init, live, _) = extract_ledger_changes(&[meta]).unwrap();
+        assert_eq!(init, vec![entry_before, entry_after]);
+        assert_eq!(live, vec![entry_op]);
+    }
+
+    #[test]
+    fn test_extract_ledger_changes_v3_before_ops_after() {
+        let entry_before = make_account_entry(1);
+        let entry_op = make_account_entry(2);
+        let entry_after = make_account_entry(3);
+        let meta = make_v3_meta(
+            vec![created(entry_before.clone())],
+            vec![vec![updated(entry_op.clone())]],
+            vec![created(entry_after.clone())],
+        );
+        let (init, live, _) = extract_ledger_changes(&[meta]).unwrap();
+        assert_eq!(init, vec![entry_before, entry_after]);
+        assert_eq!(live, vec![entry_op]);
+    }
+
+    #[test]
+    fn test_extract_ledger_changes_v4_before_ops_after() {
+        let entry_before = make_account_entry(1);
+        let entry_op = make_account_entry(2);
+        let entry_after = make_account_entry(3);
+        let meta = make_v4_meta(
+            vec![created(entry_before.clone())],
+            vec![vec![updated(entry_op.clone())]],
+            vec![created(entry_after.clone())],
+        );
+        let (init, live, _) = extract_ledger_changes(&[meta]).unwrap();
+        assert_eq!(init, vec![entry_before, entry_after]);
+        assert_eq!(live, vec![entry_op]);
+    }
+
+    // --- Tests for ordering preservation ---
+
+    #[test]
+    fn test_extract_ledger_changes_all_meta_variants_ordered() {
+        let entry_v0 = make_account_entry(0);
+        let entry_v1 = make_account_entry(1);
+        let entry_v2 = make_account_entry(2);
+        let entry_v3 = make_account_entry(3);
+        let entry_v4 = make_account_entry(4);
+
+        let metas = vec![
+            make_v0_meta(vec![vec![created(entry_v0.clone())]]),
+            make_v1_meta(vec![created(entry_v1.clone())], vec![]),
+            make_v2_meta(vec![created(entry_v2.clone())], vec![], vec![]),
+            make_v3_meta(vec![created(entry_v3.clone())], vec![], vec![]),
+            make_v4_meta(vec![created(entry_v4.clone())], vec![], vec![]),
+        ];
+
+        let (init, _, _) = extract_ledger_changes(&metas).unwrap();
+        assert_eq!(init, vec![entry_v0, entry_v1, entry_v2, entry_v3, entry_v4]);
+    }
+
+    #[test]
+    fn test_extract_ledger_changes_ordering_within_v4() {
+        // V4: tx_changes_before → operations → tx_changes_after
+        let entry_b = make_account_entry(1);
+        let entry_op1 = make_account_entry(2);
+        let entry_op2 = make_account_entry(3);
+        let entry_a = make_account_entry(4);
+        let meta = make_v4_meta(
+            vec![created(entry_b.clone())],
+            vec![
+                vec![created(entry_op1.clone())],
+                vec![created(entry_op2.clone())],
+            ],
+            vec![created(entry_a.clone())],
+        );
+        let (init, _, _) = extract_ledger_changes(&[meta]).unwrap();
+        assert_eq!(init, vec![entry_b, entry_op1, entry_op2, entry_a]);
+    }
+
+    #[test]
+    fn test_extract_ledger_changes_ordering_within_v1() {
+        // V1: tx_changes → operations (in op order)
+        let entry_tx = make_account_entry(1);
+        let entry_op1 = make_account_entry(2);
+        let entry_op2 = make_account_entry(3);
+        let meta = make_v1_meta(
+            vec![created(entry_tx.clone())],
+            vec![
+                vec![created(entry_op1.clone())],
+                vec![created(entry_op2.clone())],
+            ],
+        );
+        let (init, _, _) = extract_ledger_changes(&[meta]).unwrap();
+        assert_eq!(init, vec![entry_tx, entry_op1, entry_op2]);
+    }
+
+    // --- Edge cases ---
+
+    #[test]
+    fn test_extract_ledger_changes_empty_input() {
+        let (init, live, dead) = extract_ledger_changes(&[]).unwrap();
+        assert!(init.is_empty());
+        assert!(live.is_empty());
+        assert!(dead.is_empty());
+    }
+
+    #[test]
+    fn test_extract_ledger_changes_mixed_categories() {
+        // All change types in one meta, verifying correct categorization
+        let entry_created = make_account_entry(1);
+        let entry_updated = make_account_entry(2);
+        let entry_removed = make_account_entry(3);
+        let entry_restored = make_account_entry(4);
+        let entry_state = make_account_entry(5);
+
+        let key_removed = key_for(&entry_removed);
+
+        let meta = make_v4_meta(
+            vec![
+                created(entry_created.clone()),
+                updated(entry_updated.clone()),
+                removed(key_removed.clone()),
+                restored(entry_restored.clone()),
+                state(entry_state),
+            ],
+            vec![],
+            vec![],
+        );
+        let (init, live, dead) = extract_ledger_changes(&[meta]).unwrap();
+        assert_eq!(init, vec![entry_created]);
+        assert_eq!(live, vec![entry_updated, entry_restored]);
+        assert_eq!(dead, vec![key_removed]);
+    }
+
+    #[test]
+    fn test_extract_ledger_changes_multiple_metas_accumulate() {
+        // Changes from multiple tx metas are accumulated in order
+        let entry_a = make_account_entry(1);
+        let entry_b = make_account_entry(2);
+        let entry_c = make_account_entry(3);
+
+        let metas = vec![
+            make_v4_meta(vec![created(entry_a.clone())], vec![], vec![]),
+            make_v4_meta(vec![created(entry_b.clone())], vec![], vec![]),
+            make_v4_meta(vec![created(entry_c.clone())], vec![], vec![]),
+        ];
+        let (init, _, _) = extract_ledger_changes(&metas).unwrap();
+        assert_eq!(init, vec![entry_a, entry_b, entry_c]);
+    }
+
+    #[test]
+    fn test_extract_ledger_changes_v0_multiple_changes_per_operation() {
+        let entry_a = make_account_entry(1);
+        let entry_b = make_account_entry(2);
+        let meta = make_v0_meta(vec![vec![
+            created(entry_a.clone()),
+            updated(entry_b.clone()),
+        ]]);
+        let (init, live, _) = extract_ledger_changes(&[meta]).unwrap();
+        assert_eq!(init, vec![entry_a]);
+        assert_eq!(live, vec![entry_b]);
+    }
+
+    #[test]
+    fn test_extract_ledger_changes_v2_ordering_before_ops_after() {
+        // V2: tx_changes_before → operations → tx_changes_after
+        let entry_b = make_account_entry(1);
+        let entry_op1 = make_account_entry(2);
+        let entry_op2 = make_account_entry(3);
+        let entry_a = make_account_entry(4);
+        let meta = make_v2_meta(
+            vec![created(entry_b.clone())],
+            vec![
+                vec![created(entry_op1.clone())],
+                vec![created(entry_op2.clone())],
+            ],
+            vec![created(entry_a.clone())],
+        );
+        let (init, _, _) = extract_ledger_changes(&[meta]).unwrap();
+        assert_eq!(init, vec![entry_b, entry_op1, entry_op2, entry_a]);
     }
 }
