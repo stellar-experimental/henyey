@@ -124,12 +124,6 @@ impl LedgerChanges {
         }
     }
 
-    fn push_all(&mut self, changes: &stellar_xdr::curr::LedgerEntryChanges) {
-        for change in changes.iter() {
-            self.push(change);
-        }
-    }
-
     fn into_tuple(self) -> (Vec<LedgerEntry>, Vec<LedgerEntry>, Vec<LedgerKey>) {
         (self.init, self.live, self.dead)
     }
@@ -139,44 +133,7 @@ pub(crate) fn extract_ledger_changes(
     tx_metas: &[TransactionMeta],
 ) -> Result<(Vec<LedgerEntry>, Vec<LedgerEntry>, Vec<LedgerKey>)> {
     let mut changes = LedgerChanges::new();
-
-    for meta in tx_metas {
-        match meta {
-            TransactionMeta::V0(operations) => {
-                for op_meta in operations.iter() {
-                    changes.push_all(&op_meta.changes);
-                }
-            }
-            TransactionMeta::V1(v1) => {
-                changes.push_all(&v1.tx_changes);
-                for op_changes in v1.operations.iter() {
-                    changes.push_all(&op_changes.changes);
-                }
-            }
-            TransactionMeta::V2(v2) => {
-                changes.push_all(&v2.tx_changes_before);
-                for op in v2.operations.iter() {
-                    changes.push_all(&op.changes);
-                }
-                changes.push_all(&v2.tx_changes_after);
-            }
-            TransactionMeta::V3(v3) => {
-                changes.push_all(&v3.tx_changes_before);
-                for op in v3.operations.iter() {
-                    changes.push_all(&op.changes);
-                }
-                changes.push_all(&v3.tx_changes_after);
-            }
-            TransactionMeta::V4(v4) => {
-                changes.push_all(&v4.tx_changes_before);
-                for op in v4.operations.iter() {
-                    changes.push_all(&op.changes);
-                }
-                changes.push_all(&v4.tx_changes_after);
-            }
-        }
-    }
-
+    crate::meta_walk::for_each_change(tx_metas, |change| changes.push(change));
     Ok(changes.into_tuple())
 }
 

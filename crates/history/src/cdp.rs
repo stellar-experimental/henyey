@@ -999,14 +999,11 @@ pub fn extract_evicted_keys(meta: &LedgerCloseMeta) -> Vec<stellar_xdr::curr::Le
 pub fn extract_restored_keys(
     tx_metas: &[stellar_xdr::curr::TransactionMeta],
 ) -> Vec<stellar_xdr::curr::LedgerKey> {
-    use stellar_xdr::curr::{LedgerEntryChange, TransactionMeta};
+    use stellar_xdr::curr::LedgerEntryChange;
 
     let mut restored_keys = Vec::new();
 
-    fn process_change(
-        change: &LedgerEntryChange,
-        restored_keys: &mut Vec<stellar_xdr::curr::LedgerKey>,
-    ) {
+    crate::meta_walk::for_each_change(tx_metas, |change| {
         if let LedgerEntryChange::Restored(entry) = change {
             let key = henyey_common::entry_to_key(entry);
             // Only CONTRACT_DATA and CONTRACT_CODE keys go to hot archive.
@@ -1016,49 +1013,7 @@ pub fn extract_restored_keys(
                 restored_keys.push(key);
             }
         }
-    }
-
-    /// Process tx_changes_before, operations, and tx_changes_after for V2+.
-    macro_rules! process_v2_plus {
-        ($v:expr, $out:expr) => {{
-            for change in $v.tx_changes_before.iter() {
-                process_change(change, $out);
-            }
-            for op_changes in $v.operations.iter() {
-                for change in op_changes.changes.iter() {
-                    process_change(change, $out);
-                }
-            }
-            for change in $v.tx_changes_after.iter() {
-                process_change(change, $out);
-            }
-        }};
-    }
-
-    for meta in tx_metas {
-        match meta {
-            TransactionMeta::V0(operations) => {
-                for op_meta in operations.iter() {
-                    for change in op_meta.changes.iter() {
-                        process_change(change, &mut restored_keys);
-                    }
-                }
-            }
-            TransactionMeta::V1(v1) => {
-                for change in v1.tx_changes.iter() {
-                    process_change(change, &mut restored_keys);
-                }
-                for op_changes in v1.operations.iter() {
-                    for change in op_changes.changes.iter() {
-                        process_change(change, &mut restored_keys);
-                    }
-                }
-            }
-            TransactionMeta::V2(v) => process_v2_plus!(v, &mut restored_keys),
-            TransactionMeta::V3(v) => process_v2_plus!(v, &mut restored_keys),
-            TransactionMeta::V4(v) => process_v2_plus!(v, &mut restored_keys),
-        }
-    }
+    });
 
     restored_keys
 }

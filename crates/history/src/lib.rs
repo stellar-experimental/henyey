@@ -112,6 +112,9 @@ pub mod verify;
 // Comparison and validation
 pub mod compare;
 
+// Shared helpers
+mod meta_walk;
+
 // Publishing and external data sources
 pub mod cdp;
 pub mod checkpoint_builder;
