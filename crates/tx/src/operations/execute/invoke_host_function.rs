@@ -21,11 +21,6 @@ use crate::state::LedgerStateManager;
 use crate::validation::LedgerContext;
 use crate::{Result, TxError};
 
-/// Check if a ledger key is for a Soroban entry.
-pub(crate) fn is_soroban_key(key: &LedgerKey) -> bool {
-    matches!(key, LedgerKey::ContractData(_) | LedgerKey::ContractCode(_))
-}
-
 /// Check if a key was already created in the delta (by a previous TX in this ledger).
 ///
 /// This is used for hot archive restoration to distinguish between:
@@ -642,7 +637,7 @@ fn disk_read_bytes_exceeded(
 
     // Helper to meter a single entry
     let meter_entry = |key: &LedgerKey, total: &mut u32| -> Result<bool> {
-        let entry: Option<LedgerEntry> = if is_soroban_key(key) {
+        let entry: Option<LedgerEntry> = if henyey_common::is_soroban_key(key) {
             lookup_soroban_entry_or_hot_archive(state, key, current_ledger, guarded_hot_archive)?
         } else {
             state.get_entry(key)
@@ -687,12 +682,12 @@ fn disk_read_bytes_exceeded(
         }
     } else {
         for key in soroban_data.resources.footprint.read_only.iter() {
-            if !is_soroban_key(key) && meter_and_check(key)? {
+            if !henyey_common::is_soroban_key(key) && meter_and_check(key)? {
                 return Ok(true);
             }
         }
         for key in soroban_data.resources.footprint.read_write.iter() {
-            if !is_soroban_key(key) && meter_and_check(key)? {
+            if !henyey_common::is_soroban_key(key) && meter_and_check(key)? {
                 return Ok(true);
             }
         }
@@ -705,7 +700,7 @@ fn disk_read_bytes_exceeded(
                     .read_write
                     .get(*index as usize)
                 {
-                    if !is_soroban_key(key) {
+                    if !henyey_common::is_soroban_key(key) {
                         continue;
                     }
                     // Match stellar-core behavior: only meter archived entries that are
@@ -900,7 +895,7 @@ fn apply_soroban_storage_changes(
     // stellar-core uses releaseAssertOrThrow (fires in all builds), so we use
     // assert! (not debug_assert!) to match — never fail silently.
     for key in &created_keys {
-        if is_soroban_key(key) {
+        if henyey_common::is_soroban_key(key) {
             // Soroban entries must have a corresponding TTL entry also created
             let key_hash = crate::soroban::get_or_compute_key_hash(ttl_key_cache, key);
             let ttl_key = LedgerKey::Ttl(stellar_xdr::curr::LedgerKeyTtl { key_hash });
@@ -1379,14 +1374,7 @@ fn is_archived_contract_entry(
 ) -> crate::Result<bool> {
     // Only persistent Soroban entries can be "archived".
     // Temporary entries just disappear when expired.
-    let is_persistent_soroban = match key {
-        LedgerKey::ContractData(cd) => {
-            cd.durability == stellar_xdr::curr::ContractDataDurability::Persistent
-        }
-        LedgerKey::ContractCode(_) => true,
-        _ => false,
-    };
-    if !is_persistent_soroban {
+    if !henyey_common::is_persistent_key(key) {
         return Ok(false);
     }
 

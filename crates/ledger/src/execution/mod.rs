@@ -2962,20 +2962,13 @@ impl PriorStageState {
             deleted_keys: delta
                 .dead_entries()
                 .into_iter()
-                .filter(is_soroban_key)
+                // Filter to in-memory Soroban state keys (ContractData, ContractCode, Ttl).
+                // Mirrors stellar-core InMemorySorobanState::isInMemoryType.
+                .filter(crate::soroban_state::InMemorySorobanState::is_in_memory_type)
                 .collect(),
             hot_archive_restored_keys,
         }
     }
-}
-
-/// Returns true if a LedgerKey is a Soroban entry type (ContractData,
-/// ContractCode, or Ttl) relevant for parallel Soroban execution state.
-pub(crate) fn is_soroban_key(key: &LedgerKey) -> bool {
-    matches!(
-        key,
-        LedgerKey::ContractData(_) | LedgerKey::ContractCode(_) | LedgerKey::Ttl(_)
-    )
 }
 
 /// Parameters specific to a single cluster or stage within the parallel phase.

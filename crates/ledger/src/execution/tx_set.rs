@@ -500,12 +500,14 @@ fn pre_parallel_apply(
     for entry in delta.current_entries() {
         executor.state.load_entry(entry);
     }
-    // Only propagate Soroban key deletions — classic deletions are irrelevant
-    // for parallel Soroban execution (classic entries are loaded from snapshot).
+    // Only propagate in-memory Soroban state key deletions (ContractData,
+    // ContractCode, Ttl) — classic deletions are irrelevant for parallel
+    // Soroban execution (classic entries are loaded from snapshot).
+    // Mirrors stellar-core InMemorySorobanState::isInMemoryType.
     for key in delta
         .dead_entries()
         .iter()
-        .filter(|k| super::is_soroban_key(k))
+        .filter(|k| crate::soroban_state::InMemorySorobanState::is_in_memory_type(k))
     {
         executor.state.mark_entry_deleted(key);
     }

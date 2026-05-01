@@ -27,9 +27,9 @@
 //!
 //! This module also provides helper functions for Soroban state archival:
 //!
-//! - [`is_soroban_entry`]: Check if an entry is ContractData or ContractCode
-//! - [`is_temporary_entry`]: Check if a ContractData entry is temporary
-//! - [`is_persistent_entry`]: Check if an entry is persistent (archived on eviction)
+//! - [`is_soroban_entry`](henyey_common::is_soroban_entry): Check if an entry is ContractData or ContractCode
+//! - [`is_temporary_entry`](henyey_common::is_temporary_entry): Check if a ContractData entry is temporary
+//! - [`is_persistent_entry`](henyey_common::is_persistent_entry): Check if an entry is persistent (archived on eviction)
 //! - [`get_ttl_key`]: Get the TTL key for a Soroban entry
 //! - [`is_ttl_expired`]: Check if a TTL entry has expired
 
@@ -37,8 +37,8 @@ use std::cmp::Ordering;
 
 use sha2::{Digest, Sha256};
 use stellar_xdr::curr::{
-    BucketEntryType, ContractDataDurability, Hash, LedgerEntry, LedgerEntryData, LedgerKey,
-    LedgerKeyTtl, Limits, ReadXdr, WriteXdr,
+    BucketEntryType, Hash, LedgerEntry, LedgerEntryData, LedgerKey, LedgerKeyTtl, Limits, ReadXdr,
+    WriteXdr,
 };
 
 use crate::{BucketError, Result};
@@ -187,81 +187,9 @@ pub fn compare_entries(a: &BucketEntry, b: &BucketEntry) -> Ordering {
 // These functions support the incremental eviction scan for Soroban entries.
 // Soroban uses a time-to-live (TTL) mechanism where entries expire and must
 // be either deleted (temporary) or archived (persistent).
-
-/// Check if a ledger entry is a Soroban entry (ContractData or ContractCode).
-///
-/// Soroban entries are the only entry types subject to eviction and state
-/// archival. They have associated TTL entries that track when they expire.
-///
-/// # Returns
-///
-/// `true` if the entry is `ContractData` or `ContractCode`, `false` otherwise.
-pub fn is_soroban_entry(entry: &LedgerEntry) -> bool {
-    matches!(
-        entry.data,
-        LedgerEntryData::ContractData(_) | LedgerEntryData::ContractCode(_)
-    )
-}
-
-/// Check if a ledger key is for a Soroban entry.
-pub fn is_soroban_key(key: &LedgerKey) -> bool {
-    matches!(key, LedgerKey::ContractData(_) | LedgerKey::ContractCode(_))
-}
-
-/// Check if a ledger entry is a temporary Soroban entry.
-///
-/// Temporary entries (ContractData with `Temporary` durability) are deleted
-/// immediately on eviction and are NOT archived to the hot archive bucket list.
-///
-/// # Use Case
-///
-/// Temporary data is used for values that don't need to persist across
-/// archival, such as caches or ephemeral state.
-pub fn is_temporary_entry(entry: &LedgerEntry) -> bool {
-    if let LedgerEntryData::ContractData(data) = &entry.data {
-        data.durability == ContractDataDurability::Temporary
-    } else {
-        false
-    }
-}
-
-/// Check if a ledger entry is a persistent Soroban entry.
-///
-/// Persistent entries (ContractCode or ContractData with `Persistent` durability)
-/// are archived to the hot archive bucket list on eviction. They can later be
-/// restored to the live bucket list by paying for additional TTL.
-///
-/// # Persistent Entry Types
-///
-/// - All `ContractCode` entries (WASM code is always persistent)
-/// - `ContractData` entries with `Persistent` durability
-pub fn is_persistent_entry(entry: &LedgerEntry) -> bool {
-    match &entry.data {
-        LedgerEntryData::ContractCode(_) => true,
-        LedgerEntryData::ContractData(data) => {
-            data.durability == ContractDataDurability::Persistent
-        }
-        _ => false,
-    }
-}
-
-/// Check if a ledger key is for a persistent Soroban entry.
-///
-/// This is the key-based counterpart to [`is_persistent_entry`]. It checks
-/// whether the key refers to a `ContractCode` entry (always persistent) or a
-/// `ContractData` entry with `Persistent` durability.
-///
-/// # Returns
-///
-/// `true` if the key is for a persistent Soroban entry, `false` otherwise.
-/// Returns `false` for `Temporary` contract data and all non-Soroban keys.
-pub fn is_persistent_key(key: &LedgerKey) -> bool {
-    match key {
-        LedgerKey::ContractCode(_) => true,
-        LedgerKey::ContractData(data) => data.durability == ContractDataDurability::Persistent,
-        _ => false,
-    }
-}
+//
+// Classification helpers (is_soroban_entry, is_soroban_key, is_temporary_entry,
+// is_persistent_entry, is_persistent_key) are in henyey_common::ledger_type_utils.
 
 /// Get the TTL key for a Soroban entry.
 ///
@@ -279,7 +207,7 @@ pub fn is_persistent_key(key: &LedgerKey) -> bool {
 /// - `Some(LedgerKey::Ttl)` with the key hash for Soroban entries
 /// - `None` for non-Soroban entries (they don't have TTL)
 pub fn get_ttl_key(key: &LedgerKey) -> Option<LedgerKey> {
-    if !is_soroban_key(key) {
+    if !henyey_common::is_soroban_key(key) {
         return None;
     }
 

@@ -55,10 +55,7 @@ use henyey_common::{BucketListDbConfig, Hash256};
 
 use crate::bucket::Bucket;
 use crate::cache::CacheStats;
-use crate::entry::{
-    get_ttl_key, is_persistent_entry, is_soroban_entry, is_temporary_entry, is_ttl_expired,
-    BucketEntry, BucketEntryExt,
-};
+use crate::entry::{get_ttl_key, is_ttl_expired, BucketEntry, BucketEntryExt};
 use crate::eviction::{
     update_starting_eviction_iterator, EvictionCandidate, EvictionIterator, EvictionIteratorExt,
     EvictionResult,
@@ -76,6 +73,7 @@ use crate::metrics::MergeCounters;
 use crate::{
     protocol_version_is_before, protocol_version_starts_from, BucketError, ProtocolVersion, Result,
 };
+use henyey_common::{is_persistent_entry, is_soroban_entry, is_temporary_entry};
 
 /// Number of levels in the BucketList (matches stellar-core's `kNumLevels`).
 pub const BUCKET_LIST_LEVELS: usize = 11;

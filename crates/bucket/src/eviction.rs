@@ -84,9 +84,8 @@ use stellar_xdr::curr::{LedgerEntry, LedgerKey, StateArchivalSettings};
 
 use crate::bucket::Bucket;
 use crate::bucket_list::BUCKET_LIST_LEVELS;
-use crate::entry::{
-    get_ttl_key, is_soroban_entry, is_temporary_entry, is_ttl_expired, BucketEntry,
-};
+use crate::entry::{get_ttl_key, is_ttl_expired, BucketEntry};
+use henyey_common::{is_soroban_entry, is_temporary_entry};
 
 /// Default eviction scan size in bytes per ledger (100 KB).
 pub const DEFAULT_EVICTION_SCAN_SIZE: u32 = 100_000;

@@ -72,7 +72,7 @@ pub(crate) fn execute_restore_footprint(
     }
 
     for key in footprint.read_write.iter() {
-        if !is_persistent_entry(key) {
+        if !henyey_common::is_persistent_key(key) {
             return Ok(make_result(RestoreFootprintResultCode::Malformed));
         }
     }
@@ -170,17 +170,6 @@ pub(crate) fn execute_restore_footprint(
     }
 
     Ok(make_result(RestoreFootprintResultCode::Success))
-}
-
-fn is_persistent_entry(key: &LedgerKey) -> bool {
-    match key {
-        LedgerKey::ContractCode(_) => true,
-        LedgerKey::ContractData(cd) => matches!(
-            cd.durability,
-            stellar_xdr::curr::ContractDataDurability::Persistent
-        ),
-        _ => false,
-    }
 }
 
 /// Compute XDR-serialized size of a ledger entry.

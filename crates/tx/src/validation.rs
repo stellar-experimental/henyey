@@ -41,8 +41,7 @@
 use henyey_common::{asset::is_asset_valid, Hash256, NetworkId};
 use henyey_crypto::{PublicKey, Signature};
 use stellar_xdr::curr::{
-    AccountEntry, ContractDataDurability, DecoratedSignature, LedgerKey, OperationBody,
-    Preconditions, SignerKey, TransactionEnvelope,
+    AccountEntry, DecoratedSignature, OperationBody, Preconditions, SignerKey, TransactionEnvelope,
 };
 
 use crate::fee_bump::{validate_fee_bump, FeeBumpError, FeeBumpFrame};
@@ -50,22 +49,6 @@ use crate::frame::TransactionFrame;
 
 /// stellar-core: TransactionFrame.cpp:65 — MAX_RESOURCE_FEE = 2^50
 pub(crate) const MAX_RESOURCE_FEE: i64 = 1i64 << 50;
-
-/// Check if a ledger key is a Soroban entry (ContractData or ContractCode).
-/// Mirrors stellar-core: LedgerTypeUtils.h:isSorobanEntry
-fn is_soroban_entry(key: &LedgerKey) -> bool {
-    matches!(key, LedgerKey::ContractData(_) | LedgerKey::ContractCode(_))
-}
-
-/// Check if a ledger key is a persistent Soroban entry.
-/// Mirrors stellar-core: LedgerTypeUtils.h:isPersistentEntry
-fn is_persistent_entry(key: &LedgerKey) -> bool {
-    match key {
-        LedgerKey::ContractCode(_) => true,
-        LedgerKey::ContractData(d) => d.durability == ContractDataDurability::Persistent,
-        _ => false,
-    }
-}
 
 /// Ledger context for transaction validation and execution.
 ///
@@ -603,7 +586,7 @@ fn validate_soroban_resources(
                 ));
             };
 
-            if !is_archivable_soroban_key(key) {
+            if !henyey_common::is_persistent_key(key) {
                 return Err(ValidationError::InvalidStructure(
                     "archived soroban entry must be a persistent contract entry".to_string(),
                 ));
@@ -647,16 +630,6 @@ fn validate_soroban_resources(
     }
 
     Ok(())
-}
-
-fn is_archivable_soroban_key(key: &stellar_xdr::curr::LedgerKey) -> bool {
-    use stellar_xdr::curr::{ContractDataDurability, LedgerKey};
-
-    match key {
-        LedgerKey::ContractData(cd) => cd.durability == ContractDataDurability::Persistent,
-        LedgerKey::ContractCode(_) => true,
-        _ => false,
-    }
 }
 
 /// Validate fee bump-specific rules.
@@ -1097,7 +1070,7 @@ pub fn check_valid_pre_seq_num_with_config(
                         ));
                     }
                     for key in fp.read_write.iter() {
-                        if !is_persistent_entry(key) {
+                        if !henyey_common::is_persistent_key(key) {
                             return Err(PreSeqNumError::SorobanInvalid(
                                 "RestoreFootprint: only persistent Soroban entries can be restored"
                                     .to_string(),
@@ -1114,7 +1087,7 @@ pub fn check_valid_pre_seq_num_with_config(
                         ));
                     }
                     for key in fp.read_only.iter() {
-                        if !is_soroban_entry(key) {
+                        if !henyey_common::is_soroban_key(key) {
                             return Err(PreSeqNumError::SorobanInvalid(
                                 "ExtendFootprintTtl: only Soroban entries can have TTL extended"
                                     .to_string(),

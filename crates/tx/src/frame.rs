@@ -837,10 +837,6 @@ pub fn envelope_sequence_number(envelope: &TransactionEnvelope) -> i64 {
     }
 }
 
-pub fn is_soroban_ledger_key(key: &LedgerKey) -> bool {
-    matches!(key, LedgerKey::ContractData(_) | LedgerKey::ContractCode(_))
-}
-
 pub fn soroban_disk_read_entries(
     resources: &stellar_xdr::curr::SorobanResources,
     ext: Option<&SorobanTransactionDataExt>,
@@ -857,12 +853,12 @@ pub fn soroban_disk_read_entries(
 
     let mut count = 0i64;
     for key in resources.footprint.read_only.iter() {
-        if !is_soroban_ledger_key(key) {
+        if !henyey_common::is_soroban_key(key) {
             count += 1;
         }
     }
     for key in resources.footprint.read_write.iter() {
-        if !is_soroban_ledger_key(key) {
+        if !henyey_common::is_soroban_key(key) {
             count += 1;
         }
     }

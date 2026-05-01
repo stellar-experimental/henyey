@@ -62,7 +62,7 @@ pub(crate) fn execute_extend_footprint_ttl(
     }
 
     for key in footprint.read_only.iter() {
-        if !super::invoke_host_function::is_soroban_key(key) {
+        if !henyey_common::is_soroban_key(key) {
             return Ok(make_result(ExtendFootprintTtlResultCode::Malformed));
         }
     }
