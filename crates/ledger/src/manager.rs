@@ -923,14 +923,25 @@ impl crate::EntryReader for PairsReader<'_> {
 
 /// Build a `SorobanRentConfig` from any entry reader.
 ///
-/// All three config entries (CPU cost params, memory cost params, compute limits)
-/// are required once Soroban is active. Missing or wrong-subtype entries produce
-/// an error, matching stellar-core's `releaseAssertOrThrow` on config corruption.
+/// Returns `Ok(None)` if the config entries are absent (bucket list not yet
+/// populated with Soroban config — e.g. empty bucket list during test fixtures
+/// or initialization). Returns `Ok(Some(...))` when all three entries are
+/// present. Returns `Err(...)` on wrong-variant (data corruption) or
+/// inconsistent state (some entries present, others absent).
+///
+/// This mirrors the probe pattern in `load_soroban_network_info` (config.rs:396)
+/// where absence is distinguished from corruption.
 fn build_soroban_rent_config(
     reader: &impl crate::EntryReader,
-) -> Result<crate::soroban_state::SorobanRentConfig> {
-    use crate::execution::require_config;
+) -> Result<Option<crate::soroban_state::SorobanRentConfig>> {
+    use crate::execution::{load_config_setting, require_config};
 
+    // Probe: if the first key is absent, config is not populated yet.
+    if load_config_setting(reader, ConfigSettingId::ContractCostParamsCpuInstructions)?.is_none() {
+        return Ok(None);
+    }
+
+    // First key exists — all three must be present (mixed state = corruption).
     let cpu_params = require_config(
         reader,
         ConfigSettingId::ContractCostParamsCpuInstructions,
@@ -970,18 +981,18 @@ fn build_soroban_rent_config(
         "build_soroban_rent_config",
     )?;
 
-    Ok(crate::soroban_state::SorobanRentConfig {
+    Ok(Some(crate::soroban_state::SorobanRentConfig {
         cpu_cost_params: cpu_params,
         mem_cost_params: mem_params,
         tx_max_instructions: compute.tx_max_instructions as u64,
         tx_max_memory_bytes: compute.tx_memory_limit as u64,
-    })
+    }))
 }
 
 /// Compute Soroban rent config from pre-extracted bucket level pairs via point lookups.
 fn compute_soroban_rent_config_from_pairs(
     level_pairs: &[(Arc<henyey_bucket::Bucket>, Arc<henyey_bucket::Bucket>)],
-) -> Result<crate::soroban_state::SorobanRentConfig> {
+) -> Result<Option<crate::soroban_state::SorobanRentConfig>> {
     build_soroban_rent_config(&PairsReader(level_pairs))
 }
 
@@ -1017,7 +1028,7 @@ pub fn scan_level_pairs_for_caches(
     // caller's thread context — for the startup path it runs inside spawn_blocking,
     // keeping the tokio thread unblocked.
     let rent_config = if soroban_enabled {
-        Some(compute_soroban_rent_config_from_pairs(&level_pairs)?)
+        compute_soroban_rent_config_from_pairs(&level_pairs)?
     } else {
         None
     };
@@ -1799,10 +1810,11 @@ impl LedgerManager {
     }
 
     /// Load Soroban rent config from bucket list for code size calculation.
+    /// Returns `None` if config entries are not present (empty/pre-init state).
     fn load_soroban_rent_config(
         &self,
         bucket_list: &BucketList,
-    ) -> Result<crate::soroban_state::SorobanRentConfig> {
+    ) -> Result<Option<crate::soroban_state::SorobanRentConfig>> {
         build_soroban_rent_config(&BucketListReader(bucket_list))
     }
 
@@ -4290,83 +4302,87 @@ impl LedgerCloseContext<'_> {
             && protocol_version >= henyey_common::MIN_SOROBAN_PROTOCOL_VERSION
         {
             // Load rent config through CloseLedgerState (sees post-upgrade values).
-            let rent_config = build_soroban_rent_config(&self.ltx)?;
-
-            // Recompute contract code sizes with new cost params
-            {
-                let mut soroban_state = self.manager.soroban_state.write();
-                let code_size_before = soroban_state.contract_code_state_size();
-                let data_size_before = soroban_state.contract_data_state_size();
-                let code_count = soroban_state.contract_code_count();
-                let data_count = soroban_state.contract_data_count();
-                soroban_state.recompute_contract_code_sizes(protocol_version, Some(&rent_config));
-                tracing::info!(
-                    ledger_seq = self.close_data.ledger_seq,
-                    code_size_before = code_size_before,
-                    code_size_after = soroban_state.contract_code_state_size(),
-                    data_size = data_size_before,
-                    code_count = code_count,
-                    data_count = data_count,
-                    total_size = soroban_state.total_size(),
-                    has_rent_config = true,
-                    "Recomputed contract code sizes"
-                );
-            }
-
-            // Update all window entries with the new total size
-            // Parity: NetworkConfig.cpp:2165 updateRecomputedSorobanStateSize
-            if protocol_version_starts_from(protocol_version, ProtocolVersion::V23) {
-                let new_size = self.manager.soroban_state.read().total_size();
-                let window_key = stellar_xdr::curr::LedgerKey::ConfigSetting(
-                    stellar_xdr::curr::LedgerKeyConfigSetting {
-                        config_setting_id:
-                            stellar_xdr::curr::ConfigSettingId::LiveSorobanStateSizeWindow,
-                    },
-                );
-
-                // Read the window through CloseLedgerState (may have been resized by config upgrade).
-                // Parity: stellar-core reads from LedgerTxn which includes prior modifications.
-                // Created at V20; missing/wrong type here is data corruption.
-                let previous_entry = self.ltx.get_entry(&window_key)?.ok_or_else(|| {
-                    LedgerError::Internal(
-                        "LiveSorobanStateSizeWindow not found during state size update".to_string(),
-                    )
-                })?;
-                let mut window_vec: Vec<u64> =
-                    if let stellar_xdr::curr::LedgerEntryData::ConfigSetting(
-                        stellar_xdr::curr::ConfigSettingEntry::LiveSorobanStateSizeWindow(ref w),
-                    ) = previous_entry.data
-                    {
-                        w.iter().copied().collect()
-                    } else {
-                        return Err(LedgerError::Internal(
-                            "LiveSorobanStateSizeWindow has unexpected entry type".to_string(),
-                        ));
-                    };
-
-                for size in &mut window_vec {
-                    *size = new_size;
+            if let Some(rent_config) = build_soroban_rent_config(&self.ltx)? {
+                // Recompute contract code sizes with new cost params
+                {
+                    let mut soroban_state = self.manager.soroban_state.write();
+                    let code_size_before = soroban_state.contract_code_state_size();
+                    let data_size_before = soroban_state.contract_data_state_size();
+                    let code_count = soroban_state.contract_code_count();
+                    let data_count = soroban_state.contract_data_count();
+                    soroban_state
+                        .recompute_contract_code_sizes(protocol_version, Some(&rent_config));
+                    tracing::info!(
+                        ledger_seq = self.close_data.ledger_seq,
+                        code_size_before = code_size_before,
+                        code_size_after = soroban_state.contract_code_state_size(),
+                        data_size = data_size_before,
+                        code_count = code_count,
+                        data_count = data_count,
+                        total_size = soroban_state.total_size(),
+                        has_rent_config = true,
+                        "Recomputed contract code sizes"
+                    );
                 }
-                let new_window: stellar_xdr::curr::VecM<u64> =
-                    window_vec.try_into().map_err(|_| {
-                        LedgerError::Internal("Failed to convert window vec".to_string())
+
+                // Update all window entries with the new total size
+                // Parity: NetworkConfig.cpp:2165 updateRecomputedSorobanStateSize
+                if protocol_version_starts_from(protocol_version, ProtocolVersion::V23) {
+                    let new_size = self.manager.soroban_state.read().total_size();
+                    let window_key = stellar_xdr::curr::LedgerKey::ConfigSetting(
+                        stellar_xdr::curr::LedgerKeyConfigSetting {
+                            config_setting_id:
+                                stellar_xdr::curr::ConfigSettingId::LiveSorobanStateSizeWindow,
+                        },
+                    );
+
+                    // Read the window through CloseLedgerState (may have been resized by config upgrade).
+                    // Parity: stellar-core reads from LedgerTxn which includes prior modifications.
+                    // Created at V20; missing/wrong type here is data corruption.
+                    let previous_entry = self.ltx.get_entry(&window_key)?.ok_or_else(|| {
+                        LedgerError::Internal(
+                            "LiveSorobanStateSizeWindow not found during state size update"
+                                .to_string(),
+                        )
                     })?;
-                let new_window_entry = stellar_xdr::curr::LedgerEntry {
-                    last_modified_ledger_seq: self.close_data.ledger_seq,
-                    data: stellar_xdr::curr::LedgerEntryData::ConfigSetting(
-                        stellar_xdr::curr::ConfigSettingEntry::LiveSorobanStateSizeWindow(
-                            new_window,
+                    let mut window_vec: Vec<u64> =
+                        if let stellar_xdr::curr::LedgerEntryData::ConfigSetting(
+                            stellar_xdr::curr::ConfigSettingEntry::LiveSorobanStateSizeWindow(
+                                ref w,
+                            ),
+                        ) = previous_entry.data
+                        {
+                            w.iter().copied().collect()
+                        } else {
+                            return Err(LedgerError::Internal(
+                                "LiveSorobanStateSizeWindow has unexpected entry type".to_string(),
+                            ));
+                        };
+
+                    for size in &mut window_vec {
+                        *size = new_size;
+                    }
+                    let new_window: stellar_xdr::curr::VecM<u64> =
+                        window_vec.try_into().map_err(|_| {
+                            LedgerError::Internal("Failed to convert window vec".to_string())
+                        })?;
+                    let new_window_entry = stellar_xdr::curr::LedgerEntry {
+                        last_modified_ledger_seq: self.close_data.ledger_seq,
+                        data: stellar_xdr::curr::LedgerEntryData::ConfigSetting(
+                            stellar_xdr::curr::ConfigSettingEntry::LiveSorobanStateSizeWindow(
+                                new_window,
+                            ),
                         ),
-                    ),
-                    ext: stellar_xdr::curr::LedgerEntryExt::V0,
-                };
-                self.ltx.record_update(previous_entry, new_window_entry)?;
-                tracing::info!(
-                    ledger_seq = self.close_data.ledger_seq,
-                    new_size = new_size,
-                    delta_count = self.ltx.num_changes(),
-                    "Updated all state size window entries due to memory cost params upgrade"
-                );
+                        ext: stellar_xdr::curr::LedgerEntryExt::V0,
+                    };
+                    self.ltx.record_update(previous_entry, new_window_entry)?;
+                    tracing::info!(
+                        ledger_seq = self.close_data.ledger_seq,
+                        new_size = new_size,
+                        delta_count = self.ltx.num_changes(),
+                        "Updated all state size window entries due to memory cost params upgrade"
+                    );
+                }
             }
         }
 
@@ -4951,13 +4967,13 @@ impl LedgerCloseContext<'_> {
                 // causing spurious EntryArchived errors on subsequent ledgers.
                 for entry in &init_entries {
                     if soroban_state
-                        .process_entry_create(entry, protocol_version, Some(&rent_config))
+                        .process_entry_create(entry, protocol_version, rent_config.as_ref())
                         .is_err()
                     {
                         if let Err(e) = soroban_state.process_entry_update(
                             entry,
                             protocol_version,
-                            Some(&rent_config),
+                            rent_config.as_ref(),
                         ) {
                             tracing::trace!(error = %e, "Failed to process init entry in soroban state");
                         }
@@ -4969,7 +4985,7 @@ impl LedgerCloseContext<'_> {
                     if let Err(e) = soroban_state.process_entry_update(
                         entry,
                         protocol_version,
-                        Some(&rent_config),
+                        rent_config.as_ref(),
                     ) {
                         tracing::trace!(error = %e, "Failed to process live entry in soroban state");
                     }
@@ -8248,6 +8264,135 @@ mod tests {
         assert!(
             result.is_ok(),
             "close_ledger with None expected_header_hash should succeed"
+        );
+    }
+
+    // --- Tests for build_soroban_rent_config ---
+
+    /// A simple EntryReader backed by a HashMap for testing.
+    struct MapReader(
+        std::collections::HashMap<stellar_xdr::curr::LedgerKey, stellar_xdr::curr::LedgerEntry>,
+    );
+    impl crate::EntryReader for MapReader {
+        fn get_entry(
+            &self,
+            key: &stellar_xdr::curr::LedgerKey,
+        ) -> Result<Option<stellar_xdr::curr::LedgerEntry>> {
+            Ok(self.0.get(key).cloned())
+        }
+    }
+
+    fn make_config_ledger_entry(setting: ConfigSettingEntry) -> LedgerEntry {
+        LedgerEntry {
+            last_modified_ledger_seq: 1,
+            data: stellar_xdr::curr::LedgerEntryData::ConfigSetting(setting),
+            ext: stellar_xdr::curr::LedgerEntryExt::V0,
+        }
+    }
+
+    fn config_key(id: ConfigSettingId) -> stellar_xdr::curr::LedgerKey {
+        stellar_xdr::curr::LedgerKey::ConfigSetting(stellar_xdr::curr::LedgerKeyConfigSetting {
+            config_setting_id: id,
+        })
+    }
+
+    #[test]
+    fn test_build_soroban_rent_config_empty_reader_returns_none() {
+        let reader = MapReader(std::collections::HashMap::new());
+        let result = build_soroban_rent_config(&reader);
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_none());
+    }
+
+    #[test]
+    fn test_build_soroban_rent_config_complete_reader_returns_some() {
+        use stellar_xdr::curr::{ConfigSettingContractComputeV0, ContractCostParams};
+
+        let mut map = std::collections::HashMap::new();
+        map.insert(
+            config_key(ConfigSettingId::ContractCostParamsCpuInstructions),
+            make_config_ledger_entry(ConfigSettingEntry::ContractCostParamsCpuInstructions(
+                ContractCostParams(stellar_xdr::curr::VecM::default()),
+            )),
+        );
+        map.insert(
+            config_key(ConfigSettingId::ContractCostParamsMemoryBytes),
+            make_config_ledger_entry(ConfigSettingEntry::ContractCostParamsMemoryBytes(
+                ContractCostParams(stellar_xdr::curr::VecM::default()),
+            )),
+        );
+        map.insert(
+            config_key(ConfigSettingId::ContractComputeV0),
+            make_config_ledger_entry(ConfigSettingEntry::ContractComputeV0(
+                ConfigSettingContractComputeV0 {
+                    ledger_max_instructions: 100,
+                    tx_max_instructions: 50,
+                    fee_rate_per_instructions_increment: 10,
+                    tx_memory_limit: 1000,
+                },
+            )),
+        );
+
+        let reader = MapReader(map);
+        let result = build_soroban_rent_config(&reader);
+        assert!(result.is_ok());
+        let config = result.unwrap().expect("should return Some");
+        assert_eq!(config.tx_max_instructions, 50);
+        assert_eq!(config.tx_max_memory_bytes, 1000);
+    }
+
+    #[test]
+    fn test_build_soroban_rent_config_partial_state_errors() {
+        use stellar_xdr::curr::ContractCostParams;
+
+        // Only the first key present, others missing — inconsistent state.
+        let mut map = std::collections::HashMap::new();
+        map.insert(
+            config_key(ConfigSettingId::ContractCostParamsCpuInstructions),
+            make_config_ledger_entry(ConfigSettingEntry::ContractCostParamsCpuInstructions(
+                ContractCostParams(stellar_xdr::curr::VecM::default()),
+            )),
+        );
+
+        let reader = MapReader(map);
+        let result = build_soroban_rent_config(&reader);
+        assert!(result.is_err(), "partial state should error");
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(
+            err_msg.contains("required config setting"),
+            "Error should mention required config: {}",
+            err_msg
+        );
+    }
+
+    #[test]
+    fn test_build_soroban_rent_config_wrong_variant_errors() {
+        use stellar_xdr::curr::ContractCostParams;
+
+        // First key exists with correct variant, but second key has wrong variant.
+        let mut map = std::collections::HashMap::new();
+        map.insert(
+            config_key(ConfigSettingId::ContractCostParamsCpuInstructions),
+            make_config_ledger_entry(ConfigSettingEntry::ContractCostParamsCpuInstructions(
+                ContractCostParams(stellar_xdr::curr::VecM::default()),
+            )),
+        );
+        // Wrong variant for MemoryBytes — put CPU params where Memory should be.
+        map.insert(
+            config_key(ConfigSettingId::ContractCostParamsMemoryBytes),
+            make_config_ledger_entry(ConfigSettingEntry::ContractCostParamsCpuInstructions(
+                ContractCostParams(stellar_xdr::curr::VecM::default()),
+            )),
+        );
+
+        let reader = MapReader(map);
+        let result = build_soroban_rent_config(&reader);
+        assert!(result.is_err(), "wrong variant should error");
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(
+            err_msg.contains("unexpected ConfigSettingEntry variant"),
+            "Error should mention wrong variant: {}",
+            err_msg
         );
     }
 }
