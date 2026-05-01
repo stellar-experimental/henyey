@@ -61,6 +61,27 @@ macro_rules! load_config {
     }};
 }
 
+/// Load an optional config setting and extract a specific variant.
+///
+/// Returns `Some(inner)` if the setting exists with the correct variant,
+/// `None` if the setting is genuinely absent, or errors if the setting
+/// exists but has an unexpected `ConfigSettingEntry` subtype (data corruption).
+macro_rules! load_config_optional {
+    ($snapshot:expr, $id:expr, $variant:ident, $ctx:expr) => {{
+        let id = $id;
+        match load_config_setting($snapshot, id)? {
+            Some(ConfigSettingEntry::$variant(val)) => Some(val),
+            Some(_) => {
+                return Err(LedgerError::Internal(format!(
+                    "{}: unexpected variant for {:?}",
+                    $ctx, id
+                )));
+            }
+            None => None,
+        }
+    }};
+}
+
 /// Load SorobanConfig from the ledger's ConfigSettingEntry entries.
 ///
 /// This loads the cost parameters and limits from the ledger state,
@@ -335,135 +356,152 @@ pub fn load_soroban_config(
 /// Load SorobanNetworkInfo from the ledger's ConfigSettingEntry entries.
 ///
 /// This loads all the configuration settings needed for the /sorobaninfo endpoint,
-/// matching the "basic" format from stellar-core.
+/// matching the "basic" format from stellar-core's `SorobanNetworkConfig::loadFromLedger`.
+///
+/// Returns `Ok(None)` if Soroban is not active (no `ContractComputeV0` setting exists).
+/// Returns `Err` if any required setting is missing or has a wrong variant (data corruption).
+/// V23+ settings (`ContractLedgerCostExtV0`, `ScpTiming`, `ContractParallelComputeV0`) are
+/// loaded optionally since the snapshot header may be stale during protocol-upgrade ledgers.
 pub(crate) fn load_soroban_network_info(
     snapshot: &SnapshotHandle,
 ) -> Result<Option<SorobanNetworkInfo>> {
-    // Check if we have any Soroban config (indicates protocol 20+)
-    let compute_v0 = match load_config_setting(snapshot, ConfigSettingId::ContractComputeV0)? {
-        Some(cs) => cs,
-        None => return Ok(None),
-    };
+    const CTX: &str = "load_soroban_network_info";
+
+    // Probe: if ContractComputeV0 doesn't exist, Soroban is not active (pre-protocol 20)
+    if load_config_setting(snapshot, ConfigSettingId::ContractComputeV0)?.is_none() {
+        return Ok(None);
+    }
 
     let mut info = SorobanNetworkInfo::default();
 
-    // Load contract size limits
-    if let Some(ConfigSettingEntry::ContractDataKeySizeBytes(size)) =
-        load_config_setting(snapshot, ConfigSettingId::ContractDataKeySizeBytes)?
-    {
-        info.max_contract_data_key_size = size;
-    }
-    if let Some(ConfigSettingEntry::ContractDataEntrySizeBytes(size)) =
-        load_config_setting(snapshot, ConfigSettingId::ContractDataEntrySizeBytes)?
-    {
-        info.max_contract_data_entry_size = size;
-    }
-    if let Some(ConfigSettingEntry::ContractMaxSizeBytes(size)) =
-        load_config_setting(snapshot, ConfigSettingId::ContractMaxSizeBytes)?
-    {
-        info.max_contract_size = size;
+    // --- Base required settings (must exist once Soroban is active) ---
+
+    let compute = load_config!(
+        snapshot,
+        ConfigSettingId::ContractComputeV0,
+        ContractComputeV0,
+        CTX
+    );
+    info.tx_max_instructions = compute.tx_max_instructions;
+    info.ledger_max_instructions = compute.ledger_max_instructions;
+    info.fee_rate_per_instructions_increment = compute.fee_rate_per_instructions_increment;
+    info.tx_memory_limit = compute.tx_memory_limit;
+
+    info.max_contract_data_key_size = load_config!(
+        snapshot,
+        ConfigSettingId::ContractDataKeySizeBytes,
+        ContractDataKeySizeBytes,
+        CTX
+    );
+    info.max_contract_data_entry_size = load_config!(
+        snapshot,
+        ConfigSettingId::ContractDataEntrySizeBytes,
+        ContractDataEntrySizeBytes,
+        CTX
+    );
+    info.max_contract_size = load_config!(
+        snapshot,
+        ConfigSettingId::ContractMaxSizeBytes,
+        ContractMaxSizeBytes,
+        CTX
+    );
+
+    let cost = load_config!(
+        snapshot,
+        ConfigSettingId::ContractLedgerCostV0,
+        ContractLedgerCostV0,
+        CTX
+    );
+    info.ledger_max_read_ledger_entries = cost.ledger_max_disk_read_entries;
+    info.ledger_max_read_bytes = cost.ledger_max_disk_read_bytes;
+    info.ledger_max_write_ledger_entries = cost.ledger_max_write_ledger_entries;
+    info.ledger_max_write_bytes = cost.ledger_max_write_bytes;
+    info.tx_max_read_ledger_entries = cost.tx_max_disk_read_entries;
+    info.tx_max_read_bytes = cost.tx_max_disk_read_bytes;
+    info.tx_max_write_ledger_entries = cost.tx_max_write_ledger_entries;
+    info.tx_max_write_bytes = cost.tx_max_write_bytes;
+    info.fee_read_ledger_entry = cost.fee_disk_read_ledger_entry;
+    info.fee_write_ledger_entry = cost.fee_write_ledger_entry;
+    info.fee_read_1kb = cost.fee_disk_read1_kb;
+    info.state_target_size_bytes = cost.soroban_state_target_size_bytes;
+    info.rent_fee_1kb_state_size_low = cost.rent_fee1_kb_soroban_state_size_low;
+    info.rent_fee_1kb_state_size_high = cost.rent_fee1_kb_soroban_state_size_high;
+    info.state_size_rent_fee_growth_factor = cost.soroban_state_rent_fee_growth_factor;
+
+    let hist = load_config!(
+        snapshot,
+        ConfigSettingId::ContractHistoricalDataV0,
+        ContractHistoricalDataV0,
+        CTX
+    );
+    info.fee_historical_1kb = hist.fee_historical1_kb;
+
+    let events = load_config!(
+        snapshot,
+        ConfigSettingId::ContractEventsV0,
+        ContractEventsV0,
+        CTX
+    );
+    info.tx_max_contract_events_size_bytes = events.tx_max_contract_events_size_bytes;
+    info.fee_contract_events_size_1kb = events.fee_contract_events1_kb;
+
+    let bandwidth = load_config!(
+        snapshot,
+        ConfigSettingId::ContractBandwidthV0,
+        ContractBandwidthV0,
+        CTX
+    );
+    info.ledger_max_tx_size_bytes = bandwidth.ledger_max_txs_size_bytes;
+    info.tx_max_size_bytes = bandwidth.tx_max_size_bytes;
+    info.fee_transaction_size_1kb = bandwidth.fee_tx_size1_kb;
+
+    let lanes = load_config!(
+        snapshot,
+        ConfigSettingId::ContractExecutionLanes,
+        ContractExecutionLanes,
+        CTX
+    );
+    info.ledger_max_tx_count = lanes.ledger_max_tx_count;
+
+    let archival = load_config!(snapshot, ConfigSettingId::StateArchival, StateArchival, CTX);
+    info.max_entry_ttl = archival.max_entry_ttl;
+    info.min_temporary_ttl = archival.min_temporary_ttl;
+    info.min_persistent_ttl = archival.min_persistent_ttl;
+    info.persistent_rent_rate_denominator = archival.persistent_rent_rate_denominator;
+    info.temp_rent_rate_denominator = archival.temp_rent_rate_denominator;
+    info.max_entries_to_archive = archival.max_entries_to_archive;
+    info.bucketlist_size_window_sample_size = archival.live_soroban_state_size_window_sample_size;
+    info.eviction_scan_size = archival.eviction_scan_size as i64;
+    info.starting_eviction_scan_level = archival.starting_eviction_scan_level;
+
+    let window = load_config!(
+        snapshot,
+        ConfigSettingId::LiveSorobanStateSizeWindow,
+        LiveSorobanStateSizeWindow,
+        CTX
+    );
+    if !window.is_empty() {
+        let mut sum: u64 = 0;
+        for size in window.iter() {
+            sum = sum.saturating_add(*size);
+        }
+        info.average_bucket_list_size = sum / window.len() as u64;
     }
 
-    // Load compute settings
-    if let ConfigSettingEntry::ContractComputeV0(compute) = compute_v0 {
-        info.tx_max_instructions = compute.tx_max_instructions;
-        info.ledger_max_instructions = compute.ledger_max_instructions;
-        info.fee_rate_per_instructions_increment = compute.fee_rate_per_instructions_increment;
-        info.tx_memory_limit = compute.tx_memory_limit;
-    }
+    // --- V23+ settings (optional — may be absent during protocol upgrade ledgers) ---
 
-    // Load ledger access settings
-    if let Some(ConfigSettingEntry::ContractLedgerCostV0(cost)) =
-        load_config_setting(snapshot, ConfigSettingId::ContractLedgerCostV0)?
-    {
-        info.ledger_max_read_ledger_entries = cost.ledger_max_disk_read_entries;
-        info.ledger_max_read_bytes = cost.ledger_max_disk_read_bytes;
-        info.ledger_max_write_ledger_entries = cost.ledger_max_write_ledger_entries;
-        info.ledger_max_write_bytes = cost.ledger_max_write_bytes;
-        info.tx_max_read_ledger_entries = cost.tx_max_disk_read_entries;
-        info.tx_max_read_bytes = cost.tx_max_disk_read_bytes;
-        info.tx_max_write_ledger_entries = cost.tx_max_write_ledger_entries;
-        info.tx_max_write_bytes = cost.tx_max_write_bytes;
-        info.fee_read_ledger_entry = cost.fee_disk_read_ledger_entry;
-        info.fee_write_ledger_entry = cost.fee_write_ledger_entry;
-        info.fee_read_1kb = cost.fee_disk_read1_kb;
-        info.state_target_size_bytes = cost.soroban_state_target_size_bytes;
-        info.rent_fee_1kb_state_size_low = cost.rent_fee1_kb_soroban_state_size_low;
-        info.rent_fee_1kb_state_size_high = cost.rent_fee1_kb_soroban_state_size_high;
-        info.state_size_rent_fee_growth_factor = cost.soroban_state_rent_fee_growth_factor;
-    }
-
-    // Load fee_write_1kb from extended cost settings
-    if let Some(ConfigSettingEntry::ContractLedgerCostExtV0(ext)) =
-        load_config_setting(snapshot, ConfigSettingId::ContractLedgerCostExtV0)?
-    {
+    if let Some(ext) = load_config_optional!(
+        snapshot,
+        ConfigSettingId::ContractLedgerCostExtV0,
+        ContractLedgerCostExtV0,
+        CTX
+    ) {
         info.fee_write_1kb = ext.fee_write1_kb;
         info.tx_max_footprint_entries = ext.tx_max_footprint_entries;
     }
 
-    // Load historical data settings
-    if let Some(ConfigSettingEntry::ContractHistoricalDataV0(hist)) =
-        load_config_setting(snapshot, ConfigSettingId::ContractHistoricalDataV0)?
-    {
-        info.fee_historical_1kb = hist.fee_historical1_kb;
-    }
-
-    // Load contract events settings
-    if let Some(ConfigSettingEntry::ContractEventsV0(events)) =
-        load_config_setting(snapshot, ConfigSettingId::ContractEventsV0)?
-    {
-        info.tx_max_contract_events_size_bytes = events.tx_max_contract_events_size_bytes;
-        info.fee_contract_events_size_1kb = events.fee_contract_events1_kb;
-    }
-
-    // Load bandwidth settings
-    if let Some(ConfigSettingEntry::ContractBandwidthV0(bandwidth)) =
-        load_config_setting(snapshot, ConfigSettingId::ContractBandwidthV0)?
-    {
-        info.ledger_max_tx_size_bytes = bandwidth.ledger_max_txs_size_bytes;
-        info.tx_max_size_bytes = bandwidth.tx_max_size_bytes;
-        info.fee_transaction_size_1kb = bandwidth.fee_tx_size1_kb;
-    }
-
-    // Load execution lanes settings for ledger tx count
-    if let Some(ConfigSettingEntry::ContractExecutionLanes(lanes)) =
-        load_config_setting(snapshot, ConfigSettingId::ContractExecutionLanes)?
-    {
-        info.ledger_max_tx_count = lanes.ledger_max_tx_count;
-    }
-
-    // Load state archival settings
-    if let Some(ConfigSettingEntry::StateArchival(archival)) =
-        load_config_setting(snapshot, ConfigSettingId::StateArchival)?
-    {
-        info.max_entry_ttl = archival.max_entry_ttl;
-        info.min_temporary_ttl = archival.min_temporary_ttl;
-        info.min_persistent_ttl = archival.min_persistent_ttl;
-        info.persistent_rent_rate_denominator = archival.persistent_rent_rate_denominator;
-        info.temp_rent_rate_denominator = archival.temp_rent_rate_denominator;
-        info.max_entries_to_archive = archival.max_entries_to_archive;
-        info.bucketlist_size_window_sample_size =
-            archival.live_soroban_state_size_window_sample_size;
-        info.eviction_scan_size = archival.eviction_scan_size as i64;
-        info.starting_eviction_scan_level = archival.starting_eviction_scan_level;
-    }
-
-    // Load average bucket list size from live window
-    if let Some(ConfigSettingEntry::LiveSorobanStateSizeWindow(window)) =
-        load_config_setting(snapshot, ConfigSettingId::LiveSorobanStateSizeWindow)?
-    {
-        if !window.is_empty() {
-            let mut sum: u64 = 0;
-            for size in window.iter() {
-                sum = sum.saturating_add(*size);
-            }
-            info.average_bucket_list_size = sum / window.len() as u64;
-        }
-    }
-
-    // Load SCP timing settings (Protocol 23+)
-    if let Some(ConfigSettingEntry::ScpTiming(timing)) =
-        load_config_setting(snapshot, ConfigSettingId::ScpTiming)?
+    if let Some(timing) =
+        load_config_optional!(snapshot, ConfigSettingId::ScpTiming, ScpTiming, CTX)
     {
         info.nomination_timeout_initial_ms = timing.nomination_timeout_initial_milliseconds;
         info.nomination_timeout_increment_ms = timing.nomination_timeout_increment_milliseconds;
@@ -472,10 +510,12 @@ pub(crate) fn load_soroban_network_info(
         info.ledger_target_close_time_ms = timing.ledger_target_close_time_milliseconds;
     }
 
-    // Load parallel compute settings (Protocol 23+)
-    if let Some(ConfigSettingEntry::ContractParallelComputeV0(parallel)) =
-        load_config_setting(snapshot, ConfigSettingId::ContractParallelComputeV0)?
-    {
+    if let Some(parallel) = load_config_optional!(
+        snapshot,
+        ConfigSettingId::ContractParallelComputeV0,
+        ContractParallelComputeV0,
+        CTX
+    ) {
         info.ledger_max_dependent_tx_clusters = parallel.ledger_max_dependent_tx_clusters;
     }
 
@@ -874,6 +914,282 @@ mod tests {
         let err_msg = format!("{}", result.unwrap_err());
         assert!(
             err_msg.contains("unexpected variant"),
+            "Error should mention unexpected variant, got: {}",
+            err_msg
+        );
+    }
+
+    // --- Tests for load_soroban_network_info variant masking fix ---
+
+    /// Helper: create a lookup function that returns specific ConfigSettingEntry values
+    /// based on the requested ConfigSettingId. Used to construct test snapshots for
+    /// load_soroban_network_info.
+    fn soroban_info_lookup(
+        overrides: std::collections::HashMap<ConfigSettingId, Option<ConfigSettingEntry>>,
+    ) -> crate::EntryLookupFn {
+        use stellar_xdr::curr::LedgerEntryExt;
+        std::sync::Arc::new(move |key: &LedgerKey| {
+            if let LedgerKey::ConfigSetting(cs) = key {
+                let id = cs.config_setting_id;
+                if let Some(override_val) = overrides.get(&id) {
+                    return match override_val {
+                        Some(entry) => Ok(Some(LedgerEntry {
+                            last_modified_ledger_seq: 1,
+                            data: LedgerEntryData::ConfigSetting(entry.clone()),
+                            ext: LedgerEntryExt::V0,
+                        })),
+                        None => Ok(None),
+                    };
+                }
+                // Default: return correct default entries for all base settings
+                let entry = match id {
+                    ConfigSettingId::ContractComputeV0 => {
+                        Some(ConfigSettingEntry::ContractComputeV0(Default::default()))
+                    }
+                    ConfigSettingId::ContractDataKeySizeBytes => {
+                        Some(ConfigSettingEntry::ContractDataKeySizeBytes(64))
+                    }
+                    ConfigSettingId::ContractDataEntrySizeBytes => {
+                        Some(ConfigSettingEntry::ContractDataEntrySizeBytes(65536))
+                    }
+                    ConfigSettingId::ContractMaxSizeBytes => {
+                        Some(ConfigSettingEntry::ContractMaxSizeBytes(65536))
+                    }
+                    ConfigSettingId::ContractLedgerCostV0 => {
+                        Some(ConfigSettingEntry::ContractLedgerCostV0(Default::default()))
+                    }
+                    ConfigSettingId::ContractHistoricalDataV0 => Some(
+                        ConfigSettingEntry::ContractHistoricalDataV0(Default::default()),
+                    ),
+                    ConfigSettingId::ContractEventsV0 => {
+                        Some(ConfigSettingEntry::ContractEventsV0(Default::default()))
+                    }
+                    ConfigSettingId::ContractBandwidthV0 => {
+                        Some(ConfigSettingEntry::ContractBandwidthV0(Default::default()))
+                    }
+                    ConfigSettingId::ContractExecutionLanes => Some(
+                        ConfigSettingEntry::ContractExecutionLanes(Default::default()),
+                    ),
+                    ConfigSettingId::StateArchival => {
+                        Some(ConfigSettingEntry::StateArchival(Default::default()))
+                    }
+                    ConfigSettingId::LiveSorobanStateSizeWindow => Some(
+                        ConfigSettingEntry::LiveSorobanStateSizeWindow(Default::default()),
+                    ),
+                    _ => None,
+                };
+                match entry {
+                    Some(e) => Ok(Some(LedgerEntry {
+                        last_modified_ledger_seq: 1,
+                        data: LedgerEntryData::ConfigSetting(e),
+                        ext: LedgerEntryExt::V0,
+                    })),
+                    None => Ok(None),
+                }
+            } else {
+                Ok(None)
+            }
+        })
+    }
+
+    /// Pre-Soroban: no ContractComputeV0 entry returns Ok(None).
+    #[test]
+    fn test_load_soroban_network_info_pre_soroban_returns_none() {
+        let mut overrides = std::collections::HashMap::new();
+        overrides.insert(ConfigSettingId::ContractComputeV0, None);
+        let lookup = soroban_info_lookup(overrides);
+        let snapshot = SnapshotHandle::with_lookup(LedgerSnapshot::empty(100), lookup);
+
+        let result = load_soroban_network_info(&snapshot);
+        assert!(result.is_ok());
+        assert!(
+            result.unwrap().is_none(),
+            "Should return None when Soroban is not active"
+        );
+    }
+
+    /// All base settings correct returns Ok(Some(info)) with populated fields.
+    #[test]
+    fn test_load_soroban_network_info_all_correct() {
+        let overrides = std::collections::HashMap::new();
+        let lookup = soroban_info_lookup(overrides);
+        let snapshot = SnapshotHandle::with_lookup(LedgerSnapshot::empty(100), lookup);
+
+        let result = load_soroban_network_info(&snapshot);
+        assert!(result.is_ok(), "Should succeed with all correct settings");
+        assert!(result.unwrap().is_some(), "Should return Some(info)");
+    }
+
+    /// Missing required base setting (StateArchival) after Soroban probe passes → error.
+    #[test]
+    fn test_load_soroban_network_info_missing_required_setting() {
+        let mut overrides = std::collections::HashMap::new();
+        overrides.insert(ConfigSettingId::StateArchival, None);
+        let lookup = soroban_info_lookup(overrides);
+        let snapshot = SnapshotHandle::with_lookup(LedgerSnapshot::empty(100), lookup);
+
+        let result = load_soroban_network_info(&snapshot);
+        assert!(
+            result.is_err(),
+            "Should error when required setting is missing"
+        );
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(
+            err_msg.contains("required config setting") && err_msg.contains("StateArchival"),
+            "Error should mention missing required setting, got: {}",
+            err_msg
+        );
+    }
+
+    /// Wrong variant for required base setting (ContractComputeV0) → error.
+    #[test]
+    fn test_load_soroban_network_info_wrong_variant_required() {
+        let mut overrides = std::collections::HashMap::new();
+        // Return a ContractBandwidthV0 value for the ContractComputeV0 key
+        overrides.insert(
+            ConfigSettingId::ContractComputeV0,
+            Some(ConfigSettingEntry::ContractBandwidthV0(Default::default())),
+        );
+        let lookup = soroban_info_lookup(overrides);
+        let snapshot = SnapshotHandle::with_lookup(LedgerSnapshot::empty(100), lookup);
+
+        let result = load_soroban_network_info(&snapshot);
+        assert!(
+            result.is_err(),
+            "Should error when required setting has wrong variant"
+        );
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(
+            err_msg.contains("unexpected variant") && err_msg.contains("ContractComputeV0"),
+            "Error should mention unexpected variant for ContractComputeV0, got: {}",
+            err_msg
+        );
+    }
+
+    /// Wrong variant for optional V23 setting (ContractLedgerCostExtV0) → error.
+    #[test]
+    fn test_load_soroban_network_info_wrong_variant_optional_v23() {
+        let mut overrides = std::collections::HashMap::new();
+        // Return a wrong variant for the V23 optional setting
+        overrides.insert(
+            ConfigSettingId::ContractLedgerCostExtV0,
+            Some(ConfigSettingEntry::ContractComputeV0(Default::default())),
+        );
+        let lookup = soroban_info_lookup(overrides);
+        let snapshot = SnapshotHandle::with_lookup(LedgerSnapshot::empty(100), lookup);
+
+        let result = load_soroban_network_info(&snapshot);
+        assert!(
+            result.is_err(),
+            "Should error when V23 optional setting has wrong variant"
+        );
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(
+            err_msg.contains("unexpected variant") && err_msg.contains("ContractLedgerCostExtV0"),
+            "Error should mention unexpected variant for V23 setting, got: {}",
+            err_msg
+        );
+    }
+
+    /// V23 settings absent (None) is acceptable — returns Ok(Some(info)) with defaults.
+    #[test]
+    fn test_load_soroban_network_info_v23_settings_absent_ok() {
+        // Default lookup doesn't include V23 settings, so they're absent (None)
+        let overrides = std::collections::HashMap::new();
+        let lookup = soroban_info_lookup(overrides);
+        let snapshot = SnapshotHandle::with_lookup(LedgerSnapshot::empty(100), lookup);
+
+        let result = load_soroban_network_info(&snapshot);
+        assert!(
+            result.is_ok(),
+            "Should succeed when V23 settings are absent"
+        );
+        let info = result.unwrap().unwrap();
+        // V23 fields should be at default (zero)
+        assert_eq!(
+            info.fee_write_1kb, 0,
+            "fee_write_1kb should be default (0) when V23 absent"
+        );
+        assert_eq!(
+            info.ledger_max_dependent_tx_clusters, 0,
+            "ledger_max_dependent_tx_clusters should be default (0) when V23 absent"
+        );
+    }
+
+    /// V23 settings present and correct are loaded properly.
+    #[test]
+    fn test_load_soroban_network_info_v23_settings_present() {
+        use stellar_xdr::curr::{
+            ConfigSettingContractLedgerCostExtV0, ConfigSettingContractParallelComputeV0,
+            ConfigSettingScpTiming,
+        };
+
+        let mut overrides = std::collections::HashMap::new();
+        overrides.insert(
+            ConfigSettingId::ContractLedgerCostExtV0,
+            Some(ConfigSettingEntry::ContractLedgerCostExtV0(
+                ConfigSettingContractLedgerCostExtV0 {
+                    fee_write1_kb: 42,
+                    tx_max_footprint_entries: 10,
+                },
+            )),
+        );
+        overrides.insert(
+            ConfigSettingId::ScpTiming,
+            Some(ConfigSettingEntry::ScpTiming(ConfigSettingScpTiming {
+                nomination_timeout_initial_milliseconds: 1000,
+                nomination_timeout_increment_milliseconds: 500,
+                ballot_timeout_initial_milliseconds: 2000,
+                ballot_timeout_increment_milliseconds: 300,
+                ledger_target_close_time_milliseconds: 5000,
+            })),
+        );
+        overrides.insert(
+            ConfigSettingId::ContractParallelComputeV0,
+            Some(ConfigSettingEntry::ContractParallelComputeV0(
+                ConfigSettingContractParallelComputeV0 {
+                    ledger_max_dependent_tx_clusters: 7,
+                },
+            )),
+        );
+        let lookup = soroban_info_lookup(overrides);
+        let snapshot = SnapshotHandle::with_lookup(LedgerSnapshot::empty(100), lookup);
+
+        let result = load_soroban_network_info(&snapshot);
+        assert!(
+            result.is_ok(),
+            "Should succeed with all V23 settings present"
+        );
+        let info = result.unwrap().unwrap();
+        assert_eq!(info.fee_write_1kb, 42);
+        assert_eq!(info.tx_max_footprint_entries, 10);
+        assert_eq!(info.nomination_timeout_initial_ms, 1000);
+        assert_eq!(info.nomination_timeout_increment_ms, 500);
+        assert_eq!(info.ballot_timeout_initial_ms, 2000);
+        assert_eq!(info.ballot_timeout_increment_ms, 300);
+        assert_eq!(info.ledger_target_close_time_ms, 5000);
+        assert_eq!(info.ledger_max_dependent_tx_clusters, 7);
+    }
+
+    /// Wrong variant for another base required setting (ContractLedgerCostV0) → error.
+    #[test]
+    fn test_load_soroban_network_info_wrong_variant_ledger_cost() {
+        let mut overrides = std::collections::HashMap::new();
+        overrides.insert(
+            ConfigSettingId::ContractLedgerCostV0,
+            Some(ConfigSettingEntry::ContractEventsV0(Default::default())),
+        );
+        let lookup = soroban_info_lookup(overrides);
+        let snapshot = SnapshotHandle::with_lookup(LedgerSnapshot::empty(100), lookup);
+
+        let result = load_soroban_network_info(&snapshot);
+        assert!(
+            result.is_err(),
+            "Should error when ContractLedgerCostV0 has wrong variant"
+        );
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(
+            err_msg.contains("unexpected variant") && err_msg.contains("ContractLedgerCostV0"),
             "Error should mention unexpected variant, got: {}",
             err_msg
         );
