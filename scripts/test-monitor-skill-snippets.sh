@@ -42,7 +42,7 @@ cleanup  # ensure fresh state
 mkdir -p "$TEST_ROOT"
 
 # ── TAP state ────────────────────────────────────────────────────────────────
-TAP_PLAN=19
+TAP_PLAN=20
 TAP_CURRENT=0
 TAP_FAILURES=0
 
@@ -99,6 +99,11 @@ check_skill_structure() {
   fi
   if ! grep -q 'recover_session_from_stdout' "$loop_file"; then
     echo "WARNING: monitor-loop/SKILL.md does not call recover_session_from_stdout" >&2
+    drift=true
+  fi
+  # Verify fail-fast: recover_session_from_stdout call must include || exit 1
+  if ! grep -A3 'recover_session_from_stdout' "$loop_file" | grep -q 'exit 1'; then
+    echo "WARNING: monitor-loop/SKILL.md calls recover_session_from_stdout without fail-fast error handling" >&2
     drift=true
   fi
   if ! grep -q 'cleanup_guard' "$loop_file"; then
@@ -422,7 +427,25 @@ run_tests() {
     tap_not_ok "attach-mode: (deleted) stdout emits warning to stderr" "stderr='$stderr18'"
   fi
 
-  # ── Test 19: Session dir exists → not wiped (no-op fall-through) ───────
+  # ── Test 19: Cleanup guard no-.alive fall-through → PASS ─────────────
+  # Source: scripts/lib/monitor-decisions.sh:167-185 (cleanup_guard)
+  # When no .alive file exists, layer 2 is bypassed entirely. With no
+  # running process (layer 3 miss), the result is PASS (eligible for cleanup).
+  data="$TEST_ROOT/t19b/data"
+  proc="$TEST_ROOT/t19b/proc"
+  mkdir -p "$data/no-alive-sess" "$proc"
+  # No .alive file created — layer 2 skipped
+  # Not the active session — layer 1 skipped
+  # No process entries — layer 3 skipped
+  local result19b
+  result19b=$(cleanup_guard "$data" "$proc" "no-alive-sess" "different-sess" 3600)
+  if [[ "$result19b" == "PASS" ]]; then
+    tap_ok "cleanup-guard: no .alive file falls through to PASS"
+  else
+    tap_not_ok "cleanup-guard: no .alive file falls through to PASS" "got: $result19b"
+  fi
+
+  # ── Test 20: Session dir exists → not wiped (no-op fall-through) ───────
   # Source: scripts/lib/monitor-decisions.sh — check_session_wiped
   # Verifies observable contract: when session dir already exists, function
   # reports not-wiped regardless of hostile environment state.
