@@ -3408,6 +3408,39 @@ async fn cmd_http_command(command: &str, port: u16) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    /// Serializes tests that read or write `RS_STELLAR_CORE_*` env vars via
+    /// `cmd_check_config` → `apply_env_overrides`. Without this, parallel test
+    /// threads can observe each other's env mutations (see #2165).
+    static ENV_TEST_MUTEX: Mutex<()> = Mutex::new(());
+
+    /// RAII guard that restores env vars to their original state on drop.
+    /// Mirrors the pattern in `crates/app/src/config.rs`.
+    struct EnvGuard {
+        vars: Vec<(String, Option<String>)>,
+    }
+
+    impl EnvGuard {
+        fn new(names: &[&str]) -> Self {
+            let vars = names
+                .iter()
+                .map(|&name| (name.to_owned(), std::env::var(name).ok()))
+                .collect();
+            Self { vars }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (name, original) in &self.vars {
+                match original {
+                    Some(val) => std::env::set_var(name, val),
+                    None => std::env::remove_var(name),
+                }
+            }
+        }
+    }
 
     // =========================================================================
     // CLI Parsing Tests
@@ -3741,6 +3774,7 @@ mod tests {
 
     #[test]
     fn test_check_config_shipped_config_parses() {
+        let _lock = ENV_TEST_MUTEX.lock().unwrap();
         let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .unwrap()
@@ -3777,6 +3811,7 @@ bogus_field_that_does_not_exist = true
 
     #[test]
     fn test_check_config_validate_pass() {
+        let _lock = ENV_TEST_MUTEX.lock().unwrap();
         // Minimal watcher config that passes both parse and validate.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("watcher.toml");
@@ -3807,6 +3842,7 @@ url = "https://history.stellar.org/prd/core-testnet/core_testnet_001"
 
     #[test]
     fn test_check_config_validate_fail_empty_archives() {
+        let _lock = ENV_TEST_MUTEX.lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("no-archives.toml");
         std::fs::write(
@@ -3841,6 +3877,9 @@ passphrase = "Test SDF Network ; September 2015"
 
     #[test]
     fn test_check_config_rejects_malformed_env_override() {
+        let _lock = ENV_TEST_MUTEX.lock().unwrap();
+        let _guard = EnvGuard::new(&["RS_STELLAR_CORE_NODE_VALIDATOR"]);
+
         // Regression test: cmd_check_config must apply env overrides and fail
         // on malformed values (caught in review-fix round 1 of #2145).
         let dir = tempfile::tempdir().unwrap();
@@ -3858,18 +3897,9 @@ url = "https://history.stellar.org/prd/core-testnet/core_testnet_001"
         )
         .unwrap();
 
-        // Save and set a malformed env var.
-        let key = "RS_STELLAR_CORE_NODE_VALIDATOR";
-        let original = std::env::var(key).ok();
-        std::env::set_var(key, "not_a_bool");
+        std::env::set_var("RS_STELLAR_CORE_NODE_VALIDATOR", "not_a_bool");
 
         let result = cmd_check_config(&path, false);
-
-        // Restore env var.
-        match original {
-            Some(val) => std::env::set_var(key, val),
-            None => std::env::remove_var(key),
-        }
 
         let err = result.unwrap_err();
         let msg = format!("{err:#}");
