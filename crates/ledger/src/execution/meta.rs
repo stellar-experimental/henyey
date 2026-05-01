@@ -8,6 +8,25 @@ use super::*;
 
 pub(super) use henyey_common::asset::non_native_asset_to_trustline_asset as asset_to_trustline_asset;
 
+/// If `entry` is a Soroban create type (TTL, ContractData, ContractCode),
+/// returns `Some((key_hash_bytes, type_order))`; otherwise returns `None`.
+///
+/// TTL entries get type_order 0; ContractData/ContractCode get type_order 1.
+/// Sorting by (key_hash, type_order) places each TTL immediately before its
+/// associated contract entry.
+fn soroban_create_sort_key(entry: &LedgerEntry) -> Option<(Vec<u8>, u8)> {
+    match &entry.data {
+        stellar_xdr::curr::LedgerEntryData::Ttl(ttl) => Some((ttl.key_hash.0.to_vec(), 0)),
+        stellar_xdr::curr::LedgerEntryData::ContractData(_)
+        | stellar_xdr::curr::LedgerEntryData::ContractCode(_) => {
+            let key = henyey_common::entry_to_key(entry);
+            let key_hash = Hash256::hash_xdr(&key);
+            Some((key_hash.as_bytes().to_vec(), 1))
+        }
+        _ => None,
+    }
+}
+
 pub(super) fn asset_issuer_id(asset: &stellar_xdr::curr::Asset) -> Option<AccountId> {
     henyey_common::asset::get_issuer(asset).ok().cloned()
 }
@@ -500,37 +519,10 @@ pub(super) fn build_entry_changes_with_hot_archive(
     // the positions of classic entry changes (Account, Trustline) while sorting Soroban creates
     // (TTL, ContractData, ContractCode) by their associated key_hash to match stellar-core behavior.
     if is_soroban {
-        fn is_soroban_entry(entry: &LedgerEntry) -> bool {
-            matches!(
-                &entry.data,
-                stellar_xdr::curr::LedgerEntryData::Ttl(_)
-                    | stellar_xdr::curr::LedgerEntryData::ContractData(_)
-                    | stellar_xdr::curr::LedgerEntryData::ContractCode(_)
-            )
-        }
-
-        /// Sort Soroban create indices by (associated_key_hash, type_order) so TTL
-        /// entries appear immediately before their ContractData/ContractCode pair.
-        fn sort_soroban_creates(indices: Vec<usize>, created: &[LedgerEntry]) -> Vec<usize> {
-            fn associated_sort_key(entry: &LedgerEntry) -> (Vec<u8>, u8) {
-                match &entry.data {
-                    stellar_xdr::curr::LedgerEntryData::Ttl(ttl) => (ttl.key_hash.0.to_vec(), 0),
-                    stellar_xdr::curr::LedgerEntryData::ContractData(_)
-                    | stellar_xdr::curr::LedgerEntryData::ContractCode(_) => {
-                        let key = henyey_common::entry_to_key(entry);
-                        let key_hash = Hash256::hash_xdr(&key);
-                        (key_hash.as_bytes().to_vec(), 1)
-                    }
-                    _ => (Vec::new(), 2),
-                }
-            }
-
-            let mut entries_with_sort: Vec<(usize, (Vec<u8>, u8))> = indices
-                .into_iter()
-                .map(|idx| (idx, associated_sort_key(&created[idx])))
-                .collect();
-            entries_with_sort.sort_by(|(_, a), (_, b)| a.cmp(b));
-            entries_with_sort.into_iter().map(|(idx, _)| idx).collect()
+        /// Sort precomputed Soroban create entries by (key_hash, type_order).
+        fn sort_soroban_creates(mut entries: Vec<(usize, (Vec<u8>, u8))>) -> Vec<usize> {
+            entries.sort_by(|(_, a), (_, b)| a.cmp(b));
+            entries.into_iter().map(|(idx, _)| idx).collect()
         }
 
         // Track which keys have been created (for deduplication)
@@ -539,27 +531,35 @@ pub(super) fn build_entry_changes_with_hot_archive(
         // Process change_order to preserve execution sequence
         // Collect groups of changes: either single updates/deletes or consecutive Soroban creates
         enum ChangeGroup {
-            SingleUpdate { idx: usize },
-            SingleDelete { idx: usize },
-            SorobanCreates { indices: Vec<usize> },
-            ClassicCreate { idx: usize },
+            SingleUpdate {
+                idx: usize,
+            },
+            SingleDelete {
+                idx: usize,
+            },
+            SorobanCreates {
+                entries: Vec<(usize, (Vec<u8>, u8))>,
+            },
+            ClassicCreate {
+                idx: usize,
+            },
         }
 
         let mut groups: Vec<ChangeGroup> = Vec::new();
-        let mut pending_soroban_creates: Vec<usize> = Vec::new();
+        let mut pending_soroban_creates: Vec<(usize, (Vec<u8>, u8))> = Vec::new();
 
         for change_ref in change_order {
             match change_ref {
                 henyey_tx::ChangeRef::Created(idx) => {
                     if *idx < created.len() {
                         let entry = &created[*idx];
-                        if is_soroban_entry(entry) {
-                            pending_soroban_creates.push(*idx);
+                        if let Some(sort_key) = soroban_create_sort_key(entry) {
+                            pending_soroban_creates.push((*idx, sort_key));
                         } else {
                             // Flush any pending Soroban creates before this classic create
                             if !pending_soroban_creates.is_empty() {
                                 groups.push(ChangeGroup::SorobanCreates {
-                                    indices: std::mem::take(&mut pending_soroban_creates),
+                                    entries: std::mem::take(&mut pending_soroban_creates),
                                 });
                             }
                             groups.push(ChangeGroup::ClassicCreate { idx: *idx });
@@ -570,7 +570,7 @@ pub(super) fn build_entry_changes_with_hot_archive(
                     // Flush any pending Soroban creates before this update
                     if !pending_soroban_creates.is_empty() {
                         groups.push(ChangeGroup::SorobanCreates {
-                            indices: std::mem::take(&mut pending_soroban_creates),
+                            entries: std::mem::take(&mut pending_soroban_creates),
                         });
                     }
                     groups.push(ChangeGroup::SingleUpdate { idx: *idx });
@@ -579,7 +579,7 @@ pub(super) fn build_entry_changes_with_hot_archive(
                     // Flush any pending Soroban creates before this delete
                     if !pending_soroban_creates.is_empty() {
                         groups.push(ChangeGroup::SorobanCreates {
-                            indices: std::mem::take(&mut pending_soroban_creates),
+                            entries: std::mem::take(&mut pending_soroban_creates),
                         });
                     }
                     groups.push(ChangeGroup::SingleDelete { idx: *idx });
@@ -590,15 +590,15 @@ pub(super) fn build_entry_changes_with_hot_archive(
         // Flush any remaining Soroban creates
         if !pending_soroban_creates.is_empty() {
             groups.push(ChangeGroup::SorobanCreates {
-                indices: pending_soroban_creates,
+                entries: pending_soroban_creates,
             });
         }
 
         // Process each group
         for group in groups {
             match group {
-                ChangeGroup::SorobanCreates { indices } => {
-                    for idx in sort_soroban_creates(indices, created) {
+                ChangeGroup::SorobanCreates { entries } => {
+                    for idx in sort_soroban_creates(entries) {
                         let entry = &created[idx];
                         let key = henyey_common::entry_to_key(entry);
                         if created_keys.insert(key.clone()) {
@@ -989,4 +989,126 @@ pub(super) fn empty_transaction_meta() -> TransactionMeta {
         emit_soroban_tx_meta_ext_v1: false,
         enable_soroban_diagnostic_events: false,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use stellar_xdr::curr::*;
+
+    fn make_ttl_entry(key_hash: [u8; 32], live_until: u32) -> LedgerEntry {
+        LedgerEntry {
+            last_modified_ledger_seq: 0,
+            data: LedgerEntryData::Ttl(TtlEntry {
+                key_hash: key_hash.into(),
+                live_until_ledger_seq: live_until,
+            }),
+            ext: LedgerEntryExt::V0,
+        }
+    }
+
+    fn make_contract_data_entry(contract_hash: [u8; 32]) -> LedgerEntry {
+        LedgerEntry {
+            last_modified_ledger_seq: 0,
+            data: LedgerEntryData::ContractData(ContractDataEntry {
+                ext: ExtensionPoint::V0,
+                contract: ScAddress::Contract(ContractId(Hash(contract_hash))),
+                key: ScVal::LedgerKeyContractInstance,
+                durability: ContractDataDurability::Persistent,
+                val: ScVal::Void,
+            }),
+            ext: LedgerEntryExt::V0,
+        }
+    }
+
+    fn make_contract_code_entry(code: &[u8]) -> LedgerEntry {
+        let hash = Hash256::hash(code);
+        LedgerEntry {
+            last_modified_ledger_seq: 0,
+            data: LedgerEntryData::ContractCode(ContractCodeEntry {
+                ext: ContractCodeEntryExt::V0,
+                hash: hash.into(),
+                code: code.to_vec().try_into().unwrap(),
+            }),
+            ext: LedgerEntryExt::V0,
+        }
+    }
+
+    fn make_account_entry() -> LedgerEntry {
+        LedgerEntry {
+            last_modified_ledger_seq: 0,
+            data: LedgerEntryData::Account(AccountEntry {
+                account_id: AccountId(PublicKey::PublicKeyTypeEd25519([0u8; 32].into())),
+                balance: 100,
+                seq_num: SequenceNumber(1),
+                num_sub_entries: 0,
+                inflation_dest: None,
+                flags: 0,
+                home_domain: Default::default(),
+                thresholds: Thresholds([1, 0, 0, 0]),
+                signers: Default::default(),
+                ext: AccountEntryExt::V0,
+            }),
+            ext: LedgerEntryExt::V0,
+        }
+    }
+
+    #[test]
+    fn test_soroban_create_sort_key_classifies_ttl() {
+        let key_hash = [0xAA; 32];
+        let entry = make_ttl_entry(key_hash, 100);
+        let result = soroban_create_sort_key(&entry);
+        assert!(result.is_some());
+        let (hash_bytes, type_order) = result.unwrap();
+        assert_eq!(hash_bytes, key_hash.to_vec());
+        assert_eq!(type_order, 0);
+    }
+
+    #[test]
+    fn test_soroban_create_sort_key_classifies_contract_data() {
+        let contract_hash = [0xBB; 32];
+        let entry = make_contract_data_entry(contract_hash);
+        let result = soroban_create_sort_key(&entry);
+        assert!(result.is_some());
+        let (_hash_bytes, type_order) = result.unwrap();
+        assert_eq!(type_order, 1);
+        // Hash bytes should be the XDR hash of the derived LedgerKey, not the raw contract hash.
+        assert!(!_hash_bytes.is_empty());
+    }
+
+    #[test]
+    fn test_soroban_create_sort_key_classifies_contract_code() {
+        let entry = make_contract_code_entry(b"test-wasm-code");
+        let result = soroban_create_sort_key(&entry);
+        assert!(result.is_some());
+        let (_hash_bytes, type_order) = result.unwrap();
+        assert_eq!(type_order, 1);
+        assert!(!_hash_bytes.is_empty());
+    }
+
+    #[test]
+    fn test_soroban_create_sort_key_returns_none_for_classic() {
+        let entry = make_account_entry();
+        assert!(soroban_create_sort_key(&entry).is_none());
+    }
+
+    #[test]
+    fn test_soroban_create_sort_key_ttl_sorts_before_contract() {
+        // TTL and ContractData sharing the same key_hash should sort TTL first
+        // because TTL gets type_order=0 and ContractData gets type_order=1.
+        let key_hash = [0xCC; 32];
+
+        let ttl = make_ttl_entry(key_hash, 100);
+        let ttl_key = soroban_create_sort_key(&ttl).unwrap();
+
+        // For the ContractData entry, we need the XDR hash of its LedgerKey to
+        // equal key_hash for a direct comparison. Instead, verify the ordering
+        // property: for any TTL entry with key_hash H, its sort key (H, 0) is
+        // always less than any ContractData sort key (_, 1) with the same H prefix.
+        assert_eq!(ttl_key.1, 0, "TTL type_order should be 0");
+
+        let cd = make_contract_data_entry([0xCC; 32]);
+        let cd_key = soroban_create_sort_key(&cd).unwrap();
+        assert_eq!(cd_key.1, 1, "ContractData type_order should be 1");
+    }
 }
