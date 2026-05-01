@@ -114,6 +114,10 @@ mod loadgen_runner {
         /// Set by [`LoadGenPermit::complete`] before normal drop.
         /// If false at drop time, the exit was abnormal.
         completed_cleanly: AtomicBool,
+        /// Per-run stop token. `stop_load` sets the current token to `true`;
+        /// the running task checks it cooperatively at loop boundaries via
+        /// `generate_load`'s `stop_signal` parameter.
+        current_stop_token: std::sync::Mutex<Arc<AtomicBool>>,
         /// Test-only: trigger a panic inside the spawned task.
         #[cfg(test)]
         panic_inject: AtomicBool,
@@ -125,6 +129,7 @@ mod loadgen_runner {
                 running: AtomicBool::new(false),
                 generator_tainted: AtomicBool::new(false),
                 completed_cleanly: AtomicBool::new(false),
+                current_stop_token: std::sync::Mutex::new(Arc::new(AtomicBool::new(false))),
                 #[cfg(test)]
                 panic_inject: AtomicBool::new(false),
             }
@@ -470,6 +475,10 @@ mod loadgen_runner {
             let inner = Arc::clone(&self.inner);
             let state = Arc::clone(&self.state);
 
+            // Fresh per-run stop token — stop_load will signal this instance.
+            let stop_token = Arc::new(AtomicBool::new(false));
+            *state.current_stop_token.lock().unwrap() = Arc::clone(&stop_token);
+
             henyey_common::spawn::spawn_observed("load_generation", async move {
                 // Permit is moved into this future — dropped at end, on
                 // panic (unwind), or on task cancellation.
@@ -497,7 +506,7 @@ mod loadgen_runner {
                     panic!("injected load generation panic for testing");
                 }
 
-                let result = generator.generate_load(&mut config).await;
+                let result = generator.generate_load(&mut config, &stop_token).await;
 
                 match result {
                     henyey_simulation::LoadResult::Done { submitted } => {
@@ -519,16 +528,12 @@ mod loadgen_runner {
         }
 
         fn stop_load(&self) {
-            // Set the stopped flag on the generator so the running task
-            // breaks out of its loop on the next iteration. This matches
-            // stellar-core's LoadGenerator::stop() which cancels the timer
-            // and resets state. The background task will observe Stopped
-            // and clear the running flag.
-            if let Ok(mut guard) = self.inner.generator.try_lock() {
-                if let Some(gen) = guard.as_mut() {
-                    gen.stop();
-                }
-            }
+            // Signal the current run's per-run stop token. The task checks
+            // this cooperatively at each loop iteration in generate_load and
+            // returns LoadResult::Stopped. This matches stellar-core's
+            // LoadGenerator::stop() which cancels the step timer.
+            let token = self.state.current_stop_token.lock().unwrap();
+            token.store(true, Ordering::SeqCst);
         }
 
         fn is_running(&self) -> bool {
