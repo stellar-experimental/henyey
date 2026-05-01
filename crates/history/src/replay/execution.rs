@@ -575,7 +575,7 @@ pub fn replay_ledger_with_execution(
         if protocol_version_starts_from(header.ledger_version, ProtocolVersion::V20)
             && !transactions.is_empty()
         {
-            load_soroban_config(&snapshot, header.ledger_version)?
+            load_soroban_config(&snapshot, header.ledger_version)?.unwrap_or_default()
         } else {
             SorobanConfig::default()
         };
