@@ -296,3 +296,93 @@ pub(crate) async fn dumpproposedsettings_handler(
         ),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    use axum::body::Body;
+    use http::Request;
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+
+    use crate::app::App;
+    use crate::config::ConfigBuilder;
+    use crate::http::{build_router, ServerState};
+
+    /// Build a `ServerState` backed by a real (minimal) `App` with the given
+    /// `commit_hash`. Returns the state and the `TempDir` whose lifetime keeps
+    /// the on-disk database valid.
+    async fn test_server_state(commit_hash: &str) -> (Arc<ServerState>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("test.db");
+        let mut config = ConfigBuilder::new().database_path(db_path).build();
+        config.build.commit_hash = commit_hash.to_string();
+
+        let app = App::new(config).await.unwrap();
+        let state = Arc::new(ServerState {
+            app: Arc::new(app),
+            start_time: Instant::now(),
+            started_on: "2024-01-01T00:00:00Z".to_string(),
+            log_handle: None,
+            prometheus_handle: None,
+            #[cfg(feature = "loadgen")]
+            loadgen_state: None,
+        });
+        (state, dir)
+    }
+
+    /// Collect an axum response body and parse it as JSON.
+    async fn body_json(response: axum::response::Response) -> serde_json::Value {
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_info_handler_commit_hash_present() {
+        let commit = "abc123def456";
+        let (state, _dir) = test_server_state(commit).await;
+        let app = build_router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/info")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), http::StatusCode::OK);
+        let json = body_json(response).await;
+        assert_eq!(json["commit_hash"], commit);
+    }
+
+    #[tokio::test]
+    async fn test_info_handler_commit_hash_absent() {
+        let (state, _dir) = test_server_state("").await;
+        let app = build_router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/info")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), http::StatusCode::OK);
+        let json = body_json(response).await;
+        assert!(
+            json.get("commit_hash").is_none(),
+            "commit_hash field should be absent when empty, got: {:?}",
+            json.get("commit_hash")
+        );
+    }
+}
