@@ -1520,4 +1520,35 @@ mod tests {
             proposals,
         );
     }
+
+    /// Regression test for #2227: from_snapshot must propagate get_entry errors
+    /// instead of silently converting them to None.
+    #[test]
+    fn test_from_snapshot_propagates_get_entry_error() {
+        use henyey_ledger::{EntryLookupFn, LedgerSnapshot, SnapshotHandle};
+        use stellar_xdr::curr::*;
+
+        let key = ConfigUpgradeSetKey {
+            contract_id: stellar_xdr::curr::ContractId(Hash([1u8; 32])),
+            content_hash: Hash([2u8; 32]),
+        };
+
+        // Lookup function that always returns an error (simulating I/O failure)
+        let error_lookup: EntryLookupFn = std::sync::Arc::new(|_key: &LedgerKey| {
+            Err(LedgerError::Internal("simulated I/O error".into()))
+        });
+        let snapshot = SnapshotHandle::with_lookup(LedgerSnapshot::empty(100), error_lookup);
+
+        let result = ConfigUpgradeContext::from_snapshot(&snapshot, &key);
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("from_snapshot should propagate get_entry errors"),
+        };
+        let err_msg = format!("{}", err);
+        assert!(
+            err_msg.contains("simulated I/O error"),
+            "Error should propagate the original message, got: {}",
+            err_msg
+        );
+    }
 }
