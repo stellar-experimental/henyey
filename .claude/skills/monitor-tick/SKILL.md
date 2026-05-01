@@ -40,6 +40,24 @@ Variables provided by the env file (all required):
 
 Throughout this skill, substitute those values for the `$MONITOR_*` references below.
 
+### Per-session state files
+
+All files below live in `/home/tomer/data/$MONITOR_SESSION_ID/`:
+
+| File | Purpose | Writer |
+|------|---------|--------|
+| `build_sha` | 40-char hex sha of the currently-deployed binary's source tree | check 10 (after successful build) and `monitor-loop` step 5 |
+| `last_ledger` | STUCK detection state (check 4) | check 4 |
+| `last_ledger_count` | STUCK confirmation counter (check 4) | check 4 |
+| `tick-history.jsonl` | daily-summary aggregation | tick epilogue |
+| `metrics/current.prom` | latest Prometheus scrape | check 8 |
+| `metrics/prev.prom` | previous Prometheus scrape | check 8 |
+| `metrics/ratio_snapshot` | counter-ratio history (check 12) | check 12 |
+| `metrics/anomaly_cooldown.json` | alert dedup state | check 9 |
+| `logs/monitor.log` | node stdout/stderr (rotated on restart) | node process |
+| `cargo-target/` | cached build tree | cargo |
+| `.alive` | session liveness marker | session startup |
+
 ## Session-dir-vanished detection
 
 Immediately after loading `monitor-loop.env`, check whether the session
@@ -102,6 +120,12 @@ fi
   ```bash
   CARGO_TARGET_DIR=/home/tomer/data/$MONITOR_SESSION_ID/cargo-target \
     cargo build --release -p henyey
+  ```
+  If build succeeds, persist the deployed sha (atomic write):
+  ```bash
+  new_sha=$(git rev-parse HEAD)
+  printf '%s\n' "$new_sha" > "/home/tomer/data/$MONITOR_SESSION_ID/build_sha.tmp"
+  mv "/home/tomer/data/$MONITOR_SESSION_ID/build_sha.tmp" "/home/tomer/data/$MONITOR_SESSION_ID/build_sha"
   ```
   If build fails: report `OFFLINE`; emit `actions`/`watch`/`wipe:` per
   wipe-state composition table (row #5 or #8). **File/comment issue before
@@ -833,25 +857,105 @@ SCP, quorum, herder_state, histogram p99 alerts, and ratio checks.
   Investigate the dirty tree before the next tick.
 - If clean, `git fetch origin main`. If in detached HEAD state
   (`git symbolic-ref HEAD` fails), `git checkout main` first.
-- Compare `git rev-parse HEAD` vs `git rev-parse origin/main`.
 
-If they differ (origin/main is ahead):
+**Determine `deployed_sha`** — the sha of the source tree used to build the
+currently-running binary. This decouples the deploy gate from git HEAD, which
+can diverge from the running binary if an operator or CI pushes commits
+without going through the skill's build+restart path.
+
+```bash
+BUILD_SHA_FILE="/home/tomer/data/$MONITOR_SESSION_ID/build_sha"
+SESSION_DIR="/home/tomer/data/$MONITOR_SESSION_ID"
+
+deployed_sha=""
+deployed_sha_status=""
+
+if [ -s "$BUILD_SHA_FILE" ]; then
+  candidate=$(tr -d '[:space:]' < "$BUILD_SHA_FILE")
+  if printf '%s' "$candidate" | grep -qE '^[0-9a-f]{40}$' \
+     && git cat-file -e "${candidate}^{commit}" 2>/dev/null; then
+    deployed_sha="$candidate"
+    deployed_sha_status="ok"
+  else
+    deployed_sha_status="invalid"
+  fi
+elif [ -e "$SESSION_DIR/last_ledger" ] \
+  || [ -e "$SESSION_DIR/metrics/current.prom" ] \
+  || [ -e "$SESSION_DIR/tick-history.jsonl" ]; then
+  # Other per-session state exists — monitor-loop should have written
+  # build_sha but didn't (e.g. rollout of this change to an existing
+  # session). Force a rebuild to restore the invariant.
+  deployed_sha_status="invalid"
+else
+  # Truly fresh session dir — safe to fall back to today's behavior.
+  deployed_sha=$(git rev-parse HEAD)
+  deployed_sha_status="missing-fresh"
+fi
+```
+
+| State | Meaning | Gate behavior |
+|-------|---------|---------------|
+| `ok` | File valid + reachable | Compare `deployed_sha` vs `origin/main` |
+| `missing-fresh` | No file, no other session state | Falls back to `HEAD` vs `origin/main` (today's behavior) |
+| `invalid` | File missing/corrupt/unreachable but session state exists | Force rebuild unconditionally |
+
+Report `deployed_sha_status` in the tick's status line.
+
+**Gate comparison:**
+
+```bash
+origin_sha=$(git rev-parse origin/main)
+
+case "$deployed_sha_status" in
+  ok|missing-fresh)
+    [ "$deployed_sha" = "$origin_sha" ] && gate_action="up-to-date" || gate_action="proceed"
+    ;;
+  invalid)
+    gate_action="proceed-force-rebuild"
+    ;;
+esac
+```
+
+If `gate_action="up-to-date"`: no action (already up to date).
+
+Otherwise enter the deploy path:
 
 1. **Cool-down guard**: if node uptime is `< 60m` AND `CRASH_RECOVERY=no` (i.e.
    the previous tick deployed cleanly), SKIP DEPLOY this tick. Report:
-   `DEPLOY DEFERRED (cool-down: uptime=<X>m < 60m)`. Rationale: every restart
-   costs ~1-2m of validation downtime + brief peer reconnect. Deploying multiple
-   commits within minutes thrashes the validator without giving each version
-   time to surface issues. The 60m floor was raised from the original 30m
-   (#1944) on 2026-04-30 after observing too many quick-cycle deploys per day.
-   Crash-recovery restarts are exempt because they're not voluntary deploys.
-   Urgent fixes can override by killing the node manually before the next
-   tick — the normal startup path will pick up the latest origin/main.
-2. **Binary-relevance check**: list changed paths with
-   `git diff --name-only HEAD origin/main`. If every changed path is
-   allowlisted as non-binary-impact, skip the rebuild + restart: run
-   `git pull --rebase` only, then report
+   `DEPLOY DEFERRED (cool-down: uptime=<X>m < 60m)`. If `deployed_sha_status`
+   is `invalid`, append `, build_sha: invalid` to the report so the operator
+   knows a follow-up rebuild is pending once cool-down expires. Rationale:
+   every restart costs ~1-2m of validation downtime + brief peer reconnect.
+   Deploying multiple commits within minutes thrashes the validator without
+   giving each version time to surface issues. The 60m floor was raised from
+   the original 30m (#1944) on 2026-04-30 after observing too many quick-cycle
+   deploys per day. Crash-recovery restarts are exempt because they're not
+   voluntary deploys. Urgent fixes can override by killing the node manually
+   before the next tick — the normal startup path will pick up the latest
+   origin/main.
+2. **Binary-relevance check**:
+   ```bash
+   if [ "$gate_action" = "proceed-force-rebuild" ]; then
+     # invalid build_sha — skip allowlist, force rebuild
+     needs_rebuild="yes"
+   else
+     # ok or missing-fresh: diff from deployed_sha
+     if changed_paths=$(git diff --name-only "$deployed_sha" origin/main 2>/dev/null); then
+       # Evaluate allowlist on $changed_paths (see below).
+       # If every path is allowlisted: needs_rebuild="no"
+       # Else: needs_rebuild="yes"
+       ...
+     else
+       # git diff failed — fail closed, force rebuild.
+       needs_rebuild="yes"
+     fi
+   fi
+   ```
+   If `needs_rebuild="no"` (all paths allowlisted), skip the rebuild + restart:
+   run `git pull --rebase` only, then report
    `DEPLOY SYNCED (no-binary-impact: docs/scripts only — pulled <N> commits, no restart)`.
+   Do NOT update `BUILD_SHA_FILE` (the binary hasn't changed).
+
    The non-binary-impact allowlist is:
    - `.github/`
    - `.claude/`
@@ -869,12 +973,18 @@ If they differ (origin/main is ahead):
    through check (11) and wait.
 4. If all conclusions are `success` (ignore `""` for in-progress and `cancelled`):
    `git pull --rebase`, `CARGO_TARGET_DIR=/home/tomer/data/$MONITOR_SESSION_ID/cargo-target cargo build --release -p henyey`.
-5. If build succeeds: Stop-PID, Rotate-log suffix `preredeploy`, Relaunch.
+5. If build succeeds:
+   ```bash
+   # Persist the just-built sha BEFORE Stop-PID. Atomic via tmp + mv.
+   new_sha=$(git rev-parse HEAD)
+   printf '%s\n' "$new_sha" > "${BUILD_SHA_FILE}.tmp"
+   mv "${BUILD_SHA_FILE}.tmp" "$BUILD_SHA_FILE"
+   ```
+   Then: Stop-PID, Rotate-log suffix `preredeploy`, Relaunch.
    Report: `DEPLOY — pulled <N> commits (<old-sha>..<new-sha>), rebuilt, restarted at L<ledger>`.
 6. If build fails: report `BUILD FAILED`, do NOT restart — the old binary is
-   still running. Route the build error through check (11).
-
-If `HEAD == origin/main`: no action (already up to date).
+   still running. Do NOT update `BUILD_SHA_FILE`. Route the build error through
+   check (11).
 
 ## CI check workflow
 

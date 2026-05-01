@@ -509,6 +509,14 @@ process watches for `ready`-labeled issues and handles the fix.
    ```
    CARGO_TARGET_DIR=~/data/<session-id>/cargo-target cargo build --release -p henyey
    ```
+   Immediately after the build succeeds, persist the deployed sha (atomic
+   write via tmp + mv) so `monitor-tick` check 10 has an authoritative
+   record from the very first tick:
+   ```
+   new_sha=$(git rev-parse HEAD)
+   printf '%s\n' "$new_sha" > ~/data/<session-id>/build_sha.tmp
+   mv ~/data/<session-id>/build_sha.tmp ~/data/<session-id>/build_sha
+   ```
 
 6. **Select config based on `$MODE` and start the node in the background:**
    - **validator** (default):
