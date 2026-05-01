@@ -667,8 +667,8 @@ mod tests {
         // Store two tx sets with explicit hashes.
         let hash_a = Hash256::from_bytes([0xAA; 32]);
         let hash_b = Hash256::from_bytes([0xBB; 32]);
-        let ts_a = TransactionSet::with_hash(Hash256::default(), hash_a, Vec::new());
-        let ts_b = TransactionSet::with_hash(Hash256::default(), hash_b, Vec::new());
+        let ts_a = TransactionSet::with_unchecked_hash(Hash256::default(), hash_a, Vec::new());
+        let ts_b = TransactionSet::with_unchecked_hash(Hash256::default(), hash_b, Vec::new());
         tracker.store(ts_a);
         tracker.store(ts_b);
 
@@ -680,7 +680,7 @@ mod tests {
 
         // Store a third tx set — should evict hash_b (oldest), not hash_a.
         let hash_c = Hash256::from_bytes([0xCC; 32]);
-        let ts_c = TransactionSet::with_hash(Hash256::default(), hash_c, Vec::new());
+        let ts_c = TransactionSet::with_unchecked_hash(Hash256::default(), hash_c, Vec::new());
         tracker.store(ts_c);
 
         assert!(

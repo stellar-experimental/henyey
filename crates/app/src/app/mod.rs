@@ -8754,7 +8754,11 @@ mod tests {
         app.herder.set_state(henyey_herder::HerderState::Tracking);
 
         let slot: u64 = 200;
-        let tx_set_hash_bytes = [0x42u8; 32];
+
+        // Build the tx set first, then derive its hash for the StellarValue.
+        let zero_hash = henyey_common::Hash256::from_bytes([0u8; 32]);
+        let tx_set = henyey_herder::TransactionSet::from_wire_legacy(zero_hash, Vec::new());
+        let tx_set_hash_bytes = tx_set.hash().0;
 
         // Externalize the slot (which seeds check_ledger_close, but
         // the returned info.tx_set will be None since we don't seed
@@ -8763,10 +8767,6 @@ mod tests {
         let driver = app.herder.scp_driver();
         driver.record_externalized(slot, mk_value(xdr), None);
 
-        // Create a tx_set with matching hash via with_hash
-        let hash = henyey_common::Hash256::from_bytes(tx_set_hash_bytes);
-        let zero_hash = henyey_common::Hash256::from_bytes([0u8; 32]);
-        let tx_set = henyey_herder::TransactionSet::with_hash(zero_hash, hash, Vec::new());
         let result = app.buffer_externalized_tx_set(&tx_set).await;
         assert!(result, "should return true when slot is found");
 

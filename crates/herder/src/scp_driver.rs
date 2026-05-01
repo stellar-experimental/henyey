@@ -2622,8 +2622,11 @@ mod cache_tests {
         );
         let tx_set = make_tx_set(4);
         let bad_hash = Hash256::from_bytes([9; 32]);
-        let bad_set =
-            TransactionSet::with_hash(tx_set.previous_ledger_hash(), bad_hash, Vec::new());
+        let bad_set = TransactionSet::with_unchecked_hash(
+            tx_set.previous_ledger_hash(),
+            bad_hash,
+            Vec::new(),
+        );
 
         let received = driver.receive_tx_set(bad_set);
         assert_eq!(received, None);
@@ -3761,7 +3764,7 @@ mod tests {
     fn test_tx_set_hash_mismatch_rejected() {
         let (driver, secret_key) = make_test_driver_with_key();
 
-        let tx_set = TransactionSet::with_hash(Hash256::ZERO, Hash256::ZERO, vec![]);
+        let tx_set = TransactionSet::with_unchecked_hash(Hash256::ZERO, Hash256::ZERO, vec![]);
         let tx_set_hash = *tx_set.hash();
         driver.cache_tx_set(tx_set);
 
@@ -4652,7 +4655,7 @@ mod tests {
         txs.swap(0, 1);
 
         // Use with_hash to bypass auto-sorting in TransactionSet::new
-        let tx_set = TransactionSet::with_hash(Hash256::ZERO, Hash256::ZERO, txs);
+        let tx_set = TransactionSet::from_wire_legacy(Hash256::ZERO, txs);
         assert!(
             !ScpDriver::is_tx_set_well_formed(&tx_set),
             "Swapped tx set should not be well-formed"
@@ -4663,7 +4666,7 @@ mod tests {
     fn test_is_tx_set_well_formed_duplicates() {
         let tx = make_simple_tx(1);
         // Use with_hash to bypass auto-sorting/dedup in TransactionSet::new
-        let tx_set = TransactionSet::with_hash(Hash256::ZERO, Hash256::ZERO, vec![tx.clone(), tx]);
+        let tx_set = TransactionSet::from_wire_legacy(Hash256::ZERO, vec![tx.clone(), tx]);
         assert!(
             !ScpDriver::is_tx_set_well_formed(&tx_set),
             "Tx set with duplicate should not be well-formed"
@@ -4688,7 +4691,7 @@ mod tests {
 
         // Verify this order IS unsorted by hash (precondition for the test)
         let unsorted_set =
-            TransactionSet::with_hash(Hash256::ZERO, Hash256::ZERO, fee_priority_order.clone());
+            TransactionSet::from_wire_legacy(Hash256::ZERO, fee_priority_order.clone());
         assert!(
             !ScpDriver::is_tx_set_well_formed(&unsorted_set),
             "Precondition: fee-priority order should fail global hash sort"

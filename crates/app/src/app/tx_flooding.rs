@@ -705,13 +705,10 @@ impl App {
     pub(super) async fn handle_tx_set(&self, tx_set: stellar_xdr::curr::TransactionSet) {
         use henyey_herder::TransactionSet;
 
-        // For legacy TransactionSet, hash is SHA-256 of previous_ledger_hash + tx XDR blobs
+        // Build internal TransactionSet from wire data — hash computed internally
         let transactions: Vec<_> = tx_set.txs.to_vec();
         let prev_hash = henyey_common::Hash256::from_bytes(tx_set.previous_ledger_hash.0);
-        let hash = TransactionSet::compute_non_generalized_hash(prev_hash, &transactions);
-
-        // Create our internal TransactionSet with correct hash
-        let internal_tx_set = TransactionSet::with_hash(prev_hash, hash, transactions);
+        let internal_tx_set = TransactionSet::from_wire_legacy(prev_hash, transactions);
         {
             let mut map = self.tx_set_dont_have.write().await;
             map.remove(internal_tx_set.hash());

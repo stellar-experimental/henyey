@@ -35,9 +35,12 @@ pub enum TxSetBody {
 /// A set of transactions for a ledger.
 ///
 /// All fields are private. Construction only through provided constructors.
-/// `new_legacy` and `new_generalized` compute the hash internally (hash is
-/// guaranteed correct). `from_wire_legacy` trusts a caller-provided hash for
-/// legacy sets received from the wire (validated later).
+/// Every constructor computes the hash internally — hash/body consistency is
+/// guaranteed by construction. There is no production code path that accepts
+/// a caller-supplied hash.
+///
+/// Matches the stellar-core `TxSetXDRFrame` design where the constructor
+/// always computes the hash (`TxSetFrame.cpp:755-758`).
 #[derive(Debug, Clone)]
 pub struct TransactionSet {
     hash: Hash256,
@@ -67,27 +70,27 @@ impl TransactionSet {
     ) -> Self {
         let mut transactions = transactions;
         sort_txs_by_hash(&mut transactions);
-        let hash = Self::compute_non_generalized_hash(previous_ledger_hash, &transactions);
-
-        Self {
-            hash,
-            body: TxSetBody::Legacy {
-                previous_ledger_hash,
-                transactions,
-            },
-        }
+        Self::from_legacy_parts(previous_ledger_hash, transactions)
     }
 
-    /// Build a legacy tx set from wire/archive data.
+    /// Build a legacy tx set from wire data.
     ///
-    /// Hash is caller-provided, transactions are stored as-is (may be unsorted
-    /// or have duplicates). Validation happens later in `is_tx_set_well_formed`
-    /// / `prepare_for_apply`.
-    pub(crate) fn from_wire_legacy(
+    /// Preserves input transaction order (no sorting, no dedup). Computes the
+    /// hash from the provided transactions in their given order. Does NOT
+    /// validate well-formedness — that is deferred to `prepare_for_apply`.
+    pub fn from_wire_legacy(
         previous_ledger_hash: Hash256,
-        hash: Hash256,
         transactions: Vec<TransactionEnvelope>,
     ) -> Self {
+        Self::from_legacy_parts(previous_ledger_hash, transactions)
+    }
+
+    /// Internal constructor for legacy sets. Computes hash from content.
+    fn from_legacy_parts(
+        previous_ledger_hash: Hash256,
+        transactions: Vec<TransactionEnvelope>,
+    ) -> Self {
+        let hash = Self::compute_non_generalized_hash(previous_ledger_hash, &transactions);
         Self {
             hash,
             body: TxSetBody::Legacy {
@@ -119,14 +122,25 @@ impl TransactionSet {
         Self::new_legacy(previous_ledger_hash, transactions)
     }
 
-    /// Alias for `from_wire_legacy`.
-    #[doc(hidden)]
-    pub fn with_hash(
+    /// Construct with a caller-provided hash. Does NOT validate hash/body
+    /// consistency.
+    ///
+    /// For testing within the herder crate only — intentionally creates sets
+    /// with controlled (possibly incorrect) hashes for hash-rejection and
+    /// tracker-lookup tests.
+    #[cfg(test)]
+    pub(crate) fn with_unchecked_hash(
         previous_ledger_hash: Hash256,
         hash: Hash256,
         transactions: Vec<TransactionEnvelope>,
     ) -> Self {
-        Self::from_wire_legacy(previous_ledger_hash, hash, transactions)
+        Self {
+            hash,
+            body: TxSetBody::Legacy {
+                previous_ledger_hash,
+                transactions,
+            },
+        }
     }
 
     // ── Accessors ─────────────────────────────────────────────────────
@@ -375,15 +389,7 @@ impl TransactionSet {
             StoredTransactionSet::V0(legacy) => {
                 let previous_ledger_hash = Hash256::from_bytes(legacy.previous_ledger_hash.0);
                 let transactions: Vec<TransactionEnvelope> = legacy.txs.to_vec();
-                let hash = Self::compute_non_generalized_hash(previous_ledger_hash, &transactions);
-
-                Ok(Self {
-                    hash,
-                    body: TxSetBody::Legacy {
-                        previous_ledger_hash,
-                        transactions,
-                    },
-                })
+                Ok(Self::from_legacy_parts(previous_ledger_hash, transactions))
             }
             StoredTransactionSet::V1(gen) => Ok(Self::new_generalized(gen.clone())),
         }
@@ -2000,5 +2006,61 @@ mod tests {
 
         // Hash should be consistent with recompute_hash
         assert_eq!(tx_set.hash(), &tx_set.recompute_hash());
+    }
+
+    #[test]
+    fn test_from_wire_legacy_preserves_wire_order_and_computes_hash() {
+        // Create transactions in a specific order (not sorted by hash)
+        let tx_a = make_tx_envelope(1, 100);
+        let tx_b = make_tx_envelope(2, 200);
+        let tx_c = make_tx_envelope(3, 300);
+        let wire_order = vec![tx_c.clone(), tx_a.clone(), tx_b.clone()];
+
+        let prev_hash = Hash256::from_bytes([0xAA; 32]);
+        let tx_set = TransactionSet::from_wire_legacy(prev_hash, wire_order.clone());
+
+        // (a) Wire order is preserved (no sorting)
+        let stored: Vec<_> = tx_set.iter_transactions().cloned().collect();
+        assert_eq!(stored.len(), 3);
+        assert_eq!(stored[0], tx_c);
+        assert_eq!(stored[1], tx_a);
+        assert_eq!(stored[2], tx_b);
+
+        // (b) Hash matches compute_non_generalized_hash over wire order
+        let expected_hash = TransactionSet::compute_non_generalized_hash(prev_hash, &wire_order);
+        assert_eq!(*tx_set.hash(), expected_hash);
+
+        // (c) recompute_hash() == hash() (invariant)
+        assert_eq!(tx_set.recompute_hash(), *tx_set.hash());
+    }
+
+    #[test]
+    fn test_from_wire_legacy_matches_from_xdr_stored_set() {
+        use stellar_xdr::curr::StoredTransactionSet;
+
+        // Create unsorted transactions
+        let tx_a = make_tx_envelope(10, 500);
+        let tx_b = make_tx_envelope(20, 600);
+        let wire_order = vec![tx_b.clone(), tx_a.clone()];
+
+        let prev_hash = Hash256::from_bytes([0xBB; 32]);
+
+        // Build via from_wire_legacy
+        let from_wire = TransactionSet::from_wire_legacy(prev_hash, wire_order.clone());
+
+        // Build via from_xdr_stored_set (V0 legacy path)
+        let stored_set = StoredTransactionSet::V0(stellar_xdr::curr::TransactionSet {
+            previous_ledger_hash: Hash(prev_hash.0),
+            txs: wire_order.try_into().unwrap(),
+        });
+        let from_stored = TransactionSet::from_xdr_stored_set(&stored_set).unwrap();
+
+        // Both must produce identical hash
+        assert_eq!(from_wire.hash(), from_stored.hash());
+
+        // Both must produce identical transaction order
+        let wire_txs: Vec<_> = from_wire.iter_transactions().cloned().collect();
+        let stored_txs: Vec<_> = from_stored.iter_transactions().cloned().collect();
+        assert_eq!(wire_txs, stored_txs);
     }
 }

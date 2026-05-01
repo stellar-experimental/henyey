@@ -6038,8 +6038,11 @@ mod tests {
 
         // Construct a tx set that claims to have `expected_hash` but whose
         // content actually hashes to something different.
-        let malformed_tx_set =
-            TransactionSet::with_hash(Hash256::from_bytes([0x11; 32]), expected_hash, Vec::new());
+        let malformed_tx_set = TransactionSet::with_unchecked_hash(
+            Hash256::from_bytes([0x11; 32]),
+            expected_hash,
+            Vec::new(),
+        );
         assert_ne!(
             malformed_tx_set.recompute_hash(),
             expected_hash,
