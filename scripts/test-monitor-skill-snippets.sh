@@ -82,6 +82,11 @@ check_skill_structure() {
     echo "WARNING: monitor-tick/SKILL.md does not call check_session_wiped" >&2
     drift=true
   fi
+  # Verify fail-fast: check_session_wiped call must include || exit 1
+  if ! grep -A2 'check_session_wiped' "$tick_file" | grep -q '|| exit 1'; then
+    echo "WARNING: monitor-tick/SKILL.md calls check_session_wiped without || exit 1 fail-fast" >&2
+    drift=true
+  fi
   if ! grep -q 'check_mainnet_wiped' "$tick_file"; then
     echo "WARNING: monitor-tick/SKILL.md does not call check_mainnet_wiped" >&2
     drift=true
