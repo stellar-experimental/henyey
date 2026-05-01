@@ -4921,34 +4921,41 @@ impl LedgerCloseContext<'_> {
                     // this ledger's changes are applied (matching stellar-core behavior)
                     let soroban_state_size = self.manager.soroban_state.read().total_size();
 
-                    if let Some(window_entry) = crate::execution::compute_state_size_window_entry(
-                        self.close_data.ledger_seq,
-                        protocol_version,
-                        &bucket_list,
-                        soroban_state_size,
-                        sample_period,
-                        eviction_settings
-                            .as_ref()
-                            .map(|s| s.live_soroban_state_size_window_sample_size)
-                            .unwrap_or(0),
-                    ) {
-                        // Remove any existing window entry (e.g. from a config upgrade
-                        // that resized the window) — our computed entry includes both
-                        // resize and shift+push.
-                        live_entries.retain(|e| {
-                            !matches!(
-                                &e.data,
-                                LedgerEntryData::ConfigSetting(
-                                    stellar_xdr::curr::ConfigSettingEntry::LiveSorobanStateSizeWindow(_)
+                    let sample_size = eviction_settings
+                        .as_ref()
+                        .map(|s| s.live_soroban_state_size_window_sample_size)
+                        .unwrap_or(0);
+
+                    // Only call compute if we have a valid sample_size (eviction_settings loaded)
+                    if sample_size > 0 {
+                        if let Some(window_entry) =
+                            crate::execution::compute_state_size_window_entry(
+                                self.close_data.ledger_seq,
+                                protocol_version,
+                                &bucket_list,
+                                soroban_state_size,
+                                sample_period,
+                                sample_size,
+                            )?
+                        {
+                            // Remove any existing window entry (e.g. from a config upgrade
+                            // that resized the window) — our computed entry includes both
+                            // resize and shift+push.
+                            live_entries.retain(|e| {
+                                !matches!(
+                                    &e.data,
+                                    LedgerEntryData::ConfigSetting(
+                                        stellar_xdr::curr::ConfigSettingEntry::LiveSorobanStateSizeWindow(_)
+                                    )
                                 )
-                            )
-                        });
-                        tracing::info!(
-                            ledger_seq = self.close_data.ledger_seq,
-                            soroban_state_size = soroban_state_size,
-                            "Adding state size window entry to live entries (from in-memory state)"
-                        );
-                        live_entries.push(window_entry);
+                            });
+                            tracing::info!(
+                                ledger_seq = self.close_data.ledger_seq,
+                                soroban_state_size = soroban_state_size,
+                                "Adding state size window entry to live entries (from in-memory state)"
+                            );
+                            live_entries.push(window_entry);
+                        }
                     }
                 }
             }

@@ -380,7 +380,7 @@ pub(super) fn compute_soroban_state_size_window_entry(
     bucket_list: &henyey_bucket::BucketList,
     soroban_state_size: u64,
     archival_override: Option<&stellar_xdr::curr::StateArchivalSettings>,
-) -> Option<LedgerEntry> {
+) -> Result<Option<LedgerEntry>> {
     use stellar_xdr::curr::VecM;
 
     // Load StateArchival settings
@@ -390,32 +390,54 @@ pub(super) fn compute_soroban_state_size_window_entry(
         let archival_key = LedgerKey::ConfigSetting(LedgerKeyConfigSetting {
             config_setting_id: ConfigSettingId::StateArchival,
         });
-        let archival_entry = bucket_list.get(&archival_key).ok()??;
+        let archival_entry = bucket_list.get(&archival_key)?.ok_or_else(|| {
+            HistoryError::VerificationFailed(
+                "compute_soroban_state_size_window_entry: StateArchival config entry not found"
+                    .into(),
+            )
+        })?;
         match archival_entry.data {
             LedgerEntryData::ConfigSetting(ConfigSettingEntry::StateArchival(settings)) => settings,
-            _ => return None,
+            _ => {
+                return Err(HistoryError::VerificationFailed(
+                    "compute_soroban_state_size_window_entry: expected StateArchival, got wrong variant".into(),
+                ));
+            }
         }
     };
 
     let sample_period = archival.live_soroban_state_size_window_sample_period;
     let sample_size = archival.live_soroban_state_size_window_sample_size as usize;
     if sample_period == 0 || sample_size == 0 {
-        return None;
+        return Err(HistoryError::VerificationFailed(
+            "compute_soroban_state_size_window_entry: sample_period or sample_size is 0 (invalid config)".into(),
+        ));
     }
 
     // Load current window
     let window_key = LedgerKey::ConfigSetting(LedgerKeyConfigSetting {
         config_setting_id: ConfigSettingId::LiveSorobanStateSizeWindow,
     });
-    let window_entry = bucket_list.get(&window_key).ok()??;
+    let window_entry = bucket_list.get(&window_key)?.ok_or_else(|| {
+        HistoryError::VerificationFailed(
+            "compute_soroban_state_size_window_entry: LiveSorobanStateSizeWindow config entry not found".into(),
+        )
+    })?;
     let window = match window_entry.data {
         LedgerEntryData::ConfigSetting(ConfigSettingEntry::LiveSorobanStateSizeWindow(w)) => w,
-        _ => return None,
+        _ => {
+            return Err(HistoryError::VerificationFailed(
+                "compute_soroban_state_size_window_entry: expected LiveSorobanStateSizeWindow, got wrong variant".into(),
+            ));
+        }
     };
 
     let mut window_vec: Vec<u64> = window.into();
     if window_vec.is_empty() {
-        return None;
+        return Err(HistoryError::VerificationFailed(
+            "compute_soroban_state_size_window_entry: window vec is empty (invariant violation)"
+                .into(),
+        ));
     }
 
     let mut changed = false;
@@ -443,18 +465,18 @@ pub(super) fn compute_soroban_state_size_window_entry(
     }
 
     if !changed {
-        return None;
+        return Ok(None);
     }
 
-    let window_vecm: VecM<u64> = window_vec.try_into().ok()?;
+    let window_vecm: VecM<u64> = window_vec.try_into()?;
 
-    Some(LedgerEntry {
+    Ok(Some(LedgerEntry {
         last_modified_ledger_seq: seq,
         data: LedgerEntryData::ConfigSetting(ConfigSettingEntry::LiveSorobanStateSizeWindow(
             window_vecm,
         )),
         ext: LedgerEntryExt::V0,
-    })
+    }))
 }
 
 fn combined_bucket_list_hash(
@@ -739,7 +761,7 @@ pub fn replay_ledger_with_execution(
             bucket_list,
             state_size,
             Some(&eviction_settings),
-        ) {
+        )? {
             // Remove any existing window entry (e.g. from a config upgrade resize)
             all_live_entries.retain(|e| {
                 !matches!(
@@ -1395,7 +1417,8 @@ mod tests {
 
         // Test at sample boundary (seq % 100 == 0) with new state size 6000
         let result =
-            compute_soroban_state_size_window_entry(200, &bucket_list, 6000, Some(&archival));
+            compute_soroban_state_size_window_entry(200, &bucket_list, 6000, Some(&archival))
+                .expect("should not error");
         assert!(
             result.is_some(),
             "Should produce window entry at sample boundary"
@@ -1469,7 +1492,8 @@ mod tests {
 
         // Test NOT at sample boundary (seq % 100 != 0)
         let result =
-            compute_soroban_state_size_window_entry(201, &bucket_list, 6000, Some(&archival));
+            compute_soroban_state_size_window_entry(201, &bucket_list, 6000, Some(&archival))
+                .expect("should not error");
         assert!(
             result.is_none(),
             "Should NOT produce window entry when not at sample boundary"
@@ -1531,7 +1555,8 @@ mod tests {
 
         // Even when not at sample boundary, resize should trigger update
         let result =
-            compute_soroban_state_size_window_entry(201, &bucket_list, 6000, Some(&archival));
+            compute_soroban_state_size_window_entry(201, &bucket_list, 6000, Some(&archival))
+                .expect("should not error");
         assert!(
             result.is_some(),
             "Should produce window entry when resizing"
