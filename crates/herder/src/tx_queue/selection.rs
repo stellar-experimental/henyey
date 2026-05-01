@@ -117,7 +117,7 @@ impl TransactionQueue {
         override_fee_provider: Option<&dyn FeeBalanceProvider>,
         override_account_provider: Option<&dyn AccountProvider>,
     ) -> TransactionSet {
-        use stellar_xdr::curr::{GeneralizedTransactionSet, WriteXdr};
+        use stellar_xdr::curr::GeneralizedTransactionSet;
 
         let SelectedTxs {
             transactions,
@@ -220,15 +220,7 @@ impl TransactionQueue {
                 .unwrap_or_default(),
         });
 
-        // Compute hash as SHA-256 of XDR-encoded GeneralizedTransactionSet
-        let hash = if let Ok(xdr_bytes) = gen_tx_set.to_xdr(stellar_xdr::curr::Limits::none()) {
-            Hash256::hash(&xdr_bytes)
-        } else {
-            Hash256::ZERO
-        };
-
-        let tx_set = TransactionSet::new_generalized(hash, gen_tx_set);
-        tx_set
+        TransactionSet::new_generalized(gen_tx_set)
     }
 
     #[cfg(test)]

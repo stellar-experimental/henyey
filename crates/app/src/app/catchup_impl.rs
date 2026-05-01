@@ -1017,7 +1017,7 @@ impl App {
         mut message_rx: tokio::sync::mpsc::UnboundedReceiver<OverlayMessage>,
     ) {
         use std::collections::HashSet;
-        use stellar_xdr::curr::{Limits, ScpStatementPledges, WriteXdr};
+        use stellar_xdr::curr::{Limits, ScpStatementPledges};
 
         let mut cached_tx_sets = 0u32;
         let mut requested_tx_sets = 0u32;
@@ -1029,18 +1029,9 @@ impl App {
         while let Some(msg) = message_rx.recv().await {
             match msg.message {
                 StellarMessage::GeneralizedTxSet(gen_tx_set) => {
-                    // Compute hash as SHA-256 of XDR-encoded GeneralizedTransactionSet
-                    let xdr_bytes = match gen_tx_set.to_xdr(stellar_xdr::curr::Limits::none()) {
-                        Ok(bytes) => bytes,
-                        Err(e) => {
-                            tracing::warn!(error = %e, "Failed to encode GeneralizedTxSet to XDR");
-                            continue;
-                        }
-                    };
-                    let hash = henyey_common::Hash256::hash(&xdr_bytes);
+                    let tx_set = henyey_herder::TransactionSet::new_generalized(gen_tx_set);
 
-                    let tx_set = henyey_herder::TransactionSet::new_generalized(hash, gen_tx_set);
-
+                    let hash = *tx_set.hash();
                     // Cache it in herder and drain ready envelopes off the
                     // event loop (this will be available after catchup).
                     self.herder.clone().cache_tx_set_and_drain(tx_set).await;

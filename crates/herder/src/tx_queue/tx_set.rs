@@ -34,8 +34,10 @@ pub enum TxSetBody {
 
 /// A set of transactions for a ledger.
 ///
-/// All fields are private. Construction only through provided constructors,
-/// which enforce the hash-is-correct invariant.
+/// All fields are private. Construction only through provided constructors.
+/// `new_legacy` and `new_generalized` compute the hash internally (hash is
+/// guaranteed correct). `from_wire_legacy` trusts a caller-provided hash for
+/// legacy sets received from the wire (validated later).
 #[derive(Debug, Clone)]
 pub struct TransactionSet {
     hash: Hash256,
@@ -95,15 +97,14 @@ impl TransactionSet {
         }
     }
 
-    /// Construct a generalized transaction set from a precomputed hash and body.
+    /// Construct a generalized transaction set. Computes the hash internally
+    /// as SHA-256 of the XDR-encoded body.
     ///
-    /// Stores the caller-provided hash/body pair without validating hash/body
-    /// consistency or structural well-formedness. Hash must be the SHA-256 of the
-    /// XDR-encoded `GeneralizedTransactionSet`.
-    ///
-    /// This follows "store first, validate later" semantics consistent with
-    /// the receive-layer parity model.
-    pub fn new_generalized(hash: Hash256, generalized_tx_set: GeneralizedTransactionSet) -> Self {
+    /// Enforces only hash/body consistency — does NOT validate semantic
+    /// well-formedness or protocol conformance. Validation is deferred to
+    /// `is_tx_set_well_formed` / `prepare_for_apply` (store now, validate later).
+    pub fn new_generalized(generalized_tx_set: GeneralizedTransactionSet) -> Self {
+        let hash = Hash256::hash_xdr(&generalized_tx_set);
         Self {
             hash,
             body: TxSetBody::Generalized(generalized_tx_set),
@@ -384,17 +385,7 @@ impl TransactionSet {
                     },
                 })
             }
-            StoredTransactionSet::V1(gen) => {
-                let hash = gen
-                    .to_xdr(Limits::none())
-                    .map(|bytes| Hash256::hash(&bytes))
-                    .map_err(|e| format!("Failed to encode generalized tx set: {}", e))?;
-
-                Ok(Self {
-                    hash,
-                    body: TxSetBody::Generalized(gen.clone()),
-                })
-            }
+            StoredTransactionSet::V1(gen) => Ok(Self::new_generalized(gen.clone())),
         }
     }
 
@@ -455,15 +446,7 @@ impl TransactionSet {
         let all_transactions: Vec<TransactionEnvelope> = extract_transactions_from_generalized(gen);
         check_no_duplicate_source_accounts(&all_transactions)?;
 
-        let hash = gen
-            .to_xdr(Limits::none())
-            .map(|bytes| Hash256::hash(&bytes))
-            .map_err(|e| format!("Failed to encode generalized tx set: {}", e))?;
-
-        Ok(Self {
-            hash,
-            body: TxSetBody::Generalized(gen.clone()),
-        })
+        Ok(Self::new_generalized(gen.clone()))
     }
 
     /// Validate and prepare a legacy (non-generalized) transaction set for application.
@@ -1980,13 +1963,42 @@ mod tests {
             .try_into()
             .unwrap(),
         });
-        let hash = Hash256::hash_xdr(&gen);
+        let expected_hash = Hash256::hash_xdr(&gen);
 
-        let tx_set = TransactionSet::new_generalized(hash, gen.clone());
+        let tx_set = TransactionSet::new_generalized(gen.clone());
 
-        assert_eq!(tx_set.hash(), &hash);
+        assert_eq!(tx_set.hash(), &expected_hash);
         assert!(tx_set.is_generalized());
         assert_eq!(tx_set.generalized_tx_set(), Some(&gen));
         assert!(tx_set.as_legacy_transactions().is_none());
+    }
+
+    #[test]
+    fn test_new_generalized_accepts_malformed_set() {
+        // A semantically invalid but XDR-encodable GeneralizedTransactionSet
+        // (3 phases — protocol only allows 1 or 2). Proves the constructor does
+        // not perform early validation.
+        let phase = TransactionPhase::V0(
+            vec![TxSetComponent::TxsetCompTxsMaybeDiscountedFee(
+                TxSetComponentTxsMaybeDiscountedFee {
+                    base_fee: None,
+                    txs: vec![].try_into().unwrap(),
+                },
+            )]
+            .try_into()
+            .unwrap(),
+        );
+        let malformed_gen = GeneralizedTransactionSet::V1(TransactionSetV1 {
+            previous_ledger_hash: Hash([0xBB; 32]),
+            phases: vec![phase.clone(), phase.clone(), phase]
+                .try_into()
+                .unwrap(),
+        });
+
+        // Constructor should accept it without panic
+        let tx_set = TransactionSet::new_generalized(malformed_gen);
+
+        // Hash should be consistent with recompute_hash
+        assert_eq!(tx_set.hash(), &tx_set.recompute_hash());
     }
 }

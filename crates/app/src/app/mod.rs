@@ -3477,8 +3477,8 @@ mod tests {
     #[tokio::test]
     async fn test_try_start_ledger_close_rejects_malformed_tx_set() {
         use stellar_xdr::curr::{
-            GeneralizedTransactionSet, Hash, Limits, TransactionPhase, TransactionSetV1,
-            TxSetComponent, TxSetComponentTxsMaybeDiscountedFee, WriteXdr,
+            GeneralizedTransactionSet, Hash, TransactionPhase, TransactionSetV1, TxSetComponent,
+            TxSetComponentTxsMaybeDiscountedFee,
         };
 
         let dir = tempfile::tempdir().expect("temp dir");
@@ -3509,11 +3509,8 @@ mod tests {
                 .unwrap(),
         });
 
-        // Compute the real hash so it passes the tx_set_hash check.
-        let xdr_bytes = malformed_gen.to_xdr(Limits::none()).unwrap();
-        let hash = henyey_common::Hash256::hash(&xdr_bytes);
-
-        let tx_set = henyey_herder::TransactionSet::new_generalized(hash, malformed_gen);
+        let tx_set = henyey_herder::TransactionSet::new_generalized(malformed_gen);
+        let hash = *tx_set.hash();
 
         // get_current_ledger() returns 0 for uninitialized app → next_seq = 1
         let next_seq: u32 = 1;

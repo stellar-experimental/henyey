@@ -7696,8 +7696,7 @@ mod advance_tracking_slot_tests {
     /// encoding so that `prepare_for_apply` accepts the recomputed hash.
     fn empty_n_phase_generalized_tx_set(n_phases: usize) -> TransactionSet {
         use stellar_xdr::curr::{
-            GeneralizedTransactionSet, Hash, Limits, TransactionPhase, TransactionSetV1, VecM,
-            WriteXdr,
+            GeneralizedTransactionSet, Hash, TransactionPhase, TransactionSetV1, VecM,
         };
         let phases: VecM<TransactionPhase> = (0..n_phases)
             .map(|_| TransactionPhase::V0(VecM::default()))
@@ -7708,11 +7707,7 @@ mod advance_tracking_slot_tests {
             previous_ledger_hash: Hash([0u8; 32]),
             phases,
         });
-        let hash = gen
-            .to_xdr(Limits::none())
-            .map(|bytes| Hash256::hash(&bytes))
-            .unwrap_or(Hash256::ZERO);
-        TransactionSet::new_generalized(hash, gen)
+        TransactionSet::new_generalized(gen)
     }
 
     /// Helper accepts a valid empty 2-phase generalized V0 tx set on protocol
@@ -7994,12 +7989,7 @@ mod advance_tracking_slot_tests {
             phases: vec![classic_phase, soroban_phase].try_into().unwrap(),
         });
 
-        let hash = gen
-            .to_xdr(stellar_xdr::curr::Limits::none())
-            .map(|bytes| Hash256::hash(&bytes))
-            .expect("XDR encoding");
-
-        TransactionSet::new_generalized(hash, gen)
+        TransactionSet::new_generalized(gen)
     }
 
     fn make_test_soroban_info() -> henyey_ledger::SorobanNetworkInfo {

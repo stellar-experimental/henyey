@@ -772,23 +772,12 @@ impl App {
         gen_tx_set: stellar_xdr::curr::GeneralizedTransactionSet,
     ) {
         use henyey_herder::TransactionSet;
-        use stellar_xdr::curr::WriteXdr;
-
-        // Compute hash as SHA-256 of XDR-encoded GeneralizedTransactionSet
-        // This matches how stellar-core computes it: xdrSha256(xdrTxSet)
-        let xdr_bytes = match gen_tx_set.to_xdr(stellar_xdr::curr::Limits::none()) {
-            Ok(bytes) => bytes,
-            Err(e) => {
-                tracing::error!(error = %e, "Failed to encode GeneralizedTxSet to XDR");
-                return;
-            }
-        };
-        let hash = henyey_common::Hash256::hash(&xdr_bytes);
 
         // Parity: stellar-core's Peer::recvGeneralizedTxSet (Peer.cpp:1515–1521)
         // performs zero structural validation at the receive layer — all validation
         // is deferred to the herder via prepare_for_apply. We match that approach.
-        let internal_tx_set = TransactionSet::new_generalized(hash, gen_tx_set);
+        let internal_tx_set = TransactionSet::new_generalized(gen_tx_set);
+        let hash = *internal_tx_set.hash();
 
         tracing::debug!(
             hash = %hash,
