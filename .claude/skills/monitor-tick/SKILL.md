@@ -90,10 +90,9 @@ fi
 - Skip checks dependent on log/metrics files (1, 5, 6, 7, 12).
 - Attempt admin-port checks: (2) ledger progression, (8) RPC health, (9) OBSRVR
   — the live process may still respond to HTTP.
-- Report status: **`ACTION`** with `wipe: SESSION DIR WIPED — process alive
-  (PID $OUR_PID), operator intervention needed`.
-- Add `"session-wiped-process-alive"` to `actions`, `"wipe=session-dir"` to `watch`.
-- File/comment issue per the Filing Flow below.
+- Report status, `actions`, `watch`, and `wipe:` line per wipe-state
+  composition table (row #3 or #6 depending on `MAINNET_WIPED`).
+- File/comment issue per wipe-state issue-filing policy.
 
 **Case B: `SESSION_WIPED_PROCESS_ALIVE=no`**
 - Touch `.alive`.
@@ -104,21 +103,24 @@ fi
   CARGO_TARGET_DIR=/home/tomer/data/$MONITOR_SESSION_ID/cargo-target \
     cargo build --release -p henyey
   ```
-  If build fails: report `OFFLINE` with action `session-wiped-rebuild-failed`, exit.
+  If build fails: report `OFFLINE`; emit `actions`/`watch`/`wipe:` per
+  wipe-state composition table (row #5 or #8). **File/comment issue before
+  exit** using wipe-state issue-filing policy. Then exit.
 - **Relaunch** via standard Relaunch procedure.
-- Report status: **`ACTION`** with `wipe: SESSION DIR WIPED — rebuilt +
-  relaunched (new PID $NEW_PID)`.
-- Add `"session-wiped-recovery"` to `actions`, `"wipe=session-dir"` to `watch`.
-- File/comment issue per the Filing Flow below.
+- Report status, `actions`, `watch`, and `wipe:` line per wipe-state
+  composition table (row #4 or #7 depending on `MAINNET_WIPED`).
+- File/comment issue per wipe-state issue-filing policy.
 
 ## Mainnet-data-vanished detection
 
-After the session-dir check, when `SESSION_WIPED=no` (session dir exists but
-mainnet data may not):
+After the session-dir check, independently verify that mainnet data exists
+(regardless of session-dir state). **Note:** The stale-env early-exit
+(line 75) terminates the tick before reaching this point — no wipe signal
+is emitted in that case because no tick report is generated.
 
 ```bash
 MAINNET_WIPED=no
-if [ "$SESSION_WIPED" = "no" ] && [ ! -d "/home/tomer/data/mainnet" ]; then
+if [ ! -d "/home/tomer/data/mainnet" ]; then
   MAINNET_WIPED=yes
 fi
 # Note: if mainnet/ dir exists but mainnet.db is missing, defer to FRESH_START
@@ -126,11 +128,51 @@ fi
 # MAINNET_WIPED only fires when the ENTIRE directory is gone.
 ```
 
-When `MAINNET_WIPED=yes`:
-- The tick proceeds normally (catchup recovery via `FRESH_START=yes`).
-- Include `"mainnet-data-wiped"` in `actions` array.
-- Include `"wipe=mainnet-data"` in `watch`.
-- File/comment an `urgent` issue per the Filing Flow.
+### Wipe-state composition
+
+Both `SESSION_WIPED` and `MAINNET_WIPED` are fully determined at this point.
+All downstream reporting derives wipe-related outputs from these two flags
+using the truth table below. **This is the single source of truth** — Case A/B
+and the status formatter reference this table; they do not independently define
+wipe-related outputs.
+
+#### Complete state truth table
+
+| # | SESSION_WIPED | MAINNET_WIPED | Case | `actions` | `watch` | Status level | `wipe:` line | Issue title pattern |
+|---|:---:|:---:|---|---|---|---|---|---|
+| 1 | no | no | — | — | — | (normal) | (omitted) | — |
+| 2 | no | yes | — | `"mainnet-data-wiped"` | `"wipe=mainnet-data"` | ACTION | `MAINNET DATA WIPED — catchup recovery` | `OFFLINE: mainnet data wiped out-of-band` |
+| 3 | yes | no | A | `"session-wiped-process-alive"` | `"wipe=session-dir"` | ACTION | `SESSION DIR WIPED — process alive (PID N), operator intervention needed` | `OFFLINE: validator session wiped out-of-band` |
+| 4 | yes | no | B-ok | `"session-wiped-recovery"` | `"wipe=session-dir"` | ACTION | `SESSION DIR WIPED — rebuilt + relaunched (new PID N)` | `OFFLINE: validator session wiped out-of-band` |
+| 5 | yes | no | B-fail | `"session-wiped-rebuild-failed"` | `"wipe=session-dir"` | OFFLINE | `SESSION DIR WIPED — rebuild failed` | `OFFLINE: validator session wiped out-of-band` |
+| 6 | yes | yes | A | `"session-wiped-process-alive"`, `"mainnet-data-wiped"` | `"wipe=session-dir"`, `"wipe=mainnet-data"` | ACTION | `SESSION DIR WIPED — process alive (PID N) + MAINNET DATA WIPED` | `OFFLINE: session + mainnet data wiped out-of-band` |
+| 7 | yes | yes | B-ok | `"session-wiped-recovery"`, `"mainnet-data-wiped"` | `"wipe=session-dir"`, `"wipe=mainnet-data"` | ACTION | `SESSION DIR WIPED — rebuilt + relaunched (new PID N) + MAINNET DATA WIPED` | `OFFLINE: session + mainnet data wiped out-of-band` |
+| 8 | yes | yes | B-fail | `"session-wiped-rebuild-failed"`, `"mainnet-data-wiped"` | `"wipe=session-dir"`, `"wipe=mainnet-data"` | OFFLINE | `SESSION DIR WIPED — rebuild failed + MAINNET DATA WIPED` | `OFFLINE: session + mainnet data wiped out-of-band` |
+
+**Composition rule:** The `wipe:` line is built from up to two fragments
+joined by ` + `:
+1. Session fragment (from Case outcome): present when `SESSION_WIPED=yes`
+2. `MAINNET DATA WIPED`: appended when `MAINNET_WIPED=yes`
+
+When only mainnet is wiped (#2), append `— catchup recovery` to the mainnet
+fragment. In combined cases (#6–8), omit this suffix because the recovery
+mechanism is the session-wipe Case B relaunch (which handles FRESH_START
+implicitly).
+
+**Issue-filing policy:**
+- File/comment **one** issue per tick, not per flag.
+- **Dedup/search:** Search open issues by the canonical title pattern from the
+  table above. If an open issue with that title exists, comment on it (adding
+  new evidence). Otherwise create a new issue.
+- **Combined wipe:** Use the combined title (`session + mainnet data wiped`).
+  Do NOT also file a separate mainnet-only issue.
+- **Label/severity:** Defer to the existing Filing Flow label policy. In
+  general: OFFLINE status → `urgent`; ACTION with process alive → per policy
+  (typically `urgent` since node state is uncertain).
+
+**Tick-history `watch` array:** Both `"wipe=session-dir"` and
+`"wipe=mainnet-data"` may coexist in a single tick's watch array. The
+daily-summary aggregator handles this — each entry is independent.
 
 ## Session-alive marker
 
@@ -996,7 +1038,7 @@ Print a multiline status report:
 ```
 MONITOR <OK|WARNING|ACTION|OFFLINE> — L<ledger> — <timestamp>
   node:    mode=<MODE> session=<session-id> pid=<PID> fresh_start=<yes|no>
-  wipe:    <SESSION DIR WIPED — process alive (PID N), operator intervention needed | SESSION DIR WIPED — rebuilt + relaunched (new PID N) | MAINNET DATA WIPED — catchup recovery | N/A>
+  wipe:    <per wipe-state composition table — omitted when no wipe>
   sync:    <synced | CATCHING UP (gap=N, uptime=Xm, deadline=<15m|60m|4h>) | SYNC FAILURE (gap=N, uptime=Xm — filed/commented #<N>)>
   mem:     <RSS_MB>MB rss | alloc=<alloc>MB resident=<resident>MB frag=<pct>%
            heap=<heap>MB mmap=<mmap>MB unaccounted=<sign><unaccounted>MB
@@ -1010,8 +1052,9 @@ MONITOR <OK|WARNING|ACTION|OFFLINE> — L<ledger> — <timestamp>
   self_reflect: <clean | fixed inline (<sha>: <short-desc>) | filed #<N> (urgent: <short-desc>) | filed #<N> (no-label: <short-desc>) | filed #<N> (not-ready: <short-desc>)>
 ```
 
-The `wipe:` line is only present when `SESSION_WIPED=yes` or `MAINNET_WIPED=yes`.
-When neither wipe condition fires, omit the `wipe:` line entirely.
+The `wipe:` line is present when `SESSION_WIPED=yes` or `MAINNET_WIPED=yes`
+(or both). Format per the wipe-state composition table above. When neither
+fires, omit the line entirely.
 
 Use WARNING for threshold breaches. Use ACTION when a corrective action was
 taken (restart, deploy, filed a new issue, commented on an existing issue,
