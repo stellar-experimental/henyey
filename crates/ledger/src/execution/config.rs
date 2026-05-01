@@ -10,8 +10,9 @@ use super::*;
 ///
 /// Returns `Ok(Some(entry))` if the setting exists, `Ok(None)` if it genuinely
 /// doesn't exist (e.g., pre-Soroban protocol), and `Err` if an I/O error
-/// occurred during lookup. This matches stellar-core's behavior where I/O
-/// errors are never silently swallowed.
+/// occurred during lookup or if the entry exists but contains a non-ConfigSetting
+/// data variant (data corruption). This matches stellar-core's behavior where
+/// data invariant violations are never silently swallowed.
 pub(crate) fn load_config_setting(
     reader: &impl crate::EntryReader,
     id: ConfigSettingId,
@@ -24,7 +25,10 @@ pub(crate) fn load_config_setting(
             if let LedgerEntryData::ConfigSetting(config) = entry.data {
                 Ok(Some(config))
             } else {
-                Ok(None)
+                Err(LedgerError::Internal(format!(
+                    "load_config_setting: expected ConfigSetting data for {:?}, got wrong LedgerEntryData variant",
+                    id
+                )))
             }
         }
         None => Ok(None),
@@ -33,25 +37,25 @@ pub(crate) fn load_config_setting(
 
 /// Load a required config setting and extract a specific variant.
 ///
-/// Reduces the repeated pattern of:
-/// 1. `load_config_setting(snapshot, id)?`
-/// 2. `require_setting(result, id)?`
-/// 3. `if let ConfigSettingEntry::Variant(val) = cs { val } else { return Err(...) }`
+/// Returns the inner value of the requested `ConfigSettingEntry` variant,
+/// or errors if the setting is missing or has a wrong `ConfigSettingEntry`
+/// subtype. The `$ctx` parameter identifies the calling function for
+/// diagnostic messages.
 macro_rules! load_config {
-    ($snapshot:expr, $id:expr, $variant:ident) => {{
+    ($snapshot:expr, $id:expr, $variant:ident, $ctx:expr) => {{
         let id = $id;
         let cs = load_config_setting($snapshot, id)?.ok_or_else(|| {
             LedgerError::Internal(format!(
-                "load_soroban_config: required config setting {:?} not found in ledger",
-                id
+                "{}: required config setting {:?} not found in ledger",
+                $ctx, id
             ))
         })?;
         if let ConfigSettingEntry::$variant(val) = cs {
             val
         } else {
             return Err(LedgerError::Internal(format!(
-                "load_soroban_config: unexpected variant for {:?}",
-                id
+                "{}: unexpected variant for {:?}",
+                $ctx, id
             )));
         }
     }};
@@ -79,21 +83,24 @@ pub fn load_soroban_config(
     let cpu_cost_params = load_config!(
         reader,
         ConfigSettingId::ContractCostParamsCpuInstructions,
-        ContractCostParamsCpuInstructions
+        ContractCostParamsCpuInstructions,
+        "load_soroban_config"
     );
 
     // Load memory cost params
     let mem_cost_params = load_config!(
         reader,
         ConfigSettingId::ContractCostParamsMemoryBytes,
-        ContractCostParamsMemoryBytes
+        ContractCostParamsMemoryBytes,
+        "load_soroban_config"
     );
 
     // Load compute limits and fee rate per instructions
     let compute = load_config!(
         reader,
         ConfigSettingId::ContractComputeV0,
-        ContractComputeV0
+        ContractComputeV0,
+        "load_soroban_config"
     );
     let (tx_max_instructions, tx_max_memory_bytes, fee_per_instruction_increment) = (
         compute.tx_max_instructions as u64,
@@ -105,7 +112,8 @@ pub fn load_soroban_config(
     let cost = load_config!(
         reader,
         ConfigSettingId::ContractLedgerCostV0,
-        ContractLedgerCostV0
+        ContractLedgerCostV0,
+        "load_soroban_config"
     );
     let (
         fee_disk_read_ledger_entry,
@@ -145,13 +153,19 @@ pub fn load_soroban_config(
         let hist = load_config!(
             reader,
             ConfigSettingId::ContractHistoricalDataV0,
-            ContractHistoricalDataV0
+            ContractHistoricalDataV0,
+            "load_soroban_config"
         );
         hist.fee_historical1_kb
     };
 
     let (tx_max_contract_events_size_bytes, fee_contract_events_1kb) = {
-        let events = load_config!(reader, ConfigSettingId::ContractEventsV0, ContractEventsV0);
+        let events = load_config!(
+            reader,
+            ConfigSettingId::ContractEventsV0,
+            ContractEventsV0,
+            "load_soroban_config"
+        );
         (
             events.tx_max_contract_events_size_bytes,
             events.fee_contract_events1_kb,
@@ -162,7 +176,8 @@ pub fn load_soroban_config(
         let bandwidth = load_config!(
             reader,
             ConfigSettingId::ContractBandwidthV0,
-            ContractBandwidthV0
+            ContractBandwidthV0,
+            "load_soroban_config"
         );
         bandwidth.fee_tx_size1_kb
     };
@@ -171,17 +186,24 @@ pub fn load_soroban_config(
     let max_contract_size_bytes = load_config!(
         reader,
         ConfigSettingId::ContractMaxSizeBytes,
-        ContractMaxSizeBytes
+        ContractMaxSizeBytes,
+        "load_soroban_config"
     );
 
     let max_contract_data_entry_size_bytes = load_config!(
         reader,
         ConfigSettingId::ContractDataEntrySizeBytes,
-        ContractDataEntrySizeBytes
+        ContractDataEntrySizeBytes,
+        "load_soroban_config"
     );
 
     // Load state archival TTL settings
-    let archival = load_config!(reader, ConfigSettingId::StateArchival, StateArchival);
+    let archival = load_config!(
+        reader,
+        ConfigSettingId::StateArchival,
+        StateArchival,
+        "load_soroban_config"
+    );
     tracing::debug!(
         min_temp_ttl = archival.min_temporary_ttl,
         min_persistent_ttl = archival.min_persistent_ttl,
@@ -208,7 +230,8 @@ pub fn load_soroban_config(
         let window = load_config!(
             reader,
             ConfigSettingId::LiveSorobanStateSizeWindow,
-            LiveSorobanStateSizeWindow
+            LiveSorobanStateSizeWindow,
+            "load_soroban_config"
         );
         if window.is_empty() {
             0i64
@@ -475,8 +498,9 @@ pub(crate) fn compute_soroban_resource_fee(
 /// Load frozen key configuration from ledger state (Protocol 26+, CAP-77).
 ///
 /// Returns a `FrozenKeyConfig` loaded from CONFIG_SETTING_FROZEN_LEDGER_KEYS and
-/// CONFIG_SETTING_FREEZE_BYPASS_TXS. Returns empty config if settings don't exist
-/// (pre-P26 or not yet initialized).
+/// CONFIG_SETTING_FREEZE_BYPASS_TXS. Returns empty config for pre-P26 protocols.
+/// Returns an error if settings are missing or have wrong variants for P26+,
+/// since both are created during V26 ledger initialization.
 pub fn load_frozen_key_config(
     reader: &impl crate::EntryReader,
     protocol_version: u32,
@@ -487,19 +511,23 @@ pub fn load_frozen_key_config(
         return Ok(henyey_tx::frozen_keys::FrozenKeyConfig::empty());
     }
 
-    // Load frozen ledger keys
-    let frozen_key_bytes = match load_config_setting(reader, ConfigSettingId::FrozenLedgerKeys)? {
-        Some(ConfigSettingEntry::FrozenLedgerKeys(fk)) => {
-            fk.keys.iter().map(|k| k.0.to_vec()).collect()
-        }
-        _ => Vec::new(),
-    };
+    // Load frozen ledger keys (required for V26+)
+    let fk = load_config!(
+        reader,
+        ConfigSettingId::FrozenLedgerKeys,
+        FrozenLedgerKeys,
+        "load_frozen_key_config"
+    );
+    let frozen_key_bytes = fk.keys.iter().map(|k| k.0.to_vec()).collect();
 
-    // Load freeze bypass tx hashes
-    let bypass_tx_hashes = match load_config_setting(reader, ConfigSettingId::FreezeBypassTxs)? {
-        Some(ConfigSettingEntry::FreezeBypassTxs(bt)) => bt.tx_hashes.to_vec(),
-        _ => Vec::new(),
-    };
+    // Load freeze bypass tx hashes (required for V26+)
+    let bt = load_config!(
+        reader,
+        ConfigSettingId::FreezeBypassTxs,
+        FreezeBypassTxs,
+        "load_frozen_key_config"
+    );
+    let bypass_tx_hashes = bt.tx_hashes.to_vec();
 
     Ok(henyey_tx::frozen_keys::FrozenKeyConfig::new(
         frozen_key_bytes,
@@ -582,6 +610,271 @@ mod tests {
         assert!(
             err_msg.contains("disk read failed"),
             "Error should contain the original I/O error, got: {}",
+            err_msg
+        );
+    }
+
+    // --- Tests for load_config_setting wrong data variant (Layer 1) ---
+
+    /// load_config_setting must error when an entry exists but contains a
+    /// non-ConfigSetting LedgerEntryData variant (data corruption).
+    #[test]
+    fn test_load_config_setting_wrong_data_variant() {
+        use stellar_xdr::curr::{
+            AccountEntry, AccountId, LedgerEntryExt, PublicKey, SequenceNumber, Thresholds, Uint256,
+        };
+
+        let corrupt_lookup: crate::EntryLookupFn = std::sync::Arc::new(|_key: &LedgerKey| {
+            // Return a LedgerEntry with Account data for a ConfigSetting key
+            Ok(Some(LedgerEntry {
+                last_modified_ledger_seq: 1,
+                data: LedgerEntryData::Account(AccountEntry {
+                    account_id: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([0; 32]))),
+                    balance: 0,
+                    seq_num: SequenceNumber(0),
+                    num_sub_entries: 0,
+                    inflation_dest: None,
+                    flags: 0,
+                    home_domain: Default::default(),
+                    thresholds: Thresholds([0; 4]),
+                    signers: Default::default(),
+                    ext: Default::default(),
+                }),
+                ext: LedgerEntryExt::V0,
+            }))
+        });
+        let snapshot = SnapshotHandle::with_lookup(LedgerSnapshot::empty(100), corrupt_lookup);
+
+        let result = load_config_setting(&snapshot, ConfigSettingId::ContractComputeV0);
+        assert!(
+            result.is_err(),
+            "load_config_setting should error on wrong LedgerEntryData variant, not return Ok(None)"
+        );
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(
+            err_msg.contains("expected ConfigSetting data")
+                && err_msg.contains("wrong LedgerEntryData variant"),
+            "Error should describe the data variant mismatch, got: {}",
+            err_msg
+        );
+    }
+
+    // --- Tests for load_frozen_key_config ---
+
+    /// Helper: create a LedgerEntry wrapping a ConfigSettingEntry.
+    fn make_config_entry(setting: ConfigSettingEntry) -> LedgerEntry {
+        use stellar_xdr::curr::LedgerEntryExt;
+        LedgerEntry {
+            last_modified_ledger_seq: 1,
+            data: LedgerEntryData::ConfigSetting(setting),
+            ext: LedgerEntryExt::V0,
+        }
+    }
+
+    /// Pre-V26 protocol returns empty FrozenKeyConfig without loading any settings.
+    #[test]
+    fn test_load_frozen_key_config_pre_v26_returns_empty() {
+        // Use an error lookup to prove no settings are accessed
+        let error_lookup: crate::EntryLookupFn = std::sync::Arc::new(|_key: &LedgerKey| {
+            Err(LedgerError::Internal("should not be called".to_string()))
+        });
+        let snapshot = SnapshotHandle::with_lookup(LedgerSnapshot::empty(100), error_lookup);
+
+        let result = load_frozen_key_config(&snapshot, 25);
+        assert!(result.is_ok(), "Pre-V26 should return Ok");
+        let config = result.unwrap();
+        assert!(
+            !config.has_frozen_keys(),
+            "Pre-V26 should return empty config"
+        );
+    }
+
+    /// V26+ with both settings present and populated returns correct config.
+    #[test]
+    fn test_load_frozen_key_config_v26_happy_path() {
+        use stellar_xdr::curr::{EncodedLedgerKey, FreezeBypassTxs, FrozenLedgerKeys, Hash};
+
+        let lookup: crate::EntryLookupFn = std::sync::Arc::new(move |key: &LedgerKey| {
+            if let LedgerKey::ConfigSetting(cs) = key {
+                match cs.config_setting_id {
+                    ConfigSettingId::FrozenLedgerKeys => Ok(Some(make_config_entry(
+                        ConfigSettingEntry::FrozenLedgerKeys(FrozenLedgerKeys {
+                            keys: vec![EncodedLedgerKey(vec![1u8; 32].try_into().unwrap())]
+                                .try_into()
+                                .unwrap(),
+                        }),
+                    ))),
+                    ConfigSettingId::FreezeBypassTxs => Ok(Some(make_config_entry(
+                        ConfigSettingEntry::FreezeBypassTxs(FreezeBypassTxs {
+                            tx_hashes: vec![Hash([2u8; 32])].try_into().unwrap(),
+                        }),
+                    ))),
+                    _ => Ok(None),
+                }
+            } else {
+                Ok(None)
+            }
+        });
+        let snapshot = SnapshotHandle::with_lookup(LedgerSnapshot::empty(100), lookup);
+
+        let result = load_frozen_key_config(&snapshot, 26);
+        assert!(result.is_ok(), "V26 with correct settings should succeed");
+        let config = result.unwrap();
+        assert!(config.has_frozen_keys(), "Config should have frozen keys");
+    }
+
+    /// V26+ with both settings present but empty (VecM::default) succeeds with empty config.
+    #[test]
+    fn test_load_frozen_key_config_v26_empty_settings() {
+        use stellar_xdr::curr::{FreezeBypassTxs, FrozenLedgerKeys};
+
+        let lookup: crate::EntryLookupFn = std::sync::Arc::new(|key: &LedgerKey| {
+            if let LedgerKey::ConfigSetting(cs) = key {
+                match cs.config_setting_id {
+                    ConfigSettingId::FrozenLedgerKeys => Ok(Some(make_config_entry(
+                        ConfigSettingEntry::FrozenLedgerKeys(FrozenLedgerKeys {
+                            keys: Default::default(),
+                        }),
+                    ))),
+                    ConfigSettingId::FreezeBypassTxs => Ok(Some(make_config_entry(
+                        ConfigSettingEntry::FreezeBypassTxs(FreezeBypassTxs {
+                            tx_hashes: Default::default(),
+                        }),
+                    ))),
+                    _ => Ok(None),
+                }
+            } else {
+                Ok(None)
+            }
+        });
+        let snapshot = SnapshotHandle::with_lookup(LedgerSnapshot::empty(100), lookup);
+
+        let result = load_frozen_key_config(&snapshot, 26);
+        assert!(result.is_ok(), "V26 with empty settings should succeed");
+        let config = result.unwrap();
+        assert!(
+            !config.has_frozen_keys(),
+            "Config with empty settings should have no frozen keys"
+        );
+    }
+
+    /// V26+ with missing FrozenLedgerKeys setting must error.
+    #[test]
+    fn test_load_frozen_key_config_missing_frozen_keys() {
+        let lookup: crate::EntryLookupFn = std::sync::Arc::new(|_key: &LedgerKey| Ok(None));
+        let snapshot = SnapshotHandle::with_lookup(LedgerSnapshot::empty(100), lookup);
+
+        let result = load_frozen_key_config(&snapshot, 26);
+        assert!(
+            result.is_err(),
+            "Missing FrozenLedgerKeys should error for V26+"
+        );
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(
+            err_msg.contains("required config setting") && err_msg.contains("FrozenLedgerKeys"),
+            "Error should mention missing FrozenLedgerKeys, got: {}",
+            err_msg
+        );
+    }
+
+    /// V26+ with missing FreezeBypassTxs setting must error.
+    #[test]
+    fn test_load_frozen_key_config_missing_bypass_txs() {
+        use stellar_xdr::curr::FrozenLedgerKeys;
+
+        let lookup: crate::EntryLookupFn = std::sync::Arc::new(|key: &LedgerKey| {
+            if let LedgerKey::ConfigSetting(cs) = key {
+                match cs.config_setting_id {
+                    ConfigSettingId::FrozenLedgerKeys => Ok(Some(make_config_entry(
+                        ConfigSettingEntry::FrozenLedgerKeys(FrozenLedgerKeys {
+                            keys: Default::default(),
+                        }),
+                    ))),
+                    _ => Ok(None),
+                }
+            } else {
+                Ok(None)
+            }
+        });
+        let snapshot = SnapshotHandle::with_lookup(LedgerSnapshot::empty(100), lookup);
+
+        let result = load_frozen_key_config(&snapshot, 26);
+        assert!(
+            result.is_err(),
+            "Missing FreezeBypassTxs should error for V26+"
+        );
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(
+            err_msg.contains("required config setting") && err_msg.contains("FreezeBypassTxs"),
+            "Error should mention missing FreezeBypassTxs, got: {}",
+            err_msg
+        );
+    }
+
+    /// V26+ with wrong ConfigSettingEntry subtype for FrozenLedgerKeys must error.
+    #[test]
+    fn test_load_frozen_key_config_wrong_subtype_frozen_keys() {
+        // Return ContractComputeV0 when FrozenLedgerKeys is requested
+        let lookup: crate::EntryLookupFn = std::sync::Arc::new(|key: &LedgerKey| {
+            if let LedgerKey::ConfigSetting(_cs) = key {
+                Ok(Some(make_config_entry(
+                    ConfigSettingEntry::ContractComputeV0(Default::default()),
+                )))
+            } else {
+                Ok(None)
+            }
+        });
+        let snapshot = SnapshotHandle::with_lookup(LedgerSnapshot::empty(100), lookup);
+
+        let result = load_frozen_key_config(&snapshot, 26);
+        assert!(
+            result.is_err(),
+            "Wrong subtype for FrozenLedgerKeys should error"
+        );
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(
+            err_msg.contains("unexpected variant"),
+            "Error should mention unexpected variant, got: {}",
+            err_msg
+        );
+    }
+
+    /// V26+ with wrong ConfigSettingEntry subtype for FreezeBypassTxs must error.
+    #[test]
+    fn test_load_frozen_key_config_wrong_subtype_bypass_txs() {
+        use stellar_xdr::curr::FrozenLedgerKeys;
+
+        // Return correct FrozenLedgerKeys, but wrong subtype for FreezeBypassTxs
+        let lookup: crate::EntryLookupFn = std::sync::Arc::new(|key: &LedgerKey| {
+            if let LedgerKey::ConfigSetting(cs) = key {
+                match cs.config_setting_id {
+                    ConfigSettingId::FrozenLedgerKeys => Ok(Some(make_config_entry(
+                        ConfigSettingEntry::FrozenLedgerKeys(FrozenLedgerKeys {
+                            keys: Default::default(),
+                        }),
+                    ))),
+                    _ => {
+                        // Return wrong subtype for FreezeBypassTxs
+                        Ok(Some(make_config_entry(
+                            ConfigSettingEntry::ContractComputeV0(Default::default()),
+                        )))
+                    }
+                }
+            } else {
+                Ok(None)
+            }
+        });
+        let snapshot = SnapshotHandle::with_lookup(LedgerSnapshot::empty(100), lookup);
+
+        let result = load_frozen_key_config(&snapshot, 26);
+        assert!(
+            result.is_err(),
+            "Wrong subtype for FreezeBypassTxs should error"
+        );
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(
+            err_msg.contains("unexpected variant"),
+            "Error should mention unexpected variant, got: {}",
             err_msg
         );
     }
