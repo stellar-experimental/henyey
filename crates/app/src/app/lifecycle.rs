@@ -278,13 +278,14 @@ impl App {
             tokio::select! {
                 // NOTE: Removed biased; to ensure timers get fair polling
 
-                // Await pending ledger close completion
-                join_result = async {
-                    match close_pipeline.closing.as_mut() {
-                        Some(p) => (&mut p.handle).await,
-                        None => std::future::pending().await,
-                    }
-                } => {
+                // Await pending ledger close or persist completion.
+                // The pipeline is a state machine: at most one operation is
+                // active. poll_completion() awaits whichever is in progress,
+                // or pends forever if idle (letting other branches fire).
+                pipeline_event = close_pipeline.poll_completion() => {
+                    match pipeline_event {
+                        super::close_pipeline::PipelineEvent::CloseComplete(join_result) => {
+                    let join_result = *join_result;
                     self.set_phase(6); // 6 = pending_close
                     // Phase 6: Record close-cycle metric (deferred pipeline only).
                     {
@@ -398,7 +399,38 @@ impl App {
                         // Persisting state (start_persist above), so
                         // is_idle() returns false and no close can start.
                         // `finish_rapid_close_cycle` fires from the
-                        // persist_result arm once persist completes.
+                        // PersistComplete arm once persist completes.
+                    }
+                        }
+                        super::close_pipeline::PipelineEvent::PersistComplete(persist_result) => {
+                    let persist = close_pipeline.take_persist();
+                    // Persist-cycle decomposition (#1916): dispatch-to-join latency.
+                    metrics::histogram!(crate::metrics::PERSIST_DISPATCH_TO_JOIN_SECONDS)
+                        .record(persist.dispatch_time.elapsed().as_secs_f64());
+                    if let Err(e) = persist_result {
+                        tracing::error!(
+                            error = %e,
+                            ledger_seq = persist.ledger_seq,
+                            "Persist task panicked"
+                        );
+                        std::process::abort();
+                    }
+                    tracing::debug!(
+                        ledger_seq = persist.ledger_seq,
+                        "Persist completed, starting next close"
+                    );
+
+                    // Now start the next close (persist is done, DB is up to date).
+                    if close_pipeline.is_idle() {
+                        let next = self.try_start_ledger_close().await;
+                        close_pipeline.try_start_close(next);
+
+                        // If no more closes ready, rapid close cycle ended.
+                        if close_pipeline.is_idle() {
+                            self.finish_rapid_close_cycle().await;
+                        }
+                    }
+                        }
                     }
                 }
 
@@ -490,44 +522,6 @@ impl App {
                     if close_pipeline.is_idle() {
                         let next = self.try_start_ledger_close().await;
                         close_pipeline.try_start_close(next);
-                    }
-                }
-
-                // Await deferred persist completion.
-                // Once the DB writes and bucket flush finish, we can start
-                // the next ledger close.
-                persist_result = async {
-                    match close_pipeline.persisting.as_mut() {
-                        Some(p) => (&mut p.handle).await,
-                        None => std::future::pending().await,
-                    }
-                } => {
-                    let persist = close_pipeline.take_persist();
-                    // Persist-cycle decomposition (#1916): dispatch-to-join latency.
-                    metrics::histogram!(crate::metrics::PERSIST_DISPATCH_TO_JOIN_SECONDS)
-                        .record(persist.dispatch_time.elapsed().as_secs_f64());
-                    if let Err(e) = persist_result {
-                        tracing::error!(
-                            error = %e,
-                            ledger_seq = persist.ledger_seq,
-                            "Persist task panicked"
-                        );
-                        std::process::abort();
-                    }
-                    tracing::debug!(
-                        ledger_seq = persist.ledger_seq,
-                        "Persist completed, starting next close"
-                    );
-
-                    // Now start the next close (persist is done, DB is up to date).
-                    if close_pipeline.is_idle() {
-                        let next = self.try_start_ledger_close().await;
-                        close_pipeline.try_start_close(next);
-
-                        // If no more closes ready, rapid close cycle ended.
-                        if close_pipeline.is_idle() {
-                            self.finish_rapid_close_cycle().await;
-                        }
                     }
                 }
 
@@ -1551,8 +1545,9 @@ impl App {
         &self,
         pipeline: &mut super::close_pipeline::ClosePipeline,
     ) {
-        // 1. Drain prior persist (abort on panic, matching the normal path).
-        if pipeline.persisting.is_some() {
+        // With the enum-based pipeline, only one state is active at a time.
+        // Drain whichever operation is in progress.
+        if pipeline.is_persisting() {
             let persist = pipeline.take_persist();
             tracing::info!(
                 ledger_seq = persist.ledger_seq,
@@ -1568,9 +1563,7 @@ impl App {
             }
         }
 
-        // 2. Drain pending close (parity: stellar-core joins ledger-close
-        //    thread first in idempotentShutdown).
-        if pipeline.closing.is_some() {
+        if pipeline.is_closing() {
             let mut pending = pipeline.take_close();
             tracing::info!(
                 ledger_seq = pending.ledger_seq,

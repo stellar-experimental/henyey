@@ -3673,10 +3673,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_drain_close_pipeline_both_pending() {
-        use std::sync::atomic::AtomicBool;
-        use std::sync::Arc;
-
+    async fn test_drain_close_pipeline_persisting() {
         let dir = tempfile::tempdir().expect("temp dir");
         let db_path = dir.path().join("rs-stellar-test.db");
         let config = crate::config::ConfigBuilder::new()
@@ -3684,61 +3681,17 @@ mod tests {
             .build();
 
         let app = App::new(config).await.unwrap();
-        app.set_applying_ledger(true);
 
-        // Track ordering: persist must complete before close is awaited.
-        let persist_done = Arc::new(AtomicBool::new(false));
-        let persist_done_clone = persist_done.clone();
-
-        // Simulate a persist task that sets the flag.
-        let persist_handle = tokio::spawn(async move {
-            persist_done_clone.store(true, Ordering::SeqCst);
-        });
-
-        // Note: The state machine normally prevents both being active at once,
-        // but drain_close_pipeline handles it defensively by draining persist
-        // first, then close. We test this by directly setting both fields.
         let mut pipeline = super::close_pipeline::ClosePipeline::new();
-        pipeline.persisting = Some(super::types::PendingPersist {
-            handle: persist_handle,
-            ledger_seq: 41,
+        pipeline.start_persist(super::types::PendingPersist {
+            handle: tokio::spawn(async {}),
+            ledger_seq: 55,
             dispatch_time: std::time::Instant::now(),
         });
-
-        // Simulate a close that verifies persist already ran.
-        let persist_done_check = persist_done.clone();
-        let pending = PendingLedgerClose {
-            handle: tokio::task::spawn_blocking(move || {
-                // By the time close is awaited, persist should be done.
-                assert!(
-                    persist_done_check.load(Ordering::SeqCst),
-                    "persist should complete before close is awaited"
-                );
-                Err("simulated error after persist".to_string())
-            }),
-            ledger_seq: 42,
-            tx_set: henyey_herder::TransactionSet::new_legacy(
-                henyey_common::Hash256::ZERO,
-                Vec::new(),
-            ),
-            close_time: 1,
-            upgrades: Vec::new(),
-            dispatch_time: std::time::Instant::now(),
-        };
-
-        pipeline.closing = Some(pending);
 
         app.drain_close_pipeline(&mut pipeline).await;
 
         assert!(pipeline.is_idle(), "pipeline should be idle after drain");
-        assert!(
-            persist_done.load(Ordering::SeqCst),
-            "persist should have completed"
-        );
-        assert!(
-            !app.is_applying_ledger.load(Ordering::Relaxed),
-            "is_applying_ledger should be cleared"
-        );
     }
 
     // ============================================================
