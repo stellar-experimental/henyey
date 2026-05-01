@@ -75,8 +75,8 @@ pub trait LoadGenRunner: Send + Sync + 'static {
 
     /// Stop a running load generation. No-op if nothing is running.
     ///
-    /// Matches stellar-core's `LoadGenerator::stop()` which cancels the
-    /// step timer, marks the run as failed, and resets state.
+    /// Sets the per-run stop token to `true`; the running task checks this
+    /// cooperatively at each loop iteration and returns `LoadResult::Stopped`.
     fn stop_load(&self);
 
     /// Whether a load generation run is currently in progress.

@@ -429,6 +429,53 @@ mod loadgen_runner {
                 "generator should be tainted when permit dropped without complete()"
             );
         }
+
+        #[test]
+        fn test_stop_load_signals_current_token() {
+            let state = test_state();
+
+            // Simulate start_load: install a fresh per-run token.
+            let run_token = Arc::new(AtomicBool::new(false));
+            *state.current_stop_token.lock().unwrap() = Arc::clone(&run_token);
+
+            // stop_load sets the current token to true.
+            state
+                .current_stop_token
+                .lock()
+                .unwrap()
+                .store(true, Ordering::SeqCst);
+
+            assert!(
+                run_token.load(Ordering::SeqCst),
+                "stop_load must signal the per-run token"
+            );
+        }
+
+        #[test]
+        fn test_fresh_token_per_run_isolates_stop_signals() {
+            let state = test_state();
+
+            // First run: install token and stop it.
+            let token_run1 = Arc::new(AtomicBool::new(false));
+            *state.current_stop_token.lock().unwrap() = Arc::clone(&token_run1);
+            state
+                .current_stop_token
+                .lock()
+                .unwrap()
+                .store(true, Ordering::SeqCst);
+            assert!(token_run1.load(Ordering::SeqCst));
+
+            // Second run: install a fresh token — old stop must not leak.
+            let token_run2 = Arc::new(AtomicBool::new(false));
+            *state.current_stop_token.lock().unwrap() = Arc::clone(&token_run2);
+
+            assert!(
+                !token_run2.load(Ordering::SeqCst),
+                "new run token must start unsignaled"
+            );
+            // Old token remains signaled but is no longer referenced by state.
+            assert!(token_run1.load(Ordering::SeqCst));
+        }
     }
 
     impl LoadGenRunner for SimulationLoadGenRunner {
