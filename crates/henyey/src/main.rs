@@ -102,6 +102,53 @@ mod loadgen_runner {
     use henyey_simulation::{GeneratedLoadConfig, LoadGenMode, LoadGenerator};
     use tokio::sync::Mutex;
 
+    /// Centralized per-run stop signaling with explicit idle/active states.
+    ///
+    /// - **Idle**: `current_token` is `None`. `stop_current()` is a no-op.
+    /// - **Active**: `current_token` is `Some(token)`. A spawned task holds
+    ///   an `Arc` clone and checks it cooperatively.
+    ///
+    /// Token creation is coupled to [`LoadGenPermit::try_acquire`], which
+    /// calls `new_run()` atomically with the `running` flag swap.
+    struct RunControl {
+        current_token: std::sync::Mutex<Option<Arc<AtomicBool>>>,
+    }
+
+    impl RunControl {
+        fn new() -> Self {
+            Self {
+                current_token: std::sync::Mutex::new(None),
+            }
+        }
+
+        /// Create a fresh per-run stop token, store it as current, and
+        /// return the clone for the spawned task.
+        fn new_run(&self) -> Arc<AtomicBool> {
+            let token = Arc::new(AtomicBool::new(false));
+            *self.current_token.lock().unwrap() = Some(Arc::clone(&token));
+            token
+        }
+
+        /// Signal the current run to stop. No-op if idle.
+        fn stop_current(&self) {
+            if let Some(token) = self.current_token.lock().unwrap().as_ref() {
+                token.store(true, Ordering::SeqCst);
+            }
+        }
+
+        /// Clear the current token only if it is the same instance as
+        /// `token`. Prevents a completing run from erasing a newer run's
+        /// token.
+        fn clear_if_current(&self, token: &Arc<AtomicBool>) {
+            let mut guard = self.current_token.lock().unwrap();
+            if let Some(current) = guard.as_ref() {
+                if Arc::ptr_eq(current, token) {
+                    *guard = None;
+                }
+            }
+        }
+    }
+
     /// Atomic state governing load generation exclusivity and health.
     /// Extracted from `Inner` so permit logic can be unit-tested without
     /// constructing a full `App`.
@@ -114,10 +161,8 @@ mod loadgen_runner {
         /// Set by [`LoadGenPermit::complete`] before normal drop.
         /// If false at drop time, the exit was abnormal.
         completed_cleanly: AtomicBool,
-        /// Per-run stop token. `stop_load` sets the current token to `true`;
-        /// the running task checks it cooperatively at loop boundaries via
-        /// `generate_load`'s `stop_signal` parameter.
-        current_stop_token: std::sync::Mutex<Arc<AtomicBool>>,
+        /// Per-run stop signaling with explicit idle/active states.
+        run_control: RunControl,
         /// Test-only: trigger a panic inside the spawned task.
         #[cfg(test)]
         panic_inject: AtomicBool,
@@ -129,7 +174,7 @@ mod loadgen_runner {
                 running: AtomicBool::new(false),
                 generator_tainted: AtomicBool::new(false),
                 completed_cleanly: AtomicBool::new(false),
-                current_stop_token: std::sync::Mutex::new(Arc::new(AtomicBool::new(false))),
+                run_control: RunControl::new(),
                 #[cfg(test)]
                 panic_inject: AtomicBool::new(false),
             }
@@ -152,15 +197,23 @@ mod loadgen_runner {
     }
 
     impl LoadGenPermit {
-        /// Attempt to acquire the permit. Returns `None` if load generation
-        /// is already running (atomic swap returns old=true).
-        fn try_acquire(state: &Arc<LoadGenState>) -> Option<Self> {
+        /// Attempt to acquire the permit and create a fresh stop token.
+        ///
+        /// Returns `None` if load generation is already running.
+        /// On success, returns the permit and the per-run stop token.
+        /// Token creation is coupled to acquisition so there is no window
+        /// where `is_running()` is true but no token is published.
+        fn try_acquire(state: &Arc<LoadGenState>) -> Option<(Self, Arc<AtomicBool>)> {
             if state.running.swap(true, Ordering::SeqCst) {
                 None
             } else {
-                Some(Self {
-                    state: Arc::clone(state),
-                })
+                let token = state.run_control.new_run();
+                Some((
+                    Self {
+                        state: Arc::clone(state),
+                    },
+                    token,
+                ))
             }
         }
 
@@ -342,7 +395,7 @@ mod loadgen_runner {
             state.panic_inject.store(true, Ordering::SeqCst);
 
             // Acquire permit and spawn a panicking task
-            let permit = LoadGenPermit::try_acquire(&state).unwrap();
+            let (permit, _token) = LoadGenPermit::try_acquire(&state).unwrap();
             assert!(state.running.load(Ordering::SeqCst));
 
             // A second acquire should fail while running
@@ -376,7 +429,7 @@ mod loadgen_runner {
             let permit2 = LoadGenPermit::try_acquire(&state);
             assert!(permit2.is_some(), "should be able to acquire after panic");
             // Clean up
-            if let Some(p) = permit2 {
+            if let Some((p, _)) = permit2 {
                 p.complete();
             }
         }
@@ -399,7 +452,7 @@ mod loadgen_runner {
         fn test_permit_normal_completion_no_taint() {
             let state = test_state();
 
-            let permit = LoadGenPermit::try_acquire(&state).unwrap();
+            let (permit, _token) = LoadGenPermit::try_acquire(&state).unwrap();
             assert!(state.running.load(Ordering::SeqCst));
 
             // Simulate normal completion
@@ -417,7 +470,7 @@ mod loadgen_runner {
         fn test_permit_drop_without_complete_taints() {
             let state = test_state();
 
-            let permit = LoadGenPermit::try_acquire(&state).unwrap();
+            let (permit, _token) = LoadGenPermit::try_acquire(&state).unwrap();
             assert!(state.running.load(Ordering::SeqCst));
 
             // Drop without calling complete() — simulates abnormal exit
@@ -431,50 +484,104 @@ mod loadgen_runner {
         }
 
         #[test]
-        fn test_stop_load_signals_current_token() {
+        fn test_active_run_stop_lifecycle() {
             let state = test_state();
 
-            // Simulate start_load: install a fresh per-run token.
-            let run_token = Arc::new(AtomicBool::new(false));
-            *state.current_stop_token.lock().unwrap() = Arc::clone(&run_token);
+            // Acquire permit — token is created atomically.
+            let (permit, token) = LoadGenPermit::try_acquire(&state).unwrap();
+            assert!(state.running.load(Ordering::SeqCst));
+            assert!(!token.load(Ordering::SeqCst), "token must start unsignaled");
 
-            // stop_load sets the current token to true.
-            state
-                .current_stop_token
-                .lock()
-                .unwrap()
-                .store(true, Ordering::SeqCst);
+            // Stop signals the token.
+            state.run_control.stop_current();
+            assert!(token.load(Ordering::SeqCst), "stop must signal the token");
 
+            // Clean completion: clear token, complete permit, drop.
+            state.run_control.clear_if_current(&token);
+            permit.complete();
+            drop(permit);
+
+            assert!(!state.running.load(Ordering::SeqCst));
             assert!(
-                run_token.load(Ordering::SeqCst),
-                "stop_load must signal the per-run token"
+                !state.generator_tainted.load(Ordering::SeqCst),
+                "clean stop must not taint the generator"
             );
         }
 
         #[test]
-        fn test_fresh_token_per_run_isolates_stop_signals() {
+        fn test_stale_token_isolation() {
             let state = test_state();
 
-            // First run: install token and stop it.
-            let token_run1 = Arc::new(AtomicBool::new(false));
-            *state.current_stop_token.lock().unwrap() = Arc::clone(&token_run1);
-            state
-                .current_stop_token
-                .lock()
-                .unwrap()
-                .store(true, Ordering::SeqCst);
-            assert!(token_run1.load(Ordering::SeqCst));
+            // Run 1: create, stop, clear.
+            let token1 = state.run_control.new_run();
+            state.run_control.stop_current();
+            assert!(token1.load(Ordering::SeqCst));
+            state.run_control.clear_if_current(&token1);
 
-            // Second run: install a fresh token — old stop must not leak.
-            let token_run2 = Arc::new(AtomicBool::new(false));
-            *state.current_stop_token.lock().unwrap() = Arc::clone(&token_run2);
-
+            // Run 2: new token must not inherit old stop.
+            let token2 = state.run_control.new_run();
             assert!(
-                !token_run2.load(Ordering::SeqCst),
+                !token2.load(Ordering::SeqCst),
                 "new run token must start unsignaled"
             );
-            // Old token remains signaled but is no longer referenced by state.
-            assert!(token_run1.load(Ordering::SeqCst));
+            // Old token remains signaled but is no longer current.
+            assert!(token1.load(Ordering::SeqCst));
+        }
+
+        #[test]
+        fn test_idle_stop_is_noop() {
+            let state = test_state();
+
+            // stop_current with no active run must not panic.
+            state.run_control.stop_current();
+
+            // A subsequent new_run must return an unsignaled token.
+            let token = state.run_control.new_run();
+            assert!(
+                !token.load(Ordering::SeqCst),
+                "token after idle stop must be unsignaled"
+            );
+        }
+
+        #[test]
+        fn test_clear_if_current_identity_check() {
+            let state = test_state();
+
+            let token_a = state.run_control.new_run();
+            // Overwrite with a second run's token.
+            let token_b = state.run_control.new_run();
+
+            // Clearing with the stale token_a must be a no-op.
+            state.run_control.clear_if_current(&token_a);
+
+            // token_b is still current — stop must signal it.
+            state.run_control.stop_current();
+            assert!(
+                token_b.load(Ordering::SeqCst),
+                "stop must signal current token after stale clear"
+            );
+        }
+
+        #[test]
+        fn test_abnormal_exit_stale_token() {
+            let state = test_state();
+
+            // Acquire permit and create token (simulates start_load).
+            let (permit, _token) = LoadGenPermit::try_acquire(&state).unwrap();
+
+            // Drop without complete (abnormal exit).
+            drop(permit);
+            assert!(
+                state.generator_tainted.load(Ordering::SeqCst),
+                "abnormal exit must taint"
+            );
+
+            // New run must get a fresh unsignaled token (new_run overwrites stale).
+            let fresh = state.run_control.new_run();
+            assert!(
+                !fresh.load(Ordering::SeqCst),
+                "new_run after abnormal exit must return unsignaled token"
+            );
         }
     }
 
@@ -494,9 +601,8 @@ mod loadgen_runner {
                 )
             })?;
 
-            // Atomic exclusivity gate — replaces the old TOCTOU
-            // load-then-store pattern.
-            let permit = LoadGenPermit::try_acquire(&self.state)
+            // Atomic exclusivity gate with coupled stop-token creation.
+            let (permit, stop_token) = LoadGenPermit::try_acquire(&self.state)
                 .ok_or_else(|| "Load generation is already running.".to_string())?;
 
             let mut config = GeneratedLoadConfig {
@@ -521,10 +627,6 @@ mod loadgen_runner {
 
             let inner = Arc::clone(&self.inner);
             let state = Arc::clone(&self.state);
-
-            // Fresh per-run stop token — stop_load will signal this instance.
-            let stop_token = Arc::new(AtomicBool::new(false));
-            *state.current_stop_token.lock().unwrap() = Arc::clone(&stop_token);
 
             henyey_common::spawn::spawn_observed("load_generation", async move {
                 // Permit is moved into this future — dropped at end, on
@@ -567,6 +669,9 @@ mod loadgen_runner {
                     }
                 }
 
+                // Transition RunControl to idle before marking clean.
+                state.run_control.clear_if_current(&stop_token);
+
                 // Mark clean completion before permit drops.
                 permit.complete();
             });
@@ -575,12 +680,7 @@ mod loadgen_runner {
         }
 
         fn stop_load(&self) {
-            // Signal the current run's per-run stop token. The task checks
-            // this cooperatively at each loop iteration in generate_load and
-            // returns LoadResult::Stopped. This matches stellar-core's
-            // LoadGenerator::stop() which cancels the step timer.
-            let token = self.state.current_stop_token.lock().unwrap();
-            token.store(true, Ordering::SeqCst);
+            self.state.run_control.stop_current();
         }
 
         fn is_running(&self) -> bool {
