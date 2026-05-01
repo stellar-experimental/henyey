@@ -772,9 +772,7 @@ impl App {
         gen_tx_set: stellar_xdr::curr::GeneralizedTransactionSet,
     ) {
         use henyey_herder::TransactionSet;
-        use stellar_xdr::curr::{
-            GeneralizedTransactionSet, TransactionPhase, TxSetComponent, WriteXdr,
-        };
+        use stellar_xdr::curr::WriteXdr;
 
         // Compute hash as SHA-256 of XDR-encoded GeneralizedTransactionSet
         // This matches how stellar-core computes it: xdrSha256(xdrTxSet)
@@ -787,23 +785,14 @@ impl App {
         };
         let hash = henyey_common::Hash256::hash(&xdr_bytes);
 
-        // Validate phase count before extracting
-        let GeneralizedTransactionSet::V1(v1) = &gen_tx_set;
-        if v1.phases.len() != 2 {
-            tracing::warn!(
-                hash = %hash,
-                phases = v1.phases.len(),
-                "Invalid GeneralizedTxSet phase count"
-            );
-            return;
-        }
-
-        // Extract transactions from GeneralizedTransactionSet
-        let (prev_hash, transactions) = super::extract_txs_from_generalized(&gen_tx_set);
+        // Parity: stellar-core's Peer::recvGeneralizedTxSet (Peer.cpp:1515–1521)
+        // performs zero structural validation at the receive layer — all validation
+        // is deferred to the herder via prepare_for_apply. We match that approach.
+        let internal_tx_set = TransactionSet::new_generalized(hash, gen_tx_set);
 
         tracing::debug!(
             hash = %hash,
-            tx_count = transactions.len(),
+            tx_count = internal_tx_set.len(),
             "Processing GeneralizedTxSet"
         );
 
@@ -813,78 +802,6 @@ impl App {
         if !tracked_lock::time_call("herder.needs_tx_set", || self.herder.needs_tx_set(&hash)) {
             tracing::debug!(hash = %hash, "GeneralizedTxSet not pending");
         }
-
-        let phase_check = match &gen_tx_set {
-            GeneralizedTransactionSet::V1(v1) => {
-                let classic_ok = matches!(v1.phases[0], TransactionPhase::V0(_));
-                let soroban_ok = matches!(
-                    v1.phases[1],
-                    TransactionPhase::V1(_) | TransactionPhase::V0(_)
-                );
-                if !classic_ok || !soroban_ok {
-                    tracing::warn!(hash = %hash, "Invalid GeneralizedTxSet phase types");
-                }
-                classic_ok && soroban_ok
-            }
-        };
-        if !phase_check {
-            return;
-        }
-
-        let network_id = NetworkId(self.network_id());
-        let mut classic_count = 0usize;
-        let mut soroban_count = 0usize;
-        for env in &transactions {
-            let frame =
-                henyey_tx::TransactionFrame::from_owned_with_network(env.clone(), network_id);
-            if frame.is_soroban() {
-                soroban_count += 1;
-            } else {
-                classic_count += 1;
-            }
-        }
-        let phase_sizes = match &gen_tx_set {
-            GeneralizedTransactionSet::V1(v1) => {
-                let classic_phase_count: usize = match &v1.phases[0] {
-                    TransactionPhase::V0(components) => components
-                        .iter()
-                        .map(|component| match component {
-                            TxSetComponent::TxsetCompTxsMaybeDiscountedFee(comp) => comp.txs.len(),
-                        })
-                        .sum(),
-                    _ => 0,
-                };
-                let soroban_phase_count: usize = match &v1.phases[1] {
-                    TransactionPhase::V1(parallel) => parallel
-                        .execution_stages
-                        .iter()
-                        .map(|stage| stage.0.iter().map(|cluster| cluster.0.len()).sum::<usize>())
-                        .sum(),
-                    TransactionPhase::V0(components) => components
-                        .iter()
-                        .map(|component| match component {
-                            TxSetComponent::TxsetCompTxsMaybeDiscountedFee(comp) => comp.txs.len(),
-                        })
-                        .sum(),
-                };
-                (classic_phase_count, soroban_phase_count)
-            }
-        };
-        if classic_count != phase_sizes.0 || soroban_count != phase_sizes.1 {
-            tracing::warn!(
-                hash = %hash,
-                classic = classic_count,
-                soroban = soroban_count,
-                classic_phase = phase_sizes.0,
-                soroban_phase = phase_sizes.1,
-                "GeneralizedTxSet phase tx type mismatch"
-            );
-            return;
-        }
-
-        // Create internal tx set with the correct hash and retain generalized set
-        let internal_tx_set =
-            TransactionSet::with_generalized(prev_hash, hash, transactions, gen_tx_set);
         {
             let mut map = self.tx_set_dont_have.write().await;
             map.remove(internal_tx_set.hash());
