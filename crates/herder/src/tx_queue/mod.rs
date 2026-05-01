@@ -2954,7 +2954,9 @@ impl TransactionQueue {
 
     /// Get statistics about the transaction queue.
     pub fn stats(&self) -> TxQueueStats {
-        let seen = self.seen.read();
+        // Acquire locks in canonical order (account_states before seen) to avoid
+        // inversion with mutation paths that hold account_states → banned → seen.
+        // We only need seen.len() so snapshot it separately.
         let account_states = self.account_states.read();
 
         let mut pending_count = 0;
@@ -2970,11 +2972,13 @@ impl TransactionQueue {
             }
         }
 
+        drop(account_states);
+
         TxQueueStats {
             pending_count,
             account_count,
             banned_count: self.banned_count(),
-            seen_count: seen.len(),
+            seen_count: self.seen.read().len(),
             arb_tx_seen: self.arb_tx_seen.load(std::sync::atomic::Ordering::Relaxed),
             arb_tx_dropped: self
                 .arb_tx_dropped
