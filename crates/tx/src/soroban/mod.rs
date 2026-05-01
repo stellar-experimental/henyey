@@ -100,10 +100,9 @@ pub use host::{
 pub use storage::{SorobanStorage, StorageEntry, StorageKey};
 pub use ttl::{extend_ttl_target, restore_ttl_target};
 
-use sha2::{Digest, Sha256};
 use stellar_xdr::curr::{
-    AccountId, Hash, HostFunction, LedgerEntry, LedgerKey, Limits, SorobanAuthorizationEntry,
-    SorobanTransactionData, WriteXdr,
+    AccountId, Hash, HostFunction, LedgerEntry, LedgerKey, SorobanAuthorizationEntry,
+    SorobanTransactionData,
 };
 
 use crate::{state::LedgerStateManager, validation::LedgerContext};
@@ -170,11 +169,7 @@ pub fn get_or_compute_key_hash(cache: Option<&TtlKeyCache>, key: &LedgerKey) -> 
 
 /// Compute the hash of a ledger key for TTL lookup.
 pub fn compute_key_hash(key: &LedgerKey) -> Hash {
-    let mut hasher = Sha256::new();
-    if let Ok(bytes) = key.to_xdr(Limits::none()) {
-        hasher.update(&bytes);
-    }
-    Hash(hasher.finalize().into())
+    henyey_common::Hash256::hash_xdr(key).into()
 }
 
 /// Trait for looking up archived entries from the hot archive.

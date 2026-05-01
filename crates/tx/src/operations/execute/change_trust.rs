@@ -280,8 +280,7 @@ fn create_trustline(
 fn change_trust_asset_to_trust_line_asset(
     asset: &ChangeTrustAsset,
 ) -> stellar_xdr::curr::TrustLineAsset {
-    use sha2::{Digest, Sha256};
-    use stellar_xdr::curr::{Hash, Limits, PoolId, WriteXdr};
+    use stellar_xdr::curr::PoolId;
 
     match asset {
         ChangeTrustAsset::Native => stellar_xdr::curr::TrustLineAsset::Native,
@@ -292,14 +291,7 @@ fn change_trust_asset_to_trust_line_asset(
             stellar_xdr::curr::TrustLineAsset::CreditAlphanum12(a.clone())
         }
         ChangeTrustAsset::PoolShare(params) => {
-            // Compute pool ID as SHA256 hash of the liquidity pool parameters XDR
-            let pool_id = if let Ok(xdr_bytes) = params.to_xdr(Limits::none()) {
-                let mut hasher = Sha256::new();
-                hasher.update(&xdr_bytes);
-                Hash(hasher.finalize().into())
-            } else {
-                Hash([0u8; 32])
-            };
+            let pool_id = henyey_common::Hash256::hash_xdr(params).into();
             stellar_xdr::curr::TrustLineAsset::PoolShare(PoolId(pool_id))
         }
     }
@@ -524,7 +516,6 @@ mod tests {
         create_test_account_id, create_test_asset, create_test_trustline_asset,
     };
     use henyey_common::LIQUIDITY_POOL_FEE_V18;
-    use sha2::{Digest, Sha256};
     use stellar_xdr::curr::*;
 
     fn create_test_account(account_id: AccountId, balance: i64) -> AccountEntry {
@@ -557,10 +548,7 @@ mod tests {
     }
 
     fn pool_id_from_params(params: &LiquidityPoolParameters) -> PoolId {
-        let xdr = params.to_xdr(Limits::none()).expect("pool params xdr");
-        let mut hasher = Sha256::new();
-        hasher.update(&xdr);
-        PoolId(Hash(hasher.finalize().into()))
+        PoolId(henyey_common::Hash256::hash_xdr(params).into())
     }
 
     fn trustline_with_pool_use_count(

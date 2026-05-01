@@ -3,14 +3,13 @@
 //! This module implements the execution logic for PathPaymentStrictReceive
 //! and PathPaymentStrictSend operations, which transfer assets through a path.
 
-use sha2::{Digest, Sha256};
 use stellar_xdr::curr::{
-    AccountId, Asset, ClaimAtom, ClaimLiquidityAtom, Hash, Limits, LiquidityPoolEntryBody,
+    AccountId, Asset, ClaimAtom, ClaimLiquidityAtom, LiquidityPoolEntryBody,
     LiquidityPoolParameters, OperationResult, OperationResultTr, PathPaymentStrictReceiveOp,
     PathPaymentStrictReceiveResult, PathPaymentStrictReceiveResultCode,
     PathPaymentStrictReceiveResultSuccess, PathPaymentStrictSendOp, PathPaymentStrictSendResult,
     PathPaymentStrictSendResultCode, PathPaymentStrictSendResultSuccess, PoolId,
-    SimplePaymentResult, WriteXdr, LIQUIDITY_POOL_FEE_V18,
+    SimplePaymentResult, LIQUIDITY_POOL_FEE_V18,
 };
 
 use super::offer_exchange::{ConversionParams, RoundingType};
@@ -751,7 +750,7 @@ fn compute_pool_exchange(
     round: RoundingType,
     state: &LedgerStateManager,
 ) -> Result<Option<PoolExchange>> {
-    let pool_id = pool_id_for_assets(send_asset, recv_asset)?;
+    let pool_id = pool_id_for_assets(send_asset, recv_asset);
     let Some(pool) = state.get_liquidity_pool(&pool_id) else {
         return Ok(None);
     };
@@ -801,7 +800,7 @@ fn apply_pool_exchange(
     from_pool: i64,
     state: &mut LedgerStateManager,
 ) -> Result<bool> {
-    let pool_id = pool_id_for_assets(send_asset, recv_asset)?;
+    let pool_id = pool_id_for_assets(send_asset, recv_asset);
     let Some(pool) = state.get_liquidity_pool_mut(&pool_id) else {
         return Ok(false);
     };
@@ -832,7 +831,7 @@ fn apply_pool_exchange(
     Ok(true)
 }
 
-fn pool_id_for_assets(send_asset: &Asset, recv_asset: &Asset) -> Result<PoolId> {
+fn pool_id_for_assets(send_asset: &Asset, recv_asset: &Asset) -> PoolId {
     let params = LiquidityPoolParameters::LiquidityPoolConstantProduct(
         stellar_xdr::curr::LiquidityPoolConstantProductParameters {
             asset_a: std::cmp::min(send_asset.clone(), recv_asset.clone()),
@@ -840,10 +839,7 @@ fn pool_id_for_assets(send_asset: &Asset, recv_asset: &Asset) -> Result<PoolId> 
             fee: LIQUIDITY_POOL_FEE_V18 as i32,
         },
     );
-    let xdr = params.to_xdr(Limits::none())?;
-    let mut hasher = Sha256::new();
-    hasher.update(&xdr);
-    Ok(PoolId(Hash(hasher.finalize().into())))
+    PoolId(henyey_common::Hash256::hash_xdr(&params).into())
 }
 
 struct PoolExchangeRequest<'a> {
@@ -3085,7 +3081,6 @@ mod tests {
     /// path payments must skip pool exchange and use order-book only.
     #[test]
     fn test_audit_011_pool_trading_disabled_flag_skips_pool_exchange() {
-        use sha2::Digest;
         use stellar_xdr::curr::LedgerHeaderFlags;
 
         let mut state = LedgerStateManager::new(5_000_000, 100);
@@ -3134,9 +3129,12 @@ mod tests {
             asset_b: asset_b.clone(),
             fee: 30, // LIQUIDITY_POOL_FEE_V18
         };
-        let pool_params_xdr = pool_params.to_xdr(Limits::none()).unwrap();
-        let pool_hash = stellar_xdr::curr::Hash(sha2::Sha256::digest(&pool_params_xdr).into());
-        let pool_id = PoolId(pool_hash);
+        let pool_id = PoolId(
+            henyey_common::Hash256::hash_xdr(
+                &LiquidityPoolParameters::LiquidityPoolConstantProduct(pool_params.clone()),
+            )
+            .into(),
+        );
 
         // Create pool with good reserves (1:1 ratio)
         state.create_liquidity_pool(LiquidityPoolEntry {

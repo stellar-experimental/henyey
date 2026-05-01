@@ -5,7 +5,7 @@
 
 use stellar_xdr::curr::{
     ContractDataDurability, ContractDataEntry, Hash, LedgerKey, LedgerKeyContractData, ScAddress,
-    ScVal, WriteXdr,
+    ScVal,
 };
 
 /// A storage key for contract data.
@@ -40,14 +40,7 @@ impl StorageKey {
 
     /// Compute the hash of this storage key.
     pub fn hash(&self) -> Hash {
-        use sha2::{Digest, Sha256};
-
-        let ledger_key = self.to_ledger_key();
-        let mut hasher = Sha256::new();
-        if let Ok(bytes) = ledger_key.to_xdr(stellar_xdr::curr::Limits::none()) {
-            hasher.update(&bytes);
-        }
-        Hash(hasher.finalize().into())
+        henyey_common::Hash256::hash_xdr(&self.to_ledger_key()).into()
     }
 }
 

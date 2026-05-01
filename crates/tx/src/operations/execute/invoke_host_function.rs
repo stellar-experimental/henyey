@@ -6,8 +6,8 @@
 use stellar_xdr::curr::{
     AccountId, ContractEvent, DiagnosticEvent, Hash, InvokeHostFunctionOp,
     InvokeHostFunctionResult, InvokeHostFunctionResultCode, InvokeHostFunctionSuccessPreImage,
-    LedgerEntry, LedgerKey, Limits, OperationResult, OperationResultTr, ScVal,
-    SorobanTransactionData, SorobanTransactionDataExt, TtlEntry, WriteXdr,
+    LedgerEntry, LedgerKey, OperationResult, OperationResultTr, ScVal, SorobanTransactionData,
+    SorobanTransactionDataExt, TtlEntry,
 };
 
 use henyey_common::protocol::{
@@ -742,20 +742,15 @@ fn disk_read_bytes_exceeded(
 /// the hash is SHA256 of the XDR-encoded InvokeHostFunctionSuccessPreImage,
 /// which contains both the return value and the contract events.
 fn compute_success_preimage_hash(return_value: &ScVal, events: &[ContractEvent]) -> Hash {
-    use sha2::{Digest, Sha256};
-
-    // Build the success preimage
     let preimage = InvokeHostFunctionSuccessPreImage {
         return_value: return_value.clone(),
-        events: events.to_vec().try_into().unwrap_or_default(),
+        events: events
+            .to_vec()
+            .try_into()
+            .expect("events count within u32::MAX"),
     };
 
-    // Hash the XDR-encoded preimage
-    let mut hasher = Sha256::new();
-    if let Ok(bytes) = preimage.to_xdr(Limits::none()) {
-        hasher.update(&bytes);
-    }
-    Hash(hasher.finalize().into())
+    henyey_common::Hash256::hash_xdr(&preimage).into()
 }
 
 fn build_soroban_operation_meta(

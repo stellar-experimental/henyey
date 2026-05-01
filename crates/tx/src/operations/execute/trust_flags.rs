@@ -3762,9 +3762,6 @@ mod tests {
     /// stellar-core's at-most-one-change-per-key-per-operation guarantee.
     #[test]
     fn test_pool_share_deauth_one_account_updated_per_key() {
-        use sha2::{Digest, Sha256};
-        use stellar_xdr::curr::{Limits, WriteXdr};
-
         let mut state = LedgerStateManager::new(5_000_000, 100);
         let context = create_test_context();
 
@@ -3842,10 +3839,7 @@ mod tests {
 
         // Helper to compute pool ID from params
         fn compute_pool_id(params: &LiquidityPoolParameters) -> PoolId {
-            let xdr = params.to_xdr(Limits::none()).expect("pool params xdr");
-            let mut hasher = Sha256::new();
-            hasher.update(&xdr);
-            PoolId(Hash(hasher.finalize().into()))
+            PoolId(henyey_common::Hash256::hash_xdr(params).into())
         }
 
         // Pool 1: USDC/EUR  (uses usdc_asset)
