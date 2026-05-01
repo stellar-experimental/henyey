@@ -197,6 +197,29 @@ pub(super) fn ensure_trustline_ext_v2(
     }
 }
 
+/// Get a mutable reference to the V2 trustline extension, returning an error
+/// if it doesn't exist. Matches stellar-core's `getTrustLineEntryExtensionV2`
+/// (TransactionUtils.cpp:162-167) which throws if the extension is missing.
+///
+/// Use this for paths that require V2 to already exist (e.g. decrementing
+/// `liquidityPoolUseCount`). For paths that need to create V2 if absent
+/// (e.g. incrementing during pool share creation), use `ensure_trustline_ext_v2`.
+pub(super) fn get_trustline_ext_v2_mut(
+    trustline: &mut TrustLineEntry,
+) -> Result<&mut TrustLineEntryExtensionV2> {
+    match &mut trustline.ext {
+        TrustLineEntryExt::V1(v1) => match &mut v1.ext {
+            TrustLineEntryV1Ext::V2(v2) => Ok(v2),
+            TrustLineEntryV1Ext::V0 => Err(TxError::Internal(
+                "expected TrustLineEntry extension V2".into(),
+            )),
+        },
+        TrustLineEntryExt::V0 => Err(TxError::Internal(
+            "expected TrustLineEntry extension V2".into(),
+        )),
+    }
+}
+
 /// Contract size limits from SorobanConfig for `validate_contract_ledger_entry`.
 pub(super) struct ContractSizeLimits {
     pub max_contract_size_bytes: u32,

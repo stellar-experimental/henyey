@@ -616,11 +616,11 @@ fn redeem_pool_share_trustlines(
         }
 
         // Decrement liquidity pool use count on asset trustlines
-        decrement_liquidity_pool_use_count(state, &asset_a, account_id);
-        decrement_liquidity_pool_use_count(state, &asset_b, account_id);
+        decrement_liquidity_pool_use_count(state, &asset_a, account_id)?;
+        decrement_liquidity_pool_use_count(state, &asset_b, account_id)?;
 
         // Decrement pool shares trust line count (may delete pool if count reaches 0)
-        decrement_pool_shares_trust_line_count(state, &pool_id);
+        decrement_pool_shares_trust_line_count(state, &pool_id)?;
     }
 
     Ok(RemoveResult::Success)
@@ -774,84 +774,61 @@ fn find_pool_share_trustlines_for_asset(
 }
 
 /// Decrement the liquidity pool use count on an asset trustline.
+///
+/// Matches stellar-core `decrementLiquidityPoolUseCount`
+/// (TransactionUtils.cpp:1796-1816) which throws on missing trustline,
+/// missing V2 extension, or negative count after decrement.
 fn decrement_liquidity_pool_use_count(
     state: &mut LedgerStateManager,
     asset: &Asset,
     account_id: &AccountId,
-) {
+) -> Result<()> {
     if matches!(asset, Asset::Native) {
-        return;
+        return Ok(());
     }
     if is_issuer(account_id, asset) {
-        return;
+        return Ok(());
     }
-    if let Some(tl) = state.get_trustline_mut(account_id, asset) {
-        let v2 = ensure_trustline_ext_v2(tl);
-        if v2.liquidity_pool_use_count > 0 {
-            v2.liquidity_pool_use_count -= 1;
-        }
+    let tl = state
+        .get_trustline_mut(account_id, asset)
+        .ok_or_else(|| crate::TxError::Internal("asset trustline is missing".into()))?;
+    let v2 = super::get_trustline_ext_v2_mut(tl)?;
+    let new_count = v2
+        .liquidity_pool_use_count
+        .checked_sub(1)
+        .ok_or_else(|| crate::TxError::Internal("liquidityPoolUseCount overflow".into()))?;
+    if new_count < 0 {
+        return Err(crate::TxError::Internal(
+            "liquidityPoolUseCount is negative".into(),
+        ));
     }
-}
-
-/// Ensure a trustline has the V2 extension and return a mutable reference to it.
-fn ensure_trustline_ext_v2(
-    trustline: &mut stellar_xdr::curr::TrustLineEntry,
-) -> &mut stellar_xdr::curr::TrustLineEntryExtensionV2 {
-    use stellar_xdr::curr::{
-        Liabilities, TrustLineEntryExt, TrustLineEntryExtensionV2, TrustLineEntryExtensionV2Ext,
-        TrustLineEntryV1, TrustLineEntryV1Ext,
-    };
-
-    match &mut trustline.ext {
-        TrustLineEntryExt::V0 => {
-            trustline.ext = TrustLineEntryExt::V1(TrustLineEntryV1 {
-                liabilities: Liabilities {
-                    buying: 0,
-                    selling: 0,
-                },
-                ext: TrustLineEntryV1Ext::V2(TrustLineEntryExtensionV2 {
-                    liquidity_pool_use_count: 0,
-                    ext: TrustLineEntryExtensionV2Ext::V0,
-                }),
-            });
-        }
-        TrustLineEntryExt::V1(v1) => match v1.ext {
-            TrustLineEntryV1Ext::V0 => {
-                v1.ext = TrustLineEntryV1Ext::V2(TrustLineEntryExtensionV2 {
-                    liquidity_pool_use_count: 0,
-                    ext: TrustLineEntryExtensionV2Ext::V0,
-                });
-            }
-            TrustLineEntryV1Ext::V2(_) => {}
-        },
-    }
-
-    match &mut trustline.ext {
-        TrustLineEntryExt::V1(v1) => match &mut v1.ext {
-            TrustLineEntryV1Ext::V2(v2) => v2,
-            TrustLineEntryV1Ext::V0 => unreachable!(),
-        },
-        TrustLineEntryExt::V0 => unreachable!(),
-    }
+    v2.liquidity_pool_use_count = new_count;
+    Ok(())
 }
 
 /// Decrement the pool shares trust line count and delete the pool if it reaches 0.
-fn decrement_pool_shares_trust_line_count(state: &mut LedgerStateManager, pool_id: &PoolId) {
-    let should_delete = {
-        let Some(pool) = state.get_liquidity_pool_mut(pool_id) else {
-            return;
-        };
-        let LiquidityPoolEntryBody::LiquidityPoolConstantProduct(cp) = &mut pool.body;
-        cp.pool_shares_trust_line_count -= 1;
-        if cp.pool_shares_trust_line_count < 0 {
-            panic!("poolSharesTrustLineCount is negative");
-        }
-        cp.pool_shares_trust_line_count == 0
-    };
-
-    if should_delete {
+///
+/// Matches stellar-core `decrementPoolSharesTrustLineCount`
+/// (TransactionUtils.cpp:1779-1795) which throws on negative count.
+fn decrement_pool_shares_trust_line_count(
+    state: &mut LedgerStateManager,
+    pool_id: &PoolId,
+) -> Result<()> {
+    let pool = state
+        .get_liquidity_pool_mut(pool_id)
+        .ok_or_else(|| crate::TxError::Internal("liquidity pool is missing".into()))?;
+    let LiquidityPoolEntryBody::LiquidityPoolConstantProduct(cp) = &mut pool.body;
+    let new_count = cp.pool_shares_trust_line_count - 1;
+    if new_count < 0 {
+        return Err(crate::TxError::Internal(
+            "poolSharesTrustLineCount is negative".into(),
+        ));
+    }
+    cp.pool_shares_trust_line_count = new_count;
+    if new_count == 0 {
         state.delete_liquidity_pool(pool_id);
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -3843,15 +3820,22 @@ mod tests {
             ));
         }
 
-        // Set liquidityPoolUseCount=1 on the asset trustlines involved in pools
-        fn set_pool_use_count(state: &mut LedgerStateManager, acct: &AccountId, asset: &Asset) {
+        // Set liquidityPoolUseCount on the asset trustlines involved in pools.
+        // USDC is in 2 pools (EUR/USDC and GBP/USDC), so its count is 2.
+        // EUR and GBP are each in 1 pool, so their counts are 1.
+        fn set_pool_use_count(
+            state: &mut LedgerStateManager,
+            acct: &AccountId,
+            asset: &Asset,
+            count: i32,
+        ) {
             if let Some(tl) = state.get_trustline_mut(acct, asset) {
-                super::ensure_trustline_ext_v2(tl).liquidity_pool_use_count = 1;
+                super::super::ensure_trustline_ext_v2(tl).liquidity_pool_use_count = count;
             }
         }
-        set_pool_use_count(&mut state, &trustor_id, &usdc_asset);
-        set_pool_use_count(&mut state, &trustor_id, &eur_asset);
-        set_pool_use_count(&mut state, &trustor_id, &gbp_asset);
+        set_pool_use_count(&mut state, &trustor_id, &usdc_asset, 2);
+        set_pool_use_count(&mut state, &trustor_id, &eur_asset, 1);
+        set_pool_use_count(&mut state, &trustor_id, &gbp_asset, 1);
 
         // Helper to compute pool ID from params
         fn compute_pool_id(params: &LiquidityPoolParameters) -> PoolId {
@@ -4016,5 +4000,239 @@ mod tests {
             trustor.num_sub_entries, 3,
             "num_sub_entries should be 7 - 4 = 3 (3 asset trustlines remain)"
         );
+    }
+
+    // --- Tests for decrement_liquidity_pool_use_count parity fix (AUDIT-224) ---
+
+    fn create_trustline_with_pool_use_count(
+        account_id: AccountId,
+        asset: TrustLineAsset,
+        pool_use_count: i32,
+    ) -> TrustLineEntry {
+        TrustLineEntry {
+            account_id,
+            asset,
+            balance: 1_000_000,
+            limit: i64::MAX,
+            flags: AUTHORIZED_FLAG,
+            ext: TrustLineEntryExt::V1(TrustLineEntryV1 {
+                liabilities: Liabilities {
+                    buying: 0,
+                    selling: 0,
+                },
+                ext: TrustLineEntryV1Ext::V2(TrustLineEntryExtensionV2 {
+                    liquidity_pool_use_count: pool_use_count,
+                    ext: TrustLineEntryExtensionV2Ext::V0,
+                }),
+            }),
+        }
+    }
+
+    #[test]
+    fn test_decrement_pool_use_count_missing_trustline() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let account_id = create_test_account_id(1);
+        let issuer_id = create_test_account_id(2);
+        let asset = Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4(*b"USD\0"),
+            issuer: issuer_id,
+        });
+
+        // No trustline exists — should return TxError::Internal
+        let result = super::decrement_liquidity_pool_use_count(&mut state, &asset, &account_id);
+        assert!(matches!(result, Err(crate::TxError::Internal(_))));
+    }
+
+    #[test]
+    fn test_decrement_pool_use_count_zero_count() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let account_id = create_test_account_id(1);
+        let issuer_id = create_test_account_id(2);
+        let asset = Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4(*b"USD\0"),
+            issuer: issuer_id,
+        });
+        let tl_asset = TrustLineAsset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4(*b"USD\0"),
+            issuer: create_test_account_id(2),
+        });
+
+        // Trustline with count=0 — decrement should produce negative → error
+        state.create_trustline(create_trustline_with_pool_use_count(
+            account_id.clone(),
+            tl_asset,
+            0,
+        ));
+
+        let result = super::decrement_liquidity_pool_use_count(&mut state, &asset, &account_id);
+        assert!(matches!(result, Err(crate::TxError::Internal(_))));
+    }
+
+    #[test]
+    fn test_decrement_pool_use_count_missing_v2_extension() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let account_id = create_test_account_id(1);
+        let issuer_id = create_test_account_id(2);
+        let asset = Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4(*b"USD\0"),
+            issuer: issuer_id,
+        });
+        let tl_asset = TrustLineAsset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4(*b"USD\0"),
+            issuer: create_test_account_id(2),
+        });
+
+        // Trustline without V2 extension — should error
+        state.create_trustline(create_test_trustline(
+            account_id.clone(),
+            tl_asset,
+            1_000_000,
+            i64::MAX,
+            AUTHORIZED_FLAG,
+        ));
+
+        let result = super::decrement_liquidity_pool_use_count(&mut state, &asset, &account_id);
+        assert!(matches!(result, Err(crate::TxError::Internal(_))));
+    }
+
+    #[test]
+    fn test_decrement_pool_use_count_valid() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let account_id = create_test_account_id(1);
+        let issuer_id = create_test_account_id(2);
+        let asset = Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4(*b"USD\0"),
+            issuer: issuer_id,
+        });
+        let tl_asset = TrustLineAsset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4(*b"USD\0"),
+            issuer: create_test_account_id(2),
+        });
+
+        // Trustline with count=1 — should decrement to 0 successfully
+        state.create_trustline(create_trustline_with_pool_use_count(
+            account_id.clone(),
+            tl_asset.clone(),
+            1,
+        ));
+
+        let result = super::decrement_liquidity_pool_use_count(&mut state, &asset, &account_id);
+        assert!(result.is_ok());
+
+        // Verify count is now 0
+        let tl = state
+            .get_trustline_by_trustline_asset(&account_id, &tl_asset)
+            .unwrap();
+        if let TrustLineEntryExt::V1(v1) = &tl.ext {
+            if let TrustLineEntryV1Ext::V2(v2) = &v1.ext {
+                assert_eq!(v2.liquidity_pool_use_count, 0);
+            } else {
+                panic!("expected V2 extension");
+            }
+        } else {
+            panic!("expected V1 extension");
+        }
+    }
+
+    #[test]
+    fn test_decrement_pool_use_count_native_asset_noop() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let account_id = create_test_account_id(1);
+
+        // Native asset — should return Ok(()) without looking up trustline
+        let result =
+            super::decrement_liquidity_pool_use_count(&mut state, &Asset::Native, &account_id);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_decrement_pool_use_count_issuer_noop() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let issuer_id = create_test_account_id(1);
+        let asset = Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4(*b"USD\0"),
+            issuer: issuer_id.clone(),
+        });
+
+        // Issuer of the asset — should return Ok(()) without looking up trustline
+        let result = super::decrement_liquidity_pool_use_count(&mut state, &asset, &issuer_id);
+        assert!(result.is_ok());
+    }
+
+    // --- Tests for decrement_pool_shares_trust_line_count parity fix ---
+
+    #[test]
+    fn test_decrement_pool_shares_tl_count_missing_pool() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let pool_id = PoolId(Hash([0u8; 32]));
+
+        // No pool exists — should return TxError::Internal
+        let result = super::decrement_pool_shares_trust_line_count(&mut state, &pool_id);
+        assert!(matches!(result, Err(crate::TxError::Internal(_))));
+    }
+
+    #[test]
+    fn test_decrement_pool_shares_tl_count_zero_count() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let pool_id = PoolId(Hash([1u8; 32]));
+
+        // Create pool with count=0
+        let pool = LiquidityPoolEntry {
+            liquidity_pool_id: pool_id.clone(),
+            body: LiquidityPoolEntryBody::LiquidityPoolConstantProduct(
+                LiquidityPoolEntryConstantProduct {
+                    params: LiquidityPoolConstantProductParameters {
+                        asset_a: Asset::Native,
+                        asset_b: Asset::CreditAlphanum4(AlphaNum4 {
+                            asset_code: AssetCode4(*b"USD\0"),
+                            issuer: create_test_account_id(1),
+                        }),
+                        fee: LIQUIDITY_POOL_FEE_V18,
+                    },
+                    reserve_a: 0,
+                    reserve_b: 0,
+                    total_pool_shares: 0,
+                    pool_shares_trust_line_count: 0,
+                },
+            ),
+        };
+        state.create_liquidity_pool(pool);
+
+        // Count=0, decrement would give -1 → error
+        let result = super::decrement_pool_shares_trust_line_count(&mut state, &pool_id);
+        assert!(matches!(result, Err(crate::TxError::Internal(_))));
+    }
+
+    #[test]
+    fn test_decrement_pool_shares_tl_count_valid_deletes_pool() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let pool_id = PoolId(Hash([2u8; 32]));
+
+        // Create pool with count=1
+        let pool = LiquidityPoolEntry {
+            liquidity_pool_id: pool_id.clone(),
+            body: LiquidityPoolEntryBody::LiquidityPoolConstantProduct(
+                LiquidityPoolEntryConstantProduct {
+                    params: LiquidityPoolConstantProductParameters {
+                        asset_a: Asset::Native,
+                        asset_b: Asset::CreditAlphanum4(AlphaNum4 {
+                            asset_code: AssetCode4(*b"USD\0"),
+                            issuer: create_test_account_id(1),
+                        }),
+                        fee: LIQUIDITY_POOL_FEE_V18,
+                    },
+                    reserve_a: 100,
+                    reserve_b: 100,
+                    total_pool_shares: 100,
+                    pool_shares_trust_line_count: 1,
+                },
+            ),
+        };
+        state.create_liquidity_pool(pool);
+
+        // Count=1 → decrement to 0 → pool deleted
+        let result = super::decrement_pool_shares_trust_line_count(&mut state, &pool_id);
+        assert!(result.is_ok());
+        assert!(state.get_liquidity_pool(&pool_id).is_none());
     }
 }
