@@ -40,6 +40,111 @@ Variables provided by the env file (all required):
 
 Throughout this skill, substitute those values for the `$MONITOR_*` references below.
 
+## Session-dir-vanished detection
+
+Immediately after loading `monitor-loop.env`, check whether the session
+directory still exists. If not, this is a distinct (and severe) failure class
+— the entire session state (binary, logs, metrics, tick history) was deleted
+out-of-band.
+
+```bash
+SESSION_WIPED=no
+if [ ! -d "/home/tomer/data/$MONITOR_SESSION_ID" ]; then
+  # Identify our process by matching the expected binary path (not `comm`).
+  EXPECTED_BINARY="/home/tomer/data/$MONITOR_SESSION_ID/cargo-target/release/henyey"
+  OUR_PID=""
+  for p in /proc/[0-9]*; do
+    exe=$(readlink "$p/exe" 2>/dev/null || true)
+    if [ "$exe" = "$EXPECTED_BINARY" ] || [ "$exe" = "${EXPECTED_BINARY} (deleted)" ]; then
+      OUR_PID=$(basename "$p")
+      break
+    fi
+  done
+
+  if [ -n "$OUR_PID" ]; then
+    # Binary still running (inode alive despite unlinked path).
+    # Do NOT terminate — it may still be validating.
+    SESSION_WIPED=yes
+    SESSION_WIPED_PROCESS_ALIVE=yes
+  else
+    # No matching process. Check env freshness to avoid resurrecting stale session.
+    env_mtime=$(stat -c %Y /home/tomer/data/monitor-loop.env 2>/dev/null || echo 0)
+    env_age=$(( $(date +%s) - env_mtime ))
+    if [ "$env_age" -gt 7200 ]; then
+      echo "ERROR: session $MONITOR_SESSION_ID absent, no process, env stale (${env_age}s > 2h). Run /monitor-loop."
+      exit 1
+    fi
+    SESSION_WIPED=yes
+    SESSION_WIPED_PROCESS_ALIVE=no
+  fi
+
+  # Recreate minimal session structure for recovery.
+  mkdir -p /home/tomer/data/$MONITOR_SESSION_ID/{logs,cache,cargo-target,metrics}
+fi
+```
+
+### Recovery path when `SESSION_WIPED=yes`
+
+**Case A: `SESSION_WIPED_PROCESS_ALIVE=yes`**
+- Touch `.alive`.
+- Skip checks dependent on log/metrics files (1, 5, 6, 7, 12).
+- Attempt admin-port checks: (2) ledger progression, (8) RPC health, (9) OBSRVR
+  — the live process may still respond to HTTP.
+- Report status: **`ACTION`** with `wipe: SESSION DIR WIPED — process alive
+  (PID $OUR_PID), operator intervention needed`.
+- Add `"session-wiped-process-alive"` to `actions`, `"wipe=session-dir"` to `watch`.
+- File/comment issue per the Filing Flow below.
+
+**Case B: `SESSION_WIPED_PROCESS_ALIVE=no`**
+- Touch `.alive`.
+- `FRESH_START` determined normally (mainnet.db likely absent → yes).
+- Skip checks (1)–(9), (12) — no process, no logs, no metrics.
+- **Rebuild the binary**:
+  ```bash
+  CARGO_TARGET_DIR=/home/tomer/data/$MONITOR_SESSION_ID/cargo-target \
+    cargo build --release -p henyey
+  ```
+  If build fails: report `OFFLINE` with action `session-wiped-rebuild-failed`, exit.
+- **Relaunch** via standard Relaunch procedure.
+- Report status: **`ACTION`** with `wipe: SESSION DIR WIPED — rebuilt +
+  relaunched (new PID $NEW_PID)`.
+- Add `"session-wiped-recovery"` to `actions`, `"wipe=session-dir"` to `watch`.
+- File/comment issue per the Filing Flow below.
+
+## Mainnet-data-vanished detection
+
+After the session-dir check, when `SESSION_WIPED=no` (session dir exists but
+mainnet data may not):
+
+```bash
+MAINNET_WIPED=no
+if [ "$SESSION_WIPED" = "no" ] && [ ! -d "/home/tomer/data/mainnet" ]; then
+  MAINNET_WIPED=yes
+fi
+# Note: if mainnet/ dir exists but mainnet.db is missing, defer to FRESH_START
+# logic — this is the expected state after a (3a) self-heal wipe.
+# MAINNET_WIPED only fires when the ENTIRE directory is gone.
+```
+
+When `MAINNET_WIPED=yes`:
+- The tick proceeds normally (catchup recovery via `FRESH_START=yes`).
+- Include `"mainnet-data-wiped"` in `actions` array.
+- Include `"wipe=mainnet-data"` in `watch`.
+- File/comment an `urgent` issue per the Filing Flow.
+
+## Session-alive marker
+
+After the session-dir-vanished detection (which ensures the dir exists),
+touch a sentinel file at the **start of every tick**:
+
+```bash
+touch /home/tomer/data/$MONITOR_SESSION_ID/.alive
+```
+
+The `.alive` file's mtime = timestamp of last successful tick start. Cleanup
+tooling uses this to determine session liveness (see monitor-loop cleanup
+guards).
+
 ## Fresh-start state
 
 Determine once at the top of the tick: if `/home/tomer/data/mainnet/mainnet.db`
@@ -889,8 +994,9 @@ path in the status report and skip the filing.
 Print a multiline status report:
 
 ```
-MONITOR <OK|WARNING|ACTION> — L<ledger> — <timestamp>
+MONITOR <OK|WARNING|ACTION|OFFLINE> — L<ledger> — <timestamp>
   node:    mode=<MODE> session=<session-id> pid=<PID> fresh_start=<yes|no>
+  wipe:    <SESSION DIR WIPED — process alive (PID N), operator intervention needed | SESSION DIR WIPED — rebuilt + relaunched (new PID N) | MAINNET DATA WIPED — catchup recovery | N/A>
   sync:    <synced | CATCHING UP (gap=N, uptime=Xm, deadline=<15m|60m|4h>) | SYNC FAILURE (gap=N, uptime=Xm — filed/commented #<N>)>
   mem:     <RSS_MB>MB rss | alloc=<alloc>MB resident=<resident>MB frag=<pct>%
            heap=<heap>MB mmap=<mmap>MB unaccounted=<sign><unaccounted>MB
@@ -904,8 +1010,13 @@ MONITOR <OK|WARNING|ACTION> — L<ledger> — <timestamp>
   self_reflect: <clean | fixed inline (<sha>: <short-desc>) | filed #<N> (urgent: <short-desc>) | filed #<N> (no-label: <short-desc>) | filed #<N> (not-ready: <short-desc>)>
 ```
 
+The `wipe:` line is only present when `SESSION_WIPED=yes` or `MAINNET_WIPED=yes`.
+When neither wipe condition fires, omit the `wipe:` line entirely.
+
 Use WARNING for threshold breaches. Use ACTION when a corrective action was
-taken (restart, deploy, filed a new issue, commented on an existing issue).
+taken (restart, deploy, filed a new issue, commented on an existing issue,
+session-wipe recovery). Use OFFLINE when the node cannot be recovered in
+this tick (e.g., rebuild failed after session wipe).
 Use SYNC FAILURE (not WARNING) when the node has exceeded the active sync
 deadline (15m populated / 4h fresh-start) but is not closing ledgers in
 real-time — this is a bug that requires immediate investigation AND
@@ -928,7 +1039,7 @@ print(json.dumps({
   "build":        "<short-sha>",
   "deploys":      <0 or 1>,
   "warnings":     [<list of metric names that breached>],
-  "actions":      [<list of action keywords: restart, deploy, filed-#N>],
+  "actions":      [<list of action keywords: restart, deploy, filed-#N, session-wiped-recovery, session-wiped-process-alive, session-wiped-rebuild-failed, mainnet-data-wiped>],
   "self_reflect": "<clean | fixed-inline | filed-#N>",
   "watch":        ["<key>=<value>", ...]
 }))
@@ -936,10 +1047,11 @@ PY
 ```
 
 `watch` carries multi-tick non-incident concerns the daily summary should
-surface — examples: `pruning_gap=2451`, `frag_pct=18`, `disk_pct=72`. Add
-a key whenever the tick body called out a value worth tracking but did
-not file an issue. Each entry MUST be one line — the daily-summary
-aggregator parses with `for ln in f: json.loads(ln)`.
+surface — examples: `pruning_gap=2451`, `frag_pct=18`, `disk_pct=72`,
+`wipe=session-dir`, `wipe=mainnet-data`. Add a key whenever the tick body
+called out a value worth tracking but did not file an issue. Each entry MUST
+be one line — the daily-summary aggregator parses with
+`for ln in f: json.loads(ln)`.
 
 ## Self-reflection
 

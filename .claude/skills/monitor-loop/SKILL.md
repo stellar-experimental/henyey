@@ -470,6 +470,20 @@ process watches for `ready`-labeled issues and handles the fix.
      The result is the original `monitor.log` path; take its parent's
      parent as `<session-id>` root. Example:
      `/home/tomer/data/ab12cd34/logs/monitor.log` → `<session-id>=ab12cd34`.
+   - **Handle `(deleted)` paths**: If `readlink` returns a path with
+     ` (deleted)` suffix (e.g., `/home/tomer/data/ab12cd34/logs/monitor.log (deleted)`),
+     the session directory was wiped while the process was running:
+     ```bash
+     proc_stdout=$(readlink /proc/<pid>/fd/1)
+     if echo "$proc_stdout" | grep -q '(deleted)'; then
+       echo "WARNING: henyey stdout target deleted (out-of-band wipe). Process still alive."
+       original_path=$(echo "$proc_stdout" | sed 's/ (deleted)$//')
+       session_id=$(echo "$original_path" | sed 's|.*/data/\([^/]*\)/.*|\1|')
+       mkdir -p ~/data/$session_id/{logs,cache,cargo-target,metrics}
+       touch ~/data/$session_id/.alive
+       # Continue with recovered session_id — process is still running.
+     fi
+     ```
    - Verify the running binary:
      ```
      readlink /proc/<pid>/exe
@@ -486,6 +500,7 @@ process watches for `ready`-labeled issues and handles the fix.
 4. **Create directories:**
    ```
    mkdir -p ~/data/<session-id>/{logs,cache,cargo-target,metrics}
+   touch ~/data/<session-id>/.alive
    ```
 
 5. **Build the binary** (henyey crate only, matching the redeploy step in
@@ -791,6 +806,11 @@ When the OBSRVR Radar API reports `isValidating: false` or low
 
 ### Low Disk (> 85% usage)
 
+> ⚠️ **NEVER delete `~/data/mainnet/` or any of its contents during disk
+> cleanup.** This is the validator's live persisted state (database + buckets).
+> Only the (3a) Repeated-FATAL state-wipe trigger in monitor-tick may remove
+> it. Disk reclamation targets old session subtrees only.
+
 1. **Identify large consumers**:
    ```
    du -sh ~/data/*/ | sort -rh | head -10
@@ -802,15 +822,47 @@ When the OBSRVR Radar API reports `isValidating: false` or low
 
 2. **Safe cleanup candidates** (delete without asking):
    - Cargo build artifacts from old sessions:
-     `~/data/<old-session-id>/cargo-target/` where the session is not
-     the current one and no henyey process is using that binary.
+     `~/data/<old-session-id>/cargo-target/` where the session passes the
+     three-layer guard below.
    - Stale cache directories from old sessions:
      `~/data/<old-session-id>/cache/` (same criteria).
    - Old log files: `~/data/<old-session-id>/logs/` (same criteria).
    - Rust incremental build caches: `find ~/data/*/cargo-target -name
-     incremental -type d` — these can be safely removed.
-   Before deleting, verify no running process references the directory:
-   `ls -la /proc/*/exe 2>/dev/null | grep <session-id>`.
+     incremental -type d` — these can be safely removed (apply layer 1 only).
+
+   **Three-layer cleanup guard** — apply before deleting any subtree of a
+   candidate session directory:
+   ```bash
+   # Layer 1: Never touch the active session from monitor-loop.env
+   active_session=$(grep '^MONITOR_SESSION_ID=' ~/data/monitor-loop.env 2>/dev/null | cut -d= -f2)
+   if [ "$candidate" = "$active_session" ]; then
+     echo "SKIP $candidate — active per monitor-loop.env"
+     continue
+   fi
+
+   # Layer 2: Check .alive marker freshness (1h threshold)
+   alive_file="$HOME/data/$candidate/.alive"
+   if [ -f "$alive_file" ]; then
+     alive_age=$(( $(date +%s) - $(stat -c %Y "$alive_file") ))
+     if [ "$alive_age" -lt 3600 ]; then
+       echo "SKIP $candidate — .alive touched ${alive_age}s ago (< 1h)"
+       continue
+     fi
+   fi
+
+   # Layer 3: Check if any running process references this session
+   if ls -la /proc/*/exe 2>/dev/null | grep -q "/data/$candidate/"; then
+     echo "SKIP $candidate — running process uses this session"
+     continue
+   fi
+
+   # All guards passed — safe to delete subtrees
+   ```
+
+   **Threshold rationale**: Ticks run every ~20 min. A 1-hour `.alive`
+   freshness window covers 3 missed ticks — enough to survive a single
+   cron miss, failed invocation, or long rebuild. Layer 1 (env match)
+   provides unconditional protection regardless of `.alive` age.
 
 3. **Investigate if no obvious cleanup**: If disk usage is high and
    there are no stale sessions to clean, check whether the mainnet data
