@@ -788,7 +788,7 @@ impl App {
 
         let overlay_clone = Arc::clone(&overlay);
         let envelope_count = envelopes.len();
-        tokio::spawn(async move {
+        henyey_common::spawn_observed("scp_envelope_forwarding", async move {
             let broadcast_futures: Vec<_> = envelopes
                 .into_iter()
                 .map(|envelope| {
@@ -1307,14 +1307,17 @@ impl App {
                     *self.last_scp_state_request_at.write().await = self.clock.now();
                     let overlay_clone = std::sync::Arc::clone(&overlay);
                     let ledger = current_ledger;
-                    tokio::spawn(async move {
-                        if let Err(e) = overlay_clone.request_scp_state(ledger).await {
-                            tracing::debug!(
-                                error = %e,
-                                "Failed to request SCP state during inter-checkpoint recovery"
-                            );
-                        }
-                    });
+                    henyey_common::spawn_observed(
+                        "inter_checkpoint_scp_state_request",
+                        async move {
+                            if let Err(e) = overlay_clone.request_scp_state(ledger).await {
+                                tracing::debug!(
+                                    error = %e,
+                                    "Failed to request SCP state during inter-checkpoint recovery"
+                                );
+                            }
+                        },
+                    );
                 }
 
                 // Retry exhausted tx_set fetches with 30s per-hash backoff.

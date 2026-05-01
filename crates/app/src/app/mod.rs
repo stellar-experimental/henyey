@@ -580,6 +580,9 @@ pub struct App {
     /// Uses parking_lot::RwLock for synchronous access from callbacks.
     sync_recovery_handle: parking_lot::RwLock<Option<SyncRecoveryHandle>>,
 
+    /// JoinHandle for the sync recovery manager task (for shutdown awaiting).
+    sync_recovery_task: parking_lot::RwLock<Option<tokio::task::JoinHandle<()>>>,
+
     /// Whether ledger application is currently in progress (for sync recovery).
     is_applying_ledger: AtomicBool,
 
@@ -1050,6 +1053,7 @@ impl App {
             last_soroban_stage_count: AtomicU64::new(0),
             last_soroban_max_cluster_count: AtomicU64::new(0),
             sync_recovery_handle: parking_lot::RwLock::new(None), // Initialized in run() when needed
+            sync_recovery_task: parking_lot::RwLock::new(None),
             is_applying_ledger: AtomicBool::new(false),
             close_cycle_last_start: parking_lot::Mutex::new(None),
             #[cfg(test)]
@@ -2288,11 +2292,35 @@ impl App {
     /// Start the sync recovery manager background task.
     ///
     /// This spawns a background task that monitors for consensus stuck conditions
-    /// and triggers recovery actions when needed.
+    /// and triggers recovery actions when needed. The task is supervised: if it
+    /// panics, shutdown is triggered immediately.
     pub fn start_sync_recovery(self: &Arc<Self>) {
         let (handle, manager) = SyncRecoveryManager::new(Arc::clone(self));
         *self.sync_recovery_handle.write() = Some(handle);
-        tokio::spawn(manager.run());
+        let shutdown_tx = self.shutdown_tx.clone();
+        let task = tokio::spawn(async move {
+            use futures::FutureExt;
+            use std::panic::AssertUnwindSafe;
+            let result = AssertUnwindSafe(manager.run()).catch_unwind().await;
+            match result {
+                Ok(()) => {
+                    tracing::debug!("Sync recovery manager exited cleanly");
+                }
+                Err(payload) => {
+                    let msg = payload
+                        .downcast_ref::<&str>()
+                        .copied()
+                        .or_else(|| payload.downcast_ref::<String>().map(|s| s.as_str()))
+                        .unwrap_or("<non-string panic>");
+                    tracing::error!(
+                        panic_message = msg,
+                        "FATAL: sync recovery manager panicked — triggering shutdown"
+                    );
+                    let _ = shutdown_tx.send(());
+                }
+            }
+        });
+        *self.sync_recovery_task.write() = Some(task);
         tracing::info!("Sync recovery manager started");
     }
 
@@ -2329,7 +2357,7 @@ impl App {
         // Create a shutdown watch channel driven by the app's broadcast channel.
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let mut broadcast_rx = self.shutdown_tx.subscribe();
-        tokio::spawn(async move {
+        henyey_common::spawn_observed("maintainer_shutdown_bridge", async move {
             let _ = broadcast_rx.recv().await;
             let _ = shutdown_tx.send(true);
         });

@@ -1589,6 +1589,17 @@ impl App {
         self.set_state(AppState::ShuttingDown).await;
         self.stop_survey_reporting().await;
 
+        // Shut down sync recovery manager gracefully: send Shutdown command,
+        // then await the task handle for clean ordering.
+        let sync_recovery = self.sync_recovery_handle.read().clone();
+        if let Some(ref handle) = sync_recovery {
+            handle.shutdown().await;
+        }
+        let sync_task = self.sync_recovery_task.write().take();
+        if let Some(task) = sync_task {
+            let _ = task.await;
+        }
+
         // Explicitly flush and close the meta stream before shutting down
         // overlay connections. This ensures all streamed LedgerCloseMeta frames
         // are written to the pipe/file before the process exits. The stream
