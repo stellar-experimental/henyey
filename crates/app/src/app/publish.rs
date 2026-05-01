@@ -2,6 +2,31 @@
 
 use super::*;
 
+/// Exclusive permit for history publishing. Clears `publish_in_progress` on
+/// drop, ensuring the flag is released even if the publish task panics (in
+/// unwind builds) or returns early.
+struct PublishPermit {
+    app: Arc<App>,
+}
+
+impl PublishPermit {
+    /// Attempt to acquire the publish permit. Returns `None` if publishing
+    /// is already in progress (flag was already true).
+    fn try_acquire(app: Arc<App>) -> Option<Self> {
+        if app.publish_in_progress.swap(true, Ordering::SeqCst) {
+            None
+        } else {
+            Some(Self { app })
+        }
+    }
+}
+
+impl Drop for PublishPermit {
+    fn drop(&mut self) {
+        self.app.publish_in_progress.store(false, Ordering::SeqCst);
+    }
+}
+
 impl App {
     /// Drain the publish queue, publishing one checkpoint at a time.
     ///
@@ -11,7 +36,8 @@ impl App {
     /// the checkpoint files in a temp directory and uploads them.
     ///
     /// Publishing runs as a background task to avoid blocking the event loop.
-    /// The `publish_in_progress` flag prevents concurrent publishes.
+    /// The `publish_in_progress` flag prevents concurrent publishes via
+    /// [`PublishPermit`] (RAII guard).
     pub async fn maybe_publish_history(&self) {
         // Only validators publish
         if !self.is_validator {
@@ -57,33 +83,38 @@ impl App {
             return;
         }
 
-        // Try to acquire the publish lock
-        if self.publish_in_progress.swap(true, Ordering::SeqCst) {
-            return; // Another call raced us
-        }
-
-        tracing::info!(
-            checkpoint,
-            "Publishing checkpoint to history archive (background)"
-        );
-
-        // Spawn the publish as a background task via self_arc to avoid
-        // blocking the event loop. Publishing involves gzip compression
-        // of XDR files and shell command execution (cp/mkdir), which can
-        // take 30-50 seconds on large checkpoints.
+        // Upgrade self_arc before acquiring the permit so that failure
+        // doesn't require releasing the flag.
         let app = {
             let weak = self.self_arc.read().await;
             match weak.upgrade() {
                 Some(arc) => arc,
                 None => {
-                    self.publish_in_progress.store(false, Ordering::SeqCst);
                     tracing::warn!("Cannot spawn publish task: self_arc unavailable");
                     return;
                 }
             }
         };
 
-        tokio::task::spawn_blocking(move || {
+        // Acquire the publish permit (RAII: cleared on drop or panic)
+        let permit = match PublishPermit::try_acquire(Arc::clone(&app)) {
+            Some(p) => p,
+            None => return, // Another call raced us
+        };
+
+        tracing::info!(
+            checkpoint,
+            "Publishing checkpoint to history archive (background)"
+        );
+
+        // Spawn the publish as a background task to avoid blocking the
+        // event loop. Publishing involves gzip compression of XDR files
+        // and shell command execution (cp/mkdir), which can take 30-50
+        // seconds on large checkpoints.
+        let handle = tokio::task::spawn_blocking(move || {
+            // Permit drops at end of closure or on panic → flag cleared
+            let _permit = permit;
+
             let command_archives: Vec<_> = app
                 .config
                 .history
@@ -103,8 +134,20 @@ impl App {
                     tracing::warn!(checkpoint, error = %e, "Failed to publish checkpoint");
                 }
             }
+        });
 
-            app.publish_in_progress.store(false, Ordering::SeqCst);
+        // Observe panics via existing helper (non-blocking watcher)
+        tokio::spawn(async move {
+            if let Err(e) =
+                henyey_common::spawn::await_blocking_logged("publish_checkpoint", handle).await
+            {
+                if e.is_panic() {
+                    tracing::error!(
+                        checkpoint,
+                        "Publish task panicked — permit released by guard"
+                    );
+                }
+            }
         });
     }
 
@@ -1035,5 +1078,70 @@ mod tests {
                 remaining.iter().map(|e| e.path()).collect::<Vec<_>>()
             );
         }
+    }
+
+    // -- PublishPermit RAII guard tests --
+
+    async fn permit_test_app() -> Arc<App> {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("permit-test.sqlite");
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(&db_path)
+            .validator(true)
+            .node_seed("SAFTEV5U6QDFE2DRMSD7HBE76XG7SQZJD6VIUTHIXTJGO77RUQYVURLA")
+            .build();
+        // Leak the tempdir so the DB file outlives the test
+        std::mem::forget(dir);
+        Arc::new(App::new(config).await.unwrap())
+    }
+
+    #[tokio::test]
+    async fn test_publish_permit_try_acquire_and_release() {
+        let app = permit_test_app().await;
+
+        // Initially the flag is false
+        assert!(!app.publish_in_progress.load(Ordering::SeqCst));
+
+        // First acquire succeeds
+        let permit = PublishPermit::try_acquire(Arc::clone(&app));
+        assert!(permit.is_some());
+        assert!(app.publish_in_progress.load(Ordering::SeqCst));
+
+        // Second acquire fails (flag already held)
+        let permit2 = PublishPermit::try_acquire(Arc::clone(&app));
+        assert!(permit2.is_none());
+
+        // Drop the first permit — flag should clear
+        drop(permit);
+        assert!(!app.publish_in_progress.load(Ordering::SeqCst));
+
+        // Can re-acquire after drop
+        let permit3 = PublishPermit::try_acquire(Arc::clone(&app));
+        assert!(permit3.is_some());
+        drop(permit3);
+        assert!(!app.publish_in_progress.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn test_publish_permit_panic_clears_flag() {
+        let app = permit_test_app().await;
+
+        // Acquire permit, then panic inside catch_unwind
+        let app_clone = Arc::clone(&app);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _permit = PublishPermit::try_acquire(app_clone).unwrap();
+            panic!("simulated publish panic");
+        }));
+
+        // The panic was caught
+        assert!(result.is_err());
+
+        // The flag is cleared by the permit's Drop during unwinding
+        assert!(!app.publish_in_progress.load(Ordering::SeqCst));
+
+        // A subsequent acquire should succeed
+        let permit = PublishPermit::try_acquire(Arc::clone(&app));
+        assert!(permit.is_some());
+        drop(permit);
     }
 }
