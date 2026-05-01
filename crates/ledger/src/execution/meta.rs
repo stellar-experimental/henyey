@@ -1111,4 +1111,222 @@ mod tests {
         let cd_key = soroban_create_sort_key(&cd).unwrap();
         assert_eq!(cd_key.1, 1, "ContractData type_order should be 1");
     }
+
+    /// Helper: derive the key_hash that `soroban_create_sort_key` would compute
+    /// for a ContractData or ContractCode entry, so we can build a paired TTL
+    /// entry with the matching hash.
+    fn derive_key_hash(entry: &LedgerEntry) -> [u8; 32] {
+        let key = henyey_common::entry_to_key(entry);
+        let hash = Hash256::hash_xdr(&key);
+        *hash.as_bytes()
+    }
+
+    /// Helper: build an account entry with a specific public key for
+    /// distinct update/delete entries.
+    fn make_account_entry_with_id(id: [u8; 32]) -> LedgerEntry {
+        LedgerEntry {
+            last_modified_ledger_seq: 0,
+            data: LedgerEntryData::Account(AccountEntry {
+                account_id: AccountId(PublicKey::PublicKeyTypeEd25519(id.into())),
+                balance: 100,
+                seq_num: SequenceNumber(1),
+                num_sub_entries: 0,
+                inflation_dest: None,
+                flags: 0,
+                home_domain: Default::default(),
+                thresholds: Thresholds([1, 0, 0, 0]),
+                signers: Default::default(),
+                ext: AccountEntryExt::V0,
+            }),
+            ext: LedgerEntryExt::V0,
+        }
+    }
+
+    #[test]
+    fn test_soroban_create_group_ordering_and_flush_boundaries() {
+        // Build ContractData entries with distinct contract hashes.
+        let cd_a = make_contract_data_entry([0x01; 32]);
+        let cd_b = make_contract_data_entry([0x02; 32]);
+        let cd_c = make_contract_data_entry([0x03; 32]);
+        let cd_e = make_contract_data_entry([0x05; 32]);
+
+        // Build ContractCode entry for group 3.
+        let cc_d = make_contract_code_entry(b"wasm-code-for-d");
+
+        // Derive key_hashes from the contract entries' XDR-hashed ledger keys.
+        let hash_a: [u8; 32] = derive_key_hash(&cd_a);
+        let hash_b: [u8; 32] = derive_key_hash(&cd_b);
+        let hash_c: [u8; 32] = derive_key_hash(&cd_c);
+        let hash_d: [u8; 32] = derive_key_hash(&cc_d);
+        let hash_e: [u8; 32] = derive_key_hash(&cd_e);
+
+        // Build paired TTL entries using derived hashes.
+        let ttl_a = make_ttl_entry(hash_a, 100);
+        let ttl_b = make_ttl_entry(hash_b, 100);
+        let ttl_c = make_ttl_entry(hash_c, 100);
+        let ttl_d = make_ttl_entry(hash_d, 100);
+        let ttl_e = make_ttl_entry(hash_e, 100);
+
+        // Classic create: Account with id [0x00; 32] (same as make_account_entry).
+        let account_create = make_account_entry();
+
+        // Distinct update/delete account entries (different IDs from created entries).
+        let update_pre = make_account_entry_with_id([0x02; 32]);
+        let update_post = {
+            let mut e = update_pre.clone();
+            if let LedgerEntryData::Account(ref mut a) = e.data {
+                a.balance = 200;
+            }
+            e
+        };
+        let delete_pre = make_account_entry_with_id([0x03; 32]);
+        let delete_key = LedgerKey::Account(LedgerKeyAccount {
+            account_id: AccountId(PublicKey::PublicKeyTypeEd25519([0x03; 32].into())),
+        });
+
+        // Build the created array (indices 0-10).
+        // Note: group 1 input order is scrambled: CD_B, TTL_B, CD_A, TTL_A
+        // but the created array stores entries at fixed indices.
+        let created = vec![
+            ttl_a.clone(),          // 0
+            cd_a.clone(),           // 1
+            ttl_b.clone(),          // 2
+            cd_b.clone(),           // 3
+            account_create.clone(), // 4
+            ttl_c.clone(),          // 5
+            cd_c.clone(),           // 6
+            ttl_d.clone(),          // 7
+            cc_d.clone(),           // 8
+            ttl_e.clone(),          // 9
+            cd_e.clone(),           // 10
+        ];
+
+        // Build change_order with group 1 SCRAMBLED to prove sorting.
+        // Input order: CD_B(3), TTL_B(2), CD_A(1), TTL_A(0) — deliberately reversed.
+        let change_order = vec![
+            // Group 1 (scrambled): CD_B, TTL_B, CD_A, TTL_A
+            henyey_tx::ChangeRef::Created(3), // CD_B
+            henyey_tx::ChangeRef::Created(2), // TTL_B
+            henyey_tx::ChangeRef::Created(1), // CD_A
+            henyey_tx::ChangeRef::Created(0), // TTL_A
+            // Classic create flush
+            henyey_tx::ChangeRef::Created(4), // Account
+            // Group 2: TTL_C, CD_C
+            henyey_tx::ChangeRef::Created(5), // TTL_C
+            henyey_tx::ChangeRef::Created(6), // CD_C
+            // Delete flush
+            henyey_tx::ChangeRef::Deleted(0),
+            // Group 3: TTL_D, CC_D
+            henyey_tx::ChangeRef::Created(7), // TTL_D
+            henyey_tx::ChangeRef::Created(8), // CC_D
+            // Update flush
+            henyey_tx::ChangeRef::Updated(0),
+            // Group 4 (end-of-input flush): TTL_E, CD_E
+            henyey_tx::ChangeRef::Created(9),  // TTL_E
+            henyey_tx::ChangeRef::Created(10), // CD_E
+        ];
+
+        let state = LedgerStateManager::new(5_000_000, 100);
+        let restored = super::super::apply::RestoredEntries::default();
+
+        let changes = build_entry_changes_with_hot_archive(
+            &state,
+            &LedgerChanges {
+                created: &created,
+                updated: &[update_post.clone()],
+                update_states: &[update_pre.clone()],
+                deleted: &[delete_key.clone()],
+                delete_states: &[delete_pre.clone()],
+                change_order: &change_order,
+                state_overrides: &HashMap::new(),
+                restored: &restored,
+            },
+            true, // is_soroban
+            100,  // current_ledger_seq
+        );
+
+        let changes = changes.0.to_vec();
+        assert_eq!(changes.len(), 15, "Expected exactly 15 changes");
+
+        // Determine expected group 1 order by comparing key hashes.
+        let (first_ttl, first_cd, second_ttl, second_cd) = if hash_a < hash_b {
+            (&ttl_a, &cd_a, &ttl_b, &cd_b)
+        } else {
+            (&ttl_b, &cd_b, &ttl_a, &cd_a)
+        };
+
+        // Group 1: sorted by (key_hash, type_order)
+        assert!(
+            matches!(&changes[0], LedgerEntryChange::Created(e) if e == first_ttl),
+            "changes[0]: expected Created(TTL) for first hash group"
+        );
+        assert!(
+            matches!(&changes[1], LedgerEntryChange::Created(e) if e == first_cd),
+            "changes[1]: expected Created(ContractData) for first hash group"
+        );
+        assert!(
+            matches!(&changes[2], LedgerEntryChange::Created(e) if e == second_ttl),
+            "changes[2]: expected Created(TTL) for second hash group"
+        );
+        assert!(
+            matches!(&changes[3], LedgerEntryChange::Created(e) if e == second_cd),
+            "changes[3]: expected Created(ContractData) for second hash group"
+        );
+
+        // Classic create at flush boundary
+        assert!(
+            matches!(&changes[4], LedgerEntryChange::Created(e) if e == &account_create),
+            "changes[4]: expected Created(Account)"
+        );
+
+        // Group 2: TTL_C before CD_C (same hash group)
+        assert!(
+            matches!(&changes[5], LedgerEntryChange::Created(e) if e == &ttl_c),
+            "changes[5]: expected Created(TTL_C)"
+        );
+        assert!(
+            matches!(&changes[6], LedgerEntryChange::Created(e) if e == &cd_c),
+            "changes[6]: expected Created(CD_C)"
+        );
+
+        // Delete: State(pre_state) + Removed(key)
+        assert!(
+            matches!(&changes[7], LedgerEntryChange::State(e) if e == &delete_pre),
+            "changes[7]: expected State(delete pre-state)"
+        );
+        assert!(
+            matches!(&changes[8], LedgerEntryChange::Removed(k) if k == &delete_key),
+            "changes[8]: expected Removed(delete key)"
+        );
+
+        // Group 3: TTL_D before CC_D (same hash group)
+        assert!(
+            matches!(&changes[9], LedgerEntryChange::Created(e) if e == &ttl_d),
+            "changes[9]: expected Created(TTL_D)"
+        );
+        assert!(
+            matches!(&changes[10], LedgerEntryChange::Created(e) if e == &cc_d),
+            "changes[10]: expected Created(CC_D)"
+        );
+
+        // Update: State(pre_state) + Updated(post_state)
+        assert!(
+            matches!(&changes[11], LedgerEntryChange::State(e) if e == &update_pre),
+            "changes[11]: expected State(update pre-state)"
+        );
+        assert!(
+            matches!(&changes[12], LedgerEntryChange::Updated(e) if e == &update_post),
+            "changes[12]: expected Updated(update post-state)"
+        );
+
+        // Group 4 (end-of-input flush): TTL_E before CD_E
+        assert!(
+            matches!(&changes[13], LedgerEntryChange::Created(e) if e == &ttl_e),
+            "changes[13]: expected Created(TTL_E)"
+        );
+        assert!(
+            matches!(&changes[14], LedgerEntryChange::Created(e) if e == &cd_e),
+            "changes[14]: expected Created(CD_E)"
+        );
+    }
 }
