@@ -325,40 +325,34 @@
       "fieldConfig": {"defaults": {"thresholds": {"steps": [{"value": null, "color": "green"}, {"value": 1, "color": "red"}]}}}
     },
     {
-      "id": 27,
-      "type": "row",
-      "title": "Memory Queued / TX Error / Catchup",
-      "description": "Panels 30-33 of 10334.",
-      "gridPos": {"h": 6, "w": 6, "x": 18, "y": 25},
-      "panels": [
-        {
-          "id": 270,
-          "type": "stat",
-          "title": "Memory Queued Ledgers",
-          "gridPos": {"h": 3, "w": 2, "x": 0, "y": 0},
-          "datasource": {"type": "prometheus", "uid": "000000001"},
-          "targets": [{"expr": "stellar_ledger_memory_queued_ledgers{instance=~\"$instance\"}", "legendFormat": ""}],
-          "fieldConfig": {"defaults": {"unit": "short"}}
-        },
-        {
-          "id": 271,
-          "type": "stat",
-          "title": "TX Internal Error Rate",
-          "gridPos": {"h": 3, "w": 2, "x": 2, "y": 0},
-          "datasource": {"type": "prometheus", "uid": "000000001"},
-          "targets": [{"expr": "rate(stellar_ledger_transaction_internal_error_total{instance=~\"$instance\"}[5m])", "legendFormat": ""}],
-          "fieldConfig": {"defaults": {"unit": "ops", "thresholds": {"steps": [{"value": null, "color": "green"}, {"value": 0.01, "color": "red"}]}}}
-        },
-        {
-          "id": 272,
-          "type": "stat",
-          "title": "Catchup Duration (median)",
-          "gridPos": {"h": 3, "w": 2, "x": 4, "y": 0},
-          "datasource": {"type": "prometheus", "uid": "000000001"},
-          "targets": [{"expr": "histogram_quantile(0.5, rate(stellar_ledger_catchup_duration_seconds_bucket{instance=~\"$instance\"}[1h]))", "legendFormat": ""}],
-          "fieldConfig": {"defaults": {"unit": "s"}}
-        }
-      ]
+      "id": 270,
+      "type": "stat",
+      "title": "Memory Queued Ledgers",
+      "description": "Externalized ledger slots buffered and waiting to close.",
+      "gridPos": {"h": 6, "w": 2, "x": 18, "y": 25},
+      "datasource": {"type": "prometheus", "uid": "000000001"},
+      "targets": [{"expr": "stellar_ledger_memory_queued_ledgers{instance=~\"$instance\"}", "legendFormat": ""}],
+      "fieldConfig": {"defaults": {"unit": "short"}}
+    },
+    {
+      "id": 271,
+      "type": "stat",
+      "title": "TX Internal Error Rate",
+      "description": "Rate of transactions resulting in txINTERNAL_ERROR.",
+      "gridPos": {"h": 6, "w": 2, "x": 20, "y": 25},
+      "datasource": {"type": "prometheus", "uid": "000000001"},
+      "targets": [{"expr": "rate(stellar_ledger_transaction_internal_error_total{instance=~\"$instance\"}[5m])", "legendFormat": ""}],
+      "fieldConfig": {"defaults": {"unit": "ops", "thresholds": {"steps": [{"value": null, "color": "green"}, {"value": 0.01, "color": "red"}]}}}
+    },
+    {
+      "id": 272,
+      "type": "stat",
+      "title": "Catchup Duration (median)",
+      "description": "Median catchup wall-clock duration over the last hour.",
+      "gridPos": {"h": 6, "w": 2, "x": 22, "y": 25},
+      "datasource": {"type": "prometheus", "uid": "000000001"},
+      "targets": [{"expr": "histogram_quantile(0.5, rate(stellar_ledger_catchup_duration_seconds_bucket{instance=~\"$instance\"}[1h]))", "legendFormat": ""}],
+      "fieldConfig": {"defaults": {"unit": "s"}}
     },
     {
       "id": 28,

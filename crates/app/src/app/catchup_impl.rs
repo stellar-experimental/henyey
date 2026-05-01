@@ -231,9 +231,7 @@ impl App {
 
         // Stage B: Record catchup duration for successful catchups.
         let catchup_elapsed = catchup_timer.elapsed().as_secs_f64();
-        if catchup_elapsed > 0.1 {
-            metrics::histogram!("stellar_ledger_catchup_duration_seconds").record(catchup_elapsed);
-        }
+        metrics::histogram!("stellar_ledger_catchup_duration_seconds").record(catchup_elapsed);
 
         // Persist the HAS and LCL to DB after catchup.
         // The LedgerManager is already initialized inside the catchup pipeline,
