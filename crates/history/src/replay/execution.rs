@@ -1712,4 +1712,82 @@ mod tests {
         let delta = compute_soroban_state_size_delta(&changes, 25, None);
         assert_eq!(delta, 0);
     }
+
+    #[tokio::test]
+    async fn test_compute_soroban_state_size_window_entry_zero_sample_period_errors() {
+        use stellar_xdr::curr::StateArchivalSettings;
+
+        let archival = StateArchivalSettings {
+            live_soroban_state_size_window_sample_period: 0,
+            live_soroban_state_size_window_sample_size: 5,
+            ..StateArchivalSettings::default()
+        };
+
+        let bucket_list = BucketList::new();
+        let result =
+            compute_soroban_state_size_window_entry(100, &bucket_list, 5000, Some(&archival));
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("sample_period or sample_size is 0"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_compute_soroban_state_size_window_entry_missing_window_errors() {
+        use stellar_xdr::curr::StateArchivalSettings;
+
+        let archival = StateArchivalSettings {
+            live_soroban_state_size_window_sample_period: 100,
+            live_soroban_state_size_window_sample_size: 5,
+            ..StateArchivalSettings::default()
+        };
+
+        // Empty bucket list — no window entry exists
+        let bucket_list = BucketList::new();
+        let result =
+            compute_soroban_state_size_window_entry(100, &bucket_list, 5000, Some(&archival));
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("not found"), "unexpected error: {err}");
+    }
+
+    #[tokio::test]
+    async fn test_compute_soroban_state_size_window_entry_empty_window_errors() {
+        use stellar_xdr::curr::{BucketListType, ConfigSettingEntry, StateArchivalSettings};
+
+        let archival = StateArchivalSettings {
+            live_soroban_state_size_window_sample_period: 100,
+            live_soroban_state_size_window_sample_size: 5,
+            ..StateArchivalSettings::default()
+        };
+
+        // Add an empty window to the bucket list
+        let mut bucket_list = BucketList::new();
+        let empty_window: stellar_xdr::curr::VecM<u64> = vec![].try_into().unwrap();
+        let window_entry = LedgerEntry {
+            last_modified_ledger_seq: 1,
+            data: LedgerEntryData::ConfigSetting(ConfigSettingEntry::LiveSorobanStateSizeWindow(
+                empty_window,
+            )),
+            ext: LedgerEntryExt::V0,
+        };
+        bucket_list
+            .add_batch(
+                1,
+                25,
+                BucketListType::Live,
+                vec![],
+                vec![window_entry],
+                vec![],
+            )
+            .expect("add window");
+
+        let result =
+            compute_soroban_state_size_window_entry(100, &bucket_list, 5000, Some(&archival));
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("empty"), "unexpected error: {err}");
+    }
 }

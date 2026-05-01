@@ -1816,27 +1816,14 @@ mod tests {
 
         #[test]
         fn test_missing_window_entry_returns_error() {
-            // Empty bucket list — entry not found
+            // When protocol is active (>= MIN_SOROBAN) but the LiveSorobanStateSizeWindow
+            // config entry doesn't exist in the bucket list, the function should error
+            // rather than silently returning None.
             let bl = BucketList::new();
             let result = compute_state_size_window_entry(64, 25, &bl, 5000, 64, 30);
             assert!(result.is_err());
             let err = result.unwrap_err().to_string();
             assert!(err.contains("not found"), "unexpected error: {err}");
-        }
-
-        #[test]
-        fn test_wrong_variant_returns_error() {
-            // The "wrong variant" error path guards against data corruption where
-            // the entry stored under the LiveSorobanStateSizeWindow key doesn't
-            // contain the expected ConfigSettingEntry variant. This is hard to
-            // reproduce with a normal BucketList (which keys by entry data), so
-            // we test that the error message is correct by verifying the function
-            // errors on missing entry (the next best thing for a unit test).
-            // The wrong-variant path is tested implicitly via integration tests
-            // that verify error propagation.
-            let bl = BucketList::new();
-            let result = compute_state_size_window_entry(64, 25, &bl, 5000, 64, 30);
-            assert!(result.is_err());
         }
 
         #[test]

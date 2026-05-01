@@ -4926,7 +4926,12 @@ impl LedgerCloseContext<'_> {
                         .map(|s| s.live_soroban_state_size_window_sample_size)
                         .unwrap_or(0);
 
-                    // Only call compute if we have a valid sample_size (eviction_settings loaded)
+                    // Only call compute if we have a valid sample_size.
+                    // When eviction_settings is None (e.g. test fixtures or early init),
+                    // sample_size is 0 via unwrap_or(0) — this is "absent" not "invalid".
+                    // The function itself would error on 0, matching stellar-core's assertion
+                    // that sample_size >= 1. We skip here because we genuinely don't know
+                    // the sample_size, not because it's intentionally zero.
                     if sample_size > 0 {
                         if let Some(window_entry) =
                             crate::execution::compute_state_size_window_entry(
