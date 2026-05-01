@@ -818,7 +818,9 @@ fn decrement_pool_shares_trust_line_count(
         .get_liquidity_pool_mut(pool_id)
         .ok_or_else(|| crate::TxError::Internal("liquidity pool is missing".into()))?;
     let LiquidityPoolEntryBody::LiquidityPoolConstantProduct(cp) = &mut pool.body;
-    let new_count = cp.pool_shares_trust_line_count - 1;
+    let new_count = cp.pool_shares_trust_line_count.checked_sub(1).ok_or_else(|| {
+        crate::TxError::Internal("poolSharesTrustLineCount overflow".into())
+    })?;
     if new_count < 0 {
         return Err(crate::TxError::Internal(
             "poolSharesTrustLineCount is negative".into(),
