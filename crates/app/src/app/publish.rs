@@ -669,6 +669,27 @@ mod tests {
         );
     }
 
+    /// Build a `HistoryArchiveEntry` for local filesystem tests.
+    /// All commands use absolute paths derived from `archive_dir` to prevent
+    /// writing relative to CWD (which would pollute the source tree).
+    fn test_archive_entry(
+        name: &str,
+        archive_dir: &std::path::Path,
+    ) -> crate::config::HistoryArchiveEntry {
+        crate::config::HistoryArchiveEntry {
+            name: name.to_string(),
+            url: format!("file://{}", archive_dir.display()),
+            get_enabled: false,
+            put_enabled: true,
+            put: Some(format!(
+                "mkdir -p {}/$(dirname {{1}}) && cp {{0}} {}/{{1}}",
+                archive_dir.display(),
+                archive_dir.display()
+            )),
+            mkdir: Some(format!("mkdir -p {}/{{0}}", archive_dir.display())),
+        }
+    }
+
     #[tokio::test]
     async fn custom_bucket_directory_survives_genesis_publish_and_restore() {
         let dir = tempfile::tempdir().expect("temp dir");
@@ -687,18 +708,7 @@ mod tests {
             .validator(true)
             .node_seed("SAFTEV5U6QDFE2DRMSD7HBE76XG7SQZJD6VIUTHIXTJGO77RUQYVURLA")
             .build();
-        config.history.archives = vec![crate::config::HistoryArchiveEntry {
-            name: "local-test".to_string(),
-            url: format!("file://{}", archive_dir.display()),
-            get_enabled: false,
-            put_enabled: true,
-            put: Some(format!(
-                "mkdir -p {}/$(dirname {{1}}) && cp {{0}} {}/{{1}}",
-                archive_dir.display(),
-                archive_dir.display()
-            )),
-            mkdir: Some(format!("mkdir -p {}/{{0}}", archive_dir.display())),
-        }];
+        config.history.archives = vec![test_archive_entry("local-test", &archive_dir)];
 
         {
             let app = Arc::new(App::new(config.clone()).await.unwrap());
@@ -1194,23 +1204,13 @@ mod tests {
         std::fs::create_dir_all(&custom_bucket_dir).unwrap();
         std::fs::create_dir_all(&archive_dir).unwrap();
 
-        let put_cmd = format!("cp {{0}} {{1}}");
-        let mkdir_cmd = "mkdir -p {0}".to_string();
-
         let mut config = crate::config::ConfigBuilder::new()
             .database_path(&db_path)
             .bucket_directory(&custom_bucket_dir)
             .validator(true)
             .node_seed("SAFTEV5U6QDFE2DRMSD7HBE76XG7SQZJD6VIUTHIXTJGO77RUQYVURLA")
             .build();
-        config.history.archives = vec![crate::config::HistoryArchiveEntry {
-            name: "panic-test".to_string(),
-            url: format!("file://{}", archive_dir.display()),
-            get_enabled: false,
-            put_enabled: true,
-            put: Some(put_cmd),
-            mkdir: Some(mkdir_cmd),
-        }];
+        config.history.archives = vec![test_archive_entry("panic-test", &archive_dir)];
 
         let app = Arc::new(App::new(config.clone()).await.unwrap());
         app.set_self_arc().await;
@@ -1378,5 +1378,24 @@ mod tests {
             Vec::<u32>::new(),
             "queue should be empty after successful retry"
         );
+
+        // Regression: verify no archive artifacts were written in-tree (relative to CWD).
+        // The put/mkdir commands must use absolute paths so output lands in the tempdir.
+        let crate_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        for dir_name in &[
+            "bucket",
+            "history",
+            "ledger",
+            "results",
+            "scp",
+            "transactions",
+            ".well-known",
+        ] {
+            assert!(
+                !crate_dir.join(dir_name).exists(),
+                "archive artifact {dir_name}/ was written in-tree — \
+                 put/mkdir commands must use absolute paths"
+            );
+        }
     }
 }

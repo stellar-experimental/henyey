@@ -59,3 +59,31 @@ reports/
 .serena/
 local-data
 ai-summary/
+
+# Scratch files (repo root)
+/.scratch*.rs
+/scratch_*.rs
+
+# History-archive output artifacts (defense in depth).
+# These appear when a publish command writes archive output relative to CWD.
+# The archive format uses hex-sharded directories (e.g., bucket/93/6f/3d/,
+# history/00/00/00/). Patterns target the sharded structure to avoid
+# accidentally ignoring legitimate paths like crates/bucket/ (Rust crate).
+
+# Repo-root level (CWD = repo root)
+/.well-known/stellar-history.json
+/bucket/[0-9a-f][0-9a-f]/
+/history/[0-9a-f][0-9a-f]/
+/ledger/[0-9a-f][0-9a-f]/
+/results/[0-9a-f][0-9a-f]/
+/scp/[0-9a-f][0-9a-f]/
+/transactions/[0-9a-f][0-9a-f]/
+
+# Crate-level (CWD = crates/<name>/)
+crates/*/.well-known/stellar-history.json
+crates/*/bucket/[0-9a-f][0-9a-f]/
+crates/*/history/[0-9a-f][0-9a-f]/
+crates/*/ledger/[0-9a-f][0-9a-f]/
+crates/*/results/[0-9a-f][0-9a-f]/
+crates/*/scp/[0-9a-f][0-9a-f]/
+crates/*/transactions/[0-9a-f][0-9a-f]/
