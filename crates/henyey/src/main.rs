@@ -102,11 +102,10 @@ mod loadgen_runner {
     use henyey_simulation::{GeneratedLoadConfig, LoadGenMode, LoadGenerator};
     use tokio::sync::Mutex;
 
-    /// Shared inner state that can be referenced from spawned tasks.
-    struct Inner {
-        app: Arc<App>,
-        network_passphrase: String,
-        generator: Mutex<Option<LoadGenerator>>,
+    /// Atomic state governing load generation exclusivity and health.
+    /// Extracted from `Inner` so permit logic can be unit-tested without
+    /// constructing a full `App`.
+    struct LoadGenState {
         running: AtomicBool,
         /// Set when a load generation run exits abnormally (panic or
         /// cancellation), indicating the generator may be in an
@@ -120,23 +119,42 @@ mod loadgen_runner {
         panic_inject: AtomicBool,
     }
 
-    /// Exclusive permit for load generation. Clears `Inner::running` on drop,
+    impl LoadGenState {
+        fn new() -> Self {
+            Self {
+                running: AtomicBool::new(false),
+                generator_tainted: AtomicBool::new(false),
+                completed_cleanly: AtomicBool::new(false),
+                #[cfg(test)]
+                panic_inject: AtomicBool::new(false),
+            }
+        }
+    }
+
+    /// Shared inner state that can be referenced from spawned tasks.
+    struct Inner {
+        app: Arc<App>,
+        network_passphrase: String,
+        generator: Mutex<Option<LoadGenerator>>,
+    }
+
+    /// Exclusive permit for load generation. Clears `running` on drop,
     /// ensuring the flag is released on panic (unwind builds) or task
     /// cancellation. On abnormal exit (drop without [`Self::complete`]),
     /// also marks the generator as tainted so the next run recreates it.
     struct LoadGenPermit {
-        inner: Arc<Inner>,
+        state: Arc<LoadGenState>,
     }
 
     impl LoadGenPermit {
         /// Attempt to acquire the permit. Returns `None` if load generation
         /// is already running (atomic swap returns old=true).
-        fn try_acquire(inner: &Arc<Inner>) -> Option<Self> {
-            if inner.running.swap(true, Ordering::SeqCst) {
+        fn try_acquire(state: &Arc<LoadGenState>) -> Option<Self> {
+            if state.running.swap(true, Ordering::SeqCst) {
                 None
             } else {
                 Some(Self {
-                    inner: Arc::clone(inner),
+                    state: Arc::clone(state),
                 })
             }
         }
@@ -144,15 +162,15 @@ mod loadgen_runner {
         /// Mark this run as completed cleanly. Must be called before drop
         /// to prevent the generator from being tainted.
         fn complete(&self) {
-            self.inner.completed_cleanly.store(true, Ordering::SeqCst);
+            self.state.completed_cleanly.store(true, Ordering::SeqCst);
         }
     }
 
     impl Drop for LoadGenPermit {
         fn drop(&mut self) {
-            self.inner.running.store(false, Ordering::SeqCst);
-            if !self.inner.completed_cleanly.swap(false, Ordering::SeqCst) {
-                self.inner.generator_tainted.store(true, Ordering::SeqCst);
+            self.state.running.store(false, Ordering::SeqCst);
+            if !self.state.completed_cleanly.swap(false, Ordering::SeqCst) {
+                self.state.generator_tainted.store(true, Ordering::SeqCst);
             }
         }
     }
@@ -163,6 +181,7 @@ mod loadgen_runner {
     /// spawned by `start_load`.
     pub(crate) struct SimulationLoadGenRunner {
         inner: Arc<Inner>,
+        state: Arc<LoadGenState>,
     }
 
     impl SimulationLoadGenRunner {
@@ -173,12 +192,8 @@ mod loadgen_runner {
                     app,
                     network_passphrase,
                     generator: Mutex::new(None),
-                    running: AtomicBool::new(false),
-                    generator_tainted: AtomicBool::new(false),
-                    completed_cleanly: AtomicBool::new(false),
-                    #[cfg(test)]
-                    panic_inject: AtomicBool::new(false),
                 }),
+                state: Arc::new(LoadGenState::new()),
             }
         }
 
@@ -311,52 +326,27 @@ mod loadgen_runner {
             assert!(SimulationLoadGenRunner::deprecated_mode("pay").is_none());
         }
 
-        /// Minimal `Inner` for testing permit logic without requiring a
-        /// full `App` or `LoadGenerator`.
-        fn test_inner() -> Arc<Inner> {
-            // SAFETY: We never actually use `app` in permit tests — only
-            // the atomic flags. Use a dangling Arc<App> placeholder via
-            // raw allocation to avoid needing real App construction.
-            //
-            // This is acceptable because these tests exclusively exercise
-            // LoadGenPermit acquire/release/taint logic and never touch the
-            // app or generator fields.
-
-            // Create a fake Arc<App> — we need a valid Arc but the App
-            // inside will never be dereferenced in permit-only tests.
-            let fake_app: Arc<App> = unsafe {
-                let layout = std::alloc::Layout::new::<App>();
-                let ptr = std::alloc::alloc(layout) as *mut App;
-                Arc::from_raw(ptr)
-            };
-
-            Arc::new(Inner {
-                app: fake_app,
-                network_passphrase: String::new(),
-                generator: Mutex::new(None),
-                running: AtomicBool::new(false),
-                generator_tainted: AtomicBool::new(false),
-                completed_cleanly: AtomicBool::new(false),
-                panic_inject: AtomicBool::new(false),
-            })
+        /// Create a `LoadGenState` for testing permit logic — no `App` needed.
+        fn test_state() -> Arc<LoadGenState> {
+            Arc::new(LoadGenState::new())
         }
 
         #[tokio::test]
         async fn test_running_flag_cleared_on_panic() {
-            let inner = test_inner();
-            inner.panic_inject.store(true, Ordering::SeqCst);
+            let state = test_state();
+            state.panic_inject.store(true, Ordering::SeqCst);
 
             // Acquire permit and spawn a panicking task
-            let permit = LoadGenPermit::try_acquire(&inner).unwrap();
-            assert!(inner.running.load(Ordering::SeqCst));
+            let permit = LoadGenPermit::try_acquire(&state).unwrap();
+            assert!(state.running.load(Ordering::SeqCst));
 
             // A second acquire should fail while running
-            assert!(LoadGenPermit::try_acquire(&inner).is_none());
+            assert!(LoadGenPermit::try_acquire(&state).is_none());
 
-            let inner_clone = Arc::clone(&inner);
+            let state_clone = Arc::clone(&state);
             let handle = tokio::spawn(async move {
                 let _permit = permit;
-                if inner_clone.panic_inject.swap(false, Ordering::SeqCst) {
+                if state_clone.panic_inject.swap(false, Ordering::SeqCst) {
                     panic!("injected panic for testing");
                 }
             });
@@ -367,18 +357,18 @@ mod loadgen_runner {
 
             // After panic, running flag should be cleared
             assert!(
-                !inner.running.load(Ordering::SeqCst),
+                !state.running.load(Ordering::SeqCst),
                 "running flag should be cleared after panic"
             );
 
             // Generator should be tainted
             assert!(
-                inner.generator_tainted.load(Ordering::SeqCst),
+                state.generator_tainted.load(Ordering::SeqCst),
                 "generator should be tainted after panic"
             );
 
             // A new acquire should succeed
-            let permit2 = LoadGenPermit::try_acquire(&inner);
+            let permit2 = LoadGenPermit::try_acquire(&state);
             assert!(permit2.is_some(), "should be able to acquire after panic");
             // Clean up
             if let Some(p) = permit2 {
@@ -386,58 +376,51 @@ mod loadgen_runner {
             }
         }
 
-        #[tokio::test]
-        async fn test_tainted_generator_recreated() {
-            let inner = test_inner();
-            inner.generator_tainted.store(true, Ordering::SeqCst);
+        #[test]
+        fn test_tainted_flag_cleared_on_check() {
+            let state = test_state();
+            state.generator_tainted.store(true, Ordering::SeqCst);
 
-            // Generator is tainted — the spawned future should discard it
-            let mut guard = inner.generator.lock().await;
-            if inner.generator_tainted.swap(false, Ordering::SeqCst) {
-                *guard = None;
-            }
-            // Taint should be cleared
+            // Simulates what start_load's spawned future does: swap taint
+            let was_tainted = state.generator_tainted.swap(false, Ordering::SeqCst);
+            assert!(was_tainted, "should have been tainted");
             assert!(
-                !inner.generator_tainted.load(Ordering::SeqCst),
+                !state.generator_tainted.load(Ordering::SeqCst),
                 "taint flag should be cleared after swap"
-            );
-            assert!(
-                guard.is_none(),
-                "generator should be None after taint clear"
             );
         }
 
         #[test]
         fn test_permit_normal_completion_no_taint() {
-            let inner = test_inner();
+            let state = test_state();
 
-            let permit = LoadGenPermit::try_acquire(&inner).unwrap();
-            assert!(inner.running.load(Ordering::SeqCst));
+            let permit = LoadGenPermit::try_acquire(&state).unwrap();
+            assert!(state.running.load(Ordering::SeqCst));
 
             // Simulate normal completion
             permit.complete();
             drop(permit);
 
-            assert!(!inner.running.load(Ordering::SeqCst));
+            assert!(!state.running.load(Ordering::SeqCst));
             assert!(
-                !inner.generator_tainted.load(Ordering::SeqCst),
+                !state.generator_tainted.load(Ordering::SeqCst),
                 "generator should not be tainted on normal completion"
             );
         }
 
         #[test]
         fn test_permit_drop_without_complete_taints() {
-            let inner = test_inner();
+            let state = test_state();
 
-            let permit = LoadGenPermit::try_acquire(&inner).unwrap();
-            assert!(inner.running.load(Ordering::SeqCst));
+            let permit = LoadGenPermit::try_acquire(&state).unwrap();
+            assert!(state.running.load(Ordering::SeqCst));
 
             // Drop without calling complete() — simulates abnormal exit
             drop(permit);
 
-            assert!(!inner.running.load(Ordering::SeqCst));
+            assert!(!state.running.load(Ordering::SeqCst));
             assert!(
-                inner.generator_tainted.load(Ordering::SeqCst),
+                state.generator_tainted.load(Ordering::SeqCst),
                 "generator should be tainted when permit dropped without complete()"
             );
         }
@@ -461,7 +444,7 @@ mod loadgen_runner {
 
             // Atomic exclusivity gate — replaces the old TOCTOU
             // load-then-store pattern.
-            let permit = LoadGenPermit::try_acquire(&self.inner)
+            let permit = LoadGenPermit::try_acquire(&self.state)
                 .ok_or_else(|| "Load generation is already running.".to_string())?;
 
             let mut config = GeneratedLoadConfig {
@@ -485,6 +468,7 @@ mod loadgen_runner {
             };
 
             let inner = Arc::clone(&self.inner);
+            let state = Arc::clone(&self.state);
 
             henyey_common::spawn::spawn_observed("load_generation", async move {
                 // Permit is moved into this future — dropped at end, on
@@ -494,7 +478,7 @@ mod loadgen_runner {
                 // If a prior run exited abnormally, discard the generator
                 // so we start fresh.
                 let mut guard = inner.generator.lock().await;
-                if inner.generator_tainted.swap(false, Ordering::SeqCst) {
+                if state.generator_tainted.swap(false, Ordering::SeqCst) {
                     *guard = None;
                 }
 
@@ -509,7 +493,7 @@ mod loadgen_runner {
                 let generator = guard.as_mut().unwrap();
 
                 #[cfg(test)]
-                if inner.panic_inject.swap(false, Ordering::SeqCst) {
+                if state.panic_inject.swap(false, Ordering::SeqCst) {
                     panic!("injected load generation panic for testing");
                 }
 
@@ -548,7 +532,7 @@ mod loadgen_runner {
         }
 
         fn is_running(&self) -> bool {
-            self.inner.running.load(Ordering::SeqCst)
+            self.state.running.load(Ordering::SeqCst)
         }
     }
 }
