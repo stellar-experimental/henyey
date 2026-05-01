@@ -471,15 +471,10 @@ impl TransactionSet {
             return Err("Legacy transaction set transactions are not sorted correctly".to_string());
         }
 
-        let hash = Self::compute_non_generalized_hash(previous_ledger_hash, transactions);
-
-        Ok(Self {
-            hash,
-            body: TxSetBody::Legacy {
-                previous_ledger_hash,
-                transactions: transactions.to_vec(),
-            },
-        })
+        Ok(Self::from_legacy_parts(
+            previous_ledger_hash,
+            transactions.to_vec(),
+        ))
     }
 }
 
