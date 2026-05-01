@@ -898,6 +898,13 @@ mod tests {
     }
 
     fn make_account_entry(seq: u32) -> LedgerEntry {
+        make_account_entry_with_id(seq, 0)
+    }
+
+    /// Build an `Account` entry whose `AccountId` is uniquely determined by
+    /// `account_id_byte`. Used to construct multiple distinct `LedgerKey`s in
+    /// tests that need more than one Account in the bucket list.
+    fn make_account_entry_with_id(seq: u32, account_id_byte: u8) -> LedgerEntry {
         use stellar_xdr::curr::{
             AccountEntry, AccountEntryExt, AccountId, PublicKey, SequenceNumber, Thresholds,
             Uint256,
@@ -905,7 +912,9 @@ mod tests {
         LedgerEntry {
             last_modified_ledger_seq: seq,
             data: LedgerEntryData::Account(AccountEntry {
-                account_id: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([0u8; 32]))),
+                account_id: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(
+                    [account_id_byte; 32],
+                ))),
                 balance: 1000000,
                 seq_num: SequenceNumber(1),
                 num_sub_entries: 0,
@@ -918,6 +927,287 @@ mod tests {
             }),
             ext: LedgerEntryExt::V0,
         }
+    }
+
+    /// Build a `ContractCode` entry with a deterministic 32-byte hash derived
+    /// from `hash_byte` and a fixed 100-byte WASM payload. Mirrors the helper
+    /// in `crates/tx/src/operations/execute/restore_footprint.rs`.
+    fn make_contract_code_entry(seq: u32, hash_byte: u8) -> LedgerEntry {
+        use stellar_xdr::curr::{ContractCodeEntry, ContractCodeEntryExt};
+        LedgerEntry {
+            last_modified_ledger_seq: seq,
+            data: LedgerEntryData::ContractCode(ContractCodeEntry {
+                ext: ContractCodeEntryExt::V0,
+                hash: Hash([hash_byte; 32]),
+                code: vec![0u8; 100].try_into().unwrap(),
+            }),
+            ext: LedgerEntryExt::V0,
+        }
+    }
+
+    /// Protocol version used by all `classify_delta_entries` tests.
+    const CLASSIFY_TEST_PROTOCOL: u32 = 25;
+
+    /// Seed `bucket_list` with the given live entries at `ledger_seq` and
+    /// protocol [`CLASSIFY_TEST_PROTOCOL`]. Panics on failure (test-only).
+    fn seed_bucket_list_live(
+        bucket_list: &mut BucketList,
+        ledger_seq: u32,
+        live: Vec<LedgerEntry>,
+    ) {
+        use stellar_xdr::curr::BucketListType;
+        bucket_list
+            .add_batch(
+                ledger_seq,
+                CLASSIFY_TEST_PROTOCOL,
+                BucketListType::Live,
+                vec![],
+                live,
+                vec![],
+            )
+            .expect("seed bucket list");
+    }
+
+    // ---- classify_delta_entries unit tests (issue #2206) ---------------------
+    //
+    // These tests pin down the three behaviors named in #2206:
+    //   1. Soroban INIT entries already in the bucket list are reclassified
+    //      as LIVE.
+    //   2. Non-Soroban INIT entries skip the bucket-list check entirely.
+    //   3. Soroban INIT entries not in the bucket list remain as INIT.
+    //
+    // Plus parity-safe sanity coverage of the same function: mixed
+    // Soroban/non-Soroban batches, hot-archive restored-key reconciliation,
+    // and the empty-input case.
+
+    #[test]
+    fn test_classify_delta_entries_soroban_init_already_in_bucket_list_moved_to_live() {
+        // Bucket list has a ContractData entry at key K.
+        let existing = make_contract_data_entry(1, &[0xAA], &[0x01]);
+        let mut bucket_list = BucketList::new();
+        seed_bucket_list_live(&mut bucket_list, 1, vec![existing]);
+
+        // Delta INIT contains the same key K but with a *different* value.
+        // This proves the gate uses key equality, not entry equality.
+        let delta_init = make_contract_data_entry(2, &[0xAA], &[0x02]);
+        let header = make_test_header(100);
+
+        let (init, live, dead) = classify_delta_entries(
+            &header,
+            &bucket_list,
+            vec![delta_init.clone()],
+            vec![],
+            vec![],
+            &[],
+        );
+
+        assert!(init.is_empty(), "INIT entry should have been moved to LIVE");
+        assert_eq!(live.len(), 1, "exactly one entry should be in LIVE");
+        // The *delta* entry is moved (with its new value), not the
+        // bucket-list entry.
+        assert_eq!(live[0].data, delta_init.data);
+        assert!(dead.is_empty());
+    }
+
+    #[test]
+    fn test_classify_delta_entries_soroban_init_not_in_bucket_list_stays_init() {
+        let bucket_list = BucketList::new();
+        let delta_init = make_contract_data_entry(2, &[0xBB], &[0x10]);
+        let header = make_test_header(100);
+
+        let (init, live, dead) = classify_delta_entries(
+            &header,
+            &bucket_list,
+            vec![delta_init.clone()],
+            vec![],
+            vec![],
+            &[],
+        );
+
+        assert_eq!(init.len(), 1);
+        assert_eq!(init[0].data, delta_init.data);
+        assert!(live.is_empty());
+        assert!(dead.is_empty());
+    }
+
+    #[test]
+    fn test_classify_delta_entries_contract_code_init_already_in_bucket_list_moved_to_live() {
+        // Same as the ContractData case but with ContractCode — the second
+        // arm of the inline `matches!` gate. Catches a refactor that drops
+        // either arm independently.
+        let existing = make_contract_code_entry(1, 0xCC);
+        let mut bucket_list = BucketList::new();
+        seed_bucket_list_live(&mut bucket_list, 1, vec![existing]);
+
+        let delta_init = make_contract_code_entry(2, 0xCC);
+        let header = make_test_header(100);
+
+        let (init, live, dead) = classify_delta_entries(
+            &header,
+            &bucket_list,
+            vec![delta_init.clone()],
+            vec![],
+            vec![],
+            &[],
+        );
+
+        assert!(init.is_empty());
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0].data, delta_init.data);
+        assert!(dead.is_empty());
+    }
+
+    #[test]
+    fn test_classify_delta_entries_non_soroban_init_skips_bucket_list_check() {
+        // Direct regression test for the gap #2206 names: the `should_check`
+        // gate at execution.rs:237-241 must short-circuit non-Soroban entries
+        // before the bucket-list lookup. If a refactor drops the gate (e.g.
+        // replaces it with an unconditional `bucket_list.get(...).is_some()`),
+        // this test fails.
+        let existing_account = make_account_entry_with_id(1, 0x01);
+        let mut bucket_list = BucketList::new();
+        seed_bucket_list_live(&mut bucket_list, 1, vec![existing_account.clone()]);
+
+        let delta_init = make_account_entry_with_id(2, 0x01);
+        let header = make_test_header(100);
+
+        let (init, live, dead) = classify_delta_entries(
+            &header,
+            &bucket_list,
+            vec![delta_init.clone()],
+            vec![],
+            vec![],
+            &[],
+        );
+
+        assert_eq!(
+            init.len(),
+            1,
+            "non-Soroban INIT entry must NOT be moved to LIVE even when its \
+             key is already in the bucket list"
+        );
+        assert_eq!(init[0].data, delta_init.data);
+        assert!(live.is_empty());
+        assert!(dead.is_empty());
+    }
+
+    #[test]
+    fn test_classify_delta_entries_mixed_soroban_and_non_soroban_init() {
+        // Bucket list contains:
+        //   - K1 = ContractData (Soroban)
+        //   - K2 = Account (non-Soroban)
+        let existing_cd = make_contract_data_entry(1, &[0xD1], &[0x01]);
+        let existing_acct = make_account_entry_with_id(1, 0x02);
+        let mut bucket_list = BucketList::new();
+        seed_bucket_list_live(
+            &mut bucket_list,
+            1,
+            vec![existing_cd.clone(), existing_acct.clone()],
+        );
+
+        // Delta INIT contains:
+        //   - ContractData at K1 (Soroban + already in bucket list → LIVE)
+        //   - ContractCode at K3 (Soroban + new → INIT)
+        //   - Account at K2 (non-Soroban + already in bucket list → INIT,
+        //                     gate skipped)
+        let delta_cd = make_contract_data_entry(2, &[0xD1], &[0x02]);
+        let delta_cc = make_contract_code_entry(2, 0xD3);
+        let delta_acct = make_account_entry_with_id(2, 0x02);
+        let header = make_test_header(100);
+
+        let (init, live, dead) = classify_delta_entries(
+            &header,
+            &bucket_list,
+            vec![delta_cd.clone(), delta_cc.clone(), delta_acct.clone()],
+            vec![],
+            vec![],
+            &[],
+        );
+
+        // INIT: ContractCode (new) and Account (gate skipped) — order
+        // preserved from input minus the moved entries.
+        assert_eq!(init.len(), 2);
+        let init_data: Vec<_> = init.iter().map(|e| e.data.clone()).collect();
+        assert!(init_data.contains(&delta_cc.data));
+        assert!(init_data.contains(&delta_acct.data));
+
+        // LIVE: ContractData only.
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0].data, delta_cd.data);
+
+        assert!(dead.is_empty());
+    }
+
+    #[test]
+    fn test_classify_delta_entries_hot_archive_restored_adds_to_live_and_removes_from_dead() {
+        // Bucket list has a ContractData entry at K (last_modified_ledger_seq=1).
+        let existing = make_contract_data_entry(1, &[0xE1], &[0x01]);
+        let restored_key = henyey_common::entry_to_key(&existing);
+
+        // K_other is a different ContractData key that should be preserved
+        // in the returned dead_entries.
+        let other_entry = make_contract_data_entry(1, &[0xE2], &[0x02]);
+        let other_key = henyey_common::entry_to_key(&other_entry);
+
+        let mut bucket_list = BucketList::new();
+        seed_bucket_list_live(&mut bucket_list, 1, vec![existing.clone()]);
+
+        let header = make_test_header(100);
+
+        let (init, live, dead) = classify_delta_entries(
+            &header,
+            &bucket_list,
+            vec![],
+            vec![],
+            vec![restored_key.clone(), other_key.clone()],
+            std::slice::from_ref(&restored_key),
+        );
+
+        assert!(init.is_empty());
+
+        // LIVE contains the bucket-list entry with last_modified_ledger_seq
+        // rewritten to header.ledger_seq.
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0].data, existing.data);
+        assert_eq!(live[0].last_modified_ledger_seq, header.ledger_seq);
+
+        // DEAD: K removed; K_other preserved.
+        assert_eq!(dead.len(), 1);
+        assert_eq!(dead[0], other_key);
+    }
+
+    #[test]
+    fn test_classify_delta_entries_hot_archive_restored_missing_from_bucket_list_is_noop() {
+        // Empty bucket list — bucket_list.get(key) returns Ok(None), and the
+        // restored-key loop silently skips. Pins down the no-op behavior so
+        // a future refactor doesn't accidentally turn it into an error or a
+        // panic.
+        let bucket_list = BucketList::new();
+        let header = make_test_header(100);
+
+        // Construct a key that is not in the bucket list.
+        let absent_entry = make_contract_data_entry(1, &[0xF1], &[0x01]);
+        let absent_key = henyey_common::entry_to_key(&absent_entry);
+
+        let (init, live, dead) =
+            classify_delta_entries(&header, &bucket_list, vec![], vec![], vec![], &[absent_key]);
+
+        assert!(init.is_empty());
+        assert!(live.is_empty());
+        assert!(dead.is_empty());
+    }
+
+    #[test]
+    fn test_classify_delta_entries_empty_inputs() {
+        let bucket_list = BucketList::new();
+        let header = make_test_header(100);
+
+        let (init, live, dead) =
+            classify_delta_entries(&header, &bucket_list, vec![], vec![], vec![], &[]);
+
+        assert!(init.is_empty());
+        assert!(live.is_empty());
+        assert!(dead.is_empty());
     }
 
     #[test]
