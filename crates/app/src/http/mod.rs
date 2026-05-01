@@ -186,6 +186,8 @@ pub struct StatusServer {
     address: String,
     app: Arc<App>,
     start_time: Instant,
+    /// Unix epoch seconds captured at construction (≈ application start).
+    started_on_epoch: f64,
     log_handle: Option<crate::logging::LogLevelHandle>,
     prometheus_handle: Option<metrics_exporter_prometheus::PrometheusHandle>,
     #[cfg(feature = "loadgen")]
@@ -195,11 +197,16 @@ pub struct StatusServer {
 impl StatusServer {
     /// Create a new status server.
     pub fn new(port: u16, address: String, app: Arc<App>) -> Self {
+        let started_on_epoch = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs_f64();
         Self {
             port,
             address,
             app,
             start_time: Instant::now(),
+            started_on_epoch,
             log_handle: None,
             prometheus_handle: None,
             #[cfg(feature = "loadgen")]
@@ -214,11 +221,16 @@ impl StatusServer {
         app: Arc<App>,
         log_handle: crate::logging::LogLevelHandle,
     ) -> Self {
+        let started_on_epoch = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs_f64();
         Self {
             port,
             address,
             app,
             start_time: Instant::now(),
+            started_on_epoch,
             log_handle: Some(log_handle),
             prometheus_handle: None,
             #[cfg(feature = "loadgen")]
@@ -242,15 +254,11 @@ impl StatusServer {
     /// Start the server.
     pub async fn start(self) -> anyhow::Result<()> {
         let started_on = format_utc_now();
-        let started_on_epoch = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs_f64();
         let state = Arc::new(ServerState {
             app: self.app,
             start_time: self.start_time,
             started_on,
-            started_on_epoch,
+            started_on_epoch: self.started_on_epoch,
             log_handle: self.log_handle,
             prometheus_handle: self.prometheus_handle,
             #[cfg(feature = "loadgen")]
