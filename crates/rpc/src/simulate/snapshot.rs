@@ -83,10 +83,7 @@ impl SnapshotSource for BucketListSnapshotSource {
         let live_until = get_entry_ttl(&self.snapshot, &ws_key).map_err(|_| make_err())?;
 
         // Check TTL expiration for contract entries
-        if matches!(
-            ws_key,
-            LedgerKey::ContractData(_) | LedgerKey::ContractCode(_)
-        ) {
+        if henyey_common::is_soroban_key(&ws_key) {
             match live_until {
                 Some(ttl) if ttl >= self.current_ledger => {} // live, proceed
                 _ => return Ok(None),                         // expired or no TTL

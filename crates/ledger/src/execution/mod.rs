@@ -1453,7 +1453,7 @@ impl TransactionExecutor {
             // prior stage TX via prior_stage.entries) but its TTL might be absent if the
             // prior stage TX only modified the entry data (not the TTL). We always check
             // whether the TTL needs loading, even when the entry is already in state.
-            if matches!(key, LedgerKey::ContractData(_) | LedgerKey::ContractCode(_)) {
+            if henyey_common::is_soroban_key(key) {
                 // Compute TTL key hash (O3: reused for both IMS and bucket-list paths).
                 // The cache is shared across TXs in this cluster for entries that recur.
                 let key_bytes = key

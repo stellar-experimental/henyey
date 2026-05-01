@@ -999,7 +999,7 @@ pub fn extract_evicted_keys(meta: &LedgerCloseMeta) -> Vec<stellar_xdr::curr::Le
 pub fn extract_restored_keys(
     tx_metas: &[stellar_xdr::curr::TransactionMeta],
 ) -> Vec<stellar_xdr::curr::LedgerKey> {
-    use stellar_xdr::curr::{LedgerEntryChange, LedgerKey, TransactionMeta};
+    use stellar_xdr::curr::{LedgerEntryChange, TransactionMeta};
 
     let mut restored_keys = Vec::new();
 
@@ -1012,13 +1012,8 @@ pub fn extract_restored_keys(
             // Only CONTRACT_DATA and CONTRACT_CODE keys go to hot archive.
             // TTL keys are NOT recorded in the hot archive bucket list,
             // matching stellar-core behavior in LedgerManagerImpl.cpp.
-            match &key {
-                LedgerKey::ContractData(_) | LedgerKey::ContractCode(_) => {
-                    restored_keys.push(key);
-                }
-                _ => {
-                    // Skip TTL keys and any other key types
-                }
+            if henyey_common::is_soroban_key(&key) {
+                restored_keys.push(key);
             }
         }
     }

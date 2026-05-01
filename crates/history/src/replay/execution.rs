@@ -234,11 +234,7 @@ fn classify_delta_entries(
     for entry in delta_init_entries {
         let key = henyey_common::entry_to_key(&entry);
 
-        let should_check = matches!(
-            &entry.data,
-            stellar_xdr::curr::LedgerEntryData::ContractCode(_)
-                | stellar_xdr::curr::LedgerEntryData::ContractData(_)
-        );
+        let should_check = henyey_common::is_soroban_entry(&entry);
 
         let already_in_bucket_list = should_check && bucket_list.get(&key).ok().flatten().is_some();
 

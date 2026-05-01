@@ -15,15 +15,14 @@ pub(super) use henyey_common::asset::non_native_asset_to_trustline_asset as asse
 /// Sorting by (key_hash, type_order) places each TTL immediately before its
 /// associated contract entry.
 fn soroban_create_sort_key(entry: &LedgerEntry) -> Option<(Vec<u8>, u8)> {
-    match &entry.data {
-        stellar_xdr::curr::LedgerEntryData::Ttl(ttl) => Some((ttl.key_hash.0.to_vec(), 0)),
-        stellar_xdr::curr::LedgerEntryData::ContractData(_)
-        | stellar_xdr::curr::LedgerEntryData::ContractCode(_) => {
-            let key = henyey_common::entry_to_key(entry);
-            let key_hash = Hash256::hash_xdr(&key);
-            Some((key_hash.as_bytes().to_vec(), 1))
-        }
-        _ => None,
+    if let stellar_xdr::curr::LedgerEntryData::Ttl(ttl) = &entry.data {
+        Some((ttl.key_hash.0.to_vec(), 0))
+    } else if henyey_common::is_soroban_entry(entry) {
+        let key = henyey_common::entry_to_key(entry);
+        let key_hash = Hash256::hash_xdr(&key);
+        Some((key_hash.as_bytes().to_vec(), 1))
+    } else {
+        None
     }
 }
 

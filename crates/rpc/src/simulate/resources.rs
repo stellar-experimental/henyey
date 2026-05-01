@@ -2,7 +2,7 @@
 //! computation, fee estimation, resource bumping.
 
 use soroban_env_host_p25 as soroban_host;
-use stellar_xdr::curr::{LedgerKey, OperationBody, SorobanResources};
+use stellar_xdr::curr::{OperationBody, SorobanResources};
 
 /// Multiplicative adjustment factor for refundable fees (soroban-simulation default).
 const REFUNDABLE_FEE_ADJUSTMENT_FACTOR: f64 = 1.15;
@@ -205,15 +205,13 @@ pub(super) fn compute_invoke_resource_fee(
     // disk reads. Auto-restored entries also count.
     let mut disk_read_entries = 0u32;
     for k in resources.footprint.read_only.iter() {
-        match k {
-            LedgerKey::ContractData(_) | LedgerKey::ContractCode(_) => (),
-            _ => disk_read_entries += 1,
+        if !henyey_common::is_soroban_key(k) {
+            disk_read_entries += 1;
         }
     }
     for k in resources.footprint.read_write.iter() {
-        match k {
-            LedgerKey::ContractData(_) | LedgerKey::ContractCode(_) => (),
-            _ => disk_read_entries += 1,
+        if !henyey_common::is_soroban_key(k) {
+            disk_read_entries += 1;
         }
     }
     disk_read_entries += restored_entry_count;

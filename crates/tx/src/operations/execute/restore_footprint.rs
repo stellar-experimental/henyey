@@ -239,9 +239,8 @@ fn restore_entry(
     accumulator: &mut ResourceAccumulator,
 ) -> std::result::Result<(), ()> {
     // Only contract data and contract code can be restored
-    match key {
-        LedgerKey::ContractData(_) | LedgerKey::ContractCode(_) => {}
-        _ => return Ok(()),
+    if !henyey_common::is_soroban_key(key) {
+        return Ok(());
     }
 
     // Compute the key hash for TTL lookup

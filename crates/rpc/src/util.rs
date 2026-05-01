@@ -776,13 +776,12 @@ pub(crate) fn insert_diagnostic_events(
 ///
 /// Returns `None` if the key is not a TTL-bearing type.
 pub(crate) fn ttl_key_for_ledger_key(key: &LedgerKey) -> Option<LedgerKey> {
-    match key {
-        LedgerKey::ContractData(_) | LedgerKey::ContractCode(_) => {
-            Some(LedgerKey::Ttl(stellar_xdr::curr::LedgerKeyTtl {
-                key_hash: hash_ledger_key(key),
-            }))
-        }
-        _ => None,
+    if henyey_common::is_soroban_key(key) {
+        Some(LedgerKey::Ttl(stellar_xdr::curr::LedgerKeyTtl {
+            key_hash: hash_ledger_key(key),
+        }))
+    } else {
+        None
     }
 }
 

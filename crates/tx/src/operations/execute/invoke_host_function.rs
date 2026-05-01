@@ -130,7 +130,7 @@ fn validate_footprint_entry(
     ttl_key_cache: Option<&crate::soroban::TtlKeyCache>,
 ) -> bool {
     // Only CONTRACT_CODE and CONTRACT_DATA can fail validation
-    if !matches!(key, LedgerKey::ContractCode(_) | LedgerKey::ContractData(_)) {
+    if !henyey_common::is_soroban_key(key) {
         return true;
     }
 
@@ -269,7 +269,7 @@ fn validate_archived_entry_sizes(
             continue;
         }
         // Only CONTRACT_CODE and CONTRACT_DATA can fail size validation
-        if !matches!(key, LedgerKey::ContractCode(_) | LedgerKey::ContractData(_)) {
+        if !henyey_common::is_soroban_key(key) {
             continue;
         }
 

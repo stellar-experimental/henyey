@@ -327,7 +327,7 @@ impl LedgerStateManager {
     pub fn flush_ro_ttl_bumps_for_write_footprint(&mut self, write_keys: &[LedgerKey]) {
         for key in write_keys {
             // Only flush for Soroban entry keys (ContractData, ContractCode)
-            if !matches!(key, LedgerKey::ContractData(_) | LedgerKey::ContractCode(_)) {
+            if !henyey_common::is_soroban_key(key) {
                 continue;
             }
 

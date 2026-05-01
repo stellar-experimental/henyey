@@ -21,8 +21,8 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use stellar_xdr::curr::{
-    Asset, ContractDataDurability, LedgerEntry, LedgerEntryData, LedgerEntryType, LedgerKey,
-    Limits, PoolId, TrustLineAsset, WriteXdr,
+    Asset, LedgerEntry, LedgerEntryData, LedgerEntryType, LedgerKey, Limits, PoolId,
+    TrustLineAsset, WriteXdr,
 };
 
 use crate::entry::{ledger_entry_data_type, ledger_key_type};
@@ -133,14 +133,10 @@ impl BucketEntryCounters {
 
     /// Records Soroban durability for an entry.
     fn record_soroban_durability(&mut self, entry: &LedgerEntry) {
-        if let LedgerEntryData::ContractData(data) = &entry.data {
-            match data.durability {
-                ContractDataDurability::Persistent => self.persistent_soroban_entries += 1,
-                ContractDataDurability::Temporary => self.temporary_soroban_entries += 1,
-            }
-        } else if matches!(entry.data, LedgerEntryData::ContractCode(_)) {
-            // ContractCode is always persistent
+        if henyey_common::is_persistent_entry(entry) {
             self.persistent_soroban_entries += 1;
+        } else if henyey_common::is_temporary_entry(entry) {
+            self.temporary_soroban_entries += 1;
         }
     }
 

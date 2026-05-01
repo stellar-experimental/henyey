@@ -220,52 +220,51 @@ mod tests {
         key: &LedgerKey,
         current_ledger: u32,
     ) -> Option<u32> {
-        match key {
-            LedgerKey::ContractData(_) | LedgerKey::ContractCode(_) => {
-                let key_hash = crate::soroban::compute_key_hash(key);
-                // Use get_ttl_at_ledger_start() to match stellar-core behavior for parallel Soroban.
-                // This returns the TTL from the bucket list snapshot at ledger start,
-                // NOT the current TTL (which might include entries created by earlier TXs).
-                let ttl = state.get_ttl_at_ledger_start(&key_hash);
-                if let Some(live_until) = ttl {
-                    if live_until < current_ledger {
-                        tracing::debug!(
-                            current_ledger,
-                            live_until,
-                            key_type = if matches!(key, LedgerKey::ContractCode(_)) {
-                                "ContractCode"
-                            } else {
-                                "ContractData"
-                            },
-                            "Soroban entry TTL is EXPIRED (from bucket list snapshot)"
-                        );
-                    }
-                } else {
-                    // Check if the entry has a current TTL (created within this ledger)
-                    let has_current_ttl = state.get_ttl(&key_hash).is_some();
-                    if has_current_ttl {
-                        tracing::debug!(
-                            key_type = if matches!(key, LedgerKey::ContractCode(_)) {
-                                "ContractCode"
-                            } else {
-                                "ContractData"
-                            },
-                            "Soroban entry has TTL but not in bucket list snapshot (created within ledger)"
-                        );
-                    } else {
-                        tracing::debug!(
-                            key_type = if matches!(key, LedgerKey::ContractCode(_)) {
-                                "ContractCode"
-                            } else {
-                                "ContractData"
-                            },
-                            "Soroban entry has NO TTL record"
-                        );
-                    }
+        if henyey_common::is_soroban_key(key) {
+            let key_hash = crate::soroban::compute_key_hash(key);
+            // Use get_ttl_at_ledger_start() to match stellar-core behavior for parallel Soroban.
+            // This returns the TTL from the bucket list snapshot at ledger start,
+            // NOT the current TTL (which might include entries created by earlier TXs).
+            let ttl = state.get_ttl_at_ledger_start(&key_hash);
+            if let Some(live_until) = ttl {
+                if live_until < current_ledger {
+                    tracing::debug!(
+                        current_ledger,
+                        live_until,
+                        key_type = if matches!(key, LedgerKey::ContractCode(_)) {
+                            "ContractCode"
+                        } else {
+                            "ContractData"
+                        },
+                        "Soroban entry TTL is EXPIRED (from bucket list snapshot)"
+                    );
                 }
-                ttl
+            } else {
+                // Check if the entry has a current TTL (created within this ledger)
+                let has_current_ttl = state.get_ttl(&key_hash).is_some();
+                if has_current_ttl {
+                    tracing::debug!(
+                        key_type = if matches!(key, LedgerKey::ContractCode(_)) {
+                            "ContractCode"
+                        } else {
+                            "ContractData"
+                        },
+                        "Soroban entry has TTL but not in bucket list snapshot (created within ledger)"
+                    );
+                } else {
+                    tracing::debug!(
+                        key_type = if matches!(key, LedgerKey::ContractCode(_)) {
+                            "ContractCode"
+                        } else {
+                            "ContractData"
+                        },
+                        "Soroban entry has NO TTL record"
+                    );
+                }
             }
-            _ => None,
+            ttl
+        } else {
+            None
         }
     }
 

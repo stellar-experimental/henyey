@@ -356,7 +356,7 @@ impl<'a> LedgerSnapshotAdapterP25<'a> {
             get_entry_ttl_with_cache(self.state, key, self.current_ledger, self.ttl_key_cache);
 
         // Check TTL expiration for contract entries before looking up the entry.
-        if matches!(key, LedgerKey::ContractData(_) | LedgerKey::ContractCode(_)) {
+        if henyey_common::is_soroban_key(key) {
             match live_until {
                 Some(ttl) if ttl >= self.current_ledger => {} // live, proceed
                 _ => return Ok(None),                         // expired or no TTL
@@ -495,10 +495,7 @@ impl soroban_env_host25::storage::SnapshotSource for LedgerSnapshotAdapterP25<'_
             get_entry_ttl_with_cache(self.state, &ws_key, self.current_ledger, self.ttl_key_cache);
 
         // Check TTL expiration for contract entries before looking up the entry.
-        if matches!(
-            ws_key,
-            LedgerKey::ContractData(_) | LedgerKey::ContractCode(_)
-        ) {
+        if henyey_common::is_soroban_key(&ws_key) {
             match live_until {
                 Some(ttl) if ttl >= self.current_ledger => {} // live, proceed
                 _ => return Ok(None),                         // expired or no TTL
@@ -557,32 +554,31 @@ fn get_entry_ttl_with_cache(
     current_ledger: u32,
     ttl_key_cache: Option<&super::TtlKeyCache>,
 ) -> Option<u32> {
-    match key {
-        LedgerKey::ContractData(_) | LedgerKey::ContractCode(_) => {
-            let key_hash = super::get_or_compute_key_hash(ttl_key_cache, key);
-            // Use current state TTL which includes updates from earlier TXs in this ledger.
-            // This matches stellar-core sequential execution where LedgerTxn reflects all prior
-            // changes, including TTL bumps from earlier transactions.
-            let ttl = state
-                .get_ttl(&key_hash)
-                .map(|ttl| ttl.live_until_ledger_seq);
-            if let Some(live_until) = ttl {
-                if live_until < current_ledger {
-                    tracing::debug!(
-                        current_ledger,
-                        live_until,
-                        key_type = if matches!(key, LedgerKey::ContractCode(_)) {
-                            "ContractCode"
-                        } else {
-                            "ContractData"
-                        },
-                        "Soroban entry TTL is EXPIRED"
-                    );
-                }
+    if henyey_common::is_soroban_key(key) {
+        let key_hash = super::get_or_compute_key_hash(ttl_key_cache, key);
+        // Use current state TTL which includes updates from earlier TXs in this ledger.
+        // This matches stellar-core sequential execution where LedgerTxn reflects all prior
+        // changes, including TTL bumps from earlier transactions.
+        let ttl = state
+            .get_ttl(&key_hash)
+            .map(|ttl| ttl.live_until_ledger_seq);
+        if let Some(live_until) = ttl {
+            if live_until < current_ledger {
+                tracing::debug!(
+                    current_ledger,
+                    live_until,
+                    key_type = if matches!(key, LedgerKey::ContractCode(_)) {
+                        "ContractCode"
+                    } else {
+                        "ContractData"
+                    },
+                    "Soroban entry TTL is EXPIRED"
+                );
             }
-            ttl
         }
-        _ => None,
+        ttl
+    } else {
+        None
     }
 }
 
@@ -794,7 +790,7 @@ fn prepare_footprint_entries(
     let mut actual_restored_indices: Vec<u32> = Vec::new();
 
     let encode_ttl = |key: &LedgerKey, live_until: Option<u32>| -> Vec<u8> {
-        let needs_ttl = matches!(key, LedgerKey::ContractData(_) | LedgerKey::ContractCode(_));
+        let needs_ttl = henyey_common::is_soroban_key(key);
         if let Some(lu) = live_until {
             let key_hash = super::get_or_compute_key_hash(ttl_key_cache, key);
             henyey_common::xdr_to_bytes(&stellar_xdr::curr::TtlEntry {
