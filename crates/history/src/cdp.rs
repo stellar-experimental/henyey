@@ -1076,6 +1076,351 @@ pub fn extract_upgrade_metas(meta: &LedgerCloseMeta) -> Vec<stellar_xdr::curr::U
 #[cfg(test)]
 mod tests {
     use super::*;
+    use stellar_xdr::curr::{
+        AccountEntry, AccountEntryExt, AccountId, ContractCodeEntry, ContractCodeEntryExt,
+        ContractDataDurability, ContractDataEntry, ContractId, ExtensionPoint, Hash, LedgerEntry,
+        LedgerEntryChange, LedgerEntryChanges, LedgerEntryData, LedgerEntryExt, LedgerKey,
+        OperationMeta, OperationMetaV2, PublicKey, ScAddress, ScVal, SequenceNumber, String32,
+        Thresholds, TransactionMeta, TransactionMetaV1, TransactionMetaV2, TransactionMetaV3,
+        TransactionMetaV4, TtlEntry, Uint256,
+    };
+
+    // --- Helper constructors ---
+
+    fn make_contract_data_entry(id_byte: u8) -> LedgerEntry {
+        let mut contract_id = [0u8; 32];
+        contract_id[0] = id_byte;
+        LedgerEntry {
+            last_modified_ledger_seq: 0,
+            data: LedgerEntryData::ContractData(ContractDataEntry {
+                ext: ExtensionPoint::V0,
+                contract: ScAddress::Contract(ContractId(Hash(contract_id))),
+                key: ScVal::Void,
+                durability: ContractDataDurability::Persistent,
+                val: ScVal::Void,
+            }),
+            ext: LedgerEntryExt::V0,
+        }
+    }
+
+    fn make_temporary_contract_data_entry(id_byte: u8) -> LedgerEntry {
+        let mut contract_id = [0u8; 32];
+        contract_id[0] = id_byte;
+        LedgerEntry {
+            last_modified_ledger_seq: 0,
+            data: LedgerEntryData::ContractData(ContractDataEntry {
+                ext: ExtensionPoint::V0,
+                contract: ScAddress::Contract(ContractId(Hash(contract_id))),
+                key: ScVal::Void,
+                durability: ContractDataDurability::Temporary,
+                val: ScVal::Void,
+            }),
+            ext: LedgerEntryExt::V0,
+        }
+    }
+
+    fn make_contract_code_entry(hash_byte: u8) -> LedgerEntry {
+        let mut code_hash = [0u8; 32];
+        code_hash[0] = hash_byte;
+        LedgerEntry {
+            last_modified_ledger_seq: 0,
+            data: LedgerEntryData::ContractCode(ContractCodeEntry {
+                ext: ContractCodeEntryExt::V0,
+                hash: Hash(code_hash),
+                code: vec![].try_into().unwrap(),
+            }),
+            ext: LedgerEntryExt::V0,
+        }
+    }
+
+    fn make_ttl_entry(hash_byte: u8) -> LedgerEntry {
+        let mut key_hash = [0u8; 32];
+        key_hash[0] = hash_byte;
+        LedgerEntry {
+            last_modified_ledger_seq: 0,
+            data: LedgerEntryData::Ttl(TtlEntry {
+                key_hash: Hash(key_hash),
+                live_until_ledger_seq: 1000,
+            }),
+            ext: LedgerEntryExt::V0,
+        }
+    }
+
+    fn make_account_entry() -> LedgerEntry {
+        LedgerEntry {
+            last_modified_ledger_seq: 0,
+            data: LedgerEntryData::Account(AccountEntry {
+                account_id: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([0u8; 32]))),
+                balance: 0,
+                seq_num: SequenceNumber(0),
+                num_sub_entries: 0,
+                inflation_dest: None,
+                flags: 0,
+                home_domain: String32::default(),
+                thresholds: Thresholds([0; 4]),
+                signers: vec![].try_into().unwrap(),
+                ext: AccountEntryExt::V0,
+            }),
+            ext: LedgerEntryExt::V0,
+        }
+    }
+
+    fn changes(entries: Vec<LedgerEntryChange>) -> LedgerEntryChanges {
+        entries.try_into().unwrap()
+    }
+
+    fn make_v4_meta(
+        before: Vec<LedgerEntryChange>,
+        ops: Vec<Vec<LedgerEntryChange>>,
+        after: Vec<LedgerEntryChange>,
+    ) -> TransactionMeta {
+        let op_metas: Vec<OperationMetaV2> = ops
+            .into_iter()
+            .map(|op_changes| OperationMetaV2 {
+                ext: ExtensionPoint::V0,
+                changes: changes(op_changes),
+                events: vec![].try_into().unwrap(),
+            })
+            .collect();
+        TransactionMeta::V4(TransactionMetaV4 {
+            ext: ExtensionPoint::V0,
+            tx_changes_before: changes(before),
+            operations: op_metas.try_into().unwrap(),
+            tx_changes_after: changes(after),
+            soroban_meta: None,
+            events: vec![].try_into().unwrap(),
+            diagnostic_events: vec![].try_into().unwrap(),
+        })
+    }
+
+    fn make_v3_meta(
+        before: Vec<LedgerEntryChange>,
+        ops: Vec<Vec<LedgerEntryChange>>,
+        after: Vec<LedgerEntryChange>,
+    ) -> TransactionMeta {
+        let op_metas: Vec<OperationMeta> = ops
+            .into_iter()
+            .map(|op_changes| OperationMeta {
+                changes: changes(op_changes),
+            })
+            .collect();
+        TransactionMeta::V3(TransactionMetaV3 {
+            ext: ExtensionPoint::V0,
+            tx_changes_before: changes(before),
+            operations: op_metas.try_into().unwrap(),
+            tx_changes_after: changes(after),
+            soroban_meta: None,
+        })
+    }
+
+    fn make_v2_meta(
+        before: Vec<LedgerEntryChange>,
+        ops: Vec<Vec<LedgerEntryChange>>,
+        after: Vec<LedgerEntryChange>,
+    ) -> TransactionMeta {
+        let op_metas: Vec<OperationMeta> = ops
+            .into_iter()
+            .map(|op_changes| OperationMeta {
+                changes: changes(op_changes),
+            })
+            .collect();
+        TransactionMeta::V2(TransactionMetaV2 {
+            tx_changes_before: changes(before),
+            operations: op_metas.try_into().unwrap(),
+            tx_changes_after: changes(after),
+        })
+    }
+
+    fn make_v1_meta(
+        tx_changes: Vec<LedgerEntryChange>,
+        ops: Vec<Vec<LedgerEntryChange>>,
+    ) -> TransactionMeta {
+        let op_metas: Vec<OperationMeta> = ops
+            .into_iter()
+            .map(|op_changes| OperationMeta {
+                changes: changes(op_changes),
+            })
+            .collect();
+        TransactionMeta::V1(TransactionMetaV1 {
+            tx_changes: changes(tx_changes),
+            operations: op_metas.try_into().unwrap(),
+        })
+    }
+
+    fn make_v0_meta(ops: Vec<Vec<LedgerEntryChange>>) -> TransactionMeta {
+        let op_metas: Vec<OperationMeta> = ops
+            .into_iter()
+            .map(|op_changes| OperationMeta {
+                changes: changes(op_changes),
+            })
+            .collect();
+        TransactionMeta::V0(op_metas.try_into().unwrap())
+    }
+
+    fn restored(entry: LedgerEntry) -> LedgerEntryChange {
+        LedgerEntryChange::Restored(entry)
+    }
+
+    // --- Tests for extract_restored_keys ---
+
+    #[test]
+    fn test_extract_restored_keys_includes_contract_data() {
+        let entry = make_contract_data_entry(1);
+        let expected_key = henyey_common::entry_to_key(&entry);
+        let meta = make_v4_meta(vec![restored(entry)], vec![], vec![]);
+        assert_eq!(extract_restored_keys(&[meta]), vec![expected_key]);
+    }
+
+    #[test]
+    fn test_extract_restored_keys_includes_contract_code() {
+        let entry = make_contract_code_entry(1);
+        let expected_key = henyey_common::entry_to_key(&entry);
+        let meta = make_v4_meta(vec![], vec![vec![restored(entry)]], vec![]);
+        assert_eq!(extract_restored_keys(&[meta]), vec![expected_key]);
+    }
+
+    #[test]
+    fn test_extract_restored_keys_includes_temporary_contract_data() {
+        // is_soroban_key accepts all ContractData regardless of durability,
+        // matching stellar-core which filters by key type only.
+        let entry = make_temporary_contract_data_entry(1);
+        let expected_key = henyey_common::entry_to_key(&entry);
+        let meta = make_v4_meta(vec![restored(entry)], vec![], vec![]);
+        assert_eq!(extract_restored_keys(&[meta]), vec![expected_key]);
+    }
+
+    #[test]
+    fn test_extract_restored_keys_excludes_ttl() {
+        let entry = make_ttl_entry(1);
+        let meta = make_v4_meta(vec![restored(entry)], vec![], vec![]);
+        assert_eq!(extract_restored_keys(&[meta]), vec![]);
+    }
+
+    #[test]
+    fn test_extract_restored_keys_excludes_non_soroban() {
+        let entry = make_account_entry();
+        let meta = make_v4_meta(vec![restored(entry)], vec![], vec![]);
+        assert_eq!(extract_restored_keys(&[meta]), vec![]);
+    }
+
+    #[test]
+    fn test_extract_restored_keys_excludes_non_restored_changes() {
+        let entry_a = make_contract_data_entry(1);
+        let entry_b = make_contract_data_entry(2);
+        let meta = make_v4_meta(
+            vec![
+                LedgerEntryChange::Created(entry_a),
+                LedgerEntryChange::Updated(entry_b),
+            ],
+            vec![],
+            vec![],
+        );
+        assert_eq!(extract_restored_keys(&[meta]), vec![]);
+    }
+
+    #[test]
+    fn test_extract_restored_keys_v0_operations() {
+        let entry_a = make_contract_data_entry(1);
+        let entry_b = make_contract_data_entry(2);
+        let key_a = henyey_common::entry_to_key(&entry_a);
+        let key_b = henyey_common::entry_to_key(&entry_b);
+        let meta = make_v0_meta(vec![vec![restored(entry_a)], vec![restored(entry_b)]]);
+        assert_eq!(extract_restored_keys(&[meta]), vec![key_a, key_b]);
+    }
+
+    #[test]
+    fn test_extract_restored_keys_v1_both_sources() {
+        let entry_a = make_contract_data_entry(1);
+        let entry_b = make_contract_data_entry(2);
+        let key_a = henyey_common::entry_to_key(&entry_a);
+        let key_b = henyey_common::entry_to_key(&entry_b);
+        // V1: tx_changes processed first, then operations
+        let meta = make_v1_meta(vec![restored(entry_a)], vec![vec![restored(entry_b)]]);
+        assert_eq!(extract_restored_keys(&[meta]), vec![key_a, key_b]);
+    }
+
+    #[test]
+    fn test_extract_restored_keys_all_meta_variants() {
+        let entry_v0 = make_contract_data_entry(0);
+        let entry_v1 = make_contract_data_entry(1);
+        let entry_v2 = make_contract_data_entry(2);
+        let entry_v3 = make_contract_data_entry(3);
+        let entry_v4 = make_contract_data_entry(4);
+
+        let key_v0 = henyey_common::entry_to_key(&entry_v0);
+        let key_v1 = henyey_common::entry_to_key(&entry_v1);
+        let key_v2 = henyey_common::entry_to_key(&entry_v2);
+        let key_v3 = henyey_common::entry_to_key(&entry_v3);
+        let key_v4 = henyey_common::entry_to_key(&entry_v4);
+
+        let metas = vec![
+            make_v0_meta(vec![vec![restored(entry_v0)]]),
+            make_v1_meta(vec![restored(entry_v1)], vec![]),
+            make_v2_meta(vec![restored(entry_v2)], vec![], vec![]),
+            make_v3_meta(vec![restored(entry_v3)], vec![], vec![]),
+            make_v4_meta(vec![restored(entry_v4)], vec![], vec![]),
+        ];
+
+        assert_eq!(
+            extract_restored_keys(&metas),
+            vec![key_v0, key_v1, key_v2, key_v3, key_v4]
+        );
+    }
+
+    #[test]
+    fn test_extract_restored_keys_empty_input() {
+        assert_eq!(extract_restored_keys(&[]), Vec::<LedgerKey>::new());
+    }
+
+    #[test]
+    fn test_extract_restored_keys_v4_all_positions() {
+        let entry_before = make_contract_data_entry(1);
+        let entry_op = make_contract_data_entry(2);
+        let entry_after = make_contract_data_entry(3);
+        let key_before = henyey_common::entry_to_key(&entry_before);
+        let key_op = henyey_common::entry_to_key(&entry_op);
+        let key_after = henyey_common::entry_to_key(&entry_after);
+
+        let meta = make_v4_meta(
+            vec![restored(entry_before)],
+            vec![vec![restored(entry_op)]],
+            vec![restored(entry_after)],
+        );
+        assert_eq!(
+            extract_restored_keys(&[meta]),
+            vec![key_before, key_op, key_after]
+        );
+    }
+
+    #[test]
+    fn test_extract_restored_keys_mixed_input() {
+        // Interleave valid and invalid entries in tx_changes_before.
+        // Only restored ContractData/ContractCode should appear in output,
+        // in encounter order, with invalid entries filtered without disturbing neighbors.
+        let contract_data_a = make_contract_data_entry(1);
+        let contract_data_b = make_contract_data_entry(2);
+        let ttl_entry = make_ttl_entry(3);
+        let account_entry = make_account_entry();
+        let contract_code_e = make_contract_code_entry(5);
+
+        let key_a = henyey_common::entry_to_key(&contract_data_a);
+        let key_e = henyey_common::entry_to_key(&contract_code_e);
+
+        let meta = make_v4_meta(
+            vec![
+                restored(contract_data_a),                   // included
+                LedgerEntryChange::Created(contract_data_b), // excluded: not Restored
+                restored(ttl_entry),                         // excluded: TTL
+                restored(account_entry),                     // excluded: non-Soroban
+                restored(contract_code_e),                   // included
+            ],
+            vec![],
+            vec![],
+        );
+        assert_eq!(extract_restored_keys(&[meta]), vec![key_a, key_e]);
+    }
+
+    // --- Existing tests ---
 
     #[test]
     fn test_partition_calculation() {
