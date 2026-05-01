@@ -324,6 +324,8 @@ metric_catalog! {
             => "Quorum set nodes disagreeing";
         QUORUM_FAIL_AT = "stellar_quorum_fail_at"
             => "Peers that can fail before quorum is lost (via find_closest_v_blocking, excludes self)";
+        QUORUM_DELAYED = "stellar_quorum_delayed"
+            => "Quorum set nodes lagging behind the local node (subset of agree)";
 
         // Phase 4: SCP timing.
         SCP_TIMING_EXTERNALIZED_SECONDS = "stellar_scp_timing_externalized_seconds"
@@ -777,11 +779,13 @@ pub(crate) async fn refresh_gauges(state: &ServerState) {
         gauge!(QUORUM_MISSING).set(qh.missing as f64);
         gauge!(QUORUM_DISAGREE).set(qh.disagree as f64);
         gauge!(QUORUM_FAIL_AT).set(qh.fail_at as f64);
+        gauge!(QUORUM_DELAYED).set(qh.delayed as f64);
     } else {
         gauge!(QUORUM_AGREE).set(0.0);
         gauge!(QUORUM_MISSING).set(0.0);
         gauge!(QUORUM_DISAGREE).set(0.0);
         gauge!(QUORUM_FAIL_AT).set(0.0);
+        gauge!(QUORUM_DELAYED).set(0.0);
     }
 
     // Phase 4: SCP timing.

@@ -2260,12 +2260,13 @@ impl App {
 
     /// Quorum health summary (None when not tracking).
     pub fn quorum_health(&self) -> Option<crate::app::types::QuorumHealthMetrics> {
-        let (agree, missing, disagree, fail_at) = self.herder.quorum_health()?;
+        let (agree, missing, disagree, fail_at, delayed) = self.herder.quorum_health()?;
         Some(crate::app::types::QuorumHealthMetrics {
             agree,
             missing,
             disagree,
             fail_at,
+            delayed,
         })
     }
 

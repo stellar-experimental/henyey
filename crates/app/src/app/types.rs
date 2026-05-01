@@ -397,6 +397,9 @@ pub struct QuorumHealthMetrics {
     /// `find_closest_v_blocking` (excludes self). More precise than
     /// `total - threshold` for nested quorum sets.
     pub fail_at: u64,
+    /// Nodes that are participating but lagging behind the local node's
+    /// latest ledger. A subset of `agree` (delayed peers count as agreeing).
+    pub delayed: u64,
 }
 
 /// SCP timing for the most recently externalized slot.

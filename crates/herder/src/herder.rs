@@ -3101,7 +3101,7 @@ impl Herder {
     /// - Uses `tracking_slot - 1` first (previous slot has completed envelopes)
     /// - Falls back to current tracking slot if previous is unavailable
     /// - Returns None when not tracking (tracking_slot == 0)
-    pub fn quorum_health(&self) -> Option<(u64, u64, u64, u64)> {
+    pub fn quorum_health(&self) -> Option<(u64, u64, u64, u64, u64)> {
         let tracking = self.tracking_slot();
         // When tracking_slot is 0, we're not tracking — equivalent to
         // stellar-core's HERDER_BOOTING_STATE check.
@@ -3123,6 +3123,7 @@ impl Herder {
 
         // Delayed counts as agree (node is participating, just behind).
         let agree = summary.agree + summary.delayed;
+        let delayed = summary.delayed;
         let missing = summary.missing;
         let disagree = summary.disagree;
 
@@ -3135,7 +3136,7 @@ impl Herder {
         let v_blocking =
             henyey_scp::find_closest_v_blocking(qs, &summary.agreeing_nodes, Some(local_id));
         let fail_at = v_blocking.len() as u64;
-        Some((agree, missing, disagree, fail_at))
+        Some((agree, missing, disagree, fail_at, delayed))
     }
 
     /// Determine the slot index to use for quorum info queries.
@@ -8427,7 +8428,7 @@ mod quorum_health_tests {
         set_tracking(&herder, 10);
 
         let health = herder.quorum_health();
-        assert_eq!(health, Some((1, 0, 0, 0)));
+        assert_eq!(health, Some((1, 0, 0, 0, 0)));
     }
 
     // ── Test 3: fallback to current when previous is absent ────────
@@ -8442,7 +8443,7 @@ mod quorum_health_tests {
         set_tracking(&herder, 10);
 
         let health = herder.quorum_health();
-        assert_eq!(health, Some((1, 0, 0, 0)));
+        assert_eq!(health, Some((1, 0, 0, 0, 0)));
     }
 
     // ── Test 4: both slots absent → None ───────────────────────────
@@ -8484,7 +8485,7 @@ mod quorum_health_tests {
         // agree = 1 (local Agree) + 1 (peer Delayed) = 2.
         // find_closest_v_blocking excludes self: left_till_block = 1+2-2 = 1,
         // peer is agreeing → fail_at = 1 (one peer failure blocks quorum).
-        assert_eq!(health, Some((2, 0, 0, 1)));
+        assert_eq!(health, Some((2, 0, 0, 1, 0)));
     }
 
     // ── Test 6: tracking_slot == 1 edge case ───────────────────────
@@ -8499,7 +8500,7 @@ mod quorum_health_tests {
         set_tracking(&herder, 1);
 
         let health = herder.quorum_health();
-        assert_eq!(health, Some((1, 0, 0, 0)));
+        assert_eq!(health, Some((1, 0, 0, 0, 0)));
     }
 
     // ── Test 7: non-zero fail_at ───────────────────────────────────
@@ -8527,7 +8528,7 @@ mod quorum_health_tests {
         let health = herder.quorum_health();
         // 3 nodes all Agree. find_closest_v_blocking excludes self:
         // left_till_block = 1+3-2 = 2, both peers agreeing → fail_at = 2.
-        assert_eq!(health, Some((3, 0, 0, 2)));
+        assert_eq!(health, Some((3, 0, 0, 2, 0)));
     }
 
     // ── Test 8: nested quorum set precision ────────────────────────
@@ -8631,7 +8632,7 @@ mod quorum_health_tests {
         // The precise fail_at depends on the recursive v-blocking calculation.
         // Key assertion: fail_at is NOT 9 - 2 = 7 (the old broken formula applied
         // to the flat threshold — which doesn't even apply to nested sets).
-        let (agree, missing, disagree, fail_at) = health.unwrap();
+        let (agree, missing, disagree, fail_at, _delayed) = health.unwrap();
         assert_eq!(agree, 10);
         assert_eq!(missing, 0);
         assert_eq!(disagree, 0);
@@ -8662,7 +8663,7 @@ mod quorum_health_tests {
         set_tracking(&herder, 10);
 
         let health = herder.quorum_health();
-        let (agree, missing, _disagree, fail_at) = health.unwrap();
+        let (agree, missing, _disagree, fail_at, _delayed) = health.unwrap();
         assert_eq!(agree, 2); // local + peer1
         assert_eq!(missing, 1); // peer2
 
@@ -8686,7 +8687,7 @@ mod quorum_health_tests {
         set_tracking(&herder, 10);
 
         let health = herder.quorum_health();
-        let (agree, missing, _disagree, fail_at) = health.unwrap();
+        let (agree, missing, _disagree, fail_at, _delayed) = health.unwrap();
         assert_eq!(agree, 1); // only local
         assert_eq!(missing, 2); // both peers
 

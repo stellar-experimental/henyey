@@ -65,6 +65,7 @@ Metrics with the `stellar_` prefix that directly mirror stellar-core Medida coun
 | `QUORUM_MISSING` | `stellar_quorum_missing` | gauge | Nodes missing from latest slot |
 | `QUORUM_DISAGREE` | `stellar_quorum_disagree` | gauge | Nodes disagreeing in latest slot |
 | `QUORUM_FAIL_AT` | `stellar_quorum_fail_at` | gauge | Peers that can fail before quorum loss (via `find_closest_v_blocking`, excludes self) |
+| `QUORUM_DELAYED` | `stellar_quorum_delayed` | gauge | Quorum set nodes lagging behind the local node (subset of agree) |
 
 ## 2. Derived / Approximate Equivalents
 
@@ -230,3 +231,17 @@ The following metrics were removed as redundant (see issue #1927):
 | `henyey_ledger_soroban_exec_us` | `henyey_ledger_close_soroban_exec_seconds` (histogram) | Same source data; histogram provides distribution. |
 | `henyey_ledger_classic_exec_us` | `henyey_ledger_close_classic_exec_seconds` (histogram) | Same source data; histogram provides distribution. |
 | `stellar_ledger_close_time_ms` | `stellar_ledger_close_duration_seconds` (histogram) | Same source data (`stats.close_time_ms`); histogram provides distribution. |
+
+## 5. Not Applicable Stellar-Core Metrics
+
+The following stellar-core metrics have no henyey equivalent and are intentionally omitted.
+They reference concepts or architecture that don't exist in henyey.
+
+| Stellar-core metric | Reason not applicable |
+|---|---|
+| `stellar_core_quorum_transitive_intersection` | Stellar-core's periodic transitive quorum intersection check is not implemented in henyey. |
+| `stellar_core_quorum_transitive_last_check_ledger` | Same as above — no transitive quorum check. |
+| `stellar_core_bucket_memory_shared` | Stellar-core's in-memory bucket sharing model differs from henyey's bucket cache architecture. |
+| `stellar_core_app_post_on_main_thread_delay_seconds` | Stellar-core's queue-backed main thread; henyey uses tokio async runtime instead. |
+| `stellar_core_app_post_on_background_thread_delay_seconds` | Same as above — no background thread queue. |
+| `stellar_core_crypto_verify_hit` / `_total` | Stellar-core's signature verification cache; henyey has no signature cache (SCP verify pipeline uses `henyey_scp_verify_*` metrics). |
