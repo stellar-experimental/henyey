@@ -283,11 +283,17 @@ pub(crate) async fn dumpproposedsettings_handler(
     };
 
     match state.app.get_config_upgrade_set(&key) {
-        Some(settings) => (StatusCode::OK, Json(serde_json::json!(settings))),
-        None => (
+        Ok(Some(settings)) => (StatusCode::OK, Json(serde_json::json!(settings))),
+        Ok(None) => (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({
                 "error": "configUpgradeSet is missing or invalid"
+            })),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": format!("Internal error loading config upgrade set: {}", e)
             })),
         ),
     }

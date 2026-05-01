@@ -352,6 +352,7 @@ fn test_config_upgrade_sees_stale_protocol_version() {
         closing_ledger_seq,
         post_upgrade_version,
     )
+    .expect("should not encounter I/O errors")
     .expect("should find config upgrade entry");
 
     // The frame must use the post-upgrade version, not the stale snapshot version.
@@ -412,7 +413,8 @@ fn test_config_upgrade_ttl_checked_against_snapshot_ledger_seq() {
     // make_from_key now uses closing_ledger (100) for TTL check.
     // Entry with live_until=99 is expired because 99 < 100.
     let ltx = CloseLedgerState::begin(handle.clone(), header.clone(), header_hash, closing_ledger);
-    let frame = ConfigUpgradeSetFrame::make_from_key(&ltx, &upgrade_key, closing_ledger, 25);
+    let frame = ConfigUpgradeSetFrame::make_from_key(&ltx, &upgrade_key, closing_ledger, 25)
+        .expect("should not encounter I/O errors");
 
     assert!(
         frame.is_none(),
@@ -630,9 +632,10 @@ fn test_config_upgrade_nonexistent_key_rejected() {
         content_hash: Hash([0xCC; 32]),
     };
 
-    // make_from_key returns None — key doesn't exist in ledger
+    // make_from_key returns Ok(None) — key doesn't exist in ledger
     let ltx = CloseLedgerState::begin(handle.clone(), header.clone(), header_hash, 1);
-    let frame = ConfigUpgradeSetFrame::make_from_key(&ltx, &bogus_key, 1, 25);
+    let frame = ConfigUpgradeSetFrame::make_from_key(&ltx, &bogus_key, 1, 25)
+        .expect("should not encounter I/O errors");
     assert!(
         frame.is_none(),
         "Nonexistent config upgrade key should not be loadable"

@@ -2303,8 +2303,20 @@ impl Herder {
                         // Use a fresh snapshot from the same manager state for the
                         // config upgrade context. This is consistent with the header
                         // snapshot already captured.
-                        let cfg_snapshot = manager.create_snapshot().ok()?;
-                        ConfigUpgradeContext::from_snapshot(&cfg_snapshot, &key)
+                        let cfg_snapshot = match manager.create_snapshot() {
+                            Ok(s) => s,
+                            Err(e) => {
+                                error!("Failed to create snapshot for config upgrade context: {e}");
+                                return None;
+                            }
+                        };
+                        match ConfigUpgradeContext::from_snapshot(&cfg_snapshot, &key) {
+                            Ok(ctx) => ctx,
+                            Err(e) => {
+                                error!("Error loading config upgrade context: {e}");
+                                None
+                            }
+                        }
                     });
 
                 (

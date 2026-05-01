@@ -65,10 +65,14 @@ pub struct ConfigUpgradeContext {
 impl ConfigUpgradeContext {
     /// Build from a pre-existing snapshot.
     ///
-    /// Returns `None` if the key doesn't exist in the ledger, the TTL has
+    /// Returns `Ok(None)` if the key doesn't exist in the ledger, the TTL has
     /// expired, the XDR is invalid, or the entry has wrong durability. These
     /// are not errors — the upgrade set simply isn't available for proposal.
-    pub fn from_snapshot(snapshot: &SnapshotHandle, key: &ConfigUpgradeSetKey) -> Option<Self> {
+    /// Returns `Err` on I/O errors or invariant violations.
+    pub fn from_snapshot(
+        snapshot: &SnapshotHandle,
+        key: &ConfigUpgradeSetKey,
+    ) -> Result<Option<Self>, LedgerError> {
         let closing_ledger_seq = snapshot.ledger_seq() + 1;
         let protocol_version = snapshot.header().ledger_version;
         let ltx = CloseLedgerState::begin(
@@ -77,9 +81,16 @@ impl ConfigUpgradeContext {
             *snapshot.snapshot().header_hash(),
             closing_ledger_seq,
         );
-        let frame =
-            ConfigUpgradeSetFrame::make_from_key(&ltx, key, closing_ledger_seq, protocol_version)?;
-        Some(Self { frame, ltx })
+        let frame = match ConfigUpgradeSetFrame::make_from_key(
+            &ltx,
+            key,
+            closing_ledger_seq,
+            protocol_version,
+        )? {
+            Some(f) => f,
+            None => return Ok(None),
+        };
+        Ok(Some(Self { frame, ltx }))
     }
 
     /// Check whether the config upgrade should be proposed.
@@ -1388,6 +1399,7 @@ mod tests {
         let handle = SnapshotHandle::new(snapshot);
 
         let ctx = ConfigUpgradeContext::from_snapshot(&handle, &key)
+            .expect("from_snapshot should not encounter I/O errors in test")
             .expect("from_snapshot should succeed with valid entries");
 
         (ctx, key)

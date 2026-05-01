@@ -30,7 +30,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use parking_lot::RwLock;
-use tracing::{debug, trace, warn};
+use tracing::{debug, error, trace, warn};
 
 use crate::tracked_lock::{tracked_read, tracked_write};
 
@@ -1710,12 +1710,23 @@ impl ScpDriver {
                     debug!("Config upgrade validation: no ledger manager available, rejecting");
                     return false;
                 };
-                let Some(frame) = lm.get_config_upgrade_set(key) else {
-                    debug!(
-                        contract_id = ?key.contract_id,
-                        "Config upgrade key not found in ledger"
-                    );
-                    return false;
+                let frame = match lm.get_config_upgrade_set(key) {
+                    Ok(Some(f)) => f,
+                    Ok(None) => {
+                        debug!(
+                            contract_id = ?key.contract_id,
+                            "Config upgrade key not found in ledger"
+                        );
+                        return false;
+                    }
+                    Err(e) => {
+                        error!(
+                            contract_id = ?key.contract_id,
+                            error = %e,
+                            "Error loading config upgrade set from ledger"
+                        );
+                        return false;
+                    }
                 };
                 use henyey_ledger::ConfigUpgradeValidity;
                 match frame.is_valid_for_apply() {

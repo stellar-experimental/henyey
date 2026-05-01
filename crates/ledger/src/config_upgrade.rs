@@ -143,8 +143,12 @@ impl ConfigUpgradeSetFrame {
 
     /// Load a ConfigUpgradeSet from the ledger.
     ///
-    /// Returns None if:
-    /// - The CONTRACT_DATA entry doesn't exist
+    /// Returns `Ok(None)` if the CONTRACT_DATA entry doesn't exist (legitimate
+    /// absence). Returns `Err` on I/O errors or if the TTL entry is missing
+    /// when the data entry exists (invariant violation per stellar-core
+    /// `Upgrades.cpp:1300`).
+    ///
+    /// Returns `Ok(None)` for non-error validation failures:
     /// - The entry's TTL has expired
     /// - The entry is not TEMPORARY durability
     /// - The value is not SCV_BYTES
@@ -154,33 +158,39 @@ impl ConfigUpgradeSetFrame {
         key: &ConfigUpgradeSetKey,
         closing_ledger_seq: u32,
         protocol_version: u32,
-    ) -> Option<Arc<Self>> {
+    ) -> crate::Result<Option<Arc<Self>>> {
         let lk = Self::get_ledger_key(key);
 
         // Load the CONTRACT_DATA entry
-        let entry = ltx.get_entry(&lk).ok()??;
+        let Some(entry) = ltx.get_entry(&lk)? else {
+            return Ok(None);
+        };
 
-        // Check TTL (entry must be live)
+        // Check TTL (entry must be live).
+        // Parity: stellar-core does releaseAssert(ttlLtxe) — if the data entry
+        // exists but the TTL entry doesn't, that's an invariant violation.
         let ttl_key = Self::get_ttl_key(&lk);
-        let ttl_entry = ltx.get_entry(&ttl_key).ok()??;
+        let ttl_entry = ltx.get_entry(&ttl_key)?.ok_or_else(|| {
+            LedgerError::Internal("CONFIG_DATA entry exists but TTL entry is missing".into())
+        })?;
         if !Self::is_live(&ttl_entry, closing_ledger_seq) {
             debug!(
                 hash = format!("{:02x?}", &key.content_hash.0[..8]),
                 "ConfigUpgradeSet TTL expired"
             );
-            return None;
+            return Ok(None);
         }
 
         // Extract CONTRACT_DATA
         let contract_data = match &entry.data {
             stellar_xdr::curr::LedgerEntryData::ContractData(cd) => cd,
-            _ => return None,
+            _ => return Ok(None),
         };
 
         // Must be TEMPORARY durability
         if contract_data.durability != ContractDataDurability::Temporary {
             debug!("ConfigUpgradeSet must have TEMPORARY durability");
-            return None;
+            return Ok(None);
         }
 
         // Value must be SCV_BYTES
@@ -188,7 +198,7 @@ impl ConfigUpgradeSetFrame {
             ScVal::Bytes(b) => b.0.as_slice(),
             _ => {
                 debug!("ConfigUpgradeSet value must be SCV_BYTES");
-                return None;
+                return Ok(None);
             }
         };
 
@@ -201,7 +211,7 @@ impl ConfigUpgradeSetFrame {
                     error = %e,
                     "Failed to decode ConfigUpgradeSet"
                 );
-                return None;
+                return Ok(None);
             }
         };
 
@@ -214,7 +224,7 @@ impl ConfigUpgradeSetFrame {
             ledger_version: protocol_version,
         };
 
-        Some(Arc::new(frame))
+        Ok(Some(Arc::new(frame)))
     }
 
     /// Construct the LedgerKey for a ConfigUpgradeSet.
@@ -1885,6 +1895,102 @@ mod tests {
             err_msg.contains("missing CONFIG_SETTING"),
             "Error message should mention missing setting, got: {}",
             err_msg,
+        );
+    }
+
+    /// Regression test for #2227: make_from_key must propagate get_entry errors
+    /// instead of silently converting them to None via .ok().
+    #[test]
+    fn test_make_from_key_propagates_get_entry_error() {
+        use crate::close_state::CloseLedgerState;
+        use crate::snapshot::{LedgerSnapshot, SnapshotHandle};
+        use stellar_xdr::curr::*;
+
+        let key = make_test_key();
+
+        // Lookup function that always returns an error (simulating I/O failure)
+        let error_lookup: crate::EntryLookupFn = std::sync::Arc::new(|_key: &LedgerKey| {
+            Err(LedgerError::Internal("simulated I/O error".into()))
+        });
+        let snapshot = SnapshotHandle::with_lookup(LedgerSnapshot::empty(100), error_lookup);
+
+        let header = LedgerHeader {
+            ledger_version: 25,
+            ledger_seq: 100,
+            ..Default::default()
+        };
+        let ltx = CloseLedgerState::begin(snapshot, header, henyey_common::Hash256::ZERO, 101);
+
+        let result = ConfigUpgradeSetFrame::make_from_key(&ltx, &key, 101, 25);
+        assert!(
+            result.is_err(),
+            "make_from_key should propagate get_entry errors, got: {:?}",
+            result
+        );
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(
+            err_msg.contains("simulated I/O error"),
+            "Error should propagate the original message, got: {}",
+            err_msg
+        );
+    }
+
+    /// Regression test for #2227: make_from_key must return an invariant violation
+    /// error when the data entry exists but the TTL entry is missing.
+    #[test]
+    fn test_make_from_key_errors_on_missing_ttl() {
+        use crate::close_state::CloseLedgerState;
+        use crate::snapshot::{LedgerSnapshot, SnapshotHandle};
+        use stellar_xdr::curr::*;
+
+        let key = make_test_key();
+        let lk = ConfigUpgradeSetFrame::get_ledger_key(&key);
+
+        // Build a CONTRACT_DATA entry
+        let contract_data = ContractDataEntry {
+            ext: ExtensionPoint::V0,
+            contract: ScAddress::Contract(key.contract_id.clone()),
+            key: ScVal::Bytes(key.content_hash.0.to_vec().try_into().unwrap()),
+            durability: ContractDataDurability::Temporary,
+            val: ScVal::Bytes(vec![0u8; 10].try_into().unwrap()),
+        };
+        let entry = LedgerEntry {
+            last_modified_ledger_seq: 1,
+            data: LedgerEntryData::ContractData(contract_data),
+            ext: LedgerEntryExt::V0,
+        };
+
+        // Lookup returns the data entry but None for the TTL key
+        let lk_clone = lk.clone();
+        let entry_clone = entry.clone();
+        let lookup: crate::EntryLookupFn = std::sync::Arc::new(move |req_key: &LedgerKey| {
+            if *req_key == lk_clone {
+                Ok(Some(entry_clone.clone()))
+            } else {
+                // TTL key lookup returns None — simulating missing TTL
+                Ok(None)
+            }
+        });
+        let snapshot = SnapshotHandle::with_lookup(LedgerSnapshot::empty(100), lookup);
+
+        let header = LedgerHeader {
+            ledger_version: 25,
+            ledger_seq: 100,
+            ..Default::default()
+        };
+        let ltx = CloseLedgerState::begin(snapshot, header, henyey_common::Hash256::ZERO, 101);
+
+        let result = ConfigUpgradeSetFrame::make_from_key(&ltx, &key, 101, 25);
+        assert!(
+            result.is_err(),
+            "make_from_key should error when TTL entry is missing but data entry exists, got: {:?}",
+            result
+        );
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(
+            err_msg.contains("TTL entry is missing"),
+            "Error should mention missing TTL, got: {}",
+            err_msg
         );
     }
 }

@@ -1290,7 +1290,7 @@ impl UpgradeContext {
                 &key,
                 closing_ledger_seq,
                 protocol_version,
-            ) {
+            )? {
                 Some(f) => f,
                 None => {
                     return Err(LedgerError::UpgradeError(format!(

@@ -2664,20 +2664,17 @@ impl LedgerManager {
     /// This retrieves a ConfigUpgradeSet that has been uploaded to the network
     /// but not yet applied. Validators use this to validate scheduled upgrades.
     ///
-    /// Returns `None` if:
-    /// - The ledger is not initialized
-    /// - The CONTRACT_DATA entry doesn't exist
-    /// - The entry's TTL has expired
-    /// - The entry is not TEMPORARY durability
-    /// - The XDR cannot be decoded
+    /// Returns `Ok(None)` if the entry doesn't exist, TTL expired, wrong
+    /// durability, or XDR decode fails. Returns `Err` on I/O errors or
+    /// invariant violations (e.g. missing TTL entry).
     pub fn get_config_upgrade_set(
         &self,
         key: &stellar_xdr::curr::ConfigUpgradeSetKey,
-    ) -> Option<std::sync::Arc<crate::config_upgrade::ConfigUpgradeSetFrame>> {
+    ) -> crate::Result<Option<std::sync::Arc<crate::config_upgrade::ConfigUpgradeSetFrame>>> {
         if !self.is_initialized() {
-            return None;
+            return Ok(None);
         }
-        let snapshot = self.create_snapshot().ok()?;
+        let snapshot = self.create_snapshot()?;
         let closing_ledger_seq = snapshot.ledger_seq() + 1;
         let protocol_version = snapshot.header().ledger_version;
         // Create a read-only CloseLedgerState so make_from_key can use the unified read path.

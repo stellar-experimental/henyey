@@ -41,20 +41,24 @@ impl App {
     ///
     /// # Returns
     ///
-    /// * `Some(json)` - The ConfigUpgradeSet as a JSON-serializable value
-    /// * `None` - The upgrade set was not found or is invalid
+    /// * `Ok(Some(json))` - The ConfigUpgradeSet as a JSON-serializable value
+    /// * `Ok(None)` - The upgrade set was not found or is invalid
+    /// * `Err` - I/O error or invariant violation reading from ledger
     pub fn get_config_upgrade_set(
         &self,
         key: &stellar_xdr::curr::ConfigUpgradeSetKey,
-    ) -> Option<serde_json::Value> {
-        let frame = self.ledger_manager.get_config_upgrade_set(key)?;
+    ) -> Result<Option<serde_json::Value>, henyey_ledger::LedgerError> {
+        let frame = match self.ledger_manager.get_config_upgrade_set(key)? {
+            Some(f) => f,
+            None => return Ok(None),
+        };
         let upgrade_set = frame.to_xdr();
 
         // Convert to JSON-serializable format
-        Some(serde_json::json!({
+        Ok(Some(serde_json::json!({
             "updated_entry": upgrade_set.updated_entry.iter().map(|entry| {
                 format!("{:?}", entry)
             }).collect::<Vec<_>>()
-        }))
+        })))
     }
 }
