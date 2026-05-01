@@ -133,7 +133,7 @@ pub(crate) fn extract_ledger_changes(
     tx_metas: &[TransactionMeta],
 ) -> Result<(Vec<LedgerEntry>, Vec<LedgerEntry>, Vec<LedgerKey>)> {
     let mut changes = LedgerChanges::new();
-    crate::meta_walk::for_each_change(tx_metas, |change| changes.push(change));
+    henyey_common::meta_walk::for_each_change(tx_metas, |change| changes.push(change));
     Ok(changes.into_tuple())
 }
 

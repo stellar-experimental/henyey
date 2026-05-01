@@ -1,84 +1,80 @@
-//! Shared traversal helper for `TransactionMeta` V0–V4.
+//! Shared traversal helpers for `TransactionMeta` V0–V4.
 //!
-//! This module provides a single function that encapsulates the
-//! V0–V4 `TransactionMeta` variant traversal pattern, invoking a
-//! caller-supplied closure on each `LedgerEntryChange` in field
-//! traversal order.
+//! This module centralizes the V0–V4 `TransactionMeta` variant traversal
+//! pattern, avoiding duplication across crates that need to walk ledger
+//! entry changes from transaction metadata.
 
 use stellar_xdr::curr::{LedgerEntryChange, TransactionMeta};
+
+/// Walk change groups in a single `TransactionMeta`, invoking `f` once per
+/// contiguous slice of changes in field traversal order.
+///
+/// Each call to `f` receives one logical group of changes:
+/// - V0: one call per operation (`operations[i].changes`)
+/// - V1: `tx_changes`, then one call per operation
+/// - V2/V3/V4: `tx_changes_before`, one call per operation, `tx_changes_after`
+///
+/// This is the lower-level primitive; use [`for_each_change`] if you need
+/// individual `&LedgerEntryChange` callbacks instead.
+pub fn for_each_change_group<F>(meta: &TransactionMeta, mut f: F)
+where
+    F: FnMut(&[LedgerEntryChange]),
+{
+    match meta {
+        TransactionMeta::V0(operations) => {
+            for op_meta in operations.iter() {
+                f(&op_meta.changes);
+            }
+        }
+        TransactionMeta::V1(v1) => {
+            f(&v1.tx_changes);
+            for op_changes in v1.operations.iter() {
+                f(&op_changes.changes);
+            }
+        }
+        TransactionMeta::V2(v2) => {
+            f(&v2.tx_changes_before);
+            for op in v2.operations.iter() {
+                f(&op.changes);
+            }
+            f(&v2.tx_changes_after);
+        }
+        TransactionMeta::V3(v3) => {
+            f(&v3.tx_changes_before);
+            for op in v3.operations.iter() {
+                f(&op.changes);
+            }
+            f(&v3.tx_changes_after);
+        }
+        TransactionMeta::V4(v4) => {
+            f(&v4.tx_changes_before);
+            for op in v4.operations.iter() {
+                f(&op.changes);
+            }
+            f(&v4.tx_changes_after);
+        }
+    }
+}
 
 /// Walk all `LedgerEntryChange` entries in a slice of `TransactionMeta`,
 /// invoking `f` for each change in field traversal order.
 ///
-/// Traversal order preserves the current henyey/XDR field traversal order:
+/// Traversal order preserves the XDR field traversal order:
 /// - V0: `operations[i].changes` (sequentially per operation)
 /// - V1: `tx_changes`, then `operations[i].changes`
 /// - V2/V3/V4: `tx_changes_before`, `operations[i].changes`, `tx_changes_after`
 ///
 /// Multiple metas in the slice are processed sequentially in slice order.
-pub(crate) fn for_each_change<F>(tx_metas: &[TransactionMeta], mut f: F)
+pub fn for_each_change<F>(tx_metas: &[TransactionMeta], mut f: F)
 where
     F: FnMut(&LedgerEntryChange),
 {
     for meta in tx_metas {
-        match meta {
-            TransactionMeta::V0(operations) => {
-                for op_meta in operations.iter() {
-                    for change in op_meta.changes.iter() {
-                        f(change);
-                    }
-                }
+        for_each_change_group(meta, |changes| {
+            for change in changes {
+                f(change);
             }
-            TransactionMeta::V1(v1) => {
-                for change in v1.tx_changes.iter() {
-                    f(change);
-                }
-                for op_changes in v1.operations.iter() {
-                    for change in op_changes.changes.iter() {
-                        f(change);
-                    }
-                }
-            }
-            TransactionMeta::V2(v2) => {
-                for change in v2.tx_changes_before.iter() {
-                    f(change);
-                }
-                for op in v2.operations.iter() {
-                    for change in op.changes.iter() {
-                        f(change);
-                    }
-                }
-                for change in v2.tx_changes_after.iter() {
-                    f(change);
-                }
-            }
-            TransactionMeta::V3(v3) => {
-                for change in v3.tx_changes_before.iter() {
-                    f(change);
-                }
-                for op in v3.operations.iter() {
-                    for change in op.changes.iter() {
-                        f(change);
-                    }
-                }
-                for change in v3.tx_changes_after.iter() {
-                    f(change);
-                }
-            }
-            TransactionMeta::V4(v4) => {
-                for change in v4.tx_changes_before.iter() {
-                    f(change);
-                }
-                for op in v4.operations.iter() {
-                    for change in op.changes.iter() {
-                        f(change);
-                    }
-                }
-                for change in v4.tx_changes_after.iter() {
-                    f(change);
-                }
-            }
-        }
+        });
     }
 }
 
@@ -139,6 +135,15 @@ mod tests {
         let mut ids = Vec::new();
         for_each_change(metas, |change| ids.push(marker_id(change)));
         ids
+    }
+
+    /// Collect all change marker IDs from `for_each_change_group`.
+    fn collect_group_ids(meta: &TransactionMeta) -> Vec<Vec<u8>> {
+        let mut groups = Vec::new();
+        for_each_change_group(meta, |changes| {
+            groups.push(changes.iter().map(marker_id).collect());
+        });
+        groups
     }
 
     fn make_v0_meta(ops: Vec<Vec<LedgerEntryChange>>) -> TransactionMeta {
@@ -229,6 +234,8 @@ mod tests {
         })
     }
 
+    // --- for_each_change tests ---
+
     #[test]
     fn test_for_each_change_empty_slice() {
         let ids = collect_ids(&[]);
@@ -237,14 +244,12 @@ mod tests {
 
     #[test]
     fn test_for_each_change_v0_order() {
-        // V0: operations[0].changes then operations[1].changes
         let meta = make_v0_meta(vec![vec![marker(1), marker(2)], vec![marker(3)]]);
         assert_eq!(collect_ids(&[meta]), vec![1, 2, 3]);
     }
 
     #[test]
     fn test_for_each_change_v1_order() {
-        // V1: tx_changes first, then operations
         let meta = make_v1_meta(
             vec![marker(10), marker(11)],
             vec![vec![marker(20)], vec![marker(21), marker(22)]],
@@ -254,7 +259,6 @@ mod tests {
 
     #[test]
     fn test_for_each_change_v2_order() {
-        // V2: before → ops → after
         let meta = make_v2_meta(
             vec![marker(1)],
             vec![vec![marker(2), marker(3)]],
@@ -265,7 +269,6 @@ mod tests {
 
     #[test]
     fn test_for_each_change_v3_order() {
-        // V3: before → ops → after
         let meta = make_v3_meta(
             vec![marker(5)],
             vec![vec![marker(6)], vec![marker(7)]],
@@ -276,7 +279,6 @@ mod tests {
 
     #[test]
     fn test_for_each_change_v4_order() {
-        // V4: before → ops → after
         let meta = make_v4_meta(
             vec![marker(10), marker(11)],
             vec![vec![marker(12)]],
@@ -287,7 +289,6 @@ mod tests {
 
     #[test]
     fn test_for_each_change_multiple_metas() {
-        // Multiple metas processed sequentially in slice order
         let m1 = make_v0_meta(vec![vec![marker(1)]]);
         let m2 = make_v2_meta(vec![marker(2)], vec![vec![marker(3)]], vec![marker(4)]);
         let m3 = make_v4_meta(vec![marker(5)], vec![], vec![marker(6)]);
@@ -298,24 +299,91 @@ mod tests {
     fn test_for_each_change_empty_containers() {
         let empty: Vec<u8> = vec![];
 
-        // V0 with no operations
         let m0 = make_v0_meta(vec![]);
         assert_eq!(collect_ids(&[m0]), empty);
 
-        // V1 with empty tx_changes and empty ops
         let m1 = make_v1_meta(vec![], vec![]);
         assert_eq!(collect_ids(&[m1]), empty);
 
-        // V2 with empty before/after but operations present
         let m2 = make_v2_meta(vec![], vec![vec![marker(1)]], vec![]);
         assert_eq!(collect_ids(&[m2]), vec![1]);
 
-        // V3 with all empty
         let m3 = make_v3_meta(vec![], vec![], vec![]);
         assert_eq!(collect_ids(&[m3]), empty);
 
-        // V4 with empty operations but before/after present
         let m4 = make_v4_meta(vec![marker(2)], vec![], vec![marker(3)]);
         assert_eq!(collect_ids(&[m4]), vec![2, 3]);
+    }
+
+    // --- for_each_change_group tests ---
+
+    #[test]
+    fn test_for_each_change_group_v0() {
+        let meta = make_v0_meta(vec![vec![marker(1), marker(2)], vec![marker(3)]]);
+        assert_eq!(collect_group_ids(&meta), vec![vec![1, 2], vec![3]]);
+    }
+
+    #[test]
+    fn test_for_each_change_group_v1() {
+        let meta = make_v1_meta(
+            vec![marker(10), marker(11)],
+            vec![vec![marker(20)], vec![marker(21)]],
+        );
+        assert_eq!(
+            collect_group_ids(&meta),
+            vec![vec![10, 11], vec![20], vec![21]]
+        );
+    }
+
+    #[test]
+    fn test_for_each_change_group_v2() {
+        let meta = make_v2_meta(
+            vec![marker(1)],
+            vec![vec![marker(2), marker(3)]],
+            vec![marker(4)],
+        );
+        assert_eq!(collect_group_ids(&meta), vec![vec![1], vec![2, 3], vec![4]]);
+    }
+
+    #[test]
+    fn test_for_each_change_group_v3() {
+        let meta = make_v3_meta(
+            vec![marker(5)],
+            vec![vec![marker(6)], vec![marker(7)]],
+            vec![marker(8)],
+        );
+        assert_eq!(
+            collect_group_ids(&meta),
+            vec![vec![5], vec![6], vec![7], vec![8]]
+        );
+    }
+
+    #[test]
+    fn test_for_each_change_group_v4() {
+        let meta = make_v4_meta(
+            vec![marker(10)],
+            vec![vec![marker(11), marker(12)]],
+            vec![marker(13)],
+        );
+        assert_eq!(
+            collect_group_ids(&meta),
+            vec![vec![10], vec![11, 12], vec![13]]
+        );
+    }
+
+    #[test]
+    fn test_for_each_change_group_empty_v3() {
+        let meta = make_v3_meta(vec![], vec![], vec![]);
+        // Empty before/after groups are still visited
+        let mut group_count = 0;
+        for_each_change_group(&meta, |_| group_count += 1);
+        assert_eq!(group_count, 2); // before + after (no ops)
+    }
+
+    #[test]
+    fn test_for_each_change_group_empty_v0() {
+        let meta = make_v0_meta(vec![]);
+        let groups = collect_group_ids(&meta);
+        assert!(groups.is_empty());
     }
 }

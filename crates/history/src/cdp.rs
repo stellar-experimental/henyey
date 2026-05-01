@@ -1003,7 +1003,7 @@ pub fn extract_restored_keys(
 
     let mut restored_keys = Vec::new();
 
-    crate::meta_walk::for_each_change(tx_metas, |change| {
+    henyey_common::meta_walk::for_each_change(tx_metas, |change| {
         if let LedgerEntryChange::Restored(entry) = change {
             let key = henyey_common::entry_to_key(entry);
             // Only CONTRACT_DATA and CONTRACT_CODE keys go to hot archive.

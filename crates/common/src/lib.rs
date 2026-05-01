@@ -15,6 +15,7 @@
 //! - [`fs_utils`] - Crash-safe filesystem operations (durable rename with fsync)
 //! - [`math`] - 128-bit arithmetic and overflow-safe math operations
 //! - [`meta`] - Ledger metadata normalization for deterministic hashing
+//! - [`meta_walk`] - Shared V0–V4 `TransactionMeta` traversal helpers
 //! - [`network`] - Network identity derived from network passphrases
 //! - [`protocol`] - Protocol version constants and feature gating utilities
 //! - [`resource`] - Resource accounting for transaction limits and surge pricing
@@ -57,6 +58,7 @@ pub mod ledger_type_utils;
 pub mod math;
 pub mod memory;
 pub mod meta;
+pub mod meta_walk;
 pub mod network;
 pub mod protocol;
 pub mod resource;
