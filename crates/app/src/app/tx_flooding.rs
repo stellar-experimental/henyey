@@ -874,13 +874,7 @@ impl App {
             .cloned()
             .or_else(|| tx_set.to_generalized_tx_set())
         {
-            let gen_hash = match gen_tx_set.to_xdr(stellar_xdr::curr::Limits::none()) {
-                Ok(bytes) => henyey_common::Hash256::hash(&bytes),
-                Err(e) => {
-                    tracing::warn!(hash = %hash, error = %e, "Failed to encode GeneralizedTxSet");
-                    henyey_common::Hash256::ZERO
-                }
-            };
+            let gen_hash = Hash256::hash_xdr(&gen_tx_set);
             if gen_hash == *hash {
                 let message = StellarMessage::GeneralizedTxSet(gen_tx_set);
                 if let Some(overlay) = self.overlay().await {
@@ -1981,6 +1975,80 @@ mod tests {
         assert!(
             app.herder.has_tx_set(&hash),
             "tx set should be cached in the herder"
+        );
+    }
+
+    /// Regression test: send_tx_set sends a GeneralizedTxSet when the cached
+    /// tx set has a generalized form whose hash matches the requested hash.
+    #[tokio::test]
+    async fn test_send_tx_set_sends_generalized_for_matching_hash() {
+        use stellar_xdr::curr::{
+            GeneralizedTransactionSet, Hash, ParallelTxsComponent, TransactionPhase,
+            TransactionSetV1, TxSetComponent, TxSetComponentTxsMaybeDiscountedFee,
+        };
+
+        let (app, _dir) = create_test_app_with_overlay().await;
+        let overlay = app.overlay().await.unwrap();
+
+        // Inject a test peer.
+        let peer_id = make_peer_id(99);
+        let mut receiver = overlay.inject_test_peer(peer_id.clone(), 16);
+
+        // Construct a GeneralizedTransactionSet.
+        let gen_tx_set = GeneralizedTransactionSet::V1(TransactionSetV1 {
+            previous_ledger_hash: Hash([0u8; 32]),
+            phases: vec![
+                TransactionPhase::V0(
+                    vec![TxSetComponent::TxsetCompTxsMaybeDiscountedFee(
+                        TxSetComponentTxsMaybeDiscountedFee {
+                            base_fee: Some(100),
+                            txs: vec![].try_into().unwrap(),
+                        },
+                    )]
+                    .try_into()
+                    .unwrap(),
+                ),
+                TransactionPhase::V1(ParallelTxsComponent {
+                    base_fee: Some(100),
+                    execution_stages: vec![].try_into().unwrap(),
+                }),
+            ]
+            .try_into()
+            .unwrap(),
+        });
+
+        let hash = Hash256::hash_xdr(&gen_tx_set);
+
+        // Cache the tx set: request it, then handle it so it's stored.
+        app.herder.scp_driver().request_tx_set(hash, 100);
+        app.handle_generalized_tx_set(gen_tx_set.clone()).await;
+        assert!(
+            app.herder.has_tx_set(&hash),
+            "precondition: tx set must be cached"
+        );
+
+        // Act: send_tx_set should send the generalized set for the matching hash.
+        app.send_tx_set(&peer_id, &hash).await;
+
+        // Assert: peer receives GeneralizedTxSet with matching hash.
+        let msg = receiver
+            .try_recv()
+            .expect("expected GeneralizedTxSet message");
+        match msg {
+            StellarMessage::GeneralizedTxSet(ref received) => {
+                assert_eq!(
+                    Hash256::hash_xdr(received),
+                    hash,
+                    "received GeneralizedTxSet hash must match requested hash"
+                );
+            }
+            other => panic!("expected GeneralizedTxSet, got {:?}", other.name()),
+        }
+
+        // No additional messages.
+        assert!(
+            receiver.try_recv().is_none(),
+            "no extra messages should be sent"
         );
     }
 }
