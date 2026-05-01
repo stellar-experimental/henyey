@@ -3545,6 +3545,83 @@ mod tests {
         );
     }
 
+    /// Regression test for #2177: `try_start_ledger_close` must reject a
+    /// buffered tx set whose cached hash does not match the `tx_set_hash`
+    /// recorded in the `LedgerCloseInfo`. Exercises the defense-in-depth
+    /// branch at `ledger_close.rs:1835-1847`.
+    #[tokio::test]
+    async fn test_try_start_ledger_close_rejects_tx_set_hash_mismatch() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-test.db");
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
+
+        let app = App::new(config).await.unwrap();
+
+        // Precondition: uninitialized app has header hash ZERO and ledger seq 0.
+        assert_eq!(
+            app.get_current_ledger().await.unwrap(),
+            0,
+            "precondition: uninitialized app ledger seq should be 0"
+        );
+
+        // Build a legacy tx set with previous_ledger_hash = ZERO to match the
+        // uninitialized app's header hash (bypasses the fatal pre-close hash
+        // mismatch check).
+        let tx_set =
+            henyey_herder::TransactionSet::new_legacy(henyey_common::Hash256::ZERO, vec![]);
+        let real_hash = *tx_set.hash();
+
+        // Derive a mismatched hash by flipping the first byte.
+        let mut mismatched_bytes = real_hash.as_bytes().to_owned();
+        mismatched_bytes[0] ^= 0xFF;
+        let mismatched_hash = henyey_common::Hash256::from(mismatched_bytes);
+        assert_ne!(
+            mismatched_hash, real_hash,
+            "precondition: mismatched hash must differ from real hash"
+        );
+
+        let next_seq: u32 = 1;
+
+        // Insert into syncing_ledgers with the WRONG tx_set_hash but the real tx_set.
+        {
+            let mut buffer = app.syncing_ledgers.write().await;
+            buffer.insert(
+                next_seq,
+                henyey_herder::LedgerCloseInfo {
+                    slot: next_seq as u64,
+                    tx_set_hash: mismatched_hash,
+                    tx_set: Some(tx_set),
+                    close_time: 1,
+                    upgrades: Vec::new(),
+                    stellar_value_ext: StellarValueExt::Basic,
+                },
+            );
+        }
+
+        // Act: try_start_ledger_close should detect the hash mismatch and
+        // return None.
+        let result = app.try_start_ledger_close().await;
+        assert!(
+            result.is_none(),
+            "should return None when buffered tx set hash mismatches tx_set_hash"
+        );
+
+        // Verify: entry still exists but tx_set has been cleared; tx_set_hash
+        // remains unchanged.
+        let buffer = app.syncing_ledgers.read().await;
+        let entry = buffer.get(&next_seq).expect("entry should still exist");
+        assert!(
+            entry.tx_set.is_none(),
+            "tx_set field should be cleared after hash mismatch"
+        );
+        assert_eq!(
+            entry.tx_set_hash, mismatched_hash,
+            "tx_set_hash should remain unchanged after clearing tx_set"
+        );
+    }
+
     #[tokio::test]
     async fn test_try_apply_buffered_skips_when_already_applying() {
         let dir = tempfile::tempdir().expect("temp dir");
