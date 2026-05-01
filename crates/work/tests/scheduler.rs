@@ -381,9 +381,9 @@ async fn test_cancel_then_panic() {
     assert_eq!(scheduler.state(id), Some(WorkState::Cancelled));
 }
 
-/// Regression test: normal retry still works after catch_unwind is in place.
+/// Regression test: normal retry still works with JoinSet-based panic handling.
 #[tokio::test]
-async fn test_retry_still_works_with_catch_unwind() {
+async fn test_retry_still_works_after_panic_handling() {
     let attempts = Arc::new(Mutex::new(0u32));
 
     let mut scheduler = WorkScheduler::new(WorkSchedulerConfig {
@@ -407,4 +407,40 @@ async fn test_retry_still_works_with_catch_unwind() {
     // RetryWork succeeds on second attempt
     assert_eq!(*attempts.lock().unwrap(), 2);
     assert_eq!(scheduler.state(id), Some(WorkState::Success));
+}
+
+// ============================================================================
+// Cancel-Before-Start Tests
+// ============================================================================
+
+/// Verifies that a work item cancelled before it starts reaches Cancelled
+/// without triggering panic handling.
+#[tokio::test]
+async fn test_cancelled_before_start_not_panicked() {
+    let log = Arc::new(Mutex::new(Vec::new()));
+
+    let mut scheduler = WorkScheduler::new(WorkSchedulerConfig {
+        max_concurrency: 1,
+        retry_delay: Duration::from_millis(1),
+        event_tx: None,
+    });
+
+    let id = scheduler.add_work(
+        Box::new(LogWork {
+            name: "should-not-run".to_string(),
+            log: Arc::clone(&log),
+        }),
+        vec![],
+        0,
+    );
+
+    // Cancel the work before running
+    assert!(scheduler.cancel(id));
+
+    let result = tokio::time::timeout(Duration::from_secs(2), scheduler.run_until_done()).await;
+    assert!(result.is_ok(), "scheduler hung on cancelled-before-start");
+
+    assert_eq!(scheduler.state(id), Some(WorkState::Cancelled));
+    // Work should never have run
+    assert!(log.lock().unwrap().is_empty());
 }

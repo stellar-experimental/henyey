@@ -1,19 +1,14 @@
 //! Scheduler state, metrics, and execution engine.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::panic::AssertUnwindSafe;
 use std::time::Duration;
 
-use futures::FutureExt;
-use tokio::sync::mpsc;
+use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 use crate::types::EventSender;
 use crate::{Work, WorkContext, WorkEvent, WorkId, WorkOutcome, WorkState};
-
-/// Capacity of the internal channel used for work completion notifications.
-const COMPLETION_CHANNEL_CAPACITY: usize = 128;
 
 /// Configuration for the work scheduler.
 ///
@@ -91,22 +86,23 @@ impl Default for WorkSchedulerConfig {
 ///
 /// The scheduler is modeled after the work scheduling system in stellar-core.
 /// It uses a simple ready-queue approach: work items whose dependencies have all
-/// succeeded are eligible for execution. The scheduler spawns Tokio tasks for each
-/// work item and collects completion notifications via an internal channel.
+/// succeeded are eligible for execution. The scheduler spawns Tokio tasks into a
+/// [`JoinSet`] and observes completion via `join_next()`. This guarantees every
+/// task exit (success, panic, or abort) is observed — no completion can be lost.
 ///
 /// The execution loop follows these steps:
 /// 1. Fill available concurrency slots with ready work items
-/// 2. Wait for any running work to complete
+/// 2. Wait for any running work to complete (via JoinSet)
 /// 3. Process the completion and update state accordingly
 /// 4. Repeat until no work can make progress
 ///
 /// # Ownership
 ///
-/// Work items are moved into the scheduler and remain there until the scheduler
-/// is dropped. The scheduler temporarily takes work items out during execution
-/// (setting the field to `None`) and restores them after completion. This design
-/// satisfies Rust's ownership rules while allowing stateful work items to be
-/// retried.
+/// Work items are moved into spawned tasks during execution (tracked via
+/// [`WorkSlot::InFlight`]). On successful completion, ownership is returned and
+/// the work item can be retried. On panic or task abort, the work item is
+/// permanently lost ([`WorkSlot::Lost`]) — this is safe because panics and aborts
+/// transition work to terminal states that are never re-run.
 ///
 /// # Example
 ///
@@ -226,6 +222,19 @@ pub struct WorkSchedulerMetrics {
     pub retries_left: u64,
 }
 
+/// Ownership state of a work item's implementation.
+///
+/// Makes the work item lifecycle explicit: available for execution, currently
+/// running in a spawned task, or permanently lost due to panic/abort.
+enum WorkSlot {
+    /// Work is available for execution.
+    Idle(Box<dyn Work + Send>),
+    /// Work has been moved into a spawned task.
+    InFlight,
+    /// Work was irrecoverably lost due to panic or task abort (terminal).
+    Lost,
+}
+
 /// Internal representation of a registered work item.
 struct WorkEntry {
     /// Human-readable name for logging and identification.
@@ -250,10 +259,8 @@ struct WorkEntry {
     /// Shared with the [`WorkContext`] provided to the work item during execution.
     cancel_token: CancellationToken,
 
-    /// The actual work implementation.
-    ///
-    /// `None` while the work item is executing on a spawned task.
-    work: Option<Box<dyn Work + Send>>,
+    /// The work item's ownership state.
+    work: WorkSlot,
 }
 
 impl WorkScheduler {
@@ -311,7 +318,7 @@ impl WorkScheduler {
             retries_left: retries,
             attempts: 0,
             cancel_token: CancellationToken::new(),
-            work: Some(work),
+            work: WorkSlot::Idle(work),
         };
 
         self.entries.insert(id, entry);
@@ -420,8 +427,8 @@ impl WorkScheduler {
     /// - Wait for running work items to complete (they should check for cancellation).
     /// - Return once all work has stopped.
     pub async fn run_until_done_with_cancel(&mut self, cancel: CancellationToken) {
-        let (tx, mut rx) = mpsc::channel::<WorkCompletion>(COMPLETION_CHANNEL_CAPACITY);
-        let mut running = HashSet::new();
+        let mut join_set = JoinSet::<WorkCompletion>::new();
+        let mut running = RunningTasks::new();
         let mut queue = PendingQueue::new(self.pending_queue());
 
         let mut cancel_requested = false;
@@ -436,11 +443,11 @@ impl WorkScheduler {
                 let Some(id) = queue.pop() else {
                     break;
                 };
-                if running.contains(&id) {
+                if running.contains(id) {
                     continue;
                 }
-                if self.start_work(id, &tx) {
-                    running.insert(id);
+                if self.start_work(id, &mut join_set, &mut running) {
+                    // started successfully
                 }
             }
 
@@ -448,8 +455,8 @@ impl WorkScheduler {
                 break;
             }
 
-            let completion = if cancel_requested {
-                rx.recv().await
+            let join_result = if cancel_requested {
+                join_set.join_next().await
             } else {
                 tokio::select! {
                     _ = cancel.cancelled() => {
@@ -457,23 +464,34 @@ impl WorkScheduler {
                         self.cancel_all();
                         continue;
                     }
-                    completion = rx.recv() => completion,
+                    result = join_set.join_next() => result,
                 }
             };
-            let Some(completion) = completion else {
+            let Some(join_result) = join_result else {
                 break;
             };
-            running.remove(&completion.id);
 
-            match self.handle_completion(completion) {
-                CompletionAction::Done { completed_id } => {
-                    self.enqueue_dependents(completed_id, &mut queue, &running);
+            match join_result {
+                Ok(completion) => {
+                    running.remove_by_work_id(completion.id);
+                    match self.handle_completion(completion) {
+                        CompletionAction::Done { completed_id } => {
+                            self.enqueue_dependents(completed_id, &mut queue, &running);
+                        }
+                        CompletionAction::Retry { id, delay } => {
+                            tokio::time::sleep(delay).await;
+                            queue.push(id);
+                        }
+                        CompletionAction::None => {}
+                    }
                 }
-                CompletionAction::Retry { id, delay } => {
-                    tokio::time::sleep(delay).await;
-                    queue.push(id);
+                Err(join_error) => {
+                    let task_id = join_error.id();
+                    let work_id = running
+                        .remove_by_task_id(task_id)
+                        .expect("all spawned tasks are tracked in RunningTasks");
+                    self.handle_join_error(work_id, join_error);
                 }
-                CompletionAction::None => {}
             }
         }
 
@@ -497,8 +515,13 @@ impl WorkScheduler {
         self.states.get(&id).copied().unwrap_or(WorkState::Pending)
     }
 
-    /// Starts a ready work item and spawns its execution task.
-    fn start_work(&mut self, id: WorkId, tx: &mpsc::Sender<WorkCompletion>) -> bool {
+    /// Starts a ready work item by spawning it into the JoinSet.
+    fn start_work(
+        &mut self,
+        id: WorkId,
+        join_set: &mut JoinSet<WorkCompletion>,
+        running: &mut RunningTasks,
+    ) -> bool {
         if !self.can_run(id) {
             return false;
         }
@@ -519,48 +542,34 @@ impl WorkScheduler {
 
         entry.attempts += 1;
         let attempt = entry.attempts;
-        let mut work = entry
-            .work
-            .take()
-            .expect("work should be present when starting");
+
+        // Transition Idle → InFlight. If not Idle (stale queue entry), skip.
+        let WorkSlot::Idle(mut work) = std::mem::replace(&mut entry.work, WorkSlot::InFlight)
+        else {
+            return false;
+        };
+
         let name = entry.name.clone();
-        let completion_tx = tx.clone();
         let cancel_token = entry.cancel_token.clone();
         self.transition_state(id, WorkState::Running, attempt);
 
-        tokio::spawn(async move {
+        let handle = join_set.spawn(async move {
             let ctx = WorkContext {
                 id,
                 attempt,
                 cancel_token,
             };
-            // catch_unwind wraps only the run() future. On panic, the &mut
-            // borrow on `work` is released and we can still return it in
-            // WorkCompletion. Only effective in panic=unwind builds (dev/test);
-            // in release (panic=abort), panics terminate the process.
-            let outcome = match AssertUnwindSafe(work.run(&ctx)).catch_unwind().await {
-                Ok(outcome) => outcome,
-                Err(panic) => {
-                    let msg = panic
-                        .downcast_ref::<&str>()
-                        .copied()
-                        .or_else(|| panic.downcast_ref::<String>().map(|s| s.as_str()))
-                        .unwrap_or("unknown panic");
-                    error!(work_id = id, name = %name, panic_msg = msg, "work item panicked");
-                    WorkOutcome::Failed(format!("task panicked: {msg}"))
-                }
-            };
-            let _ = completion_tx
-                .send(WorkCompletion {
-                    id,
-                    outcome,
-                    work,
-                    attempt,
-                    cancelled: ctx.is_cancelled(),
-                })
-                .await;
+            let outcome = work.run(&ctx).await;
             debug!(work_id = id, name = %name, "work completed");
+            WorkCompletion {
+                id,
+                outcome,
+                work,
+                attempt,
+                cancelled: ctx.is_cancelled(),
+            }
         });
+        running.insert(handle.id(), id);
 
         true
     }
@@ -574,13 +583,13 @@ impl WorkScheduler {
         &self,
         completed_id: WorkId,
         queue: &mut PendingQueue,
-        running: &HashSet<WorkId>,
+        running: &RunningTasks,
     ) {
         let Some(children) = self.dependents.get(&completed_id) else {
             return;
         };
         for &child in children {
-            if running.contains(&child) {
+            if running.contains(child) {
                 continue;
             }
             if self.state_or_pending(child) != WorkState::Pending {
@@ -638,13 +647,13 @@ impl WorkScheduler {
         self.block_dependents(id);
     }
 
-    /// Restores a work item after execution.
+    /// Restores a work item after successful execution.
     ///
-    /// Called after a spawned work task completes, regardless of outcome.
-    /// Moves the work implementation back into the entry (replacing `None`).
+    /// Called after a spawned work task completes without panicking.
+    /// Moves the work implementation back into the entry (replacing `InFlight`).
     fn finalize_entry(&mut self, id: WorkId, work: Box<dyn Work + Send>) {
         if let Some(entry) = self.entries.get_mut(&id) {
-            entry.work = Some(work);
+            entry.work = WorkSlot::Idle(work);
         }
     }
 
@@ -737,6 +746,44 @@ impl WorkScheduler {
             attempt,
         });
     }
+
+    /// Handles a task that exited abnormally (panic or abort) via JoinError.
+    ///
+    /// Cancellation takes precedence over panic: if the work item was already
+    /// cancelled (via `cancel_all` or direct `cancel`), it is marked Cancelled
+    /// regardless of whether the task panicked.
+    fn handle_join_error(&mut self, id: WorkId, error: tokio::task::JoinError) {
+        let attempt = self.entries.get(&id).map_or(0, |e| e.attempts);
+
+        // Cancel takes precedence over panic (preserves cancel-then-panic semantics).
+        let was_cancelled = matches!(self.states.get(&id), Some(WorkState::Cancelled))
+            || self
+                .entries
+                .get(&id)
+                .is_some_and(|e| e.cancel_token.is_cancelled());
+
+        if was_cancelled {
+            self.finish_terminal_state(id, WorkState::Cancelled, attempt);
+        } else if error.is_panic() {
+            let panic = error.into_panic();
+            let msg = panic
+                .downcast_ref::<&str>()
+                .copied()
+                .or_else(|| panic.downcast_ref::<String>().map(|s| s.as_str()))
+                .unwrap_or("unknown panic");
+            error!(work_id = id, panic_msg = msg, "work item panicked");
+            self.finish_terminal_state(id, WorkState::Failed, attempt);
+        } else {
+            // Task was aborted (JoinSet dropped during shutdown, or runtime exit).
+            warn!(work_id = id, "work task aborted");
+            self.finish_terminal_state(id, WorkState::Cancelled, attempt);
+        }
+
+        // Work item is permanently lost — it was moved into the panicked/aborted task.
+        if let Some(entry) = self.entries.get_mut(&id) {
+            entry.work = WorkSlot::Lost;
+        }
+    }
 }
 
 /// Action returned by [`WorkScheduler::handle_completion`] to direct the
@@ -751,10 +798,11 @@ enum CompletionAction {
     None,
 }
 
-/// Internal message sent when a spawned work task completes.
+/// Internal message returned by a spawned work task on successful completion.
 ///
 /// Carries all the information needed to update scheduler state after
-/// a work item finishes executing.
+/// a work item finishes executing. On panic/abort, this is not available —
+/// the scheduler uses `handle_join_error` instead.
 struct WorkCompletion {
     /// The ID of the completed work item.
     id: WorkId,
@@ -775,4 +823,55 @@ struct WorkCompletion {
     /// Used to override the outcome if the work reported success but
     /// was actually cancelled.
     cancelled: bool,
+}
+
+/// Tracks all in-flight work tasks with bidirectional lookup.
+///
+/// Provides O(1) work ID containment checks (for the spawn loop) and
+/// task ID → work ID mapping (for the JoinError path).
+struct RunningTasks {
+    /// Maps tokio task ID → work ID for panic/abort identification.
+    task_to_work: HashMap<tokio::task::Id, WorkId>,
+    /// Set of currently running work IDs for fast containment checks.
+    work_ids: HashSet<WorkId>,
+}
+
+impl RunningTasks {
+    fn new() -> Self {
+        Self {
+            task_to_work: HashMap::new(),
+            work_ids: HashSet::new(),
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.work_ids.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.work_ids.is_empty()
+    }
+
+    fn contains(&self, work_id: WorkId) -> bool {
+        self.work_ids.contains(&work_id)
+    }
+
+    fn insert(&mut self, task_id: tokio::task::Id, work_id: WorkId) {
+        self.task_to_work.insert(task_id, work_id);
+        self.work_ids.insert(work_id);
+    }
+
+    /// Remove by tokio task ID (used on JoinError path).
+    fn remove_by_task_id(&mut self, task_id: tokio::task::Id) -> Option<WorkId> {
+        let work_id = self.task_to_work.remove(&task_id)?;
+        self.work_ids.remove(&work_id);
+        Some(work_id)
+    }
+
+    /// Remove by work ID (used on successful completion path).
+    fn remove_by_work_id(&mut self, work_id: WorkId) {
+        if self.work_ids.remove(&work_id) {
+            self.task_to_work.retain(|_, v| *v != work_id);
+        }
+    }
 }
