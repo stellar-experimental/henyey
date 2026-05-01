@@ -88,7 +88,7 @@ mod result_mapping;
 mod signatures;
 mod tx_set;
 
-pub(crate) use config::{compute_soroban_resource_fee, load_soroban_network_info};
+pub(crate) use config::{compute_soroban_resource_fee, load_soroban_network_info, require_config};
 pub use config::{load_frozen_key_config, load_soroban_config};
 pub use result_mapping::build_tx_result_pair;
 pub(crate) use tx_set::pre_deduct_all_fees_on_delta;

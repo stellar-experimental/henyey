@@ -35,6 +35,31 @@ pub(crate) fn load_config_setting(
     }
 }
 
+/// Load a required config setting and extract its inner value via `extract`.
+///
+/// Errors if:
+/// - The entry doesn't exist (required in Soroban-active context)
+/// - The `LedgerEntryData` is not `ConfigSetting` (checked by `load_config_setting`)
+/// - The `ConfigSettingEntry` subtype doesn't match (`extract` returns `None`)
+///
+/// This is the function equivalent of the `load_config!` macro, usable from
+/// any module in the crate (macros are module-local).
+pub(crate) fn require_config<T>(
+    reader: &impl crate::EntryReader,
+    id: ConfigSettingId,
+    extract: impl FnOnce(ConfigSettingEntry) -> Option<T>,
+    ctx: &str,
+) -> Result<T> {
+    let cs = load_config_setting(reader, id)?.ok_or_else(|| {
+        LedgerError::Internal(format!("{ctx}: required config setting {id:?} not found"))
+    })?;
+    extract(cs).ok_or_else(|| {
+        LedgerError::Internal(format!(
+            "{ctx}: unexpected ConfigSettingEntry variant for {id:?}"
+        ))
+    })
+}
+
 /// Load a required config setting and extract a specific variant.
 ///
 /// Returns the inner value of the requested `ConfigSettingEntry` variant,
@@ -1191,6 +1216,155 @@ mod tests {
         assert!(
             err_msg.contains("unexpected variant") && err_msg.contains("ContractLedgerCostV0"),
             "Error should mention unexpected variant, got: {}",
+            err_msg
+        );
+    }
+
+    // --- Tests for require_config ---
+
+    /// require_config succeeds when the entry exists and the extract closure matches.
+    #[test]
+    fn test_require_config_happy_path() {
+        use stellar_xdr::curr::ConfigSettingContractComputeV0;
+
+        let lookup: crate::EntryLookupFn = std::sync::Arc::new(|key: &LedgerKey| {
+            if let LedgerKey::ConfigSetting(cs) = key {
+                if cs.config_setting_id == ConfigSettingId::ContractComputeV0 {
+                    return Ok(Some(make_config_entry(
+                        ConfigSettingEntry::ContractComputeV0(ConfigSettingContractComputeV0 {
+                            ledger_max_instructions: 100,
+                            tx_max_instructions: 50,
+                            fee_rate_per_instructions_increment: 10,
+                            tx_memory_limit: 1000,
+                        }),
+                    )));
+                }
+            }
+            Ok(None)
+        });
+        let snapshot = SnapshotHandle::with_lookup(LedgerSnapshot::empty(100), lookup);
+
+        let result = require_config(
+            &snapshot,
+            ConfigSettingId::ContractComputeV0,
+            |cs| {
+                if let ConfigSettingEntry::ContractComputeV0(v) = cs {
+                    Some(v)
+                } else {
+                    None
+                }
+            },
+            "test_happy_path",
+        );
+        assert!(result.is_ok(), "require_config should succeed");
+        assert_eq!(result.unwrap().ledger_max_instructions, 100);
+    }
+
+    /// require_config errors when the entry is missing entirely.
+    #[test]
+    fn test_require_config_missing_entry() {
+        let lookup: crate::EntryLookupFn = std::sync::Arc::new(|_key: &LedgerKey| Ok(None));
+        let snapshot = SnapshotHandle::with_lookup(LedgerSnapshot::empty(100), lookup);
+
+        let result = require_config(
+            &snapshot,
+            ConfigSettingId::ContractComputeV0,
+            |cs| {
+                if let ConfigSettingEntry::ContractComputeV0(v) = cs {
+                    Some(v)
+                } else {
+                    None
+                }
+            },
+            "test_missing",
+        );
+        assert!(
+            result.is_err(),
+            "require_config should error on missing entry"
+        );
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(
+            err_msg.contains("required config setting") && err_msg.contains("not found"),
+            "Error should say config not found, got: {}",
+            err_msg
+        );
+    }
+
+    /// require_config errors when the ConfigSettingEntry variant doesn't match the extractor.
+    #[test]
+    fn test_require_config_wrong_variant() {
+        use stellar_xdr::curr::ConfigSettingContractComputeV0;
+
+        // Store a ContractComputeV0 but try to extract StateArchivalSettings
+        let lookup: crate::EntryLookupFn = std::sync::Arc::new(|key: &LedgerKey| {
+            if let LedgerKey::ConfigSetting(cs) = key {
+                if cs.config_setting_id == ConfigSettingId::StateArchival {
+                    return Ok(Some(make_config_entry(
+                        ConfigSettingEntry::ContractComputeV0(ConfigSettingContractComputeV0 {
+                            ledger_max_instructions: 100,
+                            tx_max_instructions: 50,
+                            fee_rate_per_instructions_increment: 10,
+                            tx_memory_limit: 1000,
+                        }),
+                    )));
+                }
+            }
+            Ok(None)
+        });
+        let snapshot = SnapshotHandle::with_lookup(LedgerSnapshot::empty(100), lookup);
+
+        let result = require_config(
+            &snapshot,
+            ConfigSettingId::StateArchival,
+            |cs| {
+                if let ConfigSettingEntry::StateArchival(v) = cs {
+                    Some(v)
+                } else {
+                    None
+                }
+            },
+            "test_wrong_variant",
+        );
+        assert!(
+            result.is_err(),
+            "require_config should error on wrong variant"
+        );
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(
+            err_msg.contains("unexpected ConfigSettingEntry variant"),
+            "Error should mention unexpected variant, got: {}",
+            err_msg
+        );
+    }
+
+    /// require_config propagates I/O errors from the reader.
+    #[test]
+    fn test_require_config_propagates_io_error() {
+        let error_lookup: crate::EntryLookupFn = std::sync::Arc::new(|_key: &LedgerKey| {
+            Err(LedgerError::Internal("disk failure".to_string()))
+        });
+        let snapshot = SnapshotHandle::with_lookup(LedgerSnapshot::empty(100), error_lookup);
+
+        let result = require_config(
+            &snapshot,
+            ConfigSettingId::ContractComputeV0,
+            |cs| {
+                if let ConfigSettingEntry::ContractComputeV0(v) = cs {
+                    Some(v)
+                } else {
+                    None
+                }
+            },
+            "test_io_error",
+        );
+        assert!(
+            result.is_err(),
+            "require_config should propagate I/O errors"
+        );
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(
+            err_msg.contains("disk failure"),
+            "Error should contain original I/O error, got: {}",
             err_msg
         );
     }

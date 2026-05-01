@@ -44,7 +44,7 @@ use crate::{
 };
 use henyey_bucket::{
     BucketEntry, BucketEntryExt, BucketList, BucketListSnapshot, BucketMergeMap, EvictionIterator,
-    EvictionIteratorExt, EvictionResult, HotArchiveBucketList,
+    EvictionResult, HotArchiveBucketList,
 };
 use henyey_common::protocol::{
     hot_archive_supported, needs_upgrade_to_version, protocol_version_starts_from, ProtocolVersion,
@@ -905,70 +905,84 @@ fn get_from_pairs(
     Ok(None)
 }
 
-/// Build a `SorobanRentConfig` from a lookup function that retrieves ledger entries by key.
+/// Adapter: allows `BucketList` to be used with `require_config` / `load_config_setting`.
+struct BucketListReader<'a>(&'a BucketList);
+impl crate::EntryReader for BucketListReader<'_> {
+    fn get_entry(&self, key: &LedgerKey) -> Result<Option<LedgerEntry>> {
+        self.0.get(key).map_err(Into::into)
+    }
+}
+
+/// Adapter: allows pre-extracted bucket level pairs to be used with `require_config`.
+struct PairsReader<'a>(&'a [(Arc<henyey_bucket::Bucket>, Arc<henyey_bucket::Bucket>)]);
+impl crate::EntryReader for PairsReader<'_> {
+    fn get_entry(&self, key: &LedgerKey) -> Result<Option<LedgerEntry>> {
+        get_from_pairs(self.0, key).map_err(Into::into)
+    }
+}
+
+/// Build a `SorobanRentConfig` from any entry reader.
 ///
-/// Both `compute_soroban_rent_config_from_pairs` and `LedgerManager::load_soroban_rent_config`
-/// perform the same 3-key extraction; this helper centralizes that logic.
+/// All three config entries (CPU cost params, memory cost params, compute limits)
+/// are required once Soroban is active. Missing or wrong-subtype entries produce
+/// an error, matching stellar-core's `releaseAssertOrThrow` on config corruption.
 fn build_soroban_rent_config(
-    mut lookup: impl FnMut(&LedgerKey) -> Option<LedgerEntry>,
-) -> Option<crate::soroban_state::SorobanRentConfig> {
-    let cpu_key = LedgerKey::ConfigSetting(LedgerKeyConfigSetting {
-        config_setting_id: ConfigSettingId::ContractCostParamsCpuInstructions,
-    });
-    let cpu_params = lookup(&cpu_key).and_then(|e| {
-        if let LedgerEntryData::ConfigSetting(
-            ConfigSettingEntry::ContractCostParamsCpuInstructions(params),
-        ) = e.data
-        {
-            Some(params)
-        } else {
-            None
-        }
-    })?;
+    reader: &impl crate::EntryReader,
+) -> Result<crate::soroban_state::SorobanRentConfig> {
+    use crate::execution::require_config;
 
-    let mem_key = LedgerKey::ConfigSetting(LedgerKeyConfigSetting {
-        config_setting_id: ConfigSettingId::ContractCostParamsMemoryBytes,
-    });
-    let mem_params = lookup(&mem_key).and_then(|e| {
-        if let LedgerEntryData::ConfigSetting(ConfigSettingEntry::ContractCostParamsMemoryBytes(
-            params,
-        )) = e.data
-        {
-            Some(params)
-        } else {
-            None
-        }
-    })?;
+    let cpu_params = require_config(
+        reader,
+        ConfigSettingId::ContractCostParamsCpuInstructions,
+        |cs| {
+            if let ConfigSettingEntry::ContractCostParamsCpuInstructions(p) = cs {
+                Some(p)
+            } else {
+                None
+            }
+        },
+        "build_soroban_rent_config",
+    )?;
 
-    let compute_key = LedgerKey::ConfigSetting(LedgerKeyConfigSetting {
-        config_setting_id: ConfigSettingId::ContractComputeV0,
-    });
-    let (tx_max_instructions, tx_max_memory_bytes) = lookup(&compute_key).and_then(|e| {
-        if let LedgerEntryData::ConfigSetting(ConfigSettingEntry::ContractComputeV0(compute)) =
-            e.data
-        {
-            Some((
-                compute.tx_max_instructions as u64,
-                compute.tx_memory_limit as u64,
-            ))
-        } else {
-            None
-        }
-    })?;
+    let mem_params = require_config(
+        reader,
+        ConfigSettingId::ContractCostParamsMemoryBytes,
+        |cs| {
+            if let ConfigSettingEntry::ContractCostParamsMemoryBytes(p) = cs {
+                Some(p)
+            } else {
+                None
+            }
+        },
+        "build_soroban_rent_config",
+    )?;
 
-    Some(crate::soroban_state::SorobanRentConfig {
+    let compute = require_config(
+        reader,
+        ConfigSettingId::ContractComputeV0,
+        |cs| {
+            if let ConfigSettingEntry::ContractComputeV0(c) = cs {
+                Some(c)
+            } else {
+                None
+            }
+        },
+        "build_soroban_rent_config",
+    )?;
+
+    Ok(crate::soroban_state::SorobanRentConfig {
         cpu_cost_params: cpu_params,
         mem_cost_params: mem_params,
-        tx_max_instructions,
-        tx_max_memory_bytes,
+        tx_max_instructions: compute.tx_max_instructions as u64,
+        tx_max_memory_bytes: compute.tx_memory_limit as u64,
     })
 }
 
 /// Compute Soroban rent config from pre-extracted bucket level pairs via point lookups.
 fn compute_soroban_rent_config_from_pairs(
     level_pairs: &[(Arc<henyey_bucket::Bucket>, Arc<henyey_bucket::Bucket>)],
-) -> Option<crate::soroban_state::SorobanRentConfig> {
-    build_soroban_rent_config(|key| get_from_pairs(level_pairs, key).ok().flatten())
+) -> Result<crate::soroban_state::SorobanRentConfig> {
+    build_soroban_rent_config(&PairsReader(level_pairs))
 }
 
 /// Scan a set of bucket level pairs and extract all cache data.
@@ -1003,7 +1017,7 @@ pub fn scan_level_pairs_for_caches(
     // caller's thread context — for the startup path it runs inside spawn_blocking,
     // keeping the tokio thread unblocked.
     let rent_config = if soroban_enabled {
-        compute_soroban_rent_config_from_pairs(&level_pairs)
+        Some(compute_soroban_rent_config_from_pairs(&level_pairs)?)
     } else {
         None
     };
@@ -1034,24 +1048,21 @@ pub fn scan_level_pairs_for_caches(
 /// Load the EvictionIterator from the bucket list's ConfigSettingEntry.
 ///
 /// The EvictionIterator tracks where the incremental eviction scan is positioned.
-/// Returns `None` if no EvictionIterator entry exists (pre-protocol 23).
-fn load_eviction_iterator_from_bucket_list(bucket_list: &BucketList) -> Option<EvictionIterator> {
-    let key = LedgerKey::ConfigSetting(LedgerKeyConfigSetting {
-        config_setting_id: ConfigSettingId::EvictionIterator,
-    });
-
-    match bucket_list.get(&key) {
-        Ok(Some(entry)) => {
-            if let LedgerEntryData::ConfigSetting(ConfigSettingEntry::EvictionIterator(iter)) =
-                entry.data
-            {
+/// Created at protocol V20; errors if missing or wrong type (data corruption).
+fn load_eviction_iterator_from_bucket_list(bucket_list: &BucketList) -> Result<EvictionIterator> {
+    use crate::execution::require_config;
+    require_config(
+        &BucketListReader(bucket_list),
+        ConfigSettingId::EvictionIterator,
+        |cs| {
+            if let ConfigSettingEntry::EvictionIterator(iter) = cs {
                 Some(iter)
             } else {
                 None
             }
-        }
-        _ => None,
-    }
+        },
+        "load_eviction_iterator_from_bucket_list",
+    )
 }
 
 /// Configuration options for the [`LedgerManager`].
@@ -1414,7 +1425,7 @@ impl LedgerManager {
     pub fn set_header_for_test(&self, header: LedgerHeader, header_hash: Hash256) {
         // Recompute from the current bucket-list state before acquiring the
         // write lock so publication is atomic.
-        let info = self.compute_soroban_info();
+        let info = self.compute_soroban_info().ok().flatten();
         let mut state = self.state.write();
         state.header = header;
         state.header_hash = header_hash;
@@ -1604,7 +1615,7 @@ impl LedgerManager {
         self.initialize_all_caches(protocol_version, 0)?;
 
         // Eagerly compute and cache Soroban network info from the initialized state.
-        self.state.write().soroban_network_info = self.compute_soroban_info();
+        self.state.write().soroban_network_info = self.compute_soroban_info()?;
 
         info!(
             ledger_seq = self.state.read().header.ledger_seq,
@@ -1660,7 +1671,7 @@ impl LedgerManager {
         crate::memory_report::log_startup_memory("after_cache_install");
 
         // Eagerly compute and cache Soroban network info from the initialized state.
-        self.state.write().soroban_network_info = self.compute_soroban_info();
+        self.state.write().soroban_network_info = self.compute_soroban_info()?;
 
         info!(
             ledger_seq = self.state.read().header.ledger_seq,
@@ -1785,8 +1796,8 @@ impl LedgerManager {
     fn load_soroban_rent_config(
         &self,
         bucket_list: &BucketList,
-    ) -> Option<crate::soroban_state::SorobanRentConfig> {
-        build_soroban_rent_config(|key| bucket_list.get(key).ok().flatten())
+    ) -> Result<crate::soroban_state::SorobanRentConfig> {
+        build_soroban_rent_config(&BucketListReader(bucket_list))
     }
 
     /// Initialize all caches from the bucket list using a single-pass scan.
@@ -2319,7 +2330,7 @@ impl LedgerManager {
         // Eagerly recompute Soroban network info from the committed bucket-list state.
         // Computed BEFORE acquiring the state write lock so readers never see a new
         // header paired with stale cached info.
-        let soroban_info = self.compute_soroban_info();
+        let soroban_info = self.compute_soroban_info()?;
 
         // Publish header, hash, and derived Soroban info atomically.
         {
@@ -2525,15 +2536,12 @@ impl LedgerManager {
     /// called once per ledger close (on the blocking thread) and once during
     /// initialization. All subsequent reads go through the cached field in
     /// `LedgerState`.
-    fn compute_soroban_info(&self) -> Option<SorobanNetworkInfo> {
-        let snapshot = self.create_snapshot().ok()?;
-        match load_soroban_network_info(&snapshot) {
-            Ok(info) => info,
-            Err(e) => {
-                tracing::warn!(error = ?e, "Failed to compute Soroban network info");
-                None
-            }
-        }
+    ///
+    /// Returns `Ok(None)` for pre-Soroban state (entries don't exist yet).
+    /// Returns `Err` on data corruption (wrong types, IO errors).
+    fn compute_soroban_info(&self) -> Result<Option<SorobanNetworkInfo>> {
+        let snapshot = self.create_snapshot()?;
+        load_soroban_network_info(&snapshot)
     }
 
     /// Set Soroban network info directly (for testing only).
@@ -2716,18 +2724,21 @@ impl LedgerCloseContext<'_> {
     /// Parity: In stellar-core, the eviction scan runs after config upgrades are applied to the
     /// LedgerTxn, so it sees the upgraded StateArchival settings. CloseLedgerState's read path
     /// (current delta → snapshot) provides this automatically.
-    fn load_state_archival_settings(&self) -> Option<StateArchivalSettings> {
-        let key = LedgerKey::ConfigSetting(LedgerKeyConfigSetting {
-            config_setting_id: ConfigSettingId::StateArchival,
-        });
-        let entry = self.ltx.get_entry(&key).ok()??;
-        if let LedgerEntryData::ConfigSetting(ConfigSettingEntry::StateArchival(settings)) =
-            entry.data
-        {
-            Some(settings)
-        } else {
-            None
-        }
+    ///
+    /// Created at protocol V20; errors if missing or wrong type (data corruption).
+    fn load_state_archival_settings(&self) -> Result<StateArchivalSettings> {
+        crate::execution::require_config(
+            &self.ltx,
+            ConfigSettingId::StateArchival,
+            |cs| {
+                if let ConfigSettingEntry::StateArchival(settings) = cs {
+                    Some(settings)
+                } else {
+                    None
+                }
+            },
+            "load_state_archival_settings",
+        )
     }
 
     /// Create the initial Soroban configuration entries for protocol v20.
@@ -3627,68 +3638,6 @@ impl LedgerCloseContext<'_> {
         Ok(())
     }
 
-    /// Load Soroban rent config from the delta (for upgraded values) falling back to snapshot.
-    ///
-    /// This is used during config upgrades where the new cost params are in the delta
-    /// but haven't been applied to the bucket list yet.
-    /// Parity: stellar-core loads from LedgerTxn which reflects the just-applied upgrades.
-    fn load_rent_config_from_delta_or_snapshot(
-        &self,
-    ) -> Option<crate::soroban_state::SorobanRentConfig> {
-        let cpu_key = LedgerKey::ConfigSetting(LedgerKeyConfigSetting {
-            config_setting_id: ConfigSettingId::ContractCostParamsCpuInstructions,
-        });
-        let cpu_params = self.load_entry(&cpu_key).ok()?.and_then(|e| {
-            if let LedgerEntryData::ConfigSetting(
-                ConfigSettingEntry::ContractCostParamsCpuInstructions(params),
-            ) = e.data
-            {
-                Some(params)
-            } else {
-                None
-            }
-        })?;
-
-        let mem_key = LedgerKey::ConfigSetting(LedgerKeyConfigSetting {
-            config_setting_id: ConfigSettingId::ContractCostParamsMemoryBytes,
-        });
-        let mem_params = self.load_entry(&mem_key).ok()?.and_then(|e| {
-            if let LedgerEntryData::ConfigSetting(
-                ConfigSettingEntry::ContractCostParamsMemoryBytes(params),
-            ) = e.data
-            {
-                Some(params)
-            } else {
-                None
-            }
-        })?;
-
-        let compute_key = LedgerKey::ConfigSetting(LedgerKeyConfigSetting {
-            config_setting_id: ConfigSettingId::ContractComputeV0,
-        });
-        let (tx_max_instructions, tx_max_memory_bytes) =
-            self.load_entry(&compute_key).ok()?.and_then(|e| {
-                if let LedgerEntryData::ConfigSetting(ConfigSettingEntry::ContractComputeV0(
-                    compute,
-                )) = e.data
-                {
-                    Some((
-                        compute.tx_max_instructions as u64,
-                        compute.tx_memory_limit as u64,
-                    ))
-                } else {
-                    None
-                }
-            })?;
-
-        Some(crate::soroban_state::SorobanRentConfig {
-            cpu_cost_params: cpu_params,
-            mem_cost_params: mem_params,
-            tx_max_instructions,
-            tx_max_memory_bytes,
-        })
-    }
-
     /// Apply transactions from the transaction set.
     ///
     /// This executes all transactions in order, recording state changes
@@ -4335,7 +4284,7 @@ impl LedgerCloseContext<'_> {
             && protocol_version >= henyey_common::MIN_SOROBAN_PROTOCOL_VERSION
         {
             // Load rent config through CloseLedgerState (sees post-upgrade values).
-            let rent_config = self.load_rent_config_from_delta_or_snapshot();
+            let rent_config = build_soroban_rent_config(&self.ltx)?;
 
             // Recompute contract code sizes with new cost params
             {
@@ -4344,7 +4293,7 @@ impl LedgerCloseContext<'_> {
                 let data_size_before = soroban_state.contract_data_state_size();
                 let code_count = soroban_state.contract_code_count();
                 let data_count = soroban_state.contract_data_count();
-                soroban_state.recompute_contract_code_sizes(protocol_version, rent_config.as_ref());
+                soroban_state.recompute_contract_code_sizes(protocol_version, Some(&rent_config));
                 tracing::info!(
                     ledger_seq = self.close_data.ledger_seq,
                     code_size_before = code_size_before,
@@ -4353,7 +4302,7 @@ impl LedgerCloseContext<'_> {
                     code_count = code_count,
                     data_count = data_count,
                     total_size = soroban_state.total_size(),
-                    has_rent_config = rent_config.is_some(),
+                    has_rent_config = true,
                     "Recomputed contract code sizes"
                 );
             }
@@ -4371,47 +4320,47 @@ impl LedgerCloseContext<'_> {
 
                 // Read the window through CloseLedgerState (may have been resized by config upgrade).
                 // Parity: stellar-core reads from LedgerTxn which includes prior modifications.
-                let (window_vec_base, previous_entry) = match self.ltx.get_entry(&window_key)? {
-                    Some(entry) => {
-                        if let stellar_xdr::curr::LedgerEntryData::ConfigSetting(
-                            stellar_xdr::curr::ConfigSettingEntry::LiveSorobanStateSizeWindow(
-                                ref w,
-                            ),
-                        ) = entry.data
-                        {
-                            (Some(w.iter().copied().collect::<Vec<u64>>()), Some(entry))
-                        } else {
-                            (None, None)
-                        }
-                    }
-                    None => (None, None),
-                };
-
-                if let (Some(mut window_vec), Some(prev)) = (window_vec_base, previous_entry) {
-                    for size in &mut window_vec {
-                        *size = new_size;
-                    }
-                    let new_window: stellar_xdr::curr::VecM<u64> =
-                        window_vec.try_into().map_err(|_| {
-                            LedgerError::Internal("Failed to convert window vec".to_string())
-                        })?;
-                    let new_window_entry = stellar_xdr::curr::LedgerEntry {
-                        last_modified_ledger_seq: self.close_data.ledger_seq,
-                        data: stellar_xdr::curr::LedgerEntryData::ConfigSetting(
-                            stellar_xdr::curr::ConfigSettingEntry::LiveSorobanStateSizeWindow(
-                                new_window,
-                            ),
-                        ),
-                        ext: stellar_xdr::curr::LedgerEntryExt::V0,
+                // Created at V20; missing/wrong type here is data corruption.
+                let previous_entry = self.ltx.get_entry(&window_key)?.ok_or_else(|| {
+                    LedgerError::Internal(
+                        "LiveSorobanStateSizeWindow not found during state size update".to_string(),
+                    )
+                })?;
+                let mut window_vec: Vec<u64> =
+                    if let stellar_xdr::curr::LedgerEntryData::ConfigSetting(
+                        stellar_xdr::curr::ConfigSettingEntry::LiveSorobanStateSizeWindow(ref w),
+                    ) = previous_entry.data
+                    {
+                        w.iter().copied().collect()
+                    } else {
+                        return Err(LedgerError::Internal(
+                            "LiveSorobanStateSizeWindow has unexpected entry type".to_string(),
+                        ));
                     };
-                    self.ltx.record_update(prev, new_window_entry)?;
-                    tracing::info!(
-                        ledger_seq = self.close_data.ledger_seq,
-                        new_size = new_size,
-                        delta_count = self.ltx.num_changes(),
-                        "Updated all state size window entries due to memory cost params upgrade"
-                    );
+
+                for size in &mut window_vec {
+                    *size = new_size;
                 }
+                let new_window: stellar_xdr::curr::VecM<u64> =
+                    window_vec.try_into().map_err(|_| {
+                        LedgerError::Internal("Failed to convert window vec".to_string())
+                    })?;
+                let new_window_entry = stellar_xdr::curr::LedgerEntry {
+                    last_modified_ledger_seq: self.close_data.ledger_seq,
+                    data: stellar_xdr::curr::LedgerEntryData::ConfigSetting(
+                        stellar_xdr::curr::ConfigSettingEntry::LiveSorobanStateSizeWindow(
+                            new_window,
+                        ),
+                    ),
+                    ext: stellar_xdr::curr::LedgerEntryExt::V0,
+                };
+                self.ltx.record_update(previous_entry, new_window_entry)?;
+                tracing::info!(
+                    ledger_seq = self.close_data.ledger_seq,
+                    new_size = new_size,
+                    delta_count = self.ltx.num_changes(),
+                    "Updated all state size window entries due to memory cost params upgrade"
+                );
             }
         }
 
@@ -4622,11 +4571,9 @@ impl LedgerCloseContext<'_> {
         // config-entry upgrades may have changed rent fee parameters. The refreshed
         // value is used in LedgerCloseMetaExtV1.sorobanFeeWrite1KB.
         if protocol_version_starts_from(self.prev_header.ledger_version, ProtocolVersion::V20) {
-            if let Ok(post_upgrade_config) =
-                crate::execution::load_soroban_config(&self.ltx, protocol_version)
-            {
-                self.soroban_fee_write_1kb = post_upgrade_config.rent_fee_config.fee_per_write_1kb;
-            }
+            let post_upgrade_config =
+                crate::execution::load_soroban_config(&self.ltx, protocol_version)?;
+            self.soroban_fee_write_1kb = post_upgrade_config.rent_fee_config.fee_per_write_1kb;
         }
 
         tracing::debug!(
@@ -4649,7 +4596,7 @@ impl LedgerCloseContext<'_> {
                 ledger_seq = self.close_data.ledger_seq,
                 "Loading state archival settings"
             );
-            let settings = self.load_state_archival_settings().unwrap_or_default();
+            let settings = self.load_state_archival_settings()?;
             tracing::debug!(
                 ledger_seq = self.close_data.ledger_seq,
                 "Loaded state archival settings"
@@ -4835,18 +4782,7 @@ impl LedgerCloseContext<'_> {
                             Some(result) => result,
                             None => {
                                 // Inline fallback: load iterator and scan synchronously
-                                let iter = load_eviction_iterator_from_bucket_list(&bucket_list)
-                                    .unwrap_or_else(|| {
-                                        tracing::debug!(
-                                            ledger_seq = self.close_data.ledger_seq,
-                                            starting_level =
-                                                eviction_settings.starting_eviction_scan_level,
-                                            "Creating new EvictionIterator (no entry found)"
-                                        );
-                                        EvictionIterator::new(
-                                            eviction_settings.starting_eviction_scan_level,
-                                        )
-                                    });
+                                let iter = load_eviction_iterator_from_bucket_list(&bucket_list)?;
                                 bucket_list
                                     .scan_for_eviction_incremental(
                                         iter,
@@ -4997,7 +4933,7 @@ impl LedgerCloseContext<'_> {
             // in-memory Soroban state update via this path does NOT run.
             if prev_version >= henyey_common::MIN_SOROBAN_PROTOCOL_VERSION {
                 // Load rent config for accurate code size calculation
-                let rent_config = self.manager.load_soroban_rent_config(&bucket_list);
+                let rent_config = self.manager.load_soroban_rent_config(&bucket_list)?;
                 let mut soroban_state = self.manager.soroban_state.write();
 
                 // Process init entries (creates).
@@ -5009,13 +4945,13 @@ impl LedgerCloseContext<'_> {
                 // causing spurious EntryArchived errors on subsequent ledgers.
                 for entry in &init_entries {
                     if soroban_state
-                        .process_entry_create(entry, protocol_version, rent_config.as_ref())
+                        .process_entry_create(entry, protocol_version, Some(&rent_config))
                         .is_err()
                     {
                         if let Err(e) = soroban_state.process_entry_update(
                             entry,
                             protocol_version,
-                            rent_config.as_ref(),
+                            Some(&rent_config),
                         ) {
                             tracing::trace!(error = %e, "Failed to process init entry in soroban state");
                         }
@@ -5027,7 +4963,7 @@ impl LedgerCloseContext<'_> {
                     if let Err(e) = soroban_state.process_entry_update(
                         entry,
                         protocol_version,
-                        rent_config.as_ref(),
+                        Some(&rent_config),
                     ) {
                         tracing::trace!(error = %e, "Failed to process live entry in soroban state");
                     }
@@ -5258,15 +5194,14 @@ impl LedgerCloseContext<'_> {
             // Gate on prev_version (initialLedgerVers) to match stellar-core.
             let bg_eviction_data =
                 if protocol_version_starts_from(prev_version, ProtocolVersion::V23) {
-                    eviction_settings.map(|settings| {
+                    if let Some(settings) = eviction_settings {
                         let snapshot =
                             BucketListSnapshot::new(&bucket_list, self.prev_header.clone());
-                        let iter = load_eviction_iterator_from_bucket_list(&bucket_list)
-                            .unwrap_or_else(|| {
-                                EvictionIterator::new(settings.starting_eviction_scan_level)
-                            });
-                        (snapshot, iter, settings)
-                    })
+                        let iter = load_eviction_iterator_from_bucket_list(&bucket_list)?;
+                        Some((snapshot, iter, settings))
+                    } else {
+                        None
+                    }
                 } else {
                     None
                 };
@@ -5444,27 +5379,25 @@ impl LedgerCloseContext<'_> {
         let avg_soroban_state_size = if prev_version >= henyey_common::MIN_SOROBAN_PROTOCOL_VERSION
         {
             let bl = self.manager.bucket_list.read();
-            let window_key = LedgerKey::ConfigSetting(LedgerKeyConfigSetting {
-                config_setting_id: ConfigSettingId::LiveSorobanStateSizeWindow,
-            });
-            bl.get(&window_key)
-                .ok()
-                .flatten()
-                .and_then(|entry| {
-                    if let LedgerEntryData::ConfigSetting(
-                        ConfigSettingEntry::LiveSorobanStateSizeWindow(window),
-                    ) = &entry.data
-                    {
-                        if window.is_empty() {
-                            return Some(0u64);
-                        }
-                        let sum: u64 = window.iter().copied().sum();
-                        Some(sum / window.len() as u64)
+            let window: VecM<u64> = crate::execution::require_config(
+                &BucketListReader(&bl),
+                ConfigSettingId::LiveSorobanStateSizeWindow,
+                |cs| {
+                    if let ConfigSettingEntry::LiveSorobanStateSizeWindow(w) = cs {
+                        Some(w)
                     } else {
                         None
                     }
-                })
-                .unwrap_or(0)
+                },
+                "avg_soroban_state_size",
+            )?;
+            if window.is_empty() {
+                return Err(LedgerError::Internal(
+                    "LiveSorobanStateSizeWindow is empty".to_string(),
+                ));
+            }
+            let sum: u64 = window.iter().copied().sum();
+            sum / window.len() as u64
         } else {
             0
         };
@@ -5675,6 +5608,7 @@ fn create_genesis_header() -> LedgerHeader {
 mod tests {
     use super::*;
     use crate::delta::LedgerDelta;
+    use henyey_bucket::EvictionIteratorExt;
     use stellar_xdr::curr::{
         Asset, ContractDataDurability, ContractDataEntry, ContractId, ExtensionPoint,
         LedgerScpMessages, OfferEntry, OfferEntryExt, Price, ScAddress, ScVal, ScpHistoryEntry,
@@ -5736,19 +5670,142 @@ mod tests {
         }
     }
 
+    /// Add all required Soroban ConfigSettingEntry values (V20 initial set).
+    /// This satisfies both `build_soroban_rent_config` (3 settings) and
+    /// `load_soroban_network_info` (13 settings) so tests at protocol >= 20
+    /// don't error from `require_config` rejecting missing settings.
+    fn add_required_config_settings(bl: &mut BucketList) {
+        use stellar_xdr::curr::{
+            ConfigSettingContractBandwidthV0, ConfigSettingContractComputeV0,
+            ConfigSettingContractEventsV0, ConfigSettingContractExecutionLanesV0,
+            ConfigSettingContractHistoricalDataV0, ConfigSettingContractLedgerCostV0,
+            ContractCostParamEntry, ContractCostParams, StateArchivalSettings,
+        };
+        let make = |setting: ConfigSettingEntry| LedgerEntry {
+            last_modified_ledger_seq: 1,
+            data: LedgerEntryData::ConfigSetting(setting),
+            ext: LedgerEntryExt::V0,
+        };
+        let cost_param = ContractCostParamEntry {
+            ext: ExtensionPoint::V0,
+            const_term: 0,
+            linear_term: 0,
+        };
+        let cost_params = ContractCostParams(vec![cost_param.clone()].try_into().unwrap());
+        let entries = vec![
+            make(ConfigSettingEntry::ContractMaxSizeBytes(2_000)),
+            make(ConfigSettingEntry::ContractDataKeySizeBytes(200)),
+            make(ConfigSettingEntry::ContractDataEntrySizeBytes(2_000)),
+            make(ConfigSettingEntry::ContractComputeV0(
+                ConfigSettingContractComputeV0 {
+                    ledger_max_instructions: 2_500_000,
+                    tx_max_instructions: 2_500_000,
+                    fee_rate_per_instructions_increment: 100,
+                    tx_memory_limit: 2_000_000,
+                },
+            )),
+            make(ConfigSettingEntry::ContractLedgerCostV0(
+                ConfigSettingContractLedgerCostV0 {
+                    ledger_max_disk_read_entries: 3,
+                    ledger_max_disk_read_bytes: 3_200,
+                    ledger_max_write_ledger_entries: 2,
+                    ledger_max_write_bytes: 3_200,
+                    tx_max_disk_read_entries: 3,
+                    tx_max_disk_read_bytes: 3_200,
+                    tx_max_write_ledger_entries: 2,
+                    tx_max_write_bytes: 3_200,
+                    fee_disk_read_ledger_entry: 5_000,
+                    fee_write_ledger_entry: 20_000,
+                    fee_disk_read1_kb: 1_000,
+                    soroban_state_target_size_bytes: 1_000_000,
+                    rent_fee1_kb_soroban_state_size_low: 1_000,
+                    rent_fee1_kb_soroban_state_size_high: 10_000,
+                    soroban_state_rent_fee_growth_factor: 1,
+                },
+            )),
+            make(ConfigSettingEntry::ContractHistoricalDataV0(
+                ConfigSettingContractHistoricalDataV0 {
+                    fee_historical1_kb: 100,
+                },
+            )),
+            make(ConfigSettingEntry::ContractEventsV0(
+                ConfigSettingContractEventsV0 {
+                    tx_max_contract_events_size_bytes: 200,
+                    fee_contract_events1_kb: 200,
+                },
+            )),
+            make(ConfigSettingEntry::ContractBandwidthV0(
+                ConfigSettingContractBandwidthV0 {
+                    ledger_max_txs_size_bytes: 10_000,
+                    tx_max_size_bytes: 10_000,
+                    fee_tx_size1_kb: 2_000,
+                },
+            )),
+            make(ConfigSettingEntry::ContractExecutionLanes(
+                ConfigSettingContractExecutionLanesV0 {
+                    ledger_max_tx_count: 1,
+                },
+            )),
+            make(ConfigSettingEntry::ContractCostParamsCpuInstructions(
+                cost_params.clone(),
+            )),
+            make(ConfigSettingEntry::ContractCostParamsMemoryBytes(
+                cost_params,
+            )),
+            make(ConfigSettingEntry::StateArchival(StateArchivalSettings {
+                max_entry_ttl: 1_054_080,
+                min_persistent_ttl: 4_096,
+                min_temporary_ttl: 16,
+                persistent_rent_rate_denominator: 252_480,
+                temp_rent_rate_denominator: 2_524_800,
+                max_entries_to_archive: 100,
+                live_soroban_state_size_window_sample_size: 30,
+                live_soroban_state_size_window_sample_period: 64,
+                eviction_scan_size: 100_000,
+                starting_eviction_scan_level: 6,
+            })),
+            make(ConfigSettingEntry::LiveSorobanStateSizeWindow(
+                vec![0u64; 30].try_into().unwrap(),
+            )),
+            make(ConfigSettingEntry::EvictionIterator(EvictionIterator {
+                bucket_list_level: 6,
+                is_curr_bucket: true,
+                bucket_file_offset: 0,
+            })),
+        ];
+        bl.add_batch(
+            1,
+            TEST_PROTOCOL,
+            BucketListType::Live,
+            entries,
+            vec![],
+            vec![],
+        )
+        .unwrap();
+    }
+
+    /// Create a new BucketList pre-populated with the required Soroban config
+    /// settings, so scans at `TEST_PROTOCOL` (>= 20) succeed.
+    fn new_bl_with_config() -> BucketList {
+        let mut bl = BucketList::new();
+        add_required_config_settings(&mut bl);
+        bl
+    }
+
     // ---- Parallel scan tests ----
 
     #[test]
     fn test_scan_empty_bucket_list() {
-        let bl = BucketList::new();
+        let bl = new_bl_with_config();
         let result = scan_bucket_list_for_caches(&bl, TEST_PROTOCOL, 2).unwrap();
         assert!(result.offers.is_empty());
-        assert!(result.soroban_state.is_empty());
+        assert_eq!(result.soroban_state.contract_data_count(), 0);
+        assert_eq!(result.soroban_state.contract_code_count(), 0);
     }
 
     #[test]
     fn test_scan_offers_from_bucket_list() {
-        let mut bl = BucketList::new();
+        let mut bl = new_bl_with_config();
         let offer1 = make_offer_entry(1, [1u8; 32]);
         let offer2 = make_offer_entry(2, [2u8; 32]);
         bl.add_batch(
@@ -5769,7 +5826,7 @@ mod tests {
 
     #[test]
     fn test_scan_contract_data_from_bucket_list() {
-        let mut bl = BucketList::new();
+        let mut bl = new_bl_with_config();
         let cd1 = make_contract_data_entry([10u8; 32]);
         let cd2 = make_contract_data_entry([20u8; 32]);
         bl.add_batch(
@@ -5788,7 +5845,7 @@ mod tests {
 
     #[test]
     fn test_scan_ttl_entries_from_bucket_list() {
-        let mut bl = BucketList::new();
+        let mut bl = new_bl_with_config();
         let ttl = make_ttl_entry([30u8; 32], 1000);
         bl.add_batch(
             1,
@@ -5808,7 +5865,7 @@ mod tests {
 
     #[test]
     fn test_scan_mixed_entry_types() {
-        let mut bl = BucketList::new();
+        let mut bl = new_bl_with_config();
         let offer = make_offer_entry(42, [1u8; 32]);
         let cd = make_contract_data_entry([10u8; 32]);
         let ttl = make_ttl_entry([30u8; 32], 500);
@@ -5833,7 +5890,7 @@ mod tests {
     async fn test_scan_dead_entries_shadow() {
         // Add an offer, then delete it in a later ledger.
         // The dead entry should shadow the live one.
-        let mut bl = BucketList::new();
+        let mut bl = new_bl_with_config();
         let offer = make_offer_entry(99, [5u8; 32]);
         bl.add_batch(
             1,
@@ -5870,7 +5927,7 @@ mod tests {
     async fn test_scan_newer_level_shadows_older() {
         // Add entries at different ledgers so they end up at different levels.
         // Lower-numbered levels (newer data) should shadow higher ones.
-        let mut bl = BucketList::new();
+        let mut bl = new_bl_with_config();
 
         // Add offer at ledger 1 (will be in a higher level after more adds)
         let old_offer = make_offer_entry(1, [1u8; 32]);
@@ -5912,7 +5969,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn test_scan_many_entries_across_levels() {
         // Add enough entries across multiple ledgers to populate several levels.
-        let mut bl = BucketList::new();
+        let mut bl = new_bl_with_config();
         let num_offers = 50;
         for i in 0..num_offers {
             let offer = make_offer_entry(i as i64, {
@@ -6122,7 +6179,7 @@ mod tests {
 
     #[test]
     fn test_scan_offer_secondary_index() {
-        let mut bl = BucketList::new();
+        let mut bl = new_bl_with_config();
         let seller_bytes = [7u8; 32];
         let offer = make_offer_entry(10, seller_bytes);
         bl.add_batch(
@@ -6144,7 +6201,7 @@ mod tests {
     async fn test_scan_thread_count_1_matches_thread_count_2() {
         // Verify that scan_thread_count=1 (sequential) and scan_thread_count=2 (parallel)
         // produce identical results for a bucket list with entries across multiple levels.
-        let mut bl = BucketList::new();
+        let mut bl = new_bl_with_config();
         let num_offers = 20;
         for i in 0..num_offers {
             let offer = make_offer_entry(i as i64, {
@@ -6183,7 +6240,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn test_scan_dead_entries_shadow_with_thread_count_1() {
         // Dead-key shadowing test with scan_thread_count=1 (exercises the sequential path).
-        let mut bl = BucketList::new();
+        let mut bl = new_bl_with_config();
         let offer = make_offer_entry(77, [7u8; 32]);
         bl.add_batch(
             1,
@@ -6220,7 +6277,7 @@ mod tests {
     async fn test_scan_level_pairs_for_caches_matches_scan_bucket_list() {
         // scan_level_pairs_for_caches (used by the overlapped startup path) must
         // produce results identical to scan_bucket_list_for_caches for the same data.
-        let mut bl = BucketList::new();
+        let mut bl = new_bl_with_config();
 
         // Populate with offers and contract data across multiple ledgers so
         // entries end up at different levels.
@@ -6274,15 +6331,16 @@ mod tests {
 
     #[test]
     fn test_streaming_scan_empty_bucket_list() {
-        let bl = BucketList::new();
+        let bl = new_bl_with_config();
         let result = scan_bucket_list_for_caches(&bl, TEST_PROTOCOL, 1).unwrap();
         assert!(result.offers.is_empty());
-        assert!(result.soroban_state.is_empty());
+        assert_eq!(result.soroban_state.contract_data_count(), 0);
+        assert_eq!(result.soroban_state.contract_code_count(), 0);
     }
 
     #[test]
     fn test_streaming_scan_offers() {
-        let mut bl = BucketList::new();
+        let mut bl = new_bl_with_config();
         let offer1 = make_offer_entry(1, [1u8; 32]);
         let offer2 = make_offer_entry(2, [2u8; 32]);
         bl.add_batch(
@@ -6303,7 +6361,7 @@ mod tests {
 
     #[test]
     fn test_streaming_scan_contract_data() {
-        let mut bl = BucketList::new();
+        let mut bl = new_bl_with_config();
         let cd1 = make_contract_data_entry([10u8; 32]);
         let cd2 = make_contract_data_entry([20u8; 32]);
         bl.add_batch(
@@ -6322,7 +6380,7 @@ mod tests {
 
     #[test]
     fn test_streaming_scan_ttl_entries() {
-        let mut bl = BucketList::new();
+        let mut bl = new_bl_with_config();
         // Add contract data entries with corresponding TTLs
         let cd1 = make_contract_data_entry([30u8; 32]);
         let cd2 = make_contract_data_entry([31u8; 32]);
@@ -6346,7 +6404,7 @@ mod tests {
 
     #[test]
     fn test_streaming_scan_mixed_types() {
-        let mut bl = BucketList::new();
+        let mut bl = new_bl_with_config();
         let offer = make_offer_entry(1, [1u8; 32]);
         let cd = make_contract_data_entry([10u8; 32]);
         let ttl = make_ttl_entry([30u8; 32], 1000);
@@ -6371,7 +6429,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_streaming_dead_entry_shadows_live() {
-        let mut bl = BucketList::new();
+        let mut bl = new_bl_with_config();
         // Add an offer at ledger 1
         let offer = make_offer_entry(1, [1u8; 32]);
         bl.add_batch(
@@ -6407,7 +6465,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_streaming_newer_level_shadows_older() {
-        let mut bl = BucketList::new();
+        let mut bl = new_bl_with_config();
         // Add offer at ledger 1 (will end up at a higher/older level after merges)
         let offer_v1 = make_offer_entry(1, [1u8; 32]);
         bl.add_batch(
@@ -6446,7 +6504,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_streaming_many_entries_across_levels() {
-        let mut bl = BucketList::new();
+        let mut bl = new_bl_with_config();
         for i in 1u32..=20 {
             let offer = make_offer_entry(i as i64, [i as u8; 32]);
             bl.add_batch(
@@ -6491,7 +6549,7 @@ mod tests {
     async fn test_streaming_intra_level_dedup() {
         // Within a single level, curr shadows snap. If the same key appears
         // in both curr and snap, only the curr version should be kept.
-        let mut bl = BucketList::new();
+        let mut bl = new_bl_with_config();
         // Add offer at ledger 1 (goes into snap after ledger 2 closes)
         let offer_v1 = make_offer_entry(1, [1u8; 32]);
         bl.add_batch(
@@ -6534,7 +6592,7 @@ mod tests {
     async fn test_streaming_cross_level_dedup() {
         // If the same key appears in different levels, the lower-numbered
         // (newer) level should win.
-        let mut bl = BucketList::new();
+        let mut bl = new_bl_with_config();
         // Create offer at ledger 1
         let offer_v1 = make_offer_entry(1, [1u8; 32]);
         bl.add_batch(
@@ -6579,7 +6637,7 @@ mod tests {
 
     #[test]
     fn test_streaming_pool_share_trustline_indexing() {
-        let mut bl = BucketList::new();
+        let mut bl = new_bl_with_config();
         let pool_hash = stellar_xdr::curr::PoolId(Hash([99u8; 32]));
         let account = make_account_id([1u8; 32]);
         let tl_entry = LedgerEntry {
@@ -6616,24 +6674,9 @@ mod tests {
 
     #[test]
     fn test_streaming_config_settings() {
-        let mut bl = BucketList::new();
-        let config_entry = LedgerEntry {
-            last_modified_ledger_seq: 1,
-            data: LedgerEntryData::ConfigSetting(
-                stellar_xdr::curr::ConfigSettingEntry::ContractMaxSizeBytes(16384),
-            ),
-            ext: LedgerEntryExt::V0,
-        };
-        bl.add_batch(
-            1,
-            TEST_PROTOCOL,
-            BucketListType::Live,
-            vec![config_entry],
-            vec![],
-            vec![],
-        )
-        .unwrap();
-
+        // new_bl_with_config() already includes all required config settings;
+        // verify they are loaded into soroban_state.
+        let bl = new_bl_with_config();
         let result = scan_bucket_list_for_caches(&bl, TEST_PROTOCOL, 1).unwrap();
         // Config settings are loaded into soroban_state
         assert!(
@@ -6686,7 +6729,7 @@ mod tests {
 
     #[test]
     fn test_streaming_vs_parallel_empty() {
-        let bl = BucketList::new();
+        let bl = new_bl_with_config();
         let streaming = scan_bucket_list_for_caches(&bl, TEST_PROTOCOL, 1).unwrap();
         let parallel = scan_bucket_list_for_caches(&bl, TEST_PROTOCOL, 2).unwrap();
         assert_cache_init_results_equivalent(&streaming, &parallel, "empty");
@@ -6694,7 +6737,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_streaming_vs_parallel_offers_only() {
-        let mut bl = BucketList::new();
+        let mut bl = new_bl_with_config();
         for i in 1i64..=5 {
             let offer = make_offer_entry(i, [i as u8; 32]);
             bl.add_batch(
@@ -6714,7 +6757,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_streaming_vs_parallel_mixed_types() {
-        let mut bl = BucketList::new();
+        let mut bl = new_bl_with_config();
         for i in 1u32..=8 {
             let offer = make_offer_entry(i as i64, [i as u8; 32]);
             let cd = make_contract_data_entry([(i + 100) as u8; 32]);
@@ -6736,7 +6779,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_streaming_vs_parallel_with_dead_entries() {
-        let mut bl = BucketList::new();
+        let mut bl = new_bl_with_config();
         // Add offers
         for i in 1i64..=5 {
             let offer = make_offer_entry(i, [i as u8; 32]);
@@ -6775,7 +6818,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_streaming_vs_parallel_cross_level_overwrites() {
-        let mut bl = BucketList::new();
+        let mut bl = new_bl_with_config();
         // Create offer and contract data at ledger 1
         let offer_init = make_offer_entry(1, [1u8; 32]);
         let cd_init = make_contract_data_entry([1u8; 32]);
@@ -6853,7 +6896,7 @@ mod tests {
         header.ledger_seq = 1;
         header.ledger_version = CURRENT_LEDGER_PROTOCOL_VERSION;
 
-        let bucket_list = henyey_bucket::BucketList::new();
+        let bucket_list = new_bl_with_config();
         let hot_archive_bucket_list = henyey_bucket::HotArchiveBucketList::new();
         let header_hash = crate::compute_header_hash(&header).expect("hash");
 
@@ -6899,7 +6942,7 @@ mod tests {
         header.ledger_seq = 1;
         header.ledger_version = CURRENT_LEDGER_PROTOCOL_VERSION;
 
-        let bucket_list = henyey_bucket::BucketList::new();
+        let bucket_list = new_bl_with_config();
         let hot_archive_bucket_list = henyey_bucket::HotArchiveBucketList::new();
         let header_hash = crate::compute_header_hash(&header).expect("hash");
 
@@ -6946,7 +6989,7 @@ mod tests {
         header.ledger_seq = 1;
         header.ledger_version = MIN_LEDGER_PROTOCOL_VERSION;
 
-        let bucket_list = henyey_bucket::BucketList::new();
+        let bucket_list = new_bl_with_config();
         let hot_archive_bucket_list = henyey_bucket::HotArchiveBucketList::new();
         let header_hash = crate::compute_header_hash(&header).expect("hash");
 
@@ -7318,7 +7361,7 @@ mod tests {
         );
 
         // Initialize with an empty bucket list
-        let bucket_list = henyey_bucket::BucketList::new();
+        let bucket_list = new_bl_with_config();
         let hot_archive_bucket_list = henyey_bucket::HotArchiveBucketList::new();
         let header = create_genesis_header();
         let header_hash = crate::compute_header_hash(&header).expect("hash");
@@ -7486,7 +7529,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        let bucket_list = henyey_bucket::BucketList::new();
+        let bucket_list = new_bl_with_config();
         let hot_archive_bucket_list = henyey_bucket::HotArchiveBucketList::new();
         let header = create_genesis_header();
         let header_hash = crate::compute_header_hash(&header).expect("hash");
@@ -7553,7 +7596,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        let bucket_list = henyey_bucket::BucketList::new();
+        let bucket_list = new_bl_with_config();
         let hot_archive_bucket_list = henyey_bucket::HotArchiveBucketList::new();
         let header = create_genesis_header();
         let header_hash = crate::compute_header_hash(&header).expect("hash");
@@ -7615,7 +7658,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        let bucket_list = henyey_bucket::BucketList::new();
+        let bucket_list = new_bl_with_config();
         let hot_archive_bucket_list = henyey_bucket::HotArchiveBucketList::new();
         let header = create_genesis_header();
         let header_hash = crate::compute_header_hash(&header).expect("hash");
@@ -7694,7 +7737,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        let bucket_list = henyey_bucket::BucketList::new();
+        let bucket_list = new_bl_with_config();
         let hot_archive_bucket_list = henyey_bucket::HotArchiveBucketList::new();
         let header = create_genesis_header();
         let header_hash = crate::compute_header_hash(&header).expect("hash");
@@ -7762,7 +7805,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        let bucket_list = henyey_bucket::BucketList::new();
+        let bucket_list = new_bl_with_config();
         let hot_archive_bucket_list = henyey_bucket::HotArchiveBucketList::new();
         let header = create_genesis_header();
         let header_hash = crate::compute_header_hash(&header).expect("hash");
@@ -8046,7 +8089,7 @@ mod tests {
         header.ledger_seq = 1;
         header.ledger_version = CURRENT_LEDGER_PROTOCOL_VERSION;
 
-        let bucket_list = henyey_bucket::BucketList::new();
+        let bucket_list = new_bl_with_config();
         let hot_archive_bucket_list = henyey_bucket::HotArchiveBucketList::new();
         let header_hash = crate::compute_header_hash(&header).expect("hash");
 
@@ -8107,7 +8150,7 @@ mod tests {
         header.ledger_seq = 1;
         header.ledger_version = CURRENT_LEDGER_PROTOCOL_VERSION;
 
-        let bucket_list = henyey_bucket::BucketList::new();
+        let bucket_list = new_bl_with_config();
         let hot_archive = henyey_bucket::HotArchiveBucketList::new();
         let header_hash = crate::compute_header_hash(&header).expect("hash");
 
@@ -8172,7 +8215,7 @@ mod tests {
         header.ledger_seq = 1;
         header.ledger_version = CURRENT_LEDGER_PROTOCOL_VERSION;
 
-        let bucket_list = henyey_bucket::BucketList::new();
+        let bucket_list = new_bl_with_config();
         let hot_archive = henyey_bucket::HotArchiveBucketList::new();
         let header_hash = crate::compute_header_hash(&header).expect("hash");
 
