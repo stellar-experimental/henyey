@@ -2536,4 +2536,82 @@ mod tests {
         drop(staging);
         assert!(!staging_path.exists());
     }
+
+    #[test]
+    fn test_cache_bounded_size() {
+        let temp_dir = TempDir::new().unwrap();
+        let manager = BucketManager::with_cache_size(temp_dir.path().to_path_buf(), 2).unwrap();
+
+        // Create 3 buckets — cache should never exceed capacity of 2
+        let b1 = manager
+            .create_bucket(vec![BucketEntry::Liveentry(make_account_entry(
+                [1u8; 32], 100,
+            ))])
+            .unwrap();
+        let h1 = b1.hash();
+        manager.add_to_cache(h1, b1);
+        assert_eq!(manager.cache_size(), 1);
+
+        let b2 = manager
+            .create_bucket(vec![BucketEntry::Liveentry(make_account_entry(
+                [2u8; 32], 200,
+            ))])
+            .unwrap();
+        let h2 = b2.hash();
+        manager.add_to_cache(h2, b2);
+        assert_eq!(manager.cache_size(), 2);
+
+        let b3 = manager
+            .create_bucket(vec![BucketEntry::Liveentry(make_account_entry(
+                [3u8; 32], 300,
+            ))])
+            .unwrap();
+        let h3 = b3.hash();
+        manager.add_to_cache(h3, b3);
+        // Cache should not exceed capacity
+        assert!(manager.cache_size() <= 2);
+        // The newly inserted entry should always be present
+        assert!(manager.bucket_exists(&h3));
+    }
+
+    #[test]
+    fn test_cache_zero_capacity() {
+        let temp_dir = TempDir::new().unwrap();
+        let manager = BucketManager::with_cache_size(temp_dir.path().to_path_buf(), 0).unwrap();
+
+        let bucket = manager
+            .create_bucket(vec![BucketEntry::Liveentry(make_account_entry(
+                [1u8; 32], 100,
+            ))])
+            .unwrap();
+        let hash = bucket.hash();
+        manager.add_to_cache(hash, bucket);
+
+        // Zero capacity means nothing stays cached
+        assert_eq!(manager.cache_size(), 0);
+        // But bucket still exists on disk
+        assert!(manager.bucket_exists(&hash));
+    }
+
+    #[test]
+    fn test_delete_bucket_removes_from_cache() {
+        let (_temp_dir, manager) = create_manager();
+
+        let bucket = manager
+            .create_bucket(vec![BucketEntry::Liveentry(make_account_entry(
+                [1u8; 32], 100,
+            ))])
+            .unwrap();
+        let hash = bucket.hash();
+        manager.add_to_cache(hash, bucket);
+
+        // Bucket is cached and on disk
+        assert_eq!(manager.cache_size(), 1);
+        assert!(manager.bucket_exists(&hash));
+
+        // Delete removes both cache entry and disk file
+        manager.delete_bucket(&hash).unwrap();
+        assert_eq!(manager.cache_size(), 0);
+        assert!(!manager.bucket_exists(&hash));
+    }
 }

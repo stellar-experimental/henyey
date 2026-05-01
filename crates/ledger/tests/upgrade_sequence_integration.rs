@@ -27,7 +27,7 @@
 //! loading and other read paths to be generic over `SnapshotHandle` (frozen
 //! state) and `CloseLedgerState` (merged view).
 
-use henyey_bucket::{BucketList, HotArchiveBucketList};
+use henyey_bucket::HotArchiveBucketList;
 use henyey_common::Hash256;
 use henyey_ledger::{
     compute_header_hash, CloseLedgerState, ConfigUpgradeSetFrame, LedgerCloseData, LedgerManager,
@@ -82,7 +82,7 @@ fn init_ledger_manager(version: u32) -> LedgerManager {
     };
     let ledger = LedgerManager::new("Test Network".to_string(), config);
 
-    let bucket_list = BucketList::new();
+    let bucket_list = henyey_ledger::new_bucket_list_with_soroban_config();
     let hot_archive = HotArchiveBucketList::new();
     let header = make_genesis_header(version);
     let header_hash = compute_header_hash(&header).expect("hash");

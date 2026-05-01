@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use henyey_bucket::{BucketList, HotArchiveBucketList};
+use henyey_bucket::HotArchiveBucketList;
 use henyey_common::Hash256;
 use henyey_ledger::{
     compute_header_hash, LedgerCloseData, LedgerManager, LedgerManagerConfig, TransactionSetVariant,
@@ -50,7 +50,7 @@ fn test_ledger_close_with_empty_tx_set() {
     };
     let ledger = LedgerManager::new("Test Network".to_string(), config);
 
-    let bucket_list = BucketList::new();
+    let bucket_list = henyey_ledger::new_bucket_list_with_soroban_config();
     let hot_archive = HotArchiveBucketList::new();
     let header = make_genesis_header();
     let header_hash = compute_header_hash(&header).expect("hash");
@@ -102,7 +102,7 @@ fn test_ledger_close_meta_structural_validation() {
     };
     let ledger = LedgerManager::new("Test Network".to_string(), config);
 
-    let bucket_list = BucketList::new();
+    let bucket_list = henyey_ledger::new_bucket_list_with_soroban_config();
     let hot_archive = HotArchiveBucketList::new();
     let header = make_genesis_header();
     let header_hash = compute_header_hash(&header).expect("hash");
@@ -157,7 +157,7 @@ fn test_ledger_close_meta_with_scp_history() {
     };
     let ledger = LedgerManager::new("Test Network".to_string(), config);
 
-    let bucket_list = BucketList::new();
+    let bucket_list = henyey_ledger::new_bucket_list_with_soroban_config();
     let hot_archive = HotArchiveBucketList::new();
     let header = make_genesis_header();
     let header_hash = compute_header_hash(&header).expect("hash");
@@ -209,7 +209,7 @@ async fn test_multiple_consecutive_ledger_closes() {
     };
     let ledger = Arc::new(LedgerManager::new("Test Network".to_string(), config));
 
-    let bucket_list = BucketList::new();
+    let bucket_list = henyey_ledger::new_bucket_list_with_soroban_config();
     let hot_archive = HotArchiveBucketList::new();
     let header = make_genesis_header();
     let header_hash = compute_header_hash(&header).expect("hash");
@@ -263,7 +263,7 @@ fn test_unsupported_protocol_version_too_high_integration() {
     let mut header = make_genesis_header();
     header.ledger_version = CURRENT_LEDGER_PROTOCOL_VERSION;
     let header_hash = compute_header_hash(&header).expect("hash");
-    let bucket_list = BucketList::new();
+    let bucket_list = henyey_ledger::new_bucket_list_with_soroban_config();
     let hot_archive = HotArchiveBucketList::new();
     ledger
         .initialize(bucket_list, hot_archive, header, header_hash)
@@ -316,7 +316,7 @@ fn test_unsupported_protocol_version_too_low_integration() {
     let mut header = make_genesis_header();
     header.ledger_version = CURRENT_LEDGER_PROTOCOL_VERSION;
     let header_hash = compute_header_hash(&header).expect("hash");
-    let bucket_list = BucketList::new();
+    let bucket_list = henyey_ledger::new_bucket_list_with_soroban_config();
     let hot_archive = HotArchiveBucketList::new();
     ledger
         .initialize(bucket_list, hot_archive, header, header_hash)
@@ -364,7 +364,7 @@ async fn test_close_ledger_from_spawn_blocking() {
     };
     let ledger = Arc::new(LedgerManager::new("Test Network".to_string(), config));
 
-    let bucket_list = BucketList::new();
+    let bucket_list = henyey_ledger::new_bucket_list_with_soroban_config();
     let hot_archive = HotArchiveBucketList::new();
     let header = make_genesis_header();
     let header_hash = compute_header_hash(&header).expect("hash");
@@ -417,7 +417,7 @@ async fn test_consecutive_close_ledger_from_spawn_blocking() {
     };
     let ledger = Arc::new(LedgerManager::new("Test Network".to_string(), config));
 
-    let bucket_list = BucketList::new();
+    let bucket_list = henyey_ledger::new_bucket_list_with_soroban_config();
     let hot_archive = HotArchiveBucketList::new();
     let header = make_genesis_header();
     let header_hash = compute_header_hash(&header).expect("hash");

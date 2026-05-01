@@ -102,6 +102,7 @@ pub use header::{
     is_before_protocol_version, protocol_version, skip_list_target_seq, verify_header_chain,
     verify_skip_list, SKIP_1, SKIP_2, SKIP_3, SKIP_4, SKIP_LIST_SIZE,
 };
+pub use manager::new_bucket_list_with_soroban_config;
 pub use manager::{
     prepend_fee_event, scan_level_pairs_for_caches, CacheInitResult, HeaderSnapshot, LedgerManager,
     LedgerManagerConfig,

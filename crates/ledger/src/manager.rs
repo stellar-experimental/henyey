@@ -1425,7 +1425,13 @@ impl LedgerManager {
     pub fn set_header_for_test(&self, header: LedgerHeader, header_hash: Hash256) {
         // Recompute from the current bucket-list state before acquiring the
         // write lock so publication is atomic.
-        let info = self.compute_soroban_info().ok().flatten();
+        let info = match self.compute_soroban_info() {
+            Ok(info) => info,
+            Err(e) => {
+                tracing::warn!(error = %e, "set_header_for_test: failed to compute soroban info");
+                None
+            }
+        };
         let mut state = self.state.write();
         state.header = header;
         state.header_hash = header_hash;
@@ -5604,6 +5610,125 @@ fn create_genesis_header() -> LedgerHeader {
     }
 }
 
+/// Create a `BucketList` pre-populated with all required V20 Soroban config settings.
+///
+/// Use this in tests that initialize a `LedgerManager` at protocol >= 20 to
+/// avoid `require_config` errors from missing settings. The entries match the
+/// values created by `create_ledger_entries_for_v20` (parity with stellar-core
+/// `MinimumSorobanNetworkConfig`).
+#[doc(hidden)]
+pub fn new_bucket_list_with_soroban_config() -> BucketList {
+    use stellar_xdr::curr::{
+        BucketListType, ConfigSettingContractBandwidthV0, ConfigSettingContractComputeV0,
+        ConfigSettingContractEventsV0, ConfigSettingContractExecutionLanesV0,
+        ConfigSettingContractHistoricalDataV0, ConfigSettingContractLedgerCostV0,
+        ContractCostParamEntry, ContractCostParams, ExtensionPoint, StateArchivalSettings,
+    };
+    let make = |setting: ConfigSettingEntry| LedgerEntry {
+        last_modified_ledger_seq: 1,
+        data: LedgerEntryData::ConfigSetting(setting),
+        ext: LedgerEntryExt::V0,
+    };
+    let cost_param = ContractCostParamEntry {
+        ext: ExtensionPoint::V0,
+        const_term: 0,
+        linear_term: 0,
+    };
+    let cost_params = ContractCostParams(vec![cost_param].try_into().unwrap());
+    let entries = vec![
+        make(ConfigSettingEntry::ContractMaxSizeBytes(2_000)),
+        make(ConfigSettingEntry::ContractDataKeySizeBytes(200)),
+        make(ConfigSettingEntry::ContractDataEntrySizeBytes(2_000)),
+        make(ConfigSettingEntry::ContractComputeV0(
+            ConfigSettingContractComputeV0 {
+                ledger_max_instructions: 2_500_000,
+                tx_max_instructions: 2_500_000,
+                fee_rate_per_instructions_increment: 100,
+                tx_memory_limit: 2_000_000,
+            },
+        )),
+        make(ConfigSettingEntry::ContractLedgerCostV0(
+            ConfigSettingContractLedgerCostV0 {
+                ledger_max_disk_read_entries: 3,
+                ledger_max_disk_read_bytes: 3_200,
+                ledger_max_write_ledger_entries: 2,
+                ledger_max_write_bytes: 3_200,
+                tx_max_disk_read_entries: 3,
+                tx_max_disk_read_bytes: 3_200,
+                tx_max_write_ledger_entries: 2,
+                tx_max_write_bytes: 3_200,
+                fee_disk_read_ledger_entry: 5_000,
+                fee_write_ledger_entry: 20_000,
+                fee_disk_read1_kb: 1_000,
+                soroban_state_target_size_bytes: 1_000_000,
+                rent_fee1_kb_soroban_state_size_low: 1_000,
+                rent_fee1_kb_soroban_state_size_high: 10_000,
+                soroban_state_rent_fee_growth_factor: 1,
+            },
+        )),
+        make(ConfigSettingEntry::ContractHistoricalDataV0(
+            ConfigSettingContractHistoricalDataV0 {
+                fee_historical1_kb: 100,
+            },
+        )),
+        make(ConfigSettingEntry::ContractEventsV0(
+            ConfigSettingContractEventsV0 {
+                tx_max_contract_events_size_bytes: 200,
+                fee_contract_events1_kb: 200,
+            },
+        )),
+        make(ConfigSettingEntry::ContractBandwidthV0(
+            ConfigSettingContractBandwidthV0 {
+                ledger_max_txs_size_bytes: 10_000,
+                tx_max_size_bytes: 10_000,
+                fee_tx_size1_kb: 2_000,
+            },
+        )),
+        make(ConfigSettingEntry::ContractExecutionLanes(
+            ConfigSettingContractExecutionLanesV0 {
+                ledger_max_tx_count: 1,
+            },
+        )),
+        make(ConfigSettingEntry::ContractCostParamsCpuInstructions(
+            cost_params.clone(),
+        )),
+        make(ConfigSettingEntry::ContractCostParamsMemoryBytes(
+            cost_params,
+        )),
+        make(ConfigSettingEntry::StateArchival(StateArchivalSettings {
+            max_entry_ttl: 1_054_080,
+            min_persistent_ttl: 4_096,
+            min_temporary_ttl: 16,
+            persistent_rent_rate_denominator: 252_480,
+            temp_rent_rate_denominator: 2_524_800,
+            max_entries_to_archive: 100,
+            live_soroban_state_size_window_sample_size: 30,
+            live_soroban_state_size_window_sample_period: 64,
+            eviction_scan_size: 100_000,
+            starting_eviction_scan_level: 6,
+        })),
+        make(ConfigSettingEntry::LiveSorobanStateSizeWindow(
+            vec![0u64; 30].try_into().unwrap(),
+        )),
+        make(ConfigSettingEntry::EvictionIterator(EvictionIterator {
+            bucket_list_level: 6,
+            is_curr_bucket: true,
+            bucket_file_offset: 0,
+        })),
+    ];
+    let mut bl = BucketList::new();
+    bl.add_batch(
+        1,
+        henyey_common::MIN_SOROBAN_PROTOCOL_VERSION,
+        BucketListType::Live,
+        entries,
+        vec![],
+        vec![],
+    )
+    .unwrap();
+    bl
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5670,126 +5795,10 @@ mod tests {
         }
     }
 
-    /// Add all required Soroban ConfigSettingEntry values (V20 initial set).
-    /// This satisfies both `build_soroban_rent_config` (3 settings) and
-    /// `load_soroban_network_info` (13 settings) so tests at protocol >= 20
-    /// don't error from `require_config` rejecting missing settings.
-    fn add_required_config_settings(bl: &mut BucketList) {
-        use stellar_xdr::curr::{
-            ConfigSettingContractBandwidthV0, ConfigSettingContractComputeV0,
-            ConfigSettingContractEventsV0, ConfigSettingContractExecutionLanesV0,
-            ConfigSettingContractHistoricalDataV0, ConfigSettingContractLedgerCostV0,
-            ContractCostParamEntry, ContractCostParams, StateArchivalSettings,
-        };
-        let make = |setting: ConfigSettingEntry| LedgerEntry {
-            last_modified_ledger_seq: 1,
-            data: LedgerEntryData::ConfigSetting(setting),
-            ext: LedgerEntryExt::V0,
-        };
-        let cost_param = ContractCostParamEntry {
-            ext: ExtensionPoint::V0,
-            const_term: 0,
-            linear_term: 0,
-        };
-        let cost_params = ContractCostParams(vec![cost_param.clone()].try_into().unwrap());
-        let entries = vec![
-            make(ConfigSettingEntry::ContractMaxSizeBytes(2_000)),
-            make(ConfigSettingEntry::ContractDataKeySizeBytes(200)),
-            make(ConfigSettingEntry::ContractDataEntrySizeBytes(2_000)),
-            make(ConfigSettingEntry::ContractComputeV0(
-                ConfigSettingContractComputeV0 {
-                    ledger_max_instructions: 2_500_000,
-                    tx_max_instructions: 2_500_000,
-                    fee_rate_per_instructions_increment: 100,
-                    tx_memory_limit: 2_000_000,
-                },
-            )),
-            make(ConfigSettingEntry::ContractLedgerCostV0(
-                ConfigSettingContractLedgerCostV0 {
-                    ledger_max_disk_read_entries: 3,
-                    ledger_max_disk_read_bytes: 3_200,
-                    ledger_max_write_ledger_entries: 2,
-                    ledger_max_write_bytes: 3_200,
-                    tx_max_disk_read_entries: 3,
-                    tx_max_disk_read_bytes: 3_200,
-                    tx_max_write_ledger_entries: 2,
-                    tx_max_write_bytes: 3_200,
-                    fee_disk_read_ledger_entry: 5_000,
-                    fee_write_ledger_entry: 20_000,
-                    fee_disk_read1_kb: 1_000,
-                    soroban_state_target_size_bytes: 1_000_000,
-                    rent_fee1_kb_soroban_state_size_low: 1_000,
-                    rent_fee1_kb_soroban_state_size_high: 10_000,
-                    soroban_state_rent_fee_growth_factor: 1,
-                },
-            )),
-            make(ConfigSettingEntry::ContractHistoricalDataV0(
-                ConfigSettingContractHistoricalDataV0 {
-                    fee_historical1_kb: 100,
-                },
-            )),
-            make(ConfigSettingEntry::ContractEventsV0(
-                ConfigSettingContractEventsV0 {
-                    tx_max_contract_events_size_bytes: 200,
-                    fee_contract_events1_kb: 200,
-                },
-            )),
-            make(ConfigSettingEntry::ContractBandwidthV0(
-                ConfigSettingContractBandwidthV0 {
-                    ledger_max_txs_size_bytes: 10_000,
-                    tx_max_size_bytes: 10_000,
-                    fee_tx_size1_kb: 2_000,
-                },
-            )),
-            make(ConfigSettingEntry::ContractExecutionLanes(
-                ConfigSettingContractExecutionLanesV0 {
-                    ledger_max_tx_count: 1,
-                },
-            )),
-            make(ConfigSettingEntry::ContractCostParamsCpuInstructions(
-                cost_params.clone(),
-            )),
-            make(ConfigSettingEntry::ContractCostParamsMemoryBytes(
-                cost_params,
-            )),
-            make(ConfigSettingEntry::StateArchival(StateArchivalSettings {
-                max_entry_ttl: 1_054_080,
-                min_persistent_ttl: 4_096,
-                min_temporary_ttl: 16,
-                persistent_rent_rate_denominator: 252_480,
-                temp_rent_rate_denominator: 2_524_800,
-                max_entries_to_archive: 100,
-                live_soroban_state_size_window_sample_size: 30,
-                live_soroban_state_size_window_sample_period: 64,
-                eviction_scan_size: 100_000,
-                starting_eviction_scan_level: 6,
-            })),
-            make(ConfigSettingEntry::LiveSorobanStateSizeWindow(
-                vec![0u64; 30].try_into().unwrap(),
-            )),
-            make(ConfigSettingEntry::EvictionIterator(EvictionIterator {
-                bucket_list_level: 6,
-                is_curr_bucket: true,
-                bucket_file_offset: 0,
-            })),
-        ];
-        bl.add_batch(
-            1,
-            TEST_PROTOCOL,
-            BucketListType::Live,
-            entries,
-            vec![],
-            vec![],
-        )
-        .unwrap();
-    }
-
     /// Create a new BucketList pre-populated with the required Soroban config
     /// settings, so scans at `TEST_PROTOCOL` (>= 20) succeed.
     fn new_bl_with_config() -> BucketList {
-        let mut bl = BucketList::new();
-        add_required_config_settings(&mut bl);
-        bl
+        new_bucket_list_with_soroban_config()
     }
 
     // ---- Parallel scan tests ----
