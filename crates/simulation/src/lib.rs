@@ -502,7 +502,11 @@ impl Simulation {
         Some(node.app.simulation_debug_stats().await)
     }
 
-    pub async fn wait_for_app_connectivity(&self, min_peers: usize, timeout: Duration) -> bool {
+    pub async fn wait_for_app_connectivity(
+        &self,
+        min_peers: usize,
+        timeout: Duration,
+    ) -> anyhow::Result<()> {
         let deadline = tokio::time::Instant::now() + timeout;
         while tokio::time::Instant::now() < deadline {
             let mut connected = true;
@@ -513,11 +517,20 @@ impl Simulation {
                 }
             }
             if connected {
-                return true;
+                return Ok(());
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        false
+        let mut counts = Vec::new();
+        for id in self.running_apps.keys() {
+            let count = self.app_peer_count(id).await.unwrap_or(0);
+            counts.push(format!("{id}={count}"));
+        }
+        anyhow::bail!(
+            "wait_for_app_connectivity: not all apps reached {min_peers} peers \
+             within {timeout:?} (current counts: {})",
+            counts.join(", ")
+        )
     }
 
     pub async fn repair_app_tcp_connectivity(&self) -> anyhow::Result<()> {
@@ -544,7 +557,7 @@ impl Simulation {
         &self,
         min_peers: usize,
         timeout: Duration,
-    ) -> anyhow::Result<bool> {
+    ) -> anyhow::Result<()> {
         let deadline = tokio::time::Instant::now() + timeout;
         while tokio::time::Instant::now() < deadline {
             if let Err(err) = self.repair_app_tcp_connectivity().await {
@@ -552,15 +565,21 @@ impl Simulation {
                     return Err(err);
                 }
             }
+            let remaining = deadline.duration_since(tokio::time::Instant::now());
+            let probe_timeout = remaining.min(Duration::from_secs(1));
             if self
-                .wait_for_app_connectivity(min_peers, Duration::from_secs(1))
+                .wait_for_app_connectivity(min_peers, probe_timeout)
                 .await
+                .is_ok()
             {
-                return Ok(true);
+                return Ok(());
             }
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            let remaining = deadline.duration_since(tokio::time::Instant::now());
+            tokio::time::sleep(Duration::from_millis(100).min(remaining)).await;
         }
-        Ok(false)
+        anyhow::bail!(
+            "stabilize_app_tcp_connectivity: connectivity did not stabilize within {timeout:?}"
+        )
     }
 
     pub fn have_all_app_nodes_externalized(&self, ledger_seq: u32, max_spread: u32) -> bool {
@@ -729,19 +748,22 @@ impl Simulation {
         true
     }
 
-    pub async fn crank_until<P>(&mut self, predicate: P, timeout: Duration) -> bool
+    pub async fn crank_until<P>(&mut self, predicate: P, timeout: Duration) -> anyhow::Result<()>
     where
         P: Fn(&Simulation) -> bool,
     {
         let mut elapsed = Duration::ZERO;
         while elapsed <= timeout {
             if predicate(self) {
-                return true;
+                return Ok(());
             }
             let _ = self.crank_all_nodes().await;
             elapsed = elapsed.saturating_add(Duration::from_millis(100));
         }
-        predicate(self)
+        if predicate(self) {
+            return Ok(());
+        }
+        anyhow::bail!("crank_until: predicate not satisfied within {timeout:?} (synthetic time)")
     }
 
     pub fn have_all_externalized(&self, ledger_seq: u32, max_spread: u32) -> bool {

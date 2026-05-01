@@ -154,13 +154,12 @@ async fn ensure_app_accounts_funded(sim: &mut Simulation, expected: usize) {
 async fn build_app_backed_topology(mut sim: Simulation, threshold_percent: u32) -> Simulation {
     sim.populate_app_nodes_from_existing(threshold_percent);
     sim.start_all_nodes().await;
-    assert!(
-        sim.stabilize_app_tcp_connectivity(1, Duration::from_secs(20))
-            .await
-            .expect("stabilize app tcp connectivity"),
-        "build_app_backed_topology: TCP connectivity did not stabilize \
-         within 20s (min_peers=1). Nodes may not have completed handshakes."
-    );
+    sim.stabilize_app_tcp_connectivity(1, Duration::from_secs(20))
+        .await
+        .expect(
+            "build_app_backed_topology: TCP connectivity did not stabilize \
+             within 20s (min_peers=1). Nodes may not have completed handshakes.",
+        );
     sim
 }
 
@@ -182,13 +181,12 @@ async fn build_two_running_of_three(mode: SimulationMode) -> Simulation {
         sim.add_app_node(id.clone(), secret, quorum_set.clone());
     }
     sim.start_all_nodes().await;
-    assert!(
-        sim.stabilize_app_tcp_connectivity(1, Duration::from_secs(20))
-            .await
-            .expect("stabilize two-of-three connectivity"),
-        "build_two_running_of_three: TCP connectivity did not stabilize \
-         within 20s (min_peers=1)."
-    );
+    sim.stabilize_app_tcp_connectivity(1, Duration::from_secs(20))
+        .await
+        .expect(
+            "build_two_running_of_three: TCP connectivity did not stabilize \
+             within 20s (min_peers=1).",
+        );
     sim
 }
 
@@ -454,14 +452,9 @@ async fn test_core3_restart_rejoin_over_tcp() {
     wait_for_app_operational(&sim, "node0", Duration::from_secs(5)).await;
 
     // Re-establish peer connections with retry (TCP connections can fail transiently).
-    let stabilized = sim
-        .stabilize_app_tcp_connectivity(1, Duration::from_secs(10))
+    sim.stabilize_app_tcp_connectivity(1, Duration::from_secs(10))
         .await
-        .expect("stabilize connectivity after restart");
-    assert!(
-        stabilized,
-        "node0 failed to establish peer connectivity after restart"
-    );
+        .expect("node0 failed to establish peer connectivity after restart");
 
     // Request SCP state so node0 learns about the externalized slots it missed.
     sim.app("node0")
@@ -527,4 +520,48 @@ async fn test_core3_restart_rejoin_over_loopback() {
     sim.stop_all_nodes()
         .await
         .expect("stop core3 loopback restart test");
+}
+
+#[tokio::test]
+async fn test_wait_for_app_connectivity_returns_error_on_timeout() {
+    let mut sim = Topologies::core3(SimulationMode::OverTcp);
+    sim.populate_app_nodes_from_existing(67);
+    sim.start_all_nodes().await;
+    // Request more peers than possible (3 nodes, asking for 10)
+    let result = sim
+        .wait_for_app_connectivity(10, Duration::from_millis(500))
+        .await;
+    assert!(result.is_err());
+    assert!(result
+        .unwrap_err()
+        .to_string()
+        .contains("not all apps reached"));
+    sim.stop_all_nodes().await.ok();
+}
+
+#[tokio::test]
+async fn test_wait_for_app_connectivity_zero_apps_succeeds() {
+    let sim = Topologies::core3(SimulationMode::OverTcp);
+    // No app nodes started — running_apps is empty → vacuous success
+    let result = sim
+        .wait_for_app_connectivity(5, Duration::from_millis(100))
+        .await;
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn test_stabilize_app_tcp_connectivity_returns_error_on_timeout() {
+    let mut sim = Topologies::core3(SimulationMode::OverTcp);
+    sim.populate_app_nodes_from_existing(67);
+    sim.start_all_nodes().await;
+    // Request impossible peer count — should timeout without panic
+    let result = sim
+        .stabilize_app_tcp_connectivity(100, Duration::from_millis(500))
+        .await;
+    assert!(result.is_err());
+    assert!(result
+        .unwrap_err()
+        .to_string()
+        .contains("did not stabilize"));
+    sim.stop_all_nodes().await.ok();
 }

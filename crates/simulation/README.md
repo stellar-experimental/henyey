@@ -54,11 +54,9 @@ use std::time::Duration;
 
 let mut sim = Topologies::core3(SimulationMode::OverLoopback);
 
-let converged = sim
-    .crank_until(|s| s.have_all_externalized(5, 0), Duration::from_secs(5))
-    .await;
-
-assert!(converged);
+sim.crank_until(|s| s.have_all_externalized(5, 0), Duration::from_secs(5))
+    .await
+    .expect("should converge");
 ```
 
 ### Start app-backed nodes and wait for peer connectivity
@@ -71,8 +69,9 @@ let mut sim = Topologies::core3(SimulationMode::OverLoopback);
 sim.populate_app_nodes_from_existing(67);
 sim.start_all_nodes().await;
 
-let connected = sim.wait_for_app_connectivity(2, Duration::from_secs(5)).await;
-assert!(connected);
+sim.wait_for_app_connectivity(2, Duration::from_secs(5))
+    .await
+    .expect("should connect");
 
 sim.stop_all_nodes().await?;
 # Ok::<(), anyhow::Error>(())

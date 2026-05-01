@@ -8,25 +8,20 @@ async fn run_core7_fault_schedule() -> (Simulation, Vec<Hash256>) {
     let mut sim = Topologies::core(7, SimulationMode::OverLoopback);
     sim.start_all_nodes().await;
 
-    let converged_20 = sim
-        .crank_until(|s| s.have_all_externalized(20, 2), Duration::from_secs(60))
-        .await;
-    assert!(converged_20, "core7 should converge to ledger 20");
+    sim.crank_until(|s| s.have_all_externalized(20, 2), Duration::from_secs(60))
+        .await
+        .expect("core7 should converge to ledger 20");
 
     sim.partition("node6");
-    let progressed_with_partition = sim
-        .crank_until(
-            |s| {
-                let progressed = (0..6).all(|i| s.ledger_seq(&format!("node{}", i)) >= 30);
-                progressed && s.ledger_seq("node6") < 30
-            },
-            Duration::from_secs(60),
-        )
-        .await;
-    assert!(
-        progressed_with_partition,
-        "majority cluster should progress while one node is partitioned"
-    );
+    sim.crank_until(
+        |s| {
+            let progressed = (0..6).all(|i| s.ledger_seq(&format!("node{}", i)) >= 30);
+            progressed && s.ledger_seq("node6") < 30
+        },
+        Duration::from_secs(60),
+    )
+    .await
+    .expect("majority cluster should progress while one node is partitioned");
 
     // Temporary hard drops on a subset of links.
     let dropped_edges = [("node0", "node1"), ("node2", "node3"), ("node4", "node5")];
@@ -34,16 +29,12 @@ async fn run_core7_fault_schedule() -> (Simulation, Vec<Hash256>) {
         sim.set_drop_prob(a, b, 1.0);
     }
 
-    let progressed_with_drops = sim
-        .crank_until(
-            |s| (0..6).all(|i| s.ledger_seq(&format!("node{}", i)) >= 40),
-            Duration::from_secs(60),
-        )
-        .await;
-    assert!(
-        progressed_with_drops,
-        "cluster should continue progressing under partial hard drops"
-    );
+    sim.crank_until(
+        |s| (0..6).all(|i| s.ledger_seq(&format!("node{}", i)) >= 40),
+        Duration::from_secs(60),
+    )
+    .await
+    .expect("cluster should continue progressing under partial hard drops");
 
     // Heal everything.
     sim.heal_partition("node6");
@@ -51,13 +42,9 @@ async fn run_core7_fault_schedule() -> (Simulation, Vec<Hash256>) {
         sim.set_drop_prob(a, b, 0.0);
     }
 
-    let converged_60 = sim
-        .crank_until(|s| s.have_all_externalized(60, 2), Duration::from_secs(120))
-        .await;
-    assert!(
-        converged_60,
-        "full network should reconverge to ledger 60 after healing"
-    );
+    sim.crank_until(|s| s.have_all_externalized(60, 2), Duration::from_secs(120))
+        .await
+        .expect("full network should reconverge to ledger 60 after healing");
 
     let hashes = sim.ledger_hashes();
     (sim, hashes)
