@@ -209,7 +209,7 @@ fn classify_delta_entries(
     mut live_entries: Vec<LedgerEntry>,
     mut dead_entries: Vec<LedgerKey>,
     hot_archive_restored_keys: &[LedgerKey],
-) -> (Vec<LedgerEntry>, Vec<LedgerEntry>, Vec<LedgerKey>) {
+) -> Result<(Vec<LedgerEntry>, Vec<LedgerEntry>, Vec<LedgerKey>)> {
     let delta_init_count = delta_init_entries.len();
     let delta_live_count = live_entries.len();
 
@@ -223,7 +223,7 @@ fn classify_delta_entries(
 
         let should_check = henyey_common::is_soroban_entry(&entry);
 
-        let already_in_bucket_list = should_check && bucket_list.get(&key).ok().flatten().is_some();
+        let already_in_bucket_list = should_check && bucket_list.get(&key)?.is_some();
 
         if already_in_bucket_list {
             tracing::debug!(
@@ -259,7 +259,7 @@ fn classify_delta_entries(
         if init_entry_keys.contains(key) {
             continue;
         }
-        if let Ok(Some(mut entry)) = bucket_list.get(key) {
+        if let Some(mut entry) = bucket_list.get(key)? {
             entry.last_modified_ledger_seq = header.ledger_seq;
             live_entries.push(entry);
         }
@@ -271,7 +271,7 @@ fn classify_delta_entries(
         dead_entries.retain(|k| !restored_set.contains(k));
     }
 
-    (init_entries, live_entries, dead_entries)
+    Ok((init_entries, live_entries, dead_entries))
 }
 
 /// Compute the size of a Soroban entry for state size tracking.
@@ -701,7 +701,7 @@ pub fn replay_ledger_with_execution(
         delta.live_entries(),
         delta.dead_entries(),
         &tx_set_result.hot_archive_restored_keys,
-    );
+    )?;
 
     // Run incremental eviction scan for protocol 23+ before applying transaction changes
     // This matches stellar-core's behavior: eviction is determined by TTL state
@@ -1020,7 +1020,8 @@ mod tests {
             vec![],
             vec![],
             &[],
-        );
+        )
+        .unwrap();
 
         assert!(init.is_empty(), "INIT entry should have been moved to LIVE");
         assert_eq!(live.len(), 1, "exactly one entry should be in LIVE");
@@ -1043,7 +1044,8 @@ mod tests {
             vec![],
             vec![],
             &[],
-        );
+        )
+        .unwrap();
 
         assert_eq!(init.len(), 1);
         assert_eq!(init[0].data, delta_init.data);
@@ -1070,7 +1072,8 @@ mod tests {
             vec![],
             vec![],
             &[],
-        );
+        )
+        .unwrap();
 
         assert!(init.is_empty());
         assert_eq!(live.len(), 1);
@@ -1099,7 +1102,8 @@ mod tests {
             vec![],
             vec![],
             &[],
-        );
+        )
+        .unwrap();
 
         assert_eq!(
             init.len(),
@@ -1143,7 +1147,8 @@ mod tests {
             vec![],
             vec![],
             &[],
-        );
+        )
+        .unwrap();
 
         // INIT: ContractCode (new) and Account (gate skipped) — order
         // preserved from input minus the moved entries.
@@ -1182,7 +1187,8 @@ mod tests {
             vec![],
             vec![restored_key.clone(), other_key.clone()],
             std::slice::from_ref(&restored_key),
-        );
+        )
+        .unwrap();
 
         assert!(init.is_empty());
 
@@ -1211,7 +1217,8 @@ mod tests {
         let absent_key = henyey_common::entry_to_key(&absent_entry);
 
         let (init, live, dead) =
-            classify_delta_entries(&header, &bucket_list, vec![], vec![], vec![], &[absent_key]);
+            classify_delta_entries(&header, &bucket_list, vec![], vec![], vec![], &[absent_key])
+                .unwrap();
 
         assert!(init.is_empty());
         assert!(live.is_empty());
@@ -1224,7 +1231,7 @@ mod tests {
         let header = make_test_header(100);
 
         let (init, live, dead) =
-            classify_delta_entries(&header, &bucket_list, vec![], vec![], vec![], &[]);
+            classify_delta_entries(&header, &bucket_list, vec![], vec![], vec![], &[]).unwrap();
 
         assert!(init.is_empty());
         assert!(live.is_empty());
@@ -1791,7 +1798,8 @@ mod tests {
     }
 
     /// Regression test for #2226: loading StateArchival with a wrong
-    /// ConfigSettingEntry variant must return an error, not silently fall back.
+    /// ConfigSettingEntry variant must produce a fatal VerificationFailed error,
+    /// not silently fall back to a default.
     #[test]
     fn test_load_state_archival_wrong_variant_errors() {
         use henyey_ledger::execution::load_config_setting;
@@ -1826,31 +1834,40 @@ mod tests {
         );
         let handle = henyey_ledger::SnapshotHandle::new(snapshot);
 
-        // load_config_setting returns Ok(Some(ContractComputeV0(...)))
-        // Our call site match should detect the wrong variant
-        let result = load_config_setting(&handle, ConfigSettingId::StateArchival);
-        match result {
-            Ok(Some(ConfigSettingEntry::StateArchival(_))) => {
-                panic!("should not match StateArchival variant");
-            }
-            Ok(Some(_)) => {
-                // This is the expected path — wrong variant detected
-            }
-            Ok(None) => panic!("should not be None when entry exists"),
-            Err(_) => {
-                // Also acceptable — load_config_setting itself might error
-                // on wrong LedgerEntryData (but here we have correct top-level variant)
-            }
-        }
+        // Exercise the exact match pattern used at the replay call site
+        let result: crate::Result<StateArchivalSettings> =
+            match load_config_setting(&handle, ConfigSettingId::StateArchival) {
+                Ok(Some(ConfigSettingEntry::StateArchival(settings))) => Ok(settings),
+                Ok(Some(_)) => Err(HistoryError::VerificationFailed(
+                    "replay: unexpected ConfigSettingEntry variant for StateArchival key"
+                        .to_string(),
+                )),
+                Ok(None) => Ok(StateArchivalSettings::default()),
+                Err(e) => Err(HistoryError::VerificationFailed(format!(
+                    "replay: failed to load StateArchival config: {e}"
+                ))),
+            };
+
+        assert!(result.is_err(), "wrong variant should produce an error");
+        let err = result.unwrap_err();
+        assert!(
+            err.is_fatal_catchup_failure(),
+            "wrong variant error should be fatal"
+        );
+        assert!(
+            err.to_string()
+                .contains("unexpected ConfigSettingEntry variant"),
+            "unexpected error message: {err}"
+        );
     }
 
-    /// Regression test for #2226: I/O error during config lookup must not be
-    /// silently swallowed.
+    /// Regression test for #2226: I/O error during config lookup must produce
+    /// a fatal VerificationFailed error, not be silently masked.
     #[test]
     fn test_load_state_archival_io_error_propagates() {
         use henyey_ledger::execution::load_config_setting;
         use std::sync::Arc;
-        use stellar_xdr::curr::ConfigSettingId;
+        use stellar_xdr::curr::{ConfigSettingEntry, ConfigSettingId};
 
         let snapshot = henyey_ledger::LedgerSnapshot::empty(1);
         let lookup_fn: henyey_ledger::EntryLookupFn = Arc::new(|_key| {
@@ -1860,12 +1877,29 @@ mod tests {
         });
         let handle = henyey_ledger::SnapshotHandle::with_lookup(snapshot, lookup_fn);
 
-        let result = load_config_setting(&handle, ConfigSettingId::StateArchival);
-        assert!(result.is_err(), "I/O error should propagate, not be masked");
-        let err = result.unwrap_err().to_string();
+        // Exercise the exact match pattern used at the replay call site
+        let result: crate::Result<StateArchivalSettings> =
+            match load_config_setting(&handle, ConfigSettingId::StateArchival) {
+                Ok(Some(ConfigSettingEntry::StateArchival(settings))) => Ok(settings),
+                Ok(Some(_)) => Err(HistoryError::VerificationFailed(
+                    "replay: unexpected ConfigSettingEntry variant for StateArchival key"
+                        .to_string(),
+                )),
+                Ok(None) => Ok(StateArchivalSettings::default()),
+                Err(e) => Err(HistoryError::VerificationFailed(format!(
+                    "replay: failed to load StateArchival config: {e}"
+                ))),
+            };
+
+        assert!(result.is_err(), "I/O error should produce an error");
+        let err = result.unwrap_err();
         assert!(
-            err.contains("simulated I/O error"),
-            "unexpected error: {err}"
+            err.is_fatal_catchup_failure(),
+            "I/O error should be fatal in replay context"
+        );
+        assert!(
+            err.to_string().contains("simulated I/O error"),
+            "unexpected error message: {err}"
         );
     }
 }
