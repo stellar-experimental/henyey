@@ -2954,25 +2954,32 @@ impl TransactionQueue {
 
     /// Get statistics about the transaction queue.
     pub fn stats(&self) -> TxQueueStats {
-        let store = self.store.read();
         let seen = self.seen.read();
+        let account_states = self.account_states.read();
 
-        // Count accounts with pending transactions
-        let mut accounts: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
-        for tx in store.values() {
-            let account_id = account_id_from_envelope(&tx.envelope);
-            accounts.insert(account_key_from_account_id(&account_id));
+        let mut pending_count = 0;
+        let mut account_count = 0;
+        let mut pending_txs_age = [0usize; 4];
+
+        for state in account_states.values() {
+            if state.transaction.is_some() {
+                pending_count += 1;
+                account_count += 1;
+                let bucket = std::cmp::min(state.age as usize, 3);
+                pending_txs_age[bucket] += 1;
+            }
         }
 
         TxQueueStats {
-            pending_count: store.len(),
-            account_count: accounts.len(),
+            pending_count,
+            account_count,
             banned_count: self.banned_count(),
             seen_count: seen.len(),
             arb_tx_seen: self.arb_tx_seen.load(std::sync::atomic::Ordering::Relaxed),
             arb_tx_dropped: self
                 .arb_tx_dropped
                 .load(std::sync::atomic::Ordering::Relaxed),
+            pending_txs_age,
         }
     }
 
@@ -3037,7 +3044,7 @@ pub struct BroadcastBudget {
 }
 
 /// Statistics about the transaction queue.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TxQueueStats {
     /// Number of pending transactions.
     pub pending_count: usize,
@@ -3051,6 +3058,9 @@ pub struct TxQueueStats {
     pub arb_tx_seen: u64,
     /// Total arbitrage transactions dropped by damping (monotonic).
     pub arb_tx_dropped: u64,
+    /// Pending transaction count bucketed by age (slot age 0, 1, 2, 3).
+    /// Matches stellar-core's `herder.pending.txs.age{0,1,2,3}` gauges.
+    pub pending_txs_age: [usize; 4],
 }
 
 fn extra_signers_satisfied(
@@ -10228,5 +10238,77 @@ mod broadcast_visitor_tests {
                 "Banned tx must not be revisited on subsequent broadcast"
             );
         }
+    }
+
+    #[test]
+    fn test_stats_pending_txs_age_histogram() {
+        // Stagger 3 transactions at different ages and verify the age histogram.
+        let queue = TransactionQueue::with_depths(TxQueueConfig::default(), 10, 4);
+
+        // Add TX A at age 0
+        let mut tx_a = make_test_envelope(200, 1);
+        set_source(&mut tx_a, 80);
+        assert_eq!(queue.try_add(tx_a), TxQueueResult::Added);
+
+        // Shift → TX A age becomes 1
+        queue.shift();
+
+        // Add TX B at age 0
+        let mut tx_b = make_test_envelope(200, 1);
+        set_source(&mut tx_b, 81);
+        assert_eq!(queue.try_add(tx_b), TxQueueResult::Added);
+
+        // Shift → TX A age=2, TX B age=1
+        queue.shift();
+
+        // Add TX C at age 0
+        let mut tx_c = make_test_envelope(200, 1);
+        set_source(&mut tx_c, 82);
+        assert_eq!(queue.try_add(tx_c), TxQueueResult::Added);
+
+        // Now: TX A age=2, TX B age=1, TX C age=0
+        let stats = queue.stats();
+        assert_eq!(stats.pending_count, 3);
+        assert_eq!(stats.pending_txs_age, [1, 1, 1, 0]);
+    }
+
+    #[test]
+    fn test_stats_pending_txs_age_excludes_fee_source_only() {
+        // A fee-bump TX creates an account_state entry for the fee-source
+        // with transaction=None. It should NOT inflate pending_txs_age[0].
+        let queue = TransactionQueue::with_depths(TxQueueConfig::default(), 10, 4);
+
+        // Add a regular TX — this creates one pending entry (age 0).
+        let mut tx = make_test_envelope(200, 1);
+        set_source(&mut tx, 90);
+        assert_eq!(queue.try_add(tx), TxQueueResult::Added);
+
+        let stats = queue.stats();
+        // Only 1 pending tx, age bucket [0] should be 1
+        assert_eq!(stats.pending_count, 1);
+        assert_eq!(stats.pending_txs_age, [1, 0, 0, 0]);
+        // account_count should be 1 (not inflated by fee-source-only entries)
+        assert_eq!(stats.account_count, 1);
+    }
+
+    #[test]
+    fn test_stats_pending_txs_age_clamp_at_3() {
+        // With pending_depth=6, a tx can reach age 5 before eviction.
+        // The age histogram should clamp it into bucket [3].
+        let queue = TransactionQueue::with_depths(TxQueueConfig::default(), 10, 6);
+
+        let mut tx = make_test_envelope(200, 1);
+        set_source(&mut tx, 91);
+        assert_eq!(queue.try_add(tx), TxQueueResult::Added);
+
+        // Shift 5 times → age = 5 (still < pending_depth=6, not evicted)
+        for _ in 0..5 {
+            queue.shift();
+        }
+
+        let stats = queue.stats();
+        assert_eq!(stats.pending_count, 1);
+        // Age 5 should clamp into bucket [3]
+        assert_eq!(stats.pending_txs_age, [0, 0, 0, 1]);
     }
 }

@@ -538,11 +538,18 @@
     },
     {
       "id": 46,
-      "type": "text",
-      "title": "Pending TXs by Age — Coming in Stage D",
+      "type": "timeseries",
+      "title": "Pending TXs by Age",
       "description": "Panel 60 of 10334. TX queue age buckets.",
       "gridPos": {"h": 6, "w": 24, "x": 0, "y": 79},
-      "options": {"mode": "markdown", "content": "**Coming in Stage D** — `stellar_herder_pending_txs_age{0,1,2,3}` gauges showing pending transaction count per slot age. The TX queue already tracks per-account age internally."}
+      "datasource": {"type": "prometheus", "uid": "000000001"},
+      "targets": [
+        {"expr": "stellar_herder_pending_txs_age0{instance=~\"$instance\"}", "legendFormat": "age 0"},
+        {"expr": "stellar_herder_pending_txs_age1{instance=~\"$instance\"}", "legendFormat": "age 1"},
+        {"expr": "stellar_herder_pending_txs_age2{instance=~\"$instance\"}", "legendFormat": "age 2"},
+        {"expr": "stellar_herder_pending_txs_age3{instance=~\"$instance\"}", "legendFormat": "age 3"}
+      ],
+      "fieldConfig": {"defaults": {"unit": "short"}}
     },
     {
       "type": "row",

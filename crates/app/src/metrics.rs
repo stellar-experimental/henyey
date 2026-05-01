@@ -223,6 +223,16 @@ metric_catalog! {
         HERDER_ARB_TX_DROPPED = "stellar_herder_arb_tx_dropped_total"
             => "Total arbitrage transactions dropped by flood damping";
 
+        // Herder pending-tx age gauges (Stage D).
+        HERDER_PENDING_TXS_AGE0 = "stellar_herder_pending_txs_age0"
+            => "Pending transactions at age 0 (current slot)";
+        HERDER_PENDING_TXS_AGE1 = "stellar_herder_pending_txs_age1"
+            => "Pending transactions at age 1";
+        HERDER_PENDING_TXS_AGE2 = "stellar_herder_pending_txs_age2"
+            => "Pending transactions at age 2";
+        HERDER_PENDING_TXS_AGE3 = "stellar_herder_pending_txs_age3"
+            => "Pending transactions at age 3";
+
         // Clock drift gauges (Phase 2).
         DRIFT_MIN_SECONDS = "henyey_herder_drift_min_seconds"
             => "Minimum close time drift in the last completed window (seconds)";
@@ -674,6 +684,12 @@ pub(crate) async fn refresh_gauges(state: &ServerState) {
     gauge!(HERDER_TX_QUEUE_SEEN).set(tq.seen_count as f64);
     counter!(HERDER_ARB_TX_SEEN).absolute(tq.arb_tx_seen);
     counter!(HERDER_ARB_TX_DROPPED).absolute(tq.arb_tx_dropped);
+
+    // Herder pending-tx age gauges (Stage D).
+    gauge!(HERDER_PENDING_TXS_AGE0).set(tq.pending_txs_age[0] as f64);
+    gauge!(HERDER_PENDING_TXS_AGE1).set(tq.pending_txs_age[1] as f64);
+    gauge!(HERDER_PENDING_TXS_AGE2).set(tq.pending_txs_age[2] as f64);
+    gauge!(HERDER_PENDING_TXS_AGE3).set(tq.pending_txs_age[3] as f64);
 
     // Herder pending envelope stats — added + released (Phase 2).
     counter!(HERDER_PENDING_ADDED_TOTAL).absolute(pstats.added);

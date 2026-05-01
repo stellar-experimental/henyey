@@ -3302,6 +3302,7 @@ mod tests {
         assert_eq!(stats.tx_queue_stats.account_count, 0);
         assert_eq!(stats.tx_queue_stats.banned_count, 0);
         assert_eq!(stats.tx_queue_stats.seen_count, 0);
+        assert_eq!(stats.tx_queue_stats.pending_txs_age, [0, 0, 0, 0]);
     }
 
     #[tokio::test]

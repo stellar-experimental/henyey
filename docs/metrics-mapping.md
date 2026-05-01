@@ -38,6 +38,10 @@ Metrics with the `stellar_` prefix that directly mirror stellar-core Medida coun
 | `HERDER_TX_QUEUE_ACCOUNTS` | `stellar_herder_tx_queue_accounts` | gauge | `TransactionQueue::mAccountStates` size |
 | `HERDER_TX_QUEUE_BANNED` | `stellar_herder_tx_queue_banned` | gauge | `TransactionQueue::mBannedTransactions` size |
 | `HERDER_TX_QUEUE_SEEN` | `stellar_herder_tx_queue_seen` | gauge | `TransactionQueue::mKnownTxHashes` size |
+| `HERDER_PENDING_TXS_AGE0` | `stellar_herder_pending_txs_age0` | gauge | Pending txs at age 0 (current slot) |
+| `HERDER_PENDING_TXS_AGE1` | `stellar_herder_pending_txs_age1` | gauge | Pending txs at age 1 |
+| `HERDER_PENDING_TXS_AGE2` | `stellar_herder_pending_txs_age2` | gauge | Pending txs at age 2 |
+| `HERDER_PENDING_TXS_AGE3` | `stellar_herder_pending_txs_age3` | gauge | Pending txs at age 3 |
 | `HERDER_LOST_SYNC_TOTAL` | `stellar_herder_lost_sync_total` | counter | `HerderImpl::mLostSync` |
 | `HERDER_PENDING_RECEIVED_TOTAL` | `stellar_herder_pending_received_total` | counter | Envelopes received |
 | `HERDER_PENDING_DUPLICATES_TOTAL` | `stellar_herder_pending_duplicates_total` | counter | Duplicate envelopes |
