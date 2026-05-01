@@ -276,7 +276,7 @@ report as WARNING without filing.
 | `henyey_scp_verify_input_backlog` | > 100 | WARN | SCP verifier queue growing |
 | `henyey_scp_verifier_thread_state` | != 0 | WARN | 0=Running, 1=Stopping, 2=Dead (`crates/app/src/app/types.rs:310-311`); only Running is healthy |
 | `stellar_herder_pending_envelopes` | > 2000 | WARN | Herder backpressure |
-| `henyey_overlay_fetch_channel_depth_max` | > 500 | WARN | Overlay fetch backpressure |
+| `henyey_overlay_fetch_channel_depth` | > 500 for two consecutive ticks | WARN | Overlay fetch backpressure (live gauge, not monotonic `_max`) |
 | `henyey_process_open_fds` / `henyey_process_max_fds` | > 0.85 | WARN | FD exhaustion imminent |
 | `henyey_herder_drift_max_seconds` | > 10 | NONC | Clock/close-time drift |
 
@@ -354,7 +354,7 @@ Titles:
 Watcher mode (`--watcher`) exposes `/metrics` on port 11727 but has no
 validator/quorum/SCP state. Run check (12) with a reduced catalog:
 process (`henyey_process_open_fds`, `_max_fds`), jemalloc, overlay
-(`stellar_overlay_*_total`, `henyey_overlay_fetch_channel_depth_max`).
+(`stellar_overlay_*_total`, `henyey_overlay_fetch_channel_depth`).
 Skip SCP, quorum, herder_state, histogram p99 alerts, and ratio checks.
 
 ## Bug / CI-Failure Filing Workflow

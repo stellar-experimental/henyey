@@ -505,7 +505,7 @@ below (traffic-proportional and self-calibrating); do NOT check absolute deltas.
 - `henyey_scp_verify_input_backlog` >100 on two consecutive ticks → WARN (single snapshots routinely spike to 100+ during slot externalize bursts and drain to 0 within seconds — gate on persistence. Sample /metrics 5x at 2s intervals to verify before filing)
 - `henyey_scp_verifier_thread_state` !=0 → WARN (0=Running, 1=Stopping, 2=Dead)
 - `stellar_herder_pending_envelopes` >2000 → WARN
-- `henyey_overlay_fetch_channel_depth_max` >500 → WARN
+- `henyey_overlay_fetch_channel_depth` >500 on two consecutive ticks → WARN (the `_max` variant is a monotonic high-water mark that never resets after catchup-tail spikes — use the live gauge with persistence guard, mirroring the scp_verify_input_backlog pattern. Sample /metrics 5x at 2s intervals to verify before filing)
 - `(henyey_process_open_fds / henyey_process_max_fds)` >0.85 → WARN
 - `henyey_herder_drift_max_seconds` >10 → NONC
 - `stellar_scp_timing_externalized_seconds` >10 → WARN (this is a SLOT-CYCLE metric:
