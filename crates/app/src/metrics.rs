@@ -533,6 +533,22 @@ metric_catalog! {
         SCP_NOMINATION_COMBINECANDIDATES_TOTAL = "stellar_scp_nomination_combinecandidates_total"
             => "Total candidate values passed to combineCandidates";
 
+        // Parity gates from #2302 — observability for the new is_applying
+        // and stale-slot skip paths.
+        CONSENSUS_TRIGGER_SKIPPED_APPLYING_TOTAL =
+            "henyey_consensus_trigger_skipped_applying_total"
+            => "Total try_trigger_consensus invocations skipped because a ledger \
+                close was in progress (parity with stellar-core HerderImpl.cpp:1440-1447)";
+        CONSENSUS_TRIGGER_SKIPPED_STALE_TOTAL =
+            "henyey_consensus_trigger_skipped_stale_total"
+            => "Total trigger_next_ledger invocations that returned SkippedStale \
+                because LCL advanced during build_nomination_value (parity with \
+                stellar-core HerderImpl.cpp:1550-1562)";
+        NOMINATION_TIMEOUT_SKIPPED_STALE_TOTAL =
+            "henyey_nomination_timeout_skipped_stale_total"
+            => "Total handle_nomination_timeout invocations that returned \
+                SkippedStale because LCL advanced during build/drain";
+
         // Stage E: History archive lifecycle counters (10334 dashboard).
         // All count terminal outcomes; retries within an operation are not counted.
         HISTORY_PUBLISH_SUCCESS_TOTAL = "stellar_history_publish_success_total"
@@ -1033,6 +1049,11 @@ pub(crate) async fn refresh_gauges(state: &ServerState) {
     gauge!(SCP_MEMORY_CUMULATIVE_STATEMENTS).set(snap.scp_cumulative_statements as f64);
     counter!(SCP_TIMEOUT_NOMINATE_TOTAL).absolute(snap.nomination_timeout_fires);
     counter!(SCP_TIMEOUT_PREPARE_TOTAL).absolute(snap.ballot_timeout_fires);
+    counter!(CONSENSUS_TRIGGER_SKIPPED_APPLYING_TOTAL)
+        .absolute(snap.consensus_trigger_skipped_applying);
+    counter!(CONSENSUS_TRIGGER_SKIPPED_STALE_TOTAL).absolute(snap.consensus_trigger_skipped_stale);
+    counter!(NOMINATION_TIMEOUT_SKIPPED_STALE_TOTAL)
+        .absolute(snap.nomination_timeout_skipped_stale);
     counter!(SCP_ENVELOPE_VALIDSIG_TOTAL).absolute(snap.scp.envelope_validsig_total);
     counter!(SCP_ENVELOPE_INVALIDSIG_TOTAL).absolute(snap.scp.envelope_invalidsig_total);
     counter!(SCP_ENVELOPE_SIGN_TOTAL).absolute(snap.scp.envelope_sign_total);

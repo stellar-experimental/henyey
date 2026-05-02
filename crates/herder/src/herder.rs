@@ -5183,6 +5183,69 @@ mod tests {
         );
     }
 
+    /// Direct regression test for the `lcl_matches_slot` helper used by the
+    /// post-build re-checks in both `trigger_next_ledger` and
+    /// `handle_nomination_timeout`. The helper is the only mechanism the
+    /// post-build re-check uses, so testing it directly verifies the
+    /// post-build path even though the public stale-slot tests exercise the
+    /// pre-build entry check (which short-circuits before the build runs).
+    ///
+    /// Covers all three branches of the helper: LM=None (proceeds), LM
+    /// matches slot, LM mismatches slot (stale).
+    #[test]
+    fn test_lcl_matches_slot_branches() {
+        let seed = [44u8; 32];
+        let secret = SecretKey::from_seed(&seed);
+        let public = secret.public_key();
+        let local_node_id =
+            stellar_xdr::curr::NodeId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
+                stellar_xdr::curr::Uint256(*public.as_bytes()),
+            ));
+        let quorum_set = ScpQuorumSet {
+            threshold: 1,
+            validators: vec![local_node_id].try_into().unwrap(),
+            inner_sets: vec![].try_into().unwrap(),
+        };
+        let config = HerderConfig {
+            is_validator: true,
+            node_public_key: public,
+            local_quorum_set: Some(quorum_set),
+            ..HerderConfig::default()
+        };
+        let herder = Herder::with_secret_key(config, secret);
+
+        // Branch 1: LM=None — preserves pre-bootstrap test scaffolding by
+        // proceeding regardless of slot.
+        assert!(
+            herder.lcl_matches_slot(0),
+            "LM=None should always match (test scaffolding compatibility)"
+        );
+        assert!(
+            herder.lcl_matches_slot(u64::MAX),
+            "LM=None should always match"
+        );
+
+        // Branch 2 & 3: install LM at seq=10, verify match (slot=11) and
+        // mismatch (slot=10, slot=5, slot=12).
+        herder.set_ledger_manager(make_lm_at_seq_for_stale_test(10));
+        assert!(
+            herder.lcl_matches_slot(11),
+            "LM at seq=10 must match slot=11 (LCL+1)"
+        );
+        assert!(
+            !herder.lcl_matches_slot(10),
+            "LM at seq=10 must NOT match slot=10 (already-LCL)"
+        );
+        assert!(
+            !herder.lcl_matches_slot(5),
+            "LM at seq=10 must NOT match slot=5 (far behind)"
+        );
+        assert!(
+            !herder.lcl_matches_slot(12),
+            "LM at seq=10 must NOT match slot=12 (ahead of LCL+1)"
+        );
+    }
+
     /// Regression test for Task 7: genesis-adjacent close-time relaxation.
     ///
     /// When a node is at genesis (tracking_consensus_index <= GENESIS_LEDGER_SEQ)
