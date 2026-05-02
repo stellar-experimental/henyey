@@ -1451,7 +1451,7 @@ mod tests {
         );
     }
 
-    /// Stage E: 18 history counters and 1 histogram are present in the
+    /// Stage E: 16 history counters and 1 histogram are present in the
     /// catalog with the exact wire names referenced from the `henyey-history`
     /// and `henyey-historywork` crates (which use string literals, not
     /// constants, to avoid a cross-crate dep on `henyey-app`).
