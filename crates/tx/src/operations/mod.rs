@@ -83,6 +83,18 @@ pub enum OperationValidationError {
     InvalidHostFunction(String),
     /// Invalid Soroban data.
     InvalidSorobanData(String),
+    /// Invalid signer (self-signer, weight out of range, invalid payload).
+    /// Used by SetOptions; maps to SET_OPTIONS_BAD_SIGNER.
+    InvalidSigner,
+    /// Invalid home domain string (non-printable/control chars or invalid UTF-8).
+    /// Used by SetOptions; maps to SET_OPTIONS_INVALID_HOME_DOMAIN.
+    InvalidHomeDomain,
+    /// Set and clear flags have overlapping bits.
+    /// Used by SetOptions; maps to SET_OPTIONS_BAD_FLAGS.
+    FlagOverlap,
+    /// Flag value contains unknown/unsupported bits outside the valid mask.
+    /// Used by SetOptions; maps to SET_OPTIONS_UNKNOWN_FLAG.
+    UnknownFlags,
     /// Operation type not supported at the current protocol version or ledger flags.
     NotSupported(OperationType),
     /// Generic validation error.
@@ -104,6 +116,10 @@ impl std::fmt::Display for OperationValidationError {
             Self::InvalidPoolId => write!(f, "invalid pool ID"),
             Self::InvalidHostFunction(msg) => write!(f, "invalid host function: {}", msg),
             Self::InvalidSorobanData(msg) => write!(f, "invalid Soroban data: {}", msg),
+            Self::InvalidSigner => write!(f, "invalid signer"),
+            Self::InvalidHomeDomain => write!(f, "invalid home domain"),
+            Self::FlagOverlap => write!(f, "set and clear flags overlap"),
+            Self::UnknownFlags => write!(f, "unknown flags"),
             Self::NotSupported(op) => write!(f, "operation not supported: {:?}", op),
             Self::Other(msg) => write!(f, "{}", msg),
         }
@@ -422,22 +438,18 @@ fn validate_set_options(
     let mask = MASK_ACCOUNT_FLAGS_V17 as u32;
     if let Some(flags) = op.set_flags {
         if flags & !mask != 0 {
-            return Err(OperationValidationError::Other("unknown set flags".into()));
+            return Err(OperationValidationError::UnknownFlags);
         }
     }
     if let Some(flags) = op.clear_flags {
         if flags & !mask != 0 {
-            return Err(OperationValidationError::Other(
-                "unknown clear flags".into(),
-            ));
+            return Err(OperationValidationError::UnknownFlags);
         }
     }
     // setFlags and clearFlags must not overlap
     if let (Some(set), Some(clear)) = (op.set_flags, op.clear_flags) {
         if (set & clear) != 0 {
-            return Err(OperationValidationError::Other(
-                "set and clear flags overlap".into(),
-            ));
+            return Err(OperationValidationError::FlagOverlap);
         }
     }
 
@@ -473,22 +485,18 @@ fn validate_set_options(
                     key.clone(),
                 ));
                 if &signer_acct == src {
-                    return Err(OperationValidationError::Other(
-                        "signer cannot be source account".into(),
-                    ));
+                    return Err(OperationValidationError::InvalidSigner);
                 }
             }
         }
         // p10+: signer weight must fit in u8
         if signer.weight > 255 {
-            return Err(OperationValidationError::InvalidWeight);
+            return Err(OperationValidationError::InvalidSigner);
         }
         // p19+: ED25519_SIGNED_PAYLOAD must have non-empty payload
         if let SignerKey::Ed25519SignedPayload(sp) = &signer.key {
             if sp.payload.is_empty() {
-                return Err(OperationValidationError::Other(
-                    "signed payload signer has empty payload".into(),
-                ));
+                return Err(OperationValidationError::InvalidSigner);
             }
         }
     }
@@ -497,9 +505,7 @@ fn validate_set_options(
     if let Some(domain) = &op.home_domain {
         let bytes: &[u8] = domain.as_ref();
         if !is_string_valid(std::str::from_utf8(bytes).unwrap_or("\0")) {
-            return Err(OperationValidationError::Other(
-                "invalid home domain string".into(),
-            ));
+            return Err(OperationValidationError::InvalidHomeDomain);
         }
     }
 
@@ -1128,19 +1134,19 @@ pub fn malformed_operation_result(
         OperationBody::CreatePassiveSellOffer(_) => {
             OperationResultTr::ManageSellOffer(ManageSellOfferResult::Malformed)
         }
-        // SetOptions: stellar-core maps to specific codes per check.
+        // SetOptions: each validation error maps to a specific result code per
+        // stellar-core SetOptionsOpFrame::doCheckValid(). All SetOptions validation
+        // paths use typed variants at p24+; the catch-all should be unreachable.
         OperationBody::SetOptions(_) => {
             let code = match err {
                 OperationValidationError::InvalidWeight
                 | OperationValidationError::InvalidThreshold => {
                     SetOptionsResult::ThresholdOutOfRange
                 }
-                OperationValidationError::Other(msg) if msg.contains("overlap") => {
-                    SetOptionsResult::BadFlags
-                }
-                OperationValidationError::Other(msg) if msg.contains("unknown") => {
-                    SetOptionsResult::UnknownFlag
-                }
+                OperationValidationError::InvalidSigner => SetOptionsResult::BadSigner,
+                OperationValidationError::InvalidHomeDomain => SetOptionsResult::InvalidHomeDomain,
+                OperationValidationError::FlagOverlap => SetOptionsResult::BadFlags,
+                OperationValidationError::UnknownFlags => SetOptionsResult::UnknownFlag,
                 _ => SetOptionsResult::BadFlags,
             };
             OperationResultTr::SetOptions(code)
@@ -2155,6 +2161,283 @@ mod tests {
                 other
             ),
         }
+    }
+
+    #[test]
+    fn test_malformed_operation_result_set_options_bad_signer_self() {
+        let body = OperationBody::SetOptions(SetOptionsOp {
+            inflation_dest: None,
+            clear_flags: None,
+            set_flags: None,
+            master_weight: None,
+            low_threshold: None,
+            med_threshold: None,
+            high_threshold: None,
+            home_domain: None,
+            signer: None,
+        });
+        let err = OperationValidationError::InvalidSigner;
+        let result = malformed_operation_result(&body, &err);
+        match result {
+            OperationResult::OpInner(OperationResultTr::SetOptions(
+                SetOptionsResult::BadSigner,
+            )) => {}
+            other => panic!("expected SetOptions::BadSigner, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_malformed_operation_result_set_options_invalid_home_domain() {
+        let body = OperationBody::SetOptions(SetOptionsOp {
+            inflation_dest: None,
+            clear_flags: None,
+            set_flags: None,
+            master_weight: None,
+            low_threshold: None,
+            med_threshold: None,
+            high_threshold: None,
+            home_domain: None,
+            signer: None,
+        });
+        let err = OperationValidationError::InvalidHomeDomain;
+        let result = malformed_operation_result(&body, &err);
+        match result {
+            OperationResult::OpInner(OperationResultTr::SetOptions(
+                SetOptionsResult::InvalidHomeDomain,
+            )) => {}
+            other => panic!("expected SetOptions::InvalidHomeDomain, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_malformed_operation_result_set_options_flag_overlap() {
+        let body = OperationBody::SetOptions(SetOptionsOp {
+            inflation_dest: None,
+            clear_flags: None,
+            set_flags: None,
+            master_weight: None,
+            low_threshold: None,
+            med_threshold: None,
+            high_threshold: None,
+            home_domain: None,
+            signer: None,
+        });
+        let err = OperationValidationError::FlagOverlap;
+        let result = malformed_operation_result(&body, &err);
+        match result {
+            OperationResult::OpInner(OperationResultTr::SetOptions(SetOptionsResult::BadFlags)) => {
+            }
+            other => panic!("expected SetOptions::BadFlags, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_malformed_operation_result_set_options_unknown_flags() {
+        let body = OperationBody::SetOptions(SetOptionsOp {
+            inflation_dest: None,
+            clear_flags: None,
+            set_flags: None,
+            master_weight: None,
+            low_threshold: None,
+            med_threshold: None,
+            high_threshold: None,
+            home_domain: None,
+            signer: None,
+        });
+        let err = OperationValidationError::UnknownFlags;
+        let result = malformed_operation_result(&body, &err);
+        match result {
+            OperationResult::OpInner(OperationResultTr::SetOptions(
+                SetOptionsResult::UnknownFlag,
+            )) => {}
+            other => panic!("expected SetOptions::UnknownFlag, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_malformed_operation_result_set_options_threshold_out_of_range() {
+        let body = OperationBody::SetOptions(SetOptionsOp {
+            inflation_dest: None,
+            clear_flags: None,
+            set_flags: None,
+            master_weight: None,
+            low_threshold: None,
+            med_threshold: None,
+            high_threshold: None,
+            home_domain: None,
+            signer: None,
+        });
+        let err = OperationValidationError::InvalidThreshold;
+        let result = malformed_operation_result(&body, &err);
+        match result {
+            OperationResult::OpInner(OperationResultTr::SetOptions(
+                SetOptionsResult::ThresholdOutOfRange,
+            )) => {}
+            other => panic!("expected SetOptions::ThresholdOutOfRange, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_malformed_operation_result_set_options_master_weight_out_of_range() {
+        let body = OperationBody::SetOptions(SetOptionsOp {
+            inflation_dest: None,
+            clear_flags: None,
+            set_flags: None,
+            master_weight: None,
+            low_threshold: None,
+            med_threshold: None,
+            high_threshold: None,
+            home_domain: None,
+            signer: None,
+        });
+        let err = OperationValidationError::InvalidWeight;
+        let result = malformed_operation_result(&body, &err);
+        match result {
+            OperationResult::OpInner(OperationResultTr::SetOptions(
+                SetOptionsResult::ThresholdOutOfRange,
+            )) => {}
+            other => panic!("expected SetOptions::ThresholdOutOfRange, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_validate_set_options_signer_is_self() {
+        let key = Uint256([1u8; 32]);
+        let source = AccountId(PublicKey::PublicKeyTypeEd25519(key.clone()));
+        let op = SetOptionsOp {
+            inflation_dest: None,
+            clear_flags: None,
+            set_flags: None,
+            master_weight: None,
+            low_threshold: None,
+            med_threshold: None,
+            high_threshold: None,
+            home_domain: None,
+            signer: Some(Signer {
+                key: SignerKey::Ed25519(key),
+                weight: 1,
+            }),
+        };
+        let err = validate_set_options(&op, 24, Some(&source)).unwrap_err();
+        assert!(
+            matches!(err, OperationValidationError::InvalidSigner),
+            "expected InvalidSigner, got {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_validate_set_options_signer_weight_invalid() {
+        let op = SetOptionsOp {
+            inflation_dest: None,
+            clear_flags: None,
+            set_flags: None,
+            master_weight: None,
+            low_threshold: None,
+            med_threshold: None,
+            high_threshold: None,
+            home_domain: None,
+            signer: Some(Signer {
+                key: SignerKey::Ed25519(Uint256([2u8; 32])),
+                weight: 256,
+            }),
+        };
+        let err = validate_set_options(&op, 24, None).unwrap_err();
+        assert!(
+            matches!(err, OperationValidationError::InvalidSigner),
+            "expected InvalidSigner, got {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_validate_set_options_empty_signed_payload() {
+        let op = SetOptionsOp {
+            inflation_dest: None,
+            clear_flags: None,
+            set_flags: None,
+            master_weight: None,
+            low_threshold: None,
+            med_threshold: None,
+            high_threshold: None,
+            home_domain: None,
+            signer: Some(Signer {
+                key: SignerKey::Ed25519SignedPayload(SignerKeyEd25519SignedPayload {
+                    ed25519: Uint256([3u8; 32]),
+                    payload: BytesM::default(),
+                }),
+                weight: 1,
+            }),
+        };
+        let err = validate_set_options(&op, 24, None).unwrap_err();
+        assert!(
+            matches!(err, OperationValidationError::InvalidSigner),
+            "expected InvalidSigner, got {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_validate_set_options_invalid_home_domain() {
+        let op = SetOptionsOp {
+            inflation_dest: None,
+            clear_flags: None,
+            set_flags: None,
+            master_weight: None,
+            low_threshold: None,
+            med_threshold: None,
+            high_threshold: None,
+            home_domain: Some(String32::try_from(vec![0x01]).unwrap()),
+            signer: None,
+        };
+        let err = validate_set_options(&op, 24, None).unwrap_err();
+        assert!(
+            matches!(err, OperationValidationError::InvalidHomeDomain),
+            "expected InvalidHomeDomain, got {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_validate_set_options_unknown_flags() {
+        let op = SetOptionsOp {
+            inflation_dest: None,
+            clear_flags: None,
+            set_flags: Some(0x8000_0000),
+            master_weight: None,
+            low_threshold: None,
+            med_threshold: None,
+            high_threshold: None,
+            home_domain: None,
+            signer: None,
+        };
+        let err = validate_set_options(&op, 24, None).unwrap_err();
+        assert!(
+            matches!(err, OperationValidationError::UnknownFlags),
+            "expected UnknownFlags, got {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_validate_set_options_flag_overlap() {
+        let op = SetOptionsOp {
+            inflation_dest: None,
+            clear_flags: Some(1),
+            set_flags: Some(1),
+            master_weight: None,
+            low_threshold: None,
+            med_threshold: None,
+            high_threshold: None,
+            home_domain: None,
+            signer: None,
+        };
+        let err = validate_set_options(&op, 24, None).unwrap_err();
+        assert!(
+            matches!(err, OperationValidationError::FlagOverlap),
+            "expected FlagOverlap, got {:?}",
+            err
+        );
     }
 
     #[test]
