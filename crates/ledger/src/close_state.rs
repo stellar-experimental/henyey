@@ -21,20 +21,30 @@
 //! let changes = state.entry_changes_since(cp);
 //! ```
 
-use crate::delta::{DeltaCategorization, LedgerDelta};
+use crate::delta::{DeltaCategorization, EntryChange, LedgerDelta};
 use crate::snapshot::SnapshotHandle;
 use crate::Result;
+use std::collections::HashMap;
 use stellar_xdr::curr::{
     AccountEntry, AccountId, LedgerEntry, LedgerEntryChange, LedgerEntryChanges, LedgerEntryData,
-    LedgerHeader, LedgerKey, VecM,
+    LedgerHeader, LedgerKey,
 };
 
 /// A checkpoint of delta state, used to extract per-upgrade entry changes.
 ///
 /// Created by [`CloseLedgerState::change_checkpoint`], consumed by
 /// [`CloseLedgerState::entry_changes_since`].
+///
+/// Stores a snapshot of the delta's entries at checkpoint time so that
+/// `entry_changes_since` can diff the current state against the checkpoint
+/// and detect all modifications — including in-place updates to pre-existing
+/// entries. This mirrors stellar-core's child LedgerTxn + getChanges() pattern.
 pub struct ChangeCheckpoint {
-    num_changes: usize,
+    /// Snapshot of delta entry values at checkpoint time.
+    entries: HashMap<LedgerKey, EntryChange>,
+    /// Keys in insertion order at checkpoint time, for deterministic
+    /// iteration over keys that disappeared from the delta after checkpoint.
+    key_order: Vec<LedgerKey>,
 }
 
 /// A merged-read view of ledger state during close.
@@ -233,43 +243,64 @@ impl CloseLedgerState {
     // Checkpoint API for upgrade meta capture
     // ------------------------------------------------------------------
 
-    /// Capture the current delta size as a checkpoint.
+    /// Capture the current delta state as a checkpoint.
     ///
-    /// Used before an upgrade sub-phase to mark the "before" state, so that
-    /// [`entry_changes_since`] can extract only the changes made during that
-    /// sub-phase.
+    /// Used before an upgrade sub-phase to snapshot the "before" state, so that
+    /// [`entry_changes_since`] can diff the current state against it and detect
+    /// all modifications — including in-place updates to pre-existing entries.
+    ///
+    /// Mirrors stellar-core's child LedgerTxn creation before each upgrade scope.
     pub fn change_checkpoint(&self) -> ChangeCheckpoint {
         ChangeCheckpoint {
-            num_changes: self.current.num_changes(),
+            entries: self.current.snapshot_changes(),
+            key_order: self.current.key_order(),
         }
     }
 
     /// Extract all entry changes made since the given checkpoint.
     ///
+    /// Performs a snapshot-and-diff: compares the current delta state against
+    /// the checkpoint snapshot to detect new entries, modified pre-existing
+    /// entries, and deleted entries. This matches stellar-core's
+    /// `LedgerTxn::getChanges()` parent-vs-child diff semantics.
+    ///
     /// Returns an XDR `LedgerEntryChanges` suitable for upgrade metadata.
     pub fn entry_changes_since(&self, cp: ChangeCheckpoint) -> LedgerEntryChanges {
-        let delta_after = self.current.num_changes();
-        if delta_after <= cp.num_changes {
-            return LedgerEntryChanges(VecM::default());
+        let mut changes: Vec<LedgerEntryChange> = Vec::new();
+
+        // Phase 1: Process all keys currently in the delta (insertion order).
+        for (key, current_change) in self.current.keyed_changes() {
+            if let Some(cp_change) = cp.entries.get(key) {
+                // Key existed at checkpoint — compare visible states.
+                let before = visible_entry(cp_change);
+                let after = visible_entry(current_change);
+                emit_diff(&mut changes, key, before, after);
+            } else {
+                // Key is new to the delta since checkpoint.
+                // The EntryChange variant encodes the correct emission:
+                // - Created = genuinely new entry
+                // - Updated = snapshot entry was modified (previous is pre-mod value)
+                // - Deleted = snapshot entry was deleted (previous is pre-del value)
+                emit_new_entry(&mut changes, current_change);
+            }
         }
 
-        let mut changes: Vec<LedgerEntryChange> = Vec::new();
-        for change in self.current.changes().skip(cp.num_changes) {
-            match change {
-                crate::delta::EntryChange::Created(entry) => {
-                    changes.push(LedgerEntryChange::Created(entry.clone()));
-                }
-                crate::delta::EntryChange::Updated { previous, current } => {
-                    changes.push(LedgerEntryChange::State(previous.clone()));
-                    changes.push(LedgerEntryChange::Updated(current.as_ref().clone()));
-                }
-                crate::delta::EntryChange::Deleted { previous } => {
-                    let key = henyey_common::entry_to_key(previous);
-                    changes.push(LedgerEntryChange::State(previous.clone()));
-                    changes.push(LedgerEntryChange::Removed(key));
+        // Phase 2: Keys in checkpoint that disappeared from the current delta.
+        // This only happens when record_delete removes a Created entry entirely
+        // (delta.rs: Created + Delete = remove from delta). If the entry was
+        // visible at checkpoint time, emit STATE + REMOVED.
+        for key in &cp.key_order {
+            if self.current.has_key(key) {
+                continue; // Already handled in Phase 1
+            }
+            if let Some(cp_change) = cp.entries.get(key) {
+                if let Some(v1) = visible_entry(cp_change) {
+                    changes.push(LedgerEntryChange::State(v1.clone()));
+                    changes.push(LedgerEntryChange::Removed(henyey_common::entry_to_key(v1)));
                 }
             }
         }
+
         LedgerEntryChanges(changes.try_into().unwrap_or_default())
     }
 
@@ -328,6 +359,69 @@ impl crate::EntryReader for CloseLedgerState {
 /// Check if a ledger key is for an offer entry.
 fn is_offer_key(key: &LedgerKey) -> bool {
     matches!(key, LedgerKey::Offer(_))
+}
+
+/// Extract the visible LedgerEntry from an EntryChange.
+///
+/// "Visible" means the entry value that would be seen by readers:
+/// - Created(v) → Some(v)
+/// - Updated{_, curr} → Some(curr)
+/// - Deleted{_} → None (entry is absent)
+fn visible_entry(change: &EntryChange) -> Option<&LedgerEntry> {
+    match change {
+        EntryChange::Created(entry) => Some(entry),
+        EntryChange::Updated { current, .. } => Some(current.as_ref()),
+        EntryChange::Deleted { .. } => None,
+    }
+}
+
+/// Emit LedgerEntryChanges for a diff between before/after visible states.
+///
+/// Matches stellar-core's parent-vs-child comparison in getChanges().
+fn emit_diff(
+    changes: &mut Vec<LedgerEntryChange>,
+    key: &LedgerKey,
+    before: Option<&LedgerEntry>,
+    after: Option<&LedgerEntry>,
+) {
+    match (before, after) {
+        (Some(v1), Some(v2)) if v1 != v2 => {
+            changes.push(LedgerEntryChange::State(v1.clone()));
+            changes.push(LedgerEntryChange::Updated(v2.clone()));
+        }
+        (Some(v1), None) => {
+            changes.push(LedgerEntryChange::State(v1.clone()));
+            changes.push(LedgerEntryChange::Removed(key.clone()));
+        }
+        (None, Some(v2)) => {
+            changes.push(LedgerEntryChange::Created(v2.clone()));
+        }
+        _ => {} // same or both absent — no emission
+    }
+}
+
+/// Emit LedgerEntryChanges for a key new to the delta since checkpoint.
+///
+/// The EntryChange variant directly determines the emission type:
+/// - Created = genuinely new entry (CREATED)
+/// - Updated = snapshot entry was modified (STATE + UPDATED)
+/// - Deleted = snapshot entry was deleted (STATE + REMOVED)
+fn emit_new_entry(changes: &mut Vec<LedgerEntryChange>, change: &EntryChange) {
+    match change {
+        EntryChange::Created(entry) => {
+            changes.push(LedgerEntryChange::Created(entry.clone()));
+        }
+        EntryChange::Updated { previous, current } => {
+            changes.push(LedgerEntryChange::State(previous.clone()));
+            changes.push(LedgerEntryChange::Updated(current.as_ref().clone()));
+        }
+        EntryChange::Deleted { previous } => {
+            changes.push(LedgerEntryChange::State(previous.clone()));
+            changes.push(LedgerEntryChange::Removed(henyey_common::entry_to_key(
+                previous,
+            )));
+        }
+    }
 }
 
 #[cfg(test)]
@@ -552,5 +646,284 @@ mod tests {
         assert_eq!(state.num_changes(), 0);
         assert_eq!(state.fee_pool_delta(), 750);
         assert_eq!(state.total_coins_delta(), -200);
+    }
+
+    // ------------------------------------------------------------------
+    // Checkpoint snapshot-and-diff tests
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_entry_changes_since_detects_pre_existing_modification() {
+        // Bug scenario: entry modified in delta before checkpoint, then modified
+        // again after checkpoint. The old skip-based approach missed this.
+        let old_entry = make_test_account_entry(1, 5000, 99);
+        let snapshot = make_snapshot_with_entry(100, old_entry.clone());
+        let header = LedgerHeader {
+            ledger_version: 25,
+            ledger_seq: 100,
+            ..Default::default()
+        };
+        let mut state =
+            CloseLedgerState::begin(snapshot, header, henyey_common::Hash256::ZERO, 101);
+
+        // Modify entry (e.g. fee processing) — adds to delta as Updated
+        let mid_entry = make_test_account_entry(1, 4000, 101);
+        state.record_update(old_entry, mid_entry.clone()).unwrap();
+
+        // Take checkpoint
+        let cp = state.change_checkpoint();
+
+        // Modify same entry again (e.g. prepareLiabilities during upgrade)
+        let final_entry = make_test_account_entry(1, 3000, 101);
+        state
+            .record_update(mid_entry.clone(), final_entry.clone())
+            .unwrap();
+
+        // Should detect the modification: STATE(mid) + UPDATED(final)
+        let changes = state.entry_changes_since(cp);
+        assert_eq!(changes.0.len(), 2, "Expected STATE + UPDATED pair");
+        assert!(matches!(&changes.0[0], LedgerEntryChange::State(e) if *e == mid_entry));
+        assert!(matches!(&changes.0[1], LedgerEntryChange::Updated(e) if *e == final_entry));
+    }
+
+    #[test]
+    fn test_entry_changes_since_created_then_deleted() {
+        // Entry created before checkpoint, then deleted after.
+        // record_delete on Created removes from delta entirely → Phase 2 catches it.
+        let snapshot = make_empty_snapshot(100);
+        let header = LedgerHeader {
+            ledger_version: 25,
+            ledger_seq: 100,
+            ..Default::default()
+        };
+        let mut state =
+            CloseLedgerState::begin(snapshot, header, henyey_common::Hash256::ZERO, 101);
+
+        // Create entry
+        let entry = make_test_account_entry(1, 1000, 101);
+        state.record_create(entry.clone()).unwrap();
+
+        // Take checkpoint (entry is visible as Created)
+        let cp = state.change_checkpoint();
+
+        // Delete the entry — removes Created from delta entirely
+        state.record_delete(entry.clone()).unwrap();
+
+        // Should emit STATE(entry) + REMOVED(key) via Phase 2
+        let changes = state.entry_changes_since(cp);
+        assert_eq!(changes.0.len(), 2, "Expected STATE + REMOVED pair");
+        assert!(matches!(&changes.0[0], LedgerEntryChange::State(e) if *e == entry));
+        assert!(matches!(&changes.0[1], LedgerEntryChange::Removed(_)));
+    }
+
+    #[test]
+    fn test_entry_changes_since_created_then_modified() {
+        // Entry created before checkpoint, then modified after (via record_create on existing).
+        let snapshot = make_empty_snapshot(100);
+        let header = LedgerHeader {
+            ledger_version: 25,
+            ledger_seq: 100,
+            ..Default::default()
+        };
+        let mut state =
+            CloseLedgerState::begin(snapshot, header, henyey_common::Hash256::ZERO, 101);
+
+        // Create entry
+        let entry_v1 = make_test_account_entry(1, 1000, 101);
+        state.record_create(entry_v1.clone()).unwrap();
+
+        // Take checkpoint
+        let cp = state.change_checkpoint();
+
+        // Modify via record_create on existing key (updates in-place)
+        let entry_v2 = make_test_account_entry(1, 2000, 101);
+        state.record_create(entry_v2.clone()).unwrap();
+
+        // Should emit STATE(v1) + UPDATED(v2)
+        let changes = state.entry_changes_since(cp);
+        assert_eq!(changes.0.len(), 2, "Expected STATE + UPDATED pair");
+        assert!(matches!(&changes.0[0], LedgerEntryChange::State(e) if *e == entry_v1));
+        assert!(matches!(&changes.0[1], LedgerEntryChange::Updated(e) if *e == entry_v2));
+    }
+
+    #[test]
+    fn test_entry_changes_since_snapshot_entry_updated() {
+        // Empty delta at checkpoint, then snapshot entry modified → STATE + UPDATED.
+        // This is the config upgrade scenario (config_upgrade.rs tests).
+        let old_entry = make_test_account_entry(1, 5000, 99);
+        let snapshot = make_snapshot_with_entry(100, old_entry.clone());
+        let header = LedgerHeader {
+            ledger_version: 25,
+            ledger_seq: 100,
+            ..Default::default()
+        };
+        let mut state =
+            CloseLedgerState::begin(snapshot, header, henyey_common::Hash256::ZERO, 101);
+
+        // Checkpoint with empty delta
+        let cp = state.change_checkpoint();
+
+        // Modify snapshot entry (new to delta as Updated{prev, curr})
+        let new_entry = make_test_account_entry(1, 3000, 101);
+        state
+            .record_update(old_entry.clone(), new_entry.clone())
+            .unwrap();
+
+        // Should emit STATE(old) + UPDATED(new) via emit_new_entry
+        let changes = state.entry_changes_since(cp);
+        assert_eq!(changes.0.len(), 2, "Expected STATE + UPDATED pair");
+        assert!(matches!(&changes.0[0], LedgerEntryChange::State(e) if *e == old_entry));
+        assert!(matches!(&changes.0[1], LedgerEntryChange::Updated(e) if *e == new_entry));
+    }
+
+    #[test]
+    fn test_entry_changes_since_snapshot_entry_deleted() {
+        // Empty delta at checkpoint, then snapshot entry deleted → STATE + REMOVED.
+        let old_entry = make_test_account_entry(1, 5000, 99);
+        let snapshot = make_snapshot_with_entry(100, old_entry.clone());
+        let header = LedgerHeader {
+            ledger_version: 25,
+            ledger_seq: 100,
+            ..Default::default()
+        };
+        let mut state =
+            CloseLedgerState::begin(snapshot, header, henyey_common::Hash256::ZERO, 101);
+
+        // Checkpoint with empty delta
+        let cp = state.change_checkpoint();
+
+        // Delete snapshot entry (new to delta as Deleted{prev})
+        state.record_delete(old_entry.clone()).unwrap();
+
+        // Should emit STATE(old) + REMOVED(key) via emit_new_entry
+        let changes = state.entry_changes_since(cp);
+        assert_eq!(changes.0.len(), 2, "Expected STATE + REMOVED pair");
+        assert!(matches!(&changes.0[0], LedgerEntryChange::State(e) if *e == old_entry));
+        assert!(matches!(&changes.0[1], LedgerEntryChange::Removed(_)));
+    }
+
+    #[test]
+    fn test_entry_changes_since_deleted_then_recreated() {
+        // Entry deleted before checkpoint (Deleted in delta), then recreated after.
+        // Visible state: absent → present = CREATED.
+        let old_entry = make_test_account_entry(1, 5000, 99);
+        let snapshot = make_snapshot_with_entry(100, old_entry.clone());
+        let header = LedgerHeader {
+            ledger_version: 25,
+            ledger_seq: 100,
+            ..Default::default()
+        };
+        let mut state =
+            CloseLedgerState::begin(snapshot, header, henyey_common::Hash256::ZERO, 101);
+
+        // Delete entry (adds Deleted{prev} to delta)
+        state.record_delete(old_entry.clone()).unwrap();
+
+        // Take checkpoint (entry visible state = absent/Deleted)
+        let cp = state.change_checkpoint();
+
+        // Recreate entry (record_create on Deleted = Updated with new value)
+        let new_entry = make_test_account_entry(1, 8000, 101);
+        state.record_create(new_entry.clone()).unwrap();
+
+        // Visible state went from absent (Deleted) to present → CREATED
+        let changes = state.entry_changes_since(cp);
+        assert_eq!(changes.0.len(), 1, "Expected CREATED");
+        assert!(matches!(&changes.0[0], LedgerEntryChange::Created(e) if *e == new_entry));
+    }
+
+    #[test]
+    fn test_entry_changes_since_mixed_scenarios() {
+        // Multiple entries with different before/after transitions.
+        let snapshot_entry = make_test_account_entry(3, 9000, 99);
+        let snapshot = make_snapshot_with_entry(100, snapshot_entry.clone());
+        let header = LedgerHeader {
+            ledger_version: 25,
+            ledger_seq: 100,
+            ..Default::default()
+        };
+        let mut state =
+            CloseLedgerState::begin(snapshot, header, henyey_common::Hash256::ZERO, 101);
+
+        // Entry 1: created before checkpoint, unchanged after → no emission
+        let entry1 = make_test_account_entry(1, 1000, 101);
+        state.record_create(entry1.clone()).unwrap();
+
+        // Entry 2: created before checkpoint, modified after → STATE + UPDATED
+        let entry2_v1 = make_test_account_entry(2, 2000, 101);
+        state.record_create(entry2_v1.clone()).unwrap();
+
+        // Take checkpoint
+        let cp = state.change_checkpoint();
+
+        // Modify entry 2
+        let entry2_v2 = make_test_account_entry(2, 2500, 101);
+        state.record_create(entry2_v2.clone()).unwrap();
+
+        // Entry 4: new after checkpoint → CREATED
+        let entry4 = make_test_account_entry(4, 4000, 101);
+        state.record_create(entry4.clone()).unwrap();
+
+        // Entry 3 (snapshot): modify after checkpoint → STATE + UPDATED (new to delta)
+        let entry3_new = make_test_account_entry(3, 7000, 101);
+        state
+            .record_update(snapshot_entry.clone(), entry3_new.clone())
+            .unwrap();
+
+        let changes = state.entry_changes_since(cp);
+        // Expected:
+        // - Entry 1: unchanged → skip
+        // - Entry 2: STATE(v1) + UPDATED(v2) [pre-existing, modified]
+        // - Entry 4: CREATED [new]
+        // - Entry 3: STATE(snapshot) + UPDATED(new) [new to delta, Updated variant]
+        assert_eq!(
+            changes.0.len(),
+            5,
+            "Expected 5 change entries: {:?}",
+            changes
+                .0
+                .iter()
+                .map(std::mem::discriminant)
+                .collect::<Vec<_>>()
+        );
+
+        // Entry 2: STATE + UPDATED
+        assert!(matches!(&changes.0[0], LedgerEntryChange::State(e) if *e == entry2_v1));
+        assert!(matches!(&changes.0[1], LedgerEntryChange::Updated(e) if *e == entry2_v2));
+        // Entry 4: CREATED
+        assert!(matches!(&changes.0[2], LedgerEntryChange::Created(e) if *e == entry4));
+        // Entry 3: STATE + UPDATED (from snapshot)
+        assert!(matches!(&changes.0[3], LedgerEntryChange::State(e) if *e == snapshot_entry));
+        assert!(matches!(&changes.0[4], LedgerEntryChange::Updated(e) if *e == entry3_new));
+    }
+
+    #[test]
+    fn test_entry_changes_since_unchanged_entry_skipped() {
+        // Entry in delta before and after checkpoint but not modified → no emission.
+        let old_entry = make_test_account_entry(1, 5000, 99);
+        let snapshot = make_snapshot_with_entry(100, old_entry.clone());
+        let header = LedgerHeader {
+            ledger_version: 25,
+            ledger_seq: 100,
+            ..Default::default()
+        };
+        let mut state =
+            CloseLedgerState::begin(snapshot, header, henyey_common::Hash256::ZERO, 101);
+
+        // Modify entry (adds to delta)
+        let new_entry = make_test_account_entry(1, 4000, 101);
+        state.record_update(old_entry, new_entry).unwrap();
+
+        // Take checkpoint
+        let cp = state.change_checkpoint();
+
+        // Don't modify the entry after checkpoint
+        // Should produce no changes
+        let changes = state.entry_changes_since(cp);
+        assert_eq!(
+            changes.0.len(),
+            0,
+            "Expected no changes for unmodified entry"
+        );
     }
 }

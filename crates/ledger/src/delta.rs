@@ -569,6 +569,28 @@ impl LedgerDelta {
         self.change_order.iter().filter_map(|k| self.changes.get(k))
     }
 
+    /// Iterate entries in insertion order, yielding (key, change) pairs.
+    pub(crate) fn keyed_changes(&self) -> impl Iterator<Item = (&LedgerKey, &EntryChange)> {
+        self.change_order
+            .iter()
+            .filter_map(|k| self.changes.get(k).map(|c| (k, c)))
+    }
+
+    /// Clone the current changes map for checkpoint snapshotting.
+    pub(crate) fn snapshot_changes(&self) -> HashMap<LedgerKey, EntryChange> {
+        self.changes.clone()
+    }
+
+    /// Clone the current key insertion order for checkpoint snapshotting.
+    pub(crate) fn key_order(&self) -> Vec<LedgerKey> {
+        self.change_order.clone()
+    }
+
+    /// Check if a key is currently present in the delta.
+    pub(crate) fn has_key(&self, key: &LedgerKey) -> bool {
+        self.changes.contains_key(key)
+    }
+
     /// Get the number of changes.
     pub fn num_changes(&self) -> usize {
         self.changes.len()
