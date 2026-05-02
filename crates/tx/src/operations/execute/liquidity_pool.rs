@@ -327,25 +327,32 @@ pub(crate) fn execute_liquidity_pool_withdraw(
     let withdraw_a = get_pool_withdrawal_amount(op.amount, total_shares, reserve_a);
     let withdraw_b = get_pool_withdrawal_amount(op.amount, total_shares, reserve_b);
 
-    if withdraw_a < op.min_amount_a || withdraw_b < op.min_amount_b {
-        return Ok(make_withdraw_result(
-            LiquidityPoolWithdrawResultCode::UnderMinimum,
-        ));
+    // Process assets sequentially matching stellar-core's tryAddAssetBalance order:
+    // check min → check capacity, per asset. Asset A is fully evaluated before B.
+    match try_add_asset_balance(state, source, &asset_a, op.min_amount_a, withdraw_a) {
+        WithdrawCheckResult::Ok => {}
+        WithdrawCheckResult::UnderMinimum => {
+            return Ok(make_withdraw_result(
+                LiquidityPoolWithdrawResultCode::UnderMinimum,
+            ));
+        }
+        WithdrawCheckResult::LineFull => {
+            return Ok(make_withdraw_result(
+                LiquidityPoolWithdrawResultCode::LineFull,
+            ));
+        }
     }
-
-    for (asset, amount) in [(&asset_a, withdraw_a), (&asset_b, withdraw_b)] {
-        match can_credit_asset(state, source, asset, amount) {
-            WithdrawAssetCheck::Ok => {}
-            WithdrawAssetCheck::NoTrust => {
-                return Ok(make_withdraw_result(
-                    LiquidityPoolWithdrawResultCode::NoTrust,
-                ));
-            }
-            WithdrawAssetCheck::LineFull => {
-                return Ok(make_withdraw_result(
-                    LiquidityPoolWithdrawResultCode::LineFull,
-                ));
-            }
+    match try_add_asset_balance(state, source, &asset_b, op.min_amount_b, withdraw_b) {
+        WithdrawCheckResult::Ok => {}
+        WithdrawCheckResult::UnderMinimum => {
+            return Ok(make_withdraw_result(
+                LiquidityPoolWithdrawResultCode::UnderMinimum,
+            ));
+        }
+        WithdrawCheckResult::LineFull => {
+            return Ok(make_withdraw_result(
+                LiquidityPoolWithdrawResultCode::LineFull,
+            ));
         }
     }
 
@@ -591,6 +598,17 @@ enum WithdrawAssetCheck {
     LineFull,
 }
 
+/// Result of checking whether a single asset withdrawal can proceed.
+/// Only two failure modes are possible at this stage: the withdrawal amount
+/// is below the minimum, or the trustline cannot hold the credited amount.
+/// `NoTrust` is excluded by invariant (pool existence guarantees constituent
+/// trustlines exist).
+enum WithdrawCheckResult {
+    Ok,
+    UnderMinimum,
+    LineFull,
+}
+
 fn can_credit_asset(
     state: &LedgerStateManager,
     source: &AccountId,
@@ -635,6 +653,48 @@ fn can_credit_asset(
         return WithdrawAssetCheck::LineFull;
     }
     WithdrawAssetCheck::Ok
+}
+
+/// Mirrors stellar-core's `tryAddAssetBalance` error-selection order:
+/// 1. Check `withdraw_amount >= min_amount` (else UNDER_MINIMUM)
+/// 2. Check trustline can hold the credit (else LINE_FULL)
+///
+/// Does NOT mutate state — only classifies whether the withdrawal would succeed.
+/// Balance mutations are deferred until both assets pass.
+///
+/// # Preconditions
+/// - Source account exists (guaranteed by transaction framework)
+/// - Pool-share trustline exists (checked earlier in withdraw flow)
+/// - Constituent asset trustlines exist for non-native, non-issuer assets
+///   (invariant: trustlines cannot be deleted while `liquidity_pool_use_count > 0`)
+///
+/// # Postconditions
+/// - No ledger state is modified regardless of return value
+///
+/// # Panics
+/// If `can_credit_asset` returns `NoTrust` — this indicates a violated invariant
+/// (constituent trustlines must exist while the pool exists).
+fn try_add_asset_balance(
+    state: &LedgerStateManager,
+    source: &AccountId,
+    asset: &Asset,
+    min_amount: i64,
+    withdraw_amount: i64,
+) -> WithdrawCheckResult {
+    if withdraw_amount < min_amount {
+        return WithdrawCheckResult::UnderMinimum;
+    }
+    match can_credit_asset(state, source, asset, withdraw_amount) {
+        WithdrawAssetCheck::Ok => WithdrawCheckResult::Ok,
+        WithdrawAssetCheck::LineFull => WithdrawCheckResult::LineFull,
+        WithdrawAssetCheck::NoTrust => {
+            panic!(
+                "invariant violation: constituent asset trustline missing during \
+                 pool withdrawal — pool existence guarantees trustlines exist \
+                 (liquidity_pool_use_count > 0 blocks trustline removal)"
+            );
+        }
+    }
 }
 
 fn credit_asset(state: &mut LedgerStateManager, source: &AccountId, asset: &Asset, amount: i64) {
@@ -2672,6 +2732,449 @@ mod tests {
                 );
             }
             other => panic!("unexpected result: {:?}", other),
+        }
+    }
+
+    /// Regression test for AUDIT-247: when asset A passes min but fails LINE_FULL,
+    /// and asset B fails UNDER_MINIMUM, the result must be LINE_FULL (not UNDER_MINIMUM).
+    /// stellar-core processes assets sequentially; A's LINE_FULL is hit before B is checked.
+    #[test]
+    fn test_liquidity_pool_withdraw_line_full_before_under_minimum() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let source_id = create_test_account_id(0);
+        let issuer_a = create_test_account_id(1);
+        let issuer_b = create_test_account_id(2);
+        state.create_account(create_test_account(source_id.clone(), 100_000_000, 0));
+        state.create_account(create_test_account(issuer_a.clone(), 100_000_000, 0));
+        state.create_account(create_test_account(issuer_b.clone(), 100_000_000, 0));
+
+        let asset_a = Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4(*b"USD\0"),
+            issuer: issuer_a,
+        });
+        let asset_b = Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4(*b"EUR\0"),
+            issuer: issuer_b,
+        });
+        let pool_id = PoolId(Hash([90u8; 32]));
+        // Pool with 1000 of each asset and 1000 shares
+        state.create_liquidity_pool(create_pool_entry(
+            pool_id.clone(),
+            asset_a.clone(),
+            asset_b.clone(),
+            1000,
+            1000,
+            1000,
+        ));
+
+        // Asset A trustline: balance=95, limit=100 → can only accept 5 more
+        let trustline_a = TrustLineEntry {
+            account_id: source_id.clone(),
+            asset: TrustLineAsset::CreditAlphanum4(match &asset_a {
+                Asset::CreditAlphanum4(a) => a.clone(),
+                _ => unreachable!(),
+            }),
+            balance: 95,
+            limit: 100,
+            flags: TrustLineFlags::AuthorizedFlag as u32,
+            ext: TrustLineEntryExt::V0,
+        };
+        // Asset B trustline: plenty of room
+        let trustline_b = TrustLineEntry {
+            account_id: source_id.clone(),
+            asset: TrustLineAsset::CreditAlphanum4(match &asset_b {
+                Asset::CreditAlphanum4(a) => a.clone(),
+                _ => unreachable!(),
+            }),
+            balance: 0,
+            limit: 10_000,
+            flags: TrustLineFlags::AuthorizedFlag as u32,
+            ext: TrustLineEntryExt::V0,
+        };
+        // Pool share trustline with 100 shares
+        let pool_share_tl = TrustLineEntry {
+            account_id: source_id.clone(),
+            asset: TrustLineAsset::PoolShare(pool_id.clone()),
+            balance: 100,
+            limit: 10_000,
+            flags: 0,
+            ext: TrustLineEntryExt::V0,
+        };
+        state.create_trustline(trustline_a);
+        state.create_trustline(trustline_b);
+        state.create_trustline(pool_share_tl);
+        state.get_account_mut(&source_id).unwrap().num_sub_entries += 3;
+
+        // Withdraw 100 shares: withdraw_a = 100, withdraw_b = 100
+        // Asset A: withdraw_a(100) >= min_amount_a(0) ✓, but trustline can only hold 5 → LINE_FULL
+        // Asset B: withdraw_b(100) < min_amount_b(999) → would be UNDER_MINIMUM
+        // Expected: LINE_FULL (A fails first in sequential order)
+        let op = LiquidityPoolWithdrawOp {
+            liquidity_pool_id: pool_id.clone(),
+            amount: 100,
+            min_amount_a: 0,   // A passes min check
+            min_amount_b: 999, // B would fail min check
+        };
+
+        let result = execute_liquidity_pool_withdraw(&op, &source_id, &mut state, &context);
+        match result.unwrap() {
+            OperationResult::OpInner(OperationResultTr::LiquidityPoolWithdraw(r)) => {
+                assert!(
+                    matches!(r, LiquidityPoolWithdrawResult::LineFull),
+                    "Expected LineFull (A fails LINE_FULL before B's UNDER_MINIMUM), got {:?}",
+                    r
+                );
+            }
+            other => panic!("unexpected result: {:?}", other),
+        }
+
+        // Verify no state mutations occurred
+        let account = state.get_account(&source_id).unwrap();
+        assert_eq!(
+            account.balance, 100_000_000,
+            "account balance should be unchanged"
+        );
+        let tl_a = state.get_trustline(&source_id, &asset_a).unwrap();
+        assert_eq!(tl_a.balance, 95, "trustline A balance should be unchanged");
+        let tl_b = state.get_trustline(&source_id, &asset_b).unwrap();
+        assert_eq!(tl_b.balance, 0, "trustline B balance should be unchanged");
+        let pool = state.get_liquidity_pool(&pool_id).unwrap();
+        match &pool.body {
+            LiquidityPoolEntryBody::LiquidityPoolConstantProduct(cp) => {
+                assert_eq!(cp.reserve_a, 1000, "pool reserve A should be unchanged");
+                assert_eq!(cp.reserve_b, 1000, "pool reserve B should be unchanged");
+                assert_eq!(
+                    cp.total_pool_shares, 1000,
+                    "pool shares should be unchanged"
+                );
+            }
+        }
+    }
+
+    /// Non-regression test: when asset A fails UNDER_MINIMUM, the result is
+    /// UNDER_MINIMUM regardless of asset B's state.
+    #[test]
+    fn test_liquidity_pool_withdraw_under_minimum_before_line_full() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let source_id = create_test_account_id(0);
+        let issuer_a = create_test_account_id(1);
+        let issuer_b = create_test_account_id(2);
+        state.create_account(create_test_account(source_id.clone(), 100_000_000, 0));
+        state.create_account(create_test_account(issuer_a.clone(), 100_000_000, 0));
+        state.create_account(create_test_account(issuer_b.clone(), 100_000_000, 0));
+
+        let asset_a = Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4(*b"USD\0"),
+            issuer: issuer_a,
+        });
+        let asset_b = Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4(*b"EUR\0"),
+            issuer: issuer_b,
+        });
+        let pool_id = PoolId(Hash([91u8; 32]));
+        state.create_liquidity_pool(create_pool_entry(
+            pool_id.clone(),
+            asset_a.clone(),
+            asset_b.clone(),
+            1000,
+            1000,
+            1000,
+        ));
+
+        // Asset A trustline: plenty of room
+        let trustline_a = TrustLineEntry {
+            account_id: source_id.clone(),
+            asset: TrustLineAsset::CreditAlphanum4(match &asset_a {
+                Asset::CreditAlphanum4(a) => a.clone(),
+                _ => unreachable!(),
+            }),
+            balance: 0,
+            limit: 10_000,
+            flags: TrustLineFlags::AuthorizedFlag as u32,
+            ext: TrustLineEntryExt::V0,
+        };
+        // Asset B trustline: nearly full (would fail LINE_FULL)
+        let trustline_b = TrustLineEntry {
+            account_id: source_id.clone(),
+            asset: TrustLineAsset::CreditAlphanum4(match &asset_b {
+                Asset::CreditAlphanum4(a) => a.clone(),
+                _ => unreachable!(),
+            }),
+            balance: 95,
+            limit: 100,
+            flags: TrustLineFlags::AuthorizedFlag as u32,
+            ext: TrustLineEntryExt::V0,
+        };
+        let pool_share_tl = TrustLineEntry {
+            account_id: source_id.clone(),
+            asset: TrustLineAsset::PoolShare(pool_id.clone()),
+            balance: 100,
+            limit: 10_000,
+            flags: 0,
+            ext: TrustLineEntryExt::V0,
+        };
+        state.create_trustline(trustline_a);
+        state.create_trustline(trustline_b);
+        state.create_trustline(pool_share_tl);
+        state.get_account_mut(&source_id).unwrap().num_sub_entries += 3;
+
+        // Withdraw 100 shares: withdraw_a = 100, withdraw_b = 100
+        // Asset A: withdraw_a(100) < min_amount_a(999) → UNDER_MINIMUM
+        // Asset B: would fail LINE_FULL (only 5 capacity) — but never reached
+        // Expected: UNDER_MINIMUM (A fails first)
+        let op = LiquidityPoolWithdrawOp {
+            liquidity_pool_id: pool_id.clone(),
+            amount: 100,
+            min_amount_a: 999, // A fails min check
+            min_amount_b: 0,   // B would pass min but fail LINE_FULL
+        };
+
+        let result = execute_liquidity_pool_withdraw(&op, &source_id, &mut state, &context);
+        match result.unwrap() {
+            OperationResult::OpInner(OperationResultTr::LiquidityPoolWithdraw(r)) => {
+                assert!(
+                    matches!(r, LiquidityPoolWithdrawResult::UnderMinimum),
+                    "Expected UnderMinimum (A fails min before B is checked), got {:?}",
+                    r
+                );
+            }
+            other => panic!("unexpected result: {:?}", other),
+        }
+
+        // Verify no state mutations
+        let tl_a = state.get_trustline(&source_id, &asset_a).unwrap();
+        assert_eq!(tl_a.balance, 0, "trustline A balance should be unchanged");
+        let tl_b = state.get_trustline(&source_id, &asset_b).unwrap();
+        assert_eq!(tl_b.balance, 95, "trustline B balance should be unchanged");
+    }
+
+    /// Test: asset A passes all checks, asset B fails UNDER_MINIMUM.
+    /// Verifies no partial credit occurs for asset A.
+    #[test]
+    fn test_liquidity_pool_withdraw_a_ok_b_under_minimum() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let source_id = create_test_account_id(0);
+        let issuer_a = create_test_account_id(1);
+        let issuer_b = create_test_account_id(2);
+        state.create_account(create_test_account(source_id.clone(), 100_000_000, 0));
+        state.create_account(create_test_account(issuer_a.clone(), 100_000_000, 0));
+        state.create_account(create_test_account(issuer_b.clone(), 100_000_000, 0));
+
+        let asset_a = Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4(*b"USD\0"),
+            issuer: issuer_a,
+        });
+        let asset_b = Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4(*b"EUR\0"),
+            issuer: issuer_b,
+        });
+        let pool_id = PoolId(Hash([92u8; 32]));
+        state.create_liquidity_pool(create_pool_entry(
+            pool_id.clone(),
+            asset_a.clone(),
+            asset_b.clone(),
+            1000,
+            1000,
+            1000,
+        ));
+
+        // Asset A trustline: plenty of room
+        let trustline_a = TrustLineEntry {
+            account_id: source_id.clone(),
+            asset: TrustLineAsset::CreditAlphanum4(match &asset_a {
+                Asset::CreditAlphanum4(a) => a.clone(),
+                _ => unreachable!(),
+            }),
+            balance: 0,
+            limit: 10_000,
+            flags: TrustLineFlags::AuthorizedFlag as u32,
+            ext: TrustLineEntryExt::V0,
+        };
+        // Asset B trustline: plenty of room
+        let trustline_b = TrustLineEntry {
+            account_id: source_id.clone(),
+            asset: TrustLineAsset::CreditAlphanum4(match &asset_b {
+                Asset::CreditAlphanum4(a) => a.clone(),
+                _ => unreachable!(),
+            }),
+            balance: 0,
+            limit: 10_000,
+            flags: TrustLineFlags::AuthorizedFlag as u32,
+            ext: TrustLineEntryExt::V0,
+        };
+        let pool_share_tl = TrustLineEntry {
+            account_id: source_id.clone(),
+            asset: TrustLineAsset::PoolShare(pool_id.clone()),
+            balance: 100,
+            limit: 10_000,
+            flags: 0,
+            ext: TrustLineEntryExt::V0,
+        };
+        state.create_trustline(trustline_a);
+        state.create_trustline(trustline_b);
+        state.create_trustline(pool_share_tl);
+        state.get_account_mut(&source_id).unwrap().num_sub_entries += 3;
+
+        // Withdraw 100 shares: withdraw_a = 100, withdraw_b = 100
+        // Asset A: passes min(0) ✓, passes capacity ✓
+        // Asset B: withdraw_b(100) < min_amount_b(999) → UNDER_MINIMUM
+        // Expected: UNDER_MINIMUM, no partial credits
+        let op = LiquidityPoolWithdrawOp {
+            liquidity_pool_id: pool_id.clone(),
+            amount: 100,
+            min_amount_a: 0,   // A passes everything
+            min_amount_b: 999, // B fails min
+        };
+
+        let result = execute_liquidity_pool_withdraw(&op, &source_id, &mut state, &context);
+        match result.unwrap() {
+            OperationResult::OpInner(OperationResultTr::LiquidityPoolWithdraw(r)) => {
+                assert!(
+                    matches!(r, LiquidityPoolWithdrawResult::UnderMinimum),
+                    "Expected UnderMinimum, got {:?}",
+                    r
+                );
+            }
+            other => panic!("unexpected result: {:?}", other),
+        }
+
+        // Verify no partial credits — asset A must NOT have been credited
+        let tl_a = state.get_trustline(&source_id, &asset_a).unwrap();
+        assert_eq!(
+            tl_a.balance, 0,
+            "trustline A should NOT be credited on B failure"
+        );
+        let tl_b = state.get_trustline(&source_id, &asset_b).unwrap();
+        assert_eq!(tl_b.balance, 0, "trustline B should be unchanged");
+        let pool = state.get_liquidity_pool(&pool_id).unwrap();
+        match &pool.body {
+            LiquidityPoolEntryBody::LiquidityPoolConstantProduct(cp) => {
+                assert_eq!(cp.reserve_a, 1000, "pool reserve A should be unchanged");
+                assert_eq!(cp.reserve_b, 1000, "pool reserve B should be unchanged");
+                assert_eq!(
+                    cp.total_pool_shares, 1000,
+                    "pool shares should be unchanged"
+                );
+            }
+        }
+    }
+
+    /// Test: asset A passes all checks, asset B fails LINE_FULL.
+    /// Verifies no partial credit occurs for asset A.
+    #[test]
+    fn test_liquidity_pool_withdraw_a_ok_b_line_full() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let source_id = create_test_account_id(0);
+        let issuer_a = create_test_account_id(1);
+        let issuer_b = create_test_account_id(2);
+        state.create_account(create_test_account(source_id.clone(), 100_000_000, 0));
+        state.create_account(create_test_account(issuer_a.clone(), 100_000_000, 0));
+        state.create_account(create_test_account(issuer_b.clone(), 100_000_000, 0));
+
+        let asset_a = Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4(*b"USD\0"),
+            issuer: issuer_a,
+        });
+        let asset_b = Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4(*b"EUR\0"),
+            issuer: issuer_b,
+        });
+        let pool_id = PoolId(Hash([93u8; 32]));
+        state.create_liquidity_pool(create_pool_entry(
+            pool_id.clone(),
+            asset_a.clone(),
+            asset_b.clone(),
+            1000,
+            1000,
+            1000,
+        ));
+
+        // Asset A trustline: plenty of room
+        let trustline_a = TrustLineEntry {
+            account_id: source_id.clone(),
+            asset: TrustLineAsset::CreditAlphanum4(match &asset_a {
+                Asset::CreditAlphanum4(a) => a.clone(),
+                _ => unreachable!(),
+            }),
+            balance: 0,
+            limit: 10_000,
+            flags: TrustLineFlags::AuthorizedFlag as u32,
+            ext: TrustLineEntryExt::V0,
+        };
+        // Asset B trustline: nearly full → LINE_FULL
+        let trustline_b = TrustLineEntry {
+            account_id: source_id.clone(),
+            asset: TrustLineAsset::CreditAlphanum4(match &asset_b {
+                Asset::CreditAlphanum4(a) => a.clone(),
+                _ => unreachable!(),
+            }),
+            balance: 95,
+            limit: 100,
+            flags: TrustLineFlags::AuthorizedFlag as u32,
+            ext: TrustLineEntryExt::V0,
+        };
+        let pool_share_tl = TrustLineEntry {
+            account_id: source_id.clone(),
+            asset: TrustLineAsset::PoolShare(pool_id.clone()),
+            balance: 100,
+            limit: 10_000,
+            flags: 0,
+            ext: TrustLineEntryExt::V0,
+        };
+        state.create_trustline(trustline_a);
+        state.create_trustline(trustline_b);
+        state.create_trustline(pool_share_tl);
+        state.get_account_mut(&source_id).unwrap().num_sub_entries += 3;
+
+        // Withdraw 100 shares: withdraw_a = 100, withdraw_b = 100
+        // Asset A: passes min(0) ✓, passes capacity ✓
+        // Asset B: passes min(0) ✓, but trustline can only hold 5 → LINE_FULL
+        // Expected: LINE_FULL, no partial credits
+        let op = LiquidityPoolWithdrawOp {
+            liquidity_pool_id: pool_id.clone(),
+            amount: 100,
+            min_amount_a: 0,
+            min_amount_b: 0,
+        };
+
+        let result = execute_liquidity_pool_withdraw(&op, &source_id, &mut state, &context);
+        match result.unwrap() {
+            OperationResult::OpInner(OperationResultTr::LiquidityPoolWithdraw(r)) => {
+                assert!(
+                    matches!(r, LiquidityPoolWithdrawResult::LineFull),
+                    "Expected LineFull, got {:?}",
+                    r
+                );
+            }
+            other => panic!("unexpected result: {:?}", other),
+        }
+
+        // Verify no partial credits — asset A must NOT have been credited
+        let tl_a = state.get_trustline(&source_id, &asset_a).unwrap();
+        assert_eq!(
+            tl_a.balance, 0,
+            "trustline A should NOT be credited on B failure"
+        );
+        let tl_b = state.get_trustline(&source_id, &asset_b).unwrap();
+        assert_eq!(tl_b.balance, 95, "trustline B should be unchanged");
+        let pool = state.get_liquidity_pool(&pool_id).unwrap();
+        match &pool.body {
+            LiquidityPoolEntryBody::LiquidityPoolConstantProduct(cp) => {
+                assert_eq!(cp.reserve_a, 1000, "pool reserve A should be unchanged");
+                assert_eq!(cp.reserve_b, 1000, "pool reserve B should be unchanged");
+                assert_eq!(
+                    cp.total_pool_shares, 1000,
+                    "pool shares should be unchanged"
+                );
+            }
         }
     }
 }
