@@ -279,10 +279,12 @@ pub struct OverlayMetrics {
     /// Inbound connections rejected at any point after accept but before establish
     /// (handshake failure, banned, duplicate, slots full, register race).
     pub inbound_reject: Counter,
-    /// Outbound connection attempts: a dial was initiated (entry to
-    /// `connect_to_discovered_peer` / `connect_to_explicit_peer`). Does NOT include
-    /// caller-side skips (e.g., `add_peer` returning early because the pool is full
-    /// before dialing) — those are not "attempts" in the wire sense.
+    /// Outbound connection attempts: a dial was actually initiated (after the
+    /// address reservation succeeded inside `connect_to_discovered_peer` /
+    /// `connect_to_explicit_peer`). Does NOT include caller-side skips (e.g.,
+    /// `add_peer` returning early because the pool is full before dialing) or
+    /// in-flight-duplicate skips (where the address is already reserved by
+    /// another in-progress dial) — those are not "attempts" in the wire sense.
     pub outbound_attempt: Counter,
     /// Outbound connections that completed handshake and were fully registered.
     pub outbound_establish: Counter,

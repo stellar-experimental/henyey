@@ -416,26 +416,27 @@ impl OverlayManager {
         shared: SharedPeerState,
         connection_factory: Arc<dyn ConnectionFactory>,
     ) {
-        // Count this dial as an outbound attempt: a TCP connect is about to
-        // happen. Caller-side skips (e.g., `add_peer` returning early because
-        // the pool is full before dialing) are NOT counted as attempts —
-        // those are tracked via the pool's pending count, not lifecycle.
-        shared.metrics.outbound_attempt.inc();
-
-        // Reserve address slot to prevent duplicate outbound dials.
+        // Reserve address slot to prevent duplicate outbound dials. If the
+        // address is already in flight, no actual dial happens, so this is a
+        // no-op skip — neither `outbound_attempt` nor `outbound_reject` fire
+        // (those track real on-the-wire lifecycle events).
         let addr_key = format!("{}:{}", addr.host, addr.port);
         if !shared
             .pending_connections
             .try_reserve_address(addr_key.clone())
         {
             debug!(
-                "Rejected discovered peer {} — connection already in flight",
+                "Skipped discovered peer {} — connection already in flight",
                 addr
             );
-            shared.metrics.outbound_reject.inc();
             pool.release_pending();
             return;
         }
+
+        // Reservation succeeded — a TCP connect is about to happen. Count
+        // the dial as an outbound attempt now (after reservation, before
+        // the actual dial).
+        shared.metrics.outbound_attempt.inc();
 
         let connection = match connection_factory
             .connect(&addr, timeouts.connect_secs)
@@ -669,23 +670,25 @@ pub(super) async fn connect_to_explicit_peer(
     shared: SharedPeerState,
     connection_factory: Arc<dyn ConnectionFactory>,
 ) -> Result<PeerId> {
-    // Count this dial as an outbound attempt: a TCP connect is about to happen.
+    // Reserve address slot to prevent duplicate outbound dials. If the
+    // address is already in flight, no actual dial happens — this is a
+    // no-op skip (neither `outbound_attempt` nor `outbound_reject` fire).
     // See `connect_to_discovered_peer` for the matching contract.
-    shared.metrics.outbound_attempt.inc();
-
-    // Reserve address slot to prevent duplicate outbound dials.
     let addr_key = format!("{}:{}", addr.host, addr.port);
     if !shared
         .pending_connections
         .try_reserve_address(addr_key.clone())
     {
-        shared.metrics.outbound_reject.inc();
         pool.release_pending();
         return Err(OverlayError::Internal(format!(
             "connection to {} already in flight",
             addr
         )));
     }
+
+    // Reservation succeeded — a TCP connect is about to happen. Count the
+    // dial as an outbound attempt.
+    shared.metrics.outbound_attempt.inc();
 
     let connection = match connection_factory
         .connect(addr, timeouts.connect_secs)
