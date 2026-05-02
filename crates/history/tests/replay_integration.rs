@@ -381,7 +381,7 @@ async fn test_catchup_recent_large_gap_bucket_apply() {
     let empty_tx_result_hash = Hash256::hash(&empty_result_xdr);
 
     // Helper: compute the generalized empty tx set hash for a given prev_hash.
-    // This must match what `make_empty_tx_set_for_header` produces for protocol >= 23.
+    // This must match what `make_empty_tx_set` produces for lcl_protocol >= 23.
     let compute_empty_gen_tx_set_hash = |prev_hash: &Hash256| -> Hash256 {
         let classic_phase = TransactionPhase::V0(VecM::default());
         let soroban_phase = TransactionPhase::V1(ParallelTxsComponent {

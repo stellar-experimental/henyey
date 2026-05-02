@@ -288,22 +288,37 @@ impl CatchupManager {
     }
 
     /// Download ledger headers, transactions, and results for a range.
+    ///
+    /// # Arguments
+    ///
+    /// * `from_ledger` — sequence number of the Last Closed Ledger (the most
+    ///   recently applied ledger). Download starts at `from_ledger + 1`.
+    /// * `to_ledger` — inclusive upper bound of the range to download.
+    /// * `lcl_protocol_version` — protocol version of the LCL at the start of
+    ///   this replay batch. Used for empty tx set synthesis when archives omit
+    ///   tx entries for ledgers with no transactions.
     pub(super) async fn download_ledger_data(
         &mut self,
-        from_checkpoint: u32,
+        from_ledger: u32,
         to_ledger: u32,
+        lcl_protocol_version: u32,
     ) -> Result<Vec<LedgerData>> {
         let mut data = Vec::new();
         let mut checkpoint_cache: HashMap<u32, CheckpointLedgerData> = HashMap::new();
 
-        // We need to download data for ledgers (from_checkpoint+1) to to_ledger
-        // The checkpoint ledger's state is already in the bucket list
-        let start = from_checkpoint + 1;
+        // We need to download data for ledgers (from_ledger+1) to to_ledger.
+        // The from_ledger's state is already in the bucket list.
+        let start = from_ledger + 1;
 
         if start > to_ledger {
             // No ledgers to replay, we're at the checkpoint
             return Ok(data);
         }
+
+        // Track the LCL protocol version across the loop. For the first ledger,
+        // this is the caller-provided value. For subsequent ledgers, it's the
+        // prior header's ledger_version (since that header becomes the new LCL).
+        let mut current_lcl_protocol = lcl_protocol_version;
 
         for seq in start..=to_ledger {
             self.progress.current_ledger = seq;
@@ -344,7 +359,15 @@ impl CatchupManager {
                 .find(|entry| entry.ledger_seq == seq)
                 .cloned();
 
-            data.push(LedgerData::new(header, tx_history_entry, tx_result_entry)?);
+            data.push(LedgerData::new(
+                header.clone(),
+                tx_history_entry,
+                tx_result_entry,
+                current_lcl_protocol,
+            )?);
+
+            // This header becomes the LCL for the next iteration.
+            current_lcl_protocol = header.ledger_version;
         }
 
         Ok(data)

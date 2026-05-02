@@ -169,9 +169,15 @@ impl CatchupManager {
 
             // Download from the checkpoint containing replay_first - 1 (the LCL).
             let download_from = current_lcl;
+            let lcl_protocol_version = snap.header.ledger_version;
 
             match self
-                .download_verify_and_replay_once(download_from, target, ledger_manager)
+                .download_verify_and_replay_once(
+                    download_from,
+                    target,
+                    lcl_protocol_version,
+                    ledger_manager,
+                )
                 .await
             {
                 Ok(result) => return Ok(result),
@@ -201,6 +207,7 @@ impl CatchupManager {
         &mut self,
         download_from: u32,
         target: u32,
+        lcl_protocol_version: u32,
         ledger_manager: &LedgerManager,
     ) -> Result<(HeaderSnapshot, u32)> {
         use henyey_common::NetworkId;
@@ -211,7 +218,9 @@ impl CatchupManager {
             4,
             "Downloading ledger data",
         );
-        let ledger_data = self.download_ledger_data(download_from, target).await?;
+        let ledger_data = self
+            .download_ledger_data(download_from, target, lcl_protocol_version)
+            .await?;
 
         // Verify the header chain.
         //

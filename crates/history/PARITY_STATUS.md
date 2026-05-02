@@ -250,6 +250,11 @@ Features not yet implemented. These ARE counted against parity %.
    - **Rust**: Case 1 uses a per-mode "replay budget" to decide whether to replay or download a checkpoint. `Complete` always replays; `Minimal` replays gaps ≤ 1,000; `Recent(N)` replays gaps ≤ N. Larger gaps fall through to checkpoint download (Case 5).
    - **Rationale**: For large gaps (e.g., 9000-ledger post-wedge recovery with `Recent(500)`), downloading a checkpoint + replaying ~500 ledgers is far faster than replaying all 9000. The final ledger state is identical; only the recovery path differs. This extends the existing Minimal-mode optimization (introduced for startup gaps) to also cover `Recent(N)`. See #1908.
 
+7. **Empty tx set synthesis uses LCL protocol version**
+   - **stellar-core**: `TxSetXDRFrame::makeEmpty(lclHeader)` (`TxSetFrame.cpp:958-979`) uses `lclHeader.header.ledgerVersion` to choose between Classic and Generalized format.
+   - **Rust**: `make_empty_tx_set(previous_ledger_hash, lcl_protocol_version)` mirrors this — branches on the LCL's protocol, not the current header's.
+   - **Parity fix**: Previously used the current ledger's `ledger_version`, which broke at protocol upgrade boundaries (e.g., ledger 2 of quickstart). Fixed in #2279.
+
 ## Test Coverage
 
 | Area | stellar-core Tests | Rust Tests | Notes |

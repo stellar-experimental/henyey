@@ -206,7 +206,7 @@ impl CatchupManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::catchup::make_empty_tx_set_for_header;
+    use crate::catchup::make_empty_tx_set;
     use henyey_bucket::BucketManager;
     use henyey_db::Database;
     use stellar_xdr::curr::{
@@ -297,7 +297,7 @@ mod tests {
         let header = make_header(100);
         let tx_history = make_tx_history_entry(100, vec![make_test_envelope()]);
         let tx_result = make_tx_result_entry(100, vec![make_success_result()]);
-        let data = LedgerData::new(header, Some(tx_history), Some(tx_result));
+        let data = LedgerData::new(header, Some(tx_history), Some(tx_result), 0);
         assert!(data.is_ok(), "valid LedgerData should succeed");
     }
 
@@ -306,7 +306,7 @@ mod tests {
         let header = make_header(200);
         let tx_history = make_tx_history_entry(200, vec![]);
         let tx_result = make_tx_result_entry(200, vec![]);
-        let data = LedgerData::new(header, Some(tx_history), Some(tx_result));
+        let data = LedgerData::new(header, Some(tx_history), Some(tx_result), 0);
         assert!(data.is_ok(), "empty ledger should succeed");
     }
 
@@ -315,7 +315,7 @@ mod tests {
         let header = make_header(100);
         let tx_history = make_tx_history_entry(999, vec![]); // wrong seq
         let tx_result = make_tx_result_entry(100, vec![]);
-        let result = LedgerData::new(header, Some(tx_history), Some(tx_result));
+        let result = LedgerData::new(header, Some(tx_history), Some(tx_result), 0);
         assert!(result.is_err(), "mismatched tx_history seq should fail");
         let err = result.unwrap_err();
         assert!(
@@ -329,7 +329,7 @@ mod tests {
         let header = make_header(100);
         let tx_history = make_tx_history_entry(100, vec![]);
         let tx_result = make_tx_result_entry(999, vec![]); // wrong seq
-        let result = LedgerData::new(header, Some(tx_history), Some(tx_result));
+        let result = LedgerData::new(header, Some(tx_history), Some(tx_result), 0);
         assert!(result.is_err(), "mismatched tx_result seq should fail");
         let err = result.unwrap_err();
         assert!(
@@ -343,7 +343,7 @@ mod tests {
         let header = make_header(100);
         let tx_history = make_tx_history_entry(100, vec![make_test_envelope()]);
         let tx_result = make_tx_result_entry(100, vec![]); // 0 results for 1 tx
-        let result = LedgerData::new(header, Some(tx_history), Some(tx_result));
+        let result = LedgerData::new(header, Some(tx_history), Some(tx_result), 0);
         assert!(result.is_err(), "count mismatch should fail");
         let err = result.unwrap_err();
         assert!(
@@ -359,7 +359,7 @@ mod tests {
     // --- Empty tx set synthesis tests ---
 
     #[test]
-    fn test_make_empty_tx_set_for_header_pre_v20() {
+    fn test_make_empty_tx_set_pre_v20() {
         use henyey_ledger::TransactionSetVariant;
 
         let header = LedgerHeader {
@@ -368,7 +368,7 @@ mod tests {
             previous_ledger_hash: Hash([42u8; 32]),
             ..Default::default()
         };
-        let tx_set = make_empty_tx_set_for_header(&header);
+        let tx_set = make_empty_tx_set(&header.previous_ledger_hash, header.ledger_version);
         match tx_set {
             TransactionSetVariant::Classic(set) => {
                 assert_eq!(set.txs.len(), 0);
@@ -379,7 +379,7 @@ mod tests {
     }
 
     #[test]
-    fn test_make_empty_tx_set_for_header_v20_sequential() {
+    fn test_make_empty_tx_set_v20_sequential() {
         use henyey_ledger::TransactionSetVariant;
         use stellar_xdr::curr::{GeneralizedTransactionSet, TransactionPhase};
 
@@ -389,7 +389,7 @@ mod tests {
             previous_ledger_hash: Hash([7u8; 32]),
             ..Default::default()
         };
-        let tx_set = make_empty_tx_set_for_header(&header);
+        let tx_set = make_empty_tx_set(&header.previous_ledger_hash, header.ledger_version);
         match tx_set {
             TransactionSetVariant::Generalized(GeneralizedTransactionSet::V1(set)) => {
                 assert_eq!(set.previous_ledger_hash, Hash([7u8; 32]));
@@ -409,7 +409,7 @@ mod tests {
     }
 
     #[test]
-    fn test_make_empty_tx_set_for_header_v22_sequential() {
+    fn test_make_empty_tx_set_v22_sequential() {
         use henyey_ledger::TransactionSetVariant;
         use stellar_xdr::curr::{GeneralizedTransactionSet, TransactionPhase};
 
@@ -419,7 +419,7 @@ mod tests {
             previous_ledger_hash: Hash([5u8; 32]),
             ..Default::default()
         };
-        let tx_set = make_empty_tx_set_for_header(&header);
+        let tx_set = make_empty_tx_set(&header.previous_ledger_hash, header.ledger_version);
         match tx_set {
             TransactionSetVariant::Generalized(GeneralizedTransactionSet::V1(set)) => {
                 assert_eq!(set.previous_ledger_hash, Hash([5u8; 32]));
@@ -434,7 +434,7 @@ mod tests {
     }
 
     #[test]
-    fn test_make_empty_tx_set_for_header_v23_parallel() {
+    fn test_make_empty_tx_set_v23_parallel() {
         use henyey_ledger::TransactionSetVariant;
         use stellar_xdr::curr::{GeneralizedTransactionSet, TransactionPhase};
 
@@ -444,7 +444,7 @@ mod tests {
             previous_ledger_hash: Hash([9u8; 32]),
             ..Default::default()
         };
-        let tx_set = make_empty_tx_set_for_header(&header);
+        let tx_set = make_empty_tx_set(&header.previous_ledger_hash, header.ledger_version);
         match tx_set {
             TransactionSetVariant::Generalized(GeneralizedTransactionSet::V1(set)) => {
                 assert_eq!(set.previous_ledger_hash, Hash([9u8; 32]));
@@ -465,7 +465,7 @@ mod tests {
     #[test]
     fn test_ledger_data_new_absent_both_none() {
         let header = make_header(300);
-        let data = LedgerData::new(header, None, None);
+        let data = LedgerData::new(header, None, None, 0);
         assert!(data.is_ok(), "both None should produce Absent LedgerData");
         let data = data.unwrap();
         assert!(!data.has_transactions());
@@ -478,7 +478,7 @@ mod tests {
     fn test_ledger_data_new_asymmetric_some_none_error() {
         let header = make_header(400);
         let tx_history = make_tx_history_entry(400, vec![]);
-        let result = LedgerData::new(header, Some(tx_history), None);
+        let result = LedgerData::new(header, Some(tx_history), None, 0);
         assert!(result.is_err(), "(Some, None) should fail");
         let err = result.unwrap_err();
         assert!(
@@ -491,7 +491,7 @@ mod tests {
     fn test_ledger_data_new_asymmetric_none_some_error() {
         let header = make_header(400);
         let tx_result = make_tx_result_entry(400, vec![]);
-        let result = LedgerData::new(header, None, Some(tx_result));
+        let result = LedgerData::new(header, None, Some(tx_result), 0);
         assert!(result.is_err(), "(None, Some) should fail");
         let err = result.unwrap_err();
         assert!(
@@ -514,6 +514,7 @@ mod tests {
             make_header(100),
             Some(make_tx_history_entry(100, vec![envelope])),
             Some(make_tx_result_entry(100, vec![result_pair])),
+            0,
         )
         .expect("valid LedgerData");
 
@@ -534,6 +535,7 @@ mod tests {
             make_header(200),
             Some(make_tx_history_entry(200, vec![])),
             Some(make_tx_result_entry(200, vec![])),
+            0,
         )
         .expect("valid empty LedgerData");
 
@@ -551,7 +553,7 @@ mod tests {
         let network_id = test_network_id();
 
         let header = make_header(300);
-        let data = LedgerData::new(header.clone(), None, None).expect("valid absent LedgerData");
+        let data = LedgerData::new(header.clone(), None, None, 0).expect("valid absent LedgerData");
 
         let result = manager.persist_ledger_history(&[data], &network_id);
         assert!(
@@ -568,6 +570,7 @@ mod tests {
             make_header(400),
             Some(make_tx_history_entry(400, vec![make_test_envelope()])),
             Some(make_tx_result_entry(400, vec![])), // 0 results for 1 tx
+            0,
         );
         assert!(
             result.is_err(),
@@ -593,6 +596,7 @@ mod tests {
             make_header(500),
             Some(make_tx_history_entry(500, vec![envelope.clone()])),
             Some(make_tx_result_entry(500, vec![result_pair])),
+            0,
         )
         .expect("valid good LedgerData");
 
@@ -602,6 +606,7 @@ mod tests {
             make_header(500),
             Some(make_tx_history_entry(500, vec![])),
             Some(make_tx_result_entry(500, vec![])),
+            0,
         )
         .expect("valid duplicate LedgerData");
 
@@ -632,6 +637,7 @@ mod tests {
             header.clone(),
             Some(make_tx_history_entry(600, vec![])),
             Some(make_tx_result_entry(600, vec![])),
+            0,
         )
         .expect("valid LedgerData");
 
@@ -649,5 +655,166 @@ mod tests {
             .expect("header should exist");
 
         assert_eq!(loaded.ledger_seq, 600);
+    }
+
+    // --- Protocol-boundary hash verification regression tests ---
+    //
+    // These tests verify that `make_empty_tx_set` produces the correct format
+    // for each protocol boundary, and that `verify_tx_set` accepts the
+    // synthesized set when the header's scp_value.tx_set_hash is computed
+    // from the same format.
+
+    /// Helper: build a header whose scp_value.tx_set_hash matches the empty tx
+    /// set synthesized with the given LCL protocol version.
+    fn make_header_with_empty_tx_set_hash(
+        ledger_seq: u32,
+        current_protocol: u32,
+        lcl_protocol: u32,
+    ) -> LedgerHeader {
+        use crate::verify::compute_tx_set_hash;
+
+        let previous_ledger_hash = Hash([0xAB; 32]);
+        let tx_set = make_empty_tx_set(&previous_ledger_hash, lcl_protocol);
+        let tx_set_hash = compute_tx_set_hash(&tx_set).expect("hash computation");
+
+        LedgerHeader {
+            ledger_seq,
+            ledger_version: current_protocol,
+            previous_ledger_hash,
+            scp_value: stellar_xdr::curr::StellarValue {
+                tx_set_hash: stellar_xdr::curr::Hash(tx_set_hash.0),
+                close_time: stellar_xdr::curr::TimePoint(0),
+                upgrades: Default::default(),
+                ext: stellar_xdr::curr::StellarValueExt::Basic,
+            },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_empty_tx_set_hash_protocol_0_to_22_regression() {
+        // The failing quickstart galexie case: LCL is genesis (protocol 0),
+        // current ledger upgrades to protocol 22. Must use Classic format.
+        use crate::verify::verify_tx_set;
+        use henyey_ledger::TransactionSetVariant;
+
+        let header = make_header_with_empty_tx_set_hash(2, 22, 0);
+        let tx_set = make_empty_tx_set(&header.previous_ledger_hash, 0);
+
+        // Must be Classic format (protocol 0 < 20)
+        assert!(
+            matches!(tx_set, TransactionSetVariant::Classic(_)),
+            "LCL protocol 0 should produce Classic tx set, got Generalized"
+        );
+
+        // verify_tx_set must accept this
+        verify_tx_set(&header, &tx_set).expect("hash should match for protocol 0→22 upgrade");
+    }
+
+    #[test]
+    fn test_empty_tx_set_hash_protocol_19_to_20_regression() {
+        // Protocol boundary: LCL at 19 (Classic), current upgrades to 20.
+        use crate::verify::verify_tx_set;
+        use henyey_ledger::TransactionSetVariant;
+
+        let header = make_header_with_empty_tx_set_hash(100, 20, 19);
+        let tx_set = make_empty_tx_set(&header.previous_ledger_hash, 19);
+
+        assert!(
+            matches!(tx_set, TransactionSetVariant::Classic(_)),
+            "LCL protocol 19 should produce Classic tx set"
+        );
+
+        verify_tx_set(&header, &tx_set).expect("hash should match for protocol 19→20 upgrade");
+    }
+
+    #[test]
+    fn test_empty_tx_set_hash_protocol_20_steady_state() {
+        // Steady state: LCL at 20, current at 20. Generalized V0+V0.
+        use crate::verify::verify_tx_set;
+        use henyey_ledger::TransactionSetVariant;
+        use stellar_xdr::curr::{GeneralizedTransactionSet, TransactionPhase};
+
+        let header = make_header_with_empty_tx_set_hash(200, 20, 20);
+        let tx_set = make_empty_tx_set(&header.previous_ledger_hash, 20);
+
+        match &tx_set {
+            TransactionSetVariant::Generalized(GeneralizedTransactionSet::V1(set)) => {
+                assert!(matches!(&set.phases[0], TransactionPhase::V0(_)));
+                assert!(matches!(&set.phases[1], TransactionPhase::V0(_)));
+            }
+            _ => panic!("LCL protocol 20 should produce Generalized V0+V0"),
+        }
+
+        verify_tx_set(&header, &tx_set).expect("hash should match for protocol 20→20");
+    }
+
+    #[test]
+    fn test_empty_tx_set_hash_protocol_22_to_23_regression() {
+        // Protocol boundary: LCL at 22 (Generalized V0+V0), current upgrades to 23.
+        use crate::verify::verify_tx_set;
+        use henyey_ledger::TransactionSetVariant;
+        use stellar_xdr::curr::{GeneralizedTransactionSet, TransactionPhase};
+
+        let header = make_header_with_empty_tx_set_hash(300, 23, 22);
+        let tx_set = make_empty_tx_set(&header.previous_ledger_hash, 22);
+
+        match &tx_set {
+            TransactionSetVariant::Generalized(GeneralizedTransactionSet::V1(set)) => {
+                assert!(matches!(&set.phases[0], TransactionPhase::V0(_)));
+                // LCL protocol 22 < 23, so soroban phase is still V0 (sequential)
+                assert!(
+                    matches!(&set.phases[1], TransactionPhase::V0(_)),
+                    "LCL protocol 22 should produce sequential soroban phase"
+                );
+            }
+            _ => panic!("LCL protocol 22 should produce Generalized V0+V0"),
+        }
+
+        verify_tx_set(&header, &tx_set).expect("hash should match for protocol 22→23 upgrade");
+    }
+
+    #[test]
+    fn test_empty_tx_set_hash_protocol_23_steady_state() {
+        // Steady state: LCL at 23, current at 23. Generalized V0+V1 (parallel).
+        use crate::verify::verify_tx_set;
+        use henyey_ledger::TransactionSetVariant;
+        use stellar_xdr::curr::{GeneralizedTransactionSet, TransactionPhase};
+
+        let header = make_header_with_empty_tx_set_hash(400, 23, 23);
+        let tx_set = make_empty_tx_set(&header.previous_ledger_hash, 23);
+
+        match &tx_set {
+            TransactionSetVariant::Generalized(GeneralizedTransactionSet::V1(set)) => {
+                assert!(matches!(&set.phases[0], TransactionPhase::V0(_)));
+                assert!(
+                    matches!(&set.phases[1], TransactionPhase::V1(_)),
+                    "LCL protocol 23 should produce parallel soroban phase"
+                );
+            }
+            _ => panic!("LCL protocol 23 should produce Generalized V0+V1"),
+        }
+
+        verify_tx_set(&header, &tx_set).expect("hash should match for protocol 23→23");
+    }
+
+    #[test]
+    fn test_empty_tx_set_hash_mismatch_when_using_wrong_protocol() {
+        // Demonstrates the original bug: using current protocol (22) instead of
+        // LCL protocol (0) produces a different hash that fails verification.
+        use crate::verify::verify_tx_set;
+
+        // Header with tx_set_hash computed from LCL protocol 0 (Classic format)
+        let header = make_header_with_empty_tx_set_hash(2, 22, 0);
+
+        // BUG reproduction: synthesize using the *wrong* protocol (current = 22)
+        let wrong_tx_set = make_empty_tx_set(&header.previous_ledger_hash, 22);
+
+        // This should fail — the hash won't match
+        let result = verify_tx_set(&header, &wrong_tx_set);
+        assert!(
+            result.is_err(),
+            "using current protocol (22) instead of LCL protocol (0) should produce hash mismatch"
+        );
     }
 }
