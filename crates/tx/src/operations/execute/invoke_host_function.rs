@@ -13,7 +13,7 @@ use stellar_xdr::curr::{
 use henyey_common::protocol::{
     protocol_version_is_before, protocol_version_starts_from, ProtocolVersion,
 };
-use henyey_common::xdr_encoded_len;
+use henyey_common::{xdr_encoded_len, xdr_encoded_len_u32};
 
 use super::{OperationExecutionResult, SorobanOperationMeta};
 use crate::soroban::{PersistentModuleCache, SorobanConfig, SorobanContext};
@@ -298,7 +298,7 @@ impl AddReadsContext<'_> {
                 self.state.get_entry(key)
             };
             if let Some(ref entry) = entry {
-                entry_size = xdr_encoded_len(entry) as u32;
+                entry_size = xdr_encoded_len_u32(entry);
             }
         }
 
@@ -366,7 +366,7 @@ impl AddReadsContext<'_> {
 
         // Autorestore path (stellar-core lines 1015-1051): validate size, then
         // meter disk reads. Both failures map to ResourceLimitExceeded.
-        let entry_size = xdr_encoded_len(entry) as u32;
+        let entry_size = xdr_encoded_len_u32(entry);
         let limits = super::ContractSizeLimits {
             max_contract_size_bytes: self.soroban_config.max_contract_size_bytes,
             max_contract_data_entry_size_bytes: self
