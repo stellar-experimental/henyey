@@ -465,17 +465,29 @@ fn execute_manage_offer(
                 dec_sub_entries(account, 1);
             }
         } else {
-            // New offer that was fully consumed during matching.
-            // In stellar-core (V14+), loadAccount is called before the exchange for
-            // createEntryWithPossibleSponsorship (numSubEntries++), and again
-            // after for removeEntryWithPossibleSponsorship (numSubEntries--).
-            // The net effect on fields is zero, but the account is recorded
-            // in the LedgerTxn and gets lastModified updated on commit.
+            // New offer that was fully consumed during matching. Mirrors
+            // stellar-core's createEntryWithPossibleSponsorship +
+            // removeEntryWithPossibleSponsorship pair (V14+,
+            // ManageOfferOpFrameBase.cpp:282-315 and 530-537):
+            //   - Sponsor numSponsoring overflow check (TOO_MANY_SPONSORING).
+            //   - lastModified bumps on source and sponsor (counts net to zero).
+            //
+            // Order is observable: record_account_access pushes onto
+            // modified_accounts, and flush_all_accounts_except iterates that
+            // Vec in push order to emit tx-meta deltas. Source-then-sponsor
+            // matches stellar-core's loadAccount(source) →
+            // createEntryWithPossibleSponsorship → loadAccount(sponsor)
+            // sequence. The overflow check runs first so on failure neither
+            // account is stamped — matches stellar-core, which discards the
+            // LedgerTxn on TOO_MANY_SPONSORING (TransactionFrame.cpp:2275-2322).
+            //
+            // The check fires AFTER convert_with_offers in henyey (vs BEFORE
+            // in stellar-core); the per-op savepoint rolls back intermediate
+            // mutations on failure, making the observable behavior identical.
+            if let Some(ref sponsor) = sponsor {
+                state.check_can_increase_num_sponsoring(sponsor, 1)?;
+            }
             state.record_account_access(source);
-            // If there was a pending sponsor, stellar-core also loads the sponsor
-            // account via createEntryWithPossibleSponsorship (numSponsoring++)
-            // and removeEntryWithPossibleSponsorship (numSponsoring--).
-            // Net effect is zero but the sponsor account gets lm stamped.
             if let Some(ref sponsor) = sponsor {
                 state.record_account_access(sponsor);
             }
@@ -4260,5 +4272,350 @@ mod tests {
             assert_eq!(trail.len(), 2);
             assert_eq!(wheat_received, 200);
         }
+    }
+
+    // ============================================================================
+    // Tests for #2287 / AUDIT-249: TOO_MANY_SPONSORING check for fully-consumed
+    // sponsored offers.
+    //
+    // Pattern: sponsor pre-arranged to sponsor source, source submits a new
+    // sponsored offer that fully crosses an existing counter-offer, expect
+    // OpTooManySponsoring on overflow. All five tests invoke `execute_operation`
+    // (the dispatcher) so that `TxError::TooManySponsoring` is converted to
+    // `Ok(OperationResult::OpTooManySponsoring)` (precedent:
+    // test_audit_058_sponsored_manage_data_at_max_sponsoring at mod.rs:1862).
+    // ============================================================================
+
+    /// Setup helper: fully-consumed sponsored offer scenario.
+    ///
+    /// Returns `(state, context, source_id, sponsor_id, asset_a, asset_b)` where
+    /// source has trustlines for both assets and a counter-offer is on the book
+    /// matching exactly the offer source will submit. Sponsor's `num_sponsoring`
+    /// and `num_sub_entries` are set per parameters.
+    fn setup_fully_consumed_sponsored_offer(
+        num_sponsoring: u32,
+        sponsor_num_sub_entries: u32,
+        base_reserve: i64,
+    ) -> (
+        LedgerStateManager,
+        LedgerContext,
+        AccountId,
+        AccountId,
+        Asset,
+        Asset,
+    ) {
+        let mut state = LedgerStateManager::new(base_reserve, 100);
+        let context = create_test_context();
+
+        let issuer_id = create_test_account_id(99);
+        state.create_account(create_test_account(issuer_id.clone(), i64::MAX));
+
+        let asset_a = Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4(*b"USDC"),
+            issuer: issuer_id.clone(),
+        });
+        let asset_b = Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4(*b"EURX"),
+            issuer: issuer_id.clone(),
+        });
+        let tl_asset_a = TrustLineAsset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4(*b"USDC"),
+            issuer: issuer_id.clone(),
+        });
+        let tl_asset_b = TrustLineAsset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4(*b"EURX"),
+            issuer: issuer_id.clone(),
+        });
+
+        // Counterparty with existing offer on the book (selling asset_a for asset_b)
+        let counter_id = create_test_account_id(1);
+        state.create_account(create_test_account(counter_id.clone(), i64::MAX));
+        state.create_trustline(TrustLineEntry {
+            account_id: counter_id.clone(),
+            asset: tl_asset_a.clone(),
+            balance: 500_000_000,
+            limit: i64::MAX,
+            flags: AUTHORIZED_FLAG,
+            ext: TrustLineEntryExt::V1(TrustLineEntryV1 {
+                liabilities: Liabilities {
+                    buying: 0,
+                    selling: 100_000_000,
+                },
+                ext: TrustLineEntryV1Ext::V0,
+            }),
+        });
+        state.create_trustline(TrustLineEntry {
+            account_id: counter_id.clone(),
+            asset: tl_asset_b.clone(),
+            balance: 0,
+            limit: i64::MAX,
+            flags: AUTHORIZED_FLAG,
+            ext: TrustLineEntryExt::V1(TrustLineEntryV1 {
+                liabilities: Liabilities {
+                    buying: 100_000_000,
+                    selling: 0,
+                },
+                ext: TrustLineEntryV1Ext::V0,
+            }),
+        });
+        let counter_offer = OfferEntry {
+            seller_id: counter_id.clone(),
+            offer_id: 1000,
+            selling: asset_a.clone(),
+            buying: asset_b.clone(),
+            amount: 100_000_000,
+            price: Price { n: 1, d: 1 },
+            flags: 0,
+            ext: OfferEntryExt::V0,
+        };
+        state.load_entry(LedgerEntry {
+            last_modified_ledger_seq: 840000,
+            data: LedgerEntryData::Offer(counter_offer),
+            ext: LedgerEntryExt::V0,
+        });
+        if let Some(acct) = state.get_account_mut(&counter_id) {
+            acct.num_sub_entries = 3;
+        }
+
+        // Source: submits a new offer that gets fully consumed
+        let source_id = create_test_account_id(2);
+        state.create_account(create_test_account(source_id.clone(), i64::MAX));
+        state.create_trustline(create_test_trustline(
+            source_id.clone(),
+            tl_asset_a.clone(),
+            0,
+            i64::MAX,
+            AUTHORIZED_FLAG,
+        ));
+        state.create_trustline(create_test_trustline(
+            source_id.clone(),
+            tl_asset_b.clone(),
+            500_000_000,
+            i64::MAX,
+            AUTHORIZED_FLAG,
+        ));
+        if let Some(acct) = state.get_account_mut(&source_id) {
+            acct.num_sub_entries = 2;
+        }
+
+        // Sponsor: balances large, num_sponsoring/num_sub_entries set per args
+        let sponsor_id = create_test_account_id(3);
+        let mut sponsor_acct = create_test_account(sponsor_id.clone(), i64::MAX);
+        sponsor_acct.num_sub_entries = sponsor_num_sub_entries;
+        sponsor_acct.ext = AccountEntryExt::V1(AccountEntryExtensionV1 {
+            liabilities: Liabilities {
+                buying: 0,
+                selling: 0,
+            },
+            ext: AccountEntryExtensionV1Ext::V2(AccountEntryExtensionV2 {
+                num_sponsoring,
+                num_sponsored: 0,
+                signer_sponsoring_i_ds: vec![].try_into().unwrap(),
+                ext: AccountEntryExtensionV2Ext::V0,
+            }),
+        });
+        state.create_account(sponsor_acct);
+
+        // Set up sponsorship: sponsor sponsors source's future reserves
+        state.push_sponsorship(sponsor_id.clone(), source_id.clone());
+
+        // Clear scaffolding from modified_accounts so test ordering assertions
+        // (and tx-meta delta assertions in general) reflect only the op itself.
+        state.flush_modified_entries();
+
+        (state, context, source_id, sponsor_id, asset_a, asset_b)
+    }
+
+    /// Build a `ManageSellOfferOp` that fully crosses the counter-offer set up
+    /// by `setup_fully_consumed_sponsored_offer`.
+    fn make_sell_op(asset_a: Asset, asset_b: Asset) -> Operation {
+        Operation {
+            source_account: None,
+            body: OperationBody::ManageSellOffer(ManageSellOfferOp {
+                selling: asset_b,
+                buying: asset_a,
+                amount: 100_000_000,
+                price: Price { n: 1, d: 1 },
+                offer_id: 0,
+            }),
+        }
+    }
+
+    /// Regression test for #2287 / AUDIT-249.
+    ///
+    /// ManageSellOffer with a new sponsored offer that fully crosses an
+    /// existing counter-offer must return OpTooManySponsoring when the
+    /// sponsor's num_sponsoring is already at u32::MAX. Pre-fix, henyey
+    /// returned `Success(Deleted)` (consensus divergence vs stellar-core).
+    #[test]
+    fn test_manage_sell_offer_fully_consumed_sponsored_too_many_sponsoring() {
+        let (mut state, context, source_id, sponsor_id, asset_a, asset_b) =
+            setup_fully_consumed_sponsored_offer(u32::MAX, 0, 5_000_000);
+
+        let op = make_sell_op(asset_a, asset_b);
+        let result = super::super::execute_operation(&op, &source_id, &mut state, &context);
+        match &result {
+            Err(e) => panic!("Should not return Err: {:?}", e),
+            Ok(r) => match &r.result {
+                OperationResult::OpTooManySponsoring => {}
+                other => panic!("Expected OpTooManySponsoring, got {:?}", other),
+            },
+        }
+
+        let (num_sponsoring, _) = state.sponsorship_counts_for_account(&sponsor_id).unwrap();
+        assert_eq!(
+            num_sponsoring,
+            u32::MAX as i64,
+            "Sponsor's num_sponsoring must be unchanged on overflow"
+        );
+    }
+
+    /// Regression test for #2287 / AUDIT-249 — ManageBuyOffer variant.
+    #[test]
+    fn test_manage_buy_offer_fully_consumed_sponsored_too_many_sponsoring() {
+        let (mut state, context, source_id, sponsor_id, asset_a, asset_b) =
+            setup_fully_consumed_sponsored_offer(u32::MAX, 0, 5_000_000);
+
+        let op = Operation {
+            source_account: None,
+            body: OperationBody::ManageBuyOffer(ManageBuyOfferOp {
+                selling: asset_b,
+                buying: asset_a,
+                buy_amount: 100_000_000,
+                price: Price { n: 1, d: 1 },
+                offer_id: 0,
+            }),
+        };
+        let result = super::super::execute_operation(&op, &source_id, &mut state, &context);
+        match &result {
+            Err(e) => panic!("Should not return Err: {:?}", e),
+            Ok(r) => match &r.result {
+                OperationResult::OpTooManySponsoring => {}
+                other => panic!("Expected OpTooManySponsoring, got {:?}", other),
+            },
+        }
+
+        let (num_sponsoring, _) = state.sponsorship_counts_for_account(&sponsor_id).unwrap();
+        assert_eq!(num_sponsoring, u32::MAX as i64);
+    }
+
+    /// Regression test for #2287 / AUDIT-249 — CreatePassiveSellOffer variant.
+    #[test]
+    fn test_create_passive_sell_offer_fully_consumed_sponsored_too_many_sponsoring() {
+        let (mut state, context, source_id, sponsor_id, asset_a, asset_b) =
+            setup_fully_consumed_sponsored_offer(u32::MAX, 0, 5_000_000);
+
+        let op = Operation {
+            source_account: None,
+            body: OperationBody::CreatePassiveSellOffer(CreatePassiveSellOfferOp {
+                selling: asset_b,
+                buying: asset_a,
+                amount: 100_000_000,
+                price: Price { n: 1, d: 1 },
+            }),
+        };
+        let result = super::super::execute_operation(&op, &source_id, &mut state, &context);
+        match &result {
+            Err(e) => panic!("Should not return Err: {:?}", e),
+            Ok(r) => match &r.result {
+                OperationResult::OpTooManySponsoring => {}
+                other => panic!("Expected OpTooManySponsoring, got {:?}", other),
+            },
+        }
+
+        let (num_sponsoring, _) = state.sponsorship_counts_for_account(&sponsor_id).unwrap();
+        assert_eq!(num_sponsoring, u32::MAX as i64);
+    }
+
+    /// Combined-cap branch: protocol-18+ rule that
+    /// `num_sponsoring + num_sub_entries <= u32::MAX` (stellar-core's
+    /// `isSponsoringSubentrySumIncreaseValid`). Sponsor has small
+    /// `num_sponsoring` but `num_sub_entries == u32::MAX - num_sponsoring`,
+    /// so adding +1 to `num_sponsoring` would overflow the combined cap.
+    ///
+    /// Uses `base_reserve=1` so the LowReserve gate at manage_offer.rs:228-238
+    /// does not short-circuit before our new check fires (precedent:
+    /// sponsorship.rs::test_revoke_sponsorship_establish_too_many_sponsoring).
+    #[test]
+    fn test_manage_sell_offer_fully_consumed_sponsored_combined_cap_overflow() {
+        let small = 100u32;
+        let (mut state, context, source_id, sponsor_id, asset_a, asset_b) =
+            setup_fully_consumed_sponsored_offer(small, u32::MAX - small, 1);
+
+        let op = make_sell_op(asset_a, asset_b);
+        let result = super::super::execute_operation(&op, &source_id, &mut state, &context);
+        match &result {
+            Err(e) => panic!("Should not return Err: {:?}", e),
+            Ok(r) => match &r.result {
+                OperationResult::OpTooManySponsoring => {}
+                other => panic!(
+                    "Expected OpTooManySponsoring (combined-cap overflow), got {:?}",
+                    other
+                ),
+            },
+        }
+
+        let (num_sponsoring, _) = state.sponsorship_counts_for_account(&sponsor_id).unwrap();
+        assert_eq!(num_sponsoring, small as i64);
+    }
+
+    /// No-spurious-failure sentinel: sponsor far below the caps, fully-consumed
+    /// sponsored offer should succeed AND sponsor's num_sponsoring must be
+    /// unchanged AND the sponsor must be pushed onto modified_accounts AFTER
+    /// the source.
+    ///
+    /// (`record_account_access(source)` is itself a contains-skip no-op once
+    /// source has been pushed by upstream `apply_balance_delta` during the
+    /// matching exchange. The assertion guards against future regressions
+    /// where a refactor might cause the sponsor to be pushed before source
+    /// via some other path.)
+    #[test]
+    fn test_manage_sell_offer_fully_consumed_sponsored_no_spurious_failure() {
+        let (mut state, context, source_id, sponsor_id, asset_a, asset_b) =
+            setup_fully_consumed_sponsored_offer(100, 0, 5_000_000);
+
+        let op = make_sell_op(asset_a, asset_b);
+        let result = super::super::execute_operation(&op, &source_id, &mut state, &context);
+        match &result {
+            Err(e) => panic!("Should not return Err: {:?}", e),
+            Ok(r) => match &r.result {
+                OperationResult::OpInner(OperationResultTr::ManageSellOffer(
+                    ManageSellOfferResult::Success(success),
+                )) => {
+                    assert!(
+                        matches!(success.offer, ManageOfferSuccessResultOffer::Deleted),
+                        "Expected Deleted, got {:?}",
+                        success.offer
+                    );
+                    assert_eq!(success.offers_claimed.len(), 1);
+                }
+                other => panic!("Expected Success(Deleted), got {:?}", other),
+            },
+        }
+
+        // Sponsor counts unchanged.
+        let (num_sponsoring, _) = state.sponsorship_counts_for_account(&sponsor_id).unwrap();
+        assert_eq!(
+            num_sponsoring, 100i64,
+            "sponsor num_sponsoring must be unchanged on success"
+        );
+
+        // Source must be pushed onto modified_accounts BEFORE sponsor.
+        let modified = state.modified_accounts_for_test();
+        let src_idx = modified
+            .iter()
+            .position(|a| a == &source_id)
+            .expect("source must be in modified_accounts");
+        let spn_idx = modified
+            .iter()
+            .position(|a| a == &sponsor_id)
+            .expect("sponsor must be in modified_accounts");
+        assert!(
+            src_idx < spn_idx,
+            "source (idx {}) must precede sponsor (idx {}) in modified_accounts: {:?}",
+            src_idx,
+            spn_idx,
+            modified,
+        );
     }
 }

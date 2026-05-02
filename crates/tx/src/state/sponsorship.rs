@@ -525,6 +525,32 @@ impl LedgerStateManager {
         Ok(())
     }
 
+    /// Check whether `account_id`'s `num_sponsoring` can be incremented by
+    /// `multiplier` without overflow, without mutating any state.
+    ///
+    /// Mirrors stellar-core's `tooManySponsoring` (`SponsorshipUtils.cpp`):
+    /// the per-account `u32::MAX` cap and the combined
+    /// `num_sponsoring + num_sub_entries` cap (`isSponsoringSubentrySumIncreaseValid`).
+    /// Positive-only — matches stellar-core's `mult: uint32_t`.
+    ///
+    /// Used when a sponsored entry would have been created and then immediately
+    /// removed (net-zero count change) but still needs the overflow check to
+    /// fire — e.g. a new sponsored offer that is fully consumed during matching.
+    pub fn check_can_increase_num_sponsoring(
+        &mut self,
+        account_id: &AccountId,
+        multiplier: u32,
+    ) -> Result<()> {
+        // Defensive: callers in the offer/trustline create paths have
+        // already loaded the account via the LowReserve check.
+        // ensure_account_loaded is idempotent.
+        self.ensure_account_loaded(account_id)?;
+        let account = self
+            .get_account(account_id)
+            .ok_or(TxError::SourceAccountNotFound)?;
+        check_num_sponsoring_overflow(account, multiplier as i64)
+    }
+
     /// Update num_sponsoring for an account.
     ///
     /// Lazily loads the account from the bucket list if not already in state.
@@ -536,18 +562,10 @@ impl LedgerStateManager {
         let account = self
             .get_account_mut(account_id)
             .ok_or(TxError::SourceAccountNotFound)?;
-        let num_sub_entries = account.num_sub_entries as u64;
+        check_num_sponsoring_overflow(account, delta)?;
         let ext = ensure_account_ext_v2(account);
-        let updated = ext.num_sponsoring as i64 + delta;
-        if updated < 0 || updated > u32::MAX as i64 {
-            return Err(TxError::TooManySponsoring);
-        }
-        // Combined cap: numSponsoring + numSubEntries must not exceed UINT32_MAX.
-        // stellar-core: SponsorshipUtils.cpp:21-28 (isSponsoringSubentrySumIncreaseValid)
-        if updated as u64 + num_sub_entries > u32::MAX as u64 {
-            return Err(TxError::TooManySponsoring);
-        }
-        ext.num_sponsoring = updated as u32;
+        // Safe: check_num_sponsoring_overflow guarantees 0 <= updated <= u32::MAX.
+        ext.num_sponsoring = (ext.num_sponsoring as i64 + delta) as u32;
         Ok(())
     }
 
@@ -739,6 +757,29 @@ impl LedgerStateManager {
 
         Ok(true)
     }
+}
+
+/// Check whether mutating `num_sponsoring` by `delta` would overflow either
+/// the per-account `u32::MAX` cap or the protocol-18+ combined
+/// `(num_sponsoring + num_sub_entries)` cap. Pure arithmetic over an
+/// already-loaded account; does NOT mutate state.
+///
+/// Shared between `LedgerStateManager::check_can_increase_num_sponsoring`
+/// (read-only check used by paths where the count change would net to zero)
+/// and `LedgerStateManager::update_num_sponsoring` (validate-then-mutate).
+fn check_num_sponsoring_overflow(account: &AccountEntry, delta: i64) -> Result<()> {
+    let num_sub_entries = account.num_sub_entries as u64;
+    let (num_sponsoring, _) = sponsorship_counts(account);
+    let updated = num_sponsoring + delta;
+    if updated < 0 || updated > u32::MAX as i64 {
+        return Err(TxError::TooManySponsoring);
+    }
+    // Combined cap: numSponsoring + numSubEntries must not exceed UINT32_MAX.
+    // stellar-core: SponsorshipUtils.cpp:21-28 (isSponsoringSubentrySumIncreaseValid)
+    if updated as u64 + num_sub_entries > u32::MAX as u64 {
+        return Err(TxError::TooManySponsoring);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -984,7 +1025,11 @@ mod tests {
         state.create_account(account);
 
         state
-            .remove_one_time_signers_from_all_sources(&tx_hash, &[account_id.clone()], 25)
+            .remove_one_time_signers_from_all_sources(
+                &tx_hash,
+                std::slice::from_ref(&account_id),
+                25,
+            )
             .unwrap();
 
         let account = state.get_account(&account_id).unwrap();
@@ -1233,8 +1278,11 @@ mod tests {
         state.create_account(account);
         // No sponsor account → error must propagate through the production entry point
 
-        let result =
-            state.remove_one_time_signers_from_all_sources(&tx_hash, &[account_id.clone()], 25);
+        let result = state.remove_one_time_signers_from_all_sources(
+            &tx_hash,
+            std::slice::from_ref(&account_id),
+            25,
+        );
         assert!(
             result.is_err(),
             "error must propagate through remove_one_time_signers_from_all_sources"

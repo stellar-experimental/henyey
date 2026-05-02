@@ -1306,6 +1306,17 @@ impl LedgerStateManager {
         self.flush_all_accounts_except(None);
     }
 
+    /// Test-only: read the current `modified_accounts` push order.
+    ///
+    /// `flush_all_accounts_except` iterates this Vec in push order to emit
+    /// tx-meta deltas, so the push order is observable. Tests use this to
+    /// assert account-access ordering invariants — see e.g.
+    /// `manage_offer.rs::test_manage_sell_offer_fully_consumed_sponsored_no_spurious_failure`.
+    #[cfg(test)]
+    pub fn modified_accounts_for_test(&self) -> &[AccountId] {
+        &self.modified_accounts
+    }
+
     /// Flush a specific account's changes to the delta.
     ///
     /// Returns true if the account was in the modified list and was flushed.
