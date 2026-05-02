@@ -982,44 +982,39 @@ mod tests {
         assert_eq!(m.outbound_reject.get(), 0);
     }
 
-    /// Drive a `send_raw` (HELLO-style unauthenticated) message from peer A to
-    /// peer B and assert that:
-    ///   - A's `bytes_written` and `async_write` increment by the wire size /
-    ///     1
-    ///   - B's `bytes_read` and `async_read` increment by the same wire size
-    ///     / 1
+    /// Drive a `Peer::send_hello` -> `Peer::recv_hello` round-trip and assert
+    /// that BOTH sides update their counters via the real instrumented paths
+    /// (no manual counter bumps). A regression in either `send_raw`'s or
+    /// `recv_hello`'s instrumentation would cause this test to fail.
     ///
-    /// This is the "happy-path" unit test for the new instrumentation.
+    /// Asserts:
+    ///   - A's `bytes_written` / `async_write` increment by wire size / 1
+    ///   - B's `bytes_read` / `async_read` increment by the same wire size / 1
     #[tokio::test]
     async fn test_peer_send_recv_metrics_increment() {
-        // Use `recv()` (authenticated) on peer B requires authenticated MAC
-        // keys, which we don't have without a full handshake. So we drive
-        // `send_raw` (unauthenticated) on A and `recv_hello` on B (which uses
-        // `connection.recv_timeout()` + `auth.unwrap_message`, where unwrap of
-        // an unauthenticated frame works without MAC).
+        // We drive `send_hello` (unauthenticated send_raw) on A and
+        // `recv_hello` on B (instrumented receive). We can't use the
+        // post-auth `send`/`recv` here because the test peers don't have
+        // derived MAC keys without a full handshake — `recv_hello` only
+        // requires unwrap of an unauthenticated frame.
         let metrics_a = Arc::new(OverlayMetrics::new());
         let metrics_b = Arc::new(OverlayMetrics::new());
         let (mut peer_a, mut peer_b) =
             make_authenticated_peer_pair(Arc::clone(&metrics_a), Arc::clone(&metrics_b));
 
-        // Send a HELLO via `send_hello` (which calls send_raw). This is the
-        // simplest unauthenticated path through the instrumented code.
+        // Send a HELLO via the real `send_hello` (which calls send_raw) and
+        // receive it on B via the real `recv_hello`. Both paths run their
+        // metric instrumentation; a regression in either would break this
+        // assertion.
         peer_a.send_hello().await.expect("send_hello");
+        // `recv_hello` will fail at `process_hello` (network mismatch /
+        // self-cert checks) for our synthetic peer pair, but the
+        // instrumentation runs BEFORE process_hello — so we accept either
+        // outcome here and only assert on the counter side-effects below.
+        let _ = peer_b.recv_hello(5).await;
 
-        // On the receive side, the *connection* delivers the frame. We drive
-        // the lower-level path directly to avoid `recv_hello`'s unwrap, which
-        // also calls `process_hello` and may fail on duplicate/etc. checks.
-        let frame = peer_b
-            .connection
-            .recv()
-            .await
-            .expect("recv ok")
-            .expect("frame present");
-        // Manually mirror what recv_hello would do for the metrics part:
-        peer_b.metrics.bytes_read.add(frame.raw_len as u64);
-        peer_b.metrics.async_read.inc();
-
-        // Sender side: bytes_written / async_write incremented exactly once.
+        // Sender side: bytes_written / async_write incremented exactly once
+        // by the real `send_raw` instrumentation.
         assert_eq!(metrics_a.async_write.get(), 1);
         assert!(
             metrics_a.bytes_written.get() > 0,
@@ -1027,49 +1022,57 @@ mod tests {
             metrics_a.bytes_written.get()
         );
 
-        // Receiver side: counts the same wire bytes.
-        assert_eq!(metrics_b.async_read.get(), 1);
+        // Receiver side: counts the same wire bytes via the real
+        // `recv_hello` instrumentation.
+        assert_eq!(
+            metrics_b.async_read.get(),
+            1,
+            "recv_hello must bump async_read exactly once"
+        );
         assert_eq!(
             metrics_b.bytes_read.get(),
             metrics_a.bytes_written.get(),
-            "wire-level byte counts must match between sender and receiver"
+            "wire-level byte counts must match between sender and receiver \
+             (both sides must use real instrumentation)"
         );
     }
 
     /// Verify that a failed send does NOT increment success-only counters.
-    /// We simulate this by closing the peer's connection before sending.
+    ///
+    /// We force a deterministic failure by closing peer_a's own connection
+    /// BEFORE attempting the send: `Connection::send` has an early return
+    /// path that yields `PeerDisconnected` when `self.closed` is true, so
+    /// the send is guaranteed to fail without depending on duplex-buffer
+    /// timing.
     #[tokio::test]
     async fn test_peer_failed_send_does_not_increment_counters() {
         let metrics_a = Arc::new(OverlayMetrics::new());
         let metrics_b = Arc::new(OverlayMetrics::new());
-        let (mut peer_a, mut peer_b) =
+        let (mut peer_a, _peer_b) =
             make_authenticated_peer_pair(Arc::clone(&metrics_a), Arc::clone(&metrics_b));
 
-        // Drop the receiver half of the duplex by closing peer_b's connection.
-        // The next send on peer_a will get a write error (broken pipe).
-        peer_b.connection.close().await;
-        drop(peer_b);
+        // Close peer_a's connection. `Connection::send` will return
+        // `PeerDisconnected` immediately on the next call (deterministic).
+        peer_a.connection.close().await;
 
-        // Drain pending bytes on the receive side before triggering an error.
-        // tokio::io::duplex returns Err on send only after the buffer fills or
-        // the peer half is dropped — give it a chance.
-        let _ = tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let result = peer_a.send_hello().await;
+        assert!(
+            result.is_err(),
+            "send_hello must fail deterministically when local connection is closed, got: {:?}",
+            result
+        );
 
-        // Attempt a send. It may succeed (bytes go into the duplex buffer) or
-        // fail. We only assert that on failure, the success counters stay at 0.
-        match peer_a.send_hello().await {
-            Ok(()) => {
-                // If the buffer absorbed the write, that's still a successful
-                // I/O op; counters reflect it.
-                assert_eq!(metrics_a.async_write.get(), 1);
-                assert!(metrics_a.bytes_written.get() > 0);
-            }
-            Err(_) => {
-                // Failed send: success-only counters must remain zero.
-                assert_eq!(metrics_a.async_write.get(), 0);
-                assert_eq!(metrics_a.bytes_written.get(), 0);
-            }
-        }
+        // Success-only counters must remain at zero on the failure path.
+        assert_eq!(
+            metrics_a.async_write.get(),
+            0,
+            "async_write must not increment on failed send"
+        );
+        assert_eq!(
+            metrics_a.bytes_written.get(),
+            0,
+            "bytes_written must not increment on failed send"
+        );
     }
 
     /// Verify reset() includes the new Stage F.1 fields.
