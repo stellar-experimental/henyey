@@ -2384,18 +2384,30 @@ impl Herder {
 
         // 3. Build & cache tx set, trimming against proposed close time.
         // Use the pre-built snapshot providers for O(1) snapshot creation.
-        let tx_set = self.tx_queue.build_generalized_tx_set_with_providers(
-            previous_hash,
-            max_txs,
-            starting_seq.as_ref(),
-            close_time_offset,
-            snapshot_providers
-                .as_ref()
-                .map(|sp| sp as &dyn crate::tx_queue::FeeBalanceProvider),
-            snapshot_providers
-                .as_ref()
-                .map(|sp| sp as &dyn crate::tx_queue::AccountProvider),
-        );
+        //
+        // Parity: stellar-core's TxSetXDRFrame::makeEmpty(lclHeader) selects the
+        // tx set format based on the LCL protocol version. At protocol < 20 the
+        // Generalized format does not exist — the tx_set_hash in scpValue must be
+        // computed as a non-generalized (Classic) contents hash. Without this
+        // check, a genesis-at-v0 network (e.g. quickstart) produces a Generalized
+        // hash during nomination but the catchup path reconstructs a Classic hash,
+        // causing "invalid tx set hash" errors (#2297).
+        let tx_set = if !protocol_version_starts_from(header.ledger_version, ProtocolVersion::V20) {
+            TransactionSet::new_legacy(previous_hash, vec![])
+        } else {
+            self.tx_queue.build_generalized_tx_set_with_providers(
+                previous_hash,
+                max_txs,
+                starting_seq.as_ref(),
+                close_time_offset,
+                snapshot_providers
+                    .as_ref()
+                    .map(|sp| sp as &dyn crate::tx_queue::FeeBalanceProvider),
+                snapshot_providers
+                    .as_ref()
+                    .map(|sp| sp as &dyn crate::tx_queue::AccountProvider),
+            )
+        };
         debug!(
             hash = %tx_set.hash(),
             tx_count = tx_set.len(),
@@ -4651,6 +4663,56 @@ mod tests {
         assert!(
             found_reserve,
             "Should have found BaseReserve(5000000) upgrade"
+        );
+    }
+
+    /// Regression test for #2297: at protocol < 20, the nomination tx set hash
+    /// must use Classic (non-generalized) format so that the catchup path
+    /// (`make_empty_tx_set`) computes the same hash.
+    #[tokio::test]
+    async fn test_nomination_uses_classic_format_at_protocol_zero() {
+        let (herder, _secret) = make_validator_herder();
+
+        // Arm a protocol upgrade so nomination triggers externalization
+        let upgrade_params = crate::upgrades::UpgradeParameters {
+            upgrade_time: 0,
+            protocol_version: Some(25),
+            ..Default::default()
+        };
+        herder
+            .set_upgrade_parameters(upgrade_params)
+            .expect("set upgrade params");
+
+        // Bootstrap at ledger 1 (genesis, protocol 0 — no LedgerManager set)
+        herder.bootstrap(1);
+
+        let result = herder.trigger_next_ledger(2);
+        assert!(
+            result.is_ok(),
+            "trigger_next_ledger failed: {:?}",
+            result.err()
+        );
+
+        let ext = herder
+            .scp_driver
+            .get_externalized(2)
+            .expect("slot 2 externalized");
+        let sv = StellarValue::from_xdr(&ext.value, Limits::none()).expect("parse StellarValue");
+
+        // The tx_set_hash in the externalized value must be the Classic
+        // (non-generalized) hash = SHA256(previous_ledger_hash).
+        // previous_ledger_hash is Hash256::ZERO since no LedgerManager is set.
+        let expected_classic_hash =
+            TransactionSet::compute_non_generalized_hash(Hash256::ZERO, &[]);
+        let actual_hash = Hash256::from(sv.tx_set_hash.0);
+
+        assert_eq!(
+            actual_hash, expected_classic_hash,
+            "At protocol 0, nomination must produce a Classic tx set hash. \
+             Got {:?} but expected Classic hash {:?}. \
+             This regression means the catchup path would fail with \
+             'invalid tx set hash' (#2297).",
+            actual_hash, expected_classic_hash
         );
     }
 
