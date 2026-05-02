@@ -1123,8 +1123,10 @@ pub fn malformed_operation_result(
         OperationBody::ManageBuyOffer(_) => {
             OperationResultTr::ManageBuyOffer(ManageBuyOfferResult::Malformed)
         }
+        // CreatePassiveSellOffer uses ManageSellOffer result discriminant
+        // (stellar-core: CreatePassiveSellOfferOpFrame inherits ManageSellOfferOpHolder)
         OperationBody::CreatePassiveSellOffer(_) => {
-            OperationResultTr::CreatePassiveSellOffer(ManageSellOfferResult::Malformed)
+            OperationResultTr::ManageSellOffer(ManageSellOfferResult::Malformed)
         }
         // SetOptions: stellar-core maps to specific codes per check.
         OperationBody::SetOptions(_) => {
@@ -2130,6 +2132,28 @@ mod tests {
                 BumpSequenceResult::BadSeq,
             )) => {}
             other => panic!("expected BumpSequence::BadSeq, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_malformed_operation_result_create_passive_sell_offer() {
+        let body = OperationBody::CreatePassiveSellOffer(CreatePassiveSellOfferOp {
+            selling: Asset::Native,
+            buying: Asset::Native,
+            amount: 100,
+            price: Price { n: 1, d: 1 },
+        });
+        let err = OperationValidationError::InvalidAsset("same assets".to_string());
+        let result = malformed_operation_result(&body, &err);
+        // CreatePassiveSellOffer must use ManageSellOffer discriminant (stellar-core parity)
+        match result {
+            OperationResult::OpInner(OperationResultTr::ManageSellOffer(
+                ManageSellOfferResult::Malformed,
+            )) => {}
+            other => panic!(
+                "expected ManageSellOffer::Malformed (discriminant 3), got {:?}",
+                other
+            ),
         }
     }
 

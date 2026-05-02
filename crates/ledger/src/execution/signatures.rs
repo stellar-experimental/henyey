@@ -448,7 +448,9 @@ pub(super) fn default_success_op_result(op: &Operation) -> OperationResult {
         OperationBody::ManageSellOffer(_) => OperationResultTr::ManageSellOffer(
             ManageSellOfferResult::Success(empty_offer_success_result()),
         ),
-        OperationBody::CreatePassiveSellOffer(_) => OperationResultTr::CreatePassiveSellOffer(
+        // CreatePassiveSellOffer uses ManageSellOffer result discriminant
+        // (stellar-core: CreatePassiveSellOfferOpFrame inherits ManageSellOfferOpHolder)
+        OperationBody::CreatePassiveSellOffer(_) => OperationResultTr::ManageSellOffer(
             ManageSellOfferResult::Success(empty_offer_success_result()),
         ),
         OperationBody::SetOptions(_) => OperationResultTr::SetOptions(SetOptionsResult::Success),
@@ -647,4 +649,55 @@ pub(super) fn check_operations_valid(
     }
 
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use stellar_xdr::curr::*;
+
+    #[test]
+    fn test_default_success_op_result_create_passive_sell_offer() {
+        let op = Operation {
+            source_account: None,
+            body: OperationBody::CreatePassiveSellOffer(CreatePassiveSellOfferOp {
+                selling: Asset::Native,
+                buying: Asset::Native,
+                amount: 100,
+                price: Price { n: 1, d: 1 },
+            }),
+        };
+        let result = default_success_op_result(&op);
+        // CreatePassiveSellOffer must use ManageSellOffer discriminant (stellar-core parity)
+        match result {
+            OperationResult::OpInner(OperationResultTr::ManageSellOffer(
+                ManageSellOfferResult::Success(_),
+            )) => {}
+            other => panic!(
+                "expected ManageSellOffer::Success (discriminant 3), got {:?}",
+                other
+            ),
+        }
+    }
+
+    #[test]
+    fn test_default_success_op_result_manage_sell_offer() {
+        let op = Operation {
+            source_account: None,
+            body: OperationBody::ManageSellOffer(ManageSellOfferOp {
+                selling: Asset::Native,
+                buying: Asset::Native,
+                amount: 100,
+                price: Price { n: 1, d: 1 },
+                offer_id: 0,
+            }),
+        };
+        let result = default_success_op_result(&op);
+        match result {
+            OperationResult::OpInner(OperationResultTr::ManageSellOffer(
+                ManageSellOfferResult::Success(_),
+            )) => {}
+            other => panic!("expected ManageSellOffer::Success, got {:?}", other),
+        }
+    }
 }
