@@ -151,7 +151,7 @@ pub use checkpoint::{
 pub use checkpoint_builder::write_record_marked_xdr;
 pub use compare::{compare_checkpoint, Category, CheckpointComparison, Mismatch};
 pub use download::DownloadConfig;
-pub use error::HistoryError;
+pub use error::{HistoryError, TxSetHashMismatchInfo};
 pub use paths::{
     bucket_path, checkpoint_path, checkpoint_path_dirty, dirty_to_final_path, final_to_dirty_path,
     is_dirty_path,

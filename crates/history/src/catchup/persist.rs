@@ -803,6 +803,8 @@ mod tests {
         // Demonstrates the original bug: using current protocol (22) instead of
         // LCL protocol (0) produces a different hash that fails verification.
         use crate::verify::verify_tx_set;
+        use crate::HistoryError;
+        use henyey_common::Hash256;
 
         // Header with tx_set_hash computed from LCL protocol 0 (Classic format)
         let header = make_header_with_empty_tx_set_hash(2, 22, 0);
@@ -812,9 +814,31 @@ mod tests {
 
         // This should fail — the hash won't match
         let result = verify_tx_set(&header, &wrong_tx_set);
-        assert!(
-            result.is_err(),
-            "using current protocol (22) instead of LCL protocol (0) should produce hash mismatch"
+        let err = result.expect_err(
+            "using current protocol (22) instead of LCL protocol (0) should produce hash mismatch",
         );
+
+        // Verify the diagnostic payload is correctly populated
+        match err {
+            HistoryError::InvalidTxSetHash { ledger, info } => {
+                assert_eq!(ledger, 2);
+                assert_eq!(info.header_ledger_version, 22);
+                // Wrong protocol (22) produces generalized format
+                assert_eq!(info.tx_set_format, "generalized_v1");
+                assert_ne!(
+                    info.expected, info.actual,
+                    "hashes must differ for the test to be valid"
+                );
+                // Both should use the same previous_ledger_hash since we passed the same one
+                assert_eq!(
+                    info.header_prev_hash, info.tx_set_prev_hash,
+                    "prev hash should match — the bug is format, not prev hash"
+                );
+                // Verify hashes are non-zero (sanity check)
+                assert_ne!(info.expected, Hash256::ZERO);
+                assert_ne!(info.actual, Hash256::ZERO);
+            }
+            other => panic!("expected InvalidTxSetHash, got: {}", other),
+        }
     }
 }

@@ -331,12 +331,37 @@ pub fn compute_tx_set_hash(tx_set: &TransactionSetVariant) -> Result<Hash256> {
 /// * `tx_set` - Transaction set variant
 pub fn verify_tx_set(header: &LedgerHeader, tx_set: &TransactionSetVariant) -> Result<()> {
     let actual_hash = compute_tx_set_hash(tx_set)?;
-    // The scpValue contains the tx set hash
     let expected_hash = Hash256::from(header.scp_value.tx_set_hash.clone());
 
     if actual_hash != expected_hash {
+        let header_prev_hash = Hash256::from(header.previous_ledger_hash.clone());
+        let tx_set_prev_hash = tx_set.previous_ledger_hash();
+        let tx_set_format = match tx_set {
+            TransactionSetVariant::Classic(_) => "classic",
+            TransactionSetVariant::Generalized(_) => "generalized_v1",
+        };
+
+        tracing::error!(
+            ledger_seq = header.ledger_seq,
+            header_ledger_version = header.ledger_version,
+            %header_prev_hash,
+            %tx_set_prev_hash,
+            %actual_hash,
+            %expected_hash,
+            tx_set_format,
+            "verify_tx_set hash mismatch"
+        );
+
         return Err(HistoryError::InvalidTxSetHash {
             ledger: header.ledger_seq,
+            info: Box::new(crate::error::TxSetHashMismatchInfo {
+                expected: expected_hash,
+                actual: actual_hash,
+                header_ledger_version: header.ledger_version,
+                header_prev_hash,
+                tx_set_prev_hash,
+                tx_set_format,
+            }),
         });
     }
 

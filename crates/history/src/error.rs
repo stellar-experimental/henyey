@@ -11,6 +11,40 @@
 use henyey_common::Hash256;
 use thiserror::Error;
 
+/// Diagnostic context for a tx-set hash mismatch, boxed inside `InvalidTxSetHash`
+/// to keep the `HistoryError` enum small.
+#[derive(Debug, Clone)]
+pub struct TxSetHashMismatchInfo {
+    /// Expected hash from the header's scp_value.tx_set_hash.
+    pub expected: Hash256,
+    /// Actual hash computed from the transaction set.
+    pub actual: Hash256,
+    /// The current ledger's protocol version (header.ledger_version).
+    pub header_ledger_version: u32,
+    /// The previous_ledger_hash from the header.
+    pub header_prev_hash: Hash256,
+    /// The previous_ledger_hash embedded in the transaction set itself.
+    pub tx_set_prev_hash: Hash256,
+    /// Human-readable tx set format: "classic" or "generalized_v1".
+    pub tx_set_format: &'static str,
+}
+
+impl std::fmt::Display for TxSetHashMismatchInfo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "expected={}, actual={}, header_ledger_version={}, \
+             header_prev_hash={}, tx_set_prev_hash={}, format={}",
+            self.expected,
+            self.actual,
+            self.header_ledger_version,
+            self.header_prev_hash,
+            self.tx_set_prev_hash,
+            self.tx_set_format
+        )
+    }
+}
+
 /// Errors that can occur during history operations.
 ///
 /// These errors cover the full range of failures that can occur when
@@ -117,11 +151,13 @@ pub enum HistoryError {
         ledger: u32,
     },
 
-    /// Invalid transaction set hash.
-    #[error("invalid tx set hash at ledger {ledger}")]
+    /// Invalid transaction set hash — includes full diagnostic context for debugging.
+    #[error("invalid tx set hash at ledger {ledger}: {info}")]
     InvalidTxSetHash {
         /// The ledger with the invalid transaction set hash.
         ledger: u32,
+        /// Boxed diagnostic info (expected/actual hashes, protocol version, format).
+        info: Box<TxSetHashMismatchInfo>,
     },
 
     /// Not a checkpoint ledger.
@@ -227,7 +263,18 @@ mod tests {
     fn test_verification_errors_are_fatal() {
         assert!(HistoryError::VerificationFailed("bad".into()).is_fatal_catchup_failure());
         assert!(HistoryError::InvalidPreviousHash { ledger: 5 }.is_fatal_catchup_failure());
-        assert!(HistoryError::InvalidTxSetHash { ledger: 5 }.is_fatal_catchup_failure());
+        assert!(HistoryError::InvalidTxSetHash {
+            ledger: 5,
+            info: Box::new(TxSetHashMismatchInfo {
+                expected: Hash256::ZERO,
+                actual: Hash256::ZERO,
+                header_ledger_version: 0,
+                header_prev_hash: Hash256::ZERO,
+                tx_set_prev_hash: Hash256::ZERO,
+                tx_set_format: "classic",
+            }),
+        }
+        .is_fatal_catchup_failure());
         assert!(HistoryError::InvalidSequence {
             expected: 5,
             got: 6
