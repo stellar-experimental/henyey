@@ -10,32 +10,28 @@ Parse `$ARGUMENTS`:
 - `--max-proposal-rounds N`: Max proposal↔critic iterations (default: 5).
 - `--max-review-rounds N`: Max implement↔review-fix iterations (default: 3).
 
-**If no issue number was provided, auto-select one:**
+**If no issue number was provided, auto-select one.**
 
-Run, in priority order (assigned-to-me → urgent → high → medium → low → rest):
-```bash
-# Priority 0: resume — oldest open issue already assigned to me.
-gh issue list \
-  --state open \
-  --assignee '@me' \
-  --search 'sort:created-asc -label:plan-do-review-loop-failed -label:not-ready' \
-  --json number,title \
-  --limit 1 \
-  --jq '.[0] // empty'
-```
+Auto-select only **unassigned** issues. Never auto-select an issue that is
+already assigned to anyone (including yourself) — an existing assignment
+signals that another worker, or a prior session of this skill, is or was
+working on it. Auto-claiming it races with that worker and silently
+piggybacks on stale context. To resume an in-progress issue, the caller
+must pass the issue number explicitly as an argument.
 
-If that returns empty, try each priority label in order:
+Try each priority label in order (urgent → high → medium → low):
 ```bash
 # Priority 1–4: unassigned issues by label (urgent → high → medium → low).
+# NOTE: `--assignee ''` does NOT filter for unassigned issues (gh ignores
+# the empty value). Use `no:assignee` inside `--search` instead.
 for priority in urgent high medium low; do
   gh issue list \
     --state open \
-    --assignee '' \
     --label "$priority" \
-    --search 'sort:created-asc -label:plan-do-review-loop-failed -label:not-ready' \
-    --json number,title \
-    --limit 1 \
-    --jq '.[0] // empty'
+    --search 'no:assignee sort:created-asc -label:plan-do-review-loop-failed -label:not-ready' \
+    --json number,title,assignees \
+    --jq '[.[] | select(.assignees | length == 0)] | .[0] // empty' \
+    --limit 5
   # Stop at the first match.
 done
 ```
@@ -45,14 +41,19 @@ If still empty, fall back:
 # Priority 5: any remaining eligible issue, oldest first.
 gh issue list \
   --state open \
-  --assignee '' \
-  --search 'sort:created-asc -label:plan-do-review-loop-failed -label:not-ready' \
-  --json number,title \
-  --limit 1 \
-  --jq '.[0] // empty'
+  --search 'no:assignee sort:created-asc -label:plan-do-review-loop-failed -label:not-ready' \
+  --json number,title,assignees \
+  --jq '[.[] | select(.assignees | length == 0)] | .[0] // empty' \
+  --limit 5
 ```
 
-If still empty, **stop** with a message: "No eligible issues found for auto-selection."
+**Defense-in-depth.** Both queries above use `no:assignee` server-side AND a
+client-side jq filter that drops any issue with a non-empty `assignees` array.
+This double-check guards against future gh CLI regressions where `no:assignee`
+is silently ignored — the symptom is hard to detect because the query still
+returns plausible-looking results, just including assigned issues.
+
+If still empty, **stop** with a message: "No eligible unassigned issues found for auto-selection."
 
 Otherwise, set `$ISSUE` to the selected issue number and announce:
 "Auto-selected issue #$ISSUE: <title>".
@@ -66,8 +67,24 @@ auto-selected and explicit issue numbers):
 gh issue edit $ISSUE --add-assignee "@me"
 ```
 
-If assignment fails (e.g., another worker raced), **stop** with a message:
-"Could not assign issue #$ISSUE — it may have been claimed by another worker."
+**Verify we hold the lock alone.** `gh issue edit --add-assignee` does NOT
+fail when someone else is already assigned — it silently appends. To detect
+a race (another worker assigned themselves between our query and our
+assignment), re-fetch the issue and confirm we are the *only* assignee:
+
+```bash
+ME=$(gh api user -q .login)
+ASSIGNEES=$(gh issue view $ISSUE --json assignees --jq '[.assignees[].login] | join(",")')
+if [ "$ASSIGNEES" != "$ME" ]; then
+  # Someone else holds (or shares) the lock — back off and stop.
+  gh issue edit $ISSUE --remove-assignee "@me"
+  echo "Could not claim issue #$ISSUE exclusively — assignees: $ASSIGNEES"
+  exit 0
+fi
+```
+
+If verification fails, **stop** with the message above. Do NOT proceed to
+Step 1.
 
 **Failure handling:** If the skill fails at any point, before stopping:
 1. Unassign yourself to release the concurrency lock:
