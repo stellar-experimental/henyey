@@ -7661,6 +7661,46 @@ mod tests {
         );
         store.assert_consistent();
     }
+
+    /// Regression test for issue #2296: when surge pricing rejects ALL Soroban
+    /// txs (soroban_limited=true, empty survivors), the emitted phase must have
+    /// base_fee=None — matching stellar-core's behavior where an empty
+    /// inclusionFeeMap leaves baseFee as std::nullopt.
+    #[test]
+    fn test_empty_surge_priced_soroban_phase_has_no_base_fee() {
+        // Set Soroban instruction limit to 1 — too small for any tx to fit.
+        let mut limit = Resource::new(vec![i64::MAX; NUM_SOROBAN_TX_RESOURCES]);
+        limit.set_val(ResourceType::Instructions, 1);
+        let config = TxQueueConfig {
+            max_soroban_resources: Some(limit),
+            ..Default::default()
+        };
+        let queue = TransactionQueue::new(config);
+
+        // Add a Soroban tx that requires 80 instructions — will be rejected.
+        let mut tx = make_soroban_envelope_with_resources(8000, 80);
+        set_source(&mut tx, 99);
+        queue.try_add(tx);
+
+        let _set = queue.build_generalized_tx_set(Hash256::ZERO, 10);
+        let gen = _set.generalized_tx_set().unwrap().clone();
+        let stellar_xdr::curr::GeneralizedTransactionSet::V1(v1) = gen;
+        let parallel = match &v1.phases[1] {
+            stellar_xdr::curr::TransactionPhase::V1(parallel) => parallel,
+            _ => panic!("expected Soroban V1 phase"),
+        };
+
+        // The phase should have no execution stages (all txs rejected).
+        assert!(
+            parallel.execution_stages.is_empty(),
+            "expected empty execution stages when all Soroban txs rejected"
+        );
+        // Invariant: empty execution_stages → base_fee must be None.
+        assert_eq!(
+            parallel.base_fee, None,
+            "empty surge-priced Soroban phase must have base_fee=None (stellar-core parity)"
+        );
+    }
 }
 
 #[cfg(test)]

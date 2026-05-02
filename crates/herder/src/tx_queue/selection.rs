@@ -520,6 +520,23 @@ impl TransactionQueue {
     }
 }
 
+/// Canonical empty Soroban parallel phase.
+///
+/// Invariant (stellar-core parity): when no Soroban transactions survive
+/// selection, `base_fee` must be `None` regardless of surge-pricing state.
+/// In stellar-core (`TxSetFrame.cpp:286-290`), `baseFee` is set only when
+/// `inclusionFeeMap` is non-empty (i.e., at least one tx survived).
+fn empty_soroban_phase() -> (stellar_xdr::curr::TransactionPhase, Option<i64>) {
+    use stellar_xdr::curr::{ParallelTxsComponent, TransactionPhase, VecM};
+    (
+        TransactionPhase::V1(ParallelTxsComponent {
+            base_fee: None,
+            execution_stages: VecM::default(),
+        }),
+        None,
+    )
+}
+
 /// Build the Soroban phase and compute base fee from surviving transactions.
 ///
 /// Matches stellar-core's approach: build the parallel phase first, then derive
@@ -534,22 +551,11 @@ fn build_soroban_phase_with_base_fee(
     config: &super::TxQueueConfig,
 ) -> (stellar_xdr::curr::TransactionPhase, Option<i64>) {
     use stellar_xdr::curr::{
-        DependentTxCluster, ParallelTxExecutionStage, ParallelTxsComponent, TransactionPhase, VecM,
+        DependentTxCluster, ParallelTxExecutionStage, ParallelTxsComponent, TransactionPhase,
     };
 
     if soroban_txs.is_empty() {
-        let base_fee = if soroban_limited {
-            Some(ledger_base_fee)
-        } else {
-            None
-        };
-        return (
-            TransactionPhase::V1(ParallelTxsComponent {
-                base_fee,
-                execution_stages: VecM::default(),
-            }),
-            base_fee,
-        );
+        return empty_soroban_phase();
     }
 
     let use_parallel = config.ledger_max_instructions > 0
@@ -618,11 +624,9 @@ fn compute_soroban_base_fee(
     ledger_base_fee: i64,
 ) -> Option<i64> {
     if stages.is_empty() {
-        return if soroban_limited || had_tx_not_fitting {
-            Some(ledger_base_fee)
-        } else {
-            None
-        };
+        // Invariant (stellar-core parity): empty execution_stages → base_fee
+        // must be None. See stellar-core TxSetFrame.cpp:286-290.
+        return None;
     }
 
     if soroban_limited || had_tx_not_fitting {

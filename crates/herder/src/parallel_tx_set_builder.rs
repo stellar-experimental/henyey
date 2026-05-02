@@ -825,8 +825,10 @@ pub fn build_two_phase_tx_set(
     // build_parallel_soroban_phase() has instruction-limit-based capacity
     // constraints that would drop TXs exceeding cluster capacity.
     let soroban_phase = if soroban_txs.is_empty() {
+        // Invariant: empty execution_stages → base_fee must be None
+        // (stellar-core TxSetFrame.cpp:286-290).
         TransactionPhase::V1(ParallelTxsComponent {
-            base_fee: soroban_base_fee,
+            base_fee: None,
             execution_stages: VecM::default(),
         })
     } else {
@@ -2964,6 +2966,36 @@ mod stellar_core_parity_tests {
                     "{ctx}: XDR roundtrip produced different bytes"
                 );
             }
+        }
+    }
+
+    /// Regression test for issue #2296: `build_two_phase_tx_set` must produce
+    /// `base_fee: None` when soroban_txs is empty, even if caller passes
+    /// `Some(base_fee)`.
+    #[test]
+    fn test_build_two_phase_tx_set_empty_soroban_ignores_caller_fee() {
+        use crate::build_two_phase_tx_set;
+        use henyey_common::types::Hash256;
+
+        let gen_set = build_two_phase_tx_set(
+            vec![], // no classic txs
+            vec![], // no soroban txs
+            &Hash256::ZERO,
+            Some(100), // caller supplies a fee — should be ignored
+            4,
+        );
+
+        let stellar_xdr::curr::GeneralizedTransactionSet::V1(v1) = gen_set;
+        let soroban_phase = &v1.phases[1];
+        match soroban_phase {
+            TransactionPhase::V1(parallel) => {
+                assert!(parallel.execution_stages.is_empty());
+                assert_eq!(
+                    parallel.base_fee, None,
+                    "empty Soroban phase must have base_fee=None regardless of caller-supplied fee"
+                );
+            }
+            _ => panic!("expected V1 Soroban phase"),
         }
     }
 }
