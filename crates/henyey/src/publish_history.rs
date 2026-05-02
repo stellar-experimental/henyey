@@ -194,19 +194,34 @@ pub(crate) async fn cmd_publish_history(config: AppConfig, force: bool) -> anyho
                 ext: stellar_xdr::curr::LedgerHeaderHistoryEntryExt::V0,
             });
 
-            let tx_entry = db
-                .get_tx_history_entry(seq)?
-                .ok_or_else(|| anyhow::anyhow!("Missing tx history entry {}", seq))?;
+            let tx_entry = db.get_tx_history_entry(seq)?;
 
-            let tx_result = db
-                .get_tx_result_entry(seq)?
-                .ok_or_else(|| anyhow::anyhow!("Missing tx result entry {}", seq))?;
+            let tx_result = db.get_tx_result_entry(seq)?;
+
+            // Enforce both-or-none invariant
+            match (&tx_entry, &tx_result) {
+                (Some(_), None) => {
+                    return Err(anyhow::anyhow!(
+                        "Ledger {}: tx history entry present but result entry missing",
+                        seq
+                    ));
+                }
+                (None, Some(_)) => {
+                    return Err(anyhow::anyhow!(
+                        "Ledger {}: result entry present but tx history entry missing",
+                        seq
+                    ));
+                }
+                _ => {}
+            }
 
             // Match stellar-core: only include tx/result entries for ledgers
             // with transactions (CheckpointBuilder.cpp:140).
-            if !tx_result.tx_result_set.results.is_empty() {
-                tx_entries.push(tx_entry);
-                tx_results.push(tx_result);
+            if let (Some(tx_entry), Some(tx_result)) = (tx_entry, tx_result) {
+                if !tx_result.tx_result_set.results.is_empty() {
+                    tx_entries.push(tx_entry);
+                    tx_results.push(tx_result);
+                }
             }
         }
 

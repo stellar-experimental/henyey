@@ -1447,17 +1447,34 @@ mod tests {
     }
 
     /// Helper: create an empty tx set and result set for a header,
-    /// and return (entry, result_entry).
+    /// Helper to construct an empty TransactionHistoryEntry and TransactionHistoryResultEntry
+    /// for a header. Used only in tests for publish-side verification.
     fn make_empty_entries(
         header: &stellar_xdr::curr::LedgerHeader,
     ) -> (
         stellar_xdr::curr::TransactionHistoryEntry,
         stellar_xdr::curr::TransactionHistoryResultEntry,
     ) {
-        (
-            crate::catchup::empty_tx_history_entry(header),
-            crate::catchup::empty_tx_result_entry(header.ledger_seq),
-        )
+        use stellar_xdr::curr::{
+            TransactionHistoryEntryExt, TransactionHistoryResultEntry,
+            TransactionHistoryResultEntryExt, TransactionResultSet, TransactionSet,
+        };
+        let tx_history = stellar_xdr::curr::TransactionHistoryEntry {
+            ledger_seq: header.ledger_seq,
+            tx_set: TransactionSet {
+                previous_ledger_hash: header.previous_ledger_hash.clone(),
+                txs: Default::default(),
+            },
+            ext: TransactionHistoryEntryExt::V0,
+        };
+        let tx_result = TransactionHistoryResultEntry {
+            ledger_seq: header.ledger_seq,
+            tx_result_set: TransactionResultSet {
+                results: Default::default(),
+            },
+            ext: TransactionHistoryResultEntryExt::default(),
+        };
+        (tx_history, tx_result)
     }
 
     #[test]

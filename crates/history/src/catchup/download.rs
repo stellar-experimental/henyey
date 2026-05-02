@@ -336,15 +336,13 @@ impl CatchupManager {
                 .tx_entries
                 .iter()
                 .find(|entry| entry.ledger_seq == seq)
-                .cloned()
-                .unwrap_or_else(|| super::empty_tx_history_entry(&header));
+                .cloned();
 
             let tx_result_entry = cache
                 .result_entries
                 .iter()
                 .find(|entry| entry.ledger_seq == seq)
-                .cloned()
-                .unwrap_or_else(|| super::empty_tx_result_entry(seq));
+                .cloned();
 
             data.push(LedgerData::new(header, tx_history_entry, tx_result_entry)?);
         }

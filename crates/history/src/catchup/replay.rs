@@ -71,24 +71,26 @@ impl CatchupManager {
         }
 
         // Verify transaction sets and result sets match header hashes.
-        // With canonical LedgerData, entries are always populated (no Option),
-        // so verification is unconditional.
+        // tx_set is always available (synthesized for absent entries), matching
+        // stellar-core's unconditional verification (ApplyCheckpointWork.cpp:280).
+        // tx_result_set verification is skipped for absent entries.
         for data in ledger_data {
             let tx_set = data.tx_set();
             verify::verify_tx_set(data.header(), &tx_set)?;
 
-            let xdr = data
-                .tx_result_entry()
-                .tx_result_set
-                .to_xdr(stellar_xdr::curr::Limits::none())
-                .map_err(|e| {
-                    HistoryError::CatchupFailed(format!(
-                        "Failed to serialize tx result set for ledger {}: {}",
-                        data.header().ledger_seq,
-                        e
-                    ))
-                })?;
-            verify::verify_tx_result_set(data.header(), &xdr)?;
+            if let Some(result_entry) = data.tx_result_entry() {
+                let xdr = result_entry
+                    .tx_result_set
+                    .to_xdr(stellar_xdr::curr::Limits::none())
+                    .map_err(|e| {
+                        HistoryError::CatchupFailed(format!(
+                            "Failed to serialize tx result set for ledger {}: {}",
+                            data.header().ledger_seq,
+                            e
+                        ))
+                    })?;
+                verify::verify_tx_result_set(data.header(), &xdr)?;
+            }
         }
 
         info!("Verified header chain for {} ledgers", headers.len());

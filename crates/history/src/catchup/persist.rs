@@ -30,8 +30,15 @@ impl CatchupManager {
                     let header_xdr = header.to_xdr(stellar_xdr::curr::Limits::none())?;
                     conn.store_ledger_header(header, &header_xdr)?;
 
-                    conn.store_tx_history_entry(header.ledger_seq, data.tx_history_entry())?;
-                    conn.store_tx_result_entry(header.ledger_seq, data.tx_result_entry())?;
+                    // Only store tx/result entries for Present data.
+                    // For Absent (empty-tx) ledgers, no DB rows are written —
+                    // matching the archive sparsity model.
+                    if let (Some(tx_entry), Some(result_entry)) =
+                        (data.tx_history_entry(), data.tx_result_entry())
+                    {
+                        conn.store_tx_history_entry(header.ledger_seq, tx_entry)?;
+                        conn.store_tx_result_entry(header.ledger_seq, result_entry)?;
+                    }
 
                     // tx/result count consistency is guaranteed by LedgerData::new()
                     let tx_set = data.tx_set();
@@ -199,7 +206,7 @@ impl CatchupManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::catchup::{empty_tx_history_entry, empty_tx_result_entry};
+    use crate::catchup::make_empty_tx_set_for_header;
     use henyey_bucket::BucketManager;
     use henyey_db::Database;
     use stellar_xdr::curr::{
@@ -290,7 +297,7 @@ mod tests {
         let header = make_header(100);
         let tx_history = make_tx_history_entry(100, vec![make_test_envelope()]);
         let tx_result = make_tx_result_entry(100, vec![make_success_result()]);
-        let data = LedgerData::new(header, tx_history, tx_result);
+        let data = LedgerData::new(header, Some(tx_history), Some(tx_result));
         assert!(data.is_ok(), "valid LedgerData should succeed");
     }
 
@@ -299,7 +306,7 @@ mod tests {
         let header = make_header(200);
         let tx_history = make_tx_history_entry(200, vec![]);
         let tx_result = make_tx_result_entry(200, vec![]);
-        let data = LedgerData::new(header, tx_history, tx_result);
+        let data = LedgerData::new(header, Some(tx_history), Some(tx_result));
         assert!(data.is_ok(), "empty ledger should succeed");
     }
 
@@ -308,7 +315,7 @@ mod tests {
         let header = make_header(100);
         let tx_history = make_tx_history_entry(999, vec![]); // wrong seq
         let tx_result = make_tx_result_entry(100, vec![]);
-        let result = LedgerData::new(header, tx_history, tx_result);
+        let result = LedgerData::new(header, Some(tx_history), Some(tx_result));
         assert!(result.is_err(), "mismatched tx_history seq should fail");
         let err = result.unwrap_err();
         assert!(
@@ -322,7 +329,7 @@ mod tests {
         let header = make_header(100);
         let tx_history = make_tx_history_entry(100, vec![]);
         let tx_result = make_tx_result_entry(999, vec![]); // wrong seq
-        let result = LedgerData::new(header, tx_history, tx_result);
+        let result = LedgerData::new(header, Some(tx_history), Some(tx_result));
         assert!(result.is_err(), "mismatched tx_result seq should fail");
         let err = result.unwrap_err();
         assert!(
@@ -336,7 +343,7 @@ mod tests {
         let header = make_header(100);
         let tx_history = make_tx_history_entry(100, vec![make_test_envelope()]);
         let tx_result = make_tx_result_entry(100, vec![]); // 0 results for 1 tx
-        let result = LedgerData::new(header, tx_history, tx_result);
+        let result = LedgerData::new(header, Some(tx_history), Some(tx_result));
         assert!(result.is_err(), "count mismatch should fail");
         let err = result.unwrap_err();
         assert!(
@@ -349,44 +356,148 @@ mod tests {
         );
     }
 
-    // --- Empty entry synthesis tests ---
+    // --- Empty tx set synthesis tests ---
 
     #[test]
-    fn test_empty_tx_history_entry_pre_v20() {
+    fn test_make_empty_tx_set_for_header_pre_v20() {
+        use henyey_ledger::TransactionSetVariant;
+
         let header = LedgerHeader {
             ledger_seq: 50,
             ledger_version: 19,
+            previous_ledger_hash: Hash([42u8; 32]),
             ..Default::default()
         };
-        let entry = empty_tx_history_entry(&header);
-        assert_eq!(entry.ledger_seq, 50);
-        assert!(
-            matches!(entry.ext, TransactionHistoryEntryExt::V0),
-            "pre-v20 should use V0 ext"
-        );
-        assert_eq!(entry.tx_set.txs.len(), 0);
+        let tx_set = make_empty_tx_set_for_header(&header);
+        match tx_set {
+            TransactionSetVariant::Classic(set) => {
+                assert_eq!(set.txs.len(), 0);
+                assert_eq!(set.previous_ledger_hash, Hash([42u8; 32]));
+            }
+            _ => panic!("pre-v20 should produce Classic tx set"),
+        }
     }
 
     #[test]
-    fn test_empty_tx_history_entry_v20_plus() {
+    fn test_make_empty_tx_set_for_header_v20_sequential() {
+        use henyey_ledger::TransactionSetVariant;
+        use stellar_xdr::curr::{GeneralizedTransactionSet, TransactionPhase};
+
         let header = LedgerHeader {
             ledger_seq: 100,
             ledger_version: 20,
+            previous_ledger_hash: Hash([7u8; 32]),
             ..Default::default()
         };
-        let entry = empty_tx_history_entry(&header);
-        assert_eq!(entry.ledger_seq, 100);
+        let tx_set = make_empty_tx_set_for_header(&header);
+        match tx_set {
+            TransactionSetVariant::Generalized(GeneralizedTransactionSet::V1(set)) => {
+                assert_eq!(set.previous_ledger_hash, Hash([7u8; 32]));
+                assert_eq!(set.phases.len(), 2);
+                // Both phases should be V0 (sequential) for protocol 20-22
+                assert!(
+                    matches!(&set.phases[0], TransactionPhase::V0(_)),
+                    "classic phase should be V0"
+                );
+                assert!(
+                    matches!(&set.phases[1], TransactionPhase::V0(_)),
+                    "soroban phase should be V0 (sequential) for protocol 20"
+                );
+            }
+            _ => panic!("v20 should produce Generalized tx set"),
+        }
+    }
+
+    #[test]
+    fn test_make_empty_tx_set_for_header_v22_sequential() {
+        use henyey_ledger::TransactionSetVariant;
+        use stellar_xdr::curr::{GeneralizedTransactionSet, TransactionPhase};
+
+        let header = LedgerHeader {
+            ledger_seq: 100,
+            ledger_version: 22,
+            previous_ledger_hash: Hash([5u8; 32]),
+            ..Default::default()
+        };
+        let tx_set = make_empty_tx_set_for_header(&header);
+        match tx_set {
+            TransactionSetVariant::Generalized(GeneralizedTransactionSet::V1(set)) => {
+                assert_eq!(set.previous_ledger_hash, Hash([5u8; 32]));
+                assert_eq!(set.phases.len(), 2);
+                assert!(
+                    matches!(&set.phases[1], TransactionPhase::V0(_)),
+                    "soroban phase should be V0 (sequential) for protocol 22"
+                );
+            }
+            _ => panic!("v22 should produce Generalized tx set"),
+        }
+    }
+
+    #[test]
+    fn test_make_empty_tx_set_for_header_v23_parallel() {
+        use henyey_ledger::TransactionSetVariant;
+        use stellar_xdr::curr::{GeneralizedTransactionSet, TransactionPhase};
+
+        let header = LedgerHeader {
+            ledger_seq: 100,
+            ledger_version: 23,
+            previous_ledger_hash: Hash([9u8; 32]),
+            ..Default::default()
+        };
+        let tx_set = make_empty_tx_set_for_header(&header);
+        match tx_set {
+            TransactionSetVariant::Generalized(GeneralizedTransactionSet::V1(set)) => {
+                assert_eq!(set.previous_ledger_hash, Hash([9u8; 32]));
+                assert_eq!(set.phases.len(), 2);
+                assert!(
+                    matches!(&set.phases[0], TransactionPhase::V0(_)),
+                    "classic phase should be V0"
+                );
+                assert!(
+                    matches!(&set.phases[1], TransactionPhase::V1(_)),
+                    "soroban phase should be V1 (parallel) for protocol 23+"
+                );
+            }
+            _ => panic!("v23 should produce Generalized tx set"),
+        }
+    }
+
+    #[test]
+    fn test_ledger_data_new_absent_both_none() {
+        let header = make_header(300);
+        let data = LedgerData::new(header, None, None);
+        assert!(data.is_ok(), "both None should produce Absent LedgerData");
+        let data = data.unwrap();
+        assert!(!data.has_transactions());
+        assert!(data.tx_history_entry().is_none());
+        assert!(data.tx_result_entry().is_none());
+        assert_eq!(data.tx_results().len(), 0);
+    }
+
+    #[test]
+    fn test_ledger_data_new_asymmetric_some_none_error() {
+        let header = make_header(400);
+        let tx_history = make_tx_history_entry(400, vec![]);
+        let result = LedgerData::new(header, Some(tx_history), None);
+        assert!(result.is_err(), "(Some, None) should fail");
+        let err = result.unwrap_err();
         assert!(
-            matches!(entry.ext, TransactionHistoryEntryExt::V1(_)),
-            "v20+ should use V1 ext"
+            matches!(&err, HistoryError::VerificationFailed(_)),
+            "expected VerificationFailed, got: {err}"
         );
     }
 
     #[test]
-    fn test_empty_tx_result_entry_produces_valid_empty() {
-        let entry = empty_tx_result_entry(42);
-        assert_eq!(entry.ledger_seq, 42);
-        assert_eq!(entry.tx_result_set.results.len(), 0);
+    fn test_ledger_data_new_asymmetric_none_some_error() {
+        let header = make_header(400);
+        let tx_result = make_tx_result_entry(400, vec![]);
+        let result = LedgerData::new(header, None, Some(tx_result));
+        assert!(result.is_err(), "(None, Some) should fail");
+        let err = result.unwrap_err();
+        assert!(
+            matches!(&err, HistoryError::VerificationFailed(_)),
+            "expected VerificationFailed, got: {err}"
+        );
     }
 
     // --- Persist path tests ---
@@ -401,8 +512,8 @@ mod tests {
 
         let data = LedgerData::new(
             make_header(100),
-            make_tx_history_entry(100, vec![envelope]),
-            make_tx_result_entry(100, vec![result_pair]),
+            Some(make_tx_history_entry(100, vec![envelope])),
+            Some(make_tx_result_entry(100, vec![result_pair])),
         )
         .expect("valid LedgerData");
 
@@ -421,8 +532,8 @@ mod tests {
 
         let data = LedgerData::new(
             make_header(200),
-            make_tx_history_entry(200, vec![]),
-            make_tx_result_entry(200, vec![]),
+            Some(make_tx_history_entry(200, vec![])),
+            Some(make_tx_result_entry(200, vec![])),
         )
         .expect("valid empty LedgerData");
 
@@ -435,22 +546,17 @@ mod tests {
     }
 
     #[test]
-    fn test_persist_ledger_history_with_synthesized_entries() {
+    fn test_persist_ledger_history_with_absent_entries() {
         let manager = make_test_catchup_manager();
         let network_id = test_network_id();
 
         let header = make_header(300);
-        let data = LedgerData::new(
-            header.clone(),
-            empty_tx_history_entry(&header),
-            empty_tx_result_entry(300),
-        )
-        .expect("valid synthesized LedgerData");
+        let data = LedgerData::new(header.clone(), None, None).expect("valid absent LedgerData");
 
         let result = manager.persist_ledger_history(&[data], &network_id);
         assert!(
             result.is_ok(),
-            "synthesized entries should persist: {:?}",
+            "absent entries should persist: {:?}",
             result.err()
         );
     }
@@ -460,8 +566,8 @@ mod tests {
         // Previously this was caught at persist time; now it's caught by LedgerData::new()
         let result = LedgerData::new(
             make_header(400),
-            make_tx_history_entry(400, vec![make_test_envelope()]),
-            make_tx_result_entry(400, vec![]), // 0 results for 1 tx
+            Some(make_tx_history_entry(400, vec![make_test_envelope()])),
+            Some(make_tx_result_entry(400, vec![])), // 0 results for 1 tx
         );
         assert!(
             result.is_err(),
@@ -485,8 +591,8 @@ mod tests {
         // First ledger: valid
         let good_data = LedgerData::new(
             make_header(500),
-            make_tx_history_entry(500, vec![envelope.clone()]),
-            make_tx_result_entry(500, vec![result_pair]),
+            Some(make_tx_history_entry(500, vec![envelope.clone()])),
+            Some(make_tx_result_entry(500, vec![result_pair])),
         )
         .expect("valid good LedgerData");
 
@@ -494,8 +600,8 @@ mod tests {
         // by having two ledgers with the same seq — the second will fail to insert)
         let also_500 = LedgerData::new(
             make_header(500),
-            make_tx_history_entry(500, vec![]),
-            make_tx_result_entry(500, vec![]),
+            Some(make_tx_history_entry(500, vec![])),
+            Some(make_tx_result_entry(500, vec![])),
         )
         .expect("valid duplicate LedgerData");
 
@@ -524,8 +630,8 @@ mod tests {
         let header = make_header(600);
         let data = LedgerData::new(
             header.clone(),
-            make_tx_history_entry(600, vec![]),
-            make_tx_result_entry(600, vec![]),
+            Some(make_tx_history_entry(600, vec![])),
+            Some(make_tx_result_entry(600, vec![])),
         )
         .expect("valid LedgerData");
 

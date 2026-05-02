@@ -134,7 +134,7 @@ pub use archive_state::HistoryArchiveState;
 pub use archive_state::MAX_HISTORY_ARCHIVE_BUCKET_SIZE;
 pub use catchup::{
     CatchupManager, CatchupOptions, CatchupProgress, CatchupStatus, CheckpointData,
-    ExistingBucketState, LedgerData,
+    ExistingBucketState, LedgerData, LedgerTxData,
 };
 pub use catchup_range::{CatchupMode, CatchupRange, LedgerRange, GENESIS_LEDGER_SEQ};
 pub use cdp::{
