@@ -1273,6 +1273,7 @@ impl UpgradeContext {
         ltx: &mut CloseLedgerState,
         closing_ledger_seq: u32,
         protocol_version: u32,
+        soroban_state: &crate::soroban_state::SharedSorobanState,
     ) -> Result<ConfigUpgradeResult, LedgerError> {
         use stellar_xdr::curr::{Limits, WriteXdr};
 
@@ -1313,9 +1314,22 @@ impl UpgradeContext {
 
             // Capture all mutations via checkpoint (mirrors stellar-core's child
             // LedgerTxn + getChanges() pattern). This automatically includes
-            // config setting updates, frozen keys delta, and window resize.
+            // config setting updates, frozen keys delta, window resize, and
+            // state size recomputation.
             let cp = ltx.change_checkpoint();
             let (archival, memory_cost) = frame.apply_to(ltx)?;
+
+            // Parity: Upgrades.cpp:1468-1472 — state size recompute runs inside
+            // the config upgrade's child LedgerTxn scope when memory cost changes.
+            if memory_cost && protocol_version >= henyey_common::MIN_SOROBAN_PROTOCOL_VERSION {
+                crate::manager::handle_upgrade_affecting_soroban_state_size(
+                    ltx,
+                    protocol_version,
+                    closing_ledger_seq,
+                    soroban_state,
+                )?;
+            }
+
             let entry_changes = ltx.entry_changes_since(cp);
 
             state_archival_changed |= archival;

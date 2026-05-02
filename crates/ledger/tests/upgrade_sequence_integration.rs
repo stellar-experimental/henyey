@@ -648,7 +648,8 @@ fn test_config_upgrade_nonexistent_key_rejected() {
     ctx.add_upgrade(LedgerUpgrade::Config(bogus_key));
 
     let mut ltx = CloseLedgerState::begin(handle, header, header_hash, 1);
-    let result = ctx.apply_config_upgrades(&mut ltx, 1, 25);
+    let soroban_state = henyey_ledger::SharedSorobanState::new();
+    let result = ctx.apply_config_upgrades(&mut ltx, 1, 25, &soroban_state);
 
     assert!(
         result.is_err(),
@@ -814,4 +815,77 @@ async fn test_failed_config_upgrade_does_not_abort_ledger_close() {
     }
 }
 
-use stellar_xdr::curr::LedgerCloseMeta;
+use stellar_xdr::curr::{LedgerCloseMeta, LedgerEntryChange};
+
+// ===========================================================================
+// Test: #2268 — State size recompute captured in upgrade meta
+// ===========================================================================
+
+/// Regression test for AUDIT-243 (#2268).
+///
+/// When a version upgrade triggers `handleUpgradeAffectingSorobanInMemoryStateSize`,
+/// the `LiveSorobanStateSizeWindow` update must appear in the version upgrade's
+/// `UpgradeEntryMeta.changes`. Previously, the recompute ran AFTER meta was built,
+/// causing these changes to be missing from upgrade meta.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_version_upgrade_state_size_recompute_in_meta() {
+    // Init at protocol 24 so we can upgrade to 25 (which triggers recompute since >= V23).
+    let ledger = init_ledger_manager(24);
+
+    // Close a ledger with version upgrade 24→25.
+    let close_data = empty_close_data(&ledger, 1, 100).with_upgrade(LedgerUpgrade::Version(25));
+    let handle = tokio::runtime::Handle::current();
+    let result = ledger
+        .close_ledger(close_data, Some(handle))
+        .expect("close ledger with version upgrade");
+
+    // Verify the result header has the new version.
+    assert_eq!(result.header.ledger_version, 25);
+
+    // Check upgrade meta: the version upgrade's changes must include
+    // LiveSorobanStateSizeWindow entries (STATE + UPDATED pair).
+    let meta = result.meta.expect("close meta should be present");
+    match meta {
+        LedgerCloseMeta::V2(v2) => {
+            assert!(
+                !v2.upgrades_processing.is_empty(),
+                "Version upgrade should produce UpgradeEntryMeta"
+            );
+
+            // Find the version upgrade meta entry.
+            let version_meta = v2
+                .upgrades_processing
+                .iter()
+                .find(|m| matches!(m.upgrade, LedgerUpgrade::Version(_)))
+                .expect("Should have Version upgrade meta");
+
+            // The changes should include LiveSorobanStateSizeWindow updates.
+            // Look for an Updated change that modifies a ConfigSetting entry
+            // with the LiveSorobanStateSizeWindow variant.
+            let has_window_update = version_meta.changes.iter().any(|change| {
+                matches!(
+                    change,
+                    LedgerEntryChange::Updated(entry)
+                    if matches!(
+                        &entry.data,
+                        LedgerEntryData::ConfigSetting(
+                            ConfigSettingEntry::LiveSorobanStateSizeWindow(_)
+                        )
+                    )
+                )
+            });
+
+            assert!(
+                has_window_update,
+                "Version upgrade meta must include LiveSorobanStateSizeWindow update. \
+                 Changes: {:?}",
+                version_meta
+                    .changes
+                    .iter()
+                    .map(std::mem::discriminant)
+                    .collect::<Vec<_>>()
+            );
+        }
+        _ => panic!("expected V2 meta"),
+    }
+}

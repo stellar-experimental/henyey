@@ -932,7 +932,7 @@ impl crate::EntryReader for PairsReader<'_> {
 ///
 /// This mirrors the probe pattern in `load_soroban_network_info` (config.rs:396)
 /// where absence is distinguished from corruption.
-fn build_soroban_rent_config(
+pub(crate) fn build_soroban_rent_config(
     reader: &impl crate::EntryReader,
 ) -> Result<Option<crate::soroban_state::SorobanRentConfig>> {
     use crate::execution::load_config_setting;
@@ -1002,6 +1002,101 @@ fn compute_soroban_rent_config_from_pairs(
     level_pairs: &[(Arc<henyey_bucket::Bucket>, Arc<henyey_bucket::Bucket>)],
 ) -> Result<Option<crate::soroban_state::SorobanRentConfig>> {
     build_soroban_rent_config(&PairsReader(level_pairs))
+}
+
+/// Recompute Soroban in-memory state size and update the LiveSorobanStateSizeWindow.
+///
+/// Parity: stellar-core `handleUpgradeAffectingSorobanInMemoryStateSize`
+/// (LedgerManagerImpl.cpp:937-1000). Called inside the upgrade's checkpoint scope so
+/// the window update is captured as part of that upgrade's `LedgerEntryChanges`.
+///
+/// This function does NOT create its own checkpoint — the caller's checkpoint captures
+/// the changes it makes (via `record_update`).
+///
+/// No-op if:
+/// - Rent config is absent (pre-Soroban protocol, empty bucket list fixtures)
+/// - `LiveSorobanStateSizeWindow` entry is absent (test fixtures without config entries)
+pub(crate) fn handle_upgrade_affecting_soroban_state_size(
+    ltx: &mut crate::close_state::CloseLedgerState,
+    protocol_version: u32,
+    ledger_seq: u32,
+    soroban_state: &crate::soroban_state::SharedSorobanState,
+) -> Result<()> {
+    use stellar_xdr::curr::{
+        ConfigSettingEntry, ConfigSettingId, LedgerEntry, LedgerEntryData, LedgerEntryExt,
+        LedgerKey, LedgerKeyConfigSetting,
+    };
+
+    // Load rent config (sees post-upgrade values through CloseLedgerState).
+    let rent_config = match build_soroban_rent_config(ltx)? {
+        Some(rc) => rc,
+        None => return Ok(()), // Pre-Soroban: no config entries yet
+    };
+
+    // Recompute contract code sizes with new cost params.
+    {
+        let mut state = soroban_state.write();
+        let code_size_before = state.contract_code_state_size();
+        let data_size_before = state.contract_data_state_size();
+        let code_count = state.contract_code_count();
+        let data_count = state.contract_data_count();
+        state.recompute_contract_code_sizes(protocol_version, Some(&rent_config));
+        tracing::info!(
+            ledger_seq,
+            code_size_before,
+            code_size_after = state.contract_code_state_size(),
+            data_size = data_size_before,
+            code_count,
+            data_count,
+            total_size = state.total_size(),
+            "Recomputed contract code sizes (upgrade-affecting state size)"
+        );
+    }
+
+    // Update all window entries with the new total size.
+    // Parity: NetworkConfig.cpp:2165 updateRecomputedSorobanStateSize
+    if protocol_version_starts_from(protocol_version, ProtocolVersion::V23) {
+        let new_size = soroban_state.read().total_size();
+        let window_key = LedgerKey::ConfigSetting(LedgerKeyConfigSetting {
+            config_setting_id: ConfigSettingId::LiveSorobanStateSizeWindow,
+        });
+
+        // Created at V20; skip if absent (test fixtures without config entries).
+        if let Some(previous_entry) = ltx.get_entry(&window_key)? {
+            let mut window_vec: Vec<u64> = if let LedgerEntryData::ConfigSetting(
+                ConfigSettingEntry::LiveSorobanStateSizeWindow(ref w),
+            ) = previous_entry.data
+            {
+                w.iter().copied().collect()
+            } else {
+                return Err(LedgerError::Internal(
+                    "LiveSorobanStateSizeWindow has unexpected entry type".to_string(),
+                ));
+            };
+
+            for size in &mut window_vec {
+                *size = new_size;
+            }
+            let new_window: stellar_xdr::curr::VecM<u64> = window_vec
+                .try_into()
+                .map_err(|_| LedgerError::Internal("Failed to convert window vec".to_string()))?;
+            let new_window_entry = LedgerEntry {
+                last_modified_ledger_seq: ledger_seq,
+                data: LedgerEntryData::ConfigSetting(
+                    ConfigSettingEntry::LiveSorobanStateSizeWindow(new_window),
+                ),
+                ext: LedgerEntryExt::V0,
+            };
+            ltx.record_update(previous_entry, new_window_entry)?;
+            tracing::info!(
+                ledger_seq,
+                new_size,
+                "Updated all state size window entries (upgrade-affecting state size)"
+            );
+        }
+    }
+
+    Ok(())
 }
 
 /// Scan a set of bucket level pairs and extract all cache data.
@@ -4153,16 +4248,26 @@ impl LedgerCloseContext<'_> {
         // (LedgerManagerImpl.cpp:1666-1690) that logs errors and continues.
         // We mirror that: errors are logged and skipped rather than aborting
         // the ledger close.
-        let mut version_upgrade_memory_cost_changed = false;
         let mut version_upgrade_succeeded = prev_version == protocol_version;
 
         // Capture changes from version upgrade side effects (cost types for V25).
         let version_changes = if prev_version != protocol_version {
             let cp = self.ltx.change_checkpoint();
             match self.apply_version_upgrade_side_effects(prev_version, protocol_version) {
-                Ok(memory_cost_changed) => {
-                    version_upgrade_memory_cost_changed = memory_cost_changed;
+                Ok(_memory_cost_changed) => {
                     version_upgrade_succeeded = true;
+                    // Parity: Upgrades.cpp:1252-1256 — state size recompute runs
+                    // inside the version upgrade's child LedgerTxn scope.
+                    if protocol_version_starts_from(protocol_version, ProtocolVersion::V23)
+                        && protocol_version >= henyey_common::MIN_SOROBAN_PROTOCOL_VERSION
+                    {
+                        handle_upgrade_affecting_soroban_state_size(
+                            &mut self.ltx,
+                            protocol_version,
+                            self.close_data.ledger_seq,
+                            &self.manager.soroban_state,
+                        )?;
+                    }
                 }
                 Err(e) => {
                     tracing::error!(
@@ -4234,6 +4339,7 @@ impl LedgerCloseContext<'_> {
                 &mut self.ltx,
                 self.close_data.ledger_seq,
                 protocol_version,
+                &self.manager.soroban_state,
             ) {
                 Ok(result) => {
                     config_state_archival_changed = result.state_archival_changed;
@@ -4317,100 +4423,6 @@ impl LedgerCloseContext<'_> {
                     upgrade_type = ?std::mem::discriminant(&upgrade),
                     "Omitting UpgradeEntryMeta for failed upgrade"
                 );
-            }
-        }
-
-        // Parity: Upgrades.cpp:1238-1242 and 1449-1453
-        // handleUpgradeAffectingSorobanInMemoryStateSize is called:
-        // 1. After version upgrade to V23+ (recompute with potentially new cost params)
-        // 2. After config upgrade that changes ContractCostParamsMemoryBytes
-        // It recomputes contract code sizes in-memory and overwrites all window entries.
-        let version_upgrade_triggers_state_size = prev_version != protocol_version
-            && protocol_version_starts_from(protocol_version, ProtocolVersion::V23);
-        if (config_memory_cost_params_changed
-            || version_upgrade_memory_cost_changed
-            || version_upgrade_triggers_state_size)
-            && protocol_version >= henyey_common::MIN_SOROBAN_PROTOCOL_VERSION
-        {
-            // Load rent config through CloseLedgerState (sees post-upgrade values).
-            if let Some(rent_config) = build_soroban_rent_config(&self.ltx)? {
-                // Recompute contract code sizes with new cost params
-                {
-                    let mut soroban_state = self.manager.soroban_state.write();
-                    let code_size_before = soroban_state.contract_code_state_size();
-                    let data_size_before = soroban_state.contract_data_state_size();
-                    let code_count = soroban_state.contract_code_count();
-                    let data_count = soroban_state.contract_data_count();
-                    soroban_state
-                        .recompute_contract_code_sizes(protocol_version, Some(&rent_config));
-                    tracing::info!(
-                        ledger_seq = self.close_data.ledger_seq,
-                        code_size_before = code_size_before,
-                        code_size_after = soroban_state.contract_code_state_size(),
-                        data_size = data_size_before,
-                        code_count = code_count,
-                        data_count = data_count,
-                        total_size = soroban_state.total_size(),
-                        has_rent_config = true,
-                        "Recomputed contract code sizes"
-                    );
-                }
-
-                // Update all window entries with the new total size
-                // Parity: NetworkConfig.cpp:2165 updateRecomputedSorobanStateSize
-                if protocol_version_starts_from(protocol_version, ProtocolVersion::V23) {
-                    let new_size = self.manager.soroban_state.read().total_size();
-                    let window_key = stellar_xdr::curr::LedgerKey::ConfigSetting(
-                        stellar_xdr::curr::LedgerKeyConfigSetting {
-                            config_setting_id:
-                                stellar_xdr::curr::ConfigSettingId::LiveSorobanStateSizeWindow,
-                        },
-                    );
-
-                    // Read the window through CloseLedgerState (may have been resized by config upgrade).
-                    // Parity: stellar-core reads from LedgerTxn which includes prior modifications.
-                    // Created at V20; skip if absent (test fixtures without config entries).
-                    if let Some(previous_entry) = self.ltx.get_entry(&window_key)? {
-                        let mut window_vec: Vec<u64> =
-                            if let stellar_xdr::curr::LedgerEntryData::ConfigSetting(
-                                stellar_xdr::curr::ConfigSettingEntry::LiveSorobanStateSizeWindow(
-                                    ref w,
-                                ),
-                            ) = previous_entry.data
-                            {
-                                w.iter().copied().collect()
-                            } else {
-                                return Err(LedgerError::Internal(
-                                    "LiveSorobanStateSizeWindow has unexpected entry type"
-                                        .to_string(),
-                                ));
-                            };
-
-                        for size in &mut window_vec {
-                            *size = new_size;
-                        }
-                        let new_window: stellar_xdr::curr::VecM<u64> =
-                            window_vec.try_into().map_err(|_| {
-                                LedgerError::Internal("Failed to convert window vec".to_string())
-                            })?;
-                        let new_window_entry = stellar_xdr::curr::LedgerEntry {
-                            last_modified_ledger_seq: self.close_data.ledger_seq,
-                            data: stellar_xdr::curr::LedgerEntryData::ConfigSetting(
-                                stellar_xdr::curr::ConfigSettingEntry::LiveSorobanStateSizeWindow(
-                                    new_window,
-                                ),
-                            ),
-                            ext: stellar_xdr::curr::LedgerEntryExt::V0,
-                        };
-                        self.ltx.record_update(previous_entry, new_window_entry)?;
-                        tracing::info!(
-                            ledger_seq = self.close_data.ledger_seq,
-                            new_size = new_size,
-                            delta_count = self.ltx.num_changes(),
-                            "Updated all state size window entries due to memory cost params upgrade"
-                        );
-                    }
-                }
             }
         }
 
