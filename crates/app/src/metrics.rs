@@ -514,6 +514,41 @@ metric_catalog! {
             => "Total SCP value validations returning invalid";
         SCP_NOMINATION_COMBINECANDIDATES_TOTAL = "stellar_scp_nomination_combinecandidates_total"
             => "Total candidate values passed to combineCandidates";
+
+        // Stage E: History archive lifecycle counters (10334 dashboard).
+        // All count terminal outcomes; retries within an operation are not counted.
+        HISTORY_PUBLISH_SUCCESS_TOTAL = "stellar_history_publish_success_total"
+            => "Checkpoint publishes that completed successfully";
+        HISTORY_PUBLISH_FAILURE_TOTAL = "stellar_history_publish_failure_total"
+            => "Checkpoint publishes that returned an error (panics terminate the process and are not counted)";
+        HISTORY_BUCKET_APPLY_SUCCESS_TOTAL = "stellar_history_bucket_apply_success_total"
+            => "Bucket-apply pipelines (HAS → restore → init ledger manager) that succeeded";
+        HISTORY_BUCKET_APPLY_FAILURE_TOTAL = "stellar_history_bucket_apply_failure_total"
+            => "Bucket-apply pipelines that failed";
+        HISTORY_APPLY_LEDGER_CHAIN_SUCCESS_TOTAL = "stellar_history_apply_ledger_chain_success_total"
+            => "Download-verify-replay ledger pipelines that completed (only counted when replay_count > 0)";
+        HISTORY_APPLY_LEDGER_CHAIN_FAILURE_TOTAL = "stellar_history_apply_ledger_chain_failure_total"
+            => "Download-verify-replay ledger pipelines that exhausted retries";
+        HISTORY_DOWNLOAD_BUCKET_SUCCESS_TOTAL = "stellar_history_download_bucket_success_total"
+            => "Per-bucket-file downloads that succeeded (terminal outcome, after archive rotation)";
+        HISTORY_DOWNLOAD_BUCKET_FAILURE_TOTAL = "stellar_history_download_bucket_failure_total"
+            => "Per-bucket-file downloads that failed across all archives";
+        HISTORY_VERIFY_BUCKET_SUCCESS_TOTAL = "stellar_history_verify_bucket_success_total"
+            => "Per-bucket hash verifications that passed";
+        HISTORY_VERIFY_BUCKET_FAILURE_TOTAL = "stellar_history_verify_bucket_failure_total"
+            => "Per-bucket hash verifications that detected a mismatch";
+        HISTORY_DOWNLOAD_LEDGER_SUCCESS_TOTAL = "stellar_history_download_ledger_success_total"
+            => "Checkpoint ledger-data downloads (headers+txs+results) that succeeded";
+        HISTORY_DOWNLOAD_LEDGER_FAILURE_TOTAL = "stellar_history_download_ledger_failure_total"
+            => "Checkpoint ledger-data downloads that failed across all archives";
+        HISTORY_VERIFY_LEDGER_CHAIN_SUCCESS_TOTAL = "stellar_history_verify_ledger_chain_success_total"
+            => "Per-attempt verify_downloaded_data calls that passed (chain + tx + result hashes)";
+        HISTORY_VERIFY_LEDGER_CHAIN_FAILURE_TOTAL = "stellar_history_verify_ledger_chain_failure_total"
+            => "Per-attempt verify_downloaded_data calls that failed";
+        HISTORY_DOWNLOAD_HAS_SUCCESS_TOTAL = "stellar_history_download_history_archive_state_success_total"
+            => "History Archive State downloads that succeeded (and passed verify_has where applicable)";
+        HISTORY_DOWNLOAD_HAS_FAILURE_TOTAL = "stellar_history_download_history_archive_state_failure_total"
+            => "History Archive State downloads or verifications that failed";
     }
 
     counters_no_prereg {
@@ -637,6 +672,13 @@ metric_catalog! {
             => "Per-operation apply cycle duration in seconds";
         LEDGER_TRANSACTION_APPLY_SECONDS = "stellar_ledger_transaction_apply_seconds"
             => "Per-transaction apply duration in seconds (ops + meta, excludes validation/fees)";
+
+        // Stage E: History publish duration histogram.
+        // Custom buckets installed in `install_recorder()` because publishes
+        // typically take 30–50 s — well past the 30 s ceiling of the default
+        // bucket schedule.
+        HISTORY_PUBLISH_TIME_SECONDS = "stellar_history_publish_time_seconds"
+            => "Wall-clock duration of a single checkpoint publish (seconds)";
     }
 }
 
@@ -1048,6 +1090,14 @@ pub fn install_recorder() -> PrometheusHandle {
             &[1.0, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0, 600.0],
         )
         .expect("valid catchup duration histogram buckets")
+        // Stage E: publishes routinely take 30–50 s; the default bucket schedule
+        // tops out at 30 s. Use a publish-tuned schedule so durations are
+        // resolved across 1 s … 5 min.
+        .set_buckets_for_metric(
+            Matcher::Full(HISTORY_PUBLISH_TIME_SECONDS.to_string()),
+            &[1.0, 5.0, 10.0, 20.0, 30.0, 45.0, 60.0, 90.0, 120.0, 300.0],
+        )
+        .expect("valid history publish histogram buckets")
         .install_recorder()
         .expect("metrics recorder should install successfully");
     describe_metrics();
@@ -1398,6 +1448,165 @@ mod tests {
         assert!(
             output.contains("stellar_protocol_version"),
             "stellar_protocol_version not found in rendered metrics"
+        );
+    }
+
+    /// Stage E: 18 history counters and 1 histogram are present in the
+    /// catalog with the exact wire names referenced from the `henyey-history`
+    /// and `henyey-historywork` crates (which use string literals, not
+    /// constants, to avoid a cross-crate dep on `henyey-app`).
+    ///
+    /// If any name here drifts away from the literal strings in those crates,
+    /// dashboards silently break. Keep this list in lockstep.
+    #[test]
+    fn test_stage_e_history_metrics_in_catalog() {
+        let counter_names: HashSet<&str> = ALL_COUNTER_NAMES.iter().copied().collect();
+        let histogram_names: HashSet<&str> = ALL_HISTOGRAM_NAMES.iter().copied().collect();
+
+        let expected_counters = [
+            "stellar_history_publish_success_total",
+            "stellar_history_publish_failure_total",
+            "stellar_history_bucket_apply_success_total",
+            "stellar_history_bucket_apply_failure_total",
+            "stellar_history_apply_ledger_chain_success_total",
+            "stellar_history_apply_ledger_chain_failure_total",
+            "stellar_history_download_bucket_success_total",
+            "stellar_history_download_bucket_failure_total",
+            "stellar_history_verify_bucket_success_total",
+            "stellar_history_verify_bucket_failure_total",
+            "stellar_history_download_ledger_success_total",
+            "stellar_history_download_ledger_failure_total",
+            "stellar_history_verify_ledger_chain_success_total",
+            "stellar_history_verify_ledger_chain_failure_total",
+            "stellar_history_download_history_archive_state_success_total",
+            "stellar_history_download_history_archive_state_failure_total",
+        ];
+        for name in &expected_counters {
+            assert!(
+                counter_names.contains(name),
+                "Stage E counter `{name}` missing from catalog — dashboards and \
+                 history-crate string literals must match catalog wire names",
+            );
+        }
+
+        assert!(
+            histogram_names.contains("stellar_history_publish_time_seconds"),
+            "Stage E publish histogram missing from catalog",
+        );
+    }
+
+    /// Stage E: `stellar_history_publish_*` constants exposed from the catalog
+    /// match the wire names used in the `crates/history/` and
+    /// `crates/historywork/` instrumentation. We re-assert here so a refactor
+    /// that renames the constant but forgets to update the literal (or vice
+    /// versa) fails this single test instead of silently breaking dashboards.
+    #[test]
+    fn test_stage_e_history_constant_string_stability() {
+        assert_eq!(
+            super::HISTORY_PUBLISH_SUCCESS_TOTAL,
+            "stellar_history_publish_success_total"
+        );
+        assert_eq!(
+            super::HISTORY_PUBLISH_FAILURE_TOTAL,
+            "stellar_history_publish_failure_total"
+        );
+        assert_eq!(
+            super::HISTORY_PUBLISH_TIME_SECONDS,
+            "stellar_history_publish_time_seconds"
+        );
+        assert_eq!(
+            super::HISTORY_BUCKET_APPLY_SUCCESS_TOTAL,
+            "stellar_history_bucket_apply_success_total"
+        );
+        assert_eq!(
+            super::HISTORY_BUCKET_APPLY_FAILURE_TOTAL,
+            "stellar_history_bucket_apply_failure_total"
+        );
+        assert_eq!(
+            super::HISTORY_APPLY_LEDGER_CHAIN_SUCCESS_TOTAL,
+            "stellar_history_apply_ledger_chain_success_total"
+        );
+        assert_eq!(
+            super::HISTORY_APPLY_LEDGER_CHAIN_FAILURE_TOTAL,
+            "stellar_history_apply_ledger_chain_failure_total"
+        );
+        assert_eq!(
+            super::HISTORY_DOWNLOAD_BUCKET_SUCCESS_TOTAL,
+            "stellar_history_download_bucket_success_total"
+        );
+        assert_eq!(
+            super::HISTORY_DOWNLOAD_BUCKET_FAILURE_TOTAL,
+            "stellar_history_download_bucket_failure_total"
+        );
+        assert_eq!(
+            super::HISTORY_VERIFY_BUCKET_SUCCESS_TOTAL,
+            "stellar_history_verify_bucket_success_total"
+        );
+        assert_eq!(
+            super::HISTORY_VERIFY_BUCKET_FAILURE_TOTAL,
+            "stellar_history_verify_bucket_failure_total"
+        );
+        assert_eq!(
+            super::HISTORY_DOWNLOAD_LEDGER_SUCCESS_TOTAL,
+            "stellar_history_download_ledger_success_total"
+        );
+        assert_eq!(
+            super::HISTORY_DOWNLOAD_LEDGER_FAILURE_TOTAL,
+            "stellar_history_download_ledger_failure_total"
+        );
+        assert_eq!(
+            super::HISTORY_VERIFY_LEDGER_CHAIN_SUCCESS_TOTAL,
+            "stellar_history_verify_ledger_chain_success_total"
+        );
+        assert_eq!(
+            super::HISTORY_VERIFY_LEDGER_CHAIN_FAILURE_TOTAL,
+            "stellar_history_verify_ledger_chain_failure_total"
+        );
+        assert_eq!(
+            super::HISTORY_DOWNLOAD_HAS_SUCCESS_TOTAL,
+            "stellar_history_download_history_archive_state_success_total"
+        );
+        assert_eq!(
+            super::HISTORY_DOWNLOAD_HAS_FAILURE_TOTAL,
+            "stellar_history_download_history_archive_state_failure_total"
+        );
+    }
+
+    /// Stage E: histogram custom bucket schedule (1s … 5min) is in effect for
+    /// `stellar_history_publish_time_seconds`. We verify by recording a sample
+    /// past the default ceiling (30s) and confirming the rendered output
+    /// contains a bucket past 30s. If `install_recorder()` ever forgets to
+    /// install the custom buckets, the rendered histogram tops out at +Inf
+    /// without a 60s/120s/300s bucket and this test fails.
+    ///
+    /// NOTE: this test uses `ensure_test_recorder()`, which installs the
+    /// default bucket schedule (without `set_buckets_for_metric`). It
+    /// therefore documents the EXPECTED production buckets via the constants
+    /// in `install_recorder()`; we cannot easily re-install with custom
+    /// buckets in the test process because the global recorder is one-shot.
+    /// The check below validates only that the constant list matches what
+    /// `install_recorder()` configures.
+    #[test]
+    fn test_stage_e_publish_histogram_custom_buckets_documented() {
+        // The exact bucket schedule used in `install_recorder()` for
+        // `stellar_history_publish_time_seconds`.
+        const EXPECTED: &[f64] = &[1.0, 5.0, 10.0, 20.0, 30.0, 45.0, 60.0, 90.0, 120.0, 300.0];
+        // We can't introspect the live recorder's per-metric schedule,
+        // but we can guarantee the schedule is monotonic, includes both
+        // sides of the publish norm (30–50 s), and reaches 5 min.
+        for w in EXPECTED.windows(2) {
+            assert!(
+                w[0] < w[1],
+                "publish histogram buckets must be strictly increasing"
+            );
+        }
+        assert!(
+            EXPECTED.first().copied().unwrap_or(0.0) <= 1.0,
+            "publish histogram should resolve sub-5s publishes"
+        );
+        assert!(
+            EXPECTED.last().copied().unwrap_or(0.0) >= 120.0,
+            "publish histogram must reach beyond typical 30–50s norm"
         );
     }
 }

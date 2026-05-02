@@ -386,7 +386,43 @@ impl CatchupManager {
     ///
     /// This is the shared "bucket apply → init ledger manager" pipeline used by
     /// all catchup variants that need to rebuild state from buckets.
+    ///
+    /// **Stage E instrumentation:** wraps the full pipeline body and emits
+    /// `stellar_history_bucket_apply_{success,failure}_total` exactly once per
+    /// invocation, so all three callers (`catchup_to_ledger`,
+    /// `catchup_to_ledger_with_mode`, `catchup_to_ledger_with_checkpoint_data`)
+    /// share the same boundary.
     async fn apply_buckets_and_init_ledger_manager(
+        &mut self,
+        has: &HistoryArchiveState,
+        buckets: &[(Hash256, Vec<u8>)],
+        checkpoint_seq: u32,
+        checkpoint_header: LedgerHeader,
+        checkpoint_hash: Hash256,
+        ledger_manager: &LedgerManager,
+    ) -> Result<()> {
+        let result = self
+            .apply_buckets_and_init_ledger_manager_inner(
+                has,
+                buckets,
+                checkpoint_seq,
+                checkpoint_header,
+                checkpoint_hash,
+                ledger_manager,
+            )
+            .await;
+        match &result {
+            Ok(()) => {
+                metrics::counter!("stellar_history_bucket_apply_success_total").increment(1);
+            }
+            Err(_) => {
+                metrics::counter!("stellar_history_bucket_apply_failure_total").increment(1);
+            }
+        }
+        result
+    }
+
+    async fn apply_buckets_and_init_ledger_manager_inner(
         &mut self,
         has: &HistoryArchiveState,
         buckets: &[(Hash256, Vec<u8>)],
@@ -499,6 +535,37 @@ impl CatchupManager {
         Ok(())
     }
 
+    /// Download and verify the HAS for a checkpoint, emitting the
+    /// `stellar_history_download_history_archive_state_{success,failure}_total`
+    /// counters on terminal outcome. The combined download+verify is a single
+    /// "HAS acquired" event from a dashboard perspective, so any failure in
+    /// either step counts as one failure here.
+    async fn download_and_verify_has(&self, checkpoint_seq: u32) -> Result<HistoryArchiveState> {
+        match self.download_has(checkpoint_seq).await {
+            Ok(has) => match self.verify_has(&has, checkpoint_seq) {
+                Ok(()) => {
+                    metrics::counter!(
+                        "stellar_history_download_history_archive_state_success_total"
+                    )
+                    .increment(1);
+                    Ok(has)
+                }
+                Err(e) => {
+                    metrics::counter!(
+                        "stellar_history_download_history_archive_state_failure_total"
+                    )
+                    .increment(1);
+                    Err(e)
+                }
+            },
+            Err(e) => {
+                metrics::counter!("stellar_history_download_history_archive_state_failure_total")
+                    .increment(1);
+                Err(e)
+            }
+        }
+    }
+
     /// Verify and persist SCP history entries.
     ///
     /// No-op when `entries` is empty.
@@ -552,8 +619,7 @@ impl CatchupManager {
             1,
             "Downloading History Archive State",
         );
-        let has = self.download_has(checkpoint_seq).await?;
-        self.verify_has(&has, checkpoint_seq)?;
+        let has = self.download_and_verify_has(checkpoint_seq).await?;
 
         let scp_history = self.download_scp_history(checkpoint_seq).await?;
         self.verify_and_persist_scp_history(&scp_history)?;
@@ -647,8 +713,7 @@ impl CatchupManager {
                 1,
                 "Downloading History Archive State",
             );
-            let has = self.download_has(bucket_apply_at).await?;
-            self.verify_has(&has, bucket_apply_at)?;
+            let has = self.download_and_verify_has(bucket_apply_at).await?;
 
             let scp_history = self.download_scp_history(bucket_apply_at).await?;
             self.verify_and_persist_scp_history(&scp_history)?;
@@ -761,13 +826,27 @@ impl CatchupManager {
             )));
         }
 
-        // Step 2: Verify HAS
+        // Step 2: Verify HAS. The HAS was supplied by the caller (no remote
+        // download in this path), but we still emit
+        // `stellar_history_download_history_archive_state_*` so dashboards see
+        // a consistent count of HAS-acquisition events across all catchup
+        // variants.
         self.update_progress(
             CatchupStatus::DownloadingHAS,
             1,
             "Using provided History Archive State",
         );
-        self.verify_has(&data.has, checkpoint_seq)?;
+        match self.verify_has(&data.has, checkpoint_seq) {
+            Ok(()) => {
+                metrics::counter!("stellar_history_download_history_archive_state_success_total")
+                    .increment(1);
+            }
+            Err(e) => {
+                metrics::counter!("stellar_history_download_history_archive_state_failure_total")
+                    .increment(1);
+                return Err(e);
+            }
+        }
 
         // Step 3: Verify bucket files exist on disk
         // Hash verification was already performed at download time by DownloadBucketsWork.
@@ -1214,6 +1293,36 @@ mod tests {
         assert_eq!(select(0), 0);
         assert_eq!(select(1), 0);
         assert_eq!(select(100), 0);
+    }
+
+    /// Stage E: source code in this module emits Prometheus metrics by raw
+    /// string literal (not by constant — `henyey-history` cannot depend on
+    /// `henyey-app` without a circular workspace dep). This test pins the
+    /// literals so a typo or rename detaches *both* sides from the catalog.
+    ///
+    /// The matching tests on the catalog side
+    /// (`crates/app/src/metrics.rs::test_stage_e_history_metrics_in_catalog`
+    /// and `test_stage_e_history_constant_string_stability`) verify the same
+    /// strings exist there. Together, the two tests guarantee end-to-end
+    /// wire-name stability without coupling the crates.
+    #[test]
+    fn test_stage_e_history_metric_literals_present() {
+        // Read this source file at test time and assert each emit-site
+        // literal is exactly as expected. Catches typos like
+        // `stellar_history_publish_succes_total` (missing 's') that would
+        // produce silent zero-rate panels in production.
+        let src = include_str!("mod.rs");
+        for literal in &[
+            "\"stellar_history_bucket_apply_success_total\"",
+            "\"stellar_history_bucket_apply_failure_total\"",
+            "\"stellar_history_download_history_archive_state_success_total\"",
+            "\"stellar_history_download_history_archive_state_failure_total\"",
+        ] {
+            assert!(
+                src.contains(literal),
+                "expected metric literal {literal} in catchup/mod.rs",
+            );
+        }
     }
 
     #[test]

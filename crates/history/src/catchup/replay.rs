@@ -106,7 +106,33 @@ impl CatchupManager {
     ///
     /// Fatal errors (verification/integrity failures) are NOT retried —
     /// only transient errors (network, download, etc.) trigger a retry.
+    ///
+    /// Stage E instrumentation: emits
+    /// `stellar_history_apply_ledger_chain_{success,failure}_total` exactly
+    /// once per *outer* call, on terminal outcome (after all retries). Per-
+    /// attempt verify failures are surfaced via the separate
+    /// `stellar_history_verify_ledger_chain_*` counters in
+    /// `download_verify_and_replay_once`.
     pub(super) async fn download_verify_and_replay_with_retry(
+        &mut self,
+        target: u32,
+        ledger_manager: &LedgerManager,
+    ) -> Result<(HeaderSnapshot, u32)> {
+        let result = self
+            .download_verify_and_replay_with_retry_inner(target, ledger_manager)
+            .await;
+        match &result {
+            Ok(_) => {
+                metrics::counter!("stellar_history_apply_ledger_chain_success_total").increment(1);
+            }
+            Err(_) => {
+                metrics::counter!("stellar_history_apply_ledger_chain_failure_total").increment(1);
+            }
+        }
+        result
+    }
+
+    async fn download_verify_and_replay_with_retry_inner(
         &mut self,
         target: u32,
         ledger_manager: &LedgerManager,
@@ -185,14 +211,27 @@ impl CatchupManager {
         );
         let ledger_data = self.download_ledger_data(download_from, target).await?;
 
-        // Verify the header chain
+        // Verify the header chain.
+        //
+        // Stage E instrumentation: counts each call to `verify_downloaded_data`
+        // (one per replay attempt). This is independent from the outer
+        // `apply_ledger_chain_*` counters: a single outer success can include
+        // multiple verify failures from prior attempts.
         self.update_progress(CatchupStatus::Verifying, 5, "Verifying header chain");
         let anchor_hash = ledger_manager.current_header_hash();
         let anchors = verify::ChainTrustAnchors {
             previous_ledger_hash: Some(anchor_hash),
             ..Default::default()
         };
-        self.verify_downloaded_data(&ledger_data, &anchors)?;
+        match self.verify_downloaded_data(&ledger_data, &anchors) {
+            Ok(()) => {
+                metrics::counter!("stellar_history_verify_ledger_chain_success_total").increment(1);
+            }
+            Err(e) => {
+                metrics::counter!("stellar_history_verify_ledger_chain_failure_total").increment(1);
+                return Err(e);
+            }
+        }
 
         // Replay ledgers via close_ledger
         self.update_progress(CatchupStatus::Replaying, 6, "Replaying ledgers");
@@ -461,5 +500,23 @@ mod tests {
             .map(|attempt| 200 * (1u64 << (attempt - 1).min(4)))
             .collect();
         assert_eq!(delays, vec![200, 400, 800, 1600, 3200]);
+    }
+
+    /// Stage E: pin the metric literals emitted from this module so a typo
+    /// can't silently detach this crate from the central catalog.
+    #[test]
+    fn test_stage_e_replay_metric_literals_present() {
+        let src = include_str!("replay.rs");
+        for literal in &[
+            "\"stellar_history_apply_ledger_chain_success_total\"",
+            "\"stellar_history_apply_ledger_chain_failure_total\"",
+            "\"stellar_history_verify_ledger_chain_success_total\"",
+            "\"stellar_history_verify_ledger_chain_failure_total\"",
+        ] {
+            assert!(
+                src.contains(literal),
+                "expected metric literal {literal} in catchup/replay.rs",
+            );
+        }
     }
 }

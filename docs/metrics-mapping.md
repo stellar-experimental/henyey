@@ -102,6 +102,34 @@ Metrics with the `stellar_` prefix that directly mirror stellar-core Medida coun
 | `LEDGER_INVARIANT_FAILURE_TOTAL` | `stellar_ledger_invariant_failure_total` | counter | `InvariantManagerImpl::handleInvariantFailure` |
 | `LEDGER_TRANSACTION_INTERNAL_ERROR_TOTAL` | `stellar_ledger_transaction_internal_error_total` | counter | `TransactionFrame::apply` txINTERNAL_ERROR path |
 
+### Stage E: History archive metrics (10334 dashboard)
+
+These are emitted under the `stellar_history_*` namespace for dashboard
+consistency with stellar-core, but they are *henyey-specific approximations*
+of stellar-core's `historywork::Work` callbacks. Counting boundaries differ
+from stellar-core in places — see `crates/history/src/catchup/` and
+`crates/historywork/src/download.rs` for the exact emit sites.
+
+| Henyey constant | Prometheus name | Type | Notes |
+|---|---|---|---|
+| `HISTORY_PUBLISH_SUCCESS_TOTAL` | `stellar_history_publish_success_total` | counter | One increment per successful checkpoint publish (validators only). Panics terminate the process (release builds use `panic = "abort"`) and are not counted. |
+| `HISTORY_PUBLISH_FAILURE_TOTAL` | `stellar_history_publish_failure_total` | counter | One increment per error-path return from `App::publish_single_checkpoint`. |
+| `HISTORY_PUBLISH_TIME_SECONDS` | `stellar_history_publish_time_seconds` | histogram | Wall-clock per successful publish. Custom buckets: 1, 5, 10, 20, 30, 45, 60, 90, 120, 300 s (default histogram tops out at 30 s, normal publishes are 30–50 s). |
+| `HISTORY_BUCKET_APPLY_SUCCESS_TOTAL` | `stellar_history_bucket_apply_success_total` | counter | One increment per `apply_buckets_and_init_ledger_manager` (HAS → restore → init ledger manager) success, covering all three catchup variants. |
+| `HISTORY_BUCKET_APPLY_FAILURE_TOTAL` | `stellar_history_bucket_apply_failure_total` | counter | Bucket-apply pipeline failure. |
+| `HISTORY_APPLY_LEDGER_CHAIN_SUCCESS_TOTAL` | `stellar_history_apply_ledger_chain_success_total` | counter | One increment per *outer* `download_verify_and_replay_with_retry` success. NOT counted in zero-replay catchups (checkpoint ≥ target). |
+| `HISTORY_APPLY_LEDGER_CHAIN_FAILURE_TOTAL` | `stellar_history_apply_ledger_chain_failure_total` | counter | Outer-pipeline failure (all retries exhausted or fatal verify error). |
+| `HISTORY_DOWNLOAD_BUCKET_SUCCESS_TOTAL` | `stellar_history_download_bucket_success_total` | counter | One per bucket-file terminal outcome. Archive-rotation attempts within a single bucket are not counted individually. Emitted by both direct catchup (`download_buckets`) and historywork (`DownloadBucketsWork`). |
+| `HISTORY_DOWNLOAD_BUCKET_FAILURE_TOTAL` | `stellar_history_download_bucket_failure_total` | counter | Per-bucket-file failure (all archives exhausted, or persistence error). |
+| `HISTORY_VERIFY_BUCKET_SUCCESS_TOTAL` | `stellar_history_verify_bucket_success_total` | counter | Per-bucket hash verification pass. In direct catchup, emitted at bucket *load* time (live + hot-archive paths). In historywork, emitted at *download* time (verify_bucket_hash inside `DownloadBucketsWork`). |
+| `HISTORY_VERIFY_BUCKET_FAILURE_TOTAL` | `stellar_history_verify_bucket_failure_total` | counter | Per-bucket hash mismatch. |
+| `HISTORY_DOWNLOAD_LEDGER_SUCCESS_TOTAL` | `stellar_history_download_ledger_success_total` | counter | One per checkpoint's headers+txs+results acquisition. In direct catchup, emitted by `download_checkpoint_ledger_data` (single call covers all three sub-files). In historywork, emitted by the trailing `DownloadTxResultsWork` (last node in the DAG: results → tx → headers). |
+| `HISTORY_DOWNLOAD_LEDGER_FAILURE_TOTAL` | `stellar_history_download_ledger_failure_total` | counter | Checkpoint ledger-data acquisition failure. In historywork, can fire at any of the three sub-work items, so a single failed checkpoint may increment more than once — accepted in exchange for keeping per-stage failure visibility. |
+| `HISTORY_VERIFY_LEDGER_CHAIN_SUCCESS_TOTAL` | `stellar_history_verify_ledger_chain_success_total` | counter | Per-attempt outcome of `verify_downloaded_data` in direct catchup, and per-attempt header chain verification in historywork's `DownloadLedgerHeadersWork`. Independent of `apply_ledger_chain_*` — multiple verify attempts can roll up into one outer success/failure. |
+| `HISTORY_VERIFY_LEDGER_CHAIN_FAILURE_TOTAL` | `stellar_history_verify_ledger_chain_failure_total` | counter | Verify attempt failed. |
+| `HISTORY_DOWNLOAD_HAS_SUCCESS_TOTAL` | `stellar_history_download_history_archive_state_success_total` | counter | History Archive State acquisition success. In direct catchup, requires both `download_has` and `verify_has` to pass. In historywork (`GetHistoryArchiveStateWork`), counts *fetch* success only — historywork does not run `verify_has`. The `catchup_to_ledger_with_checkpoint_data` variant emits success on `verify_has` of the caller-supplied HAS. |
+| `HISTORY_DOWNLOAD_HAS_FAILURE_TOTAL` | `stellar_history_download_history_archive_state_failure_total` | counter | HAS acquisition failure (download error or verify mismatch). |
+
 ## 2. Derived / Approximate Equivalents
 
 Metrics inspired by stellar-core but with different type, unit, or granularity.

@@ -625,12 +625,132 @@
       "id": 109,
       "panels": [
         {
-          "id": 47,
-          "type": "text",
-          "title": "History Panels — Coming in Stage E",
-          "description": "Panels 61-72 of 10334. History publish/apply/verify/download metrics.",
-          "gridPos": {"h": 6, "w": 24, "x": 0, "y": 86},
-          "options": {"mode": "markdown", "content": "**Coming in Stage E** — History archive metrics:\n- `stellar_history_publish_{success,failure}_total`\n- `stellar_history_publish_time_seconds`\n- `stellar_history_apply_ledger_chain_{success,failure}_total`\n- `stellar_history_bucket_apply_{success,failure}_total`\n- `stellar_history_download_bucket_{success,failure}_total`\n- `stellar_history_verify_bucket_{success,failure}_total`\n\nAll hooked into `henyey-historywork` job completion paths."}
+          "id": 200,
+          "type": "timeseries",
+          "title": "Publish Status",
+          "description": "Checkpoint publish success/failure rate. Panel 61 of 10334.",
+          "gridPos": {"h": 6, "w": 8, "x": 0, "y": 86},
+          "datasource": {"type": "prometheus", "uid": "000000001"},
+          "targets": [
+            {"expr": "rate(stellar_history_publish_success_total{instance=~\"$instance\"}[$__rate_interval])", "legendFormat": "{{instance}} success/s"},
+            {"expr": "rate(stellar_history_publish_failure_total{instance=~\"$instance\"}[$__rate_interval])", "legendFormat": "{{instance}} failure/s"}
+          ],
+          "fieldConfig": {"defaults": {"unit": "ops"}}
+        },
+        {
+          "id": 201,
+          "type": "timeseries",
+          "title": "Publish Duration (avg)",
+          "description": "Average publish wall-clock time per checkpoint. Panel 62 of 10334. Custom histogram buckets cover 1s-300s (publishes typically take 30-50s).",
+          "gridPos": {"h": 6, "w": 8, "x": 8, "y": 86},
+          "datasource": {"type": "prometheus", "uid": "000000001"},
+          "targets": [
+            {"expr": "rate(stellar_history_publish_time_seconds_sum{instance=~\"$instance\"}[5m]) / rate(stellar_history_publish_time_seconds_count{instance=~\"$instance\"}[5m])", "legendFormat": "{{instance}} avg"}
+          ],
+          "fieldConfig": {"defaults": {"unit": "s"}}
+        },
+        {
+          "id": 202,
+          "type": "timeseries",
+          "title": "Apply Ledger Chain",
+          "description": "Outer download-verify-replay pipeline outcome rate (only counted when replay_count > 0). Panel 63 of 10334.",
+          "gridPos": {"h": 6, "w": 8, "x": 16, "y": 86},
+          "datasource": {"type": "prometheus", "uid": "000000001"},
+          "targets": [
+            {"expr": "rate(stellar_history_apply_ledger_chain_success_total{instance=~\"$instance\"}[$__rate_interval])", "legendFormat": "{{instance}} success/s"},
+            {"expr": "rate(stellar_history_apply_ledger_chain_failure_total{instance=~\"$instance\"}[$__rate_interval])", "legendFormat": "{{instance}} failure/s"}
+          ],
+          "fieldConfig": {"defaults": {"unit": "ops"}}
+        },
+        {
+          "id": 203,
+          "type": "timeseries",
+          "title": "Apply Bucket",
+          "description": "Bucket-apply pipeline (HAS → restore → init ledger manager) outcome rate. Panel 64 of 10334.",
+          "gridPos": {"h": 6, "w": 8, "x": 0, "y": 92},
+          "datasource": {"type": "prometheus", "uid": "000000001"},
+          "targets": [
+            {"expr": "rate(stellar_history_bucket_apply_success_total{instance=~\"$instance\"}[$__rate_interval])", "legendFormat": "{{instance}} success/s"},
+            {"expr": "rate(stellar_history_bucket_apply_failure_total{instance=~\"$instance\"}[$__rate_interval])", "legendFormat": "{{instance}} failure/s"}
+          ],
+          "fieldConfig": {"defaults": {"unit": "ops"}}
+        },
+        {
+          "id": 204,
+          "type": "timeseries",
+          "title": "Bucket Download",
+          "description": "Per-bucket-file download outcome rate (terminal, after archive rotation). Panel 65 of 10334.",
+          "gridPos": {"h": 6, "w": 8, "x": 8, "y": 92},
+          "datasource": {"type": "prometheus", "uid": "000000001"},
+          "targets": [
+            {"expr": "rate(stellar_history_download_bucket_success_total{instance=~\"$instance\"}[$__rate_interval])", "legendFormat": "{{instance}} success/s"},
+            {"expr": "rate(stellar_history_download_bucket_failure_total{instance=~\"$instance\"}[$__rate_interval])", "legendFormat": "{{instance}} failure/s"}
+          ],
+          "fieldConfig": {"defaults": {"unit": "ops"}}
+        },
+        {
+          "id": 205,
+          "type": "timeseries",
+          "title": "Bucket Verify",
+          "description": "Per-bucket hash verification outcome rate. Panel 66 of 10334.",
+          "gridPos": {"h": 6, "w": 8, "x": 16, "y": 92},
+          "datasource": {"type": "prometheus", "uid": "000000001"},
+          "targets": [
+            {"expr": "rate(stellar_history_verify_bucket_success_total{instance=~\"$instance\"}[$__rate_interval])", "legendFormat": "{{instance}} success/s"},
+            {"expr": "rate(stellar_history_verify_bucket_failure_total{instance=~\"$instance\"}[$__rate_interval])", "legendFormat": "{{instance}} failure/s"}
+          ],
+          "fieldConfig": {"defaults": {"unit": "ops"}}
+        },
+        {
+          "id": 206,
+          "type": "timeseries",
+          "title": "Checkpoint Ledger Data Download",
+          "description": "Per-checkpoint headers+txs+results download outcome rate. Panel 67 of 10334.",
+          "gridPos": {"h": 6, "w": 8, "x": 0, "y": 98},
+          "datasource": {"type": "prometheus", "uid": "000000001"},
+          "targets": [
+            {"expr": "rate(stellar_history_download_ledger_success_total{instance=~\"$instance\"}[$__rate_interval])", "legendFormat": "{{instance}} success/s"},
+            {"expr": "rate(stellar_history_download_ledger_failure_total{instance=~\"$instance\"}[$__rate_interval])", "legendFormat": "{{instance}} failure/s"}
+          ],
+          "fieldConfig": {"defaults": {"unit": "ops"}}
+        },
+        {
+          "id": 207,
+          "type": "timeseries",
+          "title": "Verify Ledger Chain",
+          "description": "Per-attempt header chain + tx + result hash verification outcome rate. Panel 68 of 10334.",
+          "gridPos": {"h": 6, "w": 8, "x": 8, "y": 98},
+          "datasource": {"type": "prometheus", "uid": "000000001"},
+          "targets": [
+            {"expr": "rate(stellar_history_verify_ledger_chain_success_total{instance=~\"$instance\"}[$__rate_interval])", "legendFormat": "{{instance}} success/s"},
+            {"expr": "rate(stellar_history_verify_ledger_chain_failure_total{instance=~\"$instance\"}[$__rate_interval])", "legendFormat": "{{instance}} failure/s"}
+          ],
+          "fieldConfig": {"defaults": {"unit": "ops"}}
+        },
+        {
+          "id": 208,
+          "type": "timeseries",
+          "title": "HAS Acquisition",
+          "description": "History Archive State (HAS) download+verify outcome rate. Panel 69 of 10334.",
+          "gridPos": {"h": 6, "w": 8, "x": 16, "y": 98},
+          "datasource": {"type": "prometheus", "uid": "000000001"},
+          "targets": [
+            {"expr": "rate(stellar_history_download_history_archive_state_success_total{instance=~\"$instance\"}[$__rate_interval])", "legendFormat": "{{instance}} success/s"},
+            {"expr": "rate(stellar_history_download_history_archive_state_failure_total{instance=~\"$instance\"}[$__rate_interval])", "legendFormat": "{{instance}} failure/s"}
+          ],
+          "fieldConfig": {"defaults": {"unit": "ops"}}
+        },
+        {
+          "id": 209,
+          "type": "heatmap",
+          "title": "Publish Duration Heatmap",
+          "description": "Distribution of checkpoint publish wall-clock time. Panel 70 of 10334. Custom buckets: 1s, 5s, 10s, 20s, 30s, 45s, 60s, 90s, 120s, 300s.",
+          "gridPos": {"h": 8, "w": 24, "x": 0, "y": 104},
+          "datasource": {"type": "prometheus", "uid": "000000001"},
+          "targets": [
+            {"expr": "sum by (le) (rate(stellar_history_publish_time_seconds_bucket{instance=~\"$instance\"}[$__rate_interval]))", "format": "heatmap", "legendFormat": "{{le}}"}
+          ],
+          "fieldConfig": {"defaults": {"unit": "s"}}
         }
       ]
     },

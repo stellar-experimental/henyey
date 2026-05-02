@@ -62,13 +62,24 @@ impl Work for GetHistoryArchiveStateWork {
     // SECURITY: checkpoint data validated by hash chain; content integrity verified before acceptance
     async fn run(&mut self, _ctx: &WorkContext) -> WorkOutcome {
         set_progress(&self.state, HistoryWorkStage::FetchHas, "fetching HAS").await;
+        // Stage E instrumentation:
+        // `historywork::GetHistoryArchiveStateWork` does *not* run
+        // `verify_has` (unlike `catchup::download_and_verify_has`) — it just
+        // fetches the JSON. We treat fetch success as the HAS-acquisition
+        // event for dashboard consistency.
         match self.archive.fetch_checkpoint_has(self.checkpoint).await {
             Ok(has) => {
+                metrics::counter!("stellar_history_download_history_archive_state_success_total")
+                    .increment(1);
                 let mut guard = self.state.lock().await;
                 guard.has = Some(has);
                 WorkOutcome::Success
             }
-            Err(err) => WorkOutcome::Failed(format!("failed to fetch HAS: {err}")),
+            Err(err) => {
+                metrics::counter!("stellar_history_download_history_archive_state_failure_total")
+                    .increment(1);
+                WorkOutcome::Failed(format!("failed to fetch HAS: {err}"))
+            }
         }
     }
 }
@@ -99,22 +110,51 @@ pub(crate) struct DownloadBucketsWork {
     pub(crate) bucket_dir: PathBuf,
 }
 
+/// Outcome of a single-bucket download attempt, used to attribute failure to
+/// the correct Stage E counter (`download_bucket_failure_total` for fetch
+/// errors, `verify_bucket_failure_total` for hash mismatches).
+enum BucketDownloadFailure {
+    Download(String),
+    Verify(String),
+    Persist(String),
+}
+
+impl BucketDownloadFailure {
+    fn into_message(self) -> String {
+        match self {
+            BucketDownloadFailure::Download(m)
+            | BucketDownloadFailure::Verify(m)
+            | BucketDownloadFailure::Persist(m) => m,
+        }
+    }
+}
+
 /// Downloads a single bucket, verifies its hash, and saves it to disk.
+///
+/// Stage E: returns a `BucketDownloadFailure` so the caller can emit the
+/// appropriate per-bucket counter without re-classifying error strings.
+/// On success, both `download_bucket_success` and `verify_bucket_success`
+/// are emitted (both steps necessarily passed). On `Download` failure,
+/// `download_bucket_failure` is emitted; on `Verify` failure,
+/// `verify_bucket_failure`; on `Persist` failure, `download_bucket_failure`
+/// (the bucket bytes were valid but couldn't be cached — operationally
+/// equivalent to a download failure for retry purposes).
 async fn download_and_save_bucket(
     archive: &HistoryArchive,
     hash: &Hash256,
     bucket_path: &std::path::Path,
-) -> Result<(), String> {
-    let data = archive
-        .fetch_bucket(hash)
-        .await
-        .map_err(|err| format!("failed to download bucket {hash}: {err}"))?;
+) -> Result<(), BucketDownloadFailure> {
+    let data = archive.fetch_bucket(hash).await.map_err(|err| {
+        BucketDownloadFailure::Download(format!("failed to download bucket {hash}: {err}"))
+    })?;
 
-    verify::verify_bucket_hash(&data, hash)
-        .map_err(|err| format!("bucket {hash} hash mismatch: {err}"))?;
+    verify::verify_bucket_hash(&data, hash).map_err(|err| {
+        BucketDownloadFailure::Verify(format!("bucket {hash} hash mismatch: {err}"))
+    })?;
 
-    atomic_write_bytes(bucket_path, &data)
-        .map_err(|e| format!("failed to save bucket {hash} to disk: {e}"))?;
+    atomic_write_bytes(bucket_path, &data).map_err(|e| {
+        BucketDownloadFailure::Persist(format!("failed to save bucket {hash} to disk: {e}"))
+    })?;
 
     Ok(())
 }
@@ -172,7 +212,7 @@ impl Work for DownloadBucketsWork {
             let downloaded_count = std::sync::atomic::AtomicU32::new(0);
             let total_to_download = to_download.len();
 
-            let results: Vec<Result<(), String>> = stream::iter(to_download)
+            let results: Vec<Result<(), BucketDownloadFailure>> = stream::iter(to_download)
                 .map(|hash| {
                     let archive = archive.clone();
                     let bucket_dir = bucket_dir.clone();
@@ -196,11 +236,39 @@ impl Work for DownloadBucketsWork {
                 .collect()
                 .await;
 
-            // Check for failures
+            // Stage E: emit per-bucket success/failure counters, attributed to
+            // the correct phase (download vs verify). On success, both
+            // download and verify counters fire because both steps passed.
+            // Then surface the first error to the work scheduler.
+            let mut first_failure: Option<String> = None;
             for result in results {
-                if let Err(err) = result {
-                    return WorkOutcome::Failed(err);
+                match result {
+                    Ok(()) => {
+                        metrics::counter!("stellar_history_download_bucket_success_total")
+                            .increment(1);
+                        metrics::counter!("stellar_history_verify_bucket_success_total")
+                            .increment(1);
+                    }
+                    Err(failure) => {
+                        match &failure {
+                            BucketDownloadFailure::Download(_)
+                            | BucketDownloadFailure::Persist(_) => {
+                                metrics::counter!("stellar_history_download_bucket_failure_total")
+                                    .increment(1);
+                            }
+                            BucketDownloadFailure::Verify(_) => {
+                                metrics::counter!("stellar_history_verify_bucket_failure_total")
+                                    .increment(1);
+                            }
+                        }
+                        if first_failure.is_none() {
+                            first_failure = Some(failure.into_message());
+                        }
+                    }
                 }
+            }
+            if let Some(err) = first_failure {
+                return WorkOutcome::Failed(err);
             }
         }
 
@@ -250,14 +318,28 @@ impl Work for DownloadLedgerHeadersWork {
             "downloading headers",
         )
         .await;
+        // Stage E: header *download* failures map to
+        // `download_ledger_failure_total` (the checkpoint-data download is
+        // considered failed if any constituent file fails). Header *chain
+        // verification* failures map to `verify_ledger_chain_failure_total`
+        // (header chain verification is the closest historywork analogue to
+        // catchup's `verify_downloaded_data`). On success here, only count
+        // verify_ledger_chain_success — `download_ledger_success` is emitted
+        // by the trailing `DownloadTxResultsWork` so the checkpoint-data
+        // counter fires once per checkpoint, not once per file.
         let headers = match self.archive.fetch_ledger_headers(self.checkpoint).await {
             Ok(headers) => headers,
-            Err(err) => return WorkOutcome::Failed(format!("failed to download headers: {err}")),
+            Err(err) => {
+                metrics::counter!("stellar_history_download_ledger_failure_total").increment(1);
+                return WorkOutcome::Failed(format!("failed to download headers: {err}"));
+            }
         };
 
         if let Err(err) = verify::verify_header_chain_from_entries(&headers) {
+            metrics::counter!("stellar_history_verify_ledger_chain_failure_total").increment(1);
             return WorkOutcome::Failed(format!("header chain verification failed: {err}"));
         }
+        metrics::counter!("stellar_history_verify_ledger_chain_success_total").increment(1);
 
         let mut guard = self.state.lock().await;
         guard.headers = headers;
@@ -302,10 +384,17 @@ impl Work for DownloadTransactionsWork {
             "downloading transactions",
         )
         .await;
+        // Stage E: download failures here map to
+        // `download_ledger_failure_total` (any failed checkpoint sub-file
+        // means the checkpoint-data acquisition failed). tx-set hash
+        // verification failures also map to `download_ledger_failure_total`
+        // here — tx-set hash mismatches are part of the per-file integrity
+        // check folded into the same dashboard concept.
         let entries = match self.archive.fetch_transactions(self.checkpoint).await {
             Ok(entries) => entries,
             Err(err) => {
-                return WorkOutcome::Failed(format!("failed to download transactions: {err}"))
+                metrics::counter!("stellar_history_download_ledger_failure_total").increment(1);
+                return WorkOutcome::Failed(format!("failed to download transactions: {err}"));
             }
         };
 
@@ -316,7 +405,10 @@ impl Work for DownloadTransactionsWork {
         for entry in &entries {
             let header = match find_header(&headers, entry.ledger_seq, "transaction set") {
                 Ok(header) => header,
-                Err(err) => return WorkOutcome::Failed(err),
+                Err(err) => {
+                    metrics::counter!("stellar_history_download_ledger_failure_total").increment(1);
+                    return WorkOutcome::Failed(err);
+                }
             };
             let tx_set = match &entry.ext {
                 TransactionHistoryEntryExt::V0 => {
@@ -327,6 +419,7 @@ impl Work for DownloadTransactionsWork {
                 }
             };
             if let Err(err) = verify::verify_tx_set(&header.header, &tx_set) {
+                metrics::counter!("stellar_history_download_ledger_failure_total").increment(1);
                 return WorkOutcome::Failed(format!("tx set hash mismatch: {err}"));
             }
         }
@@ -382,17 +475,32 @@ impl Work for DownloadTxResultsWork {
             "downloading transaction results",
         )
         .await;
+        // Stage E: as the *last* node in the historywork DAG (results depends
+        // on transactions which depends on headers), the success of this
+        // work item means the entire checkpoint ledger-data set
+        // (headers+txs+results) has been acquired. Emit the single
+        // checkpoint-level `download_ledger_success` here so that
+        // historywork and direct catchup both fire the counter once per
+        // checkpoint. Failures in this step also count, even though
+        // upstream steps may have already failed and emitted a failure of
+        // their own — a "failed checkpoint" can plausibly increment the
+        // failure counter more than once per checkpoint, but we accept that
+        // over the alternative of dropping all upstream-failure visibility.
         let results = match self.archive.fetch_results(self.checkpoint).await {
             Ok(results) => results,
             Err(err) => {
-                return WorkOutcome::Failed(format!("failed to download tx results: {err}"))
+                metrics::counter!("stellar_history_download_ledger_failure_total").increment(1);
+                return WorkOutcome::Failed(format!("failed to download tx results: {err}"));
             }
         };
 
         for entry in &results {
             let header = match find_header(&headers, entry.ledger_seq, "tx result set") {
                 Ok(header) => header,
-                Err(err) => return WorkOutcome::Failed(err),
+                Err(err) => {
+                    metrics::counter!("stellar_history_download_ledger_failure_total").increment(1);
+                    return WorkOutcome::Failed(err);
+                }
             };
             let xdr = match entry
                 .tx_result_set
@@ -400,16 +508,20 @@ impl Work for DownloadTxResultsWork {
             {
                 Ok(xdr) => xdr,
                 Err(err) => {
+                    metrics::counter!("stellar_history_download_ledger_failure_total").increment(1);
                     return WorkOutcome::Failed(format!(
                         "failed to serialize tx result set for ledger {}: {err}",
                         entry.ledger_seq
-                    ))
+                    ));
                 }
             };
             if let Err(err) = verify::verify_tx_result_set(&header.header, &xdr) {
+                metrics::counter!("stellar_history_download_ledger_failure_total").increment(1);
                 return WorkOutcome::Failed(format!("tx result set hash mismatch: {err}"));
             }
         }
+
+        metrics::counter!("stellar_history_download_ledger_success_total").increment(1);
 
         let mut guard = self.state.lock().await;
         guard.tx_results = results;
@@ -488,4 +600,48 @@ pub(crate) fn find_header<'a>(
         .iter()
         .find(|header| header.header.ledger_seq == ledger_seq)
         .ok_or_else(|| format!("no header found for {missing_label} at ledger {ledger_seq}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Stage E: every Stage-E metric literal emitted from this module is
+    /// pinned so a typo silently detaches dashboards. The literal-presence
+    /// check is paired with the catalog-side test
+    /// `crates/app/src/metrics.rs::test_stage_e_history_metrics_in_catalog`.
+    #[test]
+    fn test_stage_e_historywork_metric_literals_present() {
+        let src = include_str!("download.rs");
+        for literal in &[
+            "\"stellar_history_download_history_archive_state_success_total\"",
+            "\"stellar_history_download_history_archive_state_failure_total\"",
+            "\"stellar_history_download_bucket_success_total\"",
+            "\"stellar_history_download_bucket_failure_total\"",
+            "\"stellar_history_verify_bucket_success_total\"",
+            "\"stellar_history_verify_bucket_failure_total\"",
+            "\"stellar_history_download_ledger_success_total\"",
+            "\"stellar_history_download_ledger_failure_total\"",
+            "\"stellar_history_verify_ledger_chain_success_total\"",
+            "\"stellar_history_verify_ledger_chain_failure_total\"",
+        ] {
+            assert!(
+                src.contains(literal),
+                "expected metric literal {literal} in historywork/download.rs",
+            );
+        }
+    }
+
+    /// Stage E: classify a download/verify/persist failure to the correct
+    /// counter. This is a pure helper test that doesn't require network
+    /// access — it just validates the enum / message routing logic.
+    #[test]
+    fn test_bucket_download_failure_message_routing() {
+        let f = BucketDownloadFailure::Download("network down".to_string());
+        assert_eq!(f.into_message(), "network down");
+        let f = BucketDownloadFailure::Verify("hash mismatch".to_string());
+        assert_eq!(f.into_message(), "hash mismatch");
+        let f = BucketDownloadFailure::Persist("disk full".to_string());
+        assert_eq!(f.into_message(), "disk full");
+    }
 }

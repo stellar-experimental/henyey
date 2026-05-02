@@ -15,6 +15,9 @@ henyey-bucket.workspace = true
 henyey-ledger.workspace = true
 henyey-tx.workspace = true
 
+# Metrics (observability only — fire-and-forget counter/histogram emission)
+metrics.workspace = true
+
 # HTTP client
 reqwest.workspace = true
 url.workspace = true

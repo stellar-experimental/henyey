@@ -261,6 +261,20 @@ impl CatchupManager {
             .collect()
             .await;
 
+        // Stage E: emit per-bucket-file terminal outcome.
+        // `download_bucket_*` counts archive-rotation-final outcomes; archive
+        // failures within a single bucket's retry loop are not counted.
+        for result in &results {
+            match result {
+                Ok(()) => {
+                    metrics::counter!("stellar_history_download_bucket_success_total").increment(1);
+                }
+                Err(_) => {
+                    metrics::counter!("stellar_history_download_bucket_failure_total").increment(1);
+                }
+            }
+        }
+
         // Check for any failures
         for result in results {
             result?;
@@ -339,6 +353,11 @@ impl CatchupManager {
     }
 
     /// Download ledger headers, transactions, and results for a checkpoint.
+    ///
+    /// Stage E instrumentation: emits
+    /// `stellar_history_download_ledger_{success,failure}_total` once per
+    /// checkpoint as a single "checkpoint data acquired" event. Per-archive
+    /// rotation attempts within this method are not counted individually.
     async fn download_checkpoint_ledger_data(
         &self,
         checkpoint: u32,
@@ -346,7 +365,10 @@ impl CatchupManager {
         // Try each archive until one succeeds
         for archive in &self.archives {
             match self.try_download_checkpoint(archive, checkpoint).await {
-                Ok(data) => return Ok(data),
+                Ok(data) => {
+                    metrics::counter!("stellar_history_download_ledger_success_total").increment(1);
+                    return Ok(data);
+                }
                 Err(e) => {
                     warn!(
                         "Failed to download checkpoint {} from archive {}: {}",
@@ -359,6 +381,7 @@ impl CatchupManager {
             }
         }
 
+        metrics::counter!("stellar_history_download_ledger_failure_total").increment(1);
         Err(HistoryError::CatchupFailed(format!(
             "failed to download checkpoint {} from any archive",
             checkpoint
@@ -531,5 +554,23 @@ mod tests {
             "expected HistoryError::Json, got: {:?}",
             err,
         );
+    }
+
+    /// Stage E: pin the metric literals emitted from this module so a typo
+    /// can't silently detach this crate from the central catalog.
+    #[test]
+    fn test_stage_e_download_metric_literals_present() {
+        let src = include_str!("download.rs");
+        for literal in &[
+            "\"stellar_history_download_bucket_success_total\"",
+            "\"stellar_history_download_bucket_failure_total\"",
+            "\"stellar_history_download_ledger_success_total\"",
+            "\"stellar_history_download_ledger_failure_total\"",
+        ] {
+            assert!(
+                src.contains(literal),
+                "expected metric literal {literal} in catchup/download.rs",
+            );
+        }
     }
 }

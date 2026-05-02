@@ -19,6 +19,9 @@ tracing.workspace = true
 stellar-xdr.workspace = true
 futures.workspace = true
 
+# Metrics (observability only — fire-and-forget counter emission)
+metrics.workspace = true
+
 [dev-dependencies]
 axum.workspace = true
 flate2.workspace = true
