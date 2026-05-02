@@ -1183,8 +1183,11 @@ pub fn malformed_operation_result(
                 EndSponsoringFutureReservesResult::NotSponsored,
             )
         }
+        // RevokeSponsorship: stellar-core's doCheckValid always returns
+        // REVOKE_SPONSORSHIP_MALFORMED for structural validation failures
+        // (RevokeSponsorshipOpFrame.cpp:420,428,437,449).
         OperationBody::RevokeSponsorship(_) => {
-            OperationResultTr::RevokeSponsorship(RevokeSponsorshipResult::DoesNotExist)
+            OperationResultTr::RevokeSponsorship(RevokeSponsorshipResult::Malformed)
         }
         OperationBody::Clawback(_) => OperationResultTr::Clawback(ClawbackResult::Malformed),
         OperationBody::ClawbackClaimableBalance(_) => OperationResultTr::ClawbackClaimableBalance(
@@ -2297,6 +2300,24 @@ mod tests {
                 SetOptionsResult::ThresholdOutOfRange,
             )) => {}
             other => panic!("expected SetOptions::ThresholdOutOfRange, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_malformed_operation_result_revoke_sponsorship() {
+        let body = OperationBody::RevokeSponsorship(RevokeSponsorshipOp::LedgerEntry(
+            LedgerKey::Offer(LedgerKeyOffer {
+                seller_id: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([1u8; 32]))),
+                offer_id: 0,
+            }),
+        ));
+        let err = OperationValidationError::InvalidOfferId;
+        let result = malformed_operation_result(&body, &err);
+        match result {
+            OperationResult::OpInner(OperationResultTr::RevokeSponsorship(
+                RevokeSponsorshipResult::Malformed,
+            )) => {}
+            other => panic!("expected RevokeSponsorship::Malformed, got {:?}", other),
         }
     }
 
