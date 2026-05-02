@@ -211,6 +211,17 @@ Corresponds to: `LedgerManagerImpl.h` (transaction execution), `NetworkConfig.h`
 | `SorobanNetworkConfig::updateCostTypesForV26()` | `update_cost_types_for_v26()` in `manager.rs` | Full |
 | `SorobanNetworkConfig::createLedgerEntriesForV26()` | `create_ledger_entries_for_v26()` in `manager.rs` | Full |
 
+### execution/preconditions.rs (`execution/preconditions.rs`)
+
+Corresponds to: `TransactionFrame::commonValidPreSeqNum()`, `FeeBumpTransactionFrame::commonValidPreSeqNum()`, `TransactionFrame::commonValid()`
+
+| stellar-core | Rust | Status | Notes |
+|--------------|------|--------|-------|
+| `commonValidPreSeqNum()` check ordering: structural → time/ledger → fee → account | `validate_preconditions()` | Full | Fixed ordering to match stellar-core (AUDIT-238 / #2260) |
+| `FeeBumpTransactionFrame::commonValidPreSeqNum()` ordering: outer fee → fee source load | `validate_preconditions()` fee-bump branch | Full | Outer fee checked before fee source account load |
+| `isTooEarly()` / `isTooLate()` | `validate_time_bounds()` + `validate_ledger_bounds()` | Partial | stellar-core combines time+ledger in each check; henyey separates them (follow-up) |
+| Fee-bump outer auth ordering (between fee source load and inner validation) | `validate_preconditions()` signature phase | Partial | Outer auth currently checked after sequence (follow-up) |
+
 ### config_upgrade.rs (`config_upgrade.rs`)
 
 Corresponds to: `NetworkConfig.h` (upgrade subset)
@@ -396,7 +407,7 @@ Features not yet implemented. These ARE counted against parity %.
 | Soroban State | -- | 16 #[test] in `soroban_state.rs` | In-memory state tests |
 | Execution | -- | 18 #[test] in `execution/mod.rs`, 2 in `execution/tx_set.rs`, 4 in `execution/result_mapping.rs`, 3 in `execution/config.rs` | Transaction execution tests |
 | Memory Report | -- | 4 #[test] in `memory_report.rs` | Memory instrumentation tests |
-| Integration | -- | 21 #[test] in `tests/transaction_execution/regression.rs`, 17 in `tests/transaction_execution/classic_events.rs`, 12 in `tests/transaction_execution/preconditions.rs`, 5 in `tests/ledger_close_integration.rs`, 2 in `tests/ledger_close_meta_vectors.rs`, 2 in `tests/tx_meta_hash_vectors.rs` | Extensive integration tests |
+| Integration | -- | 21 #[test] in `tests/transaction_execution/regression.rs`, 17 in `tests/transaction_execution/classic_events.rs`, 20 in `tests/transaction_execution/preconditions.rs`, 5 in `tests/ledger_close_integration.rs`, 2 in `tests/ledger_close_meta_vectors.rs`, 2 in `tests/tx_meta_hash_vectors.rs` | Extensive integration tests |
 
 ### Test Gaps
 

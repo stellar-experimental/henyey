@@ -74,62 +74,37 @@ impl TransactionExecutor {
             }));
         }
 
-        // Phase 2: Account loading
-        // Fee source account not found is an outer failure for fee-bump (stellar-core's
-        // FeeBumpTransactionFrame::commonValidPreSeqNum → setError(txNO_ACCOUNT)).
-        // Inner source account not found is an inner failure (stellar-core's
-        // TransactionFrame::commonValid → setInnermostError via checkValidWithOptionallyChargedFee).
+        // Phase 2: Fee, time/ledger bounds, and account loading.
+        //
+        // The ordering of these checks differs between fee-bump and non-fee-bump
+        // transactions, matching stellar-core's separate validation paths:
+        //
+        // Non-fee-bump (TransactionFrame::commonValidPreSeqNum):
+        //   time/ledger bounds → inclusion fee → account load
+        //
+        // Fee-bump (FeeBumpTransactionFrame::commonValidPreSeqNum + inner commonValidPreSeqNum):
+        //   outer fee → fee source load → inner time/ledger bounds → inner source load
+        //
+        // This ordering determines which TransactionResultCode is returned when
+        // multiple checks fail simultaneously (first-hit wins).
+        let validation_ctx = ValidationContext::new(
+            self.ledger_seq,
+            self.close_time,
+            base_fee,
+            self.base_reserve,
+            self.protocol_version,
+            self.network_id,
+        );
+
         let acct_load_start = std::time::Instant::now();
-        if !self.load_account(snapshot, &fee_source_id)? {
-            return Ok(Err(if is_fee_bump {
-                fee_bump_outer_fail(
-                    TransactionResultCode::TxNoAccount,
-                    "Fee source account not found",
-                )
-            } else {
-                pre_seq_fail(
-                    TransactionResultCode::TxNoAccount,
-                    "Source account not found",
-                )
-            }));
-        }
-        if !self.load_account(snapshot, &inner_source_id)? {
-            return Ok(Err(pre_seq_fail(
-                TransactionResultCode::TxNoAccount,
-                "Source account not found",
-            )));
-        }
 
-        let fee_source_account = match self.state.get_account(&fee_source_id) {
-            Some(acc) => acc.clone(),
-            None => {
-                return Ok(Err(if is_fee_bump {
-                    fee_bump_outer_fail(
-                        TransactionResultCode::TxNoAccount,
-                        "Fee source account not found",
-                    )
-                } else {
-                    pre_seq_fail(
-                        TransactionResultCode::TxNoAccount,
-                        "Source account not found",
-                    )
-                }))
-            }
-        };
-        let source_account = match self.state.get_account(&inner_source_id) {
-            Some(acc) => acc.clone(),
-            None => {
-                return Ok(Err(pre_seq_fail(
-                    TransactionResultCode::TxNoAccount,
-                    "Source account not found",
-                )))
-            }
-        };
-        let val_account_load_us = acct_load_start.elapsed().as_micros() as u64;
+        let (fee_source_account, source_account) = if is_fee_bump {
+            // Fee-bump ordering: outer fee → fee source load → time/ledger bounds → inner source load
+            // Parity: FeeBumpTransactionFrame::commonValidPreSeqNum (lines 337-398)
+            //         then inner TransactionFrame::commonValidPreSeqNum (lines 1471-1502)
 
-        // Phase 3: Fee validation
-        // SECURITY: fee computation overflow prevented by tx validation bounds (max_fee * max_ops fits i64)
-        if frame.is_fee_bump() {
+            // 2a. Outer fee check
+            // SECURITY: fee computation overflow prevented by tx validation bounds
             let outer_min_inclusion_fee = frame.min_inclusion_fee(base_fee as i64);
             let outer_inclusion_fee = frame.inclusion_fee();
 
@@ -176,7 +151,113 @@ impl TransactionExecutor {
                     )));
                 }
             }
+
+            // 2b. Fee source account load
+            // Parity: FeeBumpTransactionFrame::commonValidPreSeqNum line 391-396
+            if !self.load_account(snapshot, &fee_source_id)? {
+                return Ok(Err(fee_bump_outer_fail(
+                    TransactionResultCode::TxNoAccount,
+                    "Fee source account not found",
+                )));
+            }
+            let fee_source_account = match self.state.get_account(&fee_source_id) {
+                Some(acc) => acc.clone(),
+                None => {
+                    return Ok(Err(fee_bump_outer_fail(
+                        TransactionResultCode::TxNoAccount,
+                        "Fee source account not found",
+                    )))
+                }
+            };
+
+            // 2c. Time/ledger bounds (inner tx properties)
+            // Parity: inner TransactionFrame::commonValidPreSeqNum lines 1471-1480
+            if let Err(e) = validation::validate_time_bounds(&frame, &validation_ctx) {
+                return Ok(Err(pre_seq_fail(
+                    match e {
+                        validation::ValidationError::TooEarly { .. } => {
+                            TransactionResultCode::TxTooEarly
+                        }
+                        validation::ValidationError::TooLate { .. } => {
+                            TransactionResultCode::TxTooLate
+                        }
+                        _ => TransactionResultCode::TxFailed,
+                    },
+                    "Time bounds invalid",
+                )));
+            }
+
+            if let Err(e) = validation::validate_ledger_bounds(&frame, &validation_ctx) {
+                return Ok(Err(pre_seq_fail(
+                    match e {
+                        validation::ValidationError::LedgerBoundsTooEarly { .. } => {
+                            TransactionResultCode::TxTooEarly
+                        }
+                        validation::ValidationError::LedgerBoundsTooLate { .. } => {
+                            TransactionResultCode::TxTooLate
+                        }
+                        _ => TransactionResultCode::TxFailed,
+                    },
+                    "Ledger bounds invalid",
+                )));
+            }
+
+            // 2d. Inner source account load
+            // Parity: inner TransactionFrame::commonValidPreSeqNum line 1495-1502
+            if !self.load_account(snapshot, &inner_source_id)? {
+                return Ok(Err(pre_seq_fail(
+                    TransactionResultCode::TxNoAccount,
+                    "Source account not found",
+                )));
+            }
+            let source_account = match self.state.get_account(&inner_source_id) {
+                Some(acc) => acc.clone(),
+                None => {
+                    return Ok(Err(pre_seq_fail(
+                        TransactionResultCode::TxNoAccount,
+                        "Source account not found",
+                    )))
+                }
+            };
+
+            (fee_source_account, source_account)
         } else {
+            // Non-fee-bump ordering: time/ledger bounds → fee → account load
+            // Parity: TransactionFrame::commonValidPreSeqNum lines 1471-1502
+
+            // 2a. Time/ledger bounds
+            if let Err(e) = validation::validate_time_bounds(&frame, &validation_ctx) {
+                return Ok(Err(pre_seq_fail(
+                    match e {
+                        validation::ValidationError::TooEarly { .. } => {
+                            TransactionResultCode::TxTooEarly
+                        }
+                        validation::ValidationError::TooLate { .. } => {
+                            TransactionResultCode::TxTooLate
+                        }
+                        _ => TransactionResultCode::TxFailed,
+                    },
+                    "Time bounds invalid",
+                )));
+            }
+
+            if let Err(e) = validation::validate_ledger_bounds(&frame, &validation_ctx) {
+                return Ok(Err(pre_seq_fail(
+                    match e {
+                        validation::ValidationError::LedgerBoundsTooEarly { .. } => {
+                            TransactionResultCode::TxTooEarly
+                        }
+                        validation::ValidationError::LedgerBoundsTooLate { .. } => {
+                            TransactionResultCode::TxTooLate
+                        }
+                        _ => TransactionResultCode::TxFailed,
+                    },
+                    "Ledger bounds invalid",
+                )));
+            }
+
+            // 2b. Inclusion fee check
+            // Parity: TransactionFrame::commonValidPreSeqNum lines 1482-1493
             let required_fee = frame.operation_count() as u32 * base_fee;
             if frame.fee() < required_fee {
                 return Ok(Err(pre_seq_fail(
@@ -185,57 +266,50 @@ impl TransactionExecutor {
                 )));
             }
 
-            // Validate that Soroban resource fee does not exceed the full transaction fee.
-            // Parity: stellar-core TransactionFrame.cpp commonValidPreSeqNum —
-            // for p23+ non-fee-bump txs, rejects when sorobanData.resourceFee > getFullFee().
-            // Fee-bump inner txs skip this check (handled by the fee-bump branch above).
-            if frame.is_soroban()
-                && frame.declared_soroban_resource_fee().as_i64() > frame.total_fee().as_i64()
-            {
+            // 2c. Account load
+            // Parity: TransactionFrame::commonValidPreSeqNum lines 1495-1502
+            if !self.load_account(snapshot, &fee_source_id)? {
                 return Ok(Err(pre_seq_fail(
-                    TransactionResultCode::TxSorobanInvalid,
-                    "Soroban resource fee exceeds full transaction fee",
+                    TransactionResultCode::TxNoAccount,
+                    "Source account not found",
                 )));
             }
-        }
+            // For non-fee-bump, fee source and inner source are typically the same
+            // account. Load inner source separately only if they differ.
+            if fee_source_id != inner_source_id && !self.load_account(snapshot, &inner_source_id)? {
+                return Ok(Err(pre_seq_fail(
+                    TransactionResultCode::TxNoAccount,
+                    "Source account not found",
+                )));
+            }
 
-        // Phase 4: Time/ledger bounds and precondition validation
-        let validation_ctx = ValidationContext::new(
-            self.ledger_seq,
-            self.close_time,
-            base_fee,
-            self.base_reserve,
-            self.protocol_version,
-            self.network_id,
-        );
+            let fee_source_account = match self.state.get_account(&fee_source_id) {
+                Some(acc) => acc.clone(),
+                None => {
+                    return Ok(Err(pre_seq_fail(
+                        TransactionResultCode::TxNoAccount,
+                        "Source account not found",
+                    )))
+                }
+            };
+            let source_account = if fee_source_id == inner_source_id {
+                fee_source_account.clone()
+            } else {
+                match self.state.get_account(&inner_source_id) {
+                    Some(acc) => acc.clone(),
+                    None => {
+                        return Ok(Err(pre_seq_fail(
+                            TransactionResultCode::TxNoAccount,
+                            "Source account not found",
+                        )))
+                    }
+                }
+            };
 
-        if let Err(e) = validation::validate_time_bounds(&frame, &validation_ctx) {
-            return Ok(Err(pre_seq_fail(
-                match e {
-                    validation::ValidationError::TooEarly { .. } => {
-                        TransactionResultCode::TxTooEarly
-                    }
-                    validation::ValidationError::TooLate { .. } => TransactionResultCode::TxTooLate,
-                    _ => TransactionResultCode::TxFailed,
-                },
-                "Time bounds invalid",
-            )));
-        }
+            (fee_source_account, source_account)
+        };
 
-        if let Err(e) = validation::validate_ledger_bounds(&frame, &validation_ctx) {
-            return Ok(Err(pre_seq_fail(
-                match e {
-                    validation::ValidationError::LedgerBoundsTooEarly { .. } => {
-                        TransactionResultCode::TxTooEarly
-                    }
-                    validation::ValidationError::LedgerBoundsTooLate { .. } => {
-                        TransactionResultCode::TxTooLate
-                    }
-                    _ => TransactionResultCode::TxFailed,
-                },
-                "Ledger bounds invalid",
-            )));
-        }
+        let val_account_load_us = acct_load_start.elapsed().as_micros() as u64;
 
         // Phase 5: Sequence number validation
         // This combines stellar-core's isBadSeq (including min_seq_num) check.

@@ -1324,3 +1324,610 @@ fn test_execute_transaction_ledger_bounds_equality_is_too_late() {
         "current == max_ledger must yield TxTooLate, not TxFailed"
     );
 }
+
+// =============================================================================
+// AUDIT-238: Validation ordering regression tests.
+//
+// These tests verify that when a transaction fails multiple precondition checks
+// simultaneously, the first-hit result code matches stellar-core's ordering:
+//   Non-fee-bump: structural → time/ledger bounds → fee → account load
+//   Fee-bump: outer fee → fee source load → inner time/ledger bounds → inner account load
+// =============================================================================
+
+/// AUDIT-238: Time bounds (too early) must be checked before insufficient fee.
+/// A tx with minTime in the future AND fee=0 must return TxTooEarly, not TxInsufficientFee.
+#[test]
+fn test_time_bounds_too_early_checked_before_insufficient_fee() {
+    // Use a source that does NOT exist — but time bounds should fail first anyway.
+    // However, to isolate time-vs-fee, we DO provide the account so fee would be
+    // the next failure if time bounds didn't catch it.
+    let secret = SecretKey::from_seed(&[100u8; 32]);
+    let account_id: AccountId = (&secret.public_key()).into();
+
+    let (key, entry) = create_account_entry(account_id.clone(), 1, 10_000_000);
+    let snapshot = SnapshotBuilder::new(1)
+        .add_entry(key, entry)
+        .build_with_default_header();
+    let snapshot = SnapshotHandle::new(snapshot);
+
+    let operation = Operation {
+        source_account: None,
+        body: OperationBody::CreateAccount(CreateAccountOp {
+            destination: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([2u8; 32]))),
+            starting_balance: 1_000_000,
+        }),
+    };
+
+    // minTime=5000 (future), fee=50 (insufficient since base_fee=100 * 1 op = 100)
+    let tx = Transaction {
+        source_account: MuxedAccount::Ed25519(Uint256(*secret.public_key().as_bytes())),
+        fee: 50,
+        seq_num: SequenceNumber(2),
+        cond: Preconditions::Time(TimeBounds {
+            min_time: TimePoint(5_000),
+            max_time: TimePoint(0),
+        }),
+        memo: Memo::None,
+        operations: vec![operation].try_into().unwrap(),
+        ext: TransactionExt::V0,
+    };
+
+    let mut envelope = TransactionEnvelope::Tx(TransactionV1Envelope {
+        tx,
+        signatures: VecM::default(),
+    });
+
+    let network_id = NetworkId::testnet();
+    let decorated = sign_envelope(&envelope, &secret, &network_id);
+    if let TransactionEnvelope::Tx(ref mut env) = envelope {
+        env.signatures = vec![decorated].try_into().unwrap();
+    }
+
+    // close_time=1000 < minTime=5000 → too early
+    let context = henyey_tx::LedgerContext::new(1, 1_000, 100, 5_000_000, 25, network_id);
+    let mut executor = TransactionExecutor::new(
+        &context,
+        0,
+        SorobanConfig::default(),
+        ClassicEventConfig::default(),
+    );
+
+    let result = executor
+        .execute_transaction(&snapshot, &envelope, 100, None)
+        .expect("execute");
+
+    assert_eq!(
+        result.failure,
+        Some(ExecutionFailure::TxTooEarly),
+        "AUDIT-238: time bounds must be checked before fee"
+    );
+    assert!(!result.fee_bump_outer_failure);
+}
+
+/// AUDIT-238: Time bounds (too late) must be checked before insufficient fee.
+#[test]
+fn test_time_bounds_too_late_checked_before_insufficient_fee() {
+    let secret = SecretKey::from_seed(&[101u8; 32]);
+    let account_id: AccountId = (&secret.public_key()).into();
+
+    let (key, entry) = create_account_entry(account_id.clone(), 1, 10_000_000);
+    let snapshot = SnapshotBuilder::new(1)
+        .add_entry(key, entry)
+        .build_with_default_header();
+    let snapshot = SnapshotHandle::new(snapshot);
+
+    let operation = Operation {
+        source_account: None,
+        body: OperationBody::CreateAccount(CreateAccountOp {
+            destination: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([2u8; 32]))),
+            starting_balance: 1_000_000,
+        }),
+    };
+
+    // maxTime=500 (past), fee=50 (insufficient, need 100)
+    let tx = Transaction {
+        source_account: MuxedAccount::Ed25519(Uint256(*secret.public_key().as_bytes())),
+        fee: 50,
+        seq_num: SequenceNumber(2),
+        cond: Preconditions::Time(TimeBounds {
+            min_time: TimePoint(0),
+            max_time: TimePoint(500),
+        }),
+        memo: Memo::None,
+        operations: vec![operation].try_into().unwrap(),
+        ext: TransactionExt::V0,
+    };
+
+    let mut envelope = TransactionEnvelope::Tx(TransactionV1Envelope {
+        tx,
+        signatures: VecM::default(),
+    });
+
+    let network_id = NetworkId::testnet();
+    let decorated = sign_envelope(&envelope, &secret, &network_id);
+    if let TransactionEnvelope::Tx(ref mut env) = envelope {
+        env.signatures = vec![decorated].try_into().unwrap();
+    }
+
+    // close_time=1000 > maxTime=500 → too late
+    let context = henyey_tx::LedgerContext::new(1, 1_000, 100, 5_000_000, 25, network_id);
+    let mut executor = TransactionExecutor::new(
+        &context,
+        0,
+        SorobanConfig::default(),
+        ClassicEventConfig::default(),
+    );
+
+    let result = executor
+        .execute_transaction(&snapshot, &envelope, 100, None)
+        .expect("execute");
+
+    assert_eq!(
+        result.failure,
+        Some(ExecutionFailure::TxTooLate),
+        "AUDIT-238: time bounds (too late) must be checked before fee"
+    );
+    assert!(!result.fee_bump_outer_failure);
+}
+
+/// AUDIT-238: Ledger bounds (too early) must be checked before insufficient fee.
+#[test]
+fn test_ledger_bounds_too_early_checked_before_insufficient_fee() {
+    let secret = SecretKey::from_seed(&[102u8; 32]);
+    let account_id: AccountId = (&secret.public_key()).into();
+
+    let (key, entry) = create_account_entry(account_id.clone(), 1, 10_000_000);
+    let snapshot = SnapshotBuilder::new(1)
+        .add_entry(key, entry)
+        .build_with_default_header();
+    let snapshot = SnapshotHandle::new(snapshot);
+
+    let operation = Operation {
+        source_account: None,
+        body: OperationBody::CreateAccount(CreateAccountOp {
+            destination: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([2u8; 32]))),
+            starting_balance: 1_000_000,
+        }),
+    };
+
+    // minLedger=1000 (future), fee=50 (insufficient, need 100)
+    let preconditions = Preconditions::V2(PreconditionsV2 {
+        time_bounds: None,
+        ledger_bounds: Some(LedgerBounds {
+            min_ledger: 1_000,
+            max_ledger: 0,
+        }),
+        min_seq_num: None,
+        min_seq_age: Duration(0),
+        min_seq_ledger_gap: 0,
+        extra_signers: VecM::default(),
+    });
+
+    let tx = Transaction {
+        source_account: MuxedAccount::Ed25519(Uint256(*secret.public_key().as_bytes())),
+        fee: 50,
+        seq_num: SequenceNumber(2),
+        cond: preconditions,
+        memo: Memo::None,
+        operations: vec![operation].try_into().unwrap(),
+        ext: TransactionExt::V0,
+    };
+
+    let mut envelope = TransactionEnvelope::Tx(TransactionV1Envelope {
+        tx,
+        signatures: VecM::default(),
+    });
+
+    let network_id = NetworkId::testnet();
+    let decorated = sign_envelope(&envelope, &secret, &network_id);
+    if let TransactionEnvelope::Tx(ref mut env) = envelope {
+        env.signatures = vec![decorated].try_into().unwrap();
+    }
+
+    // ledger_seq=10 < minLedger=1000 → too early
+    let context = henyey_tx::LedgerContext::new(10, 1_000, 100, 5_000_000, 25, network_id);
+    let mut executor = TransactionExecutor::new(
+        &context,
+        0,
+        SorobanConfig::default(),
+        ClassicEventConfig::default(),
+    );
+
+    let result = executor
+        .execute_transaction(&snapshot, &envelope, 100, None)
+        .expect("execute");
+
+    assert_eq!(
+        result.failure,
+        Some(ExecutionFailure::TxTooEarly),
+        "AUDIT-238: ledger bounds (too early) must be checked before fee"
+    );
+    assert!(!result.fee_bump_outer_failure);
+}
+
+/// AUDIT-238: Ledger bounds (too late) must be checked before insufficient fee.
+#[test]
+fn test_ledger_bounds_too_late_checked_before_insufficient_fee() {
+    let secret = SecretKey::from_seed(&[103u8; 32]);
+    let account_id: AccountId = (&secret.public_key()).into();
+
+    let (key, entry) = create_account_entry(account_id.clone(), 1, 10_000_000);
+    let snapshot = SnapshotBuilder::new(1)
+        .add_entry(key, entry)
+        .build_with_default_header();
+    let snapshot = SnapshotHandle::new(snapshot);
+
+    let operation = Operation {
+        source_account: None,
+        body: OperationBody::CreateAccount(CreateAccountOp {
+            destination: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([2u8; 32]))),
+            starting_balance: 1_000_000,
+        }),
+    };
+
+    // maxLedger=5 (past), fee=50 (insufficient, need 100)
+    let preconditions = Preconditions::V2(PreconditionsV2 {
+        time_bounds: None,
+        ledger_bounds: Some(LedgerBounds {
+            min_ledger: 0,
+            max_ledger: 5,
+        }),
+        min_seq_num: None,
+        min_seq_age: Duration(0),
+        min_seq_ledger_gap: 0,
+        extra_signers: VecM::default(),
+    });
+
+    let tx = Transaction {
+        source_account: MuxedAccount::Ed25519(Uint256(*secret.public_key().as_bytes())),
+        fee: 50,
+        seq_num: SequenceNumber(2),
+        cond: preconditions,
+        memo: Memo::None,
+        operations: vec![operation].try_into().unwrap(),
+        ext: TransactionExt::V0,
+    };
+
+    let mut envelope = TransactionEnvelope::Tx(TransactionV1Envelope {
+        tx,
+        signatures: VecM::default(),
+    });
+
+    let network_id = NetworkId::testnet();
+    let decorated = sign_envelope(&envelope, &secret, &network_id);
+    if let TransactionEnvelope::Tx(ref mut env) = envelope {
+        env.signatures = vec![decorated].try_into().unwrap();
+    }
+
+    // ledger_seq=10 >= maxLedger=5 → too late
+    let context = henyey_tx::LedgerContext::new(10, 1_000, 100, 5_000_000, 25, network_id);
+    let mut executor = TransactionExecutor::new(
+        &context,
+        0,
+        SorobanConfig::default(),
+        ClassicEventConfig::default(),
+    );
+
+    let result = executor
+        .execute_transaction(&snapshot, &envelope, 100, None)
+        .expect("execute");
+
+    assert_eq!(
+        result.failure,
+        Some(ExecutionFailure::TxTooLate),
+        "AUDIT-238: ledger bounds (too late) must be checked before fee"
+    );
+    assert!(!result.fee_bump_outer_failure);
+}
+
+/// AUDIT-238: Time bounds must be checked before account load.
+/// A tx with nonexistent source AND expired time bounds must return TxTooEarly, not TxNoAccount.
+#[test]
+fn test_time_bounds_checked_before_account_load() {
+    // Empty snapshot — source account does NOT exist
+    let snapshot = SnapshotBuilder::new(1).build_with_default_header();
+    let snapshot = SnapshotHandle::new(snapshot);
+
+    let secret = SecretKey::from_seed(&[104u8; 32]);
+
+    let operation = Operation {
+        source_account: None,
+        body: OperationBody::CreateAccount(CreateAccountOp {
+            destination: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([2u8; 32]))),
+            starting_balance: 1_000_000,
+        }),
+    };
+
+    // minTime=5000 (future), source account doesn't exist
+    let tx = Transaction {
+        source_account: MuxedAccount::Ed25519(Uint256(*secret.public_key().as_bytes())),
+        fee: 100,
+        seq_num: SequenceNumber(2),
+        cond: Preconditions::Time(TimeBounds {
+            min_time: TimePoint(5_000),
+            max_time: TimePoint(0),
+        }),
+        memo: Memo::None,
+        operations: vec![operation].try_into().unwrap(),
+        ext: TransactionExt::V0,
+    };
+
+    let mut envelope = TransactionEnvelope::Tx(TransactionV1Envelope {
+        tx,
+        signatures: VecM::default(),
+    });
+
+    let network_id = NetworkId::testnet();
+    let decorated = sign_envelope(&envelope, &secret, &network_id);
+    if let TransactionEnvelope::Tx(ref mut env) = envelope {
+        env.signatures = vec![decorated].try_into().unwrap();
+    }
+
+    // close_time=1000 < minTime=5000 → too early (before account load)
+    let context = henyey_tx::LedgerContext::new(1, 1_000, 100, 5_000_000, 25, network_id);
+    let mut executor = TransactionExecutor::new(
+        &context,
+        0,
+        SorobanConfig::default(),
+        ClassicEventConfig::default(),
+    );
+
+    let result = executor
+        .execute_transaction(&snapshot, &envelope, 100, None)
+        .expect("execute");
+
+    assert_eq!(
+        result.failure,
+        Some(ExecutionFailure::TxTooEarly),
+        "AUDIT-238: time bounds must be checked before account load"
+    );
+    assert!(!result.fee_bump_outer_failure);
+}
+
+/// AUDIT-238: Ledger bounds must be checked before account load.
+#[test]
+fn test_ledger_bounds_checked_before_account_load() {
+    // Empty snapshot — source account does NOT exist
+    let snapshot = SnapshotBuilder::new(1).build_with_default_header();
+    let snapshot = SnapshotHandle::new(snapshot);
+
+    let secret = SecretKey::from_seed(&[105u8; 32]);
+
+    let operation = Operation {
+        source_account: None,
+        body: OperationBody::CreateAccount(CreateAccountOp {
+            destination: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([2u8; 32]))),
+            starting_balance: 1_000_000,
+        }),
+    };
+
+    // minLedger=500 (future), source account doesn't exist
+    let preconditions = Preconditions::V2(PreconditionsV2 {
+        time_bounds: None,
+        ledger_bounds: Some(LedgerBounds {
+            min_ledger: 500,
+            max_ledger: 0,
+        }),
+        min_seq_num: None,
+        min_seq_age: Duration(0),
+        min_seq_ledger_gap: 0,
+        extra_signers: VecM::default(),
+    });
+
+    let tx = Transaction {
+        source_account: MuxedAccount::Ed25519(Uint256(*secret.public_key().as_bytes())),
+        fee: 100,
+        seq_num: SequenceNumber(2),
+        cond: preconditions,
+        memo: Memo::None,
+        operations: vec![operation].try_into().unwrap(),
+        ext: TransactionExt::V0,
+    };
+
+    let mut envelope = TransactionEnvelope::Tx(TransactionV1Envelope {
+        tx,
+        signatures: VecM::default(),
+    });
+
+    let network_id = NetworkId::testnet();
+    let decorated = sign_envelope(&envelope, &secret, &network_id);
+    if let TransactionEnvelope::Tx(ref mut env) = envelope {
+        env.signatures = vec![decorated].try_into().unwrap();
+    }
+
+    // ledger_seq=10 < minLedger=500 → too early (before account load)
+    let context = henyey_tx::LedgerContext::new(10, 1_000, 100, 5_000_000, 25, network_id);
+    let mut executor = TransactionExecutor::new(
+        &context,
+        0,
+        SorobanConfig::default(),
+        ClassicEventConfig::default(),
+    );
+
+    let result = executor
+        .execute_transaction(&snapshot, &envelope, 100, None)
+        .expect("execute");
+
+    assert_eq!(
+        result.failure,
+        Some(ExecutionFailure::TxTooEarly),
+        "AUDIT-238: ledger bounds must be checked before account load"
+    );
+    assert!(!result.fee_bump_outer_failure);
+}
+
+/// AUDIT-238: Fee-bump outer fee must be checked before fee source account load.
+/// A fee-bump with insufficient outer fee AND missing fee source must return
+/// TxInsufficientFee (outer), not TxNoAccount.
+#[test]
+fn test_fee_bump_outer_fee_checked_before_fee_source_load() {
+    // Empty snapshot — fee source does NOT exist
+    let snapshot = SnapshotBuilder::new(1).build_with_default_header();
+    let snapshot = SnapshotHandle::new(snapshot);
+
+    let fee_source_secret = SecretKey::from_seed(&[106u8; 32]);
+    let inner_secret = SecretKey::from_seed(&[107u8; 32]);
+
+    let operation = Operation {
+        source_account: None,
+        body: OperationBody::CreateAccount(CreateAccountOp {
+            destination: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([2u8; 32]))),
+            starting_balance: 1_000_000,
+        }),
+    };
+
+    // Inner transaction
+    let inner_tx = Transaction {
+        source_account: MuxedAccount::Ed25519(Uint256(*inner_secret.public_key().as_bytes())),
+        fee: 100,
+        seq_num: SequenceNumber(2),
+        cond: Preconditions::None,
+        memo: Memo::None,
+        operations: vec![operation].try_into().unwrap(),
+        ext: TransactionExt::V0,
+    };
+
+    let inner_envelope = TransactionEnvelope::Tx(TransactionV1Envelope {
+        tx: inner_tx,
+        signatures: VecM::default(),
+    });
+    let network_id = NetworkId::testnet();
+    let inner_sig = sign_envelope(&inner_envelope, &inner_secret, &network_id);
+    let signed_inner = match inner_envelope {
+        TransactionEnvelope::Tx(mut env) => {
+            env.signatures = vec![inner_sig].try_into().unwrap();
+            env
+        }
+        _ => unreachable!(),
+    };
+
+    // Fee-bump with fee=1 (way too low, base_fee=100 * 1 op = 100 minimum)
+    let fee_bump_tx = FeeBumpTransaction {
+        ext: stellar_xdr::curr::FeeBumpTransactionExt::V0,
+        fee_source: MuxedAccount::Ed25519(Uint256(*fee_source_secret.public_key().as_bytes())),
+        fee: 1, // Insufficient
+        inner_tx: FeeBumpTransactionInnerTx::Tx(signed_inner),
+    };
+
+    let mut fee_bump_envelope = TransactionEnvelope::TxFeeBump(FeeBumpTransactionEnvelope {
+        tx: fee_bump_tx,
+        signatures: VecM::default(),
+    });
+    let outer_sig = sign_envelope(&fee_bump_envelope, &fee_source_secret, &network_id);
+    if let TransactionEnvelope::TxFeeBump(ref mut env) = fee_bump_envelope {
+        env.signatures = vec![outer_sig].try_into().unwrap();
+    }
+
+    let context = henyey_tx::LedgerContext::new(1, 1_000, 100, 5_000_000, 25, network_id);
+    let mut executor = TransactionExecutor::new(
+        &context,
+        0,
+        SorobanConfig::default(),
+        ClassicEventConfig::default(),
+    );
+
+    let result = executor
+        .execute_transaction(&snapshot, &fee_bump_envelope, 100, None)
+        .expect("execute");
+
+    assert_eq!(
+        result.failure,
+        Some(ExecutionFailure::TxInsufficientFee),
+        "AUDIT-238: fee-bump outer fee must be checked before fee source account load"
+    );
+    assert!(
+        result.fee_bump_outer_failure,
+        "AUDIT-238: fee-bump outer failures must set fee_bump_outer_failure=true"
+    );
+}
+
+/// AUDIT-238: Fee-bump inner time bounds must be checked before inner source account load.
+/// A fee-bump with valid outer fee, existing fee source, but invalid inner time bounds
+/// AND missing inner source must return TxTooEarly, not TxNoAccount.
+#[test]
+fn test_fee_bump_time_bounds_checked_before_inner_source_load() {
+    let fee_source_secret = SecretKey::from_seed(&[108u8; 32]);
+    let fee_source_id: AccountId = (&fee_source_secret.public_key()).into();
+    let inner_secret = SecretKey::from_seed(&[109u8; 32]);
+
+    // Only the fee source exists, inner source does NOT
+    let (key, entry) = create_account_entry(fee_source_id.clone(), 1, 100_000_000);
+    let snapshot = SnapshotBuilder::new(1)
+        .add_entry(key, entry)
+        .build_with_default_header();
+    let snapshot = SnapshotHandle::new(snapshot);
+
+    let operation = Operation {
+        source_account: None,
+        body: OperationBody::CreateAccount(CreateAccountOp {
+            destination: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([2u8; 32]))),
+            starting_balance: 1_000_000,
+        }),
+    };
+
+    // Inner tx with minTime=5000 (future) AND source account doesn't exist
+    let inner_tx = Transaction {
+        source_account: MuxedAccount::Ed25519(Uint256(*inner_secret.public_key().as_bytes())),
+        fee: 100,
+        seq_num: SequenceNumber(2),
+        cond: Preconditions::Time(TimeBounds {
+            min_time: TimePoint(5_000),
+            max_time: TimePoint(0),
+        }),
+        memo: Memo::None,
+        operations: vec![operation].try_into().unwrap(),
+        ext: TransactionExt::V0,
+    };
+
+    let inner_envelope = TransactionEnvelope::Tx(TransactionV1Envelope {
+        tx: inner_tx,
+        signatures: VecM::default(),
+    });
+    let network_id = NetworkId::testnet();
+    let inner_sig = sign_envelope(&inner_envelope, &inner_secret, &network_id);
+    let signed_inner = match inner_envelope {
+        TransactionEnvelope::Tx(mut env) => {
+            env.signatures = vec![inner_sig].try_into().unwrap();
+            env
+        }
+        _ => unreachable!(),
+    };
+
+    // Fee-bump with sufficient fee
+    let fee_bump_tx = FeeBumpTransaction {
+        ext: stellar_xdr::curr::FeeBumpTransactionExt::V0,
+        fee_source: MuxedAccount::Ed25519(Uint256(*fee_source_secret.public_key().as_bytes())),
+        fee: 200, // Sufficient (inner fee=100, so outer must be >= inner)
+        inner_tx: FeeBumpTransactionInnerTx::Tx(signed_inner),
+    };
+
+    let mut fee_bump_envelope = TransactionEnvelope::TxFeeBump(FeeBumpTransactionEnvelope {
+        tx: fee_bump_tx,
+        signatures: VecM::default(),
+    });
+    let outer_sig = sign_envelope(&fee_bump_envelope, &fee_source_secret, &network_id);
+    if let TransactionEnvelope::TxFeeBump(ref mut env) = fee_bump_envelope {
+        env.signatures = vec![outer_sig].try_into().unwrap();
+    }
+
+    // close_time=1000 < minTime=5000 → too early (before inner account load)
+    let context = henyey_tx::LedgerContext::new(1, 1_000, 100, 5_000_000, 25, network_id);
+    let mut executor = TransactionExecutor::new(
+        &context,
+        0,
+        SorobanConfig::default(),
+        ClassicEventConfig::default(),
+    );
+
+    let result = executor
+        .execute_transaction(&snapshot, &fee_bump_envelope, 100, None)
+        .expect("execute");
+
+    assert_eq!(
+        result.failure,
+        Some(ExecutionFailure::TxTooEarly),
+        "AUDIT-238: fee-bump inner time bounds must be checked before inner source load"
+    );
+    // Time bounds failure is an inner failure, not outer
+    assert!(!result.fee_bump_outer_failure);
+}
