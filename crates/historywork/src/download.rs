@@ -62,13 +62,28 @@ impl Work for GetHistoryArchiveStateWork {
     // SECURITY: checkpoint data validated by hash chain; content integrity verified before acceptance
     async fn run(&mut self, _ctx: &WorkContext) -> WorkOutcome {
         set_progress(&self.state, HistoryWorkStage::FetchHas, "fetching HAS").await;
-        // Stage E instrumentation:
-        // `historywork::GetHistoryArchiveStateWork` does *not* run
-        // `verify_has` (unlike `catchup::download_and_verify_has`) — it just
-        // fetches the JSON. We treat fetch success as the HAS-acquisition
-        // event for dashboard consistency.
+        // Stage E instrumentation: emit HAS success only after both fetch and
+        // structure/checkpoint verification pass — matching
+        // `catchup::download_and_verify_has`. Passphrase verification is not
+        // performed here because the historywork builder does not carry a
+        // network passphrase; that check belongs at the direct-catchup layer
+        // and is a superset of what this counter promises.
         match self.archive.fetch_checkpoint_has(self.checkpoint).await {
             Ok(has) => {
+                if let Err(err) = verify::verify_has_structure(&has) {
+                    metrics::counter!(
+                        "stellar_history_download_history_archive_state_failure_total"
+                    )
+                    .increment(1);
+                    return WorkOutcome::Failed(format!("HAS structure invalid: {err}"));
+                }
+                if let Err(err) = verify::verify_has_checkpoint(&has, self.checkpoint) {
+                    metrics::counter!(
+                        "stellar_history_download_history_archive_state_failure_total"
+                    )
+                    .increment(1);
+                    return WorkOutcome::Failed(format!("HAS checkpoint mismatch: {err}"));
+                }
                 metrics::counter!("stellar_history_download_history_archive_state_success_total")
                     .increment(1);
                 let mut guard = self.state.lock().await;

@@ -731,7 +731,7 @@
           "id": 208,
           "type": "timeseries",
           "title": "HAS Acquisition",
-          "description": "History Archive State (HAS) download+verify outcome rate. Panel 69 of 10334.",
+          "description": "History Archive State (HAS) acquisition outcome rate. Counts download + structure/checkpoint verify (and passphrase verify in direct catchup). Panel 69 of 10334.",
           "gridPos": {"h": 6, "w": 8, "x": 16, "y": 98},
           "datasource": {"type": "prometheus", "uid": "000000001"},
           "targets": [
