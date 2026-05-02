@@ -61,6 +61,7 @@ use crate::{
 };
 use henyey_bucket::{canonical_bucket_filename, BucketList, BucketManager, HotArchiveBucketList};
 use henyey_common::fs_utils::atomic_copy;
+use henyey_common::protocol::LclContext;
 use henyey_common::{Hash256, NetworkId};
 use henyey_db::Database;
 use std::collections::HashMap;
@@ -1004,20 +1005,19 @@ impl LedgerData {
     /// Accepts optional tx/result entries:
     /// - `(Some, Some)` → validates seq numbers and tx/result count match
     /// - `(None, None)` → synthesizes a protocol-correct empty tx set using
-    ///   `lcl_protocol_version` (the previous ledger's protocol version)
+    ///   the [`LclContext`] (the previous ledger's protocol version and hash)
     /// - `(Some, None)` or `(None, Some)` → returns error (asymmetric is invalid)
     ///
     /// # Arguments
     ///
-    /// * `lcl_protocol_version` — the protocol version of the Last Closed Ledger
-    ///   (the ledger immediately before this one). Used to select the correct
-    ///   empty tx set format when no tx entries are present, matching
+    /// * `lcl` — context from the Last Closed Ledger, used to select the correct
+    ///   empty tx set format when no tx entries are present. Mirrors
     ///   stellar-core's `TxSetXDRFrame::makeEmpty(lclHeader)` semantics.
     pub fn new(
         header: LedgerHeader,
         tx_history_entry: Option<TransactionHistoryEntry>,
         tx_result_entry: Option<TransactionHistoryResultEntry>,
-        lcl_protocol_version: u32,
+        lcl: &LclContext,
     ) -> Result<Self> {
         let tx_data = match (tx_history_entry, tx_result_entry) {
             (Some(tx_entry), Some(result_entry)) => {
@@ -1048,7 +1048,12 @@ impl LedgerData {
                 }
             }
             (None, None) => {
-                let tx_set = make_empty_tx_set(&header.previous_ledger_hash, lcl_protocol_version);
+                debug_assert_eq!(
+                    &header.previous_ledger_hash,
+                    lcl.lcl_hash(),
+                    "LclContext hash mismatch: header.previous_ledger_hash != lcl.lcl_hash()"
+                );
+                let tx_set = make_empty_tx_set(lcl);
                 LedgerTxData::Absent { tx_set }
             }
             (Some(_), None) => {
@@ -1125,27 +1130,21 @@ impl LedgerData {
 /// Construct the canonical empty [`TransactionSetVariant`] for a ledger,
 /// matching stellar-core's `TxSetXDRFrame::makeEmpty` (`TxSetFrame.cpp:958-979`).
 ///
-/// # Arguments
-///
-/// * `previous_ledger_hash` — hash of the LCL (used as the tx set's
-///   `previousLedgerHash` field). Equals the current header's
-///   `previous_ledger_hash`.
-/// * `lcl_protocol_version` — the **LCL's** protocol version, which
-///   determines the tx set format. stellar-core branches on
-///   `lclHeader.header.ledgerVersion`, NOT on the current ledger's version.
+/// Accepts an [`LclContext`] that bundles the LCL hash and protocol version,
+/// ensuring callers cannot accidentally mix values from different ledgers.
 ///
 /// Protocol ranges (based on LCL protocol):
 /// - `< 20`: Classic `TransactionSet` with empty txs
 /// - `20-22`: `GeneralizedTransactionSet` with two V0 (sequential) phases
 /// - `23+`: `GeneralizedTransactionSet` with V0 classic + V1 (parallel) soroban
-pub(crate) fn make_empty_tx_set(
-    previous_ledger_hash: &Hash,
-    lcl_protocol_version: u32,
-) -> TransactionSetVariant {
+pub(crate) fn make_empty_tx_set(lcl: &LclContext) -> TransactionSetVariant {
     use henyey_common::protocol::{
         protocol_version_starts_from, ProtocolVersion, PARALLEL_SOROBAN_PHASE_PROTOCOL_VERSION,
     };
     use stellar_xdr::curr::{ParallelTxsComponent, TransactionPhase, TransactionSet, VecM};
+
+    let previous_ledger_hash = lcl.lcl_hash().clone();
+    let lcl_protocol_version = lcl.protocol_version();
 
     if protocol_version_starts_from(lcl_protocol_version, ProtocolVersion::V20) {
         let classic_phase = TransactionPhase::V0(VecM::default());
@@ -1163,7 +1162,7 @@ pub(crate) fn make_empty_tx_set(
             TransactionPhase::V0(VecM::default())
         };
         TransactionSetVariant::Generalized(GeneralizedTransactionSet::V1(TransactionSetV1 {
-            previous_ledger_hash: previous_ledger_hash.clone(),
+            previous_ledger_hash,
             phases: vec![classic_phase, soroban_phase]
                 .try_into()
                 .unwrap_or_default(),
@@ -1171,7 +1170,7 @@ pub(crate) fn make_empty_tx_set(
     } else {
         // Protocol < 20: classic tx set
         TransactionSetVariant::Classic(TransactionSet {
-            previous_ledger_hash: previous_ledger_hash.clone(),
+            previous_ledger_hash,
             txs: Default::default(),
         })
     }

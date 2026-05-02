@@ -239,6 +239,60 @@ pub fn hot_archive_supported(protocol_version: u32) -> bool {
     protocol_version_starts_from(protocol_version, HOT_ARCHIVE_PROTOCOL_VERSION)
 }
 
+// =============================================================================
+// LCL Context
+// =============================================================================
+
+/// Context from the Last Closed Ledger needed for tx-set format selection.
+///
+/// Bundles the LCL hash and protocol version so they cannot be mixed from
+/// different ledgers. Mirrors stellar-core's `TxSetXDRFrame::makeEmpty(lclHeader)`
+/// which takes a single `lclHeader` argument providing both hash and protocol.
+///
+/// Private fields ensure construction only through approved constructors.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LclContext {
+    /// Hash of the LCL (becomes `previous_ledger_hash` in synthesized tx sets).
+    lcl_hash: stellar_xdr::curr::Hash,
+    /// The LCL's protocol version (determines Classic vs Generalized format).
+    protocol_version: u32,
+}
+
+impl LclContext {
+    /// Construct from the LCL's protocol version and hash.
+    ///
+    /// Both values must come from the same ledger header. For the live-node path,
+    /// prefer `From<&HeaderSnapshot>` (implemented in `henyey-ledger`) which
+    /// provides this guarantee structurally.
+    pub fn new(protocol_version: u32, lcl_hash: crate::Hash256) -> Self {
+        Self {
+            lcl_hash: stellar_xdr::curr::Hash(lcl_hash.0),
+            protocol_version,
+        }
+    }
+
+    /// Construct for the pre-genesis case (ledger 0, before any close).
+    ///
+    /// At genesis, there is no LCL — the "previous ledger hash" is all zeros
+    /// and the protocol version is 0 (Classic format).
+    pub fn pre_genesis() -> Self {
+        Self {
+            lcl_hash: stellar_xdr::curr::Hash([0u8; 32]),
+            protocol_version: 0,
+        }
+    }
+
+    /// The LCL hash (used as `previous_ledger_hash` in synthesized tx sets).
+    pub fn lcl_hash(&self) -> &stellar_xdr::curr::Hash {
+        &self.lcl_hash
+    }
+
+    /// The LCL's protocol version.
+    pub fn protocol_version(&self) -> u32 {
+        self.protocol_version
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -276,5 +330,20 @@ mod tests {
         assert!(soroban_supported(24));
         assert!(soroban_supported(25));
         assert!(soroban_supported(26));
+    }
+
+    #[test]
+    fn test_lcl_context_pre_genesis() {
+        let lcl = LclContext::pre_genesis();
+        assert_eq!(lcl.protocol_version(), 0);
+        assert_eq!(lcl.lcl_hash(), &stellar_xdr::curr::Hash([0u8; 32]));
+    }
+
+    #[test]
+    fn test_lcl_context_new() {
+        let hash = crate::Hash256([42u8; 32]);
+        let lcl = LclContext::new(23, hash);
+        assert_eq!(lcl.protocol_version(), 23);
+        assert_eq!(lcl.lcl_hash(), &stellar_xdr::curr::Hash([42u8; 32]));
     }
 }

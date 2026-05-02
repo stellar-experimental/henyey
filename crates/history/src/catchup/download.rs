@@ -6,6 +6,7 @@ use crate::{
 };
 use henyey_bucket::canonical_bucket_filename;
 use henyey_common::fs_utils::atomic_write_bytes;
+use henyey_common::protocol::LclContext;
 use henyey_common::Hash256;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -294,14 +295,14 @@ impl CatchupManager {
     /// * `from_ledger` — sequence number of the Last Closed Ledger (the most
     ///   recently applied ledger). Download starts at `from_ledger + 1`.
     /// * `to_ledger` — inclusive upper bound of the range to download.
-    /// * `lcl_protocol_version` — protocol version of the LCL at the start of
-    ///   this replay batch. Used for empty tx set synthesis when archives omit
-    ///   tx entries for ledgers with no transactions.
+    /// * `initial_lcl` — context from the LCL at the start of this replay batch.
+    ///   Used for empty tx set synthesis when archives omit tx entries for
+    ///   ledgers with no transactions.
     pub(super) async fn download_ledger_data(
         &mut self,
         from_ledger: u32,
         to_ledger: u32,
-        lcl_protocol_version: u32,
+        initial_lcl: LclContext,
     ) -> Result<Vec<LedgerData>> {
         let mut data = Vec::new();
         let mut checkpoint_cache: HashMap<u32, CheckpointLedgerData> = HashMap::new();
@@ -315,17 +316,17 @@ impl CatchupManager {
             return Ok(data);
         }
 
-        // Resolve the LCL protocol version from the archive when from_ledger > 0.
+        // Resolve the LCL context from the archive when from_ledger > 0.
         // The caller-provided value may be stale (e.g., synthetic genesis at
         // version 0 when the actual network genesis is at version 25+).
         // We use download_checkpoint_header (lightweight single-header fetch)
         // rather than downloading the full checkpoint data.
-        let mut current_lcl_protocol = if from_ledger > 0 {
-            let (lcl_header, _) = self.download_checkpoint_header(from_ledger).await?;
-            lcl_header.ledger_version
+        let mut current_lcl = if from_ledger > 0 {
+            let (lcl_header, lcl_hash) = self.download_checkpoint_header(from_ledger).await?;
+            LclContext::new(lcl_header.ledger_version, lcl_hash)
         } else {
-            // from_ledger == 0 means "before genesis"; protocol 0 is correct.
-            lcl_protocol_version
+            // from_ledger == 0 means "before genesis"; use caller-provided context.
+            initial_lcl
         };
 
         for seq in start..=to_ledger {
@@ -342,7 +343,7 @@ impl CatchupManager {
                 HistoryError::CatchupFailed(format!("missing checkpoint cache for {}", checkpoint))
             })?;
 
-            let header = cache
+            let header_entry = cache
                 .headers
                 .iter()
                 .find(|h| h.header.ledger_seq == seq)
@@ -351,9 +352,10 @@ impl CatchupManager {
                         "ledger {} not found in checkpoint headers",
                         seq
                     ))
-                })?
-                .header
-                .clone();
+                })?;
+
+            let header = header_entry.header.clone();
+            let header_hash = Hash256(header_entry.hash.0);
 
             let tx_history_entry = cache
                 .tx_entries
@@ -371,11 +373,11 @@ impl CatchupManager {
                 header.clone(),
                 tx_history_entry,
                 tx_result_entry,
-                current_lcl_protocol,
+                &current_lcl,
             )?);
 
             // This header becomes the LCL for the next iteration.
-            current_lcl_protocol = header.ledger_version;
+            current_lcl = LclContext::new(header.ledger_version, header_hash);
         }
 
         Ok(data)

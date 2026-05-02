@@ -51,7 +51,7 @@ use crate::tracked_lock::{tracked_read, tracked_write};
 const LOCK_HERDER_STATE: &str = "herder.state";
 const LOCK_TRACKING_STATE: &str = "shared.tracking_state";
 
-use henyey_common::protocol::{protocol_version_starts_from, ProtocolVersion};
+use henyey_common::protocol::{protocol_version_starts_from, LclContext, ProtocolVersion};
 use henyey_common::{Hash256, NetworkId};
 use henyey_crypto::{PublicKey, SecretKey};
 use henyey_ledger::LedgerManager;
@@ -2523,7 +2523,9 @@ impl Herder {
         // check, a genesis-at-v0 network (e.g. quickstart) produces a Generalized
         // hash during nomination but the catchup path reconstructs a Classic hash,
         // causing "invalid tx set hash" errors (#2297).
-        let tx_set = if !protocol_version_starts_from(header.ledger_version, ProtocolVersion::V20) {
+        let lcl = LclContext::new(header.ledger_version, previous_hash);
+        let tx_set = if !protocol_version_starts_from(lcl.protocol_version(), ProtocolVersion::V20)
+        {
             TransactionSet::new_legacy(previous_hash, vec![])
         } else {
             self.tx_queue.build_generalized_tx_set_with_providers(

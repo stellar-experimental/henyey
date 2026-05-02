@@ -1263,6 +1263,12 @@ pub struct HeaderSnapshot {
     pub hash: Hash256,
 }
 
+impl From<&HeaderSnapshot> for henyey_common::protocol::LclContext {
+    fn from(snap: &HeaderSnapshot) -> Self {
+        Self::new(snap.header.ledger_version, snap.hash)
+    }
+}
+
 /// Internal state of the ledger manager.
 ///
 /// This struct holds the mutable state that changes with each ledger close.

@@ -3,6 +3,7 @@
 use crate::{verify, HistoryError, Result};
 use std::sync::Arc;
 
+use henyey_common::protocol::LclContext;
 use henyey_ledger::{HeaderSnapshot, LedgerCloseData, LedgerManager};
 use stellar_xdr::curr::{LedgerHeader, LedgerUpgrade, Limits, ReadXdr, WriteXdr};
 use tracing::{debug, info, warn};
@@ -169,15 +170,10 @@ impl CatchupManager {
 
             // Download from the checkpoint containing replay_first - 1 (the LCL).
             let download_from = current_lcl;
-            let lcl_protocol_version = snap.header.ledger_version;
+            let lcl = LclContext::from(&snap);
 
             match self
-                .download_verify_and_replay_once(
-                    download_from,
-                    target,
-                    lcl_protocol_version,
-                    ledger_manager,
-                )
+                .download_verify_and_replay_once(download_from, target, lcl, ledger_manager)
                 .await
             {
                 Ok(result) => return Ok(result),
@@ -207,7 +203,7 @@ impl CatchupManager {
         &mut self,
         download_from: u32,
         target: u32,
-        lcl_protocol_version: u32,
+        lcl: LclContext,
         ledger_manager: &LedgerManager,
     ) -> Result<(HeaderSnapshot, u32)> {
         use henyey_common::NetworkId;
@@ -219,7 +215,7 @@ impl CatchupManager {
             "Downloading ledger data",
         );
         let ledger_data = self
-            .download_ledger_data(download_from, target, lcl_protocol_version)
+            .download_ledger_data(download_from, target, lcl)
             .await?;
 
         // Verify the header chain.
