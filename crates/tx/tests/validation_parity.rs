@@ -10,7 +10,7 @@ use henyey_common::NetworkId;
 use henyey_tx::validation::{
     check_valid_pre_seq_num, check_valid_pre_seq_num_with_config, PreSeqNumError,
 };
-use henyey_tx::{validate_operation, TransactionFrame};
+use henyey_tx::{validate_operation, SorobanResourceLimits, TransactionFrame};
 use stellar_xdr::curr::{
     AccountId, AlphaNum4, Asset, AssetCode4, ClawbackOp, ContractDataDurability, ContractId,
     ContractIdPreimage, CreateContractArgs, ExtendFootprintTtlOp, FeeBumpTransaction,
@@ -381,9 +381,13 @@ fn test_reject_upload_wasm_oversized() {
 
     let frame = make_soroban_frame(op_body, empty_footprint(), 50);
 
+    let limits = SorobanResourceLimits {
+        max_contract_size_bytes: max_contract_size,
+        ..SorobanResourceLimits::default()
+    };
+
     // With config, oversized WASM should be rejected.
-    let result =
-        check_valid_pre_seq_num_with_config(&frame, PROTOCOL_VERSION, 0, Some(max_contract_size));
+    let result = check_valid_pre_seq_num_with_config(&frame, PROTOCOL_VERSION, 0, Some(&limits));
     assert!(
         result.is_err(),
         "UploadContractWasm exceeding max contract size should be rejected"

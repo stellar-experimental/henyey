@@ -69,6 +69,7 @@ use crate::surge_pricing::{
 use crate::Result;
 use henyey_tx::envelope_sequence_number;
 use henyey_tx::FeeRate;
+use henyey_tx::SorobanResourceLimits;
 use rand::Rng;
 
 pub mod arb_flood_damping;
@@ -314,28 +315,9 @@ pub struct ValidationContext {
     /// Updated each ledger close from the dynamic network config.
     pub expected_close_time: Duration,
     /// Soroban per-transaction resource limits (if available).
-    pub soroban_limits: Option<SorobanTxLimits>,
-    /// Max contract WASM size (from Soroban config, if available).
-    pub max_contract_size_bytes: Option<u32>,
-}
-
-/// Per-transaction Soroban resource limits from network config.
-///
-/// Parity: stellar-core `SorobanNetworkConfig` tx-level limits.
-#[derive(Debug, Clone)]
-pub struct SorobanTxLimits {
-    /// Maximum instructions per transaction.
-    pub tx_max_instructions: u64,
-    /// Maximum disk read bytes per transaction.
-    pub tx_max_read_bytes: u64,
-    /// Maximum write bytes per transaction.
-    pub tx_max_write_bytes: u64,
-    /// Maximum read ledger entries per transaction.
-    pub tx_max_read_ledger_entries: u64,
-    /// Maximum write ledger entries per transaction.
-    pub tx_max_write_ledger_entries: u64,
-    /// Maximum transaction size in bytes.
-    pub tx_max_size_bytes: u64,
+    /// Combines the old `soroban_limits` and `max_contract_size_bytes` into
+    /// one atomic snapshot from the Soroban network config.
+    pub soroban_config: Option<SorobanResourceLimits>,
 }
 
 impl Default for ValidationContext {
@@ -351,8 +333,7 @@ impl Default for ValidationContext {
             base_reserve: DEFAULT_BASE_RESERVE,
             ledger_flags: 0,
             expected_close_time: Duration::from_secs(5),
-            soroban_limits: None,
-            max_contract_size_bytes: None,
+            soroban_config: None,
         }
     }
 }
@@ -1431,13 +1412,10 @@ impl TransactionQueue {
     ///
     /// Called during startup seeding (before the first ledger close) to ensure
     /// Soroban txs are validated against network config limits from the start.
-    pub fn set_soroban_limits(&self, limits: SorobanTxLimits) {
-        self.validation_context.write().soroban_limits = Some(limits);
-    }
-
-    /// Set the max contract WASM size in the validation context.
-    pub fn set_max_contract_size(&self, max_bytes: u32) {
-        self.validation_context.write().max_contract_size_bytes = Some(max_bytes);
+    /// Replaces both the old `set_soroban_limits` and `set_max_contract_size`
+    /// with a single atomic update.
+    pub fn set_soroban_config(&self, config: SorobanResourceLimits) {
+        self.validation_context.write().soroban_config = Some(config);
     }
 
     /// Validate a transaction before queueing.
@@ -1461,7 +1439,7 @@ impl TransactionQueue {
             &frame,
             ctx.protocol_version,
             ctx.ledger_flags,
-            ctx.max_contract_size_bytes,
+            ctx.soroban_config.as_ref(),
         )
         .map_err(|e| e.to_tx_result_code())?;
 
@@ -1582,76 +1560,6 @@ impl TransactionQueue {
                     return Err(stellar_xdr::curr::TransactionResultCode::TxFailed);
                 }
             }
-        }
-
-        Ok(())
-    }
-
-    /// Check that a Soroban transaction's declared resources don't exceed
-    /// per-transaction network config limits.
-    ///
-    /// Parity: stellar-core `TransactionFrame::checkSorobanResources()`.
-    fn check_soroban_resources(
-        &self,
-        env: &stellar_xdr::curr::TransactionEnvelope,
-    ) -> std::result::Result<(), String> {
-        let ctx = self.validation_context.read();
-        let Some(ref limits) = ctx.soroban_limits else {
-            // No limits configured — skip check
-            return Ok(());
-        };
-
-        let Some(data) = henyey_tx::envelope_utils::envelope_soroban_data(env) else {
-            return Err("missing soroban transaction data".to_string());
-        };
-
-        let resources = &data.resources;
-
-        if resources.instructions as u64 > limits.tx_max_instructions {
-            return Err(format!(
-                "instructions {} exceed limit {}",
-                resources.instructions, limits.tx_max_instructions
-            ));
-        }
-
-        if resources.disk_read_bytes as u64 > limits.tx_max_read_bytes {
-            return Err(format!(
-                "read bytes {} exceed limit {}",
-                resources.disk_read_bytes, limits.tx_max_read_bytes
-            ));
-        }
-
-        if resources.write_bytes as u64 > limits.tx_max_write_bytes {
-            return Err(format!(
-                "write bytes {} exceed limit {}",
-                resources.write_bytes, limits.tx_max_write_bytes
-            ));
-        }
-
-        let read_entries = resources.footprint.read_only.len() as u64;
-        let write_entries = resources.footprint.read_write.len() as u64;
-
-        if write_entries > limits.tx_max_write_ledger_entries {
-            return Err(format!(
-                "write entries {} exceed limit {}",
-                write_entries, limits.tx_max_write_ledger_entries
-            ));
-        }
-
-        if read_entries + write_entries > limits.tx_max_read_ledger_entries {
-            return Err(format!(
-                "read entries {} exceed limit {}",
-                read_entries + write_entries,
-                limits.tx_max_read_ledger_entries
-            ));
-        }
-
-        let tx_size = henyey_tx::envelope_utils::envelope_tx_size_bytes(env) as u64;
-        if tx_size > limits.tx_max_size_bytes {
-            return Err(format!(
-                "tx size {} exceeds limit {}",
-                tx_size, limits.tx_max_size_bytes
-            ));
         }
 
         Ok(())
@@ -2031,19 +1939,8 @@ impl TransactionQueue {
             return TxQueueResult::Banned;
         }
 
-        // Parity: check Soroban resource limits against network config
-        if queued_is_soroban {
-            if let Err(reason) = self.check_soroban_resources(&queued.envelope) {
-                tracing::debug!(
-                    hash = %queued.hash,
-                    reason = %reason,
-                    "Rejecting Soroban tx: resources exceed network config"
-                );
-                // Parity: stellar-core rejects resource-exceeding Soroban txs
-                // with txSOROBAN_INVALID.
-                return TxQueueResult::Invalid(Some(henyey_tx::TxResultCode::TxSorobanInvalid));
-            }
-        }
+        // NOTE: Per-TX Soroban resource checks are now handled by
+        // check_valid_pre_seq_num_with_config via the shared check_soroban_resources helper.
 
         // Check for duplicate in queue
         if store.contains_key(&queued.hash) {
@@ -7105,92 +7002,82 @@ mod tests {
         envelope
     }
 
-    fn make_queue_with_soroban_limits(limits: SorobanTxLimits) -> TransactionQueue {
-        let queue = TransactionQueue::with_defaults();
-        queue.validation_context.write().soroban_limits = Some(limits);
-        queue
-    }
-
-    fn permissive_soroban_limits() -> SorobanTxLimits {
-        SorobanTxLimits {
+    fn permissive_soroban_config() -> henyey_tx::SorobanResourceLimits {
+        henyey_tx::SorobanResourceLimits {
             tx_max_instructions: 1_000_000,
             tx_max_read_bytes: 1_000_000,
             tx_max_write_bytes: 1_000_000,
             tx_max_read_ledger_entries: 100,
             tx_max_write_ledger_entries: 50,
             tx_max_size_bytes: 1_000_000,
+            tx_max_footprint_entries: 200,
+            max_contract_size_bytes: 1_000_000,
+            max_contract_data_key_size_bytes: 250,
         }
     }
 
     #[test]
     fn test_check_soroban_resources_passes_within_limits() {
-        let queue = make_queue_with_soroban_limits(permissive_soroban_limits());
+        let config = permissive_soroban_config();
         let frame = make_soroban_frame_with_resources(100, 200, 300, 2, 1);
-        assert!(queue.check_soroban_resources(&frame).is_ok());
-    }
-
-    #[test]
-    fn test_check_soroban_resources_no_limits_skips_check() {
-        let queue = TransactionQueue::with_defaults();
-        // No soroban_limits configured — should pass
-        let frame = make_soroban_frame_with_resources(u32::MAX, u32::MAX, u32::MAX, 100, 100);
-        assert!(queue.check_soroban_resources(&frame).is_ok());
+        let tx_frame = henyey_tx::TransactionFrame::from_owned(frame);
+        assert!(henyey_tx::check_soroban_resources(&tx_frame, 21, &config).is_ok());
     }
 
     #[test]
     fn test_check_soroban_resources_rejects_excess_instructions() {
-        let mut limits = permissive_soroban_limits();
-        limits.tx_max_instructions = 50;
-        let queue = make_queue_with_soroban_limits(limits);
+        let mut config = permissive_soroban_config();
+        config.tx_max_instructions = 50;
 
         let frame = make_soroban_frame_with_resources(100, 0, 0, 0, 0);
-        let err = queue.check_soroban_resources(&frame).unwrap_err();
-        assert!(err.contains("instructions"), "Error: {}", err);
+        let tx_frame = henyey_tx::TransactionFrame::from_owned(frame);
+        let err = henyey_tx::check_soroban_resources(&tx_frame, 21, &config).unwrap_err();
+        assert!(err.to_string().contains("instructions"), "Error: {}", err);
     }
 
     #[test]
     fn test_check_soroban_resources_rejects_excess_read_bytes() {
-        let mut limits = permissive_soroban_limits();
-        limits.tx_max_read_bytes = 100;
-        let queue = make_queue_with_soroban_limits(limits);
+        let mut config = permissive_soroban_config();
+        config.tx_max_read_bytes = 100;
 
         let frame = make_soroban_frame_with_resources(0, 200, 0, 0, 0);
-        let err = queue.check_soroban_resources(&frame).unwrap_err();
-        assert!(err.contains("read bytes"), "Error: {}", err);
+        let tx_frame = henyey_tx::TransactionFrame::from_owned(frame);
+        let err = henyey_tx::check_soroban_resources(&tx_frame, 21, &config).unwrap_err();
+        assert!(err.to_string().contains("read bytes"), "Error: {}", err);
     }
 
     #[test]
     fn test_check_soroban_resources_rejects_excess_write_bytes() {
-        let mut limits = permissive_soroban_limits();
-        limits.tx_max_write_bytes = 100;
-        let queue = make_queue_with_soroban_limits(limits);
+        let mut config = permissive_soroban_config();
+        config.tx_max_write_bytes = 100;
 
         let frame = make_soroban_frame_with_resources(0, 0, 200, 0, 0);
-        let err = queue.check_soroban_resources(&frame).unwrap_err();
-        assert!(err.contains("write bytes"), "Error: {}", err);
+        let tx_frame = henyey_tx::TransactionFrame::from_owned(frame);
+        let err = henyey_tx::check_soroban_resources(&tx_frame, 21, &config).unwrap_err();
+        assert!(err.to_string().contains("write bytes"), "Error: {}", err);
     }
 
     #[test]
     fn test_check_soroban_resources_rejects_excess_write_entries() {
-        let mut limits = permissive_soroban_limits();
-        limits.tx_max_write_ledger_entries = 2;
-        let queue = make_queue_with_soroban_limits(limits);
+        let mut config = permissive_soroban_config();
+        config.tx_max_write_ledger_entries = 2;
 
         let frame = make_soroban_frame_with_resources(0, 0, 0, 0, 5);
-        let err = queue.check_soroban_resources(&frame).unwrap_err();
-        assert!(err.contains("write entries"), "Error: {}", err);
+        let tx_frame = henyey_tx::TransactionFrame::from_owned(frame);
+        let err = henyey_tx::check_soroban_resources(&tx_frame, 21, &config).unwrap_err();
+        assert!(err.to_string().contains("write entries"), "Error: {}", err);
     }
 
     #[test]
     fn test_check_soroban_resources_rejects_excess_total_read_entries() {
-        let mut limits = permissive_soroban_limits();
-        limits.tx_max_read_ledger_entries = 5;
-        let queue = make_queue_with_soroban_limits(limits);
+        let mut config = permissive_soroban_config();
+        config.tx_max_read_ledger_entries = 5;
 
         // 4 read-only + 3 read-write = 7 total > 5 limit
         let frame = make_soroban_frame_with_resources(0, 0, 0, 4, 3);
-        let err = queue.check_soroban_resources(&frame).unwrap_err();
-        assert!(err.contains("read entries"), "Error: {}", err);
+        let tx_frame = henyey_tx::TransactionFrame::from_owned(frame);
+        let err = henyey_tx::check_soroban_resources(&tx_frame, 21, &config).unwrap_err();
+        assert!(err.to_string().contains("read entries"), "Error: {}", err);
     }
 
     /// Regression test for AUDIT-072: seen-set hashes never clear on eviction.

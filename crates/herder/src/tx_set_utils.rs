@@ -19,7 +19,7 @@ use henyey_ledger::SorobanNetworkInfo;
 use henyey_tx::{
     check_valid_pre_seq_num_with_config, collect_signers_for_account, get_threshold_level,
     muxed_to_account_id, validate_basic, LedgerContext, OperationTypeExt, SignatureChecker,
-    TransactionFrame,
+    SorobanResourceLimits, TransactionFrame,
 };
 use stellar_xdr::curr::{
     AccountEntry, AccountId, GeneralizedTransactionSet, LedgerHeader, Preconditions, SignerKey,
@@ -189,8 +189,8 @@ pub struct TxSetValidationContext {
     pub network_id: NetworkId,
     /// Ledger header flags (LP disable flags etc.).
     pub ledger_flags: u32,
-    /// Max contract WASM size (from Soroban config, if available).
-    pub max_contract_size_bytes: Option<u32>,
+    /// Per-TX Soroban resource limits (from Soroban config, if available).
+    pub soroban_resource_limits: Option<SorobanResourceLimits>,
 }
 
 impl TxSetValidationContext {
@@ -223,7 +223,7 @@ impl TxSetValidationContext {
             protocol_version,
             network_id,
             ledger_flags,
-            max_contract_size_bytes: None,
+            soroban_resource_limits: None,
         }
     }
 
@@ -876,7 +876,7 @@ fn get_invalid_hashed_core(
             &frame,
             ctx.protocol_version,
             ctx.ledger_flags,
-            ctx.max_contract_size_bytes,
+            ctx.soroban_resource_limits.as_ref(),
         )
         .is_err()
         {
@@ -1611,7 +1611,17 @@ pub(crate) fn check_tx_set_valid(
         ledger_flags,
     );
     if let Some(info) = soroban_info {
-        ctx.max_contract_size_bytes = Some(info.max_contract_size);
+        ctx.soroban_resource_limits = Some(SorobanResourceLimits {
+            tx_max_instructions: info.tx_max_instructions as u64,
+            tx_max_read_bytes: info.tx_max_read_bytes as u64,
+            tx_max_write_bytes: info.tx_max_write_bytes as u64,
+            tx_max_read_ledger_entries: info.tx_max_read_ledger_entries as u64,
+            tx_max_write_ledger_entries: info.tx_max_write_ledger_entries as u64,
+            tx_max_size_bytes: info.tx_max_size_bytes as u64,
+            tx_max_footprint_entries: info.tx_max_footprint_entries as u64,
+            max_contract_size_bytes: info.max_contract_size,
+            max_contract_data_key_size_bytes: info.max_contract_data_key_size,
+        });
     }
     let close_time_bounds = CloseTimeBounds::with_offsets(close_time_offset, close_time_offset);
 
@@ -3857,7 +3867,7 @@ mod tests {
             protocol_version: 21,
             network_id: NetworkId::testnet(),
             ledger_flags: 0,
-            max_contract_size_bytes: None,
+            soroban_resource_limits: None,
         };
         let bounds = CloseTimeBounds::with_offsets(0, 0);
 
@@ -3908,7 +3918,7 @@ mod tests {
             protocol_version: 21,
             network_id: NetworkId::testnet(),
             ledger_flags: 0,
-            max_contract_size_bytes: None,
+            soroban_resource_limits: None,
         };
         let bounds = CloseTimeBounds::with_offsets(0, 0);
 
@@ -3950,7 +3960,7 @@ mod tests {
             protocol_version: 21,
             network_id: NetworkId::testnet(),
             ledger_flags: 0,
-            max_contract_size_bytes: None,
+            soroban_resource_limits: None,
         };
         let bounds = CloseTimeBounds::with_offsets(0, 0);
 
@@ -3998,7 +4008,7 @@ mod tests {
             protocol_version: 21,
             network_id: NetworkId::testnet(),
             ledger_flags: 0,
-            max_contract_size_bytes: None,
+            soroban_resource_limits: None,
         };
         let bounds = CloseTimeBounds::with_offsets(0, 0);
 

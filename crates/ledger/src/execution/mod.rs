@@ -252,6 +252,22 @@ pub struct SorobanNetworkInfo {
     pub tx_max_footprint_entries: u32,
 }
 
+impl From<&SorobanNetworkInfo> for henyey_tx::SorobanResourceLimits {
+    fn from(info: &SorobanNetworkInfo) -> Self {
+        Self {
+            tx_max_instructions: info.tx_max_instructions as u64,
+            tx_max_read_bytes: info.tx_max_read_bytes as u64,
+            tx_max_write_bytes: info.tx_max_write_bytes as u64,
+            tx_max_read_ledger_entries: info.tx_max_read_ledger_entries as u64,
+            tx_max_write_ledger_entries: info.tx_max_write_ledger_entries as u64,
+            tx_max_size_bytes: info.tx_max_size_bytes as u64,
+            tx_max_footprint_entries: info.tx_max_footprint_entries as u64,
+            max_contract_size_bytes: info.max_contract_size,
+            max_contract_data_key_size_bytes: info.max_contract_data_key_size,
+        }
+    }
+}
+
 pub(super) struct RefundableFeeTracker {
     pub(super) non_refundable_fee: i64,
     pub(super) max_refundable_fee: i64,
@@ -559,6 +575,8 @@ pub struct LedgerAdvanceParams {
     pub soroban_config: SorobanConfig,
     pub frozen_key_config: henyey_tx::frozen_keys::FrozenKeyConfig,
     pub ledger_flags: u32,
+    /// Per-TX Soroban resource limits for precondition validation.
+    pub soroban_resource_limits: Option<henyey_tx::SorobanResourceLimits>,
 }
 
 /// Context for executing transactions during ledger close.
@@ -612,6 +630,8 @@ pub struct TransactionExecutor {
     hot_archive_restored_keys: std::collections::HashSet<LedgerKey>,
     /// Optional invariant manager for runtime integrity checks.
     invariant_manager: Option<std::sync::Arc<henyey_invariant::InvariantManager>>,
+    /// Per-TX Soroban resource limits for precondition validation.
+    soroban_resource_limits: Option<henyey_tx::SorobanResourceLimits>,
 }
 
 impl TransactionExecutor {
@@ -644,6 +664,7 @@ impl TransactionExecutor {
             frozen_key_config: context.frozen_key_config.clone(),
             hot_archive_restored_keys: std::collections::HashSet::new(),
             invariant_manager: None,
+            soroban_resource_limits: None,
         }
     }
 
@@ -780,6 +801,7 @@ impl TransactionExecutor {
         self.ledger_flags = params.ledger_flags;
         self.soroban_config = params.soroban_config;
         self.frozen_key_config = params.frozen_key_config;
+        self.soroban_resource_limits = params.soroban_resource_limits;
         self.state.set_ledger_seq(params.ledger_seq);
         // Clear cached entries except offers and offer index
         self.state.clear_cached_entries_preserving_offers();
@@ -4484,6 +4506,7 @@ mod tests {
             soroban_config: SorobanConfig::default(),
             frozen_key_config: henyey_tx::frozen_keys::FrozenKeyConfig::default(),
             ledger_flags: 0,
+            soroban_resource_limits: None,
         });
         assert!(
             executor.hot_archive_restored_keys().is_empty(),

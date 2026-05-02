@@ -8120,6 +8120,16 @@ mod advance_tracking_slot_tests {
             ledger_max_dependent_tx_clusters: 4,
             ledger_max_tx_size_bytes: 1_000_000,
             ledger_max_tx_count: 100,
+            // Per-TX limits needed for resource validation
+            tx_max_instructions: 100_000_000,
+            tx_max_read_bytes: 200_000,
+            tx_max_write_bytes: 130_000,
+            tx_max_read_ledger_entries: 40,
+            tx_max_write_ledger_entries: 25,
+            tx_max_size_bytes: 130_000,
+            tx_max_footprint_entries: 60,
+            max_contract_size: 64_000,
+            max_contract_data_key_size: 250,
             ..Default::default()
         }
     }

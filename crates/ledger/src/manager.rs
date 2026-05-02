@@ -3732,6 +3732,12 @@ impl LedgerCloseContext<'_> {
         // Load frozen key configuration (CAP-77, Protocol 26+).
         let frozen_key_config =
             crate::execution::load_frozen_key_config(&self.ltx, self.prev_header.ledger_version)?;
+        // Derive per-TX Soroban resource limits from the cached SorobanNetworkInfo.
+        let soroban_resource_limits = self
+            .manager
+            .soroban_network_info()
+            .as_ref()
+            .map(henyey_tx::SorobanResourceLimits::from);
         // Use transaction set hash as base PRNG seed for Soroban execution
         let soroban_base_prng_seed = prepared.hash;
         let classic_events = ClassicEventConfig {
@@ -3806,6 +3812,7 @@ impl LedgerCloseContext<'_> {
                     stellar_xdr::curr::LedgerHeaderExt::V0 => 0,
                     stellar_xdr::curr::LedgerHeaderExt::V1(ext) => ext.flags,
                 },
+                soroban_resource_limits: soroban_resource_limits.clone(),
             });
             // Update module cache and hot archive references (they may have changed)
             if let Some(cache) = module_cache {

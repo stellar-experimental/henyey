@@ -876,7 +876,7 @@ impl App {
     /// `check_soroban_resources` silently accepts any Soroban tx until the
     /// first ledger close seeds the limits.
     pub fn seed_validation_context(&self) {
-        use henyey_herder::SorobanTxLimits;
+        use henyey_tx::SorobanResourceLimits;
 
         let header = self.ledger_manager.current_header();
         if header.ledger_seq == 0 {
@@ -900,17 +900,19 @@ impl App {
 
         // Seed Soroban per-tx limits and dynamic resource limits from network config.
         if let Some(soroban_info) = self.soroban_network_info() {
-            self.herder.tx_queue().set_soroban_limits(SorobanTxLimits {
-                tx_max_instructions: soroban_info.tx_max_instructions as u64,
-                tx_max_read_bytes: soroban_info.tx_max_read_bytes as u64,
-                tx_max_write_bytes: soroban_info.tx_max_write_bytes as u64,
-                tx_max_read_ledger_entries: soroban_info.tx_max_read_ledger_entries as u64,
-                tx_max_write_ledger_entries: soroban_info.tx_max_write_ledger_entries as u64,
-                tx_max_size_bytes: soroban_info.tx_max_size_bytes as u64,
-            });
             self.herder
                 .tx_queue()
-                .set_max_contract_size(soroban_info.max_contract_size);
+                .set_soroban_config(SorobanResourceLimits {
+                    tx_max_instructions: soroban_info.tx_max_instructions as u64,
+                    tx_max_read_bytes: soroban_info.tx_max_read_bytes as u64,
+                    tx_max_write_bytes: soroban_info.tx_max_write_bytes as u64,
+                    tx_max_read_ledger_entries: soroban_info.tx_max_read_ledger_entries as u64,
+                    tx_max_write_ledger_entries: soroban_info.tx_max_write_ledger_entries as u64,
+                    tx_max_size_bytes: soroban_info.tx_max_size_bytes as u64,
+                    tx_max_footprint_entries: soroban_info.tx_max_footprint_entries as u64,
+                    max_contract_size_bytes: soroban_info.max_contract_size,
+                    max_contract_data_key_size_bytes: soroban_info.max_contract_data_key_size,
+                });
             self.update_herder_soroban_limits(&soroban_info);
             tracing::info!(
                 ledger_seq = header.ledger_seq,
@@ -2375,7 +2377,9 @@ impl App {
             let base_reserve = result_header.base_reserve;
             let protocol_version = result_header.ledger_version;
 
-            let max_contract_size_bytes = soroban_info.as_ref().map(|info| info.max_contract_size);
+            let soroban_resource_limits = soroban_info
+                .as_ref()
+                .map(henyey_tx::SorobanResourceLimits::from);
             let (queue_limit, selection_limit) = match soroban_info.as_ref() {
                 Some(info) => {
                     let m = POOL_LEDGER_MULTIPLIER as i64;
@@ -2482,7 +2486,7 @@ impl App {
                     protocol_version,
                     network_id,
                     ledger_flags,
-                    max_contract_size_bytes,
+                    soroban_resource_limits: soroban_resource_limits.clone(),
                 };
                 // Build ONE snapshot for the whole re-validation pass.
                 //

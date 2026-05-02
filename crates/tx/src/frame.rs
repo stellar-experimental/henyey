@@ -594,6 +594,11 @@ impl TransactionFrame {
             .any(|op| matches!(op.body, OperationBody::RestoreFootprint(_)))
     }
 
+    /// Returns true if this is a Soroban RestoreFootprint transaction.
+    pub fn is_restore_footprint(&self) -> bool {
+        self.is_restore_footprint_tx()
+    }
+
     /// Return the resource footprint used for surge pricing and limits.
     ///
     /// Delegates to [`crate::envelope_utils::resources_from_envelope`].

@@ -153,8 +153,8 @@ pub use scp_driver::{
 };
 pub use state::HerderState;
 pub use tx_queue::{
-    BroadcastBudget, BroadcastCandidate, BroadcastVisitResult, QueuedTransaction, SorobanTxLimits,
-    TransactionQueue, TransactionSet, TxQueueConfig, TxQueueResult, TxQueueStats, TxSetBody,
+    BroadcastBudget, BroadcastCandidate, BroadcastVisitResult, QueuedTransaction, TransactionQueue,
+    TransactionSet, TxQueueConfig, TxQueueResult, TxQueueStats, TxSetBody,
 };
 
 // Persistence
