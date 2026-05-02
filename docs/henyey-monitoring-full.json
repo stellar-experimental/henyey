@@ -687,11 +687,16 @@
     },
     {
       "id": 51,
-      "type": "text",
-      "title": "Byte Read/Write Rate — Coming in Stage F",
-      "description": "Panels 77-80 of 10334. Byte counters.",
+      "type": "timeseries",
+      "title": "Byte Read/Write Rate",
+      "description": "Wire-level bytes per second read from / written to peers (XDR-encoded AuthenticatedMessage size). Panels 77-78 of 10334.",
       "gridPos": {"h": 6, "w": 6, "x": 0, "y": 95},
-      "options": {"mode": "markdown", "content": "**Coming in Stage F** — `stellar_overlay_byte_{read,write}_total` and async I/O counters."}
+      "datasource": {"type": "prometheus", "uid": "000000001"},
+      "targets": [
+        {"expr": "rate(stellar_overlay_byte_read_total{instance=~\"$instance\"}[5m])", "legendFormat": "read"},
+        {"expr": "rate(stellar_overlay_byte_write_total{instance=~\"$instance\"}[5m])", "legendFormat": "write"}
+      ],
+      "fieldConfig": {"defaults": {"unit": "Bps"}}
     },
     {
       "id": 52,
@@ -772,10 +777,72 @@
     {
       "id": 59,
       "type": "text",
-      "title": "Fetch/Flood/Item Fetcher/Send Counters — Coming in Stage F",
-      "description": "Panels 88-99 of 10334.",
+      "title": "Fetch/Flood/Item Fetcher/Send Counters — Coming in Stage F.2/F.3",
+      "description": "Panels 88-94 and 97-99 of 10334.",
       "gridPos": {"h": 6, "w": 12, "x": 0, "y": 107},
-      "options": {"mode": "markdown", "content": "**Coming in Stage F** — Overlay counters:\n- `stellar_overlay_fetch_{duplicate,unique}_recv_total`\n- `stellar_overlay_flood_{broadcast,duplicate_recv,unique_recv}_total`\n- `stellar_overlay_item_fetcher_next_peer_total`\n- `stellar_overlay_memory_flood_known`\n- `stellar_overlay_send_total{type=...}` (14 message types)\n- `stellar_overlay_{inbound,outbound}_{attempt,drop,establish,reject}_total`"}
+      "options": {"mode": "markdown", "content": "**Coming in Stage F.2/F.3** — Remaining overlay counters:\n- `stellar_overlay_fetch_{duplicate,unique}_recv_total`\n- `stellar_overlay_flood_{broadcast,duplicate_recv,unique_recv}_total`\n- `stellar_overlay_item_fetcher_next_peer_total`\n- `stellar_overlay_memory_flood_known`\n- `stellar_overlay_send_total{type=...}` (per-message-type counter)\n\n**Shipped in Stage F.1**: byte rate, async I/O rate, and connection lifecycle (rows below)."}
+    },
+    {
+      "id": 113,
+      "type": "timeseries",
+      "title": "Async I/O Rate (Reads/Writes per second)",
+      "description": "Successful per-frame send/recv I/O operations. Mirrors stellar-core mAsyncRead/mAsyncWrite. Panels 79-80 of 10334.",
+      "gridPos": {"h": 6, "w": 12, "x": 0, "y": 113},
+      "datasource": {"type": "prometheus", "uid": "000000001"},
+      "targets": [
+        {"expr": "rate(stellar_overlay_async_read_total{instance=~\"$instance\"}[5m])", "legendFormat": "async_read"},
+        {"expr": "rate(stellar_overlay_async_write_total{instance=~\"$instance\"}[5m])", "legendFormat": "async_write"}
+      ],
+      "fieldConfig": {"defaults": {"unit": "ops"}}
+    },
+    {
+      "id": 114,
+      "type": "timeseries",
+      "title": "Inbound Connection Lifecycle Rate",
+      "description": "Inbound connection events per second: TCP accepts, full establishments, drops, and rejections. Panels 97-98 of 10334.",
+      "gridPos": {"h": 6, "w": 12, "x": 12, "y": 113},
+      "datasource": {"type": "prometheus", "uid": "000000001"},
+      "targets": [
+        {"expr": "rate(stellar_overlay_inbound_attempt_total{instance=~\"$instance\"}[5m])", "legendFormat": "attempt"},
+        {"expr": "rate(stellar_overlay_inbound_establish_total{instance=~\"$instance\"}[5m])", "legendFormat": "establish"},
+        {"expr": "rate(stellar_overlay_inbound_drop_total{instance=~\"$instance\"}[5m])", "legendFormat": "drop"},
+        {"expr": "rate(stellar_overlay_inbound_reject_total{instance=~\"$instance\"}[5m])", "legendFormat": "reject"}
+      ],
+      "fieldConfig": {"defaults": {"unit": "ops"}}
+    },
+    {
+      "id": 115,
+      "type": "timeseries",
+      "title": "Outbound Connection Lifecycle Rate",
+      "description": "Outbound connection events per second: dial attempts, full establishments, drops, and rejections. Panels 97-98 of 10334.",
+      "gridPos": {"h": 6, "w": 12, "x": 0, "y": 119},
+      "datasource": {"type": "prometheus", "uid": "000000001"},
+      "targets": [
+        {"expr": "rate(stellar_overlay_outbound_attempt_total{instance=~\"$instance\"}[5m])", "legendFormat": "attempt"},
+        {"expr": "rate(stellar_overlay_outbound_establish_total{instance=~\"$instance\"}[5m])", "legendFormat": "establish"},
+        {"expr": "rate(stellar_overlay_outbound_drop_total{instance=~\"$instance\"}[5m])", "legendFormat": "drop"},
+        {"expr": "rate(stellar_overlay_outbound_reject_total{instance=~\"$instance\"}[5m])", "legendFormat": "reject"}
+      ],
+      "fieldConfig": {"defaults": {"unit": "ops"}}
+    },
+    {
+      "id": 116,
+      "type": "stat",
+      "title": "Connection Lifecycle Totals (cumulative)",
+      "description": "Cumulative attempt/establish/drop/reject counts since process start. Useful for spotting churn or runaway-rejection patterns.",
+      "gridPos": {"h": 6, "w": 12, "x": 12, "y": 119},
+      "datasource": {"type": "prometheus", "uid": "000000001"},
+      "targets": [
+        {"expr": "stellar_overlay_inbound_attempt_total{instance=~\"$instance\"}", "legendFormat": "in attempt"},
+        {"expr": "stellar_overlay_inbound_establish_total{instance=~\"$instance\"}", "legendFormat": "in establish"},
+        {"expr": "stellar_overlay_inbound_reject_total{instance=~\"$instance\"}", "legendFormat": "in reject"},
+        {"expr": "stellar_overlay_inbound_drop_total{instance=~\"$instance\"}", "legendFormat": "in drop"},
+        {"expr": "stellar_overlay_outbound_attempt_total{instance=~\"$instance\"}", "legendFormat": "out attempt"},
+        {"expr": "stellar_overlay_outbound_establish_total{instance=~\"$instance\"}", "legendFormat": "out establish"},
+        {"expr": "stellar_overlay_outbound_reject_total{instance=~\"$instance\"}", "legendFormat": "out reject"},
+        {"expr": "stellar_overlay_outbound_drop_total{instance=~\"$instance\"}", "legendFormat": "out drop"}
+      ],
+      "fieldConfig": {"defaults": {"unit": "short"}}
     },
     {
       "id": 60,

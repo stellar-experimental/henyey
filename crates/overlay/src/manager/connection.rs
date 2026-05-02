@@ -235,12 +235,14 @@ impl OverlayManager {
         let peer_id = peer.id().clone();
         if shared.banned_peers.read().contains(&peer_id) {
             warn!("Rejected banned peer {}", peer_id);
+            shared.metrics.inbound_reject.inc();
             peer.close().await;
             pool.release_pending();
             return;
         }
         if shared.peers.contains_key(&peer_id) {
             debug!("Rejected duplicate inbound peer {}", peer_id);
+            shared.metrics.inbound_reject.inc();
             peer.close().await;
             shared.pending_connections.release_peer_id(&peer_id);
             pool.release_pending();
@@ -267,6 +269,7 @@ impl OverlayManager {
                 "Inbound authenticated peer {} rejected because {}",
                 peer_id, reason
             );
+            shared.metrics.inbound_reject.inc();
             Self::reject_authenticated_load(&mut peer, &shared).await;
             shared.pending_connections.release_peer_id(&peer_id);
             pool.release_pending();
@@ -287,6 +290,7 @@ impl OverlayManager {
                 Ok(result) => result,
                 Err(_) => {
                     debug!("Rejected duplicate inbound peer {} (race)", peer_id);
+                    shared.metrics.inbound_reject.inc();
                     peer.close().await;
                     shared.pending_connections.release_peer_id(&peer_id);
                     pool.release_authenticated();
@@ -296,6 +300,7 @@ impl OverlayManager {
 
         // Successfully registered — release the pending reservation.
         shared.pending_connections.release_peer_id(&peer_id);
+        shared.metrics.inbound_establish.inc();
 
         Self::run_peer_loop(
             peer_id.clone(),
@@ -306,6 +311,7 @@ impl OverlayManager {
         )
         .await;
 
+        shared.metrics.inbound_drop.inc();
         shared.cleanup_peer(&peer_id);
         pool.release_authenticated();
     }
@@ -331,6 +337,10 @@ impl OverlayManager {
                     result = listener.accept() => {
                         match result {
                             Ok(connection) => {
+                                // Count every TCP-accepted inbound connection. Even
+                                // connections we immediately reject (pool full, handshake
+                                // failure) are real "attempts" from a wire perspective.
+                                shared.metrics.inbound_attempt.inc();
                                 let peer_ip = connection.remote_addr().ip();
                                 // Reserve a pending slot. We allow the handshake to proceed
                                 // even when authenticated slots are full — the actual
@@ -340,6 +350,7 @@ impl OverlayManager {
                                 // handshake and sends PEERS before rejecting with ERR_LOAD.
                                 if !pool.try_reserve_with_ip(Some(peer_ip)) {
                                     warn!("Inbound peer limit reached, rejecting connection from {}", peer_ip);
+                                    shared.metrics.inbound_reject.inc();
                                     continue;
                                 }
 
@@ -355,12 +366,13 @@ impl OverlayManager {
                                     let initial_byte_grant = shared.flow_control_bytes_config.bytes_total(
                                         shared.max_tx_size_bytes.load(Ordering::Relaxed),
                                     );
-                                    match Peer::accept(connection, local_node, auth_timeout, Arc::clone(&shared.banned_peers), pending_peer_ids, initial_byte_grant).await {
+                                    match Peer::accept(connection, local_node, auth_timeout, Arc::clone(&shared.banned_peers), pending_peer_ids, initial_byte_grant, Arc::clone(&shared.metrics)).await {
                                         Ok(peer) => {
                                             Self::handle_accepted_inbound_peer(peer, shared, pool, initial_byte_grant).await;
                                         }
                                         Err(e) => {
                                             debug!("Failed to accept peer: {}", e);
+                                            shared.metrics.inbound_reject.inc();
                                             shared.send_peer_event(PeerEvent::Failed(
                                                 PeerAddress::from(remote_addr),
                                                 PeerType::Inbound,
@@ -404,6 +416,12 @@ impl OverlayManager {
         shared: SharedPeerState,
         connection_factory: Arc<dyn ConnectionFactory>,
     ) {
+        // Count this dial as an outbound attempt: a TCP connect is about to
+        // happen. Caller-side skips (e.g., `add_peer` returning early because
+        // the pool is full before dialing) are NOT counted as attempts —
+        // those are tracked via the pool's pending count, not lifecycle.
+        shared.metrics.outbound_attempt.inc();
+
         // Reserve address slot to prevent duplicate outbound dials.
         let addr_key = format!("{}:{}", addr.host, addr.port);
         if !shared
@@ -414,6 +432,7 @@ impl OverlayManager {
                 "Rejected discovered peer {} — connection already in flight",
                 addr
             );
+            shared.metrics.outbound_reject.inc();
             pool.release_pending();
             return;
         }
@@ -425,6 +444,7 @@ impl OverlayManager {
             Ok(c) => c,
             Err(e) => {
                 debug!("Failed to connect to discovered peer {}: {}", addr, e);
+                shared.metrics.outbound_reject.inc();
                 shared
                     .send_peer_event(PeerEvent::Failed(addr.clone(), PeerType::Outbound))
                     .await;
@@ -448,12 +468,14 @@ impl OverlayManager {
             timeouts.auth_secs,
             pending_peer_ids,
             initial_byte_grant,
+            Arc::clone(&shared.metrics),
         )
         .await
         {
             Ok(p) => p,
             Err(e) => {
                 debug!("Failed to connect to discovered peer {}: {}", addr, e);
+                shared.metrics.outbound_reject.inc();
                 shared
                     .send_peer_event(PeerEvent::Failed(addr.clone(), PeerType::Outbound))
                     .await;
@@ -470,6 +492,7 @@ impl OverlayManager {
         // Reject banned peers (mirrors connect_outbound_inner).
         if shared.banned_peers.read().contains(&peer_id) {
             debug!("Rejected banned discovered peer {} at {}", peer_id, addr);
+            shared.metrics.outbound_reject.inc();
             peer.close().await;
             shared.pending_connections.release_peer_id(&peer_id);
             pool.release_pending();
@@ -479,6 +502,7 @@ impl OverlayManager {
         // Reject peers we're already connected to (mirrors connect_outbound_inner).
         if shared.peers.contains_key(&peer_id) {
             debug!("Rejected duplicate discovered peer {} at {}", peer_id, addr);
+            shared.metrics.outbound_reject.inc();
             peer.close().await;
             shared.pending_connections.release_peer_id(&peer_id);
             pool.release_pending();
@@ -496,6 +520,7 @@ impl OverlayManager {
                 "Outbound discovered peer {} rejected because {}",
                 peer_id, reason
             );
+            shared.metrics.outbound_reject.inc();
             Self::reject_authenticated_load(&mut peer, &shared).await;
             shared.pending_connections.release_peer_id(&peer_id);
             pool.release_pending();
@@ -508,6 +533,7 @@ impl OverlayManager {
                 Ok(result) => result,
                 Err(_) => {
                     debug!("Rejected duplicate discovered peer {} (race)", peer_id);
+                    shared.metrics.outbound_reject.inc();
                     peer.close().await;
                     shared.pending_connections.release_peer_id(&peer_id);
                     pool.release_authenticated();
@@ -516,6 +542,7 @@ impl OverlayManager {
             };
 
         shared.pending_connections.release_peer_id(&peer_id);
+        shared.metrics.outbound_establish.inc();
         shared
             .send_peer_event(PeerEvent::Connected(addr.clone(), PeerType::Outbound))
             .await;
@@ -531,6 +558,7 @@ impl OverlayManager {
         )
         .await;
 
+        shared.metrics.outbound_drop.inc();
         shared.cleanup_peer(&peer_id);
         pool.release_authenticated();
     }
@@ -641,12 +669,17 @@ pub(super) async fn connect_to_explicit_peer(
     shared: SharedPeerState,
     connection_factory: Arc<dyn ConnectionFactory>,
 ) -> Result<PeerId> {
+    // Count this dial as an outbound attempt: a TCP connect is about to happen.
+    // See `connect_to_discovered_peer` for the matching contract.
+    shared.metrics.outbound_attempt.inc();
+
     // Reserve address slot to prevent duplicate outbound dials.
     let addr_key = format!("{}:{}", addr.host, addr.port);
     if !shared
         .pending_connections
         .try_reserve_address(addr_key.clone())
     {
+        shared.metrics.outbound_reject.inc();
         pool.release_pending();
         return Err(OverlayError::Internal(format!(
             "connection to {} already in flight",
@@ -660,6 +693,7 @@ pub(super) async fn connect_to_explicit_peer(
     {
         Ok(connection) => connection,
         Err(e) => {
+            shared.metrics.outbound_reject.inc();
             shared.pending_connections.release_address(&addr_key);
             pool.release_pending();
             shared
@@ -683,11 +717,13 @@ pub(super) async fn connect_to_explicit_peer(
         timeouts.auth_secs,
         pending_peer_ids,
         initial_byte_grant,
+        Arc::clone(&shared.metrics),
     )
     .await
     {
         Ok(peer) => peer,
         Err(e) => {
+            shared.metrics.outbound_reject.inc();
             shared.pending_connections.release_address(&addr_key);
             pool.release_pending();
             shared
@@ -702,12 +738,14 @@ pub(super) async fn connect_to_explicit_peer(
     shared.pending_connections.release_address(&addr_key);
 
     if shared.banned_peers.read().contains(&peer_id) {
+        shared.metrics.outbound_reject.inc();
         peer.close().await;
         pool.release_pending();
         return Err(OverlayError::PeerBanned(peer_id.to_string()));
     }
 
     if shared.peers.contains_key(&peer_id) {
+        shared.metrics.outbound_reject.inc();
         peer.close().await;
         shared.pending_connections.release_peer_id(&peer_id);
         pool.release_pending();
@@ -722,6 +760,7 @@ pub(super) async fn connect_to_explicit_peer(
             "all available slots are taken"
         };
         info!("Outbound peer {} rejected because {}", peer_id, reason);
+        shared.metrics.outbound_reject.inc();
         OverlayManager::reject_authenticated_load(&mut peer, &shared).await;
         shared.pending_connections.release_peer_id(&peer_id);
         pool.release_pending();
@@ -741,6 +780,7 @@ pub(super) async fn connect_to_explicit_peer(
         Ok(result) => result,
         Err(e) => {
             debug!("Rejected duplicate peer {} (race)", peer_id);
+            shared.metrics.outbound_reject.inc();
             peer.close().await;
             shared.pending_connections.release_peer_id(&peer_id);
             pool.release_authenticated();
@@ -749,6 +789,7 @@ pub(super) async fn connect_to_explicit_peer(
     };
 
     shared.pending_connections.release_peer_id(&peer_id);
+    shared.metrics.outbound_establish.inc();
     shared
         .send_peer_event(PeerEvent::Connected(addr.clone(), PeerType::Outbound))
         .await;
@@ -771,6 +812,7 @@ pub(super) async fn connect_to_explicit_peer(
             shared_clone.clone(),
         )
         .await;
+        shared_clone.metrics.outbound_drop.inc();
         shared_clone.cleanup_peer(&peer_id_clone);
         pool_clone.release_authenticated();
     });
@@ -922,6 +964,22 @@ mod tests {
             "pending address reservation not cleared"
         );
 
+        // Stage F.1: outbound_attempt was counted at function entry, and
+        // outbound_reject was counted on the handshake failure. No establish
+        // or drop because the peer never registered.
+        assert_eq!(
+            shared.metrics.outbound_attempt.get(),
+            1,
+            "outbound_attempt should fire once per connect_to_explicit_peer call"
+        );
+        assert_eq!(
+            shared.metrics.outbound_reject.get(),
+            1,
+            "outbound_reject should fire on handshake timeout"
+        );
+        assert_eq!(shared.metrics.outbound_establish.get(), 0);
+        assert_eq!(shared.metrics.outbound_drop.get(), 0);
+
         // Verify PeerEvent::Failed was emitted.
         let event = peer_event_rx
             .try_recv()
@@ -988,6 +1046,13 @@ mod tests {
             "pending address reservation not cleared"
         );
 
+        // Stage F.1: TCP connect failure path also goes through
+        // outbound_attempt + outbound_reject.
+        assert_eq!(shared.metrics.outbound_attempt.get(), 1);
+        assert_eq!(shared.metrics.outbound_reject.get(), 1);
+        assert_eq!(shared.metrics.outbound_establish.get(), 0);
+        assert_eq!(shared.metrics.outbound_drop.get(), 0);
+
         let event = peer_event_rx
             .try_recv()
             .expect("expected PeerEvent::Failed");
@@ -1049,6 +1114,13 @@ mod tests {
             "pending address reservation not cleared"
         );
 
+        // Stage F.1: discovered-peer path also bumps outbound_attempt +
+        // outbound_reject on handshake failure.
+        assert_eq!(shared.metrics.outbound_attempt.get(), 1);
+        assert_eq!(shared.metrics.outbound_reject.get(), 1);
+        assert_eq!(shared.metrics.outbound_establish.get(), 0);
+        assert_eq!(shared.metrics.outbound_drop.get(), 0);
+
         // Verify PeerEvent::Failed was emitted.
         let event = peer_event_rx
             .try_recv()
@@ -1057,5 +1129,113 @@ mod tests {
             matches!(event, PeerEvent::Failed(_, PeerType::Outbound)),
             "expected Failed(_, Outbound), got: {event:?}"
         );
+    }
+
+    /// Verify that a successful end-to-end connection between two managers
+    /// produces matching `outbound_establish` (initiator) and
+    /// `inbound_establish` (acceptor) increments, plus matching `*_drop`
+    /// counts after teardown.
+    ///
+    /// This is the success-path counterpart to the timeout/reject tests above.
+    #[tokio::test]
+    async fn test_connection_lifecycle_counters_on_handshake_success() {
+        use crate::loopback::LoopbackConnectionFactory;
+        use crate::OverlayConfig;
+
+        let factory = Arc::new(LoopbackConnectionFactory::default());
+
+        // Two managers wired up via the loopback connection factory.
+        let mut config_a = OverlayConfig::testnet();
+        config_a.listen_port = 11625;
+        config_a.listen_enabled = true;
+        config_a.known_peers.clear();
+        config_a.connect_timeout_secs = 1;
+
+        let mut config_b = OverlayConfig::testnet();
+        config_b.listen_port = 11626;
+        config_b.listen_enabled = true;
+        config_b.known_peers.clear();
+        config_b.connect_timeout_secs = 1;
+
+        let local_a = LocalNode::new_testnet(SecretKey::generate());
+        let local_b = LocalNode::new_testnet(SecretKey::generate());
+
+        let mut manager_a = super::super::OverlayManager::new_with_connection_factory(
+            config_a,
+            local_a,
+            Arc::clone(&factory) as Arc<dyn ConnectionFactory>,
+        )
+        .unwrap();
+        let mut manager_b = super::super::OverlayManager::new_with_connection_factory(
+            config_b,
+            local_b,
+            factory as Arc<dyn ConnectionFactory>,
+        )
+        .unwrap();
+
+        manager_a.start().await.expect("start a");
+        manager_b.start().await.expect("start b");
+
+        let metrics_a = Arc::clone(&manager_a.shared_state().metrics);
+        let metrics_b = Arc::clone(&manager_b.shared_state().metrics);
+
+        // A dials B.
+        let addr_b = PeerAddress::new("127.0.0.1", 11626);
+        manager_a.connect(&addr_b).await.expect("connect");
+
+        // Wait for the handshake on both sides. The loopback duplex completes
+        // both within ~50ms; poll up to ~2s.
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            if metrics_a.outbound_establish.get() >= 1 && metrics_b.inbound_establish.get() >= 1 {
+                break;
+            }
+            if std::time::Instant::now() > deadline {
+                panic!(
+                    "lifecycle counters did not reach establish: \
+                     A: outbound_attempt={}, outbound_establish={}, outbound_reject={}; \
+                     B: inbound_attempt={}, inbound_establish={}, inbound_reject={}",
+                    metrics_a.outbound_attempt.get(),
+                    metrics_a.outbound_establish.get(),
+                    metrics_a.outbound_reject.get(),
+                    metrics_b.inbound_attempt.get(),
+                    metrics_b.inbound_establish.get(),
+                    metrics_b.inbound_reject.get(),
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        // Initiator side: exactly one outbound attempt + one establish, no reject.
+        assert_eq!(metrics_a.outbound_attempt.get(), 1, "outbound_attempt");
+        assert_eq!(metrics_a.outbound_establish.get(), 1, "outbound_establish");
+        assert_eq!(metrics_a.outbound_reject.get(), 0, "outbound_reject");
+
+        // Acceptor side: exactly one inbound attempt + one establish, no reject.
+        assert_eq!(metrics_b.inbound_attempt.get(), 1, "inbound_attempt");
+        assert_eq!(metrics_b.inbound_establish.get(), 1, "inbound_establish");
+        assert_eq!(metrics_b.inbound_reject.get(), 0, "inbound_reject");
+
+        // Tear down and verify drop counters match establish counters.
+        manager_a.shutdown().await.expect("shutdown a");
+        manager_b.shutdown().await.expect("shutdown b");
+
+        let drop_deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            if metrics_a.outbound_drop.get() >= 1 && metrics_b.inbound_drop.get() >= 1 {
+                break;
+            }
+            if std::time::Instant::now() > drop_deadline {
+                panic!(
+                    "drop counters did not reach 1: \
+                     outbound_drop={}, inbound_drop={}",
+                    metrics_a.outbound_drop.get(),
+                    metrics_b.inbound_drop.get()
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(metrics_a.outbound_drop.get(), 1);
+        assert_eq!(metrics_b.inbound_drop.get(), 1);
     }
 }

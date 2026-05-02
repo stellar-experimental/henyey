@@ -72,6 +72,18 @@ Metrics with the `stellar_` prefix that directly mirror stellar-core Medida coun
 | `OVERLAY_OUTBOUND_AUTHENTICATED` | `stellar_overlay_outbound_authenticated` | gauge | Authenticated outbound peer count |
 | `OVERLAY_INBOUND_PENDING` | `stellar_overlay_inbound_pending` | gauge | Pending inbound connections |
 | `OVERLAY_OUTBOUND_PENDING` | `stellar_overlay_outbound_pending` | gauge | Pending outbound connections |
+| `OVERLAY_BYTE_READ_TOTAL` | `stellar_overlay_byte_read_total` | counter | `OverlayManagerImpl::mByteRead` — wire-level bytes read from peers (XDR-encoded `AuthenticatedMessage` size, excludes 4-byte length header). |
+| `OVERLAY_BYTE_WRITE_TOTAL` | `stellar_overlay_byte_write_total` | counter | `OverlayManagerImpl::mByteWrite` — wire-level bytes written to peers (same encoding as read side). |
+| `OVERLAY_ASYNC_READ_TOTAL` | `stellar_overlay_async_read_total` | counter | `OverlayManagerImpl::mAsyncRead` — successful per-frame recv I/O operations. |
+| `OVERLAY_ASYNC_WRITE_TOTAL` | `stellar_overlay_async_write_total` | counter | `OverlayManagerImpl::mAsyncWrite` — successful per-frame send I/O operations. |
+| `OVERLAY_INBOUND_ATTEMPT_TOTAL` | `stellar_overlay_inbound_attempt_total` | counter | Henyey-specific — TCP `listener.accept()` Ok events. |
+| `OVERLAY_INBOUND_ESTABLISH_TOTAL` | `stellar_overlay_inbound_establish_total` | counter | Henyey-specific — inbound peers fully registered after handshake. |
+| `OVERLAY_INBOUND_DROP_TOTAL` | `stellar_overlay_inbound_drop_total` | counter | Henyey-specific — inbound peer disconnections (`run_peer_loop` returned). |
+| `OVERLAY_INBOUND_REJECT_TOTAL` | `stellar_overlay_inbound_reject_total` | counter | Henyey-specific — inbound connections rejected before establishment (handshake fail, banned, duplicate, slots full). |
+| `OVERLAY_OUTBOUND_ATTEMPT_TOTAL` | `stellar_overlay_outbound_attempt_total` | counter | Henyey-specific — outbound dial initiated. |
+| `OVERLAY_OUTBOUND_ESTABLISH_TOTAL` | `stellar_overlay_outbound_establish_total` | counter | Henyey-specific — outbound peers fully registered after handshake. |
+| `OVERLAY_OUTBOUND_DROP_TOTAL` | `stellar_overlay_outbound_drop_total` | counter | Henyey-specific — outbound peer disconnections. |
+| `OVERLAY_OUTBOUND_REJECT_TOTAL` | `stellar_overlay_outbound_reject_total` | counter | Henyey-specific — outbound connections rejected before establishment (TCP fail, handshake fail, banned, duplicate, slots full). |
 | `BUCKET_MERGE_COMPLETED_TOTAL` | `stellar_bucket_merge_completed_total` | counter | `BucketManager::mMergesCompleted` |
 | `BUCKET_MERGE_TIME_US_TOTAL` | `stellar_bucket_merge_time_us_total` | counter | Cumulative merge time μs |
 | `BUCKET_MERGE_NEW_LIVE_TOTAL` | `stellar_bucket_merge_new_live_total` | counter | Live entries produced by merges |

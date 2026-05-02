@@ -433,6 +433,34 @@ metric_catalog! {
         OVERLAY_TIMEOUT_STRAGGLER_TOTAL = "stellar_overlay_timeout_straggler_total"
             => "Total peers dropped due to straggler timeout";
 
+        // Stage F.1: Overlay byte / async I/O counters (issue #2236).
+        OVERLAY_BYTE_READ_TOTAL = "stellar_overlay_byte_read_total"
+            => "Total bytes read from peers (XDR-encoded AuthenticatedMessage size, excluding 4-byte length header)";
+        OVERLAY_BYTE_WRITE_TOTAL = "stellar_overlay_byte_write_total"
+            => "Total bytes written to peers (XDR-encoded AuthenticatedMessage size, excluding 4-byte length header)";
+        OVERLAY_ASYNC_READ_TOTAL = "stellar_overlay_async_read_total"
+            => "Total successful recv I/O operations";
+        OVERLAY_ASYNC_WRITE_TOTAL = "stellar_overlay_async_write_total"
+            => "Total successful send I/O operations";
+
+        // Stage F.1: Overlay connection lifecycle counters (issue #2236).
+        OVERLAY_INBOUND_ATTEMPT_TOTAL = "stellar_overlay_inbound_attempt_total"
+            => "Total inbound connection accepts (TCP listener.accept() Ok)";
+        OVERLAY_INBOUND_ESTABLISH_TOTAL = "stellar_overlay_inbound_establish_total"
+            => "Total inbound peers fully established (registered after handshake)";
+        OVERLAY_INBOUND_DROP_TOTAL = "stellar_overlay_inbound_drop_total"
+            => "Total inbound peer disconnections (run_peer_loop returned)";
+        OVERLAY_INBOUND_REJECT_TOTAL = "stellar_overlay_inbound_reject_total"
+            => "Total inbound connections rejected before establishment";
+        OVERLAY_OUTBOUND_ATTEMPT_TOTAL = "stellar_overlay_outbound_attempt_total"
+            => "Total outbound connection attempts (dial initiated)";
+        OVERLAY_OUTBOUND_ESTABLISH_TOTAL = "stellar_overlay_outbound_establish_total"
+            => "Total outbound peers fully established (registered after handshake)";
+        OVERLAY_OUTBOUND_DROP_TOTAL = "stellar_overlay_outbound_drop_total"
+            => "Total outbound peer disconnections (run_peer_loop returned)";
+        OVERLAY_OUTBOUND_REJECT_TOTAL = "stellar_overlay_outbound_reject_total"
+            => "Total outbound connections rejected before establishment";
+
         // Herder pending envelope counters (Phase 2).
         HERDER_PENDING_ADDED_TOTAL = "stellar_herder_pending_added_total"
             => "Envelopes added to the pending pool";
@@ -707,6 +735,22 @@ pub(crate) async fn refresh_gauges(state: &ServerState) {
         counter!(OVERLAY_ERROR_WRITE_TOTAL).absolute(ov.errors_write);
         counter!(OVERLAY_TIMEOUT_IDLE_TOTAL).absolute(ov.timeouts_idle);
         counter!(OVERLAY_TIMEOUT_STRAGGLER_TOTAL).absolute(ov.timeouts_straggler);
+
+        // Stage F.1: byte / async I/O counters (issue #2236).
+        counter!(OVERLAY_BYTE_READ_TOTAL).absolute(ov.bytes_read);
+        counter!(OVERLAY_BYTE_WRITE_TOTAL).absolute(ov.bytes_written);
+        counter!(OVERLAY_ASYNC_READ_TOTAL).absolute(ov.async_read);
+        counter!(OVERLAY_ASYNC_WRITE_TOTAL).absolute(ov.async_write);
+
+        // Stage F.1: connection lifecycle counters (issue #2236).
+        counter!(OVERLAY_INBOUND_ATTEMPT_TOTAL).absolute(ov.inbound_attempt);
+        counter!(OVERLAY_INBOUND_ESTABLISH_TOTAL).absolute(ov.inbound_establish);
+        counter!(OVERLAY_INBOUND_DROP_TOTAL).absolute(ov.inbound_drop);
+        counter!(OVERLAY_INBOUND_REJECT_TOTAL).absolute(ov.inbound_reject);
+        counter!(OVERLAY_OUTBOUND_ATTEMPT_TOTAL).absolute(ov.outbound_attempt);
+        counter!(OVERLAY_OUTBOUND_ESTABLISH_TOTAL).absolute(ov.outbound_establish);
+        counter!(OVERLAY_OUTBOUND_DROP_TOTAL).absolute(ov.outbound_drop);
+        counter!(OVERLAY_OUTBOUND_REJECT_TOTAL).absolute(ov.outbound_reject);
     }
 
     // Ledger close stats (Phase 2).
@@ -1201,10 +1245,11 @@ mod tests {
         register_label_series();
         let output = handle.render();
 
+        // Note: stellar_overlay_byte_read_total and stellar_overlay_byte_write_total
+        // were re-added in Stage F.1 (issue #2236) with proper instrumentation in the
+        // peer send/recv paths. They are no longer absent.
         let removed = [
             "stellar_overlay_message_drop_total",
-            "stellar_overlay_byte_read_total",
-            "stellar_overlay_byte_write_total",
             "stellar_overlay_pending_peers",
             "stellar_overlay_authenticated_peers",
             "stellar_overlay_flood_demanded_total",
@@ -1254,6 +1299,65 @@ mod tests {
             .chain(ALL_HISTOGRAM_NAMES.iter());
         for name in all_names {
             assert!(seen.insert(name), "duplicate metric name: {}", name);
+        }
+    }
+
+    #[test]
+    fn test_stage_f1_overlay_byte_async_counters_in_catalog() {
+        // Stage F.1 (issue #2236): byte / async I/O counters and connection
+        // lifecycle counters must all be in the pre-registered counter catalog
+        // so they appear at 0 on the very first scrape.
+        let counter_names: HashSet<&str> = ALL_COUNTER_NAMES.iter().copied().collect();
+        for expected in &[
+            "stellar_overlay_byte_read_total",
+            "stellar_overlay_byte_write_total",
+            "stellar_overlay_async_read_total",
+            "stellar_overlay_async_write_total",
+            "stellar_overlay_inbound_attempt_total",
+            "stellar_overlay_inbound_establish_total",
+            "stellar_overlay_inbound_drop_total",
+            "stellar_overlay_inbound_reject_total",
+            "stellar_overlay_outbound_attempt_total",
+            "stellar_overlay_outbound_establish_total",
+            "stellar_overlay_outbound_drop_total",
+            "stellar_overlay_outbound_reject_total",
+        ] {
+            assert!(
+                counter_names.contains(expected),
+                "Stage F.1 counter {} missing from catalog",
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn test_stage_f1_overlay_counters_preregistered_at_zero() {
+        // Stage F.1 counters must be visible on the very first scrape with a
+        // 0 value so dashboard panels render even before any peer traffic.
+        let handle = ensure_test_recorder();
+        describe_metrics();
+        register_label_series();
+        let output = handle.render();
+
+        for name in &[
+            "stellar_overlay_byte_read_total",
+            "stellar_overlay_byte_write_total",
+            "stellar_overlay_async_read_total",
+            "stellar_overlay_async_write_total",
+            "stellar_overlay_inbound_attempt_total",
+            "stellar_overlay_inbound_establish_total",
+            "stellar_overlay_inbound_drop_total",
+            "stellar_overlay_inbound_reject_total",
+            "stellar_overlay_outbound_attempt_total",
+            "stellar_overlay_outbound_establish_total",
+            "stellar_overlay_outbound_drop_total",
+            "stellar_overlay_outbound_reject_total",
+        ] {
+            assert!(
+                output.contains(&format!("{} 0", name)),
+                "Stage F.1 counter {} should be pre-registered at 0",
+                name
+            );
         }
     }
 

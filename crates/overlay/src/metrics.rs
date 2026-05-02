@@ -251,10 +251,47 @@ pub struct OverlayMetrics {
     pub messages_broadcast: Counter,
 
     // ===== Byte Metrics =====
-    /// Bytes read from peers.
+    /// Bytes read from peers (wire-level: `AuthenticatedMessage` XDR body, excluding the
+    /// 4-byte length header). Matches stellar-core `mByteRead`.
     pub bytes_read: Counter,
-    /// Bytes written to peers.
+    /// Bytes written to peers (wire-level: `AuthenticatedMessage` XDR body, excluding
+    /// the 4-byte length header). Matches stellar-core `mByteWrite`.
     pub bytes_written: Counter,
+
+    // ===== Async I/O Metrics =====
+    /// Successful recv I/O operations (each `Connection::recv*` returning a frame).
+    /// Matches stellar-core `mAsyncRead`.
+    pub async_read: Counter,
+    /// Successful send I/O operations (each `Connection::send` returning Ok).
+    /// Matches stellar-core `mAsyncWrite`.
+    pub async_write: Counter,
+
+    // ===== Connection Lifecycle Metrics =====
+    /// Inbound connection accepts: `listener.accept()` returning `Ok`.
+    /// Counts every TCP-accepted inbound connection, including those later rejected.
+    pub inbound_attempt: Counter,
+    /// Inbound connections that completed handshake and were fully registered as peers.
+    /// Incremented exactly once per inbound peer that reaches `register_peer` Ok.
+    pub inbound_establish: Counter,
+    /// Inbound peer disconnections: incremented after `run_peer_loop` returns for an
+    /// inbound peer (mirrors `inbound_establish`).
+    pub inbound_drop: Counter,
+    /// Inbound connections rejected at any point after accept but before establish
+    /// (handshake failure, banned, duplicate, slots full, register race).
+    pub inbound_reject: Counter,
+    /// Outbound connection attempts: a dial was initiated (entry to
+    /// `connect_to_discovered_peer` / `connect_to_explicit_peer`). Does NOT include
+    /// caller-side skips (e.g., `add_peer` returning early because the pool is full
+    /// before dialing) — those are not "attempts" in the wire sense.
+    pub outbound_attempt: Counter,
+    /// Outbound connections that completed handshake and were fully registered.
+    pub outbound_establish: Counter,
+    /// Outbound peer disconnections: incremented after `run_peer_loop` returns for an
+    /// outbound peer (mirrors `outbound_establish`).
+    pub outbound_drop: Counter,
+    /// Outbound connections rejected at any point after attempt but before establish
+    /// (TCP connect fail, handshake fail, banned, duplicate, slots full, register race).
+    pub outbound_reject: Counter,
 
     // ===== Error Metrics =====
     /// Read errors encountered.
@@ -426,6 +463,20 @@ impl OverlayMetrics {
             bytes_read: self.bytes_read.get(),
             bytes_written: self.bytes_written.get(),
 
+            // Async I/O metrics
+            async_read: self.async_read.get(),
+            async_write: self.async_write.get(),
+
+            // Connection lifecycle metrics
+            inbound_attempt: self.inbound_attempt.get(),
+            inbound_establish: self.inbound_establish.get(),
+            inbound_drop: self.inbound_drop.get(),
+            inbound_reject: self.inbound_reject.get(),
+            outbound_attempt: self.outbound_attempt.get(),
+            outbound_establish: self.outbound_establish.get(),
+            outbound_drop: self.outbound_drop.get(),
+            outbound_reject: self.outbound_reject.get(),
+
             // Error metrics
             errors_read: self.errors_read.get(),
             errors_write: self.errors_write.get(),
@@ -492,6 +543,16 @@ impl OverlayMetrics {
             &self.messages_broadcast,
             &self.bytes_read,
             &self.bytes_written,
+            &self.async_read,
+            &self.async_write,
+            &self.inbound_attempt,
+            &self.inbound_establish,
+            &self.inbound_drop,
+            &self.inbound_reject,
+            &self.outbound_attempt,
+            &self.outbound_establish,
+            &self.outbound_drop,
+            &self.outbound_reject,
             &self.errors_read,
             &self.errors_write,
             &self.timeouts_idle,
@@ -577,6 +638,20 @@ pub struct OverlayMetricsSnapshot {
     // Byte metrics
     pub bytes_read: u64,
     pub bytes_written: u64,
+
+    // Async I/O metrics
+    pub async_read: u64,
+    pub async_write: u64,
+
+    // Connection lifecycle metrics
+    pub inbound_attempt: u64,
+    pub inbound_establish: u64,
+    pub inbound_drop: u64,
+    pub inbound_reject: u64,
+    pub outbound_attempt: u64,
+    pub outbound_establish: u64,
+    pub outbound_drop: u64,
+    pub outbound_reject: u64,
 
     // Error metrics
     pub errors_read: u64,
