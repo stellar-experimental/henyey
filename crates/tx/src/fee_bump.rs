@@ -600,17 +600,25 @@ impl FeeBumpMutableTransactionResult {
 
     /// Finalize fee refund.
     ///
-    /// For protocol < 25: Refund is applied to outer fee
-    /// For protocol >= 25: Inner fee is 0, refund applied to outer
+    /// Matches stellar-core `FeeBumpMutableTransactionResult::finalizeFeeRefund()`
+    /// (MutableTransactionResult.cpp:420-443):
+    /// - Protocol >= 25: Refund applied to outer fee only (inner fee is always 0 in P25+).
+    /// - Protocol 21-24: Refund applied to both outer and inner fee.
+    ///
+    /// Note: henyey only supports protocol 24+. The else branch handles P24
+    /// specifically; protocols < 21 would not apply a refund in stellar-core,
+    /// but that case never arises here.
     pub fn finalize_fee_refund(&mut self, protocol_version: u32) {
         if let Some(ref tracker) = self.refundable_fee_tracker {
             let refund = tracker.get_fee_refund();
 
             if protocol_version_starts_from(protocol_version, ProtocolVersion::V25) {
-                // In P25+, all fees come from outer, so refund from outer
+                // P25+: all fees come from outer, refund from outer only
                 self.outer_fee_charged -= refund;
             } else {
-                // Pre-P25: Inner fee was charged, refund applies there
+                // P21-P24: stellar-core deducts from both outer and inner
+                // (see MutableTransactionResult.cpp:429-441)
+                self.outer_fee_charged -= refund;
                 self.inner_fee_charged -= refund;
             }
         }
@@ -1037,10 +1045,21 @@ mod tests {
             tracker.consume_rent_fee(100).unwrap();
         }
 
-        // Protocol 24: refund from inner
+        // Protocol 24: stellar-core deducts refund from both outer and inner
+        // (MutableTransactionResult.cpp:429-441)
         result.finalize_fee_refund(24);
         assert_eq!(result.inner_fee_charged(), 200); // 500 - 300 refund
-        assert_eq!(result.outer_fee_charged(), 1000); // unchanged
+        assert_eq!(result.outer_fee_charged(), 700); // 1000 - 300 refund
+
+        // Verify serialized XDR reflects the correct values
+        let xdr = result.to_xdr();
+        assert_eq!(xdr.fee_charged, 700); // outer fee in XDR
+        match &xdr.result {
+            TransactionResultResult::TxFeeBumpInnerSuccess(pair) => {
+                assert_eq!(pair.result.fee_charged, 200); // inner fee in XDR
+            }
+            _ => panic!("expected TxFeeBumpInnerSuccess"),
+        }
     }
 
     #[test]
