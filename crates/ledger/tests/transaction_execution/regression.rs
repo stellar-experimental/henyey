@@ -5398,3 +5398,106 @@ fn test_audit_245_fee_bump_outer_signer_removed_in_same_ledger_succeeds() {
         "fee-bump fee (200) must be charged from fee source"
     );
 }
+
+/// Regression test for AUDIT-229: failed Soroban txs must NOT emit
+/// SorobanTransactionMetaV2 in V4 meta. Before the fix, soroban_fee_info
+/// was always populated for Soroban txs causing spurious emission.
+#[test]
+fn test_failed_soroban_tx_no_soroban_meta() {
+    let secret = SecretKey::from_seed(&[44u8; 32]);
+    let source_id: AccountId = (&secret.public_key()).into();
+
+    let (source_key, source_entry) = create_account_entry(source_id.clone(), 1, 20_000_000);
+
+    // Build snapshot with only the source account — no contract exists.
+    let snapshot = SnapshotBuilder::new(1)
+        .add_entry(source_key, source_entry)
+        .build_with_default_header();
+    let snapshot = SnapshotHandle::new(snapshot);
+
+    // InvokeHostFunction calling a non-existent contract. This will fail
+    // during Soroban execution because the contract code doesn't exist.
+    let operation = Operation {
+        source_account: None,
+        body: OperationBody::InvokeHostFunction(InvokeHostFunctionOp {
+            host_function: HostFunction::InvokeContract(InvokeContractArgs {
+                contract_address: ScAddress::Contract(ContractId(Hash([99u8; 32]))),
+                function_name: ScSymbol("test".try_into().unwrap()),
+                args: VecM::default(),
+            }),
+            auth: VecM::default(),
+        }),
+    };
+
+    let soroban_data = SorobanTransactionData {
+        ext: SorobanTransactionDataExt::V0,
+        resources: SorobanResources {
+            footprint: LedgerFootprint {
+                read_only: VecM::default(),
+                read_write: VecM::default(),
+            },
+            instructions: 1_000_000,
+            disk_read_bytes: 10000,
+            write_bytes: 0,
+        },
+        resource_fee: 900,
+    };
+
+    let tx = Transaction {
+        source_account: MuxedAccount::Ed25519(Uint256(*secret.public_key().as_bytes())),
+        fee: 1000,
+        seq_num: SequenceNumber(2),
+        cond: Preconditions::None,
+        memo: Memo::None,
+        operations: vec![operation].try_into().unwrap(),
+        ext: TransactionExt::V1(soroban_data),
+    };
+
+    let mut envelope = TransactionEnvelope::Tx(TransactionV1Envelope {
+        tx,
+        signatures: VecM::default(),
+    });
+
+    let network_id = NetworkId::testnet();
+    let decorated = sign_envelope(&envelope, &secret, &network_id);
+    if let TransactionEnvelope::Tx(ref mut env) = envelope {
+        env.signatures = vec![decorated].try_into().unwrap();
+    }
+
+    let classic_events = ClassicEventConfig {
+        emit_classic_events: true,
+        backfill_stellar_asset_events: false,
+    };
+    let context = henyey_tx::LedgerContext::new(1, 1_000, 100, 5_000_000, 25, network_id);
+    let mut executor =
+        TransactionExecutor::new(&context, 0, SorobanConfig::default(), classic_events);
+    let module_cache = PersistentModuleCache::new_for_protocol(25).expect("create cache");
+    executor.set_module_cache(module_cache);
+
+    let result = executor
+        .execute_transaction(&snapshot, &envelope, 100, None)
+        .expect("execute");
+
+    // The transaction should fail (non-existent contract).
+    assert!(
+        !result.success,
+        "Soroban TX should fail when invoking non-existent contract"
+    );
+
+    // V4 meta must NOT contain SorobanTransactionMetaV2 for failed txs.
+    let tx_meta = result.tx_meta.expect("tx meta must be present");
+    let TransactionMeta::V4(v4) = tx_meta else {
+        panic!("expected V4 meta");
+    };
+    assert!(
+        v4.soroban_meta.is_none(),
+        "AUDIT-229: failed Soroban tx must not emit SorobanTransactionMetaV2"
+    );
+
+    // Fee refund events should still be present (fee accounting is independent).
+    let tx_events: &[stellar_xdr::curr::TransactionEvent] = v4.events.as_ref();
+    assert!(
+        !tx_events.is_empty(),
+        "fee refund events must still be emitted for failed Soroban txs"
+    );
+}

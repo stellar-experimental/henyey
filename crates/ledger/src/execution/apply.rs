@@ -700,6 +700,7 @@ impl TransactionExecutor {
             soroban_fee_info: soroban_fee_info,
             emit_soroban_tx_meta_ext_v1: self.emit_soroban_tx_meta_ext_v1,
             enable_soroban_diagnostic_events: self.enable_soroban_diagnostic_events,
+            tx_succeeded: all_success,
         });
 
         let meta_build_phase_us =

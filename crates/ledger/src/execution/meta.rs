@@ -903,6 +903,9 @@ pub(super) struct TransactionMetaParts {
     pub soroban_fee_info: Option<(i64, i64, i64)>,
     pub emit_soroban_tx_meta_ext_v1: bool,
     pub enable_soroban_diagnostic_events: bool,
+    /// Whether the transaction succeeded. V4 Soroban meta is only emitted on
+    /// success, matching stellar-core's `maybeActivateSorobanMeta(success)`.
+    pub tx_succeeded: bool,
 }
 
 pub(super) fn build_transaction_meta(parts: TransactionMetaParts) -> TransactionMeta {
@@ -928,9 +931,12 @@ pub(super) fn build_transaction_meta(parts: TransactionMetaParts) -> Transaction
         Vec::new()
     };
 
-    let has_soroban = parts.soroban_return_value.is_some()
-        || !filtered_diagnostics.is_empty()
-        || parts.soroban_fee_info.is_some();
+    // V4 Soroban meta is only emitted when the transaction succeeded,
+    // matching stellar-core's maybeActivateSorobanMeta(success) behavior.
+    let has_soroban = parts.tx_succeeded
+        && (parts.soroban_return_value.is_some()
+            || !filtered_diagnostics.is_empty()
+            || parts.soroban_fee_info.is_some());
     let soroban_meta = if has_soroban {
         // Only emit SorobanTransactionMetaExtV1 (fee breakdown) when the flag is set.
         // This matches stellar-core's EMIT_SOROBAN_TRANSACTION_META_EXT_V1 behavior.
@@ -987,6 +993,7 @@ pub(super) fn empty_transaction_meta() -> TransactionMeta {
         soroban_fee_info: None,
         emit_soroban_tx_meta_ext_v1: false,
         enable_soroban_diagnostic_events: false,
+        tx_succeeded: false,
     })
 }
 
@@ -1326,6 +1333,107 @@ mod tests {
         assert!(
             matches!(&changes[14], LedgerEntryChange::Created(e) if e == &cd_e),
             "changes[14]: expected Created(CD_E)"
+        );
+    }
+
+    // ====================================================================
+    // Regression tests for AUDIT-229: V4 Soroban meta gated on tx_succeeded
+    // ====================================================================
+
+    #[test]
+    fn test_v4_soroban_meta_emitted_on_success() {
+        let meta = build_transaction_meta(TransactionMetaParts {
+            tx_changes_before: empty_entry_changes(),
+            op_changes: Vec::new(),
+            op_events: Vec::new(),
+            tx_events: Vec::new(),
+            soroban_return_value: None,
+            diagnostic_events: Vec::new(),
+            soroban_fee_info: Some((100, 50, 25)),
+            emit_soroban_tx_meta_ext_v1: false,
+            enable_soroban_diagnostic_events: false,
+            tx_succeeded: true,
+        });
+        let TransactionMeta::V4(v4) = meta else {
+            panic!("expected V4 meta");
+        };
+        assert!(
+            v4.soroban_meta.is_some(),
+            "successful Soroban tx must emit SorobanTransactionMetaV2"
+        );
+    }
+
+    #[test]
+    fn test_v4_no_soroban_meta_on_failure() {
+        // Regression test for AUDIT-229: failed Soroban txs must not emit
+        // SorobanTransactionMetaV2, even when soroban_fee_info is present.
+        let meta = build_transaction_meta(TransactionMetaParts {
+            tx_changes_before: empty_entry_changes(),
+            op_changes: Vec::new(),
+            op_events: Vec::new(),
+            tx_events: Vec::new(),
+            soroban_return_value: None,
+            diagnostic_events: Vec::new(),
+            soroban_fee_info: Some((100, 50, 25)),
+            emit_soroban_tx_meta_ext_v1: false,
+            enable_soroban_diagnostic_events: false,
+            tx_succeeded: false,
+        });
+        let TransactionMeta::V4(v4) = meta else {
+            panic!("expected V4 meta");
+        };
+        assert!(
+            v4.soroban_meta.is_none(),
+            "failed Soroban tx must not emit SorobanTransactionMetaV2"
+        );
+    }
+
+    #[test]
+    fn test_v4_no_soroban_meta_on_failure_with_ext_v1() {
+        // Same as above but with emit_soroban_tx_meta_ext_v1 enabled.
+        let meta = build_transaction_meta(TransactionMetaParts {
+            tx_changes_before: empty_entry_changes(),
+            op_changes: Vec::new(),
+            op_events: Vec::new(),
+            tx_events: Vec::new(),
+            soroban_return_value: None,
+            diagnostic_events: Vec::new(),
+            soroban_fee_info: Some((100, 50, 25)),
+            emit_soroban_tx_meta_ext_v1: true,
+            enable_soroban_diagnostic_events: false,
+            tx_succeeded: false,
+        });
+        let TransactionMeta::V4(v4) = meta else {
+            panic!("expected V4 meta");
+        };
+        assert!(
+            v4.soroban_meta.is_none(),
+            "failed Soroban tx must not emit SorobanTransactionMetaV2 even with ext_v1 enabled"
+        );
+    }
+
+    #[test]
+    fn test_v4_no_soroban_meta_for_classic_tx() {
+        // A successful non-Soroban tx has no soroban fields populated,
+        // so no SorobanTransactionMetaV2 should be emitted.
+        let meta = build_transaction_meta(TransactionMetaParts {
+            tx_changes_before: empty_entry_changes(),
+            op_changes: Vec::new(),
+            op_events: Vec::new(),
+            tx_events: Vec::new(),
+            soroban_return_value: None,
+            diagnostic_events: Vec::new(),
+            soroban_fee_info: None,
+            emit_soroban_tx_meta_ext_v1: false,
+            enable_soroban_diagnostic_events: false,
+            tx_succeeded: true,
+        });
+        let TransactionMeta::V4(v4) = meta else {
+            panic!("expected V4 meta");
+        };
+        assert!(
+            v4.soroban_meta.is_none(),
+            "classic tx must not emit SorobanTransactionMetaV2"
         );
     }
 }

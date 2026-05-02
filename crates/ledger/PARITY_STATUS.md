@@ -419,6 +419,7 @@ Features not yet implemented. These ARE counted against parity %.
 
 | Fix | Issue | Description |
 |-----|-------|-------------|
+| Gate V4 Soroban meta on tx success | #2249 (AUDIT-229) | `build_transaction_meta` was unconditionally emitting `SorobanTransactionMetaV2` for Soroban txs because `soroban_fee_info` is always populated. stellar-core only emits this struct on success (`TransactionMeta.cpp:699-705`). Fixed by adding `tx_succeeded` field to `TransactionMetaParts` and gating `has_soroban` on it. |
 | Skip outer fee-bump sig re-check at apply | #2270 (AUDIT-245) | stellar-core's `FeeBumpTransactionFrame::apply()` does not re-validate outer (fee source) signatures. Henyey was re-checking them in `validate_preconditions`, causing consensus divergence when a prior TX in the same ledger modified the fee source's signer set. Fixed by skipping the outer `has_sufficient_signer_weight` check for fee-bump transactions during apply, matching stellar-core's trust-from-consensus design. |
 
 ## Verification Results

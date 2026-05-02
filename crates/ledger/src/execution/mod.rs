@@ -1893,6 +1893,7 @@ impl TransactionExecutor {
                             soroban_fee_info: None,
                             emit_soroban_tx_meta_ext_v1: self.emit_soroban_tx_meta_ext_v1,
                             enable_soroban_diagnostic_events: self.enable_soroban_diagnostic_events,
+                            tx_succeeded: false,
                         }));
                 }
 
