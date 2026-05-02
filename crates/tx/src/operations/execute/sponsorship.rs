@@ -205,18 +205,22 @@ pub(crate) fn execute_revoke_sponsorship(
                 state.set_entry_sponsor(ledger_key.clone(), new_sponsor);
                 sponsorship_changed = true;
             } else if was_sponsored && !will_be_sponsored {
-                if let Some(owner_account) = state.get_account(&owner_id) {
-                    let new_min_balance = state.minimum_balance_for_account_with_deltas(
-                        owner_account,
-                        context.protocol_version,
-                        0,
-                        0,
-                        -multiplier,
-                    )?;
-                    let available = account_balance_after_liabilities(owner_account);
-                    if available < new_min_balance {
-                        return Ok(make_revoke_result(RevokeSponsorshipResultCode::LowReserve));
-                    }
+                // Defense-in-depth: ensure owner is loaded (account_loading.rs
+                // pre-loads, but the reserve check must never be silently skipped).
+                state.ensure_account_loaded(&owner_id)?;
+                let owner_account = state
+                    .get_account(&owner_id)
+                    .expect("owner account must exist for sponsored entry");
+                let new_min_balance = state.minimum_balance_for_account_with_deltas(
+                    owner_account,
+                    context.protocol_version,
+                    0,
+                    0,
+                    -multiplier,
+                )?;
+                let available = account_balance_after_liabilities(owner_account);
+                if available < new_min_balance {
+                    return Ok(make_revoke_result(RevokeSponsorshipResultCode::LowReserve));
                 }
 
                 if matches!(entry.data, LedgerEntryData::ClaimableBalance(_)) {
@@ -340,18 +344,20 @@ pub(crate) fn execute_revoke_sponsorship(
                     .ok_or(TxError::SourceAccountNotFound)?;
                 prepared.apply(account);
             } else if was_sponsored && !will_be_sponsored {
-                if let Some(owner_account) = state.get_account(&owner_id) {
-                    let new_min_balance = state.minimum_balance_for_account_with_deltas(
-                        owner_account,
-                        context.protocol_version,
-                        0,
-                        0,
-                        -1,
-                    )?;
-                    let available = account_balance_after_liabilities(owner_account);
-                    if available < new_min_balance {
-                        return Ok(make_revoke_result(RevokeSponsorshipResultCode::LowReserve));
-                    }
+                state.ensure_account_loaded(&owner_id)?;
+                let owner_account = state
+                    .get_account(&owner_id)
+                    .expect("owner account must exist for sponsored signer");
+                let new_min_balance = state.minimum_balance_for_account_with_deltas(
+                    owner_account,
+                    context.protocol_version,
+                    0,
+                    0,
+                    -1,
+                )?;
+                let available = account_balance_after_liabilities(owner_account);
+                if available < new_min_balance {
+                    return Ok(make_revoke_result(RevokeSponsorshipResultCode::LowReserve));
                 }
 
                 let old_sponsor = current_sponsor.expect("old sponsor exists");
@@ -1676,5 +1682,109 @@ mod tests {
             "Expected OpTooManySponsoring, got {:?}",
             result
         );
+    }
+
+    /// Regression test for AUDIT-250: ensure_account_loaded guarantees the
+    /// LOW_RESERVE check is never silently skipped when the owner account
+    /// isn't pre-loaded in state. Before the fix, `if let Some` would skip
+    /// the check entirely, returning SUCCESS instead of LowReserve.
+    #[test]
+    fn test_revoke_sponsorship_low_reserve_owner_not_preloaded() {
+        use std::sync::Arc;
+
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let sponsor_id = create_test_account_id(50);
+        let owner_id = create_test_account_id(51);
+
+        // Sponsor (source) must be in state for the source-account check
+        state.create_account(create_test_account(sponsor_id.clone(), 100_000_000));
+
+        // Create the offer entry directly in state (owned by owner_id)
+        let offer_entry = OfferEntry {
+            seller_id: owner_id.clone(),
+            offer_id: 1,
+            selling: Asset::Native,
+            buying: Asset::CreditAlphanum4(AlphaNum4 {
+                asset_code: AssetCode4(*b"USD\0"),
+                issuer: create_test_account_id(99),
+            }),
+            amount: 1000,
+            price: Price { n: 1, d: 1 },
+            flags: 0,
+            ext: OfferEntryExt::V0,
+        };
+        state.create_offer(offer_entry);
+
+        // Set up sponsorship on the offer
+        let ledger_key = LedgerKey::Offer(LedgerKeyOffer {
+            seller_id: owner_id.clone(),
+            offer_id: 1,
+        });
+        state.set_entry_sponsor(ledger_key.clone(), sponsor_id.clone());
+
+        // Set sponsor's num_sponsoring = 1
+        if let Some(account) = state.get_account_mut(&sponsor_id) {
+            let ext = crate::state::ensure_account_ext_v2(account);
+            ext.num_sponsoring = 1;
+        }
+
+        // DO NOT put owner_id in state directly. Instead, provide it via entry_loader
+        // with a balance too low to cover reserve after sponsorship removal.
+        // min_balance for 1 subentry (the offer) without sponsorship = (2 + 1) * 5_000_000 = 15_000_000
+        let owner_account = AccountEntry {
+            account_id: owner_id.clone(),
+            balance: 10_000_001, // Below the 15M required
+            seq_num: SequenceNumber(1),
+            num_sub_entries: 1,
+            inflation_dest: None,
+            flags: 0,
+            home_domain: String32::default(),
+            thresholds: Thresholds([1, 0, 0, 0]),
+            signers: vec![].try_into().unwrap(),
+            ext: AccountEntryExt::V1(AccountEntryExtensionV1 {
+                liabilities: Liabilities {
+                    buying: 0,
+                    selling: 0,
+                },
+                ext: AccountEntryExtensionV1Ext::V2(AccountEntryExtensionV2 {
+                    num_sponsored: 1,
+                    num_sponsoring: 0,
+                    signer_sponsoring_i_ds: vec![].try_into().unwrap(),
+                    ext: AccountEntryExtensionV2Ext::V0,
+                }),
+            }),
+        };
+
+        let owner_id_clone = owner_id.clone();
+        state.set_entry_loader(Arc::new(move |key| {
+            if let LedgerKey::Account(LedgerKeyAccount { account_id }) = key {
+                if account_id == &owner_id_clone {
+                    return Ok(Some(LedgerEntry {
+                        last_modified_ledger_seq: 1,
+                        data: LedgerEntryData::Account(owner_account.clone()),
+                        ext: LedgerEntryExt::V0,
+                    }));
+                }
+            }
+            Ok(None)
+        }));
+
+        // Execute: revoke sponsorship on the offer
+        let op = RevokeSponsorshipOp::LedgerEntry(ledger_key);
+        let result = execute_revoke_sponsorship(&op, &sponsor_id, &mut state, &context);
+
+        // Should return LowReserve (not SUCCESS)
+        match result.unwrap() {
+            OperationResult::OpInner(OperationResultTr::RevokeSponsorship(r)) => {
+                assert!(
+                    matches!(r, RevokeSponsorshipResult::LowReserve),
+                    "Expected LowReserve when owner not preloaded but has insufficient balance, got {:?}",
+                    r
+                );
+            }
+            other => panic!("Unexpected result type: {:?}", other),
+        }
     }
 }
