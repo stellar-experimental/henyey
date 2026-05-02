@@ -112,16 +112,29 @@ async fn test_history_work_chain() {
         .expect("xdr");
     let header_xdr = record_marked(&[header_xdr_raw]);
 
+    // Build a structurally valid HAS: BUCKET_LIST_LEVELS (11) levels with
+    // the test bucket at level 0 and empty (zero-hash) buckets elsewhere.
+    // Stage E historywork now runs verify_has_structure +
+    // verify_has_checkpoint inline before counting HAS-acquisition success,
+    // so the fixture must satisfy both invariants.
+    let mut current_buckets = vec![HASBucketLevel {
+        curr: bucket_hash.to_hex(),
+        snap: "0".repeat(64),
+        next: Default::default(),
+    }];
+    for _ in 1..henyey_bucket::BUCKET_LIST_LEVELS {
+        current_buckets.push(HASBucketLevel {
+            curr: "0".repeat(64),
+            snap: "0".repeat(64),
+            next: Default::default(),
+        });
+    }
     let has = HistoryArchiveState {
         version: 2,
         server: Some("rs-stellar-core test".to_string()),
         current_ledger: checkpoint,
         network_passphrase: Some("Test SDF Network ; September 2015".to_string()),
-        current_buckets: vec![HASBucketLevel {
-            curr: bucket_hash.to_hex(),
-            snap: "0".repeat(64),
-            next: Default::default(),
-        }],
+        current_buckets,
         hot_archive_buckets: None,
     };
 
