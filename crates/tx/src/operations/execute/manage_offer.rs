@@ -4500,6 +4500,19 @@ mod tests {
     }
 
     /// Regression test for #2287 / AUDIT-249 — CreatePassiveSellOffer variant.
+    ///
+    /// Passive offers only cross when the counter's price is *strictly* better
+    /// (offer_filter at manage_offer.rs:912-913: passive requires
+    /// `price_cmp == Ordering::Less`). The new passive's price is therefore set
+    /// worse than the counter's so the matching engine actually crosses it
+    /// (otherwise the passive would trigger StopBadPrice and the offer would be
+    /// kept, exercising the ALREADY-correct kept-offer code path with its
+    /// existing overflow check rather than the fully-consumed branch this
+    /// regression test targets).
+    ///
+    /// At new.price=1/2 the matching engine fills at counter's better price 1/1
+    /// (maker price wins), so 100M asset_b sold gives the new offer 100M
+    /// asset_a — fully consuming both sides.
     #[test]
     fn test_create_passive_sell_offer_fully_consumed_sponsored_too_many_sponsoring() {
         let (mut state, context, source_id, sponsor_id, asset_a, asset_b) =
@@ -4511,7 +4524,9 @@ mod tests {
                 selling: asset_b,
                 buying: asset_a,
                 amount: 100_000_000,
-                price: Price { n: 1, d: 1 },
+                // Worse than counter's 1/1 so passive's max_wheat_price (2/1)
+                // is strictly greater than counter's price (1/1) → crosses.
+                price: Price { n: 1, d: 2 },
             }),
         };
         let result = super::super::execute_operation(&op, &source_id, &mut state, &context);
