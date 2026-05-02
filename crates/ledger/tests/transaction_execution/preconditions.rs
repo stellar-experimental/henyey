@@ -1931,3 +1931,166 @@ fn test_fee_bump_time_bounds_checked_before_inner_source_load() {
     // Time bounds failure is an inner failure, not outer
     assert!(!result.fee_bump_outer_failure);
 }
+
+/// Regression test for AUDIT-252: Soroban transaction with large total fee but
+/// insufficient inclusion fee must be rejected with TxInsufficientFee.
+///
+/// Before the fix, the production path compared frame.fee() (total fee including
+/// resource fee) against base_fee * op_count. For Soroban TXs, this allowed
+/// transactions to pass the fee check even when their inclusion fee was below
+/// the minimum, causing consensus divergence with stellar-core.
+#[test]
+fn test_soroban_insufficient_inclusion_fee_rejected() {
+    // Soroban TX: total_fee=200, resource_fee=195, inclusion_fee=5
+    // base_fee=100, op_count=1 → min_inclusion_fee=100
+    // Should reject: 5 < 100 → TxInsufficientFee
+    let secret = SecretKey::from_seed(&[200u8; 32]);
+
+    let operation = Operation {
+        source_account: None,
+        body: OperationBody::InvokeHostFunction(InvokeHostFunctionOp {
+            host_function: HostFunction::InvokeContract(InvokeContractArgs {
+                contract_address: ScAddress::Contract(ContractId(Hash([0u8; 32]))),
+                function_name: ScSymbol("test".try_into().unwrap()),
+                args: VecM::default(),
+            }),
+            auth: VecM::default(),
+        }),
+    };
+
+    let soroban_data = SorobanTransactionData {
+        ext: SorobanTransactionDataExt::V0,
+        resources: SorobanResources {
+            footprint: LedgerFootprint {
+                read_only: VecM::default(),
+                read_write: VecM::default(),
+            },
+            instructions: 0,
+            disk_read_bytes: 0,
+            write_bytes: 0,
+        },
+        resource_fee: 195,
+    };
+
+    let tx = Transaction {
+        source_account: MuxedAccount::Ed25519(Uint256(*secret.public_key().as_bytes())),
+        fee: 200, // total_fee=200, inclusion_fee = 200 - 195 = 5
+        seq_num: SequenceNumber(2),
+        cond: Preconditions::None,
+        memo: Memo::None,
+        operations: vec![operation].try_into().unwrap(),
+        ext: TransactionExt::V1(soroban_data),
+    };
+
+    let mut envelope = TransactionEnvelope::Tx(TransactionV1Envelope {
+        tx,
+        signatures: VecM::default(),
+    });
+
+    let network_id = NetworkId::testnet();
+    let decorated = sign_envelope(&envelope, &secret, &network_id);
+    if let TransactionEnvelope::Tx(ref mut env) = envelope {
+        env.signatures = vec![decorated].try_into().unwrap();
+    }
+
+    // No source account in snapshot — if fee check passes, next failure is TxNoAccount
+    let snapshot = SnapshotBuilder::new(1).build_with_default_header();
+    let snapshot = SnapshotHandle::new(snapshot);
+
+    let context = henyey_tx::LedgerContext::new(1, 1_000, 100, 5_000_000, 25, network_id);
+    let mut executor = TransactionExecutor::new(
+        &context,
+        0,
+        SorobanConfig::default(),
+        ClassicEventConfig::default(),
+    );
+
+    let result = executor
+        .execute_transaction(&snapshot, &envelope, 100, None)
+        .expect("execute");
+
+    assert_eq!(
+        result.failure,
+        Some(ExecutionFailure::TxInsufficientFee),
+        "AUDIT-252: Soroban TX with inclusion_fee=5 < base_fee=100 must be rejected"
+    );
+}
+
+/// Positive control for AUDIT-252: Soroban transaction with sufficient inclusion
+/// fee passes the fee check and fails on the next gate (TxNoAccount).
+#[test]
+fn test_soroban_sufficient_inclusion_fee_passes_fee_check() {
+    // Soroban TX: total_fee=295, resource_fee=195, inclusion_fee=100
+    // base_fee=100, op_count=1 → min_inclusion_fee=100
+    // Should pass fee check: 100 >= 100
+    let secret = SecretKey::from_seed(&[201u8; 32]);
+
+    let operation = Operation {
+        source_account: None,
+        body: OperationBody::InvokeHostFunction(InvokeHostFunctionOp {
+            host_function: HostFunction::InvokeContract(InvokeContractArgs {
+                contract_address: ScAddress::Contract(ContractId(Hash([0u8; 32]))),
+                function_name: ScSymbol("test".try_into().unwrap()),
+                args: VecM::default(),
+            }),
+            auth: VecM::default(),
+        }),
+    };
+
+    let soroban_data = SorobanTransactionData {
+        ext: SorobanTransactionDataExt::V0,
+        resources: SorobanResources {
+            footprint: LedgerFootprint {
+                read_only: VecM::default(),
+                read_write: VecM::default(),
+            },
+            instructions: 0,
+            disk_read_bytes: 0,
+            write_bytes: 0,
+        },
+        resource_fee: 195,
+    };
+
+    let tx = Transaction {
+        source_account: MuxedAccount::Ed25519(Uint256(*secret.public_key().as_bytes())),
+        fee: 295, // total_fee=295, inclusion_fee = 295 - 195 = 100
+        seq_num: SequenceNumber(2),
+        cond: Preconditions::None,
+        memo: Memo::None,
+        operations: vec![operation].try_into().unwrap(),
+        ext: TransactionExt::V1(soroban_data),
+    };
+
+    let mut envelope = TransactionEnvelope::Tx(TransactionV1Envelope {
+        tx,
+        signatures: VecM::default(),
+    });
+
+    let network_id = NetworkId::testnet();
+    let decorated = sign_envelope(&envelope, &secret, &network_id);
+    if let TransactionEnvelope::Tx(ref mut env) = envelope {
+        env.signatures = vec![decorated].try_into().unwrap();
+    }
+
+    // No source account in snapshot — fee check passes, then fails on TxNoAccount
+    let snapshot = SnapshotBuilder::new(1).build_with_default_header();
+    let snapshot = SnapshotHandle::new(snapshot);
+
+    let context = henyey_tx::LedgerContext::new(1, 1_000, 100, 5_000_000, 25, network_id);
+    let mut executor = TransactionExecutor::new(
+        &context,
+        0,
+        SorobanConfig::default(),
+        ClassicEventConfig::default(),
+    );
+
+    let result = executor
+        .execute_transaction(&snapshot, &envelope, 100, None)
+        .expect("execute");
+
+    assert_eq!(
+        result.failure,
+        Some(ExecutionFailure::TxNoAccount),
+        "AUDIT-252 positive control: Soroban TX with inclusion_fee=100 >= base_fee=100 should pass fee check"
+    );
+}

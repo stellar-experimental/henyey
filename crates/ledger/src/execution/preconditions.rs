@@ -258,8 +258,9 @@ impl TransactionExecutor {
 
             // 2b. Inclusion fee check
             // Parity: TransactionFrame::commonValidPreSeqNum lines 1482-1493
-            let required_fee = frame.operation_count() as u32 * base_fee;
-            if frame.fee() < required_fee {
+            let required = frame.min_inclusion_fee(base_fee as i64);
+            let provided = frame.inclusion_fee();
+            if provided.as_i64() < required.as_i64() {
                 return Ok(Err(pre_seq_fail(
                     TransactionResultCode::TxInsufficientFee,
                     "Insufficient fee",
