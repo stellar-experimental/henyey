@@ -114,14 +114,12 @@ pub(super) fn collect_soroban_restored_entries(
         .unwrap_or(&[]);
     let mut hot_archive =
         extract_hot_archive_restored_keys(soroban_data, op_type, actual_restored_indices);
-    // For RestoreFootprint, get hot archive keys and entries from the meta
+    // For RestoreFootprint and InvokeHostFunction, add hot archive keys from the meta.
+    // Entry values are stored AFTER filtering (see below) to avoid spurious RESTORED
+    // emissions for read-only auto-restores.
     if let Some(meta) = soroban_meta {
         for ha_restore in &meta.hot_archive_restores {
             hot_archive.insert(ha_restore.key.clone());
-            // Also store the entry for RESTORED meta emission
-            restored
-                .hot_archive_entries
-                .insert(ha_restore.key.clone(), ha_restore.entry.clone());
         }
     }
     let ha_before = hot_archive.len();
@@ -159,6 +157,19 @@ pub(super) fn collect_soroban_restored_entries(
                 .collect();
             (hot_archive, for_meta)
         };
+
+    // Now store original entry values ONLY for keys that passed the meta filter.
+    // This prevents read-only auto-restores from emitting spurious RESTORED changes
+    // via the hot_archive_entries post-processing at meta.rs:876-882.
+    if let Some(meta) = soroban_meta {
+        for ha_restore in &meta.hot_archive_restores {
+            if hot_archive_for_meta.contains(&ha_restore.key) {
+                restored
+                    .hot_archive_entries
+                    .insert(ha_restore.key.clone(), ha_restore.entry.clone());
+            }
+        }
+    }
     let ha_after = hot_archive_for_meta.len();
     // Log when we filter out entries
     if ha_before != ha_after {

@@ -15,7 +15,7 @@ use henyey_common::protocol::{
 };
 use henyey_common::{xdr_encoded_len, xdr_encoded_len_u32};
 
-use super::{OperationExecutionResult, SorobanOperationMeta};
+use super::{HotArchiveRestore, OperationExecutionResult, SorobanOperationMeta};
 use crate::soroban::{PersistentModuleCache, SorobanConfig, SorobanContext};
 use crate::state::LedgerStateManager;
 use crate::validation::LedgerContext;
@@ -553,6 +553,32 @@ fn execute_contract_invocation(
         }
     }
 
+    // Capture original hot archive entries BEFORE host execution may modify them.
+    // These are needed for transaction meta: if the host modifies a restored entry,
+    // we must emit RESTORED(oldValue) + UPDATED(newValue) instead of RESTORED(newValue).
+    // GuardedHotArchive::get() is safe here — it only returns None for keys restored
+    // by PRIOR transactions in this ledger, not for the current transaction's keys.
+    let hot_archive_original_entries: Vec<HotArchiveRestore> =
+        match (guarded_hot_archive.as_ref(), &soroban_data.ext) {
+            (Some(guarded), SorobanTransactionDataExt::V1(ext)) => ext
+                .archived_soroban_entries
+                .iter()
+                .filter_map(|idx| {
+                    let key = soroban_data
+                        .resources
+                        .footprint
+                        .read_write
+                        .get(*idx as usize)?;
+                    let entry = guarded.get(key).ok()??;
+                    Some(HotArchiveRestore {
+                        key: key.clone(),
+                        entry,
+                    })
+                })
+                .collect(),
+            _ => Vec::new(),
+        };
+
     // Execute via soroban-env-host
     match execute_host_function_with_cache(HostFunctionInvocation {
         host_function: &op.host_function,
@@ -645,7 +671,7 @@ fn execute_contract_invocation(
 
             Ok(OperationExecutionResult::with_soroban_meta(
                 make_result(InvokeHostFunctionResultCode::Success, result_hash),
-                build_soroban_operation_meta(&result),
+                build_soroban_operation_meta(&result, hot_archive_original_entries),
             ))
         }
         Err(exec_error) => {
@@ -737,6 +763,7 @@ fn compute_success_preimage_hash(return_value: &ScVal, events: &[ContractEvent])
 
 fn build_soroban_operation_meta(
     result: &crate::soroban::SorobanExecutionResult,
+    hot_archive_restores: Vec<HotArchiveRestore>,
 ) -> SorobanOperationMeta {
     // Use contract_events which contains the decoded Contract and System events.
     let events = result.contract_events.clone();
@@ -759,7 +786,7 @@ fn build_soroban_operation_meta(
         event_size_bytes: result.contract_events_and_return_value_size,
         rent_fee: result.rent_fee,
         live_bucket_list_restores: result.live_bucket_list_restores.clone(),
-        hot_archive_restores: Vec::new(), // For InvokeHostFunction, hot archive keys are detected via archived_soroban_entries
+        hot_archive_restores,
         actual_restored_indices: result.actual_restored_indices.clone(),
     }
 }
