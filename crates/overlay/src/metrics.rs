@@ -422,14 +422,24 @@ pub struct OverlayMetrics {
     pub flood_unique_bytes_recv: Counter,
     /// Duplicate flood bytes received.
     pub flood_duplicate_bytes_recv: Counter,
+    /// Per-recipient flood deliveries (is_flood messages only).
+    pub flood_broadcast: Counter,
+    /// Unique flood messages received (inbound, record_seen → true).
+    pub flood_unique_recv: Counter,
+    /// Duplicate flood messages received (inbound, record_seen → false).
+    pub flood_duplicate_recv: Counter,
 
     // ===== Fetch Metrics =====
     /// Unique fetch bytes received.
     pub fetch_unique_bytes_recv: Counter,
     /// Duplicate fetch bytes received.
     pub fetch_duplicate_bytes_recv: Counter,
-    /// ItemFetcher next-peer selections.
+    /// ItemFetcher next-peer selections (AskPeer results only).
     pub item_fetcher_next_peer: Counter,
+    /// Unique/solicited fetch responses (TxSet/QSet tracked by ItemFetcher).
+    pub fetch_unique_recv: Counter,
+    /// Duplicate/unsolicited fetch responses (TxSet/QSet not tracked).
+    pub fetch_duplicate_recv: Counter,
 
     // ===== Pull Metrics =====
     /// End-to-end transaction pull latency.
@@ -521,11 +531,19 @@ impl OverlayMetrics {
             flood_unfulfilled_unknown: self.flood_unfulfilled_unknown.get(),
             flood_unique_bytes_recv: self.flood_unique_bytes_recv.get(),
             flood_duplicate_bytes_recv: self.flood_duplicate_bytes_recv.get(),
+            flood_broadcast: self.flood_broadcast.get(),
+            flood_unique_recv: self.flood_unique_recv.get(),
+            flood_duplicate_recv: self.flood_duplicate_recv.get(),
 
             // Fetch metrics
             fetch_unique_bytes_recv: self.fetch_unique_bytes_recv.get(),
             fetch_duplicate_bytes_recv: self.fetch_duplicate_bytes_recv.get(),
             item_fetcher_next_peer: self.item_fetcher_next_peer.get(),
+            fetch_unique_recv: self.fetch_unique_recv.get(),
+            fetch_duplicate_recv: self.fetch_duplicate_recv.get(),
+
+            // Populated externally by the app layer from FloodGate::stats().
+            flood_known_count: 0,
 
             // Pull metrics
             tx_pull_latency: self.tx_pull_latency.snapshot(),
@@ -588,9 +606,14 @@ impl OverlayMetrics {
             &self.flood_unfulfilled_unknown,
             &self.flood_unique_bytes_recv,
             &self.flood_duplicate_bytes_recv,
+            &self.flood_broadcast,
+            &self.flood_unique_recv,
+            &self.flood_duplicate_recv,
             &self.fetch_unique_bytes_recv,
             &self.fetch_duplicate_bytes_recv,
             &self.item_fetcher_next_peer,
+            &self.fetch_unique_recv,
+            &self.fetch_duplicate_recv,
             &self.demand_timeouts,
             &self.pulled_relevant_txs,
             &self.pulled_irrelevant_txs,
@@ -697,11 +720,19 @@ pub struct OverlayMetricsSnapshot {
     pub flood_unfulfilled_unknown: u64,
     pub flood_unique_bytes_recv: u64,
     pub flood_duplicate_bytes_recv: u64,
+    pub flood_broadcast: u64,
+    pub flood_unique_recv: u64,
+    pub flood_duplicate_recv: u64,
 
     // Fetch metrics
     pub fetch_unique_bytes_recv: u64,
     pub fetch_duplicate_bytes_recv: u64,
     pub item_fetcher_next_peer: u64,
+    pub fetch_unique_recv: u64,
+    pub fetch_duplicate_recv: u64,
+
+    /// FloodGate known entries (populated by the app layer, not by OverlayMetrics).
+    pub flood_known_count: u64,
 
     // Pull metrics
     pub tx_pull_latency: TimerSnapshot,

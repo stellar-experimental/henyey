@@ -34,7 +34,7 @@ fn test_fetch_immediately_invokes_callback() {
     let callback_count = Arc::new(AtomicUsize::new(0));
     let callback_count_clone = callback_count.clone();
 
-    let mut fetcher = ItemFetcher::new(ItemType::TxSet, ItemFetcherConfig::default());
+    let mut fetcher = ItemFetcher::new(ItemType::TxSet, ItemFetcherConfig::default(), None);
 
     // Set up callback
     fetcher.set_ask_peer(Box::new(move |_peer, _hash, _item_type| {
@@ -66,7 +66,7 @@ fn test_fetch_without_peers_no_callback() {
     let callback_count = Arc::new(AtomicUsize::new(0));
     let callback_count_clone = callback_count.clone();
 
-    let mut fetcher = ItemFetcher::new(ItemType::QuorumSet, ItemFetcherConfig::default());
+    let mut fetcher = ItemFetcher::new(ItemType::QuorumSet, ItemFetcherConfig::default(), None);
 
     fetcher.set_ask_peer(Box::new(move |_peer, _hash, _item_type| {
         callback_count_clone.fetch_add(1, Ordering::SeqCst);
@@ -95,7 +95,7 @@ fn test_process_pending_invokes_callback_on_timeout() {
         ..Default::default()
     };
 
-    let mut fetcher = ItemFetcher::new(ItemType::TxSet, config);
+    let mut fetcher = ItemFetcher::new(ItemType::TxSet, config, None);
 
     fetcher.set_ask_peer(Box::new(move |_peer, _hash, _item_type| {
         callback_count_clone.fetch_add(1, Ordering::SeqCst);
@@ -125,7 +125,7 @@ fn test_process_pending_invokes_callback_on_timeout() {
 
 #[test]
 fn test_recv_clears_tracker() {
-    let fetcher = ItemFetcher::new(ItemType::TxSet, ItemFetcherConfig::default());
+    let fetcher = ItemFetcher::new(ItemType::TxSet, ItemFetcherConfig::default(), None);
 
     fetcher.set_available_peers(vec![make_test_peer(1)]);
 
@@ -152,7 +152,7 @@ fn test_doesnt_have_triggers_retry() {
     let callback_count = Arc::new(AtomicUsize::new(0));
     let callback_count_clone = callback_count.clone();
 
-    let mut fetcher = ItemFetcher::new(ItemType::QuorumSet, ItemFetcherConfig::default());
+    let mut fetcher = ItemFetcher::new(ItemType::QuorumSet, ItemFetcherConfig::default(), None);
 
     fetcher.set_ask_peer(Box::new(move |_peer, _hash, _item_type| {
         callback_count_clone.fetch_add(1, Ordering::SeqCst);
@@ -181,7 +181,7 @@ fn test_doesnt_have_triggers_retry() {
 
 #[test]
 fn test_stop_fetching_below() {
-    let fetcher = ItemFetcher::new(ItemType::TxSet, ItemFetcherConfig::default());
+    let fetcher = ItemFetcher::new(ItemType::TxSet, ItemFetcherConfig::default(), None);
 
     fetcher.set_available_peers(vec![make_test_peer(1)]);
 
@@ -211,7 +211,7 @@ fn test_item_type_passed_to_callback() {
     let received_type = Arc::new(std::sync::Mutex::new(None));
     let received_type_clone = received_type.clone();
 
-    let mut fetcher = ItemFetcher::new(ItemType::QuorumSet, ItemFetcherConfig::default());
+    let mut fetcher = ItemFetcher::new(ItemType::QuorumSet, ItemFetcherConfig::default(), None);
 
     fetcher.set_ask_peer(Box::new(move |_peer, _hash, item_type| {
         *received_type_clone.lock().unwrap() = Some(item_type);
@@ -228,7 +228,7 @@ fn test_item_type_passed_to_callback() {
 
 #[test]
 fn test_stats() {
-    let fetcher = ItemFetcher::new(ItemType::TxSet, ItemFetcherConfig::default());
+    let fetcher = ItemFetcher::new(ItemType::TxSet, ItemFetcherConfig::default(), None);
 
     assert_eq!(fetcher.num_trackers(), 0);
 

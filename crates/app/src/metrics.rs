@@ -327,6 +327,10 @@ metric_catalog! {
         OVERLAY_OUTBOUND_PENDING = "stellar_overlay_outbound_pending"
             => "Pending outbound peer connections (handshaking)";
 
+        // Stage F.2: FloodGate known entries gauge (issue #2244).
+        OVERLAY_MEMORY_FLOOD_KNOWN = "stellar_overlay_memory_flood_known"
+            => "Current FloodGate known entries count";
+
         // Phase 4: Process health.
         PROCESS_OPEN_FDS = "henyey_process_open_fds"
             => "Open file descriptors";
@@ -460,6 +464,20 @@ metric_catalog! {
             => "Total outbound peer disconnections (run_peer_loop returned)";
         OVERLAY_OUTBOUND_REJECT_TOTAL = "stellar_overlay_outbound_reject_total"
             => "Total outbound connections rejected before establishment";
+
+        // Stage F.2: Overlay flood / fetch / item-fetcher counters (issue #2244).
+        OVERLAY_FLOOD_BROADCAST_TOTAL = "stellar_overlay_flood_broadcast_total"
+            => "Total flood messages broadcast (per-recipient deliveries)";
+        OVERLAY_FLOOD_DUPLICATE_RECV_TOTAL = "stellar_overlay_flood_duplicate_recv_total"
+            => "Total duplicate flood messages received";
+        OVERLAY_FLOOD_UNIQUE_RECV_TOTAL = "stellar_overlay_flood_unique_recv_total"
+            => "Total unique flood messages received";
+        OVERLAY_FETCH_DUPLICATE_RECV_TOTAL = "stellar_overlay_fetch_duplicate_recv_total"
+            => "Total duplicate/unsolicited fetch responses received";
+        OVERLAY_FETCH_UNIQUE_RECV_TOTAL = "stellar_overlay_fetch_unique_recv_total"
+            => "Total unique/solicited fetch responses received";
+        OVERLAY_ITEM_FETCHER_NEXT_PEER_TOTAL = "stellar_overlay_item_fetcher_next_peer_total"
+            => "Total item fetcher next-peer selections";
 
         // Herder pending envelope counters (Phase 2).
         HERDER_PENDING_ADDED_TOTAL = "stellar_herder_pending_added_total"
@@ -793,6 +811,18 @@ pub(crate) async fn refresh_gauges(state: &ServerState) {
         counter!(OVERLAY_OUTBOUND_ESTABLISH_TOTAL).absolute(ov.outbound_establish);
         counter!(OVERLAY_OUTBOUND_DROP_TOTAL).absolute(ov.outbound_drop);
         counter!(OVERLAY_OUTBOUND_REJECT_TOTAL).absolute(ov.outbound_reject);
+
+        // Stage F.2: flood / fetch / item-fetcher counters (issue #2244).
+        counter!(OVERLAY_FLOOD_BROADCAST_TOTAL).absolute(ov.flood_broadcast);
+        counter!(OVERLAY_FLOOD_DUPLICATE_RECV_TOTAL).absolute(ov.flood_duplicate_recv);
+        counter!(OVERLAY_FLOOD_UNIQUE_RECV_TOTAL).absolute(ov.flood_unique_recv);
+        counter!(OVERLAY_FETCH_DUPLICATE_RECV_TOTAL).absolute(ov.fetch_duplicate_recv);
+        counter!(OVERLAY_FETCH_UNIQUE_RECV_TOTAL).absolute(ov.fetch_unique_recv);
+        counter!(OVERLAY_ITEM_FETCHER_NEXT_PEER_TOTAL).absolute(ov.item_fetcher_next_peer);
+        gauge!(OVERLAY_MEMORY_FLOOD_KNOWN).set(ov.flood_known_count as f64);
+    } else {
+        // Ensure gauge is zeroed if overlay stops.
+        gauge!(OVERLAY_MEMORY_FLOOD_KNOWN).set(0.0);
     }
 
     // Ledger close stats (Phase 2).
@@ -1409,6 +1439,61 @@ mod tests {
                 name
             );
         }
+    }
+
+    #[test]
+    fn test_stage_f2_overlay_flood_fetch_counters_in_catalog() {
+        // Stage F.2 (issue #2244): flood / fetch / item-fetcher counters
+        // must all be in the pre-registered counter catalog.
+        let counter_names: HashSet<&str> = ALL_COUNTER_NAMES.iter().copied().collect();
+        let gauge_names: HashSet<&str> = ALL_GAUGE_NAMES.iter().copied().collect();
+        for expected in &[
+            "stellar_overlay_flood_broadcast_total",
+            "stellar_overlay_flood_duplicate_recv_total",
+            "stellar_overlay_flood_unique_recv_total",
+            "stellar_overlay_fetch_duplicate_recv_total",
+            "stellar_overlay_fetch_unique_recv_total",
+            "stellar_overlay_item_fetcher_next_peer_total",
+        ] {
+            assert!(
+                counter_names.contains(expected),
+                "Stage F.2 counter {} missing from catalog",
+                expected
+            );
+        }
+        assert!(
+            gauge_names.contains("stellar_overlay_memory_flood_known"),
+            "Stage F.2 gauge stellar_overlay_memory_flood_known missing from catalog"
+        );
+    }
+
+    #[test]
+    fn test_stage_f2_overlay_counters_preregistered_at_zero() {
+        // Stage F.2 counters must be visible on the very first scrape with a
+        // 0 value so dashboard panels render even before any peer traffic.
+        let handle = ensure_test_recorder();
+        describe_metrics();
+        register_label_series();
+        let output = handle.render();
+
+        for name in &[
+            "stellar_overlay_flood_broadcast_total",
+            "stellar_overlay_flood_duplicate_recv_total",
+            "stellar_overlay_flood_unique_recv_total",
+            "stellar_overlay_fetch_duplicate_recv_total",
+            "stellar_overlay_fetch_unique_recv_total",
+            "stellar_overlay_item_fetcher_next_peer_total",
+        ] {
+            assert!(
+                output.contains(&format!("{} 0", name)),
+                "Stage F.2 counter {} should be pre-registered at 0",
+                name
+            );
+        }
+        assert!(
+            output.contains("stellar_overlay_memory_flood_known"),
+            "Stage F.2 gauge stellar_overlay_memory_flood_known should be pre-registered"
+        );
     }
 
     #[test]

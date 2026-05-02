@@ -905,6 +905,9 @@ impl OverlayManager {
 
         debug!("Broadcast {} to {} peers", msg_type, sent);
         self.metrics.messages_broadcast.add(sent as u64);
+        if is_flood {
+            self.metrics.flood_broadcast.add(sent as u64);
+        }
         Ok(sent)
     }
 

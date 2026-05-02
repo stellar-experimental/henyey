@@ -21,6 +21,7 @@
 
 use crate::{
     item_fetcher::{ItemFetcher, ItemType, PendingRequest},
+    metrics::OverlayMetrics,
     PeerId,
 };
 use henyey_crypto::RandomEvictionCache;
@@ -82,19 +83,28 @@ pub struct MessageDispatcher {
     on_quorum_set: Option<QuorumSetCallback>,
     /// Callback to re-process envelopes.
     on_envelopes_ready: Option<EnvelopeCallback>,
+    /// Shared overlay metrics.
+    metrics: Arc<OverlayMetrics>,
 }
 
 impl MessageDispatcher {
     /// Create a new message dispatcher.
-    pub fn new() -> Self {
+    pub fn new(metrics: Arc<OverlayMetrics>) -> Self {
         Self {
-            tx_set_fetcher: Arc::new(ItemFetcher::with_defaults(ItemType::TxSet)),
-            quorum_set_fetcher: Arc::new(ItemFetcher::with_defaults(ItemType::QuorumSet)),
+            tx_set_fetcher: Arc::new(ItemFetcher::with_defaults(
+                ItemType::TxSet,
+                Some(Arc::clone(&metrics)),
+            )),
+            quorum_set_fetcher: Arc::new(ItemFetcher::with_defaults(
+                ItemType::QuorumSet,
+                Some(Arc::clone(&metrics)),
+            )),
             tx_set_cache: Arc::new(Mutex::new(RandomEvictionCache::new(MAX_CACHE_SIZE))),
             quorum_set_cache: Arc::new(Mutex::new(RandomEvictionCache::new(MAX_CACHE_SIZE))),
             on_tx_set: None,
             on_quorum_set: None,
             on_envelopes_ready: None,
+            metrics,
         }
     }
 
@@ -195,8 +205,12 @@ impl MessageDispatcher {
         // Atomically check and accept — discards unsolicited items (defense in depth,
         // matching stellar-core PendingEnvelopes::recvTxSet).
         let envelopes = match self.tx_set_fetcher.recv(&hash) {
-            Some(envs) => envs,
+            Some(envs) => {
+                self.metrics.fetch_unique_recv.inc();
+                envs
+            }
             None => {
+                self.metrics.fetch_duplicate_recv.inc();
                 trace!(
                     "Discarding unsolicited {} {} from {} (no active fetch)",
                     label,
@@ -263,8 +277,12 @@ impl MessageDispatcher {
         // Atomically check and accept — discards unsolicited items (defense in depth,
         // matching stellar-core PendingEnvelopes::recvSCPQuorumSet).
         let envelopes = match self.quorum_set_fetcher.recv(&hash) {
-            Some(envs) => envs,
+            Some(envs) => {
+                self.metrics.fetch_unique_recv.inc();
+                envs
+            }
             None => {
+                self.metrics.fetch_duplicate_recv.inc();
                 trace!(
                     "Discarding unsolicited ScpQuorumSet {} from {} (no active fetch)",
                     hex::encode(hash.0),
@@ -409,11 +427,7 @@ impl MessageDispatcher {
     }
 }
 
-impl Default for MessageDispatcher {
-    fn default() -> Self {
-        Self::new()
-    }
-}
+// No Default impl: MessageDispatcher requires Arc<OverlayMetrics>.
 
 /// Statistics about message dispatch.
 #[derive(Debug, Clone)]
@@ -454,9 +468,13 @@ mod tests {
         PeerId::from_bytes([id; 32])
     }
 
+    fn make_dispatcher() -> MessageDispatcher {
+        MessageDispatcher::new(Arc::new(OverlayMetrics::new()))
+    }
+
     #[test]
     fn test_message_dispatcher_creation() {
-        let dispatcher = MessageDispatcher::new();
+        let dispatcher = make_dispatcher();
         let stats = dispatcher.stats();
 
         assert_eq!(stats.cached_tx_sets, 0);
@@ -465,7 +483,7 @@ mod tests {
 
     #[test]
     fn test_get_tx_set_unknown() {
-        let dispatcher = MessageDispatcher::new();
+        let dispatcher = make_dispatcher();
         let peer = make_peer_id(1);
         let hash = Hash([1u8; 32]);
 
@@ -477,7 +495,7 @@ mod tests {
 
     #[test]
     fn test_fetch_tx_set() {
-        let dispatcher = MessageDispatcher::new();
+        let dispatcher = make_dispatcher();
         let hash = Hash([1u8; 32]);
         let envelope = make_test_envelope(100);
 
@@ -488,7 +506,7 @@ mod tests {
 
     #[test]
     fn test_handle_dont_have() {
-        let dispatcher = MessageDispatcher::new();
+        let dispatcher = make_dispatcher();
         let peer = make_peer_id(1);
         let hash = Hash([1u8; 32]);
         let envelope = make_test_envelope(100);
@@ -508,7 +526,7 @@ mod tests {
 
     #[test]
     fn test_cache_tx_set() {
-        let dispatcher = MessageDispatcher::new();
+        let dispatcher = make_dispatcher();
         let hash = Hash([1u8; 32]);
 
         let tx_set = TransactionSet {
@@ -524,7 +542,7 @@ mod tests {
 
     #[test]
     fn test_cache_quorum_set() {
-        let dispatcher = MessageDispatcher::new();
+        let dispatcher = make_dispatcher();
         let quorum_set = ScpQuorumSet {
             threshold: 1,
             validators: vec![].try_into().unwrap(),
@@ -546,7 +564,7 @@ mod tests {
 
     #[test]
     fn test_get_tx_set_cached() {
-        let dispatcher = MessageDispatcher::new();
+        let dispatcher = make_dispatcher();
         let peer = make_peer_id(1);
         let hash = Hash([1u8; 32]);
 
@@ -565,7 +583,7 @@ mod tests {
 
     #[test]
     fn test_audit_002_tx_set_cache_bounded() {
-        let dispatcher = MessageDispatcher::new();
+        let dispatcher = make_dispatcher();
 
         // Insert more than MAX_CACHE_SIZE entries
         for i in 0..(MAX_CACHE_SIZE + 100) {
@@ -590,7 +608,7 @@ mod tests {
 
     #[test]
     fn test_audit_002_quorum_set_cache_bounded() {
-        let dispatcher = MessageDispatcher::new();
+        let dispatcher = make_dispatcher();
 
         for i in 0..(MAX_CACHE_SIZE + 100) {
             let mut hash_bytes = [0u8; 32];
@@ -615,7 +633,7 @@ mod tests {
 
     #[test]
     fn test_stop_fetching_below() {
-        let dispatcher = MessageDispatcher::new();
+        let dispatcher = make_dispatcher();
         let hash = Hash([1u8; 32]);
         let env1 = make_test_envelope(100);
         let env2 = make_test_envelope(200);

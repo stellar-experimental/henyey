@@ -32,7 +32,7 @@
 //! ```ignore
 //! use henyey_overlay::{ItemFetcher, ItemFetcherConfig, ItemType};
 //!
-//! let mut fetcher = ItemFetcher::new(ItemType::TxSet, ItemFetcherConfig::default());
+//! let mut fetcher = ItemFetcher::new(ItemType::TxSet, ItemFetcherConfig::default(), None);
 //!
 //! // Set up callback to request items from peers
 //! fetcher.set_ask_peer(Box::new(|peer_id, hash, item_type| {
@@ -49,9 +49,10 @@
 //! fetcher.process_pending();
 //! ```
 
+use crate::metrics::OverlayMetrics;
 use crate::PeerId;
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use stellar_xdr::curr::{Hash, ScpEnvelope};
 use tracing::{debug, trace};
@@ -335,23 +336,30 @@ pub struct ItemFetcher {
     ask_peer: Option<AskPeerFn>,
     /// Available peers (updated externally).
     available_peers: Mutex<Vec<PeerId>>,
+    /// Optional overlay metrics (None when used outside overlay, e.g. herder).
+    metrics: Option<Arc<OverlayMetrics>>,
 }
 
 impl ItemFetcher {
     /// Create a new item fetcher.
-    pub fn new(item_type: ItemType, config: ItemFetcherConfig) -> Self {
+    pub fn new(
+        item_type: ItemType,
+        config: ItemFetcherConfig,
+        metrics: Option<Arc<OverlayMetrics>>,
+    ) -> Self {
         Self {
             config,
             item_type,
             trackers: Mutex::new(HashMap::new()),
             ask_peer: None,
             available_peers: Mutex::new(Vec::new()),
+            metrics,
         }
     }
 
     /// Create a new item fetcher with default config.
-    pub fn with_defaults(item_type: ItemType) -> Self {
-        Self::new(item_type, ItemFetcherConfig::default())
+    pub fn with_defaults(item_type: ItemType, metrics: Option<Arc<OverlayMetrics>>) -> Self {
+        Self::new(item_type, ItemFetcherConfig::default(), metrics)
     }
 
     /// Set the callback for asking peers.
@@ -391,6 +399,9 @@ impl ItemFetcher {
             if let Some(ref ask_peer) = self.ask_peer {
                 match tracker.try_next_peer(&available_peers) {
                     NextPeerResult::AskPeer { ref peer, .. } => {
+                        if let Some(ref m) = self.metrics {
+                            m.item_fetcher_next_peer.inc();
+                        }
                         trace!(
                             "Immediately asking peer {} for {:?} {}",
                             peer,
@@ -532,6 +543,9 @@ impl ItemFetcher {
             if tracker.last_asked_peer.is_none() || tracker.is_timed_out() {
                 match tracker.try_next_peer(available_peers) {
                     NextPeerResult::AskPeer { peer, timeout } => {
+                        if let Some(ref m) = self.metrics {
+                            m.item_fetcher_next_peer.inc();
+                        }
                         requests.push(PendingRequest {
                             item_hash: hash.clone(),
                             peer,
@@ -791,7 +805,7 @@ mod tests {
 
     #[test]
     fn test_item_fetcher_fetch() {
-        let fetcher = ItemFetcher::with_defaults(ItemType::TxSet);
+        let fetcher = ItemFetcher::with_defaults(ItemType::TxSet, None);
         let hash = Hash([1u8; 32]);
         let env = make_test_envelope(100);
 
@@ -806,7 +820,7 @@ mod tests {
 
     #[test]
     fn test_item_fetcher_recv() {
-        let fetcher = ItemFetcher::with_defaults(ItemType::QuorumSet);
+        let fetcher = ItemFetcher::with_defaults(ItemType::QuorumSet, None);
         let hash = Hash([1u8; 32]);
         let env = make_test_envelope(100);
 
@@ -820,7 +834,7 @@ mod tests {
 
     #[test]
     fn test_item_fetcher_stop_fetch() {
-        let fetcher = ItemFetcher::with_defaults(ItemType::TxSet);
+        let fetcher = ItemFetcher::with_defaults(ItemType::TxSet, None);
         let hash = Hash([1u8; 32]);
         let env = make_test_envelope(100);
 
@@ -834,7 +848,7 @@ mod tests {
 
     #[test]
     fn test_item_fetcher_doesnt_have() {
-        let fetcher = ItemFetcher::with_defaults(ItemType::TxSet);
+        let fetcher = ItemFetcher::with_defaults(ItemType::TxSet, None);
         let hash = Hash([1u8; 32]);
         let env = make_test_envelope(100);
         let peer = make_peer_id(1);
@@ -847,7 +861,7 @@ mod tests {
 
     #[test]
     fn test_item_fetcher_pending_requests() {
-        let fetcher = ItemFetcher::with_defaults(ItemType::TxSet);
+        let fetcher = ItemFetcher::with_defaults(ItemType::TxSet, None);
         let hash = Hash([1u8; 32]);
         let env = make_test_envelope(100);
         let peers = vec![make_peer_id(1), make_peer_id(2)];
@@ -862,7 +876,7 @@ mod tests {
 
     #[test]
     fn test_item_fetcher_stats() {
-        let fetcher = ItemFetcher::with_defaults(ItemType::QuorumSet);
+        let fetcher = ItemFetcher::with_defaults(ItemType::QuorumSet, None);
         let hash1 = Hash([1u8; 32]);
         let hash2 = Hash([2u8; 32]);
         let env1 = make_test_envelope(100);

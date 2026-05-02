@@ -896,18 +896,80 @@
     },
     {
       "id": 59,
+      "type": "timeseries",
+      "title": "Flood Broadcast Rate (per-recipient/s)",
+      "description": "Per-recipient flood deliveries. Henyey-specific — stellar-core mMessagesBroadcast is per-event. Issue #2244.",
+      "gridPos": {"h": 6, "w": 8, "x": 0, "y": 107},
+      "datasource": {"type": "prometheus", "uid": "000000001"},
+      "targets": [
+        {"expr": "rate(stellar_overlay_flood_broadcast_total{instance=~\"$instance\"}[5m])", "legendFormat": "flood_broadcast"}
+      ],
+      "fieldConfig": {"defaults": {"unit": "ops"}}
+    },
+    {
+      "id": 290,
+      "type": "timeseries",
+      "title": "Flood Recv Rate (unique vs duplicate/s)",
+      "description": "Inbound flood message classification: unique (first-seen) vs duplicate. Issue #2244.",
+      "gridPos": {"h": 6, "w": 8, "x": 8, "y": 107},
+      "datasource": {"type": "prometheus", "uid": "000000001"},
+      "targets": [
+        {"expr": "rate(stellar_overlay_flood_unique_recv_total{instance=~\"$instance\"}[5m])", "legendFormat": "unique"},
+        {"expr": "rate(stellar_overlay_flood_duplicate_recv_total{instance=~\"$instance\"}[5m])", "legendFormat": "duplicate"}
+      ],
+      "fieldConfig": {"defaults": {"unit": "ops", "custom": {"stacking": {"mode": "normal"}}}}
+    },
+    {
+      "id": 291,
+      "type": "timeseries",
+      "title": "Fetch Recv Rate (unique vs duplicate/s)",
+      "description": "Fetch response classification: solicited (tracked by ItemFetcher) vs unsolicited/duplicate. Issue #2244.",
+      "gridPos": {"h": 6, "w": 8, "x": 16, "y": 107},
+      "datasource": {"type": "prometheus", "uid": "000000001"},
+      "targets": [
+        {"expr": "rate(stellar_overlay_fetch_unique_recv_total{instance=~\"$instance\"}[5m])", "legendFormat": "unique"},
+        {"expr": "rate(stellar_overlay_fetch_duplicate_recv_total{instance=~\"$instance\"}[5m])", "legendFormat": "duplicate"}
+      ],
+      "fieldConfig": {"defaults": {"unit": "ops", "custom": {"stacking": {"mode": "normal"}}}}
+    },
+    {
+      "id": 292,
+      "type": "timeseries",
+      "title": "Item Fetcher Next-Peer Rate (/s)",
+      "description": "Tracker::try_next_peer AskPeer selections per second. Issue #2244.",
+      "gridPos": {"h": 6, "w": 8, "x": 0, "y": 113},
+      "datasource": {"type": "prometheus", "uid": "000000001"},
+      "targets": [
+        {"expr": "rate(stellar_overlay_item_fetcher_next_peer_total{instance=~\"$instance\"}[5m])", "legendFormat": "next_peer"}
+      ],
+      "fieldConfig": {"defaults": {"unit": "ops"}}
+    },
+    {
+      "id": 293,
+      "type": "timeseries",
+      "title": "FloodGate Known Entries",
+      "description": "Current size of the FloodGate seen-message map. Issue #2244.",
+      "gridPos": {"h": 6, "w": 8, "x": 8, "y": 113},
+      "datasource": {"type": "prometheus", "uid": "000000001"},
+      "targets": [
+        {"expr": "stellar_overlay_memory_flood_known{instance=~\"$instance\"}", "legendFormat": "flood_known"}
+      ],
+      "fieldConfig": {"defaults": {"unit": "short"}}
+    },
+    {
+      "id": 294,
       "type": "text",
-      "title": "Fetch/Flood/Item Fetcher/Send Counters — Coming in Stage F.2/F.3",
-      "description": "Panels 88-94 and 97-99 of 10334.",
-      "gridPos": {"h": 6, "w": 12, "x": 0, "y": 107},
-      "options": {"mode": "markdown", "content": "**Coming in Stage F.2/F.3** — Remaining overlay counters:\n- `stellar_overlay_fetch_{duplicate,unique}_recv_total`\n- `stellar_overlay_flood_{broadcast,duplicate_recv,unique_recv}_total`\n- `stellar_overlay_item_fetcher_next_peer_total`\n- `stellar_overlay_memory_flood_known`\n- `stellar_overlay_send_total{type=...}` (per-message-type counter)\n\n**Shipped in Stage F.1**: byte rate, async I/O rate, and connection lifecycle (rows below)."}
+      "title": "Send Counters — Coming in Stage F.3",
+      "description": "Panel 97-99 of 10334.",
+      "gridPos": {"h": 6, "w": 8, "x": 16, "y": 113},
+      "options": {"mode": "markdown", "content": "**Coming in Stage F.3** — Per-message-type send counter:\n- `stellar_overlay_send_total{type=...}`\n\n**Shipped in Stage F.2**: flood broadcast/recv, fetch recv, item fetcher, flood known gauge."}
     },
     {
       "id": 273,
       "type": "timeseries",
       "title": "Async I/O Rate (Reads/Writes per second)",
       "description": "Successful per-frame send/recv I/O operations. Mirrors stellar-core mAsyncRead/mAsyncWrite. Panels 79-80 of 10334.",
-      "gridPos": {"h": 6, "w": 12, "x": 0, "y": 113},
+      "gridPos": {"h": 6, "w": 12, "x": 0, "y": 119},
       "datasource": {"type": "prometheus", "uid": "000000001"},
       "targets": [
         {"expr": "rate(stellar_overlay_async_read_total{instance=~\"$instance\"}[5m])", "legendFormat": "async_read"},
@@ -920,7 +982,7 @@
       "type": "timeseries",
       "title": "Inbound Connection Lifecycle Rate",
       "description": "Inbound connection events per second: TCP accepts, full establishments, drops, and rejections. Panels 97-98 of 10334.",
-      "gridPos": {"h": 6, "w": 12, "x": 12, "y": 113},
+      "gridPos": {"h": 6, "w": 12, "x": 12, "y": 119},
       "datasource": {"type": "prometheus", "uid": "000000001"},
       "targets": [
         {"expr": "rate(stellar_overlay_inbound_attempt_total{instance=~\"$instance\"}[5m])", "legendFormat": "attempt"},
@@ -935,7 +997,7 @@
       "type": "timeseries",
       "title": "Outbound Connection Lifecycle Rate",
       "description": "Outbound connection events per second: dial attempts, full establishments, drops, and rejections. Panels 97-98 of 10334.",
-      "gridPos": {"h": 6, "w": 12, "x": 0, "y": 119},
+      "gridPos": {"h": 6, "w": 12, "x": 0, "y": 125},
       "datasource": {"type": "prometheus", "uid": "000000001"},
       "targets": [
         {"expr": "rate(stellar_overlay_outbound_attempt_total{instance=~\"$instance\"}[5m])", "legendFormat": "attempt"},
@@ -950,7 +1012,7 @@
       "type": "stat",
       "title": "Connection Lifecycle Totals (cumulative)",
       "description": "Cumulative attempt/establish/drop/reject counts since process start. Useful for spotting churn or runaway-rejection patterns.",
-      "gridPos": {"h": 6, "w": 12, "x": 12, "y": 119},
+      "gridPos": {"h": 6, "w": 12, "x": 12, "y": 125},
       "datasource": {"type": "prometheus", "uid": "000000001"},
       "targets": [
         {"expr": "stellar_overlay_inbound_attempt_total{instance=~\"$instance\"}", "legendFormat": "in attempt"},
@@ -969,7 +1031,7 @@
       "type": "timeseries",
       "title": "Timeout Idle",
       "description": "Peers dropped due to idle timeout. Panel 95 of 10334.",
-      "gridPos": {"h": 6, "w": 6, "x": 12, "y": 107},
+      "gridPos": {"h": 6, "w": 6, "x": 12, "y": 119},
       "datasource": {"type": "prometheus", "uid": "000000001"},
       "targets": [{"expr": "rate(stellar_overlay_timeout_idle_total{instance=~\"$instance\"}[5m])", "legendFormat": "{{instance}}"}],
       "fieldConfig": {"defaults": {"unit": "ops"}}
@@ -979,7 +1041,7 @@
       "type": "timeseries",
       "title": "Timeout Straggler",
       "description": "Peers dropped due to straggler timeout. Panel 96 of 10334.",
-      "gridPos": {"h": 6, "w": 6, "x": 18, "y": 107},
+      "gridPos": {"h": 6, "w": 6, "x": 18, "y": 119},
       "datasource": {"type": "prometheus", "uid": "000000001"},
       "targets": [{"expr": "rate(stellar_overlay_timeout_straggler_total{instance=~\"$instance\"}[5m])", "legendFormat": "{{instance}}"}],
       "fieldConfig": {"defaults": {"unit": "ops"}}
@@ -988,7 +1050,7 @@
       "type": "row",
       "title": "Overlay Operation Duration",
       "collapsed": true,
-      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 125},
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 131},
       "id": 113,
       "panels": [
         {

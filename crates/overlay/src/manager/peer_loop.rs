@@ -775,6 +775,11 @@ impl OverlayManager {
                     .flood_gate
                     .record_seen(hash, Some(peer_id.clone()), lcl);
                 ctx.peer.record_flood_stats(unique, message_size);
+                if unique {
+                    state.metrics.flood_unique_recv.inc();
+                } else {
+                    state.metrics.flood_duplicate_recv.inc();
+                }
                 let is_scp = matches!(message, StellarMessage::ScpMessage(_));
                 if !unique && !is_scp {
                     return Some(false);
@@ -786,6 +791,7 @@ impl OverlayManager {
                 // recvFloodedMsgID. Every pull-control message is "unique" from
                 // the receiver's perspective since there is no global dedup.
                 ctx.peer.record_flood_stats(true, message_size);
+                state.metrics.flood_unique_recv.inc();
             }
         } else if is_fetch_message(message) {
             ctx.peer.record_fetch_stats(true, message_size);

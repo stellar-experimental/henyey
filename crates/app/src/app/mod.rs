@@ -2256,7 +2256,11 @@ impl App {
     /// Snapshot of overlay metrics (if overlay is running).
     pub async fn overlay_metrics_snapshot(&self) -> Option<henyey_overlay::OverlayMetricsSnapshot> {
         let overlay = self.overlay.read().await;
-        overlay.as_ref().map(|o| o.overlay_metrics().snapshot())
+        overlay.as_ref().map(|o| {
+            let mut snap = o.overlay_metrics().snapshot();
+            snap.flood_known_count = o.flood_stats().seen_count as u64;
+            snap
+        })
     }
 
     /// Overlay connection breakdown by direction and state.

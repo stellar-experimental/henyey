@@ -146,10 +146,15 @@ impl FetchingEnvelopes {
         );
         let qs_cache = RandomEvictionCache::new(config.max_quorum_set_cache);
         Self {
-            tx_set_fetcher: ItemFetcher::new(ItemType::TxSet, config.tx_set_fetcher_config.clone()),
+            tx_set_fetcher: ItemFetcher::new(
+                ItemType::TxSet,
+                config.tx_set_fetcher_config.clone(),
+                None,
+            ),
             quorum_set_fetcher: ItemFetcher::new(
                 ItemType::QuorumSet,
                 config.quorum_set_fetcher_config.clone(),
+                None,
             ),
             slots: DashMap::new(),
             quorum_set_cache: Mutex::new(qs_cache),
