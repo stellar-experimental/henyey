@@ -503,6 +503,11 @@ impl SnapshotHandle {
         &self.inner.header
     }
 
+    /// Get the header hash.
+    pub fn header_hash(&self) -> Hash256 {
+        self.inner.header_hash
+    }
+
     /// Look up an entry.
     ///
     /// First checks the snapshot cache, then the prefetch cache, then falls

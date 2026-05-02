@@ -2413,41 +2413,49 @@ impl Herder {
         ) = {
             let guard = self.ledger_manager.read();
             if let Some(manager) = guard.as_ref() {
-                let snap = manager.header_snapshot();
-                let lcl_ct = snap.header.scp_value.close_time.0;
-                let max = snap.header.max_tx_set_size as usize;
-                // Capture the full SorobanNetworkInfo so it can be reused by the
-                // post-build self-validation (#2113). Derive `soroban_max` from
-                // the same value to keep both views consistent.
+                // ONE snapshot for the entire nomination pass: tx set building,
+                // seq map, config upgrade context, and self-validation providers
+                // all observe the same ledger state. Consolidation eliminates the
+                // race where a concurrent commit_close() could advance the ledger
+                // between the old multi-snapshot reads.
+                let snap = match manager.create_snapshot() {
+                    Ok(s) => s,
+                    Err(e) => {
+                        // If we can't create a consistent snapshot, abort
+                        // nomination rather than proceeding with potentially
+                        // inconsistent state. Safer but less available —
+                        // nomination will be retried on the next timer tick.
+                        tracing::warn!(
+                            error = %e,
+                            "Failed to create snapshot for nomination; aborting"
+                        );
+                        return None;
+                    }
+                };
+
+                let header = snap.header().clone();
+                let lcl_ct = header.scp_value.close_time.0;
+                let max = header.max_tx_set_size as usize;
+                let ledger_seq = snap.ledger_seq();
+                let header_hash = snap.header_hash();
+
+                // Known residual race: soroban_network_info() acquires
+                // state.read() independently from create_snapshot(). If
+                // commit_close() runs between the snapshot creation above
+                // and here, soroban_info may be from a different ledger.
+                // Impact: nomination aborts on self-validation mismatch
+                // (safe). Tracked follow-up: capture soroban_network_info
+                // inside LedgerSnapshot.
                 let soroban_info = manager.soroban_network_info();
                 let soroban_max = soroban_info.as_ref().map(|info| info.ledger_max_tx_count);
 
-                // Build one snapshot for both seq-map and validation providers.
-                let providers = match manager.create_snapshot() {
-                    Ok(snapshot) => {
-                        let ledger_seq = snap.header.ledger_seq;
-                        let seq = self.build_starting_seq_map(&snapshot, ledger_seq);
-                        let sp = crate::tx_queue::SnapshotProviders::new(snapshot);
-                        Some((seq, sp))
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            error = %e,
-                            "Failed to create snapshot for nomination; \
-                             trim_invalid will use per-call providers"
-                        );
-                        None
-                    }
-                };
+                // Build seq map from the snapshot (borrows).
+                let seq = self.build_starting_seq_map(&snap, ledger_seq);
 
-                let (seq, sp) = match providers {
-                    Some((seq, sp)) => (seq, Some(sp)),
-                    None => (None, None),
-                };
-
-                // Build config upgrade context from the same snapshot used for
-                // tx set validation. Parity: stellar-core builds config upgrade
-                // decisions from the same LedgerSnapshot as the rest of nomination.
+                // Config upgrade context from the same snapshot (borrows).
+                // ConfigUpgradeContext::from_snapshot clones the snapshot
+                // internally, so both the tx set and config context observe
+                // data from the same point in time.
                 let cfg_ctx = self
                     .runtime_upgrades
                     .read()
@@ -2455,34 +2463,27 @@ impl Herder {
                     .config_upgrade_set_key
                     .as_ref()
                     .and_then(|k| k.to_xdr().ok())
-                    .and_then(|key| {
-                        // Use a fresh snapshot from the same manager state for the
-                        // config upgrade context. This is consistent with the header
-                        // snapshot already captured.
-                        let cfg_snapshot = match manager.create_snapshot() {
-                            Ok(s) => s,
-                            Err(e) => {
-                                error!("Failed to create snapshot for config upgrade context: {e}");
-                                return None;
-                            }
-                        };
-                        match ConfigUpgradeContext::from_snapshot(&cfg_snapshot, &key) {
+                    .and_then(
+                        |key| match ConfigUpgradeContext::from_snapshot(&snap, &key) {
                             Ok(ctx) => ctx,
                             Err(e) => {
                                 error!("Error loading config upgrade context: {e}");
                                 None
                             }
-                        }
-                    });
+                        },
+                    );
+
+                // SnapshotProviders takes ownership of the snapshot.
+                let sp = crate::tx_queue::SnapshotProviders::new(snap);
 
                 (
-                    snap.hash,
+                    header_hash,
                     max,
                     seq,
-                    snap.header,
+                    header,
                     lcl_ct,
                     soroban_max,
-                    sp,
+                    Some(sp),
                     cfg_ctx,
                     soroban_info,
                 )
