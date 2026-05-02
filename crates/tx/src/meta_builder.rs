@@ -796,7 +796,7 @@ impl TransactionMetaBuilder {
     }
 
     /// Finalize to V3 meta (early Soroban, events at tx level).
-    fn finalize_v3(self, success: bool) -> TransactionMeta {
+    fn finalize_v3(self, _success: bool) -> TransactionMeta {
         let operations: Vec<OperationMeta> = self
             .operation_builders
             .into_iter()
@@ -805,13 +805,14 @@ impl TransactionMetaBuilder {
 
         let diagnostic_events = self.diagnostic_event_manager.finalize();
 
-        // V3 has Soroban meta with events at transaction level
-        let soroban_meta = if self.is_soroban && success {
+        // stellar-core always activates sorobanMeta for V3 Soroban txs,
+        // even on failure (TransactionMeta.cpp:694-697).
+        let soroban_meta = if self.is_soroban {
             Some(SorobanTransactionMeta {
                 ext: SorobanTransactionMetaExt::V0,
                 events: vec![]
                     .try_into()
-                    .expect("XDR bounded conversion must not fail"), // Events collected at tx level
+                    .expect("XDR bounded conversion must not fail"),
                 return_value: ScVal::Void,
                 diagnostic_events: diagnostic_events
                     .try_into()
@@ -1358,6 +1359,144 @@ mod tests {
                 }
             }
             _ => panic!("Expected V4 meta"),
+        }
+    }
+
+    /// Helper to create a Soroban transaction frame for testing.
+    fn create_soroban_frame() -> TransactionFrame {
+        let source = MuxedAccount::Ed25519(Uint256([0u8; 32]));
+        let soroban_op = Operation {
+            source_account: None,
+            body: OperationBody::ExtendFootprintTtl(ExtendFootprintTtlOp {
+                ext: ExtensionPoint::V0,
+                extend_to: 1000,
+            }),
+        };
+        let tx = Transaction {
+            source_account: source,
+            fee: 100,
+            seq_num: SequenceNumber(1),
+            cond: Preconditions::None,
+            memo: Memo::None,
+            operations: vec![soroban_op].try_into().unwrap(),
+            ext: TransactionExt::V0,
+        };
+        let envelope = TransactionEnvelope::Tx(TransactionV1Envelope {
+            tx,
+            signatures: vec![].try_into().unwrap(),
+        });
+        TransactionFrame::from_owned(envelope)
+    }
+
+    #[test]
+    fn test_finalize_v3_failed_soroban_preserves_diagnostic_events() {
+        let diagnostic_config = DiagnosticConfig {
+            enable_soroban_diagnostic_events: true,
+            enable_diagnostics_for_tx_submission: false,
+        };
+        let soroban_frame = create_soroban_frame();
+
+        let mut builder = TransactionMetaBuilder::new(
+            true,
+            &soroban_frame,
+            21,
+            NetworkId::testnet(),
+            ClassicEventConfig::default(),
+            &diagnostic_config,
+        );
+
+        builder.diagnostic_event_manager_mut().push_error(
+            ScError::Budget(ScErrorCode::ExceededLimit),
+            "Test error on failure",
+            vec![],
+        );
+
+        // Call finalize_v3 directly (since meta_version() always returns 4)
+        let meta = builder.finalize_v3(false);
+        match meta {
+            TransactionMeta::V3(v3) => {
+                let soroban_meta = v3
+                    .soroban_meta
+                    .expect("soroban_meta must be Some for failed Soroban tx in V3");
+                assert_eq!(
+                    soroban_meta.diagnostic_events.len(),
+                    1,
+                    "diagnostic events must be preserved on failure"
+                );
+                assert!(soroban_meta.events.is_empty());
+                assert_eq!(soroban_meta.return_value, ScVal::Void);
+            }
+            _ => panic!("Expected V3 meta"),
+        }
+    }
+
+    #[test]
+    fn test_finalize_v3_failed_soroban_without_diagnostics() {
+        let diagnostic_config = DiagnosticConfig {
+            enable_soroban_diagnostic_events: false,
+            enable_diagnostics_for_tx_submission: false,
+        };
+        let soroban_frame = create_soroban_frame();
+
+        let builder = TransactionMetaBuilder::new(
+            true,
+            &soroban_frame,
+            21,
+            NetworkId::testnet(),
+            ClassicEventConfig::default(),
+            &diagnostic_config,
+        );
+
+        // Even with diagnostics disabled, V3 Soroban meta must be Some
+        let meta = builder.finalize_v3(false);
+        match meta {
+            TransactionMeta::V3(v3) => {
+                let soroban_meta = v3
+                    .soroban_meta
+                    .expect("soroban_meta must be Some for failed Soroban tx in V3");
+                assert!(
+                    soroban_meta.diagnostic_events.is_empty(),
+                    "diagnostics disabled — events should be empty"
+                );
+                assert!(soroban_meta.events.is_empty());
+                assert_eq!(soroban_meta.return_value, ScVal::Void);
+            }
+            _ => panic!("Expected V3 meta"),
+        }
+    }
+
+    #[test]
+    fn test_finalize_v3_success_soroban_has_meta() {
+        let diagnostic_config = DiagnosticConfig {
+            enable_soroban_diagnostic_events: true,
+            enable_diagnostics_for_tx_submission: false,
+        };
+        let soroban_frame = create_soroban_frame();
+
+        let mut builder = TransactionMetaBuilder::new(
+            true,
+            &soroban_frame,
+            21,
+            NetworkId::testnet(),
+            ClassicEventConfig::default(),
+            &diagnostic_config,
+        );
+
+        builder.diagnostic_event_manager_mut().push_error(
+            ScError::Budget(ScErrorCode::ExceededLimit),
+            "Test diagnostic",
+            vec![],
+        );
+
+        let meta = builder.finalize_v3(true);
+        match meta {
+            TransactionMeta::V3(v3) => {
+                let soroban_meta = v3
+                    .soroban_meta
+                    .expect("soroban_meta must be Some for successful Soroban tx in V3");
+                assert_eq!(soroban_meta.diagnostic_events.len(), 1);
+            }
+            _ => panic!("Expected V3 meta"),
         }
     }
 
