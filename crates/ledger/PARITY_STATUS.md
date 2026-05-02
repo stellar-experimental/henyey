@@ -415,6 +415,12 @@ Features not yet implemented. These ARE counted against parity %.
 - **Ledger close meta stream tests**: No equivalent for `LedgerCloseMetaStreamTests.cpp` (3 TEST_CASE / 6 SECTION) which tests meta file rotation and streaming.
 - **Entry activation/deactivation tests**: Not applicable since Rust does not use the activation tracking pattern.
 
+## Parity Fixes
+
+| Fix | Issue | Description |
+|-----|-------|-------------|
+| Skip outer fee-bump sig re-check at apply | #2270 (AUDIT-245) | stellar-core's `FeeBumpTransactionFrame::apply()` does not re-validate outer (fee source) signatures. Henyey was re-checking them in `validate_preconditions`, causing consensus divergence when a prior TX in the same ledger modified the fee source's signer set. Fixed by skipping the outer `has_sufficient_signer_weight` check for fee-bump transactions during apply, matching stellar-core's trust-from-consensus design. |
+
 ## Verification Results
 
 The ledger crate has been verified against testnet for ledger close correctness. Header hash matches, bucket list hash matches, and transaction metadata are compared during online catchup and replay.

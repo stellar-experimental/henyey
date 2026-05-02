@@ -421,25 +421,25 @@ impl TransactionExecutor {
         let val_tx_hash_us = hash_start.elapsed().as_micros() as u64;
 
         let ed25519_start = std::time::Instant::now();
-        let outer_threshold = threshold_low(&fee_source_account);
-        if !has_sufficient_signer_weight(
-            &outer_hash,
-            frame.signatures(),
-            &fee_source_account,
-            outer_threshold,
-        ) {
-            tracing::debug!("Signature check failed: fee_source outer check");
-            if is_fee_bump {
-                // Fee-bump outer signature failure: stellar-core's
-                // FeeBumpTransactionFrame::commonValid → setError(txBAD_AUTH).
-                let mut result =
-                    failed_result(TransactionResultCode::TxBadAuth, "Invalid signature");
-                result.fee_bump_outer_failure = true;
-                return Ok(Err(ValidationFailure {
-                    result,
-                    past_seq_check: true,
-                }));
-            } else {
+        // For fee-bump transactions, the outer (fee source) signature was validated
+        // during tx-set construction / consensus validation (tx_set_utils.rs:427-431).
+        // At apply time, stellar-core does NOT re-check it —
+        // FeeBumpTransactionFrame::apply only calls removeOneTimeSignerKeyFromFeeSource
+        // + inner apply. Skip the re-check to match parity: a prior TX in the same
+        // ledger may have modified the fee source's signer set (removed a signer,
+        // lowered weight, changed thresholds, or disabled master weight).
+        //
+        // PRECONDITION: This function trusts that outer fee-bump auth was validated
+        // by consensus/tx-set validation before reaching execution.
+        if !is_fee_bump {
+            let outer_threshold = threshold_low(&fee_source_account);
+            if !has_sufficient_signer_weight(
+                &outer_hash,
+                frame.signatures(),
+                &fee_source_account,
+                outer_threshold,
+            ) {
+                tracing::debug!("Signature check failed: fee_source outer check");
                 return Ok(Err(post_seq_fail(
                     TransactionResultCode::TxBadAuth,
                     "Invalid signature",
