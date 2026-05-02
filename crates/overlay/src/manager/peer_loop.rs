@@ -780,8 +780,7 @@ impl OverlayManager {
                 } else {
                     state.metrics.flood_duplicate_recv.inc();
                 }
-                let is_scp = matches!(message, StellarMessage::ScpMessage(_));
-                if !unique && !is_scp {
+                if !unique {
                     return Some(false);
                 }
             } else {

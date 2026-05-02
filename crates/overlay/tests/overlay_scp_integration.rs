@@ -93,7 +93,7 @@ async fn test_overlay_scp_message_roundtrip() {
 }
 
 #[tokio::test]
-async fn test_overlay_scp_duplicate_is_forwarded_to_receiver() {
+async fn test_overlay_scp_duplicate_is_dropped_at_overlay() {
     let Some(port_a) = allocate_port() else {
         eprintln!("skipping test: tcp bind not permitted in this environment");
         return;
@@ -142,18 +142,18 @@ async fn test_overlay_scp_duplicate_is_forwarded_to_receiver() {
         .await
         .expect("broadcast duplicate");
 
+    // First (unique) SCP message should arrive.
     let first = timeout(Duration::from_secs(5), async {
         scp_rx_b.recv().await.expect("recv first scp")
     })
     .await
     .expect("timeout waiting first scp");
-
-    let second = timeout(Duration::from_secs(5), async {
-        scp_rx_b.recv().await.expect("recv second scp")
-    })
-    .await
-    .expect("timeout waiting duplicate scp");
-
     assert!(matches!(first.message, StellarMessage::ScpMessage(_)));
-    assert!(matches!(second.message, StellarMessage::ScpMessage(_)));
+
+    // Duplicate should be dropped at the overlay level — no second message arrives.
+    let second = timeout(Duration::from_millis(500), async { scp_rx_b.recv().await }).await;
+    assert!(
+        second.is_err(),
+        "duplicate SCP message should have been dropped at overlay, but was forwarded"
+    );
 }
