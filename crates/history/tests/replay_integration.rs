@@ -585,3 +585,333 @@ async fn test_catchup_recent_large_gap_bucket_apply() {
         "ledger manager should advance to target"
     );
 }
+
+/// Regression test for #2292: when the LedgerManager has a synthetic genesis
+/// at protocol version 0, but the actual archive genesis is at version 25,
+/// `download_ledger_data` must self-correct the LCL protocol version from
+/// the archive and use Generalized v23+ format for empty tx set synthesis.
+///
+/// This test verifies the end-to-end catchup path works correctly when:
+/// - Genesis (ledger 1) is at protocol 25 (USE_CONFIG_FOR_GENESIS)
+/// - Ledger 64 has no transactions (empty tx set synthesized as Generalized)
+/// - The tx set hash in ledger 64 uses Generalized v23+ format
+#[tokio::test]
+async fn test_catchup_self_corrects_lcl_protocol_from_archive() {
+    use stellar_xdr::curr::{
+        GeneralizedTransactionSet, ParallelTxsComponent, TransactionPhase, TransactionSetV1,
+    };
+
+    let checkpoint = 63u32;
+    let target = 64u32;
+    let data_checkpoint = henyey_history::checkpoint::checkpoint_containing(target);
+
+    let bucket_list = empty_bucket_list();
+    let checkpoint_bucket_hash = combined_bucket_list_hash(bucket_list.hash());
+
+    // Build header chain: genesis (ledger 1) at protocol 23 through ledger 64.
+    // This simulates a quickstart network with USE_CONFIG_FOR_GENESIS=true.
+    let mut headers: Vec<(u32, LedgerHeader, Hash256)> = Vec::new();
+
+    // Helper: compute Generalized v23+ empty tx set hash for a given prev_hash.
+    let compute_empty_gen_tx_set_hash = |prev_hash: &Hash256| -> Hash256 {
+        let classic_phase = TransactionPhase::V0(VecM::default());
+        let soroban_phase = TransactionPhase::V1(ParallelTxsComponent {
+            base_fee: None,
+            execution_stages: VecM::default(),
+        });
+        let gen_set = GeneralizedTransactionSet::V1(TransactionSetV1 {
+            previous_ledger_hash: Hash(*prev_hash.as_bytes()),
+            phases: vec![classic_phase, soroban_phase]
+                .try_into()
+                .unwrap_or_default(),
+        });
+        let gen_set_variant = TransactionSetVariant::Generalized(gen_set);
+        verify::compute_tx_set_hash(&gen_set_variant).expect("tx set hash")
+    };
+
+    // Compute tx result hash (empty, same for every ledger)
+    let empty_result_set = TransactionResultSet {
+        results: VecM::default(),
+    };
+    let empty_result_xdr = empty_result_set
+        .to_xdr(stellar_xdr::curr::Limits::none())
+        .expect("tx result xdr");
+    let empty_tx_result_hash = Hash256::hash(&empty_result_xdr);
+
+    // Ledger 1 (genesis): protocol 23, all hashes zero for simplicity.
+    let header1 = LedgerHeader {
+        ledger_version: 25, // <-- USE_CONFIG_FOR_GENESIS protocol
+        previous_ledger_hash: Hash([0u8; 32]),
+        scp_value: StellarValue {
+            tx_set_hash: Hash([0u8; 32]),
+            close_time: TimePoint(0),
+            upgrades: VecM::default(),
+            ext: StellarValueExt::Basic,
+        },
+        tx_set_result_hash: Hash([0u8; 32]),
+        bucket_list_hash: Hash([0u8; 32]),
+        ledger_seq: 1,
+        total_coins: 1_000_000,
+        fee_pool: 0,
+        inflation_seq: 0,
+        id_pool: 0,
+        base_fee: 100,
+        base_reserve: 100,
+        max_tx_set_size: 100,
+        skip_list: [
+            Hash([0u8; 32]),
+            Hash([0u8; 32]),
+            Hash([0u8; 32]),
+            Hash([0u8; 32]),
+        ],
+        ext: LedgerHeaderExt::V0,
+    };
+    let hash1 = verify::compute_header_hash(&header1).expect("header1 hash");
+    headers.push((1, header1, hash1));
+
+    // Ledgers 2..63: protocol 23, empty tx sets (Generalized format)
+    let mut prev_hash = hash1;
+    for seq in 2..=checkpoint {
+        let tx_set_hash = compute_empty_gen_tx_set_hash(&prev_hash);
+        let bucket_hash = if seq == checkpoint {
+            checkpoint_bucket_hash
+        } else {
+            Hash256::ZERO
+        };
+        let header = LedgerHeader {
+            ledger_version: 25,
+            previous_ledger_hash: Hash(*prev_hash.as_bytes()),
+            scp_value: StellarValue {
+                tx_set_hash: Hash(*tx_set_hash.as_bytes()),
+                close_time: TimePoint(0),
+                upgrades: VecM::default(),
+                ext: StellarValueExt::Basic,
+            },
+            tx_set_result_hash: Hash(*empty_tx_result_hash.as_bytes()),
+            bucket_list_hash: Hash(*bucket_hash.as_bytes()),
+            ledger_seq: seq,
+            total_coins: 1_000_000,
+            fee_pool: 0,
+            inflation_seq: 0,
+            id_pool: 0,
+            base_fee: 100,
+            base_reserve: 100,
+            max_tx_set_size: 100,
+            skip_list: [
+                Hash([0u8; 32]),
+                Hash([0u8; 32]),
+                Hash([0u8; 32]),
+                Hash([0u8; 32]),
+            ],
+            ext: LedgerHeaderExt::V0,
+        };
+        let hash = verify::compute_header_hash(&header).expect("header hash");
+        headers.push((seq, header, hash));
+        prev_hash = hash;
+    }
+
+    // Ledger 64 (target): also protocol 23, empty tx set in Generalized format.
+    // This is the ledger where the bug manifested in CI (different format expected).
+    let tx_set_hash_64 = compute_empty_gen_tx_set_hash(&prev_hash);
+    let header64 = LedgerHeader {
+        ledger_version: 25,
+        previous_ledger_hash: Hash(*prev_hash.as_bytes()),
+        scp_value: StellarValue {
+            tx_set_hash: Hash(*tx_set_hash_64.as_bytes()),
+            close_time: TimePoint(0),
+            upgrades: VecM::default(),
+            ext: StellarValueExt::Basic,
+        },
+        tx_set_result_hash: Hash(*empty_tx_result_hash.as_bytes()),
+        bucket_list_hash: Hash([0u8; 32]), // not verified
+        ledger_seq: target,
+        total_coins: 1_000_000,
+        fee_pool: 0,
+        inflation_seq: 0,
+        id_pool: 0,
+        base_fee: 100,
+        base_reserve: 100,
+        max_tx_set_size: 100,
+        skip_list: [
+            Hash([0u8; 32]),
+            Hash([0u8; 32]),
+            Hash([0u8; 32]),
+            Hash([0u8; 32]),
+        ],
+        ext: LedgerHeaderExt::V0,
+    };
+    let hash64 = verify::compute_header_hash(&header64).expect("header64 hash");
+    headers.push((target, header64, hash64));
+
+    // Build fixtures: headers for checkpoint 63 (ledgers 1-63) and data_checkpoint (64)
+    let mut fixtures: HashMap<String, Vec<u8>> = HashMap::new();
+
+    // Headers for checkpoint 63
+    let cp63_entries: Vec<Vec<u8>> = headers
+        .iter()
+        .filter(|(seq, _, _)| *seq <= checkpoint)
+        .map(|(_, header, hash)| {
+            let entry = LedgerHeaderHistoryEntry {
+                hash: Hash(*hash.as_bytes()),
+                header: header.clone(),
+                ext: LedgerHeaderHistoryEntryExt::default(),
+            };
+            entry
+                .to_xdr(stellar_xdr::curr::Limits::none())
+                .expect("header xdr")
+        })
+        .collect();
+    fixtures.insert(
+        checkpoint_path("ledger", checkpoint, "xdr.gz"),
+        gzip_bytes(&record_marked(&cp63_entries)),
+    );
+
+    // Headers for data_checkpoint (contains ledger 64)
+    let cp_data_entries: Vec<Vec<u8>> = headers
+        .iter()
+        .filter(|(seq, _, _)| {
+            henyey_history::checkpoint::checkpoint_containing(*seq) == data_checkpoint
+                && *seq > checkpoint
+        })
+        .map(|(_, header, hash)| {
+            let entry = LedgerHeaderHistoryEntry {
+                hash: Hash(*hash.as_bytes()),
+                header: header.clone(),
+                ext: LedgerHeaderHistoryEntryExt::default(),
+            };
+            entry
+                .to_xdr(stellar_xdr::curr::Limits::none())
+                .expect("header xdr")
+        })
+        .collect();
+    if !cp_data_entries.is_empty() && data_checkpoint != checkpoint {
+        fixtures.insert(
+            checkpoint_path("ledger", data_checkpoint, "xdr.gz"),
+            gzip_bytes(&record_marked(&cp_data_entries)),
+        );
+    }
+
+    // Empty transaction and result files
+    fixtures.insert(
+        checkpoint_path("transactions", checkpoint, "xdr.gz"),
+        gzip_bytes(&[]),
+    );
+    fixtures.insert(
+        checkpoint_path("results", checkpoint, "xdr.gz"),
+        gzip_bytes(&[]),
+    );
+    if data_checkpoint != checkpoint {
+        fixtures.insert(
+            checkpoint_path("transactions", data_checkpoint, "xdr.gz"),
+            gzip_bytes(&[]),
+        );
+        fixtures.insert(
+            checkpoint_path("results", data_checkpoint, "xdr.gz"),
+            gzip_bytes(&[]),
+        );
+    }
+
+    // HAS
+    let mut levels = Vec::with_capacity(BUCKET_LIST_LEVELS);
+    for _ in 0..BUCKET_LIST_LEVELS {
+        levels.push(HASBucketLevel {
+            curr: "0".repeat(64),
+            snap: "0".repeat(64),
+            next: Default::default(),
+        });
+    }
+    let has = HistoryArchiveState {
+        version: 2,
+        server: Some("henyey test".to_string()),
+        current_ledger: checkpoint,
+        network_passphrase: Some("Test SDF Network ; September 2015".to_string()),
+        current_buckets: levels,
+        hot_archive_buckets: None,
+    };
+    fixtures.insert(
+        checkpoint_path("history", checkpoint, "json"),
+        has.to_json().unwrap().into_bytes(),
+    );
+
+    // Serve via Axum
+    let fixtures = Arc::new(fixtures);
+    let app =
+        Router::new()
+            .route(
+                "/*path",
+                get(
+                    |Path(path): Path<String>,
+                     State(state): State<Arc<HashMap<String, Vec<u8>>>>| async move {
+                        let key = path.trim_start_matches('/');
+                        if let Some(body) = state.get(key) {
+                            (StatusCode::OK, body.clone())
+                        } else {
+                            (StatusCode::NOT_FOUND, Vec::new())
+                        }
+                    },
+                ),
+            )
+            .with_state(Arc::clone(&fixtures));
+
+    let listener = match TcpListener::bind("127.0.0.1:0").await {
+        Ok(listener) => listener,
+        Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
+            eprintln!("skipping test: tcp bind not permitted in this environment");
+            return;
+        }
+        Err(err) => panic!("bind: {err}"),
+    };
+    let addr = listener.local_addr().expect("addr");
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("serve");
+    });
+
+    let base_url = format!("http://{}/", addr);
+    let archive = HistoryArchive::new(&base_url).expect("archive");
+
+    let bucket_dir = tempfile::tempdir().expect("bucket dir");
+    let bucket_manager =
+        henyey_bucket::BucketManager::new(bucket_dir.path().to_path_buf()).expect("bucket manager");
+    let db = Database::open_in_memory().expect("db");
+
+    let ledger_manager = henyey_ledger::LedgerManager::new(
+        "Test SDF Network ; September 2015".to_string(),
+        henyey_ledger::LedgerManagerConfig {
+            validate_bucket_hash: false,
+            ..Default::default()
+        },
+    );
+
+    let mut manager = CatchupManagerBuilder::new()
+        .add_archive(archive)
+        .bucket_manager(bucket_manager)
+        .database(db)
+        .options(CatchupOptions {
+            verify_buckets: false,
+            verify_headers: false,
+        })
+        .build()
+        .expect("catchup manager");
+
+    manager.set_replay_config(henyey_history::ReplayConfig {
+        verify_bucket_list: false,
+        verify_results: false,
+        verify_header_hash: false,
+        ..Default::default()
+    });
+
+    // This exercises the fix: after bucket-apply at checkpoint 63, the
+    // LedgerManager is at version 23. Then download_ledger_data(63, 64, 23)
+    // resolves the LCL header from the archive (also 23) and uses Generalized
+    // format for the empty tx set. Without the Generalized format support at
+    // protocol 23, this would fail with "invalid tx set hash at ledger 64".
+    let output = manager
+        .catchup_to_ledger(target, &ledger_manager)
+        .await
+        .expect("catchup should succeed with genesis at protocol 25 and Generalized tx sets");
+
+    assert_eq!(output.ledger_seq, target);
+    assert_eq!(output.ledgers_applied, 1);
+    let final_header = ledger_manager.current_header();
+    assert_eq!(final_header.ledger_seq, target);
+}

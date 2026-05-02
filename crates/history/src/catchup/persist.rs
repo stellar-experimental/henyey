@@ -841,4 +841,61 @@ mod tests {
             other => panic!("expected InvalidTxSetHash, got: {}", other),
         }
     }
+
+    #[test]
+    fn test_empty_tx_set_hash_ci_regression_genesis_v23() {
+        // Regression test for #2292: quickstart galexie CI failure.
+        // The actual network genesis is at protocol 23, but henyey's synthetic
+        // genesis was at protocol 0. Verify that make_empty_tx_set with protocol
+        // 23 produces the Generalized v23+ format and that using protocol 0
+        // instead produces a Classic format with a different hash (the bug).
+        use crate::verify::{compute_tx_set_hash, verify_tx_set};
+        use henyey_ledger::TransactionSetVariant;
+
+        let prev_hash = Hash([0x42; 32]);
+
+        // With protocol 23, should produce Generalized tx set
+        let tx_set_v23 = make_empty_tx_set(&prev_hash, 23);
+        assert!(
+            matches!(tx_set_v23, TransactionSetVariant::Generalized(_)),
+            "protocol 23 should produce Generalized tx set"
+        );
+        let hash_v23 = compute_tx_set_hash(&tx_set_v23).expect("hash computation");
+
+        // With protocol 0, should produce Classic tx set (the bug)
+        let tx_set_v0 = make_empty_tx_set(&prev_hash, 0);
+        assert!(
+            matches!(tx_set_v0, TransactionSetVariant::Classic(_)),
+            "protocol 0 should produce Classic tx set"
+        );
+        let hash_v0 = compute_tx_set_hash(&tx_set_v0).expect("hash computation");
+
+        // They must differ — this is the exact mismatch from #2292
+        assert_ne!(
+            hash_v23, hash_v0,
+            "protocol 23 and 0 must produce different hashes for same prev_hash"
+        );
+
+        // Build a header that expects the v23 hash (simulating stellar-core's output)
+        let header = LedgerHeader {
+            ledger_seq: 2,
+            ledger_version: 23,
+            previous_ledger_hash: prev_hash,
+            scp_value: stellar_xdr::curr::StellarValue {
+                tx_set_hash: stellar_xdr::curr::Hash(hash_v23.0),
+                close_time: stellar_xdr::curr::TimePoint(0),
+                upgrades: Default::default(),
+                ext: stellar_xdr::curr::StellarValueExt::Basic,
+            },
+            ..Default::default()
+        };
+
+        // Correct protocol → verify passes
+        verify_tx_set(&header, &tx_set_v23)
+            .expect("v23 tx set should pass verification against v23 header");
+
+        // Wrong protocol → verify fails (reproduces #2292)
+        verify_tx_set(&header, &tx_set_v0)
+            .expect_err("v0 tx set should fail verification against v23 header");
+    }
 }

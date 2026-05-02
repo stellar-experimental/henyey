@@ -315,10 +315,18 @@ impl CatchupManager {
             return Ok(data);
         }
 
-        // Track the LCL protocol version across the loop. For the first ledger,
-        // this is the caller-provided value. For subsequent ledgers, it's the
-        // prior header's ledger_version (since that header becomes the new LCL).
-        let mut current_lcl_protocol = lcl_protocol_version;
+        // Resolve the LCL protocol version from the archive when from_ledger > 0.
+        // The caller-provided value may be stale (e.g., synthetic genesis at
+        // version 0 when the actual network genesis is at version 25+).
+        // We use download_checkpoint_header (lightweight single-header fetch)
+        // rather than downloading the full checkpoint data.
+        let mut current_lcl_protocol = if from_ledger > 0 {
+            let (lcl_header, _) = self.download_checkpoint_header(from_ledger).await?;
+            lcl_header.ledger_version
+        } else {
+            // from_ledger == 0 means "before genesis"; protocol 0 is correct.
+            lcl_protocol_version
+        };
 
         for seq in start..=to_ledger {
             self.progress.current_ledger = seq;
