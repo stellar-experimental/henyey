@@ -399,6 +399,8 @@ pub struct ScpVerifyMetrics {
     pub verify_latency_us_sum: u64,
     /// Count of samples accumulated in `verify_latency_us_sum`.
     pub verify_latency_count: u64,
+    /// Count of SCP envelopes rejected by the in-flight scheduled dedup check.
+    pub scheduled_dedup_count: u64,
 }
 
 /// Overlay connection breakdown by direction and state.

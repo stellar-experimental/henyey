@@ -176,6 +176,8 @@ metric_catalog! {
             => "Enqueue-to-post-verify latency microseconds (cumulative sum)";
         SCP_VERIFY_LATENCY_US_COUNT = "henyey_scp_verify_latency_us_count"
             => "Enqueue-to-post-verify latency sample count";
+        SCP_SCHEDULED_DEDUP_TOTAL = "henyey_scp_scheduled_dedup_total"
+            => "SCP envelopes rejected by in-flight scheduled dedup";
 
         // Overlay fetch channel.
         OVERLAY_FETCH_CHANNEL_DEPTH = "henyey_overlay_fetch_channel_depth"
@@ -761,6 +763,7 @@ pub(crate) async fn refresh_gauges(state: &ServerState) {
     gauge!(SCP_VERIFIER_THREAD_STATE).set(sv.verifier_thread_state as f64);
     gauge!(SCP_VERIFY_LATENCY_US_SUM).set(sv.verify_latency_us_sum as f64);
     gauge!(SCP_VERIFY_LATENCY_US_COUNT).set(sv.verify_latency_count as f64);
+    counter!(SCP_SCHEDULED_DEDUP_TOTAL).absolute(sv.scheduled_dedup_count);
 
     // Overlay fetch channel.
     gauge!(OVERLAY_FETCH_CHANNEL_DEPTH).set(snap.overlay_fetch_channel.depth as f64);
