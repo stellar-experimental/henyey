@@ -253,8 +253,15 @@ pub fn run_transactions_on_executor(params: RunTransactionsParams<'_>) -> Result
 
     // Protocol 23+: Apply Soroban fee refunds after ALL transactions
     if has_pre_charged {
-        let post_fee_changes_list =
-            apply_soroban_fee_refunds(executor, transactions, &results, ledger_seq);
+        let post_fee_changes_list = apply_soroban_fee_refunds(
+            executor,
+            transactions,
+            &mut results,
+            &mut tx_results,
+            &mut tx_result_metas,
+            ledger_seq,
+            protocol_version,
+        );
         // Patch post_tx_apply_fee_processing in the per-tx metas
         for (tx_idx, changes) in post_fee_changes_list {
             if tx_idx < tx_result_metas.len() {
@@ -352,8 +359,40 @@ fn compute_max_seq_num_to_apply(executor: &mut TransactionExecutor, transactions
     }
 }
 
+/// Correct fee_charged in a TransactionResultPair after a failed refund application.
+///
+/// When the eager `fee_charged = charged_fee - refund` was set but the refund
+/// could not be applied (account merged/missing/overflow), this restores fee_charged
+/// to the full pre-charged amount by adding the refund back.
+///
+/// For fee-bump transactions on protocol < 25, also corrects the inner result's
+/// fee_charged (stellar-core compatibility: inner fee included refund subtraction
+/// prior to protocol 25, see MutableTransactionResult.cpp:421-443).
+///
+/// Matches stellar-core behavior where `finalizeFeeRefund` is never called when
+/// `addBalance` fails (TransactionFrame.cpp:1073-1079).
+fn correct_fee_charged_on_failed_refund(
+    pair: &mut TransactionResultPair,
+    refund: i64,
+    protocol_version: u32,
+) {
+    pair.result.fee_charged += refund;
+    if !protocol_version_starts_from(protocol_version, ProtocolVersion::V25) {
+        if let TransactionResultResult::TxFeeBumpInnerSuccess(ref mut inner)
+        | TransactionResultResult::TxFeeBumpInnerFailed(ref mut inner) = pair.result.result
+        {
+            inner.result.fee_charged += refund;
+        }
+    }
+}
+
 /// Apply Soroban fee refunds after all transactions (protocol 23+).
 /// Apply fee refunds and return per-tx post_fee_changes for meta emission.
+///
+/// On successful refund application, the fee pool is adjusted and meta is emitted.
+/// On failed refund application, fee_charged is corrected back to the full
+/// pre-charged amount in both the TransactionResultPair and TransactionResultMetaV1
+/// (matching stellar-core where finalizeFeeRefund is gated on addBalance success).
 ///
 /// Returns a Vec of (tx_index, LedgerEntryChanges) for transactions that had
 /// non-zero refunds successfully applied. Matches stellar-core's
@@ -361,8 +400,11 @@ fn compute_max_seq_num_to_apply(executor: &mut TransactionExecutor, transactions
 fn apply_soroban_fee_refunds(
     executor: &mut TransactionExecutor,
     transactions: &[TxWithFee],
-    results: &[TransactionExecutionResult],
+    results: &mut [TransactionExecutionResult],
+    tx_results: &mut [TransactionResultPair],
+    tx_result_metas: &mut [TransactionResultMetaV1],
     ledger_seq: u32,
+    protocol_version: u32,
 ) -> Vec<(usize, stellar_xdr::curr::LedgerEntryChanges)> {
     use stellar_xdr::curr::{LedgerEntryChange, LedgerEntryChanges, LedgerKeyAccount};
 
@@ -406,12 +448,26 @@ fn apply_soroban_fee_refunds(
                     "Applied P23+ Soroban fee refund"
                 );
             } else {
+                // Refund failed — correct fee_charged back to full pre-charged fee.
+                // Matches stellar-core where finalizeFeeRefund is never called on
+                // failed addBalance (TransactionFrame.cpp:1073-1076).
+                correct_fee_charged_on_failed_refund(
+                    &mut tx_results[idx],
+                    refund,
+                    protocol_version,
+                );
+                correct_fee_charged_on_failed_refund(
+                    &mut tx_result_metas[idx].result,
+                    refund,
+                    protocol_version,
+                );
+                results[idx].fee_charged += refund;
                 tracing::debug!(
                     ledger_seq = ledger_seq,
                     tx_index = idx,
                     refund = refund,
                     fee_source = %account_id_to_strkey(&fee_source_id),
-                    "Skipped Soroban fee refund (account merged or balance overflow)"
+                    "Skipped Soroban fee refund (account merged or balance overflow), corrected feeCharged"
                 );
             }
         }
@@ -807,11 +863,12 @@ pub fn execute_soroban_parallel_phase(
     // processRefund() which applies refund to both the account balance
     // (via LedgerTxn) and the fee pool (feePool -= refund).
     // Only adjust fee pool if the refund was actually credited.
+    // On failure, correct fee_charged back to full pre-charged fee (AUDIT-233).
     // Also capture STATE/UPDATED changes for post_tx_apply_fee_processing meta.
     use stellar_xdr::curr::{LedgerEntryChange, LedgerEntryChanges};
     let mut total_refunds = 0i64;
-    for (idx, result) in all_results.iter().enumerate() {
-        let refund = result.fee_refund;
+    for idx in 0..all_results.len() {
+        let refund = all_results[idx].fee_refund;
         if refund > 0 && idx < flat_txs.len() {
             let source = fee_source_account_id(flat_txs[idx]);
             let account_key = LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
@@ -834,6 +891,23 @@ pub fn execute_soroban_parallel_phase(
                         }
                     }
                 }
+            } else {
+                // Refund failed — correct fee_charged back to full pre-charged fee.
+                // Matches stellar-core where finalizeFeeRefund is never called on
+                // failed addBalance (TransactionFrame.cpp:1073-1076).
+                correct_fee_charged_on_failed_refund(
+                    &mut all_tx_results[idx],
+                    refund,
+                    context.protocol_version,
+                );
+                if idx < all_tx_result_metas.len() {
+                    correct_fee_charged_on_failed_refund(
+                        &mut all_tx_result_metas[idx].result,
+                        refund,
+                        context.protocol_version,
+                    );
+                }
+                all_results[idx].fee_charged += refund;
             }
         }
     }
@@ -1860,6 +1934,103 @@ mod tests {
                 }
                 _ => panic!("wrong entry data variant"),
             }
+        }
+    }
+
+    // --- Tests for correct_fee_charged_on_failed_refund (AUDIT-233) ---
+
+    fn make_simple_tx_result_pair(fee_charged: i64) -> TransactionResultPair {
+        TransactionResultPair {
+            transaction_hash: stellar_xdr::curr::Hash([0u8; 32]),
+            result: TransactionResult {
+                fee_charged,
+                result: TransactionResultResult::TxSuccess(Vec::new().try_into().unwrap()),
+                ext: TransactionResultExt::V0,
+            },
+        }
+    }
+
+    fn make_fee_bump_tx_result_pair(
+        outer_fee_charged: i64,
+        inner_fee_charged: i64,
+    ) -> TransactionResultPair {
+        let inner_pair = InnerTransactionResultPair {
+            transaction_hash: stellar_xdr::curr::Hash([1u8; 32]),
+            result: InnerTransactionResult {
+                fee_charged: inner_fee_charged,
+                result: InnerTransactionResultResult::TxSuccess(Vec::new().try_into().unwrap()),
+                ext: InnerTransactionResultExt::V0,
+            },
+        };
+        TransactionResultPair {
+            transaction_hash: stellar_xdr::curr::Hash([0u8; 32]),
+            result: TransactionResult {
+                fee_charged: outer_fee_charged,
+                result: TransactionResultResult::TxFeeBumpInnerSuccess(inner_pair),
+                ext: TransactionResultExt::V0,
+            },
+        }
+    }
+
+    #[test]
+    fn test_correct_fee_charged_non_fee_bump() {
+        // Non-fee-bump: outer fee_charged should be restored by adding refund back
+        let mut pair = make_simple_tx_result_pair(7000); // charged_fee=10000, refund=3000, eager=7000
+        correct_fee_charged_on_failed_refund(&mut pair, 3000, 24);
+        assert_eq!(pair.result.fee_charged, 10000);
+    }
+
+    #[test]
+    fn test_correct_fee_charged_fee_bump_protocol_24() {
+        // Fee-bump on p24: both outer and inner should be corrected
+        let mut pair = make_fee_bump_tx_result_pair(7000, 4000); // outer: 10000-3000, inner: 7000-3000
+        correct_fee_charged_on_failed_refund(&mut pair, 3000, 24);
+        assert_eq!(pair.result.fee_charged, 10000); // outer restored
+        if let TransactionResultResult::TxFeeBumpInnerSuccess(ref inner) = pair.result.result {
+            assert_eq!(inner.result.fee_charged, 7000); // inner restored
+        } else {
+            panic!("expected TxFeeBumpInnerSuccess");
+        }
+    }
+
+    #[test]
+    fn test_correct_fee_charged_fee_bump_protocol_25() {
+        // Fee-bump on p25: only outer corrected, inner stays at 0
+        let mut pair = make_fee_bump_tx_result_pair(7000, 0); // outer: 10000-3000, inner: 0 (p25)
+        correct_fee_charged_on_failed_refund(&mut pair, 3000, 25);
+        assert_eq!(pair.result.fee_charged, 10000); // outer restored
+        if let TransactionResultResult::TxFeeBumpInnerSuccess(ref inner) = pair.result.result {
+            assert_eq!(inner.result.fee_charged, 0); // inner unchanged (p25)
+        } else {
+            panic!("expected TxFeeBumpInnerSuccess");
+        }
+    }
+
+    #[test]
+    fn test_correct_fee_charged_fee_bump_inner_failed_protocol_24() {
+        // Fee-bump inner failed on p24: both outer and inner should be corrected
+        let inner_pair = InnerTransactionResultPair {
+            transaction_hash: stellar_xdr::curr::Hash([1u8; 32]),
+            result: InnerTransactionResult {
+                fee_charged: 4000,
+                result: InnerTransactionResultResult::TxFailed(Vec::new().try_into().unwrap()),
+                ext: InnerTransactionResultExt::V0,
+            },
+        };
+        let mut pair = TransactionResultPair {
+            transaction_hash: stellar_xdr::curr::Hash([0u8; 32]),
+            result: TransactionResult {
+                fee_charged: 7000,
+                result: TransactionResultResult::TxFeeBumpInnerFailed(inner_pair),
+                ext: TransactionResultExt::V0,
+            },
+        };
+        correct_fee_charged_on_failed_refund(&mut pair, 3000, 24);
+        assert_eq!(pair.result.fee_charged, 10000);
+        if let TransactionResultResult::TxFeeBumpInnerFailed(ref inner) = pair.result.result {
+            assert_eq!(inner.result.fee_charged, 7000);
+        } else {
+            panic!("expected TxFeeBumpInnerFailed");
         }
     }
 }
