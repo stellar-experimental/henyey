@@ -783,7 +783,7 @@
       "options": {"mode": "markdown", "content": "**Coming in Stage F.2/F.3** — Remaining overlay counters:\n- `stellar_overlay_fetch_{duplicate,unique}_recv_total`\n- `stellar_overlay_flood_{broadcast,duplicate_recv,unique_recv}_total`\n- `stellar_overlay_item_fetcher_next_peer_total`\n- `stellar_overlay_memory_flood_known`\n- `stellar_overlay_send_total{type=...}` (per-message-type counter)\n\n**Shipped in Stage F.1**: byte rate, async I/O rate, and connection lifecycle (rows below)."}
     },
     {
-      "id": 113,
+      "id": 273,
       "type": "timeseries",
       "title": "Async I/O Rate (Reads/Writes per second)",
       "description": "Successful per-frame send/recv I/O operations. Mirrors stellar-core mAsyncRead/mAsyncWrite. Panels 79-80 of 10334.",
@@ -796,7 +796,7 @@
       "fieldConfig": {"defaults": {"unit": "ops"}}
     },
     {
-      "id": 114,
+      "id": 274,
       "type": "timeseries",
       "title": "Inbound Connection Lifecycle Rate",
       "description": "Inbound connection events per second: TCP accepts, full establishments, drops, and rejections. Panels 97-98 of 10334.",
@@ -811,7 +811,7 @@
       "fieldConfig": {"defaults": {"unit": "ops"}}
     },
     {
-      "id": 115,
+      "id": 275,
       "type": "timeseries",
       "title": "Outbound Connection Lifecycle Rate",
       "description": "Outbound connection events per second: dial attempts, full establishments, drops, and rejections. Panels 97-98 of 10334.",
@@ -826,7 +826,7 @@
       "fieldConfig": {"defaults": {"unit": "ops"}}
     },
     {
-      "id": 116,
+      "id": 276,
       "type": "stat",
       "title": "Connection Lifecycle Totals (cumulative)",
       "description": "Cumulative attempt/establish/drop/reject counts since process start. Useful for spotting churn or runaway-rejection patterns.",
@@ -868,7 +868,7 @@
       "type": "row",
       "title": "Overlay Operation Duration",
       "collapsed": true,
-      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 113},
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 125},
       "id": 113,
       "panels": [
         {
