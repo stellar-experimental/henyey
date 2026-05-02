@@ -523,10 +523,14 @@ pub(super) fn default_success_op_result(op: &Operation) -> OperationResult {
 }
 
 /// Default empty offer success result used for manage offer operations.
+/// stellar-core default-constructs ManageOfferSuccessResult with MANAGE_OFFER_CREATED (0)
+/// discriminant and a zero-initialized OfferEntry payload.
 fn empty_offer_success_result() -> stellar_xdr::curr::ManageOfferSuccessResult {
     stellar_xdr::curr::ManageOfferSuccessResult {
         offers_claimed: VecM::default(),
-        offer: stellar_xdr::curr::ManageOfferSuccessResultOffer::Deleted,
+        offer: stellar_xdr::curr::ManageOfferSuccessResultOffer::Created(
+            stellar_xdr::curr::OfferEntry::default(),
+        ),
     }
 }
 
@@ -698,6 +702,80 @@ mod tests {
                 ManageSellOfferResult::Success(_),
             )) => {}
             other => panic!("expected ManageSellOffer::Success, got {:?}", other),
+        }
+    }
+
+    /// Regression test for AUDIT-235: empty_offer_success_result must use Created discriminant
+    /// with a zeroed OfferEntry, matching stellar-core's default construction.
+    #[test]
+    fn test_empty_offer_success_result_uses_created_discriminant() {
+        let result = empty_offer_success_result();
+        match &result.offer {
+            ManageOfferSuccessResultOffer::Created(entry) => {
+                // Verify the offer entry is zero-initialized
+                assert_eq!(entry.offer_id, 0);
+                assert_eq!(entry.amount, 0);
+                assert_eq!(
+                    entry.seller_id,
+                    AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([0; 32])))
+                );
+            }
+            other => panic!(
+                "expected ManageOfferSuccessResultOffer::Created with zeroed OfferEntry, got {:?}",
+                other
+            ),
+        }
+        assert!(result.offers_claimed.is_empty());
+    }
+
+    /// Verify all three offer operation types use Created discriminant in their defaults.
+    #[test]
+    fn test_all_offer_ops_use_created_discriminant_in_defaults() {
+        let ops = vec![
+            OperationBody::ManageSellOffer(ManageSellOfferOp {
+                selling: Asset::Native,
+                buying: Asset::Native,
+                amount: 0,
+                price: Price { n: 1, d: 1 },
+                offer_id: 0,
+            }),
+            OperationBody::ManageBuyOffer(ManageBuyOfferOp {
+                selling: Asset::Native,
+                buying: Asset::Native,
+                buy_amount: 0,
+                price: Price { n: 1, d: 1 },
+                offer_id: 0,
+            }),
+            OperationBody::CreatePassiveSellOffer(CreatePassiveSellOfferOp {
+                selling: Asset::Native,
+                buying: Asset::Native,
+                amount: 0,
+                price: Price { n: 1, d: 1 },
+            }),
+        ];
+
+        for body in ops {
+            let op = Operation {
+                source_account: None,
+                body: body.clone(),
+            };
+            let result = default_success_op_result(&op);
+            match result {
+                OperationResult::OpInner(OperationResultTr::ManageSellOffer(
+                    ManageSellOfferResult::Success(ref s),
+                ))
+                | OperationResult::OpInner(OperationResultTr::ManageBuyOffer(
+                    ManageBuyOfferResult::Success(ref s),
+                )) => {
+                    assert!(
+                        matches!(s.offer, ManageOfferSuccessResultOffer::Created(_)),
+                        "expected Created discriminant for {:?}, got {:?}",
+                        body,
+                        s.offer
+                    );
+                }
+                other => panic!("unexpected result for {:?}: {:?}", body, other),
+            }
         }
     }
 }
