@@ -30,7 +30,6 @@ use crate::{
     LocalNode, OverlayError, PeerAddress, PeerId, Result,
 };
 use dashmap::DashMap;
-use henyey_common::xdr_encoded_len;
 use parking_lot::RwLock;
 use std::collections::HashSet;
 use std::net::SocketAddr;
@@ -649,8 +648,9 @@ impl Peer {
     async fn send_raw(&mut self, message: StellarMessage) -> Result<()> {
         let body_size = msg_body_size(&message);
         let auth_msg = self.auth.wrap_unauthenticated(message);
-        let wire_size = xdr_encoded_len(&auth_msg) as u64;
-        self.connection.send(auth_msg).await?;
+        // `Connection::send` returns the on-the-wire frame size, so we don't
+        // need to re-encode the message here just to measure it.
+        let wire_size = self.connection.send(auth_msg).await?;
         // Success-only instrumentation: connection errors go to errors_write at
         // the caller (peer_loop), not bytes_written/async_write.
         self.metrics.bytes_written.add(wire_size);
@@ -666,8 +666,7 @@ impl Peer {
     async fn send_auth(&mut self, message: StellarMessage) -> Result<()> {
         let body_size = msg_body_size(&message);
         let auth_msg = self.auth.wrap_auth_message(message)?;
-        let wire_size = xdr_encoded_len(&auth_msg) as u64;
-        self.connection.send(auth_msg).await?;
+        let wire_size = self.connection.send(auth_msg).await?;
         self.metrics.bytes_written.add(wire_size);
         self.metrics.async_write.inc();
         self.stats.messages_sent.fetch_add(1, Ordering::Relaxed);
@@ -690,8 +689,7 @@ impl Peer {
 
         let body_size = msg_body_size(&message);
         let auth_msg = self.auth.wrap_message(message)?;
-        let wire_size = xdr_encoded_len(&auth_msg) as u64;
-        self.connection.send(auth_msg).await?;
+        let wire_size = self.connection.send(auth_msg).await?;
         self.metrics.bytes_written.add(wire_size);
         self.metrics.async_write.inc();
         self.stats.messages_sent.fetch_add(1, Ordering::Relaxed);

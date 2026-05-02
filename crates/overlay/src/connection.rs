@@ -26,7 +26,7 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use stellar_xdr::curr::AuthenticatedMessage;
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::timeout;
 use tokio_util::codec::Framed;
@@ -178,11 +178,15 @@ impl Connection {
 
     /// Sends an authenticated message to the peer.
     ///
+    /// On success, returns the on-the-wire frame size in bytes (the XDR-encoded
+    /// message body length, NOT including the 4-byte length prefix). Callers
+    /// use this to update wire-byte metrics without re-encoding the message.
+    ///
     /// # Errors
     ///
     /// Returns `PeerDisconnected` if the connection is already closed,
     /// or a codec error if encoding fails.
-    pub async fn send(&mut self, message: AuthenticatedMessage) -> Result<()> {
+    pub async fn send(&mut self, message: AuthenticatedMessage) -> Result<u64> {
         if self.closed {
             return Err(OverlayError::PeerDisconnected(
                 "connection closed".to_string(),
@@ -191,18 +195,26 @@ impl Connection {
 
         trace!("Sending message to {}", self.remote_addr);
 
+        // Encode once here so we can return the wire size to the caller
+        // without forcing a second XDR pass downstream. The Encoder pipeline
+        // would otherwise re-encode internally and discard the length.
+        let encoded = MessageCodec::encode_message(&message)?;
+        // `encoded` is `[len_prefix(4) | xdr_body]`; the wire body size is
+        // `encoded.len() - 4`.
+        let wire_size = (encoded.len() - 4) as u64;
+
         // Add timeout to prevent blocking indefinitely on TCP backpressure
         const SEND_TIMEOUT_SECS: u64 = 10;
         match timeout(
             Duration::from_secs(SEND_TIMEOUT_SECS),
-            self.framed.send(message),
+            self.framed.get_mut().write_all(&encoded),
         )
         .await
         {
-            Ok(Ok(())) => Ok(()),
+            Ok(Ok(())) => Ok(wire_size),
             Ok(Err(e)) => {
                 self.closed = true;
-                Err(e)
+                Err(OverlayError::Io(e))
             }
             Err(_) => {
                 self.closed = true;
