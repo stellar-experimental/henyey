@@ -43,7 +43,7 @@ fn debug_xdr_hash<T: WriteXdr>(items: &[T]) -> String {
 
 /// Result of running the incremental eviction scan for a single ledger.
 struct EvictionScanResult {
-    evicted_keys: Vec<LedgerKey>,
+    dead_keys: Vec<LedgerKey>,
     archived_entries: Vec<LedgerEntry>,
     updated_iterator: Option<EvictionIterator>,
     ran: bool,
@@ -71,7 +71,7 @@ fn run_eviction_scan(
         || protocol_version_is_before(context.header.ledger_version, ProtocolVersion::V23)
     {
         return Ok(EvictionScanResult {
-            evicted_keys: Vec::new(),
+            dead_keys: Vec::new(),
             archived_entries: Vec::new(),
             updated_iterator: context.eviction_iterator,
             ran: false,
@@ -118,7 +118,7 @@ fn run_eviction_scan(
     );
 
     Ok(EvictionScanResult {
-        evicted_keys: resolved.evicted_keys,
+        dead_keys: resolved.evicted_keys(),
         archived_entries: resolved.archived_entries,
         updated_iterator: Some(resolved.end_iterator),
         ran: true,
@@ -727,7 +727,7 @@ pub fn replay_ledger_with_execution(
 
     // Combine transaction dead entries with evicted entries
     let mut all_dead_entries = dead_entries.clone();
-    all_dead_entries.extend(eviction.evicted_keys);
+    all_dead_entries.extend(eviction.dead_keys);
 
     // Build live entries including eviction iterator update.
     // stellar-core updates the EvictionIterator ConfigSettingEntry EVERY ledger

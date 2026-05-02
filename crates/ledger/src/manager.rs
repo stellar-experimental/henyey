@@ -4879,14 +4879,14 @@ impl LedgerCloseContext<'_> {
                     let resolved = eviction_result
                         .resolve(eviction_settings.max_entries_to_archive, &modified_keys);
 
-                    // Capture evicted keys for LedgerCloseMeta before consuming them.
+                    // Capture evicted keys for LedgerCloseMeta.
                     // Parity: LedgerCloseMetaFrame.cpp:170-187 populateEvictedEntries()
-                    // adds deletedKeys (temp data + all TTL keys) and LedgerEntryKey(entry)
-                    // for archived persistent entries. Our resolved.evicted_keys already
-                    // contains all of these.
-                    evicted_meta_keys = resolved.evicted_keys.clone();
+                    // iterates deletedKeys first (temp data + all TTL keys), then appends
+                    // LedgerEntryKey(entry) for each archived persistent entry.
+                    let all_evicted = resolved.evicted_keys();
+                    evicted_meta_keys = all_evicted.clone();
 
-                    dead_entries.extend(resolved.evicted_keys);
+                    dead_entries.extend(all_evicted);
                     archived_entries = resolved.archived_entries;
 
                     // Log before moving end_iterator into the entry

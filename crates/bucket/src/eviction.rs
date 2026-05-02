@@ -221,14 +221,35 @@ pub struct EvictionResult {
 ///
 /// Produced by `EvictionResult::resolve()` after applying TTL filtering
 /// and the max_entries_to_archive limit.
+///
+/// The separation of `deleted_keys` and `archived_entries` mirrors stellar-core's
+/// `resolveBackgroundEvictionScan` which returns `EvictedStateVectors{deletedKeys, archivedEntries}`.
 pub struct ResolvedEviction {
     /// Persistent entries to archive to the hot archive bucket list.
     pub archived_entries: Vec<LedgerEntry>,
-    /// Keys of all evicted entries to delete from the live bucket list.
-    /// Includes both data keys and TTL keys in pairs.
-    pub evicted_keys: Vec<LedgerKey>,
+    /// Keys deleted from the live BucketList: temporary data keys + ALL TTL keys
+    /// (both temporary and persistent).
+    ///
+    /// Matches stellar-core's `deletedKeys` from `resolveBackgroundEvictionScan`.
+    /// Does NOT include persistent data keys (those are derived from `archived_entries`).
+    pub deleted_keys: Vec<LedgerKey>,
     /// The resolved EvictionIterator for the next scan.
     pub end_iterator: EvictionIterator,
+}
+
+impl ResolvedEviction {
+    /// Build all evicted keys matching stellar-core's `populateEvictedEntries` ordering:
+    /// `deleted_keys` first (temp data keys + all TTL keys in scan order), then persistent
+    /// data keys derived from `archived_entries`.
+    ///
+    /// Parity: LedgerCloseMetaFrame.cpp:170-187 iterates `deletedKeys` then `archivedEntries`.
+    pub fn evicted_keys(&self) -> Vec<LedgerKey> {
+        let mut keys = self.deleted_keys.clone();
+        for entry in &self.archived_entries {
+            keys.push(henyey_common::entry_to_key(entry));
+        }
+        keys
+    }
 }
 
 impl EvictionResult {
@@ -282,9 +303,14 @@ impl EvictionResult {
             })
             .collect();
 
-        // Phase 2: Apply max_entries limit and collect results
+        // Phase 2: Apply max_entries limit and collect results.
+        //
+        // Parity: stellar-core builds two separate vectors:
+        //   - deletedKeys: temp data keys + ALL TTL keys (both temp and persistent)
+        //   - archivedEntries: full LedgerEntry for persistent entries
+        // We mirror this separation in deleted_keys + archived_entries.
         let mut archived_entries = Vec::new();
-        let mut evicted_keys = Vec::new();
+        let mut deleted_keys = Vec::new();
         let mut last_evicted_position = None;
         let mut remaining = max_entries_to_archive;
 
@@ -294,14 +320,13 @@ impl EvictionResult {
             }
 
             if candidate.is_temporary {
-                evicted_keys.push(candidate.data_key);
-                evicted_keys.push(candidate.ttl_key);
+                deleted_keys.push(candidate.data_key);
             } else {
-                // Persistent entries go to hot archive AND are evicted from live
+                // Persistent entries go to hot archive
                 archived_entries.push(candidate.entry);
-                evicted_keys.push(candidate.data_key);
-                evicted_keys.push(candidate.ttl_key);
             }
+            // TTL key is always added to deleted_keys for both types
+            deleted_keys.push(candidate.ttl_key);
 
             last_evicted_position = Some(candidate.position);
             remaining -= 1;
@@ -327,7 +352,7 @@ impl EvictionResult {
 
         ResolvedEviction {
             archived_entries,
-            evicted_keys,
+            deleted_keys,
             end_iterator,
         }
     }
@@ -992,7 +1017,7 @@ mod tests {
 
         let resolved = result.resolve(10, &modified);
         assert!(
-            resolved.evicted_keys.is_empty(),
+            resolved.deleted_keys.is_empty(),
             "candidate with modified TTL should be filtered out"
         );
     }
@@ -1012,9 +1037,9 @@ mod tests {
 
         let resolved = result.resolve(10, &modified);
         assert_eq!(
-            resolved.evicted_keys.len(),
+            resolved.deleted_keys.len(),
             2,
-            "unmodified candidate should be evicted (data_key + ttl_key)"
+            "unmodified temp candidate should be evicted (data_key + ttl_key in deleted_keys)"
         );
     }
 
@@ -1041,7 +1066,7 @@ mod tests {
         // with eviction (++iter, not erase). The candidate should still be
         // evicted.
         assert_eq!(
-            resolved.evicted_keys.len(),
+            resolved.deleted_keys.len(),
             2,
             "candidate with modified data key but unmodified TTL should still be evicted"
         );
@@ -1068,7 +1093,7 @@ mod tests {
 
         let resolved = result.resolve(10, &modified);
         assert!(
-            resolved.evicted_keys.is_empty(),
+            resolved.deleted_keys.is_empty(),
             "candidate should be filtered out because TTL was modified"
         );
     }
@@ -1091,9 +1116,9 @@ mod tests {
         // Limit to 2 entries
         let resolved = result.resolve(2, &modified);
         assert_eq!(
-            resolved.evicted_keys.len(),
+            resolved.deleted_keys.len(),
             4,
-            "should evict 2 entries (4 keys: 2 data + 2 TTL)"
+            "should evict 2 temp entries (4 keys in deleted_keys: 2 data + 2 TTL)"
         );
     }
 
@@ -1117,9 +1142,135 @@ mod tests {
             "persistent entry should be archived"
         );
         assert_eq!(
-            resolved.evicted_keys.len(),
+            resolved.deleted_keys.len(),
+            1,
+            "persistent entry should have only TTL key in deleted_keys"
+        );
+        assert_eq!(
+            resolved.evicted_keys().len(),
             2,
-            "persistent entry should also have evicted keys (data + TTL)"
+            "evicted_keys() should include TTL key + persistent data key"
+        );
+    }
+
+    #[test]
+    fn test_resolve_evicted_keys_ordering_matches_stellar_core() {
+        // Parity test: stellar-core builds evictedKeys as:
+        //   deletedKeys (temp data + ALL TTL keys in scan order)
+        //   ++ persistent data keys (from archivedEntries, in scan order)
+        //
+        // With candidates in scan order: [temp1, persistent2, temp3, persistent4],
+        // the expected evicted_keys() ordering is:
+        //   temp1_data, temp1_ttl, persistent2_ttl, temp3_data, temp3_ttl, persistent4_ttl,
+        //   persistent2_data, persistent4_data
+        let temp1 = make_contract_data_candidate([1u8; 32], true);
+        let persistent2 = make_contract_data_candidate([2u8; 32], false);
+        let temp3 = make_contract_data_candidate([3u8; 32], true);
+        let persistent4 = make_contract_data_candidate([4u8; 32], false);
+
+        let temp1_data = temp1.data_key.clone();
+        let temp1_ttl = temp1.ttl_key.clone();
+        let persistent2_data = persistent2.data_key.clone();
+        let persistent2_ttl = persistent2.ttl_key.clone();
+        let temp3_data = temp3.data_key.clone();
+        let temp3_ttl = temp3.ttl_key.clone();
+        let persistent4_data = persistent4.data_key.clone();
+        let persistent4_ttl = persistent4.ttl_key.clone();
+
+        let result = EvictionResult {
+            candidates: vec![temp1, persistent2, temp3, persistent4],
+            end_iterator: EvictionIterator::with_default_level(),
+            bytes_scanned: 4000,
+            scan_complete: true,
+        };
+
+        let modified = std::collections::HashSet::new();
+        let resolved = result.resolve(10, &modified);
+
+        let evicted = resolved.evicted_keys();
+
+        // Phase 1: deleted_keys — temp data + ALL TTL keys in scan order
+        // Phase 2: persistent data keys from archived_entries in scan order
+        let expected = vec![
+            temp1_data,
+            temp1_ttl,
+            persistent2_ttl,
+            temp3_data,
+            temp3_ttl,
+            persistent4_ttl,
+            persistent2_data,
+            persistent4_data,
+        ];
+
+        assert_eq!(
+            evicted, expected,
+            "evicted_keys() must match stellar-core ordering: \
+             deleted_keys (temp data + all TTL) first, then persistent data keys"
+        );
+    }
+
+    #[test]
+    fn test_resolve_evicted_keys_ordering_with_max_entries_limit() {
+        // When max_entries_to_archive limits processing, the ordering rule
+        // still applies to the subset that was processed.
+        let temp1 = make_contract_data_candidate([1u8; 32], true);
+        let persistent2 = make_contract_data_candidate([2u8; 32], false);
+        let temp3 = make_contract_data_candidate([3u8; 32], true);
+
+        let temp1_data = temp1.data_key.clone();
+        let temp1_ttl = temp1.ttl_key.clone();
+        let persistent2_data = persistent2.data_key.clone();
+        let persistent2_ttl = persistent2.ttl_key.clone();
+
+        let result = EvictionResult {
+            candidates: vec![temp1, persistent2, temp3],
+            end_iterator: EvictionIterator::with_default_level(),
+            bytes_scanned: 3000,
+            scan_complete: true,
+        };
+
+        let modified = std::collections::HashSet::new();
+        // Only process first 2 entries (temp1 + persistent2)
+        let resolved = result.resolve(2, &modified);
+
+        let evicted = resolved.evicted_keys();
+        let expected = vec![temp1_data, temp1_ttl, persistent2_ttl, persistent2_data];
+
+        assert_eq!(
+            evicted, expected,
+            "with max_entries=2, only first 2 candidates should be processed, \
+             still with correct two-phase ordering"
+        );
+    }
+
+    #[test]
+    fn test_resolve_evicted_keys_ordering_persistent_only() {
+        // When all entries are persistent, deleted_keys has only TTL keys,
+        // and persistent data keys are appended at end.
+        let p1 = make_contract_data_candidate([1u8; 32], false);
+        let p2 = make_contract_data_candidate([2u8; 32], false);
+
+        let p1_data = p1.data_key.clone();
+        let p1_ttl = p1.ttl_key.clone();
+        let p2_data = p2.data_key.clone();
+        let p2_ttl = p2.ttl_key.clone();
+
+        let result = EvictionResult {
+            candidates: vec![p1, p2],
+            end_iterator: EvictionIterator::with_default_level(),
+            bytes_scanned: 2000,
+            scan_complete: true,
+        };
+
+        let modified = std::collections::HashSet::new();
+        let resolved = result.resolve(10, &modified);
+
+        let evicted = resolved.evicted_keys();
+        let expected = vec![p1_ttl, p2_ttl, p1_data, p2_data];
+
+        assert_eq!(
+            evicted, expected,
+            "persistent-only: TTL keys first in scan order, then data keys in scan order"
         );
     }
 }
