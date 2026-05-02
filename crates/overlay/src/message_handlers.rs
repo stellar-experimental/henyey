@@ -648,4 +648,101 @@ mod tests {
         let _stats = dispatcher.stats();
         // The tracker is either empty or has one envelope
     }
+
+    #[test]
+    fn test_fetch_unique_recv_increments_on_solicited_tx_set() {
+        let metrics = Arc::new(OverlayMetrics::new());
+        let dispatcher = MessageDispatcher::new(Arc::clone(&metrics));
+        let envelope = make_test_envelope(100);
+        let peer = make_peer_id(1);
+
+        assert_eq!(metrics.fetch_unique_recv.get(), 0);
+        assert_eq!(metrics.fetch_duplicate_recv.get(), 0);
+
+        let tx_set = TransactionSet {
+            previous_ledger_hash: Hash([0u8; 32]),
+            txs: vec![].try_into().unwrap(),
+        };
+        let data = TxSetData::Legacy(tx_set);
+        let hash = data.hash();
+
+        // Start tracking a fetch for this hash.
+        dispatcher.fetch_tx_set(hash.clone(), &envelope);
+
+        // Receive a solicited tx-set — should increment fetch_unique_recv.
+        dispatcher.handle_tx_set_data(&peer, data);
+
+        assert_eq!(metrics.fetch_unique_recv.get(), 1);
+        assert_eq!(metrics.fetch_duplicate_recv.get(), 0);
+    }
+
+    #[test]
+    fn test_fetch_duplicate_recv_increments_on_unsolicited_tx_set() {
+        let metrics = Arc::new(OverlayMetrics::new());
+        let dispatcher = MessageDispatcher::new(Arc::clone(&metrics));
+        let peer = make_peer_id(1);
+
+        assert_eq!(metrics.fetch_duplicate_recv.get(), 0);
+
+        // Receive an unsolicited tx-set (no prior fetch) — should increment
+        // fetch_duplicate_recv.
+        let tx_set = TransactionSet {
+            previous_ledger_hash: Hash([0u8; 32]),
+            txs: vec![].try_into().unwrap(),
+        };
+        dispatcher.handle_tx_set_data(&peer, TxSetData::Legacy(tx_set));
+
+        assert_eq!(metrics.fetch_unique_recv.get(), 0);
+        assert_eq!(metrics.fetch_duplicate_recv.get(), 1);
+    }
+
+    #[test]
+    fn test_fetch_unique_recv_increments_on_solicited_quorum_set() {
+        let metrics = Arc::new(OverlayMetrics::new());
+        let dispatcher = MessageDispatcher::new(Arc::clone(&metrics));
+        let envelope = make_test_envelope(100);
+        let peer = make_peer_id(1);
+
+        let quorum_set = ScpQuorumSet {
+            threshold: 1,
+            validators: vec![].try_into().unwrap(),
+            inner_sets: vec![].try_into().unwrap(),
+        };
+
+        use sha2::{Digest, Sha256};
+        use stellar_xdr::curr::WriteXdr;
+        let bytes = quorum_set
+            .to_xdr(stellar_xdr::curr::Limits::none())
+            .unwrap();
+        let hash = Hash(Sha256::digest(&bytes).into());
+
+        assert_eq!(metrics.fetch_unique_recv.get(), 0);
+
+        dispatcher.fetch_quorum_set(hash.clone(), &envelope);
+        dispatcher.handle_quorum_set(&peer, quorum_set);
+
+        assert_eq!(metrics.fetch_unique_recv.get(), 1);
+        assert_eq!(metrics.fetch_duplicate_recv.get(), 0);
+    }
+
+    #[test]
+    fn test_fetch_duplicate_recv_increments_on_unsolicited_quorum_set() {
+        let metrics = Arc::new(OverlayMetrics::new());
+        let dispatcher = MessageDispatcher::new(Arc::clone(&metrics));
+        let peer = make_peer_id(1);
+
+        let quorum_set = ScpQuorumSet {
+            threshold: 1,
+            validators: vec![].try_into().unwrap(),
+            inner_sets: vec![].try_into().unwrap(),
+        };
+
+        assert_eq!(metrics.fetch_duplicate_recv.get(), 0);
+
+        // Receive without prior fetch — unsolicited.
+        dispatcher.handle_quorum_set(&peer, quorum_set);
+
+        assert_eq!(metrics.fetch_unique_recv.get(), 0);
+        assert_eq!(metrics.fetch_duplicate_recv.get(), 1);
+    }
 }

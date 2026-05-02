@@ -790,8 +790,9 @@ impl OverlayManager {
                 // stellar-core's recvFloodAdvert/recvFloodDemand do not call
                 // recvFloodedMsgID. Every pull-control message is "unique" from
                 // the receiver's perspective since there is no global dedup.
+                // NOT counted in flood_unique_recv — that metric is reserved for
+                // FloodGate-tracked messages (Transaction, ScpMessage).
                 ctx.peer.record_flood_stats(true, message_size);
-                state.metrics.flood_unique_recv.inc();
             }
         } else if is_fetch_message(message) {
             ctx.peer.record_fetch_stats(true, message_size);

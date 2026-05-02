@@ -377,6 +377,24 @@ impl ItemFetcher {
         self.available_peers.lock().unwrap().clone()
     }
 
+    /// Wrapper around `Tracker::try_next_peer` that increments the
+    /// `item_fetcher_next_peer` counter on `AskPeer` results. All call sites
+    /// should use this instead of calling `tracker.try_next_peer()` directly
+    /// to ensure the counter cannot be missed.
+    fn try_next_peer_counted(
+        &self,
+        tracker: &mut Tracker,
+        available_peers: &[PeerId],
+    ) -> NextPeerResult {
+        let result = tracker.try_next_peer(available_peers);
+        if matches!(result, NextPeerResult::AskPeer { .. }) {
+            if let Some(ref m) = self.metrics {
+                m.item_fetcher_next_peer.inc();
+            }
+        }
+        result
+    }
+
     /// Start fetching an item needed by an envelope.
     ///
     /// Multiple envelopes may need the same item.
@@ -397,11 +415,8 @@ impl ItemFetcher {
 
             // Immediately try to fetch from a peer (like stellar-core)
             if let Some(ref ask_peer) = self.ask_peer {
-                match tracker.try_next_peer(&available_peers) {
+                match self.try_next_peer_counted(&mut tracker, &available_peers) {
                     NextPeerResult::AskPeer { ref peer, .. } => {
-                        if let Some(ref m) = self.metrics {
-                            m.item_fetcher_next_peer.inc();
-                        }
                         trace!(
                             "Immediately asking peer {} for {:?} {}",
                             peer,
@@ -541,11 +556,8 @@ impl ItemFetcher {
 
             // Check if we need to ask a new peer (timed out or no current peer)
             if tracker.last_asked_peer.is_none() || tracker.is_timed_out() {
-                match tracker.try_next_peer(available_peers) {
+                match self.try_next_peer_counted(tracker, available_peers) {
                     NextPeerResult::AskPeer { peer, timeout } => {
-                        if let Some(ref m) = self.metrics {
-                            m.item_fetcher_next_peer.inc();
-                        }
                         requests.push(PendingRequest {
                             item_hash: hash.clone(),
                             peer,
@@ -890,5 +902,39 @@ mod tests {
         assert_eq!(stats.item_type, ItemType::QuorumSet);
         assert_eq!(stats.num_trackers, 2);
         assert_eq!(stats.total_waiting_envelopes, 2);
+    }
+
+    #[test]
+    fn test_item_fetcher_next_peer_counter_increments_on_ask_peer() {
+        let metrics = Arc::new(OverlayMetrics::new());
+        let fetcher = ItemFetcher::with_defaults(ItemType::TxSet, Some(Arc::clone(&metrics)));
+        let hash = Hash([1u8; 32]);
+        let env = make_test_envelope(100);
+        let peers = vec![make_peer_id(1), make_peer_id(2)];
+
+        assert_eq!(metrics.item_fetcher_next_peer.get(), 0);
+
+        // fetch() internally calls try_next_peer_counted but only when
+        // ask_peer callback is set — without callback, no counter.
+        fetcher.fetch(hash.clone(), &env);
+        assert_eq!(metrics.item_fetcher_next_peer.get(), 0);
+
+        // get_pending_requests calls try_next_peer_counted and DOES increment.
+        let requests = fetcher.get_pending_requests(&peers);
+        assert_eq!(requests.len(), 1);
+        assert_eq!(metrics.item_fetcher_next_peer.get(), 1);
+    }
+
+    #[test]
+    fn test_item_fetcher_next_peer_counter_not_incremented_without_metrics() {
+        let fetcher = ItemFetcher::with_defaults(ItemType::TxSet, None);
+        let hash = Hash([1u8; 32]);
+        let env = make_test_envelope(100);
+        let peers = vec![make_peer_id(1)];
+
+        fetcher.fetch(hash.clone(), &env);
+        // Should not panic even though metrics is None.
+        let requests = fetcher.get_pending_requests(&peers);
+        assert_eq!(requests.len(), 1);
     }
 }
