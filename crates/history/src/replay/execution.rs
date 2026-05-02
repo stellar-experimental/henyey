@@ -639,14 +639,20 @@ pub fn replay_ledger_with_execution(
     )
     .map_err(|e| HistoryError::CatchupFailed(format!("replay execution failed: {}", e)))?;
 
-    // Add fee events to transaction metadata (matching online mode behavior)
+    // Add fee events to transaction metadata (matching online mode behavior).
+    // Use pre-refund fee (fee_charged + fee_refund) to match stellar-core's
+    // behavior: the fee event records the full debit before refund.
     if classic_events.events_enabled(header.ledger_version) {
         for (idx, ((envelope, _), meta)) in transactions
             .iter()
             .zip(tx_set_result.tx_result_metas.iter_mut())
             .enumerate()
         {
-            let fee_charged = tx_set_result.tx_results[idx].result.fee_charged;
+            if idx >= tx_set_result.results.len() {
+                break;
+            }
+            let result = &tx_set_result.results[idx];
+            let fee_charged = result.fee_charged + result.fee_refund;
             let frame = TransactionFrame::with_network(envelope.clone(), *network_id);
             let fee_source = muxed_to_account_id(&frame.fee_source_account());
             prepend_fee_event(
