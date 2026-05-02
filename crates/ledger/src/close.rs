@@ -1311,8 +1311,13 @@ impl UpgradeContext {
                 }
             }
 
-            // Apply the upgrade (includes window resize if sample size changed)
-            let (archival, memory_cost, entry_changes) = frame.apply_to(ltx)?;
+            // Capture all mutations via checkpoint (mirrors stellar-core's child
+            // LedgerTxn + getChanges() pattern). This automatically includes
+            // config setting updates, frozen keys delta, and window resize.
+            let cp = ltx.change_checkpoint();
+            let (archival, memory_cost) = frame.apply_to(ltx)?;
+            let entry_changes = ltx.entry_changes_since(cp);
+
             state_archival_changed |= archival;
             memory_cost_params_changed |= memory_cost;
 

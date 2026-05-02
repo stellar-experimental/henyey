@@ -370,16 +370,10 @@ impl ConfigUpgradeSetFrame {
     ///   and overwriting all window entries
     ///   (parity: Upgrades.cpp:1449 `handleUpgradeAffectingSorobanInMemoryStateSize`)
     // SECURITY: config entries validated during upgrade proposal phase before reaching apply
-    pub fn apply_to(
-        &self,
-        ltx: &mut CloseLedgerState,
-    ) -> Result<(bool, bool, stellar_xdr::curr::LedgerEntryChanges), LedgerError> {
-        use stellar_xdr::curr::LedgerEntryChange;
-
+    pub fn apply_to(&self, ltx: &mut CloseLedgerState) -> Result<(bool, bool), LedgerError> {
         let mut state_archival_changed = false;
         let mut memory_cost_params_changed = false;
         let mut window_sample_size_changed = false;
-        let mut changes: Vec<LedgerEntryChange> = Vec::new();
 
         for new_entry in self.config_upgrade_set.updated_entry.iter() {
             let setting_id = new_entry.discriminant();
@@ -389,11 +383,11 @@ impl ConfigUpgradeSetFrame {
             // since delta IDs don't have their own stored config setting entries.
             // Parity: Upgrades.cpp:1458-1517
             if setting_id == ConfigSettingId::FrozenLedgerKeysDelta {
-                self.apply_frozen_keys_delta(new_entry, ltx, &mut changes)?;
+                self.apply_frozen_keys_delta(new_entry, ltx)?;
                 continue;
             }
             if setting_id == ConfigSettingId::FreezeBypassTxsDelta {
-                self.apply_freeze_bypass_delta(new_entry, ltx, &mut changes)?;
+                self.apply_freeze_bypass_delta(new_entry, ltx)?;
                 continue;
             }
 
@@ -415,7 +409,7 @@ impl ConfigUpgradeSetFrame {
                 Some(entry) => entry,
                 None => {
                     // stellar-core throws here (Upgrades.cpp). All config settings
-                    // must exist after protocol 20; a missing entry is a ledger error.
+                    // must exist after protocol 24+; a missing entry is a ledger error.
                     return Err(LedgerError::UpgradeError(format!(
                         "Config setting {:?} not found during upgrade — expected to exist",
                         setting_id
@@ -452,12 +446,8 @@ impl ConfigUpgradeSetFrame {
                 ext: LedgerEntryExt::V0,
             };
 
-            // Capture before/after for upgrade meta
-            changes.push(LedgerEntryChange::State(previous.clone()));
-            changes.push(LedgerEntryChange::Updated(new_ledger_entry.clone()));
-
-            // Record the update
-            ltx.record_update(previous.clone(), new_ledger_entry)?;
+            // Record the update in the delta (captured by caller's checkpoint)
+            ltx.record_update(previous, new_ledger_entry)?;
 
             info!(
                 setting_id = ?setting_id,
@@ -473,17 +463,7 @@ impl ConfigUpgradeSetFrame {
             self.maybe_update_state_size_window(ltx)?;
         }
 
-        let entry_changes = stellar_xdr::curr::LedgerEntryChanges(
-            changes
-                .try_into()
-                .expect("config upgrade entry changes must fit XDR bounds"),
-        );
-
-        Ok((
-            state_archival_changed,
-            memory_cost_params_changed,
-            entry_changes,
-        ))
+        Ok((state_archival_changed, memory_cost_params_changed))
     }
 
     /// Apply a FrozenLedgerKeysDelta to the base FrozenLedgerKeys config setting.
@@ -497,10 +477,7 @@ impl ConfigUpgradeSetFrame {
         &self,
         delta_entry: &ConfigSettingEntry,
         ltx: &mut CloseLedgerState,
-        changes: &mut Vec<stellar_xdr::curr::LedgerEntryChange>,
     ) -> Result<(), LedgerError> {
-        use stellar_xdr::curr::LedgerEntryChange;
-
         // Load the base CONFIG_SETTING_FROZEN_LEDGER_KEYS entry
         let key = LedgerKey::ConfigSetting(stellar_xdr::curr::LedgerKeyConfigSetting {
             config_setting_id: ConfigSettingId::FrozenLedgerKeys,
@@ -564,10 +541,6 @@ impl ConfigUpgradeSetFrame {
             ext: LedgerEntryExt::V0,
         };
 
-        // Capture before/after for upgrade meta
-        changes.push(LedgerEntryChange::State(previous.clone()));
-        changes.push(LedgerEntryChange::Updated(new_ledger_entry.clone()));
-
         ltx.record_update(previous, new_ledger_entry)?;
 
         info!("Applied frozen ledger keys delta");
@@ -585,10 +558,7 @@ impl ConfigUpgradeSetFrame {
         &self,
         delta_entry: &ConfigSettingEntry,
         ltx: &mut CloseLedgerState,
-        changes: &mut Vec<stellar_xdr::curr::LedgerEntryChange>,
     ) -> Result<(), LedgerError> {
-        use stellar_xdr::curr::LedgerEntryChange;
-
         // Load the base CONFIG_SETTING_FREEZE_BYPASS_TXS entry
         let key = LedgerKey::ConfigSetting(stellar_xdr::curr::LedgerKeyConfigSetting {
             config_setting_id: ConfigSettingId::FreezeBypassTxs,
@@ -650,10 +620,6 @@ impl ConfigUpgradeSetFrame {
             data: LedgerEntryData::ConfigSetting(ConfigSettingEntry::FreezeBypassTxs(bypass_txs)),
             ext: LedgerEntryExt::V0,
         };
-
-        // Capture before/after for upgrade meta
-        changes.push(LedgerEntryChange::State(previous.clone()));
-        changes.push(LedgerEntryChange::Updated(new_ledger_entry.clone()));
 
         ltx.record_update(previous, new_ledger_entry)?;
 
@@ -1991,6 +1957,199 @@ mod tests {
             err_msg.contains("TTL entry is missing"),
             "Error should mention missing TTL, got: {}",
             err_msg
+        );
+    }
+
+    /// Regression test for #2267: apply_to must capture LiveSorobanStateSizeWindow
+    /// resize changes when liveSorobanStateSizeWindowSampleSize is modified.
+    /// The checkpoint API (used by the caller) should capture both the StateArchival
+    /// update AND the window resize as STATE/UPDATED pairs.
+    #[test]
+    fn test_apply_to_captures_window_resize_in_checkpoint() {
+        use crate::close_state::CloseLedgerState;
+        use crate::snapshot::{LedgerSnapshot, SnapshotHandle};
+        use stellar_xdr::curr::*;
+
+        // Create a StateArchival entry that changes window sample size from 5 to 3
+        let old_archival = StateArchivalSettings {
+            max_entry_ttl: 100,
+            min_temporary_ttl: 10,
+            min_persistent_ttl: 10,
+            persistent_rent_rate_denominator: 1000,
+            temp_rent_rate_denominator: 500,
+            max_entries_to_archive: 100,
+            live_soroban_state_size_window_sample_size: 5,
+            eviction_scan_size: 1000,
+            starting_eviction_scan_level: 5,
+            live_soroban_state_size_window_sample_period: 1,
+        };
+
+        let new_archival = StateArchivalSettings {
+            live_soroban_state_size_window_sample_size: 3, // shrink from 5 to 3
+            ..old_archival.clone()
+        };
+
+        // Create initial window with 5 entries
+        let old_window: VecM<u64> = vec![100, 200, 300, 400, 500].try_into().unwrap();
+
+        let upgrade_set = ConfigUpgradeSet {
+            updated_entry: vec![ConfigSettingEntry::StateArchival(new_archival)]
+                .try_into()
+                .unwrap(),
+        };
+
+        let frame = ConfigUpgradeSetFrame {
+            config_upgrade_set: upgrade_set,
+            valid_xdr: true,
+            ledger_version: 25,
+        };
+
+        // Build snapshot with both entries
+        let archival_entry = LedgerEntry {
+            last_modified_ledger_seq: 100,
+            data: LedgerEntryData::ConfigSetting(ConfigSettingEntry::StateArchival(
+                old_archival.clone(),
+            )),
+            ext: LedgerEntryExt::V0,
+        };
+        let window_entry = LedgerEntry {
+            last_modified_ledger_seq: 100,
+            data: LedgerEntryData::ConfigSetting(ConfigSettingEntry::LiveSorobanStateSizeWindow(
+                old_window.clone(),
+            )),
+            ext: LedgerEntryExt::V0,
+        };
+
+        let archival_entry_clone = archival_entry.clone();
+        let window_entry_clone = window_entry.clone();
+        let lookup: crate::EntryLookupFn = std::sync::Arc::new(move |key: &LedgerKey| {
+            if let LedgerKey::ConfigSetting(cs) = key {
+                match cs.config_setting_id {
+                    ConfigSettingId::StateArchival => Ok(Some(archival_entry_clone.clone())),
+                    ConfigSettingId::LiveSorobanStateSizeWindow => {
+                        Ok(Some(window_entry_clone.clone()))
+                    }
+                    _ => Ok(None),
+                }
+            } else {
+                Ok(None)
+            }
+        });
+        let snapshot = SnapshotHandle::with_lookup(LedgerSnapshot::empty(100), lookup);
+        let header = LedgerHeader {
+            ledger_version: 25,
+            ledger_seq: 101,
+            ..Default::default()
+        };
+        let mut ltx = CloseLedgerState::begin(snapshot, header, henyey_common::Hash256::ZERO, 101);
+
+        // Use checkpoint API (as the real caller does)
+        let cp = ltx.change_checkpoint();
+        let (state_archival_changed, _memory_cost_changed) = frame.apply_to(&mut ltx).unwrap();
+        let changes = ltx.entry_changes_since(cp);
+
+        assert!(state_archival_changed);
+
+        // Should have 4 entries: STATE + UPDATED for StateArchival, STATE + UPDATED for window
+        let entries = &changes.0;
+        assert_eq!(
+            entries.len(),
+            4,
+            "Expected 4 change entries (2 pairs), got {}: {:?}",
+            entries.len(),
+            entries
+                .iter()
+                .map(|e| std::mem::discriminant(e))
+                .collect::<Vec<_>>()
+        );
+
+        // First pair: StateArchival STATE/UPDATED
+        assert!(matches!(&entries[0], LedgerEntryChange::State(e)
+            if matches!(&e.data, LedgerEntryData::ConfigSetting(ConfigSettingEntry::StateArchival(_)))));
+        assert!(matches!(&entries[1], LedgerEntryChange::Updated(e)
+            if matches!(&e.data, LedgerEntryData::ConfigSetting(ConfigSettingEntry::StateArchival(_)))));
+
+        // Second pair: LiveSorobanStateSizeWindow STATE/UPDATED
+        assert!(matches!(&entries[2], LedgerEntryChange::State(e)
+            if matches!(&e.data, LedgerEntryData::ConfigSetting(ConfigSettingEntry::LiveSorobanStateSizeWindow(_)))));
+        assert!(matches!(&entries[3], LedgerEntryChange::Updated(e)
+            if matches!(&e.data, LedgerEntryData::ConfigSetting(ConfigSettingEntry::LiveSorobanStateSizeWindow(w))
+                if w.len() == 3)));
+    }
+
+    /// Test that no window entries appear when sample size is unchanged.
+    #[test]
+    fn test_apply_to_no_window_changes_when_size_unchanged() {
+        use crate::close_state::CloseLedgerState;
+        use crate::snapshot::{LedgerSnapshot, SnapshotHandle};
+        use stellar_xdr::curr::*;
+
+        let archival = StateArchivalSettings {
+            max_entry_ttl: 100,
+            min_temporary_ttl: 10,
+            min_persistent_ttl: 10,
+            persistent_rent_rate_denominator: 1000,
+            temp_rent_rate_denominator: 500,
+            max_entries_to_archive: 100,
+            live_soroban_state_size_window_sample_size: 5,
+            eviction_scan_size: 1000,
+            starting_eviction_scan_level: 5,
+            live_soroban_state_size_window_sample_period: 1,
+        };
+
+        // Only change eviction_scan_size, NOT the window sample size
+        let new_archival = StateArchivalSettings {
+            eviction_scan_size: 2000,
+            ..archival.clone()
+        };
+
+        let upgrade_set = ConfigUpgradeSet {
+            updated_entry: vec![ConfigSettingEntry::StateArchival(new_archival)]
+                .try_into()
+                .unwrap(),
+        };
+
+        let frame = ConfigUpgradeSetFrame {
+            config_upgrade_set: upgrade_set,
+            valid_xdr: true,
+            ledger_version: 25,
+        };
+
+        let archival_entry = LedgerEntry {
+            last_modified_ledger_seq: 100,
+            data: LedgerEntryData::ConfigSetting(ConfigSettingEntry::StateArchival(
+                archival.clone(),
+            )),
+            ext: LedgerEntryExt::V0,
+        };
+
+        let lookup: crate::EntryLookupFn = std::sync::Arc::new(move |key: &LedgerKey| {
+            if let LedgerKey::ConfigSetting(cs) = key {
+                if cs.config_setting_id == ConfigSettingId::StateArchival {
+                    return Ok(Some(archival_entry.clone()));
+                }
+            }
+            Ok(None)
+        });
+        let snapshot = SnapshotHandle::with_lookup(LedgerSnapshot::empty(100), lookup);
+        let header = LedgerHeader {
+            ledger_version: 25,
+            ledger_seq: 101,
+            ..Default::default()
+        };
+        let mut ltx = CloseLedgerState::begin(snapshot, header, henyey_common::Hash256::ZERO, 101);
+
+        let cp = ltx.change_checkpoint();
+        let (state_archival_changed, _) = frame.apply_to(&mut ltx).unwrap();
+        let changes = ltx.entry_changes_since(cp);
+
+        assert!(state_archival_changed);
+        // Only 2 entries: STATE + UPDATED for StateArchival (no window changes)
+        assert_eq!(
+            changes.0.len(),
+            2,
+            "Expected only 2 change entries for StateArchival, got {}",
+            changes.0.len()
         );
     }
 }
