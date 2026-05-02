@@ -234,6 +234,32 @@ impl PublishManager {
 
         verify::verify_header_chain_from_entries(headers)?;
 
+        // Validate tx/result entries: no duplicates, ordered by ledger_seq.
+        let mut last_tx_seq: Option<u32> = None;
+        for entry in tx_entries {
+            if let Some(prev) = last_tx_seq {
+                if entry.ledger_seq <= prev {
+                    return Err(HistoryError::VerificationFailed(format!(
+                        "tx entries not strictly ordered: {} after {}",
+                        entry.ledger_seq, prev
+                    )));
+                }
+            }
+            last_tx_seq = Some(entry.ledger_seq);
+        }
+        let mut last_res_seq: Option<u32> = None;
+        for entry in tx_results {
+            if let Some(prev) = last_res_seq {
+                if entry.ledger_seq <= prev {
+                    return Err(HistoryError::VerificationFailed(format!(
+                        "result entries not strictly ordered: {} after {}",
+                        entry.ledger_seq, prev
+                    )));
+                }
+            }
+            last_res_seq = Some(entry.ledger_seq);
+        }
+
         let tx_entry_map: std::collections::HashMap<_, _> = tx_entries
             .iter()
             .map(|entry| (entry.ledger_seq, entry))
@@ -245,12 +271,6 @@ impl PublishManager {
 
         for header_entry in headers {
             let header = &header_entry.header;
-            let entry = tx_entry_map.get(&header.ledger_seq).ok_or_else(|| {
-                HistoryError::VerificationFailed(format!(
-                    "missing tx history entry for ledger {}",
-                    header.ledger_seq
-                ))
-            })?;
 
             // Skip tx set and result verification for ledger 1 (genesis).
             // The genesis header uses all-zero sentinel hashes for both
@@ -264,20 +284,41 @@ impl PublishManager {
                 continue;
             }
 
-            let tx_set = crate::catchup::tx_set_from_history_entry(entry);
-            verify::verify_tx_set(header, &tx_set)?;
+            // stellar-core omits tx/result entries for ledgers with no
+            // transactions (CheckpointBuilder.cpp:140). Handle sparse
+            // entries with both-or-none validation.
+            match (
+                tx_entry_map.get(&header.ledger_seq),
+                tx_result_map.get(&header.ledger_seq),
+            ) {
+                (Some(tx_entry), Some(result_entry)) => {
+                    let tx_set = crate::catchup::tx_set_from_history_entry(tx_entry);
+                    verify::verify_tx_set(header, &tx_set)?;
 
-            let result_entry = tx_result_map.get(&header.ledger_seq).ok_or_else(|| {
-                HistoryError::VerificationFailed(format!(
-                    "missing tx result entry for ledger {}",
-                    header.ledger_seq
-                ))
-            })?;
-            let xdr = result_entry
-                .tx_result_set
-                .to_xdr(stellar_xdr::curr::Limits::none())
-                .map_err(|e| HistoryError::VerificationFailed(e.to_string()))?;
-            verify::verify_tx_result_set(header, &xdr)?;
+                    let xdr = result_entry
+                        .tx_result_set
+                        .to_xdr(stellar_xdr::curr::Limits::none())
+                        .map_err(|e| HistoryError::VerificationFailed(e.to_string()))?;
+                    verify::verify_tx_result_set(header, &xdr)?;
+                }
+                (None, None) => {
+                    // Empty ledger — no tx/result entries expected.
+                    // stellar-core omits entries for ledgers with no
+                    // transactions, so absence of both is normal.
+                }
+                (Some(_), None) => {
+                    return Err(HistoryError::VerificationFailed(format!(
+                        "ledger {}: tx entry present but result entry missing",
+                        header.ledger_seq
+                    )));
+                }
+                (None, Some(_)) => {
+                    return Err(HistoryError::VerificationFailed(format!(
+                        "ledger {}: result entry present but tx entry missing",
+                        header.ledger_seq
+                    )));
+                }
+            }
         }
 
         let mut state = PublishState {
@@ -1355,5 +1396,376 @@ mod tests {
         // File was NOT overwritten
         let content = std::fs::read(&bucket_path).unwrap();
         assert_eq!(content, b"pre-existing content");
+    }
+
+    /// Helper: create a header with hashes matching the given tx set and result set.
+    fn make_header_with_hashes(
+        ledger_seq: u32,
+        prev_hash: stellar_xdr::curr::Hash,
+        tx_set: &henyey_ledger::TransactionSetVariant,
+        result_set: &stellar_xdr::curr::TransactionResultSet,
+    ) -> stellar_xdr::curr::LedgerHeader {
+        use stellar_xdr::curr::*;
+
+        let tx_set_hash = crate::verify::compute_tx_set_hash(tx_set).unwrap();
+        let result_xdr = result_set.to_xdr(Limits::none()).unwrap();
+        let result_hash = henyey_common::Hash256::hash(&result_xdr);
+
+        LedgerHeader {
+            ledger_version: 25,
+            previous_ledger_hash: prev_hash,
+            scp_value: StellarValue {
+                tx_set_hash: Hash(tx_set_hash.0),
+                close_time: TimePoint(0),
+                upgrades: VecM::default(),
+                ext: StellarValueExt::Basic,
+            },
+            tx_set_result_hash: Hash(result_hash.0),
+            bucket_list_hash: Hash([0u8; 32]),
+            ledger_seq,
+            total_coins: 0,
+            fee_pool: 0,
+            inflation_seq: 0,
+            id_pool: 0,
+            base_fee: 100,
+            base_reserve: 5000000,
+            max_tx_set_size: 100,
+            skip_list: std::array::from_fn(|_| Hash([0u8; 32])),
+            ext: LedgerHeaderExt::V0,
+        }
+    }
+
+    /// Helper: create a LedgerHeaderHistoryEntry with computed hash.
+    fn make_header_entry(header: stellar_xdr::curr::LedgerHeader) -> LedgerHeaderHistoryEntry {
+        use stellar_xdr::curr::LedgerHeaderHistoryEntryExt;
+        let hash = henyey_ledger::compute_header_hash(&header).unwrap();
+        LedgerHeaderHistoryEntry {
+            hash: stellar_xdr::curr::Hash(hash.0),
+            header,
+            ext: LedgerHeaderHistoryEntryExt::default(),
+        }
+    }
+
+    /// Helper: create an empty tx set and result set for a header,
+    /// and return (entry, result_entry).
+    fn make_empty_entries(
+        header: &stellar_xdr::curr::LedgerHeader,
+    ) -> (
+        stellar_xdr::curr::TransactionHistoryEntry,
+        stellar_xdr::curr::TransactionHistoryResultEntry,
+    ) {
+        (
+            crate::catchup::empty_tx_history_entry(header),
+            crate::catchup::empty_tx_result_entry(header.ledger_seq),
+        )
+    }
+
+    #[test]
+    fn test_publish_checkpoint_sparse_entries() {
+        use stellar_xdr::curr::*;
+
+        let temp = TempDir::new().unwrap();
+        let manager = PublishManager::new(PublishConfig {
+            local_path: temp.path().to_path_buf(),
+            ..Default::default()
+        });
+
+        // Build a 4-ledger checkpoint (seqs 60..=63) where ledger 61 and 62
+        // have no transactions (sparse entries).
+        let empty_result = TransactionResultSet {
+            results: Default::default(),
+        };
+        let nonempty_result = TransactionResultSet {
+            results: vec![TransactionResultPair {
+                transaction_hash: Hash([1u8; 32]),
+                result: TransactionResult {
+                    fee_charged: 100,
+                    result: TransactionResultResult::TxSuccess(Default::default()),
+                    ext: TransactionResultExt::V0,
+                },
+            }]
+            .try_into()
+            .unwrap(),
+        };
+
+        // Create headers with matching hashes.
+        let mut headers = Vec::new();
+        let mut tx_entries = Vec::new();
+        let mut tx_results = Vec::new();
+        let mut prev_hash = Hash([0u8; 32]);
+
+        for seq in 60..=63u32 {
+            let has_txs = seq == 60 || seq == 63;
+            let result_set = if has_txs {
+                nonempty_result.clone()
+            } else {
+                empty_result.clone()
+            };
+
+            let (tx_entry, _) = make_empty_entries(&LedgerHeader {
+                ledger_version: 25,
+                previous_ledger_hash: prev_hash.clone(),
+                scp_value: StellarValue {
+                    tx_set_hash: Hash([0u8; 32]),
+                    close_time: TimePoint(0),
+                    upgrades: VecM::default(),
+                    ext: StellarValueExt::Basic,
+                },
+                tx_set_result_hash: Hash([0u8; 32]),
+                bucket_list_hash: Hash([0u8; 32]),
+                ledger_seq: seq,
+                total_coins: 0,
+                fee_pool: 0,
+                inflation_seq: 0,
+                id_pool: 0,
+                base_fee: 100,
+                base_reserve: 5000000,
+                max_tx_set_size: 100,
+                skip_list: std::array::from_fn(|_| Hash([0u8; 32])),
+                ext: LedgerHeaderExt::V0,
+            });
+
+            let tx_set = crate::catchup::tx_set_from_history_entry(&tx_entry);
+            let header = make_header_with_hashes(seq, prev_hash.clone(), &tx_set, &result_set);
+            let entry = make_header_entry(header.clone());
+            prev_hash = entry.hash.clone();
+            headers.push(entry);
+
+            if has_txs {
+                let mut tx_hist = tx_entry.clone();
+                tx_hist.ledger_seq = seq;
+                tx_entries.push(tx_hist);
+                tx_results.push(TransactionHistoryResultEntry {
+                    ledger_seq: seq,
+                    tx_result_set: result_set,
+                    ext: TransactionHistoryResultEntryExt::default(),
+                });
+            }
+        }
+
+        // publish_checkpoint should succeed with sparse entries.
+        let result = manager.publish_checkpoint(
+            63,
+            &headers,
+            &tx_entries,
+            &tx_results,
+            &BucketList::new(),
+            None,
+        );
+        assert!(
+            result.is_ok(),
+            "sparse checkpoint should publish: {:?}",
+            result.err()
+        );
+
+        // Verify the tx file has only 2 entries (ledgers 60 and 63).
+        let tx_path = temp
+            .path()
+            .join("transactions/00/00/00/transactions-0000003f.xdr.gz");
+        assert!(tx_path.exists(), "transactions file should exist");
+    }
+
+    #[test]
+    fn test_publish_checkpoint_all_empty() {
+        use stellar_xdr::curr::*;
+
+        let temp = TempDir::new().unwrap();
+        let manager = PublishManager::new(PublishConfig {
+            local_path: temp.path().to_path_buf(),
+            ..Default::default()
+        });
+
+        // Build a checkpoint where ALL ledgers are empty.
+        let empty_result = TransactionResultSet {
+            results: Default::default(),
+        };
+
+        let mut headers = Vec::new();
+        let mut prev_hash = Hash([0u8; 32]);
+
+        for seq in 60..=63u32 {
+            let (tx_entry, _) = make_empty_entries(&LedgerHeader {
+                ledger_version: 25,
+                previous_ledger_hash: prev_hash.clone(),
+                scp_value: StellarValue {
+                    tx_set_hash: Hash([0u8; 32]),
+                    close_time: TimePoint(0),
+                    upgrades: VecM::default(),
+                    ext: StellarValueExt::Basic,
+                },
+                tx_set_result_hash: Hash([0u8; 32]),
+                bucket_list_hash: Hash([0u8; 32]),
+                ledger_seq: seq,
+                total_coins: 0,
+                fee_pool: 0,
+                inflation_seq: 0,
+                id_pool: 0,
+                base_fee: 100,
+                base_reserve: 5000000,
+                max_tx_set_size: 100,
+                skip_list: std::array::from_fn(|_| Hash([0u8; 32])),
+                ext: LedgerHeaderExt::V0,
+            });
+
+            let tx_set = crate::catchup::tx_set_from_history_entry(&tx_entry);
+            let header = make_header_with_hashes(seq, prev_hash.clone(), &tx_set, &empty_result);
+            let entry = make_header_entry(header);
+            prev_hash = entry.hash.clone();
+            headers.push(entry);
+        }
+
+        // No tx entries or results at all.
+        let result = manager.publish_checkpoint(63, &headers, &[], &[], &BucketList::new(), None);
+        assert!(
+            result.is_ok(),
+            "all-empty checkpoint should publish: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn test_publish_checkpoint_rejects_one_sided_presence() {
+        use stellar_xdr::curr::*;
+
+        let temp = TempDir::new().unwrap();
+        let manager = PublishManager::new(PublishConfig {
+            local_path: temp.path().to_path_buf(),
+            ..Default::default()
+        });
+
+        let empty_result = TransactionResultSet {
+            results: Default::default(),
+        };
+
+        let mut headers = Vec::new();
+        let mut prev_hash = Hash([0u8; 32]);
+
+        for seq in 60..=63u32 {
+            let (tx_entry, _) = make_empty_entries(&LedgerHeader {
+                ledger_version: 25,
+                previous_ledger_hash: prev_hash.clone(),
+                scp_value: StellarValue {
+                    tx_set_hash: Hash([0u8; 32]),
+                    close_time: TimePoint(0),
+                    upgrades: VecM::default(),
+                    ext: StellarValueExt::Basic,
+                },
+                tx_set_result_hash: Hash([0u8; 32]),
+                bucket_list_hash: Hash([0u8; 32]),
+                ledger_seq: seq,
+                total_coins: 0,
+                fee_pool: 0,
+                inflation_seq: 0,
+                id_pool: 0,
+                base_fee: 100,
+                base_reserve: 5000000,
+                max_tx_set_size: 100,
+                skip_list: std::array::from_fn(|_| Hash([0u8; 32])),
+                ext: LedgerHeaderExt::V0,
+            });
+
+            let tx_set = crate::catchup::tx_set_from_history_entry(&tx_entry);
+            let header = make_header_with_hashes(seq, prev_hash.clone(), &tx_set, &empty_result);
+            let entry = make_header_entry(header);
+            prev_hash = entry.hash.clone();
+            headers.push(entry);
+        }
+
+        // Provide a tx entry for ledger 61 but NO result entry → one-sided.
+        let (tx_entry, _) = make_empty_entries(&headers[1].header);
+        let err = manager
+            .publish_checkpoint(63, &headers, &[tx_entry], &[], &BucketList::new(), None)
+            .unwrap_err();
+        assert!(
+            matches!(err, HistoryError::VerificationFailed(ref msg) if msg.contains("present but") && msg.contains("missing")),
+            "expected one-sided presence error, got: {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_publish_checkpoint_rejects_duplicate_entries() {
+        use stellar_xdr::curr::*;
+
+        let temp = TempDir::new().unwrap();
+        let manager = PublishManager::new(PublishConfig {
+            local_path: temp.path().to_path_buf(),
+            ..Default::default()
+        });
+
+        let empty_result = TransactionResultSet {
+            results: Default::default(),
+        };
+
+        let mut headers = Vec::new();
+        let mut prev_hash = Hash([0u8; 32]);
+
+        for seq in 60..=63u32 {
+            let (tx_entry, _) = make_empty_entries(&LedgerHeader {
+                ledger_version: 25,
+                previous_ledger_hash: prev_hash.clone(),
+                scp_value: StellarValue {
+                    tx_set_hash: Hash([0u8; 32]),
+                    close_time: TimePoint(0),
+                    upgrades: VecM::default(),
+                    ext: StellarValueExt::Basic,
+                },
+                tx_set_result_hash: Hash([0u8; 32]),
+                bucket_list_hash: Hash([0u8; 32]),
+                ledger_seq: seq,
+                total_coins: 0,
+                fee_pool: 0,
+                inflation_seq: 0,
+                id_pool: 0,
+                base_fee: 100,
+                base_reserve: 5000000,
+                max_tx_set_size: 100,
+                skip_list: std::array::from_fn(|_| Hash([0u8; 32])),
+                ext: LedgerHeaderExt::V0,
+            });
+
+            let tx_set = crate::catchup::tx_set_from_history_entry(&tx_entry);
+            let header = make_header_with_hashes(seq, prev_hash.clone(), &tx_set, &empty_result);
+            let entry = make_header_entry(header);
+            prev_hash = entry.hash.clone();
+            headers.push(entry);
+        }
+
+        // Provide duplicate tx entries for the same ledger_seq.
+        let (tx_entry, _) = make_empty_entries(&headers[0].header);
+        let dup_tx_entries = vec![tx_entry.clone(), tx_entry];
+        let nonempty_result = TransactionHistoryResultEntry {
+            ledger_seq: 60,
+            tx_result_set: TransactionResultSet {
+                results: vec![TransactionResultPair {
+                    transaction_hash: Hash([1u8; 32]),
+                    result: TransactionResult {
+                        fee_charged: 100,
+                        result: TransactionResultResult::TxSuccess(Default::default()),
+                        ext: TransactionResultExt::V0,
+                    },
+                }]
+                .try_into()
+                .unwrap(),
+            },
+            ext: TransactionHistoryResultEntryExt::default(),
+        };
+        let dup_results = vec![nonempty_result.clone(), nonempty_result];
+
+        let err = manager
+            .publish_checkpoint(
+                63,
+                &headers,
+                &dup_tx_entries,
+                &dup_results,
+                &BucketList::new(),
+                None,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(err, HistoryError::VerificationFailed(ref msg) if msg.contains("not strictly ordered")),
+            "expected ordering error, got: {:?}",
+            err
+        );
     }
 }

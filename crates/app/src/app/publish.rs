@@ -203,13 +203,18 @@ impl App {
                 .db
                 .get_tx_history_entry(seq)?
                 .ok_or_else(|| anyhow::anyhow!("Missing tx history entry {}", seq))?;
-            tx_entries.push(tx_entry);
 
             let tx_result = self
                 .db
                 .get_tx_result_entry(seq)?
                 .ok_or_else(|| anyhow::anyhow!("Missing tx result entry {}", seq))?;
-            tx_results.push(tx_result);
+
+            // Match stellar-core: only include tx/result entries for ledgers
+            // with transactions (CheckpointBuilder.cpp:140).
+            if !tx_result.tx_result_set.results.is_empty() {
+                tx_entries.push(tx_entry);
+                tx_results.push(tx_result);
+            }
         }
 
         // Build SCP history entries

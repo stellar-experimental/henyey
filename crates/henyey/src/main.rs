@@ -2818,51 +2818,59 @@ async fn verify_single_checkpoint(
 
     for header_entry in &headers {
         let header = &header_entry.header;
-        let Some(tx_entry) = tx_map.get(&header.ledger_seq) else {
-            println!(
-                "    Missing transaction history entry for ledger {}",
-                header.ledger_seq
-            );
-            errors += 1;
-            continue;
-        };
-        let Some(result_entry) = result_map.get(&header.ledger_seq) else {
-            println!(
-                "    Missing transaction result entry for ledger {}",
-                header.ledger_seq
-            );
-            errors += 1;
-            continue;
-        };
 
-        let tx_set = TransactionSetVariant::from(*tx_entry);
-        if let Err(e) = verify::verify_tx_set(header, &tx_set) {
-            println!(
-                "    Tx set hash verification FAILED (ledger {}): {}",
-                header.ledger_seq, e
-            );
-            errors += 1;
+        // Genesis uses sentinel zero hashes — skip.
+        if header.ledger_seq == 1 {
+            continue;
         }
 
-        match result_entry
-            .tx_result_set
-            .to_xdr(stellar_xdr::curr::Limits::none())
-        {
-            Ok(bytes) => {
-                if let Err(e) = verify::verify_tx_result_set(header, &bytes) {
+        // stellar-core omits tx/result entries for ledgers with no
+        // transactions (CheckpointBuilder.cpp:140). Handle sparse entries.
+        match (
+            tx_map.get(&header.ledger_seq),
+            result_map.get(&header.ledger_seq),
+        ) {
+            (None, None) => {
+                // Expected: empty ledger, omitted by stellar-core.
+            }
+            (Some(_), None) | (None, Some(_)) => {
+                println!(
+                    "    One-sided tx/result presence for ledger {}",
+                    header.ledger_seq
+                );
+                errors += 1;
+            }
+            (Some(tx_entry), Some(result_entry)) => {
+                let tx_set = TransactionSetVariant::from(*tx_entry);
+                if let Err(e) = verify::verify_tx_set(header, &tx_set) {
                     println!(
-                        "    Tx result hash verification FAILED (ledger {}): {}",
+                        "    Tx set hash verification FAILED (ledger {}): {}",
                         header.ledger_seq, e
                     );
                     errors += 1;
                 }
-            }
-            Err(e) => {
-                println!(
-                    "    Failed to encode tx result set for ledger {}: {}",
-                    header.ledger_seq, e
-                );
-                errors += 1;
+
+                match result_entry
+                    .tx_result_set
+                    .to_xdr(stellar_xdr::curr::Limits::none())
+                {
+                    Ok(bytes) => {
+                        if let Err(e) = verify::verify_tx_result_set(header, &bytes) {
+                            println!(
+                                "    Tx result hash verification FAILED (ledger {}): {}",
+                                header.ledger_seq, e
+                            );
+                            errors += 1;
+                        }
+                    }
+                    Err(e) => {
+                        println!(
+                            "    Failed to encode tx result set for ledger {}: {}",
+                            header.ledger_seq, e
+                        );
+                        errors += 1;
+                    }
+                }
             }
         }
     }

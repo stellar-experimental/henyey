@@ -10,9 +10,8 @@ use henyey_history::checkpoint::{checkpoint_containing, next_checkpoint};
 use henyey_history::checkpoint_frequency;
 use henyey_history::paths::root_has_path;
 use henyey_history::publish::{build_history_archive_state, PublishConfig, PublishManager};
-use henyey_history::verify;
+
 use henyey_ledger::compute_header_hash;
-use henyey_ledger::TransactionSetVariant;
 use url::Url;
 
 /// Publish history command handler.
@@ -198,43 +197,23 @@ pub(crate) async fn cmd_publish_history(config: AppConfig, force: bool) -> anyho
             let tx_entry = db
                 .get_tx_history_entry(seq)?
                 .ok_or_else(|| anyhow::anyhow!("Missing tx history entry {}", seq))?;
-            tx_entries.push(tx_entry);
 
             let tx_result = db
                 .get_tx_result_entry(seq)?
                 .ok_or_else(|| anyhow::anyhow!("Missing tx result entry {}", seq))?;
-            tx_results.push(tx_result);
+
+            // Match stellar-core: only include tx/result entries for ledgers
+            // with transactions (CheckpointBuilder.cpp:140).
+            if !tx_result.tx_result_set.results.is_empty() {
+                tx_entries.push(tx_entry);
+                tx_results.push(tx_result);
+            }
         }
 
         let scp_entries = build_scp_history_entries(&db, start_ledger, checkpoint)?;
 
-        for ((header_entry, tx_entry), tx_result_entry) in
-            headers.iter().zip(tx_entries.iter()).zip(tx_results.iter())
-        {
-            let header = &header_entry.header;
-            let tx_set = TransactionSetVariant::from(tx_entry);
-            let tx_set_hash = verify::compute_tx_set_hash(&tx_set)?;
-            let expected_tx_set = Hash256::from(header.scp_value.tx_set_hash.0);
-            if tx_set_hash != expected_tx_set {
-                anyhow::bail!(
-                    "Tx set hash mismatch at {} (expected {}, got {})",
-                    header.ledger_seq,
-                    expected_tx_set.to_hex(),
-                    tx_set_hash.to_hex()
-                );
-            }
-
-            let tx_result_hash = Hash256::hash_xdr(&tx_result_entry.tx_result_set);
-            let expected_tx_result = Hash256::from(header.tx_set_result_hash.0);
-            if tx_result_hash != expected_tx_result {
-                anyhow::bail!(
-                    "Tx result hash mismatch at {} (expected {}, got {})",
-                    header.ledger_seq,
-                    expected_tx_result.to_hex(),
-                    tx_result_hash.to_hex()
-                );
-            }
-        }
+        // Verification of tx set and result hashes is handled by
+        // PublishManager::publish_checkpoint — no need to duplicate here.
 
         let levels = db
             .load_bucket_list(checkpoint)?
