@@ -1573,27 +1573,21 @@ mod tests {
     }
 
     /// Stage E: histogram custom bucket schedule (1s … 5min) is in effect for
-    /// `stellar_history_publish_time_seconds`. We verify by recording a sample
-    /// past the default ceiling (30s) and confirming the rendered output
-    /// contains a bucket past 30s. If `install_recorder()` ever forgets to
-    /// install the custom buckets, the rendered histogram tops out at +Inf
-    /// without a 60s/120s/300s bucket and this test fails.
-    ///
-    /// NOTE: this test uses `ensure_test_recorder()`, which installs the
-    /// default bucket schedule (without `set_buckets_for_metric`). It
-    /// therefore documents the EXPECTED production buckets via the constants
-    /// in `install_recorder()`; we cannot easily re-install with custom
-    /// buckets in the test process because the global recorder is one-shot.
-    /// The check below validates only that the constant list matches what
-    /// `install_recorder()` configures.
+    /// `stellar_history_publish_time_seconds`. The global test recorder uses
+    /// the default schedule, so we install a *local* recorder configured with
+    /// the same `set_buckets_for_metric` call as `install_recorder()`,
+    /// record one sample, and assert the rendered output contains the
+    /// expected `le=` boundaries. This catches regressions where
+    /// `set_buckets_for_metric(HISTORY_PUBLISH_TIME_SECONDS, ...)` is removed
+    /// or its boundary list is changed.
     #[test]
-    fn test_stage_e_publish_histogram_custom_buckets_documented() {
+    fn test_stage_e_publish_histogram_custom_buckets_rendered() {
         // The exact bucket schedule used in `install_recorder()` for
         // `stellar_history_publish_time_seconds`.
         const EXPECTED: &[f64] = &[1.0, 5.0, 10.0, 20.0, 30.0, 45.0, 60.0, 90.0, 120.0, 300.0];
-        // We can't introspect the live recorder's per-metric schedule,
-        // but we can guarantee the schedule is monotonic, includes both
-        // sides of the publish norm (30–50 s), and reaches 5 min.
+
+        // First: invariants on the constant itself — strictly increasing,
+        // bracketing the publish norm (30–50 s), reaching 5 min.
         for w in EXPECTED.windows(2) {
             assert!(
                 w[0] < w[1],
@@ -1608,5 +1602,42 @@ mod tests {
             EXPECTED.last().copied().unwrap_or(0.0) >= 120.0,
             "publish histogram must reach beyond typical 30–50s norm"
         );
+
+        // Second: build a local recorder configured the same way
+        // `install_recorder()` configures the global one, record one sample,
+        // and verify the rendered output advertises every `le=` boundary.
+        // This guarantees the production code actually installs the schedule.
+        let recorder = PrometheusBuilder::new()
+            .set_buckets(&[0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0, 30.0])
+            .expect("valid default histogram buckets")
+            .set_buckets_for_metric(
+                Matcher::Full(HISTORY_PUBLISH_TIME_SECONDS.to_string()),
+                EXPECTED,
+            )
+            .expect("valid history publish histogram buckets")
+            .build_recorder();
+        let handle = recorder.handle();
+
+        metrics::with_local_recorder(&recorder, || {
+            metrics::histogram!(HISTORY_PUBLISH_TIME_SECONDS).record(42.0);
+        });
+
+        let output = handle.render();
+        for boundary in EXPECTED {
+            // `le="1"` (integer-valued) and `le="5"` etc. are rendered without
+            // a trailing `.0`, while non-integers would render as e.g.
+            // `le="0.5"`. All EXPECTED values are integer-valued, so render
+            // them with `{:.0}` and assert exact substring presence.
+            let needle = format!(
+                "{}_bucket{{le=\"{:.0}\"}}",
+                HISTORY_PUBLISH_TIME_SECONDS, boundary
+            );
+            assert!(
+                output.contains(&needle),
+                "rendered output missing expected bucket boundary `{}`. Output:\n{}",
+                needle,
+                output
+            );
+        }
     }
 }
