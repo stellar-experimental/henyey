@@ -204,19 +204,24 @@ impl CatchupManager {
             // The download path (block_on_async + download_bucket_from_archives)
             // bypasses `download_buckets`, so emit per-bucket download
             // success/failure here too — matching the pre-download stream.
+            //
+            // Stage E counter coverage: success is only emitted once the bytes
+            // are safely persisted to disk. If the network fetch succeeds but
+            // `atomic_write_bytes` fails (e.g., ENOSPC), we increment the
+            // failure counter and bail out, so dashboards see one terminal
+            // outcome per bucket.
+            let was_preloaded;
             let xdr_data = if let Some(data) = {
                 let mut preloaded = preloaded_buckets.lock().unwrap();
                 preloaded.remove(hash)
             } {
+                was_preloaded = true;
                 data
             } else {
+                was_preloaded = false;
                 // Download the bucket (blocking - we're in a sync context).
                 match block_on_async(download_bucket_from_archives(archives.clone(), *hash)) {
-                    Ok(data) => {
-                        metrics::counter!("stellar_history_download_bucket_success_total")
-                            .increment(1);
-                        data
-                    }
+                    Ok(data) => data,
                     Err(e) => {
                         metrics::counter!("stellar_history_download_bucket_failure_total")
                             .increment(1);
@@ -234,12 +239,21 @@ impl CatchupManager {
             // Save XDR data to disk first, then build the disk-backed bucket by
             // streaming through the file. This avoids holding the full file in memory
             // while also building the index — critical for multi-GB buckets on mainnet.
-            atomic_write_bytes(&bucket_path, &xdr_data).map_err(|e| {
-                henyey_bucket::BucketError::NotFound(format!(
+            if let Err(e) = atomic_write_bytes(&bucket_path, &xdr_data) {
+                if !was_preloaded {
+                    // Persistence failure on the freshly-downloaded path is a
+                    // terminal download-outcome failure — caller bails out.
+                    metrics::counter!("stellar_history_download_bucket_failure_total").increment(1);
+                }
+                return Err(henyey_bucket::BucketError::NotFound(format!(
                     "failed to write bucket to disk: {}",
                     e
-                ))
-            })?;
+                )));
+            }
+            if !was_preloaded {
+                // Successful fetch + persistence — terminal success.
+                metrics::counter!("stellar_history_download_bucket_success_total").increment(1);
+            }
             // Drop the in-memory XDR data before building the index to free memory
             drop(xdr_data);
 
@@ -373,6 +387,10 @@ impl CatchupManager {
                     // Check if we have the XDR data in the pre-downloaded cache
                     let bucket_path = bucket_dir_clone.join(canonical_bucket_filename(hash));
 
+                    // Stage E counter coverage: download outcomes are only
+                    // counted on the network-fetch fallback path. Success is
+                    // emitted once bytes are persisted; persistence-error on
+                    // the freshly-fetched path counts as a download failure.
                     let xdr_data: Option<Vec<u8>> = if let Some(data) = {
                         let mut preloaded = preloaded_buckets.lock().unwrap();
                         preloaded.remove(hash)
@@ -402,11 +420,7 @@ impl CatchupManager {
                             archives_clone.clone(),
                             *hash,
                         )) {
-                            Ok(data) => {
-                                metrics::counter!("stellar_history_download_bucket_success_total")
-                                    .increment(1);
-                                Some(data)
-                            }
+                            Ok(data) => Some(data),
                             Err(e) => {
                                 metrics::counter!("stellar_history_download_bucket_failure_total")
                                     .increment(1);
@@ -415,14 +429,20 @@ impl CatchupManager {
                         }
                     };
 
-                    // If we downloaded data, save it to disk atomically
+                    // If we downloaded data, save it to disk atomically. A
+                    // persistence error here is the terminal download outcome
+                    // for this bucket — emit failure before propagating.
                     if let Some(downloaded_data) = xdr_data {
-                        atomic_write_bytes(&bucket_path, &downloaded_data).map_err(|e| {
-                            henyey_bucket::BucketError::NotFound(format!(
+                        if let Err(e) = atomic_write_bytes(&bucket_path, &downloaded_data) {
+                            metrics::counter!("stellar_history_download_bucket_failure_total")
+                                .increment(1);
+                            return Err(henyey_bucket::BucketError::NotFound(format!(
                                 "failed to write hot archive bucket to disk: {}",
                                 e
-                            ))
-                        })?;
+                            )));
+                        }
+                        metrics::counter!("stellar_history_download_bucket_success_total")
+                            .increment(1);
                     }
 
                     // Load hot archive bucket from disk eagerly — builds the index
