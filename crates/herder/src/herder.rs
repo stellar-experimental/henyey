@@ -344,6 +344,8 @@ pub struct Herder {
     verified_rx: std::sync::Mutex<
         Option<tokio::sync::mpsc::UnboundedReceiver<crate::scp_verify::VerifiedEnvelope>>,
     >,
+    /// Shared SCP metrics counters.
+    scp_metrics: Arc<crate::metrics::ScpMetrics>,
 }
 
 impl Herder {
@@ -396,18 +398,22 @@ impl Herder {
 
         let tracking_state = Arc::new(RwLock::new(SharedTrackingState::default()));
 
+        let scp_metrics = Arc::new(crate::metrics::ScpMetrics::new());
+
         let scp_driver = Arc::new(if let Some(ref sk) = secret_key {
             ScpDriver::with_secret_key(
                 scp_driver_config,
                 config.network_id,
                 sk.clone(),
                 Arc::clone(&tracking_state),
+                Arc::clone(&scp_metrics),
             )
         } else {
             ScpDriver::new(
                 scp_driver_config,
                 config.network_id,
                 Arc::clone(&tracking_state),
+                Arc::clone(&scp_metrics),
             )
         });
 
@@ -489,6 +495,7 @@ impl Herder {
         let spawned = crate::scp_verify::spawn_scp_verifier(
             config.network_id,
             crate::scp_verify::DEFAULT_VERIFIER_QUEUE_CAPACITY,
+            Arc::clone(&scp_metrics),
         )
         .expect("scp-verify worker thread must spawn (OS resource exhaustion?)");
         let scp_verifier_handle = spawned.handle;
@@ -516,6 +523,7 @@ impl Herder {
             cached_nomination_value: RwLock::new(None),
             scp_verifier_handle,
             verified_rx: std::sync::Mutex::new(verified_rx),
+            scp_metrics,
         }
     }
 
@@ -659,6 +667,23 @@ impl Herder {
     /// Equivalent to [`tracking_slot`](Self::tracking_slot); both read the same field.
     pub fn next_consensus_ledger_index(&self) -> u64 {
         self.tracking_slot()
+    }
+
+    /// Returns the ballot-protocol phase of the tracking slot as a u8 gauge value.
+    ///
+    /// 0=unknown, 1=prepare, 2=confirm, 3=externalize.
+    pub fn tracking_slot_ballot_phase(&self) -> u8 {
+        self.scp.get_slot_ballot_phase(self.tracking_slot())
+    }
+
+    /// Get a snapshot of the SCP event counters for the metrics scrape path.
+    pub fn scp_metrics_snapshot(&self) -> crate::metrics::ScpMetricsSnapshot {
+        self.scp_metrics.snapshot()
+    }
+
+    /// Get the cumulative SCP statement count (retained-memory gauge).
+    pub fn scp_cumulative_statement_count(&self) -> usize {
+        self.scp.get_cumulative_statement_count()
     }
 
     /// Get the most recent checkpoint sequence.
@@ -6986,7 +7011,12 @@ mod scp_pipeline_tests {
 
     #[test]
     fn test_worker_dead_on_channel_close() {
-        let spawned = spawn_scp_verifier(Hash256::from_bytes([4u8; 32]), 8).expect("spawn");
+        let spawned = spawn_scp_verifier(
+            Hash256::from_bytes([4u8; 32]),
+            8,
+            Arc::new(crate::metrics::ScpMetrics::new()),
+        )
+        .expect("spawn");
         let state = spawned.handle.state.clone();
         let tx = spawned.handle.tx.clone();
         let verified_rx = spawned.verified_rx;
@@ -7016,7 +7046,12 @@ mod scp_pipeline_tests {
         // The worker has a cfg(test) sentinel: slot == u64::MAX - 1 panics
         // inside catch_unwind. The worker must emit a Panic verdict AND
         // transition state to Dead, even if the input channel stays open.
-        let spawned = spawn_scp_verifier(Hash256::from_bytes([11u8; 32]), 8).expect("spawn");
+        let spawned = spawn_scp_verifier(
+            Hash256::from_bytes([11u8; 32]),
+            8,
+            Arc::new(crate::metrics::ScpMetrics::new()),
+        )
+        .expect("spawn");
         let h = spawned.handle.clone();
         let mut verified_rx = spawned.verified_rx;
         let join_handle = spawned.join_handle;
@@ -7052,7 +7087,12 @@ mod scp_pipeline_tests {
 
     #[test]
     fn test_worker_output_receiver_close_exits() {
-        let spawned = spawn_scp_verifier(Hash256::from_bytes([5u8; 32]), 8).expect("spawn");
+        let spawned = spawn_scp_verifier(
+            Hash256::from_bytes([5u8; 32]),
+            8,
+            Arc::new(crate::metrics::ScpMetrics::new()),
+        )
+        .expect("spawn");
         let h = spawned.handle.clone();
         let join_handle = spawned.join_handle;
 

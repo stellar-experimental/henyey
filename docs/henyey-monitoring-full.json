@@ -385,11 +385,13 @@
     },
     {
       "id": 30,
-      "type": "text",
-      "title": "Quorum Phase — Coming in Stage C",
-      "description": "Panel 37 of 10334. SCP phase gauge.",
+      "type": "timeseries",
+      "title": "Quorum Phase",
+      "description": "Panel 37 of 10334. SCP ballot phase of the tracking slot (0=unknown, 1=prepare, 2=confirm, 3=externalize).",
       "gridPos": {"h": 6, "w": 6, "x": 12, "y": 38},
-      "options": {"mode": "markdown", "content": "**Coming in Stage C** — `stellar_scp_phase` enum gauge (unknown/prepare/confirm/externalize)."}
+      "datasource": {"type": "prometheus", "uid": "000000001"},
+      "targets": [{"expr": "stellar_scp_phase{instance=~\"$instance\"}", "legendFormat": "phase"}],
+      "fieldConfig": {"defaults": {"unit": "short", "min": 0, "max": 3, "mappings": [{"type": "value", "options": {"0": {"text": "unknown"}, "1": {"text": "prepare"}, "2": {"text": "confirm"}, "3": {"text": "externalize"}}}]}}
     },
     {
       "id": 31,
@@ -454,19 +456,34 @@
     },
     {
       "id": 36,
-      "type": "text",
-      "title": "SCP Timeouts / Envelope Signing / Fetch — Coming in Stage C",
-      "description": "Panels 45-49 of 10334.",
+      "type": "timeseries",
+      "title": "SCP Timeouts / Envelope Signing",
+      "description": "Panels 45-49 of 10334. Timeout and envelope signing/verification counters. Fetch metrics deferred.",
       "gridPos": {"h": 6, "w": 8, "x": 16, "y": 51},
-      "options": {"mode": "markdown", "content": "**Coming in Stage C** — SCP timeout counters (`nominate`/`prepare`), envelope signing/validation counters, and fetch duration metrics."}
+      "datasource": {"type": "prometheus", "uid": "000000001"},
+      "targets": [
+        {"expr": "rate(stellar_scp_timeout_nominate_total{instance=~\"$instance\"}[5m])", "legendFormat": "nominate timeout/s"},
+        {"expr": "rate(stellar_scp_timeout_prepare_total{instance=~\"$instance\"}[5m])", "legendFormat": "prepare timeout/s"},
+        {"expr": "rate(stellar_scp_envelope_sign_total{instance=~\"$instance\"}[5m])", "legendFormat": "sign/s"},
+        {"expr": "rate(stellar_scp_envelope_validsig_total{instance=~\"$instance\"}[5m])", "legendFormat": "valid sig/s"},
+        {"expr": "rate(stellar_scp_envelope_invalidsig_total{instance=~\"$instance\"}[5m])", "legendFormat": "invalid sig/s"}
+      ],
+      "fieldConfig": {"defaults": {"unit": "ops"}}
     },
     {
       "id": 37,
-      "type": "text",
-      "title": "Consensus Combine/Valid/Invalid/Sync Lost — Coming in Stage C",
-      "description": "Panel 50 of 10334.",
+      "type": "timeseries",
+      "title": "Consensus Combine/Valid/Invalid/Sync Lost",
+      "description": "Panel 50 of 10334. Value validation and combine_candidates rates.",
       "gridPos": {"h": 6, "w": 8, "x": 0, "y": 57},
-      "options": {"mode": "markdown", "content": "**Coming in Stage C** — Consensus metrics. Note: `stellar_herder_lost_sync_total` already exists."}
+      "datasource": {"type": "prometheus", "uid": "000000001"},
+      "targets": [
+        {"expr": "rate(stellar_scp_value_valid_total{instance=~\"$instance\"}[5m])", "legendFormat": "valid/s"},
+        {"expr": "rate(stellar_scp_value_invalid_total{instance=~\"$instance\"}[5m])", "legendFormat": "invalid/s"},
+        {"expr": "rate(stellar_scp_nomination_combinecandidates_total{instance=~\"$instance\"}[5m])", "legendFormat": "combine/s"},
+        {"expr": "rate(stellar_herder_lost_sync_total{instance=~\"$instance\"}[5m])", "legendFormat": "sync lost/s"}
+      ],
+      "fieldConfig": {"defaults": {"unit": "ops"}}
     },
     {
       "id": 38,
@@ -485,11 +502,13 @@
     },
     {
       "id": 39,
-      "type": "text",
-      "title": "SCP Memory Cumulative Statements — Coming in Stage C",
-      "description": "Panel 52 of 10334.",
+      "type": "timeseries",
+      "title": "SCP Memory Cumulative Statements",
+      "description": "Panel 52 of 10334. Number of cumulative SCP statements stored in memory.",
       "gridPos": {"h": 6, "w": 8, "x": 16, "y": 57},
-      "options": {"mode": "markdown", "content": "**Coming in Stage C** — `stellar_scp_memory_cumulative_statements` gauge."}
+      "datasource": {"type": "prometheus", "uid": "000000001"},
+      "targets": [{"expr": "stellar_scp_memory_cumulative_statements{instance=~\"$instance\"}", "legendFormat": "statements"}],
+      "fieldConfig": {"defaults": {"unit": "short"}}
     },
     {
       "type": "row",

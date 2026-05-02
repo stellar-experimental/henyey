@@ -51,6 +51,16 @@ Metrics with the `stellar_` prefix that directly mirror stellar-core Medida coun
 | `HERDER_PENDING_RELEASED_TOTAL` | `stellar_herder_pending_released_total` | counter | Envelopes released from pending |
 | `SCP_ENVELOPE_EMIT_TOTAL` | `stellar_scp_envelope_emit_total` | counter | `SCPDriver::mEnvelopeEmit` |
 | `SCP_ENVELOPE_RECEIVE_TOTAL` | `stellar_scp_envelope_receive_total` | counter | `SCPDriver::mEnvelopeReceive` |
+| `SCP_ENVELOPE_SIGN_TOTAL` | `stellar_scp_envelope_sign_total` | counter | `SCPDriver::mEnvelopeSign` — counts successful envelope signings. |
+| `SCP_ENVELOPE_VALIDSIG_TOTAL` | `stellar_scp_envelope_validsig_total` | counter | `SCPDriver::mEnvelopeValidSig` — signature verifications that pass. |
+| `SCP_ENVELOPE_INVALIDSIG_TOTAL` | `stellar_scp_envelope_invalidsig_total` | counter | `SCPDriver::mEnvelopeInvalidSig` — signature verifications that fail. |
+| `SCP_VALUE_VALID_TOTAL` | `stellar_scp_value_valid_total` | counter | `SCPDriver::mValueValid` — value validations that succeed. |
+| `SCP_VALUE_INVALID_TOTAL` | `stellar_scp_value_invalid_total` | counter | `SCPDriver::mValueInvalid` — value validations that fail (includes FullyValidated deferred path). |
+| `SCP_NOMINATION_COMBINECANDIDATES_TOTAL` | `stellar_scp_nomination_combinecandidates_total` | counter | `SCPDriver::mCombinedCandidates` — number of candidates passed to combine_candidates. |
+| `SCP_TIMEOUT_NOMINATE_TOTAL` | `stellar_scp_timeout_nominate_total` | counter | `SCPDriver::mNominateTimeout` — fires of the nomination timer. |
+| `SCP_TIMEOUT_PREPARE_TOTAL` | `stellar_scp_timeout_prepare_total` | counter | `SCPDriver::mPrepareTimeout` — fires of the ballot timer. |
+| `SCP_PHASE` | `stellar_scp_phase` | gauge | `HerderImpl::mSCPPhase` — tracking slot ballot phase (0=unknown, 1=prepare, 2=confirm, 3=externalize). |
+| `SCP_MEMORY_CUMULATIVE_STATEMENTS` | `stellar_scp_memory_cumulative_statements` | gauge | `SCP::mCumulativeStatements` — total statements stored across all slots. |
 | `OVERLAY_MESSAGE_READ_TOTAL` | `stellar_overlay_message_read_total` | counter | `OverlayManagerImpl::mMessageRead` |
 | `OVERLAY_MESSAGE_WRITE_TOTAL` | `stellar_overlay_message_write_total` | counter | `OverlayManagerImpl::mMessageWrite` |
 | `OVERLAY_MESSAGE_BROADCAST_TOTAL` | `stellar_overlay_message_broadcast_total` | counter | `OverlayManagerImpl::mMessagesBroadcast` |

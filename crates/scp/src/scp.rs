@@ -50,6 +50,7 @@ use stellar_xdr::curr::{
     NodeId, ScpBallot, ScpEnvelope, ScpQuorumSet, ScpStatement, ScpStatementPledges, Value,
 };
 
+use crate::ballot::BallotPhase;
 use crate::driver::SCPDriver;
 use crate::slot::Slot;
 use crate::EnvelopeState;
@@ -466,6 +467,33 @@ impl<D: SCPDriver> SCP<D> {
             .values()
             .map(|slot| slot.get_statement_count())
             .sum()
+    }
+
+    /// Returns the ballot-protocol phase for a specific slot as a u8 gauge value.
+    ///
+    /// - 0 = unknown (slot absent, or nomination-only with no active ballot)
+    /// - 1 = prepare (`BallotPhase::Prepare` with an active ballot)
+    /// - 2 = confirm (`BallotPhase::Confirm`)
+    /// - 3 = externalize (slot is externalized)
+    pub fn get_slot_ballot_phase(&self, slot_index: u64) -> u8 {
+        let slots = self.slots.read();
+        let Some(slot) = slots.get(&slot_index) else {
+            return 0;
+        };
+        if slot.is_externalized() {
+            return 3;
+        }
+        match slot.ballot_phase() {
+            BallotPhase::Externalize => 3,
+            BallotPhase::Confirm => 2,
+            BallotPhase::Prepare => {
+                if slot.has_active_ballot() {
+                    1
+                } else {
+                    0
+                }
+            }
+        }
     }
 
     /// Get the latest messages that would be sent for a slot.
@@ -2033,5 +2061,16 @@ mod tests {
             3,
             "parent should have 3 validators after flattening"
         );
+    }
+
+    #[test]
+    fn test_get_slot_ballot_phase_absent_slot_returns_zero() {
+        let node = make_node_id(1);
+        let validators = vec![make_node_id(1), make_node_id(2), make_node_id(3)];
+        let qs = make_quorum_set(validators, 2);
+        let driver = MockDriverBuilder::new().build();
+        let scp = SCP::new(node, true, qs, Arc::new(driver));
+        // Slot 42 never created → should return 0.
+        assert_eq!(scp.get_slot_ballot_phase(42), 0);
     }
 }

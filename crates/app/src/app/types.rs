@@ -334,6 +334,12 @@ pub struct AppMetricsSnapshot {
     pub archive_cache_refresh_timeout: u64,
     pub archive_cache_age_secs: f64,
     pub archive_cache_populated: bool,
+    // Stage C: SCP metrics (issue #2233).
+    pub scp: henyey_herder::ScpMetricsSnapshot,
+    pub scp_phase: u8,
+    pub scp_cumulative_statements: u64,
+    pub nomination_timeout_fires: u64,
+    pub ballot_timeout_fires: u64,
 }
 
 /// Metrics for the overlay fetch-response channel (issue #1741).

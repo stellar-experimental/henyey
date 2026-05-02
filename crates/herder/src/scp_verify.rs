@@ -410,6 +410,7 @@ pub struct SpawnedVerifier {
 pub fn spawn_scp_verifier(
     network_id: Hash256,
     capacity: usize,
+    scp_metrics: Arc<crate::metrics::ScpMetrics>,
 ) -> Result<SpawnedVerifier, std::io::Error> {
     let (tx, rx) = tokio::sync::mpsc::channel::<PipelinedIntake>(capacity);
     let (verified_tx, verified_rx) = tokio::sync::mpsc::unbounded_channel::<VerifiedEnvelope>();
@@ -431,6 +432,7 @@ pub fn spawn_scp_verifier(
                 state_worker,
                 heartbeat_worker,
                 backlog_worker,
+                scp_metrics,
             );
         })?;
 
@@ -456,6 +458,7 @@ pub(crate) fn scp_verify_worker(
     state: Arc<AtomicU8>,
     heartbeat: Arc<AtomicU64>,
     backlog: Arc<AtomicUsize>,
+    scp_metrics: Arc<crate::metrics::ScpMetrics>,
 ) {
     // `blocking_recv` parks the std::thread until a new intake arrives. This is
     // appropriate because we are OUTSIDE the tokio runtime.
@@ -498,6 +501,12 @@ pub(crate) fn scp_verify_worker(
                 return;
             }
         };
+
+        match verdict {
+            Verdict::Ok => scp_metrics.inc_envelope_validsig(),
+            Verdict::InvalidSignature => scp_metrics.inc_envelope_invalidsig(),
+            Verdict::Panic => {} // unreachable here (handled above)
+        }
 
         heartbeat.fetch_add(1, Ordering::Relaxed);
         if verified_tx
@@ -552,7 +561,12 @@ mod tests {
 
     #[test]
     fn test_worker_heartbeat_advances() {
-        let spawned = spawn_scp_verifier(network_id(), 16).expect("spawn");
+        let spawned = spawn_scp_verifier(
+            network_id(),
+            16,
+            Arc::new(crate::metrics::ScpMetrics::new()),
+        )
+        .expect("spawn");
         let h = spawned.handle.clone();
         let mut verified_rx = spawned.verified_rx;
 

@@ -487,6 +487,8 @@ pub struct ScpDriver {
     /// can leave both `apply_lag` and `missing_tx_sets` set on the same
     /// slot). The slot is restorable only when ALL causes have cleared.
     deferred_slots: Mutex<HashMap<SlotIndex, DeferredCauses>>,
+    /// Shared SCP metrics counters (sign, verify, validate, combine).
+    scp_metrics: Arc<crate::metrics::ScpMetrics>,
 }
 
 /// Causes that are deferring full validation for a slot.
@@ -554,6 +556,7 @@ impl ScpDriver {
         config: ScpDriverConfig,
         network_id: Hash256,
         tracking_state: Arc<RwLock<SharedTrackingState>>,
+        scp_metrics: Arc<crate::metrics::ScpMetrics>,
     ) -> Self {
         let local_quorum_set = config.local_quorum_set.clone();
         let local_node_key = *config.node_id.as_bytes();
@@ -577,6 +580,7 @@ impl ScpDriver {
             last_externalize_timing: RwLock::new(None),
             externalize_lag: RwLock::new(ExternalizeLagTracker::new()),
             deferred_slots: Mutex::new(HashMap::new()),
+            scp_metrics,
         }
     }
 
@@ -610,8 +614,9 @@ impl ScpDriver {
         network_id: Hash256,
         secret_key: SecretKey,
         tracking_state: Arc<RwLock<SharedTrackingState>>,
+        scp_metrics: Arc<crate::metrics::ScpMetrics>,
     ) -> Self {
-        let mut driver = Self::new(config, network_id, tracking_state);
+        let mut driver = Self::new(config, network_id, tracking_state, scp_metrics);
         driver.secret_key = Some(secret_key);
         driver
     }
@@ -928,6 +933,11 @@ impl ScpDriver {
     /// Get the network ID.
     pub fn network_id(&self) -> Hash256 {
         self.network_id
+    }
+
+    /// Get a reference to the shared SCP metrics.
+    pub fn scp_metrics(&self) -> &Arc<crate::metrics::ScpMetrics> {
+        &self.scp_metrics
     }
 
     /// Get the latest externalized slot.
@@ -2206,7 +2216,13 @@ impl ScpDriver {
     /// `tokio::spawn`) and for tests.
     pub fn verify_envelope(&self, envelope: &ScpEnvelope) -> Result<()> {
         let data = Self::build_signed_bytes(&self.network_id, envelope)?;
-        Self::verify_signed_bytes(&data, &envelope.statement.node_id, &envelope.signature)
+        let result =
+            Self::verify_signed_bytes(&data, &envelope.statement.node_id, &envelope.signature);
+        match &result {
+            Ok(()) => self.scp_metrics.inc_envelope_validsig(),
+            Err(_) => self.scp_metrics.inc_envelope_invalidsig(),
+        }
+        result
     }
 
     /// Construct and broadcast an EXTERNALIZE envelope for a slot that was
@@ -2592,6 +2608,7 @@ mod cache_tests {
             make_config(1),
             Hash256::hash(b"network"),
             default_tracking(),
+            Arc::new(crate::metrics::ScpMetrics::new()),
         );
         let first = make_tx_set(1);
         let second = make_tx_set(2);
@@ -2609,6 +2626,7 @@ mod cache_tests {
             make_config(4),
             Hash256::hash(b"network"),
             default_tracking(),
+            Arc::new(crate::metrics::ScpMetrics::new()),
         );
         let tx_set = make_tx_set(3);
         let slot = 12u64;
@@ -2630,6 +2648,7 @@ mod cache_tests {
             make_config(2),
             Hash256::hash(b"network"),
             default_tracking(),
+            Arc::new(crate::metrics::ScpMetrics::new()),
         );
         let tx_set = make_tx_set(4);
         let bad_hash = Hash256::from_bytes([9; 32]);
@@ -2650,6 +2669,7 @@ mod cache_tests {
             make_config(4),
             Hash256::hash(b"network"),
             default_tracking(),
+            Arc::new(crate::metrics::ScpMetrics::new()),
         );
         let tx_set_a = make_tx_set(5);
         let tx_set_b = make_tx_set(6);
@@ -2670,6 +2690,7 @@ mod cache_tests {
             make_config(4),
             Hash256::hash(b"network"),
             default_tracking(),
+            Arc::new(crate::metrics::ScpMetrics::new()),
         );
         let tx_set = make_tx_set(7);
         driver.request_tx_set(*tx_set.hash(), 20);
@@ -2697,7 +2718,12 @@ mod cache_tests {
             local_quorum_set: Some(quorum_set.clone()),
             ..make_config(4)
         };
-        let driver = ScpDriver::new(config, Hash256::hash(b"network"), default_tracking());
+        let driver = ScpDriver::new(
+            config,
+            Hash256::hash(b"network"),
+            default_tracking(),
+            Arc::new(crate::metrics::ScpMetrics::new()),
+        );
 
         // Create a test node_id for the request
         let sender_node_id =
@@ -2734,6 +2760,7 @@ mod cache_tests {
             make_config(4),
             Hash256::hash(b"network"),
             default_tracking(),
+            Arc::new(crate::metrics::ScpMetrics::new()),
         );
 
         // Externalize some slots (manually insert into the map for testing)
@@ -2768,6 +2795,7 @@ mod cache_tests {
             make_config(4),
             Hash256::hash(b"network"),
             default_tracking(),
+            Arc::new(crate::metrics::ScpMetrics::new()),
         );
 
         // Externalize some slots with gaps
@@ -2801,6 +2829,7 @@ mod cache_tests {
             make_config(10),
             Hash256::hash(b"network"),
             default_tracking(),
+            Arc::new(crate::metrics::ScpMetrics::new()),
         );
 
         // Add pending tx_sets for various slots
@@ -2851,6 +2880,7 @@ mod cache_tests {
             make_config(4),
             Hash256::hash(b"network"),
             default_tracking(),
+            Arc::new(crate::metrics::ScpMetrics::new()),
         );
         let tx_set_a = make_tx_set(10);
         let tx_set_b = make_tx_set(11);
@@ -2872,6 +2902,7 @@ mod cache_tests {
             make_config(4),
             Hash256::hash(b"network"),
             default_tracking(),
+            Arc::new(crate::metrics::ScpMetrics::new()),
         );
         assert!(driver.get_pending_tx_sets().is_empty());
 
@@ -2886,6 +2917,7 @@ mod cache_tests {
             make_config(4),
             Hash256::hash(b"network"),
             default_tracking(),
+            Arc::new(crate::metrics::ScpMetrics::new()),
         );
         let tx_set = make_tx_set(20);
 
@@ -2964,7 +2996,12 @@ mod cache_tests {
             consensus_index: 1,
             consensus_close_time: 1,
         }));
-        let driver = ScpDriver::new(config, network_id, tracking);
+        let driver = ScpDriver::new(
+            config,
+            network_id,
+            tracking,
+            Arc::new(crate::metrics::ScpMetrics::new()),
+        );
 
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -3065,7 +3102,7 @@ impl SCPDriver for HerderScpCallback {
         // and upgrade checks for ALL statements (both nomination and ballot).
         // The `nomination` flag is forwarded to upgrade validation for additional
         // strictness during nomination (isValidForNomination).
-        match self
+        let level = match self
             .driver
             .validate_value_impl(slot_index, value, nomination)
         {
@@ -3073,10 +3110,18 @@ impl SCPDriver for HerderScpCallback {
             ValueValidation::MaybeValid => ValidationLevel::MaybeValid,
             ValueValidation::MaybeValidDeferred => ValidationLevel::MaybeValidDeferred,
             ValueValidation::Invalid => ValidationLevel::Invalid,
+        };
+        match level {
+            ValidationLevel::Invalid => self.driver.scp_metrics.inc_value_invalid(),
+            _ => self.driver.scp_metrics.inc_value_valid(),
         }
+        level
     }
 
     fn combine_candidates(&self, slot_index: u64, candidates: &[Value]) -> Option<Value> {
+        self.driver
+            .scp_metrics
+            .add_combine_candidates(candidates.len() as u64);
         let result = self.driver.combine_candidates_impl(slot_index, candidates);
         if result.0.is_empty() {
             None
@@ -3221,6 +3266,7 @@ impl SCPDriver for HerderScpCallback {
         if let Some(sig) = self.driver.sign_envelope(&envelope.statement) {
             envelope.signature =
                 stellar_xdr::curr::Signature(sig.0.to_vec().try_into().unwrap_or_default());
+            self.driver.scp_metrics.inc_envelope_sign();
         }
     }
 
@@ -3275,7 +3321,12 @@ mod tests {
 
     fn make_test_driver() -> ScpDriver {
         let config = ScpDriverConfig::default();
-        ScpDriver::new(config, Hash256::ZERO, default_tracking())
+        ScpDriver::new(
+            config,
+            Hash256::ZERO,
+            default_tracking(),
+            Arc::new(crate::metrics::ScpMetrics::new()),
+        )
     }
 
     fn nomination_time(driver: &ScpDriver, slot: SlotIndex) -> Option<std::time::Instant> {
@@ -3303,8 +3354,13 @@ mod tests {
             ..ScpDriverConfig::default()
         };
         let network_id = Hash256::ZERO;
-        let driver =
-            ScpDriver::with_secret_key(config, network_id, secret_key.clone(), default_tracking());
+        let driver = ScpDriver::with_secret_key(
+            config,
+            network_id,
+            secret_key.clone(),
+            default_tracking(),
+            Arc::new(crate::metrics::ScpMetrics::new()),
+        );
         (driver, secret_key)
     }
 
@@ -5287,7 +5343,12 @@ mod compare_tx_sets_tests {
     }
 
     fn make_driver() -> ScpDriver {
-        ScpDriver::new(make_config(), Hash256::ZERO, default_tracking())
+        ScpDriver::new(
+            make_config(),
+            Hash256::ZERO,
+            default_tracking(),
+            Arc::new(crate::metrics::ScpMetrics::new()),
+        )
     }
 
     /// Create a simple transaction with a given fee and operation count.

@@ -115,6 +115,7 @@ mod herder;
 mod herder_utils;
 pub mod json_api;
 mod ledger_close_data;
+pub mod metrics;
 pub(crate) mod parallel_tx_set_builder;
 mod pending;
 mod persistence;
@@ -142,6 +143,7 @@ pub mod upgrades;
 pub use error::HerderError;
 pub use fetching_envelopes::{FetchingConfig, FetchingEnvelopes, FetchingStats, RecvResult};
 pub use herder::{EnvelopeState, Herder, HerderConfig, HerderStats, LedgerCloseInfo};
+pub use metrics::{ScpMetrics, ScpMetricsSnapshot};
 pub use pending::{PendingConfig, PendingEnvelopes, PendingResult, PendingStats};
 pub use quorum_tracker::{ExpandError, QuorumTracker, SlotQuorumTracker};
 pub use scp_driver::{

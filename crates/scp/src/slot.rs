@@ -669,6 +669,11 @@ impl Slot {
         self.ballot.phase()
     }
 
+    /// Returns true if the ballot protocol has an active ballot (current_ballot is set).
+    pub fn has_active_ballot(&self) -> bool {
+        self.ballot.current_ballot().is_some()
+    }
+
     /// Check if we're in nomination phase.
     pub fn is_nominating(&self) -> bool {
         self.nomination_started && !self.nomination.is_stopped()

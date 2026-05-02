@@ -2216,6 +2216,12 @@ impl App {
                 .last_query_age()
                 .map_or(0.0, |d| d.as_secs_f64()),
             archive_cache_populated: self.archive_checkpoint_cache.is_populated(),
+            // Stage C: SCP metrics (issue #2233).
+            scp: self.herder.scp_metrics_snapshot(),
+            scp_phase: self.herder.tracking_slot_ballot_phase(),
+            scp_cumulative_statements: self.herder.scp_cumulative_statement_count() as u64,
+            nomination_timeout_fires: self.nomination_timeout_fires.load(Ordering::Relaxed),
+            ballot_timeout_fires: self.ballot_timeout_fires.load(Ordering::Relaxed),
         }
     }
 

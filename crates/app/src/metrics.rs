@@ -362,6 +362,12 @@ metric_catalog! {
         // Stage B: Ledger pipeline depth.
         LEDGER_MEMORY_QUEUED_LEDGERS = "stellar_ledger_memory_queued_ledgers"
             => "Externalized ledger slots buffered and waiting to close";
+
+        // Stage C: SCP phase and memory gauges (issue #2233).
+        SCP_PHASE = "stellar_scp_phase"
+            => "Current SCP ballot phase of the tracking slot (0=unknown, 1=prepare, 2=confirm, 3=externalize)";
+        SCP_MEMORY_CUMULATIVE_STATEMENTS = "stellar_scp_memory_cumulative_statements"
+            => "Total SCP statements currently held in memory (decreases after slot purging)";
     }
 
     gauges_no_prereg {
@@ -462,6 +468,24 @@ metric_catalog! {
             => "Total invariant check failures";
         LEDGER_TRANSACTION_INTERNAL_ERROR_TOTAL = "stellar_ledger_transaction_internal_error_total"
             => "Total transactions resulting in txINTERNAL_ERROR";
+
+        // Stage C: SCP event counters (issue #2233).
+        SCP_TIMEOUT_NOMINATE_TOTAL = "stellar_scp_timeout_nominate_total"
+            => "Total SCP nomination timeout fires";
+        SCP_TIMEOUT_PREPARE_TOTAL = "stellar_scp_timeout_prepare_total"
+            => "Total SCP ballot (prepare) timeout fires";
+        SCP_ENVELOPE_VALIDSIG_TOTAL = "stellar_scp_envelope_validsig_total"
+            => "Total SCP envelopes with valid signature";
+        SCP_ENVELOPE_INVALIDSIG_TOTAL = "stellar_scp_envelope_invalidsig_total"
+            => "Total SCP envelopes with invalid signature";
+        SCP_ENVELOPE_SIGN_TOTAL = "stellar_scp_envelope_sign_total"
+            => "Total SCP envelopes signed locally";
+        SCP_VALUE_VALID_TOTAL = "stellar_scp_value_valid_total"
+            => "Total SCP value validations returning valid (includes MaybeValid and MaybeValidDeferred)";
+        SCP_VALUE_INVALID_TOTAL = "stellar_scp_value_invalid_total"
+            => "Total SCP value validations returning invalid";
+        SCP_NOMINATION_COMBINECANDIDATES_TOTAL = "stellar_scp_nomination_combinecandidates_total"
+            => "Total candidate values passed to combineCandidates";
     }
 
     counters_no_prereg {
@@ -887,6 +911,18 @@ pub(crate) async fn refresh_gauges(state: &ServerState) {
     } else {
         gauge!(RECOVERY_TX_SET_STUCK_SECONDS).set(0.0);
     }
+
+    // Stage C: SCP metrics (issue #2233).
+    gauge!(SCP_PHASE).set(snap.scp_phase as f64);
+    gauge!(SCP_MEMORY_CUMULATIVE_STATEMENTS).set(snap.scp_cumulative_statements as f64);
+    counter!(SCP_TIMEOUT_NOMINATE_TOTAL).absolute(snap.nomination_timeout_fires);
+    counter!(SCP_TIMEOUT_PREPARE_TOTAL).absolute(snap.ballot_timeout_fires);
+    counter!(SCP_ENVELOPE_VALIDSIG_TOTAL).absolute(snap.scp.envelope_validsig_total);
+    counter!(SCP_ENVELOPE_INVALIDSIG_TOTAL).absolute(snap.scp.envelope_invalidsig_total);
+    counter!(SCP_ENVELOPE_SIGN_TOTAL).absolute(snap.scp.envelope_sign_total);
+    counter!(SCP_VALUE_VALID_TOTAL).absolute(snap.scp.value_valid_total);
+    counter!(SCP_VALUE_INVALID_TOTAL).absolute(snap.scp.value_invalid_total);
+    counter!(SCP_NOMINATION_COMBINECANDIDATES_TOTAL).absolute(snap.scp.combine_candidates_total);
 }
 
 // ── Process health helpers ──────────────────────────────────────────────
