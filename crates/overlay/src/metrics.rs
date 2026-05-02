@@ -939,4 +939,47 @@ mod tests {
         assert!(snapshot.tx_pull_latency.min.as_millis() >= 99);
         assert!(snapshot.tx_pull_latency.max.as_millis() >= 199);
     }
+
+    #[test]
+    fn test_stage_f2_counters_in_snapshot() {
+        let metrics = OverlayMetrics::new();
+
+        metrics.flood_broadcast.add(5);
+        metrics.flood_unique_recv.inc();
+        metrics.flood_unique_recv.inc();
+        metrics.flood_duplicate_recv.inc();
+        metrics.fetch_unique_recv.add(3);
+        metrics.fetch_duplicate_recv.add(7);
+        metrics.item_fetcher_next_peer.add(4);
+
+        let snap = metrics.snapshot();
+        assert_eq!(snap.flood_broadcast, 5);
+        assert_eq!(snap.flood_unique_recv, 2);
+        assert_eq!(snap.flood_duplicate_recv, 1);
+        assert_eq!(snap.fetch_unique_recv, 3);
+        assert_eq!(snap.fetch_duplicate_recv, 7);
+        assert_eq!(snap.item_fetcher_next_peer, 4);
+    }
+
+    #[test]
+    fn test_stage_f2_counters_reset() {
+        let metrics = OverlayMetrics::new();
+
+        metrics.flood_broadcast.add(10);
+        metrics.flood_unique_recv.add(20);
+        metrics.flood_duplicate_recv.add(30);
+        metrics.fetch_unique_recv.add(40);
+        metrics.fetch_duplicate_recv.add(50);
+        metrics.item_fetcher_next_peer.add(60);
+
+        metrics.reset();
+
+        let snap = metrics.snapshot();
+        assert_eq!(snap.flood_broadcast, 0);
+        assert_eq!(snap.flood_unique_recv, 0);
+        assert_eq!(snap.flood_duplicate_recv, 0);
+        assert_eq!(snap.fetch_unique_recv, 0);
+        assert_eq!(snap.fetch_duplicate_recv, 0);
+        assert_eq!(snap.item_fetcher_next_peer, 0);
+    }
 }

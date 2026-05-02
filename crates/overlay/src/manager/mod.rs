@@ -3405,4 +3405,68 @@ mod tests {
             "all 3 peers should have dropped the second broadcast"
         );
     }
+
+    fn make_flood_tx_msg() -> StellarMessage {
+        use stellar_xdr::curr::TransactionEnvelope;
+        StellarMessage::Transaction(TransactionEnvelope::Tx(
+            stellar_xdr::curr::TransactionV1Envelope {
+                tx: stellar_xdr::curr::Transaction {
+                    source_account: stellar_xdr::curr::MuxedAccount::Ed25519(
+                        stellar_xdr::curr::Uint256([0; 32]),
+                    ),
+                    fee: 100,
+                    seq_num: stellar_xdr::curr::SequenceNumber(1),
+                    cond: stellar_xdr::curr::Preconditions::None,
+                    memo: stellar_xdr::curr::Memo::None,
+                    operations: stellar_xdr::curr::VecM::default(),
+                    ext: stellar_xdr::curr::TransactionExt::V0,
+                },
+                signatures: stellar_xdr::curr::VecM::default(),
+            },
+        ))
+    }
+
+    #[tokio::test]
+    async fn test_flood_broadcast_counter_increments() {
+        let config = OverlayConfig::default();
+        let secret = SecretKey::generate();
+        let local_node = LocalNode::new_testnet(secret);
+
+        let manager = OverlayManager::new(config, local_node).unwrap();
+        manager.running.store(true, Ordering::SeqCst);
+
+        let peer_id = PeerId::from_bytes([1u8; 32]);
+        let _rx = insert_peer_with_capacity(&manager, peer_id, 10);
+
+        assert_eq!(manager.metrics.flood_broadcast.get(), 0);
+
+        let msg = make_flood_tx_msg();
+        let sent = manager.broadcast(msg).await.unwrap();
+        assert_eq!(sent, 1);
+
+        assert_eq!(manager.metrics.flood_broadcast.get(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_non_flood_broadcast_does_not_increment_flood_counter() {
+        let config = OverlayConfig::default();
+        let secret = SecretKey::generate();
+        let local_node = LocalNode::new_testnet(secret);
+
+        let manager = OverlayManager::new(config, local_node).unwrap();
+        manager.running.store(true, Ordering::SeqCst);
+
+        let peer_id = PeerId::from_bytes([1u8; 32]);
+        let _rx = insert_peer_with_capacity(&manager, peer_id, 10);
+
+        let msg = make_hello_msg();
+        let sent = manager.broadcast(msg).await.unwrap();
+        assert_eq!(sent, 1);
+
+        assert_eq!(
+            manager.metrics.flood_broadcast.get(),
+            0,
+            "non-flood messages should not increment flood_broadcast"
+        );
+    }
 }
