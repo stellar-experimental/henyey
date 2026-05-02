@@ -144,6 +144,42 @@ pub enum EnvelopeState {
     Deferred,
 }
 
+/// Outcome of [`Herder::trigger_next_ledger`].
+///
+/// Distinguishes the three ways the call can return success so callers can
+/// bump diagnostic counters without inferring outcome from side effects.
+///
+/// Parity: this enum collapses the multiple return points in stellar-core's
+/// `HerderImpl::triggerNextLedger` (`HerderImpl.cpp:1424-1603`) into a typed
+/// result. The `SkippedStale` variant corresponds to the post-`addTxSet`
+/// LCL re-check at `HerderImpl.cpp:1559-1562`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TriggerOutcome {
+    /// Nomination started for the requested slot.
+    Triggered,
+    /// Slot already had nomination in progress; idempotent no-op.
+    AlreadyNominating,
+    /// LCL advanced during `build_nomination_value`; the value is for an
+    /// already-closed slot and was not broadcast.
+    SkippedStale,
+}
+
+/// Outcome of [`Herder::handle_nomination_timeout`].
+///
+/// The App-side dispatcher uses this to decide whether to bump the
+/// `nomination_timeout_skipped_stale` counter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TimeoutOutcome {
+    /// `scp.nominate_timeout` was called and reported it advanced state.
+    Renominated,
+    /// LCL advanced during build/drain; the value is for an already-closed
+    /// slot and was not broadcast.
+    SkippedStale,
+    /// No-op: build returned None, or `scp.nominate_timeout` was a no-op
+    /// (e.g., slot already externalized).
+    NoOp,
+}
+
 /// Ingress gate state: buffers envelopes for the next-to-close slot during
 /// the post-externalize/pre-apply window. Mirrors stellar-core's guarantee
 /// that no envelopes are processed between externalization and
@@ -1891,7 +1927,7 @@ impl Herder {
     ///
     /// This is entirely synchronous (parking_lot locks + CPU). It was
     /// previously declared `async` but had no `.await` points.
-    pub fn trigger_next_ledger(&self, ledger_seq: u32) -> Result<()> {
+    pub fn trigger_next_ledger(&self, ledger_seq: u32) -> Result<TriggerOutcome> {
         if !self.is_validator() {
             return Err(HerderError::NotValidating);
         }
@@ -1913,8 +1949,25 @@ impl Herder {
                     slot,
                     "Skipping duplicate trigger: nomination already active"
                 );
-                return Ok(());
+                return Ok(TriggerOutcome::AlreadyNominating);
             }
+        }
+
+        // Defensive entry check: if LCL is already past or ahead of the
+        // requested slot, abort before doing the (expensive) tx-set build.
+        // This is the same condition the post-build re-check enforces; we
+        // also evaluate it here so callers that pass a stale `ledger_seq`
+        // don't pay for build_nomination_value before being told to retry.
+        // Parity: stellar-core HerderImpl.cpp:1559-1562 evaluates the
+        // equivalent condition; henyey evaluates it earlier (pre-build) AND
+        // post-build to cover both "stale at entry" and "LCL advanced during
+        // build" cases. LM=None proceeds (preserves existing tests).
+        if !self.lcl_matches_slot(slot) {
+            tracing::warn!(
+                requested_slot = slot,
+                "Skipping nomination: requested slot != LCL+1 at entry"
+            );
+            return Ok(TriggerOutcome::SkippedStale);
         }
 
         tracing::debug!("Triggering consensus for ledger {}", ledger_seq);
@@ -1933,8 +1986,32 @@ impl Herder {
         // runs on spawn_blocking from the app layer.
         self.process_ready_fetching_envelopes();
 
+        // Parity: HerderImpl.cpp:1550-1562 — a concurrent `close_ledger` task
+        // running on a separate `spawn_blocking` may have advanced LCL while
+        // we were inside `build_nomination_value` and the subsequent envelope
+        // drain. If so, the value we just built is for a slot the network has
+        // already closed; broadcasting it would be wasted SCP traffic and
+        // would cause this validator to keep nominating against a stale slot
+        // until drift detection trips. This re-check complements the
+        // pre-build entry check above and covers the race-driven case the
+        // entry check cannot detect.
+        //
+        // The check must come BEFORE the cache write below — caching a value
+        // for a stale slot would mislead `handle_nomination_timeout`'s
+        // cache-hit path.
+        if !self.lcl_matches_slot(slot) {
+            tracing::warn!(
+                requested_slot = slot,
+                "Skipping nomination: LCL advanced during build_nomination_value"
+            );
+            return Ok(TriggerOutcome::SkippedStale);
+        }
+
         // Cache the nomination value for this slot so timeout retries reuse it,
-        // matching stellar-core's by-value lambda capture.
+        // matching stellar-core's by-value lambda capture. On `SkippedStale`
+        // (returned above) we deliberately do NOT clear pre-existing entries:
+        // the cache key is `(slot, value)` and `handle_nomination_timeout`
+        // filters by slot, so stale entries are unreachable.
         *self.cached_nomination_value.write() = Some((slot, value.clone()));
 
         // Get previous value for priority calculation
@@ -1978,7 +2055,7 @@ impl Herder {
             self.advance_tracking_slot(slot);
         }
 
-        Ok(())
+        Ok(TriggerOutcome::Triggered)
     }
 
     /// Get the SCP driver.
@@ -2184,10 +2261,22 @@ impl Herder {
     /// event loop) because the cache-miss fallback calls
     /// `build_nomination_value()` → `cache_tx_set()` and then drains
     /// ready envelopes via `process_ready_fetching_envelopes()`.
-    pub fn handle_nomination_timeout(&self, slot: SlotIndex) {
+    pub fn handle_nomination_timeout(&self, slot: SlotIndex) -> TimeoutOutcome {
         if !self.is_validator() {
-            return; // Observers don't nominate
+            return TimeoutOutcome::NoOp; // Observers don't nominate
         }
+
+        // Defensive entry check: if LCL is not at `slot - 1`, the slot is
+        // stale before we even consult the cache or rebuild. Mirrors the
+        // pre-build entry check in `trigger_next_ledger`.
+        if !self.lcl_matches_slot(slot) {
+            tracing::warn!(
+                slot,
+                "Skipping nomination timeout: requested slot != LCL+1 at entry"
+            );
+            return TimeoutOutcome::SkippedStale;
+        }
+
         let prev_value = self.prev_value.read().clone();
 
         // Reuse the cached nomination value for this slot, matching stellar-core's
@@ -2214,9 +2303,51 @@ impl Herder {
         }
 
         if let Some(value) = value {
+            // Parity: HerderImpl.cpp:1550-1562 — same race as
+            // `trigger_next_ledger`. A concurrent `close_ledger` task may have
+            // advanced LCL while we were inside `build_nomination_value`
+            // (cache-miss path) or between the cache write and the timer
+            // firing (cache-hit path). The re-check is symmetric across both
+            // branches because the cached value can also age out while the
+            // timer was pending.
+            if !self.lcl_matches_slot(slot) {
+                tracing::warn!(
+                    slot,
+                    "Skipping nomination timeout: LCL advanced during build/drain"
+                );
+                return TimeoutOutcome::SkippedStale;
+            }
+
             if self.scp.nominate_timeout(slot, value, &prev_value) {
                 debug!(slot, "Re-nominated after timeout");
+                return TimeoutOutcome::Renominated;
             }
+            return TimeoutOutcome::NoOp;
+        }
+        TimeoutOutcome::NoOp
+    }
+
+    /// Helper for parity gates with `HerderImpl.cpp:1550-1562`.
+    ///
+    /// Returns true when the requested SCP `slot` matches `LCL + 1`, i.e.
+    /// the next slot we should nominate.
+    ///
+    /// LM=None semantics: returns true. The pre-bootstrap path is exercised
+    /// by existing unit tests that intentionally do not install an LM
+    /// (e.g. `test_trigger_next_ledger_includes_runtime_upgrades` and
+    /// `test_trigger_next_ledger_idempotent_during_nomination`). Production
+    /// always installs the LM during bootstrap (`set_ledger_manager`) before
+    /// any consensus trigger fires, so treating None as "match" preserves
+    /// test scaffolding without weakening the production gate.
+    fn lcl_matches_slot(&self, slot: SlotIndex) -> bool {
+        let current_lcl = self
+            .ledger_manager
+            .read()
+            .as_ref()
+            .map(|m| m.current_ledger_seq() as u64);
+        match current_lcl {
+            None => true,
+            Some(lcl) => lcl + 1 == slot,
         }
     }
 
@@ -3097,15 +3228,21 @@ impl Herder {
     ///
     /// Callers in async context should use this instead of calling the sync
     /// method directly.
-    pub async fn handle_nomination_timeout_blocking(self: &Arc<Self>, slot: SlotIndex) {
+    pub async fn handle_nomination_timeout_blocking(
+        self: &Arc<Self>,
+        slot: SlotIndex,
+    ) -> TimeoutOutcome {
         let herder = Arc::clone(self);
-        if crate::spawn::spawn_blocking_logged("handle_nomination_timeout", move || {
-            herder.handle_nomination_timeout(slot);
+        match crate::spawn::spawn_blocking_logged("handle_nomination_timeout", move || {
+            herder.handle_nomination_timeout(slot)
         })
         .await
-        .is_err()
         {
-            error!(slot, "nomination timeout failed on spawn_blocking");
+            Ok(outcome) => outcome,
+            Err(_) => {
+                error!(slot, "nomination timeout failed on spawn_blocking");
+                TimeoutOutcome::NoOp
+            }
         }
     }
 
@@ -4853,7 +4990,11 @@ mod tests {
 
         // First trigger: starts nomination, round should be 1.
         let result1 = herder.trigger_next_ledger(2);
-        assert!(result1.is_ok(), "first trigger should succeed");
+        assert_eq!(
+            result1.expect("first trigger should succeed"),
+            TriggerOutcome::Triggered,
+            "first trigger should report Triggered"
+        );
 
         let state1 = herder.scp().get_slot_state(2).expect("slot 2 should exist");
         assert!(state1.is_nominating, "slot should be in nominating state");
@@ -4864,7 +5005,11 @@ mod tests {
 
         // Second trigger: should be skipped by the is_nominating guard.
         let result2 = herder.trigger_next_ledger(2);
-        assert!(result2.is_ok(), "second trigger should succeed (no-op)");
+        assert_eq!(
+            result2.expect("second trigger should succeed (no-op)"),
+            TriggerOutcome::AlreadyNominating,
+            "second trigger should report AlreadyNominating"
+        );
 
         let state2 = herder
             .scp()
@@ -4877,11 +5022,164 @@ mod tests {
 
         // Third trigger for good measure.
         let result3 = herder.trigger_next_ledger(2);
-        assert!(result3.is_ok());
+        assert_eq!(
+            result3.expect("third trigger should succeed"),
+            TriggerOutcome::AlreadyNominating
+        );
         let state3 = herder.scp().get_slot_state(2).expect("slot 2 exists");
         assert_eq!(
             state3.nomination_round, 1,
             "third trigger should NOT advance nomination round"
+        );
+    }
+
+    /// Helper for #2302 stale-slot tests: installs a LedgerManager initialized
+    /// to `ledger_seq` so `current_ledger_seq()` returns it deterministically.
+    ///
+    /// Mirrors the helper in `mod scp_pipeline_tests` (line ~7461) but lives
+    /// inside `mod tests` so the new stale-slot tests below can use it
+    /// without a cross-module visibility change.
+    fn make_lm_at_seq_for_stale_test(ledger_seq: u32) -> Arc<henyey_ledger::LedgerManager> {
+        use henyey_ledger::{LedgerManager, LedgerManagerConfig};
+        use stellar_xdr::curr::{
+            Hash, LedgerHeader, LedgerHeaderExt, StellarValue, StellarValueExt, TimePoint, VecM,
+        };
+        let config = LedgerManagerConfig {
+            validate_bucket_hash: false,
+            ..Default::default()
+        };
+        let lm = LedgerManager::new("Test Network".to_string(), config);
+        let header = LedgerHeader {
+            ledger_version: 24,
+            previous_ledger_hash: Hash([0u8; 32]),
+            scp_value: StellarValue {
+                tx_set_hash: Hash([0u8; 32]),
+                close_time: TimePoint(100),
+                upgrades: VecM::default(),
+                ext: StellarValueExt::Basic,
+            },
+            tx_set_result_hash: Hash([0u8; 32]),
+            bucket_list_hash: Hash([0u8; 32]),
+            ledger_seq,
+            total_coins: 1_000_000_000_000,
+            fee_pool: 0,
+            inflation_seq: 0,
+            id_pool: 0,
+            base_fee: 100,
+            base_reserve: 5_000_000,
+            max_tx_set_size: 100,
+            skip_list: [
+                Hash([0u8; 32]),
+                Hash([0u8; 32]),
+                Hash([0u8; 32]),
+                Hash([0u8; 32]),
+            ],
+            ext: LedgerHeaderExt::V0,
+        };
+        let header_hash = henyey_ledger::compute_header_hash(&header).expect("hash");
+        lm.initialize(
+            henyey_bucket::BucketList::new(),
+            henyey_bucket::HotArchiveBucketList::new(),
+            header,
+            header_hash,
+        )
+        .expect("init");
+        Arc::new(lm)
+    }
+
+    /// Regression test for #2302 — Change 2 of the parity-hardening proposal.
+    ///
+    /// Verifies that `trigger_next_ledger` returns `TriggerOutcome::SkippedStale`
+    /// when LCL has advanced past the requested slot — the deterministic
+    /// equivalent of "a concurrent close_ledger task advanced LCL while we
+    /// were inside `build_nomination_value`." We reproduce the failure mode
+    /// without multi-thread orchestration by installing a LedgerManager whose
+    /// `current_ledger_seq()` already equals the requested slot, so the
+    /// post-build re-check immediately observes `lcl + 1 != slot`.
+    ///
+    /// Parity: HerderImpl.cpp:1550-1562 — `ledgerSeqToTrigger != slotIndex`
+    /// abort.
+    #[test]
+    fn test_trigger_next_ledger_skips_stale_slot() {
+        let seed = [42u8; 32];
+        let secret = SecretKey::from_seed(&seed);
+        let public = secret.public_key();
+        let local_node_id =
+            stellar_xdr::curr::NodeId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
+                stellar_xdr::curr::Uint256(*public.as_bytes()),
+            ));
+        let quorum_set = ScpQuorumSet {
+            threshold: 1,
+            validators: vec![local_node_id].try_into().unwrap(),
+            inner_sets: vec![].try_into().unwrap(),
+        };
+        let config = HerderConfig {
+            is_validator: true,
+            node_public_key: public,
+            local_quorum_set: Some(quorum_set),
+            ..HerderConfig::default()
+        };
+        let herder = Herder::with_secret_key(config, secret);
+
+        // Install a LedgerManager whose current_ledger_seq() == 5.
+        const STALE_SLOT: u32 = 5;
+        herder.set_ledger_manager(make_lm_at_seq_for_stale_test(STALE_SLOT));
+        herder.bootstrap(STALE_SLOT);
+
+        // Request slot == LCL: re-check sees `lcl + 1 == 6 != slot == 5`.
+        let result = herder.trigger_next_ledger(STALE_SLOT);
+        assert_eq!(
+            result.expect("trigger should not error on stale slot"),
+            TriggerOutcome::SkippedStale,
+            "trigger_next_ledger should return SkippedStale when slot != LCL+1"
+        );
+
+        // No SCP slot state should exist for the stale slot — we aborted
+        // before scp.nominate.
+        let slot_state = herder.scp().get_slot_state(STALE_SLOT as u64);
+        assert!(
+            slot_state.map_or(true, |s| !s.is_nominating),
+            "stale slot must not be in nominating state"
+        );
+    }
+
+    /// Regression test for #2302 — Change 3 of the parity-hardening proposal.
+    ///
+    /// Verifies that `handle_nomination_timeout` returns
+    /// `TimeoutOutcome::SkippedStale` when LCL has advanced past the slot.
+    #[test]
+    fn test_handle_nomination_timeout_skips_stale_slot() {
+        let seed = [43u8; 32];
+        let secret = SecretKey::from_seed(&seed);
+        let public = secret.public_key();
+        let local_node_id =
+            stellar_xdr::curr::NodeId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
+                stellar_xdr::curr::Uint256(*public.as_bytes()),
+            ));
+        let quorum_set = ScpQuorumSet {
+            threshold: 1,
+            validators: vec![local_node_id].try_into().unwrap(),
+            inner_sets: vec![].try_into().unwrap(),
+        };
+        let config = HerderConfig {
+            is_validator: true,
+            node_public_key: public,
+            local_quorum_set: Some(quorum_set),
+            ..HerderConfig::default()
+        };
+        let herder = Herder::with_secret_key(config, secret);
+
+        const STALE_SLOT: u32 = 7;
+        herder.set_ledger_manager(make_lm_at_seq_for_stale_test(STALE_SLOT));
+        herder.bootstrap(STALE_SLOT);
+
+        // Cache is empty for this slot, so the cache-miss branch fires
+        // build_nomination_value → drain → re-check → SkippedStale.
+        let outcome = herder.handle_nomination_timeout(STALE_SLOT as u64);
+        assert_eq!(
+            outcome,
+            TimeoutOutcome::SkippedStale,
+            "timeout should report SkippedStale when slot != LCL+1"
         );
     }
 

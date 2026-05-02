@@ -142,7 +142,10 @@ pub mod upgrades;
 // Re-export main types
 pub use error::HerderError;
 pub use fetching_envelopes::{FetchingConfig, FetchingEnvelopes, FetchingStats, RecvResult};
-pub use herder::{EnvelopeState, Herder, HerderConfig, HerderStats, LedgerCloseInfo};
+pub use herder::{
+    EnvelopeState, Herder, HerderConfig, HerderStats, LedgerCloseInfo, TimeoutOutcome,
+    TriggerOutcome,
+};
 pub use metrics::{ScpMetrics, ScpMetricsSnapshot};
 pub use pending::{PendingConfig, PendingEnvelopes, PendingResult, PendingStats};
 pub use quorum_tracker::{ExpandError, QuorumTracker, SlotQuorumTracker};

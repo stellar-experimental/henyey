@@ -178,6 +178,16 @@ pub struct SimulationDebugStats {
     pub consensus_trigger_attempts: u64,
     pub consensus_trigger_successes: u64,
     pub consensus_trigger_failures: u64,
+    /// Times `try_trigger_consensus` skipped because a ledger close was in
+    /// progress (parity with stellar-core HerderImpl.cpp:1440-1447).
+    pub consensus_trigger_skipped_applying: u64,
+    /// Times `trigger_next_ledger` returned `TriggerOutcome::SkippedStale`
+    /// because LCL advanced during `build_nomination_value` (parity with
+    /// stellar-core HerderImpl.cpp:1550-1562).
+    pub consensus_trigger_skipped_stale: u64,
+    /// Times `handle_nomination_timeout` returned
+    /// `TimeoutOutcome::SkippedStale` because LCL advanced during build/drain.
+    pub nomination_timeout_skipped_stale: u64,
     // Archive checkpoint cache (issue #1784)
     pub archive_checkpoint_stale_returns: u64,
     pub archive_checkpoint_cold_returns: u64,
@@ -340,6 +350,16 @@ pub struct AppMetricsSnapshot {
     pub scp_cumulative_statements: u64,
     pub nomination_timeout_fires: u64,
     pub ballot_timeout_fires: u64,
+    /// Times `try_trigger_consensus` skipped because a ledger close was in
+    /// progress (parity with stellar-core HerderImpl.cpp:1440-1447).
+    pub consensus_trigger_skipped_applying: u64,
+    /// Times `trigger_next_ledger` returned `TriggerOutcome::SkippedStale`
+    /// because LCL advanced during `build_nomination_value` (parity with
+    /// stellar-core HerderImpl.cpp:1550-1562).
+    pub consensus_trigger_skipped_stale: u64,
+    /// Times `handle_nomination_timeout` returned
+    /// `TimeoutOutcome::SkippedStale` because LCL advanced during build/drain.
+    pub nomination_timeout_skipped_stale: u64,
 }
 
 /// Metrics for the overlay fetch-response channel (issue #1741).

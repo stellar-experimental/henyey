@@ -455,8 +455,19 @@ pub struct App {
     consensus_trigger_successes: AtomicU64,
     /// Number of failed trigger_next_ledger calls.
     consensus_trigger_failures: AtomicU64,
+    /// Number of try_trigger_consensus invocations skipped because a ledger
+    /// close was in progress (parity gate with stellar-core
+    /// HerderImpl.cpp:1440-1447).
+    pub(crate) consensus_trigger_skipped_applying: AtomicU64,
+    /// Number of trigger_next_ledger invocations that returned
+    /// TriggerOutcome::SkippedStale because LCL advanced during build_nomination_value
+    /// (parity gate with stellar-core HerderImpl.cpp:1550-1562).
+    pub(crate) consensus_trigger_skipped_stale: AtomicU64,
     /// Number of nomination timeout firings.
     nomination_timeout_fires: AtomicU64,
+    /// Number of nomination timeout invocations that returned
+    /// TimeoutOutcome::SkippedStale because LCL advanced during build/drain.
+    pub(crate) nomination_timeout_skipped_stale: AtomicU64,
     /// Number of ballot timeout firings.
     ballot_timeout_fires: AtomicU64,
     /// Time when we last observed an externalized slot.
@@ -1007,7 +1018,10 @@ impl App {
             consensus_trigger_attempts: AtomicU64::new(0),
             consensus_trigger_successes: AtomicU64::new(0),
             consensus_trigger_failures: AtomicU64::new(0),
+            consensus_trigger_skipped_applying: AtomicU64::new(0),
+            consensus_trigger_skipped_stale: AtomicU64::new(0),
             nomination_timeout_fires: AtomicU64::new(0),
+            nomination_timeout_skipped_stale: AtomicU64::new(0),
             ballot_timeout_fires: AtomicU64::new(0),
             last_externalized_at: RwLock::new(now),
             last_scp_state_request_at: RwLock::new(now),
@@ -1704,10 +1718,23 @@ impl App {
     /// - The node must be configured as a validator (`is_validator = true`)
     /// - Manual close mode must be enabled (`manual_close = true`)
     ///
+    /// # Note on parity gap
+    ///
+    /// Manual close intentionally bypasses the `is_applying_ledger` gate that
+    /// `try_trigger_consensus` enforces (parity with stellar-core
+    /// HerderImpl.cpp:1440-1447). Manual close is dev/test-only — the caller
+    /// is responsible for serialization. The post-build `LCL` re-check inside
+    /// `Herder::trigger_next_ledger` still surfaces races as
+    /// `TriggerOutcome::SkippedStale`, which this function maps to an `Err`
+    /// so callers can retry with a refreshed ledger sequence.
+    ///
     /// # Returns
     ///
-    /// * `Ok(new_ledger_seq)` - The ledger was successfully triggered
-    /// * `Err` - An error occurred (not a validator, manual close not enabled, etc.)
+    /// * `Ok(new_ledger_seq)` - The ledger was successfully triggered (or an
+    ///   identical trigger was already in progress; the latter is treated as
+    ///   idempotent success).
+    /// * `Err` - An error occurred (not a validator, manual close not enabled,
+    ///   trigger failed, or LCL advanced during build — caller should retry).
     pub async fn manual_close_ledger(&self) -> anyhow::Result<u32> {
         // Check if node is a validator
         if !self.config.node.is_validator {
@@ -1727,14 +1754,21 @@ impl App {
 
         // Trigger the herder to close the next ledger
         let herder = std::sync::Arc::clone(&self.herder);
-        henyey_common::spawn_blocking_logged("manual-close-trigger", move || {
+        let outcome = henyey_common::spawn_blocking_logged("manual-close-trigger", move || {
             herder.trigger_next_ledger(next_ledger)
         })
         .await
         .map_err(|e| anyhow::anyhow!("spawn_blocking failed for trigger_next_ledger: {e}"))?
         .map_err(|e| anyhow::anyhow!("Failed to trigger next ledger: {}", e))?;
 
-        Ok(next_ledger)
+        match outcome {
+            henyey_herder::TriggerOutcome::Triggered
+            | henyey_herder::TriggerOutcome::AlreadyNominating => Ok(next_ledger),
+            henyey_herder::TriggerOutcome::SkippedStale => Err(anyhow::anyhow!(
+                "manual close: LCL advanced during build_nomination_value; \
+                 caller should retry with refreshed ledger seq"
+            )),
+        }
     }
 
     pub fn self_check(&self, depth: u32) -> anyhow::Result<SelfCheckResult> {
@@ -1883,6 +1917,15 @@ impl App {
             consensus_trigger_attempts: self.consensus_trigger_attempts.load(Ordering::Relaxed),
             consensus_trigger_successes: self.consensus_trigger_successes.load(Ordering::Relaxed),
             consensus_trigger_failures: self.consensus_trigger_failures.load(Ordering::Relaxed),
+            consensus_trigger_skipped_applying: self
+                .consensus_trigger_skipped_applying
+                .load(Ordering::Relaxed),
+            consensus_trigger_skipped_stale: self
+                .consensus_trigger_skipped_stale
+                .load(Ordering::Relaxed),
+            nomination_timeout_skipped_stale: self
+                .nomination_timeout_skipped_stale
+                .load(Ordering::Relaxed),
             archive_checkpoint_stale_returns: self.archive_checkpoint_cache.stale_returns(),
             archive_checkpoint_cold_returns: self.archive_checkpoint_cache.cold_returns(),
             archive_checkpoint_fresh_returns: self.archive_checkpoint_cache.fresh_returns(),
@@ -2222,6 +2265,15 @@ impl App {
             scp_cumulative_statements: self.herder.scp_cumulative_statement_count() as u64,
             nomination_timeout_fires: self.nomination_timeout_fires.load(Ordering::Relaxed),
             ballot_timeout_fires: self.ballot_timeout_fires.load(Ordering::Relaxed),
+            consensus_trigger_skipped_applying: self
+                .consensus_trigger_skipped_applying
+                .load(Ordering::Relaxed),
+            consensus_trigger_skipped_stale: self
+                .consensus_trigger_skipped_stale
+                .load(Ordering::Relaxed),
+            nomination_timeout_skipped_stale: self
+                .nomination_timeout_skipped_stale
+                .load(Ordering::Relaxed),
         }
     }
 
@@ -3383,6 +3435,53 @@ mod tests {
         // Set back to false
         app.set_applying_ledger(false);
         assert!(!app.is_applying_ledger.load(Ordering::Relaxed));
+    }
+
+    /// Regression test for #2302 — Change 1 of the parity-hardening proposal.
+    ///
+    /// Verifies that `try_trigger_consensus` skips the consensus trigger when
+    /// `is_applying_ledger` is true, bumping `consensus_trigger_skipped_applying`
+    /// rather than `consensus_trigger_attempts`.
+    ///
+    /// Parity: stellar-core HerderImpl.cpp:1440-1447 (`isApplying()` skip).
+    #[tokio::test]
+    async fn test_try_trigger_consensus_skips_while_applying() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-test.db");
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
+
+        let app = App::new(config).await.unwrap();
+
+        // Bootstrap the herder so `is_tracking()` returns true and we reach
+        // the new `is_applying_ledger` gate inside `try_trigger_consensus`.
+        app.herder.bootstrap(1);
+
+        // Mark ledger close in progress.
+        app.set_applying_ledger(true);
+
+        let attempts_before = app.consensus_trigger_attempts.load(Ordering::Relaxed);
+        let skipped_before = app
+            .consensus_trigger_skipped_applying
+            .load(Ordering::Relaxed);
+
+        app.try_trigger_consensus().await;
+
+        let attempts_after = app.consensus_trigger_attempts.load(Ordering::Relaxed);
+        let skipped_after = app
+            .consensus_trigger_skipped_applying
+            .load(Ordering::Relaxed);
+
+        assert_eq!(
+            attempts_after, attempts_before,
+            "consensus_trigger_attempts must NOT increment when applying"
+        );
+        assert_eq!(
+            skipped_after,
+            skipped_before + 1,
+            "consensus_trigger_skipped_applying must increment when applying"
+        );
     }
 
     #[tokio::test]

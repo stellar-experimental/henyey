@@ -131,6 +131,26 @@ impl App {
                 return;
             }
 
+            // Parity: HerderImpl.cpp:1440-1447 — if a ledger close is in
+            // progress, do not start nomination. The header snapshot we'd
+            // capture inside `build_nomination_value` is mid-update and the
+            // slot we'd nominate would be stale by the time apply completes.
+            // henyey lacks stellar-core's `parallelLedgerClose` config flag,
+            // but `close_ledger` runs on its own `spawn_blocking` task and
+            // this method runs on the async event loop, so the parallel-close
+            // semantics this gate was designed for are structurally
+            // always-on in henyey. The gate is unconditional.
+            if self.is_applying_ledger() {
+                self.consensus_trigger_skipped_applying
+                    .fetch_add(1, Ordering::Relaxed);
+                tracing::debug!(
+                    current_ledger,
+                    tracking_slot,
+                    "Skipping consensus trigger: ledger close in progress"
+                );
+                return;
+            }
+
             let next_slot = current_ledger + 1;
             tracing::debug!(next_slot, "Checking if we should trigger consensus");
 
@@ -165,9 +185,16 @@ impl App {
             })
             .await
             {
-                Ok(Ok(())) => {
+                Ok(Ok(henyey_herder::TriggerOutcome::Triggered)) => {
                     self.consensus_trigger_successes
                         .fetch_add(1, Ordering::Relaxed);
+                }
+                Ok(Ok(henyey_herder::TriggerOutcome::SkippedStale)) => {
+                    self.consensus_trigger_skipped_stale
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                Ok(Ok(henyey_herder::TriggerOutcome::AlreadyNominating)) => {
+                    // Idempotent re-trigger; not a new success, not an error.
                 }
                 Ok(Err(e)) => {
                     self.consensus_trigger_failures
@@ -1060,7 +1087,11 @@ impl App {
         // fallback calls build_nomination_value → cache_tx_set, which can
         // stall the event loop (#1922).
         if fire_nomination {
-            self.herder.handle_nomination_timeout_blocking(slot).await;
+            let outcome = self.herder.handle_nomination_timeout_blocking(slot).await;
+            if matches!(outcome, henyey_herder::TimeoutOutcome::SkippedStale) {
+                self.nomination_timeout_skipped_stale
+                    .fetch_add(1, Ordering::Relaxed);
+            }
         }
         if fire_ballot {
             self.herder.handle_ballot_timeout(slot);
