@@ -397,6 +397,14 @@ async fn test_core4_app_simulation_can_close_ledgers_over_tcp() {
 async fn test_cycle4_app_simulation_can_close_ledgers_over_tcp() {
     let mut sim = build_app_backed_topology(Topologies::cycle4(SimulationMode::OverTcp), 75).await;
 
+    // Cycle4 topology: each node should have 2 peers (ring neighbors).
+    // Wait for full topology connectivity to ensure SCP envelopes can
+    // propagate without multi-hop relay delays that cause nomination timeouts
+    // on slow CI runners.
+    sim.stabilize_app_tcp_connectivity(2, Duration::from_secs(30))
+        .await
+        .expect("cycle4: topology connectivity (2 peers/node) did not stabilize within 30s");
+
     manual_close_until(&sim, 2, 1, Duration::from_secs(30)).await;
 
     sim.stop_all_nodes().await.expect("stop cycle4 app nodes");
