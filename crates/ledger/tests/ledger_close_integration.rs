@@ -961,3 +961,315 @@ fn test_close_ledger_fee_event_fee_bump_soroban() {
         expected_pre_refund_fee
     );
 }
+
+/// Parity: LedgerCloseMetaFrame.cpp:170-187 (populateEvictedEntries)
+///
+/// Verifies that after a ledger close with mixed temporary and persistent
+/// Soroban entries that have expired TTLs, the emitted
+/// `LedgerCloseMetaV2.evicted_keys` ordering matches stellar-core's two-phase
+/// rule: deleted_keys first (temp data + all TTL keys in scan order), then
+/// persistent data keys from archived_entries.
+///
+/// This exercises the full inline eviction scan path through ledger close,
+/// not just the unit-level ResolvedEviction ordering.
+#[test]
+fn test_ledger_close_eviction_meta_key_ordering() {
+    // The eviction scan path triggers bucket list merges that require a tokio
+    // runtime (spawn_blocking in add_batch_internal).
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        test_ledger_close_eviction_meta_key_ordering_impl();
+    });
+}
+
+fn test_ledger_close_eviction_meta_key_ordering_impl() {
+    use henyey_bucket::{BucketList, EvictionIterator};
+    use henyey_common::xdr_to_bytes;
+    use sha2::{Digest, Sha256};
+    use stellar_xdr::curr::{
+        ConfigSettingContractBandwidthV0, ConfigSettingContractComputeV0,
+        ConfigSettingContractEventsV0, ConfigSettingContractExecutionLanesV0,
+        ConfigSettingContractHistoricalDataV0, ConfigSettingContractLedgerCostV0,
+        ConfigSettingEntry, ContractCostParamEntry, ContractCostParams, ContractDataDurability,
+        ContractDataEntry, ContractId, LedgerKeyContractData, LedgerKeyTtl, ScAddress, ScBytes,
+        StateArchivalSettings, WriteXdr,
+    };
+
+    // --- Helper: compute the TTL key for a given data key ---
+    let ttl_key_for = |data_key: &LedgerKey| -> LedgerKey {
+        let key_bytes = data_key.to_xdr(stellar_xdr::curr::Limits::none()).unwrap();
+        let hash_bytes: [u8; 32] = Sha256::digest(&key_bytes).into();
+        LedgerKey::Ttl(LedgerKeyTtl {
+            key_hash: Hash(hash_bytes),
+        })
+    };
+
+    // --- Build the 4 contract data entries ---
+    let contract = ScAddress::Contract(ContractId(Hash([1u8; 32])));
+
+    let make_data_entry =
+        |key_byte: u8, durability: ContractDataDurability| -> (LedgerEntry, LedgerKey) {
+            let key = LedgerKey::ContractData(LedgerKeyContractData {
+                contract: contract.clone(),
+                key: ScVal::Bytes(ScBytes(vec![key_byte].try_into().unwrap())),
+                durability,
+            });
+            let entry = LedgerEntry {
+                last_modified_ledger_seq: 1,
+                data: LedgerEntryData::ContractData(ContractDataEntry {
+                    ext: ExtensionPoint::V0,
+                    contract: contract.clone(),
+                    key: ScVal::Bytes(ScBytes(vec![key_byte].try_into().unwrap())),
+                    durability,
+                    val: ScVal::I32(42),
+                }),
+                ext: LedgerEntryExt::V0,
+            };
+            (entry, key)
+        };
+
+    // Entries in expected XDR sort order: (key_byte, durability)
+    // Temporary(0) < Persistent(1), so:
+    // A: (0x01, Temporary)
+    // B: (0x01, Persistent)
+    // C: (0x02, Temporary)
+    // D: (0x02, Persistent)
+    let (entry_a, key_a) = make_data_entry(0x01, ContractDataDurability::Temporary);
+    let (entry_b, key_b) = make_data_entry(0x01, ContractDataDurability::Persistent);
+    let (entry_c, key_c) = make_data_entry(0x02, ContractDataDurability::Temporary);
+    let (entry_d, key_d) = make_data_entry(0x02, ContractDataDurability::Persistent);
+
+    // TTL entries with live_until = 5 (will expire at close ledger 10, since 5 < 10)
+    let make_ttl_entry_for = |data_key: &LedgerKey| -> LedgerEntry {
+        let key_bytes = xdr_to_bytes(data_key);
+        let hash_bytes: [u8; 32] = Sha256::digest(&key_bytes).into();
+        LedgerEntry {
+            last_modified_ledger_seq: 1,
+            data: LedgerEntryData::Ttl(TtlEntry {
+                key_hash: Hash(hash_bytes),
+                live_until_ledger_seq: 5,
+            }),
+            ext: LedgerEntryExt::V0,
+        }
+    };
+
+    let ttl_a = make_ttl_entry_for(&key_a);
+    let ttl_b = make_ttl_entry_for(&key_b);
+    let ttl_c = make_ttl_entry_for(&key_c);
+    let ttl_d = make_ttl_entry_for(&key_d);
+
+    // --- Build custom BucketList with eviction config ---
+    let cost_param = ContractCostParamEntry {
+        ext: ExtensionPoint::V0,
+        const_term: 0,
+        linear_term: 0,
+    };
+    let cost_params = ContractCostParams(vec![cost_param].try_into().unwrap());
+
+    let make_config = |setting: ConfigSettingEntry| LedgerEntry {
+        last_modified_ledger_seq: 1,
+        data: LedgerEntryData::ConfigSetting(setting),
+        ext: LedgerEntryExt::V0,
+    };
+
+    let config_entries = vec![
+        make_config(ConfigSettingEntry::ContractMaxSizeBytes(2_000)),
+        make_config(ConfigSettingEntry::ContractDataKeySizeBytes(200)),
+        make_config(ConfigSettingEntry::ContractDataEntrySizeBytes(2_000)),
+        make_config(ConfigSettingEntry::ContractComputeV0(
+            ConfigSettingContractComputeV0 {
+                ledger_max_instructions: 2_500_000,
+                tx_max_instructions: 2_500_000,
+                fee_rate_per_instructions_increment: 100,
+                tx_memory_limit: 2_000_000,
+            },
+        )),
+        make_config(ConfigSettingEntry::ContractLedgerCostV0(
+            ConfigSettingContractLedgerCostV0 {
+                ledger_max_disk_read_entries: 3,
+                ledger_max_disk_read_bytes: 3_200,
+                ledger_max_write_ledger_entries: 2,
+                ledger_max_write_bytes: 3_200,
+                tx_max_disk_read_entries: 3,
+                tx_max_disk_read_bytes: 3_200,
+                tx_max_write_ledger_entries: 2,
+                tx_max_write_bytes: 3_200,
+                fee_disk_read_ledger_entry: 5_000,
+                fee_write_ledger_entry: 20_000,
+                fee_disk_read1_kb: 1_000,
+                soroban_state_target_size_bytes: 1_000_000,
+                rent_fee1_kb_soroban_state_size_low: 1_000,
+                rent_fee1_kb_soroban_state_size_high: 10_000,
+                soroban_state_rent_fee_growth_factor: 1,
+            },
+        )),
+        make_config(ConfigSettingEntry::ContractHistoricalDataV0(
+            ConfigSettingContractHistoricalDataV0 {
+                fee_historical1_kb: 100,
+            },
+        )),
+        make_config(ConfigSettingEntry::ContractEventsV0(
+            ConfigSettingContractEventsV0 {
+                tx_max_contract_events_size_bytes: 200,
+                fee_contract_events1_kb: 200,
+            },
+        )),
+        make_config(ConfigSettingEntry::ContractBandwidthV0(
+            ConfigSettingContractBandwidthV0 {
+                ledger_max_txs_size_bytes: 10_000,
+                tx_max_size_bytes: 10_000,
+                fee_tx_size1_kb: 2_000,
+            },
+        )),
+        make_config(ConfigSettingEntry::ContractExecutionLanes(
+            ConfigSettingContractExecutionLanesV0 {
+                ledger_max_tx_count: 1,
+            },
+        )),
+        make_config(ConfigSettingEntry::ContractCostParamsCpuInstructions(
+            cost_params.clone(),
+        )),
+        make_config(ConfigSettingEntry::ContractCostParamsMemoryBytes(
+            cost_params,
+        )),
+        // Test shortcut: starting_eviction_scan_level = 0 so we scan level 0
+        // where add_batch places entries. Non-production (triggers warning).
+        make_config(ConfigSettingEntry::StateArchival(StateArchivalSettings {
+            max_entry_ttl: 1_054_080,
+            min_persistent_ttl: 4_096,
+            min_temporary_ttl: 16,
+            persistent_rent_rate_denominator: 252_480,
+            temp_rent_rate_denominator: 2_524_800,
+            max_entries_to_archive: 100,
+            live_soroban_state_size_window_sample_size: 30,
+            live_soroban_state_size_window_sample_period: 64,
+            eviction_scan_size: 100_000,
+            starting_eviction_scan_level: 0,
+        })),
+        make_config(ConfigSettingEntry::LiveSorobanStateSizeWindow(
+            vec![0u64; 30].try_into().unwrap(),
+        )),
+        // Test shortcut: EvictionIterator at level 0
+        make_config(ConfigSettingEntry::EvictionIterator(EvictionIterator {
+            bucket_list_level: 0,
+            is_curr_bucket: true,
+            bucket_file_offset: 0,
+        })),
+    ];
+
+    // Combine config + data + TTL entries into one add_batch call
+    let all_entries: Vec<LedgerEntry> = config_entries
+        .into_iter()
+        .chain(vec![
+            entry_a.clone(),
+            entry_b.clone(),
+            entry_c.clone(),
+            entry_d.clone(),
+            ttl_a,
+            ttl_b,
+            ttl_c,
+            ttl_d,
+        ])
+        .collect();
+
+    let mut bucket_list = BucketList::new();
+    bucket_list
+        .add_batch(1, 25, BucketListType::Live, all_entries, vec![], vec![])
+        .expect("add_batch");
+
+    // --- Initialize LedgerManager ---
+    let config = LedgerManagerConfig {
+        validate_bucket_hash: false,
+        ..Default::default()
+    };
+    let ledger = LedgerManager::new("Test Network".to_string(), config);
+
+    let hot_archive = HotArchiveBucketList::new();
+    // Custom header at ledger_seq 9 so close produces ledger 10
+    let header = LedgerHeader {
+        ledger_version: 25,
+        previous_ledger_hash: Hash([0u8; 32]),
+        scp_value: StellarValue {
+            tx_set_hash: Hash([0u8; 32]),
+            close_time: TimePoint(0),
+            upgrades: VecM::default(),
+            ext: StellarValueExt::Basic,
+        },
+        tx_set_result_hash: Hash([0u8; 32]),
+        bucket_list_hash: Hash([0u8; 32]),
+        ledger_seq: 9,
+        total_coins: 1_000_000,
+        fee_pool: 0,
+        inflation_seq: 0,
+        id_pool: 0,
+        base_fee: 100,
+        base_reserve: 100,
+        max_tx_set_size: 100,
+        skip_list: [
+            Hash([0u8; 32]),
+            Hash([0u8; 32]),
+            Hash([0u8; 32]),
+            Hash([0u8; 32]),
+        ],
+        ext: LedgerHeaderExt::V0,
+    };
+    let header_hash = compute_header_hash(&header).expect("hash");
+    ledger
+        .initialize(bucket_list, hot_archive, header, header_hash)
+        .expect("init");
+
+    // --- Close ledger 10 with empty tx set ---
+    let close_data = LedgerCloseData::new(
+        10,
+        TransactionSetVariant::Classic(TransactionSet {
+            previous_ledger_hash: Hash([0u8; 32]),
+            txs: VecM::default(),
+        }),
+        1,
+        ledger.current_header_hash(),
+    );
+
+    let result = ledger.close_ledger(close_data, None).expect("close ledger");
+    assert_eq!(result.header.ledger_seq, 10);
+
+    // --- Extract and verify evicted_keys ordering ---
+    let meta = result.meta.expect("ledger close meta");
+    let evicted_keys = match meta {
+        LedgerCloseMeta::V2(ref v2) => v2.evicted_keys.to_vec(),
+        other => panic!("expected V2 meta, got {:?}", other),
+    };
+
+    // Expected two-phase ordering:
+    // Phase 1 (deleted_keys): temp data + ALL TTL keys in scan order
+    //   A is temp: A_data, A_ttl
+    //   B is persistent: B_ttl only
+    //   C is temp: C_data, C_ttl
+    //   D is persistent: D_ttl only
+    // Phase 2 (persistent data from archived_entries): B_data, D_data
+    let expected = vec![
+        key_a.clone(),       // A_data (temp)
+        ttl_key_for(&key_a), // A_ttl
+        ttl_key_for(&key_b), // B_ttl (persistent TTL still goes to deleted_keys)
+        key_c.clone(),       // C_data (temp)
+        ttl_key_for(&key_c), // C_ttl
+        ttl_key_for(&key_d), // D_ttl
+        key_b.clone(),       // B_data (persistent, from archived_entries)
+        key_d.clone(),       // D_data (persistent, from archived_entries)
+    ];
+
+    assert_eq!(
+        evicted_keys.len(),
+        expected.len(),
+        "evicted_keys count mismatch: got {}, expected {}",
+        evicted_keys.len(),
+        expected.len()
+    );
+    assert_eq!(
+        evicted_keys, expected,
+        "evicted_keys ordering must match stellar-core two-phase rule: \
+         deleted_keys (temp data + all TTL) first, then persistent data keys"
+    );
+}
