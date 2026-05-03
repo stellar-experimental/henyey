@@ -2088,4 +2088,293 @@ mod tests {
             result.err()
         );
     }
+
+    /// Verify that `replay_ledger_with_execution()` correctly runs eviction for
+    /// protocol 25: expired entries are removed from the live bucket list,
+    /// persistent entries are archived to the hot archive, non-expired entries
+    /// survive, and the EvictionIterator config entry is persisted.
+    ///
+    /// Parity: stellar-core `populateEvictedEntries` (LedgerCloseMetaFrame.cpp:170-187),
+    /// `resolveBackgroundEvictionScan` (LedgerManagerImpl.cpp:2848-2851),
+    /// eviction scan + resolve (BucketManager.cpp:1231-1265).
+    #[test]
+    fn test_replay_eviction_application_mixed_temp_persistent() {
+        // add_batch may trigger spawn_blocking for async merges
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            test_replay_eviction_application_mixed_temp_persistent_impl();
+        });
+    }
+
+    fn test_replay_eviction_application_mixed_temp_persistent_impl() {
+        use henyey_bucket::EvictionIterator;
+        use henyey_common::xdr_to_bytes;
+        use sha2::{Digest, Sha256};
+        use stellar_xdr::curr::{
+            ConfigSettingEntry, ContractCostParamEntry, ContractCostParams, ContractDataDurability,
+            ContractDataEntry, ContractId, ExtensionPoint, LedgerKeyConfigSetting,
+            LedgerKeyContractData, LedgerKeyTtl, ScAddress, ScBytes, ScVal, StateArchivalSettings,
+            TtlEntry,
+        };
+
+        let contract = ScAddress::Contract(ContractId(Hash([1u8; 32])));
+
+        // --- Helper: build a contract data entry and its key ---
+        let make_data_entry =
+            |key_byte: u8, durability: ContractDataDurability| -> (LedgerEntry, LedgerKey) {
+                let key = LedgerKey::ContractData(LedgerKeyContractData {
+                    contract: contract.clone(),
+                    key: ScVal::Bytes(ScBytes(vec![key_byte].try_into().unwrap())),
+                    durability,
+                });
+                let entry = LedgerEntry {
+                    last_modified_ledger_seq: 1,
+                    data: LedgerEntryData::ContractData(ContractDataEntry {
+                        ext: ExtensionPoint::V0,
+                        contract: contract.clone(),
+                        key: ScVal::Bytes(ScBytes(vec![key_byte].try_into().unwrap())),
+                        durability,
+                        val: ScVal::I32(42),
+                    }),
+                    ext: LedgerEntryExt::V0,
+                };
+                (entry, key)
+            };
+
+        // --- Helper: build TTL key and entry for a given data key ---
+        let ttl_key_for = |data_key: &LedgerKey| -> LedgerKey {
+            let key_bytes = xdr_to_bytes(data_key);
+            let hash_bytes: [u8; 32] = Sha256::digest(&key_bytes).into();
+            LedgerKey::Ttl(LedgerKeyTtl {
+                key_hash: Hash(hash_bytes),
+            })
+        };
+
+        let make_ttl_entry = |data_key: &LedgerKey, live_until: u32| -> LedgerEntry {
+            let key_bytes = xdr_to_bytes(data_key);
+            let hash_bytes: [u8; 32] = Sha256::digest(&key_bytes).into();
+            LedgerEntry {
+                last_modified_ledger_seq: 1,
+                data: LedgerEntryData::Ttl(TtlEntry {
+                    key_hash: Hash(hash_bytes),
+                    live_until_ledger_seq: live_until,
+                }),
+                ext: LedgerEntryExt::V0,
+            }
+        };
+
+        // --- Build entries ---
+        // A: Temporary, expired (live_until=99 < ledger_seq=100)
+        let (entry_a, key_a) = make_data_entry(0x01, ContractDataDurability::Temporary);
+        // B: Persistent, expired
+        let (entry_b, key_b) = make_data_entry(0x01, ContractDataDurability::Persistent);
+        // C: Temporary, expired
+        let (entry_c, key_c) = make_data_entry(0x02, ContractDataDurability::Temporary);
+        // D: Persistent, expired
+        let (entry_d, key_d) = make_data_entry(0x02, ContractDataDurability::Persistent);
+        // E: Persistent, NOT expired (live_until=200 >= ledger_seq=100)
+        let (entry_e, key_e) = make_data_entry(0x03, ContractDataDurability::Persistent);
+
+        let ttl_a = make_ttl_entry(&key_a, 99);
+        let ttl_b = make_ttl_entry(&key_b, 99);
+        let ttl_c = make_ttl_entry(&key_c, 99);
+        let ttl_d = make_ttl_entry(&key_d, 99);
+        let ttl_e = make_ttl_entry(&key_e, 200);
+
+        // --- Config entries needed for replay ---
+        let cost_param = ContractCostParamEntry {
+            ext: ExtensionPoint::V0,
+            const_term: 0,
+            linear_term: 0,
+        };
+        let cost_params = ContractCostParams(vec![cost_param].try_into().unwrap());
+
+        let make_config = |setting: ConfigSettingEntry| LedgerEntry {
+            last_modified_ledger_seq: 1,
+            data: LedgerEntryData::ConfigSetting(setting),
+            ext: LedgerEntryExt::V0,
+        };
+
+        let config_entries = vec![
+            make_config(ConfigSettingEntry::StateArchival(StateArchivalSettings {
+                max_entry_ttl: 1_054_080,
+                min_persistent_ttl: 4_096,
+                min_temporary_ttl: 16,
+                persistent_rent_rate_denominator: 252_480,
+                temp_rent_rate_denominator: 2_524_800,
+                max_entries_to_archive: 100,
+                live_soroban_state_size_window_sample_size: 30,
+                live_soroban_state_size_window_sample_period: 64,
+                eviction_scan_size: 100_000,
+                starting_eviction_scan_level: 0,
+            })),
+            make_config(ConfigSettingEntry::EvictionIterator(EvictionIterator {
+                bucket_list_level: 0,
+                is_curr_bucket: true,
+                bucket_file_offset: 0,
+            })),
+            make_config(ConfigSettingEntry::ContractCostParamsCpuInstructions(
+                cost_params.clone(),
+            )),
+            make_config(ConfigSettingEntry::ContractCostParamsMemoryBytes(
+                cost_params,
+            )),
+        ];
+
+        // --- Seed the bucket list ---
+        let all_entries: Vec<LedgerEntry> = config_entries
+            .into_iter()
+            .chain(vec![
+                entry_a, entry_b, entry_c, entry_d, entry_e, ttl_a, ttl_b, ttl_c, ttl_d, ttl_e,
+            ])
+            .collect();
+
+        let mut bucket_list = BucketList::new();
+        bucket_list
+            .add_batch(
+                1,
+                25,
+                stellar_xdr::curr::BucketListType::Live,
+                all_entries,
+                vec![],
+                vec![],
+            )
+            .expect("seed bucket list");
+
+        let mut hot_archive = HotArchiveBucketList::new();
+
+        // --- Build replay header and config ---
+        let mut header = make_test_header(100);
+        header.ledger_version = 25;
+
+        let tx_set = TransactionSetVariant::Classic(make_empty_tx_set());
+
+        let config = ReplayConfig {
+            verify_results: false,
+            verify_bucket_list: false,
+            verify_header_hash: false,
+            emit_classic_events: false,
+            backfill_stellar_asset_events: false,
+            run_eviction: true,
+            eviction_settings: StateArchivalSettings::default(),
+            wait_for_publish: false,
+        };
+
+        let eviction_iterator = Some(EvictionIterator::new(0));
+
+        // --- Execute replay ---
+        let result = replay_ledger_with_execution(
+            &header,
+            &tx_set,
+            ReplayExecutionContext {
+                bucket_list: &mut bucket_list,
+                hot_archive_bucket_list: &mut hot_archive,
+                network_id: &NetworkId::testnet(),
+                config: &config,
+                expected_tx_results: None,
+                eviction_iterator,
+                module_cache: None,
+                soroban_state_size: None,
+                prev_id_pool: 0,
+                offer_entries: None,
+            },
+        )
+        .expect("replay_ledger_with_execution should succeed");
+
+        // --- Assertion 1: Evicted entries absent from live bucket list ---
+        assert!(
+            bucket_list.get(&key_a).unwrap().is_none(),
+            "entry A (temp, expired) should be evicted from live bucket list"
+        );
+        assert!(
+            bucket_list.get(&ttl_key_for(&key_a)).unwrap().is_none(),
+            "TTL for entry A should be evicted from live bucket list"
+        );
+        assert!(
+            bucket_list.get(&key_b).unwrap().is_none(),
+            "entry B (persistent, expired) data key should be dead in live bucket list"
+        );
+        assert!(
+            bucket_list.get(&ttl_key_for(&key_b)).unwrap().is_none(),
+            "TTL for entry B should be evicted from live bucket list"
+        );
+        assert!(
+            bucket_list.get(&key_c).unwrap().is_none(),
+            "entry C (temp, expired) should be evicted from live bucket list"
+        );
+        assert!(
+            bucket_list.get(&ttl_key_for(&key_c)).unwrap().is_none(),
+            "TTL for entry C should be evicted from live bucket list"
+        );
+        assert!(
+            bucket_list.get(&key_d).unwrap().is_none(),
+            "entry D (persistent, expired) data key should be dead in live bucket list"
+        );
+        assert!(
+            bucket_list.get(&ttl_key_for(&key_d)).unwrap().is_none(),
+            "TTL for entry D should be evicted from live bucket list"
+        );
+
+        // --- Assertion 2: Control entry E survives ---
+        assert!(
+            bucket_list.get(&key_e).unwrap().is_some(),
+            "entry E (persistent, NOT expired) should still be in live bucket list"
+        );
+        assert!(
+            bucket_list.get(&ttl_key_for(&key_e)).unwrap().is_some(),
+            "TTL for entry E should still be in live bucket list"
+        );
+
+        // --- Assertion 3: Persistent entries archived to hot archive ---
+        assert!(
+            hot_archive.get(&key_b).unwrap().is_some(),
+            "entry B (persistent, expired) should be in hot archive"
+        );
+        assert!(
+            hot_archive.get(&key_d).unwrap().is_some(),
+            "entry D (persistent, expired) should be in hot archive"
+        );
+
+        // --- Assertion 4: Negative hot-archive assertions ---
+        assert!(
+            hot_archive.get(&key_a).unwrap().is_none(),
+            "entry A (temporary) must NOT be in hot archive"
+        );
+        assert!(
+            hot_archive.get(&key_c).unwrap().is_none(),
+            "entry C (temporary) must NOT be in hot archive"
+        );
+        assert!(
+            hot_archive.get(&key_e).unwrap().is_none(),
+            "entry E (non-expired) must NOT be in hot archive"
+        );
+
+        // --- Assertion 5: Eviction iterator updated ---
+        assert!(
+            result.eviction_iterator.is_some(),
+            "eviction_iterator should be Some after eviction ran"
+        );
+
+        // --- Assertion 6: EvictionIterator persisted in bucket list ---
+        let iter_key = LedgerKey::ConfigSetting(LedgerKeyConfigSetting {
+            config_setting_id: ConfigSettingId::EvictionIterator,
+        });
+        let persisted_iter = bucket_list
+            .get(&iter_key)
+            .unwrap()
+            .expect("EvictionIterator config entry should be in bucket list");
+        match persisted_iter.data {
+            LedgerEntryData::ConfigSetting(ConfigSettingEntry::EvictionIterator(ref iter)) => {
+                assert_eq!(
+                    iter,
+                    result.eviction_iterator.as_ref().unwrap(),
+                    "persisted EvictionIterator should match result.eviction_iterator"
+                );
+            }
+            _ => panic!("expected ConfigSettingEntry::EvictionIterator in bucket list"),
+        }
+    }
 }
