@@ -4093,7 +4093,7 @@ impl LedgerCloseContext<'_> {
                     break;
                 }
                 let result = &tx_set_result.results[idx];
-                let fee_charged = result.fee_charged + result.fee_refund;
+                let fee_charged = result.pre_refund_fee();
                 let fee_source = &prepared.tx_meta[idx].fee_source;
                 prepend_fee_event(
                     &mut meta.tx_apply_processing,

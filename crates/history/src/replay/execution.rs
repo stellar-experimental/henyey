@@ -652,7 +652,7 @@ pub fn replay_ledger_with_execution(
                 break;
             }
             let result = &tx_set_result.results[idx];
-            let fee_charged = result.fee_charged + result.fee_refund;
+            let fee_charged = result.pre_refund_fee();
             let frame = TransactionFrame::with_network(envelope.clone(), *network_id);
             let fee_source = muxed_to_account_id(&frame.fee_source_account());
             prepend_fee_event(

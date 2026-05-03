@@ -409,6 +409,13 @@ pub struct TransactionExecutionResult {
     pub fee_bump_outer_failure: bool,
 }
 
+impl TransactionExecutionResult {
+    /// Returns the original fee debited from the source before any Soroban refund.
+    pub fn pre_refund_fee(&self) -> i64 {
+        self.fee_charged + self.fee_refund
+    }
+}
+
 /// Type alias: `ExecutionFailure` is now `TransactionResultCode` from the XDR crate.
 ///
 /// Previously this was a custom enum with 15 variants that mapped 1:1 to
@@ -4779,5 +4786,45 @@ mod tests {
             acc.seq_num.0, 2,
             "seq_num must remain 2 — seq bump must not be rolled back"
         );
+    }
+
+    #[test]
+    fn test_pre_refund_fee() {
+        let result = TransactionExecutionResult {
+            success: true,
+            fee_charged: 3000,
+            fee_refund: 2000,
+            operation_results: vec![],
+            error: None,
+            failure: None,
+            tx_meta: None,
+            fee_changes: None,
+            post_fee_changes: None,
+            hot_archive_restored_keys: vec![],
+            timings: TxExecTimings::default(),
+            tx_hash: None,
+            fee_bump_outer_failure: false,
+        };
+        assert_eq!(result.pre_refund_fee(), 5000);
+    }
+
+    #[test]
+    fn test_pre_refund_fee_zero_refund() {
+        let result = TransactionExecutionResult {
+            success: true,
+            fee_charged: 1000,
+            fee_refund: 0,
+            operation_results: vec![],
+            error: None,
+            failure: None,
+            tx_meta: None,
+            fee_changes: None,
+            post_fee_changes: None,
+            hot_archive_restored_keys: vec![],
+            timings: TxExecTimings::default(),
+            tx_hash: None,
+            fee_bump_outer_failure: false,
+        };
+        assert_eq!(result.pre_refund_fee(), 1000);
     }
 }
