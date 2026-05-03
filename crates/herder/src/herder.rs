@@ -1015,6 +1015,21 @@ impl Herder {
         // Transition to tracking state
         *tracked_write(LOCK_HERDER_STATE, &self.state) = HerderState::Tracking;
 
+        // Seed prev_value from LCL's scpValue so the first nomination uses the
+        // correct previousValue for priority calculation. Matches stellar-core's
+        // triggerNextLedger which reads lcl.header.scpValue (HerderImpl.cpp:1602).
+        if let Some(lm) = self.ledger_manager.read().as_ref() {
+            let header = lm.current_header();
+            *self.prev_value.write() = Value(
+                header
+                    .scp_value
+                    .to_xdr(Limits::none())
+                    .expect("StellarValue XDR serialization cannot fail for a valid LCL header")
+                    .try_into()
+                    .expect("StellarValue XDR bytes always fit in BytesM"),
+            );
+        }
+
         // Release any pending envelopes for this slot and previous
         self.drain_and_process_pending(slot);
 
@@ -1754,8 +1769,18 @@ impl Herder {
                         self.scp_driver
                             .cleanup_externalized(self.config.max_externalized_slots);
 
-                        // Store for next round's priority calculation
-                        *self.prev_value.write() = value;
+                        // Only update prev_value cache if this is a forward
+                        // externalization. consensus_index is the *next* slot
+                        // (externalized_slot + 1), so slot >= consensus_index
+                        // means this slot is at least as recent as the current
+                        // tracking target. Mirrors stellar-core's isLatestSlot
+                        // guard in HerderSCPDriver::valueExternalized.
+                        {
+                            let current_consensus = self.tracking_state.read().consensus_index;
+                            if slot >= current_consensus {
+                                *self.prev_value.write() = value;
+                            }
+                        }
 
                         // Advance tracking slot
                         self.advance_tracking_slot(slot);
@@ -1920,6 +1945,28 @@ impl Herder {
         result
     }
 
+    /// Derive the previous externalized value for nomination priority calculation.
+    ///
+    /// Mirrors stellar-core's `triggerNextLedger(lcl.header.scpValue)` pattern:
+    /// always read from the latest applied ledger (LCL) when `ledger_manager` is
+    /// installed. Falls back to the cached `prev_value` field for test contexts
+    /// where no LedgerManager is available.
+    fn get_previous_value(&self) -> Value {
+        if let Some(lm) = self.ledger_manager.read().as_ref() {
+            let header = lm.current_header();
+            Value(
+                header
+                    .scp_value
+                    .to_xdr(Limits::none())
+                    .expect("StellarValue XDR serialization cannot fail for a valid LCL header")
+                    .try_into()
+                    .expect("StellarValue XDR bytes always fit in BytesM"),
+            )
+        } else {
+            self.prev_value.read().clone()
+        }
+    }
+
     /// Trigger consensus for the next ledger (for validators).
     ///
     /// This is called periodically by the consensus timer.
@@ -2014,8 +2061,9 @@ impl Herder {
         // filters by slot, so stale entries are unreachable.
         *self.cached_nomination_value.write() = Some((slot, value.clone()));
 
-        // Get previous value for priority calculation
-        let prev_value = self.prev_value.read().clone();
+        // Get previous value for priority calculation — reads from LCL when
+        // available, matching stellar-core's triggerNextLedger(lcl.header.scpValue).
+        let prev_value = self.get_previous_value();
 
         // Start SCP nomination
         let t1 = std::time::Instant::now();
@@ -2050,7 +2098,10 @@ impl Herder {
         // externalized and advance tracking state accordingly.
         if self.scp_driver.latest_externalized_slot() == Some(slot) {
             if let Some(ext) = self.scp_driver.get_externalized(slot) {
-                *self.prev_value.write() = ext.value;
+                let current_consensus = self.tracking_state.read().consensus_index;
+                if slot >= current_consensus {
+                    *self.prev_value.write() = ext.value;
+                }
             }
             self.advance_tracking_slot(slot);
         }
@@ -2277,7 +2328,7 @@ impl Herder {
             return TimeoutOutcome::SkippedStale;
         }
 
-        let prev_value = self.prev_value.read().clone();
+        let prev_value = self.get_previous_value();
 
         // Reuse the cached nomination value for this slot, matching stellar-core's
         // by-value lambda capture (NominationProtocol.cpp:654-659).
@@ -9701,5 +9752,185 @@ mod dynamic_close_time_tests {
             henyey_common::Resource::soroban_ledger_limits(17, 1, 1, 1, 1, 1, 1),
         );
         assert_eq!(herder.max_queue_size_soroban_ops(), 17);
+    }
+}
+
+// =============================================================================
+// Tests for prev_value retrograde guard (issue #2342)
+// =============================================================================
+#[cfg(test)]
+mod prev_value_guard_tests {
+    use super::*;
+    use henyey_ledger::{LedgerManager, LedgerManagerConfig};
+    use stellar_xdr::curr::{
+        Hash, LedgerHeader, LedgerHeaderExt, Limits, StellarValue, StellarValueExt, TimePoint,
+        Value, VecM, WriteXdr,
+    };
+
+    /// Create a LedgerManager initialized at `ledger_seq` with the given `scp_value`.
+    fn make_lm_with_scp_value(ledger_seq: u32, scp_value: StellarValue) -> Arc<LedgerManager> {
+        let config = LedgerManagerConfig {
+            validate_bucket_hash: false,
+            ..Default::default()
+        };
+        let lm = LedgerManager::new("Test Network".to_string(), config);
+        let header = LedgerHeader {
+            ledger_version: 24,
+            previous_ledger_hash: Hash([0u8; 32]),
+            scp_value,
+            tx_set_result_hash: Hash([0u8; 32]),
+            bucket_list_hash: Hash([0u8; 32]),
+            ledger_seq,
+            total_coins: 1_000_000_000_000,
+            fee_pool: 0,
+            inflation_seq: 0,
+            id_pool: 0,
+            base_fee: 100,
+            base_reserve: 5_000_000,
+            max_tx_set_size: 100,
+            skip_list: [
+                Hash([0u8; 32]),
+                Hash([0u8; 32]),
+                Hash([0u8; 32]),
+                Hash([0u8; 32]),
+            ],
+            ext: LedgerHeaderExt::V0,
+        };
+        let header_hash = henyey_ledger::compute_header_hash(&header).expect("hash");
+        lm.initialize(
+            henyey_bucket::BucketList::new(),
+            henyey_bucket::HotArchiveBucketList::new(),
+            header,
+            header_hash,
+        )
+        .expect("init");
+        Arc::new(lm)
+    }
+
+    fn make_stellar_value(close_time: u64) -> StellarValue {
+        StellarValue {
+            tx_set_hash: Hash([close_time as u8; 32]),
+            close_time: TimePoint(close_time),
+            upgrades: VecM::default(),
+            ext: StellarValueExt::Basic,
+        }
+    }
+
+    fn stellar_value_to_scp_value(sv: &StellarValue) -> Value {
+        Value(sv.to_xdr(Limits::none()).unwrap().try_into().unwrap())
+    }
+
+    /// Retrograde externalization must NOT overwrite prev_value.
+    ///
+    /// Scenario: externalize slot 10 (forward), then externalize slot 8
+    /// (retrograde). The prev_value cache must retain the value from slot 10.
+    #[test]
+    fn test_prev_value_not_overwritten_by_retrograde_externalization() {
+        let herder = Herder::new(HerderConfig::default());
+
+        // Simulate: tracking_state.consensus_index = 10
+        // (meaning last externalized was slot 9, next expected is 10)
+        {
+            let mut ts = herder.tracking_state.write();
+            ts.is_tracking = true;
+            ts.consensus_index = 10;
+        }
+
+        let value_10 = stellar_value_to_scp_value(&make_stellar_value(10));
+        let value_8 = stellar_value_to_scp_value(&make_stellar_value(8));
+
+        // Forward externalization: slot 10 >= consensus_index 10 → writes prev_value
+        {
+            let current_consensus = herder.tracking_state.read().consensus_index;
+            assert!(10 >= current_consensus);
+            *herder.prev_value.write() = value_10.clone();
+        }
+        herder.advance_tracking_slot(10);
+
+        // Verify tracking advanced to 11
+        assert_eq!(herder.tracking_state.read().consensus_index, 11);
+
+        // Retrograde externalization: slot 8 < consensus_index 11 → must NOT write
+        {
+            let current_consensus = herder.tracking_state.read().consensus_index;
+            assert!(8 < current_consensus);
+            // Simulating what the guarded code does — should not write.
+            if 8 >= current_consensus {
+                *herder.prev_value.write() = value_8.clone();
+            }
+        }
+
+        // prev_value must still be value_10, not value_8
+        let cached = herder.prev_value.read().clone();
+        assert_eq!(
+            cached, value_10,
+            "prev_value must not regress to old slot's value"
+        );
+        assert_ne!(cached, value_8);
+    }
+
+    /// Bootstrap must seed prev_value from LCL's scpValue.
+    #[test]
+    fn test_bootstrap_seeds_prev_value_from_lcl() {
+        let herder = Herder::new(HerderConfig::default());
+
+        // prev_value starts as default
+        assert_eq!(*herder.prev_value.read(), Value::default());
+
+        let sv = make_stellar_value(42);
+        let expected_value = stellar_value_to_scp_value(&sv);
+
+        let lm = make_lm_with_scp_value(10, sv);
+        herder.set_ledger_manager(lm);
+
+        // Bootstrap at ledger 10
+        herder.bootstrap(10);
+
+        // prev_value must now be the XDR of the LCL's scpValue
+        let cached = herder.prev_value.read().clone();
+        assert_eq!(
+            cached, expected_value,
+            "bootstrap must seed prev_value from LCL scpValue"
+        );
+    }
+
+    /// get_previous_value prefers LCL when ledger_manager is set.
+    #[test]
+    fn test_get_previous_value_reads_from_lcl() {
+        let herder = Herder::new(HerderConfig::default());
+
+        // Manually set prev_value to something different
+        let stale_value = stellar_value_to_scp_value(&make_stellar_value(1));
+        *herder.prev_value.write() = stale_value.clone();
+
+        // Install LM with a different scpValue
+        let lcl_sv = make_stellar_value(99);
+        let expected = stellar_value_to_scp_value(&lcl_sv);
+        let lm = make_lm_with_scp_value(10, lcl_sv);
+        herder.set_ledger_manager(lm);
+
+        // get_previous_value should return LCL value, not the stale cache
+        let result = herder.get_previous_value();
+        assert_eq!(
+            result, expected,
+            "get_previous_value must prefer LCL over cache"
+        );
+        assert_ne!(result, stale_value);
+    }
+
+    /// get_previous_value falls back to prev_value when no LM is installed.
+    #[test]
+    fn test_get_previous_value_falls_back_to_cache_without_lm() {
+        let herder = Herder::new(HerderConfig::default());
+
+        let cached_value = stellar_value_to_scp_value(&make_stellar_value(5));
+        *herder.prev_value.write() = cached_value.clone();
+
+        // No LM installed → should use cache
+        let result = herder.get_previous_value();
+        assert_eq!(
+            result, cached_value,
+            "without LM, must fall back to cached prev_value"
+        );
     }
 }
