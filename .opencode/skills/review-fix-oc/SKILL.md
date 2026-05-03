@@ -201,4 +201,4 @@ Prioritized list of follow-up actions (if any).
 - Use subagents for codebase-wide searches to keep the analysis thorough without
   overwhelming context.
 - **Model configuration.** When spawning review sub-agents via the Task tool,
-  use `"model": "glm-5.1"` and `"subagent_type": "general"`.
+  use `"model": "glm-5.1"` and `"subagent_type": "reviewer"`.
