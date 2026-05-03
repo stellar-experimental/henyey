@@ -8,6 +8,8 @@
     "stellar",
     "full"
   ],
+  "schemaVersion": 39,
+  "version": 1,
   "timezone": "browser",
   "editable": true,
   "graphTooltip": 1,
@@ -44,7 +46,7 @@
         },
         "datasource": {
           "type": "prometheus",
-          "uid": "${DS_PROMETHEUS}"
+          "uid": "000000001"
         },
         "definition": "label_values(stellar_history_download_bucket_success_total, archive)",
         "hide": 0,
@@ -247,7 +249,7 @@
       },
       "targets": [
         {
-          "expr": "stellar_started_on{instance=~\"$instance\"}",
+          "expr": "stellar_started_on{instance=~\"$instance\"} * 1000",
           "legendFormat": "{{instance}}"
         }
       ],
@@ -529,7 +531,7 @@
     {
       "id": 17,
       "type": "stat",
-      "title": "Ledger Age",
+      "title": "Ledger Age (current)",
       "description": "Seconds since last ledger close. Panel 20 of 10334.",
       "gridPos": {
         "h": 4,
@@ -596,7 +598,7 @@
     {
       "id": 19,
       "type": "timeseries",
-      "title": "Ledger Age",
+      "title": "Ledger Age (history)",
       "description": "Seconds since last close. Panel 22 of 10334.",
       "gridPos": {
         "h": 6,
@@ -623,7 +625,7 @@
     {
       "id": 20,
       "type": "timeseries",
-      "title": "% Closed Within $le s",
+      "title": "% Closed Within ≤5/7/10s",
       "description": "Panel 23 of 10334. Percentage of ledgers closed within 5s, 7s, 10s thresholds.",
       "gridPos": {
         "h": 6,
@@ -807,7 +809,7 @@
       "description": "Panel 29 of 10334. Total invariant check failures (should always be 0).",
       "gridPos": {
         "h": 6,
-        "w": 6,
+        "w": 3,
         "x": 12,
         "y": 25
       },
@@ -845,8 +847,8 @@
       "description": "Externalized ledger slots buffered and waiting to close.",
       "gridPos": {
         "h": 6,
-        "w": 2,
-        "x": 18,
+        "w": 3,
+        "x": 15,
         "y": 25
       },
       "datasource": {
@@ -872,8 +874,8 @@
       "description": "Rate of transactions resulting in txINTERNAL_ERROR.",
       "gridPos": {
         "h": 6,
-        "w": 2,
-        "x": 20,
+        "w": 3,
+        "x": 18,
         "y": 25
       },
       "datasource": {
@@ -911,8 +913,8 @@
       "description": "Median catchup wall-clock duration over the last hour.",
       "gridPos": {
         "h": 6,
-        "w": 2,
-        "x": 22,
+        "w": 3,
+        "x": 21,
         "y": 25
       },
       "datasource": {
@@ -1456,8 +1458,8 @@
     {
       "id": 43,
       "type": "timeseries",
-      "title": "Bucket Merge Time",
-      "description": "Cumulative merge time. Panel 57 of 10334.",
+      "title": "Bucket Merge Utilization",
+      "description": "Merge time as fraction of wall clock (s of merge work per s elapsed). Panel 57 of 10334.",
       "gridPos": {
         "h": 6,
         "w": 8,
@@ -1471,12 +1473,12 @@
       "targets": [
         {
           "expr": "rate(stellar_bucket_merge_time_us_total{instance=~\"$instance\"}[5m]) / 1e6",
-          "legendFormat": "{{instance}} merge s/s"
+          "legendFormat": "{{instance}}"
         }
       ],
       "fieldConfig": {
         "defaults": {
-          "unit": "s"
+          "unit": "percentunit"
         }
       }
     },
@@ -1866,7 +1868,7 @@
           "id": 209,
           "type": "heatmap",
           "title": "Publish Duration Heatmap",
-          "description": "Distribution of checkpoint publish wall-clock time. Panel 70 of 10334. Custom buckets: 1s, 5s, 10s, 20s, 30s, 45s, 60s, 90s, 120s, 300s.",
+          "description": "Distribution of checkpoint publish wall-clock time. Panel 70 of 10334. Custom buckets: 1s, 5s, 10s, 20s, 30s, 45s, 60s, 90s, 120s, 300s. Empty when no checkpoints have been published in the selected window.",
           "gridPos": {
             "h": 8,
             "w": 24,
@@ -1893,7 +1895,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "${DS_PROMETHEUS}"
+            "uid": "000000001"
           },
           "fieldConfig": {
             "defaults": {
@@ -1971,7 +1973,7 @@
             {
               "datasource": {
                 "type": "prometheus",
-                "uid": "${DS_PROMETHEUS}"
+                "uid": "000000001"
               },
               "expr": "rate(stellar_history_download_bucket_success_total{instance=~\"$instance\", archive=~\"$archive\"}[$__rate_interval])",
               "legendFormat": "{{archive}} success",
@@ -1980,7 +1982,7 @@
             {
               "datasource": {
                 "type": "prometheus",
-                "uid": "${DS_PROMETHEUS}"
+                "uid": "000000001"
               },
               "expr": "rate(stellar_history_download_bucket_failure_total{instance=~\"$instance\", archive=~\"$archive\"}[$__rate_interval])",
               "legendFormat": "{{archive}} failure",
@@ -1991,7 +1993,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "${DS_PROMETHEUS}"
+            "uid": "000000001"
           },
           "fieldConfig": {
             "defaults": {
@@ -2071,7 +2073,7 @@
             {
               "datasource": {
                 "type": "prometheus",
-                "uid": "${DS_PROMETHEUS}"
+                "uid": "000000001"
               },
               "expr": "rate(stellar_history_download_bucket_success_total{instance=~\"$instance\", archive=~\"$archive\"}[$__rate_interval]) / (rate(stellar_history_download_bucket_success_total{instance=~\"$instance\", archive=~\"$archive\"}[$__rate_interval]) + rate(stellar_history_download_bucket_failure_total{instance=~\"$instance\", archive=~\"$archive\"}[$__rate_interval]))",
               "legendFormat": "{{archive}}",
@@ -2082,7 +2084,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "${DS_PROMETHEUS}"
+            "uid": "000000001"
           },
           "fieldConfig": {
             "defaults": {
@@ -2160,7 +2162,7 @@
             {
               "datasource": {
                 "type": "prometheus",
-                "uid": "${DS_PROMETHEUS}"
+                "uid": "000000001"
               },
               "expr": "rate(stellar_history_download_ledger_success_total{instance=~\"$instance\", archive=~\"$archive\"}[$__rate_interval])",
               "legendFormat": "{{archive}} success",
@@ -2169,7 +2171,7 @@
             {
               "datasource": {
                 "type": "prometheus",
-                "uid": "${DS_PROMETHEUS}"
+                "uid": "000000001"
               },
               "expr": "rate(stellar_history_download_ledger_failure_total{instance=~\"$instance\", archive=~\"$archive\"}[$__rate_interval])",
               "legendFormat": "{{archive}} failure",
@@ -2180,7 +2182,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "${DS_PROMETHEUS}"
+            "uid": "000000001"
           },
           "fieldConfig": {
             "defaults": {
@@ -2260,7 +2262,7 @@
             {
               "datasource": {
                 "type": "prometheus",
-                "uid": "${DS_PROMETHEUS}"
+                "uid": "000000001"
               },
               "expr": "rate(stellar_history_download_ledger_success_total{instance=~\"$instance\", archive=~\"$archive\"}[$__rate_interval]) / (rate(stellar_history_download_ledger_success_total{instance=~\"$instance\", archive=~\"$archive\"}[$__rate_interval]) + rate(stellar_history_download_ledger_failure_total{instance=~\"$instance\", archive=~\"$archive\"}[$__rate_interval]))",
               "legendFormat": "{{archive}}",
@@ -2271,7 +2273,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "${DS_PROMETHEUS}"
+            "uid": "000000001"
           },
           "fieldConfig": {
             "defaults": {
@@ -2349,7 +2351,7 @@
             {
               "datasource": {
                 "type": "prometheus",
-                "uid": "${DS_PROMETHEUS}"
+                "uid": "000000001"
               },
               "expr": "rate(stellar_history_download_history_archive_state_success_total{instance=~\"$instance\", archive=~\"$archive\"}[$__rate_interval])",
               "legendFormat": "{{archive}} success",
@@ -2358,7 +2360,7 @@
             {
               "datasource": {
                 "type": "prometheus",
-                "uid": "${DS_PROMETHEUS}"
+                "uid": "000000001"
               },
               "expr": "rate(stellar_history_download_history_archive_state_failure_total{instance=~\"$instance\", archive=~\"$archive\"}[$__rate_interval])",
               "legendFormat": "{{archive}} failure",
@@ -2369,7 +2371,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "${DS_PROMETHEUS}"
+            "uid": "000000001"
           },
           "fieldConfig": {
             "defaults": {
@@ -2449,7 +2451,7 @@
             {
               "datasource": {
                 "type": "prometheus",
-                "uid": "${DS_PROMETHEUS}"
+                "uid": "000000001"
               },
               "expr": "rate(stellar_history_download_history_archive_state_success_total{instance=~\"$instance\", archive=~\"$archive\"}[$__rate_interval]) / (rate(stellar_history_download_history_archive_state_success_total{instance=~\"$instance\", archive=~\"$archive\"}[$__rate_interval]) + rate(stellar_history_download_history_archive_state_failure_total{instance=~\"$instance\", archive=~\"$archive\"}[$__rate_interval]))",
               "legendFormat": "{{archive}}",
@@ -3141,7 +3143,30 @@
       ],
       "fieldConfig": {
         "defaults": {
-          "unit": "short"
+          "unit": "short",
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "text"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          }
+        }
+      },
+      "options": {
+        "colorMode": "none",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
         }
       }
     },
@@ -3152,9 +3177,9 @@
       "description": "Peers dropped due to idle timeout. Panel 95 of 10334.",
       "gridPos": {
         "h": 6,
-        "w": 6,
-        "x": 12,
-        "y": 119
+        "w": 12,
+        "x": 0,
+        "y": 131
       },
       "datasource": {
         "type": "prometheus",
@@ -3179,9 +3204,9 @@
       "description": "Peers dropped due to straggler timeout. Panel 96 of 10334.",
       "gridPos": {
         "h": 6,
-        "w": 6,
-        "x": 18,
-        "y": 119
+        "w": 12,
+        "x": 12,
+        "y": 131
       },
       "datasource": {
         "type": "prometheus",
@@ -3207,7 +3232,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 131
+        "y": 137
       },
       "id": 113,
       "panels": [
