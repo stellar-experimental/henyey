@@ -74,6 +74,7 @@ impl RpcAppHandle for FakeRpcApp {
             scp_verify: Default::default(),
             overlay_fetch_channel: Default::default(),
             post_catchup_hard_reset_total: 0,
+            max_verified_scp_slot: 0,
         }
     }
 
