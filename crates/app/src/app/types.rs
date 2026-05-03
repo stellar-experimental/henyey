@@ -308,6 +308,8 @@ pub struct AppInfo {
     pub overlay_fetch_channel: OverlayFetchChannelMetrics,
     /// Total post-catchup hard resets performed (issue #1822).
     pub post_catchup_hard_reset_total: u64,
+    /// Highest verified SCP slot from peers (issue #2349).
+    pub max_verified_scp_slot: u64,
 }
 
 /// Lightweight metrics-only snapshot for the `/metrics` scrape path.
@@ -323,6 +325,8 @@ pub struct AppMetricsSnapshot {
     pub scp_verify: ScpVerifyMetrics,
     pub overlay_fetch_channel: OverlayFetchChannelMetrics,
     pub post_catchup_hard_reset_total: u64,
+    /// Highest verified SCP slot from peers (issue #2349).
+    pub max_verified_scp_slot: u64,
     // Phase 3: cumulative ledger apply counters.
     pub cumulative_apply_success: u64,
     pub cumulative_apply_failure: u64,
@@ -1513,6 +1517,7 @@ mod tests {
             scp_verify: Default::default(),
             overlay_fetch_channel: Default::default(),
             post_catchup_hard_reset_total: 0,
+            max_verified_scp_slot: 0,
         };
         let output = format!("{}", info);
         assert!(!output.contains("Commit:"));
@@ -1535,6 +1540,7 @@ mod tests {
             scp_verify: Default::default(),
             overlay_fetch_channel: Default::default(),
             post_catchup_hard_reset_total: 0,
+            max_verified_scp_slot: 0,
         };
         let output = format!("{}", info);
         assert!(output.contains("Commit:     abc123"));

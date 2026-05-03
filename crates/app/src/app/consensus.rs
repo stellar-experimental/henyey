@@ -468,6 +468,45 @@ impl App {
                          (repeated)"
                     );
                 }
+                // ── No-SCP hard-reset escalation (issue #2349) ──────────
+                // When we've been at tip with no SCP progress for a long
+                // time AND the archive is confirmed behind, escalate to
+                // hard reset. Uses a higher threshold than the fast-track
+                // path because absence of SCP traffic is weaker evidence.
+                let archive_is_confirmed_behind =
+                    self.archive_confirmed_behind.load(Ordering::SeqCst);
+                let peer_gap = self.effective_peer_gap(current_ledger);
+                if archive_is_confirmed_behind
+                    && attempts >= RECOVERY_HARD_RESET_ESCALATION_ATTEMPTS_NO_SCP
+                    && !self.is_hard_reset_on_cooldown(peer_gap)
+                {
+                    use super::types::HardResetReason;
+                    tracing::warn!(
+                        current_ledger,
+                        latest_externalized,
+                        peer_gap,
+                        attempts,
+                        "Recovery stuck: AtTip, no SCP progress, archive behind \
+                         — escalating to hard reset (time-based)"
+                    );
+                    metrics::counter!(
+                        crate::metrics::RECOVERY_STALLED_TICK_TOTAL,
+                        "reason" => "at_tip_no_scp_hard_reset"
+                    )
+                    .increment(1);
+                    self.set_phase_sub(PHASE_13_10_TRIGGER_RECOVERY_CATCHUP);
+                    // If the inner cooldown blocks, fall through to
+                    // the SCP state request rather than returning idle.
+                    if let Some(pc) = self
+                        .force_post_catchup_hard_reset(
+                            current_ledger,
+                            HardResetReason::ArchiveBehindStallWallClock,
+                        )
+                        .await
+                    {
+                        return Some(pc);
+                    }
+                }
                 // Fall through to the SCP state request below
             }
         }
@@ -1307,6 +1346,47 @@ impl App {
         let archive_latest = match archive_latest {
             Some(latest) => latest,
             None => {
+                // ── Peer-ahead hard-reset escalation (issue #2349) ──────
+                // When the archive is confirmed behind AND verified peers
+                // are ahead by a meaningful gap AND we've been stuck for
+                // enough recovery ticks, escalate to hard reset.
+                let archive_is_confirmed_behind =
+                    self.archive_confirmed_behind.load(Ordering::SeqCst);
+                let peer_gap = self.effective_peer_gap(current_ledger);
+                if archive_is_confirmed_behind
+                    && peer_gap >= PEER_AHEAD_ESCALATION_THRESHOLD
+                    && attempts >= RECOVERY_HARD_RESET_ESCALATION_ATTEMPTS
+                    && !self.is_hard_reset_on_cooldown(peer_gap)
+                {
+                    use super::types::HardResetReason;
+                    tracing::warn!(
+                        current_ledger,
+                        peer_max_verified = self.max_verified_scp_slot.load(Ordering::Relaxed),
+                        peer_gap,
+                        attempts,
+                        next_checkpoint = next_cp,
+                        "Recovery stuck: archive confirmed behind, peers verified ahead \
+                         — escalating to hard reset"
+                    );
+                    metrics::counter!(
+                        crate::metrics::RECOVERY_STALLED_TICK_TOTAL,
+                        "reason" => "archive_behind_peer_ahead_hard_reset"
+                    )
+                    .increment(1);
+                    // If the inner cooldown blocks, fall through to the
+                    // peer-SCP fallback rather than returning an idle None
+                    // (the inner cooldown uses a different gap metric).
+                    if let Some(pc) = self
+                        .force_post_catchup_hard_reset(
+                            current_ledger,
+                            HardResetReason::ArchiveBehindStallWallClock,
+                        )
+                        .await
+                    {
+                        return Some(pc);
+                    }
+                }
+
                 // Demote to debug when backoff is already active (#1843):
                 // the first "skipped" log is useful; repeating it every 10s
                 // for up to 5 minutes is pure noise.

@@ -948,6 +948,8 @@ impl App {
                     let prep_sent = self.scp_prepare_sent.load(Ordering::Relaxed);
                     let conf_sent = self.scp_confirm_sent.load(Ordering::Relaxed);
                     let ext_sent = self.scp_externalize_sent.load(Ordering::Relaxed);
+                    let peer_max_verified = self.max_verified_scp_slot.load(Ordering::Relaxed);
+                    let peer_gap = self.effective_peer_gap(ledger);
                     tracing::info!(
                         tracking_slot,
                         ledger,
@@ -963,6 +965,8 @@ impl App {
                         scp_sent_prep = prep_sent,
                         scp_sent_conf = conf_sent,
                         scp_sent_ext = ext_sent,
+                        peer_max_verified,
+                        peer_gap,
                         "Heartbeat"
                     );
                     scp_messages_last_heartbeat = scp_messages_received;
@@ -2031,6 +2035,18 @@ impl App {
 
         // Per-reason post-verify metric.
         self.record_post_verify_reason(reason);
+
+        // Track highest verified SCP slot from peers for recovery stall detection.
+        // Only fires for Verdict::Ok envelopes (verify-rejected return at line 1995).
+        // Excludes self-messages (own SCP output reflected back).
+        if !matches!(
+            reason,
+            henyey_herder::scp_verify::PostVerifyReason::SelfMessage
+        ) && slot > 0
+        {
+            self.max_verified_scp_slot
+                .fetch_max(slot, Ordering::Relaxed);
+        }
 
         // Structured attribution log for Issue #1806 investigation. Emits
         // the envelope outcome and the PostVerifyReason so a single grep of

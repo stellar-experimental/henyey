@@ -231,6 +231,22 @@ const HARD_RESET_MAX_COOLDOWN_SECS: u64 = 300;
 /// the stall is worsening.
 const HARD_RESET_GAP_ESCALATION: u64 = TX_SET_REQUEST_WINDOW;
 
+/// Minimum verified peer gap (max_verified_scp_slot - current_ledger) before
+/// hard-reset escalation. Prevents spurious resets from a single far-ahead
+/// envelope.
+const PEER_AHEAD_ESCALATION_THRESHOLD: u64 = 3;
+
+/// Recovery attempts (0-based, pre-increment from fetch_add) before hard-reset
+/// escalation when archive is confirmed behind and peers are verified ahead.
+/// `attempts >= 11` fires on the 12th tick (~120s at 10s/tick), matching
+/// HARD_RESET_STALL_SECS.
+const RECOVERY_HARD_RESET_ESCALATION_ATTEMPTS: u64 =
+    (HARD_RESET_STALL_SECS / OUT_OF_SYNC_RECOVERY_TIMER_SECS) - 1;
+
+/// Higher threshold for no-SCP stall: fires on the 18th tick (~180s at 10s/tick).
+const RECOVERY_HARD_RESET_ESCALATION_ATTEMPTS_NO_SCP: u64 =
+    (HARD_RESET_STALL_SECS * 3 / 2 / OUT_OF_SYNC_RECOVERY_TIMER_SECS) - 1;
+
 /// /health returns unhealthy (503) when consensus_stuck_state has been
 /// populated for at least this long. Strictly less than
 /// HARD_RESET_STALL_SECS so operators see the stall *before* the node
@@ -670,6 +686,12 @@ pub struct App {
     /// behind the network and should reject tx submissions with
     /// TryAgainLater. Updated from lifecycle.rs envelope processing.
     max_observed_externalize_slot: AtomicU64,
+    /// Highest SCP slot observed from any post-signature-verified, non-self
+    /// envelope (including NonQuorum). Used to detect when verified peers
+    /// are ahead of us during recovery stalls. Updated in
+    /// `process_verified()` for `Verdict::Ok` envelopes only (verify-rejected
+    /// envelopes return early). Reset on ledger progress.
+    max_verified_scp_slot: AtomicU64,
     /// Number of ledger closes that contained at least one transaction.
     /// Mirrors stellar-core's `ledger.transaction.count` histogram `.count`.
     ledger_tx_count: AtomicU64,
@@ -1098,6 +1120,7 @@ impl App {
             lost_sync_count: AtomicU64::new(0),
             recovery_throttles: log_throttle::RecoveryLogThrottles::new(),
             max_observed_externalize_slot: AtomicU64::new(0),
+            max_verified_scp_slot: AtomicU64::new(0),
             ledger_tx_count: AtomicU64::new(0),
             max_tx_size_bytes: Arc::new(AtomicU32::new(
                 henyey_herder::flow_control::MAX_CLASSIC_TX_SIZE_BYTES,
@@ -1727,6 +1750,14 @@ impl App {
         self.archive_checkpoint_cache.set_urgent(true);
     }
 
+    /// Gap between the highest verified SCP slot from peers and our current
+    /// ledger. Returns 0 when no peer traffic has been observed.
+    pub(super) fn effective_peer_gap(&self, current_ledger: u32) -> u64 {
+        self.max_verified_scp_slot
+            .load(Ordering::Relaxed)
+            .saturating_sub(current_ledger as u64)
+    }
+
     /// Reset (or re-arm) the recovery attempt counter and snapshot the current
     /// SCP message count. The `seed` parameter sets the initial attempt value:
     /// - `0` for a full reset (after progress, hard reset, or successful catchup spawn)
@@ -1739,6 +1770,7 @@ impl App {
     /// concurrent reader that observes the new attempt count also sees the
     /// updated SCP baseline (or a fresher one).
     pub(super) fn reset_recovery_attempts(&self, seed: u64) {
+        self.max_verified_scp_slot.store(0, Ordering::Relaxed);
         self.recovery_baseline_scp_received.store(
             self.scp_messages_received.load(Ordering::Relaxed),
             Ordering::SeqCst,
@@ -2228,6 +2260,7 @@ impl App {
             post_catchup_hard_reset_total: self
                 .post_catchup_hard_reset_total
                 .load(Ordering::Relaxed),
+            max_verified_scp_slot: self.max_verified_scp_slot.load(Ordering::Relaxed),
         }
     }
 
@@ -2269,6 +2302,7 @@ impl App {
             post_catchup_hard_reset_total: self
                 .post_catchup_hard_reset_total
                 .load(Ordering::Relaxed),
+            max_verified_scp_slot: self.max_verified_scp_slot.load(Ordering::Relaxed),
             // Phase 3 cumulative counters.
             cumulative_apply_success: self.cumulative_apply_success.load(Ordering::Relaxed),
             cumulative_apply_failure: self.cumulative_apply_failure.load(Ordering::Relaxed),
@@ -9052,6 +9086,310 @@ mod tests {
         assert!(
             App::check_catchup_persist_pending(&db),
             "sentinel must persist across multiple checks (crash-idempotent)"
+        );
+    }
+
+    // ── Issue #2349: peer-ahead hard-reset escalation tests ─────────────
+
+    /// Helper: create a test App for #2349 tests.
+    async fn make_app_for_peer_ahead_test() -> (tempfile::TempDir, App) {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-test.db");
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
+        let app = App::new(config).await.unwrap();
+        (dir, app)
+    }
+
+    #[test]
+    fn test_peer_ahead_escalation_constants() {
+        // Verify constant arithmetic.
+        assert_eq!(
+            RECOVERY_HARD_RESET_ESCALATION_ATTEMPTS, 11,
+            "HARD_RESET_STALL_SECS(120) / OUT_OF_SYNC_RECOVERY_TIMER_SECS(10) - 1 = 11"
+        );
+        assert_eq!(
+            RECOVERY_HARD_RESET_ESCALATION_ATTEMPTS_NO_SCP, 17,
+            "(120 * 3/2) / 10 - 1 = 17"
+        );
+        assert_eq!(PEER_AHEAD_ESCALATION_THRESHOLD, 3);
+    }
+
+    #[tokio::test]
+    async fn test_effective_peer_gap_returns_correct_value() {
+        let (_dir, app) = make_app_for_peer_ahead_test().await;
+        assert_eq!(app.effective_peer_gap(100), 0, "no traffic → gap 0");
+
+        app.max_verified_scp_slot.store(110, Ordering::Relaxed);
+        assert_eq!(app.effective_peer_gap(100), 10, "110 - 100 = 10");
+
+        // When current_ledger > max_verified, saturating_sub clamps to 0.
+        assert_eq!(app.effective_peer_gap(200), 0, "200 > 110 → gap 0");
+    }
+
+    #[tokio::test]
+    async fn test_reset_recovery_attempts_clears_max_verified_scp_slot() {
+        let (_dir, app) = make_app_for_peer_ahead_test().await;
+        app.max_verified_scp_slot.store(999, Ordering::Relaxed);
+        app.scp_messages_received.store(42, Ordering::Relaxed);
+        app.reset_recovery_attempts(0);
+        assert_eq!(
+            app.max_verified_scp_slot.load(Ordering::Relaxed),
+            0,
+            "reset_recovery_attempts must clear max_verified_scp_slot"
+        );
+    }
+
+    /// Regression test for issue #2349: when archive is confirmed behind
+    /// AND peers are verified ahead (peer_gap >= 3) AND attempts >= 11,
+    /// the fast-track → trigger_recovery_catchup path should escalate to
+    /// hard reset instead of falling through to peer SCP request.
+    ///
+    /// We exercise this through out_of_sync_recovery (the public entry point)
+    /// configured to take the fast-track path (AtTip + SCP traffic).
+    #[tokio::test]
+    async fn test_trigger_recovery_archive_behind_peer_ahead_fires_hard_reset() {
+        let (_dir, app) = make_app_for_peer_ahead_test().await;
+        let current_ledger = 100u32;
+
+        // Set up the stall condition:
+        app.archive_confirmed_behind.store(true, Ordering::SeqCst);
+        app.max_verified_scp_slot.store(110, Ordering::Relaxed); // peer_gap = 10
+
+        // Set attempts so that after fetch_add(1) in out_of_sync_recovery,
+        // attempts == RECOVERY_HARD_RESET_ESCALATION_ATTEMPTS (11).
+        app.recovery_attempts_without_progress
+            .store(RECOVERY_HARD_RESET_ESCALATION_ATTEMPTS, Ordering::SeqCst);
+        app.recovery_baseline_ledger
+            .store(current_ledger as u64, Ordering::SeqCst);
+
+        // SCP traffic since reset → fast-track fires.
+        app.scp_messages_received.store(10, Ordering::Relaxed);
+        app.recovery_baseline_scp_received
+            .store(0, Ordering::SeqCst);
+
+        let result = app.out_of_sync_recovery(current_ledger).await;
+
+        // force_post_catchup_hard_reset returns None on test App (no self_arc),
+        // but we verify it was called by checking that recovery state was reset.
+        assert!(result.is_none());
+        // hard reset calls reset_recovery_attempts(0) which clears this:
+        assert_eq!(
+            app.max_verified_scp_slot.load(Ordering::Relaxed),
+            0,
+            "hard reset must clear max_verified_scp_slot"
+        );
+        // archive_confirmed_behind is cleared by force_post_catchup_hard_reset:
+        assert!(
+            !app.archive_confirmed_behind.load(Ordering::SeqCst),
+            "hard reset must clear archive_confirmed_behind"
+        );
+    }
+
+    /// Boundary: attempts just below threshold should NOT fire hard reset.
+    /// The fast-track path enters trigger_recovery_catchup but the
+    /// peer-ahead escalation check fails on attempts.
+    #[tokio::test]
+    async fn test_trigger_recovery_archive_behind_low_attempts_no_reset() {
+        let (_dir, app) = make_app_for_peer_ahead_test().await;
+        let current_ledger = 100u32;
+
+        app.archive_confirmed_behind.store(true, Ordering::SeqCst);
+        app.max_verified_scp_slot.store(110, Ordering::Relaxed);
+        // After fetch_add(1), attempts will be ESCALATION - 1 = 10.
+        app.recovery_attempts_without_progress.store(
+            RECOVERY_HARD_RESET_ESCALATION_ATTEMPTS - 1,
+            Ordering::SeqCst,
+        );
+        app.recovery_baseline_ledger
+            .store(current_ledger as u64, Ordering::SeqCst);
+        app.scp_messages_received.store(10, Ordering::Relaxed);
+        app.recovery_baseline_scp_received
+            .store(0, Ordering::SeqCst);
+
+        let _result = app.out_of_sync_recovery(current_ledger).await;
+
+        // Should NOT have fired hard reset (archive_confirmed_behind still set).
+        assert!(
+            app.archive_confirmed_behind.load(Ordering::SeqCst),
+            "low attempts must NOT trigger hard reset"
+        );
+    }
+
+    /// Boundary: peer_gap = 2 (below PEER_AHEAD_ESCALATION_THRESHOLD=3)
+    /// should NOT fire hard reset.
+    #[tokio::test]
+    async fn test_trigger_recovery_peer_gap_below_threshold_no_reset() {
+        let (_dir, app) = make_app_for_peer_ahead_test().await;
+        let current_ledger = 100u32;
+
+        app.archive_confirmed_behind.store(true, Ordering::SeqCst);
+        app.max_verified_scp_slot.store(102, Ordering::Relaxed); // peer_gap = 2
+        app.recovery_attempts_without_progress
+            .store(RECOVERY_HARD_RESET_ESCALATION_ATTEMPTS, Ordering::SeqCst);
+        app.recovery_baseline_ledger
+            .store(current_ledger as u64, Ordering::SeqCst);
+        app.scp_messages_received.store(10, Ordering::Relaxed);
+        app.recovery_baseline_scp_received
+            .store(0, Ordering::SeqCst);
+
+        let _result = app.out_of_sync_recovery(current_ledger).await;
+
+        assert!(
+            app.archive_confirmed_behind.load(Ordering::SeqCst),
+            "peer_gap below threshold must NOT trigger hard reset"
+        );
+    }
+
+    /// When archive is not confirmed behind (cold cache), should NOT fire
+    /// hard reset even with high attempts and peer gap.
+    #[tokio::test]
+    async fn test_trigger_recovery_cold_cache_not_confirmed_behind_no_reset() {
+        let (_dir, app) = make_app_for_peer_ahead_test().await;
+        let current_ledger = 100u32;
+
+        // archive_confirmed_behind defaults to false (cold cache)
+        app.max_verified_scp_slot.store(200, Ordering::Relaxed);
+        app.recovery_attempts_without_progress
+            .store(50, Ordering::SeqCst);
+        app.recovery_baseline_ledger
+            .store(current_ledger as u64, Ordering::SeqCst);
+        app.scp_messages_received.store(10, Ordering::Relaxed);
+        app.recovery_baseline_scp_received
+            .store(0, Ordering::SeqCst);
+
+        let _result = app.out_of_sync_recovery(current_ledger).await;
+
+        assert!(
+            !app.archive_confirmed_behind.load(Ordering::SeqCst),
+            "cold cache must NOT trigger hard reset"
+        );
+    }
+
+    /// Step 4 no-SCP path: archive behind + high attempts fires hard reset.
+    /// Uses current_ledger=0 so relation is AtTip (fresh herder latest_ext=0).
+    /// No SCP traffic → fast-track skipped → step 4 reached.
+    #[tokio::test]
+    async fn test_out_of_sync_at_tip_no_scp_archive_behind_fires_hard_reset() {
+        let (_dir, app) = make_app_for_peer_ahead_test().await;
+        let current_ledger = 0u32;
+
+        app.archive_confirmed_behind.store(true, Ordering::SeqCst);
+        app.max_verified_scp_slot.store(20, Ordering::Relaxed); // peer_gap = 20
+                                                                // After fetch_add(1), attempts = 17 (= threshold).
+        app.recovery_attempts_without_progress.store(
+            RECOVERY_HARD_RESET_ESCALATION_ATTEMPTS_NO_SCP,
+            Ordering::SeqCst,
+        );
+        app.recovery_baseline_ledger
+            .store(current_ledger as u64, Ordering::SeqCst);
+        // No SCP traffic since reset → scp_since_reset = 0 → step 4.
+        app.scp_messages_received.store(0, Ordering::Relaxed);
+        app.recovery_baseline_scp_received
+            .store(0, Ordering::SeqCst);
+
+        let result = app.out_of_sync_recovery(current_ledger).await;
+
+        assert!(result.is_none());
+        // Hard reset clears archive_confirmed_behind:
+        assert!(
+            !app.archive_confirmed_behind.load(Ordering::SeqCst),
+            "no-SCP hard reset must clear archive_confirmed_behind"
+        );
+    }
+
+    /// Step 4 no-SCP path: attempts one below threshold should NOT fire.
+    /// Uses current_ledger=0 for AtTip relation.
+    #[tokio::test]
+    async fn test_out_of_sync_at_tip_no_scp_low_attempts_no_reset() {
+        let (_dir, app) = make_app_for_peer_ahead_test().await;
+        let current_ledger = 0u32;
+
+        app.archive_confirmed_behind.store(true, Ordering::SeqCst);
+        app.max_verified_scp_slot.store(20, Ordering::Relaxed);
+        // After fetch_add(1), attempts = 16 (one below 17 threshold).
+        app.recovery_attempts_without_progress.store(
+            RECOVERY_HARD_RESET_ESCALATION_ATTEMPTS_NO_SCP - 1,
+            Ordering::SeqCst,
+        );
+        app.recovery_baseline_ledger
+            .store(current_ledger as u64, Ordering::SeqCst);
+        app.scp_messages_received.store(0, Ordering::Relaxed);
+        app.recovery_baseline_scp_received
+            .store(0, Ordering::SeqCst);
+
+        let _result = app.out_of_sync_recovery(current_ledger).await;
+
+        assert!(
+            app.archive_confirmed_behind.load(Ordering::SeqCst),
+            "low attempts must NOT trigger no-SCP hard reset"
+        );
+    }
+
+    /// Verify that cooldown blocks the peer-ahead hard reset path.
+    #[tokio::test]
+    async fn test_trigger_recovery_cooldown_blocks_reset() {
+        let (_dir, app) = make_app_for_peer_ahead_test().await;
+        let current_ledger = 100u32;
+
+        app.archive_confirmed_behind.store(true, Ordering::SeqCst);
+        app.max_verified_scp_slot.store(110, Ordering::Relaxed);
+        app.recovery_attempts_without_progress
+            .store(RECOVERY_HARD_RESET_ESCALATION_ATTEMPTS, Ordering::SeqCst);
+        app.recovery_baseline_ledger
+            .store(current_ledger as u64, Ordering::SeqCst);
+        app.scp_messages_received.store(10, Ordering::Relaxed);
+        app.recovery_baseline_scp_received
+            .store(0, Ordering::SeqCst);
+
+        // Set a recent hard reset to activate cooldown.
+        // NOTE: `is_hard_reset_on_cooldown` returns false when last == 0
+        // (meaning "never reset"), so we must use max(1, now_offset).
+        let now_offset = app.start_instant.elapsed().as_secs().max(1);
+        app.last_hard_reset_offset
+            .store(now_offset, Ordering::Relaxed);
+        app.last_hard_reset_gap.store(5, Ordering::Relaxed);
+
+        let _result = app.out_of_sync_recovery(current_ledger).await;
+
+        // Cooldown active → should NOT have fired hard reset.
+        assert!(
+            app.archive_confirmed_behind.load(Ordering::SeqCst),
+            "cooldown must block hard reset"
+        );
+    }
+
+    /// Verify that a single far-ahead non-quorum envelope does NOT cause
+    /// escalation by itself (needs archive_confirmed_behind + attempts).
+    #[tokio::test]
+    async fn test_single_far_ahead_non_quorum_insufficient_for_hard_reset() {
+        let (_dir, app) = make_app_for_peer_ahead_test().await;
+        let current_ledger = 100u32;
+
+        // Simulate a single far-ahead envelope updating max_verified_scp_slot.
+        app.max_verified_scp_slot.store(999, Ordering::Relaxed);
+        // archive_confirmed_behind is FALSE (default) → 4-way guard fails.
+        app.recovery_attempts_without_progress
+            .store(RECOVERY_HARD_RESET_ESCALATION_ATTEMPTS, Ordering::SeqCst);
+        app.recovery_baseline_ledger
+            .store(current_ledger as u64, Ordering::SeqCst);
+        app.scp_messages_received.store(10, Ordering::Relaxed);
+        app.recovery_baseline_scp_received
+            .store(0, Ordering::SeqCst);
+
+        let _result = app.out_of_sync_recovery(current_ledger).await;
+
+        // archive_confirmed_behind was never set → no hard reset.
+        assert!(
+            !app.archive_confirmed_behind.load(Ordering::SeqCst),
+            "single far-ahead envelope without archive_behind must NOT trigger reset"
+        );
+        // max_verified_scp_slot should remain untouched (no reset happened).
+        assert_eq!(
+            app.max_verified_scp_slot.load(Ordering::Relaxed),
+            999,
+            "no reset → max_verified_scp_slot preserved"
         );
     }
 }

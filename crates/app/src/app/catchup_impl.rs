@@ -1194,7 +1194,7 @@ impl App {
     /// Shared by both `maybe_start_buffered_catchup` (to populate
     /// `StuckSignals`) and `force_post_catchup_hard_reset` (to gate the
     /// actual reset). Single source of truth for cooldown policy — see #1843.
-    fn is_hard_reset_on_cooldown(&self, current_gap: u64) -> bool {
+    pub(super) fn is_hard_reset_on_cooldown(&self, current_gap: u64) -> bool {
         let last = self.last_hard_reset_offset.load(Ordering::Relaxed);
         if last == 0 {
             return false;
@@ -1319,7 +1319,7 @@ impl App {
     /// Progress-bound cooldown: min floor of 60s is always respected; the
     /// 300s max ceiling is overridden when the gap grows by ≥
     /// TX_SET_REQUEST_WINDOW since the last reset.
-    async fn force_post_catchup_hard_reset(
+    pub(super) async fn force_post_catchup_hard_reset(
         &self,
         current_ledger: u32,
         reason: HardResetReason,
