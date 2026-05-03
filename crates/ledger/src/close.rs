@@ -1312,25 +1312,25 @@ impl UpgradeContext {
                 }
             }
 
-            // Capture all mutations via checkpoint (mirrors stellar-core's child
-            // LedgerTxn + getChanges() pattern). This automatically includes
+            // Capture all mutations via capture_entry_changes (mirrors stellar-core's
+            // child LedgerTxn + getChanges() pattern). This automatically includes
             // config setting updates, frozen keys delta, window resize, and
             // state size recomputation.
-            let cp = ltx.change_checkpoint();
-            let (archival, memory_cost) = frame.apply_to(ltx)?;
+            let ((archival, memory_cost), entry_changes) = ltx.capture_entry_changes(|ltx| {
+                let (archival, memory_cost) = frame.apply_to(ltx)?;
 
-            // Parity: Upgrades.cpp:1468-1472 — state size recompute runs inside
-            // the config upgrade's child LedgerTxn scope when memory cost changes.
-            if memory_cost && protocol_version >= henyey_common::MIN_SOROBAN_PROTOCOL_VERSION {
-                crate::manager::handle_upgrade_affecting_soroban_state_size(
-                    ltx,
-                    protocol_version,
-                    closing_ledger_seq,
-                    soroban_state,
-                )?;
-            }
-
-            let entry_changes = ltx.entry_changes_since(cp);
+                // Parity: Upgrades.cpp:1468-1472 — state size recompute runs inside
+                // the config upgrade's child LedgerTxn scope when memory cost changes.
+                if memory_cost && protocol_version >= henyey_common::MIN_SOROBAN_PROTOCOL_VERSION {
+                    crate::manager::handle_upgrade_affecting_soroban_state_size(
+                        ltx,
+                        protocol_version,
+                        closing_ledger_seq,
+                        soroban_state,
+                    )?;
+                }
+                Ok((archival, memory_cost))
+            })?;
 
             state_archival_changed |= archival;
             memory_cost_params_changed |= memory_cost;

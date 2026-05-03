@@ -4260,6 +4260,14 @@ impl LedgerCloseContext<'_> {
         let mut version_upgrade_succeeded = prev_version == protocol_version;
 
         // Capture changes from version upgrade side effects (cost types for V25).
+        //
+        // Uses the raw change_checkpoint/entry_changes_since escape hatch
+        // because apply_version_upgrade_side_effects takes &mut self (the
+        // enclosing struct), which conflicts with the &mut self.ltx borrow
+        // that capture_entry_changes requires. See CloseLedgerState docs.
+        //
+        // Parity: stellar-core LedgerManagerImpl.cpp:1666-1685 wraps each
+        // upgrade in a per-upgrade try/catch that logs errors and continues.
         let version_changes = if prev_version != protocol_version {
             let cp = self.ltx.change_checkpoint();
             match self.apply_version_upgrade_side_effects(prev_version, protocol_version) {
@@ -4309,14 +4317,15 @@ impl LedgerCloseContext<'_> {
             if protocol_version_starts_from(protocol_version, ProtocolVersion::V10)
                 && did_reserve_increase
             {
-                let cp = self.ltx.change_checkpoint();
-                match crate::prepare_liabilities::prepare_liabilities(
-                    &mut self.ltx,
-                    protocol_version,
-                    new_reserve,
-                    self.close_data.ledger_seq,
-                ) {
-                    Ok(()) => self.ltx.entry_changes_since(cp),
+                match self.ltx.capture_entry_changes(|ltx| {
+                    crate::prepare_liabilities::prepare_liabilities(
+                        ltx,
+                        protocol_version,
+                        new_reserve,
+                        self.close_data.ledger_seq,
+                    )
+                }) {
+                    Ok(((), changes)) => changes,
                     Err(e) => {
                         tracing::error!(
                             new_reserve,

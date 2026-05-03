@@ -2043,10 +2043,10 @@ mod tests {
         };
         let mut ltx = CloseLedgerState::begin(snapshot, header, henyey_common::Hash256::ZERO, 101);
 
-        // Use checkpoint API (as the real caller does)
-        let cp = ltx.change_checkpoint();
-        let (state_archival_changed, _memory_cost_changed) = frame.apply_to(&mut ltx).unwrap();
-        let changes = ltx.entry_changes_since(cp);
+        // Use capture_entry_changes (as the real caller does)
+        let ((state_archival_changed, _memory_cost_changed), changes) = ltx
+            .capture_entry_changes(|ltx| frame.apply_to(ltx))
+            .unwrap();
 
         assert!(state_archival_changed);
 
@@ -2139,9 +2139,9 @@ mod tests {
         };
         let mut ltx = CloseLedgerState::begin(snapshot, header, henyey_common::Hash256::ZERO, 101);
 
-        let cp = ltx.change_checkpoint();
-        let (state_archival_changed, _) = frame.apply_to(&mut ltx).unwrap();
-        let changes = ltx.entry_changes_since(cp);
+        let ((state_archival_changed, _), changes) = ltx
+            .capture_entry_changes(|ltx| frame.apply_to(ltx))
+            .unwrap();
 
         assert!(state_archival_changed);
         // Only 2 entries: STATE + UPDATED for StateArchival (no window changes)

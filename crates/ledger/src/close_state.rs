@@ -12,14 +12,23 @@
 //!
 //! # Checkpoint API
 //!
-//! Per-upgrade entry change extraction uses explicit checkpoints rather than
-//! nested transaction scopes:
+//! Per-upgrade entry change extraction uses [`CloseLedgerState::capture_entry_changes`],
+//! which wraps the checkpoint lifecycle in a closure to prevent the class of bug
+//! where mutations happen after changes have been extracted (see #2268):
 //!
 //! ```text
-//! let cp = state.change_checkpoint();
-//! // ... apply upgrade ...
-//! let changes = state.entry_changes_since(cp);
+//! let (result, changes) = state.capture_entry_changes(|s| {
+//!     // ... apply upgrade ...
+//!     Ok(())
+//! })?;
 //! ```
+//!
+//! **Not transactional**: on `Err`, partial mutations remain in the delta.
+//! Only the `LedgerEntryChanges` diff return is suppressed.
+//!
+//! For borrow-conflict cases that cannot use the closure form, the low-level
+//! `change_checkpoint()` + `entry_changes_since()` pair is available as a
+//! `pub(crate)` escape hatch.
 
 use crate::delta::{DeltaCategorization, EntryChange, LedgerDelta};
 use crate::snapshot::SnapshotHandle;
@@ -39,7 +48,7 @@ use stellar_xdr::curr::{
 /// `entry_changes_since` can diff the current state against the checkpoint
 /// and detect all modifications — including in-place updates to pre-existing
 /// entries. This mirrors stellar-core's child LedgerTxn + getChanges() pattern.
-pub struct ChangeCheckpoint {
+pub(crate) struct ChangeCheckpoint {
     /// Snapshot of delta entry values at checkpoint time.
     entries: HashMap<LedgerKey, EntryChange>,
     /// Keys in insertion order at checkpoint time, for deterministic
@@ -243,14 +252,44 @@ impl CloseLedgerState {
     // Checkpoint API for upgrade meta capture
     // ------------------------------------------------------------------
 
+    /// Run `f` inside a checkpoint scope and return both its result and the
+    /// [`LedgerEntryChanges`] produced by mutations inside the closure.
+    ///
+    /// This is the **recommended API** for capturing per-upgrade entry changes.
+    /// It ensures that `change_checkpoint()` and `entry_changes_since()` are
+    /// always paired correctly, preventing the class of bug where mutations
+    /// happen after the changes have already been extracted (see #2268).
+    ///
+    /// **Entry changes only.** This captures ledger entry creates/updates/deletes.
+    /// Header, fee-pool, and coin deltas are NOT captured.
+    ///
+    /// **Not transactional.** If `f` returns `Err`, partial mutations made by
+    /// the closure remain in the delta — the helper only controls whether the
+    /// `LedgerEntryChanges` diff is returned. It does NOT roll back mutations.
+    /// A future child-delta commit/abort mechanism would address this gap.
+    pub(crate) fn capture_entry_changes<F, T>(&mut self, f: F) -> Result<(T, LedgerEntryChanges)>
+    where
+        F: FnOnce(&mut Self) -> Result<T>,
+    {
+        let cp = self.change_checkpoint();
+        let result = f(self)?;
+        Ok((result, self.entry_changes_since(cp)))
+    }
+
     /// Capture the current delta state as a checkpoint.
+    ///
+    /// **Escape hatch** — prefer [`capture_entry_changes`] for new code.
+    /// This low-level method is only needed when borrow conflicts prevent
+    /// using the closure form (e.g., `apply_upgrades` version-upgrade path
+    /// in `manager.rs` where `&mut self` on the enclosing struct conflicts
+    /// with `&mut self.ltx` in the closure).
     ///
     /// Used before an upgrade sub-phase to snapshot the "before" state, so that
     /// [`entry_changes_since`] can diff the current state against it and detect
     /// all modifications — including in-place updates to pre-existing entries.
     ///
     /// Mirrors stellar-core's child LedgerTxn creation before each upgrade scope.
-    pub fn change_checkpoint(&self) -> ChangeCheckpoint {
+    pub(crate) fn change_checkpoint(&self) -> ChangeCheckpoint {
         ChangeCheckpoint {
             entries: self.current.snapshot_changes(),
             key_order: self.current.key_order(),
@@ -259,13 +298,16 @@ impl CloseLedgerState {
 
     /// Extract all entry changes made since the given checkpoint.
     ///
+    /// **Escape hatch** — prefer [`capture_entry_changes`] for new code.
+    /// See [`change_checkpoint`] for when this low-level API is appropriate.
+    ///
     /// Performs a snapshot-and-diff: compares the current delta state against
     /// the checkpoint snapshot to detect new entries, modified pre-existing
     /// entries, and deleted entries. This matches stellar-core's
     /// `LedgerTxn::getChanges()` parent-vs-child diff semantics.
     ///
     /// Returns an XDR `LedgerEntryChanges` suitable for upgrade metadata.
-    pub fn entry_changes_since(&self, cp: ChangeCheckpoint) -> LedgerEntryChanges {
+    pub(crate) fn entry_changes_since(&self, cp: ChangeCheckpoint) -> LedgerEntryChanges {
         let mut changes: Vec<LedgerEntryChange> = Vec::new();
 
         // Phase 1: Process all keys currently in the delta (insertion order).
@@ -925,5 +967,99 @@ mod tests {
             0,
             "Expected no changes for unmodified entry"
         );
+    }
+
+    #[test]
+    fn test_capture_entry_changes_success() {
+        let snapshot = make_empty_snapshot(100);
+        let header = LedgerHeader {
+            ledger_version: 25,
+            ledger_seq: 100,
+            ..Default::default()
+        };
+        let mut state =
+            CloseLedgerState::begin(snapshot, header, henyey_common::Hash256::ZERO, 101);
+
+        let (result, changes) = state
+            .capture_entry_changes(|s| {
+                let entry = make_test_account_entry(1, 1000, 101);
+                s.record_create(entry)?;
+                Ok(42u32)
+            })
+            .unwrap();
+
+        assert_eq!(result, 42);
+        assert_eq!(changes.0.len(), 1);
+        assert!(matches!(&changes.0[0], LedgerEntryChange::Created(_)));
+    }
+
+    #[test]
+    fn test_capture_entry_changes_error_propagation() {
+        let snapshot = make_empty_snapshot(100);
+        let header = LedgerHeader {
+            ledger_version: 25,
+            ledger_seq: 100,
+            ..Default::default()
+        };
+        let mut state =
+            CloseLedgerState::begin(snapshot, header, henyey_common::Hash256::ZERO, 101);
+
+        let result = state.capture_entry_changes(|_s| -> Result<()> {
+            Err(crate::error::LedgerError::Internal("test error".into()).into())
+        });
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_capture_entry_changes_with_generic_return() {
+        let snapshot = make_empty_snapshot(100);
+        let header = LedgerHeader {
+            ledger_version: 25,
+            ledger_seq: 100,
+            ..Default::default()
+        };
+        let mut state =
+            CloseLedgerState::begin(snapshot, header, henyey_common::Hash256::ZERO, 101);
+
+        let ((flag_a, flag_b), changes) = state
+            .capture_entry_changes(|s| {
+                let entry = make_test_account_entry(1, 1000, 101);
+                s.record_create(entry)?;
+                Ok((true, false))
+            })
+            .unwrap();
+
+        assert!(flag_a);
+        assert!(!flag_b);
+        assert_eq!(changes.0.len(), 1);
+    }
+
+    #[test]
+    fn test_capture_entry_changes_not_transactional() {
+        // Verifies that on Err, partial mutations REMAIN in the delta.
+        // capture_entry_changes is NOT a rollback mechanism.
+        let snapshot = make_empty_snapshot(100);
+        let header = LedgerHeader {
+            ledger_version: 25,
+            ledger_seq: 100,
+            ..Default::default()
+        };
+        let mut state =
+            CloseLedgerState::begin(snapshot, header, henyey_common::Hash256::ZERO, 101);
+
+        let key = make_account_key(1);
+
+        // The closure creates an entry then returns Err.
+        let result = state.capture_entry_changes(|s| -> Result<()> {
+            let entry = make_test_account_entry(1, 1000, 101);
+            s.record_create(entry)?;
+            Err(crate::error::LedgerError::Internal("deliberate error".into()).into())
+        });
+        assert!(result.is_err());
+
+        // The entry should still be present in the delta despite the error.
+        let entry = state.get_entry(&key).unwrap();
+        assert!(entry.is_some(), "Entry should persist in delta after Err");
     }
 }

@@ -89,7 +89,7 @@ pub use close::{
     LedgerCloseData, LedgerClosePerf, LedgerCloseResult, LedgerCloseStats, SorobanPhaseStructure,
     SortState, TransactionSetVariant, TxWithFee, UpgradeContext,
 };
-pub use close_state::{ChangeCheckpoint, CloseLedgerState};
+pub use close_state::CloseLedgerState;
 pub use config_upgrade::{ConfigUpgradeSetFrame, ConfigUpgradeValidity};
 pub use delta::{EntryChange, LedgerDelta};
 pub use error::LedgerError;
