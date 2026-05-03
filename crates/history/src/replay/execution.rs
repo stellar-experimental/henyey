@@ -2177,12 +2177,15 @@ mod tests {
         let (entry_d, key_d) = make_data_entry(0x02, ContractDataDurability::Persistent);
         // E: Persistent, NOT expired (live_until=200 >= ledger_seq=100)
         let (entry_e, key_e) = make_data_entry(0x03, ContractDataDurability::Persistent);
+        // F: Temporary, NOT expired (live_until=200 >= ledger_seq=100) — control
+        let (entry_f, key_f) = make_data_entry(0x03, ContractDataDurability::Temporary);
 
         let ttl_a = make_ttl_entry(&key_a, 99);
         let ttl_b = make_ttl_entry(&key_b, 99);
         let ttl_c = make_ttl_entry(&key_c, 99);
         let ttl_d = make_ttl_entry(&key_d, 99);
         let ttl_e = make_ttl_entry(&key_e, 200);
+        let ttl_f = make_ttl_entry(&key_f, 200);
 
         // --- Config entries needed for replay ---
         let cost_param = ContractCostParamEntry {
@@ -2228,7 +2231,8 @@ mod tests {
         let all_entries: Vec<LedgerEntry> = config_entries
             .into_iter()
             .chain(vec![
-                entry_a, entry_b, entry_c, entry_d, entry_e, ttl_a, ttl_b, ttl_c, ttl_d, ttl_e,
+                entry_a, entry_b, entry_c, entry_d, entry_e, entry_f, ttl_a, ttl_b, ttl_c, ttl_d,
+                ttl_e, ttl_f,
             ])
             .collect();
 
@@ -2318,7 +2322,7 @@ mod tests {
             "TTL for entry D should be evicted from live bucket list"
         );
 
-        // --- Assertion 2: Control entry E survives ---
+        // --- Assertion 2: Control entries E and F survive ---
         assert!(
             bucket_list.get(&key_e).unwrap().is_some(),
             "entry E (persistent, NOT expired) should still be in live bucket list"
@@ -2326,6 +2330,14 @@ mod tests {
         assert!(
             bucket_list.get(&ttl_key_for(&key_e)).unwrap().is_some(),
             "TTL for entry E should still be in live bucket list"
+        );
+        assert!(
+            bucket_list.get(&key_f).unwrap().is_some(),
+            "entry F (temporary, NOT expired) should still be in live bucket list"
+        );
+        assert!(
+            bucket_list.get(&ttl_key_for(&key_f)).unwrap().is_some(),
+            "TTL for entry F should still be in live bucket list"
         );
 
         // --- Assertion 3: Persistent entries archived to hot archive ---
@@ -2349,7 +2361,11 @@ mod tests {
         );
         assert!(
             hot_archive.get(&key_e).unwrap().is_none(),
-            "entry E (non-expired) must NOT be in hot archive"
+            "entry E (non-expired persistent) must NOT be in hot archive"
+        );
+        assert!(
+            hot_archive.get(&key_f).unwrap().is_none(),
+            "entry F (non-expired temporary) must NOT be in hot archive"
         );
 
         // --- Assertion 5: Eviction iterator updated ---
