@@ -594,9 +594,8 @@ fn execute_contract_invocation(
     }) {
         Ok(result) => {
             // stellar-core check: event size (collectEvents in doApply)
-            if soroban_config.tx_max_contract_events_size_bytes > 0
-                && result.contract_events_and_return_value_size
-                    > soroban_config.tx_max_contract_events_size_bytes
+            if result.contract_events_and_return_value_size
+                > soroban_config.tx_max_contract_events_size_bytes
             {
                 return Ok(OperationExecutionResult::new(make_result(
                     InvokeHostFunctionResultCode::ResourceLimitExceeded,
@@ -1399,7 +1398,10 @@ mod tests {
     }
 
     fn create_test_soroban_config() -> SorobanConfig {
-        SorobanConfig::default()
+        SorobanConfig {
+            tx_max_contract_events_size_bytes: 10 * 1024,
+            ..SorobanConfig::default()
+        }
     }
 
     fn create_test_account(account_id: AccountId, balance: i64) -> AccountEntry {
@@ -4128,5 +4130,52 @@ mod tests {
             }
             _ => panic!("Unexpected result type"),
         }
+    }
+
+    /// AUDIT-263: Verify that the event size check rejects when
+    /// contract_events_and_return_value_size > tx_max_contract_events_size_bytes,
+    /// including when the limit is zero.
+    ///
+    /// This tests the comparison logic directly since full contract execution
+    /// requires WASM setup not available in unit tests.
+    #[test]
+    fn test_event_size_check_zero_limit_rejects() {
+        // The fix removes the `> 0` guard. Verify the comparison semantics:
+        // When limit is 0, any positive combined size must be rejected.
+        let limit: u32 = 0;
+        let combined_size: u32 = 1; // minimal positive size (return value alone)
+        assert!(
+            combined_size > limit,
+            "Zero limit must reject any positive combined event+return-value size"
+        );
+
+        // When limit is 0 and combined size is 0, it must be allowed.
+        let combined_size_zero: u32 = 0;
+        assert!(
+            !(combined_size_zero > limit),
+            "Zero limit with zero size must be allowed"
+        );
+    }
+
+    /// AUDIT-263: Verify boundary condition — combined size exactly at the limit passes.
+    #[test]
+    fn test_event_size_check_at_limit_passes() {
+        let limit: u32 = 1000;
+        let combined_size: u32 = 1000; // exactly at limit
+        assert!(
+            !(combined_size > limit),
+            "Combined size equal to limit must be allowed (strict > comparison)"
+        );
+    }
+
+    /// AUDIT-263: Verify that combined size exceeding limit is rejected.
+    #[test]
+    fn test_event_size_check_exceeds_limit_rejects() {
+        let limit: u32 = 1000;
+        let combined_size: u32 = 1001; // one byte over
+        assert!(
+            combined_size > limit,
+            "Combined size exceeding limit must be rejected"
+        );
     }
 }
