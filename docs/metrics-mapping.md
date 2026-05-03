@@ -35,7 +35,7 @@ Metrics with the `stellar_` prefix that directly mirror stellar-core Medida coun
 | `HERDER_STATE` | `stellar_herder_state` | gauge | `HerderImpl::mState` |
 | `HERDER_PENDING_ENVELOPES` | `stellar_herder_pending_envelopes` | gauge | `PendingEnvelopes` count |
 | `HERDER_CACHED_TX_SETS` | `stellar_herder_cached_tx_sets` | gauge | Cached transaction set count |
-| `HERDER_TX_QUEUE_ACCOUNTS` | `stellar_herder_tx_queue_accounts` | gauge | `TransactionQueue::mAccountStates` size |
+| `HERDER_TX_QUEUE_ACCOUNTS` | `stellar_herder_tx_queue_accounts` | gauge | `mAccountStates` entries with a queued transaction (fee-source-only excluded) |
 | `HERDER_TX_QUEUE_BANNED` | `stellar_herder_tx_queue_banned` | gauge | `TransactionQueue::mBannedTransactions` size |
 | `HERDER_TX_QUEUE_SEEN` | `stellar_herder_tx_queue_seen` | gauge | `TransactionQueue::mKnownTxHashes` size |
 | `HERDER_PENDING_TXS_AGE0` | `stellar_herder_pending_txs_age0` | gauge | Pending txs at age 0 (current slot) |
