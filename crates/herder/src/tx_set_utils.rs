@@ -3657,6 +3657,79 @@ mod tests {
         );
     }
 
+    /// Test that a fee-bump tx signed by a key NOT in the fee source's signer
+    /// set is rejected by tx-set validation. This exercises the outer auth
+    /// failure path at `validate_fee_bump_for_tx_set` (line ~430).
+    ///
+    /// Regression coverage for #2270 (AUDIT-245): since apply-time skips outer
+    /// re-validation, tx-set validation MUST catch invalid outer signatures.
+    #[test]
+    fn test_validate_fee_bump_invalid_outer_signature_rejected() {
+        use stellar_xdr::curr::{
+            FeeBumpTransaction, FeeBumpTransactionEnvelope, FeeBumpTransactionExt,
+            FeeBumpTransactionInnerTx,
+        };
+
+        let inner_secret = CryptoSecretKey::from_seed(&[42u8; 32]);
+        let fee_secret = CryptoSecretKey::from_seed(&[43u8; 32]);
+        let wrong_signer = CryptoSecretKey::from_seed(&[99u8; 32]);
+
+        let inner_pk = *inner_secret.public_key().as_bytes();
+        let fee_pk = *fee_secret.public_key().as_bytes();
+        let wrong_pk = *wrong_signer.public_key().as_bytes();
+
+        // Build a valid signed inner envelope
+        let inner_env = match make_signed_envelope(&inner_secret, 100, 1) {
+            TransactionEnvelope::Tx(e) => e,
+            _ => unreachable!(),
+        };
+
+        // Build fee-bump with fee_source = fee_secret's public key
+        let fee_source = MuxedAccount::Ed25519(Uint256(fee_pk));
+        let fee_bump_envelope = TransactionEnvelope::TxFeeBump(FeeBumpTransactionEnvelope {
+            tx: FeeBumpTransaction {
+                fee_source,
+                fee: 200,
+                inner_tx: FeeBumpTransactionInnerTx::Tx(inner_env),
+                ext: FeeBumpTransactionExt::V0,
+            },
+            signatures: VecM::default(),
+        });
+
+        // Sign the outer hash with `wrong_signer` (NOT the fee source)
+        let network_id = NetworkId::testnet();
+        let outer_hash = TransactionFrame::hash_envelope(&fee_bump_envelope, &network_id).unwrap();
+        let sig = sign_hash(&wrong_signer, &outer_hash);
+        let hint = SignatureHint([wrong_pk[28], wrong_pk[29], wrong_pk[30], wrong_pk[31]]);
+        let decorated = DecoratedSignature {
+            hint,
+            signature: XdrSignature(sig.0.to_vec().try_into().unwrap()),
+        };
+
+        let tx = match fee_bump_envelope {
+            TransactionEnvelope::TxFeeBump(mut env) => {
+                env.signatures = vec![decorated].try_into().unwrap();
+                TransactionEnvelope::TxFeeBump(env)
+            }
+            _ => unreachable!(),
+        };
+
+        let ctx = test_context();
+        let bounds = CloseTimeBounds::exact();
+
+        // Both accounts exist so we pass earlier checks and reach outer auth
+        let mut account_provider = MockAccountProvider::new();
+        account_provider.add_account(inner_pk, 0);
+        account_provider.add_account(fee_pk, 0);
+
+        let invalid = get_invalid_tx_list(&[tx], &ctx, &bounds, None, Some(&account_provider));
+        assert_eq!(
+            invalid.len(),
+            1,
+            "fee-bump signed by key not in fee source's signer set must be rejected"
+        );
+    }
+
     /// Test that a tx with an extra signer in V2 preconditions passes when
     /// the extra signer's signature is present.
     #[test]
