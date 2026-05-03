@@ -57,10 +57,8 @@ impl HerderCallback for App {
         let runtime_handle = tokio::runtime::Handle::current();
         self.set_applying_ledger(true);
 
-        let join_handle = tokio::task::spawn_blocking(move || {
-            lm.close_ledger(close_data, Some(runtime_handle))
-                .map_err(|e| e.to_string())
-        });
+        let join_handle =
+            tokio::task::spawn_blocking(move || lm.close_ledger(close_data, Some(runtime_handle)));
 
         let mut pending = PendingLedgerClose {
             handle: join_handle,

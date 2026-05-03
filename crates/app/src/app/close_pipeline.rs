@@ -26,7 +26,7 @@ enum State {
 /// Event produced when [`ClosePipeline::poll_completion`] resolves.
 pub(super) enum PipelineEvent {
     /// The close handle resolved. Caller must follow with [`ClosePipeline::take_close`].
-    CloseComplete(Box<Result<Result<LedgerCloseResult, String>, JoinError>>),
+    CloseComplete(Box<Result<Result<LedgerCloseResult, henyey_ledger::LedgerError>, JoinError>>),
     /// The persist handle resolved. Caller must follow with [`ClosePipeline::take_persist`].
     PersistComplete(Result<(), JoinError>),
 }
@@ -217,8 +217,11 @@ mod tests {
     fn dummy_close(seq: u32) -> PendingLedgerClose {
         use henyey_common::Hash256;
 
-        let handle: JoinHandle<Result<henyey_ledger::LedgerCloseResult, String>> =
-            tokio::task::spawn_blocking(|| Err("dummy".to_string()));
+        let handle: JoinHandle<
+            Result<henyey_ledger::LedgerCloseResult, henyey_ledger::LedgerError>,
+        > = tokio::task::spawn_blocking(|| {
+            Err(henyey_ledger::LedgerError::Internal("dummy".to_string()))
+        });
         PendingLedgerClose {
             handle,
             ledger_seq: seq,
@@ -234,11 +237,12 @@ mod tests {
         use henyey_common::Hash256;
 
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
-        let handle: JoinHandle<Result<henyey_ledger::LedgerCloseResult, String>> =
-            tokio::task::spawn_blocking(move || {
-                rx.blocking_recv().ok();
-                Err("dummy".to_string())
-            });
+        let handle: JoinHandle<
+            Result<henyey_ledger::LedgerCloseResult, henyey_ledger::LedgerError>,
+        > = tokio::task::spawn_blocking(move || {
+            rx.blocking_recv().ok();
+            Err(henyey_ledger::LedgerError::Internal("dummy".to_string()))
+        });
         let pending = PendingLedgerClose {
             handle,
             ledger_seq: seq,

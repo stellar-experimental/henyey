@@ -2987,7 +2987,9 @@ mod tests {
     /// The caller provides the blocking task handle (which determines the
     /// close outcome — success, error, or panic) and a sequence number.
     fn make_test_pending_close(
-        handle: tokio::task::JoinHandle<Result<henyey_ledger::LedgerCloseResult, String>>,
+        handle: tokio::task::JoinHandle<
+            Result<henyey_ledger::LedgerCloseResult, henyey_ledger::LedgerError>,
+        >,
         seq: u32,
     ) -> PendingLedgerClose {
         PendingLedgerClose {
@@ -3856,7 +3858,11 @@ mod tests {
 
         // Simulate a failed close result.
         let pending = PendingLedgerClose {
-            handle: tokio::task::spawn_blocking(|| Err("simulated error".to_string())),
+            handle: tokio::task::spawn_blocking(|| {
+                Err(henyey_ledger::LedgerError::Internal(
+                    "simulated error".to_string(),
+                ))
+            }),
             ledger_seq: 1,
             tx_set: henyey_herder::TransactionSet::new_legacy(
                 henyey_common::Hash256::ZERO,
@@ -3956,9 +3962,12 @@ mod tests {
 
         // Simulate a hash mismatch error.
         let pending = PendingLedgerClose {
-            handle: tokio::task::spawn_blocking(
-                || Err("previous ledger hash mismatch".to_string()),
-            ),
+            handle: tokio::task::spawn_blocking(|| {
+                Err(henyey_ledger::LedgerError::HashMismatch {
+                    expected: "abc".into(),
+                    actual: "def".into(),
+                })
+            }),
             ledger_seq: 1,
             tx_set: henyey_herder::TransactionSet::new_legacy(
                 henyey_common::Hash256::ZERO,
@@ -4005,7 +4014,11 @@ mod tests {
 
         // Simulate a failed close result.
         let pending = PendingLedgerClose {
-            handle: tokio::task::spawn_blocking(|| Err("simulated error".to_string())),
+            handle: tokio::task::spawn_blocking(|| {
+                Err(henyey_ledger::LedgerError::Internal(
+                    "simulated error".to_string(),
+                ))
+            }),
             ledger_seq: 42,
             tx_set: henyey_herder::TransactionSet::new_legacy(
                 henyey_common::Hash256::ZERO,
@@ -6889,7 +6902,11 @@ mod tests {
         app.set_applying_ledger(true);
 
         let mut pending = make_test_pending_close(
-            tokio::task::spawn_blocking(|| Err("simulated error".to_string())),
+            tokio::task::spawn_blocking(|| {
+                Err(henyey_ledger::LedgerError::Internal(
+                    "simulated error".to_string(),
+                ))
+            }),
             1,
         );
         let join_result = (&mut pending.handle).await;

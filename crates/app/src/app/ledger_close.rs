@@ -1909,10 +1909,8 @@ impl App {
         self.set_applying_ledger(true);
 
         let dispatch_time = std::time::Instant::now();
-        let join_handle = tokio::task::spawn_blocking(move || {
-            lm.close_ledger(close_data, Some(runtime_handle))
-                .map_err(|e| e.to_string())
-        });
+        let join_handle =
+            tokio::task::spawn_blocking(move || lm.close_ledger(close_data, Some(runtime_handle)));
 
         Some(PendingLedgerClose {
             handle: join_handle,
@@ -1943,7 +1941,10 @@ impl App {
     pub(super) async fn handle_close_complete(
         &self,
         pending: PendingLedgerClose,
-        join_result: Result<std::result::Result<LedgerCloseResult, String>, tokio::task::JoinError>,
+        join_result: Result<
+            std::result::Result<LedgerCloseResult, henyey_ledger::LedgerError>,
+            tokio::task::JoinError,
+        >,
         finalize: super::persist::LedgerCloseFinalizer,
     ) -> bool {
         // Time the full close-complete body (#1759 diagnostics).
@@ -1967,7 +1968,10 @@ impl App {
     async fn handle_close_complete_inner(
         &self,
         pending: PendingLedgerClose,
-        join_result: Result<std::result::Result<LedgerCloseResult, String>, tokio::task::JoinError>,
+        join_result: Result<
+            std::result::Result<LedgerCloseResult, henyey_ledger::LedgerError>,
+            tokio::task::JoinError,
+        >,
         finalize: super::persist::LedgerCloseFinalizer,
     ) -> bool {
         // Per-phase timing inside handle_close_complete (#1775 Phase 1).
@@ -1992,7 +1996,7 @@ impl App {
         let result = match join_result {
             Ok(Ok(result)) => result,
             Ok(Err(e)) => {
-                let is_hash_mismatch = e.contains("hash mismatch");
+                let is_hash_mismatch = matches!(e, henyey_ledger::LedgerError::HashMismatch { .. });
                 tracing::error!(
                     ledger_seq = pending.ledger_seq,
                     error = %e,

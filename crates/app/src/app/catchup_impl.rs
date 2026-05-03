@@ -859,8 +859,7 @@ impl App {
                     )
                     .await
             }
-        }
-        .map_err(|e| anyhow::anyhow!("Catchup failed: {}", e))?;
+        }?;
 
         // Drop the catchup manager (and its meta callback) before restoring
         // the MetaStreamManager. The callback holds an Arc clone.
@@ -2410,12 +2409,19 @@ impl App {
                     self.catchup_fatal_failure.store(true, Ordering::SeqCst);
                 } else {
                     tracing::error!(error = %err, "{} catchup failed", label);
-                    // If the error mentions hash mismatch, the local state
+                    // If the error is a typed hash mismatch, the local state
                     // diverged from the archive (e.g., missed a protocol
                     // upgrade). Flag the next catchup to do a full
                     // bucket-apply to rebuild state from scratch.
-                    let err_str = err.to_string();
-                    if err_str.contains("hash mismatch") || err_str.contains("Hash mismatch") {
+                    let is_hash_mismatch = err
+                        .downcast_ref::<henyey_history::HistoryError>()
+                        .is_some_and(|e| e.is_hash_mismatch())
+                        || err
+                            .downcast_ref::<henyey_ledger::LedgerError>()
+                            .is_some_and(|e| {
+                                matches!(e, henyey_ledger::LedgerError::HashMismatch { .. })
+                            });
+                    if is_hash_mismatch {
                         tracing::warn!(
                             "Hash mismatch detected — next catchup will use full bucket-apply"
                         );

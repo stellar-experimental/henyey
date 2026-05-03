@@ -230,6 +230,17 @@ impl HistoryError {
                 | HistoryError::InvalidTxSetHash { .. }
                 | HistoryError::InvalidSequence { .. }
                 | HistoryError::CorruptHeader { .. }
+                | HistoryError::Ledger(henyey_ledger::LedgerError::HashMismatch { .. })
+        )
+    }
+
+    /// Returns `true` if this error represents a hash mismatch (bucket list,
+    /// ledger header, or tx set) that indicates state divergence.
+    pub fn is_hash_mismatch(&self) -> bool {
+        matches!(
+            self,
+            HistoryError::Ledger(henyey_ledger::LedgerError::HashMismatch { .. })
+                | HistoryError::InvalidTxSetHash { .. }
         )
     }
 }
@@ -280,5 +291,53 @@ mod tests {
             got: 6
         }
         .is_fatal_catchup_failure());
+    }
+
+    #[test]
+    fn test_ledger_hash_mismatch_is_fatal() {
+        let err = HistoryError::Ledger(henyey_ledger::LedgerError::HashMismatch {
+            expected: "abc".into(),
+            actual: "def".into(),
+        });
+        assert!(
+            err.is_fatal_catchup_failure(),
+            "Ledger(HashMismatch) should be a fatal catchup failure"
+        );
+    }
+
+    #[test]
+    fn test_is_hash_mismatch() {
+        // Positive: LedgerError::HashMismatch via Ledger variant
+        let err = HistoryError::Ledger(henyey_ledger::LedgerError::HashMismatch {
+            expected: "abc".into(),
+            actual: "def".into(),
+        });
+        assert!(err.is_hash_mismatch());
+
+        // Positive: InvalidTxSetHash
+        let err = HistoryError::InvalidTxSetHash {
+            ledger: 5,
+            info: Box::new(TxSetHashMismatchInfo {
+                expected: Hash256::ZERO,
+                actual: Hash256::ZERO,
+                header_ledger_version: 0,
+                header_prev_hash: Hash256::ZERO,
+                tx_set_prev_hash: Hash256::ZERO,
+                tx_set_format: "classic",
+            }),
+        };
+        assert!(err.is_hash_mismatch());
+
+        // Negative: CatchupFailed is NOT a hash mismatch
+        let err = HistoryError::CatchupFailed("some other error".into());
+        assert!(!err.is_hash_mismatch());
+
+        // Negative: VerificationFailed is NOT a hash mismatch (even if text mentions it)
+        let err = HistoryError::VerificationFailed("hash mismatch at ledger 5".into());
+        assert!(!err.is_hash_mismatch());
+
+        // Negative: Other LedgerError variants are NOT hash mismatches
+        let err = HistoryError::Ledger(henyey_ledger::LedgerError::Internal("bug".into()));
+        assert!(!err.is_hash_mismatch());
     }
 }

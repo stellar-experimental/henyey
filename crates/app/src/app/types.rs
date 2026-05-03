@@ -555,8 +555,9 @@ impl PendingCatchupResult {
 /// [`App::handle_close_complete`] once the blocking close finishes.
 pub(super) struct PendingLedgerClose {
     /// Join handle for the `spawn_blocking` task.
-    pub handle:
-        tokio::task::JoinHandle<std::result::Result<henyey_ledger::LedgerCloseResult, String>>,
+    pub handle: tokio::task::JoinHandle<
+        std::result::Result<henyey_ledger::LedgerCloseResult, henyey_ledger::LedgerError>,
+    >,
     /// Sequence number being closed.
     pub ledger_seq: u32,
     /// The transaction set used for closing.

@@ -320,11 +320,7 @@ impl CatchupManager {
 
             let result = ledger_manager.close_ledger(close_data, None).map_err(|e| {
                 if matches!(e, henyey_ledger::LedgerError::HashMismatch { .. }) {
-                    HistoryError::VerificationFailed(format!(
-                        "Header hash mismatch at ledger {}: {}",
-                        data.header().ledger_seq,
-                        e
-                    ))
+                    HistoryError::Ledger(e)
                 } else {
                     HistoryError::CatchupFailed(format!(
                         "close_ledger failed at ledger {}: {}",
@@ -426,6 +422,10 @@ mod tests {
                 ledger: 100,
                 detail: "bad encoding".to_string(),
             },
+            HistoryError::Ledger(henyey_ledger::LedgerError::HashMismatch {
+                expected: "abc".into(),
+                actual: "def".into(),
+            }),
         ];
         for err in &fatal_errors {
             assert!(err.is_fatal_catchup_failure(), "expected fatal: {}", err);
