@@ -780,7 +780,15 @@ impl OverlayManager {
                 } else {
                     state.metrics.flood_duplicate_recv.inc();
                 }
-                if !unique {
+                // SCP messages are tracked in FloodGate for relay accounting but
+                // NOT dropped on duplicate. SCP dedup is handled downstream:
+                //   1. scp_scheduled_envelopes (pump_scp_intake) — in-flight dedup
+                //      matching stellar-core's checkScheduledAndCache (Peer.cpp:1113)
+                //   2. Herder self-message rejection (herder.rs:1424)
+                // This matches stellar-core where recvFloodedMsgID() records relay
+                // credit but recvSCPEnvelope() always proceeds (Peer.cpp:1667-1673).
+                let is_scp = matches!(message, StellarMessage::ScpMessage(_));
+                if !unique && !is_scp {
                     return Some(false);
                 }
             } else {

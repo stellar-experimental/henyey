@@ -154,7 +154,7 @@ impl FloodGate {
     /// Records that a message has been seen, optionally from a specific peer.
     ///
     /// Returns `true` if this is the first time seeing this message (should flood),
-    /// or `false` if it's a duplicate (should drop).
+    /// or `false` if it's a duplicate (should drop for non-SCP messages).
     ///
     /// If `from_peer` is `Some`, that peer is recorded so we don't forward
     /// the message back to them.
@@ -165,6 +165,15 @@ impl FloodGate {
     /// This is a pure insert/lookup operation with no automatic cleanup,
     /// matching stellar-core's `addRecord()`. Cleanup happens at ledger
     /// boundaries via [`clear_below`](FloodGate::clear_below).
+    ///
+    /// # FloodGate role: relay accounting only
+    ///
+    /// FloodGate tracks which peers have seen a message for relay forwarding
+    /// decisions (matching stellar-core's `recvFloodedMsgID`). It is NOT
+    /// responsible for SCP message dedup — callers must exempt SCP from the
+    /// drop decision. SCP dedup happens in `pump_scp_intake` via
+    /// `scp_scheduled_envelopes` (matching stellar-core's
+    /// `checkScheduledAndCache` with short-lived weak_ptr semantics).
     pub fn record_seen(
         &self,
         message_hash: Hash256,
