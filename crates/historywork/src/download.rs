@@ -702,10 +702,13 @@ mod tests {
         }
     }
 
-    /// Stage E: download counters must carry the `"archive"` label.
+    /// Stage E: download counters must carry the `"archive"` label at every
+    /// emit site (not just the first occurrence).
     #[test]
     fn test_stage_e_historywork_archive_label_present() {
         let src = include_str!("download.rs");
+        // Only check the main code, not test string literals.
+        let main_code = src.split("#[cfg(test)]").next().unwrap_or(src);
         // Every download counter emit site must include archive labeling.
         for metric in &[
             "stellar_history_download_history_archive_state_success_total",
@@ -715,16 +718,23 @@ mod tests {
             "stellar_history_download_ledger_success_total",
             "stellar_history_download_ledger_failure_total",
         ] {
-            // Find each occurrence of the metric and verify "archive" appears
-            // nearby (within the same counter!() macro invocation).
-            let idx = src
-                .find(metric)
-                .unwrap_or_else(|| panic!("metric {metric} not found in historywork/download.rs"));
-            // Look at the next 200 chars for the "archive" label
-            let window = &src[idx..std::cmp::min(idx + 200, src.len())];
+            // Find ALL occurrences and verify "archive" appears nearby in each.
+            let mut search_from = 0;
+            let mut found_any = false;
+            while let Some(rel_idx) = main_code[search_from..].find(metric) {
+                found_any = true;
+                let idx = search_from + rel_idx;
+                let window = &main_code[idx..std::cmp::min(idx + 200, main_code.len())];
+                assert!(
+                    window.contains("\"archive\""),
+                    "metric {metric} missing \"archive\" label at byte offset {idx} \
+                     in historywork/download.rs",
+                );
+                search_from = idx + metric.len();
+            }
             assert!(
-                window.contains("\"archive\""),
-                "metric {metric} missing \"archive\" label in historywork/download.rs",
+                found_any,
+                "metric {metric} not found in historywork/download.rs",
             );
         }
     }
