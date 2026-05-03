@@ -796,7 +796,29 @@ impl TransactionMetaBuilder {
     }
 
     /// Finalize to V3 meta (early Soroban, events at tx level).
-    fn finalize_v3(self, _success: bool) -> TransactionMeta {
+    fn finalize_v3(mut self, success: bool) -> TransactionMeta {
+        // On success for Soroban txs, extract return value and contract events
+        // from the operation builder before consuming builders into OperationMeta.
+        // V3's OperationMeta (v1) has no events field, so contract events are
+        // promoted to tx-level sorobanMeta.events.
+        // (stellar-core: TransactionMeta.cpp:1076-1094, maybeSetContractEventsAtTxLevel:669-686)
+        let (soroban_events, soroban_return_value) = if self.is_soroban && success {
+            assert_eq!(
+                self.operation_builders.len(),
+                1,
+                "Soroban transactions must have exactly one operation"
+            );
+            let op_builder = &mut self.operation_builders[0];
+            let return_value = op_builder
+                .soroban_return_value()
+                .cloned()
+                .unwrap_or(ScVal::Void);
+            let events = op_builder.event_manager_mut().finalize();
+            (events, return_value)
+        } else {
+            (vec![], ScVal::Void)
+        };
+
         let operations: Vec<OperationMeta> = self
             .operation_builders
             .into_iter()
@@ -810,10 +832,10 @@ impl TransactionMetaBuilder {
         let soroban_meta = if self.is_soroban {
             Some(SorobanTransactionMeta {
                 ext: SorobanTransactionMetaExt::V0,
-                events: vec![]
+                events: soroban_events
                     .try_into()
                     .expect("XDR bounded conversion must not fail"),
-                return_value: ScVal::Void,
+                return_value: soroban_return_value,
                 diagnostic_events: diagnostic_events
                     .try_into()
                     .expect("XDR bounded conversion must not fail"),
@@ -841,6 +863,21 @@ impl TransactionMetaBuilder {
 
     /// Finalize to V4 meta (modern Soroban, per-op events).
     fn finalize_v4(mut self, success: bool) -> TransactionMeta {
+        // On success for Soroban txs, extract return value from the operation
+        // builder before consuming builders. V4 events are per-op (in
+        // OperationMetaV2.events), so we don't extract events here.
+        // (stellar-core: TransactionMeta.cpp:1082-1086, setReturnValue:724-725)
+        let soroban_return_value = if self.is_soroban && success {
+            assert_eq!(
+                self.operation_builders.len(),
+                1,
+                "Soroban transactions must have exactly one operation"
+            );
+            self.operation_builders[0].soroban_return_value().cloned()
+        } else {
+            None
+        };
+
         // For V4, we need OperationMetaV2 with per-operation events
         let operations: Vec<OperationMetaV2> = self
             .operation_builders
@@ -866,7 +903,7 @@ impl TransactionMetaBuilder {
 
             Some(SorobanTransactionMetaV2 {
                 ext,
-                return_value: Some(ScVal::Void), // Return value from operation builder
+                return_value: soroban_return_value,
             })
         } else {
             None
@@ -1518,6 +1555,193 @@ mod tests {
                 ext: AccountEntryExt::V0,
             }),
             ext: LedgerEntryExt::V0,
+        }
+    }
+
+    #[test]
+    fn test_finalize_v3_success_populates_events_and_return_value() {
+        let diagnostic_config = DiagnosticConfig {
+            enable_soroban_diagnostic_events: true,
+            enable_diagnostics_for_tx_submission: false,
+        };
+        let soroban_frame = create_soroban_frame();
+
+        let mut builder = TransactionMetaBuilder::new(
+            true,
+            &soroban_frame,
+            21,
+            NetworkId::testnet(),
+            ClassicEventConfig::default(),
+            &diagnostic_config,
+        );
+
+        // Set a return value on the operation builder
+        builder
+            .operation_meta_builder_mut(0)
+            .set_soroban_return_value(ScVal::U64(42));
+
+        // Push a contract event via the operation event manager
+        builder
+            .operation_meta_builder_mut(0)
+            .event_manager_mut()
+            .new_transfer_event(
+                &Asset::Native,
+                &ScAddress::Account(AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(
+                    [0u8; 32],
+                )))),
+                &ScAddress::Account(AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(
+                    [1u8; 32],
+                )))),
+                1000,
+                false,
+            );
+
+        let meta = builder.finalize_v3(true);
+        match meta {
+            TransactionMeta::V3(v3) => {
+                let soroban_meta = v3
+                    .soroban_meta
+                    .expect("soroban_meta must be Some for successful Soroban tx in V3");
+                assert_eq!(
+                    soroban_meta.return_value,
+                    ScVal::U64(42),
+                    "return_value must be populated from operation builder on success"
+                );
+                assert_eq!(
+                    soroban_meta.events.len(),
+                    1,
+                    "contract events must be promoted to tx-level sorobanMeta.events in V3"
+                );
+            }
+            _ => panic!("Expected V3 meta"),
+        }
+    }
+
+    #[test]
+    fn test_finalize_v3_failure_does_not_populate_events_or_return_value() {
+        let diagnostic_config = DiagnosticConfig {
+            enable_soroban_diagnostic_events: true,
+            enable_diagnostics_for_tx_submission: false,
+        };
+        let soroban_frame = create_soroban_frame();
+
+        let mut builder = TransactionMetaBuilder::new(
+            true,
+            &soroban_frame,
+            21,
+            NetworkId::testnet(),
+            ClassicEventConfig::default(),
+            &diagnostic_config,
+        );
+
+        // Set return value and events — should NOT appear on failure
+        builder
+            .operation_meta_builder_mut(0)
+            .set_soroban_return_value(ScVal::U64(99));
+        builder
+            .operation_meta_builder_mut(0)
+            .event_manager_mut()
+            .new_transfer_event(
+                &Asset::Native,
+                &ScAddress::Account(AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(
+                    [0u8; 32],
+                )))),
+                &ScAddress::Account(AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(
+                    [1u8; 32],
+                )))),
+                500,
+                false,
+            );
+
+        let meta = builder.finalize_v3(false);
+        match meta {
+            TransactionMeta::V3(v3) => {
+                let soroban_meta = v3
+                    .soroban_meta
+                    .expect("soroban_meta must be Some even on failure in V3");
+                assert_eq!(
+                    soroban_meta.return_value,
+                    ScVal::Void,
+                    "return_value must be Void on failure"
+                );
+                assert!(
+                    soroban_meta.events.is_empty(),
+                    "events must be empty on failure"
+                );
+            }
+            _ => panic!("Expected V3 meta"),
+        }
+    }
+
+    #[test]
+    fn test_finalize_v4_success_populates_return_value() {
+        let diagnostic_config = DiagnosticConfig {
+            enable_soroban_diagnostic_events: true,
+            enable_diagnostics_for_tx_submission: false,
+        };
+        let soroban_frame = create_soroban_frame();
+
+        let mut builder = TransactionMetaBuilder::new(
+            true,
+            &soroban_frame,
+            21,
+            NetworkId::testnet(),
+            ClassicEventConfig::default(),
+            &diagnostic_config,
+        );
+
+        // Set a return value
+        builder
+            .operation_meta_builder_mut(0)
+            .set_soroban_return_value(ScVal::U64(42));
+
+        // finalize() uses meta_version()=4, so this goes through finalize_v4
+        let meta = builder.finalize(true);
+        match meta {
+            TransactionMeta::V4(v4) => {
+                let soroban_meta = v4
+                    .soroban_meta
+                    .expect("soroban_meta must be Some for successful Soroban tx in V4");
+                assert_eq!(
+                    soroban_meta.return_value,
+                    Some(ScVal::U64(42)),
+                    "return_value must be populated from operation builder"
+                );
+            }
+            _ => panic!("Expected V4 meta"),
+        }
+    }
+
+    #[test]
+    fn test_finalize_v4_success_no_return_value_is_none() {
+        let diagnostic_config = DiagnosticConfig {
+            enable_soroban_diagnostic_events: true,
+            enable_diagnostics_for_tx_submission: false,
+        };
+        let soroban_frame = create_soroban_frame();
+
+        let builder = TransactionMetaBuilder::new(
+            true,
+            &soroban_frame,
+            21,
+            NetworkId::testnet(),
+            ClassicEventConfig::default(),
+            &diagnostic_config,
+        );
+
+        // Do NOT set a return value — should result in None
+        let meta = builder.finalize(true);
+        match meta {
+            TransactionMeta::V4(v4) => {
+                let soroban_meta = v4
+                    .soroban_meta
+                    .expect("soroban_meta must be Some for successful Soroban tx in V4");
+                assert_eq!(
+                    soroban_meta.return_value, None,
+                    "return_value must be None when op builder has no return value set"
+                );
+            }
+            _ => panic!("Expected V4 meta"),
         }
     }
 }
