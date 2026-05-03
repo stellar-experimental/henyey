@@ -644,23 +644,30 @@ fn test_sequential_fee_refund_success_control() {
     let fee_charged = result.results[0].fee_charged;
     assert!(refund > 0, "should have non-zero refund");
 
-    // In the success case: fee_charged = charged_fee - refund
-    // The refund WAS applied, so fee_charged is reduced.
-    assert!(
-        fee_charged < result.tx_results[0].result.fee_charged + refund
-            || fee_charged == result.tx_results[0].result.fee_charged,
-        "fee_charged should reflect successful refund application"
+    // In the success case: fee_charged + refund = pre-charged fee (1000).
+    // The refund WAS applied, so fee_charged is reduced from the original.
+    let pre_charged_fee = 1000i64; // TX fee field
+    assert_eq!(
+        fee_charged + refund,
+        pre_charged_fee,
+        "fee_charged ({}) + refund ({}) should equal the original pre-charged fee ({}). \
+         This proves the refund was actually applied (fee_charged was reduced).",
+        fee_charged,
+        refund,
+        pre_charged_fee,
     );
-    // More precisely: fee_charged in result should equal tx_result fee_charged
+
+    // fee_charged in result should match tx_result fee_charged
     assert_eq!(
         fee_charged, result.tx_results[0].result.fee_charged,
         "result and tx_result fee_charged should match"
     );
-    // And it should be less than the total pre-charged fee
-    // (charged_fee = fee_charged + refund for successful refund)
-    assert_eq!(
-        fee_charged + refund,
-        result.tx_results[0].result.fee_charged + refund,
-        "fee_charged + refund should equal the original charged fee"
+
+    // fee_charged must be strictly less than pre-charged fee (refund applied)
+    assert!(
+        fee_charged < pre_charged_fee,
+        "fee_charged ({}) should be less than pre_charged_fee ({}) when refund succeeds",
+        fee_charged,
+        pre_charged_fee,
     );
 }
