@@ -4278,12 +4278,18 @@ impl LedgerCloseContext<'_> {
                     if protocol_version_starts_from(protocol_version, ProtocolVersion::V23)
                         && protocol_version >= henyey_common::MIN_SOROBAN_PROTOCOL_VERSION
                     {
-                        handle_upgrade_affecting_soroban_state_size(
+                        if let Err(e) = handle_upgrade_affecting_soroban_state_size(
                             &mut self.ltx,
                             protocol_version,
                             self.close_data.ledger_seq,
                             &self.manager.soroban_state,
-                        )?;
+                        ) {
+                            tracing::error!(
+                                protocol_version,
+                                error = %e,
+                                "Exception during version upgrade state size recompute — skipping"
+                            );
+                        }
                     }
                 }
                 Err(e) => {
