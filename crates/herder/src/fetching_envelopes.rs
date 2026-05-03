@@ -230,8 +230,10 @@ impl FetchingEnvelopes {
         let (need_tx_set, need_quorum_set) = self.check_dependencies(&envelope);
 
         if !need_tx_set && !need_quorum_set {
-            // All dependencies available - envelope is ready
-            // Parity: broadcast to peers when dependencies are satisfied
+            // All dependencies available - envelope is ready.
+            // Parity: stellar-core PendingEnvelopes::envelopeReady() broadcasts
+            // after isFullyFetched(). Broadcast here for both this immediate-ready
+            // path and the deferred-ready path (check_and_move_to_ready).
             self.broadcast_envelope(&envelope);
             slot_state.ready.push(envelope);
             self.stats.write().envelopes_ready += 1;
@@ -1195,7 +1197,8 @@ mod tests {
             count_clone.fetch_add(1, Ordering::SeqCst);
         });
 
-        // recv_envelope should trigger broadcast when immediately ready
+        // Immediate-ready path fires broadcast callback (parity: stellar-core
+        // envelopeReady broadcasts when isFullyFetched is true).
         fetching.recv_envelope(make_test_envelope(100, 1));
         assert_eq!(broadcast_count.load(Ordering::SeqCst), 1);
 

@@ -169,6 +169,19 @@ impl App {
             .take_verified_rx()
             .expect("scp-verify verified_rx must be taken exactly once at startup");
 
+        // Wire up the FetchingEnvelopes broadcast callback — the sole relay
+        // path for all SCP envelopes. Fires when deps are resolved, either
+        // immediately at recv_envelope or later at check_and_move_to_ready.
+        // The callback is synchronous (Fn) so we bridge to the async event
+        // loop via an unbounded channel.
+        // Parity: stellar-core PendingEnvelopes::envelopeReady() broadcasts
+        // once isFullyFetched() is true.
+        let (fetching_relay_tx, mut fetching_relay_rx) =
+            tokio::sync::mpsc::unbounded_channel::<ScpEnvelope>();
+        self.herder.set_fetching_broadcast(move |env| {
+            let _ = fetching_relay_tx.send(env.clone());
+        });
+
         // Main run loop
         let mut shutdown_rx = self.shutdown_tx.subscribe();
         let mut consensus_interval = tokio::time::interval(Duration::from_secs(1));
@@ -590,6 +603,25 @@ impl App {
                         close_pipeline.try_start_close(next);
                     }
                     tracing::trace!(select_iteration, "BRANCH: fetch_response_rx done");
+                }
+
+                // Relay SCP envelopes whose deps are now resolved.
+                // This is the sole relay path for all SCP envelopes — fires
+                // from FetchingEnvelopes (both immediate-ready and deferred-ready).
+                // Parity: stellar-core PendingEnvelopes::envelopeReady().
+                Some(env) = fetching_relay_rx.recv() => {
+                    let slot = env.statement.slot_index;
+                    let relay_msg = StellarMessage::ScpMessage(env);
+                    if let Some(overlay) = self.overlay().await {
+                        match overlay.broadcast(relay_msg).await {
+                            Ok(count) => {
+                                tracing::debug!(slot, peers = count, "Relayed SCP envelope");
+                            }
+                            Err(e) => {
+                                tracing::warn!(slot, error = %e, "Failed to relay SCP envelope");
+                            }
+                        }
+                    }
                 }
 
                 // Process non-critical overlay messages (TX floods, etc.).
@@ -2040,6 +2072,19 @@ impl App {
                 }
             }
         }
+
+        // SCP envelope relay is handled entirely by the FetchingEnvelopes
+        // broadcast callback (wired at startup). When deps are satisfied —
+        // either immediately (recv_envelope) or later (check_and_move_to_ready)
+        // — the callback fires, sending the envelope through an unbounded
+        // channel to the event loop which broadcasts via overlay.
+        //
+        // Parity: stellar-core PendingEnvelopes::envelopeReady() broadcasts
+        // once isFullyFetched() is true, before SCP processes the envelope.
+        // Our FetchingEnvelopes fires at the same point (deps resolved).
+        //
+        // No relay here at the app layer — all relay flows through one path
+        // to prevent double-relay and simplify reasoning.
 
         match envelope_result {
             EnvelopeState::Valid => {

@@ -3665,6 +3665,18 @@ impl Herder {
         self.fetching_envelopes.set_available_peers(peers);
     }
 
+    /// Set the callback for broadcasting envelopes when their dependencies
+    /// are satisfied in the FetchingEnvelopes pipeline.
+    ///
+    /// Parity: stellar-core's `PendingEnvelopes::envelopeReady()` broadcasts
+    /// envelopes to all peers once `isFullyFetched()` is true.
+    pub fn set_fetching_broadcast<F>(&self, f: F)
+    where
+        F: Fn(&ScpEnvelope) + Send + Sync + 'static,
+    {
+        self.fetching_envelopes.set_broadcast(f);
+    }
+
     /// Get statistics about envelope fetching.
     pub fn fetching_stats(&self) -> FetchingStats {
         self.fetching_envelopes.stats()
