@@ -815,7 +815,27 @@ async fn test_failed_config_upgrade_does_not_abort_ledger_close() {
     }
 }
 
-use stellar_xdr::curr::{LedgerCloseMeta, LedgerEntryChange};
+use stellar_xdr::curr::{
+    ContractCostParamEntry, ContractCostParams, ExtensionPoint, LedgerCloseMeta, LedgerEntryChange,
+};
+
+/// Build a `ConfigUpgradeSetKey` whose `content_hash` is the SHA-256 of the
+/// XDR-encoded `upgrade_set`. This produces a key that passes the hash
+/// validation in `ConfigUpgradeSetFrame::make_from_key`.
+fn make_config_upgrade_key_for_set(
+    contract_id: &[u8; 32],
+    upgrade_set: &ConfigUpgradeSet,
+) -> ConfigUpgradeSetKey {
+    use sha2::{Digest, Sha256};
+    let xdr_bytes = upgrade_set
+        .to_xdr(Limits::none())
+        .expect("encode upgrade set");
+    let hash: [u8; 32] = Sha256::digest(&xdr_bytes).into();
+    ConfigUpgradeSetKey {
+        contract_id: ContractId(Hash(*contract_id)),
+        content_hash: Hash(hash),
+    }
+}
 
 // ===========================================================================
 // Test: #2268 — State size recompute captured in upgrade meta
@@ -880,6 +900,124 @@ async fn test_version_upgrade_state_size_recompute_in_meta() {
                 "Version upgrade meta must include LiveSorobanStateSizeWindow update. \
                  Changes: {:?}",
                 version_meta
+                    .changes
+                    .iter()
+                    .map(std::mem::discriminant)
+                    .collect::<Vec<_>>()
+            );
+        }
+        _ => panic!("expected V2 meta"),
+    }
+}
+
+// ===========================================================================
+// Test: #2305 — Config upgrade (ContractCostParamsMemoryBytes) state size meta
+// ===========================================================================
+
+/// Regression test for #2305 (follow-up from #2268 / AUDIT-243).
+///
+/// When a config upgrade changes `ContractCostParamsMemoryBytes`, the
+/// `handle_upgrade_affecting_soroban_state_size` recompute runs inside the
+/// config upgrade's checkpoint scope (`close.rs:1322-1331`). The resulting
+/// `LiveSorobanStateSizeWindow` State + Updated entries must appear in the
+/// config upgrade's `UpgradeEntryMeta.changes`.
+///
+/// This covers the config-upgrade path; the version-upgrade path is covered
+/// by `test_version_upgrade_state_size_recompute_in_meta` above.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_config_upgrade_memory_cost_state_size_recompute_in_meta() {
+    let ledger = init_ledger_manager(25);
+
+    // Build a valid ConfigUpgradeSet with 85 ContractCostParamsMemoryBytes
+    // entries (required count for protocol 25, per config_upgrade.rs:805-806).
+    let cost_param = ContractCostParamEntry {
+        ext: ExtensionPoint::V0,
+        const_term: 42,
+        linear_term: 0,
+    };
+    let params = ContractCostParams(vec![cost_param; 85].try_into().expect("85 entries"));
+    let upgrade_set = ConfigUpgradeSet {
+        updated_entry: vec![ConfigSettingEntry::ContractCostParamsMemoryBytes(params)]
+            .try_into()
+            .expect("one entry"),
+    };
+
+    // Derive the key with a real SHA-256 content hash.
+    let key = make_config_upgrade_key_for_set(&[0xDE; 32], &upgrade_set);
+
+    // Store the upgrade set as CONTRACT_DATA + TTL in soroban state.
+    let data_entry = make_config_upgrade_entry(&key, &upgrade_set, 1);
+    ledger
+        .inject_synthetic_contract_data(data_entry, 1000)
+        .expect("inject config upgrade data");
+
+    // Close a ledger with the config upgrade.
+    let close_data =
+        empty_close_data(&ledger, 1, 100).with_upgrade(LedgerUpgrade::Config(key.clone()));
+    let handle = tokio::runtime::Handle::current();
+    let result = ledger
+        .close_ledger(close_data, Some(handle))
+        .expect("close ledger with config upgrade");
+
+    // Verify the config upgrade meta includes LiveSorobanStateSizeWindow changes.
+    let meta = result.meta.expect("close meta should be present");
+    match meta {
+        LedgerCloseMeta::V2(v2) => {
+            assert!(
+                !v2.upgrades_processing.is_empty(),
+                "Config upgrade should produce UpgradeEntryMeta"
+            );
+
+            // Find the config upgrade meta entry.
+            let config_meta = v2
+                .upgrades_processing
+                .iter()
+                .find(|m| matches!(m.upgrade, LedgerUpgrade::Config(_)))
+                .expect("Should have Config upgrade meta");
+
+            // Assert State (before-image) for LiveSorobanStateSizeWindow.
+            let has_window_state = config_meta.changes.iter().any(|change| {
+                matches!(
+                    change,
+                    LedgerEntryChange::State(entry)
+                    if matches!(
+                        &entry.data,
+                        LedgerEntryData::ConfigSetting(
+                            ConfigSettingEntry::LiveSorobanStateSizeWindow(_)
+                        )
+                    )
+                )
+            });
+
+            // Assert Updated (after-image) for LiveSorobanStateSizeWindow.
+            let has_window_updated = config_meta.changes.iter().any(|change| {
+                matches!(
+                    change,
+                    LedgerEntryChange::Updated(entry)
+                    if matches!(
+                        &entry.data,
+                        LedgerEntryData::ConfigSetting(
+                            ConfigSettingEntry::LiveSorobanStateSizeWindow(_)
+                        )
+                    )
+                )
+            });
+
+            assert!(
+                has_window_state,
+                "Config upgrade meta must include LiveSorobanStateSizeWindow State \
+                 (before-image). Changes: {:?}",
+                config_meta
+                    .changes
+                    .iter()
+                    .map(std::mem::discriminant)
+                    .collect::<Vec<_>>()
+            );
+            assert!(
+                has_window_updated,
+                "Config upgrade meta must include LiveSorobanStateSizeWindow Updated \
+                 (after-image). Changes: {:?}",
+                config_meta
                     .changes
                     .iter()
                     .map(std::mem::discriminant)
