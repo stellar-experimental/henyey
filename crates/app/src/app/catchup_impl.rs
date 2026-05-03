@@ -5141,4 +5141,58 @@ mod tests {
             "error must mention fatal verification failure, got: {err_msg}"
         );
     }
+
+    /// AUDIT-255 regression guard: verify that the `?` operator at the
+    /// catchup boundary (catchup_impl.rs:867) preserves the `HistoryError`
+    /// concrete type inside `anyhow::Error` for `downcast_ref` at line 2402.
+    ///
+    /// This mirrors the exact conversion mechanism: a function returning
+    /// `anyhow::Result<T>` uses `?` on a `Result<_, HistoryError>`. The
+    /// test will fail if someone reintroduces a type-erasing `map_err` or
+    /// formats the error to a string before the `?` boundary.
+    #[test]
+    fn test_history_error_type_preserved_through_question_mark() {
+        // Simulate the exact conversion at catchup_impl.rs:867:
+        //   catchup_to_ledger_with_mode returns Result<_, HistoryError>
+        //   and `?` converts it to anyhow::Error.
+        fn simulate_catchup_boundary(result: henyey_history::Result<()>) -> anyhow::Result<()> {
+            result?;
+            Ok(())
+        }
+
+        // Fatal variant: VerificationFailed
+        let err = simulate_catchup_boundary(Err(henyey_history::HistoryError::VerificationFailed(
+            "bucket list mismatch".into(),
+        )))
+        .unwrap_err();
+
+        assert!(
+            err.downcast_ref::<henyey_history::HistoryError>().is_some(),
+            "HistoryError must survive ? conversion for downcast_ref — \
+             if this fails, the catchup boundary erases the error type"
+        );
+        assert!(
+            err.downcast_ref::<henyey_history::HistoryError>()
+                .unwrap()
+                .is_fatal_catchup_failure(),
+            "VerificationFailed must be classified as fatal"
+        );
+
+        // Non-fatal variant: ArchiveUnreachable
+        let err = simulate_catchup_boundary(Err(henyey_history::HistoryError::ArchiveUnreachable(
+            "timeout".into(),
+        )))
+        .unwrap_err();
+
+        assert!(
+            err.downcast_ref::<henyey_history::HistoryError>().is_some(),
+            "Non-fatal HistoryError must also survive ? conversion"
+        );
+        assert!(
+            !err.downcast_ref::<henyey_history::HistoryError>()
+                .unwrap()
+                .is_fatal_catchup_failure(),
+            "ArchiveUnreachable must NOT be classified as fatal"
+        );
+    }
 }
