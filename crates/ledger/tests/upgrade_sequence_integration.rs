@@ -1043,9 +1043,9 @@ use henyey_common::NetworkId;
 use henyey_crypto::{sign_hash, SecretKey};
 use stellar_xdr::curr::{
     AccountEntry, AccountEntryExt, AccountEntryExtensionV1, AccountEntryExtensionV1Ext, AccountId,
-    Asset, BucketListType, BumpSequenceOp, DecoratedSignature, LedgerKeyOffer, Liabilities, Memo,
-    MuxedAccount, OfferEntry, Operation, OperationBody, Preconditions, Price, PublicKey,
-    SequenceNumber, Signature as XdrSignature, SignatureHint, Thresholds, Transaction,
+    Asset, BucketListType, BumpSequenceOp, DecoratedSignature, LedgerKeyOffer, LedgerKeyTrustLine,
+    Liabilities, Memo, MuxedAccount, OfferEntry, Operation, OperationBody, Preconditions, Price,
+    PublicKey, SequenceNumber, Signature as XdrSignature, SignatureHint, Thresholds, Transaction,
     TransactionEnvelope, TransactionExt, TransactionV1Envelope, TrustLineAsset, TrustLineEntry,
     TrustLineEntryExt, TrustLineEntryV1, TrustLineEntryV1Ext, Uint256,
 };
@@ -1198,7 +1198,7 @@ fn test_base_reserve_upgrade_prepare_liabilities_meta() {
     // Seed bucket list with accounts, offer, and trustline.
     let mut bucket_list = henyey_ledger::new_bucket_list_with_soroban_config();
 
-    let account_a_entry = make_account_with_liabilities(account_id_a.clone(), 500, 0, 1, 100);
+    let account_a_entry = make_account_with_liabilities(account_id_a.clone(), 500, 0, 2, 100);
     let offer_entry = make_native_sell_offer(account_id_a.clone(), 1, buying_asset.clone(), 100);
     let trustline_entry =
         make_authorized_trustline(account_id_a.clone(), tl_asset.clone(), 0, 10_000, 100);
@@ -1362,18 +1362,17 @@ fn test_base_reserve_upgrade_prepare_liabilities_meta() {
         _ => unreachable!(),
     };
 
-    // Before-image: account still has the offer (num_sub_entries=1) and the
-    // balance must reflect the fee deduction from tx execution. This is the
-    // core #2269 regression check: the State captures the post-tx delta state,
-    // not the original bucket-list state (balance 500).
+    // Before-image: account still has the offer + trustline (num_sub_entries=2)
+    // and the balance must reflect the fee deduction from tx execution. This is
+    // the core #2269 regression check: the State captures the post-tx delta
+    // state, not the original bucket-list state (balance 500).
     assert_eq!(
-        before.num_sub_entries, 1,
-        "before: num_sub_entries should be 1"
+        before.num_sub_entries, 2,
+        "before: num_sub_entries should be 2 (1 offer + 1 trustline)"
     );
-    assert!(
-        before.balance < 500,
-        "before-image balance ({}) should reflect fee deduction (< 500)",
-        before.balance,
+    assert_eq!(
+        before.balance, 400,
+        "before-image balance should be 400 (500 - 100 fee)"
     );
     let before_selling = match &before.ext {
         AccountEntryExt::V1(v1) => v1.liabilities.selling,
@@ -1384,12 +1383,14 @@ fn test_base_reserve_upgrade_prepare_liabilities_meta() {
         "before: selling_liabilities should be 100"
     );
 
-    // After-image: offer erased so numSubEntries decremented. Selling
-    // liabilities are NOT zeroed because prepareLiabilities only adjusts
-    // liabilities for assets that have surviving offers (stellar-core parity).
+    // After-image: offer erased so numSubEntries decremented (trustline remains).
+    // Selling liabilities are NOT zeroed because prepareLiabilities only adjusts
+    // liabilities for assets that have surviving offers (stellar-core parity:
+    // Upgrades.cpp updateOffer only accumulates to `liabilities` map inside
+    // `if (!erase)` at line 871).
     assert_eq!(
-        after.num_sub_entries, 0,
-        "after: num_sub_entries should be 0"
+        after.num_sub_entries, 1,
+        "after: num_sub_entries should be 1 (trustline remains)"
     );
     let after_selling = match &after.ext {
         AccountEntryExt::V1(v1) => v1.liabilities.selling,
@@ -1426,5 +1427,22 @@ fn test_base_reserve_upgrade_prepare_liabilities_meta() {
     assert!(
         has_offer_state,
         "BaseReserve upgrade changes should include State for the offer"
+    );
+
+    // Assert: trustline NOT modified by prepareLiabilities (all credit-buying
+    // offers erased → no entry in the liabilities map → trustline untouched).
+    let tl_key = LedgerKey::Trustline(LedgerKeyTrustLine {
+        account_id: account_id_a.clone(),
+        asset: tl_asset,
+    });
+    let tl_in_changes = reserve_meta.changes.iter().any(|change| match change {
+        LedgerEntryChange::State(entry) | LedgerEntryChange::Updated(entry) => {
+            henyey_common::entry_to_key(entry) == tl_key
+        }
+        _ => false,
+    });
+    assert!(
+        !tl_in_changes,
+        "Trustline should NOT appear in upgrade changes when all buying offers are erased"
     );
 }
