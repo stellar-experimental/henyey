@@ -1021,6 +1021,10 @@ pub(super) struct TransactionMetaParts {
     /// Whether the transaction succeeded. V4 Soroban meta is only emitted on
     /// success, matching stellar-core's `maybeActivateSorobanMeta(success)`.
     pub tx_succeeded: bool,
+    /// Whether this is a Soroban transaction. V4 Soroban meta is activated
+    /// unconditionally for successful Soroban txs, matching stellar-core's
+    /// `maybeActivateSorobanMeta` which is only called for Soroban txs.
+    pub is_soroban: bool,
 }
 
 pub(super) fn build_transaction_meta(parts: TransactionMetaParts) -> TransactionMeta {
@@ -1046,12 +1050,9 @@ pub(super) fn build_transaction_meta(parts: TransactionMetaParts) -> Transaction
         Vec::new()
     };
 
-    // V4 Soroban meta is only emitted when the transaction succeeded,
+    // V4 Soroban meta is activated unconditionally for successful Soroban txs,
     // matching stellar-core's maybeActivateSorobanMeta(success) behavior.
-    let has_soroban = parts.tx_succeeded
-        && (parts.soroban_return_value.is_some()
-            || !filtered_diagnostics.is_empty()
-            || parts.soroban_fee_info.is_some());
+    let has_soroban = parts.tx_succeeded && parts.is_soroban;
     let soroban_meta = if has_soroban {
         // Only emit SorobanTransactionMetaExtV1 (fee breakdown) when the flag is set.
         // This matches stellar-core's EMIT_SOROBAN_TRANSACTION_META_EXT_V1 behavior.
@@ -1109,6 +1110,7 @@ pub(super) fn empty_transaction_meta() -> TransactionMeta {
         emit_soroban_tx_meta_ext_v1: false,
         enable_soroban_diagnostic_events: false,
         tx_succeeded: false,
+        is_soroban: false,
     })
 }
 
@@ -1468,6 +1470,7 @@ mod tests {
             emit_soroban_tx_meta_ext_v1: false,
             enable_soroban_diagnostic_events: false,
             tx_succeeded: true,
+            is_soroban: true,
         });
         let TransactionMeta::V4(v4) = meta else {
             panic!("expected V4 meta");
@@ -1493,6 +1496,7 @@ mod tests {
             emit_soroban_tx_meta_ext_v1: false,
             enable_soroban_diagnostic_events: false,
             tx_succeeded: false,
+            is_soroban: true,
         });
         let TransactionMeta::V4(v4) = meta else {
             panic!("expected V4 meta");
@@ -1517,6 +1521,7 @@ mod tests {
             emit_soroban_tx_meta_ext_v1: true,
             enable_soroban_diagnostic_events: false,
             tx_succeeded: false,
+            is_soroban: true,
         });
         let TransactionMeta::V4(v4) = meta else {
             panic!("expected V4 meta");
@@ -1542,6 +1547,7 @@ mod tests {
             emit_soroban_tx_meta_ext_v1: false,
             enable_soroban_diagnostic_events: false,
             tx_succeeded: true,
+            is_soroban: false,
         });
         let TransactionMeta::V4(v4) = meta else {
             panic!("expected V4 meta");
@@ -1549,6 +1555,43 @@ mod tests {
         assert!(
             v4.soroban_meta.is_none(),
             "classic tx must not emit SorobanTransactionMetaV2"
+        );
+    }
+
+    #[test]
+    fn test_v4_soroban_meta_emitted_unconditionally_on_success() {
+        // Regression test: a successful Soroban tx with no payload fields
+        // (no return_value, no diagnostics, no fee_info) must still emit
+        // SorobanTransactionMetaV2, matching stellar-core's unconditional
+        // activation in maybeActivateSorobanMeta(success=true).
+        let meta = build_transaction_meta(TransactionMetaParts {
+            tx_changes_before: empty_entry_changes(),
+            op_changes: Vec::new(),
+            op_events: Vec::new(),
+            tx_events: Vec::new(),
+            soroban_return_value: None,
+            diagnostic_events: Vec::new(),
+            soroban_fee_info: None,
+            emit_soroban_tx_meta_ext_v1: false,
+            enable_soroban_diagnostic_events: false,
+            tx_succeeded: true,
+            is_soroban: true,
+        });
+        let TransactionMeta::V4(v4) = meta else {
+            panic!("expected V4 meta");
+        };
+        let soroban = v4
+            .soroban_meta
+            .as_ref()
+            .expect("successful Soroban tx must emit SorobanTransactionMetaV2 unconditionally");
+        assert_eq!(
+            soroban.ext,
+            SorobanTransactionMetaExt::V0,
+            "ext must be V0 when emit_soroban_tx_meta_ext_v1 is disabled"
+        );
+        assert_eq!(
+            soroban.return_value, None,
+            "return_value must be None when not populated"
         );
     }
 

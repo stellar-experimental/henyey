@@ -1854,10 +1854,11 @@ impl TransactionExecutor {
     ) -> Result<std::result::Result<PreApplyResult, TransactionExecutionResult>> {
         let tx_timing_start = std::time::Instant::now();
 
-        let soroban_max_refundable = {
+        let (soroban_max_refundable, is_soroban_tx) = {
             let pre_frame =
                 TransactionFrame::with_network(Arc::clone(tx_envelope), self.network_id);
-            if pre_frame.is_soroban() {
+            let is_soroban = pre_frame.is_soroban();
+            if is_soroban {
                 let (non_refundable_fee, _) = compute_soroban_resource_fee(
                     &pre_frame,
                     self.protocol_version,
@@ -1865,12 +1866,13 @@ impl TransactionExecutor {
                     0,
                 )
                 .unwrap_or((0, 0));
-                pre_frame
+                let max_refundable = pre_frame
                     .declared_soroban_resource_fee()
                     .as_i64()
-                    .saturating_sub(non_refundable_fee)
+                    .saturating_sub(non_refundable_fee);
+                (max_refundable, true)
             } else {
-                0
+                (0, false)
             }
         };
 
@@ -1912,6 +1914,7 @@ impl TransactionExecutor {
                             emit_soroban_tx_meta_ext_v1: self.emit_soroban_tx_meta_ext_v1,
                             enable_soroban_diagnostic_events: self.enable_soroban_diagnostic_events,
                             tx_succeeded: false,
+                            is_soroban: is_soroban_tx,
                         }));
                 }
 
