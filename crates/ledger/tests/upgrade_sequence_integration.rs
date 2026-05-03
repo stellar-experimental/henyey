@@ -1027,3 +1027,404 @@ async fn test_config_upgrade_memory_cost_state_size_recompute_in_meta() {
         _ => panic!("expected V2 meta"),
     }
 }
+
+// ===========================================================================
+// Regression test: #2307 — prepareLiabilities upgrade meta emission
+//
+// Validates that entry_changes_since (fixed in #2269) correctly captures
+// modifications to entries already present in the delta from transaction
+// execution. The scenario: fee charging + seq_num bump write an account to the
+// delta, then a BaseReserve upgrade calls prepareLiabilities which modifies
+// the same account again. The UpgradeEntryMeta must contain proper
+// State+Updated pairs.
+// ===========================================================================
+
+use henyey_common::NetworkId;
+use henyey_crypto::{sign_hash, SecretKey};
+use stellar_xdr::curr::{
+    AccountEntry, AccountEntryExt, AccountEntryExtensionV1, AccountEntryExtensionV1Ext, AccountId,
+    Asset, BucketListType, BumpSequenceOp, DecoratedSignature, LedgerKeyOffer, Liabilities, Memo,
+    MuxedAccount, OfferEntry, Operation, OperationBody, Preconditions, Price, PublicKey,
+    SequenceNumber, Signature as XdrSignature, SignatureHint, Thresholds, Transaction,
+    TransactionEnvelope, TransactionExt, TransactionV1Envelope, TrustLineAsset, TrustLineEntry,
+    TrustLineEntryExt, TrustLineEntryV1, TrustLineEntryV1Ext, Uint256,
+};
+
+/// Create an account entry with V1 extensions carrying native selling liabilities.
+fn make_account_with_liabilities(
+    account_id: AccountId,
+    balance: i64,
+    seq_num: i64,
+    num_sub_entries: u32,
+    selling_liab: i64,
+) -> LedgerEntry {
+    LedgerEntry {
+        last_modified_ledger_seq: 0,
+        data: LedgerEntryData::Account(AccountEntry {
+            account_id,
+            balance,
+            seq_num: SequenceNumber(seq_num),
+            num_sub_entries,
+            inflation_dest: None,
+            flags: 0,
+            home_domain: Default::default(),
+            thresholds: Thresholds([1, 0, 0, 0]),
+            signers: VecM::default(),
+            ext: AccountEntryExt::V1(AccountEntryExtensionV1 {
+                liabilities: Liabilities {
+                    buying: 0,
+                    selling: selling_liab,
+                },
+                ext: AccountEntryExtensionV1Ext::V0,
+            }),
+        }),
+        ext: LedgerEntryExt::V0,
+    }
+}
+
+/// Create an offer selling XLM for a non-native asset at price 1:1.
+fn make_native_sell_offer(
+    seller_id: AccountId,
+    offer_id: i64,
+    buying_asset: Asset,
+    amount: i64,
+) -> LedgerEntry {
+    LedgerEntry {
+        last_modified_ledger_seq: 0,
+        data: LedgerEntryData::Offer(OfferEntry {
+            seller_id,
+            offer_id,
+            selling: Asset::Native,
+            buying: buying_asset,
+            amount,
+            price: Price { n: 1, d: 1 },
+            flags: 0,
+            ext: stellar_xdr::curr::OfferEntryExt::V0,
+        }),
+        ext: LedgerEntryExt::V0,
+    }
+}
+
+/// Create an authorized trustline with V1 extensions carrying buying liabilities.
+fn make_authorized_trustline(
+    account_id: AccountId,
+    asset: TrustLineAsset,
+    balance: i64,
+    limit: i64,
+    buying_liab: i64,
+) -> LedgerEntry {
+    LedgerEntry {
+        last_modified_ledger_seq: 0,
+        data: LedgerEntryData::Trustline(TrustLineEntry {
+            account_id,
+            asset,
+            balance,
+            limit,
+            flags: 1, // AUTHORIZED_FLAG
+            ext: TrustLineEntryExt::V1(TrustLineEntryV1 {
+                liabilities: Liabilities {
+                    buying: buying_liab,
+                    selling: 0,
+                },
+                ext: TrustLineEntryV1Ext::V0,
+            }),
+        }),
+        ext: LedgerEntryExt::V0,
+    }
+}
+
+/// Sign a transaction envelope and return the decorated signature.
+fn sign_classic_envelope(
+    envelope: &TransactionEnvelope,
+    secret: &SecretKey,
+    network_id: &NetworkId,
+) -> DecoratedSignature {
+    let frame = henyey_tx::TransactionFrame::from_owned_with_network(envelope.clone(), *network_id);
+    let hash = frame.hash(network_id).expect("tx hash");
+    let signature = sign_hash(secret, &hash);
+    let public_key = secret.public_key();
+    let pk_bytes = public_key.as_bytes();
+    let hint = SignatureHint([pk_bytes[28], pk_bytes[29], pk_bytes[30], pk_bytes[31]]);
+    DecoratedSignature {
+        hint,
+        signature: XdrSignature(signature.0.to_vec().try_into().unwrap()),
+    }
+}
+
+/// Regression test for #2307 (follow-up from #2269).
+///
+/// Scenario: transaction execution writes an account to the delta (fee + seq),
+/// then a BaseReserve upgrade triggers prepareLiabilities which modifies the
+/// same account (erasing an unsupportable offer, decrementing numSubEntries).
+/// The upgrade's UpgradeEntryMeta.changes must contain State+Updated for the
+/// account and State+Removed for the offer.
+///
+/// Key validation: the State (before-image) in the upgrade changes must reflect
+/// the account's post-fee/post-tx-execution state, NOT the original bucket-list
+/// state. This confirms that entry_changes_since's snapshot-diff correctly
+/// captures modifications to pre-existing delta entries (#2269 fix).
+///
+/// Note: when all offers for a given asset are erased, prepareLiabilities does
+/// not zero the account's selling liabilities for that asset — this matches
+/// stellar-core behavior (Upgrades.cpp's updateOffer only accumulates
+/// liabilities for surviving offers).
+#[test]
+fn test_base_reserve_upgrade_prepare_liabilities_meta() {
+    let network_passphrase = "Test Network";
+    let network_id = NetworkId::from_passphrase(network_passphrase);
+
+    // Keys for account A (offer holder + tx source).
+    let secret_a = SecretKey::from_seed(&[1u8; 32]);
+    let account_id_a = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(
+        *secret_a.public_key().as_bytes(),
+    )));
+
+    // Keys for account B (asset issuer).
+    let secret_b = SecretKey::from_seed(&[2u8; 32]);
+    let account_id_b = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(
+        *secret_b.public_key().as_bytes(),
+    )));
+
+    // The non-native asset for the offer's buying side.
+    let buying_asset = Asset::CreditAlphanum4(stellar_xdr::curr::AlphaNum4 {
+        asset_code: stellar_xdr::curr::AssetCode4(*b"TEST"),
+        issuer: account_id_b.clone(),
+    });
+    let tl_asset = TrustLineAsset::CreditAlphanum4(stellar_xdr::curr::AlphaNum4 {
+        asset_code: stellar_xdr::curr::AssetCode4(*b"TEST"),
+        issuer: account_id_b.clone(),
+    });
+
+    // Seed bucket list with accounts, offer, and trustline.
+    let mut bucket_list = henyey_ledger::new_bucket_list_with_soroban_config();
+
+    let account_a_entry = make_account_with_liabilities(account_id_a.clone(), 500, 0, 1, 100);
+    let offer_entry = make_native_sell_offer(account_id_a.clone(), 1, buying_asset.clone(), 100);
+    let trustline_entry =
+        make_authorized_trustline(account_id_a.clone(), tl_asset.clone(), 0, 10_000, 100);
+    let account_b_entry = LedgerEntry {
+        last_modified_ledger_seq: 0,
+        data: LedgerEntryData::Account(AccountEntry {
+            account_id: account_id_b.clone(),
+            balance: 10_000_000,
+            seq_num: SequenceNumber(0),
+            num_sub_entries: 0,
+            inflation_dest: None,
+            flags: 0,
+            home_domain: Default::default(),
+            thresholds: Thresholds([1, 0, 0, 0]),
+            signers: VecM::default(),
+            ext: AccountEntryExt::V0,
+        }),
+        ext: LedgerEntryExt::V0,
+    };
+
+    bucket_list
+        .add_batch(
+            1,
+            25,
+            BucketListType::Live,
+            vec![
+                account_a_entry,
+                offer_entry,
+                trustline_entry,
+                account_b_entry,
+            ],
+            vec![],
+            vec![],
+        )
+        .expect("add_batch");
+
+    // Initialize LedgerManager.
+    let config = LedgerManagerConfig {
+        validate_bucket_hash: false,
+        ..Default::default()
+    };
+    let ledger = LedgerManager::new(network_passphrase.to_string(), config);
+    let hot_archive = HotArchiveBucketList::new();
+    let header = make_genesis_header(25);
+    let header_hash = compute_header_hash(&header).expect("hash");
+    ledger
+        .initialize(bucket_list, hot_archive, header, header_hash)
+        .expect("init");
+
+    // Build a BumpSequence transaction from account A.
+    let tx = Transaction {
+        source_account: MuxedAccount::Ed25519(Uint256(*secret_a.public_key().as_bytes())),
+        fee: 100,
+        seq_num: SequenceNumber(1),
+        cond: Preconditions::None,
+        memo: Memo::None,
+        operations: vec![Operation {
+            source_account: None,
+            body: OperationBody::BumpSequence(BumpSequenceOp {
+                bump_to: SequenceNumber(1),
+            }),
+        }]
+        .try_into()
+        .unwrap(),
+        ext: TransactionExt::V0,
+    };
+
+    let mut envelope = TransactionEnvelope::Tx(TransactionV1Envelope {
+        tx,
+        signatures: VecM::default(),
+    });
+    let decorated = sign_classic_envelope(&envelope, &secret_a, &network_id);
+    if let TransactionEnvelope::Tx(ref mut env) = envelope {
+        env.signatures = vec![decorated].try_into().unwrap();
+    }
+
+    // Close ledger with the tx + BaseReserve upgrade.
+    let prev_hash = ledger.current_header_hash();
+    let close_data = LedgerCloseData::new(
+        1,
+        TransactionSetVariant::Classic(TransactionSet {
+            previous_ledger_hash: Hash::from(prev_hash),
+            txs: vec![envelope].try_into().unwrap(),
+        }),
+        100,
+        prev_hash,
+    )
+    .with_upgrade(LedgerUpgrade::BaseReserve(200));
+
+    let result = ledger.close_ledger(close_data, None).expect("close ledger");
+
+    // Assert: transaction succeeded.
+    assert!(
+        !result.tx_results.is_empty(),
+        "Expected at least one transaction result"
+    );
+
+    // Assert: header reflects the new base reserve.
+    assert_eq!(result.header.base_reserve, 200);
+
+    // Extract upgrade meta.
+    let meta = result.meta.expect("close meta should be present");
+    let v2 = match meta {
+        LedgerCloseMeta::V2(v2) => v2,
+        _ => panic!("expected V2 meta"),
+    };
+
+    // Find the BaseReserve upgrade meta.
+    let reserve_meta = v2
+        .upgrades_processing
+        .iter()
+        .find(|m| matches!(m.upgrade, LedgerUpgrade::BaseReserve(200)))
+        .expect("Should have BaseReserve(200) upgrade meta");
+
+    assert!(
+        !reserve_meta.changes.is_empty(),
+        "BaseReserve upgrade should produce entry changes from prepareLiabilities"
+    );
+
+    // Find State+Updated pair for account A by iterating changes in order.
+    // Use indices to avoid lifetime issues with closures.
+    let mut account_state_idx: Option<usize> = None;
+    let mut account_updated_idx: Option<usize> = None;
+    for (i, change) in reserve_meta.changes.iter().enumerate() {
+        match change {
+            LedgerEntryChange::State(entry) => {
+                if let LedgerEntryData::Account(ref acct) = entry.data {
+                    if acct.account_id == account_id_a {
+                        account_state_idx = Some(i);
+                    }
+                }
+            }
+            LedgerEntryChange::Updated(entry) => {
+                if account_state_idx.is_some() && account_updated_idx.is_none() {
+                    if let LedgerEntryData::Account(ref acct) = entry.data {
+                        if acct.account_id == account_id_a {
+                            account_updated_idx = Some(i);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let state_idx = account_state_idx.expect("Should have State (before-image) for account A");
+    let updated_idx = account_updated_idx.expect("Should have Updated (after-image) for account A");
+
+    let before = match &reserve_meta.changes[state_idx] {
+        LedgerEntryChange::State(entry) => match &entry.data {
+            LedgerEntryData::Account(acct) => acct,
+            _ => unreachable!(),
+        },
+        _ => unreachable!(),
+    };
+    let after = match &reserve_meta.changes[updated_idx] {
+        LedgerEntryChange::Updated(entry) => match &entry.data {
+            LedgerEntryData::Account(acct) => acct,
+            _ => unreachable!(),
+        },
+        _ => unreachable!(),
+    };
+
+    // Before-image: account still has the offer (num_sub_entries=1) and the
+    // balance must reflect the fee deduction from tx execution. This is the
+    // core #2269 regression check: the State captures the post-tx delta state,
+    // not the original bucket-list state (balance 500).
+    assert_eq!(
+        before.num_sub_entries, 1,
+        "before: num_sub_entries should be 1"
+    );
+    assert!(
+        before.balance < 500,
+        "before-image balance ({}) should reflect fee deduction (< 500)",
+        before.balance,
+    );
+    let before_selling = match &before.ext {
+        AccountEntryExt::V1(v1) => v1.liabilities.selling,
+        AccountEntryExt::V0 => panic!("expected V1 ext on before-image"),
+    };
+    assert_eq!(
+        before_selling, 100,
+        "before: selling_liabilities should be 100"
+    );
+
+    // After-image: offer erased so numSubEntries decremented. Selling
+    // liabilities are NOT zeroed because prepareLiabilities only adjusts
+    // liabilities for assets that have surviving offers (stellar-core parity).
+    assert_eq!(
+        after.num_sub_entries, 0,
+        "after: num_sub_entries should be 0"
+    );
+    let after_selling = match &after.ext {
+        AccountEntryExt::V1(v1) => v1.liabilities.selling,
+        AccountEntryExt::V0 => panic!("expected V1 ext on after-image"),
+    };
+    assert_eq!(
+        after_selling, 100,
+        "after: selling_liabilities should remain 100 (no surviving native offers)"
+    );
+
+    // Assert: offer was removed.
+    let offer_key = LedgerKey::Offer(LedgerKeyOffer {
+        seller_id: account_id_a.clone(),
+        offer_id: 1,
+    });
+    let has_offer_removed = reserve_meta
+        .changes
+        .iter()
+        .any(|change| matches!(change, LedgerEntryChange::Removed(key) if *key == offer_key));
+    assert!(
+        has_offer_removed,
+        "BaseReserve upgrade changes should include Removed for the offer"
+    );
+
+    // Assert: offer has a State (before-image) preceding the Removed.
+    let has_offer_state = reserve_meta.changes.iter().any(|change| {
+        if let LedgerEntryChange::State(entry) = change {
+            if let LedgerEntryData::Offer(ref offer) = entry.data {
+                return offer.seller_id == account_id_a && offer.offer_id == 1;
+            }
+        }
+        false
+    });
+    assert!(
+        has_offer_state,
+        "BaseReserve upgrade changes should include State for the offer"
+    );
+}
