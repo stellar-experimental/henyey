@@ -53,7 +53,7 @@ use stellar_xdr::curr::{
 
 use crate::error::HerderError;
 use crate::quorum_set_tracker::QuorumSetTracker;
-use crate::tx_queue::TransactionSet;
+use crate::tx_queue::{AccountProvider, FeeBalanceProvider, SnapshotProviders, TransactionSet};
 use crate::tx_set_tracker::TxSetTracker;
 use crate::upgrades::Upgrades;
 use crate::Result;
@@ -681,11 +681,29 @@ impl ScpDriver {
             }
         };
 
-        // For generalized tx sets, run full content validation.
-        // For legacy sets, prepare_for_apply already validated structure;
-        // check_valid handles the protocol/format compatibility logic.
+        // For generalized tx sets, run full content validation including
+        // fee-balance affordability and stateful account checks (sequence,
+        // signatures, auth). Mirrors stellar-core TxSetUtils.cpp:167-246
+        // which creates a LedgerSnapshot and runs full checkValid().
         let result = if let Some(lm) = self.ledger_manager.get() {
-            let lcl_header = lm.current_header();
+            // Create snapshot atomically — captures header + bucket list state.
+            // All validation uses this single snapshot for consistency.
+            let snapshot = match lm.create_snapshot() {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!(
+                        "check_and_cache_tx_set_valid: snapshot creation failed: {}",
+                        e
+                    );
+                    // Do NOT cache — this is a transient local failure, not a
+                    // property of the TX set. Next attempt may succeed.
+                    return false;
+                }
+            };
+            let providers = SnapshotProviders::new(snapshot);
+            // Use snapshot's header for validation context — guarantees
+            // header/account-state consistency (no race with commit_close).
+            let lcl_header = providers.snapshot().header();
 
             // Skip validation entirely when protocol < 20: generalized tx sets
             // are not expected at those versions. This occurs in simulation
@@ -696,19 +714,19 @@ impl ScpDriver {
                 let soroban_info = lm.soroban_network_info();
                 prepared
                     .check_valid(
-                        &lcl_header,
+                        lcl_header,
                         close_time_offset,
                         network_id,
                         soroban_info.as_ref(),
-                        None, // fee balance checks skipped in SCP path — snapshot
-                        // staleness causes false rejects
-                        None, // account validation skipped in SCP path — snapshot
-                              // staleness causes false rejects
+                        Some(&providers as &dyn FeeBalanceProvider),
+                        Some(&providers as &dyn AccountProvider),
                     )
                     .is_ok()
             }
         } else {
-            // No ledger manager — can't validate, assume valid
+            // No ledger manager yet (OnceLock not set during startup window).
+            // SCP shouldn't be actively validating here, but if it does, accept
+            // permissively — TX set will be re-validated at apply time.
             true
         };
 
@@ -5764,6 +5782,202 @@ mod tests {
         let resolved = driver.resolve_apply_lag_for_next_index(200);
         assert_eq!(resolved, vec![200]);
         assert_eq!(driver.deferred_slot_count(), 0);
+    }
+
+    /// Regression test for AUDIT-264 (#2339): check_and_cache_tx_set_valid must
+    /// reject TX sets containing transactions from accounts that cannot afford
+    /// their aggregate fees.
+    ///
+    /// Before the fix, both fee_balance_provider and account_provider were passed
+    /// as None in the SCP validation path, skipping all stateful checks.
+    #[test]
+    fn test_audit_264_fee_balance_check_in_scp_validation() {
+        use henyey_bucket::{BucketList, HotArchiveBucketList};
+        use henyey_ledger::{compute_header_hash, LedgerManagerConfig};
+        use stellar_xdr::curr::{
+            AccountEntry, AccountEntryExt, AccountId, Asset, BucketListType, DecoratedSignature,
+            Hash, LedgerEntry, LedgerEntryData, LedgerEntryExt, LedgerHeader, LedgerHeaderExt,
+            Memo, MuxedAccount, Operation, OperationBody, PaymentOp, Preconditions, PublicKey,
+            SequenceNumber, Signature as XdrSignature, SignatureHint, StellarValue,
+            StellarValueExt, Thresholds, TimePoint, Transaction, TransactionEnvelope,
+            TransactionExt, TransactionV1Envelope, Uint256,
+        };
+        use stellar_xdr::curr::{
+            GeneralizedTransactionSet, ParallelTxsComponent, TransactionPhase, TransactionSetV1,
+            TxSetComponent, TxSetComponentTxsMaybeDiscountedFee,
+        };
+
+        // Create account key bytes
+        let account_key = [0xAA; 32];
+        let _account_id = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(account_key)));
+
+        // Create account with very low balance — cannot afford the tx fee
+        let account_entry = AccountEntry {
+            account_id: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(account_key))),
+            balance: 50, // Cannot afford fee of 10_000
+            seq_num: SequenceNumber(100),
+            num_sub_entries: 0,
+            inflation_dest: None,
+            flags: 0,
+            home_domain: stellar_xdr::curr::String32::default(),
+            thresholds: Thresholds([1, 1, 1, 1]),
+            signers: VecM::default(),
+            ext: AccountEntryExt::V0,
+        };
+
+        let ledger_entry = LedgerEntry {
+            last_modified_ledger_seq: 1,
+            data: LedgerEntryData::Account(account_entry),
+            ext: LedgerEntryExt::V0,
+        };
+
+        // Build bucket list with the account
+        let mut bucket_list = BucketList::new();
+        bucket_list
+            .add_batch(
+                1,
+                25,
+                BucketListType::Live,
+                vec![ledger_entry],
+                vec![],
+                vec![],
+            )
+            .expect("add_batch");
+
+        // Initialize LedgerManager
+        let lm_config = LedgerManagerConfig {
+            validate_bucket_hash: false,
+            ..Default::default()
+        };
+        let lm = henyey_ledger::LedgerManager::new("Test Network".to_string(), lm_config);
+        let lcl_header = LedgerHeader {
+            ledger_version: 25,
+            previous_ledger_hash: Hash([0u8; 32]),
+            scp_value: StellarValue {
+                tx_set_hash: Hash([0u8; 32]),
+                close_time: TimePoint(1000),
+                upgrades: VecM::default(),
+                ext: StellarValueExt::Basic,
+            },
+            tx_set_result_hash: Hash([0u8; 32]),
+            bucket_list_hash: Hash([0u8; 32]),
+            ledger_seq: 100,
+            total_coins: 1_000_000_000,
+            fee_pool: 0,
+            inflation_seq: 0,
+            id_pool: 0,
+            base_fee: 100,
+            base_reserve: 5_000_000,
+            max_tx_set_size: 100,
+            skip_list: [
+                Hash([0u8; 32]),
+                Hash([0u8; 32]),
+                Hash([0u8; 32]),
+                Hash([0u8; 32]),
+            ],
+            ext: LedgerHeaderExt::V0,
+        };
+        let lcl_hash = compute_header_hash(&lcl_header).expect("hash");
+        lm.initialize(
+            bucket_list,
+            HotArchiveBucketList::new(),
+            lcl_header,
+            lcl_hash,
+        )
+        .expect("init");
+
+        let driver = make_test_driver();
+        driver.set_ledger_manager(Arc::new(lm));
+
+        // Build a TX from the insolvent account with fee = 10_000 (> balance of 50)
+        let tx = Transaction {
+            source_account: MuxedAccount::Ed25519(Uint256(account_key)),
+            fee: 10_000,
+            seq_num: SequenceNumber(101),
+            cond: Preconditions::None,
+            memo: Memo::None,
+            operations: vec![Operation {
+                source_account: None,
+                body: OperationBody::Payment(PaymentOp {
+                    destination: MuxedAccount::Ed25519(Uint256([0xBB; 32])),
+                    asset: Asset::Native,
+                    amount: 1,
+                }),
+            }]
+            .try_into()
+            .unwrap(),
+            ext: TransactionExt::V0,
+        };
+        let envelope = TransactionEnvelope::Tx(TransactionV1Envelope {
+            tx,
+            signatures: vec![DecoratedSignature {
+                hint: SignatureHint(account_key[28..32].try_into().unwrap()),
+                signature: XdrSignature(vec![0u8; 64].try_into().unwrap()),
+            }]
+            .try_into()
+            .unwrap(),
+        });
+
+        // Build generalized TX set with this transaction
+        let component =
+            TxSetComponent::TxsetCompTxsMaybeDiscountedFee(TxSetComponentTxsMaybeDiscountedFee {
+                txs: vec![envelope].try_into().unwrap(),
+                base_fee: Some(100),
+            });
+        let gen = GeneralizedTransactionSet::V1(TransactionSetV1 {
+            previous_ledger_hash: Hash(lcl_hash.0),
+            phases: vec![
+                TransactionPhase::V0(vec![component].try_into().unwrap()),
+                TransactionPhase::V1(ParallelTxsComponent {
+                    base_fee: Some(100),
+                    execution_stages: vec![].try_into().unwrap(),
+                }),
+            ]
+            .try_into()
+            .unwrap(),
+        });
+        let tx_set = TransactionSet::new_generalized(gen);
+
+        // AUDIT-264: The SCP validation path must reject this TX set because
+        // the fee source account cannot afford the transaction fee.
+        let result = driver.check_and_cache_tx_set_valid(&tx_set, lcl_hash, 0);
+        assert!(
+            !result,
+            "AUDIT-264: TX set with insolvent fee source must be rejected in SCP validation"
+        );
+    }
+
+    /// Regression test for AUDIT-264: verify that when no ledger manager is
+    /// available (startup window), validation is permissive (returns true).
+    /// This confirms the None path doesn't crash and accepts gracefully.
+    #[test]
+    fn test_audit_264_no_ledger_manager_permissive() {
+        use stellar_xdr::curr::{
+            GeneralizedTransactionSet, Hash, ParallelTxsComponent, TransactionPhase,
+            TransactionSetV1,
+        };
+
+        let driver = make_test_driver();
+        // Deliberately do NOT set ledger_manager — simulates startup window.
+
+        // Build a minimal generalized TX set (empty phases, valid structure).
+        let gen = GeneralizedTransactionSet::V1(TransactionSetV1 {
+            previous_ledger_hash: Hash([0u8; 32]),
+            phases: vec![
+                TransactionPhase::V0(vec![].try_into().unwrap()),
+                TransactionPhase::V1(ParallelTxsComponent {
+                    base_fee: Some(100),
+                    execution_stages: vec![].try_into().unwrap(),
+                }),
+            ]
+            .try_into()
+            .unwrap(),
+        });
+        let tx_set = TransactionSet::new_generalized(gen);
+
+        // Without ledger manager, should be permissive (accepted)
+        let result = driver.check_and_cache_tx_set_valid(&tx_set, Hash256::ZERO, 0);
+        assert!(result, "No ledger manager should be permissive");
     }
 }
 
