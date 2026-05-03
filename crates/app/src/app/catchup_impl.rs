@@ -4979,4 +4979,132 @@ mod tests {
             "no-op catchup must not clear catchup_needs_full_reset"
         );
     }
+
+    /// AUDIT-255 regression (#2298): a fatal `HistoryError` (e.g.,
+    /// `VerificationFailed`) flowing through `handle_catchup_result` must set
+    /// `catchup_fatal_failure` to permanently block further catchup attempts.
+    ///
+    /// Prior to commit 4fe52336, the `HistoryError` type was erased by
+    /// `map_err(|e| anyhow::anyhow!("Catchup failed: {}", e))`, making
+    /// `downcast_ref::<HistoryError>()` always return `None`.
+    #[tokio::test]
+    async fn test_handle_catchup_result_sets_fatal_on_verification_error() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-test.db");
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
+        let app = App::new(config).await.unwrap();
+
+        // VerificationFailed is a fatal catchup error.
+        let err: anyhow::Error =
+            henyey_history::HistoryError::VerificationFailed("bucket list hash mismatch".into())
+                .into();
+
+        app.handle_catchup_result(Err(err), false, "test").await;
+
+        assert!(
+            app.catchup_fatal_failure.load(Ordering::SeqCst),
+            "catchup_fatal_failure must be set on VerificationFailed"
+        );
+        assert!(
+            !app.catchup_needs_full_reset.load(Ordering::SeqCst),
+            "catchup_needs_full_reset must NOT be set — fatal path takes priority"
+        );
+    }
+
+    /// AUDIT-255 regression (#2298): a transient (non-fatal) `HistoryError`
+    /// must NOT set `catchup_fatal_failure`.
+    #[tokio::test]
+    async fn test_handle_catchup_result_ignores_transient_error() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-test.db");
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
+        let app = App::new(config).await.unwrap();
+
+        // ArchiveUnreachable is transient — retry is appropriate.
+        let err: anyhow::Error =
+            henyey_history::HistoryError::ArchiveUnreachable("timeout".into()).into();
+
+        app.handle_catchup_result(Err(err), false, "test").await;
+
+        assert!(
+            !app.catchup_fatal_failure.load(Ordering::SeqCst),
+            "catchup_fatal_failure must NOT be set on transient error"
+        );
+        assert!(
+            !app.catchup_needs_full_reset.load(Ordering::SeqCst),
+            "catchup_needs_full_reset must NOT be set on transient error"
+        );
+    }
+
+    /// AUDIT-255 regression (#2298): a raw `LedgerError::HashMismatch`
+    /// (not wrapped in `HistoryError`) must trigger `catchup_needs_full_reset`
+    /// via the fallback downcast at line 2425.
+    ///
+    /// Note: In practice, replay wraps `LedgerError` in
+    /// `HistoryError::Ledger(...)` (see `catchup/replay.rs`). This test covers
+    /// the defensive fallback branch for raw `LedgerError` propagation.
+    #[tokio::test]
+    async fn test_handle_catchup_result_sets_full_reset_on_ledger_hash_mismatch() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-test.db");
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
+        let app = App::new(config).await.unwrap();
+
+        // Raw LedgerError::HashMismatch — not wrapped in HistoryError.
+        let err = anyhow::Error::new(henyey_ledger::LedgerError::HashMismatch {
+            expected: "abc".into(),
+            actual: "def".into(),
+        });
+
+        app.handle_catchup_result(Err(err), false, "test").await;
+
+        assert!(
+            !app.catchup_fatal_failure.load(Ordering::SeqCst),
+            "catchup_fatal_failure must NOT be set for raw LedgerError"
+        );
+        assert!(
+            app.catchup_needs_full_reset.load(Ordering::SeqCst),
+            "catchup_needs_full_reset must be set on LedgerError::HashMismatch"
+        );
+    }
+
+    /// AUDIT-255 regression (#2298): `HistoryError::Ledger(HashMismatch)` is
+    /// both `is_fatal_catchup_failure()` and `is_hash_mismatch()`. The fatal
+    /// check runs first (`catchup_impl.rs:2402`), so `catchup_fatal_failure`
+    /// must be set and the hash-mismatch reset path (inside the `else` branch)
+    /// must be skipped.
+    #[tokio::test]
+    async fn test_handle_catchup_result_fatal_takes_priority_over_hash_mismatch() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-test.db");
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
+        let app = App::new(config).await.unwrap();
+
+        // HistoryError::Ledger(HashMismatch) is BOTH fatal AND hash-mismatch.
+        let err: anyhow::Error =
+            henyey_history::HistoryError::Ledger(henyey_ledger::LedgerError::HashMismatch {
+                expected: "abc".into(),
+                actual: "def".into(),
+            })
+            .into();
+
+        app.handle_catchup_result(Err(err), false, "test").await;
+
+        assert!(
+            app.catchup_fatal_failure.load(Ordering::SeqCst),
+            "catchup_fatal_failure must be set — fatal check runs first"
+        );
+        assert!(
+            !app.catchup_needs_full_reset.load(Ordering::SeqCst),
+            "catchup_needs_full_reset must NOT be set — fatal path skips the else branch"
+        );
+    }
 }
