@@ -718,13 +718,36 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn custom_bucket_directory_survives_genesis_publish_and_restore() {
+    // -- Shared publish-queue test fixture --
+
+    /// Fixture returned by [`setup_publish_fixture`]. Provides a fully
+    /// initialized `App` with a seeded publish queue ready for
+    /// `maybe_publish_history()`.
+    struct PublishTestFixture {
+        app: Arc<App>,
+        config: crate::config::AppConfig,
+        custom_bucket_dir: std::path::PathBuf,
+        archive_dir: std::path::PathBuf,
+        // Kept alive for RAII — temp dir is cleaned up when this is dropped.
+        _dir: tempfile::TempDir,
+    }
+
+    /// Build a fully-seeded publish-queue test environment.
+    ///
+    /// The `configure_archives` closure receives the base temp directory
+    /// and a mutable config reference so callers can set up their archive
+    /// strategy (filesystem, staging/logging, etc.).
+    ///
+    /// All header-chain hashes are derived internally from a single source
+    /// of truth — callers cannot introduce inconsistent hashes.
+    async fn setup_publish_fixture(
+        name: &str,
+        configure_archives: impl FnOnce(&std::path::Path, &mut crate::config::AppConfig),
+    ) -> PublishTestFixture {
         let dir = tempfile::tempdir().expect("temp dir");
         let db_dir = dir.path().join("db");
         let db_path = db_dir.join("henyey.sqlite");
         let custom_bucket_dir = dir.path().join("custom-buckets");
-        let derived_bucket_dir = db_dir.join("buckets");
         let archive_dir = dir.path().join("archive");
         std::fs::create_dir_all(&db_dir).unwrap();
         std::fs::create_dir_all(&custom_bucket_dir).unwrap();
@@ -736,140 +759,176 @@ mod tests {
             .validator(true)
             .node_seed("SAFTEV5U6QDFE2DRMSD7HBE76XG7SQZJD6VIUTHIXTJGO77RUQYVURLA")
             .build();
-        config.history.archives = vec![test_archive_entry("local-test", &archive_dir)];
+        configure_archives(dir.path(), &mut config);
 
-        {
-            let app = Arc::new(App::new(config.clone()).await.unwrap());
-            app.set_self_arc().await;
-            assert_eq!(app.bucket_manager.bucket_dir(), custom_bucket_dir.as_path());
+        let app = Arc::new(App::new(config.clone()).await.unwrap());
+        app.set_self_arc().await;
 
-            let passphrase = app.config.network.passphrase.clone();
-            let genesis_entries = App::build_genesis_entries(&passphrase, 0, TOTAL_COINS);
-            let live_probe_header = make_header(
+        // Build genesis bucket list
+        let passphrase = app.config.network.passphrase.clone();
+        let genesis_entries = App::build_genesis_entries(&passphrase, 0, TOTAL_COINS);
+        let live_probe_header = make_header(
+            1,
+            Hash256::ZERO,
+            Hash256::ZERO,
+            Hash256::ZERO,
+            Hash256::ZERO,
+        );
+        let mut probe_bucket_list = BucketList::new();
+        probe_bucket_list.set_bucket_dir(custom_bucket_dir.clone());
+        probe_bucket_list
+            .add_batch(
                 1,
-                Hash256::ZERO,
-                Hash256::ZERO,
-                Hash256::ZERO,
-                Hash256::ZERO,
-            );
-            let mut probe_bucket_list = BucketList::new();
-            probe_bucket_list.set_bucket_dir(custom_bucket_dir.clone());
-            probe_bucket_list
-                .add_batch(
-                    1,
-                    0,
-                    stellar_xdr::curr::BucketListType::Live,
-                    genesis_entries.clone(),
-                    vec![],
-                    vec![],
-                )
-                .unwrap();
-            let live_hash = probe_bucket_list.hash();
-            let hot_archive = HotArchiveBucketList::new();
-            let combined_hash = combined_bucket_hash(live_hash, hot_archive.hash());
-
-            let live_header = LedgerHeader {
-                bucket_list_hash: Hash(live_hash.0),
-                ..live_probe_header
-            };
-            let mut bucket_list =
-                App::create_genesis_bucket_list(&custom_bucket_dir, genesis_entries, &live_header)
-                    .unwrap();
-            bucket_list.set_ledger_seq(CHECKPOINT);
-            let has = build_history_archive_state(
-                CHECKPOINT,
-                &bucket_list,
-                Some(&hot_archive),
-                Some(passphrase.clone()),
+                0,
+                stellar_xdr::curr::BucketListType::Live,
+                genesis_entries.clone(),
+                vec![],
+                vec![],
             )
             .unwrap();
-            let has_json = has.to_json().unwrap();
+        let live_hash = probe_bucket_list.hash();
+        let hot_archive = HotArchiveBucketList::new();
+        let combined_hash = combined_bucket_hash(live_hash, hot_archive.hash());
 
-            let empty_result = empty_tx_result(1);
-            let empty_result_hash = Hash256::hash(
-                &empty_result
-                    .tx_result_set
-                    .to_xdr(Limits::none())
-                    .expect("empty result xdr"),
+        let live_header = LedgerHeader {
+            bucket_list_hash: Hash(live_hash.0),
+            ..live_probe_header
+        };
+        let mut bucket_list =
+            App::create_genesis_bucket_list(&custom_bucket_dir, genesis_entries, &live_header)
+                .unwrap();
+        bucket_list.set_ledger_seq(CHECKPOINT);
+        let has = build_history_archive_state(
+            CHECKPOINT,
+            &bucket_list,
+            Some(&hot_archive),
+            Some(passphrase.clone()),
+        )
+        .unwrap();
+        let has_json = has.to_json().unwrap();
+
+        // Seed header chain with structurally correct hashes.
+        // All hashes are derived from the actual entry data — never pre-computed.
+        let mut headers_and_history = Vec::new();
+        let mut previous_header_hash = Hash256::ZERO;
+        let mut checkpoint_header = None;
+        let mut checkpoint_header_hash = Hash256::ZERO;
+        for seq in 1..=CHECKPOINT {
+            let tx_entry = empty_tx_history(seq, previous_header_hash);
+            let tx_hash = if seq == 1 {
+                Hash256::ZERO
+            } else {
+                henyey_history::verify::compute_tx_set_hash(&TransactionSetVariant::Classic(
+                    tx_entry.tx_set.clone(),
+                ))
+                .unwrap()
+            };
+            let result_entry = empty_tx_result(seq);
+            let result_hash = if seq == 1 {
+                Hash256::ZERO
+            } else {
+                Hash256::hash(
+                    &result_entry
+                        .tx_result_set
+                        .to_xdr(Limits::none())
+                        .expect("result xdr"),
+                )
+            };
+            let header = make_header(
+                seq,
+                previous_header_hash,
+                tx_hash,
+                result_hash,
+                combined_hash,
             );
-
-            let mut headers_and_history = Vec::new();
-            let mut previous_header_hash = Hash256::ZERO;
-            let mut checkpoint_header = None;
-            let mut checkpoint_header_hash = Hash256::ZERO;
-            for seq in 1..=CHECKPOINT {
-                let tx_entry = empty_tx_history(seq, previous_header_hash);
-                let tx_hash = if seq == 1 {
-                    Hash256::ZERO
-                } else {
-                    henyey_history::verify::compute_tx_set_hash(&TransactionSetVariant::Classic(
-                        tx_entry.tx_set.clone(),
-                    ))
-                    .unwrap()
-                };
-                let result_entry = empty_tx_result(seq);
-                let result_hash = if seq == 1 {
-                    Hash256::ZERO
-                } else {
-                    empty_result_hash
-                };
-                let header = make_header(
-                    seq,
-                    previous_header_hash,
-                    tx_hash,
-                    result_hash,
-                    combined_hash,
-                );
-                let header_xdr = header.to_xdr(Limits::none()).unwrap();
-                previous_header_hash = henyey_ledger::compute_header_hash(&header).unwrap();
-                if seq == CHECKPOINT {
-                    checkpoint_header_hash = previous_header_hash;
-                    checkpoint_header = Some(header.clone());
-                }
-                headers_and_history.push((header, header_xdr, tx_entry, result_entry));
+            let header_xdr = header.to_xdr(Limits::none()).unwrap();
+            previous_header_hash = henyey_ledger::compute_header_hash(&header).unwrap();
+            if seq == CHECKPOINT {
+                checkpoint_header_hash = previous_header_hash;
+                checkpoint_header = Some(header.clone());
             }
+            headers_and_history.push((header, header_xdr, tx_entry, result_entry));
+        }
 
-            app.db_blocking("seed-custom-bucket-checkpoint", {
-                let bucket_levels = bucket_levels(&bucket_list);
-                let has_json = has_json.clone();
-                let headers_and_history = headers_and_history.clone();
-                move |db| {
-                    db.with_connection(|conn| {
-                        for (header, header_xdr, tx_entry, result_entry) in &headers_and_history {
-                            conn.store_ledger_header(header, header_xdr)?;
-                            conn.store_tx_history_entry(header.ledger_seq, tx_entry)?;
-                            conn.store_tx_result_entry(header.ledger_seq, result_entry)?;
-                        }
-                        conn.set_last_closed_ledger(CHECKPOINT)?;
-                        conn.store_bucket_list(CHECKPOINT, &bucket_levels)?;
-                        conn.set_state(state_keys::HISTORY_ARCHIVE_STATE, &has_json)?;
-                        conn.enqueue_publish(CHECKPOINT, &has_json)?;
-                        Ok::<_, henyey_db::DbError>(())
-                    })
-                    .map_err(Into::into)
-                }
-            })
-            .await
+        app.db_blocking(&format!("seed-{name}"), {
+            let bucket_levels = bucket_levels(&bucket_list);
+            let has_json = has_json.clone();
+            let headers_and_history = headers_and_history.clone();
+            move |db| {
+                db.with_connection(|conn| {
+                    for (header, header_xdr, tx_entry, result_entry) in &headers_and_history {
+                        conn.store_ledger_header(header, header_xdr)?;
+                        conn.store_tx_history_entry(header.ledger_seq, tx_entry)?;
+                        conn.store_tx_result_entry(header.ledger_seq, result_entry)?;
+                    }
+                    conn.set_last_closed_ledger(CHECKPOINT)?;
+                    conn.store_bucket_list(CHECKPOINT, &bucket_levels)?;
+                    conn.set_state(state_keys::HISTORY_ARCHIVE_STATE, &has_json)?;
+                    conn.enqueue_publish(CHECKPOINT, &has_json)?;
+                    Ok::<_, henyey_db::DbError>(())
+                })
+                .map_err(Into::into)
+            }
+        })
+        .await
+        .unwrap();
+
+        app.ledger_manager
+            .initialize(
+                bucket_list,
+                hot_archive,
+                checkpoint_header.expect("checkpoint header"),
+                checkpoint_header_hash,
+            )
             .unwrap();
 
-            app.ledger_manager
-                .initialize(
-                    bucket_list,
-                    hot_archive,
-                    checkpoint_header.expect("checkpoint header"),
-                    checkpoint_header_hash,
-                )
-                .unwrap();
-
-            assert!(canonical_bucket_file_count(&custom_bucket_dir) > 0);
-            assert_eq!(canonical_bucket_file_count(&derived_bucket_dir), 0);
-
-            app.maybe_publish_history().await;
-            wait_for_publish_queue_to_drain(&app).await;
-
-            assert!(archive_bucket_file_count(&archive_dir) > 0);
-            assert_eq!(canonical_bucket_file_count(&derived_bucket_dir), 0);
+        PublishTestFixture {
+            app,
+            config,
+            custom_bucket_dir,
+            archive_dir,
+            _dir: dir,
         }
+    }
+
+    #[tokio::test]
+    async fn custom_bucket_directory_survives_genesis_publish_and_restore() {
+        let fixture = setup_publish_fixture("local-test", |dir, config| {
+            let archive_dir = dir.join("archive");
+            config.history.archives = vec![test_archive_entry("local-test", &archive_dir)];
+        })
+        .await;
+
+        let derived_bucket_dir = fixture
+            .config
+            .database
+            .path
+            .parent()
+            .unwrap()
+            .join("buckets");
+
+        assert_eq!(
+            fixture.app.bucket_manager.bucket_dir(),
+            fixture.custom_bucket_dir.as_path()
+        );
+        assert!(canonical_bucket_file_count(&fixture.custom_bucket_dir) > 0);
+        assert_eq!(canonical_bucket_file_count(&derived_bucket_dir), 0);
+
+        fixture.app.maybe_publish_history().await;
+        wait_for_publish_queue_to_drain(&fixture.app).await;
+
+        assert!(archive_bucket_file_count(&fixture.archive_dir) > 0);
+        assert_eq!(canonical_bucket_file_count(&derived_bucket_dir), 0);
+
+        // Destructure to drop app while keeping config and _dir alive for restore
+        let PublishTestFixture {
+            app,
+            config,
+            custom_bucket_dir,
+            archive_dir: _,
+            _dir,
+        } = fixture;
+        drop(app);
 
         let second_app = App::new(config).await.unwrap();
         assert_eq!(
@@ -933,163 +992,37 @@ mod tests {
     /// not the system temp directory.
     #[tokio::test]
     async fn test_publish_staging_uses_bucket_dir_tmp() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let db_dir = dir.path().join("db");
-        let db_path = db_dir.join("henyey.sqlite");
-        let custom_bucket_dir = dir.path().join("custom-buckets");
-        let log_file = dir.path().join("put-sources.log");
-        std::fs::create_dir_all(&db_dir).unwrap();
-        std::fs::create_dir_all(&custom_bucket_dir).unwrap();
+        let log_file = std::sync::Arc::new(std::sync::Mutex::new(std::path::PathBuf::new()));
+        let log_file_clone = log_file.clone();
 
-        // Archive put command logs the {0} source path to a file.
-        let put_cmd = format!("echo {{0}} >> {}", log_file.display());
-        let mkdir_cmd = "true".to_string(); // no-op
-
-        let mut config = crate::config::ConfigBuilder::new()
-            .database_path(&db_path)
-            .bucket_directory(&custom_bucket_dir)
-            .validator(true)
-            .node_seed("SAFTEV5U6QDFE2DRMSD7HBE76XG7SQZJD6VIUTHIXTJGO77RUQYVURLA")
-            .build();
-        config.history.archives = vec![crate::config::HistoryArchiveEntry {
-            name: "staging-test".to_string(),
-            url: "file:///unused".to_string(),
-            get_enabled: false,
-            put_enabled: true,
-            put: Some(put_cmd),
-            mkdir: Some(mkdir_cmd),
-        }];
-
-        let app = Arc::new(App::new(config.clone()).await.unwrap());
-        app.set_self_arc().await;
-        assert_eq!(app.bucket_manager.bucket_dir(), custom_bucket_dir.as_path());
-
-        // Build genesis bucket list
-        let passphrase = app.config.network.passphrase.clone();
-        let genesis_entries = App::build_genesis_entries(&passphrase, 0, TOTAL_COINS);
-        let live_probe_header = make_header(
-            1,
-            Hash256::ZERO,
-            Hash256::ZERO,
-            Hash256::ZERO,
-            Hash256::ZERO,
-        );
-        let mut probe_bucket_list = BucketList::new();
-        probe_bucket_list.set_bucket_dir(custom_bucket_dir.clone());
-        probe_bucket_list
-            .add_batch(
-                1,
-                0,
-                stellar_xdr::curr::BucketListType::Live,
-                genesis_entries.clone(),
-                vec![],
-                vec![],
-            )
-            .unwrap();
-        let live_hash = probe_bucket_list.hash();
-        let hot_archive = HotArchiveBucketList::new();
-        let combined_hash = combined_bucket_hash(live_hash, hot_archive.hash());
-
-        let live_header = LedgerHeader {
-            bucket_list_hash: Hash(live_hash.0),
-            ..live_probe_header
-        };
-        let mut bucket_list =
-            App::create_genesis_bucket_list(&custom_bucket_dir, genesis_entries, &live_header)
-                .unwrap();
-        bucket_list.set_ledger_seq(CHECKPOINT);
-        let has = build_history_archive_state(
-            CHECKPOINT,
-            &bucket_list,
-            Some(&hot_archive),
-            Some(passphrase.clone()),
-        )
-        .unwrap();
-        let has_json = has.to_json().unwrap();
-
-        let empty_result = empty_tx_result(1);
-        let empty_result_hash = Hash256::hash(
-            &empty_result
-                .tx_result_set
-                .to_xdr(Limits::none())
-                .expect("empty result xdr"),
-        );
-
-        // Seed ledger headers, tx history, results for checkpoint
-        let mut previous_header_hash = Hash256::ZERO;
-        let mut checkpoint_header = None;
-        let mut checkpoint_header_hash = Hash256::ZERO;
-        let mut headers_and_history = Vec::new();
-        for seq in 1..=CHECKPOINT {
-            let tx_entry = empty_tx_history(seq, previous_header_hash);
-            let tx_hash = if seq == 1 {
-                Hash256::ZERO
-            } else {
-                henyey_history::verify::compute_tx_set_hash(&TransactionSetVariant::Classic(
-                    tx_entry.tx_set.clone(),
-                ))
-                .unwrap()
-            };
-            let result_entry = empty_tx_result(seq);
-            let result_hash = if seq == 1 {
-                Hash256::ZERO
-            } else {
-                empty_result_hash
-            };
-            let header = make_header(
-                seq,
-                previous_header_hash,
-                tx_hash,
-                result_hash,
-                combined_hash,
-            );
-            let header_xdr = header.to_xdr(Limits::none()).unwrap();
-            previous_header_hash = henyey_ledger::compute_header_hash(&header).unwrap();
-            if seq == CHECKPOINT {
-                checkpoint_header_hash = previous_header_hash;
-                checkpoint_header = Some(header.clone());
-            }
-            headers_and_history.push((header, header_xdr, tx_entry, result_entry));
-        }
-
-        app.db_blocking("seed-staging-test", {
-            let bucket_levels = bucket_levels(&bucket_list);
-            let has_json = has_json.clone();
-            let headers_and_history = headers_and_history.clone();
-            move |db| {
-                db.with_connection(|conn| {
-                    for (header, header_xdr, tx_entry, result_entry) in &headers_and_history {
-                        conn.store_ledger_header(header, header_xdr)?;
-                        conn.store_tx_history_entry(header.ledger_seq, tx_entry)?;
-                        conn.store_tx_result_entry(header.ledger_seq, result_entry)?;
-                    }
-                    conn.set_last_closed_ledger(CHECKPOINT)?;
-                    conn.store_bucket_list(CHECKPOINT, &bucket_levels)?;
-                    conn.set_state(state_keys::HISTORY_ARCHIVE_STATE, &has_json)?;
-                    conn.enqueue_publish(CHECKPOINT, &has_json)?;
-                    Ok::<_, henyey_db::DbError>(())
-                })
-                .map_err(Into::into)
-            }
+        let fixture = setup_publish_fixture("staging-test", move |dir, config| {
+            let lf = dir.join("put-sources.log");
+            *log_file_clone.lock().unwrap() = lf.clone();
+            let put_cmd = format!("echo {{0}} >> {}", lf.display());
+            let mkdir_cmd = "true".to_string();
+            config.history.archives = vec![crate::config::HistoryArchiveEntry {
+                name: "staging-test".to_string(),
+                url: "file:///unused".to_string(),
+                get_enabled: false,
+                put_enabled: true,
+                put: Some(put_cmd),
+                mkdir: Some(mkdir_cmd),
+            }];
         })
-        .await
-        .unwrap();
+        .await;
 
-        app.ledger_manager
-            .initialize(
-                bucket_list,
-                hot_archive,
-                checkpoint_header.expect("checkpoint header"),
-                checkpoint_header_hash,
-            )
-            .unwrap();
+        let log_file_path = log_file.lock().unwrap().clone();
 
-        // Trigger publish and wait for completion
-        app.maybe_publish_history().await;
-        wait_for_publish_queue_to_drain(&app).await;
+        assert_eq!(
+            fixture.app.bucket_manager.bucket_dir(),
+            fixture.custom_bucket_dir.as_path()
+        );
+
+        fixture.app.maybe_publish_history().await;
+        wait_for_publish_queue_to_drain(&fixture.app).await;
 
         // Verify: log file must exist and contain at least one source path
-        let log_contents = std::fs::read_to_string(&log_file)
+        let log_contents = std::fs::read_to_string(&log_file_path)
             .expect("put command log file should exist (publish must have run)");
         let paths: Vec<&str> = log_contents.lines().filter(|l| !l.is_empty()).collect();
         assert!(
@@ -1098,7 +1031,7 @@ mod tests {
         );
 
         // Every source path must start with <bucket_dir>/tmp/
-        let expected_prefix = custom_bucket_dir.join("tmp");
+        let expected_prefix = fixture.custom_bucket_dir.join("tmp");
         for path in &paths {
             assert!(
                 path.starts_with(expected_prefix.to_str().unwrap()),
@@ -1109,7 +1042,7 @@ mod tests {
         }
 
         // Staging directory should be cleaned up after successful publish
-        let tmp_dir = custom_bucket_dir.join("tmp");
+        let tmp_dir = fixture.custom_bucket_dir.join("tmp");
         if tmp_dir.exists() {
             let remaining: Vec<_> = std::fs::read_dir(&tmp_dir)
                 .unwrap()
@@ -1223,163 +1156,33 @@ mod tests {
     /// the design principle that the permit guard correctly handles unwinding.
     #[tokio::test]
     async fn test_publish_panic_clears_flag_and_retains_queue() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let db_dir = dir.path().join("db");
-        let db_path = db_dir.join("henyey.sqlite");
-        let custom_bucket_dir = dir.path().join("custom-buckets");
-        let archive_dir = dir.path().join("archive");
-        std::fs::create_dir_all(&db_dir).unwrap();
-        std::fs::create_dir_all(&custom_bucket_dir).unwrap();
-        std::fs::create_dir_all(&archive_dir).unwrap();
-
-        let mut config = crate::config::ConfigBuilder::new()
-            .database_path(&db_path)
-            .bucket_directory(&custom_bucket_dir)
-            .validator(true)
-            .node_seed("SAFTEV5U6QDFE2DRMSD7HBE76XG7SQZJD6VIUTHIXTJGO77RUQYVURLA")
-            .build();
-        config.history.archives = vec![test_archive_entry("panic-test", &archive_dir)];
-
-        let app = Arc::new(App::new(config.clone()).await.unwrap());
-        app.set_self_arc().await;
-
-        // Build genesis bucket list
-        let passphrase = app.config.network.passphrase.clone();
-        let genesis_entries = App::build_genesis_entries(&passphrase, 0, TOTAL_COINS);
-        let live_probe_header = make_header(
-            1,
-            Hash256::ZERO,
-            Hash256::ZERO,
-            Hash256::ZERO,
-            Hash256::ZERO,
-        );
-        let mut probe_bucket_list = BucketList::new();
-        probe_bucket_list.set_bucket_dir(custom_bucket_dir.clone());
-        probe_bucket_list
-            .add_batch(
-                1,
-                0,
-                stellar_xdr::curr::BucketListType::Live,
-                genesis_entries.clone(),
-                vec![],
-                vec![],
-            )
-            .unwrap();
-        let live_hash = probe_bucket_list.hash();
-        let hot_archive = HotArchiveBucketList::new();
-        let combined_hash = combined_bucket_hash(live_hash, hot_archive.hash());
-
-        let live_header = LedgerHeader {
-            bucket_list_hash: Hash(live_hash.0),
-            ..live_probe_header
-        };
-        let mut bucket_list =
-            App::create_genesis_bucket_list(&custom_bucket_dir, genesis_entries, &live_header)
-                .unwrap();
-        bucket_list.set_ledger_seq(CHECKPOINT);
-        let has = build_history_archive_state(
-            CHECKPOINT,
-            &bucket_list,
-            Some(&hot_archive),
-            Some(passphrase.clone()),
-        )
-        .unwrap();
-        let has_json = has.to_json().unwrap();
-
-        let empty_result = empty_tx_result(1);
-        let empty_result_hash = Hash256::hash(
-            &empty_result
-                .tx_result_set
-                .to_xdr(Limits::none())
-                .expect("empty result xdr"),
-        );
-
-        // Seed ledger headers, tx history, results for checkpoint
-        let mut previous_header_hash = Hash256::ZERO;
-        let mut checkpoint_header = None;
-        let mut checkpoint_header_hash = Hash256::ZERO;
-        let mut headers_and_history = Vec::new();
-        for seq in 1..=CHECKPOINT {
-            let tx_entry = empty_tx_history(seq, previous_header_hash);
-            let tx_hash = if seq == 1 {
-                Hash256::ZERO
-            } else {
-                henyey_history::verify::compute_tx_set_hash(&TransactionSetVariant::Classic(
-                    tx_entry.tx_set.clone(),
-                ))
-                .unwrap()
-            };
-            let result_entry = empty_tx_result(seq);
-            let result_hash = if seq == 1 {
-                Hash256::ZERO
-            } else {
-                empty_result_hash
-            };
-            let header = make_header(
-                seq,
-                previous_header_hash,
-                tx_hash,
-                result_hash,
-                combined_hash,
-            );
-            let header_xdr = header.to_xdr(Limits::none()).unwrap();
-            previous_header_hash = henyey_ledger::compute_header_hash(&header).unwrap();
-            if seq == CHECKPOINT {
-                checkpoint_header_hash = previous_header_hash;
-                checkpoint_header = Some(header.clone());
-            }
-            headers_and_history.push((header, header_xdr, tx_entry, result_entry));
-        }
-
-        app.db_blocking("seed-panic-test", {
-            let bucket_levels = bucket_levels(&bucket_list);
-            let has_json = has_json.clone();
-            let headers_and_history = headers_and_history.clone();
-            move |db| {
-                db.with_connection(|conn| {
-                    for (header, header_xdr, tx_entry, result_entry) in &headers_and_history {
-                        conn.store_ledger_header(header, header_xdr)?;
-                        conn.store_tx_history_entry(header.ledger_seq, tx_entry)?;
-                        conn.store_tx_result_entry(header.ledger_seq, result_entry)?;
-                    }
-                    conn.set_last_closed_ledger(CHECKPOINT)?;
-                    conn.store_bucket_list(CHECKPOINT, &bucket_levels)?;
-                    conn.set_state(state_keys::HISTORY_ARCHIVE_STATE, &has_json)?;
-                    conn.enqueue_publish(CHECKPOINT, &has_json)?;
-                    Ok::<_, henyey_db::DbError>(())
-                })
-                .map_err(Into::into)
-            }
+        let fixture = setup_publish_fixture("panic-test", |dir, config| {
+            let archive_dir = dir.join("archive");
+            config.history.archives = vec![test_archive_entry("panic-test", &archive_dir)];
         })
-        .await
-        .unwrap();
-
-        app.ledger_manager
-            .initialize(
-                bucket_list,
-                hot_archive,
-                checkpoint_header.expect("checkpoint header"),
-                checkpoint_header_hash,
-            )
-            .unwrap();
+        .await;
 
         // --- Phase 1: trigger panic ---
-        app.publish_panic_inject.store(true, Ordering::SeqCst);
-        app.maybe_publish_history().await;
-        wait_for_publish_attempt(&app).await;
+        fixture
+            .app
+            .publish_panic_inject
+            .store(true, Ordering::SeqCst);
+        fixture.app.maybe_publish_history().await;
+        wait_for_publish_attempt(&fixture.app).await;
 
         // One-shot consumed → panic site was reached
         assert!(
-            !app.publish_panic_inject.load(Ordering::SeqCst),
+            !fixture.app.publish_panic_inject.load(Ordering::SeqCst),
             "panic injection flag should have been consumed"
         );
         // Permit released by Drop during unwind
         assert!(
-            !app.publish_in_progress.load(Ordering::SeqCst),
+            !fixture.app.publish_in_progress.load(Ordering::SeqCst),
             "publish_in_progress should be cleared after panic"
         );
         // Checkpoint NOT dequeued (publish failed)
-        let queue = app
+        let queue = fixture
+            .app
             .db_blocking("check-queue-after-panic", |db| {
                 db.load_publish_queue(None).map_err(Into::into)
             })
@@ -1392,10 +1195,11 @@ mod tests {
         );
 
         // --- Phase 2: retry succeeds ---
-        app.maybe_publish_history().await;
-        wait_for_publish_queue_to_drain(&app).await;
+        fixture.app.maybe_publish_history().await;
+        wait_for_publish_queue_to_drain(&fixture.app).await;
 
-        let queue = app
+        let queue = fixture
+            .app
             .db_blocking("check-queue-after-retry", |db| {
                 db.load_publish_queue(None).map_err(Into::into)
             })
@@ -1429,200 +1233,61 @@ mod tests {
 
     /// Stage E: end-to-end check that `publish_single_checkpoint`'s success
     /// path increments `stellar_history_publish_success_total` and records
-    /// the publish duration histogram. We use the global test recorder
-    /// (`ensure_test_recorder`) and assert the rendered Prometheus output
-    /// contains the counter and the histogram has at least one observation.
-    ///
-    /// Marked `#[ignore]` for now: the test setup needed for the publish
-    /// pipeline to complete (DB seed + bucket list initialisation) is
-    /// extensive and reuses the same scaffolding as `custom_bucket_directory_*`
-    /// — getting the genesis-equivalent fixture green here is a follow-up.
-    /// The catalog-registration and literal-presence tests already pin the
-    /// wire names, and the larger panic test exercises both paths through
-    /// `publish_single_checkpoint`. This test will be made non-ignored
-    /// once a shared fixture helper is extracted.
-    #[ignore = "fixture setup matches custom_bucket_directory_* but publish queue does \
-                not drain in this scaffolding — see follow-up issue"]
+    /// the publish duration histogram.
     #[tokio::test]
     async fn test_publish_emits_stage_e_metrics_on_success() {
-        // Ensure the recorder + catalog registrations are in place so the
-        // rendered output has stable HELP/TYPE/zero lines for our metrics.
+        // Ensure the recorder + catalog registrations are in place.
         let handle = crate::metrics::ensure_test_recorder();
         crate::metrics::describe_metrics();
         crate::metrics::register_label_series();
 
-        let dir = tempfile::tempdir().expect("temp dir");
-        let db_dir = dir.path().join("db");
-        let db_path = db_dir.join("henyey.sqlite");
-        let custom_bucket_dir = dir.path().join("custom-buckets");
-        let archive_dir = dir.path().join("archive");
-        std::fs::create_dir_all(&db_dir).unwrap();
-        std::fs::create_dir_all(&custom_bucket_dir).unwrap();
-        std::fs::create_dir_all(&archive_dir).unwrap();
+        // Capture baseline before publish (recorder is process-global).
+        let before_output = handle.render();
+        let before_hist_count =
+            parse_metric_count(&before_output, "stellar_history_publish_time_seconds_count");
+        let before_success_count =
+            parse_metric_count(&before_output, "stellar_history_publish_success_total");
 
-        let mut config = crate::config::ConfigBuilder::new()
-            .database_path(&db_path)
-            .bucket_directory(&custom_bucket_dir)
-            .validator(true)
-            .node_seed("SAFTEV5U6QDFE2DRMSD7HBE76XG7SQZJD6VIUTHIXTJGO77RUQYVURLA")
-            .build();
-        config.history.archives = vec![test_archive_entry("stage-e-test", &archive_dir)];
-
-        let app = Arc::new(App::new(config.clone()).await.unwrap());
-        app.set_self_arc().await;
-
-        // Build genesis bucket list and seed the publish queue, mirroring
-        // the setup pattern used by the panic test above.
-        let passphrase = app.config.network.passphrase.clone();
-        let genesis_entries = App::build_genesis_entries(&passphrase, 0, TOTAL_COINS);
-        let live_probe_header = make_header(
-            1,
-            Hash256::ZERO,
-            Hash256::ZERO,
-            Hash256::ZERO,
-            Hash256::ZERO,
-        );
-        let mut probe_bucket_list = BucketList::new();
-        probe_bucket_list.set_bucket_dir(custom_bucket_dir.clone());
-        probe_bucket_list
-            .add_batch(
-                1,
-                0,
-                stellar_xdr::curr::BucketListType::Live,
-                genesis_entries.clone(),
-                vec![],
-                vec![],
-            )
-            .unwrap();
-        let live_hash = probe_bucket_list.hash();
-        let hot_archive = HotArchiveBucketList::new();
-        let combined_hash = combined_bucket_hash(live_hash, hot_archive.hash());
-        let live_header = LedgerHeader {
-            bucket_list_hash: Hash(live_hash.0),
-            ..live_probe_header
-        };
-        let mut bucket_list =
-            App::create_genesis_bucket_list(&custom_bucket_dir, genesis_entries, &live_header)
-                .unwrap();
-        bucket_list.set_ledger_seq(CHECKPOINT);
-        let has = build_history_archive_state(
-            CHECKPOINT,
-            &bucket_list,
-            Some(&hot_archive),
-            Some(passphrase.clone()),
-        )
-        .unwrap();
-        let has_json = has.to_json().unwrap();
-
-        let empty_tx_set_hash = henyey_history::verify::compute_tx_set_hash(
-            &TransactionSetVariant::Classic(TransactionSet {
-                previous_ledger_hash: Hash([0u8; 32]),
-                txs: VecM::default(),
-            }),
-        )
-        .unwrap();
-        let empty_result = empty_tx_result(1);
-        let empty_result_hash = Hash256::hash(
-            &empty_result
-                .tx_result_set
-                .to_xdr(Limits::none())
-                .expect("empty result xdr"),
-        );
-
-        let mut headers_and_history = Vec::new();
-        let mut previous_header_hash = Hash256::ZERO;
-        let mut checkpoint_header: Option<LedgerHeader> = None;
-        let mut checkpoint_header_hash = Hash256::ZERO;
-        for seq in 1..=CHECKPOINT {
-            let tx_entry = empty_tx_history(seq, previous_header_hash);
-            let tx_hash = if seq == 1 {
-                Hash256::ZERO
-            } else {
-                empty_tx_set_hash
-            };
-            let result_entry = empty_tx_result(seq);
-            let result_hash = if seq == 1 {
-                Hash256::ZERO
-            } else {
-                empty_result_hash
-            };
-            let header = make_header(
-                seq,
-                previous_header_hash,
-                tx_hash,
-                result_hash,
-                combined_hash,
-            );
-            let header_xdr = header.to_xdr(Limits::none()).unwrap();
-            previous_header_hash = henyey_ledger::compute_header_hash(&header).unwrap();
-            if seq == CHECKPOINT {
-                checkpoint_header_hash = previous_header_hash;
-                checkpoint_header = Some(header.clone());
-            }
-            headers_and_history.push((header, header_xdr, tx_entry, result_entry));
-        }
-
-        app.db_blocking("seed-stage-e-test", {
-            let bucket_levels = bucket_levels(&bucket_list);
-            let has_json = has_json.clone();
-            let headers_and_history = headers_and_history.clone();
-            move |db| {
-                db.with_connection(|conn| {
-                    for (header, header_xdr, tx_entry, result_entry) in &headers_and_history {
-                        conn.store_ledger_header(header, header_xdr)?;
-                        conn.store_tx_history_entry(header.ledger_seq, tx_entry)?;
-                        conn.store_tx_result_entry(header.ledger_seq, result_entry)?;
-                    }
-                    conn.set_last_closed_ledger(CHECKPOINT)?;
-                    conn.store_bucket_list(CHECKPOINT, &bucket_levels)?;
-                    conn.set_state(state_keys::HISTORY_ARCHIVE_STATE, &has_json)?;
-                    conn.enqueue_publish(CHECKPOINT, &has_json)?;
-                    Ok::<_, henyey_db::DbError>(())
-                })
-                .map_err(Into::into)
-            }
+        let fixture = setup_publish_fixture("stage-e-test", |dir, config| {
+            let archive_dir = dir.join("archive");
+            config.history.archives = vec![test_archive_entry("stage-e-test", &archive_dir)];
         })
-        .await
-        .unwrap();
-
-        app.ledger_manager
-            .initialize(
-                bucket_list,
-                hot_archive,
-                checkpoint_header.expect("checkpoint header"),
-                checkpoint_header_hash,
-            )
-            .unwrap();
+        .await;
 
         // Drive a successful publish.
-        app.maybe_publish_history().await;
-        wait_for_publish_queue_to_drain(&app).await;
+        fixture.app.maybe_publish_history().await;
+        wait_for_publish_queue_to_drain(&fixture.app).await;
 
-        // After a successful publish, the histogram has at least one
-        // observation (visible as the `_count` line) and the success
-        // counter is registered (it might be 0 if catalog reset between
-        // tests, but `_count` of the histogram is the strict regression
-        // guard for the new emit-site code).
-        let output = handle.render();
+        // After a successful publish, verify metrics deltas.
+        let after_output = handle.render();
+        let after_hist_count =
+            parse_metric_count(&after_output, "stellar_history_publish_time_seconds_count");
+        let after_success_count =
+            parse_metric_count(&after_output, "stellar_history_publish_success_total");
+
+        // Use >= (not ==) because ensure_test_recorder is process-global and
+        // other tests may record metrics concurrently.
         assert!(
-            output.contains("# TYPE stellar_history_publish_success_total counter"),
-            "stellar_history_publish_success_total not in rendered metrics: {output}",
+            after_hist_count > before_hist_count,
+            "publish histogram should have at least one new observation; \
+             before={before_hist_count}, after={after_hist_count}",
         );
         assert!(
-            output.contains("# TYPE stellar_history_publish_time_seconds histogram"),
-            "stellar_history_publish_time_seconds not in rendered metrics: {output}",
+            after_success_count > before_success_count,
+            "publish success counter should have incremented; \
+             before={before_success_count}, after={after_success_count}",
         );
-        let count_line = output
+    }
+
+    /// Parse a metric value from rendered Prometheus text output.
+    /// Returns the numeric value of the first line matching `metric_name`,
+    /// or 0 if not found.
+    fn parse_metric_count(output: &str, metric_name: &str) -> u64 {
+        output
             .lines()
-            .find(|l| l.starts_with("stellar_history_publish_time_seconds_count"));
-        let count: u64 = count_line
+            .find(|l| l.starts_with(metric_name) && !l.starts_with(&format!("{metric_name}_")))
             .and_then(|l| l.split_whitespace().last())
             .and_then(|s| s.parse().ok())
-            .unwrap_or(0);
-        assert!(
-            count >= 1,
-            "publish histogram should have at least one observation after successful \
-             publish; rendered _count line: {count_line:?}",
-        );
+            .unwrap_or(0)
     }
 }
