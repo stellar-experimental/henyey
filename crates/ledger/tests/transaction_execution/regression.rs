@@ -4286,6 +4286,20 @@ fn test_audit_007_sequential_soroban_fee_charged_subtracts_refund() {
         "XDR feeCharged must match: expected {} (pre_charged {} - refund {})",
         expected_fee_charged, pre_charged_fee, fee_refund
     );
+
+    // Verify tx_result_metas also has corrected fee_charged (positive case).
+    assert_eq!(
+        result.tx_result_metas[0].result.result.fee_charged, expected_fee_charged,
+        "tx_result_metas feeCharged must match: expected {} (pre_charged {} - refund {})",
+        expected_fee_charged, pre_charged_fee, fee_refund
+    );
+
+    // Successful refund should produce STATE+UPDATED meta changes.
+    assert_eq!(
+        result.tx_result_metas[0].post_tx_apply_fee_processing.len(),
+        2,
+        "successful refund should emit STATE+UPDATED pair in post_tx_apply_fee_processing"
+    );
 }
 
 /// [AUDIT-095] Verify that pre_parallel_apply globalizes sequence bumps

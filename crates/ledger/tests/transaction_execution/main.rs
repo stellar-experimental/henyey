@@ -433,5 +433,6 @@ fn native_asset_contract_id(network_id: &NetworkId) -> ContractId {
 }
 
 mod classic_events;
+mod fee_refund_correction;
 mod preconditions;
 mod regression;
