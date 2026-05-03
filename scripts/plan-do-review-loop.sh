@@ -51,83 +51,96 @@ log "Max stale retries: ${LOOP_MAX_STALE_RETRIES}"
 log "Log dir:   $LOOP_LOG_DIR"
 
 # --- Issue selection ---
-# Priority: urgent → high → medium → low → rest (all unassigned).
-# Within each tier, oldest first. Excludes not-ready and failed issues.
-# Skips issues already assigned to anyone (uses `no:assignee` search qualifier).
-# Collects up to LOOP_BATCH_SIZE issues across priority tiers.
+# Project-board-native: eligible issues are those in the henyey project (#2)
+# `Backlog` column, open, unassigned. Excludes everything currently in
+# `Blocked`, `in plan`, `In progress`, `In review`, or `Done`.
+#
+# Priority: urgent → high → medium → low → rest. Within each tier, oldest
+# first. Collects up to LOOP_BATCH_SIZE issues across tiers.
 # Outputs one line per issue: "<number> <title>"
 # Returns 0 on success/empty, 1 on API error.
+PROJECT_OWNER="stellar-experimental"
+PROJECT_NUMBER=2
+BACKLOG_OPTION_ID="f75ad846"
+
 select_issues() {
   local needed="$LOOP_BATCH_SIZE"
-  local found=0
-  local seen_numbers=""
-  local json number title
 
-  # Priority 1–4: unassigned issues by priority label (urgent → high → medium → low),
-  # oldest first within each tier.
-  local priority
-  for priority in urgent high medium low; do
-    [[ "$found" -ge "$needed" ]] && break
-
-    local remaining=$((needed - found))
-    if ! json="$(gh issue list \
-      --state open \
-      --label "$priority" \
-      --search 'sort:created-asc no:assignee -label:plan-do-review-loop-failed -label:not-ready' \
-      --json number,title \
-      --limit "$remaining")"; then
-      return 1
-    fi
-
-    local count
-    count="$(jq 'length' <<<"$json")"
-    local i
-    for ((i = 0; i < count && found < needed; i++)); do
-      number="$(jq -r ".[$i].number" <<<"$json")"
-      # Skip duplicates (an issue may match multiple priority labels)
-      if [[ " $seen_numbers " == *" $number "* ]]; then
-        continue
-      fi
-      title="$(jq -r ".[$i].title // \"\"" <<<"$json")"
-      echo "${number} ${title}"
-      seen_numbers="$seen_numbers $number"
-      found=$((found + 1))
-    done
-  done
-
-  # Priority 5: any remaining eligible issue (no priority label requirement), oldest first.
-  if [[ "$found" -lt "$needed" ]]; then
-    local remaining=$((needed - found))
-    if ! json="$(gh issue list \
-      --state open \
-      --search 'sort:created-asc no:assignee -label:plan-do-review-loop-failed -label:not-ready' \
-      --json number,title \
-      --limit "$remaining")"; then
-      return 1
-    fi
-
-    local count
-    count="$(jq 'length' <<<"$json")"
-    local i
-    for ((i = 0; i < count && found < needed; i++)); do
-      number="$(jq -r ".[$i].number" <<<"$json")"
-      if [[ " $seen_numbers " == *" $number "* ]]; then
-        continue
-      fi
-      title="$(jq -r ".[$i].title // \"\"" <<<"$json")"
-      echo "${number} ${title}"
-      seen_numbers="$seen_numbers $number"
-      found=$((found + 1))
-    done
+  # One paginated GraphQL query: all open Backlog items on project #2.
+  # `--paginate` requires the cursor variable name to be exactly $endCursor.
+  # `jq -s` is required because gh emits one JSON object per page.
+  local backlog_json
+  if ! backlog_json="$(gh api graphql --paginate -f query='
+    query($org: String!, $proj: Int!, $endCursor: String) {
+      organization(login: $org) {
+        projectV2(number: $proj) {
+          items(first: 100, after: $endCursor) {
+            pageInfo { endCursor hasNextPage }
+            nodes {
+              status: fieldValueByName(name: "Status") {
+                ... on ProjectV2ItemFieldSingleSelectValue { optionId }
+              }
+              content {
+                ... on Issue {
+                  number title createdAt state
+                  assignees(first: 5) { nodes { login } }
+                  labels(first: 20)    { nodes { name } }
+                }
+              }
+            }
+          }
+        }
+      }
+    }' -f org="$PROJECT_OWNER" -F proj="$PROJECT_NUMBER" 2>/dev/null)"; then
+    return 1
   fi
+
+  # Walk priority tiers, dedupe, accumulate up to $needed.
+  local found=0 seen=""
+  local priority
+  for priority in urgent high medium low ""; do
+    [[ "$found" -ge "$needed" ]] && break
+    local remaining=$((needed - found))
+
+    # `$priority == ""` is the Priority-5 fallback: any remaining Backlog
+    # open unassigned issue, oldest first (no priority-label requirement).
+    local candidates
+    candidates="$(jq -rs --arg p "$priority" \
+                       --arg backlog "$BACKLOG_OPTION_ID" \
+                       --argjson n "$remaining" '
+      [ .[].data.organization.projectV2.items.nodes[]
+        | select(.status.optionId == $backlog)
+        | select(.content.state == "OPEN")
+        | select((.content.assignees.nodes | length) == 0)
+        | select($p == "" or (.content.labels.nodes | map(.name) | index($p)))
+      ]
+      | sort_by(.content.createdAt)
+      | .[0:$n][]
+      | "\(.content.number) \(.content.title)"
+    ' <<<"$backlog_json")" || return 1
+
+    local line num
+    while IFS= read -r line; do
+      [[ -z "$line" ]] && continue
+      num="${line%% *}"
+      [[ " $seen " == *" $num "* ]] && continue
+      echo "$line"
+      seen="$seen $num"
+      found=$((found + 1))
+      [[ "$found" -ge "$needed" ]] && break
+    done <<<"$candidates"
+  done
 }
 
-# Label a failed auto-selected issue so it won't be picked again.
+# Move a failed auto-selected issue to the `Blocked` column so it won't be
+# picked again, and unassign. The board column replaces the legacy
+# `plan-do-review-loop-failed` label.
 mark_failed() {
   local issue="$1"
-  log "Marking issue #${issue} as failed"
-  gh issue edit "$issue" --add-label "plan-do-review-loop-failed" 2>/dev/null \
-    || log "WARNING: could not add failure label to issue #${issue}"
+  log "Moving issue #${issue} to Blocked (failed)"
+  bash "$(dirname "$0")/../.github/skills/plan-do-review/scripts/move-issue-status.sh" \
+    "$issue" Blocked 2>/dev/null \
+    || log "WARNING: could not move issue #${issue} to Blocked"
   local me
   me="$(gh api user -q .login 2>/dev/null)" || true
   if [[ -n "$me" ]]; then
@@ -140,32 +153,56 @@ mark_failed() {
 # Count issue comments matching plan-do-review progress markers.
 # Returns a fingerprint (comment count) that changes when the skill makes
 # forward progress (new proposal draft, critic response, converged proposal,
-# review-fix report, implementation complete, not-ready triage, redirect).
+# review-fix report, implementation complete, Blocked move, redirect).
+#
+# "Moved to Blocked" matches the current dependency/readiness comments;
+# "Marking as not-ready" is kept for backward compatibility with legacy
+# comments posted before the project-board migration.
 count_progress_markers() {
   local issue="$1"
   gh issue view "$issue" --json comments \
     --jq '[.comments[].body | select(
-      test("Proposal Draft|Critic Response|Converged Proposal|Review-Fix Report|Implementation Complete|Marking as not-ready|⏩ This issue is blocked")
+      test("Proposal Draft|Critic Response|Converged Proposal|Review-Fix Report|Implementation Complete|Moved to Blocked|Marking as not-ready|⏩ This issue is blocked")
     )] | length' 2>/dev/null || echo "0"
 }
 
 # Check whether the issue reached a terminal state (no further retries needed).
-# Terminal states: closed, labeled not-ready, unassigned (redirect/triage).
+# Terminal states: closed, in the Blocked column, or unassigned (redirect).
 is_terminal() {
   local issue="$1"
   local json
-  json="$(gh issue view "$issue" --json state,labels,assignees 2>/dev/null)" || return 1
+  json="$(gh issue view "$issue" --json state,assignees 2>/dev/null)" || return 1
 
   local state
   state="$(jq -r '.state' <<<"$json")"
   [[ "$state" == "CLOSED" ]] && return 0
 
-  # not-ready label means triage decided it's not actionable
-  local has_not_ready
-  has_not_ready="$(jq -r '[.labels[].name] | any(. == "not-ready")' <<<"$json")"
-  [[ "$has_not_ready" == "true" ]] && return 0
+  # Blocked column on the henyey project board means triage decided the
+  # issue is not actionable right now (unmet deps, vague proposal, or skill
+  # crash). Operator must re-triage by moving back to Backlog.
+  local status_option
+  status_option="$(gh api graphql -f query='
+    query($owner: String!, $repo: String!, $num: Int!) {
+      repository(owner: $owner, name: $repo) {
+        issue(number: $num) {
+          projectItems(first: 20) {
+            nodes {
+              project { id }
+              fieldValueByName(name: "Status") {
+                ... on ProjectV2ItemFieldSingleSelectValue { optionId }
+              }
+            }
+          }
+        }
+      }
+    }' -f owner="$PROJECT_OWNER" -f repo=henyey -F num="$issue" \
+    --jq '.data.repository.issue.projectItems.nodes[]
+          | select(.project.id == "PVT_kwDOD-vqsM4BWQnL")
+          | .fieldValueByName.optionId' 2>/dev/null | head -n1)"
+  # Blocked option id = 53ce269e
+  [[ "$status_option" == "53ce269e" ]] && return 0
 
-  # Unassigned means the skill handed it off (redirect or triage)
+  # Unassigned means the skill handed it off (redirect / dependency triage).
   local assignee_count
   assignee_count="$(jq -r '.assignees | length' <<<"$json")"
   [[ "$assignee_count" == "0" ]] && return 0

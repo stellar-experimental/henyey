@@ -1,6 +1,6 @@
 ---
 name: plan-do-review
-description: Review a proposal issue with adversarial critics, converge on a plan, execute it, and iterate review-fix until clean
+description: Review a proposal issue with adversarial critics, converge on a plan, execute it, and iterate review-fix until clean. Drives the henyey project board (Backlog → in plan → In progress → In review → Done; Blocked on failure).
 argument-hint: "[issue-number] [--model <model>] [--max-proposal-rounds N] [--max-review-rounds N]"
 ---
 
@@ -19,41 +19,73 @@ working on it. Auto-claiming it races with that worker and silently
 piggybacks on stale context. To resume an in-progress issue, the caller
 must pass the issue number explicitly as an argument.
 
-Try each priority label in order (urgent → high → medium → low):
+**Auto-selection is project-board-native.** Eligible issues are those on the
+henyey project (`stellar-experimental/henyey`, project #2) currently in the
+`Backlog` column. Issues not yet on the project are NOT auto-selectable —
+the operator adds them to the board first. The `Blocked`, `in plan`,
+`In progress`, `In review`, and `Done` columns are excluded automatically by
+the Backlog filter; that is how the board replaces the legacy `not-ready` and
+`plan-do-review-loop-failed` labels.
+
+Fetch all open Backlog items once, then pick by priority label
+(`urgent` → `high` → `medium` → `low`) with oldest-first as the tiebreaker:
+
 ```bash
-# Priority 1–4: unassigned issues by label (urgent → high → medium → low).
-# NOTE: `--assignee ''` does NOT filter for unassigned issues (gh ignores
-# the empty value). Use `no:assignee` inside `--search` instead.
+# One paginated GraphQL query for all Backlog items on project #2.
+# `--paginate` requires the cursor variable to be named exactly $endCursor;
+# `jq -s` is required because gh outputs one JSON object per page.
+backlog_json=$(gh api graphql --paginate -f query='
+  query($org: String!, $proj: Int!, $endCursor: String) {
+    organization(login: $org) {
+      projectV2(number: $proj) {
+        items(first: 100, after: $endCursor) {
+          pageInfo { endCursor hasNextPage }
+          nodes {
+            status: fieldValueByName(name: "Status") {
+              ... on ProjectV2ItemFieldSingleSelectValue { optionId }
+            }
+            content {
+              ... on Issue {
+                number title createdAt state
+                assignees(first: 5) { nodes { login } }
+                labels(first: 20)    { nodes { name } }
+              }
+            }
+          }
+        }
+      }
+    }
+  }' -f org=stellar-experimental -F proj=2)
+
+# Backlog option id is f75ad846 (verified). Pick the first eligible issue
+# per priority tier; oldest first within a tier.
+ISSUE=
 for priority in urgent high medium low; do
-  gh issue list \
-    --state open \
-    --label "$priority" \
-    --search 'no:assignee sort:created-asc -label:plan-do-review-loop-failed -label:not-ready' \
-    --json number,title,assignees \
-    --jq '[.[] | select(.assignees | length == 0)] | .[0] // empty' \
-    --limit 5
-  # Stop at the first match.
+  ISSUE=$(jq -rs --arg p "$priority" '
+    [ .[].data.organization.projectV2.items.nodes[]
+      | select(.status.optionId == "f75ad846")
+      | select(.content.state == "OPEN")
+      | select((.content.assignees.nodes | length) == 0)
+      | select(.content.labels.nodes | map(.name) | index($p))
+    ] | sort_by(.content.createdAt) | .[0].content.number // empty
+  ' <<< "$backlog_json")
+  [ -n "$ISSUE" ] && break
 done
+
+# Priority-5 fallback: any Backlog open unassigned, oldest first.
+if [ -z "$ISSUE" ]; then
+  ISSUE=$(jq -rs '
+    [ .[].data.organization.projectV2.items.nodes[]
+      | select(.status.optionId == "f75ad846")
+      | select(.content.state == "OPEN")
+      | select((.content.assignees.nodes | length) == 0)
+    ] | sort_by(.content.createdAt) | .[0].content.number // empty
+  ' <<< "$backlog_json")
+fi
 ```
 
-If still empty, fall back:
-```bash
-# Priority 5: any remaining eligible issue, oldest first.
-gh issue list \
-  --state open \
-  --search 'no:assignee sort:created-asc -label:plan-do-review-loop-failed -label:not-ready' \
-  --json number,title,assignees \
-  --jq '[.[] | select(.assignees | length == 0)] | .[0] // empty' \
-  --limit 5
-```
-
-**Defense-in-depth.** Both queries above use `no:assignee` server-side AND a
-client-side jq filter that drops any issue with a non-empty `assignees` array.
-This double-check guards against future gh CLI regressions where `no:assignee`
-is silently ignored — the symptom is hard to detect because the query still
-returns plausible-looking results, just including assigned issues.
-
-If still empty, **stop** with a message: "No eligible unassigned issues found for auto-selection."
+If `$ISSUE` is still empty, **stop** with a message: "No eligible unassigned
+issues found in Backlog for auto-selection."
 
 Otherwise, set `$ISSUE` to the selected issue number and announce:
 "Auto-selected issue #$ISSUE: <title>".
@@ -91,13 +123,15 @@ Step 1.
    ```bash
    gh issue edit $ISSUE --remove-assignee "$(gh api user -q .login)"
    ```
-2. If `$AUTO_SELECTED` is `true`, also label the issue so it won't be
-   auto-selected again:
+2. Move the issue to the `Blocked` column. This applies whether the issue
+   was auto-selected or passed explicitly — the operator can review the
+   failure and re-triage by moving it back to `Backlog`. Auto-select
+   never picks Blocked items, so this also prevents infinite retry loops:
    ```bash
-   gh issue edit $ISSUE --add-label "plan-do-review-loop-failed"
+   bash .github/skills/plan-do-review/scripts/move-issue-status.sh "$ISSUE" Blocked
    ```
 This releases the lock so other workers can see the issue is no longer in
-progress, and (for auto-selected issues) prevents infinite retry loops.
+progress.
 
 # Plan-Do-Review
 
@@ -238,13 +272,13 @@ Before triaging readiness, check whether the issue has **unmet dependencies**
    issue is not actually blocked — continue to Readiness Triage.
 
 3. If any open blocker(s) exist, the issue has unmet dependencies. **Stop**:
-   1. Add the `not-ready` label:
+   1. Move the issue to `Blocked`:
       ```bash
-      gh issue edit $ISSUE --add-label "not-ready"
+      bash .github/skills/plan-do-review/scripts/move-issue-status.sh "$ISSUE" Blocked
       ```
    2. Post a comment listing the blockers:
       ```bash
-      gh issue comment $ISSUE --body "Marking as not-ready: blocked by open issue(s) #X, #Y. Will be retried once dependencies are resolved."
+      gh issue comment $ISSUE --body "Moved to Blocked: depends on open issue(s) #X, #Y. Will be retried once dependencies are resolved."
       ```
    3. Unassign yourself:
       ```bash
@@ -268,13 +302,13 @@ ready** if any of these are true:
 
 If the issue is **not ready**:
 
-1. Add the `not-ready` label:
+1. Move the issue to `Blocked`:
    ```bash
-   gh issue edit $ISSUE --add-label "not-ready"
+   bash .github/skills/plan-do-review/scripts/move-issue-status.sh "$ISSUE" Blocked
    ```
 2. Post a comment explaining why the issue is not ready and what is needed:
    ```bash
-   gh issue comment $ISSUE --body "Marking as not-ready: {reason}. This issue needs {what's missing} before it can be picked up."
+   gh issue comment $ISSUE --body "Moved to Blocked: {reason}. This issue needs {what's missing} before it can be picked up."
    ```
 3. Unassign yourself:
    ```bash
@@ -282,11 +316,10 @@ If the issue is **not ready**:
    ```
 4. Stop. Do not proceed to Step 2.
 
-If the issue **is ready**, remove the `not-ready` label if present (it may have
-been added previously and the issue has since been updated):
-```bash
-gh issue edit $ISSUE --remove-label "not-ready" 2>/dev/null || true
-```
+If the issue **is ready**, the Step 2 entry hook below will move it from
+its current column (typically `Backlog`, but sometimes `Blocked` if a prior
+run blocked it and the dependency has since been resolved) into `in plan`.
+No explicit cleanup is needed here.
 
 Build context for the issue — but **budget your context aggressively**.
 
@@ -352,6 +385,14 @@ Every proposal (initial and subsequent rewrites) should include:
 ---
 
 ## Step 2: Proposal Convergence Loop
+
+**Move the issue to `in plan`** — proposal convergence is starting. This is
+idempotent on resume: a prior run may have already moved it here, in which
+case this is a no-op.
+
+```bash
+bash .github/skills/plan-do-review/scripts/move-issue-status.sh "$ISSUE" "in plan"
+```
 
 Repeat until `VERDICT: APPROVED` or `proposal_round >= max_proposal_rounds`:
 
@@ -568,6 +609,12 @@ gh issue comment $ISSUE --body-file "$tmpfile"
 rm -f "$tmpfile"
 ```
 
+**Move the issue to `In progress`** — proposal converged, execution begins:
+
+```bash
+bash .github/skills/plan-do-review/scripts/move-issue-status.sh "$ISSUE" "In progress"
+```
+
 ---
 
 ## Step 3: Execute the Proposal
@@ -701,11 +748,21 @@ git worktree remove "$WORKTREE_PATH"
 git branch -d "$WORKTREE_BRANCH"
 ```
 
+**Move the issue to `In review`** — code has landed on `main` and the
+review-fix loop is about to start:
+
+```bash
+bash .github/skills/plan-do-review/scripts/move-issue-status.sh "$ISSUE" "In review"
+```
+
 If the push fails repeatedly (branch protection blocks direct pushes,
 for example), open a PR from `$WORKTREE_BRANCH` with
 `gh pr create --fill` and let the PR-level review gate handle the
 landing. The worktree stays until the PR merges; do NOT `git worktree
-remove` it in that case.
+remove` it in that case. **Do NOT move the issue to `In review` in this
+branch** — the column should advance only when the change has actually
+reached `main`. Leave the issue in `In progress` until the PR merges,
+then move it manually or rerun the skill.
 
 If any verification step (3c–3e) failed and you could not converge on a
 green state, do NOT clean up — leave the worktree in place so the
@@ -818,9 +875,10 @@ rm -f "$tmpfile"
 
 ## Step 5: Completion
 
-Post a completion comment on the GitHub issue and unassign yourself:
+Move the issue to `Done`, post a completion comment, and unassign yourself:
 
 ```bash
+bash .github/skills/plan-do-review/scripts/move-issue-status.sh "$ISSUE" Done
 gh issue edit $ISSUE --remove-assignee @me
 ```
 
