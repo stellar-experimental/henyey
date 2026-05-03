@@ -780,7 +780,38 @@ impl OverlayManager {
                 } else {
                     state.metrics.flood_duplicate_recv.inc();
                 }
-                if !unique {
+                // SCP messages are NEVER dropped at the overlay/FloodGate
+                // level — they always pass through to the herder.
+                //
+                // FloodGate's role for SCP messages is *relay accounting*
+                // only: `record_seen` above tracked which peer sent us the
+                // envelope so `get_forward_peers` won't echo it back. The
+                // actual SCP in-flight dedup happens downstream in
+                // `pump_scp_intake` via the `scp_scheduled_envelopes`
+                // HashSet, which is the henyey equivalent of stellar-core's
+                // `checkScheduledAndCache` (Peer.cpp:1113-1117) — short-lived
+                // and cleared once the verify worker finishes. Duplicate
+                // self-rejection happens in the herder.
+                //
+                // If we drop SCP duplicates here, two failure modes follow:
+                // (1) In a small/standalone topology where the validator's
+                //     own broadcast records a hash, the same envelope
+                //     re-entering via a peer (GetScpState response, peer
+                //     reconnect, out-of-sync recovery) is silently dropped
+                //     and the herder never sees the peer-sourced provenance.
+                // (2) Alternate `from_peer` provenance for the same envelope
+                //     hash is discarded, breaking tx-set / quorum-set fetch
+                //     selection (lifecycle.rs `process_verified`), which
+                //     prefers fetching from a peer that has actually sent
+                //     us the envelope.
+                //
+                // stellar-core parity: Peer.cpp:1667-1673 calls
+                // `recvFloodedMsgID` (the relay-tracking equivalent of
+                // FloodGate) and then *unconditionally* calls
+                // `recvSCPEnvelope` — there is no FloodGate-level drop
+                // for SCP. We mirror that here. (See issue #2317.)
+                let is_scp = matches!(message, StellarMessage::ScpMessage(_));
+                if !unique && !is_scp {
                     return Some(false);
                 }
             } else {

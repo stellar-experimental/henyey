@@ -165,6 +165,42 @@ impl FloodGate {
     /// This is a pure insert/lookup operation with no automatic cleanup,
     /// matching stellar-core's `addRecord()`. Cleanup happens at ledger
     /// boundaries via [`clear_below`](FloodGate::clear_below).
+    ///
+    /// # Relay tracking vs. in-flight dedup
+    ///
+    /// `FloodGate` is a **relay-tracking** structure (the henyey equivalent
+    /// of stellar-core's `recvFloodedMsgID` / `addRecord` path). Its job
+    /// is to remember which peers have sent us each message hash so that
+    /// [`get_forward_peers`](FloodGate::get_forward_peers) does not echo
+    /// messages back to their senders, and so that operators can observe
+    /// duplicate-receive rates via metrics.
+    ///
+    /// It is **not** a substitute for short-lived in-flight dedup. Entries
+    /// here persist for an entire ledger window (cleared at ledger close
+    /// by `clear_below`, with a TTL backstop), whereas stellar-core's
+    /// in-flight dedup (`checkScheduledAndCache`, Peer.cpp:1113-1117)
+    /// uses a `weak_ptr<CapacityTrackedMessage>` cache that releases
+    /// entries the moment processing completes — typically milliseconds.
+    ///
+    /// In particular, **SCP messages must NOT be dropped at the FloodGate
+    /// layer based on `record_seen`'s return value**:
+    /// - Self-broadcast records a hash with `from_peer = None`. If a peer
+    ///   later echoes the same envelope back (peer reconnect, GetScpState
+    ///   response, out-of-sync recovery), FloodGate will report the
+    ///   second occurrence as a duplicate, but the herder still needs
+    ///   that envelope (with peer provenance) to fetch tx-sets and
+    ///   converge — see lifecycle.rs `process_verified`.
+    /// - Dropping a duplicate also discards alternate `from_peer`
+    ///   provenance for the same hash, which breaks tx-set / quorum-set
+    ///   fetch peer selection.
+    ///
+    /// stellar-core mirrors this rule: Peer.cpp:1667-1673 calls
+    /// `recvFloodedMsgID` for relay accounting and then *unconditionally*
+    /// calls `recvSCPEnvelope`. The henyey port enforces the same
+    /// invariant in the call site at `peer_loop.rs::route_received_message`.
+    /// SCP-specific in-flight dedup lives downstream in
+    /// `app::lifecycle::pump_scp_intake` (`scp_scheduled_envelopes`).
+    /// See issue #2317 for the regression that motivated this comment.
     pub fn record_seen(
         &self,
         message_hash: Hash256,
