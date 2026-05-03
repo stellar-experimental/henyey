@@ -4579,21 +4579,35 @@ fn test_post_seq_failure_removes_preauth_signer() {
     match &meta {
         TransactionMeta::V4(v4) => {
             let changes = &v4.tx_changes_before;
-            assert!(
-                !changes.0.is_empty(),
-                "tx_changes_before should contain seq bump + signer removal entries"
+            // AUDIT-239: Combined seq bump + signer removal must produce exactly
+            // one STATE/UPDATED pair (not two separate pairs).
+            assert_eq!(
+                changes.0.len(),
+                2,
+                "tx_changes_before should contain exactly one STATE + one UPDATED entry \
+                 (combined seq bump + signer removal), got {} entries",
+                changes.0.len()
             );
-            // Should have STATE + UPDATED pairs for the account mutation.
-            let has_state = changes
-                .0
-                .iter()
-                .any(|c| matches!(c, LedgerEntryChange::State(_)));
-            let has_updated = changes
-                .0
-                .iter()
-                .any(|c| matches!(c, LedgerEntryChange::Updated(_)));
-            assert!(has_state, "tx_changes_before should have STATE entry");
-            assert!(has_updated, "tx_changes_before should have UPDATED entry");
+            assert!(
+                matches!(&changes.0[0], LedgerEntryChange::State(_)),
+                "First entry should be STATE"
+            );
+            assert!(
+                matches!(&changes.0[1], LedgerEntryChange::Updated(_)),
+                "Second entry should be UPDATED"
+            );
+            // Verify the UPDATED entry reflects both seq bump and signer removal.
+            if let LedgerEntryChange::Updated(updated) = &changes.0[1] {
+                if let LedgerEntryData::Account(acc) = &updated.data {
+                    assert_eq!(acc.seq_num.0, 2, "UPDATED entry must reflect seq bump");
+                    assert!(
+                        acc.signers.is_empty(),
+                        "UPDATED entry must reflect signer removal"
+                    );
+                } else {
+                    panic!("UPDATED entry should be Account");
+                }
+            }
         }
         _ => panic!(
             "Expected TransactionMeta::V4, got {:?}",
@@ -5500,4 +5514,220 @@ fn test_failed_soroban_tx_no_soroban_meta() {
         !tx_events.is_empty(),
         "fee refund events must still be emitted for failed Soroban txs"
     );
+}
+
+/// AUDIT-239: Pre-auth signer removal + sequence bump must produce a single
+/// STATE/UPDATED pair in tx_changes_before on the SUCCESS path.
+///
+/// When a transaction is authenticated by a PreAuthTx signer, stellar-core
+/// combines seq bump + signer removal into one LedgerTxnEntry scope, emitting
+/// one STATE/UPDATED pair. Previously, Henyey produced two separate pairs.
+#[test]
+fn test_preauth_signer_and_seq_bump_produce_single_meta_entry() {
+    let secret = SecretKey::from_seed(&[130u8; 32]);
+    let account_id: AccountId = (&secret.public_key()).into();
+    let network_id = NetworkId::testnet();
+
+    // Create a destination account so CreateAccount succeeds.
+    let destination_id = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([4u8; 32])));
+
+    let operation = Operation {
+        source_account: None,
+        body: OperationBody::Payment(stellar_xdr::curr::PaymentOp {
+            destination: MuxedAccount::Ed25519(Uint256([4u8; 32])),
+            asset: Asset::Native,
+            amount: 1_000_000,
+        }),
+    };
+
+    let tx = Transaction {
+        source_account: MuxedAccount::Ed25519(Uint256(*secret.public_key().as_bytes())),
+        fee: 100,
+        seq_num: SequenceNumber(2),
+        cond: Preconditions::None,
+        memo: Memo::None,
+        operations: vec![operation].try_into().unwrap(),
+        ext: TransactionExt::V0,
+    };
+
+    // No ed25519 signature: the PreAuth signer alone authenticates the tx.
+    // Including an ed25519 sig would cause TxBadAuthExtra (the PreAuth signer
+    // already satisfies the threshold, making any envelope signature "extra").
+    let envelope = TransactionEnvelope::Tx(TransactionV1Envelope {
+        tx,
+        signatures: VecM::default(),
+    });
+
+    // Compute the tx hash for the PreAuthTx signer key.
+    let frame = henyey_tx::TransactionFrame::from_owned_with_network(envelope.clone(), network_id);
+    let tx_hash = frame.hash(&network_id).expect("tx hash");
+
+    // Create the PreAuthTx signer matching this transaction's hash.
+    let preauth_signer = Signer {
+        key: SignerKey::PreAuthTx(Uint256(tx_hash.0)),
+        weight: 1,
+    };
+
+    // Source account: seq_num=1, ed25519 weight + PreAuthTx signer.
+    let (source_key, source_entry) = {
+        let key = LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
+            account_id: account_id.clone(),
+        });
+        let entry = LedgerEntry {
+            last_modified_ledger_seq: 5,
+            data: LedgerEntryData::Account(AccountEntry {
+                account_id: account_id.clone(),
+                balance: 100_000_000,
+                seq_num: SequenceNumber(1),
+                num_sub_entries: 1, // one signer
+                inflation_dest: None,
+                flags: 0,
+                home_domain: String32::default(),
+                thresholds: Thresholds([1, 0, 0, 0]),
+                signers: vec![preauth_signer].try_into().unwrap(),
+                ext: AccountEntryExt::V1(AccountEntryExtensionV1 {
+                    liabilities: Liabilities {
+                        buying: 0,
+                        selling: 0,
+                    },
+                    ext: AccountEntryExtensionV1Ext::V2(AccountEntryExtensionV2 {
+                        num_sponsored: 0,
+                        num_sponsoring: 0,
+                        signer_sponsoring_i_ds: vec![SponsorshipDescriptor(None)]
+                            .try_into()
+                            .unwrap(),
+                        ext: AccountEntryExtensionV2Ext::V3(AccountEntryExtensionV3 {
+                            ext: ExtensionPoint::V0,
+                            seq_ledger: 0,
+                            seq_time: TimePoint(0),
+                        }),
+                    }),
+                }),
+            }),
+            ext: LedgerEntryExt::V0,
+        };
+        (key, entry)
+    };
+
+    // Destination account for the payment operation to succeed.
+    let (dest_key, dest_entry) = {
+        let key = LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
+            account_id: destination_id.clone(),
+        });
+        let entry = LedgerEntry {
+            last_modified_ledger_seq: 5,
+            data: LedgerEntryData::Account(AccountEntry {
+                account_id: destination_id.clone(),
+                balance: 10_000_000,
+                seq_num: SequenceNumber(0),
+                num_sub_entries: 0,
+                inflation_dest: None,
+                flags: 0,
+                home_domain: String32::default(),
+                thresholds: Thresholds([1, 0, 0, 0]),
+                signers: VecM::default(),
+                ext: AccountEntryExt::V0,
+            }),
+            ext: LedgerEntryExt::V0,
+        };
+        (key, entry)
+    };
+
+    let snapshot = SnapshotBuilder::new(10)
+        .add_entry(source_key, source_entry)
+        .add_entry(dest_key, dest_entry)
+        .build_with_default_header();
+    let snapshot = SnapshotHandle::new(snapshot);
+
+    let classic_events = ClassicEventConfig {
+        emit_classic_events: true,
+        backfill_stellar_asset_events: false,
+    };
+    let context = henyey_tx::LedgerContext::new(10, 1_000, 100, 5_000_000, 25, network_id);
+    let mut executor =
+        TransactionExecutor::new(&context, 0, SorobanConfig::default(), classic_events);
+    let result = executor
+        .execute_transaction(&snapshot, &envelope, 100, None)
+        .expect("execute");
+
+    // Transaction should succeed (payment to existing account).
+    assert_eq!(
+        result.failure, None,
+        "Transaction should succeed, but got failure: {:?}",
+        result.failure
+    );
+
+    // Verify: tx_meta contains tx_changes_before with EXACTLY one STATE/UPDATED pair.
+    let meta = result.tx_meta.expect("tx_meta should be populated");
+    match &meta {
+        TransactionMeta::V4(v4) => {
+            let changes = &v4.tx_changes_before;
+            // AUDIT-239: Combined seq bump + signer removal must produce exactly
+            // one STATE/UPDATED pair, not two separate pairs.
+            assert_eq!(
+                changes.0.len(),
+                2,
+                "tx_changes_before should contain exactly 2 entries (one STATE + one UPDATED). \
+                 Got {} entries: {:?}",
+                changes.0.len(),
+                changes
+                    .0
+                    .iter()
+                    .map(|c| match c {
+                        LedgerEntryChange::State(_) => "STATE",
+                        LedgerEntryChange::Updated(_) => "UPDATED",
+                        LedgerEntryChange::Created(_) => "CREATED",
+                        LedgerEntryChange::Removed(_) => "REMOVED",
+                        LedgerEntryChange::Restored(_) => "RESTORED",
+                    })
+                    .collect::<Vec<_>>()
+            );
+            assert!(
+                matches!(&changes.0[0], LedgerEntryChange::State(_)),
+                "First entry should be STATE"
+            );
+            assert!(
+                matches!(&changes.0[1], LedgerEntryChange::Updated(_)),
+                "Second entry should be UPDATED"
+            );
+
+            // Verify STATE entry contains original account state.
+            if let LedgerEntryChange::State(state_entry) = &changes.0[0] {
+                if let LedgerEntryData::Account(acc) = &state_entry.data {
+                    assert_eq!(acc.seq_num.0, 1, "STATE entry should show original seq_num");
+                    assert_eq!(
+                        acc.signers.len(),
+                        1,
+                        "STATE entry should show PreAuthTx signer still present"
+                    );
+                } else {
+                    panic!("STATE entry should be Account");
+                }
+            }
+
+            // Verify UPDATED entry reflects BOTH seq bump AND signer removal.
+            if let LedgerEntryChange::Updated(updated_entry) = &changes.0[1] {
+                if let LedgerEntryData::Account(acc) = &updated_entry.data {
+                    assert_eq!(
+                        acc.seq_num.0, 2,
+                        "UPDATED entry must reflect seq bump to tx seq_num=2"
+                    );
+                    assert!(
+                        acc.signers.is_empty(),
+                        "UPDATED entry must reflect signer removal (signers should be empty)"
+                    );
+                    assert_eq!(
+                        acc.num_sub_entries, 0,
+                        "UPDATED entry must show decremented num_sub_entries"
+                    );
+                } else {
+                    panic!("UPDATED entry should be Account");
+                }
+            }
+        }
+        _ => panic!(
+            "Expected TransactionMeta::V4, got {:?}",
+            std::mem::discriminant(&meta)
+        ),
+    }
 }

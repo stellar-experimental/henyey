@@ -257,8 +257,7 @@ impl TransactionExecutor {
             sig_check_failure,
             fee,
             fee_entries,
-            seq_entries,
-            signer_entries,
+            preapply_entries,
             soroban_prng_seed,
             base_fee,
             fee_mode,
@@ -662,8 +661,7 @@ impl TransactionExecutor {
         if !all_success {
             let pre_apply = PreApplySnapshot {
                 fee_entries,
-                seq_entries,
-                signer_entries,
+                preapply_entries,
                 fee_mode,
                 fee,
             };
@@ -889,15 +887,9 @@ impl TransactionExecutor {
         }
         restore_delta_entries(
             &mut self.state,
-            &pre_apply.seq_entries.created,
-            &pre_apply.seq_entries.updated,
-            &pre_apply.seq_entries.deleted,
-        );
-        restore_delta_entries(
-            &mut self.state,
-            &pre_apply.signer_entries.created,
-            &pre_apply.signer_entries.updated,
-            &pre_apply.signer_entries.deleted,
+            &pre_apply.preapply_entries.created,
+            &pre_apply.preapply_entries.updated,
+            &pre_apply.preapply_entries.deleted,
         );
 
         // Reset the refundable fee tracker when transaction fails.
