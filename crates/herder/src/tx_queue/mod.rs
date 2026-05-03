@@ -1436,14 +1436,6 @@ impl TransactionQueue {
         self.validation_context.write().soroban_limits = Some(limits);
     }
 
-    /// Set the max contract WASM size in the validation context.
-    pub fn set_max_contract_size(&self, max_bytes: u32) {
-        let mut ctx = self.validation_context.write();
-        if let Some(ref mut limits) = ctx.soroban_resource_limits {
-            limits.max_contract_size_bytes = max_bytes;
-        }
-    }
-
     /// Set the per-TX Soroban resource limits in the validation context.
     pub fn set_soroban_resource_limits(&self, limits: henyey_tx::SorobanResourceLimits) {
         self.validation_context.write().soroban_resource_limits = Some(limits);
