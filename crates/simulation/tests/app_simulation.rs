@@ -4,7 +4,9 @@ use henyey_app::config::QuorumSetConfig;
 use henyey_app::AppState;
 use henyey_common::Hash256;
 use henyey_crypto::SecretKey;
-use henyey_simulation::{Simulation, SimulationMode, Topologies};
+use henyey_simulation::{
+    GeneratedLoadConfig, LoadGenerator, LoadStep, Simulation, SimulationMode, Topologies,
+};
 
 /// Timeout for the post-remove_node ledger close over TCP.
 /// Conservative guess (2× the original 45s) to absorb CI jitter.
@@ -572,4 +574,295 @@ async fn test_stabilize_app_tcp_connectivity_returns_error_on_timeout() {
         .to_string()
         .contains("did not stabilize"));
     sim.stop_all_nodes().await.ok();
+}
+
+// ---------------------------------------------------------------------------
+// Shared helpers for Supercluster-inspired tests
+// ---------------------------------------------------------------------------
+
+/// Submit a load step, close one ledger, and assert all nodes externalize.
+/// Returns the number of transactions accepted by the queue.
+async fn submit_and_close(
+    sim: &mut Simulation,
+    step: &LoadStep,
+    spread: u32,
+    timeout: Duration,
+) -> usize {
+    let submitted = sim
+        .submit_generated_load_step(step)
+        .await
+        .expect("submit load step");
+    let target = sim
+        .app("node0")
+        .expect("node0 for target ledger")
+        .ledger_info()
+        .ledger_seq
+        + 1;
+    manual_close_until(sim, target, spread, timeout).await;
+    submitted
+}
+
+/// Assert all app nodes are healthy: task running, overlay connected,
+/// and in an operational state (Synced or Validating).
+async fn assert_all_nodes_healthy(sim: &Simulation) {
+    for id in sim.app_node_ids() {
+        assert_eq!(
+            sim.app_task_finished(&id),
+            Some(false),
+            "{id} should still be running"
+        );
+        assert!(
+            sim.app_peer_count(&id).await.unwrap_or(0) > 0,
+            "{id} should have peers"
+        );
+        let state = sim.app(&id).expect("{id} app").state().await;
+        assert!(
+            state == AppState::Synced || state == AppState::Validating,
+            "{id} should be operational, got {state}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Supercluster-inspired simulation tests
+// ---------------------------------------------------------------------------
+
+/// Core3 payment: submit 3 txs, close a ledger, verify all accepted.
+#[tokio::test]
+async fn test_simple_payment_app_backed_core3() {
+    let mut sim =
+        build_app_backed_topology(Topologies::core3(SimulationMode::OverLoopback), 67).await;
+
+    ensure_app_accounts_funded(&mut sim, 3).await;
+
+    let steps = sim.generate_load_plan_for_app_nodes(3, 1, 100, 1_000);
+    let accepted = submit_and_close(&mut sim, &steps[0], 1, Duration::from_secs(30)).await;
+    assert_eq!(accepted, 3, "all 3 txs should be accepted");
+
+    assert_all_nodes_healthy(&sim).await;
+
+    sim.stop_all_nodes().await.expect("stop core3 payment test");
+}
+
+/// 4-node flat-quorum payment load across 3 consecutive steps.
+///
+/// Exercises a larger quorum (4 nodes, 75% threshold) under multi-step load,
+/// complementing the existing single-step 4-node test and the 3-node
+/// sustained-load test.
+#[tokio::test]
+async fn test_core4_multi_step_payment_load() {
+    let mut sim = build_app_backed_topology(
+        Topologies::core(4, SimulationMode::OverLoopback),
+        75, // ceil(3/4) = 75%
+    )
+    .await;
+
+    ensure_app_accounts_funded(&mut sim, 4).await;
+
+    let steps = sim.generate_load_plan_for_app_nodes(4, 3, 100, 1_000);
+
+    for (i, step) in steps.iter().enumerate() {
+        let accepted = submit_and_close(&mut sim, step, 1, Duration::from_secs(30)).await;
+        assert_eq!(accepted, 4, "step {i}: all 4 txs should be accepted");
+    }
+
+    assert_all_nodes_healthy(&sim).await;
+
+    sim.stop_all_nodes()
+        .await
+        .expect("stop core4 multi-step test");
+}
+
+/// 5-step sustained load across consecutive ledger closes.
+#[tokio::test]
+async fn test_sustained_payment_load_app_backed() {
+    let mut sim =
+        build_app_backed_topology(Topologies::core3(SimulationMode::OverLoopback), 67).await;
+
+    ensure_app_accounts_funded(&mut sim, 3).await;
+
+    let steps = sim.generate_load_plan_for_app_nodes(3, 5, 100, 1_000);
+
+    for (i, step) in steps.iter().enumerate() {
+        let accepted = submit_and_close(&mut sim, step, 1, Duration::from_secs(30)).await;
+        assert_eq!(accepted, 3, "step {i}: all 3 txs should be accepted");
+    }
+
+    assert_all_nodes_healthy(&sim).await;
+
+    sim.stop_all_nodes()
+        .await
+        .expect("stop sustained load test");
+}
+
+/// Burst-then-normal payment pattern (spike load approximation).
+///
+/// Uses a 4-node topology so the spike step (4 txs) can use one tx per
+/// account, avoiding queue contention. Normal steps use only the first 2
+/// accounts (2 txs).
+#[tokio::test]
+async fn test_spike_payment_load_app_backed() {
+    let mut sim =
+        build_app_backed_topology(Topologies::core(4, SimulationMode::OverLoopback), 75).await;
+
+    ensure_app_accounts_funded(&mut sim, 4).await;
+
+    let all_accounts = sim.app_node_ids();
+    let normal_accounts: Vec<String> = all_accounts.iter().take(2).cloned().collect();
+
+    // Normal step: 2 txs on first 2 accounts.
+    let normal_config = GeneratedLoadConfig {
+        accounts: normal_accounts.clone(),
+        txs_per_step: 2,
+        steps: 1,
+        fee_bid: 100,
+        amount: 1_000,
+        ..Default::default()
+    };
+    let normal_steps = LoadGenerator::step_plan(&normal_config);
+
+    // Spike step: 4 txs on all 4 accounts.
+    let spike_config = GeneratedLoadConfig {
+        accounts: all_accounts.clone(),
+        txs_per_step: 4,
+        steps: 1,
+        fee_bid: 100,
+        amount: 1_000,
+        ..Default::default()
+    };
+    let spike_steps = LoadGenerator::step_plan(&spike_config);
+
+    // Round 1: normal (2 txs).
+    let accepted = submit_and_close(&mut sim, &normal_steps[0], 1, Duration::from_secs(30)).await;
+    assert_eq!(accepted, 2, "normal round 1");
+
+    // Round 2: spike (4 txs).
+    let accepted = submit_and_close(&mut sim, &spike_steps[0], 1, Duration::from_secs(30)).await;
+    assert_eq!(accepted, 4, "spike round");
+
+    // Round 3: normal (2 txs).
+    let normal_steps_2 = LoadGenerator::step_plan(&normal_config);
+    let accepted = submit_and_close(&mut sim, &normal_steps_2[0], 1, Duration::from_secs(30)).await;
+    assert_eq!(accepted, 2, "normal round 2");
+
+    assert_all_nodes_healthy(&sim).await;
+
+    sim.stop_all_nodes().await.expect("stop spike load test");
+}
+
+/// Tx queue contention: back-to-back submissions without closing.
+///
+/// Validates the one-pending-tx-per-account `TryAgainLater` behavior.
+#[tokio::test]
+async fn test_tx_queue_contention_app_backed() {
+    let mut sim =
+        build_app_backed_topology(Topologies::core3(SimulationMode::OverLoopback), 67).await;
+
+    ensure_app_accounts_funded(&mut sim, 3).await;
+
+    // Generate 3 independent load plans (3 txs each).
+    let plan1 = sim.generate_load_plan_for_app_nodes(3, 1, 100, 1_000);
+    let plan2 = sim.generate_load_plan_for_app_nodes(3, 1, 100, 1_000);
+    let plan3 = sim.generate_load_plan_for_app_nodes(3, 1, 100, 1_000);
+
+    // Submit all 3 back-to-back without closing.
+    let accepted1 = sim
+        .submit_generated_load_step(&plan1[0])
+        .await
+        .expect("submit step 1");
+    let accepted2 = sim
+        .submit_generated_load_step(&plan2[0])
+        .await
+        .expect("submit step 2");
+    let accepted3 = sim
+        .submit_generated_load_step(&plan3[0])
+        .await
+        .expect("submit step 3");
+
+    // First batch: all 3 accepted (one per account).
+    assert_eq!(accepted1, 3, "first batch should accept all 3");
+    // Subsequent batches: rejected (one-pending-tx-per-account).
+    assert_eq!(accepted2, 0, "second batch rejected (TryAgainLater)");
+    assert_eq!(accepted3, 0, "third batch rejected (TryAgainLater)");
+
+    // Close a ledger to apply the pending transactions.
+    let target = sim.app("node0").expect("node0").ledger_info().ledger_seq + 1;
+    manual_close_until(&sim, target, 1, Duration::from_secs(30)).await;
+
+    assert_all_nodes_healthy(&sim).await;
+
+    sim.stop_all_nodes()
+        .await
+        .expect("stop queue contention test");
+}
+
+/// Lagging node recovery: remove a node, submit payment transactions to
+/// the majority, then restart the lagging node and verify it catches up
+/// with non-trivial ledger content.
+///
+/// Builds on the existing `test_core3_restart_rejoin_over_loopback` pattern
+/// by advancing with real payment load (not empty closes) while the node
+/// is down, exercising catch-up with actual transaction data.
+#[tokio::test]
+async fn test_slow_node_lagging_node_recovers() {
+    let mut sim =
+        build_app_backed_topology(Topologies::core3(SimulationMode::OverLoopback), 66).await;
+
+    // Fund accounts so we can submit payments.
+    ensure_app_accounts_funded(&mut sim, 3).await;
+
+    // Close to ledger 2 + funding rounds so all nodes are in sync.
+    let base_ledger = sim.app("node0").expect("node0").ledger_info().ledger_seq;
+
+    // Remove node0 (simulates a lagging/crashed node).
+    sim.remove_node("node0")
+        .await
+        .expect("remove node0 to simulate lag");
+    wait_for_peer_count(&sim, "node1", 1, Duration::from_secs(10)).await;
+    wait_for_peer_count(&sim, "node2", 1, Duration::from_secs(10)).await;
+
+    // Submit payment load to the majority and close 2 ledgers.
+    // This ensures the lagging node must catch up with real tx data.
+    let steps = sim.generate_load_plan_for_app_nodes(3, 2, 100, 1_000);
+    for step in &steps {
+        // Submit to node1 (node0 is down, but submit_generated_load_step
+        // distributes across running nodes).
+        let _ = sim
+            .submit_generated_load_step(step)
+            .await
+            .expect("submit load while node0 down");
+        let target = sim.app("node1").expect("node1").ledger_info().ledger_seq + 1;
+        manual_close_until(&sim, target, 0, Duration::from_secs(45)).await;
+    }
+
+    let majority_ledger = sim.app_ledger_seq("node1").unwrap_or(0);
+    assert!(
+        majority_ledger > base_ledger,
+        "majority should have advanced: {majority_ledger} > {base_ledger}"
+    );
+
+    // Restart node0 (simulates the lagging node recovering).
+    sim.restart_node("node0")
+        .await
+        .expect("restart node0 to recover");
+    wait_for_app_operational(&sim, "node0", Duration::from_secs(10)).await;
+
+    // Re-establish peer connections.
+    let _ = sim.add_connection("node0", "node1").await;
+    let _ = sim.add_connection("node0", "node2").await;
+    wait_for_peer_count(&sim, "node0", 2, Duration::from_secs(10)).await;
+
+    // Request SCP state so node0 learns about missed slots.
+    sim.app("node0")
+        .expect("node0 app")
+        .request_scp_state_from_peers()
+        .await;
+
+    // Wait for node0 to catch up to the majority's ledger.
+    wait_for_app_ledger_close(&sim, majority_ledger, Duration::from_secs(60)).await;
+
+    // Close one more ledger to confirm full sync with all 3 nodes.
+    manual_close_until(&sim, majority_ledger + 1, 1, Duration::from_secs(60)).await;
+
+    sim.stop_all_nodes().await.expect("stop lagging node test");
 }
