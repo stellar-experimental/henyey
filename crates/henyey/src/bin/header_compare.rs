@@ -72,7 +72,7 @@ async fn main() -> anyhow::Result<()> {
         .iter()
         .find(|a| a.get_enabled)
         .ok_or_else(|| anyhow::anyhow!("no enabled history archives in config"))?;
-    let archive = HistoryArchive::new(&archive.url)?;
+    let archive = HistoryArchive::with_name(&archive.url, &archive.name)?;
     let checkpoint = henyey_history::checkpoint::checkpoint_containing(args.ledger);
     let headers = archive.fetch_ledger_headers(checkpoint).await?;
     let archive_header = headers

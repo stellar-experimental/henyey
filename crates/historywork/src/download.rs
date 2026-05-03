@@ -62,6 +62,7 @@ impl Work for GetHistoryArchiveStateWork {
     // SECURITY: checkpoint data validated by hash chain; content integrity verified before acceptance
     async fn run(&mut self, _ctx: &WorkContext) -> WorkOutcome {
         set_progress(&self.state, HistoryWorkStage::FetchHas, "fetching HAS").await;
+        let archive_name = self.archive.name().to_owned();
         // Stage E instrumentation: emit HAS success only after both fetch and
         // structure/checkpoint verification pass — matching
         // `catchup::download_and_verify_has`. Passphrase verification is not
@@ -72,27 +73,35 @@ impl Work for GetHistoryArchiveStateWork {
             Ok(has) => {
                 if let Err(err) = verify::verify_has_structure(&has) {
                     metrics::counter!(
-                        "stellar_history_download_history_archive_state_failure_total"
+                        "stellar_history_download_history_archive_state_failure_total",
+                        "archive" => archive_name,
                     )
                     .increment(1);
                     return WorkOutcome::Failed(format!("HAS structure invalid: {err}"));
                 }
                 if let Err(err) = verify::verify_has_checkpoint(&has, self.checkpoint) {
                     metrics::counter!(
-                        "stellar_history_download_history_archive_state_failure_total"
+                        "stellar_history_download_history_archive_state_failure_total",
+                        "archive" => archive_name,
                     )
                     .increment(1);
                     return WorkOutcome::Failed(format!("HAS checkpoint mismatch: {err}"));
                 }
-                metrics::counter!("stellar_history_download_history_archive_state_success_total")
-                    .increment(1);
+                metrics::counter!(
+                    "stellar_history_download_history_archive_state_success_total",
+                    "archive" => archive_name,
+                )
+                .increment(1);
                 let mut guard = self.state.lock().await;
                 guard.has = Some(has);
                 WorkOutcome::Success
             }
             Err(err) => {
-                metrics::counter!("stellar_history_download_history_archive_state_failure_total")
-                    .increment(1);
+                metrics::counter!(
+                    "stellar_history_download_history_archive_state_failure_total",
+                    "archive" => archive_name,
+                )
+                .increment(1);
                 WorkOutcome::Failed(format!("failed to fetch HAS: {err}"))
             }
         }
@@ -255,12 +264,16 @@ impl Work for DownloadBucketsWork {
             // the correct phase (download vs verify). On success, both
             // download and verify counters fire because both steps passed.
             // Then surface the first error to the work scheduler.
+            let archive_name = self.archive.name().to_owned();
             let mut first_failure: Option<String> = None;
             for result in results {
                 match result {
                     Ok(()) => {
-                        metrics::counter!("stellar_history_download_bucket_success_total")
-                            .increment(1);
+                        metrics::counter!(
+                            "stellar_history_download_bucket_success_total",
+                            "archive" => archive_name.clone(),
+                        )
+                        .increment(1);
                         metrics::counter!("stellar_history_verify_bucket_success_total")
                             .increment(1);
                     }
@@ -268,8 +281,11 @@ impl Work for DownloadBucketsWork {
                         match &failure {
                             BucketDownloadFailure::Download(_)
                             | BucketDownloadFailure::Persist(_) => {
-                                metrics::counter!("stellar_history_download_bucket_failure_total")
-                                    .increment(1);
+                                metrics::counter!(
+                                    "stellar_history_download_bucket_failure_total",
+                                    "archive" => archive_name.clone(),
+                                )
+                                .increment(1);
                             }
                             BucketDownloadFailure::Verify(_) => {
                                 metrics::counter!("stellar_history_verify_bucket_failure_total")
@@ -333,6 +349,7 @@ impl Work for DownloadLedgerHeadersWork {
             "downloading headers",
         )
         .await;
+        let archive_name = self.archive.name().to_owned();
         // Stage E: header *download* failures map to
         // `download_ledger_failure_total` (the checkpoint-data download is
         // considered failed if any constituent file fails). Header *chain
@@ -345,7 +362,11 @@ impl Work for DownloadLedgerHeadersWork {
         let headers = match self.archive.fetch_ledger_headers(self.checkpoint).await {
             Ok(headers) => headers,
             Err(err) => {
-                metrics::counter!("stellar_history_download_ledger_failure_total").increment(1);
+                metrics::counter!(
+                    "stellar_history_download_ledger_failure_total",
+                    "archive" => archive_name,
+                )
+                .increment(1);
                 return WorkOutcome::Failed(format!("failed to download headers: {err}"));
             }
         };
@@ -399,6 +420,7 @@ impl Work for DownloadTransactionsWork {
             "downloading transactions",
         )
         .await;
+        let archive_name = self.archive.name().to_owned();
         // Stage E: download failures here map to
         // `download_ledger_failure_total` (any failed checkpoint sub-file
         // means the checkpoint-data acquisition failed). tx-set hash
@@ -408,7 +430,11 @@ impl Work for DownloadTransactionsWork {
         let entries = match self.archive.fetch_transactions(self.checkpoint).await {
             Ok(entries) => entries,
             Err(err) => {
-                metrics::counter!("stellar_history_download_ledger_failure_total").increment(1);
+                metrics::counter!(
+                    "stellar_history_download_ledger_failure_total",
+                    "archive" => archive_name,
+                )
+                .increment(1);
                 return WorkOutcome::Failed(format!("failed to download transactions: {err}"));
             }
         };
@@ -421,7 +447,11 @@ impl Work for DownloadTransactionsWork {
             let header = match find_header(&headers, entry.ledger_seq, "transaction set") {
                 Ok(header) => header,
                 Err(err) => {
-                    metrics::counter!("stellar_history_download_ledger_failure_total").increment(1);
+                    metrics::counter!(
+                        "stellar_history_download_ledger_failure_total",
+                        "archive" => archive_name,
+                    )
+                    .increment(1);
                     return WorkOutcome::Failed(err);
                 }
             };
@@ -434,7 +464,11 @@ impl Work for DownloadTransactionsWork {
                 }
             };
             if let Err(err) = verify::verify_tx_set(&header.header, &tx_set) {
-                metrics::counter!("stellar_history_download_ledger_failure_total").increment(1);
+                metrics::counter!(
+                    "stellar_history_download_ledger_failure_total",
+                    "archive" => archive_name,
+                )
+                .increment(1);
                 return WorkOutcome::Failed(format!("tx set hash mismatch: {err}"));
             }
         }
@@ -490,6 +524,7 @@ impl Work for DownloadTxResultsWork {
             "downloading transaction results",
         )
         .await;
+        let archive_name = self.archive.name().to_owned();
         // Stage E: as the *last* node in the historywork DAG (results depends
         // on transactions which depends on headers), the success of this
         // work item means the entire checkpoint ledger-data set
@@ -504,7 +539,11 @@ impl Work for DownloadTxResultsWork {
         let results = match self.archive.fetch_results(self.checkpoint).await {
             Ok(results) => results,
             Err(err) => {
-                metrics::counter!("stellar_history_download_ledger_failure_total").increment(1);
+                metrics::counter!(
+                    "stellar_history_download_ledger_failure_total",
+                    "archive" => archive_name,
+                )
+                .increment(1);
                 return WorkOutcome::Failed(format!("failed to download tx results: {err}"));
             }
         };
@@ -513,7 +552,11 @@ impl Work for DownloadTxResultsWork {
             let header = match find_header(&headers, entry.ledger_seq, "tx result set") {
                 Ok(header) => header,
                 Err(err) => {
-                    metrics::counter!("stellar_history_download_ledger_failure_total").increment(1);
+                    metrics::counter!(
+                        "stellar_history_download_ledger_failure_total",
+                        "archive" => archive_name,
+                    )
+                    .increment(1);
                     return WorkOutcome::Failed(err);
                 }
             };
@@ -523,7 +566,11 @@ impl Work for DownloadTxResultsWork {
             {
                 Ok(xdr) => xdr,
                 Err(err) => {
-                    metrics::counter!("stellar_history_download_ledger_failure_total").increment(1);
+                    metrics::counter!(
+                        "stellar_history_download_ledger_failure_total",
+                        "archive" => archive_name,
+                    )
+                    .increment(1);
                     return WorkOutcome::Failed(format!(
                         "failed to serialize tx result set for ledger {}: {err}",
                         entry.ledger_seq
@@ -531,12 +578,20 @@ impl Work for DownloadTxResultsWork {
                 }
             };
             if let Err(err) = verify::verify_tx_result_set(&header.header, &xdr) {
-                metrics::counter!("stellar_history_download_ledger_failure_total").increment(1);
+                metrics::counter!(
+                    "stellar_history_download_ledger_failure_total",
+                    "archive" => archive_name,
+                )
+                .increment(1);
                 return WorkOutcome::Failed(format!("tx result set hash mismatch: {err}"));
             }
         }
 
-        metrics::counter!("stellar_history_download_ledger_success_total").increment(1);
+        metrics::counter!(
+            "stellar_history_download_ledger_success_total",
+            "archive" => archive_name,
+        )
+        .increment(1);
 
         let mut guard = self.state.lock().await;
         guard.tx_results = results;
@@ -643,6 +698,33 @@ mod tests {
             assert!(
                 src.contains(literal),
                 "expected metric literal {literal} in historywork/download.rs",
+            );
+        }
+    }
+
+    /// Stage E: download counters must carry the `"archive"` label.
+    #[test]
+    fn test_stage_e_historywork_archive_label_present() {
+        let src = include_str!("download.rs");
+        // Every download counter emit site must include archive labeling.
+        for metric in &[
+            "stellar_history_download_history_archive_state_success_total",
+            "stellar_history_download_history_archive_state_failure_total",
+            "stellar_history_download_bucket_success_total",
+            "stellar_history_download_bucket_failure_total",
+            "stellar_history_download_ledger_success_total",
+            "stellar_history_download_ledger_failure_total",
+        ] {
+            // Find each occurrence of the metric and verify "archive" appears
+            // nearby (within the same counter!() macro invocation).
+            let idx = src
+                .find(metric)
+                .unwrap_or_else(|| panic!("metric {metric} not found in historywork/download.rs"));
+            // Look at the next 200 chars for the "archive" label
+            let window = &src[idx..std::cmp::min(idx + 200, src.len())];
+            assert!(
+                window.contains("\"archive\""),
+                "metric {metric} missing \"archive\" label in historywork/download.rs",
             );
         }
     }

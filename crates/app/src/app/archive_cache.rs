@@ -142,7 +142,11 @@ impl ArchiveCheckpointFetcher for ArchiveHttpFetcher {
             if !archive_config.get_enabled {
                 continue;
             }
-            match HistoryArchive::with_config(&archive_config.url, self.download_config.clone()) {
+            match HistoryArchive::with_name_and_config(
+                &archive_config.url,
+                &archive_config.name,
+                self.download_config.clone(),
+            ) {
                 Ok(archive) => match archive.fetch_current_ledger().await {
                     Ok(ledger) => {
                         tracing::info!(

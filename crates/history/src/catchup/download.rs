@@ -75,13 +75,17 @@ where
 }
 
 /// Download a bucket from archives, trying each archive in order.
+/// Downloads a bucket from archives with rotation, returning the data and the
+/// name of the archive that provided it.
 pub(super) async fn download_bucket_from_archives(
     archives: Vec<Arc<HistoryArchive>>,
     hash: Hash256,
-) -> std::result::Result<Vec<u8>, henyey_bucket::BucketError> {
+) -> std::result::Result<(Vec<u8>, String), henyey_bucket::BucketError> {
+    let mut last_archive_name = String::new();
     for archive in &archives {
+        last_archive_name = archive.name().to_owned();
         match archive.fetch_bucket(&hash).await {
-            Ok(data) => return Ok(data),
+            Ok(data) => return Ok((data, archive.name().to_owned())),
             Err(e) => {
                 warn!("Failed to download bucket {} from archive: {}", hash, e);
                 continue;
@@ -89,8 +93,8 @@ pub(super) async fn download_bucket_from_archives(
         }
     }
     Err(henyey_bucket::BucketError::NotFound(format!(
-        "Bucket {} not found in any archive",
-        hash
+        "Bucket {} not found in any archive (last: {})",
+        hash, last_archive_name
     )))
 }
 
@@ -107,12 +111,15 @@ impl CatchupManager {
     ///
     /// Uses archive rotation: each attempt tries a different archive, cycling
     /// through them to provide failover when one archive is unavailable.
-    pub(super) async fn download_has(&self, checkpoint_seq: u32) -> Result<HistoryArchiveState> {
+    pub(super) async fn download_has(
+        &self,
+        checkpoint_seq: u32,
+    ) -> Result<(HistoryArchiveState, String)> {
         let num_archives = self.archives.len() as u32;
         for attempt in 0..num_archives {
             let archive = self.select_archive(attempt);
             match archive.fetch_checkpoint_has(checkpoint_seq).await {
-                Ok(has) => return Ok(has),
+                Ok(has) => return Ok((has, archive.name().to_owned())),
                 Err(e) => {
                     warn!(
                         "Failed to download HAS from archive {}: {}",
@@ -204,7 +211,8 @@ impl CatchupManager {
         let downloaded = std::sync::atomic::AtomicU32::new(0);
 
         // Download buckets in parallel, saving directly to disk
-        let results: Vec<Result<()>> = stream::iter(to_download)
+        // Each result carries the archive name that served the bucket on success.
+        let results: Vec<Result<String>> = stream::iter(to_download)
             .map(|hash| {
                 let archives = archives.clone();
                 let bucket_dir = bucket_dir.clone();
@@ -241,7 +249,7 @@ impl CatchupManager {
                                     info!("Downloaded {}/{} buckets", count, total_to_download);
                                 }
                                 debug!("Pre-downloaded bucket {} ({} bytes)", hash, data.len());
-                                return Ok(());
+                                return Ok(archive.name().to_owned());
                             }
                             Err(e) => {
                                 debug!(
@@ -262,23 +270,36 @@ impl CatchupManager {
             .collect()
             .await;
 
-        // Stage E: emit per-bucket-file terminal outcome.
+        // Stage E: emit per-bucket-file terminal outcome with archive label.
         // `download_bucket_*` counts archive-rotation-final outcomes; archive
         // failures within a single bucket's retry loop are not counted.
+        let last_archive_name = self
+            .archives
+            .last()
+            .map(|a| a.name().to_owned())
+            .unwrap_or_default();
         for result in &results {
             match result {
-                Ok(()) => {
-                    metrics::counter!("stellar_history_download_bucket_success_total").increment(1);
+                Ok(archive_name) => {
+                    metrics::counter!(
+                        "stellar_history_download_bucket_success_total",
+                        "archive" => archive_name.clone(),
+                    )
+                    .increment(1);
                 }
                 Err(_) => {
-                    metrics::counter!("stellar_history_download_bucket_failure_total").increment(1);
+                    metrics::counter!(
+                        "stellar_history_download_bucket_failure_total",
+                        "archive" => last_archive_name.clone(),
+                    )
+                    .increment(1);
                 }
             }
         }
 
         // Check for any failures
         for result in results {
-            result?;
+            result.map(|_| ())?;
         }
 
         self.progress.buckets_downloaded = hashes.len() as u32;
@@ -394,10 +415,16 @@ impl CatchupManager {
         checkpoint: u32,
     ) -> Result<CheckpointLedgerData> {
         // Try each archive until one succeeds
+        let mut last_archive_name = String::new();
         for archive in &self.archives {
+            last_archive_name = archive.name().to_owned();
             match self.try_download_checkpoint(archive, checkpoint).await {
                 Ok(data) => {
-                    metrics::counter!("stellar_history_download_ledger_success_total").increment(1);
+                    metrics::counter!(
+                        "stellar_history_download_ledger_success_total",
+                        "archive" => archive.name().to_owned(),
+                    )
+                    .increment(1);
                     return Ok(data);
                 }
                 Err(e) => {
@@ -412,7 +439,11 @@ impl CatchupManager {
             }
         }
 
-        metrics::counter!("stellar_history_download_ledger_failure_total").increment(1);
+        metrics::counter!(
+            "stellar_history_download_ledger_failure_total",
+            "archive" => last_archive_name,
+        )
+        .increment(1);
         Err(HistoryError::CatchupFailed(format!(
             "failed to download checkpoint {} from any archive",
             checkpoint
@@ -601,6 +632,27 @@ mod tests {
             assert!(
                 src.contains(literal),
                 "expected metric literal {literal} in catchup/download.rs",
+            );
+        }
+    }
+
+    /// Stage E: download counters in this module must carry the `"archive"` label.
+    #[test]
+    fn test_stage_e_download_archive_label_present() {
+        let src = include_str!("download.rs");
+        for metric in &[
+            "stellar_history_download_bucket_success_total",
+            "stellar_history_download_bucket_failure_total",
+            "stellar_history_download_ledger_success_total",
+            "stellar_history_download_ledger_failure_total",
+        ] {
+            let idx = src
+                .find(metric)
+                .unwrap_or_else(|| panic!("metric {metric} not found in catchup/download.rs"));
+            let window = &src[idx..std::cmp::min(idx + 200, src.len())];
+            assert!(
+                window.contains("\"archive\""),
+                "metric {metric} missing \"archive\" label in catchup/download.rs",
             );
         }
     }

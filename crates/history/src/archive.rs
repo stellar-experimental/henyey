@@ -47,6 +47,8 @@ use crate::verify;
 /// ```
 #[derive(Debug, Clone)]
 pub struct HistoryArchive {
+    /// Operator-assigned name for this archive (used in metric labels).
+    name: String,
     /// Base URL of the archive.
     base_url: Url,
     /// HTTP client for requests.
@@ -79,6 +81,42 @@ impl HistoryArchive {
         Self::with_config(base_url, DownloadConfig::default())
     }
 
+    /// Create a new history archive client with an explicit name.
+    ///
+    /// The name is used as the `archive` label value in Prometheus metrics,
+    /// allowing operators to identify per-archive health.
+    pub fn with_name(base_url: &str, name: impl Into<String>) -> Result<Self, HistoryError> {
+        Self::with_name_and_config(base_url, name, DownloadConfig::default())
+    }
+
+    /// Create a new history archive client with an explicit name and custom config.
+    pub fn with_name_and_config(
+        base_url: &str,
+        name: impl Into<String>,
+        config: DownloadConfig,
+    ) -> Result<Self, HistoryError> {
+        let mut url = Url::parse(base_url).map_err(HistoryError::UrlParse)?;
+        if !url.path().ends_with('/') {
+            url.set_path(&format!("{}/", url.path()));
+        }
+
+        let name_str = name.into();
+        let effective_name = if name_str.is_empty() {
+            derive_name_from_url(&url)
+        } else {
+            name_str
+        };
+
+        let client = create_client(config.timeout)?;
+
+        Ok(Self {
+            name: effective_name,
+            base_url: url,
+            client,
+            config,
+        })
+    }
+
     /// Create a new history archive client with custom configuration.
     ///
     /// # Arguments
@@ -97,13 +135,22 @@ impl HistoryArchive {
             url.set_path(&format!("{}/", url.path()));
         }
 
+        let name = derive_name_from_url(&url);
         let client = create_client(config.timeout)?;
 
         Ok(Self {
+            name,
             base_url: url,
             client,
             config,
         })
+    }
+
+    /// Get the operator-assigned name of this archive.
+    ///
+    /// Used as the `archive` label value in Prometheus metrics.
+    pub fn name(&self) -> &str {
+        &self.name
     }
 
     /// Get the base URL of this archive.
@@ -378,6 +425,30 @@ impl HistoryArchive {
     }
 }
 
+/// Derive a short human-readable name from a URL.
+///
+/// Uses the last non-empty path segment (e.g., `core_testnet_001` from
+/// `https://history.stellar.org/prd/core-testnet/core_testnet_001/`).
+/// Falls back to `host:port` for root URLs or URLs without path segments.
+fn derive_name_from_url(url: &Url) -> String {
+    // Try last non-empty path segment
+    let segments: Vec<&str> = url
+        .path_segments()
+        .map(|s| s.filter(|seg| !seg.is_empty()).collect())
+        .unwrap_or_default();
+
+    if let Some(last) = segments.last() {
+        return (*last).to_string();
+    }
+
+    // Fallback: host + port (for root URLs like http://127.0.0.1:8080/)
+    match (url.host_str(), url.port()) {
+        (Some(host), Some(port)) => format!("{host}:{port}"),
+        (Some(host), None) => host.to_string(),
+        _ => "unknown".to_string(),
+    }
+}
+
 /// Testnet archive URLs.
 pub mod testnet {
     /// Available testnet history archive URLs.
@@ -499,5 +570,58 @@ mod tests {
                 .unwrap();
         let result = archive.fetch_bucket(Hash256::empty_hash()).await.unwrap();
         assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_derive_name_from_url_path_segment() {
+        let url =
+            Url::parse("https://history.stellar.org/prd/core-testnet/core_testnet_001").unwrap();
+        assert_eq!(derive_name_from_url(&url), "core_testnet_001");
+    }
+
+    #[test]
+    fn test_derive_name_from_url_trailing_slash() {
+        let url =
+            Url::parse("https://history.stellar.org/prd/core-testnet/core_testnet_002/").unwrap();
+        assert_eq!(derive_name_from_url(&url), "core_testnet_002");
+    }
+
+    #[test]
+    fn test_derive_name_from_url_root_with_port() {
+        let url = Url::parse("http://127.0.0.1:8080/").unwrap();
+        assert_eq!(derive_name_from_url(&url), "127.0.0.1:8080");
+    }
+
+    #[test]
+    fn test_derive_name_from_url_root_no_port() {
+        let url = Url::parse("https://archive.example.com/").unwrap();
+        assert_eq!(derive_name_from_url(&url), "archive.example.com");
+    }
+
+    #[test]
+    fn test_with_name_uses_provided_name() {
+        let archive = HistoryArchive::with_name(
+            "https://history.stellar.org/prd/core-testnet/core_testnet_001",
+            "my-custom-name",
+        )
+        .unwrap();
+        assert_eq!(archive.name(), "my-custom-name");
+    }
+
+    #[test]
+    fn test_with_name_empty_falls_back_to_url() {
+        let archive = HistoryArchive::with_name(
+            "https://history.stellar.org/prd/core-testnet/core_testnet_001",
+            "",
+        )
+        .unwrap();
+        assert_eq!(archive.name(), "core_testnet_001");
+    }
+
+    #[test]
+    fn test_new_derives_name_from_url() {
+        let archive =
+            HistoryArchive::new("https://history.stellar.org/prd/core-live/core_live_003").unwrap();
+        assert_eq!(archive.name(), "core_live_003");
     }
 }

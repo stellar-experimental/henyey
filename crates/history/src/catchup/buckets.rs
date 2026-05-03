@@ -211,20 +211,33 @@ impl CatchupManager {
             // failure counter and bail out, so dashboards see one terminal
             // outcome per bucket.
             let was_preloaded;
+            let download_archive_name: String;
             let xdr_data = if let Some(data) = {
                 let mut preloaded = preloaded_buckets.lock().unwrap();
                 preloaded.remove(hash)
             } {
                 was_preloaded = true;
+                download_archive_name = String::new();
                 data
             } else {
                 was_preloaded = false;
                 // Download the bucket (blocking - we're in a sync context).
                 match block_on_async(download_bucket_from_archives(archives.clone(), *hash)) {
-                    Ok(data) => data,
+                    Ok((data, archive_name)) => {
+                        download_archive_name = archive_name;
+                        data
+                    }
                     Err(e) => {
-                        metrics::counter!("stellar_history_download_bucket_failure_total")
-                            .increment(1);
+                        // Use last archive as the failure label (all archives exhausted).
+                        let last_name = archives
+                            .last()
+                            .map(|a| a.name().to_owned())
+                            .unwrap_or_default();
+                        metrics::counter!(
+                            "stellar_history_download_bucket_failure_total",
+                            "archive" => last_name,
+                        )
+                        .increment(1);
                         return Err(e);
                     }
                 }
@@ -243,7 +256,11 @@ impl CatchupManager {
                 if !was_preloaded {
                     // Persistence failure on the freshly-downloaded path is a
                     // terminal download-outcome failure — caller bails out.
-                    metrics::counter!("stellar_history_download_bucket_failure_total").increment(1);
+                    metrics::counter!(
+                        "stellar_history_download_bucket_failure_total",
+                        "archive" => download_archive_name.clone(),
+                    )
+                    .increment(1);
                 }
                 return Err(henyey_bucket::BucketError::NotFound(format!(
                     "failed to write bucket to disk: {}",
@@ -252,7 +269,11 @@ impl CatchupManager {
             }
             if !was_preloaded {
                 // Successful fetch + persistence — terminal success.
-                metrics::counter!("stellar_history_download_bucket_success_total").increment(1);
+                metrics::counter!(
+                    "stellar_history_download_bucket_success_total",
+                    "archive" => download_archive_name,
+                )
+                .increment(1);
             }
             // Drop the in-memory XDR data before building the index to free memory
             drop(xdr_data);
@@ -391,7 +412,7 @@ impl CatchupManager {
                     // counted on the network-fetch fallback path. Success is
                     // emitted once bytes are persisted; persistence-error on
                     // the freshly-fetched path counts as a download failure.
-                    let xdr_data: Option<Vec<u8>> = if let Some(data) = {
+                    let xdr_data: Option<(Vec<u8>, String)> = if let Some(data) = {
                         let mut preloaded = preloaded_buckets.lock().unwrap();
                         preloaded.remove(hash)
                     } {
@@ -420,10 +441,17 @@ impl CatchupManager {
                             archives_clone.clone(),
                             *hash,
                         )) {
-                            Ok(data) => Some(data),
+                            Ok((data, _archive_name)) => Some((data, _archive_name)),
                             Err(e) => {
-                                metrics::counter!("stellar_history_download_bucket_failure_total")
-                                    .increment(1);
+                                let last_name = archives_clone
+                                    .last()
+                                    .map(|a| a.name().to_owned())
+                                    .unwrap_or_default();
+                                metrics::counter!(
+                                    "stellar_history_download_bucket_failure_total",
+                                    "archive" => last_name,
+                                )
+                                .increment(1);
                                 return Err(e);
                             }
                         }
@@ -432,17 +460,23 @@ impl CatchupManager {
                     // If we downloaded data, save it to disk atomically. A
                     // persistence error here is the terminal download outcome
                     // for this bucket — emit failure before propagating.
-                    if let Some(downloaded_data) = xdr_data {
+                    if let Some((downloaded_data, archive_name)) = xdr_data {
                         if let Err(e) = atomic_write_bytes(&bucket_path, &downloaded_data) {
-                            metrics::counter!("stellar_history_download_bucket_failure_total")
-                                .increment(1);
+                            metrics::counter!(
+                                "stellar_history_download_bucket_failure_total",
+                                "archive" => archive_name,
+                            )
+                            .increment(1);
                             return Err(henyey_bucket::BucketError::NotFound(format!(
                                 "failed to write hot archive bucket to disk: {}",
                                 e
                             )));
                         }
-                        metrics::counter!("stellar_history_download_bucket_success_total")
-                            .increment(1);
+                        metrics::counter!(
+                            "stellar_history_download_bucket_success_total",
+                            "archive" => archive_name,
+                        )
+                        .increment(1);
                     }
 
                     // Load hot archive bucket from disk eagerly — builds the index

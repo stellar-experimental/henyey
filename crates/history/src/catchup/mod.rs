@@ -543,25 +543,36 @@ impl CatchupManager {
     /// either step counts as one failure here.
     async fn download_and_verify_has(&self, checkpoint_seq: u32) -> Result<HistoryArchiveState> {
         match self.download_has(checkpoint_seq).await {
-            Ok(has) => match self.verify_has(&has, checkpoint_seq) {
+            Ok((has, archive_name)) => match self.verify_has(&has, checkpoint_seq) {
                 Ok(()) => {
                     metrics::counter!(
-                        "stellar_history_download_history_archive_state_success_total"
+                        "stellar_history_download_history_archive_state_success_total",
+                        "archive" => archive_name,
                     )
                     .increment(1);
                     Ok(has)
                 }
                 Err(e) => {
                     metrics::counter!(
-                        "stellar_history_download_history_archive_state_failure_total"
+                        "stellar_history_download_history_archive_state_failure_total",
+                        "archive" => archive_name,
                     )
                     .increment(1);
                     Err(e)
                 }
             },
             Err(e) => {
-                metrics::counter!("stellar_history_download_history_archive_state_failure_total")
-                    .increment(1);
+                // All archives exhausted — label with the last attempted archive.
+                let last_name = self
+                    .archives
+                    .last()
+                    .map(|a| a.name().to_owned())
+                    .unwrap_or_default();
+                metrics::counter!(
+                    "stellar_history_download_history_archive_state_failure_total",
+                    "archive" => last_name,
+                )
+                .increment(1);
                 Err(e)
             }
         }
@@ -839,12 +850,18 @@ impl CatchupManager {
         );
         match self.verify_has(&data.has, checkpoint_seq) {
             Ok(()) => {
-                metrics::counter!("stellar_history_download_history_archive_state_success_total")
-                    .increment(1);
+                metrics::counter!(
+                    "stellar_history_download_history_archive_state_success_total",
+                    "archive" => "provided",
+                )
+                .increment(1);
             }
             Err(e) => {
-                metrics::counter!("stellar_history_download_history_archive_state_failure_total")
-                    .increment(1);
+                metrics::counter!(
+                    "stellar_history_download_history_archive_state_failure_total",
+                    "archive" => "provided",
+                )
+                .increment(1);
                 return Err(e);
             }
         }

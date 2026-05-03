@@ -690,7 +690,7 @@ impl App {
             .archives
             .iter()
             .filter(|a| a.get_enabled)
-            .filter_map(|a| match HistoryArchive::new(&a.url) {
+            .filter_map(|a| match HistoryArchive::with_name(&a.url, &a.name) {
                 Ok(archive) => Some(archive),
                 Err(e) => {
                     tracing::warn!(url = %a.url, error = %e, "Failed to create archive");

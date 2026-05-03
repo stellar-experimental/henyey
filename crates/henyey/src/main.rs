@@ -1482,7 +1482,7 @@ fn first_archive(config: &AppConfig) -> anyhow::Result<henyey_history::HistoryAr
         .archives
         .iter()
         .filter(|a| a.get_enabled)
-        .find_map(|a| henyey_history::HistoryArchive::new(&a.url).ok())
+        .find_map(|a| henyey_history::HistoryArchive::with_name(&a.url, &a.name).ok())
         .ok_or_else(|| anyhow::anyhow!("No history archives available"))
 }
 
@@ -1493,13 +1493,15 @@ fn all_archives(config: &AppConfig) -> anyhow::Result<Vec<henyey_history::Histor
         .archives
         .iter()
         .filter(|a| a.get_enabled)
-        .filter_map(|a| match henyey_history::HistoryArchive::new(&a.url) {
-            Ok(archive) => Some(archive),
-            Err(e) => {
-                println!("Warning: Failed to create archive {}: {}", a.url, e);
-                None
-            }
-        })
+        .filter_map(
+            |a| match henyey_history::HistoryArchive::with_name(&a.url, &a.name) {
+                Ok(archive) => Some(archive),
+                Err(e) => {
+                    println!("Warning: Failed to create archive {}: {}", a.url, e);
+                    None
+                }
+            },
+        )
         .collect();
 
     if archives.is_empty() {
