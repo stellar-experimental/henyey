@@ -161,7 +161,7 @@ impl App {
         // If a previous catchup failed with a hash mismatch, force a full
         // bucket-apply catchup to rebuild state from the archive instead of
         // replaying from the (possibly corrupt/diverged) local state.
-        let force_full = self.catchup_needs_full_reset.swap(false, Ordering::SeqCst);
+        let force_full = self.catchup_needs_full_reset.load(Ordering::SeqCst);
         if force_full {
             tracing::warn!("Previous catchup failed — forcing full bucket-apply catchup");
         }
@@ -596,6 +596,11 @@ impl App {
         // Stage B: Record catchup duration after all fallible work completes.
         metrics::histogram!("stellar_ledger_catchup_duration_seconds")
             .record(catchup_timer.elapsed().as_secs_f64());
+
+        // Only clear the full-reset flag after catchup succeeds. If any error
+        // propagated via `?` above, the flag remains set so the next attempt
+        // retries with a full bucket-apply (AUDIT-241).
+        self.catchup_needs_full_reset.store(false, Ordering::SeqCst);
 
         Ok(catchup_result)
     }
@@ -4885,5 +4890,93 @@ mod tests {
         let app = App::new(config).await.unwrap();
 
         assert_eq!(app.live_catchup_mode(), CatchupMode::Minimal);
+    }
+
+    /// AUDIT-241 regression: when `catchup_needs_full_reset` is set and
+    /// catchup fails (transient error), the flag must remain `true` so the
+    /// next attempt retries with a full bucket-apply.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_catchup_needs_full_reset_preserved_on_failure() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-test.db");
+        let mut config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
+        // Point at unreachable archive so catchup fails (simulates network error).
+        config.history.archives = vec![crate::config::HistoryArchiveEntry {
+            name: "unreachable".to_string(),
+            url: "http://127.0.0.1:1/.well-known/stellar-history.json".to_string(),
+            get_enabled: true,
+            put_enabled: false,
+            put: None,
+            mkdir: None,
+        }];
+        let app = App::new(config).await.unwrap();
+
+        // Set the flag — simulates a prior hash mismatch or AUDIT-226 detection.
+        app.catchup_needs_full_reset.store(true, Ordering::SeqCst);
+
+        // Attempt catchup with a target that will fail (unreachable archive).
+        // CatchupTarget::Ledger(128) forces the function past the early return
+        // (current == 0 < 128) and past line 164 where the flag is read.
+        let (persist_tx, _persist_rx) = tokio::sync::oneshot::channel();
+        let finalize = super::persist::CatchupFinalizer::deferred(
+            app.db.clone(),
+            app.ledger_manager.clone(),
+            persist_tx,
+        );
+        let result = app
+            .catchup_with_mode(CatchupTarget::Ledger(128), CatchupMode::Minimal, finalize)
+            .await;
+
+        // Catchup must fail (unreachable archive).
+        assert!(
+            result.is_err(),
+            "expected catchup to fail with unreachable archive"
+        );
+
+        // The flag must remain set — this is the AUDIT-241 fix.
+        assert!(
+            app.catchup_needs_full_reset.load(Ordering::SeqCst),
+            "catchup_needs_full_reset must remain true after failed catchup"
+        );
+    }
+
+    /// AUDIT-241: when catchup succeeds, the flag must be cleared.
+    /// We verify via the no-op early return (target <= current) that the
+    /// flag is NOT cleared — because the early return is before the flag
+    /// read. This confirms the flag is only consumed in the success path
+    /// after actual catchup work completes.
+    #[tokio::test]
+    async fn test_catchup_needs_full_reset_unchanged_on_noop() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-test.db");
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
+        let app = App::new(config).await.unwrap();
+
+        // Set the flag.
+        app.catchup_needs_full_reset.store(true, Ordering::SeqCst);
+
+        // Target ledger = 0, current = 0 → target_ledger <= current → early return.
+        let (persist_tx, _persist_rx) = tokio::sync::oneshot::channel();
+        let finalize = super::persist::CatchupFinalizer::deferred(
+            app.db.clone(),
+            app.ledger_manager.clone(),
+            persist_tx,
+        );
+        let result = app
+            .catchup_with_mode(CatchupTarget::Ledger(0), CatchupMode::Minimal, finalize)
+            .await;
+
+        // No-op catchup succeeds.
+        assert!(result.is_ok(), "no-op catchup should succeed");
+
+        // The flag must remain set — the early return path does not consume it.
+        assert!(
+            app.catchup_needs_full_reset.load(Ordering::SeqCst),
+            "no-op catchup must not clear catchup_needs_full_reset"
+        );
     }
 }
