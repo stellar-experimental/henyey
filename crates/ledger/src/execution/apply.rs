@@ -44,11 +44,14 @@ pub struct RestoredEntries {
     /// (e.g., RestoreFootprint only creates TTL, but data entry needs RESTORED).
     pub(super) hot_archive_entries: HashMap<LedgerKey, stellar_xdr::curr::LedgerEntry>,
     /// Keys restored from live BucketList (expired TTL but not yet evicted).
-    /// TTL entries will have STATE+UPDATED that should be converted to RESTORED.
-    /// Associated data/code entries need RESTORED meta added even if not modified.
+    /// For UPDATED entries: if data unchanged, emit RESTORED; if changed, emit
+    /// RESTORED(original) + UPDATED(new) per stellar-core TransactionMeta.cpp:176-197.
+    /// Associated data/code entries need RESTORED meta added even if not directly modified.
     pub(super) live_bucket_list: HashSet<LedgerKey>,
-    /// For live BL restores, maps data/code keys to their entry values.
-    /// These are needed to emit RESTORED for data/code that wasn't directly modified.
+    /// For live BL restores, maps keys to their **original** entry values (before modification).
+    /// Used for data comparison in meta emission: if post_state.data == original.data,
+    /// the entry was only restored (not modified). Also used to emit RESTORED for entries
+    /// not directly modified (only their TTL was extended).
     pub(super) live_bucket_list_entries: HashMap<LedgerKey, stellar_xdr::curr::LedgerEntry>,
 }
 

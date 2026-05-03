@@ -459,6 +459,44 @@ pub(super) struct LedgerChanges<'a> {
     pub restored: &'a RestoredEntries,
 }
 
+/// Emit correct meta for a live-BL-restored entry that appears as UPDATED.
+///
+/// Per stellar-core `TransactionMeta.cpp:176-197`:
+/// - If data unchanged after restore: emit `RESTORED(post_state)` (only the restore happened)
+/// - If data changed after restore: emit `RESTORED(original, lms=current) + UPDATED(post_state)`
+///
+/// Panics if `key` is in `restored.live_bucket_list` but not in
+/// `restored.live_bucket_list_entries` — this indicates inconsistent state since
+/// `collect_soroban_restored_entries` always populates both.
+fn push_live_bl_restored_update(
+    changes: &mut Vec<LedgerEntryChange>,
+    post_state: &LedgerEntry,
+    key: &LedgerKey,
+    restored: &RestoredEntries,
+    current_ledger_seq: u32,
+) {
+    let original = restored
+        .live_bucket_list_entries
+        .get(key)
+        .unwrap_or_else(|| {
+            panic!(
+                "live_bucket_list set contains key but live_bucket_list_entries map does not: {:?}",
+                std::mem::discriminant(key)
+            )
+        });
+
+    if post_state.data == original.data {
+        // Only restored, not modified — emit RESTORED(post_state)
+        changes.push(LedgerEntryChange::Restored(post_state.clone()));
+    } else {
+        // Restored AND modified — emit RESTORED(original, lms=current) + UPDATED(post_state)
+        let mut restored_entry = original.clone();
+        restored_entry.last_modified_ledger_seq = current_ledger_seq;
+        changes.push(LedgerEntryChange::Restored(restored_entry));
+        changes.push(LedgerEntryChange::Updated(post_state.clone()));
+    }
+}
+
 /// Build entry changes with support for hot archive and live BL restoration tracking.
 ///
 /// For entries in `restored.hot_archive`:
@@ -466,7 +504,8 @@ pub(super) struct LedgerChanges<'a> {
 /// - For deleted entries that were restored, emit RESTORED then REMOVED
 ///
 /// For entries in `restored.live_bucket_list`:
-/// - Convert STATE+UPDATED to RESTORED (entry had expired TTL in live BL)
+/// - If data unchanged: convert STATE+UPDATED to just RESTORED
+/// - If data changed: emit RESTORED(original) + UPDATED(new) (stellar-core TransactionMeta.cpp:176-197)
 /// - Emit RESTORED for associated data/code entries even if not directly modified
 ///
 /// When `is_soroban` is true, entries are ordered according to
@@ -530,7 +569,13 @@ pub(super) fn build_entry_changes_with_hot_archive(
                 changes.push(LedgerEntryChange::Restored(entry.clone()));
             }
         } else if restored.live_bucket_list.contains(key) {
-            changes.push(LedgerEntryChange::Restored(entry.clone()));
+            // Live BL restores should never appear as CREATED — they use LIVE (updated)
+            // in the delta because the entry already exists in the live BL.
+            // stellar-core: TransactionMeta.cpp:140-141 asserts this.
+            unreachable!(
+                "live BL restored entry should not appear as CREATED: {:?}",
+                std::mem::discriminant(key)
+            );
         } else {
             changes.push(LedgerEntryChange::Created(entry.clone()));
         }
@@ -662,10 +707,21 @@ pub(super) fn build_entry_changes_with_hot_archive(
                         // setLedgerChangesFromSuccessfulOp which uses raw res.getModifiedEntryMap()).
                         // The filtering to mRoTTLBumps only affects STATE updates (commitChangesFromSuccessfulOp),
                         // not transaction meta. Do NOT skip ro_ttl_keys here.
-                        if restored.hot_archive.contains(&key)
-                            || restored.live_bucket_list.contains(&key)
-                        {
-                            changes.push(LedgerEntryChange::Restored(post_state.clone()));
+                        if restored.hot_archive.contains(&key) {
+                            // stellar-core: TransactionMeta.cpp:173-174 asserts hot archive
+                            // entries do not appear as UPDATED (they use CREATED path).
+                            unreachable!(
+                                "hot archive entries should not appear as UPDATED: {:?}",
+                                std::mem::discriminant(&key)
+                            );
+                        } else if restored.live_bucket_list.contains(&key) {
+                            push_live_bl_restored_update(
+                                &mut changes,
+                                post_state,
+                                &key,
+                                restored,
+                                current_ledger_seq,
+                            );
                             processed_keys.insert(key);
                         } else {
                             // Get pre-state from update_states or snapshot
@@ -755,11 +811,21 @@ pub(super) fn build_entry_changes_with_hot_archive(
                     if *idx < updated.len() {
                         let post_state = &updated[*idx];
                         let key = henyey_common::entry_to_key(post_state);
-                        if restored.hot_archive.contains(&key)
-                            || restored.live_bucket_list.contains(&key)
-                        {
-                            // Use entry value for hot archive restored entries
-                            changes.push(LedgerEntryChange::Restored(post_state.clone()));
+                        if restored.hot_archive.contains(&key) {
+                            // stellar-core: TransactionMeta.cpp:173-174 asserts hot archive
+                            // entries do not appear as UPDATED (they use CREATED path).
+                            unreachable!(
+                                "hot archive entries should not appear as UPDATED: {:?}",
+                                std::mem::discriminant(&key)
+                            );
+                        } else if restored.live_bucket_list.contains(&key) {
+                            push_live_bl_restored_update(
+                                &mut changes,
+                                post_state,
+                                &key,
+                                restored,
+                                current_ledger_seq,
+                            );
                             processed_keys.insert(key);
                         } else {
                             // Normal update: STATE (pre-state) then UPDATED (post-state)
@@ -862,10 +928,21 @@ pub(super) fn build_entry_changes_with_hot_archive(
             if !seen_keys.contains(&key) {
                 seen_keys.insert(key.clone());
                 if let Some(final_entry) = final_updated.get(&key) {
-                    if restored.hot_archive.contains(&key)
-                        || restored.live_bucket_list.contains(&key)
-                    {
-                        changes.push(LedgerEntryChange::Restored(final_entry.clone()));
+                    if restored.hot_archive.contains(&key) {
+                        // stellar-core: TransactionMeta.cpp:173-174 asserts hot archive
+                        // entries do not appear as UPDATED (they use CREATED path).
+                        unreachable!(
+                            "hot archive entries should not appear as UPDATED: {:?}",
+                            std::mem::discriminant(&key)
+                        );
+                    } else if restored.live_bucket_list.contains(&key) {
+                        push_live_bl_restored_update(
+                            &mut changes,
+                            final_entry,
+                            &key,
+                            restored,
+                            current_ledger_seq,
+                        );
                         processed_keys.insert(key);
                     } else {
                         if let Some(state_entry) = state_overrides
@@ -1711,5 +1788,414 @@ mod tests {
             }
             other => panic!("Expected RESTORED, got {:?}", other),
         }
+    }
+
+    /// Test that a live BL restored entry that is modified emits RESTORED(original) + UPDATED(modified)
+    /// via the ChangeRef::Updated path.
+    #[test]
+    fn test_live_bl_restore_and_modify_emits_restored_plus_updated() {
+        use std::collections::HashMap;
+
+        let contract_hash = [0xAA; 32];
+        // Original entry (before modification)
+        let original_entry = LedgerEntry {
+            last_modified_ledger_seq: 50,
+            data: LedgerEntryData::ContractData(ContractDataEntry {
+                ext: ExtensionPoint::V0,
+                contract: ScAddress::Contract(ContractId(Hash(contract_hash))),
+                key: ScVal::LedgerKeyContractInstance,
+                durability: ContractDataDurability::Persistent,
+                val: ScVal::Void,
+            }),
+            ext: LedgerEntryExt::V0,
+        };
+
+        // Modified entry after host execution (val changed)
+        let modified_entry = LedgerEntry {
+            last_modified_ledger_seq: 100,
+            data: LedgerEntryData::ContractData(ContractDataEntry {
+                ext: ExtensionPoint::V0,
+                contract: ScAddress::Contract(ContractId(Hash(contract_hash))),
+                key: ScVal::LedgerKeyContractInstance,
+                durability: ContractDataDurability::Persistent,
+                val: ScVal::Bool(true),
+            }),
+            ext: LedgerEntryExt::V0,
+        };
+
+        let key = LedgerKey::ContractData(LedgerKeyContractData {
+            contract: ScAddress::Contract(ContractId(Hash(contract_hash))),
+            key: ScVal::LedgerKeyContractInstance,
+            durability: ContractDataDurability::Persistent,
+        });
+
+        let mut live_bucket_list = std::collections::HashSet::new();
+        live_bucket_list.insert(key.clone());
+
+        let mut live_bucket_list_entries = HashMap::new();
+        live_bucket_list_entries.insert(key.clone(), original_entry.clone());
+
+        let restored = super::super::apply::RestoredEntries {
+            hot_archive: std::collections::HashSet::new(),
+            hot_archive_entries: HashMap::new(),
+            live_bucket_list,
+            live_bucket_list_entries,
+        };
+
+        let updated = vec![modified_entry.clone()];
+        let change_order = vec![henyey_tx::ChangeRef::Updated(0)];
+
+        let state = LedgerStateManager::new(5_000_000, 100);
+        let current_ledger_seq = 100u32;
+
+        let changes = build_entry_changes_with_hot_archive(
+            &state,
+            &LedgerChanges {
+                created: &[],
+                updated: &updated,
+                update_states: &[],
+                deleted: &[],
+                delete_states: &[],
+                change_order: &change_order,
+                state_overrides: &HashMap::new(),
+                restored: &restored,
+            },
+            true, // is_soroban
+            current_ledger_seq,
+        );
+
+        let changes = changes.0.to_vec();
+        // Should emit RESTORED(original, lms=current) + UPDATED(modified)
+        assert_eq!(
+            changes.len(),
+            2,
+            "Expected RESTORED + UPDATED, got {:?}",
+            changes
+        );
+        match &changes[0] {
+            LedgerEntryChange::Restored(entry) => {
+                assert_eq!(entry.data, original_entry.data);
+                assert_eq!(entry.last_modified_ledger_seq, current_ledger_seq);
+            }
+            other => panic!("Expected RESTORED, got {:?}", other),
+        }
+        match &changes[1] {
+            LedgerEntryChange::Updated(entry) => {
+                assert_eq!(entry.data, modified_entry.data);
+            }
+            other => panic!("Expected UPDATED, got {:?}", other),
+        }
+    }
+
+    /// Test that a live BL restored entry with unchanged data emits only RESTORED(post_state).
+    #[test]
+    fn test_live_bl_restore_unmodified_emits_only_restored() {
+        use std::collections::HashMap;
+
+        let contract_hash = [0xBB; 32];
+        let entry = LedgerEntry {
+            last_modified_ledger_seq: 100,
+            data: LedgerEntryData::ContractData(ContractDataEntry {
+                ext: ExtensionPoint::V0,
+                contract: ScAddress::Contract(ContractId(Hash(contract_hash))),
+                key: ScVal::LedgerKeyContractInstance,
+                durability: ContractDataDurability::Persistent,
+                val: ScVal::Void,
+            }),
+            ext: LedgerEntryExt::V0,
+        };
+
+        let key = LedgerKey::ContractData(LedgerKeyContractData {
+            contract: ScAddress::Contract(ContractId(Hash(contract_hash))),
+            key: ScVal::LedgerKeyContractInstance,
+            durability: ContractDataDurability::Persistent,
+        });
+
+        let mut live_bucket_list = std::collections::HashSet::new();
+        live_bucket_list.insert(key.clone());
+
+        let mut live_bucket_list_entries = HashMap::new();
+        // Same data as the updated entry — only restored, not modified
+        live_bucket_list_entries.insert(
+            key.clone(),
+            LedgerEntry {
+                last_modified_ledger_seq: 50, // different lms is fine, only .data matters
+                data: entry.data.clone(),
+                ext: LedgerEntryExt::V0,
+            },
+        );
+
+        let restored = super::super::apply::RestoredEntries {
+            hot_archive: std::collections::HashSet::new(),
+            hot_archive_entries: HashMap::new(),
+            live_bucket_list,
+            live_bucket_list_entries,
+        };
+
+        let updated = vec![entry.clone()];
+        let change_order = vec![henyey_tx::ChangeRef::Updated(0)];
+
+        let state = LedgerStateManager::new(5_000_000, 100);
+
+        let changes = build_entry_changes_with_hot_archive(
+            &state,
+            &LedgerChanges {
+                created: &[],
+                updated: &updated,
+                update_states: &[],
+                deleted: &[],
+                delete_states: &[],
+                change_order: &change_order,
+                state_overrides: &HashMap::new(),
+                restored: &restored,
+            },
+            true,
+            100,
+        );
+
+        let changes = changes.0.to_vec();
+        // Should emit single RESTORED(entry)
+        assert_eq!(
+            changes.len(),
+            1,
+            "Expected single RESTORED, got {:?}",
+            changes
+        );
+        match &changes[0] {
+            LedgerEntryChange::Restored(e) => {
+                assert_eq!(e.data, entry.data);
+            }
+            other => panic!("Expected RESTORED, got {:?}", other),
+        }
+    }
+
+    /// Test live BL restore+modify via the dedup loop path (empty change_order for Soroban).
+    #[test]
+    fn test_live_bl_restore_modified_in_dedup_loop() {
+        use std::collections::HashMap;
+
+        let contract_hash = [0xCC; 32];
+        let original_entry = LedgerEntry {
+            last_modified_ledger_seq: 50,
+            data: LedgerEntryData::ContractData(ContractDataEntry {
+                ext: ExtensionPoint::V0,
+                contract: ScAddress::Contract(ContractId(Hash(contract_hash))),
+                key: ScVal::LedgerKeyContractInstance,
+                durability: ContractDataDurability::Persistent,
+                val: ScVal::Void,
+            }),
+            ext: LedgerEntryExt::V0,
+        };
+
+        let modified_entry = LedgerEntry {
+            last_modified_ledger_seq: 100,
+            data: LedgerEntryData::ContractData(ContractDataEntry {
+                ext: ExtensionPoint::V0,
+                contract: ScAddress::Contract(ContractId(Hash(contract_hash))),
+                key: ScVal::LedgerKeyContractInstance,
+                durability: ContractDataDurability::Persistent,
+                val: ScVal::Bool(false),
+            }),
+            ext: LedgerEntryExt::V0,
+        };
+
+        let key = LedgerKey::ContractData(LedgerKeyContractData {
+            contract: ScAddress::Contract(ContractId(Hash(contract_hash))),
+            key: ScVal::LedgerKeyContractInstance,
+            durability: ContractDataDurability::Persistent,
+        });
+
+        let mut live_bucket_list = std::collections::HashSet::new();
+        live_bucket_list.insert(key.clone());
+
+        let mut live_bucket_list_entries = HashMap::new();
+        live_bucket_list_entries.insert(key.clone(), original_entry.clone());
+
+        let restored = super::super::apply::RestoredEntries {
+            hot_archive: std::collections::HashSet::new(),
+            hot_archive_entries: HashMap::new(),
+            live_bucket_list,
+            live_bucket_list_entries,
+        };
+
+        // Use empty change_order and is_soroban=false to hit the non-soroban dedup loop fallback
+        let updated = vec![modified_entry.clone()];
+        let change_order: Vec<henyey_tx::ChangeRef> = vec![];
+
+        let state = LedgerStateManager::new(5_000_000, 100);
+        let current_ledger_seq = 100u32;
+
+        let changes = build_entry_changes_with_hot_archive(
+            &state,
+            &LedgerChanges {
+                created: &[],
+                updated: &updated,
+                update_states: &[],
+                deleted: &[],
+                delete_states: &[],
+                change_order: &change_order,
+                state_overrides: &HashMap::new(),
+                restored: &restored,
+            },
+            false, // is_soroban=false to hit the dedup loop branch
+            current_ledger_seq,
+        );
+
+        let changes = changes.0.to_vec();
+        // Dedup loop should emit RESTORED(original, lms=current) + UPDATED(modified)
+        assert_eq!(
+            changes.len(),
+            2,
+            "Expected RESTORED + UPDATED from dedup loop, got {:?}",
+            changes
+        );
+        match &changes[0] {
+            LedgerEntryChange::Restored(entry) => {
+                assert_eq!(entry.data, original_entry.data);
+                assert_eq!(entry.last_modified_ledger_seq, current_ledger_seq);
+            }
+            other => panic!("Expected RESTORED, got {:?}", other),
+        }
+        match &changes[1] {
+            LedgerEntryChange::Updated(entry) => {
+                assert_eq!(entry.data, modified_entry.data);
+            }
+            other => panic!("Expected UPDATED, got {:?}", other),
+        }
+    }
+
+    /// Test that TTL entries from live BL always take the "modified" path since
+    /// their live_until_ledger changes during restoration.
+    #[test]
+    fn test_live_bl_restore_ttl_always_modified() {
+        use std::collections::HashMap;
+
+        let key_hash = [0xDD; 32];
+        // Original TTL with expired value
+        let original_ttl = make_ttl_entry(key_hash, 50);
+        // New TTL with bumped value
+        let new_ttl = make_ttl_entry(key_hash, 200);
+
+        let ttl_key = LedgerKey::Ttl(LedgerKeyTtl {
+            key_hash: Hash(key_hash),
+        });
+
+        let mut live_bucket_list = std::collections::HashSet::new();
+        live_bucket_list.insert(ttl_key.clone());
+
+        let mut live_bucket_list_entries = HashMap::new();
+        live_bucket_list_entries.insert(ttl_key.clone(), original_ttl.clone());
+
+        let restored = super::super::apply::RestoredEntries {
+            hot_archive: std::collections::HashSet::new(),
+            hot_archive_entries: HashMap::new(),
+            live_bucket_list,
+            live_bucket_list_entries,
+        };
+
+        let updated = vec![new_ttl.clone()];
+        let change_order = vec![henyey_tx::ChangeRef::Updated(0)];
+
+        let state = LedgerStateManager::new(5_000_000, 100);
+        let current_ledger_seq = 100u32;
+
+        let changes = build_entry_changes_with_hot_archive(
+            &state,
+            &LedgerChanges {
+                created: &[],
+                updated: &updated,
+                update_states: &[],
+                deleted: &[],
+                delete_states: &[],
+                change_order: &change_order,
+                state_overrides: &HashMap::new(),
+                restored: &restored,
+            },
+            true, // is_soroban
+            current_ledger_seq,
+        );
+
+        let changes = changes.0.to_vec();
+        // TTL data always differs (live_until changed) — emit RESTORED(old) + UPDATED(new)
+        assert_eq!(
+            changes.len(),
+            2,
+            "Expected RESTORED + UPDATED for TTL, got {:?}",
+            changes
+        );
+        match &changes[0] {
+            LedgerEntryChange::Restored(entry) => {
+                assert_eq!(entry.data, original_ttl.data);
+                assert_eq!(entry.last_modified_ledger_seq, current_ledger_seq);
+            }
+            other => panic!("Expected RESTORED, got {:?}", other),
+        }
+        match &changes[1] {
+            LedgerEntryChange::Updated(entry) => {
+                assert_eq!(entry.data, new_ttl.data);
+            }
+            other => panic!("Expected UPDATED, got {:?}", other),
+        }
+    }
+
+    /// Test that set-hit/map-miss panics (inconsistent state).
+    #[test]
+    #[should_panic(
+        expected = "live_bucket_list set contains key but live_bucket_list_entries map does not"
+    )]
+    fn test_live_bl_set_map_consistency_panic() {
+        use std::collections::HashMap;
+
+        let contract_hash = [0xEE; 32];
+        let entry = LedgerEntry {
+            last_modified_ledger_seq: 100,
+            data: LedgerEntryData::ContractData(ContractDataEntry {
+                ext: ExtensionPoint::V0,
+                contract: ScAddress::Contract(ContractId(Hash(contract_hash))),
+                key: ScVal::LedgerKeyContractInstance,
+                durability: ContractDataDurability::Persistent,
+                val: ScVal::Void,
+            }),
+            ext: LedgerEntryExt::V0,
+        };
+
+        let key = LedgerKey::ContractData(LedgerKeyContractData {
+            contract: ScAddress::Contract(ContractId(Hash(contract_hash))),
+            key: ScVal::LedgerKeyContractInstance,
+            durability: ContractDataDurability::Persistent,
+        });
+
+        let mut live_bucket_list = std::collections::HashSet::new();
+        live_bucket_list.insert(key.clone());
+        // Deliberately do NOT insert into live_bucket_list_entries
+
+        let restored = super::super::apply::RestoredEntries {
+            hot_archive: std::collections::HashSet::new(),
+            hot_archive_entries: HashMap::new(),
+            live_bucket_list,
+            live_bucket_list_entries: HashMap::new(),
+        };
+
+        let updated = vec![entry.clone()];
+        let change_order = vec![henyey_tx::ChangeRef::Updated(0)];
+
+        let state = LedgerStateManager::new(5_000_000, 100);
+
+        // This should panic due to set-hit/map-miss
+        build_entry_changes_with_hot_archive(
+            &state,
+            &LedgerChanges {
+                created: &[],
+                updated: &updated,
+                update_states: &[],
+                deleted: &[],
+                delete_states: &[],
+                change_order: &change_order,
+                state_overrides: &HashMap::new(),
+                restored: &restored,
+            },
+            true,
+            100,
+        );
     }
 }
