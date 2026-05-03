@@ -16,6 +16,8 @@
 #   LOOP_LOG_DIR            Directory for per-run logs (default: ~/data/plan-do-review-loop)
 #   LOOP_MAX_STALE_RETRIES  Max consecutive no-progress attempts before marking
 #                           an issue as failed (default: 5)
+#   LOOP_ARCHIVE_DAYS       Archive closed project items older than this many
+#                           days at the start of each tick (default: 2)
 
 set -euo pipefail
 
@@ -246,7 +248,29 @@ check_stale_retries() {
 }
 
 # --- Main loop ---
+LOOP_ARCHIVE_DAYS="${LOOP_ARCHIVE_DAYS:-2}"
+
 while true; do
+  # Best-effort: archive any closed project items older than LOOP_ARCHIVE_DAYS.
+  # Idempotent and cheap (one paginated GraphQL query if nothing is stale).
+  # Failure is logged but does not break the loop.
+  archive_script="$(dirname "$0")/../.github/skills/plan-do-review/scripts/archive-stale-done.sh"
+  if [[ -x "$archive_script" ]]; then
+    set +e
+    archive_out="$(bash "$archive_script" "$LOOP_ARCHIVE_DAYS" 2>&1)"
+    archive_rc=$?
+    set -e
+    if [[ "$archive_rc" -eq 0 ]]; then
+      # Only echo if something was actually archived (suppress the
+      # routine "No items to archive" log line every minute).
+      if [[ "$archive_out" != *"No items to archive"* ]]; then
+        log "$archive_out"
+      fi
+    else
+      log "WARNING: archive-stale-done exited ${archive_rc}: ${archive_out}"
+    fi
+  fi
+
   # Select up to LOOP_BATCH_SIZE issues
   set +e
   selected="$(select_issues)"
