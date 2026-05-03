@@ -468,10 +468,9 @@ pub fn validate_fee(
     frame: &TransactionFrame,
     context: &LedgerContext,
 ) -> std::result::Result<(), ValidationError> {
-    let required = frame.min_inclusion_fee(context.base_fee as i64);
-    let provided = frame.inclusion_fee();
-
-    if provided.as_i64() < required.as_i64() {
+    if !frame.has_sufficient_inclusion_fee(context.base_fee as i64) {
+        let required = frame.min_inclusion_fee(context.base_fee as i64);
+        let provided = frame.inclusion_fee();
         return Err(ValidationError::InsufficientFee {
             required: required.as_i64(),
             provided: provided.as_i64(),

@@ -427,6 +427,33 @@ impl TransactionFrame {
         )
     }
 
+    /// Returns `true` when the transaction's inclusion fee meets or exceeds
+    /// the minimum required at the given `base_fee`.
+    ///
+    /// This is the single source of truth for the `TransactionFrame`-level
+    /// inclusion-fee sufficiency predicate. Ledger preconditions, tx
+    /// validation, and fee-bump validation all delegate to this method.
+    ///
+    /// # Preconditions
+    ///
+    /// - `base_fee` must be non-negative (sourced from ledger header).
+    /// - The frame must be structurally valid. For Soroban transactions,
+    ///   `declared_soroban_resource_fee()` must be non-negative (enforced
+    ///   by structural validation before this point).
+    /// - Valid for regular transactions and fee-bump **outer** frames only.
+    ///   Must NOT be called on fee-bump *inner* Soroban frames, which may
+    ///   have negative inclusion fees covered by the outer envelope (those
+    ///   use the cross-multiplication rate comparison instead).
+    ///
+    /// # Parity
+    ///
+    /// Mirrors the comparison in stellar-core's
+    /// `TransactionFrame::commonValidPreSeqNum` (TransactionFrame.cpp:1482-1493)
+    /// and `FeeBumpTransactionFrame::commonValidPreSeqNum` (lines 337-361).
+    pub fn has_sufficient_inclusion_fee(&self, base_fee: i64) -> bool {
+        self.inclusion_fee() >= self.min_inclusion_fee(base_fee)
+    }
+
     /// Fee to charge when applying this transaction.
     ///
     /// - **Soroban**: `resource_fee + min(inclusion_fee, min_inclusion_fee)`
@@ -2116,5 +2143,58 @@ mod tests {
         let frame = TransactionFrame::from_owned(create_test_transaction());
         // base_fee=0 → min_inclusion_fee=0 → min(100, 0) = 0
         assert_eq!(frame.fee_to_charge(0), 0);
+    }
+
+    // ── has_sufficient_inclusion_fee tests ──
+
+    #[test]
+    fn test_has_sufficient_inclusion_fee_classic_sufficient() {
+        // Classic tx: fee=100, 1 op → min_inclusion_fee at base_fee=100 is 100
+        let frame = TransactionFrame::from_owned(create_test_transaction());
+        assert!(frame.has_sufficient_inclusion_fee(100));
+    }
+
+    #[test]
+    fn test_has_sufficient_inclusion_fee_classic_exact_boundary() {
+        // fee=100, base_fee=100, 1 op → inclusion_fee (100) == min (100)
+        let frame = TransactionFrame::from_owned(create_test_transaction());
+        assert!(frame.has_sufficient_inclusion_fee(100));
+    }
+
+    #[test]
+    fn test_has_sufficient_inclusion_fee_classic_insufficient() {
+        // fee=100, base_fee=200, 1 op → min_inclusion_fee=200 > inclusion_fee=100
+        let frame = TransactionFrame::from_owned(create_test_transaction());
+        assert!(!frame.has_sufficient_inclusion_fee(200));
+    }
+
+    #[test]
+    fn test_has_sufficient_inclusion_fee_classic_excess() {
+        // fee=100, base_fee=10, 1 op → min_inclusion_fee=10 < inclusion_fee=100
+        let frame = TransactionFrame::from_owned(create_test_transaction());
+        assert!(frame.has_sufficient_inclusion_fee(10));
+    }
+
+    #[test]
+    fn test_has_sufficient_inclusion_fee_soroban_sufficient() {
+        // Soroban: total_fee=500, resource_fee=200 → inclusion_fee=300
+        // base_fee=100, 1 op → min_inclusion_fee=100
+        let frame = TransactionFrame::from_owned(create_soroban_transaction_with_fees(200, 500));
+        assert!(frame.has_sufficient_inclusion_fee(100));
+    }
+
+    #[test]
+    fn test_has_sufficient_inclusion_fee_soroban_insufficient() {
+        // Soroban: total_fee=250, resource_fee=200 → inclusion_fee=50
+        // base_fee=100, 1 op → min_inclusion_fee=100
+        let frame = TransactionFrame::from_owned(create_soroban_transaction_with_fees(200, 250));
+        assert!(!frame.has_sufficient_inclusion_fee(100));
+    }
+
+    #[test]
+    fn test_has_sufficient_inclusion_fee_zero_base_fee() {
+        // base_fee=0 → min_inclusion_fee=0, any fee is sufficient
+        let frame = TransactionFrame::from_owned(create_test_transaction());
+        assert!(frame.has_sufficient_inclusion_fee(0));
     }
 }
