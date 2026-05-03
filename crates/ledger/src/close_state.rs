@@ -1062,4 +1062,50 @@ mod tests {
         let entry = state.get_entry(&key).unwrap();
         assert!(entry.is_some(), "Entry should persist in delta after Err");
     }
+
+    /// Regression test for the raw checkpoint escape hatch with the
+    /// log-and-continue error pattern (manager.rs version-upgrade path).
+    ///
+    /// Verifies that when a checkpoint scope has multiple operations and a
+    /// later operation fails (caught via if-let-Err), changes from earlier
+    /// successful operations are still captured by `entry_changes_since`.
+    #[test]
+    fn test_raw_checkpoint_log_and_continue_captures_earlier_changes() {
+        let snapshot = make_empty_snapshot(100);
+        let header = LedgerHeader {
+            ledger_version: 25,
+            ledger_seq: 100,
+            ..Default::default()
+        };
+        let mut state =
+            CloseLedgerState::begin(snapshot, header, henyey_common::Hash256::ZERO, 101);
+
+        // Simulate the version-upgrade escape-hatch pattern:
+        // 1. Take checkpoint
+        // 2. First operation succeeds (creates an entry)
+        // 3. Second operation fails (caught by if-let-Err, logged)
+        // 4. entry_changes_since still captures changes from step 2
+        let cp = state.change_checkpoint();
+
+        // Step 2: Successful mutation
+        let entry = make_test_account_entry(1, 1000, 101);
+        state.record_create(entry).unwrap();
+
+        // Step 3: Simulate a failing operation (log and continue)
+        let result: Result<()> =
+            Err(crate::error::LedgerError::Internal("simulated recompute failure".into()).into());
+        if let Err(e) = result {
+            // In production this would be tracing::error!(...)
+            let _ = e;
+        }
+
+        // Step 4: Changes from step 2 must still be captured
+        let changes = state.entry_changes_since(cp);
+        assert_eq!(
+            changes.0.len(),
+            1,
+            "Earlier changes must be captured even when a later operation fails"
+        );
+        assert!(matches!(&changes.0[0], LedgerEntryChange::Created(_)));
+    }
 }
