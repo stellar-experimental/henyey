@@ -1172,7 +1172,22 @@ pub fn install_recorder() -> PrometheusHandle {
 mod tests {
     use super::*;
     use catalog_arrays::*;
+    use metrics_exporter_prometheus::PrometheusRecorder;
     use std::collections::HashSet;
+
+    /// Build a pristine local recorder for tests that assert absolute zero values.
+    ///
+    /// `with_local_recorder` is thread-local — this helper is only correct for
+    /// synchronous `#[test]` functions. Do NOT use in `#[tokio::test]` or any
+    /// async context where work may span threads.
+    ///
+    /// Uses a bare `PrometheusBuilder` (no custom histogram buckets) because
+    /// these tests only inspect counter/gauge values, never histogram boundaries.
+    fn fresh_local_recorder() -> (PrometheusRecorder, PrometheusHandle) {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        (recorder, handle)
+    }
 
     #[test]
     fn test_all_gauges_described_and_typed() {
@@ -1220,9 +1235,11 @@ mod tests {
 
     #[test]
     fn test_preregistered_gauges_at_zero() {
-        let handle = ensure_test_recorder();
-        describe_metrics();
-        register_label_series();
+        let (recorder, handle) = fresh_local_recorder();
+        metrics::with_local_recorder(&recorder, || {
+            describe_metrics();
+            register_label_series();
+        });
         let output = handle.render();
 
         for name in ALL_PREREGISTERED_GAUGE_NAMES {
@@ -1236,9 +1253,11 @@ mod tests {
 
     #[test]
     fn test_preregistered_counters_at_zero() {
-        let handle = ensure_test_recorder();
-        describe_metrics();
-        register_label_series();
+        let (recorder, handle) = fresh_local_recorder();
+        metrics::with_local_recorder(&recorder, || {
+            describe_metrics();
+            register_label_series();
+        });
         let output = handle.render();
 
         for name in ALL_PREREGISTERED_COUNTER_NAMES {
@@ -1447,9 +1466,11 @@ mod tests {
     fn test_stage_f1_overlay_counters_preregistered_at_zero() {
         // Stage F.1 counters must be visible on the very first scrape with a
         // 0 value so dashboard panels render even before any peer traffic.
-        let handle = ensure_test_recorder();
-        describe_metrics();
-        register_label_series();
+        let (recorder, handle) = fresh_local_recorder();
+        metrics::with_local_recorder(&recorder, || {
+            describe_metrics();
+            register_label_series();
+        });
         let output = handle.render();
 
         for name in &[
@@ -1504,9 +1525,11 @@ mod tests {
     fn test_stage_f2_overlay_counters_preregistered_at_zero() {
         // Stage F.2 counters must be visible on the very first scrape with a
         // 0 value so dashboard panels render even before any peer traffic.
-        let handle = ensure_test_recorder();
-        describe_metrics();
-        register_label_series();
+        let (recorder, handle) = fresh_local_recorder();
+        metrics::with_local_recorder(&recorder, || {
+            describe_metrics();
+            register_label_series();
+        });
         let output = handle.render();
 
         for name in &[
