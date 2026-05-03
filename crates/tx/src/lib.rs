@@ -184,7 +184,8 @@ pub use validation::{
     check_valid_pre_seq_num, check_valid_pre_seq_num_with_config, validate_basic, validate_fee,
     validate_full, validate_ledger_bounds, validate_sequence, validate_signatures,
     validate_structure, validate_time_bounds, verify_signature_with_key,
-    verify_signature_with_raw_key, LedgerContext, PreSeqNumError, ValidationError,
+    verify_signature_with_raw_key, LedgerContext, PreSeqNumError, SorobanResourceLimits,
+    ValidationError,
 };
 
 // Re-export operation types

@@ -914,7 +914,7 @@ impl App {
             });
             self.herder
                 .tx_queue()
-                .set_max_contract_size(soroban_info.max_contract_size);
+                .set_soroban_resource_limits(soroban_info.to_resource_limits());
             self.update_herder_soroban_limits(&soroban_info);
             tracing::info!(
                 ledger_seq = header.ledger_seq,
@@ -2383,7 +2383,8 @@ impl App {
             let base_reserve = result_header.base_reserve;
             let protocol_version = result_header.ledger_version;
 
-            let max_contract_size_bytes = soroban_info.as_ref().map(|info| info.max_contract_size);
+            let soroban_resource_limits =
+                soroban_info.as_ref().map(|info| info.to_resource_limits());
             let (queue_limit, selection_limit) = match soroban_info.as_ref() {
                 Some(info) => {
                     let m = POOL_LEDGER_MULTIPLIER as i64;
@@ -2490,7 +2491,7 @@ impl App {
                     protocol_version,
                     network_id,
                     ledger_flags,
-                    max_contract_size_bytes,
+                    soroban_resource_limits,
                 };
                 // Build ONE snapshot for the whole re-validation pass.
                 //

@@ -64,7 +64,7 @@ impl TransactionExecutor {
             &frame,
             self.protocol_version,
             self.ledger_flags,
-            Some(self.soroban_config.max_contract_size_bytes),
+            self.soroban_resource_limits.as_ref(),
         ) {
             let code = e.to_tx_result_code();
             return Ok(Err(if is_fee_bump {

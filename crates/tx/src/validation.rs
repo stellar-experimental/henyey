@@ -50,6 +50,36 @@ use crate::frame::TransactionFrame;
 /// stellar-core: TransactionFrame.cpp:65 — MAX_RESOURCE_FEE = 2^50
 pub(crate) const MAX_RESOURCE_FEE: i64 = 1i64 << 50;
 
+/// Per-transaction Soroban resource limits from the network configuration.
+///
+/// Parity: stellar-core `SorobanNetworkConfig` per-TX limits, checked in
+/// `TransactionFrame::checkSorobanResources()` (TransactionFrame.cpp:827-1044).
+///
+/// These limits are enforced in [`check_valid_pre_seq_num_with_config`] for all
+/// validation paths: queue admission, received tx-set validation, and ledger
+/// preconditions.
+#[derive(Debug, Clone)]
+pub struct SorobanResourceLimits {
+    /// Maximum instructions per transaction (`txMaxInstructions`).
+    pub tx_max_instructions: u64,
+    /// Maximum disk read bytes per transaction (`txMaxDiskReadBytes`).
+    pub tx_max_read_bytes: u64,
+    /// Maximum write bytes per transaction (`txMaxWriteBytes`).
+    pub tx_max_write_bytes: u64,
+    /// Maximum disk read entries per transaction (`txMaxDiskReadEntries`).
+    pub tx_max_read_ledger_entries: u64,
+    /// Maximum write ledger entries per transaction (`txMaxWriteLedgerEntries`).
+    pub tx_max_write_ledger_entries: u64,
+    /// Maximum transaction size in bytes (`txMaxSizeBytes`).
+    pub tx_max_size_bytes: u64,
+    /// Maximum footprint entries per transaction, v23+ only (`txMaxFootprintEntries`).
+    pub tx_max_footprint_entries: u64,
+    /// Maximum contract WASM size in bytes (`maxContractSizeBytes`).
+    pub max_contract_size_bytes: u32,
+    /// Maximum contract data key size in bytes (`maxContractDataKeySizeBytes`).
+    pub max_contract_data_key_size_bytes: u32,
+}
+
 /// Ledger context for transaction validation and execution.
 ///
 /// This structure provides all the ledger-level information needed to validate
@@ -953,12 +983,14 @@ pub fn check_valid_pre_seq_num(
 }
 
 /// Like `check_valid_pre_seq_num` but with optional Soroban network config for
-/// additional validation (e.g., max contract WASM size).
+/// additional validation (per-TX resource limits, WASM size, key size).
+///
+/// Parity: stellar-core `commonValidPreSeqNum` → `checkSorobanResources`.
 pub fn check_valid_pre_seq_num_with_config(
     frame: &TransactionFrame,
     protocol_version: u32,
     _ledger_flags: u32,
-    max_contract_size_bytes: Option<u32>,
+    soroban_limits: Option<&SorobanResourceLimits>,
 ) -> std::result::Result<(), PreSeqNumError> {
     // 1. Structure: op count, fee > 0, soroban single-op consistency
     if frame.operations().is_empty() {
@@ -1100,7 +1132,7 @@ pub fn check_valid_pre_seq_num_with_config(
                     if let OperationBody::InvokeHostFunction(invoke) = &op.body {
                         // 4e-i. WASM size gate
                         // stellar-core: InvokeHostFunctionOpFrame.cpp:1290-1299
-                        if let Some(max_size) = max_contract_size_bytes {
+                        if let Some(max_size) = soroban_limits.map(|l| l.max_contract_size_bytes) {
                             if let stellar_xdr::curr::HostFunction::UploadContractWasm(wasm) =
                                 &invoke.host_function
                             {
@@ -1132,6 +1164,13 @@ pub fn check_valid_pre_seq_num_with_config(
                 }
             }
         }
+
+        // 4f. Per-TX Soroban resource limit enforcement.
+        // Parity: stellar-core commonValidPreSeqNum:1362 → checkSorobanResources()
+        // (TransactionFrame.cpp:827-1044).
+        if let Some(limits) = soroban_limits {
+            check_soroban_resource_limits(frame, protocol_version, limits)?;
+        }
     } else {
         // 5. Classic: reject ext != 0 on p21+ (stellar-core commonValidPreSeqNum:1454-1467)
         // inner_tx() handles both Tx and TxFeeBump (returning the inner Transaction),
@@ -1145,6 +1184,198 @@ pub fn check_valid_pre_seq_num_with_config(
                 }
             }
         }
+    }
+
+    Ok(())
+}
+
+/// Check per-TX Soroban resource limits against network configuration.
+///
+/// Parity: stellar-core `TransactionFrame::checkSorobanResources()`
+/// (TransactionFrame.cpp:827-1044). Validates:
+/// - Instructions, read/write bytes, read/write entries
+/// - TX size
+/// - Footprint entry count (v23+)
+/// - Protocol-versioned disk read entry counting (v23+ excludes live Soroban entries)
+/// - Footprint key validity (type, trustline asset, XDR key size)
+fn check_soroban_resource_limits(
+    frame: &TransactionFrame,
+    protocol_version: u32,
+    limits: &SorobanResourceLimits,
+) -> std::result::Result<(), PreSeqNumError> {
+    let data = frame
+        .soroban_data()
+        .expect("caller ensures frame is Soroban");
+    let resources = &data.resources;
+    let read_entries = &resources.footprint.read_only;
+    let write_entries = &resources.footprint.read_write;
+
+    // 1. Instructions limit
+    if resources.instructions as u64 > limits.tx_max_instructions {
+        return Err(PreSeqNumError::SorobanInvalid(format!(
+            "instructions {} exceed per-TX limit {}",
+            resources.instructions, limits.tx_max_instructions
+        )));
+    }
+
+    // 2. Disk read bytes limit
+    if resources.disk_read_bytes as u64 > limits.tx_max_read_bytes {
+        return Err(PreSeqNumError::SorobanInvalid(format!(
+            "disk read bytes {} exceed per-TX limit {}",
+            resources.disk_read_bytes, limits.tx_max_read_bytes
+        )));
+    }
+
+    // 3. Write bytes limit
+    if resources.write_bytes as u64 > limits.tx_max_write_bytes {
+        return Err(PreSeqNumError::SorobanInvalid(format!(
+            "write bytes {} exceed per-TX limit {}",
+            resources.write_bytes, limits.tx_max_write_bytes
+        )));
+    }
+
+    // 4. Protocol-versioned disk read entry counting
+    // Parity: stellar-core getNumDiskReadEntries (TransactionFrame.cpp:68-102)
+    let num_disk_reads: u64 = if protocol_version >= 23 {
+        let disk_reads = get_num_disk_read_entries(resources, &data.ext, frame);
+
+        // v23+: total footprint entries check (txMaxFootprintEntries)
+        let total_entries = (read_entries.len() + write_entries.len()) as u64;
+        if total_entries > limits.tx_max_footprint_entries {
+            return Err(PreSeqNumError::SorobanInvalid(format!(
+                "footprint entries {} exceed per-TX limit {}",
+                total_entries, limits.tx_max_footprint_entries
+            )));
+        }
+
+        disk_reads
+    } else {
+        // Pre-v23: all footprint entries count as disk reads
+        (read_entries.len() + write_entries.len()) as u64
+    };
+
+    if num_disk_reads > limits.tx_max_read_ledger_entries {
+        return Err(PreSeqNumError::SorobanInvalid(format!(
+            "disk read entries {} exceed per-TX limit {}",
+            num_disk_reads, limits.tx_max_read_ledger_entries
+        )));
+    }
+
+    // 5. Write entries limit
+    if write_entries.len() as u64 > limits.tx_max_write_ledger_entries {
+        return Err(PreSeqNumError::SorobanInvalid(format!(
+            "write entries {} exceed per-TX limit {}",
+            write_entries.len(),
+            limits.tx_max_write_ledger_entries
+        )));
+    }
+
+    // 6. Footprint key validity: type, trustline asset, XDR key size
+    // Parity: stellar-core footprintKeyIsValid lambda (TransactionFrame.cpp:916-962)
+    for key in read_entries.iter().chain(write_entries.iter()) {
+        validate_footprint_key(key, protocol_version, limits)?;
+    }
+
+    // 7. TX size limit
+    let tx_size = frame.tx_size_bytes() as u64;
+    if tx_size > limits.tx_max_size_bytes {
+        return Err(PreSeqNumError::SorobanInvalid(format!(
+            "tx size {} exceeds per-TX limit {}",
+            tx_size, limits.tx_max_size_bytes
+        )));
+    }
+
+    // 8. Archived entry extension validation (protocol version check)
+    // Parity: stellar-core TransactionFrame.cpp:990-1041
+    if let stellar_xdr::curr::SorobanTransactionDataExt::V1(_) = &data.ext {
+        if protocol_version < 23 {
+            return Err(PreSeqNumError::SorobanInvalid(
+                "SorobanResourcesExtV0 not supported before protocol 23".to_string(),
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+/// Count disk read entries using protocol-versioned logic (v23+).
+///
+/// Parity: stellar-core `getNumDiskReadEntries` (TransactionFrame.cpp:68-102).
+/// For RestoreFootprint ops, all readWrite entries require disk reads.
+/// For other ops, only classic (non-Soroban) entries plus archived Soroban
+/// entries require disk reads.
+fn get_num_disk_read_entries(
+    resources: &stellar_xdr::curr::SorobanResources,
+    ext: &stellar_xdr::curr::SorobanTransactionDataExt,
+    frame: &TransactionFrame,
+) -> u64 {
+    let is_restore = frame
+        .operations()
+        .iter()
+        .any(|op| matches!(op.body, OperationBody::RestoreFootprint(_)));
+
+    if is_restore {
+        return resources.footprint.read_write.len() as u64;
+    }
+
+    // Count classic (non-Soroban) entry reads across both footprints
+    let mut count: u64 = 0;
+    for key in resources
+        .footprint
+        .read_only
+        .iter()
+        .chain(resources.footprint.read_write.iter())
+    {
+        if !henyey_common::is_soroban_key(key) {
+            count += 1;
+        }
+    }
+
+    // Add archived Soroban entries (on-disk by definition)
+    if let stellar_xdr::curr::SorobanTransactionDataExt::V1(resource_ext) = ext {
+        count += resource_ext.archived_soroban_entries.len() as u64;
+    }
+
+    count
+}
+
+/// Validate a single footprint key for type, trustline asset validity, and XDR size.
+///
+/// Parity: stellar-core `footprintKeyIsValid` lambda (TransactionFrame.cpp:916-962).
+fn validate_footprint_key(
+    key: &stellar_xdr::curr::LedgerKey,
+    protocol_version: u32,
+    limits: &SorobanResourceLimits,
+) -> std::result::Result<(), PreSeqNumError> {
+    match key {
+        stellar_xdr::curr::LedgerKey::Account(_)
+        | stellar_xdr::curr::LedgerKey::ContractData(_)
+        | stellar_xdr::curr::LedgerKey::ContractCode(_) => {}
+        stellar_xdr::curr::LedgerKey::Trustline(tl) => {
+            // stellar-core: reject native, self-issued, and invalid trustline assets
+            if !henyey_common::asset::is_trustline_asset_valid(&tl.asset, protocol_version)
+                || matches!(tl.asset, stellar_xdr::curr::TrustLineAsset::Native)
+                || henyey_common::asset::is_trustline_asset_issuer(&tl.account_id, &tl.asset)
+            {
+                return Err(PreSeqNumError::SorobanInvalid(
+                    "footprint contains invalid trustline asset".to_string(),
+                ));
+            }
+        }
+        _ => {
+            return Err(PreSeqNumError::SorobanInvalid(
+                "unsupported ledger key type in footprint".to_string(),
+            ));
+        }
+    }
+
+    // XDR key size check
+    let key_size = henyey_common::xdr_encoded_len_u32(key) as u32;
+    if key_size > limits.max_contract_data_key_size_bytes {
+        return Err(PreSeqNumError::SorobanInvalid(format!(
+            "footprint key size {} exceeds limit {}",
+            key_size, limits.max_contract_data_key_size_bytes
+        )));
     }
 
     Ok(())
@@ -2986,5 +3217,417 @@ mod tests {
             ),
             "Fee-bump Soroban tx with zero inclusion fee must be rejected, got: {result:?}"
         );
+    }
+
+    // ========================================================================
+    // check_soroban_resource_limits tests
+    // ========================================================================
+
+    /// Helper to build a Soroban TransactionFrame with custom resource values.
+    fn make_soroban_frame(
+        instructions: u32,
+        disk_read_bytes: u32,
+        write_bytes: u32,
+        read_only: Vec<LedgerKey>,
+        read_write: Vec<LedgerKey>,
+        ext: SorobanTransactionDataExt,
+        op_body: OperationBody,
+    ) -> TransactionFrame {
+        let source = MuxedAccount::Ed25519(Uint256([2u8; 32]));
+        let op = Operation {
+            source_account: None,
+            body: op_body,
+        };
+        let footprint = LedgerFootprint {
+            read_only: read_only.try_into().unwrap(),
+            read_write: read_write.try_into().unwrap(),
+        };
+        let tx = Transaction {
+            source_account: source,
+            fee: 100,
+            seq_num: SequenceNumber(1),
+            cond: Preconditions::None,
+            memo: Memo::None,
+            operations: vec![op].try_into().unwrap(),
+            ext: TransactionExt::V1(SorobanTransactionData {
+                ext,
+                resources: SorobanResources {
+                    footprint,
+                    instructions,
+                    disk_read_bytes,
+                    write_bytes,
+                },
+                resource_fee: 0,
+            }),
+        };
+        let envelope = TransactionEnvelope::Tx(TransactionV1Envelope {
+            tx,
+            signatures: VecM::default(),
+        });
+        TransactionFrame::from_owned(envelope)
+    }
+
+    fn default_invoke_op() -> OperationBody {
+        OperationBody::InvokeHostFunction(InvokeHostFunctionOp {
+            host_function: HostFunction::InvokeContract(InvokeContractArgs {
+                contract_address: ScAddress::Contract(ContractId(Hash([9u8; 32]))),
+                function_name: ScSymbol(StringM::<32>::try_from("noop".to_string()).unwrap()),
+                args: VecM::default(),
+            }),
+            auth: VecM::default(),
+        })
+    }
+
+    fn permissive_limits() -> SorobanResourceLimits {
+        SorobanResourceLimits {
+            tx_max_instructions: u64::MAX,
+            tx_max_read_bytes: u64::MAX,
+            tx_max_write_bytes: u64::MAX,
+            tx_max_read_ledger_entries: u64::MAX,
+            tx_max_write_ledger_entries: u64::MAX,
+            tx_max_size_bytes: u64::MAX,
+            tx_max_footprint_entries: u64::MAX,
+            max_contract_size_bytes: u32::MAX,
+            max_contract_data_key_size_bytes: u32::MAX,
+        }
+    }
+
+    fn contract_data_key(id: u8) -> LedgerKey {
+        LedgerKey::ContractData(LedgerKeyContractData {
+            contract: ScAddress::Contract(ContractId(Hash([id; 32]))),
+            key: ScVal::U32(id as u32),
+            durability: ContractDataDurability::Persistent,
+        })
+    }
+
+    #[test]
+    fn test_soroban_resource_limits_instructions_boundary() {
+        let frame = make_soroban_frame(
+            1000,
+            0,
+            0,
+            vec![],
+            vec![],
+            SorobanTransactionDataExt::V0,
+            default_invoke_op(),
+        );
+        let mut limits = permissive_limits();
+        limits.tx_max_instructions = 1000;
+        assert!(check_soroban_resource_limits(&frame, 22, &limits).is_ok());
+
+        limits.tx_max_instructions = 999;
+        let err = check_soroban_resource_limits(&frame, 22, &limits).unwrap_err();
+        assert!(matches!(err, PreSeqNumError::SorobanInvalid(_)));
+    }
+
+    #[test]
+    fn test_soroban_resource_limits_disk_read_bytes() {
+        let frame = make_soroban_frame(
+            0,
+            500,
+            0,
+            vec![],
+            vec![],
+            SorobanTransactionDataExt::V0,
+            default_invoke_op(),
+        );
+        let mut limits = permissive_limits();
+        limits.tx_max_read_bytes = 500;
+        assert!(check_soroban_resource_limits(&frame, 22, &limits).is_ok());
+
+        limits.tx_max_read_bytes = 499;
+        assert!(check_soroban_resource_limits(&frame, 22, &limits).is_err());
+    }
+
+    #[test]
+    fn test_soroban_resource_limits_write_bytes() {
+        let frame = make_soroban_frame(
+            0,
+            0,
+            800,
+            vec![],
+            vec![],
+            SorobanTransactionDataExt::V0,
+            default_invoke_op(),
+        );
+        let mut limits = permissive_limits();
+        limits.tx_max_write_bytes = 800;
+        assert!(check_soroban_resource_limits(&frame, 22, &limits).is_ok());
+
+        limits.tx_max_write_bytes = 799;
+        assert!(check_soroban_resource_limits(&frame, 22, &limits).is_err());
+    }
+
+    #[test]
+    fn test_soroban_resource_limits_write_entries() {
+        let rw = vec![contract_data_key(1), contract_data_key(2)];
+        let frame = make_soroban_frame(
+            0,
+            0,
+            0,
+            vec![],
+            rw,
+            SorobanTransactionDataExt::V0,
+            default_invoke_op(),
+        );
+        let mut limits = permissive_limits();
+        limits.tx_max_write_ledger_entries = 2;
+        assert!(check_soroban_resource_limits(&frame, 22, &limits).is_ok());
+
+        limits.tx_max_write_ledger_entries = 1;
+        assert!(check_soroban_resource_limits(&frame, 22, &limits).is_err());
+    }
+
+    #[test]
+    fn test_soroban_resource_limits_disk_read_entries_pre_v23() {
+        // Pre-v23: all footprint entries count as disk reads
+        let ro = vec![contract_data_key(1)];
+        let rw = vec![contract_data_key(2), contract_data_key(3)];
+        let frame = make_soroban_frame(
+            0,
+            0,
+            0,
+            ro,
+            rw,
+            SorobanTransactionDataExt::V0,
+            default_invoke_op(),
+        );
+        let mut limits = permissive_limits();
+        // Total footprint = 3 entries = 3 disk reads
+        limits.tx_max_read_ledger_entries = 3;
+        assert!(check_soroban_resource_limits(&frame, 22, &limits).is_ok());
+
+        limits.tx_max_read_ledger_entries = 2;
+        assert!(check_soroban_resource_limits(&frame, 22, &limits).is_err());
+    }
+
+    #[test]
+    fn test_soroban_resource_limits_disk_read_entries_v23_soroban_keys_not_counted() {
+        // v23+: Soroban keys are NOT counted as disk reads (they're in memory cache)
+        let ro = vec![contract_data_key(1)];
+        let rw = vec![contract_data_key(2)];
+        let frame = make_soroban_frame(
+            0,
+            0,
+            0,
+            ro,
+            rw,
+            SorobanTransactionDataExt::V0,
+            default_invoke_op(),
+        );
+        let mut limits = permissive_limits();
+        // Both keys are Soroban, so disk reads = 0 at v23
+        limits.tx_max_read_ledger_entries = 0;
+        assert!(check_soroban_resource_limits(&frame, 23, &limits).is_ok());
+    }
+
+    #[test]
+    fn test_soroban_resource_limits_footprint_entries_v23() {
+        // v23+: total footprint entries check
+        let ro = vec![contract_data_key(1), contract_data_key(2)];
+        let rw = vec![contract_data_key(3)];
+        let frame = make_soroban_frame(
+            0,
+            0,
+            0,
+            ro,
+            rw,
+            SorobanTransactionDataExt::V0,
+            default_invoke_op(),
+        );
+        let mut limits = permissive_limits();
+        limits.tx_max_footprint_entries = 3;
+        assert!(check_soroban_resource_limits(&frame, 23, &limits).is_ok());
+
+        limits.tx_max_footprint_entries = 2;
+        assert!(check_soroban_resource_limits(&frame, 23, &limits).is_err());
+    }
+
+    #[test]
+    fn test_soroban_resource_limits_tx_size() {
+        let frame = make_soroban_frame(
+            0,
+            0,
+            0,
+            vec![],
+            vec![],
+            SorobanTransactionDataExt::V0,
+            default_invoke_op(),
+        );
+        let tx_size = frame.tx_size_bytes() as u64;
+        let mut limits = permissive_limits();
+        limits.tx_max_size_bytes = tx_size;
+        assert!(check_soroban_resource_limits(&frame, 22, &limits).is_ok());
+
+        limits.tx_max_size_bytes = tx_size - 1;
+        assert!(check_soroban_resource_limits(&frame, 22, &limits).is_err());
+    }
+
+    #[test]
+    fn test_soroban_resource_limits_archived_ext_rejected_pre_v23() {
+        let frame = make_soroban_frame(
+            0,
+            0,
+            0,
+            vec![],
+            vec![],
+            SorobanTransactionDataExt::V1(SorobanResourcesExtV0 {
+                archived_soroban_entries: VecM::default(),
+            }),
+            default_invoke_op(),
+        );
+        let limits = permissive_limits();
+        assert!(check_soroban_resource_limits(&frame, 22, &limits).is_err());
+        assert!(check_soroban_resource_limits(&frame, 23, &limits).is_ok());
+    }
+
+    #[test]
+    fn test_validate_footprint_key_unsupported_type() {
+        use stellar_xdr::curr::LedgerKeyOffer;
+        let key = LedgerKey::Offer(LedgerKeyOffer {
+            seller_id: AccountId(XdrPublicKey::PublicKeyTypeEd25519(Uint256([0u8; 32]))),
+            offer_id: 1,
+        });
+        let limits = permissive_limits();
+        let err = validate_footprint_key(&key, 23, &limits).unwrap_err();
+        assert!(matches!(err, PreSeqNumError::SorobanInvalid(_)));
+    }
+
+    #[test]
+    fn test_validate_footprint_key_valid_types() {
+        let limits = permissive_limits();
+
+        // Account key
+        let acct = LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
+            account_id: AccountId(XdrPublicKey::PublicKeyTypeEd25519(Uint256([1u8; 32]))),
+        });
+        assert!(validate_footprint_key(&acct, 23, &limits).is_ok());
+
+        // ContractData key
+        let cd = contract_data_key(5);
+        assert!(validate_footprint_key(&cd, 23, &limits).is_ok());
+    }
+
+    #[test]
+    fn test_validate_footprint_key_xdr_size_boundary() {
+        let key = contract_data_key(1);
+        let key_size = henyey_common::xdr_encoded_len_u32(&key) as u32;
+
+        let mut limits = permissive_limits();
+        limits.max_contract_data_key_size_bytes = key_size;
+        assert!(validate_footprint_key(&key, 23, &limits).is_ok());
+
+        limits.max_contract_data_key_size_bytes = key_size - 1;
+        assert!(validate_footprint_key(&key, 23, &limits).is_err());
+    }
+
+    #[test]
+    fn test_validate_footprint_key_trustline_native_rejected() {
+        use stellar_xdr::curr::{LedgerKeyTrustLine, TrustLineAsset};
+        let key = LedgerKey::Trustline(LedgerKeyTrustLine {
+            account_id: AccountId(XdrPublicKey::PublicKeyTypeEd25519(Uint256([1u8; 32]))),
+            asset: TrustLineAsset::Native,
+        });
+        let limits = permissive_limits();
+        assert!(validate_footprint_key(&key, 23, &limits).is_err());
+    }
+
+    #[test]
+    fn test_validate_footprint_key_trustline_self_issued_rejected() {
+        use stellar_xdr::curr::{AlphaNum4, AssetCode4, LedgerKeyTrustLine, TrustLineAsset};
+        let issuer_bytes = [7u8; 32];
+        let key = LedgerKey::Trustline(LedgerKeyTrustLine {
+            account_id: AccountId(XdrPublicKey::PublicKeyTypeEd25519(Uint256(issuer_bytes))),
+            asset: TrustLineAsset::CreditAlphanum4(AlphaNum4 {
+                asset_code: AssetCode4([b'U', b'S', b'D', 0]),
+                issuer: AccountId(XdrPublicKey::PublicKeyTypeEd25519(Uint256(issuer_bytes))),
+            }),
+        });
+        let limits = permissive_limits();
+        assert!(validate_footprint_key(&key, 23, &limits).is_err());
+    }
+
+    #[test]
+    fn test_validate_footprint_key_trustline_valid() {
+        use stellar_xdr::curr::{AlphaNum4, AssetCode4, LedgerKeyTrustLine, TrustLineAsset};
+        let key = LedgerKey::Trustline(LedgerKeyTrustLine {
+            account_id: AccountId(XdrPublicKey::PublicKeyTypeEd25519(Uint256([1u8; 32]))),
+            asset: TrustLineAsset::CreditAlphanum4(AlphaNum4 {
+                asset_code: AssetCode4([b'U', b'S', b'D', 0]),
+                issuer: AccountId(XdrPublicKey::PublicKeyTypeEd25519(Uint256([2u8; 32]))),
+            }),
+        });
+        let limits = permissive_limits();
+        assert!(validate_footprint_key(&key, 23, &limits).is_ok());
+    }
+
+    #[test]
+    fn test_get_num_disk_read_entries_restore_footprint() {
+        use stellar_xdr::curr::RestoreFootprintOp;
+        let rw = vec![
+            contract_data_key(1),
+            contract_data_key(2),
+            contract_data_key(3),
+        ];
+        let frame = make_soroban_frame(
+            0,
+            0,
+            0,
+            vec![],
+            rw,
+            SorobanTransactionDataExt::V0,
+            OperationBody::RestoreFootprint(RestoreFootprintOp {
+                ext: stellar_xdr::curr::ExtensionPoint::V0,
+            }),
+        );
+        let data = frame.soroban_data().unwrap();
+        let count = get_num_disk_read_entries(&data.resources, &data.ext, &frame);
+        // RestoreFootprint: all readWrite entries require disk reads
+        assert_eq!(count, 3);
+    }
+
+    #[test]
+    fn test_get_num_disk_read_entries_with_archived_soroban() {
+        let ro = vec![contract_data_key(1)];
+        let rw = vec![contract_data_key(2)];
+        let frame = make_soroban_frame(
+            0,
+            0,
+            0,
+            ro,
+            rw,
+            SorobanTransactionDataExt::V1(SorobanResourcesExtV0 {
+                // One archived entry → 1 disk read
+                archived_soroban_entries: vec![0u32].try_into().unwrap(),
+            }),
+            default_invoke_op(),
+        );
+        let data = frame.soroban_data().unwrap();
+        let count = get_num_disk_read_entries(&data.resources, &data.ext, &frame);
+        // Both keys are Soroban (not classic), so classic count = 0; archived = 1
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn test_get_num_disk_read_entries_classic_keys_counted() {
+        use stellar_xdr::curr::LedgerKeyAccount;
+        // Account keys are classic (non-Soroban) → counted as disk reads at v23+
+        let acct_key = LedgerKey::Account(LedgerKeyAccount {
+            account_id: AccountId(XdrPublicKey::PublicKeyTypeEd25519(Uint256([5u8; 32]))),
+        });
+        let ro = vec![acct_key, contract_data_key(1)];
+        let frame = make_soroban_frame(
+            0,
+            0,
+            0,
+            ro,
+            vec![],
+            SorobanTransactionDataExt::V0,
+            default_invoke_op(),
+        );
+        let data = frame.soroban_data().unwrap();
+        let count = get_num_disk_read_entries(&data.resources, &data.ext, &frame);
+        // Account key = 1 classic disk read, ContractData = 0 (Soroban, in-memory)
+        assert_eq!(count, 1);
     }
 }

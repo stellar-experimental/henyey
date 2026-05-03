@@ -1800,6 +1800,7 @@ fn test_advance_to_ledger() {
         soroban_config: SorobanConfig::default(),
         frozen_key_config: henyey_tx::frozen_keys::FrozenKeyConfig::empty(),
         ledger_flags: 0,
+        soroban_resource_limits: None,
     });
 
     // Verify offer A is NOT in the executor's state (it was consumed in ledger 1)

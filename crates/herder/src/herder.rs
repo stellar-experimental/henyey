@@ -2597,7 +2597,7 @@ impl Herder {
                 ledger_flags,
             );
             if let Some(info) = soroban_info.as_ref() {
-                validation_ctx.max_contract_size_bytes = Some(info.max_contract_size);
+                validation_ctx.soroban_resource_limits = Some(info.to_resource_limits());
             }
             let nomination_ctx = crate::tx_queue::NominationBuildContext {
                 base_fee: header.base_fee as i64,
@@ -8570,6 +8570,16 @@ mod advance_tracking_slot_tests {
             ledger_max_dependent_tx_clusters: 4,
             ledger_max_tx_size_bytes: 1_000_000,
             ledger_max_tx_count: 100,
+            // Per-TX limits needed by check_soroban_resource_limits
+            tx_max_instructions: 100_000,
+            tx_max_read_bytes: 100_000,
+            tx_max_write_bytes: 50_000,
+            tx_max_read_ledger_entries: 50,
+            tx_max_write_ledger_entries: 25,
+            tx_max_size_bytes: 100_000,
+            tx_max_footprint_entries: 50,
+            max_contract_size: 65_536,
+            max_contract_data_key_size: 250,
             ..Default::default()
         }
     }

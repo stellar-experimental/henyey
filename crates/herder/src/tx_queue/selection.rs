@@ -163,7 +163,7 @@ impl TransactionQueue {
                         protocol_version: vc.protocol_version,
                         network_id: self.config.network_id,
                         ledger_flags: vc.ledger_flags,
-                        max_contract_size_bytes: vc.max_contract_size_bytes,
+                        soroban_resource_limits: vc.soroban_resource_limits.clone(),
                     }),
                 )
             }

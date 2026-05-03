@@ -316,8 +316,8 @@ pub struct ValidationContext {
     pub expected_close_time: Duration,
     /// Soroban per-transaction resource limits (if available).
     pub soroban_limits: Option<SorobanTxLimits>,
-    /// Max contract WASM size (from Soroban config, if available).
-    pub max_contract_size_bytes: Option<u32>,
+    /// Per-TX Soroban resource limits for check_valid_pre_seq_num validation.
+    pub soroban_resource_limits: Option<henyey_tx::SorobanResourceLimits>,
 }
 
 /// Per-transaction Soroban resource limits from network config.
@@ -353,7 +353,7 @@ impl Default for ValidationContext {
             ledger_flags: 0,
             expected_close_time: Duration::from_secs(5),
             soroban_limits: None,
-            max_contract_size_bytes: None,
+            soroban_resource_limits: None,
         }
     }
 }
@@ -1438,7 +1438,15 @@ impl TransactionQueue {
 
     /// Set the max contract WASM size in the validation context.
     pub fn set_max_contract_size(&self, max_bytes: u32) {
-        self.validation_context.write().max_contract_size_bytes = Some(max_bytes);
+        let mut ctx = self.validation_context.write();
+        if let Some(ref mut limits) = ctx.soroban_resource_limits {
+            limits.max_contract_size_bytes = max_bytes;
+        }
+    }
+
+    /// Set the per-TX Soroban resource limits in the validation context.
+    pub fn set_soroban_resource_limits(&self, limits: henyey_tx::SorobanResourceLimits) {
+        self.validation_context.write().soroban_resource_limits = Some(limits);
     }
 
     /// Validate a transaction before queueing.
@@ -1462,7 +1470,7 @@ impl TransactionQueue {
             &frame,
             ctx.protocol_version,
             ctx.ledger_flags,
-            ctx.max_contract_size_bytes,
+            ctx.soroban_resource_limits.as_ref(),
         )
         .map_err(|e| e.to_tx_result_code())?;
 

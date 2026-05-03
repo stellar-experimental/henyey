@@ -255,6 +255,23 @@ pub struct SorobanNetworkInfo {
     pub tx_max_footprint_entries: u32,
 }
 
+impl SorobanNetworkInfo {
+    /// Build per-TX Soroban resource limits for `check_valid_pre_seq_num_with_config`.
+    pub fn to_resource_limits(&self) -> henyey_tx::SorobanResourceLimits {
+        henyey_tx::SorobanResourceLimits {
+            tx_max_instructions: self.tx_max_instructions as u64,
+            tx_max_read_bytes: self.tx_max_read_bytes as u64,
+            tx_max_write_bytes: self.tx_max_write_bytes as u64,
+            tx_max_read_ledger_entries: self.tx_max_read_ledger_entries as u64,
+            tx_max_write_ledger_entries: self.tx_max_write_ledger_entries as u64,
+            tx_max_size_bytes: self.tx_max_size_bytes as u64,
+            tx_max_footprint_entries: self.tx_max_footprint_entries as u64,
+            max_contract_size_bytes: self.max_contract_size,
+            max_contract_data_key_size_bytes: self.max_contract_data_key_size,
+        }
+    }
+}
+
 pub(super) struct RefundableFeeTracker {
     pub(super) non_refundable_fee: i64,
     pub(super) max_refundable_fee: i64,
@@ -579,6 +596,8 @@ pub struct LedgerAdvanceParams {
     pub soroban_config: SorobanConfig,
     pub frozen_key_config: henyey_tx::frozen_keys::FrozenKeyConfig,
     pub ledger_flags: u32,
+    /// Per-TX Soroban resource limits for check_valid_pre_seq_num validation.
+    pub soroban_resource_limits: Option<henyey_tx::SorobanResourceLimits>,
 }
 
 /// Context for executing transactions during ledger close.
@@ -601,6 +620,9 @@ pub struct TransactionExecutor {
     loaded_accounts: HashMap<AccountId, bool>,
     /// Soroban network configuration for contract execution.
     soroban_config: SorobanConfig,
+    /// Per-TX Soroban resource limits for check_valid_pre_seq_num validation.
+    /// Parity: stellar-core checkSorobanResources() limits.
+    soroban_resource_limits: Option<henyey_tx::SorobanResourceLimits>,
     /// Classic event configuration.
     classic_events: ClassicEventConfig,
     /// Optional persistent module cache for Soroban WASM compilation.
@@ -654,6 +676,7 @@ impl TransactionExecutor {
             state,
             loaded_accounts: HashMap::new(),
             soroban_config,
+            soroban_resource_limits: None,
             classic_events,
             module_cache: None,
             hot_archive: None,
@@ -799,6 +822,7 @@ impl TransactionExecutor {
         self.protocol_version = params.protocol_version;
         self.ledger_flags = params.ledger_flags;
         self.soroban_config = params.soroban_config;
+        self.soroban_resource_limits = params.soroban_resource_limits;
         self.frozen_key_config = params.frozen_key_config;
         self.state.set_ledger_seq(params.ledger_seq);
         // Clear cached entries except offers and offer index
@@ -4382,6 +4406,7 @@ mod tests {
             soroban_config: SorobanConfig::default(),
             frozen_key_config: henyey_tx::frozen_keys::FrozenKeyConfig::default(),
             ledger_flags: 0,
+            soroban_resource_limits: None,
         });
         assert!(
             executor.hot_archive_restored_keys().is_empty(),

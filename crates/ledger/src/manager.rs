@@ -3906,6 +3906,10 @@ impl LedgerCloseContext<'_> {
                     stellar_xdr::curr::LedgerHeaderExt::V0 => 0,
                     stellar_xdr::curr::LedgerHeaderExt::V1(ext) => ext.flags,
                 },
+                soroban_resource_limits: self
+                    .manager
+                    .soroban_network_info()
+                    .map(|info| info.to_resource_limits()),
             });
             // Update module cache and hot archive references (they may have changed)
             if let Some(cache) = module_cache {

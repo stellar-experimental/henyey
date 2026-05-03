@@ -370,6 +370,8 @@ fn test_reject_create_contract_from_invalid_asset() {
 /// UploadContractWasm exceeding max contract size should be rejected before host.
 #[test]
 fn test_reject_upload_wasm_oversized() {
+    use henyey_tx::validation::SorobanResourceLimits;
+
     // Typical maxContractSizeBytes is 256KB
     let max_contract_size: u32 = 256 * 1024;
     let oversized_wasm = vec![0u8; 512 * 1024];
@@ -381,9 +383,20 @@ fn test_reject_upload_wasm_oversized() {
 
     let frame = make_soroban_frame(op_body, empty_footprint(), 50);
 
+    let limits = SorobanResourceLimits {
+        tx_max_instructions: u64::MAX,
+        tx_max_read_bytes: u64::MAX,
+        tx_max_write_bytes: u64::MAX,
+        tx_max_read_ledger_entries: u64::MAX,
+        tx_max_write_ledger_entries: u64::MAX,
+        tx_max_size_bytes: u64::MAX,
+        tx_max_footprint_entries: u64::MAX,
+        max_contract_size_bytes: max_contract_size,
+        max_contract_data_key_size_bytes: u32::MAX,
+    };
+
     // With config, oversized WASM should be rejected.
-    let result =
-        check_valid_pre_seq_num_with_config(&frame, PROTOCOL_VERSION, 0, Some(max_contract_size));
+    let result = check_valid_pre_seq_num_with_config(&frame, PROTOCOL_VERSION, 0, Some(&limits));
     assert!(
         result.is_err(),
         "UploadContractWasm exceeding max contract size should be rejected"
