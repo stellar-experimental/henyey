@@ -765,20 +765,24 @@ impl TransactionMetaBuilder {
         let meta_version = self.meta_version();
 
         match meta_version {
-            2 => self.finalize_v2(),
+            2 => self.finalize_v2(success),
             3 => self.finalize_v3(success),
             4 => self.finalize_v4(success),
-            _ => self.finalize_v2(),
+            _ => self.finalize_v2(success),
         }
     }
 
     /// Finalize to V2 meta (classic, no Soroban).
-    fn finalize_v2(self) -> TransactionMeta {
-        let operations: Vec<OperationMeta> = self
-            .operation_builders
-            .into_iter()
-            .map(|b| b.finalize_v2())
-            .collect();
+    fn finalize_v2(self, success: bool) -> TransactionMeta {
+        // stellar-core omits operation meta on failure (TransactionMeta.cpp:1073)
+        let operations: Vec<OperationMeta> = if success {
+            self.operation_builders
+                .into_iter()
+                .map(|b| b.finalize_v2())
+                .collect()
+        } else {
+            vec![]
+        };
 
         TransactionMeta::V2(TransactionMetaV2 {
             tx_changes_before: self
@@ -819,11 +823,15 @@ impl TransactionMetaBuilder {
             (vec![], ScVal::Void)
         };
 
-        let operations: Vec<OperationMeta> = self
-            .operation_builders
-            .into_iter()
-            .map(|b| b.finalize_v2())
-            .collect();
+        // stellar-core omits operation meta on failure (TransactionMeta.cpp:1073)
+        let operations: Vec<OperationMeta> = if success {
+            self.operation_builders
+                .into_iter()
+                .map(|b| b.finalize_v2())
+                .collect()
+        } else {
+            vec![]
+        };
 
         let diagnostic_events = self.diagnostic_event_manager.finalize();
 
@@ -878,12 +886,15 @@ impl TransactionMetaBuilder {
             None
         };
 
-        // For V4, we need OperationMetaV2 with per-operation events
-        let operations: Vec<OperationMetaV2> = self
-            .operation_builders
-            .into_iter()
-            .map(|b| b.finalize_v4())
-            .collect();
+        // stellar-core omits operation meta on failure (TransactionMeta.cpp:1073)
+        let operations: Vec<OperationMetaV2> = if success {
+            self.operation_builders
+                .into_iter()
+                .map(|b| b.finalize_v4())
+                .collect()
+        } else {
+            vec![]
+        };
 
         let tx_events = self.tx_event_manager.finalize();
         let diagnostic_events = self.diagnostic_event_manager.finalize();
@@ -1740,6 +1751,264 @@ mod tests {
                     soroban_meta.return_value, None,
                     "return_value must be None when op builder has no return value set"
                 );
+            }
+            _ => panic!("Expected V4 meta"),
+        }
+    }
+
+    // Tests for operation meta omission on failure (issue #2281)
+
+    #[test]
+    fn test_finalize_v2_failed_omits_op_meta() {
+        let frame = create_test_frame();
+        let diagnostic_config = DiagnosticConfig::default();
+
+        let mut builder = TransactionMetaBuilder::new(
+            true,
+            &frame,
+            21,
+            NetworkId::testnet(),
+            ClassicEventConfig::default(),
+            &diagnostic_config,
+        );
+
+        builder
+            .operation_meta_builder_mut(0)
+            .record_create(create_test_account_entry());
+
+        // Failure: operations must be empty
+        let meta = builder.finalize_v2(false);
+        match meta {
+            TransactionMeta::V2(v2) => {
+                assert!(
+                    v2.operations.is_empty(),
+                    "V2: operations must be empty on failure"
+                );
+            }
+            _ => panic!("Expected V2 meta"),
+        }
+    }
+
+    #[test]
+    fn test_finalize_v2_success_includes_op_meta() {
+        let frame = create_test_frame();
+        let diagnostic_config = DiagnosticConfig::default();
+
+        let mut builder = TransactionMetaBuilder::new(
+            true,
+            &frame,
+            21,
+            NetworkId::testnet(),
+            ClassicEventConfig::default(),
+            &diagnostic_config,
+        );
+
+        builder
+            .operation_meta_builder_mut(0)
+            .record_create(create_test_account_entry());
+
+        // Success: operations must be populated
+        let meta = builder.finalize_v2(true);
+        match meta {
+            TransactionMeta::V2(v2) => {
+                assert_eq!(
+                    v2.operations.len(),
+                    1,
+                    "V2: operations must be populated on success"
+                );
+                assert_eq!(v2.operations[0].changes.len(), 1);
+            }
+            _ => panic!("Expected V2 meta"),
+        }
+    }
+
+    #[test]
+    fn test_finalize_v3_failed_classic_omits_op_meta() {
+        let frame = create_test_frame();
+        let diagnostic_config = DiagnosticConfig::default();
+
+        let mut builder = TransactionMetaBuilder::new(
+            true,
+            &frame,
+            21,
+            NetworkId::testnet(),
+            ClassicEventConfig::default(),
+            &diagnostic_config,
+        );
+
+        builder
+            .operation_meta_builder_mut(0)
+            .record_create(create_test_account_entry());
+
+        let meta = builder.finalize_v3(false);
+        match meta {
+            TransactionMeta::V3(v3) => {
+                assert!(
+                    v3.operations.is_empty(),
+                    "V3 classic: operations must be empty on failure"
+                );
+                // soroban_meta should be None for classic tx
+                assert!(v3.soroban_meta.is_none());
+            }
+            _ => panic!("Expected V3 meta"),
+        }
+    }
+
+    #[test]
+    fn test_finalize_v3_failed_soroban_omits_op_meta() {
+        let diagnostic_config = DiagnosticConfig {
+            enable_soroban_diagnostic_events: true,
+            enable_diagnostics_for_tx_submission: false,
+        };
+        let soroban_frame = create_soroban_frame();
+
+        let mut builder = TransactionMetaBuilder::new(
+            true,
+            &soroban_frame,
+            21,
+            NetworkId::testnet(),
+            ClassicEventConfig::default(),
+            &diagnostic_config,
+        );
+
+        builder
+            .operation_meta_builder_mut(0)
+            .record_create(create_test_account_entry());
+
+        builder.diagnostic_event_manager_mut().push_error(
+            ScError::Budget(ScErrorCode::ExceededLimit),
+            "Test error",
+            vec![],
+        );
+
+        let meta = builder.finalize_v3(false);
+        match meta {
+            TransactionMeta::V3(v3) => {
+                assert!(
+                    v3.operations.is_empty(),
+                    "V3 soroban: operations must be empty on failure"
+                );
+                // soroban_meta must still be present on failure
+                let soroban_meta = v3
+                    .soroban_meta
+                    .expect("soroban_meta must be Some even on failure in V3");
+                assert!(soroban_meta.events.is_empty());
+                assert_eq!(soroban_meta.return_value, ScVal::Void);
+                // diagnostic events preserved
+                assert_eq!(soroban_meta.diagnostic_events.len(), 1);
+            }
+            _ => panic!("Expected V3 meta"),
+        }
+    }
+
+    #[test]
+    fn test_finalize_v4_failed_classic_omits_op_meta() {
+        let frame = create_test_frame();
+        let diagnostic_config = DiagnosticConfig::default();
+
+        let mut builder = TransactionMetaBuilder::new(
+            true,
+            &frame,
+            21,
+            NetworkId::testnet(),
+            ClassicEventConfig::default(),
+            &diagnostic_config,
+        );
+
+        builder
+            .operation_meta_builder_mut(0)
+            .record_create(create_test_account_entry());
+
+        // This goes through the public API (finalize -> finalize_v4)
+        let meta = builder.finalize(false);
+        match meta {
+            TransactionMeta::V4(v4) => {
+                assert!(
+                    v4.operations.is_empty(),
+                    "V4 classic: operations must be empty on failure"
+                );
+                // soroban_meta should be None for classic tx
+                assert!(v4.soroban_meta.is_none());
+                // tx_changes fields still present (may be empty in test but field exists)
+            }
+            _ => panic!("Expected V4 meta"),
+        }
+    }
+
+    #[test]
+    fn test_finalize_v4_failed_soroban_omits_op_meta() {
+        let diagnostic_config = DiagnosticConfig {
+            enable_soroban_diagnostic_events: true,
+            enable_diagnostics_for_tx_submission: false,
+        };
+        let soroban_frame = create_soroban_frame();
+
+        let mut builder = TransactionMetaBuilder::new(
+            true,
+            &soroban_frame,
+            21,
+            NetworkId::testnet(),
+            ClassicEventConfig::default(),
+            &diagnostic_config,
+        );
+
+        builder
+            .operation_meta_builder_mut(0)
+            .record_create(create_test_account_entry());
+
+        builder.diagnostic_event_manager_mut().push_error(
+            ScError::Budget(ScErrorCode::ExceededLimit),
+            "Test error",
+            vec![],
+        );
+
+        // This goes through the public API (finalize -> finalize_v4)
+        let meta = builder.finalize(false);
+        match meta {
+            TransactionMeta::V4(v4) => {
+                assert!(
+                    v4.operations.is_empty(),
+                    "V4 soroban: operations must be empty on failure"
+                );
+                // soroban_meta should be None on failure
+                assert!(
+                    v4.soroban_meta.is_none(),
+                    "V4 soroban: soroban_meta must be None on failure"
+                );
+                // diagnostic events preserved
+                assert_eq!(v4.diagnostic_events.len(), 1);
+            }
+            _ => panic!("Expected V4 meta"),
+        }
+    }
+
+    #[test]
+    fn test_finalize_v4_success_classic_includes_op_meta() {
+        let frame = create_test_frame();
+        let diagnostic_config = DiagnosticConfig::default();
+
+        let mut builder = TransactionMetaBuilder::new(
+            true,
+            &frame,
+            21,
+            NetworkId::testnet(),
+            ClassicEventConfig::default(),
+            &diagnostic_config,
+        );
+
+        builder
+            .operation_meta_builder_mut(0)
+            .record_create(create_test_account_entry());
+
+        let meta = builder.finalize(true);
+        match meta {
+            TransactionMeta::V4(v4) => {
+                assert_eq!(
+                    v4.operations.len(),
+                    1,
+                    "V4 classic: operations must be populated on success"
+                );
+                assert_eq!(v4.operations[0].changes.len(), 1);
             }
             _ => panic!("Expected V4 meta"),
         }

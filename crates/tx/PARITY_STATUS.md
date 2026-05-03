@@ -17,7 +17,7 @@
 | Classic Operations (24) | Full | All operations implemented |
 | Soroban Operations (3) | Full | Via e2e_invoke API |
 | Event Emission | Full | SAC events, lumen reconciliation |
-| Metadata Building | Full | V2/V3/V4 TransactionMeta |
+| Metadata Building | Full | V2/V3/V4 TransactionMeta; op meta gated on success |
 | Offer Exchange | Full | exchangeV10, pool exchange, price bounds |
 | Sponsorship Utils | Full | Inline in state.rs |
 | Per-Operation Rollback | Full | Savepoint matches nested LedgerTxn |
