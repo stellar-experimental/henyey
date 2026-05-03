@@ -5107,4 +5107,38 @@ mod tests {
             "catchup_needs_full_reset must NOT be set — fatal path skips the else branch"
         );
     }
+
+    /// AUDIT-255 regression (#2298): once `catchup_fatal_failure` is set,
+    /// `catchup_with_mode` must refuse to run (bail immediately).
+    /// This verifies the behavioral chain: handle_catchup_result sets the
+    /// flag → subsequent catchup_with_mode is blocked.
+    #[tokio::test]
+    async fn test_catchup_blocked_after_fatal_failure() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-test.db");
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
+        let app = App::new(config).await.unwrap();
+
+        // Simulate a prior fatal failure detection.
+        app.catchup_fatal_failure.store(true, Ordering::SeqCst);
+
+        let (persist_tx, _persist_rx) = tokio::sync::oneshot::channel();
+        let finalize = super::persist::CatchupFinalizer::deferred(
+            app.db.clone(),
+            app.ledger_manager.clone(),
+            persist_tx,
+        );
+        let result = app
+            .catchup_with_mode(CatchupTarget::Ledger(128), CatchupMode::Minimal, finalize)
+            .await;
+
+        assert!(result.is_err(), "catchup must fail when fatal flag is set");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("fatal verification failure"),
+            "error must mention fatal verification failure, got: {err_msg}"
+        );
+    }
 }
