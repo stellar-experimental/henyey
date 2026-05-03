@@ -828,6 +828,9 @@ impl App {
         // Verify on-disk ledger headers before loading state.
         Self::verify_on_disk_integrity(&db)?;
 
+        // Detect interrupted catchup persist from a previous run (AUDIT-226).
+        let force_full_catchup = Self::check_catchup_persist_pending(&db);
+
         // Initialize or generate keypair
         let keypair = Self::init_keypair(&config)?;
 
@@ -1002,7 +1005,7 @@ impl App {
             catchup_in_progress: AtomicBool::new(false),
             deferred_catchup: tokio::sync::Mutex::new(None),
             catchup_fatal_failure: AtomicBool::new(false),
-            catchup_needs_full_reset: AtomicBool::new(false),
+            catchup_needs_full_reset: AtomicBool::new(force_full_catchup),
             publish_in_progress: AtomicBool::new(false),
             #[cfg(test)]
             publish_panic_inject: AtomicBool::new(false),
@@ -1145,6 +1148,37 @@ impl App {
         // verification on startup either.
 
         Ok(())
+    }
+
+    /// Detect a previously interrupted catchup persist (AUDIT-226).
+    ///
+    /// If the `CATCHUP_PERSIST_PENDING` sentinel is present, a prior catchup
+    /// completed in-memory but crashed before the deferred persist wrote to
+    /// the DB. Returns `true` so the caller can initialize
+    /// `catchup_needs_full_reset`, skipping a doomed replay attempt.
+    ///
+    /// The sentinel is NOT cleared here — it is only cleared inside
+    /// `CatchupPersistData::write_to_db` or `LedgerPersistData::write_to_db`.
+    /// This ensures crash-idempotence: if the node crashes again before a
+    /// successful persist, subsequent restarts still detect the issue.
+    fn check_catchup_persist_pending(db: &henyey_db::Database) -> bool {
+        match db.with_connection(|conn| conn.get_state(state_keys::CATCHUP_PERSIST_PENDING)) {
+            Ok(Some(_)) => {
+                tracing::warn!(
+                    "Detected pending catchup persist from previous run. \
+                     Will force full bucket-apply on next catchup (AUDIT-226)."
+                );
+                true
+            }
+            Ok(None) => false,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "Failed to check catchup persist sentinel; proceeding normally"
+                );
+                false
+            }
+        }
     }
 
     fn ensure_network_passphrase(db: &henyey_db::Database, passphrase: &str) -> anyhow::Result<()> {
@@ -8948,6 +8982,59 @@ mod tests {
         assert!(
             !app.query_is_ready.load(Ordering::Relaxed),
             "query_is_ready must remain false when ledger manager is uninitialized"
+        );
+    }
+
+    /// AUDIT-226: `check_catchup_persist_pending` returns true when the
+    /// sentinel is present in the DB.
+    #[test]
+    fn test_check_catchup_persist_pending_detects_sentinel() {
+        let db = henyey_db::Database::open_in_memory().unwrap();
+
+        // Set the sentinel.
+        db.with_connection(|conn| {
+            use henyey_db::queries::StateQueries;
+            conn.set_state(state_keys::CATCHUP_PERSIST_PENDING, "1")
+        })
+        .unwrap();
+
+        assert!(
+            App::check_catchup_persist_pending(&db),
+            "must detect sentinel when present"
+        );
+    }
+
+    /// AUDIT-226: `check_catchup_persist_pending` returns false on a
+    /// clean DB (no sentinel).
+    #[test]
+    fn test_check_catchup_persist_pending_clean_db() {
+        let db = henyey_db::Database::open_in_memory().unwrap();
+
+        assert!(
+            !App::check_catchup_persist_pending(&db),
+            "must return false when sentinel is absent"
+        );
+    }
+
+    /// AUDIT-226: sentinel is NOT cleared by `check_catchup_persist_pending`
+    /// (crash-idempotence — it must persist for subsequent restarts).
+    #[test]
+    fn test_check_catchup_persist_pending_does_not_clear_sentinel() {
+        let db = henyey_db::Database::open_in_memory().unwrap();
+
+        db.with_connection(|conn| {
+            use henyey_db::queries::StateQueries;
+            conn.set_state(state_keys::CATCHUP_PERSIST_PENDING, "1")
+        })
+        .unwrap();
+
+        // First check.
+        assert!(App::check_catchup_persist_pending(&db));
+
+        // Second check — sentinel must still be present.
+        assert!(
+            App::check_catchup_persist_pending(&db),
+            "sentinel must persist across multiple checks (crash-idempotent)"
         );
     }
 }

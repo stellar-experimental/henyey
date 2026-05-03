@@ -570,6 +570,19 @@ impl App {
                     ledger_manager,
                     persist_tx,
                 } => {
+                    // Mark the deferred persist window so a crash before
+                    // the event loop executes the persist can be detected
+                    // on restart (AUDIT-226). Cleared atomically inside
+                    // CatchupPersistData::write_to_db.
+                    if let Err(e) = db.with_connection(|conn| {
+                        use henyey_db::queries::StateQueries;
+                        conn.set_state(state_keys::CATCHUP_PERSIST_PENDING, "1")
+                    }) {
+                        tracing::warn!(
+                            error = %e,
+                            "Failed to set catchup persist sentinel"
+                        );
+                    }
                     let ready =
                         super::persist::CatchupPersistReady::new(persist_data, db, ledger_manager);
                     // Send-failure tolerance: if the receiver was dropped

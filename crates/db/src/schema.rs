@@ -189,4 +189,12 @@ pub mod state_keys {
     /// bootstrap consensus from the current LCL. Used for single-node
     /// networks (e.g., quickstart local mode). Cleared after first use.
     pub const FORCE_SCP: &str = "forcescp";
+
+    /// Set when catchup persist data is deferred to the event loop;
+    /// cleared atomically when the persist transaction completes or
+    /// when a subsequent ledger-close persist runs.
+    ///
+    /// Presence at startup indicates the previous catchup completed
+    /// in-memory but crashed before the deferred persist ran (AUDIT-226).
+    pub const CATCHUP_PERSIST_PENDING: &str = "catchuppersistpending";
 }

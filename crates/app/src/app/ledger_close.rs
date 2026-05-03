@@ -145,6 +145,10 @@ impl LedgerPersistInputs {
 
             conn.set_state(state_keys::HISTORY_ARCHIVE_STATE, &has_json)?;
             conn.set_last_closed_ledger(self.header.ledger_seq)?;
+            // Clear any stale catchup persist sentinel (AUDIT-226).
+            // If a catchup's deferred persist was lost but the node
+            // continued closing ledgers, the DB state is now current.
+            conn.delete_state(state_keys::CATCHUP_PERSIST_PENDING)?;
 
             Ok(())
         })?;

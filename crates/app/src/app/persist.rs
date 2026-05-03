@@ -48,6 +48,10 @@ impl CatchupPersistData {
                 &self.has_json,
             )?;
             conn.set_last_closed_ledger(self.header.ledger_seq)?;
+            // Clear the deferred-persist sentinel (AUDIT-226). This runs
+            // atomically with the state update so a crash before this
+            // transaction leaves the sentinel set for startup detection.
+            conn.delete_state(henyey_db::schema::state_keys::CATCHUP_PERSIST_PENDING)?;
             Ok(())
         })
     }
@@ -861,5 +865,65 @@ mod tests {
                 "both steps must complete after interloper releases"
             );
         });
+    }
+
+    /// AUDIT-226: `CatchupPersistData::write_to_db` must clear the
+    /// CATCHUP_PERSIST_PENDING sentinel atomically with the state update.
+    #[test]
+    fn write_to_db_clears_catchup_persist_sentinel() {
+        let db = Database::open_in_memory().unwrap();
+
+        // Set the sentinel (simulating deferred catchup path).
+        db.with_connection(|conn| {
+            conn.set_state(henyey_db::schema::state_keys::CATCHUP_PERSIST_PENDING, "1")
+        })
+        .unwrap();
+
+        // Verify sentinel is set.
+        let val = db
+            .with_connection(|conn| {
+                conn.get_state(henyey_db::schema::state_keys::CATCHUP_PERSIST_PENDING)
+            })
+            .unwrap();
+        assert!(val.is_some(), "sentinel must be set before write_to_db");
+
+        // Run write_to_db.
+        let (header, header_xdr) = make_header(42);
+        let data = CatchupPersistData {
+            header,
+            header_xdr,
+            has_json: "{\"version\":1}".to_string(),
+        };
+        data.write_to_db(&db).unwrap();
+
+        // Verify sentinel is cleared.
+        let val = db
+            .with_connection(|conn| {
+                conn.get_state(henyey_db::schema::state_keys::CATCHUP_PERSIST_PENDING)
+            })
+            .unwrap();
+        assert!(val.is_none(), "sentinel must be cleared after write_to_db");
+    }
+
+    /// AUDIT-226: sentinel persists if write_to_db is never called.
+    #[test]
+    fn sentinel_persists_without_write_to_db() {
+        let db = Database::open_in_memory().unwrap();
+
+        db.with_connection(|conn| {
+            conn.set_state(henyey_db::schema::state_keys::CATCHUP_PERSIST_PENDING, "1")
+        })
+        .unwrap();
+
+        // Simulate a crash: no write_to_db call. Just re-read.
+        let val = db
+            .with_connection(|conn| {
+                conn.get_state(henyey_db::schema::state_keys::CATCHUP_PERSIST_PENDING)
+            })
+            .unwrap();
+        assert!(
+            val.is_some(),
+            "sentinel must persist when write_to_db is never called"
+        );
     }
 }
