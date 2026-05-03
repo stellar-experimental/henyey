@@ -90,7 +90,9 @@ mod signatures;
 mod tx_set;
 
 pub(crate) use config::{compute_soroban_resource_fee, load_soroban_network_info, require_config};
-pub use config::{load_config_setting, load_frozen_key_config, load_soroban_config};
+pub use config::{
+    load_config_setting, load_frozen_key_config, load_soroban_config, require_soroban_config,
+};
 pub use result_mapping::build_tx_result_pair;
 pub(crate) use tx_set::pre_deduct_all_fees_on_delta;
 pub use tx_set::{
@@ -2275,12 +2277,16 @@ impl TransactionExecutor {
             seq: tx_seq,
             op_index,
         };
-        let soroban = henyey_tx::soroban::SorobanContext {
-            soroban_data,
-            config: Some(&self.soroban_config),
-            module_cache: self.module_cache.as_ref(),
-            guarded_hot_archive,
-            ttl_key_cache: self.ttl_key_cache.as_ref(),
+        let op_context = if let Some(soroban_data) = soroban_data {
+            henyey_tx::soroban::OperationContext::Soroban(henyey_tx::soroban::SorobanContext {
+                soroban_data,
+                config: &self.soroban_config,
+                module_cache: self.module_cache.as_ref(),
+                guarded_hot_archive,
+                ttl_key_cache: self.ttl_key_cache.as_ref(),
+            })
+        } else {
+            henyey_tx::soroban::OperationContext::Classic
         };
 
         // Use the central operation dispatcher which handles all operation types
@@ -2290,7 +2296,7 @@ impl TransactionExecutor {
             &tx_id,
             &mut self.state,
             context,
-            &soroban,
+            &op_context,
         )
     }
 

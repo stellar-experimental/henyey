@@ -76,10 +76,17 @@ impl Clone for SorobanConfig {
     }
 }
 
+/// Synthetic placeholder with incomplete/zero values.
+///
+/// **Only valid for pre-protocol-20 struct initialization and test fixtures
+/// where Soroban operations are not executed.** Production Soroban execution
+/// MUST use config loaded from ledger entries via `require_soroban_config()`.
+///
+/// Notable dangerous defaults: `tx_max_contract_events_size_bytes: 0` and
+/// empty cost params. These act as a canary — any Soroban execution using
+/// this default will produce incorrect results immediately.
 impl Default for SorobanConfig {
     fn default() -> Self {
-        // Default values matching protocol 21 testnet/mainnet
-        // These are placeholders - real values should be loaded from ConfigSettingEntry
         Self {
             cpu_cost_params: ContractCostParams(vec![].try_into().unwrap_or_default()),
             mem_cost_params: ContractCostParams(vec![].try_into().unwrap_or_default()),

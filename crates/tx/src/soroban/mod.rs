@@ -122,33 +122,29 @@ pub struct HostFunctionInvocation<'a> {
     pub ttl_key_cache: Option<&'a TtlKeyCache>,
 }
 
-/// Bundles the optional Soroban parameters that thread through operation execution.
+/// Execution context passed to the operation dispatcher.
 ///
-/// Many operation-execution functions need access to these five optional fields
-/// for Soroban-enabled transactions. This struct eliminates the need to pass
-/// them as five separate parameters (and the associated `clippy::too_many_arguments`
-/// suppressions).
+/// Classic operations require no Soroban state; Soroban operations require
+/// config and transaction data to be present. The enum makes it impossible
+/// to accidentally execute a Soroban operation without required configuration.
+pub enum OperationContext<'a> {
+    /// Classic operations — never accesses Soroban config/footprint/cache.
+    Classic,
+    /// Soroban operations — all required Soroban fields are mandatory.
+    Soroban(SorobanContext<'a>),
+}
+
+/// Soroban execution state bundled for operation execution.
 ///
-/// For non-Soroban transactions, create with [`SorobanContext::none()`].
+/// Config and soroban_data are non-optional; their presence is guaranteed
+/// by construction. Optional fields (module_cache, hot_archive, ttl_key_cache)
+/// are genuinely optional capabilities that may or may not be available.
 pub struct SorobanContext<'a> {
-    pub soroban_data: Option<&'a SorobanTransactionData>,
-    pub config: Option<&'a SorobanConfig>,
+    pub soroban_data: &'a SorobanTransactionData,
+    pub config: &'a SorobanConfig,
     pub module_cache: Option<&'a PersistentModuleCache>,
     pub guarded_hot_archive: Option<GuardedHotArchive<'a>>,
     pub ttl_key_cache: Option<&'a TtlKeyCache>,
-}
-
-impl SorobanContext<'_> {
-    /// Create a context with no Soroban data (for non-Soroban transactions).
-    pub fn none() -> Self {
-        Self {
-            soroban_data: None,
-            config: None,
-            module_cache: None,
-            guarded_hot_archive: None,
-            ttl_key_cache: None,
-        }
-    }
 }
 
 /// Cache of pre-computed TTL key hashes. Built during footprint loading,

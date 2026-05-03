@@ -464,19 +464,8 @@ pub(crate) fn execute_invoke_host_function(
     context: &LedgerContext,
     soroban: &SorobanContext<'_>,
 ) -> Result<OperationExecutionResult> {
-    // Validate we have Soroban data for footprint
-    let soroban_data = match soroban.soroban_data {
-        Some(data) => data,
-        None => {
-            return Ok(OperationExecutionResult::new(make_result(
-                InvokeHostFunctionResultCode::Malformed,
-                Hash([0u8; 32]),
-            )));
-        }
-    };
-
-    let default_config = SorobanConfig::default();
-    let soroban_config = soroban.config.unwrap_or(&default_config);
+    let soroban_data = soroban.soroban_data;
+    let soroban_config = soroban.config;
 
     // All host functions go through soroban-env-host, matching stellar-core behavior.
     // This ensures rent calculation and other host-computed values are consistent.
@@ -1383,7 +1372,7 @@ fn map_host_error_to_result_code(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::soroban::{HotArchiveLookup, StorageChange};
+    use crate::soroban::{HotArchiveLookup, OperationContext, StorageChange};
     use crate::test_utils::create_test_account_id;
     use stellar_xdr::curr::*;
 
@@ -1420,32 +1409,43 @@ mod tests {
     }
 
     #[test]
-    fn test_invoke_host_function_no_soroban_data() {
+    fn test_invoke_host_function_classic_context_returns_malformed() {
+        // When a Soroban operation is dispatched in Classic context,
+        // the dispatcher returns Malformed without entering the operation.
         let mut state = LedgerStateManager::new(5_000_000, 100);
         let context = create_test_context();
         let source = create_test_account_id(0);
-        let config = create_test_soroban_config();
 
-        let op = InvokeHostFunctionOp {
-            host_function: HostFunction::UploadContractWasm(vec![0u8; 100].try_into().unwrap()),
-            auth: vec![].try_into().unwrap(),
+        state.create_account(create_test_account(source.clone(), 1_000_000));
+
+        let op = Operation {
+            source_account: None,
+            body: OperationBody::InvokeHostFunction(InvokeHostFunctionOp {
+                host_function: HostFunction::UploadContractWasm(vec![0u8; 100].try_into().unwrap()),
+                auth: vec![].try_into().unwrap(),
+            }),
         };
 
-        let soroban = SorobanContext {
-            soroban_data: None,
-            config: Some(&config),
-            module_cache: None,
-            guarded_hot_archive: None,
-            ttl_key_cache: None,
+        let tx_id = crate::operations::execute::TxIdentity {
+            source_id: &source,
+            seq: 0,
+            op_index: 0,
         };
-        let result = execute_invoke_host_function(&op, &source, &mut state, &context, &soroban)
-            .expect("invoke host function");
+        let result = crate::operations::execute::execute_operation_with_soroban(
+            &op,
+            &source,
+            &tx_id,
+            &mut state,
+            &context,
+            &OperationContext::Classic,
+        )
+        .expect("execute operation");
 
         match result.result {
             OperationResult::OpInner(OperationResultTr::InvokeHostFunction(r)) => {
                 assert!(matches!(r, InvokeHostFunctionResult::Malformed));
             }
-            _ => panic!("Unexpected result type"),
+            _ => panic!("Unexpected result type: {:?}", result.result),
         }
     }
 
@@ -1483,8 +1483,8 @@ mod tests {
         };
 
         let soroban = SorobanContext {
-            soroban_data: Some(&soroban_data),
-            config: Some(&config),
+            soroban_data: &soroban_data,
+            config: &config,
             module_cache: None,
             guarded_hot_archive: None,
             ttl_key_cache: None,
@@ -1562,8 +1562,8 @@ mod tests {
         };
 
         let soroban = SorobanContext {
-            soroban_data: Some(&soroban_data),
-            config: Some(&config),
+            soroban_data: &soroban_data,
+            config: &config,
             module_cache: None,
             guarded_hot_archive: None,
             ttl_key_cache: None,
@@ -1646,8 +1646,8 @@ mod tests {
         let module_cache = PersistentModuleCache::new_for_protocol(context.protocol_version)
             .expect("create module cache");
         let soroban = SorobanContext {
-            soroban_data: Some(&soroban_data),
-            config: Some(&config),
+            soroban_data: &soroban_data,
+            config: &config,
             module_cache: Some(&module_cache),
             guarded_hot_archive: None,
             ttl_key_cache: None,
@@ -1731,8 +1731,8 @@ mod tests {
             .expect("create module cache");
 
         let soroban = SorobanContext {
-            soroban_data: Some(&soroban_data),
-            config: Some(&config),
+            soroban_data: &soroban_data,
+            config: &config,
             module_cache: Some(&module_cache),
             guarded_hot_archive: None,
             ttl_key_cache: None,
@@ -1785,8 +1785,8 @@ mod tests {
         };
 
         let soroban = SorobanContext {
-            soroban_data: Some(&soroban_data),
-            config: Some(&config),
+            soroban_data: &soroban_data,
+            config: &config,
             module_cache: None,
             guarded_hot_archive: None,
             ttl_key_cache: None,
@@ -4023,8 +4023,8 @@ mod tests {
         };
 
         let soroban = SorobanContext {
-            soroban_data: Some(&soroban_data),
-            config: Some(&config),
+            soroban_data: &soroban_data,
+            config: &config,
             module_cache: None,
             guarded_hot_archive: None,
             ttl_key_cache: None,
@@ -4110,8 +4110,8 @@ mod tests {
         };
 
         let soroban = SorobanContext {
-            soroban_data: Some(&soroban_data),
-            config: Some(&config),
+            soroban_data: &soroban_data,
+            config: &config,
             module_cache: None,
             guarded_hot_archive: None,
             ttl_key_cache: None,

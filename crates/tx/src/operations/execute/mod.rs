@@ -39,14 +39,14 @@ use soroban_env_host_p25 as soroban_env_host25;
 use soroban_env_host_p26 as soroban_env_host26;
 use stellar_xdr::curr::{
     AccountEntry, AccountEntryExt, AccountEntryExtensionV1, AccountEntryExtensionV1Ext, AccountId,
-    Asset, ContractEvent, DiagnosticEvent, ExtendFootprintTtlResult, LedgerKey, Liabilities,
-    Operation, OperationBody, OperationResult, OperationResultTr, RestoreFootprintResult,
-    TrustLineEntry, TrustLineEntryExt, TrustLineEntryExtensionV2, TrustLineEntryExtensionV2Ext,
-    TrustLineEntryV1, TrustLineEntryV1Ext, TrustLineFlags,
+    Asset, ContractEvent, DiagnosticEvent, ExtendFootprintTtlResult, InvokeHostFunctionResult,
+    LedgerKey, Liabilities, Operation, OperationBody, OperationResult, OperationResultTr,
+    RestoreFootprintResult, TrustLineEntry, TrustLineEntryExt, TrustLineEntryExtensionV2,
+    TrustLineEntryExtensionV2Ext, TrustLineEntryV1, TrustLineEntryV1Ext, TrustLineFlags,
 };
 
 use crate::frame::muxed_to_account_id;
-use crate::soroban::{SorobanConfig, SorobanContext};
+use crate::soroban::OperationContext;
 use crate::state::LedgerStateManager;
 use crate::validation::LedgerContext;
 use crate::{Result, TxError};
@@ -873,29 +873,29 @@ pub(crate) fn execute_operation(
         &tx_id,
         state,
         context,
-        &SorobanContext::none(),
+        &OperationContext::Classic,
     )
 }
 
-/// Execute a single operation with optional Soroban transaction data.
+/// Execute a single operation with an operation context.
 ///
-/// This variant is used for Soroban operations that need access to the footprint
-/// and network configuration.
+/// This is the main dispatcher for all operation types. Soroban operations
+/// require `OperationContext::Soroban(...)` with valid config and transaction
+/// data. Classic operations work in either context.
 ///
 /// # Arguments
 ///
 /// * `tx_id` - Transaction identity for generating deterministic claimable balance
 ///   and revocation IDs.
-/// * `soroban` - Soroban execution context with optional config, module cache,
-///   hot archive lookup, and TTL key cache. Use `SorobanContext::none()` for
-///   non-Soroban transactions.
+/// * `op_context` - Operation context: `Classic` for non-Soroban transactions,
+///   `Soroban(...)` for transactions with Soroban operations.
 pub fn execute_operation_with_soroban(
     op: &Operation,
     source_account_id: &AccountId,
     tx_id: &TxIdentity<'_>,
     state: &mut LedgerStateManager,
     context: &LedgerContext,
-    soroban: &SorobanContext<'_>,
+    op_context: &OperationContext<'_>,
 ) -> Result<OperationExecutionResult> {
     // Get the actual source for this operation
     // If the operation has an explicit source, use it; otherwise use the transaction source
@@ -936,39 +936,67 @@ pub fn execute_operation_with_soroban(
             OperationBody::SetOptions(op_data) => Ok(OperationExecutionResult::new(
                 set_options::execute_set_options(op_data, &op_source, state, context)?,
             )),
-            // Soroban operations
+            // Soroban operations — require OperationContext::Soroban
             OperationBody::InvokeHostFunction(op_data) => {
+                let soroban = match op_context {
+                    OperationContext::Soroban(ctx) => ctx,
+                    OperationContext::Classic => {
+                        return Ok(OperationExecutionResult::new(OperationResult::OpInner(
+                            OperationResultTr::InvokeHostFunction(
+                                InvokeHostFunctionResult::Malformed,
+                            ),
+                        )));
+                    }
+                };
                 invoke_host_function::execute_invoke_host_function(
                     op_data, &op_source, state, context, soroban,
                 )
             }
             OperationBody::ExtendFootprintTtl(op_data) => {
-                let default_config = SorobanConfig::default();
-                let config = soroban.config.unwrap_or(&default_config);
-                let snapshots = soroban
-                    .soroban_data
-                    .map(|data| {
-                        let mut keys = Vec::new();
-                        keys.extend(data.resources.footprint.read_only.iter().cloned());
-                        keys.extend(data.resources.footprint.read_write.iter().cloned());
-                        rent_snapshot_for_keys(
-                            &keys,
-                            state,
-                            context.protocol_version,
-                            soroban
-                                .config
-                                .map(|c| (&c.cpu_cost_params, &c.mem_cost_params)),
-                            soroban.ttl_key_cache,
-                        )
-                    })
-                    .unwrap_or_default();
+                let soroban = match op_context {
+                    OperationContext::Soroban(ctx) => ctx,
+                    OperationContext::Classic => {
+                        return Ok(OperationExecutionResult::new(OperationResult::OpInner(
+                            OperationResultTr::ExtendFootprintTtl(
+                                ExtendFootprintTtlResult::Malformed,
+                            ),
+                        )));
+                    }
+                };
+                let config = soroban.config;
+                let mut keys = Vec::new();
+                keys.extend(
+                    soroban
+                        .soroban_data
+                        .resources
+                        .footprint
+                        .read_only
+                        .iter()
+                        .cloned(),
+                );
+                keys.extend(
+                    soroban
+                        .soroban_data
+                        .resources
+                        .footprint
+                        .read_write
+                        .iter()
+                        .cloned(),
+                );
+                let snapshots = rent_snapshot_for_keys(
+                    &keys,
+                    state,
+                    context.protocol_version,
+                    Some((&config.cpu_cost_params, &config.mem_cost_params)),
+                    soroban.ttl_key_cache,
+                );
                 let result = extend_footprint_ttl::execute_extend_footprint_ttl(
                     op_data,
                     &op_source,
                     state,
                     context,
                     &extend_footprint_ttl::SorobanExtendConfig {
-                        soroban_data: soroban.soroban_data,
+                        soroban_data: Some(soroban.soroban_data),
                         ttl_key_cache: soroban.ttl_key_cache,
                         size_limits: Some(&ContractSizeLimits {
                             max_contract_size_bytes: config.max_contract_size_bytes,
@@ -989,9 +1017,7 @@ pub fn execute_operation_with_soroban(
                         &snapshots,
                         state,
                         context.protocol_version,
-                        soroban
-                            .config
-                            .map(|c| (&c.cpu_cost_params, &c.mem_cost_params)),
+                        Some((&config.cpu_cost_params, &config.mem_cost_params)),
                         soroban.ttl_key_cache,
                     );
                     let rent_fee = compute_rent_fee_by_protocol(
@@ -1014,8 +1040,15 @@ pub fn execute_operation_with_soroban(
                 Ok(exec)
             }
             OperationBody::RestoreFootprint(op_data) => {
-                let default_config = SorobanConfig::default();
-                let config = soroban.config.unwrap_or(&default_config);
+                let soroban = match op_context {
+                    OperationContext::Soroban(ctx) => ctx,
+                    OperationContext::Classic => {
+                        return Ok(OperationExecutionResult::new(OperationResult::OpInner(
+                            OperationResultTr::RestoreFootprint(RestoreFootprintResult::Malformed),
+                        )));
+                    }
+                };
+                let config = soroban.config;
                 // For RestoreFootprint, we need to track which entries are ACTUALLY restored.
                 // stellar-core only computes rent for entries that need restoration (not already live).
                 //
@@ -1027,76 +1060,72 @@ pub fn execute_operation_with_soroban(
                 // 3. If TTL exists but expired (TTL < current_ledger) -> include (restore from live BL)
                 let mut snapshots = Vec::new();
                 let mut hot_archive_restores = Vec::new();
-                if let Some(data) = soroban.soroban_data {
-                    for key in data.resources.footprint.read_write.iter() {
-                        // Only compute rent for entries that need restoration
-                        let key_hash =
-                            crate::soroban::get_or_compute_key_hash(soroban.ttl_key_cache, key);
-                        let current_ttl = state.get_ttl(&key_hash).map(|t| t.live_until_ledger_seq);
+                for key in soroban.soroban_data.resources.footprint.read_write.iter() {
+                    // Only compute rent for entries that need restoration
+                    let key_hash =
+                        crate::soroban::get_or_compute_key_hash(soroban.ttl_key_cache, key);
+                    let current_ttl = state.get_ttl(&key_hash).map(|t| t.live_until_ledger_seq);
 
-                        // Case 1: TTL exists and entry is live -> skip
-                        if let Some(ttl) = current_ttl {
-                            if ttl >= context.sequence {
-                                continue;
-                            }
-                            // Case 3: TTL exists but expired -> data entry must exist
-                            // stellar-core: releaseAssertOrThrow(entryLeOpt)
-                            let entry = state.get_entry(key).unwrap_or_else(|| {
-                                panic!(
-                                    "restore rent snapshot: expired TTL exists but data entry missing for key {:?}",
-                                    key
-                                )
-                            });
-                            let entry_size = entry_size_for_rent_by_protocol_with_cost_params(
-                                context.protocol_version,
-                                &entry,
-                                henyey_common::xdr_encoded_len_u32(&entry),
-                                soroban
-                                    .config
-                                    .map(|c| (&c.cpu_cost_params, &c.mem_cost_params)),
-                            );
-                            let (is_persistent, is_code_entry) = rent_classification(key);
-                            snapshots.push(RentSnapshot {
-                                key: key.clone(),
-                                is_persistent,
-                                is_code_entry,
-                                old_size_bytes: entry_size,
-                                old_live_until: ttl,
-                            });
-                        } else {
-                            // Case 2: No TTL -> check if already restored in this
-                            // cluster, then check hot archive.
-                            //
-                            // stellar-core: entryWasRestored(lk) — if the entry was
-                            // restored from hot archive earlier in this ledger and then
-                            // deleted, skip it. The immutable hot archive snapshot would
-                            // still return the entry, but restoring it again diverges.
-                            // GuardedHotArchive::get() handles this check transparently.
-                            // Per stellar-core createEntryRentChangeWithoutModification():
-                            // When entryLiveUntilLedger is std::nullopt (no previous TTL):
-                            //   - old_size_bytes = 0
-                            //   - old_live_until_ledger = 0
-                            // This is different from expired entries where we use the actual old size.
-                            if let Some(ref guarded) = soroban.guarded_hot_archive {
-                                if let Some(entry) = guarded.get(key).map_err(|e| {
-                                    TxError::Internal(format!(
-                                        "hot archive lookup failed during restore: {e}"
-                                    ))
-                                })? {
-                                    let (is_persistent, is_code_entry) = rent_classification(key);
-                                    snapshots.push(RentSnapshot {
-                                        key: key.clone(),
-                                        is_persistent,
-                                        is_code_entry,
-                                        old_size_bytes: 0, // Hot archive entries: old_size_bytes = 0
-                                        old_live_until: 0, // Hot archive entries: old_live_until = 0
-                                    });
-                                    // Track this entry for RESTORED metadata emission
-                                    hot_archive_restores.push(HotArchiveRestore {
-                                        key: key.clone(),
-                                        entry: entry.clone(),
-                                    });
-                                }
+                    // Case 1: TTL exists and entry is live -> skip
+                    if let Some(ttl) = current_ttl {
+                        if ttl >= context.sequence {
+                            continue;
+                        }
+                        // Case 3: TTL exists but expired -> data entry must exist
+                        // stellar-core: releaseAssertOrThrow(entryLeOpt)
+                        let entry = state.get_entry(key).unwrap_or_else(|| {
+                            panic!(
+                                "restore rent snapshot: expired TTL exists but data entry missing for key {:?}",
+                                key
+                            )
+                        });
+                        let entry_size = entry_size_for_rent_by_protocol_with_cost_params(
+                            context.protocol_version,
+                            &entry,
+                            henyey_common::xdr_encoded_len_u32(&entry),
+                            Some((&config.cpu_cost_params, &config.mem_cost_params)),
+                        );
+                        let (is_persistent, is_code_entry) = rent_classification(key);
+                        snapshots.push(RentSnapshot {
+                            key: key.clone(),
+                            is_persistent,
+                            is_code_entry,
+                            old_size_bytes: entry_size,
+                            old_live_until: ttl,
+                        });
+                    } else {
+                        // Case 2: No TTL -> check if already restored in this
+                        // cluster, then check hot archive.
+                        //
+                        // stellar-core: entryWasRestored(lk) — if the entry was
+                        // restored from hot archive earlier in this ledger and then
+                        // deleted, skip it. The immutable hot archive snapshot would
+                        // still return the entry, but restoring it again diverges.
+                        // GuardedHotArchive::get() handles this check transparently.
+                        // Per stellar-core createEntryRentChangeWithoutModification():
+                        // When entryLiveUntilLedger is std::nullopt (no previous TTL):
+                        //   - old_size_bytes = 0
+                        //   - old_live_until_ledger = 0
+                        // This is different from expired entries where we use the actual old size.
+                        if let Some(ref guarded) = soroban.guarded_hot_archive {
+                            if let Some(entry) = guarded.get(key).map_err(|e| {
+                                TxError::Internal(format!(
+                                    "hot archive lookup failed during restore: {e}"
+                                ))
+                            })? {
+                                let (is_persistent, is_code_entry) = rent_classification(key);
+                                snapshots.push(RentSnapshot {
+                                    key: key.clone(),
+                                    is_persistent,
+                                    is_code_entry,
+                                    old_size_bytes: 0, // Hot archive entries: old_size_bytes = 0
+                                    old_live_until: 0, // Hot archive entries: old_live_until = 0
+                                });
+                                // Track this entry for RESTORED metadata emission
+                                hot_archive_restores.push(HotArchiveRestore {
+                                    key: key.clone(),
+                                    entry: entry.clone(),
+                                });
                             }
                         }
                     }
@@ -1116,7 +1145,7 @@ pub fn execute_operation_with_soroban(
                     state,
                     context,
                     restore_footprint::RestoreFootprintResources {
-                        soroban_data: soroban.soroban_data,
+                        soroban_data: Some(soroban.soroban_data),
                         min_persistent_entry_ttl: config.min_persistent_entry_ttl,
                         hot_archive_restores: &ha_restore_entries,
                         ttl_key_cache: soroban.ttl_key_cache,
@@ -1138,9 +1167,7 @@ pub fn execute_operation_with_soroban(
                         &snapshots,
                         state,
                         context.protocol_version,
-                        soroban
-                            .config
-                            .map(|c| (&c.cpu_cost_params, &c.mem_cost_params)),
+                        Some((&config.cpu_cost_params, &config.mem_cost_params)),
                         soroban.ttl_key_cache,
                     );
                     let rent_fee = compute_rent_fee_by_protocol(
@@ -1912,5 +1939,74 @@ mod tests {
                 other => panic!("Expected OpTooManySponsoring, got {:?}", other),
             },
         }
+    }
+
+    #[test]
+    fn test_soroban_ops_classic_context_returns_malformed() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+        let source = create_test_account_id(0);
+        state.create_account(create_test_account(source.clone(), 1_000_000));
+
+        let tx_id = TxIdentity {
+            source_id: &source,
+            seq: 0,
+            op_index: 0,
+        };
+
+        // ExtendFootprintTtl in Classic context → Malformed
+        let extend_op = Operation {
+            source_account: None,
+            body: OperationBody::ExtendFootprintTtl(ExtendFootprintTtlOp {
+                ext: ExtensionPoint::V0,
+                extend_to: 1000,
+            }),
+        };
+        let result = execute_operation_with_soroban(
+            &extend_op,
+            &source,
+            &tx_id,
+            &mut state,
+            &context,
+            &OperationContext::Classic,
+        )
+        .expect("execute operation");
+        assert!(
+            matches!(
+                result.result,
+                OperationResult::OpInner(OperationResultTr::ExtendFootprintTtl(
+                    ExtendFootprintTtlResult::Malformed
+                ))
+            ),
+            "ExtendFootprintTtl in Classic context should return Malformed, got {:?}",
+            result.result
+        );
+
+        // RestoreFootprint in Classic context → Malformed
+        let restore_op = Operation {
+            source_account: None,
+            body: OperationBody::RestoreFootprint(RestoreFootprintOp {
+                ext: ExtensionPoint::V0,
+            }),
+        };
+        let result = execute_operation_with_soroban(
+            &restore_op,
+            &source,
+            &tx_id,
+            &mut state,
+            &context,
+            &OperationContext::Classic,
+        )
+        .expect("execute operation");
+        assert!(
+            matches!(
+                result.result,
+                OperationResult::OpInner(OperationResultTr::RestoreFootprint(
+                    RestoreFootprintResult::Malformed
+                ))
+            ),
+            "RestoreFootprint in Classic context should return Malformed, got {:?}",
+            result.result
+        );
     }
 }

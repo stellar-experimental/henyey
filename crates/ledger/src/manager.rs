@@ -3822,8 +3822,7 @@ impl LedgerCloseContext<'_> {
             self.prev_header.ledger_version,
             ProtocolVersion::V20,
         ) {
-            crate::execution::load_soroban_config(&self.ltx, self.prev_header.ledger_version)?
-                .unwrap_or_default()
+            crate::execution::require_soroban_config(&self.ltx, self.prev_header.ledger_version)?
         } else {
             henyey_tx::soroban::SorobanConfig::default()
         };
@@ -4638,7 +4637,7 @@ impl LedgerCloseContext<'_> {
         // The value cached at apply_transactions() time reflects pre-upgrade config;
         // config-entry upgrades may have changed rent fee parameters. The refreshed
         // value is used in LedgerCloseMetaExtV1.sorobanFeeWrite1KB.
-        if protocol_version_starts_from(self.prev_header.ledger_version, ProtocolVersion::V20) {
+        if protocol_version_starts_from(protocol_version, ProtocolVersion::V20) {
             if let Some(post_upgrade_config) =
                 crate::execution::load_soroban_config(&self.ltx, protocol_version)?
             {

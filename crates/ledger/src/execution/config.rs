@@ -388,6 +388,25 @@ pub fn load_soroban_config(
     Ok(Some(config))
 }
 
+/// Load Soroban config, erroring if entries are missing.
+///
+/// Callers MUST gate on `protocol_version_starts_from(version, ProtocolVersion::V20)`
+/// before calling. This matches stellar-core's `SorobanNetworkConfig::loadFromLedger()`
+/// which is only called for Soroban-active protocols and throws on missing entries.
+///
+/// The `protocol_version` parameter is passed through to `load_soroban_config()`
+/// to determine version-specific fee configuration.
+pub fn require_soroban_config(
+    reader: &impl crate::EntryReader,
+    protocol_version: u32,
+) -> Result<SorobanConfig> {
+    load_soroban_config(reader, protocol_version)?.ok_or_else(|| {
+        LedgerError::Internal(
+            "required Soroban config entries missing for protocol >= 20 ledger".into(),
+        )
+    })
+}
+
 /// Load SorobanNetworkInfo from the ledger's ConfigSettingEntry entries.
 ///
 /// This loads all the configuration settings needed for the /sorobaninfo endpoint,
@@ -684,6 +703,25 @@ mod tests {
         assert!(
             err_msg.contains("disk read failed"),
             "Error should contain the original I/O error, got: {}",
+            err_msg
+        );
+    }
+
+    /// require_soroban_config must return an error when config entries are missing.
+    #[test]
+    fn test_require_soroban_config_errors_on_missing() {
+        let empty_lookup: crate::EntryLookupFn = std::sync::Arc::new(|_key: &LedgerKey| Ok(None));
+        let snapshot = SnapshotHandle::with_lookup(LedgerSnapshot::empty(100), empty_lookup);
+
+        let result = require_soroban_config(&snapshot, 21);
+        assert!(
+            result.is_err(),
+            "require_soroban_config should error when config is absent"
+        );
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(
+            err_msg.contains("required Soroban config entries missing"),
+            "Error should indicate missing config, got: {}",
             err_msg
         );
     }

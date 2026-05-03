@@ -13,7 +13,7 @@ use henyey_common::protocol::{
 use henyey_common::Hash256;
 use henyey_ledger::{
     execution::{
-        execute_transaction_set, load_config_setting, load_soroban_config, SorobanContext,
+        execute_transaction_set, load_config_setting, require_soroban_config, SorobanContext,
     },
     prepend_fee_event, EntryChange, LedgerDelta, LedgerError, LedgerSnapshot, SnapshotHandle,
     TransactionSetVariant,
@@ -584,7 +584,7 @@ pub fn replay_ledger_with_execution(
         if protocol_version_starts_from(header.ledger_version, ProtocolVersion::V20)
             && !transactions.is_empty()
         {
-            load_soroban_config(&snapshot, header.ledger_version)?.unwrap_or_default()
+            require_soroban_config(&snapshot, header.ledger_version)?
         } else {
             SorobanConfig::default()
         };
