@@ -611,14 +611,8 @@ impl FeeBumpMutableTransactionResult {
     pub fn finalize_fee_refund(&mut self, protocol_version: u32) {
         if let Some(ref tracker) = self.refundable_fee_tracker {
             let refund = tracker.get_fee_refund();
-
-            if protocol_version_starts_from(protocol_version, ProtocolVersion::V25) {
-                // P25+: all fees come from outer, refund from outer only
-                self.outer_fee_charged -= refund;
-            } else {
-                // P21-P24: stellar-core deducts from both outer and inner
-                // (see MutableTransactionResult.cpp:429-441)
-                self.outer_fee_charged -= refund;
+            self.outer_fee_charged -= refund;
+            if fee_bump_refund_applies_to_inner(protocol_version) {
                 self.inner_fee_charged -= refund;
             }
         }
@@ -705,6 +699,23 @@ impl FeeBumpMutableTransactionResult {
     }
 }
 
+/// Determine whether a fee-bump refund should be applied to the inner fee_charged field.
+///
+/// - Protocol >= 25: refund is NOT applied to inner (inner fee is always 0 in P25+)
+/// - Protocol < 25 (henyey supports 24+): refund IS applied to inner
+///   (stellar-core bug replicated for parity; see MutableTransactionResult.cpp:421-443)
+///
+/// Note: henyey only supports protocol 24+. The `true` branch handles P24
+/// specifically; protocols < 21 would not apply a refund in stellar-core,
+/// but that case never arises here.
+///
+/// References:
+/// - stellar-core `MutableTransactionResult.cpp:421-443`
+/// - stellar-core `FeeBumpTransactionFrame.cpp:696-700`
+pub fn fee_bump_refund_applies_to_inner(protocol_version: u32) -> bool {
+    !protocol_version_starts_from(protocol_version, ProtocolVersion::V25)
+}
+
 /// Calculate the inner fee charged for a fee bump transaction.
 ///
 /// # Protocol Behavior
@@ -714,11 +725,10 @@ impl FeeBumpMutableTransactionResult {
 ///
 /// This matches stellar-core `FeeBumpTransactionFrame::getInnerFullFee`.
 pub fn calculate_inner_fee_charged(inner_declared_fee: u32, protocol_version: u32) -> i64 {
-    if protocol_version_starts_from(protocol_version, ProtocolVersion::V25) {
-        // In protocol 25+, inner fee is always 0
-        0
-    } else {
+    if fee_bump_refund_applies_to_inner(protocol_version) {
         inner_declared_fee as i64
+    } else {
+        0
     }
 }
 
@@ -1070,6 +1080,16 @@ mod tests {
         // Protocol 25+: inner fee is 0
         assert_eq!(calculate_inner_fee_charged(500, 25), 0);
         assert_eq!(calculate_inner_fee_charged(500, 26), 0);
+    }
+
+    #[test]
+    fn test_fee_bump_refund_applies_to_inner() {
+        // Protocol 24: refund applies to inner (stellar-core bug replicated for parity)
+        assert!(fee_bump_refund_applies_to_inner(24));
+
+        // Protocol 25+: refund does NOT apply to inner
+        assert!(!fee_bump_refund_applies_to_inner(25));
+        assert!(!fee_bump_refund_applies_to_inner(26));
     }
 
     #[test]

@@ -377,7 +377,7 @@ fn correct_fee_charged_on_failed_refund(
     protocol_version: u32,
 ) {
     pair.result.fee_charged += refund;
-    if !protocol_version_starts_from(protocol_version, ProtocolVersion::V25) {
+    if fee_bump_refund_applies_to_inner(protocol_version) {
         if let TransactionResultResult::TxFeeBumpInnerSuccess(ref mut inner)
         | TransactionResultResult::TxFeeBumpInnerFailed(ref mut inner) = pair.result.result
         {

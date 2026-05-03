@@ -200,9 +200,9 @@ pub use state::{AssetPair, LedgerStateManager, OfferDescriptor, OfferIndex, Offe
 
 // Re-export fee bump types
 pub use fee_bump::{
-    calculate_inner_fee_charged, extract_inner_hash_from_result, validate_fee_bump,
-    verify_inner_signatures, wrap_inner_result_in_fee_bump, FeeBumpError, FeeBumpFrame,
-    FeeBumpMutableTransactionResult,
+    calculate_inner_fee_charged, extract_inner_hash_from_result, fee_bump_refund_applies_to_inner,
+    validate_fee_bump, verify_inner_signatures, wrap_inner_result_in_fee_bump, FeeBumpError,
+    FeeBumpFrame, FeeBumpMutableTransactionResult,
 };
 
 // Re-export fee newtypes

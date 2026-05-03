@@ -48,7 +48,8 @@ use soroban_env_host_p25::fees::{
 };
 
 use henyey_tx::{
-    make_account_address, make_claimable_balance_address, make_muxed_account_address,
+    fee_bump_refund_applies_to_inner, make_account_address, make_claimable_balance_address,
+    make_muxed_account_address,
     soroban::{PersistentModuleCache, SorobanConfig},
     validation, ClassicEventConfig, LedgerContext, LedgerStateManager, OpEventManager,
     TransactionFrame, TxError, TxEventManager,
