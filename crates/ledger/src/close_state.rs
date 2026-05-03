@@ -28,33 +28,17 @@
 //!
 //! For borrow-conflict cases that cannot use the closure form, the low-level
 //! `change_checkpoint()` + `entry_changes_since()` pair is available as a
-//! `pub(crate)` escape hatch.
+//! `pub(crate)` escape hatch. The checkpoint/diff logic is encapsulated in
+//! [`LedgerDelta`] (see [`crate::delta::ChangeCheckpoint`]); `CloseLedgerState`
+//! delegates to it.
 
-use crate::delta::{DeltaCategorization, EntryChange, LedgerDelta};
+use crate::delta::{ChangeCheckpoint, DeltaCategorization, LedgerDelta};
 use crate::snapshot::SnapshotHandle;
 use crate::Result;
-use std::collections::HashMap;
 use stellar_xdr::curr::{
-    AccountEntry, AccountId, LedgerEntry, LedgerEntryChange, LedgerEntryChanges, LedgerEntryData,
-    LedgerHeader, LedgerKey,
+    AccountEntry, AccountId, LedgerEntry, LedgerEntryChanges, LedgerEntryData, LedgerHeader,
+    LedgerKey,
 };
-
-/// A checkpoint of delta state, used to extract per-upgrade entry changes.
-///
-/// Created by [`CloseLedgerState::change_checkpoint`], consumed by
-/// [`CloseLedgerState::entry_changes_since`].
-///
-/// Stores a snapshot of the delta's entries at checkpoint time so that
-/// `entry_changes_since` can diff the current state against the checkpoint
-/// and detect all modifications — including in-place updates to pre-existing
-/// entries. This mirrors stellar-core's child LedgerTxn + getChanges() pattern.
-pub(crate) struct ChangeCheckpoint {
-    /// Snapshot of delta entry values at checkpoint time.
-    entries: HashMap<LedgerKey, EntryChange>,
-    /// Keys in insertion order at checkpoint time, for deterministic
-    /// iteration over keys that disappeared from the delta after checkpoint.
-    key_order: Vec<LedgerKey>,
-}
 
 /// A merged-read view of ledger state during close.
 ///
@@ -284,16 +268,10 @@ impl CloseLedgerState {
     /// in `manager.rs` where `&mut self` on the enclosing struct conflicts
     /// with `&mut self.ltx` in the closure).
     ///
-    /// Used before an upgrade sub-phase to snapshot the "before" state, so that
-    /// [`entry_changes_since`] can diff the current state against it and detect
-    /// all modifications — including in-place updates to pre-existing entries.
-    ///
-    /// Mirrors stellar-core's child LedgerTxn creation before each upgrade scope.
+    /// Delegates to [`LedgerDelta::checkpoint`]. See [`ChangeCheckpoint`]
+    /// for the usage contract.
     pub(crate) fn change_checkpoint(&self) -> ChangeCheckpoint {
-        ChangeCheckpoint {
-            entries: self.current.snapshot_changes(),
-            key_order: self.current.key_order(),
-        }
+        self.current.checkpoint()
     }
 
     /// Extract all entry changes made since the given checkpoint.
@@ -301,49 +279,9 @@ impl CloseLedgerState {
     /// **Escape hatch** — prefer [`capture_entry_changes`] for new code.
     /// See [`change_checkpoint`] for when this low-level API is appropriate.
     ///
-    /// Performs a snapshot-and-diff: compares the current delta state against
-    /// the checkpoint snapshot to detect new entries, modified pre-existing
-    /// entries, and deleted entries. This matches stellar-core's
-    /// `LedgerTxn::getChanges()` parent-vs-child diff semantics.
-    ///
-    /// Returns an XDR `LedgerEntryChanges` suitable for upgrade metadata.
+    /// Delegates to [`LedgerDelta::changes_since`].
     pub(crate) fn entry_changes_since(&self, cp: ChangeCheckpoint) -> LedgerEntryChanges {
-        let mut changes: Vec<LedgerEntryChange> = Vec::new();
-
-        // Phase 1: Process all keys currently in the delta (insertion order).
-        for (key, current_change) in self.current.keyed_changes() {
-            if let Some(cp_change) = cp.entries.get(key) {
-                // Key existed at checkpoint — compare visible states.
-                let before = visible_entry(cp_change);
-                let after = visible_entry(current_change);
-                emit_diff(&mut changes, key, before, after);
-            } else {
-                // Key is new to the delta since checkpoint.
-                // The EntryChange variant encodes the correct emission:
-                // - Created = genuinely new entry
-                // - Updated = snapshot entry was modified (previous is pre-mod value)
-                // - Deleted = snapshot entry was deleted (previous is pre-del value)
-                emit_new_entry(&mut changes, current_change);
-            }
-        }
-
-        // Phase 2: Keys in checkpoint that disappeared from the current delta.
-        // This only happens when record_delete removes a Created entry entirely
-        // (delta.rs: Created + Delete = remove from delta). If the entry was
-        // visible at checkpoint time, emit STATE + REMOVED.
-        for key in &cp.key_order {
-            if self.current.has_key(key) {
-                continue; // Already handled in Phase 1
-            }
-            if let Some(cp_change) = cp.entries.get(key) {
-                if let Some(v1) = visible_entry(cp_change) {
-                    changes.push(LedgerEntryChange::State(v1.clone()));
-                    changes.push(LedgerEntryChange::Removed(henyey_common::entry_to_key(v1)));
-                }
-            }
-        }
-
-        LedgerEntryChanges(changes.try_into().unwrap_or_default())
+        self.current.changes_since(cp)
     }
 
     // ------------------------------------------------------------------
@@ -403,76 +341,13 @@ fn is_offer_key(key: &LedgerKey) -> bool {
     matches!(key, LedgerKey::Offer(_))
 }
 
-/// Extract the visible LedgerEntry from an EntryChange.
-///
-/// "Visible" means the entry value that would be seen by readers:
-/// - Created(v) → Some(v)
-/// - Updated{_, curr} → Some(curr)
-/// - Deleted{_} → None (entry is absent)
-fn visible_entry(change: &EntryChange) -> Option<&LedgerEntry> {
-    match change {
-        EntryChange::Created(entry) => Some(entry),
-        EntryChange::Updated { current, .. } => Some(current.as_ref()),
-        EntryChange::Deleted { .. } => None,
-    }
-}
-
-/// Emit LedgerEntryChanges for a diff between before/after visible states.
-///
-/// Matches stellar-core's parent-vs-child comparison in getChanges().
-fn emit_diff(
-    changes: &mut Vec<LedgerEntryChange>,
-    key: &LedgerKey,
-    before: Option<&LedgerEntry>,
-    after: Option<&LedgerEntry>,
-) {
-    match (before, after) {
-        (Some(v1), Some(v2)) if v1 != v2 => {
-            changes.push(LedgerEntryChange::State(v1.clone()));
-            changes.push(LedgerEntryChange::Updated(v2.clone()));
-        }
-        (Some(v1), None) => {
-            changes.push(LedgerEntryChange::State(v1.clone()));
-            changes.push(LedgerEntryChange::Removed(key.clone()));
-        }
-        (None, Some(v2)) => {
-            changes.push(LedgerEntryChange::Created(v2.clone()));
-        }
-        _ => {} // same or both absent — no emission
-    }
-}
-
-/// Emit LedgerEntryChanges for a key new to the delta since checkpoint.
-///
-/// The EntryChange variant directly determines the emission type:
-/// - Created = genuinely new entry (CREATED)
-/// - Updated = snapshot entry was modified (STATE + UPDATED)
-/// - Deleted = snapshot entry was deleted (STATE + REMOVED)
-fn emit_new_entry(changes: &mut Vec<LedgerEntryChange>, change: &EntryChange) {
-    match change {
-        EntryChange::Created(entry) => {
-            changes.push(LedgerEntryChange::Created(entry.clone()));
-        }
-        EntryChange::Updated { previous, current } => {
-            changes.push(LedgerEntryChange::State(previous.clone()));
-            changes.push(LedgerEntryChange::Updated(current.as_ref().clone()));
-        }
-        EntryChange::Deleted { previous } => {
-            changes.push(LedgerEntryChange::State(previous.clone()));
-            changes.push(LedgerEntryChange::Removed(henyey_common::entry_to_key(
-                previous,
-            )));
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::snapshot::{LedgerSnapshot, SnapshotHandle};
     use stellar_xdr::curr::{
-        AccountEntry, AccountId, LedgerEntry, LedgerEntryData, LedgerEntryExt, LedgerHeader,
-        LedgerKey, LedgerKeyAccount, PublicKey, Thresholds, Uint256,
+        AccountEntry, AccountId, LedgerEntry, LedgerEntryChange, LedgerEntryData, LedgerEntryExt,
+        LedgerHeader, LedgerKey, LedgerKeyAccount, PublicKey, Thresholds, Uint256,
     };
 
     fn make_test_account_id(seed: u8) -> AccountId {
