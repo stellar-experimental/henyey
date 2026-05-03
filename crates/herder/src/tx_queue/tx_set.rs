@@ -534,7 +534,7 @@ impl PreparedTransactionSet {
         soroban_info: Option<&henyey_ledger::SorobanNetworkInfo>,
         fee_balance_provider: Option<&dyn FeeBalanceProvider>,
         account_provider: Option<&dyn AccountProvider>,
-    ) -> bool {
+    ) -> std::result::Result<(), String> {
         use henyey_common::protocol::{protocol_version_starts_from, ProtocolVersion};
 
         let is_v20_plus =
@@ -558,15 +558,15 @@ impl PreparedTransactionSet {
             }
             (true, false) => {
                 // Generalized set on pre-V20: reject
-                false
+                Err("generalized set on pre-V20".into())
             }
             (false, true) => {
                 // Legacy set on V20+: reject
-                false
+                Err("legacy set on V20+".into())
             }
             (false, false) => {
                 // Legacy set on pre-V20: already validated by prepare_for_apply
-                true
+                Ok(())
             }
         }
     }
@@ -1868,14 +1868,16 @@ mod tests {
         let soroban_info = henyey_ledger::SorobanNetworkInfo::default();
 
         assert!(
-            prepared.check_valid(
-                &header,
-                0,
-                NetworkId::testnet(),
-                Some(&soroban_info),
-                None,
-                None
-            ),
+            prepared
+                .check_valid(
+                    &header,
+                    0,
+                    NetworkId::testnet(),
+                    Some(&soroban_info),
+                    None,
+                    None
+                )
+                .is_ok(),
             "empty generalized set on V22 should pass check_valid"
         );
     }
@@ -1900,7 +1902,9 @@ mod tests {
         header.ext = LedgerHeaderExt::V0;
 
         assert!(
-            !prepared.check_valid(&header, 0, NetworkId::testnet(), None, None, None),
+            prepared
+                .check_valid(&header, 0, NetworkId::testnet(), None, None, None)
+                .is_err(),
             "generalized set on protocol 19 should be rejected by check_valid"
         );
     }
@@ -1920,7 +1924,9 @@ mod tests {
         header.ext = LedgerHeaderExt::V0;
 
         assert!(
-            !prepared.check_valid(&header, 0, NetworkId::testnet(), None, None, None),
+            prepared
+                .check_valid(&header, 0, NetworkId::testnet(), None, None, None)
+                .is_err(),
             "legacy set on protocol 24 should be rejected by check_valid"
         );
     }
@@ -1941,7 +1947,9 @@ mod tests {
         header.ext = LedgerHeaderExt::V0;
 
         assert!(
-            prepared.check_valid(&header, 0, NetworkId::testnet(), None, None, None),
+            prepared
+                .check_valid(&header, 0, NetworkId::testnet(), None, None, None)
+                .is_ok(),
             "legacy set on protocol 19 should pass check_valid"
         );
     }

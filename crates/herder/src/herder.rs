@@ -2529,7 +2529,32 @@ impl Herder {
         {
             TransactionSet::new_legacy(previous_hash, vec![])
         } else {
+            // Construct NominationBuildContext from the snapshot header so the
+            // build path uses the same ledger state as self-validation (#2319).
+            let network_id = NetworkId(self.scp_driver.network_id());
+            let ledger_flags = match &header.ext {
+                stellar_xdr::curr::LedgerHeaderExt::V0 => 0u32,
+                stellar_xdr::curr::LedgerHeaderExt::V1(v1) => v1.flags,
+            };
+            let mut validation_ctx = crate::tx_set_utils::TxSetValidationContext::new(
+                header.ledger_seq,
+                header.scp_value.close_time.0,
+                header.base_fee,
+                header.base_reserve,
+                header.ledger_version,
+                network_id,
+                ledger_flags,
+            );
+            if let Some(info) = soroban_info.as_ref() {
+                validation_ctx.max_contract_size_bytes = Some(info.max_contract_size);
+            }
+            let nomination_ctx = crate::tx_queue::NominationBuildContext {
+                base_fee: header.base_fee as i64,
+                protocol_version: header.ledger_version,
+                validation_ctx,
+            };
             self.tx_queue.build_generalized_tx_set_with_providers(
+                crate::tx_queue::BuildContext::Nomination(&nomination_ctx),
                 previous_hash,
                 max_txs,
                 starting_seq.as_ref(),
@@ -2682,7 +2707,7 @@ impl Herder {
         soroban_info: Option<&henyey_ledger::SorobanNetworkInfo>,
         snapshot_providers: Option<&crate::tx_queue::SnapshotProviders>,
     ) -> Option<()> {
-        if !self.self_validate_nomination_tx_set(
+        if let Err(reason) = self.self_validate_nomination_tx_set(
             tx_set,
             header,
             close_time_offset,
@@ -2695,6 +2720,7 @@ impl Herder {
                 previous_hash = %previous_hash,
                 close_time_offset,
                 ledger_seq = header.ledger_seq,
+                %reason,
                 "Self-validation rejected the freshly-built nomination tx \
                  set; aborting nomination (defense-in-depth #2113)"
             );
@@ -2749,9 +2775,9 @@ impl Herder {
         close_time_offset: u64,
         soroban_info: Option<&henyey_ledger::SorobanNetworkInfo>,
         snapshot_providers: Option<&crate::tx_queue::SnapshotProviders>,
-    ) -> bool {
+    ) -> std::result::Result<(), String> {
         if !protocol_version_starts_from(header.ledger_version, ProtocolVersion::V20) {
-            return true;
+            return Ok(());
         }
 
         // Step 1: XDR-structure / sort-order / cross-phase duplicate-source
@@ -2761,13 +2787,7 @@ impl Herder {
         let prepared = match tx_set.prepare_for_apply(NetworkId(self.scp_driver.network_id())) {
             Ok(prepared) => prepared,
             Err(e) => {
-                warn!(
-                    tx_set_hash = %tx_set.hash(),
-                    error = %e,
-                    "build_nomination_value: prepare_for_apply rejected the freshly-built \
-                     tx set (construction bug)"
-                );
-                return false;
+                return Err(format!("prepare_for_apply failed: {}", e));
             }
         };
 
@@ -2776,25 +2796,20 @@ impl Herder {
         // a hash that disagrees with the canonical XDR encoding — analogous
         // to stellar-core's per-phase tx-count check after the roundtrip.
         if prepared.hash() != tx_set.hash() {
-            warn!(
-                builder_hash = %tx_set.hash(),
-                prepared_hash = %prepared.hash(),
-                "build_nomination_value: prepare_for_apply hash differs from builder \
-                 hash; rejecting (construction bug)"
-            );
-            return false;
+            return Err(format!(
+                "prepare_for_apply hash {} differs from builder hash {}",
+                prepared.hash(),
+                tx_set.hash()
+            ));
         }
 
         // Builder invariant: on protocol >= V20, we should always produce
         // a generalized tx set. A legacy set here indicates a construction bug.
         if !prepared.is_generalized() {
-            warn!(
-                tx_set_hash = %tx_set.hash(),
-                ledger_version = header.ledger_version,
-                "build_nomination_value: built tx set is not generalized on \
-                 protocol >= 20; rejecting (construction bug)"
-            );
-            return false;
+            return Err(format!(
+                "built tx set is not generalized on protocol {}",
+                header.ledger_version
+            ));
         }
 
         // Step 2: content validation against the same snapshot used to build
@@ -8206,7 +8221,9 @@ mod advance_tracking_slot_tests {
         header.ledger_version = 22;
         let soroban_info = henyey_ledger::SorobanNetworkInfo::default();
         assert!(
-            herder.self_validate_nomination_tx_set(&tx_set, &header, 0, Some(&soroban_info), None,),
+            herder
+                .self_validate_nomination_tx_set(&tx_set, &header, 0, Some(&soroban_info), None,)
+                .is_ok(),
             "empty 2-phase generalized V0 tx set on v22 must pass self-validation"
         );
     }
@@ -8220,7 +8237,9 @@ mod advance_tracking_slot_tests {
         let tx_set = TransactionSet::new_legacy(Hash256::ZERO, vec![]);
         let header = v24_header();
         assert!(
-            !herder.self_validate_nomination_tx_set(&tx_set, &header, 0, None, None),
+            herder
+                .self_validate_nomination_tx_set(&tx_set, &header, 0, None, None)
+                .is_err(),
             "legacy tx set on v24 must be rejected by self-validation"
         );
     }
@@ -8236,7 +8255,9 @@ mod advance_tracking_slot_tests {
         let tx_set = empty_n_phase_generalized_tx_set(3);
         let header = v24_header();
         assert!(
-            !herder.self_validate_nomination_tx_set(&tx_set, &header, 0, None, None),
+            herder
+                .self_validate_nomination_tx_set(&tx_set, &header, 0, None, None)
+                .is_err(),
             "3-phase generalized tx set must be rejected by prepare_for_apply"
         );
     }
@@ -8251,7 +8272,9 @@ mod advance_tracking_slot_tests {
         let mut header = v24_header();
         header.ledger_version = 19;
         assert!(
-            herder.self_validate_nomination_tx_set(&tx_set, &header, 0, None, None),
+            herder
+                .self_validate_nomination_tx_set(&tx_set, &header, 0, None, None)
+                .is_ok(),
             "self-validation must be skipped on protocol < 20"
         );
     }
@@ -8505,8 +8528,9 @@ mod advance_tracking_slot_tests {
         let soroban_info = make_test_soroban_info();
 
         assert!(
-            !herder
-                .self_validate_nomination_tx_set(&tx_set, &header, 0, Some(&soroban_info), None,),
+            herder
+                .self_validate_nomination_tx_set(&tx_set, &header, 0, Some(&soroban_info), None,)
+                .is_err(),
             "tx set with same source in classic and Soroban phases must be rejected"
         );
     }
@@ -8528,8 +8552,174 @@ mod advance_tracking_slot_tests {
         let soroban_info = make_test_soroban_info();
 
         assert!(
-            herder.self_validate_nomination_tx_set(&tx_set, &header, 0, Some(&soroban_info), None,),
+            herder
+                .self_validate_nomination_tx_set(&tx_set, &header, 0, Some(&soroban_info), None,)
+                .is_ok(),
             "tx set with distinct sources across phases must pass self-validation"
+        );
+    }
+
+    /// Regression test for #2319: when the queue's validation context has a
+    /// STALE base_fee (from ledger N-1) but the snapshot header has an UPDATED
+    /// base_fee (ledger N), the build path must use the snapshot values via
+    /// NominationBuildContext. Without this fix, `check_fee_map` rejects the
+    /// freshly-built tx set because the component base_fee < lcl base_fee.
+    #[test]
+    fn test_nomination_build_context_prevents_stale_fee_divergence() {
+        use crate::tx_queue::{BuildContext, NominationBuildContext, TransactionQueue};
+        use crate::tx_set_utils::TxSetValidationContext;
+        use henyey_common::NetworkId;
+        use std::time::Duration;
+        use stellar_xdr::curr::{
+            AccountId, DecoratedSignature, Hash, LedgerHeader, LedgerHeaderExt, Memo, MuxedAccount,
+            Operation, OperationBody, Preconditions, PublicKey, SequenceNumber, SignatureHint,
+            StellarValue, StellarValueExt, TimePoint, Transaction, TransactionEnvelope,
+            TransactionExt, TransactionV1Envelope, Uint256, VecM,
+        };
+
+        // Queue validation context: base_fee=100 (stale, from ledger N-1)
+        let queue = TransactionQueue::with_defaults();
+        queue.update_validation_context(
+            9,   // ledger_seq (N-1)
+            100, // close_time
+            24,  // protocol_version
+            100, // base_fee (stale!)
+            5_000_000,
+            0,
+            Duration::from_secs(5),
+        );
+
+        // Add a single transaction with fee=200 (above both old and new base_fee)
+        let source = MuxedAccount::Ed25519(Uint256([1u8; 32]));
+        let tx = Transaction {
+            source_account: source,
+            fee: 200,
+            seq_num: SequenceNumber(1),
+            cond: Preconditions::None,
+            memo: Memo::None,
+            operations: vec![Operation {
+                source_account: None,
+                body: OperationBody::CreateAccount(stellar_xdr::curr::CreateAccountOp {
+                    destination: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([255u8; 32]))),
+                    starting_balance: 1_000_000_000,
+                }),
+            }]
+            .try_into()
+            .unwrap(),
+            ext: TransactionExt::V0,
+        };
+        let env = TransactionEnvelope::Tx(TransactionV1Envelope {
+            tx,
+            signatures: vec![DecoratedSignature {
+                hint: SignatureHint([0u8; 4]),
+                signature: stellar_xdr::curr::Signature(vec![0u8; 64].try_into().unwrap()),
+            }]
+            .try_into()
+            .unwrap(),
+        });
+        queue.try_add(env);
+
+        // Snapshot header: base_fee=200 (updated, from ledger N)
+        let header = LedgerHeader {
+            ledger_version: 24,
+            previous_ledger_hash: Hash([0u8; 32]),
+            scp_value: StellarValue {
+                tx_set_hash: Hash([0u8; 32]),
+                close_time: TimePoint(100),
+                upgrades: VecM::default(),
+                ext: StellarValueExt::Basic,
+            },
+            tx_set_result_hash: Hash([0u8; 32]),
+            bucket_list_hash: Hash([0u8; 32]),
+            ledger_seq: 10,
+            total_coins: 1_000_000_000_000,
+            fee_pool: 0,
+            inflation_seq: 0,
+            id_pool: 0,
+            base_fee: 200, // UPDATED base_fee (higher than stale 100)
+            base_reserve: 5_000_000,
+            max_tx_set_size: 100,
+            skip_list: [
+                Hash([0u8; 32]),
+                Hash([0u8; 32]),
+                Hash([0u8; 32]),
+                Hash([0u8; 32]),
+            ],
+            ext: LedgerHeaderExt::V0,
+        };
+
+        let network_id = NetworkId::testnet();
+        let soroban_info = henyey_ledger::SorobanNetworkInfo::default();
+
+        // Path A: BuildContext::Queue — uses stale base_fee=100.
+        // Self-validation against header (base_fee=200) must FAIL.
+        let tx_set_stale = queue.build_generalized_tx_set_with_providers(
+            BuildContext::Queue,
+            Hash256::ZERO,
+            100,
+            None,
+            0,
+            None,
+            None,
+        );
+        assert!(
+            tx_set_stale.len() > 0,
+            "tx set should contain the transaction"
+        );
+        let prepared_stale = tx_set_stale
+            .prepare_for_apply(network_id)
+            .expect("prepare_for_apply should succeed");
+        let result_stale =
+            prepared_stale.check_valid(&header, 0, network_id, Some(&soroban_info), None, None);
+        assert!(
+            result_stale.is_err(),
+            "Stale base_fee (100) should fail check_fee_map against header base_fee (200), \
+             but got Ok. This would be the #2319 bug."
+        );
+        let err_msg = result_stale.unwrap_err();
+        assert!(
+            err_msg.contains("fee"),
+            "Error should mention fee map: {err_msg}"
+        );
+
+        // Path B: BuildContext::Nomination — uses snapshot base_fee=200.
+        // Self-validation against the same header must PASS.
+        let nomination_ctx = NominationBuildContext {
+            base_fee: header.base_fee as i64,
+            protocol_version: header.ledger_version,
+            validation_ctx: TxSetValidationContext::new(
+                header.ledger_seq,
+                header.scp_value.close_time.0,
+                header.base_fee,
+                header.base_reserve,
+                header.ledger_version,
+                network_id,
+                0, // ledger_flags
+            ),
+        };
+        let tx_set_fixed = queue.build_generalized_tx_set_with_providers(
+            BuildContext::Nomination(&nomination_ctx),
+            Hash256::ZERO,
+            100,
+            None,
+            0,
+            None,
+            None,
+        );
+        assert!(
+            tx_set_fixed.len() > 0,
+            "tx set should contain the transaction"
+        );
+        let prepared_fixed = tx_set_fixed
+            .prepare_for_apply(network_id)
+            .expect("prepare_for_apply should succeed");
+        let result_fixed =
+            prepared_fixed.check_valid(&header, 0, network_id, Some(&soroban_info), None, None);
+        assert!(
+            result_fixed.is_ok(),
+            "Nomination context (base_fee=200) should pass check_fee_map against header \
+             (base_fee=200), but got: {:?}",
+            result_fixed.unwrap_err()
         );
     }
 

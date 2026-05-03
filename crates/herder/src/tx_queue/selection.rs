@@ -6,6 +6,23 @@
 
 use super::*;
 
+/// All ledger-state inputs for building a nomination tx set, derived from the
+/// snapshot header. Bundles all header-derived state so the build path cannot
+/// accidentally read stale queue state.
+pub struct NominationBuildContext {
+    pub base_fee: i64,
+    pub protocol_version: u32,
+    pub validation_ctx: crate::tx_set_utils::TxSetValidationContext,
+}
+
+/// Where the builder sources its ledger-state inputs.
+pub enum BuildContext<'a> {
+    /// Nomination path: all fields from snapshot header.
+    Nomination(&'a NominationBuildContext),
+    /// Queue/test path: reads from self.validation_context (single consistent read).
+    Queue,
+}
+
 type AccountTransactions = HashMap<Vec<u8>, Vec<QueuedTransaction>>;
 
 fn seed_account_queue(
@@ -55,8 +72,9 @@ impl TransactionQueue {
         previous_ledger_hash: Hash256,
         max_ops: usize,
     ) -> TransactionSet {
+        let ledger_version = self.validation_context.read().protocol_version;
         let SelectedTxs { transactions, .. } =
-            self.select_transactions_with_starting_seq(max_ops, None);
+            self.select_transactions_with_starting_seq(max_ops, None, ledger_version);
         let envelopes: Vec<TransactionEnvelope> = transactions
             .into_iter()
             .map(|htx| htx.into_envelope())
@@ -70,8 +88,9 @@ impl TransactionQueue {
         max_ops: usize,
         starting_seq: Option<&HashMap<Vec<u8>, i64>>,
     ) -> TransactionSet {
+        let ledger_version = self.validation_context.read().protocol_version;
         let SelectedTxs { transactions, .. } =
-            self.select_transactions_with_starting_seq(max_ops, starting_seq);
+            self.select_transactions_with_starting_seq(max_ops, starting_seq, ledger_version);
         let envelopes: Vec<TransactionEnvelope> = transactions
             .into_iter()
             .map(|htx| htx.into_envelope())
@@ -98,6 +117,7 @@ impl TransactionQueue {
         close_time_offset: u64,
     ) -> TransactionSet {
         self.build_generalized_tx_set_with_providers(
+            BuildContext::Queue,
             previous_ledger_hash,
             max_ops,
             starting_seq,
@@ -108,8 +128,10 @@ impl TransactionQueue {
     }
 
     /// Build a GeneralizedTransactionSet with caller-supplied snapshot providers.
+    #[allow(clippy::too_many_arguments)]
     pub fn build_generalized_tx_set_with_providers(
         &self,
+        build_ctx: BuildContext<'_>,
         previous_ledger_hash: Hash256,
         max_ops: usize,
         starting_seq: Option<&HashMap<Vec<u8>, i64>>,
@@ -119,13 +141,40 @@ impl TransactionQueue {
     ) -> TransactionSet {
         use stellar_xdr::curr::GeneralizedTransactionSet;
 
+        // Derive base_fee, protocol_version, and validation context from the
+        // build context. For Nomination, these come from the snapshot header.
+        // For Queue, we read self.validation_context ONCE to prevent torn reads.
+        let (base_fee, protocol_version, trim_ctx) = match &build_ctx {
+            BuildContext::Nomination(ctx) => (
+                ctx.base_fee,
+                ctx.protocol_version,
+                Some(ctx.validation_ctx.clone()),
+            ),
+            BuildContext::Queue => {
+                let vc = self.validation_context.read();
+                (
+                    vc.base_fee as i64,
+                    vc.protocol_version,
+                    Some(crate::tx_set_utils::TxSetValidationContext {
+                        next_ledger_seq: vc.ledger_seq + 1,
+                        close_time: vc.close_time,
+                        base_fee: vc.base_fee,
+                        base_reserve: vc.base_reserve,
+                        protocol_version: vc.protocol_version,
+                        network_id: self.config.network_id,
+                        ledger_flags: vc.ledger_flags,
+                        max_contract_size_bytes: vc.max_contract_size_bytes,
+                    }),
+                )
+            }
+        };
+
         let SelectedTxs {
             transactions,
             soroban_limited,
             dex_limited,
             classic_limited,
-        } = self.select_transactions_with_starting_seq(max_ops, starting_seq);
-        let base_fee = self.validation_context.read().base_fee as i64;
+        } = self.select_transactions_with_starting_seq(max_ops, starting_seq, protocol_version);
 
         // Classify into classic/soroban using envelope helpers (no TransactionFrame).
         let mut classic_txs = Vec::new();
@@ -167,19 +216,7 @@ impl TransactionQueue {
             override_account_provider.or(queue_account.as_deref());
 
         let (classic_txs, mut soroban_txs) = if fee_ref.is_some() || account_ref.is_some() {
-            let ctx = {
-                let vc = self.validation_context.read();
-                crate::tx_set_utils::TxSetValidationContext {
-                    next_ledger_seq: vc.ledger_seq + 1,
-                    close_time: vc.close_time,
-                    base_fee: vc.base_fee,
-                    base_reserve: vc.base_reserve,
-                    protocol_version: vc.protocol_version,
-                    network_id: self.config.network_id,
-                    ledger_flags: vc.ledger_flags,
-                    max_contract_size_bytes: vc.max_contract_size_bytes,
-                }
-            };
+            let ctx = trim_ctx.expect("trim_ctx always Some");
             let close_time_bounds = crate::tx_set_utils::CloseTimeBounds::with_offsets(
                 close_time_offset,
                 close_time_offset,
@@ -225,13 +262,15 @@ impl TransactionQueue {
 
     #[cfg(test)]
     pub(super) fn select_transactions(&self, max_ops: usize) -> SelectedTxs {
-        self.select_transactions_with_starting_seq(max_ops, None)
+        let ledger_version = self.validation_context.read().protocol_version;
+        self.select_transactions_with_starting_seq(max_ops, None, ledger_version)
     }
 
     fn select_transactions_with_starting_seq(
         &self,
         max_ops: usize,
         starting_seq: Option<&HashMap<Vec<u8>, i64>>,
+        ledger_version: u32,
     ) -> SelectedTxs {
         let seed = if cfg!(test) {
             0
@@ -304,7 +343,6 @@ impl TransactionQueue {
         let max_ops = u32::try_from(max_ops).unwrap_or(u32::MAX);
         let use_classic_bytes =
             self.config.max_classic_bytes.is_some() || self.config.max_dex_bytes.is_some();
-        let ledger_version = self.validation_context.read().protocol_version;
 
         let (classic_accounts, soroban_accounts) = self.split_layered_accounts_by_phase(&layered);
 

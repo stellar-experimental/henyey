@@ -25,7 +25,7 @@ use stellar_xdr::curr::{
     AccountEntry, AccountId, GeneralizedTransactionSet, LedgerHeader, Preconditions, SignerKey,
     TransactionEnvelope, TransactionPhase, TxSetComponent,
 };
-use tracing::{debug, warn};
+use tracing::debug;
 
 use crate::tx_queue::{AccountProvider, FeeBalanceProvider};
 
@@ -1575,21 +1575,19 @@ pub(crate) fn check_tx_set_valid(
     soroban_info: Option<&SorobanNetworkInfo>,
     fee_balance_provider: Option<&dyn FeeBalanceProvider>,
     account_provider: Option<&dyn AccountProvider>,
-) -> bool {
+) -> Result<(), String> {
     let GeneralizedTransactionSet::V1(v1) = gen_tx_set;
 
     // Verify generalized tx set is expected for this protocol
     let need_generalized =
         protocol_version_starts_from(lcl_header.ledger_version, ProtocolVersion::V20);
     if !need_generalized {
-        debug!("Got bad txSet: generalized tx set not expected for protocol < 20");
-        return false;
+        return Err("generalized tx set not expected for protocol < 20".into());
     }
 
     // Generalized sets should always have 2 phases
     if v1.phases.len() != 2 {
-        debug!("Got bad txSet: expected 2 phases, got {}", v1.phases.len());
-        return false;
+        return Err(format!("expected 2 phases, got {}", v1.phases.len()));
     }
 
     // Cross-phase fee map handling (Protocol 26+)
@@ -1624,7 +1622,10 @@ pub(crate) fn check_tx_set_valid(
 
         // 1. Check fee map
         if !check_fee_map(phase, lcl_header.base_fee) {
-            return false;
+            return Err(format!(
+                "check_fee_map: phase {} component base fee < lcl base fee {}",
+                phase_idx, lcl_header.base_fee
+            ));
         }
 
         let is_soroban = phase_idx == 1;
@@ -1633,11 +1634,7 @@ pub(crate) fn check_tx_set_valid(
         let phase_txs = collect_phase_txs(phase);
         for tx in &phase_txs {
             if is_soroban_envelope(tx) != is_soroban {
-                debug!(
-                    "Got bad txSet: invalid phase {} transaction type",
-                    phase_idx
-                );
-                return false;
+                return Err(format!("invalid phase {} transaction type", phase_idx));
             }
         }
 
@@ -1645,15 +1642,20 @@ pub(crate) fn check_tx_set_valid(
         if is_soroban {
             if let Some(info) = soroban_info {
                 if !check_valid_soroban(phase, lcl_header, info) {
-                    return false;
+                    return Err(format!(
+                        "check_valid_soroban: phase {} soroban validation failed",
+                        phase_idx
+                    ));
                 }
             } else {
                 // Soroban phase present but no network config — reject.
-                warn!("check_tx_set_valid: Soroban phase present but soroban config unavailable");
-                return false;
+                return Err("soroban phase present but soroban config unavailable".into());
             }
         } else if !check_valid_classic(phase, lcl_header.max_tx_set_size) {
-            return false;
+            return Err(format!(
+                "check_valid_classic: phase {} classic validation failed",
+                phase_idx
+            ));
         }
 
         // 4. Per-TX content validation (time bounds, fees, etc.)
@@ -1668,16 +1670,15 @@ pub(crate) fn check_tx_set_valid(
             &mut account_fee_map,
         );
         if !invalid.is_empty() {
-            debug!(
-                "Got bad txSet: {} invalid transactions in phase {}",
+            return Err(format!(
+                "{} invalid transactions in phase {}",
                 invalid.len(),
                 phase_idx
-            );
-            return false;
+            ));
         }
     }
 
-    true
+    Ok(())
 }
 
 #[cfg(test)]
@@ -3154,7 +3155,7 @@ mod tests {
             None,
         );
         assert!(
-            !result,
+            result.is_err(),
             "check_tx_set_valid should reject Soroban tx-set when config unavailable"
         );
     }
@@ -3187,7 +3188,7 @@ mod tests {
             Some(&account_provider),
         );
         assert!(
-            !result,
+            result.is_err(),
             "check_tx_set_valid should reject tx-set with bad sequence number"
         );
     }
@@ -3243,7 +3244,7 @@ mod tests {
         );
         // stellar-core would reject unsigned transactions in a tx-set.
         assert!(
-            !result,
+            result.is_err(),
             "check_tx_set_valid should reject tx-set with unsigned transactions"
         );
     }

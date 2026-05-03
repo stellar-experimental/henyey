@@ -694,16 +694,18 @@ impl ScpDriver {
                 true
             } else {
                 let soroban_info = lm.soroban_network_info();
-                prepared.check_valid(
-                    &lcl_header,
-                    close_time_offset,
-                    network_id,
-                    soroban_info.as_ref(),
-                    None, // fee balance checks skipped in SCP path — snapshot
-                    // staleness causes false rejects
-                    None, // account validation skipped in SCP path — snapshot
-                          // staleness causes false rejects
-                )
+                prepared
+                    .check_valid(
+                        &lcl_header,
+                        close_time_offset,
+                        network_id,
+                        soroban_info.as_ref(),
+                        None, // fee balance checks skipped in SCP path — snapshot
+                        // staleness causes false rejects
+                        None, // account validation skipped in SCP path — snapshot
+                              // staleness causes false rejects
+                    )
+                    .is_ok()
             }
         } else {
             // No ledger manager — can't validate, assume valid
