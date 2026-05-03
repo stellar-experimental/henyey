@@ -1369,7 +1369,7 @@ fn validate_footprint_key(
     }
 
     // XDR key size check
-    let key_size = henyey_common::xdr_encoded_len_u32(key) as u32;
+    let key_size = henyey_common::xdr_encoded_len_u32(key);
     if key_size > limits.max_contract_data_key_size_bytes {
         return Err(PreSeqNumError::SorobanInvalid(format!(
             "footprint key size {} exceeds limit {}",
