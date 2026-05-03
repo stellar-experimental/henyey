@@ -1908,4 +1908,184 @@ mod tests {
             "unexpected error message: {err}"
         );
     }
+
+    /// Regression test: replay path exercises prepend_fee_event with emit_classic_events enabled.
+    ///
+    /// Verifies that replay_ledger_with_execution succeeds (no panic) when processing
+    /// a Soroban ExtendFootprintTtl transaction with emit_classic_events: true.
+    /// Both the online (close_ledger) and replay paths share the same prepend_fee_event
+    /// logic; this test ensures the replay code path doesn't diverge.
+    #[tokio::test]
+    async fn test_replay_fee_event_code_path_executes() {
+        use henyey_common::NetworkId;
+        use henyey_crypto::{sign_hash, SecretKey};
+        use stellar_xdr::curr::{
+            AccountEntry, AccountEntryExt, AccountId, BucketListType, ContractCodeEntry,
+            ContractCodeEntryExt, DecoratedSignature, ExtendFootprintTtlOp, ExtensionPoint,
+            LedgerFootprint, LedgerKeyContractCode, Memo, MuxedAccount, Operation, OperationBody,
+            Preconditions, SequenceNumber, Signature as XdrSignature, SignatureHint,
+            SorobanResources, SorobanTransactionData, SorobanTransactionDataExt, Thresholds,
+            Transaction, TransactionEnvelope, TransactionExt, TransactionSet,
+            TransactionV1Envelope, TtlEntry, Uint256, VecM,
+        };
+
+        let network_id = NetworkId::testnet();
+        let secret = SecretKey::from_seed(&[1u8; 32]);
+        let source_id = AccountId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(Uint256(
+            *secret.public_key().as_bytes(),
+        )));
+
+        // Build bucket list with soroban config + required entries
+        let mut bucket_list = henyey_ledger::new_bucket_list_with_soroban_config();
+        let source_entry = LedgerEntry {
+            last_modified_ledger_seq: 0,
+            data: LedgerEntryData::Account(AccountEntry {
+                account_id: source_id.clone(),
+                balance: 20_000_000,
+                seq_num: SequenceNumber(1),
+                num_sub_entries: 0,
+                inflation_dest: None,
+                flags: 0,
+                home_domain: Default::default(),
+                thresholds: Thresholds([1, 0, 0, 0]),
+                signers: VecM::default(),
+                ext: AccountEntryExt::V0,
+            }),
+            ext: LedgerEntryExt::V0,
+        };
+
+        let code_hash = Hash([9u8; 32]);
+        let contract_code_entry = LedgerEntry {
+            last_modified_ledger_seq: 0,
+            data: LedgerEntryData::ContractCode(ContractCodeEntry {
+                ext: ContractCodeEntryExt::V0,
+                hash: code_hash.clone(),
+                code: stellar_xdr::curr::BytesM::try_from(vec![1u8, 2u8, 3u8]).unwrap(),
+            }),
+            ext: LedgerEntryExt::V0,
+        };
+
+        let contract_key = LedgerKey::ContractCode(LedgerKeyContractCode {
+            hash: code_hash.clone(),
+        });
+        let key_hash: Hash = henyey_common::Hash256::hash_xdr(&contract_key).into();
+        let ttl_entry = LedgerEntry {
+            last_modified_ledger_seq: 0,
+            data: LedgerEntryData::Ttl(TtlEntry {
+                key_hash,
+                live_until_ledger_seq: 10,
+            }),
+            ext: LedgerEntryExt::V0,
+        };
+
+        bucket_list
+            .add_batch(
+                1,
+                25,
+                BucketListType::Live,
+                vec![source_entry, contract_code_entry, ttl_entry],
+                vec![],
+                vec![],
+            )
+            .expect("add_batch");
+
+        // Build Soroban ExtendFootprintTtl transaction
+        let soroban_data = SorobanTransactionData {
+            ext: SorobanTransactionDataExt::V0,
+            resources: SorobanResources {
+                footprint: LedgerFootprint {
+                    read_only: vec![contract_key].try_into().unwrap(),
+                    read_write: VecM::default(),
+                },
+                instructions: 0,
+                disk_read_bytes: 100,
+                write_bytes: 0,
+            },
+            resource_fee: 100_000,
+        };
+
+        let tx = Transaction {
+            source_account: MuxedAccount::Ed25519(Uint256(*secret.public_key().as_bytes())),
+            fee: 110_000,
+            seq_num: SequenceNumber(2),
+            cond: Preconditions::None,
+            memo: Memo::None,
+            operations: vec![Operation {
+                source_account: None,
+                body: OperationBody::ExtendFootprintTtl(ExtendFootprintTtlOp {
+                    ext: ExtensionPoint::V0,
+                    extend_to: 100,
+                }),
+            }]
+            .try_into()
+            .unwrap(),
+            ext: TransactionExt::V1(soroban_data),
+        };
+
+        let mut envelope = TransactionEnvelope::Tx(TransactionV1Envelope {
+            tx,
+            signatures: VecM::default(),
+        });
+        // Sign the transaction
+        let frame =
+            henyey_tx::TransactionFrame::from_owned_with_network(envelope.clone(), network_id);
+        let hash = frame.hash(&network_id).expect("tx hash");
+        let signature = sign_hash(&secret, &hash);
+        let public_key = secret.public_key();
+        let pk_bytes = public_key.as_bytes();
+        let hint = SignatureHint([pk_bytes[28], pk_bytes[29], pk_bytes[30], pk_bytes[31]]);
+        let decorated = DecoratedSignature {
+            hint,
+            signature: XdrSignature(signature.0.to_vec().try_into().unwrap()),
+        };
+        if let TransactionEnvelope::Tx(ref mut env) = envelope {
+            env.signatures = vec![decorated].try_into().unwrap();
+        }
+
+        // Set up replay context with emit_classic_events: true
+        let mut header = make_test_header(2);
+        header.ledger_version = 25;
+
+        let tx_set = TransactionSetVariant::Classic(TransactionSet {
+            previous_ledger_hash: Hash([0u8; 32]),
+            txs: vec![envelope].try_into().unwrap(),
+        });
+
+        let config = ReplayConfig {
+            verify_results: false,
+            verify_bucket_list: false,
+            verify_header_hash: false,
+            emit_classic_events: true,
+            backfill_stellar_asset_events: false,
+            run_eviction: false,
+            eviction_settings: StateArchivalSettings::default(),
+            wait_for_publish: false,
+        };
+
+        let mut hot_archive = HotArchiveBucketList::new();
+
+        let result = replay_ledger_with_execution(
+            &header,
+            &tx_set,
+            ReplayExecutionContext {
+                bucket_list: &mut bucket_list,
+                hot_archive_bucket_list: &mut hot_archive,
+                network_id: &network_id,
+                config: &config,
+                expected_tx_results: None,
+                eviction_iterator: None,
+                module_cache: None,
+                soroban_state_size: None,
+                prev_id_pool: 0,
+                offer_entries: None,
+            },
+        );
+
+        // The replay should succeed without panic — the fee event code path is exercised
+        assert!(
+            result.is_ok(),
+            "replay_ledger_with_execution should succeed with emit_classic_events: true, got: {:?}",
+            result.err()
+        );
+    }
 }
