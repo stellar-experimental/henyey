@@ -25,6 +25,8 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use stellar_xdr::curr::StellarMessage;
+
 /// Atomic counter for simple metrics.
 #[derive(Debug, Default)]
 pub struct Counter {
@@ -234,6 +236,179 @@ pub struct TimerSnapshot {
     pub max: Duration,
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// OverlayMessageKind — canonical message classifier for metrics and logging
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Classifies `StellarMessage` variants for per-type send metrics.
+///
+/// Each variant corresponds to exactly one XDR `StellarMessage` discriminant.
+/// Intentionally richer than stellar-core's 19 grouped meters (which merge
+/// `TX_SET`/`GENERALIZED_TX_SET` and `SEND_MORE`/`SEND_MORE_EXTENDED`). 21
+/// labels are trivially aggregable in PromQL.
+///
+/// # Counting semantics
+///
+/// Counters increment **after** successful wire send. On connection failure,
+/// no increment occurs. This differs from stellar-core which counts pre-send
+/// (`Peer.cpp:830`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum OverlayMessageKind {
+    ErrorMsg = 0,
+    Hello = 1,
+    Auth = 2,
+    DontHave = 3,
+    Peers = 4,
+    GetTxSet = 5,
+    TxSet = 6,
+    GeneralizedTxSet = 7,
+    Transaction = 8,
+    GetScpQuorumset = 9,
+    ScpQuorumset = 10,
+    ScpMessage = 11,
+    GetScpState = 12,
+    SendMore = 13,
+    SendMoreExtended = 14,
+    FloodAdvert = 15,
+    FloodDemand = 16,
+    TimeSlicedSurveyRequest = 17,
+    TimeSlicedSurveyResponse = 18,
+    TimeSlicedSurveyStartCollecting = 19,
+    TimeSlicedSurveyStopCollecting = 20,
+}
+
+impl OverlayMessageKind {
+    /// All variants in discriminant order. Single source of truth for
+    /// iteration, counter allocation, and Prometheus label generation.
+    pub const ALL: [Self; 21] = [
+        Self::ErrorMsg,
+        Self::Hello,
+        Self::Auth,
+        Self::DontHave,
+        Self::Peers,
+        Self::GetTxSet,
+        Self::TxSet,
+        Self::GeneralizedTxSet,
+        Self::Transaction,
+        Self::GetScpQuorumset,
+        Self::ScpQuorumset,
+        Self::ScpMessage,
+        Self::GetScpState,
+        Self::SendMore,
+        Self::SendMoreExtended,
+        Self::FloodAdvert,
+        Self::FloodDemand,
+        Self::TimeSlicedSurveyRequest,
+        Self::TimeSlicedSurveyResponse,
+        Self::TimeSlicedSurveyStartCollecting,
+        Self::TimeSlicedSurveyStopCollecting,
+    ];
+
+    /// Number of variants (derived from `ALL`).
+    pub const COUNT: usize = Self::ALL.len();
+
+    /// Prometheus metric label (lowercase snake_case).
+    pub const fn label(&self) -> &'static str {
+        match self {
+            Self::ErrorMsg => "error",
+            Self::Hello => "hello",
+            Self::Auth => "auth",
+            Self::DontHave => "dont_have",
+            Self::Peers => "peers",
+            Self::GetTxSet => "get_tx_set",
+            Self::TxSet => "tx_set",
+            Self::GeneralizedTxSet => "generalized_tx_set",
+            Self::Transaction => "transaction",
+            Self::GetScpQuorumset => "get_scp_qset",
+            Self::ScpQuorumset => "scp_qset",
+            Self::ScpMessage => "scp_message",
+            Self::GetScpState => "get_scp_state",
+            Self::SendMore => "send_more",
+            Self::SendMoreExtended => "send_more_extended",
+            Self::FloodAdvert => "flood_advert",
+            Self::FloodDemand => "flood_demand",
+            Self::TimeSlicedSurveyRequest => "time_sliced_survey_request",
+            Self::TimeSlicedSurveyResponse => "time_sliced_survey_response",
+            Self::TimeSlicedSurveyStartCollecting => "time_sliced_survey_start_collecting",
+            Self::TimeSlicedSurveyStopCollecting => "time_sliced_survey_stop_collecting",
+        }
+    }
+
+    /// Uppercase wire name for logging (matches existing `message_type_name` output).
+    pub const fn wire_name(&self) -> &'static str {
+        match self {
+            Self::ErrorMsg => "ERROR",
+            Self::Hello => "HELLO",
+            Self::Auth => "AUTH",
+            Self::DontHave => "DONT_HAVE",
+            Self::Peers => "PEERS",
+            Self::GetTxSet => "GET_TX_SET",
+            Self::TxSet => "TX_SET",
+            Self::GeneralizedTxSet => "GENERALIZED_TX_SET",
+            Self::Transaction => "TRANSACTION",
+            Self::GetScpQuorumset => "GET_SCP_QUORUMSET",
+            Self::ScpQuorumset => "SCP_QUORUMSET",
+            Self::ScpMessage => "SCP_MESSAGE",
+            Self::GetScpState => "GET_SCP_STATE",
+            Self::SendMore => "SEND_MORE",
+            Self::SendMoreExtended => "SEND_MORE_EXTENDED",
+            Self::FloodAdvert => "FLOOD_ADVERT",
+            Self::FloodDemand => "FLOOD_DEMAND",
+            Self::TimeSlicedSurveyRequest => "TIME_SLICED_SURVEY_REQUEST",
+            Self::TimeSlicedSurveyResponse => "TIME_SLICED_SURVEY_RESPONSE",
+            Self::TimeSlicedSurveyStartCollecting => "TIME_SLICED_SURVEY_START_COLLECTING",
+            Self::TimeSlicedSurveyStopCollecting => "TIME_SLICED_SURVEY_STOP_COLLECTING",
+        }
+    }
+
+    /// Map a `StellarMessage` to its kind. Exhaustive match ensures compile-time
+    /// coverage — adding a new XDR variant without updating this function is a
+    /// compile error.
+    pub fn from_stellar_message(msg: &StellarMessage) -> Self {
+        match msg {
+            StellarMessage::ErrorMsg(_) => Self::ErrorMsg,
+            StellarMessage::Hello(_) => Self::Hello,
+            StellarMessage::Auth(_) => Self::Auth,
+            StellarMessage::DontHave(_) => Self::DontHave,
+            StellarMessage::Peers(_) => Self::Peers,
+            StellarMessage::GetTxSet(_) => Self::GetTxSet,
+            StellarMessage::TxSet(_) => Self::TxSet,
+            StellarMessage::GeneralizedTxSet(_) => Self::GeneralizedTxSet,
+            StellarMessage::Transaction(_) => Self::Transaction,
+            StellarMessage::GetScpQuorumset(_) => Self::GetScpQuorumset,
+            StellarMessage::ScpQuorumset(_) => Self::ScpQuorumset,
+            StellarMessage::ScpMessage(_) => Self::ScpMessage,
+            StellarMessage::GetScpState(_) => Self::GetScpState,
+            StellarMessage::SendMore(_) => Self::SendMore,
+            StellarMessage::SendMoreExtended(_) => Self::SendMoreExtended,
+            StellarMessage::FloodAdvert(_) => Self::FloodAdvert,
+            StellarMessage::FloodDemand(_) => Self::FloodDemand,
+            StellarMessage::TimeSlicedSurveyRequest(_) => Self::TimeSlicedSurveyRequest,
+            StellarMessage::TimeSlicedSurveyResponse(_) => Self::TimeSlicedSurveyResponse,
+            StellarMessage::TimeSlicedSurveyStartCollecting(_) => {
+                Self::TimeSlicedSurveyStartCollecting
+            }
+            StellarMessage::TimeSlicedSurveyStopCollecting(_) => {
+                Self::TimeSlicedSurveyStopCollecting
+            }
+        }
+    }
+}
+
+// Compile-time: ALL is complete, ordered, and covers every discriminant.
+const _: () = {
+    let mut i = 0;
+    while i < OverlayMessageKind::ALL.len() {
+        assert!(OverlayMessageKind::ALL[i] as usize == i);
+        i += 1;
+    }
+    assert!(
+        OverlayMessageKind::ALL.len()
+            == OverlayMessageKind::TimeSlicedSurveyStopCollecting as usize + 1
+    );
+};
+
 /// Overlay network metrics.
 ///
 /// Provides comprehensive metrics for monitoring overlay operations.
@@ -356,40 +531,9 @@ pub struct OverlayMetrics {
     pub recv_survey_response: Timer,
 
     // ===== Send Counters =====
-    /// Error messages sent.
-    pub send_error: Counter,
-    /// Hello messages sent.
-    pub send_hello: Counter,
-    /// Auth messages sent.
-    pub send_auth: Counter,
-    /// DontHave messages sent.
-    pub send_dont_have: Counter,
-    /// Peers messages sent.
-    pub send_peers: Counter,
-    /// GetTxSet messages sent.
-    pub send_get_txset: Counter,
-    /// Transaction messages sent.
-    pub send_transaction: Counter,
-    /// TxSet messages sent.
-    pub send_txset: Counter,
-    /// GetScpQuorumSet messages sent.
-    pub send_get_scp_qset: Counter,
-    /// ScpQuorumSet messages sent.
-    pub send_scp_qset: Counter,
-    /// ScpMessage messages sent.
-    pub send_scp_message: Counter,
-    /// GetScpState messages sent.
-    pub send_get_scp_state: Counter,
-    /// SendMore messages sent.
-    pub send_send_more: Counter,
-    /// FloodAdvert messages sent.
-    pub send_flood_advert: Counter,
-    /// FloodDemand messages sent.
-    pub send_flood_demand: Counter,
-    /// SurveyRequest messages sent.
-    pub send_survey_request: Counter,
-    /// SurveyResponse messages sent.
-    pub send_survey_response: Counter,
+    /// Per-message-type send counters, indexed by [`OverlayMessageKind`].
+    /// Incremented on successful wire send only.
+    pub send_by_type: [Counter; OverlayMessageKind::COUNT],
 
     // ===== Queue Metrics =====
     /// Queue delay for SCP messages.
@@ -511,12 +655,7 @@ impl OverlayMetrics {
             recv_flood_demand_count: self.recv_flood_demand.count(),
 
             // Send counters
-            send_hello: self.send_hello.get(),
-            send_auth: self.send_auth.get(),
-            send_transaction: self.send_transaction.get(),
-            send_scp_message: self.send_scp_message.get(),
-            send_flood_advert: self.send_flood_advert.get(),
-            send_flood_demand: self.send_flood_demand.get(),
+            send_by_type: std::array::from_fn(|i| self.send_by_type[i].get()),
 
             // Queue metrics
             queue_drop_scp: self.queue_drop_scp.get(),
@@ -554,6 +693,11 @@ impl OverlayMetrics {
         }
     }
 
+    /// Record a successful message send of the given kind.
+    pub fn record_send(&self, kind: OverlayMessageKind) {
+        self.send_by_type[kind as usize].inc();
+    }
+
     /// Reset all metrics to initial state.
     pub fn reset(&self) {
         reset_counters(&[
@@ -579,23 +723,6 @@ impl OverlayMetrics {
             &self.timeouts_straggler,
             &self.pending_peers,
             &self.authenticated_peers,
-            &self.send_error,
-            &self.send_hello,
-            &self.send_auth,
-            &self.send_dont_have,
-            &self.send_peers,
-            &self.send_get_txset,
-            &self.send_transaction,
-            &self.send_txset,
-            &self.send_get_scp_qset,
-            &self.send_scp_qset,
-            &self.send_scp_message,
-            &self.send_get_scp_state,
-            &self.send_send_more,
-            &self.send_flood_advert,
-            &self.send_flood_demand,
-            &self.send_survey_request,
-            &self.send_survey_response,
             &self.queue_drop_scp,
             &self.queue_drop_tx,
             &self.queue_drop_advert,
@@ -619,6 +746,10 @@ impl OverlayMetrics {
             &self.pulled_irrelevant_txs,
             &self.abandoned_demands,
         ]);
+
+        for counter in &self.send_by_type {
+            counter.reset();
+        }
 
         reset_timers(&[
             &self.connection_latency,
@@ -699,13 +830,8 @@ pub struct OverlayMetricsSnapshot {
     pub recv_flood_advert_count: u64,
     pub recv_flood_demand_count: u64,
 
-    // Send counts
-    pub send_hello: u64,
-    pub send_auth: u64,
-    pub send_transaction: u64,
-    pub send_scp_message: u64,
-    pub send_flood_advert: u64,
-    pub send_flood_demand: u64,
+    // Send counts (indexed by OverlayMessageKind)
+    pub send_by_type: [u64; OverlayMessageKind::COUNT],
 
     // Queue drops
     pub queue_drop_scp: u64,
@@ -855,11 +981,14 @@ mod tests {
         metrics.messages_read.inc();
         metrics.messages_read.inc();
         metrics.bytes_read.add(1024);
-        metrics.send_hello.inc();
+        metrics.record_send(OverlayMessageKind::Hello);
 
         assert_eq!(metrics.messages_read.get(), 2);
         assert_eq!(metrics.bytes_read.get(), 1024);
-        assert_eq!(metrics.send_hello.get(), 1);
+        assert_eq!(
+            metrics.send_by_type[OverlayMessageKind::Hello as usize].get(),
+            1
+        );
     }
 
     #[test]
@@ -981,5 +1110,125 @@ mod tests {
         assert_eq!(snap.fetch_unique_recv, 0);
         assert_eq!(snap.fetch_duplicate_recv, 0);
         assert_eq!(snap.item_fetcher_next_peer, 0);
+    }
+
+    #[test]
+    fn test_overlay_message_kind_all_completeness() {
+        // ALL must contain exactly COUNT variants, each at its discriminant index.
+        assert_eq!(OverlayMessageKind::ALL.len(), OverlayMessageKind::COUNT);
+        for (i, kind) in OverlayMessageKind::ALL.iter().enumerate() {
+            assert_eq!(*kind as usize, i);
+        }
+    }
+
+    #[test]
+    fn test_overlay_message_kind_from_stellar_message() {
+        use stellar_xdr::curr::*;
+
+        // Test representative variants
+        let hello = StellarMessage::Hello(Hello::default());
+        assert_eq!(
+            OverlayMessageKind::from_stellar_message(&hello),
+            OverlayMessageKind::Hello
+        );
+
+        let peers = StellarMessage::Peers(VecM::default());
+        assert_eq!(
+            OverlayMessageKind::from_stellar_message(&peers),
+            OverlayMessageKind::Peers
+        );
+
+        let get_scp_state = StellarMessage::GetScpState(42);
+        assert_eq!(
+            OverlayMessageKind::from_stellar_message(&get_scp_state),
+            OverlayMessageKind::GetScpState
+        );
+
+        let send_more = StellarMessage::SendMore(SendMore { num_messages: 10 });
+        assert_eq!(
+            OverlayMessageKind::from_stellar_message(&send_more),
+            OverlayMessageKind::SendMore
+        );
+
+        let send_more_ext = StellarMessage::SendMoreExtended(SendMoreExtended {
+            num_messages: 10,
+            num_bytes: 1000,
+        });
+        assert_eq!(
+            OverlayMessageKind::from_stellar_message(&send_more_ext),
+            OverlayMessageKind::SendMoreExtended
+        );
+    }
+
+    #[test]
+    fn test_overlay_message_kind_labels() {
+        // Spot-check label format
+        assert_eq!(OverlayMessageKind::Hello.label(), "hello");
+        assert_eq!(OverlayMessageKind::GetTxSet.label(), "get_tx_set");
+        assert_eq!(OverlayMessageKind::FloodAdvert.label(), "flood_advert");
+        assert_eq!(
+            OverlayMessageKind::TimeSlicedSurveyRequest.label(),
+            "time_sliced_survey_request"
+        );
+
+        // Wire names (uppercase for logging)
+        assert_eq!(OverlayMessageKind::Hello.wire_name(), "HELLO");
+        assert_eq!(OverlayMessageKind::GetTxSet.wire_name(), "GET_TX_SET");
+    }
+
+    #[test]
+    fn test_record_send() {
+        let metrics = OverlayMetrics::new();
+
+        metrics.record_send(OverlayMessageKind::Hello);
+        metrics.record_send(OverlayMessageKind::Hello);
+        metrics.record_send(OverlayMessageKind::Transaction);
+
+        assert_eq!(
+            metrics.send_by_type[OverlayMessageKind::Hello as usize].get(),
+            2
+        );
+        assert_eq!(
+            metrics.send_by_type[OverlayMessageKind::Transaction as usize].get(),
+            1
+        );
+        assert_eq!(
+            metrics.send_by_type[OverlayMessageKind::Auth as usize].get(),
+            0
+        );
+    }
+
+    #[test]
+    fn test_send_by_type_in_snapshot() {
+        let metrics = OverlayMetrics::new();
+
+        metrics.record_send(OverlayMessageKind::ScpMessage);
+        metrics.record_send(OverlayMessageKind::ScpMessage);
+        metrics.record_send(OverlayMessageKind::FloodAdvert);
+
+        let snap = metrics.snapshot();
+        assert_eq!(
+            snap.send_by_type[OverlayMessageKind::ScpMessage as usize],
+            2
+        );
+        assert_eq!(
+            snap.send_by_type[OverlayMessageKind::FloodAdvert as usize],
+            1
+        );
+        assert_eq!(snap.send_by_type[OverlayMessageKind::Hello as usize], 0);
+    }
+
+    #[test]
+    fn test_send_by_type_reset() {
+        let metrics = OverlayMetrics::new();
+
+        metrics.record_send(OverlayMessageKind::Hello);
+        metrics.record_send(OverlayMessageKind::Transaction);
+
+        metrics.reset();
+
+        for kind in OverlayMessageKind::ALL {
+            assert_eq!(metrics.send_by_type[kind as usize].get(), 0);
+        }
     }
 }

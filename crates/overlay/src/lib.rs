@@ -112,7 +112,9 @@ pub use loopback::LoopbackConnectionFactory;
 pub use manager::TestPeerReceiver;
 pub use manager::{OverlayManager, OverlayMessage, OverlayStats, PeerSnapshot};
 pub use message_handlers::{MessageDispatcher, MessageDispatcherStats, TxSetData};
-pub use metrics::{Counter, OverlayMetrics, OverlayMetricsSnapshot, Timer, TimerSnapshot};
+pub use metrics::{
+    Counter, OverlayMessageKind, OverlayMetrics, OverlayMetricsSnapshot, Timer, TimerSnapshot,
+};
 pub use peer::{Peer, PeerInfo, PeerState, PeerStats, PeerStatsSnapshot};
 pub use peer_manager::{
     BackOffUpdate, PeerManager, PeerQuery, PeerRecord, PeerTypeFilter, StoredPeerType, TypeUpdate,

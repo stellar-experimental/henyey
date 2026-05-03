@@ -155,6 +155,7 @@ Corresponds to: `Peer.h`, `TCPPeer.h`
 | `recvHello()` | (in handshake flow via AuthContext) | Full |
 | `recvAuth()` | (in handshake flow) | Full |
 | `sendMessage()` | `send()` | Full |
+| *send-type metrics (19 grouped meters)* | `record_send()` via `OverlayMessageKind` | Approximate — Henyey uses 21 individual counters (one per XDR variant) vs stellar-core's 19 grouped meters; henyey counts post-successful-send vs stellar-core pre-send |
 | `recvMessage()` / `recvRawMessage()` | `recv()` | Full |
 | `recvError()` | (in manager message dispatch) | Full |
 | `recvPeers()` | (in manager message dispatch) | Full |

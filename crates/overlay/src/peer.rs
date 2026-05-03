@@ -26,7 +26,7 @@ use crate::{
     codec::helpers,
     connection::{Connection, ConnectionDirection},
     flow_control::{msg_body_size, FlowControlConfig, INITIAL_PEER_FLOOD_READING_CAPACITY_BYTES},
-    metrics::OverlayMetrics,
+    metrics::{OverlayMessageKind, OverlayMetrics},
     LocalNode, OverlayError, PeerAddress, PeerId, Result,
 };
 use dashmap::DashMap;
@@ -646,6 +646,7 @@ impl Peer {
 
     /// Send a raw message (before authentication, e.g., Hello).
     async fn send_raw(&mut self, message: StellarMessage) -> Result<()> {
+        let kind = OverlayMessageKind::from_stellar_message(&message);
         let body_size = msg_body_size(&message);
         let auth_msg = self.auth.wrap_unauthenticated(message);
         // `Connection::send` returns the on-the-wire frame size, so we don't
@@ -653,6 +654,7 @@ impl Peer {
         let wire_size = self.connection.send(auth_msg).await?;
         // Success-only instrumentation: connection errors go to errors_write at
         // the caller (peer_loop), not bytes_written/async_write.
+        self.metrics.record_send(kind);
         self.metrics.bytes_written.add(wire_size);
         self.metrics.async_write.inc();
         self.stats.messages_sent.fetch_add(1, Ordering::Relaxed);
@@ -664,9 +666,11 @@ impl Peer {
 
     /// Send an Auth message (with MAC but sequence 0).
     async fn send_auth(&mut self, message: StellarMessage) -> Result<()> {
+        let kind = OverlayMessageKind::from_stellar_message(&message);
         let body_size = msg_body_size(&message);
         let auth_msg = self.auth.wrap_auth_message(message)?;
         let wire_size = self.connection.send(auth_msg).await?;
+        self.metrics.record_send(kind);
         self.metrics.bytes_written.add(wire_size);
         self.metrics.async_write.inc();
         self.stats.messages_sent.fetch_add(1, Ordering::Relaxed);
@@ -684,12 +688,14 @@ impl Peer {
             ));
         }
 
+        let kind = OverlayMessageKind::from_stellar_message(&message);
         let msg_type = helpers::message_type_name(&message);
         trace!("SEND {} to {}", msg_type, self.info.peer_id);
 
         let body_size = msg_body_size(&message);
         let auth_msg = self.auth.wrap_message(message)?;
         let wire_size = self.connection.send(auth_msg).await?;
+        self.metrics.record_send(kind);
         self.metrics.bytes_written.add(wire_size);
         self.metrics.async_write.inc();
         self.stats.messages_sent.fetch_add(1, Ordering::Relaxed);

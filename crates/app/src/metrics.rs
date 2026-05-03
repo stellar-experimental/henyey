@@ -602,6 +602,9 @@ metric_catalog! {
         SCP_POST_VERIFY_TOTAL = "henyey_scp_post_verify_total"
             => "Envelopes processed by post-verify, by reason",
             "reason", henyey_herder::scp_verify::PostVerifyReason;
+        OVERLAY_SEND_TOTAL = "stellar_overlay_send_total"
+            => "Overlay messages sent by type (success-only, post-wire-send)",
+            "type", henyey_overlay::OverlayMessageKind;
     }
 
     labeled_counters_literal {
@@ -839,6 +842,12 @@ pub(crate) async fn refresh_gauges(state: &ServerState) {
         counter!(OVERLAY_FETCH_UNIQUE_RECV_TOTAL).absolute(ov.fetch_unique_recv);
         counter!(OVERLAY_ITEM_FETCHER_NEXT_PEER_TOTAL).absolute(ov.item_fetcher_next_peer);
         gauge!(OVERLAY_MEMORY_FLOOD_KNOWN).set(ov.flood_known_count as f64);
+
+        // Stage F.3: per-message-type send counter (issue #2245).
+        for kind in henyey_overlay::OverlayMessageKind::ALL {
+            counter!(OVERLAY_SEND_TOTAL, "type" => kind.label())
+                .absolute(ov.send_by_type[kind as usize]);
+        }
     } else {
         // Ensure gauge is zeroed if overlay stops.
         gauge!(OVERLAY_MEMORY_FLOOD_KNOWN).set(0.0);

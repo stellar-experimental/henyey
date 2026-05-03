@@ -346,35 +346,10 @@ pub mod helpers {
 
     /// Returns a human-readable name for the message type.
     ///
-    /// Useful for logging and debugging.
+    /// Delegates to [`OverlayMessageKind::wire_name`] — the single source of
+    /// truth for message classification.
     pub fn message_type_name(message: &StellarMessage) -> &'static str {
-        match message {
-            StellarMessage::ErrorMsg(_) => "ERROR",
-            StellarMessage::Hello(_) => "HELLO",
-            StellarMessage::Auth(_) => "AUTH",
-            StellarMessage::DontHave(_) => "DONT_HAVE",
-            StellarMessage::Peers(_) => "PEERS",
-            StellarMessage::GetTxSet(_) => "GET_TX_SET",
-            StellarMessage::TxSet(_) => "TX_SET",
-            StellarMessage::GeneralizedTxSet(_) => "GENERALIZED_TX_SET",
-            StellarMessage::Transaction(_) => "TRANSACTION",
-            StellarMessage::TimeSlicedSurveyRequest(_) => "TIME_SLICED_SURVEY_REQUEST",
-            StellarMessage::TimeSlicedSurveyResponse(_) => "TIME_SLICED_SURVEY_RESPONSE",
-            StellarMessage::TimeSlicedSurveyStartCollecting(_) => {
-                "TIME_SLICED_SURVEY_START_COLLECTING"
-            }
-            StellarMessage::TimeSlicedSurveyStopCollecting(_) => {
-                "TIME_SLICED_SURVEY_STOP_COLLECTING"
-            }
-            StellarMessage::GetScpQuorumset(_) => "GET_SCP_QUORUMSET",
-            StellarMessage::ScpQuorumset(_) => "SCP_QUORUMSET",
-            StellarMessage::ScpMessage(_) => "SCP_MESSAGE",
-            StellarMessage::GetScpState(_) => "GET_SCP_STATE",
-            StellarMessage::SendMore(_) => "SEND_MORE",
-            StellarMessage::SendMoreExtended(_) => "SEND_MORE_EXTENDED",
-            StellarMessage::FloodAdvert(_) => "FLOOD_ADVERT",
-            StellarMessage::FloodDemand(_) => "FLOOD_DEMAND",
-        }
+        crate::metrics::OverlayMessageKind::from_stellar_message(message).wire_name()
     }
 }
 

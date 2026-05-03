@@ -958,11 +958,15 @@
     },
     {
       "id": 294,
-      "type": "text",
-      "title": "Send Counters — Coming in Stage F.3",
-      "description": "Panel 97-99 of 10334.",
+      "type": "timeseries",
+      "title": "Send Rate by Message Type",
+      "description": "Per-message-type send rates (Stage F.3). Panels 97-99 of 10334.",
       "gridPos": {"h": 6, "w": 8, "x": 16, "y": 113},
-      "options": {"mode": "markdown", "content": "**Coming in Stage F.3** — Per-message-type send counter:\n- `stellar_overlay_send_total{type=...}`\n\n**Shipped in Stage F.2**: flood broadcast/recv, fetch recv, item fetcher, flood known gauge."}
+      "datasource": {"type": "prometheus", "uid": "000000001"},
+      "targets": [
+        {"expr": "rate(stellar_overlay_send_total{instance=~\"$instance\"}[5m])", "legendFormat": "{{type}}"}
+      ],
+      "fieldConfig": {"defaults": {"unit": "ops"}}
     },
     {
       "id": 273,

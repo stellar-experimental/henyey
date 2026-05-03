@@ -91,6 +91,7 @@ Metrics with the `stellar_` prefix that directly mirror stellar-core Medida coun
 | `OVERLAY_FETCH_UNIQUE_RECV_TOTAL` | `stellar_overlay_fetch_unique_recv_total` | counter | Henyey-specific — unique/solicited fetch responses (TxSet/QSet tracked by ItemFetcher). |
 | `OVERLAY_ITEM_FETCHER_NEXT_PEER_TOTAL` | `stellar_overlay_item_fetcher_next_peer_total` | counter | Henyey-specific — `Tracker::try_next_peer` AskPeer selections. |
 | `OVERLAY_MEMORY_FLOOD_KNOWN` | `stellar_overlay_memory_flood_known` | gauge | Henyey-specific — current FloodGate known entries count (`FloodGate.records.len()`). |
+| `OVERLAY_SEND_TOTAL` | `stellar_overlay_send_total` | counter (labeled: `type`) | Replaces stellar-core's per-type `mSendXxxMeter` meters (19 groups, `Peer.cpp:830-897`). Henyey uses 21 individual labels (one per XDR variant) for finer granularity. Success-only semantics (post-wire-send), unlike stellar-core which counts pre-send. |
 | `BUCKET_MERGE_COMPLETED_TOTAL` | `stellar_bucket_merge_completed_total` | counter | `BucketManager::mMergesCompleted` |
 | `BUCKET_MERGE_TIME_US_TOTAL` | `stellar_bucket_merge_time_us_total` | counter | Cumulative merge time μs |
 | `BUCKET_MERGE_NEW_LIVE_TOTAL` | `stellar_bucket_merge_new_live_total` | counter | Live entries produced by merges |
