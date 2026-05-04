@@ -14,13 +14,7 @@ use crate::state::LedgerStateManager;
 use crate::validation::LedgerContext;
 use crate::Result;
 
-/// Entry to restore from the hot archive.
-pub struct HotArchiveRestoreEntry {
-    /// The key of the entry to restore.
-    pub key: LedgerKey,
-    /// The entry value from the hot archive.
-    pub entry: LedgerEntry,
-}
+use super::HotArchiveRestore;
 
 /// Soroban inputs needed to restore archived entries.
 pub struct RestoreFootprintResources<'a> {
@@ -29,7 +23,7 @@ pub struct RestoreFootprintResources<'a> {
     /// Minimum persistent entry TTL from Soroban config.
     pub min_persistent_entry_ttl: u32,
     /// Entries loaded from the hot archive for this operation.
-    pub hot_archive_restores: &'a [HotArchiveRestoreEntry],
+    pub hot_archive_restores: &'a [HotArchiveRestore],
     /// Optional TTL key cache for hashing restored entries.
     pub ttl_key_cache: Option<&'a crate::soroban::TtlKeyCache>,
     /// Contract size limits from SorobanConfig.
@@ -41,7 +35,7 @@ impl<'a> RestoreFootprintResources<'a> {
     /// this operation.
     pub(crate) fn new(
         ctx: &crate::soroban::SorobanContext<'a>,
-        hot_archive_restores: &'a [HotArchiveRestoreEntry],
+        hot_archive_restores: &'a [HotArchiveRestore],
     ) -> Self {
         Self {
             soroban_data: ctx.soroban_data,
@@ -884,7 +878,7 @@ mod tests {
         let key = LedgerKey::ContractCode(LedgerKeyContractCode { hash: hash.clone() });
         let entry = make_contract_code_entry(hash);
 
-        let hot_restores = vec![HotArchiveRestoreEntry {
+        let hot_restores = vec![HotArchiveRestore {
             key: key.clone(),
             entry,
         }];
@@ -942,7 +936,7 @@ mod tests {
         let key = LedgerKey::ContractCode(LedgerKeyContractCode { hash: hash.clone() });
         let entry = make_contract_code_entry(hash);
 
-        let hot_restores = vec![HotArchiveRestoreEntry {
+        let hot_restores = vec![HotArchiveRestore {
             key: key.clone(),
             entry,
         }];
@@ -991,7 +985,7 @@ mod tests {
         let key = LedgerKey::ContractCode(LedgerKeyContractCode { hash: hash.clone() });
         let entry = make_contract_code_entry(hash);
 
-        let hot_restores = vec![HotArchiveRestoreEntry {
+        let hot_restores = vec![HotArchiveRestore {
             key: key.clone(),
             entry,
         }];
@@ -1045,7 +1039,7 @@ mod tests {
         let hot_entry = make_contract_code_entry(hot_hash);
         let hot_entry_size = hot_entry.to_xdr(Limits::none()).unwrap().len() as u32;
 
-        let hot_restores = vec![HotArchiveRestoreEntry {
+        let hot_restores = vec![HotArchiveRestore {
             key: hot_key.clone(),
             entry: hot_entry,
         }];
@@ -1227,7 +1221,7 @@ mod tests {
             "entry XDR size ({entry_xdr_size}) must exceed restrictive limit (100)"
         );
 
-        let hot_restores = vec![HotArchiveRestoreEntry {
+        let hot_restores = vec![HotArchiveRestore {
             key: key.clone(),
             entry: entry.clone(),
         }];
@@ -1326,7 +1320,7 @@ mod tests {
             "entry XDR size ({entry_xdr_size}) must exceed restrictive limit (100)"
         );
 
-        let hot_restores = vec![HotArchiveRestoreEntry {
+        let hot_restores = vec![HotArchiveRestore {
             key: key.clone(),
             entry: entry.clone(),
         }];
@@ -1643,7 +1637,7 @@ mod tests {
         let entry = make_contract_code_entry_with_size(hash, 100);
         let entry_xdr_size = entry.to_xdr(Limits::none()).unwrap().len() as u32;
 
-        let hot_restores = vec![HotArchiveRestoreEntry {
+        let hot_restores = vec![HotArchiveRestore {
             key: key.clone(),
             entry,
         }];

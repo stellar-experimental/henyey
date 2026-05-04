@@ -1131,21 +1131,15 @@ pub fn execute_operation_with_soroban(
                         }
                     }
                 }
-                // Convert HotArchiveRestore to HotArchiveRestoreEntry for execute_restore_footprint
-                let ha_restore_entries: Vec<restore_footprint::HotArchiveRestoreEntry> =
-                    hot_archive_restores
-                        .iter()
-                        .map(|r| restore_footprint::HotArchiveRestoreEntry {
-                            key: r.key.clone(),
-                            entry: r.entry.clone(),
-                        })
-                        .collect();
                 let result = restore_footprint::execute_restore_footprint(
                     op_data,
                     &op_source,
                     state,
                     context,
-                    restore_footprint::RestoreFootprintResources::new(soroban, &ha_restore_entries),
+                    restore_footprint::RestoreFootprintResources::new(
+                        soroban,
+                        &hot_archive_restores,
+                    ),
                 )?;
                 let mut exec = OperationExecutionResult::new(result);
                 if matches!(
