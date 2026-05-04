@@ -185,12 +185,13 @@ fn verify_bucket_list_hash(
                 "Level state at mismatch"
             );
         }
-        return Err(HistoryError::VerificationFailed(format!(
-            "bucket list hash mismatch at ledger {} protocol {} (expected {}, got {})",
-            header.ledger_seq,
-            header.ledger_version,
-            expected.to_hex(),
-            actual.to_hex()
+        return Err(HistoryError::VerificationHashMismatch(Box::new(
+            crate::error::VerifyHashMismatchInfo {
+                kind: crate::error::VerifyHashKind::BucketList,
+                ledger: Some(header.ledger_seq),
+                expected,
+                actual,
+            },
         )));
     }
     Ok(())
@@ -1287,7 +1288,14 @@ mod tests {
             },
         );
 
-        assert!(matches!(result, Err(HistoryError::VerificationFailed(_))));
+        match result {
+            Err(HistoryError::VerificationHashMismatch(info)) => {
+                assert_eq!(info.kind, crate::error::VerifyHashKind::BucketList);
+                assert_eq!(info.ledger, Some(127));
+                assert_ne!(info.expected, info.actual);
+            }
+            other => panic!("expected VerificationHashMismatch, got: {other:?}"),
+        }
     }
 
     #[test]

@@ -131,14 +131,15 @@ pub enum HistoryError {
     #[error("history verification failed: {0}")]
     VerificationFailed(String),
 
-    /// Typed verification hash mismatch (offline verification path).
+    /// Typed verification hash mismatch.
     ///
     /// Replaces string-based [`VerificationFailed`](HistoryError::VerificationFailed)
     /// for hash comparison errors in [`crate::verify::verify_bucket_hash`],
     /// [`crate::verify::verify_ledger_hash`],
     /// [`crate::verify::verify_ledger_header_history_entry`],
-    /// [`crate::verify::verify_tx_result_set`], and
-    /// [`crate::verify::verify_header_matches_trusted`].
+    /// [`crate::verify::verify_tx_result_set`],
+    /// [`crate::verify::verify_header_matches_trusted`], and
+    /// [`crate::replay::execution::verify_bucket_list_hash`].
     #[error("verification hash mismatch: {0}")]
     VerificationHashMismatch(Box<VerifyHashMismatchInfo>),
 
@@ -321,8 +322,8 @@ impl HistoryError {
     ///
     /// Recognized variants:
     /// - [`VerificationHashMismatch`](HistoryError::VerificationHashMismatch)
-    ///   — offline verification path (bucket, bucket list, header entry, tx
-    ///   result set, trusted header)
+    ///   — verification and replay paths (bucket, bucket list, header entry,
+    ///   tx result set, trusted header)
     /// - [`InvalidTxSetHash`](HistoryError::InvalidTxSetHash) — tx set hash
     ///   mismatch with rich diagnostic context
     /// - [`Ledger(LedgerError::HashMismatch)`](HistoryError::Ledger) —
