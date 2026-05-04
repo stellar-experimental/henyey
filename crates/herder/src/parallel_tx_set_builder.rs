@@ -2145,6 +2145,51 @@ mod stages_to_xdr_phase_tests {
             _ => panic!("Expected V1 phase"),
         }
     }
+
+    // -- Mixed empty-cluster + non-empty-cluster within a single stage --
+
+    #[test]
+    fn test_mixed_empty_cluster_in_stage_sorted() {
+        let tx = make_soroban_tx(1, 1, vec![], vec![contract_key(1)], 1000);
+        // One stage with an empty cluster and a non-empty cluster.
+        let stages = vec![vec![vec![], vec![tx.clone()]]];
+        let phase = stages_to_xdr_phase(to_hashed_stages(stages), Some(100));
+
+        match phase {
+            TransactionPhase::V1(parallel) => {
+                assert_eq!(parallel.base_fee, Some(100));
+                assert_eq!(parallel.execution_stages.len(), 1, "one stage");
+                assert_eq!(
+                    parallel.execution_stages[0].0.len(),
+                    1,
+                    "empty cluster should be stripped"
+                );
+                assert_eq!(parallel.execution_stages[0].0[0].0.len(), 1, "one tx");
+            }
+            _ => panic!("Expected V1 phase"),
+        }
+    }
+
+    #[test]
+    fn test_mixed_empty_cluster_in_stage_unsorted() {
+        let tx = make_soroban_tx(1, 1, vec![], vec![contract_key(1)], 1000);
+        let stages = vec![vec![vec![], vec![tx.clone()]]];
+        let phase = stages_to_xdr_phase_unsorted(stages, Some(100));
+
+        match phase {
+            TransactionPhase::V1(parallel) => {
+                assert_eq!(parallel.base_fee, Some(100));
+                assert_eq!(parallel.execution_stages.len(), 1, "one stage");
+                assert_eq!(
+                    parallel.execution_stages[0].0.len(),
+                    1,
+                    "empty cluster should be stripped"
+                );
+                assert_eq!(parallel.execution_stages[0].0[0].0.len(), 1, "one tx");
+            }
+            _ => panic!("Expected V1 phase"),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
