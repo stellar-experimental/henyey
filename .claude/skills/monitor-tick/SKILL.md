@@ -322,19 +322,29 @@ ticks so STUCK can be detected by a single invocation:
 
 ```bash
 logs_dir=/home/tomer/data/$MONITOR_SESSION_ID/logs
-recent_crashed=$(find "$logs_dir" -maxdepth 1 -type f -name 'monitor.log.crashed-*' \
-  -newermt '30 minutes ago' -printf '%T@ %p\n' 2>/dev/null | sort -rn)
+# Requires GNU coreutils date (standard on Linux monitoring hosts).
+# bfs/GNU-find both accept ISO 8601 with -newermt.
+boundary=$(date -u -d '30 minutes ago' +%Y-%m-%dT%H:%M:%SZ) || {
+  echo "WARNING: date computation failed — auto-wipe heuristic disabled this tick" >&2
+  boundary=""
+}
+if [ -n "$boundary" ]; then
+  recent_crashed=$(find "$logs_dir" -maxdepth 1 -type f -name 'monitor.log.crashed-*' \
+    -newermt "$boundary" -printf '%T@ %p\n' 2>/dev/null | sort -rn)
+else
+  recent_crashed=""
+fi
 recent_count=$(printf '%s\n' "$recent_crashed" | grep -c .)
 latest_crashed=$(printf '%s\n' "$recent_crashed" | head -1 | cut -d' ' -f2-)
 hash_mismatch_signal="no"
-if [ -n "$latest_crashed" ] && grep -qE 'FATAL: pre-close hash mismatch|Catchup failed:.*Header hash mismatch' "$latest_crashed" 2>/dev/null; then
+if [ -n "$latest_crashed" ] && grep -q 'State wipe required before restart' "$latest_crashed" 2>/dev/null; then
   hash_mismatch_signal="yes"
 fi
 ```
 
 Trigger the wipe when ALL hold:
 1. `recent_count >= 3` (3+ crashed rotations in the last 30 min — proves restart-without-fix isn't recovering)
-2. `hash_mismatch_signal == "yes"` (the most recent crash is hash-mismatch family — the symptom that uniquely identifies persisted state corruption rather than a transient bug)
+2. `hash_mismatch_signal == "yes"` (the most recent crash logged "State wipe required before restart" — the invariant emitted by `trigger_fatal_shutdown()` for any unrecoverable local state corruption)
 3. `FRESH_START=no` (don't fire on a fresh sync that hasn't completed yet)
 
 When triggered:
