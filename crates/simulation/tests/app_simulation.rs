@@ -1106,3 +1106,87 @@ async fn test_slow_node_lagging_node_recovers() {
 
     sim.stop_all_nodes().await.expect("stop lagging node test");
 }
+
+/// End-to-end test that two validators exchanging SCP messages over TCP
+/// exercise the full `pump_scp_intake` accept path across multiple slots.
+///
+/// Covers the app-level SCP pipeline:
+///   overlay → scp_message_rx → pump_scp_intake → pre-filter → verify
+///   → process_verified → SCP state machine
+///
+/// Complements the overlay-level self-echo test
+/// (`test_scp_self_echo_not_dropped_after_broadcast`) which only covers
+/// FloodGate routing. This test proves peer-sourced SCP envelopes reach
+/// the SCP state machine and are accepted (`PostVerifyReason::Accepted`).
+///
+/// Regression context: #2317, #2325, #2364.
+#[tokio::test]
+async fn test_pair_tcp_scp_messages_exercise_pump_scp_intake() {
+    use henyey_herder::scp_verify::PostVerifyReason;
+
+    let mut sim =
+        build_app_backed_topology(Topologies::pair(SimulationMode::OverTcp), 100, 1).await;
+
+    // Ensure both nodes are operational before baselining counters.
+    wait_for_app_operational(&sim, "node0", Duration::from_secs(10)).await;
+    wait_for_app_operational(&sim, "node1", Duration::from_secs(10)).await;
+
+    // Baseline: capture SCP counters after startup to isolate manual-close traffic.
+    let app_0 = sim.app("node0").unwrap();
+    let app_1 = sim.app("node1").unwrap();
+    let base_accepted_0 = app_0.info().scp_verify.pv_counters[PostVerifyReason::Accepted];
+    let base_accepted_1 = app_1.info().scp_verify.pv_counters[PostVerifyReason::Accepted];
+    let base_stats_0 = sim.app_debug_stats("node0").await.unwrap();
+    let base_stats_1 = sim.app_debug_stats("node1").await.unwrap();
+
+    // Close 5 ledgers: from genesis (ledger 1) through ledger 6.
+    // max_spread = 1 follows the convention of existing pair tests.
+    manual_close_until(&sim, 6, 1, Duration::from_secs(60)).await;
+
+    // Per-node assertions: each node must have exchanged SCP messages and
+    // accepted peer envelopes through the full pump_scp_intake pipeline.
+    let post_accepted_0 = app_0.info().scp_verify.pv_counters[PostVerifyReason::Accepted];
+    let post_accepted_1 = app_1.info().scp_verify.pv_counters[PostVerifyReason::Accepted];
+    let stats_0 = sim.app_debug_stats("node0").await.unwrap();
+    let stats_1 = sim.app_debug_stats("node1").await.unwrap();
+
+    let delta_accepted_0 = post_accepted_0 - base_accepted_0;
+    let delta_accepted_1 = post_accepted_1 - base_accepted_1;
+    let delta_sent_0 = stats_0.scp_messages_sent - base_stats_0.scp_messages_sent;
+    let delta_sent_1 = stats_1.scp_messages_sent - base_stats_1.scp_messages_sent;
+
+    assert!(
+        delta_accepted_0 > 0,
+        "node0 must have accepted peer SCP envelopes through pump_scp_intake \
+         (pv_counters[Accepted] delta = {delta_accepted_0})"
+    );
+    assert!(
+        delta_accepted_1 > 0,
+        "node1 must have accepted peer SCP envelopes through pump_scp_intake \
+         (pv_counters[Accepted] delta = {delta_accepted_1})"
+    );
+    assert!(
+        delta_sent_0 > 0,
+        "node0 must have broadcast SCP envelopes (sent delta = {delta_sent_0})"
+    );
+    assert!(
+        delta_sent_1 > 0,
+        "node1 must have broadcast SCP envelopes (sent delta = {delta_sent_1})"
+    );
+
+    // Both nodes must have reached at least ledger 6.
+    assert!(
+        stats_0.current_ledger >= 6,
+        "node0 current_ledger = {}, expected >= 6",
+        stats_0.current_ledger
+    );
+    assert!(
+        stats_1.current_ledger >= 6,
+        "node1 current_ledger = {}, expected >= 6",
+        stats_1.current_ledger
+    );
+
+    sim.stop_all_nodes()
+        .await
+        .expect("stop pair pump_scp_intake test nodes");
+}
