@@ -33,12 +33,11 @@ fn should_forget_flood_record(
         return false;
     }
 
+    // Duplicate: stellar-core returns ENVELOPE_STATUS_PROCESSED (not
+    // DISCARDED) — keep the flood record so relay accounting is preserved.
     matches!(
         state,
-        EnvelopeState::TooOld
-            | EnvelopeState::InvalidSignature
-            | EnvelopeState::Invalid
-            | EnvelopeState::Duplicate
+        EnvelopeState::TooOld | EnvelopeState::InvalidSignature | EnvelopeState::Invalid
     )
 }
 
@@ -2709,7 +2708,6 @@ mod forget_flood_record_tests {
             EnvelopeState::TooOld,
             EnvelopeState::InvalidSignature,
             EnvelopeState::Invalid,
-            EnvelopeState::Duplicate,
         ] {
             for reason in R::ALL {
                 if matches!(reason, R::SelfMessage) {
@@ -2723,13 +2721,14 @@ mod forget_flood_record_tests {
         }
     }
 
-    /// Envelopes that should NOT cause forget: Valid, Pending, Fetching, Deferred.
+    /// Envelopes that should NOT cause forget: Valid, Pending, Fetching, Duplicate, Deferred.
     #[test]
     fn test_no_forget_valid_pending_fetching() {
         for state in [
             EnvelopeState::Valid,
             EnvelopeState::Pending,
             EnvelopeState::Fetching,
+            EnvelopeState::Duplicate,
         ] {
             for reason in R::ALL {
                 assert!(
@@ -2758,7 +2757,6 @@ mod forget_flood_record_tests {
             EnvelopeState::TooOld,
             EnvelopeState::InvalidSignature,
             EnvelopeState::Invalid,
-            EnvelopeState::Duplicate,
         ] {
             assert!(
                 !should_forget_flood_record(state, R::SelfMessage),
