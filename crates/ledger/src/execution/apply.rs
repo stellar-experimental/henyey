@@ -33,26 +33,153 @@ use super::{
 
 pub(super) const AUTHORIZED_FLAG: u32 = TrustLineFlags::AuthorizedFlag as u32;
 
-/// Tracks entries restored from different sources per CAP-0066.
-#[derive(Debug, Default)]
+/// Value stored for a hot-archive restored key.
+#[derive(Debug, Clone)]
+pub(super) enum HotArchiveValue {
+    /// Key has an original entry available for meta emission comparison.
+    Entry(Box<stellar_xdr::curr::LedgerEntry>),
+    /// Key is marked as restored but has no original entry. Used for:
+    /// - Synthesized TTL keys (derived from data/code key hash)
+    /// - Data/code keys from actual_restored_indices without entry values
+    NoOriginal,
+}
+
+/// Tracks entries restored from different sources per CAP-0066 (Soroban only).
+///
+/// All fields are private; use the `pub(super)` methods to query and mutate.
+/// This ensures that live-BL keys always have an associated original entry
+/// and that hot-archive keys carry the correct value variant.
+#[derive(Debug)]
 pub struct RestoredEntries {
-    /// Keys restored from hot archive (evicted entries).
-    /// These will have CREATED changes that should be converted to RESTORED.
-    pub(super) hot_archive: HashSet<LedgerKey>,
-    /// For hot archive restores, maps data/code keys to their entry values.
-    /// These are needed to emit RESTORED for data/code that wasn't directly modified
-    /// (e.g., RestoreFootprint only creates TTL, but data entry needs RESTORED).
-    pub(super) hot_archive_entries: HashMap<LedgerKey, stellar_xdr::curr::LedgerEntry>,
-    /// Keys restored from live BucketList (expired TTL but not yet evicted).
-    /// For UPDATED entries: if data unchanged, emit RESTORED; if changed, emit
-    /// RESTORED(original) + UPDATED(new) per stellar-core TransactionMeta.cpp:176-197.
-    /// Associated data/code entries need RESTORED meta added even if not directly modified.
-    pub(super) live_bucket_list: HashSet<LedgerKey>,
-    /// For live BL restores, maps keys to their **original** entry values (before modification).
-    /// Used for data comparison in meta emission: if post_state.data == original.data,
-    /// the entry was only restored (not modified). Also used to emit RESTORED for entries
-    /// not directly modified (only their TTL was extended).
-    pub(super) live_bucket_list_entries: HashMap<LedgerKey, stellar_xdr::curr::LedgerEntry>,
+    /// Keys restored from hot archive, mapped to their original entry value
+    /// (`Entry`) or `NoOriginal` for keys without stored originals.
+    hot_archive: HashMap<LedgerKey, HotArchiveValue>,
+    /// Keys restored from live BucketList, always mapped to the **original**
+    /// entry value (before modification).
+    live_bucket_list: HashMap<LedgerKey, stellar_xdr::curr::LedgerEntry>,
+}
+
+impl RestoredEntries {
+    pub(super) fn new() -> Self {
+        Self {
+            hot_archive: HashMap::new(),
+            live_bucket_list: HashMap::new(),
+        }
+    }
+
+    // --- Hot archive ---
+
+    pub(super) fn is_hot_archive_restored(&self, key: &LedgerKey) -> bool {
+        self.hot_archive.contains_key(key)
+    }
+
+    /// Returns the original entry for a hot-archive key, or `None` if the key
+    /// is absent or is a `NoOriginal`.
+    pub(super) fn hot_archive_original(
+        &self,
+        key: &LedgerKey,
+    ) -> Option<&stellar_xdr::curr::LedgerEntry> {
+        match self.hot_archive.get(key) {
+            Some(HotArchiveValue::Entry(entry)) => Some(entry),
+            _ => None,
+        }
+    }
+
+    /// Insert a data/code key restored from the hot archive with its original entry.
+    pub(super) fn insert_hot_archive_entry(
+        &mut self,
+        key: LedgerKey,
+        original: stellar_xdr::curr::LedgerEntry,
+    ) {
+        debug_assert!(
+            !matches!(key, LedgerKey::Ttl(_)),
+            "insert_hot_archive_entry called with TTL key"
+        );
+        debug_assert!(
+            !self.live_bucket_list.contains_key(&key),
+            "key already in live_bucket_list"
+        );
+        self.hot_archive
+            .insert(key, HotArchiveValue::Entry(Box::new(original)));
+    }
+
+    /// Iterate hot-archive entries that have original values (filters out NoOriginal).
+    pub(super) fn hot_archive_entries_with_originals(
+        &self,
+    ) -> impl Iterator<Item = (&LedgerKey, &stellar_xdr::curr::LedgerEntry)> {
+        self.hot_archive.iter().filter_map(|(k, v)| match v {
+            HotArchiveValue::Entry(entry) => Some((k, entry.as_ref())),
+            HotArchiveValue::NoOriginal => None,
+        })
+    }
+
+    /// Bulk-insert synthesized TTL keys into the hot archive.
+    pub(super) fn extend_hot_archive_ttls(&mut self, keys: impl IntoIterator<Item = LedgerKey>) {
+        for key in keys {
+            debug_assert!(
+                matches!(key, LedgerKey::Ttl(_)),
+                "extend_hot_archive_ttls called with non-TTL key"
+            );
+            self.hot_archive.insert(key, HotArchiveValue::NoOriginal);
+        }
+    }
+
+    /// Mark a key as hot-archive restored without an original entry value.
+    fn insert_hot_archive_no_original(&mut self, key: LedgerKey) {
+        self.hot_archive.insert(key, HotArchiveValue::NoOriginal);
+    }
+
+    // --- Live BL ---
+
+    pub(super) fn is_live_bl_restored(&self, key: &LedgerKey) -> bool {
+        self.live_bucket_list.contains_key(key)
+    }
+
+    /// Returns the original entry for a live-BL restored key.
+    pub(super) fn live_bl_original(
+        &self,
+        key: &LedgerKey,
+    ) -> Option<&stellar_xdr::curr::LedgerEntry> {
+        self.live_bucket_list.get(key)
+    }
+
+    /// Insert a key restored from the live BucketList with its original entry.
+    pub(super) fn insert_live_bl(
+        &mut self,
+        key: LedgerKey,
+        original: stellar_xdr::curr::LedgerEntry,
+    ) {
+        debug_assert!(
+            !self.hot_archive.contains_key(&key),
+            "key already in hot_archive"
+        );
+        self.live_bucket_list.insert(key, original);
+    }
+
+    /// Iterate all live-BL entries (key + original entry).
+    pub(super) fn live_bl_entries(
+        &self,
+    ) -> impl Iterator<Item = (&LedgerKey, &stellar_xdr::curr::LedgerEntry)> {
+        self.live_bucket_list.iter()
+    }
+
+    /// Number of live-BL restored keys.
+    pub(super) fn live_bl_len(&self) -> usize {
+        self.live_bucket_list.len()
+    }
+
+    // --- Cross-source ---
+
+    /// Check if a key was restored from either source.
+    pub(super) fn is_restored(&self, key: &LedgerKey) -> bool {
+        self.hot_archive.contains_key(key) || self.live_bucket_list.contains_key(key)
+    }
+}
+
+impl Default for RestoredEntries {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// Collect restored entries for a Soroban operation from both the hot archive
@@ -87,17 +214,8 @@ pub(super) fn collect_soroban_restored_entries(
     // Get live BL restorations from the Soroban execution result
     if let Some(meta) = soroban_meta {
         for live_bl_restore in &meta.live_bucket_list_restores {
-            restored
-                .live_bucket_list
-                .insert(live_bl_restore.key.clone());
-            restored
-                .live_bucket_list_entries
-                .insert(live_bl_restore.key.clone(), live_bl_restore.entry.clone());
-            // Also track the TTL entry
-            restored
-                .live_bucket_list
-                .insert(live_bl_restore.ttl_key.clone());
-            restored.live_bucket_list_entries.insert(
+            restored.insert_live_bl(live_bl_restore.key.clone(), live_bl_restore.entry.clone());
+            restored.insert_live_bl(
                 live_bl_restore.ttl_key.clone(),
                 live_bl_restore.ttl_entry.clone(),
             );
@@ -126,7 +244,7 @@ pub(super) fn collect_soroban_restored_entries(
         }
     }
     let ha_before = hot_archive.len();
-    hot_archive.retain(|k| !restored.live_bucket_list.contains(k));
+    hot_archive.retain(|k| !restored.is_live_bl_restored(k));
     let ha_after_live_bl = hot_archive.len();
 
     // Also exclude keys that were listed in archived_soroban_entries but
@@ -163,13 +281,11 @@ pub(super) fn collect_soroban_restored_entries(
 
     // Now store original entry values ONLY for keys that passed the meta filter.
     // This prevents read-only auto-restores from emitting spurious RESTORED changes
-    // via the hot_archive_entries post-processing at meta.rs:876-882.
+    // via hot_archive_entries_with_originals() post-processing at meta.rs.
     if let Some(meta) = soroban_meta {
         for ha_restore in &meta.hot_archive_restores {
             if hot_archive_for_meta.contains(&ha_restore.key) {
-                restored
-                    .hot_archive_entries
-                    .insert(ha_restore.key.clone(), ha_restore.entry.clone());
+                restored.insert_hot_archive_entry(ha_restore.key.clone(), ha_restore.entry.clone());
             }
         }
     }
@@ -180,7 +296,7 @@ pub(super) fn collect_soroban_restored_entries(
             ha_before,
             ha_after_live_bl,
             ha_after,
-            live_bl_count = restored.live_bucket_list.len(),
+            live_bl_count = restored.live_bl_len(),
             created_count = created_keys.len(),
             ?hot_archive_for_bucket_list,
             ?created_keys,
@@ -223,9 +339,18 @@ pub(super) fn collect_soroban_restored_entries(
     if is_operation_success(op_result) {
         collected_hot_archive_keys.extend(hot_archive_for_bucket_list.iter().cloned());
     }
-    // Add filtered keys (including TTL) to restored.hot_archive for meta conversion
-    restored.hot_archive.extend(hot_archive_for_meta);
-    restored.hot_archive.extend(ttl_keys);
+    // Add filtered keys (including TTL) to restored for meta conversion.
+    // Data/code keys from hot_archive_for_meta that weren't already inserted
+    // via insert_hot_archive_entry (from hot_archive_restores) get added as
+    // NoOriginal markers. These are needed for .is_hot_archive_restored()
+    // checks in meta emission. In practice, all non-TTL keys should have
+    // been handled above; this is a safety net for edge cases.
+    for key in hot_archive_for_meta {
+        if !restored.is_hot_archive_restored(&key) {
+            restored.insert_hot_archive_no_original(key);
+        }
+    }
+    restored.extend_hot_archive_ttls(ttl_keys);
     restored
 }
 
