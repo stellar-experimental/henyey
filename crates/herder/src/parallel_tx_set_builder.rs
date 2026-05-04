@@ -697,13 +697,54 @@ pub fn build_parallel_soroban_phase(
 /// Convert parallel phase stages into a TransactionPhase::V1 XDR structure.
 ///
 /// HERDER_SPEC §7.7: Applies canonical ordering before serialization:
+/// Strip empty clusters from each stage and empty stages from the list.
+///
+/// After canonicalization every remaining stage contains at least one
+/// non-empty cluster, which makes downstream indexing (e.g. `cluster[0]`,
+/// `stage[0][0]`) safe.
+fn canonicalize_stages<T>(stages: Vec<Vec<Vec<T>>>) -> Vec<Vec<Vec<T>>> {
+    stages
+        .into_iter()
+        .map(|stage| {
+            stage
+                .into_iter()
+                .filter(|cluster| !cluster.is_empty())
+                .collect::<Vec<_>>()
+        })
+        .filter(|stage: &Vec<Vec<T>>| !stage.is_empty())
+        .collect()
+}
+
 /// 1. Transactions within each cluster sorted by full hash (ascending).
 /// 2. Clusters within each stage sorted by first-TX hash (ascending).
 /// 3. Stages sorted by first-TX-of-first-cluster hash (ascending).
+///
+/// # Invariant
+///
+/// If `stages` contains zero transactions (including degenerate shapes like
+/// `vec![vec![]]`), the returned phase has `base_fee: None` and empty
+/// `execution_stages`, matching the stellar-core invariant at
+/// `TxSetFrame.cpp:286-290`.  A `debug_assert!` fires in debug builds if
+/// the caller passed `Some(base_fee)` with zero transactions.
 pub fn stages_to_xdr_phase(
     stages: Vec<Vec<Vec<HashedTx>>>,
     base_fee: Option<i64>,
 ) -> TransactionPhase {
+    // Canonicalize: strip empty clusters/stages to prevent index panics and
+    // to collapse degenerate zero-tx shapes into the truly-empty case.
+    let stages = canonicalize_stages(stages);
+
+    if stages.is_empty() {
+        debug_assert!(
+            base_fee.is_none(),
+            "stages_to_xdr_phase: zero-tx stages must not have Some(base_fee)"
+        );
+        return TransactionPhase::V1(ParallelTxsComponent {
+            base_fee: None,
+            execution_stages: VecM::default(),
+        });
+    }
+
     // Sort using precomputed hashes, then extract envelopes for XDR.
     let mut sorted_stages: Vec<Vec<Vec<HashedTx>>> = stages
         .into_iter()
@@ -757,10 +798,25 @@ pub fn stages_to_xdr_phase(
 /// Use this when the caller will re-sort the transactions later (e.g.,
 /// `prepare_with_hash` in the ledger close path). Avoids the cost of
 /// XDR-serializing + SHA-256-hashing every transaction for sort keys.
+///
+/// Applies the same zero-tx guard as `stages_to_xdr_phase`.
 fn stages_to_xdr_phase_unsorted(
     stages: Vec<Vec<Vec<TransactionEnvelope>>>,
     base_fee: Option<i64>,
 ) -> TransactionPhase {
+    let stages = canonicalize_stages(stages);
+
+    if stages.is_empty() {
+        debug_assert!(
+            base_fee.is_none(),
+            "stages_to_xdr_phase_unsorted: zero-tx stages must not have Some(base_fee)"
+        );
+        return TransactionPhase::V1(ParallelTxsComponent {
+            base_fee: None,
+            execution_stages: VecM::default(),
+        });
+    }
+
     let execution_stages: Vec<ParallelTxExecutionStage> = stages
         .into_iter()
         .map(|stage| {
@@ -1937,6 +1993,157 @@ mod stages_to_xdr_phase_tests {
         let xdr1 = phase1.to_xdr(stellar_xdr::curr::Limits::none()).unwrap();
         let xdr2 = phase2.to_xdr(stellar_xdr::curr::Limits::none()).unwrap();
         assert_eq!(xdr1, xdr2, "stages_to_xdr_phase should be idempotent");
+    }
+
+    // =========================================================================
+    // Empty/degenerate stages guards (#2314)
+    // =========================================================================
+
+    fn assert_canonical_empty(phase: &TransactionPhase) {
+        match phase {
+            TransactionPhase::V1(parallel) => {
+                assert_eq!(
+                    parallel.base_fee, None,
+                    "base_fee must be None for empty stages"
+                );
+                assert!(
+                    parallel.execution_stages.is_empty(),
+                    "execution_stages must be empty"
+                );
+            }
+            _ => panic!("Expected V1 phase"),
+        }
+    }
+
+    // -- Truly empty stages, base_fee: None --
+
+    #[test]
+    fn test_empty_stages_none_base_fee_returns_canonical_empty() {
+        let phase = stages_to_xdr_phase(to_hashed_stages(vec![]), None);
+        assert_canonical_empty(&phase);
+    }
+
+    #[test]
+    fn test_unsorted_empty_stages_none_base_fee_returns_canonical_empty() {
+        let phase = stages_to_xdr_phase_unsorted(vec![], None);
+        assert_canonical_empty(&phase);
+    }
+
+    // -- Degenerate empty stages (vec![vec![]]), base_fee: None --
+
+    #[test]
+    fn test_degenerate_empty_none_base_fee_returns_canonical_empty() {
+        let phase = stages_to_xdr_phase(to_hashed_stages(vec![vec![]]), None);
+        assert_canonical_empty(&phase);
+    }
+
+    #[test]
+    fn test_unsorted_degenerate_empty_none_base_fee_returns_canonical_empty() {
+        let phase = stages_to_xdr_phase_unsorted(vec![vec![]], None);
+        assert_canonical_empty(&phase);
+    }
+
+    // -- Deeply degenerate empty stages (vec![vec![vec![]]]), base_fee: None --
+
+    #[test]
+    fn test_deeply_degenerate_empty_none_base_fee_returns_canonical_empty() {
+        let phase = stages_to_xdr_phase(to_hashed_stages(vec![vec![vec![]]]), None);
+        assert_canonical_empty(&phase);
+    }
+
+    #[test]
+    fn test_unsorted_deeply_degenerate_empty_none_base_fee_returns_canonical_empty() {
+        let phase = stages_to_xdr_phase_unsorted(vec![vec![vec![]]], None);
+        assert_canonical_empty(&phase);
+    }
+
+    // -- Empty stages with Some(base_fee) → debug_assert fires --
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "zero-tx stages must not have Some(base_fee)")]
+    fn test_empty_stages_some_base_fee_panics() {
+        stages_to_xdr_phase(to_hashed_stages(vec![]), Some(100));
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "zero-tx stages must not have Some(base_fee)")]
+    fn test_unsorted_empty_stages_some_base_fee_panics() {
+        stages_to_xdr_phase_unsorted(vec![], Some(100));
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "zero-tx stages must not have Some(base_fee)")]
+    fn test_degenerate_some_base_fee_panics() {
+        stages_to_xdr_phase(to_hashed_stages(vec![vec![]]), Some(100));
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "zero-tx stages must not have Some(base_fee)")]
+    fn test_unsorted_degenerate_some_base_fee_panics() {
+        stages_to_xdr_phase_unsorted(vec![vec![]], Some(100));
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "zero-tx stages must not have Some(base_fee)")]
+    fn test_deeply_degenerate_some_base_fee_panics() {
+        stages_to_xdr_phase(to_hashed_stages(vec![vec![vec![]]]), Some(100));
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "zero-tx stages must not have Some(base_fee)")]
+    fn test_unsorted_deeply_degenerate_some_base_fee_panics() {
+        stages_to_xdr_phase_unsorted(vec![vec![vec![]]], Some(100));
+    }
+
+    // -- Mixed degenerate: empty + non-empty stages (sort-panic regression) --
+
+    #[test]
+    fn test_mixed_degenerate_stages_no_panic() {
+        let tx = make_soroban_tx(1, 1, vec![], vec![contract_key(1)], 1000);
+        // First stage is empty, second has one cluster with one tx.
+        let stages = vec![vec![], vec![vec![tx.clone()]]];
+        let phase = stages_to_xdr_phase(to_hashed_stages(stages), Some(100));
+
+        match phase {
+            TransactionPhase::V1(parallel) => {
+                assert_eq!(parallel.base_fee, Some(100));
+                assert_eq!(
+                    parallel.execution_stages.len(),
+                    1,
+                    "empty stage should be stripped"
+                );
+                assert_eq!(parallel.execution_stages[0].0.len(), 1, "one cluster");
+                assert_eq!(parallel.execution_stages[0].0[0].0.len(), 1, "one tx");
+            }
+            _ => panic!("Expected V1 phase"),
+        }
+    }
+
+    #[test]
+    fn test_unsorted_mixed_degenerate_no_panic() {
+        let tx = make_soroban_tx(1, 1, vec![], vec![contract_key(1)], 1000);
+        let stages = vec![vec![], vec![vec![tx.clone()]]];
+        let phase = stages_to_xdr_phase_unsorted(stages, Some(100));
+
+        match phase {
+            TransactionPhase::V1(parallel) => {
+                assert_eq!(parallel.base_fee, Some(100));
+                assert_eq!(
+                    parallel.execution_stages.len(),
+                    1,
+                    "empty stage should be stripped"
+                );
+                assert_eq!(parallel.execution_stages[0].0.len(), 1, "one cluster");
+                assert_eq!(parallel.execution_stages[0].0[0].0.len(), 1, "one tx");
+            }
+            _ => panic!("Expected V1 phase"),
+        }
     }
 }
 
