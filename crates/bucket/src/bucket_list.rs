@@ -4994,4 +4994,142 @@ mod tests {
             .await;
         assert!(result.is_ok(), "restart should succeed: {:?}", result.err());
     }
+
+    // -----------------------------------------------------------------------
+    // Regression tests for #2380: missing bucket files must not be silently
+    // downgraded.  Prior to the fix the restore / reconstruct paths would
+    // clear the pending‐merge state when the referenced bucket was absent,
+    // leading to bucket list hash divergence.  These tests verify that a
+    // missing file propagates as an error.
+    // -----------------------------------------------------------------------
+
+    /// A non-zero, non-sentinel hash that no loader will recognise.
+    fn phantom_hash() -> Hash256 {
+        Hash256::from_bytes([0xAB; 32])
+    }
+
+    #[test]
+    fn test_restore_from_has_fails_on_missing_state1_output() {
+        // HAS level 1 says state=1 (output ready) with a hash that doesn't
+        // exist in the loader.  restore_from_has must propagate the load error
+        // rather than silently clearing the merge.
+        let hashes = vec![(Hash256::ZERO, Hash256::ZERO); BUCKET_LIST_LEVELS];
+        let mut next_states = vec![HasNextState::default(); BUCKET_LIST_LEVELS];
+        next_states[1] = HasNextState {
+            state: HAS_NEXT_STATE_OUTPUT,
+            output: Some(phantom_hash()),
+            input_curr: None,
+            input_snap: None,
+        };
+
+        let result = BucketList::restore_from_has(&hashes, &next_states, |hash: &Hash256| {
+            Err(BucketError::Serialization(format!(
+                "bucket not found: {}",
+                hash.to_hex()
+            )))
+        });
+
+        assert!(
+            result.is_err(),
+            "restore_from_has must fail when state-1 output bucket is missing"
+        );
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("not found"),
+            "error should mention missing bucket: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_restore_from_has_parallel_fails_on_missing_state1_output() {
+        // Same as above but via the parallel restore path.
+        let hashes = vec![(Hash256::ZERO, Hash256::ZERO); BUCKET_LIST_LEVELS];
+        let mut next_states = vec![HasNextState::default(); BUCKET_LIST_LEVELS];
+        next_states[1] = HasNextState {
+            state: HAS_NEXT_STATE_OUTPUT,
+            output: Some(phantom_hash()),
+            input_curr: None,
+            input_snap: None,
+        };
+
+        let loader = |hash: &Hash256| -> crate::Result<Bucket> {
+            Err(BucketError::Serialization(format!(
+                "bucket not found: {}",
+                hash.to_hex()
+            )))
+        };
+
+        let result = BucketList::restore_from_has_parallel(&hashes, &next_states, loader);
+        assert!(
+            result.is_err(),
+            "restore_from_has_parallel must fail when state-1 output bucket is missing"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_restart_merges_fails_on_missing_state2_inputs() {
+        // HAS level 1 says state=2 (merge in progress) with input hashes
+        // that don't exist in the loader.  restart_merges_from_has must fail.
+        let mut bl = BucketList::new();
+        let mut next_states = vec![HasNextState::default(); BUCKET_LIST_LEVELS];
+        next_states[1] = HasNextState {
+            state: HAS_NEXT_STATE_INPUTS,
+            input_curr: Some(phantom_hash()),
+            input_snap: Some(Hash256::ZERO),
+            output: None,
+        };
+
+        let result = bl
+            .restart_merges_from_has(
+                1,
+                TEST_PROTOCOL,
+                &next_states,
+                |hash: &Hash256| -> crate::Result<Bucket> {
+                    Err(BucketError::Serialization(format!(
+                        "bucket not found: {}",
+                        hash.to_hex()
+                    )))
+                },
+                false,
+            )
+            .await;
+
+        assert!(
+            result.is_err(),
+            "restart_merges_from_has must fail when state-2 input bucket is missing"
+        );
+    }
+
+    #[test]
+    fn test_restore_from_has_succeeds_with_all_buckets_present() {
+        // Positive test: state-1 output exists in the loader → restore succeeds.
+        let entry = make_account_entry([42u8; 32], 500);
+        let output_bucket = Bucket::from_entries(vec![BucketListEntry::Liveentry(entry)]).unwrap();
+        let output_hash = output_bucket.hash();
+
+        let hashes = vec![(Hash256::ZERO, Hash256::ZERO); BUCKET_LIST_LEVELS];
+        let mut next_states = vec![HasNextState::default(); BUCKET_LIST_LEVELS];
+        next_states[1] = HasNextState {
+            state: HAS_NEXT_STATE_OUTPUT,
+            output: Some(output_hash),
+            input_curr: None,
+            input_snap: None,
+        };
+
+        let loader = make_loader(vec![output_bucket]);
+        let result = BucketList::restore_from_has_parallel(&hashes, &next_states, loader);
+        assert!(
+            result.is_ok(),
+            "restore should succeed when all buckets are present: {:?}",
+            result.err()
+        );
+
+        let bl = result.unwrap();
+        // Level 1 should have a pending merge (InMemory) with the output
+        let merge_state = bl.levels()[1].pending_merge_state();
+        assert!(
+            matches!(merge_state, Some(PendingMergeState::Output(h)) if h == output_hash),
+            "level 1 should have pending merge with output hash"
+        );
+    }
 }

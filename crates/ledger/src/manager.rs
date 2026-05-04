@@ -44,7 +44,7 @@ use crate::{
 };
 use henyey_bucket::{
     BucketEntry, BucketEntryExt, BucketList, BucketListSnapshot, BucketMergeMap, EvictionIterator,
-    EvictionResult, HotArchiveBucketList,
+    EvictionResult, HotArchiveBucketList, PendingMergeState,
 };
 use henyey_common::protocol::{
     hot_archive_supported, needs_upgrade_to_version, protocol_version_starts_from, ProtocolVersion,
@@ -1668,13 +1668,24 @@ impl LedgerManager {
             "HASH_MISMATCH_DEBUG: Live bucket list state"
         );
 
-        for (level, level_hash, curr_hash, snap_hash) in bucket_list.level_hashes() {
+        for (i, level) in bucket_list.levels().iter().enumerate() {
+            let level_hash = level.hash();
+            let curr_hash = level.curr.hash();
+            let snap_hash = level.snap.hash();
+            let merge_state = match level.pending_merge_state() {
+                None => "none".to_string(),
+                Some(PendingMergeState::Output(h)) => format!("output:{}", h.to_hex()),
+                Some(PendingMergeState::Inputs { curr, snap }) => {
+                    format!("inputs:curr={},snap={}", curr.to_hex(), snap.to_hex())
+                }
+            };
             tracing::error!(
                 ledger_seq,
-                level,
+                level = i,
                 level_hash = %level_hash.to_hex(),
                 curr_hash = %curr_hash.to_hex(),
                 snap_hash = %snap_hash.to_hex(),
+                merge_state = %merge_state,
                 "HASH_MISMATCH_DEBUG: Live bucket list level"
             );
         }
@@ -1689,13 +1700,21 @@ impl LedgerManager {
                 "HASH_MISMATCH_DEBUG: Hot archive bucket list state"
             );
 
-            for (level, level_hash, curr_hash, snap_hash) in ha.level_hashes() {
+            for (i, level) in ha.levels().iter().enumerate() {
+                let level_hash = level.hash();
+                let curr_hash = level.curr().hash();
+                let snap_hash = level.snap_bucket().hash();
+                let merge_state = match level.pending_merge_output_hash() {
+                    None => "none".to_string(),
+                    Some(h) => format!("output:{}", h.to_hex()),
+                };
                 tracing::error!(
                     ledger_seq,
-                    level,
+                    level = i,
                     level_hash = %level_hash.to_hex(),
                     curr_hash = %curr_hash.to_hex(),
                     snap_hash = %snap_hash.to_hex(),
+                    merge_state = %merge_state,
                     "HASH_MISMATCH_DEBUG: Hot archive bucket list level"
                 );
             }
