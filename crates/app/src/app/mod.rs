@@ -247,6 +247,18 @@ const RECOVERY_HARD_RESET_ESCALATION_ATTEMPTS: u64 =
 const RECOVERY_HARD_RESET_ESCALATION_ATTEMPTS_NO_SCP: u64 =
     (HARD_RESET_STALL_SECS * 3 / 2 / OUT_OF_SYNC_RECOVERY_TIMER_SECS) - 1;
 
+/// Maximum wall-clock duration (seconds) a node may remain stuck at the same
+/// ledger with hard resets firing before triggering a fail-fast shutdown with
+/// wipe signal. Computed as 2× the checkpoint publish window, floored at 120s.
+///
+/// At default frequency (64): 640s (~10.7 min)
+/// At accelerated frequency (8): 120s (floor)
+fn hard_reset_fatal_timeout_secs() -> u64 {
+    let freq = checkpoint_frequency() as u64;
+    let publish_window = freq * 5;
+    (publish_window * 2).max(120)
+}
+
 /// /health returns unhealthy (503) when consensus_stuck_state has been
 /// populated for at least this long. Strictly less than
 /// HARD_RESET_STALL_SECS so operators see the stall *before* the node
@@ -667,6 +679,11 @@ pub struct App {
     last_hard_reset_gap: AtomicU64,
     /// Total number of post-catchup hard resets performed.
     pub(crate) post_catchup_hard_reset_total: AtomicU64,
+    /// Seconds-since-start_instant when hard-reset livelock tracking began
+    /// for the current stuck ledger. Zero means no active tracking.
+    hard_reset_livelock_start: AtomicU64,
+    /// The ledger at which hard-reset livelock tracking started.
+    hard_reset_livelock_ledger: AtomicU32,
     /// Deterministic per-node jitter seed derived from the keypair's public key.
     /// Used to stagger recovery timer across nodes.
     jitter_seed: u64,
@@ -1114,6 +1131,8 @@ impl App {
             last_hard_reset_offset: AtomicU64::new(0),
             last_hard_reset_gap: AtomicU64::new(0),
             post_catchup_hard_reset_total: AtomicU64::new(0),
+            hard_reset_livelock_start: AtomicU64::new(0),
+            hard_reset_livelock_ledger: AtomicU32::new(0),
             jitter_seed,
             start_instant,
             lost_sync_count: AtomicU64::new(0),
