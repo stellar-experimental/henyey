@@ -440,56 +440,146 @@ impl ComparableEntry for TransactionHistoryResultEntry {
     }
 }
 
+/// Validates that entries are strictly increasing by `ledger_seq`.
+/// Returns the index of the first violation, or `None` if valid.
+fn find_ordering_violation<T: ComparableEntry>(entries: &[T]) -> Option<usize> {
+    entries
+        .windows(2)
+        .position(|w| w[1].ledger_seq() <= w[0].ledger_seq())
+        .map(|pos| pos + 1)
+}
+
+/// Compares two entry slices by `ledger_seq` using a merge-join.
+///
+/// Both slices must be strictly increasing by `ledger_seq`. If either is not,
+/// a mismatch is reported and comparison is skipped. Entries present in one
+/// side but not the other are reported individually by ledger number. Payload
+/// differences and serialization failures are reported explicitly.
 fn compare_entries<T: ComparableEntry>(local: &[T], reference: &[T]) -> Vec<Mismatch> {
     let mut out = Vec::new();
     let category = T::category();
-    if local.len() != reference.len() {
+
+    // Validate strict ordering on both sides.
+    if let Some(idx) = find_ordering_violation(local) {
         out.push(Mismatch {
             category,
             detail: format!(
-                "entry count: local={} reference={}",
-                local.len(),
-                reference.len()
+                "local entries not strictly ordered by ledger_seq (at index {})",
+                idx
             ),
         });
+        return out;
+    }
+    if let Some(idx) = find_ordering_violation(reference) {
+        out.push(Mismatch {
+            category,
+            detail: format!(
+                "reference entries not strictly ordered by ledger_seq (at index {})",
+                idx
+            ),
+        });
+        return out;
     }
 
-    let min_len = local.len().min(reference.len());
-    for i in 0..min_len {
+    // Merge-join on ledger_seq.
+    let mut i = 0;
+    let mut j = 0;
+    while i < local.len() && j < reference.len() {
         let l = &local[i];
-        let r = &reference[i];
-
-        if l.ledger_seq() != r.ledger_seq() {
-            out.push(Mismatch {
-                category,
-                detail: format!(
-                    "entry {}: ledger_seq local={} reference={}",
-                    i,
-                    l.ledger_seq(),
-                    r.ledger_seq()
-                ),
-            });
-            continue;
-        }
-
-        let l_xdr = l.payload_xdr();
-        let r_xdr = r.payload_xdr();
-        match (l_xdr, r_xdr) {
-            (Ok(l_bytes), Ok(r_bytes)) if l_bytes != r_bytes => {
+        let r = &reference[j];
+        match l.ledger_seq().cmp(&r.ledger_seq()) {
+            std::cmp::Ordering::Equal => {
+                // Compare payloads, handling serialization errors explicitly.
+                match (l.payload_xdr(), r.payload_xdr()) {
+                    (Ok(l_bytes), Ok(r_bytes)) => {
+                        if l_bytes != r_bytes {
+                            out.push(Mismatch {
+                                category,
+                                detail: format!(
+                                    "ledger {}: {} differs (local {} bytes, reference {} bytes)",
+                                    l.ledger_seq(),
+                                    T::payload_name(),
+                                    l_bytes.len(),
+                                    r_bytes.len(),
+                                ),
+                            });
+                        }
+                    }
+                    (Err(e), _) => {
+                        out.push(Mismatch {
+                            category,
+                            detail: format!(
+                                "ledger {}: local {} serialization error: {}",
+                                l.ledger_seq(),
+                                T::payload_name(),
+                                e
+                            ),
+                        });
+                    }
+                    (_, Err(e)) => {
+                        out.push(Mismatch {
+                            category,
+                            detail: format!(
+                                "ledger {}: reference {} serialization error: {}",
+                                r.ledger_seq(),
+                                T::payload_name(),
+                                e
+                            ),
+                        });
+                    }
+                }
+                i += 1;
+                j += 1;
+            }
+            std::cmp::Ordering::Less => {
                 out.push(Mismatch {
                     category,
                     detail: format!(
-                        "ledger {}: {} differs (local {} bytes, reference {} bytes)",
+                        "ledger {}: {} entry present in local but missing in reference",
                         l.ledger_seq(),
                         T::payload_name(),
-                        l_bytes.len(),
-                        r_bytes.len(),
                     ),
                 });
+                i += 1;
             }
-            _ => {}
+            std::cmp::Ordering::Greater => {
+                out.push(Mismatch {
+                    category,
+                    detail: format!(
+                        "ledger {}: {} entry present in reference but missing in local",
+                        r.ledger_seq(),
+                        T::payload_name(),
+                    ),
+                });
+                j += 1;
+            }
         }
     }
+
+    // Report remaining entries on either side.
+    while i < local.len() {
+        out.push(Mismatch {
+            category,
+            detail: format!(
+                "ledger {}: {} entry present in local but missing in reference",
+                local[i].ledger_seq(),
+                T::payload_name(),
+            ),
+        });
+        i += 1;
+    }
+    while j < reference.len() {
+        out.push(Mismatch {
+            category,
+            detail: format!(
+                "ledger {}: {} entry present in reference but missing in local",
+                reference[j].ledger_seq(),
+                T::payload_name(),
+            ),
+        });
+        j += 1;
+    }
+
     out
 }
 
@@ -497,6 +587,73 @@ fn compare_entries<T: ComparableEntry>(local: &[T], reference: &[T]) -> Vec<Mism
 mod tests {
     use super::*;
     use crate::archive_state::{HASBucketLevel, HASBucketNext};
+    use stellar_xdr::curr::{
+        Hash, TransactionHistoryEntryExt, TransactionHistoryResultEntryExt, TransactionResultSet,
+        TransactionSet,
+    };
+
+    // ========================================================================
+    // Helpers for compare_entries tests
+    // ========================================================================
+
+    fn make_tx_entry(ledger_seq: u32) -> TransactionHistoryEntry {
+        TransactionHistoryEntry {
+            ledger_seq,
+            tx_set: TransactionSet {
+                previous_ledger_hash: Hash([0u8; 32]),
+                txs: stellar_xdr::curr::VecM::default(),
+            },
+            ext: TransactionHistoryEntryExt::V0,
+        }
+    }
+
+    fn make_tx_entry_with_hash(ledger_seq: u32, hash_byte: u8) -> TransactionHistoryEntry {
+        TransactionHistoryEntry {
+            ledger_seq,
+            tx_set: TransactionSet {
+                previous_ledger_hash: Hash([hash_byte; 32]),
+                txs: stellar_xdr::curr::VecM::default(),
+            },
+            ext: TransactionHistoryEntryExt::V0,
+        }
+    }
+
+    fn make_result_entry(ledger_seq: u32) -> TransactionHistoryResultEntry {
+        TransactionHistoryResultEntry {
+            ledger_seq,
+            tx_result_set: TransactionResultSet {
+                results: stellar_xdr::curr::VecM::default(),
+            },
+            ext: TransactionHistoryResultEntryExt::default(),
+        }
+    }
+
+    fn make_result_entry_with_results(
+        ledger_seq: u32,
+        num_results: usize,
+    ) -> TransactionHistoryResultEntry {
+        // Create entries with different content by varying the number of
+        // (empty) result pairs.
+        let results: Vec<stellar_xdr::curr::TransactionResultPair> = (0..num_results)
+            .map(|_| stellar_xdr::curr::TransactionResultPair {
+                transaction_hash: stellar_xdr::curr::Hash([0u8; 32]),
+                result: stellar_xdr::curr::TransactionResult {
+                    fee_charged: 100,
+                    result: stellar_xdr::curr::TransactionResultResult::TxSuccess(
+                        stellar_xdr::curr::VecM::default(),
+                    ),
+                    ext: stellar_xdr::curr::TransactionResultExt::V0,
+                },
+            })
+            .collect();
+        TransactionHistoryResultEntry {
+            ledger_seq,
+            tx_result_set: TransactionResultSet {
+                results: results.try_into().unwrap(),
+            },
+            ext: TransactionHistoryResultEntryExt::default(),
+        }
+    }
 
     fn make_has(ledger: u32, curr_hashes: &[&str]) -> HistoryArchiveState {
         let levels: Vec<HASBucketLevel> = curr_hashes
@@ -550,5 +707,280 @@ mod tests {
         let mismatches = compare_has(&a, &b);
         assert_eq!(mismatches.len(), 1);
         assert!(mismatches[0].detail.contains("bucket level count"));
+    }
+
+    // ========================================================================
+    // compare_entries tests — TransactionHistoryEntry
+    // ========================================================================
+
+    #[test]
+    fn test_compare_entries_identical() {
+        let entries = vec![make_tx_entry(100), make_tx_entry(101), make_tx_entry(102)];
+        let mismatches = compare_entries(&entries, &entries);
+        assert!(mismatches.is_empty());
+    }
+
+    #[test]
+    fn test_compare_entries_both_empty() {
+        let empty: Vec<TransactionHistoryEntry> = vec![];
+        let mismatches = compare_entries(&empty, &empty);
+        assert!(mismatches.is_empty());
+    }
+
+    #[test]
+    fn test_compare_entries_local_has_extra() {
+        let local = vec![make_tx_entry(100), make_tx_entry(101), make_tx_entry(102)];
+        let reference = vec![make_tx_entry(100), make_tx_entry(102)];
+        let mismatches = compare_entries(&local, &reference);
+        assert_eq!(mismatches.len(), 1);
+        assert_eq!(
+            mismatches[0].detail,
+            "ledger 101: tx_set entry present in local but missing in reference"
+        );
+    }
+
+    #[test]
+    fn test_compare_entries_reference_has_extra() {
+        let local = vec![make_tx_entry(100), make_tx_entry(102)];
+        let reference = vec![make_tx_entry(100), make_tx_entry(101), make_tx_entry(102)];
+        let mismatches = compare_entries(&local, &reference);
+        assert_eq!(mismatches.len(), 1);
+        assert_eq!(
+            mismatches[0].detail,
+            "ledger 101: tx_set entry present in reference but missing in local"
+        );
+    }
+
+    #[test]
+    fn test_compare_entries_interleaved_missing() {
+        // local has ledgers 100, 102, 104; reference has 101, 102, 103
+        let local = vec![make_tx_entry(100), make_tx_entry(102), make_tx_entry(104)];
+        let reference = vec![make_tx_entry(101), make_tx_entry(102), make_tx_entry(103)];
+        let mismatches = compare_entries(&local, &reference);
+        assert_eq!(mismatches.len(), 4);
+        assert_eq!(
+            mismatches[0].detail,
+            "ledger 100: tx_set entry present in local but missing in reference"
+        );
+        assert_eq!(
+            mismatches[1].detail,
+            "ledger 101: tx_set entry present in reference but missing in local"
+        );
+        // ledger 102 matches (no mismatch)
+        assert_eq!(
+            mismatches[2].detail,
+            "ledger 103: tx_set entry present in reference but missing in local"
+        );
+        assert_eq!(
+            mismatches[3].detail,
+            "ledger 104: tx_set entry present in local but missing in reference"
+        );
+    }
+
+    #[test]
+    fn test_compare_entries_payload_mismatch() {
+        let local = vec![make_tx_entry_with_hash(100, 0xAA)];
+        let reference = vec![make_tx_entry_with_hash(100, 0xBB)];
+        let mismatches = compare_entries(&local, &reference);
+        assert_eq!(mismatches.len(), 1);
+        assert!(mismatches[0]
+            .detail
+            .starts_with("ledger 100: tx_set differs"));
+    }
+
+    #[test]
+    fn test_compare_entries_interleaved_missing_and_payload_mismatch() {
+        // Proves merge-join re-synchronizes after gaps and still finds payload diff.
+        let local = vec![
+            make_tx_entry(100),
+            make_tx_entry(102),
+            make_tx_entry_with_hash(104, 0xAA),
+        ];
+        let reference = vec![
+            make_tx_entry(101),
+            make_tx_entry(102),
+            make_tx_entry_with_hash(104, 0xBB),
+        ];
+        let mismatches = compare_entries(&local, &reference);
+        assert_eq!(mismatches.len(), 3);
+        assert!(mismatches[0].detail.contains("ledger 100"));
+        assert!(mismatches[0]
+            .detail
+            .contains("present in local but missing in reference"));
+        assert!(mismatches[1].detail.contains("ledger 101"));
+        assert!(mismatches[1]
+            .detail
+            .contains("present in reference but missing in local"));
+        // ledger 102 matches
+        assert!(mismatches[2]
+            .detail
+            .starts_with("ledger 104: tx_set differs"));
+    }
+
+    #[test]
+    fn test_compare_entries_trailing_on_local() {
+        let local = vec![make_tx_entry(100), make_tx_entry(101), make_tx_entry(102)];
+        let reference = vec![make_tx_entry(100)];
+        let mismatches = compare_entries(&local, &reference);
+        assert_eq!(mismatches.len(), 2);
+        assert!(mismatches[0].detail.contains("ledger 101"));
+        assert!(mismatches[0]
+            .detail
+            .contains("present in local but missing in reference"));
+        assert!(mismatches[1].detail.contains("ledger 102"));
+        assert!(mismatches[1]
+            .detail
+            .contains("present in local but missing in reference"));
+    }
+
+    #[test]
+    fn test_compare_entries_trailing_on_reference() {
+        let local = vec![make_tx_entry(100)];
+        let reference = vec![make_tx_entry(100), make_tx_entry(101), make_tx_entry(102)];
+        let mismatches = compare_entries(&local, &reference);
+        assert_eq!(mismatches.len(), 2);
+        assert!(mismatches[0].detail.contains("ledger 101"));
+        assert!(mismatches[0]
+            .detail
+            .contains("present in reference but missing in local"));
+        assert!(mismatches[1].detail.contains("ledger 102"));
+        assert!(mismatches[1]
+            .detail
+            .contains("present in reference but missing in local"));
+    }
+
+    #[test]
+    fn test_compare_entries_empty_vs_nonempty() {
+        let empty: Vec<TransactionHistoryEntry> = vec![];
+        let entries = vec![make_tx_entry(100), make_tx_entry(101)];
+
+        let mismatches = compare_entries(&empty, &entries);
+        assert_eq!(mismatches.len(), 2);
+        assert!(mismatches[0]
+            .detail
+            .contains("present in reference but missing in local"));
+        assert!(mismatches[1]
+            .detail
+            .contains("present in reference but missing in local"));
+
+        let mismatches = compare_entries(&entries, &empty);
+        assert_eq!(mismatches.len(), 2);
+        assert!(mismatches[0]
+            .detail
+            .contains("present in local but missing in reference"));
+        assert!(mismatches[1]
+            .detail
+            .contains("present in local but missing in reference"));
+    }
+
+    #[test]
+    fn test_compare_entries_duplicate_ledger_seq_local() {
+        let local = vec![make_tx_entry(100), make_tx_entry(100)];
+        let reference = vec![make_tx_entry(100)];
+        let mismatches = compare_entries(&local, &reference);
+        assert_eq!(mismatches.len(), 1);
+        assert!(mismatches[0]
+            .detail
+            .contains("local entries not strictly ordered"));
+    }
+
+    #[test]
+    fn test_compare_entries_duplicate_ledger_seq_reference() {
+        let local = vec![make_tx_entry(100)];
+        let reference = vec![make_tx_entry(100), make_tx_entry(100)];
+        let mismatches = compare_entries(&local, &reference);
+        assert_eq!(mismatches.len(), 1);
+        assert!(mismatches[0]
+            .detail
+            .contains("reference entries not strictly ordered"));
+    }
+
+    #[test]
+    fn test_compare_entries_out_of_order_local() {
+        let local = vec![make_tx_entry(102), make_tx_entry(101)];
+        let reference = vec![make_tx_entry(101), make_tx_entry(102)];
+        let mismatches = compare_entries(&local, &reference);
+        assert_eq!(mismatches.len(), 1);
+        assert!(mismatches[0]
+            .detail
+            .contains("local entries not strictly ordered"));
+    }
+
+    #[test]
+    fn test_compare_entries_out_of_order_reference() {
+        let local = vec![make_tx_entry(101), make_tx_entry(102)];
+        let reference = vec![make_tx_entry(102), make_tx_entry(101)];
+        let mismatches = compare_entries(&local, &reference);
+        assert_eq!(mismatches.len(), 1);
+        assert!(mismatches[0]
+            .detail
+            .contains("reference entries not strictly ordered"));
+    }
+
+    // ========================================================================
+    // compare_entries tests — TransactionHistoryResultEntry
+    // ========================================================================
+
+    #[test]
+    fn test_compare_result_entries_identical() {
+        let entries = vec![make_result_entry(100), make_result_entry(101)];
+        let mismatches = compare_entries(&entries, &entries);
+        assert!(mismatches.is_empty());
+    }
+
+    #[test]
+    fn test_compare_result_entries_local_has_extra() {
+        let local = vec![
+            make_result_entry(100),
+            make_result_entry(101),
+            make_result_entry(102),
+        ];
+        let reference = vec![make_result_entry(100), make_result_entry(102)];
+        let mismatches = compare_entries(&local, &reference);
+        assert_eq!(mismatches.len(), 1);
+        assert_eq!(
+            mismatches[0].detail,
+            "ledger 101: tx_result_set entry present in local but missing in reference"
+        );
+        assert_eq!(mismatches[0].category, Category::Results);
+    }
+
+    #[test]
+    fn test_compare_result_entries_payload_mismatch() {
+        let local = vec![make_result_entry_with_results(100, 1)];
+        let reference = vec![make_result_entry_with_results(100, 2)];
+        let mismatches = compare_entries(&local, &reference);
+        assert_eq!(mismatches.len(), 1);
+        assert!(mismatches[0]
+            .detail
+            .starts_with("ledger 100: tx_result_set differs"));
+        assert_eq!(mismatches[0].category, Category::Results);
+    }
+
+    #[test]
+    fn test_compare_result_entries_interleaved_and_mismatch() {
+        let local = vec![
+            make_result_entry(100),
+            make_result_entry(102),
+            make_result_entry_with_results(104, 1),
+        ];
+        let reference = vec![
+            make_result_entry(101),
+            make_result_entry(102),
+            make_result_entry_with_results(104, 2),
+        ];
+        let mismatches = compare_entries(&local, &reference);
+        assert_eq!(mismatches.len(), 3);
+        assert!(mismatches[0].detail.contains("ledger 100"));
+        assert!(mismatches[0]
+            .detail
+            .contains("present in local but missing in reference"));
+        assert!(mismatches[1].detail.contains("ledger 101"));
+        assert!(mismatches[1]
+            .detail
+            .contains("present in reference but missing in local"));
+        assert!(mismatches[2]
+            .detail
+            .starts_with("ledger 104: tx_result_set differs"));
     }
 }
