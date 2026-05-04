@@ -142,7 +142,13 @@ fn verify_header_chain_inner<'a>(
 ///
 /// # Errors
 ///
-/// Returns [`HistoryError::VerificationFailed`] if any anchor check fails.
+/// Returns [`HistoryError::VerificationHashMismatch`] with
+/// [`VerifyHashKind::BottomAnchor`](crate::error::VerifyHashKind::BottomAnchor)
+/// if the bottom anchor check fails, or with
+/// [`VerifyHashKind::Lcl`](crate::error::VerifyHashKind::Lcl) if the LCL hash
+/// check fails. May also return [`HistoryError::CorruptHeader`] if
+/// `compute_header_hash` fails to encode a header (only on the LCL-comparison
+/// path).
 pub fn verify_chain_anchors(headers: &[LedgerHeader], anchors: &ChainTrustAnchors) -> Result<()> {
     if headers.is_empty() {
         return Ok(());
@@ -153,12 +159,13 @@ pub fn verify_chain_anchors(headers: &[LedgerHeader], anchors: &ChainTrustAnchor
         let first = &headers[0];
         let actual_prev = Hash256::from(first.previous_ledger_hash.clone());
         if actual_prev != *expected_prev {
-            return Err(HistoryError::VerificationFailed(format!(
-                "chain trust anchor mismatch at ledger {}: first header's \
-                 previous_ledger_hash {} != expected {}",
-                first.ledger_seq,
-                actual_prev.to_hex(),
-                expected_prev.to_hex(),
+            return Err(HistoryError::VerificationHashMismatch(Box::new(
+                crate::error::VerifyHashMismatchInfo {
+                    kind: crate::error::VerifyHashKind::BottomAnchor,
+                    ledger: Some(first.ledger_seq),
+                    expected: *expected_prev,
+                    actual: actual_prev,
+                },
             )));
         }
     }
@@ -170,12 +177,13 @@ pub fn verify_chain_anchors(headers: &[LedgerHeader], anchors: &ChainTrustAnchor
             if header.ledger_seq == lcl_seq {
                 let header_hash = compute_header_hash(header)?;
                 if header_hash != *lcl_hash {
-                    return Err(HistoryError::VerificationFailed(format!(
-                        "local state corruption detected: archive header at LCL \
-                         seq {} has hash {}, but local LCL hash is {}",
-                        lcl_seq,
-                        header_hash.to_hex(),
-                        lcl_hash.to_hex(),
+                    return Err(HistoryError::VerificationHashMismatch(Box::new(
+                        crate::error::VerifyHashMismatchInfo {
+                            kind: crate::error::VerifyHashKind::Lcl,
+                            ledger: Some(lcl_seq),
+                            expected: *lcl_hash,
+                            actual: header_hash,
+                        },
                     )));
                 }
                 break;
@@ -897,9 +905,16 @@ mod tests {
             ..Default::default()
         };
         let result = verify_chain_anchors(&[h1], &anchors);
-        assert!(result.is_err());
-        let msg = format!("{}", result.unwrap_err());
-        assert!(msg.contains("chain trust anchor mismatch"), "got: {}", msg);
+        let err = result.unwrap_err();
+        match &err {
+            HistoryError::VerificationHashMismatch(info) => {
+                assert_eq!(info.kind, crate::error::VerifyHashKind::BottomAnchor);
+                assert_eq!(info.ledger, Some(10));
+                assert_eq!(info.expected, wrong_hash);
+                assert_eq!(info.actual, Hash256::ZERO);
+            }
+            other => panic!("expected VerificationHashMismatch, got: {other:?}"),
+        }
     }
 
     #[test]
@@ -917,6 +932,7 @@ mod tests {
     #[test]
     fn test_chain_anchors_lcl_hash_mismatch_detects_corruption() {
         let h1 = make_test_header(5, Hash256::ZERO);
+        let h1_hash = compute_header_hash(&h1).unwrap();
         let wrong_lcl_hash = Hash256::hash(b"corrupted local state");
         let anchors = ChainTrustAnchors {
             previous_ledger_hash: None,
@@ -924,9 +940,16 @@ mod tests {
             lcl_hash: Some(wrong_lcl_hash),
         };
         let result = verify_chain_anchors(&[h1], &anchors);
-        assert!(result.is_err());
-        let msg = format!("{}", result.unwrap_err());
-        assert!(msg.contains("local state corruption"), "got: {}", msg);
+        let err = result.unwrap_err();
+        match &err {
+            HistoryError::VerificationHashMismatch(info) => {
+                assert_eq!(info.kind, crate::error::VerifyHashKind::Lcl);
+                assert_eq!(info.ledger, Some(5));
+                assert_eq!(info.expected, wrong_lcl_hash);
+                assert_eq!(info.actual, h1_hash);
+            }
+            other => panic!("expected VerificationHashMismatch, got: {other:?}"),
+        }
     }
 
     #[test]

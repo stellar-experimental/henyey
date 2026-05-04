@@ -30,6 +30,12 @@ pub enum VerifyHashKind {
     /// Downloaded header hash doesn't match the trusted (SCP-verified) header
     /// hash.
     TrustedHeader,
+    /// First header's `previous_ledger_hash` doesn't match the expected
+    /// bottom-of-chain trust anchor.
+    BottomAnchor,
+    /// Computed header hash at the LCL sequence doesn't match the local LCL
+    /// hash (local state corruption).
+    Lcl,
 }
 
 impl std::fmt::Display for VerifyHashKind {
@@ -40,6 +46,8 @@ impl std::fmt::Display for VerifyHashKind {
             Self::LedgerHeaderEntry => write!(f, "ledger header entry"),
             Self::TxResultSet => write!(f, "tx result set"),
             Self::TrustedHeader => write!(f, "trusted header"),
+            Self::BottomAnchor => write!(f, "bottom anchor"),
+            Self::Lcl => write!(f, "LCL"),
         }
     }
 }
@@ -138,7 +146,8 @@ pub enum HistoryError {
     /// [`crate::verify::verify_ledger_hash`],
     /// [`crate::verify::verify_ledger_header_history_entry`],
     /// [`crate::verify::verify_tx_result_set`],
-    /// [`crate::verify::verify_header_matches_trusted`], and
+    /// [`crate::verify::verify_header_matches_trusted`],
+    /// [`crate::verify::verify_chain_anchors`], and
     /// [`crate::replay::execution::verify_bucket_list_hash`].
     #[error("verification hash mismatch: {0}")]
     VerificationHashMismatch(Box<VerifyHashMismatchInfo>),
@@ -317,13 +326,13 @@ impl HistoryError {
     }
 
     /// Returns `true` if this error represents a **typed** hash mismatch
-    /// (bucket, bucket list, ledger header, tx set, or trusted header) that
-    /// indicates state divergence.
+    /// (bucket, bucket list, ledger header, tx set, trusted header, bottom
+    /// anchor, or LCL) that indicates state divergence.
     ///
     /// Recognized variants:
     /// - [`VerificationHashMismatch`](HistoryError::VerificationHashMismatch)
     ///   — verification and replay paths (bucket, bucket list, header entry,
-    ///   tx result set, trusted header)
+    ///   tx result set, trusted header, bottom anchor, LCL)
     /// - [`InvalidTxSetHash`](HistoryError::InvalidTxSetHash) — tx set hash
     ///   mismatch with rich diagnostic context
     /// - [`Ledger(LedgerError::HashMismatch)`](HistoryError::Ledger) —
@@ -456,6 +465,8 @@ mod tests {
             VerifyHashKind::LedgerHeaderEntry,
             VerifyHashKind::TxResultSet,
             VerifyHashKind::TrustedHeader,
+            VerifyHashKind::BottomAnchor,
+            VerifyHashKind::Lcl,
         ] {
             let err = make_verify_hash_mismatch(kind, Some(42));
             assert!(
@@ -473,6 +484,8 @@ mod tests {
             VerifyHashKind::LedgerHeaderEntry,
             VerifyHashKind::TxResultSet,
             VerifyHashKind::TrustedHeader,
+            VerifyHashKind::BottomAnchor,
+            VerifyHashKind::Lcl,
         ] {
             let err = make_verify_hash_mismatch(kind, Some(42));
             assert!(
@@ -519,5 +532,7 @@ mod tests {
         );
         assert_eq!(VerifyHashKind::TxResultSet.to_string(), "tx result set");
         assert_eq!(VerifyHashKind::TrustedHeader.to_string(), "trusted header");
+        assert_eq!(VerifyHashKind::BottomAnchor.to_string(), "bottom anchor");
+        assert_eq!(VerifyHashKind::Lcl.to_string(), "LCL");
     }
 }
