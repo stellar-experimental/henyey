@@ -448,6 +448,74 @@ struct FlowControlState {
     peer_id: Option<PeerId>,
 }
 
+/// Result of attempting to admit a queued outbound message into a send batch.
+enum AdmitOutbound {
+    /// Message admitted: cloned into batch, then marked being_sent, capacity locked.
+    Admitted,
+    /// Message already being sent — skip to next message in this queue.
+    AlreadySending,
+    /// No outbound capacity — stop processing this priority queue.
+    NoCapacity,
+}
+
+impl FlowControlState {
+    /// Try to admit the message at `queue_idx`/`msg_idx` into `batch`.
+    ///
+    /// Enforces the required ordering from stellar-core FlowControl.cpp:172-203:
+    /// capacity check → being_sent check → clone to batch → mark being_sent → lock capacity.
+    fn try_admit_outbound(
+        &mut self,
+        queue_idx: usize,
+        msg_idx: usize,
+        batch: &mut Vec<QueuedOutboundMessage>,
+    ) -> AdmitOutbound {
+        let msg = self.outbound_queues[queue_idx][msg_idx].message.clone();
+
+        // 1. Check capacity (both message and byte)
+        if !self.message_capacity.has_outbound_capacity(&msg)
+            || !self.byte_capacity.has_outbound_capacity(&msg)
+        {
+            self.no_outbound_capacity = Some(Instant::now());
+            return AdmitOutbound::NoCapacity;
+        }
+
+        // 2. Check being_sent
+        if self.outbound_queues[queue_idx][msg_idx].being_sent {
+            return AdmitOutbound::AlreadySending;
+        }
+
+        // 3. Clone to batch (preserves being_sent=false in the returned entry)
+        batch.push(self.outbound_queues[queue_idx][msg_idx].clone());
+
+        // 4. Mark being_sent and lock capacity on the queue entry
+        self.outbound_queues[queue_idx][msg_idx].being_sent = true;
+        self.message_capacity.lock_outbound_capacity(&msg);
+        self.byte_capacity.lock_outbound_capacity(&msg);
+
+        AdmitOutbound::Admitted
+    }
+
+    /// Build the next batch of outbound messages across all priority queues.
+    ///
+    /// Mirrors stellar-core FlowControl.cpp:172-203: for each priority queue
+    /// (highest first), admit messages until capacity is exhausted (break inner)
+    /// then continue to lower-priority queues.
+    fn build_next_batch(&mut self) -> Vec<QueuedOutboundMessage> {
+        let mut batch = Vec::new();
+
+        for queue_idx in 0..self.outbound_queues.len() {
+            for msg_idx in 0..self.outbound_queues[queue_idx].len() {
+                match self.try_admit_outbound(queue_idx, msg_idx, &mut batch) {
+                    AdmitOutbound::Admitted | AdmitOutbound::AlreadySending => {}
+                    AdmitOutbound::NoCapacity => break,
+                }
+            }
+        }
+
+        batch
+    }
+}
+
 /// Flow control manager for a peer connection.
 ///
 /// Thread-safe flow control implementation that tracks capacity for
@@ -836,34 +904,7 @@ impl FlowControl {
     /// The caller must call `process_sent_messages` after actually sending them.
     pub fn get_next_batch_to_send(&self) -> Vec<QueuedOutboundMessage> {
         let mut state = self.state.lock().unwrap();
-        let mut batch = Vec::new();
-
-        // Mirrors stellar-core FlowControl.cpp:172-208.
-        // For each priority queue (highest priority first): check capacity
-        // before being_sent, lock capacity inline, and break only the inner
-        // loop so lower-priority queues are still processed.
-        for queue_idx in 0..state.outbound_queues.len() {
-            for msg_idx in 0..state.outbound_queues[queue_idx].len() {
-                let msg = state.outbound_queues[queue_idx][msg_idx].message.clone();
-
-                if !state.message_capacity.has_outbound_capacity(&msg)
-                    || !state.byte_capacity.has_outbound_capacity(&msg)
-                {
-                    state.no_outbound_capacity = Some(Instant::now());
-                    break;
-                }
-
-                if state.outbound_queues[queue_idx][msg_idx].being_sent {
-                    continue;
-                }
-
-                batch.push(state.outbound_queues[queue_idx][msg_idx].clone());
-                state.outbound_queues[queue_idx][msg_idx].being_sent = true;
-                state.message_capacity.lock_outbound_capacity(&msg);
-                state.byte_capacity.lock_outbound_capacity(&msg);
-            }
-        }
-
+        let batch = state.build_next_batch();
         trace!("Prepared batch of {} messages to send", batch.len());
         batch
     }
@@ -2072,5 +2113,46 @@ mod tests {
             fc.no_outbound_capacity_timeout(0),
             "no_outbound_capacity should be set from capacity check on being_sent head"
         );
+    }
+
+    #[test]
+    fn test_batch_entries_have_being_sent_false() {
+        // Regression: the clone-before-mark ordering in try_admit_outbound ensures
+        // that returned batch entries have being_sent=false, while the queue entries
+        // are marked being_sent=true. This locks in the invariant from
+        // stellar-core FlowControl.cpp:172-203.
+        let fc = FlowControl::default();
+        let tx = make_tx_message();
+
+        // Grant generous capacity
+        let send_more = StellarMessage::SendMoreExtended(SendMoreExtended {
+            num_messages: 10,
+            num_bytes: 100_000,
+        });
+        fc.maybe_release_capacity(&send_more);
+
+        // Enqueue two TX messages
+        fc.add_msg_and_maybe_trim_queue(tx.clone());
+        fc.add_msg_and_maybe_trim_queue(tx.clone());
+
+        let batch = fc.get_next_batch_to_send();
+        assert_eq!(batch.len(), 2);
+
+        // Batch entries must have being_sent=false (cloned before marking)
+        for (i, entry) in batch.iter().enumerate() {
+            assert!(
+                !entry.being_sent,
+                "batch[{i}].being_sent should be false (clone-before-mark invariant)"
+            );
+        }
+
+        // Queue entries should now be marked being_sent=true
+        let state = fc.state.lock().unwrap();
+        for msg_idx in 0..state.outbound_queues[MessagePriority::Transaction as usize].len() {
+            assert!(
+                state.outbound_queues[MessagePriority::Transaction as usize][msg_idx].being_sent,
+                "queue entry [{msg_idx}] should be marked being_sent=true after batching"
+            );
+        }
     }
 }
