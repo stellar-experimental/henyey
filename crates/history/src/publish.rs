@@ -653,7 +653,7 @@ mod tests {
         let err = manager
             .publish_checkpoint(63, &[entry], &[], &[], &BucketList::new(), None)
             .unwrap_err();
-        assert!(matches!(err, HistoryError::VerificationFailed(_)));
+        assert!(matches!(err, HistoryError::VerificationHashMismatch(_)));
     }
 
     /// Verify that `build_history_archive_state` produces a HAS whose bucket

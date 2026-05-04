@@ -200,9 +200,13 @@ pub fn verify_bucket_hash(data: &[u8], expected_hash: &Hash256) -> Result<()> {
     let actual_hash = Hash256::hash(data);
 
     if actual_hash != *expected_hash {
-        return Err(HistoryError::VerificationFailed(format!(
-            "bucket hash mismatch: expected {}, got {}",
-            expected_hash, actual_hash
+        return Err(HistoryError::VerificationHashMismatch(Box::new(
+            crate::error::VerifyHashMismatchInfo {
+                kind: crate::error::VerifyHashKind::Bucket,
+                ledger: None,
+                expected: *expected_hash,
+                actual: actual_hash,
+            },
         )));
     }
 
@@ -226,9 +230,13 @@ pub fn verify_ledger_hash(header: &LedgerHeader, bucket_list_hash: &Hash256) -> 
     let header_bucket_hash = Hash256::from(header.bucket_list_hash.clone());
 
     if header_bucket_hash != *bucket_list_hash {
-        return Err(HistoryError::VerificationFailed(format!(
-            "bucket list hash mismatch at ledger {}: header claims {}, computed {}",
-            header.ledger_seq, header_bucket_hash, bucket_list_hash
+        return Err(HistoryError::VerificationHashMismatch(Box::new(
+            crate::error::VerifyHashMismatchInfo {
+                kind: crate::error::VerifyHashKind::BucketList,
+                ledger: Some(header.ledger_seq),
+                expected: header_bucket_hash,
+                actual: *bucket_list_hash,
+            },
         )));
     }
 
@@ -259,9 +267,13 @@ pub fn verify_ledger_header_history_entry(entry: &LedgerHeaderHistoryEntry) -> R
     let advertised_hash = Hash256::from(entry.hash.clone());
 
     if computed_hash != advertised_hash {
-        return Err(HistoryError::VerificationFailed(format!(
-            "ledger-header entry hash mismatch at ledger {}: archive claims {}, computed {}",
-            entry.header.ledger_seq, advertised_hash, computed_hash
+        return Err(HistoryError::VerificationHashMismatch(Box::new(
+            crate::error::VerifyHashMismatchInfo {
+                kind: crate::error::VerifyHashKind::LedgerHeaderEntry,
+                ledger: Some(entry.header.ledger_seq),
+                expected: advertised_hash,
+                actual: computed_hash,
+            },
         )));
     }
 
@@ -289,9 +301,13 @@ pub fn verify_tx_result_set(header: &LedgerHeader, tx_result_set_xdr: &[u8]) -> 
     let expected_hash = Hash256::from(header.tx_set_result_hash.clone());
 
     if actual_hash != expected_hash {
-        return Err(HistoryError::VerificationFailed(format!(
-            "transaction result set hash mismatch at ledger {}: expected {}, got {}",
-            header.ledger_seq, expected_hash, actual_hash
+        return Err(HistoryError::VerificationHashMismatch(Box::new(
+            crate::error::VerifyHashMismatchInfo {
+                kind: crate::error::VerifyHashKind::TxResultSet,
+                ledger: Some(header.ledger_seq),
+                expected: expected_hash,
+                actual: actual_hash,
+            },
         )));
     }
 
@@ -392,9 +408,13 @@ pub fn verify_header_matches_trusted(
     let trusted_hash = compute_header_hash(trusted_header)?;
 
     if downloaded_hash != trusted_hash {
-        return Err(HistoryError::VerificationFailed(format!(
-            "header hash mismatch at ledger {}: downloaded {}, trusted {}",
-            downloaded_header.ledger_seq, downloaded_hash, trusted_hash
+        return Err(HistoryError::VerificationHashMismatch(Box::new(
+            crate::error::VerifyHashMismatchInfo {
+                kind: crate::error::VerifyHashKind::TrustedHeader,
+                ledger: Some(downloaded_header.ledger_seq),
+                expected: trusted_hash,
+                actual: downloaded_hash,
+            },
         )));
     }
 
@@ -1115,5 +1135,129 @@ mod tests {
         // Version 1 without passphrase — should be fine.
         let has = make_has_with_levels(11, 1, None);
         assert!(verify_has_structure(&has).is_ok());
+    }
+
+    // --- Direct producer tests for VerificationHashMismatch migration ---
+
+    #[test]
+    fn test_verify_bucket_hash_mismatch_typed() {
+        let data = b"some bucket data";
+        let wrong_hash = Hash256::ZERO;
+        let err = verify_bucket_hash(data, &wrong_hash).unwrap_err();
+
+        match err {
+            HistoryError::VerificationHashMismatch(info) => {
+                assert_eq!(info.kind, crate::error::VerifyHashKind::Bucket);
+                assert_eq!(info.ledger, None);
+                assert_eq!(info.expected, wrong_hash);
+                assert_eq!(info.actual, Hash256::hash(data));
+            }
+            other => panic!("expected VerificationHashMismatch, got: {other}"),
+        }
+    }
+
+    #[test]
+    fn test_verify_bucket_hash_match_ok() {
+        let data = b"some bucket data";
+        let correct_hash = Hash256::hash(data);
+        assert!(verify_bucket_hash(data, &correct_hash).is_ok());
+    }
+
+    #[test]
+    fn test_verify_ledger_hash_mismatch_typed() {
+        let mut header = make_test_header(42, Hash256::ZERO);
+        // Set a bucket_list_hash that won't match the computed one.
+        header.bucket_list_hash = Hash([0xAA; 32]);
+        let computed_bucket_list_hash = Hash256::ZERO;
+
+        let err = verify_ledger_hash(&header, &computed_bucket_list_hash).unwrap_err();
+
+        match err {
+            HistoryError::VerificationHashMismatch(info) => {
+                assert_eq!(info.kind, crate::error::VerifyHashKind::BucketList);
+                assert_eq!(info.ledger, Some(42));
+                assert_eq!(info.expected, Hash256::from(header.bucket_list_hash));
+                assert_eq!(info.actual, computed_bucket_list_hash);
+            }
+            other => panic!("expected VerificationHashMismatch, got: {other}"),
+        }
+    }
+
+    #[test]
+    fn test_verify_ledger_header_history_entry_mismatch_typed() {
+        let header = make_test_header(100, Hash256::ZERO);
+        let entry = LedgerHeaderHistoryEntry {
+            hash: Hash([0xFF; 32]), // Wrong hash
+            header,
+            ext: LedgerHeaderHistoryEntryExt::V0,
+        };
+
+        let err = verify_ledger_header_history_entry(&entry).unwrap_err();
+
+        match err {
+            HistoryError::VerificationHashMismatch(info) => {
+                assert_eq!(info.kind, crate::error::VerifyHashKind::LedgerHeaderEntry);
+                assert_eq!(info.ledger, Some(100));
+                assert_eq!(info.expected, Hash256::from(Hash([0xFF; 32])));
+                // actual should be the computed header hash
+                let computed = compute_header_hash(&entry.header).unwrap();
+                assert_eq!(info.actual, computed);
+            }
+            other => panic!("expected VerificationHashMismatch, got: {other}"),
+        }
+    }
+
+    #[test]
+    fn test_verify_tx_result_set_mismatch_typed() {
+        let mut header = make_test_header(50, Hash256::ZERO);
+        header.tx_set_result_hash = Hash([0xBB; 32]); // Expected hash
+        let wrong_xdr = b"wrong result set xdr";
+
+        let err = verify_tx_result_set(&header, wrong_xdr).unwrap_err();
+
+        match err {
+            HistoryError::VerificationHashMismatch(info) => {
+                assert_eq!(info.kind, crate::error::VerifyHashKind::TxResultSet);
+                assert_eq!(info.ledger, Some(50));
+                assert_eq!(info.expected, Hash256::from(Hash([0xBB; 32])));
+                assert_eq!(info.actual, Hash256::hash(wrong_xdr));
+            }
+            other => panic!("expected VerificationHashMismatch, got: {other}"),
+        }
+    }
+
+    #[test]
+    fn test_verify_tx_result_set_genesis_exception() {
+        let header = make_test_header(GENESIS_LEDGER_SEQ, Hash256::ZERO);
+        // Empty result set at genesis should succeed regardless of hash.
+        assert!(verify_tx_result_set(&header, &[]).is_ok());
+    }
+
+    #[test]
+    fn test_verify_header_matches_trusted_mismatch_typed() {
+        let downloaded = make_test_header(77, Hash256::ZERO);
+        // Trusted header with same seq but different content.
+        let mut trusted = make_test_header(77, Hash256::ZERO);
+        trusted.total_coins = 999; // Different content → different hash
+
+        let err = verify_header_matches_trusted(&downloaded, &trusted).unwrap_err();
+
+        match err {
+            HistoryError::VerificationHashMismatch(info) => {
+                assert_eq!(info.kind, crate::error::VerifyHashKind::TrustedHeader);
+                assert_eq!(info.ledger, Some(77));
+                let trusted_hash = compute_header_hash(&trusted).unwrap();
+                let downloaded_hash = compute_header_hash(&downloaded).unwrap();
+                assert_eq!(info.expected, trusted_hash);
+                assert_eq!(info.actual, downloaded_hash);
+            }
+            other => panic!("expected VerificationHashMismatch, got: {other}"),
+        }
+    }
+
+    #[test]
+    fn test_verify_header_matches_trusted_ok() {
+        let header = make_test_header(77, Hash256::ZERO);
+        assert!(verify_header_matches_trusted(&header, &header).is_ok());
     }
 }

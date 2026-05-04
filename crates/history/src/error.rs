@@ -11,6 +11,73 @@
 use henyey_common::Hash256;
 use thiserror::Error;
 
+/// Classification of verification hash mismatches in the offline verification path.
+///
+/// Each variant corresponds to a specific hash comparison in
+/// [`crate::verify`] that was previously reported as a stringly-typed
+/// [`HistoryError::VerificationFailed`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VerifyHashKind {
+    /// SHA-256 hash of bucket content doesn't match expected hash.
+    Bucket,
+    /// Computed bucket list hash doesn't match `header.bucket_list_hash`.
+    BucketList,
+    /// Computed header hash doesn't match the advertised hash in
+    /// `LedgerHeaderHistoryEntry`.
+    LedgerHeaderEntry,
+    /// Hash of tx result set XDR doesn't match `header.tx_set_result_hash`.
+    TxResultSet,
+    /// Downloaded header hash doesn't match the trusted (SCP-verified) header
+    /// hash.
+    TrustedHeader,
+}
+
+impl std::fmt::Display for VerifyHashKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Bucket => write!(f, "bucket"),
+            Self::BucketList => write!(f, "bucket list"),
+            Self::LedgerHeaderEntry => write!(f, "ledger header entry"),
+            Self::TxResultSet => write!(f, "tx result set"),
+            Self::TrustedHeader => write!(f, "trusted header"),
+        }
+    }
+}
+
+/// Diagnostic info for a verification hash mismatch.
+///
+/// Boxed inside [`HistoryError::VerificationHashMismatch`] to keep the
+/// `HistoryError` enum small, consistent with [`TxSetHashMismatchInfo`].
+#[derive(Debug, Clone)]
+pub struct VerifyHashMismatchInfo {
+    /// What kind of hash was being verified.
+    pub kind: VerifyHashKind,
+    /// Ledger sequence where the mismatch was detected (`None` for
+    /// bucket-level checks with no ledger context).
+    pub ledger: Option<u32>,
+    /// The expected hash value.
+    pub expected: Hash256,
+    /// The actual (computed) hash value.
+    pub actual: Hash256,
+}
+
+impl std::fmt::Display for VerifyHashMismatchInfo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.ledger {
+            Some(seq) => write!(
+                f,
+                "{} hash mismatch at ledger {}: expected {}, actual {}",
+                self.kind, seq, self.expected, self.actual
+            ),
+            None => write!(
+                f,
+                "{} hash mismatch: expected {}, actual {}",
+                self.kind, self.expected, self.actual
+            ),
+        }
+    }
+}
+
 /// Diagnostic context for a tx-set hash mismatch, boxed inside `InvalidTxSetHash`
 /// to keep the `HistoryError` enum small.
 #[derive(Debug, Clone)]
@@ -63,6 +130,17 @@ pub enum HistoryError {
     /// History verification failed.
     #[error("history verification failed: {0}")]
     VerificationFailed(String),
+
+    /// Typed verification hash mismatch (offline verification path).
+    ///
+    /// Replaces string-based [`VerificationFailed`](HistoryError::VerificationFailed)
+    /// for hash comparison errors in [`crate::verify::verify_bucket_hash`],
+    /// [`crate::verify::verify_ledger_hash`],
+    /// [`crate::verify::verify_ledger_header_history_entry`],
+    /// [`crate::verify::verify_tx_result_set`], and
+    /// [`crate::verify::verify_header_matches_trusted`].
+    #[error("verification hash mismatch: {0}")]
+    VerificationHashMismatch(Box<VerifyHashMismatchInfo>),
 
     /// Catchup failed.
     #[error("catchup failed: {0}")]
@@ -217,8 +295,10 @@ impl HistoryError {
     /// ledger state is corrupt (not just stale or unreachable).  Specifically:
     ///
     /// - Hash chain verification failures (`InvalidPreviousHash`)
-    /// - Bucket list / ledger hash mismatches (`VerificationFailed`)
+    /// - Bucket list / ledger hash mismatches (`VerificationFailed`,
+    ///   `VerificationHashMismatch`)
     /// - Transaction set hash mismatches (`InvalidTxSetHash`)
+    /// - Ledger-apply hash mismatches (`Ledger(LedgerError::HashMismatch)`)
     ///
     /// Transient errors (network, download, archive unreachable) are **not**
     /// fatal — the node should retry those.
@@ -226,6 +306,7 @@ impl HistoryError {
         matches!(
             self,
             HistoryError::VerificationFailed(_)
+                | HistoryError::VerificationHashMismatch(_)
                 | HistoryError::InvalidPreviousHash { .. }
                 | HistoryError::InvalidTxSetHash { .. }
                 | HistoryError::InvalidSequence { .. }
@@ -234,12 +315,27 @@ impl HistoryError {
         )
     }
 
-    /// Returns `true` if this error represents a hash mismatch (bucket list,
-    /// ledger header, or tx set) that indicates state divergence.
+    /// Returns `true` if this error represents a **typed** hash mismatch
+    /// (bucket, bucket list, ledger header, tx set, or trusted header) that
+    /// indicates state divergence.
+    ///
+    /// Recognized variants:
+    /// - [`VerificationHashMismatch`](HistoryError::VerificationHashMismatch)
+    ///   — offline verification path (bucket, bucket list, header entry, tx
+    ///   result set, trusted header)
+    /// - [`InvalidTxSetHash`](HistoryError::InvalidTxSetHash) — tx set hash
+    ///   mismatch with rich diagnostic context
+    /// - [`Ledger(LedgerError::HashMismatch)`](HistoryError::Ledger) —
+    ///   apply-path mismatch from `henyey-ledger`
+    ///
+    /// Note: [`VerificationFailed(String)`](HistoryError::VerificationFailed)
+    /// is **not** recognized even if its text mentions "hash mismatch" — only
+    /// typed variants count.
     pub fn is_hash_mismatch(&self) -> bool {
         matches!(
             self,
-            HistoryError::Ledger(henyey_ledger::LedgerError::HashMismatch { .. })
+            HistoryError::VerificationHashMismatch(_)
+                | HistoryError::Ledger(henyey_ledger::LedgerError::HashMismatch { .. })
                 | HistoryError::InvalidTxSetHash { .. }
         )
     }
@@ -339,5 +435,88 @@ mod tests {
         // Negative: Other LedgerError variants are NOT hash mismatches
         let err = HistoryError::Ledger(henyey_ledger::LedgerError::Internal("bug".into()));
         assert!(!err.is_hash_mismatch());
+    }
+
+    /// Helper to construct a `VerificationHashMismatch` error for tests.
+    fn make_verify_hash_mismatch(kind: VerifyHashKind, ledger: Option<u32>) -> HistoryError {
+        HistoryError::VerificationHashMismatch(Box::new(VerifyHashMismatchInfo {
+            kind,
+            ledger,
+            expected: Hash256::ZERO,
+            actual: Hash256::from([0xAB; 32]),
+        }))
+    }
+
+    #[test]
+    fn test_verification_hash_mismatch_is_fatal() {
+        for kind in [
+            VerifyHashKind::Bucket,
+            VerifyHashKind::BucketList,
+            VerifyHashKind::LedgerHeaderEntry,
+            VerifyHashKind::TxResultSet,
+            VerifyHashKind::TrustedHeader,
+        ] {
+            let err = make_verify_hash_mismatch(kind, Some(42));
+            assert!(
+                err.is_fatal_catchup_failure(),
+                "VerificationHashMismatch({kind}) should be a fatal catchup failure"
+            );
+        }
+    }
+
+    #[test]
+    fn test_verification_hash_mismatch_is_hash_mismatch() {
+        for kind in [
+            VerifyHashKind::Bucket,
+            VerifyHashKind::BucketList,
+            VerifyHashKind::LedgerHeaderEntry,
+            VerifyHashKind::TxResultSet,
+            VerifyHashKind::TrustedHeader,
+        ] {
+            let err = make_verify_hash_mismatch(kind, Some(42));
+            assert!(
+                err.is_hash_mismatch(),
+                "VerificationHashMismatch({kind}) should be recognized as a hash mismatch"
+            );
+        }
+    }
+
+    #[test]
+    fn test_verify_hash_mismatch_display_with_ledger() {
+        let info = VerifyHashMismatchInfo {
+            kind: VerifyHashKind::BucketList,
+            ledger: Some(42),
+            expected: Hash256::ZERO,
+            actual: Hash256::from([0xAB; 32]),
+        };
+        let msg = info.to_string();
+        assert!(msg.contains("bucket list hash mismatch at ledger 42"));
+        assert!(msg.contains("expected"));
+        assert!(msg.contains("actual"));
+    }
+
+    #[test]
+    fn test_verify_hash_mismatch_display_without_ledger() {
+        let info = VerifyHashMismatchInfo {
+            kind: VerifyHashKind::Bucket,
+            ledger: None,
+            expected: Hash256::ZERO,
+            actual: Hash256::from([0xAB; 32]),
+        };
+        let msg = info.to_string();
+        assert!(msg.contains("bucket hash mismatch:"));
+        assert!(!msg.contains("at ledger"));
+    }
+
+    #[test]
+    fn test_verify_hash_kind_display() {
+        assert_eq!(VerifyHashKind::Bucket.to_string(), "bucket");
+        assert_eq!(VerifyHashKind::BucketList.to_string(), "bucket list");
+        assert_eq!(
+            VerifyHashKind::LedgerHeaderEntry.to_string(),
+            "ledger header entry"
+        );
+        assert_eq!(VerifyHashKind::TxResultSet.to_string(), "tx result set");
+        assert_eq!(VerifyHashKind::TrustedHeader.to_string(), "trusted header");
     }
 }

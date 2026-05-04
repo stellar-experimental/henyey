@@ -242,7 +242,10 @@ mod tests {
             ..ReplayConfig::default()
         };
         let result = replay_ledger(&header, &tx_set, &tx_results, &tx_metas, &config);
-        assert!(matches!(result, Err(HistoryError::VerificationFailed(_))));
+        assert!(matches!(
+            result,
+            Err(HistoryError::VerificationHashMismatch(_))
+        ));
     }
 
     #[test]

@@ -1368,7 +1368,10 @@ mod tests {
             },
         );
 
-        assert!(matches!(result, Err(HistoryError::VerificationFailed(_))));
+        assert!(matches!(
+            result,
+            Err(HistoryError::VerificationHashMismatch(_))
+        ));
     }
 
     #[tokio::test]
