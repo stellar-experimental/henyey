@@ -788,7 +788,8 @@ When the OBSRVR Radar API reports `isValidating: false` or low
    in `crates/scp/src/ballot/envelope.rs` (`send_latest_envelope`).
 
 2. **Check heartbeat for EXTERNALIZE counts**:
-   ```
+   ```bash
+   source "$(git rev-parse --show-toplevel)/scripts/lib/monitor-decisions.sh"
    grep_heartbeat_lines ~/data/<session-id>/logs/monitor.log 5
    ```
    Look at `scp_sent_ext` — this should be incrementing roughly once
@@ -808,7 +809,8 @@ When the OBSRVR Radar API reports `isValidating: false` or low
 4. **Check peer connectivity** — the OBSRVR crawler connects as an
    overlay peer and listens for SCP messages. Verify the node has
    inbound peers and is advertising the correct port:
-   ```
+   ```bash
+   source "$(git rev-parse --show-toplevel)/scripts/lib/monitor-decisions.sh"
    grep_heartbeat_lines ~/data/<session-id>/logs/monitor.log 1
    ```
    Check `peers` count. If 0, the node can't broadcast to anyone.
