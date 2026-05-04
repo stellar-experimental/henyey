@@ -1772,6 +1772,11 @@ impl App {
     /// Returns `Some(PendingLedgerClose)` if a close was spawned, `None` if
     /// nothing to close or a close is already in progress.
     pub(super) async fn try_start_ledger_close(&self) -> Option<PendingLedgerClose> {
+        // Fatal-failure guard: don't start new ledger closes when the node
+        // has detected an unrecoverable local state failure.
+        if self.fatal_state_failure.load(Ordering::SeqCst) {
+            return None;
+        }
         if self.is_applying_ledger() {
             return None;
         }
@@ -1825,16 +1830,15 @@ impl App {
         let tx_set = close_info.tx_set.clone().expect("tx set present");
         let our_header_hash = self.ledger_manager.current_header_hash();
         if our_header_hash != tx_set.previous_ledger_hash() {
-            tracing::error!(
-                ledger_seq = next_seq,
-                our_header_hash = %our_header_hash.to_hex(),
-                network_prev_hash = %tx_set.previous_ledger_hash().to_hex(),
-                "FATAL: pre-close hash mismatch — our header hash does not match \
-                 the network's previous ledger hash. This means our ledger state \
-                 has diverged from the network. Shutting down."
-            );
             self.ledger_manager.log_bucket_list_debug(next_seq);
-            std::process::exit(1);
+            self.trigger_fatal_shutdown(&format!(
+                "pre-close hash mismatch at ledger {next_seq}: \
+                 our header hash {} does not match network's previous \
+                 ledger hash {}",
+                our_header_hash.to_hex(),
+                tx_set.previous_ledger_hash().to_hex(),
+            ));
+            return None;
         }
         if *tx_set.hash() != close_info.tx_set_hash {
             tracing::error!(
@@ -3215,6 +3219,45 @@ mod restore_result_tests {
         assert_eq!(
             count, 1,
             "publish queue should be preserved when can_publish is true"
+        );
+    }
+}
+
+#[cfg(test)]
+mod fatal_shutdown_tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    /// Helper: create a minimal App for fatal-shutdown tests.
+    async fn test_app() -> (Arc<App>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("test.db");
+        let bucket_dir = dir.path().join("buckets");
+        std::fs::create_dir_all(&bucket_dir).unwrap();
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .bucket_directory(&bucket_dir)
+            .build();
+        let app = App::new(config).await.unwrap();
+        let app = Arc::new(app);
+        app.set_self_arc().await;
+        (app, dir)
+    }
+
+    /// Once `fatal_state_failure` is set, `try_start_ledger_close` must
+    /// return `None` immediately — no ledger closes should proceed when
+    /// the node has detected an unrecoverable state failure.
+    #[tokio::test]
+    async fn test_try_start_ledger_close_blocked_after_fatal() {
+        let (app, _dir) = test_app().await;
+
+        // Pre-set the fatal flag to simulate a prior fatal failure.
+        app.fatal_state_failure.store(true, Ordering::SeqCst);
+
+        let result = app.try_start_ledger_close().await;
+        assert!(
+            result.is_none(),
+            "try_start_ledger_close must return None when fatal_state_failure is set"
         );
     }
 }

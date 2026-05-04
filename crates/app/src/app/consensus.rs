@@ -1163,22 +1163,22 @@ impl App {
         relation: LedgerRelation,
         attempts: u64,
     ) -> Option<PendingCatchup> {
-        // Fatal-failure guard (spec §13.3): block further catchup after a
-        // verification/integrity failure.
-        if self.catchup_fatal_failure.load(Ordering::SeqCst) {
+        // Fatal-failure guard: block further catchup/recovery after an
+        // unrecoverable local state failure.
+        if self.fatal_state_failure.load(Ordering::SeqCst) {
             let now_secs = self.start_instant.elapsed().as_secs();
             if self
                 .recovery_throttles
-                .fatal_catchup_blocked
+                .fatal_state_blocked
                 .should_log(now_secs)
             {
                 tracing::warn!(
-                    "Recovery escalation blocked: previous fatal catchup failure — \
+                    "Recovery escalation blocked: previous fatal state failure — \
                      manual intervention required"
                 );
             } else {
                 tracing::debug!(
-                    "Recovery escalation blocked: previous fatal catchup failure (repeated)"
+                    "Recovery escalation blocked: previous fatal state failure (repeated)"
                 );
             }
             return None;

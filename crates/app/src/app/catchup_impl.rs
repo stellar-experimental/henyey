@@ -49,12 +49,12 @@ impl App {
     ) -> anyhow::Result<CatchupResult> {
         #[allow(unused_assignments)]
         let mut catchup_persist_data: Option<super::persist::CatchupPersistData> = None;
-        // Fatal-failure guard (spec §13.3): a previous catchup detected a
-        // verification/integrity failure.  Further attempts are futile and
-        // must be blocked until the operator intervenes.
-        if self.catchup_fatal_failure.load(Ordering::SeqCst) {
+        // Fatal-failure guard: the node detected an unrecoverable local
+        // state failure.  Further catchup attempts are futile and must be
+        // blocked until the operator intervenes (state wipe + restart).
+        if self.fatal_state_failure.load(Ordering::SeqCst) {
             anyhow::bail!(
-                "catchup blocked: previous fatal verification failure — \
+                "catchup blocked: previous fatal state failure — \
                  manual intervention required"
             );
         }
@@ -1531,9 +1531,9 @@ impl App {
     pub(super) async fn maybe_start_buffered_catchup(&self) -> Option<PendingCatchup> {
         use super::phase::*;
 
-        // Fatal-failure guard (spec §13.3): block further catchup after a
-        // verification/integrity failure.
-        if self.catchup_fatal_failure.load(Ordering::SeqCst) {
+        // Fatal-failure guard: block further catchup after an
+        // unrecoverable local state failure.
+        if self.fatal_state_failure.load(Ordering::SeqCst) {
             return None;
         }
 
@@ -2236,12 +2236,17 @@ impl App {
     /// Process the result of a catchup operation: update state, bootstrap herder,
     /// and reset tracking so the main loop can close buffered ledgers.
     /// Shared by buffered and externalized catchup paths.
+    /// Handle the result of a completed catchup operation.
+    ///
+    /// Returns `true` if a fatal state failure was detected and shutdown
+    /// has been triggered. The caller must skip all post-catchup work
+    /// when this returns `true`.
     pub(super) async fn handle_catchup_result(
         &self,
         catchup_result: anyhow::Result<CatchupResult>,
         reset_stuck_state: bool,
         label: &str,
-    ) {
+    ) -> bool {
         match catchup_result {
             Ok(result) => {
                 let catchup_did_work = result.buckets_applied > 0 || result.ledgers_replayed > 0;
@@ -2396,22 +2401,19 @@ impl App {
             }
             Err(err) => {
                 // Check if this is a fatal catchup failure (verification/integrity
-                // error indicating local state corruption).  Per spec §13.3, once
-                // a fatal failure is detected, further catchup attempts must be
-                // blocked — they will keep failing and waste resources.
+                // error indicating local state corruption).  Once detected, further
+                // catchup attempts are blocked and the node shuts down.
                 let is_fatal = err
                     .downcast_ref::<henyey_history::HistoryError>()
                     .is_some_and(|e| e.is_fatal_catchup_failure());
                 if is_fatal {
-                    tracing::error!(
-                        error = %err,
-                        "{} catchup FATAL: verification/integrity failure — \
-                         local state may be corrupt.  Further catchup attempts \
-                         will be blocked.  Manual intervention required \
-                         (wipe state or restore from known-good snapshot).",
-                        label,
-                    );
-                    self.catchup_fatal_failure.store(true, Ordering::SeqCst);
+                    self.trigger_fatal_shutdown(&format!(
+                        "{label} catchup verification/integrity failure: {err}"
+                    ));
+                    // Fatal shutdown triggered — skip restore_operational_state,
+                    // cooldown, and stuck-state reset.  The main loop will exit
+                    // after draining the close pipeline.
+                    return true;
                 } else {
                     tracing::error!(error = %err, "{} catchup failed", label);
                     // If the error is a typed hash mismatch, the local state
@@ -2455,15 +2457,16 @@ impl App {
                 }
             }
         }
+        false
     }
 
     pub(super) async fn maybe_start_externalized_catchup(
         &self,
         latest_externalized: u64,
     ) -> Option<PendingCatchup> {
-        // Fatal-failure guard (spec §13.3): block further catchup after a
-        // verification/integrity failure.
-        if self.catchup_fatal_failure.load(Ordering::SeqCst) {
+        // Fatal-failure guard: block further catchup after an
+        // unrecoverable local state failure.
+        if self.fatal_state_failure.load(Ordering::SeqCst) {
             return None;
         }
 
@@ -4982,7 +4985,7 @@ mod tests {
 
     /// AUDIT-255 regression (#2298): a fatal `HistoryError` (e.g.,
     /// `VerificationFailed`) flowing through `handle_catchup_result` must set
-    /// `catchup_fatal_failure` to permanently block further catchup attempts.
+    /// `fatal_state_failure`, trigger shutdown, and return `true`.
     ///
     /// Prior to commit 4fe52336, the `HistoryError` type was erased by
     /// `map_err(|e| anyhow::anyhow!("Catchup failed: {}", e))`, making
@@ -4996,25 +4999,37 @@ mod tests {
             .build();
         let app = App::new(config).await.unwrap();
 
+        // Subscribe to shutdown before triggering the fatal path.
+        let mut shutdown_rx = app.subscribe_shutdown();
+
         // VerificationFailed is a fatal catchup error.
         let err: anyhow::Error =
             henyey_history::HistoryError::VerificationFailed("bucket list hash mismatch".into())
                 .into();
 
-        app.handle_catchup_result(Err(err), false, "test").await;
+        let fatal = app.handle_catchup_result(Err(err), false, "test").await;
 
         assert!(
-            app.catchup_fatal_failure.load(Ordering::SeqCst),
-            "catchup_fatal_failure must be set on VerificationFailed"
+            fatal,
+            "handle_catchup_result must return true on fatal error"
+        );
+        assert!(
+            app.fatal_state_failure.load(Ordering::SeqCst),
+            "fatal_state_failure must be set on VerificationFailed"
         );
         assert!(
             !app.catchup_needs_full_reset.load(Ordering::SeqCst),
             "catchup_needs_full_reset must NOT be set — fatal path takes priority"
         );
+        // Shutdown signal must have been sent.
+        assert!(
+            shutdown_rx.try_recv().is_ok(),
+            "shutdown signal must be sent on fatal catchup failure"
+        );
     }
 
     /// AUDIT-255 regression (#2298): a transient (non-fatal) `HistoryError`
-    /// must NOT set `catchup_fatal_failure`.
+    /// must NOT set `fatal_state_failure`.
     #[tokio::test]
     async fn test_handle_catchup_result_ignores_transient_error() {
         let dir = tempfile::tempdir().expect("temp dir");
@@ -5028,11 +5043,15 @@ mod tests {
         let err: anyhow::Error =
             henyey_history::HistoryError::ArchiveUnreachable("timeout".into()).into();
 
-        app.handle_catchup_result(Err(err), false, "test").await;
+        let fatal = app.handle_catchup_result(Err(err), false, "test").await;
 
         assert!(
-            !app.catchup_fatal_failure.load(Ordering::SeqCst),
-            "catchup_fatal_failure must NOT be set on transient error"
+            !fatal,
+            "handle_catchup_result must return false on transient error"
+        );
+        assert!(
+            !app.fatal_state_failure.load(Ordering::SeqCst),
+            "fatal_state_failure must NOT be set on transient error"
         );
         assert!(
             !app.catchup_needs_full_reset.load(Ordering::SeqCst),
@@ -5062,11 +5081,15 @@ mod tests {
             actual: "def".into(),
         });
 
-        app.handle_catchup_result(Err(err), false, "test").await;
+        let fatal = app.handle_catchup_result(Err(err), false, "test").await;
 
         assert!(
-            !app.catchup_fatal_failure.load(Ordering::SeqCst),
-            "catchup_fatal_failure must NOT be set for raw LedgerError"
+            !fatal,
+            "handle_catchup_result must return false for raw LedgerError"
+        );
+        assert!(
+            !app.fatal_state_failure.load(Ordering::SeqCst),
+            "fatal_state_failure must NOT be set for raw LedgerError"
         );
         assert!(
             app.catchup_needs_full_reset.load(Ordering::SeqCst),
@@ -5076,7 +5099,7 @@ mod tests {
 
     /// AUDIT-255 regression (#2298): `HistoryError::Ledger(HashMismatch)` is
     /// both `is_fatal_catchup_failure()` and `is_hash_mismatch()`. The fatal
-    /// check runs first (`catchup_impl.rs:2402`), so `catchup_fatal_failure`
+    /// check runs first (`catchup_impl.rs:2402`), so `fatal_state_failure`
     /// must be set and the hash-mismatch reset path (inside the `else` branch)
     /// must be skipped.
     #[tokio::test]
@@ -5096,11 +5119,15 @@ mod tests {
             })
             .into();
 
-        app.handle_catchup_result(Err(err), false, "test").await;
+        let fatal = app.handle_catchup_result(Err(err), false, "test").await;
 
         assert!(
-            app.catchup_fatal_failure.load(Ordering::SeqCst),
-            "catchup_fatal_failure must be set — fatal check runs first"
+            fatal,
+            "handle_catchup_result must return true — fatal check runs first"
+        );
+        assert!(
+            app.fatal_state_failure.load(Ordering::SeqCst),
+            "fatal_state_failure must be set — fatal check runs first"
         );
         assert!(
             !app.catchup_needs_full_reset.load(Ordering::SeqCst),
@@ -5108,7 +5135,7 @@ mod tests {
         );
     }
 
-    /// AUDIT-255 regression (#2298): once `catchup_fatal_failure` is set,
+    /// AUDIT-255 regression (#2298): once `fatal_state_failure` is set,
     /// `catchup_with_mode` must refuse to run (bail immediately).
     /// This verifies the behavioral chain: handle_catchup_result sets the
     /// flag → subsequent catchup_with_mode is blocked.
@@ -5122,7 +5149,7 @@ mod tests {
         let app = App::new(config).await.unwrap();
 
         // Simulate a prior fatal failure detection.
-        app.catchup_fatal_failure.store(true, Ordering::SeqCst);
+        app.fatal_state_failure.store(true, Ordering::SeqCst);
 
         let (persist_tx, _persist_rx) = tokio::sync::oneshot::channel();
         let finalize = super::persist::CatchupFinalizer::deferred(
@@ -5137,8 +5164,8 @@ mod tests {
         assert!(result.is_err(), "catchup must fail when fatal flag is set");
         let err_msg = result.unwrap_err().to_string();
         assert!(
-            err_msg.contains("fatal verification failure"),
-            "error must mention fatal verification failure, got: {err_msg}"
+            err_msg.contains("fatal state failure"),
+            "error must mention fatal state failure, got: {err_msg}"
         );
     }
 

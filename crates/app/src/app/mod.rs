@@ -378,13 +378,17 @@ pub struct App {
     /// (e.g., `handle_overlay_message`, `handle_generalized_tx_set`).
     /// The event loop promotes this to the local `pending_catchup` each iteration.
     deferred_catchup: tokio::sync::Mutex<Option<PendingCatchup>>,
-    /// Fatal catchup failure flag (spec §13.3).
+    /// Fatal local state failure flag.
     ///
-    /// Set when catchup verification detects that the local ledger state is
-    /// corrupt (chain disagrees with archive data obtained via SCP trust).
-    /// Once set, **no further catchup attempts are made** — the node requires
-    /// manual intervention (restart with fresh state).
-    catchup_fatal_failure: AtomicBool,
+    /// Set when the node detects that its local ledger state cannot be
+    /// trusted (catchup verification failure, pre-close hash mismatch, etc.).
+    /// Once set:
+    /// - No further catchup attempts are made
+    /// - No new ledger closes are started
+    /// - The main loop exits with an error status
+    ///
+    /// The supervisor should wipe state files and restart.
+    fatal_state_failure: AtomicBool,
     /// When set, the next catchup should do a full bucket-apply instead of
     /// replay-only. This is triggered when a previous catchup fails with a
     /// hash mismatch (state divergence, e.g., protocol upgrade missed).
@@ -1022,7 +1026,7 @@ impl App {
             last_processed_slot: RwLock::new(0),
             catchup_in_progress: AtomicBool::new(false),
             deferred_catchup: tokio::sync::Mutex::new(None),
-            catchup_fatal_failure: AtomicBool::new(false),
+            fatal_state_failure: AtomicBool::new(false),
             catchup_needs_full_reset: AtomicBool::new(force_full_catchup),
             publish_in_progress: AtomicBool::new(false),
             #[cfg(test)]

@@ -504,33 +504,37 @@ impl App {
                             let persist_ready = result.take_persist_ready();
                             let made_progress = result.made_progress;
 
-                            self.handle_catchup_result(
+                            let fatal = self.handle_catchup_result(
                                 result.result,
                                 pending.reset_stuck_state,
                                 &pending.label,
                             )
                             .await;
 
-                            if made_progress && pending.re_arm_recovery {
-                                self.reset_recovery_attempts(1);
-                                self.sync_recovery_pending.store(true, Ordering::SeqCst);
+                            if !fatal {
+                                if made_progress && pending.re_arm_recovery {
+                                    self.reset_recovery_attempts(1);
+                                    self.sync_recovery_pending.store(true, Ordering::SeqCst);
+                                }
+
+                                // Refresh the overlay query window after catchup — the
+                                // protocol may have advanced, changing the close duration.
+                                self.refresh_overlay_query_window().await;
+
+                                // Refresh max tx size after catchup — if the protocol
+                                // advanced (e.g., Soroban activation), notify existing
+                                // peers of the increased byte limit.
+                                self.refresh_max_tx_size_bytes().await;
+
+                                // Spawn catchup persist task on a blocking thread.
+                                // Dispatched from the event loop (not inside the catchup
+                                // task) to avoid nested spawn_blocking (#1713, #1735).
+                                if let Some(ready) = persist_ready {
+                                    close_pipeline.start_persist(ready.spawn());
+                                }
                             }
-
-                            // Refresh the overlay query window after catchup — the
-                            // protocol may have advanced, changing the close duration.
-                            self.refresh_overlay_query_window().await;
-
-                            // Refresh max tx size after catchup — if the protocol
-                            // advanced (e.g., Soroban activation), notify existing
-                            // peers of the increased byte limit.
-                            self.refresh_max_tx_size_bytes().await;
-
-                            // Spawn catchup persist task on a blocking thread.
-                            // Dispatched from the event loop (not inside the catchup
-                            // task) to avoid nested spawn_blocking (#1713, #1735).
-                            if let Some(ready) = persist_ready {
-                                close_pipeline.start_persist(ready.spawn());
-                            }
+                            // If fatal, all post-catchup work is skipped — shutdown
+                            // signal will break the loop on the next select iteration.
                         }
                         Err(_) => {
                             // Oneshot sender was dropped — task panicked or was cancelled.
@@ -1103,6 +1107,13 @@ impl App {
             "Shutdown cleanup complete"
         );
 
+        // If we shut down due to a fatal state failure, return an error
+        // so the supervisor sees a nonzero exit code and can trigger
+        // recovery (state wipe + restart).
+        if self.fatal_state_failure.load(Ordering::SeqCst) {
+            anyhow::bail!("Node shutdown due to fatal state failure — state wipe required");
+        }
+
         Ok(())
     }
 
@@ -1592,6 +1603,31 @@ impl App {
     pub fn shutdown(&self) {
         tracing::info!("Shutdown requested");
         let _ = self.shutdown_tx.send(());
+    }
+
+    /// Trigger shutdown due to unrecoverable local state failure.
+    ///
+    /// Called when the node detects that its local ledger state cannot be
+    /// trusted (fatal catchup verification failure, pre-close hash mismatch,
+    /// etc.).  Sets [`fatal_state_failure`] to block further catchup and
+    /// ledger-close attempts, then signals the main loop to exit.
+    ///
+    /// After shutdown, [`App::run`] returns `Err` (exit code 1) so the
+    /// supervisor can detect the failure and trigger recovery.
+    ///
+    /// **Delayed shutdown**: the shutdown signal is processed in a subsequent
+    /// `select` iteration of the main event loop.  Between the call and the
+    /// shutdown-signal arm firing, other select arms may execute once.  This
+    /// is acceptable because the `fatal_state_failure` flag immediately blocks
+    /// new catchup attempts and new ledger closes.
+    pub fn trigger_fatal_shutdown(&self, reason: &str) {
+        tracing::error!(
+            "FATAL: unrecoverable local state failure — {}. \
+             Node will shut down. State wipe required before restart.",
+            reason
+        );
+        self.fatal_state_failure.store(true, Ordering::SeqCst);
+        self.shutdown();
     }
 
     /// Subscribe to shutdown notifications.

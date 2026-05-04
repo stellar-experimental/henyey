@@ -106,8 +106,8 @@ pub(crate) struct RecoveryLogThrottles {
     pub permanently_missing: LogThrottleSecs,
     /// "No tx_sets available for any buffered slot — forcing catchup"
     pub no_txsets_forcing: LogThrottleSecs,
-    /// "Recovery escalation blocked: previous fatal catchup failure"
-    pub fatal_catchup_blocked: LogThrottleSecs,
+    /// "Recovery escalation blocked: previous fatal state failure"
+    pub fatal_state_blocked: LogThrottleSecs,
     /// "Recovery exhausted; triggering catchup"
     pub recovery_exhausted: LogThrottleSecs,
     /// "Post-catchup livelock detected — hard reset"
@@ -131,7 +131,7 @@ impl RecoveryLogThrottles {
             gap_in_externalized: LogThrottleSecs::new(RECOVERY_THROTTLE_SECS),
             permanently_missing: LogThrottleSecs::new(RECOVERY_THROTTLE_SECS),
             no_txsets_forcing: LogThrottleSecs::new(RECOVERY_THROTTLE_SECS),
-            fatal_catchup_blocked: LogThrottleSecs::new(RECOVERY_THROTTLE_SECS),
+            fatal_state_blocked: LogThrottleSecs::new(RECOVERY_THROTTLE_SECS),
             recovery_exhausted: LogThrottleSecs::new(RECOVERY_THROTTLE_SECS),
             livelock_hard_reset: LogThrottleSecs::new(RECOVERY_THROTTLE_SECS),
             hard_reset_followon: LogThrottleSecs::new(RECOVERY_THROTTLE_SECS),
@@ -150,7 +150,7 @@ impl RecoveryLogThrottles {
         self.gap_in_externalized.reset();
         self.permanently_missing.reset();
         self.no_txsets_forcing.reset();
-        self.fatal_catchup_blocked.reset();
+        self.fatal_state_blocked.reset();
         self.recovery_exhausted.reset();
         self.livelock_hard_reset.reset();
         self.hard_reset_followon.reset();
@@ -250,7 +250,7 @@ mod tests {
         assert!(t.gap_in_externalized.should_log(0));
         assert!(t.permanently_missing.should_log(0));
         assert!(t.no_txsets_forcing.should_log(0));
-        assert!(t.fatal_catchup_blocked.should_log(0));
+        assert!(t.fatal_state_blocked.should_log(0));
         assert!(t.recovery_exhausted.should_log(0));
         assert!(t.livelock_hard_reset.should_log(0));
         assert!(t.hard_reset_followon.should_log(0));
@@ -272,7 +272,7 @@ mod tests {
         assert!(t.gap_in_externalized.should_log(0));
         assert!(t.permanently_missing.should_log(0));
         assert!(t.no_txsets_forcing.should_log(0));
-        assert!(t.fatal_catchup_blocked.should_log(0));
+        assert!(t.fatal_state_blocked.should_log(0));
         assert!(t.recovery_exhausted.should_log(0));
         assert!(t.livelock_hard_reset.should_log(0));
         assert!(t.hard_reset_followon.should_log(0));
