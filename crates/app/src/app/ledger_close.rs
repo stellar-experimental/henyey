@@ -666,7 +666,7 @@ impl App {
                 }
             }
         }
-        if let Some(hot_next_states) = has.hot_archive_next_states() {
+        if let Some(hot_next_states) = has.hot_archive_next_states()? {
             for state in &hot_next_states {
                 if state.state == 1 {
                     if let Some(ref output_hash) = state.output {
@@ -723,7 +723,7 @@ impl App {
 
         let live_hash_pairs = has.bucket_hash_pairs();
         let live_next_states: Vec<HasNextState> = has
-            .live_next_states()
+            .live_next_states()?
             .into_iter()
             .map(|s| HasNextState {
                 state: s.state,
@@ -795,7 +795,7 @@ impl App {
         // Step 6e: Restore hot archive (~1s, sequential).
         let hot_archive = if let Some(hot_hash_pairs) = has.hot_archive_bucket_hash_pairs() {
             let hot_next_states: Vec<HasNextState> = has
-                .hot_archive_next_states()
+                .hot_archive_next_states()?
                 .unwrap_or_default()
                 .into_iter()
                 .map(|s| HasNextState {
@@ -1071,7 +1071,7 @@ impl App {
         // Reconstruct live BucketList
         let live_hash_pairs = has.bucket_hash_pairs();
         let live_next_states: Vec<HasNextState> = has
-            .live_next_states()
+            .live_next_states()?
             .into_iter()
             .map(|s| HasNextState {
                 state: s.state,
@@ -1130,7 +1130,7 @@ impl App {
         // Reconstruct hot archive BucketList (or create empty)
         let hot_archive = if let Some(hot_hash_pairs) = has.hot_archive_bucket_hash_pairs() {
             let hot_next_states: Vec<HasNextState> = has
-                .hot_archive_next_states()
+                .hot_archive_next_states()?
                 .unwrap_or_default()
                 .into_iter()
                 .map(|s| HasNextState {

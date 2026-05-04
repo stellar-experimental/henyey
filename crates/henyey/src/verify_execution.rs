@@ -625,7 +625,7 @@ async fn setup(config: AppConfig, opts: VerifyExecutionOptions) -> anyhow::Resul
     let bucket_hashes = init_has.bucket_hash_pairs();
 
     let live_next_states: Vec<HasNextState> = init_has
-        .live_next_states()
+        .live_next_states()?
         .into_iter()
         .map(HasNextState::from)
         .collect();
@@ -634,7 +634,7 @@ async fn setup(config: AppConfig, opts: VerifyExecutionOptions) -> anyhow::Resul
     let hot_archive_hashes = init_has.hot_archive_bucket_hash_pairs();
 
     let hot_archive_next_states: Option<Vec<HasNextState>> = init_has
-        .hot_archive_next_states()
+        .hot_archive_next_states()?
         .map(|states| states.into_iter().map(HasNextState::from).collect());
 
     // Collect all bucket hashes to download
@@ -647,6 +647,12 @@ async fn setup(config: AppConfig, opts: VerifyExecutionOptions) -> anyhow::Resul
         if let Some(ref output) = state.output {
             all_hashes.push(*output);
         }
+        if let Some(ref input_curr) = state.input_curr {
+            all_hashes.push(*input_curr);
+        }
+        if let Some(ref input_snap) = state.input_snap {
+            all_hashes.push(*input_snap);
+        }
     }
     if let Some(ref ha_hashes) = hot_archive_hashes {
         for (curr, snap) in ha_hashes {
@@ -658,6 +664,12 @@ async fn setup(config: AppConfig, opts: VerifyExecutionOptions) -> anyhow::Resul
         for state in ha_states {
             if let Some(ref output) = state.output {
                 all_hashes.push(*output);
+            }
+            if let Some(ref input_curr) = state.input_curr {
+                all_hashes.push(*input_curr);
+            }
+            if let Some(ref input_snap) = state.input_snap {
+                all_hashes.push(*input_snap);
             }
         }
     }

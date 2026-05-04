@@ -311,7 +311,7 @@ impl CatchupManager {
         // This is required for proper FutureBucket restoration
         let live_hash_pairs = has.bucket_hash_pairs();
         let live_next_states: Vec<HasNextState> = has
-            .live_next_states()
+            .live_next_states()?
             .into_iter()
             .map(HasNextState::from)
             .collect();
@@ -351,7 +351,7 @@ impl CatchupManager {
         // Default to the correct number of levels so restart_merges_from_has gets valid input.
         let hot_next_states: Vec<HasNextState> = {
             let states: Vec<HasNextState> = has
-                .hot_archive_next_states()
+                .hot_archive_next_states()?
                 .unwrap_or_default()
                 .into_iter()
                 .map(HasNextState::from)

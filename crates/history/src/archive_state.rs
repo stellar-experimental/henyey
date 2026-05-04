@@ -73,26 +73,59 @@ fn parse_bucket_hash_pairs(levels: &[HASBucketLevel]) -> Vec<(Hash256, Hash256)>
 }
 
 /// Parse the next-merge states from a slice of bucket levels.
-fn parse_next_states(levels: &[HASBucketLevel]) -> Vec<LiveBucketNextState> {
+///
+/// Returns an error if a hash field required by the declared state is present
+/// but contains a malformed hex string (parity: stellar-core would fail hard
+/// on such an HAS).
+fn parse_next_states(
+    levels: &[HASBucketLevel],
+) -> std::result::Result<Vec<LiveBucketNextState>, HistoryError> {
     levels
         .iter()
-        .map(|level| LiveBucketNextState {
-            state: level.next.state,
-            output: level
-                .next
-                .output
-                .as_ref()
-                .and_then(|h| Hash256::from_hex(h).ok()),
-            input_curr: level
-                .next
-                .curr
-                .as_ref()
-                .and_then(|h| Hash256::from_hex(h).ok()),
-            input_snap: level
-                .next
-                .snap
-                .as_ref()
-                .and_then(|h| Hash256::from_hex(h).ok()),
+        .enumerate()
+        .map(|(i, level)| {
+            let output = match level.next.output.as_ref() {
+                Some(h) if level.next.state == HAS_NEXT_STATE_OUTPUT => {
+                    Some(Hash256::from_hex(h).map_err(|_| {
+                        HistoryError::InvalidResponse(format!(
+                            "level {}: state {} output hash is malformed: {}",
+                            i, level.next.state, h
+                        ))
+                    })?)
+                }
+                Some(h) => Hash256::from_hex(h).ok(),
+                None => None,
+            };
+            let input_curr = match level.next.curr.as_ref() {
+                Some(h) if level.next.state == HAS_NEXT_STATE_INPUTS => {
+                    Some(Hash256::from_hex(h).map_err(|_| {
+                        HistoryError::InvalidResponse(format!(
+                            "level {}: state {} input curr hash is malformed: {}",
+                            i, level.next.state, h
+                        ))
+                    })?)
+                }
+                Some(h) => Hash256::from_hex(h).ok(),
+                None => None,
+            };
+            let input_snap = match level.next.snap.as_ref() {
+                Some(h) if level.next.state == HAS_NEXT_STATE_INPUTS => {
+                    Some(Hash256::from_hex(h).map_err(|_| {
+                        HistoryError::InvalidResponse(format!(
+                            "level {}: state {} input snap hash is malformed: {}",
+                            i, level.next.state, h
+                        ))
+                    })?)
+                }
+                Some(h) => Hash256::from_hex(h).ok(),
+                None => None,
+            };
+            Ok(LiveBucketNextState {
+                state: level.next.state,
+                output,
+                input_curr,
+                input_snap,
+            })
         })
         .collect()
 }
@@ -511,7 +544,10 @@ impl HistoryArchiveState {
     ///
     /// This extracts the FutureBucket state from each level for use with
     /// `BucketList::restore_from_has` and `restart_merges_from_has`.
-    pub fn live_next_states(&self) -> Vec<LiveBucketNextState> {
+    ///
+    /// Returns an error if any hash field required by the declared state
+    /// contains a malformed hex string.
+    pub fn live_next_states(&self) -> std::result::Result<Vec<LiveBucketNextState>, HistoryError> {
         parse_next_states(&self.current_buckets)
     }
 
@@ -626,10 +662,16 @@ impl HistoryArchiveState {
     }
 
     /// Get the next bucket merge states for hot archive bucket levels.
-    pub fn hot_archive_next_states(&self) -> Option<Vec<LiveBucketNextState>> {
-        self.hot_archive_buckets
-            .as_ref()
-            .map(|levels| parse_next_states(levels))
+    ///
+    /// Returns an error if any hash field required by the declared state
+    /// contains a malformed hex string.
+    pub fn hot_archive_next_states(
+        &self,
+    ) -> std::result::Result<Option<Vec<LiveBucketNextState>>, HistoryError> {
+        match self.hot_archive_buckets.as_ref() {
+            Some(levels) => Ok(Some(parse_next_states(levels)?)),
+            None => Ok(None),
+        }
     }
 }
 
