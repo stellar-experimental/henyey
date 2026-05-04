@@ -1599,22 +1599,7 @@ impl App {
         } else {
             0
         };
-        // Extract flags from LedgerHeaderExt::V1 if present.
-        let flags = match &snap.header.ext {
-            stellar_xdr::curr::LedgerHeaderExt::V0 => 0,
-            stellar_xdr::curr::LedgerHeaderExt::V1(ext) => ext.flags,
-        };
-        LedgerSummary {
-            num: snap.header.ledger_seq,
-            hash: snap.hash,
-            close_time,
-            version: snap.header.ledger_version,
-            base_fee: snap.header.base_fee,
-            base_reserve: snap.header.base_reserve,
-            max_tx_set_size: snap.header.max_tx_set_size,
-            flags,
-            age,
-        }
+        LedgerSummary::from_snapshot(&snap, age)
     }
 
     pub fn target_ledger_close_duration(&self) -> Duration {

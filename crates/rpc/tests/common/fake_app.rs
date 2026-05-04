@@ -61,40 +61,17 @@ impl RpcAppHandle for FakeRpcApp {
 
     fn info(&self) -> AppInfo {
         AppInfo {
-            version: "0.0.0-test".to_string(),
             commit_hash: self.commit_hash.clone(),
             build_timestamp: self.build_timestamp.clone(),
             node_name: "fake-rpc-test-node".to_string(),
-            public_key: String::new(),
             network_passphrase: self.config.network.passphrase.clone(),
-            is_validator: false,
-            database_path: PathBuf::from(":memory:"),
-            meta_stream_bytes_total: 0,
-            meta_stream_writes_total: 0,
-            scp_verify: Default::default(),
-            overlay_fetch_channel: Default::default(),
-            post_catchup_hard_reset_total: 0,
-            max_verified_scp_slot: 0,
+            ..AppInfo::test_default()
         }
     }
 
     fn ledger_summary(&self) -> LedgerSummary {
         let snap = self.ledger_manager.header_snapshot();
-        let flags = match &snap.header.ext {
-            stellar_xdr::curr::LedgerHeaderExt::V0 => 0,
-            stellar_xdr::curr::LedgerHeaderExt::V1(ext) => ext.flags,
-        };
-        LedgerSummary {
-            num: snap.header.ledger_seq,
-            hash: snap.hash,
-            close_time: snap.header.scp_value.close_time.0,
-            version: snap.header.ledger_version,
-            base_fee: snap.header.base_fee,
-            base_reserve: snap.header.base_reserve,
-            max_tx_set_size: snap.header.max_tx_set_size,
-            flags,
-            age: 0,
-        }
+        LedgerSummary::from_snapshot(&snap, 0)
     }
 
     fn ledger_snapshot(&self) -> HeaderSnapshot {

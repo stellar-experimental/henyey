@@ -12,7 +12,7 @@ use serde::Serialize;
 
 use henyey_common::Hash256;
 use henyey_herder::{AccountProvider, FeeBalanceProvider, Herder};
-use henyey_ledger::LedgerManager;
+use henyey_ledger::{HeaderSnapshot, LedgerManager};
 use henyey_overlay::{PeerId, ScpQueueCallback};
 use stellar_xdr::curr::{Hash, LedgerUpgrade, ReadXdr, TopologyResponseBodyV2, UpgradeType};
 
@@ -279,6 +279,30 @@ pub struct LedgerSummary {
     pub age: u64,
 }
 
+impl LedgerSummary {
+    /// Construct from a [`HeaderSnapshot`] and a pre-computed age.
+    ///
+    /// All header-derived fields are extracted from `snap`; `age` is passed in
+    /// because it depends on the system clock (which only the caller has).
+    pub fn from_snapshot(snap: &HeaderSnapshot, age: u64) -> Self {
+        let flags = match &snap.header.ext {
+            stellar_xdr::curr::LedgerHeaderExt::V0 => 0,
+            stellar_xdr::curr::LedgerHeaderExt::V1(ext) => ext.flags,
+        };
+        LedgerSummary {
+            num: snap.header.ledger_seq,
+            hash: snap.hash,
+            close_time: snap.header.scp_value.close_time.0,
+            version: snap.header.ledger_version,
+            base_fee: snap.header.base_fee,
+            base_reserve: snap.header.base_reserve,
+            max_tx_set_size: snap.header.max_tx_set_size,
+            flags,
+            age,
+        }
+    }
+}
+
 /// Application info for the info command.
 #[derive(Debug, Clone)]
 pub struct AppInfo {
@@ -479,6 +503,35 @@ impl std::fmt::Display for AppInfo {
             writeln!(f, "  Writes:         {}", self.meta_stream_writes_total)?;
         }
         Ok(())
+    }
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+#[doc(hidden)]
+impl AppInfo {
+    /// Test-only constructor with sensible placeholder values.
+    ///
+    /// Callers should override fields they care about using struct update syntax:
+    /// ```ignore
+    /// AppInfo { version: "custom".into(), ..AppInfo::test_default() }
+    /// ```
+    pub fn test_default() -> Self {
+        AppInfo {
+            version: "0.0.0-test".to_string(),
+            commit_hash: None,
+            build_timestamp: None,
+            node_name: "test-node".to_string(),
+            public_key: String::new(),
+            network_passphrase: "Test SDF Network ; September 2015".to_string(),
+            is_validator: false,
+            database_path: std::path::PathBuf::from(":memory:"),
+            meta_stream_bytes_total: 0,
+            meta_stream_writes_total: 0,
+            scp_verify: ScpVerifyMetrics::default(),
+            overlay_fetch_channel: OverlayFetchChannelMetrics::default(),
+            post_catchup_hard_reset_total: 0,
+            max_verified_scp_slot: 0,
+        }
     }
 }
 
@@ -1505,19 +1558,9 @@ mod tests {
     fn test_app_info_display_absent_metadata() {
         let info = AppInfo {
             version: "1.0.0".to_string(),
-            commit_hash: None,
-            build_timestamp: None,
-            node_name: "test-node".to_string(),
             public_key: "GABCD".to_string(),
             network_passphrase: "Test".to_string(),
-            is_validator: false,
-            database_path: std::path::PathBuf::from(":memory:"),
-            meta_stream_bytes_total: 0,
-            meta_stream_writes_total: 0,
-            scp_verify: Default::default(),
-            overlay_fetch_channel: Default::default(),
-            post_catchup_hard_reset_total: 0,
-            max_verified_scp_slot: 0,
+            ..AppInfo::test_default()
         };
         let output = format!("{}", info);
         assert!(!output.contains("Commit:"));
@@ -1530,20 +1573,130 @@ mod tests {
             version: "1.0.0".to_string(),
             commit_hash: Some("abc123".to_string()),
             build_timestamp: Some("2024-01-01T00:00:00Z".to_string()),
-            node_name: "test-node".to_string(),
             public_key: "GABCD".to_string(),
             network_passphrase: "Test".to_string(),
-            is_validator: false,
-            database_path: std::path::PathBuf::from(":memory:"),
-            meta_stream_bytes_total: 0,
-            meta_stream_writes_total: 0,
-            scp_verify: Default::default(),
-            overlay_fetch_channel: Default::default(),
-            post_catchup_hard_reset_total: 0,
-            max_verified_scp_slot: 0,
+            ..AppInfo::test_default()
         };
         let output = format!("{}", info);
         assert!(output.contains("Commit:     abc123"));
         assert!(output.contains("Built:      2024-01-01T00:00:00Z"));
+    }
+
+    #[test]
+    fn test_ledger_summary_from_snapshot_v0() {
+        use henyey_ledger::HeaderSnapshot;
+        use stellar_xdr::curr::*;
+
+        let header = LedgerHeader {
+            ledger_version: 25,
+            previous_ledger_hash: Hash([0; 32]),
+            scp_value: StellarValue {
+                tx_set_hash: Hash([0; 32]),
+                close_time: TimePoint(1700000000),
+                upgrades: VecM::default(),
+                ext: StellarValueExt::Basic,
+            },
+            tx_set_result_hash: Hash([0; 32]),
+            bucket_list_hash: Hash([0; 32]),
+            ledger_seq: 100,
+            total_coins: 0,
+            fee_pool: 0,
+            inflation_seq: 0,
+            id_pool: 0,
+            base_fee: 100,
+            base_reserve: 5_000_000,
+            max_tx_set_size: 1000,
+            skip_list: [const { Hash([0; 32]) }; 4],
+            ext: LedgerHeaderExt::V0,
+        };
+        let snap = HeaderSnapshot {
+            header,
+            hash: henyey_common::Hash256([42; 32]),
+        };
+
+        let summary = LedgerSummary::from_snapshot(&snap, 55);
+        assert_eq!(summary.num, 100);
+        assert_eq!(summary.hash, henyey_common::Hash256([42; 32]));
+        assert_eq!(summary.close_time, 1700000000);
+        assert_eq!(summary.version, 25);
+        assert_eq!(summary.base_fee, 100);
+        assert_eq!(summary.base_reserve, 5_000_000);
+        assert_eq!(summary.max_tx_set_size, 1000);
+        assert_eq!(summary.flags, 0);
+        assert_eq!(summary.age, 55);
+    }
+
+    #[test]
+    fn test_ledger_summary_from_snapshot_v1_flags() {
+        use henyey_ledger::HeaderSnapshot;
+        use stellar_xdr::curr::*;
+
+        let header = LedgerHeader {
+            ledger_version: 25,
+            previous_ledger_hash: Hash([0; 32]),
+            scp_value: StellarValue {
+                tx_set_hash: Hash([0; 32]),
+                close_time: TimePoint(1700000000),
+                upgrades: VecM::default(),
+                ext: StellarValueExt::Basic,
+            },
+            tx_set_result_hash: Hash([0; 32]),
+            bucket_list_hash: Hash([0; 32]),
+            ledger_seq: 200,
+            total_coins: 0,
+            fee_pool: 0,
+            inflation_seq: 0,
+            id_pool: 0,
+            base_fee: 200,
+            base_reserve: 10_000_000,
+            max_tx_set_size: 2000,
+            skip_list: [const { Hash([0; 32]) }; 4],
+            ext: LedgerHeaderExt::V1(LedgerHeaderExtensionV1 {
+                flags: 0x1,
+                ext: LedgerHeaderExtensionV1Ext::V0,
+            }),
+        };
+        let snap = HeaderSnapshot {
+            header,
+            hash: henyey_common::Hash256([99; 32]),
+        };
+
+        let summary = LedgerSummary::from_snapshot(&snap, 0);
+        assert_eq!(summary.num, 200);
+        assert_eq!(summary.flags, 0x1);
+        assert_eq!(summary.base_fee, 200);
+        assert_eq!(summary.max_tx_set_size, 2000);
+    }
+
+    #[test]
+    fn test_app_info_test_default_sentinel_values() {
+        let info = AppInfo::test_default();
+        assert_eq!(info.version, "0.0.0-test");
+        assert!(info.commit_hash.is_none());
+        assert!(info.build_timestamp.is_none());
+        assert_eq!(info.node_name, "test-node");
+        assert!(info.public_key.is_empty());
+        assert_eq!(info.network_passphrase, "Test SDF Network ; September 2015");
+        assert!(!info.is_validator);
+        assert_eq!(info.database_path, std::path::PathBuf::from(":memory:"));
+        assert_eq!(info.meta_stream_bytes_total, 0);
+        assert_eq!(info.meta_stream_writes_total, 0);
+        assert_eq!(info.post_catchup_hard_reset_total, 0);
+        assert_eq!(info.max_verified_scp_slot, 0);
+    }
+
+    #[test]
+    fn test_app_info_test_default_struct_update_preserves_overrides() {
+        let info = AppInfo {
+            commit_hash: Some("deadbeef".to_string()),
+            node_name: "custom-node".to_string(),
+            ..AppInfo::test_default()
+        };
+        assert_eq!(info.commit_hash, Some("deadbeef".to_string()));
+        assert_eq!(info.node_name, "custom-node");
+        // Non-overridden fields retain test_default sentinels.
+        assert_eq!(info.version, "0.0.0-test");
+        assert!(info.build_timestamp.is_none());
+        assert!(info.public_key.is_empty());
     }
 }
