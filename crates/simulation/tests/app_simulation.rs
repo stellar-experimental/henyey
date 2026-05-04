@@ -1,9 +1,10 @@
 use std::time::Duration;
 
 use henyey_app::config::QuorumSetConfig;
-use henyey_app::AppState;
+use henyey_app::{App, AppState};
 use henyey_common::Hash256;
 use henyey_crypto::SecretKey;
+use henyey_herder::scp_verify::PostVerifyReason;
 use henyey_simulation::{
     GeneratedLoadConfig, LoadGenerator, LoadStep, Simulation, SimulationMode, Topologies,
 };
@@ -196,6 +197,33 @@ async fn build_two_running_of_three(mode: SimulationMode) -> Simulation {
              within 20s (min_peers=1).",
         );
     sim
+}
+
+/// Capture the three `pv_counters` variants that prove `pump_scp_intake` traversal.
+///
+/// Returns `(Accepted, PendingAddBuffered, PendingAddProcessedDirectly)`.
+fn scp_intake_counters(app: &App) -> (u64, u64, u64) {
+    let c = &app.info().scp_verify.pv_counters;
+    (
+        c[PostVerifyReason::Accepted],
+        c[PostVerifyReason::PendingAddBuffered],
+        c[PostVerifyReason::PendingAddProcessedDirectly],
+    )
+}
+
+/// Assert that `Accepted + PendingAddBuffered + PendingAddProcessedDirectly` is
+/// positive, proving SCP envelopes traversed the `pump_scp_intake` pipeline.
+///
+/// Use after a fresh `restart_node()` + recovery: the new `App` starts with
+/// zero counters, so any positive total proves the intake pipeline worked.
+fn assert_scp_intake_reached(app: &App, node: &str) {
+    let (accepted, buffered, direct) = scp_intake_counters(app);
+    let total = accepted + buffered + direct;
+    assert!(
+        total > 0,
+        "{node} must have processed SCP envelopes through pump_scp_intake \
+         (Accepted={accepted}, Buffered={buffered}, Direct={direct}, total={total})"
+    );
 }
 
 #[tokio::test]
@@ -689,6 +717,11 @@ async fn test_core3_restart_rejoin_over_tcp() {
     // 60s timeout: post-restart catchup can be slow on CI runners.
     wait_for_app_ledger_close(&sim, 3, Duration::from_secs(60)).await;
 
+    // Verify SCP envelopes traversed the pump_scp_intake pipeline during recovery.
+    // restart_node() creates a fresh App with zero counters, so any positive
+    // total proves the intake pipeline worked.
+    assert_scp_intake_reached(&sim.app("node0").expect("node0 for post-check"), "node0");
+
     // Now advance all nodes to ledger 4.
     manual_close_until(&sim, 4, 1, Duration::from_secs(60)).await;
 
@@ -736,6 +769,11 @@ async fn test_core3_restart_rejoin_over_loopback() {
     // Wait for node0 to catch up to ledger 3 before triggering ledger 4.
     // 60s timeout: post-restart catchup can be slow on CI runners.
     wait_for_app_ledger_close(&sim, 3, Duration::from_secs(60)).await;
+
+    // Verify SCP envelopes traversed the pump_scp_intake pipeline during recovery.
+    // restart_node() creates a fresh App with zero counters, so any positive
+    // total proves the intake pipeline worked.
+    assert_scp_intake_reached(&sim.app("node0").expect("node0 for post-check"), "node0");
 
     // Now advance all nodes to ledger 4.
     manual_close_until(&sim, 4, 1, Duration::from_secs(60)).await;
@@ -1101,6 +1139,11 @@ async fn test_slow_node_lagging_node_recovers() {
     // Wait for node0 to catch up to the majority's ledger.
     wait_for_app_ledger_close(&sim, majority_ledger, Duration::from_secs(60)).await;
 
+    // Verify SCP envelopes traversed the pump_scp_intake pipeline during recovery.
+    // restart_node() creates a fresh App with zero counters, so any positive
+    // total proves the intake pipeline worked.
+    assert_scp_intake_reached(&sim.app("node0").expect("node0 for post-check"), "node0");
+
     // Close one more ledger to confirm full sync with all 3 nodes.
     manual_close_until(&sim, majority_ledger + 1, 1, Duration::from_secs(60)).await;
 
@@ -1122,8 +1165,6 @@ async fn test_slow_node_lagging_node_recovers() {
 /// Regression context: #2317, #2325, #2364.
 #[tokio::test]
 async fn test_pair_tcp_scp_messages_exercise_pump_scp_intake() {
-    use henyey_herder::scp_verify::PostVerifyReason;
-
     let mut sim =
         build_app_backed_topology(Topologies::pair(SimulationMode::OverTcp), 100, 1).await;
 
@@ -1203,7 +1244,6 @@ async fn test_pair_tcp_scp_messages_exercise_pump_scp_intake() {
 /// Regression context: #2317, #2364, #2374.
 #[tokio::test]
 async fn test_self_echo_scp_reaches_pump_scp_intake() {
-    use henyey_herder::scp_verify::PostVerifyReason;
     use stellar_xdr::curr::{NodeId, StellarMessage};
 
     let mut sim =
