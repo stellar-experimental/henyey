@@ -313,7 +313,7 @@ impl Default for HerderConfig {
 ///
 /// // Create a non-validator herder
 /// let config = HerderConfig::default();
-/// let herder = Herder::new(config);
+/// let herder = Herder::new(config, ledger_manager);
 ///
 /// // Start syncing when catchup begins
 /// herder.start_syncing();
@@ -347,8 +347,8 @@ pub struct Herder {
     tracking_started_at: RwLock<Option<Instant>>,
     /// Secret key for signing (if validator).
     secret_key: Option<SecretKey>,
-    /// Ledger manager reference (optional, for validation).
-    ledger_manager: RwLock<Option<Arc<LedgerManager>>>,
+    /// Ledger manager reference.
+    ledger_manager: Arc<LedgerManager>,
     /// Slot-level quorum tracker for heard-from quorum/v-blocking checks.
     slot_quorum_tracker: RwLock<SlotQuorumTracker>,
     /// Transitive quorum tracker for the current quorum map.
@@ -384,17 +384,25 @@ pub struct Herder {
 
 impl Herder {
     /// Create a new Herder (observer mode, no secret key).
-    pub fn new(config: HerderConfig) -> Self {
-        Self::build(config, None)
+    pub fn new(config: HerderConfig, ledger_manager: Arc<LedgerManager>) -> Self {
+        Self::build(config, None, ledger_manager)
     }
 
     /// Create a new Herder with a secret key for validation.
-    pub fn with_secret_key(config: HerderConfig, secret_key: SecretKey) -> Self {
-        Self::build(config, Some(secret_key))
+    pub fn with_secret_key(
+        config: HerderConfig,
+        secret_key: SecretKey,
+        ledger_manager: Arc<LedgerManager>,
+    ) -> Self {
+        Self::build(config, Some(secret_key), ledger_manager)
     }
 
     /// Shared constructor logic for both observer and validator modes.
-    fn build(mut config: HerderConfig, secret_key: Option<SecretKey>) -> Self {
+    fn build(
+        mut config: HerderConfig,
+        secret_key: Option<SecretKey>,
+        ledger_manager: Arc<LedgerManager>,
+    ) -> Self {
         // Normalize the local quorum set up front, before it fans out to
         // SCP::new, ScpDriverConfig, FetchingEnvelopes, QuorumSetTracker,
         // and SlotQuorumTracker. Matches stellar-core's LocalNode constructor
@@ -439,6 +447,7 @@ impl Herder {
                 scp_driver_config,
                 config.network_id,
                 sk.clone(),
+                Arc::clone(&ledger_manager),
                 Arc::clone(&tracking_state),
                 Arc::clone(&scp_metrics),
             )
@@ -446,6 +455,7 @@ impl Herder {
             ScpDriver::new(
                 scp_driver_config,
                 config.network_id,
+                Arc::clone(&ledger_manager),
                 Arc::clone(&tracking_state),
                 Arc::clone(&scp_metrics),
             )
@@ -546,7 +556,7 @@ impl Herder {
             tracking_state,
             tracking_started_at: RwLock::new(None),
             secret_key,
-            ledger_manager: RwLock::new(None),
+            ledger_manager,
             slot_quorum_tracker: RwLock::new(slot_quorum_tracker),
             quorum_tracker: RwLock::new(quorum_tracker),
             quorum_intersection_state: Arc::new(RwLock::new(QuorumIntersectionState::new())),
@@ -591,12 +601,6 @@ impl Herder {
     /// Get current runtime upgrade parameters.
     pub fn upgrade_parameters(&self) -> UpgradeParameters {
         self.runtime_upgrades.read().parameters().clone()
-    }
-
-    /// Set the ledger manager reference.
-    pub fn set_ledger_manager(&self, manager: Arc<LedgerManager>) {
-        self.scp_driver.set_ledger_manager(Arc::clone(&manager));
-        *self.ledger_manager.write() = Some(manager);
     }
 
     /// Get the current state of the Herder.
@@ -758,12 +762,7 @@ impl Herder {
 
     /// Compute the minimum ledger sequence to ask peers for SCP state.
     pub fn get_min_ledger_seq_to_ask_peers(&self) -> u32 {
-        let lcl = self
-            .ledger_manager
-            .read()
-            .as_ref()
-            .map(|manager| manager.current_ledger_seq())
-            .unwrap_or_else(|| self.tracking_slot().min(u32::MAX as u64) as u32);
+        let lcl = self.ledger_manager.current_ledger_seq();
         let mut low = lcl.saturating_add(1);
         let max_slots = self.config.max_externalized_slots.max(1) as u32;
         // Number of extra ledgers to keep beyond max_externalized_slots, matching
@@ -780,21 +779,15 @@ impl Herder {
 
     /// Get the expected ledger close duration.
     ///
-    /// For protocol >= 23, reads the dynamic value from the ledger config
-    /// (via `LedgerManager::expected_ledger_close_duration()`). Falls back to
-    /// the static `HerderConfig::ledger_close_time` when the ledger manager
-    /// is not yet installed (startup, unit tests).
+    /// Reads the dynamic value from the ledger config
+    /// (via `LedgerManager::expected_ledger_close_duration()`).
     ///
     /// The returned `Duration` has millisecond precision. Callers needing a
     /// raw integer should use `.as_secs()` or `.as_millis() as u64` at the
     /// leaf site — the source value is always bounded by `u32`, so the cast
     /// to `u64` is lossless.
     pub fn ledger_close_duration(&self) -> Duration {
-        let guard = self.ledger_manager.read();
-        if let Some(manager) = guard.as_ref() {
-            return manager.expected_ledger_close_duration();
-        }
-        Duration::from_secs(self.config.ledger_close_time as u64)
+        self.ledger_manager.expected_ledger_close_duration()
     }
 
     /// Get the maximum size of a transaction set (ops).
@@ -988,14 +981,9 @@ impl Herder {
 
         debug!("Bootstrapping Herder at ledger {}", ledger_seq);
 
-        // Get tracking consensus close time from LCL if available
+        // Get tracking consensus close time from LCL
         // (matching stellar-core setTrackingSCPState which sets close time from externalized value)
-        let close_time = self
-            .ledger_manager
-            .read()
-            .as_ref()
-            .map(|lm| lm.current_header().scp_value.close_time.0)
-            .unwrap_or(0);
+        let close_time = self.ledger_manager.current_header().scp_value.close_time.0;
 
         // Update shared tracking state (immediately visible to ScpDriver)
         {
@@ -1054,15 +1042,9 @@ impl Herder {
         let env_ledger_index = envelope.statement.slot_index;
 
         // Get LCL data
-        let (lcl_seq, lcl_close_time) = self
-            .ledger_manager
-            .read()
-            .as_ref()
-            .map(|lm| {
-                let header = lm.current_header();
-                (header.ledger_seq as u64, header.scp_value.close_time.0)
-            })
-            .unwrap_or((0, 0));
+        let header = self.ledger_manager.current_header();
+        let lcl_seq = header.ledger_seq as u64;
+        let lcl_close_time = header.scp_value.close_time.0;
 
         let mut last_close_index = lcl_seq;
         let mut last_close_time = lcl_close_time;
@@ -1448,17 +1430,13 @@ impl Herder {
 
         // Pre-fetch tx sets from EXTERNALIZE envelopes immediately so they're
         // available by the time SCP processes the envelope.
-        let lcl = self
-            .ledger_manager
-            .read()
-            .as_ref()
-            .map(|m| m.current_ledger_seq() as u64);
+        let lcl = self.ledger_manager.current_ledger_seq() as u64;
         if let stellar_xdr::curr::ScpStatementPledges::Externalize(ext) =
             &envelope.statement.pledges
         {
             if let Ok(sv) = StellarValue::from_xdr(&ext.commit.value.0, Limits::none()) {
                 let tx_set_hash = Hash256::from_bytes(sv.tx_set_hash.0);
-                if lcl.map_or(true, |l| slot > l) {
+                if slot > lcl {
                     if self.scp_driver.request_tx_set(tx_set_hash, slot) {
                         debug!(slot, hash = %tx_set_hash, "Requesting tx set from EXTERNALIZE");
                     }
@@ -1921,22 +1899,16 @@ impl Herder {
     ///
     /// Reads from the LedgerManager's LCL (`current_header().scp_value`),
     /// mirroring stellar-core's `triggerNextLedger(lcl.header.scpValue)` pattern.
-    /// Returns `Value::default()` when no LedgerManager is installed (test-only path).
     fn get_previous_value(&self) -> Value {
-        if let Some(lm) = self.ledger_manager.read().as_ref() {
-            let header = lm.current_header();
-            Value(
-                header
-                    .scp_value
-                    .to_xdr(Limits::none())
-                    .expect("StellarValue XDR serialization cannot fail for a valid LCL header")
-                    .try_into()
-                    .expect("StellarValue XDR bytes always fit in BytesM"),
-            )
-        } else {
-            tracing::debug!("get_previous_value: no LedgerManager installed, returning default");
-            Value::default()
-        }
+        let header = self.ledger_manager.current_header();
+        Value(
+            header
+                .scp_value
+                .to_xdr(Limits::none())
+                .expect("StellarValue XDR serialization cannot fail for a valid LCL header")
+                .try_into()
+                .expect("StellarValue XDR bytes always fit in BytesM"),
+        )
     }
 
     /// Trigger consensus for the next ledger (for validators).
@@ -2348,24 +2320,8 @@ impl Herder {
     ///
     /// Returns true when the requested SCP `slot` matches `LCL + 1`, i.e.
     /// the next slot we should nominate.
-    ///
-    /// LM=None semantics: returns true. The pre-bootstrap path is exercised
-    /// by existing unit tests that intentionally do not install an LM
-    /// (e.g. `test_trigger_next_ledger_includes_runtime_upgrades` and
-    /// `test_trigger_next_ledger_idempotent_during_nomination`). Production
-    /// always installs the LM during bootstrap (`set_ledger_manager`) before
-    /// any consensus trigger fires, so treating None as "match" preserves
-    /// test scaffolding without weakening the production gate.
     fn lcl_matches_slot(&self, slot: SlotIndex) -> bool {
-        let current_lcl = self
-            .ledger_manager
-            .read()
-            .as_ref()
-            .map(|m| m.current_ledger_seq() as u64);
-        match current_lcl {
-            None => true,
-            Some(lcl) => lcl + 1 == slot,
-        }
+        self.ledger_manager.current_ledger_seq() as u64 + 1 == slot
     }
 
     /// Handle ballot timeout.
@@ -2428,95 +2384,80 @@ impl Herder {
             config_ctx,
             soroban_info,
         ) = {
-            let guard = self.ledger_manager.read();
-            if let Some(manager) = guard.as_ref() {
-                // ONE snapshot for the entire nomination pass: tx set building,
-                // seq map, config upgrade context, and self-validation providers
-                // all observe the same ledger state. Consolidation eliminates the
-                // race where a concurrent commit_close() could advance the ledger
-                // between the old multi-snapshot reads.
-                let snap = match manager.create_snapshot() {
-                    Ok(s) => s,
-                    Err(e) => {
-                        // If we can't create a consistent snapshot, abort
-                        // nomination rather than proceeding with potentially
-                        // inconsistent state. Safer but less available —
-                        // nomination will be retried on the next timer tick.
-                        tracing::warn!(
-                            error = %e,
-                            "Failed to create snapshot for nomination; aborting"
-                        );
-                        return None;
-                    }
-                };
-
-                let header = snap.header().clone();
-                let lcl_ct = header.scp_value.close_time.0;
-                let max = header.max_tx_set_size as usize;
-                let ledger_seq = snap.ledger_seq();
-                let header_hash = snap.header_hash();
-
-                // Known residual race: soroban_network_info() acquires
-                // state.read() independently from create_snapshot(). If
-                // commit_close() runs between the snapshot creation above
-                // and here, soroban_info may be from a different ledger.
-                // Impact: nomination aborts on self-validation mismatch
-                // (safe). Tracked follow-up: capture soroban_network_info
-                // inside LedgerSnapshot.
-                let soroban_info = manager.soroban_network_info();
-                let soroban_max = soroban_info.as_ref().map(|info| info.ledger_max_tx_count);
-
-                // Build seq map from the snapshot (borrows).
-                let seq = self.build_starting_seq_map(&snap, ledger_seq);
-
-                // Config upgrade context from the same snapshot (borrows).
-                // ConfigUpgradeContext::from_snapshot clones the snapshot
-                // internally, so both the tx set and config context observe
-                // data from the same point in time.
-                let cfg_ctx = self
-                    .runtime_upgrades
-                    .read()
-                    .parameters()
-                    .config_upgrade_set_key
-                    .as_ref()
-                    .and_then(|k| k.to_xdr().ok())
-                    .and_then(
-                        |key| match ConfigUpgradeContext::from_snapshot(&snap, &key) {
-                            Ok(ctx) => ctx,
-                            Err(e) => {
-                                error!("Error loading config upgrade context: {e}");
-                                None
-                            }
-                        },
+            // ONE snapshot for the entire nomination pass: tx set building,
+            // seq map, config upgrade context, and self-validation providers
+            // all observe the same ledger state. Consolidation eliminates the
+            // race where a concurrent commit_close() could advance the ledger
+            // between the old multi-snapshot reads.
+            let snap = match self.ledger_manager.create_snapshot() {
+                Ok(s) => s,
+                Err(e) => {
+                    // If we can't create a consistent snapshot, abort
+                    // nomination rather than proceeding with potentially
+                    // inconsistent state. Safer but less available —
+                    // nomination will be retried on the next timer tick.
+                    tracing::warn!(
+                        error = %e,
+                        "Failed to create snapshot for nomination; aborting"
                     );
+                    return None;
+                }
+            };
 
-                // SnapshotProviders takes ownership of the snapshot.
-                let sp = crate::tx_queue::SnapshotProviders::new(snap);
+            let header = snap.header().clone();
+            let lcl_ct = header.scp_value.close_time.0;
+            let max = header.max_tx_set_size as usize;
+            let ledger_seq = snap.ledger_seq();
+            let header_hash = snap.header_hash();
 
-                (
-                    header_hash,
-                    max,
-                    seq,
-                    header,
-                    lcl_ct,
-                    soroban_max,
-                    Some(sp),
-                    cfg_ctx,
-                    soroban_info,
-                )
-            } else {
-                (
-                    Hash256::ZERO,
-                    self.config.max_tx_set_size,
-                    None,
-                    LedgerHeader::default(),
-                    0,
-                    None,
-                    None,
-                    None,
-                    None,
-                )
-            }
+            // Known residual race: soroban_network_info() acquires
+            // state.read() independently from create_snapshot(). If
+            // commit_close() runs between the snapshot creation above
+            // and here, soroban_info may be from a different ledger.
+            // Impact: nomination aborts on self-validation mismatch
+            // (safe). Tracked follow-up: capture soroban_network_info
+            // inside LedgerSnapshot.
+            let soroban_info = self.ledger_manager.soroban_network_info();
+            let soroban_max = soroban_info.as_ref().map(|info| info.ledger_max_tx_count);
+
+            // Build seq map from the snapshot (borrows).
+            let seq = self.build_starting_seq_map(&snap, ledger_seq);
+
+            // Config upgrade context from the same snapshot (borrows).
+            // ConfigUpgradeContext::from_snapshot clones the snapshot
+            // internally, so both the tx set and config context observe
+            // data from the same point in time.
+            let cfg_ctx = self
+                .runtime_upgrades
+                .read()
+                .parameters()
+                .config_upgrade_set_key
+                .as_ref()
+                .and_then(|k| k.to_xdr().ok())
+                .and_then(
+                    |key| match ConfigUpgradeContext::from_snapshot(&snap, &key) {
+                        Ok(ctx) => ctx,
+                        Err(e) => {
+                            error!("Error loading config upgrade context: {e}");
+                            None
+                        }
+                    },
+                );
+
+            // SnapshotProviders takes ownership of the snapshot.
+            let sp = crate::tx_queue::SnapshotProviders::new(snap);
+
+            (
+                header_hash,
+                max,
+                seq,
+                header,
+                lcl_ct,
+                soroban_max,
+                Some(sp),
+                cfg_ctx,
+                soroban_info,
+            )
         };
 
         // 2. Close time with monotonic clamp (parity: HerderImpl.cpp triggerNextLedger).
@@ -3807,9 +3748,13 @@ mod tests {
         StellarValueExt, TimePoint, Value, WriteXdr,
     };
 
+    fn make_default_lm() -> Arc<henyey_ledger::LedgerManager> {
+        make_lm_at_seq_for_stale_test(0)
+    }
+
     fn make_test_herder() -> Herder {
         let config = HerderConfig::default();
-        Herder::new(config)
+        Herder::new(config, make_default_lm())
     }
 
     fn make_validator_herder() -> (Herder, SecretKey) {
@@ -3831,14 +3776,15 @@ mod tests {
             ..HerderConfig::default()
         };
 
-        let herder = Herder::with_secret_key(config, secret_for_herder);
+        let herder = Herder::with_secret_key(config, secret_for_herder, make_default_lm());
         let secret_for_signing = SecretKey::from_seed(&seed);
 
         (herder, secret_for_signing)
     }
 
     fn make_valid_value_with_cached_tx_set(herder: &Herder, secret_key: &SecretKey) -> Value {
-        let tx_set = TransactionSet::new(Hash256::ZERO, Vec::new());
+        let lcl_hash = herder.scp_driver.current_header_hash();
+        let tx_set = TransactionSet::new(lcl_hash, Vec::new());
         let tx_set_hash = *tx_set.hash();
         herder.scp_driver.cache_tx_set(tx_set);
 
@@ -4043,7 +3989,7 @@ mod tests {
             ..HerderConfig::default()
         };
 
-        let herder = Herder::with_secret_key(config, local_secret.clone());
+        let herder = Herder::with_secret_key(config, local_secret.clone(), make_default_lm());
         herder.start_syncing();
         herder.bootstrap(100);
 
@@ -4141,7 +4087,7 @@ mod tests {
             ..HerderConfig::default()
         };
 
-        let herder = Herder::with_secret_key(config, local_secret);
+        let herder = Herder::with_secret_key(config, local_secret, make_default_lm());
         herder.start_syncing();
         herder.bootstrap(100);
 
@@ -4204,7 +4150,7 @@ mod tests {
             ..HerderConfig::default()
         };
 
-        let herder = Herder::with_secret_key(config, local_secret);
+        let herder = Herder::with_secret_key(config, local_secret, make_default_lm());
         herder.start_syncing();
         herder.bootstrap(100);
 
@@ -4262,7 +4208,7 @@ mod tests {
             ..HerderConfig::default()
         };
 
-        let herder = Herder::with_secret_key(config, local_secret);
+        let herder = Herder::with_secret_key(config, local_secret, make_default_lm());
         herder.start_syncing();
         herder.bootstrap(100);
 
@@ -4311,7 +4257,7 @@ mod tests {
             ..HerderConfig::default()
         };
 
-        let herder = Herder::with_secret_key(config, local_secret);
+        let herder = Herder::with_secret_key(config, local_secret, make_default_lm());
         herder.start_syncing();
         herder.bootstrap(100);
 
@@ -4406,7 +4352,7 @@ mod tests {
             ..HerderConfig::default()
         };
 
-        let herder = Herder::with_secret_key(config, secret_for_herder);
+        let herder = Herder::with_secret_key(config, secret_for_herder, make_default_lm());
         let secret = SecretKey::from_seed(&seed);
         let slot = 1u64;
 
@@ -4453,7 +4399,7 @@ mod tests {
             ..HerderConfig::default()
         };
 
-        let herder = Herder::with_secret_key(config, secret_for_herder);
+        let herder = Herder::with_secret_key(config, secret_for_herder, make_default_lm());
         let secret = SecretKey::from_seed(&seed);
         let slot = 1u64;
 
@@ -4586,7 +4532,7 @@ mod tests {
             local_quorum_set: Some(quorum_set),
             ..HerderConfig::default()
         };
-        let herder = Herder::with_secret_key(config, secret);
+        let herder = Herder::with_secret_key(config, secret, make_default_lm());
 
         // (a) SCP must store the normalized form.
         let scp_stored = herder.scp().local_quorum_set();
@@ -4608,7 +4554,9 @@ mod tests {
         //     statement matches the canonical hash.
         let signing_secret = SecretKey::from_seed(&[9u8; 32]);
         let value = make_valid_value_with_cached_tx_set(&herder, &signing_secret);
-        let prev_value = value.clone();
+        // Use a deterministic prev_value so leader election doesn't depend
+        // on the (LCL-hash-derived) value bytes.
+        let prev_value = Value::default();
         assert!(herder.scp().nominate(1, value, &prev_value));
 
         let envelopes = herder.scp().get_latest_messages_send(1);
@@ -4783,11 +4731,12 @@ mod tests {
     async fn test_trigger_next_ledger_includes_runtime_upgrades() {
         let (herder, _secret) = make_validator_herder();
 
-        // Set runtime upgrades: protocol version 25, base reserve 5000000
+        // Set runtime upgrades: protocol version 25, base reserve 10000000
+        // (LM header defaults to base_reserve=5000000, so 10000000 is a change)
         let upgrade_params = crate::upgrades::UpgradeParameters {
             upgrade_time: 0, // immediate
             protocol_version: Some(25),
-            base_reserve: Some(5_000_000),
+            base_reserve: Some(10_000_000),
             ..Default::default()
         };
         herder
@@ -4795,12 +4744,12 @@ mod tests {
             .expect("set_upgrade_parameters should succeed");
 
         // Bootstrap herder to Tracking state (required for trigger_next_ledger)
-        herder.bootstrap(1);
+        herder.bootstrap(0);
         assert_eq!(herder.state(), HerderState::Tracking);
 
-        // Trigger consensus for ledger 2 (no LedgerManager, so header defaults
-        // to version=0, base_reserve=0 — upgrades should fire)
-        let result = herder.trigger_next_ledger(2);
+        // Trigger consensus for ledger 1 (LCL=0, so LCL+1=1 is the current ledger;
+        // LM header has version=0, base_reserve=0 — upgrades should fire)
+        let result = herder.trigger_next_ledger(1);
         assert!(
             result.is_ok(),
             "trigger_next_ledger should succeed: {:?}",
@@ -4809,10 +4758,10 @@ mod tests {
 
         // For a solo validator (1-of-1 quorum), nomination→ballot→externalization
         // happens synchronously. The externalized value should contain the upgrades.
-        let externalized = herder.scp_driver.get_externalized(2);
+        let externalized = herder.scp_driver.get_externalized(1);
         assert!(
             externalized.is_some(),
-            "Slot 2 should be externalized for solo validator"
+            "Slot 1 should be externalized for solo validator"
         );
 
         let ext = externalized.unwrap();
@@ -4836,7 +4785,7 @@ mod tests {
                         found_version = true;
                     }
                     LedgerUpgrade::BaseReserve(r) => {
-                        assert_eq!(r, 5_000_000, "Expected base reserve 5000000");
+                        assert_eq!(r, 10_000_000, "Expected base reserve 10000000");
                         found_reserve = true;
                     }
                     other => panic!("Unexpected upgrade: {:?}", other),
@@ -4846,7 +4795,7 @@ mod tests {
         assert!(found_version, "Should have found Version(25) upgrade");
         assert!(
             found_reserve,
-            "Should have found BaseReserve(5000000) upgrade"
+            "Should have found BaseReserve(10000000) upgrade"
         );
     }
 
@@ -4867,10 +4816,10 @@ mod tests {
             .set_upgrade_parameters(upgrade_params)
             .expect("set upgrade params");
 
-        // Bootstrap at ledger 1 (genesis, protocol 0 — no LedgerManager set)
-        herder.bootstrap(1);
+        // Bootstrap at ledger 0 (genesis, protocol 0)
+        herder.bootstrap(0);
 
-        let result = herder.trigger_next_ledger(2);
+        let result = herder.trigger_next_ledger(1);
         assert!(
             result.is_ok(),
             "trigger_next_ledger failed: {:?}",
@@ -4879,15 +4828,15 @@ mod tests {
 
         let ext = herder
             .scp_driver
-            .get_externalized(2)
-            .expect("slot 2 externalized");
+            .get_externalized(1)
+            .expect("slot 1 externalized");
         let sv = StellarValue::from_xdr(&ext.value, Limits::none()).expect("parse StellarValue");
 
         // The tx_set_hash in the externalized value must be the Classic
         // (non-generalized) hash = SHA256(previous_ledger_hash).
-        // previous_ledger_hash is Hash256::ZERO since no LedgerManager is set.
-        let expected_classic_hash =
-            TransactionSet::compute_non_generalized_hash(Hash256::ZERO, &[]);
+        // previous_ledger_hash is the computed LCL hash.
+        let lcl_hash = herder.scp_driver.current_header_hash();
+        let expected_classic_hash = TransactionSet::compute_non_generalized_hash(lcl_hash, &[]);
         let actual_hash = Hash256::from(sv.tx_set_hash.0);
 
         assert_eq!(
@@ -4922,36 +4871,41 @@ mod tests {
                 .unwrap(),
                 inner_sets: vec![].try_into().unwrap(),
             }),
-            // Set upgrades in REVERSE of canonical order
+            // Set upgrades in REVERSE of canonical order.
+            // Use upgrades valid at protocol 0 (Flags requires V18+).
             proposed_upgrades: vec![
-                LedgerUpgrade::Flags(1),
+                LedgerUpgrade::MaxTxSetSize(200),
                 LedgerUpgrade::BaseFee(200),
                 LedgerUpgrade::Version(25),
             ],
             ..Default::default()
         };
-        // Also set runtime upgrades that would append BaseReserve after Flags
-        let herder = Herder::with_secret_key(config, secret);
+        // Set runtime upgrades matching ALL proposed upgrades (required for
+        // nomination validation) plus an additional BaseReserve.
+        let herder = Herder::with_secret_key(config, secret, make_default_lm());
         let upgrade_params = crate::upgrades::UpgradeParameters {
             upgrade_time: 0,
-            base_reserve: Some(5_000_000),
+            protocol_version: Some(25),
+            base_fee: Some(200),
+            max_tx_set_size: Some(200),
+            base_reserve: Some(10_000_000),
             ..Default::default()
         };
         herder
             .set_upgrade_parameters(upgrade_params)
             .expect("set_upgrade_parameters should succeed");
 
-        herder.bootstrap(1);
+        herder.bootstrap(0);
 
-        let result = herder.trigger_next_ledger(2);
+        let result = herder.trigger_next_ledger(1);
         assert!(
             result.is_ok(),
             "trigger_next_ledger failed: {:?}",
             result.err()
         );
 
-        let externalized = herder.scp_driver.get_externalized(2);
-        assert!(externalized.is_some(), "slot 2 should be externalized");
+        let externalized = herder.scp_driver.get_externalized(1);
+        assert!(externalized.is_some(), "slot 1 should be externalized");
 
         let ext = externalized.unwrap();
         let sv = StellarValue::from_xdr(&ext.value, Limits::none()).expect("parse StellarValue");
@@ -5032,18 +4986,18 @@ mod tests {
             local_quorum_set: Some(quorum_set),
             ..HerderConfig::default()
         };
-        let herder = Herder::with_secret_key(config, secret);
-        herder.bootstrap(1);
+        let herder = Herder::with_secret_key(config, secret, make_default_lm());
+        herder.bootstrap(0);
 
         // First trigger: starts nomination, round should be 1.
-        let result1 = herder.trigger_next_ledger(2);
+        let result1 = herder.trigger_next_ledger(1);
         assert_eq!(
             result1.expect("first trigger should succeed"),
             TriggerOutcome::Triggered,
             "first trigger should report Triggered"
         );
 
-        let state1 = herder.scp().get_slot_state(2).expect("slot 2 should exist");
+        let state1 = herder.scp().get_slot_state(1).expect("slot 1 should exist");
         assert!(state1.is_nominating, "slot should be in nominating state");
         assert_eq!(
             state1.nomination_round, 1,
@@ -5051,7 +5005,7 @@ mod tests {
         );
 
         // Second trigger: should be skipped by the is_nominating guard.
-        let result2 = herder.trigger_next_ledger(2);
+        let result2 = herder.trigger_next_ledger(1);
         assert_eq!(
             result2.expect("second trigger should succeed (no-op)"),
             TriggerOutcome::AlreadyNominating,
@@ -5060,20 +5014,20 @@ mod tests {
 
         let state2 = herder
             .scp()
-            .get_slot_state(2)
-            .expect("slot 2 should still exist");
+            .get_slot_state(1)
+            .expect("slot 1 should still exist");
         assert_eq!(
             state2.nomination_round, 1,
             "second trigger should NOT advance nomination round"
         );
 
         // Third trigger for good measure.
-        let result3 = herder.trigger_next_ledger(2);
+        let result3 = herder.trigger_next_ledger(1);
         assert_eq!(
             result3.expect("third trigger should succeed"),
             TriggerOutcome::AlreadyNominating
         );
-        let state3 = herder.scp().get_slot_state(2).expect("slot 2 exists");
+        let state3 = herder.scp().get_slot_state(1).expect("slot 1 exists");
         assert_eq!(
             state3.nomination_round, 1,
             "third trigger should NOT advance nomination round"
@@ -5097,11 +5051,11 @@ mod tests {
         };
         let lm = LedgerManager::new("Test Network".to_string(), config);
         let header = LedgerHeader {
-            ledger_version: 24,
+            ledger_version: 0,
             previous_ledger_hash: Hash([0u8; 32]),
             scp_value: StellarValue {
                 tx_set_hash: Hash([0u8; 32]),
-                close_time: TimePoint(100),
+                close_time: TimePoint(0),
                 upgrades: VecM::default(),
                 ext: StellarValueExt::Basic,
             },
@@ -5166,11 +5120,10 @@ mod tests {
             local_quorum_set: Some(quorum_set),
             ..HerderConfig::default()
         };
-        let herder = Herder::with_secret_key(config, secret);
-
-        // Install a LedgerManager whose current_ledger_seq() == 5.
         const STALE_SLOT: u32 = 5;
-        herder.set_ledger_manager(make_lm_at_seq_for_stale_test(STALE_SLOT));
+        let herder =
+            Herder::with_secret_key(config, secret, make_lm_at_seq_for_stale_test(STALE_SLOT));
+
         herder.bootstrap(STALE_SLOT);
 
         // Request slot == LCL: re-check sees `lcl + 1 == 6 != slot == 5`.
@@ -5214,10 +5167,10 @@ mod tests {
             local_quorum_set: Some(quorum_set),
             ..HerderConfig::default()
         };
-        let herder = Herder::with_secret_key(config, secret);
-
         const STALE_SLOT: u32 = 7;
-        herder.set_ledger_manager(make_lm_at_seq_for_stale_test(STALE_SLOT));
+        let herder =
+            Herder::with_secret_key(config, secret, make_lm_at_seq_for_stale_test(STALE_SLOT));
+
         herder.bootstrap(STALE_SLOT);
 
         // Cache is empty for this slot, so the cache-miss branch fires
@@ -5259,22 +5212,10 @@ mod tests {
             local_quorum_set: Some(quorum_set),
             ..HerderConfig::default()
         };
-        let herder = Herder::with_secret_key(config, secret);
+        let herder = Herder::with_secret_key(config, secret, make_lm_at_seq_for_stale_test(10));
 
-        // Branch 1: LM=None — preserves pre-bootstrap test scaffolding by
-        // proceeding regardless of slot.
-        assert!(
-            herder.lcl_matches_slot(0),
-            "LM=None should always match (test scaffolding compatibility)"
-        );
-        assert!(
-            herder.lcl_matches_slot(u64::MAX),
-            "LM=None should always match"
-        );
-
-        // Branch 2 & 3: install LM at seq=10, verify match (slot=11) and
+        // LM at seq=10: verify match (slot=11) and
         // mismatch (slot=10, slot=5, slot=12).
-        herder.set_ledger_manager(make_lm_at_seq_for_stale_test(10));
         assert!(
             herder.lcl_matches_slot(11),
             "LM at seq=10 must match slot=11 (LCL+1)"
@@ -5408,9 +5349,10 @@ mod tests {
             ..HerderConfig::default()
         };
 
-        let herder = Herder::with_secret_key(config, SecretKey::from_seed(&[7u8; 32]));
+        let herder =
+            Herder::with_secret_key(config, SecretKey::from_seed(&[7u8; 32]), make_default_lm());
         herder.start_syncing();
-        herder.bootstrap(100);
+        herder.bootstrap(0);
 
         herder
             .quorum_tracker
@@ -5577,7 +5519,7 @@ mod tests {
             ..HerderConfig::default()
         };
 
-        let herder = Herder::with_secret_key(config, local_secret);
+        let herder = Herder::with_secret_key(config, local_secret, make_default_lm());
         herder.start_syncing();
         herder.bootstrap(100);
 
@@ -5668,7 +5610,7 @@ mod tests {
             ..HerderConfig::default()
         };
 
-        let herder = Herder::with_secret_key(config, local_secret);
+        let herder = Herder::with_secret_key(config, local_secret, make_default_lm());
         herder.start_syncing();
         herder.bootstrap(100);
 
@@ -5780,7 +5722,7 @@ mod tests {
             ..HerderConfig::default()
         };
 
-        let herder = Herder::with_secret_key(config, local_secret);
+        let herder = Herder::with_secret_key(config, local_secret, make_default_lm());
 
         // Store quorum sets for both nodes (simulates having learned them
         // from SCP message exchange before the purge).
@@ -5857,7 +5799,7 @@ mod tests {
             ..HerderConfig::default()
         };
 
-        let herder = Herder::with_secret_key(config, local_secret);
+        let herder = Herder::with_secret_key(config, local_secret, make_default_lm());
 
         herder.store_quorum_set(&local_node_id, quorum_set.clone());
         herder.store_quorum_set(&remote_node_id, quorum_set.clone());
@@ -6468,7 +6410,11 @@ mod tests {
             ..HerderConfig::default()
         };
 
-        let herder = Arc::new(Herder::with_secret_key(config, local_secret));
+        let herder = Arc::new(Herder::with_secret_key(
+            config,
+            local_secret,
+            make_default_lm(),
+        ));
         herder.bootstrap(100);
 
         // Expand the quorum tracker so the other node passes the non-quorum filter.
@@ -6609,24 +6555,24 @@ mod tests {
             stellar_xdr::curr::Uint256(*peer_public.as_bytes()),
         ));
 
-        // Set tracking: consensus_index = 100 (next slot to close).
-        // This makes the tracking-state fallback yield lcl_seq = 99.
+        // Set tracking: consensus_index = 1 (next slot to close).
+        // The LM has ledger_seq=0, so is_current_ledger = (1 == 0+1) = true.
         {
             let mut ts = herder.tracking_state.write();
-            ts.consensus_index = 100;
+            ts.consensus_index = 1;
             ts.is_tracking = true;
             // consensus_close_time = 0 (default) so close_time=1 > 0 passes.
         }
-        herder.pending_envelopes.set_current_slot(100);
+        herder.pending_envelopes.set_current_slot(1);
 
         // Create a properly signed StellarValue with cached tx_set.
         let value = make_valid_value_with_cached_tx_set(&herder, &peer_secret);
 
-        // Construct EXTERNALIZE envelope for slot 100.
+        // Construct EXTERNALIZE envelope for slot 1.
         let envelope = ScpEnvelope {
             statement: ScpStatement {
                 node_id: peer_node_id,
-                slot_index: 100,
+                slot_index: 1,
                 pledges: ScpStatementPledges::Externalize(ScpStatementExternalize {
                     commit: ScpBallot { counter: 1, value },
                     n_h: 1,
@@ -6637,24 +6583,24 @@ mod tests {
             signature: XdrSignature(vec![0u8; 64].try_into().unwrap()),
         };
 
-        // Buffer the envelope as pending for slot 100.
-        herder.pending_envelopes.add(100, envelope);
+        // Buffer the envelope as pending for slot 1.
+        herder.pending_envelopes.add(1, envelope);
         assert_eq!(herder.pending_envelopes.slot_count(), 1);
 
-        // Precondition: slot 100 has no deferred causes yet.
+        // Precondition: slot 1 has no deferred causes yet.
         assert_eq!(
             herder.scp_driver.deferred_slot_count(),
             0,
             "precondition: no deferred slots before drain"
         );
 
-        // ledger_closed(99): LCL = 99, drains pending for slot <= 100.
+        // ledger_closed(0): LCL = 0, drains pending for slot <= 1.
         // The drained EXTERNALIZE is processed through:
         //   process_scp_envelope → process_scp_envelope_with_tx_set →
-        //   scp.receive_envelope → validate_value(100, ...) →
-        //   validate_value_against_local_state: lcl_seq=99, is_current_ledger=true
+        //   scp.receive_envelope → validate_value(1, ...) →
+        //   validate_value_against_local_state: lcl_seq=0, is_current_ledger=true
         //   → ValueValidation::Valid (no apply_lag recorded).
-        herder.ledger_closed(99, &[], &[], 0);
+        herder.ledger_closed(0, &[], &[], 0);
 
         // The envelope was drained.
         assert_eq!(
@@ -6676,7 +6622,7 @@ mod tests {
         // would have cleared it (via SCP's ballot protocol), but
         // FullyValidated leaves it untouched.
         assert!(
-            herder.scp.is_slot_fully_validated(100),
+            herder.scp.is_slot_fully_validated(1),
             "post-drain envelope must preserve fully_validated — the \
              is_current_ledger path returns FullyValidated which does not \
              clear the slot's fully_validated flag"
@@ -6720,31 +6666,31 @@ mod tests {
             stellar_xdr::curr::Uint256(*peer_public.as_bytes()),
         ));
 
-        // Set tracking: consensus_index = 100 (next slot to close).
-        // This makes the tracking-state fallback yield lcl_seq = 99.
+        // Set tracking: consensus_index = 1 (next slot to close).
+        // The LM has ledger_seq=0, so is_current_ledger = (1 == 0+1) = true.
         {
             let mut ts = herder.tracking_state.write();
-            ts.consensus_index = 100;
+            ts.consensus_index = 1;
             ts.is_tracking = true;
             // consensus_close_time = 0 (default) so close_time=1 > 0 passes.
         }
 
-        // Activate closing gate for slot 100, mirroring production behavior
+        // Activate closing gate for slot 1, mirroring production behavior
         // in advance_tracking_slot (herder.rs:1759-1763).
         {
             let mut gate = herder.closing_gate.lock().unwrap();
-            gate.slot = 100;
+            gate.slot = 1;
             gate.buffer.clear();
         }
 
         // Create a properly signed StellarValue with cached tx_set.
         let value = make_valid_value_with_cached_tx_set(&herder, &peer_secret);
 
-        // Construct EXTERNALIZE envelope for slot 100.
+        // Construct EXTERNALIZE envelope for slot 1.
         let envelope = ScpEnvelope {
             statement: ScpStatement {
                 node_id: peer_node_id,
-                slot_index: 100,
+                slot_index: 1,
                 pledges: ScpStatementPledges::Externalize(ScpStatementExternalize {
                     commit: ScpBallot { counter: 1, value },
                     n_h: 1,
@@ -6780,12 +6726,12 @@ mod tests {
             "precondition: no deferred slots before gate replay"
         );
 
-        // ledger_closed(99): LCL = 99, replays the gate buffer.
+        // ledger_closed(0): LCL = 0, replays the gate buffer.
         // The replayed EXTERNALIZE is processed through:
         //   process_scp_envelope_with_tx_set → scp.receive_envelope →
-        //   validate_value(100, ...) → validate_value_against_local_state:
-        //   lcl_seq=99, is_current_ledger=true → ValueValidation::Valid.
-        herder.ledger_closed(99, &[], &[], 0);
+        //   validate_value(1, ...) → validate_value_against_local_state:
+        //   lcl_seq=0, is_current_ledger=true → ValueValidation::Valid.
+        herder.ledger_closed(0, &[], &[], 0);
 
         // Gate-cleared assertion: proves the replay path was exercised.
         {
@@ -6813,7 +6759,7 @@ mod tests {
         // would have cleared it (via SCP's ballot protocol), but
         // FullyValidated leaves it untouched.
         assert!(
-            herder.scp.is_slot_fully_validated(100),
+            herder.scp.is_slot_fully_validated(1),
             "gate-replayed envelope must preserve fully_validated — the \
              is_current_ledger path returns FullyValidated which does not \
              clear the slot's fully_validated flag"
@@ -6828,8 +6774,56 @@ mod closing_gate_tests {
         ScpNomination, ScpStatement, ScpStatementPledges, Signature as XdrSignature,
     };
 
+    fn make_default_lm() -> Arc<henyey_ledger::LedgerManager> {
+        use henyey_ledger::{LedgerManager, LedgerManagerConfig};
+        use stellar_xdr::curr::{
+            Hash, LedgerHeader, LedgerHeaderExt, StellarValue, StellarValueExt, TimePoint, VecM,
+        };
+        let config = LedgerManagerConfig {
+            validate_bucket_hash: false,
+            ..Default::default()
+        };
+        let lm = LedgerManager::new("Test Network".to_string(), config);
+        let header = LedgerHeader {
+            ledger_version: 0,
+            previous_ledger_hash: Hash([0u8; 32]),
+            scp_value: StellarValue {
+                tx_set_hash: Hash([0u8; 32]),
+                close_time: TimePoint(0),
+                upgrades: VecM::default(),
+                ext: StellarValueExt::Basic,
+            },
+            tx_set_result_hash: Hash([0u8; 32]),
+            bucket_list_hash: Hash([0u8; 32]),
+            ledger_seq: 0,
+            total_coins: 1_000_000_000_000,
+            fee_pool: 0,
+            inflation_seq: 0,
+            id_pool: 0,
+            base_fee: 100,
+            base_reserve: 5_000_000,
+            max_tx_set_size: 100,
+            skip_list: [
+                Hash([0u8; 32]),
+                Hash([0u8; 32]),
+                Hash([0u8; 32]),
+                Hash([0u8; 32]),
+            ],
+            ext: LedgerHeaderExt::V0,
+        };
+        let header_hash = henyey_ledger::compute_header_hash(&header).expect("hash");
+        lm.initialize(
+            henyey_bucket::BucketList::new(),
+            henyey_bucket::HotArchiveBucketList::new(),
+            header,
+            header_hash,
+        )
+        .expect("init");
+        Arc::new(lm)
+    }
+
     fn make_test_herder() -> Herder {
-        Herder::new(HerderConfig::default())
+        Herder::new(HerderConfig::default(), make_default_lm())
     }
 
     fn make_test_envelope(slot: u64) -> ScpEnvelope {
@@ -7044,8 +7038,56 @@ mod closing_gate_tests {
 mod set_state_tests {
     use super::*;
 
+    fn make_default_lm() -> Arc<henyey_ledger::LedgerManager> {
+        use henyey_ledger::{LedgerManager, LedgerManagerConfig};
+        use stellar_xdr::curr::{
+            Hash, LedgerHeader, LedgerHeaderExt, StellarValue, StellarValueExt, TimePoint, VecM,
+        };
+        let config = LedgerManagerConfig {
+            validate_bucket_hash: false,
+            ..Default::default()
+        };
+        let lm = LedgerManager::new("Test Network".to_string(), config);
+        let header = LedgerHeader {
+            ledger_version: 0,
+            previous_ledger_hash: Hash([0u8; 32]),
+            scp_value: StellarValue {
+                tx_set_hash: Hash([0u8; 32]),
+                close_time: TimePoint(0),
+                upgrades: VecM::default(),
+                ext: StellarValueExt::Basic,
+            },
+            tx_set_result_hash: Hash([0u8; 32]),
+            bucket_list_hash: Hash([0u8; 32]),
+            ledger_seq: 0,
+            total_coins: 1_000_000_000_000,
+            fee_pool: 0,
+            inflation_seq: 0,
+            id_pool: 0,
+            base_fee: 100,
+            base_reserve: 5_000_000,
+            max_tx_set_size: 100,
+            skip_list: [
+                Hash([0u8; 32]),
+                Hash([0u8; 32]),
+                Hash([0u8; 32]),
+                Hash([0u8; 32]),
+            ],
+            ext: LedgerHeaderExt::V0,
+        };
+        let header_hash = henyey_ledger::compute_header_hash(&header).expect("hash");
+        lm.initialize(
+            henyey_bucket::BucketList::new(),
+            henyey_bucket::HotArchiveBucketList::new(),
+            header,
+            header_hash,
+        )
+        .expect("init");
+        Arc::new(lm)
+    }
+
     fn make_test_herder() -> Herder {
-        Herder::new(HerderConfig::default())
+        Herder::new(HerderConfig::default(), make_default_lm())
     }
 
     // =========================================================================
@@ -7235,8 +7277,13 @@ mod scp_pipeline_tests {
         NodeId as XdrNodeId, ScpNomination, ScpStatement, ScpStatementPledges,
         Signature as XdrSignature,
     };
+
+    fn make_default_lm() -> Arc<henyey_ledger::LedgerManager> {
+        make_ledger_manager_at_seq(0)
+    }
+
     fn make_test_herder() -> Herder {
-        Herder::new(HerderConfig::default())
+        Herder::new(HerderConfig::default(), make_default_lm())
     }
 
     fn make_unsigned_envelope(slot: u64, node_seed: u8) -> ScpEnvelope {
@@ -7416,7 +7463,7 @@ mod scp_pipeline_tests {
             local_quorum_set: Some(quorum_set),
             ..HerderConfig::default()
         };
-        let herder = Herder::with_secret_key(config, secret.clone());
+        let herder = Herder::with_secret_key(config, secret.clone(), make_default_lm());
         herder.start_syncing();
         herder.pending_envelopes.set_current_slot(95);
 
@@ -7662,11 +7709,11 @@ mod scp_pipeline_tests {
         };
         let lm = LedgerManager::new("Test Network".to_string(), config);
         let header = LedgerHeader {
-            ledger_version: 24,
+            ledger_version: 0,
             previous_ledger_hash: Hash([0u8; 32]),
             scp_value: StellarValue {
                 tx_set_hash: Hash([0u8; 32]),
-                close_time: TimePoint(100),
+                close_time: TimePoint(0),
                 upgrades: VecM::default(),
                 ext: StellarValueExt::Basic,
             },
@@ -7703,8 +7750,7 @@ mod scp_pipeline_tests {
     /// tracking_slot set to `tracking_slot`. Returns the herder ready for
     /// `pre_filter_scp_envelope` exercise.
     fn herder_with_lcl_and_tracking(lcl: u32, tracking_slot: u64) -> Herder {
-        let herder = make_test_herder();
-        herder.set_ledger_manager(make_ledger_manager_at_seq(lcl));
+        let herder = Herder::new(HerderConfig::default(), make_ledger_manager_at_seq(lcl));
         herder.start_syncing();
         // Set tracking_slot directly (we're inside the crate, so private
         // fields are accessible). is_tracking is set so the
@@ -7825,6 +7871,54 @@ mod advance_tracking_slot_tests {
         ScpStatementPledges, Uint256,
     };
 
+    fn make_default_lm() -> Arc<henyey_ledger::LedgerManager> {
+        use henyey_ledger::{LedgerManager, LedgerManagerConfig};
+        use stellar_xdr::curr::{
+            LedgerHeader, LedgerHeaderExt, StellarValue, StellarValueExt, TimePoint, VecM,
+        };
+        let config = LedgerManagerConfig {
+            validate_bucket_hash: false,
+            ..Default::default()
+        };
+        let lm = LedgerManager::new("Test Network".to_string(), config);
+        let header = LedgerHeader {
+            ledger_version: 0,
+            previous_ledger_hash: Hash([0u8; 32]),
+            scp_value: StellarValue {
+                tx_set_hash: Hash([0u8; 32]),
+                close_time: TimePoint(0),
+                upgrades: VecM::default(),
+                ext: StellarValueExt::Basic,
+            },
+            tx_set_result_hash: Hash([0u8; 32]),
+            bucket_list_hash: Hash([0u8; 32]),
+            ledger_seq: 0,
+            total_coins: 1_000_000_000_000,
+            fee_pool: 0,
+            inflation_seq: 0,
+            id_pool: 0,
+            base_fee: 100,
+            base_reserve: 5_000_000,
+            max_tx_set_size: 100,
+            skip_list: [
+                Hash([0u8; 32]),
+                Hash([0u8; 32]),
+                Hash([0u8; 32]),
+                Hash([0u8; 32]),
+            ],
+            ext: LedgerHeaderExt::V0,
+        };
+        let header_hash = henyey_ledger::compute_header_hash(&header).expect("hash");
+        lm.initialize(
+            henyey_bucket::BucketList::new(),
+            henyey_bucket::HotArchiveBucketList::new(),
+            header,
+            header_hash,
+        )
+        .expect("init");
+        Arc::new(lm)
+    }
+
     fn make_test_envelope(slot: u64) -> ScpEnvelope {
         let node_id = XdrNodeId(PublicKey::PublicKeyTypeEd25519(Uint256([0u8; 32])));
         make_test_envelope_with_node(slot, node_id)
@@ -7864,7 +7958,7 @@ mod advance_tracking_slot_tests {
     /// but does NOT drain pending envelopes (they remain buffered).
     #[test]
     fn test_advance_tracking_slot_drains_intermediate_pending() {
-        let herder = Herder::new(HerderConfig::default());
+        let herder = Herder::new(HerderConfig::default(), make_default_lm());
 
         // Set initial tracking state: consensus_index = 100
         {
@@ -7904,7 +7998,7 @@ mod advance_tracking_slot_tests {
     /// stellar-core's `safelyProcessSCPQueue(false)`.
     #[test]
     fn test_ledger_closed_drains_pending_envelopes() {
-        let herder = Herder::new(HerderConfig::default());
+        let herder = Herder::new(HerderConfig::default(), make_default_lm());
 
         // Set current_slot low so envelopes are accepted by add()
         herder.pending_envelopes.set_current_slot(101);
@@ -7937,7 +8031,7 @@ mod advance_tracking_slot_tests {
     /// before ledger_closed, each ledger_closed drains up to its slot + 1.
     #[test]
     fn test_ledger_closed_multi_slot_sequencing() {
-        let herder = Herder::new(HerderConfig::default());
+        let herder = Herder::new(HerderConfig::default(), make_default_lm());
 
         // Set current_slot low so envelopes are accepted by add()
         herder.pending_envelopes.set_current_slot(104);
@@ -7981,7 +8075,7 @@ mod advance_tracking_slot_tests {
     /// `processSCPQueueUpToIndex`. This test checks slot-local ordering only.
     #[test]
     fn test_drain_and_process_pending_uses_lifo_within_slot() {
-        let herder = Herder::new(HerderConfig::default());
+        let herder = Herder::new(HerderConfig::default(), make_default_lm());
         herder.pending_envelopes.set_current_slot(100);
 
         assert_eq!(
@@ -8086,19 +8180,18 @@ mod advance_tracking_slot_tests {
             local_quorum_set: Some(quorum_set),
             ..HerderConfig::default()
         };
-        let herder = Herder::with_secret_key(config, secret_for_herder);
 
-        let config = LedgerManagerConfig {
+        let lm_config = LedgerManagerConfig {
             validate_bucket_hash: false,
             ..Default::default()
         };
-        let lm = henyey_ledger::LedgerManager::new("Test Network".to_string(), config);
+        let lm = henyey_ledger::LedgerManager::new("Test Network".to_string(), lm_config);
         let header = LedgerHeader {
             ledger_version: 25,
             previous_ledger_hash: Hash([0u8; 32]),
             scp_value: StellarValue {
                 tx_set_hash: Hash([0u8; 32]),
-                close_time: TimePoint(100),
+                close_time: TimePoint(0),
                 upgrades: VecM::default(),
                 ext: StellarValueExt::Basic,
             },
@@ -8130,7 +8223,7 @@ mod advance_tracking_slot_tests {
         .expect("init");
 
         let lm = Arc::new(lm);
-        herder.set_ledger_manager(lm.clone());
+        let herder = Herder::with_secret_key(config, secret_for_herder, lm.clone());
 
         // Populate the tx queue with N transactions from distinct accounts.
         let n_txs = 20u8;
@@ -8186,7 +8279,7 @@ mod advance_tracking_slot_tests {
     /// Build a `Herder` (observer mode) with default config — sufficient for
     /// helper-level tests that don't exercise nomination signing.
     fn make_herder_for_self_validate_tests() -> Herder {
-        Herder::new(HerderConfig::default())
+        Herder::new(HerderConfig::default(), make_default_lm())
     }
 
     /// Build a v24 `LedgerHeader` with a non-zero `max_tx_set_size`. Mirrors
@@ -8200,7 +8293,7 @@ mod advance_tracking_slot_tests {
             previous_ledger_hash: Hash([0u8; 32]),
             scp_value: StellarValue {
                 tx_set_hash: Hash([0u8; 32]),
-                close_time: TimePoint(100),
+                close_time: TimePoint(0),
                 upgrades: VecM::default(),
                 ext: StellarValueExt::Basic,
             },
@@ -8671,7 +8764,7 @@ mod advance_tracking_slot_tests {
             previous_ledger_hash: Hash([0u8; 32]),
             scp_value: StellarValue {
                 tx_set_hash: Hash([0u8; 32]),
-                close_time: TimePoint(100),
+                close_time: TimePoint(0),
                 upgrades: VecM::default(),
                 ext: StellarValueExt::Basic,
             },
@@ -8791,13 +8884,12 @@ mod advance_tracking_slot_tests {
             validators: vec![node_id].try_into().unwrap(),
             inner_sets: vec![].try_into().unwrap(),
         };
-        let config = HerderConfig {
+        let herder_config = HerderConfig {
             is_validator: true,
             node_public_key: public,
             local_quorum_set: Some(quorum_set),
             ..HerderConfig::default()
         };
-        let herder = Herder::with_secret_key(config, secret_for_herder);
 
         let lm_config = LedgerManagerConfig {
             validate_bucket_hash: false,
@@ -8809,7 +8901,7 @@ mod advance_tracking_slot_tests {
             previous_ledger_hash: Hash([0u8; 32]),
             scp_value: StellarValue {
                 tx_set_hash: Hash([0u8; 32]),
-                close_time: TimePoint(100),
+                close_time: TimePoint(0),
                 upgrades: VecM::default(),
                 ext: StellarValueExt::Basic,
             },
@@ -8844,7 +8936,7 @@ mod advance_tracking_slot_tests {
         // builder produces an empty V1 parallel phase that has no resource
         // demand to compare against.
         lm.set_soroban_network_info_for_test(henyey_ledger::SorobanNetworkInfo::default());
-        herder.set_ledger_manager(Arc::new(lm));
+        let herder = Herder::with_secret_key(herder_config, secret_for_herder, Arc::new(lm));
         herder.bootstrap(10);
 
         // Empty tx queue → empty 2-phase tx set → passes self-validation.
@@ -8881,7 +8973,7 @@ mod advance_tracking_slot_tests {
     /// applied must have its `fully_validated` flag flipped back to true.
     #[test]
     fn test_ledger_closed_restores_apply_lag_deferred_slots() {
-        let herder = Herder::new(HerderConfig::default());
+        let herder = Herder::new(HerderConfig::default(), make_default_lm());
 
         // Initial tracking state: LCL = 99, tracking_index = 100.
         {
@@ -8922,7 +9014,7 @@ mod advance_tracking_slot_tests {
     /// remain deferred until the LCL advances enough.
     #[test]
     fn test_ledger_closed_does_not_restore_future_apply_lag() {
-        let herder = Herder::new(HerderConfig::default());
+        let herder = Herder::new(HerderConfig::default(), make_default_lm());
 
         // Two future slots: 100 (next_index after this close = 99) and 105.
         herder.scp.test_clear_slot_fully_validated(100);
@@ -8978,7 +9070,6 @@ mod advance_tracking_slot_tests {
 mod quorum_health_tests {
     use super::*;
     use crate::tx_queue::TransactionSet;
-    use henyey_common::Hash256;
     use henyey_crypto::SecretKey;
     use henyey_scp::hash_quorum_set;
     use stellar_xdr::curr::{
@@ -8986,6 +9077,52 @@ mod quorum_health_tests {
         ScpStatement, ScpStatementExternalize, ScpStatementPledges, ScpStatementPrepare,
         Signature as XdrSignature, StellarValue, StellarValueExt, TimePoint, Value, WriteXdr,
     };
+
+    fn make_default_lm() -> Arc<henyey_ledger::LedgerManager> {
+        use henyey_ledger::{LedgerManager, LedgerManagerConfig};
+        use stellar_xdr::curr::{Hash, LedgerHeader, LedgerHeaderExt, VecM};
+        let config = LedgerManagerConfig {
+            validate_bucket_hash: false,
+            ..Default::default()
+        };
+        let lm = LedgerManager::new("Test Network".to_string(), config);
+        let header = LedgerHeader {
+            ledger_version: 0,
+            previous_ledger_hash: Hash([0u8; 32]),
+            scp_value: StellarValue {
+                tx_set_hash: Hash([0u8; 32]),
+                close_time: TimePoint(0),
+                upgrades: VecM::default(),
+                ext: StellarValueExt::Basic,
+            },
+            tx_set_result_hash: Hash([0u8; 32]),
+            bucket_list_hash: Hash([0u8; 32]),
+            ledger_seq: 0,
+            total_coins: 1_000_000_000_000,
+            fee_pool: 0,
+            inflation_seq: 0,
+            id_pool: 0,
+            base_fee: 100,
+            base_reserve: 5_000_000,
+            max_tx_set_size: 100,
+            skip_list: [
+                Hash([0u8; 32]),
+                Hash([0u8; 32]),
+                Hash([0u8; 32]),
+                Hash([0u8; 32]),
+            ],
+            ext: LedgerHeaderExt::V0,
+        };
+        let header_hash = henyey_ledger::compute_header_hash(&header).expect("hash");
+        lm.initialize(
+            henyey_bucket::BucketList::new(),
+            henyey_bucket::HotArchiveBucketList::new(),
+            header,
+            header_hash,
+        )
+        .expect("init");
+        Arc::new(lm)
+    }
 
     /// Build a validator herder whose quorum set contains `n` validators
     /// (the local node + `n-1` peers) with the given `threshold`.
@@ -9020,7 +9157,8 @@ mod quorum_health_tests {
             ..HerderConfig::default()
         };
 
-        let herder = Herder::with_secret_key(config, SecretKey::from_seed(&[10u8; 32]));
+        let herder =
+            Herder::with_secret_key(config, SecretKey::from_seed(&[10u8; 32]), make_default_lm());
 
         // Register each peer's quorum set so that is_statement_sane can
         // resolve the quorum_set_hash in PREPARE/CONFIRM envelopes.
@@ -9037,7 +9175,8 @@ mod quorum_health_tests {
     /// Build a signed StellarValue and cache its tx set in the herder.
     /// This produces a Value that passes validate_value_impl.
     fn make_valid_value(herder: &Herder, signer: &SecretKey) -> Value {
-        let tx_set = TransactionSet::new(Hash256::ZERO, Vec::new());
+        let lcl_hash = herder.scp_driver.current_header_hash();
+        let tx_set = TransactionSet::new(lcl_hash, Vec::new());
         let tx_set_hash = *tx_set.hash();
         herder.scp_driver.cache_tx_set(tx_set);
 
@@ -9125,7 +9264,7 @@ mod quorum_health_tests {
 
     #[test]
     fn test_quorum_health_returns_none_when_not_tracking() {
-        let herder = Herder::new(HerderConfig::default());
+        let herder = Herder::new(HerderConfig::default(), make_default_lm());
         assert_eq!(herder.tracking_slot(), 0);
         assert!(herder.quorum_health().is_none());
     }
@@ -9315,7 +9454,8 @@ mod quorum_health_tests {
             local_quorum_set: Some(quorum_set.clone()),
             ..HerderConfig::default()
         };
-        let herder = Herder::with_secret_key(config, SecretKey::from_seed(&[50u8; 32]));
+        let herder =
+            Herder::with_secret_key(config, SecretKey::from_seed(&[50u8; 32]), make_default_lm());
 
         for key in &keys[1..] {
             let peer_node_id = NodeId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(Uint256(
@@ -9426,6 +9566,54 @@ mod quorum_intersection_deadlock_tests {
     use super::*;
     use henyey_crypto::SecretKey;
 
+    fn make_default_lm() -> Arc<henyey_ledger::LedgerManager> {
+        use henyey_ledger::{LedgerManager, LedgerManagerConfig};
+        use stellar_xdr::curr::{
+            Hash, LedgerHeader, LedgerHeaderExt, StellarValue, StellarValueExt, TimePoint, VecM,
+        };
+        let config = LedgerManagerConfig {
+            validate_bucket_hash: false,
+            ..Default::default()
+        };
+        let lm = LedgerManager::new("Test Network".to_string(), config);
+        let header = LedgerHeader {
+            ledger_version: 0,
+            previous_ledger_hash: Hash([0u8; 32]),
+            scp_value: StellarValue {
+                tx_set_hash: Hash([0u8; 32]),
+                close_time: TimePoint(0),
+                upgrades: VecM::default(),
+                ext: StellarValueExt::Basic,
+            },
+            tx_set_result_hash: Hash([0u8; 32]),
+            bucket_list_hash: Hash([0u8; 32]),
+            ledger_seq: 0,
+            total_coins: 1_000_000_000_000,
+            fee_pool: 0,
+            inflation_seq: 0,
+            id_pool: 0,
+            base_fee: 100,
+            base_reserve: 5_000_000,
+            max_tx_set_size: 100,
+            skip_list: [
+                Hash([0u8; 32]),
+                Hash([0u8; 32]),
+                Hash([0u8; 32]),
+                Hash([0u8; 32]),
+            ],
+            ext: LedgerHeaderExt::V0,
+        };
+        let header_hash = henyey_ledger::compute_header_hash(&header).expect("hash");
+        lm.initialize(
+            henyey_bucket::BucketList::new(),
+            henyey_bucket::HotArchiveBucketList::new(),
+            header,
+            header_hash,
+        )
+        .expect("init");
+        Arc::new(lm)
+    }
+
     /// Build a herder whose transitive quorum tracker contains `n` nodes
     /// (the local node + `n-1` peers), all with the same quorum set.
     fn make_herder_with_n_quorum_nodes(n: usize) -> Herder {
@@ -9455,7 +9643,8 @@ mod quorum_intersection_deadlock_tests {
             ..HerderConfig::default()
         };
 
-        let herder = Herder::with_secret_key(config, SecretKey::from_seed(&[50u8; 32]));
+        let herder =
+            Herder::with_secret_key(config, SecretKey::from_seed(&[50u8; 32]), make_default_lm());
 
         // Expand the transitive quorum tracker with all peers.
         for key in keys.iter().skip(1) {
@@ -9540,6 +9729,50 @@ mod dynamic_close_time_tests {
         Hash, LedgerHeader, LedgerHeaderExt, StellarValue, StellarValueExt, TimePoint, VecM,
     };
 
+    fn make_default_lm() -> Arc<henyey_ledger::LedgerManager> {
+        let config = LedgerManagerConfig {
+            validate_bucket_hash: false,
+            ..Default::default()
+        };
+        let lm = LedgerManager::new("Test Network".to_string(), config);
+        let header = LedgerHeader {
+            ledger_version: 0,
+            previous_ledger_hash: Hash([0u8; 32]),
+            scp_value: StellarValue {
+                tx_set_hash: Hash([0u8; 32]),
+                close_time: TimePoint(0),
+                upgrades: VecM::default(),
+                ext: StellarValueExt::Basic,
+            },
+            tx_set_result_hash: Hash([0u8; 32]),
+            bucket_list_hash: Hash([0u8; 32]),
+            ledger_seq: 0,
+            total_coins: 1_000_000_000_000,
+            fee_pool: 0,
+            inflation_seq: 0,
+            id_pool: 0,
+            base_fee: 100,
+            base_reserve: 5_000_000,
+            max_tx_set_size: 100,
+            skip_list: [
+                Hash([0u8; 32]),
+                Hash([0u8; 32]),
+                Hash([0u8; 32]),
+                Hash([0u8; 32]),
+            ],
+            ext: LedgerHeaderExt::V0,
+        };
+        let header_hash = henyey_ledger::compute_header_hash(&header).expect("hash");
+        lm.initialize(
+            henyey_bucket::BucketList::new(),
+            henyey_bucket::HotArchiveBucketList::new(),
+            header,
+            header_hash,
+        )
+        .expect("init");
+        Arc::new(lm)
+    }
+
     fn make_ledger_manager_with_protocol(protocol: u32) -> LedgerManager {
         let config = LedgerManagerConfig {
             validate_bucket_hash: false,
@@ -9551,7 +9784,7 @@ mod dynamic_close_time_tests {
             previous_ledger_hash: Hash([0u8; 32]),
             scp_value: StellarValue {
                 tx_set_hash: Hash([0u8; 32]),
-                close_time: TimePoint(100),
+                close_time: TimePoint(0),
                 upgrades: VecM::default(),
                 ext: StellarValueExt::Basic,
             },
@@ -9585,24 +9818,13 @@ mod dynamic_close_time_tests {
     }
 
     #[test]
-    fn test_herder_close_time_falls_back_to_config_without_ledger_manager() {
-        let config = HerderConfig {
-            ledger_close_time: 3,
-            ..HerderConfig::default()
-        };
-        let herder = Herder::new(config);
-        assert_eq!(herder.ledger_close_duration(), Duration::from_secs(3));
-    }
-
-    #[test]
     fn test_herder_close_time_returns_5s_for_pre_v23() {
         let config = HerderConfig {
             ledger_close_time: 5,
             ..HerderConfig::default()
         };
-        let herder = Herder::new(config);
         let lm = Arc::new(make_ledger_manager_with_protocol(22));
-        herder.set_ledger_manager(lm);
+        let herder = Herder::new(config, lm);
 
         // Protocol 22: should return pre-v23 default (5000ms)
         assert_eq!(herder.ledger_close_duration(), Duration::from_secs(5));
@@ -9614,7 +9836,6 @@ mod dynamic_close_time_tests {
             ledger_close_time: 5,
             ..HerderConfig::default()
         };
-        let herder = Herder::new(config);
         let lm = make_ledger_manager_with_protocol(23);
 
         // Set soroban network info with a custom close time (4000ms)
@@ -9625,7 +9846,7 @@ mod dynamic_close_time_tests {
         }
 
         let lm = Arc::new(lm);
-        herder.set_ledger_manager(lm);
+        let herder = Herder::new(config, lm);
 
         assert_eq!(herder.ledger_close_duration(), Duration::from_millis(4000));
     }
@@ -9636,10 +9857,9 @@ mod dynamic_close_time_tests {
             ledger_close_time: 5,
             ..HerderConfig::default()
         };
-        let herder = Herder::new(config);
         // Protocol 23 but no soroban_network_info populated
         let lm = Arc::new(make_ledger_manager_with_protocol(23));
-        herder.set_ledger_manager(lm);
+        let herder = Herder::new(config, lm);
 
         // Falls back to 5000ms pre-v23 constant
         assert_eq!(herder.ledger_close_duration(), Duration::from_secs(5));
@@ -9685,12 +9905,11 @@ mod dynamic_close_time_tests {
                 ledger_close_time: 5,
                 ..HerderConfig::default()
             };
-            let herder = Herder::new(config);
             let lm = make_ledger_manager_with_protocol(23);
             let mut info = SorobanNetworkInfo::default();
             info.ledger_target_close_time_ms = ms;
             lm.set_soroban_network_info_for_test(info);
-            herder.set_ledger_manager(Arc::new(lm));
+            let herder = Herder::new(config, Arc::new(lm));
 
             assert_eq!(
                 herder.ledger_close_duration(),
@@ -9701,19 +9920,8 @@ mod dynamic_close_time_tests {
     }
 
     #[test]
-    fn test_herder_close_duration_startup_fallback() {
-        // Without a ledger manager, falls back to config value.
-        let config = HerderConfig {
-            ledger_close_time: 7,
-            ..HerderConfig::default()
-        };
-        let herder = Herder::new(config);
-        assert_eq!(herder.ledger_close_duration(), Duration::from_secs(7));
-    }
-
-    #[test]
     fn test_max_queue_size_soroban_ops_defaults_to_zero() {
-        let herder = Herder::new(HerderConfig::default());
+        let herder = Herder::new(HerderConfig::default(), make_default_lm());
         assert_eq!(herder.max_queue_size_soroban_ops(), 0);
     }
 
@@ -9724,13 +9932,13 @@ mod dynamic_close_time_tests {
             Some(henyey_common::Resource::new(vec![
                 7, 200, 300, 400, 500, 600, 700,
             ]));
-        let herder = Herder::new(config);
+        let herder = Herder::new(config, make_default_lm());
         assert_eq!(herder.max_queue_size_soroban_ops(), 7);
     }
 
     #[test]
     fn test_max_queue_size_soroban_ops_prefers_dynamic() {
-        let herder = Herder::new(HerderConfig::default());
+        let herder = Herder::new(HerderConfig::default(), make_default_lm());
         herder.tx_queue().update_soroban_resource_limits(
             henyey_common::Resource::soroban_ledger_limits(17, 1, 1, 1, 1, 1, 1),
         );
@@ -9745,7 +9953,6 @@ mod dynamic_close_time_tests {
 mod previous_value_tests {
     use super::*;
     use crate::tx_queue::TransactionSet;
-    use henyey_common::Hash256;
     use henyey_crypto::SecretKey;
     use henyey_ledger::{LedgerManager, LedgerManagerConfig};
     use stellar_xdr::curr::{
@@ -9753,6 +9960,50 @@ mod previous_value_tests {
         NodeId as XdrNodeId, ScpBallot, ScpStatement, ScpStatementExternalize, ScpStatementPledges,
         Signature as XdrSignature, StellarValue, StellarValueExt, TimePoint, Value, VecM, WriteXdr,
     };
+
+    fn make_default_lm() -> Arc<henyey_ledger::LedgerManager> {
+        let config = LedgerManagerConfig {
+            validate_bucket_hash: false,
+            ..Default::default()
+        };
+        let lm = LedgerManager::new("Test Network".to_string(), config);
+        let header = LedgerHeader {
+            ledger_version: 0,
+            previous_ledger_hash: Hash([0u8; 32]),
+            scp_value: StellarValue {
+                tx_set_hash: Hash([0u8; 32]),
+                close_time: TimePoint(0),
+                upgrades: VecM::default(),
+                ext: StellarValueExt::Basic,
+            },
+            tx_set_result_hash: Hash([0u8; 32]),
+            bucket_list_hash: Hash([0u8; 32]),
+            ledger_seq: 0,
+            total_coins: 1_000_000_000_000,
+            fee_pool: 0,
+            inflation_seq: 0,
+            id_pool: 0,
+            base_fee: 100,
+            base_reserve: 5_000_000,
+            max_tx_set_size: 100,
+            skip_list: [
+                Hash([0u8; 32]),
+                Hash([0u8; 32]),
+                Hash([0u8; 32]),
+                Hash([0u8; 32]),
+            ],
+            ext: LedgerHeaderExt::V0,
+        };
+        let header_hash = henyey_ledger::compute_header_hash(&header).expect("hash");
+        lm.initialize(
+            henyey_bucket::BucketList::new(),
+            henyey_bucket::HotArchiveBucketList::new(),
+            header,
+            header_hash,
+        )
+        .expect("init");
+        Arc::new(lm)
+    }
 
     /// Create a LedgerManager initialized at `ledger_seq` with the given `scp_value`.
     fn make_lm_with_scp_value(ledger_seq: u32, scp_value: StellarValue) -> Arc<LedgerManager> {
@@ -9762,7 +10013,7 @@ mod previous_value_tests {
         };
         let lm = LedgerManager::new("Test Network".to_string(), config);
         let header = LedgerHeader {
-            ledger_version: 24,
+            ledger_version: 0,
             previous_ledger_hash: Hash([0u8; 32]),
             scp_value,
             tx_set_result_hash: Hash([0u8; 32]),
@@ -9810,33 +10061,17 @@ mod previous_value_tests {
     /// get_previous_value reads from LCL when ledger_manager is set.
     #[test]
     fn test_get_previous_value_reads_from_lcl() {
-        let herder = Herder::new(HerderConfig::default());
-
         // Install LM with a known scpValue
         let lcl_sv = make_stellar_value(99);
         let expected = stellar_value_to_scp_value(&lcl_sv);
         let lm = make_lm_with_scp_value(10, lcl_sv);
-        herder.set_ledger_manager(lm);
+        let herder = Herder::new(HerderConfig::default(), lm);
 
         // get_previous_value should return LCL value
         let result = herder.get_previous_value();
         assert_eq!(
             result, expected,
             "get_previous_value must return LCL's scpValue"
-        );
-    }
-
-    /// get_previous_value returns Value::default() when no LM is installed.
-    #[test]
-    fn test_get_previous_value_returns_default_without_lm() {
-        let herder = Herder::new(HerderConfig::default());
-
-        // No LM installed → should return default
-        let result = herder.get_previous_value();
-        assert_eq!(
-            result,
-            Value::default(),
-            "without LM, get_previous_value must return Value::default()"
         );
     }
 
@@ -9855,7 +10090,8 @@ mod previous_value_tests {
         secret: &SecretKey,
         close_time: u64,
     ) -> Value {
-        let tx_set = TransactionSet::new(Hash256::ZERO, Vec::new());
+        let lcl_hash = herder.scp_driver.current_header_hash();
+        let tx_set = TransactionSet::new(lcl_hash, Vec::new());
         let tx_set_hash = *tx_set.hash();
         herder.scp_driver.cache_tx_set(tx_set);
 
@@ -9972,7 +10208,8 @@ mod previous_value_tests {
             ..HerderConfig::default()
         };
 
-        let herder = Herder::with_secret_key(config, SecretKey::from_seed(&[7u8; 32]));
+        let herder =
+            Herder::with_secret_key(config, SecretKey::from_seed(&[7u8; 32]), make_default_lm());
 
         herder.start_syncing();
         herder.bootstrap(100); // tracking slot = 101
@@ -10046,5 +10283,107 @@ mod previous_value_tests {
             Some(101),
             "latest_externalized_slot must remain 101 (not regress to 99)"
         );
+    }
+}
+
+// =============================================================================
+// Behavioral tests: LedgerManager is always available (no Option/fallback).
+// Verifies that bootstrap, get_min_ledger_seq_to_ask_peers, and
+// ledger_close_duration read state directly from the injected LedgerManager.
+// =============================================================================
+
+#[cfg(test)]
+mod required_lm_behavioral_tests {
+    use super::*;
+    use henyey_ledger::{LedgerManager, LedgerManagerConfig};
+    use stellar_xdr::curr::{
+        Hash, LedgerHeader, LedgerHeaderExt, StellarValue, StellarValueExt, TimePoint, VecM,
+    };
+
+    fn make_ledger_manager_at_seq(ledger_seq: u32) -> Arc<LedgerManager> {
+        let config = LedgerManagerConfig {
+            validate_bucket_hash: false,
+            ..Default::default()
+        };
+        let lm = LedgerManager::new("Test Network".to_string(), config);
+        let header = LedgerHeader {
+            ledger_version: 24,
+            previous_ledger_hash: Hash([0u8; 32]),
+            scp_value: StellarValue {
+                tx_set_hash: Hash([0u8; 32]),
+                close_time: TimePoint(500),
+                upgrades: VecM::default(),
+                ext: StellarValueExt::Basic,
+            },
+            tx_set_result_hash: Hash([0u8; 32]),
+            bucket_list_hash: Hash([0u8; 32]),
+            ledger_seq,
+            total_coins: 1_000_000_000_000,
+            fee_pool: 0,
+            inflation_seq: 0,
+            id_pool: 0,
+            base_fee: 100,
+            base_reserve: 5_000_000,
+            max_tx_set_size: 100,
+            skip_list: [
+                Hash([0u8; 32]),
+                Hash([0u8; 32]),
+                Hash([0u8; 32]),
+                Hash([0u8; 32]),
+            ],
+            ext: LedgerHeaderExt::V0,
+        };
+        let header_hash = henyey_ledger::compute_header_hash(&header).expect("hash");
+        lm.initialize(
+            henyey_bucket::BucketList::new(),
+            henyey_bucket::HotArchiveBucketList::new(),
+            header,
+            header_hash,
+        )
+        .expect("init");
+        Arc::new(lm)
+    }
+
+    /// bootstrap() reads close_time from the LedgerManager's current header.
+    #[test]
+    fn test_bootstrap_derives_state_from_lm() {
+        let lm = make_ledger_manager_at_seq(42);
+        let herder = Herder::new(HerderConfig::default(), lm);
+
+        herder.start_syncing();
+        herder.bootstrap(42);
+
+        assert_eq!(herder.state(), HerderState::Tracking);
+        // tracking_slot = ledger_seq + 1
+        assert_eq!(herder.tracking_slot(), 43);
+        // consensus_close_time should match the LM header's close_time (500)
+        let ts = herder.tracking_state.read();
+        assert_eq!(ts.consensus_close_time, 500);
+    }
+
+    /// get_min_ledger_seq_to_ask_peers() uses LedgerManager.current_ledger_seq().
+    #[test]
+    fn test_get_min_ledger_seq_to_ask_peers_uses_lm() {
+        let lm = make_ledger_manager_at_seq(100);
+        let herder = Herder::new(HerderConfig::default(), lm);
+
+        let min_seq = herder.get_min_ledger_seq_to_ask_peers();
+        // lcl = 100, low = 101, window = min(max_externalized_slots, 3)
+        // Default max_externalized_slots is > 3, so window = 3
+        // low = 101 - 3 = 98
+        assert_eq!(min_seq, 98);
+    }
+
+    /// ledger_close_duration() delegates directly to LedgerManager.
+    #[test]
+    fn test_ledger_close_duration_reads_from_lm() {
+        let lm = make_ledger_manager_at_seq(1);
+        let herder = Herder::new(HerderConfig::default(), lm.clone());
+
+        let duration = herder.ledger_close_duration();
+        let expected = lm.expected_ledger_close_duration();
+        assert_eq!(duration, expected);
+        // Should be a positive duration
+        assert!(duration.as_millis() > 0);
     }
 }

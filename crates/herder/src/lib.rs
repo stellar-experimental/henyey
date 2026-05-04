@@ -60,11 +60,14 @@
 //! # Example
 //!
 //! ```ignore
+//! use std::sync::Arc;
 //! use henyey_herder::{Herder, HerderConfig, HerderState};
+//! use henyey_ledger::LedgerManager;
 //!
 //! // Create a non-validator herder
 //! let config = HerderConfig::default();
-//! let herder = Herder::new(config);
+//! let ledger_manager: Arc<LedgerManager> = /* ... */;
+//! let herder = Herder::new(config, ledger_manager);
 //!
 //! // Start syncing (when catchup begins)
 //! herder.start_syncing();
@@ -292,17 +295,65 @@ mod tests {
         assert_eq!(config.ledger_close_time, 5);
     }
 
+    fn make_default_lm() -> std::sync::Arc<henyey_ledger::LedgerManager> {
+        use henyey_ledger::{LedgerManager, LedgerManagerConfig};
+        use stellar_xdr::curr::{
+            Hash, LedgerHeader, LedgerHeaderExt, StellarValue, StellarValueExt, TimePoint, VecM,
+        };
+        let config = LedgerManagerConfig {
+            validate_bucket_hash: false,
+            ..Default::default()
+        };
+        let lm = LedgerManager::new("Test Network".to_string(), config);
+        let header = LedgerHeader {
+            ledger_version: 24,
+            previous_ledger_hash: Hash([0u8; 32]),
+            scp_value: StellarValue {
+                tx_set_hash: Hash([0u8; 32]),
+                close_time: TimePoint(100),
+                upgrades: VecM::default(),
+                ext: StellarValueExt::Basic,
+            },
+            tx_set_result_hash: Hash([0u8; 32]),
+            bucket_list_hash: Hash([0u8; 32]),
+            ledger_seq: 1,
+            total_coins: 1_000_000_000_000,
+            fee_pool: 0,
+            inflation_seq: 0,
+            id_pool: 0,
+            base_fee: 100,
+            base_reserve: 5_000_000,
+            max_tx_set_size: 100,
+            skip_list: [
+                Hash([0u8; 32]),
+                Hash([0u8; 32]),
+                Hash([0u8; 32]),
+                Hash([0u8; 32]),
+            ],
+            ext: LedgerHeaderExt::V0,
+        };
+        let header_hash = henyey_ledger::compute_header_hash(&header).expect("hash");
+        lm.initialize(
+            henyey_bucket::BucketList::new(),
+            henyey_bucket::HotArchiveBucketList::new(),
+            header,
+            header_hash,
+        )
+        .expect("init");
+        std::sync::Arc::new(lm)
+    }
+
     #[test]
     fn test_herder_creation() {
         let config = HerderConfig::default();
-        let herder = Herder::new(config);
+        let herder = Herder::new(config, make_default_lm());
         assert_eq!(herder.state(), HerderState::Booting);
     }
 
     #[test]
     fn test_state_transitions() {
         let config = HerderConfig::default();
-        let herder = Herder::new(config);
+        let herder = Herder::new(config, make_default_lm());
 
         assert_eq!(herder.state(), HerderState::Booting);
 

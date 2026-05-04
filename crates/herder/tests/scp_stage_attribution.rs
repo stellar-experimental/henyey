@@ -34,12 +34,65 @@ use henyey_herder::scp_verify::{
     self, PostVerifyReason, PreFilter, PreFilterRejectReason, VerifiedEnvelope,
 };
 use henyey_herder::{Herder, HerderConfig, HerderState};
+use henyey_ledger::{LedgerManager, LedgerManagerConfig};
 use stellar_xdr::curr::{
     Hash as XdrHash, Limits, NodeId as XdrNodeId, PublicKey as XdrPublicKey, ScpBallot,
     ScpEnvelope, ScpNomination, ScpQuorumSet, ScpStatement, ScpStatementExternalize,
     ScpStatementPledges, ScpStatementPrepare, Signature as XdrSignature, StellarValue,
     StellarValueExt, TimePoint, Uint256, Value, WriteXdr,
 };
+
+// ---------------------------------------------------------------------------
+// LedgerManager helper
+// ---------------------------------------------------------------------------
+
+fn make_default_lm() -> Arc<LedgerManager> {
+    use stellar_xdr::curr::{
+        Hash, LedgerHeader, LedgerHeaderExt, StellarValue as XdrStellarValue,
+        StellarValueExt as XdrStellarValueExt, TimePoint as XdrTimePoint, VecM,
+    };
+    let config = LedgerManagerConfig {
+        validate_bucket_hash: false,
+        ..Default::default()
+    };
+    let lm = LedgerManager::new("Test Network".to_string(), config);
+    let header = LedgerHeader {
+        ledger_version: 24,
+        previous_ledger_hash: Hash([0u8; 32]),
+        scp_value: XdrStellarValue {
+            tx_set_hash: Hash([0u8; 32]),
+            close_time: XdrTimePoint(100),
+            upgrades: VecM::default(),
+            ext: XdrStellarValueExt::Basic,
+        },
+        tx_set_result_hash: Hash([0u8; 32]),
+        bucket_list_hash: Hash([0u8; 32]),
+        ledger_seq: 1,
+        total_coins: 1_000_000_000_000,
+        fee_pool: 0,
+        inflation_seq: 0,
+        id_pool: 0,
+        base_fee: 100,
+        base_reserve: 5_000_000,
+        max_tx_set_size: 100,
+        skip_list: [
+            Hash([0u8; 32]),
+            Hash([0u8; 32]),
+            Hash([0u8; 32]),
+            Hash([0u8; 32]),
+        ],
+        ext: LedgerHeaderExt::V0,
+    };
+    let header_hash = henyey_ledger::compute_header_hash(&header).expect("hash");
+    lm.initialize(
+        henyey_bucket::BucketList::new(),
+        henyey_bucket::HotArchiveBucketList::new(),
+        header,
+        header_hash,
+    )
+    .expect("init");
+    Arc::new(lm)
+}
 
 // ---------------------------------------------------------------------------
 // Stage enum
@@ -111,7 +164,8 @@ impl Fixture {
             ..HerderConfig::default()
         };
 
-        let herder = Arc::new(Herder::with_secret_key(config, local_secret.clone()));
+        let lm = make_default_lm();
+        let herder = Arc::new(Herder::with_secret_key(config, local_secret.clone(), lm));
         herder.set_test_clock_seconds(NOW);
         herder.set_tracking_for_testing(TRACKING_SLOT, TRACKING_CLOSE_TIME);
         herder.set_pending_current_slot_for_testing(TRACKING_SLOT);
@@ -523,7 +577,8 @@ fn row_12_precedence_self_message_beats_non_quorum() {
         local_quorum_set: Some(quorum_set.clone()),
         ..HerderConfig::default()
     };
-    let herder = Arc::new(Herder::with_secret_key(config, local_secret.clone()));
+    let lm = make_default_lm();
+    let herder = Arc::new(Herder::with_secret_key(config, local_secret.clone(), lm));
     herder.set_test_clock_seconds(NOW);
     herder.start_syncing();
     herder.bootstrap((TRACKING_SLOT - 1) as u32);

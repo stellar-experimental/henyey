@@ -458,7 +458,7 @@ pub struct ScpDriver {
     /// Network ID for signing.
     network_id: Hash256,
     /// Ledger manager for network configuration lookups.
-    ledger_manager: OnceLock<Arc<LedgerManager>>,
+    ledger_manager: Arc<LedgerManager>,
     /// Upgrade parameters for nomination validation.
     /// Set via `set_upgrades` when the Herder initializes.
     upgrades: OnceLock<Arc<RwLock<Upgrades>>>,
@@ -556,6 +556,7 @@ impl ScpDriver {
     pub(crate) fn new(
         config: ScpDriverConfig,
         network_id: Hash256,
+        ledger_manager: Arc<LedgerManager>,
         tracking_state: Arc<RwLock<SharedTrackingState>>,
         scp_metrics: Arc<crate::metrics::ScpMetrics>,
     ) -> Self {
@@ -573,7 +574,7 @@ impl ScpDriver {
             latest_externalized: RwLock::new(None),
             envelope_sender: OnceLock::new(),
             network_id,
-            ledger_manager: OnceLock::new(),
+            ledger_manager,
             upgrades: OnceLock::new(),
             tracking_state,
             test_clock: Arc::new(AtomicU64::new(0)),
@@ -614,10 +615,17 @@ impl ScpDriver {
         config: ScpDriverConfig,
         network_id: Hash256,
         secret_key: SecretKey,
+        ledger_manager: Arc<LedgerManager>,
         tracking_state: Arc<RwLock<SharedTrackingState>>,
         scp_metrics: Arc<crate::metrics::ScpMetrics>,
     ) -> Self {
-        let mut driver = Self::new(config, network_id, tracking_state, scp_metrics);
+        let mut driver = Self::new(
+            config,
+            network_id,
+            ledger_manager,
+            tracking_state,
+            scp_metrics,
+        );
         driver.secret_key = Some(secret_key);
         driver
     }
@@ -628,11 +636,6 @@ impl ScpDriver {
         F: Fn(ScpEnvelope) + Send + Sync + 'static,
     {
         let _ = self.envelope_sender.set(Box::new(sender));
-    }
-
-    /// Provide ledger manager access for network configuration lookups.
-    pub fn set_ledger_manager(&self, manager: Arc<LedgerManager>) {
-        let _ = self.ledger_manager.set(manager);
     }
 
     /// Provide upgrade parameters access for nomination validation.
@@ -686,10 +689,10 @@ impl ScpDriver {
         // fee-balance affordability and stateful account checks (sequence,
         // signatures, auth). Mirrors stellar-core TxSetUtils.cpp:167-246
         // which creates a LedgerSnapshot and runs full checkValid().
-        let result = if let Some(lm) = self.ledger_manager.get() {
-            // Create snapshot atomically — captures header + bucket list state.
-            // All validation uses this single snapshot for consistency.
-            let snapshot = match lm.create_snapshot() {
+        // Create snapshot atomically — captures header + bucket list state.
+        // All validation uses this single snapshot for consistency.
+        let result = {
+            let snapshot = match self.ledger_manager.create_snapshot() {
                 Ok(s) => s,
                 Err(e) => {
                     warn!(
@@ -712,7 +715,7 @@ impl ScpDriver {
             if !protocol_version_starts_from(lcl_header.ledger_version, ProtocolVersion::V20) {
                 true
             } else {
-                let soroban_info = lm.soroban_network_info();
+                let soroban_info = self.ledger_manager.soroban_network_info();
                 prepared
                     .check_valid(
                         lcl_header,
@@ -724,11 +727,6 @@ impl ScpDriver {
                     )
                     .is_ok()
             }
-        } else {
-            // No ledger manager yet (OnceLock not set during startup window).
-            // SCP shouldn't be actively validating here, but if it does, accept
-            // permissively — TX set will be re-validated at apply time.
-            true
         };
 
         self.tx_tracker.store_valid(cache_key, result);
@@ -954,6 +952,12 @@ impl ScpDriver {
     /// Get the network ID.
     pub fn network_id(&self) -> Hash256 {
         self.network_id
+    }
+
+    /// Get the current LCL header hash from the ledger manager.
+    #[cfg(test)]
+    pub(crate) fn current_header_hash(&self) -> Hash256 {
+        self.ledger_manager.current_header_hash()
     }
 
     /// Get a reference to the shared SCP metrics.
@@ -1366,42 +1370,10 @@ impl ScpDriver {
         // Get LCL data from ledger manager.
         // Use header_snapshot() to atomically capture both header fields and
         // hash, avoiding a race with commit_close() between the reads.
-        let (lcl_seq, lcl_close_time, lcl_hash_from_snapshot) =
-            if let Some(lm) = self.ledger_manager.get() {
-                let snap = lm.header_snapshot();
-                (
-                    snap.header.ledger_seq as u64,
-                    snap.header.scp_value.close_time.0,
-                    Some(snap.hash),
-                )
-            } else {
-                // No ledger manager available — fall back to externalized data
-                if let Some(latest) =
-                    *tracked_read(LOCK_SCP_LATEST_EXTERNALIZED, &self.latest_externalized)
-                {
-                    if let Some(externalized) =
-                        tracked_read(LOCK_SCP_EXTERNALIZED, &self.externalized).get(&latest)
-                    {
-                        (externalized.slot, externalized.close_time, None)
-                    } else {
-                        (0, 0, None)
-                    }
-                } else {
-                    let ts = tracked_read(LOCK_TRACKING_STATE, &self.tracking_state);
-                    if ts.is_tracking {
-                        // When tracking but no ledger manager or externalized data (e.g., after
-                        // bootstrap), derive the LCL from the tracking consensus index.
-                        // consensus_index is the next slot to close, so LCL = index - 1.
-                        (
-                            ts.consensus_index.saturating_sub(1),
-                            ts.consensus_close_time,
-                            None,
-                        )
-                    } else {
-                        (0, 0, None)
-                    }
-                }
-            };
+        let snap = self.ledger_manager.header_snapshot();
+        let lcl_seq = snap.header.ledger_seq as u64;
+        let lcl_close_time = snap.header.scp_value.close_time.0;
+        let lcl_hash_from_snapshot = Some(snap.hash);
 
         let is_current_ledger = slot_index == lcl_seq + 1;
 
@@ -1608,16 +1580,12 @@ impl ScpDriver {
         // Parity: strip invalid upgrades, keeping valid ones in order
         // Also validates each upgrade via isValid (apply + nomination)
         // stellar-core: extractValidValue calls isValid with nomination=true
-        let lm_ref = self.ledger_manager.get().map(|lm| lm.as_ref());
         // Read header once to avoid split reads between ledger_version and close_time.
-        let lcl_header = lm_ref.map(|lm| lm.current_header());
-        let current_version = lcl_header.as_ref().map(|h| h.ledger_version).unwrap_or(0);
+        let lcl_header = self.ledger_manager.current_header();
+        let current_version = lcl_header.ledger_version;
         // Use LCL close time (not candidate close_time) for upgrade validity
         // to prevent one-ledger-early activation (#1166).
-        let lcl_close_time = lcl_header
-            .as_ref()
-            .map(|h| h.scp_value.close_time.0)
-            .unwrap_or(0);
+        let lcl_close_time = lcl_header.scp_value.close_time.0;
         let mut valid_upgrades = Vec::new();
         let mut last_upgrade_type = None;
         for upgrade_bytes in stellar_value.upgrades.iter() {
@@ -1630,8 +1598,11 @@ impl ScpDriver {
                 let in_order = last_upgrade_type
                     .map(|prev| upgrade_type > prev)
                     .unwrap_or(true);
-                let valid_for_apply =
-                    Self::is_valid_upgrade_for_apply(&upgrade, current_version, lm_ref);
+                let valid_for_apply = Self::is_valid_upgrade_for_apply(
+                    &upgrade,
+                    current_version,
+                    &self.ledger_manager,
+                );
                 // Also check nomination validity (timing + parameter match)
                 let valid_for_nomination = if let Some(upgrades_arc) = self.upgrades.get() {
                     upgrades_arc
@@ -1665,12 +1636,8 @@ impl ScpDriver {
     /// Parity: Upgrades.cpp `isValid` — calls `isValidForApply` always,
     /// and additionally `isValidForNomination` when `nomination=true`.
     fn check_upgrades_valid(&self, stellar_value: &StellarValue, nomination: bool) -> bool {
-        let lm_ref = match self.ledger_manager.get() {
-            Some(lm) => lm,
-            None => return true, // No ledger manager — can't validate
-        };
         // Read header once to avoid split reads between ledger_version and close_time.
-        let lcl_header = lm_ref.current_header();
+        let lcl_header = self.ledger_manager.current_header();
         let current_version = lcl_header.ledger_version;
 
         // Use LCL close time for upgrade validity, not candidate close_time (#1166).
@@ -1684,7 +1651,7 @@ impl ScpDriver {
                 Ok(u) => u,
                 Err(_) => return false,
             };
-            if !Self::is_valid_upgrade_for_apply(&upgrade, current_version, Some(lm_ref)) {
+            if !Self::is_valid_upgrade_for_apply(&upgrade, current_version, &self.ledger_manager) {
                 debug!(?upgrade, "Invalid upgrade for apply");
                 return false;
             }
@@ -1712,7 +1679,7 @@ impl ScpDriver {
     fn is_valid_upgrade_for_apply(
         upgrade: &LedgerUpgrade,
         current_version: u32,
-        ledger_manager: Option<&LedgerManager>,
+        ledger_manager: &LedgerManager,
     ) -> bool {
         match upgrade {
             LedgerUpgrade::Version(new_version) => {
@@ -1734,14 +1701,7 @@ impl ScpDriver {
                 if current_version < henyey_common::MIN_SOROBAN_PROTOCOL_VERSION {
                     return false;
                 }
-                // Parity: stellar-core loads ConfigUpgradeSetFrame from ledger
-                // and validates it. Without a ledger manager we cannot perform
-                // this check, so we conservatively reject.
-                let Some(lm) = ledger_manager else {
-                    debug!("Config upgrade validation: no ledger manager available, rejecting");
-                    return false;
-                };
-                let frame = match lm.get_config_upgrade_set(key) {
+                let frame = match ledger_manager.get_config_upgrade_set(key) {
                     Ok(Some(f)) => f,
                     Ok(None) => {
                         debug!(
@@ -1898,17 +1858,11 @@ impl ScpDriver {
         // Phase 3: Filter to selectable candidates (previousLedgerHash matches LCL).
         // Parity: stellar-core applies this filter only during tx set selection
         // (HerderSCPDriver.cpp:784), not during hash/upgrade computation.
-        // When no LedgerManager is set (bootstrap/test), all candidates are selectable.
-        let mut selectable_candidates: Vec<ResolvedCandidate> =
-            if let Some(lm) = self.ledger_manager.get() {
-                let lcl_hash = lm.current_header_hash();
-                all_candidates
-                    .into_iter()
-                    .filter(|c| c.tx_set.previous_ledger_hash() == lcl_hash)
-                    .collect()
-            } else {
-                all_candidates
-            };
+        let lcl_hash = self.ledger_manager.current_header_hash();
+        let mut selectable_candidates: Vec<ResolvedCandidate> = all_candidates
+            .into_iter()
+            .filter(|c| c.tx_set.previous_ledger_hash() == lcl_hash)
+            .collect();
 
         if selectable_candidates.is_empty() {
             // Intentional divergence: stellar-core throws at line 800-804
@@ -2632,6 +2586,54 @@ mod cache_tests {
         Arc::new(RwLock::new(SharedTrackingState::default()))
     }
 
+    fn make_default_lm() -> Arc<henyey_ledger::LedgerManager> {
+        use henyey_ledger::{LedgerManager, LedgerManagerConfig};
+        use stellar_xdr::curr::{
+            Hash, LedgerHeader, LedgerHeaderExt, StellarValue, StellarValueExt, TimePoint, VecM,
+        };
+        let config = LedgerManagerConfig {
+            validate_bucket_hash: false,
+            ..Default::default()
+        };
+        let lm = LedgerManager::new("Test Network".to_string(), config);
+        let header = LedgerHeader {
+            ledger_version: 0,
+            previous_ledger_hash: Hash([0u8; 32]),
+            scp_value: StellarValue {
+                tx_set_hash: Hash([0u8; 32]),
+                close_time: TimePoint(0),
+                upgrades: VecM::default(),
+                ext: StellarValueExt::Basic,
+            },
+            tx_set_result_hash: Hash([0u8; 32]),
+            bucket_list_hash: Hash([0u8; 32]),
+            ledger_seq: 0,
+            total_coins: 1_000_000_000_000,
+            fee_pool: 0,
+            inflation_seq: 0,
+            id_pool: 0,
+            base_fee: 100,
+            base_reserve: 5_000_000,
+            max_tx_set_size: 100,
+            skip_list: [
+                Hash([0u8; 32]),
+                Hash([0u8; 32]),
+                Hash([0u8; 32]),
+                Hash([0u8; 32]),
+            ],
+            ext: LedgerHeaderExt::V0,
+        };
+        let header_hash = henyey_ledger::compute_header_hash(&header).expect("hash");
+        lm.initialize(
+            henyey_bucket::BucketList::new(),
+            henyey_bucket::HotArchiveBucketList::new(),
+            header,
+            header_hash,
+        )
+        .expect("init");
+        Arc::new(lm)
+    }
+
     fn make_tx_set(seed: u8) -> TransactionSet {
         let prev_hash = Hash256::from_bytes([seed; 32]);
         TransactionSet::new(prev_hash, Vec::new())
@@ -2642,6 +2644,7 @@ mod cache_tests {
         let driver = ScpDriver::new(
             make_config(1),
             Hash256::hash(b"network"),
+            make_default_lm(),
             default_tracking(),
             Arc::new(crate::metrics::ScpMetrics::new()),
         );
@@ -2660,6 +2663,7 @@ mod cache_tests {
         let driver = ScpDriver::new(
             make_config(4),
             Hash256::hash(b"network"),
+            make_default_lm(),
             default_tracking(),
             Arc::new(crate::metrics::ScpMetrics::new()),
         );
@@ -2682,6 +2686,7 @@ mod cache_tests {
         let driver = ScpDriver::new(
             make_config(2),
             Hash256::hash(b"network"),
+            make_default_lm(),
             default_tracking(),
             Arc::new(crate::metrics::ScpMetrics::new()),
         );
@@ -2703,6 +2708,7 @@ mod cache_tests {
         let driver = ScpDriver::new(
             make_config(4),
             Hash256::hash(b"network"),
+            make_default_lm(),
             default_tracking(),
             Arc::new(crate::metrics::ScpMetrics::new()),
         );
@@ -2724,6 +2730,7 @@ mod cache_tests {
         let driver = ScpDriver::new(
             make_config(4),
             Hash256::hash(b"network"),
+            make_default_lm(),
             default_tracking(),
             Arc::new(crate::metrics::ScpMetrics::new()),
         );
@@ -2756,6 +2763,7 @@ mod cache_tests {
         let driver = ScpDriver::new(
             config,
             Hash256::hash(b"network"),
+            make_default_lm(),
             default_tracking(),
             Arc::new(crate::metrics::ScpMetrics::new()),
         );
@@ -2794,6 +2802,7 @@ mod cache_tests {
         let driver = ScpDriver::new(
             make_config(4),
             Hash256::hash(b"network"),
+            make_default_lm(),
             default_tracking(),
             Arc::new(crate::metrics::ScpMetrics::new()),
         );
@@ -2829,6 +2838,7 @@ mod cache_tests {
         let driver = ScpDriver::new(
             make_config(4),
             Hash256::hash(b"network"),
+            make_default_lm(),
             default_tracking(),
             Arc::new(crate::metrics::ScpMetrics::new()),
         );
@@ -2863,6 +2873,7 @@ mod cache_tests {
         let driver = ScpDriver::new(
             make_config(10),
             Hash256::hash(b"network"),
+            make_default_lm(),
             default_tracking(),
             Arc::new(crate::metrics::ScpMetrics::new()),
         );
@@ -2914,6 +2925,7 @@ mod cache_tests {
         let driver = ScpDriver::new(
             make_config(4),
             Hash256::hash(b"network"),
+            make_default_lm(),
             default_tracking(),
             Arc::new(crate::metrics::ScpMetrics::new()),
         );
@@ -2936,6 +2948,7 @@ mod cache_tests {
         let driver = ScpDriver::new(
             make_config(4),
             Hash256::hash(b"network"),
+            make_default_lm(),
             default_tracking(),
             Arc::new(crate::metrics::ScpMetrics::new()),
         );
@@ -2951,6 +2964,7 @@ mod cache_tests {
         let driver = ScpDriver::new(
             make_config(4),
             Hash256::hash(b"network"),
+            make_default_lm(),
             default_tracking(),
             Arc::new(crate::metrics::ScpMetrics::new()),
         );
@@ -3034,6 +3048,7 @@ mod cache_tests {
         let driver = ScpDriver::new(
             config,
             network_id,
+            make_default_lm(),
             tracking,
             Arc::new(crate::metrics::ScpMetrics::new()),
         );
@@ -3073,7 +3088,8 @@ mod cache_tests {
         );
 
         // Now cache the tx set and re-validate — should pass the tx set check
-        let tx_set = TransactionSet::new(Hash256::ZERO, Vec::new());
+        let lcl_hash = driver.ledger_manager.current_header_hash();
+        let tx_set = TransactionSet::new(lcl_hash, Vec::new());
         // The tx_set created by TransactionSet::new computes its own hash,
         // so we need to use that hash in the value
         let tx_set_hash_real = *tx_set.hash();
@@ -3176,12 +3192,7 @@ impl SCPDriver for HerderScpCallback {
         is_local_node: bool,
     ) -> u64 {
         // Startup/test safety: if ledger manager isn't installed yet,
-        // fall back to base weights. Matches the compute_timeout pattern.
-        let Some(manager) = self.driver.ledger_manager.get() else {
-            return henyey_scp::base_get_node_weight(node_id, quorum_set, is_local_node);
-        };
-
-        let header = manager.current_header();
+        let header = self.driver.ledger_manager.current_header();
         let unsupported_protocol =
             !protocol_version_starts_from(header.ledger_version, ProtocolVersion::V22);
 
@@ -3278,10 +3289,10 @@ impl SCPDriver for HerderScpCallback {
         const MAX_TIMEOUT_MS: u64 = 30 * 60 * 1000;
         let mut initial_ms: u64 = 1000;
         let mut increment_ms: u64 = 1000;
-        if let Some(manager) = self.driver.ledger_manager.get() {
-            let header = manager.current_header();
+        {
+            let header = self.driver.ledger_manager.current_header();
             if protocol_version_starts_from(header.ledger_version, ProtocolVersion::V23) {
-                if let Some(info) = manager.soroban_network_info() {
+                if let Some(info) = self.driver.ledger_manager.soroban_network_info() {
                     if is_nomination {
                         initial_ms = info.nomination_timeout_initial_ms as u64;
                         increment_ms = info.nomination_timeout_increment_ms as u64;
@@ -3354,11 +3365,62 @@ mod tests {
         Arc::new(RwLock::new(SharedTrackingState::default()))
     }
 
+    fn make_default_lm() -> Arc<henyey_ledger::LedgerManager> {
+        use henyey_ledger::{LedgerManager, LedgerManagerConfig};
+        use stellar_xdr::curr::{Hash, LedgerHeader, LedgerHeaderExt};
+        let config = LedgerManagerConfig {
+            validate_bucket_hash: false,
+            ..Default::default()
+        };
+        let lm = LedgerManager::new("Test Network".to_string(), config);
+        let header = LedgerHeader {
+            ledger_version: 0,
+            previous_ledger_hash: Hash([0u8; 32]),
+            scp_value: StellarValue {
+                tx_set_hash: Hash([0u8; 32]),
+                close_time: TimePoint(0),
+                upgrades: VecM::default(),
+                ext: StellarValueExt::Basic,
+            },
+            tx_set_result_hash: Hash([0u8; 32]),
+            bucket_list_hash: Hash([0u8; 32]),
+            ledger_seq: 0,
+            total_coins: 1_000_000_000_000,
+            fee_pool: 0,
+            inflation_seq: 0,
+            id_pool: 0,
+            base_fee: 100,
+            base_reserve: 5_000_000,
+            max_tx_set_size: 100,
+            skip_list: [
+                Hash([0u8; 32]),
+                Hash([0u8; 32]),
+                Hash([0u8; 32]),
+                Hash([0u8; 32]),
+            ],
+            ext: LedgerHeaderExt::V0,
+        };
+        let header_hash = henyey_ledger::compute_header_hash(&header).expect("hash");
+        lm.initialize(
+            henyey_bucket::BucketList::new(),
+            henyey_bucket::HotArchiveBucketList::new(),
+            header,
+            header_hash,
+        )
+        .expect("init");
+        Arc::new(lm)
+    }
+
     fn make_test_driver() -> ScpDriver {
+        make_test_driver_with_lm(make_default_lm())
+    }
+
+    fn make_test_driver_with_lm(lm: Arc<henyey_ledger::LedgerManager>) -> ScpDriver {
         let config = ScpDriverConfig::default();
         ScpDriver::new(
             config,
             Hash256::ZERO,
+            lm,
             default_tracking(),
             Arc::new(crate::metrics::ScpMetrics::new()),
         )
@@ -3382,6 +3444,12 @@ mod tests {
 
     /// Create a test driver with a known secret key for signing.
     fn make_test_driver_with_key() -> (ScpDriver, SecretKey) {
+        make_test_driver_with_key_and_lm(make_default_lm())
+    }
+
+    fn make_test_driver_with_key_and_lm(
+        lm: Arc<henyey_ledger::LedgerManager>,
+    ) -> (ScpDriver, SecretKey) {
         let secret_key = SecretKey::generate();
         let public_key = secret_key.public_key();
         let config = ScpDriverConfig {
@@ -3393,6 +3461,7 @@ mod tests {
             config,
             network_id,
             secret_key.clone(),
+            lm,
             default_tracking(),
             Arc::new(crate::metrics::ScpMetrics::new()),
         );
@@ -3955,32 +4024,17 @@ mod tests {
     #[test]
     fn test_close_time_must_increase() {
         let (driver, secret_key) = make_test_driver_with_key();
+        let lcl_hash = driver.ledger_manager.current_header_hash();
 
-        let tx_set = TransactionSet::new(Hash256::ZERO, vec![]);
+        let tx_set = TransactionSet::new(lcl_hash, vec![]);
         let tx_set_hash = *tx_set.hash();
         driver.cache_tx_set(tx_set);
 
-        let base_close_time = 100;
-        // Record externalized with Basic ext (record_externalized doesn't validate)
-        let ext_value = StellarValue {
-            tx_set_hash: stellar_xdr::curr::Hash(tx_set_hash.0),
-            close_time: TimePoint(base_close_time),
-            upgrades: VecM::default(),
-            ext: StellarValueExt::Basic,
-        };
-        let ext = Value(
-            ext_value
-                .to_xdr(Limits::none())
-                .expect("xdr")
-                .try_into()
-                .unwrap(),
-        );
-        driver.record_externalized(1, ext, None);
-
-        // Now try to validate a value with same close time (should fail)
+        // LCL close_time is 0. A value with close_time=0 (not strictly
+        // greater) must be rejected at slot 1 (current ledger = LCL+1).
         let sv = make_signed_stellar_value(
             stellar_xdr::curr::Hash(tx_set_hash.0),
-            base_close_time,
+            0, // same as LCL close_time
             vec![],
             &secret_key,
             &driver.network_id,
@@ -3988,7 +4042,7 @@ mod tests {
         let value = encode_sv(&sv);
 
         assert_eq!(
-            driver.validate_value_impl(2, &value, false),
+            driver.validate_value_impl(1, &value, false),
             ValueValidation::Invalid
         );
     }
@@ -4105,8 +4159,9 @@ mod tests {
     fn test_validate_accepts_signed_value() {
         // Parity: a properly signed StellarValue should be accepted
         let (driver, secret_key) = make_test_driver_with_key();
+        let lcl_hash = driver.ledger_manager.current_header_hash();
 
-        let tx_set = TransactionSet::new(Hash256::ZERO, vec![]);
+        let tx_set = TransactionSet::new(lcl_hash, vec![]);
         let tx_set_hash = *tx_set.hash();
         driver.cache_tx_set(tx_set);
 
@@ -4228,8 +4283,9 @@ mod tests {
     fn test_extract_valid_value_strips_invalid_upgrades() {
         // Parity: extractValidValue strips invalid upgrades
         let driver = make_test_driver();
+        let lcl_hash = driver.ledger_manager.current_header_hash();
 
-        let tx_set = TransactionSet::new(Hash256::ZERO, vec![]);
+        let tx_set = TransactionSet::new(lcl_hash, vec![]);
         let tx_set_hash = *tx_set.hash();
         driver.cache_tx_set(tx_set);
 
@@ -4274,6 +4330,7 @@ mod tests {
     fn test_combine_candidates_merges_upgrades() {
         // Parity: combineCandidates merges upgrades from ALL candidates
         let driver = make_test_driver();
+        let lcl_hash = driver.ledger_manager.current_header_hash();
 
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -4281,7 +4338,7 @@ mod tests {
             .as_secs();
 
         // Create and cache real tx sets so the cache filter keeps them
-        let tx_set_1 = TransactionSet::new(Hash256::ZERO, vec![]);
+        let tx_set_1 = TransactionSet::new(lcl_hash, vec![]);
         let hash_1 = *tx_set_1.hash();
         driver.cache_tx_set(tx_set_1);
 
@@ -4329,6 +4386,7 @@ mod tests {
     fn test_combine_candidates_takes_max_upgrade() {
         // Parity: when multiple candidates have same upgrade type, take max
         let driver = make_test_driver();
+        let lcl_hash = driver.ledger_manager.current_header_hash();
 
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -4336,7 +4394,7 @@ mod tests {
             .as_secs();
 
         // Create and cache real tx sets
-        let tx_set_1 = TransactionSet::new(Hash256::ZERO, vec![]);
+        let tx_set_1 = TransactionSet::new(lcl_hash, vec![]);
         let hash_1 = *tx_set_1.hash();
         driver.cache_tx_set(tx_set_1);
 
@@ -4713,12 +4771,13 @@ mod tests {
         // When slot_index == lcl_seq + 1, validate_value_against_local_state
         // does full validation including tx set hash check
         let (driver, secret_key) = make_test_driver_with_key();
+        let lcl_hash = driver.ledger_manager.current_header_hash();
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs();
 
-        let tx_set = TransactionSet::new(Hash256::ZERO, vec![]);
+        let tx_set = TransactionSet::new(lcl_hash, vec![]);
         let tx_set_hash = *tx_set.hash();
         driver.cache_tx_set(tx_set);
 
@@ -5010,16 +5069,16 @@ mod tests {
             ext: StellarValueExt::Basic,
         };
 
-        // Without ledger manager, check_upgrades_valid returns true (can't validate)
-        // This is expected — the test verifies the nomination path once a ledger manager
-        // is available. The is_valid_for_nomination unit tests above cover the logic directly.
+        // Ballot check: BaseFee(500) is valid for apply (500 != 0), so passes
         assert!(
             driver.check_upgrades_valid(&sv, false),
-            "Without ledger manager, ballot check should pass"
+            "Ballot check should pass — BaseFee is valid for apply"
         );
+        // Nomination check: BaseFee(500) != configured 200 AND upgrade time
+        // (1000) has not been reached (lcl_close_time=0), so fails
         assert!(
-            driver.check_upgrades_valid(&sv, true),
-            "Without ledger manager, nomination check should pass (can't validate)"
+            !driver.check_upgrades_valid(&sv, true),
+            "Nomination check should reject — wrong value and upgrade time not reached"
         );
     }
 
@@ -5080,8 +5139,7 @@ mod tests {
         )
         .expect("init");
 
-        let (driver, _) = make_test_driver_with_key();
-        driver.set_ledger_manager(Arc::new(lm));
+        let (driver, _) = make_test_driver_with_key_and_lm(Arc::new(lm));
 
         // Create a Config upgrade with a bogus key that doesn't exist in ledger
         let bogus_key = ConfigUpgradeSetKey {
@@ -5094,7 +5152,7 @@ mod tests {
 
         let sv = StellarValue {
             tx_set_hash: stellar_xdr::curr::Hash([0; 32]),
-            close_time: TimePoint(100),
+            close_time: TimePoint(0),
             upgrades: vec![upgrade_type].try_into().unwrap(),
             ext: StellarValueExt::Basic,
         };
@@ -5108,35 +5166,38 @@ mod tests {
         );
     }
 
-    /// Test is_valid_upgrade_for_apply directly: Config upgrade without
-    /// ledger manager is rejected, and non-Config upgrades are unaffected.
+    /// Test is_valid_upgrade_for_apply directly: Config upgrade with a
+    /// default (uninitialized) LedgerManager is rejected because the key is
+    /// not found, and non-Config upgrades are unaffected.
     #[test]
-    fn test_audit_023_is_valid_upgrade_for_apply_config_without_lm() {
+    fn test_audit_023_is_valid_upgrade_for_apply_config_with_default_lm() {
         use stellar_xdr::curr::{ConfigUpgradeSetKey, ContractId, Hash};
+
+        let lm = make_default_lm();
 
         let bogus_key = ConfigUpgradeSetKey {
             contract_id: ContractId(Hash([0xDE; 32])),
             content_hash: Hash([0xAD; 32]),
         };
 
-        // Config upgrade without ledger manager: rejected
+        // Config upgrade with default LM (no config upgrade set stored): rejected
         assert!(
-            !ScpDriver::is_valid_upgrade_for_apply(&LedgerUpgrade::Config(bogus_key), 25, None,),
-            "Config upgrade must be rejected when no ledger manager is available"
+            !ScpDriver::is_valid_upgrade_for_apply(&LedgerUpgrade::Config(bogus_key), 25, &lm),
+            "Config upgrade must be rejected when key is not found in LedgerManager"
         );
 
-        // Non-Config upgrades are unaffected by the ledger_manager parameter
+        // Non-Config upgrades are unaffected by the ledger_manager contents
         assert!(
-            ScpDriver::is_valid_upgrade_for_apply(&LedgerUpgrade::BaseFee(200), 25, None),
-            "BaseFee upgrade should not need ledger manager"
+            ScpDriver::is_valid_upgrade_for_apply(&LedgerUpgrade::BaseFee(200), 25, &lm),
+            "BaseFee upgrade should not need ledger manager contents"
         );
         assert!(
             ScpDriver::is_valid_upgrade_for_apply(
                 &LedgerUpgrade::MaxSorobanTxSetSize(100),
                 25,
-                None,
+                &lm,
             ),
-            "MaxSorobanTxSetSize upgrade should not need ledger manager"
+            "MaxSorobanTxSetSize upgrade should not need ledger manager contents"
         );
     }
 
@@ -5188,10 +5249,12 @@ mod tests {
         use stellar_xdr::curr::{Limits, StellarValue, StellarValueExt, TimePoint, WriteXdr};
 
         let driver = make_test_driver();
+        let lcl_hash = driver.ledger_manager.current_header_hash();
 
-        // Create two tx sets but only cache one
-        let tx_set_a = TransactionSet::new(Hash256::ZERO, vec![]);
-        let tx_set_b = TransactionSet::new(Hash256::from_bytes([1u8; 32]), vec![]);
+        // Create two tx sets but only cache one.
+        // tx_set_a uses a non-LCL hash, tx_set_b uses the LCL hash.
+        let tx_set_a = TransactionSet::new(Hash256::from_bytes([1u8; 32]), vec![]);
+        let tx_set_b = TransactionSet::new(lcl_hash, vec![]);
 
         let sv_a = StellarValue {
             tx_set_hash: stellar_xdr::curr::Hash(tx_set_a.hash().0),
@@ -5283,8 +5346,7 @@ mod tests {
         )
         .expect("init");
 
-        let driver = make_test_driver();
-        driver.set_ledger_manager(Arc::new(lm));
+        let driver = make_test_driver_with_lm(Arc::new(lm));
 
         // Candidate 1: matching LCL, no upgrades
         let tx_set_valid = TransactionSet::new(Hash256::from_bytes(lcl_hash.0), vec![]);
@@ -5397,8 +5459,7 @@ mod tests {
         )
         .expect("init");
 
-        let driver = make_test_driver();
-        driver.set_ledger_manager(Arc::new(lm));
+        let driver = make_test_driver_with_lm(Arc::new(lm));
 
         // Two tx sets with LCL-matching previousLedgerHash (same ops/fees/size)
         let tx_set_a = TransactionSet::new(Hash256::from_bytes(lcl_hash.0), vec![]);
@@ -5540,8 +5601,7 @@ mod tests {
         )
         .expect("init");
 
-        let driver = make_test_driver();
-        driver.set_ledger_manager(Arc::new(lm));
+        let driver = make_test_driver_with_lm(Arc::new(lm));
 
         // Single candidate with stale LCL
         let stale_lcl = Hash256::from_bytes([0xCC; 32]);
@@ -5616,8 +5676,7 @@ mod tests {
         )
         .expect("init");
 
-        let driver = make_test_driver();
-        driver.set_ledger_manager(Arc::new(lm));
+        let driver = make_test_driver_with_lm(Arc::new(lm));
 
         // Two candidates, both with stale LCL
         let stale_lcl_1 = Hash256::from_bytes([0xDD; 32]);
@@ -5952,8 +6011,7 @@ mod tests {
         )
         .expect("init");
 
-        let driver = make_test_driver();
-        driver.set_ledger_manager(Arc::new(lm));
+        let driver = make_test_driver_with_lm(Arc::new(lm));
 
         // Build a TX from the insolvent account with fee = 10_000 (> balance of 50)
         let tx = Transaction {
@@ -6014,18 +6072,60 @@ mod tests {
         );
     }
 
-    /// Regression test for AUDIT-264: verify that when no ledger manager is
-    /// available (startup window), validation is permissive (returns true).
-    /// This confirms the None path doesn't crash and accepts gracefully.
+    /// Regression test for AUDIT-264: verify that with a low-protocol
+    /// LedgerManager, validation of a minimal TX set is permissive (protocol
+    /// < 20 skips generalized tx set validation).
     #[test]
-    fn test_audit_264_no_ledger_manager_permissive() {
+    fn test_audit_264_default_ledger_manager_permissive() {
+        use henyey_ledger::{LedgerManager, LedgerManagerConfig};
         use stellar_xdr::curr::{
             GeneralizedTransactionSet, Hash, ParallelTxsComponent, TransactionPhase,
             TransactionSetV1,
         };
 
-        let driver = make_test_driver();
-        // Deliberately do NOT set ledger_manager — simulates startup window.
+        // Create a LM at protocol 0 — pre-v20 skips generalized tx set checks.
+        let lm_config = LedgerManagerConfig {
+            validate_bucket_hash: false,
+            ..Default::default()
+        };
+        let lm = LedgerManager::new("Test Network".to_string(), lm_config);
+        let header = stellar_xdr::curr::LedgerHeader {
+            ledger_version: 0,
+            previous_ledger_hash: Hash([0u8; 32]),
+            scp_value: StellarValue {
+                tx_set_hash: Hash([0u8; 32]),
+                close_time: TimePoint(0),
+                upgrades: VecM::default(),
+                ext: StellarValueExt::Basic,
+            },
+            tx_set_result_hash: Hash([0u8; 32]),
+            bucket_list_hash: Hash([0u8; 32]),
+            ledger_seq: 0,
+            total_coins: 1_000_000_000_000,
+            fee_pool: 0,
+            inflation_seq: 0,
+            id_pool: 0,
+            base_fee: 100,
+            base_reserve: 5_000_000,
+            max_tx_set_size: 100,
+            skip_list: [
+                Hash([0u8; 32]),
+                Hash([0u8; 32]),
+                Hash([0u8; 32]),
+                Hash([0u8; 32]),
+            ],
+            ext: stellar_xdr::curr::LedgerHeaderExt::V0,
+        };
+        let header_hash = henyey_ledger::compute_header_hash(&header).expect("hash");
+        lm.initialize(
+            henyey_bucket::BucketList::new(),
+            henyey_bucket::HotArchiveBucketList::new(),
+            header,
+            header_hash,
+        )
+        .expect("init");
+
+        let driver = make_test_driver_with_lm(Arc::new(lm));
 
         // Build a minimal generalized TX set (empty phases, valid structure).
         let gen = GeneralizedTransactionSet::V1(TransactionSetV1 {
@@ -6043,9 +6143,9 @@ mod tests {
         });
         let tx_set = TransactionSet::new_generalized(gen);
 
-        // Without ledger manager, should be permissive (accepted)
+        // With protocol 0 LedgerManager, should be permissive (accepted)
         let result = driver.check_and_cache_tx_set_valid(&tx_set, Hash256::ZERO, 0);
-        assert!(result, "No ledger manager should be permissive");
+        assert!(result, "Pre-v20 LedgerManager should be permissive");
     }
 }
 
@@ -6066,10 +6166,59 @@ mod compare_tx_sets_tests {
         Arc::new(RwLock::new(SharedTrackingState::default()))
     }
 
+    fn make_default_lm() -> Arc<henyey_ledger::LedgerManager> {
+        use henyey_ledger::{LedgerManager, LedgerManagerConfig};
+        use stellar_xdr::curr::{
+            Hash, LedgerHeader, LedgerHeaderExt, StellarValue, StellarValueExt, TimePoint, VecM,
+        };
+        let config = LedgerManagerConfig {
+            validate_bucket_hash: false,
+            ..Default::default()
+        };
+        let lm = LedgerManager::new("Test Network".to_string(), config);
+        let header = LedgerHeader {
+            ledger_version: 0,
+            previous_ledger_hash: Hash([0u8; 32]),
+            scp_value: StellarValue {
+                tx_set_hash: Hash([0u8; 32]),
+                close_time: TimePoint(0),
+                upgrades: VecM::default(),
+                ext: StellarValueExt::Basic,
+            },
+            tx_set_result_hash: Hash([0u8; 32]),
+            bucket_list_hash: Hash([0u8; 32]),
+            ledger_seq: 0,
+            total_coins: 1_000_000_000_000,
+            fee_pool: 0,
+            inflation_seq: 0,
+            id_pool: 0,
+            base_fee: 100,
+            base_reserve: 5_000_000,
+            max_tx_set_size: 100,
+            skip_list: [
+                Hash([0u8; 32]),
+                Hash([0u8; 32]),
+                Hash([0u8; 32]),
+                Hash([0u8; 32]),
+            ],
+            ext: LedgerHeaderExt::V0,
+        };
+        let header_hash = henyey_ledger::compute_header_hash(&header).expect("hash");
+        lm.initialize(
+            henyey_bucket::BucketList::new(),
+            henyey_bucket::HotArchiveBucketList::new(),
+            header,
+            header_hash,
+        )
+        .expect("init");
+        Arc::new(lm)
+    }
+
     fn make_driver() -> ScpDriver {
         ScpDriver::new(
             make_config(),
             Hash256::ZERO,
+            make_default_lm(),
             default_tracking(),
             Arc::new(crate::metrics::ScpMetrics::new()),
         )
@@ -6399,11 +6548,12 @@ mod compare_tx_sets_tests {
         use stellar_xdr::curr::{Limits, StellarValue, StellarValueExt, TimePoint, WriteXdr};
 
         let driver = make_driver();
+        let lcl_hash = driver.ledger_manager.current_header_hash();
 
         // A has 5 ops (should win on criterion 1)
-        let tx_set_a = TransactionSet::new(Hash256::ZERO, vec![make_tx(1, 500, 5)]);
+        let tx_set_a = TransactionSet::new(lcl_hash, vec![make_tx(1, 500, 5)]);
         // B has 1 op
-        let tx_set_b = TransactionSet::new(Hash256::ZERO, vec![make_tx(2, 100, 1)]);
+        let tx_set_b = TransactionSet::new(lcl_hash, vec![make_tx(2, 100, 1)]);
 
         let sv_a = StellarValue {
             tx_set_hash: stellar_xdr::curr::Hash(tx_set_a.hash().0),
@@ -6676,10 +6826,11 @@ mod compare_tx_sets_tests {
         use stellar_xdr::curr::{StellarValue, StellarValueExt, TimePoint, WriteXdr};
 
         let driver = make_driver();
+        let lcl_hash = driver.ledger_manager.current_header_hash();
 
         // Create a single transaction set (both candidates reference the same tx_set)
         let tx = make_tx(42, 100, 1);
-        let tx_set = TransactionSet::new(Hash256::ZERO, vec![tx]);
+        let tx_set = TransactionSet::new(lcl_hash, vec![tx]);
         let tx_set_hash = *tx_set.hash();
         driver.cache_tx_set(tx_set);
 

@@ -1322,11 +1322,14 @@ impl App {
         db: &henyey_db::Database,
     ) -> Arc<Herder> {
         let herder = if app_config.node.is_validator {
-            Arc::new(Herder::with_secret_key(config, keypair.clone()))
+            Arc::new(Herder::with_secret_key(
+                config,
+                keypair.clone(),
+                ledger_manager.clone(),
+            ))
         } else {
-            Arc::new(Herder::new(config))
+            Arc::new(Herder::new(config, ledger_manager.clone()))
         };
-        herder.set_ledger_manager(ledger_manager.clone());
         herder
             .tx_queue()
             .set_fee_balance_provider(Arc::new(types::LedgerFeeBalanceProvider {

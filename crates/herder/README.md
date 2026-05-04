@@ -46,10 +46,13 @@ graph TD
 
 ## Usage
 
-```rust
+```rust,ignore
+use std::sync::Arc;
 use henyey_herder::{Herder, HerderConfig, HerderState};
+use henyey_ledger::LedgerManager;
 
-let herder = Herder::new(HerderConfig::default());
+let ledger_manager: Arc<LedgerManager> = /* ... */;
+let herder = Herder::new(HerderConfig::default(), ledger_manager);
 
 herder.start_syncing();
 assert_eq!(herder.state(), HerderState::Syncing);
@@ -59,17 +62,20 @@ assert_eq!(herder.state(), HerderState::Tracking);
 assert_eq!(herder.tracking_slot(), 1025);
 ```
 
-```rust
+```rust,ignore
+use std::sync::Arc;
 use henyey_crypto::SecretKey;
 use henyey_herder::{Herder, HerderConfig, UpgradeParameters};
+use henyey_ledger::LedgerManager;
 
 let config = HerderConfig {
     is_validator: true,
     ..HerderConfig::default()
 };
 
+let ledger_manager: Arc<LedgerManager> = /* ... */;
 let secret_key = SecretKey::from_binary([7; 32]);
-let herder = Herder::with_secret_key(config, secret_key);
+let herder = Herder::with_secret_key(config, secret_key, ledger_manager);
 
 herder
     .set_upgrade_parameters(UpgradeParameters {
@@ -79,11 +85,14 @@ herder
     .expect("supported upgrade");
 ```
 
-```rust
+```rust,ignore
+use std::sync::Arc;
 use henyey_common::Hash256;
 use henyey_herder::{Herder, HerderConfig};
+use henyey_ledger::LedgerManager;
 
-let herder = Herder::new(HerderConfig::default());
+let ledger_manager: Arc<LedgerManager> = /* ... */;
+let herder = Herder::new(HerderConfig::default(), ledger_manager);
 
 let needed: Hash256 = Hash256::ZERO;
 if herder.needs_tx_set(&needed) {
