@@ -1145,6 +1145,30 @@ mod tests {
         }
     }
 
+    /// Wait for a publish attempt to complete by observing a test-local
+    /// witness file (written by the `put` command) and `publish_in_progress`
+    /// clearing. Safe against races because the witness file is monotonic
+    /// (once created, it persists) and, for a single-checkpoint fixture with
+    /// one `maybe_publish_history()` call, the flag transitions exactly once
+    /// (`false→true→false`).
+    async fn wait_for_publish_witness(witness: &std::path::Path, app: &App) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let witness_exists = witness.exists();
+            let in_progress = app.publish_in_progress.load(Ordering::SeqCst);
+            if witness_exists && !in_progress {
+                return;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                panic!(
+                    "publish did not complete within 10s; witness={witness_exists}, \
+                     in_progress={in_progress}"
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
     /// End-to-end test: a panic inside `publish_single_checkpoint` (via
     /// `spawn_blocking`) clears `publish_in_progress` (permit Drop during
     /// unwind), keeps the checkpoint in the publish queue, and allows a
@@ -1276,6 +1300,85 @@ mod tests {
             after_success_count > before_success_count,
             "publish success counter should have incremented; \
              before={before_success_count}, after={after_success_count}",
+        );
+    }
+
+    /// End-to-end test: a failing `put` command causes `publish_single_checkpoint`
+    /// to return `Err`, incrementing `stellar_history_publish_failure_total` and
+    /// leaving the checkpoint in the queue (not dequeued).
+    #[tokio::test]
+    async fn test_publish_failure_increments_counter_and_retains_queue() {
+        let handle = crate::metrics::ensure_test_recorder();
+        crate::metrics::describe_metrics();
+        crate::metrics::register_label_series();
+
+        // Capture baseline failure counter (recorder is process-global).
+        let before_output = handle.render();
+        let before_failure_count =
+            parse_metric_count(&before_output, "stellar_history_publish_failure_total");
+
+        // Witness file: the put command writes here before exiting 1,
+        // proving the publish task reached the upload step.
+        let witness = std::sync::Arc::new(std::sync::Mutex::new(std::path::PathBuf::new()));
+        let witness_clone = witness.clone();
+
+        let fixture = setup_publish_fixture("failure-test", move |dir, config| {
+            let witness_path = dir.join("put-witness.log");
+            *witness_clone.lock().unwrap() = witness_path.clone();
+            let put_cmd = format!("echo attempt >> {} && exit 1", witness_path.display());
+            config.history.archives = vec![crate::config::HistoryArchiveEntry {
+                name: "failure-test".to_string(),
+                url: "file:///unused".to_string(),
+                get_enabled: false,
+                put_enabled: true,
+                put: Some(put_cmd),
+                // No-op mkdir: exercises the "mkdir command present" branch
+                // in upload_publish_directory without validating substitution.
+                mkdir: Some("true".to_string()),
+            }];
+        })
+        .await;
+
+        let witness_path = witness.lock().unwrap().clone();
+
+        // Drive a failing publish.
+        fixture.app.maybe_publish_history().await;
+        wait_for_publish_witness(&witness_path, &fixture.app).await;
+
+        // Primary signal: witness file proves the put command ran.
+        assert!(
+            witness_path.exists(),
+            "witness file should exist — put command must have been invoked"
+        );
+
+        // Secondary evidence: failure counter incremented.
+        let after_output = handle.render();
+        let after_failure_count =
+            parse_metric_count(&after_output, "stellar_history_publish_failure_total");
+        assert!(
+            after_failure_count > before_failure_count,
+            "publish failure counter should have incremented; \
+             before={before_failure_count}, after={after_failure_count}",
+        );
+
+        // Queue retention: checkpoint was NOT dequeued (publish failed).
+        let queue = fixture
+            .app
+            .db_blocking("check-queue-after-failure", |db| {
+                db.load_publish_queue(None).map_err(Into::into)
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            queue,
+            vec![CHECKPOINT],
+            "checkpoint should remain in queue after publish failure"
+        );
+
+        // Permit released: publish_in_progress cleared on the Err path.
+        assert!(
+            !fixture.app.publish_in_progress.load(Ordering::SeqCst),
+            "publish_in_progress should be cleared after failed publish"
         );
     }
 
