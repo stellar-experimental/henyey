@@ -2594,4 +2594,96 @@ mod tests {
             assert!(level.snap.hash().is_zero());
         }
     }
+
+    // -----------------------------------------------------------------------
+    // Regression tests for #2380: missing bucket files must not be silently
+    // downgraded. Same as BucketList tests but for the hot archive path.
+    // -----------------------------------------------------------------------
+
+    fn phantom_hash() -> Hash256 {
+        Hash256::from_bytes([0xAB; 32])
+    }
+
+    #[test]
+    fn test_hot_archive_restore_fails_on_missing_state1_output() {
+        let hashes = vec![(Hash256::ZERO, Hash256::ZERO); HOT_ARCHIVE_BUCKET_LIST_LEVELS];
+        let mut next_states = vec![HasNextState::default(); HOT_ARCHIVE_BUCKET_LIST_LEVELS];
+        next_states[1] = HasNextState {
+            state: HAS_NEXT_STATE_OUTPUT,
+            output: Some(phantom_hash()),
+            input_curr: None,
+            input_snap: None,
+        };
+
+        let result = HotArchiveBucketList::restore_from_has(
+            &hashes,
+            &next_states,
+            |hash: &Hash256| -> Result<HotArchiveBucket> {
+                Err(BucketError::Serialization(format!(
+                    "bucket not found: {}",
+                    hash.to_hex()
+                )))
+            },
+        );
+
+        assert!(
+            result.is_err(),
+            "hot archive restore must fail when state-1 output bucket is missing"
+        );
+    }
+
+    #[test]
+    fn test_hot_archive_restore_parallel_fails_on_missing_state1_output() {
+        let hashes = vec![(Hash256::ZERO, Hash256::ZERO); HOT_ARCHIVE_BUCKET_LIST_LEVELS];
+        let mut next_states = vec![HasNextState::default(); HOT_ARCHIVE_BUCKET_LIST_LEVELS];
+        next_states[1] = HasNextState {
+            state: HAS_NEXT_STATE_OUTPUT,
+            output: Some(phantom_hash()),
+            input_curr: None,
+            input_snap: None,
+        };
+
+        let loader = |hash: &Hash256| -> Result<HotArchiveBucket> {
+            Err(BucketError::Serialization(format!(
+                "bucket not found: {}",
+                hash.to_hex()
+            )))
+        };
+
+        let result = HotArchiveBucketList::restore_from_has_parallel(&hashes, &next_states, loader);
+        assert!(
+            result.is_err(),
+            "hot archive parallel restore must fail when state-1 output bucket is missing"
+        );
+    }
+
+    #[test]
+    fn test_hot_archive_restart_merges_fails_on_missing_state2_inputs() {
+        let mut bl = HotArchiveBucketList::default();
+        let mut next_states = vec![HasNextState::default(); HOT_ARCHIVE_BUCKET_LIST_LEVELS];
+        next_states[1] = HasNextState {
+            state: HAS_NEXT_STATE_INPUTS,
+            input_curr: Some(phantom_hash()),
+            input_snap: Some(Hash256::ZERO),
+            output: None,
+        };
+
+        let result = bl.restart_merges_from_has(
+            1,
+            25,
+            &next_states,
+            |hash: &Hash256| -> Result<HotArchiveBucket> {
+                Err(BucketError::Serialization(format!(
+                    "bucket not found: {}",
+                    hash.to_hex()
+                )))
+            },
+            false,
+        );
+
+        assert!(
+            result.is_err(),
+            "hot archive restart_merges must fail when state-2 input bucket is missing"
+        );
+    }
 }

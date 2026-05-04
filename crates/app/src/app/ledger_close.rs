@@ -617,16 +617,45 @@ impl App {
         let header_hash = compute_header_hash(&header)
             .map_err(|e| anyhow::anyhow!("Failed to compute header hash: {}", e))?;
 
-        // Step 5: Verify essential bucket files exist on disk.
-        // We only require curr/snap hashes — pending merge outputs (next.output)
-        // are optional; if missing we'll discard the pending merge state.
+        // Step 5: Verify ALL referenced bucket files exist on disk.
+        // Parity: stellar-core validates all bucket hashes (curr, snap, AND
+        // pending merge outputs/inputs) and fails hard if any are missing
+        // (LedgerManagerImpl.cpp:555-560). We must do the same — silently
+        // discarding pending merge state produces wrong bucket list hashes.
         let mut essential_hashes: Vec<Hash256> = has
             .bucket_hash_pairs()
             .iter()
             .flat_map(|(curr, snap)| [*curr, *snap])
             .filter(|h| !h.is_zero())
             .collect();
-        // Also include hot archive bucket hashes
+        // Include pending merge hashes (output for state-1, inputs for state-2)
+        for level in &has.current_buckets {
+            if level.next.state == 1 {
+                if let Some(ref output_hex) = level.next.output {
+                    if let Ok(hash) = Hash256::from_hex(output_hex) {
+                        if !hash.is_zero() {
+                            essential_hashes.push(hash);
+                        }
+                    }
+                }
+            } else if level.next.state == 2 {
+                if let Some(ref input_hex) = level.next.curr {
+                    if let Ok(hash) = Hash256::from_hex(input_hex) {
+                        if !hash.is_zero() {
+                            essential_hashes.push(hash);
+                        }
+                    }
+                }
+                if let Some(ref input_hex) = level.next.snap {
+                    if let Ok(hash) = Hash256::from_hex(input_hex) {
+                        if !hash.is_zero() {
+                            essential_hashes.push(hash);
+                        }
+                    }
+                }
+            }
+        }
+        // Also include hot archive bucket hashes (curr, snap, and pending merges)
         if let Some(hot_pairs) = has.hot_archive_bucket_hash_pairs() {
             for (curr, snap) in &hot_pairs {
                 if !curr.is_zero() {
@@ -634,6 +663,28 @@ impl App {
                 }
                 if !snap.is_zero() {
                     essential_hashes.push(*snap);
+                }
+            }
+        }
+        if let Some(hot_next_states) = has.hot_archive_next_states() {
+            for state in &hot_next_states {
+                if state.state == 1 {
+                    if let Some(ref output_hash) = state.output {
+                        if !output_hash.is_zero() {
+                            essential_hashes.push(*output_hash);
+                        }
+                    }
+                } else if state.state == 2 {
+                    if let Some(ref input_hash) = state.input_curr {
+                        if !input_hash.is_zero() {
+                            essential_hashes.push(*input_hash);
+                        }
+                    }
+                    if let Some(ref input_hash) = state.input_snap {
+                        if !input_hash.is_zero() {
+                            essential_hashes.push(*input_hash);
+                        }
+                    }
                 }
             }
         }
@@ -657,29 +708,11 @@ impl App {
             );
         }
 
-        // Step 5b: Check which pending merge outputs are available.
-        // If a next.output hash is missing on disk, downgrade that level's
-        // merge state so restore_from_has doesn't try to load it.
-        let mut has = has;
-        for level in &mut has.current_buckets {
-            if level.next.state == 1 {
-                // state 1 = FB_HASH_OUTPUT (merge completed, output hash known)
-                if let Some(ref output_hex) = level.next.output {
-                    if let Ok(hash) = Hash256::from_hex(output_hex) {
-                        if !hash.is_zero() && !self.bucket_manager.bucket_exists(&hash) {
-                            tracing::info!(
-                                output = %hash.to_hex(),
-                                "Pending merge output not on disk, discarding merge state"
-                            );
-                            level.next.state = 0;
-                            level.next.output = None;
-                        }
-                    }
-                }
-            }
-        }
-
         // Step 6: Reconstruct bucket lists with overlapped cache scan.
+        //
+        // Parity: stellar-core fails hard on missing buckets (validated above).
+        // No silent downgrade of pending merge state — all HAS-referenced files
+        // are guaranteed present by the preflight check.
         //
         // The scan runs concurrently with merge restart because it only reads
         // level.curr and level.snap (via Arc clones) while restart_merges_from_has
@@ -773,25 +806,9 @@ impl App {
                 })
                 .collect();
 
-            // Downgrade hot-archive state-1 outputs whose files are missing,
-            // matching the live-bucket downgrade above.
-            let mut hot_next_states = hot_next_states;
-            for state in &mut hot_next_states {
-                if state.state == 1 {
-                    if let Some(ref output_hash) = state.output {
-                        if !output_hash.is_zero() && !self.bucket_manager.bucket_exists(output_hash)
-                        {
-                            tracing::info!(
-                                output = %output_hash.to_hex(),
-                                "Hot archive pending merge output not on disk, \
-                                 discarding merge state"
-                            );
-                            state.state = 0;
-                            state.output = None;
-                        }
-                    }
-                }
-            }
+            // Parity: all hot archive bucket files (including pending merge
+            // outputs/inputs) are validated by the preflight check above.
+            // No silent downgrade needed — missing files cause a hard failure.
 
             let bucket_manager = self.bucket_manager.clone();
             let load_hot =
@@ -1053,7 +1070,7 @@ impl App {
     ) -> anyhow::Result<(BucketList, HotArchiveBucketList)> {
         // Reconstruct live BucketList
         let live_hash_pairs = has.bucket_hash_pairs();
-        let mut live_next_states: Vec<HasNextState> = has
+        let live_next_states: Vec<HasNextState> = has
             .live_next_states()
             .into_iter()
             .map(|s| HasNextState {
@@ -1064,24 +1081,11 @@ impl App {
             })
             .collect();
 
-        // Downgrade state-1 (completed merge output) to state-0 if the output
-        // file is missing on disk. The merge will be re-run via structure-based
-        // restart. This matches the same logic in load_last_known_ledger.
-        for state in &mut live_next_states {
-            if state.state == 1 {
-                if let Some(ref output_hash) = state.output {
-                    if !output_hash.is_zero() && !self.bucket_manager.bucket_exists(output_hash) {
-                        tracing::info!(
-                            output = %output_hash.to_hex(),
-                            "reconstruct_bucket_lists: pending merge output not on disk, \
-                             discarding merge state"
-                        );
-                        state.state = 0;
-                        state.output = None;
-                    }
-                }
-            }
-        }
+        // Parity: stellar-core fails hard on missing bucket files
+        // (LedgerManagerImpl.cpp:555-560). All referenced files (curr, snap,
+        // and pending merge outputs/inputs) must be present. The caller is
+        // responsible for ensuring this via preflight or download.
+        // No silent downgrade of pending merge state.
 
         let bucket_manager = self.bucket_manager.clone();
         let load_bucket = |hash: &Hash256| -> henyey_bucket::Result<henyey_bucket::Bucket> {
@@ -1143,25 +1147,8 @@ impl App {
                     bucket_manager.load_hot_archive_bucket(hash)
                 };
 
-            // Downgrade hot-archive state-1 outputs whose files are missing,
-            // matching the live-bucket downgrade above.
-            let mut hot_next_states = hot_next_states;
-            for state in &mut hot_next_states {
-                if state.state == 1 {
-                    if let Some(ref output_hash) = state.output {
-                        if !output_hash.is_zero() && !self.bucket_manager.bucket_exists(output_hash)
-                        {
-                            tracing::info!(
-                                output = %output_hash.to_hex(),
-                                "reconstruct_bucket_lists: hot archive pending merge output \
-                                 not on disk, discarding merge state"
-                            );
-                            state.state = 0;
-                            state.output = None;
-                        }
-                    }
-                }
-            }
+            // Parity: no silent downgrade of hot archive merge state.
+            // All referenced files must be present (caller ensures this).
 
             let mut hot_bl = HotArchiveBucketList::restore_from_has_parallel(
                 &hot_hash_pairs,
