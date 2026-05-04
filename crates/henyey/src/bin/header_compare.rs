@@ -141,65 +141,140 @@ fn print_header(label: &str, header: &LedgerHeader, hash: &Hash256) {
 /// Compares transaction results between local database and archive.
 ///
 /// Fetches transaction results for the specified ledger from both the local
-/// database and the history archive, then compares them transaction by
-/// transaction. Any differences (in fee charged or result code) are printed.
-///
-/// This helps identify which specific transactions produced different results
-/// when debugging execution divergence.
+/// database and the history archive, then compares them. Handles sparse entries
+/// gracefully: when a ledger has no transactions, stellar-core omits the entry
+/// from checkpoint archives (CheckpointBuilder.cpp:140), and henyey's catchup
+/// path mirrors this sparsity (persist.rs:33-41).
 async fn compare_tx_results(
     db: &henyey_db::Database,
     archive: &HistoryArchive,
     ledger: u32,
     checkpoint: u32,
 ) -> anyhow::Result<()> {
-    let local_entry = db
-        .get_tx_result_entry(ledger)?
-        .ok_or_else(|| anyhow::anyhow!("missing tx result entry {} in db", ledger))?;
+    let local_entry = db.get_tx_result_entry(ledger)?;
 
     let archive_entries = archive.fetch_results(checkpoint).await?;
     let archive_entry = archive_entries
         .into_iter()
-        .find(|entry| entry.ledger_seq == ledger)
-        .ok_or_else(|| anyhow::anyhow!("tx result entry {} not found in archive", ledger))?;
+        .find(|entry| entry.ledger_seq == ledger);
 
     println!();
     println!("Tx result set:");
-    print_tx_result_hash("local", &local_entry);
-    print_tx_result_hash("archive", &archive_entry);
+    match (&local_entry, &archive_entry) {
+        (Some(local), Some(archive)) => {
+            print_tx_result_hash("local", local);
+            print_tx_result_hash("archive", archive);
+        }
+        (Some(local), None) => {
+            print_tx_result_hash("local", local);
+            println!("  archive: (sparse)");
+        }
+        (None, Some(archive)) => {
+            println!("  local: (sparse)");
+            print_tx_result_hash("archive", archive);
+        }
+        (None, None) => {
+            println!("  local: (sparse)");
+            println!("  archive: (sparse)");
+        }
+    }
 
-    let local_results = &local_entry.tx_result_set.results;
-    let archive_results = &archive_entry.tx_result_set.results;
+    let diffs =
+        compare_optional_result_entries(local_entry.as_ref(), archive_entry.as_ref(), ledger)?;
+    for diff in &diffs {
+        println!("  {diff}");
+    }
+
+    Ok(())
+}
+
+/// Compares optional tx result entries, handling sparse (None) entries gracefully.
+///
+/// Returns a list of human-readable difference descriptions. An empty vec means
+/// the entries are equivalent (both present and identical, or both canonically absent).
+fn compare_optional_result_entries(
+    local: Option<&TransactionHistoryResultEntry>,
+    archive: Option<&TransactionHistoryResultEntry>,
+    ledger: u32,
+) -> anyhow::Result<Vec<String>> {
+    match (local, archive) {
+        (None, None) => {
+            // Both sparse — canonical empty ledger (catchup-populated DB + archive).
+            Ok(vec![format!(
+                "ledger {ledger}: no tx results (both sparse)"
+            )])
+        }
+        (Some(local_entry), None) => {
+            if local_entry.tx_result_set.results.is_empty() {
+                // Canonical: local populated via normal-close (stores empty entry),
+                // archive is sparse (omits empty ledgers).
+                Ok(vec![format!(
+                    "ledger {ledger}: no tx results (local entry empty, archive sparse)"
+                )])
+            } else {
+                // Genuine mismatch: local executed transactions but archive has no entry.
+                Ok(vec![format!(
+                    "MISMATCH: local has {} tx result(s) but archive entry is missing for ledger {ledger}",
+                    local_entry.tx_result_set.results.len()
+                )])
+            }
+        }
+        (None, Some(archive_entry)) => {
+            if archive_entry.tx_result_set.results.is_empty() {
+                // Non-canonical: archives omit empty entries rather than emitting them empty.
+                Ok(vec![format!(
+                    "ANOMALY: archive has empty tx result entry for ledger {ledger} (non-canonical; archives normally omit empty entries)"
+                )])
+            } else {
+                // Genuine mismatch: archive has results but local is sparse.
+                Ok(vec![format!(
+                    "MISMATCH: archive has {} tx result(s) but local entry is missing for ledger {ledger}",
+                    archive_entry.tx_result_set.results.len()
+                )])
+            }
+        }
+        (Some(local_entry), Some(archive_entry)) => {
+            compare_present_entries(local_entry, archive_entry)
+        }
+    }
+}
+
+/// Compares two present tx result entries transaction-by-transaction.
+///
+/// Returns descriptions of any differences found (count mismatch, per-tx divergence).
+fn compare_present_entries(
+    local: &TransactionHistoryResultEntry,
+    archive: &TransactionHistoryResultEntry,
+) -> anyhow::Result<Vec<String>> {
+    let mut diffs = Vec::new();
+    let local_results = &local.tx_result_set.results;
+    let archive_results = &archive.tx_result_set.results;
 
     if local_results.len() != archive_results.len() {
-        println!(
-            "  result count differs: local={}, archive={}",
+        diffs.push(format!(
+            "result count differs: local={}, archive={}",
             local_results.len(),
             archive_results.len()
-        );
+        ));
     }
 
     let count = local_results.len().min(archive_results.len());
     for i in 0..count {
-        let local_pair = &local_results[i];
-        let archive_pair = &archive_results[i];
-
-        let local_bytes = local_pair.to_xdr(stellar_xdr::curr::Limits::none())?;
-        let archive_bytes = archive_pair.to_xdr(stellar_xdr::curr::Limits::none())?;
+        let local_bytes = local_results[i].to_xdr(stellar_xdr::curr::Limits::none())?;
+        let archive_bytes = archive_results[i].to_xdr(stellar_xdr::curr::Limits::none())?;
         if local_bytes != archive_bytes {
-            let local_summary = format!("{:?}", local_pair.result.result);
-            let archive_summary = format!("{:?}", archive_pair.result.result);
-            println!(
-                "  tx[{}] mismatch: local fee={} result={} | archive fee={} result={}",
+            diffs.push(format!(
+                "tx[{}] mismatch: local fee={} result={:?} | archive fee={} result={:?}",
                 i,
-                local_pair.result.fee_charged,
-                local_summary,
-                archive_pair.result.fee_charged,
-                archive_summary,
-            );
+                local_results[i].result.fee_charged,
+                local_results[i].result.result,
+                archive_results[i].result.fee_charged,
+                archive_results[i].result.result,
+            ));
         }
     }
 
-    Ok(())
+    Ok(diffs)
 }
 
 /// Prints the hash of a transaction result set for comparison.
@@ -210,4 +285,117 @@ fn print_tx_result_hash(label: &str, entry: &TransactionHistoryResultEntry) {
         .unwrap_or_default();
     let hash = Hash256::hash(&bytes);
     println!("  {} hash: {}", label, hash.to_hex());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use stellar_xdr::curr::{
+        Hash, TransactionResult, TransactionResultExt, TransactionResultPair,
+        TransactionResultResult, TransactionResultSet, VecM,
+    };
+
+    /// Helper: create an empty TransactionHistoryResultEntry (no transactions).
+    fn empty_result_entry(ledger: u32) -> TransactionHistoryResultEntry {
+        TransactionHistoryResultEntry {
+            ledger_seq: ledger,
+            tx_result_set: TransactionResultSet {
+                results: VecM::default(),
+            },
+            ext: stellar_xdr::curr::TransactionHistoryResultEntryExt::V0,
+        }
+    }
+
+    /// Helper: create a TransactionHistoryResultEntry with one result pair.
+    fn non_empty_result_entry(ledger: u32, fee: i64) -> TransactionHistoryResultEntry {
+        let pair = TransactionResultPair {
+            transaction_hash: Hash([0u8; 32]),
+            result: TransactionResult {
+                fee_charged: fee,
+                result: TransactionResultResult::TxSuccess(VecM::default()),
+                ext: TransactionResultExt::V0,
+            },
+        };
+        TransactionHistoryResultEntry {
+            ledger_seq: ledger,
+            tx_result_set: TransactionResultSet {
+                results: vec![pair].try_into().unwrap(),
+            },
+            ext: stellar_xdr::curr::TransactionHistoryResultEntryExt::V0,
+        }
+    }
+
+    #[test]
+    fn test_both_sparse_empty_ledger() {
+        let diffs = compare_optional_result_entries(None, None, 100).unwrap();
+        assert_eq!(diffs.len(), 1);
+        assert!(diffs[0].contains("no tx results"));
+        assert!(diffs[0].contains("both sparse"));
+    }
+
+    #[test]
+    fn test_local_empty_archive_sparse() {
+        let local = empty_result_entry(100);
+        let diffs = compare_optional_result_entries(Some(&local), None, 100).unwrap();
+        assert_eq!(diffs.len(), 1);
+        assert!(diffs[0].contains("no tx results"));
+        assert!(diffs[0].contains("local entry empty"));
+        assert!(diffs[0].contains("archive sparse"));
+    }
+
+    #[test]
+    fn test_local_non_empty_archive_sparse_is_mismatch() {
+        let local = non_empty_result_entry(100, 200);
+        let diffs = compare_optional_result_entries(Some(&local), None, 100).unwrap();
+        assert_eq!(diffs.len(), 1);
+        assert!(diffs[0].contains("MISMATCH"));
+        assert!(diffs[0].contains("local has 1 tx result(s)"));
+    }
+
+    #[test]
+    fn test_local_sparse_archive_non_empty_is_mismatch() {
+        let archive = non_empty_result_entry(100, 300);
+        let diffs = compare_optional_result_entries(None, Some(&archive), 100).unwrap();
+        assert_eq!(diffs.len(), 1);
+        assert!(diffs[0].contains("MISMATCH"));
+        assert!(diffs[0].contains("archive has 1 tx result(s)"));
+    }
+
+    #[test]
+    fn test_local_sparse_archive_empty_is_anomaly() {
+        let archive = empty_result_entry(100);
+        let diffs = compare_optional_result_entries(None, Some(&archive), 100).unwrap();
+        assert_eq!(diffs.len(), 1);
+        assert!(diffs[0].contains("ANOMALY"));
+        assert!(diffs[0].contains("non-canonical"));
+    }
+
+    #[test]
+    fn test_both_present_identical() {
+        let local = non_empty_result_entry(100, 200);
+        let archive = non_empty_result_entry(100, 200);
+        let diffs = compare_optional_result_entries(Some(&local), Some(&archive), 100).unwrap();
+        assert!(diffs.is_empty());
+    }
+
+    #[test]
+    fn test_both_present_different_fee() {
+        let local = non_empty_result_entry(100, 200);
+        let archive = non_empty_result_entry(100, 300);
+        let diffs = compare_optional_result_entries(Some(&local), Some(&archive), 100).unwrap();
+        assert_eq!(diffs.len(), 1);
+        assert!(diffs[0].contains("tx[0] mismatch"));
+        assert!(diffs[0].contains("fee=200"));
+        assert!(diffs[0].contains("fee=300"));
+    }
+
+    #[test]
+    fn test_both_present_different_count() {
+        let local = non_empty_result_entry(100, 200);
+        let archive = empty_result_entry(100);
+        let diffs = compare_optional_result_entries(Some(&local), Some(&archive), 100).unwrap();
+        assert!(diffs.iter().any(|d| d.contains("result count differs")));
+        assert!(diffs.iter().any(|d| d.contains("local=1")));
+        assert!(diffs.iter().any(|d| d.contains("archive=0")));
+    }
 }
