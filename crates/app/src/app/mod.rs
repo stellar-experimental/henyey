@@ -1937,6 +1937,16 @@ impl App {
         self.herder.tx_queue().set_skip_fee_balance_check(skip);
     }
 
+    /// Return the SCP envelopes recorded for a given slot.
+    ///
+    /// Test-only: used by integration tests that need to inspect or replay
+    /// SCP envelopes (e.g., self-echo tests). Delegates to
+    /// `Herder::get_scp_envelopes`.
+    #[cfg(feature = "test-utils")]
+    pub fn get_scp_envelopes(&self, slot: u64) -> Vec<stellar_xdr::curr::ScpEnvelope> {
+        self.herder.get_scp_envelopes(slot)
+    }
+
     pub fn herder_stats(&self) -> HerderStats {
         self.herder.stats()
     }

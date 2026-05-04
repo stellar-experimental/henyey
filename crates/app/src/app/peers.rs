@@ -95,6 +95,25 @@ impl App {
         Ok(peers)
     }
 
+    /// Send a message to a specific peer via the overlay manager.
+    ///
+    /// Test-only: used for directed message injection in integration tests
+    /// (e.g., self-echo SCP tests). The overlay field stays `pub(crate)`;
+    /// this wrapper provides a narrow escape hatch.
+    #[cfg(feature = "test-utils")]
+    pub async fn try_send_to_peer(
+        &self,
+        peer_id: &PeerId,
+        message: stellar_xdr::curr::StellarMessage,
+    ) -> anyhow::Result<()> {
+        let overlay = self
+            .overlay()
+            .await
+            .ok_or_else(|| anyhow::anyhow!("overlay not available"))?;
+        overlay.try_send_to(peer_id, message)?;
+        Ok(())
+    }
+
     /// Maintain peer connections - reconnect if peer count drops too low.
     ///
     /// IMPORTANT: This function must NOT hold the overlay lock during connection

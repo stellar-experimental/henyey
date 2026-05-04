@@ -1190,3 +1190,107 @@ async fn test_pair_tcp_scp_messages_exercise_pump_scp_intake() {
         .await
         .expect("stop pair pump_scp_intake test nodes");
 }
+
+/// App-level self-echo test: proves that a node's own SCP envelope, echoed
+/// back by a peer, traverses the full `pump_scp_intake → pre-filter → verify
+/// → process_verified` pipeline and is correctly classified as
+/// `PostVerifyReason::SelfMessage`.
+///
+/// Coverage supplement to:
+/// - overlay-level `test_scp_self_echo_not_dropped_after_broadcast` (FloodGate only)
+/// - `test_pair_tcp_scp_messages_exercise_pump_scp_intake` (peer-originated only)
+///
+/// Regression context: #2317, #2364, #2374.
+#[tokio::test]
+async fn test_self_echo_scp_reaches_pump_scp_intake() {
+    use henyey_herder::scp_verify::PostVerifyReason;
+    use stellar_xdr::curr::{NodeId, StellarMessage};
+
+    let mut sim =
+        build_app_backed_topology(Topologies::pair(SimulationMode::OverTcp), 100, 1).await;
+
+    wait_for_app_operational(&sim, "node0", Duration::from_secs(10)).await;
+    wait_for_app_operational(&sim, "node1", Duration::from_secs(10)).await;
+
+    // Close ledgers so both nodes have SCP envelopes in memory.
+    manual_close_until(&sim, 5, 1, Duration::from_secs(30)).await;
+
+    let app_0 = sim.app("node0").unwrap();
+    let app_1 = sim.app("node1").unwrap();
+
+    // Derive node0's NodeId (matches herder's node_id_from_public_key).
+    let pk_0 = app_0.public_key();
+    let node0_id = NodeId(stellar_xdr::curr::PublicKey::from(&pk_0));
+
+    // Find an envelope authored by node0 from node1's SCP state.
+    // Node0's own SCP slot doesn't store self-authored envelopes (they're
+    // emitted directly, not via process_envelope). But node1 received them
+    // as peer messages, so node1's slot DOES have node0's envelopes.
+    let latest_slot = app_0
+        .latest_externalized_slot()
+        .expect("node0 must have externalized at least one slot");
+    let envelopes = app_1.get_scp_envelopes(latest_slot);
+    let self_envelope = envelopes
+        .into_iter()
+        .find(|e| e.statement.node_id == node0_id)
+        .expect("node1 must have received at least one SCP envelope from node0 in the latest slot");
+
+    // Derive node0's PeerId for directed send from node1.
+    let node0_peer_id = henyey_overlay::PeerId::from_bytes(*pk_0.as_bytes());
+
+    // Baseline SelfMessage counter before injection.
+    let baseline = app_0.info().scp_verify.pv_counters[PostVerifyReason::SelfMessage];
+
+    // Inject: node1 echoes node0's own envelope back to node0.
+    // Deadline-based retry in case the outbound channel is temporarily full.
+    let send_deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        match app_1
+            .try_send_to_peer(
+                &node0_peer_id,
+                StellarMessage::ScpMessage(self_envelope.clone()),
+            )
+            .await
+        {
+            Ok(()) => break,
+            Err(e) => {
+                if tokio::time::Instant::now() >= send_deadline {
+                    panic!("try_send_to_peer failed after 2s deadline: {e}");
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+    }
+
+    // Poll until SelfMessage counter increments (event-driven, not sleep-based).
+    let poll_result = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let current = app_0.info().scp_verify.pv_counters[PostVerifyReason::SelfMessage];
+            if current > baseline {
+                return current;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+
+    match poll_result {
+        Ok(observed) => {
+            assert!(
+                observed > baseline,
+                "SelfMessage counter must have incremented (baseline={baseline}, observed={observed})"
+            );
+        }
+        Err(_) => {
+            let final_val = app_0.info().scp_verify.pv_counters[PostVerifyReason::SelfMessage];
+            panic!(
+                "SelfMessage counter did not increment within 5s \
+                 (baseline={baseline}, final={final_val}, slot={latest_slot})"
+            );
+        }
+    }
+
+    sim.stop_all_nodes()
+        .await
+        .expect("stop self-echo test nodes");
+}
