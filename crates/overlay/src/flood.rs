@@ -282,6 +282,17 @@ impl FloodGate {
         self.seen.contains_key(message_hash)
     }
 
+    /// Removes a previously-seen message from the flood gate, allowing
+    /// it to be treated as new on re-delivery.
+    ///
+    /// Mirrors stellar-core's `Floodgate::forgetRecord(Hash const& h)`
+    /// (Floodgate.cpp:197-200). Called when a flood-tracked message is
+    /// discarded after initial recording — e.g., SCP envelopes rejected
+    /// by herder pre-filter or post-verify gate drift.
+    pub fn forget(&self, message_hash: &Hash256) {
+        self.seen.remove(message_hash);
+    }
+
     /// Returns current statistics about the flood gate.
     pub fn stats(&self) -> FloodGateStats {
         FloodGateStats {
@@ -622,5 +633,57 @@ mod tests {
             gate.record_seen(compute_message_hash(&tx), None, 1);
         }
         assert_eq!(gate.seen.len(), 1);
+    }
+
+    #[test]
+    fn test_flood_gate_forget_basic() {
+        let gate = FloodGate::new();
+        let hash = make_hash(1);
+
+        // Record, then forget — should_flood returns true again.
+        assert!(gate.record_seen(hash, None, 1));
+        assert!(!gate.should_flood(&hash));
+
+        gate.forget(&hash);
+        assert!(gate.should_flood(&hash));
+        assert!(!gate.has_seen(&hash));
+    }
+
+    #[test]
+    fn test_flood_gate_forget_nonexistent() {
+        let gate = FloodGate::new();
+        let hash = make_hash(42);
+
+        // Forgetting a hash that was never recorded is a no-op.
+        gate.forget(&hash);
+        assert!(gate.should_flood(&hash));
+    }
+
+    #[test]
+    fn test_flood_gate_forget_redelivery() {
+        let gate = FloodGate::new();
+        let hash = make_hash(1);
+        let peer_a = make_peer_id(1);
+        let peer_b = make_peer_id(2);
+        let peer_c = make_peer_id(3);
+        let all_peers = vec![peer_a.clone(), peer_b.clone(), peer_c.clone()];
+
+        // Peer A delivers the message.
+        assert!(gate.record_seen(hash, Some(peer_a.clone()), 1));
+        // Forward list excludes peer A.
+        let fwd = gate.get_forward_peers(&hash, &all_peers);
+        assert!(!fwd.contains(&peer_a));
+        assert!(fwd.contains(&peer_b));
+
+        // Forget the record (simulating herder discard).
+        gate.forget(&hash);
+
+        // Peer B re-delivers. FloodGate treats it as new.
+        assert!(gate.record_seen(hash, Some(peer_b.clone()), 1));
+        // Forward list now includes peer A (provenance reset).
+        let fwd = gate.get_forward_peers(&hash, &all_peers);
+        assert!(fwd.contains(&peer_a));
+        assert!(!fwd.contains(&peer_b));
+        assert!(fwd.contains(&peer_c));
     }
 }

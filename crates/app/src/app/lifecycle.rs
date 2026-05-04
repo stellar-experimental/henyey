@@ -9,6 +9,39 @@ pub(crate) fn query_rate_limit_window(close_duration: Duration) -> Duration {
     henyey_overlay::query_policy::query_rate_limit_window(close_duration)
 }
 
+/// Whether a post-verify SCP outcome requires removal of the corresponding
+/// FloodGate record, allowing re-delivery to be treated as new.
+///
+/// Mirrors stellar-core: Peer.cpp:1672-1678 calls `forgetFloodedMsg` when
+/// `recvSCPEnvelope` returns `ENVELOPE_STATUS_DISCARDED`.
+fn should_forget_flood_record(
+    state: henyey_herder::EnvelopeState,
+    reason: henyey_herder::scp_verify::PostVerifyReason,
+) -> bool {
+    use henyey_herder::scp_verify::PostVerifyReason as R;
+    use henyey_herder::EnvelopeState;
+
+    // Self-messages: stellar-core returns SKIPPED_SELF (not DISCARDED).
+    // Keep the flood record for relay accounting.
+    if matches!(reason, R::SelfMessage) {
+        return false;
+    }
+
+    // Deferred (henyey-specific closing gate): will be replayed after
+    // ledger_closed. Keep the flood record so relay tracking stays intact.
+    if matches!(state, EnvelopeState::Deferred) {
+        return false;
+    }
+
+    matches!(
+        state,
+        EnvelopeState::TooOld
+            | EnvelopeState::InvalidSignature
+            | EnvelopeState::Invalid
+            | EnvelopeState::Duplicate
+    )
+}
+
 impl App {
     /// Run the main event loop.
     ///
@@ -1818,6 +1851,11 @@ impl App {
         self.scp_verify_output_backlog
             .store(verified_rx.len() as u64, Ordering::Relaxed);
 
+        // Compute the FloodGate message hash BEFORE destructuring — the hash
+        // covers the full StellarMessage XDR, which is lost once we extract
+        // the inner ScpEnvelope.
+        let flood_msg_hash = henyey_overlay::compute_message_hash(&scp_msg.message);
+
         let envelope = match scp_msg.message {
             StellarMessage::ScpMessage(e) => e,
             other => {
@@ -1878,6 +1916,7 @@ impl App {
                     ) {
                         PreFilter::Accept(mut intake) => {
                             intake.peer_id = Some(from_peer);
+                            intake.flood_msg_hash = Some(flood_msg_hash);
                             // Insert into in-flight set AFTER successful dispatch.
                             // Pre-filter rejects do not poison the cache.
                             dedup_slot.commit();
@@ -1885,6 +1924,12 @@ impl App {
                         }
                         PreFilter::Reject(reason) => {
                             self.record_prefilter_reject(reason);
+                            // Pre-filter rejects are terminal — forget the
+                            // FloodGate record so a re-delivered copy is treated
+                            // as new (parity: Peer.cpp:1672-1678).
+                            if let Some(overlay) = self.overlay().await {
+                                overlay.forget_flooded_msg(&flood_msg_hash);
+                            }
                             // DedupSlot dropped without commit — no cache poisoning.
                             drop(permit);
                         }
@@ -1912,6 +1957,9 @@ impl App {
         let slot = ve.intake.slot;
         let tracking = self.herder.tracking_slot();
         let is_externalize = ve.intake.is_externalize;
+        // Extract the FloodGate message hash (if set by pump_scp_intake) before
+        // the VerifiedEnvelope is consumed by herder.process_verified().
+        let flood_msg_hash = ve.intake.flood_msg_hash;
 
         // Record verify latency (enqueue → post-verify dispatch) into the
         // poor-man's histogram (sum + count) so the average can be read
@@ -1972,6 +2020,15 @@ impl App {
             let node_id = ve.intake.envelope.statement.node_id.clone();
             let (envelope_result, reason) = self.herder.process_verified(ve);
             self.record_post_verify_reason(reason);
+            // Forget the FloodGate record when the outcome is DISCARDED
+            // (parity: Peer.cpp:1672-1678 forgetFloodedMsg).
+            if should_forget_flood_record(envelope_result, reason) {
+                if let Some(hash) = &flood_msg_hash {
+                    if let Some(overlay) = self.overlay().await {
+                        overlay.forget_flooded_msg(hash);
+                    }
+                }
+            }
             tracing::info!(
                 target: "henyey::envelope_path",
                 slot,
@@ -2019,6 +2076,16 @@ impl App {
 
         // Per-reason post-verify metric.
         self.record_post_verify_reason(reason);
+
+        // Forget the FloodGate record when the outcome is DISCARDED
+        // (parity: Peer.cpp:1672-1678 forgetFloodedMsg).
+        if should_forget_flood_record(envelope_result, reason) {
+            if let Some(hash) = &flood_msg_hash {
+                if let Some(overlay) = self.overlay().await {
+                    overlay.forget_flooded_msg(hash);
+                }
+            }
+        }
 
         // Track highest verified SCP slot from peers for recovery stall detection.
         // Only fires for Verdict::Ok envelopes (verify-rejected return at line 1995).
@@ -2264,6 +2331,7 @@ mod pump_tests {
                 is_externalize: false,
                 peer_id: None,
                 enqueue_at: Instant::now(),
+                flood_msg_hash: None,
             },
             verdict: Verdict::Ok,
         }
@@ -2623,5 +2691,79 @@ mod max_tx_size_tests {
 
         assert_eq!(atomic.load(Ordering::Relaxed), MAX_CLASSIC_TX_SIZE_BYTES);
         assert_eq!(increase, 0);
+    }
+}
+
+#[cfg(test)]
+mod forget_flood_record_tests {
+    use super::should_forget_flood_record;
+    use henyey_herder::scp_verify::PostVerifyReason as R;
+    use henyey_herder::EnvelopeState;
+
+    /// Every (EnvelopeState, PostVerifyReason) combination that maps to
+    /// stellar-core's ENVELOPE_STATUS_DISCARDED should return true.
+    #[test]
+    fn test_forget_cases() {
+        // Terminal reject states — always forget (unless SelfMessage / Deferred).
+        for state in [
+            EnvelopeState::TooOld,
+            EnvelopeState::InvalidSignature,
+            EnvelopeState::Invalid,
+            EnvelopeState::Duplicate,
+        ] {
+            for reason in R::ALL {
+                if matches!(reason, R::SelfMessage) {
+                    continue;
+                }
+                assert!(
+                    should_forget_flood_record(state, reason),
+                    "expected forget for ({state:?}, {reason:?})"
+                );
+            }
+        }
+    }
+
+    /// Envelopes that should NOT cause forget: Valid, Pending, Fetching, Deferred.
+    #[test]
+    fn test_no_forget_valid_pending_fetching() {
+        for state in [
+            EnvelopeState::Valid,
+            EnvelopeState::Pending,
+            EnvelopeState::Fetching,
+        ] {
+            for reason in R::ALL {
+                assert!(
+                    !should_forget_flood_record(state, reason),
+                    "expected no forget for ({state:?}, {reason:?})"
+                );
+            }
+        }
+    }
+
+    /// Deferred is a henyey-specific closing gate — never forget.
+    #[test]
+    fn test_no_forget_deferred() {
+        for reason in R::ALL {
+            assert!(
+                !should_forget_flood_record(EnvelopeState::Deferred, reason),
+                "expected no forget for (Deferred, {reason:?})"
+            );
+        }
+    }
+
+    /// SelfMessage reason — never forget regardless of state.
+    #[test]
+    fn test_no_forget_self_message() {
+        for state in [
+            EnvelopeState::TooOld,
+            EnvelopeState::InvalidSignature,
+            EnvelopeState::Invalid,
+            EnvelopeState::Duplicate,
+        ] {
+            assert!(
+                !should_forget_flood_record(state, R::SelfMessage),
+                "expected no forget for ({state:?}, SelfMessage)"
+            );
+        }
     }
 }

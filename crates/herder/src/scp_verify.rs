@@ -165,6 +165,10 @@ pub struct PipelinedIntake {
     pub peer_id: Option<henyey_overlay::PeerId>,
     /// Enqueue timestamp for latency histograms.
     pub enqueue_at: Instant,
+    /// BLAKE2 hash of the full `StellarMessage::ScpMessage(envelope)`.
+    /// FloodGate key for `forget_flooded_msg` calls on discard.
+    /// Set by `pump_scp_intake`; `None` for non-overlay paths (catchup, tests).
+    pub flood_msg_hash: Option<henyey_common::Hash256>,
 }
 
 /// Result of the pre-filter stage that runs on the event loop.
@@ -576,6 +580,7 @@ mod tests {
             is_externalize: false,
             peer_id: None,
             enqueue_at: Instant::now(),
+            flood_msg_hash: None,
         };
         assert_eq!(h.state(), VerifierState::Running);
         h.tx.blocking_send(intake).unwrap();

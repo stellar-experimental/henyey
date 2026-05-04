@@ -1212,6 +1212,17 @@ impl OverlayManager {
         self.flood_gate.stats()
     }
 
+    /// Remove a flood-tracked message, allowing re-delivery to be treated
+    /// as new.
+    ///
+    /// Mirrors stellar-core's `OverlayManagerImpl::forgetFloodedMsg`
+    /// (OverlayManagerImpl.cpp:1264-1268). Called from the app layer when
+    /// an SCP envelope is discarded after `record_seen` already recorded
+    /// the message hash.
+    pub fn forget_flooded_msg(&self, message_hash: &henyey_common::Hash256) {
+        self.flood_gate.forget(message_hash);
+    }
+
     /// Set the SCP queue callback for intelligent queue trimming.
     ///
     /// When set, the overlay will use herder state to make smart decisions

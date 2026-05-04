@@ -1194,6 +1194,7 @@ impl Herder {
             is_externalize,
             peer_id: None,
             enqueue_at: Instant::now(),
+            flood_msg_hash: None,
         };
         self.process_verified(VerifiedEnvelope {
             intake,
@@ -1255,6 +1256,7 @@ impl Herder {
             is_externalize,
             peer_id: None,
             enqueue_at: Instant::now(),
+            flood_msg_hash: None,
         };
         self.process_verified(VerifiedEnvelope {
             intake,
@@ -1370,6 +1372,7 @@ impl Herder {
             is_externalize,
             peer_id: None,
             enqueue_at: Instant::now(),
+            flood_msg_hash: None,
         })
     }
 
@@ -7401,6 +7404,7 @@ mod scp_pipeline_tests {
             is_externalize: false,
             peer_id: None,
             enqueue_at: std::time::Instant::now(),
+            flood_msg_hash: None,
         };
         let (state, reason) = herder.process_verified(VerifiedEnvelope {
             intake,
@@ -7421,6 +7425,7 @@ mod scp_pipeline_tests {
             is_externalize: false,
             peer_id: None,
             enqueue_at: std::time::Instant::now(),
+            flood_msg_hash: None,
         };
         let (state, reason) = herder.process_verified(VerifiedEnvelope {
             intake,
@@ -7460,6 +7465,7 @@ mod scp_pipeline_tests {
             is_externalize: false,
             peer_id: None,
             enqueue_at: std::time::Instant::now(),
+            flood_msg_hash: None,
         };
         let (state, reason) = herder.process_verified(VerifiedEnvelope {
             intake,
@@ -7498,6 +7504,7 @@ mod scp_pipeline_tests {
             is_externalize: false,
             peer_id: None,
             enqueue_at: std::time::Instant::now(),
+            flood_msg_hash: None,
         };
         let (state, reason) = herder.process_verified(VerifiedEnvelope {
             intake,
@@ -7566,6 +7573,7 @@ mod scp_pipeline_tests {
             is_externalize: false,
             peer_id: None,
             enqueue_at: std::time::Instant::now(),
+            flood_msg_hash: None,
         };
         h.tx.blocking_send(intake).expect("send");
 
@@ -7611,6 +7619,7 @@ mod scp_pipeline_tests {
             is_externalize: false,
             peer_id: None,
             enqueue_at: std::time::Instant::now(),
+            flood_msg_hash: None,
         };
         h.tx.blocking_send(intake).expect("send");
 
@@ -7652,6 +7661,7 @@ mod scp_pipeline_tests {
                 is_externalize: false,
                 peer_id: None,
                 enqueue_at: std::time::Instant::now(),
+                flood_msg_hash: None,
             })
             .expect("send");
         }
