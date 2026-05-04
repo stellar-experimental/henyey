@@ -337,7 +337,7 @@ impl FlowControlCapacity {
     fn lock_outbound_capacity(&mut self, msg: &StellarMessage) {
         if is_flow_controlled_message(msg) {
             let count = self.get_msg_resource_count(msg);
-            debug_assert!(self.outbound_capacity >= count);
+            assert!(self.outbound_capacity >= count);
             self.outbound_capacity = self.outbound_capacity.saturating_sub(count);
         }
     }
@@ -546,12 +546,6 @@ impl FlowControl {
             dropped_adverts: AtomicU64::new(0),
             dropped_demands: AtomicU64::new(0),
         }
-    }
-
-    /// Check if we have capacity to send a message to this peer.
-    fn has_outbound_capacity(state: &FlowControlState, msg: &StellarMessage) -> bool {
-        state.message_capacity.has_outbound_capacity(msg)
-            && state.byte_capacity.has_outbound_capacity(msg)
     }
 
     fn peer_label(state: &FlowControlState) -> String {
@@ -843,35 +837,31 @@ impl FlowControl {
     pub fn get_next_batch_to_send(&self) -> Vec<QueuedOutboundMessage> {
         let mut state = self.state.lock().unwrap();
         let mut batch = Vec::new();
-        let mut to_mark: Vec<(usize, usize, StellarMessage)> = Vec::new();
-        let mut out_of_capacity = false;
 
-        'outer: for queue_idx in 0..state.outbound_queues.len() {
+        // Mirrors stellar-core FlowControl.cpp:172-208.
+        // For each priority queue (highest priority first): check capacity
+        // before being_sent, lock capacity inline, and break only the inner
+        // loop so lower-priority queues are still processed.
+        for queue_idx in 0..state.outbound_queues.len() {
             for msg_idx in 0..state.outbound_queues[queue_idx].len() {
-                let queued_msg = &state.outbound_queues[queue_idx][msg_idx];
-                if queued_msg.being_sent {
+                let msg = state.outbound_queues[queue_idx][msg_idx].message.clone();
+
+                if !state.message_capacity.has_outbound_capacity(&msg)
+                    || !state.byte_capacity.has_outbound_capacity(&msg)
+                {
+                    state.no_outbound_capacity = Some(Instant::now());
+                    break;
+                }
+
+                if state.outbound_queues[queue_idx][msg_idx].being_sent {
                     continue;
                 }
 
-                if !Self::has_outbound_capacity(&state, &queued_msg.message) {
-                    out_of_capacity = true;
-                    break 'outer;
-                }
-
-                to_mark.push((queue_idx, msg_idx, queued_msg.message.clone()));
-                batch.push(queued_msg.clone());
+                batch.push(state.outbound_queues[queue_idx][msg_idx].clone());
+                state.outbound_queues[queue_idx][msg_idx].being_sent = true;
+                state.message_capacity.lock_outbound_capacity(&msg);
+                state.byte_capacity.lock_outbound_capacity(&msg);
             }
-        }
-
-        if out_of_capacity {
-            state.no_outbound_capacity = Some(Instant::now());
-        }
-
-        // Mark messages as being sent and lock capacity
-        for (queue_idx, msg_idx, msg) in to_mark {
-            state.outbound_queues[queue_idx][msg_idx].being_sent = true;
-            state.message_capacity.lock_outbound_capacity(&msg);
-            state.byte_capacity.lock_outbound_capacity(&msg);
         }
 
         trace!("Prepared batch of {} messages to send", batch.len());
@@ -1905,6 +1895,182 @@ mod tests {
         assert_eq!(
             before.local_flood_bytes_capacity, after.local_flood_bytes_capacity,
             "AUDIT-H9: byte flood capacity must not leak when message capacity check fails"
+        );
+    }
+
+    // ── AUDIT-227: get_next_batch_to_send parity fixes ──────────────────
+
+    #[test]
+    fn test_priority_starvation_fix() {
+        // Bug 1: break 'outer blocked lower-priority queues when a high-priority
+        // message didn't fit. After fix, lower-priority queues are still processed.
+        let fc = FlowControl::default();
+
+        let scp = make_scp_message();
+        let tx = make_tx_message();
+        let scp_size = msg_body_size(&scp);
+        let tx_size = msg_body_size(&tx);
+
+        // Grant capacity: enough for one TX but NOT enough for the SCP message.
+        // Message capacity is generous; byte capacity is the limiting factor.
+        assert!(
+            tx_size < scp_size,
+            "test requires tx ({tx_size}) < scp ({scp_size})"
+        );
+        let send_more = StellarMessage::SendMoreExtended(SendMoreExtended {
+            num_messages: 10,
+            num_bytes: (tx_size + 1) as u32,
+        });
+        fc.maybe_release_capacity(&send_more);
+
+        // Enqueue: SCP in queue 0, TX in queue 1
+        fc.add_msg_and_maybe_trim_queue(scp.clone());
+        fc.add_msg_and_maybe_trim_queue(tx.clone());
+
+        let batch = fc.get_next_batch_to_send();
+
+        // TX should be in the batch (queue 1 processed despite queue 0 blocking)
+        assert_eq!(batch.len(), 1, "expected 1 message in batch (the TX)");
+        assert!(
+            matches!(&batch[0].message, StellarMessage::Transaction(_)),
+            "expected TX message in batch, got SCP"
+        );
+
+        // no_outbound_capacity should be set (SCP queue triggered it)
+        assert!(
+            fc.no_outbound_capacity_timeout(0),
+            "no_outbound_capacity should be set after SCP queue blocked"
+        );
+
+        // SCP should still be in its queue
+        let stats = fc.get_stats();
+        assert_eq!(stats.scp_queue_size, 1, "SCP message should remain queued");
+    }
+
+    #[test]
+    fn test_cumulative_byte_capacity() {
+        // Bug 2: deferred locking let too many messages into the batch.
+        // After fix, inline locking ensures cumulative accounting is correct.
+        let fc = FlowControl::default();
+
+        let tx = make_tx_message();
+        let tx_size = msg_body_size(&tx);
+
+        // Grant exactly 2x the TX byte size, and enough message capacity.
+        let send_more = StellarMessage::SendMoreExtended(SendMoreExtended {
+            num_messages: 10,
+            num_bytes: (tx_size * 2) as u32,
+        });
+        fc.maybe_release_capacity(&send_more);
+
+        // Enqueue 3 identical TX messages
+        fc.add_msg_and_maybe_trim_queue(tx.clone());
+        fc.add_msg_and_maybe_trim_queue(tx.clone());
+        fc.add_msg_and_maybe_trim_queue(tx.clone());
+
+        let batch = fc.get_next_batch_to_send();
+
+        // Only 2 should fit (inline locking consumes capacity after each)
+        assert_eq!(
+            batch.len(),
+            2,
+            "expected 2 messages (capacity for 2x tx_size = {})",
+            tx_size * 2
+        );
+
+        // no_outbound_capacity should be set (3rd message didn't fit)
+        assert!(
+            fc.no_outbound_capacity_timeout(0),
+            "no_outbound_capacity should be set after 3rd message blocked"
+        );
+
+        // 1 message should remain in queue
+        let stats = fc.get_stats();
+        assert_eq!(
+            stats.tx_queue_size, 3,
+            "all 3 still in queue (2 being_sent)"
+        );
+    }
+
+    #[test]
+    fn test_cumulative_message_capacity() {
+        // Test message-count exhaustion (not just byte exhaustion).
+        let fc = FlowControl::default();
+
+        let tx = make_tx_message();
+        let tx_size = msg_body_size(&tx);
+
+        // Grant 2 message slots but ample byte capacity.
+        let send_more = StellarMessage::SendMoreExtended(SendMoreExtended {
+            num_messages: 2,
+            num_bytes: (tx_size * 10) as u32,
+        });
+        fc.maybe_release_capacity(&send_more);
+
+        // Enqueue 3 TX messages
+        fc.add_msg_and_maybe_trim_queue(tx.clone());
+        fc.add_msg_and_maybe_trim_queue(tx.clone());
+        fc.add_msg_and_maybe_trim_queue(tx.clone());
+
+        let batch = fc.get_next_batch_to_send();
+
+        // Only 2 should fit (message-count capacity exhausted)
+        assert_eq!(batch.len(), 2, "expected 2 messages (message capacity = 2)");
+
+        // no_outbound_capacity should be set
+        assert!(
+            fc.no_outbound_capacity_timeout(0),
+            "no_outbound_capacity should be set after message capacity exhausted"
+        );
+    }
+
+    #[test]
+    fn test_being_sent_head_of_line_mixed_sizes() {
+        // Bug 3: being_sent check before capacity check let smaller messages
+        // behind a large being_sent head slip through. After fix, capacity check
+        // fires first and breaks the queue.
+        let fc = FlowControl::default();
+
+        let scp = make_scp_message();
+        let tx = make_tx_message();
+        let scp_size = msg_body_size(&scp);
+        let tx_size = msg_body_size(&tx);
+
+        // Phase 1: Grant exactly enough byte capacity for both messages.
+        let send_more = StellarMessage::SendMoreExtended(SendMoreExtended {
+            num_messages: 10,
+            num_bytes: (scp_size + tx_size) as u32,
+        });
+        fc.maybe_release_capacity(&send_more);
+
+        // Enqueue SCP (queue 0) and TX (queue 1)
+        fc.add_msg_and_maybe_trim_queue(scp.clone());
+        fc.add_msg_and_maybe_trim_queue(tx.clone());
+
+        let batch1 = fc.get_next_batch_to_send();
+        assert_eq!(batch1.len(), 2, "phase 1: both messages should be batched");
+
+        // Phase 2: No additional capacity granted. Remaining byte capacity = 0.
+        // Both messages are being_sent at the head of their queues.
+        let batch2 = fc.get_next_batch_to_send();
+
+        // With correct ordering (capacity before being_sent):
+        // Queue 0: SCP head → capacity check (0 >= scp_size) → false → break
+        // Queue 1: TX head → capacity check (0 >= tx_size) → false → break
+        // With old ordering (being_sent before capacity):
+        // Queue 0: SCP head → being_sent → skip → no more msgs → no capacity set
+        // Queue 1: TX head → being_sent → skip → no more msgs → no capacity set
+        assert_eq!(
+            batch2.len(),
+            0,
+            "phase 2: being_sent messages should not be re-batched"
+        );
+
+        // no_outbound_capacity should be set because capacity check fires
+        // before being_sent skip (new ordering matches stellar-core)
+        assert!(
+            fc.no_outbound_capacity_timeout(0),
+            "no_outbound_capacity should be set from capacity check on being_sent head"
         );
     }
 }
