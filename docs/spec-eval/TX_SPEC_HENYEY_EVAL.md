@@ -136,8 +136,8 @@ The crate supports the two-phase ledger model (classic then Soroban), fee/seqnum
 
 | Requirement | Status | Evidence |
 |-------------|--------|----------|
-| Time bounds (minTime, maxTime) → `txTOO_EARLY` / `txTOO_LATE` | ✅ | `validate_time_bounds()` |
-| Ledger bounds @version(≥19) → `txTOO_EARLY` / `txTOO_LATE` | ✅ | `validate_ledger_bounds()` |
+| Time bounds (minTime, maxTime) → `txTOO_EARLY` / `txTOO_LATE` | ✅ | `is_too_early()` / `is_too_late()` |
+| Ledger bounds @version(≥19) → `txTOO_EARLY` / `txTOO_LATE` | ✅ | `is_too_early()` / `is_too_late()` |
 | Minimum fee ≥ baseFee × numOps → `txINSUFFICIENT_FEE` | ✅ | `validate_fee()` |
 
 #### Source Account Validation (§4.4)

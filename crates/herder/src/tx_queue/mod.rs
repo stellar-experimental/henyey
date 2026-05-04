@@ -212,8 +212,8 @@ pub struct TxQueueConfig {
     pub min_fee_per_op: u32,
     /// Whether to validate signatures before queueing.
     pub validate_signatures: bool,
-    /// Whether to validate time bounds before queueing.
-    pub validate_time_bounds: bool,
+    /// Whether to validate time/ledger bounds before queueing.
+    pub validate_bounds: bool,
     /// Network ID for signature validation.
     pub network_id: NetworkId,
     /// Optional limit for DEX operation counts within a tx set.
@@ -270,7 +270,7 @@ impl Default for TxQueueConfig {
             max_age_secs: DEFAULT_MAX_AGE_SECS,
             min_fee_per_op: DEFAULT_MIN_FEE_PER_OP,
             validate_signatures: true,
-            validate_time_bounds: true,
+            validate_bounds: true,
             network_id: NetworkId::testnet(),
             max_dex_ops: None,
             max_classic_bytes: Some(MAX_CLASSIC_BYTE_ALLOWANCE),
@@ -1447,8 +1447,8 @@ impl TransactionQueue {
         envelope: &TransactionEnvelope,
     ) -> std::result::Result<(), henyey_tx::TxResultCode> {
         use henyey_tx::{
-            validate_ledger_bounds, validate_signatures, validate_time_bounds, LedgerContext,
-            TransactionFrame, TxResultCode, ValidationError,
+            is_too_early, is_too_late, validate_signatures, LedgerContext, TransactionFrame,
+            TxResultCode,
         };
 
         let frame =
@@ -1472,7 +1472,7 @@ impl TransactionQueue {
             return Err(stellar_xdr::curr::TransactionResultCode::TxSorobanInvalid);
         }
 
-        // Build ledger context once for time-bound and signature validation.
+        // Build ledger context once for bounds and signature validation.
         let ledger_ctx = LedgerContext::new(
             ctx.ledger_seq,
             ctx.close_time,
@@ -1482,27 +1482,16 @@ impl TransactionQueue {
             self.config.network_id,
         );
 
-        // Validate time bounds if enabled.
-        // Parity: stellar-core TransactionQueue::tryAdd uses
-        // getUpperBoundCloseTimeOffset(app, closeTime) for the max_time check,
-        // which accounts for drift since LCL + expected close time * 2.
-        if self.config.validate_time_bounds {
-            // Check against LCL close time (no offset): catches min_time too
-            // early and max_time already expired.
-            match validate_time_bounds(&frame, &ledger_ctx) {
-                Err(ValidationError::TooEarly { .. }) => {
-                    return Err(TxResultCode::TxTooEarly);
-                }
-                Err(ValidationError::TooLate { .. }) => {
-                    return Err(TxResultCode::TxTooLate);
-                }
-                Err(_) => {
-                    return Err(TxResultCode::TxTooEarly);
-                }
-                Ok(()) => {}
+        // Validate time/ledger bounds if enabled.
+        // Parity: stellar-core TransactionQueue::tryAdd uses isTooEarly then isTooLate
+        // with getUpperBoundCloseTimeOffset for the "too late" check.
+        if self.config.validate_bounds {
+            // Combined "too early" check: minTime OR minLedger
+            if is_too_early(&frame, &ledger_ctx).is_err() {
+                return Err(TxResultCode::TxTooEarly);
             }
 
-            // For max_time (too late) check: add upper bound offset.
+            // For "too late" check: add upper bound offset to close time.
             // upperBound = expected_close_time * EXPECTED_CLOSE_TIME_MULT + drift
             // where drift = max(0, now - lcl_close_time).
             let now = std::time::SystemTime::now()
@@ -1522,16 +1511,9 @@ impl TransactionQueue {
                 ctx.protocol_version,
                 self.config.network_id,
             );
-            if validate_time_bounds(&frame, &upper_ctx).is_err() {
+            // Combined "too late" check: maxTime OR maxLedger
+            if is_too_late(&frame, &upper_ctx).is_err() {
                 return Err(TxResultCode::TxTooLate);
-            }
-
-            if let Err(e) = validate_ledger_bounds(&frame, &ledger_ctx) {
-                return Err(match e {
-                    ValidationError::LedgerBoundsTooEarly { .. } => TxResultCode::TxTooEarly,
-                    ValidationError::LedgerBoundsTooLate { .. } => TxResultCode::TxTooLate,
-                    _ => TxResultCode::TxTooEarly,
-                });
             }
         }
 
@@ -5966,7 +5948,7 @@ mod tests {
 
         let config = TxQueueConfig {
             validate_signatures: false,
-            validate_time_bounds: true,
+            validate_bounds: true,
             expected_ledger_close_secs: expected_close_secs,
             ..Default::default()
         };
@@ -6033,7 +6015,7 @@ mod tests {
         let lcl_close_time: u64 = 1_700_000_000;
         let config = TxQueueConfig {
             validate_signatures: false,
-            validate_time_bounds: true,
+            validate_bounds: true,
             expected_ledger_close_secs: 5,
             ..Default::default()
         };
@@ -6112,7 +6094,7 @@ mod tests {
 
         let config = TxQueueConfig {
             validate_signatures: false,
-            validate_time_bounds: true,
+            validate_bounds: true,
             expected_ledger_close_secs: 5, // Static config says 5s
             ..Default::default()
         };
@@ -6177,7 +6159,7 @@ mod tests {
     fn test_is_filtered_empty_config() {
         let config = TxQueueConfig {
             validate_signatures: false,
-            validate_time_bounds: false,
+            validate_bounds: false,
             filtered_operation_types: HashSet::new(), // No filters
             ..Default::default()
         };
@@ -6197,7 +6179,7 @@ mod tests {
 
         let config = TxQueueConfig {
             validate_signatures: false,
-            validate_time_bounds: false,
+            validate_bounds: false,
             filtered_operation_types: filtered,
             ..Default::default()
         };
@@ -6217,7 +6199,7 @@ mod tests {
 
         let config = TxQueueConfig {
             validate_signatures: false,
-            validate_time_bounds: false,
+            validate_bounds: false,
             filtered_operation_types: filtered,
             ..Default::default()
         };
@@ -6237,7 +6219,7 @@ mod tests {
 
         let config = TxQueueConfig {
             validate_signatures: false,
-            validate_time_bounds: false,
+            validate_bounds: false,
             filtered_operation_types: filtered,
             ..Default::default()
         };
@@ -6259,7 +6241,7 @@ mod tests {
     fn test_try_add_lower_seq_returns_bad_seq_not_invalid_none() {
         let config = TxQueueConfig {
             validate_signatures: false,
-            validate_time_bounds: false,
+            validate_bounds: false,
             ..Default::default()
         };
         let queue = TransactionQueue::new(config);
@@ -6290,7 +6272,7 @@ mod tests {
 
         let config = TxQueueConfig {
             validate_signatures: false,
-            validate_time_bounds: false,
+            validate_bounds: false,
             filtered_operation_types: filtered,
             ..Default::default()
         };
@@ -6311,7 +6293,7 @@ mod tests {
 
         let config = TxQueueConfig {
             validate_signatures: false,
-            validate_time_bounds: false,
+            validate_bounds: false,
             filtered_operation_types: filtered,
             ..Default::default()
         };
@@ -6443,7 +6425,7 @@ mod tests {
         let config = TxQueueConfig {
             max_size: 2,
             validate_signatures: false,
-            validate_time_bounds: false,
+            validate_bounds: false,
             ..Default::default()
         };
         let queue = TransactionQueue::new(config);
@@ -6469,7 +6451,7 @@ mod tests {
         let config = TxQueueConfig {
             max_queue_soroban_resources: Some(Resource::new(vec![10])),
             validate_signatures: false,
-            validate_time_bounds: false,
+            validate_bounds: false,
             ..Default::default()
         };
         let queue = TransactionQueue::new(config);
@@ -8237,7 +8219,7 @@ mod resource_limit_parity_tests {
             soroban_phase_min_stage_count: min_stage,
             soroban_phase_max_stage_count: max_stage,
             validate_signatures: false,
-            validate_time_bounds: false,
+            validate_bounds: false,
             max_soroban_bytes: None,
             ..Default::default()
         };

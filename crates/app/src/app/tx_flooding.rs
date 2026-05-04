@@ -1485,7 +1485,7 @@ mod tests {
     fn test_queue_config() -> TxQueueConfig {
         TxQueueConfig {
             validate_signatures: false,
-            validate_time_bounds: false,
+            validate_bounds: false,
             max_dex_ops: Some(1000),
             ..Default::default()
         }

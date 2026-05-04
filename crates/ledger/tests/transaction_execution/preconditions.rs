@@ -1326,6 +1326,105 @@ fn test_execute_transaction_ledger_bounds_equality_is_too_late() {
 }
 
 // =============================================================================
+// AUDIT-238 follow-up (#2272): Combined isTooEarly/isTooLate ordering.
+//
+// When both time-max and ledger-min are violated simultaneously, the result
+// must be TxTooEarly (ledger min checked via is_too_early before time max
+// checked via is_too_late), matching stellar-core's combined isTooEarly().
+// =============================================================================
+
+/// Regression test for #2272: time max violated + ledger min violated → TxTooEarly.
+///
+/// stellar-core's isTooEarly() checks time-min then ledger-min. If ledger-min
+/// is violated, it returns TxTooEarly regardless of whether time-max is also
+/// violated. The old henyey code would return TxTooLate because it checked
+/// time bounds (min then max) before ledger bounds.
+#[test]
+fn test_combined_bounds_ledger_too_early_wins_over_time_too_late() {
+    let secret = SecretKey::from_seed(&[42u8; 32]);
+    let account_id: AccountId = (&secret.public_key()).into();
+
+    let (key, entry) = create_account_entry(account_id.clone(), 1, 10_000_000);
+    let snapshot = SnapshotBuilder::new(1)
+        .add_entry(key, entry)
+        .build_with_default_header();
+    let snapshot = SnapshotHandle::new(snapshot);
+
+    let destination = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([2u8; 32])));
+    let operation = Operation {
+        source_account: None,
+        body: OperationBody::CreateAccount(CreateAccountOp {
+            destination,
+            starting_balance: 1_000_000,
+        }),
+    };
+
+    // Time bounds: min_time = 100, max_time = 500
+    // Ledger bounds: min_ledger = 200, max_ledger = 0 (no max)
+    // Context: close_time = 1000 (time-max violated), ledger_seq = 100 (ledger-min violated)
+    //
+    // stellar-core: isTooEarly checks time-min (100 <= 1000, ok) then ledger-min (200 > 100, fail)
+    //   → returns txTOO_EARLY
+    // Old henyey: validate_time_bounds checks min (ok) then max (500 < 1000, fail)
+    //   → returns txTOO_LATE (WRONG)
+    let preconditions = Preconditions::V2(PreconditionsV2 {
+        time_bounds: Some(TimeBounds {
+            min_time: TimePoint(100),
+            max_time: TimePoint(500),
+        }),
+        ledger_bounds: Some(LedgerBounds {
+            min_ledger: 200,
+            max_ledger: 0,
+        }),
+        min_seq_num: None,
+        min_seq_age: Duration(0),
+        min_seq_ledger_gap: 0,
+        extra_signers: VecM::default(),
+    });
+
+    let tx = Transaction {
+        source_account: MuxedAccount::Ed25519(Uint256(*secret.public_key().as_bytes())),
+        fee: 100,
+        seq_num: SequenceNumber(2),
+        cond: preconditions,
+        memo: Memo::None,
+        operations: vec![operation].try_into().unwrap(),
+        ext: TransactionExt::V0,
+    };
+
+    let mut envelope = TransactionEnvelope::Tx(TransactionV1Envelope {
+        tx,
+        signatures: VecM::default(),
+    });
+
+    let network_id = NetworkId::testnet();
+    let decorated = sign_envelope(&envelope, &secret, &network_id);
+    if let TransactionEnvelope::Tx(ref mut env) = envelope {
+        env.signatures = vec![decorated].try_into().unwrap();
+    }
+
+    // ledger_seq=100, close_time=1000
+    let context = henyey_tx::LedgerContext::new(100, 1_000, 100, 5_000_000, 25, network_id);
+    let mut executor = TransactionExecutor::new(
+        &context,
+        0,
+        SorobanConfig::default(),
+        ClassicEventConfig::default(),
+    );
+
+    let result = executor
+        .execute_transaction(&snapshot, &envelope, 100, None)
+        .expect("execute");
+
+    assert_eq!(
+        result.failure,
+        Some(ExecutionFailure::TxTooEarly),
+        "When ledger-min is violated AND time-max is violated, \
+         result must be TxTooEarly (not TxTooLate) — matches stellar-core isTooEarly()"
+    );
+}
+
+// =============================================================================
 // AUDIT-238: Validation ordering regression tests.
 //
 // These tests verify that when a transaction fails multiple precondition checks

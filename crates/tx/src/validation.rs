@@ -480,30 +480,67 @@ pub fn validate_fee(
     Ok(())
 }
 
-/// Validate time bounds.
-pub fn validate_time_bounds(
+/// Combined "too early" check matching stellar-core's `isTooEarly()`.
+///
+/// Returns an error if `minTime > closeTime` OR `minLedger > ledgerSeq`.
+/// Parity: TransactionFrame.cpp:1177-1198 — checks time min first, then ledger min.
+pub fn is_too_early(
     frame: &TransactionFrame,
     context: &LedgerContext,
 ) -> std::result::Result<(), ValidationError> {
+    // Check time min bound
     let time_bounds = match frame.preconditions() {
-        Preconditions::None => return Ok(()),
+        Preconditions::None => None,
         Preconditions::Time(tb) => Some(tb),
         Preconditions::V2(cond) => cond.time_bounds,
     };
 
     if let Some(tb) = time_bounds {
         let min_time: u64 = tb.min_time.into();
-        let max_time: u64 = tb.max_time.into();
-
-        // Check min time
         if min_time > 0 && context.close_time < min_time {
             return Err(ValidationError::TooEarly {
                 min_time,
                 ledger_time: context.close_time,
             });
         }
+    }
 
-        // Check max time (0 means no limit)
+    // Check ledger min bound
+    let ledger_bounds = match frame.preconditions() {
+        Preconditions::None | Preconditions::Time(_) => None,
+        Preconditions::V2(cond) => cond.ledger_bounds,
+    };
+
+    if let Some(lb) = ledger_bounds {
+        if lb.min_ledger > 0 && context.sequence < lb.min_ledger {
+            return Err(ValidationError::LedgerBoundsTooEarly {
+                min_ledger: lb.min_ledger,
+                current: context.sequence,
+            });
+        }
+    }
+
+    Ok(())
+}
+
+/// Combined "too late" check matching stellar-core's `isTooLate()`.
+///
+/// Returns an error if `maxTime < closeTime` OR `maxLedger <= ledgerSeq`.
+/// Parity: TransactionFrame.cpp:1202-1228 — checks time max first, then ledger max.
+pub fn is_too_late(
+    frame: &TransactionFrame,
+    context: &LedgerContext,
+) -> std::result::Result<(), ValidationError> {
+    // Check time max bound
+    let time_bounds = match frame.preconditions() {
+        Preconditions::None => None,
+        Preconditions::Time(tb) => Some(tb),
+        Preconditions::V2(cond) => cond.time_bounds,
+    };
+
+    if let Some(tb) = time_bounds {
+        let max_time: u64 = tb.max_time.into();
+        // 0 means no limit
         if max_time > 0 && context.close_time > max_time {
             return Err(ValidationError::TooLate {
                 max_time,
@@ -512,36 +549,18 @@ pub fn validate_time_bounds(
         }
     }
 
-    Ok(())
-}
-
-/// Validate ledger bounds.
-pub fn validate_ledger_bounds(
-    frame: &TransactionFrame,
-    context: &LedgerContext,
-) -> std::result::Result<(), ValidationError> {
+    // Check ledger max bound
+    // Spec: TX_SPEC §4.2.3 — ledger sequence MUST be strictly less than maxLedger.
     let ledger_bounds = match frame.preconditions() {
-        Preconditions::None | Preconditions::Time(_) => return Ok(()),
+        Preconditions::None | Preconditions::Time(_) => None,
         Preconditions::V2(cond) => cond.ledger_bounds,
     };
 
     if let Some(lb) = ledger_bounds {
-        let current = context.sequence;
-
-        // Check min ledger
-        if lb.min_ledger > 0 && current < lb.min_ledger {
-            return Err(ValidationError::LedgerBoundsTooEarly {
-                min_ledger: lb.min_ledger,
-                current,
-            });
-        }
-
-        // Check max ledger (0 means no limit)
-        // Spec: TX_SPEC §4.2.3 — ledger sequence MUST be strictly less than maxLedger.
-        if lb.max_ledger > 0 && current >= lb.max_ledger {
+        if lb.max_ledger > 0 && context.sequence >= lb.max_ledger {
             return Err(ValidationError::LedgerBoundsTooLate {
                 max_ledger: lb.max_ledger,
-                current,
+                current: context.sequence,
             });
         }
     }
@@ -719,11 +738,11 @@ pub fn validate_basic(
         errors.push(e);
     }
 
-    if let Err(e) = validate_time_bounds(frame, context) {
+    if let Err(e) = is_too_early(frame, context) {
         errors.push(e);
     }
 
-    if let Err(e) = validate_ledger_bounds(frame, context) {
+    if let Err(e) = is_too_late(frame, context) {
         errors.push(e);
     }
 
@@ -763,11 +782,11 @@ pub fn validate_full(
         errors.push(e);
     }
 
-    if let Err(e) = validate_time_bounds(frame, context) {
+    if let Err(e) = is_too_early(frame, context) {
         errors.push(e);
     }
 
-    if let Err(e) = validate_ledger_bounds(frame, context) {
+    if let Err(e) = is_too_late(frame, context) {
         errors.push(e);
     }
 
@@ -1580,7 +1599,7 @@ mod tests {
         let context = LedgerContext::testnet(1, 1000);
 
         // No time bounds, should pass
-        assert!(validate_time_bounds(&frame, &context).is_ok());
+        assert!(is_too_early(&frame, &context).is_ok());
     }
 
     #[test]
@@ -1891,7 +1910,7 @@ mod tests {
         let context = LedgerContext::testnet(1, 1000); // close_time = 1000
 
         assert!(matches!(
-            validate_time_bounds(&frame, &context),
+            is_too_early(&frame, &context),
             Err(ValidationError::TooEarly { .. })
         ));
     }
@@ -1937,7 +1956,7 @@ mod tests {
         let context = LedgerContext::testnet(1, 1000); // close_time = 1000
 
         assert!(matches!(
-            validate_time_bounds(&frame, &context),
+            is_too_late(&frame, &context),
             Err(ValidationError::TooLate { .. })
         ));
     }
@@ -1992,7 +2011,7 @@ mod tests {
         let context = LedgerContext::testnet(50, 1000); // ledger = 50
 
         assert!(matches!(
-            validate_ledger_bounds(&frame, &context),
+            is_too_early(&frame, &context),
             Err(ValidationError::LedgerBoundsTooEarly { .. })
         ));
     }
@@ -2047,7 +2066,7 @@ mod tests {
         let context = LedgerContext::testnet(100, 1000); // ledger = 100
 
         assert!(matches!(
-            validate_ledger_bounds(&frame, &context),
+            is_too_late(&frame, &context),
             Err(ValidationError::LedgerBoundsTooLate { .. })
         ));
     }
@@ -2163,7 +2182,8 @@ mod tests {
         let frame = TransactionFrame::from_owned(envelope);
         let context = LedgerContext::testnet(100, 1000); // ledger = 100
 
-        assert!(validate_ledger_bounds(&frame, &context).is_ok());
+        assert!(is_too_early(&frame, &context).is_ok());
+        assert!(is_too_late(&frame, &context).is_ok());
     }
 
     /// Test validate_time_bounds within valid range.
@@ -2206,7 +2226,8 @@ mod tests {
         let frame = TransactionFrame::from_owned(envelope);
         let context = LedgerContext::testnet(1, 1000); // close_time = 1000
 
-        assert!(validate_time_bounds(&frame, &context).is_ok());
+        assert!(is_too_early(&frame, &context).is_ok());
+        assert!(is_too_late(&frame, &context).is_ok());
     }
 
     /// Test validate_time_bounds with unbounded max_time (0).
@@ -2248,7 +2269,8 @@ mod tests {
         let frame = TransactionFrame::from_owned(envelope);
         let context = LedgerContext::testnet(1, 999999); // Any large close_time
 
-        assert!(validate_time_bounds(&frame, &context).is_ok());
+        assert!(is_too_early(&frame, &context).is_ok());
+        assert!(is_too_late(&frame, &context).is_ok());
     }
 
     /// Test validate_ledger_bounds with unbounded max_ledger (0).
@@ -2299,7 +2321,7 @@ mod tests {
         let frame = TransactionFrame::from_owned(envelope);
         let context = LedgerContext::testnet(999999, 1000); // Any large ledger
 
-        assert!(validate_ledger_bounds(&frame, &context).is_ok());
+        assert!(is_too_late(&frame, &context).is_ok());
     }
 
     /// Test validation with multiple operations.
@@ -2468,7 +2490,7 @@ mod tests {
         let context = LedgerContext::testnet(100, 1000);
         assert!(
             matches!(
-                validate_ledger_bounds(&frame, &context),
+                is_too_late(&frame, &context),
                 Err(ValidationError::LedgerBoundsTooLate { .. })
             ),
             "current == max_ledger must be rejected (strictly less than)"
@@ -2477,9 +2499,123 @@ mod tests {
         // current == max_ledger - 1: should pass
         let context = LedgerContext::testnet(99, 1000);
         assert!(
-            validate_ledger_bounds(&frame, &context).is_ok(),
+            is_too_late(&frame, &context).is_ok(),
             "current < max_ledger must pass"
         );
+    }
+
+    // ── Combined is_too_early / is_too_late ordering (parity with stellar-core) ──
+
+    /// Regression test for #2272: time-max violated + ledger-min violated → is_too_early fails.
+    ///
+    /// stellar-core's isTooEarly() checks time-min then ledger-min in one function.
+    /// The old separate validate_time_bounds (min+max) / validate_ledger_bounds (min+max)
+    /// would return TooLate from time-max before reaching ledger-min.
+    #[test]
+    fn test_is_too_early_catches_ledger_min_before_time_max() {
+        let source = MuxedAccount::Ed25519(Uint256([0u8; 32]));
+        let dest = MuxedAccount::Ed25519(Uint256([1u8; 32]));
+
+        let payment_op = Operation {
+            source_account: None,
+            body: OperationBody::Payment(PaymentOp {
+                destination: dest,
+                asset: Asset::Native,
+                amount: 1000,
+            }),
+        };
+
+        // Time bounds: min_time = 100, max_time = 500
+        // Ledger bounds: min_ledger = 200, max_ledger = 0
+        // Context: close_time = 1000 (time-max violated), ledger_seq = 50 (ledger-min violated)
+        let preconditions = Preconditions::V2(PreconditionsV2 {
+            time_bounds: Some(TimeBounds {
+                min_time: TimePoint(100),
+                max_time: TimePoint(500),
+            }),
+            ledger_bounds: Some(LedgerBounds {
+                min_ledger: 200,
+                max_ledger: 0,
+            }),
+            min_seq_num: None,
+            min_seq_age: Duration(0),
+            min_seq_ledger_gap: 0,
+            extra_signers: vec![].try_into().unwrap(),
+        });
+
+        let tx = Transaction {
+            source_account: source.clone(),
+            fee: 100,
+            seq_num: SequenceNumber(1),
+            cond: preconditions,
+            memo: Memo::None,
+            operations: vec![payment_op].try_into().unwrap(),
+            ext: TransactionExt::V0,
+        };
+
+        let envelope = TransactionEnvelope::Tx(TransactionV1Envelope {
+            tx,
+            signatures: vec![].try_into().unwrap(),
+        });
+
+        let frame = TransactionFrame::from_owned(envelope);
+        let context = LedgerContext::testnet(50, 1000);
+
+        // is_too_early must catch ledger-min violation (time-min is fine: 100 <= 1000)
+        assert!(matches!(
+            is_too_early(&frame, &context),
+            Err(ValidationError::LedgerBoundsTooEarly { .. })
+        ));
+    }
+
+    /// Test that is_too_early passes when only time-max is violated.
+    /// The "too late" condition is caught by is_too_late, not is_too_early.
+    #[test]
+    fn test_is_too_early_does_not_catch_time_max() {
+        let source = MuxedAccount::Ed25519(Uint256([0u8; 32]));
+        let dest = MuxedAccount::Ed25519(Uint256([1u8; 32]));
+
+        let payment_op = Operation {
+            source_account: None,
+            body: OperationBody::Payment(PaymentOp {
+                destination: dest,
+                asset: Asset::Native,
+                amount: 1000,
+            }),
+        };
+
+        // Time bounds: min_time = 100, max_time = 500
+        // Context: close_time = 1000 (time-max violated, but is_too_early only checks min)
+        let time_bounds = TimeBounds {
+            min_time: TimePoint(100),
+            max_time: TimePoint(500),
+        };
+
+        let tx = Transaction {
+            source_account: source,
+            fee: 100,
+            seq_num: SequenceNumber(1),
+            cond: Preconditions::Time(time_bounds),
+            memo: Memo::None,
+            operations: vec![payment_op].try_into().unwrap(),
+            ext: TransactionExt::V0,
+        };
+
+        let envelope = TransactionEnvelope::Tx(TransactionV1Envelope {
+            tx,
+            signatures: vec![].try_into().unwrap(),
+        });
+
+        let frame = TransactionFrame::from_owned(envelope);
+        let context = LedgerContext::testnet(1, 1000);
+
+        // is_too_early should pass (time-min 100 <= 1000)
+        assert!(is_too_early(&frame, &context).is_ok());
+        // is_too_late should fail (time-max 500 < 1000)
+        assert!(matches!(
+            is_too_late(&frame, &context),
+            Err(ValidationError::TooLate { .. })
+        ));
     }
 
     // ── TX_SPEC §4.2.6: non-Soroban tx with SorobanTransactionData ──

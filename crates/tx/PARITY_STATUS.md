@@ -122,8 +122,8 @@ Corresponds to: `TransactionFrame::checkValid*()`, `TransactionFrame::commonVali
 | `commonValid()` | `validate_basic()` | Full |
 | Structure validation | `validate_structure()` | Full |
 | Fee validation | `validate_fee()` | Full |
-| Time bounds | `validate_time_bounds()` | Full |
-| Ledger bounds | `validate_ledger_bounds()` | Full |
+| Too early (time+ledger min) | `is_too_early()` | Full |
+| Too late (time+ledger max) | `is_too_late()` | Full |
 | Sequence validation | `validate_sequence()` | Full |
 | Min seq num | `validate_min_seq_num()` | Full |
 | Extra signers | `validate_extra_signers()` | Full |

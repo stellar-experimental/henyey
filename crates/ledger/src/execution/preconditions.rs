@@ -197,34 +197,18 @@ impl TransactionExecutor {
             // outer auth was validated by tx-set construction and we proceed.
 
             // 2c. Time/ledger bounds (inner tx properties)
-            // Parity: inner TransactionFrame::commonValidPreSeqNum lines 1471-1480
-            if let Err(e) = validation::validate_time_bounds(&frame, &validation_ctx) {
+            // Parity: isTooEarly then isTooLate (TransactionFrame.cpp:1471-1476)
+            if let Err(_e) = validation::is_too_early(&frame, &validation_ctx) {
                 return Ok(Err(pre_seq_fail(
-                    match e {
-                        validation::ValidationError::TooEarly { .. } => {
-                            TransactionResultCode::TxTooEarly
-                        }
-                        validation::ValidationError::TooLate { .. } => {
-                            TransactionResultCode::TxTooLate
-                        }
-                        _ => TransactionResultCode::TxFailed,
-                    },
-                    "Time bounds invalid",
+                    TransactionResultCode::TxTooEarly,
+                    "Too early",
                 )));
             }
 
-            if let Err(e) = validation::validate_ledger_bounds(&frame, &validation_ctx) {
+            if let Err(_e) = validation::is_too_late(&frame, &validation_ctx) {
                 return Ok(Err(pre_seq_fail(
-                    match e {
-                        validation::ValidationError::LedgerBoundsTooEarly { .. } => {
-                            TransactionResultCode::TxTooEarly
-                        }
-                        validation::ValidationError::LedgerBoundsTooLate { .. } => {
-                            TransactionResultCode::TxTooLate
-                        }
-                        _ => TransactionResultCode::TxFailed,
-                    },
-                    "Ledger bounds invalid",
+                    TransactionResultCode::TxTooLate,
+                    "Too late",
                 )));
             }
 
@@ -249,33 +233,18 @@ impl TransactionExecutor {
             (fee_source_account, source_account, Some(outer_hash))
         } else {
             // 2a. Time/ledger bounds
-            if let Err(e) = validation::validate_time_bounds(&frame, &validation_ctx) {
+            // Parity: isTooEarly then isTooLate (TransactionFrame.cpp:1471-1476)
+            if let Err(_e) = validation::is_too_early(&frame, &validation_ctx) {
                 return Ok(Err(pre_seq_fail(
-                    match e {
-                        validation::ValidationError::TooEarly { .. } => {
-                            TransactionResultCode::TxTooEarly
-                        }
-                        validation::ValidationError::TooLate { .. } => {
-                            TransactionResultCode::TxTooLate
-                        }
-                        _ => TransactionResultCode::TxFailed,
-                    },
-                    "Time bounds invalid",
+                    TransactionResultCode::TxTooEarly,
+                    "Too early",
                 )));
             }
 
-            if let Err(e) = validation::validate_ledger_bounds(&frame, &validation_ctx) {
+            if let Err(_e) = validation::is_too_late(&frame, &validation_ctx) {
                 return Ok(Err(pre_seq_fail(
-                    match e {
-                        validation::ValidationError::LedgerBoundsTooEarly { .. } => {
-                            TransactionResultCode::TxTooEarly
-                        }
-                        validation::ValidationError::LedgerBoundsTooLate { .. } => {
-                            TransactionResultCode::TxTooLate
-                        }
-                        _ => TransactionResultCode::TxFailed,
-                    },
-                    "Ledger bounds invalid",
+                    TransactionResultCode::TxTooLate,
+                    "Too late",
                 )));
             }
 
