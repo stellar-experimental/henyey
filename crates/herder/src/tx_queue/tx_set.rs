@@ -1281,16 +1281,7 @@ mod tests {
     #[test]
     fn test_validate_parallel_component_valid_single_stage() {
         let tx = make_tx_envelope(1, 100);
-        let parallel = ParallelTxsComponent {
-            base_fee: Some(100),
-            execution_stages: vec![ParallelTxExecutionStage(
-                vec![DependentTxCluster(vec![tx].try_into().unwrap())]
-                    .try_into()
-                    .unwrap(),
-            )]
-            .try_into()
-            .unwrap(),
-        };
+        let parallel = make_parallel_component(vec![vec![vec![tx]]], Some(100));
         assert!(validate_parallel_component(&parallel).is_ok());
     }
 
@@ -1307,19 +1298,7 @@ mod tests {
             (tx_a, tx_b)
         };
 
-        let parallel = ParallelTxsComponent {
-            base_fee: Some(100),
-            execution_stages: vec![ParallelTxExecutionStage(
-                vec![
-                    DependentTxCluster(vec![first].try_into().unwrap()),
-                    DependentTxCluster(vec![second].try_into().unwrap()),
-                ]
-                .try_into()
-                .unwrap(),
-            )]
-            .try_into()
-            .unwrap(),
-        };
+        let parallel = make_parallel_component(vec![vec![vec![first], vec![second]]], Some(100));
 
         let result = validate_parallel_component(&parallel);
         assert!(result.is_err());
@@ -1341,23 +1320,10 @@ mod tests {
             (tx_a, tx_b)
         };
 
-        let parallel = ParallelTxsComponent {
-            base_fee: Some(100),
-            execution_stages: vec![
-                ParallelTxExecutionStage(
-                    vec![DependentTxCluster(vec![stage0_tx].try_into().unwrap())]
-                        .try_into()
-                        .unwrap(),
-                ),
-                ParallelTxExecutionStage(
-                    vec![DependentTxCluster(vec![stage1_tx].try_into().unwrap())]
-                        .try_into()
-                        .unwrap(),
-                ),
-            ]
-            .try_into()
-            .unwrap(),
-        };
+        let parallel = make_parallel_component(
+            vec![vec![vec![stage0_tx]], vec![vec![stage1_tx]]],
+            Some(100),
+        );
 
         let result = validate_parallel_component(&parallel);
         assert!(result.is_err());
@@ -1371,19 +1337,7 @@ mod tests {
         // Two clusters whose first TX is identical → equal hashes.
         // Nondecreasing order (matching C++ std::is_sorted) must accept this.
         let tx = make_tx_envelope(1, 100);
-        let parallel = ParallelTxsComponent {
-            base_fee: Some(100),
-            execution_stages: vec![ParallelTxExecutionStage(
-                vec![
-                    DependentTxCluster(vec![tx.clone()].try_into().unwrap()),
-                    DependentTxCluster(vec![tx].try_into().unwrap()),
-                ]
-                .try_into()
-                .unwrap(),
-            )]
-            .try_into()
-            .unwrap(),
-        };
+        let parallel = make_parallel_component(vec![vec![vec![tx.clone()], vec![tx]]], Some(100));
         assert!(validate_parallel_component(&parallel).is_ok());
     }
 
@@ -1392,23 +1346,8 @@ mod tests {
         // Two stages whose first-TX-of-first-cluster is identical → equal hashes.
         // Nondecreasing order (matching C++ std::is_sorted) must accept this.
         let tx = make_tx_envelope(1, 100);
-        let parallel = ParallelTxsComponent {
-            base_fee: Some(100),
-            execution_stages: vec![
-                ParallelTxExecutionStage(
-                    vec![DependentTxCluster(vec![tx.clone()].try_into().unwrap())]
-                        .try_into()
-                        .unwrap(),
-                ),
-                ParallelTxExecutionStage(
-                    vec![DependentTxCluster(vec![tx].try_into().unwrap())]
-                        .try_into()
-                        .unwrap(),
-                ),
-            ]
-            .try_into()
-            .unwrap(),
-        };
+        let parallel =
+            make_parallel_component(vec![vec![vec![tx.clone()]], vec![vec![tx]]], Some(100));
         assert!(validate_parallel_component(&parallel).is_ok());
     }
 
