@@ -302,12 +302,7 @@ impl AddReadsContext<'_> {
             }
         }
 
-        let limits = super::ContractSizeLimits {
-            max_contract_size_bytes: self.soroban_config.max_contract_size_bytes,
-            max_contract_data_entry_size_bytes: self
-                .soroban_config
-                .max_contract_data_entry_size_bytes,
-        };
+        let limits = super::ContractSizeLimits::from(self.soroban_config);
         if !super::validate_contract_ledger_entry(key, entry_size as usize, &limits) {
             tracing::warn!(
                 entry_size,
@@ -367,12 +362,7 @@ impl AddReadsContext<'_> {
         // Autorestore path (stellar-core lines 1015-1051): validate size, then
         // meter disk reads. Both failures map to ResourceLimitExceeded.
         let entry_size = xdr_encoded_len_u32(entry);
-        let limits = super::ContractSizeLimits {
-            max_contract_size_bytes: self.soroban_config.max_contract_size_bytes,
-            max_contract_data_entry_size_bytes: self
-                .soroban_config
-                .max_contract_data_entry_size_bytes,
-        };
+        let limits = super::ContractSizeLimits::from(self.soroban_config);
         if !super::validate_contract_ledger_entry(key, entry_size as usize, &limits) {
             tracing::warn!(
                 entry_size,
@@ -598,11 +588,7 @@ fn execute_contract_invocation(
             // network config limits (validateContractLedgerEntry).
             match validate_and_compute_write_bytes(
                 &result.storage_changes,
-                &super::ContractSizeLimits {
-                    max_contract_size_bytes: soroban_config.max_contract_size_bytes,
-                    max_contract_data_entry_size_bytes: soroban_config
-                        .max_contract_data_entry_size_bytes,
-                },
+                &super::ContractSizeLimits::from(soroban_config),
             ) {
                 StorageChangeValidation::EntrySizeExceeded => {
                     return Ok(OperationExecutionResult::new(make_result(

@@ -221,9 +221,19 @@ pub(super) fn get_trustline_ext_v2_mut(
 }
 
 /// Contract size limits from SorobanConfig for `validate_contract_ledger_entry`.
+#[derive(Clone, Copy)]
 pub(super) struct ContractSizeLimits {
     pub max_contract_size_bytes: u32,
     pub max_contract_data_entry_size_bytes: u32,
+}
+
+impl From<&crate::soroban::SorobanConfig> for ContractSizeLimits {
+    fn from(config: &crate::soroban::SorobanConfig) -> Self {
+        Self {
+            max_contract_size_bytes: config.max_contract_size_bytes,
+            max_contract_data_entry_size_bytes: config.max_contract_data_entry_size_bytes,
+        }
+    }
 }
 
 /// Validate CONTRACT_CODE and CONTRACT_DATA entry sizes against network config limits.
@@ -995,16 +1005,7 @@ pub fn execute_operation_with_soroban(
                     &op_source,
                     state,
                     context,
-                    &extend_footprint_ttl::SorobanExtendConfig {
-                        soroban_data: soroban.soroban_data,
-                        ttl_key_cache: soroban.ttl_key_cache,
-                        size_limits: &ContractSizeLimits {
-                            max_contract_size_bytes: config.max_contract_size_bytes,
-                            max_contract_data_entry_size_bytes: config
-                                .max_contract_data_entry_size_bytes,
-                        },
-                        max_entry_ttl: config.max_entry_ttl,
-                    },
+                    &extend_footprint_ttl::SorobanExtendConfig::new(soroban),
                 )?;
                 let mut exec = OperationExecutionResult::new(result);
                 if matches!(
@@ -1144,17 +1145,7 @@ pub fn execute_operation_with_soroban(
                     &op_source,
                     state,
                     context,
-                    restore_footprint::RestoreFootprintResources {
-                        soroban_data: soroban.soroban_data,
-                        min_persistent_entry_ttl: config.min_persistent_entry_ttl,
-                        hot_archive_restores: &ha_restore_entries,
-                        ttl_key_cache: soroban.ttl_key_cache,
-                        size_limits: ContractSizeLimits {
-                            max_contract_size_bytes: config.max_contract_size_bytes,
-                            max_contract_data_entry_size_bytes: config
-                                .max_contract_data_entry_size_bytes,
-                        },
-                    },
+                    restore_footprint::RestoreFootprintResources::new(soroban, &ha_restore_entries),
                 )?;
                 let mut exec = OperationExecutionResult::new(result);
                 if matches!(

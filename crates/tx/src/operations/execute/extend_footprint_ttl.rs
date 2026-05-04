@@ -20,8 +20,20 @@ use crate::Result;
 pub(crate) struct SorobanExtendConfig<'a> {
     pub soroban_data: &'a SorobanTransactionData,
     pub ttl_key_cache: Option<&'a crate::soroban::TtlKeyCache>,
-    pub size_limits: &'a super::ContractSizeLimits,
+    pub size_limits: super::ContractSizeLimits,
     pub max_entry_ttl: u32,
+}
+
+impl<'a> SorobanExtendConfig<'a> {
+    /// Build from a [`SorobanContext`], extracting the required fields.
+    pub(crate) fn new(ctx: &crate::soroban::SorobanContext<'a>) -> Self {
+        Self {
+            soroban_data: ctx.soroban_data,
+            ttl_key_cache: ctx.ttl_key_cache,
+            size_limits: super::ContractSizeLimits::from(ctx.config),
+            max_entry_ttl: ctx.config.max_entry_ttl,
+        }
+    }
 }
 
 /// Execute an ExtendFootprintTtl operation.
@@ -111,7 +123,7 @@ pub(crate) fn execute_extend_footprint_ttl(
         // Validate contract entry size against config limits.
         // Matches stellar-core validateContractLedgerEntry() which rejects
         // CONTRACT_CODE > maxContractSizeBytes and CONTRACT_DATA > maxContractDataEntrySizeBytes.
-        if !super::validate_contract_ledger_entry(key, entry_size, config.size_limits) {
+        if !super::validate_contract_ledger_entry(key, entry_size, &config.size_limits) {
             return Ok(make_result(
                 ExtendFootprintTtlResultCode::ResourceLimitExceeded,
             ));
@@ -216,7 +228,7 @@ mod tests {
             &SorobanExtendConfig {
                 soroban_data: &soroban_data,
                 ttl_key_cache: None,
-                size_limits: &PERMISSIVE_LIMITS,
+                size_limits: PERMISSIVE_LIMITS,
                 max_entry_ttl: TEST_MAX_ENTRY_TTL,
             },
         );
@@ -271,7 +283,7 @@ mod tests {
             &SorobanExtendConfig {
                 soroban_data: &soroban_data,
                 ttl_key_cache: None,
-                size_limits: &PERMISSIVE_LIMITS,
+                size_limits: PERMISSIVE_LIMITS,
                 max_entry_ttl: TEST_MAX_ENTRY_TTL,
             },
         );
@@ -322,7 +334,7 @@ mod tests {
             &SorobanExtendConfig {
                 soroban_data: &soroban_data,
                 ttl_key_cache: None,
-                size_limits: &PERMISSIVE_LIMITS,
+                size_limits: PERMISSIVE_LIMITS,
                 max_entry_ttl: TEST_MAX_ENTRY_TTL,
             },
         );
@@ -369,7 +381,7 @@ mod tests {
             &SorobanExtendConfig {
                 soroban_data: &soroban_data,
                 ttl_key_cache: None,
-                size_limits: &PERMISSIVE_LIMITS,
+                size_limits: PERMISSIVE_LIMITS,
                 max_entry_ttl: TEST_MAX_ENTRY_TTL,
             },
         );
@@ -420,7 +432,7 @@ mod tests {
             &SorobanExtendConfig {
                 soroban_data: &soroban_data,
                 ttl_key_cache: None,
-                size_limits: &PERMISSIVE_LIMITS,
+                size_limits: PERMISSIVE_LIMITS,
                 max_entry_ttl: TEST_MAX_ENTRY_TTL,
             },
         );
@@ -475,7 +487,7 @@ mod tests {
             &SorobanExtendConfig {
                 soroban_data: &soroban_data,
                 ttl_key_cache: None,
-                size_limits: &PERMISSIVE_LIMITS,
+                size_limits: PERMISSIVE_LIMITS,
                 max_entry_ttl: TEST_MAX_ENTRY_TTL,
             },
         );
@@ -536,7 +548,7 @@ mod tests {
             &SorobanExtendConfig {
                 soroban_data: &soroban_data,
                 ttl_key_cache: None,
-                size_limits: &PERMISSIVE_LIMITS,
+                size_limits: PERMISSIVE_LIMITS,
                 max_entry_ttl: TEST_MAX_ENTRY_TTL,
             },
         );
@@ -598,7 +610,7 @@ mod tests {
             &SorobanExtendConfig {
                 soroban_data: &soroban_data,
                 ttl_key_cache: None,
-                size_limits: &PERMISSIVE_LIMITS,
+                size_limits: PERMISSIVE_LIMITS,
                 max_entry_ttl: TEST_MAX_ENTRY_TTL,
             },
         );
@@ -681,7 +693,7 @@ mod tests {
             &SorobanExtendConfig {
                 soroban_data: &soroban_data,
                 ttl_key_cache: None,
-                size_limits: &PERMISSIVE_LIMITS,
+                size_limits: PERMISSIVE_LIMITS,
                 max_entry_ttl: TEST_MAX_ENTRY_TTL,
             },
         );
@@ -758,7 +770,7 @@ mod tests {
             &SorobanExtendConfig {
                 soroban_data: &soroban_data,
                 ttl_key_cache: None,
-                size_limits: &PERMISSIVE_LIMITS,
+                size_limits: PERMISSIVE_LIMITS,
                 max_entry_ttl: TEST_MAX_ENTRY_TTL,
             },
         );
@@ -836,7 +848,7 @@ mod tests {
             &SorobanExtendConfig {
                 soroban_data: &soroban_data,
                 ttl_key_cache: None,
-                size_limits: &PERMISSIVE_LIMITS,
+                size_limits: PERMISSIVE_LIMITS,
                 max_entry_ttl: TEST_MAX_ENTRY_TTL,
             },
         );
@@ -929,7 +941,7 @@ mod tests {
             &SorobanExtendConfig {
                 soroban_data: &soroban_data,
                 ttl_key_cache: None,
-                size_limits: &small_limits,
+                size_limits: small_limits,
                 max_entry_ttl: TEST_MAX_ENTRY_TTL,
             },
         );
@@ -958,7 +970,7 @@ mod tests {
             &SorobanExtendConfig {
                 soroban_data: &soroban_data,
                 ttl_key_cache: None,
-                size_limits: &big_limits,
+                size_limits: big_limits,
                 max_entry_ttl: TEST_MAX_ENTRY_TTL,
             },
         );
@@ -1014,7 +1026,7 @@ mod tests {
             &SorobanExtendConfig {
                 soroban_data: &soroban_data,
                 ttl_key_cache: None,
-                size_limits: &PERMISSIVE_LIMITS,
+                size_limits: PERMISSIVE_LIMITS,
                 max_entry_ttl: 100,
             },
         );
@@ -1044,7 +1056,7 @@ mod tests {
             &SorobanExtendConfig {
                 soroban_data: &soroban_data,
                 ttl_key_cache: None,
-                size_limits: &PERMISSIVE_LIMITS,
+                size_limits: PERMISSIVE_LIMITS,
                 max_entry_ttl: 100,
             },
         );
@@ -1074,7 +1086,7 @@ mod tests {
             &SorobanExtendConfig {
                 soroban_data: &soroban_data,
                 ttl_key_cache: None,
-                size_limits: &PERMISSIVE_LIMITS,
+                size_limits: PERMISSIVE_LIMITS,
                 max_entry_ttl: 100,
             },
         );
@@ -1146,7 +1158,7 @@ mod tests {
             &SorobanExtendConfig {
                 soroban_data: &soroban_data,
                 ttl_key_cache: None,
-                size_limits: &PERMISSIVE_LIMITS,
+                size_limits: PERMISSIVE_LIMITS,
                 max_entry_ttl: TEST_MAX_ENTRY_TTL,
             },
         );
@@ -1217,7 +1229,7 @@ mod tests {
             &SorobanExtendConfig {
                 soroban_data: &soroban_data,
                 ttl_key_cache: None,
-                size_limits: &PERMISSIVE_LIMITS,
+                size_limits: PERMISSIVE_LIMITS,
                 max_entry_ttl: TEST_MAX_ENTRY_TTL,
             },
         );

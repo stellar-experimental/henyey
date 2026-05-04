@@ -36,6 +36,23 @@ pub struct RestoreFootprintResources<'a> {
     pub size_limits: super::ContractSizeLimits,
 }
 
+impl<'a> RestoreFootprintResources<'a> {
+    /// Build from a [`SorobanContext`] plus the hot-archive entries specific to
+    /// this operation.
+    pub(crate) fn new(
+        ctx: &crate::soroban::SorobanContext<'a>,
+        hot_archive_restores: &'a [HotArchiveRestoreEntry],
+    ) -> Self {
+        Self {
+            soroban_data: ctx.soroban_data,
+            min_persistent_entry_ttl: ctx.config.min_persistent_entry_ttl,
+            hot_archive_restores,
+            ttl_key_cache: ctx.ttl_key_cache,
+            size_limits: super::ContractSizeLimits::from(ctx.config),
+        }
+    }
+}
+
 /// Execute a RestoreFootprint operation.
 ///
 /// This operation restores archived entries that have expired TTLs,
