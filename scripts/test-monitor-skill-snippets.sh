@@ -42,7 +42,7 @@ cleanup  # ensure fresh state
 mkdir -p "$TEST_ROOT"
 
 # ── TAP state ────────────────────────────────────────────────────────────────
-TAP_PLAN=33
+TAP_PLAN=40
 TAP_CURRENT=0
 TAP_FAILURES=0
 
@@ -118,6 +118,21 @@ check_skill_structure() {
   fi
   if ! grep -q 'cleanup_guard' "$loop_file"; then
     echo "WARNING: monitor-loop/SKILL.md does not call cleanup_guard" >&2
+    drift=true
+  fi
+
+  # monitor-loop must call grep_heartbeat_lines (not raw grep Heartbeat)
+  if ! grep -q 'grep_heartbeat_lines' "$loop_file"; then
+    echo "WARNING: monitor-loop/SKILL.md does not call grep_heartbeat_lines" >&2
+    drift=true
+  fi
+  # Neither file should contain raw grep 'Heartbeat' patterns for log detection
+  if grep -qE 'grep.*Heartbeat.*monitor' "$tick_file" 2>/dev/null; then
+    echo "WARNING: monitor-tick/SKILL.md contains raw grep Heartbeat (use grep_heartbeat_lines)" >&2
+    drift=true
+  fi
+  if grep -qE 'grep.*Heartbeat.*monitor' "$loop_file" 2>/dev/null; then
+    echo "WARNING: monitor-loop/SKILL.md contains raw grep Heartbeat (use grep_heartbeat_lines)" >&2
     drift=true
   fi
 
@@ -658,6 +673,72 @@ run_tests() {
   else
     tap_not_ok "crash-detect: mtime tie-break → lexicographic-last path" \
       "LATEST=$CRASH_LATEST_FILE MISMATCH=$CRASH_HASH_MISMATCH"
+  fi
+
+  # ── Heartbeat helper tests ─────────────────────────────────────────────────
+  local hb_log="$TEST_ROOT/hb/monitor.log"
+  mkdir -p "$TEST_ROOT/hb"
+
+  # Test 34: Text format + tail
+  printf '2026-05-01T00:00:00Z INFO heartbeat=true gap=0 peers=5\n' > "$hb_log"
+  printf '2026-05-01T00:00:05Z INFO heartbeat=true gap=1 peers=3\n' >> "$hb_log"
+  local hb_result
+  hb_result=$(grep_heartbeat_lines "$hb_log" 1)
+  if [[ "$hb_result" == *"gap=1"* ]]; then
+    tap_ok "heartbeat: text format, tail-1 returns most recent"
+  else
+    tap_not_ok "heartbeat: text format, tail-1 returns most recent" "got: $hb_result"
+  fi
+
+  # Test 35: Colon separator
+  printf 'heartbeat: true gap=2\n' > "$hb_log"
+  hb_result=$(grep_heartbeat_lines "$hb_log")
+  if [[ -n "$hb_result" ]]; then
+    tap_ok "heartbeat: colon separator matches"
+  else
+    tap_not_ok "heartbeat: colon separator matches" "no output"
+  fi
+
+  # Test 36: JSON format
+  printf '{"heartbeat":true,"gap":0}\n' > "$hb_log"
+  hb_result=$(grep_heartbeat_lines "$hb_log")
+  if [[ "$hb_result" == *'"heartbeat":true'* ]]; then
+    tap_ok "heartbeat: JSON format matches"
+  else
+    tap_not_ok "heartbeat: JSON format matches" "got: $hb_result"
+  fi
+
+  # Test 37: Prose-only "Heartbeat" does NOT match (exit 1)
+  printf 'INFO Heartbeat: essentially caught up with network\n' > "$hb_log"
+  if ! grep_heartbeat_lines "$hb_log" >/dev/null 2>&1; then
+    tap_ok "heartbeat: prose-only Heartbeat does not match"
+  else
+    tap_not_ok "heartbeat: prose-only Heartbeat does not match" "unexpected match"
+  fi
+
+  # Test 38: Empty file → exit 1
+  : > "$hb_log"
+  if ! grep_heartbeat_lines "$hb_log" >/dev/null 2>&1; then
+    tap_ok "heartbeat: empty log → exit 1"
+  else
+    tap_not_ok "heartbeat: empty log → exit 1" "expected failure"
+  fi
+
+  # Test 39: Empty file with tail_count → exit 1
+  : > "$hb_log"
+  if ! grep_heartbeat_lines "$hb_log" 5 >/dev/null 2>&1; then
+    tap_ok "heartbeat: empty log with tail_count → exit 1"
+  else
+    tap_not_ok "heartbeat: empty log with tail_count → exit 1" "expected failure"
+  fi
+
+  # Test 40: Missing file → exit code > 0
+  local hb_rc=0
+  grep_heartbeat_lines "$TEST_ROOT/hb/nonexistent.log" >/dev/null 2>&1 || hb_rc=$?
+  if [[ $hb_rc -ne 0 ]]; then
+    tap_ok "heartbeat: missing file → non-zero exit"
+  else
+    tap_not_ok "heartbeat: missing file → non-zero exit" "rc=$hb_rc"
   fi
 }
 

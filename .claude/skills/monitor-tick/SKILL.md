@@ -293,7 +293,7 @@ ticks so STUCK can be detected by a single invocation:
 
 - Read `/home/tomer/data/$MONITOR_SESSION_ID/last_ledger` (if it exists) —
   format is `"<ledger>|<unix-timestamp>"`.
-- Extract the current ledger from the most recent Heartbeat line in the log tail.
+- Extract the current ledger from the most recent heartbeat event (`heartbeat=true`) in the log tail.
 - If the file exists and its ledger equals the current ledger and the recorded
   timestamp is more than 600s old, flag STUCK.
 - If the ledger has advanced or the file is missing, overwrite
@@ -301,13 +301,13 @@ ticks so STUCK can be detected by a single invocation:
 - Check node uptime: `ps -o etime= -p $(for p in /proc/[0-9]*; do [ "$(cat $p/comm 2>/dev/null)" = "henyey" ] && basename $p; done | head -1)`.
   Active deadline: **15m** when `FRESH_START=no` and `CRASH_RECOVERY=no`,
   **60m** when `CRASH_RECOVERY=yes`, **4h** when `FRESH_START=yes`.
-- "Real-time sync" means RPC `age < 30s` — NOT just Heartbeat `gap=0`. Gap is
+- "Real-time sync" means RPC `age < 30s` — NOT just heartbeat event `gap=0`. Gap is
   the node's local view (`latest_ext - ledger`) and can stay at 0 even when
   the node is minutes behind the network. The authoritative wall-clock signal
   is RPC `age`.
 - If uptime exceeds the active deadline AND the node is not in real-time sync:
   flag SYNC FAILURE if `gap > 5`, or `age > 30s`, or `heard_from_quorum=false`
-  in the latest Heartbeat. Investigate the catchup path (checkpoint-boundary
+  in the latest heartbeat event. Investigate the catchup path (checkpoint-boundary
   stalls, hash mismatches, event-loop freezes); do not just wait.
 - **Progress carveout (only when `CRASH_RECOVERY=yes`)**: if lcl has advanced
   by ≥ 500 ledgers since the previous tick's `last_ledger`, the node is
@@ -626,7 +626,7 @@ or label change).
 
 **Skip conditions** (skip all ratio checks when any is true):
 - `FRESH_START=yes`
-- Heartbeat gap > 5
+- heartbeat event `gap` > 5
 - `stellar_ledger_age_current_seconds > 30`
 - Process uptime < 10 minutes
 - `/metrics` fetch fails (curl error or empty response)

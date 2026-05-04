@@ -270,3 +270,30 @@ detect_crash_state() {
     CRASH_HASH_MISMATCH="yes"
   fi
 }
+
+# ─────────────────────────────────────────────────────────────────────────────
+# grep_heartbeat_lines LOG_FILE [TAIL_COUNT]
+#
+# Prints heartbeat event lines from LOG_FILE.
+# If TAIL_COUNT is provided, returns only the most recent N lines.
+#
+# Detection contract:
+#   Text:  heartbeat=true  or  heartbeat: true
+#   JSON:  "heartbeat":true
+#
+# Exit: preserves grep semantics (0=match, 1=no-match, 2=error).
+# ─────────────────────────────────────────────────────────────────────────────
+grep_heartbeat_lines() {
+  local log_file="${1:?log file required}"
+  local tail_count="${2:-}"
+  local pattern='heartbeat\s*[=:]\s*true|"heartbeat"\s*:\s*true'
+  if [[ -n "$tail_count" ]]; then
+    local output rc
+    output=$(grep -E "$pattern" "$log_file" 2>/dev/null)
+    rc=$?
+    [[ $rc -ne 0 ]] && return $rc
+    printf '%s\n' "$output" | tail -n "$tail_count"
+  else
+    grep -E "$pattern" "$log_file" 2>/dev/null
+  fi
+}

@@ -141,7 +141,7 @@ doesn't change when it should — you MUST investigate. Specifically:
   Investigate the catchup path, the buffered-catchup code, and the checkpoint
   download logic, then route through the Bug / CI-Failure Filing Workflow.
 - **"Real-time sync" means `age < 30s` (RPC healthy), NOT just `gap == 0`.**
-  The Heartbeat `gap = latest_ext - ledger` is the node's *local* view —
+  The heartbeat event `gap = latest_ext - ledger` is the node's *local* view —
   gap=0 only says the node has closed everything *it has observed* as
   externalized. The node can be behind network tip by many ledgers while
   still reporting gap=0 if it hasn't received those externalization messages
@@ -151,7 +151,7 @@ doesn't change when it should — you MUST investigate. Specifically:
   ~5s, so a healthy validator always sits in the 0-20s age band. If `age`
   is persistently > 30s (RPC `status=unhealthy`) across multiple ticks on
   a non-fresh-start node past the 15m deadline, the node is **lagging
-  network tip** — treat this as SYNC FAILURE even when Heartbeat gap=0.
+  network tip** — treat this as SYNC FAILURE even when heartbeat event gap=0.
   File/comment per the Bug Filing Workflow. Do NOT downgrade it to OK
   just because heard_from_quorum=true and gap=0.
 
@@ -223,7 +223,7 @@ traffic-proportional and self-calibrating.
 
 **Ratio check skip conditions** (skip all ratio checks when any is true):
 - `FRESH_START=yes` (replaying history)
-- Heartbeat gap > 5 (catching up)
+- heartbeat event `gap` > 5 (catching up)
 - `stellar_ledger_age_current_seconds > 30` (not in real-time sync — works in both validator and watcher modes)
 - Process uptime < 10 minutes (warmup)
 - `/metrics` fetch fails
@@ -789,7 +789,7 @@ When the OBSRVR Radar API reports `isValidating: false` or low
 
 2. **Check heartbeat for EXTERNALIZE counts**:
    ```
-   grep 'Heartbeat' ~/data/<session-id>/logs/monitor.log | tail -5
+   grep_heartbeat_lines ~/data/<session-id>/logs/monitor.log 5
    ```
    Look at `scp_sent_ext` — this should be incrementing roughly once
    per ledger close (~5 seconds). If it's 0 or not growing, the node
@@ -809,7 +809,7 @@ When the OBSRVR Radar API reports `isValidating: false` or low
    overlay peer and listens for SCP messages. Verify the node has
    inbound peers and is advertising the correct port:
    ```
-   grep 'Heartbeat' ~/data/<session-id>/logs/monitor.log | tail -1
+   grep_heartbeat_lines ~/data/<session-id>/logs/monitor.log 1
    ```
    Check `peers` count. If 0, the node can't broadcast to anyone.
 
