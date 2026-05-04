@@ -28,6 +28,53 @@ pub(crate) const FATAL_WIPE_FIELD: &str = "fatal_wipe_required";
 #[cfg(test)]
 pub(crate) const HEARTBEAT_FIELD: &str = "heartbeat";
 
+/// Emit the summary heartbeat log event with the `heartbeat = true` sentinel.
+///
+/// This is the **sole** emitter of the `heartbeat` structured field. External
+/// monitoring tools grep for this field to detect heartbeat events. Extracting
+/// the log call into a standalone function enables direct unit testing of the
+/// monitoring contract without spinning up the full event loop.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn emit_heartbeat_log(
+    tracking_slot: u64,
+    ledger: u32,
+    latest_ext: u64,
+    peers: usize,
+    heard_from_quorum: bool,
+    is_v_blocking: bool,
+    scp_total: u64,
+    scp_since_last: u64,
+    scp_silent_secs: u64,
+    scp_sent: u64,
+    scp_sent_nom: u64,
+    scp_sent_prep: u64,
+    scp_sent_conf: u64,
+    scp_sent_ext: u64,
+    peer_max_verified: u64,
+    peer_gap: u64,
+) {
+    tracing::info!(
+        heartbeat = true,
+        tracking_slot,
+        ledger,
+        latest_ext,
+        peers,
+        heard_from_quorum,
+        is_v_blocking,
+        scp_total,
+        scp_since_last,
+        scp_silent_secs,
+        scp_sent,
+        scp_sent_nom,
+        scp_sent_prep,
+        scp_sent_conf,
+        scp_sent_ext,
+        peer_max_verified,
+        peer_gap,
+        "Heartbeat"
+    );
+}
+
 /// Compute the query rate-limit window (parity: Peer.cpp:1426-1429).
 ///
 /// Re-exported from the overlay's shared query policy module.
@@ -1012,25 +1059,23 @@ impl App {
                     let ext_sent = self.scp_externalize_sent.load(Ordering::Relaxed);
                     let peer_max_verified = self.max_verified_scp_slot.load(Ordering::Relaxed);
                     let peer_gap = self.effective_peer_gap(ledger);
-                    tracing::info!(
-                        heartbeat = true,
+                    emit_heartbeat_log(
                         tracking_slot,
                         ledger,
                         latest_ext,
                         peers,
                         heard_from_quorum,
                         is_v_blocking,
-                        scp_total = scp_messages_received,
-                        scp_since_last = scp_messages_received - scp_messages_last_heartbeat,
-                        scp_silent_secs = last_scp_message_at.elapsed().as_secs(),
+                        scp_messages_received,
+                        scp_messages_received - scp_messages_last_heartbeat,
+                        last_scp_message_at.elapsed().as_secs(),
                         scp_sent,
-                        scp_sent_nom = nom_sent,
-                        scp_sent_prep = prep_sent,
-                        scp_sent_conf = conf_sent,
-                        scp_sent_ext = ext_sent,
+                        nom_sent,
+                        prep_sent,
+                        conf_sent,
+                        ext_sent,
                         peer_max_verified,
                         peer_gap,
-                        "Heartbeat"
                     );
                     scp_messages_last_heartbeat = scp_messages_received;
 
@@ -3016,12 +3061,37 @@ mod fatal_wipe_field_tests {
 /// formatters render it in grep-able form.
 #[cfg(test)]
 mod heartbeat_field_tests {
-    use super::HEARTBEAT_FIELD;
+    use super::{emit_heartbeat_log, HEARTBEAT_FIELD};
     use std::io;
     use std::sync::{Arc, Mutex};
 
-    /// Verify the heartbeat event emits the structured field `heartbeat = true`
-    /// via a capturing subscriber.
+    /// Call `emit_heartbeat_log` with representative dummy values.
+    fn emit_test_heartbeat() {
+        emit_heartbeat_log(
+            100,  // tracking_slot
+            99,   // ledger
+            98,   // latest_ext
+            5,    // peers
+            true, // heard_from_quorum
+            true, // is_v_blocking
+            1000, // scp_total
+            10,   // scp_since_last
+            5,    // scp_silent_secs
+            50,   // scp_sent
+            20,   // scp_sent_nom
+            15,   // scp_sent_prep
+            10,   // scp_sent_conf
+            5,    // scp_sent_ext
+            97,   // peer_max_verified
+            3,    // peer_gap
+        );
+    }
+
+    /// Verify `emit_heartbeat_log` emits the structured field
+    /// `heartbeat = true` via a capturing subscriber.
+    ///
+    /// This calls the real production helper, not a raw `tracing::info!`,
+    /// so it will break if the field is ever removed from `emit_heartbeat_log`.
     #[test]
     fn test_heartbeat_emits_field_structured() {
         use tracing::{
@@ -3071,13 +3141,13 @@ mod heartbeat_field_tests {
         let captured = sub.captured.clone();
 
         with_default(sub, || {
-            tracing::info!(heartbeat = true, "Heartbeat");
+            emit_test_heartbeat();
         });
 
         assert_eq!(
             *captured.lock().unwrap(),
             Some(true),
-            "heartbeat event must emit {HEARTBEAT_FIELD}=true"
+            "emit_heartbeat_log must emit {HEARTBEAT_FIELD}=true"
         );
     }
 
@@ -3102,13 +3172,17 @@ mod heartbeat_field_tests {
             .with(fmt_layer);
 
         with_default(subscriber, || {
-            tracing::info!(heartbeat = true, "Heartbeat");
+            emit_test_heartbeat();
         });
 
         let output = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
         assert!(
             output.contains("heartbeat=true"),
             "Text format must render field as 'heartbeat=true' for grep. Got: {output}"
+        );
+        assert!(
+            output.contains("Heartbeat"),
+            "Text format must still contain the prose message 'Heartbeat'. Got: {output}"
         );
     }
 
@@ -3134,13 +3208,17 @@ mod heartbeat_field_tests {
             .with(fmt_layer);
 
         with_default(subscriber, || {
-            tracing::info!(heartbeat = true, "Heartbeat");
+            emit_test_heartbeat();
         });
 
         let output = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
         assert!(
             output.contains("\"heartbeat\":true"),
             "JSON format must render field as '\"heartbeat\":true' for grep. Got: {output}"
+        );
+        assert!(
+            output.contains("Heartbeat"),
+            "JSON format must still contain the prose message 'Heartbeat'. Got: {output}"
         );
     }
 
