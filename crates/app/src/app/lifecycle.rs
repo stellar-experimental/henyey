@@ -2841,10 +2841,15 @@ mod fatal_wipe_field_tests {
     use std::io;
     use std::sync::{Arc, Mutex};
 
-    /// Verify the field is emitted as a structured boolean via a capturing
-    /// subscriber (format-independent).
-    #[test]
-    fn test_fatal_shutdown_emits_wipe_field_structured() {
+    /// Verify `trigger_fatal_shutdown()` emits the structured field
+    /// `fatal_wipe_required = true` via a capturing subscriber.
+    ///
+    /// This calls the actual `App::trigger_fatal_shutdown()` method, not a raw
+    /// `tracing::error!`, so it will break if the field is ever removed from
+    /// the method.
+    #[tokio::test]
+    async fn test_fatal_shutdown_emits_wipe_field_structured() {
+        use std::sync::atomic::Ordering;
         use tracing::{
             field::{Field, Visit},
             subscriber::with_default,
@@ -2888,17 +2893,28 @@ mod fatal_wipe_field_tests {
             fn exit(&self, _: &tracing::span::Id) {}
         }
 
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-test.db");
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
+        let app = super::super::App::new(config).await.unwrap();
+
         let sub = WipeFieldSubscriber::default();
         let captured = sub.captured.clone();
 
         with_default(sub, || {
-            tracing::error!(fatal_wipe_required = true, "test fatal shutdown");
+            app.trigger_fatal_shutdown("test reason");
         });
 
         assert_eq!(
             *captured.lock().unwrap(),
             Some(true),
             "trigger_fatal_shutdown must emit {FATAL_WIPE_FIELD}=true"
+        );
+        assert!(
+            app.fatal_state_failure.load(Ordering::SeqCst),
+            "fatal_state_failure must be set"
         );
     }
 
