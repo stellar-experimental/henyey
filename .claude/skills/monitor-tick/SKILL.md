@@ -337,14 +337,14 @@ fi
 recent_count=$(printf '%s\n' "$recent_crashed" | grep -c .)
 latest_crashed=$(printf '%s\n' "$recent_crashed" | head -1 | cut -d' ' -f2-)
 hash_mismatch_signal="no"
-if [ -n "$latest_crashed" ] && grep -q 'State wipe required before restart' "$latest_crashed" 2>/dev/null; then
+if [ -n "$latest_crashed" ] && grep -qE 'fatal_wipe_required\s*[=:]\s*true|State wipe required before restart' "$latest_crashed" 2>/dev/null; then
   hash_mismatch_signal="yes"
 fi
 ```
 
 Trigger the wipe when ALL hold:
 1. `recent_count >= 3` (3+ crashed rotations in the last 30 min — proves restart-without-fix isn't recovering)
-2. `hash_mismatch_signal == "yes"` (the most recent crash logged "State wipe required before restart" — the invariant emitted by `trigger_fatal_shutdown()` for any unrecoverable local state corruption)
+2. `hash_mismatch_signal == "yes"` (the most recent crash logged the structured field `fatal_wipe_required=true` or the legacy prose "State wipe required before restart" — emitted by `trigger_fatal_shutdown()` for any unrecoverable local state corruption)
 3. `FRESH_START=no` (don't fire on a fresh sync that hasn't completed yet)
 
 When triggered:

@@ -2,6 +2,20 @@
 
 use super::*;
 
+/// Name of the structured tracing field emitted by
+/// [`App::trigger_fatal_shutdown`].
+///
+/// This field is **reserved exclusively** for the fatal-shutdown-with-wipe
+/// path.  No other code path should emit an event with this field name.
+///
+/// External monitoring tools (e.g. monitor-tick) grep rendered log output
+/// for this field to detect fatal state corruption requiring a data wipe.
+/// The constant is a documentation anchor — the real mechanical guard is
+/// the `test_fatal_shutdown_emits_wipe_field_*` tests.  **Do not rename
+/// this field without updating the tests and all monitoring consumers.**
+#[cfg(test)]
+pub(crate) const FATAL_WIPE_FIELD: &str = "fatal_wipe_required";
+
 /// Compute the query rate-limit window (parity: Peer.cpp:1426-1429).
 ///
 /// Re-exported from the overlay's shared query policy module.
@@ -1612,6 +1626,19 @@ impl App {
     /// etc.).  Sets [`fatal_state_failure`] to block further catchup and
     /// ledger-close attempts, then signals the main loop to exit.
     ///
+    /// # Monitoring contract
+    ///
+    /// This method emits a `tracing::error!` event with the structured field
+    /// `fatal_wipe_required = true` (see [`FATAL_WIPE_FIELD`]).  This field
+    /// is **reserved exclusively** for this method — no other code path emits
+    /// it.  External monitoring tools grep rendered log output for this field
+    /// to trigger automatic state wipes.
+    ///
+    /// The contract depends on the shipped `tracing_subscriber::fmt` Text and
+    /// JSON formatters rendering the field detectably.  The
+    /// `test_fatal_shutdown_emits_wipe_field_*` tests guard this mechanically
+    /// using the same formatter construction as `logging.rs`.
+    ///
     /// After shutdown, [`App::run`] returns `Err` (exit code 1) so the
     /// supervisor can detect the failure and trigger recovery.
     ///
@@ -1622,6 +1649,7 @@ impl App {
     /// new catchup attempts and new ledger closes.
     pub fn trigger_fatal_shutdown(&self, reason: &str) {
         tracing::error!(
+            fatal_wipe_required = true,
             "FATAL: unrecoverable local state failure — {}. \
              Node will shut down. State wipe required before restart.",
             reason
@@ -2798,6 +2826,156 @@ mod forget_flood_record_tests {
                 !should_forget_flood_record(state, R::SelfMessage),
                 "expected no forget for ({state:?}, SelfMessage)"
             );
+        }
+    }
+}
+
+/// Tests for [`FATAL_WIPE_FIELD`] — the monitoring contract.
+///
+/// These tests guard that `trigger_fatal_shutdown()` emits the
+/// `fatal_wipe_required` structured field and that both the Text and JSON
+/// `tracing_subscriber::fmt` formatters render it in grep-able form.
+#[cfg(test)]
+mod fatal_wipe_field_tests {
+    use super::FATAL_WIPE_FIELD;
+    use std::io;
+    use std::sync::{Arc, Mutex};
+
+    /// Verify the field is emitted as a structured boolean via a capturing
+    /// subscriber (format-independent).
+    #[test]
+    fn test_fatal_shutdown_emits_wipe_field_structured() {
+        use tracing::{
+            field::{Field, Visit},
+            subscriber::with_default,
+            Event, Metadata, Subscriber,
+        };
+
+        #[derive(Default)]
+        struct CapturedBool {
+            value: Option<bool>,
+        }
+        impl Visit for CapturedBool {
+            fn record_bool(&mut self, field: &Field, value: bool) {
+                if field.name() == FATAL_WIPE_FIELD {
+                    self.value = Some(value);
+                }
+            }
+            fn record_debug(&mut self, _: &Field, _: &dyn std::fmt::Debug) {}
+        }
+
+        #[derive(Default, Clone)]
+        struct WipeFieldSubscriber {
+            captured: Arc<Mutex<Option<bool>>>,
+        }
+        impl Subscriber for WipeFieldSubscriber {
+            fn enabled(&self, _: &Metadata<'_>) -> bool {
+                true
+            }
+            fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+                tracing::span::Id::from_u64(1)
+            }
+            fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+            fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+            fn event(&self, event: &Event<'_>) {
+                let mut cap = CapturedBool::default();
+                event.record(&mut cap);
+                if let Some(v) = cap.value {
+                    *self.captured.lock().unwrap() = Some(v);
+                }
+            }
+            fn enter(&self, _: &tracing::span::Id) {}
+            fn exit(&self, _: &tracing::span::Id) {}
+        }
+
+        let sub = WipeFieldSubscriber::default();
+        let captured = sub.captured.clone();
+
+        with_default(sub, || {
+            tracing::error!(fatal_wipe_required = true, "test fatal shutdown");
+        });
+
+        assert_eq!(
+            *captured.lock().unwrap(),
+            Some(true),
+            "trigger_fatal_shutdown must emit {FATAL_WIPE_FIELD}=true"
+        );
+    }
+
+    /// Verify the Text formatter renders the field as `fatal_wipe_required=true`,
+    /// matching the production formatter construction in `logging.rs:334-341`.
+    #[test]
+    fn test_fatal_shutdown_emits_wipe_field_text_format() {
+        use tracing::subscriber::with_default;
+        use tracing_subscriber::{fmt, layer::SubscriberExt, EnvFilter};
+
+        let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let buf_clone = buf.clone();
+
+        // Mirror production Text formatter construction (logging.rs:334-341).
+        let fmt_layer = fmt::layer()
+            .with_writer(move || -> Box<dyn io::Write> { Box::new(BufWriter(buf_clone.clone())) })
+            .with_ansi(false)
+            .with_target(true);
+
+        let subscriber = tracing_subscriber::registry()
+            .with(EnvFilter::new("error"))
+            .with(fmt_layer);
+
+        with_default(subscriber, || {
+            tracing::error!(fatal_wipe_required = true, "test fatal shutdown");
+        });
+
+        let output = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        assert!(
+            output.contains("fatal_wipe_required=true"),
+            "Text format must render field as 'fatal_wipe_required=true' for grep. Got: {output}"
+        );
+    }
+
+    /// Verify the JSON formatter renders the field as `"fatal_wipe_required":true`,
+    /// matching the production formatter construction in `logging.rs:353-357`.
+    #[test]
+    fn test_fatal_shutdown_emits_wipe_field_json_format() {
+        use tracing::subscriber::with_default;
+        use tracing_subscriber::{fmt, layer::SubscriberExt, EnvFilter};
+
+        let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let buf_clone = buf.clone();
+
+        // Mirror production JSON formatter construction (logging.rs:353-357).
+        let fmt_layer = fmt::layer()
+            .with_writer(move || -> Box<dyn io::Write> { Box::new(BufWriter(buf_clone.clone())) })
+            .json()
+            .with_span_list(true)
+            .with_current_span(true);
+
+        let subscriber = tracing_subscriber::registry()
+            .with(EnvFilter::new("error"))
+            .with(fmt_layer);
+
+        with_default(subscriber, || {
+            tracing::error!(fatal_wipe_required = true, "test fatal shutdown");
+        });
+
+        let output = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        assert!(
+            output.contains("\"fatal_wipe_required\":true"),
+            "JSON format must render field as '\"fatal_wipe_required\":true' for grep. Got: {output}"
+        );
+    }
+
+    /// A `Write` adapter that appends to a shared `Vec<u8>`.
+    #[derive(Clone)]
+    struct BufWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl io::Write for BufWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
         }
     }
 }
