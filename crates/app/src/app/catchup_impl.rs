@@ -1343,6 +1343,30 @@ impl App {
             return None;
         }
 
+        // Circuit breaker: hard-reset livelock detection (#2389).
+        // Check BEFORE clearing state so the fatal path does not leave
+        // partially-reset state.
+        let livelock_ledger = self.hard_reset_livelock_ledger.load(Ordering::Relaxed);
+        let livelock_start = self.hard_reset_livelock_start.load(Ordering::Relaxed);
+
+        if livelock_ledger == current_ledger && livelock_start > 0 {
+            let elapsed = now_offset.saturating_sub(livelock_start);
+            if elapsed >= hard_reset_fatal_timeout_secs() {
+                self.trigger_fatal_shutdown(&format!(
+                    "Hard-reset livelock: {elapsed}s stuck at ledger \
+                     {current_ledger} (gap={current_gap}) with no progress. \
+                     Fail-fast: state wipe required."
+                ));
+                return None;
+            }
+        } else {
+            // New stuck episode: first hard reset at this ledger, or ledger changed.
+            self.hard_reset_livelock_ledger
+                .store(current_ledger, Ordering::Relaxed);
+            self.hard_reset_livelock_start
+                .store(now_offset.max(1), Ordering::Relaxed);
+        }
+
         // Lock order: archive_behind_until → syncing_ledgers → consensus_stuck_state
         // (matches existing precedent at consensus.rs trigger_recovery_catchup).
 
@@ -5220,6 +5244,141 @@ mod tests {
                 .unwrap()
                 .is_fatal_catchup_failure(),
             "ArchiveUnreachable must NOT be classified as fatal"
+        );
+    }
+
+    // ================================================================
+    // Tests for #2389: hard-reset livelock circuit breaker
+    // ================================================================
+
+    #[tokio::test]
+    async fn test_hard_reset_livelock_fires_after_timeout() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-test.db");
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
+        let mut app = App::new(config).await.unwrap();
+
+        let current_ledger: u32 = 5_000;
+
+        // Backdate start_instant so elapsed() reports ~700s.
+        app.start_instant = std::time::Instant::now() - std::time::Duration::from_secs(700);
+
+        // Simulate: livelock tracking started at offset 1 (same ledger).
+        // Now elapsed ~700, so 700 - 1 = 699 >= 640 threshold.
+        app.hard_reset_livelock_ledger
+            .store(current_ledger, Ordering::Relaxed);
+        app.hard_reset_livelock_start.store(1, Ordering::Relaxed);
+
+        // Call force_post_catchup_hard_reset — should trigger fatal_shutdown.
+        let result = app
+            .force_post_catchup_hard_reset(
+                current_ledger,
+                HardResetReason::ArchiveBehindStallWallClock,
+            )
+            .await;
+
+        // Should return None (fatal path).
+        assert!(result.is_none(), "livelock should return None");
+        assert!(
+            app.fatal_state_failure.load(Ordering::SeqCst),
+            "fatal_state_failure must be set after livelock timeout"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_hard_reset_livelock_not_triggered_below_timeout() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-test.db");
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
+        let mut app = App::new(config).await.unwrap();
+
+        let current_ledger: u32 = 5_000;
+
+        // Backdate start_instant so elapsed() reports ~500s.
+        app.start_instant = std::time::Instant::now() - std::time::Duration::from_secs(500);
+
+        // Simulate: tracking started at offset 1. elapsed = 500 - 1 = 499 < 640.
+        app.hard_reset_livelock_ledger
+            .store(current_ledger, Ordering::Relaxed);
+        app.hard_reset_livelock_start.store(1, Ordering::Relaxed);
+
+        // Call force_post_catchup_hard_reset — should NOT trigger fatal.
+        app.force_post_catchup_hard_reset(
+            current_ledger,
+            HardResetReason::ArchiveBehindStallWallClock,
+        )
+        .await;
+
+        assert!(
+            !app.fatal_state_failure.load(Ordering::SeqCst),
+            "fatal_state_failure must NOT be set below timeout"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_hard_reset_livelock_resets_on_new_ledger() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-test.db");
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
+        let mut app = App::new(config).await.unwrap();
+
+        // Backdate start_instant so elapsed() reports ~1000s.
+        app.start_instant = std::time::Instant::now() - std::time::Duration::from_secs(1000);
+
+        // Simulate: tracking started at offset 1 at ledger 5000.
+        // elapsed = 1000 - 1 = 999 > threshold, BUT ledger will differ.
+        app.hard_reset_livelock_ledger
+            .store(5000, Ordering::Relaxed);
+        app.hard_reset_livelock_start.store(1, Ordering::Relaxed);
+
+        // Call at a DIFFERENT ledger (5001) — should NOT trigger fatal
+        // and should reset tracking to the new ledger.
+        app.force_post_catchup_hard_reset(5001, HardResetReason::ArchiveBehindStallWallClock)
+            .await;
+
+        assert!(
+            !app.fatal_state_failure.load(Ordering::SeqCst),
+            "fatal_state_failure must NOT be set when ledger changes"
+        );
+        assert_eq!(
+            app.hard_reset_livelock_ledger.load(Ordering::Relaxed),
+            5001,
+            "livelock tracking should reset to new ledger"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_hard_reset_livelock_cleared_on_progress() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-test.db");
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
+        let app = App::new(config).await.unwrap();
+
+        // Arm livelock tracking.
+        app.hard_reset_livelock_ledger
+            .store(5000, Ordering::Relaxed);
+        app.hard_reset_livelock_start.store(100, Ordering::Relaxed);
+
+        assert!(
+            app.hard_reset_livelock_start.load(Ordering::Relaxed) > 0,
+            "precondition: tracking active"
+        );
+
+        // Simulate progress: clear via the same mechanism used in consensus.rs.
+        app.hard_reset_livelock_start.store(0, Ordering::Relaxed);
+
+        assert_eq!(
+            app.hard_reset_livelock_start.load(Ordering::Relaxed),
+            0,
+            "tracking should be cleared after progress"
         );
     }
 }

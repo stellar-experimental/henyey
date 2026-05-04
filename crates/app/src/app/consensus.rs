@@ -247,6 +247,8 @@ impl App {
             let mut guard = self.archive_behind_until.write().await;
             *guard = None;
             self.archive_checkpoint_cache.set_urgent(false);
+            // Clear hard-reset livelock tracking: ledger advanced (#2389).
+            self.hard_reset_livelock_start.store(0, Ordering::Relaxed);
         }
         let attempts = self
             .recovery_attempts_without_progress

@@ -588,6 +588,9 @@ impl App {
                                 if made_progress && pending.re_arm_recovery {
                                     self.reset_recovery_attempts(1);
                                     self.sync_recovery_pending.store(true, Ordering::SeqCst);
+                                    // Clear hard-reset livelock tracking (#2389).
+                                    self.hard_reset_livelock_start
+                                        .store(0, Ordering::Relaxed);
                                 }
 
                                 // Refresh the overlay query window after catchup — the
