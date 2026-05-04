@@ -153,15 +153,21 @@ async fn ensure_app_accounts_funded(sim: &mut Simulation, expected: usize) {
     assert_eq!(funded_total, expected);
 }
 
-async fn build_app_backed_topology(mut sim: Simulation, threshold_percent: u32) -> Simulation {
+async fn build_app_backed_topology(
+    mut sim: Simulation,
+    threshold_percent: u32,
+    min_peers: usize,
+) -> Simulation {
     sim.populate_app_nodes_from_existing(threshold_percent);
     sim.start_all_nodes().await;
-    sim.stabilize_app_tcp_connectivity(1, Duration::from_secs(20))
+    sim.stabilize_app_tcp_connectivity(min_peers, Duration::from_secs(30))
         .await
-        .expect(
-            "build_app_backed_topology: TCP connectivity did not stabilize \
-             within 20s (min_peers=1). Nodes may not have completed handshakes.",
-        );
+        .unwrap_or_else(|_| {
+            panic!(
+                "build_app_backed_topology: TCP connectivity did not stabilize \
+             within 30s (min_peers={min_peers}). Nodes may not have completed handshakes.",
+            )
+        });
     sim
 }
 
@@ -407,7 +413,7 @@ async fn test_load_account_sequence_finds_root_account() {
 #[tokio::test]
 async fn test_load_account_sequence_pair_topology() {
     let mut sim =
-        build_app_backed_topology(Topologies::pair(SimulationMode::OverLoopback), 100).await;
+        build_app_backed_topology(Topologies::pair(SimulationMode::OverLoopback), 100, 1).await;
 
     // Wait for both nodes to be operational.
     wait_for_app_operational(&sim, "node0", Duration::from_secs(10)).await;
@@ -446,7 +452,8 @@ async fn test_load_account_sequence_pair_topology() {
 
 #[tokio::test]
 async fn test_core3_app_simulation_starts_over_tcp() {
-    let mut sim = build_app_backed_topology(Topologies::core3(SimulationMode::OverTcp), 67).await;
+    let mut sim =
+        build_app_backed_topology(Topologies::core3(SimulationMode::OverTcp), 67, 1).await;
 
     let mut total_peers = 0usize;
 
@@ -495,7 +502,8 @@ async fn test_three_nodes_two_running_threshold_two_over_loopback() {
 
 #[tokio::test]
 async fn test_core3_app_simulation_can_attempt_multi_node_close() {
-    let mut sim = build_app_backed_topology(Topologies::core3(SimulationMode::OverTcp), 67).await;
+    let mut sim =
+        build_app_backed_topology(Topologies::core3(SimulationMode::OverTcp), 67, 1).await;
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     while tokio::time::Instant::now() < deadline {
@@ -524,7 +532,8 @@ async fn test_core3_app_simulation_can_attempt_multi_node_close() {
 
 #[tokio::test]
 async fn test_pair_app_simulation_can_close_ledgers_over_tcp() {
-    let mut sim = build_app_backed_topology(Topologies::pair(SimulationMode::OverTcp), 100).await;
+    let mut sim =
+        build_app_backed_topology(Topologies::pair(SimulationMode::OverTcp), 100, 1).await;
 
     manual_close_until(&sim, 2, 1, Duration::from_secs(20)).await;
 
@@ -534,7 +543,7 @@ async fn test_pair_app_simulation_can_close_ledgers_over_tcp() {
 #[tokio::test]
 async fn test_pair_app_simulation_can_close_ledgers_over_loopback() {
     let mut sim =
-        build_app_backed_topology(Topologies::pair(SimulationMode::OverLoopback), 100).await;
+        build_app_backed_topology(Topologies::pair(SimulationMode::OverLoopback), 100, 1).await;
 
     manual_close_until(&sim, 2, 1, Duration::from_secs(20)).await;
 
@@ -545,7 +554,8 @@ async fn test_pair_app_simulation_can_close_ledgers_over_loopback() {
 
 #[tokio::test]
 async fn test_pair_app_simulation_executes_generated_load_over_tcp() {
-    let mut sim = build_app_backed_topology(Topologies::pair(SimulationMode::OverTcp), 100).await;
+    let mut sim =
+        build_app_backed_topology(Topologies::pair(SimulationMode::OverTcp), 100, 1).await;
 
     ensure_app_accounts_funded(&mut sim, 2).await;
 
@@ -570,7 +580,7 @@ async fn test_pair_app_simulation_executes_generated_load_over_tcp() {
 #[tokio::test]
 async fn test_pair_app_simulation_executes_generated_load_over_loopback() {
     let mut sim =
-        build_app_backed_topology(Topologies::pair(SimulationMode::OverLoopback), 100).await;
+        build_app_backed_topology(Topologies::pair(SimulationMode::OverLoopback), 100, 1).await;
 
     ensure_app_accounts_funded(&mut sim, 2).await;
 
@@ -596,7 +606,8 @@ async fn test_pair_app_simulation_executes_generated_load_over_loopback() {
 
 #[tokio::test]
 async fn test_core4_app_simulation_can_close_ledgers_over_tcp() {
-    let mut sim = build_app_backed_topology(Topologies::core(4, SimulationMode::OverTcp), 75).await;
+    let mut sim =
+        build_app_backed_topology(Topologies::core(4, SimulationMode::OverTcp), 75, 1).await;
 
     manual_close_until(&sim, 2, 1, Duration::from_secs(20)).await;
 
@@ -605,15 +616,8 @@ async fn test_core4_app_simulation_can_close_ledgers_over_tcp() {
 
 #[tokio::test]
 async fn test_cycle4_app_simulation_can_close_ledgers_over_tcp() {
-    let mut sim = build_app_backed_topology(Topologies::cycle4(SimulationMode::OverTcp), 75).await;
-
-    // Cycle4 topology: each node should have 2 peers (ring neighbors).
-    // Wait for full topology connectivity to ensure SCP envelopes can
-    // propagate without multi-hop relay delays that cause nomination timeouts
-    // on slow CI runners.
-    sim.stabilize_app_tcp_connectivity(2, Duration::from_secs(30))
-        .await
-        .expect("cycle4: topology connectivity (2 peers/node) did not stabilize within 30s");
+    let mut sim =
+        build_app_backed_topology(Topologies::cycle4(SimulationMode::OverTcp), 75, 2).await;
 
     manual_close_until(&sim, 2, 1, Duration::from_secs(30)).await;
 
@@ -623,7 +627,7 @@ async fn test_cycle4_app_simulation_can_close_ledgers_over_tcp() {
 #[tokio::test]
 async fn test_core3_app_simulation_can_close_ledgers_over_loopback() {
     let mut sim =
-        build_app_backed_topology(Topologies::core3(SimulationMode::OverLoopback), 67).await;
+        build_app_backed_topology(Topologies::core3(SimulationMode::OverLoopback), 67, 1).await;
 
     manual_close_until(&sim, 2, 1, Duration::from_secs(20)).await;
 
@@ -635,7 +639,7 @@ async fn test_core3_app_simulation_can_close_ledgers_over_loopback() {
 #[tokio::test]
 async fn test_separate_app_simulation_stays_partitioned_over_tcp() {
     let mut sim =
-        build_app_backed_topology(Topologies::separate(SimulationMode::OverTcp), 75).await;
+        build_app_backed_topology(Topologies::separate(SimulationMode::OverTcp), 75, 1).await;
 
     let _ = sim
         .manual_close_all_app_nodes()
@@ -650,7 +654,8 @@ async fn test_separate_app_simulation_stays_partitioned_over_tcp() {
 
 #[tokio::test]
 async fn test_core3_restart_rejoin_over_tcp() {
-    let mut sim = build_app_backed_topology(Topologies::core3(SimulationMode::OverTcp), 66).await;
+    let mut sim =
+        build_app_backed_topology(Topologies::core3(SimulationMode::OverTcp), 66, 1).await;
 
     manual_close_until(&sim, 2, 1, Duration::from_secs(45)).await;
 
@@ -695,7 +700,7 @@ async fn test_core3_restart_rejoin_over_tcp() {
 #[tokio::test]
 async fn test_core3_restart_rejoin_over_loopback() {
     let mut sim =
-        build_app_backed_topology(Topologies::core3(SimulationMode::OverLoopback), 66).await;
+        build_app_backed_topology(Topologies::core3(SimulationMode::OverLoopback), 66, 1).await;
 
     manual_close_until(&sim, 2, 1, Duration::from_secs(45)).await;
 
@@ -839,7 +844,7 @@ async fn assert_all_nodes_healthy(sim: &Simulation) {
 #[tokio::test]
 async fn test_simple_payment_app_backed_core3() {
     let mut sim =
-        build_app_backed_topology(Topologies::core3(SimulationMode::OverLoopback), 67).await;
+        build_app_backed_topology(Topologies::core3(SimulationMode::OverLoopback), 67, 1).await;
 
     ensure_app_accounts_funded(&mut sim, 3).await;
 
@@ -862,6 +867,7 @@ async fn test_core4_multi_step_payment_load() {
     let mut sim = build_app_backed_topology(
         Topologies::core(4, SimulationMode::OverLoopback),
         75, // ceil(3/4) = 75%
+        1,
     )
     .await;
 
@@ -887,7 +893,7 @@ async fn test_core4_multi_step_payment_load() {
 #[tokio::test]
 async fn test_core5_over_loopback_can_close_ledgers() {
     let mut sim =
-        build_app_backed_topology(Topologies::core(5, SimulationMode::OverLoopback), 80).await;
+        build_app_backed_topology(Topologies::core(5, SimulationMode::OverLoopback), 80, 1).await;
 
     // Close ledgers 3-10 (8 closes, exercises multiple SCP rounds).
     manual_close_until(&sim, 10, 2, Duration::from_secs(120)).await;
@@ -911,7 +917,7 @@ async fn test_core5_over_loopback_can_close_ledgers() {
 #[tokio::test]
 async fn test_sustained_payment_load_app_backed() {
     let mut sim =
-        build_app_backed_topology(Topologies::core3(SimulationMode::OverLoopback), 67).await;
+        build_app_backed_topology(Topologies::core3(SimulationMode::OverLoopback), 67, 1).await;
 
     ensure_app_accounts_funded(&mut sim, 3).await;
 
@@ -937,7 +943,7 @@ async fn test_sustained_payment_load_app_backed() {
 #[tokio::test]
 async fn test_spike_payment_load_app_backed() {
     let mut sim =
-        build_app_backed_topology(Topologies::core(4, SimulationMode::OverLoopback), 75).await;
+        build_app_backed_topology(Topologies::core(4, SimulationMode::OverLoopback), 75, 1).await;
 
     ensure_app_accounts_funded(&mut sim, 4).await;
 
@@ -990,7 +996,7 @@ async fn test_spike_payment_load_app_backed() {
 #[tokio::test]
 async fn test_tx_queue_contention_app_backed() {
     let mut sim =
-        build_app_backed_topology(Topologies::core3(SimulationMode::OverLoopback), 67).await;
+        build_app_backed_topology(Topologies::core3(SimulationMode::OverLoopback), 67, 1).await;
 
     ensure_app_accounts_funded(&mut sim, 3).await;
 
@@ -1040,7 +1046,7 @@ async fn test_tx_queue_contention_app_backed() {
 #[tokio::test]
 async fn test_slow_node_lagging_node_recovers() {
     let mut sim =
-        build_app_backed_topology(Topologies::core3(SimulationMode::OverLoopback), 66).await;
+        build_app_backed_topology(Topologies::core3(SimulationMode::OverLoopback), 66, 1).await;
 
     // Fund accounts so we can submit payments.
     ensure_app_accounts_funded(&mut sim, 3).await;
