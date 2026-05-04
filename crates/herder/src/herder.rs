@@ -9781,10 +9781,14 @@ mod dynamic_close_time_tests {
 #[cfg(test)]
 mod prev_value_guard_tests {
     use super::*;
+    use crate::tx_queue::TransactionSet;
+    use henyey_common::Hash256;
+    use henyey_crypto::SecretKey;
     use henyey_ledger::{LedgerManager, LedgerManagerConfig};
     use stellar_xdr::curr::{
-        Hash, LedgerHeader, LedgerHeaderExt, Limits, StellarValue, StellarValueExt, TimePoint,
-        Value, VecM, WriteXdr,
+        EnvelopeType, Hash, LedgerCloseValueSignature, LedgerHeader, LedgerHeaderExt, Limits,
+        NodeId as XdrNodeId, ScpBallot, ScpStatement, ScpStatementExternalize, ScpStatementPledges,
+        Signature as XdrSignature, StellarValue, StellarValueExt, TimePoint, Value, VecM, WriteXdr,
     };
 
     /// Create a LedgerManager initialized at `ledger_seq` with the given `scp_value`.
@@ -9951,6 +9955,236 @@ mod prev_value_guard_tests {
         assert_eq!(
             result, cached_value,
             "without LM, must fall back to cached prev_value"
+        );
+    }
+
+    // =========================================================================
+    // Helpers for end-to-end tests (issue #2345)
+    // =========================================================================
+
+    /// Build a properly signed SCP `Value` with a custom close time.
+    ///
+    /// Creates a `TransactionSet`, caches it in `scp_driver`, builds a
+    /// `StellarValue` with `StellarValueExt::Signed`, and returns the
+    /// XDR-encoded `Value`. Mirrors `make_valid_value_with_cached_tx_set`
+    /// (herder.rs tests module) but accepts `close_time`.
+    fn make_externalize_value_with_close_time(
+        herder: &Herder,
+        secret: &SecretKey,
+        close_time: u64,
+    ) -> Value {
+        let tx_set = TransactionSet::new(Hash256::ZERO, Vec::new());
+        let tx_set_hash = *tx_set.hash();
+        herder.scp_driver.cache_tx_set(tx_set);
+
+        let xdr_tx_set_hash = Hash(tx_set_hash.0);
+        let ct = TimePoint(close_time);
+
+        // Sign: (networkID, ENVELOPE_TYPE_SCPVALUE, txSetHash, closeTime)
+        let network_id = herder.scp_driver.network_id();
+        let mut sign_data = network_id.0.to_vec();
+        sign_data.extend_from_slice(&EnvelopeType::Scpvalue.to_xdr(Limits::none()).unwrap());
+        sign_data.extend_from_slice(&xdr_tx_set_hash.to_xdr(Limits::none()).unwrap());
+        sign_data.extend_from_slice(&ct.to_xdr(Limits::none()).unwrap());
+        let sig = secret.sign(&sign_data);
+
+        let node_id = XdrNodeId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
+            stellar_xdr::curr::Uint256(*secret.public_key().as_bytes()),
+        ));
+
+        let stellar_value = StellarValue {
+            tx_set_hash: xdr_tx_set_hash,
+            close_time: ct,
+            upgrades: VecM::default(),
+            ext: StellarValueExt::Signed(LedgerCloseValueSignature {
+                node_id,
+                signature: stellar_xdr::curr::Signature(
+                    sig.0.to_vec().try_into().unwrap_or_default(),
+                ),
+            }),
+        };
+        Value(
+            stellar_value
+                .to_xdr(Limits::none())
+                .unwrap()
+                .try_into()
+                .unwrap(),
+        )
+    }
+
+    /// Build a signed EXTERNALIZE envelope for a given slot and value.
+    ///
+    /// Mirrors `sign_statement` / `make_signed_externalize_from` from the
+    /// sibling tests module but is accessible within `prev_value_guard_tests`.
+    fn make_signed_externalize(
+        slot: u64,
+        herder: &Herder,
+        secret: &SecretKey,
+        value: Value,
+    ) -> ScpEnvelope {
+        let node_id = XdrNodeId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
+            stellar_xdr::curr::Uint256(*secret.public_key().as_bytes()),
+        ));
+
+        let statement = ScpStatement {
+            node_id,
+            slot_index: slot,
+            pledges: ScpStatementPledges::Externalize(ScpStatementExternalize {
+                commit: ScpBallot { counter: 1, value },
+                n_h: 1,
+                commit_quorum_set_hash: Hash([0u8; 32]),
+            }),
+        };
+
+        let statement_bytes = statement.to_xdr(Limits::none()).unwrap();
+        let mut data = herder.scp_driver.network_id().0.to_vec();
+        data.extend_from_slice(&1i32.to_be_bytes()); // ENVELOPE_TYPE_SCP = 1
+        data.extend_from_slice(&statement_bytes);
+
+        let signature = secret.sign(&data);
+        let sig_bytes: Vec<u8> = signature.as_bytes().to_vec();
+
+        ScpEnvelope {
+            statement,
+            signature: XdrSignature(sig_bytes.try_into().unwrap()),
+        }
+    }
+
+    // =========================================================================
+    // End-to-end retrograde externalization test (issue #2345)
+    // =========================================================================
+
+    /// End-to-end test: retrograde externalization must NOT overwrite prev_value.
+    ///
+    /// Unlike `test_prev_value_not_overwritten_by_retrograde_externalization`
+    /// which manually reenacts the guard, this test drives the real
+    /// `receive_scp_envelope` → `process_scp_envelope_with_tx_set` path.
+    ///
+    /// Scenario:
+    /// 1. Bootstrap at ledger 100 (tracking slot 101)
+    /// 2. Externalize slot 101 via receive_scp_envelope → prev_value = value_101
+    /// 3. Send retrograde EXTERNALIZE for slot 99 → prev_value must still be value_101
+    #[test]
+    fn test_retrograde_externalization_e2e_preserves_prev_value() {
+        // -- Setup: validator herder with 2 validators (threshold 1) ----------
+        let local_secret = SecretKey::from_seed(&[7u8; 32]);
+        let local_public = local_secret.public_key();
+        let local_node_id = node_id_from_public_key(&local_public);
+
+        let peer_secret = SecretKey::from_seed(&[1u8; 32]);
+        let peer_public = peer_secret.public_key();
+        let peer_node_id = node_id_from_public_key(&peer_public);
+
+        let quorum_set = ScpQuorumSet {
+            threshold: 1,
+            validators: vec![local_node_id.clone(), peer_node_id.clone()]
+                .try_into()
+                .unwrap(),
+            inner_sets: vec![].try_into().unwrap(),
+        };
+
+        let config = HerderConfig {
+            is_validator: true,
+            node_public_key: local_public,
+            local_quorum_set: Some(quorum_set.clone()),
+            ..HerderConfig::default()
+        };
+
+        let herder = Herder::with_secret_key(config, SecretKey::from_seed(&[7u8; 32]));
+
+        // No LedgerManager installed — this test targets the prev_value cache
+        // guard, which is the fallback path used when no LM is present.
+        // (With LM, get_previous_value() reads from LCL directly.)
+
+        herder.start_syncing();
+        herder.bootstrap(100); // tracking slot = 101
+
+        // Register peer in quorum tracker
+        herder
+            .quorum_tracker
+            .write()
+            .expand(&peer_node_id, quorum_set)
+            .unwrap();
+
+        // -- Build distinct values for slot 101 and slot 99 ------------------
+        let value_101 = make_externalize_value_with_close_time(&herder, &peer_secret, 1001);
+        let value_99 = make_externalize_value_with_close_time(&herder, &peer_secret, 999);
+        assert_ne!(
+            value_101, value_99,
+            "values must be byte-distinct to make the test meaningful"
+        );
+
+        // -- Forward externalization: slot 101 --------------------------------
+        let env_101 = make_signed_externalize(101, &herder, &peer_secret, value_101.clone());
+        let result_101 = herder.receive_scp_envelope(env_101);
+        assert_eq!(
+            result_101,
+            EnvelopeState::Valid,
+            "forward EXTERNALIZE for slot 101 must be accepted"
+        );
+        assert!(
+            herder.scp().is_slot_externalized(101),
+            "slot 101 must be externalized by SCP"
+        );
+        assert_eq!(
+            herder.tracking_slot(),
+            102,
+            "tracking must advance to 102 after externalizing 101"
+        );
+        assert_eq!(
+            *herder.prev_value.read(),
+            value_101,
+            "prev_value cache must hold slot 101's value after forward externalization"
+        );
+
+        // -- Retrograde externalization: slot 99 ------------------------------
+        let env_99 = make_signed_externalize(99, &herder, &peer_secret, value_99.clone());
+        let result_99 = herder.receive_scp_envelope(env_99);
+
+        // The retrograde envelope must reach the externalization path
+        // (not be rejected by pre-filter or signature verification).
+        assert_eq!(
+            result_99,
+            EnvelopeState::Valid,
+            "retrograde EXTERNALIZE for slot 99 must pass pre-filter and reach SCP"
+        );
+        assert!(
+            herder.scp().is_slot_externalized(99),
+            "slot 99 must be externalized by SCP (retrograde still processes through SCP)"
+        );
+        // Confirm the herder post-SCP block ran (record_externalized)
+        let ext_99 = herder.scp_driver.get_externalized(99);
+        assert!(
+            ext_99.is_some(),
+            "slot 99 must be recorded in scp_driver.externalized"
+        );
+        assert_eq!(
+            ext_99.unwrap().value,
+            value_99,
+            "externalized slot 99 must contain value_99"
+        );
+
+        // -- Verify state did NOT regress -------------------------------------
+        assert_eq!(
+            herder.tracking_slot(),
+            102,
+            "tracking must NOT regress after retrograde externalization"
+        );
+        assert_eq!(
+            herder.latest_externalized_slot(),
+            Some(101),
+            "latest_externalized_slot must remain 101 (not regress to 99)"
+        );
+
+        // -- The key assertion: prev_value guard prevented overwrite ----------
+        let cached = herder.prev_value.read().clone();
+        assert_eq!(
+            cached, value_101,
+            "prev_value must still hold slot 101's value after retrograde externalization"
+        );
+        assert_ne!(
+            cached, value_99,
+            "prev_value must NOT contain slot 99's value"
         );
     }
 }
