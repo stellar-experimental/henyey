@@ -398,6 +398,9 @@ pub(super) struct SharedPeerState {
     /// Flow control byte parameters (initial grant and batch size).
     /// Immutable after initialization — no atomic needed.
     pub(super) flow_control_bytes_config: FlowControlBytesConfig,
+    /// Per-peer outbound channel capacity. Sourced from the `ConnectionFactory`
+    /// so OverLoopback can use a larger value than TCP. See issue #2356.
+    pub(super) outbound_channel_capacity: usize,
 }
 
 impl SharedPeerState {
@@ -760,6 +763,7 @@ impl OverlayManager {
             query_rate_limit_window_secs: Arc::clone(&self.query_rate_limit_window_secs),
             max_tx_size_bytes: Arc::clone(&self.max_tx_size_bytes),
             flow_control_bytes_config: self.config.flow_control_bytes_config,
+            outbound_channel_capacity: self.connection_factory.outbound_channel_capacity(),
         }
     }
 
@@ -1683,6 +1687,30 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_outbound_channel_capacity_propagates_from_connection_factory() {
+        use crate::loopback::LoopbackConnectionFactory;
+
+        // TCP factory → default 256
+        let config = OverlayConfig::default();
+        let secret = SecretKey::generate();
+        let local_node = LocalNode::new_testnet(secret.clone());
+        let manager = OverlayManager::new(config.clone(), local_node).unwrap();
+        let shared = manager.shared_state();
+        assert_eq!(shared.outbound_channel_capacity, 256);
+
+        // Loopback factory → 2048
+        let local_node2 = LocalNode::new_testnet(secret);
+        let manager2 = OverlayManager::new_with_connection_factory(
+            config,
+            local_node2,
+            Arc::new(LoopbackConnectionFactory::default()),
+        )
+        .unwrap();
+        let shared2 = manager2.shared_state();
+        assert_eq!(shared2.outbound_channel_capacity, 2048);
+    }
+
     #[tokio::test]
     async fn test_subscribe_fetch_responses_returns_receiver_once() {
         let config = OverlayConfig::default();
@@ -1933,6 +1961,7 @@ mod tests {
                 crate::flow_control::DEFAULT_MAX_TX_SIZE_BYTES,
             )),
             flow_control_bytes_config: FlowControlBytesConfig::default(),
+            outbound_channel_capacity: 256,
         }
     }
     fn insert_fake_peer(
@@ -2449,6 +2478,7 @@ mod tests {
                 crate::flow_control::DEFAULT_MAX_TX_SIZE_BYTES,
             )),
             flow_control_bytes_config: FlowControlBytesConfig::default(),
+            outbound_channel_capacity: 256,
         };
 
         let peer_id = PeerId::from_bytes([42u8; 32]);
@@ -2539,6 +2569,7 @@ mod tests {
                 crate::flow_control::DEFAULT_MAX_TX_SIZE_BYTES,
             )),
             flow_control_bytes_config: FlowControlBytesConfig::default(),
+            outbound_channel_capacity: 256,
         };
         (shared, broadcast_rx, fetch_rx)
     }
@@ -3173,6 +3204,7 @@ mod tests {
                 crate::flow_control::DEFAULT_MAX_TX_SIZE_BYTES,
             )),
             flow_control_bytes_config: FlowControlBytesConfig::default(),
+            outbound_channel_capacity: 256,
         };
 
         // Pool with capacity (max=10, current authenticated=0)
@@ -3238,6 +3270,7 @@ mod tests {
                 crate::flow_control::DEFAULT_MAX_TX_SIZE_BYTES,
             )),
             flow_control_bytes_config: FlowControlBytesConfig::default(),
+            outbound_channel_capacity: 256,
         };
 
         // Pool with capacity — reserve a pending slot (required before promote)

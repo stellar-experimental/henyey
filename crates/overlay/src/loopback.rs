@@ -59,4 +59,10 @@ impl ConnectionFactory for LoopbackConnectionFactory {
         registry.listeners.insert(port, tx);
         Ok(Listener::from_loopback(Self::socket_addr(port), rx))
     }
+
+    /// 8× headroom over the default 256 to absorb SCP relay bursts in
+    /// app-backed simulation. See issue #2356.
+    fn outbound_channel_capacity(&self) -> usize {
+        2048
+    }
 }

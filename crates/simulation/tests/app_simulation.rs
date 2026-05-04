@@ -673,6 +673,32 @@ async fn test_core4_multi_step_payment_load() {
         .expect("stop core4 multi-step test");
 }
 
+/// 5-node OverLoopback: validates that the larger outbound channel capacity
+/// (2048 for loopback vs 256 for TCP) prevents SCP relay drops that cause
+/// nodes to fall into CatchingUp. See issue #2356.
+#[tokio::test]
+async fn test_core5_over_loopback_can_close_ledgers() {
+    let mut sim =
+        build_app_backed_topology(Topologies::core(5, SimulationMode::OverLoopback), 80).await;
+
+    // Close ledgers 3-10 (8 closes, exercises multiple SCP rounds).
+    manual_close_until(&sim, 10, 2, Duration::from_secs(120)).await;
+
+    // Verify no node is stuck in CatchingUp.
+    for id in sim.app_node_ids() {
+        if let Some(stats) = sim.app_debug_stats(&id).await {
+            assert_ne!(
+                stats.app_state, "Catching Up",
+                "node {id} should not be in CatchingUp after 5-node consensus"
+            );
+        }
+    }
+
+    sim.stop_all_nodes()
+        .await
+        .expect("stop core5 loopback test");
+}
+
 /// 5-step sustained load across consecutive ledger closes.
 #[tokio::test]
 async fn test_sustained_payment_load_app_backed() {
