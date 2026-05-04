@@ -3740,6 +3740,147 @@ mod tests {
         );
     }
 
+    /// Test that a fee-bump with a valid outer signature plus an extra unused
+    /// outer signature is rejected (txBAD_AUTH_EXTRA).
+    ///
+    /// Branch isolation: both accounts exist, outer auth passes via the valid
+    /// fee-source signature, inner tx is fully valid. The only defect is the
+    /// extra unused outer signature, so rejection can only come from
+    /// `check_all_signatures_used()` on the outer envelope.
+    #[test]
+    fn test_validate_fee_bump_extra_outer_signature_rejected() {
+        let inner_secret = CryptoSecretKey::from_seed(&[42u8; 32]);
+        let fee_secret = CryptoSecretKey::from_seed(&[43u8; 32]);
+        let extra_secret = CryptoSecretKey::from_seed(&[99u8; 32]);
+
+        let inner_pk = *inner_secret.public_key().as_bytes();
+        let fee_pk = *fee_secret.public_key().as_bytes();
+        let extra_pk = *extra_secret.public_key().as_bytes();
+
+        // Build a valid signed fee-bump envelope
+        let tx = make_signed_fee_bump_envelope(&inner_secret, &fee_secret, 100, 1, 200);
+
+        // Sign the outer hash with the extra key and append it
+        let network_id = NetworkId::testnet();
+        let outer_hash = TransactionFrame::hash_envelope(&tx, &network_id).unwrap();
+        let extra_sig = sign_hash(&extra_secret, &outer_hash);
+        let extra_decorated = DecoratedSignature {
+            hint: SignatureHint([extra_pk[28], extra_pk[29], extra_pk[30], extra_pk[31]]),
+            signature: XdrSignature(extra_sig.0.to_vec().try_into().unwrap()),
+        };
+
+        let tx = match tx {
+            TransactionEnvelope::TxFeeBump(mut env) => {
+                let mut sigs: Vec<_> = env.signatures.to_vec();
+                sigs.push(extra_decorated);
+                env.signatures = sigs.try_into().unwrap();
+                TransactionEnvelope::TxFeeBump(env)
+            }
+            _ => unreachable!(),
+        };
+
+        let ctx = test_context();
+        let bounds = CloseTimeBounds::exact();
+
+        let mut account_provider = MockAccountProvider::new();
+        account_provider.add_account(inner_pk, 0);
+        account_provider.add_account(fee_pk, 0);
+
+        let invalid = get_invalid_tx_list(&[tx], &ctx, &bounds, None, Some(&account_provider));
+        assert_eq!(
+            invalid.len(),
+            1,
+            "fee-bump with extra unused outer signature should be rejected (txBAD_AUTH_EXTRA)"
+        );
+    }
+
+    /// Test that a fee-bump whose inner transaction carries an extra unused
+    /// signature is rejected (txBAD_AUTH_EXTRA).
+    ///
+    /// Branch isolation: both accounts exist, outer auth passes (valid
+    /// fee-source signature, no extra outer sigs), inner auth passes via the
+    /// valid inner signature. The only defect is the extra unused inner
+    /// signature, so rejection can only come from `check_all_signatures_used()`
+    /// on the inner transaction.
+    #[test]
+    fn test_validate_fee_bump_extra_inner_signature_rejected() {
+        use stellar_xdr::curr::{
+            FeeBumpTransaction, FeeBumpTransactionEnvelope, FeeBumpTransactionExt,
+            FeeBumpTransactionInnerTx,
+        };
+
+        let inner_secret = CryptoSecretKey::from_seed(&[42u8; 32]);
+        let fee_secret = CryptoSecretKey::from_seed(&[43u8; 32]);
+        let extra_secret = CryptoSecretKey::from_seed(&[99u8; 32]);
+
+        let inner_pk = *inner_secret.public_key().as_bytes();
+        let fee_pk = *fee_secret.public_key().as_bytes();
+        let extra_pk = *extra_secret.public_key().as_bytes();
+
+        // Build a valid signed inner envelope, then append an extra signature
+        let inner_envelope = make_signed_envelope(&inner_secret, 100, 1);
+        let network_id = NetworkId::testnet();
+        let inner_hash = TransactionFrame::hash_envelope(&inner_envelope, &network_id).unwrap();
+
+        let extra_sig = sign_hash(&extra_secret, &inner_hash);
+        let extra_decorated = DecoratedSignature {
+            hint: SignatureHint([extra_pk[28], extra_pk[29], extra_pk[30], extra_pk[31]]),
+            signature: XdrSignature(extra_sig.0.to_vec().try_into().unwrap()),
+        };
+
+        let inner_env = match inner_envelope {
+            TransactionEnvelope::Tx(mut env) => {
+                let mut sigs: Vec<_> = env.signatures.to_vec();
+                sigs.push(extra_decorated);
+                env.signatures = sigs.try_into().unwrap();
+                env
+            }
+            _ => unreachable!(),
+        };
+
+        // Build fee-bump wrapping the modified inner envelope
+        let fee_source = MuxedAccount::Ed25519(Uint256(fee_pk));
+        let fee_bump_envelope = TransactionEnvelope::TxFeeBump(FeeBumpTransactionEnvelope {
+            tx: FeeBumpTransaction {
+                fee_source,
+                fee: 200,
+                inner_tx: FeeBumpTransactionInnerTx::Tx(inner_env),
+                ext: FeeBumpTransactionExt::V0,
+            },
+            signatures: VecM::default(),
+        });
+
+        // Sign the outer envelope with the fee source key
+        let outer_hash = TransactionFrame::hash_envelope(&fee_bump_envelope, &network_id).unwrap();
+        let fee_sig = sign_hash(&fee_secret, &outer_hash);
+        let fee_decorated = DecoratedSignature {
+            hint: SignatureHint([fee_pk[28], fee_pk[29], fee_pk[30], fee_pk[31]]),
+            signature: XdrSignature(fee_sig.0.to_vec().try_into().unwrap()),
+        };
+
+        let tx = match fee_bump_envelope {
+            TransactionEnvelope::TxFeeBump(mut env) => {
+                env.signatures = vec![fee_decorated].try_into().unwrap();
+                TransactionEnvelope::TxFeeBump(env)
+            }
+            _ => unreachable!(),
+        };
+
+        let ctx = test_context();
+        let bounds = CloseTimeBounds::exact();
+
+        let mut account_provider = MockAccountProvider::new();
+        account_provider.add_account(inner_pk, 0);
+        account_provider.add_account(fee_pk, 0);
+
+        let invalid = get_invalid_tx_list(&[tx], &ctx, &bounds, None, Some(&account_provider));
+        assert_eq!(
+            invalid.len(),
+            1,
+            "fee-bump with extra unused inner signature should be rejected (txBAD_AUTH_EXTRA)"
+        );
+    }
+
     /// Test that a tx with an extra signer in V2 preconditions passes when
     /// the extra signer's signature is present.
     #[test]
