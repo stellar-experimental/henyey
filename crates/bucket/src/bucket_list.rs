@@ -3158,6 +3158,47 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn test_snapshot_lookup_after_genesis_add_batch() {
+        // Regression test for #2357: BucketListSnapshot::get_result should find
+        // entries added via add_batch (the genesis path).
+        let mut bl = BucketList::new();
+        let entry = make_account_entry([1u8; 32], 100);
+        bl.add_batch(
+            1,
+            0, // genesis protocol_version = 0
+            BucketListType::Live,
+            vec![entry],
+            vec![],
+            vec![],
+        )
+        .unwrap();
+
+        // Direct lookup should work
+        let key = make_account_key([1u8; 32]);
+        assert!(
+            bl.get(&key).unwrap().is_some(),
+            "Direct BucketList::get must find the entry"
+        );
+
+        // Snapshot lookup must also work
+        let header = LedgerHeader {
+            ledger_seq: 1,
+            ..Default::default()
+        };
+        let snapshot = crate::BucketListSnapshot::new(&bl, header);
+        let found = snapshot.get_result(&key).unwrap();
+        assert!(
+            found.is_some(),
+            "BucketListSnapshot::get_result must find the entry added via add_batch"
+        );
+        if let LedgerEntryData::Account(acct) = found.unwrap().data {
+            assert_eq!(acct.balance, 100);
+        } else {
+            panic!("Expected Account entry");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_new_bucket_list() {
         let bl = BucketList::new();
         assert_eq!(bl.levels().len(), BUCKET_LIST_LEVELS);

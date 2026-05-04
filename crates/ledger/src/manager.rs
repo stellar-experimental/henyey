@@ -1899,6 +1899,26 @@ impl LedgerManager {
     pub fn reset(&self) {
         debug!("Resetting ledger manager for catchup");
 
+        // Mark as uninitialized FIRST, before clearing the bucket list.
+        //
+        // create_snapshot() holds state.read across its entire body including
+        // the bucket_list.read at line ~2237. By acquiring state.write first
+        // we either:
+        //   - block until an in-flight create_snapshot releases its read lock, OR
+        //   - prevent new create_snapshot calls from starting.
+        // This eliminates the TOCTOU race where create_snapshot could observe
+        // initialized == true but read an already-cleared (empty) bucket list
+        // (#2357).
+        let mut state = self.state.write();
+        state.initialized = false;
+        state.header = create_genesis_header();
+        state.header_hash = Hash256::ZERO;
+        state.soroban_network_info = None;
+        // Drop the state lock before acquiring other locks to avoid holding
+        // multiple write locks simultaneously (which isn't needed — the
+        // initialized=false flag is sufficient to block concurrent readers).
+        drop(state);
+
         // Clear bucket lists
         *self.bucket_list.write() = BucketList::default();
         *self.hot_archive_bucket_list.write() = Some(HotArchiveBucketList::new());
@@ -1914,13 +1934,6 @@ impl LedgerManager {
 
         // Discard any pending background eviction scan
         *self.pending_eviction_scan.lock() = None;
-
-        // Reset state
-        let mut state = self.state.write();
-        state.header = create_genesis_header();
-        state.header_hash = Hash256::ZERO;
-        state.initialized = false;
-        state.soroban_network_info = None;
 
         debug!("Ledger manager reset complete");
     }
@@ -2201,6 +2214,19 @@ impl LedgerManager {
         // --- Sub-timer: state read + LedgerSnapshot construction ---
         let t0 = std::time::Instant::now();
         let state = self.state.read();
+
+        // Guard: reject snapshots when the ledger manager has not been
+        // initialized (or has been reset for catchup).  Without this check,
+        // callers would silently receive an empty bucket-list snapshot and
+        // every lookup would return None — the symptom reported in #2357.
+        //
+        // The state read lock is held across the bucket_list read below, so
+        // a concurrent reset() (which now sets initialized=false before
+        // clearing the bucket list) cannot produce an inconsistent view.
+        if !state.initialized {
+            return Err(LedgerError::NotInitialized);
+        }
+
         // Use an empty entry cache - all lookups go through lookup_fn which handles:
         // - Soroban types (CONTRACT_DATA, CONTRACT_CODE, TTL): O(1) via in-memory soroban_state
         // - Classic types (accounts, trustlines, offers, etc.): O(log n) via bucket list snapshot
@@ -8729,6 +8755,146 @@ mod tests {
         assert_eq!(
             events1, events2,
             "With zero refund, fee events should be identical"
+        );
+    }
+
+    /// Regression test for #2357: create_snapshot must be able to look up
+    /// accounts that were added to the bucket list during genesis bootstrap.
+    #[test]
+    fn test_create_snapshot_finds_genesis_account() {
+        use stellar_xdr::curr::{
+            AccountEntry, AccountEntryExt, LedgerHeader, SequenceNumber, String32, Thresholds,
+        };
+
+        // Build a genesis-style bucket list with one account.
+        let mut bl = BucketList::new();
+        let account_bytes = [42u8; 32];
+        let account_id = make_account_id(account_bytes);
+        let entry = LedgerEntry {
+            last_modified_ledger_seq: 1,
+            data: LedgerEntryData::Account(AccountEntry {
+                account_id: account_id.clone(),
+                balance: 1_000_000_000,
+                seq_num: SequenceNumber(0),
+                num_sub_entries: 0,
+                inflation_dest: None,
+                flags: 0,
+                home_domain: String32::default(),
+                thresholds: Thresholds([1, 0, 0, 0]),
+                signers: Vec::new().try_into().unwrap(),
+                ext: AccountEntryExt::V0,
+            }),
+            ext: LedgerEntryExt::V0,
+        };
+        bl.add_batch(
+            1,
+            0, // genesis protocol = 0
+            BucketListType::Live,
+            vec![entry],
+            vec![],
+            vec![],
+        )
+        .unwrap();
+
+        // Build a header whose bucket_list_hash matches.
+        let bl_hash = bl.hash();
+        let header = LedgerHeader {
+            ledger_seq: 1,
+            bucket_list_hash: Hash(*bl_hash.as_bytes()),
+            ..Default::default()
+        };
+
+        // Create LedgerManager and initialize.
+        let mut config = LedgerManagerConfig::default();
+        config.validate_bucket_hash = true;
+        let lm = LedgerManager::new("Test SDF Network ; September 2015".to_string(), config);
+        let header_hash = crate::compute_header_hash(&header).unwrap();
+        lm.initialize(
+            bl,
+            henyey_bucket::HotArchiveBucketList::new(),
+            header,
+            header_hash,
+        )
+        .unwrap();
+
+        // create_snapshot + get_account must find the entry.
+        let snapshot = lm.create_snapshot().unwrap();
+        let account = snapshot.get_account(&account_id).unwrap();
+        assert!(
+            account.is_some(),
+            "create_snapshot must find the genesis account (bug #2357)"
+        );
+        let account = account.unwrap();
+        assert_eq!(account.seq_num.0, 0);
+        assert_eq!(account.balance, 1_000_000_000);
+    }
+
+    /// Regression test for #2357: create_snapshot must return NotInitialized
+    /// when the ledger manager has been reset (simulating the window during
+    /// catchup). This validates the defensive check added in create_snapshot.
+    #[test]
+    fn test_create_snapshot_returns_error_after_reset() {
+        use stellar_xdr::curr::{
+            AccountEntry, AccountEntryExt, LedgerHeader, SequenceNumber, String32, Thresholds,
+        };
+
+        // Build and initialize a ledger manager with one account.
+        let mut bl = BucketList::new();
+        let account_id = make_account_id([99u8; 32]);
+        let entry = LedgerEntry {
+            last_modified_ledger_seq: 1,
+            data: LedgerEntryData::Account(AccountEntry {
+                account_id: account_id.clone(),
+                balance: 500,
+                seq_num: SequenceNumber(0),
+                num_sub_entries: 0,
+                inflation_dest: None,
+                flags: 0,
+                home_domain: String32::default(),
+                thresholds: Thresholds([1, 0, 0, 0]),
+                signers: Vec::new().try_into().unwrap(),
+                ext: AccountEntryExt::V0,
+            }),
+            ext: LedgerEntryExt::V0,
+        };
+        bl.add_batch(1, 0, BucketListType::Live, vec![entry], vec![], vec![])
+            .unwrap();
+
+        let bl_hash = bl.hash();
+        let header = LedgerHeader {
+            ledger_seq: 1,
+            bucket_list_hash: Hash(*bl_hash.as_bytes()),
+            ..Default::default()
+        };
+        let mut config = LedgerManagerConfig::default();
+        config.validate_bucket_hash = true;
+        let lm = LedgerManager::new("Test SDF Network ; September 2015".to_string(), config);
+        let header_hash = crate::compute_header_hash(&header).unwrap();
+        lm.initialize(
+            bl,
+            henyey_bucket::HotArchiveBucketList::new(),
+            header,
+            header_hash,
+        )
+        .unwrap();
+
+        // Sanity: snapshot works before reset.
+        assert!(lm.create_snapshot().is_ok());
+
+        // Reset the ledger manager (as catchup does).
+        lm.reset();
+
+        // After reset, create_snapshot must return NotInitialized — not an
+        // empty snapshot that silently returns None for every account.
+        let result = lm.create_snapshot();
+        assert!(
+            matches!(&result, Err(LedgerError::NotInitialized)),
+            "create_snapshot after reset must return NotInitialized, got: {}",
+            if result.is_ok() {
+                "Ok(..)".to_string()
+            } else {
+                format!("Err({})", result.err().unwrap())
+            }
         );
     }
 }
