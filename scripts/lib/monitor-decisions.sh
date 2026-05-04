@@ -198,3 +198,75 @@ check_mainnet_wiped() {
     MAINNET_WIPED=yes
   fi
 }
+
+# ─────────────────────────────────────────────────────────────────────────────
+# detect_crash_state LOGS_DIR [NOW_EPOCH]
+#
+# Analyzes crashed log files to determine crash state for the (3a) wipe trigger.
+#
+# Arguments:
+#   LOGS_DIR   - Directory containing monitor.log.crashed-* files
+#   NOW_EPOCH  - Optional: current epoch seconds (default: $(date +%s)).
+#                Injecting this makes the 30-minute window deterministically
+#                testable without real-time waits.
+#
+# Sets globals:
+#   CRASH_RECENT_COUNT  - Number of crashed files modified within last 30 min
+#   CRASH_LATEST_FILE   - Path to most recent crashed file (empty if none)
+#   CRASH_HASH_MISMATCH - "yes" | "no" — latest crash indicates fatal state corruption
+#
+# Behavior:
+#   1. Lists all monitor.log.crashed-* files in LOGS_DIR
+#   2. For each: stat -c %Y for mtime epoch; skip files where stat fails
+#      (race: file deleted between glob expansion and stat)
+#   3. Filter to files with mtime > (NOW_EPOCH - 1800)  [strict >]
+#   4. Sort: mtime descending, ties broken by path descending (lexicographic)
+#   5. Grep newest for fatal wipe signature (text, JSON, and legacy prose):
+#      - Text:   fatal_wipe_required=true  or  fatal_wipe_required: true
+#      - JSON:   "fatal_wipe_required":true
+#      - Prose:  "State wipe required before restart"
+#      Contract: trigger_fatal_shutdown() in crates/app/src/app/lifecycle.rs
+#
+# Edge cases:
+#   - Missing/empty LOGS_DIR: all outputs are 0/""/no (no error)
+#   - All files older than 30 min: CRASH_RECENT_COUNT=0, CRASH_LATEST_FILE=""
+#   - stat race (file vanishes): that file is silently skipped
+#
+# Returns: always 0
+# ─────────────────────────────────────────────────────────────────────────────
+detect_crash_state() {
+  local logs_dir="$1"
+  local now_epoch="${2:-$(date +%s)}"
+  local boundary=$((now_epoch - 1800))
+
+  CRASH_RECENT_COUNT=0
+  CRASH_LATEST_FILE=""
+  CRASH_HASH_MISMATCH="no"
+
+  [[ -d "$logs_dir" ]] || return 0
+
+  local files_with_mtime=""
+  local f mtime
+  for f in "$logs_dir"/monitor.log.crashed-*; do
+    [[ -f "$f" ]] || continue
+    mtime=$(stat -c %Y "$f" 2>/dev/null) || continue
+    if [[ "$mtime" -gt "$boundary" ]]; then
+      files_with_mtime+="$mtime $f"$'\n'
+    fi
+  done
+
+  [[ -z "$files_with_mtime" ]] && return 0
+
+  # Sort: mtime descending (numeric), ties broken by path descending
+  local sorted
+  sorted=$(printf '%s' "$files_with_mtime" | sort -t' ' -k1,1rn -k2,2r)
+
+  CRASH_RECENT_COUNT=$(printf '%s\n' "$sorted" | grep -c .)
+  CRASH_LATEST_FILE=$(printf '%s\n' "$sorted" | head -1 | cut -d' ' -f2-)
+
+  if [[ -n "$CRASH_LATEST_FILE" ]] && \
+     grep -qE 'fatal_wipe_required\s*[=:]\s*true|"fatal_wipe_required"\s*:\s*true|State wipe required before restart' \
+       "$CRASH_LATEST_FILE" 2>/dev/null; then
+    CRASH_HASH_MISMATCH="yes"
+  fi
+}

@@ -322,24 +322,13 @@ ticks so STUCK can be detected by a single invocation:
 
 ```bash
 logs_dir=/home/tomer/data/$MONITOR_SESSION_ID/logs
-# Requires GNU coreutils date (standard on Linux monitoring hosts).
-# bfs/GNU-find both accept ISO 8601 with -newermt.
-boundary=$(date -u -d '30 minutes ago' +%Y-%m-%dT%H:%M:%SZ) || {
-  echo "WARNING: date computation failed — auto-wipe heuristic disabled this tick" >&2
-  boundary=""
-}
-if [ -n "$boundary" ]; then
-  recent_crashed=$(find "$logs_dir" -maxdepth 1 -type f -name 'monitor.log.crashed-*' \
-    -newermt "$boundary" -printf '%T@ %p\n' 2>/dev/null | sort -rn)
-else
-  recent_crashed=""
-fi
-recent_count=$(printf '%s\n' "$recent_crashed" | grep -c .)
-latest_crashed=$(printf '%s\n' "$recent_crashed" | head -1 | cut -d' ' -f2-)
-hash_mismatch_signal="no"
-if [ -n "$latest_crashed" ] && grep -qE 'fatal_wipe_required\s*[=:]\s*true|State wipe required before restart' "$latest_crashed" 2>/dev/null; then
-  hash_mismatch_signal="yes"
-fi
+# Uses the shared detect_crash_state function from scripts/lib/monitor-decisions.sh
+# (already sourced at skill init). Uses numeric mtime comparison (stat -c %Y),
+# not -newermt, for portability and testability.
+detect_crash_state "$logs_dir"
+recent_count="$CRASH_RECENT_COUNT"
+latest_crashed="$CRASH_LATEST_FILE"
+hash_mismatch_signal="$CRASH_HASH_MISMATCH"
 ```
 
 Trigger the wipe when ALL hold:

@@ -42,7 +42,7 @@ cleanup  # ensure fresh state
 mkdir -p "$TEST_ROOT"
 
 # ── TAP state ────────────────────────────────────────────────────────────────
-TAP_PLAN=20
+TAP_PLAN=33
 TAP_CURRENT=0
 TAP_FAILURES=0
 
@@ -89,6 +89,16 @@ check_skill_structure() {
   fi
   if ! grep -q 'check_mainnet_wiped' "$tick_file"; then
     echo "WARNING: monitor-tick/SKILL.md does not call check_mainnet_wiped" >&2
+    drift=true
+  fi
+  # monitor-tick must call detect_crash_state (3a refactor)
+  if ! grep -q 'detect_crash_state' "$tick_file"; then
+    echo "WARNING: monitor-tick/SKILL.md does not call detect_crash_state" >&2
+    drift=true
+  fi
+  # monitor-tick must NOT contain old inline crash detection (replaced by detect_crash_state)
+  if grep -q 'recent_crashed=\$(find' "$tick_file"; then
+    echo "WARNING: monitor-tick/SKILL.md still contains old inline crash detection (find-based)" >&2
     drift=true
   fi
 
@@ -149,6 +159,14 @@ mock_alive_file() {
   mkdir -p "$(dirname "$alive_path")"
   touch "$alive_path"
   touch -d "@$target_mtime" "$alive_path"
+}
+
+mock_crashed_log() {
+  # Create a monitor.log.crashed-<suffix> file with known content and mtime
+  local logs_dir="$1" suffix="$2" content="$3" mtime_epoch="$4"
+  mkdir -p "$logs_dir"
+  printf '%s\n' "$content" > "$logs_dir/monitor.log.crashed-$suffix"
+  touch -d "@$mtime_epoch" "$logs_dir/monitor.log.crashed-$suffix"
 }
 
 # ── Tests ────────────────────────────────────────────────────────────────────
@@ -468,6 +486,178 @@ run_tests() {
   else
     tap_not_ok "session-wipe: session dir exists → not wiped" \
       "exit=$exit_code19 WIPED=$SESSION_WIPED ALIVE=$SESSION_WIPED_PROCESS_ALIVE stderr='$stderr19' contents='$(ls "$data/$session_id" 2>/dev/null)'"
+  fi
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # detect_crash_state tests (T21-T33)
+  # Source: scripts/lib/monitor-decisions.sh — detect_crash_state
+  # ════════════════════════════════════════════════════════════════════════════
+
+  local NOW_EPOCH=1700000000  # fixed reference point for all crash tests
+  local BOUNDARY=$((NOW_EPOCH - 1800))  # 1799998200
+
+  # ── Test 21: fatal_wipe_required=true in text log (structured field) ────
+  local logs21="$TEST_ROOT/t21/logs"
+  mock_crashed_log "$logs21" "20260504T140000Z" \
+    "2026-05-04T14:04:09.061014Z ERROR henyey_app::app::lifecycle: FATAL: unrecoverable local state failure — pre-close hash mismatch at ledger 62415630 fatal_wipe_required=true" \
+    $((NOW_EPOCH - 300))
+  detect_crash_state "$logs21" "$NOW_EPOCH"
+  if [[ "$CRASH_HASH_MISMATCH" == "yes" && "$CRASH_RECENT_COUNT" -eq 1 ]]; then
+    tap_ok "crash-detect: fatal_wipe_required=true in text log"
+  else
+    tap_not_ok "crash-detect: fatal_wipe_required=true in text log" \
+      "MISMATCH=$CRASH_HASH_MISMATCH COUNT=$CRASH_RECENT_COUNT"
+  fi
+
+  # ── Test 22: Legacy prose "State wipe required before restart" ──────────
+  local logs22="$TEST_ROOT/t22/logs"
+  mock_crashed_log "$logs22" "20260504T140100Z" \
+    "FATAL: unrecoverable local state failure — pre-close hash mismatch. Node will shut down. State wipe required before restart." \
+    $((NOW_EPOCH - 300))
+  detect_crash_state "$logs22" "$NOW_EPOCH"
+  if [[ "$CRASH_HASH_MISMATCH" == "yes" ]]; then
+    tap_ok "crash-detect: legacy prose 'State wipe required before restart'"
+  else
+    tap_not_ok "crash-detect: legacy prose 'State wipe required before restart'" \
+      "MISMATCH=$CRASH_HASH_MISMATCH"
+  fi
+
+  # ── Test 23: Unrelated error log (no fatal wipe) ───────────────────────
+  local logs23="$TEST_ROOT/t23/logs"
+  mock_crashed_log "$logs23" "20260504T140200Z" \
+    "thread 'main' panicked at 'out of memory' note: run with RUST_BACKTRACE=1" \
+    $((NOW_EPOCH - 300))
+  detect_crash_state "$logs23" "$NOW_EPOCH"
+  if [[ "$CRASH_HASH_MISMATCH" == "no" && "$CRASH_RECENT_COUNT" -eq 1 ]]; then
+    tap_ok "crash-detect: unrelated error → no hash mismatch"
+  else
+    tap_not_ok "crash-detect: unrelated error → no hash mismatch" \
+      "MISMATCH=$CRASH_HASH_MISMATCH COUNT=$CRASH_RECENT_COUNT"
+  fi
+
+  # ── Test 24: All files older than 30 minutes ───────────────────────────
+  local logs24="$TEST_ROOT/t24/logs"
+  mock_crashed_log "$logs24" "20260504T130000Z" "fatal_wipe_required=true" $((NOW_EPOCH - 2000))
+  mock_crashed_log "$logs24" "20260504T130100Z" "fatal_wipe_required=true" $((NOW_EPOCH - 3600))
+  mock_crashed_log "$logs24" "20260504T130200Z" "fatal_wipe_required=true" $((NOW_EPOCH - 7200))
+  detect_crash_state "$logs24" "$NOW_EPOCH"
+  if [[ "$CRASH_RECENT_COUNT" -eq 0 && -z "$CRASH_LATEST_FILE" ]]; then
+    tap_ok "crash-detect: all files older than 30 min → count=0"
+  else
+    tap_not_ok "crash-detect: all files older than 30 min → count=0" \
+      "COUNT=$CRASH_RECENT_COUNT LATEST=$CRASH_LATEST_FILE"
+  fi
+
+  # ── Test 25: Empty log directory ────────────────────────────────────────
+  local logs25="$TEST_ROOT/t25/logs"
+  mkdir -p "$logs25"
+  detect_crash_state "$logs25" "$NOW_EPOCH"
+  if [[ "$CRASH_RECENT_COUNT" -eq 0 && -z "$CRASH_LATEST_FILE" && "$CRASH_HASH_MISMATCH" == "no" ]]; then
+    tap_ok "crash-detect: empty log directory → count=0"
+  else
+    tap_not_ok "crash-detect: empty log directory → count=0" \
+      "COUNT=$CRASH_RECENT_COUNT"
+  fi
+
+  # ── Test 26: Missing log directory ──────────────────────────────────────
+  detect_crash_state "$TEST_ROOT/t26/nonexistent" "$NOW_EPOCH"
+  if [[ "$CRASH_RECENT_COUNT" -eq 0 && -z "$CRASH_LATEST_FILE" && "$CRASH_HASH_MISMATCH" == "no" ]]; then
+    tap_ok "crash-detect: missing log directory → count=0"
+  else
+    tap_not_ok "crash-detect: missing log directory → count=0" \
+      "COUNT=$CRASH_RECENT_COUNT"
+  fi
+
+  # ── Test 27: Mixed ages: 4 recent + 2 old → count=4, newest selected ──
+  local logs27="$TEST_ROOT/t27/logs"
+  # 4 recent files (within 30 min)
+  mock_crashed_log "$logs27" "recent-a" "some log" $((NOW_EPOCH - 100))
+  mock_crashed_log "$logs27" "recent-b" "some log" $((NOW_EPOCH - 200))
+  mock_crashed_log "$logs27" "recent-c" "some log" $((NOW_EPOCH - 500))
+  mock_crashed_log "$logs27" "recent-d" "some log" $((NOW_EPOCH - 1000))
+  # 2 old files (outside 30 min)
+  mock_crashed_log "$logs27" "old-a" "some log" $((NOW_EPOCH - 2000))
+  mock_crashed_log "$logs27" "old-b" "some log" $((NOW_EPOCH - 3600))
+  detect_crash_state "$logs27" "$NOW_EPOCH"
+  if [[ "$CRASH_RECENT_COUNT" -eq 4 && "$CRASH_LATEST_FILE" == "$logs27/monitor.log.crashed-recent-a" ]]; then
+    tap_ok "crash-detect: 4 recent + 2 old → count=4, newest selected"
+  else
+    tap_not_ok "crash-detect: 4 recent + 2 old → count=4, newest selected" \
+      "COUNT=$CRASH_RECENT_COUNT LATEST=$CRASH_LATEST_FILE"
+  fi
+
+  # ── Test 28: Exact boundary (NOW-1800, excluded by strict >) ───────────
+  local logs28="$TEST_ROOT/t28/logs"
+  mock_crashed_log "$logs28" "boundary" "fatal_wipe_required=true" "$BOUNDARY"
+  detect_crash_state "$logs28" "$NOW_EPOCH"
+  if [[ "$CRASH_RECENT_COUNT" -eq 0 ]]; then
+    tap_ok "crash-detect: exact boundary (NOW-1800) excluded"
+  else
+    tap_not_ok "crash-detect: exact boundary (NOW-1800) excluded" \
+      "COUNT=$CRASH_RECENT_COUNT"
+  fi
+
+  # ── Test 29: Just inside boundary (NOW-1799, included) ─────────────────
+  local logs29="$TEST_ROOT/t29/logs"
+  mock_crashed_log "$logs29" "just-inside" "fatal_wipe_required=true" $((BOUNDARY + 1))
+  detect_crash_state "$logs29" "$NOW_EPOCH"
+  if [[ "$CRASH_RECENT_COUNT" -eq 1 && "$CRASH_HASH_MISMATCH" == "yes" ]]; then
+    tap_ok "crash-detect: just inside boundary (NOW-1799) included"
+  else
+    tap_not_ok "crash-detect: just inside boundary (NOW-1799) included" \
+      "COUNT=$CRASH_RECENT_COUNT MISMATCH=$CRASH_HASH_MISMATCH"
+  fi
+
+  # ── Test 30: Newest non-fatal, older recent fatal → no mismatch ────────
+  local logs30="$TEST_ROOT/t30/logs"
+  mock_crashed_log "$logs30" "newer-nonfatal" "thread panicked at OOM" $((NOW_EPOCH - 100))
+  mock_crashed_log "$logs30" "older-fatal" "fatal_wipe_required=true" $((NOW_EPOCH - 500))
+  detect_crash_state "$logs30" "$NOW_EPOCH"
+  if [[ "$CRASH_HASH_MISMATCH" == "no" && "$CRASH_RECENT_COUNT" -eq 2 ]]; then
+    tap_ok "crash-detect: newest non-fatal, older fatal → no mismatch"
+  else
+    tap_not_ok "crash-detect: newest non-fatal, older fatal → no mismatch" \
+      "MISMATCH=$CRASH_HASH_MISMATCH COUNT=$CRASH_RECENT_COUNT LATEST=$CRASH_LATEST_FILE"
+  fi
+
+  # ── Test 31: Colon separator variant (fatal_wipe_required: true) ───────
+  local logs31="$TEST_ROOT/t31/logs"
+  mock_crashed_log "$logs31" "colon-variant" \
+    "2026-05-04T14:04:09Z ERROR lifecycle: fatal_wipe_required: true FATAL: unrecoverable" \
+    $((NOW_EPOCH - 300))
+  detect_crash_state "$logs31" "$NOW_EPOCH"
+  if [[ "$CRASH_HASH_MISMATCH" == "yes" ]]; then
+    tap_ok "crash-detect: colon separator (fatal_wipe_required: true)"
+  else
+    tap_not_ok "crash-detect: colon separator (fatal_wipe_required: true)" \
+      "MISMATCH=$CRASH_HASH_MISMATCH"
+  fi
+
+  # ── Test 32: JSON format ("fatal_wipe_required":true) ──────────────────
+  local logs32="$TEST_ROOT/t32/logs"
+  mock_crashed_log "$logs32" "json-format" \
+    '{"timestamp":"2026-05-04T14:04:09Z","level":"ERROR","fields":{"fatal_wipe_required":true,"message":"FATAL: unrecoverable local state failure"}}' \
+    $((NOW_EPOCH - 300))
+  detect_crash_state "$logs32" "$NOW_EPOCH"
+  if [[ "$CRASH_HASH_MISMATCH" == "yes" ]]; then
+    tap_ok "crash-detect: JSON format (\"fatal_wipe_required\":true)"
+  else
+    tap_not_ok "crash-detect: JSON format (\"fatal_wipe_required\":true)" \
+      "MISMATCH=$CRASH_HASH_MISMATCH"
+  fi
+
+  # ── Test 33: Mtime tie-break — lexicographic-last path wins ────────────
+  local logs33="$TEST_ROOT/t33/logs"
+  local same_mtime=$((NOW_EPOCH - 300))
+  mock_crashed_log "$logs33" "aaa-first" "fatal_wipe_required=true" "$same_mtime"
+  mock_crashed_log "$logs33" "zzz-last" "thread panicked at OOM" "$same_mtime"
+  detect_crash_state "$logs33" "$NOW_EPOCH"
+  # With same mtime, lexicographic-descending path wins → zzz-last is newest
+  if [[ "$CRASH_LATEST_FILE" == "$logs33/monitor.log.crashed-zzz-last" && "$CRASH_HASH_MISMATCH" == "no" ]]; then
+    tap_ok "crash-detect: mtime tie-break → lexicographic-last path"
+  else
+    tap_not_ok "crash-detect: mtime tie-break → lexicographic-last path" \
+      "LATEST=$CRASH_LATEST_FILE MISMATCH=$CRASH_HASH_MISMATCH"
   fi
 }
 
