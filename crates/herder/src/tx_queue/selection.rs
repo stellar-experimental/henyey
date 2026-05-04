@@ -564,15 +564,8 @@ impl TransactionQueue {
 /// selection, `base_fee` must be `None` regardless of surge-pricing state.
 /// In stellar-core (`TxSetFrame.cpp:286-290`), `baseFee` is set only when
 /// `inclusionFeeMap` is non-empty (i.e., at least one tx survived).
-fn empty_soroban_phase() -> (stellar_xdr::curr::TransactionPhase, Option<i64>) {
-    use stellar_xdr::curr::{ParallelTxsComponent, TransactionPhase, VecM};
-    (
-        TransactionPhase::V1(ParallelTxsComponent {
-            base_fee: None,
-            execution_stages: VecM::default(),
-        }),
-        None,
-    )
+fn empty_soroban_phase_pair() -> (stellar_xdr::curr::TransactionPhase, Option<i64>) {
+    (henyey_tx::tx_set_xdr::empty_soroban_phase(), None)
 }
 
 /// Build the Soroban phase and compute base fee from surviving transactions.
@@ -588,12 +581,10 @@ fn build_soroban_phase_with_base_fee(
     ledger_base_fee: i64,
     config: &super::TxQueueConfig,
 ) -> (stellar_xdr::curr::TransactionPhase, Option<i64>) {
-    use stellar_xdr::curr::{
-        DependentTxCluster, ParallelTxExecutionStage, ParallelTxsComponent, TransactionPhase,
-    };
+    use stellar_xdr::curr::{DependentTxCluster, ParallelTxExecutionStage, TransactionEnvelope};
 
     if soroban_txs.is_empty() {
-        return empty_soroban_phase();
+        return empty_soroban_phase_pair();
     }
 
     let use_parallel = config.ledger_max_instructions > 0
@@ -642,10 +633,10 @@ fn build_soroban_phase_with_base_fee(
             .collect();
         let cluster = DependentTxCluster(envelopes.try_into().unwrap_or_default());
         let stage = ParallelTxExecutionStage(vec![cluster].try_into().unwrap_or_default());
-        let phase = TransactionPhase::V1(ParallelTxsComponent {
-            base_fee: soroban_base_fee,
-            execution_stages: vec![stage].try_into().unwrap_or_default(),
-        });
+        let phase = henyey_tx::tx_set_xdr::soroban_phase_with_stages(
+            soroban_base_fee,
+            vec![stage].try_into().unwrap_or_default(),
+        );
         (phase, soroban_base_fee)
     }
 }

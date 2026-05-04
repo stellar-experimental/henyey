@@ -2542,6 +2542,7 @@ mod tests {
     #[test]
     fn test_check_fee_map_negative_parallel_base_fee_rejected() {
         use stellar_xdr::curr::ParallelTxsComponent;
+        // Intentionally invalid: negative base_fee tests check_fee_map rejection
         let phase = TransactionPhase::V1(ParallelTxsComponent {
             base_fee: Some(-1),
             execution_stages: vec![].try_into().unwrap(),
@@ -2595,6 +2596,7 @@ mod tests {
     #[test]
     fn test_check_valid_classic_rejects_parallel_phase() {
         use stellar_xdr::curr::ParallelTxsComponent;
+        // Intentionally invalid: parallel phase where classic is expected
         let phase = TransactionPhase::V1(ParallelTxsComponent {
             base_fee: Some(100),
             execution_stages: vec![].try_into().unwrap(),
@@ -2735,7 +2737,7 @@ mod tests {
         use stellar_xdr::curr::ParallelTxsComponent;
         let info = make_soroban_network_info();
         let header = make_soroban_lcl_header(22);
-        // Protocol 22 should NOT have parallel phase
+        // Intentionally invalid: parallel phase on protocol 22 (pre-parallel)
         let phase = TransactionPhase::V1(ParallelTxsComponent {
             base_fee: Some(100),
             execution_stages: vec![].try_into().unwrap(),
@@ -2755,9 +2757,7 @@ mod tests {
 
     #[test]
     fn test_check_valid_soroban_parallel_too_many_clusters() {
-        use stellar_xdr::curr::{
-            DependentTxCluster, ParallelTxExecutionStage, ParallelTxsComponent,
-        };
+        use stellar_xdr::curr::{DependentTxCluster, ParallelTxExecutionStage};
         let mut info = make_soroban_network_info();
         info.ledger_max_dependent_tx_clusters = 2; // Only allow 2 clusters per stage
         let header = make_soroban_lcl_header(23);
@@ -2775,18 +2775,16 @@ mod tests {
         .try_into()
         .unwrap();
 
-        let phase = TransactionPhase::V1(ParallelTxsComponent {
-            base_fee: Some(100),
-            execution_stages: vec![stage].try_into().unwrap(),
-        });
+        let phase = henyey_tx::tx_set_xdr::soroban_phase_with_stages(
+            Some(100),
+            vec![stage].try_into().unwrap(),
+        );
         assert!(!check_valid_soroban(&phase, &header, &info));
     }
 
     #[test]
     fn test_check_valid_soroban_parallel_sequential_instruction_limit() {
-        use stellar_xdr::curr::{
-            DependentTxCluster, ParallelTxExecutionStage, ParallelTxsComponent,
-        };
+        use stellar_xdr::curr::{DependentTxCluster, ParallelTxExecutionStage};
         let mut info = make_soroban_network_info();
         info.ledger_max_instructions = 1_000;
         info.ledger_max_dependent_tx_clusters = 10;
@@ -2807,10 +2805,10 @@ mod tests {
                 .try_into()
                 .unwrap();
 
-        let phase = TransactionPhase::V1(ParallelTxsComponent {
-            base_fee: Some(100),
-            execution_stages: vec![stage1, stage2].try_into().unwrap(),
-        });
+        let phase = henyey_tx::tx_set_xdr::soroban_phase_with_stages(
+            Some(100),
+            vec![stage1, stage2].try_into().unwrap(),
+        );
         assert!(!check_valid_soroban(&phase, &header, &info));
     }
 
@@ -2818,7 +2816,6 @@ mod tests {
     fn test_check_valid_soroban_parallel_rw_conflict() {
         use stellar_xdr::curr::{
             DependentTxCluster, LedgerKey, LedgerKeyAccount, ParallelTxExecutionStage,
-            ParallelTxsComponent,
         };
         let mut info = make_soroban_network_info();
         info.ledger_max_instructions = 10_000_000;
@@ -2841,10 +2838,10 @@ mod tests {
         .try_into()
         .unwrap();
 
-        let phase = TransactionPhase::V1(ParallelTxsComponent {
-            base_fee: Some(100),
-            execution_stages: vec![stage].try_into().unwrap(),
-        });
+        let phase = henyey_tx::tx_set_xdr::soroban_phase_with_stages(
+            Some(100),
+            vec![stage].try_into().unwrap(),
+        );
         assert!(!check_valid_soroban(&phase, &header, &info));
     }
 
@@ -2852,7 +2849,6 @@ mod tests {
     fn test_check_valid_soroban_parallel_no_conflict_different_keys() {
         use stellar_xdr::curr::{
             DependentTxCluster, LedgerKey, LedgerKeyAccount, ParallelTxExecutionStage,
-            ParallelTxsComponent,
         };
         let mut info = make_soroban_network_info();
         info.ledger_max_instructions = 10_000_000;
@@ -2877,10 +2873,10 @@ mod tests {
         .try_into()
         .unwrap();
 
-        let phase = TransactionPhase::V1(ParallelTxsComponent {
-            base_fee: Some(100),
-            execution_stages: vec![stage].try_into().unwrap(),
-        });
+        let phase = henyey_tx::tx_set_xdr::soroban_phase_with_stages(
+            Some(100),
+            vec![stage].try_into().unwrap(),
+        );
         assert!(check_valid_soroban(&phase, &header, &info));
     }
 

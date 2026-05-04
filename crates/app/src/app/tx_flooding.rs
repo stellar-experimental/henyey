@@ -1940,6 +1940,7 @@ mod tests {
                     .unwrap(),
                 ),
                 // Phase 1 (Soroban): V1 parallel with low base_fee
+                // Intentionally invalid: empty stages + Some(base_fee) for flooding test fixture
                 TransactionPhase::V1(ParallelTxsComponent {
                     base_fee: Some(low_fee),
                     execution_stages: vec![].try_into().unwrap(),
@@ -2005,6 +2006,7 @@ mod tests {
                     .try_into()
                     .unwrap(),
                 ),
+                // Intentionally invalid: empty stages + Some(base_fee) for flooding test fixture
                 TransactionPhase::V1(ParallelTxsComponent {
                     base_fee: Some(100),
                     execution_stages: vec![].try_into().unwrap(),

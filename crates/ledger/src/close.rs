@@ -1565,10 +1565,9 @@ mod tests {
     use stellar_xdr::curr::{
         DependentTxCluster, FeeBumpTransaction, FeeBumpTransactionEnvelope,
         FeeBumpTransactionInnerTx, GeneralizedTransactionSet, Hash, Limits, Memo, MuxedAccount,
-        ParallelTxExecutionStage, ParallelTxsComponent, Preconditions, Transaction,
-        TransactionEnvelope, TransactionExt, TransactionPhase, TransactionSetV1,
-        TransactionV1Envelope, TxSetComponent, TxSetComponentTxsMaybeDiscountedFee, Uint256, VecM,
-        WriteXdr,
+        ParallelTxExecutionStage, Preconditions, Transaction, TransactionEnvelope, TransactionExt,
+        TransactionPhase, TransactionSetV1, TransactionV1Envelope, TxSetComponent,
+        TxSetComponentTxsMaybeDiscountedFee, Uint256, VecM, WriteXdr,
     };
 
     fn make_tx(seed: u8, seq: i64) -> TransactionEnvelope {
@@ -1876,10 +1875,10 @@ mod tests {
         let cluster_c = DependentTxCluster(vec![soroban_d.clone()].try_into().unwrap());
         let stage_one = ParallelTxExecutionStage(vec![cluster_b, cluster_a].try_into().unwrap());
         let stage_two = ParallelTxExecutionStage(vec![cluster_c].try_into().unwrap());
-        let soroban_phase = TransactionPhase::V1(ParallelTxsComponent {
-            base_fee: None,
-            execution_stages: vec![stage_two, stage_one].try_into().unwrap(),
-        });
+        let soroban_phase = henyey_tx::tx_set_xdr::soroban_phase_with_stages(
+            None,
+            vec![stage_two, stage_one].try_into().unwrap(),
+        );
 
         let gen_set = GeneralizedTransactionSet::V1(TransactionSetV1 {
             previous_ledger_hash: Hash::from(Hash256::ZERO),
@@ -1936,10 +1935,10 @@ mod tests {
                 let stage = ParallelTxExecutionStage(
                     vec![cluster_first, cluster_second].try_into().unwrap(),
                 );
-                let parallel = ParallelTxsComponent {
-                    base_fee: None,
-                    execution_stages: vec![stage].try_into().unwrap(),
-                };
+                let parallel = henyey_tx::tx_set_xdr::new_parallel_txs_component(
+                    None,
+                    vec![stage].try_into().unwrap(),
+                );
                 let gen_set = GeneralizedTransactionSet::V1(TransactionSetV1 {
                     previous_ledger_hash: Hash::from(Hash256::ZERO),
                     phases: vec![

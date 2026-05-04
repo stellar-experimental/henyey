@@ -1177,10 +1177,10 @@ mod tests {
                 ParallelTxExecutionStage(clusters.try_into().unwrap())
             })
             .collect();
-        ParallelTxsComponent {
+        henyey_tx::tx_set_xdr::new_parallel_txs_component(
             base_fee,
-            execution_stages: execution_stages.try_into().unwrap(),
-        }
+            execution_stages.try_into().unwrap(),
+        )
     }
 
     fn make_gen_tx_set(phases: Vec<TransactionPhase>) -> GeneralizedTransactionSet {
@@ -1248,6 +1248,7 @@ mod tests {
 
     #[test]
     fn test_validate_parallel_component_rejects_empty_stage() {
+        // Intentionally invalid: empty stage tests validate_parallel_component rejection
         let parallel = ParallelTxsComponent {
             base_fee: Some(100),
             execution_stages: vec![ParallelTxExecutionStage(vec![].try_into().unwrap())]
@@ -1261,6 +1262,7 @@ mod tests {
 
     #[test]
     fn test_validate_parallel_component_rejects_empty_cluster() {
+        // Intentionally invalid: empty cluster tests validate_parallel_component rejection
         let parallel = ParallelTxsComponent {
             base_fee: Some(100),
             execution_stages: vec![ParallelTxExecutionStage(

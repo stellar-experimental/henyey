@@ -146,6 +146,7 @@ pub mod soroban;
 pub mod state;
 #[cfg(test)]
 pub mod test_utils;
+pub mod tx_set_xdr;
 pub mod validation;
 
 // Re-export error types

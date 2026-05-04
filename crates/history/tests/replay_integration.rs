@@ -359,9 +359,7 @@ async fn test_catchup_replay_bucket_hash_verification() {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_catchup_recent_large_gap_bucket_apply() {
     use henyey_history::CatchupMode;
-    use stellar_xdr::curr::{
-        GeneralizedTransactionSet, ParallelTxsComponent, TransactionPhase, TransactionSetV1,
-    };
+    use stellar_xdr::curr::{GeneralizedTransactionSet, TransactionPhase, TransactionSetV1};
 
     let bucket_apply_at = 127u32; // checkpoint where buckets are applied
     let target = 200u32;
@@ -384,10 +382,7 @@ async fn test_catchup_recent_large_gap_bucket_apply() {
     // This must match what `make_empty_tx_set` produces for lcl_protocol >= 23.
     let compute_empty_gen_tx_set_hash = |prev_hash: &Hash256| -> Hash256 {
         let classic_phase = TransactionPhase::V0(VecM::default());
-        let soroban_phase = TransactionPhase::V1(ParallelTxsComponent {
-            base_fee: None,
-            execution_stages: VecM::default(),
-        });
+        let soroban_phase = henyey_tx::tx_set_xdr::empty_soroban_phase();
         let gen_set = GeneralizedTransactionSet::V1(TransactionSetV1 {
             previous_ledger_hash: Hash(*prev_hash.as_bytes()),
             phases: vec![classic_phase, soroban_phase]
@@ -597,9 +592,7 @@ async fn test_catchup_recent_large_gap_bucket_apply() {
 /// - The tx set hash in ledger 64 uses Generalized v23+ format
 #[tokio::test]
 async fn test_catchup_self_corrects_lcl_protocol_from_archive() {
-    use stellar_xdr::curr::{
-        GeneralizedTransactionSet, ParallelTxsComponent, TransactionPhase, TransactionSetV1,
-    };
+    use stellar_xdr::curr::{GeneralizedTransactionSet, TransactionPhase, TransactionSetV1};
 
     let checkpoint = 63u32;
     let target = 64u32;
@@ -615,10 +608,7 @@ async fn test_catchup_self_corrects_lcl_protocol_from_archive() {
     // Helper: compute Generalized v23+ empty tx set hash for a given prev_hash.
     let compute_empty_gen_tx_set_hash = |prev_hash: &Hash256| -> Hash256 {
         let classic_phase = TransactionPhase::V0(VecM::default());
-        let soroban_phase = TransactionPhase::V1(ParallelTxsComponent {
-            base_fee: None,
-            execution_stages: VecM::default(),
-        });
+        let soroban_phase = henyey_tx::tx_set_xdr::empty_soroban_phase();
         let gen_set = GeneralizedTransactionSet::V1(TransactionSetV1 {
             previous_ledger_hash: Hash(*prev_hash.as_bytes()),
             phases: vec![classic_phase, soroban_phase]

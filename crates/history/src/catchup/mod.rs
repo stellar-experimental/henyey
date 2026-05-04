@@ -1158,7 +1158,7 @@ pub(crate) fn make_empty_tx_set(lcl: &LclContext) -> TransactionSetVariant {
     use henyey_common::protocol::{
         protocol_version_starts_from, ProtocolVersion, PARALLEL_SOROBAN_PHASE_PROTOCOL_VERSION,
     };
-    use stellar_xdr::curr::{ParallelTxsComponent, TransactionPhase, TransactionSet, VecM};
+    use stellar_xdr::curr::{TransactionPhase, TransactionSet, VecM};
 
     let previous_ledger_hash = lcl.lcl_hash().clone();
     let lcl_protocol_version = lcl.protocol_version();
@@ -1170,10 +1170,7 @@ pub(crate) fn make_empty_tx_set(lcl: &LclContext) -> TransactionSetVariant {
             PARALLEL_SOROBAN_PHASE_PROTOCOL_VERSION,
         ) {
             // Protocol 23+: parallel soroban phase
-            TransactionPhase::V1(ParallelTxsComponent {
-                base_fee: None,
-                execution_stages: VecM::default(),
-            })
+            henyey_tx::tx_set_xdr::empty_soroban_phase()
         } else {
             // Protocol 20-22: sequential soroban phase
             TransactionPhase::V0(VecM::default())

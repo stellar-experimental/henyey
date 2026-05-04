@@ -18,11 +18,12 @@
 use crate::tx_set_utils::HashedTx;
 use henyey_common::types::Hash256;
 use henyey_tx::envelope_utils::envelope_soroban_data;
+use henyey_tx::tx_set_xdr::{empty_soroban_phase, soroban_phase_with_stages};
 use henyey_tx::{FeeRate, InclusionFee};
 use stellar_xdr::curr::{
     DependentTxCluster, GeneralizedTransactionSet, Hash, LedgerKey, Limits,
-    ParallelTxExecutionStage, ParallelTxsComponent, TransactionEnvelope, TransactionPhase,
-    TransactionSetV1, TxSetComponent, TxSetComponentTxsMaybeDiscountedFee, VecM, WriteXdr,
+    ParallelTxExecutionStage, TransactionEnvelope, TransactionPhase, TransactionSetV1,
+    TxSetComponent, TxSetComponentTxsMaybeDiscountedFee, VecM, WriteXdr,
 };
 
 // ---------------------------------------------------------------------------
@@ -737,12 +738,10 @@ pub fn stages_to_xdr_phase(
     if stages.is_empty() {
         debug_assert!(
             base_fee.is_none(),
-            "stages_to_xdr_phase: zero-tx stages must not have Some(base_fee)"
+            "zero-tx stages must not have Some(base_fee) (got {:?})",
+            base_fee
         );
-        return TransactionPhase::V1(ParallelTxsComponent {
-            base_fee: None,
-            execution_stages: VecM::default(),
-        });
+        return empty_soroban_phase();
     }
 
     // Sort using precomputed hashes, then extract envelopes for XDR.
@@ -785,12 +784,12 @@ pub fn stages_to_xdr_phase(
         })
         .collect();
 
-    TransactionPhase::V1(ParallelTxsComponent {
+    soroban_phase_with_stages(
         base_fee,
-        execution_stages: execution_stages
+        execution_stages
             .try_into()
             .expect("execution_stages exceeds XDR VecM limit"),
-    })
+    )
 }
 
 /// Like `stages_to_xdr_phase`, but skips canonical sorting.
@@ -809,12 +808,10 @@ fn stages_to_xdr_phase_unsorted(
     if stages.is_empty() {
         debug_assert!(
             base_fee.is_none(),
-            "stages_to_xdr_phase_unsorted: zero-tx stages must not have Some(base_fee)"
+            "zero-tx stages must not have Some(base_fee) (got {:?})",
+            base_fee
         );
-        return TransactionPhase::V1(ParallelTxsComponent {
-            base_fee: None,
-            execution_stages: VecM::default(),
-        });
+        return empty_soroban_phase();
     }
 
     let execution_stages: Vec<ParallelTxExecutionStage> = stages
@@ -830,12 +827,12 @@ fn stages_to_xdr_phase_unsorted(
         })
         .collect();
 
-    TransactionPhase::V1(ParallelTxsComponent {
+    soroban_phase_with_stages(
         base_fee,
-        execution_stages: execution_stages
+        execution_stages
             .try_into()
             .expect("execution_stages exceeds XDR VecM limit"),
-    })
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -881,12 +878,7 @@ pub fn build_two_phase_tx_set(
     // build_parallel_soroban_phase() has instruction-limit-based capacity
     // constraints that would drop TXs exceeding cluster capacity.
     let soroban_phase = if soroban_txs.is_empty() {
-        // Invariant: empty execution_stages → base_fee must be None
-        // (stellar-core TxSetFrame.cpp:286-290).
-        TransactionPhase::V1(ParallelTxsComponent {
-            base_fee: None,
-            execution_stages: VecM::default(),
-        })
+        empty_soroban_phase()
     } else {
         let num_clusters = ledger_max_dependent_tx_clusters.max(1) as usize;
         let mut cluster_txs: Vec<Vec<TransactionEnvelope>> =

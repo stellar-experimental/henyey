@@ -8494,7 +8494,7 @@ mod advance_tracking_slot_tests {
     fn make_two_phase_tx_set(classic_seed: u8, soroban_seed: u8) -> TransactionSet {
         use stellar_xdr::curr::{
             DependentTxCluster, GeneralizedTransactionSet, Hash, ParallelTxExecutionStage,
-            ParallelTxsComponent, TransactionPhase, TransactionSetV1, TxSetComponent,
+            TransactionPhase, TransactionSetV1, TxSetComponent,
             TxSetComponentTxsMaybeDiscountedFee,
         };
 
@@ -8514,16 +8514,16 @@ mod advance_tracking_slot_tests {
         );
 
         // Phase 1: Soroban V1 parallel (single stage, single cluster)
-        let soroban_phase = TransactionPhase::V1(ParallelTxsComponent {
-            base_fee: Some(100),
-            execution_stages: vec![ParallelTxExecutionStage(
+        let soroban_phase = henyey_tx::tx_set_xdr::soroban_phase_with_stages(
+            Some(100),
+            vec![ParallelTxExecutionStage(
                 vec![DependentTxCluster(vec![soroban_tx].try_into().unwrap())]
                     .try_into()
                     .unwrap(),
             )]
             .try_into()
             .unwrap(),
-        });
+        );
 
         let gen = GeneralizedTransactionSet::V1(TransactionSetV1 {
             previous_ledger_hash: Hash([0u8; 32]),

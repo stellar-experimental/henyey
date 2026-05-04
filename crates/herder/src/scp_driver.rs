@@ -4871,6 +4871,7 @@ mod tests {
             previous_ledger_hash: Hash([0u8; 32]),
             phases: vec![
                 TransactionPhase::V0(vec![component].try_into().unwrap()),
+                // Intentionally invalid: empty stages + Some(base_fee) for SCP test fixture
                 TransactionPhase::V1(ParallelTxsComponent {
                     base_fee: Some(100),
                     execution_stages: vec![].try_into().unwrap(),
@@ -4880,9 +4881,6 @@ mod tests {
             .unwrap(),
         });
         let gen_set = TransactionSet::new_generalized(gen);
-
-        // The generalized tx set has a generalized_tx_set field
-        assert!(gen_set.generalized_tx_set().is_some());
 
         // The guard should skip is_tx_set_well_formed for generalized sets.
         // We can verify the guard logic directly: generalized_tx_set.is_none() is false,
@@ -5996,6 +5994,7 @@ mod tests {
             previous_ledger_hash: Hash(lcl_hash.0),
             phases: vec![
                 TransactionPhase::V0(vec![component].try_into().unwrap()),
+                // Intentionally invalid: empty stages + Some(base_fee) for SCP test fixture
                 TransactionPhase::V1(ParallelTxsComponent {
                     base_fee: Some(100),
                     execution_stages: vec![].try_into().unwrap(),
@@ -6033,6 +6032,7 @@ mod tests {
             previous_ledger_hash: Hash([0u8; 32]),
             phases: vec![
                 TransactionPhase::V0(vec![].try_into().unwrap()),
+                // Intentionally invalid: empty stages + Some(base_fee) for SCP test fixture
                 TransactionPhase::V1(ParallelTxsComponent {
                     base_fee: Some(100),
                     execution_stages: vec![].try_into().unwrap(),
@@ -6209,6 +6209,7 @@ mod compare_tx_sets_tests {
             previous_ledger_hash: Hash([0u8; 32]),
             phases: vec![
                 TransactionPhase::V0(vec![component].try_into().unwrap()),
+                // Intentionally invalid: empty stages + Some(base_fee) for compare_tx_sets fixture
                 TransactionPhase::V1(ParallelTxsComponent {
                     base_fee: Some(base_fee),
                     execution_stages: vec![].try_into().unwrap(),
@@ -6548,8 +6549,8 @@ mod compare_tx_sets_tests {
     #[test]
     fn test_tx_set_total_fees_generalized_saturation() {
         use stellar_xdr::curr::{
-            GeneralizedTransactionSet, Hash, ParallelTxsComponent, TransactionPhase,
-            TransactionSetV1, TxSetComponent, TxSetComponentTxsMaybeDiscountedFee,
+            GeneralizedTransactionSet, Hash, TransactionPhase, TransactionSetV1, TxSetComponent,
+            TxSetComponentTxsMaybeDiscountedFee,
         };
 
         // Generalized tx set with extreme fees. base_fee=None means
@@ -6566,10 +6567,7 @@ mod compare_tx_sets_tests {
             previous_ledger_hash: Hash([0u8; 32]),
             phases: vec![
                 TransactionPhase::V0(vec![component].try_into().unwrap()),
-                TransactionPhase::V1(ParallelTxsComponent {
-                    base_fee: None,
-                    execution_stages: vec![].try_into().unwrap(),
-                }),
+                henyey_tx::tx_set_xdr::empty_soroban_phase(),
             ]
             .try_into()
             .unwrap(),
