@@ -365,8 +365,10 @@ loop (watchdog fires, HTTP hangs, ledger progression stops). Check 3 alone
 misses this because `pgrep` still finds the PID.
 
 Flag WEDGE when BOTH:
-1. `grep 'WATCHDOG: Event loop appears frozen' $LOG | tail -1` is present
+1. `grep -E 'watchdog_freeze"?\s*[=:]\s*true|WATCHDOG: Event loop appears frozen' $LOG | tail -1` is present
    with a timestamp within the last 120s.
+   (The structured field `watchdog_freeze=true` is the primary signal; the
+   prose string is a legacy fallback. The `"?` accounts for JSON key quoting.)
 2. `curl -s -m 3 http://localhost:$MONITOR_ADMIN_PORT/info` returns empty
    body or times out.
 

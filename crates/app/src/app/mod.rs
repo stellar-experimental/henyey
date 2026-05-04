@@ -2904,6 +2904,22 @@ pub(crate) const WATCHDOG_PHASE_LEGEND: &str = "\
     27=ping, 28=peer_maint, 29=peer_refresh, \
     30=herder_cleanup, 31=scp_verifier, 32=scp_verified.";
 
+/// Name of the structured tracing field emitted by
+/// [`WatchdogSnapshot::emit_error()`].
+///
+/// This field is **reserved exclusively** for the ≥30s error-tier freeze
+/// path.  No other code path (including `emit_warn()`) should emit an event
+/// with this field name — doing so would cause monitor-tick to restart the
+/// node on transient stalls.
+///
+/// External monitoring tools (e.g. monitor-tick) grep rendered log output
+/// for this field to detect event-loop freezes.  The constant is a
+/// documentation anchor — the real mechanical guard is the
+/// `watchdog_freeze_field_tests` module.  **Do not rename this field without
+/// updating the tests and all monitoring consumers.**
+#[cfg(test)]
+pub(crate) const WATCHDOG_FREEZE_FIELD: &str = "watchdog_freeze";
+
 /// Which tier of WATCHDOG alert to emit based on event-loop staleness.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WatchdogTier {
@@ -2968,6 +2984,7 @@ impl WatchdogSnapshot {
     /// Emit the ≥30s error-tier WATCHDOG event with the phase-code legend.
     pub(crate) fn emit_error(&self) {
         tracing::error!(
+            watchdog_freeze = true,
             stale_secs = self.stale_secs,
             phase = self.phase,
             phase_sub = self.phase_sub,
@@ -5747,6 +5764,15 @@ mod tests {
             "pid must not appear in warn event: {}",
             ev.fields
         );
+
+        // watchdog_freeze sentinel must NOT be present on warn events —
+        // only the ≥30s error tier should carry it.
+        assert!(
+            !ev.fields.contains(super::WATCHDOG_FREEZE_FIELD),
+            "emit_warn() must NOT emit {} — only emit_error() may: {}",
+            super::WATCHDOG_FREEZE_FIELD,
+            ev.fields
+        );
     }
 
     /// Test C: `emit_error()` emits an ERROR event with all fields
@@ -5788,6 +5814,15 @@ mod tests {
             ev.fields
         );
         assert!(ev.fields.contains("pid=99999"), "pid: {}", ev.fields);
+
+        // Structured sentinel for machine-readable freeze detection.
+        assert!(
+            ev.fields
+                .contains(&format!("{}=true", super::WATCHDOG_FREEZE_FIELD)),
+            "{}: {}",
+            super::WATCHDOG_FREEZE_FIELD,
+            ev.fields
+        );
 
         // Message content.
         assert!(
@@ -5855,6 +5890,98 @@ mod tests {
                 entry,
                 legend
             );
+        }
+    }
+
+    /// Tests for [`WATCHDOG_FREEZE_FIELD`] — the monitoring contract.
+    ///
+    /// These tests guard that `emit_error()` emits the `watchdog_freeze`
+    /// structured field and that both the Text and JSON `tracing_subscriber::fmt`
+    /// formatters render it in grep-able form.
+    mod watchdog_freeze_field_tests {
+        use super::super::WATCHDOG_FREEZE_FIELD;
+        use std::io;
+        use std::sync::{Arc, Mutex};
+
+        /// Verify the Text formatter renders the field as `watchdog_freeze=true`,
+        /// matching the production formatter construction in `logging.rs`.
+        #[test]
+        fn test_watchdog_freeze_emits_field_text_format() {
+            use tracing::subscriber::with_default;
+            use tracing_subscriber::{fmt, layer::SubscriberExt, EnvFilter};
+
+            let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+            let buf_clone = buf.clone();
+
+            let fmt_layer = fmt::layer()
+                .with_writer(move || -> Box<dyn io::Write> {
+                    Box::new(BufWriter(buf_clone.clone()))
+                })
+                .with_ansi(false)
+                .with_target(true);
+
+            let subscriber = tracing_subscriber::registry()
+                .with(EnvFilter::new("error"))
+                .with(fmt_layer);
+
+            with_default(subscriber, || {
+                tracing::error!(watchdog_freeze = true, "test watchdog freeze");
+            });
+
+            let output = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+            assert!(
+                output.contains(&format!("{}=true", WATCHDOG_FREEZE_FIELD)),
+                "Text format must render field as '{}=true' for grep. Got: {output}",
+                WATCHDOG_FREEZE_FIELD,
+            );
+        }
+
+        /// Verify the JSON formatter renders the field as `"watchdog_freeze":true`,
+        /// matching the production formatter construction in `logging.rs`.
+        #[test]
+        fn test_watchdog_freeze_emits_field_json_format() {
+            use tracing::subscriber::with_default;
+            use tracing_subscriber::{fmt, layer::SubscriberExt, EnvFilter};
+
+            let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+            let buf_clone = buf.clone();
+
+            let fmt_layer = fmt::layer()
+                .with_writer(move || -> Box<dyn io::Write> {
+                    Box::new(BufWriter(buf_clone.clone()))
+                })
+                .json()
+                .with_span_list(true)
+                .with_current_span(true);
+
+            let subscriber = tracing_subscriber::registry()
+                .with(EnvFilter::new("error"))
+                .with(fmt_layer);
+
+            with_default(subscriber, || {
+                tracing::error!(watchdog_freeze = true, "test watchdog freeze");
+            });
+
+            let output = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+            assert!(
+                output.contains(&format!("\"{}\":true", WATCHDOG_FREEZE_FIELD)),
+                "JSON format must render field as '\"{}\":true' for grep. Got: {output}",
+                WATCHDOG_FREEZE_FIELD,
+            );
+        }
+
+        /// A `Write` adapter that appends to a shared `Vec<u8>`.
+        #[derive(Clone)]
+        struct BufWriter(Arc<Mutex<Vec<u8>>>);
+
+        impl io::Write for BufWriter {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
         }
     }
 
