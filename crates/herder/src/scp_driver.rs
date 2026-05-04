@@ -474,7 +474,7 @@ pub struct ScpDriver {
     test_clock: Arc<AtomicU64>,
     /// Per-slot timing for metrics (first-seen, nomination start, ballot start).
     slot_timing: RwLock<HashMap<SlotIndex, SlotTimingState>>,
-    /// Timing snapshot for the most recently externalized slot.
+    /// Timing snapshot for the highest externalized slot (monotonically updated).
     last_externalize_timing: RwLock<Option<ExternalizeTimingSnapshot>>,
     /// Externalize lag tracker for per-node lag statistics.
     /// Mirrors stellar-core's `mQSetLag` in `HerderSCPDriver`.
@@ -531,7 +531,8 @@ impl DeferredCauses {
     }
 }
 
-/// Timing snapshot for the most recently externalized slot.
+/// Timing snapshot for the highest externalized slot (by slot index, not wall-clock order).
+/// Only updated on strictly forward externalizations (monotonic guard).
 /// Both durations are guaranteed to describe the same slot.
 #[derive(Clone, Copy, Debug)]
 pub struct ExternalizeTimingSnapshot {
@@ -997,14 +998,14 @@ impl ScpDriver {
             .get_or_insert_with(std::time::Instant::now);
     }
 
-    /// Duration of the most recently externalized slot (first-seen → externalized).
+    /// Duration of the highest externalized slot (first-seen → externalized).
     pub fn last_externalize_duration(&self) -> Option<std::time::Duration> {
         self.last_externalize_timing
             .read()
             .map(|s| s.externalize_duration)
     }
 
-    /// Full timing snapshot for the most recently externalized slot.
+    /// Full timing snapshot for the highest externalized slot.
     pub fn last_externalize_timing(&self) -> Option<ExternalizeTimingSnapshot> {
         *self.last_externalize_timing.read()
     }
@@ -2321,9 +2322,14 @@ impl ScpDriver {
             externalized_at: now,
         };
 
-        // Compute timing snapshot only on first externalization for this slot.
+        // Monotonic guard: only update timing for strictly forward externalizations.
+        // Uses latest_externalized as the self-contained proxy — it is updated within
+        // this same function, so it reflects all prior externalizations by the next call.
+        // Prevents retrograde slots from overwriting timing of a newer slot.
+        let current_latest = *tracked_read(LOCK_SCP_LATEST_EXTERNALIZED, &self.latest_externalized);
+        let is_forward = current_latest.map(|l| slot > l).unwrap_or(true);
         let is_first = !tracked_read(LOCK_SCP_EXTERNALIZED, &self.externalized).contains_key(&slot);
-        if is_first {
+        if is_first && is_forward {
             let first_to_self = self
                 .externalize_lag
                 .read()
@@ -3535,6 +3541,68 @@ mod tests {
             snapshot2.externalize_duration
         );
         assert_eq!(snapshot1.nomination_duration, snapshot2.nomination_duration);
+    }
+
+    #[test]
+    fn test_nomination_timing_retrograde_slot_monotonic_guard() {
+        let driver = make_test_driver();
+
+        // Externalize slot 101 with full timing data.
+        driver.record_slot_activity(101);
+        driver.record_nomination_start(101);
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        driver.record_ballot_start(101);
+        driver.record_externalized(101, Value::default(), None);
+
+        let snapshot_before = driver.last_externalize_timing().unwrap();
+        assert_eq!(snapshot_before.slot, 101);
+        assert!(snapshot_before.externalize_duration.as_nanos() > 0);
+        assert!(snapshot_before.nomination_duration.is_some());
+        assert_eq!(driver.latest_externalized_slot(), Some(101));
+
+        // Now externalize retrograde slot 99 with its own timing data.
+        driver.record_slot_activity(99);
+        driver.record_nomination_start(99);
+        driver.record_ballot_start(99);
+        driver.record_externalized(99, Value::default(), None);
+
+        // Timing snapshot must still reflect slot 101, not regress to 99.
+        let snapshot_after = driver.last_externalize_timing().unwrap();
+        assert_eq!(snapshot_after.slot, 101);
+        assert_eq!(
+            snapshot_before.externalize_duration,
+            snapshot_after.externalize_duration
+        );
+        assert_eq!(
+            snapshot_before.nomination_duration,
+            snapshot_after.nomination_duration
+        );
+        // latest_externalized must remain at 101.
+        assert_eq!(driver.latest_externalized_slot(), Some(101));
+    }
+
+    #[test]
+    fn test_nomination_timing_retrograde_catchup_preserves_timing() {
+        let driver = make_test_driver();
+
+        // Externalize slot 101 with timing.
+        driver.record_slot_activity(101);
+        driver.record_nomination_start(101);
+        driver.record_externalized(101, Value::default(), None);
+
+        let snapshot_before = driver.last_externalize_timing().unwrap();
+        assert_eq!(snapshot_before.slot, 101);
+
+        // Retrograde slot 99 via catchup path (no slot_timing recorded).
+        // This must NOT clear the timing of the newer slot.
+        driver.record_externalized(99, Value::default(), None);
+
+        let snapshot_after = driver.last_externalize_timing().unwrap();
+        assert_eq!(snapshot_after.slot, 101);
+        assert_eq!(
+            snapshot_before.externalize_duration,
+            snapshot_after.externalize_duration
+        );
     }
 
     #[test]

@@ -3474,7 +3474,7 @@ impl Herder {
         })
     }
 
-    /// Timing snapshot for the most recently externalized slot.
+    /// Timing snapshot for the highest externalized slot (monotonically updated).
     pub fn scp_timing(&self) -> Option<crate::scp_driver::ExternalizeTimingSnapshot> {
         self.scp_driver.last_externalize_timing()
     }
