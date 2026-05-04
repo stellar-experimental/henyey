@@ -1,0 +1,93 @@
+name: Gitlinks
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: Check for unmatched gitlinks
+    runs-on: ubuntu-latest
+    timeout-minutes: 1
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify all gitlinks have .gitmodules entries
+        run: |
+          # Find all gitlink entries (mode 160000) in the index.
+          # NUL-delimited output handles paths with spaces or special chars.
+          gitlink_paths=()
+          while IFS= read -r -d '' entry; do
+            # Field layout: "<mode> <hash> <stage>\t<path>"
+            local_mode="${entry%% *}"
+            if [ "$local_mode" = "160000" ]; then
+              local_path="${entry#*	}"
+              gitlink_paths+=("$local_path")
+            fi
+          done < <(git ls-files -z --stage)
+
+          if [ ${#gitlink_paths[@]} -eq 0 ]; then
+            echo "No gitlink entries found."
+            exit 0
+          fi
+
+          echo "Found ${#gitlink_paths[@]} gitlink(s):"
+          printf '  %s\n' "${gitlink_paths[@]}"
+
+          # Extract legitimate submodule paths from .gitmodules.
+          submodule_paths=()
+          if [ -f .gitmodules ]; then
+            config_output=""
+            config_exit=0
+            config_output=$(git config --file .gitmodules --get-regexp '^submodule\..*\.path$' 2>&1) || config_exit=$?
+
+            if [ "$config_exit" -gt 1 ]; then
+              # Exit >1 = real error (parse failure, I/O error).
+              # Exit 1 = no matches (valid: no submodules declared).
+              echo "::error::Failed to parse .gitmodules (git config exit code $config_exit): $config_output"
+              exit 1
+            fi
+
+            if [ -n "$config_output" ]; then
+              while IFS= read -r line; do
+                # Output: "submodule.<name>.path <value>"
+                # Shortest-prefix removal at first space handles dots in names.
+                local_sp="${line#* }"
+                submodule_paths+=("$local_sp")
+              done <<< "$config_output"
+            fi
+          else
+            echo "::warning::No .gitmodules file found — all gitlinks will be flagged."
+          fi
+
+          # Check each gitlink has a matching .gitmodules entry.
+          unmatched=()
+          for link in "${gitlink_paths[@]}"; do
+            found=false
+            for sp in "${submodule_paths[@]}"; do
+              if [ "$link" = "$sp" ]; then
+                found=true
+                break
+              fi
+            done
+            if [ "$found" = false ]; then
+              unmatched+=("$link")
+            fi
+          done
+
+          if [ ${#unmatched[@]} -gt 0 ]; then
+            echo "::error::Found gitlink entries without matching .gitmodules entries:"
+            printf '  - %s\n' "${unmatched[@]}"
+            echo ""
+            echo "Each 160000-mode entry in the git index must have a corresponding"
+            echo "submodule declaration in .gitmodules. Either:"
+            echo "  1. Add the path to .gitmodules if it is a legitimate submodule, or"
+            echo "  2. Remove the gitlink with: git rm --cached <path>"
+            exit 1
+          fi
+
+          echo "All ${#gitlink_paths[@]} gitlink(s) have matching .gitmodules entries."
