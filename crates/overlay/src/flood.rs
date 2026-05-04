@@ -33,18 +33,23 @@ use crate::PeerId;
 
 /// Result of recording a message hash in the [`FloodGate`].
 ///
-/// **FloodGate is relay accounting, not a generic dedup layer.** The caller
-/// decides drop policy per message type:
-/// - SCP messages are NEVER dropped based on this (stellar-core parity:
-///   Peer.cpp:1667-1673 calls `recvFloodedMsgID` then unconditionally
-///   calls `recvSCPEnvelope`).
-/// - Transaction duplicates may be dropped (current `peer_loop` behavior).
+/// **FloodGate is relay accounting, not a dedup layer.** No FloodGate-tracked
+/// message type should be dropped based on this value. The return indicates
+/// whether the hash is new (for metrics/forwarding) or repeated (peer
+/// recorded for relay tracking). Actual dedup happens downstream:
+/// - SCP: `scp_scheduled_envelopes` in `pump_scp_intake`
+/// - Tx: herder `receive_transaction` / tx queue
+///
+/// stellar-core parity:
+/// - SCP: Peer.cpp:1667-1673 — unconditional `recvSCPEnvelope`
+/// - Tx:  OverlayManagerImpl.cpp:1215-1248 — unconditional `recvTransaction`
+/// See issues #2317, #2327.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[must_use]
 pub enum RelayRecord {
     /// First time this hash was seen — caller may forward to other peers.
     New,
-    /// Hash was already recorded. Caller decides drop policy per message type.
+    /// Hash was already recorded — for relay accounting only, NOT a drop signal.
     Repeated,
 }
 
