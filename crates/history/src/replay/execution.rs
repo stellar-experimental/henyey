@@ -185,14 +185,13 @@ fn verify_bucket_list_hash(
                 "Level state at mismatch"
             );
         }
-        return Err(HistoryError::VerificationHashMismatch(Box::new(
-            crate::error::VerifyHashMismatchInfo {
-                kind: crate::error::VerifyHashKind::BucketList,
-                ledger: Some(header.ledger_seq),
-                expected,
-                actual,
-            },
-        )));
+        return Err(crate::error::VerifyHashMismatchInfo::new(
+            crate::error::VerifyHashKind::BucketList,
+            Some(header.ledger_seq),
+            expected,
+            actual,
+        )
+        .into());
     }
     Ok(())
 }

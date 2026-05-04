@@ -159,14 +159,13 @@ pub fn verify_chain_anchors(headers: &[LedgerHeader], anchors: &ChainTrustAnchor
         let first = &headers[0];
         let actual_prev = Hash256::from(first.previous_ledger_hash.clone());
         if actual_prev != *expected_prev {
-            return Err(HistoryError::VerificationHashMismatch(Box::new(
-                crate::error::VerifyHashMismatchInfo {
-                    kind: crate::error::VerifyHashKind::BottomAnchor,
-                    ledger: Some(first.ledger_seq),
-                    expected: *expected_prev,
-                    actual: actual_prev,
-                },
-            )));
+            return Err(crate::error::VerifyHashMismatchInfo::new(
+                crate::error::VerifyHashKind::BottomAnchor,
+                Some(first.ledger_seq),
+                *expected_prev,
+                actual_prev,
+            )
+            .into());
         }
     }
 
@@ -177,14 +176,13 @@ pub fn verify_chain_anchors(headers: &[LedgerHeader], anchors: &ChainTrustAnchor
             if header.ledger_seq == lcl_seq {
                 let header_hash = compute_header_hash(header)?;
                 if header_hash != *lcl_hash {
-                    return Err(HistoryError::VerificationHashMismatch(Box::new(
-                        crate::error::VerifyHashMismatchInfo {
-                            kind: crate::error::VerifyHashKind::Lcl,
-                            ledger: Some(lcl_seq),
-                            expected: *lcl_hash,
-                            actual: header_hash,
-                        },
-                    )));
+                    return Err(crate::error::VerifyHashMismatchInfo::new(
+                        crate::error::VerifyHashKind::Lcl,
+                        Some(lcl_seq),
+                        *lcl_hash,
+                        header_hash,
+                    )
+                    .into());
                 }
                 break;
             }
@@ -208,14 +206,13 @@ pub fn verify_bucket_hash(data: &[u8], expected_hash: &Hash256) -> Result<()> {
     let actual_hash = Hash256::hash(data);
 
     if actual_hash != *expected_hash {
-        return Err(HistoryError::VerificationHashMismatch(Box::new(
-            crate::error::VerifyHashMismatchInfo {
-                kind: crate::error::VerifyHashKind::Bucket,
-                ledger: None,
-                expected: *expected_hash,
-                actual: actual_hash,
-            },
-        )));
+        return Err(crate::error::VerifyHashMismatchInfo::new(
+            crate::error::VerifyHashKind::Bucket,
+            None,
+            *expected_hash,
+            actual_hash,
+        )
+        .into());
     }
 
     Ok(())
@@ -238,14 +235,13 @@ pub fn verify_ledger_hash(header: &LedgerHeader, bucket_list_hash: &Hash256) -> 
     let header_bucket_hash = Hash256::from(header.bucket_list_hash.clone());
 
     if header_bucket_hash != *bucket_list_hash {
-        return Err(HistoryError::VerificationHashMismatch(Box::new(
-            crate::error::VerifyHashMismatchInfo {
-                kind: crate::error::VerifyHashKind::BucketList,
-                ledger: Some(header.ledger_seq),
-                expected: header_bucket_hash,
-                actual: *bucket_list_hash,
-            },
-        )));
+        return Err(crate::error::VerifyHashMismatchInfo::new(
+            crate::error::VerifyHashKind::BucketList,
+            Some(header.ledger_seq),
+            header_bucket_hash,
+            *bucket_list_hash,
+        )
+        .into());
     }
 
     Ok(())
@@ -275,14 +271,13 @@ pub fn verify_ledger_header_history_entry(entry: &LedgerHeaderHistoryEntry) -> R
     let advertised_hash = Hash256::from(entry.hash.clone());
 
     if computed_hash != advertised_hash {
-        return Err(HistoryError::VerificationHashMismatch(Box::new(
-            crate::error::VerifyHashMismatchInfo {
-                kind: crate::error::VerifyHashKind::LedgerHeaderEntry,
-                ledger: Some(entry.header.ledger_seq),
-                expected: advertised_hash,
-                actual: computed_hash,
-            },
-        )));
+        return Err(crate::error::VerifyHashMismatchInfo::new(
+            crate::error::VerifyHashKind::LedgerHeaderEntry,
+            Some(entry.header.ledger_seq),
+            advertised_hash,
+            computed_hash,
+        )
+        .into());
     }
 
     Ok(computed_hash)
@@ -309,14 +304,13 @@ pub fn verify_tx_result_set(header: &LedgerHeader, tx_result_set_xdr: &[u8]) -> 
     let expected_hash = Hash256::from(header.tx_set_result_hash.clone());
 
     if actual_hash != expected_hash {
-        return Err(HistoryError::VerificationHashMismatch(Box::new(
-            crate::error::VerifyHashMismatchInfo {
-                kind: crate::error::VerifyHashKind::TxResultSet,
-                ledger: Some(header.ledger_seq),
-                expected: expected_hash,
-                actual: actual_hash,
-            },
-        )));
+        return Err(crate::error::VerifyHashMismatchInfo::new(
+            crate::error::VerifyHashKind::TxResultSet,
+            Some(header.ledger_seq),
+            expected_hash,
+            actual_hash,
+        )
+        .into());
     }
 
     Ok(())
@@ -416,14 +410,13 @@ pub fn verify_header_matches_trusted(
     let trusted_hash = compute_header_hash(trusted_header)?;
 
     if downloaded_hash != trusted_hash {
-        return Err(HistoryError::VerificationHashMismatch(Box::new(
-            crate::error::VerifyHashMismatchInfo {
-                kind: crate::error::VerifyHashKind::TrustedHeader,
-                ledger: Some(downloaded_header.ledger_seq),
-                expected: trusted_hash,
-                actual: downloaded_hash,
-            },
-        )));
+        return Err(crate::error::VerifyHashMismatchInfo::new(
+            crate::error::VerifyHashKind::TrustedHeader,
+            Some(downloaded_header.ledger_seq),
+            trusted_hash,
+            downloaded_hash,
+        )
+        .into());
     }
 
     Ok(())

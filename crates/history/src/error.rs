@@ -69,6 +69,33 @@ pub struct VerifyHashMismatchInfo {
     pub actual: Hash256,
 }
 
+impl VerifyHashMismatchInfo {
+    /// Convenience constructor for `VerifyHashMismatchInfo`.
+    ///
+    /// All fields remain `pub`, so direct struct literal construction is still
+    /// valid. This constructor exists purely for ergonomics — combine with
+    /// `.into()` to produce a [`HistoryError::VerificationHashMismatch`].
+    pub fn new(
+        kind: VerifyHashKind,
+        ledger: Option<u32>,
+        expected: Hash256,
+        actual: Hash256,
+    ) -> Self {
+        Self {
+            kind,
+            ledger,
+            expected,
+            actual,
+        }
+    }
+}
+
+impl From<VerifyHashMismatchInfo> for HistoryError {
+    fn from(info: VerifyHashMismatchInfo) -> Self {
+        HistoryError::VerificationHashMismatch(Box::new(info))
+    }
+}
+
 impl std::fmt::Display for VerifyHashMismatchInfo {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self.ledger {
@@ -447,14 +474,27 @@ mod tests {
         assert!(!err.is_hash_mismatch());
     }
 
-    /// Helper to construct a `VerificationHashMismatch` error for tests.
-    fn make_verify_hash_mismatch(kind: VerifyHashKind, ledger: Option<u32>) -> HistoryError {
-        HistoryError::VerificationHashMismatch(Box::new(VerifyHashMismatchInfo {
-            kind,
-            ledger,
-            expected: Hash256::ZERO,
-            actual: Hash256::from([0xAB; 32]),
-        }))
+    #[test]
+    fn test_verify_hash_mismatch_info_new_and_into() {
+        let expected = Hash256::ZERO;
+        let actual = Hash256::from([0xAB; 32]);
+        let info = VerifyHashMismatchInfo::new(VerifyHashKind::Bucket, Some(42), expected, actual);
+
+        assert_eq!(info.kind, VerifyHashKind::Bucket);
+        assert_eq!(info.ledger, Some(42));
+        assert_eq!(info.expected, expected);
+        assert_eq!(info.actual, actual);
+
+        let err: HistoryError = info.into();
+        match &err {
+            HistoryError::VerificationHashMismatch(boxed) => {
+                assert_eq!(boxed.kind, VerifyHashKind::Bucket);
+                assert_eq!(boxed.ledger, Some(42));
+                assert_eq!(boxed.expected, expected);
+                assert_eq!(boxed.actual, actual);
+            }
+            other => panic!("expected VerificationHashMismatch, got: {other:?}"),
+        }
     }
 
     #[test]
@@ -468,7 +508,13 @@ mod tests {
             VerifyHashKind::BottomAnchor,
             VerifyHashKind::Lcl,
         ] {
-            let err = make_verify_hash_mismatch(kind, Some(42));
+            let err: HistoryError = VerifyHashMismatchInfo::new(
+                kind,
+                Some(42),
+                Hash256::ZERO,
+                Hash256::from([0xAB; 32]),
+            )
+            .into();
             assert!(
                 err.is_fatal_catchup_failure(),
                 "VerificationHashMismatch({kind}) should be a fatal catchup failure"
@@ -487,7 +533,13 @@ mod tests {
             VerifyHashKind::BottomAnchor,
             VerifyHashKind::Lcl,
         ] {
-            let err = make_verify_hash_mismatch(kind, Some(42));
+            let err: HistoryError = VerifyHashMismatchInfo::new(
+                kind,
+                Some(42),
+                Hash256::ZERO,
+                Hash256::from([0xAB; 32]),
+            )
+            .into();
             assert!(
                 err.is_hash_mismatch(),
                 "VerificationHashMismatch({kind}) should be recognized as a hash mismatch"
@@ -497,12 +549,12 @@ mod tests {
 
     #[test]
     fn test_verify_hash_mismatch_display_with_ledger() {
-        let info = VerifyHashMismatchInfo {
-            kind: VerifyHashKind::BucketList,
-            ledger: Some(42),
-            expected: Hash256::ZERO,
-            actual: Hash256::from([0xAB; 32]),
-        };
+        let info = VerifyHashMismatchInfo::new(
+            VerifyHashKind::BucketList,
+            Some(42),
+            Hash256::ZERO,
+            Hash256::from([0xAB; 32]),
+        );
         let msg = info.to_string();
         assert!(msg.contains("bucket list hash mismatch at ledger 42"));
         assert!(msg.contains("expected"));
@@ -511,12 +563,12 @@ mod tests {
 
     #[test]
     fn test_verify_hash_mismatch_display_without_ledger() {
-        let info = VerifyHashMismatchInfo {
-            kind: VerifyHashKind::Bucket,
-            ledger: None,
-            expected: Hash256::ZERO,
-            actual: Hash256::from([0xAB; 32]),
-        };
+        let info = VerifyHashMismatchInfo::new(
+            VerifyHashKind::Bucket,
+            None,
+            Hash256::ZERO,
+            Hash256::from([0xAB; 32]),
+        );
         let msg = info.to_string();
         assert!(msg.contains("bucket hash mismatch:"));
         assert!(!msg.contains("at ledger"));
