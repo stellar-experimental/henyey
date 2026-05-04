@@ -996,13 +996,13 @@ pub fn execute_operation_with_soroban(
                     state,
                     context,
                     &extend_footprint_ttl::SorobanExtendConfig {
-                        soroban_data: Some(soroban.soroban_data),
+                        soroban_data: soroban.soroban_data,
                         ttl_key_cache: soroban.ttl_key_cache,
-                        size_limits: Some(&ContractSizeLimits {
+                        size_limits: &ContractSizeLimits {
                             max_contract_size_bytes: config.max_contract_size_bytes,
                             max_contract_data_entry_size_bytes: config
                                 .max_contract_data_entry_size_bytes,
-                        }),
+                        },
                         max_entry_ttl: config.max_entry_ttl,
                     },
                 )?;
@@ -1145,15 +1145,15 @@ pub fn execute_operation_with_soroban(
                     state,
                     context,
                     restore_footprint::RestoreFootprintResources {
-                        soroban_data: Some(soroban.soroban_data),
+                        soroban_data: soroban.soroban_data,
                         min_persistent_entry_ttl: config.min_persistent_entry_ttl,
                         hot_archive_restores: &ha_restore_entries,
                         ttl_key_cache: soroban.ttl_key_cache,
-                        size_limits: Some(ContractSizeLimits {
+                        size_limits: ContractSizeLimits {
                             max_contract_size_bytes: config.max_contract_size_bytes,
                             max_contract_data_entry_size_bytes: config
                                 .max_contract_data_entry_size_bytes,
-                        }),
+                        },
                     },
                 )?;
                 let mut exec = OperationExecutionResult::new(result);

@@ -25,7 +25,7 @@ pub struct HotArchiveRestoreEntry {
 /// Soroban inputs needed to restore archived entries.
 pub struct RestoreFootprintResources<'a> {
     /// Soroban transaction data containing the restore footprint.
-    pub soroban_data: Option<&'a SorobanTransactionData>,
+    pub soroban_data: &'a SorobanTransactionData,
     /// Minimum persistent entry TTL from Soroban config.
     pub min_persistent_entry_ttl: u32,
     /// Entries loaded from the hot archive for this operation.
@@ -33,7 +33,7 @@ pub struct RestoreFootprintResources<'a> {
     /// Optional TTL key cache for hashing restored entries.
     pub ttl_key_cache: Option<&'a crate::soroban::TtlKeyCache>,
     /// Contract size limits from SorobanConfig.
-    pub size_limits: Option<super::ContractSizeLimits>,
+    pub size_limits: super::ContractSizeLimits,
 }
 
 /// Execute a RestoreFootprint operation.
@@ -59,13 +59,7 @@ pub(crate) fn execute_restore_footprint(
     context: &LedgerContext,
     resources: RestoreFootprintResources<'_>,
 ) -> Result<OperationResult> {
-    // Get the footprint from Soroban transaction data
-    let footprint = match resources.soroban_data {
-        Some(data) => &data.resources.footprint,
-        None => {
-            return Ok(make_result(RestoreFootprintResultCode::Malformed));
-        }
-    };
+    let footprint = &resources.soroban_data.resources.footprint;
 
     if !footprint.read_only.is_empty() {
         return Ok(make_result(RestoreFootprintResultCode::Malformed));
@@ -84,10 +78,9 @@ pub(crate) fn execute_restore_footprint(
     let new_ttl = restore_ttl_target(current_ledger, resources.min_persistent_entry_ttl);
 
     // Resource limit tracking (stellar-core: RestoreFootprintApplyHelper::apply)
-    let soroban_data = resources.soroban_data.unwrap(); // safe: checked above
     let mut accumulator = ResourceAccumulator::new(
-        soroban_data.resources.disk_read_bytes,
-        soroban_data.resources.write_bytes,
+        resources.soroban_data.resources.disk_read_bytes,
+        resources.soroban_data.resources.write_bytes,
     );
 
     // First, restore hot archive entries to state.
@@ -108,12 +101,14 @@ pub(crate) fn execute_restore_footprint(
                 RestoreFootprintResultCode::ResourceLimitExceeded,
             ));
         }
-        if let Some(ref limits) = resources.size_limits {
-            if !super::validate_contract_ledger_entry(&restore.key, entry_size as usize, limits) {
-                return Ok(make_result(
-                    RestoreFootprintResultCode::ResourceLimitExceeded,
-                ));
-            }
+        if !super::validate_contract_ledger_entry(
+            &restore.key,
+            entry_size as usize,
+            &resources.size_limits,
+        ) {
+            return Ok(make_result(
+                RestoreFootprintResultCode::ResourceLimitExceeded,
+            ));
         }
         if accumulator.add_write(entry_size).is_err() {
             return Ok(make_result(
@@ -154,7 +149,7 @@ pub(crate) fn execute_restore_footprint(
         new_ttl,
         current_ledger,
         ttl_key_cache: resources.ttl_key_cache,
-        size_limits: resources.size_limits.as_ref(),
+        size_limits: &resources.size_limits,
     };
     for key in footprint.read_write.iter() {
         // Skip entries that were restored from hot archive - they're already handled
@@ -225,7 +220,7 @@ struct RestoreContext<'a> {
     new_ttl: u32,
     current_ledger: u32,
     ttl_key_cache: Option<&'a crate::soroban::TtlKeyCache>,
-    size_limits: Option<&'a super::ContractSizeLimits>,
+    size_limits: &'a super::ContractSizeLimits,
 }
 
 /// Restore a single ledger entry.
@@ -268,10 +263,8 @@ fn restore_entry(
 
             // stellar-core ordering: read_bytes → validate_contract → write_bytes
             accumulator.add_read(entry_size)?;
-            if let Some(limits) = ctx.size_limits {
-                if !super::validate_contract_ledger_entry(key, entry_size as usize, limits) {
-                    return Err(());
-                }
+            if !super::validate_contract_ledger_entry(key, entry_size as usize, ctx.size_limits) {
+                return Err(());
             }
             accumulator.add_write(entry_size)?;
 
@@ -322,41 +315,15 @@ mod tests {
     /// Default min persistent TTL for tests (matches testnet config)
     const TEST_MIN_PERSISTENT_TTL: u32 = 120960;
 
+    /// Permissive size limits that never trigger rejection, used by tests that
+    /// don't exercise contract size validation.
+    const PERMISSIVE_LIMITS: super::super::ContractSizeLimits = super::super::ContractSizeLimits {
+        max_contract_size_bytes: u32::MAX,
+        max_contract_data_entry_size_bytes: u32::MAX,
+    };
+
     fn create_test_context() -> LedgerContext {
         LedgerContext::testnet(1, 1000)
-    }
-
-    #[test]
-    fn test_restore_footprint_no_soroban_data() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
-        let context = create_test_context();
-        let source = create_test_account_id(0);
-
-        let op = RestoreFootprintOp {
-            ext: ExtensionPoint::V0,
-        };
-
-        let result = execute_restore_footprint(
-            &op,
-            &source,
-            &mut state,
-            &context,
-            RestoreFootprintResources {
-                soroban_data: None,
-                min_persistent_entry_ttl: TEST_MIN_PERSISTENT_TTL,
-                hot_archive_restores: &[], // No hot archive restores
-                ttl_key_cache: None,
-                size_limits: None,
-            },
-        );
-        assert!(result.is_ok());
-
-        match result.unwrap() {
-            OperationResult::OpInner(OperationResultTr::RestoreFootprint(r)) => {
-                assert!(matches!(r, RestoreFootprintResult::Malformed));
-            }
-            _ => panic!("Unexpected result type"),
-        }
     }
 
     #[test]
@@ -389,11 +356,11 @@ mod tests {
             &mut state,
             &context,
             RestoreFootprintResources {
-                soroban_data: Some(&soroban_data),
+                soroban_data: &soroban_data,
                 min_persistent_entry_ttl: TEST_MIN_PERSISTENT_TTL,
                 hot_archive_restores: &[], // No hot archive restores
                 ttl_key_cache: None,
-                size_limits: None,
+                size_limits: PERMISSIVE_LIMITS,
             },
         );
         assert!(result.is_ok());
@@ -440,11 +407,11 @@ mod tests {
             &mut state,
             &context,
             RestoreFootprintResources {
-                soroban_data: Some(&soroban_data),
+                soroban_data: &soroban_data,
                 min_persistent_entry_ttl: TEST_MIN_PERSISTENT_TTL,
                 hot_archive_restores: &[], // No hot archive restores
                 ttl_key_cache: None,
-                size_limits: None,
+                size_limits: PERMISSIVE_LIMITS,
             },
         );
         assert!(result.is_ok());
@@ -493,11 +460,11 @@ mod tests {
             &mut state,
             &context,
             RestoreFootprintResources {
-                soroban_data: Some(&soroban_data),
+                soroban_data: &soroban_data,
                 min_persistent_entry_ttl: TEST_MIN_PERSISTENT_TTL,
                 hot_archive_restores: &[], // No hot archive restores
                 ttl_key_cache: None,
-                size_limits: None,
+                size_limits: PERMISSIVE_LIMITS,
             },
         );
         assert!(result.is_ok());
@@ -547,11 +514,11 @@ mod tests {
             &mut state,
             &context,
             RestoreFootprintResources {
-                soroban_data: Some(&soroban_data),
+                soroban_data: &soroban_data,
                 min_persistent_entry_ttl: TEST_MIN_PERSISTENT_TTL,
                 hot_archive_restores: &[],
                 ttl_key_cache: None,
-                size_limits: None,
+                size_limits: PERMISSIVE_LIMITS,
             },
         );
         assert!(result.is_ok());
@@ -608,11 +575,11 @@ mod tests {
             &mut state,
             &context,
             RestoreFootprintResources {
-                soroban_data: Some(&soroban_data),
+                soroban_data: &soroban_data,
                 min_persistent_entry_ttl: TEST_MIN_PERSISTENT_TTL,
                 hot_archive_restores: &[],
                 ttl_key_cache: None,
-                size_limits: None,
+                size_limits: PERMISSIVE_LIMITS,
             },
         );
         assert!(result.is_ok());
@@ -669,11 +636,11 @@ mod tests {
             &mut state,
             &context,
             RestoreFootprintResources {
-                soroban_data: Some(&soroban_data),
+                soroban_data: &soroban_data,
                 min_persistent_entry_ttl: TEST_MIN_PERSISTENT_TTL,
                 hot_archive_restores: &[],
                 ttl_key_cache: None,
-                size_limits: None,
+                size_limits: PERMISSIVE_LIMITS,
             },
         );
         assert!(result.is_ok());
@@ -731,11 +698,11 @@ mod tests {
             &mut state,
             &context,
             RestoreFootprintResources {
-                soroban_data: Some(&soroban_data),
+                soroban_data: &soroban_data,
                 min_persistent_entry_ttl: TEST_MIN_PERSISTENT_TTL,
                 hot_archive_restores: &[],
                 ttl_key_cache: None,
-                size_limits: None,
+                size_limits: PERMISSIVE_LIMITS,
             },
         );
         assert!(result.is_ok());
@@ -810,11 +777,11 @@ mod tests {
             &mut state,
             &context,
             RestoreFootprintResources {
-                soroban_data: Some(&soroban_data),
+                soroban_data: &soroban_data,
                 min_persistent_entry_ttl: TEST_MIN_PERSISTENT_TTL,
                 hot_archive_restores: &[],
                 ttl_key_cache: None,
-                size_limits: None,
+                size_limits: PERMISSIVE_LIMITS,
             },
         );
         assert!(result.is_ok());
@@ -896,11 +863,11 @@ mod tests {
             &mut state,
             &context,
             RestoreFootprintResources {
-                soroban_data: Some(&soroban_data),
+                soroban_data: &soroban_data,
                 min_persistent_entry_ttl: 10,
                 hot_archive_restores: &hot_restores,
                 ttl_key_cache: None,
-                size_limits: None,
+                size_limits: PERMISSIVE_LIMITS,
             },
         );
         assert_restore_result(result, RestoreFootprintResult::Success);
@@ -952,11 +919,11 @@ mod tests {
             &mut state,
             &context,
             RestoreFootprintResources {
-                soroban_data: Some(&soroban_data),
+                soroban_data: &soroban_data,
                 min_persistent_entry_ttl: TEST_MIN_PERSISTENT_TTL,
                 hot_archive_restores: &hot_restores,
                 ttl_key_cache: None,
-                size_limits: None,
+                size_limits: PERMISSIVE_LIMITS,
             },
         );
         assert_restore_result(result, RestoreFootprintResult::Success);
@@ -1002,11 +969,11 @@ mod tests {
             &mut state,
             &context,
             RestoreFootprintResources {
-                soroban_data: Some(&soroban_data),
+                soroban_data: &soroban_data,
                 min_persistent_entry_ttl: TEST_MIN_PERSISTENT_TTL,
                 hot_archive_restores: &hot_restores,
                 ttl_key_cache: None,
-                size_limits: None,
+                size_limits: PERMISSIVE_LIMITS,
             },
         );
         assert_restore_result(result, RestoreFootprintResult::ResourceLimitExceeded);
@@ -1073,11 +1040,11 @@ mod tests {
             &mut state,
             &context,
             RestoreFootprintResources {
-                soroban_data: Some(&soroban_data),
+                soroban_data: &soroban_data,
                 min_persistent_entry_ttl: TEST_MIN_PERSISTENT_TTL,
                 hot_archive_restores: &hot_restores,
                 ttl_key_cache: None,
-                size_limits: None,
+                size_limits: PERMISSIVE_LIMITS,
             },
         );
         assert_restore_result(result, RestoreFootprintResult::ResourceLimitExceeded);
@@ -1129,11 +1096,11 @@ mod tests {
             &mut state,
             &context,
             RestoreFootprintResources {
-                soroban_data: Some(&soroban_data),
+                soroban_data: &soroban_data,
                 min_persistent_entry_ttl: TEST_MIN_PERSISTENT_TTL,
                 hot_archive_restores: &[],
                 ttl_key_cache: None,
-                size_limits: None,
+                size_limits: PERMISSIVE_LIMITS,
             },
         );
     }
@@ -1176,11 +1143,11 @@ mod tests {
             &mut state,
             &context,
             RestoreFootprintResources {
-                soroban_data: Some(&soroban_data),
+                soroban_data: &soroban_data,
                 min_persistent_entry_ttl: TEST_MIN_PERSISTENT_TTL,
                 hot_archive_restores: &[],
                 ttl_key_cache: None,
-                size_limits: None,
+                size_limits: PERMISSIVE_LIMITS,
             },
         );
         assert_restore_result(result, RestoreFootprintResult::Success);
