@@ -74,9 +74,12 @@ fn parse_bucket_hash_pairs(levels: &[HASBucketLevel]) -> Vec<(Hash256, Hash256)>
 
 /// Parse the next-merge states from a slice of bucket levels.
 ///
-/// Returns an error if a hash field required by the declared state is present
-/// but contains a malformed hex string (parity: stellar-core would fail hard
-/// on such an HAS).
+/// Returns an error if:
+/// - A hash field required by the declared state is present but contains a
+///   malformed hex string.
+/// - A hash field required by the declared state is absent (`None`). Parity:
+///   stellar-core's FutureBucket invariants require output for state-1 and
+///   both inputs for state-2 (FutureBucket.cpp:248-315).
 fn parse_next_states(
     levels: &[HASBucketLevel],
 ) -> std::result::Result<Vec<LiveBucketNextState>, HistoryError> {
@@ -84,41 +87,53 @@ fn parse_next_states(
         .iter()
         .enumerate()
         .map(|(i, level)| {
-            let output = match level.next.output.as_ref() {
-                Some(h) if level.next.state == HAS_NEXT_STATE_OUTPUT => {
-                    Some(Hash256::from_hex(h).map_err(|_| {
-                        HistoryError::InvalidResponse(format!(
-                            "level {}: state {} output hash is malformed: {}",
-                            i, level.next.state, h
-                        ))
-                    })?)
+            let output = match (level.next.state, level.next.output.as_ref()) {
+                (HAS_NEXT_STATE_OUTPUT, Some(h)) => Some(Hash256::from_hex(h).map_err(|_| {
+                    HistoryError::InvalidResponse(format!(
+                        "level {}: state {} output hash is malformed: {}",
+                        i, level.next.state, h
+                    ))
+                })?),
+                (HAS_NEXT_STATE_OUTPUT, None) => {
+                    return Err(HistoryError::InvalidResponse(format!(
+                        "level {}: state {} requires output hash but field is absent",
+                        i, level.next.state
+                    )));
                 }
-                Some(h) => Hash256::from_hex(h).ok(),
-                None => None,
+                (_, Some(h)) => Hash256::from_hex(h).ok(),
+                (_, None) => None,
             };
-            let input_curr = match level.next.curr.as_ref() {
-                Some(h) if level.next.state == HAS_NEXT_STATE_INPUTS => {
-                    Some(Hash256::from_hex(h).map_err(|_| {
-                        HistoryError::InvalidResponse(format!(
-                            "level {}: state {} input curr hash is malformed: {}",
-                            i, level.next.state, h
-                        ))
-                    })?)
+            let input_curr = match (level.next.state, level.next.curr.as_ref()) {
+                (HAS_NEXT_STATE_INPUTS, Some(h)) => Some(Hash256::from_hex(h).map_err(|_| {
+                    HistoryError::InvalidResponse(format!(
+                        "level {}: state {} input curr hash is malformed: {}",
+                        i, level.next.state, h
+                    ))
+                })?),
+                (HAS_NEXT_STATE_INPUTS, None) => {
+                    return Err(HistoryError::InvalidResponse(format!(
+                        "level {}: state {} requires input curr hash but field is absent",
+                        i, level.next.state
+                    )));
                 }
-                Some(h) => Hash256::from_hex(h).ok(),
-                None => None,
+                (_, Some(h)) => Hash256::from_hex(h).ok(),
+                (_, None) => None,
             };
-            let input_snap = match level.next.snap.as_ref() {
-                Some(h) if level.next.state == HAS_NEXT_STATE_INPUTS => {
-                    Some(Hash256::from_hex(h).map_err(|_| {
-                        HistoryError::InvalidResponse(format!(
-                            "level {}: state {} input snap hash is malformed: {}",
-                            i, level.next.state, h
-                        ))
-                    })?)
+            let input_snap = match (level.next.state, level.next.snap.as_ref()) {
+                (HAS_NEXT_STATE_INPUTS, Some(h)) => Some(Hash256::from_hex(h).map_err(|_| {
+                    HistoryError::InvalidResponse(format!(
+                        "level {}: state {} input snap hash is malformed: {}",
+                        i, level.next.state, h
+                    ))
+                })?),
+                (HAS_NEXT_STATE_INPUTS, None) => {
+                    return Err(HistoryError::InvalidResponse(format!(
+                        "level {}: state {} requires input snap hash but field is absent",
+                        i, level.next.state
+                    )));
                 }
-                Some(h) => Hash256::from_hex(h).ok(),
-                None => None,
+                (_, Some(h)) => Hash256::from_hex(h).ok(),
+                (_, None) => None,
             };
             Ok(LiveBucketNextState {
                 state: level.next.state,
@@ -1414,6 +1429,155 @@ mod tests {
             "Go SDK hash ({}) != henyey hash ({})",
             go_hash.to_hex(),
             combined_henyey.to_hex()
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Regression tests for #2380: parse_next_states must reject HAS with
+    // malformed or missing required future-bucket hashes.
+    // -----------------------------------------------------------------------
+
+    const ZERO_HEX: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+
+    fn make_has_with_next(next: HASBucketNext) -> HistoryArchiveState {
+        let levels = vec![
+            HASBucketLevel {
+                curr: ZERO_HEX.to_string(),
+                snap: ZERO_HEX.to_string(),
+                next: HASBucketNext::default(),
+            },
+            HASBucketLevel {
+                curr: ZERO_HEX.to_string(),
+                snap: ZERO_HEX.to_string(),
+                next,
+            },
+            HASBucketLevel {
+                curr: ZERO_HEX.to_string(),
+                snap: ZERO_HEX.to_string(),
+                next: HASBucketNext::default(),
+            },
+        ];
+        HistoryArchiveState {
+            version: 2,
+            server: None,
+            current_ledger: 100,
+            network_passphrase: None,
+            current_buckets: levels,
+            hot_archive_buckets: None,
+        }
+    }
+
+    #[test]
+    fn test_parse_next_states_state1_valid() {
+        let has = make_has_with_next(HASBucketNext {
+            state: HAS_NEXT_STATE_OUTPUT,
+            output: Some(HASH_A.to_string()),
+            curr: None,
+            snap: None,
+            shadow: None,
+        });
+        let states = has.live_next_states().unwrap();
+        assert_eq!(states[1].state, HAS_NEXT_STATE_OUTPUT);
+        assert!(states[1].output.is_some());
+    }
+
+    #[test]
+    fn test_parse_next_states_state1_missing_output() {
+        let has = make_has_with_next(HASBucketNext {
+            state: HAS_NEXT_STATE_OUTPUT,
+            output: None,
+            curr: None,
+            snap: None,
+            shadow: None,
+        });
+        let err = has.live_next_states().unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("requires output hash") && msg.contains("absent"),
+            "should reject state=1 with missing output: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_parse_next_states_state1_malformed_output() {
+        let has = make_has_with_next(HASBucketNext {
+            state: HAS_NEXT_STATE_OUTPUT,
+            output: Some("not_valid_hex".to_string()),
+            curr: None,
+            snap: None,
+            shadow: None,
+        });
+        let err = has.live_next_states().unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("malformed"),
+            "should reject state=1 with malformed output: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_parse_next_states_state2_valid() {
+        let has = make_has_with_next(HASBucketNext {
+            state: HAS_NEXT_STATE_INPUTS,
+            output: None,
+            curr: Some(HASH_A.to_string()),
+            snap: Some(HASH_B.to_string()),
+            shadow: None,
+        });
+        let states = has.live_next_states().unwrap();
+        assert_eq!(states[1].state, HAS_NEXT_STATE_INPUTS);
+        assert!(states[1].input_curr.is_some());
+        assert!(states[1].input_snap.is_some());
+    }
+
+    #[test]
+    fn test_parse_next_states_state2_missing_curr() {
+        let has = make_has_with_next(HASBucketNext {
+            state: HAS_NEXT_STATE_INPUTS,
+            output: None,
+            curr: None,
+            snap: Some(HASH_A.to_string()),
+            shadow: None,
+        });
+        let err = has.live_next_states().unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("requires input curr hash") && msg.contains("absent"),
+            "should reject state=2 with missing curr: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_parse_next_states_state2_missing_snap() {
+        let has = make_has_with_next(HASBucketNext {
+            state: HAS_NEXT_STATE_INPUTS,
+            output: None,
+            curr: Some(HASH_A.to_string()),
+            snap: None,
+            shadow: None,
+        });
+        let err = has.live_next_states().unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("requires input snap hash") && msg.contains("absent"),
+            "should reject state=2 with missing snap: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_parse_next_states_state2_malformed_curr() {
+        let has = make_has_with_next(HASBucketNext {
+            state: HAS_NEXT_STATE_INPUTS,
+            output: None,
+            curr: Some("bad_hex".to_string()),
+            snap: Some(HASH_A.to_string()),
+            shadow: None,
+        });
+        let err = has.live_next_states().unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("malformed"),
+            "should reject state=2 with malformed curr: {msg}"
         );
     }
 }
