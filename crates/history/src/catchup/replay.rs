@@ -403,17 +403,15 @@ mod tests {
         let fatal_errors: Vec<HistoryError> = vec![
             HistoryError::VerificationFailed("hash mismatch".to_string()),
             HistoryError::InvalidPreviousHash { ledger: 100 },
-            HistoryError::InvalidTxSetHash {
-                ledger: 100,
-                info: Box::new(crate::error::TxSetHashMismatchInfo {
-                    expected: Hash256::ZERO,
-                    actual: Hash256::ZERO,
-                    header_ledger_version: 0,
-                    header_prev_hash: Hash256::ZERO,
-                    tx_set_prev_hash: Hash256::ZERO,
-                    tx_set_format: "classic",
-                }),
-            },
+            crate::error::TxSetHashMismatchInfo::new(
+                Hash256::ZERO,
+                Hash256::ZERO,
+                0,
+                Hash256::ZERO,
+                Hash256::ZERO,
+                "classic",
+            )
+            .into_error(100),
             HistoryError::InvalidSequence {
                 expected: 100,
                 got: 200,

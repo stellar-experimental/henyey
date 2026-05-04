@@ -131,6 +131,40 @@ pub struct TxSetHashMismatchInfo {
     pub tx_set_format: &'static str,
 }
 
+impl TxSetHashMismatchInfo {
+    /// Convenience constructor for `TxSetHashMismatchInfo`.
+    ///
+    /// All fields remain `pub`, so direct struct literal construction is still
+    /// valid. This constructor exists purely for ergonomics — combine with
+    /// [`into_error`](Self::into_error) to produce a
+    /// [`HistoryError::InvalidTxSetHash`].
+    pub fn new(
+        expected: Hash256,
+        actual: Hash256,
+        header_ledger_version: u32,
+        header_prev_hash: Hash256,
+        tx_set_prev_hash: Hash256,
+        tx_set_format: &'static str,
+    ) -> Self {
+        Self {
+            expected,
+            actual,
+            header_ledger_version,
+            header_prev_hash,
+            tx_set_prev_hash,
+            tx_set_format,
+        }
+    }
+
+    /// Convert into a [`HistoryError::InvalidTxSetHash`], boxing `self`.
+    pub fn into_error(self, ledger: u32) -> HistoryError {
+        HistoryError::InvalidTxSetHash {
+            ledger,
+            info: Box::new(self),
+        }
+    }
+}
+
 impl std::fmt::Display for TxSetHashMismatchInfo {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
@@ -407,17 +441,15 @@ mod tests {
     fn test_verification_errors_are_fatal() {
         assert!(HistoryError::VerificationFailed("bad".into()).is_fatal_catchup_failure());
         assert!(HistoryError::InvalidPreviousHash { ledger: 5 }.is_fatal_catchup_failure());
-        assert!(HistoryError::InvalidTxSetHash {
-            ledger: 5,
-            info: Box::new(TxSetHashMismatchInfo {
-                expected: Hash256::ZERO,
-                actual: Hash256::ZERO,
-                header_ledger_version: 0,
-                header_prev_hash: Hash256::ZERO,
-                tx_set_prev_hash: Hash256::ZERO,
-                tx_set_format: "classic",
-            }),
-        }
+        assert!(TxSetHashMismatchInfo::new(
+            Hash256::ZERO,
+            Hash256::ZERO,
+            0,
+            Hash256::ZERO,
+            Hash256::ZERO,
+            "classic",
+        )
+        .into_error(5)
         .is_fatal_catchup_failure());
         assert!(HistoryError::InvalidSequence {
             expected: 5,
@@ -448,17 +480,15 @@ mod tests {
         assert!(err.is_hash_mismatch());
 
         // Positive: InvalidTxSetHash
-        let err = HistoryError::InvalidTxSetHash {
-            ledger: 5,
-            info: Box::new(TxSetHashMismatchInfo {
-                expected: Hash256::ZERO,
-                actual: Hash256::ZERO,
-                header_ledger_version: 0,
-                header_prev_hash: Hash256::ZERO,
-                tx_set_prev_hash: Hash256::ZERO,
-                tx_set_format: "classic",
-            }),
-        };
+        let err = TxSetHashMismatchInfo::new(
+            Hash256::ZERO,
+            Hash256::ZERO,
+            0,
+            Hash256::ZERO,
+            Hash256::ZERO,
+            "classic",
+        )
+        .into_error(5);
         assert!(err.is_hash_mismatch());
 
         // Negative: CatchupFailed is NOT a hash mismatch
@@ -544,6 +574,37 @@ mod tests {
                 err.is_hash_mismatch(),
                 "VerificationHashMismatch({kind}) should be recognized as a hash mismatch"
             );
+        }
+    }
+
+    #[test]
+    fn test_tx_set_hash_mismatch_info_helpers() {
+        let expected = Hash256::from([1u8; 32]);
+        let actual = Hash256::from([2u8; 32]);
+        let prev = Hash256::from([3u8; 32]);
+        let tx_prev = Hash256::from([4u8; 32]);
+
+        let info =
+            TxSetHashMismatchInfo::new(expected, actual, 21, prev, tx_prev, "generalized_v1");
+        assert_eq!(info.expected, expected);
+        assert_eq!(info.actual, actual);
+        assert_eq!(info.header_ledger_version, 21);
+        assert_eq!(info.header_prev_hash, prev);
+        assert_eq!(info.tx_set_prev_hash, tx_prev);
+        assert_eq!(info.tx_set_format, "generalized_v1");
+
+        let err = info.into_error(42);
+        match &err {
+            HistoryError::InvalidTxSetHash { ledger, info } => {
+                assert_eq!(*ledger, 42);
+                assert_eq!(info.expected, expected);
+                assert_eq!(info.actual, actual);
+                assert_eq!(info.header_ledger_version, 21);
+                assert_eq!(info.header_prev_hash, prev);
+                assert_eq!(info.tx_set_prev_hash, tx_prev);
+                assert_eq!(info.tx_set_format, "generalized_v1");
+            }
+            other => panic!("expected InvalidTxSetHash, got: {other:?}"),
         }
     }
 

@@ -370,17 +370,15 @@ pub fn verify_tx_set(header: &LedgerHeader, tx_set: &TransactionSetVariant) -> R
             "verify_tx_set hash mismatch"
         );
 
-        return Err(HistoryError::InvalidTxSetHash {
-            ledger: header.ledger_seq,
-            info: Box::new(crate::error::TxSetHashMismatchInfo {
-                expected: expected_hash,
-                actual: actual_hash,
-                header_ledger_version: header.ledger_version,
-                header_prev_hash,
-                tx_set_prev_hash,
-                tx_set_format,
-            }),
-        });
+        return Err(crate::error::TxSetHashMismatchInfo::new(
+            expected_hash,
+            actual_hash,
+            header.ledger_version,
+            header_prev_hash,
+            tx_set_prev_hash,
+            tx_set_format,
+        )
+        .into_error(header.ledger_seq));
     }
 
     Ok(())
