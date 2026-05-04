@@ -349,8 +349,6 @@ pub struct Herder {
     secret_key: Option<SecretKey>,
     /// Ledger manager reference (optional, for validation).
     ledger_manager: RwLock<Option<Arc<LedgerManager>>>,
-    /// Previous externalized value (for priority calculation).
-    prev_value: RwLock<Value>,
     /// Slot-level quorum tracker for heard-from quorum/v-blocking checks.
     slot_quorum_tracker: RwLock<SlotQuorumTracker>,
     /// Transitive quorum tracker for the current quorum map.
@@ -549,7 +547,6 @@ impl Herder {
             tracking_started_at: RwLock::new(None),
             secret_key,
             ledger_manager: RwLock::new(None),
-            prev_value: RwLock::new(Value::default()),
             slot_quorum_tracker: RwLock::new(slot_quorum_tracker),
             quorum_tracker: RwLock::new(quorum_tracker),
             quorum_intersection_state: Arc::new(RwLock::new(QuorumIntersectionState::new())),
@@ -1014,21 +1011,6 @@ impl Herder {
 
         // Transition to tracking state
         *tracked_write(LOCK_HERDER_STATE, &self.state) = HerderState::Tracking;
-
-        // Seed prev_value from LCL's scpValue so the first nomination uses the
-        // correct previousValue for priority calculation. Matches stellar-core's
-        // triggerNextLedger which reads lcl.header.scpValue (HerderImpl.cpp:1602).
-        if let Some(lm) = self.ledger_manager.read().as_ref() {
-            let header = lm.current_header();
-            *self.prev_value.write() = Value(
-                header
-                    .scp_value
-                    .to_xdr(Limits::none())
-                    .expect("StellarValue XDR serialization cannot fail for a valid LCL header")
-                    .try_into()
-                    .expect("StellarValue XDR bytes always fit in BytesM"),
-            );
-        }
 
         // Release any pending envelopes for this slot and previous
         self.drain_and_process_pending(slot);
@@ -1772,19 +1754,6 @@ impl Herder {
                         self.scp_driver
                             .cleanup_externalized(self.config.max_externalized_slots);
 
-                        // Only update prev_value cache if this is a forward
-                        // externalization. consensus_index is the *next* slot
-                        // (externalized_slot + 1), so slot >= consensus_index
-                        // means this slot is at least as recent as the current
-                        // tracking target. Mirrors stellar-core's isLatestSlot
-                        // guard in HerderSCPDriver::valueExternalized.
-                        {
-                            let current_consensus = self.tracking_state.read().consensus_index;
-                            if slot >= current_consensus {
-                                *self.prev_value.write() = value;
-                            }
-                        }
-
                         // Advance tracking slot
                         self.advance_tracking_slot(slot);
                     }
@@ -1950,10 +1919,9 @@ impl Herder {
 
     /// Derive the previous externalized value for nomination priority calculation.
     ///
-    /// Mirrors stellar-core's `triggerNextLedger(lcl.header.scpValue)` pattern:
-    /// always read from the latest applied ledger (LCL) when `ledger_manager` is
-    /// installed. Falls back to the cached `prev_value` field for test contexts
-    /// where no LedgerManager is available.
+    /// Reads from the LedgerManager's LCL (`current_header().scp_value`),
+    /// mirroring stellar-core's `triggerNextLedger(lcl.header.scpValue)` pattern.
+    /// Returns `Value::default()` when no LedgerManager is installed (test-only path).
     fn get_previous_value(&self) -> Value {
         if let Some(lm) = self.ledger_manager.read().as_ref() {
             let header = lm.current_header();
@@ -1966,7 +1934,8 @@ impl Herder {
                     .expect("StellarValue XDR bytes always fit in BytesM"),
             )
         } else {
-            self.prev_value.read().clone()
+            tracing::debug!("get_previous_value: no LedgerManager installed, returning default");
+            Value::default()
         }
     }
 
@@ -2100,12 +2069,6 @@ impl Herder {
         // happens synchronously within self.scp.nominate(). Check if the slot was
         // externalized and advance tracking state accordingly.
         if self.scp_driver.latest_externalized_slot() == Some(slot) {
-            if let Some(ext) = self.scp_driver.get_externalized(slot) {
-                let current_consensus = self.tracking_state.read().consensus_index;
-                if slot >= current_consensus {
-                    *self.prev_value.write() = ext.value;
-                }
-            }
             self.advance_tracking_slot(slot);
         }
 
@@ -9776,10 +9739,10 @@ mod dynamic_close_time_tests {
 }
 
 // =============================================================================
-// Tests for prev_value retrograde guard (issue #2342)
+// Tests for get_previous_value and retrograde externalization (issues #2342, #2347)
 // =============================================================================
 #[cfg(test)]
-mod prev_value_guard_tests {
+mod previous_value_tests {
     use super::*;
     use crate::tx_queue::TransactionSet;
     use henyey_common::Hash256;
@@ -9844,117 +9807,36 @@ mod prev_value_guard_tests {
         Value(sv.to_xdr(Limits::none()).unwrap().try_into().unwrap())
     }
 
-    /// Retrograde externalization must NOT overwrite prev_value.
-    ///
-    /// Scenario: externalize slot 10 (forward), then externalize slot 8
-    /// (retrograde). The prev_value cache must retain the value from slot 10.
-    #[test]
-    fn test_prev_value_not_overwritten_by_retrograde_externalization() {
-        let herder = Herder::new(HerderConfig::default());
-
-        // Simulate: tracking_state.consensus_index = 10
-        // (meaning last externalized was slot 9, next expected is 10)
-        {
-            let mut ts = herder.tracking_state.write();
-            ts.is_tracking = true;
-            ts.consensus_index = 10;
-        }
-
-        let value_10 = stellar_value_to_scp_value(&make_stellar_value(10));
-        let value_8 = stellar_value_to_scp_value(&make_stellar_value(8));
-
-        // Forward externalization: slot 10 >= consensus_index 10 → writes prev_value
-        {
-            let current_consensus = herder.tracking_state.read().consensus_index;
-            assert!(10 >= current_consensus);
-            *herder.prev_value.write() = value_10.clone();
-        }
-        herder.advance_tracking_slot(10);
-
-        // Verify tracking advanced to 11
-        assert_eq!(herder.tracking_state.read().consensus_index, 11);
-
-        // Retrograde externalization: slot 8 < consensus_index 11 → must NOT write
-        {
-            let current_consensus = herder.tracking_state.read().consensus_index;
-            assert!(8 < current_consensus);
-            // Simulating what the guarded code does — should not write.
-            if 8 >= current_consensus {
-                *herder.prev_value.write() = value_8.clone();
-            }
-        }
-
-        // prev_value must still be value_10, not value_8
-        let cached = herder.prev_value.read().clone();
-        assert_eq!(
-            cached, value_10,
-            "prev_value must not regress to old slot's value"
-        );
-        assert_ne!(cached, value_8);
-    }
-
-    /// Bootstrap must seed prev_value from LCL's scpValue.
-    #[test]
-    fn test_bootstrap_seeds_prev_value_from_lcl() {
-        let herder = Herder::new(HerderConfig::default());
-
-        // prev_value starts as default
-        assert_eq!(*herder.prev_value.read(), Value::default());
-
-        let sv = make_stellar_value(42);
-        let expected_value = stellar_value_to_scp_value(&sv);
-
-        let lm = make_lm_with_scp_value(10, sv);
-        herder.set_ledger_manager(lm);
-
-        // Bootstrap at ledger 10
-        herder.bootstrap(10);
-
-        // prev_value must now be the XDR of the LCL's scpValue
-        let cached = herder.prev_value.read().clone();
-        assert_eq!(
-            cached, expected_value,
-            "bootstrap must seed prev_value from LCL scpValue"
-        );
-    }
-
-    /// get_previous_value prefers LCL when ledger_manager is set.
+    /// get_previous_value reads from LCL when ledger_manager is set.
     #[test]
     fn test_get_previous_value_reads_from_lcl() {
         let herder = Herder::new(HerderConfig::default());
 
-        // Manually set prev_value to something different
-        let stale_value = stellar_value_to_scp_value(&make_stellar_value(1));
-        *herder.prev_value.write() = stale_value.clone();
-
-        // Install LM with a different scpValue
+        // Install LM with a known scpValue
         let lcl_sv = make_stellar_value(99);
         let expected = stellar_value_to_scp_value(&lcl_sv);
         let lm = make_lm_with_scp_value(10, lcl_sv);
         herder.set_ledger_manager(lm);
 
-        // get_previous_value should return LCL value, not the stale cache
+        // get_previous_value should return LCL value
         let result = herder.get_previous_value();
         assert_eq!(
             result, expected,
-            "get_previous_value must prefer LCL over cache"
+            "get_previous_value must return LCL's scpValue"
         );
-        assert_ne!(result, stale_value);
     }
 
-    /// get_previous_value falls back to prev_value when no LM is installed.
+    /// get_previous_value returns Value::default() when no LM is installed.
     #[test]
-    fn test_get_previous_value_falls_back_to_cache_without_lm() {
+    fn test_get_previous_value_returns_default_without_lm() {
         let herder = Herder::new(HerderConfig::default());
 
-        let cached_value = stellar_value_to_scp_value(&make_stellar_value(5));
-        *herder.prev_value.write() = cached_value.clone();
-
-        // No LM installed → should use cache
+        // No LM installed → should return default
         let result = herder.get_previous_value();
         assert_eq!(
-            result, cached_value,
-            "without LM, must fall back to cached prev_value"
+            result,
+            Value::default(),
+            "without LM, get_previous_value must return Value::default()"
         );
     }
 
@@ -10015,7 +9897,7 @@ mod prev_value_guard_tests {
     /// Build a signed EXTERNALIZE envelope for a given slot and value.
     ///
     /// Mirrors `sign_statement` / `make_signed_externalize_from` from the
-    /// sibling tests module but is accessible within `prev_value_guard_tests`.
+    /// sibling tests module but is accessible within `previous_value_tests`.
     fn make_signed_externalize(
         slot: u64,
         herder: &Herder,
@@ -10054,18 +9936,18 @@ mod prev_value_guard_tests {
     // End-to-end retrograde externalization test (issue #2345)
     // =========================================================================
 
-    /// End-to-end test: retrograde externalization must NOT overwrite prev_value.
+    /// Retrograde externalization must NOT regress tracking state.
     ///
-    /// Unlike `test_prev_value_not_overwritten_by_retrograde_externalization`
-    /// which manually reenacts the guard, this test drives the real
-    /// `receive_scp_envelope` → `process_scp_envelope_with_tx_set` path.
+    /// Drives the real `receive_scp_envelope` → externalization path to verify
+    /// that tracking_slot and latest_externalized_slot are not regressed by a
+    /// retrograde EXTERNALIZE envelope.
     ///
     /// Scenario:
     /// 1. Bootstrap at ledger 100 (tracking slot 101)
-    /// 2. Externalize slot 101 via receive_scp_envelope → prev_value = value_101
-    /// 3. Send retrograde EXTERNALIZE for slot 99 → prev_value must still be value_101
+    /// 2. Externalize slot 101 via receive_scp_envelope
+    /// 3. Send retrograde EXTERNALIZE for slot 99 → tracking must not regress
     #[test]
-    fn test_retrograde_externalization_e2e_preserves_prev_value() {
+    fn test_retrograde_externalization_e2e_preserves_tracking() {
         // -- Setup: validator herder with 2 validators (threshold 1) ----------
         let local_secret = SecretKey::from_seed(&[7u8; 32]);
         let local_public = local_secret.public_key();
@@ -10091,10 +9973,6 @@ mod prev_value_guard_tests {
         };
 
         let herder = Herder::with_secret_key(config, SecretKey::from_seed(&[7u8; 32]));
-
-        // No LedgerManager installed — this test targets the prev_value cache
-        // guard, which is the fallback path used when no LM is present.
-        // (With LM, get_previous_value() reads from LCL directly.)
 
         herder.start_syncing();
         herder.bootstrap(100); // tracking slot = 101
@@ -10131,18 +10009,11 @@ mod prev_value_guard_tests {
             102,
             "tracking must advance to 102 after externalizing 101"
         );
-        assert_eq!(
-            *herder.prev_value.read(),
-            value_101,
-            "prev_value cache must hold slot 101's value after forward externalization"
-        );
 
         // -- Retrograde externalization: slot 99 ------------------------------
         let env_99 = make_signed_externalize(99, &herder, &peer_secret, value_99.clone());
         let result_99 = herder.receive_scp_envelope(env_99);
 
-        // The retrograde envelope must reach the externalization path
-        // (not be rejected by pre-filter or signature verification).
         assert_eq!(
             result_99,
             EnvelopeState::Valid,
@@ -10164,7 +10035,7 @@ mod prev_value_guard_tests {
             "externalized slot 99 must contain value_99"
         );
 
-        // -- Verify state did NOT regress -------------------------------------
+        // -- Verify tracking state did NOT regress ----------------------------
         assert_eq!(
             herder.tracking_slot(),
             102,
@@ -10174,17 +10045,6 @@ mod prev_value_guard_tests {
             herder.latest_externalized_slot(),
             Some(101),
             "latest_externalized_slot must remain 101 (not regress to 99)"
-        );
-
-        // -- The key assertion: prev_value guard prevented overwrite ----------
-        let cached = herder.prev_value.read().clone();
-        assert_eq!(
-            cached, value_101,
-            "prev_value must still hold slot 101's value after retrograde externalization"
-        );
-        assert_ne!(
-            cached, value_99,
-            "prev_value must NOT contain slot 99's value"
         );
     }
 }
