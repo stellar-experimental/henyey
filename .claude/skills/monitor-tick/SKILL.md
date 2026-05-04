@@ -385,7 +385,7 @@ incidents: #1904, #1873, #1921, #1949.
   1. `RSS > 16 GB`, AND
   2. system `available` memory from `free -m` (NOT `free` — that excludes
      reclaimable kernel cache) `< 8 GB`, AND
-  3. latest two `Memory report summary` entries both show `heap_components_mb`
+  3. latest two `memory_report=true` (or `Memory report summary`) entries both show `heap_components_mb`
      growing by > 500 MB vs the earlier snapshot.
 - Restart: Stop-PID, Rotate-log suffix `crashed`, Relaunch.
 
@@ -407,7 +407,7 @@ Report how many files were removed if any.
 **(6) Session disk** — `du -sh /home/tomer/data/$MONITOR_SESSION_ID/`
 and `du -sh /home/tomer/data/mainnet/`. If combined > 200 GB, flag SESSION DISK HIGH.
 
-**(7) Memory report** — `grep 'Memory report summary' /home/tomer/data/$MONITOR_SESSION_ID/logs/monitor.log | tail -1`.
+**(7) Memory report** — `grep -E 'memory_report=true|Memory report summary' /home/tomer/data/$MONITOR_SESSION_ID/logs/monitor.log | tail -1`.
 If grep returns no output AND process uptime > 400s, flag WARNING
 memory-report-missing (log format may have changed). Memory reports emit
 every ~6 minutes, so an uptime below 400s legitimately has no entry yet on

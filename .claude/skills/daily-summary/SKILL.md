@@ -83,7 +83,7 @@ Extract:
   (mean of the rate over today using the histogram sum/count)
 - `stellar_scp_timing_externalized_seconds` (slot-cycle) likewise
 - `henyey_jemalloc_fragmentation_pct` (current value)
-- Last `Memory report summary` line for `heap_components_mb` trajectory
+- Last `memory_report=true` (or `Memory report summary`) line for `heap_components_mb` trajectory
 
 Build (uptime, deploys, RSS-GB, frag-pct) and emit:
 

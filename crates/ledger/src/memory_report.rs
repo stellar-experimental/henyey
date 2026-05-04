@@ -10,6 +10,19 @@
 use henyey_common::memory::ComponentMemory;
 use tracing::info;
 
+/// Name of the structured tracing field emitted by [`MemoryReport::log`].
+///
+/// This field is **reserved exclusively** for the memory-report summary
+/// event.  No other code path should emit an event with this field name.
+///
+/// External monitoring tools (e.g. monitor-tick) grep rendered log output
+/// for this field to detect memory report presence.  The constant is a
+/// documentation anchor — the real mechanical guard is the
+/// `test_memory_report_emits_field_*` tests.  **Do not rename this field
+/// without updating the tests and all monitoring consumers.**
+#[cfg(test)]
+pub(crate) const MEMORY_REPORT_FIELD: &str = "memory_report";
+
 /// Process-level memory breakdown parsed from `/proc/self/status`.
 #[derive(Debug, Clone, Default)]
 pub struct ProcessMemory {
@@ -175,10 +188,18 @@ impl MemoryReport {
     }
 
     /// Emit structured log lines for the report.
+    ///
+    /// The summary event includes a `memory_report = true` structured tracing
+    /// field.  This field is **reserved exclusively** for this event — no other
+    /// code path should emit it.  External monitoring tools (e.g. monitor-tick)
+    /// grep rendered log output for this field to detect memory report presence.
+    /// **Do not rename or remove the field without updating all monitoring
+    /// consumers and the `test_memory_report_emits_field_*` test suite.**
     pub fn log(&self) {
         let to_mb = |b: u64| b as f64 / (1024.0 * 1024.0);
 
         info!(
+            memory_report = true,
             ledger_seq = self.ledger_seq,
             rss_mb = format!("{:.0}", to_mb(self.process.rss_bytes)),
             anon_rss_mb = format!("{:.0}", to_mb(self.process.anon_rss_bytes)),
@@ -289,5 +310,201 @@ mod tests {
             components: vec![],
         };
         assert_eq!(report.fragmentation_pct(), 0.0);
+    }
+}
+
+/// Tests for [`MEMORY_REPORT_FIELD`] — the monitoring contract.
+///
+/// These tests guard that `MemoryReport::log()` emits the `memory_report`
+/// structured field and that both the Text and JSON `tracing_subscriber::fmt`
+/// formatters render it in grep-able form.
+#[cfg(test)]
+mod memory_report_field_tests {
+    use super::*;
+    use std::io;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex,
+    };
+
+    /// Build a minimal `MemoryReport` suitable for testing `log()`.
+    fn test_report() -> MemoryReport {
+        MemoryReport {
+            ledger_seq: 42,
+            process: ProcessMemory::default(),
+            allocator: AllocatorStats::default(),
+            components: vec![ComponentMemory::new("test", 100, 5)],
+        }
+    }
+
+    /// Verify `MemoryReport::log()` emits the structured field
+    /// `memory_report = true` on the summary event, and that component
+    /// events do NOT carry the field (exclusivity).
+    #[test]
+    fn test_memory_report_emits_field_structured() {
+        use tracing::{
+            field::{Field, Visit},
+            subscriber::with_default,
+            Event, Metadata, Subscriber,
+        };
+
+        #[derive(Default)]
+        struct CapturedBool {
+            value: Option<bool>,
+        }
+        impl Visit for CapturedBool {
+            fn record_bool(&mut self, field: &Field, value: bool) {
+                if field.name() == MEMORY_REPORT_FIELD {
+                    self.value = Some(value);
+                }
+            }
+            fn record_debug(&mut self, _: &Field, _: &dyn std::fmt::Debug) {}
+        }
+
+        #[derive(Default, Clone)]
+        struct MemReportFieldSubscriber {
+            summary_count: Arc<AtomicUsize>,
+            component_has_field: Arc<Mutex<bool>>,
+            total_events: Arc<AtomicUsize>,
+        }
+        impl Subscriber for MemReportFieldSubscriber {
+            fn enabled(&self, _: &Metadata<'_>) -> bool {
+                true
+            }
+            fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+                tracing::span::Id::from_u64(1)
+            }
+            fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+            fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+            fn event(&self, event: &Event<'_>) {
+                self.total_events.fetch_add(1, Ordering::SeqCst);
+                let mut cap = CapturedBool::default();
+                event.record(&mut cap);
+                if let Some(true) = cap.value {
+                    self.summary_count.fetch_add(1, Ordering::SeqCst);
+                }
+                // Check if a component event was seen with the field —
+                // that would be a contract violation.
+                let mut is_component = false;
+                struct MsgVisitor<'a>(&'a mut bool);
+                impl Visit for MsgVisitor<'_> {
+                    fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+                        if field.name() == "message" {
+                            let msg = format!("{:?}", value);
+                            if msg.contains("Memory report component") {
+                                *self.0 = true;
+                            }
+                        }
+                    }
+                }
+                event.record(&mut MsgVisitor(&mut is_component));
+                if is_component && cap.value == Some(true) {
+                    *self.component_has_field.lock().unwrap() = true;
+                }
+            }
+            fn enter(&self, _: &tracing::span::Id) {}
+            fn exit(&self, _: &tracing::span::Id) {}
+        }
+
+        let sub = MemReportFieldSubscriber::default();
+        let summary_count = sub.summary_count.clone();
+        let component_has_field = sub.component_has_field.clone();
+        let total_events = sub.total_events.clone();
+
+        with_default(sub, || {
+            test_report().log();
+        });
+
+        assert_eq!(
+            summary_count.load(Ordering::SeqCst),
+            1,
+            "MemoryReport::log() must emit exactly one event with {MEMORY_REPORT_FIELD}=true"
+        );
+        assert!(
+            !*component_has_field.lock().unwrap(),
+            "Component events must NOT carry the {MEMORY_REPORT_FIELD} field"
+        );
+        // Summary + 1 component = 2 events minimum
+        assert!(
+            total_events.load(Ordering::SeqCst) >= 2,
+            "Expected at least 2 events (summary + components)"
+        );
+    }
+
+    /// Verify the Text formatter renders the field as `memory_report=true`,
+    /// matching the production formatter construction in `logging.rs:334-341`.
+    #[test]
+    fn test_memory_report_emits_field_text_format() {
+        use tracing::subscriber::with_default;
+        use tracing_subscriber::{fmt, layer::SubscriberExt, EnvFilter};
+
+        let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let buf_clone = buf.clone();
+
+        // Mirror production Text formatter construction (logging.rs:334-341).
+        let fmt_layer = fmt::layer()
+            .with_writer(move || -> Box<dyn io::Write> { Box::new(BufWriter(buf_clone.clone())) })
+            .with_ansi(false)
+            .with_target(true);
+
+        let subscriber = tracing_subscriber::registry()
+            .with(EnvFilter::new("info"))
+            .with(fmt_layer);
+
+        with_default(subscriber, || {
+            test_report().log();
+        });
+
+        let output = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        assert!(
+            output.contains("memory_report=true"),
+            "Text format must render field as 'memory_report=true' for grep. Got: {output}"
+        );
+    }
+
+    /// Verify the JSON formatter renders the field as `"memory_report":true`,
+    /// matching the production formatter construction in `logging.rs:353-357`.
+    #[test]
+    fn test_memory_report_emits_field_json_format() {
+        use tracing::subscriber::with_default;
+        use tracing_subscriber::{fmt, layer::SubscriberExt, EnvFilter};
+
+        let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let buf_clone = buf.clone();
+
+        // Mirror production JSON formatter construction (logging.rs:353-357).
+        let fmt_layer = fmt::layer()
+            .with_writer(move || -> Box<dyn io::Write> { Box::new(BufWriter(buf_clone.clone())) })
+            .json()
+            .with_span_list(true)
+            .with_current_span(true);
+
+        let subscriber = tracing_subscriber::registry()
+            .with(EnvFilter::new("info"))
+            .with(fmt_layer);
+
+        with_default(subscriber, || {
+            test_report().log();
+        });
+
+        let output = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        assert!(
+            output.contains("\"memory_report\":true"),
+            "JSON format must render field as '\"memory_report\":true' for grep. Got: {output}"
+        );
+    }
+
+    /// A `Write` adapter that appends to a shared `Vec<u8>`.
+    #[derive(Clone)]
+    struct BufWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl io::Write for BufWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
     }
 }

@@ -49,3 +49,4 @@ serde_json.workspace = true
 hex.workspace = true
 base64.workspace = true
 hex-literal.workspace = true
+tracing-subscriber.workspace = true

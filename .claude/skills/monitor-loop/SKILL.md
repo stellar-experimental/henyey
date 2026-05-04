@@ -632,7 +632,7 @@ These are fundamental data structures, not leaks.
 
    Also check the jemalloc memory report trend from the log:
    ```
-   grep 'Memory report summary' ~/data/<session-id>/logs/monitor.log | tail -5
+   grep -E 'memory_report=true|Memory report summary' ~/data/<session-id>/logs/monitor.log | tail -5
    ```
    This shows jemalloc allocated vs resident (fragmentation) over time.
 
