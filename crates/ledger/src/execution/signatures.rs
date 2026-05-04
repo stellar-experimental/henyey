@@ -192,6 +192,24 @@ pub(super) fn has_required_extra_signers(
     })
 }
 
+/// Check fee-bump outer auth: verify the fee source account's signatures meet
+/// the LOW threshold for the outer envelope hash.
+///
+/// Parity: stellar-core `FeeBumpTransactionFrame::checkAllTransactionSignatures`
+/// (FeeBumpTransactionFrame.cpp:258-269) which calls `checkSignature` with
+/// `thresholds[THRESHOLD_LOW]`.
+///
+/// This is a shared helper used by both apply-time validation (`validate_preconditions`)
+/// and tx-set validation (`validate_fee_bump_for_tx_set`).
+pub(super) fn fee_bump_outer_auth_check(
+    tx_hash: &Hash256,
+    signatures: &[stellar_xdr::curr::DecoratedSignature],
+    fee_source_account: &AccountEntry,
+) -> bool {
+    let required_weight = threshold_low(fee_source_account);
+    has_sufficient_signer_weight(tx_hash, signatures, fee_source_account, required_weight)
+}
+
 pub(super) fn fee_bump_inner_hash(
     frame: &TransactionFrame,
     network_id: &NetworkId,

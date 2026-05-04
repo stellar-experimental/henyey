@@ -2094,3 +2094,454 @@ fn test_soroban_sufficient_inclusion_fee_passes_fee_check() {
         "AUDIT-252 positive control: Soroban TX with inclusion_fee=100 >= base_fee=100 should pass fee check"
     );
 }
+
+/// AUDIT-238: Fee-bump outer auth is checked BEFORE sequence validation.
+/// Bad outer sig + bad inner seq → TxBadAuth (not TxBadSeq).
+#[test]
+fn test_audit_238_fee_bump_bad_outer_sig_before_seq_check() {
+    let inner_secret = SecretKey::from_seed(&[80u8; 32]);
+    let inner_account_id: AccountId = (&inner_secret.public_key()).into();
+
+    let fee_secret = SecretKey::from_seed(&[81u8; 32]);
+    let fee_account_id: AccountId = (&fee_secret.public_key()).into();
+
+    let wrong_secret = SecretKey::from_seed(&[82u8; 32]); // NOT on fee source
+
+    let network_id = NetworkId::testnet();
+
+    // Create both accounts (fee_source has master_weight=1, low_threshold=1)
+    let (inner_key, inner_entry) = create_account_entry(inner_account_id.clone(), 1, 20_000_000);
+    let (fee_key, fee_entry) = create_account_entry(fee_account_id.clone(), 1, 20_000_000);
+    let snapshot = SnapshotBuilder::new(1)
+        .add_entry(inner_key, inner_entry)
+        .add_entry(fee_key, fee_entry)
+        .build_with_default_header();
+    let snapshot = SnapshotHandle::new(snapshot);
+
+    let context = henyey_tx::LedgerContext::new(1, 1_000, 100, 5_000_000, 25, network_id);
+    let mut executor = TransactionExecutor::new(
+        &context,
+        0,
+        SorobanConfig::default(),
+        ClassicEventConfig::default(),
+    );
+
+    // Inner tx has BAD seq_num (99 instead of 2) — would produce TxBadSeq if reached
+    let payment_op = Operation {
+        source_account: None,
+        body: OperationBody::Payment(stellar_xdr::curr::PaymentOp {
+            destination: MuxedAccount::Ed25519(Uint256([9u8; 32])),
+            asset: Asset::Native,
+            amount: 1,
+        }),
+    };
+
+    let inner_tx = Transaction {
+        source_account: MuxedAccount::Ed25519(Uint256(*inner_secret.public_key().as_bytes())),
+        fee: 100,
+        seq_num: SequenceNumber(99), // BAD sequence number
+        cond: Preconditions::None,
+        memo: Memo::None,
+        operations: vec![payment_op].try_into().unwrap(),
+        ext: TransactionExt::V0,
+    };
+
+    let inner_env_for_signing = TransactionEnvelope::Tx(TransactionV1Envelope {
+        tx: inner_tx.clone(),
+        signatures: VecM::default(),
+    });
+    let inner_sig = sign_envelope(&inner_env_for_signing, &inner_secret, &network_id);
+
+    let inner_v1 = TransactionV1Envelope {
+        tx: inner_tx,
+        signatures: vec![inner_sig].try_into().unwrap(),
+    };
+
+    let fee_bump = FeeBumpTransaction {
+        fee_source: MuxedAccount::Ed25519(Uint256(*fee_secret.public_key().as_bytes())),
+        fee: 200,
+        inner_tx: FeeBumpTransactionInnerTx::Tx(inner_v1),
+        ext: stellar_xdr::curr::FeeBumpTransactionExt::V0,
+    };
+
+    let mut envelope = TransactionEnvelope::TxFeeBump(FeeBumpTransactionEnvelope {
+        tx: fee_bump,
+        signatures: VecM::default(),
+    });
+    // Sign with WRONG key (not on fee source account)
+    let outer_sig = sign_envelope(&envelope, &wrong_secret, &network_id);
+    if let TransactionEnvelope::TxFeeBump(ref mut e) = envelope {
+        e.signatures = vec![outer_sig].try_into().unwrap();
+    }
+
+    let result = executor
+        .execute_transaction(&snapshot, &envelope, 100, None)
+        .expect("execute");
+
+    // Must be TxBadAuth (outer auth failed), NOT TxBadSeq
+    assert!(!result.success);
+    assert_eq!(
+        result.failure,
+        Some(ExecutionFailure::TxBadAuth),
+        "Bad outer sig must produce TxBadAuth, not TxBadSeq"
+    );
+    assert!(
+        result.fee_bump_outer_failure,
+        "must be flagged as fee_bump_outer_failure"
+    );
+    // past_seq_check: false means no fee charged (fee_charged == 0)
+    assert_eq!(result.fee_charged, 0, "No fee charged on pre-seq failure");
+}
+
+/// AUDIT-238: Fee-bump with valid outer sig + bad inner seq → TxBadSeq
+/// (outer auth passes, sequence check reached).
+#[test]
+fn test_audit_238_fee_bump_good_outer_sig_bad_inner_seq() {
+    let inner_secret = SecretKey::from_seed(&[83u8; 32]);
+    let inner_account_id: AccountId = (&inner_secret.public_key()).into();
+
+    let fee_secret = SecretKey::from_seed(&[84u8; 32]);
+    let fee_account_id: AccountId = (&fee_secret.public_key()).into();
+
+    let network_id = NetworkId::testnet();
+
+    let (inner_key, inner_entry) = create_account_entry(inner_account_id.clone(), 1, 20_000_000);
+    let (fee_key, fee_entry) = create_account_entry(fee_account_id.clone(), 1, 20_000_000);
+    let snapshot = SnapshotBuilder::new(1)
+        .add_entry(inner_key, inner_entry)
+        .add_entry(fee_key, fee_entry)
+        .build_with_default_header();
+    let snapshot = SnapshotHandle::new(snapshot);
+
+    let context = henyey_tx::LedgerContext::new(1, 1_000, 100, 5_000_000, 25, network_id);
+    let mut executor = TransactionExecutor::new(
+        &context,
+        0,
+        SorobanConfig::default(),
+        ClassicEventConfig::default(),
+    );
+
+    let payment_op = Operation {
+        source_account: None,
+        body: OperationBody::Payment(stellar_xdr::curr::PaymentOp {
+            destination: MuxedAccount::Ed25519(Uint256([9u8; 32])),
+            asset: Asset::Native,
+            amount: 1,
+        }),
+    };
+
+    let inner_tx = Transaction {
+        source_account: MuxedAccount::Ed25519(Uint256(*inner_secret.public_key().as_bytes())),
+        fee: 100,
+        seq_num: SequenceNumber(99), // BAD sequence number
+        cond: Preconditions::None,
+        memo: Memo::None,
+        operations: vec![payment_op].try_into().unwrap(),
+        ext: TransactionExt::V0,
+    };
+
+    let inner_env_for_signing = TransactionEnvelope::Tx(TransactionV1Envelope {
+        tx: inner_tx.clone(),
+        signatures: VecM::default(),
+    });
+    let inner_sig = sign_envelope(&inner_env_for_signing, &inner_secret, &network_id);
+
+    let inner_v1 = TransactionV1Envelope {
+        tx: inner_tx,
+        signatures: vec![inner_sig].try_into().unwrap(),
+    };
+
+    let fee_bump = FeeBumpTransaction {
+        fee_source: MuxedAccount::Ed25519(Uint256(*fee_secret.public_key().as_bytes())),
+        fee: 200,
+        inner_tx: FeeBumpTransactionInnerTx::Tx(inner_v1),
+        ext: stellar_xdr::curr::FeeBumpTransactionExt::V0,
+    };
+
+    let mut envelope = TransactionEnvelope::TxFeeBump(FeeBumpTransactionEnvelope {
+        tx: fee_bump,
+        signatures: VecM::default(),
+    });
+    // Sign with CORRECT key (fee source)
+    let outer_sig = sign_envelope(&envelope, &fee_secret, &network_id);
+    if let TransactionEnvelope::TxFeeBump(ref mut e) = envelope {
+        e.signatures = vec![outer_sig].try_into().unwrap();
+    }
+
+    let result = executor
+        .execute_transaction(&snapshot, &envelope, 100, None)
+        .expect("execute");
+
+    // Outer auth passes → sequence check reached → TxBadSeq
+    assert!(!result.success);
+    assert_eq!(
+        result.failure,
+        Some(ExecutionFailure::TxBadSeq),
+        "Good outer sig + bad seq must produce TxBadSeq"
+    );
+    assert!(
+        !result.fee_bump_outer_failure,
+        "should NOT be flagged as fee_bump_outer_failure"
+    );
+}
+
+/// AUDIT-238: Same-ledger signer modification must NOT affect outer auth check.
+/// TX1 removes a signer from fee source; TX2 fee-bump signed by that signer
+/// must still pass outer auth (snapshot is immutable).
+#[test]
+fn test_audit_238_fee_bump_outer_auth_uses_snapshot_not_mutated_state() {
+    let inner_secret = SecretKey::from_seed(&[85u8; 32]);
+    let inner_account_id: AccountId = (&inner_secret.public_key()).into();
+
+    let fee_secret = SecretKey::from_seed(&[86u8; 32]);
+    let fee_account_id: AccountId = (&fee_secret.public_key()).into();
+
+    // Additional signer on fee_source that TX1 will remove
+    let extra_signer_secret = SecretKey::from_seed(&[87u8; 32]);
+    let extra_signer_pubkey = extra_signer_secret.public_key();
+
+    let network_id = NetworkId::testnet();
+
+    // Fee source: master_weight=1, low=1, has extra signer with weight=1
+    let fee_signer = Signer {
+        key: SignerKey::Ed25519(Uint256(*extra_signer_pubkey.as_bytes())),
+        weight: 1,
+    };
+    let fee_key = LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
+        account_id: fee_account_id.clone(),
+    });
+    let fee_entry = LedgerEntry {
+        last_modified_ledger_seq: 1,
+        data: LedgerEntryData::Account(AccountEntry {
+            account_id: fee_account_id.clone(),
+            balance: 20_000_000,
+            seq_num: SequenceNumber(1),
+            num_sub_entries: 1,
+            inflation_dest: None,
+            flags: 0,
+            home_domain: String32::default(),
+            thresholds: Thresholds([1, 1, 1, 1]),
+            signers: vec![fee_signer].try_into().unwrap(),
+            ext: AccountEntryExt::V0,
+        }),
+        ext: LedgerEntryExt::V0,
+    };
+
+    let (inner_key, inner_entry) = create_account_entry(inner_account_id.clone(), 1, 20_000_000);
+    let snapshot = SnapshotBuilder::new(1)
+        .add_entry(inner_key, inner_entry)
+        .add_entry(fee_key, fee_entry)
+        .build_with_default_header();
+    let snapshot = SnapshotHandle::new(snapshot);
+
+    let context = henyey_tx::LedgerContext::new(1, 1_000, 100, 5_000_000, 25, network_id);
+    let mut executor = TransactionExecutor::new(
+        &context,
+        0,
+        SorobanConfig::default(),
+        ClassicEventConfig::default(),
+    );
+
+    // TX1: Fee source master removes extra_signer
+    let set_options_op = Operation {
+        source_account: None,
+        body: OperationBody::SetOptions(SetOptionsOp {
+            inflation_dest: None,
+            clear_flags: None,
+            set_flags: None,
+            master_weight: None,
+            low_threshold: None,
+            med_threshold: None,
+            high_threshold: None,
+            home_domain: None,
+            signer: Some(Signer {
+                key: SignerKey::Ed25519(Uint256(*extra_signer_pubkey.as_bytes())),
+                weight: 0, // remove
+            }),
+        }),
+    };
+
+    let tx1 = Transaction {
+        source_account: MuxedAccount::Ed25519(Uint256(*fee_secret.public_key().as_bytes())),
+        fee: 100,
+        seq_num: SequenceNumber(2),
+        cond: Preconditions::None,
+        memo: Memo::None,
+        operations: vec![set_options_op].try_into().unwrap(),
+        ext: TransactionExt::V0,
+    };
+
+    let mut env1 = TransactionEnvelope::Tx(TransactionV1Envelope {
+        tx: tx1,
+        signatures: VecM::default(),
+    });
+    let sig1 = sign_envelope(&env1, &fee_secret, &network_id);
+    if let TransactionEnvelope::Tx(ref mut e) = env1 {
+        e.signatures = vec![sig1].try_into().unwrap();
+    }
+
+    let result1 = executor
+        .execute_transaction(&snapshot, &env1, 100, None)
+        .expect("execute tx1");
+    assert!(result1.success, "TX1 (remove signer) should succeed");
+
+    // TX2: fee-bump signed by extra_signer_secret (removed from fee source by TX1)
+    let payment_op = Operation {
+        source_account: None,
+        body: OperationBody::Payment(stellar_xdr::curr::PaymentOp {
+            destination: MuxedAccount::Ed25519(Uint256([9u8; 32])),
+            asset: Asset::Native,
+            amount: 1,
+        }),
+    };
+
+    let inner_tx = Transaction {
+        source_account: MuxedAccount::Ed25519(Uint256(*inner_secret.public_key().as_bytes())),
+        fee: 100,
+        seq_num: SequenceNumber(2),
+        cond: Preconditions::None,
+        memo: Memo::None,
+        operations: vec![payment_op].try_into().unwrap(),
+        ext: TransactionExt::V0,
+    };
+
+    let inner_env_for_signing = TransactionEnvelope::Tx(TransactionV1Envelope {
+        tx: inner_tx.clone(),
+        signatures: VecM::default(),
+    });
+    let inner_sig = sign_envelope(&inner_env_for_signing, &inner_secret, &network_id);
+
+    let inner_v1 = TransactionV1Envelope {
+        tx: inner_tx,
+        signatures: vec![inner_sig].try_into().unwrap(),
+    };
+
+    let fee_bump = FeeBumpTransaction {
+        fee_source: MuxedAccount::Ed25519(Uint256(*fee_secret.public_key().as_bytes())),
+        fee: 200,
+        inner_tx: FeeBumpTransactionInnerTx::Tx(inner_v1),
+        ext: stellar_xdr::curr::FeeBumpTransactionExt::V0,
+    };
+
+    let mut envelope = TransactionEnvelope::TxFeeBump(FeeBumpTransactionEnvelope {
+        tx: fee_bump,
+        signatures: VecM::default(),
+    });
+    // Sign with extra_signer_secret — was removed from mutated state, still in snapshot
+    let outer_sig = sign_envelope(&envelope, &extra_signer_secret, &network_id);
+    if let TransactionEnvelope::TxFeeBump(ref mut e) = envelope {
+        e.signatures = vec![outer_sig].try_into().unwrap();
+    }
+
+    let result2 = executor
+        .execute_transaction(&snapshot, &envelope, 100, None)
+        .expect("execute tx2");
+
+    // Outer auth uses SNAPSHOT state where extra_signer still exists → auth PASSES.
+    // The TX should proceed past outer auth (may fail later for other reasons, but NOT TxBadAuth
+    // on the outer failure flag).
+    assert!(
+        !result2.fee_bump_outer_failure,
+        "Outer auth must pass using snapshot signer set, not mutated state"
+    );
+    // It should NOT fail with TxBadAuth as an outer failure
+    if !result2.success {
+        assert_ne!(
+            result2.failure,
+            Some(ExecutionFailure::TxBadAuth),
+            "If it fails, it should not be outer TxBadAuth"
+        );
+    }
+}
+
+/// AUDIT-238: fee_source == inner_source variant — outer auth check still works
+/// when both are the same account.
+#[test]
+fn test_audit_238_fee_bump_outer_auth_same_source() {
+    let source_secret = SecretKey::from_seed(&[88u8; 32]);
+    let source_account_id: AccountId = (&source_secret.public_key()).into();
+
+    let wrong_secret = SecretKey::from_seed(&[89u8; 32]); // NOT a signer
+
+    let network_id = NetworkId::testnet();
+
+    let (key, entry) = create_account_entry(source_account_id.clone(), 1, 20_000_000);
+    let snapshot = SnapshotBuilder::new(1)
+        .add_entry(key, entry)
+        .build_with_default_header();
+    let snapshot = SnapshotHandle::new(snapshot);
+
+    let context = henyey_tx::LedgerContext::new(1, 1_000, 100, 5_000_000, 25, network_id);
+    let mut executor = TransactionExecutor::new(
+        &context,
+        0,
+        SorobanConfig::default(),
+        ClassicEventConfig::default(),
+    );
+
+    let payment_op = Operation {
+        source_account: None,
+        body: OperationBody::Payment(stellar_xdr::curr::PaymentOp {
+            destination: MuxedAccount::Ed25519(Uint256([9u8; 32])),
+            asset: Asset::Native,
+            amount: 1,
+        }),
+    };
+
+    let inner_tx = Transaction {
+        // Same account as fee source
+        source_account: MuxedAccount::Ed25519(Uint256(*source_secret.public_key().as_bytes())),
+        fee: 100,
+        seq_num: SequenceNumber(2),
+        cond: Preconditions::None,
+        memo: Memo::None,
+        operations: vec![payment_op].try_into().unwrap(),
+        ext: TransactionExt::V0,
+    };
+
+    let inner_env_for_signing = TransactionEnvelope::Tx(TransactionV1Envelope {
+        tx: inner_tx.clone(),
+        signatures: VecM::default(),
+    });
+    let inner_sig = sign_envelope(&inner_env_for_signing, &source_secret, &network_id);
+
+    let inner_v1 = TransactionV1Envelope {
+        tx: inner_tx,
+        signatures: vec![inner_sig].try_into().unwrap(),
+    };
+
+    let fee_bump = FeeBumpTransaction {
+        // fee_source == inner source
+        fee_source: MuxedAccount::Ed25519(Uint256(*source_secret.public_key().as_bytes())),
+        fee: 200,
+        inner_tx: FeeBumpTransactionInnerTx::Tx(inner_v1),
+        ext: stellar_xdr::curr::FeeBumpTransactionExt::V0,
+    };
+
+    let mut envelope = TransactionEnvelope::TxFeeBump(FeeBumpTransactionEnvelope {
+        tx: fee_bump,
+        signatures: VecM::default(),
+    });
+    // Sign outer with WRONG key
+    let outer_sig = sign_envelope(&envelope, &wrong_secret, &network_id);
+    if let TransactionEnvelope::TxFeeBump(ref mut e) = envelope {
+        e.signatures = vec![outer_sig].try_into().unwrap();
+    }
+
+    let result = executor
+        .execute_transaction(&snapshot, &envelope, 100, None)
+        .expect("execute");
+
+    // Even when fee_source == inner_source, outer auth fails with wrong key
+    assert!(!result.success);
+    assert_eq!(
+        result.failure,
+        Some(ExecutionFailure::TxBadAuth),
+        "fee_source==inner_source: wrong outer sig must still produce TxBadAuth"
+    );
+    assert!(
+        result.fee_bump_outer_failure,
+        "must be flagged as fee_bump_outer_failure"
+    );
+    assert_eq!(result.fee_charged, 0, "No fee charged on pre-seq failure");
+}

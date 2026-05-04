@@ -98,7 +98,7 @@ impl TransactionExecutor {
 
         let acct_load_start = std::time::Instant::now();
 
-        let (fee_source_account, source_account) = if is_fee_bump {
+        let (fee_source_account, source_account, precomputed_outer_hash) = if is_fee_bump {
             // Fee-bump ordering: outer fee → fee source load → time/ledger bounds → inner source load
             // Parity: FeeBumpTransactionFrame::commonValidPreSeqNum (lines 337-398)
             //         then inner TransactionFrame::commonValidPreSeqNum (lines 1471-1502)
@@ -170,6 +170,32 @@ impl TransactionExecutor {
                 }
             };
 
+            // 2b'. Outer auth check (fee source signature, LOW threshold)
+            // Parity: FeeBumpTransactionFrame::commonValid lines 416-421
+            //         (`checkAllTransactionSignatures` before inner validation).
+            //
+            // Read the fee source from the IMMUTABLE SNAPSHOT, not self.state.
+            // Precondition: the snapshot is the LCL — the same state that tx-set
+            // validation validated against. Reading from self.state would see
+            // prior-TX mutations (e.g., signer removal) and create a parity
+            // divergence: stellar-core does NOT re-check outer auth at apply time,
+            // so using the snapshot ensures we match what tx-set validation saw.
+            let outer_hash = frame
+                .hash(&self.network_id)
+                .map_err(|e| LedgerError::Internal(format!("tx hash error: {}", e)))?;
+            if let Some(snapshot_fee_source) = snapshot.get_account(&fee_source_id)? {
+                if !fee_bump_outer_auth_check(&outer_hash, frame.signatures(), &snapshot_fee_source)
+                {
+                    return Ok(Err(fee_bump_outer_fail(
+                        TransactionResultCode::TxBadAuth,
+                        "Fee-bump outer signature check failed",
+                    )));
+                }
+            }
+            // If the snapshot doesn't have the account, the state-based load above
+            // found it (created by a prior TX in this ledger). In that case the
+            // outer auth was validated by tx-set construction and we proceed.
+
             // 2c. Time/ledger bounds (inner tx properties)
             // Parity: inner TransactionFrame::commonValidPreSeqNum lines 1471-1480
             if let Err(e) = validation::validate_time_bounds(&frame, &validation_ctx) {
@@ -220,11 +246,8 @@ impl TransactionExecutor {
                 }
             };
 
-            (fee_source_account, source_account)
+            (fee_source_account, source_account, Some(outer_hash))
         } else {
-            // Non-fee-bump ordering: time/ledger bounds → fee → account load
-            // Parity: TransactionFrame::commonValidPreSeqNum lines 1471-1502
-
             // 2a. Time/ledger bounds
             if let Err(e) = validation::validate_time_bounds(&frame, &validation_ctx) {
                 return Ok(Err(pre_seq_fail(
@@ -305,7 +328,7 @@ impl TransactionExecutor {
                 }
             };
 
-            (fee_source_account, source_account)
+            (fee_source_account, source_account, None)
         };
 
         let val_account_load_us = acct_load_start.elapsed().as_micros() as u64;
@@ -397,39 +420,38 @@ impl TransactionExecutor {
         // Phase 6: Signature validation
         let sig_start = std::time::Instant::now();
         if validation::validate_signatures(&frame, &validation_ctx).is_err() {
-            if is_fee_bump {
-                let mut result =
-                    failed_result(TransactionResultCode::TxBadAuth, "Invalid signature");
-                result.fee_bump_outer_failure = true;
-                return Ok(Err(ValidationFailure {
-                    result,
-                    past_seq_check: true,
-                }));
-            } else {
-                return Ok(Err(post_seq_fail(
-                    TransactionResultCode::TxBadAuth,
-                    "Invalid signature",
-                )));
-            }
+            // validate_signatures only fails on hash computation errors.
+            // For fee-bump, hash failure is now caught in Phase 2b' above.
+            // For non-fee-bump, report as TxBadAuth.
+            return Ok(Err(post_seq_fail(
+                TransactionResultCode::TxBadAuth,
+                "Invalid signature",
+            )));
         }
 
         let hash_start = std::time::Instant::now();
-        let outer_hash = frame
-            .hash(&self.network_id)
-            .map_err(|e| LedgerError::Internal(format!("tx hash error: {}", e)))?;
+        // For fee-bump, outer_hash was computed in Phase 2b'. For non-fee-bump,
+        // compute it here.
+        let outer_hash = if let Some(h) = precomputed_outer_hash {
+            h
+        } else {
+            frame
+                .hash(&self.network_id)
+                .map_err(|e| LedgerError::Internal(format!("tx hash error: {}", e)))?
+        };
         let val_tx_hash_us = hash_start.elapsed().as_micros() as u64;
 
         let ed25519_start = std::time::Instant::now();
-        // For fee-bump transactions, the outer (fee source) signature was validated
-        // during tx-set construction / consensus validation (tx_set_utils.rs:427-431).
-        // At apply time, stellar-core does NOT re-check it —
-        // FeeBumpTransactionFrame::apply only calls removeOneTimeSignerKeyFromFeeSource
-        // + inner apply. Skip the re-check to match parity: a prior TX in the same
-        // ledger may have modified the fee source's signer set (removed a signer,
-        // lowered weight, changed thresholds, or disabled master weight).
+        // Fee-bump outer auth (fee source signature) is validated in Phase 2b'
+        // against the immutable snapshot, matching stellar-core's
+        // FeeBumpTransactionFrame::commonValid ordering. The check below handles
+        // non-fee-bump source account signature validation only.
         //
-        // PRECONDITION: This function trusts that outer fee-bump auth was validated
-        // by consensus/tx-set validation before reaching execution.
+        // NOTE: For fee-bump transactions, we deliberately do NOT re-check the
+        // outer signature here against self.state. The Phase 2b' check uses the
+        // snapshot (LCL state) which is what tx-set validation saw. A prior TX
+        // in the same ledger may have modified the fee source's signer set;
+        // stellar-core's apply path also does not re-check outer auth.
         if !is_fee_bump {
             let outer_threshold = threshold_low(&fee_source_account);
             if !has_sufficient_signer_weight(
