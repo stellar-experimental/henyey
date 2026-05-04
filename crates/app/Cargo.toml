@@ -98,7 +98,9 @@ henyey-ledger = { workspace = true, features = ["test-utils"] }
 # Enable test-only instrumentation on henyey-herder (e.g.
 # `TransactionQueue::insert_for_test`) used by the #1759 regression
 # test to populate the tx_queue without running admission validation.
-henyey-herder = { workspace = true, features = ["test-utils"] }
+# `test-support` enables SCP fixture hooks (set_tracking_for_testing,
+# expand_quorum_tracker_for_testing) needed by the SCP dedup pipeline test.
+henyey-herder = { workspace = true, features = ["test-utils", "test-support"] }
 # Enable test-only instrumentation on henyey-overlay (e.g.
 # `OverlayManager::inject_test_peer`) for handle_flood_demand regression tests.
 henyey-overlay = { workspace = true, features = ["test-utils"] }

@@ -266,6 +266,7 @@ mod peers;
 mod persist;
 mod phase;
 mod publish;
+mod scp_dedup;
 mod survey_impl;
 mod tracked_lock;
 mod tx_flooding;
@@ -452,13 +453,8 @@ pub struct App {
     /// Poor-man's histogram for verify latency (enqueue → post-verify dispatch).
     scp_verify_latency_us_sum: AtomicU64,
     scp_verify_latency_count: AtomicU64,
-    /// In-flight SCP envelope hashes dispatched to the verify worker.
-    /// Provides dedup semantics matching stellar-core's `mScheduledMessages`
-    /// (`OverlayManagerImpl.cpp:326, 1190-1212`): entries are inserted after
-    /// successful dispatch and removed at the start of `process_verified`.
-    scp_scheduled_envelopes: std::sync::Mutex<HashSet<henyey_common::Hash256>>,
-    /// Count of SCP envelopes rejected by the in-flight dedup check.
-    scp_scheduled_dedup_count: AtomicU64,
+    /// In-flight SCP envelope dedup cache. See [`scp_dedup::ScheduledEnvelopeSet`].
+    scp_scheduled: scp_dedup::ScheduledEnvelopeSet,
     /// Sampled depth of the verified-output channel (verified_rx.len()).
     /// Updated by the event loop each time it touches `verified_rx`, so
     /// `/metrics` reflects the true output-side backlog.
@@ -1044,8 +1040,7 @@ impl App {
             scp_pv_counters: henyey_herder::scp_verify::PostVerifyCounters::default(),
             scp_verify_latency_us_sum: AtomicU64::new(0),
             scp_verify_latency_count: AtomicU64::new(0),
-            scp_scheduled_envelopes: std::sync::Mutex::new(HashSet::new()),
-            scp_scheduled_dedup_count: AtomicU64::new(0),
+            scp_scheduled: scp_dedup::ScheduledEnvelopeSet::new(),
             scp_verify_output_backlog: AtomicU64::new(0),
             fetch_channel_depth: Arc::new(AtomicI64::new(0)),
             fetch_channel_depth_max: Arc::new(AtomicI64::new(0)),
@@ -2251,7 +2246,7 @@ impl App {
                 verifier_thread_state: self.herder.scp_verifier_handle().state() as u64,
                 verify_latency_us_sum: self.scp_verify_latency_us_sum.load(Ordering::Relaxed),
                 verify_latency_count: self.scp_verify_latency_count.load(Ordering::Relaxed),
-                scheduled_dedup_count: self.scp_scheduled_dedup_count.load(Ordering::Relaxed),
+                scheduled_dedup_count: self.scp_scheduled.dedup_count(),
             },
             overlay_fetch_channel: OverlayFetchChannelMetrics {
                 depth: self.fetch_channel_depth.load(Ordering::Relaxed),
@@ -2293,7 +2288,7 @@ impl App {
                 verifier_thread_state: self.herder.scp_verifier_handle().state() as u64,
                 verify_latency_us_sum: self.scp_verify_latency_us_sum.load(Ordering::Relaxed),
                 verify_latency_count: self.scp_verify_latency_count.load(Ordering::Relaxed),
-                scheduled_dedup_count: self.scp_scheduled_dedup_count.load(Ordering::Relaxed),
+                scheduled_dedup_count: self.scp_scheduled.dedup_count(),
             },
             overlay_fetch_channel: OverlayFetchChannelMetrics {
                 depth: self.fetch_channel_depth.load(Ordering::Relaxed),

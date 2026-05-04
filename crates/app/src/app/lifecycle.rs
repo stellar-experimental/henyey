@@ -1832,22 +1832,12 @@ impl App {
         // Compute envelope hash for in-flight dedup check.
         // Matches stellar-core's checkScheduledAndCache (Peer.cpp:1113-1117,
         // OverlayManagerImpl.cpp:1190-1212).
-        let envelope_hash = {
-            use stellar_xdr::curr::{Limits, WriteXdr};
-            henyey_crypto::blake2(&envelope.to_xdr(Limits::none()).unwrap())
-        };
+        let envelope_hash = super::scp_dedup::ScheduledEnvelopeSet::envelope_hash(&envelope);
 
         // In-flight dedup: reject envelopes already dispatched to the verify worker.
-        if self
-            .scp_scheduled_envelopes
-            .lock()
-            .unwrap()
-            .contains(&envelope_hash)
-        {
-            self.scp_scheduled_dedup_count
-                .fetch_add(1, Ordering::Relaxed);
+        let Some(dedup_slot) = self.scp_scheduled.check(&envelope_hash) else {
             return;
-        }
+        };
 
         let mut drained: usize = 0;
         loop {
@@ -1873,6 +1863,7 @@ impl App {
                                 "scp-verify worker channel closed (worker likely dead); \
                                  dropping envelope"
                             );
+                            // DedupSlot dropped without commit — no cache poisoning.
                             return;
                         }
                     };
@@ -1889,14 +1880,12 @@ impl App {
                             intake.peer_id = Some(from_peer);
                             // Insert into in-flight set AFTER successful dispatch.
                             // Pre-filter rejects do not poison the cache.
-                            self.scp_scheduled_envelopes
-                                .lock()
-                                .unwrap()
-                                .insert(envelope_hash);
+                            dedup_slot.commit();
                             permit.send(intake);
                         }
                         PreFilter::Reject(reason) => {
                             self.record_prefilter_reject(reason);
+                            // DedupSlot dropped without commit — no cache poisoning.
                             drop(permit);
                         }
                     }
@@ -1918,12 +1907,7 @@ impl App {
         self.set_phase(32); // 32 = scp_verified
 
         // Remove from in-flight dedup set FIRST, before any early returns.
-        // Recompute hash to avoid leaking app-specific state into PipelinedIntake.
-        {
-            use stellar_xdr::curr::{Limits, WriteXdr};
-            let hash = henyey_crypto::blake2(&ve.intake.envelope.to_xdr(Limits::none()).unwrap());
-            self.scp_scheduled_envelopes.lock().unwrap().remove(&hash);
-        }
+        self.scp_scheduled.complete(&ve.intake.envelope);
 
         let slot = ve.intake.slot;
         let tracking = self.herder.tracking_slot();
@@ -2324,144 +2308,189 @@ mod pump_tests {
 }
 
 #[cfg(test)]
-mod scp_dedup_tests {
-    use henyey_common::Hash256;
-    use std::collections::HashSet;
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::sync::Mutex;
+mod scp_dedup_pipeline_tests {
+    use super::App;
+    use henyey_overlay::OverlayMessage;
     use stellar_xdr::curr::{
-        Limits, NodeId, PublicKey as XdrPublicKey, ScpBallot, ScpEnvelope, ScpStatement,
-        ScpStatementPledges, ScpStatementPrepare, Signature, Uint256, Value, WriteXdr,
+        Hash as XdrHash, Limits, NodeId as XdrNodeId, PublicKey as XdrPublicKey, ScpBallot,
+        ScpEnvelope, ScpStatement, ScpStatementPledges, ScpStatementPrepare,
+        Signature as XdrSignature, StellarMessage, StellarValue, StellarValueExt, TimePoint,
+        Uint256, Value, WriteXdr,
     };
 
-    fn make_envelope(slot: u64, node_seed: u8) -> ScpEnvelope {
-        let node_id = NodeId(XdrPublicKey::PublicKeyTypeEd25519(Uint256([node_seed; 32])));
-        let value = Value(vec![].try_into().unwrap());
-        let pledges = ScpStatementPledges::Prepare(ScpStatementPrepare {
-            quorum_set_hash: stellar_xdr::curr::Hash([0u8; 32]),
-            ballot: ScpBallot {
-                counter: 1,
-                value: value.clone(),
-            },
-            prepared: None,
-            prepared_prime: None,
-            n_c: 0,
-            n_h: 0,
-        });
+    fn value_with_close_time(close_time: u64) -> Value {
+        let sv = StellarValue {
+            tx_set_hash: XdrHash([0u8; 32]),
+            close_time: TimePoint(close_time),
+            upgrades: vec![].try_into().unwrap(),
+            ext: StellarValueExt::Basic,
+        };
+        Value(sv.to_xdr(Limits::none()).unwrap().try_into().unwrap())
+    }
+
+    fn make_overlay_scp_msg(envelope: ScpEnvelope) -> OverlayMessage {
+        let peer_id =
+            henyey_overlay::PeerId(XdrPublicKey::PublicKeyTypeEd25519(Uint256([0xAA; 32])));
+        OverlayMessage {
+            from_peer: peer_id,
+            message: StellarMessage::ScpMessage(envelope),
+            received_at: std::time::Instant::now(),
+        }
+    }
+
+    fn make_test_envelope(slot: u64, close_time: u64) -> ScpEnvelope {
+        let node_id = XdrNodeId(XdrPublicKey::PublicKeyTypeEd25519(Uint256([1u8; 32])));
         ScpEnvelope {
             statement: ScpStatement {
                 node_id,
                 slot_index: slot,
-                pledges,
+                pledges: ScpStatementPledges::Prepare(ScpStatementPrepare {
+                    quorum_set_hash: XdrHash([0u8; 32]),
+                    ballot: ScpBallot {
+                        counter: 1,
+                        value: value_with_close_time(close_time),
+                    },
+                    prepared: None,
+                    prepared_prime: None,
+                    n_c: 0,
+                    n_h: 0,
+                }),
             },
-            signature: Signature(vec![0u8; 64].try_into().unwrap()),
+            signature: XdrSignature(vec![0u8; 64].try_into().unwrap()),
         }
     }
 
-    fn envelope_hash(env: &ScpEnvelope) -> Hash256 {
-        henyey_crypto::blake2(&env.to_xdr(Limits::none()).unwrap())
+    /// Pipeline test: pump_scp_intake rejects duplicates through real App wiring.
+    ///
+    /// The herder is in Booting state (can't receive SCP), so the pre-filter
+    /// rejects. But the dedup check runs BEFORE the pre-filter, so we can
+    /// verify:
+    /// 1. First call: dedup check passes (new hash), pre-filter rejects → DedupSlot
+    ///    dropped → no cache entry created (no poisoning).
+    /// 2. Because no cache entry was created, a second call also passes the
+    ///    dedup check (and also gets pre-filter rejected).
+    /// 3. The dedup counter stays at 0 (no duplicates detected, since nothing
+    ///    was ever committed to the cache).
+    #[tokio::test]
+    async fn test_pump_scp_intake_no_poison_on_prefilter_reject() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-dedup-test.db");
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
+
+        let app = App::new(config).await.unwrap();
+        let mut verified_rx = app.herder.take_verified_rx().expect("take verified_rx");
+
+        let envelope = make_test_envelope(100, 2_000_000_000);
+        let msg = make_overlay_scp_msg(envelope);
+
+        // Herder is in Booting → pre-filter rejects → DedupSlot dropped.
+        app.pump_scp_intake(msg.clone(), &mut verified_rx).await;
+        assert_eq!(
+            app.scp_scheduled.len(),
+            0,
+            "no cache entry after pre-filter reject"
+        );
+
+        // Second call: same envelope, dedup check passes again (not in cache).
+        app.pump_scp_intake(msg, &mut verified_rx).await;
+        assert_eq!(app.scp_scheduled.len(), 0, "still no cache entry");
+        assert_eq!(app.scp_scheduled.dedup_count(), 0, "no dedup rejections");
     }
 
-    /// First envelope passes; duplicate is rejected.
-    #[test]
-    fn test_scp_dedup_rejects_inflight_duplicate() {
-        let cache: Mutex<HashSet<Hash256>> = Mutex::new(HashSet::new());
-        let counter = AtomicU64::new(0);
-        let env = make_envelope(100, 1);
-        let hash = envelope_hash(&env);
+    /// Pipeline test: pump_scp_intake dedup works end-to-end with dispatch.
+    ///
+    /// Sets up herder in Tracking state with proper tracking slot so the
+    /// pre-filter accepts envelopes. Tests:
+    /// 1. First pump_scp_intake: dispatches → hash in cache
+    /// 2. Second pump_scp_intake: dedup rejects → counter increments
+    /// 3. process_verified: hash removed from cache
+    /// 4. Third pump_scp_intake: re-dispatch succeeds
+    #[tokio::test]
+    async fn test_pump_scp_intake_dedup_full_dispatch() {
+        use henyey_herder::HerderState;
 
-        // First arrival: not in cache, insert it (simulates successful dispatch).
-        assert!(!cache.lock().unwrap().contains(&hash));
-        cache.lock().unwrap().insert(hash);
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-dedup-dispatch.db");
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
 
-        // Second arrival: in cache, rejected.
-        assert!(cache.lock().unwrap().contains(&hash));
-        counter.fetch_add(1, Ordering::Relaxed);
-        assert_eq!(counter.load(Ordering::Relaxed), 1);
-    }
+        let app = App::new(config).await.unwrap();
+        let mut verified_rx = app.herder.take_verified_rx().expect("take verified_rx");
 
-    /// After process_verified removes the hash, the same envelope can pass again.
-    #[test]
-    fn test_scp_dedup_allows_after_completion() {
-        let cache: Mutex<HashSet<Hash256>> = Mutex::new(HashSet::new());
-        let env = make_envelope(100, 1);
-        let hash = envelope_hash(&env);
+        // Configure herder for accepting envelopes.
+        // Transition: Booting → Syncing → Tracking
+        app.herder.set_state(HerderState::Syncing);
+        app.herder.set_state(HerderState::Tracking);
 
-        // Dispatch: insert.
-        cache.lock().unwrap().insert(hash);
-        assert!(cache.lock().unwrap().contains(&hash));
+        // Set tracking state so the close-time and slot-range pre-filters pass.
+        let tracking_slot = 101u64;
+        let close_time = 2_000_000_000u64;
+        app.herder
+            .set_tracking_for_testing(tracking_slot, close_time);
+        app.herder
+            .set_pending_current_slot_for_testing(tracking_slot);
 
-        // process_verified: remove.
-        cache.lock().unwrap().remove(&hash);
-        assert!(!cache.lock().unwrap().contains(&hash));
+        // Set the test clock so close-time checks use our controlled time.
+        app.herder.set_test_clock_seconds(close_time + 5);
 
-        // Re-dispatch: passes again.
-        assert!(!cache.lock().unwrap().contains(&hash));
-    }
+        // Build an envelope for the tracking slot with valid close time.
+        // The close time in the value should be > tracking close time (future slot case)
+        // to pass check_close_time. We use close_time + 5 which is plausible.
+        let envelope = make_test_envelope(tracking_slot, close_time + 5);
+        let msg = make_overlay_scp_msg(envelope.clone());
 
-    /// Pre-filter reject does NOT insert into the cache (no poisoning).
-    #[test]
-    fn test_scp_dedup_no_poison_on_prefilter_reject() {
-        let cache: Mutex<HashSet<Hash256>> = Mutex::new(HashSet::new());
-        let env = make_envelope(100, 1);
-        let hash = envelope_hash(&env);
+        // --- 1. First dispatch: dedup passes, pre-filter accepts, hash enters cache ---
+        app.pump_scp_intake(msg.clone(), &mut verified_rx).await;
+        assert_eq!(
+            app.scp_scheduled.len(),
+            1,
+            "hash should be in cache after dispatch"
+        );
 
-        // Simulate: dedup check passes (not in cache), but pre-filter rejects.
-        // The hash should NOT be in the cache since we only insert after dispatch.
-        assert!(!cache.lock().unwrap().contains(&hash));
-        // (pre-filter would reject here — we don't insert)
-        assert!(!cache.lock().unwrap().contains(&hash));
-    }
+        // --- 2. Second call: dedup rejects (hash in cache) ---
+        app.pump_scp_intake(msg.clone(), &mut verified_rx).await;
+        assert_eq!(app.scp_scheduled.dedup_count(), 1, "one dedup rejection");
+        assert_eq!(app.scp_scheduled.len(), 1, "cache unchanged");
 
-    /// Invalid signature verdict: hash is still removed in process_verified.
-    #[test]
-    fn test_scp_dedup_cleanup_on_invalid_signature() {
-        let cache: Mutex<HashSet<Hash256>> = Mutex::new(HashSet::new());
-        let env = make_envelope(100, 1);
-        let hash = envelope_hash(&env);
+        // --- 3. Drain verified_rx and call process_verified ---
+        // The verify worker should process the envelope and send a VerifiedEnvelope.
+        // Wait briefly for the worker to complete verification.
+        let ve = tokio::time::timeout(std::time::Duration::from_secs(5), verified_rx.recv())
+            .await
+            .expect("timeout waiting for verified envelope")
+            .expect("verified_rx closed");
 
-        // Dispatch.
-        cache.lock().unwrap().insert(hash);
-        assert!(cache.lock().unwrap().contains(&hash));
+        // Before process_verified: hash is still in cache.
+        assert_eq!(
+            app.scp_scheduled.len(),
+            1,
+            "hash still in cache before process_verified"
+        );
 
-        // process_verified (InvalidSignature path): removal at top, before early return.
-        // Recompute hash from envelope (same as production code does).
-        let recomputed = envelope_hash(&env);
-        cache.lock().unwrap().remove(&recomputed);
-        assert!(!cache.lock().unwrap().contains(&hash));
-    }
+        // process_verified removes the hash at the START, before any other processing.
+        app.process_verified(ve).await;
+        assert_eq!(
+            app.scp_scheduled.len(),
+            0,
+            "hash removed after process_verified"
+        );
 
-    /// Different envelopes have different hashes and both pass.
-    #[test]
-    fn test_scp_dedup_distinct_envelopes_pass() {
-        let cache: Mutex<HashSet<Hash256>> = Mutex::new(HashSet::new());
-        let env_a = make_envelope(100, 1);
-        let env_b = make_envelope(101, 2);
-        let hash_a = envelope_hash(&env_a);
-        let hash_b = envelope_hash(&env_b);
-
-        assert_ne!(hash_a, hash_b);
-
-        // Both pass dedup check.
-        assert!(!cache.lock().unwrap().contains(&hash_a));
-        assert!(!cache.lock().unwrap().contains(&hash_b));
-
-        // Dispatch both.
-        cache.lock().unwrap().insert(hash_a);
-        cache.lock().unwrap().insert(hash_b);
-
-        // Both are now cached.
-        assert!(cache.lock().unwrap().contains(&hash_a));
-        assert!(cache.lock().unwrap().contains(&hash_b));
-    }
-
-    /// Hash computation is deterministic: same envelope produces same hash.
-    #[test]
-    fn test_scp_dedup_hash_deterministic() {
-        let env = make_envelope(42, 7);
-        let h1 = envelope_hash(&env);
-        let h2 = envelope_hash(&env);
-        assert_eq!(h1, h2);
+        // --- 4. Re-dispatch: same envelope passes dedup again ---
+        app.pump_scp_intake(msg, &mut verified_rx).await;
+        assert_eq!(
+            app.scp_scheduled.len(),
+            1,
+            "re-dispatch succeeds after completion"
+        );
+        // Dedup count unchanged (still 1 from step 2).
+        assert_eq!(
+            app.scp_scheduled.dedup_count(),
+            1,
+            "dedup count unchanged on re-dispatch"
+        );
     }
 }
 
