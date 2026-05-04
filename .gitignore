@@ -57,6 +57,9 @@ reports/
 .opencode/*
 !.opencode/skills/
 .serena/
+
+# Copilot agent worktrees and artifacts
+.copilot/
 local-data
 ai-summary/
 
