@@ -3822,8 +3822,18 @@ mod tests {
 
         let mut ha = HotArchiveBucketList::new();
 
-        // Add a single archived entry at ledger 1
-        let entry = make_account_entry([1u8; 32], 100);
+        // Add a single archived entry at ledger 1 (must be persistent)
+        let entry = LedgerEntry {
+            last_modified_ledger_seq: 1,
+            data: LedgerEntryData::ContractData(ContractDataEntry {
+                ext: ExtensionPoint::V0,
+                contract: ScAddress::Contract(Hash([1u8; 32]).into()),
+                key: ScVal::Bytes(b"key1".to_vec().try_into().unwrap()),
+                durability: ContractDataDurability::Persistent,
+                val: ScVal::I64(100),
+            }),
+            ext: LedgerEntryExt::V0,
+        };
         ha.add_batch(1, TEST_PROTOCOL, vec![entry], vec![]).unwrap();
 
         // Level 0 curr should have entries (1 data + potentially metadata)

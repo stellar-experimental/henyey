@@ -126,12 +126,17 @@ impl HotArchiveBucket {
         }
     }
 
-    /// Create a hot archive bucket from entries.
+    /// Create a hot archive bucket from pre-formed entries.
     ///
-    /// **Important**: The entries MUST be pre-sorted in stellar-core order
-    /// (using LedgerEntryIdCmp comparison). The entries are stored in the
-    /// provided order for hash computation.
-    pub fn from_entries(entries: Vec<HotArchiveBucketEntry>) -> Result<Self> {
+    /// # Preconditions
+    ///
+    /// - Entries MUST be pre-sorted in stellar-core order (LedgerEntryIdCmp)
+    /// - Entries MUST have unique keys (no duplicates)
+    /// - All non-meta entries MUST be persistent Soroban entries
+    ///
+    /// These invariants are enforced at the public entry point ([`Self::fresh()`]).
+    /// This constructor trusts its callers within the crate.
+    pub(crate) fn from_entries(entries: Vec<HotArchiveBucketEntry>) -> Result<Self> {
         let mut entry_map = BTreeMap::new();
 
         for entry in &entries {
@@ -163,13 +168,31 @@ impl HotArchiveBucket {
         archived_entries: Vec<LedgerEntry>,
         restored_keys: Vec<LedgerKey>,
     ) -> Result<Self> {
+        // Validate all archived entries are persistent
+        // (stellar-core: releaseAssertOrThrow(isPersistentEntry(e.data)))
+        for entry in &archived_entries {
+            if !henyey_common::is_persistent_entry(entry) {
+                return Err(BucketError::Merge(
+                    "hot archive fresh: archived entry is not a persistent entry".into(),
+                ));
+            }
+        }
+
+        // Validate all restored keys are persistent
+        // (stellar-core: releaseAssertOrThrow(isPersistentEntry(k)))
+        for key in &restored_keys {
+            if !henyey_common::is_persistent_key(key) {
+                return Err(BucketError::Merge(
+                    "hot archive fresh: restored key is not a persistent key".into(),
+                ));
+            }
+        }
+
         // In stellar-core, BucketOutputIterator constructor always writes a metaentry first,
         // so fresh buckets always have at least a metaentry (even with no data entries).
-        // mObjectsPut is 1 after writing metaentry, so getBucket() creates a bucket file.
         let mut entries = Vec::with_capacity(1 + archived_entries.len() + restored_keys.len());
 
         // Add metadata - hot archive buckets always use V1 with BucketListType::HotArchive
-        // Metadata is only included when there are actual entries to add
         entries.push(HotArchiveBucketEntry::Metaentry(BucketMetadata {
             ledger_version: protocol_version,
             ext: BucketMetadataExt::V1(BucketListType::HotArchive),
@@ -188,6 +211,16 @@ impl HotArchiveBucket {
         // Sort entries using stellar-core's comparison order
         // This matches BucketEntryIdCmp<HotArchiveBucket>
         entries.sort_by(compare_hot_archive_entries);
+
+        // Assert no duplicate keys after sort
+        // (stellar-core: releaseAssert + adjacent_find)
+        for window in entries.windows(2) {
+            if compare_hot_archive_entries(&window[0], &window[1]) == std::cmp::Ordering::Equal {
+                return Err(BucketError::Merge(
+                    "hot archive fresh: duplicate key detected".into(),
+                ));
+            }
+        }
 
         let bucket = Self::from_entries(entries)?;
 
@@ -2695,5 +2728,103 @@ mod tests {
             result.is_err(),
             "hot archive restart_merges must fail when state-2 input bucket is missing"
         );
+    }
+
+    // ── fresh() validation tests ─────────────────────────────────────────
+
+    #[test]
+    fn test_fresh_rejects_non_persistent_archived_entry() {
+        // Temporary ContractData entry (not persistent)
+        let entry = LedgerEntry {
+            last_modified_ledger_seq: 1,
+            data: LedgerEntryData::ContractData(ContractDataEntry {
+                ext: ExtensionPoint::V0,
+                contract: ScAddress::Contract(Hash([1u8; 32]).into()),
+                key: ScVal::Bytes(b"key1".to_vec().try_into().unwrap()),
+                durability: ContractDataDurability::Temporary,
+                val: ScVal::I64(100),
+            }),
+            ext: LedgerEntryExt::V0,
+        };
+
+        let result = HotArchiveBucket::fresh(25, vec![entry], vec![]);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("not a persistent entry"),
+            "unexpected error: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn test_fresh_rejects_non_persistent_restored_key() {
+        // Account key (not a Soroban persistent key)
+        let key = LedgerKey::Account(LedgerKeyAccount {
+            account_id: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([0u8; 32]))),
+        });
+
+        let result = HotArchiveBucket::fresh(25, vec![], vec![key]);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("not a persistent key"),
+            "unexpected error: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn test_fresh_rejects_duplicate_archived_keys() {
+        let entry1 = make_contract_data_entry([1u8; 32], b"key1", 100);
+        let entry2 = make_contract_data_entry([1u8; 32], b"key1", 200);
+
+        let result = HotArchiveBucket::fresh(25, vec![entry1, entry2], vec![]);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("duplicate key"),
+            "unexpected error: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn test_fresh_rejects_duplicate_restored_keys() {
+        let key1 = make_contract_data_key([1u8; 32], b"key1");
+        let key2 = make_contract_data_key([1u8; 32], b"key1");
+
+        let result = HotArchiveBucket::fresh(25, vec![], vec![key1, key2]);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("duplicate key"),
+            "unexpected error: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn test_fresh_rejects_duplicate_archived_and_live_same_key() {
+        let entry = make_contract_data_entry([1u8; 32], b"key1", 100);
+        let key = make_contract_data_key([1u8; 32], b"key1");
+
+        let result = HotArchiveBucket::fresh(25, vec![entry], vec![key]);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("duplicate key"),
+            "unexpected error: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn test_fresh_happy_path_valid_persistent_entries() {
+        let entry1 = make_contract_data_entry([1u8; 32], b"key1", 100);
+        let entry2 = make_contract_data_entry([2u8; 32], b"key2", 200);
+        let key = make_contract_data_key([3u8; 32], b"key3");
+
+        let result = HotArchiveBucket::fresh(25, vec![entry1, entry2], vec![key]);
+        assert!(result.is_ok());
+        let bucket = result.unwrap();
+        // metaentry + 2 archived + 1 live = 4
+        assert_eq!(bucket.len(), 4);
+        assert!(!bucket.hash().is_zero());
     }
 }
