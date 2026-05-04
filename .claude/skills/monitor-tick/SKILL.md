@@ -724,12 +724,14 @@ for v in "$pending_too_old" "$pending_received"; do
 done
 
 # henyey_recovery_stalled_tick_total: extract via Form 2 (see §Metric extraction
-# forms). Validate expected 4-label set {backoff_active, forcing_catchup_behind,
-# forcing_catchup_not_behind, archive_behind_peer_ahead_hard_reset}; skip the
-# alert entirely on mismatch. Alert when the delta of the forcing_catchup_behind
-# series ≥ 1. The archive_behind_peer_ahead_hard_reset label is informational
-# (counts the archive-behind hard-reset path that self-recovers in <1s — see
-# the HardResetEscalation chain documented above); do not alert on its delta.
+# forms). Validate expected 5-label set {backoff_active, forcing_catchup_behind,
+# forcing_catchup_not_behind, archive_behind_peer_ahead_hard_reset,
+# at_tip_no_scp_hard_reset}; skip the alert entirely on mismatch. Alert when the
+# delta of the forcing_catchup_behind series ≥ 1. The two hard_reset labels
+# (archive_behind_peer_ahead_hard_reset, at_tip_no_scp_hard_reset) are both
+# informational — they count the hard-reset escalation paths that self-recover
+# in <1s (see the HardResetEscalation chain documented above); do not alert
+# on their deltas.
 ```
 
 **Check 1: SCP post-verify acceptance rate**
