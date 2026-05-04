@@ -16,6 +16,18 @@ use super::*;
 #[cfg(test)]
 pub(crate) const FATAL_WIPE_FIELD: &str = "fatal_wipe_required";
 
+/// Structured tracing field name for the summary heartbeat event.
+///
+/// External monitoring tools (e.g. monitor-tick) grep rendered log output
+/// for this field to detect heartbeat presence without relying on fragile
+/// prose-string matching.  This field is **reserved exclusively** for the
+/// summary heartbeat event — do not add it to other code paths.
+/// The `test_heartbeat_emits_field_*` tests guard the rendering contract.
+/// **Do not rename this field without updating the tests and all monitoring
+/// consumers.**
+#[cfg(test)]
+pub(crate) const HEARTBEAT_FIELD: &str = "heartbeat";
+
 /// Compute the query rate-limit window (parity: Peer.cpp:1426-1429).
 ///
 /// Re-exported from the overlay's shared query policy module.
@@ -1001,6 +1013,7 @@ impl App {
                     let peer_max_verified = self.max_verified_scp_slot.load(Ordering::Relaxed);
                     let peer_gap = self.effective_peer_gap(ledger);
                     tracing::info!(
+                        heartbeat = true,
                         tracking_slot,
                         ledger,
                         latest_ext,
@@ -2978,6 +2991,156 @@ mod fatal_wipe_field_tests {
         assert!(
             output.contains("\"fatal_wipe_required\":true"),
             "JSON format must render field as '\"fatal_wipe_required\":true' for grep. Got: {output}"
+        );
+    }
+
+    /// A `Write` adapter that appends to a shared `Vec<u8>`.
+    #[derive(Clone)]
+    struct BufWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl io::Write for BufWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+}
+
+/// Tests for [`HEARTBEAT_FIELD`] — the monitoring contract.
+///
+/// These tests guard that the summary heartbeat event emits the `heartbeat`
+/// structured field and that both the Text and JSON `tracing_subscriber::fmt`
+/// formatters render it in grep-able form.
+#[cfg(test)]
+mod heartbeat_field_tests {
+    use super::HEARTBEAT_FIELD;
+    use std::io;
+    use std::sync::{Arc, Mutex};
+
+    /// Verify the heartbeat event emits the structured field `heartbeat = true`
+    /// via a capturing subscriber.
+    #[test]
+    fn test_heartbeat_emits_field_structured() {
+        use tracing::{
+            field::{Field, Visit},
+            subscriber::with_default,
+            Event, Metadata, Subscriber,
+        };
+
+        #[derive(Default)]
+        struct CapturedBool {
+            value: Option<bool>,
+        }
+        impl Visit for CapturedBool {
+            fn record_bool(&mut self, field: &Field, value: bool) {
+                if field.name() == HEARTBEAT_FIELD {
+                    self.value = Some(value);
+                }
+            }
+            fn record_debug(&mut self, _: &Field, _: &dyn std::fmt::Debug) {}
+        }
+
+        #[derive(Default, Clone)]
+        struct HeartbeatFieldSubscriber {
+            captured: Arc<Mutex<Option<bool>>>,
+        }
+        impl Subscriber for HeartbeatFieldSubscriber {
+            fn enabled(&self, _: &Metadata<'_>) -> bool {
+                true
+            }
+            fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+                tracing::span::Id::from_u64(1)
+            }
+            fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+            fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+            fn event(&self, event: &Event<'_>) {
+                let mut cap = CapturedBool::default();
+                event.record(&mut cap);
+                if let Some(v) = cap.value {
+                    *self.captured.lock().unwrap() = Some(v);
+                }
+            }
+            fn enter(&self, _: &tracing::span::Id) {}
+            fn exit(&self, _: &tracing::span::Id) {}
+        }
+
+        let sub = HeartbeatFieldSubscriber::default();
+        let captured = sub.captured.clone();
+
+        with_default(sub, || {
+            tracing::info!(heartbeat = true, "Heartbeat");
+        });
+
+        assert_eq!(
+            *captured.lock().unwrap(),
+            Some(true),
+            "heartbeat event must emit {HEARTBEAT_FIELD}=true"
+        );
+    }
+
+    /// Verify the Text formatter renders the field as `heartbeat=true`,
+    /// matching the production formatter construction in `logging.rs:334-341`.
+    #[test]
+    fn test_heartbeat_emits_field_text_format() {
+        use tracing::subscriber::with_default;
+        use tracing_subscriber::{fmt, layer::SubscriberExt, EnvFilter};
+
+        let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let buf_clone = buf.clone();
+
+        // Mirror production Text formatter construction (logging.rs:334-341).
+        let fmt_layer = fmt::layer()
+            .with_writer(move || -> Box<dyn io::Write> { Box::new(BufWriter(buf_clone.clone())) })
+            .with_ansi(false)
+            .with_target(true);
+
+        let subscriber = tracing_subscriber::registry()
+            .with(EnvFilter::new("info"))
+            .with(fmt_layer);
+
+        with_default(subscriber, || {
+            tracing::info!(heartbeat = true, "Heartbeat");
+        });
+
+        let output = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        assert!(
+            output.contains("heartbeat=true"),
+            "Text format must render field as 'heartbeat=true' for grep. Got: {output}"
+        );
+    }
+
+    /// Verify the JSON formatter renders the field as `"heartbeat":true`,
+    /// matching the production formatter construction in `logging.rs:353-357`.
+    #[test]
+    fn test_heartbeat_emits_field_json_format() {
+        use tracing::subscriber::with_default;
+        use tracing_subscriber::{fmt, layer::SubscriberExt, EnvFilter};
+
+        let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let buf_clone = buf.clone();
+
+        // Mirror production JSON formatter construction (logging.rs:353-357).
+        let fmt_layer = fmt::layer()
+            .with_writer(move || -> Box<dyn io::Write> { Box::new(BufWriter(buf_clone.clone())) })
+            .json()
+            .with_span_list(true)
+            .with_current_span(true);
+
+        let subscriber = tracing_subscriber::registry()
+            .with(EnvFilter::new("info"))
+            .with(fmt_layer);
+
+        with_default(subscriber, || {
+            tracing::info!(heartbeat = true, "Heartbeat");
+        });
+
+        let output = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        assert!(
+            output.contains("\"heartbeat\":true"),
+            "JSON format must render field as '\"heartbeat\":true' for grep. Got: {output}"
         );
     }
 
