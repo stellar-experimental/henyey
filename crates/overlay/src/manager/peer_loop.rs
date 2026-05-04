@@ -7,7 +7,7 @@ use super::{OutboundMessage, OverlayManager, OverlayMessage, SharedPeerState};
 use crate::connection::ConnectionDirection;
 use crate::{
     codec::helpers,
-    flood::compute_message_hash,
+    flood::{compute_message_hash, RelayRecord},
     flow_control::{msg_body_size, FlowControl},
     peer::Peer,
     PeerId,
@@ -771,14 +771,18 @@ impl OverlayManager {
             if helpers::is_flood_gate_tracked(message) {
                 let hash = compute_message_hash(message);
                 let lcl = state.last_closed_ledger.load(Ordering::Relaxed);
-                let unique = state
+                let relay = state
                     .flood_gate
                     .record_seen(hash, Some(peer_id.clone()), lcl);
-                ctx.peer.record_flood_stats(unique, message_size);
-                if unique {
-                    state.metrics.flood_unique_recv.inc();
-                } else {
-                    state.metrics.flood_duplicate_recv.inc();
+                match relay {
+                    RelayRecord::New => {
+                        ctx.peer.record_flood_stats(true, message_size);
+                        state.metrics.flood_unique_recv.inc();
+                    }
+                    RelayRecord::Repeated => {
+                        ctx.peer.record_flood_stats(false, message_size);
+                        state.metrics.flood_duplicate_recv.inc();
+                    }
                 }
                 // SCP messages are NEVER dropped at the overlay/FloodGate
                 // level — they always pass through to the herder.
@@ -811,7 +815,7 @@ impl OverlayManager {
                 // `recvSCPEnvelope` — there is no FloodGate-level drop
                 // for SCP. We mirror that here. (See issue #2317.)
                 let is_scp = matches!(message, StellarMessage::ScpMessage(_));
-                if !unique && !is_scp {
+                if !relay.is_new() && !is_scp {
                     return Some(false);
                 }
             } else {

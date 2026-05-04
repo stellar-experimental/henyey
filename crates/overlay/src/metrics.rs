@@ -568,9 +568,9 @@ pub struct OverlayMetrics {
     pub flood_duplicate_bytes_recv: Counter,
     /// Per-recipient flood deliveries (is_flood messages only).
     pub flood_broadcast: Counter,
-    /// Unique flood messages received (inbound, record_seen → true).
+    /// Unique flood messages received (inbound, record_seen → RelayRecord::New).
     pub flood_unique_recv: Counter,
-    /// Duplicate flood messages received (inbound, record_seen → false).
+    /// Duplicate flood messages received (inbound, record_seen → RelayRecord::Repeated).
     pub flood_duplicate_recv: Counter,
 
     // ===== Fetch Metrics =====

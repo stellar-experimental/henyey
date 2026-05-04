@@ -31,6 +31,30 @@ use tracing::{debug, trace, warn};
 
 use crate::PeerId;
 
+/// Result of recording a message hash in the [`FloodGate`].
+///
+/// **FloodGate is relay accounting, not a generic dedup layer.** The caller
+/// decides drop policy per message type:
+/// - SCP messages are NEVER dropped based on this (stellar-core parity:
+///   Peer.cpp:1667-1673 calls `recvFloodedMsgID` then unconditionally
+///   calls `recvSCPEnvelope`).
+/// - Transaction duplicates may be dropped (current `peer_loop` behavior).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use]
+pub enum RelayRecord {
+    /// First time this hash was seen — caller may forward to other peers.
+    New,
+    /// Hash was already recorded. Caller decides drop policy per message type.
+    Repeated,
+}
+
+impl RelayRecord {
+    /// Returns `true` if this is the first time the hash was recorded.
+    pub fn is_new(self) -> bool {
+        matches!(self, RelayRecord::New)
+    }
+}
+
 /// Default TTL for seen messages (5 minutes).
 ///
 /// Used by [`FloodGate::clear_below`] as a secondary expiry mechanism
@@ -97,10 +121,11 @@ impl SeenEntry {
 /// ```rust,ignore
 /// let gate = FloodGate::new();
 ///
-/// // Check if we should flood a message
+/// // Record a message and check whether it was new
 /// let hash = compute_message_hash(&message);
-/// if gate.record_seen(hash, Some(peer_id), current_ledger_seq) {
-///     // First time seeing this - flood to other peers
+/// let result = gate.record_seen(hash, Some(peer_id), current_ledger_seq);
+/// if result.is_new() {
+///     // First time seeing this — flood to other peers
 ///     let forward_to = gate.get_forward_peers(&hash, &all_peers);
 /// }
 /// ```
@@ -153,8 +178,8 @@ impl FloodGate {
 
     /// Records that a message has been seen, optionally from a specific peer.
     ///
-    /// Returns `true` if this is the first time seeing this message (should flood),
-    /// or `false` if it's a duplicate (should drop).
+    /// Returns [`RelayRecord::New`] if this is the first time seeing this
+    /// message, or [`RelayRecord::Repeated`] if it was already recorded.
     ///
     /// If `from_peer` is `Some`, that peer is recorded so we don't forward
     /// the message back to them.
@@ -206,7 +231,7 @@ impl FloodGate {
         message_hash: Hash256,
         from_peer: Option<PeerId>,
         ledger_seq: u32,
-    ) -> bool {
+    ) -> RelayRecord {
         self.messages_seen.fetch_add(1, Ordering::Relaxed);
 
         // Check if we've seen this message
@@ -217,7 +242,7 @@ impl FloodGate {
             }
             self.messages_dropped.fetch_add(1, Ordering::Relaxed);
             trace!("Duplicate message: {}", message_hash);
-            return false;
+            return RelayRecord::Repeated;
         }
 
         // New message
@@ -238,7 +263,7 @@ impl FloodGate {
         }
 
         trace!("New message: {}", message_hash);
-        true
+        RelayRecord::New
     }
 
     /// Checks if another message is allowed under the rate limit.
@@ -424,13 +449,13 @@ mod tests {
         assert!(gate.should_flood(&hash));
 
         // Record as seen
-        assert!(gate.record_seen(hash, None, 1));
+        assert_eq!(gate.record_seen(hash, None, 1), RelayRecord::New);
 
         // Should not flood again
         assert!(!gate.should_flood(&hash));
 
-        // Record again should return false
-        assert!(!gate.record_seen(hash, None, 1));
+        // Record again should return Repeated
+        assert_eq!(gate.record_seen(hash, None, 1), RelayRecord::Repeated);
     }
 
     #[test]
@@ -443,10 +468,16 @@ mod tests {
         let peer3 = make_peer_id(3);
 
         // First seen from peer1
-        assert!(gate.record_seen(hash, Some(peer1.clone()), 1));
+        assert_eq!(
+            gate.record_seen(hash, Some(peer1.clone()), 1),
+            RelayRecord::New
+        );
 
         // Also seen from peer2
-        assert!(!gate.record_seen(hash, Some(peer2.clone()), 1));
+        assert_eq!(
+            gate.record_seen(hash, Some(peer2.clone()), 1),
+            RelayRecord::Repeated
+        );
 
         // Get forward peers - should exclude peer1 and peer2
         let all_peers = vec![peer1.clone(), peer2.clone(), peer3.clone()];
@@ -463,9 +494,9 @@ mod tests {
         let hash1 = make_hash(1);
         let hash2 = make_hash(2);
 
-        gate.record_seen(hash1, None, 1);
-        gate.record_seen(hash1, None, 1); // duplicate
-        gate.record_seen(hash2, None, 1);
+        let _ = gate.record_seen(hash1, None, 1);
+        let _ = gate.record_seen(hash1, None, 1); // duplicate
+        let _ = gate.record_seen(hash2, None, 1);
 
         let stats = gate.stats();
         assert_eq!(stats.seen_count, 2);
@@ -478,9 +509,7 @@ mod tests {
         let gate = FloodGate::with_ttl(Duration::from_millis(10));
 
         let hash = make_hash(1);
-        gate.record_seen(hash, None, 1);
-
-        // Wait for expiry
+        let _ = gate.record_seen(hash, None, 1);
         std::thread::sleep(Duration::from_millis(20));
 
         // clear_below with a high ledger seq removes expired entries
@@ -507,9 +536,9 @@ mod tests {
         let hash2 = make_hash(2);
         let hash3 = make_hash(3);
         // Record at different ledger sequences
-        gate.record_seen(hash1, None, 50);
-        gate.record_seen(hash2, None, 100);
-        gate.record_seen(hash3, None, 150);
+        let _ = gate.record_seen(hash1, None, 50);
+        let _ = gate.record_seen(hash2, None, 100);
+        let _ = gate.record_seen(hash3, None, 150);
 
         assert_eq!(gate.stats().seen_count, 3);
 
@@ -528,8 +557,8 @@ mod tests {
 
         let hash1 = make_hash(1);
         let hash2 = make_hash(2);
-        gate.record_seen(hash1, None, 100);
-        gate.record_seen(hash2, None, 100);
+        let _ = gate.record_seen(hash1, None, 100);
+        let _ = gate.record_seen(hash2, None, 100);
 
         assert_eq!(gate.stats().seen_count, 2);
 
@@ -549,8 +578,8 @@ mod tests {
 
         let hash1 = make_hash(1);
         let hash2 = make_hash(2);
-        gate.record_seen(hash1, None, 100);
-        gate.record_seen(hash2, None, 100);
+        let _ = gate.record_seen(hash1, None, 100);
+        let _ = gate.record_seen(hash2, None, 100);
 
         // clear_below should not remove entries at or above the threshold
         gate.clear_below(100);
@@ -569,7 +598,7 @@ mod tests {
 
         // Insert 5 entries at ledger 1
         for i in 0..5u8 {
-            gate.record_seen(make_hash(i), None, 1);
+            let _ = gate.record_seen(make_hash(i), None, 1);
         }
         assert_eq!(gate.stats().seen_count, 5);
 
@@ -578,7 +607,7 @@ mod tests {
 
         // Insert 5 new entries at ledger 2 via record_seen
         for i in 10..15u8 {
-            gate.record_seen(make_hash(i), None, 2);
+            let _ = gate.record_seen(make_hash(i), None, 2);
         }
 
         // All 10 entries should still be present — record_seen does not clean up
@@ -619,10 +648,10 @@ mod tests {
 
         // Simulating the fixed routing: only gate-tracked messages get recorded
         if helpers::is_flood_gate_tracked(&advert) {
-            gate.record_seen(compute_message_hash(&advert), None, 1);
+            let _ = gate.record_seen(compute_message_hash(&advert), None, 1);
         }
         if helpers::is_flood_gate_tracked(&demand) {
-            gate.record_seen(compute_message_hash(&demand), None, 1);
+            let _ = gate.record_seen(compute_message_hash(&demand), None, 1);
         }
         // FloodGate should be empty — pull-control does NOT pollute it
         assert_eq!(gate.seen.len(), 0);
@@ -630,7 +659,7 @@ mod tests {
         // Transaction IS gate-tracked and should be recorded
         assert!(helpers::is_flood_gate_tracked(&tx));
         if helpers::is_flood_gate_tracked(&tx) {
-            gate.record_seen(compute_message_hash(&tx), None, 1);
+            let _ = gate.record_seen(compute_message_hash(&tx), None, 1);
         }
         assert_eq!(gate.seen.len(), 1);
     }
@@ -641,7 +670,7 @@ mod tests {
         let hash = make_hash(1);
 
         // Record, then forget — should_flood returns true again.
-        assert!(gate.record_seen(hash, None, 1));
+        assert_eq!(gate.record_seen(hash, None, 1), RelayRecord::New);
         assert!(!gate.should_flood(&hash));
 
         gate.forget(&hash);
@@ -669,7 +698,10 @@ mod tests {
         let all_peers = vec![peer_a.clone(), peer_b.clone(), peer_c.clone()];
 
         // Peer A delivers the message.
-        assert!(gate.record_seen(hash, Some(peer_a.clone()), 1));
+        assert_eq!(
+            gate.record_seen(hash, Some(peer_a.clone()), 1),
+            RelayRecord::New
+        );
         // Forward list excludes peer A.
         let fwd = gate.get_forward_peers(&hash, &all_peers);
         assert!(!fwd.contains(&peer_a));
@@ -679,7 +711,10 @@ mod tests {
         gate.forget(&hash);
 
         // Peer B re-delivers. FloodGate treats it as new.
-        assert!(gate.record_seen(hash, Some(peer_b.clone()), 1));
+        assert_eq!(
+            gate.record_seen(hash, Some(peer_b.clone()), 1),
+            RelayRecord::New
+        );
         // Forward list now includes peer A (provenance reset).
         let fwd = gate.get_forward_peers(&hash, &all_peers);
         assert!(fwd.contains(&peer_a));
