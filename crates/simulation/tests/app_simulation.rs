@@ -236,6 +236,43 @@ async fn test_single_node_app_simulation_can_manual_close_over_tcp() {
     sim.stop_all_nodes().await.expect("stop app-backed nodes");
 }
 
+/// Multi-slot standalone validator regression test (follow-up from #2317).
+///
+/// Extends `test_single_node_app_simulation_can_manual_close_over_tcp` to close
+/// 5 consecutive ledgers (2 through 6) in a zero-peer, single-validator topology.
+/// Catches regressions in the solo-quorum SCP state machine, tracking-state
+/// advancement, and nomination value building across multiple slots.
+#[tokio::test]
+async fn test_standalone_validator_closes_multiple_ledgers() {
+    let mut sim =
+        Simulation::with_network(SimulationMode::OverTcp, "Test SDF Network ; September 2015");
+
+    let seed = Hash256::hash(b"STANDALONE_MULTI_SLOT");
+    let secret = SecretKey::from_seed(&seed.0);
+    let quorum_set = QuorumSetConfig {
+        threshold_percent: 100,
+        validators: vec![secret.public_key().to_strkey()],
+        inner_sets: Vec::new(),
+    };
+
+    sim.add_app_node("node0", secret, quorum_set);
+    sim.start_all_nodes().await;
+
+    wait_for_app_operational(&sim, "node0", Duration::from_secs(10)).await;
+
+    // Close 5 ledgers: from genesis (ledger 1) through ledger 6.
+    manual_close_until(&sim, 6, 0, Duration::from_secs(60)).await;
+
+    // Confirm the node operated with zero connected peers throughout.
+    assert_eq!(
+        sim.app_peer_count("node0").await,
+        Some(0),
+        "standalone validator should have zero peers"
+    );
+
+    sim.stop_all_nodes().await.expect("stop standalone node");
+}
+
 /// Regression test for #2357: App::load_account_sequence must return the
 /// root account's sequence number, not Ok(None).
 #[tokio::test]
