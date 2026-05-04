@@ -2546,6 +2546,12 @@ impl BucketList {
     where
         F: FnMut(&Hash256) -> Result<Bucket>,
     {
+        debug_assert!(
+            protocol_version >= henyey_common::protocol::MIN_LEDGER_PROTOCOL_VERSION,
+            "restart_merges_from_has called with unsupported protocol version {}",
+            protocol_version
+        );
+
         tracing::debug!(
             ledger = ledger,
             "restart_merges_from_has: restarting merges using HAS input hashes (parallel)"

@@ -13,9 +13,6 @@ use tracing::{debug, info, warn};
 use super::download::{block_on_async, download_bucket_from_archives};
 use super::CatchupManager;
 
-/// Current protocol version used for merge restarts.
-pub(super) const CURRENT_PROTOCOL_VERSION: u32 = 25;
-
 /// Read the current process RSS (Resident Set Size) in MB from `/proc/self/status`.
 /// Returns `None` on non-Linux platforms or if the file can't be read.
 pub(super) fn rss_mb() -> Option<u64> {
@@ -67,9 +64,8 @@ impl CatchupManager {
         checkpoint_seq: u32,
         live_next_states: &[HasNextState],
         hot_next_states: &[HasNextState],
+        protocol_version: u32,
     ) -> Result<()> {
-        let protocol_version = CURRENT_PROTOCOL_VERSION;
-
         // Run live bucket list merge restarts in parallel (all levels concurrently).
         let load_bucket_for_merge = verified_bucket_loader(self.bucket_manager.clone());
 

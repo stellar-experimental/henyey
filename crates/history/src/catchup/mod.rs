@@ -446,6 +446,7 @@ impl CatchupManager {
             checkpoint_seq,
             &live_next_states,
             &hot_next_states,
+            checkpoint_header.ledger_version,
         )
         .await?;
 
