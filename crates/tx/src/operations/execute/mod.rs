@@ -528,6 +528,24 @@ pub struct SorobanOperationMeta {
     pub actual_restored_indices: Vec<u32>,
 }
 
+impl SorobanOperationMeta {
+    /// Create meta for a failed InvokeHostFunction that still produced diagnostic events.
+    /// stellar-core populates diagnostic events before checking success
+    /// (InvokeHostFunctionOpFrame.cpp:561), so we preserve them on failure.
+    pub fn for_failed_invoke(diagnostic_events: Vec<DiagnosticEvent>) -> Self {
+        Self {
+            events: Vec::new(),
+            diagnostic_events,
+            return_value: None,
+            event_size_bytes: 0,
+            rent_fee: 0,
+            live_bucket_list_restores: Vec::new(),
+            hot_archive_restores: Vec::new(),
+            actual_restored_indices: Vec::new(),
+        }
+    }
+}
+
 /// Entry restored from the hot archive.
 #[derive(Debug, Clone)]
 pub struct HotArchiveRestore {
@@ -1389,6 +1407,36 @@ mod tests {
             _ => panic!("Expected I32"),
         }
         assert_eq!(meta.actual_restored_indices.len(), 3);
+    }
+
+    #[test]
+    fn test_soroban_operation_meta_for_failed_invoke() {
+        // Regression test for #2277: for_failed_invoke preserves diagnostic events.
+        let diag = DiagnosticEvent {
+            in_successful_contract_call: false,
+            event: ContractEvent {
+                ext: ExtensionPoint::V0,
+                contract_id: None,
+                type_: ContractEventType::Diagnostic,
+                body: ContractEventBody::V0(ContractEventV0 {
+                    topics: vec![ScVal::Symbol("error".try_into().unwrap())]
+                        .try_into()
+                        .unwrap(),
+                    data: ScVal::Void,
+                }),
+            },
+        };
+        let meta = SorobanOperationMeta::for_failed_invoke(vec![diag.clone()]);
+
+        assert!(meta.events.is_empty(), "no contract events on failure");
+        assert_eq!(meta.diagnostic_events.len(), 1);
+        assert_eq!(meta.diagnostic_events[0], diag);
+        assert!(meta.return_value.is_none());
+        assert_eq!(meta.event_size_bytes, 0);
+        assert_eq!(meta.rent_fee, 0);
+        assert!(meta.live_bucket_list_restores.is_empty());
+        assert!(meta.hot_archive_restores.is_empty());
+        assert!(meta.actual_restored_indices.is_empty());
     }
 
     // === HotArchiveRestore tests ===

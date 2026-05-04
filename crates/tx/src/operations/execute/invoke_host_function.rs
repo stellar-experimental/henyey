@@ -576,10 +576,14 @@ fn execute_contract_invocation(
             if result.contract_events_and_return_value_size
                 > soroban_config.tx_max_contract_events_size_bytes
             {
-                return Ok(OperationExecutionResult::new(make_result(
-                    InvokeHostFunctionResultCode::ResourceLimitExceeded,
-                    Hash([0u8; 32]),
-                )));
+                // Preserve host-produced diagnostic events on post-host validation failure.
+                return Ok(OperationExecutionResult::with_soroban_meta(
+                    make_result(
+                        InvokeHostFunctionResultCode::ResourceLimitExceeded,
+                        Hash([0u8; 32]),
+                    ),
+                    SorobanOperationMeta::for_failed_invoke(result.diagnostic_events),
+                ));
             }
 
             // stellar-core check: write bytes (recordStorageChanges lines 639-652)
@@ -591,10 +595,13 @@ fn execute_contract_invocation(
                 &super::ContractSizeLimits::from(soroban_config),
             ) {
                 StorageChangeValidation::EntrySizeExceeded => {
-                    return Ok(OperationExecutionResult::new(make_result(
-                        InvokeHostFunctionResultCode::ResourceLimitExceeded,
-                        Hash([0u8; 32]),
-                    )));
+                    return Ok(OperationExecutionResult::with_soroban_meta(
+                        make_result(
+                            InvokeHostFunctionResultCode::ResourceLimitExceeded,
+                            Hash([0u8; 32]),
+                        ),
+                        SorobanOperationMeta::for_failed_invoke(result.diagnostic_events),
+                    ));
                 }
                 StorageChangeValidation::Valid { total_write_bytes } => {
                     if total_write_bytes > soroban_data.resources.write_bytes {
@@ -603,10 +610,13 @@ fn execute_contract_invocation(
                             specified_write_bytes = soroban_data.resources.write_bytes,
                             "Write bytes exceeded specified limit"
                         );
-                        return Ok(OperationExecutionResult::new(make_result(
-                            InvokeHostFunctionResultCode::ResourceLimitExceeded,
-                            Hash([0u8; 32]),
-                        )));
+                        return Ok(OperationExecutionResult::with_soroban_meta(
+                            make_result(
+                                InvokeHostFunctionResultCode::ResourceLimitExceeded,
+                                Hash([0u8; 32]),
+                            ),
+                            SorobanOperationMeta::for_failed_invoke(result.diagnostic_events),
+                        ));
                     }
                 }
             }
@@ -667,10 +677,14 @@ fn execute_contract_invocation(
                 soroban_data.resources.instructions,
                 soroban_config.tx_max_memory_bytes,
             );
-            Ok(OperationExecutionResult::new(make_result(
-                result_code,
-                Hash([0u8; 32]),
-            )))
+            // Preserve host-produced diagnostic events even on failure.
+            // Parity: stellar-core's maybePopulateOutputDiagnosticEvents is called
+            // before checking success (InvokeHostFunctionOpFrame.cpp:561).
+            let diagnostic_events = exec_error.diagnostic_events;
+            Ok(OperationExecutionResult::with_soroban_meta(
+                make_result(result_code, Hash([0u8; 32])),
+                SorobanOperationMeta::for_failed_invoke(diagnostic_events),
+            ))
         }
     }
 }
@@ -2030,6 +2044,7 @@ mod tests {
             host_error,
             cpu_insns_consumed: 1000,
             mem_bytes_consumed: 100,
+            diagnostic_events: vec![],
         };
         // 1000 > 500 specified, so ResourceLimitExceeded
         assert_eq!(
@@ -2051,6 +2066,7 @@ mod tests {
             host_error,
             cpu_insns_consumed: 1000, // CPU exceeded (1000 > 500)
             mem_bytes_consumed: 100,
+            diagnostic_events: vec![],
         };
         // Even though it's a Storage error, CPU exceeded so ResourceLimitExceeded
         assert_eq!(
@@ -2071,6 +2087,7 @@ mod tests {
             host_error,
             cpu_insns_consumed: 100, // CPU within limit (100 < 500)
             mem_bytes_consumed: 100, // Mem within limit (100 < 1000)
+            diagnostic_events: vec![],
         };
         // Resources within limits, so TRAPPED
         assert_eq!(
@@ -2091,6 +2108,7 @@ mod tests {
             host_error,
             cpu_insns_consumed: 100, // CPU within limit
             mem_bytes_consumed: 100, // Mem within limit
+            diagnostic_events: vec![],
         };
         assert_eq!(
             map_host_error_to_result_code(&exec_error, 500, 1000),
@@ -2112,6 +2130,7 @@ mod tests {
             host_error,
             cpu_insns_consumed: 100, // CPU within limit (100 < 500)
             mem_bytes_consumed: 100, // Mem within limit (100 < 1000)
+            diagnostic_events: vec![],
         };
         // Even though host reported Budget/ExceededLimit, consumption is within limits -> TRAPPED
         assert_eq!(
@@ -2132,6 +2151,7 @@ mod tests {
             host_error,
             cpu_insns_consumed: 100,  // CPU within limit
             mem_bytes_consumed: 2000, // Mem exceeded (2000 > 1000)
+            diagnostic_events: vec![],
         };
         assert_eq!(
             map_host_error_to_result_code(&exec_error, 500, 1000),

@@ -2099,4 +2099,86 @@ mod tests {
             other => panic!("Expected UPDATED, got {:?}", other),
         }
     }
+
+    // ====================================================================
+    // Regression tests for #2277: Failed Soroban txs preserve diagnostic events
+    // ====================================================================
+
+    fn make_test_diagnostic_event() -> DiagnosticEvent {
+        DiagnosticEvent {
+            in_successful_contract_call: false,
+            event: ContractEvent {
+                ext: ExtensionPoint::V0,
+                contract_id: None,
+                type_: ContractEventType::Diagnostic,
+                body: ContractEventBody::V0(ContractEventV0 {
+                    topics: vec![ScVal::Symbol("error".try_into().unwrap())]
+                        .try_into()
+                        .unwrap(),
+                    data: ScVal::Void,
+                }),
+            },
+        }
+    }
+
+    #[test]
+    fn test_v4_failed_soroban_preserves_diagnostic_events() {
+        // Regression test for #2277: diagnostic events must be preserved in V4
+        // meta even when the Soroban transaction fails. stellar-core writes
+        // diagnostic events unconditionally (TransactionMeta.cpp:1119-1126).
+        let diag = make_test_diagnostic_event();
+        let meta = build_transaction_meta(TransactionMetaParts {
+            tx_changes_before: empty_entry_changes(),
+            op_changes: Vec::new(),
+            op_events: Vec::new(),
+            tx_events: Vec::new(),
+            soroban_return_value: None,
+            diagnostic_events: vec![diag.clone()],
+            soroban_fee_info: Some((100, 50, 25)),
+            emit_soroban_tx_meta_ext_v1: false,
+            enable_soroban_diagnostic_events: true,
+            tx_succeeded: false,
+            is_soroban: true,
+        });
+        let TransactionMeta::V4(v4) = meta else {
+            panic!("expected V4 meta");
+        };
+        // soroban_meta is None for failed txs (AUDIT-229)
+        assert!(v4.soroban_meta.is_none());
+        // But diagnostic events are preserved
+        assert_eq!(
+            v4.diagnostic_events.len(),
+            1,
+            "failed Soroban tx must preserve diagnostic events in V4 meta"
+        );
+        assert_eq!(v4.diagnostic_events[0], diag);
+    }
+
+    #[test]
+    fn test_v4_failed_soroban_diagnostic_events_filtered_when_disabled() {
+        // When enable_soroban_diagnostic_events is false, diagnostic events
+        // are filtered out even if present — same for both success and failure.
+        let diag = make_test_diagnostic_event();
+        let meta = build_transaction_meta(TransactionMetaParts {
+            tx_changes_before: empty_entry_changes(),
+            op_changes: Vec::new(),
+            op_events: Vec::new(),
+            tx_events: Vec::new(),
+            soroban_return_value: None,
+            diagnostic_events: vec![diag],
+            soroban_fee_info: Some((100, 50, 25)),
+            emit_soroban_tx_meta_ext_v1: false,
+            enable_soroban_diagnostic_events: false,
+            tx_succeeded: false,
+            is_soroban: true,
+        });
+        let TransactionMeta::V4(v4) = meta else {
+            panic!("expected V4 meta");
+        };
+        assert!(v4.soroban_meta.is_none());
+        assert!(
+            v4.diagnostic_events.is_empty(),
+            "diagnostic events must be filtered when disabled"
+        );
+    }
 }

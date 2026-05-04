@@ -127,6 +127,10 @@ pub struct SorobanExecutionError {
     pub cpu_insns_consumed: u64,
     /// Memory bytes consumed before failure.
     pub mem_bytes_consumed: u64,
+    /// Diagnostic events collected by the host before the failure.
+    /// stellar-core preserves these unconditionally in V4 meta
+    /// (TransactionMeta.cpp:1119-1126, InvokeHostFunctionOpFrame.cpp:561).
+    pub diagnostic_events: Vec<DiagnosticEvent>,
 }
 
 /// What kind of storage change the host reported.
@@ -739,6 +743,7 @@ fn make_xdr_setup_error() -> SorobanExecutionError {
         )),
         cpu_insns_consumed: 0,
         mem_bytes_consumed: 0,
+        diagnostic_events: Vec::new(),
     }
 }
 
@@ -812,6 +817,7 @@ fn prepare_footprint_entries(
         host_error: e,
         cpu_insns_consumed: 0,
         mem_bytes_consumed: 0,
+        diagnostic_events: Vec::new(),
     };
 
     // Read-only footprint entries
@@ -1096,6 +1102,7 @@ fn execute_host_function_p24(
             host_error: convert_host_error_p24_to_p25(e),
             cpu_insns_consumed: 0,
             mem_bytes_consumed: 0,
+            diagnostic_events: Vec::new(),
         })?
     } else {
         tracing::warn!("Using default Soroban budget - cost parameters not loaded from network.");
@@ -1201,11 +1208,16 @@ fn execute_host_function_p24(
                 host_error: convert_host_error_p24_to_p25(e),
                 cpu_insns_consumed: budget.get_cpu_insns_consumed().unwrap_or(0),
                 mem_bytes_consumed: budget.get_mem_bytes_consumed().unwrap_or(0),
+                diagnostic_events: convert_diagnostic_events_p24(diagnostic_events),
             });
         }
     };
 
     // ── Decode result ──
+    // Convert diagnostic events before defining closures that borrow budget.
+    // The host has already populated them regardless of invoke result.
+    let converted_diagnostics = convert_diagnostic_events_p24(diagnostic_events);
+
     let make_budget_error = |desc: &str| -> SorobanExecutionError {
         tracing::debug!(desc, "P24: XDR decode error in result processing");
         SorobanExecutionError {
@@ -1215,6 +1227,7 @@ fn execute_host_function_p24(
             )),
             cpu_insns_consumed: budget.get_cpu_insns_consumed().unwrap_or(0),
             mem_bytes_consumed: budget.get_mem_bytes_consumed().unwrap_or(0),
+            diagnostic_events: converted_diagnostics.clone(),
         }
     };
 
@@ -1233,6 +1246,7 @@ fn execute_host_function_p24(
                 host_error: convert_host_error_p24_to_p25(e.clone()),
                 cpu_insns_consumed: budget.get_cpu_insns_consumed().unwrap_or(0),
                 mem_bytes_consumed: budget.get_mem_bytes_consumed().unwrap_or(0),
+                diagnostic_events: converted_diagnostics.clone(),
             });
         }
     };
@@ -1273,13 +1287,12 @@ fn execute_host_function_p24(
     let mem_bytes = budget.get_mem_bytes_consumed().unwrap_or(0);
     let contract_events_and_return_value_size =
         contract_events_size.saturating_add(return_value_size);
-    let diagnostic_events = convert_diagnostic_events_p24(diagnostic_events);
 
     Ok(SorobanExecutionResult {
         return_value,
         storage_changes,
         contract_events,
-        diagnostic_events,
+        diagnostic_events: converted_diagnostics,
         cpu_insns,
         mem_bytes,
         contract_events_and_return_value_size,
@@ -1312,6 +1325,7 @@ fn execute_host_function_p25(
         host_error: e,
         cpu_insns_consumed: 0,
         mem_bytes_consumed: 0,
+        diagnostic_events: Vec::new(),
     };
 
     let instruction_limit = soroban_data.resources.instructions as u64;
@@ -1458,11 +1472,15 @@ fn execute_host_function_p25(
                 host_error: e,
                 cpu_insns_consumed,
                 mem_bytes_consumed,
+                diagnostic_events: convert_diagnostic_events_p25(diagnostic_events),
             });
         }
     };
 
     // ── Decode result ──
+    // Convert diagnostic events before defining closures that borrow budget.
+    let converted_diagnostics = convert_diagnostic_events_p25(diagnostic_events);
+
     let make_budget_error = |desc: &str| -> SorobanExecutionError {
         tracing::debug!(desc, "P25: XDR decode error in result processing");
         SorobanExecutionError {
@@ -1472,6 +1490,7 @@ fn execute_host_function_p25(
             )),
             cpu_insns_consumed: budget.get_cpu_insns_consumed().unwrap_or(0),
             mem_bytes_consumed: budget.get_mem_bytes_consumed().unwrap_or(0),
+            diagnostic_events: converted_diagnostics.clone(),
         }
     };
 
@@ -1494,6 +1513,7 @@ fn execute_host_function_p25(
                 host_error: e.clone(),
                 cpu_insns_consumed,
                 mem_bytes_consumed,
+                diagnostic_events: converted_diagnostics.clone(),
             });
         }
     };
@@ -1532,14 +1552,11 @@ fn execute_host_function_p25(
     let contract_events_and_return_value_size =
         contract_events_size.saturating_add(return_value_size);
 
-    // Convert P25 diagnostic events to workspace types via XDR bytes.
-    let diagnostic_events = convert_diagnostic_events_p25(diagnostic_events);
-
     Ok(SorobanExecutionResult {
         return_value,
         storage_changes,
         contract_events,
-        diagnostic_events,
+        diagnostic_events: converted_diagnostics,
         cpu_insns,
         mem_bytes,
         contract_events_and_return_value_size,
@@ -1666,6 +1683,7 @@ fn execute_host_function_p26(
         host_error: convert_host_error_p26_to_p25(e),
         cpu_insns_consumed: 0,
         mem_bytes_consumed: 0,
+        diagnostic_events: Vec::new(),
     };
 
     let instruction_limit = soroban_data.resources.instructions as u64;
@@ -1791,15 +1809,21 @@ fn execute_host_function_p26(
                     );
                 }
             }
+            // P26 diagnostic events use stellar-xdr 26.0.0, same as workspace.
+            let converted_diagnostics: Vec<DiagnosticEvent> = diagnostic_events;
             return Err(SorobanExecutionError {
                 host_error: convert_host_error_p26_to_p25(e),
                 cpu_insns_consumed,
                 mem_bytes_consumed,
+                diagnostic_events: converted_diagnostics,
             });
         }
     };
 
     // ── Decode result ──
+    // P26 diagnostic events use stellar-xdr 26.0.0, same as workspace — no conversion needed.
+    let converted_diagnostics: Vec<DiagnosticEvent> = diagnostic_events;
+
     let make_budget_error = |desc: &str| -> SorobanExecutionError {
         tracing::debug!(desc, "P26: XDR decode error in result processing");
         SorobanExecutionError {
@@ -1809,6 +1833,7 @@ fn execute_host_function_p26(
             )),
             cpu_insns_consumed: budget.get_cpu_insns_consumed().unwrap_or(0),
             mem_bytes_consumed: budget.get_mem_bytes_consumed().unwrap_or(0),
+            diagnostic_events: converted_diagnostics.clone(),
         }
     };
 
@@ -1831,6 +1856,7 @@ fn execute_host_function_p26(
                 host_error: convert_host_error_p26_to_p25(e.clone()),
                 cpu_insns_consumed,
                 mem_bytes_consumed,
+                diagnostic_events: converted_diagnostics.clone(),
             });
         }
     };
@@ -1866,14 +1892,11 @@ fn execute_host_function_p26(
     let contract_events_and_return_value_size =
         contract_events_size.saturating_add(return_value_size);
 
-    // P26 diagnostic events use stellar-xdr 26.0.0, same as workspace — no conversion needed.
-    let diagnostic_events: Vec<DiagnosticEvent> = diagnostic_events;
-
     Ok(SorobanExecutionResult {
         return_value,
         storage_changes,
         contract_events,
-        diagnostic_events,
+        diagnostic_events: converted_diagnostics,
         cpu_insns,
         mem_bytes,
         contract_events_and_return_value_size,
@@ -2099,6 +2122,7 @@ mod tests {
                 )),
                 cpu_insns_consumed: 0,
                 mem_bytes_consumed: 0,
+                diagnostic_events: vec![],
             }
         };
         let changes = vec![NormalizedLedgerChange {
@@ -2126,6 +2150,7 @@ mod tests {
                 )),
                 cpu_insns_consumed: 0,
                 mem_bytes_consumed: 0,
+                diagnostic_events: vec![],
             }
         };
         // Valid key, invalid new_value
@@ -2158,6 +2183,7 @@ mod tests {
                 )),
                 cpu_insns_consumed: 0,
                 mem_bytes_consumed: 0,
+                diagnostic_events: vec![],
             }
         };
         let key = LedgerKey::ContractCode(stellar_xdr::curr::LedgerKeyContractCode {

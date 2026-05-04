@@ -684,11 +684,16 @@ impl TransactionExecutor {
                         );
 
                         let mut op_events_final = Vec::new();
+                        // Always extract diagnostic events from soroban_meta, regardless
+                        // of success. Parity: stellar-core captures diagnostics before
+                        // checking success (InvokeHostFunctionOpFrame.cpp:561,
+                        // TransactionMeta.cpp:1119-1126).
+                        if let Some(meta) = op_exec.soroban_meta.as_mut() {
+                            diagnostic_events.extend(std::mem::take(&mut meta.diagnostic_events));
+                        }
                         if all_success && is_operation_success(&op_result) {
                             if let Some(meta) = op_exec.soroban_meta.as_mut() {
                                 op_event_manager.set_events(std::mem::take(&mut meta.events));
-                                diagnostic_events
-                                    .extend(std::mem::take(&mut meta.diagnostic_events));
                                 soroban_return_value =
                                     std::mem::take(&mut meta.return_value).or(soroban_return_value);
                             }
@@ -800,7 +805,8 @@ impl TransactionExecutor {
             );
             op_changes.clear();
             op_events.clear();
-            diagnostic_events.clear();
+            // Diagnostic events are NOT cleared on failure — stellar-core preserves
+            // them unconditionally in V4 meta (TransactionMeta.cpp:1119-1126).
             soroban_return_value = None;
         } else {
             self.commit_successful_tx(pre_tx_created_count);
