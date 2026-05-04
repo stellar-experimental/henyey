@@ -326,6 +326,37 @@ mod tests {
         LedgerContext::testnet(1, 1000)
     }
 
+    /// Build a ContractCode LedgerEntry with a code blob of `code_len` bytes.
+    fn make_contract_code_entry_with_size(hash: Hash, code_len: usize) -> LedgerEntry {
+        LedgerEntry {
+            last_modified_ledger_seq: 1,
+            data: LedgerEntryData::ContractCode(ContractCodeEntry {
+                ext: ContractCodeEntryExt::V0,
+                hash,
+                code: vec![0u8; code_len].try_into().unwrap(),
+            }),
+            ext: LedgerEntryExt::V0,
+        }
+    }
+
+    /// Build a ContractData key + entry with a Bytes payload of `val_len` bytes.
+    fn make_oversized_contract_data(hash: Hash, val_len: usize) -> (LedgerKey, ContractDataEntry) {
+        let contract = ScAddress::Contract(ContractId(hash));
+        let key = LedgerKey::ContractData(LedgerKeyContractData {
+            contract: contract.clone(),
+            key: ScVal::Bool(true),
+            durability: ContractDataDurability::Persistent,
+        });
+        let data = ContractDataEntry {
+            ext: ExtensionPoint::V0,
+            contract,
+            key: ScVal::Bool(true),
+            durability: ContractDataDurability::Persistent,
+            val: ScVal::Bytes(ScBytes(vec![0xAA; val_len].try_into().unwrap())),
+        };
+        (key, data)
+    }
+
     #[test]
     fn test_restore_footprint_empty_footprint() {
         let mut state = LedgerStateManager::new(5_000_000, 100);
@@ -1151,5 +1182,562 @@ mod tests {
             },
         );
         assert_restore_result(result, RestoreFootprintResult::Success);
+    }
+
+    // ── ContractSizeLimits rejection tests ────────────────────────────────
+
+    /// Hot-archive restore rejects oversized ContractData entries.
+    #[test]
+    fn test_restore_rejects_oversized_hot_archive_contract_data() {
+        let context = create_test_context();
+        let source = create_test_account_id(0);
+        let op = RestoreFootprintOp {
+            ext: ExtensionPoint::V0,
+        };
+
+        let hash = Hash([70u8; 32]);
+        let (key, data) = make_oversized_contract_data(hash, 2000);
+        let entry = LedgerEntry {
+            last_modified_ledger_seq: 1,
+            data: LedgerEntryData::ContractData(data),
+            ext: LedgerEntryExt::V0,
+        };
+
+        // Precondition: XDR size exceeds the restrictive limit.
+        let entry_xdr_size = entry.to_xdr(Limits::none()).unwrap().len();
+        assert!(
+            entry_xdr_size > 100,
+            "entry XDR size ({entry_xdr_size}) must exceed restrictive limit (100)"
+        );
+
+        let hot_restores = vec![HotArchiveRestoreEntry {
+            key: key.clone(),
+            entry: entry.clone(),
+        }];
+
+        let soroban_data = SorobanTransactionData {
+            ext: SorobanTransactionDataExt::V0,
+            resources: SorobanResources {
+                footprint: LedgerFootprint {
+                    read_only: vec![].try_into().unwrap(),
+                    read_write: vec![key.clone()].try_into().unwrap(),
+                },
+                instructions: 0,
+                disk_read_bytes: 100_000,
+                write_bytes: 100_000,
+            },
+            resource_fee: 0,
+        };
+
+        let small_limits = super::super::ContractSizeLimits {
+            max_contract_size_bytes: 64 * 1024,
+            max_contract_data_entry_size_bytes: 100,
+        };
+
+        // Restrictive limits → rejected.
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let result = execute_restore_footprint(
+            &op,
+            &source,
+            &mut state,
+            &context,
+            RestoreFootprintResources {
+                soroban_data: &soroban_data,
+                min_persistent_entry_ttl: TEST_MIN_PERSISTENT_TTL,
+                hot_archive_restores: &hot_restores,
+                ttl_key_cache: None,
+                size_limits: small_limits,
+            },
+        );
+        assert_restore_result(result, RestoreFootprintResult::ResourceLimitExceeded);
+
+        // No state mutation: entry not created, no TTL created.
+        assert!(
+            state.get_entry(&key).is_none(),
+            "entry should not exist after rejection"
+        );
+        let key_hash = crate::soroban::compute_key_hash(&key);
+        assert!(
+            state.get_ttl(&key_hash).is_none(),
+            "TTL should not exist after rejection"
+        );
+
+        // Permissive limits → success (fresh state).
+        let mut state2 = LedgerStateManager::new(5_000_000, 100);
+        let result = execute_restore_footprint(
+            &op,
+            &source,
+            &mut state2,
+            &context,
+            RestoreFootprintResources {
+                soroban_data: &soroban_data,
+                min_persistent_entry_ttl: TEST_MIN_PERSISTENT_TTL,
+                hot_archive_restores: &hot_restores,
+                ttl_key_cache: None,
+                size_limits: PERMISSIVE_LIMITS,
+            },
+        );
+        assert_restore_result(result, RestoreFootprintResult::Success);
+        assert!(
+            state2.get_entry(&key).is_some(),
+            "entry should exist after successful restore"
+        );
+        let ttl = state2
+            .get_ttl(&key_hash)
+            .expect("TTL should exist after successful restore");
+        let expected_ttl =
+            crate::soroban::ttl::restore_ttl_target(context.sequence, TEST_MIN_PERSISTENT_TTL);
+        assert_eq!(ttl.live_until_ledger_seq, expected_ttl);
+    }
+
+    /// Hot-archive restore rejects oversized ContractCode entries.
+    #[test]
+    fn test_restore_rejects_oversized_hot_archive_contract_code() {
+        let context = create_test_context();
+        let source = create_test_account_id(0);
+        let op = RestoreFootprintOp {
+            ext: ExtensionPoint::V0,
+        };
+
+        let hash = Hash([71u8; 32]);
+        let key = LedgerKey::ContractCode(LedgerKeyContractCode { hash: hash.clone() });
+        let entry = make_contract_code_entry_with_size(hash, 2000);
+
+        let entry_xdr_size = entry.to_xdr(Limits::none()).unwrap().len();
+        assert!(
+            entry_xdr_size > 100,
+            "entry XDR size ({entry_xdr_size}) must exceed restrictive limit (100)"
+        );
+
+        let hot_restores = vec![HotArchiveRestoreEntry {
+            key: key.clone(),
+            entry: entry.clone(),
+        }];
+
+        let soroban_data = SorobanTransactionData {
+            ext: SorobanTransactionDataExt::V0,
+            resources: SorobanResources {
+                footprint: LedgerFootprint {
+                    read_only: vec![].try_into().unwrap(),
+                    read_write: vec![key.clone()].try_into().unwrap(),
+                },
+                instructions: 0,
+                disk_read_bytes: 100_000,
+                write_bytes: 100_000,
+            },
+            resource_fee: 0,
+        };
+
+        let small_limits = super::super::ContractSizeLimits {
+            max_contract_size_bytes: 100,
+            max_contract_data_entry_size_bytes: 64 * 1024,
+        };
+
+        // Restrictive limits → rejected.
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let result = execute_restore_footprint(
+            &op,
+            &source,
+            &mut state,
+            &context,
+            RestoreFootprintResources {
+                soroban_data: &soroban_data,
+                min_persistent_entry_ttl: TEST_MIN_PERSISTENT_TTL,
+                hot_archive_restores: &hot_restores,
+                ttl_key_cache: None,
+                size_limits: small_limits,
+            },
+        );
+        assert_restore_result(result, RestoreFootprintResult::ResourceLimitExceeded);
+
+        assert!(
+            state.get_entry(&key).is_none(),
+            "entry should not exist after rejection"
+        );
+        let key_hash = crate::soroban::compute_key_hash(&key);
+        assert!(
+            state.get_ttl(&key_hash).is_none(),
+            "TTL should not exist after rejection"
+        );
+
+        // Permissive limits → success (fresh state).
+        let mut state2 = LedgerStateManager::new(5_000_000, 100);
+        let result = execute_restore_footprint(
+            &op,
+            &source,
+            &mut state2,
+            &context,
+            RestoreFootprintResources {
+                soroban_data: &soroban_data,
+                min_persistent_entry_ttl: TEST_MIN_PERSISTENT_TTL,
+                hot_archive_restores: &hot_restores,
+                ttl_key_cache: None,
+                size_limits: PERMISSIVE_LIMITS,
+            },
+        );
+        assert_restore_result(result, RestoreFootprintResult::Success);
+        assert!(
+            state2.get_entry(&key).is_some(),
+            "entry should exist after successful restore"
+        );
+        let ttl = state2
+            .get_ttl(&key_hash)
+            .expect("TTL should exist after successful restore");
+        let expected_ttl =
+            crate::soroban::ttl::restore_ttl_target(context.sequence, TEST_MIN_PERSISTENT_TTL);
+        assert_eq!(ttl.live_until_ledger_seq, expected_ttl);
+    }
+
+    /// Expired-live-entry restore rejects oversized ContractData entries.
+    #[test]
+    fn test_restore_rejects_oversized_expired_live_contract_data() {
+        let context = create_test_context();
+        let source = create_test_account_id(0);
+        let op = RestoreFootprintOp {
+            ext: ExtensionPoint::V0,
+        };
+
+        let hash = Hash([72u8; 32]);
+        let (key, data) = make_oversized_contract_data(hash, 2000);
+        let entry = LedgerEntry {
+            last_modified_ledger_seq: 1,
+            data: LedgerEntryData::ContractData(data.clone()),
+            ext: LedgerEntryExt::V0,
+        };
+
+        let entry_xdr_size = entry.to_xdr(Limits::none()).unwrap().len();
+        assert!(
+            entry_xdr_size > 100,
+            "entry XDR size ({entry_xdr_size}) must exceed restrictive limit (100)"
+        );
+
+        let soroban_data = SorobanTransactionData {
+            ext: SorobanTransactionDataExt::V0,
+            resources: SorobanResources {
+                footprint: LedgerFootprint {
+                    read_only: vec![].try_into().unwrap(),
+                    read_write: vec![key.clone()].try_into().unwrap(),
+                },
+                instructions: 0,
+                disk_read_bytes: 100_000,
+                write_bytes: 100_000,
+            },
+            resource_fee: 0,
+        };
+
+        let small_limits = super::super::ContractSizeLimits {
+            max_contract_size_bytes: 64 * 1024,
+            max_contract_data_entry_size_bytes: 100,
+        };
+
+        let key_hash = crate::soroban::compute_key_hash(&key);
+        let expired_ttl = context.sequence - 1;
+
+        // Restrictive limits → rejected.
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        state.create_contract_data(data.clone());
+        state.create_ttl(TtlEntry {
+            key_hash: key_hash.clone(),
+            live_until_ledger_seq: expired_ttl,
+        });
+
+        let result = execute_restore_footprint(
+            &op,
+            &source,
+            &mut state,
+            &context,
+            RestoreFootprintResources {
+                soroban_data: &soroban_data,
+                min_persistent_entry_ttl: TEST_MIN_PERSISTENT_TTL,
+                hot_archive_restores: &[],
+                ttl_key_cache: None,
+                size_limits: small_limits,
+            },
+        );
+        assert_restore_result(result, RestoreFootprintResult::ResourceLimitExceeded);
+
+        // TTL should remain at the expired value (no mutation).
+        let ttl = state.get_ttl(&key_hash).expect("TTL should still exist");
+        assert_eq!(
+            ttl.live_until_ledger_seq, expired_ttl,
+            "TTL should not be updated on rejection"
+        );
+
+        // Permissive limits → success (fresh state).
+        let mut state2 = LedgerStateManager::new(5_000_000, 100);
+        state2.create_contract_data(data);
+        state2.create_ttl(TtlEntry {
+            key_hash: key_hash.clone(),
+            live_until_ledger_seq: expired_ttl,
+        });
+
+        let result = execute_restore_footprint(
+            &op,
+            &source,
+            &mut state2,
+            &context,
+            RestoreFootprintResources {
+                soroban_data: &soroban_data,
+                min_persistent_entry_ttl: TEST_MIN_PERSISTENT_TTL,
+                hot_archive_restores: &[],
+                ttl_key_cache: None,
+                size_limits: PERMISSIVE_LIMITS,
+            },
+        );
+        assert_restore_result(result, RestoreFootprintResult::Success);
+
+        let ttl = state2
+            .get_ttl(&key_hash)
+            .expect("TTL should exist after restore");
+        let expected_ttl =
+            crate::soroban::ttl::restore_ttl_target(context.sequence, TEST_MIN_PERSISTENT_TTL);
+        assert_eq!(
+            ttl.live_until_ledger_seq, expected_ttl,
+            "TTL should be updated to new_ttl"
+        );
+    }
+
+    /// Expired-live-entry restore rejects oversized ContractCode entries.
+    #[test]
+    fn test_restore_rejects_oversized_expired_live_contract_code() {
+        let context = create_test_context();
+        let source = create_test_account_id(0);
+        let op = RestoreFootprintOp {
+            ext: ExtensionPoint::V0,
+        };
+
+        let hash = Hash([73u8; 32]);
+        let key = LedgerKey::ContractCode(LedgerKeyContractCode { hash: hash.clone() });
+        let code_entry = ContractCodeEntry {
+            ext: ContractCodeEntryExt::V0,
+            hash: hash.clone(),
+            code: vec![0u8; 2000].try_into().unwrap(),
+        };
+        let entry = LedgerEntry {
+            last_modified_ledger_seq: 1,
+            data: LedgerEntryData::ContractCode(code_entry.clone()),
+            ext: LedgerEntryExt::V0,
+        };
+
+        let entry_xdr_size = entry.to_xdr(Limits::none()).unwrap().len();
+        assert!(
+            entry_xdr_size > 100,
+            "entry XDR size ({entry_xdr_size}) must exceed restrictive limit (100)"
+        );
+
+        let soroban_data = SorobanTransactionData {
+            ext: SorobanTransactionDataExt::V0,
+            resources: SorobanResources {
+                footprint: LedgerFootprint {
+                    read_only: vec![].try_into().unwrap(),
+                    read_write: vec![key.clone()].try_into().unwrap(),
+                },
+                instructions: 0,
+                disk_read_bytes: 100_000,
+                write_bytes: 100_000,
+            },
+            resource_fee: 0,
+        };
+
+        let small_limits = super::super::ContractSizeLimits {
+            max_contract_size_bytes: 100,
+            max_contract_data_entry_size_bytes: 64 * 1024,
+        };
+
+        let key_hash = crate::soroban::compute_key_hash(&key);
+        let expired_ttl = context.sequence - 1;
+
+        // Restrictive limits → rejected.
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        state.create_contract_code(code_entry.clone());
+        state.create_ttl(TtlEntry {
+            key_hash: key_hash.clone(),
+            live_until_ledger_seq: expired_ttl,
+        });
+
+        let result = execute_restore_footprint(
+            &op,
+            &source,
+            &mut state,
+            &context,
+            RestoreFootprintResources {
+                soroban_data: &soroban_data,
+                min_persistent_entry_ttl: TEST_MIN_PERSISTENT_TTL,
+                hot_archive_restores: &[],
+                ttl_key_cache: None,
+                size_limits: small_limits,
+            },
+        );
+        assert_restore_result(result, RestoreFootprintResult::ResourceLimitExceeded);
+
+        let ttl = state.get_ttl(&key_hash).expect("TTL should still exist");
+        assert_eq!(
+            ttl.live_until_ledger_seq, expired_ttl,
+            "TTL should not be updated on rejection"
+        );
+
+        // Permissive limits → success (fresh state).
+        let mut state2 = LedgerStateManager::new(5_000_000, 100);
+        state2.create_contract_code(code_entry);
+        state2.create_ttl(TtlEntry {
+            key_hash: key_hash.clone(),
+            live_until_ledger_seq: expired_ttl,
+        });
+
+        let result = execute_restore_footprint(
+            &op,
+            &source,
+            &mut state2,
+            &context,
+            RestoreFootprintResources {
+                soroban_data: &soroban_data,
+                min_persistent_entry_ttl: TEST_MIN_PERSISTENT_TTL,
+                hot_archive_restores: &[],
+                ttl_key_cache: None,
+                size_limits: PERMISSIVE_LIMITS,
+            },
+        );
+        assert_restore_result(result, RestoreFootprintResult::Success);
+
+        let ttl = state2
+            .get_ttl(&key_hash)
+            .expect("TTL should exist after restore");
+        let expected_ttl =
+            crate::soroban::ttl::restore_ttl_target(context.sequence, TEST_MIN_PERSISTENT_TTL);
+        assert_eq!(
+            ttl.live_until_ledger_seq, expected_ttl,
+            "TTL should be updated to new_ttl"
+        );
+    }
+
+    // ── Boundary tests (entry_size == limit) ──────────────────────────────
+
+    /// Hot-archive entry exactly at the size limit passes (strict `>` check).
+    #[test]
+    fn test_restore_hot_archive_entry_at_exact_size_limit_passes() {
+        let context = create_test_context();
+        let source = create_test_account_id(0);
+        let op = RestoreFootprintOp {
+            ext: ExtensionPoint::V0,
+        };
+
+        let hash = Hash([74u8; 32]);
+        let key = LedgerKey::ContractCode(LedgerKeyContractCode { hash: hash.clone() });
+        let entry = make_contract_code_entry_with_size(hash, 100);
+        let entry_xdr_size = entry.to_xdr(Limits::none()).unwrap().len() as u32;
+
+        let hot_restores = vec![HotArchiveRestoreEntry {
+            key: key.clone(),
+            entry,
+        }];
+
+        let soroban_data = SorobanTransactionData {
+            ext: SorobanTransactionDataExt::V0,
+            resources: SorobanResources {
+                footprint: LedgerFootprint {
+                    read_only: vec![].try_into().unwrap(),
+                    read_write: vec![key.clone()].try_into().unwrap(),
+                },
+                instructions: 0,
+                disk_read_bytes: 100_000,
+                write_bytes: 100_000,
+            },
+            resource_fee: 0,
+        };
+
+        // Set limit = exact XDR size → should pass (strict > comparison).
+        let exact_limits = super::super::ContractSizeLimits {
+            max_contract_size_bytes: entry_xdr_size,
+            max_contract_data_entry_size_bytes: 64 * 1024,
+        };
+
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let result = execute_restore_footprint(
+            &op,
+            &source,
+            &mut state,
+            &context,
+            RestoreFootprintResources {
+                soroban_data: &soroban_data,
+                min_persistent_entry_ttl: TEST_MIN_PERSISTENT_TTL,
+                hot_archive_restores: &hot_restores,
+                ttl_key_cache: None,
+                size_limits: exact_limits,
+            },
+        );
+        assert_restore_result(result, RestoreFootprintResult::Success);
+    }
+
+    /// Expired-live entry exactly at the size limit passes (strict `>` check).
+    #[test]
+    fn test_restore_expired_live_entry_at_exact_size_limit_passes() {
+        let context = create_test_context();
+        let source = create_test_account_id(0);
+        let op = RestoreFootprintOp {
+            ext: ExtensionPoint::V0,
+        };
+
+        let hash = Hash([75u8; 32]);
+        let (key, data) = make_oversized_contract_data(hash, 200);
+        let entry = LedgerEntry {
+            last_modified_ledger_seq: 1,
+            data: LedgerEntryData::ContractData(data.clone()),
+            ext: LedgerEntryExt::V0,
+        };
+        let entry_xdr_size = entry.to_xdr(Limits::none()).unwrap().len() as u32;
+
+        let soroban_data = SorobanTransactionData {
+            ext: SorobanTransactionDataExt::V0,
+            resources: SorobanResources {
+                footprint: LedgerFootprint {
+                    read_only: vec![].try_into().unwrap(),
+                    read_write: vec![key.clone()].try_into().unwrap(),
+                },
+                instructions: 0,
+                disk_read_bytes: 100_000,
+                write_bytes: 100_000,
+            },
+            resource_fee: 0,
+        };
+
+        let exact_limits = super::super::ContractSizeLimits {
+            max_contract_size_bytes: 64 * 1024,
+            max_contract_data_entry_size_bytes: entry_xdr_size,
+        };
+
+        let key_hash = crate::soroban::compute_key_hash(&key);
+        let expired_ttl = context.sequence - 1;
+
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        state.create_contract_data(data);
+        state.create_ttl(TtlEntry {
+            key_hash: key_hash.clone(),
+            live_until_ledger_seq: expired_ttl,
+        });
+
+        let result = execute_restore_footprint(
+            &op,
+            &source,
+            &mut state,
+            &context,
+            RestoreFootprintResources {
+                soroban_data: &soroban_data,
+                min_persistent_entry_ttl: TEST_MIN_PERSISTENT_TTL,
+                hot_archive_restores: &[],
+                ttl_key_cache: None,
+                size_limits: exact_limits,
+            },
+        );
+        assert_restore_result(result, RestoreFootprintResult::Success);
+
+        let ttl = state
+            .get_ttl(&key_hash)
+            .expect("TTL should exist after restore");
+        let expected_ttl =
+            crate::soroban::ttl::restore_ttl_target(context.sequence, TEST_MIN_PERSISTENT_TTL);
+        assert_eq!(
+            ttl.live_until_ledger_seq, expected_ttl,
+            "TTL should be updated"
+        );
     }
 }
