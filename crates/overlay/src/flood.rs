@@ -136,8 +136,8 @@ pub struct FloodGate {
     ttl: Duration,
     /// Counter: total messages processed.
     messages_seen: AtomicU64,
-    /// Counter: duplicate messages dropped.
-    messages_dropped: AtomicU64,
+    /// Counter: duplicate messages observed.
+    messages_duplicate: AtomicU64,
     /// Maximum messages per second.
     rate_limit: u64,
     /// Start of current rate-limiting window.
@@ -160,7 +160,7 @@ impl FloodGate {
             seen: DashMap::new(),
             ttl,
             messages_seen: AtomicU64::new(0),
-            messages_dropped: AtomicU64::new(0),
+            messages_duplicate: AtomicU64::new(0),
             rate_limit: DEFAULT_RATE_LIMIT_PER_SEC,
             rate_window_start: RwLock::new(Instant::now()),
             rate_window_count: AtomicU64::new(0),
@@ -180,6 +180,12 @@ impl FloodGate {
     ///
     /// Returns [`RelayRecord::New`] if this is the first time seeing this
     /// message, or [`RelayRecord::Repeated`] if it was already recorded.
+    ///
+    /// **Callers must NOT use this return value as a drop signal.** FloodGate
+    /// is relay accounting — it tracks which peers have sent us a given hash
+    /// so `get_forward_peers` can avoid echoing it back. Dedup decisions
+    /// belong to downstream, message-type-specific handlers (SCP scheduler,
+    /// tx queue, etc.). See issues #2317, #2327.
     ///
     /// If `from_peer` is `Some`, that peer is recorded so we don't forward
     /// the message back to them.
@@ -207,25 +213,21 @@ impl FloodGate {
     /// uses a `weak_ptr<CapacityTrackedMessage>` cache that releases
     /// entries the moment processing completes — typically milliseconds.
     ///
-    /// In particular, **SCP messages must NOT be dropped at the FloodGate
-    /// layer based on `record_seen`'s return value**:
-    /// - Self-broadcast records a hash with `from_peer = None`. If a peer
-    ///   later echoes the same envelope back (peer reconnect, GetScpState
-    ///   response, out-of-sync recovery), FloodGate will report the
-    ///   second occurrence as a duplicate, but the herder still needs
-    ///   that envelope (with peer provenance) to fetch tx-sets and
-    ///   converge — see lifecycle.rs `process_verified`.
-    /// - Dropping a duplicate also discards alternate `from_peer`
-    ///   provenance for the same hash, which breaks tx-set / quorum-set
-    ///   fetch peer selection.
+    /// **No FloodGate-tracked message type should be dropped based on
+    /// `record_seen`'s return value**:
+    /// - SCP: Self-broadcast records a hash with `from_peer = None`. If a
+    ///   peer later echoes the same envelope back, the herder still needs
+    ///   that envelope (with peer provenance) to fetch tx-sets and converge.
+    /// - Tx: stellar-core's `OverlayManagerImpl::recvTransaction`
+    ///   (OverlayManagerImpl.cpp:1215-1248) calls `recvFloodedMsgID` for
+    ///   relay tracking then unconditionally processes the transaction.
     ///
-    /// stellar-core mirrors this rule: Peer.cpp:1667-1673 calls
-    /// `recvFloodedMsgID` for relay accounting and then *unconditionally*
-    /// calls `recvSCPEnvelope`. The henyey port enforces the same
-    /// invariant in the call site at `peer_loop.rs::route_received_message`.
-    /// SCP-specific in-flight dedup lives downstream in
-    /// `app::lifecycle::pump_scp_intake` (`scp_scheduled_envelopes`).
-    /// See issue #2317 for the regression that motivated this comment.
+    /// stellar-core parity:
+    /// - SCP: Peer.cpp:1667-1673 calls `recvFloodedMsgID` then
+    ///   unconditionally calls `recvSCPEnvelope`.
+    /// - Tx: OverlayManagerImpl.cpp:1224-1229 calls `recvFloodedMsgID`
+    ///   then unconditionally calls `Herder::recvTransaction`.
+    /// See issues #2317, #2327.
     pub fn record_seen(
         &self,
         message_hash: Hash256,
@@ -240,7 +242,7 @@ impl FloodGate {
             if let Some(peer) = from_peer {
                 entry.add_peer(peer);
             }
-            self.messages_dropped.fetch_add(1, Ordering::Relaxed);
+            self.messages_duplicate.fetch_add(1, Ordering::Relaxed);
             trace!("Duplicate message: {}", message_hash);
             return RelayRecord::Repeated;
         }
@@ -323,7 +325,7 @@ impl FloodGate {
         FloodGateStats {
             seen_count: self.seen.len(),
             total_messages: self.messages_seen.load(Ordering::Relaxed),
-            dropped_messages: self.messages_dropped.load(Ordering::Relaxed),
+            duplicate_messages: self.messages_duplicate.load(Ordering::Relaxed),
         }
     }
 
@@ -374,8 +376,8 @@ pub struct FloodGateStats {
     pub seen_count: usize,
     /// Total messages processed (including duplicates).
     pub total_messages: u64,
-    /// Number of messages dropped as duplicates.
-    pub dropped_messages: u64,
+    /// Number of duplicate messages observed (relay accounting only).
+    pub duplicate_messages: u64,
 }
 
 impl FloodGateStats {
@@ -386,7 +388,7 @@ impl FloodGateStats {
         if self.total_messages == 0 {
             0.0
         } else {
-            (self.dropped_messages as f64 / self.total_messages as f64) * 100.0
+            (self.duplicate_messages as f64 / self.total_messages as f64) * 100.0
         }
     }
 }
@@ -501,7 +503,7 @@ mod tests {
         let stats = gate.stats();
         assert_eq!(stats.seen_count, 2);
         assert_eq!(stats.total_messages, 3);
-        assert_eq!(stats.dropped_messages, 1);
+        assert_eq!(stats.duplicate_messages, 1);
     }
 
     #[test]

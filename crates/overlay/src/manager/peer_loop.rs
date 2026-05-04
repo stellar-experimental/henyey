@@ -784,40 +784,32 @@ impl OverlayManager {
                         state.metrics.flood_duplicate_recv.inc();
                     }
                 }
-                // SCP messages are NEVER dropped at the overlay/FloodGate
-                // level — they always pass through to the herder.
+                // FloodGate-tracked messages (SCP and Transaction) are NEVER
+                // dropped at the overlay/FloodGate layer.
                 //
-                // FloodGate's role for SCP messages is *relay accounting*
-                // only: `record_seen` above tracked which peer sent us the
-                // envelope so `get_forward_peers` won't echo it back. The
-                // actual SCP in-flight dedup happens downstream in
-                // `pump_scp_intake` via the `scp_scheduled_envelopes`
-                // HashSet, which is the henyey equivalent of stellar-core's
-                // `checkScheduledAndCache` (Peer.cpp:1113-1117) — short-lived
-                // and cleared once the verify worker finishes. Duplicate
-                // self-rejection happens in the herder.
+                // FloodGate's role is *relay accounting* only: `record_seen`
+                // above tracked which peer sent us this hash so
+                // `get_forward_peers` won't echo it back. Actual dedup
+                // happens downstream in message-type-specific handlers:
+                // - SCP: `scp_scheduled_envelopes` HashSet in
+                //   `pump_scp_intake` (henyey equivalent of stellar-core's
+                //   `checkScheduledAndCache`, Peer.cpp:1113-1117)
+                // - Tx: herder `receive_transaction` / tx queue dedup
+                //   (app/lifecycle.rs, herder.rs)
                 //
-                // If we drop SCP duplicates here, two failure modes follow:
-                // (1) In a small/standalone topology where the validator's
-                //     own broadcast records a hash, the same envelope
-                //     re-entering via a peer (GetScpState response, peer
-                //     reconnect, out-of-sync recovery) is silently dropped
-                //     and the herder never sees the peer-sourced provenance.
-                // (2) Alternate `from_peer` provenance for the same envelope
-                //     hash is discarded, breaking tx-set / quorum-set fetch
-                //     selection (lifecycle.rs `process_verified`), which
-                //     prefers fetching from a peer that has actually sent
-                //     us the envelope.
+                // Note: Transaction messages route through the lossy generic
+                // broadcast channel (message_tx), not a dedicated channel
+                // like SCP. This is a separate architectural difference from
+                // stellar-core's direct call path; it does not affect the
+                // correctness of removing the FloodGate drop.
                 //
-                // stellar-core parity: Peer.cpp:1667-1673 calls
-                // `recvFloodedMsgID` (the relay-tracking equivalent of
-                // FloodGate) and then *unconditionally* calls
-                // `recvSCPEnvelope` — there is no FloodGate-level drop
-                // for SCP. We mirror that here. (See issue #2317.)
-                let is_scp = matches!(message, StellarMessage::ScpMessage(_));
-                if !relay.is_new() && !is_scp {
-                    return Some(false);
-                }
+                // stellar-core parity:
+                // - SCP: Peer.cpp:1667-1673 — unconditional
+                //   `recvSCPEnvelope`
+                // - Tx:  OverlayManagerImpl.cpp:1215-1248 —
+                //   `recvFloodedMsgID` (line 1224) then unconditional
+                //   `recvTransaction` (Peer.cpp:1524-1533 delegates here)
+                // See issues #2317, #2327.
             } else {
                 // Pull-control messages (FloodAdvert/FloodDemand) use flow-control
                 // capacity but are NOT globally deduplicated or tracked in FloodGate.

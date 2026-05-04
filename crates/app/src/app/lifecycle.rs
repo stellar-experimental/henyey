@@ -1556,7 +1556,7 @@ impl App {
         if let Some(fs) = flood_stats {
             tracing::debug!(
                 seen_messages = fs.seen_count,
-                dropped_messages = fs.dropped_messages,
+                duplicate_messages = fs.duplicate_messages,
                 "Flood gate stats"
             );
         }
