@@ -236,6 +236,177 @@ async fn test_single_node_app_simulation_can_manual_close_over_tcp() {
     sim.stop_all_nodes().await.expect("stop app-backed nodes");
 }
 
+/// Regression test for #2357: App::load_account_sequence must return the
+/// root account's sequence number, not Ok(None).
+#[tokio::test]
+async fn test_load_account_sequence_finds_root_account() {
+    let mut sim = Simulation::with_network(
+        SimulationMode::OverLoopback,
+        "Test SDF Network ; September 2015",
+    );
+
+    let seed = Hash256::hash(b"LOAD_ACCT_SEQ_NODE");
+    let secret = SecretKey::from_seed(&seed.0);
+    let quorum_set = QuorumSetConfig {
+        threshold_percent: 100,
+        validators: vec![secret.public_key().to_strkey()],
+        inner_sets: Vec::new(),
+    };
+
+    sim.add_app_node("node0", secret, quorum_set);
+    sim.start_all_nodes().await;
+
+    let app = sim.app("node0").expect("running app node");
+
+    // Wait for the app to be ready.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while tokio::time::Instant::now() < deadline {
+        if app.state().await == AppState::Validating {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(app.state().await, AppState::Validating);
+
+    // Derive root account ID from the network passphrase (same derivation
+    // as build_genesis_entries / TxGenerator::find_account).
+    let network_id = henyey_common::NetworkId::from_passphrase("Test SDF Network ; September 2015");
+    let root_sk = henyey_crypto::SecretKey::from_seed(network_id.as_bytes());
+    let root_pk = root_sk.public_key();
+    let root_account_id =
+        stellar_xdr::curr::AccountId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
+            stellar_xdr::curr::Uint256(*root_pk.as_bytes()),
+        ));
+
+    // This is the bug: load_account_sequence returns Ok(None) instead of
+    // Ok(Some(0)) for the genesis root account.
+    let result = app.load_account_sequence(&root_account_id);
+    assert!(
+        result.is_ok(),
+        "load_account_sequence should not error: {:?}",
+        result.err()
+    );
+    let seq = result.unwrap();
+    assert!(
+        seq.is_some(),
+        "load_account_sequence must find the root account (bug #2357), got None"
+    );
+    // Genesis root starts at seq 0.
+    assert_eq!(seq.unwrap(), 0, "root account initial sequence should be 0");
+
+    // Now close a ledger and check again. The issue description says the bug
+    // appears "after closing several ledgers".
+    let closed = sim
+        .manual_close_all_app_nodes()
+        .await
+        .expect("manual close");
+    assert_eq!(closed, vec![2]);
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while tokio::time::Instant::now() < deadline {
+        if sim.have_all_app_nodes_externalized(2, 0) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(sim.have_all_app_nodes_externalized(2, 0));
+
+    // Check after ledger close
+    let result_after = app.load_account_sequence(&root_account_id);
+    assert!(
+        result_after.is_ok(),
+        "load_account_sequence should not error after close: {:?}",
+        result_after.err()
+    );
+    let seq_after = result_after.unwrap();
+    assert!(
+        seq_after.is_some(),
+        "load_account_sequence must find root account after ledger close (bug #2357)"
+    );
+
+    // Fund app accounts (step 2 in the issue's repro steps).
+    let funded = sim
+        .fund_app_accounts(1_000_000_000)
+        .await
+        .expect("fund app accounts");
+    eprintln!("funded {} accounts", funded);
+
+    // Close several more ledgers (step 3).
+    for target in 3..=6 {
+        sim.manual_close_all_app_nodes()
+            .await
+            .expect("manual close");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while tokio::time::Instant::now() < deadline {
+            if sim.have_all_app_nodes_externalized(target, 0) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            sim.have_all_app_nodes_externalized(target, 0),
+            "timed out waiting for ledger {target}"
+        );
+    }
+
+    // Check after multiple ledger closes (step 4).
+    let result_final = app.load_account_sequence(&root_account_id);
+    assert!(
+        result_final.is_ok(),
+        "load_account_sequence should not error after several closes: {:?}",
+        result_final.err()
+    );
+    let seq_final = result_final.unwrap();
+    assert!(
+        seq_final.is_some(),
+        "load_account_sequence must find root account after several ledger closes (bug #2357)"
+    );
+
+    sim.stop_all_nodes().await.expect("stop nodes");
+}
+
+/// Regression test for #2357 with a pair topology: App::load_account_sequence
+/// must return the root account's sequence number, not Ok(None).
+#[tokio::test]
+async fn test_load_account_sequence_pair_topology() {
+    let mut sim =
+        build_app_backed_topology(Topologies::pair(SimulationMode::OverLoopback), 100).await;
+
+    // Wait for both nodes to be operational.
+    wait_for_app_operational(&sim, "node0", Duration::from_secs(10)).await;
+    wait_for_app_operational(&sim, "node1", Duration::from_secs(10)).await;
+
+    // Close a few ledgers.
+    manual_close_until(&sim, 3, 1, Duration::from_secs(20)).await;
+
+    // Derive root account ID.
+    let network_id = henyey_common::NetworkId::from_passphrase("Test SDF Network ; September 2015");
+    let root_sk = henyey_crypto::SecretKey::from_seed(network_id.as_bytes());
+    let root_pk = root_sk.public_key();
+    let root_account_id =
+        stellar_xdr::curr::AccountId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
+            stellar_xdr::curr::Uint256(*root_pk.as_bytes()),
+        ));
+
+    // Check on both nodes.
+    for node_id in ["node0", "node1"] {
+        let app = sim.app(node_id).expect("app");
+        let result = app.load_account_sequence(&root_account_id);
+        assert!(
+            result.is_ok(),
+            "{node_id}: load_account_sequence error: {:?}",
+            result.err()
+        );
+        let seq = result.unwrap();
+        assert!(
+            seq.is_some(),
+            "{node_id}: load_account_sequence returned None for root account (bug #2357)"
+        );
+    }
+
+    sim.stop_all_nodes().await.expect("stop nodes");
+}
+
 #[tokio::test]
 async fn test_core3_app_simulation_starts_over_tcp() {
     let mut sim = build_app_backed_topology(Topologies::core3(SimulationMode::OverTcp), 67).await;

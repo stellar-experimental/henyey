@@ -1656,6 +1656,8 @@ impl App {
     /// Load the current sequence number for an account from the bucket list.
     ///
     /// Returns `Ok(None)` if the account does not exist.
+    /// Returns `Err(NotInitialized)` if the ledger manager has not been
+    /// initialized yet (or was reset for catchup).
     /// Used by the simulation LoadGenerator to refresh cached sequence numbers.
     pub fn load_account_sequence(
         &self,
@@ -1663,6 +1665,11 @@ impl App {
     ) -> henyey_ledger::Result<Option<i64>> {
         let snapshot = self.ledger_manager.create_snapshot()?;
         let Some(account) = snapshot.get_account(account_id)? else {
+            tracing::debug!(
+                account = %henyey_crypto::account_id_to_strkey(account_id),
+                snapshot_ledger = snapshot.ledger_seq(),
+                "load_account_sequence: account not found in bucket list snapshot"
+            );
             return Ok(None);
         };
         Ok(Some(account.seq_num.0))
