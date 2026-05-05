@@ -30,6 +30,8 @@ use stellar_xdr::curr::{
     AccountEntry, AccountId, LedgerEntry, LedgerEntryData, LedgerHeader, LedgerKey, PoolId,
 };
 
+use crate::execution::SorobanNetworkInfo;
+
 /// Lookup statistics for SnapshotHandle cache layers.
 ///
 /// Tracks hits at each cache layer and fallback lookups. Shared across
@@ -96,20 +98,39 @@ pub struct LedgerSnapshot {
     /// This may be a subset of the full ledger state. Entries not in
     /// this cache can be loaded via the lookup function in SnapshotHandle.
     entries: HashMap<LedgerKey, LedgerEntry>,
+
+    /// Soroban network configuration captured at snapshot creation time.
+    ///
+    /// Paired with `header` — both come from the same atomic state read.
+    /// Callers holding a snapshot MUST use this rather than a fresh
+    /// `LedgerManager::soroban_network_info()` read to avoid TOCTOU races
+    /// with `commit_close()`.
+    ///
+    /// `None` for:
+    /// - Pre-Soroban protocols (ledger_version < 20)
+    /// - Snapshots built without soroban context (close_state, history replay)
+    /// - Uninitialized state
+    soroban_network_info: Option<SorobanNetworkInfo>,
 }
 
 impl LedgerSnapshot {
-    /// Create a new snapshot from a header and entries.
+    /// Create a new snapshot from a header, entries, and optional soroban config.
+    ///
+    /// `soroban_network_info` should be captured from the same state read as
+    /// `header` to guarantee consistency. Pass `None` for snapshots that don't
+    /// need soroban config (e.g., close_state entry lookups, history replay).
     pub fn new(
         header: LedgerHeader,
         header_hash: Hash256,
         entries: HashMap<LedgerKey, LedgerEntry>,
+        soroban_network_info: Option<SorobanNetworkInfo>,
     ) -> Self {
         Self {
             ledger_seq: header.ledger_seq,
             header,
             header_hash,
             entries,
+            soroban_network_info,
         }
     }
 
@@ -141,6 +162,7 @@ impl LedgerSnapshot {
             },
             header_hash: Hash256::ZERO,
             entries: HashMap::new(),
+            soroban_network_info: None,
         }
     }
 
@@ -172,6 +194,19 @@ impl LedgerSnapshot {
     /// Get the base reserve.
     pub fn base_reserve(&self) -> u32 {
         self.header.base_reserve
+    }
+
+    /// Soroban network configuration captured at snapshot creation time.
+    ///
+    /// Paired with `header()` — both come from the same atomic state read
+    /// in `create_snapshot()`. Callers holding a snapshot MUST use this
+    /// rather than a fresh `LedgerManager::soroban_network_info()` read to
+    /// avoid TOCTOU races with `commit_close()`.
+    ///
+    /// Returns `None` for pre-Soroban protocols, snapshots built without
+    /// soroban context, or uninitialized state.
+    pub fn soroban_network_info(&self) -> Option<&SorobanNetworkInfo> {
+        self.soroban_network_info.as_ref()
     }
 
     /// Get the bucket list hash.
@@ -229,6 +264,7 @@ impl Clone for LedgerSnapshot {
             header: self.header.clone(),
             header_hash: self.header_hash,
             entries: self.entries.clone(),
+            soroban_network_info: self.soroban_network_info.clone(),
         }
     }
 }
@@ -508,6 +544,13 @@ impl SnapshotHandle {
         self.inner.header_hash
     }
 
+    /// Soroban network configuration captured at snapshot creation time.
+    ///
+    /// See [`LedgerSnapshot::soroban_network_info`] for invariant details.
+    pub fn soroban_network_info(&self) -> Option<&SorobanNetworkInfo> {
+        self.inner.soroban_network_info()
+    }
+
     /// Look up an entry.
     ///
     /// First checks the snapshot cache, then the prefetch cache, then falls
@@ -656,6 +699,8 @@ pub struct SnapshotBuilder {
     header_hash: Hash256,
     /// Preloaded entries.
     entries: HashMap<LedgerKey, LedgerEntry>,
+    /// Optional soroban network info (defaults to None).
+    soroban_network_info: Option<SorobanNetworkInfo>,
 }
 
 impl SnapshotBuilder {
@@ -666,6 +711,7 @@ impl SnapshotBuilder {
             header: None,
             header_hash: Hash256::ZERO,
             entries: HashMap::new(),
+            soroban_network_info: None,
         }
     }
 
@@ -673,6 +719,15 @@ impl SnapshotBuilder {
     pub fn with_header(mut self, header: LedgerHeader, hash: Hash256) -> Self {
         self.header = Some(header);
         self.header_hash = hash;
+        self
+    }
+
+    /// Set the soroban network info.
+    ///
+    /// Only needed for test snapshots that require soroban config. Production
+    /// snapshots get this populated by `create_snapshot()`.
+    pub fn with_soroban_network_info(mut self, info: SorobanNetworkInfo) -> Self {
+        self.soroban_network_info = Some(info);
         self
     }
 
@@ -704,6 +759,7 @@ impl SnapshotBuilder {
             header,
             header_hash: self.header_hash,
             entries: self.entries,
+            soroban_network_info: self.soroban_network_info,
         })
     }
 
@@ -737,6 +793,7 @@ impl SnapshotBuilder {
             header,
             header_hash: self.header_hash,
             entries: self.entries,
+            soroban_network_info: self.soroban_network_info,
         }
     }
 }
@@ -1316,6 +1373,105 @@ mod tests {
             Arc::strong_count(&shared_data),
             1,
             "after clearing executor and releasing lookups, refcount should be 1"
+        );
+    }
+
+    #[test]
+    fn test_snapshot_soroban_network_info_none_for_empty() {
+        let snapshot = LedgerSnapshot::empty(42);
+        assert!(
+            snapshot.soroban_network_info().is_none(),
+            "empty snapshot should have None soroban_network_info"
+        );
+    }
+
+    #[test]
+    fn test_snapshot_new_with_soroban_info() {
+        use crate::execution::SorobanNetworkInfo;
+
+        let info = SorobanNetworkInfo {
+            ledger_max_tx_count: 123,
+            ..Default::default()
+        };
+        let snapshot = LedgerSnapshot::new(
+            LedgerHeader::default(),
+            Hash256::ZERO,
+            HashMap::new(),
+            Some(info.clone()),
+        );
+
+        let got = snapshot.soroban_network_info().unwrap();
+        assert_eq!(got.ledger_max_tx_count, 123);
+    }
+
+    #[test]
+    fn test_snapshot_clone_preserves_soroban_info() {
+        use crate::execution::SorobanNetworkInfo;
+
+        let info = SorobanNetworkInfo {
+            tx_max_instructions: 999,
+            ..Default::default()
+        };
+        let snapshot = LedgerSnapshot::new(
+            LedgerHeader::default(),
+            Hash256::ZERO,
+            HashMap::new(),
+            Some(info),
+        );
+
+        let cloned = snapshot.clone();
+        assert_eq!(
+            cloned.soroban_network_info().unwrap().tx_max_instructions,
+            999
+        );
+    }
+
+    #[test]
+    fn test_snapshot_builder_with_soroban_info() {
+        use crate::execution::SorobanNetworkInfo;
+
+        let info = SorobanNetworkInfo {
+            ledger_max_instructions: 42,
+            ..Default::default()
+        };
+        let snapshot = SnapshotBuilder::new(10)
+            .with_soroban_network_info(info)
+            .build_with_default_header();
+
+        assert_eq!(
+            snapshot
+                .soroban_network_info()
+                .unwrap()
+                .ledger_max_instructions,
+            42
+        );
+    }
+
+    #[test]
+    fn test_snapshot_builder_default_soroban_info_is_none() {
+        let snapshot = SnapshotBuilder::new(10).build_with_default_header();
+        assert!(snapshot.soroban_network_info().is_none());
+    }
+
+    #[test]
+    fn test_snapshot_handle_soroban_network_info_delegation() {
+        use crate::execution::SorobanNetworkInfo;
+
+        let info = SorobanNetworkInfo {
+            max_contract_size: 777,
+            ..Default::default()
+        };
+        let snapshot = LedgerSnapshot::new(
+            LedgerHeader::default(),
+            Hash256::ZERO,
+            HashMap::new(),
+            Some(info),
+        );
+        let handle = SnapshotHandle::new(snapshot);
+
+        assert_eq!(
+            handle.soroban_network_info().unwrap().max_contract_size,
+            777
         );
     }
 }

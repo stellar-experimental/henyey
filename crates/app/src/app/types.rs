@@ -1612,6 +1612,7 @@ mod tests {
         let snap = HeaderSnapshot {
             header,
             hash: henyey_common::Hash256([42; 32]),
+            soroban_network_info: None,
         };
 
         let summary = LedgerSummary::from_snapshot(&snap, 55);
@@ -1659,6 +1660,7 @@ mod tests {
         let snap = HeaderSnapshot {
             header,
             hash: henyey_common::Hash256([99; 32]),
+            soroban_network_info: None,
         };
 
         let summary = LedgerSummary::from_snapshot(&snap, 0);

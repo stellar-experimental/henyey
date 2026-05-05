@@ -2410,14 +2410,9 @@ impl Herder {
             let ledger_seq = snap.ledger_seq();
             let header_hash = snap.header_hash();
 
-            // Known residual race: soroban_network_info() acquires
-            // state.read() independently from create_snapshot(). If
-            // commit_close() runs between the snapshot creation above
-            // and here, soroban_info may be from a different ledger.
-            // Impact: nomination aborts on self-validation mismatch
-            // (safe). Tracked follow-up: capture soroban_network_info
-            // inside LedgerSnapshot.
-            let soroban_info = self.ledger_manager.soroban_network_info();
+            // Soroban info captured atomically with header inside create_snapshot(),
+            // eliminating the TOCTOU race with commit_close().
+            let soroban_info = snap.soroban_network_info().cloned();
             let soroban_max = soroban_info.as_ref().map(|info| info.ledger_max_tx_count);
 
             // Build seq map from the snapshot (borrows).

@@ -1847,6 +1847,7 @@ mod tests {
             LedgerHeader::default(),
             henyey_common::Hash256::ZERO,
             entries,
+            None,
         );
         let handle = henyey_ledger::SnapshotHandle::new(snapshot);
 

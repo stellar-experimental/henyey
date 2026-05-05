@@ -1261,6 +1261,12 @@ pub struct HeaderSnapshot {
     pub header: LedgerHeader,
     /// SHA-256 hash of the header's XDR encoding.
     pub hash: Hash256,
+    /// Soroban network configuration at the time of the snapshot.
+    ///
+    /// Captured atomically with `header` and `hash` under the same state
+    /// read lock. Use this instead of a separate `soroban_network_info()`
+    /// call to avoid TOCTOU races with `commit_close()`.
+    pub soroban_network_info: Option<SorobanNetworkInfo>,
 }
 
 impl From<&HeaderSnapshot> for henyey_common::protocol::LclContext {
@@ -1527,6 +1533,7 @@ impl LedgerManager {
         HeaderSnapshot {
             header: state.header.clone(),
             hash: state.header_hash,
+            soroban_network_info: state.soroban_network_info.clone(),
         }
     }
 
@@ -2253,7 +2260,17 @@ impl LedgerManager {
         // performance degradation (45ms per ledger once cache filled).
         let entries = HashMap::new();
 
-        let snapshot = LedgerSnapshot::new(state.header.clone(), state.header_hash, entries);
+        // Capture soroban_network_info under the same state read lock as header,
+        // eliminating the TOCTOU race where commit_close() could advance the
+        // ledger between snapshot creation and a separate soroban_network_info() read.
+        let soroban_network_info = state.soroban_network_info.clone();
+
+        let snapshot = LedgerSnapshot::new(
+            state.header.clone(),
+            state.header_hash,
+            entries,
+            soroban_network_info,
+        );
         let ledger_seq = state.header.ledger_seq;
         let state_read_elapsed = t0.elapsed();
 
@@ -8216,6 +8233,87 @@ mod tests {
         let r2 = mgr.soroban_network_info();
         assert_eq!(r1.unwrap().tx_max_instructions, 42);
         assert_eq!(r2.unwrap().ledger_max_tx_count, 99);
+    }
+
+    /// Verify that `create_snapshot()` captures soroban_network_info atomically
+    /// with the header, and that subsequent mutations to the manager's state
+    /// do not affect the already-created snapshot.
+    #[test]
+    fn test_create_snapshot_captures_soroban_info_atomically() {
+        let mgr = LedgerManager::new(
+            "Test SDF Network ; September 2015".into(),
+            LedgerManagerConfig {
+                validate_bucket_hash: false,
+                ..Default::default()
+            },
+        );
+
+        // Initialize the manager so create_snapshot() works.
+        let mut header = create_genesis_header();
+        header.ledger_seq = 1;
+        header.ledger_version = 25;
+        let bucket_list = new_bl_with_config();
+        let hot_archive_bucket_list = henyey_bucket::HotArchiveBucketList::new();
+        let header_hash = crate::compute_header_hash(&header).expect("hash");
+        mgr.initialize(
+            bucket_list,
+            hot_archive_bucket_list,
+            header.clone(),
+            header_hash,
+        )
+        .unwrap();
+
+        // Set soroban_network_info to a known value.
+        let mut info = SorobanNetworkInfo::default();
+        info.ledger_max_tx_count = 42;
+        mgr.set_soroban_network_info_for_test(info);
+
+        // Create a snapshot — it should capture the current soroban_info.
+        let snapshot = mgr.create_snapshot().unwrap();
+        assert_eq!(
+            snapshot.soroban_network_info().unwrap().ledger_max_tx_count,
+            42,
+            "snapshot should capture the soroban_info at creation time"
+        );
+
+        // Mutate the manager's state after the snapshot was created.
+        let mut new_info = SorobanNetworkInfo::default();
+        new_info.ledger_max_tx_count = 999;
+        mgr.set_soroban_network_info_for_test(new_info);
+
+        // The snapshot should still have the original value.
+        assert_eq!(
+            snapshot.soroban_network_info().unwrap().ledger_max_tx_count,
+            42,
+            "snapshot soroban_info must be isolated from later state mutations"
+        );
+
+        // The manager's fresh read should see the new value.
+        assert_eq!(mgr.soroban_network_info().unwrap().ledger_max_tx_count, 999);
+    }
+
+    /// Verify that `header_snapshot()` captures soroban_network_info atomically.
+    #[test]
+    fn test_header_snapshot_includes_soroban_info() {
+        let mgr = LedgerManager::new(
+            "Test SDF Network ; September 2015".into(),
+            LedgerManagerConfig::default(),
+        );
+
+        // Set soroban_network_info.
+        let mut info = SorobanNetworkInfo::default();
+        info.tx_max_instructions = 500;
+        {
+            let mut state = mgr.state.write();
+            state.soroban_network_info = Some(info);
+        }
+
+        let snap = mgr.header_snapshot();
+        assert_eq!(
+            snap.soroban_network_info.unwrap().tx_max_instructions,
+            500,
+            "header_snapshot should include soroban_network_info"
+        );
     }
 
     /// Regression test: `set_header_version_for_test()` must recompute the

@@ -715,7 +715,9 @@ impl ScpDriver {
             if !protocol_version_starts_from(lcl_header.ledger_version, ProtocolVersion::V20) {
                 true
             } else {
-                let soroban_info = self.ledger_manager.soroban_network_info();
+                // Use soroban_info from the snapshot (captured atomically with
+                // header) to avoid TOCTOU race with commit_close().
+                let soroban_info = providers.snapshot().soroban_network_info().cloned();
                 prepared
                     .check_valid(
                         lcl_header,
@@ -3290,9 +3292,11 @@ impl SCPDriver for HerderScpCallback {
         let mut initial_ms: u64 = 1000;
         let mut increment_ms: u64 = 1000;
         {
-            let header = self.driver.ledger_manager.current_header();
-            if protocol_version_starts_from(header.ledger_version, ProtocolVersion::V23) {
-                if let Some(info) = self.driver.ledger_manager.soroban_network_info() {
+            // Read header and soroban_info atomically via header_snapshot()
+            // to avoid TOCTOU race with commit_close().
+            let snap = self.driver.ledger_manager.header_snapshot();
+            if protocol_version_starts_from(snap.header.ledger_version, ProtocolVersion::V23) {
+                if let Some(info) = &snap.soroban_network_info {
                     if is_nomination {
                         initial_ms = info.nomination_timeout_initial_ms as u64;
                         increment_ms = info.nomination_timeout_increment_ms as u64;

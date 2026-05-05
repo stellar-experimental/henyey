@@ -392,6 +392,7 @@ mod tests {
             header,
             henyey_common::Hash256::ZERO,
             std::collections::HashMap::new(),
+            None,
         );
         SnapshotHandle::new(snapshot)
     }
@@ -405,7 +406,7 @@ mod tests {
         let key = henyey_common::entry_to_key(&entry);
         let mut entries = std::collections::HashMap::new();
         entries.insert(key, entry);
-        let snapshot = LedgerSnapshot::new(header, henyey_common::Hash256::ZERO, entries);
+        let snapshot = LedgerSnapshot::new(header, henyey_common::Hash256::ZERO, entries, None);
         SnapshotHandle::new(snapshot)
     }
 
