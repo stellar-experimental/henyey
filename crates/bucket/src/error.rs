@@ -70,4 +70,13 @@ pub enum BucketError {
     /// - Too many hash collisions during construction
     #[error("bloom filter error: {0}")]
     BloomFilter(String),
+
+    /// Bucket data is structurally corrupt.
+    ///
+    /// Returned when loading a bucket from disk or raw bytes reveals that
+    /// entries are not strictly sorted, contain duplicate keys, or violate
+    /// the metadata-prefix invariant. Distinct from `Merge` (construction-
+    /// time failures) — this variant covers load-time validation only.
+    #[error("bucket corruption: {0}")]
+    Corruption(String),
 }

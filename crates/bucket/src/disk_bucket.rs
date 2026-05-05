@@ -134,6 +134,8 @@ struct StreamingXdrEntryIterator {
     records: crate::record::RecordMarkedReader<BufReader<File>>,
     /// Optional hasher for computing bucket hash during iteration.
     hasher: Option<Sha256>,
+    /// Validates that entries are strictly sorted with no duplicates.
+    validator: crate::entry::StreamingSortedValidator,
     /// Number of records read (including those that failed to parse).
     record_count: usize,
     failed: bool,
@@ -149,6 +151,7 @@ impl StreamingXdrEntryIterator {
             } else {
                 None
             },
+            validator: crate::entry::StreamingSortedValidator::new(),
             record_count: 0,
             failed: false,
         })
@@ -205,6 +208,13 @@ impl Iterator for StreamingXdrEntryIterator {
                         ))));
                     }
                 };
+
+            // Validate sorted-unique invariant before filtering metadata
+            if let Err(e) = self.validator.validate(&xdr_entry) {
+                self.failed = true;
+                return Some(Err(e));
+            }
+
             if xdr_entry.key().is_some() {
                 return Some(Ok((xdr_entry, record.offset)));
             }
@@ -336,6 +346,16 @@ impl DiskBucket {
     /// This is used when loading a persisted index from disk, avoiding the
     /// expensive 2-pass streaming build. The caller is responsible for ensuring
     /// that the index matches the bucket file contents.
+    ///
+    /// # Trust model
+    ///
+    /// This path trusts the persisted index's semantic correctness (key ordering,
+    /// offset accuracy). It verifies the bucket file's content hash against the
+    /// expected hash, confirming the file hasn't changed since it was first loaded
+    /// by `from_file_streaming_with_seed` (which validates sort order). If the
+    /// persisted index was built from a valid file and the file hash still matches,
+    /// the bucket data is consistent. The persisted index file itself is
+    /// integrity-checked during deserialization (see `index_persistence.rs`).
     ///
     /// # Arguments
     ///
@@ -1221,5 +1241,101 @@ mod tests {
             Err(other) => panic!("Expected HashMismatch, got: {:?}", other),
             Ok(_) => panic!("Expected error, got Ok"),
         }
+    }
+
+    /// Build raw XDR bytes for a single account entry with the given key byte.
+    fn make_entry_bytes(key_byte: u8) -> Vec<u8> {
+        use stellar_xdr::curr::WriteXdr;
+
+        let account = AccountEntry {
+            account_id: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([key_byte; 32]))),
+            balance: 100,
+            seq_num: SequenceNumber(1),
+            num_sub_entries: 0,
+            inflation_dest: None,
+            flags: 0,
+            home_domain: String32::default(),
+            thresholds: Thresholds([1, 0, 0, 0]),
+            signers: Vec::new().try_into().unwrap(),
+            ext: AccountEntryExt::V0,
+        };
+        let entry = LedgerEntry {
+            last_modified_ledger_seq: 1,
+            data: LedgerEntryData::Account(account),
+            ext: LedgerEntryExt::V0,
+        };
+        let bucket_entry = stellar_xdr::curr::BucketEntry::Liveentry(entry);
+        let entry_bytes = bucket_entry.to_xdr(Limits::none()).unwrap();
+
+        let mut bytes = Vec::new();
+        let record_mark = (entry_bytes.len() as u32) | crate::XDR_RECORD_MARK;
+        bytes.extend_from_slice(&record_mark.to_be_bytes());
+        bytes.extend_from_slice(&entry_bytes);
+        bytes
+    }
+
+    #[test]
+    fn test_streaming_loader_rejects_unsorted_entries() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("unsorted.bucket");
+
+        // Write entries out of order: key [2] then key [1]
+        let mut file_bytes = Vec::new();
+        file_bytes.extend(make_entry_bytes(2));
+        file_bytes.extend(make_entry_bytes(1));
+        std::fs::write(&path, &file_bytes).unwrap();
+
+        let result = DiskBucket::from_file_streaming(&path);
+        assert!(
+            result.is_err(),
+            "streaming loader should reject unsorted entries"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("corruption"),
+            "Expected corruption error, got: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn test_streaming_loader_rejects_duplicate_keys() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("duplicates.bucket");
+
+        // Write duplicate keys: key [1] twice
+        let mut file_bytes = Vec::new();
+        file_bytes.extend(make_entry_bytes(1));
+        file_bytes.extend(make_entry_bytes(1));
+        std::fs::write(&path, &file_bytes).unwrap();
+
+        let result = DiskBucket::from_file_streaming(&path);
+        assert!(
+            result.is_err(),
+            "streaming loader should reject duplicate keys"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("corruption"),
+            "Expected corruption error, got: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn test_streaming_loader_accepts_sorted_entries() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("sorted.bucket");
+
+        // Write entries in correct order: key [1] then key [2]
+        let mut file_bytes = Vec::new();
+        file_bytes.extend(make_entry_bytes(1));
+        file_bytes.extend(make_entry_bytes(2));
+        std::fs::write(&path, &file_bytes).unwrap();
+
+        let result = DiskBucket::from_file_streaming(&path);
+        assert!(
+            result.is_ok(),
+            "streaming loader should accept sorted entries"
+        );
+        assert_eq!(result.unwrap().len(), 2);
     }
 }

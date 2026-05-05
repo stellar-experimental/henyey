@@ -30,7 +30,6 @@
 //! to share across threads. The disk-backed mode uses file handles that are opened
 //! fresh for each operation to avoid contention.
 
-use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -279,24 +278,27 @@ impl Bucket {
     /// * `entries` - All entries including metadata, already sorted
     /// * `key_index` - Pre-built key index mapping serialized keys to entry indices
     /// * `metadata_count` - Number of metadata entries at the start (0 or 1)
+    ///
+    /// # Errors
+    ///
+    /// Returns `BucketError::Corruption` if entries are not strictly sorted
+    /// or violate the metadata-prefix invariant.
     pub fn from_parts(
         hash: Hash256,
         entries: Arc<Vec<BucketEntry>>,
         key_index: Arc<HashMap<LedgerKey, usize>>,
         metadata_count: usize,
-    ) -> Self {
-        debug_assert!(
-            entries
-                .windows(2)
-                .all(|w| crate::entry::compare_entries(&w[0], &w[1]) == Ordering::Less),
-            "from_parts: entries not strictly sorted (duplicate or out-of-order key)"
-        );
-        Self {
+    ) -> Result<Self> {
+        // Validate sorted-unique invariant in release mode (was debug_assert! only)
+        let mut validator = crate::entry::StreamingSortedValidator::new();
+        for entry in entries.iter() {
+            validator.validate(entry)?;
+        }
+        Ok(Self {
             hash,
             storage: BucketStorage::InMemory { entries, key_index },
-            // Use shared state - entries are already in storage, just need to skip metadata
             level_zero_state: LevelZeroState::SharedWithStorage { metadata_count },
-        }
+        })
     }
 
     /// Create a "shell" bucket for immediate in-memory merging.
@@ -454,6 +456,17 @@ impl Bucket {
     /// Internal method to create a bucket with optional key index building.
     fn from_xdr_bytes_internal(bytes: &[u8], build_index: bool) -> Result<Self> {
         let entries = Self::parse_entries(bytes)?;
+
+        // Validate sorted-unique invariant on loaded data.
+        // Construction paths validate via assert_sorted_no_duplicates; load
+        // paths use StreamingSortedValidator (returns Corruption, not Merge).
+        {
+            use crate::entry::StreamingSortedValidator;
+            let mut validator = StreamingSortedValidator::new();
+            for entry in &entries {
+                validator.validate(entry)?;
+            }
+        }
 
         // Build key index only if requested (skip during catchup for memory efficiency)
         let key_index = if build_index {
@@ -1823,5 +1836,72 @@ mod tests {
             result.is_err(),
             "parse_entries should reject raw XDR without record marks"
         );
+    }
+
+    #[test]
+    fn test_from_xdr_bytes_rejects_unsorted() {
+        // Create entries out of order: [2, 1] instead of [1, 2]
+        let entry_high = BucketEntry::Liveentry(make_account_entry([2u8; 32], 100));
+        let entry_low = BucketEntry::Liveentry(make_account_entry([1u8; 32], 100));
+
+        // Serialize in wrong order
+        let bytes = Bucket::serialize_entries(&[entry_high, entry_low]).unwrap();
+
+        let result = Bucket::from_xdr_bytes(&bytes);
+        assert!(
+            result.is_err(),
+            "from_xdr_bytes should reject unsorted entries"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("corruption"),
+            "Expected corruption error, got: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn test_from_xdr_bytes_rejects_duplicate_keys() {
+        let entry1 = BucketEntry::Liveentry(make_account_entry([1u8; 32], 100));
+        let entry2 = BucketEntry::Liveentry(make_account_entry([1u8; 32], 200));
+
+        let bytes = Bucket::serialize_entries(&[entry1, entry2]).unwrap();
+
+        let result = Bucket::from_xdr_bytes(&bytes);
+        assert!(
+            result.is_err(),
+            "from_xdr_bytes should reject duplicate keys"
+        );
+    }
+
+    #[test]
+    fn test_from_parts_rejects_unsorted() {
+        let entry_high = BucketEntry::Liveentry(make_account_entry([2u8; 32], 100));
+        let entry_low = BucketEntry::Liveentry(make_account_entry([1u8; 32], 100));
+
+        let entries = Arc::new(vec![entry_high, entry_low]);
+        let key_index = Arc::new(HashMap::new());
+
+        let result = Bucket::from_parts(Hash256::ZERO, entries, key_index, 0);
+        assert!(
+            result.is_err(),
+            "from_parts should reject unsorted entries in release mode"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("corruption"),
+            "Expected corruption error, got: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn test_from_parts_accepts_sorted() {
+        let entry1 = BucketEntry::Liveentry(make_account_entry([1u8; 32], 100));
+        let entry2 = BucketEntry::Liveentry(make_account_entry([2u8; 32], 100));
+
+        let entries = Arc::new(vec![entry1, entry2]);
+        let key_index = Arc::new(HashMap::new());
+
+        let result = Bucket::from_parts(Hash256::ZERO, entries, key_index, 0);
+        assert!(result.is_ok(), "from_parts should accept sorted entries");
     }
 }

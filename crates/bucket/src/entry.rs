@@ -204,6 +204,64 @@ pub fn assert_sorted_no_duplicates(entries: &[BucketEntry]) -> Result<()> {
     Ok(())
 }
 
+/// Streaming validator for the bucket sorted-unique invariant.
+///
+/// Validates entries one at a time as they are streamed, enforcing:
+/// - **Metadata prefix**: at most one metadata entry, and only at position 0
+/// - **Strict key ordering**: keyed entries must be strictly ascending
+/// - **No metadata after keys**: once a keyed entry is seen, metadata is rejected
+///
+/// Used by load paths (`from_xdr_bytes_internal`, `StreamingXdrEntryIterator`)
+/// to validate bucket data from disk or archives without buffering the full set.
+pub struct StreamingSortedValidator {
+    prev_key: Option<LedgerKey>,
+    seen_keyed: bool,
+    seen_metadata: bool,
+}
+
+impl StreamingSortedValidator {
+    /// Create a new validator in its initial state.
+    pub fn new() -> Self {
+        Self {
+            prev_key: None,
+            seen_keyed: false,
+            seen_metadata: false,
+        }
+    }
+
+    /// Validate the next entry in the stream.
+    ///
+    /// Returns `Err(BucketError::Corruption)` if the entry violates the
+    /// sorted-unique invariant relative to previously validated entries.
+    pub fn validate(&mut self, entry: &BucketEntry) -> Result<()> {
+        match entry.key() {
+            Some(key) => {
+                self.seen_keyed = true;
+                if let Some(ref prev) = self.prev_key {
+                    if compare_keys(prev, &key) != Ordering::Less {
+                        return Err(BucketError::Corruption(
+                            "entries not strictly sorted: duplicate or out-of-order key".into(),
+                        ));
+                    }
+                }
+                self.prev_key = Some(key);
+            }
+            None => {
+                if self.seen_keyed {
+                    return Err(BucketError::Corruption(
+                        "metadata entry found after keyed entries".into(),
+                    ));
+                }
+                if self.seen_metadata {
+                    return Err(BucketError::Corruption("duplicate metadata entry".into()));
+                }
+                self.seen_metadata = true;
+            }
+        }
+        Ok(())
+    }
+}
+
 // ============================================================================
 // Eviction helper functions (Soroban State Archival)
 // ============================================================================
@@ -387,6 +445,102 @@ mod tests {
         assert_eq!(
             compare_keys(&trustline_key, &account_key),
             Ordering::Greater
+        );
+    }
+
+    // ========================================================================
+    // StreamingSortedValidator tests
+    // ========================================================================
+
+    fn make_live_entry(id: u8) -> BucketEntry {
+        BucketEntry::Liveentry(make_account_entry([id; 32]))
+    }
+
+    fn make_metadata() -> BucketEntry {
+        BucketEntry::Metaentry(BucketMetadata {
+            ledger_version: 22,
+            ext: BucketMetadataExt::V0,
+        })
+    }
+
+    #[test]
+    fn test_streaming_validator_accepts_empty() {
+        // Empty bucket — no calls to validate
+        let _validator = StreamingSortedValidator::new();
+        // No entries, no error
+    }
+
+    #[test]
+    fn test_streaming_validator_accepts_metadata_only() {
+        let mut validator = StreamingSortedValidator::new();
+        validator.validate(&make_metadata()).unwrap();
+    }
+
+    #[test]
+    fn test_streaming_validator_accepts_keys_only() {
+        let mut validator = StreamingSortedValidator::new();
+        validator.validate(&make_live_entry(1)).unwrap();
+        validator.validate(&make_live_entry(2)).unwrap();
+        validator.validate(&make_live_entry(3)).unwrap();
+    }
+
+    #[test]
+    fn test_streaming_validator_accepts_metadata_then_keys() {
+        let mut validator = StreamingSortedValidator::new();
+        validator.validate(&make_metadata()).unwrap();
+        validator.validate(&make_live_entry(1)).unwrap();
+        validator.validate(&make_live_entry(2)).unwrap();
+    }
+
+    #[test]
+    fn test_streaming_validator_rejects_duplicate_keys() {
+        let mut validator = StreamingSortedValidator::new();
+        validator.validate(&make_live_entry(1)).unwrap();
+        let result = validator.validate(&make_live_entry(1));
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("not strictly sorted"),
+            "Expected 'not strictly sorted' in error: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn test_streaming_validator_rejects_out_of_order() {
+        let mut validator = StreamingSortedValidator::new();
+        validator.validate(&make_live_entry(5)).unwrap();
+        let result = validator.validate(&make_live_entry(3));
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("not strictly sorted"),
+            "Expected 'not strictly sorted' in error: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn test_streaming_validator_rejects_metadata_after_keys() {
+        let mut validator = StreamingSortedValidator::new();
+        validator.validate(&make_live_entry(1)).unwrap();
+        let result = validator.validate(&make_metadata());
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("metadata entry found after keyed entries"),
+            "Expected 'metadata entry found after keyed entries' in error: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn test_streaming_validator_rejects_duplicate_metadata() {
+        let mut validator = StreamingSortedValidator::new();
+        validator.validate(&make_metadata()).unwrap();
+        let result = validator.validate(&make_metadata());
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("duplicate metadata"),
+            "Expected 'duplicate metadata' in error: {err_msg}"
         );
     }
 }

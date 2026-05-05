@@ -692,12 +692,12 @@ pub fn merge_in_memory(
 
     // Create bucket directly with pre-computed hash
     // Use shared level zero state - no cloning needed!
-    Ok(Bucket::from_parts(
+    Bucket::from_parts(
         hash,
         Arc::new(all_entries),
         Arc::new(key_index),
         metadata_count,
-    ))
+    )
 }
 
 struct ShadowCursor<'a> {
