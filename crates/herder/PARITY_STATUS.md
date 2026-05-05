@@ -20,7 +20,7 @@
 | TxQueueLimiter | Partial | `visitTopTxs` custom limits implemented; missing total flood resource tracking |
 | TxSetFrame / ApplicableTxSetFrame | Partial | No ApplicableTxSetFrame abstraction |
 | SurgePricingUtils | Full | All lane configs and priority queue; `erase()` guard matches `releaseAssert(res <= mLaneCurrentCount[lane])` |
-| Upgrades / ConfigUpgradeSetFrame | Partial | `isConsistentWith`, `encodeAsString`, `toJson` not implemented; proposal gating via `ConfigUpgradeContext` is now at parity |
+| Upgrades / ConfigUpgradeSetFrame | Partial | `isConsistentWith`, `encodeAsString`, `toJson` not implemented; proposal gating via `ConfigUpgradeContext` is now at parity; `extractValidValue` upgrade filtering now matches stellar-core (no spurious ordering enforcement) |
 | QuorumIntersectionChecker | Full | SCC decomposition + MinQuorumEnumerator with interrupt support |
 | ParallelTxSetBuilder | Full | Implemented in parallel_tx_set_builder.rs |
 | FilteredEntries | None | Not implemented (trivial) |

@@ -1579,9 +1579,11 @@ impl ScpDriver {
             return None;
         }
 
-        // Parity: strip invalid upgrades, keeping valid ones in order
-        // Also validates each upgrade via isValid (apply + nomination)
-        // stellar-core: extractValidValue calls isValid with nomination=true
+        // Parity: strip individually-invalid upgrades but do NOT enforce ordering.
+        // stellar-core's extractValidValue (HerderSCPDriver.cpp:434-444) only calls
+        // isValid per upgrade and erases invalid ones — ordering is enforced only in
+        // validateValue (via check_upgrade_ordering). The returned value may still fail
+        // validateValue due to ordering; that is intentional.
         // Read header once to avoid split reads between ledger_version and close_time.
         let lcl_header = self.ledger_manager.current_header();
         let current_version = lcl_header.ledger_version;
@@ -1589,32 +1591,12 @@ impl ScpDriver {
         // to prevent one-ledger-early activation (#1166).
         let lcl_close_time = lcl_header.scp_value.close_time.0;
         let mut valid_upgrades = Vec::new();
-        let mut last_upgrade_type = None;
         for upgrade_bytes in stellar_value.upgrades.iter() {
             if let Ok(upgrade) = LedgerUpgrade::from_xdr(
                 upgrade_bytes.0.as_slice(),
                 stellar_xdr::curr::Limits::none(),
             ) {
-                let upgrade_type = Self::upgrade_type_order(&upgrade);
-                // Only keep if in strictly increasing order and valid for apply
-                let in_order = last_upgrade_type
-                    .map(|prev| upgrade_type > prev)
-                    .unwrap_or(true);
-                let valid_for_apply = Self::is_valid_upgrade_for_apply(
-                    &upgrade,
-                    current_version,
-                    &self.ledger_manager,
-                );
-                // Also check nomination validity (timing + parameter match)
-                let valid_for_nomination = if let Some(upgrades_arc) = self.upgrades.get() {
-                    upgrades_arc
-                        .read()
-                        .is_valid_for_nomination(&upgrade, lcl_close_time)
-                } else {
-                    true // No upgrade config — can't filter
-                };
-                if in_order && valid_for_apply && valid_for_nomination {
-                    last_upgrade_type = Some(upgrade_type);
+                if self.is_upgrade_valid(&upgrade, current_version, lcl_close_time, true) {
                     valid_upgrades.push(upgrade_bytes.clone());
                 }
             }
@@ -1631,6 +1613,37 @@ impl ScpDriver {
         } else {
             Some(value.clone())
         }
+    }
+
+    /// Check whether a single decoded upgrade is valid for apply (and optionally nomination).
+    ///
+    /// Used by both `extract_valid_value_impl` (filter mode — skip invalid) and
+    /// `check_upgrades_valid` (reject mode — fail on first invalid). Callers supply
+    /// `current_version` and `lcl_close_time` from their own `current_header()` snapshot.
+    ///
+    /// When `nomination` is true and `self.upgrades` is unset (`None`), the nomination
+    /// check defaults to permissive (upgrade passes).
+    fn is_upgrade_valid(
+        &self,
+        upgrade: &LedgerUpgrade,
+        current_version: u32,
+        lcl_close_time: u64,
+        nomination: bool,
+    ) -> bool {
+        if !Self::is_valid_upgrade_for_apply(upgrade, current_version, &self.ledger_manager) {
+            return false;
+        }
+        if nomination {
+            if let Some(upgrades_arc) = self.upgrades.get() {
+                if !upgrades_arc
+                    .read()
+                    .is_valid_for_nomination(upgrade, lcl_close_time)
+                {
+                    return false;
+                }
+            }
+        }
+        true
     }
 
     /// Check that all upgrades in a StellarValue are valid.
@@ -1653,18 +1666,8 @@ impl ScpDriver {
                 Ok(u) => u,
                 Err(_) => return false,
             };
-            if !Self::is_valid_upgrade_for_apply(&upgrade, current_version, &self.ledger_manager) {
-                debug!(?upgrade, "Invalid upgrade for apply");
+            if !self.is_upgrade_valid(&upgrade, current_version, lcl_close_time, nomination) {
                 return false;
-            }
-            if nomination {
-                if let Some(upgrades_arc) = self.upgrades.get() {
-                    let upgrades = upgrades_arc.read();
-                    if !upgrades.is_valid_for_nomination(&upgrade, lcl_close_time) {
-                        debug!(?upgrade, "Invalid upgrade for nomination");
-                        return false;
-                    }
-                }
             }
         }
         true
@@ -4285,7 +4288,7 @@ mod tests {
 
     #[test]
     fn test_extract_valid_value_strips_invalid_upgrades() {
-        // Parity: extractValidValue strips invalid upgrades
+        // Parity: extractValidValue strips truly invalid upgrades (e.g., BaseFee(0))
         let driver = make_test_driver();
         let lcl_hash = driver.ledger_manager.current_header_hash();
 
@@ -4298,14 +4301,58 @@ mod tests {
             .unwrap_or_default()
             .as_secs();
 
-        // Create value with an invalid upgrade + a valid upgrade
+        // BaseFee(0) is invalid for apply; Version(25) is valid
+        let invalid_fee = LedgerUpgrade::BaseFee(0)
+            .to_xdr(Limits::none())
+            .expect("xdr");
         let version = LedgerUpgrade::Version(25)
             .to_xdr(Limits::none())
             .expect("xdr");
+        let upgrades = vec![
+            UpgradeType(invalid_fee.try_into().unwrap()),
+            UpgradeType(version.try_into().unwrap()),
+        ];
+
+        let stellar_value = StellarValue {
+            tx_set_hash: stellar_xdr::curr::Hash(tx_set_hash.0),
+            close_time: TimePoint(now),
+            upgrades: upgrades.try_into().unwrap(),
+            ext: StellarValueExt::Basic,
+        };
+        let value = encode_sv(&stellar_value);
+
+        let result = driver.extract_valid_value_impl(1, &value);
+        assert!(result.is_some());
+
+        // Only the valid upgrade (Version(25)) should remain
+        let result_sv =
+            StellarValue::from_xdr(&result.unwrap(), Limits::none()).expect("decode result");
+        assert_eq!(result_sv.upgrades.len(), 1);
+    }
+
+    #[test]
+    fn test_extract_valid_value_keeps_out_of_order_valid_upgrades() {
+        // Parity: extractValidValue does NOT enforce ordering (HerderSCPDriver.cpp:434-444).
+        // Out-of-order but individually-valid upgrades are all kept.
+        let driver = make_test_driver();
+        let lcl_hash = driver.ledger_manager.current_header_hash();
+
+        let tx_set = TransactionSet::new(lcl_hash, vec![]);
+        let tx_set_hash = *tx_set.hash();
+        driver.cache_tx_set(tx_set);
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        // BaseFee (order 1) before Version (order 0) — out of order but both valid
         let base_fee = LedgerUpgrade::BaseFee(200)
             .to_xdr(Limits::none())
             .expect("xdr");
-        // Wrong order: base_fee (order 1) before version (order 0) -> invalid
+        let version = LedgerUpgrade::Version(25)
+            .to_xdr(Limits::none())
+            .expect("xdr");
         let upgrades = vec![
             UpgradeType(base_fee.try_into().unwrap()),
             UpgradeType(version.try_into().unwrap()),
@@ -4319,15 +4366,99 @@ mod tests {
         };
         let value = encode_sv(&stellar_value);
 
-        // extractValidValue should strip the out-of-order upgrade
         let result = driver.extract_valid_value_impl(1, &value);
         assert!(result.is_some());
 
-        // The result should only have the first upgrade (base_fee at order 1)
-        // since version (order 0) is out of order after base_fee
+        // Both upgrades should be kept — no ordering enforcement in extract path
         let result_sv =
             StellarValue::from_xdr(&result.unwrap(), Limits::none()).expect("decode result");
-        assert_eq!(result_sv.upgrades.len(), 1);
+        assert_eq!(result_sv.upgrades.len(), 2);
+    }
+
+    #[test]
+    fn test_extract_valid_value_keeps_duplicate_type_upgrades() {
+        // Parity: extractValidValue keeps duplicate-type upgrades that are individually valid.
+        // stellar-core's isValid in extract path doesn't reject duplicates.
+        let driver = make_test_driver();
+        let lcl_hash = driver.ledger_manager.current_header_hash();
+
+        let tx_set = TransactionSet::new(lcl_hash, vec![]);
+        let tx_set_hash = *tx_set.hash();
+        driver.cache_tx_set(tx_set);
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        // Two BaseFee upgrades — same type, both valid (non-zero)
+        let fee1 = LedgerUpgrade::BaseFee(200)
+            .to_xdr(Limits::none())
+            .expect("xdr");
+        let fee2 = LedgerUpgrade::BaseFee(300)
+            .to_xdr(Limits::none())
+            .expect("xdr");
+        let upgrades = vec![
+            UpgradeType(fee1.try_into().unwrap()),
+            UpgradeType(fee2.try_into().unwrap()),
+        ];
+
+        let stellar_value = StellarValue {
+            tx_set_hash: stellar_xdr::curr::Hash(tx_set_hash.0),
+            close_time: TimePoint(now),
+            upgrades: upgrades.try_into().unwrap(),
+            ext: StellarValueExt::Basic,
+        };
+        let value = encode_sv(&stellar_value);
+
+        let result = driver.extract_valid_value_impl(1, &value);
+        assert!(result.is_some());
+
+        // Both kept — extractValidValue doesn't enforce uniqueness or ordering
+        let result_sv =
+            StellarValue::from_xdr(&result.unwrap(), Limits::none()).expect("decode result");
+        assert_eq!(result_sv.upgrades.len(), 2);
+    }
+
+    #[test]
+    fn test_validate_value_still_rejects_out_of_order_upgrades() {
+        // Regression: validate_value_impl (via check_upgrade_ordering) still
+        // rejects values with out-of-order upgrades after the extract path fix.
+        let driver = make_test_driver();
+        let lcl_hash = driver.ledger_manager.current_header_hash();
+
+        let tx_set = TransactionSet::new(lcl_hash, vec![]);
+        let tx_set_hash = *tx_set.hash();
+        driver.cache_tx_set(tx_set);
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        // BaseFee (order 1) before Version (order 0) — out of order
+        let base_fee = LedgerUpgrade::BaseFee(200)
+            .to_xdr(Limits::none())
+            .expect("xdr");
+        let version = LedgerUpgrade::Version(25)
+            .to_xdr(Limits::none())
+            .expect("xdr");
+        let upgrades = vec![
+            UpgradeType(base_fee.try_into().unwrap()),
+            UpgradeType(version.try_into().unwrap()),
+        ];
+
+        let stellar_value = StellarValue {
+            tx_set_hash: stellar_xdr::curr::Hash(tx_set_hash.0),
+            close_time: TimePoint(now),
+            upgrades: upgrades.try_into().unwrap(),
+            ext: StellarValueExt::Basic,
+        };
+        let value = encode_sv(&stellar_value);
+
+        // validate_value_impl should reject this (ordering enforced there)
+        let result = driver.validate_value_impl(1, &value, true);
+        assert_ne!(result, ValueValidation::Valid);
     }
 
     #[test]
