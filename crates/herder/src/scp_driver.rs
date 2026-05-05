@@ -2520,8 +2520,8 @@ impl ScpDriver {
         self.cleanup_old_pending_slots(slot);
 
         // NOTE: We intentionally do NOT clear qset_tracker here.
-        // Quorum sets are not slot-scoped — they map node_id → quorum_set
-        // and are bounded by the number of active validators (~30).
+        // Quorum sets are not slot-scoped — they are bounded at 10,000
+        // entries via RandomEvictionCache (see MAX_VALIDATED_QSETS).
         // Clearing them here breaks heard_from_quorum() because is_quorum()
         // needs get_quorum_set(node_id) to return Some for remote nodes.
         // See #1874.
