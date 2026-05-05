@@ -42,7 +42,7 @@ cleanup  # ensure fresh state
 mkdir -p "$TEST_ROOT"
 
 # ── TAP state ────────────────────────────────────────────────────────────────
-TAP_PLAN=52
+TAP_PLAN=53
 TAP_CURRENT=0
 TAP_FAILURES=0
 
@@ -858,14 +858,18 @@ run_tests() {
       "Check 12b should reference '$snapshot_file', not ratio_snapshot"
   fi
 
-  # Test 45: Excluded from watcher mode (monitor-tick)
-  if echo "$watcher_section" | grep -Fq 'Check 12b' \
-     && echo "$watcher_section" | grep -iq 'skip' \
-     && echo "$watcher_section" | grep -Fq 'recovery_stalled'; then
-    tap_ok "check-12b-semantics: watcher mode excludes Check 12b + recovery_stalled"
+  # Test 45: Excluded from watcher mode (monitor-tick, driven from TOML mode=validator)
+  if [[ "$mode_val" == "validator" ]]; then
+    if echo "$watcher_section" | grep -Fq 'Check 12b' \
+       && echo "$watcher_section" | grep -iq 'skip' \
+       && echo "$watcher_section" | grep -Fq 'recovery_stalled'; then
+      tap_ok "check-12b-semantics: watcher mode excludes Check 12b (mode=$mode_val)"
+    else
+      tap_not_ok "check-12b-semantics: watcher mode excludes Check 12b (mode=$mode_val)" \
+        "Watcher section must skip Check 12b and omit recovery_stalled line"
+    fi
   else
-    tap_not_ok "check-12b-semantics: watcher mode excludes Check 12b + recovery_stalled" \
-      "Watcher section must skip Check 12b and omit recovery_stalled line"
+    tap_ok "check-12b-semantics: watcher exclusion (mode=$mode_val, not validator — N/A)"
   fi
 
   # Test 46: Excluded from metrics: aggregate (NOT counted)
@@ -885,8 +889,9 @@ run_tests() {
   fi
 
   # Test 48: Cross-file — monitor-loop table row matches TOML values (row-specific)
+  # Use metric_label from TOML to select the row (not hardcoded)
   local recovery_row
-  recovery_row=$(echo "$loop_streak_table" | grep 'forcing_catchup_behind' || true)
+  recovery_row=$(echo "$loop_streak_table" | grep -F "$metric_label" || true)
   if [[ -n "$recovery_row" ]] \
      && echo "$recovery_row" | grep -Fq "${streak_val} ticks" \
      && echo "$recovery_row" | grep -Fq "≥ ${burst_val}" \
@@ -894,7 +899,7 @@ run_tests() {
     tap_ok "check-12b-semantics: monitor-loop table row + snapshot match TOML"
   else
     tap_not_ok "check-12b-semantics: monitor-loop table row + snapshot match TOML" \
-      "Expected forcing_catchup_behind row with '${streak_val} ticks', '≥ ${burst_val}', and '$snapshot_file'"
+      "Expected row with '$metric_label' containing '${streak_val} ticks', '≥ ${burst_val}', and '$snapshot_file' in snapshot"
   fi
 
   # Test 49: monitor-loop watcher explicitly excludes Check 12b
@@ -933,6 +938,15 @@ run_tests() {
   else
     tap_not_ok "check-12b-semantics: metric name from TOML in both specs" \
       "Expected '$metric_name' in both Check 12b section and monitor-loop table"
+  fi
+
+  # Test 53: Metric label from TOML appears in both SKILL.md files
+  if echo "$check_12b_section" | grep -Fq "$metric_label" \
+     && echo "$loop_streak_table" | grep -Fq "$metric_label"; then
+    tap_ok "check-12b-semantics: metric label from TOML in both specs ($metric_label)"
+  else
+    tap_not_ok "check-12b-semantics: metric label from TOML in both specs" \
+      "Expected '$metric_label' in both Check 12b section and monitor-loop table"
   fi
 }
 
