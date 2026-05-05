@@ -114,6 +114,10 @@ impl RestoredEntries {
             ),
             "key already restored from live BL: {key:?}"
         );
+        assert!(
+            !self.entries.contains_key(&key),
+            "duplicate hot archive entry insertion for key: {key:?}"
+        );
         self.entries
             .insert(key, RestoreSource::HotArchive(Box::new(original)));
     }
@@ -124,6 +128,15 @@ impl RestoredEntries {
             matches!(key, LedgerKey::Ttl(_)),
             "insert_hot_archive_ttl called with non-TTL key: {key:?}"
         );
+        assert!(
+            !matches!(
+                self.entries.get(&key),
+                Some(RestoreSource::LiveBucketList(_))
+            ),
+            "TTL key already restored from live BL: {key:?}"
+        );
+        // TTL keys may be re-inserted (once from safety-net loop, once from
+        // extend_hot_archive_ttls) — allow idempotent insertion for HotArchiveTtl.
         self.entries.insert(key, RestoreSource::HotArchiveTtl);
     }
 
@@ -1273,21 +1286,43 @@ mod tests {
     }
 
     #[test]
-    fn test_same_source_overwrite_allowed() {
+    #[should_panic(expected = "duplicate hot archive entry insertion")]
+    fn test_same_source_duplicate_panics() {
         let mut r = RestoredEntries::new();
         let key = make_contract_data_key();
         let entry1 = make_entry(1);
         let entry2 = make_entry(2);
 
         r.insert_hot_archive_entry(key.clone(), entry1);
-        // Re-inserting same key from same source overwrites (no panic)
-        r.insert_hot_archive_entry(key.clone(), entry2);
+        // Re-inserting same key panics (matches stellar-core behavior)
+        r.insert_hot_archive_entry(key, entry2);
+    }
 
-        match r.source(&key) {
-            Some(RestoreSource::HotArchive(e)) => {
-                assert_eq!(e.last_modified_ledger_seq, 2);
-            }
-            _ => panic!("expected HotArchive variant"),
-        }
+    #[test]
+    #[should_panic(expected = "TTL key already restored from live BL")]
+    fn test_hot_archive_ttl_rejects_existing_live_bl() {
+        let mut r = RestoredEntries::new();
+        let ttl_key = make_ttl_key();
+        let entry = make_ttl_entry(1);
+
+        r.insert_live_bl(ttl_key.clone(), entry);
+        // Inserting TTL as hot archive when already in live BL should panic
+        r.insert_hot_archive_ttl(ttl_key);
+    }
+
+    #[test]
+    fn test_hot_archive_ttl_idempotent() {
+        let mut r = RestoredEntries::new();
+        let ttl_key = make_ttl_key();
+
+        // First insertion
+        r.insert_hot_archive_ttl(ttl_key.clone());
+        // Idempotent re-insertion is allowed (same variant, same key)
+        r.insert_hot_archive_ttl(ttl_key.clone());
+
+        assert!(matches!(
+            r.source(&ttl_key),
+            Some(RestoreSource::HotArchiveTtl)
+        ));
     }
 }
