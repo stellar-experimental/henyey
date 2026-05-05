@@ -170,9 +170,8 @@ async fn test_overlay_scp_duplicate_is_forwarded_to_receiver() {
 /// envelope hash is recorded in its FloodGate with `from_peer = None`.
 /// If the same envelope later arrives back from a peer (e.g. via
 /// `GetScpState` response, peer reconnect, or out-of-sync recovery),
-/// FloodGate's `record_seen` returns `RelayRecord::Repeated` because the hash
-/// is already present. Without the SCP exemption restored in this fix,
-/// the overlay drops the envelope and the herder never sees the
+/// FloodGate's `record_inbound_relay` invokes the `on_repeated` callback (the
+/// hash is already present). The overlay never drops based on this — the
 /// peer-sourced provenance — which in standalone mode means the
 /// validator stops closing ledgers entirely.
 ///

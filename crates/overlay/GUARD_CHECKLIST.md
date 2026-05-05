@@ -57,7 +57,7 @@ message handler entry points, cross-referenced with Henyey's implementation stat
 
 | Guard | stellar-core Location | Henyey Location | Status | Issue |
 |-------|----------------------|-----------------|--------|-------|
-| Floodgate dedup (hash-based) | `Peer.cpp` broadcast path | `peer_loop.rs:448-452` (`compute_message_hash` + `record_seen`) | PRESENT | |
+| Floodgate relay tracking (hash-based) | `Peer.cpp` broadcast path | `peer_loop.rs` (`compute_message_hash` + `record_inbound_relay`) | PRESENT | |
 | Watcher filter (non-validators drop flood msgs) | `OverlayManagerImpl.cpp` | `peer_loop.rs:435` (`is_watcher_droppable`) | PRESENT | |
 | Global rate limiter | N/A (henyey-specific) | `peer_loop.rs:441` (`flood_gate.allow_message`) | PRESENT | |
 

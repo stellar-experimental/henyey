@@ -833,7 +833,7 @@ impl OverlayManager {
             if is_flood && helpers::is_flood_gate_tracked(&message) {
                 let hash = compute_message_hash(&message);
                 let lcl = self.last_closed_ledger.load(Ordering::Relaxed);
-                let _ = self.flood_gate.record_seen(hash, None, lcl);
+                self.flood_gate.record_local_broadcast(hash, lcl);
                 // Only forward to peers that haven't already sent us this message
                 let all_peers: Vec<PeerId> = self.peers.iter().map(|e| e.key().clone()).collect();
                 Some(self.flood_gate.get_forward_peers(&hash, &all_peers))
@@ -1773,8 +1773,8 @@ mod tests {
         // Record some flood messages at ledger 100
         let hash1 = henyey_common::Hash256([1u8; 32]);
         let hash2 = henyey_common::Hash256([2u8; 32]);
-        let _ = manager.flood_gate.record_seen(hash1, None, 100);
-        let _ = manager.flood_gate.record_seen(hash2, None, 100);
+        manager.flood_gate.record_local_broadcast(hash1, 100);
+        manager.flood_gate.record_local_broadcast(hash2, 100);
         assert_eq!(manager.flood_stats().seen_count, 2);
 
         // clear_ledgers_below should not remove entries at or above the threshold

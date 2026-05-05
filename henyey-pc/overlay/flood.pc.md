@@ -62,42 +62,62 @@ function with_ttl(ttl) → FloodGate:
 
 ---
 
-### should_flood
+### record_local_broadcast
+
+"Record a locally-originated message for relay accounting (self-broadcast).
+ Returns nothing — the message always continues to processing."
 
 ```
-function should_flood(self, message_hash) → boolean:
-  → seen does NOT contain message_hash
+function record_local_broadcast(self, message_hash, ledger_seq):
+  record_seen(message_hash, None, ledger_seq)
+  // No return value — prevents accidental use as a drop signal
 ```
 
 ---
 
-### record_seen
+### record_inbound_relay
 
-"Records that a message has been seen, optionally from a specific peer.
- Returns true if first time seeing this message (should flood),
- false if duplicate (should drop)."
+"Record a flood-tracked message received from a peer and invoke metric callbacks.
+ Returns nothing — the message always continues to processing.
+ This prevents the c6118f2c (#2317) bug class where relay status was
+ used as a drop signal."
 
 ```
-function record_seen(self, message_hash, from_peer, ledger_seq) → boolean:
+function record_inbound_relay(self, message_hash, from_peer, ledger_seq, on_new, on_repeated):
+  result = record_seen(message_hash, Some(from_peer), ledger_seq)
+  if result is New:
+    on_new()
+  else:
+    on_repeated()
+  // No return value — caller cannot branch on relay status
+```
+
+---
+
+### record_seen (private)
+
+"Internal: records that a message has been seen, optionally from a specific peer.
+ Returns New or Repeated for internal use only — never exposed to callers
+ outside the flood module."
+
+```
+function record_seen(self, message_hash, from_peer, ledger_seq) → RelayRecord:
   increment messages_seen counter
-  maybe_cleanup()
 
   if seen contains message_hash:
     entry = seen[message_hash]
     if from_peer is provided:
       MUTATE entry.peers add from_peer
-    increment messages_dropped counter
-    → false
+    increment messages_duplicate counter
+    → Repeated
 
   "New message"
   entry = SeenEntry { now, ledger_seq, empty peers }
   if from_peer is provided:
     entry.peers.add(from_peer)
   seen[message_hash] = entry
-  → true
+  → New
 ```
-
-**Calls**: [maybe_cleanup](#maybe_cleanup)
 
 ---
 
@@ -131,7 +151,7 @@ function get_forward_peers(self, message_hash, all_peers) → list of PeerId:
 
 ---
 
-### has_seen
+### has_seen (private, test-only)
 
 ```
 function has_seen(self, message_hash) → boolean:

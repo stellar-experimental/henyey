@@ -74,10 +74,10 @@ Corresponds to: `Floodgate.h`
 |--------------|------|--------|
 | `Floodgate()` | `FloodGate::new()` / `with_ttl()` | Full |
 | `clearBelow()` | `clear_below()` | Full (+ henyey-specific TTL expiry) |
-| `addRecord()` | `record_seen()` | Full |
+| `addRecord()` | `record_inbound_relay()` / `record_local_broadcast()` | Full |
 | `broadcast()` | `get_forward_peers()` + external send | Full |
 | `getPeersKnows()` | `get_forward_peers()` | Full |
-| `forgetRecord()` | Handled within `clear_below()` | Full |
+| `forgetRecord()` | `forget()` | Full |
 | `shutdown()` | `clear()` | Full |
 
 ### FlowControl (`flow_control.rs`)
@@ -306,7 +306,7 @@ Corresponds to: `OverlayManager.h`, `OverlayManagerImpl.h`
 | `isShuttingDown()` | `is_running()` (inverted) | Full |
 | `clearLedgersBelow()` | `clear_ledgers_below()` | Full |
 | `broadcastMessage()` | (via broadcast channel + flood gate) | Full |
-| `recvFloodedMsgID()` | `FloodGate::record_seen()` | Full |
+| `recvFloodedMsgID()` | `FloodGate::record_inbound_relay()` / `record_local_broadcast()` | Full |
 | `recvTransaction()` | (via broadcast channel + flood gate) | Full |
 | `forgetFloodedMsg()` | Handled within `clear_below()` at ledger close | Full |
 | `recvTxDemand()` | Handled in app crate (`App::handle_flood_demand`) | Full (moved to app layer) |

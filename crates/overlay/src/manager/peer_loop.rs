@@ -7,7 +7,7 @@ use super::{OutboundMessage, OverlayManager, OverlayMessage, SharedPeerState};
 use crate::connection::ConnectionDirection;
 use crate::{
     codec::helpers,
-    flood::{compute_message_hash, RelayRecord},
+    flood::compute_message_hash,
     flow_control::{msg_body_size, FlowControl},
     peer::Peer,
     PeerId,
@@ -771,44 +771,32 @@ impl OverlayManager {
             if helpers::is_flood_gate_tracked(message) {
                 let hash = compute_message_hash(message);
                 let lcl = state.last_closed_ledger.load(Ordering::Relaxed);
-                let relay = state
-                    .flood_gate
-                    .record_seen(hash, Some(peer_id.clone()), lcl);
-                match relay {
-                    RelayRecord::New => {
+                state.flood_gate.record_inbound_relay(
+                    hash,
+                    peer_id.clone(),
+                    lcl,
+                    || {
                         ctx.peer.record_flood_stats(true, message_size);
                         state.metrics.flood_unique_recv.inc();
-                    }
-                    RelayRecord::Repeated => {
+                    },
+                    || {
                         ctx.peer.record_flood_stats(false, message_size);
                         state.metrics.flood_duplicate_recv.inc();
-                    }
-                }
+                    },
+                );
                 // FloodGate-tracked messages (SCP and Transaction) are NEVER
                 // dropped at the overlay/FloodGate layer.
                 //
-                // FloodGate's role is *relay accounting* only: `record_seen`
-                // above tracked which peer sent us this hash so
-                // `get_forward_peers` won't echo it back. Actual dedup
-                // happens downstream in message-type-specific handlers:
-                // - SCP: `scp_scheduled_envelopes` HashSet in
-                //   `pump_scp_intake` (henyey equivalent of stellar-core's
-                //   `checkScheduledAndCache`, Peer.cpp:1113-1117)
+                // `record_inbound_relay` returns () — there is no relay status
+                // value to branch on, preventing the c6118f2c bug class.
+                // Actual dedup happens downstream:
+                // - SCP: `scp_scheduled_envelopes` in `pump_scp_intake`
                 // - Tx: herder `receive_transaction` / tx queue dedup
-                //   (app/lifecycle.rs, herder.rs)
-                //
-                // Note: Transaction messages route through the lossy generic
-                // broadcast channel (message_tx), not a dedicated channel
-                // like SCP. This is a separate architectural difference from
-                // stellar-core's direct call path; it does not affect the
-                // correctness of removing the FloodGate drop.
                 //
                 // stellar-core parity:
-                // - SCP: Peer.cpp:1667-1673 — unconditional
-                //   `recvSCPEnvelope`
-                // - Tx:  OverlayManagerImpl.cpp:1215-1248 —
-                //   `recvFloodedMsgID` (line 1224) then unconditional
-                //   `recvTransaction` (Peer.cpp:1524-1533 delegates here)
+                // - SCP: Peer.cpp:1667-1673 — unconditional recvSCPEnvelope
+                // - Tx:  OverlayManagerImpl.cpp:1215-1248 — unconditional
+                //   recvTransaction (Peer.cpp:1524-1533)
                 // See issues #2317, #2327.
             } else {
                 // Pull-control messages (FloodAdvert/FloodDemand) use flow-control

@@ -85,8 +85,8 @@ Metrics with the `stellar_` prefix that directly mirror stellar-core Medida coun
 | `OVERLAY_OUTBOUND_DROP_TOTAL` | `stellar_overlay_outbound_drop_total` | counter | Henyey-specific — outbound peer disconnections. |
 | `OVERLAY_OUTBOUND_REJECT_TOTAL` | `stellar_overlay_outbound_reject_total` | counter | Henyey-specific — outbound connections rejected before establishment (TCP fail, handshake fail, banned, duplicate, slots full). |
 | `OVERLAY_FLOOD_BROADCAST_TOTAL` | `stellar_overlay_flood_broadcast_total` | counter | Henyey-specific — per-recipient flood deliveries (`is_flood` messages only; stellar-core's `mMessagesBroadcast` counts per-event). |
-| `OVERLAY_FLOOD_DUPLICATE_RECV_TOTAL` | `stellar_overlay_flood_duplicate_recv_total` | counter | Henyey-specific — duplicate flood messages received (inbound, `FloodGate::record_seen` → false). |
-| `OVERLAY_FLOOD_UNIQUE_RECV_TOTAL` | `stellar_overlay_flood_unique_recv_total` | counter | Henyey-specific — unique flood messages received (inbound, `FloodGate::record_seen` → true). |
+| `OVERLAY_FLOOD_DUPLICATE_RECV_TOTAL` | `stellar_overlay_flood_duplicate_recv_total` | counter | Henyey-specific — duplicate flood messages received (inbound, `FloodGate::record_inbound_relay` → on_repeated). |
+| `OVERLAY_FLOOD_UNIQUE_RECV_TOTAL` | `stellar_overlay_flood_unique_recv_total` | counter | Henyey-specific — unique flood messages received (inbound, `FloodGate::record_inbound_relay` → on_new). |
 | `OVERLAY_FETCH_DUPLICATE_RECV_TOTAL` | `stellar_overlay_fetch_duplicate_recv_total` | counter | Henyey-specific — duplicate/unsolicited fetch responses (TxSet/QSet not tracked by ItemFetcher). |
 | `OVERLAY_FETCH_UNIQUE_RECV_TOTAL` | `stellar_overlay_fetch_unique_recv_total` | counter | Henyey-specific — unique/solicited fetch responses (TxSet/QSet tracked by ItemFetcher). |
 | `OVERLAY_ITEM_FETCHER_NEXT_PEER_TOTAL` | `stellar_overlay_item_fetcher_next_peer_total` | counter | Henyey-specific — `Tracker::try_next_peer` AskPeer selections. |

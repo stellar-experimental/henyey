@@ -97,7 +97,7 @@ pub use codec::{helpers as message_helpers, MessageCodec, MessageFrame};
 pub use connection::{Connection, ConnectionDirection, ConnectionPool, Listener};
 pub use connection_factory::{ConnectionFactory, TcpConnectionFactory};
 pub use error::OverlayError;
-pub use flood::{compute_message_hash, FloodGate, FloodGateStats, FloodRecord, RelayRecord};
+pub use flood::{compute_message_hash, FloodGate, FloodGateStats, FloodRecord};
 pub use flow_control::{
     is_flow_controlled_message, FlowControl, FlowControlBytesConfig, FlowControlConfig,
     FlowControlStats, MessagePriority, QueuedOutboundMessage, ScpQueueCallback, SendMoreCapacity,

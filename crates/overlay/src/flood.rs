@@ -31,33 +31,23 @@ use tracing::{debug, trace, warn};
 
 use crate::PeerId;
 
-/// Result of recording a message hash in the [`FloodGate`].
+/// Internal result of recording a message hash in the [`FloodGate`].
 ///
-/// **FloodGate is relay accounting, not a dedup layer.** No FloodGate-tracked
-/// message type should be dropped based on this value. The return indicates
-/// whether the hash is new (for metrics/forwarding) or repeated (peer
-/// recorded for relay tracking). Actual dedup happens downstream:
+/// **Module-private by design.** This enum is deliberately NOT exported from
+/// the `flood` module. External callers interact via [`FloodGate::record_inbound_relay`]
+/// and [`FloodGate::record_local_broadcast`], which return `()` — making it
+/// structurally impossible to accidentally use relay status as a drop signal
+/// (the c6118f2c / #2317 bug class).
+///
+/// Actual dedup happens downstream:
 /// - SCP: `scp_scheduled_envelopes` in `pump_scp_intake`
 /// - Tx: herder `receive_transaction` / tx queue
-///
-/// stellar-core parity:
-/// - SCP: Peer.cpp:1667-1673 — unconditional `recvSCPEnvelope`
-/// - Tx:  OverlayManagerImpl.cpp:1215-1248 — unconditional `recvTransaction`
-/// See issues #2317, #2327.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[must_use]
-pub enum RelayRecord {
-    /// First time this hash was seen — caller may forward to other peers.
+enum RelayRecord {
+    /// First time this hash was seen.
     New,
-    /// Hash was already recorded — for relay accounting only, NOT a drop signal.
+    /// Hash was already recorded.
     Repeated,
-}
-
-impl RelayRecord {
-    /// Returns `true` if this is the first time the hash was recorded.
-    pub fn is_new(self) -> bool {
-        matches!(self, RelayRecord::New)
-    }
 }
 
 /// Default TTL for seen messages (5 minutes).
@@ -126,13 +116,16 @@ impl SeenEntry {
 /// ```rust,ignore
 /// let gate = FloodGate::new();
 ///
-/// // Record a message and check whether it was new
+/// // Record an inbound message with metric callbacks
 /// let hash = compute_message_hash(&message);
-/// let result = gate.record_seen(hash, Some(peer_id), current_ledger_seq);
-/// if result.is_new() {
-///     // First time seeing this — flood to other peers
-///     let forward_to = gate.get_forward_peers(&hash, &all_peers);
-/// }
+/// gate.record_inbound_relay(hash, peer_id, current_ledger_seq,
+///     || metrics.unique.inc(),
+///     || metrics.duplicate.inc(),
+/// );
+/// // Message always continues to processing — no drop decision possible.
+///
+/// // Determine forwarding targets (excludes peers that already sent us this hash)
+/// let forward_to = gate.get_forward_peers(&hash, &all_peers);
 /// ```
 pub struct FloodGate {
     /// Map of message hash to tracking entry.
@@ -173,67 +166,19 @@ impl FloodGate {
         }
     }
 
-    /// Returns true if this message has not been seen before.
-    ///
-    /// This is a quick check that doesn't record the message - use
-    /// [`record_seen`](FloodGate::record_seen) to both check and record.
-    pub fn should_flood(&self, message_hash: &Hash256) -> bool {
-        !self.seen.contains_key(message_hash)
-    }
-
     /// Records that a message has been seen, optionally from a specific peer.
     ///
     /// Returns [`RelayRecord::New`] if this is the first time seeing this
     /// message, or [`RelayRecord::Repeated`] if it was already recorded.
     ///
-    /// **Callers must NOT use this return value as a drop signal.** FloodGate
-    /// is relay accounting — it tracks which peers have sent us a given hash
-    /// so `get_forward_peers` can avoid echoing it back. Dedup decisions
-    /// belong to downstream, message-type-specific handlers (SCP scheduler,
-    /// tx queue, etc.). See issues #2317, #2327.
-    ///
-    /// If `from_peer` is `Some`, that peer is recorded so we don't forward
-    /// the message back to them.
-    ///
-    /// The `ledger_seq` parameter records the current ledger sequence for
-    /// ledger-based cleanup via [`clear_below`](FloodGate::clear_below).
+    /// **Private by design.** External callers use [`record_inbound_relay`] or
+    /// [`record_local_broadcast`] which return `()`, preventing accidental use
+    /// of relay status as a drop signal (c6118f2c / #2317 bug class).
     ///
     /// This is a pure insert/lookup operation with no automatic cleanup,
     /// matching stellar-core's `addRecord()`. Cleanup happens at ledger
     /// boundaries via [`clear_below`](FloodGate::clear_below).
-    ///
-    /// # Relay tracking vs. in-flight dedup
-    ///
-    /// `FloodGate` is a **relay-tracking** structure (the henyey equivalent
-    /// of stellar-core's `recvFloodedMsgID` / `addRecord` path). Its job
-    /// is to remember which peers have sent us each message hash so that
-    /// [`get_forward_peers`](FloodGate::get_forward_peers) does not echo
-    /// messages back to their senders, and so that operators can observe
-    /// duplicate-receive rates via metrics.
-    ///
-    /// It is **not** a substitute for short-lived in-flight dedup. Entries
-    /// here persist for an entire ledger window (cleared at ledger close
-    /// by `clear_below`, with a TTL backstop), whereas stellar-core's
-    /// in-flight dedup (`checkScheduledAndCache`, Peer.cpp:1113-1117)
-    /// uses a `weak_ptr<CapacityTrackedMessage>` cache that releases
-    /// entries the moment processing completes — typically milliseconds.
-    ///
-    /// **No FloodGate-tracked message type should be dropped based on
-    /// `record_seen`'s return value**:
-    /// - SCP: Self-broadcast records a hash with `from_peer = None`. If a
-    ///   peer later echoes the same envelope back, the herder still needs
-    ///   that envelope (with peer provenance) to fetch tx-sets and converge.
-    /// - Tx: stellar-core's `OverlayManagerImpl::recvTransaction`
-    ///   (OverlayManagerImpl.cpp:1215-1248) calls `recvFloodedMsgID` for
-    ///   relay tracking then unconditionally processes the transaction.
-    ///
-    /// stellar-core parity:
-    /// - SCP: Peer.cpp:1667-1673 calls `recvFloodedMsgID` then
-    ///   unconditionally calls `recvSCPEnvelope`.
-    /// - Tx: OverlayManagerImpl.cpp:1224-1229 calls `recvFloodedMsgID`
-    ///   then unconditionally calls `Herder::recvTransaction`.
-    /// See issues #2317, #2327.
-    pub fn record_seen(
+    fn record_seen(
         &self,
         message_hash: Hash256,
         from_peer: Option<PeerId>,
@@ -291,11 +236,56 @@ impl FloodGate {
         count <= self.rate_limit
     }
 
+    /// Record a locally-originated message for relay accounting (self-broadcast).
+    ///
+    /// Returns nothing — the message always continues to processing. This
+    /// method is for messages this node originates or re-broadcasts, where
+    /// no inbound peer needs recording and no metrics callback is needed.
+    ///
+    /// stellar-core parity: mirrors the `addRecord(hash, nullptr)` path in
+    /// `Floodgate.cpp` for self-originated messages.
+    pub(crate) fn record_local_broadcast(&self, message_hash: Hash256, ledger_seq: u32) {
+        self.record_seen(message_hash, None, ledger_seq);
+    }
+
+    /// Record a flood-tracked message received from a peer and invoke metric callbacks.
+    ///
+    /// Returns nothing — the message always continues to processing. The
+    /// caller never observes new-vs-repeated status directly; only the
+    /// provided closures do. This prevents the accidental misuse pattern
+    /// from c6118f2c (#2317) where relay status was used as a drop signal.
+    ///
+    /// # Arguments
+    ///
+    /// * `on_new` — called if this is the first time seeing this hash
+    /// * `on_repeated` — called if the hash was already recorded
+    ///
+    /// stellar-core parity:
+    /// - SCP: Peer.cpp:1667-1673 — recvFloodedMsgID then unconditional recvSCPEnvelope
+    /// - Tx: OverlayManagerImpl.cpp:1224-1229 — recvFloodedMsgID then unconditional recvTransaction
+    pub(crate) fn record_inbound_relay(
+        &self,
+        message_hash: Hash256,
+        from_peer: PeerId,
+        ledger_seq: u32,
+        on_new: impl FnOnce(),
+        on_repeated: impl FnOnce(),
+    ) {
+        match self.record_seen(message_hash, Some(from_peer), ledger_seq) {
+            RelayRecord::New => on_new(),
+            RelayRecord::Repeated => on_repeated(),
+        }
+    }
+
     /// Returns the list of peers to forward a message to.
     ///
     /// Excludes any peers that have already sent us this message (tracked
-    /// via [`record_seen`](FloodGate::record_seen)).
-    pub fn get_forward_peers(&self, message_hash: &Hash256, all_peers: &[PeerId]) -> Vec<PeerId> {
+    /// via relay recording).
+    pub(crate) fn get_forward_peers(
+        &self,
+        message_hash: &Hash256,
+        all_peers: &[PeerId],
+    ) -> Vec<PeerId> {
         let exclude: HashSet<PeerId> = self
             .seen
             .get(message_hash)
@@ -310,7 +300,10 @@ impl FloodGate {
     }
 
     /// Returns true if this message has been seen before.
-    pub fn has_seen(&self, message_hash: &Hash256) -> bool {
+    /// Only available in tests — not part of the public API to prevent
+    /// use as a drop-decision signal.
+    #[cfg(test)]
+    fn has_seen(&self, message_hash: &Hash256) -> bool {
         self.seen.contains_key(message_hash)
     }
 
@@ -321,7 +314,7 @@ impl FloodGate {
     /// (Floodgate.cpp:197-200). Called when a flood-tracked message is
     /// discarded after initial recording — e.g., SCP envelopes rejected
     /// by herder pre-filter or post-verify gate drift.
-    pub fn forget(&self, message_hash: &Hash256) {
+    pub(crate) fn forget(&self, message_hash: &Hash256) {
         self.seen.remove(message_hash);
     }
 
@@ -453,13 +446,13 @@ mod tests {
         let gate = FloodGate::new();
 
         let hash = make_hash(1);
-        assert!(gate.should_flood(&hash));
+        assert!(!gate.has_seen(&hash));
 
         // Record as seen
         assert_eq!(gate.record_seen(hash, None, 1), RelayRecord::New);
 
-        // Should not flood again
-        assert!(!gate.should_flood(&hash));
+        // Should be seen now
+        assert!(gate.has_seen(&hash));
 
         // Record again should return Repeated
         assert_eq!(gate.record_seen(hash, None, 1), RelayRecord::Repeated);
@@ -522,8 +515,8 @@ mod tests {
         // clear_below with a high ledger seq removes expired entries
         gate.clear_below(u32::MAX);
 
-        // Should be able to flood again
-        assert!(gate.should_flood(&hash));
+        // Should not be seen anymore
+        assert!(!gate.has_seen(&hash));
     }
 
     #[test]
@@ -676,12 +669,11 @@ mod tests {
         let gate = FloodGate::new();
         let hash = make_hash(1);
 
-        // Record, then forget — should_flood returns true again.
+        // Record, then forget — has_seen returns false again.
         assert_eq!(gate.record_seen(hash, None, 1), RelayRecord::New);
-        assert!(!gate.should_flood(&hash));
+        assert!(gate.has_seen(&hash));
 
         gate.forget(&hash);
-        assert!(gate.should_flood(&hash));
         assert!(!gate.has_seen(&hash));
     }
 
@@ -692,7 +684,7 @@ mod tests {
 
         // Forgetting a hash that was never recorded is a no-op.
         gate.forget(&hash);
-        assert!(gate.should_flood(&hash));
+        assert!(!gate.has_seen(&hash));
     }
 
     #[test]
@@ -727,5 +719,83 @@ mod tests {
         assert!(fwd.contains(&peer_a));
         assert!(!fwd.contains(&peer_b));
         assert!(fwd.contains(&peer_c));
+    }
+
+    #[test]
+    fn test_record_local_broadcast() {
+        let gate = FloodGate::new();
+        let hash = make_hash(1);
+
+        assert!(!gate.has_seen(&hash));
+        gate.record_local_broadcast(hash, 1);
+        assert!(gate.has_seen(&hash));
+
+        // Calling again doesn't panic, just increments duplicate counter
+        gate.record_local_broadcast(hash, 1);
+        assert_eq!(gate.stats().duplicate_messages, 1);
+    }
+
+    #[test]
+    fn test_record_inbound_relay_calls_on_new() {
+        let gate = FloodGate::new();
+        let hash = make_hash(1);
+        let peer = make_peer_id(1);
+
+        let mut new_called = false;
+        let mut repeated_called = false;
+
+        gate.record_inbound_relay(
+            hash,
+            peer,
+            1,
+            || new_called = true,
+            || repeated_called = true,
+        );
+
+        assert!(new_called);
+        assert!(!repeated_called);
+        assert!(gate.has_seen(&hash));
+    }
+
+    #[test]
+    fn test_record_inbound_relay_calls_on_repeated() {
+        let gate = FloodGate::new();
+        let hash = make_hash(1);
+        let peer1 = make_peer_id(1);
+        let peer2 = make_peer_id(2);
+
+        // First record
+        gate.record_inbound_relay(hash, peer1, 1, || {}, || {});
+
+        // Second record from different peer
+        let mut new_called = false;
+        let mut repeated_called = false;
+        gate.record_inbound_relay(
+            hash,
+            peer2,
+            1,
+            || new_called = true,
+            || repeated_called = true,
+        );
+
+        assert!(!new_called);
+        assert!(repeated_called);
+    }
+
+    #[test]
+    fn test_record_inbound_relay_accumulates_peers() {
+        let gate = FloodGate::new();
+        let hash = make_hash(1);
+        let peer1 = make_peer_id(1);
+        let peer2 = make_peer_id(2);
+        let peer3 = make_peer_id(3);
+
+        gate.record_inbound_relay(hash, peer1.clone(), 1, || {}, || {});
+        gate.record_inbound_relay(hash, peer2.clone(), 1, || {}, || {});
+
+        // get_forward_peers should exclude peer1 and peer2
+        let all_peers = vec![peer1.clone(), peer2.clone(), peer3.clone()];
+        let forward = gate.get_forward_peers(&hash, &all_peers);
+        assert_eq!(forward, vec![peer3]);
     }
 }
