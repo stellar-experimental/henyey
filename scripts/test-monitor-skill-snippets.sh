@@ -64,6 +64,34 @@ tap_not_ok() {
   fi
 }
 
+# ── Section extraction helper ─────────────────────────────────────────────────
+# extract_md_section FILE START_PATTERN [END_PATTERN]
+#
+# Thin wrapper around the two sed extraction idioms used in this file.
+# Arguments are sed BRE address patterns (callers must escape '/' as '\/').
+#
+# Two-arg form (heading-scoped):
+#   Prints lines from START_PATTERN to the next line matching ^##,
+#   excluding lines matching "^## " (## + space). The start heading
+#   and any ###-level terminator ARE included.
+#   Equivalent to: sed -n '/PAT/,/^##/{/^## /!p}'
+#
+# Three-arg form (range-scoped):
+#   Prints lines from START_PATTERN to END_PATTERN (both inclusive).
+#   Equivalent to: sed -n '/START/,/END/p'
+#
+# Exit status: always 0 (sed returns 0 even on no matches).
+# Empty output indicates the start pattern was not found.
+# Callers must check for empty output themselves.
+extract_md_section() {
+  local file="$1" start="$2" end="${3:-}"
+  if [[ -n "$end" ]]; then
+    sed -n "/${start}/,/${end}/p" "$file"
+  else
+    sed -n "/${start}/,/^##/{/^## /!p}" "$file"
+  fi
+}
+
 # ── Structural Assertions ────────────────────────────────────────────────────
 # Verify that skill markdown files reference the shared library.
 # Replaces old checksum-based drift detection.
@@ -753,18 +781,12 @@ run_tests() {
   local check_12b_section watcher_section output_section
   local loop_streak_table loop_snapshot_section loop_watcher_section
 
-  # Check 12b section: from heading to next heading (exclude terminating heading)
-  check_12b_section=$(sed -n '/^### Check 12b:/,/^##/{/^## /!p}' "$tick_file")
-  # Watcher mode section in monitor-tick
-  watcher_section=$(sed -n '/^### Watcher mode/,/^##/{/^## /!p}' "$tick_file")
-  # Output template: from "MONITOR" line to closing ``` of the code block
-  output_section=$(sed -n '/^MONITOR /,/^```$/p' "$tick_file")
-  # Monitor-loop streak-gated counters table (section B to section D)
-  loop_streak_table=$(sed -n '/^\*\*B\. Streak-gated/,/^\*\*D\./p' "$loop_file")
-  # Monitor-loop counter-streak snapshot (separate block, after ratio snapshot)
-  loop_snapshot_section=$(sed -n '/^\*\*Counter-streak snapshot\*\*/,/^\*\*SCP/p' "$loop_file")
-  # Monitor-loop watcher section
-  loop_watcher_section=$(sed -n '/^### Watcher mode/,/^##/{/^## /!p}' "$loop_file")
+  check_12b_section=$(extract_md_section "$tick_file" '^### Check 12b:')
+  watcher_section=$(extract_md_section "$tick_file" '^### Watcher mode')
+  output_section=$(extract_md_section "$tick_file" '^MONITOR ' '^```$')
+  loop_streak_table=$(extract_md_section "$loop_file" '^\*\*B\. Streak-gated' '^\*\*D\.')
+  loop_snapshot_section=$(extract_md_section "$loop_file" '^\*\*Counter-streak snapshot\*\*' '^\*\*SCP')
+  loop_watcher_section=$(extract_md_section "$loop_file" '^### Watcher mode')
 
   # Existence guards — if any extraction is empty, all tests fail with context
   local sections_ok=true
