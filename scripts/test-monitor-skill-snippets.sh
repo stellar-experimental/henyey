@@ -42,7 +42,7 @@ cleanup  # ensure fresh state
 mkdir -p "$TEST_ROOT"
 
 # ── TAP state ────────────────────────────────────────────────────────────────
-TAP_PLAN=40
+TAP_PLAN=48
 TAP_CURRENT=0
 TAP_FAILURES=0
 
@@ -739,6 +739,122 @@ run_tests() {
     tap_ok "heartbeat: missing file → non-zero exit"
   else
     tap_not_ok "heartbeat: missing file → non-zero exit" "rc=$hb_rc"
+  fi
+
+  # ── Check 12b semantic assertions ──────────────────────────────────────────
+  # Verify that the Check 12b recovery-stalled streak semantics in the
+  # monitor-tick and monitor-loop SKILL.md specs have not regressed.
+  # See issue #2399.
+
+  local tick_file="$REPO_ROOT/.claude/skills/monitor-tick/SKILL.md"
+  local loop_file="$REPO_ROOT/.claude/skills/monitor-loop/SKILL.md"
+
+  # Section extractions (scoped to avoid false positives from unrelated text)
+  local check_12b_section watcher_section output_section
+  local loop_streak_table loop_snapshot_section loop_watcher_section
+
+  # Check 12b section: from heading to next heading (exclude terminating heading)
+  check_12b_section=$(sed -n '/^### Check 12b:/,/^##/{/^## /!p}' "$tick_file")
+  # Watcher mode section in monitor-tick
+  watcher_section=$(sed -n '/^### Watcher mode/,/^##/{/^## /!p}' "$tick_file")
+  # Output template: from "MONITOR" line to closing ``` of the code block
+  output_section=$(sed -n '/^MONITOR /,/^```$/p' "$tick_file")
+  # Monitor-loop streak-gated counters table (section B to section D)
+  loop_streak_table=$(sed -n '/^\*\*B\. Streak-gated/,/^\*\*D\./p' "$loop_file")
+  # Monitor-loop counter-streak snapshot (separate block, after ratio snapshot)
+  loop_snapshot_section=$(sed -n '/^\*\*Counter-streak snapshot\*\*/,/^\*\*SCP/p' "$loop_file")
+  # Monitor-loop watcher section
+  loop_watcher_section=$(sed -n '/^### Watcher mode/,/^##/{/^## /!p}' "$loop_file")
+
+  # Existence guards — if any extraction is empty, all tests fail with context
+  local sections_ok=true
+  for var_name in check_12b_section watcher_section output_section \
+                  loop_streak_table loop_snapshot_section loop_watcher_section; do
+    if [[ -z "${!var_name}" ]]; then
+      echo "  # FATAL: $var_name extraction returned empty" >&2
+      sections_ok=false
+    fi
+  done
+
+  if [[ "$sections_ok" != "true" ]]; then
+    tap_not_ok "check-12b-semantics: section extraction" "one or more sections not found"
+    # Emit remaining planned tests as not-ok so TAP count matches
+    while [[ $TAP_CURRENT -lt $TAP_PLAN ]]; do
+      tap_not_ok "check-12b-semantics: skipped (section extraction failed)"
+    done
+    return
+  fi
+
+  # Test 41: Streak threshold — breach_streak >= 3
+  if echo "$check_12b_section" | grep -Fq 'breach_streak >= 3'; then
+    tap_ok "check-12b-semantics: streak threshold (breach_streak >= 3)"
+  else
+    tap_not_ok "check-12b-semantics: streak threshold (breach_streak >= 3)" \
+      "Check 12b section missing 'breach_streak >= 3'"
+  fi
+
+  # Test 42: Burst threshold — delta >= 10
+  if echo "$check_12b_section" | grep -Fq 'delta >= 10'; then
+    tap_ok "check-12b-semantics: burst threshold (delta >= 10)"
+  else
+    tap_not_ok "check-12b-semantics: burst threshold (delta >= 10)" \
+      "Check 12b section missing 'delta >= 10'"
+  fi
+
+  # Test 43: Uses counter_streak_snapshot (not ratio_snapshot)
+  if echo "$check_12b_section" | grep -Fq 'counter_streak_snapshot' \
+     && ! echo "$check_12b_section" | grep -Fq 'ratio_snapshot'; then
+    tap_ok "check-12b-semantics: uses counter_streak_snapshot (not ratio_snapshot)"
+  else
+    tap_not_ok "check-12b-semantics: uses counter_streak_snapshot (not ratio_snapshot)" \
+      "Check 12b should reference counter_streak_snapshot, not ratio_snapshot"
+  fi
+
+  # Test 44: Excluded from watcher mode (monitor-tick)
+  if echo "$watcher_section" | grep -Fq 'Check 12b' \
+     && echo "$watcher_section" | grep -iq 'skip' \
+     && echo "$watcher_section" | grep -Fq 'recovery_stalled'; then
+    tap_ok "check-12b-semantics: watcher mode excludes Check 12b + recovery_stalled"
+  else
+    tap_not_ok "check-12b-semantics: watcher mode excludes Check 12b + recovery_stalled" \
+      "Watcher section must skip Check 12b and omit recovery_stalled line"
+  fi
+
+  # Test 45: Excluded from metrics: aggregate (NOT counted)
+  if echo "$check_12b_section" | grep -Fq 'NOT counted in the'; then
+    tap_ok "check-12b-semantics: excluded from metrics aggregate (NOT counted)"
+  else
+    tap_not_ok "check-12b-semantics: excluded from metrics aggregate (NOT counted)" \
+      "Check 12b section missing 'NOT counted in the' (metrics exclusion)"
+  fi
+
+  # Test 46: recovery_stalled: in output template
+  if echo "$output_section" | grep -Fq 'recovery_stalled:'; then
+    tap_ok "check-12b-semantics: recovery_stalled in output template"
+  else
+    tap_not_ok "check-12b-semantics: recovery_stalled in output template" \
+      "Output template missing 'recovery_stalled:' line"
+  fi
+
+  # Test 47: Cross-file — monitor-loop streak table + snapshot consistency
+  if echo "$loop_streak_table" | grep -Fq '3 ticks' \
+     && echo "$loop_streak_table" | grep -Fq '≥ 10' \
+     && echo "$loop_snapshot_section" | grep -Fq 'counter_streak_snapshot'; then
+    tap_ok "check-12b-semantics: monitor-loop streak table + snapshot consistent"
+  else
+    tap_not_ok "check-12b-semantics: monitor-loop streak table + snapshot consistent" \
+      "monitor-loop missing '3 ticks', '≥ 10', or 'counter_streak_snapshot'"
+  fi
+
+  # Test 48: Cross-file — monitor-loop validator-only + watcher excludes Check 12b
+  if echo "$loop_snapshot_section" | grep -Fq 'Validator mode only' \
+     && echo "$loop_watcher_section" | grep -Fq 'Watcher mode' \
+     && ! echo "$loop_watcher_section" | grep -Fq 'recovery_stalled' \
+     && ! echo "$loop_watcher_section" | grep -Fq 'counter_streak'; then
+    tap_ok "check-12b-semantics: monitor-loop validator-only + watcher excludes Check 12b"
+  else
+    tap_not_ok "check-12b-semantics: monitor-loop validator-only + watcher excludes Check 12b" \
+      "monitor-loop: snapshot must say 'Validator mode only'; watcher must not mention recovery_stalled/counter_streak"
   fi
 }
 
