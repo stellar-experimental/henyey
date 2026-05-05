@@ -201,11 +201,21 @@ table is the human reference.
 |--------|-----------------|----------|-----------|
 | `stellar_herder_lost_sync_total` | ≥ 1 | SYNC | Node fell out of Tracking — always a bug on a steady-state node |
 | `henyey_post_catchup_hard_reset_total` | ≥ 1 | ACTION | Recovery fired |
-| `henyey_recovery_stalled_tick_total{reason="forcing_catchup_behind"}` | ≥ 1 | WARN | Recovery forced catchup while behind consensus (Form 2 labeled extraction; excludes `backoff_active` and `forcing_catchup_not_behind`) |
 | `stellar_overlay_timeout_idle_total` + `_straggler_total` (sum) | 5× prior-tick sum | WARN | Overlay churn burst |
 | `stellar_overlay_error_read_total` + `_write_total` (sum) | ≥ 50 | WARN | Overlay I/O errors |
 | `henyey_archive_cache_refresh_error_total` | ≥ 1 | NONC | Archive fetch failing |
 | `henyey_archive_cache_refresh_timeout_total` | ≥ 3 | NONC | Archive fetch slow |
+
+**B. Streak-gated counters — fire on sustained delta breach (3 consecutive ticks) or burst (single-tick delta ≥ 10)**
+
+These counter-based checks use streak gating rather than immediate-fire thresholds
+because single-tick increments are often transient self-recovering events that
+don't warrant operator attention (see #2309). State is tracked independently of
+the ratio checks in a separate snapshot (`metrics/counter_streak_snapshot`).
+
+| Metric | Delta threshold | Streak threshold | Burst threshold | Severity | Rationale |
+|--------|-----------------|------------------|-----------------|----------|-----------|
+| `henyey_recovery_stalled_tick_total{reason="forcing_catchup_behind"}` | ≥ 1 | 3 ticks | ≥ 10 | WARN | Recovery forced catchup while behind consensus; single occurrences are transient self-recovering events (see #2309); large bursts indicate sustained stalling |
 
 **D. Ratio checks — fire on sustained ratio breach (3 consecutive ticks)**
 
@@ -251,6 +261,19 @@ pending_received=<value>
 pending_breach_streak=<N>
 ```
 Invalidate on PID/start_ticks change, malformed snapshot, or counter reset (current < previous).
+
+**Counter-streak snapshot** persisted at `~/data/<session-id>/metrics/counter_streak_snapshot`:
+```
+version=1
+pid=<PID>
+start_ticks=<field 22 from /proc/$PID/stat>
+timestamp=<ISO8601>
+recovery_stalled_behind=<value>
+recovery_stalled_breach_streak=<N>
+```
+Separate from ratio snapshot — runs independently of ratio skip conditions (see
+Check 12b in monitor-tick for full state machine). Invalidate on PID/start_ticks
+change, malformed snapshot, or counter reset. Validator mode only.
 
 **SCP denominator rationale:** Includes all 13 post-verify outcomes (not just errors). Normal
 outcomes (`duplicate`, `buffered`, `non_quorum`, `self_message`) appear at healthy-state

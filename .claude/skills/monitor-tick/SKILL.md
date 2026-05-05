@@ -53,6 +53,7 @@ All files below live in `/home/tomer/data/$MONITOR_SESSION_ID/`:
 | `metrics/current.prom` | latest Prometheus scrape | check 8 |
 | `metrics/prev.prom` | previous Prometheus scrape | check 8 |
 | `metrics/ratio_snapshot` | counter-ratio history (check 12) | check 12 |
+| `metrics/counter_streak_snapshot` | counter-streak state (check 12b) | check 12b |
 | `metrics/anomaly_cooldown.json` | alert dedup state | check 9 |
 | `logs/monitor.log` | node stdout/stderr (rotated on restart) | node process |
 | `cargo-target/` | cached build tree | cargo |
@@ -483,10 +484,6 @@ Catalog-wide notes:
 
 - `stellar_herder_lost_sync_total` ≥1 → SYNC
 - `henyey_post_catchup_hard_reset_total` ≥1 → ACTION
-- `henyey_recovery_stalled_tick_total{reason="forcing_catchup_behind"}` ≥1 → WARN
-  (Form 2 extraction; alert identity = the full selector-qualified name. Other
-  reasons are informational/duplicative — `backoff_active` ticks routinely;
-  `forcing_catchup_not_behind` is debug; the fast-track caller emits its own WARN.)
 - `(stellar_overlay_timeout_idle_total + stellar_overlay_timeout_straggler_total)` ≥5× prior-tick-sum → WARN
 - `(stellar_overlay_error_read_total + stellar_overlay_error_write_total)` ≥50 → WARN
 - `henyey_archive_cache_refresh_error_total` ≥1 → NONC
@@ -724,14 +721,14 @@ for v in "$pending_too_old" "$pending_received"; do
 done
 
 # henyey_recovery_stalled_tick_total: extract via Form 2 (see §Metric extraction
-# forms). Validate expected 5-label set {backoff_active, forcing_catchup_behind,
-# forcing_catchup_not_behind, archive_behind_peer_ahead_hard_reset,
-# at_tip_no_scp_hard_reset}; skip the alert entirely on mismatch. Alert when the
-# delta of the forcing_catchup_behind series ≥ 1. The two hard_reset labels
-# (archive_behind_peer_ahead_hard_reset, at_tip_no_scp_hard_reset) are both
-# informational — they count the hard-reset escalation paths that self-recover
-# in <1s (see the HardResetEscalation chain documented above); do not alert
-# on their deltas.
+# forms). Relaxed label validation: require only the forcing_catchup_behind
+# label to be present (minimum for Check 12b alerting). Other labels
+# (backoff_active, forcing_catchup_not_behind, archive_behind_peer_ahead_hard_reset,
+# at_tip_no_scp_hard_reset) may not yet exist on a fresh node — only 3 of the 5
+# are pre-registered in the metrics macro (crates/app/src/metrics.rs:613); the
+# remaining 2 are created dynamically on first use of each recovery path.
+# If forcing_catchup_behind is missing, skip Check 12b for this tick.
+# Alerting is streak-gated — see Check 12b section for logic.
 ```
 
 **Check 1: SCP post-verify acceptance rate**
@@ -779,6 +776,106 @@ minimum, that check skips (streak resets to 0) and the others proceed normally.
 **Status report:** Each check independently reports one of: `ok (value)`,
 `skipped (reason)`, `WARNING value (N ticks)`, or `collecting baseline`.
 
+### Check 12b: Recovery-stalled streak (counter-based, independent of ratio checks)
+
+This check tracks `henyey_recovery_stalled_tick_total{reason="forcing_catchup_behind"}`
+using a streak-gated alert, independent of Check 12's ratio checks. It runs on
+its own state machine because ratio checks are globally skipped during unsync
+states (ledger age > 30s, gap > 5, etc.), but the recovery-stalled counter fires
+precisely during recovery transitions when the node is briefly unsynced.
+
+**Data source:** Reuses the same `/metrics` scrape result (`$metrics_body` /
+`metrics/current.prom`) already fetched by check-8/check-12. Does NOT perform a
+second `/metrics` fetch.
+
+**Applicability:** Validator mode only. In watcher mode, skip Check 12b entirely
+and omit the `recovery_stalled:` line from the status report.
+
+**Snapshot file:** `/home/tomer/data/$MONITOR_SESSION_ID/metrics/counter_streak_snapshot`
+
+Format:
+```
+version=1
+pid=<PID>
+start_ticks=<field 22 from /proc/$PID/stat>
+timestamp=<ISO8601>
+recovery_stalled_behind=<value>
+recovery_stalled_breach_streak=<N>
+```
+
+**PID/start_ticks check (always, even on skip):** Before evaluating skip
+conditions, check PID/start_ticks against the stored snapshot. If the process
+restarted (PID or start_ticks changed), invalidate the snapshot immediately.
+This catches restarts during skip ticks and prevents comparing post-restart
+counters to a pre-restart baseline.
+
+**Skip conditions (skip Check 12b only when any is true):**
+- `/metrics` fetch failed this tick (same condition check-8 detects)
+- `/metrics` returns "recorder not installed"
+- `forcing_catchup_behind` label missing from the scrape
+
+On skip: write snapshot preserving existing `recovery_stalled_behind` value (or
+0 if no prior snapshot) with `recovery_stalled_breach_streak=0`. Next healthy
+tick compares against preserved value — does NOT enter "collecting baseline" after
+a skip. Report `recovery_stalled: skipped (<reason>)`.
+
+**Invalidation (reset streak AND enter "collecting baseline"):**
+- PID or `start_ticks` changed (process restart) — checked before skip conditions
+- Snapshot malformed, missing fields, or `version` ≠ `1`
+- Current `recovery_stalled_behind` value < previous (counter reset)
+- First tick after fresh start (no prior snapshot exists)
+
+On invalidation: write new snapshot with current counter value and
+`recovery_stalled_breach_streak=0`. Report `recovery_stalled: collecting baseline`.
+Do NOT evaluate burst or streak logic on invalidation ticks — this prevents
+false-firing the burst override on the first tick after a restart where the
+counter jumps from 0 to the current absolute value.
+
+**Per-tick logic (not skipped AND not invalidated):**
+```
+delta = current(recovery_stalled_behind) - prev(recovery_stalled_behind)
+
+if delta >= 10:
+    # Immediate-fire override: large burst indicates sustained stalling.
+    # Do NOT reset streak — keep incrementing; cooldown (7200s) handles dedup.
+    recovery_stalled_breach_streak += 1
+    → fire WARN, route through Bug Filing Workflow
+elif delta >= 1:
+    recovery_stalled_breach_streak += 1
+    if recovery_stalled_breach_streak >= 3:
+        → fire WARN, route through Bug Filing Workflow
+else:  # delta == 0
+    recovery_stalled_breach_streak = 0
+```
+
+Note: after skipped ticks where the counter value was preserved, the first
+healthy tick may see a large accumulated delta spanning multiple monitor
+intervals. This is acceptable — the burst threshold (≥10) catches sustained
+trouble regardless of tick granularity.
+
+**Post-restart warmup:** First tick writes baseline ("collecting baseline").
+Second tick has a valid prev for delta comparison and begins normal evaluation.
+
+**Alert identity and cooldown:**
+- Cooldown key: `henyey_recovery_stalled_tick_total{reason="forcing_catchup_behind"}` (full selector-qualified)
+- Cooldown period: 7200s (2h)
+- Issue search: `gh issue list --search 'metrics: henyey_recovery_stalled_tick_total{reason="forcing_catchup_behind"}' --state open`
+- Issue title on filing: `metrics: henyey_recovery_stalled_tick_total{reason="forcing_catchup_behind"} — sustained breach`
+- Filing follows the standard Bug Filing Workflow (§Firing alerts — cooldown + filing)
+
+**Integration with metrics aggregate:** Check 12b alerts are NOT counted in the
+`metrics:` line (which tracks immediate-fire counter/gauge alerts). They appear
+on their own `recovery_stalled:` line. A fired Check 12b alert does contribute
+to overall tick severity — the tick is considered unhealthy when any alert fires.
+
+**Status line:** `recovery_stalled:` (reported after `metrics_ratio:`):
+- `recovery_stalled: ok (delta=0)` — no increment, streak reset
+- `recovery_stalled: breach (delta=N, streak M/3)` — incrementing, below threshold
+- `recovery_stalled: WARNING delta=N (M ticks) — investigating` — streak ≥ 3
+- `recovery_stalled: WARNING delta=N (burst) — investigating` — immediate fire (delta ≥ 10)
+- `recovery_stalled: skipped (<reason>)` — metric missing or fetch failed
+- `recovery_stalled: collecting baseline` — first tick after restart/invalidation
+
 **Rendering precedence** (determines the `metrics_ratio:` line format):
 
 1. **Global skip** (all checks skipped for the same reason — e.g., not in sync,
@@ -797,6 +894,14 @@ Examples:
 - Pending skipped (missing counters): `metrics_ratio: scp ok (accept=15%), apply ok (fail=8%), pending skipped (missing counters)`
 - Global skip: `metrics_ratio: skipped (not in sync)`
 - Collecting: `metrics_ratio: collecting baseline`
+
+`recovery_stalled:` examples (after `metrics_ratio:` in output):
+- Healthy: `recovery_stalled: ok (delta=0)`
+- Building streak: `recovery_stalled: breach (delta=2, streak 1/3)`
+- Firing (streak): `recovery_stalled: WARNING delta=1 (3 ticks) — investigating`
+- Firing (burst): `recovery_stalled: WARNING delta=15 (burst) — investigating`
+- Skipped: `recovery_stalled: skipped (metric missing)`
+- Baseline: `recovery_stalled: collecting baseline`
 
 ### Firing alerts — cooldown + filing
 
@@ -827,7 +932,9 @@ For each firing alert:
 
 If `$MONITOR_MODE = watcher`, run check (12) with a reduced catalog: only
 process (open_fds, max_fds), jemalloc, and overlay counters/gauges. Skip
-SCP, quorum, herder_state, histogram p99 alerts, and ratio checks.
+SCP, quorum, herder_state, histogram p99 alerts, ratio checks, and
+Check 12b (recovery-stalled streak). Omit the `recovery_stalled:` line
+from watcher output entirely.
 
 ## Remote sync & redeploy
 
@@ -1186,6 +1293,7 @@ MONITOR <OK|WARNING|ACTION|OFFLINE> — L<ledger> — <timestamp>
   obsrvr:  <validating=<Y/N> val24h=<pct>% lag=<N> | N/A (watcher) | N/A (api-error)>
   metrics: <clean | N alerts (<metric1>,<metric2>,...) — filed/commented #<N>,#<M> | N alerts, K suppressed by cooldown>
   metrics_ratio: scp <ok (accept=X%) | skipped (reason) | WARNING accept=X%<5% (N ticks)>, apply <ok (fail=Y%) | skipped (reason) | WARNING fail=Y%>50% (N ticks) — investigating>, pending <ok (too_old=Z%) | skipped (reason) | WARNING too_old=Z%>50% (N ticks)> | collecting baseline
+  recovery_stalled: <ok (delta=0) | breach (delta=N, streak M/3) | WARNING delta=N (M ticks) — investigating | WARNING delta=N (burst) — investigating | skipped (<reason>) | collecting baseline>
   deploy:  <up-to-date | pulled N commits (old..new) | SKIPPED (dirty-tree|ci-red|build-failed, filed/commented #<N>)>
   ci:      <all green (run+job level) | WORKFLOW failed — filed/commented #<N> | WORKFLOW jobs FAILED (continue-on-error) — NAME|conclusion listed, filed/commented #<N>>
   self_reflect: <clean | fixed inline (<sha>: <short-desc>) | filed #<N> (urgent: <short-desc>) | filed #<N> (no-label: <short-desc>) | filed #<N> (not-ready: <short-desc>)>
