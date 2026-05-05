@@ -229,12 +229,16 @@ impl StreamingSortedValidator {
         }
     }
 
-    /// Validate the next entry in the stream.
+    /// Validate the next entry by its pre-extracted key.
     ///
-    /// Returns `Err(BucketError::Corruption)` if the entry violates the
-    /// sorted-unique invariant relative to previously validated entries.
-    pub fn validate(&mut self, entry: &BucketEntry) -> Result<()> {
-        match entry.key() {
+    /// `key` should be `None` for metadata entries and `Some(LedgerKey)` for
+    /// keyed entries. Enforces:
+    /// - At most one metadata entry, and if present it must appear before any keyed entries
+    /// - Keyed entries must be strictly ascending by `LedgerKey::cmp` (no duplicates)
+    ///
+    /// Returns `Err(BucketError::Corruption)` on violation.
+    pub fn validate_key(&mut self, key: Option<LedgerKey>) -> Result<()> {
+        match key {
             Some(key) => {
                 self.seen_keyed = true;
                 if let Some(ref prev) = self.prev_key {
@@ -259,6 +263,14 @@ impl StreamingSortedValidator {
             }
         }
         Ok(())
+    }
+
+    /// Validate the next `BucketEntry` in the stream.
+    ///
+    /// Convenience wrapper around [`validate_key`](Self::validate_key) that
+    /// extracts the key from a `BucketEntry`.
+    pub fn validate(&mut self, entry: &BucketEntry) -> Result<()> {
+        self.validate_key(entry.key())
     }
 }
 
@@ -542,5 +554,70 @@ mod tests {
             err_msg.contains("duplicate metadata"),
             "Expected 'duplicate metadata' in error: {err_msg}"
         );
+    }
+
+    // ========================================================================
+    // validate_key tests (used by both live and hot-archive paths)
+    // ========================================================================
+
+    fn make_key(id: u8) -> LedgerKey {
+        LedgerKey::Account(LedgerKeyAccount {
+            account_id: make_account_id([id; 32]),
+        })
+    }
+
+    #[test]
+    fn test_validate_key_accepts_ascending_keys() {
+        let mut validator = StreamingSortedValidator::new();
+        validator.validate_key(Some(make_key(1))).unwrap();
+        validator.validate_key(Some(make_key(2))).unwrap();
+        validator.validate_key(Some(make_key(3))).unwrap();
+    }
+
+    #[test]
+    fn test_validate_key_accepts_metadata_then_keys() {
+        let mut validator = StreamingSortedValidator::new();
+        validator.validate_key(None).unwrap(); // metadata
+        validator.validate_key(Some(make_key(1))).unwrap();
+        validator.validate_key(Some(make_key(2))).unwrap();
+    }
+
+    #[test]
+    fn test_validate_key_accepts_keys_only() {
+        let mut validator = StreamingSortedValidator::new();
+        validator.validate_key(Some(make_key(5))).unwrap();
+        validator.validate_key(Some(make_key(10))).unwrap();
+    }
+
+    #[test]
+    fn test_validate_key_rejects_duplicate_keys() {
+        let mut validator = StreamingSortedValidator::new();
+        validator.validate_key(Some(make_key(1))).unwrap();
+        let result = validator.validate_key(Some(make_key(1)));
+        assert!(matches!(result, Err(BucketError::Corruption(_))));
+    }
+
+    #[test]
+    fn test_validate_key_rejects_out_of_order() {
+        let mut validator = StreamingSortedValidator::new();
+        validator.validate_key(Some(make_key(5))).unwrap();
+        let result = validator.validate_key(Some(make_key(3)));
+        assert!(matches!(result, Err(BucketError::Corruption(_))));
+    }
+
+    #[test]
+    fn test_validate_key_rejects_duplicate_metadata() {
+        let mut validator = StreamingSortedValidator::new();
+        validator.validate_key(None).unwrap();
+        let result = validator.validate_key(None);
+        assert!(matches!(result, Err(BucketError::Corruption(_))));
+    }
+
+    #[test]
+    fn test_validate_key_rejects_metadata_after_keys() {
+        let mut validator = StreamingSortedValidator::new();
+        validator.validate_key(Some(make_key(1))).unwrap();
+        let result = validator.validate_key(None);
+        assert!(matches!(result, Err(BucketError::Corruption(_))));
     }
 }

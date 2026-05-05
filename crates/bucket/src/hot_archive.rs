@@ -128,18 +128,26 @@ impl HotArchiveBucket {
 
     /// Create a hot archive bucket from pre-formed entries.
     ///
-    /// # Preconditions
+    /// Validates that entries satisfy the sorted-unique invariant:
+    /// - At most one metadata entry, and if present it must be first
+    /// - Keyed entries must be strictly ascending by `LedgerKey::cmp`
+    /// - No duplicate keys (including cross-variant: `Archived(k)` and `Live(k)`
+    ///   with the same `LedgerKey` are duplicates)
     ///
-    /// - Entries MUST be pre-sorted in stellar-core order (LedgerEntryIdCmp)
-    /// - Entries MUST have unique keys (no duplicates)
-    /// - All non-meta entries MUST be persistent Soroban entries
-    ///
-    /// These invariants are enforced at the public entry point ([`Self::fresh()`]).
-    /// This constructor trusts its callers within the crate.
+    /// Content validation (e.g., Soroban persistence checks) is the
+    /// responsibility of higher-level constructors like [`Self::fresh()`].
     pub(crate) fn from_entries(entries: Vec<HotArchiveBucketEntry>) -> Result<Self> {
+        let mut validator = crate::entry::StreamingSortedValidator::new();
         let mut entry_map = BTreeMap::new();
 
         for entry in &entries {
+            validator
+                .validate_key(hot_archive_entry_ledger_key(entry))
+                .map_err(|e| {
+                    BucketError::Merge(format!(
+                        "hot archive from_entries: sorted-unique invariant violated: {e}"
+                    ))
+                })?;
             let key = hot_archive_entry_to_key(entry)?;
             entry_map.insert(key, entry.clone());
         }
@@ -450,6 +458,7 @@ impl HotArchiveBucket {
             return Ok(Self::empty());
         }
 
+        let mut validator = crate::entry::StreamingSortedValidator::new();
         let mut entries = BTreeMap::new();
         let mut ordered_entries = Vec::new();
         let mut records = crate::record::RecordMarkedSliceIter::new(bytes);
@@ -457,6 +466,7 @@ impl HotArchiveBucket {
         while let Some(record) = records.next_record()? {
             match HotArchiveBucketEntry::from_xdr(record.body, Limits::none()) {
                 Ok(entry) => {
+                    validator.validate_key(hot_archive_entry_ledger_key(&entry))?;
                     let key = hot_archive_entry_to_key(&entry)?;
                     entries.insert(key, entry.clone());
                     ordered_entries.push(entry);
@@ -551,6 +561,7 @@ impl HotArchiveBucket {
         let file_len = file.metadata()?.len();
         let mut records = crate::record::RecordMarkedReader::new(BufReader::new(file), file_len);
 
+        let mut validator = crate::entry::StreamingSortedValidator::new();
         let mut built_index = BTreeMap::new();
         let mut hasher = Sha256::new();
         let mut entry_count = 0;
@@ -569,6 +580,7 @@ impl HotArchiveBucket {
                     ))
                 })?;
 
+            validator.validate_key(hot_archive_entry_ledger_key(&entry))?;
             let key = hot_archive_entry_to_key(&entry)?;
             built_index.insert(key, record.offset);
             entry_count += 1;
@@ -1633,6 +1645,19 @@ fn hot_archive_entry_to_key(entry: &HotArchiveBucketEntry) -> Result<Vec<u8>> {
             // Metadata uses a special key (empty)
             Ok(Vec::new())
         }
+    }
+}
+
+/// Extract the `LedgerKey` from a hot archive bucket entry for sorted-unique validation.
+///
+/// Returns `None` for metadata entries and `Some(LedgerKey)` for keyed entries
+/// (`Archived` and `Live`). Used with [`StreamingSortedValidator::validate_key`]
+/// to validate hot archive bucket data on load.
+fn hot_archive_entry_ledger_key(entry: &HotArchiveBucketEntry) -> Option<LedgerKey> {
+    match entry {
+        HotArchiveBucketEntry::Metaentry(_) => None,
+        HotArchiveBucketEntry::Archived(e) => Some(henyey_common::entry_to_key(e)),
+        HotArchiveBucketEntry::Live(key) => Some(key.clone()),
     }
 }
 
@@ -2826,5 +2851,289 @@ mod tests {
         // metaentry + 2 archived + 1 live = 4
         assert_eq!(bucket.len(), 4);
         assert!(!bucket.hash().is_zero());
+    }
+
+    // ========================================================================
+    // Sorted-unique validation tests for hot archive load/construction paths
+    // ========================================================================
+
+    /// Serialize entries to XDR bytes with record marks, bypassing validation.
+    fn entries_to_raw_xdr(entries: &[HotArchiveBucketEntry]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        for entry in entries {
+            let entry_bytes = entry.to_xdr(Limits::none()).unwrap();
+            let sz = entry_bytes.len() as u32;
+            let record_mark = sz | crate::XDR_RECORD_MARK;
+            bytes.extend_from_slice(&record_mark.to_be_bytes());
+            bytes.extend_from_slice(&entry_bytes);
+        }
+        bytes
+    }
+
+    /// Write entries to a temp file, bypassing validation.
+    fn write_entries_to_file(
+        entries: &[HotArchiveBucketEntry],
+    ) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hot.bucket");
+        std::fs::write(&path, entries_to_raw_xdr(entries)).unwrap();
+        (dir, path)
+    }
+
+    fn make_meta() -> HotArchiveBucketEntry {
+        HotArchiveBucketEntry::Metaentry(BucketMetadata {
+            ledger_version: 25,
+            ext: BucketMetadataExt::V1(BucketListType::HotArchive),
+        })
+    }
+
+    fn make_archived(contract_id: [u8; 32], key_bytes: &[u8]) -> HotArchiveBucketEntry {
+        HotArchiveBucketEntry::Archived(make_contract_data_entry(contract_id, key_bytes, 100))
+    }
+
+    fn make_live_key(contract_id: [u8; 32], key_bytes: &[u8]) -> HotArchiveBucketEntry {
+        HotArchiveBucketEntry::Live(make_contract_data_key(contract_id, key_bytes))
+    }
+
+    // --- Valid data tests ---
+
+    #[test]
+    fn test_hot_archive_load_valid_sorted_from_xdr_bytes() {
+        let entries = vec![
+            make_meta(),
+            make_archived([1u8; 32], b"a"),
+            make_archived([2u8; 32], b"b"),
+        ];
+        let bytes = entries_to_raw_xdr(&entries);
+        let bucket = HotArchiveBucket::from_xdr_bytes(&bytes).unwrap();
+        assert_eq!(bucket.len(), 3);
+    }
+
+    #[test]
+    fn test_hot_archive_load_valid_sorted_disk_backed() {
+        let entries = vec![
+            make_meta(),
+            make_archived([1u8; 32], b"a"),
+            make_archived([2u8; 32], b"b"),
+        ];
+        let (_dir, path) = write_entries_to_file(&entries);
+        let bucket = HotArchiveBucket::from_xdr_file_disk_backed(&path).unwrap();
+        assert_eq!(bucket.len(), 3);
+    }
+
+    #[test]
+    fn test_hot_archive_load_no_metadata_from_xdr_bytes() {
+        let entries = vec![
+            make_archived([1u8; 32], b"a"),
+            make_archived([2u8; 32], b"b"),
+        ];
+        let bytes = entries_to_raw_xdr(&entries);
+        let bucket = HotArchiveBucket::from_xdr_bytes(&bytes).unwrap();
+        assert_eq!(bucket.len(), 2);
+    }
+
+    #[test]
+    fn test_hot_archive_load_no_metadata_disk_backed() {
+        let entries = vec![
+            make_archived([1u8; 32], b"a"),
+            make_archived([2u8; 32], b"b"),
+        ];
+        let (_dir, path) = write_entries_to_file(&entries);
+        let bucket = HotArchiveBucket::from_xdr_file_disk_backed(&path).unwrap();
+        assert_eq!(bucket.len(), 2);
+    }
+
+    // --- Duplicate keys ---
+
+    #[test]
+    fn test_hot_archive_load_rejects_duplicate_keys_from_xdr_bytes() {
+        let entries = vec![
+            make_meta(),
+            make_archived([1u8; 32], b"a"),
+            make_archived([1u8; 32], b"a"), // duplicate
+        ];
+        let bytes = entries_to_raw_xdr(&entries);
+        let result = HotArchiveBucket::from_xdr_bytes(&bytes);
+        assert!(matches!(result, Err(BucketError::Corruption(_))));
+    }
+
+    #[test]
+    fn test_hot_archive_load_rejects_duplicate_keys_disk_backed() {
+        let entries = vec![
+            make_meta(),
+            make_archived([1u8; 32], b"a"),
+            make_archived([1u8; 32], b"a"), // duplicate
+        ];
+        let (_dir, path) = write_entries_to_file(&entries);
+        let result = HotArchiveBucket::from_xdr_file_disk_backed(&path);
+        assert!(matches!(result, Err(BucketError::Corruption(_))));
+    }
+
+    // --- Out-of-order entries ---
+
+    #[test]
+    fn test_hot_archive_load_rejects_out_of_order_from_xdr_bytes() {
+        let entries = vec![
+            make_meta(),
+            make_archived([2u8; 32], b"b"),
+            make_archived([1u8; 32], b"a"), // out of order
+        ];
+        let bytes = entries_to_raw_xdr(&entries);
+        let result = HotArchiveBucket::from_xdr_bytes(&bytes);
+        assert!(matches!(result, Err(BucketError::Corruption(_))));
+    }
+
+    #[test]
+    fn test_hot_archive_load_rejects_out_of_order_disk_backed() {
+        let entries = vec![
+            make_meta(),
+            make_archived([2u8; 32], b"b"),
+            make_archived([1u8; 32], b"a"), // out of order
+        ];
+        let (_dir, path) = write_entries_to_file(&entries);
+        let result = HotArchiveBucket::from_xdr_file_disk_backed(&path);
+        assert!(matches!(result, Err(BucketError::Corruption(_))));
+    }
+
+    // --- Duplicate metadata ---
+
+    #[test]
+    fn test_hot_archive_load_rejects_duplicate_metadata_from_xdr_bytes() {
+        let entries = vec![
+            make_meta(),
+            make_meta(), // duplicate
+            make_archived([1u8; 32], b"a"),
+        ];
+        let bytes = entries_to_raw_xdr(&entries);
+        let result = HotArchiveBucket::from_xdr_bytes(&bytes);
+        assert!(matches!(result, Err(BucketError::Corruption(_))));
+    }
+
+    #[test]
+    fn test_hot_archive_load_rejects_duplicate_metadata_disk_backed() {
+        let entries = vec![
+            make_meta(),
+            make_meta(), // duplicate
+            make_archived([1u8; 32], b"a"),
+        ];
+        let (_dir, path) = write_entries_to_file(&entries);
+        let result = HotArchiveBucket::from_xdr_file_disk_backed(&path);
+        assert!(matches!(result, Err(BucketError::Corruption(_))));
+    }
+
+    // --- Cross-variant duplicate keys ---
+
+    #[test]
+    fn test_hot_archive_load_rejects_cross_variant_duplicate_from_xdr_bytes() {
+        // Archived(k) then Live(k) — same LedgerKey, different variant
+        let entries = vec![
+            make_meta(),
+            make_archived([1u8; 32], b"a"),
+            make_live_key([1u8; 32], b"a"), // same key, different variant
+        ];
+        let bytes = entries_to_raw_xdr(&entries);
+        let result = HotArchiveBucket::from_xdr_bytes(&bytes);
+        assert!(matches!(result, Err(BucketError::Corruption(_))));
+    }
+
+    #[test]
+    fn test_hot_archive_load_rejects_cross_variant_duplicate_disk_backed() {
+        let entries = vec![
+            make_meta(),
+            make_archived([1u8; 32], b"a"),
+            make_live_key([1u8; 32], b"a"), // same key, different variant
+        ];
+        let (_dir, path) = write_entries_to_file(&entries);
+        let result = HotArchiveBucket::from_xdr_file_disk_backed(&path);
+        assert!(matches!(result, Err(BucketError::Corruption(_))));
+    }
+
+    // --- Metadata after keyed entries ---
+
+    #[test]
+    fn test_hot_archive_load_rejects_metadata_after_keys_from_xdr_bytes() {
+        let entries = vec![
+            make_archived([1u8; 32], b"a"),
+            make_meta(), // metadata after keyed entries
+        ];
+        let bytes = entries_to_raw_xdr(&entries);
+        let result = HotArchiveBucket::from_xdr_bytes(&bytes);
+        assert!(matches!(result, Err(BucketError::Corruption(_))));
+    }
+
+    #[test]
+    fn test_hot_archive_load_rejects_metadata_after_keys_disk_backed() {
+        let entries = vec![
+            make_archived([1u8; 32], b"a"),
+            make_meta(), // metadata after keyed entries
+        ];
+        let (_dir, path) = write_entries_to_file(&entries);
+        let result = HotArchiveBucket::from_xdr_file_disk_backed(&path);
+        assert!(matches!(result, Err(BucketError::Corruption(_))));
+    }
+
+    // --- Both storage modes fail identically ---
+
+    #[test]
+    fn test_hot_archive_both_modes_fail_identically_on_duplicates() {
+        let entries = vec![
+            make_meta(),
+            make_archived([1u8; 32], b"a"),
+            make_archived([1u8; 32], b"a"), // duplicate
+        ];
+        let bytes = entries_to_raw_xdr(&entries);
+        let in_memory_result = HotArchiveBucket::from_xdr_bytes(&bytes);
+        let (_dir, path) = write_entries_to_file(&entries);
+        let disk_result = HotArchiveBucket::from_xdr_file_disk_backed(&path);
+
+        // Both must fail with the same error variant (Corruption)
+        assert!(matches!(in_memory_result, Err(BucketError::Corruption(_))));
+        assert!(matches!(disk_result, Err(BucketError::Corruption(_))));
+    }
+
+    // --- Constructor (from_entries) tests ---
+
+    #[test]
+    fn test_hot_archive_from_entries_rejects_duplicate_keys() {
+        let entries = vec![
+            make_meta(),
+            make_archived([1u8; 32], b"a"),
+            make_archived([1u8; 32], b"a"), // duplicate
+        ];
+        let result = HotArchiveBucket::from_entries(entries);
+        assert!(matches!(result, Err(BucketError::Merge(_))));
+    }
+
+    #[test]
+    fn test_hot_archive_from_entries_rejects_duplicate_metadata() {
+        let entries = vec![
+            make_meta(),
+            make_meta(), // duplicate
+            make_archived([1u8; 32], b"a"),
+        ];
+        let result = HotArchiveBucket::from_entries(entries);
+        assert!(matches!(result, Err(BucketError::Merge(_))));
+    }
+
+    #[test]
+    fn test_hot_archive_from_entries_rejects_metadata_after_keys() {
+        let entries = vec![
+            make_archived([1u8; 32], b"a"),
+            make_meta(), // metadata after keyed entries
+        ];
+        let result = HotArchiveBucket::from_entries(entries);
+        assert!(matches!(result, Err(BucketError::Merge(_))));
+    }
+
+    #[test]
+    fn test_hot_archive_from_entries_accepts_valid_sorted() {
+        let entries = vec![
+            make_meta(),
+            make_archived([1u8; 32], b"a"),
+            make_archived([2u8; 32], b"b"),
+        ];
+        let result = HotArchiveBucket::from_entries(entries);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().len(), 3);
     }
 }
