@@ -293,8 +293,15 @@ fn compare_ledger_headers(
         // Compare the full header by XDR serialization.
         let l_xdr = l.header.to_xdr(stellar_xdr::curr::Limits::none());
         let r_xdr = r.header.to_xdr(stellar_xdr::curr::Limits::none());
-        match (l_xdr, r_xdr) {
-            (Ok(l_bytes), Ok(r_bytes)) if l_bytes != r_bytes => {
+        if let Some((l_bytes, r_bytes)) = report_xdr_errors(
+            l_xdr,
+            r_xdr,
+            l.header.ledger_seq,
+            Category::LedgerHeaders,
+            "header",
+            &mut out,
+        ) {
+            if l_bytes != r_bytes {
                 // Identify which fields differ.
                 let h_l = &l.header;
                 let h_r = &r.header;
@@ -372,7 +379,6 @@ fn compare_ledger_headers(
                     });
                 }
             }
-            _ => {}
         }
     }
 
@@ -396,6 +402,72 @@ fn compare_ledger_headers(
         });
     }
     out
+}
+
+// ============================================================================
+// Shared XDR serialization error reporting
+// ============================================================================
+
+/// Compares two XDR serialization results. On success, returns the byte vectors
+/// for further comparison. On failure, pushes diagnostic Mismatches and returns
+/// None. Field-by-field diffs are skipped when serialization fails.
+///
+/// `ledger_seq` identifies the ledger being compared in diagnostic messages.
+/// For `compare_entries()`, the merge-join guarantees local == reference seq.
+/// For `compare_ledger_headers()`, this is the local entry's seq (index-based
+/// iteration means seqs could theoretically differ — the hash/field-diff
+/// comparison already catches that case separately).
+///
+/// Ordering guarantee for `(Err, Err)`: local mismatch is pushed first,
+/// reference second.
+fn report_xdr_errors(
+    l_xdr: Result<Vec<u8>, stellar_xdr::curr::Error>,
+    r_xdr: Result<Vec<u8>, stellar_xdr::curr::Error>,
+    ledger_seq: u32,
+    category: Category,
+    payload_name: &str,
+    out: &mut Vec<Mismatch>,
+) -> Option<(Vec<u8>, Vec<u8>)> {
+    match (l_xdr, r_xdr) {
+        (Ok(l), Ok(r)) => Some((l, r)),
+        (Err(le), Err(re)) => {
+            out.push(Mismatch {
+                category,
+                detail: format!(
+                    "ledger {}: local {} serialization error: {}",
+                    ledger_seq, payload_name, le
+                ),
+            });
+            out.push(Mismatch {
+                category,
+                detail: format!(
+                    "ledger {}: reference {} serialization error: {}",
+                    ledger_seq, payload_name, re
+                ),
+            });
+            None
+        }
+        (Err(e), Ok(_)) => {
+            out.push(Mismatch {
+                category,
+                detail: format!(
+                    "ledger {}: local {} serialization error: {}",
+                    ledger_seq, payload_name, e
+                ),
+            });
+            None
+        }
+        (Ok(_), Err(e)) => {
+            out.push(Mismatch {
+                category,
+                detail: format!(
+                    "ledger {}: reference {} serialization error: {}",
+                    ledger_seq, payload_name, e
+                ),
+            });
+            None
+        }
+    }
 }
 
 // ============================================================================
@@ -490,40 +562,23 @@ fn compare_entries<T: ComparableEntry>(local: &[T], reference: &[T]) -> Vec<Mism
         match l.ledger_seq().cmp(&r.ledger_seq()) {
             std::cmp::Ordering::Equal => {
                 // Compare payloads, handling serialization errors explicitly.
-                match (l.payload_xdr(), r.payload_xdr()) {
-                    (Ok(l_bytes), Ok(r_bytes)) => {
-                        if l_bytes != r_bytes {
-                            out.push(Mismatch {
-                                category,
-                                detail: format!(
-                                    "ledger {}: {} differs (local {} bytes, reference {} bytes)",
-                                    l.ledger_seq(),
-                                    T::payload_name(),
-                                    l_bytes.len(),
-                                    r_bytes.len(),
-                                ),
-                            });
-                        }
-                    }
-                    (Err(e), _) => {
+                if let Some((l_bytes, r_bytes)) = report_xdr_errors(
+                    l.payload_xdr(),
+                    r.payload_xdr(),
+                    l.ledger_seq(),
+                    category,
+                    T::payload_name(),
+                    &mut out,
+                ) {
+                    if l_bytes != r_bytes {
                         out.push(Mismatch {
                             category,
                             detail: format!(
-                                "ledger {}: local {} serialization error: {}",
+                                "ledger {}: {} differs (local {} bytes, reference {} bytes)",
                                 l.ledger_seq(),
                                 T::payload_name(),
-                                e
-                            ),
-                        });
-                    }
-                    (_, Err(e)) => {
-                        out.push(Mismatch {
-                            category,
-                            detail: format!(
-                                "ledger {}: reference {} serialization error: {}",
-                                r.ledger_seq(),
-                                T::payload_name(),
-                                e
+                                l_bytes.len(),
+                                r_bytes.len(),
                             ),
                         });
                     }
@@ -982,5 +1037,200 @@ mod tests {
         assert!(mismatches[2]
             .detail
             .starts_with("ledger 104: tx_result_set differs"));
+    }
+
+    // ========================================================================
+    // Tests for report_xdr_errors helper
+    // ========================================================================
+
+    #[test]
+    fn test_report_xdr_errors_ok_ok() {
+        let mut out = Vec::new();
+        let result = report_xdr_errors(
+            Ok(vec![1, 2, 3]),
+            Ok(vec![4, 5, 6]),
+            42,
+            Category::LedgerHeaders,
+            "header",
+            &mut out,
+        );
+        assert_eq!(result, Some((vec![1, 2, 3], vec![4, 5, 6])));
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn test_report_xdr_errors_local_err() {
+        let mut out = Vec::new();
+        let result = report_xdr_errors(
+            Err(stellar_xdr::curr::Error::Invalid),
+            Ok(vec![4, 5, 6]),
+            42,
+            Category::Transactions,
+            "tx_set",
+            &mut out,
+        );
+        assert_eq!(result, None);
+        assert_eq!(out.len(), 1);
+        assert!(out[0].detail.contains("local"));
+        assert!(out[0].detail.contains("tx_set"));
+        assert!(out[0].detail.contains("ledger 42"));
+        assert!(out[0].detail.contains("serialization error"));
+    }
+
+    #[test]
+    fn test_report_xdr_errors_reference_err() {
+        let mut out = Vec::new();
+        let result = report_xdr_errors(
+            Ok(vec![1, 2, 3]),
+            Err(stellar_xdr::curr::Error::Invalid),
+            99,
+            Category::Results,
+            "tx_result_set",
+            &mut out,
+        );
+        assert_eq!(result, None);
+        assert_eq!(out.len(), 1);
+        assert!(out[0].detail.contains("reference"));
+        assert!(out[0].detail.contains("tx_result_set"));
+        assert!(out[0].detail.contains("ledger 99"));
+        assert!(out[0].detail.contains("serialization error"));
+    }
+
+    #[test]
+    fn test_report_xdr_errors_both_err() {
+        let mut out = Vec::new();
+        let result = report_xdr_errors(
+            Err(stellar_xdr::curr::Error::Invalid),
+            Err(stellar_xdr::curr::Error::Invalid),
+            7,
+            Category::LedgerHeaders,
+            "header",
+            &mut out,
+        );
+        assert_eq!(result, None);
+        assert_eq!(out.len(), 2);
+        // Local is first, reference is second.
+        assert!(out[0].detail.contains("local"));
+        assert!(out[0].detail.contains("ledger 7"));
+        assert!(out[1].detail.contains("reference"));
+        assert!(out[1].detail.contains("ledger 7"));
+    }
+
+    // ========================================================================
+    // Tests for compare_ledger_headers
+    // ========================================================================
+
+    fn make_ledger_header_entry(ledger_seq: u32, base_fee: u32) -> LedgerHeaderHistoryEntry {
+        use stellar_xdr::curr::{
+            Hash, LedgerHeader, LedgerHeaderExt, LedgerHeaderHistoryEntryExt, StellarValue,
+            StellarValueExt, TimePoint, VecM,
+        };
+        let header = LedgerHeader {
+            ledger_version: 25,
+            previous_ledger_hash: Hash([0u8; 32]),
+            scp_value: StellarValue {
+                tx_set_hash: Hash([0u8; 32]),
+                close_time: TimePoint(0),
+                upgrades: VecM::default(),
+                ext: StellarValueExt::Basic,
+            },
+            tx_set_result_hash: Hash([0u8; 32]),
+            bucket_list_hash: Hash([0u8; 32]),
+            ledger_seq,
+            total_coins: 1_000_000,
+            fee_pool: 0,
+            inflation_seq: 0,
+            id_pool: 0,
+            base_fee,
+            base_reserve: 100,
+            max_tx_set_size: 100,
+            skip_list: [
+                Hash([0u8; 32]),
+                Hash([0u8; 32]),
+                Hash([0u8; 32]),
+                Hash([0u8; 32]),
+            ],
+            ext: LedgerHeaderExt::V0,
+        };
+        LedgerHeaderHistoryEntry {
+            hash: Hash([0u8; 32]),
+            header,
+            ext: LedgerHeaderHistoryEntryExt::V0,
+        }
+    }
+
+    #[test]
+    fn test_compare_ledger_headers_field_diff() {
+        let local = vec![make_ledger_header_entry(10, 100)];
+        let reference = vec![make_ledger_header_entry(10, 200)];
+
+        let mismatches = compare_ledger_headers(&local, &reference);
+
+        // Should have a hash mismatch and a field diff for base_fee.
+        assert!(!mismatches.is_empty());
+        let field_mismatch = mismatches
+            .iter()
+            .find(|m| m.detail.contains("fields differ"))
+            .expect("should report field differences");
+        assert!(field_mismatch.detail.contains("base_fee"));
+        assert!(field_mismatch.detail.contains("100!=200"));
+    }
+
+    #[test]
+    fn test_compare_ledger_headers_identical() {
+        let local = vec![make_ledger_header_entry(10, 100)];
+        let reference = vec![make_ledger_header_entry(10, 100)];
+
+        let mismatches = compare_ledger_headers(&local, &reference);
+        // Hash mismatch might still fire since we used zeroed hashes but
+        // equal headers. The key assertion is no serialization errors.
+        for m in &mismatches {
+            assert!(
+                !m.detail.contains("serialization error"),
+                "unexpected serialization error: {}",
+                m.detail
+            );
+        }
+    }
+
+    // ========================================================================
+    // Tests for compare_entries with both-error case
+    // ========================================================================
+
+    #[cfg(test)]
+    struct FailingEntry {
+        seq: u32,
+    }
+
+    impl ComparableEntry for FailingEntry {
+        fn ledger_seq(&self) -> u32 {
+            self.seq
+        }
+        fn payload_xdr(&self) -> std::result::Result<Vec<u8>, stellar_xdr::curr::Error> {
+            Err(stellar_xdr::curr::Error::Invalid)
+        }
+        fn category() -> Category {
+            Category::Transactions
+        }
+        fn payload_name() -> &'static str {
+            "test_payload"
+        }
+    }
+
+    #[test]
+    fn test_compare_entries_both_errors() {
+        let local = vec![FailingEntry { seq: 5 }];
+        let reference = vec![FailingEntry { seq: 5 }];
+
+        let mismatches = compare_entries::<FailingEntry>(&local, &reference);
+
+        // Should produce two mismatches: local first, reference second.
+        assert_eq!(mismatches.len(), 2);
+        assert!(mismatches[0].detail.contains("local"));
+        assert!(mismatches[0].detail.contains("test_payload"));
+        assert!(mismatches[0].detail.contains("serialization error"));
+        assert!(mismatches[1].detail.contains("reference"));
+        assert!(mismatches[1].detail.contains("test_payload"));
+        assert!(mismatches[1].detail.contains("serialization error"));
     }
 }
