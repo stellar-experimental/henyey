@@ -467,14 +467,9 @@ pub(super) struct LedgerChanges<'a> {
 fn push_live_bl_restored_update(
     changes: &mut Vec<LedgerEntryChange>,
     post_state: &LedgerEntry,
-    key: &LedgerKey,
-    restored: &RestoredEntries,
+    original: &LedgerEntry,
     current_ledger_seq: u32,
 ) {
-    let original = restored
-        .live_bl_original(key)
-        .expect("live_bl_restored key must have an original entry");
-
     if post_state.data == original.data {
         // Only restored, not modified — emit RESTORED(post_state)
         changes.push(LedgerEntryChange::Restored(post_state.clone()));
@@ -528,46 +523,37 @@ pub(super) fn build_entry_changes_with_hot_archive(
         processed_keys: &mut HashSet<LedgerKey>,
         current_ledger_seq: u32,
     ) {
-        // For hot archive restores and live bucket list restores (expired TTL),
-        // emit RESTORED instead of CREATED.
-        // This matches stellar-core's processOpLedgerEntryChanges behavior.
-        if restored.is_hot_archive_restored(key) {
-            // Check if the entry was modified after restoration by comparing
-            // against the original hot archive value.
-            // stellar-core: TransactionMeta.cpp:148-161
-            if let Some(original) = restored.hot_archive_original(key) {
+        // Emit RESTORED instead of CREATED for hot archive / live BL restores.
+        // stellar-core: processOpLedgerEntryChanges (TransactionMeta.cpp:148-161)
+        match restored.source(key) {
+            Some(RestoreSource::HotArchive(original)) => {
                 if entry.data == original.data {
-                    // Entry restored but not modified — emit RESTORED(entry)
+                    // Restored but not modified — emit RESTORED(entry)
                     changes.push(LedgerEntryChange::Restored(entry.clone()));
                 } else {
-                    // Entry restored AND modified — emit RESTORED(old) + UPDATED(new)
-                    // stellar-core: stateChangesToAdd inserts RESTORED(oldValue),
-                    // and the CREATED change becomes UPDATED(newValue).
-                    let mut restored_entry = original.clone();
+                    // Restored AND modified — emit RESTORED(old) + UPDATED(new)
+                    let mut restored_entry = original.as_ref().clone();
                     restored_entry.last_modified_ledger_seq = current_ledger_seq;
                     changes.push(LedgerEntryChange::Restored(restored_entry));
                     changes.push(LedgerEntryChange::Updated(entry.clone()));
                 }
-            } else {
-                // No original entry stored — valid only for TTL keys (synthetic).
-                // Non-TTL keys must have an original entry; its absence is a bug.
-                assert!(
-                    matches!(key, LedgerKey::Ttl(_)),
-                    "hot archive key missing original entry but is not TTL: {:?}",
-                    std::mem::discriminant(key)
-                );
+            }
+            Some(RestoreSource::HotArchiveTtl) => {
+                // Synthesized TTL key — no original to compare, just emit RESTORED.
                 changes.push(LedgerEntryChange::Restored(entry.clone()));
             }
-        } else if restored.is_live_bl_restored(key) {
-            // Live BL restores should never appear as CREATED — they use LIVE (updated)
-            // in the delta because the entry already exists in the live BL.
-            // stellar-core: TransactionMeta.cpp:140-141 asserts this.
-            unreachable!(
-                "live BL restored entry should not appear as CREATED: {:?}",
-                std::mem::discriminant(key)
-            );
-        } else {
-            changes.push(LedgerEntryChange::Created(entry.clone()));
+            Some(RestoreSource::LiveBucketList(_)) => {
+                // Live BL restores should never appear as CREATED — they use LIVE
+                // (updated) in the delta because the entry already exists.
+                // stellar-core: TransactionMeta.cpp:140-141 asserts this.
+                unreachable!(
+                    "live BL restored entry should not appear as CREATED: {:?}",
+                    std::mem::discriminant(key)
+                );
+            }
+            None => {
+                changes.push(LedgerEntryChange::Created(entry.clone()));
+            }
         }
         processed_keys.insert(key.clone());
     }
@@ -697,37 +683,40 @@ pub(super) fn build_entry_changes_with_hot_archive(
                         // setLedgerChangesFromSuccessfulOp which uses raw res.getModifiedEntryMap()).
                         // The filtering to mRoTTLBumps only affects STATE updates (commitChangesFromSuccessfulOp),
                         // not transaction meta. Do NOT skip ro_ttl_keys here.
-                        if restored.is_hot_archive_restored(&key) {
-                            // stellar-core: TransactionMeta.cpp:173-174 asserts hot archive
-                            // entries do not appear as UPDATED (they use CREATED path).
-                            unreachable!(
-                                "hot archive entries should not appear as UPDATED: {:?}",
-                                std::mem::discriminant(&key)
-                            );
-                        } else if restored.is_live_bl_restored(&key) {
-                            push_live_bl_restored_update(
-                                &mut changes,
-                                post_state,
-                                &key,
-                                restored,
-                                current_ledger_seq,
-                            );
-                            processed_keys.insert(key);
-                        } else {
-                            // Get pre-state from update_states or snapshot
-                            let pre_state = if idx < update_states.len() {
-                                Some(update_states[idx].clone())
-                            } else {
-                                state_overrides
-                                    .get(&key)
-                                    .cloned()
-                                    .or_else(|| state.snapshot_entry(&key))
-                            };
-                            if let Some(state_entry) = pre_state {
-                                changes.push(LedgerEntryChange::State(state_entry));
+                        match restored.source(&key) {
+                            Some(RestoreSource::HotArchive(_) | RestoreSource::HotArchiveTtl) => {
+                                // stellar-core: TransactionMeta.cpp:173-174 asserts hot archive
+                                // entries do not appear as UPDATED (they use CREATED path).
+                                unreachable!(
+                                    "hot archive entries should not appear as UPDATED: {:?}",
+                                    std::mem::discriminant(&key)
+                                );
                             }
-                            changes.push(LedgerEntryChange::Updated(post_state.clone()));
-                            processed_keys.insert(key);
+                            Some(RestoreSource::LiveBucketList(original)) => {
+                                push_live_bl_restored_update(
+                                    &mut changes,
+                                    post_state,
+                                    original,
+                                    current_ledger_seq,
+                                );
+                                processed_keys.insert(key);
+                            }
+                            None => {
+                                // Get pre-state from update_states or snapshot
+                                let pre_state = if idx < update_states.len() {
+                                    Some(update_states[idx].clone())
+                                } else {
+                                    state_overrides
+                                        .get(&key)
+                                        .cloned()
+                                        .or_else(|| state.snapshot_entry(&key))
+                                };
+                                if let Some(state_entry) = pre_state {
+                                    changes.push(LedgerEntryChange::State(state_entry));
+                                }
+                                changes.push(LedgerEntryChange::Updated(post_state.clone()));
+                                processed_keys.insert(key);
+                            }
                         }
                     }
                 }
@@ -799,39 +788,40 @@ pub(super) fn build_entry_changes_with_hot_archive(
                     if *idx < updated.len() {
                         let post_state = &updated[*idx];
                         let key = henyey_common::entry_to_key(post_state);
-                        if restored.is_hot_archive_restored(&key) {
-                            // stellar-core: TransactionMeta.cpp:173-174 asserts hot archive
-                            // entries do not appear as UPDATED (they use CREATED path).
-                            unreachable!(
-                                "hot archive entries should not appear as UPDATED: {:?}",
-                                std::mem::discriminant(&key)
-                            );
-                        } else if restored.is_live_bl_restored(&key) {
-                            push_live_bl_restored_update(
-                                &mut changes,
-                                post_state,
-                                &key,
-                                restored,
-                                current_ledger_seq,
-                            );
-                            processed_keys.insert(key);
-                        } else {
-                            // Normal update: STATE (pre-state) then UPDATED (post-state)
-                            // Use the pre-state stored in the delta at the same index
-                            let pre_state = if *idx < update_states.len() {
-                                Some(update_states[*idx].clone())
-                            } else {
-                                // Fallback to snapshot lookup if pre-state not available
-                                state_overrides
-                                    .get(&key)
-                                    .cloned()
-                                    .or_else(|| state.snapshot_entry(&key))
-                            };
-                            if let Some(state_entry) = pre_state {
-                                changes.push(LedgerEntryChange::State(state_entry));
+                        match restored.source(&key) {
+                            Some(RestoreSource::HotArchive(_) | RestoreSource::HotArchiveTtl) => {
+                                // stellar-core: TransactionMeta.cpp:173-174 asserts hot archive
+                                // entries do not appear as UPDATED (they use CREATED path).
+                                unreachable!(
+                                    "hot archive entries should not appear as UPDATED: {:?}",
+                                    std::mem::discriminant(&key)
+                                );
                             }
-                            changes.push(LedgerEntryChange::Updated(post_state.clone()));
-                            processed_keys.insert(key);
+                            Some(RestoreSource::LiveBucketList(original)) => {
+                                push_live_bl_restored_update(
+                                    &mut changes,
+                                    post_state,
+                                    original,
+                                    current_ledger_seq,
+                                );
+                                processed_keys.insert(key);
+                            }
+                            None => {
+                                // Normal update: STATE (pre-state) then UPDATED (post-state)
+                                let pre_state = if *idx < update_states.len() {
+                                    Some(update_states[*idx].clone())
+                                } else {
+                                    state_overrides
+                                        .get(&key)
+                                        .cloned()
+                                        .or_else(|| state.snapshot_entry(&key))
+                                };
+                                if let Some(state_entry) = pre_state {
+                                    changes.push(LedgerEntryChange::State(state_entry));
+                                }
+                                changes.push(LedgerEntryChange::Updated(post_state.clone()));
+                                processed_keys.insert(key);
+                            }
                         }
                     }
                 }
@@ -914,32 +904,35 @@ pub(super) fn build_entry_changes_with_hot_archive(
             if !seen_keys.contains(&key) {
                 seen_keys.insert(key.clone());
                 if let Some(final_entry) = final_updated.get(&key) {
-                    if restored.is_hot_archive_restored(&key) {
-                        // stellar-core: TransactionMeta.cpp:173-174 asserts hot archive
-                        // entries do not appear as UPDATED (they use CREATED path).
-                        unreachable!(
-                            "hot archive entries should not appear as UPDATED: {:?}",
-                            std::mem::discriminant(&key)
-                        );
-                    } else if restored.is_live_bl_restored(&key) {
-                        push_live_bl_restored_update(
-                            &mut changes,
-                            final_entry,
-                            &key,
-                            restored,
-                            current_ledger_seq,
-                        );
-                        processed_keys.insert(key);
-                    } else {
-                        if let Some(state_entry) = state_overrides
-                            .get(&key)
-                            .cloned()
-                            .or_else(|| state.snapshot_entry(&key))
-                        {
-                            changes.push(LedgerEntryChange::State(state_entry));
+                    match restored.source(&key) {
+                        Some(RestoreSource::HotArchive(_) | RestoreSource::HotArchiveTtl) => {
+                            // stellar-core: TransactionMeta.cpp:173-174 asserts hot archive
+                            // entries do not appear as UPDATED (they use CREATED path).
+                            unreachable!(
+                                "hot archive entries should not appear as UPDATED: {:?}",
+                                std::mem::discriminant(&key)
+                            );
                         }
-                        changes.push(LedgerEntryChange::Updated(final_entry.clone()));
-                        processed_keys.insert(key);
+                        Some(RestoreSource::LiveBucketList(original)) => {
+                            push_live_bl_restored_update(
+                                &mut changes,
+                                final_entry,
+                                original,
+                                current_ledger_seq,
+                            );
+                            processed_keys.insert(key);
+                        }
+                        None => {
+                            if let Some(state_entry) = state_overrides
+                                .get(&key)
+                                .cloned()
+                                .or_else(|| state.snapshot_entry(&key))
+                            {
+                                changes.push(LedgerEntryChange::State(state_entry));
+                            }
+                            changes.push(LedgerEntryChange::Updated(final_entry.clone()));
+                            processed_keys.insert(key);
+                        }
                     }
                 }
             }

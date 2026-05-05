@@ -100,7 +100,7 @@ pub use tx_set::{
     run_transactions_on_executor, FeeStrategy, RunTransactionsParams, SorobanFeeSource,
 };
 
-use apply::{RestoredEntries, AUTHORIZED_FLAG};
+use apply::{RestoreSource, RestoredEntries, AUTHORIZED_FLAG};
 use meta::*;
 use signatures::*;
 
