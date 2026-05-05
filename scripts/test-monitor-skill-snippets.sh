@@ -42,7 +42,7 @@ cleanup  # ensure fresh state
 mkdir -p "$TEST_ROOT"
 
 # ── TAP state ────────────────────────────────────────────────────────────────
-TAP_PLAN=48
+TAP_PLAN=50
 TAP_CURRENT=0
 TAP_FAILURES=0
 
@@ -772,10 +772,12 @@ run_tests() {
   # ── Check 12b semantic assertions ──────────────────────────────────────────
   # Verify that the Check 12b recovery-stalled streak semantics in the
   # monitor-tick and monitor-loop SKILL.md specs have not regressed.
-  # See issue #2399.
+  # Cross-validates inline literals against the canonical TOML source.
+  # See issues #2399, #2402.
 
   local tick_file="$REPO_ROOT/.claude/skills/monitor-tick/SKILL.md"
   local loop_file="$REPO_ROOT/.claude/skills/monitor-loop/SKILL.md"
+  local constants_file="$REPO_ROOT/.claude/skills/shared/check-12b-constants.toml"
 
   # Section extractions (scoped to avoid false positives from unrelated text)
   local check_12b_section watcher_section output_section
@@ -807,32 +809,53 @@ run_tests() {
     return
   fi
 
-  # Test 41: Streak threshold — breach_streak >= 3
-  if echo "$check_12b_section" | grep -Fq 'breach_streak >= 3'; then
-    tap_ok "check-12b-semantics: streak threshold (breach_streak >= 3)"
+  # Test 41: TOML constants file exists and is parseable (fail closed)
+  local streak_val burst_val delta_val snapshot_file mode_val
+  streak_val=$(grep -oP '^streak\s*=\s*\K\d+' "$constants_file" 2>/dev/null) || streak_val=""
+  burst_val=$(grep -oP '^burst\s*=\s*\K\d+' "$constants_file" 2>/dev/null) || burst_val=""
+  delta_val=$(grep -oP '^delta\s*=\s*\K\d+' "$constants_file" 2>/dev/null) || delta_val=""
+  snapshot_file=$(grep -oP '^file\s*=\s*"\K[^"]+' "$constants_file" 2>/dev/null) || snapshot_file=""
+  mode_val=$(grep -oP '^mode\s*=\s*"\K[^"]+' "$constants_file" 2>/dev/null) || mode_val=""
+
+  if [[ -n "$streak_val" && -n "$burst_val" && -n "$delta_val" \
+        && -n "$snapshot_file" && -n "$mode_val" ]]; then
+    tap_ok "check-12b-constants: TOML exists and parseable (streak=$streak_val burst=$burst_val delta=$delta_val)"
   else
-    tap_not_ok "check-12b-semantics: streak threshold (breach_streak >= 3)" \
-      "Check 12b section missing 'breach_streak >= 3'"
+    tap_not_ok "check-12b-constants: TOML exists and parseable" \
+      "Missing or unparseable: streak=$streak_val burst=$burst_val delta=$delta_val file=$snapshot_file mode=$mode_val"
+    # Fail closed: remaining 12b tests cannot proceed
+    while [[ $TAP_CURRENT -lt $TAP_PLAN ]]; do
+      tap_not_ok "check-12b (skipped: TOML parse failed)"
+    done
+    return
   fi
 
-  # Test 42: Burst threshold — delta >= 10
-  if echo "$check_12b_section" | grep -Fq 'delta >= 10'; then
-    tap_ok "check-12b-semantics: burst threshold (delta >= 10)"
+  # Test 42: Streak threshold cross-validated against TOML
+  if echo "$check_12b_section" | grep -Fq "breach_streak >= $streak_val"; then
+    tap_ok "check-12b-semantics: streak threshold (breach_streak >= $streak_val)"
   else
-    tap_not_ok "check-12b-semantics: burst threshold (delta >= 10)" \
-      "Check 12b section missing 'delta >= 10'"
+    tap_not_ok "check-12b-semantics: streak threshold (breach_streak >= $streak_val)" \
+      "Check 12b section missing 'breach_streak >= $streak_val'"
   fi
 
-  # Test 43: Uses counter_streak_snapshot (not ratio_snapshot)
-  if echo "$check_12b_section" | grep -Fq 'counter_streak_snapshot' \
+  # Test 43: Burst threshold cross-validated against TOML
+  if echo "$check_12b_section" | grep -Fq "delta >= $burst_val"; then
+    tap_ok "check-12b-semantics: burst threshold (delta >= $burst_val)"
+  else
+    tap_not_ok "check-12b-semantics: burst threshold (delta >= $burst_val)" \
+      "Check 12b section missing 'delta >= $burst_val'"
+  fi
+
+  # Test 44: Snapshot file from TOML + negative assertion (not ratio_snapshot)
+  if echo "$check_12b_section" | grep -Fq "$snapshot_file" \
      && ! echo "$check_12b_section" | grep -Fq 'ratio_snapshot'; then
-    tap_ok "check-12b-semantics: uses counter_streak_snapshot (not ratio_snapshot)"
+    tap_ok "check-12b-semantics: uses $snapshot_file (not ratio_snapshot)"
   else
-    tap_not_ok "check-12b-semantics: uses counter_streak_snapshot (not ratio_snapshot)" \
-      "Check 12b should reference counter_streak_snapshot, not ratio_snapshot"
+    tap_not_ok "check-12b-semantics: uses $snapshot_file (not ratio_snapshot)" \
+      "Check 12b should reference '$snapshot_file', not ratio_snapshot"
   fi
 
-  # Test 44: Excluded from watcher mode (monitor-tick)
+  # Test 45: Excluded from watcher mode (monitor-tick)
   if echo "$watcher_section" | grep -Fq 'Check 12b' \
      && echo "$watcher_section" | grep -iq 'skip' \
      && echo "$watcher_section" | grep -Fq 'recovery_stalled'; then
@@ -842,7 +865,7 @@ run_tests() {
       "Watcher section must skip Check 12b and omit recovery_stalled line"
   fi
 
-  # Test 45: Excluded from metrics: aggregate (NOT counted)
+  # Test 46: Excluded from metrics: aggregate (NOT counted)
   if echo "$check_12b_section" | grep -Fq 'NOT counted in the'; then
     tap_ok "check-12b-semantics: excluded from metrics aggregate (NOT counted)"
   else
@@ -850,7 +873,7 @@ run_tests() {
       "Check 12b section missing 'NOT counted in the' (metrics exclusion)"
   fi
 
-  # Test 46: recovery_stalled: in output template
+  # Test 47: recovery_stalled: in output template
   if echo "$output_section" | grep -Fq 'recovery_stalled:'; then
     tap_ok "check-12b-semantics: recovery_stalled in output template"
   else
@@ -858,25 +881,36 @@ run_tests() {
       "Output template missing 'recovery_stalled:' line"
   fi
 
-  # Test 47: Cross-file — monitor-loop streak table + snapshot consistency
-  if echo "$loop_streak_table" | grep -Fq '3 ticks' \
-     && echo "$loop_streak_table" | grep -Fq '≥ 10' \
-     && echo "$loop_snapshot_section" | grep -Fq 'counter_streak_snapshot'; then
-    tap_ok "check-12b-semantics: monitor-loop streak table + snapshot consistent"
+  # Test 48: Cross-file — monitor-loop table row matches TOML values (row-specific)
+  local recovery_row
+  recovery_row=$(echo "$loop_streak_table" | grep 'forcing_catchup_behind' || true)
+  if [[ -n "$recovery_row" ]] \
+     && echo "$recovery_row" | grep -Fq "${streak_val} ticks" \
+     && echo "$recovery_row" | grep -Fq "≥ ${burst_val}" \
+     && echo "$loop_snapshot_section" | grep -Fq "$snapshot_file"; then
+    tap_ok "check-12b-semantics: monitor-loop table row + snapshot match TOML"
   else
-    tap_not_ok "check-12b-semantics: monitor-loop streak table + snapshot consistent" \
-      "monitor-loop missing '3 ticks', '≥ 10', or 'counter_streak_snapshot'"
+    tap_not_ok "check-12b-semantics: monitor-loop table row + snapshot match TOML" \
+      "Expected forcing_catchup_behind row with '${streak_val} ticks', '≥ ${burst_val}', and '$snapshot_file'"
   fi
 
-  # Test 48: Cross-file — monitor-loop validator-only + watcher excludes Check 12b
-  if echo "$loop_snapshot_section" | grep -Fq 'Validator mode only' \
-     && echo "$loop_watcher_section" | grep -Fq 'Watcher mode' \
-     && ! echo "$loop_watcher_section" | grep -Fq 'recovery_stalled' \
-     && ! echo "$loop_watcher_section" | grep -Fq 'counter_streak'; then
-    tap_ok "check-12b-semantics: monitor-loop validator-only + watcher excludes Check 12b"
+  # Test 49: monitor-loop watcher explicitly excludes Check 12b
+  if echo "$loop_watcher_section" | grep -Fq 'Check 12b' \
+     && echo "$loop_watcher_section" | grep -Fq 'recovery_stalled' \
+     && echo "$loop_snapshot_section" | grep -Fq 'Validator mode only'; then
+    tap_ok "check-12b-semantics: monitor-loop watcher excludes Check 12b + validator-only"
   else
-    tap_not_ok "check-12b-semantics: monitor-loop validator-only + watcher excludes Check 12b" \
-      "monitor-loop: snapshot must say 'Validator mode only'; watcher must not mention recovery_stalled/counter_streak"
+    tap_not_ok "check-12b-semantics: monitor-loop watcher excludes Check 12b + validator-only" \
+      "monitor-loop: watcher must mention Check 12b + recovery_stalled; snapshot must say Validator mode only"
+  fi
+
+  # Test 50: Reference link to constants file in both SKILL.md files
+  if grep -Fq 'check-12b-constants.toml' "$tick_file" \
+     && grep -Fq 'check-12b-constants.toml' "$loop_file"; then
+    tap_ok "check-12b-constants: reference link in both SKILL.md files"
+  else
+    tap_not_ok "check-12b-constants: reference link in both SKILL.md files" \
+      "Both SKILL.md must contain 'check-12b-constants.toml'"
   fi
 }
 

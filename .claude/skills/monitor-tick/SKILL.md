@@ -53,7 +53,7 @@ All files below live in `/home/tomer/data/$MONITOR_SESSION_ID/`:
 | `metrics/current.prom` | latest Prometheus scrape | check 8 |
 | `metrics/prev.prom` | previous Prometheus scrape | check 8 |
 | `metrics/ratio_snapshot` | counter-ratio history (check 12) | check 12 |
-| `metrics/counter_streak_snapshot` | counter-streak state (check 12b) | check 12b |
+| `metrics/counter_streak_snapshot` | counter-streak state (check 12b) | check 12b ([constants](../shared/check-12b-constants.toml)) |
 | `metrics/anomaly_cooldown.json` | alert dedup state | check 9 |
 | `logs/monitor.log` | node stdout/stderr (rotated on restart) | node process |
 | `cargo-target/` | cached build tree | cargo |
@@ -777,6 +777,11 @@ minimum, that check skips (streak resets to 0) and the others proceed normally.
 `skipped (reason)`, `WARNING value (N ticks)`, or `collecting baseline`.
 
 ### Check 12b: Recovery-stalled streak (counter-based, independent of ratio checks)
+
+> **Canonical constants:** Threshold values, snapshot path, and applicability
+> are defined in [`shared/check-12b-constants.toml`](../shared/check-12b-constants.toml).
+> This section is authoritative for the state machine *logic*; inline literals
+> are cross-validated against the TOML by `scripts/test-monitor-skill-snippets.sh`.
 
 This check tracks `henyey_recovery_stalled_tick_total{reason="forcing_catchup_behind"}`
 using a streak-gated alert, independent of Check 12's ratio checks. It runs on

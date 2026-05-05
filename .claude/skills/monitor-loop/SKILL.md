@@ -208,6 +208,10 @@ table is the human reference.
 
 **B. Streak-gated counters — fire on sustained delta breach (3 consecutive ticks) or burst (single-tick delta ≥ 10)**
 
+> **Canonical constants:** Check 12b threshold values and rules are defined in
+> [`shared/check-12b-constants.toml`](../shared/check-12b-constants.toml).
+> The table below is a quick-reference summary; the TOML file is authoritative.
+
 These counter-based checks use streak gating rather than immediate-fire thresholds
 because single-tick increments are often transient self-recovering events that
 don't warrant operator attention (see #2309). State is tracked independently of
@@ -262,18 +266,11 @@ pending_breach_streak=<N>
 ```
 Invalidate on PID/start_ticks change, malformed snapshot, or counter reset (current < previous).
 
-**Counter-streak snapshot** persisted at `~/data/<session-id>/metrics/counter_streak_snapshot`:
-```
-version=1
-pid=<PID>
-start_ticks=<field 22 from /proc/$PID/stat>
-timestamp=<ISO8601>
-recovery_stalled_behind=<value>
-recovery_stalled_breach_streak=<N>
-```
+**Counter-streak snapshot** persisted at `~/data/<session-id>/metrics/counter_streak_snapshot`
+(format and invalidation rules defined in Check 12b of monitor-tick/SKILL.md;
+path canonicalized in [`shared/check-12b-constants.toml`](../shared/check-12b-constants.toml)).
 Separate from ratio snapshot — runs independently of ratio skip conditions (see
-Check 12b in monitor-tick for full state machine). Invalidate on PID/start_ticks
-change, malformed snapshot, or counter reset. Validator mode only.
+Check 12b in monitor-tick for full state machine). Validator mode only.
 
 **SCP denominator rationale:** Includes all 13 post-verify outcomes (not just errors). Normal
 outcomes (`duplicate`, `buffered`, `non_quorum`, `self_message`) appear at healthy-state
@@ -378,7 +375,9 @@ Watcher mode (`--watcher`) exposes `/metrics` on port 11727 but has no
 validator/quorum/SCP state. Run check (12) with a reduced catalog:
 process (`henyey_process_open_fds`, `_max_fds`), jemalloc, overlay
 (`stellar_overlay_*_total`, `henyey_overlay_fetch_channel_depth`).
-Skip SCP, quorum, herder_state, histogram p99 alerts, and ratio checks.
+Skip SCP, quorum, herder_state, histogram p99 alerts, ratio checks,
+and Check 12b (recovery-stalled streak). Omit the `recovery_stalled:`
+line from watcher output entirely.
 
 ## Bug / CI-Failure Filing Workflow
 
@@ -630,7 +629,9 @@ Invocation options:
   ```
 
 For the authoritative catalog (thresholds, metric names, rules), see
-`/monitor-tick/SKILL.md`. The human-readable reference catalog in
+`/monitor-tick/SKILL.md`. Check 12b threshold constants are canonicalized in
+[`shared/check-12b-constants.toml`](../shared/check-12b-constants.toml) for
+machine-readable validation. The human-readable reference catalog in
 [Metrics Scan](#metrics-scan) above is informational; the live catalog
 is in the tick skill.
 

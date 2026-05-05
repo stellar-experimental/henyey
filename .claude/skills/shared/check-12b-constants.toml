@@ -1,0 +1,23 @@
+# Check 12b: Recovery-Stalled Streak — Canonical Constants
+#
+# Single source of truth for Check 12b threshold values.
+# Both SKILL.md files reference this. Update ONLY here when changing values.
+# scripts/test-monitor-skill-snippets.sh validates both specs against this file.
+
+[metric]
+name = "henyey_recovery_stalled_tick_total"
+label = 'reason="forcing_catchup_behind"'
+
+[thresholds]
+delta = 1           # Any increment counts as a breach tick (delta >= 1)
+streak = 3          # Consecutive breach ticks before alert fires
+burst = 10          # Single-tick delta for immediate-fire override (delta >= 10)
+
+[applicability]
+# "validator" means: skip Check 12b entirely in watcher mode,
+# omit recovery_stalled: status line in watcher output,
+# exclude Check 12b alerts from the metrics: aggregate line.
+mode = "validator"
+
+[snapshot]
+file = "metrics/counter_streak_snapshot"  # Relative to session data dir
