@@ -1274,4 +1274,70 @@ mod tests {
         let header = make_test_header(77, Hash256::ZERO);
         assert!(verify_header_matches_trusted(&header, &header).is_ok());
     }
+
+    // --- Precedence regression tests for verify_tx_result_ordering ---
+
+    fn make_tx_result_entry(ledger_seq: u32) -> TransactionHistoryResultEntry {
+        use stellar_xdr::curr::{TransactionHistoryResultEntryExt, TransactionResultSet};
+        TransactionHistoryResultEntry {
+            ledger_seq,
+            tx_result_set: TransactionResultSet {
+                results: VecM::default(),
+            },
+            ext: TransactionHistoryResultEntryExt::V0,
+        }
+    }
+
+    #[test]
+    fn test_ordering_violation_before_range_violation() {
+        // Checkpoint 63 → range [1, 63].
+        // Index 1: ordering violation (20 <= 30). Index 2: range violation (999 > 63).
+        // Ordering violation comes first by position → ordering error reported.
+        let entries = vec![
+            make_tx_result_entry(30),
+            make_tx_result_entry(20),  // ordering violation
+            make_tx_result_entry(999), // range violation
+        ];
+        let err = verify_tx_result_ordering(&entries, 63).unwrap_err();
+        assert!(
+            err.to_string().contains("not strictly increasing"),
+            "expected ordering error, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_range_violation_before_ordering_violation() {
+        // Checkpoint 63 → range [1, 63].
+        // Index 0: range violation (999 > 63). Index 2: ordering violation (5 <= 10).
+        // Range violation comes first by position → range error reported.
+        let entries = vec![
+            make_tx_result_entry(999), // range violation
+            make_tx_result_entry(10),
+            make_tx_result_entry(5), // ordering violation
+        ];
+        let err = verify_tx_result_ordering(&entries, 63).unwrap_err();
+        assert!(
+            err.to_string().contains("outside checkpoint range"),
+            "expected range error, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_same_entry_violates_both_range_wins() {
+        // Checkpoint 63 → range [1, 63].
+        // Entry with seq=0 after seq=50: out-of-range (0 < 1) AND non-increasing (0 <= 50).
+        // Range is checked first in the loop body → range error wins.
+        let entries = vec![
+            make_tx_result_entry(50),
+            make_tx_result_entry(0), // range: 0 < 1; ordering: 0 <= 50
+        ];
+        let err = verify_tx_result_ordering(&entries, 63).unwrap_err();
+        assert!(
+            err.to_string().contains("outside checkpoint range"),
+            "expected range error, got: {}",
+            err
+        );
+    }
 }

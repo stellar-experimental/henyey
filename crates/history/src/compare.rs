@@ -512,15 +512,6 @@ impl ComparableEntry for TransactionHistoryResultEntry {
     }
 }
 
-/// Validates that entries are strictly increasing by `ledger_seq`.
-/// Returns the index of the first violation, or `None` if valid.
-fn find_ordering_violation<T: ComparableEntry>(entries: &[T]) -> Option<usize> {
-    entries
-        .windows(2)
-        .position(|w| w[1].ledger_seq() <= w[0].ledger_seq())
-        .map(|pos| pos + 1)
-}
-
 /// Compares two entry slices by `ledger_seq` using a merge-join.
 ///
 /// Both slices must be strictly increasing by `ledger_seq`. If either is not,
@@ -532,22 +523,22 @@ fn compare_entries<T: ComparableEntry>(local: &[T], reference: &[T]) -> Vec<Mism
     let category = T::category();
 
     // Validate strict ordering on both sides.
-    if let Some(idx) = find_ordering_violation(local) {
+    if let Some(v) = crate::ordering::find_ordering_violation(local, |e| e.ledger_seq()) {
         out.push(Mismatch {
             category,
             detail: format!(
                 "local entries not strictly ordered by ledger_seq (at index {})",
-                idx
+                v.index
             ),
         });
         return out;
     }
-    if let Some(idx) = find_ordering_violation(reference) {
+    if let Some(v) = crate::ordering::find_ordering_violation(reference, |e| e.ledger_seq()) {
         out.push(Mismatch {
             category,
             detail: format!(
                 "reference entries not strictly ordered by ledger_seq (at index {})",
-                idx
+                v.index
             ),
         });
         return out;

@@ -235,29 +235,17 @@ impl PublishManager {
         verify::verify_header_chain_from_entries(headers)?;
 
         // Validate tx/result entries: no duplicates, ordered by ledger_seq.
-        let mut last_tx_seq: Option<u32> = None;
-        for entry in tx_entries {
-            if let Some(prev) = last_tx_seq {
-                if entry.ledger_seq <= prev {
-                    return Err(HistoryError::VerificationFailed(format!(
-                        "tx entries not strictly ordered: {} after {}",
-                        entry.ledger_seq, prev
-                    )));
-                }
-            }
-            last_tx_seq = Some(entry.ledger_seq);
+        if let Some(v) = crate::ordering::find_ordering_violation(tx_entries, |e| e.ledger_seq) {
+            return Err(HistoryError::VerificationFailed(format!(
+                "tx entries not strictly ordered: {} after {}",
+                v.curr_seq, v.prev_seq
+            )));
         }
-        let mut last_res_seq: Option<u32> = None;
-        for entry in tx_results {
-            if let Some(prev) = last_res_seq {
-                if entry.ledger_seq <= prev {
-                    return Err(HistoryError::VerificationFailed(format!(
-                        "result entries not strictly ordered: {} after {}",
-                        entry.ledger_seq, prev
-                    )));
-                }
-            }
-            last_res_seq = Some(entry.ledger_seq);
+        if let Some(v) = crate::ordering::find_ordering_violation(tx_results, |e| e.ledger_seq) {
+            return Err(HistoryError::VerificationFailed(format!(
+                "result entries not strictly ordered: {} after {}",
+                v.curr_seq, v.prev_seq
+            )));
         }
 
         let tx_entry_map: std::collections::HashMap<_, _> = tx_entries

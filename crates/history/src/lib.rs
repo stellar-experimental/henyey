@@ -111,6 +111,7 @@ pub mod verify;
 
 // Comparison and validation
 pub mod compare;
+pub(crate) mod ordering;
 
 // Publishing and external data sources
 pub mod cdp;
