@@ -5153,4 +5153,79 @@ mod tests {
             "level 1 should have pending merge with output hash"
         );
     }
+
+    /// Regression test for AUDIT-257 (#2300): add_batch must reject cross-category
+    /// duplicate keys (same key in both init and dead entries).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_add_batch_cross_category_duplicate_rejected() {
+        let mut bl = BucketList::new();
+        let entry = make_account_entry([5u8; 32], 100);
+        let key = make_account_key([5u8; 32]);
+        let result = bl.add_batch(
+            1,
+            TEST_PROTOCOL,
+            BucketListType::Live,
+            vec![entry],
+            vec![],
+            vec![key],
+        );
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("duplicate or out-of-order"),
+            "expected duplicate key error from cross-category init+dead"
+        );
+    }
+
+    /// Regression test for AUDIT-257 (#2300): add_batch_unique must also reject
+    /// cross-category duplicate keys despite skipping within-category dedup.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_add_batch_unique_cross_category_duplicate_rejected() {
+        let mut bl = BucketList::new();
+        let entry = make_account_entry([6u8; 32], 200);
+        let key = make_account_key([6u8; 32]);
+        let result = bl.add_batch_unique(
+            1,
+            TEST_PROTOCOL,
+            BucketListType::Live,
+            vec![entry],
+            vec![],
+            vec![key],
+        );
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("duplicate or out-of-order"),
+            "expected duplicate key error from cross-category init+dead via add_batch_unique"
+        );
+    }
+
+    /// Regression test for AUDIT-257 (#2300): pre-v11 protocol normalizes init
+    /// entries to Liveentry, so same key in init_entries and live_entries should
+    /// be caught as a duplicate.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_add_batch_pre_v11_duplicate_rejected() {
+        let mut bl = BucketList::new();
+        let entry = make_account_entry([7u8; 32], 100);
+        let result = bl.add_batch(
+            1,
+            10, // pre-v11
+            BucketListType::Live,
+            vec![entry.clone()],
+            vec![entry],
+            vec![],
+        );
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("duplicate or out-of-order"),
+            "expected duplicate key error for pre-v11 init+live same key"
+        );
+    }
 }
