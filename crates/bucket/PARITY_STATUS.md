@@ -120,6 +120,7 @@ Corresponds to: `HotArchiveBucket.h`, `HotArchiveBucketList.h`, `HotArchiveBucke
 | `HotArchiveBucketIndex::getPageSize()` | *(none)* | None |
 | `HotArchiveBucketIndex::begin()` / `end()` | *(none)* | None |
 | `HotArchiveBucketIndex::markBloomMiss()` | *(none)* | None |
+| `BucketInputIterator<HotArchiveBucket>` metadata ext validation | `validate_hot_archive_metadata()` in load paths | Full |
 
 ### bucket manager (`manager.rs`)
 

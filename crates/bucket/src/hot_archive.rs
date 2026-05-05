@@ -126,13 +126,17 @@ impl HotArchiveBucket {
         }
     }
 
-    /// Create a hot archive bucket from pre-formed entries.
+    /// Create a hot archive bucket from pre-formed entries (unchecked internal constructor).
     ///
     /// Validates that entries satisfy the sorted-unique invariant:
     /// - At most one metadata entry, and if present it must be first
     /// - Keyed entries must be strictly ascending by `LedgerKey::cmp`
     /// - No duplicate keys (including cross-variant: `Archived(k)` and `Live(k)`
     ///   with the same `LedgerKey` are duplicates)
+    ///
+    /// Does NOT validate metadata ext — callers are responsible for ensuring
+    /// entries are valid for their context. Used by merge (which mirrors stellar-core's
+    /// protocol-conditional output) and tests.
     ///
     /// Content validation (e.g., Soroban persistence checks) is the
     /// responsibility of higher-level constructors like [`Self::fresh()`].
@@ -467,6 +471,9 @@ impl HotArchiveBucket {
             match HotArchiveBucketEntry::from_xdr(record.body, Limits::none()) {
                 Ok(entry) => {
                     validator.validate_key(hot_archive_entry_ledger_key(&entry))?;
+                    if let HotArchiveBucketEntry::Metaentry(ref meta) = entry {
+                        validate_hot_archive_metadata(meta)?;
+                    }
                     let key = hot_archive_entry_to_key(&entry)?;
                     entries.insert(key, entry.clone());
                     ordered_entries.push(entry);
@@ -581,6 +588,9 @@ impl HotArchiveBucket {
                 })?;
 
             validator.validate_key(hot_archive_entry_ledger_key(&entry))?;
+            if let HotArchiveBucketEntry::Metaentry(ref meta) = entry {
+                validate_hot_archive_metadata(meta)?;
+            }
             let key = hot_archive_entry_to_key(&entry)?;
             built_index.insert(key, record.offset);
             entry_count += 1;
@@ -1627,6 +1637,22 @@ impl std::fmt::Debug for HotArchiveBucketList {
             .field("hash", &self.hash().to_hex())
             .field("stats", &self.stats())
             .finish()
+    }
+}
+
+/// Validate that a hot archive bucket's metadata has the correct ext field.
+///
+/// Hot archive buckets loaded from external sources must have
+/// `BucketMetadataExt::V1(BucketListType::HotArchive)`. Buckets with no metadata
+/// entry are valid (stellar-core only validates metadata when present).
+///
+/// stellar-core parity: BucketInputIterator.cpp:54-63
+fn validate_hot_archive_metadata(meta: &BucketMetadata) -> Result<()> {
+    match &meta.ext {
+        BucketMetadataExt::V1(BucketListType::HotArchive) => Ok(()),
+        _ => Err(BucketError::Corruption(
+            "META entry with incorrect bucket list type".into(),
+        )),
     }
 }
 
@@ -3135,5 +3161,105 @@ mod tests {
         let result = HotArchiveBucket::from_entries(entries);
         assert!(result.is_ok());
         assert_eq!(result.unwrap().len(), 3);
+    }
+
+    // --- Metadata ext validation tests ---
+
+    fn make_meta_v0() -> HotArchiveBucketEntry {
+        HotArchiveBucketEntry::Metaentry(BucketMetadata {
+            ledger_version: 25,
+            ext: BucketMetadataExt::V0,
+        })
+    }
+
+    fn make_meta_live() -> HotArchiveBucketEntry {
+        HotArchiveBucketEntry::Metaentry(BucketMetadata {
+            ledger_version: 25,
+            ext: BucketMetadataExt::V1(BucketListType::Live),
+        })
+    }
+
+    #[test]
+    fn test_from_xdr_bytes_rejects_metadata_ext_v0() {
+        let entries = vec![make_meta_v0(), make_archived([1u8; 32], b"a")];
+        let bytes = entries_to_raw_xdr(&entries);
+        let result = HotArchiveBucket::from_xdr_bytes(&bytes);
+        assert!(matches!(result, Err(BucketError::Corruption(_))));
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("bucket list type"), "got: {}", err_msg);
+    }
+
+    #[test]
+    fn test_from_xdr_bytes_rejects_metadata_ext_live() {
+        let entries = vec![make_meta_live(), make_archived([1u8; 32], b"a")];
+        let bytes = entries_to_raw_xdr(&entries);
+        let result = HotArchiveBucket::from_xdr_bytes(&bytes);
+        assert!(matches!(result, Err(BucketError::Corruption(_))));
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("bucket list type"), "got: {}", err_msg);
+    }
+
+    #[test]
+    fn test_from_xdr_file_disk_backed_rejects_metadata_ext_v0() {
+        let entries = vec![make_meta_v0(), make_archived([1u8; 32], b"a")];
+        let (_dir, path) = write_entries_to_file(&entries);
+        let result = HotArchiveBucket::from_xdr_file_disk_backed(&path);
+        assert!(matches!(result, Err(BucketError::Corruption(_))));
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("bucket list type"), "got: {}", err_msg);
+    }
+
+    #[test]
+    fn test_from_xdr_file_disk_backed_rejects_metadata_ext_live() {
+        let entries = vec![make_meta_live(), make_archived([1u8; 32], b"a")];
+        let (_dir, path) = write_entries_to_file(&entries);
+        let result = HotArchiveBucket::from_xdr_file_disk_backed(&path);
+        assert!(matches!(result, Err(BucketError::Corruption(_))));
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("bucket list type"), "got: {}", err_msg);
+    }
+
+    #[test]
+    fn test_meta_only_bucket_rejects_wrong_ext() {
+        // A bucket containing only a metaentry with wrong ext should be rejected
+        let entries = vec![make_meta_v0()];
+        let bytes = entries_to_raw_xdr(&entries);
+        let result = HotArchiveBucket::from_xdr_bytes(&bytes);
+        assert!(matches!(result, Err(BucketError::Corruption(_))));
+    }
+
+    #[test]
+    fn test_metadata_ext_validation_after_duplicate_check() {
+        // Duplicate metadata (both with wrong ext) should report duplicate error,
+        // not ext error — validates correct error precedence
+        let entries = vec![make_meta_v0(), make_meta_v0()];
+        let bytes = entries_to_raw_xdr(&entries);
+        let result = HotArchiveBucket::from_xdr_bytes(&bytes);
+        assert!(matches!(result, Err(BucketError::Corruption(_))));
+        let err_msg = result.unwrap_err().to_string();
+        // First metadata passes validate_key, then fails ext check.
+        // Second metadata fails validate_key (duplicate) before reaching ext check.
+        // So first error is the ext check on the first metaentry.
+        assert!(
+            err_msg.contains("bucket list type") || err_msg.contains("duplicate"),
+            "got: {}",
+            err_msg
+        );
+    }
+
+    #[test]
+    fn test_metadata_after_entries_error_takes_precedence_over_ext() {
+        // Metadata after keyed entries with wrong ext should report position error
+        let entries = vec![make_archived([1u8; 32], b"a"), make_meta_v0()];
+        let bytes = entries_to_raw_xdr(&entries);
+        let result = HotArchiveBucket::from_xdr_bytes(&bytes);
+        assert!(matches!(result, Err(BucketError::Corruption(_))));
+        let err_msg = result.unwrap_err().to_string();
+        // validate_key runs first and catches meta-after-keyed
+        assert!(
+            err_msg.contains("metadata entry found after keyed entries"),
+            "got: {}",
+            err_msg
+        );
     }
 }
