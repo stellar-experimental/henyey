@@ -42,7 +42,7 @@ cleanup  # ensure fresh state
 mkdir -p "$TEST_ROOT"
 
 # ── TAP state ────────────────────────────────────────────────────────────────
-TAP_PLAN=50
+TAP_PLAN=52
 TAP_CURRENT=0
 TAP_FAILURES=0
 
@@ -810,19 +810,22 @@ run_tests() {
   fi
 
   # Test 41: TOML constants file exists and is parseable (fail closed)
-  local streak_val burst_val delta_val snapshot_file mode_val
+  local streak_val burst_val delta_val snapshot_file mode_val metric_name metric_label
   streak_val=$(grep -oP '^streak\s*=\s*\K\d+' "$constants_file" 2>/dev/null) || streak_val=""
   burst_val=$(grep -oP '^burst\s*=\s*\K\d+' "$constants_file" 2>/dev/null) || burst_val=""
   delta_val=$(grep -oP '^delta\s*=\s*\K\d+' "$constants_file" 2>/dev/null) || delta_val=""
   snapshot_file=$(grep -oP '^file\s*=\s*"\K[^"]+' "$constants_file" 2>/dev/null) || snapshot_file=""
   mode_val=$(grep -oP '^mode\s*=\s*"\K[^"]+' "$constants_file" 2>/dev/null) || mode_val=""
+  metric_name=$(grep -oP '^name\s*=\s*"\K[^"]+' "$constants_file" 2>/dev/null) || metric_name=""
+  metric_label=$(grep -oP "^label\s*=\s*'\K[^']+" "$constants_file" 2>/dev/null) || metric_label=""
 
   if [[ -n "$streak_val" && -n "$burst_val" && -n "$delta_val" \
-        && -n "$snapshot_file" && -n "$mode_val" ]]; then
+        && -n "$snapshot_file" && -n "$mode_val" \
+        && -n "$metric_name" && -n "$metric_label" ]]; then
     tap_ok "check-12b-constants: TOML exists and parseable (streak=$streak_val burst=$burst_val delta=$delta_val)"
   else
     tap_not_ok "check-12b-constants: TOML exists and parseable" \
-      "Missing or unparseable: streak=$streak_val burst=$burst_val delta=$delta_val file=$snapshot_file mode=$mode_val"
+      "Missing or unparseable: streak=$streak_val burst=$burst_val delta=$delta_val file=$snapshot_file mode=$mode_val metric=$metric_name label=$metric_label"
     # Fail closed: remaining 12b tests cannot proceed
     while [[ $TAP_CURRENT -lt $TAP_PLAN ]]; do
       tap_not_ok "check-12b (skipped: TOML parse failed)"
@@ -911,6 +914,25 @@ run_tests() {
   else
     tap_not_ok "check-12b-constants: reference link in both SKILL.md files" \
       "Both SKILL.md must contain 'check-12b-constants.toml'"
+  fi
+
+  # Test 51: Delta threshold cross-validated against TOML
+  # monitor-tick pseudocode: "elif delta >= 1:" ; monitor-loop table: "≥ 1"
+  if echo "$check_12b_section" | grep -Fq "delta >= $delta_val" \
+     && echo "$recovery_row" | grep -Fq "≥ $delta_val"; then
+    tap_ok "check-12b-semantics: delta threshold cross-validated (delta >= $delta_val)"
+  else
+    tap_not_ok "check-12b-semantics: delta threshold cross-validated (delta >= $delta_val)" \
+      "Expected 'delta >= $delta_val' in monitor-tick and '≥ $delta_val' in monitor-loop table row"
+  fi
+
+  # Test 52: Metric name from TOML appears in both SKILL.md files
+  if echo "$check_12b_section" | grep -Fq "$metric_name" \
+     && echo "$loop_streak_table" | grep -Fq "$metric_name"; then
+    tap_ok "check-12b-semantics: metric name from TOML in both specs ($metric_name)"
+  else
+    tap_not_ok "check-12b-semantics: metric name from TOML in both specs" \
+      "Expected '$metric_name' in both Check 12b section and monitor-loop table"
   fi
 }
 
