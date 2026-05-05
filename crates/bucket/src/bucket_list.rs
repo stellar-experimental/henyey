@@ -1848,7 +1848,7 @@ impl BucketList {
             // per entry reduces it to O(n).
             e.sort_by_cached_key(|entry| entry.key());
             e
-        });
+        })?;
         let sort_us = sort_start.elapsed().as_micros() as u64;
 
         let internal_start = std::time::Instant::now();

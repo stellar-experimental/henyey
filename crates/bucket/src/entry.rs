@@ -180,6 +180,30 @@ pub fn compare_entries(a: &BucketEntry, b: &BucketEntry) -> Ordering {
     }
 }
 
+/// Assert that bucket entries are strictly sorted with no duplicates.
+///
+/// Mirrors stellar-core's `releaseAssert(adjacent_find(...) == bucket.end())`
+/// in `LiveBucket.cpp:413-418` (inside `convertToBucketEntry`, called by
+/// `freshInMemoryOnly`). Verifies every adjacent pair is strictly ascending
+/// under [`compare_entries`] — validating both sort order and key uniqueness
+/// in a single pass.
+///
+/// # Failure mode
+///
+/// stellar-core uses `releaseAssert` (process abort). henyey returns
+/// `Err(BucketError::Merge(...))`. In production, this propagates through
+/// `add_batch` → `close_ledger`, halting the node with proper cleanup.
+pub fn assert_sorted_no_duplicates(entries: &[BucketEntry]) -> Result<()> {
+    for window in entries.windows(2) {
+        if compare_entries(&window[0], &window[1]) != Ordering::Less {
+            return Err(BucketError::Merge(
+                "bucket entries not strictly sorted: duplicate or out-of-order key detected".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 // ============================================================================
 // Eviction helper functions (Soroban State Archival)
 // ============================================================================

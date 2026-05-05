@@ -1677,7 +1677,7 @@ mod tests {
             BucketEntry::Liveentry(make_account_entry([2u8; 32], 200)),
         ];
 
-        let bucket = Bucket::fresh_in_memory_only(entries.clone());
+        let bucket = Bucket::fresh_in_memory_only(entries.clone()).unwrap();
 
         // Should have in-memory entries
         assert!(bucket.has_in_memory_entries());
@@ -1688,6 +1688,91 @@ mod tests {
         // Should be able to get in-memory entries
         let in_mem = bucket.get_in_memory_entries().unwrap();
         assert_eq!(in_mem.len(), 2);
+    }
+
+    #[test]
+    fn test_fresh_in_memory_only_rejects_duplicate_live_keys() {
+        let entries = vec![
+            BucketEntry::Liveentry(make_account_entry([1u8; 32], 100)),
+            BucketEntry::Liveentry(make_account_entry([1u8; 32], 200)),
+        ];
+        let err = Bucket::fresh_in_memory_only(entries).unwrap_err();
+        assert!(
+            err.to_string().contains("duplicate or out-of-order"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_fresh_in_memory_only_rejects_duplicate_dead_keys() {
+        let entries = vec![
+            BucketEntry::Deadentry(make_account_key([1u8; 32])),
+            BucketEntry::Deadentry(make_account_key([1u8; 32])),
+        ];
+        let err = Bucket::fresh_in_memory_only(entries).unwrap_err();
+        assert!(
+            err.to_string().contains("duplicate or out-of-order"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_fresh_in_memory_only_rejects_init_live_same_key() {
+        // Init + Live with the same key should be rejected (same key = equal under comparator)
+        let entries = vec![
+            BucketEntry::Initentry(make_account_entry([1u8; 32], 100)),
+            BucketEntry::Liveentry(make_account_entry([1u8; 32], 200)),
+        ];
+        let err = Bucket::fresh_in_memory_only(entries).unwrap_err();
+        assert!(
+            err.to_string().contains("duplicate or out-of-order"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_fresh_in_memory_only_rejects_live_dead_same_key() {
+        let entries = vec![
+            BucketEntry::Liveentry(make_account_entry([1u8; 32], 100)),
+            BucketEntry::Deadentry(make_account_key([1u8; 32])),
+        ];
+        let err = Bucket::fresh_in_memory_only(entries).unwrap_err();
+        assert!(
+            err.to_string().contains("duplicate or out-of-order"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_fresh_in_memory_only_rejects_duplicate_metadata() {
+        let entries = vec![
+            BucketEntry::Metaentry(BucketMetadata {
+                ledger_version: 21,
+                ext: BucketMetadataExt::V0,
+            }),
+            BucketEntry::Metaentry(BucketMetadata {
+                ledger_version: 22,
+                ext: BucketMetadataExt::V0,
+            }),
+        ];
+        let err = Bucket::fresh_in_memory_only(entries).unwrap_err();
+        assert!(
+            err.to_string().contains("duplicate or out-of-order"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_from_sorted_entries_rejects_duplicates() {
+        let entries = vec![
+            BucketEntry::Liveentry(make_account_entry([1u8; 32], 100)),
+            BucketEntry::Liveentry(make_account_entry([1u8; 32], 200)),
+        ];
+        let err = Bucket::from_sorted_entries(entries).unwrap_err();
+        assert!(
+            err.to_string().contains("duplicate or out-of-order"),
+            "unexpected error: {err}"
+        );
     }
 
     // ============ Protocol Version Handling Regression Tests ============

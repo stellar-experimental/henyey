@@ -30,6 +30,7 @@
 //! to share across threads. The disk-backed mode uses file handles that are opened
 //! fresh for each operation to avoid contention.
 
+use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -204,19 +205,11 @@ impl Bucket {
         Self::from_sorted_entries(entries)
     }
 
-    /// Create a bucket from a list of pre-sorted entries.
+    /// Create a bucket from a list of pre-sorted, unique entries.
     ///
-    /// This method skips the sorting step, which is useful when entries are
-    /// already known to be in the correct order (e.g., extracted from another
-    /// bucket via iteration).
-    ///
-    /// # Safety
-    ///
-    /// The entries **must** already be sorted by key according to [`compare_entries`].
-    /// Using unsorted entries will result in incorrect bucket behavior:
-    /// - Lookups may fail to find existing entries
-    /// - Merges will produce incorrect results
-    /// - Hash verification may fail
+    /// Entries **must** be strictly sorted (ascending under [`compare_entries`])
+    /// with no duplicates. This is validated at runtime and returns an error if
+    /// violated.
     ///
     /// This is intended for entries extracted from disk-backed buckets that were
     /// already sorted by stellar-core, or from bucket iteration which preserves order.
@@ -227,8 +220,11 @@ impl Bucket {
     /// using a single serialization pass for each entry. This is more efficient than
     /// serializing all entries twice (once for the index, once for the hash).
     pub fn from_sorted_entries(entries: Vec<BucketEntry>) -> Result<Self> {
+        use crate::entry::assert_sorted_no_duplicates;
         use sha2::{Digest, Sha256};
         use stellar_xdr::curr::{Limited, WriteXdr};
+
+        assert_sorted_no_duplicates(&entries)?;
 
         let mut key_index = HashMap::new();
         let mut hasher = Sha256::new();
@@ -289,6 +285,12 @@ impl Bucket {
         key_index: Arc<HashMap<LedgerKey, usize>>,
         metadata_count: usize,
     ) -> Self {
+        debug_assert!(
+            entries
+                .windows(2)
+                .all(|w| crate::entry::compare_entries(&w[0], &w[1]) == Ordering::Less),
+            "from_parts: entries not strictly sorted (duplicate or out-of-order key)"
+        );
         Self {
             hash,
             storage: BucketStorage::InMemory { entries, key_index },
@@ -314,12 +316,17 @@ impl Bucket {
     ///
     /// # Arguments
     ///
-    /// * `entries` - Sorted entries (metadata first, then data entries by key)
-    pub fn fresh_in_memory_only(entries: Vec<BucketEntry>) -> Self {
+    /// * `entries` - Strictly sorted, unique entries (metadata first, then data
+    ///   entries by key). Returns an error if entries are not strictly ascending
+    ///   under `compare_entries`.
+    pub fn fresh_in_memory_only(entries: Vec<BucketEntry>) -> Result<Self> {
+        use crate::entry::assert_sorted_no_duplicates;
+        assert_sorted_no_duplicates(&entries)?;
+
         // Count metadata entries (typically 0 or 1, always at the start)
         let metadata_count = entries.iter().take_while(|e| e.is_metadata()).count();
 
-        Self {
+        Ok(Self {
             hash: Hash256::ZERO, // Hash not computed - this is intentional!
             storage: BucketStorage::InMemory {
                 entries: Arc::new(entries),
@@ -327,7 +334,7 @@ impl Bucket {
             },
             // Use shared state - no cloning needed
             level_zero_state: LevelZeroState::SharedWithStorage { metadata_count },
-        }
+        })
     }
 
     /// Load a bucket from a gzipped XDR file.
@@ -932,10 +939,12 @@ impl Bucket {
         self.level_zero_state = LevelZeroState::None;
     }
 
-    /// Create a bucket from sorted entries with in-memory optimization enabled.
+    /// Create a bucket from strictly sorted, unique entries with in-memory
+    /// optimization enabled.
     ///
     /// This is like `from_sorted_entries` but also keeps entries in memory
-    /// for level 0 optimization.
+    /// for level 0 optimization. Entries must be strictly ascending under
+    /// [`compare_entries`] with no duplicates (validated at runtime).
     ///
     /// # Important: METAENTRY exclusion from in-memory state
     ///
@@ -953,8 +962,11 @@ impl Bucket {
     /// This method uses zero-copy shared storage: entries are stored once and
     /// the in-memory state references the same storage with an offset to skip metadata.
     pub fn from_sorted_entries_with_in_memory(entries: Vec<BucketEntry>) -> Result<Self> {
+        use crate::entry::assert_sorted_no_duplicates;
         use sha2::{Digest, Sha256};
         use stellar_xdr::curr::{Limited, WriteXdr};
+
+        assert_sorted_no_duplicates(&entries)?;
 
         let mut key_index = HashMap::new();
         let mut hasher = Sha256::new();
