@@ -2315,6 +2315,10 @@ impl App {
                 "manual close: LCL advanced during build_nomination_value; \
                  caller should retry with refreshed ledger seq"
             )),
+            henyey_herder::TriggerOutcome::SkippedInvalidCloseTime => Err(anyhow::anyhow!(
+                "manual close: proposed close time too far ahead of wall clock; \
+                 caller should retry later"
+            )),
         }
     }
 

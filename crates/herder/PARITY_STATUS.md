@@ -81,7 +81,7 @@ Corresponds to: `Herder.h`, `HerderImpl.h`
 | `getMinLedgerSeqToRemember()` | `get_min_ledger_seq_to_remember()` | Full |
 | `isNewerNominationOrBallotSt()` | _(not implemented)_ | None |
 | `getMostRecentCheckpointSeq()` | `get_most_recent_checkpoint_seq()` | Full |
-| `triggerNextLedger()` | `trigger_next_ledger()` | Partial | Henyey adds an `is_nominating` idempotency guard that skips duplicate triggers while nomination is active. stellar-core logs and continues on duplicate calls but never invokes them in a retry loop. Observable SCP behavior is unchanged. Remaining divergence: stellar-core re-checks `mLedgerManager.isApplying()` after tx-set construction (HerderImpl.cpp:1583-1585) before nomination; henyey re-checks slot staleness (`lcl_matches_slot`) but does not re-check the applying flag at that post-build point. |
+| `triggerNextLedger()` | `trigger_next_ledger()` | Full | Henyey adds an `is_nominating` idempotency guard (stellar-core logs and continues on duplicate calls but never invokes them in a retry loop) and the far-ahead close-time abort (#2816): `nextCloseTime` is derived once (monotonic clamp + `ctValidityOffset` far-ahead check) and nomination is skipped (`SkippedInvalidCloseTime`) when it exceeds `now + MAX_TIME_SLIP_SECONDS`, mirroring stellar-core's abort in the same function (HerderImpl.cpp:1522-1532). Henyey also re-checks `is_applying()` alongside slot staleness after tx-set construction (HerderImpl.cpp:1583-1585). Observable SCP behavior is unchanged. |
 | Nomination value caching (timer lambda capture) | `cached_nomination_value` field + `handle_nomination_timeout()` | Full |
 | `setInSyncAndTriggerNextLedger()` | `trigger_next_ledger()` | Full |
 | `resolveNodeID()` | _(not implemented)_ | None |
@@ -104,8 +104,8 @@ Corresponds to: `Herder.h`, `HerderImpl.h`
 | `emitEnvelope()` | handled by `ScpDriver` | Full |
 | `lostSync()` | `SyncRecoveryManager::record_lost_sync()` | Full |
 | `checkCloseTime()` | `check_envelope_close_time()` | Full |
-| `ctValidityOffset()` | _(not implemented)_ | None |
-| `setupTriggerNextLedger()` | Split: `App::try_trigger_consensus()` (behind/applying gates) + `Herder::trigger_next_ledger()` (lcl_matches_slot) | Partial — behind/applying/not-tracking pre-entry guards match; remaining divergences: (1) `LCL >= tracking` uses corrective recovery instead of stellar-core's fail-fast assertion, (2) no post-build `isApplying()` suppression before nomination (stellar-core triggerNextLedger HerderImpl.cpp:1583-1585 re-checks applying after tx-set construction); trigger-time / `ctValidityOffset()` tracked separately (#2702) |
+| `ctValidityOffset()` | `Herder::ct_validity_offset()` | Partial | Close-time validity offset (#2816) computed per stellar-core HerderImpl.cpp:1158-1172 and used by both the app-side trigger delay (`try_trigger_consensus`) and the herder-side far-ahead abort (`trigger_next_ledger`); exact event-driven timer scheduling remains in #2702. |
+| `setupTriggerNextLedger()` | Split: `App::try_trigger_consensus()` + `Herder::trigger_next_ledger()` | Partial | App-side polling loop now enforces the `prepareStart + expectedClose` trigger-time delay and the `ctValidityOffset` adjustment before calling `trigger_next_ledger()` (#2816), so henyey never triggers earlier than stellar-core's computed boundary (it may trigger up to one poll tick later). Pre-entry behind/applying/not-tracking guards match; `LCL >= tracking` uses corrective recovery instead of stellar-core's fail-fast assertion, and `is_applying()` is re-checked post-build inside `trigger_next_ledger`. Exact timer-based (event-driven) scheduling remains in #2702. |
 | `startOutOfSyncTimer()` | `SyncRecoveryManager` | Full |
 | `outOfSyncRecovery()` | `out_of_sync_recovery()` | Full |
 | `broadcast()` | `flush_tx_adverts()` in `App` | Partial — priority-ordered via `TransactionQueue::broadcast_with_visitor()` with DEX-lane flood budget, budget-neutral skipped txs, arb flood damping, and ban-on-damping; broadcast period uses `flood_tx_period_ms` (200 ms) matching stellar-core `FLOOD_TX_PERIOD_MS`; missing dedicated flood queue, mark-on-attempt, separate advert flush timer |
@@ -519,7 +519,7 @@ Features not yet implemented. These ARE counted against parity %.
 | `setFilteredAccounts()` | Medium | Runtime filtered-account override API missing |
 | `checkAndMaybeReanalyzeQuorumMap()` | Low | Background quorum analysis |
 | `recomputeKeysToFilter()` | Low | Soroban footprint filtering |
-| `ctValidityOffset()` | Low | Close time offset computation |
+| ~~`ctValidityOffset()`~~ | ~~Low~~ | ~~Close time offset computation~~ — **Implemented in #2816** |
 | PendingEnvelopes cost tracking (4 methods) | Low | Per-validator cost analysis |
 | `HerderPersistence::getNodeQuorumSet()` | Low | Node-level quorum set lookup |
 | `HerderPersistence::getQuorumSet()` | Low | Hash-based quorum set lookup |
@@ -574,7 +574,13 @@ Features not yet implemented. These ARE counted against parity %.
      (`HerderImpl.cpp:1194`), giving ledger apply a chance to complete
      before peer envelopes for the next tracking slot are processed.
      `setupTriggerNextLedger` (`HerderImpl.cpp:1237-1254`) asserts that
-     apply is not in flight and tracking equals the LCL.
+     apply is not in flight and tracking equals the LCL. As of #2816,
+     henyey's `try_trigger_consensus()` enforces the `prepareStart +
+     expectedClose` delay and `ctValidityOffset` check before calling
+     `trigger_next_ledger()`, and the herder-side far-ahead abort in
+     `trigger_next_ledger()` refuses to build/nominate when the proposed
+     close time exceeds `now + MAX_TIME_SLIP_SECONDS`. Full event-driven
+     timer scheduling (#2702) is not yet ported.
    - **Rust**: `process_scp_envelope` forwards peer EXTERNALIZE to SCP
      before the tx_set is fetched, so tracking advance can proceed
      during catchup (#1795). Pending envelope drain now runs post-apply
