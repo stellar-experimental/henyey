@@ -111,6 +111,40 @@ pub(super) fn should_delay_checkpoint(checkpoint: u64, first_sequential_ledger: 
     checkpoint < first_sequential_ledger
 }
 
+/// The action to take when an SCP timer event fires.
+///
+/// Pure classification of the three-way split from stellar-core's
+/// `HerderSCPDriver::timerCallbackWrapper`: old-slot timers are dropped,
+/// future-slot timers are re-armed at 1 second while tracking, and
+/// current-slot timers fire immediately.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum TimerEventAction {
+    /// Old-slot timer — discard without re-arming.
+    Drop,
+    /// Future-slot timer while tracking — re-arm with 1-second delay.
+    Rearm,
+    /// Current slot or non-tracking — execute the timeout handler.
+    Fire,
+}
+
+/// Classify a timer event into an action based on the event's slot, the next
+/// consensus slot, and whether the herder is currently tracking.
+///
+/// Spec: HERDER_SPEC §5.4-2 (future-slot timer reschedule).
+pub(super) fn classify_timer_event(
+    event_slot: u64,
+    next_consensus_slot: u64,
+    is_tracking: bool,
+) -> TimerEventAction {
+    if event_slot < next_consensus_slot {
+        TimerEventAction::Drop
+    } else if event_slot > next_consensus_slot && is_tracking {
+        TimerEventAction::Rearm
+    } else {
+        TimerEventAction::Fire
+    }
+}
+
 impl App {
     /// Try to trigger consensus for the next ledger.
     ///
@@ -1349,33 +1383,53 @@ impl App {
             return;
         }
 
-        // Staleness guard: compute the active slot exactly as the old
-        // check_scp_timeouts did (consensus.rs:1157-1158).
-        let current_ledger = self.current_ledger_seq() as u64;
-        let active_slot = self.herder.tracking_slot().get().max(current_ledger + 1);
-        if event.slot != active_slot {
-            // Stale event — slot advanced past this timer
-            return;
-        }
+        let next_slot = self.herder.next_consensus_ledger_index().get();
+        let action = classify_timer_event(event.slot, next_slot, self.herder.is_tracking());
 
-        // Fire the timeout handler, preserving counters and spawn_blocking
-        // for nomination (parity with the removed check_scp_timeouts).
-        match event.timer_type {
-            henyey_herder::TimerType::Nomination => {
-                self.nomination_timeout_fires
-                    .fetch_add(1, Ordering::Relaxed);
-                let outcome = self
-                    .herder
-                    .handle_nomination_timeout_blocking(event.slot)
-                    .await;
-                if matches!(outcome, henyey_herder::TimeoutOutcome::SkippedStale) {
-                    self.nomination_timeout_skipped_stale
-                        .fetch_add(1, Ordering::Relaxed);
+        match action {
+            TimerEventAction::Drop => {
+                // Stale old-slot timer — drop without re-arming.
+                // Spec: HERDER_SPEC §5.4-2: old-slot timers are discarded.
+            }
+            TimerEventAction::Rearm => {
+                // Future-slot timer while tracking — re-arm for 1 second.
+                // Spec: HERDER_SPEC §5.4-2: stellar-core's timerCallbackWrapper
+                // defers future-slot timer callbacks by re-scheduling them at a
+                // 1-second interval until the slot becomes current.
+                let one_second = std::time::Duration::from_secs(1);
+                match event.timer_type {
+                    henyey_herder::TimerType::Nomination => {
+                        self.timer_manager_handle
+                            .schedule_nomination_timeout(event.slot, one_second)
+                            .await;
+                    }
+                    henyey_herder::TimerType::Ballot => {
+                        self.timer_manager_handle
+                            .schedule_ballot_timeout(event.slot, one_second)
+                            .await;
+                    }
                 }
             }
-            henyey_herder::TimerType::Ballot => {
-                self.ballot_timeout_fires.fetch_add(1, Ordering::Relaxed);
-                self.herder.handle_ballot_timeout(event.slot);
+            TimerEventAction::Fire => {
+                // Current slot or non-tracking — execute the timeout handler.
+                match event.timer_type {
+                    henyey_herder::TimerType::Nomination => {
+                        self.nomination_timeout_fires
+                            .fetch_add(1, Ordering::Relaxed);
+                        let outcome = self
+                            .herder
+                            .handle_nomination_timeout_blocking(event.slot)
+                            .await;
+                        if matches!(outcome, henyey_herder::TimeoutOutcome::SkippedStale) {
+                            self.nomination_timeout_skipped_stale
+                                .fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                    henyey_herder::TimerType::Ballot => {
+                        self.ballot_timeout_fires.fetch_add(1, Ordering::Relaxed);
+                        self.herder.handle_ballot_timeout(event.slot);
+                    }
+                }
             }
         }
     }
@@ -2016,5 +2070,67 @@ mod tests {
     #[test]
     fn test_should_delay_checkpoint_first_checkpoint_behind() {
         assert!(should_delay_checkpoint(1, 5));
+    }
+
+    // ── TimerEventAction / classify_timer_event tests ────────────────────
+
+    use super::{classify_timer_event, TimerEventAction};
+
+    /// Future-slot nomination timer while tracking → Rearm (1-second defer).
+    /// Spec: HERDER_SPEC §5.4-2.
+    #[test]
+    fn test_handle_scp_timer_event_reschedules_future_nomination_by_one_second() {
+        // next_slot = 100, event_slot = 105, tracking = true → Rearm
+        assert_eq!(
+            classify_timer_event(105, 100, true),
+            TimerEventAction::Rearm
+        );
+    }
+
+    /// Future-slot ballot timer while tracking → Rearm (1-second defer).
+    /// Spec: HERDER_SPEC §5.4-2.
+    #[test]
+    fn test_handle_scp_timer_event_reschedules_future_ballot_by_one_second() {
+        // next_slot = 50, event_slot = 51, tracking = true → Rearm
+        assert_eq!(classify_timer_event(51, 50, true), TimerEventAction::Rearm);
+    }
+
+    /// Old-slot timer → Drop without re-arming.
+    #[test]
+    fn test_handle_scp_timer_event_drops_old_slot_without_rearm() {
+        // next_slot = 100, event_slot = 99 → Drop
+        assert_eq!(classify_timer_event(99, 100, true), TimerEventAction::Drop);
+        assert_eq!(classify_timer_event(99, 100, false), TimerEventAction::Drop);
+        // Far behind
+        assert_eq!(classify_timer_event(1, 100, true), TimerEventAction::Drop);
+    }
+
+    /// Current-slot timer → Fire immediately regardless of tracking state.
+    #[test]
+    fn test_classify_timer_event_current_slot_fires() {
+        assert_eq!(classify_timer_event(100, 100, true), TimerEventAction::Fire);
+        assert_eq!(
+            classify_timer_event(100, 100, false),
+            TimerEventAction::Fire
+        );
+    }
+
+    /// Future-slot timer while NOT tracking → Fire (don't enter defer loop).
+    #[test]
+    fn test_classify_timer_event_future_slot_not_tracking_fires() {
+        // Not tracking: even future-slot events should fire, not rearm.
+        assert_eq!(
+            classify_timer_event(105, 100, false),
+            TimerEventAction::Fire
+        );
+    }
+
+    /// Edge case: event_slot == next_slot + 1 while tracking → Rearm (just barely future).
+    #[test]
+    fn test_classify_timer_event_one_ahead_tracking_rearms() {
+        assert_eq!(
+            classify_timer_event(101, 100, true),
+            TimerEventAction::Rearm
+        );
     }
 }
