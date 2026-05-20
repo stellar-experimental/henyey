@@ -1401,6 +1401,19 @@ impl App {
         if !self.herder.state().can_receive_scp() {
             return;
         }
+        // Gate: reject events from a prior tracking epoch. These were already
+        // queued in scp_timer_rx before on_lost_sync() incremented the epoch,
+        // so cancel_all_timers_nonblocking() could not retract them.
+        let current_epoch = self.scp_timer_epoch.load(Ordering::Acquire);
+        if event.epoch != current_epoch {
+            tracing::debug!(
+                slot = event.slot,
+                event_epoch = event.epoch,
+                current_epoch,
+                "Dropping stale timer event from prior tracking epoch"
+            );
+            return;
+        }
 
         // Use max(tracking_slot, current_ledger + 1) as the effective next slot.
         // In the INV-H2 corrective window where LCL + 1 > tracking_slot, a timer
@@ -2218,6 +2231,7 @@ mod tests {
         let event = super::super::scp_timer_bridge::ScpTimerEvent {
             slot: future_slot,
             timer_type: henyey_herder::TimerType::Nomination,
+            epoch: 0,
         };
 
         let fires_before = app.nomination_timeout_fires.load(Ordering::Relaxed);
@@ -2278,6 +2292,7 @@ mod tests {
         let event = super::super::scp_timer_bridge::ScpTimerEvent {
             slot: future_slot,
             timer_type: henyey_herder::TimerType::Ballot,
+            epoch: 0,
         };
 
         let fires_before = app.ballot_timeout_fires.load(Ordering::Relaxed);
@@ -2325,6 +2340,7 @@ mod tests {
         let event = super::super::scp_timer_bridge::ScpTimerEvent {
             slot: old_slot,
             timer_type: henyey_herder::TimerType::Nomination,
+            epoch: 0,
         };
 
         let nom_fires_before = app.nomination_timeout_fires.load(Ordering::Relaxed);
@@ -2393,6 +2409,7 @@ mod tests {
         let event = super::super::scp_timer_bridge::ScpTimerEvent {
             slot,
             timer_type: henyey_herder::TimerType::Nomination,
+            epoch: 0,
         };
         app.handle_scp_timer_event(event).await;
 
@@ -2446,6 +2463,7 @@ mod tests {
         let event = super::super::scp_timer_bridge::ScpTimerEvent {
             slot: 6,
             timer_type: henyey_herder::TimerType::Nomination,
+            epoch: 0,
         };
 
         let fires_before = app.nomination_timeout_fires.load(Ordering::Relaxed);
@@ -2505,6 +2523,7 @@ mod tests {
         let stale_event = super::super::scp_timer_bridge::ScpTimerEvent {
             slot: 2,
             timer_type: henyey_herder::TimerType::Ballot,
+            epoch: 0,
         };
 
         let fires_before = app.ballot_timeout_fires.load(Ordering::Relaxed);
@@ -2521,6 +2540,7 @@ mod tests {
         let stale_nom_event = super::super::scp_timer_bridge::ScpTimerEvent {
             slot: 2,
             timer_type: henyey_herder::TimerType::Nomination,
+            epoch: 0,
         };
 
         let nom_fires_before = app.nomination_timeout_fires.load(Ordering::Relaxed);
@@ -2530,6 +2550,106 @@ mod tests {
             app.nomination_timeout_fires.load(Ordering::Relaxed),
             nom_fires_before,
             "stale nomination timer from prior tracking epoch must not fire after sync loss"
+        );
+    }
+
+    /// Regression test: future-slot timers queued before sync loss must be
+    /// dropped after the epoch advances, even when their slot >= next_slot.
+    ///
+    /// Scenario: the node is tracking at slot 2. A future-slot ballot timer
+    /// for slot 5 fires and gets queued in scp_timer_rx (the channel). Before
+    /// the main loop processes it, on_lost_sync() is called, incrementing the
+    /// tracking epoch. When the event is finally dequeued, its epoch (0) does
+    /// not match the current epoch (1), so it must be dropped — even though
+    /// slot 5 >= next_slot and would otherwise hit the Fire branch.
+    ///
+    /// Without the epoch guard, this would call handle_ballot_timeout() /
+    /// handle_nomination_timeout() against stale consensus state.
+    #[tokio::test(start_paused = true)]
+    async fn test_handle_scp_timer_event_future_slot_stale_epoch_drops() {
+        use henyey_herder::sync_recovery::SyncRecoveryCallback;
+
+        let (_dir, app) = mk_validator_app().await;
+
+        // Bootstrap herder at ledger 1 → tracking slot = 2, is_tracking = true
+        app.herder.bootstrap(1);
+        assert!(app.herder.is_tracking());
+        assert_eq!(app.herder.next_consensus_ledger_index().get(), 2);
+
+        // The timer epoch starts at 0
+        assert_eq!(
+            app.scp_timer_epoch
+                .load(std::sync::atomic::Ordering::Acquire),
+            0
+        );
+
+        // Simulate losing sync — this increments the epoch to 1
+        app.on_lost_sync();
+        assert!(!app.herder.is_tracking());
+        assert_eq!(
+            app.scp_timer_epoch
+                .load(std::sync::atomic::Ordering::Acquire),
+            1
+        );
+
+        // Allow timer manager to process the cancel command
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+
+        // Inject a FUTURE-slot ballot timer event from the OLD epoch (epoch 0).
+        // This simulates a timer that was already queued in scp_timer_rx before
+        // on_lost_sync() was called. Slot 5 >= next_slot (2), so without the
+        // epoch guard it would hit the Fire branch.
+        let stale_future_ballot = super::super::scp_timer_bridge::ScpTimerEvent {
+            slot: 5,
+            timer_type: henyey_herder::TimerType::Ballot,
+            epoch: 0, // old epoch — before sync loss
+        };
+
+        let fires_before = app.ballot_timeout_fires.load(Ordering::Relaxed);
+        app.handle_scp_timer_event(stale_future_ballot).await;
+
+        assert_eq!(
+            app.ballot_timeout_fires.load(Ordering::Relaxed),
+            fires_before,
+            "future-slot ballot timer from prior epoch must not fire after sync loss"
+        );
+
+        // Same for nomination timers — verify uniform rejection
+        let stale_future_nom = super::super::scp_timer_bridge::ScpTimerEvent {
+            slot: 5,
+            timer_type: henyey_herder::TimerType::Nomination,
+            epoch: 0, // old epoch
+        };
+
+        let nom_fires_before = app.nomination_timeout_fires.load(Ordering::Relaxed);
+        app.handle_scp_timer_event(stale_future_nom).await;
+
+        assert_eq!(
+            app.nomination_timeout_fires.load(Ordering::Relaxed),
+            nom_fires_before,
+            "future-slot nomination timer from prior epoch must not fire after sync loss"
+        );
+
+        // Verify that a timer with the CURRENT epoch (1) IS processed normally.
+        // This confirms the epoch guard is checking the right thing and not
+        // blanket-rejecting all post-sync-loss timers.
+        let current_epoch_event = super::super::scp_timer_bridge::ScpTimerEvent {
+            slot: 5,
+            timer_type: henyey_herder::TimerType::Ballot,
+            epoch: 1, // current epoch — after sync loss
+        };
+
+        // This event passes the epoch check, passes can_receive_scp (Syncing allows it),
+        // and hits the Fire branch (non-tracking, slot >= next_slot). It will actually
+        // call handle_ballot_timeout — confirming the epoch guard is selective.
+        let fires_before_current = app.ballot_timeout_fires.load(Ordering::Relaxed);
+        app.handle_scp_timer_event(current_epoch_event).await;
+        assert_eq!(
+            app.ballot_timeout_fires.load(Ordering::Relaxed),
+            fires_before_current + 1,
+            "event with current epoch must pass the epoch guard and fire"
         );
     }
 }
