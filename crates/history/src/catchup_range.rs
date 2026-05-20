@@ -60,7 +60,10 @@ impl LedgerRange {
     }
 }
 
-/// Catchup mode determining history depth.
+/// Catchup mode determining history depth (replay count).
+///
+/// This enum models the spec's `count` field (§3.4), NOT the spec's `Mode`
+/// discriminator. For the spec-aligned run-mode axis, see [`CatchupRunMode`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CatchupMode {
     /// Download only the latest bucket state (fastest).
@@ -72,6 +75,75 @@ pub enum CatchupMode {
     Complete,
     /// Download the last N ledgers of history.
     Recent(u32),
+}
+
+/// Spec §6.1 run-mode discriminator.
+///
+/// This is orthogonal to [`CatchupMode`] (which controls replay depth / count).
+/// The run mode distinguishes the operational context in which catchup runs:
+///
+/// - `OfflineBasic`: Standalone CLI catchup (no overlay, no SCP).
+/// - `OfflineComplete`: Full archive verification with tx-result checking.
+///   (Not yet implemented — semantics tracked by #2831.)
+/// - `Online`: Live node catchup during startup or recovery (overlay + SCP active).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CatchupRunMode {
+    /// Standalone offline catchup (CLI `catchup` command).
+    /// No overlay, no SCP context.
+    #[default]
+    OfflineBasic,
+    /// Full archive verification with tx-result set checking.
+    /// Semantics not yet implemented — tracked by #2831.
+    OfflineComplete,
+    /// Live node catchup during startup or recovery.
+    /// Overlay and SCP context are active.
+    Online,
+}
+
+impl std::fmt::Display for CatchupRunMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CatchupRunMode::OfflineBasic => write!(f, "OFFLINE_BASIC"),
+            CatchupRunMode::OfflineComplete => write!(f, "OFFLINE_COMPLETE"),
+            CatchupRunMode::Online => write!(f, "ONLINE"),
+        }
+    }
+}
+
+/// A catchup configuration carrying both the replay depth and the spec run mode.
+///
+/// This type separates the two orthogonal axes of catchup configuration:
+/// - **depth** ([`CatchupMode`]): how many ledgers to replay (spec `count` field, §3.4)
+/// - **run_mode** ([`CatchupRunMode`]): operational context (spec `Mode` discriminator, §6.1)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CatchupConfiguration {
+    /// Replay depth / count (Minimal, Complete, or Recent(N)).
+    pub depth: CatchupMode,
+    /// Spec §6.1 run-mode discriminator.
+    pub run_mode: CatchupRunMode,
+}
+
+impl CatchupConfiguration {
+    /// Create a new catchup configuration.
+    pub fn new(depth: CatchupMode, run_mode: CatchupRunMode) -> Self {
+        Self { depth, run_mode }
+    }
+
+    /// Create an offline-basic configuration with the given depth.
+    pub fn offline_basic(depth: CatchupMode) -> Self {
+        Self {
+            depth,
+            run_mode: CatchupRunMode::OfflineBasic,
+        }
+    }
+
+    /// Create an online configuration with the given depth.
+    pub fn online(depth: CatchupMode) -> Self {
+        Self {
+            depth,
+            run_mode: CatchupRunMode::Online,
+        }
+    }
 }
 
 impl CatchupMode {
@@ -808,5 +880,44 @@ mod tests {
     #[should_panic(expected = "replay_only requires a non-empty replay range")]
     fn test_replay_only_rejects_empty_replay() {
         let _ = CatchupRange::replay_only(LedgerRange::empty());
+    }
+
+    #[test]
+    fn test_catchup_configuration_online_preserves_depth() {
+        // The CatchupConfiguration must store run_mode and depth independently,
+        // so the two axes cannot collapse back together.
+        let config_recent = CatchupConfiguration::online(CatchupMode::Recent(500));
+        assert_eq!(config_recent.depth, CatchupMode::Recent(500));
+        assert_eq!(config_recent.run_mode, CatchupRunMode::Online);
+
+        let config_complete = CatchupConfiguration::online(CatchupMode::Complete);
+        assert_eq!(config_complete.depth, CatchupMode::Complete);
+        assert_eq!(config_complete.run_mode, CatchupRunMode::Online);
+
+        let config_minimal = CatchupConfiguration::online(CatchupMode::Minimal);
+        assert_eq!(config_minimal.depth, CatchupMode::Minimal);
+        assert_eq!(config_minimal.run_mode, CatchupRunMode::Online);
+
+        // Offline basic with Complete depth is NOT the same as OfflineComplete.
+        let offline_complete_depth = CatchupConfiguration::offline_basic(CatchupMode::Complete);
+        assert_eq!(offline_complete_depth.depth, CatchupMode::Complete);
+        assert_eq!(
+            offline_complete_depth.run_mode,
+            CatchupRunMode::OfflineBasic
+        );
+        assert_ne!(
+            offline_complete_depth.run_mode,
+            CatchupRunMode::OfflineComplete
+        );
+    }
+
+    #[test]
+    fn test_catchup_run_mode_display() {
+        assert_eq!(CatchupRunMode::OfflineBasic.to_string(), "OFFLINE_BASIC");
+        assert_eq!(
+            CatchupRunMode::OfflineComplete.to_string(),
+            "OFFLINE_COMPLETE"
+        );
+        assert_eq!(CatchupRunMode::Online.to_string(), "ONLINE");
     }
 }

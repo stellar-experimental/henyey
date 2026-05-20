@@ -124,7 +124,7 @@ Source file references use the format `file.rs:line`.
 |-------------|--------|----------|
 | `toLedger` with sentinel 0 = "latest from archive" | ✅ | `catchup_range.rs` — `CatchupMode::Minimal` resolves to archive's latest |
 | `count` field (UINT32_MAX = complete, 0 = minimal) | ✅ | `catchup_range.rs:35-50` — `CatchupMode` enum with `Minimal`, `Complete`, `Recent(u32)` |
-| `mode` field: ONLINE / OFFLINE_BASIC / OFFLINE_COMPLETE | ⚠️ | No explicit mode enum. Online vs offline distinction is implicit in `CatchupManager` behavior. No `OFFLINE_BASIC` vs `OFFLINE_COMPLETE` distinction for validation scope |
+| `mode` field: ONLINE / OFFLINE_BASIC / OFFLINE_COMPLETE | ✅ | `catchup_range.rs` — `CatchupRunMode` enum with `OfflineBasic`, `OfflineComplete`, `Online`. `CatchupConfiguration` wrapper carries both depth and run mode. `OFFLINE_COMPLETE` tx-result verification semantics not yet implemented (#2831) |
 
 #### Catchup Range and Ledger Range (§3.5–3.7)
 
@@ -309,7 +309,7 @@ Source file references use the format `file.rs:line`.
 | Requirement | Status | Evidence |
 |-------------|--------|----------|
 | Herder consistency work (set tracking state) | ❌ | Not implemented in these crates |
-| Tx result verification (offline-complete mode) | ⚠️ | Tx result hash verification exists in `verify.rs:135+` but no offline-complete mode gating |
+| Tx result verification (offline-complete mode) | ⚠️ | Tx result hash verification exists in `verify.rs:135+`; `CatchupRunMode::OfflineComplete` enum value exists but verification not yet gated on it (#2831) |
 | Bucket download → verify → apply sequence | ✅ | `CatchupManager` downloads buckets, verifies hashes, applies via `apply_buckets()` |
 | Transaction download → apply sequence | ✅ | `CatchupManager::replay_via_close_ledger()` |
 
@@ -541,7 +541,7 @@ Source file references use the format `file.rs:line`.
 | **SCP message publishing** | §5.5 | Work items exist in historywork but not wired into the full publish pipeline |
 | **Crash recovery truncation** | §5.7 | Partial dirty files are deleted instead of truncated to LCL; checkpoint must be fully rebuilt |
 | **HAS download retry count** | §13.1 | 3 retries vs spec's 10 retries |
-| **Online/offline mode distinction** | §3.4 | No `ONLINE`/`OFFLINE_BASIC`/`OFFLINE_COMPLETE` mode enum; validation scope is not configurable |
+| **Online/offline mode distinction** | §3.4 | `CatchupRunMode` enum exists (`OfflineBasic`/`OfflineComplete`/`Online`); `OFFLINE_COMPLETE` tx-result verification not yet gated on the mode value (#2831) |
 | **Network passphrase validation during catchup** | §8.2 | HAS field exists but no explicit validation against configured passphrase |
 
 ### Minor Gaps
@@ -598,7 +598,7 @@ Catchup correctness is solid. The gaps are primarily in efficiency (differential
 
 4. **Implement publish queue backpressure** (§5.6): Add `PUBLISH_QUEUE_MAX_SIZE = 16` and `PUBLISH_QUEUE_UNBLOCK_APPLICATION = 8` constants and gating logic in the replay loop.
 
-5. **Add online/offline mode distinction** (§3.4): Introduce a mode enum and use it to control validation scope (e.g., tx result verification only in `OFFLINE_COMPLETE` mode).
+5. **~~Add online/offline mode distinction~~** (§3.4): ✅ Done — `CatchupRunMode` enum introduced (#2829). Remaining: gate `OFFLINE_COMPLETE` tx-result verification on the mode value (#2831).
 
 6. **Increase HAS download retry count** to 10 (§13.1).
 

@@ -142,7 +142,9 @@ pub use catchup::{
     CatchupManager, CatchupOptions, CatchupProgress, CatchupStatus, CheckpointData,
     ExistingBucketState, LedgerData, LedgerTxData,
 };
-pub use catchup_range::{CatchupMode, LedgerRange, GENESIS_LEDGER_SEQ};
+pub use catchup_range::{
+    CatchupConfiguration, CatchupMode, CatchupRunMode, LedgerRange, GENESIS_LEDGER_SEQ,
+};
 pub use cdp::{
     extract_ledger_header, extract_transaction_envelopes, extract_transaction_metas, CacheStats,
     CachedCdpDataLake, CdpDataLake,

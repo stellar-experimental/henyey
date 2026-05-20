@@ -41,6 +41,7 @@
 use crate::app::{App, CatchupFinalizer, CatchupResult, CatchupTarget};
 use crate::config::AppConfig;
 pub use henyey_history::CatchupMode;
+use henyey_history::CatchupRunMode;
 
 /// Configuration options for the catchup command.
 ///
@@ -255,7 +256,12 @@ pub async fn run_catchup(
     // blocking-pool pressure.
     let finalize = CatchupFinalizer::inline(app.database().clone(), app.ledger_manager().clone());
     let result = app
-        .catchup_with_mode(target, effective_mode, finalize)
+        .catchup_with_mode(
+            target,
+            effective_mode,
+            CatchupRunMode::OfflineBasic,
+            finalize,
+        )
         .await?;
 
     // Print result
@@ -574,5 +580,46 @@ mod tests {
         };
         let (_, mode) = options.parse_target_and_mode().unwrap();
         assert!(matches!(mode, CatchupMode::Recent(100)));
+    }
+
+    /// The standalone catchup command should produce OFFLINE_BASIC requests,
+    /// regardless of whether the depth is Complete, Recent, or Minimal.
+    /// This ensures that `CatchupMode::Complete` depth is not conflated with
+    /// `CatchupRunMode::OfflineComplete` (which has tx-result verification
+    /// semantics tracked by #2831).
+    #[test]
+    fn test_parse_target_and_mode_builds_offline_basic_request() {
+        use henyey_history::CatchupConfiguration;
+
+        // "ledger/max" -> Complete depth, but run_mode should be OFFLINE_BASIC
+        let options = CatchupOptions {
+            target: "1000000/max".to_string(),
+            mode: CatchupMode::Minimal,
+            verify: true,
+            parallelism: 8,
+            keep_temp: false,
+        };
+        let (target, depth) = options.parse_target_and_mode().unwrap();
+        assert!(matches!(target, CatchupTarget::Ledger(1000000)));
+        assert_eq!(depth, CatchupMode::Complete);
+        // Building a configuration from the CLI command always uses OfflineBasic
+        let config = CatchupConfiguration::offline_basic(depth);
+        assert_eq!(config.run_mode, CatchupRunMode::OfflineBasic);
+        assert_eq!(config.depth, CatchupMode::Complete);
+
+        // "1000000/500" -> Recent(500) depth, still OFFLINE_BASIC
+        let options = CatchupOptions {
+            target: "1000000/500".to_string(),
+            mode: CatchupMode::Minimal,
+            verify: true,
+            parallelism: 8,
+            keep_temp: false,
+        };
+        let (target, depth) = options.parse_target_and_mode().unwrap();
+        assert!(matches!(target, CatchupTarget::Ledger(1000000)));
+        assert_eq!(depth, CatchupMode::Recent(500));
+        let config = CatchupConfiguration::offline_basic(depth);
+        assert_eq!(config.run_mode, CatchupRunMode::OfflineBasic);
+        assert_eq!(config.depth, CatchupMode::Recent(500));
     }
 }

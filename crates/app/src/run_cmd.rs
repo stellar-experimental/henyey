@@ -46,6 +46,7 @@ use crate::app::{App, AppState, CatchupTarget, FallbackCatchup, RestoreResult};
 use crate::compat_http::CompatServer;
 use crate::config::AppConfig;
 use crate::http::{QueryServer, StatusServer};
+use henyey_history::CatchupRunMode;
 
 /// Node running mode determining behavior and consensus participation.
 ///
@@ -451,7 +452,12 @@ async fn run_main_loop(app: Arc<App>, options: RunOptions) -> anyhow::Result<()>
                 app.ledger_manager().clone(),
             );
             let _result = app
-                .catchup_with_mode(CatchupTarget::Current, catchup_mode, finalize)
+                .catchup_with_mode(
+                    CatchupTarget::Current,
+                    catchup_mode,
+                    CatchupRunMode::Online,
+                    finalize,
+                )
                 .await?;
 
             // Wait for SCP state request to complete

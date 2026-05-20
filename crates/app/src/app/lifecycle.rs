@@ -196,7 +196,12 @@ impl App {
                     // matching the explicit run_cmd path. See #2104.
                     let mode = self.live_catchup_mode();
                     let _result = self
-                        .catchup_with_mode(CatchupTarget::Current, mode, finalize)
+                        .catchup_with_mode(
+                            CatchupTarget::Current,
+                            mode,
+                            CatchupRunMode::Online,
+                            finalize,
+                        )
                         .await?;
                     if let Ok(ready) = persist_rx.try_recv() {
                         // Drive the persist task to completion before continuing.
