@@ -4418,6 +4418,64 @@ mod tests {
         );
     }
 
+    /// Verifies that `try_trigger_consensus` does NOT trigger consensus and
+    /// does NOT record drift when `ct_validity_offset` indicates the candidate
+    /// close time is still invalid (too far ahead of the herder clock).
+    ///
+    /// Parity: stellar-core HerderImpl::setupTriggerNextLedger — nomination is
+    /// delayed until the proposed close time falls within the MAX_TIME_SLIP
+    /// validity window.
+    #[tokio::test]
+    async fn test_try_trigger_consensus_skips_and_no_drift_on_ct_validity_delay() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-test.db");
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
+
+        let app = App::new(config).await.unwrap();
+
+        // Fix the herder's internal clock to a known value.
+        let now_secs: u64 = 1_700_000_000;
+        app.herder.set_test_clock_seconds(now_secs);
+
+        // Set LCL with close_time far enough ahead that lcl_close_time + 1
+        // exceeds the MAX_TIME_SLIP_SECONDS (60) validity window.
+        // lcl_close_time = now + 61 → candidate = now + 62 > now + 60
+        let far_ahead_close_time = now_secs + 61;
+        let mut header = app.ledger_manager().current_header();
+        header.ledger_seq = 10;
+        header.scp_value.close_time = stellar_xdr::curr::TimePoint(far_ahead_close_time);
+        app.ledger_manager()
+            .set_header_for_test(header, henyey_common::Hash256::ZERO);
+
+        // Bootstrap herder so is_tracking() is true — slot = ledger_seq + 1
+        app.herder.bootstrap(11);
+
+        let attempts_before = app.consensus_trigger_attempts.load(Ordering::Relaxed);
+
+        app.try_trigger_consensus().await;
+
+        // Trigger attempt must NOT have occurred because ctValidityOffset > 0.
+        let attempts_after = app.consensus_trigger_attempts.load(Ordering::Relaxed);
+        assert_eq!(
+            attempts_after, attempts_before,
+            "consensus_trigger_attempts must NOT increment when ct_validity_offset blocks"
+        );
+
+        // Drift tracker must NOT have a record for the next slot (11).
+        let next_slot = 11u32;
+        let drift_recorded = app
+            .drift_tracker
+            .lock()
+            .unwrap()
+            .record_local_close_time(next_slot, 0);
+        assert!(
+            drift_recorded,
+            "drift_tracker must not have been written for the skipped slot"
+        );
+    }
+
     /// Regression test for #2869 — HERDER §5.2 non-validator txset build + cache parity.
     ///
     /// Verifies that a watcher App can call `try_trigger_consensus()` and

@@ -228,18 +228,6 @@ impl App {
                 return;
             }
 
-            // Record local close time for drift tracking before triggering consensus.
-            // This captures when we started the consensus round.
-            let local_time = self
-                .clock
-                .system_now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("system clock before UNIX epoch")
-                .as_secs();
-            if let Ok(mut tracker) = self.drift_tracker.lock() {
-                tracker.record_local_close_time(next_slot, local_time);
-            }
-
             // In a full implementation, we would:
             // 1. Check if enough time has passed since last close
             // 2. Build a transaction set from queued transactions
@@ -260,6 +248,19 @@ impl App {
             .await
             {
                 Ok(Ok(henyey_herder::TriggerOutcome::Triggered)) => {
+                    // Record local close time for drift tracking only after
+                    // nomination actually starts. Recording before
+                    // trigger_next_ledger() would poison the drift tracker
+                    // on retryable skips (e.g. SkippedInvalidCloseTime).
+                    let local_time = self
+                        .clock
+                        .system_now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .expect("system clock before UNIX epoch")
+                        .as_secs();
+                    if let Ok(mut tracker) = self.drift_tracker.lock() {
+                        tracker.record_local_close_time(next_slot, local_time);
+                    }
                     self.consensus_trigger_successes
                         .fetch_add(1, Ordering::Relaxed);
                 }
