@@ -168,7 +168,7 @@ Corresponds to: `HerderSCPDriver.h`
 | `getValueString()` | `get_value_string()` | Full |
 | `setupTimer()` | `TimerManager` | Full |
 | `stopTimer()` | `TimerManager` | Full |
-| `timerCallbackWrapper()` future-slot defer | `App::handle_scp_timer_event` 3-way split | Full |
+| `timerCallbackWrapper()` future-slot defer + old-slot cleanup | `App::handle_scp_timer_event` 3-way split | Full |
 | `computeTimeout()` | `compute_timeout()` | Full |
 | `getHashOf()` | `compute_hash_node()` | Full |
 | `combineCandidates()` | `combine_candidates()` | Full |

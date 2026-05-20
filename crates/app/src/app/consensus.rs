@@ -1397,8 +1397,15 @@ impl App {
 
         match action {
             TimerEventAction::Drop => {
-                // Stale old-slot timer — drop without re-arming.
-                // Spec: HERDER_SPEC §5.4-2: old-slot timers are discarded.
+                // Stale old-slot timer — cancel all timers for this slot.
+                // Parity: stellar-core's timerCallbackWrapper routes mismatched
+                // slots through setupTimer(), which erases the entire slot's
+                // timer set when slotIndex <= trackingConsensusLedgerIndex().
+                // This ensures sibling timers for the same stale slot are also
+                // cleaned up rather than firing later.
+                self.timer_manager_handle
+                    .cancel_slot_timers(event.slot)
+                    .await;
             }
             TimerEventAction::Rearm => {
                 // Future-slot timer while tracking — re-arm for 1 second.
@@ -2329,6 +2336,66 @@ mod tests {
         assert!(
             rx.try_recv().is_err(),
             "no timer event should be re-delivered for a dropped old-slot timer"
+        );
+    }
+
+    /// End-to-end: old-slot timer cancels sibling timers for the same slot.
+    ///
+    /// Parity: stellar-core's setupTimer() erases the entire slot's timer set
+    /// when slotIndex <= trackingConsensusLedgerIndex(). This test verifies
+    /// that when an old-slot timer fires through the Drop path, any
+    /// previously-scheduled sibling timer for the same slot is also cancelled.
+    #[tokio::test(start_paused = true)]
+    async fn test_handle_scp_timer_event_e2e_old_slot_cancels_sibling_timers() {
+        let (_dir, app) = mk_validator_app().await;
+
+        // Bootstrap at ledger 1 → next_slot = 2, tracking
+        app.herder.bootstrap(1);
+        assert!(app.herder.is_tracking());
+        assert_eq!(app.herder.next_consensus_ledger_index().get(), 2);
+
+        // Schedule a ballot timer for slot 3 (currently a future slot) via the
+        // Rearm path. This simulates a ballot timer that was deferred.
+        let slot = 3u64;
+        app.timer_manager_handle
+            .schedule_ballot_timeout(slot, std::time::Duration::from_secs(2))
+            .await;
+
+        // Yield to let the timer manager process the schedule command
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+
+        // Now advance herder so slot 3 becomes an old slot (bootstrap at 5 →
+        // next_slot = 6, so slot 3 < 6).
+        app.herder.bootstrap(5);
+        assert_eq!(app.herder.next_consensus_ledger_index().get(), 6);
+        assert!(app.herder.is_tracking());
+
+        // Fire a nomination timer event for the now-old slot 3.
+        // This should hit the Drop path AND cancel all timers for slot 3.
+        let event = super::super::scp_timer_bridge::ScpTimerEvent {
+            slot,
+            timer_type: henyey_herder::TimerType::Nomination,
+        };
+        app.handle_scp_timer_event(event).await;
+
+        // Yield to let cancel propagate
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+
+        // Advance time well past the 2-second ballot timer and verify it was
+        // cancelled — no timer event should arrive from the sibling ballot.
+        let mut rx = app.scp_timer_rx.lock().await;
+        tokio::time::advance(std::time::Duration::from_secs(5)).await;
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+
+        assert!(
+            rx.try_recv().is_err(),
+            "sibling ballot timer for the old slot must be cancelled"
         );
     }
 }
