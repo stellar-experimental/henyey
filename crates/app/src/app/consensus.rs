@@ -131,14 +131,23 @@ pub(super) enum TimerEventAction {
 /// consensus slot, and whether the herder is currently tracking.
 ///
 /// Spec: HERDER_SPEC §5.4-2 (future-slot timer reschedule).
+///
+/// Parity: stellar-core's `timerCallbackWrapper` only applies the slot-based
+/// defer/drop logic when `isTracking()` is true. When not tracking, all timer
+/// callbacks fire immediately regardless of slot relationship to
+/// `nextConsensusLedgerIndex()`.
 pub(super) fn classify_timer_event(
     event_slot: u64,
     next_consensus_slot: u64,
     is_tracking: bool,
 ) -> TimerEventAction {
-    if event_slot < next_consensus_slot {
+    if !is_tracking {
+        // Not tracking: fire immediately, matching stellar-core's
+        // timerCallbackWrapper fallthrough when !isTracking().
+        TimerEventAction::Fire
+    } else if event_slot < next_consensus_slot {
         TimerEventAction::Drop
-    } else if event_slot > next_consensus_slot && is_tracking {
+    } else if event_slot > next_consensus_slot {
         TimerEventAction::Rearm
     } else {
         TimerEventAction::Fire
@@ -2095,14 +2104,23 @@ mod tests {
         assert_eq!(classify_timer_event(51, 50, true), TimerEventAction::Rearm);
     }
 
-    /// Old-slot timer → Drop without re-arming.
+    /// Old-slot timer while tracking → Drop without re-arming.
     #[test]
     fn test_handle_scp_timer_event_drops_old_slot_without_rearm() {
-        // next_slot = 100, event_slot = 99 → Drop
+        // next_slot = 100, event_slot = 99, tracking = true → Drop
         assert_eq!(classify_timer_event(99, 100, true), TimerEventAction::Drop);
-        assert_eq!(classify_timer_event(99, 100, false), TimerEventAction::Drop);
-        // Far behind
+        // Far behind, tracking
         assert_eq!(classify_timer_event(1, 100, true), TimerEventAction::Drop);
+    }
+
+    /// Old-slot timer while NOT tracking → Fire immediately.
+    /// Parity: stellar-core's timerCallbackWrapper fires all callbacks when
+    /// !isTracking(), regardless of slot relationship to nextConsensusLedgerIndex().
+    #[test]
+    fn test_classify_timer_event_old_slot_not_tracking_fires() {
+        // Not tracking: old-slot timers fire immediately, not dropped.
+        assert_eq!(classify_timer_event(99, 100, false), TimerEventAction::Fire);
+        assert_eq!(classify_timer_event(1, 100, false), TimerEventAction::Fire);
     }
 
     /// Current-slot timer → Fire immediately regardless of tracking state.
