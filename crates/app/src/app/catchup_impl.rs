@@ -858,7 +858,7 @@ impl App {
                 // With checkpoint data, use direct method (minimal mode behavior)
                 // but still thread the full config so run_mode is preserved.
                 catchup_manager
-                    .catchup_to_ledger_with_checkpoint_data(
+                    .catchup_to_ledger_with_checkpoint_data_config(
                         target_ledger,
                         data,
                         config,

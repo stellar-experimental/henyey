@@ -54,7 +54,7 @@ mod replay;
 use crate::{
     archive::HistoryArchive,
     archive_state::HistoryArchiveState,
-    catchup_range::{CatchupConfiguration, CatchupMode, CatchupRange},
+    catchup_range::{CatchupConfiguration, CatchupMode, CatchupRange, CatchupRunMode},
     checkpoint,
     replay::ReplayConfig,
     verify, CatchupResult, HistoryError, Result,
@@ -802,6 +802,18 @@ impl CatchupManager {
     ) -> Result<CatchupResult> {
         let mode = config.depth;
         let run_mode = config.run_mode;
+
+        // OfflineComplete is not yet implemented (tx-result verification tracked
+        // by #2831). Reject loudly so callers cannot silently receive weaker
+        // validation than they requested.
+        if run_mode == CatchupRunMode::OfflineComplete {
+            return Err(HistoryError::CatchupFailed(
+                "CatchupRunMode::OfflineComplete is not yet implemented \
+                 (tx-result verification tracked by #2831)"
+                    .to_string(),
+            ));
+        }
+
         info!(
             "Starting catchup to ledger {} with mode {:?}, run_mode={}, lcl={}",
             target, mode, run_mode, lcl
@@ -921,16 +933,49 @@ impl CatchupManager {
 
     /// Catch up to a target ledger using pre-downloaded checkpoint data.
     ///
+    /// This is the backwards-compatible 3-argument entry point that defaults to
+    /// `CatchupRunMode::OfflineBasic`. Use
+    /// [`catchup_to_ledger_with_checkpoint_data_config`] when you need to
+    /// specify a different run mode.
+    pub async fn catchup_to_ledger_with_checkpoint_data(
+        &mut self,
+        target: u32,
+        data: CheckpointData,
+        ledger_manager: &LedgerManager,
+    ) -> Result<CatchupResult> {
+        self.catchup_to_ledger_with_checkpoint_data_config(
+            target,
+            data,
+            CatchupConfiguration::offline_basic(CatchupMode::Minimal),
+            ledger_manager,
+        )
+        .await
+    }
+
+    /// Catch up to a target ledger using pre-downloaded checkpoint data with
+    /// an explicit catchup configuration.
+    ///
     /// The `config` parameter carries the spec §6.1 run-mode discriminator so
     /// that online minimal catchup going through the historywork fast path
     /// preserves `CatchupRunMode::Online` end-to-end.
-    pub async fn catchup_to_ledger_with_checkpoint_data(
+    pub async fn catchup_to_ledger_with_checkpoint_data_config(
         &mut self,
         target: u32,
         data: CheckpointData,
         config: CatchupConfiguration,
         ledger_manager: &LedgerManager,
     ) -> Result<CatchupResult> {
+        // OfflineComplete is not yet implemented (tx-result verification tracked
+        // by #2831). Reject loudly so callers cannot silently receive weaker
+        // validation than they requested.
+        if config.run_mode == CatchupRunMode::OfflineComplete {
+            return Err(HistoryError::CatchupFailed(
+                "CatchupRunMode::OfflineComplete is not yet implemented \
+                 (tx-result verification tracked by #2831)"
+                    .to_string(),
+            ));
+        }
+
         info!(
             "Starting catchup to ledger {} with checkpoint data (run_mode={})",
             target, config.run_mode
