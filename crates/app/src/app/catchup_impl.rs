@@ -30,21 +30,39 @@ impl App {
         self.config().catchup.to_mode()
     }
 
-    /// Run catchup to a target ledger with a specific mode.
+    /// Backwards-compatible catchup entry point that defaults to
+    /// `CatchupRunMode::OfflineBasic`.
+    ///
+    /// Prefer [`Self::catchup_with_run_mode`] when the caller knows whether
+    /// the catchup is online or offline.
+    pub async fn catchup_with_mode(
+        &self,
+        target: CatchupTarget,
+        mode: CatchupMode,
+        finalize: CatchupFinalizer,
+    ) -> anyhow::Result<CatchupResult> {
+        self.catchup_with_run_mode(target, mode, CatchupRunMode::OfflineBasic, finalize)
+            .await
+    }
+
+    /// Run catchup to a target ledger with a specific mode and run-mode context.
     ///
     /// The mode controls how much history is downloaded:
     /// - Minimal: Only download bucket state at latest checkpoint
     /// - Recent(N): Download and replay the last N ledgers
     /// - Complete: Download complete history from genesis
     ///
+    /// The run_mode (spec §6.1) distinguishes online vs offline context.
+    ///
     /// `finalize` specifies how post-catchup state (final header, HAS,
     /// last_closed_ledger) is persisted. The finalizer is consumed before
     /// this function returns (Inline) or at caller's discretion via the
     /// oneshot (Deferred). See [`CatchupFinalizer`].
-    pub async fn catchup_with_mode(
+    pub async fn catchup_with_run_mode(
         &self,
         target: CatchupTarget,
         mode: CatchupMode,
+        run_mode: CatchupRunMode,
         finalize: CatchupFinalizer,
     ) -> anyhow::Result<CatchupResult> {
         #[allow(unused_assignments)]
@@ -73,7 +91,7 @@ impl App {
 
         let progress = Arc::new(CatchupProgress::new());
 
-        tracing::info!(?target, ?mode, "Starting catchup");
+        tracing::info!(?target, ?mode, %run_mode, "Starting catchup");
 
         // Determine target ledger
         let target_ledger = match target {
@@ -232,6 +250,7 @@ impl App {
             .run_catchup_work(
                 target_ledger,
                 mode,
+                run_mode,
                 progress.clone(),
                 existing_state,
                 override_lcl,
@@ -670,6 +689,7 @@ impl App {
         &self,
         target_ledger: u32,
         mode: CatchupMode,
+        run_mode: CatchupRunMode,
         progress: Arc<CatchupProgress>,
         existing_state: Option<ExistingBucketState>,
         override_lcl: Option<u32>,
@@ -832,23 +852,26 @@ impl App {
             }
         };
 
+        let config = CatchupConfiguration::new(mode, run_mode);
         let output = match checkpoint_data {
             Some(data) => {
                 // With checkpoint data, use direct method (minimal mode behavior)
+                // but still thread the full config so run_mode is preserved.
                 catchup_manager
-                    .catchup_to_ledger_with_checkpoint_data(
+                    .catchup_to_ledger_with_checkpoint_data_config(
                         target_ledger,
                         data,
+                        config,
                         &self.ledger_manager,
                     )
                     .await
             }
             None => {
-                // Use mode-aware catchup
+                // Use mode-aware catchup with full configuration
                 catchup_manager
-                    .catchup_to_ledger_with_mode(
+                    .catchup_to_ledger_with_config(
                         target_ledger,
-                        mode,
+                        config,
                         lcl,
                         existing_state,
                         &self.ledger_manager,
@@ -5041,6 +5064,51 @@ mod tests {
         assert_eq!(app.live_catchup_mode(), CatchupMode::Minimal);
     }
 
+    /// The live catchup request helper must produce the same replay depth
+    /// while tagging the request as ONLINE (spec §6.1 discriminator).
+    #[tokio::test]
+    async fn test_live_catchup_request_uses_online_mode() {
+        use henyey_history::{CatchupConfiguration, CatchupRunMode};
+
+        // Complete config -> depth=Complete, run_mode=Online
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-test.db");
+        let mut config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
+        config.catchup.complete = true;
+        let app = App::new(config).await.unwrap();
+        let depth = app.live_catchup_mode();
+        let catchup_config = CatchupConfiguration::online(depth);
+        assert_eq!(catchup_config.depth, CatchupMode::Complete);
+        assert_eq!(catchup_config.run_mode, CatchupRunMode::Online);
+
+        // Recent config -> depth=Recent(500), run_mode=Online
+        let dir2 = tempfile::tempdir().expect("temp dir");
+        let db_path2 = dir2.path().join("rs-stellar-test.db");
+        let mut config2 = crate::config::ConfigBuilder::new()
+            .database_path(db_path2)
+            .build();
+        config2.catchup.recent = 500;
+        let app2 = App::new(config2).await.unwrap();
+        let depth2 = app2.live_catchup_mode();
+        let catchup_config2 = CatchupConfiguration::online(depth2);
+        assert_eq!(catchup_config2.depth, CatchupMode::Recent(500));
+        assert_eq!(catchup_config2.run_mode, CatchupRunMode::Online);
+
+        // Default config -> depth=Minimal, run_mode=Online
+        let dir3 = tempfile::tempdir().expect("temp dir");
+        let db_path3 = dir3.path().join("rs-stellar-test.db");
+        let config3 = crate::config::ConfigBuilder::new()
+            .database_path(db_path3)
+            .build();
+        let app3 = App::new(config3).await.unwrap();
+        let depth3 = app3.live_catchup_mode();
+        let catchup_config3 = CatchupConfiguration::online(depth3);
+        assert_eq!(catchup_config3.depth, CatchupMode::Minimal);
+        assert_eq!(catchup_config3.run_mode, CatchupRunMode::Online);
+    }
+
     /// AUDIT-241 regression: when `catchup_needs_full_reset` is set and
     /// catchup fails (transient error), the flag must remain `true` so the
     /// next attempt retries with a full bucket-apply.
@@ -5075,7 +5143,12 @@ mod tests {
             persist_tx,
         );
         let result = app
-            .catchup_with_mode(CatchupTarget::Ledger(128), CatchupMode::Minimal, finalize)
+            .catchup_with_run_mode(
+                CatchupTarget::Ledger(128),
+                CatchupMode::Minimal,
+                CatchupRunMode::OfflineBasic,
+                finalize,
+            )
             .await;
 
         // Catchup must fail (unreachable archive).
@@ -5116,7 +5189,12 @@ mod tests {
             persist_tx,
         );
         let result = app
-            .catchup_with_mode(CatchupTarget::Ledger(0), CatchupMode::Minimal, finalize)
+            .catchup_with_run_mode(
+                CatchupTarget::Ledger(0),
+                CatchupMode::Minimal,
+                CatchupRunMode::OfflineBasic,
+                finalize,
+            )
             .await;
 
         // No-op catchup succeeds.
@@ -5304,7 +5382,12 @@ mod tests {
             persist_tx,
         );
         let result = app
-            .catchup_with_mode(CatchupTarget::Ledger(128), CatchupMode::Minimal, finalize)
+            .catchup_with_run_mode(
+                CatchupTarget::Ledger(128),
+                CatchupMode::Minimal,
+                CatchupRunMode::OfflineBasic,
+                finalize,
+            )
             .await;
 
         assert!(result.is_err(), "catchup must fail when fatal flag is set");

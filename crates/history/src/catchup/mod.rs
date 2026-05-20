@@ -54,7 +54,7 @@ mod replay;
 use crate::{
     archive::HistoryArchive,
     archive_state::HistoryArchiveState,
-    catchup_range::{CatchupMode, CatchupRange},
+    catchup_range::{CatchupConfiguration, CatchupMode, CatchupRange, CatchupRunMode},
     checkpoint,
     replay::ReplayConfig,
     verify, CatchupResult, HistoryError, Result,
@@ -742,8 +742,8 @@ impl CatchupManager {
 
     /// Catch up to a target ledger with a specific catchup mode.
     ///
-    /// This method calculates the appropriate checkpoint and replay range based on
-    /// the mode (Minimal, Complete, or Recent(N)).
+    /// Compatibility shim: delegates to [`Self::catchup_to_ledger_with_config`]
+    /// with `CatchupRunMode::OfflineBasic`.
     ///
     /// # Arguments
     ///
@@ -765,10 +765,63 @@ impl CatchupManager {
         existing_state: Option<ExistingBucketState>,
         ledger_manager: &LedgerManager,
     ) -> Result<CatchupResult> {
+        self.catchup_to_ledger_with_config(
+            target,
+            CatchupConfiguration::offline_basic(mode),
+            lcl,
+            existing_state,
+            ledger_manager,
+        )
+        .await
+    }
+
+    /// Catch up to a target ledger with a full catchup configuration.
+    ///
+    /// This is the config-aware entry point that carries both replay depth and
+    /// the spec §6.1 run-mode discriminator.
+    ///
+    /// # Arguments
+    ///
+    /// * `target` - The target ledger sequence to catch up to
+    /// * `config` - The catchup configuration (depth + run mode)
+    /// * `lcl` - The current Last Closed Ledger (use GENESIS_LEDGER_SEQ if starting fresh)
+    /// * `existing_state` - If provided, contains the existing bucket lists and header
+    ///   for replay-only catchup (Case 1: LCL > genesis). When `None`, Case 1 will
+    ///   return an error (bucket lists are required for replay without re-downloading).
+    ///
+    /// # Returns
+    ///
+    /// A `CatchupResult` containing the bucket list, header, and summary information.
+    pub async fn catchup_to_ledger_with_config(
+        &mut self,
+        target: u32,
+        config: CatchupConfiguration,
+        lcl: u32,
+        existing_state: Option<ExistingBucketState>,
+        ledger_manager: &LedgerManager,
+    ) -> Result<CatchupResult> {
+        let mode = config.depth;
+        let run_mode = config.run_mode;
+
+        // OfflineComplete is not yet implemented (tx-result verification tracked
+        // by #2831). Reject loudly so callers cannot silently receive weaker
+        // validation than they requested.
+        if run_mode == CatchupRunMode::OfflineComplete {
+            return Err(HistoryError::CatchupFailed(
+                "CatchupRunMode::OfflineComplete is not yet implemented \
+                 (tx-result verification tracked by #2831)"
+                    .to_string(),
+            ));
+        }
+
         info!(
-            "Starting catchup to ledger {} with mode {:?}, lcl={}",
-            target, mode, lcl
+            "Starting catchup to ledger {} with mode {:?}, run_mode={}, lcl={}",
+            target, mode, run_mode, lcl
         );
+        // run_mode is threaded through for observability and future behavioral
+        // differences (OFFLINE_COMPLETE tx-result verification, #2831). Currently
+        // only logged; replay-depth drives all range/download decisions.
+        let _ = run_mode;
         self.progress.target_ledger = target;
 
         // Calculate the catchup range based on mode
@@ -879,13 +932,71 @@ impl CatchupManager {
     }
 
     /// Catch up to a target ledger using pre-downloaded checkpoint data.
+    ///
+    /// This is the backwards-compatible 3-argument entry point that defaults to
+    /// `CatchupRunMode::OfflineBasic`. Use
+    /// [`catchup_to_ledger_with_checkpoint_data_config`] when you need to
+    /// specify a different run mode.
     pub async fn catchup_to_ledger_with_checkpoint_data(
         &mut self,
         target: u32,
         data: CheckpointData,
         ledger_manager: &LedgerManager,
     ) -> Result<CatchupResult> {
-        info!("Starting catchup to ledger {} with checkpoint data", target);
+        self.catchup_to_ledger_with_checkpoint_data_config(
+            target,
+            data,
+            CatchupConfiguration::offline_basic(CatchupMode::Minimal),
+            ledger_manager,
+        )
+        .await
+    }
+
+    /// Catch up to a target ledger using pre-downloaded checkpoint data with
+    /// an explicit catchup configuration.
+    ///
+    /// The `config` parameter carries the spec §6.1 run-mode discriminator so
+    /// that online minimal catchup going through the historywork fast path
+    /// preserves `CatchupRunMode::Online` end-to-end.
+    pub async fn catchup_to_ledger_with_checkpoint_data_config(
+        &mut self,
+        target: u32,
+        data: CheckpointData,
+        config: CatchupConfiguration,
+        ledger_manager: &LedgerManager,
+    ) -> Result<CatchupResult> {
+        // OfflineComplete is not yet implemented (tx-result verification tracked
+        // by #2831). Reject loudly so callers cannot silently receive weaker
+        // validation than they requested.
+        if config.run_mode == CatchupRunMode::OfflineComplete {
+            return Err(HistoryError::CatchupFailed(
+                "CatchupRunMode::OfflineComplete is not yet implemented \
+                 (tx-result verification tracked by #2831)"
+                    .to_string(),
+            ));
+        }
+
+        // The checkpoint-data fast path only supports minimal replay (replay
+        // from the checkpoint boundary to target). Reject non-Minimal depths
+        // so callers cannot silently receive fewer replayed ledgers than they
+        // requested.
+        if !matches!(config.depth, CatchupMode::Minimal) {
+            return Err(HistoryError::CatchupFailed(format!(
+                "catchup_to_ledger_with_checkpoint_data_config only supports \
+                 CatchupMode::Minimal depth, got {:?}. Use \
+                 catchup_to_ledger_with_config for non-minimal replay depths.",
+                config.depth
+            )));
+        }
+
+        info!(
+            "Starting catchup to ledger {} with checkpoint data (run_mode={})",
+            target, config.run_mode
+        );
+        // run_mode is threaded through for observability and future behavioral
+        // differences (OFFLINE_COMPLETE tx-result verification, #2831). Currently
+        // only logged; replay-depth drives all range/download decisions.
+        let _ = config.run_mode;
         self.progress.target_ledger = target;
 
         let checkpoint_seq =
