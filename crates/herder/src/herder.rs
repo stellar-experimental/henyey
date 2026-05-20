@@ -2630,8 +2630,21 @@ impl Herder {
             // Parity: stellar-core HerderImpl.cpp:1546-1625 — observers build
             // the candidate tx set, self-validate, and publish it into the
             // pending/fetch cache, then stop before `makeStellarValue`/`nominate`.
-            self.build_and_cache_candidate_tx_set(next_close_time)
-                .ok_or_else(|| HerderError::Internal("Failed to build candidate tx set".into()))?;
+            //
+            // A None result here means the candidate build aborted on a benign
+            // retryable condition (LCL advanced concurrently, or the defensive
+            // close-time gate rejected). Map it to SkippedStale rather than a
+            // hard error so callers retry on the next tick (review feedback).
+            if self
+                .build_and_cache_candidate_tx_set(next_close_time)
+                .is_none()
+            {
+                tracing::warn!(
+                    slot,
+                    "trigger_next_ledger: candidate tx-set build returned None (stale race)"
+                );
+                return Ok(TriggerOutcome::SkippedStale);
+            }
             let build_value_ms = t0.elapsed().as_millis();
 
             // Drain ready fetching envelopes after cache publication.
@@ -2659,9 +2672,19 @@ impl Herder {
         }
 
         // --- Validator path ---
-        let value = self
-            .build_nomination_value(next_close_time)
-            .ok_or_else(|| HerderError::Internal("Failed to build nomination value".into()))?;
+        let value = match self.build_nomination_value(next_close_time) {
+            Some(v) => v,
+            None => {
+                // build_nomination_value returns None when LCL advanced
+                // concurrently (stale close_time race). This is benign and
+                // retryable — map to SkippedStale rather than a hard error.
+                tracing::warn!(
+                    slot,
+                    "trigger_next_ledger: build_nomination_value returned None (stale race)"
+                );
+                return Ok(TriggerOutcome::SkippedStale);
+            }
+        };
         let build_value_ms = t0.elapsed().as_millis();
 
         // build_nomination_value() caches the tx set but no longer drains
@@ -6864,6 +6887,89 @@ mod tests {
         assert!(
             result.is_none(),
             "build_nomination_value must abort when close_time <= snapshot lcl_close_time"
+        );
+    }
+
+    /// Regression test for #2816 Correctness review round 2:
+    /// `trigger_next_ledger()` must return `Ok(SkippedStale)` (not a hard
+    /// `Err(Internal)`) when `build_nomination_value()` returns None.
+    /// Simulates the race by resetting the LedgerManager (making
+    /// `create_snapshot()` fail with NotInitialized) after the entry guards
+    /// pass but before the snapshot is taken inside `build_nomination_value`.
+    #[test]
+    fn test_trigger_next_ledger_returns_skipped_stale_on_build_none() {
+        let now = 5000u64;
+        let seed = [70u8; 32];
+        let secret = SecretKey::from_seed(&seed);
+        let public = secret.public_key();
+        let local_node_id =
+            stellar_xdr::curr::NodeId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
+                stellar_xdr::curr::Uint256(*public.as_bytes()),
+            ));
+        let quorum_set = ScpQuorumSet {
+            threshold: 1,
+            validators: vec![local_node_id].try_into().unwrap(),
+            inner_sets: vec![].try_into().unwrap(),
+        };
+        let config = HerderConfig {
+            is_validator: true,
+            node_public_key: public,
+            local_quorum_set: Some(quorum_set),
+            ..HerderConfig::default()
+        };
+
+        let lm = make_lm_with_close_time(0, now);
+        let herder =
+            Herder::with_secret_key(config, secret, lm.clone(), TimerManagerHandle::no_op());
+        herder.scp_driver.set_test_clock(now);
+        herder.bootstrap(0);
+
+        // Reset the LedgerManager so `create_snapshot()` returns Err(NotInitialized).
+        // Entry guards still pass: lcl_matches_slot(1) checks current_ledger_seq()
+        // which reads from the reset genesis header (seq=0), so 0+1=1 matches.
+        // But build_nomination_value → create_snapshot → Err → returns None.
+        lm.reset();
+
+        let result = herder.trigger_next_ledger(1);
+        assert_eq!(
+            result.expect(
+                "must not be a hard error — the old code erroneously returned Err(Internal)"
+            ),
+            TriggerOutcome::SkippedStale,
+            "trigger_next_ledger must return SkippedStale when build_nomination_value returns None"
+        );
+    }
+
+    /// Regression test for #2816 Correctness review round 2:
+    /// `ScpDriver::slot_trigger_time()` returns the first_seen instant for
+    /// a slot after `record_slot_activity` is called.
+    #[test]
+    fn test_slot_trigger_time_returns_recorded_instant() {
+        let (herder, _) = make_validator_herder();
+        herder.bootstrap(0);
+
+        // Before recording activity, slot_trigger_time should be None.
+        assert!(
+            herder.scp_driver.slot_trigger_time(1).is_none(),
+            "slot_trigger_time must be None before record_slot_activity"
+        );
+
+        // Record activity for slot 1.
+        herder.scp_driver.record_slot_activity(1);
+
+        // After recording, slot_trigger_time should be Some.
+        let trigger_time = herder.scp_driver.slot_trigger_time(1);
+        assert!(
+            trigger_time.is_some(),
+            "slot_trigger_time must be Some after record_slot_activity"
+        );
+
+        // The recorded time should be very recent (within 1 second of now).
+        let elapsed = trigger_time.unwrap().elapsed();
+        assert!(
+            elapsed.as_secs() < 1,
+            "slot_trigger_time should be very recent, got {:?} ago",
+            elapsed
         );
     }
 
