@@ -1392,7 +1392,13 @@ impl App {
             return;
         }
 
-        let next_slot = self.herder.next_consensus_ledger_index().get();
+        // Use max(tracking_slot, current_ledger + 1) as the effective next slot.
+        // In the INV-H2 corrective window where LCL + 1 > tracking_slot, a timer
+        // for LCL + 1 is current from the app's perspective and must fire immediately
+        // rather than being deferred as a "future" slot.
+        let tracking_next = self.herder.next_consensus_ledger_index().get();
+        let lcl_next = self.current_ledger_seq() as u64 + 1;
+        let next_slot = tracking_next.max(lcl_next);
         let action = classify_timer_event(event.slot, next_slot, self.herder.is_tracking());
 
         match action {
@@ -2396,6 +2402,50 @@ mod tests {
         assert!(
             rx.try_recv().is_err(),
             "sibling ballot timer for the old slot must be cancelled"
+        );
+    }
+
+    /// Regression test for INV-H2 corrective window: when LCL + 1 > tracking_slot,
+    /// a timer for LCL + 1 must fire immediately (not be deferred as a "future" slot).
+    ///
+    /// This exercises the max(tracking_slot, current_ledger + 1) floor that prevents
+    /// an unintended 1-second delay in the corrective recovery path.
+    #[tokio::test(start_paused = true)]
+    async fn test_handle_scp_timer_event_e2e_lcl_ahead_of_tracking_fires_immediately() {
+        let (_dir, app) = mk_validator_app().await;
+
+        // Bootstrap herder at ledger 1 → tracking slot = 2, is_tracking = true
+        app.herder.bootstrap(1);
+        assert!(app.herder.is_tracking());
+        assert_eq!(app.herder.next_consensus_ledger_index().get(), 2);
+
+        // Advance the LCL to ledger 5 without advancing herder tracking.
+        // This creates the INV-H2 corrective window: LCL=5, tracking_slot=2,
+        // so current_ledger + 1 = 6 > tracking_slot = 2.
+        {
+            let mut header = app.ledger_manager().current_header();
+            header.ledger_seq = 5;
+            app.ledger_manager()
+                .set_header_for_test(header, henyey_common::Hash256::default());
+        }
+        assert_eq!(app.current_ledger_seq(), 5);
+
+        // A nomination timer for slot 6 (= current_ledger + 1) should fire
+        // immediately — it is "current" from the app's perspective even though
+        // it's ahead of the tracking slot.
+        let event = super::super::scp_timer_bridge::ScpTimerEvent {
+            slot: 6,
+            timer_type: henyey_herder::TimerType::Nomination,
+        };
+
+        let fires_before = app.nomination_timeout_fires.load(Ordering::Relaxed);
+        app.handle_scp_timer_event(event).await;
+
+        // The fire counter must increment — this timer should NOT be rearmed.
+        assert_eq!(
+            app.nomination_timeout_fires.load(Ordering::Relaxed),
+            fires_before + 1,
+            "timer for LCL+1 must fire immediately in the corrective window, not be rearmed"
         );
     }
 }
