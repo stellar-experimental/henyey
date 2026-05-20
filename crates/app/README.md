@@ -157,6 +157,20 @@ Buffered ledger application is intentionally interleaved with the main event loo
 
 Metadata streaming has asymmetric failure semantics: writes to the configured main output stream are fatal and abort the node, while rotating debug stream failures are logged and ignored. This mirrors the requirement that primary ingestion output must never be silently dropped.
 
+### Catchup Crash Recovery (§14.5 parity)
+
+stellar-core uses a `REBUILD_FOR_OFFER_TABLE` persistent-state flag because its SQL offer tables are mutated incrementally during bucket apply. On restart, `maybeRebuildLedger()` detects the flag and rebuilds SQL state from buckets.
+
+henyey has no SQL offer table — it uses BucketListDB-only persistence with an in-memory offer index — so the literal flag is not needed. Instead, crash recovery is ensured by a **two-window design**:
+
+1. **Window 1 — mid-catchup before final LCL/HAS persist.** Pre-final-persist writes (`persist_bucket_list_snapshot`, `persist_header_only`, `persist_ledger_history`, `emit_meta`) are durable but non-authoritative for the **startup restore path**: `load_last_known_ledger` reads from `last_closed_ledger` and `HISTORY_ARCHIVE_STATE`, not from ahead-of-LCL rows. Orphaned rows are overwritten by the next successful catchup. **Caveats:**
+   - `verify_on_disk_integrity()` also anchors on `get_latest_ledger_seq()` and runs at startup before `check_catchup_persist_pending()`. After a Window-1 crash this walks ahead-of-LCL headers, but because catchup writes headers in sequential order the hash chain remains valid — the function succeeds without incorrect results. It simply verifies more headers than semantically necessary, which is harmless.
+   - CLI readers that use `get_latest_ledger_seq()` (e.g. `publish_history`, `self_check`) also anchor on `MAX(ledgerseq)` over `ledgerheaders` and may observe ahead-of-LCL state after a Window-1 crash. This is a known gap tracked for future hardening.
+
+2. **Window 2 — post-catchup / pre-deferred-persist.** After catchup succeeds in memory, `catchup_impl.rs` sets the `CATCHUP_PERSIST_PENDING` sentinel before handing off to the deferred persist task. If the node crashes before that task commits, `App::new()` → `check_catchup_persist_pending()` detects the sentinel on restart and seeds `catchup_needs_full_reset`, forcing the next catchup down the full bucket-apply path. The sentinel is only cleared atomically with the final state write in `CatchupPersistData::write_to_db`, ensuring crash-idempotence across repeated restarts.
+
+This preserves the core recovery contract — the startup/catchup path never trusts interrupted catchup state — via a different mechanism suited to the BucketListDB-only architecture. `verify_on_disk_integrity()` is safe during Window-1 because catchup writes headers sequentially, keeping the hash chain valid even for orphaned rows (it simply verifies further than semantically needed). Full parity with stellar-core's `REBUILD_FOR_OFFER_TABLE` semantics requires additionally hardening CLI reader paths to anchor on durable LCL/HAS rather than `MAX(ledgerseq)`.
+
 ## stellar-core Mapping
 
 | Rust | stellar-core |

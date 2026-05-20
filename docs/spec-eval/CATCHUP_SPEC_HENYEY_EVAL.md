@@ -51,7 +51,7 @@ The history crate is at **79% function-level parity** and the historywork crate 
 | **Bucket Application (§10)** | **High** | Disk-backed bucket loading, hash verification, live + hot archive restore; missing `differingBuckets()` (downloads all buckets) |
 | **Transaction Replay (§11)** | **High** | Re-execution and metadata replay modes; per-checkpoint download; tx set/result hash verification |
 | **Buffered Ledger Application (§12)** | **Not present** | Part of Ledger Apply Manager, not in these crates |
-| **Error Handling & Recovery (§13)** | **Medium** | Archive failover, crash-safe checkpoint building present; missing fatal catchup failure flag, crash recovery during catchup is simplified |
+| **Error Handling & Recovery (§13)** | **Medium** | Archive failover, crash-safe checkpoint building present; missing fatal catchup failure flag; crash recovery during catchup handled via two-window design (§14.5) |
 | **Invariants (§14)** | **High** | Most invariants enforced; INV-C5 (per-ledger hash check after replay) and INV-C7 (buffer monotonicity) not applicable here |
 | **Constants (§15)** | **High** | All core constants present; PUBLISH_QUEUE_MAX_SIZE/UNBLOCK not enforced |
 
@@ -476,7 +476,7 @@ Source file references use the format `file.rs:line`.
 |-------------|--------|----------|
 | Checkpoint builder recovers on restart | ✅ | `checkpoint_builder.rs:340-436` — `cleanup()` method |
 | LCL restored from persistent storage | ✅ | Handled by database layer |
-| Crash after bucket apply → re-catch up from advanced LCL | ⚠️ | Implicit — LCL is persisted after bucket apply, but no explicit crash-during-catchup recovery logic |
+| Crash after bucket apply → re-catch up from advanced LCL | ⚠️ | Two-window design: (1) startup restore path is safe (reads `last_closed_ledger`/HAS, not ahead-of-LCL rows); (2) `CATCHUP_PERSIST_PENDING` sentinel forces full bucket-apply on restart if deferred persist was interrupted. **Gap:** CLI readers (`publish_history`, `self_check`) still use `MAX(ledgerseq)` and may observe ahead-of-LCL state after a Window-1 crash. See `crates/app/README.md` §14.5 design note. |
 | Crash before bucket apply → catch up from scratch | ✅ | No partial state to recover |
 
 #### Hash Verification Failures (§13.5)

@@ -57,9 +57,10 @@ impl CatchupPersistData {
                 &self.has_json,
             )?;
             conn.set_last_closed_ledger(self.header.ledger_seq)?;
-            // Clear the deferred-persist sentinel (AUDIT-226). This runs
-            // atomically with the state update so a crash before this
-            // transaction leaves the sentinel set for startup detection.
+            // Clear the deferred-persist sentinel (AUDIT-226 / §14.5). This
+            // runs atomically with the state update, closing the second crash
+            // window. A crash before this transaction leaves the sentinel set
+            // for startup detection via `check_catchup_persist_pending`.
             conn.delete_state(henyey_db::schema::state_keys::CATCHUP_PERSIST_PENDING)?;
 
             // stellar-core parity: `skipFirstCheckpointSinceItIsIncomplete`.

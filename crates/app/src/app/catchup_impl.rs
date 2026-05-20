@@ -557,10 +557,14 @@ impl App {
                     ledger_manager,
                     persist_tx,
                 } => {
-                    // Mark the deferred persist window so a crash before
-                    // the event loop executes the persist can be detected
-                    // on restart (AUDIT-226). Cleared atomically inside
-                    // CatchupPersistData::write_to_db.
+                    // Mark the second crash window (post-catchup / pre-deferred-persist)
+                    // so a crash before the event loop executes the persist can be
+                    // detected on restart (AUDIT-226). This does NOT cover the
+                    // earlier pre-final-persist window (bucket-list snapshot and
+                    // header writes in `crates/history`); that window is safe because
+                    // those writes are non-authoritative until LCL/HAS advance.
+                    // Cleared atomically inside CatchupPersistData::write_to_db.
+                    // See §14.5 parity note on `check_catchup_persist_pending`.
                     if let Err(e) = db.with_connection(|conn| {
                         use henyey_db::queries::StateQueries;
                         conn.set_state(state_keys::CATCHUP_PERSIST_PENDING, "1")
