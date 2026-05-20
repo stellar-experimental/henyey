@@ -1665,7 +1665,7 @@ impl App {
             // stellar-core's getCatchupCount() behavior. See #2104.
             let mode = app.live_catchup_mode();
             let catchup_result = app
-                .catchup_with_mode(target, mode, CatchupRunMode::Online, finalize)
+                .catchup_with_run_mode(target, mode, CatchupRunMode::Online, finalize)
                 .await;
 
             let persist_ready = match &catchup_result {

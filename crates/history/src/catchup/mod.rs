@@ -920,13 +920,25 @@ impl CatchupManager {
     }
 
     /// Catch up to a target ledger using pre-downloaded checkpoint data.
+    ///
+    /// The `config` parameter carries the spec §6.1 run-mode discriminator so
+    /// that online minimal catchup going through the historywork fast path
+    /// preserves `CatchupRunMode::Online` end-to-end.
     pub async fn catchup_to_ledger_with_checkpoint_data(
         &mut self,
         target: u32,
         data: CheckpointData,
+        config: CatchupConfiguration,
         ledger_manager: &LedgerManager,
     ) -> Result<CatchupResult> {
-        info!("Starting catchup to ledger {} with checkpoint data", target);
+        info!(
+            "Starting catchup to ledger {} with checkpoint data (run_mode={})",
+            target, config.run_mode
+        );
+        // run_mode is threaded through for observability and future behavioral
+        // differences (OFFLINE_COMPLETE tx-result verification, #2831). Currently
+        // only logged; replay-depth drives all range/download decisions.
+        let _ = config.run_mode;
         self.progress.target_ledger = target;
 
         let checkpoint_seq =

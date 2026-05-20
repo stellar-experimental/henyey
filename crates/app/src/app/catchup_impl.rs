@@ -30,6 +30,21 @@ impl App {
         self.config().catchup.to_mode()
     }
 
+    /// Backwards-compatible catchup entry point that defaults to
+    /// `CatchupRunMode::OfflineBasic`.
+    ///
+    /// Prefer [`Self::catchup_with_run_mode`] when the caller knows whether
+    /// the catchup is online or offline.
+    pub async fn catchup_with_mode(
+        &self,
+        target: CatchupTarget,
+        mode: CatchupMode,
+        finalize: CatchupFinalizer,
+    ) -> anyhow::Result<CatchupResult> {
+        self.catchup_with_run_mode(target, mode, CatchupRunMode::OfflineBasic, finalize)
+            .await
+    }
+
     /// Run catchup to a target ledger with a specific mode and run-mode context.
     ///
     /// The mode controls how much history is downloaded:
@@ -43,7 +58,7 @@ impl App {
     /// last_closed_ledger) is persisted. The finalizer is consumed before
     /// this function returns (Inline) or at caller's discretion via the
     /// oneshot (Deferred). See [`CatchupFinalizer`].
-    pub async fn catchup_with_mode(
+    pub async fn catchup_with_run_mode(
         &self,
         target: CatchupTarget,
         mode: CatchupMode,
@@ -837,20 +852,22 @@ impl App {
             }
         };
 
+        let config = CatchupConfiguration::new(mode, run_mode);
         let output = match checkpoint_data {
             Some(data) => {
                 // With checkpoint data, use direct method (minimal mode behavior)
+                // but still thread the full config so run_mode is preserved.
                 catchup_manager
                     .catchup_to_ledger_with_checkpoint_data(
                         target_ledger,
                         data,
+                        config,
                         &self.ledger_manager,
                     )
                     .await
             }
             None => {
                 // Use mode-aware catchup with full configuration
-                let config = CatchupConfiguration::new(mode, run_mode);
                 catchup_manager
                     .catchup_to_ledger_with_config(
                         target_ledger,
@@ -5126,7 +5143,7 @@ mod tests {
             persist_tx,
         );
         let result = app
-            .catchup_with_mode(
+            .catchup_with_run_mode(
                 CatchupTarget::Ledger(128),
                 CatchupMode::Minimal,
                 CatchupRunMode::OfflineBasic,
@@ -5172,7 +5189,7 @@ mod tests {
             persist_tx,
         );
         let result = app
-            .catchup_with_mode(
+            .catchup_with_run_mode(
                 CatchupTarget::Ledger(0),
                 CatchupMode::Minimal,
                 CatchupRunMode::OfflineBasic,
@@ -5365,7 +5382,7 @@ mod tests {
             persist_tx,
         );
         let result = app
-            .catchup_with_mode(
+            .catchup_with_run_mode(
                 CatchupTarget::Ledger(128),
                 CatchupMode::Minimal,
                 CatchupRunMode::OfflineBasic,

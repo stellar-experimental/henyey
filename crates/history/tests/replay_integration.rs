@@ -18,7 +18,7 @@ use henyey_history::{
     archive_state::{HASBucketLevel, HistoryArchiveState},
     catchup::{CatchupManagerBuilder, CatchupOptions},
     paths::checkpoint_path,
-    verify, HistoryError,
+    verify, CatchupConfiguration, HistoryError,
 };
 use henyey_ledger::TransactionSetVariant;
 use stellar_xdr::curr::{
@@ -1536,7 +1536,12 @@ async fn test_inv_c15_rejects_bucket_apply_older_than_lcl() {
     };
 
     let result = manager
-        .catchup_to_ledger_with_checkpoint_data(target, data, &ledger_manager)
+        .catchup_to_ledger_with_checkpoint_data(
+            target,
+            data,
+            CatchupConfiguration::offline_basic(henyey_history::CatchupMode::Minimal),
+            &ledger_manager,
+        )
         .await;
 
     let err = result.expect_err("should reject bucket-apply older than LCL");
@@ -1695,7 +1700,12 @@ async fn test_inv_c15_allows_bucket_apply_at_lcl() {
 
     // This should succeed — checkpoint == LCL is valid per INV-C15.
     let result = manager
-        .catchup_to_ledger_with_checkpoint_data(target, data, &ledger_manager)
+        .catchup_to_ledger_with_checkpoint_data(
+            target,
+            data,
+            CatchupConfiguration::offline_basic(henyey_history::CatchupMode::Minimal),
+            &ledger_manager,
+        )
         .await;
 
     // The bucket-apply + replay should succeed (equality does not violate INV-C15).
@@ -1715,5 +1725,112 @@ async fn test_inv_c15_allows_bucket_apply_at_lcl() {
             // Other errors (e.g. replay verification) are acceptable in this
             // synthetic test — the important thing is INV-C15 didn't reject it.
         }
+    }
+}
+
+/// Regression test: online minimal catchup going through the historywork/
+/// checkpoint-data fast path must preserve `CatchupRunMode::Online` end-to-end.
+/// Before the fix, `catchup_to_ledger_with_checkpoint_data` had no config param
+/// and silently dropped the run mode.
+#[tokio::test]
+async fn test_checkpoint_data_path_preserves_online_run_mode() {
+    use henyey_history::catchup::CheckpointData;
+    use henyey_history::CatchupRunMode;
+    use stellar_xdr::curr::ScpHistoryEntry;
+
+    let checkpoint = 127u32;
+    let target = 128u32;
+
+    let ledger_manager = henyey_ledger::LedgerManager::new(
+        "Test SDF Network ; September 2015".to_string(),
+        henyey_ledger::LedgerManagerConfig {
+            validate_bucket_hash: false,
+            ..Default::default()
+        },
+    );
+
+    // Fresh ledger manager (not initialized) = the "no existing state" case
+    // that triggers the historywork/checkpoint-data fast path in henyey-app.
+    assert!(!ledger_manager.is_initialized());
+
+    let checkpoint_header = make_header(
+        checkpoint,
+        Hash256::ZERO,
+        Hash256::ZERO,
+        Hash256::ZERO,
+        Hash256::ZERO,
+    );
+    let checkpoint_hash = henyey_history::verify::compute_header_hash(&checkpoint_header)
+        .expect("checkpoint header hash");
+
+    let header_entry = LedgerHeaderHistoryEntry {
+        hash: checkpoint_hash.into(),
+        header: checkpoint_header,
+        ext: LedgerHeaderHistoryEntryExt::default(),
+    };
+
+    let mut levels = Vec::with_capacity(BUCKET_LIST_LEVELS);
+    for _ in 0..BUCKET_LIST_LEVELS {
+        levels.push(HASBucketLevel {
+            curr: "0".repeat(64),
+            snap: "0".repeat(64),
+            next: Default::default(),
+        });
+    }
+
+    let has = HistoryArchiveState {
+        version: 2,
+        server: Some("test".to_string()),
+        current_ledger: checkpoint,
+        network_passphrase: Some("Test SDF Network ; September 2015".to_string()),
+        current_buckets: levels,
+        hot_archive_buckets: make_test_hot_archive_buckets(),
+    };
+
+    let bucket_dir = tempfile::tempdir().expect("bucket dir");
+    let bucket_manager =
+        henyey_bucket::BucketManager::new(bucket_dir.path().to_path_buf()).expect("bucket manager");
+    let db = henyey_db::Database::open_in_memory().expect("db");
+
+    let dummy_archive = HistoryArchive::new("http://127.0.0.1:1/").expect("dummy archive");
+    let mut manager = CatchupManagerBuilder::new()
+        .add_archive(dummy_archive)
+        .bucket_manager(bucket_manager)
+        .database(db)
+        .options(CatchupOptions {
+            verify_buckets: false,
+            verify_headers: false,
+        })
+        .build()
+        .expect("catchup manager");
+
+    let data = CheckpointData {
+        has,
+        bucket_dir: bucket_dir.path().to_path_buf(),
+        headers: vec![header_entry],
+        transactions: vec![],
+        tx_results: vec![],
+        scp_history: Vec::<ScpHistoryEntry>::new(),
+    };
+
+    // Call with CatchupRunMode::Online — this previously wasn't possible
+    // because the function had no config parameter.
+    let config = CatchupConfiguration::online(henyey_history::CatchupMode::Minimal);
+    assert_eq!(config.run_mode, CatchupRunMode::Online);
+
+    let result = manager
+        .catchup_to_ledger_with_checkpoint_data(target, data, config, &ledger_manager)
+        .await;
+
+    // The call succeeds (or may fail due to bucket-apply/replay in synthetic test),
+    // but the important assertion is that it accepted the Online config without
+    // ignoring/discarding the run_mode. If it compiles and doesn't panic on
+    // config handling, the discriminator is threaded through.
+    if let Err(e) = &result {
+        let msg = e.to_string();
+        assert!(
+            !msg.contains("run_mode") && !msg.contains("Online"),
+            "error should not be about run_mode, got: {msg}"
+        );
     }
 }

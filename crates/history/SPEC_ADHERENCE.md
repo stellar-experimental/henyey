@@ -34,7 +34,7 @@ invariants. INV-C9 (bucket-apply newest-wins) lives in
 | §5.5 | Differing-buckets diff algorithm | Full | `archive_state.rs:220-274` |
 | §5.6 | Publish queue backpressure (8/16) | Full | `publish_queue.rs:108-112`, `catchup/replay.rs:559-585` |
 | §5.7 | restoreCheckpoint / cleanup recovery | Full | `checkpoint_builder.rs:491-680` |
-| §6.1 | Catchup modes (OFFLINE_BASIC/OFFLINE_COMPLETE/ONLINE) | Full | `catchup_range.rs` — `CatchupRunMode` enum + `CatchupConfiguration` wrapper; threaded through all entry points (#2829). OFFLINE_COMPLETE tx-result verification semantics deferred to #2831 |
+| §6.1 | Catchup modes (OFFLINE_BASIC/OFFLINE_COMPLETE/ONLINE) | Partial | `catchup_range.rs` — `CatchupRunMode` enum + `CatchupConfiguration` wrapper; threaded through all entry points (#2829). OFFLINE_COMPLETE tx-result verification semantics deferred to #2831 (structural only until then) |
 | §6.3 | calculateCatchupRange | Partial | `catchup_range.rs:221-319` — see Drift item below |
 | §7 | LedgerApplyManager | N/A | lives in `crates/app/src/app/ledger_close.rs` |
 | §8.1 | Phase 1: Fetch HAS | Full | `catchup/mod.rs:578-616` |
@@ -106,7 +106,7 @@ invariants. INV-C9 (bucket-apply newest-wins) lives in
 ### §6.1 — Catchup Modes
 - **Claim §6.1-1** (MUST): modes are OFFLINE_BASIC, OFFLINE_COMPLETE, ONLINE.
 - **Rust**: `crates/history/src/catchup_range.rs` defines `CatchupRunMode::{OfflineBasic, OfflineComplete, Online}` as the spec §6.1 discriminator, and `CatchupConfiguration` wrapping both `CatchupMode` (replay depth/count) and `CatchupRunMode`. The discriminator is threaded through `catchup_to_ledger_with_config` and all app-level entry points.
-- **Status**: Full (structural). The enum exists and is correctly threaded. `OFFLINE_COMPLETE` tx-result verification loop (§12) remains gated by #2831 — the mode value is carried but does not yet trigger the additional verification behavior.
+- **Status**: Partial (structural only). The enum exists and is threaded through all entry points including the historywork/checkpoint-data fast path. `OFFLINE_COMPLETE` tx-result verification loop (§12) remains gated by #2831 — the mode value is carried but does not yet trigger the additional verification behavior.
 - **Notes**: `CatchupMode::{Minimal, Complete, Recent(n)}` remains the replay-depth/count axis (spec `count` field). The two axes are intentionally separate.
 
 ### §6.3 — Range Computation

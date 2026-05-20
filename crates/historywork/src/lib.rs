@@ -257,7 +257,7 @@ pub async fn get_progress(state: &SharedHistoryState) -> HistoryWorkProgress {
 /// // After scheduler completes all work...
 /// let checkpoint_data = build_checkpoint_data(&state).await?;
 /// catchup_manager
-///     .catchup_to_ledger_with_checkpoint_data(target, checkpoint_data)
+///     .catchup_to_ledger_with_checkpoint_data(target, checkpoint_data, config)
 ///     .await?;
 /// ```
 ///

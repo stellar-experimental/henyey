@@ -256,7 +256,7 @@ pub async fn run_catchup(
     // blocking-pool pressure.
     let finalize = CatchupFinalizer::inline(app.database().clone(), app.ledger_manager().clone());
     let result = app
-        .catchup_with_mode(
+        .catchup_with_run_mode(
             target,
             effective_mode,
             CatchupRunMode::OfflineBasic,

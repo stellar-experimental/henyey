@@ -124,7 +124,7 @@ Source file references use the format `file.rs:line`.
 |-------------|--------|----------|
 | `toLedger` with sentinel 0 = "latest from archive" | ✅ | `catchup_range.rs` — `CatchupMode::Minimal` resolves to archive's latest |
 | `count` field (UINT32_MAX = complete, 0 = minimal) | ✅ | `catchup_range.rs:35-50` — `CatchupMode` enum with `Minimal`, `Complete`, `Recent(u32)` |
-| `mode` field: ONLINE / OFFLINE_BASIC / OFFLINE_COMPLETE | ✅ | `catchup_range.rs` — `CatchupRunMode` enum with `OfflineBasic`, `OfflineComplete`, `Online`. `CatchupConfiguration` wrapper carries both depth and run mode. `OFFLINE_COMPLETE` tx-result verification semantics not yet implemented (#2831) |
+| `mode` field: ONLINE / OFFLINE_BASIC / OFFLINE_COMPLETE | ⚠️ Partial | `catchup_range.rs` — `CatchupRunMode` enum with `OfflineBasic`, `OfflineComplete`, `Online`. `CatchupConfiguration` wrapper carries both depth and run mode. Structural only: `OFFLINE_COMPLETE` tx-result verification semantics not yet implemented (#2831) |
 
 #### Catchup Range and Ledger Range (§3.5–3.7)
 

@@ -452,7 +452,7 @@ async fn run_main_loop(app: Arc<App>, options: RunOptions) -> anyhow::Result<()>
                 app.ledger_manager().clone(),
             );
             let _result = app
-                .catchup_with_mode(
+                .catchup_with_run_mode(
                     CatchupTarget::Current,
                     catchup_mode,
                     CatchupRunMode::Online,
