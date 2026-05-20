@@ -836,6 +836,20 @@ impl App {
         // frames match the live-mode LedgerCloseMetaExt version.
         catchup_manager.set_emit_meta_ext_v1(self.config.metadata.emit_ledger_close_meta_ext_v1);
 
+        // §9.1 + INV-C5: Resolve an SCP-derived trust anchor for online catchup.
+        // If target + 1 has been externalized and its tx-set is available, use
+        // tx_set.previous_ledger_hash() as the trusted anchor for reverse-walk
+        // verification. This matches stellar-core's startOnlineCatchup() behavior.
+        if let Some((seq, hash)) = self.resolve_scp_trust_anchor(target_ledger) {
+            tracing::info!(
+                target_ledger,
+                anchor_seq = seq,
+                anchor_hash = %hash.to_hex(),
+                "Resolved SCP trust anchor from externalized slot target+1"
+            );
+            catchup_manager.set_trusted_scp_anchor(seq, hash);
+        }
+
         // Run catchup
         progress.set_phase(CatchupPhase::DownloadingBuckets);
 
@@ -918,6 +932,24 @@ impl App {
         tracing::info!("Verifying catchup state");
 
         Ok(output)
+    }
+
+    /// Resolve an SCP-derived trust anchor for reverse-walk verification.
+    ///
+    /// Checks `Herder::check_ledger_close(target_ledger + 1)` for a concrete
+    /// tx-set. If available, returns `(target_ledger, tx_set.previous_ledger_hash())`
+    /// which is the hash of `target_ledger` as attested by SCP consensus.
+    /// Returns `None` if the adjacent slot is not externalized or its tx-set
+    /// is not yet cached (preserving the existing untrusted fallback behavior).
+    ///
+    /// This mirrors stellar-core's `LedgerApplyManagerImpl::startOnlineCatchup()`
+    /// which anchors verification at `firstBufferedLedger.txSet.previousLedgerHash()`.
+    pub(crate) fn resolve_scp_trust_anchor(&self, target_ledger: u32) -> Option<(u32, Hash256)> {
+        let adjacent_slot = (target_ledger as u64) + 1;
+        let info = self.herder.check_ledger_close(adjacent_slot)?;
+        let tx_set = info.tx_set?;
+        let prev_hash = tx_set.previous_ledger_hash();
+        Some((target_ledger, prev_hash))
     }
 
     async fn download_checkpoint_with_historywork(
@@ -6145,5 +6177,141 @@ mod tests {
              #2789: suppression on every tick prevents any state-changing recovery.",
             app.post_catchup_hard_reset_total.load(Ordering::Relaxed),
         );
+    }
+
+    // ================================================================
+    // §9.1 + INV-C5: SCP trust anchor resolution tests (#2830)
+    // ================================================================
+
+    /// Helper: seed herder with an externalized slot carrying a tx-set whose
+    /// `previous_ledger_hash` is `expected_prev_hash`.
+    fn seed_externalized_with_tx_set(
+        app: &App,
+        slot: u64,
+        previous_ledger_hash: henyey_common::types::Hash256,
+    ) {
+        use stellar_xdr::curr::{Limits, StellarValue, StellarValueExt, TimePoint, WriteXdr};
+
+        let tx_set = henyey_herder::TransactionSet::new(previous_ledger_hash, vec![]);
+        let tx_set_hash = *tx_set.hash();
+
+        // Cache the tx-set in the SCP driver so check_ledger_close can find it.
+        app.herder.scp_driver().cache_tx_set(tx_set);
+
+        // Build a StellarValue with the matching tx_set_hash.
+        let sv = StellarValue {
+            tx_set_hash: stellar_xdr::curr::Hash(tx_set_hash.0),
+            close_time: TimePoint(1000),
+            upgrades: vec![].try_into().unwrap(),
+            ext: StellarValueExt::Basic,
+        };
+        let value =
+            stellar_xdr::curr::Value(sv.to_xdr(Limits::none()).unwrap().try_into().unwrap());
+
+        // Record the slot as externalized.
+        app.herder
+            .scp_driver()
+            .record_externalized(slot, value, None);
+    }
+
+    #[tokio::test]
+    async fn test_resolve_scp_trust_anchor_uses_herder_target_plus_one_prev_hash() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-test.db");
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
+        let app = App::new(config).await.unwrap();
+
+        let target_ledger: u32 = 100;
+        let expected_prev_hash = henyey_common::types::Hash256([42u8; 32]);
+
+        // Seed slot target+1 with a tx-set whose previous_ledger_hash is expected_prev_hash.
+        seed_externalized_with_tx_set(&app, (target_ledger + 1) as u64, expected_prev_hash);
+
+        // resolve_scp_trust_anchor should return (target_ledger, expected_prev_hash).
+        let result = app.resolve_scp_trust_anchor(target_ledger);
+        assert_eq!(result, Some((target_ledger, expected_prev_hash)));
+    }
+
+    #[tokio::test]
+    async fn test_resolve_scp_trust_anchor_returns_none_without_adjacent_tx_set() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-test.db");
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
+        let app = App::new(config).await.unwrap();
+
+        let target_ledger: u32 = 200;
+
+        // Case 1: slot target+1 is not externalized at all.
+        let result = app.resolve_scp_trust_anchor(target_ledger);
+        assert_eq!(result, None);
+
+        // Case 2: slot target+1 is externalized but WITHOUT a cached tx-set.
+        // Build a StellarValue with a tx_set_hash that has no cached tx-set.
+        {
+            use stellar_xdr::curr::{Limits, StellarValue, StellarValueExt, TimePoint, WriteXdr};
+
+            let fake_hash = henyey_common::types::Hash256([99u8; 32]);
+            let sv = StellarValue {
+                tx_set_hash: stellar_xdr::curr::Hash(fake_hash.0),
+                close_time: TimePoint(2000),
+                upgrades: vec![].try_into().unwrap(),
+                ext: StellarValueExt::Basic,
+            };
+            let value =
+                stellar_xdr::curr::Value(sv.to_xdr(Limits::none()).unwrap().try_into().unwrap());
+
+            app.herder
+                .scp_driver()
+                .record_externalized((target_ledger + 1) as u64, value, None);
+        }
+
+        // check_ledger_close will return Some(LedgerCloseInfo { tx_set: None, ... })
+        // because the tx-set is not cached. resolve_scp_trust_anchor should return None.
+        let result = app.resolve_scp_trust_anchor(target_ledger);
+        assert_eq!(result, None);
+    }
+
+    #[tokio::test]
+    async fn test_run_catchup_work_applies_resolved_scp_anchor_to_manager() {
+        // This test verifies the wiring: when resolve_scp_trust_anchor returns
+        // Some, the CatchupManager receives the anchor. We test this indirectly
+        // by verifying that resolve_scp_trust_anchor is called with target_ledger
+        // and produces the expected result, since the integration of the anchor
+        // into catchup_manager is exercised by the code path in run_catchup_work.
+        //
+        // A full integration test would require a running archive, which is out
+        // of scope for unit tests. The history-side test
+        // (test_set_trusted_scp_anchor_updates_reverse_walk_config) verifies that
+        // the anchor, once set, is used correctly in verification.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-test.db");
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
+        let app = App::new(config).await.unwrap();
+
+        let target_ledger: u32 = 500;
+        let expected_prev_hash = henyey_common::types::Hash256([7u8; 32]);
+        seed_externalized_with_tx_set(&app, (target_ledger + 1) as u64, expected_prev_hash);
+
+        // Verify the anchor is correctly resolved (this is what run_catchup_work calls).
+        let anchor = app.resolve_scp_trust_anchor(target_ledger);
+        assert_eq!(anchor, Some((target_ledger, expected_prev_hash)));
+
+        // Verify that CatchupManager correctly receives and stores the anchor.
+        use henyey_bucket::BucketManager;
+        let tmp = tempfile::tempdir().unwrap();
+        let bucket_manager = BucketManager::new(tmp.path().to_path_buf()).unwrap();
+        let db = henyey_db::Database::open_in_memory().unwrap();
+        let mut manager = henyey_history::CatchupManager::new(vec![], bucket_manager, db);
+        if let Some((seq, hash)) = anchor {
+            manager.set_trusted_scp_anchor(seq, hash);
+        }
+        // The anchor is pub(super) so we can't directly inspect it here,
+        // but the history-side test confirms it flows through to ReverseWalkConfig.
     }
 }

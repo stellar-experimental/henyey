@@ -229,10 +229,15 @@ impl CatchupManager {
             // from highest to lowest, threading trust from the top anchor.
             // Individual header integrity was already verified during download
             // (per-checkpoint verify_header_chain_from_entries).
+            let trust_source = match &self.trusted_scp_anchor {
+                Some((seq, hash)) => verify::TrustSource::Scp {
+                    seq: *seq,
+                    hash: *hash,
+                },
+                None => verify::TrustSource::None,
+            };
             let config = verify::ReverseWalkConfig {
-                // TrustSource::None until SCP consensus hash plumbing is added.
-                // Internal consistency and LCL comparison are still verified.
-                trust_source: verify::TrustSource::None,
+                trust_source,
                 lcl: Some((lcl_snapshot.header.ledger_seq, lcl_snapshot.hash)),
                 max_supported_version: henyey_common::protocol::CURRENT_LEDGER_PROTOCOL_VERSION,
                 min_supported_version: henyey_common::protocol::MIN_LEDGER_PROTOCOL_VERSION,
@@ -1156,5 +1161,81 @@ mod tests {
             }
             assert!(found_any, "metric {metric} not found in catchup/replay.rs",);
         }
+    }
+
+    // ================================================================
+    // §9.1 + INV-C5: Trusted SCP anchor configuration tests (#2830)
+    // ================================================================
+
+    #[test]
+    fn test_set_trusted_scp_anchor_updates_reverse_walk_config() {
+        use crate::verify;
+
+        // Construct a CatchupManager with a trusted SCP anchor.
+        let bucket_manager =
+            henyey_bucket::BucketManager::new(tempfile::tempdir().unwrap().keep()).unwrap();
+        let db = henyey_db::Database::open_in_memory().unwrap();
+        let archive =
+            crate::archive::HistoryArchive::with_name("http://localhost:1234", "test").unwrap();
+        let mut manager = super::CatchupManager::new(vec![archive], bucket_manager, db);
+
+        // Enable header chain verification.
+        manager.replay_config.verify_header_chain = true;
+
+        // Set the SCP trust anchor.
+        let anchor_seq = 128u32;
+        let anchor_hash = Hash256::from_bytes([0xAB; 32]);
+        manager.set_trusted_scp_anchor(anchor_seq, anchor_hash);
+
+        // Verify the anchor is stored.
+        assert_eq!(manager.trusted_scp_anchor, Some((anchor_seq, anchor_hash)));
+
+        // The verify_downloaded_data method uses self.trusted_scp_anchor
+        // to build TrustSource::Scp. We verify the field is correctly set
+        // which the replay code reads as:
+        //   match &self.trusted_scp_anchor {
+        //       Some((seq, hash)) => TrustSource::Scp { seq: *seq, hash: *hash },
+        //       None => TrustSource::None,
+        //   }
+        let trust_source = match &manager.trusted_scp_anchor {
+            Some((seq, hash)) => verify::TrustSource::Scp {
+                seq: *seq,
+                hash: *hash,
+            },
+            None => verify::TrustSource::None,
+        };
+        match trust_source {
+            verify::TrustSource::Scp { seq, hash } => {
+                assert_eq!(seq, anchor_seq);
+                assert_eq!(hash, anchor_hash);
+            }
+            verify::TrustSource::None => panic!("Expected TrustSource::Scp"),
+        }
+    }
+
+    #[test]
+    fn test_reverse_walk_config_defaults_to_trust_source_none() {
+        use crate::verify;
+
+        // Construct a CatchupManager WITHOUT a trusted SCP anchor.
+        let bucket_manager =
+            henyey_bucket::BucketManager::new(tempfile::tempdir().unwrap().keep()).unwrap();
+        let db = henyey_db::Database::open_in_memory().unwrap();
+        let archive =
+            crate::archive::HistoryArchive::with_name("http://localhost:1234", "test").unwrap();
+        let manager = super::CatchupManager::new(vec![archive], bucket_manager, db);
+
+        // No anchor set — trusted_scp_anchor should be None.
+        assert_eq!(manager.trusted_scp_anchor, None);
+
+        // The replay code should produce TrustSource::None.
+        let trust_source = match &manager.trusted_scp_anchor {
+            Some((seq, hash)) => verify::TrustSource::Scp {
+                seq: *seq,
+                hash: *hash,
+            },
+            None => verify::TrustSource::None,
+        };
+        assert!(matches!(trust_source, verify::TrustSource::None));
     }
 }

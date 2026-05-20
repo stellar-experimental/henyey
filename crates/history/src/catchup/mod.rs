@@ -283,6 +283,14 @@ pub struct CatchupManager {
     /// When true, synthetic bucket-apply meta uses `LedgerCloseMetaExtV1`
     /// (matching the live mode setting `EMIT_LEDGER_CLOSE_META_EXT_V1`).
     pub(super) emit_meta_ext_v1: bool,
+
+    /// Optional SCP-derived trusted anchor for reverse-walk verification (§9.1 + INV-C5).
+    ///
+    /// When set, the reverse-walk verifier uses `TrustSource::Scp` instead of
+    /// `TrustSource::None`, making local-state disagreement fatal (non-retriable).
+    /// Derived from `Herder::check_ledger_close(target + 1)` during online catchup:
+    /// `(target_ledger, tx_set.previous_ledger_hash())`.
+    pub(super) trusted_scp_anchor: Option<(u32, Hash256)>,
 }
 
 impl CatchupManager {
@@ -303,6 +311,7 @@ impl CatchupManager {
             network_passphrase: None,
             meta_callback: None,
             emit_meta_ext_v1: false,
+            trusted_scp_anchor: None,
         }
     }
 
@@ -321,6 +330,7 @@ impl CatchupManager {
             network_passphrase: None,
             meta_callback: None,
             emit_meta_ext_v1: false,
+            trusted_scp_anchor: None,
         }
     }
 
@@ -359,6 +369,20 @@ impl CatchupManager {
     /// meta extension version.
     pub fn set_emit_meta_ext_v1(&mut self, enabled: bool) {
         self.emit_meta_ext_v1 = enabled;
+    }
+
+    /// Set an SCP-derived trusted anchor for reverse-walk verification (§9.1 + INV-C5).
+    ///
+    /// When set, `verify_downloaded_data` builds `ReverseWalkConfig` with
+    /// `TrustSource::Scp { seq, hash }` instead of the default `TrustSource::None`.
+    /// This makes local-state disagreement during header-chain verification a
+    /// fatal (non-retriable) error, matching stellar-core's online catchup behavior
+    /// (`LedgerApplyManagerImpl::startOnlineCatchup` → `VerifyLedgerChainWork`).
+    ///
+    /// The anchor is derived from `Herder::check_ledger_close(target + 1)`:
+    /// `(target_ledger, tx_set.previous_ledger_hash())`.
+    pub fn set_trusted_scp_anchor(&mut self, seq: u32, hash: Hash256) {
+        self.trusted_scp_anchor = Some((seq, hash));
     }
 
     /// Select an archive for a download attempt, rotating through available archives.
