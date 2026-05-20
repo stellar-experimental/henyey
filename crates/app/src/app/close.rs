@@ -112,6 +112,11 @@ impl SyncRecoveryCallback for App {
         self.lost_sync_count.fetch_add(1, Ordering::Relaxed);
         // Update herder state to syncing
         self.herder.set_state(henyey_herder::HerderState::Syncing);
+        // Cancel all outstanding SCP timers — they belong to the previous
+        // tracking epoch and must not fire after sync loss. Without this,
+        // stale ballot/nomination timers would execute their timeout handlers
+        // (e.g. bump_ballot) against an outdated consensus state.
+        self.timer_manager_handle.cancel_all_timers_nonblocking();
         // Tell the overlay we're no longer tracking so it can rotate peers.
         if let Some(flag) = self.overlay_tracking.lock().unwrap().as_ref() {
             flag.store(false, Ordering::Relaxed);

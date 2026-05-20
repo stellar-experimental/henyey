@@ -190,6 +190,15 @@ impl TimerManagerHandle {
             tracing::warn!(slot, "timer channel closed: cancel ballot dropped");
         }
     }
+
+    /// Cancel all active timers (non-blocking).
+    /// Used from synchronous contexts like `on_lost_sync` where outstanding
+    /// SCP timers must be invalidated immediately on state transition.
+    pub fn cancel_all_timers_nonblocking(&self) {
+        if self.sender.send(TimerCommand::CancelAllTimers).is_err() {
+            tracing::warn!("timer channel closed: cancel all timers dropped");
+        }
+    }
 }
 
 /// Callback trait for timer expiration events.

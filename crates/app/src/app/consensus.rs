@@ -136,15 +136,25 @@ pub(super) enum TimerEventAction {
 /// defer/drop logic when `isTracking()` is true. When not tracking, all timer
 /// callbacks fire immediately regardless of slot relationship to
 /// `nextConsensusLedgerIndex()`.
+///
+/// Safety: when not tracking, we still drop old-slot timers as defense-in-depth.
+/// Outstanding timers from a prior tracking epoch are cancelled by `on_lost_sync`,
+/// but this prevents any that slip through the cancellation race from executing
+/// stale timeout handlers (e.g. bump_ballot on an outdated slot).
 pub(super) fn classify_timer_event(
     event_slot: u64,
     next_consensus_slot: u64,
     is_tracking: bool,
 ) -> TimerEventAction {
     if !is_tracking {
-        // Not tracking: fire immediately, matching stellar-core's
-        // timerCallbackWrapper fallthrough when !isTracking().
-        TimerEventAction::Fire
+        // Not tracking: fire only if the timer is for the current slot.
+        // Drop stale timers from a prior tracking epoch that survived the
+        // on_lost_sync cancellation window.
+        if event_slot < next_consensus_slot {
+            TimerEventAction::Drop
+        } else {
+            TimerEventAction::Fire
+        }
     } else if event_slot < next_consensus_slot {
         TimerEventAction::Drop
     } else if event_slot > next_consensus_slot {
@@ -2126,14 +2136,14 @@ mod tests {
         assert_eq!(classify_timer_event(1, 100, true), TimerEventAction::Drop);
     }
 
-    /// Old-slot timer while NOT tracking → Fire immediately.
-    /// Parity: stellar-core's timerCallbackWrapper fires all callbacks when
-    /// !isTracking(), regardless of slot relationship to nextConsensusLedgerIndex().
+    /// Old-slot timer while NOT tracking → Drop (defense-in-depth).
+    /// Even though on_lost_sync cancels outstanding timers, any that slip through
+    /// the cancellation race must not execute stale timeout handlers.
     #[test]
-    fn test_classify_timer_event_old_slot_not_tracking_fires() {
-        // Not tracking: old-slot timers fire immediately, not dropped.
-        assert_eq!(classify_timer_event(99, 100, false), TimerEventAction::Fire);
-        assert_eq!(classify_timer_event(1, 100, false), TimerEventAction::Fire);
+    fn test_classify_timer_event_old_slot_not_tracking_drops() {
+        // Not tracking: old-slot timers are dropped as defense-in-depth.
+        assert_eq!(classify_timer_event(99, 100, false), TimerEventAction::Drop);
+        assert_eq!(classify_timer_event(1, 100, false), TimerEventAction::Drop);
     }
 
     /// Current-slot timer → Fire immediately regardless of tracking state.
@@ -2446,6 +2456,80 @@ mod tests {
             app.nomination_timeout_fires.load(Ordering::Relaxed),
             fires_before + 1,
             "timer for LCL+1 must fire immediately in the corrective window, not be rearmed"
+        );
+    }
+
+    /// Regression test: stale SCP timers must NOT fire after Tracking → Syncing.
+    ///
+    /// Scenario: the node was tracking at slot 2 and loses sync. While syncing,
+    /// the LCL advances (via catchup) to ledger 5. A stale ballot timer from the
+    /// old tracking epoch (slot 2) fires. The handler must drop it because
+    /// slot 2 < next_slot (6), not execute bump_ballot on outdated state.
+    ///
+    /// This regression was introduced when the non-tracking path unconditionally
+    /// returned `Fire` for all slots. The fix drops old-slot timers regardless
+    /// of tracking state.
+    #[tokio::test(start_paused = true)]
+    async fn test_handle_scp_timer_event_e2e_stale_timer_after_sync_loss_drops() {
+        use henyey_herder::sync_recovery::SyncRecoveryCallback;
+
+        let (_dir, app) = mk_validator_app().await;
+
+        // Bootstrap herder at ledger 1 → tracking slot = 2, is_tracking = true
+        app.herder.bootstrap(1);
+        assert!(app.herder.is_tracking());
+        assert_eq!(app.herder.next_consensus_ledger_index().get(), 2);
+
+        // Simulate losing sync — transitions herder to Syncing and cancels timers
+        app.on_lost_sync();
+        assert!(!app.herder.is_tracking());
+        assert_eq!(app.herder.state(), henyey_herder::HerderState::Syncing);
+
+        // Allow timer manager to process the cancel command
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+
+        // Simulate LCL advancing via catchup while syncing (ledger 5 → next = 6)
+        {
+            let mut header = app.ledger_manager().current_header();
+            header.ledger_seq = 5;
+            app.ledger_manager()
+                .set_header_for_test(header, henyey_common::Hash256::default());
+        }
+        assert_eq!(app.current_ledger_seq(), 5);
+
+        // Now inject a stale ballot timer event from the old tracking epoch (slot 2).
+        // This simulates a timer that was already in-flight in the event channel
+        // when on_lost_sync cancelled timers.
+        let stale_event = super::super::scp_timer_bridge::ScpTimerEvent {
+            slot: 2,
+            timer_type: henyey_herder::TimerType::Ballot,
+        };
+
+        let fires_before = app.ballot_timeout_fires.load(Ordering::Relaxed);
+        app.handle_scp_timer_event(stale_event).await;
+
+        // The stale timer must NOT have fired — slot 2 < next_slot 6, so it's dropped.
+        assert_eq!(
+            app.ballot_timeout_fires.load(Ordering::Relaxed),
+            fires_before,
+            "stale ballot timer from prior tracking epoch must not fire after sync loss"
+        );
+
+        // Also verify a stale nomination timer for the old tracking slot is dropped.
+        let stale_nom_event = super::super::scp_timer_bridge::ScpTimerEvent {
+            slot: 2,
+            timer_type: henyey_herder::TimerType::Nomination,
+        };
+
+        let nom_fires_before = app.nomination_timeout_fires.load(Ordering::Relaxed);
+        app.handle_scp_timer_event(stale_nom_event).await;
+
+        assert_eq!(
+            app.nomination_timeout_fires.load(Ordering::Relaxed),
+            nom_fires_before,
+            "stale nomination timer from prior tracking epoch must not fire after sync loss"
         );
     }
 }
