@@ -843,7 +843,8 @@ impl App {
         if let Some((seq, hash)) = self.resolve_scp_trust_anchor(target_ledger) {
             tracing::info!(
                 target_ledger,
-                anchor_seq = seq,
+                adjacent_slot = target_ledger + 1,
+                trusted_seq = seq,
                 anchor_hash = %hash.to_hex(),
                 "Resolved SCP trust anchor from externalized slot target+1"
             );
@@ -6218,7 +6219,7 @@ mod tests {
     async fn test_resolve_scp_trust_anchor_uses_herder_target_plus_one_prev_hash() {
         let dir = tempfile::tempdir().expect("temp dir");
         let db_path = dir.path().join("rs-stellar-test.db");
-        let config = crate::config::ConfigBuilder::new()
+        let config = crate::config::ConfigBuilder::simulation()
             .database_path(db_path)
             .build();
         let app = App::new(config).await.unwrap();
@@ -6238,7 +6239,7 @@ mod tests {
     async fn test_resolve_scp_trust_anchor_returns_none_without_adjacent_tx_set() {
         let dir = tempfile::tempdir().expect("temp dir");
         let db_path = dir.path().join("rs-stellar-test.db");
-        let config = crate::config::ConfigBuilder::new()
+        let config = crate::config::ConfigBuilder::simulation()
             .database_path(db_path)
             .build();
         let app = App::new(config).await.unwrap();
@@ -6273,45 +6274,5 @@ mod tests {
         // because the tx-set is not cached. resolve_scp_trust_anchor should return None.
         let result = app.resolve_scp_trust_anchor(target_ledger);
         assert_eq!(result, None);
-    }
-
-    #[tokio::test]
-    async fn test_run_catchup_work_applies_resolved_scp_anchor_to_manager() {
-        // This test verifies the wiring: when resolve_scp_trust_anchor returns
-        // Some, the CatchupManager receives the anchor. We test this indirectly
-        // by verifying that resolve_scp_trust_anchor is called with target_ledger
-        // and produces the expected result, since the integration of the anchor
-        // into catchup_manager is exercised by the code path in run_catchup_work.
-        //
-        // A full integration test would require a running archive, which is out
-        // of scope for unit tests. The history-side test
-        // (test_set_trusted_scp_anchor_updates_reverse_walk_config) verifies that
-        // the anchor, once set, is used correctly in verification.
-        let dir = tempfile::tempdir().expect("temp dir");
-        let db_path = dir.path().join("rs-stellar-test.db");
-        let config = crate::config::ConfigBuilder::new()
-            .database_path(db_path)
-            .build();
-        let app = App::new(config).await.unwrap();
-
-        let target_ledger: u32 = 500;
-        let expected_prev_hash = henyey_common::types::Hash256([7u8; 32]);
-        seed_externalized_with_tx_set(&app, (target_ledger + 1) as u64, expected_prev_hash);
-
-        // Verify the anchor is correctly resolved (this is what run_catchup_work calls).
-        let anchor = app.resolve_scp_trust_anchor(target_ledger);
-        assert_eq!(anchor, Some((target_ledger, expected_prev_hash)));
-
-        // Verify that CatchupManager correctly receives and stores the anchor.
-        use henyey_bucket::BucketManager;
-        let tmp = tempfile::tempdir().unwrap();
-        let bucket_manager = BucketManager::new(tmp.path().to_path_buf()).unwrap();
-        let db = henyey_db::Database::open_in_memory().unwrap();
-        let mut manager = henyey_history::CatchupManager::new(vec![], bucket_manager, db);
-        if let Some((seq, hash)) = anchor {
-            manager.set_trusted_scp_anchor(seq, hash);
-        }
-        // The anchor is pub(super) so we can't directly inspect it here,
-        // but the history-side test confirms it flows through to ReverseWalkConfig.
     }
 }
