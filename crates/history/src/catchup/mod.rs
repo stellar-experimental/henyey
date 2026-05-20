@@ -492,11 +492,20 @@ impl CatchupManager {
         // `bucketlist` rows. A crash here leaves orphaned rows overwritten by
         // the next successful catchup.
         //
-        // CAVEAT: CLI readers (`publish_history`, `self_check`) still anchor on
+        // Other pre-final-persist writes in this window include:
+        // - `persist_header_only` (below, when checkpoint_seq >= target)
+        // - `persist_ledger_history` (replay.rs — headers, txs, results)
+        // - `emit_meta` (replay.rs — LedgerCloseMeta rows)
+        // All share the same non-authoritative property.
+        //
+        // CAVEAT: `verify_on_disk_integrity()` and CLI readers
+        // (`publish_history`, `self_check`) still anchor on
         // `get_latest_ledger_seq()` → `MAX(ledgerseq)` and may observe
-        // ahead-of-LCL state after a Window-1 crash. This is a known gap;
-        // full parity requires hardening those paths to use durable LCL/HAS
-        // as their authority anchor (see crates/history/SPEC_ADHERENCE.md §14.5).
+        // ahead-of-LCL state after a Window-1 crash. `verify_on_disk_integrity`
+        // is harmless (hash chain remains valid because headers are written
+        // sequentially), but CLI readers are a known gap requiring future
+        // hardening to use durable LCL/HAS as their authority anchor
+        // (see crates/history/SPEC_ADHERENCE.md §14.5).
         //
         // This is the first of two crash windows; the second (deferred-persist)
         // is guarded by `CATCHUP_PERSIST_PENDING` in
