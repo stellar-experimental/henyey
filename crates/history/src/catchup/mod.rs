@@ -818,10 +818,6 @@ impl CatchupManager {
             "Starting catchup to ledger {} with mode {:?}, run_mode={}, lcl={}",
             target, mode, run_mode, lcl
         );
-        // run_mode is threaded through for observability and future behavioral
-        // differences (OFFLINE_COMPLETE tx-result verification, #2831). Currently
-        // only logged; replay-depth drives all range/download decisions.
-        let _ = run_mode;
         self.progress.target_ledger = target;
 
         // Calculate the catchup range based on mode
@@ -993,10 +989,6 @@ impl CatchupManager {
             "Starting catchup to ledger {} with checkpoint data (run_mode={})",
             target, config.run_mode
         );
-        // run_mode is threaded through for observability and future behavioral
-        // differences (OFFLINE_COMPLETE tx-result verification, #2831). Currently
-        // only logged; replay-depth drives all range/download decisions.
-        let _ = config.run_mode;
         self.progress.target_ledger = target;
 
         let checkpoint_seq =
