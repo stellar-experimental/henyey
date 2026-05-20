@@ -135,26 +135,20 @@ pub(super) enum TimerEventAction {
 /// Parity: stellar-core's `timerCallbackWrapper` only applies the slot-based
 /// defer/drop logic when `isTracking()` is true. When not tracking, all timer
 /// callbacks fire immediately regardless of slot relationship to
-/// `nextConsensusLedgerIndex()`.
-///
-/// Safety: when not tracking, we still drop old-slot timers as defense-in-depth.
-/// Outstanding timers from a prior tracking epoch are cancelled by `on_lost_sync`,
-/// but this prevents any that slip through the cancellation race from executing
-/// stale timeout handlers (e.g. bump_ballot on an outdated slot).
+/// `nextConsensusLedgerIndex()`. We match this behavior exactly — stale events
+/// from prior tracking epochs are rejected by the epoch guard in
+/// `handle_scp_timer_event()` before reaching this classifier.
 pub(super) fn classify_timer_event(
     event_slot: u64,
     next_consensus_slot: u64,
     is_tracking: bool,
 ) -> TimerEventAction {
     if !is_tracking {
-        // Not tracking: fire only if the timer is for the current slot.
-        // Drop stale timers from a prior tracking epoch that survived the
-        // on_lost_sync cancellation window.
-        if event_slot < next_consensus_slot {
-            TimerEventAction::Drop
-        } else {
-            TimerEventAction::Fire
-        }
+        // Not tracking: fire unconditionally. Matches stellar-core's
+        // timerCallbackWrapper which only gates on slot when isTracking().
+        // Stale events from prior epochs are already rejected by the
+        // epoch guard before reaching this point.
+        TimerEventAction::Fire
     } else if event_slot < next_consensus_slot {
         TimerEventAction::Drop
     } else if event_slot > next_consensus_slot {
@@ -2150,13 +2144,14 @@ mod tests {
     }
 
     /// Old-slot timer while NOT tracking → Drop (defense-in-depth).
-    /// Even though on_lost_sync cancels outstanding timers, any that slip through
-    /// the cancellation race must not execute stale timeout handlers.
+    /// Parity: stellar-core fires timer callbacks unconditionally when !isTracking().
+    /// Old-slot timers from prior tracking epochs are rejected by the epoch guard
+    /// before reaching the classifier, so this path is safe.
     #[test]
-    fn test_classify_timer_event_old_slot_not_tracking_drops() {
-        // Not tracking: old-slot timers are dropped as defense-in-depth.
-        assert_eq!(classify_timer_event(99, 100, false), TimerEventAction::Drop);
-        assert_eq!(classify_timer_event(1, 100, false), TimerEventAction::Drop);
+    fn test_classify_timer_event_old_slot_not_tracking_fires() {
+        // Not tracking: all timers fire (parity with stellar-core timerCallbackWrapper).
+        assert_eq!(classify_timer_event(99, 100, false), TimerEventAction::Fire);
+        assert_eq!(classify_timer_event(1, 100, false), TimerEventAction::Fire);
     }
 
     /// Current-slot timer → Fire immediately regardless of tracking state.

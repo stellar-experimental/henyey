@@ -1224,11 +1224,9 @@ impl App {
         // matching stellar-core's VirtualTimer pattern.
         let (scp_timer_tx, scp_timer_rx) = tokio::sync::mpsc::unbounded_channel();
         let scp_timer_epoch = Arc::new(AtomicU64::new(0));
-        let timer_bridge = std::sync::Arc::new(scp_timer_bridge::ScpTimerBridge::new(
-            scp_timer_tx,
-            Arc::clone(&scp_timer_epoch),
-        ));
-        let (timer_manager_handle, timer_manager) = henyey_herder::TimerManager::new(timer_bridge);
+        let timer_bridge = std::sync::Arc::new(scp_timer_bridge::ScpTimerBridge::new(scp_timer_tx));
+        let (timer_manager_handle, timer_manager) =
+            henyey_herder::TimerManager::new(timer_bridge, Arc::clone(&scp_timer_epoch));
         let timer_manager_join = tokio::spawn(timer_manager.run());
 
         let herder_config = Self::build_herder_config(&config, &keypair, local_quorum_set);

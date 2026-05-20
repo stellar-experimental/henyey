@@ -39,6 +39,7 @@
 //! ```
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -204,12 +205,16 @@ impl TimerManagerHandle {
 /// Callback trait for timer expiration events.
 ///
 /// Implement this trait to receive timer expiration callbacks.
+/// The `epoch` parameter is the tracking epoch captured at timer-schedule time,
+/// allowing receivers to discard stale events from prior epochs.
 pub trait TimerCallback: Send + Sync + 'static {
     /// Called when a nomination timeout expires.
-    fn on_nomination_timeout(&self, slot: SlotIndex);
+    /// `epoch` is the tracking epoch that was current when this timer was scheduled.
+    fn on_nomination_timeout(&self, slot: SlotIndex, epoch: u64);
 
     /// Called when a ballot timeout expires.
-    fn on_ballot_timeout(&self, slot: SlotIndex);
+    /// `epoch` is the tracking epoch that was current when this timer was scheduled.
+    fn on_ballot_timeout(&self, slot: SlotIndex, epoch: u64);
 }
 
 /// Timer type for a slot.
@@ -227,6 +232,9 @@ struct ActiveTimer {
     expires_at: Instant,
     /// Unique ID to detect if timer was rescheduled (stored for future use)
     _generation: u64,
+    /// The tracking epoch at which this timer was scheduled. Passed to the
+    /// callback on fire so the receiver can discard events from prior epochs.
+    epoch: u64,
 }
 
 /// The timer manager that runs as a background task.
@@ -237,14 +245,20 @@ pub struct TimerManager<C: TimerCallback> {
     timers: HashMap<(SlotIndex, TimerType), ActiveTimer>,
     /// Generation counter for timer identification
     generation: u64,
+    /// Shared tracking epoch — read at schedule-time and stored in each timer.
+    epoch: Arc<AtomicU64>,
 }
 
 impl<C: TimerCallback> TimerManager<C> {
-    /// Create a new timer manager with the given callback.
+    /// Create a new timer manager with the given callback and shared epoch.
+    ///
+    /// The `epoch` is read at timer-schedule time and stored in each active timer.
+    /// When a timer fires, the stored epoch is passed to the callback, allowing
+    /// the receiver to detect and discard stale events from prior tracking epochs.
     ///
     /// Returns a handle for sending commands and the manager itself which should
     /// be spawned as a tokio task.
-    pub fn new(callback: Arc<C>) -> (TimerManagerHandle, Self) {
+    pub fn new(callback: Arc<C>, epoch: Arc<AtomicU64>) -> (TimerManagerHandle, Self) {
         let (sender, receiver) = mpsc::unbounded_channel();
         let handle = TimerManagerHandle { sender };
         let manager = Self {
@@ -252,6 +266,7 @@ impl<C: TimerCallback> TimerManager<C> {
             receiver,
             timers: HashMap::new(),
             generation: 0,
+            epoch,
         };
         (handle, manager)
     }
@@ -327,12 +342,14 @@ impl<C: TimerCallback> TimerManager<C> {
     fn schedule_timer(&mut self, slot: SlotIndex, timer_type: TimerType, duration: Duration) {
         self.generation = self.generation.wrapping_add(1);
         let expires_at = Instant::now() + duration;
+        let epoch = self.epoch.load(Ordering::Acquire);
 
         let timer = ActiveTimer {
             timer_type,
             slot,
             expires_at,
             _generation: self.generation,
+            epoch,
         };
 
         debug!(
@@ -387,21 +404,21 @@ impl<C: TimerCallback> TimerManager<C> {
             .timers
             .iter()
             .filter(|(_, t)| t.expires_at <= now)
-            .map(|(k, t)| (*k, t.timer_type, t.slot))
+            .map(|(k, t)| (*k, t.timer_type, t.slot, t.epoch))
             .collect();
 
         // Remove and fire
-        for (key, timer_type, slot) in expired {
+        for (key, timer_type, slot, epoch) in expired {
             self.timers.remove(&key);
 
-            trace!(slot, timer_type = ?timer_type, "Firing timer");
+            trace!(slot, timer_type = ?timer_type, epoch, "Firing timer");
 
             match timer_type {
                 TimerType::Nomination => {
-                    self.callback.on_nomination_timeout(slot);
+                    self.callback.on_nomination_timeout(slot, epoch);
                 }
                 TimerType::Ballot => {
-                    self.callback.on_ballot_timeout(slot);
+                    self.callback.on_ballot_timeout(slot, epoch);
                 }
             }
         }
@@ -429,8 +446,11 @@ pub struct TimerManagerWithStats<C: TimerCallback> {
 
 impl<C: TimerCallback> TimerManagerWithStats<C> {
     /// Create a new timer manager with stats tracking.
-    pub fn new(callback: Arc<C>) -> (TimerManagerHandle, Arc<RwLock<TimerStats>>, Self) {
-        let (handle, inner) = TimerManager::new(callback);
+    pub fn new(
+        callback: Arc<C>,
+        epoch: Arc<AtomicU64>,
+    ) -> (TimerManagerHandle, Arc<RwLock<TimerStats>>, Self) {
+        let (handle, inner) = TimerManager::new(callback, epoch);
         let stats = Arc::new(RwLock::new(TimerStats::default()));
         let manager = Self {
             inner,
@@ -512,11 +532,11 @@ mod tests {
     }
 
     impl TimerCallback for TestCallback {
-        fn on_nomination_timeout(&self, slot: SlotIndex) {
+        fn on_nomination_timeout(&self, slot: SlotIndex, _epoch: u64) {
             self.nomination_fired.store(slot, Ordering::SeqCst);
         }
 
-        fn on_ballot_timeout(&self, slot: SlotIndex) {
+        fn on_ballot_timeout(&self, slot: SlotIndex, _epoch: u64) {
             self.ballot_fired.store(slot, Ordering::SeqCst);
         }
     }
@@ -524,7 +544,7 @@ mod tests {
     #[tokio::test]
     async fn test_nomination_timeout_fires() {
         let callback = Arc::new(TestCallback::new());
-        let (handle, manager) = TimerManager::new(callback.clone());
+        let (handle, manager) = TimerManager::new(callback.clone(), Arc::new(AtomicU64::new(0)));
 
         let manager_task = tokio::spawn(manager.run());
 
@@ -547,7 +567,7 @@ mod tests {
     #[tokio::test]
     async fn test_ballot_timeout_fires() {
         let callback = Arc::new(TestCallback::new());
-        let (handle, manager) = TimerManager::new(callback.clone());
+        let (handle, manager) = TimerManager::new(callback.clone(), Arc::new(AtomicU64::new(0)));
 
         let manager_task = tokio::spawn(manager.run());
 
@@ -570,7 +590,7 @@ mod tests {
     #[tokio::test]
     async fn test_cancel_prevents_firing() {
         let callback = Arc::new(TestCallback::new());
-        let (handle, manager) = TimerManager::new(callback.clone());
+        let (handle, manager) = TimerManager::new(callback.clone(), Arc::new(AtomicU64::new(0)));
 
         let manager_task = tokio::spawn(manager.run());
 
@@ -597,7 +617,7 @@ mod tests {
     #[tokio::test]
     async fn test_reschedule_timer() {
         let callback = Arc::new(TestCallback::new());
-        let (handle, manager) = TimerManager::new(callback.clone());
+        let (handle, manager) = TimerManager::new(callback.clone(), Arc::new(AtomicU64::new(0)));
 
         let manager_task = tokio::spawn(manager.run());
 
@@ -632,7 +652,7 @@ mod tests {
     #[tokio::test]
     async fn test_purge_old_slots() {
         let callback = Arc::new(TestCallback::new());
-        let (handle, manager) = TimerManager::new(callback.clone());
+        let (handle, manager) = TimerManager::new(callback.clone(), Arc::new(AtomicU64::new(0)));
 
         let manager_task = tokio::spawn(manager.run());
 
@@ -665,7 +685,7 @@ mod tests {
     #[tokio::test]
     async fn test_nonblocking_schedule_nomination() {
         let callback = Arc::new(TestCallback::new());
-        let (handle, manager) = TimerManager::new(callback.clone());
+        let (handle, manager) = TimerManager::new(callback.clone(), Arc::new(AtomicU64::new(0)));
         let manager_task = tokio::spawn(manager.run());
 
         handle.schedule_nomination_timeout_nonblocking(55, Duration::from_millis(50));
@@ -680,7 +700,7 @@ mod tests {
     #[tokio::test]
     async fn test_nonblocking_schedule_ballot() {
         let callback = Arc::new(TestCallback::new());
-        let (handle, manager) = TimerManager::new(callback.clone());
+        let (handle, manager) = TimerManager::new(callback.clone(), Arc::new(AtomicU64::new(0)));
         let manager_task = tokio::spawn(manager.run());
 
         handle.schedule_ballot_timeout_nonblocking(77, Duration::from_millis(50));
@@ -695,7 +715,7 @@ mod tests {
     #[tokio::test]
     async fn test_nonblocking_cancel_nomination() {
         let callback = Arc::new(TestCallback::new());
-        let (handle, manager) = TimerManager::new(callback.clone());
+        let (handle, manager) = TimerManager::new(callback.clone(), Arc::new(AtomicU64::new(0)));
         let manager_task = tokio::spawn(manager.run());
 
         handle.schedule_nomination_timeout_nonblocking(42, Duration::from_millis(100));
@@ -712,7 +732,7 @@ mod tests {
     #[tokio::test]
     async fn test_nonblocking_cancel_ballot() {
         let callback = Arc::new(TestCallback::new());
-        let (handle, manager) = TimerManager::new(callback.clone());
+        let (handle, manager) = TimerManager::new(callback.clone(), Arc::new(AtomicU64::new(0)));
         let manager_task = tokio::spawn(manager.run());
 
         handle.schedule_ballot_timeout_nonblocking(42, Duration::from_millis(100));
@@ -729,7 +749,7 @@ mod tests {
     #[tokio::test]
     async fn test_nonblocking_cancel_slot_timers() {
         let callback = Arc::new(TestCallback::new());
-        let (handle, manager) = TimerManager::new(callback.clone());
+        let (handle, manager) = TimerManager::new(callback.clone(), Arc::new(AtomicU64::new(0)));
         let manager_task = tokio::spawn(manager.run());
 
         handle.schedule_nomination_timeout_nonblocking(42, Duration::from_millis(100));
