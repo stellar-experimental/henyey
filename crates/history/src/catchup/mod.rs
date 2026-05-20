@@ -976,6 +976,19 @@ impl CatchupManager {
             ));
         }
 
+        // The checkpoint-data fast path only supports minimal replay (replay
+        // from the checkpoint boundary to target). Reject non-Minimal depths
+        // so callers cannot silently receive fewer replayed ledgers than they
+        // requested.
+        if !matches!(config.depth, CatchupMode::Minimal) {
+            return Err(HistoryError::CatchupFailed(format!(
+                "catchup_to_ledger_with_checkpoint_data_config only supports \
+                 CatchupMode::Minimal depth, got {:?}. Use \
+                 catchup_to_ledger_with_config for non-minimal replay depths.",
+                config.depth
+            )));
+        }
+
         info!(
             "Starting catchup to ledger {} with checkpoint data (run_mode={})",
             target, config.run_mode

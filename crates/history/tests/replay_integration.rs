@@ -1971,3 +1971,119 @@ async fn test_offline_complete_rejected_at_checkpoint_data_entry_point() {
         "error should reference tracking issue #2831, got: {msg}"
     );
 }
+
+/// Non-Minimal depth on the checkpoint-data config path must be rejected.
+/// Before this fix, callers could request `Recent(500)` or `Complete` and
+/// silently receive minimal replay behavior.
+#[tokio::test]
+async fn test_checkpoint_data_config_rejects_non_minimal_depth() {
+    use henyey_history::catchup::CheckpointData;
+    use henyey_history::CatchupConfiguration;
+    use henyey_history::CatchupRunMode;
+    use stellar_xdr::curr::ScpHistoryEntry;
+
+    let ledger_manager = henyey_ledger::LedgerManager::new(
+        "Test SDF Network ; September 2015".to_string(),
+        henyey_ledger::LedgerManagerConfig {
+            validate_bucket_hash: false,
+            ..Default::default()
+        },
+    );
+
+    let bucket_dir = tempfile::tempdir().expect("bucket dir");
+    let bucket_manager =
+        henyey_bucket::BucketManager::new(bucket_dir.path().to_path_buf()).expect("bucket manager");
+    let db = henyey_db::Database::open_in_memory().expect("db");
+
+    let dummy_archive = HistoryArchive::new("http://127.0.0.1:1/").expect("dummy archive");
+    let mut manager = CatchupManagerBuilder::new()
+        .add_archive(dummy_archive)
+        .bucket_manager(bucket_manager)
+        .database(db)
+        .options(CatchupOptions {
+            verify_buckets: false,
+            verify_headers: false,
+        })
+        .build()
+        .expect("catchup manager");
+
+    let checkpoint = 64u32;
+    let mut levels = Vec::with_capacity(BUCKET_LIST_LEVELS);
+    for _ in 0..BUCKET_LIST_LEVELS {
+        levels.push(HASBucketLevel {
+            curr: "0".repeat(64),
+            snap: "0".repeat(64),
+            next: Default::default(),
+        });
+    }
+
+    let has = HistoryArchiveState {
+        version: 2,
+        server: Some("test".to_string()),
+        current_ledger: checkpoint,
+        network_passphrase: Some("Test SDF Network ; September 2015".to_string()),
+        current_buckets: levels.clone(),
+        hot_archive_buckets: make_test_hot_archive_buckets(),
+    };
+
+    let data = CheckpointData {
+        has,
+        bucket_dir: bucket_dir.path().to_path_buf(),
+        headers: vec![],
+        transactions: vec![],
+        tx_results: vec![],
+        scp_history: Vec::<ScpHistoryEntry>::new(),
+    };
+
+    // Test with Recent(500) — should be rejected
+    let config = CatchupConfiguration::new(
+        henyey_history::CatchupMode::Recent(500),
+        CatchupRunMode::OfflineBasic,
+    );
+
+    let result = manager
+        .catchup_to_ledger_with_checkpoint_data_config(checkpoint, data, config, &ledger_manager)
+        .await;
+
+    let err = result.expect_err("non-Minimal depth should be rejected");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("only supports CatchupMode::Minimal"),
+        "error should mention Minimal requirement, got: {msg}"
+    );
+
+    // Test with Complete — should also be rejected
+    let has2 = HistoryArchiveState {
+        version: 2,
+        server: Some("test".to_string()),
+        current_ledger: checkpoint,
+        network_passphrase: Some("Test SDF Network ; September 2015".to_string()),
+        current_buckets: levels,
+        hot_archive_buckets: make_test_hot_archive_buckets(),
+    };
+
+    let data2 = CheckpointData {
+        has: has2,
+        bucket_dir: bucket_dir.path().to_path_buf(),
+        headers: vec![],
+        transactions: vec![],
+        tx_results: vec![],
+        scp_history: Vec::<ScpHistoryEntry>::new(),
+    };
+
+    let config2 = CatchupConfiguration::new(
+        henyey_history::CatchupMode::Complete,
+        CatchupRunMode::Online,
+    );
+
+    let result2 = manager
+        .catchup_to_ledger_with_checkpoint_data_config(checkpoint, data2, config2, &ledger_manager)
+        .await;
+
+    let err2 = result2.expect_err("Complete depth should be rejected");
+    let msg2 = err2.to_string();
+    assert!(
+        msg2.contains("only supports CatchupMode::Minimal"),
+        "error should mention Minimal requirement, got: {msg2}"
+    );
+}
