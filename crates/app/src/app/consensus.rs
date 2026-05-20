@@ -2088,7 +2088,7 @@ mod tests {
     /// Future-slot nomination timer while tracking → Rearm (1-second defer).
     /// Spec: HERDER_SPEC §5.4-2.
     #[test]
-    fn test_handle_scp_timer_event_reschedules_future_nomination_by_one_second() {
+    fn test_classify_timer_event_future_nomination_tracking_rearms() {
         // next_slot = 100, event_slot = 105, tracking = true → Rearm
         assert_eq!(
             classify_timer_event(105, 100, true),
@@ -2099,14 +2099,14 @@ mod tests {
     /// Future-slot ballot timer while tracking → Rearm (1-second defer).
     /// Spec: HERDER_SPEC §5.4-2.
     #[test]
-    fn test_handle_scp_timer_event_reschedules_future_ballot_by_one_second() {
+    fn test_classify_timer_event_future_ballot_tracking_rearms() {
         // next_slot = 50, event_slot = 51, tracking = true → Rearm
         assert_eq!(classify_timer_event(51, 50, true), TimerEventAction::Rearm);
     }
 
     /// Old-slot timer while tracking → Drop without re-arming.
     #[test]
-    fn test_handle_scp_timer_event_drops_old_slot_without_rearm() {
+    fn test_classify_timer_event_old_slot_tracking_drops() {
         // next_slot = 100, event_slot = 99, tracking = true → Drop
         assert_eq!(classify_timer_event(99, 100, true), TimerEventAction::Drop);
         // Far behind, tracking
@@ -2149,6 +2149,186 @@ mod tests {
         assert_eq!(
             classify_timer_event(101, 100, true),
             TimerEventAction::Rearm
+        );
+    }
+
+    // ── End-to-end handle_scp_timer_event tests ─────────────────────────
+    //
+    // These exercise the full App::handle_scp_timer_event path including the
+    // timer_manager_handle scheduling and fire-counter side effects. Uses
+    // paused tokio time to verify exact 1-second rearm timing.
+
+    use super::super::App;
+    use std::sync::atomic::Ordering;
+
+    /// Helper: build a minimal validator App with paused-time-compatible config.
+    async fn mk_validator_app() -> (tempfile::TempDir, App) {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("timer-event-test.db");
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .validator(true)
+            .node_seed("SAFTEV5U6QDFE2DRMSD7HBE76XG7SQZJD6VIUTHIXTJGO77RUQYVURLA")
+            .build();
+        let app = App::new(config).await.unwrap();
+        (dir, app)
+    }
+
+    /// End-to-end: future-slot nomination timer while tracking is re-armed at
+    /// exactly 1 second and fires back through the timer bridge.
+    ///
+    /// Verifies:
+    /// - nomination_timeout_fires counter does NOT increment on the defer path
+    /// - the same timer type (nomination) is re-delivered after exactly 1 second
+    #[tokio::test(start_paused = true)]
+    async fn test_handle_scp_timer_event_e2e_future_nomination_rearms_one_second() {
+        let (_dir, app) = mk_validator_app().await;
+
+        // Bootstrap herder at ledger 1 → tracking slot = 2, is_tracking = true
+        app.herder.bootstrap(1);
+        assert!(app.herder.is_tracking());
+        let next_slot = app.herder.next_consensus_ledger_index().get();
+        assert_eq!(next_slot, 2);
+
+        // Inject a nomination timer event for a future slot (slot 5 > next_slot 2)
+        let future_slot = 5u64;
+        let event = super::super::scp_timer_bridge::ScpTimerEvent {
+            slot: future_slot,
+            timer_type: henyey_herder::TimerType::Nomination,
+        };
+
+        let fires_before = app.nomination_timeout_fires.load(Ordering::Relaxed);
+
+        app.handle_scp_timer_event(event).await;
+
+        // Fire counter must NOT have incremented (defer path, not fire path)
+        assert_eq!(
+            app.nomination_timeout_fires.load(Ordering::Relaxed),
+            fires_before,
+            "nomination_timeout_fires must not increment on the rearm path"
+        );
+
+        // Give the timer manager task a chance to receive and process the
+        // ScheduleNominationTimeout command before we advance time.
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+
+        // The timer manager should have scheduled a 1-second timeout.
+        // Advance time by just under 1 second — no event should arrive yet.
+        let mut rx = app.scp_timer_rx.lock().await;
+        tokio::time::advance(std::time::Duration::from_millis(999)).await;
+        // Yield multiple times to let the timer manager task process
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            rx.try_recv().is_err(),
+            "timer must not fire before 1 second"
+        );
+
+        // Advance past the 1-second mark
+        tokio::time::advance(std::time::Duration::from_millis(2)).await;
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+
+        // The timer bridge should have delivered a new ScpTimerEvent
+        let redelivered = rx
+            .try_recv()
+            .expect("expected re-delivered nomination timer event");
+        assert_eq!(redelivered.slot, future_slot);
+        assert_eq!(redelivered.timer_type, henyey_herder::TimerType::Nomination);
+    }
+
+    /// End-to-end: future-slot ballot timer while tracking is re-armed at
+    /// exactly 1 second and fires back through the timer bridge.
+    #[tokio::test(start_paused = true)]
+    async fn test_handle_scp_timer_event_e2e_future_ballot_rearms_one_second() {
+        let (_dir, app) = mk_validator_app().await;
+
+        app.herder.bootstrap(1);
+        let next_slot = app.herder.next_consensus_ledger_index().get();
+
+        // Future-slot ballot event
+        let future_slot = next_slot + 3;
+        let event = super::super::scp_timer_bridge::ScpTimerEvent {
+            slot: future_slot,
+            timer_type: henyey_herder::TimerType::Ballot,
+        };
+
+        let fires_before = app.ballot_timeout_fires.load(Ordering::Relaxed);
+
+        app.handle_scp_timer_event(event).await;
+
+        // Fire counter must NOT have incremented
+        assert_eq!(
+            app.ballot_timeout_fires.load(Ordering::Relaxed),
+            fires_before,
+            "ballot_timeout_fires must not increment on the rearm path"
+        );
+
+        // Give the timer manager task a chance to process the schedule command
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+
+        // Advance time past 1 second and verify the ballot timer re-fires
+        let mut rx = app.scp_timer_rx.lock().await;
+        tokio::time::advance(std::time::Duration::from_millis(1001)).await;
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+
+        let redelivered = rx
+            .try_recv()
+            .expect("expected re-delivered ballot timer event");
+        assert_eq!(redelivered.slot, future_slot);
+        assert_eq!(redelivered.timer_type, henyey_herder::TimerType::Ballot);
+    }
+
+    /// End-to-end: old-slot timer while tracking is dropped — no re-arm occurs,
+    /// no fire counters advance, and no timer event is re-delivered.
+    #[tokio::test(start_paused = true)]
+    async fn test_handle_scp_timer_event_e2e_old_slot_drops_without_rearm() {
+        let (_dir, app) = mk_validator_app().await;
+
+        app.herder.bootstrap(5);
+        let next_slot = app.herder.next_consensus_ledger_index().get();
+        assert_eq!(next_slot, 6);
+
+        // Old-slot nomination event (slot 3 < next_slot 6)
+        let old_slot = 3u64;
+        let event = super::super::scp_timer_bridge::ScpTimerEvent {
+            slot: old_slot,
+            timer_type: henyey_herder::TimerType::Nomination,
+        };
+
+        let nom_fires_before = app.nomination_timeout_fires.load(Ordering::Relaxed);
+        let ballot_fires_before = app.ballot_timeout_fires.load(Ordering::Relaxed);
+
+        app.handle_scp_timer_event(event).await;
+
+        // No fire counters should have incremented
+        assert_eq!(
+            app.nomination_timeout_fires.load(Ordering::Relaxed),
+            nom_fires_before,
+            "nomination_timeout_fires must not increment on the drop path"
+        );
+        assert_eq!(
+            app.ballot_timeout_fires.load(Ordering::Relaxed),
+            ballot_fires_before,
+            "ballot_timeout_fires must not increment on the drop path"
+        );
+
+        // Advance time well past any possible re-arm delay and verify nothing arrives
+        let mut rx = app.scp_timer_rx.lock().await;
+        tokio::time::advance(std::time::Duration::from_secs(5)).await;
+        tokio::task::yield_now().await;
+
+        assert!(
+            rx.try_recv().is_err(),
+            "no timer event should be re-delivered for a dropped old-slot timer"
         );
     }
 }
