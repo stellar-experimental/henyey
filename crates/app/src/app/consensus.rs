@@ -208,10 +208,13 @@ impl App {
                 return;
             }
 
-            let trigger_offset_secs = now_instant
-                .saturating_duration_since(last_ballot_start.unwrap_or(now_instant))
-                .as_secs()
-                .min(expected_close.as_secs());
+            // Parity: stellar-core HerderImpl.cpp:1281-1282
+            // triggerOffset = triggerTime - now (always >= 0 because triggerTime
+            // was clamped to max(lastBallotStart + expectedClose, now) above).
+            // This is the *remaining* time until trigger, not elapsed time.
+            let trigger_offset_secs = trigger_time
+                .saturating_duration_since(now_instant)
+                .as_secs();
             let ct_offset = self.herder.ct_validity_offset(
                 self.herder.lcl_close_time().saturating_add(1),
                 trigger_offset_secs,

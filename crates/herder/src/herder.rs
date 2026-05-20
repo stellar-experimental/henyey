@@ -1324,6 +1324,10 @@ impl Herder {
     /// Returns the number of seconds we must wait before `close_time` falls
     /// within the `now + MAX_TIME_SLIP_SECONDS` validity window.
     /// Returns 0 when `close_time` is already valid.
+    ///
+    /// Stellar-core adds +1ms to the result as a boundary guard (ensuring the
+    /// timer fires strictly after the boundary). In henyey's second-granularity
+    /// polling architecture, we add +1 second to be conservative.
     pub fn ct_validity_offset(&self, close_time: u64, max_ct_offset: u64) -> u64 {
         let now = self.scp_driver.now_seconds();
         let boundary = now
@@ -1332,7 +1336,8 @@ impl Herder {
         if close_time <= boundary {
             0
         } else {
-            close_time - boundary
+            // +1 second boundary guard (parity: stellar-core adds +1ms)
+            (close_time - boundary).saturating_add(1)
         }
     }
 
@@ -3348,7 +3353,23 @@ impl Herder {
 
         // 2. Caller supplied a validated close time. Use its offset so tx-set
         // trimming still sees the proposed close time (#1192).
-        let close_time_offset = close_time - lcl_close_time;
+        // Use checked subtraction: if LCL advanced concurrently (race between
+        // the caller's lcl_close_time() read and our snapshot), abort nomination
+        // rather than wrapping to a huge offset.
+        let close_time_offset = match close_time.checked_sub(lcl_close_time) {
+            Some(0) | None => {
+                // close_time <= lcl_close_time from snapshot: LCL advanced
+                // between caller's read and our snapshot, making the proposed
+                // close time stale. Abort — caller will retry next tick.
+                tracing::warn!(
+                    close_time,
+                    lcl_close_time,
+                    "build_nomination_value: close_time stale vs snapshot LCL; aborting"
+                );
+                return None;
+            }
+            Some(offset) => offset,
+        };
 
         // 2.5. Close-time validity gate (parity: stellar-core HerderImpl.cpp:1524).
         // stellar-core calls `ctValidityOffset(nextCloseTime)` which checks
@@ -6727,7 +6748,7 @@ mod tests {
     }
 
     /// Unit test for #2816: `ct_validity_offset` returns positive offset
-    /// one second past the boundary.
+    /// one second past the boundary (includes +1 boundary guard).
     #[test]
     fn test_ct_validity_offset_positive_one_second_past_boundary() {
         let (herder, _) = make_validator_herder();
@@ -6737,7 +6758,11 @@ mod tests {
         // close_time = now + MAX_TIME_SLIP_SECONDS + 1 = one past boundary with offset=0
         let close_time = now + MAX_TIME_SLIP_SECONDS + 1;
         let offset = herder.ct_validity_offset(close_time, 0);
-        assert_eq!(offset, 1, "one second past boundary → need 1 second delay");
+        // Parity: stellar-core returns (1s + 1ms), in whole seconds = 2
+        assert_eq!(
+            offset, 2,
+            "one second past boundary + 1s guard → need 2 seconds delay"
+        );
     }
 
     /// Unit test for #2816: `ct_validity_offset` accounts for max_ct_offset
@@ -6754,9 +6779,9 @@ mod tests {
         let offset = herder.ct_validity_offset(close_time, 5);
         assert_eq!(offset, 0, "trigger offset should widen validity window");
 
-        // close_time = now + 66, trigger_offset = 5 → boundary = now+65, need 1s
+        // close_time = now + 66, trigger_offset = 5 → boundary = now+65, need 1s + 1 guard = 2
         let offset2 = herder.ct_validity_offset(now + 66, 5);
-        assert_eq!(offset2, 1);
+        assert_eq!(offset2, 2);
     }
 
     /// Unit test for #2816: `Herder::prepare_start` forwards to the driver.
@@ -6785,6 +6810,79 @@ mod tests {
             herder.prepare_start(1).is_none(),
             "prepare_start must return None after slot is purged"
         );
+    }
+
+    /// Regression test for #2816 Parity review: when `prepareStart + expectedClose <= now`
+    /// (trigger_time is clamped to `now`), the triggerOffset passed to `ct_validity_offset`
+    /// must be 0 (remaining time until trigger = 0), NOT `expectedClose` (elapsed time).
+    /// This ensures we don't widen the validity window by `expectedClose` seconds.
+    ///
+    /// Concrete case: now=1000, expectedClose=5s, lcl.close_time=1070.
+    /// minCandidateCt=1071. With triggerOffset=0: boundary=1060, offset=12 (blocks).
+    /// With the OLD (wrong) triggerOffset=5: boundary=1065, offset=7 (would fire too early).
+    #[test]
+    fn test_ct_validity_offset_clamped_trigger_time_gives_zero_offset() {
+        let (herder, _) = make_validator_herder();
+        let now = 1000u64;
+        herder.scp_driver.set_test_clock(now);
+
+        let lcl_close_time = 1070u64;
+        let min_candidate_ct = lcl_close_time + 1; // 1071
+
+        // Correct behavior: triggerOffset = 0 (trigger_time clamped to now)
+        let offset = herder.ct_validity_offset(min_candidate_ct, 0);
+        // boundary = 1000 + 60 + 0 = 1060, excess = 1071 - 1060 = 11, +1 guard = 12
+        assert_eq!(offset, 12, "clamped trigger must not widen validity window");
+
+        // Wrong behavior would pass expectedClose=5 as offset:
+        let wrong_offset = herder.ct_validity_offset(min_candidate_ct, 5);
+        // boundary = 1000 + 60 + 5 = 1065, excess = 1071 - 1065 = 6, +1 guard = 7
+        assert_eq!(
+            wrong_offset, 7,
+            "wider window from elapsed time = incorrect"
+        );
+
+        // The correct offset (12) must be larger than the wrong one (7),
+        // proving we'd wait longer and not nominate too early.
+        assert!(offset > wrong_offset);
+    }
+
+    /// Regression test for #2816 Correctness review: `build_nomination_value`
+    /// must not underflow when the snapshot's LCL has advanced past the
+    /// caller-provided close_time. Instead it returns None (abort).
+    #[test]
+    fn test_build_nomination_value_aborts_on_stale_close_time() {
+        let (herder, _) = make_validator_herder();
+        herder.bootstrap(0);
+        let now = 5000u64;
+        herder.scp_driver.set_test_clock(now);
+
+        // The default LM has lcl_close_time = 0.
+        // Pass close_time = 0 to trigger the checked_sub guard (offset = 0 → abort).
+        let lcl_ct = herder.lcl_close_time();
+        let result = herder.build_nomination_value(lcl_ct);
+        assert!(
+            result.is_none(),
+            "build_nomination_value must abort when close_time <= snapshot lcl_close_time"
+        );
+    }
+
+    /// Regression test for #2816 Correctness review: `lcl_close_time()` is
+    /// a public accessor that reads the current LCL close time.
+    #[test]
+    fn test_lcl_close_time_accessor() {
+        let now = 3000u64;
+        let herder = Herder::with_secret_key(
+            HerderConfig {
+                is_validator: true,
+                ..HerderConfig::default()
+            },
+            SecretKey::from_seed(&[60u8; 32]),
+            make_lm_with_close_time(0, now),
+            TimerManagerHandle::no_op(),
+        );
+        herder.bootstrap(0);
+        assert_eq!(herder.lcl_close_time(), now);
     }
 
     /// Direct regression test for the `lcl_matches_slot` helper used by the

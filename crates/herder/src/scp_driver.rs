@@ -1163,11 +1163,24 @@ impl ScpDriver {
             .get_or_insert_with(std::time::Instant::now);
     }
 
-    /// Get the ballot start instant for a slot (used as "prepare start" for trigger-time adjustment).
+    /// Get the ballot start instant for a slot.
+    ///
+    /// Parity: stellar-core `HerderSCPDriver::getPrepareStart()` returns
+    /// `mPrepareStart`, which is recorded in `startedBallotProtocol`.
+    /// This correctly maps to `ballot_start` in henyey (not `first_seen`).
     /// Returns `None` if `record_ballot_start()` hasn't been called yet for this slot.
     pub fn prepare_start(&self, slot: SlotIndex) -> Option<std::time::Instant> {
         let map = self.slot_timing.read();
         map.get(&slot).and_then(|s| s.ballot_start)
+    }
+
+    /// Get the trigger instant for a slot (when `trigger_next_ledger` first ran).
+    ///
+    /// This is the `first_seen` timestamp — the actual moment the slot was
+    /// triggered. Useful for measuring total slot latency.
+    pub fn slot_trigger_time(&self, slot: SlotIndex) -> Option<std::time::Instant> {
+        let map = self.slot_timing.read();
+        map.get(&slot).and_then(|s| s.first_seen)
     }
 
     /// Duration of the highest externalized slot (first-seen → externalized).
