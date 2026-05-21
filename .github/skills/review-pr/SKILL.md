@@ -234,15 +234,19 @@ Post via `gh pr comment $PR_NUM --repo stellar-experimental/henyey --body-file <
 >      `## Regression test` section (which /do should have populated).
 >    - **Verify the regression test would have caught the bug.** Walk the PR
 >      commit list (\`gh pr view $PR_NUM --json commits\`). The test should
->      have been committed BEFORE the fix. Check out the parent of the fix
->      commit and run the test:
+>      have been committed BEFORE the fix. Check out the test commit in your
+>      validated reviewer scratch workspace and run the test there:
 >      \`\`\`bash
+>      cd "$REVIEWER_WORKTREE"
 >      git fetch origin pull/$PR_NUM/head:pr-$PR_NUM
 >      git checkout <test-commit-sha>
 >      cargo test -p henyey-<crate> <test_fn> 2>&1 | tail -10
 >      \`\`\`
->      Confirm the test FAILS at that point. If the test passes at the test-
->      commit, the regression test doesn't actually capture the bug → bounce.
+>      All checkout and build operations MUST happen inside
+>      `$REVIEWER_WORKTREE` (under `$HOME/data`), never in the live repo
+>      checkout. Confirm the test FAILS at that point. If the test passes at
+>      the test-commit, the regression test doesn't actually capture the bug
+>      → bounce.
 >    - If the PR body has no \`## Regression test\` section, or the section's
 >      claims don't match what's in the diff, → bounce.
 > 3. For `kind: feature`:

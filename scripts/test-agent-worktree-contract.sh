@@ -584,6 +584,54 @@ test_plan_bootstrap_normal_session_id_succeeds() {
 }
 
 # --------------------------------------------------------------------------
+# Test: review-pr bug-fix verification uses $REVIEWER_WORKTREE, not in-place checkout
+# --------------------------------------------------------------------------
+test_review_pr_bugfix_verification_uses_reviewer_worktree() {
+  local desc="review-pr bug-fix verification uses \$REVIEWER_WORKTREE, not in-place checkout"
+
+  # The bug-fix verification snippet (git fetch / git checkout / cargo test)
+  # must be preceded by a cd into $REVIEWER_WORKTREE. If the snippet does a
+  # bare "git checkout" without first entering the reviewer scratch workspace,
+  # it would bypass the $HOME/data workspace contract.
+
+  # The bug-fix verification snippet lives inside a blockquote with escaped
+  # backtick fences (\`\`\`bash ... \`\`\`). Extract lines between them that
+  # contain "git fetch origin pull/" and "git checkout".
+  local in_block=false
+  local block_content=""
+  while IFS= read -r line; do
+    # Match opening fence: lines containing \`\`\`bash (escaped backticks)
+    if ! $in_block && echo "$line" | grep -q '\\`\\`\\`bash'; then
+      in_block=true
+      block_content=""
+      continue
+    fi
+    # Match closing fence: \`\`\` without language tag
+    if $in_block && echo "$line" | grep -q '\\`\\`\\`' && ! echo "$line" | grep -q '\\`\\`\\`bash'; then
+      # End of block — check if it's the bug-fix verification block
+      if echo "$block_content" | grep -q "git fetch origin pull/" && \
+         echo "$block_content" | grep -q "git checkout"; then
+        # Found it — verify it includes cd into REVIEWER_WORKTREE
+        if echo "$block_content" | grep -q 'REVIEWER_WORKTREE'; then
+          tap_ok "$desc"
+          return
+        else
+          tap_not_ok "$desc" "Bug-fix verification block does git checkout without cd into \$REVIEWER_WORKTREE"
+          return
+        fi
+      fi
+      in_block=false
+      continue
+    fi
+    if $in_block; then
+      block_content+="$line"$'\n'
+    fi
+  done < "$REVIEW_PR_SKILL"
+
+  tap_not_ok "$desc" "Could not find bug-fix verification code block in review-pr SKILL.md"
+}
+
+# --------------------------------------------------------------------------
 # Run all tests
 # --------------------------------------------------------------------------
 
@@ -609,6 +657,7 @@ test_review_pr_bootstrap_rejects_session_id_traversal
 test_plan_bootstrap_rejects_session_id_traversal
 test_review_pr_bootstrap_normal_session_id_succeeds
 test_plan_bootstrap_normal_session_id_succeeds
+test_review_pr_bugfix_verification_uses_reviewer_worktree
 
 echo "1..$TEST_NUM"
 echo "# pass: $PASS"
