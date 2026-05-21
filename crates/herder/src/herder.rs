@@ -3295,6 +3295,15 @@ impl Herder {
             return None;
         }
 
+        // Populate the validity cache with `true` for this locally-built tx set.
+        // Mirrors stellar-core's `cacheValidTxSet(*applicableProposedSet, lcl,
+        // upperBoundCloseTimeOffset)` in `HerderImpl::triggerNextLedger()` —
+        // ensures later SCP nomination/validation lookups can reuse the result
+        // without re-running full `checkValid`. This side effect runs for both
+        // validators and observers, before the non-validator early return.
+        self.scp_driver
+            .cache_valid_tx_set(previous_hash, *tx_set.hash(), close_time_offset);
+
         // Cache the tx set and notify FetchingEnvelopes. Does NOT drain the
         // ready queue — callers (trigger_next_ledger, handle_nomination_timeout)
         // are responsible for draining via process_ready_fetching_envelopes().
@@ -5979,6 +5988,56 @@ mod tests {
         assert!(
             slot_state.map_or(true, |s| !s.is_nominating),
             "observer must NOT enter nominating state"
+        );
+    }
+
+    /// Regression test for #2869 (Bounce-Back Cycle 2) — validity cache parity.
+    ///
+    /// Verifies that `trigger_next_ledger` on a non-validator populates BOTH
+    /// the raw tx-set cache AND the validity cache, mirroring stellar-core's
+    /// `cacheValidTxSet(*applicableProposedSet, lcl, upperBoundCloseTimeOffset)`
+    /// in `HerderImpl::triggerNextLedger()`.
+    ///
+    /// Pre-fix: the validity cache remains empty because
+    /// `validate_and_cache_built_tx_set` only called `cache_tx_set`.
+    /// Post-fix: `cache_valid_tx_set` writes `true` into the validity cache.
+    #[test]
+    fn test_trigger_next_ledger_observer_populates_validity_cache() {
+        let config = HerderConfig {
+            is_validator: false,
+            ..HerderConfig::default()
+        };
+        let herder = Herder::new(config, make_default_lm(), TimerManagerHandle::no_op());
+
+        // Bootstrap into tracking state.
+        herder.bootstrap(0);
+        assert!(herder.is_tracking());
+        assert!(!herder.is_validator());
+
+        // Validity cache should be empty before the trigger.
+        let valid_before = herder.scp_driver.cache_sizes().tx_set_valid_cache;
+        assert_eq!(
+            valid_before, 0,
+            "validity cache should be empty before trigger"
+        );
+
+        // Trigger for slot 1.
+        let result = herder.trigger_next_ledger(1);
+        assert_eq!(
+            result.expect("observer trigger should succeed"),
+            TriggerOutcome::ObserverCached,
+        );
+
+        // The raw tx-set cache should be populated (existing assertion).
+        let cached_hashes = herder.scp_driver.cached_tx_set_hashes();
+        assert_eq!(cached_hashes.len(), 1);
+
+        // The validity cache MUST also be populated — this is the parity fix.
+        let valid_after = herder.scp_driver.cache_sizes().tx_set_valid_cache;
+        assert_eq!(
+            valid_after, 1,
+            "validity cache must contain one entry after observer trigger \
+             (parity: stellar-core cacheValidTxSet in triggerNextLedger)"
         );
     }
 
@@ -10227,6 +10286,12 @@ mod advance_tracking_slot_tests {
             !herder.scp_driver.has_tx_set(tx_set.hash()),
             "rejected tx set hash must not be queryable in the cache"
         );
+        // Validity cache must also remain empty on rejection.
+        assert_eq!(
+            herder.scp_driver.cache_sizes().tx_set_valid_cache,
+            0,
+            "validity cache must not be populated when helper rejects"
+        );
     }
 
     /// Wiring test (positive path): when the helper returns `true`, the
@@ -10263,6 +10328,17 @@ mod advance_tracking_slot_tests {
         assert!(
             herder.scp_driver.has_tx_set(tx_set.hash()),
             "accepted tx set hash must be queryable in the cache"
+        );
+        // Validity cache must be populated with `true` on success.
+        let valid_entry =
+            herder
+                .scp_driver
+                .check_tx_set_valid_cached(&Hash256::ZERO, tx_set.hash(), 0);
+        assert_eq!(
+            valid_entry,
+            Some(true),
+            "validity cache must contain true for accepted tx set \
+             (parity: stellar-core cacheValidTxSet)"
         );
     }
 

@@ -715,6 +715,37 @@ impl ScpDriver {
         self.tx_tracker.clear_valid_cache();
     }
 
+    /// Store a `true` validity result for a locally-built tx set.
+    ///
+    /// Mirrors stellar-core's `HerderSCPDriver::cacheValidTxSet()` which
+    /// populates the validity cache after a successful local build so later
+    /// SCP nomination/validation lookups can reuse the result without
+    /// re-running `checkValid`.
+    ///
+    /// Key: `(lcl_hash, tx_set_hash, close_time_offset)`.
+    pub fn cache_valid_tx_set(
+        &self,
+        lcl_hash: Hash256,
+        tx_set_hash: Hash256,
+        close_time_offset: u64,
+    ) {
+        let key = (lcl_hash, tx_set_hash, close_time_offset);
+        self.tx_tracker.store_valid(key, true);
+    }
+
+    /// Check whether a validity result is cached for the given key.
+    /// Returns `Some(true)` / `Some(false)` on hit, `None` on miss.
+    #[cfg(test)]
+    pub(crate) fn check_tx_set_valid_cached(
+        &self,
+        lcl_hash: &Hash256,
+        tx_set_hash: &Hash256,
+        close_time_offset: u64,
+    ) -> Option<bool> {
+        let key = (*lcl_hash, *tx_set_hash, close_time_offset);
+        self.tx_tracker.check_valid(&key)
+    }
+
     /// Check and cache whether a transaction set is valid for application.
     ///
     /// Mirrors stellar-core's `HerderSCPDriver::checkAndCacheTxSetValid()`
