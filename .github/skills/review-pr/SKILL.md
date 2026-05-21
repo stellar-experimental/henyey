@@ -155,19 +155,32 @@ Otherwise, the PR is **non-parity** — Reviewer B uses risk lens.
 ```bash
 SESSION_ID="${CLAUDE_SESSION_ID:-$(date +%Y%m%d-%H%M%S)}"
 
+# Portable canonicalization: tries realpath, readlink -f, then Python as fallback.
+_canonicalize() {
+  realpath --canonicalize-missing "$1" 2>/dev/null \
+    || readlink -f "$1" 2>/dev/null \
+    || python3 -c "import os,sys; print(os.path.realpath(sys.argv[1]))" "$1" 2>/dev/null \
+    || true
+}
+
 # Validate pre-seeded overrides: must canonicalize under $HOME/data.
 _validate_under_home_data() {
   local varname="$1" candidate="$2"
-  local resolved
-  resolved="$(realpath --canonicalize-missing "$candidate" 2>/dev/null || readlink -f "$candidate" 2>/dev/null || true)"
+  local resolved allowed_root
+  resolved="$(_canonicalize "$candidate")"
   if [ -z "$resolved" ]; then
-    echo "ERROR: Cannot canonicalize $varname='$candidate' — neither realpath nor readlink -f available. Aborting." >&2
+    echo "ERROR: Cannot canonicalize $varname='$candidate' — realpath, readlink -f, and python3 all unavailable. Aborting." >&2
+    exit 1
+  fi
+  allowed_root="$(_canonicalize "$HOME/data")"
+  if [ -z "$allowed_root" ]; then
+    echo "ERROR: Cannot canonicalize \$HOME/data — realpath, readlink -f, and python3 all unavailable. Aborting." >&2
     exit 1
   fi
   case "$resolved" in
-    "$HOME/data"/*) return 0 ;;
-    "$HOME/data") return 0 ;;
-    *) echo "ERROR: $varname='$candidate' (resolves to '$resolved') is outside \$HOME/data. Aborting." >&2; exit 1 ;;
+    "$allowed_root"/*) return 0 ;;
+    "$allowed_root") return 0 ;;
+    *) echo "ERROR: $varname='$candidate' (resolves to '$resolved') is outside \$HOME/data (resolved root: '$allowed_root'). Aborting." >&2; exit 1 ;;
   esac
 }
 

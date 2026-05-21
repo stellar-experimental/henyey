@@ -632,6 +632,132 @@ test_review_pr_bugfix_verification_uses_reviewer_worktree() {
 }
 
 # --------------------------------------------------------------------------
+# Test: review-pr bootstrap works with symlinked $HOME
+# --------------------------------------------------------------------------
+test_review_pr_bootstrap_works_with_symlinked_home() {
+  local desc="review-pr bootstrap accepts valid overrides when \$HOME contains symlinks"
+
+  local snippet
+  snippet=$(extract_bash_block "$REVIEW_PR_SKILL" "Reviewer workspace contract")
+
+  if [ -z "$snippet" ]; then
+    tap_not_ok "$desc" "Could not extract reviewer workspace contract bash block from review-pr SKILL.md"
+    return
+  fi
+
+  local tmpdir
+  tmpdir=$(mktemp -d "${HOME}/data/test-contract-XXXXXX")
+  # Create real-home/data and a symlink link-home -> real-home
+  local real_home="$tmpdir/real-home"
+  local link_home="$tmpdir/link-home"
+  mkdir -p "$real_home/data"
+  ln -s "$real_home" "$link_home"
+
+  # Use the symlinked HOME with a valid override under the real data dir
+  local output exit_code=0
+  output=$(
+    HOME="$link_home" \
+    CLAUDE_SESSION_ID="test-session" \
+    ISSUE="9999" \
+    PR_NUM="1234" \
+    WORKTREE_BASE="$link_home/data/my-workspace" \
+    CARGO_TARGET_DIR="$link_home/data/my-workspace/cargo-target" \
+    bash -c "$snippet" 2>&1
+  ) || exit_code=$?
+
+  rm -rf "$tmpdir"
+
+  if [ "$exit_code" -eq 0 ]; then
+    tap_ok "$desc"
+  else
+    tap_not_ok "$desc" "Expected exit 0 for valid overrides under symlinked \$HOME/data, got $exit_code. Output: $output"
+  fi
+}
+
+# --------------------------------------------------------------------------
+# Test: plan bootstrap works with symlinked $HOME
+# --------------------------------------------------------------------------
+test_plan_bootstrap_works_with_symlinked_home() {
+  local desc="plan bootstrap accepts valid overrides when \$HOME contains symlinks"
+
+  local snippet
+  snippet=$(extract_bash_block "$PLAN_SKILL" "Critic workspace contract")
+
+  if [ -z "$snippet" ]; then
+    tap_not_ok "$desc" "Could not extract critic workspace contract bash block from plan SKILL.md"
+    return
+  fi
+
+  local tmpdir
+  tmpdir=$(mktemp -d "${HOME}/data/test-contract-XXXXXX")
+  local real_home="$tmpdir/real-home"
+  local link_home="$tmpdir/link-home"
+  mkdir -p "$real_home/data"
+  ln -s "$real_home" "$link_home"
+
+  local output exit_code=0
+  output=$(
+    HOME="$link_home" \
+    CLAUDE_SESSION_ID="test-session" \
+    ISSUE="9999" \
+    WORKTREE_BASE="$link_home/data/my-workspace" \
+    CARGO_TARGET_DIR="$link_home/data/my-workspace/cargo-target" \
+    bash -c "$snippet" 2>&1
+  ) || exit_code=$?
+
+  rm -rf "$tmpdir"
+
+  if [ "$exit_code" -eq 0 ]; then
+    tap_ok "$desc"
+  else
+    tap_not_ok "$desc" "Expected exit 0 for valid overrides under symlinked \$HOME/data, got $exit_code. Output: $output"
+  fi
+}
+
+# --------------------------------------------------------------------------
+# Test: review-pr bootstrap uses python3 fallback for canonicalization
+# --------------------------------------------------------------------------
+test_review_pr_bootstrap_python3_fallback() {
+  local desc="review-pr bootstrap falls back to python3 when realpath/readlink unavailable"
+
+  local snippet
+  snippet=$(extract_bash_block "$REVIEW_PR_SKILL" "Reviewer workspace contract")
+
+  if [ -z "$snippet" ]; then
+    tap_not_ok "$desc" "Could not extract reviewer workspace contract bash block from review-pr SKILL.md"
+    return
+  fi
+
+  # Verify the snippet references python3 as a fallback
+  if echo "$snippet" | grep -q "python3"; then
+    tap_ok "$desc"
+  else
+    tap_not_ok "$desc" "Bootstrap does not reference python3 fallback for canonicalization"
+  fi
+}
+
+# --------------------------------------------------------------------------
+# Test: plan bootstrap uses python3 fallback for canonicalization
+# --------------------------------------------------------------------------
+test_plan_bootstrap_python3_fallback() {
+  local desc="plan bootstrap falls back to python3 when realpath/readlink unavailable"
+
+  local snippet
+  snippet=$(extract_bash_block "$PLAN_SKILL" "Critic workspace contract")
+
+  if [ -z "$snippet" ]; then
+    tap_not_ok "$desc" "Could not extract critic workspace contract bash block from plan SKILL.md"
+    return
+  fi
+
+  if echo "$snippet" | grep -q "python3"; then
+    tap_ok "$desc"
+  else
+    tap_not_ok "$desc" "Bootstrap does not reference python3 fallback for canonicalization"
+  fi
+}
+
+# --------------------------------------------------------------------------
 # Run all tests
 # --------------------------------------------------------------------------
 
@@ -658,6 +784,10 @@ test_plan_bootstrap_rejects_session_id_traversal
 test_review_pr_bootstrap_normal_session_id_succeeds
 test_plan_bootstrap_normal_session_id_succeeds
 test_review_pr_bugfix_verification_uses_reviewer_worktree
+test_review_pr_bootstrap_works_with_symlinked_home
+test_plan_bootstrap_works_with_symlinked_home
+test_review_pr_bootstrap_python3_fallback
+test_plan_bootstrap_python3_fallback
 
 echo "1..$TEST_NUM"
 echo "# pass: $PASS"
