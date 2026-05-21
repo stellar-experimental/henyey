@@ -95,7 +95,11 @@ SESSION_ID="${CLAUDE_SESSION_ID:-$(date +%Y%m%d-%H%M%S)}"
 _validate_under_home_data() {
   local varname="$1" candidate="$2"
   local resolved
-  resolved="$(realpath --canonicalize-missing "$candidate" 2>/dev/null || readlink -f "$candidate" 2>/dev/null || echo "$candidate")"
+  resolved="$(realpath --canonicalize-missing "$candidate" 2>/dev/null || readlink -f "$candidate" 2>/dev/null || true)"
+  if [ -z "$resolved" ]; then
+    echo "ERROR: Cannot canonicalize $varname='$candidate' — neither realpath nor readlink -f available. Aborting." >&2
+    exit 1
+  fi
   case "$resolved" in
     "$HOME/data"/*) return 0 ;;
     "$HOME/data") return 0 ;;

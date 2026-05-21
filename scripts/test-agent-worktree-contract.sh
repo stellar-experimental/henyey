@@ -239,13 +239,17 @@ test_claude_plan_synced() {
 # --------------------------------------------------------------------------
 extract_bash_block() {
   local file="$1" heading="$2"
+  if [ ! -r "$file" ]; then
+    echo ""
+    return 0
+  fi
   sed -n "/^### *${heading}\|^## *${heading}/,/^## \|^### /{
     /^\`\`\`bash/,/^\`\`\`/{
       /^\`\`\`bash/d
       /^\`\`\`/d
       p
     }
-  }" "$file"
+  }" "$file" || { echo ""; return 0; }
 }
 
 # --------------------------------------------------------------------------
@@ -266,7 +270,7 @@ test_review_pr_bootstrap_rejects_outside_home_data_overrides() {
   # Run the snippet in a subshell with outside-$HOME/data overrides.
   # It should exit non-zero.
   local tmpdir
-  tmpdir=$(mktemp -d)
+  tmpdir=$(mktemp -d "${HOME}/data/test-contract-XXXXXX")
   local fake_home="$tmpdir/fakehome"
   mkdir -p "$fake_home/data" "$fake_home/not-under-data"
 
@@ -307,7 +311,7 @@ test_plan_bootstrap_rejects_outside_home_data_overrides() {
 
   # Run the snippet with outside-$HOME/data overrides — should exit non-zero.
   local tmpdir
-  tmpdir=$(mktemp -d)
+  tmpdir=$(mktemp -d "${HOME}/data/test-contract-XXXXXX")
   local fake_home="$tmpdir/fakehome"
   mkdir -p "$fake_home/data" "$fake_home/not-under-data"
 
@@ -345,7 +349,7 @@ test_review_pr_bootstrap_preserves_valid_home_data_overrides() {
   fi
 
   local tmpdir
-  tmpdir=$(mktemp -d)
+  tmpdir=$(mktemp -d "${HOME}/data/test-contract-XXXXXX")
   local fake_home="$tmpdir/fakehome"
   mkdir -p "$fake_home/data/my-session/review-pr-1234"
 
@@ -392,7 +396,7 @@ test_plan_bootstrap_preserves_valid_home_data_overrides() {
   fi
 
   local tmpdir
-  tmpdir=$(mktemp -d)
+  tmpdir=$(mktemp -d "${HOME}/data/test-contract-XXXXXX")
   local fake_home="$tmpdir/fakehome"
   mkdir -p "$fake_home/data/my-session/plan-9999"
 
