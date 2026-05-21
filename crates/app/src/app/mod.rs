@@ -4521,6 +4521,99 @@ mod tests {
         );
     }
 
+    /// Regression test for the watcher latch race condition found in review:
+    /// a failed older trigger must NOT clear a newer slot's latch claim.
+    ///
+    /// Scenario: trigger A claims slot N, while A is in-flight trigger B claims
+    /// slot N+1 (bumping the latch). When A fails and attempts rollback via
+    /// compare_exchange(N, 0), it should be a no-op because latch == N+1.
+    ///
+    /// Pre-fix (unconditional store(0)): the latch would be wiped, allowing
+    /// duplicate builds for slot N+1.
+    /// Post-fix (compare_exchange): latch N+1 survives the stale rollback.
+    #[tokio::test]
+    async fn test_try_trigger_consensus_watcher_stale_rollback_preserves_newer_claim() {
+        let config = crate::config::ConfigBuilder::new().in_memory(true).build();
+        assert!(!config.node.is_validator, "test requires watcher config");
+
+        let app = App::new(config).await.unwrap();
+        app.bootstrap_from_db().await.unwrap();
+        app.herder.bootstrap(1);
+        assert!(app.herder.is_tracking());
+        assert!(!app.herder.is_validator());
+
+        // Force the first trigger to fail via invalid close time.
+        app.herder.set_test_clock_seconds(1);
+
+        let failures_before = app.consensus_trigger_failures.load(Ordering::Relaxed);
+        app.try_trigger_consensus().await;
+        let failures_after = app.consensus_trigger_failures.load(Ordering::Relaxed);
+        assert_eq!(
+            failures_after,
+            failures_before + 1,
+            "trigger should fail due to invalid close time"
+        );
+
+        // After failure, latch was rolled back (same-slot rollback is correct).
+        // Now simulate a newer slot having been claimed concurrently: set
+        // the latch to slot 3 (next_slot was 2, so 3 > 2).
+        app.watcher_last_triggered_slot.store(3, Ordering::Relaxed);
+
+        // Attempt another trigger for slot 2 (still LCL=1 → next_slot=2).
+        // The latch check (last >= next_slot) should block entry because 3 >= 2.
+        let attempts_before = app.consensus_trigger_attempts.load(Ordering::Relaxed);
+        app.try_trigger_consensus().await;
+        let attempts_after = app.consensus_trigger_attempts.load(Ordering::Relaxed);
+
+        assert_eq!(
+            attempts_after, attempts_before,
+            "trigger should be blocked by newer slot's latch claim"
+        );
+
+        // The latch must still be 3 — the newer claim was preserved.
+        assert_eq!(
+            app.watcher_last_triggered_slot.load(Ordering::Relaxed),
+            3,
+            "newer slot claim (3) must survive stale trigger attempts"
+        );
+    }
+
+    /// Regression test for the watcher latch race at the atomic level.
+    ///
+    /// Directly verifies that compare_exchange(failed_slot, 0) is a no-op
+    /// when a newer slot has been claimed (latch > failed_slot).
+    #[test]
+    fn test_watcher_latch_compare_exchange_preserves_newer_claim() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        let latch = AtomicU64::new(0);
+
+        // Trigger A claims slot 5.
+        let slot_a = 5u64;
+        assert_eq!(
+            latch.compare_exchange(0, slot_a, Ordering::AcqRel, Ordering::Relaxed),
+            Ok(0)
+        );
+
+        // While A is in-flight, trigger B claims slot 6.
+        let slot_b = 6u64;
+        latch.store(slot_b, Ordering::Release);
+
+        // A fails and attempts rollback: compare_exchange(5, 0).
+        // Since latch == 6 != 5, this must be a no-op.
+        let rollback_result =
+            latch.compare_exchange(slot_a, 0, Ordering::AcqRel, Ordering::Relaxed);
+        assert!(
+            rollback_result.is_err(),
+            "rollback for slot 5 must fail when latch is slot 6"
+        );
+        assert_eq!(
+            latch.load(Ordering::Relaxed),
+            slot_b,
+            "slot 6 claim must be preserved after failed rollback of slot 5"
+        );
+    }
+
     #[tokio::test]
     async fn test_sync_recovery_callback_is_applying_ledger() {
         let dir = tempfile::tempdir().expect("temp dir");

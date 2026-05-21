@@ -241,8 +241,15 @@ impl App {
                         .fetch_add(1, Ordering::Relaxed);
                     // Roll back the watcher per-slot latch so a retry can
                     // re-attempt the build for this slot on the next tick.
+                    // Only clear if the latch still holds OUR slot — a newer
+                    // slot may have been claimed while we were awaiting.
                     if !self.is_validator {
-                        self.watcher_last_triggered_slot.store(0, Ordering::Relaxed);
+                        let _ = self.watcher_last_triggered_slot.compare_exchange(
+                            next_slot as u64,
+                            0,
+                            Ordering::AcqRel,
+                            Ordering::Relaxed,
+                        );
                     }
                     tracing::error!(error = %e, slot = next_slot, "Failed to trigger ledger");
                 }
@@ -250,9 +257,15 @@ impl App {
                     // Already logged by spawn_blocking_logged
                     self.consensus_trigger_failures
                         .fetch_add(1, Ordering::Relaxed);
-                    // Roll back latch on join failure as well.
+                    // Roll back latch on join failure as well — only if our
+                    // slot is still current (same race-safety as above).
                     if !self.is_validator {
-                        self.watcher_last_triggered_slot.store(0, Ordering::Relaxed);
+                        let _ = self.watcher_last_triggered_slot.compare_exchange(
+                            next_slot as u64,
+                            0,
+                            Ordering::AcqRel,
+                            Ordering::Relaxed,
+                        );
                     }
                 }
             }
