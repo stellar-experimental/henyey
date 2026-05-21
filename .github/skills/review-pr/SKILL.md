@@ -181,6 +181,11 @@ fi
 WORKTREE_BASE="${WORKTREE_BASE:-$HOME/data/$SESSION_ID/review-pr-$PR_NUM}"
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$WORKTREE_BASE/cargo-target}"
 
+# Final validation: even default-derived paths must resolve under $HOME/data
+# (guards against path traversal in CLAUDE_SESSION_ID).
+_validate_under_home_data WORKTREE_BASE "$WORKTREE_BASE"
+_validate_under_home_data CARGO_TARGET_DIR "$CARGO_TARGET_DIR"
+
 # Reviewer-specific scratch dir (only if needed for checkout/build):
 REVIEWER_WORKTREE="$WORKTREE_BASE/reviewer-a"  # or reviewer-b
 mkdir -p "$REVIEWER_WORKTREE"

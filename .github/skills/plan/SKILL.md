@@ -117,6 +117,11 @@ fi
 WORKTREE_BASE="${WORKTREE_BASE:-$HOME/data/$SESSION_ID/plan-$ISSUE}"
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$WORKTREE_BASE/cargo-target}"
 
+# Final validation: even default-derived paths must resolve under $HOME/data
+# (guards against path traversal in CLAUDE_SESSION_ID).
+_validate_under_home_data WORKTREE_BASE "$WORKTREE_BASE"
+_validate_under_home_data CARGO_TARGET_DIR "$CARGO_TARGET_DIR"
+
 # Critic-specific scratch dir (only if needed for checkout/build):
 CRITIC_WORKTREE="$WORKTREE_BASE/critic-a"  # or critic-b, critic-c
 mkdir -p "$CRITIC_WORKTREE"

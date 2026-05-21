@@ -428,6 +428,162 @@ test_plan_bootstrap_preserves_valid_home_data_overrides() {
 }
 
 # --------------------------------------------------------------------------
+# Test: review-pr bootstrap rejects traversal via CLAUDE_SESSION_ID
+# --------------------------------------------------------------------------
+test_review_pr_bootstrap_rejects_session_id_traversal() {
+  local desc="review-pr bootstrap rejects CLAUDE_SESSION_ID path traversal"
+
+  local snippet
+  snippet=$(extract_bash_block "$REVIEW_PR_SKILL" "Reviewer workspace contract")
+
+  if [ -z "$snippet" ]; then
+    tap_not_ok "$desc" "Could not extract reviewer workspace contract bash block from review-pr SKILL.md"
+    return
+  fi
+
+  local tmpdir
+  tmpdir=$(mktemp -d "${HOME}/data/test-contract-XXXXXX")
+  local fake_home="$tmpdir/fakehome"
+  mkdir -p "$fake_home/data"
+
+  # Use a traversal session ID — no WORKTREE_BASE/CARGO_TARGET_DIR overrides,
+  # so the defaults are derived from CLAUDE_SESSION_ID. Should fail.
+  local output exit_code=0
+  output=$(
+    HOME="$fake_home" \
+    CLAUDE_SESSION_ID="../../escape" \
+    PR_NUM="1234" \
+    bash -c "$snippet" 2>&1
+  ) || exit_code=$?
+
+  rm -rf "$tmpdir"
+
+  if [ "$exit_code" -ne 0 ]; then
+    tap_ok "$desc"
+  else
+    tap_not_ok "$desc" "Expected non-zero exit for traversal session ID, got 0. Output: $output"
+  fi
+}
+
+# --------------------------------------------------------------------------
+# Test: plan bootstrap rejects traversal via CLAUDE_SESSION_ID
+# --------------------------------------------------------------------------
+test_plan_bootstrap_rejects_session_id_traversal() {
+  local desc="plan bootstrap rejects CLAUDE_SESSION_ID path traversal"
+
+  local snippet
+  snippet=$(extract_bash_block "$PLAN_SKILL" "Critic workspace contract")
+
+  if [ -z "$snippet" ]; then
+    tap_not_ok "$desc" "Could not extract critic workspace contract bash block from plan SKILL.md"
+    return
+  fi
+
+  local tmpdir
+  tmpdir=$(mktemp -d "${HOME}/data/test-contract-XXXXXX")
+  local fake_home="$tmpdir/fakehome"
+  mkdir -p "$fake_home/data"
+
+  local output exit_code=0
+  output=$(
+    HOME="$fake_home" \
+    CLAUDE_SESSION_ID="../../escape" \
+    ISSUE="9999" \
+    bash -c "$snippet" 2>&1
+  ) || exit_code=$?
+
+  rm -rf "$tmpdir"
+
+  if [ "$exit_code" -ne 0 ]; then
+    tap_ok "$desc"
+  else
+    tap_not_ok "$desc" "Expected non-zero exit for traversal session ID, got 0. Output: $output"
+  fi
+}
+
+# --------------------------------------------------------------------------
+# Test: review-pr bootstrap succeeds with normal CLAUDE_SESSION_ID (no overrides)
+# --------------------------------------------------------------------------
+test_review_pr_bootstrap_normal_session_id_succeeds() {
+  local desc="review-pr bootstrap succeeds with normal CLAUDE_SESSION_ID"
+
+  local snippet
+  snippet=$(extract_bash_block "$REVIEW_PR_SKILL" "Reviewer workspace contract")
+
+  if [ -z "$snippet" ]; then
+    tap_not_ok "$desc" "Could not extract reviewer workspace contract bash block from review-pr SKILL.md"
+    return
+  fi
+
+  local tmpdir
+  tmpdir=$(mktemp -d "${HOME}/data/test-contract-XXXXXX")
+  local fake_home="$tmpdir/fakehome"
+  mkdir -p "$fake_home/data"
+
+  local output exit_code=0
+  output=$(
+    HOME="$fake_home" \
+    CLAUDE_SESSION_ID="abc123-normal-session" \
+    PR_NUM="1234" \
+    bash -c "$snippet"' && echo "WORKTREE_BASE=$WORKTREE_BASE"' 2>&1
+  ) || exit_code=$?
+
+  rm -rf "$tmpdir"
+
+  if [ "$exit_code" -ne 0 ]; then
+    tap_not_ok "$desc" "Expected exit 0 for normal session ID, got $exit_code. Output: $output"
+    return
+  fi
+
+  if echo "$output" | grep -q "WORKTREE_BASE=$fake_home/data/abc123-normal-session/review-pr-1234"; then
+    tap_ok "$desc"
+  else
+    tap_not_ok "$desc" "Unexpected WORKTREE_BASE. Output: $output"
+  fi
+}
+
+# --------------------------------------------------------------------------
+# Test: plan bootstrap succeeds with normal CLAUDE_SESSION_ID (no overrides)
+# --------------------------------------------------------------------------
+test_plan_bootstrap_normal_session_id_succeeds() {
+  local desc="plan bootstrap succeeds with normal CLAUDE_SESSION_ID"
+
+  local snippet
+  snippet=$(extract_bash_block "$PLAN_SKILL" "Critic workspace contract")
+
+  if [ -z "$snippet" ]; then
+    tap_not_ok "$desc" "Could not extract critic workspace contract bash block from plan SKILL.md"
+    return
+  fi
+
+  local tmpdir
+  tmpdir=$(mktemp -d "${HOME}/data/test-contract-XXXXXX")
+  local fake_home="$tmpdir/fakehome"
+  mkdir -p "$fake_home/data"
+
+  local output exit_code=0
+  output=$(
+    HOME="$fake_home" \
+    CLAUDE_SESSION_ID="abc123-normal-session" \
+    ISSUE="9999" \
+    bash -c "$snippet"' && echo "WORKTREE_BASE=$WORKTREE_BASE"' 2>&1
+  ) || exit_code=$?
+
+  rm -rf "$tmpdir"
+
+  if [ "$exit_code" -ne 0 ]; then
+    tap_not_ok "$desc" "Expected exit 0 for normal session ID, got $exit_code. Output: $output"
+    return
+  fi
+
+  if echo "$output" | grep -q "WORKTREE_BASE=$fake_home/data/abc123-normal-session/plan-9999"; then
+    tap_ok "$desc"
+  else
+    tap_not_ok "$desc" "Unexpected WORKTREE_BASE. Output: $output"
+  fi
+}
+
+# --------------------------------------------------------------------------
 # Run all tests
 # --------------------------------------------------------------------------
 
@@ -449,6 +605,10 @@ test_review_pr_bootstrap_rejects_outside_home_data_overrides
 test_plan_bootstrap_rejects_outside_home_data_overrides
 test_review_pr_bootstrap_preserves_valid_home_data_overrides
 test_plan_bootstrap_preserves_valid_home_data_overrides
+test_review_pr_bootstrap_rejects_session_id_traversal
+test_plan_bootstrap_rejects_session_id_traversal
+test_review_pr_bootstrap_normal_session_id_succeeds
+test_plan_bootstrap_normal_session_id_succeeds
 
 echo "1..$TEST_NUM"
 echo "# pass: $PASS"
