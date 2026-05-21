@@ -12,7 +12,10 @@
 #   plan_critic_bootstrap "$ISSUE" "critic-a"
 #   review_pr_bootstrap "$ISSUE"
 
-set -euo pipefail
+# NOTE: Do not use `set -e` here — this file is meant to be sourced by callers,
+# and errexit inside command substitutions can cause hard exits that bypass
+# caller error handling. Callers should check return codes explicitly.
+set -uo pipefail
 
 # canonicalize_contract_path <path>
 # Resolve symlinks and collapse .. traversals without requiring the path to exist.
@@ -33,7 +36,9 @@ require_home_data_path() {
   local home_data
   home_data="$(canonicalize_contract_path "$HOME/data")"
 
-  if [[ "$canonical" != "$home_data"* ]]; then
+  # Directory-boundary check: accept exact $HOME/data or paths under $HOME/data/.
+  # A plain prefix check would incorrectly accept sibling paths like $HOME/data-evil.
+  if [[ "$canonical" != "$home_data" && "$canonical" != "$home_data/"* ]]; then
     echo "ERROR: $var_name='$path' resolves to '$canonical' which is outside '$home_data'" >&2
     return 1
   fi
@@ -67,17 +72,23 @@ plan_critic_bootstrap() {
 
   # Derive or validate WORKTREE_BASE
   local candidate_base="${WORKTREE_BASE:-$HOME/data/$session_id/plan-$issue}"
-  WORKTREE_BASE="$(require_home_data_path "$candidate_base" "WORKTREE_BASE")" || return 1
+  if ! WORKTREE_BASE="$(require_home_data_path "$candidate_base" "WORKTREE_BASE")"; then
+    return 1
+  fi
   export WORKTREE_BASE
 
   # Derive or validate CARGO_TARGET_DIR
   local candidate_cargo="${CARGO_TARGET_DIR:-$WORKTREE_BASE/cargo-target}"
-  CARGO_TARGET_DIR="$(require_home_data_path "$candidate_cargo" "CARGO_TARGET_DIR")" || return 1
+  if ! CARGO_TARGET_DIR="$(require_home_data_path "$candidate_cargo" "CARGO_TARGET_DIR")"; then
+    return 1
+  fi
   export CARGO_TARGET_DIR
 
   # Derive critic-specific worktree
   CRITIC_WORKTREE="$WORKTREE_BASE/$critic_id"
-  CRITIC_WORKTREE="$(require_home_data_path "$CRITIC_WORKTREE" "CRITIC_WORKTREE")" || return 1
+  if ! CRITIC_WORKTREE="$(require_home_data_path "$CRITIC_WORKTREE" "CRITIC_WORKTREE")"; then
+    return 1
+  fi
   export CRITIC_WORKTREE
 }
 
@@ -91,16 +102,22 @@ review_pr_bootstrap() {
 
   # Derive or validate WORKTREE_BASE
   local candidate_base="${WORKTREE_BASE:-$HOME/data/$session_id/review-pr-$issue}"
-  WORKTREE_BASE="$(require_home_data_path "$candidate_base" "WORKTREE_BASE")" || return 1
+  if ! WORKTREE_BASE="$(require_home_data_path "$candidate_base" "WORKTREE_BASE")"; then
+    return 1
+  fi
   export WORKTREE_BASE
 
   # Derive or validate CARGO_TARGET_DIR
   local candidate_cargo="${CARGO_TARGET_DIR:-$WORKTREE_BASE/cargo-target}"
-  CARGO_TARGET_DIR="$(require_home_data_path "$candidate_cargo" "CARGO_TARGET_DIR")" || return 1
+  if ! CARGO_TARGET_DIR="$(require_home_data_path "$candidate_cargo" "CARGO_TARGET_DIR")"; then
+    return 1
+  fi
   export CARGO_TARGET_DIR
 
   # Derive reviewer-specific worktree
   REVIEWER_WORKTREE="$WORKTREE_BASE/reviewer"
-  REVIEWER_WORKTREE="$(require_home_data_path "$REVIEWER_WORKTREE" "REVIEWER_WORKTREE")" || return 1
+  if ! REVIEWER_WORKTREE="$(require_home_data_path "$REVIEWER_WORKTREE" "REVIEWER_WORKTREE")"; then
+    return 1
+  fi
   export REVIEWER_WORKTREE
 }

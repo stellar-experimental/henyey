@@ -101,13 +101,17 @@ test_plan_bootstrap_accepts_safe_preseeded_home_data_paths() {
     return
   fi
 
-  # Verify all paths contain $HOME/data
+  # Verify all paths are under $HOME/data (directory-boundary check, not prefix)
   local home_data
   home_data="$(realpath -m "$HOME/data")"
-  if echo "$output" | grep -v "^$home_data" | grep -q .; then
-    tap_not_ok "$desc" "Some paths not under \$HOME/data: $output"
-    return
-  fi
+  # Each output line must be exactly $home_data or start with $home_data/
+  local line
+  while IFS= read -r line; do
+    if [[ -n "$line" && "$line" != "$home_data" && "$line" != "$home_data/"* ]]; then
+      tap_not_ok "$desc" "Path not under \$HOME/data: $line"
+      return
+    fi
+  done <<< "$output"
 
   tap_ok "$desc"
 }
@@ -159,10 +163,13 @@ test_review_pr_bootstrap_requires_home_data_workspace() {
 
   local home_data
   home_data="$(realpath -m "$HOME/data")"
-  if echo "$output" | grep -v "^$home_data" | grep -q .; then
-    tap_not_ok "$desc" "Some default paths not under \$HOME/data: $output"
-    return
-  fi
+  local line
+  while IFS= read -r line; do
+    if [[ -n "$line" && "$line" != "$home_data" && "$line" != "$home_data/"* ]]; then
+      tap_not_ok "$desc" "Some default paths not under \$HOME/data: $line"
+      return
+    fi
+  done <<< "$output"
 
   tap_ok "$desc"
 }
@@ -192,17 +199,22 @@ test_default_bootstrap_layouts_stay_under_home_data() {
   local home_data
   home_data="$(realpath -m "$HOME/data")"
 
-  # Verify plan paths
-  if echo "$plan_out" | grep -v "^$home_data" | grep -q .; then
-    tap_not_ok "$desc" "Plan paths escape \$HOME/data: $plan_out"
-    return
-  fi
+  # Verify plan paths (directory-boundary check)
+  local line
+  while IFS= read -r line; do
+    if [[ -n "$line" && "$line" != "$home_data" && "$line" != "$home_data/"* ]]; then
+      tap_not_ok "$desc" "Plan paths escape \$HOME/data: $line"
+      return
+    fi
+  done <<< "$plan_out"
 
-  # Verify review paths
-  if echo "$review_out" | grep -v "^$home_data" | grep -q .; then
-    tap_not_ok "$desc" "Review paths escape \$HOME/data: $review_out"
-    return
-  fi
+  # Verify review paths (directory-boundary check)
+  while IFS= read -r line; do
+    if [[ -n "$line" && "$line" != "$home_data" && "$line" != "$home_data/"* ]]; then
+      tap_not_ok "$desc" "Review paths escape \$HOME/data: $line"
+      return
+    fi
+  done <<< "$review_out"
 
   # Verify expected structure
   if ! echo "$plan_out" | grep -q "data/default-test/plan-55"; then
@@ -315,14 +327,65 @@ test_claude_plan_synced() {
 }
 
 # --------------------------------------------------------------------------
+# Test: plan bootstrap rejects sibling-prefix WORKTREE_BASE (e.g. $HOME/data-evil)
+# --------------------------------------------------------------------------
+test_plan_bootstrap_rejects_sibling_prefix_worktree_base() {
+  local desc="plan bootstrap rejects sibling-prefix WORKTREE_BASE"
+
+  # Sibling-prefix: $HOME/data-evil shares the $HOME/data string prefix
+  local output
+  if output=$(WORKTREE_BASE="$HOME/data-evil/plan-999" CARGO_TARGET_DIR="" CLAUDE_SESSION_ID="test-session" \
+    bash -c "source '$CONTRACT_HELPER' && plan_critic_bootstrap 999 critic-a" 2>&1); then
+    tap_not_ok "$desc (data-evil)" "Should have failed but succeeded: $output"
+    return
+  fi
+
+  # Sibling-prefix: $HOME/data2
+  if output=$(WORKTREE_BASE="$HOME/data2/plan-999" CARGO_TARGET_DIR="" CLAUDE_SESSION_ID="test-session" \
+    bash -c "source '$CONTRACT_HELPER' && plan_critic_bootstrap 999 critic-a" 2>&1); then
+    tap_not_ok "$desc (data2)" "Should have failed but succeeded: $output"
+    return
+  fi
+
+  tap_ok "$desc"
+}
+
+# --------------------------------------------------------------------------
+# Test: review-pr bootstrap rejects sibling-prefix paths
+# --------------------------------------------------------------------------
+test_review_pr_bootstrap_rejects_sibling_prefix() {
+  local desc="review-pr bootstrap rejects sibling-prefix paths"
+
+  # Sibling-prefix WORKTREE_BASE
+  local output
+  if output=$(WORKTREE_BASE="$HOME/data-evil/review-100" CARGO_TARGET_DIR="" CLAUDE_SESSION_ID="test-session" \
+    bash -c "source '$CONTRACT_HELPER' && review_pr_bootstrap 100" 2>&1); then
+    tap_not_ok "$desc (base: data-evil)" "Should have failed but succeeded: $output"
+    return
+  fi
+
+  # Valid base but sibling-prefix CARGO_TARGET_DIR
+  if output=$(WORKTREE_BASE="$HOME/data/test-session/review-pr-100" \
+    CARGO_TARGET_DIR="$HOME/data-evil/cargo" CLAUDE_SESSION_ID="test-session" \
+    bash -c "source '$CONTRACT_HELPER' && review_pr_bootstrap 100" 2>&1); then
+    tap_not_ok "$desc (cargo: data-evil)" "Should have failed but succeeded: $output"
+    return
+  fi
+
+  tap_ok "$desc"
+}
+
+# --------------------------------------------------------------------------
 # Run all tests
 # --------------------------------------------------------------------------
 echo "TAP version 13"
 
 test_plan_bootstrap_rejects_hostile_worktree_base
 test_plan_bootstrap_rejects_hostile_cargo_target_dir
+test_plan_bootstrap_rejects_sibling_prefix_worktree_base
 test_plan_bootstrap_accepts_safe_preseeded_home_data_paths
 test_review_pr_bootstrap_rejects_hostile_worktree_base_and_cargo_target
+test_review_pr_bootstrap_rejects_sibling_prefix
 test_review_pr_bootstrap_requires_home_data_workspace
 test_default_bootstrap_layouts_stay_under_home_data
 test_skill_files_reference_shared_contract_helper
