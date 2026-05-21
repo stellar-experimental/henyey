@@ -79,7 +79,7 @@ Counts (excluding Drift and N/A from denominator):
 | §11.2 | Start/Stop Collecting signed-message receipt | Full | App-owned: `crates/app/src/app/survey_impl.rs:941-956` `verify_survey_signature` verifies Ed25519 signature on incoming start/stop messages via `henyey_crypto::verify_from_raw_key`; `survey.rs:426-522` manages local phase transitions |
 | §11.3 | `SurveyRequest`/`SurveyResponse` flow | Full | App-owned: `crates/app/src/app/survey_impl.rs:488-790` handles all four survey message types (`handle_survey_request`, `handle_survey_response`, `handle_survey_start_collecting`, `handle_survey_stop_collecting`); dispatched from `lifecycle.rs:1669-1688`; includes signature verification (941-956) and rate-limiter integration |
 | §11.3 | Curve25519 sealed-box encryption/decryption | Full | App-owned: `crates/app/src/app/survey_impl.rs:674-680` (`seal_to_curve25519_public_key`) and `786-793` (`open_from_curve25519_secret_key`) via `henyey_crypto` |
-| §11.5 | `surveyorPermitted` (allowlist or tracked quorum) | Partial | `survey.rs:415-421` supports allowlist; tracked-quorum fallback not implemented |
+| §11.5 | `surveyorPermitted` (allowlist or tracked quorum) | Partial | App-owned: `crates/app/src/app/survey_impl.rs:964-983` — allowlist gate via `config.overlay.surveyor_keys` with fallback to `Herder::local_quorum_nodes()` (static local quorum-set membership). Divergence: stellar-core uses `Herder::getCurrentlyTrackedQuorum()` (`SurveyManager.cpp:834-845`) which reflects the dynamically tracked quorum, not the static local config. Called at lines 501, 565, 622 before processing survey start/stop/request. |
 | §11.6 | TimeSlicedNodeData / PeerData counters | Full | `survey.rs:74-212,491-521` |
 | §12.1 | ERROR_MSG: zero seq+MAC pre-key, normal HMAC post-key | Partial | Receive-side parity: `auth.rs:672-675` skips MAC verification for incoming ERROR_MSG. Outbound divergence: post-auth ERROR_MSG sent via `peer.send()` → `auth.wrap_message()` applies normal MAC/seq, unlike stellar-core `Hmac.cpp:72-79` which exempts outbound ERROR_MSG. |
 | §12.1 | ERROR_MSG drops connection | Full | `manager/peer_loop.rs:1046-1064` |
@@ -113,7 +113,7 @@ Counts (excluding Drift and N/A from denominator):
 | INV-O10 (SEND_MORE_EXTENDED validation) | Full | `flow_control.rs:979-1010` (numBytes!=0 + overflow guards) |
 | INV-O11 (Recv-side batch grants) | Partial | `flow_control.rs:1038-1065` emits SEND_MORE_EXTENDED on batch threshold, but the spec's `releaseAssert(mFloodDataProcessed <= BATCH_SIZE)` upper bound is not asserted |
 | INV-O12 (One PEERS per connection) | Full | `manager/peer_loop.rs:512-531,712-717` |
-| INV-O13 (Outbound role rejects PEERS) | Full | `manager/peer_loop.rs:522-524` rejects PEERS in **Inbound** role; spec says "an inbound role peer MUST NOT receive `PEERS`" — Rust enforces the same. Re-read confirms code matches. |
+| INV-O13 (Inbound role rejects PEERS) | Full | `manager/peer_loop.rs:522-524` rejects PEERS from **Inbound** direction peers (`REMOTE_CALLED_US`); spec says "an inbound role peer MUST NOT receive `PEERS`" — Rust enforces the same. |
 | INV-O14 (No flood while not synced) | Full | `manager/peer_loop.rs:693-697` |
 | INV-O15 (Survey signature verification) | Full | App-owned: `crates/app/src/app/survey_impl.rs:941-956` `verify_survey_signature` uses `henyey_crypto::verify_from_raw_key` on Ed25519 key extracted from `NodeId`; called before processing survey start/stop/request/response |
 | INV-O16 (Survey rate limit) | Full | `survey.rs:268-356` (`SurveyMessageLimiter`) |
@@ -121,7 +121,7 @@ Counts (excluding Drift and N/A from denominator):
 | INV-O18 (Banned peer rejection) | Full | `peer.rs:390-400`, `manager/connection.rs:378-381,685-687` |
 | INV-O19 (Drop idempotence) | Partial | State-machine guard (`peer.rs:932-939`) provides single-threaded idempotence; no atomic `mDropStarted` flag means truly-concurrent drops from different tasks would need to rely on the outbound channel's shutdown signal — works in practice but not as explicitly designed in stellar-core |
 
-Re-evaluation: INV-O13 — code is correct. Spec says "An inbound role peer (`REMOTE_CALLED_US`) MUST NOT receive `PEERS`"; the Rust code `if direction == ConnectionDirection::Inbound { return RejectWrongDirection }` matches that exactly. Reclassified to **Full** in the summary count.
+Re-evaluation: INV-O13 — code is correct. Spec says "An inbound role peer (`REMOTE_CALLED_US`) MUST NOT receive `PEERS`"; the Rust code `if direction == ConnectionDirection::Inbound { return RejectWrongDirection }` matches that exactly. The invariant name is corrected to "Inbound role rejects PEERS" to align with the spec language. Reclassified to **Full** in the summary count.
 
 Corrected invariant tally: **Full 17 | Partial 2 | Absent 0**.
 
