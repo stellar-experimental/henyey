@@ -558,6 +558,151 @@ test_documented_snippet_fails_closed() {
 }
 
 # --------------------------------------------------------------------------
+# Test: HOME poisoning is defeated (passwd-derived trust anchor)
+# --------------------------------------------------------------------------
+test_home_poisoning_defeated() {
+  local desc="HOME poisoning is defeated by passwd-derived trust anchor"
+
+  # Get the real home from passwd for reference
+  local real_home
+  real_home="$(getent passwd "$(id -un)" | cut -d: -f6)"
+
+  # Poison HOME to a fake directory. The contract should still validate
+  # against the real home (from passwd), not the poisoned $HOME.
+  local output
+
+  # Case 1: Path under fake HOME/data should be rejected
+  if output=$(HOME="/tmp/fakehome" \
+    WORKTREE_BASE="" CARGO_TARGET_DIR="" CLAUDE_SESSION_ID="test-session" \
+    bash -c "source '$CONTRACT_HELPER' && review_pr_bootstrap 200 && echo \$WORKTREE_BASE" 2>&1); then
+    # If it succeeded, the derived path should be under the REAL home, not fake
+    if echo "$output" | grep -q "/tmp/fakehome"; then
+      tap_not_ok "$desc" "Used poisoned HOME: $output"
+      return
+    fi
+    # It used real home — that's correct behavior
+    if echo "$output" | grep -q "$real_home/data"; then
+      tap_ok "$desc"
+      return
+    fi
+    tap_not_ok "$desc" "Unexpected path: $output"
+    return
+  fi
+
+  # Bootstrap failed — check if it correctly rejected the poisoned-HOME path
+  if echo "$output" | grep -q "outside"; then
+    # Correctly rejected because /tmp/fakehome/data is not under real home
+    tap_ok "$desc"
+  else
+    tap_not_ok "$desc" "Unexpected failure: $output"
+  fi
+}
+
+# --------------------------------------------------------------------------
+# Test: HOME poisoning with explicit override to fake home's data dir
+# --------------------------------------------------------------------------
+test_home_poisoning_explicit_override() {
+  local desc="HOME poisoning with explicit override rejected"
+
+  local real_home
+  real_home="$(getent passwd "$(id -un)" | cut -d: -f6)"
+
+  # Explicitly set WORKTREE_BASE to a path under the fake HOME/data
+  local output
+  if output=$(HOME="/tmp/fakehome" \
+    WORKTREE_BASE="/tmp/fakehome/data/test-session/review-pr-200" \
+    CARGO_TARGET_DIR="" CLAUDE_SESSION_ID="test-session" \
+    bash -c "source '$CONTRACT_HELPER' && review_pr_bootstrap 200 && echo \$WORKTREE_BASE" 2>&1); then
+    tap_not_ok "$desc" "Should have failed but succeeded: $output"
+    return
+  fi
+
+  # Should fail because /tmp/fakehome/data is not under real_home/data
+  if echo "$output" | grep -q "outside"; then
+    tap_ok "$desc"
+  else
+    tap_not_ok "$desc" "Wrong failure reason: $output"
+  fi
+}
+
+# --------------------------------------------------------------------------
+# Test: shared in-bounds directory rejected (session-prefix enforcement)
+# --------------------------------------------------------------------------
+test_shared_inbounds_directory_rejected() {
+  local desc="shared in-bounds directory rejected by session-prefix check"
+
+  local real_home
+  real_home="$(getent passwd "$(id -un)" | cut -d: -f6)"
+
+  # Case 1: WORKTREE_BASE under $HOME/data but wrong session/issue prefix
+  local output
+  if output=$(WORKTREE_BASE="$real_home/data/shared/review-pr-100" \
+    CARGO_TARGET_DIR="" CLAUDE_SESSION_ID="test-session" \
+    bash -c "source '$CONTRACT_HELPER' && review_pr_bootstrap 100 && echo \$WORKTREE_BASE" 2>&1); then
+    tap_not_ok "$desc (review shared base)" "Should have failed but succeeded: $output"
+    return
+  fi
+
+  # Case 2: CARGO_TARGET_DIR under ~/data but wrong prefix
+  if output=$(WORKTREE_BASE="" \
+    CARGO_TARGET_DIR="$real_home/data/shared/cargo" CLAUDE_SESSION_ID="test-session" \
+    bash -c "source '$CONTRACT_HELPER' && review_pr_bootstrap 100 && echo \$CARGO_TARGET_DIR" 2>&1); then
+    tap_not_ok "$desc (review shared cargo)" "Should have failed but succeeded: $output"
+    return
+  fi
+
+  # Case 3: plan_critic_bootstrap with cross-session WORKTREE_BASE
+  if output=$(WORKTREE_BASE="$real_home/data/other-session/plan-42" \
+    CARGO_TARGET_DIR="" CLAUDE_SESSION_ID="test-session" \
+    bash -c "source '$CONTRACT_HELPER' && plan_critic_bootstrap 42 critic-a && echo \$WORKTREE_BASE" 2>&1); then
+    tap_not_ok "$desc (plan cross-session)" "Should have failed but succeeded: $output"
+    return
+  fi
+
+  tap_ok "$desc"
+}
+
+# --------------------------------------------------------------------------
+# Test: correct session-prefix overrides still accepted
+# --------------------------------------------------------------------------
+test_correct_session_prefix_overrides_accepted() {
+  local desc="correct session-prefix overrides accepted"
+
+  local real_home
+  real_home="$(getent passwd "$(id -un)" | cut -d: -f6)"
+
+  # Exact prefix match — should succeed
+  local output
+  if ! output=$(WORKTREE_BASE="$real_home/data/my-session/plan-42" \
+    CARGO_TARGET_DIR="$real_home/data/my-session/plan-42/cargo-target" \
+    CLAUDE_SESSION_ID="my-session" \
+    bash -c "source '$CONTRACT_HELPER' && plan_critic_bootstrap 42 critic-b && echo \$WORKTREE_BASE && echo \$CARGO_TARGET_DIR && echo \$CRITIC_WORKTREE" 2>&1); then
+    tap_not_ok "$desc (plan)" "Should have succeeded but failed: $output"
+    return
+  fi
+
+  # Review-pr with correct prefix
+  if ! output=$(WORKTREE_BASE="$real_home/data/my-session/review-pr-100" \
+    CARGO_TARGET_DIR="$real_home/data/my-session/review-pr-100/cargo-target" \
+    CLAUDE_SESSION_ID="my-session" \
+    bash -c "source '$CONTRACT_HELPER' && review_pr_bootstrap 100 && echo \$WORKTREE_BASE && echo \$CARGO_TARGET_DIR && echo \$REVIEWER_WORKTREE" 2>&1); then
+    tap_not_ok "$desc (review)" "Should have succeeded but failed: $output"
+    return
+  fi
+
+  # Subdirectory of expected prefix — should also succeed
+  if ! output=$(WORKTREE_BASE="$real_home/data/my-session/plan-42/subdir" \
+    CARGO_TARGET_DIR="$real_home/data/my-session/plan-42/subdir/cargo" \
+    CLAUDE_SESSION_ID="my-session" \
+    bash -c "source '$CONTRACT_HELPER' && plan_critic_bootstrap 42 critic-c && echo \$WORKTREE_BASE" 2>&1); then
+    tap_not_ok "$desc (subdirectory)" "Should have succeeded but failed: $output"
+    return
+  fi
+
+  tap_ok "$desc"
+}
+
+# --------------------------------------------------------------------------
 # Run all tests
 # --------------------------------------------------------------------------
 echo "TAP version 13"
@@ -574,6 +719,10 @@ test_review_pr_bootstrap_clears_stale_vars_on_failure
 test_default_bootstrap_layouts_stay_under_home_data
 test_documented_snippet_fails_closed
 test_sourcing_preserves_caller_shell_options
+test_home_poisoning_defeated
+test_home_poisoning_explicit_override
+test_shared_inbounds_directory_rejected
+test_correct_session_prefix_overrides_accepted
 test_skill_files_reference_shared_contract_helper
 test_claude_review_pr_synced
 test_claude_plan_synced
