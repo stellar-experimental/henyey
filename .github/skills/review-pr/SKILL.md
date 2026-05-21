@@ -30,20 +30,48 @@ You do **not** review the code yourself — you orchestrate two independent revi
 
 ## Step 0 — Find the PR
 
+Source the shared merge helper for linked-PR state classification and merge execution:
+
 ```bash
-# Use raw GraphQL — `gh issue view --json closedByPullRequestsReferences` silently
-# omits the `state` subfield, so `select(.state == "OPEN")` would never match and
-# PR_NUM would always be empty even when an OPEN PR exists.
-PR_NUM=$(gh api graphql -f query='{
-  repository(owner: "stellar-experimental", name: "henyey") {
-    issue(number: '"$ISSUE"') {
-      closedByPullRequestsReferences(first: 5) { nodes { number state } }
-    }
-  }
-}' --jq '.data.repository.issue.closedByPullRequestsReferences.nodes | map(select(.state == "OPEN")) | .[0].number // empty')
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+source "$REPO_ROOT/scripts/lib/review-pr-merge.sh"
 ```
 
-If `PR_NUM` is empty, the issue is in `in-review` but has no open PR — that's a bug in `/do`. Post `## Review: No PR Linked` and move the issue back to `ready-for-doing`. Unassign. Exit.
+Classify the linked PR state (distinguishes OPEN, MERGED, and CLOSED-without-merge):
+
+```bash
+PR_STATE=$(classify_linked_pr_state $ISSUE)
+```
+
+Handle each state:
+
+- **`open:<number>`** → extract `PR_NUM` and proceed to Step 0.5.
+- **`merged:<number>`** → the PR was already merged (e.g. by a previous `/review-pr` tick that armed auto-merge and GH completed it). Recover the merge SHA via `gh pr view <number> --repo stellar-experimental/henyey --json mergeCommit --jq '.mergeCommit.oid'`, run the Step 7.4 cleanup/done path, and exit.
+- **`closed:<number>`** → PR was closed without merge. That's a bug in `/do`. Post `## Review: No PR Linked` and move the issue back to `ready-for-doing`. Unassign. Exit.
+- **`missing`** → no linked PRs at all. Same handling as `closed`.
+
+### Step 0.5 — Check if auto-merge is already armed
+
+Before spawning reviewers or filing follow-up issues, check whether this PR already has auto-merge enabled from a previous tick:
+
+```bash
+if [[ "$(is_auto_merge_armed $PR_NUM)" == "true" ]]; then
+  # PR is OPEN and auto-merge is armed. GitHub will merge it automatically
+  # once branch protection requirements are met. Don't re-run reviewers or
+  # re-file follow-up issues — just post a waiting comment and exit.
+  gh pr comment $PR_NUM --repo stellar-experimental/henyey \
+    --body "## Review: Auto-merge armed — waiting
+
+Auto-merge was previously enabled on this PR. GitHub will merge automatically once all branch protection checks pass. Re-picking on next tick to verify completion.
+
+CI age: check \`autoMergeRequest\` state on next tick."
+
+  gh issue edit $ISSUE --repo stellar-experimental/henyey --remove-assignee @me
+  exit 0
+fi
+```
+
+This short-circuit prevents duplicate reviewer runs and duplicate follow-up issue filing on subsequent ticks while waiting for GitHub to complete the deferred merge.
 
 ## Step 1 — Read the PR + CI state
 
@@ -489,11 +517,30 @@ Collect the list of newly-filed issue numbers — they'll be referenced in the m
 
 #### 7.3 Merge
 
+Use the shared merge helper which handles the deferred-merge path:
+
 ```bash
-gh pr merge $PR_NUM --repo stellar-experimental/henyey --squash --admin
+MERGE_RESULT=$(attempt_merge $PR_NUM)
 ```
 
-The `--admin` flag means the agent must be authenticated as a repo admin. If your token doesn't have admin, the merge will fail — at which point operator intervention is needed (file a follow-up issue documenting the merge-permission gap; do NOT downgrade to non-admin merge that might silently bypass CI).
+Handle the result:
+
+- **`merged`** → immediate merge succeeded. Proceed to Step 7.4 cleanup.
+- **`auto-merge-armed`** → GitHub cannot create the merge commit cleanly right now but will merge automatically once conditions are met. Post a waiting comment recording the follow-up issue numbers filed in Step 7.2:
+
+  ```markdown
+  ## Review: Auto-merge armed
+
+  Enabled deferred auto-merge (squash). GitHub will merge once branch protection checks pass.
+
+  **Follow-up issues filed:** #N1, #N2 (or "none")
+
+  Re-picking on next tick to verify merge completion.
+  ```
+
+  Unassign and exit. The next `/review-pr` tick will detect the `MERGED` state via `classify_linked_pr_state` and run cleanup, or detect `OPEN + armed` via `is_auto_merge_armed` and short-circuit to waiting.
+
+- **`hard-failure:<stderr>`** → merge failed for a reason other than the auto-merge hint. Leave the issue in `in-review`; file a follow-up issue documenting the merge-permission gap; do NOT downgrade to non-admin merge that might silently bypass CI. Post `## Review: Merge Failed` with the stderr content.
 
 #### 7.4 Clean up
 
@@ -638,7 +685,8 @@ Exit.
 | Reviewer sub-agent fails to post | Retry once. If still failing, treat as `CHANGES_REQUESTED` and bounce. |
 | Reviewer's comment doesn't match the expected header/verdict shape | Treat as `pending`; if it stays malformed after Step 4 completes, bounce with a `## Review: Malformed Verdict` note. |
 | No PR linked | Bounce to `ready-for-doing` with `## Review: No PR Linked`. |
-| `gh pr merge --admin` fails (token lacks admin) | Leave the issue in `in-review`; file a follow-up issue documenting the gap; do NOT degrade to a non-admin merge that might bypass CI gates. |
+| `gh pr merge --admin` fails with auto-merge hint | Retry with `--auto` (deferred merge). If `--auto` also fails, hard failure. See Step 7.3. |
+| `gh pr merge --admin` fails (other error, e.g. token lacks admin) | Leave the issue in `in-review`; file a follow-up issue documenting the gap; do NOT degrade to a non-admin merge that might bypass CI gates. |
 | GH API failure | Retry once after 5s; if still failing, leave assigned and exit non-zero. |
 
 ## Workspace contract
