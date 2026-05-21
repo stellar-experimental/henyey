@@ -4324,6 +4324,51 @@ mod tests {
         );
     }
 
+    /// Regression test for #2868 — §5.1 trigger setup preconditions parity.
+    ///
+    /// Verifies that `try_trigger_consensus` skips the consensus trigger when
+    /// the node's LCL is behind the tracking slot (i.e. `current_ledger + 1 <
+    /// tracking_slot`), matching stellar-core's `isSynced()` precondition in
+    /// `setupTriggerNextLedger`.
+    ///
+    /// Parity: stellar-core HerderImpl.cpp — `trackingConsensusLedgerIndex()`
+    /// requires `lastClosedLedger + 1 == trackingConsensusLedgerIndex`.
+    #[tokio::test]
+    async fn test_try_trigger_consensus_skips_when_lcl_behind_tracking_slot() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-test.db");
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
+
+        let app = App::new(config).await.unwrap();
+
+        // After init the LCL is at genesis (ledger 1).
+        let current_ledger = app.current_ledger_seq();
+        assert_eq!(current_ledger, 1, "LCL should be at genesis");
+
+        // Bootstrap to enter Tracking state, then override tracking_slot to 5
+        // — well ahead of current_ledger + 1 = 2. This simulates a node that
+        // fell behind the network's consensus frontier.
+        app.herder.bootstrap(1);
+        app.herder.set_tracking_for_testing(5, 1000);
+        assert!(app.herder.is_tracking());
+        assert!(
+            (current_ledger as u64) + 1 < app.herder.tracking_slot().get(),
+            "precondition: LCL+1 must be behind tracking_slot"
+        );
+
+        let attempts_before = app.consensus_trigger_attempts.load(Ordering::Relaxed);
+
+        app.try_trigger_consensus().await;
+
+        let attempts_after = app.consensus_trigger_attempts.load(Ordering::Relaxed);
+        assert_eq!(
+            attempts_after, attempts_before,
+            "consensus_trigger_attempts must NOT increment when LCL is behind tracking slot"
+        );
+    }
+
     #[tokio::test]
     async fn test_sync_recovery_callback_is_applying_ledger() {
         let dir = tempfile::tempdir().expect("temp dir");
