@@ -148,6 +148,42 @@ If any path matches one of these prefixes, the PR is **parity-critical** — Rev
 
 Otherwise, the PR is **non-parity** — Reviewer B uses risk lens.
 
+### Reviewer workspace contract
+
+**All reviewer scratch work must live only under `$HOME/data`.** Reviewers should prefer the existing checkout for read-only inspection. If a reviewer needs a scratch checkout (e.g. to run a test or verify a claim), it must live under `$HOME/data`, never in the repo root, the repo parent, or anywhere outside `$HOME/data`. Each reviewer derives its workspace as follows:
+
+```bash
+SESSION_ID="${CLAUDE_SESSION_ID:-$(date +%Y%m%d-%H%M%S)}"
+
+# Validate pre-seeded overrides: must canonicalize under $HOME/data.
+_validate_under_home_data() {
+  local varname="$1" candidate="$2"
+  local resolved
+  resolved="$(realpath --canonicalize-missing "$candidate" 2>/dev/null || readlink -f "$candidate" 2>/dev/null || echo "$candidate")"
+  case "$resolved" in
+    "$HOME/data"/*) return 0 ;;
+    "$HOME/data") return 0 ;;
+    *) echo "ERROR: $varname='$candidate' (resolves to '$resolved') is outside \$HOME/data. Aborting." >&2; exit 1 ;;
+  esac
+}
+
+if [ -n "${WORKTREE_BASE:-}" ]; then
+  _validate_under_home_data WORKTREE_BASE "$WORKTREE_BASE"
+fi
+if [ -n "${CARGO_TARGET_DIR:-}" ]; then
+  _validate_under_home_data CARGO_TARGET_DIR "$CARGO_TARGET_DIR"
+fi
+
+WORKTREE_BASE="${WORKTREE_BASE:-$HOME/data/$SESSION_ID/review-pr-$PR_NUM}"
+export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$WORKTREE_BASE/cargo-target}"
+
+# Reviewer-specific scratch dir (only if needed for checkout/build):
+REVIEWER_WORKTREE="$WORKTREE_BASE/reviewer-a"  # or reviewer-b
+mkdir -p "$REVIEWER_WORKTREE"
+```
+
+Include this bootstrap verbatim in each reviewer's prompt so the sub-agent knows where to place any checkout or build output. The bootstrap is self-seeding: if the parent runtime pre-sets `WORKTREE_BASE` or `CARGO_TARGET_DIR`, the reviewer respects those only if they canonicalize under `$HOME/data`; otherwise it fails loudly. Without pre-seeded values, it falls back to `$HOME/data/$SESSION_ID/review-pr-$PR_NUM/...`.
+
 ## Step 4 — Spawn 2 reviewers in parallel
 
 Launch both as `general-purpose` foreground sub-agents. Do not wait between them. **Each reviewer must be spawned with `--model gpt-5.4`** (or equivalent model parameter) explicitly — do not inherit from the parent. Cross-model diversity catches issues a same-model pipeline would miss.

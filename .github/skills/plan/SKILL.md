@@ -90,6 +90,26 @@ must be preserved. If not parity-critical: write "n/a — non-parity path".>
 
 ```bash
 SESSION_ID="${CLAUDE_SESSION_ID:-$(date +%Y%m%d-%H%M%S)}"
+
+# Validate pre-seeded overrides: must canonicalize under $HOME/data.
+_validate_under_home_data() {
+  local varname="$1" candidate="$2"
+  local resolved
+  resolved="$(realpath --canonicalize-missing "$candidate" 2>/dev/null || readlink -f "$candidate" 2>/dev/null || echo "$candidate")"
+  case "$resolved" in
+    "$HOME/data"/*) return 0 ;;
+    "$HOME/data") return 0 ;;
+    *) echo "ERROR: $varname='$candidate' (resolves to '$resolved') is outside \$HOME/data. Aborting." >&2; exit 1 ;;
+  esac
+}
+
+if [ -n "${WORKTREE_BASE:-}" ]; then
+  _validate_under_home_data WORKTREE_BASE "$WORKTREE_BASE"
+fi
+if [ -n "${CARGO_TARGET_DIR:-}" ]; then
+  _validate_under_home_data CARGO_TARGET_DIR "$CARGO_TARGET_DIR"
+fi
+
 WORKTREE_BASE="${WORKTREE_BASE:-$HOME/data/$SESSION_ID/plan-$ISSUE}"
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$WORKTREE_BASE/cargo-target}"
 
@@ -98,7 +118,7 @@ CRITIC_WORKTREE="$WORKTREE_BASE/critic-a"  # or critic-b, critic-c
 mkdir -p "$CRITIC_WORKTREE"
 ```
 
-Include this bootstrap verbatim in each critic's prompt so the sub-agent knows where to place any checkout or build output. The bootstrap is self-seeding: if the parent runtime pre-sets `WORKTREE_BASE` or `CARGO_TARGET_DIR`, the critic respects those; otherwise it falls back to `$HOME/data/$SESSION_ID/plan-$ISSUE/...`.
+Include this bootstrap verbatim in each critic's prompt so the sub-agent knows where to place any checkout or build output. The bootstrap is self-seeding: if the parent runtime pre-sets `WORKTREE_BASE` or `CARGO_TARGET_DIR`, the critic respects those only if they canonicalize under `$HOME/data`; otherwise it fails loudly. Without pre-seeded values, it falls back to `$HOME/data/$SESSION_ID/plan-$ISSUE/...`.
 
 Launch three `general-purpose` agents in parallel — do not wait between them. **Each critic must be spawned with `--model gpt-5.4`** (or equivalent model parameter) explicitly — do not inherit from the parent. Cross-model diversity is the whole point of the critic step. Each gets the issue number, the plan-draft comment ID, and a focused brief:
 
