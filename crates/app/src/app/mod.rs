@@ -4328,12 +4328,14 @@ mod tests {
     ///
     /// Verifies that `try_trigger_consensus` skips the consensus trigger when
     /// the node's LCL is behind the tracking slot (i.e. `current_ledger + 1 <
-    /// tracking_slot`), matching stellar-core's `isSynced()` precondition in
-    /// `setupTriggerNextLedger`.
+    /// tracking_slot`), matching stellar-core's soft early-return in
+    /// `HerderImpl::triggerNextLedger()` (HerderImpl.cpp:1456-1461) when
+    /// `!isSynced()`.
     ///
-    /// Parity: stellar-core HerderImpl.cpp — `nextConsensusLedgerIndex()`
-    /// (== `tracking_slot()` in henyey) requires
-    /// `lastClosedLedger + 1 == nextConsensusLedgerIndex`.
+    /// Note: this is distinct from `setupTriggerNextLedger()` which uses
+    /// fail-fast `releaseAssert` preconditions (HerderImpl.cpp:1237-1249).
+    /// Henyey's `try_trigger_consensus` implements the soft skip path, not
+    /// the fatal assertion path.
     #[tokio::test]
     async fn test_try_trigger_consensus_skips_when_lcl_behind_tracking_slot() {
         let dir = tempfile::tempdir().expect("temp dir");
