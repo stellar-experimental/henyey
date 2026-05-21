@@ -1926,9 +1926,11 @@ impl Herder {
 
         // Slot quorum tracker bookkeeping is deferred to
         // process_scp_envelope_with_tx_set, which is the SCP-acceptance
-        // boundary. This matches the timing of stellar-core's
-        // processSCPQueueUpToIndex: envelopes are only SCP-visible (and
-        // thus quorum-relevant) after they pass dependency admission.
+        // boundary. Envelopes are only quorum-relevant after SCP accepts
+        // them (Valid/ValidNew). Note: EXTERNALIZE envelopes for the
+        // current/past slot bypass dependency admission via the bypass
+        // path in process_scp_envelope, so the true boundary is SCP
+        // acceptance, not dependency resolution.
 
         // Pre-fetch tx sets from EXTERNALIZE envelopes immediately so they're
         // available by the time SCP processes the envelope. Uses the strict
