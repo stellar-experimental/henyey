@@ -21,8 +21,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 TEST_ROOT="$REPO_ROOT/data/test-review-pr-snippets"
 
-# ── Source the library under test ─────────────────────────────────────────────
+# ── Source the libraries under test ───────────────────────────────────────────
 source "$SCRIPT_DIR/lib/review-pr-verdicts.sh"
+source "$SCRIPT_DIR/lib/review-pr-merge.sh"
 
 # ── Cleanup ──────────────────────────────────────────────────────────────────
 cleanup() {
@@ -33,7 +34,7 @@ cleanup
 mkdir -p "$TEST_ROOT"
 
 # ── TAP state ────────────────────────────────────────────────────────────────
-TAP_PLAN=13
+TAP_PLAN=21
 TAP_CURRENT=0
 TAP_FAILURES=0
 
@@ -228,6 +229,119 @@ export REVIEW_PR_COMMENTS_FILE="$TEST_ROOT/multi-comments.json"
 VERDICTS=$(fetch_reviewer_verdict_comments 999 "2026-05-19T03:00:00Z")
 STATE=$(latest_reviewer_verdict_state "Correctness" "$VERDICTS")
 assert_eq "APPROVE" "$STATE" "latest comment wins when multiple verdicts exist"
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TEST 9: attempt_merge retries with --auto on auto-hint failure
+# ══════════════════════════════════════════════════════════════════════════════
+# Stub gh so the first --admin call fails with the exact auto-hint error
+# and the second --auto call succeeds.
+
+MERGE_CALL_NUM=0
+mock_merge_auto_hint() {
+  local pr_num="$1" repo="$2" flags="$3"
+  MERGE_CALL_NUM=$((MERGE_CALL_NUM + 1))
+  if [[ "$flags" == *"--admin"* ]]; then
+    echo "X Pull request stellar-experimental/henyey#$pr_num is not mergeable: the merge commit cannot be cleanly created." >&2
+    echo "To have the pull request merged after all the requirements have been met, add the \`--auto\` flag." >&2
+    return 1
+  elif [[ "$flags" == *"--auto"* ]]; then
+    return 0
+  fi
+  return 1
+}
+
+export REVIEW_PR_MERGE_CMD=mock_merge_auto_hint
+MERGE_CALL_NUM=0
+RESULT=$(attempt_merge 2875)
+RC=$?
+assert_eq "auto-merge-armed" "$RESULT" "attempt_merge retries with --auto on auto-hint failure"
+assert_eq "0" "$RC" "attempt_merge returns 0 on auto-merge-armed"
+unset REVIEW_PR_MERGE_CMD
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TEST 10: classify_linked_pr_state prefers merged PR when no open PR exists
+# ══════════════════════════════════════════════════════════════════════════════
+
+echo '[{"number": 2875, "state": "MERGED"}]' > "$TEST_ROOT/linked-prs-merged.json"
+export REVIEW_PR_LINKED_PRS_FILE="$TEST_ROOT/linked-prs-merged.json"
+
+RESULT=$(classify_linked_pr_state 2877)
+assert_eq "merged:2875" "$RESULT" "classify_linked_pr_state returns merged when no open PR"
+unset REVIEW_PR_LINKED_PRS_FILE
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TEST 11: is_auto_merge_armed short-circuits to wait when armed
+# ══════════════════════════════════════════════════════════════════════════════
+
+echo "true" > "$TEST_ROOT/auto-merge-armed.txt"
+export REVIEW_PR_AUTO_MERGE_FILE="$TEST_ROOT/auto-merge-armed.txt"
+
+RESULT=$(is_auto_merge_armed 2875)
+assert_eq "true" "$RESULT" "is_auto_merge_armed returns true when autoMergeRequest is set"
+unset REVIEW_PR_AUTO_MERGE_FILE
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TEST 12: attempt_merge auto rejection stays hard failure
+# ══════════════════════════════════════════════════════════════════════════════
+# When --auto also fails (e.g. autoMergeAllowed: false), result is hard-failure.
+
+mock_merge_auto_both_fail() {
+  local pr_num="$1" repo="$2" flags="$3"
+  if [[ "$flags" == *"--admin"* ]]; then
+    echo "To have the pull request merged after all the requirements have been met, add the \`--auto\` flag." >&2
+    return 1
+  elif [[ "$flags" == *"--auto"* ]]; then
+    echo "auto-merge is not allowed for this repository" >&2
+    return 1
+  fi
+  return 1
+}
+
+export REVIEW_PR_MERGE_CMD=mock_merge_auto_both_fail
+set +e
+RESULT=$(attempt_merge 2875)
+RC=$?
+set -e
+[[ "$RESULT" == hard-failure:* ]] && tap_ok "attempt_merge auto rejection stays hard failure" || tap_fail "attempt_merge auto rejection stays hard failure" "got: $RESULT"
+assert_eq "1" "$RC" "attempt_merge returns 1 on hard failure"
+unset REVIEW_PR_MERGE_CMD
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TEST 13: unexpected admin merge failure stays terminal (no --auto retry)
+# ══════════════════════════════════════════════════════════════════════════════
+
+mock_merge_other_failure() {
+  local pr_num="$1" repo="$2" flags="$3"
+  if [[ "$flags" == *"--admin"* ]]; then
+    echo "permission denied: token lacks admin access" >&2
+    return 1
+  fi
+  # Should never reach --auto path
+  echo "UNEXPECTED: should not have retried with --auto" >&2
+  return 1
+}
+
+export REVIEW_PR_MERGE_CMD=mock_merge_other_failure
+set +e
+RESULT=$(attempt_merge 2875)
+RC=$?
+set -e
+[[ "$RESULT" == "hard-failure:permission denied: token lacks admin access" ]] && \
+  tap_ok "unexpected admin merge failure stays terminal" || \
+  tap_fail "unexpected admin merge failure stays terminal" "got: $RESULT"
+unset REVIEW_PR_MERGE_CMD
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TEST 14: SKILL.md references merge helper and wait path
+# ══════════════════════════════════════════════════════════════════════════════
+
+SKILL_FILE="$REPO_ROOT/.github/skills/review-pr/SKILL.md"
+if grep -q 'review-pr-merge.sh' "$SKILL_FILE" && grep -q 'auto-merge.*armed' "$SKILL_FILE"; then
+  tap_ok "SKILL.md references merge helper and auto-merge armed path"
+else
+  tap_fail "SKILL.md references merge helper and auto-merge armed path" \
+    "SKILL.md missing references to review-pr-merge.sh or auto-merge armed"
+fi
 
 # ── Summary ──────────────────────────────────────────────────────────────────
 unset REVIEW_PR_COMMENTS_FILE
