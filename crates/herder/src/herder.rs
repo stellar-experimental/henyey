@@ -176,6 +176,23 @@ pub enum TriggerOutcome {
     /// LCL advanced during `build_nomination_value`; the value is for an
     /// already-closed slot and was not broadcast.
     SkippedStale,
+    /// Observer (non-validator) built and cached the tx set for this slot
+    /// without entering SCP nomination. Parity: stellar-core
+    /// `HerderImpl::triggerNextLedger` lines 1546-1625 — observers stop
+    /// after `addTxSet` / cache publication and before `makeStellarValue`.
+    ObserverCached,
+}
+
+/// Intermediate result from [`Herder::build_and_cache_candidate_tx_set`]
+/// carrying data needed by the validator-only signing step in
+/// [`Herder::build_nomination_value`].
+struct CandidateTxSetParts {
+    tx_set_hash: Hash256,
+    close_time: u64,
+    lcl_close_time: u64,
+    header: LedgerHeader,
+    max_soroban_tx_set_size: Option<u32>,
+    config_ctx: Option<ConfigUpgradeContext>,
 }
 
 /// Outcome of [`Herder::handle_nomination_timeout`].
@@ -2409,13 +2426,11 @@ impl Herder {
     /// This is entirely synchronous (parking_lot locks + CPU). It was
     /// previously declared `async` but had no `.await` points.
     pub fn trigger_next_ledger(&self, ledger_seq: u32) -> Result<TriggerOutcome> {
-        if !self.is_validator() {
-            return Err(HerderError::NotValidating);
-        }
-
         if !self.is_tracking() {
             return Err(HerderError::NotValidating);
         }
+
+        let is_validator = self.is_validator();
 
         let slot = ledger_seq as u64;
 
@@ -2461,6 +2476,37 @@ impl Herder {
         self.scp_driver.record_slot_activity(slot);
 
         let t0 = std::time::Instant::now();
+
+        if !is_validator {
+            // --- Observer path ---
+            // Parity: stellar-core HerderImpl.cpp:1546-1625 — observers build
+            // the candidate tx set, self-validate, and publish it into the
+            // pending/fetch cache, then stop before `makeStellarValue`/`nominate`.
+            self.build_and_cache_candidate_tx_set()
+                .ok_or_else(|| HerderError::Internal("Failed to build candidate tx set".into()))?;
+            let build_value_ms = t0.elapsed().as_millis();
+
+            // Drain ready fetching envelopes after cache publication.
+            self.process_ready_fetching_envelopes();
+
+            // Post-build stale check (same as validator path).
+            if !self.lcl_matches_slot(slot) {
+                tracing::warn!(
+                    requested_slot = slot,
+                    "Skipping: LCL advanced during observer build"
+                );
+                return Ok(TriggerOutcome::SkippedStale);
+            }
+
+            tracing::debug!(
+                slot,
+                build_value_ms,
+                "trigger_next_ledger: observer cached tx set"
+            );
+            return Ok(TriggerOutcome::ObserverCached);
+        }
+
+        // --- Validator path ---
         let value = self
             .build_nomination_value()
             .ok_or_else(|| HerderError::Internal("Failed to build nomination value".into()))?;
@@ -2475,11 +2521,7 @@ impl Herder {
         // running on a separate `spawn_blocking` may have advanced LCL while
         // we were inside `build_nomination_value` and the subsequent envelope
         // drain. If so, the value we just built is for a slot the network has
-        // already closed; broadcasting it would be wasted SCP traffic and
-        // would cause this validator to keep nominating against a stale slot
-        // until drift detection trips. This re-check complements the
-        // pre-build entry check above and covers the race-driven case the
-        // entry check cannot detect.
+        // already closed; broadcasting it would be wasted SCP traffic.
         //
         // The check must come BEFORE the cache write below — caching a value
         // for a stale slot would mislead `handle_nomination_timeout`'s
@@ -2493,10 +2535,7 @@ impl Herder {
         }
 
         // Cache the nomination value for this slot so timeout retries reuse it,
-        // matching stellar-core's by-value lambda capture. On `SkippedStale`
-        // (returned above) we deliberately do NOT clear pre-existing entries:
-        // the cache key is `(slot, value)` and `handle_nomination_timeout`
-        // filters by slot, so stale entries are unreachable.
+        // matching stellar-core's by-value lambda capture.
         *self.cached_nomination_value.write() = Some((slot, value.clone()));
 
         // Get previous value for priority calculation — reads from LCL when
@@ -2875,13 +2914,146 @@ impl Herder {
 
     /// Build a nomination-ready SCP `Value`: transaction set + signed StellarValue.
     ///
-    /// Called by `trigger_next_ledger` to build the initial nomination value. Steps:
-    ///   1. Read ledger state (previous_hash, max_txs, starting_seq)
-    ///   2. Build generalized transaction set and cache it
-    ///   3. Compute close_time with monotonic clamp (parity: stellar-core)
-    ///   4. Merge config + runtime upgrades, filter already-applied
-    ///   5. Sign via `make_stellar_value` and XDR-encode to `Value`
+    /// Called by `trigger_next_ledger` (validator path) to build the initial
+    /// nomination value. Delegates the heavy build/validate/cache work to
+    /// [`build_and_cache_candidate_tx_set`] then adds the validator-only
+    /// signing step (upgrades + `make_stellar_value`).
     fn build_nomination_value(&self) -> Option<Value> {
+        let parts = self.build_and_cache_candidate_tx_set()?;
+
+        // 4. Upgrades: config + runtime, filtered against current state.
+        // Use lcl_close_time (not candidate close_time) for upgrade parameter
+        // decisions to prevent one-ledger-early activation (#1166).
+        let state = CurrentLedgerState {
+            close_time: parts.lcl_close_time,
+            protocol_version: parts.header.ledger_version,
+            base_fee: parts.header.base_fee,
+            max_tx_set_size: parts.header.max_tx_set_size,
+            base_reserve: parts.header.base_reserve,
+            flags: match &parts.header.ext {
+                stellar_xdr::curr::LedgerHeaderExt::V0 => 0,
+                stellar_xdr::curr::LedgerHeaderExt::V1(ext) => ext.flags,
+            },
+            max_soroban_tx_set_size: parts.max_soroban_tx_set_size,
+        };
+
+        let mut upgrade_list: Vec<LedgerUpgrade> = self
+            .config
+            .proposed_upgrades
+            .iter()
+            .filter(|upgrade| match upgrade {
+                LedgerUpgrade::Version(v) => *v != state.protocol_version,
+                LedgerUpgrade::BaseFee(f) => *f != state.base_fee,
+                LedgerUpgrade::MaxTxSetSize(s) => *s != state.max_tx_set_size,
+                LedgerUpgrade::BaseReserve(r) => *r != state.base_reserve,
+                LedgerUpgrade::Flags(f) => *f != state.flags,
+                LedgerUpgrade::MaxSorobanTxSetSize(s) => {
+                    state.max_soroban_tx_set_size.map_or(true, |c| *s != c)
+                }
+                // Parity: gate config upgrades through the same makeFromKey +
+                // isValidForApply + upgradeNeeded checks as runtime upgrades.
+                LedgerUpgrade::Config(_) => parts
+                    .config_ctx
+                    .as_ref()
+                    .and_then(|ctx| match ctx.should_propose() {
+                        Ok(v) => Some(v),
+                        Err(e) => {
+                            tracing::error!(
+                                error = %e,
+                                "broken ledger state in config upgrade check"
+                            );
+                            None
+                        }
+                    })
+                    .unwrap_or(false),
+            })
+            .cloned()
+            .collect();
+
+        // If should_propose() returned Err above (broken ledger state), abort
+        // nomination. Check by looking for the error condition: config_ctx is
+        // Some but proposed_upgrades contained a Config that we couldn't check.
+        // (The error was already logged above.)
+
+        let runtime_upgrades = match self
+            .runtime_upgrades
+            .read()
+            .create_upgrades_for(&state, parts.config_ctx.as_ref())
+        {
+            Ok(upgrades) => upgrades,
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    "broken ledger state in runtime config upgrade check; aborting nomination"
+                );
+                return None;
+            }
+        };
+        for upgrade in runtime_upgrades {
+            let dominated = upgrade_list.iter().any(|existing| {
+                std::mem::discriminant(existing) == std::mem::discriminant(&upgrade)
+            });
+            if !dominated {
+                upgrade_list.push(upgrade);
+            }
+        }
+
+        // Sort upgrades by type to match stellar-core's deterministic ordering
+        // (VERSION=0, BASE_FEE=1, MAX_TX_SET_SIZE=2, BASE_RESERVE=3, FLAGS=4,
+        // CONFIG=5, MAX_SOROBAN_TX_SET_SIZE=6).
+        upgrade_list.sort_by_key(|u| match u {
+            LedgerUpgrade::Version(_) => 0u32,
+            LedgerUpgrade::BaseFee(_) => 1,
+            LedgerUpgrade::MaxTxSetSize(_) => 2,
+            LedgerUpgrade::BaseReserve(_) => 3,
+            LedgerUpgrade::Flags(_) => 4,
+            LedgerUpgrade::Config(_) => 5,
+            LedgerUpgrade::MaxSorobanTxSetSize(_) => 6,
+        });
+
+        // Parity: stellar-core logs and skips individual upgrades whose encoded
+        // size exceeds UpgradeType::max_size() (HerderImpl.cpp:1572-1587).
+        // The XDR encode itself should never fail for a valid LedgerUpgrade.
+        let upgrades: Vec<UpgradeType> = upgrade_list
+            .iter()
+            .filter_map(|upgrade| {
+                let bytes = upgrade
+                    .to_xdr(Limits::none())
+                    .expect("BUG: failed to encode LedgerUpgrade to XDR");
+                match bytes.try_into() {
+                    Ok(b) => Some(UpgradeType(b)),
+                    Err(_) => {
+                        error!(
+                            upgrade_type = ?std::mem::discriminant(upgrade),
+                            "upgrade blob exceeds UpgradeType max size — skipping"
+                        );
+                        None
+                    }
+                }
+            })
+            .collect();
+
+        // 5. Sign & encode
+        let stellar_value = self
+            .make_stellar_value(parts.tx_set_hash, parts.close_time, upgrades)
+            .ok()?;
+        let value_bytes = henyey_common::xdr_to_bytes(&stellar_value);
+        let value = Value(value_bytes.try_into().ok()?);
+        Some(value)
+    }
+
+    /// Shared build/validate/cache pipeline for the next-slot candidate tx set.
+    ///
+    /// Parity: stellar-core `HerderImpl::triggerNextLedger` lines 1546-1625 —
+    /// all work up to (but not including) `makeStellarValue` and `nominate`.
+    /// Both validators and observers execute this path; observers stop here.
+    ///
+    /// Steps:
+    ///   1. Read ledger state (previous_hash, max_txs, starting_seq)
+    ///   2. Compute close_time with monotonic clamp
+    ///   3. Build generalized transaction set
+    ///   3.5. Self-validate and cache the built tx set
+    fn build_and_cache_candidate_tx_set(&self) -> Option<CandidateTxSetParts> {
         // 1. Ledger state — create ONE snapshot for the entire nomination pass.
         // This snapshot is shared between build_starting_seq_map, the
         // trim_invalid_two_phase validation, and config upgrade context.
@@ -3072,124 +3244,14 @@ impl Herder {
             snapshot_providers.as_ref(),
         )?;
 
-        // 4. Upgrades: config + runtime, filtered against current state.
-        // Use lcl_close_time (not candidate close_time) for upgrade parameter
-        // decisions to prevent one-ledger-early activation (#1166).
-        let state = CurrentLedgerState {
-            close_time: lcl_close_time,
-            protocol_version: header.ledger_version,
-            base_fee: header.base_fee,
-            max_tx_set_size: header.max_tx_set_size,
-            base_reserve: header.base_reserve,
-            flags: match &header.ext {
-                stellar_xdr::curr::LedgerHeaderExt::V0 => 0,
-                stellar_xdr::curr::LedgerHeaderExt::V1(ext) => ext.flags,
-            },
-            max_soroban_tx_set_size: max_soroban_tx_set_size,
-        };
-
-        let mut upgrade_list: Vec<LedgerUpgrade> = self
-            .config
-            .proposed_upgrades
-            .iter()
-            .filter(|upgrade| match upgrade {
-                LedgerUpgrade::Version(v) => *v != state.protocol_version,
-                LedgerUpgrade::BaseFee(f) => *f != state.base_fee,
-                LedgerUpgrade::MaxTxSetSize(s) => *s != state.max_tx_set_size,
-                LedgerUpgrade::BaseReserve(r) => *r != state.base_reserve,
-                LedgerUpgrade::Flags(f) => *f != state.flags,
-                LedgerUpgrade::MaxSorobanTxSetSize(s) => {
-                    state.max_soroban_tx_set_size.map_or(true, |c| *s != c)
-                }
-                // Parity: gate config upgrades through the same makeFromKey +
-                // isValidForApply + upgradeNeeded checks as runtime upgrades.
-                LedgerUpgrade::Config(_) => config_ctx
-                    .as_ref()
-                    .and_then(|ctx| match ctx.should_propose() {
-                        Ok(v) => Some(v),
-                        Err(e) => {
-                            tracing::error!(
-                                error = %e,
-                                "broken ledger state in config upgrade check"
-                            );
-                            None
-                        }
-                    })
-                    .unwrap_or(false),
-            })
-            .cloned()
-            .collect();
-
-        // If should_propose() returned Err above (broken ledger state), abort
-        // nomination. Check by looking for the error condition: config_ctx is
-        // Some but proposed_upgrades contained a Config that we couldn't check.
-        // (The error was already logged above.)
-
-        let runtime_upgrades = match self
-            .runtime_upgrades
-            .read()
-            .create_upgrades_for(&state, config_ctx.as_ref())
-        {
-            Ok(upgrades) => upgrades,
-            Err(e) => {
-                tracing::error!(
-                    error = %e,
-                    "broken ledger state in runtime config upgrade check; aborting nomination"
-                );
-                return None;
-            }
-        };
-        for upgrade in runtime_upgrades {
-            let dominated = upgrade_list.iter().any(|existing| {
-                std::mem::discriminant(existing) == std::mem::discriminant(&upgrade)
-            });
-            if !dominated {
-                upgrade_list.push(upgrade);
-            }
-        }
-
-        // Sort upgrades by type to match stellar-core's deterministic ordering
-        // (VERSION=0, BASE_FEE=1, MAX_TX_SET_SIZE=2, BASE_RESERVE=3, FLAGS=4,
-        // CONFIG=5, MAX_SOROBAN_TX_SET_SIZE=6).
-        upgrade_list.sort_by_key(|u| match u {
-            LedgerUpgrade::Version(_) => 0u32,
-            LedgerUpgrade::BaseFee(_) => 1,
-            LedgerUpgrade::MaxTxSetSize(_) => 2,
-            LedgerUpgrade::BaseReserve(_) => 3,
-            LedgerUpgrade::Flags(_) => 4,
-            LedgerUpgrade::Config(_) => 5,
-            LedgerUpgrade::MaxSorobanTxSetSize(_) => 6,
-        });
-
-        // Parity: stellar-core logs and skips individual upgrades whose encoded
-        // size exceeds UpgradeType::max_size() (HerderImpl.cpp:1572-1587).
-        // The XDR encode itself should never fail for a valid LedgerUpgrade.
-        let upgrades: Vec<UpgradeType> = upgrade_list
-            .iter()
-            .filter_map(|upgrade| {
-                let bytes = upgrade
-                    .to_xdr(Limits::none())
-                    .expect("BUG: failed to encode LedgerUpgrade to XDR");
-                match bytes.try_into() {
-                    Ok(b) => Some(UpgradeType(b)),
-                    Err(_) => {
-                        error!(
-                            upgrade_type = ?std::mem::discriminant(upgrade),
-                            "upgrade blob exceeds UpgradeType max size — skipping"
-                        );
-                        None
-                    }
-                }
-            })
-            .collect();
-
-        // 5. Sign & encode
-        let stellar_value = self
-            .make_stellar_value(*tx_set.hash(), close_time, upgrades)
-            .ok()?;
-        let value_bytes = henyey_common::xdr_to_bytes(&stellar_value);
-        let value = Value(value_bytes.try_into().ok()?);
-        Some(value)
+        Some(CandidateTxSetParts {
+            tx_set_hash: *tx_set.hash(),
+            close_time,
+            lcl_close_time,
+            header,
+            max_soroban_tx_set_size,
+            config_ctx,
+        })
     }
 
     /// Run self-validation on `tx_set` and, on success, cache it. On failure

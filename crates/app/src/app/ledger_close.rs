@@ -1781,9 +1781,8 @@ impl App {
         // handler at the end of the select-loop chain.
         if success {
             // Trigger consensus immediately after close, matching stellar-core.
-            if self.is_validator {
-                self.try_trigger_consensus().await;
-            }
+            // Both validators and watchers participate (HERDER §5.2).
+            self.try_trigger_consensus().await;
 
             *self.last_externalized_at.write().await = self.clock.now();
             self.reset_tx_set_tracking().await;
