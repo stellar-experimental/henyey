@@ -2,10 +2,10 @@
 
 **Spec version:** 26 (stellar-core v26.0.1 / Protocol 26)
 **Crate:** crates/ledger (with cross-references to crates/app)
-**Last updated:** 2026-05-13
-**Overall adherence:** 79%
+**Last updated:** 2026-05-21
+**Overall adherence:** 82%
 
-**Counts:** Full 56 | Partial 9 | Absent 6 | Drift 3 | N/A 11
+**Counts:** Full 58 | Partial 8 | Absent 5 | Drift 3 | N/A 11
 
 > **Architectural note.** `crates/ledger` deliberately replaces stellar-core's
 > nested `LedgerTxn` chain with a flat `CloseLedgerState` wrapper composed of
@@ -28,7 +28,7 @@
 | §4.2 step 10 | `txSet.getContentsHash() == ledgerData.value.txSetHash` | Full | app/ledger_close.rs:1962 |
 | §4.2 step 12 | `prepareForApply` | Partial | app/ledger_close.rs:1982 (called pre-close, not inside `begin_close`) |
 | §4.3 | LedgerCloseMeta construction | Full | manager.rs:5832 `build_ledger_close_meta` |
-| §4.4 | Fee phase (`processFeesSeqNums`) | Partial | manager.rs:4044 `pre_deduct_all_fees_on_delta` (no `MAX_SEQ_NUM_TO_APPLY` markers) |
+| §4.4 | Fee phase (`processFeesSeqNums`) | Full | manager.rs:4044 `pre_deduct_all_fees_on_delta`; `MAX_SEQ_NUM_TO_APPLY` markers installed via `execution/tx_set.rs:165,347-371` `compute_max_seq_num_to_apply` |
 | §4.5 | Apply phase (sequential / parallel split) | Full | manager.rs:4044-4177 |
 | §4.6 | `txSetResultHash = sha256(txResultSet)` | Full | manager.rs:4768 |
 | §4.7 | `APPLYING → COMMITTING` transition | N/A | No `ApplyState` phase machine in Rust |
@@ -38,7 +38,7 @@
 | §4.11 | 8-step subtle sequence | Partial | Most steps inlined; LCL update before meta (Drift) |
 | §5 | Apply state phase machine | N/A | No `SETTING_UP_STATE / READY_TO_APPLY / APPLYING / COMMITTING` states |
 | §6.1 | Apply order, per-source seq-num ordering | Full | close.rs:603 `sorted_for_apply_sequential` |
-| §6.2 step 4 (P19+) | `accToMaxSeq` + `mergeSeen` | Absent | No `MAX_SEQ_NUM_TO_APPLY` plumbing in ledger crate |
+| §6.2 step 4 (P19+) | `accToMaxSeq` + `mergeSeen` | Full | `execution/tx_set.rs:347-371` `compute_max_seq_num_to_apply` scans txs for AccountMerge, builds per-source max-seq map, installs via `set_max_seq_num_to_apply`; regression-tested by `test_audit_577_max_seq_num_to_apply_with_pre_charged` |
 | §6.4 step 3 | `subSeed = SHA-256(base \|\| index)` | Full | execution/signatures.rs:615 `sub_sha256` |
 | §6.5 | Parallel Soroban phase (stages/clusters) | Full | execution/tx_set.rs:644 `execute_soroban_parallel_phase` |
 | §6.6 | `processPostTxSetApply` (Soroban refunds) | Full | execution/tx_set.rs:242,902 |
@@ -102,7 +102,7 @@
 - **§4.2 step 10 txset contents-hash.** Full. app/ledger_close.rs:1962 — done at app layer; ledger crate trusts `close_data.tx_set_hash()`.
 - **§4.2 step 11 `scpValue` assignment.** Full. manager.rs:4669 — `tx_set_hash` and `close_time` written into `header.scp_value` via `NextHeaderFields`.
 - **§4.2 step 12 `prepareForApply`.** Partial. app/ledger_close.rs:1982 validates pre-close but the ledger crate itself does not re-call it inside `begin_close`. Acceptable defense-in-depth boundary.
-- **§4.4 step 14-15 (fee phase + per-source seq).** Partial. manager.rs:4057 `pre_deduct_all_fees_on_delta` charges fees in a unified pre-pass; sequence-number advancement and pre-conditions are performed inside `TransactionExecutor::execute_transaction_with_fee_mode`. The `MAX_SEQ_NUM_TO_APPLY` marker (§4.4 step 15 / §6.2 step 7) is **Absent**.
+- **§4.4 step 14-15 (fee phase + per-source seq).** Full. manager.rs:4057 `pre_deduct_all_fees_on_delta` charges fees in a unified pre-pass; sequence-number advancement and pre-conditions are performed inside `TransactionExecutor::execute_transaction_with_fee_mode`. The `MAX_SEQ_NUM_TO_APPLY` marker (§4.4 step 15 / §6.2 step 7) is implemented at `execution/tx_set.rs:165,347-371` via `compute_max_seq_num_to_apply`.
 - **§4.6 result-set hash.** Full. manager.rs:4768 — streamed sha256 of all `TransactionResult` entries.
 - **§4.8 upgrades.** Full. close.rs:1358 `apply_to_header` handles `Version/BaseFee/MaxTxSetSize/BaseReserve/Flags`; manager.rs:4395 wraps each in capture/skip-on-error (parity with stellar-core's per-upgrade try/catch). `MaxSorobanTxSetSize` applied via close.rs:1412.
 - **§4.9 seal + persist.** Partial. manager.rs:4757 `commit`:
@@ -121,8 +121,8 @@
 - **§6.1 apply order.** Full. close.rs:603 `sorted_for_apply_sequential` xors `txSetHash` into account ordering; per-source seq strictly preserved.
 - **§6.2 fee phase.**
   - Step 1-3 (per-tx fee charge, seq advance, result capture): Full — fee deducted via `LedgerDelta::deduct_fee_from_account` (delta.rs:435) and `execution::pre_deduct_all_fees_on_delta`.
-  - Step 4 `accToMaxSeq` / `mergeSeen`: **Absent**. Two searches: grep `MAX_SEQ_NUM_TO_APPLY` and grep `mergeSeen` return no hits in crates/ledger; account-merge sequence-number safety is delegated to per-tx pre-condition check.
-  - Step 7 `MAX_SEQ_NUM_TO_APPLY` synthesis: **Absent** (same searches).
+  - Step 4 `accToMaxSeq` / `mergeSeen`: **Full**. `execution/tx_set.rs:347-371` `compute_max_seq_num_to_apply` scans all transactions for `AccountMerge` operations, builds a per-source max-sequence map, and installs it on the executor via `set_max_seq_num_to_apply`. Called at `tx_set.rs:165` during sequential-phase setup. Regression-tested by `test_audit_577_max_seq_num_to_apply_with_pre_charged`.
+  - Step 7 `MAX_SEQ_NUM_TO_APPLY` synthesis: **Full** (same function at tx_set.rs:347-371).
 - **§6.3 phase selection.** Full. manager.rs:4044 dispatches to `execute_soroban_parallel_phase` when V1 Soroban phase present.
 - **§6.4 sequential phase.** Full. `applySequentialPhase` steps 1-7 are inlined in `execution::run_transactions_on_executor` (execution/tx_set.rs:122) with `prepend_fee_event` for classic events (manager.rs:4218).
 - **§6.5 parallel Soroban phase.**
@@ -252,19 +252,17 @@ These `// LEDGER_SPEC §X` comments cite section numbers that have moved or are 
 ## Absent — Correctness-Relevant Gaps
 
 1. **INV-L4 `ConservationOfLumens`.** Not enforced at runtime. The downstream invariant crate has a stub (crates/invariant/PARITY_STATUS.md:25). Without it, an arithmetic bug in fee/refund/inflation paths could silently mint or burn XLM.
-2. **§6.2 step 4/7 `MAX_SEQ_NUM_TO_APPLY` + `mergeSeen`.** No plumbing for the Protocol-19+ marker that lets a later tx still observe its declared sequence number after an earlier tx merges the source. Validated by two searches: `grep MAX_SEQ_NUM_TO_APPLY` and `grep mergeSeen` over `crates/ledger/src/`. The actual cross-tx visibility may still be correct (a merged account can't re-appear in the same ledger absent restoration), but the explicit guard is missing.
-3. **§4.1 step 2 `finishPendingCompilation`.** No drain of pending Wasm compilations at close entry. Rust's `rebuild_module_cache` runs synchronously at upgrade boundaries (manager.rs:5694), so the failure mode (close starts while a compile thread is mid-flight) doesn't exist in the current single-threaded compile design — but if multi-threaded compile is added later this gap matters.
-4. **§6.5 `checkAllTxBundleInvariants`.** Parallel-cluster post-apply invariant hook absent (search: `grep checkAllTxBundleInvariants` and `grep tx_bundle_invariant` both empty). The single-tx invariant manager (execution/mod.rs:802) only fires per-op in classic path.
-5. **§14.2 root `AccountEntry` synthesis.** `initialize` does not create the network-id-derived root account; this must be done by the caller (typically by feeding genesis buckets). Replay/test flows that bypass the catchup-from-buckets path will not get a root account.
-6. **§12.2 P23 `Protocol23CorruptionDataVerifier`.** Optional in spec; not implemented. Acceptable for parity but flagged for completeness.
+2. **§4.1 step 2 `finishPendingCompilation`.** No drain of pending Wasm compilations at close entry. Rust's `rebuild_module_cache` runs synchronously at upgrade boundaries (manager.rs:5694), so the failure mode (close starts while a compile thread is mid-flight) doesn't exist in the current single-threaded compile design — but if multi-threaded compile is added later this gap matters.
+3. **§6.5 `checkAllTxBundleInvariants`.** Parallel-cluster post-apply invariant hook absent (search: `grep checkAllTxBundleInvariants` and `grep tx_bundle_invariant` both empty). The single-tx invariant manager (execution/mod.rs:802) only fires per-op in classic path.
+4. **§14.2 root `AccountEntry` synthesis.** `initialize` does not create the network-id-derived root account; this must be done by the caller (typically by feeding genesis buckets). Replay/test flows that bypass the catchup-from-buckets path will not get a root account.
+5. **§12.2 P23 `Protocol23CorruptionDataVerifier`.** Optional in spec; not implemented. Acceptable for parity but flagged for completeness.
 
 ---
 
 ## Recommendations
 
 1. **High priority — INV-L4.** Implement `ConservationOfLumens` runtime check; protocol-deterministic safety property.
-2. **High priority — §6.2 step 4/7.** Add explicit `MAX_SEQ_NUM_TO_APPLY` tracking (or confirm equivalence via a documented invariant that henyey's seq-bump-at-execute-time covers the same case).
-3. **Medium — §13.1 Drift.** Gate meta version on `initialLedgerVers` even if `MIN_LEDGER_PROTOCOL_VERSION=24`; cheap defense-in-depth.
-4. **Medium — §4.11 step ordering.** Re-order `commit_close` to occur AFTER `build_ledger_close_meta` to match the spec sequence and INV-L13 expectations.
-5. **Low — dangling anchors.** A mechanical pass renumbering 13 `// Spec: LEDGER_SPEC §...` comments to the regenerated v26.0.1 section numbers (table above).
-6. **Low — §14.2 `startNewLedger`.** Provide a `start_new_ledger(network_id) -> Result<()>` helper that synthesizes the genesis bucket lists with the network-id-derived root account.
+2. **Medium — §13.1 Drift.** Gate meta version on `initialLedgerVers` even if `MIN_LEDGER_PROTOCOL_VERSION=24`; cheap defense-in-depth.
+3. **Medium — §4.11 step ordering.** Re-order `commit_close` to occur AFTER `build_ledger_close_meta` to match the spec sequence and INV-L13 expectations.
+4. **Low — dangling anchors.** A mechanical pass renumbering 13 `// Spec: LEDGER_SPEC §...` comments to the regenerated v26.0.1 section numbers (table above).
+5. **Low — §14.2 `startNewLedger`.** Provide a `start_new_ledger(network_id) -> Result<()>` helper that synthesizes the genesis bucket lists with the network-id-derived root account.
