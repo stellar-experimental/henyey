@@ -6,7 +6,7 @@
 **Overall adherence:** 82%
 
 Counts (excluding Drift and N/A from denominator):
-**Full 45 | Partial 9 | Absent 1 | Drift 2 | N/A 2**
+**Full 81 | Partial 15 | Absent 3 | Drift 2 | N/A 2**
 
 ## Summary table
 
@@ -113,7 +113,7 @@ Counts (excluding Drift and N/A from denominator):
 | INV-O10 (SEND_MORE_EXTENDED validation) | Full | `flow_control.rs:979-1010` (numBytes!=0 + overflow guards) |
 | INV-O11 (Recv-side batch grants) | Partial | `flow_control.rs:1038-1065` emits SEND_MORE_EXTENDED on batch threshold, but the spec's `releaseAssert(mFloodDataProcessed <= BATCH_SIZE)` upper bound is not asserted |
 | INV-O12 (One PEERS per connection) | Full | `manager/peer_loop.rs:512-531,712-717` |
-| INV-O13 (Outbound role rejects PEERS) | Drift | `manager/peer_loop.rs:522-524` rejects PEERS in **Inbound** role; spec says outbound role (`WE_CALLED_REMOTE`) MUST NOT receive PEERS. Verify: spec text §5.5 line 532 says "an inbound role peer MUST NOT receive `PEERS`" — Rust enforces the same. **Re-read confirms code matches.** Reclassify to Full. |
+| INV-O13 (Outbound role rejects PEERS) | Full | `manager/peer_loop.rs:522-524` rejects PEERS in **Inbound** role; spec says "an inbound role peer MUST NOT receive `PEERS`" — Rust enforces the same. Re-read confirms code matches. |
 | INV-O14 (No flood while not synced) | Full | `manager/peer_loop.rs:693-697` |
 | INV-O15 (Survey signature verification) | Full | App-owned: `crates/app/src/app/survey_impl.rs:941-956` `verify_survey_signature` uses `henyey_crypto::verify_from_raw_key` on Ed25519 key extracted from `NodeId`; called before processing survey start/stop/request/response |
 | INV-O16 (Survey rate limit) | Full | `survey.rs:268-356` (`SurveyMessageLimiter`) |
@@ -123,7 +123,7 @@ Counts (excluding Drift and N/A from denominator):
 
 Re-evaluation: INV-O13 — code is correct. Spec says "An inbound role peer (`REMOTE_CALLED_US`) MUST NOT receive `PEERS`"; the Rust code `if direction == ConnectionDirection::Inbound { return RejectWrongDirection }` matches that exactly. Reclassified to **Full** in the summary count.
 
-Corrected invariant tally: **Full 18 | Partial 1 | Absent 0**.
+Corrected invariant tally: **Full 17 | Partial 2 | Absent 0**.
 
 ## Detailed findings
 
