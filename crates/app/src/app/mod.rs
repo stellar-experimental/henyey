@@ -4372,6 +4372,68 @@ mod tests {
         );
     }
 
+    /// Regression test for #2869 — HERDER §5.2 non-validator txset build + cache parity.
+    ///
+    /// Verifies that a watcher App can call `try_trigger_consensus()` and have
+    /// the locally-built tx set cached without error, and that a second call
+    /// on the same slot is a no-op (per-slot latch).
+    ///
+    /// Pre-fix: FAILS because `try_trigger_consensus` is never called for
+    /// watchers (guarded by `if self.is_validator`) and even if reached,
+    /// the herder returns `NotValidating`.
+    /// Post-fix: PASSES — watcher callers reach the shared herder path and
+    /// the app-side slot latch suppresses repeat polling.
+    #[tokio::test]
+    async fn test_try_trigger_consensus_watcher_caches_next_slot_tx_set_once() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-test.db");
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
+
+        // Default config has is_validator = false (watcher mode).
+        assert!(!config.node.is_validator, "test requires watcher config");
+
+        let app = App::new(config).await.unwrap();
+
+        // Bootstrap the herder into tracking state.
+        app.herder.bootstrap(0);
+        assert!(app.herder.is_tracking(), "herder must be tracking");
+        assert!(!app.herder.is_validator(), "herder must NOT be a validator");
+
+        // First call: should build and cache the tx set for slot 1.
+        let attempts_before = app.consensus_trigger_attempts.load(Ordering::Relaxed);
+        app.try_trigger_consensus().await;
+        let attempts_after = app.consensus_trigger_attempts.load(Ordering::Relaxed);
+
+        // Verify that try_trigger_consensus actually attempted the trigger
+        // (reached the herder call, not short-circuited).
+        assert!(
+            attempts_after > attempts_before,
+            "watcher try_trigger_consensus should attempt the trigger (got {} before, {} after)",
+            attempts_before,
+            attempts_after
+        );
+
+        // The tx set should be cached.
+        let cached = app.herder.stats().cached_tx_sets;
+        assert!(
+            cached > 0,
+            "watcher should have cached a tx set after try_trigger_consensus"
+        );
+
+        // Second call on the same slot: should be a no-op (watcher latch).
+        let attempts_before2 = app.consensus_trigger_attempts.load(Ordering::Relaxed);
+        app.try_trigger_consensus().await;
+        let attempts_after2 = app.consensus_trigger_attempts.load(Ordering::Relaxed);
+
+        // The latch should prevent a second trigger attempt for the same slot.
+        assert_eq!(
+            attempts_after2, attempts_before2,
+            "second watcher trigger on same slot should be latched (no-op)"
+        );
+    }
+
     #[tokio::test]
     async fn test_sync_recovery_callback_is_applying_ledger() {
         let dir = tempfile::tempdir().expect("temp dir");

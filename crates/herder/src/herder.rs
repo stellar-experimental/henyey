@@ -5847,6 +5847,62 @@ mod tests {
         );
     }
 
+    /// Regression test for #2869 — HERDER §5.2 non-validator txset build + cache parity.
+    ///
+    /// Verifies that an observer herder (non-validator) in tracking mode can
+    /// call `trigger_next_ledger` and have the locally-built tx set published
+    /// into the cache (queryable via `has_tx_set`/`get_tx_set`) WITHOUT
+    /// creating any SCP nomination state for that slot.
+    ///
+    /// Pre-fix: FAILS because `trigger_next_ledger` returns
+    /// `Err(HerderError::NotValidating)` before any tx set is built.
+    /// Post-fix: PASSES — observers run the shared build/cache path and stop
+    /// before `cached_nomination_value` / `scp.nominate`.
+    #[test]
+    fn test_trigger_next_ledger_observer_publishes_tx_set_to_cache_without_nominating() {
+        // Create an observer herder (no secret key, is_validator=false).
+        let config = HerderConfig {
+            is_validator: false,
+            ..HerderConfig::default()
+        };
+        let herder = Herder::new(config, make_default_lm(), TimerManagerHandle::no_op());
+
+        // Bootstrap into tracking state so the is_tracking() check passes.
+        herder.bootstrap(0);
+        assert!(
+            herder.is_tracking(),
+            "herder should be tracking after bootstrap"
+        );
+        assert!(!herder.is_validator(), "herder should NOT be a validator");
+
+        // Call trigger_next_ledger for the next slot (LCL=0, so next=1).
+        let result = herder.trigger_next_ledger(1);
+
+        // Post-fix: should succeed with ObserverCached (or Triggered variant).
+        let outcome = result.expect(
+            "observer trigger_next_ledger should succeed after fix (currently returns NotValidating)",
+        );
+        assert_eq!(
+            outcome,
+            TriggerOutcome::ObserverCached,
+            "observer should get ObserverCached outcome"
+        );
+
+        // The built tx set should be queryable in the cache.
+        let cached_sets = herder.scp_driver.tx_set_cache_size();
+        assert!(
+            cached_sets > 0,
+            "observer should have cached a tx set, but cache is empty"
+        );
+
+        // No SCP nomination state should exist for the slot.
+        let slot_state = herder.scp().get_slot_state(1);
+        assert!(
+            slot_state.map_or(true, |s| !s.is_nominating),
+            "observer must NOT enter nominating state"
+        );
+    }
+
     /// Regression test for #2302 — Change 3 of the parity-hardening proposal.
     ///
     /// Verifies that `handle_nomination_timeout` returns
