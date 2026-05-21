@@ -4459,6 +4459,68 @@ mod tests {
         );
     }
 
+    /// Regression test for #2869 review feedback — watcher latch rollback.
+    ///
+    /// Verifies that when the observer trigger fails (e.g. close-time validity
+    /// gate rejects), the per-slot latch is rolled back so the next tick can
+    /// retry the same slot.
+    #[tokio::test]
+    async fn test_try_trigger_consensus_watcher_retries_after_failure() {
+        let config = crate::config::ConfigBuilder::new().in_memory(true).build();
+        assert!(!config.node.is_validator, "test requires watcher config");
+
+        let app = App::new(config).await.unwrap();
+        app.bootstrap_from_db().await.unwrap();
+        app.herder.bootstrap(1);
+        assert!(app.herder.is_tracking());
+        assert!(!app.herder.is_validator());
+
+        // Set the test clock to a very small value so the close-time validity
+        // gate fails: build_and_cache computes close_time from SystemTime::now()
+        // (real time ~2026), but check_close_time uses test_clock=1, so
+        // close_time > 1 + 60 → invalid → trigger fails.
+        app.herder.set_test_clock_seconds(1);
+
+        let failures_before = app.consensus_trigger_failures.load(Ordering::Relaxed);
+        app.try_trigger_consensus().await;
+        let failures_after = app.consensus_trigger_failures.load(Ordering::Relaxed);
+
+        // The trigger should have failed (close-time invalid).
+        assert_eq!(
+            failures_after,
+            failures_before + 1,
+            "first trigger should fail due to invalid close time"
+        );
+
+        // Verify no tx set was cached.
+        assert_eq!(
+            app.herder.scp_driver().tx_set_cache_size(),
+            0,
+            "no tx set should be cached after failed trigger"
+        );
+
+        // Now fix the clock so the next trigger succeeds.
+        // Set test_clock to 0 to restore real SystemTime::now() behavior.
+        app.herder.set_test_clock_seconds(0);
+
+        let successes_before = app.consensus_trigger_successes.load(Ordering::Relaxed);
+        app.try_trigger_consensus().await;
+        let successes_after = app.consensus_trigger_successes.load(Ordering::Relaxed);
+
+        // The retry should succeed because the latch was rolled back.
+        assert_eq!(
+            successes_after,
+            successes_before + 1,
+            "retry after failure should succeed (latch must have been rolled back)"
+        );
+
+        // Verify the tx set is now cached.
+        assert!(
+            app.herder.scp_driver().tx_set_cache_size() > 0,
+            "tx set should be cached after successful retry"
+        );
+    }
+
     #[tokio::test]
     async fn test_sync_recovery_callback_is_applying_ledger() {
         let dir = tempfile::tempdir().expect("temp dir");

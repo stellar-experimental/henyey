@@ -239,12 +239,21 @@ impl App {
                 Ok(Err(e)) => {
                     self.consensus_trigger_failures
                         .fetch_add(1, Ordering::Relaxed);
+                    // Roll back the watcher per-slot latch so a retry can
+                    // re-attempt the build for this slot on the next tick.
+                    if !self.is_validator {
+                        self.watcher_last_triggered_slot.store(0, Ordering::Relaxed);
+                    }
                     tracing::error!(error = %e, slot = next_slot, "Failed to trigger ledger");
                 }
                 Err(_join_error) => {
                     // Already logged by spawn_blocking_logged
                     self.consensus_trigger_failures
                         .fetch_add(1, Ordering::Relaxed);
+                    // Roll back latch on join failure as well.
+                    if !self.is_validator {
+                        self.watcher_last_triggered_slot.store(0, Ordering::Relaxed);
+                    }
                 }
             }
         }

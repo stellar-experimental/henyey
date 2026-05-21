@@ -3172,6 +3172,23 @@ impl Herder {
         }
         let close_time_offset = close_time - lcl_close_time;
 
+        // 2.5. Close-time validity gate (parity: stellar-core HerderImpl.cpp:1524).
+        // stellar-core calls `ctValidityOffset(nextCloseTime)` which checks
+        // `nextCloseTime <= now + MAX_TIME_SLIP_SECONDS`. If the locally-selected
+        // close time is invalid (e.g. node clock is behind and lcl_close_time+1
+        // is too far in the future), skip the entire build/cache/publish path.
+        if !self
+            .scp_driver
+            .check_close_time(0, lcl_close_time, close_time)
+        {
+            tracing::warn!(
+                close_time,
+                lcl_close_time,
+                "Invalid close time selected, skipping trigger (parity: ctValidityOffset gate)"
+            );
+            return None;
+        }
+
         // 3. Build & cache tx set, trimming against proposed close time.
         // Use the pre-built snapshot providers for O(1) snapshot creation.
         //
@@ -6038,6 +6055,103 @@ mod tests {
             valid_after, 1,
             "validity cache must contain one entry after observer trigger \
              (parity: stellar-core cacheValidTxSet in triggerNextLedger)"
+        );
+    }
+
+    /// Regression test for #2869 review feedback — close-time validity gate.
+    ///
+    /// Verifies that `trigger_next_ledger` on an observer performs NO
+    /// build/cache/publish side effects when the locally-selected close time
+    /// is invalid (too far in the future relative to wall clock).
+    /// Mirrors stellar-core's `ctValidityOffset` gate in `triggerNextLedger`.
+    #[test]
+    fn test_trigger_next_ledger_observer_skips_build_on_invalid_close_time() {
+        // Create a LedgerManager whose LCL has a close_time far in the future.
+        // build_and_cache_candidate_tx_set will compute:
+        //   close_time = max(SystemTime::now(), lcl_close_time + 1)
+        // With lcl_close_time = u64::MAX - 100, close_time = u64::MAX - 99,
+        // which is always > now + MAX_TIME_SLIP_SECONDS → gate rejects.
+        use henyey_ledger::{LedgerManager, LedgerManagerConfig};
+        use stellar_xdr::curr::{
+            Hash, LedgerHeader, LedgerHeaderExt, StellarValue, StellarValueExt, TimePoint, VecM,
+        };
+        let lm_config = LedgerManagerConfig {
+            validate_bucket_hash: false,
+            ..Default::default()
+        };
+        let lm = LedgerManager::new("Test Network".to_string(), lm_config);
+        let header = LedgerHeader {
+            ledger_version: 0,
+            previous_ledger_hash: Hash([0u8; 32]),
+            scp_value: StellarValue {
+                tx_set_hash: Hash([0u8; 32]),
+                close_time: TimePoint(u64::MAX - 100),
+                upgrades: VecM::default(),
+                ext: StellarValueExt::Basic,
+            },
+            tx_set_result_hash: Hash([0u8; 32]),
+            bucket_list_hash: Hash([0u8; 32]),
+            ledger_seq: 0,
+            total_coins: 1_000_000_000_000,
+            fee_pool: 0,
+            inflation_seq: 0,
+            id_pool: 0,
+            base_fee: 100,
+            base_reserve: 5_000_000,
+            max_tx_set_size: 100,
+            skip_list: [
+                Hash([0u8; 32]),
+                Hash([0u8; 32]),
+                Hash([0u8; 32]),
+                Hash([0u8; 32]),
+            ],
+            ext: LedgerHeaderExt::V0,
+        };
+        let header_hash = henyey_ledger::compute_header_hash(&header).expect("hash");
+        lm.initialize(
+            henyey_bucket::BucketList::new(),
+            henyey_bucket::HotArchiveBucketList::new(),
+            header,
+            header_hash,
+        )
+        .expect("init");
+
+        let config = HerderConfig {
+            is_validator: false,
+            ..HerderConfig::default()
+        };
+        let herder = Herder::new(config, Arc::new(lm), TimerManagerHandle::no_op());
+
+        // Bootstrap into tracking state.
+        herder.bootstrap(0);
+        assert!(herder.is_tracking());
+        assert!(!herder.is_validator());
+
+        // Verify no tx sets are cached before trigger.
+        let cache_before = herder.scp_driver.cached_tx_set_hashes().len();
+        assert_eq!(cache_before, 0);
+        let valid_before = herder.scp_driver.cache_sizes().tx_set_valid_cache;
+        assert_eq!(valid_before, 0);
+
+        // Trigger for slot 1 — should fail the close-time validity gate.
+        let result = herder.trigger_next_ledger(1);
+        assert!(
+            result.is_err(),
+            "observer trigger should fail when close time is invalid \
+             (returns Err because build_and_cache returns None)"
+        );
+
+        // Verify NO side effects: tx-set cache and validity cache stay empty.
+        let cache_after = herder.scp_driver.cached_tx_set_hashes().len();
+        assert_eq!(
+            cache_after, 0,
+            "no tx set should be cached when close time is invalid"
+        );
+        let valid_after = herder.scp_driver.cache_sizes().tx_set_valid_cache;
+        assert_eq!(
+            valid_after, 0,
+            "validity cache must remain empty when close time is invalid \
+             (parity: stellar-core skips cacheValidTxSet when ctValidityOffset != 0)"
         );
     }
 
