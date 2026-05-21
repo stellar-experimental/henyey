@@ -310,16 +310,17 @@ impl FetchingEnvelopes {
         self.recv_envelope_inner(envelope, None)
     }
 
-    /// Receive a pre-validated SCP envelope (skips StellarValue signed check).
+    /// Receive a pre-validated SCP envelope with strict StellarValue signed check.
     ///
     /// Use this for envelopes that have already passed network-level validation
     /// (pre-filter, signature verification) and are entering FetchingEnvelopes
-    /// for dependency tracking, relay, and slot-aware queuing.
+    /// for dependency tracking, relay, and slot-aware queuing. Despite prior
+    /// validation, this method still enforces `STELLAR_VALUE_SIGNED` to prevent
+    /// malformed or non-signed values from triggering fetch/relay side effects.
     ///
     /// Parity: stellar-core's `PendingEnvelopes::recvSCPEnvelope()` enforces
     /// strict `STELLAR_VALUE_SIGNED` validation before `startFetch` /
-    /// `envelopeReady`. This method applies the same gate so malformed or
-    /// non-signed values cannot trigger fetch/relay side effects.
+    /// `envelopeReady`. This method applies the same gate.
     pub fn recv_envelope_validated(
         &self,
         envelope: ScpEnvelope,
