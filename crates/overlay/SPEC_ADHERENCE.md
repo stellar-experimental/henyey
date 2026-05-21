@@ -3,10 +3,10 @@
 **Spec version:** 26 (Overlay Protocol v38–v39)
 **Crate:** crates/overlay
 **Last updated:** 2026-05-21
-**Overall adherence:** 81%
+**Overall adherence:** 80%
 
 Counts (excluding Drift and N/A from denominator):
-**Full 80 | Partial 16 | Absent 3 | Drift 2 | N/A 2**
+**Full 79 | Partial 17 | Absent 3 | Drift 2 | N/A 2**
 
 ## Summary table
 
@@ -81,7 +81,7 @@ Counts (excluding Drift and N/A from denominator):
 | §11.3 | Curve25519 sealed-box encryption/decryption | Full | App-owned: `crates/app/src/app/survey_impl.rs:674-680` (`seal_to_curve25519_public_key`) and `786-793` (`open_from_curve25519_secret_key`) via `henyey_crypto` |
 | §11.5 | `surveyorPermitted` (allowlist or tracked quorum) | Partial | `survey.rs:415-421` supports allowlist; tracked-quorum fallback not implemented |
 | §11.6 | TimeSlicedNodeData / PeerData counters | Full | `survey.rs:74-212,491-521` |
-| §12.1 | ERROR_MSG: zero seq+MAC pre-key, normal HMAC post-key | Full | `auth.rs:672-675,737-744` (Error skips MAC unconditionally — matches spec §12.1 exemption) |
+| §12.1 | ERROR_MSG: zero seq+MAC pre-key, normal HMAC post-key | Partial | Receive-side parity: `auth.rs:672-675` skips MAC verification for incoming ERROR_MSG. Outbound divergence: post-auth ERROR_MSG sent via `peer.send()` → `auth.wrap_message()` applies normal MAC/seq, unlike stellar-core `Hmac.cpp:72-79` which exempts outbound ERROR_MSG. |
 | §12.1 | ERROR_MSG drops connection | Full | `manager/peer_loop.rs:1046-1064` |
 | §12.2 | ERR_MISC/ERR_DATA/ERR_CONF/ERR_AUTH/ERR_LOAD usage | Full | `peer.rs:557-576`, `manager/connection.rs:224`, `manager/peer_loop.rs:1079-1082` |
 | §12.3 | Drop-once idempotence (INV-O19) | Partial | No `mDropStarted`-style atomic flag in `peer.rs::close`; instead state machine + tokio drop semantics. Idempotence relies on `state != PeerState::Disconnected` guard (`peer.rs:932-939`), which is single-threaded per peer. |
@@ -166,10 +166,11 @@ Corrected invariant tally: **Full 17 | Partial 2 | Absent 0**.
 - **Rust**: XDR decode errors surface as `OverlayError::Message`, propagated to the peer loop which logs and drops the peer (`peer_loop.rs:1334-1366`). The error message is *not* specifically `ERR_DATA` — the connection simply terminates without sending an outbound `ERROR_MSG`.
 - **Notes**: Drop happens; ERR_DATA is not transmitted. Lower-priority drift since the peer will see the TCP close.
 
-### §12.1 — ERROR_MSG MAC handling (Full)
+### §12.1 — ERROR_MSG MAC handling (Partial)
 - **Claim**: ERROR_MSG sent with zero seq+MAC pre-key, normal HMAC post-key.
-- **Rust**: `auth.rs:672-675` *always* skips MAC verification for incoming ERROR_MSG, regardless of whether keys are established.
-- **Notes**: Spec text actually says the receiver doesn't verify the MAC on ERROR_MSG (§12.1 lines 1304-1306) — so this is **NOT** drift. **Reclassify: Full.** The send path doesn't emit a real MAC even when keys are set (`peer.rs:557-576` uses `send_raw`), which matches the spec exemption.
+- **Receive side (parity)**: `auth.rs:672-675` *always* skips MAC verification for incoming ERROR_MSG, regardless of whether keys are established. Matches stellar-core `Peer.cpp:1032-1035`.
+- **Send side (divergence)**: Post-auth ERROR_MSG goes through `send_error_and_drop` (`peer_loop.rs:306-314`) → `OutboundMessage::Send` → `peer.send()` (`peer.rs:738-751`) → `auth.wrap_message()`, which applies normal MAC/sequence. Stellar-core exempts outbound ERROR_MSG from MAC in `Hmac.cpp:72-79`. Pre-auth errors use `send_raw` (`peer.rs:573`) which is correct (no MAC before keys).
+- **Notes**: Partial because receive-side matches but outbound path diverges. The divergence is benign (peers accept MACed ERROR_MSG) but not spec-identical.
 
 ### §10.4 — Tick promote-inbound (Absent)
 - **Claim**: Step 8: "Promote inbound peers (open a parallel outbound connection to their address) to fill any leftover pending slots."
