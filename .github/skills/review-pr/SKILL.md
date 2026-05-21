@@ -644,11 +644,19 @@ Exit.
 ## Workspace contract
 
 The `/review-pr` skill must never create worktrees outside `$HOME/data`. All scratch
-state lives under `$HOME/data/$SESSION_ID/review-pr-$ISSUE/`:
+state lives under `$HOME/data/$SESSION_ID/review-pr-$ISSUE/`. Reviewers derive their
+workspace by sourcing the shared contract helper:
 
 ```bash
-SESSION_ID="${CLAUDE_SESSION_ID:-$(date +%Y%m%d-%H%M%S)}"
-export CARGO_TARGET_DIR="$HOME/data/$SESSION_ID/review-pr-$ISSUE/cargo-target"
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+source "$REPO_ROOT/scripts/lib/agent-worktree-contract.sh"
+
+# review_pr_bootstrap validates and exports WORKTREE_BASE, CARGO_TARGET_DIR,
+# and REVIEWER_WORKTREE. Pre-seeded values are accepted only if they resolve
+# under $HOME/data; hostile values (outside $HOME/data or using ../ traversal)
+# are rejected with a non-zero exit.
+review_pr_bootstrap "$ISSUE"
+mkdir -p "$REVIEWER_WORKTREE"
 ```
 
 This ensures build artifacts are isolated per-session and automatically discoverable

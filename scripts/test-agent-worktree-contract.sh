@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # test-agent-worktree-contract.sh — TAP contract test for agent workspace placement.
 #
-# Verifies that /review-pr and /plan skill files enforce the ~/data workspace
+# Verifies that /review-pr and /plan skill bootstraps enforce the ~/data workspace
 # contract: all worktrees, cargo targets, and scratch dirs resolve under
-# $HOME/data/$SESSION_ID/..., and both skills explicitly forbid repo-root or
-# repo-parent worktree creation. Also verifies that .claude/skills/ copies
-# remain synchronized with their .github/skills/ counterparts.
+# $HOME/data/$SESSION_ID/..., and hostile/traversal env overrides are rejected.
+# Also verifies that .claude/skills/ copies remain synchronized with their
+# .github/skills/ counterparts and that skill docs reference the shared helper.
 #
 # Usage: bash scripts/test-agent-worktree-contract.sh
 # Exit: 0 if all tests pass, 1 otherwise.
@@ -17,6 +17,7 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 REVIEW_PR_SKILL="$REPO_ROOT/.github/skills/review-pr/SKILL.md"
 PLAN_SKILL="$REPO_ROOT/.github/skills/plan/SKILL.md"
+CONTRACT_HELPER="$REPO_ROOT/scripts/lib/agent-worktree-contract.sh"
 
 PASS=0
 FAIL=0
@@ -36,121 +37,210 @@ tap_not_ok() {
 }
 
 # --------------------------------------------------------------------------
-# Test: review-pr workspace contract resolves under ~/data
+# Test: plan bootstrap rejects hostile WORKTREE_BASE
 # --------------------------------------------------------------------------
-test_review_pr_workspace_contract_resolves_under_home_data() {
-  local desc="review-pr workspace contract resolves under ~/data"
+test_plan_bootstrap_rejects_hostile_worktree_base() {
+  local desc="plan bootstrap rejects hostile WORKTREE_BASE"
 
-  # The skill must contain a reviewer workspace bootstrap that derives paths
-  # under $HOME/data. We look for the documented pattern.
-  if grep -q 'HOME/data/\$SESSION_ID/review-pr' "$REVIEW_PR_SKILL" ||
-     grep -q 'HOME/data/\${SESSION_ID}/review-pr' "$REVIEW_PR_SKILL" ||
-     grep -q '\~/data/\$SESSION_ID/review-pr' "$REVIEW_PR_SKILL" ||
-     grep -q '\$HOME/data/.*review-pr' "$REVIEW_PR_SKILL"; then
-    tap_ok "$desc"
-  else
-    tap_not_ok "$desc" "SKILL.md does not contain a ~/data/\$SESSION_ID/review-pr workspace derivation"
+  # Test 1: Absolute path outside $HOME/data
+  local output
+  if output=$(WORKTREE_BASE="/tmp/evil" CARGO_TARGET_DIR="" CLAUDE_SESSION_ID="test-session" \
+    bash -c "source '$CONTRACT_HELPER' && plan_critic_bootstrap 999 critic-a" 2>&1); then
+    tap_not_ok "$desc (absolute outside)" "Should have failed but succeeded: $output"
+    return
   fi
+
+  # Test 2: Traversal that escapes $HOME/data
+  if output=$(WORKTREE_BASE="$HOME/data/../escape" CARGO_TARGET_DIR="" CLAUDE_SESSION_ID="test-session" \
+    bash -c "source '$CONTRACT_HELPER' && plan_critic_bootstrap 999 critic-a" 2>&1); then
+    tap_not_ok "$desc (traversal)" "Should have failed but succeeded: $output"
+    return
+  fi
+
+  tap_ok "$desc"
 }
 
 # --------------------------------------------------------------------------
-# Test: plan workspace contract resolves under ~/data
+# Test: plan bootstrap rejects hostile CARGO_TARGET_DIR independently
 # --------------------------------------------------------------------------
-test_plan_workspace_contract_resolves_under_home_data() {
-  local desc="plan workspace contract resolves under ~/data"
+test_plan_bootstrap_rejects_hostile_cargo_target_dir() {
+  local desc="plan bootstrap rejects hostile CARGO_TARGET_DIR"
 
-  if grep -q 'HOME/data/\$SESSION_ID/plan' "$PLAN_SKILL" ||
-     grep -q 'HOME/data/\${SESSION_ID}/plan' "$PLAN_SKILL" ||
-     grep -q '\~/data/\$SESSION_ID/plan' "$PLAN_SKILL" ||
-     grep -q '\$HOME/data/.*plan-\$ISSUE' "$PLAN_SKILL"; then
-    tap_ok "$desc"
-  else
-    tap_not_ok "$desc" "SKILL.md does not contain a ~/data/\$SESSION_ID/plan workspace derivation"
+  # Valid WORKTREE_BASE but hostile CARGO_TARGET_DIR
+  local output
+  if output=$(WORKTREE_BASE="$HOME/data/test-session/plan-999" \
+    CARGO_TARGET_DIR="/tmp/evil-cargo" CLAUDE_SESSION_ID="test-session" \
+    bash -c "source '$CONTRACT_HELPER' && plan_critic_bootstrap 999 critic-a" 2>&1); then
+    tap_not_ok "$desc (absolute outside)" "Should have failed but succeeded: $output"
+    return
   fi
+
+  # Traversal CARGO_TARGET_DIR
+  if output=$(WORKTREE_BASE="$HOME/data/test-session/plan-999" \
+    CARGO_TARGET_DIR="$HOME/data/../escape/cargo" CLAUDE_SESSION_ID="test-session" \
+    bash -c "source '$CONTRACT_HELPER' && plan_critic_bootstrap 999 critic-a" 2>&1); then
+    tap_not_ok "$desc (traversal)" "Should have failed but succeeded: $output"
+    return
+  fi
+
+  tap_ok "$desc"
 }
 
 # --------------------------------------------------------------------------
-# Test: skill prompts forbid repo-root worktrees
+# Test: plan bootstrap accepts safe pre-seeded $HOME/data paths
 # --------------------------------------------------------------------------
-test_skill_prompts_forbid_repo_root_worktrees() {
-  local desc="skill prompts forbid repo-root worktrees"
-  local review_has_guard=false
-  local plan_has_guard=false
+test_plan_bootstrap_accepts_safe_preseeded_home_data_paths() {
+  local desc="plan bootstrap accepts safe pre-seeded HOME/data paths"
 
-  # Check review-pr skill for explicit prohibition
-  if grep -qi 'never.*worktree.*repo.*root\|never.*repo.*root.*worktree\|never.*create.*worktree.*outside.*~/data\|must not.*worktree.*outside.*\~/data\|do not.*create.*worktree.*outside\|never.*outside.*\$HOME/data\|must.*under.*\$HOME/data\|only.*under.*\$HOME/data' "$REVIEW_PR_SKILL"; then
-    review_has_guard=true
+  local output
+  if ! output=$(WORKTREE_BASE="$HOME/data/my-session/plan-42" \
+    CARGO_TARGET_DIR="$HOME/data/my-session/plan-42/cargo-target" \
+    CLAUDE_SESSION_ID="my-session" \
+    bash -c "source '$CONTRACT_HELPER' && plan_critic_bootstrap 42 critic-b && echo \$WORKTREE_BASE && echo \$CARGO_TARGET_DIR && echo \$CRITIC_WORKTREE" 2>&1); then
+    tap_not_ok "$desc" "Should have succeeded but failed: $output"
+    return
   fi
 
-  # Check plan skill for explicit prohibition
-  if grep -qi 'never.*worktree.*repo.*root\|never.*repo.*root.*worktree\|never.*create.*worktree.*outside.*~/data\|must not.*worktree.*outside.*\~/data\|do not.*create.*worktree.*outside\|never.*outside.*\$HOME/data\|must.*under.*\$HOME/data\|only.*under.*\$HOME/data' "$PLAN_SKILL"; then
-    plan_has_guard=true
+  # Verify all paths contain $HOME/data
+  local home_data
+  home_data="$(realpath -m "$HOME/data")"
+  if echo "$output" | grep -v "^$home_data" | grep -q .; then
+    tap_not_ok "$desc" "Some paths not under \$HOME/data: $output"
+    return
   fi
 
-  if $review_has_guard && $plan_has_guard; then
+  tap_ok "$desc"
+}
+
+# --------------------------------------------------------------------------
+# Test: review-pr bootstrap rejects hostile WORKTREE_BASE and CARGO_TARGET_DIR
+# --------------------------------------------------------------------------
+test_review_pr_bootstrap_rejects_hostile_worktree_base_and_cargo_target() {
+  local desc="review-pr bootstrap rejects hostile WORKTREE_BASE and CARGO_TARGET_DIR"
+
+  # Hostile WORKTREE_BASE
+  local output
+  if output=$(WORKTREE_BASE="/var/tmp/evil" CARGO_TARGET_DIR="" CLAUDE_SESSION_ID="test-session" \
+    bash -c "source '$CONTRACT_HELPER' && review_pr_bootstrap 100" 2>&1); then
+    tap_not_ok "$desc (hostile base)" "Should have failed but succeeded: $output"
+    return
+  fi
+
+  # Hostile CARGO_TARGET_DIR with valid base
+  if output=$(WORKTREE_BASE="$HOME/data/test-session/review-pr-100" \
+    CARGO_TARGET_DIR="/opt/evil/cargo" CLAUDE_SESSION_ID="test-session" \
+    bash -c "source '$CONTRACT_HELPER' && review_pr_bootstrap 100" 2>&1); then
+    tap_not_ok "$desc (hostile cargo)" "Should have failed but succeeded: $output"
+    return
+  fi
+
+  # Traversal
+  if output=$(WORKTREE_BASE="$HOME/data/../../etc/evil" CARGO_TARGET_DIR="" CLAUDE_SESSION_ID="test-session" \
+    bash -c "source '$CONTRACT_HELPER' && review_pr_bootstrap 100" 2>&1); then
+    tap_not_ok "$desc (traversal)" "Should have failed but succeeded: $output"
+    return
+  fi
+
+  tap_ok "$desc"
+}
+
+# --------------------------------------------------------------------------
+# Test: review-pr bootstrap requires HOME/data workspace
+# --------------------------------------------------------------------------
+test_review_pr_bootstrap_requires_home_data_workspace() {
+  local desc="review-pr bootstrap requires HOME/data workspace"
+
+  local output
+  if ! output=$(WORKTREE_BASE="" CARGO_TARGET_DIR="" CLAUDE_SESSION_ID="test-sess" \
+    bash -c "source '$CONTRACT_HELPER' && review_pr_bootstrap 200 && echo \$WORKTREE_BASE && echo \$CARGO_TARGET_DIR && echo \$REVIEWER_WORKTREE" 2>&1); then
+    tap_not_ok "$desc" "Default bootstrap failed: $output"
+    return
+  fi
+
+  local home_data
+  home_data="$(realpath -m "$HOME/data")"
+  if echo "$output" | grep -v "^$home_data" | grep -q .; then
+    tap_not_ok "$desc" "Some default paths not under \$HOME/data: $output"
+    return
+  fi
+
+  tap_ok "$desc"
+}
+
+# --------------------------------------------------------------------------
+# Test: default bootstrap layouts stay under $HOME/data
+# --------------------------------------------------------------------------
+test_default_bootstrap_layouts_stay_under_home_data() {
+  local desc="default bootstrap layouts stay under HOME/data"
+
+  # Plan critic with no pre-seeded vars
+  local plan_out
+  if ! plan_out=$(WORKTREE_BASE="" CARGO_TARGET_DIR="" CLAUDE_SESSION_ID="default-test" \
+    bash -c "source '$CONTRACT_HELPER' && plan_critic_bootstrap 55 critic-c && echo \$WORKTREE_BASE && echo \$CARGO_TARGET_DIR && echo \$CRITIC_WORKTREE" 2>&1); then
+    tap_not_ok "$desc" "Plan default failed: $plan_out"
+    return
+  fi
+
+  # Review-pr with no pre-seeded vars
+  local review_out
+  if ! review_out=$(WORKTREE_BASE="" CARGO_TARGET_DIR="" CLAUDE_SESSION_ID="default-test" \
+    bash -c "source '$CONTRACT_HELPER' && review_pr_bootstrap 55 && echo \$WORKTREE_BASE && echo \$CARGO_TARGET_DIR && echo \$REVIEWER_WORKTREE" 2>&1); then
+    tap_not_ok "$desc" "Review default failed: $review_out"
+    return
+  fi
+
+  local home_data
+  home_data="$(realpath -m "$HOME/data")"
+
+  # Verify plan paths
+  if echo "$plan_out" | grep -v "^$home_data" | grep -q .; then
+    tap_not_ok "$desc" "Plan paths escape \$HOME/data: $plan_out"
+    return
+  fi
+
+  # Verify review paths
+  if echo "$review_out" | grep -v "^$home_data" | grep -q .; then
+    tap_not_ok "$desc" "Review paths escape \$HOME/data: $review_out"
+    return
+  fi
+
+  # Verify expected structure
+  if ! echo "$plan_out" | grep -q "data/default-test/plan-55"; then
+    tap_not_ok "$desc" "Plan layout missing expected session/plan structure: $plan_out"
+    return
+  fi
+  if ! echo "$review_out" | grep -q "data/default-test/review-pr-55"; then
+    tap_not_ok "$desc" "Review layout missing expected session/review-pr structure: $review_out"
+    return
+  fi
+
+  tap_ok "$desc"
+}
+
+# --------------------------------------------------------------------------
+# Test: skill files reference shared contract helper
+# --------------------------------------------------------------------------
+test_skill_files_reference_shared_contract_helper() {
+  local desc="skill files reference shared contract helper"
+
+  local plan_refs=false
+  local review_refs=false
+
+  if grep -q 'agent-worktree-contract.sh\|plan_critic_bootstrap' "$PLAN_SKILL"; then
+    plan_refs=true
+  fi
+
+  if grep -q 'agent-worktree-contract.sh\|review_pr_bootstrap' "$REVIEW_PR_SKILL"; then
+    review_refs=true
+  fi
+
+  if $plan_refs && $review_refs; then
     tap_ok "$desc"
   else
     local missing=""
-    $review_has_guard || missing="review-pr"
-    $plan_has_guard || missing="${missing:+$missing, }plan"
-    tap_not_ok "$desc" "Missing repo-root worktree prohibition in: $missing"
-  fi
-}
-
-# --------------------------------------------------------------------------
-# Test: review-pr bootstrap is self-seeding (works with or without env vars)
-# --------------------------------------------------------------------------
-test_review_pr_self_seeding() {
-  local desc="review-pr bootstrap is self-seeding (WORKTREE_BASE fallback)"
-
-  # The skill should show a ${WORKTREE_BASE:-...} or SESSION_ID fallback pattern
-  if grep -q 'WORKTREE_BASE:-\|SESSION_ID:-\|CLAUDE_SESSION_ID:-' "$REVIEW_PR_SKILL" ||
-     grep -q 'WORKTREE_BASE:=' "$REVIEW_PR_SKILL"; then
-    tap_ok "$desc"
-  else
-    tap_not_ok "$desc" "No self-seeding fallback (e.g. \${WORKTREE_BASE:-...}) found in review-pr SKILL.md"
-  fi
-}
-
-# --------------------------------------------------------------------------
-# Test: plan bootstrap is self-seeding (works with or without env vars)
-# --------------------------------------------------------------------------
-test_plan_self_seeding() {
-  local desc="plan bootstrap is self-seeding (WORKTREE_BASE fallback)"
-
-  if grep -q 'WORKTREE_BASE:-\|SESSION_ID:-\|CLAUDE_SESSION_ID:-' "$PLAN_SKILL" ||
-     grep -q 'WORKTREE_BASE:=' "$PLAN_SKILL"; then
-    tap_ok "$desc"
-  else
-    tap_not_ok "$desc" "No self-seeding fallback (e.g. \${WORKTREE_BASE:-...}) found in plan SKILL.md"
-  fi
-}
-
-# --------------------------------------------------------------------------
-# Test: review-pr CARGO_TARGET_DIR resolves under ~/data
-# --------------------------------------------------------------------------
-test_review_pr_cargo_target_under_data() {
-  local desc="review-pr CARGO_TARGET_DIR resolves under ~/data"
-
-  if grep -q 'CARGO_TARGET_DIR.*HOME/data\|CARGO_TARGET_DIR.*~/data' "$REVIEW_PR_SKILL" ||
-     grep -q 'CARGO_TARGET_DIR.*\$WORKTREE_BASE' "$REVIEW_PR_SKILL"; then
-    tap_ok "$desc"
-  else
-    tap_not_ok "$desc" "CARGO_TARGET_DIR not directed to ~/data in review-pr SKILL.md"
-  fi
-}
-
-# --------------------------------------------------------------------------
-# Test: plan CARGO_TARGET_DIR resolves under ~/data
-# --------------------------------------------------------------------------
-test_plan_cargo_target_under_data() {
-  local desc="plan CARGO_TARGET_DIR resolves under ~/data"
-
-  if grep -q 'CARGO_TARGET_DIR.*HOME/data\|CARGO_TARGET_DIR.*~/data' "$PLAN_SKILL" ||
-     grep -q 'CARGO_TARGET_DIR.*\$WORKTREE_BASE' "$PLAN_SKILL"; then
-    tap_ok "$desc"
-  else
-    tap_not_ok "$desc" "CARGO_TARGET_DIR not directed to ~/data in plan SKILL.md"
+    $plan_refs || missing="plan"
+    $review_refs || missing="${missing:+$missing, }review-pr"
+    tap_not_ok "$desc" "Missing helper reference in: $missing"
   fi
 }
 
@@ -163,11 +253,8 @@ test_claude_review_pr_synced() {
   local github_path="$REPO_ROOT/.github/skills/review-pr"
 
   if [ -L "$claude_path" ]; then
-    # It's a symlink — verify it resolves to the .github copy
     local target resolved expected
     target="$(readlink "$claude_path")"
-    # Guard: resolve the symlink target safely; broken/misdirected symlinks
-    # must emit tap_not_ok rather than aborting the script under set -e.
     if resolved="$(cd "$(dirname "$claude_path")" && cd "$target" 2>/dev/null && pwd)"; then
       if expected="$(cd "$github_path" 2>/dev/null && pwd)"; then
         if [ "$resolved" = "$expected" ]; then
@@ -182,7 +269,6 @@ test_claude_review_pr_synced() {
       tap_not_ok "$desc" "Symlink target '$target' does not resolve"
     fi
   elif [ -d "$claude_path" ]; then
-    # Not a symlink — verify content is identical
     if diff -r "$claude_path" "$github_path" > /dev/null 2>&1; then
       tap_ok "$desc (identical copy)"
     else
@@ -202,11 +288,8 @@ test_claude_plan_synced() {
   local github_path="$REPO_ROOT/.github/skills/plan"
 
   if [ -L "$claude_path" ]; then
-    # It's a symlink — verify it resolves to the .github copy
     local target resolved expected
     target="$(readlink "$claude_path")"
-    # Guard: resolve the symlink target safely; broken/misdirected symlinks
-    # must emit tap_not_ok rather than aborting the script under set -e.
     if resolved="$(cd "$(dirname "$claude_path")" && cd "$target" 2>/dev/null && pwd)"; then
       if expected="$(cd "$github_path" 2>/dev/null && pwd)"; then
         if [ "$resolved" = "$expected" ]; then
@@ -221,7 +304,6 @@ test_claude_plan_synced() {
       tap_not_ok "$desc" "Symlink target '$target' does not resolve"
     fi
   elif [ -d "$claude_path" ]; then
-    # Not a symlink — verify content is identical
     if diff -r "$claude_path" "$github_path" > /dev/null 2>&1; then
       tap_ok "$desc (identical copy)"
     else
@@ -237,13 +319,13 @@ test_claude_plan_synced() {
 # --------------------------------------------------------------------------
 echo "TAP version 13"
 
-test_review_pr_workspace_contract_resolves_under_home_data
-test_plan_workspace_contract_resolves_under_home_data
-test_skill_prompts_forbid_repo_root_worktrees
-test_review_pr_self_seeding
-test_plan_self_seeding
-test_review_pr_cargo_target_under_data
-test_plan_cargo_target_under_data
+test_plan_bootstrap_rejects_hostile_worktree_base
+test_plan_bootstrap_rejects_hostile_cargo_target_dir
+test_plan_bootstrap_accepts_safe_preseeded_home_data_paths
+test_review_pr_bootstrap_rejects_hostile_worktree_base_and_cargo_target
+test_review_pr_bootstrap_requires_home_data_workspace
+test_default_bootstrap_layouts_stay_under_home_data
+test_skill_files_reference_shared_contract_helper
 test_claude_review_pr_synced
 test_claude_plan_synced
 
