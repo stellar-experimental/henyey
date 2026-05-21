@@ -36,10 +36,10 @@ use henyey_herder::scp_verify::{
 use henyey_herder::{Herder, HerderConfig, HerderState, TimerManagerHandle};
 use henyey_ledger::{LedgerManager, LedgerManagerConfig};
 use stellar_xdr::curr::{
-    Hash as XdrHash, Limits, NodeId as XdrNodeId, PublicKey as XdrPublicKey, ScpBallot,
-    ScpEnvelope, ScpNomination, ScpQuorumSet, ScpStatement, ScpStatementExternalize,
-    ScpStatementPledges, ScpStatementPrepare, Signature as XdrSignature, StellarValue,
-    StellarValueExt, TimePoint, Uint256, Value, WriteXdr,
+    Hash as XdrHash, LedgerCloseValueSignature, Limits, NodeId as XdrNodeId,
+    PublicKey as XdrPublicKey, ScpBallot, ScpEnvelope, ScpNomination, ScpQuorumSet, ScpStatement,
+    ScpStatementExternalize, ScpStatementPledges, ScpStatementPrepare, Signature as XdrSignature,
+    StellarValue, StellarValueExt, TimePoint, Uint256, Value, WriteXdr,
 };
 
 // ---------------------------------------------------------------------------
@@ -205,7 +205,10 @@ fn value_with_close_time(close_time: u64) -> Value {
         tx_set_hash: XdrHash([0u8; 32]),
         close_time: TimePoint(close_time),
         upgrades: vec![].try_into().unwrap(),
-        ext: StellarValueExt::Basic,
+        ext: StellarValueExt::Signed(LedgerCloseValueSignature {
+            node_id: XdrNodeId(XdrPublicKey::PublicKeyTypeEd25519(Uint256([0u8; 32]))),
+            signature: XdrSignature(vec![0u8; 64].try_into().unwrap()),
+        }),
     };
     Value(sv.to_xdr(Limits::none()).unwrap().try_into().unwrap())
 }

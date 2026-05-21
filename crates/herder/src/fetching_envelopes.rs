@@ -315,12 +315,27 @@ impl FetchingEnvelopes {
     /// Use this for envelopes that have already passed network-level validation
     /// (pre-filter, signature verification) and are entering FetchingEnvelopes
     /// for dependency tracking, relay, and slot-aware queuing.
+    ///
+    /// Parity: stellar-core's `PendingEnvelopes::recvSCPEnvelope()` enforces
+    /// strict `STELLAR_VALUE_SIGNED` validation before `startFetch` /
+    /// `envelopeReady`. This method applies the same gate so malformed or
+    /// non-signed values cannot trigger fetch/relay side effects.
     pub fn recv_envelope_validated(
         &self,
         envelope: ScpEnvelope,
         received_at: Option<Instant>,
     ) -> RecvResult {
         self.stats.write().envelopes_received += 1;
+
+        // Strict value validation: reject before any fetch/relay side effects.
+        if !Self::check_stellar_value_signed(&envelope) {
+            debug!(
+                slot = envelope.statement.slot_index,
+                "recv_envelope_validated: rejecting envelope with non-SIGNED StellarValue"
+            );
+            return RecvResult::Discarded;
+        }
+
         self.recv_envelope_inner(envelope, received_at)
     }
 

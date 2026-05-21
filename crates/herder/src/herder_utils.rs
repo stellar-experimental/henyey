@@ -9,7 +9,9 @@
 
 use henyey_common::Hash256;
 use henyey_scp::Slot;
-use stellar_xdr::curr::{Limits, NodeId, ReadXdr, ScpEnvelope, ScpStatement, StellarValue};
+use stellar_xdr::curr::{
+    Limits, NodeId, ReadXdr, ScpEnvelope, ScpStatement, StellarValue, StellarValueExt,
+};
 
 /// Extract all StellarValues from an SCP statement.
 ///
@@ -73,6 +75,44 @@ pub fn get_tx_set_hashes_from_envelope(envelope: &ScpEnvelope) -> Vec<Hash256> {
         .into_iter()
         .map(|sv| Hash256::from_bytes(sv.tx_set_hash.0))
         .collect()
+}
+
+/// Strictly validate and extract StellarValues from an SCP statement.
+///
+/// Unlike [`get_stellar_values`], this function fails fast on the first value
+/// that either fails to decode or is not `STELLAR_VALUE_SIGNED`. This mirrors
+/// stellar-core's `HerderUtils::getStellarValues` + the signed-only check in
+/// `PendingEnvelopes::recvSCPEnvelope()`.
+///
+/// Returns `Ok(values)` if all values decode and are signed, or `Err(())` if
+/// any value is malformed or uses `StellarValueExt::Basic`.
+pub fn get_validated_stellar_values(statement: &ScpStatement) -> Result<Vec<StellarValue>, ()> {
+    let values = Slot::get_statement_values(statement);
+    let mut result = Vec::with_capacity(values.len());
+    for v in values {
+        let sv = StellarValue::from_xdr(&v.0, Limits::none()).map_err(|_| ())?;
+        if matches!(sv.ext, StellarValueExt::Basic) {
+            return Err(());
+        }
+        result.push(sv);
+    }
+    Ok(result)
+}
+
+/// Strictly validate and extract transaction set hashes from an SCP envelope.
+///
+/// Mirrors stellar-core's `getValidatedTxSetHashes` which calls
+/// `getStellarValues` and fails if any value is malformed or not signed.
+///
+/// Returns `Ok(hashes)` if all values pass strict validation, or `Err(())` if
+/// any value fails.
+pub fn get_validated_tx_set_hashes(envelope: &ScpEnvelope) -> Result<Vec<Hash256>, ()> {
+    get_validated_stellar_values(&envelope.statement).map(|values| {
+        values
+            .into_iter()
+            .map(|sv| Hash256::from_bytes(sv.tx_set_hash.0))
+            .collect()
+    })
 }
 
 /// Render a NodeID as a short human-readable string.
@@ -154,8 +194,9 @@ pub(crate) async fn sleep_until_or_forever(instant: Option<tokio::time::Instant>
 mod tests {
     use super::*;
     use stellar_xdr::curr::{
-        Limits, ScpBallot, ScpNomination, ScpStatement, ScpStatementExternalize,
-        ScpStatementPledges, StellarValue, StellarValueExt, TimePoint, Uint256, Value, WriteXdr,
+        LedgerCloseValueSignature, Limits, ScpBallot, ScpNomination, ScpStatement,
+        ScpStatementExternalize, ScpStatementPledges, Signature as XdrSignature, StellarValue,
+        StellarValueExt, TimePoint, Uint256, Value, WriteXdr,
     };
 
     fn make_test_stellar_value(tx_set_hash: [u8; 32], close_time: u64) -> StellarValue {
@@ -287,5 +328,123 @@ mod tests {
         // Should return empty vec (invalid values are skipped)
         let values = get_stellar_values(&statement);
         assert!(values.is_empty());
+    }
+
+    // =========================================================================
+    // Tests for get_validated_stellar_values / get_validated_tx_set_hashes
+    // =========================================================================
+
+    fn make_signed_stellar_value(tx_set_hash: [u8; 32], close_time: u64) -> StellarValue {
+        StellarValue {
+            tx_set_hash: stellar_xdr::curr::Hash(tx_set_hash),
+            close_time: TimePoint(close_time),
+            upgrades: vec![].try_into().unwrap(),
+            ext: StellarValueExt::Signed(LedgerCloseValueSignature {
+                node_id: NodeId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(Uint256(
+                    [0u8; 32],
+                ))),
+                signature: XdrSignature(vec![0u8; 64].try_into().unwrap()),
+            }),
+        }
+    }
+
+    #[test]
+    fn test_get_validated_tx_set_hashes_accepts_signed_values() {
+        let sv = make_signed_stellar_value([5u8; 32], 500);
+
+        let envelope = ScpEnvelope {
+            statement: ScpStatement {
+                node_id: make_test_node_id(1),
+                slot_index: 1,
+                pledges: ScpStatementPledges::Externalize(ScpStatementExternalize {
+                    commit: ScpBallot {
+                        counter: 1,
+                        value: encode_value(&sv),
+                    },
+                    n_h: 1,
+                    commit_quorum_set_hash: stellar_xdr::curr::Hash([0u8; 32]),
+                }),
+            },
+            signature: stellar_xdr::curr::Signature(vec![0u8; 64].try_into().unwrap()),
+        };
+
+        let result = get_validated_tx_set_hashes(&envelope);
+        assert!(result.is_ok());
+        let hashes = result.unwrap();
+        assert_eq!(hashes.len(), 1);
+        assert_eq!(hashes[0].0, [5u8; 32]);
+    }
+
+    #[test]
+    fn test_get_validated_tx_set_hashes_rejects_basic_values() {
+        // Basic (non-signed) value should be rejected.
+        let sv = make_test_stellar_value([6u8; 32], 600); // uses StellarValueExt::Basic
+
+        let envelope = ScpEnvelope {
+            statement: ScpStatement {
+                node_id: make_test_node_id(1),
+                slot_index: 1,
+                pledges: ScpStatementPledges::Externalize(ScpStatementExternalize {
+                    commit: ScpBallot {
+                        counter: 1,
+                        value: encode_value(&sv),
+                    },
+                    n_h: 1,
+                    commit_quorum_set_hash: stellar_xdr::curr::Hash([0u8; 32]),
+                }),
+            },
+            signature: stellar_xdr::curr::Signature(vec![0u8; 64].try_into().unwrap()),
+        };
+
+        let result = get_validated_tx_set_hashes(&envelope);
+        assert!(result.is_err(), "Basic value should be rejected");
+    }
+
+    #[test]
+    fn test_get_validated_tx_set_hashes_rejects_malformed_xdr() {
+        // Malformed XDR in value bytes should be rejected.
+        let envelope = ScpEnvelope {
+            statement: ScpStatement {
+                node_id: make_test_node_id(1),
+                slot_index: 1,
+                pledges: ScpStatementPledges::Nominate(ScpNomination {
+                    quorum_set_hash: stellar_xdr::curr::Hash([0u8; 32]),
+                    votes: vec![Value(vec![1, 2, 3].try_into().unwrap())]
+                        .try_into()
+                        .unwrap(),
+                    accepted: vec![].try_into().unwrap(),
+                }),
+            },
+            signature: stellar_xdr::curr::Signature(vec![0u8; 64].try_into().unwrap()),
+        };
+
+        let result = get_validated_tx_set_hashes(&envelope);
+        assert!(result.is_err(), "Malformed XDR should be rejected");
+    }
+
+    #[test]
+    fn test_get_validated_stellar_values_rejects_mixed_signed_and_basic() {
+        // A nominate envelope with one signed and one basic value should fail
+        // fast on the basic one.
+        let signed_sv = make_signed_stellar_value([7u8; 32], 700);
+        let basic_sv = make_test_stellar_value([8u8; 32], 800);
+
+        let statement = ScpStatement {
+            node_id: make_test_node_id(1),
+            slot_index: 1,
+            pledges: ScpStatementPledges::Nominate(ScpNomination {
+                quorum_set_hash: stellar_xdr::curr::Hash([0u8; 32]),
+                votes: vec![encode_value(&signed_sv), encode_value(&basic_sv)]
+                    .try_into()
+                    .unwrap(),
+                accepted: vec![].try_into().unwrap(),
+            }),
+        };
+
+        let result = get_validated_stellar_values(&statement);
+        assert!(
+            result.is_err(),
+            "Mixed signed/basic values should be rejected"
+        );
     }
 }

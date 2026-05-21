@@ -1924,21 +1924,25 @@ impl Herder {
             return (EnvelopeState::Invalid, PostVerifyReason::NonQuorum);
         }
 
-        self.slot_quorum_tracker
-            .write()
-            .record_envelope(slot, envelope.statement.node_id.clone());
+        // Slot quorum tracker bookkeeping is deferred to
+        // process_scp_envelope_with_tx_set, which is the SCP-acceptance
+        // boundary. This matches the timing of stellar-core's
+        // processSCPQueueUpToIndex: envelopes are only SCP-visible (and
+        // thus quorum-relevant) after they pass dependency admission.
 
         // Pre-fetch tx sets from EXTERNALIZE envelopes immediately so they're
-        // available by the time SCP processes the envelope.
+        // available by the time SCP processes the envelope. Uses the strict
+        // validated helper so malformed EXTERNALIZE values cannot trigger
+        // fetch side effects.
         let lcl = self.ledger_manager.current_ledger_seq() as u64;
-        if let stellar_xdr::curr::ScpStatementPledges::Externalize(ext) =
-            &envelope.statement.pledges
+        if let stellar_xdr::curr::ScpStatementPledges::Externalize(_) = &envelope.statement.pledges
         {
-            if let Ok(sv) = StellarValue::from_xdr(&ext.commit.value.0, Limits::none()) {
-                let tx_set_hash = Hash256::from_bytes(sv.tx_set_hash.0);
-                if slot > lcl {
-                    if self.scp_driver.request_tx_set(tx_set_hash, slot) {
-                        debug!(slot, hash = %tx_set_hash, "Requesting tx set from EXTERNALIZE");
+            if let Ok(hashes) = crate::herder_utils::get_validated_tx_set_hashes(&envelope) {
+                for tx_set_hash in hashes {
+                    if slot > lcl {
+                        if self.scp_driver.request_tx_set(tx_set_hash, slot) {
+                            debug!(slot, hash = %tx_set_hash, "Requesting tx set from EXTERNALIZE");
+                        }
                     }
                 }
             }
@@ -2162,6 +2166,14 @@ impl Herder {
                     self.scp_driver
                         .record_peer_externalize_event(slot, &envelope.statement.node_id);
                 }
+
+                // Slot quorum tracker: record the envelope at SCP-acceptance
+                // boundary. This matches the timing of stellar-core's
+                // processSCPQueueUpToIndex — envelopes become quorum-relevant
+                // only after SCP actually accepts them (Valid/ValidNew).
+                self.slot_quorum_tracker
+                    .write()
+                    .record_envelope(slot, envelope.statement.node_id.clone());
 
                 if result == henyey_scp::EnvelopeState::Valid {
                     // Valid but not new
@@ -5069,7 +5081,12 @@ mod tests {
             tx_set_hash: stellar_xdr::curr::Hash([0u8; 32]),
             close_time: TimePoint(close_time),
             upgrades: vec![].try_into().unwrap(),
-            ext: StellarValueExt::Basic,
+            ext: StellarValueExt::Signed(LedgerCloseValueSignature {
+                node_id: XdrNodeId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
+                    stellar_xdr::curr::Uint256([0u8; 32]),
+                )),
+                signature: XdrSignature(vec![0u8; 64].try_into().unwrap()),
+            }),
         };
         Value(sv.to_xdr(Limits::none()).unwrap().try_into().unwrap())
     }
