@@ -430,6 +430,10 @@ test_plan_bootstrap_preserves_valid_home_data_overrides() {
 # --------------------------------------------------------------------------
 # Run all tests
 # --------------------------------------------------------------------------
+
+# Ensure $HOME/data exists — CI runners (e.g. /home/runner) may not have it.
+mkdir -p "$HOME/data"
+
 echo "TAP version 13"
 
 test_review_pr_workspace_contract_resolves_under_home_data
