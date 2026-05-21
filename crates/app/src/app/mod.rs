@@ -4331,8 +4331,9 @@ mod tests {
     /// tracking_slot`), matching stellar-core's `isSynced()` precondition in
     /// `setupTriggerNextLedger`.
     ///
-    /// Parity: stellar-core HerderImpl.cpp — `trackingConsensusLedgerIndex()`
-    /// requires `lastClosedLedger + 1 == trackingConsensusLedgerIndex`.
+    /// Parity: stellar-core HerderImpl.cpp — `nextConsensusLedgerIndex()`
+    /// (== `tracking_slot()` in henyey) requires
+    /// `lastClosedLedger + 1 == nextConsensusLedgerIndex`.
     #[tokio::test]
     async fn test_try_trigger_consensus_skips_when_lcl_behind_tracking_slot() {
         let dir = tempfile::tempdir().expect("temp dir");

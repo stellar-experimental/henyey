@@ -21,7 +21,7 @@ excluded. SHOULD claims and operational defaults excluded.
 | §4 | State machine transitions | Full | state.rs:82 + herder.rs:980 |
 | §4 | INV: BOOTING regression forbidden | Full | state.rs:82-88 |
 | §4 | trackingConsensusLedgerIndex >= LCL | Full | herder.rs:1066 (corrective; deviation) |
-| §5.1 | Trigger setup preconditions | Partial | App::try_trigger_consensus (behind/applying) + herder.rs:2399-2444 (lcl_matches_slot); diverges on LCL≥tracking corrective recovery |
+| §5.1 | Trigger setup preconditions | Partial | consensus.rs:121-163 (behind/applying gates) + herder.rs:2399-2444 (lcl_matches_slot); diverges: (1) LCL≥tracking uses corrective recovery instead of fail-fast assertion, (2) no post-build `isApplying()` suppression before nomination (stellar-core HerderImpl.cpp:1579-1585) |
 | §5.1 | ctValidityOffset adjustment of trigger time | Absent | not found |
 | §5.1 | MANUAL_CLOSE skips trigger | Full | herder.rs:1758 (suppress_scp gate) |
 | §5.2 | triggerNextLedger pipeline | Full | herder.rs:2399 + build_nomination_value |
