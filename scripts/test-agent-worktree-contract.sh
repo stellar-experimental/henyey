@@ -233,6 +233,197 @@ test_claude_plan_synced() {
 }
 
 # --------------------------------------------------------------------------
+# Helper: extract the first fenced bash block from a markdown section.
+# Usage: extract_bash_block FILE SECTION_HEADING
+# Returns the content of the ```bash ... ``` block (without the fences).
+# --------------------------------------------------------------------------
+extract_bash_block() {
+  local file="$1" heading="$2"
+  sed -n "/^### *${heading}\|^## *${heading}/,/^## \|^### /{
+    /^\`\`\`bash/,/^\`\`\`/{
+      /^\`\`\`bash/d
+      /^\`\`\`/d
+      p
+    }
+  }" "$file"
+}
+
+# --------------------------------------------------------------------------
+# Test: review-pr bootstrap rejects outside-$HOME/data overrides
+# --------------------------------------------------------------------------
+test_review_pr_bootstrap_rejects_outside_home_data_overrides() {
+  local desc="review-pr bootstrap rejects outside-\$HOME/data overrides"
+
+  # Extract the reviewer workspace contract bootstrap
+  local snippet
+  snippet=$(extract_bash_block "$REVIEW_PR_SKILL" "Reviewer workspace contract")
+
+  if [ -z "$snippet" ]; then
+    tap_not_ok "$desc" "Could not extract reviewer workspace contract bash block from review-pr SKILL.md"
+    return
+  fi
+
+  # Run the snippet in a subshell with outside-$HOME/data overrides.
+  # It should exit non-zero.
+  local tmpdir
+  tmpdir=$(mktemp -d)
+  local fake_home="$tmpdir/fakehome"
+  mkdir -p "$fake_home/data" "$fake_home/not-under-data"
+
+  local output exit_code=0
+  output=$(
+    HOME="$fake_home" \
+    CLAUDE_SESSION_ID="test-session" \
+    ISSUE="9999" \
+    PR_NUM="1234" \
+    WORKTREE_BASE="$fake_home/not-under-data/review-pr" \
+    CARGO_TARGET_DIR="$fake_home/not-under-data/cargo-target" \
+    bash -c "$snippet" 2>&1
+  ) || exit_code=$?
+
+  rm -rf "$tmpdir"
+
+  if [ "$exit_code" -ne 0 ]; then
+    tap_ok "$desc"
+  else
+    tap_not_ok "$desc" "Expected non-zero exit for outside-\$HOME/data overrides, got 0. Output: $output"
+  fi
+}
+
+# --------------------------------------------------------------------------
+# Test: plan bootstrap rejects outside-$HOME/data overrides
+# --------------------------------------------------------------------------
+test_plan_bootstrap_rejects_outside_home_data_overrides() {
+  local desc="plan bootstrap rejects outside-\$HOME/data overrides"
+
+  # Extract the critic workspace contract bootstrap
+  local snippet
+  snippet=$(extract_bash_block "$PLAN_SKILL" "Critic workspace contract")
+
+  if [ -z "$snippet" ]; then
+    tap_not_ok "$desc" "Could not extract critic workspace contract bash block from plan SKILL.md"
+    return
+  fi
+
+  # Run the snippet with outside-$HOME/data overrides — should exit non-zero.
+  local tmpdir
+  tmpdir=$(mktemp -d)
+  local fake_home="$tmpdir/fakehome"
+  mkdir -p "$fake_home/data" "$fake_home/not-under-data"
+
+  local output exit_code=0
+  output=$(
+    HOME="$fake_home" \
+    CLAUDE_SESSION_ID="test-session" \
+    ISSUE="9999" \
+    WORKTREE_BASE="$fake_home/not-under-data/plan" \
+    CARGO_TARGET_DIR="$fake_home/not-under-data/cargo-target" \
+    bash -c "$snippet" 2>&1
+  ) || exit_code=$?
+
+  rm -rf "$tmpdir"
+
+  if [ "$exit_code" -ne 0 ]; then
+    tap_ok "$desc"
+  else
+    tap_not_ok "$desc" "Expected non-zero exit for outside-\$HOME/data overrides, got 0. Output: $output"
+  fi
+}
+
+# --------------------------------------------------------------------------
+# Test: review-pr bootstrap preserves valid $HOME/data overrides
+# --------------------------------------------------------------------------
+test_review_pr_bootstrap_preserves_valid_home_data_overrides() {
+  local desc="review-pr bootstrap preserves valid \$HOME/data overrides"
+
+  local snippet
+  snippet=$(extract_bash_block "$REVIEW_PR_SKILL" "Reviewer workspace contract")
+
+  if [ -z "$snippet" ]; then
+    tap_not_ok "$desc" "Could not extract reviewer workspace contract bash block from review-pr SKILL.md"
+    return
+  fi
+
+  local tmpdir
+  tmpdir=$(mktemp -d)
+  local fake_home="$tmpdir/fakehome"
+  mkdir -p "$fake_home/data/my-session/review-pr-1234"
+
+  # Run with valid overrides under $HOME/data — should exit 0 and preserve values.
+  local output exit_code=0
+  output=$(
+    HOME="$fake_home" \
+    CLAUDE_SESSION_ID="test-session" \
+    ISSUE="9999" \
+    PR_NUM="1234" \
+    WORKTREE_BASE="$fake_home/data/my-session/review-pr-1234" \
+    CARGO_TARGET_DIR="$fake_home/data/my-session/review-pr-1234/cargo-target" \
+    bash -c "$snippet"' && echo "WORKTREE_BASE=$WORKTREE_BASE" && echo "CARGO_TARGET_DIR=$CARGO_TARGET_DIR"' 2>&1
+  ) || exit_code=$?
+
+  rm -rf "$tmpdir"
+
+  if [ "$exit_code" -ne 0 ]; then
+    tap_not_ok "$desc" "Expected exit 0 for valid overrides, got $exit_code. Output: $output"
+    return
+  fi
+
+  # Verify the values survived (were not overwritten by defaults)
+  if echo "$output" | grep -q "WORKTREE_BASE=$fake_home/data/my-session/review-pr-1234" &&
+     echo "$output" | grep -q "CARGO_TARGET_DIR=$fake_home/data/my-session/review-pr-1234/cargo-target"; then
+    tap_ok "$desc"
+  else
+    tap_not_ok "$desc" "Valid overrides were not preserved. Output: $output"
+  fi
+}
+
+# --------------------------------------------------------------------------
+# Test: plan bootstrap preserves valid $HOME/data overrides
+# --------------------------------------------------------------------------
+test_plan_bootstrap_preserves_valid_home_data_overrides() {
+  local desc="plan bootstrap preserves valid \$HOME/data overrides"
+
+  local snippet
+  snippet=$(extract_bash_block "$PLAN_SKILL" "Critic workspace contract")
+
+  if [ -z "$snippet" ]; then
+    tap_not_ok "$desc" "Could not extract critic workspace contract bash block from plan SKILL.md"
+    return
+  fi
+
+  local tmpdir
+  tmpdir=$(mktemp -d)
+  local fake_home="$tmpdir/fakehome"
+  mkdir -p "$fake_home/data/my-session/plan-9999"
+
+  # Run with valid overrides under $HOME/data — should exit 0 and preserve values.
+  local output exit_code=0
+  output=$(
+    HOME="$fake_home" \
+    CLAUDE_SESSION_ID="test-session" \
+    ISSUE="9999" \
+    WORKTREE_BASE="$fake_home/data/my-session/plan-9999" \
+    CARGO_TARGET_DIR="$fake_home/data/my-session/plan-9999/cargo-target" \
+    bash -c "$snippet"' && echo "WORKTREE_BASE=$WORKTREE_BASE" && echo "CARGO_TARGET_DIR=$CARGO_TARGET_DIR"' 2>&1
+  ) || exit_code=$?
+
+  rm -rf "$tmpdir"
+
+  if [ "$exit_code" -ne 0 ]; then
+    tap_not_ok "$desc" "Expected exit 0 for valid overrides, got $exit_code. Output: $output"
+    return
+  fi
+
+  # Verify the values survived
+  if echo "$output" | grep -q "WORKTREE_BASE=$fake_home/data/my-session/plan-9999" &&
+     echo "$output" | grep -q "CARGO_TARGET_DIR=$fake_home/data/my-session/plan-9999/cargo-target"; then
+    tap_ok "$desc"
+  else
+    tap_not_ok "$desc" "Valid overrides were not preserved. Output: $output"
+  fi
+}
+
+# --------------------------------------------------------------------------
 # Run all tests
 # --------------------------------------------------------------------------
 echo "TAP version 13"
@@ -246,6 +437,10 @@ test_review_pr_cargo_target_under_data
 test_plan_cargo_target_under_data
 test_claude_review_pr_synced
 test_claude_plan_synced
+test_review_pr_bootstrap_rejects_outside_home_data_overrides
+test_plan_bootstrap_rejects_outside_home_data_overrides
+test_review_pr_bootstrap_preserves_valid_home_data_overrides
+test_plan_bootstrap_preserves_valid_home_data_overrides
 
 echo "1..$TEST_NUM"
 echo "# pass: $PASS"
