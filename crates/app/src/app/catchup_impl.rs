@@ -6279,21 +6279,74 @@ mod tests {
         assert_eq!(result, None);
     }
 
-    /// Regression test: offline catchup must NOT install an SCP trust anchor even
-    /// when herder has externalized target+1. This verifies the run_mode gate
-    /// added in response to the review finding that offline paths must remain
-    /// TrustSource::None regardless of incidental herder cache state.
+    // ================================================================
+    // Production-path wiring tests: verify that run_catchup_work() installs
+    // (or does not install) the SCP trust anchor based on CatchupRunMode.
+    //
+    // These tests drive the real catchup_with_run_mode() entry point and use
+    // tracing capture to observe the anchor-installation decision. The
+    // "Resolved SCP trust anchor" log fires inside run_catchup_work() at the
+    // exact production branch under test, BEFORE any archive I/O. If the
+    // `if run_mode == CatchupRunMode::Online` gate were removed, both tests
+    // would see the log (causing the offline test to fail).
+    // ================================================================
+
+    /// Minimal tracing layer that records whether a specific message was logged.
+    mod anchor_tracing {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        use tracing::subscriber::Subscriber;
+        use tracing_subscriber::layer::Context;
+        use tracing_subscriber::Layer;
+
+        /// Layer that sets a flag when "Resolved SCP trust anchor" is logged.
+        pub struct AnchorDetector {
+            pub detected: Arc<AtomicBool>,
+        }
+
+        impl<S: Subscriber> Layer<S> for AnchorDetector {
+            fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
+                // Check the message field for our target log line.
+                let mut visitor = MessageVisitor(String::new());
+                event.record(&mut visitor);
+                if visitor.0.contains("Resolved SCP trust anchor") {
+                    self.detected.store(true, Ordering::SeqCst);
+                }
+            }
+        }
+
+        struct MessageVisitor(String);
+
+        impl tracing::field::Visit for MessageVisitor {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                if field.name() == "message" {
+                    self.0 = format!("{:?}", value);
+                }
+            }
+
+            fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                if field.name() == "message" {
+                    self.0 = value.to_string();
+                }
+            }
+        }
+    }
+
+    /// Online catchup with herder data MUST install the SCP trust anchor.
+    /// This test exercises the real `catchup_with_run_mode(Online)` production
+    /// path and would fail if the anchor-installation block were removed.
     #[tokio::test]
-    async fn test_offline_catchup_does_not_install_scp_trust_anchor() {
+    async fn test_online_catchup_installs_scp_trust_anchor_production_path() {
         use henyey_history::CatchupRunMode;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        use tracing_subscriber::layer::SubscriberExt;
 
         let dir = tempfile::tempdir().expect("temp dir");
         let db_path = dir.path().join("rs-stellar-test.db");
         let mut config = crate::config::ConfigBuilder::simulation()
             .database_path(db_path)
             .build();
-        // Point to an unreachable archive — catchup will fail at download,
-        // but that's after the SCP anchor decision point.
         config.history.archives = vec![crate::config::HistoryArchiveEntry {
             name: "unreachable".to_string(),
             url: "http://127.0.0.1:1/.well-known/stellar-history.json".to_string(),
@@ -6307,25 +6360,105 @@ mod tests {
         let target_ledger: u32 = 100;
         let expected_prev_hash = henyey_common::types::Hash256([42u8; 32]);
 
-        // Seed herder with externalized target+1. This means
-        // resolve_scp_trust_anchor() WOULD return Some if called.
+        // Seed herder with externalized target+1.
         seed_externalized_with_tx_set(&app, (target_ledger + 1) as u64, expected_prev_hash);
 
-        // Verify the herder data is available.
+        // Precondition: herder data is available.
         assert_eq!(
             app.resolve_scp_trust_anchor(target_ledger),
             Some((target_ledger, expected_prev_hash)),
             "precondition: herder data must be available"
         );
 
-        // Run offline catchup — this should NOT install the SCP anchor.
+        // Set up tracing capture to detect anchor installation.
+        let detected = Arc::new(AtomicBool::new(false));
+        let layer = anchor_tracing::AnchorDetector {
+            detected: Arc::clone(&detected),
+        };
+        let subscriber = tracing_subscriber::registry().with(layer);
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        // Run online catchup — the anchor decision fires before archive download.
         let (persist_tx, _persist_rx) = tokio::sync::oneshot::channel();
         let finalize = super::persist::CatchupFinalizer::deferred(
             app.db.clone(),
             app.ledger_manager.clone(),
             persist_tx,
         );
-        let result = app
+        let _result = app
+            .catchup_with_run_mode(
+                CatchupTarget::Ledger(target_ledger),
+                CatchupMode::Minimal,
+                CatchupRunMode::Online,
+                finalize,
+            )
+            .await;
+
+        // The anchor-installation log MUST have fired for Online mode.
+        assert!(
+            detected.load(Ordering::SeqCst),
+            "Online catchup with herder data must install SCP trust anchor \
+             (log 'Resolved SCP trust anchor' was not emitted — \
+             the run_catchup_work() online wiring is broken)"
+        );
+    }
+
+    /// Offline catchup must NOT install an SCP trust anchor even when herder
+    /// has externalized target+1. This exercises the real
+    /// `catchup_with_run_mode(OfflineBasic)` production path and would fail
+    /// if the `run_mode == Online` gate were removed.
+    #[tokio::test]
+    async fn test_offline_catchup_does_not_install_scp_trust_anchor_production_path() {
+        use henyey_history::CatchupRunMode;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-test.db");
+        let mut config = crate::config::ConfigBuilder::simulation()
+            .database_path(db_path)
+            .build();
+        config.history.archives = vec![crate::config::HistoryArchiveEntry {
+            name: "unreachable".to_string(),
+            url: "http://127.0.0.1:1/.well-known/stellar-history.json".to_string(),
+            get_enabled: true,
+            put_enabled: false,
+            put: None,
+            mkdir: None,
+        }];
+        let app = App::new(config).await.unwrap();
+
+        let target_ledger: u32 = 100;
+        let expected_prev_hash = henyey_common::types::Hash256([42u8; 32]);
+
+        // Seed herder with externalized target+1. resolve_scp_trust_anchor()
+        // WOULD return Some if called — but OfflineBasic must skip it.
+        seed_externalized_with_tx_set(&app, (target_ledger + 1) as u64, expected_prev_hash);
+
+        // Precondition: herder data is available.
+        assert_eq!(
+            app.resolve_scp_trust_anchor(target_ledger),
+            Some((target_ledger, expected_prev_hash)),
+            "precondition: herder data must be available"
+        );
+
+        // Set up tracing capture to detect anchor installation.
+        let detected = Arc::new(AtomicBool::new(false));
+        let layer = anchor_tracing::AnchorDetector {
+            detected: Arc::clone(&detected),
+        };
+        let subscriber = tracing_subscriber::registry().with(layer);
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        // Run offline catchup — the anchor decision must NOT fire.
+        let (persist_tx, _persist_rx) = tokio::sync::oneshot::channel();
+        let finalize = super::persist::CatchupFinalizer::deferred(
+            app.db.clone(),
+            app.ledger_manager.clone(),
+            persist_tx,
+        );
+        let _result = app
             .catchup_with_run_mode(
                 CatchupTarget::Ledger(target_ledger),
                 CatchupMode::Minimal,
@@ -6334,17 +6467,12 @@ mod tests {
             )
             .await;
 
-        // Catchup fails (archive unreachable) — that's expected and fine.
-        // The important thing is that it did NOT fail with FatalChainDisagreement,
-        // which would indicate the SCP anchor was incorrectly installed.
+        // The anchor-installation log must NOT have fired for OfflineBasic.
         assert!(
-            result.is_err(),
-            "expected catchup to fail (unreachable archive)"
-        );
-        let err_msg = format!("{}", result.unwrap_err());
-        assert!(
-            !err_msg.contains("FatalChainDisagreement"),
-            "offline catchup must not produce FatalChainDisagreement; got: {err_msg}"
+            !detected.load(Ordering::SeqCst),
+            "Offline catchup must NOT install SCP trust anchor even when \
+             herder has externalized target+1 (log 'Resolved SCP trust anchor' \
+             was emitted — the run_mode gate is broken)"
         );
     }
 }
