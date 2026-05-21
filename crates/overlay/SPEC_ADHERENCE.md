@@ -3,10 +3,10 @@
 **Spec version:** 26 (Overlay Protocol v38–v39)
 **Crate:** crates/overlay
 **Last updated:** 2026-05-21
-**Overall adherence:** 82%
+**Overall adherence:** 81%
 
 Counts (excluding Drift and N/A from denominator):
-**Full 81 | Partial 15 | Absent 3 | Drift 2 | N/A 2**
+**Full 80 | Partial 16 | Absent 3 | Drift 2 | N/A 2**
 
 ## Summary table
 
@@ -57,7 +57,7 @@ Counts (excluding Drift and N/A from denominator):
 | §9.3 | `DONT_HAVE` reply for miss | Partial | Handled inbound (`message_handlers.rs:314-340`); outbound (sending DONT_HAVE for unknown items) lives in app callbacks |
 | §9.4 | PEERS broadcasting (≤50 entries, randomized) | Partial | `manager/mod.rs:1373-1415` builds message; MAX_PEERS_PER_MESSAGE cap applied; pool combines outbound+inbound but selection not strictly the spec's "sample 50 from outbound pool first" algorithm |
 | §9.4 | PEERS receipt: `ensureExists` per entry | Full | App-owned: `crates/app/src/app/peers.rs:293-338` `process_peer_list()` converts, filters, persists entries and adds to overlay; dispatched from `lifecycle.rs:1689` |
-| §9.4 | PEERS receipt: skip port==0, IPv6, private, self, localhost | Full | App-owned: `crates/app/src/app/peers.rs:293-338` filters invalid/duplicate/disallowed peers before persisting |
+| §9.4 | PEERS receipt: skip port==0, IPv6, private, self, localhost | Partial | App-owned: `crates/app/src/app/peers.rs:293-338` filters port==0, IPv6, private, localhost via `is_public_peer`; **missing explicit self-address filter** (stellar-core checks `Peer.cpp:2024-2030`) |
 | §9.4 | PEERS one-per-connection + role check (INV-O12, INV-O13) | Full | `manager/peer_loop.rs:505-531,700-718` |
 | §10.1 | Peer DB schema (ip, port, nextattempt, numfailures, type) | Full | `peer_manager.rs:14-25,222-238` |
 | §10.1 | Type lattice (PREFERRED upgrade, INBOUND no promote) | Full | `peer_manager.rs:577-615` |
@@ -81,7 +81,7 @@ Counts (excluding Drift and N/A from denominator):
 | §11.3 | Curve25519 sealed-box encryption/decryption | Full | App-owned: `crates/app/src/app/survey_impl.rs:674-680` (`seal_to_curve25519_public_key`) and `786-793` (`open_from_curve25519_secret_key`) via `henyey_crypto` |
 | §11.5 | `surveyorPermitted` (allowlist or tracked quorum) | Partial | `survey.rs:415-421` supports allowlist; tracked-quorum fallback not implemented |
 | §11.6 | TimeSlicedNodeData / PeerData counters | Full | `survey.rs:74-212,491-521` |
-| §12.1 | ERROR_MSG: zero seq+MAC pre-key, normal HMAC post-key | Full | `auth.rs:672-675,737-744` (Error skips MAC unconditionally — see Drift) |
+| §12.1 | ERROR_MSG: zero seq+MAC pre-key, normal HMAC post-key | Full | `auth.rs:672-675,737-744` (Error skips MAC unconditionally — matches spec §12.1 exemption) |
 | §12.1 | ERROR_MSG drops connection | Full | `manager/peer_loop.rs:1046-1064` |
 | §12.2 | ERR_MISC/ERR_DATA/ERR_CONF/ERR_AUTH/ERR_LOAD usage | Full | `peer.rs:557-576`, `manager/connection.rs:224`, `manager/peer_loop.rs:1079-1082` |
 | §12.3 | Drop-once idempotence (INV-O19) | Partial | No `mDropStarted`-style atomic flag in `peer.rs::close`; instead state machine + tokio drop semantics. Idempotence relies on `state != PeerState::Disconnected` guard (`peer.rs:932-939`), which is single-threaded per peer. |
@@ -142,9 +142,9 @@ Corrected invariant tally: **Full 17 | Partial 2 | Absent 0**.
 - **Rust**: `Peer::handshake` blocks on `recv_hello` then `recv_auth`; any unexpected message returns `InvalidMessage`. Post-handshake, `is_handshake_message` checks block stray HELLO/AUTH (`peer_loop.rs:721-727`).
 - **Notes**: Implicit handling; no separate scheduler queue. Behavior matches in practice.
 
-### §9.4 — PEERS receipt (Full — app-owned)
+### §9.4 — PEERS receipt (Partial — app-owned)
 - **Claim**: For each entry in a received PEERS message: skip if port==0/IPv6/private/self/localhost; otherwise call `PeerManager::ensureExists`.
-- **Status**: **Full (app-owned)**. The stale 2026-05-13 audit incorrectly marked this Absent because it searched only `crates/overlay/`. The receive path is wired through `crates/app/src/app/lifecycle.rs:1689` which dispatches `StellarMessage::Peers` to `process_peer_list()` in `crates/app/src/app/peers.rs:293-338`. That function converts XDR peer addresses, filters invalid/duplicate/disallowed peers, persists them via `PeerManager::ensure_exists`, and refreshes known peers in the overlay.
+- **Status**: **Partial (app-owned)**. The stale 2026-05-13 audit incorrectly marked this Absent because it searched only `crates/overlay/`. The receive path is wired through `crates/app/src/app/lifecycle.rs:1689` which dispatches `StellarMessage::Peers` to `process_peer_list()` in `crates/app/src/app/peers.rs:293-338`. That function converts XDR peer addresses, filters port==0/IPv6/private/localhost via `filter_discovered_peers` + `is_public_peer` (lines 463-514), then persists via direct DB writes (`persist_peers` at lines 441-454) and calls `overlay.add_peers()`. **Gap**: no explicit self-address filter matching stellar-core's check at `Peer.cpp:2024-2030`.
 
 ### §11.3 — Survey request/response flow (Full — app-owned)
 - **Claim**: On `TIME_SLICED_SURVEY_REQUEST` receipt, validate via `SurveyMessageLimiter::addAndValidateRequest`, verify signature, fill `TopologyResponseBodyV2`, sealed-box encrypt with `encryptionKey`, sign response, broadcast.
@@ -166,12 +166,10 @@ Corrected invariant tally: **Full 17 | Partial 2 | Absent 0**.
 - **Rust**: XDR decode errors surface as `OverlayError::Message`, propagated to the peer loop which logs and drops the peer (`peer_loop.rs:1334-1366`). The error message is *not* specifically `ERR_DATA` — the connection simply terminates without sending an outbound `ERROR_MSG`.
 - **Notes**: Drop happens; ERR_DATA is not transmitted. Lower-priority drift since the peer will see the TCP close.
 
-### §12.1 — ERROR_MSG MAC handling (Drift)
+### §12.1 — ERROR_MSG MAC handling (Full)
 - **Claim**: ERROR_MSG sent with zero seq+MAC pre-key, normal HMAC post-key.
 - **Rust**: `auth.rs:672-675` *always* skips MAC verification for incoming ERROR_MSG, regardless of whether keys are established.
 - **Notes**: Spec text actually says the receiver doesn't verify the MAC on ERROR_MSG (§12.1 lines 1304-1306) — so this is **NOT** drift. **Reclassify: Full.** The send path doesn't emit a real MAC even when keys are set (`peer.rs:557-576` uses `send_raw`), which matches the spec exemption.
-
-(Corrected tally: same as initial: Full 38 | Partial 11 | Absent 5.)
 
 ### §10.4 — Tick promote-inbound (Absent)
 - **Claim**: Step 8: "Promote inbound peers (open a parallel outbound connection to their address) to fill any leftover pending slots."
