@@ -34,7 +34,7 @@ cleanup
 mkdir -p "$TEST_ROOT"
 
 # ── TAP state ────────────────────────────────────────────────────────────────
-TAP_PLAN=21
+TAP_PLAN=27
 TAP_CURRENT=0
 TAP_FAILURES=0
 
@@ -341,6 +341,65 @@ if grep -q 'review-pr-merge.sh' "$SKILL_FILE" && grep -q 'auto-merge.*armed' "$S
 else
   tap_fail "SKILL.md references merge helper and auto-merge armed path" \
     "SKILL.md missing references to review-pr-merge.sh or auto-merge armed"
+fi
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TEST 15: classify_linked_pr_state propagates API failure
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Use a file that doesn't exist to simulate API failure
+export REVIEW_PR_LINKED_PRS_FILE="/nonexistent/path/should-fail.json"
+set +e
+RESULT=$(classify_linked_pr_state 9999)
+RC=$?
+set -e
+assert_eq "1" "$RC" "classify_linked_pr_state returns 1 on API failure"
+[[ "$RESULT" == error:* ]] && \
+  tap_ok "classify_linked_pr_state outputs error: on API failure" || \
+  tap_fail "classify_linked_pr_state outputs error: on API failure" "got: $RESULT"
+unset REVIEW_PR_LINKED_PRS_FILE
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TEST 16: is_auto_merge_armed propagates API failure
+# ══════════════════════════════════════════════════════════════════════════════
+
+export REVIEW_PR_AUTO_MERGE_FILE="/nonexistent/path/should-fail.json"
+set +e
+RESULT=$(is_auto_merge_armed 9999)
+RC=$?
+set -e
+assert_eq "1" "$RC" "is_auto_merge_armed returns 1 on API failure"
+assert_eq "error" "$RESULT" "is_auto_merge_armed outputs error on API failure"
+unset REVIEW_PR_AUTO_MERGE_FILE
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TEST 17: attempt_merge uses REVIEW_PR_SCRATCH_DIR instead of mktemp
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Set a custom scratch dir and verify attempt_merge uses it (no mktemp)
+CUSTOM_SCRATCH="$TEST_ROOT/custom-scratch"
+mkdir -p "$CUSTOM_SCRATCH"
+export REVIEW_PR_SCRATCH_DIR="$CUSTOM_SCRATCH"
+
+mock_merge_success() {
+  local pr_num="$1" repo="$2" flags="$3"
+  return 0
+}
+export REVIEW_PR_MERGE_CMD=mock_merge_success
+RESULT=$(attempt_merge 1234)
+assert_eq "merged" "$RESULT" "attempt_merge uses REVIEW_PR_SCRATCH_DIR (no mktemp)"
+unset REVIEW_PR_MERGE_CMD REVIEW_PR_SCRATCH_DIR
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TEST 18: SKILL.md documents PR_NUM extraction from PR_STATE
+# ══════════════════════════════════════════════════════════════════════════════
+
+SKILL_FILE="$REPO_ROOT/.github/skills/review-pr/SKILL.md"
+if grep -q 'PR_NUM=.*PR_STATE#open:' "$SKILL_FILE"; then
+  tap_ok "SKILL.md documents explicit PR_NUM extraction from PR_STATE"
+else
+  tap_fail "SKILL.md documents explicit PR_NUM extraction from PR_STATE" \
+    "SKILL.md missing PR_NUM extraction from open: state"
 fi
 
 # ── Summary ──────────────────────────────────────────────────────────────────

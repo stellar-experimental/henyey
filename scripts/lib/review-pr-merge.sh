@@ -35,8 +35,9 @@ attempt_merge() {
   local pr_num="$1"
   local repo="${REVIEW_PR_REPO:-stellar-experimental/henyey}"
 
-  local stderr_file
-  stderr_file=$(mktemp)
+  local scratch_dir="${REVIEW_PR_SCRATCH_DIR:-${HOME}/data/review-pr-scratch}"
+  mkdir -p "$scratch_dir"
+  local stderr_file="$scratch_dir/merge-stderr-$$-$pr_num.tmp"
 
   # Try admin merge first
   if _review_pr_exec_merge "$pr_num" "$repo" "--squash --admin" "$stderr_file"; then
@@ -78,15 +79,19 @@ attempt_merge() {
 #   "merged:<pr_number>"  — no open PR, but a merged one exists
 #   "closed:<pr_number>"  — PR was closed without merge
 #   "missing"             — no linked PRs at all
+#   "error:<message>"     — API call failed
 #
-# Returns: 0 always.
+# Returns: 0 on success, 1 on API failure.
 # ─────────────────────────────────────────────────────────────────────────────
 classify_linked_pr_state() {
   local issue_num="$1"
   local repo="${REVIEW_PR_REPO:-stellar-experimental/henyey}"
 
   local linked_prs
-  linked_prs=$(_review_pr_fetch_linked_prs "$issue_num" "$repo")
+  if ! linked_prs=$(_review_pr_fetch_linked_prs "$issue_num" "$repo"); then
+    echo "error:failed to fetch linked PRs"
+    return 1
+  fi
 
   if [[ -z "$linked_prs" || "$linked_prs" == "null" ]]; then
     echo "missing"
@@ -125,15 +130,18 @@ classify_linked_pr_state() {
 #
 # Checks whether a PR has autoMergeRequest set (deferred auto-merge enabled).
 #
-# Output: "true" or "false" on stdout.
-# Returns: 0 always.
+# Output: "true", "false", or "error" on stdout.
+# Returns: 0 on success, 1 on API failure.
 # ─────────────────────────────────────────────────────────────────────────────
 is_auto_merge_armed() {
   local pr_num="$1"
   local repo="${REVIEW_PR_REPO:-stellar-experimental/henyey}"
 
   local auto_merge
-  auto_merge=$(_review_pr_fetch_auto_merge_state "$pr_num" "$repo")
+  if ! auto_merge=$(_review_pr_fetch_auto_merge_state "$pr_num" "$repo"); then
+    echo "error"
+    return 1
+  fi
 
   if [[ "$auto_merge" == "true" ]]; then
     echo "true"

@@ -41,21 +41,68 @@ Classify the linked PR state (distinguishes OPEN, MERGED, and CLOSED-without-mer
 
 ```bash
 PR_STATE=$(classify_linked_pr_state $ISSUE)
+PR_STATE_RC=$?
+
+# API failure — retry once, then block
+if [[ $PR_STATE_RC -ne 0 ]]; then
+  sleep 5
+  PR_STATE=$(classify_linked_pr_state $ISSUE) || {
+    echo "## Review: API Failure" && exit 1
+  }
+fi
+```
+
+Extract `PR_NUM` and route based on state:
+
+```bash
+case "$PR_STATE" in
+  open:*)
+    PR_NUM="${PR_STATE#open:}"
+    # Proceed to Step 0.5
+    ;;
+  merged:*)
+    PR_NUM="${PR_STATE#merged:}"
+    # PR already merged — recover merge SHA and follow-up issues, then finalize
+    MERGE_SHA=$(gh pr view "$PR_NUM" --repo stellar-experimental/henyey \
+      --json mergeCommit --jq '.mergeCommit.oid')
+    # Recover previously filed follow-up issue numbers from the armed comment
+    FOLLOWUP_ISSUES=$(gh pr view "$PR_NUM" --repo stellar-experimental/henyey \
+      --json comments --jq '
+        [.comments[].body
+         | select(contains("## Review: Auto-merge armed"))
+         | capture("Follow-up issues filed:\\*\\* (?<nums>[^\n]+)"; "g") | .nums]
+        | last // "none"')
+    # Run Step 7.4 cleanup/done path with recovered metadata and exit
+    ;;
+  closed:*)
+    # PR was closed without merge — bug in /do
+    # Post ## Review: No PR Linked, move to ready-for-doing, unassign, exit
+    ;;
+  missing)
+    # No linked PRs — same handling as closed
+    ;;
+esac
 ```
 
 Handle each state:
 
-- **`open:<number>`** → extract `PR_NUM` and proceed to Step 0.5.
-- **`merged:<number>`** → the PR was already merged (e.g. by a previous `/review-pr` tick that armed auto-merge and GH completed it). Recover the merge SHA via `gh pr view <number> --repo stellar-experimental/henyey --json mergeCommit --jq '.mergeCommit.oid'`, run the Step 7.4 cleanup/done path, and exit.
+- **`open:<number>`** → `PR_NUM` extracted above; proceed to Step 0.5.
+- **`merged:<number>`** → the PR was already merged (e.g. by a previous `/review-pr` tick that armed auto-merge and GH completed it). Recover the merge SHA via `gh pr view <number> --json mergeCommit --jq '.mergeCommit.oid'` and follow-up issue numbers from the `## Review: Auto-merge armed` comment body. Run the Step 7.4 cleanup/done path and exit.
 - **`closed:<number>`** → PR was closed without merge. That's a bug in `/do`. Post `## Review: No PR Linked` and move the issue back to `ready-for-doing`. Unassign. Exit.
 - **`missing`** → no linked PRs at all. Same handling as `closed`.
+- **`error:<message>`** → API failure. Retry once after 5s; if still failing, leave assigned and exit non-zero.
 
 ### Step 0.5 — Check if auto-merge is already armed
 
 Before spawning reviewers or filing follow-up issues, check whether this PR already has auto-merge enabled from a previous tick:
 
 ```bash
-if [[ "$(is_auto_merge_armed $PR_NUM)" == "true" ]]; then
+AUTO_MERGE_STATE=$(is_auto_merge_armed $PR_NUM)
+if [[ $? -ne 0 ]]; then
+  # API failure checking auto-merge state — safe to proceed with normal review
+  # since worst case is a redundant reviewer run. Log the issue.
+  echo "Warning: could not check auto-merge state (API failure)" >&2
+elif [[ "$AUTO_MERGE_STATE" == "true" ]]; then
   # PR is OPEN and auto-merge is armed. GitHub will merge it automatically
   # once branch protection requirements are met. Don't re-run reviewers or
   # re-file follow-up issues — just post a waiting comment and exit.
