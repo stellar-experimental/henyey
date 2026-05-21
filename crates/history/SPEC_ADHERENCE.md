@@ -41,7 +41,7 @@ invariants. INV-C9 (bucket-apply newest-wins) lives in
 | §8.2 | Phase 2: Download + verify chain | Full | `catchup/mod.rs:540-545`, `verify.rs:253-441` |
 | §8.4 | Apply buffered ledgers | N/A | lives in `crates/app/src/app/ledger_close.rs:1758-1792` (`try_apply_buffered_ledgers`) |
 | §8.5 | Post-bucket asserts (HAS/header/LCL) | Full | `catchup/mod.rs:463-486` |
-| §9.1 | Trust establishment | Partial | `verify.rs:303-306` — only TrustSource::None used at call site (`catchup/replay.rs:235`) |
+| §9.1 | Trust establishment | Full | `verify.rs:303-306` — `TrustSource::Scp` plumbed from `App::resolve_scp_trust_anchor()` through `CatchupManager::set_trusted_scp_anchor()` to `catchup/replay.rs` |
 | §9.2 | Reverse-walk verification | Full | `verify.rs:253-441` |
 | §9.3 | Outcome → fatal mapping | Full | `verify.rs:422-436` |
 | §10.1 | Bucket size limit + per-bucket SHA-256 | Full | `catchup/download.rs:230-240`, bucket hash verify in `apply_buckets` (`catchup/buckets.rs:381-405`) |
@@ -123,7 +123,7 @@ invariants. INV-C9 (bucket-apply newest-wins) lives in
 - **§8.5 post-apply asserts**: `catchup/mod.rs:463-486`. **Full**. Both (a) HAS/header seq agreement and (b) INV-C15 (`checkpoint_header.ledger_seq >= lcl_seq`).
 
 ### §9 — Ledger Chain Verification
-- **§9.1 trust anchors**: `verify.rs:53-67` defines `TrustSource::{Scp{seq,hash}, None}` and `ChainTrustAnchors`. Call site at `catchup/replay.rs:235` always uses `TrustSource::None` because SCP-side hash plumbing is not wired through. **Partial**. The pure verification code path correctly implements the trusted-hash check (verify.rs:354-384); only the caller side does not yet provide a trusted hash.
+- **§9.1 trust anchors**: `verify.rs:53-67` defines `TrustSource::{Scp{seq,hash}, None}` and `ChainTrustAnchors`. Online catchup now derives the trust anchor from `Herder::check_ledger_close(target+1)` via `App::resolve_scp_trust_anchor()` and passes it through `CatchupManager::set_trusted_scp_anchor()` to the reverse-walk config in `catchup/replay.rs`. **Full**. Matches stellar-core's `LedgerApplyManagerImpl::startOnlineCatchup()` → `VerifyLedgerChainWork` path. Offline/synthetic callers without an adjacent externalized slot still get `TrustSource::None`.
 - **§9.2 reverse-walk algorithm**: `verify.rs:253-441`. **Full**. Partitions into checkpoint groups, walks reverse, threads cross-checkpoint link, checks `previous_ledger_hash` continuity, LCL+1 link check (verify.rs:393-405).
 - **§9.3 outcome → fatal**: `verify.rs:422-436`. **Full**. When `local_state_disagrees && TrustSource::Scp`, returns `FatalChainDisagreement`; with `TrustSource::None`, returns `InvalidPreviousHash` (retryable). Matches §9.3 table.
 
@@ -179,7 +179,7 @@ All constants present with correct values:
 | INV-C2 (Checkpoint alignment) | Full | `verify.rs:282-292` (group partition by checkpoint); checkpoint ledger range enforced via `verify_tx_result_ordering` (`verify.rs:808-842`). |
 | INV-C3 (HAS integrity) | Full | `verify.rs:709-761` + `archive_state.rs:404-473`. |
 | INV-C4 (BucketList hash agreement) | Full | `verify.rs:480-494` (`verify_ledger_hash`) + `archive_state.rs:600-654` (`compute_bucket_list_hash`). |
-| INV-C5 (Trust anchor authentication) | Partial | Verification function supports `TrustSource::Scp` (`verify.rs:355-384`), but call site uses `TrustSource::None` (`catchup/replay.rs:235`). Internal-only verification still flags LCL disagreement as fatal-via-`InvalidPreviousHash` retry, but no SCP-side trusted hash is plumbed. |
+| INV-C5 (Trust anchor authentication) | Full | Verification function supports `TrustSource::Scp` (`verify.rs:355-384`) and online catchup now plumbs the SCP-derived anchor from `App::resolve_scp_trust_anchor()` → `CatchupManager::set_trusted_scp_anchor()` → `catchup/replay.rs`. LCL disagreement is fatal when trusted hash exists. |
 | INV-C6 (Tx result hash check) | Partial | `verify_tx_result_set` correct (`verify.rs:542-563`) but no `OFFLINE_COMPLETE`-mode caller that loops over every replay-range ledger. See §12. |
 | INV-C7 (Knit-to-LCL exclusivity) | Full | `catchup/replay.rs:58-117` — five mutually-exclusive cases; case 5 returns `KnitOvershot` error (fatal). |
 | INV-C8 (Buffered drain ordering) | N/A | Lives in `crates/app/src/app/ledger_close.rs:1758-1792` (`try_apply_buffered_ledgers` only advances `next_seq = current + 1`; gap stops the chain). |
@@ -220,7 +220,7 @@ No dangling anchors were detected — all cited sections exist in the regenerate
 ## Recommendations
 
 1. **~~Add OFFLINE_BASIC / OFFLINE_COMPLETE / ONLINE mode discriminator~~** ✅ Done (#2829). Wire OFFLINE_COMPLETE to a `verify_results_for_range` work that loops over `results-*.xdr.gz` files for every checkpoint in the replay range, invoking `verify_tx_result_set` per ledger. Closes the §12 / INV-C6 gap (#2831).
-2. **Plumb SCP-side trusted hash through** to `catchup/replay.rs:235` so `TrustSource::Scp` is actually exercised in ONLINE mode. Closes the INV-C5 gap (currently relies on internal-only chain consistency).
+2. ~~**Plumb SCP-side trusted hash through** to `catchup/replay.rs:235` so `TrustSource::Scp` is actually exercised in ONLINE mode. Closes the INV-C5 gap (currently relies on internal-only chain consistency).~~ *(Done — #2830. `App::resolve_scp_trust_anchor()` derives the anchor from `Herder::check_ledger_close(target+1)` and passes it to `CatchupManager::set_trusted_scp_anchor()`.)*
 3. ~~**Add a `REBUILD_FOR_OFFER_TABLE`-equivalent persistent-state flag**~~ *(Partially resolved — §14.5 two-window design covers the startup/catchup recovery path. Remaining gap: CLI readers (`publish_history`, `self_check`) anchor on `MAX(ledgerseq)` instead of durable LCL/HAS and may observe ahead-of-LCL state after a Window-1 crash. Needs hardening.)*
 4. ~~**Update spec §5.3** to acknowledge SQLite-backed publish queue as a conforming alternative storage shape (or vice versa, if filesystem-backed is required for stellar-core interoperability).~~ *(No spec update needed — documented in-repo as intentional implementation difference; queue is node-local. Tracked as Drift 1 above.)*
 5. **Update spec §6.3** to make the post-#2677 collapsed factoring of Case 1 / Case 2 / Case 4b explicit, eliminating the apparent drift.

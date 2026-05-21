@@ -18,7 +18,7 @@
 | Publish queue persistence | Full | SQLite-backed queue replaces filesystem queue |
 | Publish orchestration | Partial | Missing some callbacks, metrics, cleanup helpers |
 | State snapshot publishing | Partial | No differential HAS upload; upload ordering now matches stellar-core (data-before-HAS) |
-| Verification | Full | Header entry hash, header chain, bucket, tx-set, tx-result checks implemented |
+| Verification | Full | Header entry hash, header chain, bucket, tx-set, tx-result checks implemented; SCP trust anchor plumbed from online catchup (§9.1 + INV-C5) |
 | Catchup and replay | Full | Rust-native orchestration covers core flow; §11.2 5-case knit-to-LCL decision matrix matches stellar-core |
 | Metrics and status plumbing | None | No Medida/StatusManager equivalent yet |
 

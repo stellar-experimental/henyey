@@ -836,6 +836,28 @@ impl App {
         // frames match the live-mode LedgerCloseMetaExt version.
         catchup_manager.set_emit_meta_ext_v1(self.config.metadata.emit_ledger_close_meta_ext_v1);
 
+        // §9.1 + INV-C5: Resolve an SCP-derived trust anchor for online catchup.
+        // If target + 1 has been externalized and its tx-set is available, use
+        // tx_set.previous_ledger_hash() as the trusted anchor for reverse-walk
+        // verification. This matches stellar-core's startOnlineCatchup() behavior.
+        // Only applies to Online mode — offline/synthetic paths have no SCP context.
+        if run_mode == CatchupRunMode::Online {
+            if let Some((seq, hash)) = self.resolve_scp_trust_anchor(target_ledger) {
+                tracing::info!(
+                    target_ledger,
+                    adjacent_slot = target_ledger + 1,
+                    trusted_seq = seq,
+                    anchor_hash = %hash.to_hex(),
+                    "Resolved SCP trust anchor from externalized slot target+1"
+                );
+                catchup_manager.set_trusted_scp_anchor(seq, hash);
+                #[cfg(test)]
+                {
+                    *self.last_installed_scp_anchor.lock().unwrap() = Some((seq, hash));
+                }
+            }
+        }
+
         // Run catchup
         progress.set_phase(CatchupPhase::DownloadingBuckets);
 
@@ -918,6 +940,24 @@ impl App {
         tracing::info!("Verifying catchup state");
 
         Ok(output)
+    }
+
+    /// Resolve an SCP-derived trust anchor for reverse-walk verification.
+    ///
+    /// Checks `Herder::check_ledger_close(target_ledger + 1)` for a concrete
+    /// tx-set. If available, returns `(target_ledger, tx_set.previous_ledger_hash())`
+    /// which is the hash of `target_ledger` as attested by SCP consensus.
+    /// Returns `None` if the adjacent slot is not externalized or its tx-set
+    /// is not yet cached (preserving the existing untrusted fallback behavior).
+    ///
+    /// This mirrors stellar-core's `LedgerApplyManagerImpl::startOnlineCatchup()`
+    /// which anchors verification at `firstBufferedLedger.txSet.previousLedgerHash()`.
+    pub(crate) fn resolve_scp_trust_anchor(&self, target_ledger: u32) -> Option<(u32, Hash256)> {
+        let adjacent_slot = (target_ledger as u64) + 1;
+        let info = self.herder.check_ledger_close(adjacent_slot)?;
+        let tx_set = info.tx_set?;
+        let prev_hash = tx_set.previous_ledger_hash();
+        Some((target_ledger, prev_hash))
     }
 
     async fn download_checkpoint_with_historywork(
@@ -6144,6 +6184,244 @@ mod tests {
             "loop must unwedge after first call: counter expected >= 1, got {}. \
              #2789: suppression on every tick prevents any state-changing recovery.",
             app.post_catchup_hard_reset_total.load(Ordering::Relaxed),
+        );
+    }
+
+    // ================================================================
+    // §9.1 + INV-C5: SCP trust anchor resolution tests (#2830)
+    // ================================================================
+
+    /// Helper: seed herder with an externalized slot carrying a tx-set whose
+    /// `previous_ledger_hash` is `expected_prev_hash`.
+    fn seed_externalized_with_tx_set(
+        app: &App,
+        slot: u64,
+        previous_ledger_hash: henyey_common::types::Hash256,
+    ) {
+        use stellar_xdr::curr::{Limits, StellarValue, StellarValueExt, TimePoint, WriteXdr};
+
+        let tx_set = henyey_herder::TransactionSet::new(previous_ledger_hash, vec![]);
+        let tx_set_hash = *tx_set.hash();
+
+        // Cache the tx-set in the SCP driver so check_ledger_close can find it.
+        app.herder.scp_driver().cache_tx_set(tx_set);
+
+        // Build a StellarValue with the matching tx_set_hash.
+        let sv = StellarValue {
+            tx_set_hash: stellar_xdr::curr::Hash(tx_set_hash.0),
+            close_time: TimePoint(1000),
+            upgrades: vec![].try_into().unwrap(),
+            ext: StellarValueExt::Basic,
+        };
+        let value =
+            stellar_xdr::curr::Value(sv.to_xdr(Limits::none()).unwrap().try_into().unwrap());
+
+        // Record the slot as externalized.
+        app.herder
+            .scp_driver()
+            .record_externalized(slot, value, None);
+    }
+
+    #[tokio::test]
+    async fn test_resolve_scp_trust_anchor_uses_herder_target_plus_one_prev_hash() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-test.db");
+        let config = crate::config::ConfigBuilder::simulation()
+            .database_path(db_path)
+            .build();
+        let app = App::new(config).await.unwrap();
+
+        let target_ledger: u32 = 100;
+        let expected_prev_hash = henyey_common::types::Hash256([42u8; 32]);
+
+        // Seed slot target+1 with a tx-set whose previous_ledger_hash is expected_prev_hash.
+        seed_externalized_with_tx_set(&app, (target_ledger + 1) as u64, expected_prev_hash);
+
+        // resolve_scp_trust_anchor should return (target_ledger, expected_prev_hash).
+        let result = app.resolve_scp_trust_anchor(target_ledger);
+        assert_eq!(result, Some((target_ledger, expected_prev_hash)));
+    }
+
+    #[tokio::test]
+    async fn test_resolve_scp_trust_anchor_returns_none_without_adjacent_tx_set() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-test.db");
+        let config = crate::config::ConfigBuilder::simulation()
+            .database_path(db_path)
+            .build();
+        let app = App::new(config).await.unwrap();
+
+        let target_ledger: u32 = 200;
+
+        // Case 1: slot target+1 is not externalized at all.
+        let result = app.resolve_scp_trust_anchor(target_ledger);
+        assert_eq!(result, None);
+
+        // Case 2: slot target+1 is externalized but WITHOUT a cached tx-set.
+        // Build a StellarValue with a tx_set_hash that has no cached tx-set.
+        {
+            use stellar_xdr::curr::{Limits, StellarValue, StellarValueExt, TimePoint, WriteXdr};
+
+            let fake_hash = henyey_common::types::Hash256([99u8; 32]);
+            let sv = StellarValue {
+                tx_set_hash: stellar_xdr::curr::Hash(fake_hash.0),
+                close_time: TimePoint(2000),
+                upgrades: vec![].try_into().unwrap(),
+                ext: StellarValueExt::Basic,
+            };
+            let value =
+                stellar_xdr::curr::Value(sv.to_xdr(Limits::none()).unwrap().try_into().unwrap());
+
+            app.herder
+                .scp_driver()
+                .record_externalized((target_ledger + 1) as u64, value, None);
+        }
+
+        // check_ledger_close will return Some(LedgerCloseInfo { tx_set: None, ... })
+        // because the tx-set is not cached. resolve_scp_trust_anchor should return None.
+        let result = app.resolve_scp_trust_anchor(target_ledger);
+        assert_eq!(result, None);
+    }
+
+    // ================================================================
+    // Production-path wiring tests: verify that run_catchup_work() installs
+    // (or does not install) the SCP trust anchor based on CatchupRunMode.
+    //
+    // These tests drive the real catchup_with_run_mode() entry point and
+    // assert on `App::last_installed_scp_anchor` (a #[cfg(test)] field that
+    // records the actual `set_trusted_scp_anchor()` call). This catches the
+    // case where the surrounding log is preserved but the setter is removed.
+    // ================================================================
+
+    /// Online catchup with herder data MUST install the SCP trust anchor.
+    /// This test exercises the real `catchup_with_run_mode(Online)` production
+    /// path and would fail if the `set_trusted_scp_anchor()` call were removed
+    /// (even if the surrounding log line is preserved).
+    #[tokio::test]
+    async fn test_online_catchup_installs_scp_trust_anchor_production_path() {
+        use henyey_history::CatchupRunMode;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-test.db");
+        let mut config = crate::config::ConfigBuilder::simulation()
+            .database_path(db_path)
+            .build();
+        config.history.archives = vec![crate::config::HistoryArchiveEntry {
+            name: "unreachable".to_string(),
+            url: "http://127.0.0.1:1/.well-known/stellar-history.json".to_string(),
+            get_enabled: true,
+            put_enabled: false,
+            put: None,
+            mkdir: None,
+        }];
+        let app = App::new(config).await.unwrap();
+
+        let target_ledger: u32 = 100;
+        let expected_prev_hash = henyey_common::types::Hash256([42u8; 32]);
+
+        // Seed herder with externalized target+1.
+        seed_externalized_with_tx_set(&app, (target_ledger + 1) as u64, expected_prev_hash);
+
+        // Precondition: herder data is available.
+        assert_eq!(
+            app.resolve_scp_trust_anchor(target_ledger),
+            Some((target_ledger, expected_prev_hash)),
+            "precondition: herder data must be available"
+        );
+
+        // Precondition: no anchor installed yet.
+        assert_eq!(
+            *app.last_installed_scp_anchor.lock().unwrap(),
+            None,
+            "precondition: anchor must not be installed before catchup"
+        );
+
+        // Run online catchup — the anchor decision fires before archive download.
+        let (persist_tx, _persist_rx) = tokio::sync::oneshot::channel();
+        let finalize = super::persist::CatchupFinalizer::deferred(
+            app.db.clone(),
+            app.ledger_manager.clone(),
+            persist_tx,
+        );
+        let _result = app
+            .catchup_with_run_mode(
+                CatchupTarget::Ledger(target_ledger),
+                CatchupMode::Minimal,
+                CatchupRunMode::Online,
+                finalize,
+            )
+            .await;
+
+        // Assert that set_trusted_scp_anchor was actually called with expected values.
+        let installed = app.last_installed_scp_anchor.lock().unwrap().clone();
+        assert_eq!(
+            installed,
+            Some((target_ledger, expected_prev_hash)),
+            "Online catchup with herder data must call set_trusted_scp_anchor() \
+             on CatchupManager — removing the setter while keeping the log \
+             would cause this assertion to fail"
+        );
+    }
+
+    /// Offline catchup must NOT install an SCP trust anchor even when herder
+    /// has externalized target+1. This exercises the real
+    /// `catchup_with_run_mode(OfflineBasic)` production path and would fail
+    /// if the `run_mode == Online` gate were removed.
+    #[tokio::test]
+    async fn test_offline_catchup_does_not_install_scp_trust_anchor_production_path() {
+        use henyey_history::CatchupRunMode;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-test.db");
+        let mut config = crate::config::ConfigBuilder::simulation()
+            .database_path(db_path)
+            .build();
+        config.history.archives = vec![crate::config::HistoryArchiveEntry {
+            name: "unreachable".to_string(),
+            url: "http://127.0.0.1:1/.well-known/stellar-history.json".to_string(),
+            get_enabled: true,
+            put_enabled: false,
+            put: None,
+            mkdir: None,
+        }];
+        let app = App::new(config).await.unwrap();
+
+        let target_ledger: u32 = 100;
+        let expected_prev_hash = henyey_common::types::Hash256([42u8; 32]);
+
+        // Seed herder with externalized target+1. resolve_scp_trust_anchor()
+        // WOULD return Some if called — but OfflineBasic must skip it.
+        seed_externalized_with_tx_set(&app, (target_ledger + 1) as u64, expected_prev_hash);
+
+        // Precondition: herder data is available.
+        assert_eq!(
+            app.resolve_scp_trust_anchor(target_ledger),
+            Some((target_ledger, expected_prev_hash)),
+            "precondition: herder data must be available"
+        );
+
+        // Run offline catchup — the anchor decision must NOT fire.
+        let (persist_tx, _persist_rx) = tokio::sync::oneshot::channel();
+        let finalize = super::persist::CatchupFinalizer::deferred(
+            app.db.clone(),
+            app.ledger_manager.clone(),
+            persist_tx,
+        );
+        let _result = app
+            .catchup_with_run_mode(
+                CatchupTarget::Ledger(target_ledger),
+                CatchupMode::Minimal,
+                CatchupRunMode::OfflineBasic,
+                finalize,
+            )
+            .await;
+
+        // The anchor must NOT have been installed for OfflineBasic.
+        let installed = app.last_installed_scp_anchor.lock().unwrap().clone();
+        assert_eq!(
+            installed, None,
+            "Offline catchup must NOT call set_trusted_scp_anchor() even when \
+             herder has externalized target+1 — the run_mode gate is broken"
         );
     }
 }

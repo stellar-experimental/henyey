@@ -566,6 +566,12 @@ pub struct App {
     /// to `publish_single_checkpoint` will swap it to `false` and panic.
     #[cfg(test)]
     pub(crate) publish_panic_inject: AtomicBool,
+    /// Records the last SCP trust anchor installed during `run_catchup_work`.
+    /// Used by tests to verify that `set_trusted_scp_anchor` was actually called
+    /// on the `CatchupManager` (not just that the surrounding log was emitted).
+    #[cfg(test)]
+    pub(crate) last_installed_scp_anchor:
+        std::sync::Mutex<Option<(u32, henyey_common::types::Hash256)>>,
     /// Buffered externalized ledgers waiting to apply.
     ///
     /// # Invariant (event-loop freeze guard rail)
@@ -1297,6 +1303,8 @@ impl App {
             publish_in_progress: AtomicBool::new(false),
             #[cfg(test)]
             publish_panic_inject: AtomicBool::new(false),
+            #[cfg(test)]
+            last_installed_scp_anchor: std::sync::Mutex::new(None),
             syncing_ledgers: RwLock::new(BTreeMap::new()),
             last_externalized_slot: AtomicU64::new(0),
             scp_messages_sent: AtomicU64::new(0),

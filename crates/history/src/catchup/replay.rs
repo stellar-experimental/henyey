@@ -229,10 +229,15 @@ impl CatchupManager {
             // from highest to lowest, threading trust from the top anchor.
             // Individual header integrity was already verified during download
             // (per-checkpoint verify_header_chain_from_entries).
+            let trust_source = match &self.trusted_scp_anchor {
+                Some((seq, hash)) => verify::TrustSource::Scp {
+                    seq: *seq,
+                    hash: *hash,
+                },
+                None => verify::TrustSource::None,
+            };
             let config = verify::ReverseWalkConfig {
-                // TrustSource::None until SCP consensus hash plumbing is added.
-                // Internal consistency and LCL comparison are still verified.
-                trust_source: verify::TrustSource::None,
+                trust_source,
                 lcl: Some((lcl_snapshot.header.ledger_seq, lcl_snapshot.hash)),
                 max_supported_version: henyey_common::protocol::CURRENT_LEDGER_PROTOCOL_VERSION,
                 min_supported_version: henyey_common::protocol::MIN_LEDGER_PROTOCOL_VERSION,
@@ -1156,5 +1161,140 @@ mod tests {
             }
             assert!(found_any, "metric {metric} not found in catchup/replay.rs",);
         }
+    }
+
+    // ================================================================
+    // §9.1 + INV-C5: Trusted SCP anchor configuration tests (#2830)
+    // ================================================================
+
+    /// Build a valid header chain and matching `LedgerData` entries.
+    /// Returns (ledger_data_vec, hash_of_header_before_chain) where the
+    /// hash before the chain is the `previous_ledger_hash` of the first header.
+    fn make_test_ledger_data_chain(
+        start_seq: u32,
+        count: u32,
+    ) -> (Vec<super::LedgerData>, Hash256) {
+        use crate::verify::compute_header_hash;
+        use henyey_common::protocol::LclContext;
+        use stellar_xdr::curr::{Hash, StellarValue, TimePoint, VecM};
+
+        let mut entries = Vec::with_capacity(count as usize);
+        let mut prev_hash = Hash256::ZERO;
+        let genesis_hash = prev_hash;
+
+        for i in 0..count {
+            let seq = start_seq + i;
+            let header = LedgerHeader {
+                ledger_version: 25,
+                previous_ledger_hash: prev_hash.into(),
+                scp_value: StellarValue {
+                    tx_set_hash: Hash([0u8; 32]),
+                    close_time: TimePoint(0),
+                    upgrades: VecM::default(),
+                    ext: stellar_xdr::curr::StellarValueExt::Basic,
+                },
+                tx_set_result_hash: Hash([0u8; 32]),
+                bucket_list_hash: Hash([0u8; 32]),
+                ledger_seq: seq,
+                total_coins: 0,
+                fee_pool: 0,
+                inflation_seq: 0,
+                id_pool: 0,
+                base_fee: 100,
+                base_reserve: 5000000,
+                max_tx_set_size: 100,
+                skip_list: std::array::from_fn(|_| Hash([0u8; 32])),
+                ext: stellar_xdr::curr::LedgerHeaderExt::V0,
+            };
+
+            let lcl_context = LclContext::new(25, prev_hash);
+            let ledger_data =
+                super::LedgerData::new(header.clone(), None, None, &lcl_context).unwrap();
+            prev_hash = compute_header_hash(&header).unwrap();
+            entries.push(ledger_data);
+        }
+
+        (entries, genesis_hash)
+    }
+
+    /// With TrustSource::Scp (anchor set), LCL disagreement produces
+    /// FatalChainDisagreement through the production `verify_downloaded_data` path.
+    #[test]
+    fn test_verify_downloaded_data_scp_anchor_makes_lcl_disagreement_fatal() {
+        use crate::verify::compute_header_hash;
+
+        let tmpdir = tempfile::tempdir().unwrap();
+        let bucket_manager =
+            henyey_bucket::BucketManager::new(tmpdir.path().to_path_buf()).unwrap();
+        let db = henyey_db::Database::open_in_memory().unwrap();
+        let archive =
+            crate::archive::HistoryArchive::with_name("http://localhost:1234", "test").unwrap();
+        let mut manager = super::CatchupManager::new(vec![archive], bucket_manager, db);
+
+        // Enable header chain verification (production default for catchup).
+        manager.replay_config.verify_header_chain = true;
+
+        // Build a valid chain of 5 headers starting at seq 10.
+        let (ledger_data, _genesis_hash) = make_test_ledger_data_chain(10, 5);
+
+        // Compute the hash of the last header for the SCP trust anchor.
+        let last_header = ledger_data.last().unwrap().header();
+        let last_hash = compute_header_hash(last_header).unwrap();
+
+        // Set SCP trust anchor at the last header in the chain.
+        manager.set_trusted_scp_anchor(last_header.ledger_seq, last_hash);
+
+        // Build a DISAGREEING LCL: seq = 9 (right before chain start), but
+        // hash is wrong (doesn't match first header's previous_ledger_hash).
+        let wrong_lcl_hash = Hash256::from_bytes([0xBB; 32]);
+        let lcl_snapshot = make_test_lcl(9, wrong_lcl_hash, Hash256::ZERO);
+
+        // Call the production path: verify_downloaded_data.
+        let err = manager
+            .verify_downloaded_data(&ledger_data, &lcl_snapshot)
+            .unwrap_err();
+
+        // With TrustSource::Scp, LCL disagreement must be fatal.
+        assert!(
+            matches!(err, crate::HistoryError::FatalChainDisagreement),
+            "expected FatalChainDisagreement with SCP anchor, got: {err}"
+        );
+    }
+
+    /// Without SCP anchor (TrustSource::None), LCL disagreement produces
+    /// InvalidPreviousHash through the production `verify_downloaded_data` path.
+    #[test]
+    fn test_verify_downloaded_data_no_anchor_makes_lcl_disagreement_non_fatal() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let bucket_manager =
+            henyey_bucket::BucketManager::new(tmpdir.path().to_path_buf()).unwrap();
+        let db = henyey_db::Database::open_in_memory().unwrap();
+        let archive =
+            crate::archive::HistoryArchive::with_name("http://localhost:1234", "test").unwrap();
+        let mut manager = super::CatchupManager::new(vec![archive], bucket_manager, db);
+
+        // Enable header chain verification.
+        manager.replay_config.verify_header_chain = true;
+
+        // Build a valid chain of 5 headers starting at seq 10.
+        let (ledger_data, _genesis_hash) = make_test_ledger_data_chain(10, 5);
+
+        // Do NOT set any SCP trust anchor (TrustSource::None by default).
+
+        // Build a DISAGREEING LCL.
+        let wrong_lcl_hash = Hash256::from_bytes([0xBB; 32]);
+        let lcl_snapshot = make_test_lcl(9, wrong_lcl_hash, Hash256::ZERO);
+
+        // Call the production path: verify_downloaded_data.
+        let err = manager
+            .verify_downloaded_data(&ledger_data, &lcl_snapshot)
+            .unwrap_err();
+
+        // Without SCP anchor, LCL disagreement is treated as a broken chain
+        // (InvalidPreviousHash) — retriable, not fatal.
+        assert!(
+            matches!(err, crate::HistoryError::InvalidPreviousHash { .. }),
+            "expected InvalidPreviousHash without SCP anchor, got: {err}"
+        );
     }
 }
