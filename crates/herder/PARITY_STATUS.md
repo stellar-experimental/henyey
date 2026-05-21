@@ -105,7 +105,7 @@ Corresponds to: `Herder.h`, `HerderImpl.h`
 | `lostSync()` | `SyncRecoveryManager::record_lost_sync()` | Full |
 | `checkCloseTime()` | `check_envelope_close_time()` | Full |
 | `ctValidityOffset()` | _(not implemented)_ | None |
-| `setupTriggerNextLedger()` | _(not implemented)_ | None |
+| `setupTriggerNextLedger()` | Split: `App::try_trigger_consensus()` (behind/applying gates) + `Herder::trigger_next_ledger()` (lcl_matches_slot) | Partial — behind/applying/not-tracking guards match; `LCL >= tracking` uses corrective recovery instead of stellar-core's fail-fast assertion; trigger-time / `ctValidityOffset()` tracked separately (#2702) |
 | `startOutOfSyncTimer()` | `SyncRecoveryManager` | Full |
 | `outOfSyncRecovery()` | `out_of_sync_recovery()` | Full |
 | `broadcast()` | `flush_tx_adverts()` in `App` | Partial — priority-ordered via `TransactionQueue::broadcast_with_visitor()` with DEX-lane flood budget, budget-neutral skipped txs, arb flood damping, and ban-on-damping; broadcast period uses `flood_tx_period_ms` (200 ms) matching stellar-core `FLOOD_TX_PERIOD_MS`; missing dedicated flood queue, mark-on-attempt, separate advert flush timer |
