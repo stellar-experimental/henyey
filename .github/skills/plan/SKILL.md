@@ -86,19 +86,23 @@ must be preserved. If not parity-critical: write "n/a — non-parity path".>
 
 ### Critic workspace contract
 
-**All critic scratch work must live only under `$HOME/data`.** Critics should prefer the existing checkout for read-only inspection. If a critic needs a scratch checkout (e.g. to run a test or verify a claim), it must live under `$HOME/data`, never in the repo root, the repo parent, or anywhere outside `$HOME/data`. Each critic derives its workspace as follows:
+**All critic scratch work must live only under `~/data` (the real home directory's `data/` subdirectory, derived from the passwd entry — immune to `$HOME` poisoning).** Critics should prefer the existing checkout for read-only inspection. If a critic needs a scratch checkout (e.g. to run a test or verify a claim), it must live under `~/data`, never in the repo root, the repo parent, or anywhere outside `~/data`. Each critic derives its workspace by sourcing the shared contract helper:
 
 ```bash
-SESSION_ID="${CLAUDE_SESSION_ID:-$(date +%Y%m%d-%H%M%S)}"
-WORKTREE_BASE="${WORKTREE_BASE:-$HOME/data/$SESSION_ID/plan-$ISSUE}"
-export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$WORKTREE_BASE/cargo-target}"
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+source "$REPO_ROOT/scripts/lib/agent-worktree-contract.sh"
 
-# Critic-specific scratch dir (only if needed for checkout/build):
-CRITIC_WORKTREE="$WORKTREE_BASE/critic-a"  # or critic-b, critic-c
+# plan_critic_bootstrap validates and exports WORKTREE_BASE, CARGO_TARGET_DIR,
+# and CRITIC_WORKTREE. Pre-seeded values are accepted only if they resolve under
+# the real ~/data AND match the expected session/issue prefix
+# ($HOME/data/$SESSION_ID/plan-$ISSUE/...). Hostile values (outside ~/data,
+# using ../ traversal, HOME poisoning, or cross-session paths) are rejected
+# with a non-zero exit.
+plan_critic_bootstrap "$ISSUE" "critic-a" || exit 1  # or critic-b, critic-c
 mkdir -p "$CRITIC_WORKTREE"
 ```
 
-Include this bootstrap verbatim in each critic's prompt so the sub-agent knows where to place any checkout or build output. The bootstrap is self-seeding: if the parent runtime pre-sets `WORKTREE_BASE` or `CARGO_TARGET_DIR`, the critic respects those; otherwise it falls back to `$HOME/data/$SESSION_ID/plan-$ISSUE/...`.
+Include this bootstrap verbatim in each critic's prompt so the sub-agent knows where to place any checkout or build output. The bootstrap is self-seeding: if the parent runtime pre-sets `WORKTREE_BASE` or `CARGO_TARGET_DIR`, the critic respects those only if they resolve under the real `~/data` AND under the expected session/issue prefix (`~/data/$SESSION_ID/plan-$ISSUE/...`); otherwise the bootstrap rejects the value and exits non-zero — the `|| exit 1` guard ensures no subsequent commands run with stale env vars. Hostile overrides (paths outside `~/data`, traversal like `~/data/../escape`, HOME-poisoned paths, or cross-session shared directories) are rejected before any `mkdir`, `git clone`, or cargo command runs.
 
 Launch three `general-purpose` agents in parallel — do not wait between them. **Each critic must be spawned with `--model gpt-5.4`** (or equivalent model parameter) explicitly — do not inherit from the parent. Cross-model diversity is the whole point of the critic step. Each gets the issue number, the plan-draft comment ID, and a focused brief:
 

@@ -643,21 +643,32 @@ Exit.
 
 ## Workspace contract
 
-The `/review-pr` skill must never create worktrees outside `$HOME/data`. All scratch
-state lives under `$HOME/data/$SESSION_ID/review-pr-$ISSUE/`:
+The `/review-pr` skill must never create worktrees outside `~/data` (the real home
+directory's `data/` subdirectory, derived from the passwd entry — immune to `$HOME`
+poisoning). All scratch state lives under `~/data/$SESSION_ID/review-pr-$ISSUE/`.
+Reviewers derive their workspace by sourcing the shared contract helper:
 
 ```bash
-SESSION_ID="${CLAUDE_SESSION_ID:-$(date +%Y%m%d-%H%M%S)}"
-export CARGO_TARGET_DIR="$HOME/data/$SESSION_ID/review-pr-$ISSUE/cargo-target"
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+source "$REPO_ROOT/scripts/lib/agent-worktree-contract.sh"
+
+# review_pr_bootstrap validates and exports WORKTREE_BASE, CARGO_TARGET_DIR,
+# and REVIEWER_WORKTREE. Pre-seeded values are accepted only if they resolve
+# under the real ~/data AND match the expected session/issue prefix
+# (~/data/$SESSION_ID/review-pr-$ISSUE/...). Hostile values (outside ~/data,
+# ../ traversal, HOME poisoning, or cross-session shared directories) are
+# rejected with a non-zero exit.
+review_pr_bootstrap "$ISSUE" || exit 1
+mkdir -p "$REVIEWER_WORKTREE"
 ```
 
 This ensures build artifacts are isolated per-session and automatically discoverable
 for cleanup. The skill itself is read-only (no code changes), so it rarely needs a
 build cache — but if a reviewer sub-agent builds to verify, the target dir must
-resolve under `$HOME/data`.
+resolve under `~/data` and within the session prefix.
 
-**Never create worktrees at the repo root or outside `$HOME/data`.** All worktrees
-must be under `$HOME/data/$SESSION_ID/` to avoid polluting the shared checkout.
+**Never create worktrees at the repo root or outside `~/data`.** All worktrees
+must be under `~/data/$SESSION_ID/` to avoid polluting the shared checkout.
 
 ## Branch protection
 
