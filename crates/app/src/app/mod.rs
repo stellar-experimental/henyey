@@ -793,8 +793,14 @@ pub struct App {
     /// JoinHandle for the sync recovery manager task (for shutdown awaiting).
     sync_recovery_task: parking_lot::RwLock<Option<tokio::task::JoinHandle<()>>>,
 
-    /// Whether ledger application is currently in progress (for sync recovery).
-    is_applying_ledger: AtomicBool,
+    /// Whether ledger application is currently in progress (for sync recovery
+    /// and herder post-publication guards).
+    ///
+    /// Shared with the Herder via [`Herder::set_is_applying_flag`] so
+    /// `trigger_next_ledger` can check `is_applying()` after draining ready
+    /// envelopes, matching stellar-core's `mLedgerManager.isApplying()` check
+    /// in `HerderImpl::triggerNextLedger` (HerderImpl.cpp:1583).
+    is_applying_ledger: Arc<AtomicBool>,
 
     /// Wall-clock of the last deferred-pipeline close-complete entry.
     /// Used to compute `henyey_ledger_close_cycle_seconds` — the time between
@@ -1224,6 +1230,11 @@ impl App {
             timer_manager_handle.clone(),
         );
 
+        // Shared is_applying flag: the app sets it during ledger application,
+        // the herder reads it in trigger_next_ledger's post-publication guard.
+        let is_applying_ledger = Arc::new(AtomicBool::new(false));
+        let _ = herder.set_is_applying_flag(Arc::clone(&is_applying_ledger));
+
         let meta_stream = Self::init_meta_stream(&config, &bucket_dir)?;
 
         // If streaming is active, wrap the MetaStreamManager in a MetaWriter
@@ -1381,7 +1392,7 @@ impl App {
             last_soroban_max_cluster_count: AtomicU64::new(0),
             sync_recovery_handle: parking_lot::RwLock::new(None), // Initialized in run() when needed
             sync_recovery_task: parking_lot::RwLock::new(None),
-            is_applying_ledger: AtomicBool::new(false),
+            is_applying_ledger,
             close_cycle_last_start: parking_lot::Mutex::new(None),
             #[cfg(test)]
             close_complete_inject_blocking_ms: AtomicU64::new(0),
@@ -4397,7 +4408,12 @@ mod tests {
     /// cache the tx set on first call, and the atomic latch prevents repeats.
     #[tokio::test]
     async fn test_try_trigger_consensus_watcher_caches_next_slot_tx_set_once() {
-        let config = crate::config::ConfigBuilder::new().in_memory(true).build();
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("watcher-cache-test.db");
+        let config = crate::config::ConfigBuilder::new()
+            .in_memory(true)
+            .database_path(db_path)
+            .build();
 
         // Default config has is_validator = false (watcher mode).
         assert!(!config.node.is_validator, "test requires watcher config");
@@ -4466,7 +4482,12 @@ mod tests {
     /// retry the same slot.
     #[tokio::test]
     async fn test_try_trigger_consensus_watcher_retries_after_failure() {
-        let config = crate::config::ConfigBuilder::new().in_memory(true).build();
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("watcher-retry-test.db");
+        let config = crate::config::ConfigBuilder::new()
+            .in_memory(true)
+            .database_path(db_path)
+            .build();
         assert!(!config.node.is_validator, "test requires watcher config");
 
         let app = App::new(config).await.unwrap();
@@ -4533,7 +4554,12 @@ mod tests {
     /// Post-fix (compare_exchange): latch N+1 survives the stale rollback.
     #[tokio::test]
     async fn test_try_trigger_consensus_watcher_stale_rollback_preserves_newer_claim() {
-        let config = crate::config::ConfigBuilder::new().in_memory(true).build();
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("watcher-stale-test.db");
+        let config = crate::config::ConfigBuilder::new()
+            .in_memory(true)
+            .database_path(db_path)
+            .build();
         assert!(!config.node.is_validator, "test requires watcher config");
 
         let app = App::new(config).await.unwrap();

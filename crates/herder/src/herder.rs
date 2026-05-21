@@ -532,6 +532,15 @@ pub struct Herder {
     /// don't install a manager simply leave it empty (purge becomes a no-op),
     /// while production install exactly once in `init_herder`.
     scp_persistence: std::sync::OnceLock<Arc<crate::persistence::ScpPersistenceManager>>,
+    /// Shared flag indicating whether ledger application is in progress.
+    ///
+    /// Parity: stellar-core's `triggerNextLedger` checks
+    /// `mLedgerManager.isApplying()` after `addTxSet` because the side effects
+    /// of draining ready envelopes can externalize a slot and start apply.
+    /// If apply is in progress, upstream returns immediately — henyey must do
+    /// the same. Installed post-construction by the app via
+    /// [`Self::set_is_applying_flag`].
+    is_applying_flag: std::sync::OnceLock<Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl Herder {
@@ -736,6 +745,7 @@ impl Herder {
             scp_metrics,
             lcl_ahead_of_tracking_corrective_total: AtomicU64::new(0),
             scp_persistence: std::sync::OnceLock::new(),
+            is_applying_flag: std::sync::OnceLock::new(),
         }
     }
 
@@ -877,6 +887,28 @@ impl Herder {
         });
 
         Ok(())
+    }
+
+    /// Install the shared `is_applying` flag so `trigger_next_ledger` can
+    /// check whether ledger application is in progress.
+    ///
+    /// Parity: stellar-core's `HerderImpl::triggerNextLedger` checks
+    /// `mLedgerManager.isApplying()` after `addTxSet` because draining ready
+    /// envelopes can trigger SCP callbacks that externalize and start apply.
+    /// If apply begins mid-trigger, upstream returns immediately.
+    pub fn set_is_applying_flag(
+        &self,
+        flag: Arc<std::sync::atomic::AtomicBool>,
+    ) -> std::result::Result<(), Arc<std::sync::atomic::AtomicBool>> {
+        self.is_applying_flag.set(flag)
+    }
+
+    /// Returns true if ledger application is currently in progress.
+    /// Returns false when no flag has been installed (test convenience).
+    fn is_applying(&self) -> bool {
+        self.is_applying_flag.get().map_or(false, |flag| {
+            flag.load(std::sync::atomic::Ordering::Relaxed)
+        })
     }
 
     /// Purge persisted tx sets that are no longer referenced by any persisted
@@ -2493,10 +2525,14 @@ impl Herder {
             self.process_ready_fetching_envelopes();
 
             // Post-build stale check (same as validator path).
-            if !self.lcl_matches_slot(slot) {
+            // Parity: HerderImpl.cpp:1574-1585 — re-read LCL AND check
+            // isApplying() after addTxSet because side effects from draining
+            // ready envelopes can externalize and start ledger application.
+            if !self.lcl_matches_slot(slot) || self.is_applying() {
                 tracing::warn!(
                     requested_slot = slot,
-                    "Skipping: LCL advanced during observer build"
+                    is_applying = self.is_applying(),
+                    "Skipping: LCL advanced or apply started during observer build"
                 );
                 return Ok(TriggerOutcome::SkippedStale);
             }
@@ -2520,19 +2556,23 @@ impl Herder {
         // runs on spawn_blocking from the app layer.
         self.process_ready_fetching_envelopes();
 
-        // Parity: HerderImpl.cpp:1550-1562 — a concurrent `close_ledger` task
+        // Parity: HerderImpl.cpp:1574-1585 — a concurrent `close_ledger` task
         // running on a separate `spawn_blocking` may have advanced LCL while
         // we were inside `build_nomination_value` and the subsequent envelope
-        // drain. If so, the value we just built is for a slot the network has
-        // already closed; broadcasting it would be wasted SCP traffic.
+        // drain. Additionally, draining ready envelopes can trigger SCP
+        // callbacks that externalize and start ledger application. If so, the
+        // value we just built is for a slot the network has already closed or
+        // is in the process of closing; broadcasting it would be wasted SCP
+        // traffic.
         //
         // The check must come BEFORE the cache write below — caching a value
         // for a stale slot would mislead `handle_nomination_timeout`'s
         // cache-hit path.
-        if !self.lcl_matches_slot(slot) {
+        if !self.lcl_matches_slot(slot) || self.is_applying() {
             tracing::warn!(
                 requested_slot = slot,
-                "Skipping nomination: LCL advanced during build_nomination_value"
+                is_applying = self.is_applying(),
+                "Skipping nomination: LCL advanced or apply started during build_nomination_value"
             );
             return Ok(TriggerOutcome::SkippedStale);
         }
@@ -6005,6 +6045,67 @@ mod tests {
         assert!(
             slot_state.map_or(true, |s| !s.is_nominating),
             "observer must NOT enter nominating state"
+        );
+    }
+
+    /// Regression test for #2869 review feedback — post-publication is_applying guard.
+    ///
+    /// Parity: stellar-core HerderImpl.cpp:1583 checks
+    /// `mLedgerManager.isApplying()` after `addTxSet` because side effects
+    /// from draining ready envelopes can externalize and start ledger
+    /// application. If apply starts mid-trigger, upstream returns immediately
+    /// without observer success or validator nomination.
+    ///
+    /// Pre-fix: trigger_next_ledger returns ObserverCached even when
+    /// is_applying is true (missing guard).
+    /// Post-fix: returns SkippedStale when is_applying becomes true after
+    /// tx-set publication.
+    #[test]
+    fn test_trigger_next_ledger_observer_skips_when_is_applying() {
+        use std::sync::atomic::AtomicBool;
+
+        let config = HerderConfig {
+            is_validator: false,
+            ..HerderConfig::default()
+        };
+        let herder = Herder::new(config, make_default_lm(), TimerManagerHandle::no_op());
+
+        // Install is_applying flag set to true — simulating that ledger
+        // application started (e.g. triggered by SCP externalization during
+        // process_ready_fetching_envelopes).
+        let is_applying = Arc::new(AtomicBool::new(true));
+        herder
+            .set_is_applying_flag(Arc::clone(&is_applying))
+            .expect("flag install should succeed");
+
+        // Bootstrap into tracking state.
+        herder.bootstrap(0);
+        assert!(herder.is_tracking());
+        assert!(!herder.is_validator());
+
+        // With is_applying=true, trigger should return SkippedStale even
+        // though LCL hasn't advanced (the tx set is built and cached, but
+        // the post-publication guard fires).
+        let result = herder.trigger_next_ledger(1);
+        let outcome = result.expect("trigger should not error");
+        assert_eq!(
+            outcome,
+            TriggerOutcome::SkippedStale,
+            "observer must skip when is_applying is true (parity: HerderImpl.cpp:1583)"
+        );
+
+        // Now clear the flag and verify trigger succeeds normally.
+        is_applying.store(false, std::sync::atomic::Ordering::Relaxed);
+        // Reset the herder to avoid the idempotent build_and_cache guard
+        // (the first call already built/cached, but was stopped at the guard).
+        // bootstrap(0) re-initializes tracking state.
+        herder.bootstrap(0);
+        let result2 = herder.trigger_next_ledger(1);
+        let outcome2 = result2.expect("trigger should not error after clearing flag");
+        assert_eq!(
+            outcome2,
+            TriggerOutcome::ObserverCached,
+            "observer should succeed when is_applying is false"
         );
     }
 
