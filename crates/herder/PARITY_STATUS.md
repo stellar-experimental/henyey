@@ -12,7 +12,7 @@
 | Core Herder (state machine, envelope recv) | Partial | Missing metrics, quorum map reanalysis |
 | HerderSCPDriver (value validation, signing) | Partial | Missing SCP metrics, node weight, TxSet validity cache; fee+account checks now wired |
 | HerderPersistence (SCP state DB) | Partial | Missing `copySCPHistoryToStream`, `getNodeQuorumSet` |
-| HerderUtils (value extraction) | Partial | Missing validated hash/quorum-map helpers |
+| HerderUtils (value extraction) | Full | `get_stellar_values`, `get_validated_stellar_values`, `get_validated_tx_set_hashes` |
 | LedgerCloseData | Full | All accessors and XDR round-trip |
 | PendingEnvelopes (fetching, caching) | Partial | Missing cost tracking, value size cache; release-up-to drain now matches `processSCPQueueUpToIndex`; intra-slot LIFO ordering now matches `pop()` |
 | QuorumTracker | Full | expand, rebuild, closest validators |
@@ -219,7 +219,7 @@ Corresponds to: `HerderUtils.h`
 |--------------|------|--------|
 | `toStellarValue()` | `ScpDriver::parse_stellar_value()` | Full |
 | `getTxSetHashes()` | `get_tx_set_hashes_from_envelope()` | Full |
-| `getValidatedTxSetHashes()` | _(not implemented)_ | None |
+| `getValidatedTxSetHashes()` | `get_validated_tx_set_hashes()` | Full |
 | `getStellarValues()` | `get_stellar_values()` | Full |
 | `toShortString()` | `to_short_string()`, `to_short_strkey()` | Full |
 | `toQuorumIntersectionMap()` | _(not implemented)_ | None |
@@ -524,7 +524,6 @@ Features not yet implemented. These ARE counted against parity %.
 | PendingEnvelopes cost tracking (4 methods) | Low | Per-validator cost analysis |
 | `HerderPersistence::getNodeQuorumSet()` | Low | Node-level quorum set lookup |
 | `HerderPersistence::getQuorumSet()` | Low | Hash-based quorum set lookup |
-| `HerderUtils::getValidatedTxSetHashes()` | Low | No strict variant that errors on malformed envelope values |
 | `HerderUtils::toQuorumIntersectionMap()` | Low | Quorum map conversion |
 | `HerderUtils::parseQuorumMapFromJson()` | Low | JSON quorum map parsing |
 | `TxSetXDRFrame::makeFromHistoryTransactions()` | Low | History tx set construction |

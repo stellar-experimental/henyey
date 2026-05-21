@@ -65,7 +65,7 @@ excluded. SHOULD claims and operational defaults excluded.
 | §11 | combineCandidates: upgrade merge by type | Full | scp_driver.rs:1918-1939, 2021-2034 |
 | §11 | combineCandidates: signature carry-over | Partial | uses selected candidate's full SV (deviation: defensive fallback when no candidate matches LCL) |
 | §12.1 | One tx per source account | Full | tx_queue/mod.rs::check_account_limit |
-| §12.2 | Reception pipeline order | Partial | order largely preserved; ban check inlined post-store-lock TOCTOU re-check |
+| §12.2 | Reception pipeline order | Full | outer pre-filter → signature verify → self-skip → quorum gate → strict STELLAR_VALUE_SIGNED validation before fetch/relay → dependency admission → SCP acceptance (#2870) |
 | §12.2 | Cross-queue source check | Partial | spec puts it at top of HerderImpl.recvTransaction; henyey enforces inside try_add (regression test #1934) |
 | §12.3 | Replace-by-fee FEE_MULTIPLIER × per-op | Full | tx_queue/mod.rs:606, 663 (FEE_MULTIPLIER = 10) |
 | §12.4 | shift() ban deque + age + auto-ban | Full | tx_queue/mod.rs:2761 (TIMEOUT=4, BAN=10) |
@@ -83,7 +83,7 @@ excluded. SHOULD claims and operational defaults excluded.
 | §14.2 | Rebroadcast after ledger close | Full | tx_queue/mod.rs (flood reset on shift) |
 | §15.1 | recvSCPEnvelope pre-filter chain | Full | herder.rs:1751-1836 + scp_verify.rs |
 | §15.1 | Skip-self + non-quorum reject | Full | herder.rs:1906-1925 |
-| §15.1 | StellarValue parse + SIGNED check | Partial | scp_driver.rs:1392 (full); pre-fetch path parses w/o re-check |
+| §15.1 | StellarValue parse + SIGNED check | Full | recv_envelope_validated enforces strict SIGNED gate before fetch/relay; EXTERNALIZE prefetch uses get_validated_tx_set_hashes (#2870) |
 | §15.2 | ItemFetcher get/peerDoesntHave | Full | fetching_envelopes.rs |
 | §15.2 | Broadcast onward after fetch | Full | fetching_envelopes.rs:280-286 |
 | §15.3 | Out-of-sync recovery loop | Full | sync_recovery.rs |
