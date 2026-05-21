@@ -1537,6 +1537,33 @@ impl TransactionQueue {
         self.validation_context.write().soroban_resource_limits = Some(limits);
     }
 
+    /// Early cross-type source-account conflict check.
+    ///
+    /// Parity: stellar-core `HerderImpl::recvTransaction` (HerderImpl.cpp:627-645)
+    /// rejects a tx whose sequence-number source already has a pending tx of the
+    /// opposite type (classic vs Soroban) before ANY validation. This helper
+    /// replicates that precedence so the externally visible result is
+    /// `TryAgainLater` rather than whatever validation error would fire first.
+    ///
+    /// This is an optimistic read (no write lock); the later `check_account_limit`
+    /// under the store write-lock remains the authoritative recheck.
+    fn check_cross_type_conflict(&self, envelope: &TransactionEnvelope) -> Option<TxQueueResult> {
+        let seq_source = account_key(envelope);
+        let candidate_is_soroban = henyey_tx::envelope_utils::is_soroban_envelope(envelope);
+
+        let account_states = self.account_states.read();
+        if let Some(state) = account_states.get(&seq_source) {
+            if let Some(ref current_tx) = state.transaction {
+                let current_is_soroban =
+                    henyey_tx::envelope_utils::is_soroban_envelope(&current_tx.envelope);
+                if current_is_soroban != candidate_is_soroban {
+                    return Some(TxQueueResult::TryAgainLater);
+                }
+            }
+        }
+        None
+    }
+
     /// Validate a transaction before queueing.
     fn validate_transaction(
         &self,
@@ -2063,6 +2090,15 @@ impl TransactionQueue {
 
     /// Try to add a transaction to the queue.
     pub fn try_add(&self, envelope: TransactionEnvelope) -> TxQueueResult {
+        // Parity: stellar-core HerderImpl.cpp:627-645 checks whether the
+        // source account already has a pending tx of the opposite type
+        // (classic vs Soroban) BEFORE running any validation. Replicate that
+        // precedence here so cross-type conflicts always surface as
+        // TryAgainLater rather than whatever validation error would fire first.
+        if let Some(result) = self.check_cross_type_conflict(&envelope) {
+            return result;
+        }
+
         // Validate transaction before queueing
         if let Err(code) = self.validate_transaction(&envelope) {
             return TxQueueResult::Invalid(Some(code));

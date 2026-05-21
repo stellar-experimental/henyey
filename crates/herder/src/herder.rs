@@ -4955,6 +4955,98 @@ mod tests {
         );
     }
 
+    /// Parity: when the herder is Tracking and the queue already has a pending
+    /// tx from a source, submitting an opposite-type tx from the same source
+    /// must return TryAgainLater (stellar-core HerderImpl.cpp:627-645).
+    #[test]
+    fn test_receive_transaction_cross_type_conflict_returns_try_again_later() {
+        use stellar_xdr::curr::{
+            CreateAccountOp, DecoratedSignature, HostFunction, InvokeContractArgs,
+            InvokeHostFunctionOp, Memo, MuxedAccount, Operation, OperationBody, Preconditions,
+            PublicKey, ScAddress, ScSymbol, SequenceNumber, SignatureHint, StringM, Transaction,
+            TransactionEnvelope, TransactionExt, TransactionV1Envelope, Uint256, VecM,
+        };
+
+        let herder = make_test_herder();
+        herder.set_state(HerderState::Tracking);
+        assert!(herder.state().can_receive_transactions());
+
+        // Seed a valid classic tx from source seed 42.
+        let classic_tx = Transaction {
+            source_account: MuxedAccount::Ed25519(Uint256([42u8; 32])),
+            fee: 200,
+            seq_num: SequenceNumber(1),
+            cond: Preconditions::None,
+            memo: Memo::None,
+            operations: vec![Operation {
+                source_account: None,
+                body: OperationBody::CreateAccount(CreateAccountOp {
+                    destination: stellar_xdr::curr::AccountId(PublicKey::PublicKeyTypeEd25519(
+                        Uint256([255u8; 32]),
+                    )),
+                    starting_balance: 1000000000,
+                }),
+            }]
+            .try_into()
+            .unwrap(),
+            ext: TransactionExt::V0,
+        };
+        let classic_env = TransactionEnvelope::Tx(TransactionV1Envelope {
+            tx: classic_tx,
+            signatures: vec![DecoratedSignature {
+                hint: SignatureHint([0u8; 4]),
+                signature: XdrSignature(vec![0u8; 64].try_into().unwrap()),
+            }]
+            .try_into()
+            .unwrap(),
+        });
+        assert_eq!(
+            herder.receive_transaction(classic_env),
+            TxQueueResult::Added,
+        );
+
+        // Submit a Soroban tx from the same source (seed 42).
+        let function_name = ScSymbol(StringM::<32>::try_from("test".to_string()).expect("symbol"));
+        let host_function = HostFunction::InvokeContract(InvokeContractArgs {
+            contract_address: ScAddress::default(),
+            function_name,
+            args: VecM::<stellar_xdr::curr::ScVal>::default(),
+        });
+        let soroban_tx = Transaction {
+            source_account: MuxedAccount::Ed25519(Uint256([42u8; 32])),
+            fee: 200,
+            seq_num: SequenceNumber(1),
+            cond: Preconditions::None,
+            memo: Memo::None,
+            operations: vec![Operation {
+                source_account: None,
+                body: OperationBody::InvokeHostFunction(InvokeHostFunctionOp {
+                    host_function,
+                    auth: VecM::default(),
+                }),
+            }]
+            .try_into()
+            .unwrap(),
+            ext: TransactionExt::V0,
+        };
+        let soroban_env = TransactionEnvelope::Tx(TransactionV1Envelope {
+            tx: soroban_tx,
+            signatures: vec![DecoratedSignature {
+                hint: SignatureHint([0u8; 4]),
+                signature: XdrSignature(vec![0u8; 64].try_into().unwrap()),
+            }]
+            .try_into()
+            .unwrap(),
+        });
+
+        let result = herder.receive_transaction(soroban_env);
+        assert_eq!(
+            result,
+            TxQueueResult::TryAgainLater,
+            "cross-type conflict must return TryAgainLater through public intake"
+        );
+    }
+
     // =========================================================================
     // Issue #1953 — Herder end-to-end normalization regression
     // =========================================================================
