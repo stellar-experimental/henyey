@@ -851,6 +851,10 @@ impl App {
                     "Resolved SCP trust anchor from externalized slot target+1"
                 );
                 catchup_manager.set_trusted_scp_anchor(seq, hash);
+                #[cfg(test)]
+                {
+                    *self.last_installed_scp_anchor.lock().unwrap() = Some((seq, hash));
+                }
             }
         }
 
@@ -6283,64 +6287,19 @@ mod tests {
     // Production-path wiring tests: verify that run_catchup_work() installs
     // (or does not install) the SCP trust anchor based on CatchupRunMode.
     //
-    // These tests drive the real catchup_with_run_mode() entry point and use
-    // tracing capture to observe the anchor-installation decision. The
-    // "Resolved SCP trust anchor" log fires inside run_catchup_work() at the
-    // exact production branch under test, BEFORE any archive I/O. If the
-    // `if run_mode == CatchupRunMode::Online` gate were removed, both tests
-    // would see the log (causing the offline test to fail).
+    // These tests drive the real catchup_with_run_mode() entry point and
+    // assert on `App::last_installed_scp_anchor` (a #[cfg(test)] field that
+    // records the actual `set_trusted_scp_anchor()` call). This catches the
+    // case where the surrounding log is preserved but the setter is removed.
     // ================================================================
-
-    /// Minimal tracing layer that records whether a specific message was logged.
-    mod anchor_tracing {
-        use std::sync::atomic::{AtomicBool, Ordering};
-        use std::sync::Arc;
-        use tracing::subscriber::Subscriber;
-        use tracing_subscriber::layer::Context;
-        use tracing_subscriber::Layer;
-
-        /// Layer that sets a flag when "Resolved SCP trust anchor" is logged.
-        pub struct AnchorDetector {
-            pub detected: Arc<AtomicBool>,
-        }
-
-        impl<S: Subscriber> Layer<S> for AnchorDetector {
-            fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
-                // Check the message field for our target log line.
-                let mut visitor = MessageVisitor(String::new());
-                event.record(&mut visitor);
-                if visitor.0.contains("Resolved SCP trust anchor") {
-                    self.detected.store(true, Ordering::SeqCst);
-                }
-            }
-        }
-
-        struct MessageVisitor(String);
-
-        impl tracing::field::Visit for MessageVisitor {
-            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-                if field.name() == "message" {
-                    self.0 = format!("{:?}", value);
-                }
-            }
-
-            fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
-                if field.name() == "message" {
-                    self.0 = value.to_string();
-                }
-            }
-        }
-    }
 
     /// Online catchup with herder data MUST install the SCP trust anchor.
     /// This test exercises the real `catchup_with_run_mode(Online)` production
-    /// path and would fail if the anchor-installation block were removed.
+    /// path and would fail if the `set_trusted_scp_anchor()` call were removed
+    /// (even if the surrounding log line is preserved).
     #[tokio::test]
     async fn test_online_catchup_installs_scp_trust_anchor_production_path() {
         use henyey_history::CatchupRunMode;
-        use std::sync::atomic::{AtomicBool, Ordering};
-        use std::sync::Arc;
-        use tracing_subscriber::layer::SubscriberExt;
 
         let dir = tempfile::tempdir().expect("temp dir");
         let db_path = dir.path().join("rs-stellar-test.db");
@@ -6370,13 +6329,12 @@ mod tests {
             "precondition: herder data must be available"
         );
 
-        // Set up tracing capture to detect anchor installation.
-        let detected = Arc::new(AtomicBool::new(false));
-        let layer = anchor_tracing::AnchorDetector {
-            detected: Arc::clone(&detected),
-        };
-        let subscriber = tracing_subscriber::registry().with(layer);
-        let _guard = tracing::subscriber::set_default(subscriber);
+        // Precondition: no anchor installed yet.
+        assert_eq!(
+            *app.last_installed_scp_anchor.lock().unwrap(),
+            None,
+            "precondition: anchor must not be installed before catchup"
+        );
 
         // Run online catchup — the anchor decision fires before archive download.
         let (persist_tx, _persist_rx) = tokio::sync::oneshot::channel();
@@ -6394,12 +6352,14 @@ mod tests {
             )
             .await;
 
-        // The anchor-installation log MUST have fired for Online mode.
-        assert!(
-            detected.load(Ordering::SeqCst),
-            "Online catchup with herder data must install SCP trust anchor \
-             (log 'Resolved SCP trust anchor' was not emitted — \
-             the run_catchup_work() online wiring is broken)"
+        // Assert that set_trusted_scp_anchor was actually called with expected values.
+        let installed = app.last_installed_scp_anchor.lock().unwrap().clone();
+        assert_eq!(
+            installed,
+            Some((target_ledger, expected_prev_hash)),
+            "Online catchup with herder data must call set_trusted_scp_anchor() \
+             on CatchupManager — removing the setter while keeping the log \
+             would cause this assertion to fail"
         );
     }
 
@@ -6410,9 +6370,6 @@ mod tests {
     #[tokio::test]
     async fn test_offline_catchup_does_not_install_scp_trust_anchor_production_path() {
         use henyey_history::CatchupRunMode;
-        use std::sync::atomic::{AtomicBool, Ordering};
-        use std::sync::Arc;
-        use tracing_subscriber::layer::SubscriberExt;
 
         let dir = tempfile::tempdir().expect("temp dir");
         let db_path = dir.path().join("rs-stellar-test.db");
@@ -6443,14 +6400,6 @@ mod tests {
             "precondition: herder data must be available"
         );
 
-        // Set up tracing capture to detect anchor installation.
-        let detected = Arc::new(AtomicBool::new(false));
-        let layer = anchor_tracing::AnchorDetector {
-            detected: Arc::clone(&detected),
-        };
-        let subscriber = tracing_subscriber::registry().with(layer);
-        let _guard = tracing::subscriber::set_default(subscriber);
-
         // Run offline catchup — the anchor decision must NOT fire.
         let (persist_tx, _persist_rx) = tokio::sync::oneshot::channel();
         let finalize = super::persist::CatchupFinalizer::deferred(
@@ -6467,12 +6416,12 @@ mod tests {
             )
             .await;
 
-        // The anchor-installation log must NOT have fired for OfflineBasic.
-        assert!(
-            !detected.load(Ordering::SeqCst),
-            "Offline catchup must NOT install SCP trust anchor even when \
-             herder has externalized target+1 (log 'Resolved SCP trust anchor' \
-             was emitted — the run_mode gate is broken)"
+        // The anchor must NOT have been installed for OfflineBasic.
+        let installed = app.last_installed_scp_anchor.lock().unwrap().clone();
+        assert_eq!(
+            installed, None,
+            "Offline catchup must NOT call set_trusted_scp_anchor() even when \
+             herder has externalized target+1 — the run_mode gate is broken"
         );
     }
 }
