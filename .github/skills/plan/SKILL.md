@@ -96,11 +96,11 @@ source "$REPO_ROOT/scripts/lib/agent-worktree-contract.sh"
 # and CRITIC_WORKTREE. Pre-seeded values are accepted only if they resolve under
 # $HOME/data; hostile values (outside $HOME/data or using ../ traversal) are
 # rejected with a non-zero exit.
-plan_critic_bootstrap "$ISSUE" "critic-a"  # or critic-b, critic-c
+plan_critic_bootstrap "$ISSUE" "critic-a" || exit 1  # or critic-b, critic-c
 mkdir -p "$CRITIC_WORKTREE"
 ```
 
-Include this bootstrap verbatim in each critic's prompt so the sub-agent knows where to place any checkout or build output. The bootstrap is self-seeding: if the parent runtime pre-sets `WORKTREE_BASE` or `CARGO_TARGET_DIR`, the critic respects those only if they resolve under `$HOME/data`; otherwise it falls back to `$HOME/data/$SESSION_ID/plan-$ISSUE/...`. Hostile overrides (paths outside `$HOME/data` or traversal like `$HOME/data/../escape`) are rejected before any `mkdir`, `git clone`, or cargo command runs.
+Include this bootstrap verbatim in each critic's prompt so the sub-agent knows where to place any checkout or build output. The bootstrap is self-seeding: if the parent runtime pre-sets `WORKTREE_BASE` or `CARGO_TARGET_DIR`, the critic respects those only if they resolve under `$HOME/data`; otherwise the bootstrap rejects the hostile value and exits non-zero — the `|| exit 1` guard ensures no subsequent commands run with stale env vars. Hostile overrides (paths outside `$HOME/data` or traversal like `$HOME/data/../escape`) are rejected before any `mkdir`, `git clone`, or cargo command runs.
 
 Launch three `general-purpose` agents in parallel — do not wait between them. **Each critic must be spawned with `--model gpt-5.4`** (or equivalent model parameter) explicitly — do not inherit from the parent. Cross-model diversity is the whole point of the critic step. Each gets the issue number, the plan-draft comment ID, and a focused brief:
 

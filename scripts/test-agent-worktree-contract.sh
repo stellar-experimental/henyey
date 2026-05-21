@@ -425,6 +425,139 @@ test_sourcing_preserves_caller_shell_options() {
 }
 
 # --------------------------------------------------------------------------
+# Test: stale CRITIC_WORKTREE is cleared after plan bootstrap rejection
+# --------------------------------------------------------------------------
+test_plan_bootstrap_clears_stale_vars_on_failure() {
+  local desc="plan bootstrap clears stale vars on failure (stale-env escape)"
+
+  # Pre-seed CRITIC_WORKTREE with a stale path outside $HOME/data, then call
+  # plan_critic_bootstrap with a hostile WORKTREE_BASE. After the bootstrap
+  # fails, CRITIC_WORKTREE must be empty — not the stale value.
+  local output
+  output=$(CRITIC_WORKTREE="/tmp/stale-critic" \
+    WORKTREE_BASE="/tmp/evil-base" \
+    CARGO_TARGET_DIR="" \
+    CLAUDE_SESSION_ID="test-session" \
+    bash -c '
+      source "'"$CONTRACT_HELPER"'"
+      plan_critic_bootstrap 999 critic-a
+      rc=$?
+      echo "rc=$rc"
+      echo "CRITIC_WORKTREE=${CRITIC_WORKTREE:-EMPTY}"
+      echo "WORKTREE_BASE=${WORKTREE_BASE:-EMPTY}"
+      echo "CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-EMPTY}"
+    ' 2>&1)
+
+  # Bootstrap must fail
+  if ! echo "$output" | grep -q "rc=1"; then
+    tap_not_ok "$desc" "Expected rc=1, got: $output"
+    return
+  fi
+
+  # All derived vars must be cleared (not stale)
+  if echo "$output" | grep -q "CRITIC_WORKTREE=/tmp/stale-critic"; then
+    tap_not_ok "$desc" "CRITIC_WORKTREE still has stale value after failure: $output"
+    return
+  fi
+  if ! echo "$output" | grep -q "CRITIC_WORKTREE=EMPTY"; then
+    tap_not_ok "$desc" "CRITIC_WORKTREE not cleared: $output"
+    return
+  fi
+
+  tap_ok "$desc"
+}
+
+# --------------------------------------------------------------------------
+# Test: stale REVIEWER_WORKTREE is cleared after review-pr bootstrap rejection
+# --------------------------------------------------------------------------
+test_review_pr_bootstrap_clears_stale_vars_on_failure() {
+  local desc="review-pr bootstrap clears stale vars on failure (stale-env escape)"
+
+  # Pre-seed REVIEWER_WORKTREE with a stale path, give hostile WORKTREE_BASE.
+  local output
+  output=$(REVIEWER_WORKTREE="/tmp/stale-reviewer" \
+    WORKTREE_BASE="/tmp/evil-base" \
+    CARGO_TARGET_DIR="" \
+    CLAUDE_SESSION_ID="test-session" \
+    bash -c '
+      source "'"$CONTRACT_HELPER"'"
+      review_pr_bootstrap 100
+      rc=$?
+      echo "rc=$rc"
+      echo "REVIEWER_WORKTREE=${REVIEWER_WORKTREE:-EMPTY}"
+      echo "WORKTREE_BASE=${WORKTREE_BASE:-EMPTY}"
+      echo "CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-EMPTY}"
+    ' 2>&1)
+
+  # Bootstrap must fail
+  if ! echo "$output" | grep -q "rc=1"; then
+    tap_not_ok "$desc" "Expected rc=1, got: $output"
+    return
+  fi
+
+  # All derived vars must be cleared
+  if echo "$output" | grep -q "REVIEWER_WORKTREE=/tmp/stale-reviewer"; then
+    tap_not_ok "$desc" "REVIEWER_WORKTREE still has stale value after failure: $output"
+    return
+  fi
+  if ! echo "$output" | grep -q "REVIEWER_WORKTREE=EMPTY"; then
+    tap_not_ok "$desc" "REVIEWER_WORKTREE not cleared: $output"
+    return
+  fi
+
+  tap_ok "$desc"
+}
+
+# --------------------------------------------------------------------------
+# Test: documented bootstrap snippet shape fails closed on hostile override
+# --------------------------------------------------------------------------
+test_documented_snippet_fails_closed() {
+  local desc="documented bootstrap snippet fails closed (no mkdir on hostile env)"
+
+  # Simulate the exact documented snippet from plan/SKILL.md and review-pr/SKILL.md
+  # with hostile pre-seeded vars. The || exit 1 guard must prevent mkdir from running.
+  local plan_output
+  plan_output=$(WORKTREE_BASE="/tmp/evil" \
+    CRITIC_WORKTREE="/tmp/stale-critic" \
+    CARGO_TARGET_DIR="" \
+    CLAUDE_SESSION_ID="test-session" \
+    bash -c '
+      REPO_ROOT="'"$(cd "$REPO_ROOT" && pwd)"'"
+      source "$REPO_ROOT/scripts/lib/agent-worktree-contract.sh"
+      ISSUE=999
+      plan_critic_bootstrap "$ISSUE" "critic-a" || exit 1
+      mkdir -p "$CRITIC_WORKTREE"
+      echo "REACHED_MKDIR"
+    ' 2>&1) || true
+
+  if echo "$plan_output" | grep -q "REACHED_MKDIR"; then
+    tap_not_ok "$desc (plan)" "mkdir was reached despite hostile WORKTREE_BASE"
+    return
+  fi
+
+  local review_output
+  review_output=$(WORKTREE_BASE="/tmp/evil" \
+    REVIEWER_WORKTREE="/tmp/stale-reviewer" \
+    CARGO_TARGET_DIR="" \
+    CLAUDE_SESSION_ID="test-session" \
+    bash -c '
+      REPO_ROOT="'"$(cd "$REPO_ROOT" && pwd)"'"
+      source "$REPO_ROOT/scripts/lib/agent-worktree-contract.sh"
+      ISSUE=100
+      review_pr_bootstrap "$ISSUE" || exit 1
+      mkdir -p "$REVIEWER_WORKTREE"
+      echo "REACHED_MKDIR"
+    ' 2>&1) || true
+
+  if echo "$review_output" | grep -q "REACHED_MKDIR"; then
+    tap_not_ok "$desc (review-pr)" "mkdir was reached despite hostile WORKTREE_BASE"
+    return
+  fi
+
+  tap_ok "$desc"
+}
+
+# --------------------------------------------------------------------------
 # Run all tests
 # --------------------------------------------------------------------------
 echo "TAP version 13"
@@ -433,10 +566,13 @@ test_plan_bootstrap_rejects_hostile_worktree_base
 test_plan_bootstrap_rejects_hostile_cargo_target_dir
 test_plan_bootstrap_rejects_sibling_prefix_worktree_base
 test_plan_bootstrap_accepts_safe_preseeded_home_data_paths
+test_plan_bootstrap_clears_stale_vars_on_failure
 test_review_pr_bootstrap_rejects_hostile_worktree_base_and_cargo_target
 test_review_pr_bootstrap_rejects_sibling_prefix
 test_review_pr_bootstrap_requires_home_data_workspace
+test_review_pr_bootstrap_clears_stale_vars_on_failure
 test_default_bootstrap_layouts_stay_under_home_data
+test_documented_snippet_fails_closed
 test_sourcing_preserves_caller_shell_options
 test_skill_files_reference_shared_contract_helper
 test_claude_review_pr_synced

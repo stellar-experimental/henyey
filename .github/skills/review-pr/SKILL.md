@@ -655,7 +655,7 @@ source "$REPO_ROOT/scripts/lib/agent-worktree-contract.sh"
 # and REVIEWER_WORKTREE. Pre-seeded values are accepted only if they resolve
 # under $HOME/data; hostile values (outside $HOME/data or using ../ traversal)
 # are rejected with a non-zero exit.
-review_pr_bootstrap "$ISSUE"
+review_pr_bootstrap "$ISSUE" || exit 1
 mkdir -p "$REVIEWER_WORKTREE"
 ```
 
