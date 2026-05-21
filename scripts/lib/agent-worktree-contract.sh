@@ -12,10 +12,10 @@
 #   plan_critic_bootstrap "$ISSUE" "critic-a"
 #   review_pr_bootstrap "$ISSUE"
 
-# NOTE: Do not use `set -e` here — this file is meant to be sourced by callers,
-# and errexit inside command substitutions can cause hard exits that bypass
-# caller error handling. Callers should check return codes explicitly.
-set -uo pipefail
+# NOTE: This file is meant to be sourced by callers. Do NOT set shell options
+# (set -e, set -u, set -o pipefail, etc.) here — doing so mutates the caller's
+# shell state, which is an operational regression risk. All functions below use
+# explicit guards and return codes instead of relying on global shell options.
 
 # canonicalize_contract_path <path>
 # Resolve symlinks and collapse .. traversals without requiring the path to exist.

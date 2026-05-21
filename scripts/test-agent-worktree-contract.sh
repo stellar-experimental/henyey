@@ -376,6 +376,55 @@ test_review_pr_bootstrap_rejects_sibling_prefix() {
 }
 
 # --------------------------------------------------------------------------
+# Test: sourcing the helper does not mutate caller shell options
+# --------------------------------------------------------------------------
+test_sourcing_preserves_caller_shell_options() {
+  local desc="sourcing helper preserves caller shell options"
+
+  # Run in a subshell where nounset and pipefail are explicitly OFF,
+  # source the helper, then verify they remain OFF.
+  local output
+  output=$(bash -c '
+    # Ensure nounset and pipefail are OFF
+    set +u
+    set +o pipefail
+
+    # Capture initial state
+    before_u=$(set +o | grep nounset)
+    before_p=$(set +o | grep pipefail)
+
+    source "'"$CONTRACT_HELPER"'"
+
+    # Capture state after sourcing
+    after_u=$(set +o | grep nounset)
+    after_p=$(set +o | grep pipefail)
+
+    if [[ "$before_u" != "$after_u" ]]; then
+      echo "FAIL: nounset changed from [$before_u] to [$after_u]"
+      exit 1
+    fi
+    if [[ "$before_p" != "$after_p" ]]; then
+      echo "FAIL: pipefail changed from [$before_p] to [$after_p]"
+      exit 1
+    fi
+
+    # Also verify the helper still works (hostile path rejected)
+    if require_home_data_path "/tmp/evil" "TEST" 2>/dev/null; then
+      echo "FAIL: hostile path was not rejected after sourcing"
+      exit 1
+    fi
+
+    echo "OK"
+  ' 2>&1)
+
+  if [[ "$output" == "OK" ]]; then
+    tap_ok "$desc"
+  else
+    tap_not_ok "$desc" "$output"
+  fi
+}
+
+# --------------------------------------------------------------------------
 # Run all tests
 # --------------------------------------------------------------------------
 echo "TAP version 13"
@@ -388,6 +437,7 @@ test_review_pr_bootstrap_rejects_hostile_worktree_base_and_cargo_target
 test_review_pr_bootstrap_rejects_sibling_prefix
 test_review_pr_bootstrap_requires_home_data_workspace
 test_default_bootstrap_layouts_stay_under_home_data
+test_sourcing_preserves_caller_shell_options
 test_skill_files_reference_shared_contract_helper
 test_claude_review_pr_synced
 test_claude_plan_synced
