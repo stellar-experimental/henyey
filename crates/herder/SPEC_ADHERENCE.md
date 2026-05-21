@@ -66,7 +66,7 @@ excluded. SHOULD claims and operational defaults excluded.
 | §11 | combineCandidates: signature carry-over | Partial | uses selected candidate's full SV (deviation: defensive fallback when no candidate matches LCL) |
 | §12.1 | One tx per source account | Full | tx_queue/mod.rs::check_account_limit |
 | §12.2 | Reception pipeline order | Full | outer pre-filter → signature verify → self-skip → quorum gate → strict STELLAR_VALUE_SIGNED validation before fetch/relay → dependency admission → SCP acceptance (#2870) |
-| §12.2 | Cross-queue source check | Partial | spec puts it at top of HerderImpl.recvTransaction; henyey enforces inside try_add (regression test #1934) |
+| §12.2 | Cross-queue source check | Full | early check in `try_add` before validation; `check_cross_type_conflict_with` covers seq-source and fee-source-only entries + authoritative recheck in `check_account_limit` (regression tests #2871) |
 | §12.3 | Replace-by-fee FEE_MULTIPLIER × per-op | Full | tx_queue/mod.rs:606, 663 (FEE_MULTIPLIER = 10) |
 | §12.4 | shift() ban deque + age + auto-ban | Full | tx_queue/mod.rs:2761 (TIMEOUT=4, BAN=10) |
 | §12.4 | removeApplied semantics | Full | tx_queue/mod.rs:2654 |
@@ -444,11 +444,21 @@ excluded. SHOULD claims and operational defaults excluded.
     overlay validity → fee balance.
   - **Sub-claim §12.2-1 (cross-queue source check)**: Spec places this at
     the *top* of `HerderImpl.recvTransaction`. In henyey,
-    `Herder::receive_transaction` (`herder.rs:2324`) delegates to the
-    correct queue; the cross-queue source-account check is then performed
-    inside `try_add` rather than as a top-level pre-check. Regression test
-    coverage: #1934.
-    - **Status:** Partial.
+    `TransactionQueue::try_add` performs an early cross-type
+    source-account conflict check (`check_cross_type_conflict_with`) before
+    `validate_transaction`, matching stellar-core's precedence: opposite-type
+    submissions always surface `TryAgainLater` before any validation error.
+    The guard covers both seq-source entries (`state.transaction`) and
+    fee-source-only entries (`soroban_fee_tx_count` / `classic_fee_tx_count`),
+    matching `sourceAccountPending` which returns true for any
+    `mAccountStates` entry in the opposite queue.
+    The later `check_account_limit` recheck under the store write-lock
+    remains the authoritative guard against races.
+    Regression tests: `test_cross_type_invalid_classic_returns_try_again_later`,
+    `test_cross_type_invalid_soroban_returns_try_again_later`,
+    `test_cross_type_fee_source_only_classic_returns_try_again_later`,
+    `test_cross_type_fee_source_only_soroban_returns_try_again_later` (#2871).
+    - **Status:** Full.
   - **Sub-claim §12.2-3 (ban check before filter)**: Henyey performs the
     ban check (`is_banned`) before the filter check at line 2090; matches
     spec.
@@ -766,10 +776,9 @@ sections present in the current spec:
    so reviewers understand the spec calls it fatal but henyey treats it
    as recoverable.
 
-4. **Audit cross-queue source-account check ordering** (§12.2-1). Spec
-   wants it at the top of `recvTransaction`; henyey runs it inside
-   `try_add`. Verify there is no behavioural divergence under fee-bump
-   churn.
+4. ~~**Audit cross-queue source-account check ordering** (§12.2-1).~~ Fixed
+   in #2871 — early `check_cross_type_conflict` guard now runs before
+   `validate_transaction` in `try_add`.
 
 5. **Verify §15.3 random-peer ask path** is wired in the overlay /
    sync_recovery integration; the herder side only exposes the slot
