@@ -7985,6 +7985,153 @@ mod tests {
         assert!(!queue.contains(&old_hash));
         assert_eq!(queue.len(), 1);
     }
+
+    /// Parity regression: queue a valid Soroban tx, then submit a classic tx
+    /// from the same source with unsatisfied extra_signers. On current main
+    /// this returns Invalid(Some(TxBadAuth)) because validate_transaction runs
+    /// before the cross-type guard. After the fix, the early cross-type check
+    /// returns TryAgainLater before validation.
+    #[test]
+    fn test_cross_type_invalid_classic_returns_try_again_later() {
+        let queue = TransactionQueue::with_defaults();
+
+        // Queue a valid Soroban tx from account seed 42, seq 1.
+        let mut soroban = make_soroban_envelope(200);
+        set_source(&mut soroban, 42);
+        if let TransactionEnvelope::Tx(env) = &mut soroban {
+            env.tx.seq_num = SequenceNumber(1);
+        }
+        assert_eq!(queue.try_add(soroban.clone()), TxQueueResult::Added);
+        let soroban_hash = full_hash(&soroban);
+
+        // Build a classic tx from same source (seed 42) with an unsatisfied
+        // extra_signers precondition — this makes validate_transaction return
+        // TxBadAuth on current main (the bug).
+        let extra_signer = SignerKey::Ed25519(Uint256([99u8; 32])); // nobody signs with this key
+        let preconditions = Preconditions::V2(PreconditionsV2 {
+            time_bounds: None,
+            ledger_bounds: None,
+            min_seq_num: None,
+            min_seq_age: Duration(0),
+            min_seq_ledger_gap: 0,
+            extra_signers: vec![extra_signer].try_into().unwrap(),
+        });
+
+        let tx = Transaction {
+            source_account: MuxedAccount::Ed25519(Uint256([42u8; 32])),
+            fee: 200,
+            seq_num: SequenceNumber(1),
+            cond: preconditions,
+            memo: Memo::None,
+            operations: vec![Operation {
+                source_account: None,
+                body: OperationBody::CreateAccount(CreateAccountOp {
+                    destination: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([255u8; 32]))),
+                    starting_balance: 1000000000,
+                }),
+            }]
+            .try_into()
+            .unwrap(),
+            ext: TransactionExt::V0,
+        };
+
+        let classic = TransactionEnvelope::Tx(TransactionV1Envelope {
+            tx,
+            signatures: vec![DecoratedSignature {
+                hint: SignatureHint([0u8; 4]),
+                signature: XdrSignature(vec![0u8; 64].try_into().unwrap()),
+            }]
+            .try_into()
+            .unwrap(),
+        });
+
+        // Parity: stellar-core returns TryAgainLater here because the
+        // cross-queue source-account check fires before validation.
+        let result = queue.try_add(classic);
+        assert_eq!(
+            result,
+            TxQueueResult::TryAgainLater,
+            "cross-type guard must precede validate_transaction"
+        );
+
+        // Original Soroban tx must remain queued.
+        assert!(queue.contains(&soroban_hash));
+        assert_eq!(queue.len(), 1);
+    }
+
+    /// Symmetric case: queue a valid classic tx, then submit a Soroban tx
+    /// from the same source with unsatisfied extra_signers.
+    #[test]
+    fn test_cross_type_invalid_soroban_returns_try_again_later() {
+        let queue = TransactionQueue::with_defaults();
+
+        // Queue a valid classic tx from account seed 42, seq 1.
+        let mut classic = make_test_envelope(200, 1);
+        set_source(&mut classic, 42);
+        if let TransactionEnvelope::Tx(env) = &mut classic {
+            env.tx.seq_num = SequenceNumber(1);
+        }
+        assert_eq!(queue.try_add(classic.clone()), TxQueueResult::Added);
+        let classic_hash = full_hash(&classic);
+
+        // Build a Soroban tx from same source (seed 42) with an unsatisfied
+        // extra_signers precondition.
+        let extra_signer = SignerKey::Ed25519(Uint256([99u8; 32]));
+        let preconditions = Preconditions::V2(PreconditionsV2 {
+            time_bounds: None,
+            ledger_bounds: None,
+            min_seq_num: None,
+            min_seq_age: Duration(0),
+            min_seq_ledger_gap: 0,
+            extra_signers: vec![extra_signer].try_into().unwrap(),
+        });
+
+        let function_name = ScSymbol(StringM::<32>::try_from("test".to_string()).expect("symbol"));
+        let host_function = HostFunction::InvokeContract(InvokeContractArgs {
+            contract_address: ScAddress::default(),
+            function_name,
+            args: VecM::<ScVal>::default(),
+        });
+        let op = Operation {
+            source_account: None,
+            body: OperationBody::InvokeHostFunction(InvokeHostFunctionOp {
+                host_function,
+                auth: VecM::default(),
+            }),
+        };
+
+        let tx = Transaction {
+            source_account: MuxedAccount::Ed25519(Uint256([42u8; 32])),
+            fee: 200,
+            seq_num: SequenceNumber(1),
+            cond: preconditions,
+            memo: Memo::None,
+            operations: vec![op].try_into().unwrap(),
+            ext: TransactionExt::V0,
+        };
+
+        let soroban = TransactionEnvelope::Tx(TransactionV1Envelope {
+            tx,
+            signatures: vec![DecoratedSignature {
+                hint: SignatureHint([0u8; 4]),
+                signature: XdrSignature(vec![0u8; 64].try_into().unwrap()),
+            }]
+            .try_into()
+            .unwrap(),
+        });
+
+        // Parity: stellar-core returns TryAgainLater here.
+        let result = queue.try_add(soroban);
+        assert_eq!(
+            result,
+            TxQueueResult::TryAgainLater,
+            "cross-type guard must precede validate_transaction"
+        );
+
+        // Original classic tx must remain queued.
+        assert!(queue.contains(&classic_hash));
+        assert_eq!(queue.len(), 1);
+    }
 }
 
 #[cfg(test)]
