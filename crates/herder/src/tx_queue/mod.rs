@@ -593,12 +593,23 @@ pub struct AccountState {
     /// The single pending transaction for which this account is the sequence-number-source.
     /// stellar-core enforces one transaction per account (non-fee-bump) in the queue.
     pub transaction: Option<QueuedTransaction>,
+    /// Number of queued Soroban transactions for which this account is the fee-source.
+    /// Parity: stellar-core's per-queue `mAccountStates` implicitly tracks fee-source
+    /// involvement by type (each queue only contains one tx type). In henyey's
+    /// single-queue model we need explicit type counts to replicate the cross-queue
+    /// source-account guard for fee-source-only entries.
+    pub soroban_fee_tx_count: u32,
+    /// Number of queued classic transactions for which this account is the fee-source.
+    pub classic_fee_tx_count: u32,
 }
 
 impl AccountState {
     /// Check if this account state can be removed (no transaction and no fees tracked).
     pub fn is_empty(&self) -> bool {
-        self.transaction.is_none() && self.total_fees == 0
+        self.transaction.is_none()
+            && self.total_fees == 0
+            && self.soroban_fee_tx_count == 0
+            && self.classic_fee_tx_count == 0
     }
 }
 
@@ -1547,18 +1558,40 @@ impl TransactionQueue {
     ///
     /// This is an optimistic read (no write lock); the later `check_account_limit`
     /// under the store write-lock remains the authoritative recheck.
-    fn check_cross_type_conflict(&self, envelope: &TransactionEnvelope) -> Option<TxQueueResult> {
-        let seq_source = account_key(envelope);
-        let candidate_is_soroban = henyey_tx::envelope_utils::is_soroban_envelope(envelope);
-
+    /// Check if a candidate transaction conflicts with an opposite-type pending
+    /// entry for the same source account, using pre-computed key and type.
+    ///
+    /// Parity: stellar-core `HerderImpl::recvTransaction` (HerderImpl.cpp:627-645)
+    /// checks `sourceAccountPending` on the opposite queue before `tryAdd`. This
+    /// replicates that precedence so the externally visible result is
+    /// `TryAgainLater` rather than whatever validation error would fire first.
+    ///
+    /// This is an optimistic read (no write lock); the later `check_account_limit`
+    /// under the store write-lock remains the authoritative recheck.
+    fn check_cross_type_conflict_with(
+        &self,
+        seq_source: &[u8],
+        candidate_is_soroban: bool,
+    ) -> Option<TxQueueResult> {
         let account_states = self.account_states.read();
-        if let Some(state) = account_states.get(&seq_source) {
+        if let Some(state) = account_states.get(seq_source) {
+            // Check if the account has a pending tx of the opposite type (seq-source role)
             if let Some(ref current_tx) = state.transaction {
                 let current_is_soroban =
                     henyey_tx::envelope_utils::is_soroban_envelope(&current_tx.envelope);
                 if current_is_soroban != candidate_is_soroban {
                     return Some(TxQueueResult::TryAgainLater);
                 }
+            }
+            // Parity: stellar-core's `sourceAccountPending` returns true for
+            // any entry in the opposite queue's `mAccountStates`, including
+            // fee-source-only entries. Check if this account pays fees for a
+            // tx of the opposite type.
+            if candidate_is_soroban && state.classic_fee_tx_count > 0 {
+                return Some(TxQueueResult::TryAgainLater);
+            }
+            if !candidate_is_soroban && state.soroban_fee_tx_count > 0 {
+                return Some(TxQueueResult::TryAgainLater);
             }
         }
         None
@@ -1816,6 +1849,16 @@ impl TransactionQueue {
                 }
 
                 return Ok(Some(current_tx.clone()));
+            }
+
+            // Parity: authoritative recheck for fee-source-only entries.
+            // stellar-core's sourceAccountPending also matches fee-source-only
+            // entries in the opposite queue's mAccountStates.
+            if candidate_is_soroban && state.classic_fee_tx_count > 0 {
+                return Err(TxQueueResult::TryAgainLater);
+            }
+            if !candidate_is_soroban && state.soroban_fee_tx_count > 0 {
+                return Err(TxQueueResult::TryAgainLater);
             }
         }
         Ok(None)
@@ -2090,12 +2133,20 @@ impl TransactionQueue {
 
     /// Try to add a transaction to the queue.
     pub fn try_add(&self, envelope: TransactionEnvelope) -> TxQueueResult {
+        // Pre-compute values needed by both the early cross-type guard and
+        // the later account-limit / admission logic, avoiding redundant
+        // allocations on this hot path.
+        let seq_source_key = account_key(&envelope);
+        let candidate_is_soroban = henyey_tx::envelope_utils::is_soroban_envelope(&envelope);
+
         // Parity: stellar-core HerderImpl.cpp:627-645 checks whether the
         // source account already has a pending tx of the opposite type
         // (classic vs Soroban) BEFORE running any validation. Replicate that
         // precedence here so cross-type conflicts always surface as
         // TryAgainLater rather than whatever validation error would fire first.
-        if let Some(result) = self.check_cross_type_conflict(&envelope) {
+        if let Some(result) =
+            self.check_cross_type_conflict_with(&seq_source_key, candidate_is_soroban)
+        {
             return result;
         }
 
@@ -2166,7 +2217,7 @@ impl TransactionQueue {
 
         let mut store = self.store.write();
         let ledger_version = self.validation_context.read().protocol_version;
-        let queued_is_soroban = henyey_tx::envelope_utils::is_soroban_envelope(&queued.envelope);
+        let queued_is_soroban = candidate_is_soroban;
 
         // Re-check ban after acquiring store.write() to close the TOCTOU
         // window with ban(). The early is_banned() check (above) is a
@@ -2196,7 +2247,7 @@ impl TransactionQueue {
         }
 
         // Per-account limit check: one transaction per account (sequence-number-source)
-        let seq_source_key = account_key(&queued.envelope);
+        // seq_source_key was pre-computed at the top of try_add.
         let new_seq = envelope_sequence_number(&queued.envelope);
         let is_fee_bump = is_fee_bump_envelope(&queued.envelope);
         let new_fee_source_key = fee_source_key(&queued.envelope);
@@ -2281,6 +2332,16 @@ impl TransactionQueue {
                     old_fee_state.total_fees = old_fee_state
                         .total_fees
                         .saturating_sub(old_tx.total_fee as i64);
+                    // Decrement fee type count for the old tx
+                    let old_is_soroban =
+                        henyey_tx::envelope_utils::is_soroban_envelope(&old_tx.envelope);
+                    if old_is_soroban {
+                        old_fee_state.soroban_fee_tx_count =
+                            old_fee_state.soroban_fee_tx_count.saturating_sub(1);
+                    } else {
+                        old_fee_state.classic_fee_tx_count =
+                            old_fee_state.classic_fee_tx_count.saturating_sub(1);
+                    }
                     // Remove the account state if it's empty
                     if old_fee_state.is_empty() {
                         account_states.remove(&old_fee_source_key);
@@ -2306,6 +2367,7 @@ impl TransactionQueue {
                 let old_fee_source_key = fee_source_key(&old_tx.envelope);
                 if old_fee_source_key == new_fee_source_key {
                     // Same fee source - only add the difference
+                    // Fee type count stays the same (same fee source, same type)
                     (new_fee as i64).saturating_sub(old_tx.total_fee as i64)
                 } else {
                     // Different fee source - add full new fee
@@ -2318,15 +2380,35 @@ impl TransactionQueue {
 
             seq_state.transaction = Some(queued.clone());
 
-            // Update the fee-source account state (tracks total_fees)
+            // Update the fee-source account state (tracks total_fees and fee type counts)
             // Note: seq_source and fee_source may be the same account
             if seq_source_key == new_fee_source_key {
                 // Same account - already have the entry
                 seq_state.total_fees = seq_state.total_fees.saturating_add(fee_to_add);
+                // Update fee type count for the new tx (only if not a same-source replacement)
+                if replaced_tx.as_ref().map_or(true, |old| {
+                    fee_source_key(&old.envelope) != new_fee_source_key
+                }) {
+                    if queued_is_soroban {
+                        seq_state.soroban_fee_tx_count += 1;
+                    } else {
+                        seq_state.classic_fee_tx_count += 1;
+                    }
+                }
             } else {
                 // Different accounts - update fee-source separately
                 let fee_state = account_states.entry(new_fee_source_key).or_default();
                 fee_state.total_fees = fee_state.total_fees.saturating_add(fee_to_add);
+                // Update fee type count for the new tx (only if not a same-source replacement)
+                if replaced_tx.as_ref().map_or(true, |old| {
+                    fee_source_key(&old.envelope) != fee_source_key(&queued.envelope)
+                }) {
+                    if queued_is_soroban {
+                        fee_state.soroban_fee_tx_count += 1;
+                    } else {
+                        fee_state.classic_fee_tx_count += 1;
+                    }
+                }
             }
         }
 
@@ -2462,6 +2544,7 @@ impl TransactionQueue {
     ) {
         let seq_source = account_key(&queued.envelope);
         let fee_source = fee_source_key(&queued.envelope);
+        let is_soroban = henyey_tx::envelope_utils::is_soroban_envelope(&queued.envelope);
 
         // Clear the pending transaction on the seq-source account.
         if let Some(state) = account_states.get_mut(&seq_source) {
@@ -2471,9 +2554,14 @@ impl TransactionQueue {
             }
         }
 
-        // Release fees on the fee-source account.
+        // Release fees and decrement fee type count on the fee-source account.
         if let Some(fee_state) = account_states.get_mut(&fee_source) {
             fee_state.total_fees = fee_state.total_fees.saturating_sub(queued.total_fee as i64);
+            if is_soroban {
+                fee_state.soroban_fee_tx_count = fee_state.soroban_fee_tx_count.saturating_sub(1);
+            } else {
+                fee_state.classic_fee_tx_count = fee_state.classic_fee_tx_count.saturating_sub(1);
+            }
         }
 
         // Remove empty account state entries.
@@ -2699,7 +2787,7 @@ impl TransactionQueue {
         let ledger_version = self.validation_context.read().protocol_version;
 
         // Collect fee releases to apply after processing all transactions
-        let mut fee_releases: Vec<(Vec<u8>, i64)> = Vec::new();
+        let mut fee_releases: Vec<(Vec<u8>, i64, bool)> = Vec::new(); // (key, fee, is_soroban)
         let mut accounts_to_cleanup: Vec<Vec<u8>> = Vec::new();
         let mut removed_hashes: Vec<Hash256> = Vec::new();
 
@@ -2730,7 +2818,9 @@ impl TransactionQueue {
                         // Collect fee release info
                         let tx_fee = queued_tx.total_fee as i64;
                         let tx_fee_source_key = self::fee_source_key(&queued_tx.envelope);
-                        fee_releases.push((tx_fee_source_key, tx_fee));
+                        let tx_is_soroban =
+                            henyey_tx::envelope_utils::is_soroban_envelope(&queued_tx.envelope);
+                        fee_releases.push((tx_fee_source_key, tx_fee, tx_is_soroban));
 
                         state.transaction = None;
                         state.age = 0;
@@ -2752,9 +2842,16 @@ impl TransactionQueue {
         }
 
         // Apply fee releases
-        for (fee_source_key, tx_fee) in fee_releases {
+        for (fee_source_key, tx_fee, is_soroban) in fee_releases {
             if let Some(fee_state) = account_states.get_mut(&fee_source_key) {
                 fee_state.total_fees = fee_state.total_fees.saturating_sub(tx_fee);
+                if is_soroban {
+                    fee_state.soroban_fee_tx_count =
+                        fee_state.soroban_fee_tx_count.saturating_sub(1);
+                } else {
+                    fee_state.classic_fee_tx_count =
+                        fee_state.classic_fee_tx_count.saturating_sub(1);
+                }
             }
         }
 
@@ -2810,7 +2907,7 @@ impl TransactionQueue {
         let mut evicted_due_to_age = 0;
         let mut accounts_to_remove = Vec::new();
         // Collect fee releases to apply after iteration (to avoid borrow conflicts)
-        let mut fee_releases: Vec<(Vec<u8>, u64)> = Vec::new();
+        let mut fee_releases: Vec<(Vec<u8>, u64, bool)> = Vec::new(); // (key, fee, is_soroban)
         let mut evicted_hashes: Vec<Hash256> = Vec::new();
 
         // Process account states: increment age, auto-ban stale transactions
@@ -2831,7 +2928,9 @@ impl TransactionQueue {
 
                     // Track fee release for the fee-source account
                     let tx_fee_source_key = fee_source_key(&queued_tx.envelope);
-                    fee_releases.push((tx_fee_source_key, queued_tx.total_fee));
+                    let tx_is_soroban =
+                        henyey_tx::envelope_utils::is_soroban_envelope(&queued_tx.envelope);
+                    fee_releases.push((tx_fee_source_key, queued_tx.total_fee, tx_is_soroban));
 
                     evicted_due_to_age += 1;
 
@@ -2848,9 +2947,16 @@ impl TransactionQueue {
         }
 
         // Apply fee releases
-        for (fee_source_key, tx_fee) in fee_releases {
+        for (fee_source_key, tx_fee, is_soroban) in fee_releases {
             if let Some(fee_state) = account_states.get_mut(&fee_source_key) {
                 fee_state.total_fees = fee_state.total_fees.saturating_sub(tx_fee as i64);
+                if is_soroban {
+                    fee_state.soroban_fee_tx_count =
+                        fee_state.soroban_fee_tx_count.saturating_sub(1);
+                } else {
+                    fee_state.classic_fee_tx_count =
+                        fee_state.classic_fee_tx_count.saturating_sub(1);
+                }
                 // Mark for removal if now empty
                 if fee_state.is_empty() && !accounts_to_remove.contains(&fee_source_key) {
                     accounts_to_remove.push(fee_source_key);
@@ -8166,6 +8272,98 @@ mod tests {
 
         // Original classic tx must remain queued.
         assert!(queue.contains(&classic_hash));
+        assert_eq!(queue.len(), 1);
+    }
+
+    /// Fee-source-only cross-type guard: an account that only *fee-pays*
+    /// an opposite-type tx must also trigger TryAgainLater.
+    ///
+    /// Parity: stellar-core's `sourceAccountPending` checks the opposite
+    /// queue's `mAccountStates`, which includes fee-source-only entries.
+    /// Before this fix, henyey's check only fired when `state.transaction`
+    /// was set, missing the fee-source-only case.
+    #[test]
+    fn test_cross_type_fee_source_only_classic_returns_try_again_later() {
+        let queue = TransactionQueue::with_defaults();
+
+        // Queue a Soroban tx with seq-source = account 10, fee-source = account 42.
+        // This creates an account_states entry for account 42 with
+        // transaction = None but total_fees > 0 and soroban_fee_tx_count = 1.
+        let mut soroban = make_soroban_envelope(200);
+        set_source(&mut soroban, 10);
+        if let TransactionEnvelope::Tx(env) = &mut soroban {
+            env.tx.seq_num = SequenceNumber(1);
+        }
+        let fee_bumped = make_fee_bump_envelope(
+            match soroban {
+                TransactionEnvelope::Tx(ref env) => env.clone(),
+                _ => panic!("expected Tx"),
+            },
+            42, // fee-source seed
+            500,
+        );
+        assert_eq!(queue.try_add(fee_bumped.clone()), TxQueueResult::Added);
+        let original_hash = full_hash(&fee_bumped);
+
+        // Now submit a classic tx as seq-source = account 42 (the fee-payer above).
+        // Parity: stellar-core sees account 42 in the Soroban queue (fee-source entry)
+        // and returns TryAgainLater.
+        let mut classic = make_test_envelope(200, 1);
+        set_source(&mut classic, 42);
+        if let TransactionEnvelope::Tx(env) = &mut classic {
+            env.tx.seq_num = SequenceNumber(1);
+        }
+
+        let result = queue.try_add(classic);
+        assert_eq!(
+            result,
+            TxQueueResult::TryAgainLater,
+            "fee-source-only cross-type guard must reject opposite-type submission"
+        );
+
+        // Original fee-bumped Soroban tx must remain queued.
+        assert!(queue.contains(&original_hash));
+        assert_eq!(queue.len(), 1);
+    }
+
+    /// Symmetric case: fee-source-only with classic tx queued, then Soroban submission.
+    #[test]
+    fn test_cross_type_fee_source_only_soroban_returns_try_again_later() {
+        let queue = TransactionQueue::with_defaults();
+
+        // Queue a classic tx with seq-source = account 10, fee-source = account 42.
+        let mut classic = make_test_envelope(200, 1);
+        set_source(&mut classic, 10);
+        if let TransactionEnvelope::Tx(env) = &mut classic {
+            env.tx.seq_num = SequenceNumber(1);
+        }
+        let fee_bumped = make_fee_bump_envelope(
+            match classic {
+                TransactionEnvelope::Tx(ref env) => env.clone(),
+                _ => panic!("expected Tx"),
+            },
+            42, // fee-source seed
+            500,
+        );
+        assert_eq!(queue.try_add(fee_bumped.clone()), TxQueueResult::Added);
+        let original_hash = full_hash(&fee_bumped);
+
+        // Now submit a Soroban tx as seq-source = account 42.
+        let mut soroban = make_soroban_envelope(200);
+        set_source(&mut soroban, 42);
+        if let TransactionEnvelope::Tx(env) = &mut soroban {
+            env.tx.seq_num = SequenceNumber(1);
+        }
+
+        let result = queue.try_add(soroban);
+        assert_eq!(
+            result,
+            TxQueueResult::TryAgainLater,
+            "fee-source-only cross-type guard must reject opposite-type submission"
+        );
+
+        // Original fee-bumped classic tx must remain queued.
+        assert!(queue.contains(&original_hash));
         assert_eq!(queue.len(), 1);
     }
 }
