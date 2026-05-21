@@ -160,7 +160,23 @@ Order actionable items by:
 2. **Label priority** within state — descending: `urgent` > `high` > `medium` > `low` > (no priority label).
 3. **Age** within priority tier — oldest `createdAt` first.
 
-Pick the head of the sorted list. If the list is empty, print `no actionable issues` and exit 0.
+Before picking the head of the sorted list, **filter out any issues this loop recently lost the sentinel race for** (per-loop cooldown — see #2822). The cooldown prevents the losing loop from re-picking the same issue every 30s while a concurrent loop is still working it, which historically wedged one loop's capacity for the entire duration of the other's `/review-pr` or `/do` cycle. The cooldown file is per-loop (keyed by `$LOOP_PID` exported by `scripts/project-tick-loop.sh`); each entry is `<issue> <expiry_epoch>` and the picker skips issues whose expiry is still in the future:
+
+```bash
+COOLDOWN_FILE="/tmp/project-tick-cooldown-${LOOP_PID:-default}"
+COOLED_DOWN=""
+if [ -f "$COOLDOWN_FILE" ]; then
+  NOW=$(date +%s)
+  # Prune expired entries in place; keep only still-active cooldowns.
+  awk -v now="$NOW" '$2 > now' "$COOLDOWN_FILE" > "$COOLDOWN_FILE.tmp" \
+    && mv "$COOLDOWN_FILE.tmp" "$COOLDOWN_FILE"
+  COOLED_DOWN=$(awk '{print $1}' "$COOLDOWN_FILE" | sort -u | paste -sd, -)
+fi
+# Then filter the sorted actionable list: drop any issue whose number is in
+# $COOLED_DOWN (comma-separated) before picking the head.
+```
+
+Pick the head of the post-filter sorted list. If the list is empty, print `no actionable issues` and exit 0.
 
 ### Step 4 — Acquire the issue (sentinel-comment lock)
 
@@ -210,6 +226,13 @@ if [ "$WINNER_TICK" != "$TICK_ID" ]; then
   # the winner's assignment out from under it (see #2787 / audit M1). The
   # winner retains the assignment and proceeds; we just step back.
   gh api "repos/stellar-experimental/henyey/issues/comments/$SENTINEL_ID" --method DELETE 2>/dev/null || true
+  # Record a 5-minute cooldown so the next tick from this loop skips this
+  # issue and falls through to lower-priority actionable items (#2822). The
+  # foreign loop's specialist typically runs 5–30 min; if it finishes before
+  # the cooldown expires, the natural state transition removes the item from
+  # the actionable list anyway and the cooldown entry harmlessly expires.
+  COOLDOWN_FILE="/tmp/project-tick-cooldown-${LOOP_PID:-default}"
+  echo "$ISSUE $(( $(date +%s) + 300 ))" >> "$COOLDOWN_FILE"
   exit 0
 fi
 

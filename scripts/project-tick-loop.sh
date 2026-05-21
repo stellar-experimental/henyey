@@ -28,6 +28,13 @@ LOOP_LOG_DIR="${LOOP_LOG_DIR:-$HOME/data/project-tick-loop}"
 LOOP_TICK_TIMEOUT="${LOOP_TICK_TIMEOUT:-14400}"
 LOOP_DRY_RUN="${LOOP_DRY_RUN:-0}"
 
+# Per-loop PID — exported so /project-tick's picker can scope its lost-race
+# cooldown set to this loop (see issue #2822). Fresh on every loop start, so
+# we also clean up any stale cooldown file from a previous run with the same
+# PID (rare but possible after a long uptime).
+export LOOP_PID=$$
+rm -f "/tmp/project-tick-cooldown-${LOOP_PID}" 2>/dev/null || true
+
 log() { printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"; }
 
 on_signal() {
