@@ -81,7 +81,7 @@ Corresponds to: `Herder.h`, `HerderImpl.h`
 | `getMinLedgerSeqToRemember()` | `get_min_ledger_seq_to_remember()` | Full |
 | `isNewerNominationOrBallotSt()` | _(not implemented)_ | None |
 | `getMostRecentCheckpointSeq()` | `get_most_recent_checkpoint_seq()` | Full |
-| `triggerNextLedger()` | `trigger_next_ledger()` | Full | Henyey adds an `is_nominating` idempotency guard that skips duplicate triggers while nomination is active. stellar-core logs and continues on duplicate calls but never invokes them in a retry loop. Observable SCP behavior is unchanged. |
+| `triggerNextLedger()` | `trigger_next_ledger()` | Partial | Henyey adds an `is_nominating` idempotency guard that skips duplicate triggers while nomination is active. stellar-core logs and continues on duplicate calls but never invokes them in a retry loop. Observable SCP behavior is unchanged. Remaining divergence: stellar-core re-checks `mLedgerManager.isApplying()` after tx-set construction (HerderImpl.cpp:1583-1585) before nomination; henyey re-checks slot staleness (`lcl_matches_slot`) but does not re-check the applying flag at that post-build point. |
 | Nomination value caching (timer lambda capture) | `cached_nomination_value` field + `handle_nomination_timeout()` | Full |
 | `setInSyncAndTriggerNextLedger()` | `trigger_next_ledger()` | Full |
 | `resolveNodeID()` | _(not implemented)_ | None |
@@ -105,7 +105,7 @@ Corresponds to: `Herder.h`, `HerderImpl.h`
 | `lostSync()` | `SyncRecoveryManager::record_lost_sync()` | Full |
 | `checkCloseTime()` | `check_envelope_close_time()` | Full |
 | `ctValidityOffset()` | _(not implemented)_ | None |
-| `setupTriggerNextLedger()` | _(not implemented)_ | None |
+| `setupTriggerNextLedger()` | Split: `App::try_trigger_consensus()` (behind/applying gates) + `Herder::trigger_next_ledger()` (lcl_matches_slot) | Partial — behind/applying/not-tracking pre-entry guards match; remaining divergences: (1) `LCL >= tracking` uses corrective recovery instead of stellar-core's fail-fast assertion, (2) no post-build `isApplying()` suppression before nomination (stellar-core triggerNextLedger HerderImpl.cpp:1583-1585 re-checks applying after tx-set construction); trigger-time / `ctValidityOffset()` tracked separately (#2702) |
 | `startOutOfSyncTimer()` | `SyncRecoveryManager` | Full |
 | `outOfSyncRecovery()` | `out_of_sync_recovery()` | Full |
 | `broadcast()` | `flush_tx_adverts()` in `App` | Partial — priority-ordered via `TransactionQueue::broadcast_with_visitor()` with DEX-lane flood budget, budget-neutral skipped txs, arb flood damping, and ban-on-damping; broadcast period uses `flood_tx_period_ms` (200 ms) matching stellar-core `FLOOD_TX_PERIOD_MS`; missing dedicated flood queue, mark-on-attempt, separate advert flush timer |

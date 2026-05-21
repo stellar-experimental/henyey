@@ -2,7 +2,7 @@
 
 **Spec version:** 26 (stellar-core v26.0.1 / Protocol 26)
 **Crate:** crates/herder
-**Last updated:** 2026-05-13
+**Last updated:** 2026-05-21
 **Overall adherence:** 86%
 
 **Tally:** Full 51 | Partial 7 | Absent 1 | Drift 2 | N/A 4
@@ -21,7 +21,7 @@ excluded. SHOULD claims and operational defaults excluded.
 | §4 | State machine transitions | Full | state.rs:82 + herder.rs:980 |
 | §4 | INV: BOOTING regression forbidden | Full | state.rs:82-88 |
 | §4 | trackingConsensusLedgerIndex >= LCL | Full | herder.rs:1066 (corrective; deviation) |
-| §5.1 | Trigger setup preconditions | Partial | herder.rs:2399-2444 (lcl_matches_slot only) |
+| §5.1 | Trigger setup preconditions | Partial | consensus.rs:121-163 (behind/applying gates) + herder.rs:2399-2444 (lcl_matches_slot); diverges: (1) LCL≥tracking uses corrective recovery instead of fail-fast assertion, (2) no post-build `isApplying()` suppression before nomination (stellar-core triggerNextLedger HerderImpl.cpp:1583-1585) |
 | §5.1 | ctValidityOffset adjustment of trigger time | Absent | not found |
 | §5.1 | MANUAL_CLOSE skips trigger | Full | herder.rs:1758 (suppress_scp gate) |
 | §5.2 | triggerNextLedger pipeline | Full | herder.rs:2399 + build_nomination_value |
@@ -162,12 +162,20 @@ excluded. SHOULD claims and operational defaults excluded.
 - **§5.1-1 (MUST)** Trigger requires `LedgerManager.isApplying() == false`,
   `Herder.isTracking() == true`, `trackingConsensusLedgerIndex() ==
   LCL.ledgerSeq`, `LedgerManager.isSynced() == true`.
-  - **Rust:** `herder.rs:2399-2444` gates on `is_validator + is_tracking +
-    lcl_matches_slot`. The `isApplying` check is performed by the caller in
-    the app/dispatcher; `lcl_matches_slot` covers `tracking == lcl + 1`.
-  - **Status:** Partial — `isApplying` and `isSynced` are dispatched
-    outside this crate (acceptable for the architectural split); the
-    invariant is preserved at the dispatcher level.
+  - **Rust:** Split across app and herder layers:
+    - `App::try_trigger_consensus()` (`crates/app/src/app/consensus.rs`)
+      gates on `is_tracking()`, `current_ledger + 1 < tracking_slot`
+      (behind/not-synced skip), and `is_applying_ledger()`.
+    - `Herder::trigger_next_ledger()` (`herder.rs:2399-2444`) gates on
+      `is_validator + is_tracking + lcl_matches_slot`.
+    - `Herder::assert_lcl_consistency()` handles the `LCL >= tracking_slot`
+      case by repairing tracking to `lcl + 1` and continuing — a
+      **divergence** from stellar-core which release-asserts / throws via
+      `trackingConsensusLedgerIndex()` and `setupTriggerNextLedger()`.
+  - **Status:** Partial — the automatic trigger guards (behind, applying,
+    not-tracking) are preserved across the app/herder split; the `LCL >=
+    tracking` corrective-recovery path diverges from stellar-core's
+    fail-fast equality precondition.
 
 - **§5.1-2 (MUST)** "Trigger time is computed as `lastBallotStart +
   expectedLedgerCloseTime`…" and "MUST be advanced by `ctValidityOffset`".
@@ -201,6 +209,11 @@ excluded. SHOULD claims and operational defaults excluded.
     - Step 9 (publish to pending envelopes): `cache_tx_set` /
       `pending_envelopes`.
     - Step 10 (post-build LCL re-check): `trigger_next_ledger:2475-2481`.
+      Note: stellar-core also re-checks `mLedgerManager.isApplying()` at this
+      point (HerderImpl.cpp:1583-1585), suppressing nomination if a concurrent
+      ledger close started during tx-set construction. Henyey checks slot
+      staleness (`lcl_matches_slot`) but does not re-check the applying flag
+      here — this is a known partial-parity gap tracked under §5.1.
     - Step 11 (upgrades): `build_nomination_value:3079-3172` + filter on
       `UpgradeType::max_size()`.
     - Step 12 (non-validator stop): `trigger_next_ledger:2400-2402`.
