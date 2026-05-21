@@ -839,6 +839,12 @@ impl ScpDriver {
         self.tx_tracker.cache_count()
     }
 
+    /// Return all hashes currently in the tx set cache. Test-only.
+    #[cfg(test)]
+    pub(crate) fn cached_tx_set_hashes(&self) -> Vec<Hash256> {
+        self.tx_tracker.cached_hashes()
+    }
+
     /// Record a missing-tx-set cause for `slot`. Adds `hash` to the slot's
     /// pending-hashes set; creates the entry if absent. Called from
     /// `validate_value_against_local_state` on the LCL+1 path when the

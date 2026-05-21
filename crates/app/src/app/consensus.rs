@@ -166,9 +166,22 @@ impl App {
             // not rebuild/cache the same slot repeatedly. Validators don't need
             // this because their idempotency is handled by herder's
             // AlreadyNominating guard.
+            //
+            // We latch BEFORE spawning the blocking task so that concurrent
+            // callers (or tight polling intervals) cannot start a second build
+            // for the same slot while the first is still running.
             if !self.is_validator {
                 let last = self.watcher_last_triggered_slot.load(Ordering::Relaxed);
                 if last >= next_slot as u64 {
+                    return;
+                }
+                // Atomically claim this slot. If another caller raced us,
+                // the compare_exchange fails and we bail out.
+                if self
+                    .watcher_last_triggered_slot
+                    .compare_exchange(last, next_slot as u64, Ordering::AcqRel, Ordering::Relaxed)
+                    .is_err()
+                {
                     return;
                 }
             }
@@ -220,8 +233,8 @@ impl App {
                 Ok(Ok(henyey_herder::TriggerOutcome::ObserverCached)) => {
                     self.consensus_trigger_successes
                         .fetch_add(1, Ordering::Relaxed);
-                    self.watcher_last_triggered_slot
-                        .store(next_slot as u64, Ordering::Relaxed);
+                    // Latch was already set before spawning (compare_exchange
+                    // above), so no need to store again here.
                 }
                 Ok(Err(e)) => {
                     self.consensus_trigger_failures

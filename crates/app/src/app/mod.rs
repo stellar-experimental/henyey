@@ -659,8 +659,9 @@ pub struct App {
     /// HerderImpl.cpp:1440-1447).
     pub(crate) consensus_trigger_skipped_applying: AtomicU64,
     /// Number of trigger_next_ledger invocations that returned
-    /// TriggerOutcome::SkippedStale because LCL advanced during build_nomination_value
-    /// (parity gate with stellar-core HerderImpl.cpp:1550-1562).
+    /// TriggerOutcome::SkippedStale because LCL advanced during the tx-set
+    /// build phase (applies to both validators and observers; parity gate with
+    /// stellar-core HerderImpl.cpp:1550-1562).
     pub(crate) consensus_trigger_skipped_stale: AtomicU64,
     /// Watcher per-slot latch: stores the last slot for which the watcher
     /// successfully ran `trigger_next_ledger`. Prevents repeated same-slot
@@ -2285,8 +2286,12 @@ impl App {
 
         match outcome {
             henyey_herder::TriggerOutcome::Triggered
-            | henyey_herder::TriggerOutcome::AlreadyNominating
-            | henyey_herder::TriggerOutcome::ObserverCached => Ok(next_ledger),
+            | henyey_herder::TriggerOutcome::AlreadyNominating => Ok(next_ledger),
+            henyey_herder::TriggerOutcome::ObserverCached => {
+                // Unreachable: manual_close_ledger requires is_validator=true,
+                // and validators never get ObserverCached from trigger_next_ledger.
+                unreachable!("ObserverCached in manual_close_ledger (validator-only path)")
+            }
             henyey_herder::TriggerOutcome::SkippedStale => Err(anyhow::anyhow!(
                 "manual close: LCL advanced during build_nomination_value; \
                  caller should retry with refreshed ledger seq"
@@ -4381,57 +4386,68 @@ mod tests {
 
     /// Regression test for #2869 — HERDER §5.2 non-validator txset build + cache parity.
     ///
-    /// Verifies that a watcher App can call `try_trigger_consensus()` without
-    /// being short-circuited by `is_validator` guards, and that the per-slot
-    /// watcher latch suppresses repeated trigger attempts for the same slot.
+    /// Verifies that a watcher App can call `try_trigger_consensus()` and
+    /// have the first call successfully build/cache the next-slot tx set,
+    /// while the second same-slot call is a genuine no-op via the per-slot
+    /// latch (without manually seeding the latch).
     ///
     /// Pre-fix: FAILS because `try_trigger_consensus` was guarded by
     /// `if self.is_validator` at all call sites.
-    /// Post-fix: PASSES — watcher callers reach the herder trigger path.
-    ///
-    /// Note: The actual tx-set caching success is verified by the herder-level
-    /// test `test_trigger_next_ledger_observer_publishes_tx_set_to_cache_without_nominating`.
-    /// This test focuses on the app-layer wiring and latch behavior.
+    /// Post-fix: PASSES — watcher callers reach the herder trigger path,
+    /// cache the tx set on first call, and the atomic latch prevents repeats.
     #[tokio::test]
     async fn test_try_trigger_consensus_watcher_caches_next_slot_tx_set_once() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let db_path = dir.path().join("rs-stellar-test.db");
-        let config = crate::config::ConfigBuilder::new()
-            .database_path(db_path)
-            .build();
+        let config = crate::config::ConfigBuilder::new().in_memory(true).build();
 
         // Default config has is_validator = false (watcher mode).
         assert!(!config.node.is_validator, "test requires watcher config");
 
         let app = App::new(config).await.unwrap();
 
+        // Bootstrap from genesis DB state to initialize the LedgerManager
+        // (required for trigger_next_ledger to succeed with build_and_cache).
+        app.bootstrap_from_db().await.unwrap();
+
         // Bootstrap the herder into tracking state at LCL=1 (matching genesis).
         app.herder.bootstrap(1);
         assert!(app.herder.is_tracking(), "herder must be tracking");
         assert!(!app.herder.is_validator(), "herder must NOT be a validator");
 
-        // First call: should reach the herder trigger_next_ledger call (not
-        // be short-circuited by an is_validator guard). The trigger will fail
-        // internally (uninitialized LM) but the key assertion is that it
-        // ATTEMPTS the trigger — i.e., watchers are no longer gated out.
-        let attempts_before = app.consensus_trigger_attempts.load(Ordering::Relaxed);
-        app.try_trigger_consensus().await;
-        let attempts_after = app.consensus_trigger_attempts.load(Ordering::Relaxed);
-
-        // Verify that try_trigger_consensus actually attempted the trigger
-        // (reached the herder call, not short-circuited by is_validator).
-        assert!(
-            attempts_after > attempts_before,
-            "watcher try_trigger_consensus should attempt the trigger (got {} before, {} after)",
-            attempts_before,
-            attempts_after
+        // Verify no tx sets are cached before the trigger.
+        assert_eq!(
+            app.herder.scp_driver().tx_set_cache_size(),
+            0,
+            "cache should be empty before first trigger"
         );
 
-        // Simulate a successful observer trigger by manually storing the latch.
-        // next_slot = current_ledger(1) + 1 = 2
-        app.watcher_last_triggered_slot.store(2, Ordering::Relaxed);
+        // First call: should reach the herder trigger_next_ledger call,
+        // successfully build and cache the next-slot tx set.
+        let attempts_before = app.consensus_trigger_attempts.load(Ordering::Relaxed);
+        let successes_before = app.consensus_trigger_successes.load(Ordering::Relaxed);
+        app.try_trigger_consensus().await;
+        let attempts_after = app.consensus_trigger_attempts.load(Ordering::Relaxed);
+        let successes_after = app.consensus_trigger_successes.load(Ordering::Relaxed);
 
-        // Second call on the same slot: should be a no-op (watcher latch).
+        // Verify the trigger was attempted and succeeded.
+        assert_eq!(
+            attempts_after,
+            attempts_before + 1,
+            "watcher should have attempted the trigger"
+        );
+        assert_eq!(
+            successes_after,
+            successes_before + 1,
+            "watcher first trigger should succeed (ObserverCached)"
+        );
+
+        // Verify the tx set was actually cached.
+        assert!(
+            app.herder.scp_driver().tx_set_cache_size() > 0,
+            "watcher should have cached a tx set after first try_trigger_consensus"
+        );
+
+        // Second call on the same slot: should be a genuine no-op via the
+        // atomic latch (set before spawning), without manually seeding it.
         let attempts_before2 = app.consensus_trigger_attempts.load(Ordering::Relaxed);
         app.try_trigger_consensus().await;
         let attempts_after2 = app.consensus_trigger_attempts.load(Ordering::Relaxed);

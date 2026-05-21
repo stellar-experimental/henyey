@@ -2421,7 +2421,10 @@ impl Herder {
     /// Trigger consensus for the next ledger (for validators).
     ///
     /// This is called periodically by the consensus timer.
-    /// Trigger SCP nomination for the next ledger.
+    /// For validators: builds a candidate tx set, caches it, and triggers SCP
+    /// nomination (returns `Triggered`).
+    /// For observers: builds, validates, and caches the next-slot tx set but
+    /// stops before nomination/signing (returns `ObserverCached`).
     ///
     /// This is entirely synchronous (parking_lot locks + CPU). It was
     /// previously declared `async` but had no `.await` points.
@@ -2970,10 +2973,9 @@ impl Herder {
             .cloned()
             .collect();
 
-        // If should_propose() returned Err above (broken ledger state), abort
-        // nomination. Check by looking for the error condition: config_ctx is
-        // Some but proposed_upgrades contained a Config that we couldn't check.
-        // (The error was already logged above.)
+        // If should_propose() returned Err above (broken ledger state), the
+        // Config upgrade is excluded from the upgrade list (treated as false).
+        // The error was already logged above. Nomination continues without it.
 
         let runtime_upgrades = match self
             .runtime_upgrades
@@ -5940,7 +5942,7 @@ mod tests {
         // Call trigger_next_ledger for the next slot (LCL=0, so next=1).
         let result = herder.trigger_next_ledger(1);
 
-        // Post-fix: should succeed with ObserverCached (or Triggered variant).
+        // Post-fix: should succeed with ObserverCached.
         let outcome = result.expect(
             "observer trigger_next_ledger should succeed after fix (currently returns NotValidating)",
         );
@@ -5950,11 +5952,26 @@ mod tests {
             "observer should get ObserverCached outcome"
         );
 
-        // The built tx set should be queryable in the cache.
-        let cached_sets = herder.scp_driver.tx_set_cache_size();
+        // The built tx set should be queryable via the real has_tx_set/get_tx_set
+        // cache path (not just a size check).
+        let cached_hashes = herder.scp_driver.cached_tx_set_hashes();
+        assert_eq!(
+            cached_hashes.len(),
+            1,
+            "observer should have cached exactly one tx set, got {}",
+            cached_hashes.len()
+        );
+        let built_hash = &cached_hashes[0];
+
+        // Verify the specific hash is retrievable via the public query path.
         assert!(
-            cached_sets > 0,
-            "observer should have cached a tx set, but cache is empty"
+            herder.has_tx_set(built_hash),
+            "built tx set must be queryable via has_tx_set"
+        );
+        let retrieved = herder.get_tx_set(built_hash);
+        assert!(
+            retrieved.is_some(),
+            "built tx set must be retrievable via get_tx_set"
         );
 
         // No SCP nomination state should exist for the slot.
