@@ -6,6 +6,7 @@
 #   - attempt_merge PR_NUM  — try admin merge, classify failure, retry with --auto
 #   - classify_linked_pr_state ISSUE — distinguish OPEN, MERGED, CLOSED-without-merge
 #   - is_auto_merge_armed PR_NUM — check if PR has autoMergeRequest set
+#   - has_armed_waiting_comment PR_NUM — check if waiting comment already posted
 #
 # Requires: Bash 4+, jq, gh CLI authenticated.
 # Does NOT set shell options (set -e, -u, etc.) — callers control strictness.
@@ -151,6 +152,33 @@ is_auto_merge_armed() {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
+# has_armed_waiting_comment PR_NUM
+#
+# Checks whether a "## Review: Auto-merge armed — waiting" comment already
+# exists on the PR. Used to make the OPEN+armed short-circuit idempotent:
+# if the comment already exists, we skip posting another one.
+#
+# Output: "true" or "false" on stdout.
+# Returns: 0 always (best-effort; defaults to "false" on error).
+# ─────────────────────────────────────────────────────────────────────────────
+has_armed_waiting_comment() {
+  local pr_num="$1"
+  local repo="${REVIEW_PR_REPO:-stellar-experimental/henyey}"
+
+  local comments
+  if ! comments=$(_review_pr_fetch_issue_comments "$pr_num" "$repo"); then
+    echo "false"
+    return 0
+  fi
+
+  if echo "$comments" | grep -qF "## Review: Auto-merge armed — waiting"; then
+    echo "true"
+  else
+    echo "false"
+  fi
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Internal helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -223,5 +251,18 @@ _review_pr_fetch_auto_merge_state() {
   else
     gh pr view "$pr_num" --repo "$repo" --json autoMergeRequest \
       --jq '.autoMergeRequest != null'
+  fi
+}
+
+# _review_pr_fetch_issue_comments PR_NUM REPO
+# Fetches issue/PR-level comments. Mockable via REVIEW_PR_ISSUE_COMMENTS_FILE.
+_review_pr_fetch_issue_comments() {
+  local pr_num="$1"
+  local repo="$2"
+
+  if [[ -n "${REVIEW_PR_ISSUE_COMMENTS_FILE:-}" ]]; then
+    cat "$REVIEW_PR_ISSUE_COMMENTS_FILE"
+  else
+    gh api "repos/$repo/issues/$pr_num/comments" --paginate --jq '.[].body'
   fi
 }

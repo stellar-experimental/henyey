@@ -105,20 +105,23 @@ if [[ $? -ne 0 ]]; then
 elif [[ "$AUTO_MERGE_STATE" == "true" ]]; then
   # PR is OPEN and auto-merge is armed. GitHub will merge it automatically
   # once branch protection requirements are met. Don't re-run reviewers or
-  # re-file follow-up issues — just post a waiting comment and exit.
-  gh pr comment $PR_NUM --repo stellar-experimental/henyey \
-    --body "## Review: Auto-merge armed — waiting
+  # re-file follow-up issues — just ensure a waiting comment exists and exit.
+  ALREADY_COMMENTED=$(has_armed_waiting_comment $PR_NUM)
+  if [[ "$ALREADY_COMMENTED" != "true" ]]; then
+    gh pr comment $PR_NUM --repo stellar-experimental/henyey \
+      --body "## Review: Auto-merge armed — waiting
 
 Auto-merge was previously enabled on this PR. GitHub will merge automatically once all branch protection checks pass. Re-picking on next tick to verify completion.
 
 CI age: check \`autoMergeRequest\` state on next tick."
+  fi
 
   gh issue edit $ISSUE --repo stellar-experimental/henyey --remove-assignee @me
   exit 0
 fi
 ```
 
-This short-circuit prevents duplicate reviewer runs and duplicate follow-up issue filing on subsequent ticks while waiting for GitHub to complete the deferred merge.
+This short-circuit prevents duplicate reviewer runs and duplicate follow-up issue filing on subsequent ticks while waiting for GitHub to complete the deferred merge. The `has_armed_waiting_comment` check ensures idempotency: if a waiting comment was already posted on a previous tick, no duplicate is created.
 
 ## Step 1 — Read the PR + CI state
 

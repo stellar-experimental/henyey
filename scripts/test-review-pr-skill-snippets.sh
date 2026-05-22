@@ -34,7 +34,7 @@ cleanup
 mkdir -p "$TEST_ROOT"
 
 # ── TAP state ────────────────────────────────────────────────────────────────
-TAP_PLAN=27
+TAP_PLAN=29
 TAP_CURRENT=0
 TAP_FAILURES=0
 
@@ -401,6 +401,28 @@ else
   tap_fail "SKILL.md documents explicit PR_NUM extraction from PR_STATE" \
     "SKILL.md missing PR_NUM extraction from open: state"
 fi
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TEST 19: has_armed_waiting_comment returns true when comment exists
+# ══════════════════════════════════════════════════════════════════════════════
+
+WAITING_COMMENTS_FILE="$TEST_ROOT/waiting-comments.txt"
+printf '## Review: Auto-merge armed — waiting\n\nAuto-merge was previously enabled.\n' > "$WAITING_COMMENTS_FILE"
+export REVIEW_PR_ISSUE_COMMENTS_FILE="$WAITING_COMMENTS_FILE"
+RESULT=$(has_armed_waiting_comment 9999)
+assert_eq "true" "$RESULT" "has_armed_waiting_comment detects existing comment"
+unset REVIEW_PR_ISSUE_COMMENTS_FILE
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TEST 20: has_armed_waiting_comment returns false when no comment exists
+# ══════════════════════════════════════════════════════════════════════════════
+
+NO_WAITING_FILE="$TEST_ROOT/no-waiting-comments.txt"
+printf '## Review: Merge Failed\n\nSome other comment body.\n' > "$NO_WAITING_FILE"
+export REVIEW_PR_ISSUE_COMMENTS_FILE="$NO_WAITING_FILE"
+RESULT=$(has_armed_waiting_comment 9999)
+assert_eq "false" "$RESULT" "has_armed_waiting_comment returns false when missing"
+unset REVIEW_PR_ISSUE_COMMENTS_FILE
 
 # ── Summary ──────────────────────────────────────────────────────────────────
 unset REVIEW_PR_COMMENTS_FILE
