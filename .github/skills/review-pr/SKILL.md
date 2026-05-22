@@ -157,6 +157,19 @@ Auto-merge was armed but the PR now has merge conflicts. Bouncing back to \`/do\
       gh issue edit $ISSUE --repo stellar-experimental/henyey --remove-assignee @me
       exit 0
       ;;
+    no-ci)
+      # No CI checks detected — cannot treat as green. This may indicate a
+      # workflow misconfiguration, disabled Actions, or permissions issue.
+      # Block for operator investigation.
+      gh pr merge $PR_NUM --repo stellar-experimental/henyey --disable-auto
+      gh pr comment $PR_NUM --repo stellar-experimental/henyey \
+        --body "## Review: Auto-merge cancelled — no CI detected
+
+Auto-merge was armed but no CI checks are present on this PR. This may indicate a workflow misconfiguration or disabled Actions. Blocking for operator investigation."
+      bash .github/skills/shared/scripts/move-issue-status.sh $ISSUE blocked
+      gh issue edit $ISSUE --repo stellar-experimental/henyey --remove-assignee @me
+      exit 0
+      ;;
     error)
       # Could not check health — proceed with normal review as a safe fallback.
       echo "Warning: could not check armed PR health (API failure), proceeding with full review" >&2

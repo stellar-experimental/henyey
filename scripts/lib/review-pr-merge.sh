@@ -197,6 +197,7 @@ has_armed_waiting_comment() {
 #   "healthy"           — CI green or still running within budget; safe to wait
 #   "ci-red"            — CI has failures; auto-merge will never fire
 #   "ci-stuck"          — CI running but exceeded wall-clock budget (60 min)
+#   "no-ci"             — No CI checks detected; cannot treat as green
 #   "not-mergeable"     — PR has merge conflicts or was closed
 #   "error"             — API failure checking state
 #
@@ -227,8 +228,10 @@ check_armed_pr_health() {
   ci_total=$(echo "$rollup" | jq 'length')
 
   if [[ "$ci_total" -eq 0 ]]; then
-    # No CI at all — treat as healthy (auto-merge may have different requirements)
-    echo "healthy"
+    # No CI checks detected — this must not be treated as green. The PR may
+    # have a workflow misconfiguration, disabled Actions, or permissions issue
+    # that prevents checks from starting. Surface it so the operator can act.
+    echo "no-ci"
     return 0
   fi
 
@@ -375,13 +378,19 @@ _review_pr_fetch_armed_health() {
   if [[ -n "${REVIEW_PR_ARMED_HEALTH_FILE:-}" ]]; then
     cat "$REVIEW_PR_ARMED_HEALTH_FILE"
   else
-    local head_ref pr_json oldest_start
+    local pr_json oldest_start
     pr_json=$(gh pr view "$pr_num" --repo "$repo" \
-      --json statusCheckRollup,mergeable,headRefName)
-    head_ref=$(echo "$pr_json" | jq -r '.headRefName')
-    oldest_start=$(gh run list --repo "$repo" --branch "$head_ref" --limit 20 \
-      --json startedAt,status \
-      --jq '[.[] | select(.status != "completed")] | min_by(.startedAt) | .startedAt // ""' 2>/dev/null || echo "")
+      --json statusCheckRollup,mergeable,headRefName) || return 1
+
+    # Derive oldest in-progress check start time from the statusCheckRollup
+    # itself (scoped to this PR's head commit), not from branch-wide gh run list.
+    oldest_start=$(echo "$pr_json" | jq -r '
+      [.statusCheckRollup // [] | .[]
+       | select((.status != null and (.status | ascii_upcase) != "COMPLETED")
+                or (.status == null and (.state | ascii_upcase) == "PENDING"))
+       | .startedAt // empty]
+      | sort | .[0] // ""')
+
     echo "$pr_json" | jq --arg os "$oldest_start" '. + {oldestRunStart: $os}'
   fi
 }

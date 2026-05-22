@@ -39,7 +39,7 @@ export REVIEW_PR_SCRATCH_DIR="$TEST_ROOT/merge-scratch"
 mkdir -p "$REVIEW_PR_SCRATCH_DIR"
 
 # ── TAP state ────────────────────────────────────────────────────────────────
-TAP_PLAN=39
+TAP_PLAN=41
 TAP_CURRENT=0
 TAP_FAILURES=0
 
@@ -598,6 +598,32 @@ if grep -A5 'AUTO_MERGE_STATE.*==.*true' "$SKILL_FILE" | grep -q 'check_armed_pr
 else
   tap_fail "OPEN+armed path checks CI health before deciding (not unconditional exit)" \
     "SKILL.md still takes unconditional exit in armed path without CI check"
+fi
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TEST 31: check_armed_pr_health returns "no-ci" on empty statusCheckRollup
+# ══════════════════════════════════════════════════════════════════════════════
+
+HEALTH_DATA=$(mktemp)
+cat > "$HEALTH_DATA" <<'HEALTHJSON'
+{"statusCheckRollup":[],"mergeable":"MERGEABLE","headRefName":"do/issue-2877","oldestRunStart":""}
+HEALTHJSON
+export REVIEW_PR_ARMED_HEALTH_FILE="$HEALTH_DATA"
+RESULT=$(check_armed_pr_health 2885)
+assert_eq "no-ci" "$RESULT" "check_armed_pr_health returns no-ci on empty rollup"
+rm -f "$HEALTH_DATA"
+unset REVIEW_PR_ARMED_HEALTH_FILE
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TEST 32: SKILL.md handles no-ci case in OPEN+armed path
+# ══════════════════════════════════════════════════════════════════════════════
+
+SKILL_FILE="$REPO_ROOT/.github/skills/review-pr/SKILL.md"
+if grep -q 'no-ci' "$SKILL_FILE" && grep -q 'no CI detected' "$SKILL_FILE"; then
+  tap_ok "SKILL.md handles no-ci case in OPEN+armed path"
+else
+  tap_fail "SKILL.md handles no-ci case in OPEN+armed path" \
+    "SKILL.md missing no-ci handling in armed path"
 fi
 
 # ── Summary ──────────────────────────────────────────────────────────────────
