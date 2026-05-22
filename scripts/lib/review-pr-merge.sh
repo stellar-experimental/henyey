@@ -274,8 +274,23 @@ check_armed_pr_health() {
     return 0
   fi
 
-  # All checks completed and none failed → green
-  echo "healthy"
+  # All checks completed — verify positive green (only SUCCESS/SKIPPED/NEUTRAL
+  # for CheckRun conclusions, or state=SUCCESS for StatusContext). Anything else
+  # (ACTION_REQUIRED, STARTUP_FAILURE, STALE, etc.) is suspicious.
+  local green_count
+  green_count=$(echo "$rollup" | jq '[.[] | select(
+    ((.conclusion // "") | ascii_upcase) as $c |
+    $c == "SUCCESS" or $c == "SKIPPED" or $c == "NEUTRAL"
+    or ((.state // "") | ascii_upcase) == "SUCCESS"
+  )] | length')
+  if [[ "$green_count" -eq "$ci_total" ]]; then
+    echo "healthy"
+    return 0
+  fi
+
+  # Some checks completed with unexpected conclusions (e.g. ACTION_REQUIRED,
+  # STARTUP_FAILURE) — treat as red since auto-merge may never fire.
+  echo "ci-red"
   return 0
 }
 

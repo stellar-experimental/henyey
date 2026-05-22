@@ -40,15 +40,12 @@ source "$REPO_ROOT/scripts/lib/review-pr-merge.sh"
 Classify the linked PR state (distinguishes OPEN, MERGED, and CLOSED-without-merge):
 
 ```bash
-PR_STATE=$(classify_linked_pr_state $ISSUE)
-PR_STATE_RC=$?
-
-# API failure — retry once, then block
-if [[ $PR_STATE_RC -ne 0 ]]; then
+if ! PR_STATE=$(classify_linked_pr_state $ISSUE); then
+  # API failure — retry once, then block
   sleep 5
-  PR_STATE=$(classify_linked_pr_state $ISSUE) || {
+  if ! PR_STATE=$(classify_linked_pr_state $ISSUE); then
     echo "## Review: API Failure" && exit 1
-  }
+  fi
 fi
 ```
 
@@ -97,8 +94,7 @@ Handle each state:
 Before spawning reviewers or filing follow-up issues, check whether this PR already has auto-merge enabled from a previous tick:
 
 ```bash
-AUTO_MERGE_STATE=$(is_auto_merge_armed $PR_NUM)
-if [[ $? -ne 0 ]]; then
+if ! AUTO_MERGE_STATE=$(is_auto_merge_armed $PR_NUM); then
   # API failure checking auto-merge state — safe to proceed with normal review
   # since worst case is a redundant reviewer run. Log the issue.
   echo "Warning: could not check auto-merge state (API failure)" >&2
@@ -106,7 +102,7 @@ elif [[ "$AUTO_MERGE_STATE" == "true" ]]; then
   # PR is OPEN and auto-merge is armed. Before short-circuiting, verify that
   # CI is healthy — if CI went red or stuck while waiting, we must bounce or
   # block rather than wait indefinitely.
-  ARMED_HEALTH=$(check_armed_pr_health $PR_NUM)
+  ARMED_HEALTH=$(check_armed_pr_health $PR_NUM) || ARMED_HEALTH="error"
   case "$ARMED_HEALTH" in
     healthy)
       # CI green or still running within budget. Don't re-run reviewers or
@@ -407,8 +403,15 @@ elif [ "$(echo "$ROLLUP" | jq '[.[] | select(
        or (.status == null and (.state | ascii_upcase) == "PENDING")
      )] | length')" -gt 0 ]; then
   CI_STATE="running"
-else
+elif [ "$(echo "$ROLLUP" | jq '[.[] | select(
+       ((.conclusion // "") | ascii_upcase) as $c |
+       $c == "SUCCESS" or $c == "SKIPPED" or $c == "NEUTRAL"
+       or ((.state // "") | ascii_upcase) == "SUCCESS"
+     )] | length')" -eq "$CI_TOTAL" ]; then
   CI_STATE="green"
+else
+  # Unexpected conclusions (ACTION_REQUIRED, STARTUP_FAILURE, etc.) — treat as red
+  CI_STATE="red"
 fi
 ```
 
@@ -634,7 +637,9 @@ the workspace contract (all scratch state under `~/data/$SESSION_ID/review-pr-$I
 export REVIEW_PR_SCRATCH_DIR="${WORKTREE_BASE:-$(eval echo "~$(id -un)")/data/${SESSION_ID:-$(date +%Y%m%d-%H%M%S)}/review-pr-$ISSUE}"
 mkdir -p "$REVIEW_PR_SCRATCH_DIR"
 
-MERGE_RESULT=$(attempt_merge $PR_NUM)
+if ! MERGE_RESULT=$(attempt_merge $PR_NUM); then
+  MERGE_RESULT="hard-failure:attempt_merge returned nonzero"
+fi
 ```
 
 Handle the result:

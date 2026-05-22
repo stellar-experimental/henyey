@@ -604,7 +604,7 @@ fi
 # TEST 31: check_armed_pr_health returns "no-ci" on empty statusCheckRollup
 # ══════════════════════════════════════════════════════════════════════════════
 
-HEALTH_DATA=$(mktemp)
+HEALTH_DATA="$TEST_ROOT/empty-rollup-health.json"
 cat > "$HEALTH_DATA" <<'HEALTHJSON'
 {"statusCheckRollup":[],"mergeable":"MERGEABLE","headRefName":"do/issue-2877","oldestRunStart":""}
 HEALTHJSON
@@ -624,6 +624,86 @@ if grep -q 'no-ci' "$SKILL_FILE" && grep -q 'no CI detected' "$SKILL_FILE"; then
 else
   tap_fail "SKILL.md handles no-ci case in OPEN+armed path" \
     "SKILL.md missing no-ci handling in armed path"
+fi
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TEST 33: check_armed_pr_health returns ci-red on ACTION_REQUIRED conclusion
+# ══════════════════════════════════════════════════════════════════════════════
+
+HEALTH_DATA="$TEST_ROOT/action-required-health.json"
+cat > "$HEALTH_DATA" <<'HEALTHJSON'
+{"statusCheckRollup":[{"__typename":"CheckRun","status":"COMPLETED","conclusion":"ACTION_REQUIRED","name":"codeql"}],"mergeable":"MERGEABLE","headRefName":"do/issue-2877","oldestRunStart":""}
+HEALTHJSON
+export REVIEW_PR_ARMED_HEALTH_FILE="$HEALTH_DATA"
+RESULT=$(check_armed_pr_health 2885)
+assert_eq "ci-red" "$RESULT" "check_armed_pr_health returns ci-red on ACTION_REQUIRED"
+rm -f "$HEALTH_DATA"
+unset REVIEW_PR_ARMED_HEALTH_FILE
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TEST 34: check_armed_pr_health returns ci-red on STARTUP_FAILURE conclusion
+# ══════════════════════════════════════════════════════════════════════════════
+
+HEALTH_DATA="$TEST_ROOT/startup-failure-health.json"
+cat > "$HEALTH_DATA" <<'HEALTHJSON'
+{"statusCheckRollup":[{"__typename":"CheckRun","status":"COMPLETED","conclusion":"STARTUP_FAILURE","name":"build"}],"mergeable":"MERGEABLE","headRefName":"do/issue-2877","oldestRunStart":""}
+HEALTHJSON
+export REVIEW_PR_ARMED_HEALTH_FILE="$HEALTH_DATA"
+RESULT=$(check_armed_pr_health 2885)
+assert_eq "ci-red" "$RESULT" "check_armed_pr_health returns ci-red on STARTUP_FAILURE"
+rm -f "$HEALTH_DATA"
+unset REVIEW_PR_ARMED_HEALTH_FILE
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TEST 35: check_armed_pr_health returns healthy only on SUCCESS/SKIPPED/NEUTRAL
+# ══════════════════════════════════════════════════════════════════════════════
+
+HEALTH_DATA="$TEST_ROOT/mixed-green-health.json"
+cat > "$HEALTH_DATA" <<'HEALTHJSON'
+{"statusCheckRollup":[{"__typename":"CheckRun","status":"COMPLETED","conclusion":"SUCCESS","name":"build"},{"__typename":"CheckRun","status":"COMPLETED","conclusion":"SKIPPED","name":"optional"},{"__typename":"CheckRun","status":"COMPLETED","conclusion":"NEUTRAL","name":"info"}],"mergeable":"MERGEABLE","headRefName":"do/issue-2877","oldestRunStart":""}
+HEALTHJSON
+export REVIEW_PR_ARMED_HEALTH_FILE="$HEALTH_DATA"
+RESULT=$(check_armed_pr_health 2885)
+assert_eq "healthy" "$RESULT" "check_armed_pr_health returns healthy on SUCCESS/SKIPPED/NEUTRAL"
+rm -f "$HEALTH_DATA"
+unset REVIEW_PR_ARMED_HEALTH_FILE
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TEST 36: SKILL.md uses errexit-safe patterns for command substitutions
+# ══════════════════════════════════════════════════════════════════════════════
+
+SKILL_FILE="$REPO_ROOT/.github/skills/review-pr/SKILL.md"
+# Verify the old unsafe pattern (VAR=$(...) followed by $?) is gone
+if grep -q 'PR_STATE_RC=\$?' "$SKILL_FILE"; then
+  tap_fail "SKILL.md uses errexit-safe command substitutions" \
+    "Still contains PR_STATE_RC=\$? pattern (unsafe under set -e)"
+elif ! grep -q 'if ! PR_STATE=\$(classify_linked_pr_state' "$SKILL_FILE"; then
+  tap_fail "SKILL.md uses errexit-safe command substitutions" \
+    "Missing 'if ! PR_STATE=\$(classify_linked_pr_state' errexit-safe pattern"
+elif ! grep -q 'if ! MERGE_RESULT=\$(attempt_merge' "$SKILL_FILE"; then
+  tap_fail "SKILL.md uses errexit-safe command substitutions" \
+    "Missing 'if ! MERGE_RESULT=\$(attempt_merge' errexit-safe pattern"
+elif ! grep -q 'if ! AUTO_MERGE_STATE=\$(is_auto_merge_armed' "$SKILL_FILE"; then
+  tap_fail "SKILL.md uses errexit-safe command substitutions" \
+    "Missing 'if ! AUTO_MERGE_STATE=\$(is_auto_merge_armed' errexit-safe pattern"
+else
+  tap_ok "SKILL.md uses errexit-safe command substitutions"
+fi
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TEST 37: SKILL.md CI classifier requires positive green match (not fallthrough)
+# ══════════════════════════════════════════════════════════════════════════════
+
+SKILL_FILE="$REPO_ROOT/.github/skills/review-pr/SKILL.md"
+# The Step 5 classifier should explicitly check for SUCCESS/SKIPPED/NEUTRAL,
+# not use a bare 'else CI_STATE="green"' which lets ACTION_REQUIRED through.
+if grep -A2 'CI_STATE="green"' "$SKILL_FILE" | grep -q 'SUCCESS.*SKIPPED.*NEUTRAL'; then
+  tap_ok "SKILL.md CI classifier requires positive green match"
+elif grep -B5 'CI_STATE="green"' "$SKILL_FILE" | grep -q 'SUCCESS.*SKIPPED.*NEUTRAL'; then
+  tap_ok "SKILL.md CI classifier requires positive green match"
+else
+  tap_fail "SKILL.md CI classifier requires positive green match" \
+    "CI_STATE=green not guarded by positive SUCCESS/SKIPPED/NEUTRAL check"
 fi
 
 # ── Summary ──────────────────────────────────────────────────────────────────
