@@ -267,7 +267,17 @@ check_armed_pr_health() {
           echo "ci-stuck"
           return 0
         fi
+      else
+        # startedAt present but unparseable — cannot determine age; treat as stuck
+        echo "ci-stuck"
+        return 0
       fi
+    else
+      # No startedAt available (e.g. pending StatusContext without a start
+      # timestamp). We cannot determine how long the check has been waiting,
+      # so treat it as stuck to avoid an infinite-wait path.
+      echo "ci-stuck"
+      return 0
     fi
     # Running within budget
     echo "healthy"

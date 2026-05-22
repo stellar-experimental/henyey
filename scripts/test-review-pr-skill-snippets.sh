@@ -39,7 +39,7 @@ export REVIEW_PR_SCRATCH_DIR="$TEST_ROOT/merge-scratch"
 mkdir -p "$REVIEW_PR_SCRATCH_DIR"
 
 # ── TAP state ────────────────────────────────────────────────────────────────
-TAP_PLAN=41
+TAP_PLAN=47
 TAP_CURRENT=0
 TAP_FAILURES=0
 
@@ -669,7 +669,23 @@ rm -f "$HEALTH_DATA"
 unset REVIEW_PR_ARMED_HEALTH_FILE
 
 # ══════════════════════════════════════════════════════════════════════════════
-# TEST 36: SKILL.md uses errexit-safe patterns for command substitutions
+# TEST 36: check_armed_pr_health returns ci-stuck on pending StatusContext with no startedAt
+# ══════════════════════════════════════════════════════════════════════════════
+# Regression for #2877: a PENDING StatusContext without a startedAt field was
+# classified as "healthy", allowing infinite wait. Must return "ci-stuck".
+
+HEALTH_DATA="$TEST_ROOT/pending-statuscontext-no-start.json"
+cat > "$HEALTH_DATA" <<'HEALTHJSON'
+{"statusCheckRollup":[{"__typename":"StatusContext","state":"PENDING"}],"mergeable":"MERGEABLE","headRefName":"do/issue-2877","oldestRunStart":""}
+HEALTHJSON
+export REVIEW_PR_ARMED_HEALTH_FILE="$HEALTH_DATA"
+RESULT=$(check_armed_pr_health 2885)
+assert_eq "ci-stuck" "$RESULT" "check_armed_pr_health returns ci-stuck on pending StatusContext (no startedAt)"
+rm -f "$HEALTH_DATA"
+unset REVIEW_PR_ARMED_HEALTH_FILE
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TEST 37: SKILL.md uses errexit-safe patterns for command substitutions
 # ══════════════════════════════════════════════════════════════════════════════
 
 SKILL_FILE="$REPO_ROOT/.github/skills/review-pr/SKILL.md"
@@ -691,7 +707,7 @@ else
 fi
 
 # ══════════════════════════════════════════════════════════════════════════════
-# TEST 37: SKILL.md CI classifier requires positive green match (not fallthrough)
+# TEST 38: SKILL.md CI classifier requires positive green match (not fallthrough)
 # ══════════════════════════════════════════════════════════════════════════════
 
 SKILL_FILE="$REPO_ROOT/.github/skills/review-pr/SKILL.md"
