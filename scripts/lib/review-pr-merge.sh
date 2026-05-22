@@ -36,7 +36,16 @@ attempt_merge() {
   local pr_num="$1"
   local repo="${REVIEW_PR_REPO:-stellar-experimental/henyey}"
 
-  local scratch_dir="${REVIEW_PR_SCRATCH_DIR:-${HOME}/data/review-pr-scratch}"
+  # REVIEW_PR_SCRATCH_DIR must be set by the caller (typically via
+  # review_pr_bootstrap which exports WORKTREE_BASE). Falling back to a shared
+  # directory would violate the workspace contract that requires all scratch
+  # state under ~/data/$SESSION_ID/review-pr-$ISSUE/.
+  if [[ -z "${REVIEW_PR_SCRATCH_DIR:-}" ]]; then
+    echo "hard-failure:REVIEW_PR_SCRATCH_DIR is not set — caller must export a session-scoped scratch directory before calling attempt_merge"
+    return 1
+  fi
+
+  local scratch_dir="$REVIEW_PR_SCRATCH_DIR"
   mkdir -p "$scratch_dir"
   local stderr_file="$scratch_dir/merge-stderr-$$-$pr_num.tmp"
 

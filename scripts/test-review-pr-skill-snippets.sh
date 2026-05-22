@@ -33,8 +33,13 @@ trap cleanup EXIT
 cleanup
 mkdir -p "$TEST_ROOT"
 
+# Default scratch dir for attempt_merge tests (workspace-contract compliant location).
+# Individual tests that exercise the "unset" path will unset this explicitly.
+export REVIEW_PR_SCRATCH_DIR="$TEST_ROOT/merge-scratch"
+mkdir -p "$REVIEW_PR_SCRATCH_DIR"
+
 # ── TAP state ────────────────────────────────────────────────────────────────
-TAP_PLAN=29
+TAP_PLAN=31
 TAP_CURRENT=0
 TAP_FAILURES=0
 
@@ -423,6 +428,33 @@ export REVIEW_PR_ISSUE_COMMENTS_FILE="$NO_WAITING_FILE"
 RESULT=$(has_armed_waiting_comment 9999)
 assert_eq "false" "$RESULT" "has_armed_waiting_comment returns false when missing"
 unset REVIEW_PR_ISSUE_COMMENTS_FILE
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TEST 21: attempt_merge fails when REVIEW_PR_SCRATCH_DIR is unset
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Ensure REVIEW_PR_SCRATCH_DIR is unset to exercise the default (production) path
+unset REVIEW_PR_SCRATCH_DIR 2>/dev/null || true
+unset REVIEW_PR_MERGE_CMD 2>/dev/null || true
+RESULT=$(attempt_merge 1234) && RC=$? || RC=$?
+if [[ $RC -ne 0 ]] && echo "$RESULT" | grep -qF "REVIEW_PR_SCRATCH_DIR is not set"; then
+  tap_ok "attempt_merge fails with clear error when REVIEW_PR_SCRATCH_DIR unset"
+else
+  tap_fail "attempt_merge fails with clear error when REVIEW_PR_SCRATCH_DIR unset" \
+    "Expected hard-failure about unset REVIEW_PR_SCRATCH_DIR, got rc=$RC result='$RESULT'"
+fi
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TEST 22: SKILL.md exports REVIEW_PR_SCRATCH_DIR before attempt_merge
+# ══════════════════════════════════════════════════════════════════════════════
+
+SKILL_FILE="$REPO_ROOT/.github/skills/review-pr/SKILL.md"
+if grep -B5 'attempt_merge' "$SKILL_FILE" | grep -qF "REVIEW_PR_SCRATCH_DIR"; then
+  tap_ok "SKILL.md exports REVIEW_PR_SCRATCH_DIR before calling attempt_merge"
+else
+  tap_fail "SKILL.md exports REVIEW_PR_SCRATCH_DIR before calling attempt_merge" \
+    "SKILL.md does not set REVIEW_PR_SCRATCH_DIR before attempt_merge call"
+fi
 
 # ── Summary ──────────────────────────────────────────────────────────────────
 unset REVIEW_PR_COMMENTS_FILE

@@ -567,9 +567,16 @@ Collect the list of newly-filed issue numbers — they'll be referenced in the m
 
 #### 7.3 Merge
 
-Use the shared merge helper which handles the deferred-merge path:
+Use the shared merge helper which handles the deferred-merge path. The helper
+requires `REVIEW_PR_SCRATCH_DIR` to be set to a session-scoped directory under
+the workspace contract (all scratch state under `~/data/$SESSION_ID/review-pr-$ISSUE/`):
 
 ```bash
+# Derive scratch dir from the workspace contract. review_pr_bootstrap exports
+# WORKTREE_BASE = ~/data/$SESSION_ID/review-pr-$ISSUE — reuse it for merge scratch.
+export REVIEW_PR_SCRATCH_DIR="${WORKTREE_BASE:-$(eval echo "~$(id -un)")/data/${SESSION_ID:-$(date +%Y%m%d-%H%M%S)}/review-pr-$ISSUE}"
+mkdir -p "$REVIEW_PR_SCRATCH_DIR"
+
 MERGE_RESULT=$(attempt_merge $PR_NUM)
 ```
 
