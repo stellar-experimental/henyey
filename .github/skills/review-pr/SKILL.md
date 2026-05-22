@@ -103,25 +103,69 @@ if [[ $? -ne 0 ]]; then
   # since worst case is a redundant reviewer run. Log the issue.
   echo "Warning: could not check auto-merge state (API failure)" >&2
 elif [[ "$AUTO_MERGE_STATE" == "true" ]]; then
-  # PR is OPEN and auto-merge is armed. GitHub will merge it automatically
-  # once branch protection requirements are met. Don't re-run reviewers or
-  # re-file follow-up issues — just ensure a waiting comment exists and exit.
-  ALREADY_COMMENTED=$(has_armed_waiting_comment $PR_NUM)
-  if [[ "$ALREADY_COMMENTED" != "true" ]]; then
-    gh pr comment $PR_NUM --repo stellar-experimental/henyey \
-      --body "## Review: Auto-merge armed — waiting
+  # PR is OPEN and auto-merge is armed. Before short-circuiting, verify that
+  # CI is healthy — if CI went red or stuck while waiting, we must bounce or
+  # block rather than wait indefinitely.
+  ARMED_HEALTH=$(check_armed_pr_health $PR_NUM)
+  case "$ARMED_HEALTH" in
+    healthy)
+      # CI green or still running within budget. Don't re-run reviewers or
+      # re-file follow-up issues — just ensure a waiting comment exists and exit.
+      ALREADY_COMMENTED=$(has_armed_waiting_comment $PR_NUM)
+      if [[ "$ALREADY_COMMENTED" != "true" ]]; then
+        gh pr comment $PR_NUM --repo stellar-experimental/henyey \
+          --body "## Review: Auto-merge armed — waiting
 
 Auto-merge was previously enabled on this PR. GitHub will merge automatically once all branch protection checks pass. Re-picking on next tick to verify completion.
 
-CI age: check \`autoMergeRequest\` state on next tick."
-  fi
+CI state: healthy. Next check on next tick."
+      fi
+      gh issue edit $ISSUE --repo stellar-experimental/henyey --remove-assignee @me
+      exit 0
+      ;;
+    ci-red)
+      # CI failed while auto-merge was armed. GitHub won't merge it. Cancel
+      # auto-merge and bounce to /do for investigation.
+      gh pr merge $PR_NUM --repo stellar-experimental/henyey --disable-auto
+      gh pr comment $PR_NUM --repo stellar-experimental/henyey \
+        --body "## Review: Auto-merge cancelled — CI red
 
-  gh issue edit $ISSUE --repo stellar-experimental/henyey --remove-assignee @me
-  exit 0
+Auto-merge was armed but CI has failures. Disabling auto-merge and bouncing back to \`/do\` for investigation."
+      bash .github/skills/shared/scripts/move-issue-status.sh $ISSUE ready-for-doing
+      gh issue edit $ISSUE --repo stellar-experimental/henyey --remove-assignee @me
+      exit 0
+      ;;
+    ci-stuck)
+      # CI running but exceeded wall-clock budget. Block.
+      gh pr merge $PR_NUM --repo stellar-experimental/henyey --disable-auto
+      gh pr comment $PR_NUM --repo stellar-experimental/henyey \
+        --body "## Review: Auto-merge cancelled — CI stuck
+
+Auto-merge was armed but CI has been running past the stuck threshold. Blocking for operator investigation."
+      bash .github/skills/shared/scripts/move-issue-status.sh $ISSUE blocked
+      gh issue edit $ISSUE --repo stellar-experimental/henyey --remove-assignee @me
+      exit 0
+      ;;
+    not-mergeable)
+      # PR has merge conflicts. Cancel auto-merge and bounce.
+      gh pr merge $PR_NUM --repo stellar-experimental/henyey --disable-auto
+      gh pr comment $PR_NUM --repo stellar-experimental/henyey \
+        --body "## Review: Auto-merge cancelled — merge conflicts
+
+Auto-merge was armed but the PR now has merge conflicts. Bouncing back to \`/do\` for rebase."
+      bash .github/skills/shared/scripts/move-issue-status.sh $ISSUE ready-for-doing
+      gh issue edit $ISSUE --repo stellar-experimental/henyey --remove-assignee @me
+      exit 0
+      ;;
+    error)
+      # Could not check health — proceed with normal review as a safe fallback.
+      echo "Warning: could not check armed PR health (API failure), proceeding with full review" >&2
+      ;;
+  esac
 fi
 ```
 
-This short-circuit prevents duplicate reviewer runs and duplicate follow-up issue filing on subsequent ticks while waiting for GitHub to complete the deferred merge. The `has_armed_waiting_comment` check ensures idempotency: if a waiting comment was already posted on a previous tick, no duplicate is created.
+This short-circuit prevents duplicate reviewer runs and duplicate follow-up issue filing on subsequent ticks while waiting for GitHub to complete the deferred merge. The `has_armed_waiting_comment` check ensures idempotency: if a waiting comment was already posted on a previous tick, no duplicate is created. Critically, it still checks CI state on every tick — if CI goes red or gets stuck while auto-merge is armed, the skill cancels auto-merge and routes the issue appropriately rather than waiting indefinitely.
 
 ## Step 1 — Read the PR + CI state
 

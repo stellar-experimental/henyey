@@ -188,6 +188,95 @@ has_armed_waiting_comment() {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
+# check_armed_pr_health PR_NUM
+#
+# For an OPEN PR with auto-merge armed, checks CI/mergeability state to detect
+# failures that require intervention (rather than blindly waiting forever).
+#
+# Output on stdout: one of:
+#   "healthy"           — CI green or still running within budget; safe to wait
+#   "ci-red"            — CI has failures; auto-merge will never fire
+#   "ci-stuck"          — CI running but exceeded wall-clock budget (60 min)
+#   "not-mergeable"     — PR has merge conflicts or was closed
+#   "error"             — API failure checking state
+#
+# Returns: 0 always (caller decides action based on output).
+# ─────────────────────────────────────────────────────────────────────────────
+check_armed_pr_health() {
+  local pr_num="$1"
+  local repo="${REVIEW_PR_REPO:-stellar-experimental/henyey}"
+  local ci_stuck_minutes="${CI_STUCK_AFTER_MINUTES:-60}"
+
+  local pr_data
+  if ! pr_data=$(_review_pr_fetch_armed_health "$pr_num" "$repo"); then
+    echo "error"
+    return 0
+  fi
+
+  # Check mergeability
+  local mergeable
+  mergeable=$(echo "$pr_data" | jq -r '.mergeable // "UNKNOWN"')
+  if [[ "$mergeable" == "CONFLICTING" ]]; then
+    echo "not-mergeable"
+    return 0
+  fi
+
+  # Classify CI from statusCheckRollup
+  local rollup ci_total
+  rollup=$(echo "$pr_data" | jq '.statusCheckRollup // []')
+  ci_total=$(echo "$rollup" | jq 'length')
+
+  if [[ "$ci_total" -eq 0 ]]; then
+    # No CI at all — treat as healthy (auto-merge may have different requirements)
+    echo "healthy"
+    return 0
+  fi
+
+  # Check for red (any failure/cancelled/timed_out)
+  local red_count
+  red_count=$(echo "$rollup" | jq '[.[] | select(
+    ((.conclusion // "") | ascii_upcase) as $c |
+    $c == "FAILURE" or $c == "CANCELLED" or $c == "TIMED_OUT"
+    or ((.state // "") | ascii_upcase) as $s | $s == "FAILURE" or $s == "ERROR"
+  )] | length')
+  if [[ "$red_count" -gt 0 ]]; then
+    echo "ci-red"
+    return 0
+  fi
+
+  # Check for running
+  local running_count
+  running_count=$(echo "$rollup" | jq '[.[] | select(
+    (.status != null and (.status | ascii_upcase) != "COMPLETED")
+    or (.status == null and (.state | ascii_upcase) == "PENDING")
+  )] | length')
+  if [[ "$running_count" -gt 0 ]]; then
+    # Check wall-clock age
+    local oldest_start
+    oldest_start=$(echo "$pr_data" | jq -r '.oldestRunStart // ""')
+    if [[ -n "$oldest_start" && "$oldest_start" != "null" ]]; then
+      local now_epoch start_epoch age_min
+      now_epoch=$(date +%s)
+      start_epoch=$(date -d "$oldest_start" +%s 2>/dev/null || echo "0")
+      if [[ "$start_epoch" -gt 0 ]]; then
+        age_min=$(( (now_epoch - start_epoch) / 60 ))
+        if [[ "$age_min" -gt "$ci_stuck_minutes" ]]; then
+          echo "ci-stuck"
+          return 0
+        fi
+      fi
+    fi
+    # Running within budget
+    echo "healthy"
+    return 0
+  fi
+
+  # All checks completed and none failed → green
+  echo "healthy"
+  return 0
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Internal helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -273,5 +362,26 @@ _review_pr_fetch_issue_comments() {
     cat "$REVIEW_PR_ISSUE_COMMENTS_FILE"
   else
     gh api "repos/$repo/issues/$pr_num/comments" --paginate --jq '.[].body'
+  fi
+}
+
+# _review_pr_fetch_armed_health PR_NUM REPO
+# Fetches PR health data (mergeability + CI rollup) for armed-PR checking.
+# Mockable via REVIEW_PR_ARMED_HEALTH_FILE.
+_review_pr_fetch_armed_health() {
+  local pr_num="$1"
+  local repo="$2"
+
+  if [[ -n "${REVIEW_PR_ARMED_HEALTH_FILE:-}" ]]; then
+    cat "$REVIEW_PR_ARMED_HEALTH_FILE"
+  else
+    local head_ref pr_json oldest_start
+    pr_json=$(gh pr view "$pr_num" --repo "$repo" \
+      --json statusCheckRollup,mergeable,headRefName)
+    head_ref=$(echo "$pr_json" | jq -r '.headRefName')
+    oldest_start=$(gh run list --repo "$repo" --branch "$head_ref" --limit 20 \
+      --json startedAt,status \
+      --jq '[.[] | select(.status != "completed")] | min_by(.startedAt) | .startedAt // ""' 2>/dev/null || echo "")
+    echo "$pr_json" | jq --arg os "$oldest_start" '. + {oldestRunStart: $os}'
   fi
 }

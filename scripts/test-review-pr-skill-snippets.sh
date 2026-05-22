@@ -39,7 +39,7 @@ export REVIEW_PR_SCRATCH_DIR="$TEST_ROOT/merge-scratch"
 mkdir -p "$REVIEW_PR_SCRATCH_DIR"
 
 # ── TAP state ────────────────────────────────────────────────────────────────
-TAP_PLAN=31
+TAP_PLAN=39
 TAP_CURRENT=0
 TAP_FAILURES=0
 
@@ -454,6 +454,150 @@ if grep -B5 'attempt_merge' "$SKILL_FILE" | grep -qF "REVIEW_PR_SCRATCH_DIR"; th
 else
   tap_fail "SKILL.md exports REVIEW_PR_SCRATCH_DIR before calling attempt_merge" \
     "SKILL.md does not set REVIEW_PR_SCRATCH_DIR before attempt_merge call"
+fi
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TEST 23: check_armed_pr_health returns "healthy" when CI is green
+# ══════════════════════════════════════════════════════════════════════════════
+
+HEALTH_FILE="$TEST_ROOT/armed-health-green.json"
+cat > "$HEALTH_FILE" <<'EOJSON'
+{
+  "statusCheckRollup": [
+    {"name": "build", "status": "COMPLETED", "conclusion": "SUCCESS"},
+    {"name": "test", "status": "COMPLETED", "conclusion": "SUCCESS"}
+  ],
+  "mergeable": "MERGEABLE",
+  "headRefName": "do/issue-2877",
+  "oldestRunStart": null
+}
+EOJSON
+export REVIEW_PR_ARMED_HEALTH_FILE="$HEALTH_FILE"
+RESULT=$(check_armed_pr_health 2885)
+assert_eq "healthy" "$RESULT" "check_armed_pr_health returns healthy when CI green"
+unset REVIEW_PR_ARMED_HEALTH_FILE
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TEST 24: check_armed_pr_health returns "ci-red" when CI has failures
+# ══════════════════════════════════════════════════════════════════════════════
+
+HEALTH_FILE="$TEST_ROOT/armed-health-red.json"
+cat > "$HEALTH_FILE" <<'EOJSON'
+{
+  "statusCheckRollup": [
+    {"name": "build", "status": "COMPLETED", "conclusion": "SUCCESS"},
+    {"name": "test", "status": "COMPLETED", "conclusion": "FAILURE"}
+  ],
+  "mergeable": "MERGEABLE",
+  "headRefName": "do/issue-2877",
+  "oldestRunStart": null
+}
+EOJSON
+export REVIEW_PR_ARMED_HEALTH_FILE="$HEALTH_FILE"
+RESULT=$(check_armed_pr_health 2885)
+assert_eq "ci-red" "$RESULT" "check_armed_pr_health returns ci-red when CI has failures"
+unset REVIEW_PR_ARMED_HEALTH_FILE
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TEST 25: check_armed_pr_health returns "ci-stuck" when running past budget
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Use a start time 90 minutes ago (budget is 60)
+PAST_START=$(date -d "90 minutes ago" --iso-8601=seconds)
+HEALTH_FILE="$TEST_ROOT/armed-health-stuck.json"
+cat > "$HEALTH_FILE" <<EOJSON
+{
+  "statusCheckRollup": [
+    {"name": "build", "status": "COMPLETED", "conclusion": "SUCCESS"},
+    {"name": "integration", "status": "IN_PROGRESS", "conclusion": null}
+  ],
+  "mergeable": "MERGEABLE",
+  "headRefName": "do/issue-2877",
+  "oldestRunStart": "$PAST_START"
+}
+EOJSON
+export REVIEW_PR_ARMED_HEALTH_FILE="$HEALTH_FILE"
+RESULT=$(check_armed_pr_health 2885)
+assert_eq "ci-stuck" "$RESULT" "check_armed_pr_health returns ci-stuck when past budget"
+unset REVIEW_PR_ARMED_HEALTH_FILE
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TEST 26: check_armed_pr_health returns "healthy" when running within budget
+# ══════════════════════════════════════════════════════════════════════════════
+
+RECENT_START=$(date -d "5 minutes ago" --iso-8601=seconds)
+HEALTH_FILE="$TEST_ROOT/armed-health-running.json"
+cat > "$HEALTH_FILE" <<EOJSON
+{
+  "statusCheckRollup": [
+    {"name": "build", "status": "COMPLETED", "conclusion": "SUCCESS"},
+    {"name": "integration", "status": "IN_PROGRESS", "conclusion": null}
+  ],
+  "mergeable": "MERGEABLE",
+  "headRefName": "do/issue-2877",
+  "oldestRunStart": "$RECENT_START"
+}
+EOJSON
+export REVIEW_PR_ARMED_HEALTH_FILE="$HEALTH_FILE"
+RESULT=$(check_armed_pr_health 2885)
+assert_eq "healthy" "$RESULT" "check_armed_pr_health returns healthy when running within budget"
+unset REVIEW_PR_ARMED_HEALTH_FILE
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TEST 27: check_armed_pr_health returns "not-mergeable" on conflicts
+# ══════════════════════════════════════════════════════════════════════════════
+
+HEALTH_FILE="$TEST_ROOT/armed-health-conflict.json"
+cat > "$HEALTH_FILE" <<'EOJSON'
+{
+  "statusCheckRollup": [
+    {"name": "build", "status": "COMPLETED", "conclusion": "SUCCESS"}
+  ],
+  "mergeable": "CONFLICTING",
+  "headRefName": "do/issue-2877",
+  "oldestRunStart": null
+}
+EOJSON
+export REVIEW_PR_ARMED_HEALTH_FILE="$HEALTH_FILE"
+RESULT=$(check_armed_pr_health 2885)
+assert_eq "not-mergeable" "$RESULT" "check_armed_pr_health returns not-mergeable on conflicts"
+unset REVIEW_PR_ARMED_HEALTH_FILE
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TEST 28: check_armed_pr_health returns "error" on API failure
+# ══════════════════════════════════════════════════════════════════════════════
+
+export REVIEW_PR_ARMED_HEALTH_FILE="/nonexistent/path/should-fail.json"
+RESULT=$(check_armed_pr_health 9999)
+assert_eq "error" "$RESULT" "check_armed_pr_health returns error on API failure"
+unset REVIEW_PR_ARMED_HEALTH_FILE
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TEST 29: SKILL.md uses check_armed_pr_health in OPEN+armed path
+# ══════════════════════════════════════════════════════════════════════════════
+
+SKILL_FILE="$REPO_ROOT/.github/skills/review-pr/SKILL.md"
+if grep -q 'check_armed_pr_health' "$SKILL_FILE" && grep -q 'ci-red' "$SKILL_FILE"; then
+  tap_ok "SKILL.md uses check_armed_pr_health with CI-red handling in armed path"
+else
+  tap_fail "SKILL.md uses check_armed_pr_health with CI-red handling in armed path" \
+    "SKILL.md missing check_armed_pr_health or ci-red handling in armed path"
+fi
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TEST 30: OPEN+armed path does NOT unconditionally exit (checks CI first)
+# ══════════════════════════════════════════════════════════════════════════════
+# Structural assertion: the SKILL.md armed path must check health before exiting.
+# The old bug was: `exit 0` immediately after detecting armed state without CI check.
+
+SKILL_FILE="$REPO_ROOT/.github/skills/review-pr/SKILL.md"
+# Verify the pattern: after is_auto_merge_armed == "true", the next action is
+# check_armed_pr_health (not an immediate exit 0).
+if grep -A5 'AUTO_MERGE_STATE.*==.*true' "$SKILL_FILE" | grep -q 'check_armed_pr_health'; then
+  tap_ok "OPEN+armed path checks CI health before deciding (not unconditional exit)"
+else
+  tap_fail "OPEN+armed path checks CI health before deciding (not unconditional exit)" \
+    "SKILL.md still takes unconditional exit in armed path without CI check"
 fi
 
 # ── Summary ──────────────────────────────────────────────────────────────────
