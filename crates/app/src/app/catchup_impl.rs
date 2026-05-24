@@ -2548,13 +2548,19 @@ impl App {
                         // Record timestamp before spawning so heartbeat/gap
                         // throttle sees this attempt and does not duplicate it.
                         *self.last_scp_state_request_at.write().await = self.clock.now();
+                        // Use low watermark per §15.3 parity with stellar-core.
+                        let ledger_seq = self.herder.get_min_ledger_seq_to_ask_peers();
                         henyey_common::spawn_observed(
                             "scp_state_request_after_catchup",
                             async move {
-                                let _ = overlay.request_scp_state(current_ledger).await;
+                                let _ = overlay.request_scp_state(ledger_seq).await;
                             },
                         );
-                        tracing::info!(current_ledger, "Spawned SCP state request after catchup");
+                        tracing::info!(
+                            current_ledger,
+                            ledger_seq,
+                            "Spawned SCP state request after catchup"
+                        );
                     }
                 } else {
                     tracing::info!(

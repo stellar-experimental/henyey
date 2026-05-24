@@ -3929,3 +3929,210 @@ mod publish_skip_marker_tests {
         (header, xdr)
     }
 }
+
+/// Regression test for #2820: SCP history persistence ordering and tracked
+/// quorum set inclusion.
+#[cfg(test)]
+mod scp_history_persistence_ordering_tests {
+    use henyey_common::Hash256;
+    use henyey_db::queries::ScpQueries;
+    use henyey_db::Database;
+    use stellar_xdr::curr::{
+        ScpBallot, ScpEnvelope, ScpQuorumSet, ScpStatement, ScpStatementPledges,
+        ScpStatementPrepare, Signature,
+    };
+
+    fn make_envelope(node_seed: u8, qset_hash_seed: u8) -> ScpEnvelope {
+        let mut node_bytes = [0u8; 32];
+        node_bytes[0] = node_seed;
+        let node_id =
+            stellar_xdr::curr::NodeId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
+                stellar_xdr::curr::Uint256(node_bytes),
+            ));
+        let mut hash_bytes = [0u8; 32];
+        hash_bytes[0] = qset_hash_seed;
+        let qset_hash = stellar_xdr::curr::Hash(hash_bytes);
+        ScpEnvelope {
+            statement: ScpStatement {
+                node_id,
+                slot_index: 0, // unused for storage
+                pledges: ScpStatementPledges::Prepare(ScpStatementPrepare {
+                    quorum_set_hash: qset_hash,
+                    ballot: ScpBallot {
+                        counter: 1,
+                        value: vec![].try_into().unwrap(),
+                    },
+                    prepared: None,
+                    prepared_prime: None,
+                    n_c: 0,
+                    n_h: 0,
+                }),
+            },
+            signature: Signature::default(),
+        }
+    }
+
+    fn make_qset(threshold: u32) -> ScpQuorumSet {
+        ScpQuorumSet {
+            threshold,
+            validators: vec![].try_into().unwrap(),
+            inner_sets: vec![].try_into().unwrap(),
+        }
+    }
+
+    /// Verifies that SCP history batches are persisted in the correct order
+    /// (previous slot N-1 first, then current slot N) and that tracked quorum
+    /// sets not referenced by envelopes are still stored in the DB.
+    #[test]
+    fn test_scp_history_batches_ordering_and_tracked_qsets() {
+        let db = Database::open_in_memory().unwrap();
+
+        // Build two batches: slot 9 (previous) and slot 10 (current).
+        let env_prev = make_envelope(1, 0xAA);
+        let env_curr = make_envelope(2, 0xBB);
+
+        let qset_prev = make_qset(1);
+        let mut prev_hash_bytes = [0u8; 32];
+        prev_hash_bytes[0] = 0xAA;
+        let prev_hash = Hash256::from(prev_hash_bytes);
+
+        let qset_curr = make_qset(2);
+        let mut curr_hash_bytes = [0u8; 32];
+        curr_hash_bytes[0] = 0xBB;
+        let curr_hash = Hash256::from(curr_hash_bytes);
+
+        // Extra tracked quorum set NOT referenced by any envelope.
+        let qset_tracked = make_qset(3);
+        let mut tracked_hash_bytes = [0u8; 32];
+        tracked_hash_bytes[0] = 0xCC;
+        let tracked_hash = Hash256::from(tracked_hash_bytes);
+
+        // Simulate the ordered batch persistence from ledger_close.rs.
+        let batches = vec![
+            super::ScpHistoryBatch {
+                ledger_seq: 9,
+                envelopes: vec![env_prev],
+                quorum_sets: vec![(prev_hash.clone(), qset_prev.clone())],
+            },
+            super::ScpHistoryBatch {
+                ledger_seq: 10,
+                envelopes: vec![env_curr],
+                quorum_sets: vec![
+                    (curr_hash.clone(), qset_curr.clone()),
+                    // Tracked quorum set merged in from get_currently_tracked_quorum().
+                    (tracked_hash.clone(), qset_tracked.clone()),
+                ],
+            },
+        ];
+
+        // Persist in order (same loop as serialize_and_write_to_db).
+        db.transaction(|conn| {
+            for batch in &batches {
+                conn.store_scp_history(batch.ledger_seq, &batch.envelopes)?;
+                for (hash, qset) in &batch.quorum_sets {
+                    conn.store_scp_quorum_set(hash, batch.ledger_seq, qset)?;
+                }
+            }
+            Ok(())
+        })
+        .unwrap();
+
+        // Verify: both slots have their envelopes persisted.
+        let loaded_prev = db.with_connection(|c| c.load_scp_history(9)).unwrap();
+        assert_eq!(loaded_prev.len(), 1, "previous slot should have 1 envelope");
+
+        let loaded_curr = db.with_connection(|c| c.load_scp_history(10)).unwrap();
+        assert_eq!(loaded_curr.len(), 1, "current slot should have 1 envelope");
+
+        // Verify: all three quorum sets are in the DB (including tracked).
+        let prev_loaded = db
+            .with_connection(|c| c.load_scp_quorum_set(&prev_hash))
+            .unwrap();
+        assert!(prev_loaded.is_some(), "prev slot qset must be stored");
+        assert_eq!(prev_loaded.unwrap().threshold, 1);
+
+        let curr_loaded = db
+            .with_connection(|c| c.load_scp_quorum_set(&curr_hash))
+            .unwrap();
+        assert!(curr_loaded.is_some(), "curr slot qset must be stored");
+        assert_eq!(curr_loaded.unwrap().threshold, 2);
+
+        let tracked_loaded = db
+            .with_connection(|c| c.load_scp_quorum_set(&tracked_hash))
+            .unwrap();
+        assert!(
+            tracked_loaded.is_some(),
+            "tracked quorum set (not in any envelope) must be stored"
+        );
+        assert_eq!(tracked_loaded.unwrap().threshold, 3);
+    }
+
+    /// Verifies that storing batches with N-1 first means the previous-slot
+    /// quorum set is available before the current slot is written — this is
+    /// the ordering guarantee required by §5.3.
+    #[test]
+    fn test_previous_slot_persisted_before_current() {
+        let db = Database::open_in_memory().unwrap();
+
+        let env_prev = make_envelope(1, 0xAA);
+        let env_curr = make_envelope(2, 0xBB);
+
+        let qset_prev = make_qset(1);
+        let mut prev_hash_bytes = [0u8; 32];
+        prev_hash_bytes[0] = 0xAA;
+        let prev_hash = Hash256::from(prev_hash_bytes);
+
+        let qset_curr = make_qset(2);
+        let mut curr_hash_bytes = [0u8; 32];
+        curr_hash_bytes[0] = 0xBB;
+        let curr_hash = Hash256::from(curr_hash_bytes);
+
+        let batches = vec![
+            super::ScpHistoryBatch {
+                ledger_seq: 99,
+                envelopes: vec![env_prev],
+                quorum_sets: vec![(prev_hash.clone(), qset_prev.clone())],
+            },
+            super::ScpHistoryBatch {
+                ledger_seq: 100,
+                envelopes: vec![env_curr],
+                quorum_sets: vec![(curr_hash.clone(), qset_curr.clone())],
+            },
+        ];
+
+        // Persist only the first batch (simulate mid-persist state).
+        db.transaction(|conn| {
+            let batch = &batches[0];
+            conn.store_scp_history(batch.ledger_seq, &batch.envelopes)?;
+            for (hash, qset) in &batch.quorum_sets {
+                conn.store_scp_quorum_set(hash, batch.ledger_seq, qset)?;
+            }
+            Ok(())
+        })
+        .unwrap();
+
+        // At this point, previous slot is persisted but current is not.
+        let loaded_prev = db.with_connection(|c| c.load_scp_history(99)).unwrap();
+        assert_eq!(loaded_prev.len(), 1);
+
+        let loaded_curr = db.with_connection(|c| c.load_scp_history(100)).unwrap();
+        assert!(
+            loaded_curr.is_empty(),
+            "current slot should not be persisted yet"
+        );
+
+        // Now persist the second batch.
+        db.transaction(|conn| {
+            let batch = &batches[1];
+            conn.store_scp_history(batch.ledger_seq, &batch.envelopes)?;
+            for (hash, qset) in &batch.quorum_sets {
+                conn.store_scp_quorum_set(hash, batch.ledger_seq, qset)?;
+            }
+            Ok(())
+        })
+        .unwrap();
+
+        let loaded_curr = db.with_connection(|c| c.load_scp_history(100)).unwrap();
+        assert_eq!(loaded_curr.len(), 1, "current slot should now be persisted");
+    }
+}

@@ -606,6 +606,8 @@ excluded. SHOULD claims and operational defaults excluded.
     `get_min_ledger_seq_to_remember()` floor). Peer selection:
     `OverlayManager::request_scp_state()` snapshots authenticated peers,
     shuffles, sends to at most 2 (matching `getRandomAuthenticatedPeers(2)`).
+    All app-level callers (consensus.rs, catchup_impl.rs, mod.rs) now route
+    through `get_min_ledger_seq_to_ask_peers()`.
   - **Status:** Full. Implemented in #2820.
 
 - **§15.3 (MUST)** "`sendSCPStateToPeer` for a requesting peer MUST send up
