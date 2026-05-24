@@ -4,8 +4,10 @@ description: |
   Draft an implementation plan for a triaged henyey issue, validated by three
   independent critics in parallel. Picks up issues in `ready-for-planning`,
   transitions them to `planning` while actively drafting, then to
-  `ready-for-doing` on convergence (or `blocked` if critics still disagree
-  after two rounds). Use when invoked by /project-tick with an issue in
+  `ready-for-doing` on convergence. At the round-2 cap, instead of blocking,
+  the plan **force-converges**: the round-2 plan ships as-is and each
+  residual REVISE-MAJOR concern is filed as a follow-up issue for operator
+  triage. Use when invoked by /project-tick with an issue in
   ready-for-planning, or manually as /plan <issue>.
 model: gpt-5.4
 ---
@@ -16,7 +18,7 @@ You produce a single, converged implementation plan for one issue. The plan is w
 
 You are not alone — three independent critics evaluate every draft in parallel. The plan converges when all three approve (or downgrade to `REVISE-MINOR`).
 
-**Hard cap: 2 rounds.** If you can't converge in 2, the issue goes to `blocked` and a human decides.
+**Hard cap: 2 rounds.** If round 2 still has REVISE-MAJOR verdicts, the plan **force-converges**: ship the round-2 plan as-is, file one follow-up issue per residual REVISE-MAJOR concern (so the disagreement is preserved as backlog rather than blocking the pipeline), and advance to `ready-for-doing`. The doer reads the converged plan and the follow-up list as "minor items to consider during implementation."
 
 ## Inputs
 
@@ -225,7 +227,83 @@ Spawn the same three critics again in parallel with the same briefs, but with "R
 **Round 2 outcomes:**
 
 - All approve or REVISE-MINOR → converge (Step 6).
-- Any `REVISE-MAJOR` → move to `blocked` with `## Plan: Did Not Converge` comment summarizing the residual disagreement. Unassign. Exit.
+- Any `REVISE-MAJOR` → **force-converge** (Step 5-bis below). The round-2 plan ships as-is; residual REVISE-MAJOR concerns become follow-up issues for operator triage. The pipeline advances to `ready-for-doing` rather than stalling at `blocked`.
+
+## Step 5-bis — Force-converge (round-2 REVISE-MAJOR)
+
+Only entered when round-2 critics still produced any `REVISE-MAJOR` verdict.
+
+### 5-bis.1 File one follow-up issue per residual REVISE-MAJOR concern
+
+For each round-2 critic comment with verdict `REVISE-MAJOR`, extract each concern bullet from its body and file:
+
+```bash
+gh issue create --repo stellar-experimental/henyey \
+  --title "<critic lens>: <short summary of concern, ≤80 chars>" \
+  --body "$(cat <<EOF
+Follow-up from issue #$ISSUE plan. Plan force-converged at the round-2 cap; this concern was raised by a critic but not resolved before the plan shipped to /do.
+
+## Source
+
+Critic: <Correctness | Parity | Scope>
+Round: 2
+Verdict: REVISE-MAJOR
+
+Link: <round-2 critic comment URL>
+
+## Concern detail
+
+<full concern bullet body — quote the critic verbatim>
+
+## Why this is a follow-up, not a plan block
+
+The plan stage reached its hard cap of 2 rounds without consensus on this concern. Per /plan force-converge policy, the round-2 plan ships and unresolved concerns are preserved as backlog rather than stalling the pipeline indefinitely. Operator should triage this issue:
+- close as won't-fix if the critic was over-strict or the concern is non-blocking,
+- file a follow-up PR if the concern is real and needs addressing post-merge,
+- or post \`## Review: Reset\` on the eventual PR and re-plan if the concern changes the implementation approach.
+EOF
+)" \
+  --label "follow-up,force-converge,plan-residual"
+```
+
+If the issue has a `crate:<name>` label, propagate it.
+
+Collect the new issue numbers.
+
+### 5-bis.2 Ship the round-2 plan with force-converge marker
+
+Post a single converged-plan comment matching Step 6's structure, but with a force-converge header instead of the clean `## ✅ Converged Plan`:
+
+```markdown
+## ⚠️ Plan: Force-Converged (Round 2 Cap)
+
+**Summary:** <one sentence>
+
+**Files to modify:** <as in normal converged plan>
+
+**Approach:** <round-2 plan body, unchanged>
+
+**Kind:** <bug-fix|feature|refactor|docs|test-only>
+
+**Test plan:** <as in normal converged plan>
+
+**Parity considerations:** <round-2 form>
+
+**Residual disagreements (followed up as separate issues — `/do` MAY treat these as advisory):**
+- <critic lens> `<concern class or short summary>`: #N1
+- <critic lens> `<concern class or short summary>`: #N2
+
+**Convergence:** Round 2, verdicts: A=<>, B=<>, C=<> *(force-converged on residual REVISE-MAJOR)*
+```
+
+Then advance to `ready-for-doing` (same as normal converge):
+
+```bash
+bash .github/skills/shared/scripts/move-issue-status.sh $ISSUE ready-for-doing
+gh issue edit $ISSUE --repo stellar-experimental/henyey --remove-assignee @me
+```
+
+Exit.
 
 ## Step 6 — Converged Plan
 
@@ -272,8 +350,8 @@ gh issue edit $ISSUE --repo stellar-experimental/henyey --remove-assignee @me
 
 - **Do not** write or commit code. `/do` does that.
 - **Do not** run sequential critic rounds — critics run in parallel.
-- **Do not** exceed 2 rounds. If round 2 fails, that's `blocked`. Period.
-- **Do not** "argue back" with a critic by re-opening the same plan. If you genuinely disagree, post your reasoning in the revised plan and let the round-2 critic re-evaluate. If round 2 still REVISE-MAJOR, accept the block.
+- **Do not** exceed 2 rounds. If round 2 still has REVISE-MAJOR verdicts, force-converge (Step 5-bis) — file follow-ups for the residuals and ship the round-2 plan to `ready-for-doing`. Do NOT spin a third round.
+- **Do not** "argue back" with a critic by re-opening the same plan. If you genuinely disagree, post your reasoning in the revised plan and let the round-2 critic re-evaluate. If round 2 still REVISE-MAJOR, force-converge with the disagreement preserved as follow-up issues — don't block the pipeline.
 - **Do not** explore the codebase open-endedly. Each round, you read at most ~15 files of new context. Critics may read additional files independently.
 
 ## Failure handling
@@ -292,7 +370,7 @@ gh issue edit $ISSUE --repo stellar-experimental/henyey --remove-assignee @me
 - Round 1: A: APPROVE, B: REVISE-MAJOR ("misses stellar-core's pre-protocol-26 fallback"), C: APPROVE.
 - → Revise to add the fallback handling. Round 2: A: APPROVE, B: APPROVE, C: REVISE-MINOR. → Converge.
 
-**Round 2 fails:**
+**Round 2 force-converges:**
 - Round 1: C: REVISE-MAJOR ("too broad — splits across 3 crates")
-- → File sub-issues, narrow plan. Round 2: A: REVISE-MAJOR ("narrowed plan no longer addresses original problem")
-- → `blocked` with "scope-mismatch" reason. Humans decide.
+- → File sub-issues, narrow plan. Round 2: A: REVISE-MAJOR ("narrowed plan no longer addresses original problem"), B: APPROVE, C: APPROVE.
+- → Force-converge (Step 5-bis): file follow-up issue capturing A's "narrowed plan misses original problem" concern, post `## ⚠️ Plan: Force-Converged (Round 2 Cap)` with the round-2 plan body and a reference to the follow-up, advance to `ready-for-doing`. The operator triages the follow-up — close as won't-fix if the original problem is genuinely covered by the narrowed plan + sub-issues, or schedule a follow-up PR if A was right.

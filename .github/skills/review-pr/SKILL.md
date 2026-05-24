@@ -10,9 +10,12 @@ description: |
   --admin on all-green (after filing follow-up issues for unaddressed inline
   review comments, so non-critical feedback is preserved as backlog instead of
   dropped); bounces to `ready-for-doing` on any request-changes or CI red;
-  blocks after 3 bounce-backs on the same code state OR 6 lifetime bounces
-  (since last `## Review: Reset`), whichever trips first. Use when invoked by
-  /project-tick with an issue in in-review, or manually as /review-pr <issue>.
+  blocks after 3 bounce-backs on the same code state. At the lifetime cap
+  (6 bounces since last `## Review: Reset`) the PR enters **force-converge
+  mode**: if CI is green, the PR auto-merges and unresolved reviewer concerns
+  become follow-up issues; only red/pending CI at the cap still blocks. Use
+  when invoked by /project-tick with an issue in in-review, or manually as
+  /review-pr <issue>.
 model: gpt-5.4
 ---
 
@@ -115,8 +118,8 @@ LIFETIME_COUNT=$(echo "$ALL_BOUNCES_JSON" | jq --argjson base "$LIFETIME_BASELIN
 
 **Cap checks (apply in order):**
 
-- If `LIFETIME_COUNT >= 6`, the PR has cycled too many times across multiple code states. Post `## Review: Lifetime Cycle Cap Reached` (see message template in the Block section below), move to `blocked`, unassign, and exit. This catches runaway loops where each fresh `/do` push resets the head-scoped counter but the underlying disagreement never converges.
-- Otherwise, if `HEAD_COUNT >= 3`, this is the 4th cycle on the current code. Post `## Review: Cycle Cap Reached`, move to `blocked`, unassign, and exit.
+- If `LIFETIME_COUNT >= 6`, the PR has cycled too many times across multiple code states. Enter **force-converge mode**: `export FORCE_CONVERGE=1` and continue with the normal review flow. The matrix in Step 6 will, if CI is green, route to a force-merge that files follow-up issues for any remaining CHANGES_REQUESTED concerns. If CI is still red/pending at the lifetime cap, the matrix routes to `blocked` (force-converge cannot merge unsafe code). This replaces the older "always block at lifetime cap" rule, which created a graveyard of PRs nobody could land.
+- Otherwise, if `HEAD_COUNT >= 3`, this is the 4th cycle on the current code. Post `## Review: Cycle Cap Reached`, move to `blocked`, unassign, and exit. (Head-scoped cap still blocks; force-converge applies only to the lifetime cap.)
 - Otherwise (both under cap) → proceed with the review.
 
 **Recovery semantics:**
@@ -176,10 +179,44 @@ Post via `gh pr comment $PR_NUM --repo stellar-experimental/henyey --body-file <
 
 **Inline-comment convention:** if a reviewer's concern is non-blocking (would be a `MINOR` note), they should APPROVE at the top level AND leave the concern as an inline comment. `/review-pr` will auto-file a follow-up issue for every unaddressed inline comment at merge time (see Step 7.2), so non-critical feedback is preserved as actionable backlog without blocking the merge. If a concern is blocking, use `**Verdict:** CHANGES_REQUESTED` at the top level; `/do` Mode B will address every inline in that case.
 
+**Concern-class discipline (kills whack-a-mole bouncing):** Every concern in a CHANGES_REQUESTED verdict MUST be labeled with a **concern class** — a 1–3 word category like `test-coverage`, `workspace-contract`, `parity-gap`, `regression-risk`, `doc-drift`, `error-handling`, `api-shape`, `ci-failure`. The reviewer prompts below enforce two rules:
+
+- **Cycle 1** (no prior `## 🔍 Reviewer: <YourName>` comment on this PR): produce a COMPLETE change-list. Don't hold concerns back for later cycles. Every concern is labeled with its class. The implicit contract: a class not raised in cycle 1 should not be raised in cycle 2+.
+- **Cycle N≥2** (prior reviewer comments exist): you read your latest prior verdict, enumerate the classes you previously raised, and stick to them. Verify each prior concern is addressed; you may add new specific bullets within an existing class. If you genuinely identify a concern in a class you did NOT previously raise, you MUST flag the section with `**NEW CLASS DISCOVERED:** <class-name>` and explain why cycle 1 missed it. This becomes audit-trail evidence that cycle 1 was incomplete and signals the orchestrator/operator that the PR may be larger in scope than was understood. (It still counts as a normal bounce — the goal is transparency, not blocking.)
+
 ### Reviewer A — Correctness (always)
 
 > Invoke /review on PR #$PR_NUM in stellar-experimental/henyey. Focus on:
 > correctness of the diff, test coverage, readability, error handling.
+>
+> **Cycle-awareness (kills whack-a-mole bouncing) — do this BEFORE writing
+> your review:**
+>
+> 1. Fetch your own prior comments on this PR:
+>    \`\`\`bash
+>    gh pr view $PR_NUM --repo stellar-experimental/henyey --comments \\
+>      --json comments --jq '.comments[] | select(.body | startswith("## 🔍 Reviewer: Correctness")) | .body'
+>    \`\`\`
+> 2. If empty → this is **cycle 1**. Produce a COMPLETE change-list. Every
+>    concern must be labeled with a **concern class** (a 1–3 word category,
+>    e.g. \`test-coverage\`, \`workspace-contract\`, \`regression-risk\`,
+>    \`error-handling\`, \`api-shape\`, \`ci-failure\`). Group concerns by class
+>    in the verdict body. Don't hold concerns back hoping the doer figures
+>    them out — your cycle-1 list is the contract for the whole review arc.
+> 3. If non-empty → this is **cycle N≥2**. Read your latest prior verdict.
+>    Enumerate the classes you raised. This cycle, you must:
+>    - Verify each prior concern is addressed (re-evaluating within the same
+>      class is fine — e.g. if you raised \`test-coverage\` and the test was
+>      added but is wrong, that's still \`test-coverage\`).
+>    - Stick to those classes. New specific bullets within an existing class
+>      are fine.
+>    - If you genuinely identify a concern in a class you did NOT raise
+>      previously, you MAY add it, but you MUST flag the section
+>      \`**NEW CLASS DISCOVERED:** <class-name>\` and explain in 1–2 sentences
+>      why cycle 1 missed it. (This still counts as a normal bounce; the
+>      flag is audit-trail evidence, not a block.)
+>
+> **Test verification (REQUEST_CHANGES if any of these fails):**
 >
 > **Test verification (REQUEST_CHANGES if any of these fails):**
 >
@@ -228,6 +265,17 @@ Post via `gh pr comment $PR_NUM --repo stellar-experimental/henyey --body-file <
 > verdict as a single PR-level comment via `gh pr comment`, headed
 > `## 🔍 Reviewer: Parity`, with `**Verdict:**` on its own line. Reviewer A
 > is doing correctness; you focus only on parity.
+>
+> **Cycle-awareness (same discipline as Reviewer A):** Before writing your
+> review, fetch your own prior comments via
+> \`gh pr view $PR_NUM --comments --json comments --jq '.comments[] | select(.body | startswith("## 🔍 Reviewer: Parity")) | .body'\`.
+> If empty → cycle 1: produce a complete change-list with every concern
+> labeled by a concern class (e.g. \`parity-gap\`, \`spec-divergence\`,
+> \`sequencing\`, \`edge-case\`). If non-empty → cycle N≥2: stick to the
+> classes you raised before; only add a new class with an explicit
+> \`**NEW CLASS DISCOVERED:**\` flag and rationale. This stops the
+> parity-vs-correctness bounce-orbit that historically pushed PRs into
+> the lifetime cap.
 
 **If non-parity (risk lens):**
 
@@ -237,6 +285,15 @@ Post via `gh pr comment $PR_NUM --repo stellar-experimental/henyey --body-file <
 > Reviewer A is doing correctness; you focus only on risk. Post your verdict
 > as a single PR-level comment via `gh pr comment`, headed
 > `## 🔍 Reviewer: Risk`, with `**Verdict:**` on its own line.
+>
+> **Cycle-awareness (same discipline as Reviewer A):** Before writing your
+> review, fetch your own prior comments via
+> \`gh pr view $PR_NUM --comments --json comments --jq '.comments[] | select(.body | startswith("## 🔍 Reviewer: Risk")) | .body'\`.
+> Cycle 1 → complete change-list, concerns labeled by class
+> (e.g. \`regression-risk\`, \`perf-regression\`, \`api-break\`,
+> \`migration-risk\`, \`config-risk\`). Cycle N≥2 → stick to your
+> previously-raised classes; only add a new class with an explicit
+> \`**NEW CLASS DISCOVERED:**\` flag and rationale.
 
 Wait for both reviewers to post.
 
@@ -334,6 +391,20 @@ Additional gate — any external CHANGES_REQUESTED is a blocker:
 CI state — `empty` / `green` / `red` / `running` (per the bucket rules in Step 5).
 
 Apply the outcome matrix (top-to-bottom, first match wins):
+
+### Force-converge override (lifetime cap reached, CI green)
+
+If Step 2 set `FORCE_CONVERGE=1` (lifetime bounce cap was reached), the matrix is short-circuited:
+
+| FORCE_CONVERGE | CI state | Action |
+|---|---|---|
+| 1 | `green` | **Force-merge** via Step 7-bis. File one follow-up issue per CHANGES_REQUESTED concern bullet from the latest reviewer comments; merge with `--admin`; post `## ⚠️ Force-Converged (Lifetime Cap)`. |
+| 1 | `running` | Wait (`## Review: Waiting on CI` — force-converge still needs green CI). Re-pick next tick. |
+| 1 | `red` / `empty` | **Block.** Post `## Review: Lifetime Cap + Unsafe CI` (force-converge cannot merge red/missing CI; this requires operator). |
+
+The reviewer-verdict outputs are still used (to produce the follow-up list), but they no longer gate the merge. This is intentional: at the lifetime cap, the reviewer↔doer loop has demonstrated it cannot converge, so we drain the PR with CI as the sole final safety net and preserve the unresolved concerns as backlog.
+
+If `FORCE_CONVERGE` is unset, fall through to the normal matrix below.
 
 ### Block immediately on suspicious CI state
 
@@ -532,6 +603,86 @@ Post a `## ✅ Merged` comment with the merge commit SHA AND the list of follow-
 
 Exit.
 
+## Step 7-bis — Force-converge merge (lifetime cap, CI green)
+
+Only entered if Step 6's force-converge override fired. The flow is parallel to Step 7 but takes its follow-up source from the **top-level reviewer CHANGES_REQUESTED concern bullets** instead of (or in addition to) unaddressed inline comments. CI is green by precondition of this branch.
+
+#### 7-bis.1 Collect unresolved concern bullets
+
+Parse the latest `## 🔍 Reviewer: Correctness` and `## 🔍 Reviewer: <Parity|Risk>` PR comments. If a reviewer's verdict is `CHANGES_REQUESTED`, extract each bulleted concern from the `<details><summary>Full review</summary>` block. Group by the `class:` label on each bullet (or "(unlabeled)" if missing — older comments may predate the discipline). External reviewer CHANGES_REQUESTED bodies are processed the same way.
+
+Also fetch unaddressed inline comments via the Step 7.1 mechanism — those still file follow-ups too.
+
+#### 7-bis.2 File one follow-up issue per unresolved concern bullet
+
+For each concern bullet:
+
+```bash
+gh issue create --repo stellar-experimental/henyey \
+  --title "<class>: <short summary derived from concern bullet, ≤80 chars>" \
+  --body "$(cat <<EOF
+Follow-up from PR #$PR_NUM (issue #$ISSUE). PR was force-converged at the lifetime bounce cap; this concern was raised by a reviewer but not resolved before merge.
+
+## Concern class
+
+\`<class-name>\` (from reviewer cycle-1 change-list discipline)
+
+## Source
+
+[Reviewer comment](<link-to-reviewer-PR-comment>) on PR #$PR_NUM.
+
+Reviewer: <Correctness|Parity|Risk|external-username>
+Verdict: CHANGES_REQUESTED
+
+## Detail
+
+<full concern bullet body — quote the reviewer's text verbatim>
+
+## Why this is a follow-up, not a merge-blocker
+
+PR #$PR_NUM reached the lifetime bounce cap (6 cycles since last \`## Review: Reset\`) without converging. Per /review-pr force-converge policy, CI being green is sufficient to land the change and preserve unresolved concerns as backlog. Operator should triage this issue — close as won't-fix if the reviewer was over-strict, or schedule a follow-up PR if the concern is real.
+EOF
+)" \
+  --label "follow-up,force-converge"
+```
+
+Also apply any `crate:<name>` label inferred from file paths in the concern text.
+
+Collect the new issue numbers; they'll be referenced in the force-converge comment.
+
+#### 7-bis.3 Merge
+
+```bash
+gh pr merge $PR_NUM --repo stellar-experimental/henyey --squash --admin
+```
+
+If `--admin` fails (no admin token), still file the follow-ups, but leave the PR open and post `## Review: Force-Converge Permission Gap` so the operator can land it manually. Do NOT degrade to a non-admin merge.
+
+#### 7-bis.4 Clean up + post
+
+Same cleanup as Step 7.4 (move issue to `done`, unassign, prune worktree + build cache). Then post:
+
+```markdown
+## ⚠️ Force-Converged (Lifetime Cap)
+
+**Commit:** <merge-commit-sha>
+**Lifetime bounce count at force-converge:** <N>
+**CI at merge:** green
+
+This PR cycled 6+ times across multiple code states without convergence between reviewers and `/do`. Rather than blocking indefinitely, the pipeline force-merged on the strength of green CI alone, preserving each unresolved reviewer concern as a follow-up issue for operator triage.
+
+**Unresolved concern follow-ups (by class):**
+- `<class-A>`: #N1, #N2
+- `<class-B>`: #N3
+- `(unlabeled)`: #N4 *(reviewer didn't follow cycle-1 class-labeling discipline)*
+
+**Inline-comment follow-ups (if any):** #N5, #N6
+
+To prevent this in future cycles: reviewers should produce a COMPLETE cycle-1 change-list grouped by concern class. New classes appearing in cycle N≥2 should be flagged `**NEW CLASS DISCOVERED:**` to surface incomplete cycle-1 reviews early.
+```
+
+Exit.
+
 ### Wait path
 
 Post:
@@ -594,10 +745,13 @@ This PR has cycled 3 times on the current code state without converging. Human r
 ```
 
 ```markdown
-## Review: Lifetime Cycle Cap Reached
+## Review: Lifetime Cap + Unsafe CI
 
 **Lifetime bounce count:** <LIFETIME_COUNT>
+**CI state at cap:** red | empty | running-too-long
 **Status:** blocked
+
+The lifetime bounce cap was reached, but CI is not currently green so force-converge cannot proceed. Force-converge requires green CI as its sole final safety net; without it the pipeline cannot guarantee the merge is safe.
 
 **Pattern:** <summary across the lifetime of this PR: what concerns kept recurring
 across multiple /do pushes. This is the runaway-loop pattern — /do produces a
@@ -627,7 +781,7 @@ Exit.
 
 - **Do not** post a review yourself. Spawn sub-agents that post their own structured comments — you only orchestrate and combine.
 - **Do not** override or summarize the reviewers' verdicts. Their `**Verdict:**` line is the verdict. You read it; you don't rewrite it.
-- **Do not** merge if any of the three signals is not green. The matrix is the rule.
+- **Do not** merge if any of the three signals is not green. The matrix is the rule. *(Exception: the force-converge override at the lifetime cap merges on green CI alone — see Step 7-bis. Reviewer verdicts become follow-up issues rather than merge gates.)*
 - **Do not** wait synchronously on long-running CI. If CI is `running`, unassign and exit — the next tick re-picks the issue.
 - **Do not** use `gh pr review --approve` — GH silently downgrades it to a comment because the agent is the PR author. Use structured PR comments via `gh pr comment` instead.
 
