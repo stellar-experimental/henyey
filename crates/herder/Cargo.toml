@@ -47,7 +47,7 @@ test-utils = []
 # Exposes test hooks (`scp_verify::verify_envelope_sync`,
 # `Herder::set_tracking_for_testing`, etc.) used by the Phase B SCP
 # verify-pipeline parity tests under `tests/`.
-test-support = []
+test-support = ["henyey-scp/test-helpers"]
 
 [dev-dependencies]
 metrics-exporter-prometheus.workspace = true

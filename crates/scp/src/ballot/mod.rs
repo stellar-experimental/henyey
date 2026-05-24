@@ -508,6 +508,13 @@ impl BallotProtocol {
         crate::compare::ballot_summary_of(&env.statement.pledges)
     }
 
+    /// Test-only: inject an envelope into `latest_envelopes`.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn test_inject_latest_envelope(&mut self, envelope: ScpEnvelope) {
+        let node_id = envelope.statement.node_id.clone();
+        self.latest_envelopes.insert(node_id, envelope);
+    }
+
     /// Get the state of a node in the ballot protocol.
     ///
     /// Returns the QuorumInfoNodeState for a given node based on their

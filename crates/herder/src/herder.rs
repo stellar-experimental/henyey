@@ -1008,6 +1008,32 @@ impl Herder {
         self.fetching_envelopes.set_current_slot(slot);
     }
 
+    /// Test-only: inject an envelope into a slot's externalizing state.
+    /// Used by app-level tests that exercise the SCP history persistence path
+    /// without needing to go through the full consensus/validation flow.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn test_inject_externalizing_envelope(
+        &self,
+        slot: u64,
+        envelope: stellar_xdr::curr::ScpEnvelope,
+    ) {
+        self.scp.test_inject_externalizing_envelope(slot, envelope);
+    }
+
+    /// Test-only: register a quorum set so `get_quorum_set_by_hash()` can
+    /// find it. Used alongside `test_inject_externalizing_envelope` to set
+    /// up the full SCP persistence path for tests.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn test_store_quorum_set(
+        &self,
+        node_id: &stellar_xdr::curr::NodeId,
+        qset: stellar_xdr::curr::ScpQuorumSet,
+    ) {
+        self.scp_driver.test_store_quorum_set(node_id, qset);
+    }
+
     /// Test-only: arm the closing gate for a specific slot.
     ///
     /// In production, the gate is set to `externalized_slot + 1` when a slot

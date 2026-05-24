@@ -662,6 +662,14 @@ impl ScpDriver {
         Arc::clone(&self.test_clock)
     }
 
+    /// Test-only: register a quorum set by node ID so
+    /// `get_quorum_set_by_hash()` can find it.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn test_store_quorum_set(&self, node_id: &stellar_xdr::curr::NodeId, qset: ScpQuorumSet) {
+        self.qset_tracker.store(node_id, qset);
+    }
+
     /// Create a new SCP driver with a secret key for signing.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn with_secret_key(
