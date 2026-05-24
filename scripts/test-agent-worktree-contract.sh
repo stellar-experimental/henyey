@@ -23,6 +23,13 @@ PASS=0
 FAIL=0
 TEST_NUM=0
 
+# Portable real-home lookup — reuses the contract helper's own fallback logic
+# so the tests can run on macOS/BSD where getent is unavailable.
+_test_real_home() {
+  # shellcheck disable=SC1090
+  ( source "$CONTRACT_HELPER" && _contract_real_home )
+}
+
 tap_ok() {
   TEST_NUM=$((TEST_NUM + 1))
   PASS=$((PASS + 1))
@@ -565,7 +572,7 @@ test_home_poisoning_defeated() {
 
   # Get the real home from passwd for reference
   local real_home
-  real_home="$(getent passwd "$(id -un)" | cut -d: -f6)"
+  real_home="$(_test_real_home)"
 
   # Poison HOME to a fake directory. The contract should still validate
   # against the real home (from passwd), not the poisoned $HOME.
@@ -605,7 +612,7 @@ test_home_poisoning_explicit_override() {
   local desc="HOME poisoning with explicit override rejected"
 
   local real_home
-  real_home="$(getent passwd "$(id -un)" | cut -d: -f6)"
+  real_home="$(_test_real_home)"
 
   # Explicitly set WORKTREE_BASE to a path under the fake HOME/data
   local output
@@ -632,7 +639,7 @@ test_shared_inbounds_directory_rejected() {
   local desc="shared in-bounds directory rejected by session-prefix check"
 
   local real_home
-  real_home="$(getent passwd "$(id -un)" | cut -d: -f6)"
+  real_home="$(_test_real_home)"
 
   # Case 1: WORKTREE_BASE under $HOME/data but wrong session/issue prefix
   local output
@@ -669,7 +676,7 @@ test_correct_session_prefix_overrides_accepted() {
   local desc="correct session-prefix overrides accepted"
 
   local real_home
-  real_home="$(getent passwd "$(id -un)" | cut -d: -f6)"
+  real_home="$(_test_real_home)"
 
   # Exact prefix match — should succeed
   local output
@@ -709,7 +716,7 @@ test_bootstraps_fallback_when_realpath_is_missing() {
   local desc="bootstraps fall back when realpath is missing from PATH"
 
   local real_home
-  real_home="$(getent passwd "$(id -un)" | cut -d: -f6)"
+  real_home="$(_test_real_home)"
 
   # Create a stub directory with a realpath that always fails (simulates missing)
   local stub_dir
@@ -773,10 +780,12 @@ STUB
   done <<< "$output"
 
   if ! $found_non_empty; then
+    rm -rf "$stub_dir"
     tap_not_ok "$desc" "Review output lines were empty (fail-open): $output"
     return
   fi
 
+  rm -rf "$stub_dir"
   tap_ok "$desc"
 }
 
@@ -787,7 +796,7 @@ test_bootstraps_fallback_when_realpath_rejects_dash_m() {
   local desc="bootstraps fall back when realpath rejects -m flag"
 
   local real_home
-  real_home="$(getent passwd "$(id -un)" | cut -d: -f6)"
+  real_home="$(_test_real_home)"
 
   # Create a fake realpath that rejects -m but otherwise exists
   local stub_dir
@@ -874,7 +883,7 @@ test_symlinked_home_alias_overrides_are_accepted() {
   local desc="symlinked HOME alias overrides are accepted"
 
   local real_home
-  real_home="$(getent passwd "$(id -un)" | cut -d: -f6)"
+  real_home="$(_test_real_home)"
 
   # Create a symlink alias that points at the real home directory
   local link_dir
