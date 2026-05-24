@@ -1266,11 +1266,11 @@ impl Herder {
     pub fn get_min_ledger_seq_to_ask_peers(&self) -> u32 {
         let lcl = self.ledger_manager.current_ledger_seq();
         let mut low = lcl.saturating_add(1);
-        let max_slots = self.config.max_externalized_slots.max(1) as u32;
-        // Number of extra ledgers to keep beyond max_externalized_slots, matching
-        // stellar-core's LEDGER_VALIDITY_BRACKET lookback cushion.
-        const PEER_LEDGER_WINDOW: u32 = 3;
-        let window = max_slots.min(PEER_LEDGER_WINDOW);
+        // stellar-core uses min(MAX_SLOTS_TO_REMEMBER, SCP_EXTRA_LOOKBACK_LEDGERS)
+        // where SCP_EXTRA_LOOKBACK_LEDGERS = 3. Use the same fixed constants to
+        // ensure parity regardless of the configurable max_externalized_slots.
+        const SCP_EXTRA_LOOKBACK_LEDGERS: u32 = 3;
+        let window = (MAX_SLOTS_TO_REMEMBER as u32).min(SCP_EXTRA_LOOKBACK_LEDGERS);
         if low > window {
             low = low.saturating_sub(window);
         } else {
@@ -13025,9 +13025,25 @@ mod required_lm_behavioral_tests {
         let herder = Herder::new(HerderConfig::default(), lm, TimerManagerHandle::no_op());
 
         let min_seq = herder.get_min_ledger_seq_to_ask_peers();
-        // lcl = 100, low = 101, window = min(max_externalized_slots, 3)
-        // Default max_externalized_slots is > 3, so window = 3
+        // lcl = 100, low = 101, window = min(MAX_SLOTS_TO_REMEMBER=12, 3) = 3
         // low = 101 - 3 = 98
+        assert_eq!(min_seq, 98);
+    }
+
+    /// get_min_ledger_seq_to_ask_peers() uses the fixed MAX_SLOTS_TO_REMEMBER constant
+    /// for its pre-clamp lookback, NOT max_externalized_slots. This ensures parity
+    /// with stellar-core even when max_externalized_slots < 3.
+    #[test]
+    fn test_get_min_ledger_seq_to_ask_peers_ignores_low_max_externalized_slots() {
+        let lm = make_ledger_manager_at_seq(100);
+        let mut config = HerderConfig::default();
+        config.max_externalized_slots = 1; // below 3
+        let herder = Herder::new(config, lm, TimerManagerHandle::no_op());
+
+        let min_seq = herder.get_min_ledger_seq_to_ask_peers();
+        // stellar-core: min(MAX_SLOTS_TO_REMEMBER, SCP_EXTRA_LOOKBACK_LEDGERS) = min(12, 3) = 3
+        // lcl = 100, low = 101 - 3 = 98
+        // Before the fix, this would have been 101 - min(1, 3) = 100.
         assert_eq!(min_seq, 98);
     }
 
