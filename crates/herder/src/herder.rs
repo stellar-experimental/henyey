@@ -1233,6 +1233,10 @@ impl Herder {
     }
 
     /// Compute the minimum ledger sequence to ask peers for SCP state.
+    ///
+    /// Matches stellar-core's `HerderImpl::getMinLedgerSeqToAskPeers()`:
+    /// the computed low watermark is clamped so it never drops below
+    /// `get_min_ledger_seq_to_remember()`.
     pub fn get_min_ledger_seq_to_ask_peers(&self) -> u32 {
         let lcl = self.ledger_manager.current_ledger_seq();
         let mut low = lcl.saturating_add(1);
@@ -1246,7 +1250,10 @@ impl Herder {
         } else {
             low = 1;
         }
-        low
+        // Clamp against the remember floor so we never ask for slots that are
+        // too old to be useful (parity with stellar-core §15.3).
+        let remember_floor = self.get_min_ledger_seq_to_remember() as u32;
+        low.max(remember_floor)
     }
 
     /// Get the expected ledger close duration.
@@ -3614,6 +3621,15 @@ impl Herder {
     /// Get all SCP envelopes recorded for a slot.
     pub fn get_scp_envelopes(&self, slot: u64) -> Vec<ScpEnvelope> {
         self.scp.get_slot_envelopes(slot)
+    }
+
+    /// Get the externalizing state for a slot.
+    ///
+    /// Returns envelopes that contribute to the externalized state of a slot,
+    /// matching stellar-core's `getExternalizingState(slot)` used in
+    /// `processExternalized()` for SCP history persistence.
+    pub fn get_scp_externalizing_state(&self, slot: u64) -> Vec<ScpEnvelope> {
+        self.scp.get_externalizing_state(slot)
     }
 
     /// Get the current sendable SCP state for a specific slot.
@@ -12839,6 +12855,46 @@ mod required_lm_behavioral_tests {
         // Default max_externalized_slots is > 3, so window = 3
         // low = 101 - 3 = 98
         assert_eq!(min_seq, 98);
+    }
+
+    /// get_min_ledger_seq_to_ask_peers() clamps against get_min_ledger_seq_to_remember()
+    /// so the returned value never drops below the remember floor (§15.3 parity).
+    #[test]
+    fn test_get_min_ledger_seq_to_ask_peers_clamps_to_remember_floor() {
+        // Create a herder at a high ledger seq with tracking set high enough
+        // that the remember floor exceeds the lookback window.
+        let lm = make_ledger_manager_at_seq(50);
+        let herder = Herder::new(HerderConfig::default(), lm, TimerManagerHandle::no_op());
+
+        // Bootstrap so tracking_consensus_ledger_index = 100 (tracking_slot = 101)
+        herder.start_syncing();
+        herder.bootstrap(100);
+
+        // tracking_consensus_ledger_index = 100
+        // get_min_ledger_seq_to_remember: current_slot=100, 100 > 12, so 100-12+1 = 89
+        let remember_floor = herder.get_min_ledger_seq_to_remember();
+        assert_eq!(remember_floor, 89);
+
+        // get_min_ledger_seq_to_ask_peers: lcl=50, low=51, window=3, low=51-3=48
+        // But 48 < 89 (remember floor), so clamp to 89.
+        let min_seq = herder.get_min_ledger_seq_to_ask_peers();
+        assert_eq!(min_seq, remember_floor as u32);
+    }
+
+    /// get_scp_externalizing_state() returns the externalizing state snapshot for
+    /// an externalized slot, and empty for a slot with no externalizing state.
+    #[test]
+    fn test_get_scp_externalizing_state_uses_externalizing_snapshot() {
+        let lm = make_ledger_manager_at_seq(1);
+        let herder = Herder::new(HerderConfig::default(), lm, TimerManagerHandle::no_op());
+
+        // Slot 42 has no externalizing state → empty.
+        let state = herder.get_scp_externalizing_state(42);
+        assert!(state.is_empty());
+
+        // Slot 0 also empty.
+        let state = herder.get_scp_externalizing_state(0);
+        assert!(state.is_empty());
     }
 
     /// ledger_close_duration() delegates directly to LedgerManager.

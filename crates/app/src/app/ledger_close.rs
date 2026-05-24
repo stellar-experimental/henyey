@@ -76,6 +76,17 @@ fn consume_skip_marker_if_matches(
     }
 }
 
+/// A single SCP history persistence batch for one slot.
+///
+/// Matches stellar-core's `saveSCPHistory(slot, envelopes, qmap)` contract.
+/// The close pipeline builds ordered batches (slot N-1 first, then N) so the
+/// DB write preserves the same ordering as `processExternalized()`.
+struct ScpHistoryBatch {
+    ledger_seq: u32,
+    envelopes: Vec<stellar_xdr::curr::ScpEnvelope>,
+    quorum_sets: Vec<(Hash256, stellar_xdr::curr::ScpQuorumSet)>,
+}
+
 /// Raw inputs for a ledger-close persist job, captured on the event loop.
 ///
 /// Phase A of #1733: the event loop captures only cheap clones (no XDR/JSON
@@ -90,8 +101,9 @@ struct LedgerPersistInputs {
     tx_metas: Option<Vec<TransactionMeta>>,
     tx_count: usize,
     network_id: NetworkId,
-    scp_envelopes: Vec<stellar_xdr::curr::ScpEnvelope>,
-    scp_quorum_sets: Vec<(Hash256, stellar_xdr::curr::ScpQuorumSet)>,
+    /// Ordered SCP history batches: previous slot (N-1) first, then current (N).
+    /// Matches stellar-core's `processExternalized()` persistence ordering (§5.3).
+    scp_history_batches: Vec<ScpHistoryBatch>,
     /// HAS struct built on the event loop under bucket-list read guards.
     /// JSON serialization happens later on the blocking thread.
     has: HistoryArchiveState,
@@ -212,9 +224,14 @@ impl LedgerPersistInputs {
                 }
             }
 
-            conn.store_scp_history(self.header.ledger_seq, &self.scp_envelopes)?;
-            for (hash, qset) in &self.scp_quorum_sets {
-                conn.store_scp_quorum_set(hash, self.header.ledger_seq, qset)?;
+            // Persist SCP history in ordered batches: previous slot (N-1) first,
+            // then current slot (N), matching stellar-core's processExternalized()
+            // persistence ordering (§5.3).
+            for batch in &self.scp_history_batches {
+                conn.store_scp_history(batch.ledger_seq, &batch.envelopes)?;
+                for (hash, qset) in &batch.quorum_sets {
+                    conn.store_scp_quorum_set(hash, batch.ledger_seq, qset)?;
+                }
             }
 
             conn.set_state(state_keys::HISTORY_ARCHIVE_STATE, &has_json)?;
@@ -371,17 +388,49 @@ impl App {
         }
         let tx_count = ordered_txs.len();
 
-        let scp_envelopes = self.herder.get_scp_envelopes(header.ledger_seq as u64);
-        let mut scp_quorum_sets = Vec::new();
-        for envelope in &scp_envelopes {
-            let hash = henyey_common::scp_quorum_set_hash(&envelope.statement);
-            let hash256 = Hash256::from_bytes(hash.0);
-            if let Some(qset) = self.herder.get_quorum_set_by_hash(&hash256) {
-                scp_quorum_sets.push((hash256, qset));
-            } else {
-                tracing::debug!(hash = %hash256.to_hex(), "Missing quorum set for SCP history — export will skip this envelope");
+        // Build ordered SCP history batches: previous slot (N-1) first, then
+        // current slot (N), matching stellar-core's processExternalized() §5.3.
+        let scp_history_batches = {
+            let current_slot = header.ledger_seq as u64;
+            let mut batches = Vec::new();
+
+            // Helper to build a batch from externalizing state for a slot.
+            let build_batch = |slot: u64| -> ScpHistoryBatch {
+                let envelopes = self.herder.get_scp_externalizing_state(slot);
+                let mut quorum_sets = Vec::new();
+                for envelope in &envelopes {
+                    let hash = henyey_common::scp_quorum_set_hash(&envelope.statement);
+                    let hash256 = Hash256::from_bytes(hash.0);
+                    if let Some(qset) = self.herder.get_quorum_set_by_hash(&hash256) {
+                        quorum_sets.push((hash256, qset));
+                    } else {
+                        tracing::debug!(
+                            hash = %hash256.to_hex(),
+                            slot,
+                            "Missing quorum set for SCP history batch"
+                        );
+                    }
+                }
+                ScpHistoryBatch {
+                    ledger_seq: slot as u32,
+                    envelopes,
+                    quorum_sets,
+                }
+            };
+
+            // Previous slot first (if available).
+            if current_slot > 1 {
+                let prev_batch = build_batch(current_slot - 1);
+                if !prev_batch.envelopes.is_empty() {
+                    batches.push(prev_batch);
+                }
             }
-        }
+
+            // Current slot.
+            batches.push(build_batch(current_slot));
+
+            batches
+        };
 
         let tx_set_entry = match tx_set_variant {
             TransactionSetVariant::Classic(set) => set.clone(),
@@ -449,8 +498,7 @@ impl App {
             tx_metas: tx_metas.map(|m| m.to_vec()),
             tx_count,
             network_id,
-            scp_envelopes,
-            scp_quorum_sets,
+            scp_history_batches,
             has,
             bucket_list_levels,
             publish_enabled: self.is_validator && self.config.history.publish_enabled(),

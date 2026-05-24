@@ -113,7 +113,7 @@ Corresponds to: `Herder.h`, `HerderImpl.h`
 | `updateTransactionQueue()` | handled in `ledger_closed()` | Full |
 | `maybeSetupSorobanQueue()` | Integrated via lane-based `TransactionQueue` | Full |
 | `herderOutOfSync()` | `SyncRecoveryManager` | Full |
-| `getMoreSCPState()` | _(not implemented)_ | None |
+| `getMoreSCPState()` | `request_scp_state_from_peers()` → `OverlayManager::request_scp_state()` with clamped low-watermark and 2-peer fanout | Full |
 | `persistSCPState()` | `ScpPersistenceManager.persist_scp_state()` wired via `ScpDriver::emit` persist callback | Full[^persist-scp] |
 | `restoreSCPState()` | `ScpPersistenceManager.restore()` | Full |
 | `persistUpgrades()` | `UpgradeParameters` with Serde persistence | Full |
@@ -204,7 +204,7 @@ Corresponds to: `HerderPersistence.h`, `HerderPersistenceImpl.h`
 
 | stellar-core | Rust | Status |
 |--------------|------|--------|
-| `saveSCPHistory()` | `ScpPersistenceManager.persist()` | Full |
+| `saveSCPHistory()` | `ScpPersistenceManager.persist()` + ordered batch persistence in `ledger_close.rs` (slot N-1 before N) | Full |
 | `copySCPHistoryToStream()` | _(not implemented)_ | None |
 | `getNodeQuorumSet()` | _(not implemented)_ | None |
 | `getQuorumSet()` | _(not implemented)_ | None |
@@ -518,7 +518,6 @@ Features not yet implemented. These ARE counted against parity %.
 | `setUpgrades()` / `getUpgradesJson()` | Medium | Admin API for upgrade scheduling |
 | `setFilteredAccounts()` | Medium | Runtime filtered-account override API missing |
 | `checkAndMaybeReanalyzeQuorumMap()` | Low | Background quorum analysis |
-| `getMoreSCPState()` | Low | Peer SCP state request |
 | `recomputeKeysToFilter()` | Low | Soroban footprint filtering |
 | `ctValidityOffset()` | Low | Close time offset computation |
 | PendingEnvelopes cost tracking (4 methods) | Low | Per-validator cost analysis |

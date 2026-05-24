@@ -1721,10 +1721,31 @@ impl OverlayManager {
         *advertised_inbound = inbound_peers;
     }
 
-    /// Request SCP state from all peers.
+    /// Request SCP state from up to 2 random authenticated peers.
+    ///
+    /// Matches stellar-core's `getMoreSCPState()` + `getRandomAuthenticatedPeers(2)`
+    /// semantics: snapshot peer IDs once, shuffle, send to at most 2 (§15.3).
     pub async fn request_scp_state(&self, ledger_seq: u32) -> Result<usize> {
+        use rand::seq::SliceRandom;
+
         let message = StellarMessage::GetScpState(ledger_seq);
-        self.broadcast(message).await
+        let all_peers: Vec<PeerId> = self.peers.iter().map(|e| e.key().clone()).collect();
+        if all_peers.is_empty() {
+            return Ok(0);
+        }
+
+        let mut rng = rand::thread_rng();
+        let mut shuffled = all_peers;
+        shuffled.shuffle(&mut rng);
+        let targets = &shuffled[..shuffled.len().min(2)];
+
+        let mut sent = 0;
+        for peer_id in targets {
+            if self.try_send_to(peer_id, message.clone()).is_ok() {
+                sent += 1;
+            }
+        }
+        Ok(sent)
     }
 
     /// Request a transaction set by hash from all peers.
@@ -4303,5 +4324,72 @@ mod tests {
         // Dedup: config resolved and discovered have same canonical_key
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].host, "10.0.0.1");
+    }
+
+    // ──────── request_scp_state §15.3 parity tests ────────
+
+    #[tokio::test]
+    async fn test_request_scp_state_targets_at_most_two_peers() {
+        let config = OverlayConfig::default();
+        let secret = SecretKey::generate();
+        let local_node = LocalNode::new_testnet(secret);
+
+        let manager = OverlayManager::new(config, local_node).unwrap();
+
+        // Insert 5 peers
+        let mut receivers = Vec::new();
+        for i in 0..5u8 {
+            let peer_id = PeerId::from_bytes([i + 10; 32]);
+            let rx = insert_peer_with_capacity(&manager, peer_id, 16);
+            receivers.push(rx);
+        }
+
+        // Request SCP state — should send to at most 2 of the 5 peers.
+        let sent = manager.request_scp_state(100).await.unwrap();
+        assert_eq!(sent, 2, "should send to exactly 2 peers when > 2 available");
+
+        // Count how many receivers got a message
+        let mut received = 0;
+        for rx in &mut receivers {
+            if rx.try_recv().is_ok() {
+                received += 1;
+            }
+        }
+        assert_eq!(received, 2);
+    }
+
+    #[tokio::test]
+    async fn test_request_scp_state_with_single_peer_sends_once() {
+        let config = OverlayConfig::default();
+        let secret = SecretKey::generate();
+        let local_node = LocalNode::new_testnet(secret);
+
+        let manager = OverlayManager::new(config, local_node).unwrap();
+
+        let peer_id = PeerId::from_bytes([42u8; 32]);
+        let mut rx = insert_peer_with_capacity(&manager, peer_id, 16);
+
+        let sent = manager.request_scp_state(50).await.unwrap();
+        assert_eq!(sent, 1, "should send to the single available peer");
+
+        let msg = rx.try_recv().unwrap();
+        match msg {
+            OutboundMessage::Send(StellarMessage::GetScpState(seq)) => {
+                assert_eq!(seq, 50);
+            }
+            _ => panic!("expected Send(GetScpState(50))"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_request_scp_state_with_zero_peers_returns_zero() {
+        let config = OverlayConfig::default();
+        let secret = SecretKey::generate();
+        let local_node = LocalNode::new_testnet(secret);
+
+        let manager = OverlayManager::new(config, local_node).unwrap();
+
+        let sent = manager.request_scp_state(100).await.unwrap();
+        assert_eq!(sent, 0, "should return 0 when no peers connected");
     }
 }
