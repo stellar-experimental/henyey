@@ -103,7 +103,7 @@ test_plan_bootstrap_accepts_safe_preseeded_home_data_paths() {
 
   # Verify all paths are under $HOME/data (directory-boundary check, not prefix)
   local home_data
-  home_data="$(realpath -m "$HOME/data")"
+  home_data="$(source "$CONTRACT_HELPER" && canonicalize_contract_path "$HOME/data")"
   # Each output line must be exactly $home_data or start with $home_data/
   local line
   while IFS= read -r line; do
@@ -162,7 +162,7 @@ test_review_pr_bootstrap_requires_home_data_workspace() {
   fi
 
   local home_data
-  home_data="$(realpath -m "$HOME/data")"
+  home_data="$(source "$CONTRACT_HELPER" && canonicalize_contract_path "$HOME/data")"
   local line
   while IFS= read -r line; do
     if [[ -n "$line" && "$line" != "$home_data" && "$line" != "$home_data/"* ]]; then
@@ -197,7 +197,7 @@ test_default_bootstrap_layouts_stay_under_home_data() {
   fi
 
   local home_data
-  home_data="$(realpath -m "$HOME/data")"
+  home_data="$(source "$CONTRACT_HELPER" && canonicalize_contract_path "$HOME/data")"
 
   # Verify plan paths (directory-boundary check)
   local line
@@ -711,22 +711,22 @@ test_bootstraps_fallback_when_realpath_is_missing() {
   local real_home
   real_home="$(getent passwd "$(id -un)" | cut -d: -f6)"
 
-  # Create a restricted PATH that excludes realpath
-  local restricted_path=""
-  local dir
-  while IFS=: read -r -d: dir || [[ -n "$dir" ]]; do
-    # Skip dirs that contain realpath
-    if [[ ! -x "$dir/realpath" ]]; then
-      restricted_path="${restricted_path:+$restricted_path:}$dir"
-    fi
-  done <<< "$PATH:"
+  # Create a stub directory with a realpath that always fails (simulates missing)
+  local stub_dir
+  stub_dir="$(mktemp -d)"
+  cat > "$stub_dir/realpath" << 'STUB'
+#!/usr/bin/env bash
+# Stub: simulate realpath not being available
+exit 127
+STUB
+  chmod +x "$stub_dir/realpath"
 
-  # Ensure basic tools are still available (bash, id, getent, python3)
-  # but realpath is not
+  # Put stub first in PATH so it shadows the real realpath
   local output
-  if ! output=$(PATH="$restricted_path" \
+  if ! output=$(PATH="$stub_dir:$PATH" \
     WORKTREE_BASE="" CARGO_TARGET_DIR="" CLAUDE_SESSION_ID="fallback-test" \
     bash -c "source '$CONTRACT_HELPER' && plan_critic_bootstrap 77 critic-a && echo \$WORKTREE_BASE && echo \$CARGO_TARGET_DIR && echo \$CRITIC_WORKTREE" 2>&1); then
+    rm -rf "$stub_dir"
     tap_not_ok "$desc (plan)" "Plan bootstrap failed when realpath missing: $output"
     return
   fi
@@ -738,6 +738,7 @@ test_bootstraps_fallback_when_realpath_is_missing() {
     if [[ -n "$line" ]]; then
       found_non_empty=true
       if [[ "$line" != "$real_home/data/"* ]]; then
+        rm -rf "$stub_dir"
         tap_not_ok "$desc" "Path not under real home/data: $line"
         return
       fi
@@ -745,14 +746,16 @@ test_bootstraps_fallback_when_realpath_is_missing() {
   done <<< "$output"
 
   if ! $found_non_empty; then
+    rm -rf "$stub_dir"
     tap_not_ok "$desc" "All output lines were empty (fail-open): $output"
     return
   fi
 
   # Also test review_pr_bootstrap
-  if ! output=$(PATH="$restricted_path" \
+  if ! output=$(PATH="$stub_dir:$PATH" \
     WORKTREE_BASE="" CARGO_TARGET_DIR="" CLAUDE_SESSION_ID="fallback-test" \
     bash -c "source '$CONTRACT_HELPER' && review_pr_bootstrap 77 && echo \$WORKTREE_BASE && echo \$CARGO_TARGET_DIR && echo \$REVIEWER_WORKTREE" 2>&1); then
+    rm -rf "$stub_dir"
     tap_not_ok "$desc (review)" "Review bootstrap failed when realpath missing: $output"
     return
   fi
@@ -762,6 +765,7 @@ test_bootstraps_fallback_when_realpath_is_missing() {
     if [[ -n "$line" ]]; then
       found_non_empty=true
       if [[ "$line" != "$real_home/data/"* ]]; then
+        rm -rf "$stub_dir"
         tap_not_ok "$desc" "Review path not under real home/data: $line"
         return
       fi

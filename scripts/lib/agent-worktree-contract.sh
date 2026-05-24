@@ -32,10 +32,32 @@ _contract_real_home() {
 
 # canonicalize_contract_path <path>
 # Resolve symlinks and collapse .. traversals without requiring the path to exist.
-# Uses realpath -m (GNU coreutils) for canonical resolution.
+# Tries GNU realpath -m first, falls back to Python os.path.realpath, then fails
+# closed (returns non-zero) if neither backend is available.
 canonicalize_contract_path() {
   local path="$1"
-  realpath -m "$path"
+  local result
+
+  # Fast path: GNU realpath -m (works on Linux with coreutils)
+  if result="$(realpath -m "$path" 2>/dev/null)" && [[ -n "$result" ]]; then
+    echo "$result"
+    return 0
+  fi
+
+  # Fallback: Python os.path.realpath handles symlinks and missing paths portably
+  if result="$(python3 -c "import os, sys; print(os.path.realpath(sys.argv[1]))" "$path" 2>/dev/null)" && [[ -n "$result" ]]; then
+    echo "$result"
+    return 0
+  fi
+
+  # Last resort: try python2
+  if result="$(python -c "import os, sys; print(os.path.realpath(sys.argv[1]))" "$path" 2>/dev/null)" && [[ -n "$result" ]]; then
+    echo "$result"
+    return 0
+  fi
+
+  echo "ERROR: canonicalize_contract_path: no supported canonicalization backend available (need realpath -m or python3)" >&2
+  return 1
 }
 
 # require_home_data_path <path> <var_name>
@@ -46,11 +68,17 @@ require_home_data_path() {
   local path="$1"
   local var_name="$2"
   local canonical
-  canonical="$(canonicalize_contract_path "$path")"
+  if ! canonical="$(canonicalize_contract_path "$path")" || [[ -z "$canonical" ]]; then
+    echo "ERROR: $var_name='$path' could not be canonicalized (no backend available)" >&2
+    return 1
+  fi
   local real_home
   real_home="$(_contract_real_home)"
   local home_data
-  home_data="$(canonicalize_contract_path "$real_home/data")"
+  if ! home_data="$(canonicalize_contract_path "$real_home/data")" || [[ -z "$home_data" ]]; then
+    echo "ERROR: could not canonicalize home data path '$real_home/data'" >&2
+    return 1
+  fi
 
   # Directory-boundary check: accept exact <real-home>/data or paths under it.
   # A plain prefix check would incorrectly accept sibling paths like ~/data-evil.
@@ -70,7 +98,10 @@ require_session_prefix() {
   local expected_prefix="$2"
   local var_name="$3"
   local canon_prefix
-  canon_prefix="$(canonicalize_contract_path "$expected_prefix")"
+  if ! canon_prefix="$(canonicalize_contract_path "$expected_prefix")" || [[ -z "$canon_prefix" ]]; then
+    echo "ERROR: could not canonicalize expected prefix '$expected_prefix'" >&2
+    return 1
+  fi
 
   if [[ "$canonical" != "$canon_prefix" && "$canonical" != "$canon_prefix/"* ]]; then
     echo "ERROR: $var_name='$canonical' is not under expected session prefix '$canon_prefix'" >&2
