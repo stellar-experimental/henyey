@@ -23,6 +23,13 @@ PASS=0
 FAIL=0
 TEST_NUM=0
 
+# Portable real-home lookup — reuses the contract helper's own fallback logic
+# so the tests can run on macOS/BSD where getent is unavailable.
+_test_real_home() {
+  # shellcheck disable=SC1090
+  ( source "$CONTRACT_HELPER" && _contract_real_home )
+}
+
 tap_ok() {
   TEST_NUM=$((TEST_NUM + 1))
   PASS=$((PASS + 1))
@@ -103,7 +110,7 @@ test_plan_bootstrap_accepts_safe_preseeded_home_data_paths() {
 
   # Verify all paths are under $HOME/data (directory-boundary check, not prefix)
   local home_data
-  home_data="$(realpath -m "$HOME/data")"
+  home_data="$(source "$CONTRACT_HELPER" && canonicalize_contract_path "$HOME/data")"
   # Each output line must be exactly $home_data or start with $home_data/
   local line
   while IFS= read -r line; do
@@ -162,7 +169,7 @@ test_review_pr_bootstrap_requires_home_data_workspace() {
   fi
 
   local home_data
-  home_data="$(realpath -m "$HOME/data")"
+  home_data="$(source "$CONTRACT_HELPER" && canonicalize_contract_path "$HOME/data")"
   local line
   while IFS= read -r line; do
     if [[ -n "$line" && "$line" != "$home_data" && "$line" != "$home_data/"* ]]; then
@@ -197,7 +204,7 @@ test_default_bootstrap_layouts_stay_under_home_data() {
   fi
 
   local home_data
-  home_data="$(realpath -m "$HOME/data")"
+  home_data="$(source "$CONTRACT_HELPER" && canonicalize_contract_path "$HOME/data")"
 
   # Verify plan paths (directory-boundary check)
   local line
@@ -565,7 +572,7 @@ test_home_poisoning_defeated() {
 
   # Get the real home from passwd for reference
   local real_home
-  real_home="$(getent passwd "$(id -un)" | cut -d: -f6)"
+  real_home="$(_test_real_home)"
 
   # Poison HOME to a fake directory. The contract should still validate
   # against the real home (from passwd), not the poisoned $HOME.
@@ -605,7 +612,7 @@ test_home_poisoning_explicit_override() {
   local desc="HOME poisoning with explicit override rejected"
 
   local real_home
-  real_home="$(getent passwd "$(id -un)" | cut -d: -f6)"
+  real_home="$(_test_real_home)"
 
   # Explicitly set WORKTREE_BASE to a path under the fake HOME/data
   local output
@@ -632,7 +639,7 @@ test_shared_inbounds_directory_rejected() {
   local desc="shared in-bounds directory rejected by session-prefix check"
 
   local real_home
-  real_home="$(getent passwd "$(id -un)" | cut -d: -f6)"
+  real_home="$(_test_real_home)"
 
   # Case 1: WORKTREE_BASE under $HOME/data but wrong session/issue prefix
   local output
@@ -669,7 +676,7 @@ test_correct_session_prefix_overrides_accepted() {
   local desc="correct session-prefix overrides accepted"
 
   local real_home
-  real_home="$(getent passwd "$(id -un)" | cut -d: -f6)"
+  real_home="$(_test_real_home)"
 
   # Exact prefix match — should succeed
   local output
@@ -703,6 +710,387 @@ test_correct_session_prefix_overrides_accepted() {
 }
 
 # --------------------------------------------------------------------------
+# Test: bootstraps fall back when realpath is missing from PATH
+# --------------------------------------------------------------------------
+test_bootstraps_fallback_when_realpath_is_missing() {
+  local desc="bootstraps fall back when realpath is missing from PATH"
+
+  local real_home
+  real_home="$(_test_real_home)"
+
+  # Create a stub directory with a realpath that always fails (simulates missing)
+  local stub_dir
+  stub_dir="$(mktemp -d)"
+  cat > "$stub_dir/realpath" << 'STUB'
+#!/usr/bin/env bash
+# Stub: simulate realpath not being available
+exit 127
+STUB
+  chmod +x "$stub_dir/realpath"
+
+  # Put stub first in PATH so it shadows the real realpath
+  local output
+  if ! output=$(PATH="$stub_dir:$PATH" \
+    WORKTREE_BASE="" CARGO_TARGET_DIR="" CLAUDE_SESSION_ID="fallback-test" \
+    bash -c "source '$CONTRACT_HELPER' && plan_critic_bootstrap 77 critic-a && echo \$WORKTREE_BASE && echo \$CARGO_TARGET_DIR && echo \$CRITIC_WORKTREE" 2>&1); then
+    rm -rf "$stub_dir"
+    tap_not_ok "$desc (plan)" "Plan bootstrap failed when realpath missing: $output"
+    return
+  fi
+
+  # Verify each exported variable is individually non-empty and under real home
+  local worktree_base cargo_target_dir derived_worktree
+  worktree_base=$(sed -n '1p' <<< "$output")
+  cargo_target_dir=$(sed -n '2p' <<< "$output")
+  derived_worktree=$(sed -n '3p' <<< "$output")
+
+  if [[ -z "$worktree_base" ]]; then
+    rm -rf "$stub_dir"
+    tap_not_ok "$desc" "WORKTREE_BASE is empty (fail-open)"
+    return
+  fi
+  if [[ -z "$cargo_target_dir" ]]; then
+    rm -rf "$stub_dir"
+    tap_not_ok "$desc" "CARGO_TARGET_DIR is empty (fail-open)"
+    return
+  fi
+  if [[ -z "$derived_worktree" ]]; then
+    rm -rf "$stub_dir"
+    tap_not_ok "$desc" "CRITIC_WORKTREE is empty (fail-open)"
+    return
+  fi
+  for p in "$worktree_base" "$cargo_target_dir" "$derived_worktree"; do
+    if [[ "$p" != "$real_home/data/"* ]]; then
+      rm -rf "$stub_dir"
+      tap_not_ok "$desc" "Path not under real home/data: $p"
+      return
+    fi
+  done
+
+  # Also test review_pr_bootstrap
+  if ! output=$(PATH="$stub_dir:$PATH" \
+    WORKTREE_BASE="" CARGO_TARGET_DIR="" CLAUDE_SESSION_ID="fallback-test" \
+    bash -c "source '$CONTRACT_HELPER' && review_pr_bootstrap 77 && echo \$WORKTREE_BASE && echo \$CARGO_TARGET_DIR && echo \$REVIEWER_WORKTREE" 2>&1); then
+    rm -rf "$stub_dir"
+    tap_not_ok "$desc (review)" "Review bootstrap failed when realpath missing: $output"
+    return
+  fi
+
+  worktree_base=$(sed -n '1p' <<< "$output")
+  cargo_target_dir=$(sed -n '2p' <<< "$output")
+  derived_worktree=$(sed -n '3p' <<< "$output")
+
+  if [[ -z "$worktree_base" ]]; then
+    rm -rf "$stub_dir"
+    tap_not_ok "$desc" "Review WORKTREE_BASE is empty (fail-open)"
+    return
+  fi
+  if [[ -z "$cargo_target_dir" ]]; then
+    rm -rf "$stub_dir"
+    tap_not_ok "$desc" "Review CARGO_TARGET_DIR is empty (fail-open)"
+    return
+  fi
+  if [[ -z "$derived_worktree" ]]; then
+    rm -rf "$stub_dir"
+    tap_not_ok "$desc" "Review REVIEWER_WORKTREE is empty (fail-open)"
+    return
+  fi
+  for p in "$worktree_base" "$cargo_target_dir" "$derived_worktree"; do
+    if [[ "$p" != "$real_home/data/"* ]]; then
+      rm -rf "$stub_dir"
+      tap_not_ok "$desc" "Review path not under real home/data: $p"
+      return
+    fi
+  done
+
+  rm -rf "$stub_dir"
+  tap_ok "$desc"
+}
+
+# --------------------------------------------------------------------------
+# Test: bootstraps fall back when realpath rejects -m flag
+# --------------------------------------------------------------------------
+test_bootstraps_fallback_when_realpath_rejects_dash_m() {
+  local desc="bootstraps fall back when realpath rejects -m flag"
+
+  local real_home
+  real_home="$(_test_real_home)"
+
+  # Create a fake realpath that rejects -m but otherwise exists
+  local stub_dir
+  stub_dir="$(mktemp -d)"
+  cat > "$stub_dir/realpath" << 'STUB'
+#!/usr/bin/env bash
+# Stub realpath that rejects -m (simulates BSD realpath)
+for arg in "$@"; do
+  if [[ "$arg" == "-m" || "$arg" == "--canonicalize-missing" ]]; then
+    echo "realpath: invalid option -- 'm'" >&2
+    exit 1
+  fi
+done
+# Without -m, just pass through (but won't resolve missing paths)
+/usr/bin/realpath "$@" 2>/dev/null || exit 1
+STUB
+  chmod +x "$stub_dir/realpath"
+
+  # Put stub first in PATH
+  local output
+  if ! output=$(PATH="$stub_dir:$PATH" \
+    WORKTREE_BASE="" CARGO_TARGET_DIR="" CLAUDE_SESSION_ID="fallback-test" \
+    bash -c "source '$CONTRACT_HELPER' && plan_critic_bootstrap 78 critic-a && echo \$WORKTREE_BASE && echo \$CARGO_TARGET_DIR && echo \$CRITIC_WORKTREE" 2>&1); then
+    rm -rf "$stub_dir"
+    tap_not_ok "$desc (plan)" "Plan bootstrap failed when realpath rejects -m: $output"
+    return
+  fi
+
+  # Verify each exported variable is individually non-empty and under real home
+  local worktree_base cargo_target_dir derived_worktree
+  worktree_base=$(sed -n '1p' <<< "$output")
+  cargo_target_dir=$(sed -n '2p' <<< "$output")
+  derived_worktree=$(sed -n '3p' <<< "$output")
+
+  if [[ -z "$worktree_base" ]]; then
+    rm -rf "$stub_dir"
+    tap_not_ok "$desc" "WORKTREE_BASE is empty (fail-open)"
+    return
+  fi
+  if [[ -z "$cargo_target_dir" ]]; then
+    rm -rf "$stub_dir"
+    tap_not_ok "$desc" "CARGO_TARGET_DIR is empty (fail-open)"
+    return
+  fi
+  if [[ -z "$derived_worktree" ]]; then
+    rm -rf "$stub_dir"
+    tap_not_ok "$desc" "CRITIC_WORKTREE is empty (fail-open)"
+    return
+  fi
+  for p in "$worktree_base" "$cargo_target_dir" "$derived_worktree"; do
+    if [[ "$p" != "$real_home/data/"* ]]; then
+      rm -rf "$stub_dir"
+      tap_not_ok "$desc" "Path not under real home/data: $p"
+      return
+    fi
+  done
+
+  # Also test review_pr_bootstrap
+  if ! output=$(PATH="$stub_dir:$PATH" \
+    WORKTREE_BASE="" CARGO_TARGET_DIR="" CLAUDE_SESSION_ID="fallback-test" \
+    bash -c "source '$CONTRACT_HELPER' && review_pr_bootstrap 78 && echo \$WORKTREE_BASE && echo \$CARGO_TARGET_DIR && echo \$REVIEWER_WORKTREE" 2>&1); then
+    rm -rf "$stub_dir"
+    tap_not_ok "$desc (review)" "Review bootstrap failed when realpath rejects -m: $output"
+    return
+  fi
+
+  worktree_base=$(sed -n '1p' <<< "$output")
+  cargo_target_dir=$(sed -n '2p' <<< "$output")
+  derived_worktree=$(sed -n '3p' <<< "$output")
+
+  if [[ -z "$worktree_base" ]]; then
+    rm -rf "$stub_dir"
+    tap_not_ok "$desc" "Review WORKTREE_BASE is empty (fail-open)"
+    return
+  fi
+  if [[ -z "$cargo_target_dir" ]]; then
+    rm -rf "$stub_dir"
+    tap_not_ok "$desc" "Review CARGO_TARGET_DIR is empty (fail-open)"
+    return
+  fi
+  if [[ -z "$derived_worktree" ]]; then
+    rm -rf "$stub_dir"
+    tap_not_ok "$desc" "Review REVIEWER_WORKTREE is empty (fail-open)"
+    return
+  fi
+  for p in "$worktree_base" "$cargo_target_dir" "$derived_worktree"; do
+    if [[ "$p" != "$real_home/data/"* ]]; then
+      rm -rf "$stub_dir"
+      tap_not_ok "$desc" "Review path not under real home/data: $p"
+      return
+    fi
+  done
+
+  rm -rf "$stub_dir"
+  tap_ok "$desc"
+}
+
+# --------------------------------------------------------------------------
+# Test: symlinked HOME alias overrides are accepted
+# --------------------------------------------------------------------------
+test_symlinked_home_alias_overrides_are_accepted() {
+  local desc="symlinked HOME alias overrides are accepted"
+
+  local real_home
+  real_home="$(_test_real_home)"
+
+  # Create a symlink alias that points at the real home directory
+  local link_dir
+  link_dir="$(mktemp -d)"
+  local link_home="$link_dir/link-home"
+  ln -s "$real_home" "$link_home"
+
+  # Set HOME to the symlink alias and pass overrides through it
+  local output
+  if ! output=$(HOME="$link_home" \
+    WORKTREE_BASE="$link_home/data/sym-session/plan-99" \
+    CARGO_TARGET_DIR="$link_home/data/sym-session/plan-99/cargo-target" \
+    CLAUDE_SESSION_ID="sym-session" \
+    bash -c "source '$CONTRACT_HELPER' && plan_critic_bootstrap 99 critic-a && echo \$WORKTREE_BASE && echo \$CARGO_TARGET_DIR && echo \$CRITIC_WORKTREE" 2>&1); then
+    rm -rf "$link_dir"
+    tap_not_ok "$desc (plan)" "Plan bootstrap failed with symlinked HOME: $output"
+    return
+  fi
+
+  # Verify each exported variable is individually non-empty and under real home/data
+  local worktree_base cargo_target_dir derived_worktree
+  worktree_base=$(sed -n '1p' <<< "$output")
+  cargo_target_dir=$(sed -n '2p' <<< "$output")
+  derived_worktree=$(sed -n '3p' <<< "$output")
+
+  if [[ -z "$worktree_base" ]]; then
+    rm -rf "$link_dir"
+    tap_not_ok "$desc" "WORKTREE_BASE is empty (fail-open)"
+    return
+  fi
+  if [[ -z "$cargo_target_dir" ]]; then
+    rm -rf "$link_dir"
+    tap_not_ok "$desc" "CARGO_TARGET_DIR is empty (fail-open)"
+    return
+  fi
+  if [[ -z "$derived_worktree" ]]; then
+    rm -rf "$link_dir"
+    tap_not_ok "$desc" "CRITIC_WORKTREE is empty (fail-open)"
+    return
+  fi
+  for p in "$worktree_base" "$cargo_target_dir" "$derived_worktree"; do
+    if [[ "$p" != "$real_home/data/"* ]]; then
+      rm -rf "$link_dir"
+      tap_not_ok "$desc" "Path not normalized to real home/data: $p (expected under $real_home/data/)"
+      return
+    fi
+  done
+
+  # Also test review_pr_bootstrap with symlinked HOME
+  if ! output=$(HOME="$link_home" \
+    WORKTREE_BASE="$link_home/data/sym-session/review-pr-99" \
+    CARGO_TARGET_DIR="$link_home/data/sym-session/review-pr-99/cargo-target" \
+    CLAUDE_SESSION_ID="sym-session" \
+    bash -c "source '$CONTRACT_HELPER' && review_pr_bootstrap 99 && echo \$WORKTREE_BASE && echo \$CARGO_TARGET_DIR && echo \$REVIEWER_WORKTREE" 2>&1); then
+    rm -rf "$link_dir"
+    tap_not_ok "$desc (review)" "Review bootstrap failed with symlinked HOME: $output"
+    return
+  fi
+
+  worktree_base=$(sed -n '1p' <<< "$output")
+  cargo_target_dir=$(sed -n '2p' <<< "$output")
+  derived_worktree=$(sed -n '3p' <<< "$output")
+
+  if [[ -z "$worktree_base" ]]; then
+    rm -rf "$link_dir"
+    tap_not_ok "$desc" "Review WORKTREE_BASE is empty (fail-open)"
+    return
+  fi
+  if [[ -z "$cargo_target_dir" ]]; then
+    rm -rf "$link_dir"
+    tap_not_ok "$desc" "Review CARGO_TARGET_DIR is empty (fail-open)"
+    return
+  fi
+  if [[ -z "$derived_worktree" ]]; then
+    rm -rf "$link_dir"
+    tap_not_ok "$desc" "Review REVIEWER_WORKTREE is empty (fail-open)"
+    return
+  fi
+  for p in "$worktree_base" "$cargo_target_dir" "$derived_worktree"; do
+    if [[ "$p" != "$real_home/data/"* ]]; then
+      rm -rf "$link_dir"
+      tap_not_ok "$desc" "Review path not normalized to real home/data: $p"
+      return
+    fi
+  done
+
+  rm -rf "$link_dir"
+  tap_ok "$desc"
+}
+
+# --------------------------------------------------------------------------
+# Test: poisoned python3 on PATH does not bypass canonicalization
+# --------------------------------------------------------------------------
+test_poisoned_python_on_path_ignored() {
+  local desc="poisoned python3 on PATH is ignored (uses absolute path only)"
+
+  local real_home
+  real_home="$(_test_real_home)"
+
+  # Create a stub directory with:
+  # - realpath that always fails (forces Python fallback)
+  # - python3 that prints attacker-controlled output (/etc)
+  # - python that also prints attacker-controlled output
+  local stub_dir
+  stub_dir="$(mktemp -d)"
+  cat > "$stub_dir/realpath" << 'STUB'
+#!/usr/bin/env bash
+exit 127
+STUB
+  chmod +x "$stub_dir/realpath"
+
+  cat > "$stub_dir/python3" << 'STUB'
+#!/usr/bin/env bash
+# Malicious: always outputs /etc regardless of input
+echo "/etc"
+STUB
+  chmod +x "$stub_dir/python3"
+
+  cat > "$stub_dir/python" << 'STUB'
+#!/usr/bin/env bash
+echo "/etc"
+STUB
+  chmod +x "$stub_dir/python"
+
+  # Run bootstrap with poisoned PATH — the helper should use /usr/bin/python3
+  # (absolute path) and ignore the stub. If /usr/bin/python3 doesn't exist,
+  # it should fail closed rather than using the poisoned PATH python3.
+  local output
+  if output=$(PATH="$stub_dir:$PATH" \
+    WORKTREE_BASE="" CARGO_TARGET_DIR="" CLAUDE_SESSION_ID="poison-test" \
+    bash -c "source '$CONTRACT_HELPER' && plan_critic_bootstrap 77 critic-a && echo \$WORKTREE_BASE && echo \$CARGO_TARGET_DIR && echo \$CRITIC_WORKTREE" 2>&1); then
+    # Bootstrap succeeded — verify paths are NOT /etc (attacker-controlled)
+    local worktree_base cargo_target_dir derived_worktree
+    worktree_base=$(sed -n '1p' <<< "$output")
+    cargo_target_dir=$(sed -n '2p' <<< "$output")
+    derived_worktree=$(sed -n '3p' <<< "$output")
+
+    for p in "$worktree_base" "$cargo_target_dir" "$derived_worktree"; do
+      if [[ "$p" == "/etc"* ]]; then
+        rm -rf "$stub_dir"
+        tap_not_ok "$desc" "PATH-poisoned python3 was trusted! Got path: $p"
+        return
+      fi
+    done
+
+    # If it succeeded and paths are correct, the absolute-path fallback worked
+    for p in "$worktree_base" "$cargo_target_dir" "$derived_worktree"; do
+      if [[ -z "$p" || "$p" != "$real_home/data/"* ]]; then
+        rm -rf "$stub_dir"
+        tap_not_ok "$desc" "Unexpected path: '$p' (expected under $real_home/data/)"
+        return
+      fi
+    done
+  else
+    # Bootstrap failed — that's acceptable (fail-closed) as long as it didn't
+    # succeed with attacker output. Verify the error output doesn't contain /etc
+    # as an accepted path.
+    if [[ "$output" == *"resolves to '/etc'"* ]] && [[ "$output" != *"outside"* ]]; then
+      rm -rf "$stub_dir"
+      tap_not_ok "$desc" "Bootstrap accepted poisoned /etc path before failing"
+      return
+    fi
+    # Fail-closed is the correct behavior when realpath and absolute-path python
+    # are both unavailable — this is NOT a bypass.
+  fi
+
+  rm -rf "$stub_dir"
+  tap_ok "$desc"
+}
+
+# --------------------------------------------------------------------------
 # Run all tests
 # --------------------------------------------------------------------------
 echo "TAP version 13"
@@ -726,6 +1114,10 @@ test_correct_session_prefix_overrides_accepted
 test_skill_files_reference_shared_contract_helper
 test_claude_review_pr_synced
 test_claude_plan_synced
+test_bootstraps_fallback_when_realpath_is_missing
+test_bootstraps_fallback_when_realpath_rejects_dash_m
+test_symlinked_home_alias_overrides_are_accepted
+test_poisoned_python_on_path_ignored
 
 echo "1..$TEST_NUM"
 echo "# pass: $PASS"
