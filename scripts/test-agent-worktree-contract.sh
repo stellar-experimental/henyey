@@ -738,25 +738,34 @@ STUB
     return
   fi
 
-  # Verify paths are non-empty and under real home
-  local line
-  local found_non_empty=false
-  while IFS= read -r line; do
-    if [[ -n "$line" ]]; then
-      found_non_empty=true
-      if [[ "$line" != "$real_home/data/"* ]]; then
-        rm -rf "$stub_dir"
-        tap_not_ok "$desc" "Path not under real home/data: $line"
-        return
-      fi
-    fi
-  done <<< "$output"
+  # Verify each exported variable is individually non-empty and under real home
+  local worktree_base cargo_target_dir derived_worktree
+  worktree_base=$(sed -n '1p' <<< "$output")
+  cargo_target_dir=$(sed -n '2p' <<< "$output")
+  derived_worktree=$(sed -n '3p' <<< "$output")
 
-  if ! $found_non_empty; then
+  if [[ -z "$worktree_base" ]]; then
     rm -rf "$stub_dir"
-    tap_not_ok "$desc" "All output lines were empty (fail-open): $output"
+    tap_not_ok "$desc" "WORKTREE_BASE is empty (fail-open)"
     return
   fi
+  if [[ -z "$cargo_target_dir" ]]; then
+    rm -rf "$stub_dir"
+    tap_not_ok "$desc" "CARGO_TARGET_DIR is empty (fail-open)"
+    return
+  fi
+  if [[ -z "$derived_worktree" ]]; then
+    rm -rf "$stub_dir"
+    tap_not_ok "$desc" "CRITIC_WORKTREE is empty (fail-open)"
+    return
+  fi
+  for p in "$worktree_base" "$cargo_target_dir" "$derived_worktree"; do
+    if [[ "$p" != "$real_home/data/"* ]]; then
+      rm -rf "$stub_dir"
+      tap_not_ok "$desc" "Path not under real home/data: $p"
+      return
+    fi
+  done
 
   # Also test review_pr_bootstrap
   if ! output=$(PATH="$stub_dir:$PATH" \
@@ -767,23 +776,32 @@ STUB
     return
   fi
 
-  found_non_empty=false
-  while IFS= read -r line; do
-    if [[ -n "$line" ]]; then
-      found_non_empty=true
-      if [[ "$line" != "$real_home/data/"* ]]; then
-        rm -rf "$stub_dir"
-        tap_not_ok "$desc" "Review path not under real home/data: $line"
-        return
-      fi
-    fi
-  done <<< "$output"
+  worktree_base=$(sed -n '1p' <<< "$output")
+  cargo_target_dir=$(sed -n '2p' <<< "$output")
+  derived_worktree=$(sed -n '3p' <<< "$output")
 
-  if ! $found_non_empty; then
+  if [[ -z "$worktree_base" ]]; then
     rm -rf "$stub_dir"
-    tap_not_ok "$desc" "Review output lines were empty (fail-open): $output"
+    tap_not_ok "$desc" "Review WORKTREE_BASE is empty (fail-open)"
     return
   fi
+  if [[ -z "$cargo_target_dir" ]]; then
+    rm -rf "$stub_dir"
+    tap_not_ok "$desc" "Review CARGO_TARGET_DIR is empty (fail-open)"
+    return
+  fi
+  if [[ -z "$derived_worktree" ]]; then
+    rm -rf "$stub_dir"
+    tap_not_ok "$desc" "Review REVIEWER_WORKTREE is empty (fail-open)"
+    return
+  fi
+  for p in "$worktree_base" "$cargo_target_dir" "$derived_worktree"; do
+    if [[ "$p" != "$real_home/data/"* ]]; then
+      rm -rf "$stub_dir"
+      tap_not_ok "$desc" "Review path not under real home/data: $p"
+      return
+    fi
+  done
 
   rm -rf "$stub_dir"
   tap_ok "$desc"
@@ -825,25 +843,34 @@ STUB
     return
   fi
 
-  # Verify paths are non-empty and under real home
-  local line
-  local found_non_empty=false
-  while IFS= read -r line; do
-    if [[ -n "$line" ]]; then
-      found_non_empty=true
-      if [[ "$line" != "$real_home/data/"* ]]; then
-        rm -rf "$stub_dir"
-        tap_not_ok "$desc" "Path not under real home/data: $line"
-        return
-      fi
-    fi
-  done <<< "$output"
+  # Verify each exported variable is individually non-empty and under real home
+  local worktree_base cargo_target_dir derived_worktree
+  worktree_base=$(sed -n '1p' <<< "$output")
+  cargo_target_dir=$(sed -n '2p' <<< "$output")
+  derived_worktree=$(sed -n '3p' <<< "$output")
 
-  if ! $found_non_empty; then
+  if [[ -z "$worktree_base" ]]; then
     rm -rf "$stub_dir"
-    tap_not_ok "$desc" "All output lines were empty (fail-open): $output"
+    tap_not_ok "$desc" "WORKTREE_BASE is empty (fail-open)"
     return
   fi
+  if [[ -z "$cargo_target_dir" ]]; then
+    rm -rf "$stub_dir"
+    tap_not_ok "$desc" "CARGO_TARGET_DIR is empty (fail-open)"
+    return
+  fi
+  if [[ -z "$derived_worktree" ]]; then
+    rm -rf "$stub_dir"
+    tap_not_ok "$desc" "CRITIC_WORKTREE is empty (fail-open)"
+    return
+  fi
+  for p in "$worktree_base" "$cargo_target_dir" "$derived_worktree"; do
+    if [[ "$p" != "$real_home/data/"* ]]; then
+      rm -rf "$stub_dir"
+      tap_not_ok "$desc" "Path not under real home/data: $p"
+      return
+    fi
+  done
 
   # Also test review_pr_bootstrap
   if ! output=$(PATH="$stub_dir:$PATH" \
@@ -854,23 +881,32 @@ STUB
     return
   fi
 
-  found_non_empty=false
-  while IFS= read -r line; do
-    if [[ -n "$line" ]]; then
-      found_non_empty=true
-      if [[ "$line" != "$real_home/data/"* ]]; then
-        rm -rf "$stub_dir"
-        tap_not_ok "$desc" "Review path not under real home/data: $line"
-        return
-      fi
-    fi
-  done <<< "$output"
+  worktree_base=$(sed -n '1p' <<< "$output")
+  cargo_target_dir=$(sed -n '2p' <<< "$output")
+  derived_worktree=$(sed -n '3p' <<< "$output")
 
-  if ! $found_non_empty; then
+  if [[ -z "$worktree_base" ]]; then
     rm -rf "$stub_dir"
-    tap_not_ok "$desc" "Review output lines were empty (fail-open): $output"
+    tap_not_ok "$desc" "Review WORKTREE_BASE is empty (fail-open)"
     return
   fi
+  if [[ -z "$cargo_target_dir" ]]; then
+    rm -rf "$stub_dir"
+    tap_not_ok "$desc" "Review CARGO_TARGET_DIR is empty (fail-open)"
+    return
+  fi
+  if [[ -z "$derived_worktree" ]]; then
+    rm -rf "$stub_dir"
+    tap_not_ok "$desc" "Review REVIEWER_WORKTREE is empty (fail-open)"
+    return
+  fi
+  for p in "$worktree_base" "$cargo_target_dir" "$derived_worktree"; do
+    if [[ "$p" != "$real_home/data/"* ]]; then
+      rm -rf "$stub_dir"
+      tap_not_ok "$desc" "Review path not under real home/data: $p"
+      return
+    fi
+  done
 
   rm -rf "$stub_dir"
   tap_ok "$desc"
@@ -903,15 +939,34 @@ test_symlinked_home_alias_overrides_are_accepted() {
     return
   fi
 
-  # Verify paths resolve back to real home/data
-  local line
-  while IFS= read -r line; do
-    if [[ -n "$line" && "$line" != "$real_home/data/"* ]]; then
+  # Verify each exported variable is individually non-empty and under real home/data
+  local worktree_base cargo_target_dir derived_worktree
+  worktree_base=$(sed -n '1p' <<< "$output")
+  cargo_target_dir=$(sed -n '2p' <<< "$output")
+  derived_worktree=$(sed -n '3p' <<< "$output")
+
+  if [[ -z "$worktree_base" ]]; then
+    rm -rf "$link_dir"
+    tap_not_ok "$desc" "WORKTREE_BASE is empty (fail-open)"
+    return
+  fi
+  if [[ -z "$cargo_target_dir" ]]; then
+    rm -rf "$link_dir"
+    tap_not_ok "$desc" "CARGO_TARGET_DIR is empty (fail-open)"
+    return
+  fi
+  if [[ -z "$derived_worktree" ]]; then
+    rm -rf "$link_dir"
+    tap_not_ok "$desc" "CRITIC_WORKTREE is empty (fail-open)"
+    return
+  fi
+  for p in "$worktree_base" "$cargo_target_dir" "$derived_worktree"; do
+    if [[ "$p" != "$real_home/data/"* ]]; then
       rm -rf "$link_dir"
-      tap_not_ok "$desc" "Path not normalized to real home/data: $line (expected under $real_home/data/)"
+      tap_not_ok "$desc" "Path not normalized to real home/data: $p (expected under $real_home/data/)"
       return
     fi
-  done <<< "$output"
+  done
 
   # Also test review_pr_bootstrap with symlinked HOME
   if ! output=$(HOME="$link_home" \
@@ -924,13 +979,32 @@ test_symlinked_home_alias_overrides_are_accepted() {
     return
   fi
 
-  while IFS= read -r line; do
-    if [[ -n "$line" && "$line" != "$real_home/data/"* ]]; then
+  worktree_base=$(sed -n '1p' <<< "$output")
+  cargo_target_dir=$(sed -n '2p' <<< "$output")
+  derived_worktree=$(sed -n '3p' <<< "$output")
+
+  if [[ -z "$worktree_base" ]]; then
+    rm -rf "$link_dir"
+    tap_not_ok "$desc" "Review WORKTREE_BASE is empty (fail-open)"
+    return
+  fi
+  if [[ -z "$cargo_target_dir" ]]; then
+    rm -rf "$link_dir"
+    tap_not_ok "$desc" "Review CARGO_TARGET_DIR is empty (fail-open)"
+    return
+  fi
+  if [[ -z "$derived_worktree" ]]; then
+    rm -rf "$link_dir"
+    tap_not_ok "$desc" "Review REVIEWER_WORKTREE is empty (fail-open)"
+    return
+  fi
+  for p in "$worktree_base" "$cargo_target_dir" "$derived_worktree"; do
+    if [[ "$p" != "$real_home/data/"* ]]; then
       rm -rf "$link_dir"
-      tap_not_ok "$desc" "Review path not normalized to real home/data: $line"
+      tap_not_ok "$desc" "Review path not normalized to real home/data: $p"
       return
     fi
-  done <<< "$output"
+  done
 
   rm -rf "$link_dir"
   tap_ok "$desc"
