@@ -703,6 +703,227 @@ test_correct_session_prefix_overrides_accepted() {
 }
 
 # --------------------------------------------------------------------------
+# Test: bootstraps fall back when realpath is missing from PATH
+# --------------------------------------------------------------------------
+test_bootstraps_fallback_when_realpath_is_missing() {
+  local desc="bootstraps fall back when realpath is missing from PATH"
+
+  local real_home
+  real_home="$(getent passwd "$(id -un)" | cut -d: -f6)"
+
+  # Create a restricted PATH that excludes realpath
+  local restricted_path=""
+  local dir
+  while IFS=: read -r -d: dir || [[ -n "$dir" ]]; do
+    # Skip dirs that contain realpath
+    if [[ ! -x "$dir/realpath" ]]; then
+      restricted_path="${restricted_path:+$restricted_path:}$dir"
+    fi
+  done <<< "$PATH:"
+
+  # Ensure basic tools are still available (bash, id, getent, python3)
+  # but realpath is not
+  local output
+  if ! output=$(PATH="$restricted_path" \
+    WORKTREE_BASE="" CARGO_TARGET_DIR="" CLAUDE_SESSION_ID="fallback-test" \
+    bash -c "source '$CONTRACT_HELPER' && plan_critic_bootstrap 77 critic-a && echo \$WORKTREE_BASE && echo \$CARGO_TARGET_DIR && echo \$CRITIC_WORKTREE" 2>&1); then
+    tap_not_ok "$desc (plan)" "Plan bootstrap failed when realpath missing: $output"
+    return
+  fi
+
+  # Verify paths are non-empty and under real home
+  local line
+  local found_non_empty=false
+  while IFS= read -r line; do
+    if [[ -n "$line" ]]; then
+      found_non_empty=true
+      if [[ "$line" != "$real_home/data/"* ]]; then
+        tap_not_ok "$desc" "Path not under real home/data: $line"
+        return
+      fi
+    fi
+  done <<< "$output"
+
+  if ! $found_non_empty; then
+    tap_not_ok "$desc" "All output lines were empty (fail-open): $output"
+    return
+  fi
+
+  # Also test review_pr_bootstrap
+  if ! output=$(PATH="$restricted_path" \
+    WORKTREE_BASE="" CARGO_TARGET_DIR="" CLAUDE_SESSION_ID="fallback-test" \
+    bash -c "source '$CONTRACT_HELPER' && review_pr_bootstrap 77 && echo \$WORKTREE_BASE && echo \$CARGO_TARGET_DIR && echo \$REVIEWER_WORKTREE" 2>&1); then
+    tap_not_ok "$desc (review)" "Review bootstrap failed when realpath missing: $output"
+    return
+  fi
+
+  found_non_empty=false
+  while IFS= read -r line; do
+    if [[ -n "$line" ]]; then
+      found_non_empty=true
+      if [[ "$line" != "$real_home/data/"* ]]; then
+        tap_not_ok "$desc" "Review path not under real home/data: $line"
+        return
+      fi
+    fi
+  done <<< "$output"
+
+  if ! $found_non_empty; then
+    tap_not_ok "$desc" "Review output lines were empty (fail-open): $output"
+    return
+  fi
+
+  tap_ok "$desc"
+}
+
+# --------------------------------------------------------------------------
+# Test: bootstraps fall back when realpath rejects -m flag
+# --------------------------------------------------------------------------
+test_bootstraps_fallback_when_realpath_rejects_dash_m() {
+  local desc="bootstraps fall back when realpath rejects -m flag"
+
+  local real_home
+  real_home="$(getent passwd "$(id -un)" | cut -d: -f6)"
+
+  # Create a fake realpath that rejects -m but otherwise exists
+  local stub_dir
+  stub_dir="$(mktemp -d)"
+  cat > "$stub_dir/realpath" << 'STUB'
+#!/usr/bin/env bash
+# Stub realpath that rejects -m (simulates BSD realpath)
+for arg in "$@"; do
+  if [[ "$arg" == "-m" || "$arg" == "--canonicalize-missing" ]]; then
+    echo "realpath: invalid option -- 'm'" >&2
+    exit 1
+  fi
+done
+# Without -m, just pass through (but won't resolve missing paths)
+/usr/bin/realpath "$@" 2>/dev/null || exit 1
+STUB
+  chmod +x "$stub_dir/realpath"
+
+  # Put stub first in PATH
+  local output
+  if ! output=$(PATH="$stub_dir:$PATH" \
+    WORKTREE_BASE="" CARGO_TARGET_DIR="" CLAUDE_SESSION_ID="fallback-test" \
+    bash -c "source '$CONTRACT_HELPER' && plan_critic_bootstrap 78 critic-a && echo \$WORKTREE_BASE && echo \$CARGO_TARGET_DIR && echo \$CRITIC_WORKTREE" 2>&1); then
+    rm -rf "$stub_dir"
+    tap_not_ok "$desc (plan)" "Plan bootstrap failed when realpath rejects -m: $output"
+    return
+  fi
+
+  # Verify paths are non-empty and under real home
+  local line
+  local found_non_empty=false
+  while IFS= read -r line; do
+    if [[ -n "$line" ]]; then
+      found_non_empty=true
+      if [[ "$line" != "$real_home/data/"* ]]; then
+        rm -rf "$stub_dir"
+        tap_not_ok "$desc" "Path not under real home/data: $line"
+        return
+      fi
+    fi
+  done <<< "$output"
+
+  if ! $found_non_empty; then
+    rm -rf "$stub_dir"
+    tap_not_ok "$desc" "All output lines were empty (fail-open): $output"
+    return
+  fi
+
+  # Also test review_pr_bootstrap
+  if ! output=$(PATH="$stub_dir:$PATH" \
+    WORKTREE_BASE="" CARGO_TARGET_DIR="" CLAUDE_SESSION_ID="fallback-test" \
+    bash -c "source '$CONTRACT_HELPER' && review_pr_bootstrap 78 && echo \$WORKTREE_BASE && echo \$CARGO_TARGET_DIR && echo \$REVIEWER_WORKTREE" 2>&1); then
+    rm -rf "$stub_dir"
+    tap_not_ok "$desc (review)" "Review bootstrap failed when realpath rejects -m: $output"
+    return
+  fi
+
+  found_non_empty=false
+  while IFS= read -r line; do
+    if [[ -n "$line" ]]; then
+      found_non_empty=true
+      if [[ "$line" != "$real_home/data/"* ]]; then
+        rm -rf "$stub_dir"
+        tap_not_ok "$desc" "Review path not under real home/data: $line"
+        return
+      fi
+    fi
+  done <<< "$output"
+
+  if ! $found_non_empty; then
+    rm -rf "$stub_dir"
+    tap_not_ok "$desc" "Review output lines were empty (fail-open): $output"
+    return
+  fi
+
+  rm -rf "$stub_dir"
+  tap_ok "$desc"
+}
+
+# --------------------------------------------------------------------------
+# Test: symlinked HOME alias overrides are accepted
+# --------------------------------------------------------------------------
+test_symlinked_home_alias_overrides_are_accepted() {
+  local desc="symlinked HOME alias overrides are accepted"
+
+  local real_home
+  real_home="$(getent passwd "$(id -un)" | cut -d: -f6)"
+
+  # Create a symlink alias that points at the real home directory
+  local link_dir
+  link_dir="$(mktemp -d)"
+  local link_home="$link_dir/link-home"
+  ln -s "$real_home" "$link_home"
+
+  # Set HOME to the symlink alias and pass overrides through it
+  local output
+  if ! output=$(HOME="$link_home" \
+    WORKTREE_BASE="$link_home/data/sym-session/plan-99" \
+    CARGO_TARGET_DIR="$link_home/data/sym-session/plan-99/cargo-target" \
+    CLAUDE_SESSION_ID="sym-session" \
+    bash -c "source '$CONTRACT_HELPER' && plan_critic_bootstrap 99 critic-a && echo \$WORKTREE_BASE && echo \$CARGO_TARGET_DIR && echo \$CRITIC_WORKTREE" 2>&1); then
+    rm -rf "$link_dir"
+    tap_not_ok "$desc (plan)" "Plan bootstrap failed with symlinked HOME: $output"
+    return
+  fi
+
+  # Verify paths resolve back to real home/data
+  local line
+  while IFS= read -r line; do
+    if [[ -n "$line" && "$line" != "$real_home/data/"* ]]; then
+      rm -rf "$link_dir"
+      tap_not_ok "$desc" "Path not normalized to real home/data: $line (expected under $real_home/data/)"
+      return
+    fi
+  done <<< "$output"
+
+  # Also test review_pr_bootstrap with symlinked HOME
+  if ! output=$(HOME="$link_home" \
+    WORKTREE_BASE="$link_home/data/sym-session/review-pr-99" \
+    CARGO_TARGET_DIR="$link_home/data/sym-session/review-pr-99/cargo-target" \
+    CLAUDE_SESSION_ID="sym-session" \
+    bash -c "source '$CONTRACT_HELPER' && review_pr_bootstrap 99 && echo \$WORKTREE_BASE && echo \$CARGO_TARGET_DIR && echo \$REVIEWER_WORKTREE" 2>&1); then
+    rm -rf "$link_dir"
+    tap_not_ok "$desc (review)" "Review bootstrap failed with symlinked HOME: $output"
+    return
+  fi
+
+  while IFS= read -r line; do
+    if [[ -n "$line" && "$line" != "$real_home/data/"* ]]; then
+      rm -rf "$link_dir"
+      tap_not_ok "$desc" "Review path not normalized to real home/data: $line"
+      return
+    fi
+  done <<< "$output"
+
+  rm -rf "$link_dir"
+  tap_ok "$desc"
+}
+
+# --------------------------------------------------------------------------
 # Run all tests
 # --------------------------------------------------------------------------
 echo "TAP version 13"
@@ -726,6 +947,9 @@ test_correct_session_prefix_overrides_accepted
 test_skill_files_reference_shared_contract_helper
 test_claude_review_pr_synced
 test_claude_plan_synced
+test_bootstraps_fallback_when_realpath_is_missing
+test_bootstraps_fallback_when_realpath_rejects_dash_m
+test_symlinked_home_alias_overrides_are_accepted
 
 echo "1..$TEST_NUM"
 echo "# pass: $PASS"
