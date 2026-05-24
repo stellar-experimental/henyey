@@ -1011,6 +1011,86 @@ test_symlinked_home_alias_overrides_are_accepted() {
 }
 
 # --------------------------------------------------------------------------
+# Test: poisoned python3 on PATH does not bypass canonicalization
+# --------------------------------------------------------------------------
+test_poisoned_python_on_path_ignored() {
+  local desc="poisoned python3 on PATH is ignored (uses absolute path only)"
+
+  local real_home
+  real_home="$(_test_real_home)"
+
+  # Create a stub directory with:
+  # - realpath that always fails (forces Python fallback)
+  # - python3 that prints attacker-controlled output (/etc)
+  # - python that also prints attacker-controlled output
+  local stub_dir
+  stub_dir="$(mktemp -d)"
+  cat > "$stub_dir/realpath" << 'STUB'
+#!/usr/bin/env bash
+exit 127
+STUB
+  chmod +x "$stub_dir/realpath"
+
+  cat > "$stub_dir/python3" << 'STUB'
+#!/usr/bin/env bash
+# Malicious: always outputs /etc regardless of input
+echo "/etc"
+STUB
+  chmod +x "$stub_dir/python3"
+
+  cat > "$stub_dir/python" << 'STUB'
+#!/usr/bin/env bash
+echo "/etc"
+STUB
+  chmod +x "$stub_dir/python"
+
+  # Run bootstrap with poisoned PATH — the helper should use /usr/bin/python3
+  # (absolute path) and ignore the stub. If /usr/bin/python3 doesn't exist,
+  # it should fail closed rather than using the poisoned PATH python3.
+  local output
+  if output=$(PATH="$stub_dir:$PATH" \
+    WORKTREE_BASE="" CARGO_TARGET_DIR="" CLAUDE_SESSION_ID="poison-test" \
+    bash -c "source '$CONTRACT_HELPER' && plan_critic_bootstrap 77 critic-a && echo \$WORKTREE_BASE && echo \$CARGO_TARGET_DIR && echo \$CRITIC_WORKTREE" 2>&1); then
+    # Bootstrap succeeded — verify paths are NOT /etc (attacker-controlled)
+    local worktree_base cargo_target_dir derived_worktree
+    worktree_base=$(sed -n '1p' <<< "$output")
+    cargo_target_dir=$(sed -n '2p' <<< "$output")
+    derived_worktree=$(sed -n '3p' <<< "$output")
+
+    for p in "$worktree_base" "$cargo_target_dir" "$derived_worktree"; do
+      if [[ "$p" == "/etc"* ]]; then
+        rm -rf "$stub_dir"
+        tap_not_ok "$desc" "PATH-poisoned python3 was trusted! Got path: $p"
+        return
+      fi
+    done
+
+    # If it succeeded and paths are correct, the absolute-path fallback worked
+    for p in "$worktree_base" "$cargo_target_dir" "$derived_worktree"; do
+      if [[ -z "$p" || "$p" != "$real_home/data/"* ]]; then
+        rm -rf "$stub_dir"
+        tap_not_ok "$desc" "Unexpected path: '$p' (expected under $real_home/data/)"
+        return
+      fi
+    done
+  else
+    # Bootstrap failed — that's acceptable (fail-closed) as long as it didn't
+    # succeed with attacker output. Verify the error output doesn't contain /etc
+    # as an accepted path.
+    if [[ "$output" == *"resolves to '/etc'"* ]] && [[ "$output" != *"outside"* ]]; then
+      rm -rf "$stub_dir"
+      tap_not_ok "$desc" "Bootstrap accepted poisoned /etc path before failing"
+      return
+    fi
+    # Fail-closed is the correct behavior when realpath and absolute-path python
+    # are both unavailable — this is NOT a bypass.
+  fi
+
+  rm -rf "$stub_dir"
+  tap_ok "$desc"
+}
+
+# --------------------------------------------------------------------------
 # Run all tests
 # --------------------------------------------------------------------------
 echo "TAP version 13"
@@ -1037,6 +1117,7 @@ test_claude_plan_synced
 test_bootstraps_fallback_when_realpath_is_missing
 test_bootstraps_fallback_when_realpath_rejects_dash_m
 test_symlinked_home_alias_overrides_are_accepted
+test_poisoned_python_on_path_ignored
 
 echo "1..$TEST_NUM"
 echo "# pass: $PASS"

@@ -32,8 +32,12 @@ _contract_real_home() {
 
 # canonicalize_contract_path <path>
 # Resolve symlinks and collapse .. traversals without requiring the path to exist.
-# Tries GNU realpath -m first, falls back to Python os.path.realpath, then fails
-# closed (returns non-zero) if neither backend is available.
+# Tries GNU realpath -m first, falls back to Python os.path.realpath at a known
+# absolute path, then fails closed (returns non-zero) if neither backend is available.
+#
+# SECURITY: The Python fallback uses absolute paths (/usr/bin/python3, /usr/bin/python)
+# rather than PATH lookup. This prevents PATH-poisoning attacks where a malicious
+# python3 stub could feed arbitrary output into the canonicalization trust chain.
 canonicalize_contract_path() {
   local path="$1"
   local result
@@ -44,19 +48,18 @@ canonicalize_contract_path() {
     return 0
   fi
 
-  # Fallback: Python os.path.realpath handles symlinks and missing paths portably
-  if result="$(python3 -c "import os, sys; print(os.path.realpath(sys.argv[1]))" "$path" 2>/dev/null)" && [[ -n "$result" ]]; then
-    echo "$result"
-    return 0
-  fi
+  # Fallback: Python os.path.realpath at known absolute paths (immune to PATH poisoning)
+  local py
+  for py in /usr/bin/python3 /usr/bin/python /usr/local/bin/python3; do
+    if [[ -x "$py" ]]; then
+      if result="$("$py" -c "import os, sys; print(os.path.realpath(sys.argv[1]))" "$path" 2>/dev/null)" && [[ -n "$result" ]]; then
+        echo "$result"
+        return 0
+      fi
+    fi
+  done
 
-  # Last resort: try python (may be python2 or python3 depending on system)
-  if result="$(python -c "import os, sys; print(os.path.realpath(sys.argv[1]))" "$path" 2>/dev/null)" && [[ -n "$result" ]]; then
-    echo "$result"
-    return 0
-  fi
-
-  echo "ERROR: canonicalize_contract_path: no supported canonicalization backend available (need realpath -m, python3, or python)" >&2
+  echo "ERROR: canonicalize_contract_path: no supported canonicalization backend available (need realpath -m or /usr/bin/python3)" >&2
   return 1
 }
 
