@@ -426,8 +426,18 @@ impl App {
                 }
             }
 
-            // Current slot.
-            batches.push(build_batch(current_slot));
+            // Current slot — includes tracked quorum map qsets per stellar-core's
+            // saveSCPHistory(slotN, envelopes, getCurrentlyTrackedQuorum()).
+            let mut current_batch = build_batch(current_slot);
+            // Merge in quorum sets from the tracked quorum map that aren't already
+            // present from the externalizing envelopes (§5.3 parity).
+            let tracked_qsets = self.herder.get_currently_tracked_quorum();
+            for (hash, qset) in tracked_qsets {
+                if !current_batch.quorum_sets.iter().any(|(h, _)| *h == hash) {
+                    current_batch.quorum_sets.push((hash, qset));
+                }
+            }
+            batches.push(current_batch);
 
             batches
         };

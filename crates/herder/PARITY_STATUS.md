@@ -204,7 +204,7 @@ Corresponds to: `HerderPersistence.h`, `HerderPersistenceImpl.h`
 
 | stellar-core | Rust | Status |
 |--------------|------|--------|
-| `saveSCPHistory()` | `ScpPersistenceManager.persist()` + ordered batch persistence in `ledger_close.rs` (slot N-1 before N) | Full |
+| `saveSCPHistory()` | `ScpPersistenceManager.persist()` + ordered batch persistence in `ledger_close.rs` (slot N-1 before N; current slot includes tracked quorum map qsets) | Full |
 | `copySCPHistoryToStream()` | _(not implemented)_ | None |
 | `getNodeQuorumSet()` | _(not implemented)_ | None |
 | `getQuorumSet()` | _(not implemented)_ | None |

@@ -1728,6 +1728,10 @@ impl OverlayManager {
     pub async fn request_scp_state(&self, ledger_seq: u32) -> Result<usize> {
         use rand::seq::SliceRandom;
 
+        if !self.running.load(Ordering::Relaxed) {
+            return Err(OverlayError::NotStarted);
+        }
+
         let message = StellarMessage::GetScpState(ledger_seq);
         let all_peers: Vec<PeerId> = self.peers.iter().map(|e| e.key().clone()).collect();
         if all_peers.is_empty() {
@@ -4335,6 +4339,7 @@ mod tests {
         let local_node = LocalNode::new_testnet(secret);
 
         let manager = OverlayManager::new(config, local_node).unwrap();
+        manager.running.store(true, Ordering::SeqCst);
 
         // Insert 5 peers
         let mut receivers = Vec::new();
@@ -4365,6 +4370,7 @@ mod tests {
         let local_node = LocalNode::new_testnet(secret);
 
         let manager = OverlayManager::new(config, local_node).unwrap();
+        manager.running.store(true, Ordering::SeqCst);
 
         let peer_id = PeerId::from_bytes([42u8; 32]);
         let mut rx = insert_peer_with_capacity(&manager, peer_id, 16);
@@ -4388,8 +4394,26 @@ mod tests {
         let local_node = LocalNode::new_testnet(secret);
 
         let manager = OverlayManager::new(config, local_node).unwrap();
+        manager.running.store(true, Ordering::SeqCst);
 
         let sent = manager.request_scp_state(100).await.unwrap();
         assert_eq!(sent, 0, "should return 0 when no peers connected");
+    }
+
+    #[tokio::test]
+    async fn test_request_scp_state_returns_not_started_when_not_running() {
+        let config = OverlayConfig::default();
+        let secret = SecretKey::generate();
+        let local_node = LocalNode::new_testnet(secret);
+
+        let manager = OverlayManager::new(config, local_node).unwrap();
+        // running defaults to false — do not store true.
+
+        let result = manager.request_scp_state(100).await;
+        assert!(result.is_err(), "should return error when not running");
+        assert!(
+            matches!(result.unwrap_err(), OverlayError::NotStarted),
+            "error should be NotStarted"
+        );
     }
 }

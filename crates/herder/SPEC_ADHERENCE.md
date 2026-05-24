@@ -250,8 +250,10 @@ excluded. SHOULD claims and operational defaults excluded.
   previous slot (without quorum map) before persisting the current slot
   (with the current quorum map)."
   - **Rust:** `ledger_close.rs` builds ordered `ScpHistoryBatch` entries
-    (slot N-1 first, then N) using `herder.get_scp_externalizing_state(slot)`
-    and persists them in sequence during DB write.
+    (slot N-1 first, then N) using `herder.get_scp_externalizing_state(slot)`.
+    The current-slot batch additionally includes all quorum sets from
+    `herder.get_currently_tracked_quorum()`, matching stellar-core's
+    `saveSCPHistory(slotN, envelopes, getCurrentlyTrackedQuorum())`.
   - **Status:** Full. Implemented in #2820.
 
 ### §5.4 — Timers
