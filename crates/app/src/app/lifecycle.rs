@@ -526,10 +526,11 @@ impl App {
                         self.maybe_publish_history().await;
 
                         // Trigger consensus immediately after a successful close.
-                        if self.is_validator {
-                            self.set_phase_sub(super::phase::PHASE_6_10_TRY_TRIGGER_CONSENSUS);
-                            self.try_trigger_consensus().await;
-                        }
+                        // Both validators and watchers participate: validators
+                        // nominate; watchers build/cache the next-slot tx set
+                        // (parity: HERDER §5.2).
+                        self.set_phase_sub(super::phase::PHASE_6_10_TRY_TRIGGER_CONSENSUS);
+                        self.try_trigger_consensus().await;
 
                         // Drain SCP + fetch response channels.
                         // Timed (#1759 diagnostics): if either drain takes
@@ -1041,10 +1042,9 @@ impl App {
                         self.maybe_publish_history().await;
                     }
 
-                    // For validators, try to trigger next round
-                    if self.is_validator {
-                        self.try_trigger_consensus().await;
-                    }
+                    // Try to trigger next round (validators nominate; watchers
+                    // build/cache the next-slot tx set per HERDER §5.2).
+                    self.try_trigger_consensus().await;
                 }
 
                 // Stats logging

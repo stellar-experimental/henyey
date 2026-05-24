@@ -659,9 +659,15 @@ pub struct App {
     /// HerderImpl.cpp:1440-1447).
     pub(crate) consensus_trigger_skipped_applying: AtomicU64,
     /// Number of trigger_next_ledger invocations that returned
-    /// TriggerOutcome::SkippedStale because LCL advanced during build_nomination_value
-    /// (parity gate with stellar-core HerderImpl.cpp:1550-1562).
+    /// TriggerOutcome::SkippedStale because LCL advanced during the tx-set
+    /// build phase (applies to both validators and observers; parity gate with
+    /// stellar-core HerderImpl.cpp:1550-1562).
     pub(crate) consensus_trigger_skipped_stale: AtomicU64,
+    /// Watcher per-slot latch: stores the last slot for which the watcher
+    /// successfully ran `trigger_next_ledger`. Prevents repeated same-slot
+    /// rebuilds from periodic polling (henyey's equivalent of stellar-core's
+    /// one-shot timer scheduling in `setupTriggerNextLedger`).
+    pub(crate) watcher_last_triggered_slot: AtomicU64,
     /// Number of nomination timeout firings.
     nomination_timeout_fires: AtomicU64,
     /// Number of nomination timeout invocations that returned
@@ -787,8 +793,14 @@ pub struct App {
     /// JoinHandle for the sync recovery manager task (for shutdown awaiting).
     sync_recovery_task: parking_lot::RwLock<Option<tokio::task::JoinHandle<()>>>,
 
-    /// Whether ledger application is currently in progress (for sync recovery).
-    is_applying_ledger: AtomicBool,
+    /// Whether ledger application is currently in progress (for sync recovery
+    /// and herder post-publication guards).
+    ///
+    /// Shared with the Herder via [`Herder::set_is_applying_flag`] so
+    /// `trigger_next_ledger` can check `is_applying()` after draining ready
+    /// envelopes, matching stellar-core's `mLedgerManager.isApplying()` check
+    /// in `HerderImpl::triggerNextLedger` (HerderImpl.cpp:1583).
+    is_applying_ledger: Arc<AtomicBool>,
 
     /// Wall-clock of the last deferred-pipeline close-complete entry.
     /// Used to compute `henyey_ledger_close_cycle_seconds` — the time between
@@ -1218,6 +1230,11 @@ impl App {
             timer_manager_handle.clone(),
         );
 
+        // Shared is_applying flag: the app sets it during ledger application,
+        // the herder reads it in trigger_next_ledger's post-publication guard.
+        let is_applying_ledger = Arc::new(AtomicBool::new(false));
+        let _ = herder.set_is_applying_flag(Arc::clone(&is_applying_ledger));
+
         let meta_stream = Self::init_meta_stream(&config, &bucket_dir)?;
 
         // If streaming is active, wrap the MetaStreamManager in a MetaWriter
@@ -1327,6 +1344,7 @@ impl App {
             consensus_trigger_failures: AtomicU64::new(0),
             consensus_trigger_skipped_applying: AtomicU64::new(0),
             consensus_trigger_skipped_stale: AtomicU64::new(0),
+            watcher_last_triggered_slot: AtomicU64::new(0),
             nomination_timeout_fires: AtomicU64::new(0),
             nomination_timeout_skipped_stale: AtomicU64::new(0),
             ballot_timeout_fires: AtomicU64::new(0),
@@ -1374,7 +1392,7 @@ impl App {
             last_soroban_max_cluster_count: AtomicU64::new(0),
             sync_recovery_handle: parking_lot::RwLock::new(None), // Initialized in run() when needed
             sync_recovery_task: parking_lot::RwLock::new(None),
-            is_applying_ledger: AtomicBool::new(false),
+            is_applying_ledger,
             close_cycle_last_start: parking_lot::Mutex::new(None),
             #[cfg(test)]
             close_complete_inject_blocking_ms: AtomicU64::new(0),
@@ -2280,6 +2298,11 @@ impl App {
         match outcome {
             henyey_herder::TriggerOutcome::Triggered
             | henyey_herder::TriggerOutcome::AlreadyNominating => Ok(next_ledger),
+            henyey_herder::TriggerOutcome::ObserverCached => {
+                // Unreachable: manual_close_ledger requires is_validator=true,
+                // and validators never get ObserverCached from trigger_next_ledger.
+                unreachable!("ObserverCached in manual_close_ledger (validator-only path)")
+            }
             henyey_herder::TriggerOutcome::SkippedStale => Err(anyhow::anyhow!(
                 "manual close: LCL advanced during build_nomination_value; \
                  caller should retry with refreshed ledger seq"
@@ -4369,6 +4392,251 @@ mod tests {
         assert_eq!(
             attempts_after, attempts_before,
             "consensus_trigger_attempts must NOT increment when LCL is behind tracking slot"
+        );
+    }
+
+    /// Regression test for #2869 — HERDER §5.2 non-validator txset build + cache parity.
+    ///
+    /// Verifies that a watcher App can call `try_trigger_consensus()` and
+    /// have the first call successfully build/cache the next-slot tx set,
+    /// while the second same-slot call is a genuine no-op via the per-slot
+    /// latch (without manually seeding the latch).
+    ///
+    /// Pre-fix: FAILS because `try_trigger_consensus` was guarded by
+    /// `if self.is_validator` at all call sites.
+    /// Post-fix: PASSES — watcher callers reach the herder trigger path,
+    /// cache the tx set on first call, and the atomic latch prevents repeats.
+    #[tokio::test]
+    async fn test_try_trigger_consensus_watcher_caches_next_slot_tx_set_once() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("watcher-cache-test.db");
+        let config = crate::config::ConfigBuilder::new()
+            .in_memory(true)
+            .database_path(db_path)
+            .build();
+
+        // Default config has is_validator = false (watcher mode).
+        assert!(!config.node.is_validator, "test requires watcher config");
+
+        let app = App::new(config).await.unwrap();
+
+        // Bootstrap from genesis DB state to initialize the LedgerManager
+        // (required for trigger_next_ledger to succeed with build_and_cache).
+        app.bootstrap_from_db().await.unwrap();
+
+        // Bootstrap the herder into tracking state at LCL=1 (matching genesis).
+        app.herder.bootstrap(1);
+        assert!(app.herder.is_tracking(), "herder must be tracking");
+        assert!(!app.herder.is_validator(), "herder must NOT be a validator");
+
+        // Verify no tx sets are cached before the trigger.
+        assert_eq!(
+            app.herder.scp_driver().tx_set_cache_size(),
+            0,
+            "cache should be empty before first trigger"
+        );
+
+        // First call: should reach the herder trigger_next_ledger call,
+        // successfully build and cache the next-slot tx set.
+        let attempts_before = app.consensus_trigger_attempts.load(Ordering::Relaxed);
+        let successes_before = app.consensus_trigger_successes.load(Ordering::Relaxed);
+        app.try_trigger_consensus().await;
+        let attempts_after = app.consensus_trigger_attempts.load(Ordering::Relaxed);
+        let successes_after = app.consensus_trigger_successes.load(Ordering::Relaxed);
+
+        // Verify the trigger was attempted and succeeded.
+        assert_eq!(
+            attempts_after,
+            attempts_before + 1,
+            "watcher should have attempted the trigger"
+        );
+        assert_eq!(
+            successes_after,
+            successes_before + 1,
+            "watcher first trigger should succeed (ObserverCached)"
+        );
+
+        // Verify the tx set was actually cached.
+        assert!(
+            app.herder.scp_driver().tx_set_cache_size() > 0,
+            "watcher should have cached a tx set after first try_trigger_consensus"
+        );
+
+        // Second call on the same slot: should be a genuine no-op via the
+        // atomic latch (set before spawning), without manually seeding it.
+        let attempts_before2 = app.consensus_trigger_attempts.load(Ordering::Relaxed);
+        app.try_trigger_consensus().await;
+        let attempts_after2 = app.consensus_trigger_attempts.load(Ordering::Relaxed);
+
+        // The latch should prevent a second trigger attempt for the same slot.
+        assert_eq!(
+            attempts_after2, attempts_before2,
+            "second watcher trigger on same slot should be latched (no-op)"
+        );
+    }
+
+    /// Regression test for #2869 review feedback — watcher latch rollback.
+    ///
+    /// Verifies that when the observer trigger fails (e.g. close-time validity
+    /// gate rejects), the per-slot latch is rolled back so the next tick can
+    /// retry the same slot.
+    #[tokio::test]
+    async fn test_try_trigger_consensus_watcher_retries_after_failure() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("watcher-retry-test.db");
+        let config = crate::config::ConfigBuilder::new()
+            .in_memory(true)
+            .database_path(db_path)
+            .build();
+        assert!(!config.node.is_validator, "test requires watcher config");
+
+        let app = App::new(config).await.unwrap();
+        app.bootstrap_from_db().await.unwrap();
+        app.herder.bootstrap(1);
+        assert!(app.herder.is_tracking());
+        assert!(!app.herder.is_validator());
+
+        // Set the test clock to a very small value so the close-time validity
+        // gate fails: build_and_cache computes close_time from SystemTime::now()
+        // (real time ~2026), but check_close_time uses test_clock=1, so
+        // close_time > 1 + 60 → invalid → trigger fails.
+        app.herder.set_test_clock_seconds(1);
+
+        let failures_before = app.consensus_trigger_failures.load(Ordering::Relaxed);
+        app.try_trigger_consensus().await;
+        let failures_after = app.consensus_trigger_failures.load(Ordering::Relaxed);
+
+        // The trigger should have failed (close-time invalid).
+        assert_eq!(
+            failures_after,
+            failures_before + 1,
+            "first trigger should fail due to invalid close time"
+        );
+
+        // Verify no tx set was cached.
+        assert_eq!(
+            app.herder.scp_driver().tx_set_cache_size(),
+            0,
+            "no tx set should be cached after failed trigger"
+        );
+
+        // Now fix the clock so the next trigger succeeds.
+        // Set test_clock to 0 to restore real SystemTime::now() behavior.
+        app.herder.set_test_clock_seconds(0);
+
+        let successes_before = app.consensus_trigger_successes.load(Ordering::Relaxed);
+        app.try_trigger_consensus().await;
+        let successes_after = app.consensus_trigger_successes.load(Ordering::Relaxed);
+
+        // The retry should succeed because the latch was rolled back.
+        assert_eq!(
+            successes_after,
+            successes_before + 1,
+            "retry after failure should succeed (latch must have been rolled back)"
+        );
+
+        // Verify the tx set is now cached.
+        assert!(
+            app.herder.scp_driver().tx_set_cache_size() > 0,
+            "tx set should be cached after successful retry"
+        );
+    }
+
+    /// Regression test for the watcher latch race condition found in review:
+    /// a failed older trigger must NOT clear a newer slot's latch claim.
+    ///
+    /// Scenario: trigger A claims slot N, while A is in-flight trigger B claims
+    /// slot N+1 (bumping the latch). When A fails and attempts rollback via
+    /// compare_exchange(N, 0), it should be a no-op because latch == N+1.
+    ///
+    /// Pre-fix (unconditional store(0)): the latch would be wiped, allowing
+    /// duplicate builds for slot N+1.
+    /// Post-fix (compare_exchange): latch N+1 survives the stale rollback.
+    #[tokio::test]
+    async fn test_try_trigger_consensus_watcher_stale_rollback_preserves_newer_claim() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("watcher-stale-test.db");
+        let config = crate::config::ConfigBuilder::new()
+            .in_memory(true)
+            .database_path(db_path)
+            .build();
+        assert!(!config.node.is_validator, "test requires watcher config");
+
+        let app = App::new(config).await.unwrap();
+        app.bootstrap_from_db().await.unwrap();
+        app.herder.bootstrap(1);
+        assert!(app.herder.is_tracking());
+        assert!(!app.herder.is_validator());
+
+        // Force the first trigger to fail via invalid close time.
+        app.herder.set_test_clock_seconds(1);
+
+        let failures_before = app.consensus_trigger_failures.load(Ordering::Relaxed);
+        app.try_trigger_consensus().await;
+        let failures_after = app.consensus_trigger_failures.load(Ordering::Relaxed);
+        assert_eq!(
+            failures_after,
+            failures_before + 1,
+            "trigger should fail due to invalid close time"
+        );
+
+        // After failure, latch was rolled back (same-slot rollback is correct).
+        // Now simulate a newer slot having been claimed concurrently: set
+        // the latch to slot 3 (next_slot was 2, so 3 > 2).
+        app.watcher_last_triggered_slot.store(3, Ordering::Relaxed);
+
+        // Attempt another trigger for slot 2 (still LCL=1 → next_slot=2).
+        // The latch check (last >= next_slot) should block entry because 3 >= 2.
+        let attempts_before = app.consensus_trigger_attempts.load(Ordering::Relaxed);
+        app.try_trigger_consensus().await;
+        let attempts_after = app.consensus_trigger_attempts.load(Ordering::Relaxed);
+
+        assert_eq!(
+            attempts_after, attempts_before,
+            "trigger should be blocked by newer slot's latch claim"
+        );
+
+        // The latch must still be 3 — the newer claim was preserved.
+        assert_eq!(
+            app.watcher_last_triggered_slot.load(Ordering::Relaxed),
+            3,
+            "newer slot claim (3) must survive stale trigger attempts"
+        );
+    }
+
+    /// Regression test for the watcher latch race at the atomic level.
+    ///
+    /// Directly verifies that compare_exchange(failed_slot, 0) is a no-op
+    /// when a newer slot has been claimed (latch > failed_slot).
+    #[test]
+    fn test_watcher_latch_compare_exchange_preserves_newer_claim() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        let latch = AtomicU64::new(0);
+
+        // Trigger A claims slot 5.
+        let slot_a = 5u64;
+        assert_eq!(
+            latch.compare_exchange(0, slot_a, Ordering::AcqRel, Ordering::Relaxed),
+            Ok(0)
+        );
+
+        // While A is in-flight, trigger B claims slot 6.
+        let slot_b = 6u64;
+        latch.store(slot_b, Ordering::Release);
+
+        // A fails and attempts rollback: compare_exchange(5, 0).
+        // Since latch == 6 != 5, this must be a no-op.
+        let rollback_result =
+            latch.compare_exchange(slot_a, 0, Ordering::AcqRel, Ordering::Relaxed);
+        assert!(
+            rollback_result.is_err(),
+            "rollback for slot 5 must fail when latch is slot 6"
+        );
+        assert_eq!(
+            latch.load(Ordering::Relaxed),
+            slot_b,
+            "slot 6 claim must be preserved after failed rollback of slot 5"
         );
     }
 

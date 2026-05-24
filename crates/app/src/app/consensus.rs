@@ -112,9 +112,13 @@ pub(super) fn should_delay_checkpoint(checkpoint: u64, first_sequential_ledger: 
 }
 
 impl App {
-    /// Try to trigger consensus for the next ledger (validators only).
+    /// Try to trigger consensus for the next ledger.
     ///
-    /// Matches stellar-core's triggerNextLedger() gate: only propose when
+    /// Validators: proposes a signed nomination value and starts SCP.
+    /// Watchers (non-validators): builds and caches the candidate tx set
+    /// without entering SCP nomination (parity: stellar-core §5.2).
+    ///
+    /// Matches stellar-core's triggerNextLedger() gate: only proceed when
     /// the node is tracking the network AND the ledger manager is synced
     /// (LCL == tracking slot). Without this, a node that is behind would
     /// propose stale transaction sets for slots it hasn't closed yet.
@@ -143,14 +147,7 @@ impl App {
             }
 
             // Parity: HerderImpl.cpp:1440-1447 — if a ledger close is in
-            // progress, do not start nomination. The header snapshot we'd
-            // capture inside `build_nomination_value` is mid-update and the
-            // slot we'd nominate would be stale by the time apply completes.
-            // henyey lacks stellar-core's `parallelLedgerClose` config flag,
-            // but `close_ledger` runs on its own `spawn_blocking` task and
-            // this method runs on the async event loop, so the parallel-close
-            // semantics this gate was designed for are structurally
-            // always-on in henyey. The gate is unconditional.
+            // progress, do not start nomination.
             if self.is_applying_ledger() {
                 self.consensus_trigger_skipped_applying
                     .fetch_add(1, Ordering::Relaxed);
@@ -163,6 +160,32 @@ impl App {
             }
 
             let next_slot = current_ledger + 1;
+
+            // Watcher per-slot latch: because henyey polls try_trigger_consensus
+            // periodically (unlike stellar-core's one-shot timer), watchers must
+            // not rebuild/cache the same slot repeatedly. Validators don't need
+            // this because their idempotency is handled by herder's
+            // AlreadyNominating guard.
+            //
+            // We latch BEFORE spawning the blocking task so that concurrent
+            // callers (or tight polling intervals) cannot start a second build
+            // for the same slot while the first is still running.
+            if !self.is_validator {
+                let last = self.watcher_last_triggered_slot.load(Ordering::Relaxed);
+                if last >= next_slot as u64 {
+                    return;
+                }
+                // Atomically claim this slot. If another caller raced us,
+                // the compare_exchange fails and we bail out.
+                if self
+                    .watcher_last_triggered_slot
+                    .compare_exchange(last, next_slot as u64, Ordering::AcqRel, Ordering::Relaxed)
+                    .is_err()
+                {
+                    return;
+                }
+            }
+
             tracing::debug!(next_slot, "Checking if we should trigger consensus");
 
             // Record local close time for drift tracking before triggering consensus.
@@ -207,15 +230,43 @@ impl App {
                 Ok(Ok(henyey_herder::TriggerOutcome::AlreadyNominating)) => {
                     // Idempotent re-trigger; not a new success, not an error.
                 }
+                Ok(Ok(henyey_herder::TriggerOutcome::ObserverCached)) => {
+                    self.consensus_trigger_successes
+                        .fetch_add(1, Ordering::Relaxed);
+                    // Latch was already set before spawning (compare_exchange
+                    // above), so no need to store again here.
+                }
                 Ok(Err(e)) => {
                     self.consensus_trigger_failures
                         .fetch_add(1, Ordering::Relaxed);
+                    // Roll back the watcher per-slot latch so a retry can
+                    // re-attempt the build for this slot on the next tick.
+                    // Only clear if the latch still holds OUR slot — a newer
+                    // slot may have been claimed while we were awaiting.
+                    if !self.is_validator {
+                        let _ = self.watcher_last_triggered_slot.compare_exchange(
+                            next_slot as u64,
+                            0,
+                            Ordering::AcqRel,
+                            Ordering::Relaxed,
+                        );
+                    }
                     tracing::error!(error = %e, slot = next_slot, "Failed to trigger ledger");
                 }
                 Err(_join_error) => {
                     // Already logged by spawn_blocking_logged
                     self.consensus_trigger_failures
                         .fetch_add(1, Ordering::Relaxed);
+                    // Roll back latch on join failure as well — only if our
+                    // slot is still current (same race-safety as above).
+                    if !self.is_validator {
+                        let _ = self.watcher_last_triggered_slot.compare_exchange(
+                            next_slot as u64,
+                            0,
+                            Ordering::AcqRel,
+                            Ordering::Relaxed,
+                        );
+                    }
                 }
             }
         }

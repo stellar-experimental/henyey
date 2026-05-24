@@ -176,6 +176,23 @@ pub enum TriggerOutcome {
     /// LCL advanced during `build_nomination_value`; the value is for an
     /// already-closed slot and was not broadcast.
     SkippedStale,
+    /// Observer (non-validator) built and cached the tx set for this slot
+    /// without entering SCP nomination. Parity: stellar-core
+    /// `HerderImpl::triggerNextLedger` lines 1546-1625 — observers stop
+    /// after `addTxSet` / cache publication and before `makeStellarValue`.
+    ObserverCached,
+}
+
+/// Intermediate result from [`Herder::build_and_cache_candidate_tx_set`]
+/// carrying data needed by the validator-only signing step in
+/// [`Herder::build_nomination_value`].
+struct CandidateTxSetParts {
+    tx_set_hash: Hash256,
+    close_time: u64,
+    lcl_close_time: u64,
+    header: LedgerHeader,
+    max_soroban_tx_set_size: Option<u32>,
+    config_ctx: Option<ConfigUpgradeContext>,
 }
 
 /// Outcome of [`Herder::handle_nomination_timeout`].
@@ -515,6 +532,15 @@ pub struct Herder {
     /// don't install a manager simply leave it empty (purge becomes a no-op),
     /// while production install exactly once in `init_herder`.
     scp_persistence: std::sync::OnceLock<Arc<crate::persistence::ScpPersistenceManager>>,
+    /// Shared flag indicating whether ledger application is in progress.
+    ///
+    /// Parity: stellar-core's `triggerNextLedger` checks
+    /// `mLedgerManager.isApplying()` after `addTxSet` because the side effects
+    /// of draining ready envelopes can externalize a slot and start apply.
+    /// If apply is in progress, upstream returns immediately — henyey must do
+    /// the same. Installed post-construction by the app via
+    /// [`Self::set_is_applying_flag`].
+    is_applying_flag: std::sync::OnceLock<Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl Herder {
@@ -719,6 +745,7 @@ impl Herder {
             scp_metrics,
             lcl_ahead_of_tracking_corrective_total: AtomicU64::new(0),
             scp_persistence: std::sync::OnceLock::new(),
+            is_applying_flag: std::sync::OnceLock::new(),
         }
     }
 
@@ -860,6 +887,28 @@ impl Herder {
         });
 
         Ok(())
+    }
+
+    /// Install the shared `is_applying` flag so `trigger_next_ledger` can
+    /// check whether ledger application is in progress.
+    ///
+    /// Parity: stellar-core's `HerderImpl::triggerNextLedger` checks
+    /// `mLedgerManager.isApplying()` after `addTxSet` because draining ready
+    /// envelopes can trigger SCP callbacks that externalize and start apply.
+    /// If apply begins mid-trigger, upstream returns immediately.
+    pub fn set_is_applying_flag(
+        &self,
+        flag: Arc<std::sync::atomic::AtomicBool>,
+    ) -> std::result::Result<(), Arc<std::sync::atomic::AtomicBool>> {
+        self.is_applying_flag.set(flag)
+    }
+
+    /// Returns true if ledger application is currently in progress.
+    /// Returns false when no flag has been installed (test convenience).
+    fn is_applying(&self) -> bool {
+        self.is_applying_flag.get().map_or(false, |flag| {
+            flag.load(std::sync::atomic::Ordering::Relaxed)
+        })
     }
 
     /// Purge persisted tx sets that are no longer referenced by any persisted
@@ -2406,18 +2455,19 @@ impl Herder {
     /// Trigger consensus for the next ledger (for validators).
     ///
     /// This is called periodically by the consensus timer.
-    /// Trigger SCP nomination for the next ledger.
+    /// For validators: builds a candidate tx set, caches it, and triggers SCP
+    /// nomination (returns `Triggered`).
+    /// For observers: builds, validates, and caches the next-slot tx set but
+    /// stops before nomination/signing (returns `ObserverCached`).
     ///
     /// This is entirely synchronous (parking_lot locks + CPU). It was
     /// previously declared `async` but had no `.await` points.
     pub fn trigger_next_ledger(&self, ledger_seq: u32) -> Result<TriggerOutcome> {
-        if !self.is_validator() {
-            return Err(HerderError::NotValidating);
-        }
-
         if !self.is_tracking() {
             return Err(HerderError::NotValidating);
         }
+
+        let is_validator = self.is_validator();
 
         let slot = ledger_seq as u64;
 
@@ -2463,6 +2513,41 @@ impl Herder {
         self.scp_driver.record_slot_activity(slot);
 
         let t0 = std::time::Instant::now();
+
+        if !is_validator {
+            // --- Observer path ---
+            // Parity: stellar-core HerderImpl.cpp:1546-1625 — observers build
+            // the candidate tx set, self-validate, and publish it into the
+            // pending/fetch cache, then stop before `makeStellarValue`/`nominate`.
+            self.build_and_cache_candidate_tx_set()
+                .ok_or_else(|| HerderError::Internal("Failed to build candidate tx set".into()))?;
+            let build_value_ms = t0.elapsed().as_millis();
+
+            // Drain ready fetching envelopes after cache publication.
+            self.process_ready_fetching_envelopes();
+
+            // Post-build stale check (same as validator path).
+            // Parity: HerderImpl.cpp:1574-1585 — re-read LCL AND check
+            // isApplying() after addTxSet because side effects from draining
+            // ready envelopes can externalize and start ledger application.
+            if !self.lcl_matches_slot(slot) || self.is_applying() {
+                tracing::warn!(
+                    requested_slot = slot,
+                    is_applying = self.is_applying(),
+                    "Skipping: LCL advanced or apply started during observer build"
+                );
+                return Ok(TriggerOutcome::SkippedStale);
+            }
+
+            tracing::debug!(
+                slot,
+                build_value_ms,
+                "trigger_next_ledger: observer cached tx set"
+            );
+            return Ok(TriggerOutcome::ObserverCached);
+        }
+
+        // --- Validator path ---
         let value = self
             .build_nomination_value()
             .ok_or_else(|| HerderError::Internal("Failed to build nomination value".into()))?;
@@ -2473,32 +2558,29 @@ impl Herder {
         // runs on spawn_blocking from the app layer.
         self.process_ready_fetching_envelopes();
 
-        // Parity: HerderImpl.cpp:1550-1562 — a concurrent `close_ledger` task
+        // Parity: HerderImpl.cpp:1574-1585 — a concurrent `close_ledger` task
         // running on a separate `spawn_blocking` may have advanced LCL while
         // we were inside `build_nomination_value` and the subsequent envelope
-        // drain. If so, the value we just built is for a slot the network has
-        // already closed; broadcasting it would be wasted SCP traffic and
-        // would cause this validator to keep nominating against a stale slot
-        // until drift detection trips. This re-check complements the
-        // pre-build entry check above and covers the race-driven case the
-        // entry check cannot detect.
+        // drain. Additionally, draining ready envelopes can trigger SCP
+        // callbacks that externalize and start ledger application. If so, the
+        // value we just built is for a slot the network has already closed or
+        // is in the process of closing; broadcasting it would be wasted SCP
+        // traffic.
         //
         // The check must come BEFORE the cache write below — caching a value
         // for a stale slot would mislead `handle_nomination_timeout`'s
         // cache-hit path.
-        if !self.lcl_matches_slot(slot) {
+        if !self.lcl_matches_slot(slot) || self.is_applying() {
             tracing::warn!(
                 requested_slot = slot,
-                "Skipping nomination: LCL advanced during build_nomination_value"
+                is_applying = self.is_applying(),
+                "Skipping nomination: LCL advanced or apply started during build_nomination_value"
             );
             return Ok(TriggerOutcome::SkippedStale);
         }
 
         // Cache the nomination value for this slot so timeout retries reuse it,
-        // matching stellar-core's by-value lambda capture. On `SkippedStale`
-        // (returned above) we deliberately do NOT clear pre-existing entries:
-        // the cache key is `(slot, value)` and `handle_nomination_timeout`
-        // filters by slot, so stale entries are unreachable.
+        // matching stellar-core's by-value lambda capture.
         *self.cached_nomination_value.write() = Some((slot, value.clone()));
 
         // Get previous value for priority calculation — reads from LCL when
@@ -2877,13 +2959,145 @@ impl Herder {
 
     /// Build a nomination-ready SCP `Value`: transaction set + signed StellarValue.
     ///
-    /// Called by `trigger_next_ledger` to build the initial nomination value. Steps:
-    ///   1. Read ledger state (previous_hash, max_txs, starting_seq)
-    ///   2. Build generalized transaction set and cache it
-    ///   3. Compute close_time with monotonic clamp (parity: stellar-core)
-    ///   4. Merge config + runtime upgrades, filter already-applied
-    ///   5. Sign via `make_stellar_value` and XDR-encode to `Value`
+    /// Called by `trigger_next_ledger` (validator path) to build the initial
+    /// nomination value. Delegates the heavy build/validate/cache work to
+    /// [`build_and_cache_candidate_tx_set`] then adds the validator-only
+    /// signing step (upgrades + `make_stellar_value`).
     fn build_nomination_value(&self) -> Option<Value> {
+        let parts = self.build_and_cache_candidate_tx_set()?;
+
+        // 4. Upgrades: config + runtime, filtered against current state.
+        // Use lcl_close_time (not candidate close_time) for upgrade parameter
+        // decisions to prevent one-ledger-early activation (#1166).
+        let state = CurrentLedgerState {
+            close_time: parts.lcl_close_time,
+            protocol_version: parts.header.ledger_version,
+            base_fee: parts.header.base_fee,
+            max_tx_set_size: parts.header.max_tx_set_size,
+            base_reserve: parts.header.base_reserve,
+            flags: match &parts.header.ext {
+                stellar_xdr::curr::LedgerHeaderExt::V0 => 0,
+                stellar_xdr::curr::LedgerHeaderExt::V1(ext) => ext.flags,
+            },
+            max_soroban_tx_set_size: parts.max_soroban_tx_set_size,
+        };
+
+        let mut upgrade_list: Vec<LedgerUpgrade> = self
+            .config
+            .proposed_upgrades
+            .iter()
+            .filter(|upgrade| match upgrade {
+                LedgerUpgrade::Version(v) => *v != state.protocol_version,
+                LedgerUpgrade::BaseFee(f) => *f != state.base_fee,
+                LedgerUpgrade::MaxTxSetSize(s) => *s != state.max_tx_set_size,
+                LedgerUpgrade::BaseReserve(r) => *r != state.base_reserve,
+                LedgerUpgrade::Flags(f) => *f != state.flags,
+                LedgerUpgrade::MaxSorobanTxSetSize(s) => {
+                    state.max_soroban_tx_set_size.map_or(true, |c| *s != c)
+                }
+                // Parity: gate config upgrades through the same makeFromKey +
+                // isValidForApply + upgradeNeeded checks as runtime upgrades.
+                LedgerUpgrade::Config(_) => parts
+                    .config_ctx
+                    .as_ref()
+                    .and_then(|ctx| match ctx.should_propose() {
+                        Ok(v) => Some(v),
+                        Err(e) => {
+                            tracing::error!(
+                                error = %e,
+                                "broken ledger state in config upgrade check"
+                            );
+                            None
+                        }
+                    })
+                    .unwrap_or(false),
+            })
+            .cloned()
+            .collect();
+
+        // If should_propose() returned Err above (broken ledger state), the
+        // Config upgrade is excluded from the upgrade list (treated as false).
+        // The error was already logged above. Nomination continues without it.
+
+        let runtime_upgrades = match self
+            .runtime_upgrades
+            .read()
+            .create_upgrades_for(&state, parts.config_ctx.as_ref())
+        {
+            Ok(upgrades) => upgrades,
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    "broken ledger state in runtime config upgrade check; aborting nomination"
+                );
+                return None;
+            }
+        };
+        for upgrade in runtime_upgrades {
+            let dominated = upgrade_list.iter().any(|existing| {
+                std::mem::discriminant(existing) == std::mem::discriminant(&upgrade)
+            });
+            if !dominated {
+                upgrade_list.push(upgrade);
+            }
+        }
+
+        // Sort upgrades by type to match stellar-core's deterministic ordering
+        // (VERSION=0, BASE_FEE=1, MAX_TX_SET_SIZE=2, BASE_RESERVE=3, FLAGS=4,
+        // CONFIG=5, MAX_SOROBAN_TX_SET_SIZE=6).
+        upgrade_list.sort_by_key(|u| match u {
+            LedgerUpgrade::Version(_) => 0u32,
+            LedgerUpgrade::BaseFee(_) => 1,
+            LedgerUpgrade::MaxTxSetSize(_) => 2,
+            LedgerUpgrade::BaseReserve(_) => 3,
+            LedgerUpgrade::Flags(_) => 4,
+            LedgerUpgrade::Config(_) => 5,
+            LedgerUpgrade::MaxSorobanTxSetSize(_) => 6,
+        });
+
+        // Parity: stellar-core logs and skips individual upgrades whose encoded
+        // size exceeds UpgradeType::max_size() (HerderImpl.cpp:1572-1587).
+        // The XDR encode itself should never fail for a valid LedgerUpgrade.
+        let upgrades: Vec<UpgradeType> = upgrade_list
+            .iter()
+            .filter_map(|upgrade| {
+                let bytes = upgrade
+                    .to_xdr(Limits::none())
+                    .expect("BUG: failed to encode LedgerUpgrade to XDR");
+                match bytes.try_into() {
+                    Ok(b) => Some(UpgradeType(b)),
+                    Err(_) => {
+                        error!(
+                            upgrade_type = ?std::mem::discriminant(upgrade),
+                            "upgrade blob exceeds UpgradeType max size — skipping"
+                        );
+                        None
+                    }
+                }
+            })
+            .collect();
+
+        // 5. Sign & encode
+        let stellar_value = self
+            .make_stellar_value(parts.tx_set_hash, parts.close_time, upgrades)
+            .ok()?;
+        let value_bytes = henyey_common::xdr_to_bytes(&stellar_value);
+        let value = Value(value_bytes.try_into().ok()?);
+        Some(value)
+    }
+
+    /// Shared build/validate/cache pipeline for the next-slot candidate tx set.
+    ///
+    /// Parity: stellar-core `HerderImpl::triggerNextLedger` lines 1546-1625 —
+    /// all work up to (but not including) `makeStellarValue` and `nominate`.
+    /// Both validators and observers execute this path; observers stop here.
+    ///
+    /// Steps:
+    ///   1. Read ledger state (previous_hash, max_txs, starting_seq)
+    ///   2. Compute close_time with monotonic clamp
+    ///   3. Build generalized transaction set
+    ///   3.5. Self-validate and cache the built tx set
+    fn build_and_cache_candidate_tx_set(&self) -> Option<CandidateTxSetParts> {
         // 1. Ledger state — create ONE snapshot for the entire nomination pass.
         // This snapshot is shared between build_starting_seq_map, the
         // trim_invalid_two_phase validation, and config upgrade context.
@@ -3000,6 +3214,23 @@ impl Herder {
         }
         let close_time_offset = close_time - lcl_close_time;
 
+        // 2.5. Close-time validity gate (parity: stellar-core HerderImpl.cpp:1524).
+        // stellar-core calls `ctValidityOffset(nextCloseTime)` which checks
+        // `nextCloseTime <= now + MAX_TIME_SLIP_SECONDS`. If the locally-selected
+        // close time is invalid (e.g. node clock is behind and lcl_close_time+1
+        // is too far in the future), skip the entire build/cache/publish path.
+        if !self
+            .scp_driver
+            .check_close_time(0, lcl_close_time, close_time)
+        {
+            tracing::warn!(
+                close_time,
+                lcl_close_time,
+                "Invalid close time selected, skipping trigger (parity: ctValidityOffset gate)"
+            );
+            return None;
+        }
+
         // 3. Build & cache tx set, trimming against proposed close time.
         // Use the pre-built snapshot providers for O(1) snapshot creation.
         //
@@ -3074,124 +3305,14 @@ impl Herder {
             snapshot_providers.as_ref(),
         )?;
 
-        // 4. Upgrades: config + runtime, filtered against current state.
-        // Use lcl_close_time (not candidate close_time) for upgrade parameter
-        // decisions to prevent one-ledger-early activation (#1166).
-        let state = CurrentLedgerState {
-            close_time: lcl_close_time,
-            protocol_version: header.ledger_version,
-            base_fee: header.base_fee,
-            max_tx_set_size: header.max_tx_set_size,
-            base_reserve: header.base_reserve,
-            flags: match &header.ext {
-                stellar_xdr::curr::LedgerHeaderExt::V0 => 0,
-                stellar_xdr::curr::LedgerHeaderExt::V1(ext) => ext.flags,
-            },
-            max_soroban_tx_set_size: max_soroban_tx_set_size,
-        };
-
-        let mut upgrade_list: Vec<LedgerUpgrade> = self
-            .config
-            .proposed_upgrades
-            .iter()
-            .filter(|upgrade| match upgrade {
-                LedgerUpgrade::Version(v) => *v != state.protocol_version,
-                LedgerUpgrade::BaseFee(f) => *f != state.base_fee,
-                LedgerUpgrade::MaxTxSetSize(s) => *s != state.max_tx_set_size,
-                LedgerUpgrade::BaseReserve(r) => *r != state.base_reserve,
-                LedgerUpgrade::Flags(f) => *f != state.flags,
-                LedgerUpgrade::MaxSorobanTxSetSize(s) => {
-                    state.max_soroban_tx_set_size.map_or(true, |c| *s != c)
-                }
-                // Parity: gate config upgrades through the same makeFromKey +
-                // isValidForApply + upgradeNeeded checks as runtime upgrades.
-                LedgerUpgrade::Config(_) => config_ctx
-                    .as_ref()
-                    .and_then(|ctx| match ctx.should_propose() {
-                        Ok(v) => Some(v),
-                        Err(e) => {
-                            tracing::error!(
-                                error = %e,
-                                "broken ledger state in config upgrade check"
-                            );
-                            None
-                        }
-                    })
-                    .unwrap_or(false),
-            })
-            .cloned()
-            .collect();
-
-        // If should_propose() returned Err above (broken ledger state), abort
-        // nomination. Check by looking for the error condition: config_ctx is
-        // Some but proposed_upgrades contained a Config that we couldn't check.
-        // (The error was already logged above.)
-
-        let runtime_upgrades = match self
-            .runtime_upgrades
-            .read()
-            .create_upgrades_for(&state, config_ctx.as_ref())
-        {
-            Ok(upgrades) => upgrades,
-            Err(e) => {
-                tracing::error!(
-                    error = %e,
-                    "broken ledger state in runtime config upgrade check; aborting nomination"
-                );
-                return None;
-            }
-        };
-        for upgrade in runtime_upgrades {
-            let dominated = upgrade_list.iter().any(|existing| {
-                std::mem::discriminant(existing) == std::mem::discriminant(&upgrade)
-            });
-            if !dominated {
-                upgrade_list.push(upgrade);
-            }
-        }
-
-        // Sort upgrades by type to match stellar-core's deterministic ordering
-        // (VERSION=0, BASE_FEE=1, MAX_TX_SET_SIZE=2, BASE_RESERVE=3, FLAGS=4,
-        // CONFIG=5, MAX_SOROBAN_TX_SET_SIZE=6).
-        upgrade_list.sort_by_key(|u| match u {
-            LedgerUpgrade::Version(_) => 0u32,
-            LedgerUpgrade::BaseFee(_) => 1,
-            LedgerUpgrade::MaxTxSetSize(_) => 2,
-            LedgerUpgrade::BaseReserve(_) => 3,
-            LedgerUpgrade::Flags(_) => 4,
-            LedgerUpgrade::Config(_) => 5,
-            LedgerUpgrade::MaxSorobanTxSetSize(_) => 6,
-        });
-
-        // Parity: stellar-core logs and skips individual upgrades whose encoded
-        // size exceeds UpgradeType::max_size() (HerderImpl.cpp:1572-1587).
-        // The XDR encode itself should never fail for a valid LedgerUpgrade.
-        let upgrades: Vec<UpgradeType> = upgrade_list
-            .iter()
-            .filter_map(|upgrade| {
-                let bytes = upgrade
-                    .to_xdr(Limits::none())
-                    .expect("BUG: failed to encode LedgerUpgrade to XDR");
-                match bytes.try_into() {
-                    Ok(b) => Some(UpgradeType(b)),
-                    Err(_) => {
-                        error!(
-                            upgrade_type = ?std::mem::discriminant(upgrade),
-                            "upgrade blob exceeds UpgradeType max size — skipping"
-                        );
-                        None
-                    }
-                }
-            })
-            .collect();
-
-        // 5. Sign & encode
-        let stellar_value = self
-            .make_stellar_value(*tx_set.hash(), close_time, upgrades)
-            .ok()?;
-        let value_bytes = henyey_common::xdr_to_bytes(&stellar_value);
-        let value = Value(value_bytes.try_into().ok()?);
-        Some(value)
+        Some(CandidateTxSetParts {
+            tx_set_hash: *tx_set.hash(),
+            close_time,
+            lcl_close_time,
+            header,
+            max_soroban_tx_set_size,
+            config_ctx,
+        })
     }
 
     /// Run self-validation on `tx_set` and, on success, cache it. On failure
@@ -3232,6 +3353,15 @@ impl Herder {
             );
             return None;
         }
+
+        // Populate the validity cache with `true` for this locally-built tx set.
+        // Mirrors stellar-core's `cacheValidTxSet(*applicableProposedSet, lcl,
+        // upperBoundCloseTimeOffset)` in `HerderImpl::triggerNextLedger()` —
+        // ensures later SCP nomination/validation lookups can reuse the result
+        // without re-running full `checkValid`. This side effect runs for both
+        // validators and observers, before the non-validator early return.
+        self.scp_driver
+            .cache_valid_tx_set(previous_hash, *tx_set.hash(), close_time_offset);
 
         // Cache the tx set and notify FetchingEnvelopes. Does NOT drain the
         // ready queue — callers (trigger_next_ledger, handle_nomination_timeout)
@@ -5938,6 +6068,285 @@ mod tests {
         assert!(
             slot_state.map_or(true, |s| !s.is_nominating),
             "stale slot must not be in nominating state"
+        );
+    }
+
+    /// Regression test for #2869 — HERDER §5.2 non-validator txset build + cache parity.
+    ///
+    /// Verifies that an observer herder (non-validator) in tracking mode can
+    /// call `trigger_next_ledger` and have the locally-built tx set published
+    /// into the cache (queryable via `has_tx_set`/`get_tx_set`) WITHOUT
+    /// creating any SCP nomination state for that slot.
+    ///
+    /// Pre-fix: FAILS because `trigger_next_ledger` returns
+    /// `Err(HerderError::NotValidating)` before any tx set is built.
+    /// Post-fix: PASSES — observers run the shared build/cache path and stop
+    /// before `cached_nomination_value` / `scp.nominate`.
+    #[test]
+    fn test_trigger_next_ledger_observer_publishes_tx_set_to_cache_without_nominating() {
+        // Create an observer herder (no secret key, is_validator=false).
+        let config = HerderConfig {
+            is_validator: false,
+            ..HerderConfig::default()
+        };
+        let herder = Herder::new(config, make_default_lm(), TimerManagerHandle::no_op());
+
+        // Bootstrap into tracking state so the is_tracking() check passes.
+        herder.bootstrap(0);
+        assert!(
+            herder.is_tracking(),
+            "herder should be tracking after bootstrap"
+        );
+        assert!(!herder.is_validator(), "herder should NOT be a validator");
+
+        // Call trigger_next_ledger for the next slot (LCL=0, so next=1).
+        let result = herder.trigger_next_ledger(1);
+
+        // Post-fix: should succeed with ObserverCached.
+        let outcome = result.expect(
+            "observer trigger_next_ledger should succeed after fix (currently returns NotValidating)",
+        );
+        assert_eq!(
+            outcome,
+            TriggerOutcome::ObserverCached,
+            "observer should get ObserverCached outcome"
+        );
+
+        // The built tx set should be queryable via the real has_tx_set/get_tx_set
+        // cache path (not just a size check).
+        let cached_hashes = herder.scp_driver.cached_tx_set_hashes();
+        assert_eq!(
+            cached_hashes.len(),
+            1,
+            "observer should have cached exactly one tx set, got {}",
+            cached_hashes.len()
+        );
+        let built_hash = &cached_hashes[0];
+
+        // Verify the specific hash is retrievable via the public query path.
+        assert!(
+            herder.has_tx_set(built_hash),
+            "built tx set must be queryable via has_tx_set"
+        );
+        let retrieved = herder.get_tx_set(built_hash);
+        assert!(
+            retrieved.is_some(),
+            "built tx set must be retrievable via get_tx_set"
+        );
+
+        // No SCP nomination state should exist for the slot.
+        let slot_state = herder.scp().get_slot_state(1);
+        assert!(
+            slot_state.map_or(true, |s| !s.is_nominating),
+            "observer must NOT enter nominating state"
+        );
+    }
+
+    /// Regression test for #2869 review feedback — post-publication is_applying guard.
+    ///
+    /// Parity: stellar-core HerderImpl.cpp:1583 checks
+    /// `mLedgerManager.isApplying()` after `addTxSet` because side effects
+    /// from draining ready envelopes can externalize and start ledger
+    /// application. If apply starts mid-trigger, upstream returns immediately
+    /// without observer success or validator nomination.
+    ///
+    /// Pre-fix: trigger_next_ledger returns ObserverCached even when
+    /// is_applying is true (missing guard).
+    /// Post-fix: returns SkippedStale when is_applying becomes true after
+    /// tx-set publication.
+    #[test]
+    fn test_trigger_next_ledger_observer_skips_when_is_applying() {
+        use std::sync::atomic::AtomicBool;
+
+        let config = HerderConfig {
+            is_validator: false,
+            ..HerderConfig::default()
+        };
+        let herder = Herder::new(config, make_default_lm(), TimerManagerHandle::no_op());
+
+        // Install is_applying flag set to true — simulating that ledger
+        // application started (e.g. triggered by SCP externalization during
+        // process_ready_fetching_envelopes).
+        let is_applying = Arc::new(AtomicBool::new(true));
+        herder
+            .set_is_applying_flag(Arc::clone(&is_applying))
+            .expect("flag install should succeed");
+
+        // Bootstrap into tracking state.
+        herder.bootstrap(0);
+        assert!(herder.is_tracking());
+        assert!(!herder.is_validator());
+
+        // With is_applying=true, trigger should return SkippedStale even
+        // though LCL hasn't advanced (the tx set is built and cached, but
+        // the post-publication guard fires).
+        let result = herder.trigger_next_ledger(1);
+        let outcome = result.expect("trigger should not error");
+        assert_eq!(
+            outcome,
+            TriggerOutcome::SkippedStale,
+            "observer must skip when is_applying is true (parity: HerderImpl.cpp:1583)"
+        );
+
+        // Now clear the flag and verify trigger succeeds normally.
+        is_applying.store(false, std::sync::atomic::Ordering::Relaxed);
+        // Reset the herder to avoid the idempotent build_and_cache guard
+        // (the first call already built/cached, but was stopped at the guard).
+        // bootstrap(0) re-initializes tracking state.
+        herder.bootstrap(0);
+        let result2 = herder.trigger_next_ledger(1);
+        let outcome2 = result2.expect("trigger should not error after clearing flag");
+        assert_eq!(
+            outcome2,
+            TriggerOutcome::ObserverCached,
+            "observer should succeed when is_applying is false"
+        );
+    }
+
+    /// Regression test for #2869 (Bounce-Back Cycle 2) — validity cache parity.
+    ///
+    /// Verifies that `trigger_next_ledger` on a non-validator populates BOTH
+    /// the raw tx-set cache AND the validity cache, mirroring stellar-core's
+    /// `cacheValidTxSet(*applicableProposedSet, lcl, upperBoundCloseTimeOffset)`
+    /// in `HerderImpl::triggerNextLedger()`.
+    ///
+    /// Pre-fix: the validity cache remains empty because
+    /// `validate_and_cache_built_tx_set` only called `cache_tx_set`.
+    /// Post-fix: `cache_valid_tx_set` writes `true` into the validity cache.
+    #[test]
+    fn test_trigger_next_ledger_observer_populates_validity_cache() {
+        let config = HerderConfig {
+            is_validator: false,
+            ..HerderConfig::default()
+        };
+        let herder = Herder::new(config, make_default_lm(), TimerManagerHandle::no_op());
+
+        // Bootstrap into tracking state.
+        herder.bootstrap(0);
+        assert!(herder.is_tracking());
+        assert!(!herder.is_validator());
+
+        // Validity cache should be empty before the trigger.
+        let valid_before = herder.scp_driver.cache_sizes().tx_set_valid_cache;
+        assert_eq!(
+            valid_before, 0,
+            "validity cache should be empty before trigger"
+        );
+
+        // Trigger for slot 1.
+        let result = herder.trigger_next_ledger(1);
+        assert_eq!(
+            result.expect("observer trigger should succeed"),
+            TriggerOutcome::ObserverCached,
+        );
+
+        // The raw tx-set cache should be populated (existing assertion).
+        let cached_hashes = herder.scp_driver.cached_tx_set_hashes();
+        assert_eq!(cached_hashes.len(), 1);
+
+        // The validity cache MUST also be populated — this is the parity fix.
+        let valid_after = herder.scp_driver.cache_sizes().tx_set_valid_cache;
+        assert_eq!(
+            valid_after, 1,
+            "validity cache must contain one entry after observer trigger \
+             (parity: stellar-core cacheValidTxSet in triggerNextLedger)"
+        );
+    }
+
+    /// Regression test for #2869 review feedback — close-time validity gate.
+    ///
+    /// Verifies that `trigger_next_ledger` on an observer performs NO
+    /// build/cache/publish side effects when the locally-selected close time
+    /// is invalid (too far in the future relative to wall clock).
+    /// Mirrors stellar-core's `ctValidityOffset` gate in `triggerNextLedger`.
+    #[test]
+    fn test_trigger_next_ledger_observer_skips_build_on_invalid_close_time() {
+        // Create a LedgerManager whose LCL has a close_time far in the future.
+        // build_and_cache_candidate_tx_set will compute:
+        //   close_time = max(SystemTime::now(), lcl_close_time + 1)
+        // With lcl_close_time = u64::MAX - 100, close_time = u64::MAX - 99,
+        // which is always > now + MAX_TIME_SLIP_SECONDS → gate rejects.
+        use henyey_ledger::{LedgerManager, LedgerManagerConfig};
+        use stellar_xdr::curr::{
+            Hash, LedgerHeader, LedgerHeaderExt, StellarValue, StellarValueExt, TimePoint, VecM,
+        };
+        let lm_config = LedgerManagerConfig {
+            validate_bucket_hash: false,
+            ..Default::default()
+        };
+        let lm = LedgerManager::new("Test Network".to_string(), lm_config);
+        let header = LedgerHeader {
+            ledger_version: 0,
+            previous_ledger_hash: Hash([0u8; 32]),
+            scp_value: StellarValue {
+                tx_set_hash: Hash([0u8; 32]),
+                close_time: TimePoint(u64::MAX - 100),
+                upgrades: VecM::default(),
+                ext: StellarValueExt::Basic,
+            },
+            tx_set_result_hash: Hash([0u8; 32]),
+            bucket_list_hash: Hash([0u8; 32]),
+            ledger_seq: 0,
+            total_coins: 1_000_000_000_000,
+            fee_pool: 0,
+            inflation_seq: 0,
+            id_pool: 0,
+            base_fee: 100,
+            base_reserve: 5_000_000,
+            max_tx_set_size: 100,
+            skip_list: [
+                Hash([0u8; 32]),
+                Hash([0u8; 32]),
+                Hash([0u8; 32]),
+                Hash([0u8; 32]),
+            ],
+            ext: LedgerHeaderExt::V0,
+        };
+        let header_hash = henyey_ledger::compute_header_hash(&header).expect("hash");
+        lm.initialize(
+            henyey_bucket::BucketList::new(),
+            henyey_bucket::HotArchiveBucketList::new(),
+            header,
+            header_hash,
+        )
+        .expect("init");
+
+        let config = HerderConfig {
+            is_validator: false,
+            ..HerderConfig::default()
+        };
+        let herder = Herder::new(config, Arc::new(lm), TimerManagerHandle::no_op());
+
+        // Bootstrap into tracking state.
+        herder.bootstrap(0);
+        assert!(herder.is_tracking());
+        assert!(!herder.is_validator());
+
+        // Verify no tx sets are cached before trigger.
+        let cache_before = herder.scp_driver.cached_tx_set_hashes().len();
+        assert_eq!(cache_before, 0);
+        let valid_before = herder.scp_driver.cache_sizes().tx_set_valid_cache;
+        assert_eq!(valid_before, 0);
+
+        // Trigger for slot 1 — should fail the close-time validity gate.
+        let result = herder.trigger_next_ledger(1);
+        assert!(
+            result.is_err(),
+            "observer trigger should fail when close time is invalid \
+             (returns Err because build_and_cache returns None)"
+        );
+
+        // Verify NO side effects: tx-set cache and validity cache stay empty.
+        let cache_after = herder.scp_driver.cached_tx_set_hashes().len();
+        assert_eq!(
+            cache_after, 0,
+            "no tx set should be cached when close time is invalid"
+        );
+        let valid_after = herder.scp_driver.cache_sizes().tx_set_valid_cache;
+        assert_eq!(
+            valid_after, 0,
+            "validity cache must remain empty when close time is invalid \
+             (parity: stellar-core skips cacheValidTxSet when ctValidityOffset != 0)"
         );
     }
 
@@ -10186,6 +10595,12 @@ mod advance_tracking_slot_tests {
             !herder.scp_driver.has_tx_set(tx_set.hash()),
             "rejected tx set hash must not be queryable in the cache"
         );
+        // Validity cache must also remain empty on rejection.
+        assert_eq!(
+            herder.scp_driver.cache_sizes().tx_set_valid_cache,
+            0,
+            "validity cache must not be populated when helper rejects"
+        );
     }
 
     /// Wiring test (positive path): when the helper returns `true`, the
@@ -10222,6 +10637,17 @@ mod advance_tracking_slot_tests {
         assert!(
             herder.scp_driver.has_tx_set(tx_set.hash()),
             "accepted tx set hash must be queryable in the cache"
+        );
+        // Validity cache must be populated with `true` on success.
+        let valid_entry =
+            herder
+                .scp_driver
+                .check_tx_set_valid_cached(&Hash256::ZERO, tx_set.hash(), 0);
+        assert_eq!(
+            valid_entry,
+            Some(true),
+            "validity cache must contain true for accepted tx set \
+             (parity: stellar-core cacheValidTxSet)"
         );
     }
 
