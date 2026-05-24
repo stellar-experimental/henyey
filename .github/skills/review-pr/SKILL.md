@@ -33,20 +33,151 @@ You do **not** review the code yourself — you orchestrate two independent revi
 
 ## Step 0 — Find the PR
 
+Source the shared merge helper for linked-PR state classification and merge execution:
+
 ```bash
-# Use raw GraphQL — `gh issue view --json closedByPullRequestsReferences` silently
-# omits the `state` subfield, so `select(.state == "OPEN")` would never match and
-# PR_NUM would always be empty even when an OPEN PR exists.
-PR_NUM=$(gh api graphql -f query='{
-  repository(owner: "stellar-experimental", name: "henyey") {
-    issue(number: '"$ISSUE"') {
-      closedByPullRequestsReferences(first: 5) { nodes { number state } }
-    }
-  }
-}' --jq '.data.repository.issue.closedByPullRequestsReferences.nodes | map(select(.state == "OPEN")) | .[0].number // empty')
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+source "$REPO_ROOT/scripts/lib/review-pr-merge.sh"
 ```
 
-If `PR_NUM` is empty, the issue is in `in-review` but has no open PR — that's a bug in `/do`. Post `## Review: No PR Linked` and move the issue back to `ready-for-doing`. Unassign. Exit.
+Classify the linked PR state (distinguishes OPEN, MERGED, and CLOSED-without-merge):
+
+```bash
+if ! PR_STATE=$(classify_linked_pr_state $ISSUE); then
+  # API failure — retry once, then block
+  sleep 5
+  if ! PR_STATE=$(classify_linked_pr_state $ISSUE); then
+    echo "## Review: API Failure" && exit 1
+  fi
+fi
+```
+
+Extract `PR_NUM` and route based on state:
+
+```bash
+case "$PR_STATE" in
+  open:*)
+    PR_NUM="${PR_STATE#open:}"
+    # Proceed to Step 0.5
+    ;;
+  merged:*)
+    PR_NUM="${PR_STATE#merged:}"
+    # PR already merged — recover merge SHA and follow-up issues, then finalize
+    MERGE_SHA=$(gh pr view "$PR_NUM" --repo stellar-experimental/henyey \
+      --json mergeCommit --jq '.mergeCommit.oid')
+    # Recover previously filed follow-up issue numbers from the armed comment
+    FOLLOWUP_ISSUES=$(gh pr view "$PR_NUM" --repo stellar-experimental/henyey \
+      --json comments --jq '
+        [.comments[].body
+         | select(contains("## Review: Auto-merge armed"))
+         | capture("Follow-up issues filed:\\*\\* (?<nums>[^\n]+)"; "g") | .nums]
+        | last // "none"')
+    # Run Step 7.4 cleanup/done path with recovered metadata and exit
+    ;;
+  closed:*)
+    # PR was closed without merge — bug in /do
+    # Post ## Review: No PR Linked, move to ready-for-doing, unassign, exit
+    ;;
+  missing)
+    # No linked PRs — same handling as closed
+    ;;
+esac
+```
+
+Handle each state:
+
+- **`open:<number>`** → `PR_NUM` extracted above; proceed to Step 0.5.
+- **`merged:<number>`** → the PR was already merged (e.g. by a previous `/review-pr` tick that armed auto-merge and GH completed it). Recover the merge SHA via `gh pr view <number> --json mergeCommit --jq '.mergeCommit.oid'` and follow-up issue numbers from the `## Review: Auto-merge armed` comment body. Run the Step 7.4 cleanup/done path and exit.
+- **`closed:<number>`** → PR was closed without merge. That's a bug in `/do`. Post `## Review: No PR Linked` and move the issue back to `ready-for-doing`. Unassign. Exit.
+- **`missing`** → no linked PRs at all. Same handling as `closed`.
+- **`error:<message>`** → API failure. Retry once after 5s; if still failing, leave assigned and exit non-zero.
+
+### Step 0.5 — Check if auto-merge is already armed
+
+Before spawning reviewers or filing follow-up issues, check whether this PR already has auto-merge enabled from a previous tick:
+
+```bash
+if ! AUTO_MERGE_STATE=$(is_auto_merge_armed $PR_NUM); then
+  # API failure checking auto-merge state — safe to proceed with normal review
+  # since worst case is a redundant reviewer run. Log the issue.
+  echo "Warning: could not check auto-merge state (API failure)" >&2
+elif [[ "$AUTO_MERGE_STATE" == "true" ]]; then
+  # PR is OPEN and auto-merge is armed. Before short-circuiting, verify that
+  # CI is healthy — if CI went red or stuck while waiting, we must bounce or
+  # block rather than wait indefinitely.
+  ARMED_HEALTH=$(check_armed_pr_health $PR_NUM) || ARMED_HEALTH="error"
+  case "$ARMED_HEALTH" in
+    healthy)
+      # CI green or still running within budget. Don't re-run reviewers or
+      # re-file follow-up issues — just ensure a waiting comment exists and exit.
+      ALREADY_COMMENTED=$(has_armed_waiting_comment $PR_NUM)
+      if [[ "$ALREADY_COMMENTED" != "true" ]]; then
+        gh pr comment $PR_NUM --repo stellar-experimental/henyey \
+          --body "## Review: Auto-merge armed — waiting
+
+Auto-merge was previously enabled on this PR. GitHub will merge automatically once all branch protection checks pass. Re-picking on next tick to verify completion.
+
+CI state: healthy. Next check on next tick."
+      fi
+      gh issue edit $ISSUE --repo stellar-experimental/henyey --remove-assignee @me
+      exit 0
+      ;;
+    ci-red)
+      # CI failed while auto-merge was armed. GitHub won't merge it. Cancel
+      # auto-merge and bounce to /do for investigation.
+      gh pr merge $PR_NUM --repo stellar-experimental/henyey --disable-auto
+      gh pr comment $PR_NUM --repo stellar-experimental/henyey \
+        --body "## Review: Auto-merge cancelled — CI red
+
+Auto-merge was armed but CI has failures. Disabling auto-merge and bouncing back to \`/do\` for investigation."
+      bash .github/skills/shared/scripts/move-issue-status.sh $ISSUE ready-for-doing
+      gh issue edit $ISSUE --repo stellar-experimental/henyey --remove-assignee @me
+      exit 0
+      ;;
+    ci-stuck)
+      # CI running but exceeded wall-clock budget. Block.
+      gh pr merge $PR_NUM --repo stellar-experimental/henyey --disable-auto
+      gh pr comment $PR_NUM --repo stellar-experimental/henyey \
+        --body "## Review: Auto-merge cancelled — CI stuck
+
+Auto-merge was armed but CI has been running past the stuck threshold. Blocking for operator investigation."
+      bash .github/skills/shared/scripts/move-issue-status.sh $ISSUE blocked
+      gh issue edit $ISSUE --repo stellar-experimental/henyey --remove-assignee @me
+      exit 0
+      ;;
+    not-mergeable)
+      # PR has merge conflicts. Cancel auto-merge and bounce.
+      gh pr merge $PR_NUM --repo stellar-experimental/henyey --disable-auto
+      gh pr comment $PR_NUM --repo stellar-experimental/henyey \
+        --body "## Review: Auto-merge cancelled — merge conflicts
+
+Auto-merge was armed but the PR now has merge conflicts. Bouncing back to \`/do\` for rebase."
+      bash .github/skills/shared/scripts/move-issue-status.sh $ISSUE ready-for-doing
+      gh issue edit $ISSUE --repo stellar-experimental/henyey --remove-assignee @me
+      exit 0
+      ;;
+    no-ci)
+      # No CI checks detected — cannot treat as green. This may indicate a
+      # workflow misconfiguration, disabled Actions, or permissions issue.
+      # Block for operator investigation.
+      gh pr merge $PR_NUM --repo stellar-experimental/henyey --disable-auto
+      gh pr comment $PR_NUM --repo stellar-experimental/henyey \
+        --body "## Review: Auto-merge cancelled — no CI detected
+
+Auto-merge was armed but no CI checks are present on this PR. This may indicate a workflow misconfiguration or disabled Actions. Blocking for operator investigation."
+      bash .github/skills/shared/scripts/move-issue-status.sh $ISSUE blocked
+      gh issue edit $ISSUE --repo stellar-experimental/henyey --remove-assignee @me
+      exit 0
+      ;;
+    error)
+      # Could not check health — proceed with normal review as a safe fallback.
+      echo "Warning: could not check armed PR health (API failure), proceeding with full review" >&2
+      ;;
+  esac
+fi
+```
+
+This short-circuit prevents duplicate reviewer runs and duplicate follow-up issue filing on subsequent ticks while waiting for GitHub to complete the deferred merge. The `has_armed_waiting_comment` check ensures idempotency: if a waiting comment was already posted on a previous tick, no duplicate is created. Critically, it still checks CI state on every tick — if CI goes red or gets stuck while auto-merge is armed, the skill cancels auto-merge and routes the issue appropriately rather than waiting indefinitely.
 
 ## Step 1 — Read the PR + CI state
 
@@ -329,8 +460,15 @@ elif [ "$(echo "$ROLLUP" | jq '[.[] | select(
        or (.status == null and (.state | ascii_upcase) == "PENDING")
      )] | length')" -gt 0 ]; then
   CI_STATE="running"
-else
+elif [ "$(echo "$ROLLUP" | jq '[.[] | select(
+       ((.conclusion // "") | ascii_upcase) as $c |
+       $c == "SUCCESS" or $c == "SKIPPED" or $c == "NEUTRAL"
+       or ((.state // "") | ascii_upcase) == "SUCCESS"
+     )] | length')" -eq "$CI_TOTAL" ]; then
   CI_STATE="green"
+else
+  # Unexpected conclusions (ACTION_REQUIRED, STARTUP_FAILURE, etc.) — treat as red
+  CI_STATE="red"
 fi
 ```
 
@@ -560,11 +698,39 @@ Collect the list of newly-filed issue numbers — they'll be referenced in the m
 
 #### 7.3 Merge
 
+Use the shared merge helper which handles the deferred-merge path. The helper
+requires `REVIEW_PR_SCRATCH_DIR` to be set to a session-scoped directory under
+the workspace contract (all scratch state under `~/data/$SESSION_ID/review-pr-$ISSUE/`):
+
 ```bash
-gh pr merge $PR_NUM --repo stellar-experimental/henyey --squash --admin
+# Derive scratch dir from the workspace contract. review_pr_bootstrap exports
+# WORKTREE_BASE = ~/data/$SESSION_ID/review-pr-$ISSUE — reuse it for merge scratch.
+export REVIEW_PR_SCRATCH_DIR="${WORKTREE_BASE:-$(eval echo "~$(id -un)")/data/${SESSION_ID:-$(date +%Y%m%d-%H%M%S)}/review-pr-$ISSUE}"
+mkdir -p "$REVIEW_PR_SCRATCH_DIR"
+
+if ! MERGE_RESULT=$(attempt_merge $PR_NUM); then
+  MERGE_RESULT="hard-failure:attempt_merge returned nonzero"
+fi
 ```
 
-The `--admin` flag means the agent must be authenticated as a repo admin. If your token doesn't have admin, the merge will fail — at which point operator intervention is needed (file a follow-up issue documenting the merge-permission gap; do NOT downgrade to non-admin merge that might silently bypass CI).
+Handle the result:
+
+- **`merged`** → immediate merge succeeded. Proceed to Step 7.4 cleanup.
+- **`auto-merge-armed`** → GitHub cannot create the merge commit cleanly right now but will merge automatically once conditions are met. Post a waiting comment recording the follow-up issue numbers filed in Step 7.2:
+
+  ```markdown
+  ## Review: Auto-merge armed
+
+  Enabled deferred auto-merge (squash). GitHub will merge once branch protection checks pass.
+
+  **Follow-up issues filed:** #N1, #N2 (or "none")
+
+  Re-picking on next tick to verify merge completion.
+  ```
+
+  Unassign and exit. The next `/review-pr` tick will detect the `MERGED` state via `classify_linked_pr_state` and run cleanup, or detect `OPEN + armed` via `is_auto_merge_armed` and short-circuit to waiting.
+
+- **`hard-failure:<stderr>`** → merge failed for a reason other than the auto-merge hint. Leave the issue in `in-review`; file a follow-up issue documenting the merge-permission gap; do NOT downgrade to non-admin merge that might silently bypass CI. Post `## Review: Merge Failed` with the stderr content.
 
 #### 7.4 Clean up
 
@@ -792,7 +958,8 @@ Exit.
 | Reviewer sub-agent fails to post | Retry once. If still failing, treat as `CHANGES_REQUESTED` and bounce. |
 | Reviewer's comment doesn't match the expected header/verdict shape | Treat as `pending`; if it stays malformed after Step 4 completes, bounce with a `## Review: Malformed Verdict` note. |
 | No PR linked | Bounce to `ready-for-doing` with `## Review: No PR Linked`. |
-| `gh pr merge --admin` fails (token lacks admin) | Leave the issue in `in-review`; file a follow-up issue documenting the gap; do NOT degrade to a non-admin merge that might bypass CI gates. |
+| `gh pr merge --admin` fails with auto-merge hint | Retry with `--auto` (deferred merge). If `--auto` also fails, hard failure. See Step 7.3. |
+| `gh pr merge --admin` fails (other error, e.g. token lacks admin) | Leave the issue in `in-review`; file a follow-up issue documenting the gap; do NOT degrade to a non-admin merge that might bypass CI gates. |
 | GH API failure | Retry once after 5s; if still failing, leave assigned and exit non-zero. |
 
 ## Workspace contract
