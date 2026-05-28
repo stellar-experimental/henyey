@@ -4036,12 +4036,12 @@ mod scp_history_persistence_ordering_tests {
         NodeId(PublicKey::PublicKeyTypeEd25519(Uint256(bytes)))
     }
 
-    fn make_externalize_envelope(node_seed: u8, qset_hash: Hash) -> ScpEnvelope {
+    fn make_externalize_envelope(node_seed: u8, slot_index: u64, qset_hash: Hash) -> ScpEnvelope {
         let node_id = make_node_id(node_seed);
         ScpEnvelope {
             statement: ScpStatement {
                 node_id,
-                slot_index: 0, // overridden by injection
+                slot_index,
                 pledges: ScpStatementPledges::Externalize(ScpStatementExternalize {
                     commit: ScpBallot {
                         counter: 1,
@@ -4171,8 +4171,8 @@ mod scp_history_persistence_ordering_tests {
             .test_store_quorum_set(&node_curr, qset_curr.clone());
 
         // Inject EXTERNALIZE envelopes for slots 9 (previous) and 10 (current).
-        let env_prev = make_externalize_envelope(0xAA, qset_prev_xdr_hash);
-        let env_curr = make_externalize_envelope(0xBB, qset_curr_xdr_hash);
+        let env_prev = make_externalize_envelope(0xAA, 9, qset_prev_xdr_hash);
+        let env_curr = make_externalize_envelope(0xBB, 10, qset_curr_xdr_hash);
         herder.test_inject_externalizing_envelope(9, env_prev);
         herder.test_inject_externalizing_envelope(10, env_curr);
 
@@ -4210,8 +4210,16 @@ mod scp_history_persistence_ordering_tests {
         // iterates scp_history_batches in order, so N-1 is written first).
         let loaded_prev = db.with_connection(|c| c.load_scp_history(9)).unwrap();
         assert_eq!(loaded_prev.len(), 1, "previous slot should have 1 envelope");
+        assert_eq!(
+            loaded_prev[0].statement.slot_index, 9,
+            "persisted envelope must carry correct slot_index for previous slot"
+        );
         let loaded_curr = db.with_connection(|c| c.load_scp_history(10)).unwrap();
         assert_eq!(loaded_curr.len(), 1, "current slot should have 1 envelope");
+        assert_eq!(
+            loaded_curr[0].statement.slot_index, 10,
+            "persisted envelope must carry correct slot_index for current slot"
+        );
 
         // (2) Verify previous-slot quorum set is persisted.
         let prev_qs = db
@@ -4257,7 +4265,7 @@ mod scp_history_persistence_ordering_tests {
             .scp_driver()
             .test_store_quorum_set(&node, qset.clone());
 
-        let env = make_externalize_envelope(0xAA, xdr_hash);
+        let env = make_externalize_envelope(0xAA, 1, xdr_hash);
         herder.test_inject_externalizing_envelope(1, env);
 
         // Slot 1 — no previous slot to persist.
@@ -4274,6 +4282,10 @@ mod scp_history_persistence_ordering_tests {
 
         let loaded = db.with_connection(|c| c.load_scp_history(1)).unwrap();
         assert_eq!(loaded.len(), 1, "slot 1 should have 1 envelope");
+        assert_eq!(
+            loaded[0].statement.slot_index, 1,
+            "persisted envelope must carry correct slot_index for slot 1"
+        );
 
         let qs = db
             .with_connection(|c| c.load_scp_quorum_set(&qset_hash))
@@ -4302,7 +4314,7 @@ mod scp_history_persistence_ordering_tests {
             .test_store_quorum_set(&node, qset.clone());
 
         // Only inject current slot (10), not previous (9).
-        let env = make_externalize_envelope(0xAA, xdr_hash);
+        let env = make_externalize_envelope(0xAA, 10, xdr_hash);
         herder.test_inject_externalizing_envelope(10, env);
 
         let batches = super::build_scp_history_batches(&herder, 10);
@@ -4323,6 +4335,10 @@ mod scp_history_persistence_ordering_tests {
         );
         let loaded_curr = db.with_connection(|c| c.load_scp_history(10)).unwrap();
         assert_eq!(loaded_curr.len(), 1, "current slot should have 1 envelope");
+        assert_eq!(
+            loaded_curr[0].statement.slot_index, 10,
+            "persisted envelope must carry correct slot_index for current slot"
+        );
     }
 
     /// Verifies the ordering guarantee: in the production `serialize_and_write_to_db()`
@@ -4353,11 +4369,13 @@ mod scp_history_persistence_ordering_tests {
             .scp_driver()
             .test_store_quorum_set(&node_curr, qset_curr.clone());
 
-        herder
-            .test_inject_externalizing_envelope(99, make_externalize_envelope(0xAA, prev_xdr_hash));
+        herder.test_inject_externalizing_envelope(
+            99,
+            make_externalize_envelope(0xAA, 99, prev_xdr_hash),
+        );
         herder.test_inject_externalizing_envelope(
             100,
-            make_externalize_envelope(0xBB, curr_xdr_hash),
+            make_externalize_envelope(0xBB, 100, curr_xdr_hash),
         );
 
         let batches = super::build_scp_history_batches(&herder, 100);
@@ -4372,11 +4390,19 @@ mod scp_history_persistence_ordering_tests {
             .serialize_and_write_to_db(&db)
             .expect("serialize_and_write_to_db must succeed");
 
-        // Both slots persisted correctly.
+        // Both slots persisted correctly with correct slot_index.
         let loaded_prev = db.with_connection(|c| c.load_scp_history(99)).unwrap();
         assert_eq!(loaded_prev.len(), 1, "previous slot should have 1 envelope");
+        assert_eq!(
+            loaded_prev[0].statement.slot_index, 99,
+            "persisted envelope must carry correct slot_index for previous slot"
+        );
         let loaded_curr = db.with_connection(|c| c.load_scp_history(100)).unwrap();
         assert_eq!(loaded_curr.len(), 1, "current slot should have 1 envelope");
+        assert_eq!(
+            loaded_curr[0].statement.slot_index, 100,
+            "persisted envelope must carry correct slot_index for current slot"
+        );
 
         // Quorum sets for both slots.
         let prev_qs = db

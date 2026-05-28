@@ -29,7 +29,7 @@ excluded. SHOULD claims and operational defaults excluded.
 | §5.2 | ctValidityOffset abort on far-ahead clock | Drift | guarded only by `>= UNIX_EPOCH` + monotonic clamp |
 | §5.2 | Cache tx set valid + ban invalid | Full | herder.rs:3054 + tx_set_tracker.rs |
 | §5.2 | Drop oversized upgrades | Full | herder.rs:3155-3172 |
-| §5.2 | Non-validator builds + caches | Partial | trigger_next_ledger requires is_validator |
+| §5.2 | Non-validator builds + caches | Full | lifecycle.rs: watchers also call try_trigger_consensus for tx-set build/cache |
 | §5.3 | Externalize handler (Latest vs Older) | Full | scp_driver.rs:value_externalized → herder.rs |
 | §5.3 | SCP history persistence ordering | Full | ledger_close.rs: ordered ScpHistoryBatch (prev slot N-1 first, then N) via get_scp_externalizing_state |
 | §5.4 | computeTimeout formula | Full | scp_driver.rs:3709-3735 |
