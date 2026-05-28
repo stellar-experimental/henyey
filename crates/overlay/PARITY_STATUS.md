@@ -2,8 +2,8 @@
 
 **Crate**: `henyey-overlay`
 **Upstream**: `stellar-core/src/overlay/`
-**Overall Parity**: 92%
-**Last Updated**: 2026-04-27
+**Overall Parity**: 91%
+**Last Updated**: 2026-05-28
 
 ## Summary
 
@@ -547,7 +547,7 @@ Features not yet implemented. These ARE counted against parity %.
 
 | Category | Count |
 |----------|-------|
-| Implemented (Full) | 259 |
-| Gaps (None + Partial) | 24 |
+| Implemented (Full) | 258 |
+| Gaps (None + Partial) | 25 |
 | Intentional Omissions | 10 |
-| **Parity** | **259 / (259 + 24) = 92%** |
+| **Parity** | **258 / (258 + 25) = 91%** |
