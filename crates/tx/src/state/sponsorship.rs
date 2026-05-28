@@ -236,7 +236,8 @@ impl LedgerStateManager {
         sponsored: &AccountId,
         multiplier: i64,
     ) -> Result<Option<AccountId>> {
-        if self.entry_sponsor(key).is_none() {
+        let phase1_sponsor = self.entry_sponsor(key);
+        if phase1_sponsor.is_none() {
             return Ok(None);
         }
         if multiplier < 0 {
@@ -246,9 +247,9 @@ impl LedgerStateManager {
         }
         // Validate before any mutation.
         self.validate_can_remove_sponsorship(key, Some(sponsored), multiplier)?;
-        let sponsor = self
-            .remove_entry_sponsor(key)
-            .expect("sponsor verified present");
+        // Use Phase-1 captured sponsor for count updates (issue #2900).
+        let sponsor = phase1_sponsor.unwrap();
+        self.remove_entry_sponsor(key);
         self.update_num_sponsoring(&sponsor, -multiplier)?;
         self.update_num_sponsored(sponsored, -multiplier)?;
         Ok(Some(sponsor))
@@ -263,7 +264,8 @@ impl LedgerStateManager {
         sponsored: Option<&AccountId>,
         multiplier: i64,
     ) -> Result<Option<AccountId>> {
-        if self.entry_sponsor(key).is_none() {
+        let phase1_sponsor = self.entry_sponsor(key);
+        if phase1_sponsor.is_none() {
             return Ok(None);
         }
         if multiplier < 0 {
@@ -273,9 +275,9 @@ impl LedgerStateManager {
         }
         // Validate before any mutation.
         self.validate_can_remove_sponsorship(key, sponsored, multiplier)?;
-        let sponsor = self
-            .remove_entry_sponsor(key)
-            .expect("sponsor verified present");
+        // Use Phase-1 captured sponsor for count updates (issue #2900).
+        let sponsor = phase1_sponsor.unwrap();
+        self.remove_entry_sponsor(key);
         self.update_num_sponsoring(&sponsor, -multiplier)?;
         if let Some(sponsored) = sponsored {
             self.update_num_sponsored(sponsored, -multiplier)?;
@@ -343,11 +345,12 @@ impl LedgerStateManager {
 
         // ── Phase 1: validate ────────────────────────────────────────
         //
-        // Load the sponsored account explicitly. `validate_can_remove_sponsorship`
-        // only loads it when there *is* a sponsor; we need it loaded
-        // unconditionally because Phase 2 unconditionally decrements
-        // `num_sub_entries` on it.
+        // Capture the sponsor identity once. This snapshot is the single
+        // source of truth for Phase 2 — no second lookup is performed.
+        // (Fixes issue #2900: remove_entry_sponsorship could previously
+        // return None for offer keys with stale fallback entries.)
         self.ensure_account_loaded(sponsored)?;
+        let phase1_sponsor = self.entry_sponsor(key);
         self.validate_can_remove_sponsorship(key, Some(sponsored), multiplier)?;
 
         // ── Phase 2: mutate (infallible — direct field writes) ───────
@@ -359,11 +362,10 @@ impl LedgerStateManager {
             .expect("sponsored account loaded in Phase 1");
         henyey_common::checked_types::dec_sub_entries(acc, multiplier as u32);
 
-        // (b) If sponsored, clear metadata and decrement counts.
-        if self.entry_sponsor(key).is_some() {
-            let sponsor = self
-                .remove_entry_sponsor(key)
-                .expect("sponsor verified present in Phase 1");
+        // (b) If sponsored, clear metadata and decrement counts using
+        //     the Phase-1 captured sponsor identity.
+        if let Some(sponsor) = phase1_sponsor {
+            self.remove_entry_sponsor(key);
 
             let sponsor_acc = self
                 .get_account_mut(&sponsor)
@@ -456,10 +458,8 @@ impl LedgerStateManager {
         self.validate_can_remove_sponsorship(&key, Some(source), multiplier)?;
 
         // Phase 2: mutate (direct field writes — preconditions verified).
-        let sponsor_removed = self
-            .remove_entry_sponsor(&key)
-            .expect("sponsor verified present in Phase 1");
-        debug_assert_eq!(sponsor_removed, sponsor);
+        // Use Phase-1 captured `sponsor` for count updates (issue #2900).
+        self.remove_entry_sponsor(&key);
 
         let sponsor_acc = self
             .get_account_mut(&sponsor)
@@ -504,16 +504,15 @@ impl LedgerStateManager {
                 "negative sponsorship multiplier".to_string(),
             ));
         }
-        if self.entry_sponsor(key).is_none() {
+        // Phase 1: capture sponsor and validate.
+        let phase1_sponsor = self.entry_sponsor(key);
+        let Some(sponsor) = phase1_sponsor else {
             return Ok(()); // No sponsor — nothing to validate or decrement.
-        }
-        // Phase 1: validate (loads sponsor, verifies num_sponsoring >= multiplier).
+        };
         self.validate_can_remove_sponsorship(key, None, multiplier)?;
 
-        // Phase 2: mutate (direct field writes — preconditions verified).
-        let sponsor = self
-            .remove_entry_sponsor(key)
-            .expect("sponsor verified present in Phase 1");
+        // Phase 2: mutate using Phase-1 captured sponsor (issue #2900).
+        self.remove_entry_sponsor(key);
         let sponsor_acc = self
             .get_account_mut(&sponsor)
             .expect("sponsor account loaded by validate_can_remove_sponsorship");
