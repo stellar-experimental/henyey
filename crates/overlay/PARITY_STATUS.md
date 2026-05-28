@@ -354,7 +354,7 @@ Corresponds to: `OverlayManager.h`, `OverlayManagerImpl.h`
 | `checkScheduledAndCache()` | `ScpScheduledCache` in henyey-app with RAII token lifetime (#2631) | Full |
 | `getOverlayThreadSnapshot()` | N/A | None |
 | `tick()` | `start_tick_loop()` (3s interval) | Full |
-| `updateTimerAndMaybeDropRandomPeer()` | `maybe_drop_random_peer()` | Full |
+| `updateTimerAndMaybeDropRandomPeer()` | `maybe_drop_random_peer()` | Partial |
 | `storeConfigPeers()` | In `start()` — stores known+preferred peers | Full |
 | `purgeDeadPeers()` | App layer `maintain_peers()` — `remove_peers_with_failures(120)` | Full |
 | `triggerPeerResolution()` | DNS backoff in tick loop | Full |
