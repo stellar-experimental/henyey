@@ -353,7 +353,13 @@ impl LedgerStateManager {
                 let offer_key = OfferKey::new(ok.seller_id.clone(), ok.offer_id);
                 let mut store = self.offer_store_lock();
                 if let Some(record) = store.get_mut(&offer_key) {
-                    record.sponsor.take()
+                    let from_record = record.sponsor.take();
+                    drop(store);
+                    // Also check fallback map — a stale entry can exist after
+                    // rollback restores sponsorship while the offer record
+                    // already exists in the store (issue #2900).
+                    let from_fallback = self.entry_sponsorships.remove(key);
+                    from_record.or(from_fallback)
                 } else {
                     // Check fallback map (sponsorship set before offer existed).
                     drop(store);
