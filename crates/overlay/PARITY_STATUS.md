@@ -353,7 +353,7 @@ Corresponds to: `OverlayManager.h`, `OverlayManagerImpl.h`
 | `getFlowControlBytesBatch()` | `FlowControlBytesConfig::bytes_batch()` | Full |
 | `checkScheduledAndCache()` | `ScpScheduledCache` in henyey-app with RAII token lifetime (#2631) | Full |
 | `getOverlayThreadSnapshot()` | N/A | None |
-| `tick()` | `start_tick_loop()` (3s interval) | Full |
+| `tick()` | `start_tick_loop()` (3s interval) | Partial — calls `maybe_drop_random_peer()` unconditionally each tick; upstream gates on `availableOutboundPendingSlots() == 0` before invoking `updateTimerAndMaybeDropRandomPeer()` |
 | `updateTimerAndMaybeDropRandomPeer()` | `maybe_drop_random_peer()` | Partial |
 | `storeConfigPeers()` | In `start()` — stores known+preferred peers | Full |
 | `purgeDeadPeers()` | App layer `maintain_peers()` — `remove_peers_with_failures(120)` | Full |
@@ -547,7 +547,7 @@ Features not yet implemented. These ARE counted against parity %.
 
 | Category | Count |
 |----------|-------|
-| Implemented (Full) | 258 |
-| Gaps (None + Partial) | 25 |
+| Implemented (Full) | 257 |
+| Gaps (None + Partial) | 26 |
 | Intentional Omissions | 10 |
-| **Parity** | **258 / (258 + 25) = 91%** |
+| **Parity** | **257 / (257 + 26) = 91%** |
