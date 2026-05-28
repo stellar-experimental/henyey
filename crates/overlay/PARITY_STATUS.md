@@ -2,8 +2,8 @@
 
 **Crate**: `henyey-overlay`
 **Upstream**: `stellar-core/src/overlay/`
-**Overall Parity**: 92%
-**Last Updated**: 2026-04-27
+**Overall Parity**: 91%
+**Last Updated**: 2026-05-28
 
 ## Summary
 
@@ -353,8 +353,8 @@ Corresponds to: `OverlayManager.h`, `OverlayManagerImpl.h`
 | `getFlowControlBytesBatch()` | `FlowControlBytesConfig::bytes_batch()` | Full |
 | `checkScheduledAndCache()` | `ScpScheduledCache` in henyey-app with RAII token lifetime (#2631) | Full |
 | `getOverlayThreadSnapshot()` | N/A | None |
-| `tick()` | `start_tick_loop()` (3s interval) | Full |
-| `updateTimerAndMaybeDropRandomPeer()` | `maybe_drop_random_peer()` | Full |
+| `tick()` | `start_tick_loop()` (3s interval) | Partial — calls `maybe_drop_random_peer()` unconditionally each tick; upstream only enters the random-drop path when `availableOutboundPendingSlots() > 0` (i.e. pending slots are available), skipping `updateTimerAndMaybeDropRandomPeer()` entirely when pending slots are exhausted |
+| `updateTimerAndMaybeDropRandomPeer()` | `maybe_drop_random_peer()` | Partial |
 | `storeConfigPeers()` | In `start()` — stores known+preferred peers | Full |
 | `purgeDeadPeers()` | App layer `maintain_peers()` — `remove_peers_with_failures(120)` | Full |
 | `triggerPeerResolution()` | DNS backoff in tick loop | Full |
@@ -547,7 +547,7 @@ Features not yet implemented. These ARE counted against parity %.
 
 | Category | Count |
 |----------|-------|
-| Implemented (Full) | 259 |
-| Gaps (None + Partial) | 24 |
+| Implemented (Full) | 257 |
+| Gaps (None + Partial) | 26 |
 | Intentional Omissions | 10 |
-| **Parity** | **259 / (259 + 24) = 92%** |
+| **Parity** | **257 / (257 + 26) = 91%** |
