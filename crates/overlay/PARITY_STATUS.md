@@ -353,7 +353,7 @@ Corresponds to: `OverlayManager.h`, `OverlayManagerImpl.h`
 | `getFlowControlBytesBatch()` | `FlowControlBytesConfig::bytes_batch()` | Full |
 | `checkScheduledAndCache()` | `ScpScheduledCache` in henyey-app with RAII token lifetime (#2631) | Full |
 | `getOverlayThreadSnapshot()` | N/A | None |
-| `tick()` | `start_tick_loop()` (3s interval) | Partial — calls `maybe_drop_random_peer()` unconditionally each tick; upstream gates on `availableOutboundPendingSlots() == 0` before invoking `updateTimerAndMaybeDropRandomPeer()` |
+| `tick()` | `start_tick_loop()` (3s interval) | Partial — calls `maybe_drop_random_peer()` unconditionally each tick; upstream only enters the random-drop path when `availableOutboundPendingSlots() > 0` (i.e. pending slots are available), skipping `updateTimerAndMaybeDropRandomPeer()` entirely when pending slots are exhausted |
 | `updateTimerAndMaybeDropRandomPeer()` | `maybe_drop_random_peer()` | Partial |
 | `storeConfigPeers()` | In `start()` — stores known+preferred peers | Full |
 | `purgeDeadPeers()` | App layer `maintain_peers()` — `remove_peers_with_failures(120)` | Full |
