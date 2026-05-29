@@ -3740,6 +3740,16 @@ impl Herder {
         self.scp_driver.needs_tx_set(hash)
     }
 
+    /// Count tx-set backlog (cached + pending) in the active catchup window.
+    /// Used by app-side scheduling to bound outbound `GetTxSet` demand.
+    pub fn tx_set_backlog_in_window(&self, from_slot: u64, to_slot: u64) -> usize {
+        let cached = self.scp_driver.cached_tx_sets_in_window(from_slot, to_slot);
+        let pending = self
+            .scp_driver
+            .pending_tx_sets_in_window(from_slot, to_slot);
+        cached + pending
+    }
+
     /// Receive a transaction set from the network.
     /// Returns the slot it was needed for, if any.
     ///

@@ -927,11 +927,29 @@ impl App {
             );
         }
 
+        // Compute active-window backlog budget: cached + pending tx sets in
+        // the window plus fetch_channel_depth (in-flight overlay responses).
+        let window_backlog = self.herder.tx_set_backlog_in_window(min_slot, window_end);
+        let fetch_depth = self.fetch_channel_depth.load(Ordering::Relaxed).max(0) as usize;
+        let current_load = window_backlog + fetch_depth;
+        let remaining_budget = TX_SET_ACTIVE_WINDOW_BUDGET.saturating_sub(current_load);
+
+        if remaining_budget == 0 {
+            tracing::debug!(
+                current_load,
+                window_backlog,
+                fetch_depth,
+                budget = TX_SET_ACTIVE_WINDOW_BUDGET,
+                "Pausing tx_set requests: active window backlog budget full"
+            );
+            return;
+        }
+
         let pending_hashes: Vec<Hash256> = pending
             .into_iter()
             .filter(|(_, slot)| *slot >= min_slot && *slot <= window_end)
             .map(|(hash, _)| hash)
-            .take(MAX_TX_SET_REQUESTS_PER_TICK)
+            .take(MAX_TX_SET_REQUESTS_PER_TICK.min(remaining_budget))
             .collect();
         if pending_hashes.is_empty() {
             return;
@@ -1146,6 +1164,19 @@ impl App {
         };
         let min_slot = current_ledger.saturating_add(1) as u64;
         let window_end = current_ledger as u64 + TX_SET_REQUEST_WINDOW;
+
+        // Check active-window backlog budget before retrying
+        let window_backlog = self.herder.tx_set_backlog_in_window(min_slot, window_end);
+        let fetch_depth = self.fetch_channel_depth.load(Ordering::Relaxed).max(0) as usize;
+        let current_load = window_backlog + fetch_depth;
+        if current_load >= TX_SET_ACTIVE_WINDOW_BUDGET {
+            tracing::debug!(
+                current_load,
+                budget = TX_SET_ACTIVE_WINDOW_BUDGET,
+                "Skipping tx_set retry: active window backlog budget full"
+            );
+            return;
+        }
 
         let pending = self.herder.get_pending_tx_sets();
         let pending_hashes: Vec<Hash256> = pending

@@ -155,6 +155,14 @@ const TX_SUBMISSION_MAX_BEHIND: u64 = 2;
 /// the requests and treat as if all peers said DontHave.
 const TX_SET_REQUEST_TIMEOUT_SECS: u64 = 10;
 
+/// Maximum tx-set backlog budget for the active catchup window.
+/// When cached + pending + fetch_channel_depth tx sets in
+/// `[current_ledger + 1, current_ledger + TX_SET_REQUEST_WINDOW]` reaches
+/// this limit, `request_pending_tx_sets()` pauses new `GetTxSet` sends.
+/// Set to `2 * TX_SET_REQUEST_WINDOW` to allow some pipelining while
+/// preventing unbounded memory growth during long-gap catchup.
+const TX_SET_ACTIVE_WINDOW_BUDGET: usize = 24; // 2 * TX_SET_REQUEST_WINDOW
+
 /// Recovery timer for out-of-sync recovery attempts.
 /// Matches stellar-core's OUT_OF_SYNC_RECOVERY_TIMER.
 const OUT_OF_SYNC_RECOVERY_TIMER_SECS: u64 = 10;
@@ -9996,6 +10004,72 @@ mod tests {
             app.tx_set_exhausted_since_offset(),
             0,
             "should be zero after clearing"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_request_pending_tx_sets_pauses_when_active_window_backlog_budget_is_full() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-test.db");
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
+        let app = App::new(config).await.unwrap();
+
+        // Seed the ledger manager at a known ledger so current_ledger works.
+        // The App starts with ledger 0; min_slot = 1, window_end = 12.
+        // Seed pending tx-set hashes in the active window.
+        for i in 0..TX_SET_ACTIVE_WINDOW_BUDGET {
+            let hash = Hash256::from_bytes([(i + 1) as u8; 32]);
+            app.herder.scp_driver().request_tx_set(hash, (i as u64) + 1);
+        }
+
+        // All pending hashes are in the window, so pending count fills the budget.
+        // Calling request_pending_tx_sets should send NO requests.
+        app.request_pending_tx_sets().await;
+
+        // The request state map should be empty — no requests were made
+        let last_request = app.tx_set_last_request.read().await;
+        assert!(
+            last_request.is_empty(),
+            "No requests should be made when backlog budget is full, but got {} entries",
+            last_request.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_request_pending_tx_sets_uses_remaining_active_window_budget() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-test.db");
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
+        let app = App::new(config).await.unwrap();
+
+        // Start with ledger 0: min_slot = 1, window_end = 12.
+        // Fill most of the budget via fetch_channel_depth, leaving N slots.
+        let remaining = 3usize;
+        let fill_depth = TX_SET_ACTIVE_WINDOW_BUDGET - remaining;
+        app.fetch_channel_depth
+            .store(fill_depth as i64, Ordering::Relaxed);
+
+        // Seed more pending hashes than remaining budget
+        let total_pending = remaining + 5;
+        for i in 0..total_pending {
+            let hash = Hash256::from_bytes([(i + 1) as u8; 32]);
+            app.herder.scp_driver().request_tx_set(hash, (i as u64) + 1);
+        }
+
+        // request_pending_tx_sets should emit at most `remaining` requests
+        app.request_pending_tx_sets().await;
+
+        // Check how many requests were actually issued
+        let last_request = app.tx_set_last_request.read().await;
+        assert!(
+            last_request.len() <= remaining,
+            "Should emit at most {} requests but got {}",
+            remaining,
+            last_request.len()
         );
     }
 
