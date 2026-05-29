@@ -92,7 +92,14 @@ impl TxSetTracker {
         match self.pending.entry(hash) {
             dashmap::mapref::entry::Entry::Occupied(mut entry) => {
                 // Always increment — cap does not apply to existing entries.
-                entry.get_mut().request_count += 1;
+                let pending = entry.get_mut();
+                pending.request_count += 1;
+                // Propagate max slot: a later slot referencing the same hash
+                // should keep the entry alive longer during slot-based eviction
+                // (matches stellar-core's last-seen-slot semantics).
+                if slot > pending.slot {
+                    pending.slot = slot;
+                }
                 false
             }
             dashmap::mapref::entry::Entry::Vacant(entry) => {
@@ -301,9 +308,20 @@ impl TxSetTracker {
 
     /// Check if a tx set is cached, and refresh its LRU touch_seq if so.
     /// This prevents eviction of tx-sets still referenced by buffered envelopes.
+    #[cfg(test)]
     pub fn is_cached_and_touch(&self, hash: &Hash256) -> bool {
+        self.is_cached_and_touch_slot(hash, None)
+    }
+
+    /// Check if a tx set is cached, refresh its LRU touch_seq, and optionally
+    /// propagate `slot` to `max(current, new)` — matching stellar-core's
+    /// last-seen-slot semantics (`touchFetchCache` / `getKnownTxSet`).
+    pub fn is_cached_and_touch_slot(&self, hash: &Hash256, slot: Option<u64>) -> bool {
         if let Some(mut entry) = self.cache.get_mut(hash) {
             entry.touch_seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
+            if let Some(new_slot) = slot {
+                entry.slot = Some(entry.slot.map_or(new_slot, |s| s.max(new_slot)));
+            }
             true
         } else {
             false
@@ -1330,5 +1348,47 @@ mod tests {
         assert_eq!(tracker.cached_count_in_window(50, 150), 3);
         // Window [200, 300] should include none
         assert_eq!(tracker.cached_count_in_window(200, 300), 0);
+    }
+
+    #[test]
+    fn test_request_propagates_max_slot() {
+        let tracker = TxSetTracker::new(256);
+        let hash = Hash256::from_bytes([0xAA; 32]);
+
+        // First request at slot 10
+        assert!(tracker.request(hash, 10));
+        assert_eq!(tracker.pending.get(&hash).unwrap().slot, 10);
+
+        // Duplicate request at slot 20 — should propagate max
+        assert!(!tracker.request(hash, 20));
+        assert_eq!(tracker.pending.get(&hash).unwrap().slot, 20);
+
+        // Duplicate request at slot 5 — should NOT regress
+        assert!(!tracker.request(hash, 5));
+        assert_eq!(tracker.pending.get(&hash).unwrap().slot, 20);
+    }
+
+    #[test]
+    fn test_is_cached_and_touch_slot_propagates_max() {
+        let tracker = TxSetTracker::new(256);
+        let ts = make_tx_set(42);
+        let hash = *ts.hash();
+
+        // Request at slot 10, receive it → cached with slot=10
+        tracker.request(hash, 10);
+        tracker.receive(ts);
+        assert_eq!(tracker.cache.get(&hash).unwrap().slot, Some(10));
+
+        // Touch with slot 20 → should update to 20
+        assert!(tracker.is_cached_and_touch_slot(&hash, Some(20)));
+        assert_eq!(tracker.cache.get(&hash).unwrap().slot, Some(20));
+
+        // Touch with slot 5 → should NOT regress
+        assert!(tracker.is_cached_and_touch_slot(&hash, Some(5)));
+        assert_eq!(tracker.cache.get(&hash).unwrap().slot, Some(20));
+
+        // Touch with None → should keep 20
+        assert!(tracker.is_cached_and_touch_slot(&hash, None));
+        assert_eq!(tracker.cache.get(&hash).unwrap().slot, Some(20));
     }
 }

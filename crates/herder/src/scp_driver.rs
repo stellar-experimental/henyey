@@ -874,8 +874,9 @@ impl ScpDriver {
     /// Check if a tx set is cached AND refresh its LRU recency.
     /// Used by FetchingEnvelopes callback to prevent eviction of tx-sets
     /// still referenced by buffered envelopes waiting on other dependencies.
-    pub fn has_tx_set_and_touch(&self, hash: &Hash256) -> bool {
-        self.tx_tracker.is_cached_and_touch(hash)
+    /// Also propagates max slot for stellar-core parity (last-seen-slot).
+    pub fn has_tx_set_and_touch(&self, hash: &Hash256, slot: u64) -> bool {
+        self.tx_tracker.is_cached_and_touch_slot(hash, Some(slot))
     }
 
     /// Number of tx sets currently cached in the tracker. Test-only — used

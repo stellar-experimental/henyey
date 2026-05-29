@@ -1169,7 +1169,8 @@ impl App {
         let window_backlog = self.herder.tx_set_backlog_in_window(min_slot, window_end);
         let fetch_depth = self.fetch_channel_depth.load(Ordering::Relaxed).max(0) as usize;
         let current_load = window_backlog + fetch_depth;
-        if current_load >= TX_SET_ACTIVE_WINDOW_BUDGET {
+        let remaining_budget = TX_SET_ACTIVE_WINDOW_BUDGET.saturating_sub(current_load);
+        if remaining_budget == 0 {
             tracing::debug!(
                 current_load,
                 budget = TX_SET_ACTIVE_WINDOW_BUDGET,
@@ -1200,6 +1201,7 @@ impl App {
         let now = self.clock.now();
         const RETRY_BACKOFF: Duration = Duration::from_secs(30);
         const MAX_RETRIES_PER_TICK: usize = 4;
+        let max_retries = MAX_RETRIES_PER_TICK.min(remaining_budget);
 
         let retry_hashes = {
             let mut dont_have = self.tx_set_dont_have.write().await;
@@ -1210,7 +1212,7 @@ impl App {
             let mut to_retry = Vec::new();
 
             for hash in &pending_hashes {
-                if to_retry.len() >= MAX_RETRIES_PER_TICK {
+                if to_retry.len() >= max_retries {
                     break;
                 }
 

@@ -644,7 +644,7 @@ impl Herder {
         };
         let fetching_envelopes = FetchingEnvelopes::new(
             fetching_config,
-            Box::new(move |hash| scp_driver_for_fetching.has_tx_set_and_touch(hash)),
+            Box::new(move |hash, slot| scp_driver_for_fetching.has_tx_set_and_touch(hash, slot)),
         );
 
         // Pre-cache the local quorum set in fetching_envelopes so envelopes
@@ -3743,11 +3743,11 @@ impl Herder {
     /// Count tx-set backlog (cached + pending) in the active catchup window.
     /// Used by app-side scheduling to bound outbound `GetTxSet` demand.
     pub fn tx_set_backlog_in_window(&self, from_slot: u64, to_slot: u64) -> usize {
-        let cached = self.scp_driver.cached_tx_sets_in_window(from_slot, to_slot);
-        let pending = self
-            .scp_driver
-            .pending_tx_sets_in_window(from_slot, to_slot);
-        cached + pending
+        // Only count cached tx-sets (which consume memory) — not pending hashes
+        // (which are small metadata). Counting pending against the budget would
+        // prevent GetTxSet from ever being issued when many hashes arrive during
+        // catchup, causing a liveness deadlock.
+        self.scp_driver.cached_tx_sets_in_window(from_slot, to_slot)
     }
 
     /// Receive a transaction set from the network.
