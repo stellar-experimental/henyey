@@ -155,6 +155,14 @@ const TX_SUBMISSION_MAX_BEHIND: u64 = 2;
 /// the requests and treat as if all peers said DontHave.
 const TX_SET_REQUEST_TIMEOUT_SECS: u64 = 10;
 
+/// Maximum tx-set backlog budget for the active catchup window.
+/// When cached + pending + fetch_channel_depth tx sets in
+/// `[current_ledger + 1, current_ledger + TX_SET_REQUEST_WINDOW]` reaches
+/// this limit, `request_pending_tx_sets()` pauses new `GetTxSet` sends.
+/// Set to `2 * TX_SET_REQUEST_WINDOW` to allow some pipelining while
+/// preventing unbounded memory growth during long-gap catchup.
+const TX_SET_ACTIVE_WINDOW_BUDGET: usize = 24; // 2 * TX_SET_REQUEST_WINDOW
+
 /// Recovery timer for out-of-sync recovery attempts.
 /// Matches stellar-core's OUT_OF_SYNC_RECOVERY_TIMER.
 const OUT_OF_SYNC_RECOVERY_TIMER_SECS: u64 = 10;
@@ -9996,6 +10004,153 @@ mod tests {
             app.tx_set_exhausted_since_offset(),
             0,
             "should be zero after clearing"
+        );
+    }
+
+    /// Helper: create an App with an overlay containing an injected test peer.
+    /// Returns (app, tempdir, TestPeerReceiver) so the caller can inspect
+    /// messages actually sent to the peer.
+    async fn app_with_test_overlay() -> (App, tempfile::TempDir, henyey_overlay::TestPeerReceiver) {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-test.db");
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
+        let app = App::new(config).await.unwrap();
+
+        // Create a minimal overlay manager and inject a test peer.
+        let overlay_config = OverlayManagerConfig::default();
+        let local_node = LocalNode::new_testnet(henyey_crypto::SecretKey::generate());
+        let overlay = OverlayManager::new(overlay_config, local_node).unwrap();
+        let peer_id = PeerId::from_bytes([0xAA; 32]);
+        let receiver = overlay.inject_test_peer(peer_id, 64);
+        *app.overlay.write().await = Some(Arc::new(overlay));
+
+        (app, dir, receiver)
+    }
+
+    /// With a full budget (fetch_channel_depth saturated), no GetTxSet
+    /// requests should be sent to the overlay peer.
+    #[tokio::test]
+    async fn test_request_pending_tx_sets_pauses_when_active_window_backlog_budget_is_full() {
+        let (app, _dir, mut receiver) = app_with_test_overlay().await;
+
+        // Saturate the budget via fetch_channel_depth (simulating in-flight
+        // overlay responses consuming all budget capacity).
+        app.fetch_channel_depth
+            .store(TX_SET_ACTIVE_WINDOW_BUDGET as i64, Ordering::Relaxed);
+
+        // Seed a few pending hashes in the active window (ledger 0: min_slot=1, window_end=12).
+        for i in 0..4u8 {
+            let hash = Hash256::from_bytes([i + 1; 32]);
+            app.herder.scp_driver().request_tx_set(hash, (i as u64) + 1);
+        }
+
+        // With budget full, request_pending_tx_sets should send NO requests.
+        app.request_pending_tx_sets().await;
+
+        // Verify no messages were sent to the peer.
+        assert!(
+            receiver.try_recv().is_none(),
+            "No GetTxSet should be sent when backlog budget is full"
+        );
+        let last_request = app.tx_set_last_request.read().await;
+        assert!(
+            last_request.is_empty(),
+            "No requests should be recorded when budget is full, but got {} entries",
+            last_request.len()
+        );
+    }
+
+    /// A pending-only saturated window (many pending hashes, zero cached)
+    /// must still issue GetTxSet requests. This is the key liveness property:
+    /// pre-fix, pending hashes counted against the budget and blocked all
+    /// first-send GetTxSet traffic.
+    #[tokio::test]
+    async fn test_request_pending_tx_sets_issues_requests_when_only_pending() {
+        let (app, _dir, mut receiver) = app_with_test_overlay().await;
+
+        // fetch_channel_depth = 0 (no in-flight responses).
+        // No cached tx sets exist (fresh app). Budget should be fully available.
+        // Seed many pending hashes — more than the budget.
+        let num_pending = TX_SET_ACTIVE_WINDOW_BUDGET + 5;
+        for i in 0..num_pending {
+            let hash = Hash256::from_bytes([(i + 1) as u8; 32]);
+            app.herder.scp_driver().request_tx_set(hash, (i as u64) + 1);
+        }
+
+        app.request_pending_tx_sets().await;
+
+        // At least one GetTxSet must have been issued (liveness).
+        let msg = receiver.try_recv();
+        assert!(
+            msg.is_some(),
+            "At least one GetTxSet must be sent when pending hashes exist and budget is available"
+        );
+        // All received messages must be GetTxSet.
+        if let Some(StellarMessage::GetTxSet(_)) = msg {
+            // good
+        } else {
+            panic!("Expected GetTxSet message, got {:?}", msg);
+        }
+
+        // Count total requests issued — should not exceed budget.
+        let last_request = app.tx_set_last_request.read().await;
+        assert!(
+            !last_request.is_empty(),
+            "last_request must record at least one issued request"
+        );
+        assert!(
+            last_request.len() <= TX_SET_ACTIVE_WINDOW_BUDGET,
+            "Requests ({}) must not exceed budget ({})",
+            last_request.len(),
+            TX_SET_ACTIVE_WINDOW_BUDGET,
+        );
+    }
+
+    /// With partial budget remaining (fetch_channel_depth partially filled),
+    /// requests must be capped at the remaining budget.
+    #[tokio::test]
+    async fn test_request_pending_tx_sets_uses_remaining_active_window_budget() {
+        let (app, _dir, mut receiver) = app_with_test_overlay().await;
+
+        // Leave exactly 3 slots of remaining budget via fetch_channel_depth.
+        let remaining = 3usize;
+        let fill_depth = TX_SET_ACTIVE_WINDOW_BUDGET - remaining;
+        app.fetch_channel_depth
+            .store(fill_depth as i64, Ordering::Relaxed);
+
+        // Seed more pending hashes than the remaining budget.
+        let total_pending = remaining + 5;
+        for i in 0..total_pending {
+            let hash = Hash256::from_bytes([(i + 1) as u8; 32]);
+            app.herder.scp_driver().request_tx_set(hash, (i as u64) + 1);
+        }
+
+        app.request_pending_tx_sets().await;
+
+        // Count messages received by the peer — should be exactly `remaining`.
+        let mut count = 0;
+        while let Some(msg) = receiver.try_recv() {
+            match msg {
+                StellarMessage::GetTxSet(_) => count += 1,
+                other => panic!("Expected GetTxSet, got {:?}", other),
+            }
+        }
+        assert_eq!(
+            count, remaining,
+            "Should emit exactly {} GetTxSet requests but got {}",
+            remaining, count
+        );
+
+        // Also verify last_request tracking matches.
+        let last_request = app.tx_set_last_request.read().await;
+        assert_eq!(
+            last_request.len(),
+            remaining,
+            "last_request should record {} entries but got {}",
+            remaining,
+            last_request.len()
         );
     }
 

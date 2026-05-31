@@ -351,6 +351,11 @@ pub struct CachedTxSet {
     pub(crate) touch_seq: u64,
     /// Number of times this was requested.
     pub request_count: u64,
+    /// The slot that last needed this tx set, or `None` for entries stored
+    /// directly via `cache_tx_set()` (unknown-slot sentinel). Slot-range
+    /// cleanup preserves `None` entries to avoid over-pruning.
+    /// When the same hash is reused across slots, keeps the **max** slot seen.
+    pub(crate) slot: Option<u64>,
 }
 
 impl CachedTxSet {
@@ -360,6 +365,17 @@ impl CachedTxSet {
             cached_at: std::time::Instant::now(),
             touch_seq,
             request_count: 0,
+            slot: None,
+        }
+    }
+
+    pub(crate) fn new_with_slot(tx_set: TransactionSet, touch_seq: u64, slot: u64) -> Self {
+        Self {
+            tx_set,
+            cached_at: std::time::Instant::now(),
+            touch_seq,
+            request_count: 0,
+            slot: Some(slot),
         }
     }
 }
@@ -858,8 +874,9 @@ impl ScpDriver {
     /// Check if a tx set is cached AND refresh its LRU recency.
     /// Used by FetchingEnvelopes callback to prevent eviction of tx-sets
     /// still referenced by buffered envelopes waiting on other dependencies.
-    pub fn has_tx_set_and_touch(&self, hash: &Hash256) -> bool {
-        self.tx_tracker.is_cached_and_touch(hash)
+    /// Also propagates max slot for stellar-core parity (last-seen-slot).
+    pub fn has_tx_set_and_touch(&self, hash: &Hash256, slot: u64) -> bool {
+        self.tx_tracker.is_cached_and_touch_slot(hash, Some(slot))
     }
 
     /// Number of tx sets currently cached in the tracker. Test-only — used
@@ -868,6 +885,21 @@ impl ScpDriver {
     #[cfg(test)]
     pub(crate) fn tx_set_cache_count(&self) -> usize {
         self.tx_tracker.cache_count()
+    }
+
+    /// Count cached tx sets in the active window [from_slot, to_slot].
+    /// Used by the app-side backlog budget to bound catchup demand.
+    pub fn cached_tx_sets_in_window(&self, from_slot: u64, to_slot: u64) -> usize {
+        self.tx_tracker.cached_count_in_window(from_slot, to_slot)
+    }
+
+    /// Count pending tx set requests in the active window [from_slot, to_slot].
+    pub fn pending_tx_sets_in_window(&self, from_slot: u64, to_slot: u64) -> usize {
+        self.tx_tracker
+            .pending_entries()
+            .iter()
+            .filter(|(_, slot)| *slot >= from_slot && *slot <= to_slot)
+            .count()
     }
 
     /// Return all hashes currently in the tx set cache. Test-only.
@@ -2627,6 +2659,9 @@ impl ScpDriver {
         }
         drop(externalized);
 
+        // Evict cached tx sets for the removed slots
+        self.tx_tracker.evict_cached_for_slots(&removed_slots);
+
         // Clean up lag tracker entries for evicted slots
         let mut lag = self.externalize_lag.write();
         for slot in removed_slots {
@@ -2673,8 +2708,10 @@ impl ScpDriver {
         let initial_pending_count = self.tx_tracker.pending_count();
         let initial_externalized_count =
             tracked_read(LOCK_SCP_EXTERNALIZED, &self.externalized).len();
+        let initial_cache_count = self.tx_tracker.cache_count();
 
         self.tx_tracker.trim_stale_pending(keep_after_slot);
+        let cached_evicted = self.tx_tracker.trim_stale_cached(keep_after_slot);
 
         // Trim externalized - keep slots > keep_after_slot
         {
@@ -2694,6 +2731,8 @@ impl ScpDriver {
         tracing::info!(
             initial_pending_count,
             initial_externalized_count,
+            initial_cache_count,
+            cached_evicted,
             kept_pending,
             kept_externalized,
             keep_after_slot,
@@ -2726,12 +2765,24 @@ impl ScpDriver {
         // Clean up pending tx set requests for old slots
         self.cleanup_old_pending_slots(slot);
 
+        // Evict cached tx sets for slots below the cutoff
+        self.tx_tracker.purge_cached_below(slot);
+
         // NOTE: We intentionally do NOT clear qset_tracker here.
         // Quorum sets are not slot-scoped — they are bounded at 10,000
         // entries via RandomEvictionCache (see MAX_VALIDATED_QSETS).
         // Clearing them here breaks heard_from_quorum() because is_quorum()
         // needs get_quorum_set(node_id) to return Some for remote nodes.
         // See #1874.
+    }
+
+    /// Evict cached tx sets with a known slot above the given upper bound.
+    /// Parity: stellar-core evicts tx-set cache entries outside
+    /// `[minSlotToRemember, maxSlotToRemember]` during `newSlotExternalized`.
+    /// The lower-bound eviction is already handled by `purge_slots_below` /
+    /// `trim_stale_caches`; this covers the upper bound.
+    pub fn evict_cached_above(&self, max_slot: SlotIndex) -> usize {
+        self.tx_tracker.evict_cached_above(max_slot)
     }
 
     /// Get local SCP envelopes for a slot.
@@ -3555,9 +3606,206 @@ mod cache_tests {
             "with tx set cached, validation should not return Invalid"
         );
     }
-}
 
-/// SCP callback implementation wrapper.
+    #[test]
+    fn test_trim_stale_caches_drops_cached_tx_sets_at_or_before_keep_after_slot() {
+        let driver = ScpDriver::new(
+            make_config(10),
+            Hash256::hash(b"network"),
+            make_default_lm(),
+            default_tracking(),
+            Arc::new(crate::metrics::ScpMetrics::new()),
+            make_default_upgrades(),
+            TimerManagerHandle::no_op(),
+        );
+
+        // Request and receive tx sets for various slots (this gives them slot provenance)
+        let ts_old = make_tx_set(10);
+        let ts_boundary = make_tx_set(11);
+        let ts_future = make_tx_set(12);
+
+        driver.request_tx_set(*ts_old.hash(), 95);
+        driver.receive_tx_set(ts_old.clone());
+
+        driver.request_tx_set(*ts_boundary.hash(), 100);
+        driver.receive_tx_set(ts_boundary.clone());
+
+        driver.request_tx_set(*ts_future.hash(), 105);
+        driver.receive_tx_set(ts_future.clone());
+
+        // All three should be cached
+        assert!(driver.has_tx_set(ts_old.hash()));
+        assert!(driver.has_tx_set(ts_boundary.hash()));
+        assert!(driver.has_tx_set(ts_future.hash()));
+
+        // Trim with keep_after_slot = 100 — should evict slots <= 100
+        driver.trim_stale_caches(100);
+
+        // Old (slot 95) and boundary (slot 100) should be evicted
+        assert!(!driver.has_tx_set(ts_old.hash()));
+        assert!(!driver.has_tx_set(ts_boundary.hash()));
+        // Future (slot 105) should remain
+        assert!(driver.has_tx_set(ts_future.hash()));
+    }
+
+    #[test]
+    fn test_purge_slots_below_drops_cached_tx_sets_below_cutoff() {
+        let driver = ScpDriver::new(
+            make_config(10),
+            Hash256::hash(b"network"),
+            make_default_lm(),
+            default_tracking(),
+            Arc::new(crate::metrics::ScpMetrics::new()),
+            make_default_upgrades(),
+            TimerManagerHandle::no_op(),
+        );
+
+        // Request and receive tx sets on both sides of the purge boundary
+        let ts_below = make_tx_set(20);
+        let ts_at = make_tx_set(21);
+        let ts_above = make_tx_set(22);
+
+        driver.request_tx_set(*ts_below.hash(), 99);
+        driver.receive_tx_set(ts_below.clone());
+
+        driver.request_tx_set(*ts_at.hash(), 100);
+        driver.receive_tx_set(ts_at.clone());
+
+        driver.request_tx_set(*ts_above.hash(), 101);
+        driver.receive_tx_set(ts_above.clone());
+
+        assert!(driver.has_tx_set(ts_below.hash()));
+        assert!(driver.has_tx_set(ts_at.hash()));
+        assert!(driver.has_tx_set(ts_above.hash()));
+
+        // Purge below slot 100 — evicts slots < 100
+        driver.purge_slots_below(100);
+
+        assert!(!driver.has_tx_set(ts_below.hash()));
+        // Slot == cutoff should remain (purge_cached_below uses >=)
+        assert!(driver.has_tx_set(ts_at.hash()));
+        assert!(driver.has_tx_set(ts_above.hash()));
+    }
+
+    #[test]
+    fn test_cleanup_externalized_drops_cached_tx_sets_for_trimmed_slots() {
+        let driver = ScpDriver::new(
+            make_config(10),
+            Hash256::hash(b"network"),
+            make_default_lm(),
+            default_tracking(),
+            Arc::new(crate::metrics::ScpMetrics::new()),
+            make_default_upgrades(),
+            TimerManagerHandle::no_op(),
+        );
+
+        // Seed externalized slots and cached tx sets for those slots
+        let ts1 = make_tx_set(30);
+        let ts2 = make_tx_set(31);
+        let ts3 = make_tx_set(32);
+
+        // Request/receive gives slot provenance
+        driver.request_tx_set(*ts1.hash(), 1);
+        driver.receive_tx_set(ts1.clone());
+        driver.request_tx_set(*ts2.hash(), 2);
+        driver.receive_tx_set(ts2.clone());
+        driver.request_tx_set(*ts3.hash(), 3);
+        driver.receive_tx_set(ts3.clone());
+
+        // Add externalized entries for slots 1, 2, 3
+        {
+            let mut externalized = driver.externalized.write();
+            externalized.insert(1, make_externalized_slot(1, 100));
+            externalized.insert(2, make_externalized_slot(2, 200));
+            externalized.insert(3, make_externalized_slot(3, 300));
+        }
+
+        // Keep only 1 externalized slot (slot 3, the newest)
+        driver.cleanup_externalized(1);
+
+        // Slots 1 and 2 are evicted from externalized
+        assert_eq!(driver.externalized.read().len(), 1);
+        assert!(driver.externalized.read().contains_key(&3));
+
+        // Cached tx sets for evicted slots 1 and 2 should also be gone
+        assert!(!driver.has_tx_set(ts1.hash()));
+        assert!(!driver.has_tx_set(ts2.hash()));
+        // Slot 3 (retained) should still be cached
+        assert!(driver.has_tx_set(ts3.hash()));
+    }
+
+    #[test]
+    fn test_evict_cached_above_drops_far_future_tx_sets() {
+        let driver = ScpDriver::new(
+            make_config(10),
+            Hash256::hash(b"network"),
+            make_default_lm(),
+            default_tracking(),
+            Arc::new(crate::metrics::ScpMetrics::new()),
+            make_default_upgrades(),
+            TimerManagerHandle::no_op(),
+        );
+
+        // Seed cached tx sets at various slots
+        let ts_low = make_tx_set(40);
+        let ts_mid = make_tx_set(41);
+        let ts_high = make_tx_set(42);
+        let ts_very_high = make_tx_set(43);
+
+        // Request/receive gives slot provenance
+        driver.request_tx_set(*ts_low.hash(), 50);
+        driver.receive_tx_set(ts_low.clone());
+        driver.request_tx_set(*ts_mid.hash(), 150);
+        driver.receive_tx_set(ts_mid.clone());
+        driver.request_tx_set(*ts_high.hash(), 200);
+        driver.receive_tx_set(ts_high.clone());
+        driver.request_tx_set(*ts_very_high.hash(), 500);
+        driver.receive_tx_set(ts_very_high.clone());
+
+        // Evict cached tx sets with slot > 200
+        let evicted = driver.evict_cached_above(200);
+        assert_eq!(evicted, 1); // only ts_very_high (slot 500) should be evicted
+
+        // Slots <= 200 remain
+        assert!(driver.has_tx_set(ts_low.hash()));
+        assert!(driver.has_tx_set(ts_mid.hash()));
+        assert!(driver.has_tx_set(ts_high.hash()));
+        // Slot 500 (above max) is gone
+        assert!(!driver.has_tx_set(ts_very_high.hash()));
+    }
+
+    /// Regression test: far-future envelope touch raises a cached tx-set's slot
+    /// above the validity bracket, but evict_cached_above must still reclaim it.
+    /// This reproduces the parity gap reported in PR #2906 review cycle 4.
+    #[test]
+    fn test_evict_cached_above_handles_slot_raised_by_touch() {
+        let driver = ScpDriver::new(
+            make_config(10),
+            Hash256::hash(b"network"),
+            make_default_lm(),
+            default_tracking(),
+            Arc::new(crate::metrics::ScpMetrics::new()),
+            make_default_upgrades(),
+            TimerManagerHandle::no_op(),
+        );
+
+        // Cache a tx set at a normal slot (100)
+        let ts = make_tx_set(50);
+        driver.request_tx_set(*ts.hash(), 100);
+        driver.receive_tx_set(ts.clone());
+        assert!(driver.has_tx_set(ts.hash()));
+
+        // Simulate a far-future envelope touching the same hash, raising its
+        // slot to 9999 (above any reasonable validity bracket).
+        assert!(driver.has_tx_set_and_touch(ts.hash(), 9999));
+
+        // Upper-bound eviction with max_slot=200 should evict it because its
+        // slot is now 9999 > 200.
+        let evicted = driver.evict_cached_above(200);
+        assert_eq!(evicted, 1);
+        assert!(!driver.has_tx_set(ts.hash()));
+    }
+}
 ///
 /// This wraps the ScpDriver to implement the SCPDriver trait.
 pub struct HerderScpCallback {

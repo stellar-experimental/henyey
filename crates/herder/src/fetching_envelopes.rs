@@ -48,7 +48,10 @@ type BroadcastFn = Box<dyn Fn(ScpRelayEnvelope) + Send + Sync>;
 ///
 /// Queries the authoritative source (ScpDriver) to determine whether a
 /// tx_set hash is known. This eliminates the need for a shadow cache.
-type HasTxSetFn = Box<dyn Fn(&Hash256) -> bool + Send + Sync>;
+/// Callback to check if a tx-set hash is cached. The `slot` argument allows
+/// the callee to propagate max-last-seen-slot on cache touches (stellar-core
+/// parity: `touchFetchCache` / `getKnownTxSet(..., slot, true)`).
+type HasTxSetFn = Box<dyn Fn(&Hash256, u64) -> bool + Send + Sync>;
 
 /// Result of receiving an SCP envelope.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -458,7 +461,7 @@ impl FetchingEnvelopes {
 
                 if need_tx_set {
                     for tx_set_hash in Self::extract_tx_set_hashes(&envelope) {
-                        if !self.is_tx_set_available(&tx_set_hash) {
+                        if !self.is_tx_set_available(&tx_set_hash, envelope.statement.slot_index) {
                             let hash = Hash(tx_set_hash.0);
                             if self.tx_set_fetcher.fetch(hash, &envelope) {
                                 any_tracked = true;
@@ -912,18 +915,19 @@ impl FetchingEnvelopes {
     }
 
     /// Check if a tx_set is available via the authoritative source.
-    fn is_tx_set_available(&self, hash: &Hash256) -> bool {
-        (self.has_tx_set_fn)(hash)
+    fn is_tx_set_available(&self, hash: &Hash256, slot: u64) -> bool {
+        (self.has_tx_set_fn)(hash, slot)
     }
     /// Check what dependencies are missing for an envelope.
     ///
     /// Parity: checks both tx set and quorum set dependencies.
     /// An envelope is ready only when all referenced data is cached.
     fn check_dependencies(&self, envelope: &ScpEnvelope) -> (bool, bool) {
+        let slot = envelope.statement.slot_index;
         let tx_set_hashes = Self::extract_tx_set_hashes(envelope);
         let need_tx_set = tx_set_hashes
             .iter()
-            .any(|hash| !self.is_tx_set_available(hash));
+            .any(|hash| !self.is_tx_set_available(hash, slot));
 
         let need_quorum_set = if let Some(hash) = Self::extract_quorum_set_hash(envelope) {
             !self.qs_cache_exists(&hash)
@@ -975,7 +979,7 @@ impl FetchingEnvelopes {
             // until temporal cleanup removes it.
             if need_tx_set {
                 for tx_set_hash in Self::extract_tx_set_hashes(&envelope) {
-                    if !self.is_tx_set_available(&tx_set_hash) {
+                    if !self.is_tx_set_available(&tx_set_hash, slot) {
                         let hash = Hash(tx_set_hash.0);
                         let _ = self.tx_set_fetcher.fetch(hash, &envelope);
                         debug!(
@@ -1211,7 +1215,7 @@ mod tests {
 
     #[test]
     fn test_recv_envelope_nomination_needs_quorum_set() {
-        let fetching = FetchingEnvelopes::with_defaults(Box::new(|_| false));
+        let fetching = FetchingEnvelopes::with_defaults(Box::new(|_, _| false));
 
         // Without pre-caching the quorum set, nomination envelopes need fetching
         let envelope = make_test_envelope(100, 1);
@@ -1221,7 +1225,7 @@ mod tests {
 
     #[test]
     fn test_recv_envelope_ready_when_cached() {
-        let fetching = FetchingEnvelopes::with_defaults(Box::new(|_| false));
+        let fetching = FetchingEnvelopes::with_defaults(Box::new(|_, _| false));
 
         // Pre-cache the quorum set so envelope is immediately ready
         cache_test_quorum_set(&fetching);
@@ -1235,7 +1239,7 @@ mod tests {
 
     #[test]
     fn test_cache_quorum_set() {
-        let fetching = FetchingEnvelopes::with_defaults(Box::new(|_| false));
+        let fetching = FetchingEnvelopes::with_defaults(Box::new(|_, _| false));
 
         // Verify we can cache and retrieve quorum sets
         let qs_hash = Hash256::from_bytes([1u8; 32]);
@@ -1254,7 +1258,7 @@ mod tests {
 
     #[test]
     fn test_pop_marks_as_processed() {
-        let fetching = FetchingEnvelopes::with_defaults(Box::new(|_| false));
+        let fetching = FetchingEnvelopes::with_defaults(Box::new(|_, _| false));
         cache_test_quorum_set(&fetching);
 
         let envelope = make_test_envelope(100, 1);
@@ -1271,7 +1275,7 @@ mod tests {
 
     #[test]
     fn test_erase_outside_range_min_only() {
-        let fetching = FetchingEnvelopes::with_defaults(Box::new(|_| false));
+        let fetching = FetchingEnvelopes::with_defaults(Box::new(|_, _| false));
         cache_test_quorum_set(&fetching);
 
         // Add envelopes for different slots
@@ -1293,7 +1297,7 @@ mod tests {
 
     #[test]
     fn test_erase_outside_range_max_only() {
-        let fetching = FetchingEnvelopes::with_defaults(Box::new(|_| false));
+        let fetching = FetchingEnvelopes::with_defaults(Box::new(|_, _| false));
         cache_test_quorum_set(&fetching);
 
         fetching.recv_envelope(make_test_envelope(100, 1));
@@ -1313,7 +1317,7 @@ mod tests {
 
     #[test]
     fn test_erase_outside_range_both_bounds() {
-        let fetching = FetchingEnvelopes::with_defaults(Box::new(|_| false));
+        let fetching = FetchingEnvelopes::with_defaults(Box::new(|_, _| false));
         cache_test_quorum_set(&fetching);
 
         fetching.recv_envelope(make_test_envelope(50, 1));
@@ -1335,7 +1339,7 @@ mod tests {
 
     #[test]
     fn test_erase_outside_range_none_none_is_noop() {
-        let fetching = FetchingEnvelopes::with_defaults(Box::new(|_| false));
+        let fetching = FetchingEnvelopes::with_defaults(Box::new(|_, _| false));
         cache_test_quorum_set(&fetching);
 
         fetching.recv_envelope(make_test_envelope(100, 1));
@@ -1348,7 +1352,7 @@ mod tests {
 
     #[test]
     fn test_erase_outside_range_slot_to_keep_outside_range() {
-        let fetching = FetchingEnvelopes::with_defaults(Box::new(|_| false));
+        let fetching = FetchingEnvelopes::with_defaults(Box::new(|_, _| false));
         cache_test_quorum_set(&fetching);
 
         fetching.recv_envelope(make_test_envelope(50, 1));
@@ -1366,7 +1370,7 @@ mod tests {
 
     #[test]
     fn test_trim_stale_preserves_quorum_sets() {
-        let fetching = FetchingEnvelopes::with_defaults(Box::new(|_| false));
+        let fetching = FetchingEnvelopes::with_defaults(Box::new(|_, _| false));
 
         // Add some quorum sets and slot state
         let qs_hash = Hash256::from_bytes([1u8; 32]);
@@ -1403,7 +1407,7 @@ mod tests {
 
     #[test]
     fn test_recv_quorum_set_rejects_insane() {
-        let fetching = FetchingEnvelopes::with_defaults(Box::new(|_| false));
+        let fetching = FetchingEnvelopes::with_defaults(Box::new(|_, _| false));
 
         // First, make the fetcher track a hash so recv_quorum_set doesn't
         // short-circuit with "unrequested".
@@ -1441,7 +1445,7 @@ mod tests {
 
     #[test]
     fn test_recv_quorum_set_accepts_sane() {
-        let fetching = FetchingEnvelopes::with_defaults(Box::new(|_| false));
+        let fetching = FetchingEnvelopes::with_defaults(Box::new(|_, _| false));
         let qs_hash = Hash256::from_bytes([42u8; 32]);
 
         // Submit an envelope to make fetcher track the hash
@@ -1525,7 +1529,7 @@ mod tests {
 
     #[test]
     fn test_recv_envelope_rejects_basic_stellar_value() {
-        let fetching = FetchingEnvelopes::with_defaults(Box::new(|_| false));
+        let fetching = FetchingEnvelopes::with_defaults(Box::new(|_, _| false));
         cache_test_quorum_set(&fetching);
 
         // Envelope with a nomination containing a Basic StellarValue
@@ -1541,7 +1545,7 @@ mod tests {
     #[test]
     fn test_recv_envelope_accepts_signed_stellar_value() {
         // Callback returns true for hash [0u8; 32] (the signed value's tx_set_hash)
-        let fetching = FetchingEnvelopes::with_defaults(Box::new(|hash| {
+        let fetching = FetchingEnvelopes::with_defaults(Box::new(|hash, _| {
             *hash == Hash256::from_bytes([0u8; 32])
         }));
         cache_test_quorum_set(&fetching);
@@ -1559,7 +1563,7 @@ mod tests {
 
     #[test]
     fn test_recv_envelope_rejects_undecoded_value() {
-        let fetching = FetchingEnvelopes::with_defaults(Box::new(|_| false));
+        let fetching = FetchingEnvelopes::with_defaults(Box::new(|_, _| false));
         cache_test_quorum_set(&fetching);
 
         // Envelope with garbage bytes that can't be decoded as StellarValue
@@ -1578,7 +1582,7 @@ mod tests {
 
     #[test]
     fn test_pop_returns_lowest_slot_first() {
-        let fetching = FetchingEnvelopes::with_defaults(Box::new(|_| false));
+        let fetching = FetchingEnvelopes::with_defaults(Box::new(|_, _| false));
         cache_test_quorum_set(&fetching);
 
         // Add envelopes in non-sequential order: slot 300, 100, 200
@@ -1604,7 +1608,7 @@ mod tests {
 
     #[test]
     fn test_pop_respects_max_slot() {
-        let fetching = FetchingEnvelopes::with_defaults(Box::new(|_| false));
+        let fetching = FetchingEnvelopes::with_defaults(Box::new(|_, _| false));
         cache_test_quorum_set(&fetching);
 
         fetching.recv_envelope(make_test_envelope(100, 1));
@@ -1621,7 +1625,7 @@ mod tests {
 
     #[test]
     fn test_ready_slots_returns_sorted() {
-        let fetching = FetchingEnvelopes::with_defaults(Box::new(|_| false));
+        let fetching = FetchingEnvelopes::with_defaults(Box::new(|_, _| false));
         cache_test_quorum_set(&fetching);
 
         // Add in non-sequential order
@@ -1641,7 +1645,7 @@ mod tests {
     fn test_broadcast_called_when_envelope_ready() {
         use std::sync::atomic::{AtomicU64, Ordering};
 
-        let fetching = FetchingEnvelopes::with_defaults(Box::new(|_| false));
+        let fetching = FetchingEnvelopes::with_defaults(Box::new(|_, _| false));
         cache_test_quorum_set(&fetching);
 
         let broadcast_count = Arc::new(AtomicU64::new(0));
@@ -1664,7 +1668,7 @@ mod tests {
     fn test_broadcast_called_when_dependency_satisfied() {
         use std::sync::atomic::{AtomicU64, Ordering};
 
-        let fetching = FetchingEnvelopes::with_defaults(Box::new(|_| false));
+        let fetching = FetchingEnvelopes::with_defaults(Box::new(|_, _| false));
 
         let broadcast_count = Arc::new(AtomicU64::new(0));
         let count_clone = broadcast_count.clone();
@@ -1703,7 +1707,7 @@ mod tests {
 
     #[test]
     fn test_no_broadcast_when_no_callback() {
-        let fetching = FetchingEnvelopes::with_defaults(Box::new(|_| false));
+        let fetching = FetchingEnvelopes::with_defaults(Box::new(|_, _| false));
         cache_test_quorum_set(&fetching);
 
         // No broadcast set — should not panic
@@ -1801,7 +1805,7 @@ mod tests {
     /// so NOMINATE envelopes bypassed tx_set fetch gating entirely.
     #[test]
     fn test_nominate_waits_for_tx_sets() {
-        let fetching = FetchingEnvelopes::with_defaults(Box::new(|_| false));
+        let fetching = FetchingEnvelopes::with_defaults(Box::new(|_, _| false));
         cache_test_quorum_set(&fetching);
 
         // Create a NOMINATE envelope with two tx_set hashes in votes + accepted
@@ -1835,7 +1839,7 @@ mod tests {
     #[test]
     fn test_nominate_ready_when_tx_sets_cached() {
         // Callback returns true for the tx_set hash [0xAA; 32]
-        let fetching = FetchingEnvelopes::with_defaults(Box::new(|hash| {
+        let fetching = FetchingEnvelopes::with_defaults(Box::new(|hash, _| {
             *hash == Hash256::from_bytes([0xAA; 32])
         }));
         cache_test_quorum_set(&fetching);
@@ -1901,9 +1905,9 @@ mod tests {
 
         // Create with a callback that reports the tx_set as available
         let target_hash = tx_set_hash;
-        let fetching = Arc::new(FetchingEnvelopes::with_defaults(Box::new(move |hash| {
-            *hash == target_hash
-        })));
+        let fetching = Arc::new(FetchingEnvelopes::with_defaults(Box::new(
+            move |hash, _| *hash == target_hash,
+        )));
 
         // Cache the quorum set so the only missing dependency is the TxSet.
         let node_id = XdrNodeId(PublicKey::PublicKeyTypeEd25519(Uint256([1u8; 32])));
@@ -2026,7 +2030,7 @@ mod tests {
         let qs_hash = Hash256::from_bytes([0x01; 32]);
 
         // Callback always returns false (tx_set not available)
-        let fetching = FetchingEnvelopes::with_defaults(Box::new(|_| false));
+        let fetching = FetchingEnvelopes::with_defaults(Box::new(|_, _| false));
 
         // Cache quorum-set so only tx_set is missing
         fetching.cache_quorum_set(qs_hash, make_sane_quorum_set());
@@ -2057,7 +2061,7 @@ mod tests {
 
         // Callback returns true for our target hash
         let target = tx_set_hash;
-        let fetching = FetchingEnvelopes::with_defaults(Box::new(move |hash| *hash == target));
+        let fetching = FetchingEnvelopes::with_defaults(Box::new(move |hash, _| *hash == target));
 
         // Cache quorum-set so only tx_set is missing
         fetching.cache_quorum_set(qs_hash, make_sane_quorum_set());
@@ -2099,7 +2103,7 @@ mod tests {
 
         // tx_set is always available via the callback
         let target = tx_hash_a;
-        let fetching = FetchingEnvelopes::new(config, Box::new(move |hash| *hash == target));
+        let fetching = FetchingEnvelopes::new(config, Box::new(move |hash, _| *hash == target));
 
         // 1. Insert envelope needing tx-set A and quorum-set Q
         let envelope = make_envelope_with_deps(100, 1, tx_hash_a, qs_hash);
@@ -2132,7 +2136,7 @@ mod tests {
         let available = Arc::new(AtomicBool::new(false));
         let avail_clone = available.clone();
         let target = tx_hash_a;
-        let fetching = FetchingEnvelopes::with_defaults(Box::new(move |hash| {
+        let fetching = FetchingEnvelopes::with_defaults(Box::new(move |hash, _| {
             *hash == target && avail_clone.load(Ordering::Relaxed)
         }));
 
@@ -2160,7 +2164,7 @@ mod tests {
         let mut config = FetchingConfig::default();
         config.max_quorum_set_cache = 3;
 
-        let fetching = FetchingEnvelopes::new(config, Box::new(|_| false));
+        let fetching = FetchingEnvelopes::new(config, Box::new(|_, _| false));
 
         // Insert 5 distinct quorum sets
         for i in 0..5u8 {
@@ -2188,7 +2192,7 @@ mod tests {
 
         // tx_set always available
         let target = tx_hash;
-        let fetching = FetchingEnvelopes::new(config, Box::new(move |hash| *hash == target));
+        let fetching = FetchingEnvelopes::new(config, Box::new(move |hash, _| *hash == target));
 
         // Deliver QS-A into cache
         fetching.cache_quorum_set(qs_hash, make_sane_quorum_set());
@@ -2230,7 +2234,7 @@ mod tests {
         let target = tx_hash;
         let fetching = FetchingEnvelopes::new(
             config,
-            Box::new(move |hash| {
+            Box::new(move |hash, _| {
                 *hash == target && avail_clone.load(std::sync::atomic::Ordering::Relaxed)
             }),
         );
@@ -2283,7 +2287,7 @@ mod tests {
             ..Default::default()
         };
         // Quorum set NOT available so envelopes go to fetching state
-        FetchingEnvelopes::new(config, Box::new(|_| false))
+        FetchingEnvelopes::new(config, Box::new(|_, _| false))
     }
 
     /// Helper: create FetchingEnvelopes with per-slot cap and pre-cached
@@ -2293,7 +2297,7 @@ mod tests {
             max_envelopes_per_slot: cap,
             ..Default::default()
         };
-        let fetching = FetchingEnvelopes::new(config, Box::new(|_| false));
+        let fetching = FetchingEnvelopes::new(config, Box::new(|_, _| false));
         cache_test_quorum_set(&fetching);
         fetching
     }
@@ -2524,7 +2528,7 @@ mod tests {
 
         // tx_set never available → tx_set fetching always needed.
         // Quorum sets not pre-cached → quorum_set fetching always needed.
-        let fetching = FetchingEnvelopes::new(config, Box::new(|_| false));
+        let fetching = FetchingEnvelopes::new(config, Box::new(|_, _| false));
 
         // Fill both fetchers with 2 distinct hashes each.
         let tx_hash_1 = Hash256::from_bytes([0xA1; 32]);
@@ -2567,7 +2571,7 @@ mod tests {
     fn test_discard_insane_qset_moves_to_discarded() {
         // Verify that receiving an insane quorum set moves waiting envelopes
         // from fetching to discarded.
-        let fetching = FetchingEnvelopes::with_defaults(Box::new(|_| false));
+        let fetching = FetchingEnvelopes::with_defaults(Box::new(|_, _| false));
         let qs_hash = Hash256::from_bytes([42u8; 32]);
 
         // Submit an envelope that needs this quorum set
@@ -2595,7 +2599,7 @@ mod tests {
     fn test_discard_insane_qset_multiple_slots() {
         // Verify discarding works across multiple slots with envelopes waiting
         // on the same quorum set hash.
-        let fetching = FetchingEnvelopes::with_defaults(Box::new(|_| false));
+        let fetching = FetchingEnvelopes::with_defaults(Box::new(|_, _| false));
         let qs_hash = Hash256::from_bytes([42u8; 32]);
         let tx_hash = Hash256::from_bytes([0xAA; 32]);
 
@@ -2636,7 +2640,7 @@ mod tests {
         let tx_available = Arc::new(AtomicBool::new(false));
         let tx_available_clone = tx_available.clone();
 
-        let fetching = FetchingEnvelopes::with_defaults(Box::new(move |_| {
+        let fetching = FetchingEnvelopes::with_defaults(Box::new(move |_, _| {
             tx_available_clone.load(Ordering::Relaxed)
         }));
 
@@ -2675,7 +2679,7 @@ mod tests {
     fn test_re_receive_discarded_envelope_returns_discarded() {
         // Verify that re-receiving a discarded envelope returns Discarded,
         // not AlreadyProcessed.
-        let fetching = FetchingEnvelopes::with_defaults(Box::new(|_| false));
+        let fetching = FetchingEnvelopes::with_defaults(Box::new(|_, _| false));
         let qs_hash = Hash256::from_bytes([42u8; 32]);
         let tx_hash = Hash256::from_bytes([0xAA; 32]);
 
@@ -2701,7 +2705,7 @@ mod tests {
     #[test]
     fn test_discard_increases_slot_lifetime_count() {
         // Verify that discarded envelopes contribute to slot_lifetime_count.
-        let fetching = FetchingEnvelopes::with_defaults(Box::new(|_| false));
+        let fetching = FetchingEnvelopes::with_defaults(Box::new(|_, _| false));
         let qs_hash = Hash256::from_bytes([42u8; 32]);
         let tx_hash = Hash256::from_bytes([0xAA; 32]);
 
@@ -2732,7 +2736,7 @@ mod tests {
     #[test]
     fn test_discard_is_idempotent() {
         // Verify that discarding the same envelope twice is a no-op.
-        let fetching = FetchingEnvelopes::with_defaults(Box::new(|_| false));
+        let fetching = FetchingEnvelopes::with_defaults(Box::new(|_, _| false));
         let qs_hash = Hash256::from_bytes([42u8; 32]);
         let tx_hash = Hash256::from_bytes([0xAA; 32]);
 
@@ -2755,7 +2759,7 @@ mod tests {
     #[test]
     fn test_discard_cleans_up_fetcher_trackers() {
         // Verify that both quorum-set and tx-set fetcher trackers are cleaned up.
-        let fetching = FetchingEnvelopes::with_defaults(Box::new(|_| false));
+        let fetching = FetchingEnvelopes::with_defaults(Box::new(|_, _| false));
         let qs_hash = Hash256::from_bytes([42u8; 32]);
         let tx_hash = Hash256::from_bytes([0xAA; 32]);
 
@@ -2795,7 +2799,7 @@ mod tests {
             max_envelopes_per_slot: 0,
             ..Default::default()
         };
-        let fetching = FetchingEnvelopes::new(config, Box::new(|_| false));
+        let fetching = FetchingEnvelopes::new(config, Box::new(|_, _| false));
         fetching.set_current_slot(100);
 
         // Fill 3 future slots
@@ -2820,7 +2824,7 @@ mod tests {
             max_envelopes_per_slot: 0,
             ..Default::default()
         };
-        let fetching = FetchingEnvelopes::new(config, Box::new(|_| false));
+        let fetching = FetchingEnvelopes::new(config, Box::new(|_, _| false));
         fetching.set_current_slot(100);
 
         // Fill 2 future slots
@@ -2843,7 +2847,7 @@ mod tests {
             max_envelopes_per_slot: 0,
             ..Default::default()
         };
-        let fetching = FetchingEnvelopes::new(config, Box::new(|_| false));
+        let fetching = FetchingEnvelopes::new(config, Box::new(|_, _| false));
         fetching.set_current_slot(100);
 
         // Fill the single future-slot budget
@@ -2865,7 +2869,7 @@ mod tests {
             max_envelopes_per_slot: 0,
             ..Default::default()
         };
-        let fetching = FetchingEnvelopes::new(config, Box::new(|_| false));
+        let fetching = FetchingEnvelopes::new(config, Box::new(|_, _| false));
         fetching.set_current_slot(100);
 
         let env1 = make_envelope(101, 1);
@@ -2888,7 +2892,7 @@ mod tests {
             max_envelopes_per_slot: 0,
             ..Default::default()
         };
-        let fetching = FetchingEnvelopes::new(config, Box::new(|_| false));
+        let fetching = FetchingEnvelopes::new(config, Box::new(|_, _| false));
         fetching.set_current_slot(100);
 
         for s in 101..=300 {
@@ -2910,7 +2914,7 @@ mod tests {
             max_envelopes_per_slot: 0,
             ..Default::default()
         };
-        let fetching = Arc::new(FetchingEnvelopes::new(config, Box::new(|_| false)));
+        let fetching = Arc::new(FetchingEnvelopes::new(config, Box::new(|_, _| false)));
         fetching.set_current_slot(100);
 
         let barrier = Arc::new(Barrier::new(20));
@@ -2953,7 +2957,7 @@ mod tests {
     fn test_broadcast_callback_immediate_ready() {
         use std::sync::Mutex;
 
-        let fetching = FetchingEnvelopes::with_defaults(Box::new(|_| false));
+        let fetching = FetchingEnvelopes::with_defaults(Box::new(|_, _| false));
         cache_test_quorum_set(&fetching);
 
         let captured = Arc::new(Mutex::new(Vec::new()));
@@ -2978,7 +2982,7 @@ mod tests {
     fn test_broadcast_callback_deferred_ready() {
         use std::sync::Mutex;
 
-        let fetching = FetchingEnvelopes::with_defaults(Box::new(|_| false));
+        let fetching = FetchingEnvelopes::with_defaults(Box::new(|_, _| false));
 
         let captured = Arc::new(Mutex::new(Vec::new()));
         let cap = captured.clone();
@@ -3015,7 +3019,7 @@ mod tests {
     fn test_broadcast_callback_local_path() {
         use std::sync::Mutex;
 
-        let fetching = FetchingEnvelopes::with_defaults(Box::new(|_| false));
+        let fetching = FetchingEnvelopes::with_defaults(Box::new(|_, _| false));
         cache_test_quorum_set(&fetching);
 
         let captured = Arc::new(Mutex::new(Vec::new()));
@@ -3043,7 +3047,7 @@ mod tests {
         // which defaults to `|_| false`, but that means tx_set is "always needed" — so
         // use a callback that says "always available" and test double-broadcast via
         // quorum set delivery).
-        let fetching = FetchingEnvelopes::with_defaults(Box::new(|_| true));
+        let fetching = FetchingEnvelopes::with_defaults(Box::new(|_, _| true));
 
         let broadcast_count = Arc::new(AtomicU64::new(0));
         let count_clone = broadcast_count.clone();

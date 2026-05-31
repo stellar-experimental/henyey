@@ -644,7 +644,7 @@ impl Herder {
         };
         let fetching_envelopes = FetchingEnvelopes::new(
             fetching_config,
-            Box::new(move |hash| scp_driver_for_fetching.has_tx_set_and_touch(hash)),
+            Box::new(move |hash, slot| scp_driver_for_fetching.has_tx_set_and_touch(hash, slot)),
         );
 
         // Pre-cache the local quorum set in fetching_envelopes so envelopes
@@ -2824,6 +2824,16 @@ impl Herder {
         self.fetching_envelopes
             .erase_outside_range(min_slot, max_slot, keep_slot);
 
+        // Evict cached tx sets outside the valid slot range in scp_driver.
+        // Parity: stellar-core PendingEnvelopes::eraseOutsideRange (line 726-731)
+        // also prunes the tx-set cache for entries outside [min, max].
+        // The lower bound is already handled by purge_slots_below / trim_stale_caches;
+        // this covers the upper bound so far-future slot touches cannot pin tx-sets
+        // indefinitely outside the active window.
+        if let Some(max) = max_slot {
+            self.scp_driver.evict_cached_above(max);
+        }
+
         // Clean up old data
         self.cleanup();
 
@@ -3738,6 +3748,16 @@ impl Herder {
     /// Check if we need a transaction set.
     pub fn needs_tx_set(&self, hash: &Hash256) -> bool {
         self.scp_driver.needs_tx_set(hash)
+    }
+
+    /// Count tx-set backlog (cached + pending) in the active catchup window.
+    /// Used by app-side scheduling to bound outbound `GetTxSet` demand.
+    pub fn tx_set_backlog_in_window(&self, from_slot: u64, to_slot: u64) -> usize {
+        // Only count cached tx-sets (which consume memory) — not pending hashes
+        // (which are small metadata). Counting pending against the budget would
+        // prevent GetTxSet from ever being issued when many hashes arrive during
+        // catchup, causing a liveness deadlock.
+        self.scp_driver.cached_tx_sets_in_window(from_slot, to_slot)
     }
 
     /// Receive a transaction set from the network.
