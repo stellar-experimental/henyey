@@ -1233,12 +1233,16 @@ impl Herder {
     }
 
     /// Compute the minimum ledger sequence to ask peers for SCP state.
+    ///
+    /// Parity: stellar-core `HerderImpl::getMinLedgerSeqToAskPeers()` —
+    /// computes a lookback from LCL, then clamps upward so we never ask for
+    /// slots the herder would immediately forget.
     pub fn get_min_ledger_seq_to_ask_peers(&self) -> u32 {
         let lcl = self.ledger_manager.current_ledger_seq();
         let mut low = lcl.saturating_add(1);
         let max_slots = self.config.max_externalized_slots.max(1) as u32;
         // Number of extra ledgers to keep beyond max_externalized_slots, matching
-        // stellar-core's LEDGER_VALIDITY_BRACKET lookback cushion.
+        // stellar-core's SCP_EXTRA_LOOKBACK_LEDGERS.
         const PEER_LEDGER_WINDOW: u32 = 3;
         let window = max_slots.min(PEER_LEDGER_WINDOW);
         if low > window {
@@ -1246,6 +1250,12 @@ impl Herder {
         } else {
             low = 1;
         }
+
+        // Do not ask for slots we'd be dropping anyway (stellar-core parity:
+        // `low = std::max<uint32>(low, getMinLedgerSeqToRemember())`).
+        let herder_low = self.get_min_ledger_seq_to_remember() as u32;
+        low = low.max(herder_low);
+
         low
     }
 
@@ -12859,6 +12869,37 @@ mod required_lm_behavioral_tests {
         // Default max_externalized_slots is > 3, so window = 3
         // low = 101 - 3 = 98
         assert_eq!(min_seq, 98);
+    }
+
+    /// Regression test for #2904: when the herder's tracking consensus index
+    /// is far ahead of LCL (e.g. tracking = 200, LCL = 50), the unclamped
+    /// formula returns a low watermark below get_min_ledger_seq_to_remember().
+    /// stellar-core clamps with `max(low, getMinLedgerSeqToRemember())`.
+    #[test]
+    fn test_get_min_ledger_seq_to_ask_peers_clamps_to_remember_floor_when_tracking_ahead() {
+        let lm = make_ledger_manager_at_seq(50);
+        let herder = Herder::new(HerderConfig::default(), lm, TimerManagerHandle::no_op());
+        // Set to Tracking state with tracking_slot=201 → consensus_index=200
+        {
+            let mut state = tracked_write(LOCK_HERDER_STATE, &herder.state);
+            *state = HerderState::Tracking;
+        }
+        {
+            let mut ts = tracked_write(LOCK_TRACKING_STATE, &herder.tracking_state);
+            ts.is_tracking = true;
+            ts.consensus_index = 201;
+        }
+
+        // get_min_ledger_seq_to_remember() = 200 - 12 + 1 = 189
+        let min_seq = herder.get_min_ledger_seq_to_ask_peers();
+
+        // Without clamp: lcl=50, low=51, window=3, low=48
+        // With clamp: max(48, 189) = 189
+        assert_eq!(
+            min_seq, 189,
+            "get_min_ledger_seq_to_ask_peers must clamp to get_min_ledger_seq_to_remember \
+             when tracking is ahead of LCL (stellar-core parity)"
+        );
     }
 
     /// ledger_close_duration() delegates directly to LedgerManager.
