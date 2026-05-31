@@ -12861,6 +12861,37 @@ mod required_lm_behavioral_tests {
         assert_eq!(min_seq, 98);
     }
 
+    /// Regression test for #2904: when the herder's tracking consensus index
+    /// is far ahead of LCL (e.g. tracking = 200, LCL = 50), the unclamped
+    /// formula returns a low watermark below get_min_ledger_seq_to_remember().
+    /// stellar-core clamps with `max(low, getMinLedgerSeqToRemember())`.
+    #[test]
+    fn test_get_min_ledger_seq_to_ask_peers_clamps_to_remember_floor_when_tracking_ahead() {
+        let lm = make_ledger_manager_at_seq(50);
+        let herder = Herder::new(HerderConfig::default(), lm, TimerManagerHandle::no_op());
+        // Set to Tracking state with tracking_slot=201 → consensus_index=200
+        {
+            let mut state = tracked_write(LOCK_HERDER_STATE, &herder.state);
+            *state = HerderState::Tracking;
+        }
+        {
+            let mut ts = tracked_write(LOCK_TRACKING_STATE, &herder.tracking_state);
+            ts.is_tracking = true;
+            ts.consensus_index = 201;
+        }
+
+        // get_min_ledger_seq_to_remember() = 200 - 12 + 1 = 189
+        let min_seq = herder.get_min_ledger_seq_to_ask_peers();
+
+        // Without clamp: lcl=50, low=51, window=3, low=48
+        // With clamp: max(48, 189) = 189
+        assert_eq!(
+            min_seq, 189,
+            "get_min_ledger_seq_to_ask_peers must clamp to get_min_ledger_seq_to_remember \
+             when tracking is ahead of LCL (stellar-core parity)"
+        );
+    }
+
     /// ledger_close_duration() delegates directly to LedgerManager.
     #[test]
     fn test_ledger_close_duration_reads_from_lm() {
