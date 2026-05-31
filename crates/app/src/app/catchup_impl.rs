@@ -2544,17 +2544,19 @@ impl App {
                     // try_start_ledger_close immediately for any buffered
                     // ledgers that are already ready.
                     if let Some(overlay) = self.overlay().await {
-                        let current_ledger = self.current_ledger_seq();
+                        // Use the shared low-watermark helper instead of raw
+                        // current_ledger (#2904).
+                        let ledger_seq = self.scp_state_request_ledger_seq();
                         // Record timestamp before spawning so heartbeat/gap
                         // throttle sees this attempt and does not duplicate it.
                         *self.last_scp_state_request_at.write().await = self.clock.now();
                         henyey_common::spawn_observed(
                             "scp_state_request_after_catchup",
                             async move {
-                                let _ = overlay.request_scp_state(current_ledger).await;
+                                let _ = overlay.request_scp_state(ledger_seq).await;
                             },
                         );
-                        tracing::info!(current_ledger, "Spawned SCP state request after catchup");
+                        tracing::info!(ledger_seq, "Spawned SCP state request after catchup");
                     }
                 } else {
                     tracing::info!(

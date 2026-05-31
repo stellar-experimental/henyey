@@ -1233,12 +1233,16 @@ impl Herder {
     }
 
     /// Compute the minimum ledger sequence to ask peers for SCP state.
+    ///
+    /// Parity: stellar-core `HerderImpl::getMinLedgerSeqToAskPeers()` —
+    /// computes a lookback from LCL, then clamps upward so we never ask for
+    /// slots the herder would immediately forget.
     pub fn get_min_ledger_seq_to_ask_peers(&self) -> u32 {
         let lcl = self.ledger_manager.current_ledger_seq();
         let mut low = lcl.saturating_add(1);
         let max_slots = self.config.max_externalized_slots.max(1) as u32;
         // Number of extra ledgers to keep beyond max_externalized_slots, matching
-        // stellar-core's LEDGER_VALIDITY_BRACKET lookback cushion.
+        // stellar-core's SCP_EXTRA_LOOKBACK_LEDGERS.
         const PEER_LEDGER_WINDOW: u32 = 3;
         let window = max_slots.min(PEER_LEDGER_WINDOW);
         if low > window {
@@ -1246,6 +1250,12 @@ impl Herder {
         } else {
             low = 1;
         }
+
+        // Do not ask for slots we'd be dropping anyway (stellar-core parity:
+        // `low = std::max<uint32>(low, getMinLedgerSeqToRemember())`).
+        let herder_low = self.get_min_ledger_seq_to_remember() as u32;
+        low = low.max(herder_low);
+
         low
     }
 

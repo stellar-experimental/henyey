@@ -983,6 +983,8 @@ impl App {
 
         let overlay_clone = Arc::clone(&overlay);
         let envelope_count = envelopes.len();
+        // Use the shared low-watermark helper instead of raw current_ledger (#2904).
+        let ledger_seq = self.scp_state_request_ledger_seq();
         henyey_common::spawn_observed("scp_envelope_forwarding", async move {
             let broadcast_futures: Vec<_> = envelopes
                 .into_iter()
@@ -1005,7 +1007,6 @@ impl App {
                 );
             }
 
-            let ledger_seq = current_ledger;
             tracing::info!(
                 ledger_seq,
                 "Requesting SCP state from peers (recovery task)"
@@ -1553,7 +1554,8 @@ impl App {
                     // sees this attempt and does not immediately duplicate it.
                     *self.last_scp_state_request_at.write().await = self.clock.now();
                     let overlay_clone = std::sync::Arc::clone(&overlay);
-                    let ledger = current_ledger;
+                    // Use the shared low-watermark helper instead of raw current_ledger (#2904).
+                    let ledger = self.scp_state_request_ledger_seq();
                     henyey_common::spawn_observed(
                         "inter_checkpoint_scp_state_request",
                         async move {

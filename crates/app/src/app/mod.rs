@@ -2676,6 +2676,13 @@ impl App {
         self.request_scp_state_from_peers().await;
     }
 
+    /// Returns the low-watermark ledger sequence for outbound `GetScpState`
+    /// requests. Delegates to `Herder::get_min_ledger_seq_to_ask_peers()` so
+    /// all recovery/catchup callers use the same parity-correct formula.
+    pub(crate) fn scp_state_request_ledger_seq(&self) -> u32 {
+        self.herder.get_min_ledger_seq_to_ask_peers()
+    }
+
     /// Request SCP state from all connected peers.
     pub async fn request_scp_state_from_peers(&self) {
         let Some(overlay) = self.overlay().await else {
