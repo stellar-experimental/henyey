@@ -2824,6 +2824,16 @@ impl Herder {
         self.fetching_envelopes
             .erase_outside_range(min_slot, max_slot, keep_slot);
 
+        // Evict cached tx sets outside the valid slot range in scp_driver.
+        // Parity: stellar-core PendingEnvelopes::eraseOutsideRange (line 726-731)
+        // also prunes the tx-set cache for entries outside [min, max].
+        // The lower bound is already handled by purge_slots_below / trim_stale_caches;
+        // this covers the upper bound so far-future slot touches cannot pin tx-sets
+        // indefinitely outside the active window.
+        if let Some(max) = max_slot {
+            self.scp_driver.evict_cached_above(max);
+        }
+
         // Clean up old data
         self.cleanup();
 

@@ -2776,6 +2776,15 @@ impl ScpDriver {
         // See #1874.
     }
 
+    /// Evict cached tx sets with a known slot above the given upper bound.
+    /// Parity: stellar-core evicts tx-set cache entries outside
+    /// `[minSlotToRemember, maxSlotToRemember]` during `newSlotExternalized`.
+    /// The lower-bound eviction is already handled by `purge_slots_below` /
+    /// `trim_stale_caches`; this covers the upper bound.
+    pub fn evict_cached_above(&self, max_slot: SlotIndex) -> usize {
+        self.tx_tracker.evict_cached_above(max_slot)
+    }
+
     /// Get local SCP envelopes for a slot.
     ///
     /// Returns envelopes this node has emitted for the given slot.
@@ -3723,6 +3732,78 @@ mod cache_tests {
         assert!(!driver.has_tx_set(ts2.hash()));
         // Slot 3 (retained) should still be cached
         assert!(driver.has_tx_set(ts3.hash()));
+    }
+
+    #[test]
+    fn test_evict_cached_above_drops_far_future_tx_sets() {
+        let driver = ScpDriver::new(
+            make_config(10),
+            Hash256::hash(b"network"),
+            make_default_lm(),
+            default_tracking(),
+            Arc::new(crate::metrics::ScpMetrics::new()),
+            make_default_upgrades(),
+            TimerManagerHandle::no_op(),
+        );
+
+        // Seed cached tx sets at various slots
+        let ts_low = make_tx_set(40);
+        let ts_mid = make_tx_set(41);
+        let ts_high = make_tx_set(42);
+        let ts_very_high = make_tx_set(43);
+
+        // Request/receive gives slot provenance
+        driver.request_tx_set(*ts_low.hash(), 50);
+        driver.receive_tx_set(ts_low.clone());
+        driver.request_tx_set(*ts_mid.hash(), 150);
+        driver.receive_tx_set(ts_mid.clone());
+        driver.request_tx_set(*ts_high.hash(), 200);
+        driver.receive_tx_set(ts_high.clone());
+        driver.request_tx_set(*ts_very_high.hash(), 500);
+        driver.receive_tx_set(ts_very_high.clone());
+
+        // Evict cached tx sets with slot > 200
+        let evicted = driver.evict_cached_above(200);
+        assert_eq!(evicted, 1); // only ts_very_high (slot 500) should be evicted
+
+        // Slots <= 200 remain
+        assert!(driver.has_tx_set(ts_low.hash()));
+        assert!(driver.has_tx_set(ts_mid.hash()));
+        assert!(driver.has_tx_set(ts_high.hash()));
+        // Slot 500 (above max) is gone
+        assert!(!driver.has_tx_set(ts_very_high.hash()));
+    }
+
+    /// Regression test: far-future envelope touch raises a cached tx-set's slot
+    /// above the validity bracket, but evict_cached_above must still reclaim it.
+    /// This reproduces the parity gap reported in PR #2906 review cycle 4.
+    #[test]
+    fn test_evict_cached_above_handles_slot_raised_by_touch() {
+        let driver = ScpDriver::new(
+            make_config(10),
+            Hash256::hash(b"network"),
+            make_default_lm(),
+            default_tracking(),
+            Arc::new(crate::metrics::ScpMetrics::new()),
+            make_default_upgrades(),
+            TimerManagerHandle::no_op(),
+        );
+
+        // Cache a tx set at a normal slot (100)
+        let ts = make_tx_set(50);
+        driver.request_tx_set(*ts.hash(), 100);
+        driver.receive_tx_set(ts.clone());
+        assert!(driver.has_tx_set(ts.hash()));
+
+        // Simulate a far-future envelope touching the same hash, raising its
+        // slot to 9999 (above any reasonable validity bracket).
+        assert!(driver.has_tx_set_and_touch(ts.hash(), 9999));
+
+        // Upper-bound eviction with max_slot=200 should evict it because its
+        // slot is now 9999 > 200.
+        let evicted = driver.evict_cached_above(200);
+        assert_eq!(evicted, 1);
+        assert!(!driver.has_tx_set(ts.hash()));
     }
 }
 ///

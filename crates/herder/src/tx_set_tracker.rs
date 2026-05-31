@@ -433,6 +433,18 @@ impl TxSetTracker {
         before - self.cache.len()
     }
 
+    /// Evict cached tx sets with a known slot > `max_slot`.
+    /// Entries with `slot: None` are preserved (unknown-slot sentinel).
+    /// Parity: stellar-core `PendingEnvelopes::eraseOutsideRange` evicts tx-set
+    /// cache entries with `slot > maxSlot` during `newSlotExternalized`.
+    /// Returns the number of entries evicted.
+    pub fn evict_cached_above(&self, max_slot: u64) -> usize {
+        let before = self.cache.len();
+        self.cache
+            .retain(|_, entry| entry.slot.map_or(true, |s| s <= max_slot));
+        before - self.cache.len()
+    }
+
     /// Count cached tx sets whose slot falls within [from_slot, to_slot] (inclusive).
     /// Entries with `slot: None` are NOT counted (they are from direct inserts,
     /// not from pending fetches in the active catchup window).
@@ -1390,5 +1402,51 @@ mod tests {
         // Touch with None → should keep 20
         assert!(tracker.is_cached_and_touch_slot(&hash, None));
         assert_eq!(tracker.cache.get(&hash).unwrap().slot, Some(20));
+    }
+
+    #[test]
+    fn test_evict_cached_above_drops_entries_above_max_slot() {
+        let tracker = TxSetTracker::new(256);
+
+        // Direct store (no slot) — should be preserved
+        let ts_direct = make_tx_set(70);
+        let hash_direct = *ts_direct.hash();
+        tracker.store(ts_direct);
+
+        // Slotted entries
+        let ts_within = make_tx_set(71);
+        let hash_within = *ts_within.hash();
+        tracker.request(hash_within, 100);
+        tracker.receive(ts_within);
+
+        let ts_at_boundary = make_tx_set(72);
+        let hash_at = *ts_at_boundary.hash();
+        tracker.request(hash_at, 200);
+        tracker.receive(ts_at_boundary);
+
+        let ts_above = make_tx_set(73);
+        let hash_above = *ts_above.hash();
+        tracker.request(hash_above, 201);
+        tracker.receive(ts_above);
+
+        let ts_far_above = make_tx_set(74);
+        let hash_far = *ts_far_above.hash();
+        tracker.request(hash_far, 9999);
+        tracker.receive(ts_far_above);
+
+        // Evict entries with slot > 200
+        let evicted = tracker.evict_cached_above(200);
+        assert_eq!(evicted, 2); // ts_above (201) and ts_far_above (9999)
+
+        // Direct-store (no slot) preserved
+        assert!(tracker.is_cached(&hash_direct));
+        // slot 100 preserved
+        assert!(tracker.is_cached(&hash_within));
+        // slot 200 (boundary, <=) preserved
+        assert!(tracker.is_cached(&hash_at));
+        // slot 201 evicted
+        assert!(!tracker.is_cached(&hash_above));
+        // slot 9999 evicted
+        assert!(!tracker.is_cached(&hash_far));
     }
 }
