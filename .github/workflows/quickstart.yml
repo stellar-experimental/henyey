@@ -91,19 +91,31 @@ jobs:
   # internal-build.yml (artifact/image contract) from the resolved SHA, then
   # validates both against scripts/ci/upstream-quickstart-contract.yml.
   #
-  # Limitation: GitHub Actions does not support dynamic refs in reusable
-  # workflow `uses:` — the build job below calls build.yml@main. This means
-  # the executed workflow definition can drift independently of the SHA we
-  # validate here. This step catches contract drift *at the resolved SHA*
-  # as a best-effort early signal; it does NOT guarantee the @main definition
-  # is identical. If upstream makes a breaking change to main without also
-  # changing the contract at HEAD, a false-green is possible. True pinning
-  # requires vendoring the upstream workflow (tracked as future work).
+  # The drift guard step verifies the resolved SHA == current main HEAD,
+  # since GitHub Actions requires the literal `@main` ref in `uses:`. If they
+  # diverge (e.g., setup resolved a stale SHA), the job fails immediately
+  # rather than validating one revision while executing another.
   validate-contract:
     needs: setup
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      - name: Verify resolved SHA matches @main (drift guard)
+        run: |
+          SHA="${{ needs.setup.outputs.quickstart-sha }}"
+          # We call build.yml@main but validate at $SHA. If main has advanced
+          # past the SHA we resolved in setup, the executed workflow may differ
+          # from what we validated — fail fast to avoid silent false-greens.
+          MAIN_SHA=$(git ls-remote https://github.com/stellar/quickstart.git refs/heads/main | cut -f1)
+          if [[ "$SHA" != "$MAIN_SHA" ]]; then
+            echo "✗ Resolved SHA ($SHA) differs from current main ($MAIN_SHA)."
+            echo "  The build job calls build.yml@main but we validated at $SHA."
+            echo "  This means the executed workflow may have drifted from what"
+            echo "  we validated. Re-run the workflow to pick up the latest SHA."
+            exit 1
+          fi
+          echo "✓ Resolved SHA matches current main — no @main drift."
 
       - name: Fetch upstream workflows
         run: |
@@ -196,13 +208,17 @@ jobs:
               ERRORS=$((ERRORS + 1))
             fi
 
-            # Validate the artifact name template includes both tag and arch interpolation.
-            # Upstream uses ${{ inputs.tag }} or ${{ matrix.tag }} for tag, and
-            # ${{ matrix.arch }} or ${{ inputs.arch }} for arch in the artifact name.
-            if grep "$ARTIFACT_PREFIX" "$INTERNAL" | grep -qE '\$\{\{.*\}\}.*\$\{\{.*\}\}'; then
-              echo "✓ internal-build.yml artifact name interpolates tag and arch"
+            # Validate the artifact name template follows the exact {tag}-{arch}.tar structure.
+            # Upstream must produce: image-quickstart-<tag_expr>-<arch_expr> (with .tar optional
+            # in the upload name). We check that the line contains the prefix, then a tag
+            # expression, a literal hyphen separator, then an arch expression — in that order.
+            # This rejects incompatible shapes like {arch}-{tag} or {tag}.zip.
+            ARTIFACT_REGEX="${ARTIFACT_PREFIX}"'\$\{\{[^}]*(tag|inputs\.tag|matrix\.tag)[^}]*\}\}-\$\{\{[^}]*(arch|matrix\.arch|inputs\.arch)[^}]*\}\}'
+            if grep -qE "$ARTIFACT_REGEX" "$INTERNAL"; then
+              echo "✓ internal-build.yml artifact name matches {tag}-{arch} structure"
             else
-              echo "✗ internal-build.yml artifact name does not interpolate both tag and arch"
+              echo "✗ internal-build.yml artifact name does not match expected {tag}-{arch} structure"
+              echo "  Expected regex: $ARTIFACT_REGEX"
               echo "  Expected pattern: $ARTIFACT_PATTERN (tag=testing-with-pr, arch=amd64)"
               ERRORS=$((ERRORS + 1))
             fi
@@ -221,11 +237,15 @@ jobs:
               ERRORS=$((ERRORS + 1))
             fi
 
-            # Validate the image tag template includes interpolation for tag and arch.
-            if grep "$IMAGE_TAG_PREFIX" "$INTERNAL" | grep -qE '\$\{\{.*\}\}'; then
-              echo "✓ internal-build.yml image tag includes interpolation"
+            # Validate the image tag template follows the exact {tag}-{arch} structure.
+            # Upstream must tag as: quickstart:<tag_expr>-<arch_expr>.
+            # Reject shapes like quickstart:${{ inputs.tag }} (missing arch).
+            TAG_REGEX="${IMAGE_TAG_PREFIX}"'\$\{\{[^}]*(tag|inputs\.tag|matrix\.tag)[^}]*\}\}-\$\{\{[^}]*(arch|matrix\.arch|inputs\.arch)[^}]*\}\}'
+            if grep -qE "$TAG_REGEX" "$INTERNAL"; then
+              echo "✓ internal-build.yml image tag matches {tag}-{arch} structure"
             else
-              echo "✗ internal-build.yml image tag is static (no interpolation)"
+              echo "✗ internal-build.yml image tag does not match expected {tag}-{arch} structure"
+              echo "  Expected regex: $TAG_REGEX"
               echo "  Expected: dynamic tag with {tag}-{arch} pattern"
               ERRORS=$((ERRORS + 1))
             fi
@@ -266,12 +286,9 @@ jobs:
   # Build the quickstart image with test: false — testing is handled locally.
   #
   # NOTE: GitHub Actions does not support dynamic refs in `uses:` for reusable
-  # workflows (expressions like ${{ ... }} are not evaluated in this field).
-  # We call build.yml@main, meaning the executed workflow definition tracks
-  # upstream's main branch. The `validate-contract` job above validates the
-  # contract *at the resolved SHA*, providing best-effort drift detection, but
-  # cannot guarantee the @main definition matches that SHA. If this becomes a
-  # source of flakes, the next step is to vendor the build logic locally.
+  # workflows. We call build.yml@main; the `validate-contract` job's drift
+  # guard ensures the resolved SHA == main HEAD before we reach this point,
+  # so the validated and executed definitions are the same revision.
   build:
     needs: [setup, validate-contract]
     uses: stellar/quickstart/.github/workflows/build.yml@main

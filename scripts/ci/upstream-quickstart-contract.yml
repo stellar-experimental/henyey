@@ -7,11 +7,9 @@
 # breaks these, we'll get a clear failure here rather than a mysterious
 # flake in the test matrix.
 #
-# IMPORTANT LIMITATION: GitHub Actions does not support dynamic refs in
-# reusable workflow `uses:`. Our workflow calls build.yml@main, so the
-# executed workflow definition can drift independently of the SHA validated
-# here. This contract provides best-effort drift detection at the resolved
-# SHA. True pinning requires vendoring (tracked as future work).
+# Drift guard: The validate-contract job verifies that the resolved SHA
+# matches the current main HEAD before proceeding, ensuring the validated
+# and executed (build.yml@main) workflow definitions are the same revision.
 #
 # Last verified against: stellar/quickstart main (2026-05-31)
 # Upstream workflows validated:

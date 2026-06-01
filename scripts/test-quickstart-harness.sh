@@ -437,11 +437,11 @@ test_upstream_contract_validation() {
         tap_not_ok "workflow_reads_contract_file" "workflow does not read contract file in validation"
     fi
 
-    # Validate contract documents the @main limitation
-    if grep -q 'does not support dynamic refs' "$CONTRACT" || grep -q 'IMPORTANT LIMITATION' "$CONTRACT"; then
-        tap_ok "contract_documents_limitation"
+    # Validate contract documents the drift guard
+    if grep -q 'Drift guard' "$CONTRACT" || grep -q 'drift guard' "$CONTRACT"; then
+        tap_ok "contract_documents_drift_guard"
     else
-        tap_not_ok "contract_documents_limitation" "contract should document @main pinning limitation"
+        tap_not_ok "contract_documents_drift_guard" "contract should document the SHA == main drift guard"
     fi
 
     # Validate contract documents the delegated artifact contract
@@ -451,33 +451,40 @@ test_upstream_contract_validation() {
         tap_not_ok "contract_documents_delegated_artifact" "contract should document internal-build.yml artifact expectations"
     fi
 
-    # --- NEW: Validate the workflow enforces exact artifact-name pattern from contract ---
-    # The validate-contract job must extract expected_artifact_name from the contract file
-    # and check internal-build.yml against the exact "image-quickstart-" prefix with
-    # tag+arch interpolation — not just a broad "image-quickstart" grep.
-    if grep -q "ARTIFACT_PREFIX" "$WORKFLOW" && \
-       grep -q 'grep.*ARTIFACT_PREFIX.*INTERNAL' "$WORKFLOW" && \
-       grep -q 'grep.*ARTIFACT_PREFIX.*INTERNAL.*grep.*\\$\\{\\{' "$WORKFLOW"; then
+    # --- Validate the workflow enforces exact {tag}-{arch} artifact-name structure ---
+    # The validate-contract job must use a regex that enforces the ordering:
+    # image-quickstart-<tag_expr>-<arch_expr> (not just any two interpolations).
+    if grep -q "ARTIFACT_REGEX" "$WORKFLOW" && \
+       grep -qE 'tag.*arch' "$WORKFLOW" | head -1 && \
+       grep -q 'grep -qE.*ARTIFACT_REGEX.*INTERNAL' "$WORKFLOW"; then
         tap_ok "workflow_enforces_exact_artifact_pattern"
     else
         tap_not_ok "workflow_enforces_exact_artifact_pattern" \
-            "validate-contract must check internal-build.yml for exact artifact prefix + tag/arch interpolation"
+            "validate-contract must check internal-build.yml for exact {tag}-{arch} structure"
     fi
 
-    # --- NEW: Validate the workflow enforces exact image-tag pattern from contract ---
-    # The validate-contract job must validate the "quickstart:" image tag prefix and
-    # check that internal-build.yml uses interpolation for tag/arch in image tagging.
-    if grep -q "IMAGE_TAG_PREFIX" "$WORKFLOW" && \
-       grep -q 'grep.*IMAGE_TAG_PREFIX.*INTERNAL' "$WORKFLOW"; then
+    # --- Validate the workflow enforces exact {tag}-{arch} image-tag structure ---
+    # Same structural enforcement for image tags (quickstart:<tag>-<arch>).
+    if grep -q "TAG_REGEX" "$WORKFLOW" && \
+       grep -q 'grep -qE.*TAG_REGEX.*INTERNAL' "$WORKFLOW"; then
         tap_ok "workflow_enforces_exact_image_tag_pattern"
     else
         tap_not_ok "workflow_enforces_exact_image_tag_pattern" \
-            "validate-contract must check internal-build.yml for exact image tag prefix + interpolation"
+            "validate-contract must check internal-build.yml for exact image tag {tag}-{arch} structure"
+    fi
+
+    # --- Validate the workflow includes a drift guard (SHA == main check) ---
+    if grep -q 'git ls-remote.*quickstart.*refs/heads/main' "$WORKFLOW" && \
+       grep -q 'SHA.*MAIN_SHA\|MAIN_SHA.*SHA' "$WORKFLOW"; then
+        tap_ok "workflow_has_drift_guard"
+    else
+        tap_not_ok "workflow_has_drift_guard" \
+            "validate-contract must verify resolved SHA == main HEAD before build"
     fi
 }
 
 # --- Run all tests ---
-tap_plan 32
+tap_plan 33
 
 test_timeout_retry_on_targeted_shard
 test_non_timeout_failure_no_retry
