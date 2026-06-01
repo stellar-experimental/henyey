@@ -19,6 +19,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 WRAPPER="$REPO_ROOT/scripts/ci/run-quickstart-test.sh"
 WORKFLOW="$REPO_ROOT/.github/workflows/quickstart.yml"
+CONTRACT="$REPO_ROOT/scripts/ci/upstream-quickstart-contract.yml"
 
 # TAP output
 TEST_COUNT=0
@@ -312,8 +313,81 @@ test_success_no_retry_artifacts() {
     fi
 }
 
+# ============================================================
+# Test 7: test_upstream_contract_pinned_and_workflow_matches
+#
+# Validates that the workflow's assumptions about upstream stellar/quickstart
+# match the pinned contract file. This catches drift: if upstream changes
+# artifact naming, image tags, or probe layout, the contract file must be
+# updated explicitly (forcing a human review of whether our workflow still
+# works).
+# ============================================================
+test_upstream_contract_validation() {
+    if [[ ! -f "$CONTRACT" ]]; then
+        tap_not_ok "upstream_contract_file_exists" "scripts/ci/upstream-quickstart-contract.yml not found"
+        tap_not_ok "workflow_artifact_matches_contract" "skipped (no contract)"
+        tap_not_ok "workflow_image_tag_matches_contract" "skipped (no contract)"
+        tap_not_ok "workflow_build_inputs_match_contract" "skipped (no contract)"
+        tap_not_ok "workflow_pubnet_exclusions_match_contract" "skipped (no contract)"
+        tap_not_ok "workflow_probe_normalization_matches_contract" "skipped (no contract)"
+        return
+    fi
+
+    tap_ok "upstream_contract_file_exists"
+
+    # Extract expected values from contract (simple grep — no YAML parser needed)
+    local expected_artifact expected_tag
+    expected_artifact=$(grep '^expected_artifact_name:' "$CONTRACT" | sed 's/.*: *"\(.*\)"/\1/')
+    expected_tag=$(grep '^expected_image_tag:' "$CONTRACT" | sed 's/.*: *"\(.*\)"/\1/')
+
+    # Validate artifact name in workflow matches contract
+    if grep -q "$expected_artifact" "$WORKFLOW"; then
+        tap_ok "workflow_artifact_matches_contract"
+    else
+        tap_not_ok "workflow_artifact_matches_contract" "expected '$expected_artifact' in workflow"
+    fi
+
+    # Validate image tag in workflow matches contract
+    if grep -q "$expected_tag" "$WORKFLOW"; then
+        tap_ok "workflow_image_tag_matches_contract"
+    else
+        tap_not_ok "workflow_image_tag_matches_contract" "expected '$expected_tag' in workflow"
+    fi
+
+    # Validate workflow passes test: false (matches contract's build_inputs)
+    if grep -q 'test: false' "$WORKFLOW"; then
+        tap_ok "workflow_build_inputs_match_contract"
+    else
+        tap_not_ok "workflow_build_inputs_match_contract" "test: false not found"
+    fi
+
+    # Validate pubnet exclusions match contract
+    # Contract says: horizon-core-up, horizon-ingesting, stellar-rpc-healthy excluded on pubnet
+    local pubnet_probes_line
+    pubnet_probes_line=$(awk '/network: pubnet/{found=1} found && /probes:/{print; exit}' "$WORKFLOW")
+    local contract_ok=true
+    for excluded in horizon_core_up horizon_ingesting stellar_rpc_healthy; do
+        if echo "$pubnet_probes_line" | grep -q "$excluded"; then
+            contract_ok=false
+            break
+        fi
+    done
+    if $contract_ok; then
+        tap_ok "workflow_pubnet_exclusions_match_contract"
+    else
+        tap_not_ok "workflow_pubnet_exclusions_match_contract" "pubnet includes excluded probe"
+    fi
+
+    # Validate probe normalization exists (contract says: underscores to hyphens)
+    if grep -q 'probe_name="${probe_name//_/-}"' "$WORKFLOW"; then
+        tap_ok "workflow_probe_normalization_matches_contract"
+    else
+        tap_not_ok "workflow_probe_normalization_matches_contract" "underscore-to-hyphen normalization missing"
+    fi
+}
+
 # --- Run all tests ---
-tap_plan 18
+tap_plan 24
 
 test_timeout_retry_on_targeted_shard
 test_non_timeout_failure_no_retry
@@ -321,6 +395,7 @@ test_workflow_shard_probe_contract
 test_double_timeout_fails
 test_non_targeted_timeout_no_retry
 test_success_no_retry_artifacts
+test_upstream_contract_validation
 
 echo ""
 echo "# Results: $PASS_COUNT/$TEST_COUNT passed, $FAIL_COUNT failed"

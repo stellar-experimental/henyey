@@ -77,9 +77,74 @@ jobs:
           echo "sha=$SHA" >> "$GITHUB_OUTPUT"
           echo "Resolved stellar/quickstart SHA: $SHA"
 
+  # Validate that our assumptions about the upstream contract still hold.
+  # This fetches the upstream build workflow and checks it against our pinned
+  # contract expectations. Fails fast if upstream has drifted.
+  validate-contract:
+    needs: setup
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch upstream build workflow
+        run: |
+          curl -sf "https://raw.githubusercontent.com/stellar/quickstart/${{ needs.setup.outputs.quickstart-sha }}/.github/workflows/build.yml" \
+            -o /tmp/upstream-build.yml
+
+      - name: Validate upstream contract
+        run: |
+          CONTRACT="scripts/ci/upstream-quickstart-contract.yml"
+          UPSTREAM="/tmp/upstream-build.yml"
+
+          echo "=== Validating upstream quickstart contract ==="
+
+          # Check that upstream build.yml accepts 'test' input (our test: false depends on it)
+          if grep -q 'test:' "$UPSTREAM" && grep -A5 'test:' "$UPSTREAM" | grep -q 'type: boolean\|type:.*bool'; then
+            echo "✓ upstream accepts 'test' boolean input"
+          else
+            echo "✗ upstream 'test' input not found or not boolean — contract may have drifted"
+            exit 1
+          fi
+
+          # Check that upstream build.yml accepts 'images' input
+          if grep -q 'images:' "$UPSTREAM"; then
+            echo "✓ upstream accepts 'images' input"
+          else
+            echo "✗ upstream 'images' input not found — contract may have drifted"
+            exit 1
+          fi
+
+          # Check that upstream build.yml accepts 'archs' input
+          if grep -q 'archs:' "$UPSTREAM"; then
+            echo "✓ upstream accepts 'archs' input"
+          else
+            echo "✗ upstream 'archs' input not found — contract may have drifted"
+            exit 1
+          fi
+
+          # Check that upstream build.yml accepts 'ref' input
+          if grep -q 'ref:' "$UPSTREAM"; then
+            echo "✓ upstream accepts 'ref' input"
+          else
+            echo "✗ upstream 'ref' input not found — contract may have drifted"
+            exit 1
+          fi
+
+          # Check that upstream produces artifacts matching our expected naming
+          # The artifact name pattern from our contract: image-quickstart-{tag}-{arch}.tar
+          if grep -q 'image-quickstart' "$UPSTREAM" || grep -q 'upload-artifact' "$UPSTREAM"; then
+            echo "✓ upstream produces image artifacts"
+          else
+            echo "⚠ could not confirm artifact naming in upstream (non-blocking)"
+          fi
+
+          echo ""
+          echo "=== Upstream contract validation passed ==="
+          echo "SHA: ${{ needs.setup.outputs.quickstart-sha }}"
+
   # Build the quickstart image with test: false — testing is handled locally.
   build:
-    needs: setup
+    needs: [setup, validate-contract]
     uses: stellar/quickstart/.github/workflows/build.yml@main
     with:
       ref: ${{ needs.setup.outputs.quickstart-sha }}
