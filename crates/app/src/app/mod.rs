@@ -2683,7 +2683,12 @@ impl App {
         self.herder.get_min_ledger_seq_to_ask_peers()
     }
 
-    /// Request SCP state from all connected peers.
+    /// Request SCP state from up to 2 random authenticated peers using the
+    /// shared low-watermark. This is the canonical dispatch point for all
+    /// GetScpState pulls (lifecycle, recovery, catchup, simulation).
+    ///
+    /// Parity: mirrors stellar-core's `getMoreSCPState()` bounded-pull
+    /// semantics (HerderImpl.cpp:2643-2658).
     pub async fn request_scp_state_from_peers(&self) {
         let Some(overlay) = self.overlay().await else {
             return;
@@ -2695,14 +2700,13 @@ impl App {
             return;
         }
 
-        // Request SCP state from a low watermark similar to stellar-core behavior.
-        let ledger_seq = self.herder.get_min_ledger_seq_to_ask_peers();
-        match overlay.request_scp_state(ledger_seq).await {
+        let ledger_seq = self.scp_state_request_ledger_seq();
+        match overlay.request_scp_state(ledger_seq) {
             Ok(count) => {
                 tracing::info!(
                     ledger_seq,
                     peers_sent = count,
-                    "Requested SCP state from peers"
+                    "Requested SCP state from peers (bounded pull)"
                 );
             }
             Err(e) => {

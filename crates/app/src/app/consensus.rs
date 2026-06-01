@@ -958,12 +958,17 @@ impl App {
     ///
     /// Spawns a background task to avoid blocking the event loop.
     async fn broadcast_recovery_scp_state(&self, current_ledger: u32) {
-        let from_slot = current_ledger.saturating_sub(5) as u64;
-        tracing::debug!(from_slot, "Getting SCP state for recovery");
-        let envelopes = self.herder.get_scp_state(from_slot);
+        // Parity: stellar-core `HerderImpl::maybeTriggerNextLedger` (HerderImpl.cpp:554-560)
+        // rebroadcasts only the current slot's latest messages, then issues a
+        // bounded GetScpState pull. Previously we dumped historical envelopes
+        // from get_scp_state(current_ledger - 5) and broadcast GetScpState to
+        // ALL peers, causing periodic backpressure episodes (#2909).
+        let next_slot = current_ledger as u64 + 1;
+        let envelopes = self.herder.scp().get_latest_messages_send(next_slot);
         tracing::debug!(
+            next_slot,
             envelope_count = envelopes.len(),
-            "Got SCP state for recovery"
+            "Got latest messages for recovery rebroadcast"
         );
 
         let Some(overlay) = self.overlay().await else {
@@ -977,15 +982,18 @@ impl App {
             return;
         }
 
-        // Record timestamp before spawning so heartbeat/gap throttle sees
+        // Record timestamp before dispatching so heartbeat/gap throttle sees
         // this attempt and does not immediately duplicate it.
         *self.last_scp_state_request_at.write().await = self.clock.now();
 
+        // Step 1: Rebroadcast current-slot latest envelopes to all peers.
         let overlay_clone = Arc::clone(&overlay);
         let envelope_count = envelopes.len();
-        // Use the shared low-watermark helper instead of raw current_ledger (#2904).
+        // Step 2: Bounded pull — GetScpState to up to 2 random peers.
         let ledger_seq = self.scp_state_request_ledger_seq();
+
         henyey_common::spawn_observed("scp_envelope_forwarding", async move {
+            // Rebroadcast current-slot envelopes.
             let broadcast_futures: Vec<_> = envelopes
                 .into_iter()
                 .map(|envelope| {
@@ -1003,15 +1011,16 @@ impl App {
             if broadcast_count > 0 {
                 tracing::info!(
                     broadcast_count,
-                    "Broadcast SCP envelopes during out-of-sync recovery"
+                    "Broadcast current-slot SCP envelopes during out-of-sync recovery"
                 );
             }
 
+            // Bounded pull: request SCP state from up to 2 random peers.
             tracing::info!(
                 ledger_seq,
-                "Requesting SCP state from peers (recovery task)"
+                "Requesting SCP state from peers (recovery task, bounded pull)"
             );
-            match overlay_clone.request_scp_state(ledger_seq).await {
+            match overlay_clone.request_scp_state(ledger_seq) {
                 Ok(count) => {
                     tracing::info!(
                         ledger_seq,
@@ -1553,20 +1562,14 @@ impl App {
                     // Record timestamp before spawning so heartbeat/gap throttle
                     // sees this attempt and does not immediately duplicate it.
                     *self.last_scp_state_request_at.write().await = self.clock.now();
-                    let overlay_clone = std::sync::Arc::clone(&overlay);
                     // Use the shared low-watermark helper instead of raw current_ledger (#2904).
                     let ledger = self.scp_state_request_ledger_seq();
-                    henyey_common::spawn_observed(
-                        "inter_checkpoint_scp_state_request",
-                        async move {
-                            if let Err(e) = overlay_clone.request_scp_state(ledger).await {
-                                tracing::debug!(
-                                    error = %e,
-                                    "Failed to request SCP state during inter-checkpoint recovery"
-                                );
-                            }
-                        },
-                    );
+                    if let Err(e) = overlay.request_scp_state(ledger) {
+                        tracing::debug!(
+                            error = %e,
+                            "Failed to request SCP state during inter-checkpoint recovery"
+                        );
+                    }
                 }
 
                 // Retry exhausted tx_set fetches with 30s per-hash backoff.

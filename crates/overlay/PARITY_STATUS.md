@@ -326,6 +326,7 @@ Corresponds to: `OverlayManager.h`, `OverlayManagerImpl.h`
 | `getRandomInboundAuthenticatedPeers()` | N/A | None |
 | `getRandomOutboundAuthenticatedPeers()` | N/A | None |
 | `getConnectedPeer()` | (via DashMap lookup) | Full |
+| `getMoreSCPState()` (bounded 2-peer pull) | `request_scp_state()` — selects up to 2 random authenticated peers | Full |
 | `maybeAddInboundConnection()` | (in listener accept flow) | Full |
 | `addOutboundConnection()` | (in connector flow) | Full |
 | `removePeer()` | (via peer drop) | Full |
