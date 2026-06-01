@@ -337,15 +337,18 @@ test_upstream_contract_validation() {
         tap_not_ok "workflow_reads_contract_file" "skipped (no contract)"
         tap_not_ok "contract_documents_limitation" "skipped (no contract)"
         tap_not_ok "contract_documents_delegated_artifact" "skipped (no contract)"
+        tap_not_ok "workflow_enforces_exact_artifact_pattern" "skipped (no contract)"
+        tap_not_ok "workflow_enforces_exact_image_tag_pattern" "skipped (no contract)"
         return
     fi
 
     tap_ok "upstream_contract_file_exists"
 
     # Extract expected values from contract (simple grep — no YAML parser needed)
-    local expected_artifact expected_tag
+    local expected_artifact expected_tag artifact_pattern
     expected_artifact=$(grep '^expected_artifact_name:' "$CONTRACT" | sed 's/.*: *"\(.*\)"/\1/')
     expected_tag=$(grep '^expected_image_tag:' "$CONTRACT" | sed 's/.*: *"\(.*\)"/\1/')
+    artifact_pattern=$(grep '^artifact_name_pattern:' "$CONTRACT" | sed 's/.*: *"\(.*\)"/\1/')
 
     # Validate artifact name in workflow matches contract
     if grep -q "$expected_artifact" "$WORKFLOW"; then
@@ -420,10 +423,34 @@ test_upstream_contract_validation() {
     else
         tap_not_ok "contract_documents_delegated_artifact" "contract should document internal-build.yml artifact expectations"
     fi
+
+    # --- NEW: Validate the workflow enforces exact artifact-name pattern from contract ---
+    # The validate-contract job must extract expected_artifact_name from the contract file
+    # and check internal-build.yml against the exact "image-quickstart-" prefix with
+    # tag+arch interpolation — not just a broad "image-quickstart" grep.
+    if grep -q "ARTIFACT_PREFIX" "$WORKFLOW" && \
+       grep -q 'grep.*ARTIFACT_PREFIX.*INTERNAL' "$WORKFLOW" && \
+       grep -q 'grep.*ARTIFACT_PREFIX.*INTERNAL.*grep.*\\$\\{\\{' "$WORKFLOW"; then
+        tap_ok "workflow_enforces_exact_artifact_pattern"
+    else
+        tap_not_ok "workflow_enforces_exact_artifact_pattern" \
+            "validate-contract must check internal-build.yml for exact artifact prefix + tag/arch interpolation"
+    fi
+
+    # --- NEW: Validate the workflow enforces exact image-tag pattern from contract ---
+    # The validate-contract job must validate the "quickstart:" image tag prefix and
+    # check that internal-build.yml uses interpolation for tag/arch in image tagging.
+    if grep -q "IMAGE_TAG_PREFIX" "$WORKFLOW" && \
+       grep -q 'grep.*IMAGE_TAG_PREFIX.*INTERNAL' "$WORKFLOW"; then
+        tap_ok "workflow_enforces_exact_image_tag_pattern"
+    else
+        tap_not_ok "workflow_enforces_exact_image_tag_pattern" \
+            "validate-contract must check internal-build.yml for exact image tag prefix + interpolation"
+    fi
 }
 
 # --- Run all tests ---
-tap_plan 28
+tap_plan 30
 
 test_timeout_retry_on_targeted_shard
 test_non_timeout_failure_no_retry

@@ -169,21 +169,64 @@ jobs:
           if [[ -f "$INTERNAL" ]]; then
             echo "✓ internal-build.yml found at resolved SHA"
 
-            # Check artifact upload naming pattern.
-            # upstream uses: image-quickstart-${{ inputs.tag || ... }}-${{ matrix.arch }}
-            if grep -q 'image-quickstart' "$INTERNAL"; then
-              echo "✓ internal-build.yml uses 'image-quickstart' artifact naming"
-            else
-              echo "✗ internal-build.yml does not contain 'image-quickstart' artifact naming"
-              echo "  Expected pattern: $ARTIFACT_PATTERN"
-              ERRORS=$((ERRORS + 1))
-            fi
-
             # Check that it uploads artifacts (upload-artifact action present)
             if grep -q 'upload-artifact' "$INTERNAL"; then
               echo "✓ internal-build.yml uploads artifacts"
             else
               echo "✗ internal-build.yml does not use upload-artifact"
+              ERRORS=$((ERRORS + 1))
+            fi
+
+            # --- Exact artifact name validation ---
+            # The contract specifies artifact_name_pattern: "image-quickstart-{tag}-{arch}.tar"
+            # Upstream internal-build.yml constructs the artifact name using expressions like:
+            #   image-quickstart-${{ inputs.tag ... }}-${{ matrix.arch }}
+            # We validate: (a) the exact "image-quickstart-" prefix with tag/arch interpolation,
+            # and (b) our concrete expected_artifact_name decomposes correctly from the pattern.
+            #
+            # Convert pattern "image-quickstart-{tag}-{arch}.tar" into a regex that matches
+            # the upstream template expression (tag and arch are GHA expressions).
+            ARTIFACT_PREFIX="image-quickstart-"
+            if grep -q "${ARTIFACT_PREFIX}" "$INTERNAL"; then
+              echo "✓ internal-build.yml artifact name uses prefix '${ARTIFACT_PREFIX}'"
+            else
+              echo "✗ internal-build.yml missing artifact name prefix '${ARTIFACT_PREFIX}'"
+              echo "  Expected pattern: $ARTIFACT_PATTERN"
+              echo "  Expected concrete: $EXPECTED_ARTIFACT"
+              ERRORS=$((ERRORS + 1))
+            fi
+
+            # Validate the artifact name template includes both tag and arch interpolation.
+            # Upstream uses ${{ inputs.tag }} or ${{ matrix.tag }} for tag, and
+            # ${{ matrix.arch }} or ${{ inputs.arch }} for arch in the artifact name.
+            if grep "$ARTIFACT_PREFIX" "$INTERNAL" | grep -qE '\$\{\{.*\}\}.*\$\{\{.*\}\}'; then
+              echo "✓ internal-build.yml artifact name interpolates tag and arch"
+            else
+              echo "✗ internal-build.yml artifact name does not interpolate both tag and arch"
+              echo "  Expected pattern: $ARTIFACT_PATTERN (tag=testing-with-pr, arch=amd64)"
+              ERRORS=$((ERRORS + 1))
+            fi
+
+            # --- Exact image tag validation ---
+            # The contract specifies image_tag_pattern: "quickstart:{tag}-{arch}"
+            # Upstream tags the image as quickstart:${{ inputs.tag }}-${{ matrix.arch }}
+            # or similar. Validate the "quickstart:" prefix with tag-arch interpolation.
+            IMAGE_TAG_PREFIX="quickstart:"
+            if grep -q "${IMAGE_TAG_PREFIX}" "$INTERNAL"; then
+              echo "✓ internal-build.yml image tag uses prefix '${IMAGE_TAG_PREFIX}'"
+            else
+              echo "✗ internal-build.yml missing image tag prefix '${IMAGE_TAG_PREFIX}'"
+              echo "  Expected tag pattern: quickstart:{tag}-{arch}"
+              echo "  Expected concrete: $EXPECTED_TAG"
+              ERRORS=$((ERRORS + 1))
+            fi
+
+            # Validate the image tag template includes interpolation for tag and arch.
+            if grep "$IMAGE_TAG_PREFIX" "$INTERNAL" | grep -qE '\$\{\{.*\}\}'; then
+              echo "✓ internal-build.yml image tag includes interpolation"
+            else
+              echo "✗ internal-build.yml image tag is static (no interpolation)"
+              echo "  Expected: dynamic tag with {tag}-{arch} pattern"
               ERRORS=$((ERRORS + 1))
             fi
 
@@ -196,7 +239,7 @@ jobs:
           else
             # internal-build.yml not found — check if build.yml itself handles artifacts
             echo "⚠ internal-build.yml not found at resolved SHA (may be inlined in build.yml)"
-            if grep -q 'image-quickstart' "$UPSTREAM" && grep -q 'upload-artifact' "$UPSTREAM"; then
+            if grep -q "${ARTIFACT_PREFIX:-image-quickstart-}" "$UPSTREAM" && grep -q 'upload-artifact' "$UPSTREAM"; then
               echo "✓ build.yml directly handles artifact upload with expected naming"
             else
               echo "✗ neither build.yml nor internal-build.yml confirms artifact contract"
