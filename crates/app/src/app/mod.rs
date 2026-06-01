@@ -12687,4 +12687,114 @@ mod tests {
             get_scp_state_count
         );
     }
+
+    /// Regression test for #2912: the archive-miss fallback inside
+    /// `trigger_recovery_catchup()` must mark archive-behind, advance the
+    /// SCP-state-request timestamp, return `None` (no catchup spawned), and
+    /// send `GetScpState` to exactly 2 of 3 peers via bounded pull.
+    ///
+    /// Call chain exercised:
+    ///   out_of_sync_recovery → fast-track (AtTip + SCP traffic)
+    ///   → trigger_recovery_catchup → archive cache below next_cp
+    ///   → mark_archive_confirmed_behind → peer-SCP fallback (request_scp_state)
+    #[tokio::test]
+    async fn test_trigger_recovery_catchup_archive_skip_requests_bounded_scp_state() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-test.db");
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
+        let app = App::new(config).await.unwrap();
+
+        // Inject 3 test peers into the overlay.
+        let overlay_config = OverlayManagerConfig::default();
+        let local_node = LocalNode::new_testnet(henyey_crypto::SecretKey::generate());
+        let overlay = OverlayManager::new(overlay_config, local_node).unwrap();
+        let peer1 = PeerId::from_bytes([0xC1; 32]);
+        let peer2 = PeerId::from_bytes([0xC2; 32]);
+        let peer3 = PeerId::from_bytes([0xC3; 32]);
+        let mut rx1 = overlay.inject_test_peer(peer1, 64);
+        let mut rx2 = overlay.inject_test_peer(peer2, 64);
+        let mut rx3 = overlay.inject_test_peer(peer3, 64);
+        overlay.set_running_for_test();
+        *app.overlay.write().await = Some(Arc::new(overlay));
+
+        let current_ledger: u32 = 100;
+        // checkpoint_containing(101) = 127, so seeding at 63 is below next_cp.
+        let next_cp = henyey_history::checkpoint::checkpoint_containing(current_ledger + 1);
+        assert_eq!(next_cp, 127, "precondition: next checkpoint for ledger 101");
+        app.archive_checkpoint_cache.seed(63);
+
+        // Set up fast-track conditions: SCP traffic since reset, attempts >= 1,
+        // AtTip relation (latest_externalized == current_ledger).
+        app.scp_messages_received.store(10, Ordering::Relaxed);
+        app.recovery_baseline_scp_received
+            .store(0, Ordering::SeqCst);
+        app.recovery_attempts_without_progress
+            .store(1, Ordering::SeqCst);
+        app.recovery_baseline_ledger
+            .store(current_ledger as u64, Ordering::SeqCst);
+
+        // Record timestamp before the call.
+        let before = *app.last_scp_state_request_at.read().await;
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+
+        // Drive recovery through the fast-track → trigger_recovery_catchup path.
+        let result = app.out_of_sync_recovery(current_ledger).await;
+
+        // Assert 1: no catchup spawned (archive is behind).
+        assert!(
+            result.is_none(),
+            "trigger_recovery_catchup must return None when archive is behind next checkpoint"
+        );
+
+        // Assert 2: archive recovery status is now ConfirmedBehind.
+        assert!(
+            app.archive_recovery_snapshot().await.is_confirmed_behind(),
+            "archive_recovery_status must be ConfirmedBehind after archive-miss fallback"
+        );
+
+        // Assert 3: last_scp_state_request_at advanced.
+        let after = *app.last_scp_state_request_at.read().await;
+        assert!(
+            after > before,
+            "last_scp_state_request_at must advance during fallback SCP request"
+        );
+
+        // Give the synchronous request_scp_state a moment to deliver.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // Drain all messages from the three peer receivers.
+        let drain =
+            |rx: &mut henyey_overlay::TestPeerReceiver| -> Vec<stellar_xdr::curr::StellarMessage> {
+                let mut msgs = Vec::new();
+                while let Some(msg) = rx.try_recv() {
+                    msgs.push(msg);
+                }
+                msgs
+            };
+        let msgs1 = drain(&mut rx1);
+        let msgs2 = drain(&mut rx2);
+        let msgs3 = drain(&mut rx3);
+
+        // Assert 4: exactly 2 of 3 peers received GetScpState with the
+        // correct low-watermark ledger sequence.
+        let expected_seq = app.scp_state_request_ledger_seq();
+        let get_scp_state_count: usize = [&msgs1, &msgs2, &msgs3]
+            .iter()
+            .map(|msgs| {
+                msgs.iter()
+                    .filter(|m| {
+                        matches!(m, stellar_xdr::curr::StellarMessage::GetScpState(s) if *s == expected_seq)
+                    })
+                    .count()
+            })
+            .sum();
+
+        assert_eq!(
+            get_scp_state_count, 2,
+            "Bounded pull must send GetScpState to exactly 2 of 3 peers, got {}",
+            get_scp_state_count
+        );
+    }
 }
