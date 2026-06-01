@@ -12701,7 +12701,7 @@ mod tests {
     async fn test_trigger_recovery_catchup_archive_skip_requests_bounded_scp_state() {
         let dir = tempfile::tempdir().expect("temp dir");
         let db_path = dir.path().join("rs-stellar-test.db");
-        let config = crate::config::ConfigBuilder::new()
+        let config = crate::config::ConfigBuilder::simulation()
             .database_path(db_path)
             .build();
         let app = App::new(config).await.unwrap();
