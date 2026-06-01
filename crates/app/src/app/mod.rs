@@ -12720,10 +12720,22 @@ mod tests {
         *app.overlay.write().await = Some(Arc::new(overlay));
 
         let current_ledger: u32 = 100;
-        // checkpoint_containing(101) = 127, so seeding at 63 is below next_cp.
+        // Derive checkpoint preconditions from the active cadence so the test
+        // stays correct under both default (64) and accelerated (8) frequencies.
         let next_cp = henyey_history::checkpoint::checkpoint_containing(current_ledger + 1);
-        assert_eq!(next_cp, 127, "precondition: next checkpoint for ledger 101");
-        app.archive_checkpoint_cache.seed(63);
+        assert!(
+            next_cp > current_ledger,
+            "precondition: next checkpoint ({next_cp}) must be ahead of current ledger ({current_ledger})"
+        );
+        let archive_seed = henyey_history::checkpoint::latest_checkpoint_before_or_at(
+            current_ledger,
+        )
+        .expect("precondition: there must be a published checkpoint at or before current_ledger");
+        assert!(
+            archive_seed < next_cp,
+            "precondition: seeded archive checkpoint ({archive_seed}) must be below next_cp ({next_cp})"
+        );
+        app.archive_checkpoint_cache.seed(archive_seed);
 
         // Set up fast-track conditions: SCP traffic since reset, attempts >= 1,
         // AtTip relation (latest_externalized == current_ledger).
