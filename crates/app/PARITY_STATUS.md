@@ -255,6 +255,7 @@ Features not yet implemented. These ARE counted against parity %.
 - **Post-catchup convergence**: Fixed several convergence failures including dead loops targeting stale checkpoints, deadlocks from frozen `latest_externalized`, and SCP EXTERNALIZE envelope emission for validator nodes (March–April 2026).
 - **TX queue parity**: Implemented stellar-core `updateQueue` semantics with correct invalidation and revalidation ordering (March 2026).
 - **Audit fixes**: Resolved audit findings including config passphrase matching, quorum threshold rounding, unsolicited quorum set rejection, compat config validator entry validation, and compat `SURVEYOR_KEYS` translation (March–April 2026).
+- **Out-of-sync recovery parity (#2909)**: Recovery now matches stellar-core's two-part sequence: rebroadcast only current-slot `getLatestMessagesSend(lcl+1)` envelopes, then issue bounded `GetScpState` pull to up to 2 random authenticated peers (previously flooded historical envelopes from `getSCPState(lcl-5)` and broadcast `GetScpState` to all peers).
 - **Survey protocol**: Time-sliced surveys successfully collect and report topology data from testnet peers.
 
 ## Parity Calculation

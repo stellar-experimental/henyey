@@ -1122,6 +1122,21 @@ impl NominationProtocol {
     pub(crate) fn candidates(&self) -> &BTreeSet<Value> {
         &self.candidates
     }
+
+    /// Test-only: inject an envelope as the latest nomination envelope.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn test_set_last_envelope(&mut self, envelope: ScpEnvelope) {
+        self.last_envelope = Some(envelope);
+    }
+
+    /// Test-only: inject an envelope into latest_nominations for a node.
+    ///
+    /// This makes `process_current_state` (used by `get_scp_state`) return
+    /// the envelope when iterating the slot's state.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn test_inject_latest_nomination(&mut self, node_id: NodeId, envelope: ScpEnvelope) {
+        self.latest_nominations.insert(node_id, envelope);
+    }
 }
 
 impl Default for NominationProtocol {

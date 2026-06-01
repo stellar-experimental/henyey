@@ -396,6 +396,7 @@ pub(super) struct PeerHandle {
 }
 
 /// Messages sent to a peer task via the outbound channel.
+#[derive(Debug)]
 pub(super) enum OutboundMessage {
     /// Direct send (non-flood, e.g. GetTxSet, ScpQuorumset response).
     Send(StellarMessage),
@@ -1721,10 +1722,38 @@ impl OverlayManager {
         *advertised_inbound = inbound_peers;
     }
 
-    /// Request SCP state from all peers.
-    pub async fn request_scp_state(&self, ledger_seq: u32) -> Result<usize> {
+    /// Request SCP state from up to 2 random authenticated peers.
+    ///
+    /// Parity: stellar-core `HerderImpl::getMoreSCPState()` (HerderImpl.cpp:2643-2658)
+    /// selects up to 2 random authenticated peers for `GetScpState` requests
+    /// rather than flooding all connected peers.
+    pub fn request_scp_state(&self, ledger_seq: u32) -> Result<usize> {
+        use rand::seq::SliceRandom;
+
         let message = StellarMessage::GetScpState(ledger_seq);
-        self.broadcast(message).await
+        let peers = self.connected_peers();
+        if peers.is_empty() {
+            return Ok(0);
+        }
+
+        // Select up to 2 random peers, matching stellar-core's bounded pull.
+        let mut rng = rand::thread_rng();
+        let selected: Vec<&PeerId> = peers
+            .choose_multiple(&mut rng, 2.min(peers.len()))
+            .collect();
+
+        let mut sent = 0usize;
+        for peer_id in &selected {
+            match self.try_send_to(peer_id, message.clone()) {
+                Ok(()) => sent += 1,
+                Err(e) => {
+                    debug!(peer = %peer_id, error = %e, "Failed to send GetScpState to peer");
+                }
+            }
+        }
+
+        debug!(ledger_seq, sent, "Sent GetScpState to random peers");
+        Ok(sent)
     }
 
     /// Request a transaction set by hash from all peers.
@@ -1974,6 +2003,16 @@ impl OverlayManager {
             },
         );
         TestPeerReceiver { rx: outbound_rx }
+    }
+
+    /// Mark the overlay as running for testing purposes.
+    ///
+    /// This allows `broadcast()` to proceed without calling `start()`,
+    /// which would spin up listener/connector background tasks.
+    #[doc(hidden)]
+    pub fn set_running_for_test(&self) {
+        self.running
+            .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -4303,5 +4342,94 @@ mod tests {
         // Dedup: config resolved and discovered have same canonical_key
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].host, "10.0.0.1");
+    }
+
+    /// Regression test for #2909: request_scp_state targets at most 2 random
+    /// authenticated peers instead of broadcasting to all connected peers.
+    #[test]
+    fn test_request_scp_state_targets_two_authenticated_peers() {
+        let shared = test_shared_state(vec![]);
+
+        // Insert 3 authenticated test peers.
+        let peer1 = PeerId::from_bytes([1u8; 32]);
+        let peer2 = PeerId::from_bytes([2u8; 32]);
+        let peer3 = PeerId::from_bytes([3u8; 32]);
+        let addr1: std::net::SocketAddr = "10.0.0.1:11625".parse().unwrap();
+        let addr2: std::net::SocketAddr = "10.0.0.2:11625".parse().unwrap();
+        let addr3: std::net::SocketAddr = "10.0.0.3:11625".parse().unwrap();
+
+        let mut rx1 = insert_fake_peer(
+            &shared,
+            peer1,
+            addr1,
+            crate::connection::ConnectionDirection::Outbound,
+        );
+        let mut rx2 = insert_fake_peer(
+            &shared,
+            peer2,
+            addr2,
+            crate::connection::ConnectionDirection::Outbound,
+        );
+        let mut rx3 = insert_fake_peer(
+            &shared,
+            peer3,
+            addr3,
+            crate::connection::ConnectionDirection::Outbound,
+        );
+
+        // Build an OverlayManager that uses this shared state.
+        let config = OverlayConfig::testnet();
+        let secret = henyey_crypto::SecretKey::generate();
+        let local_node = LocalNode::new_testnet(secret);
+        let mut manager = OverlayManager::new(config, local_node).unwrap();
+        // Replace the internal shared state with ours (which has peers).
+        manager.peers = shared.peers.clone();
+        manager.peer_info_cache = shared.peer_info_cache.clone();
+        manager.running = shared.running.clone();
+
+        let ledger_seq = 100u32;
+        let result = manager.request_scp_state(ledger_seq).unwrap();
+
+        // Exactly 2 peers should receive the message (3 connected, bound is 2,
+        // channels have ample capacity so no send failures).
+        assert_eq!(
+            result, 2,
+            "request_scp_state should target exactly 2 peers when 3 are connected, got {}",
+            result
+        );
+
+        // Validate that exactly 2 peers received GetScpState(ledger_seq).
+        let msg1 = rx1.try_recv().ok();
+        let msg2 = rx2.try_recv().ok();
+        let msg3 = rx3.try_recv().ok();
+
+        let received: Vec<_> = [msg1, msg2, msg3].into_iter().flatten().collect();
+        assert_eq!(
+            received.len(),
+            2,
+            "Exactly 2 of 3 peers should receive GetScpState, got {}",
+            received.len()
+        );
+
+        // Verify each received message is the correct GetScpState(ledger_seq).
+        for msg in &received {
+            match msg {
+                super::OutboundMessage::Send(stellar_xdr::curr::StellarMessage::GetScpState(
+                    seq,
+                )) => {
+                    assert_eq!(
+                        *seq, ledger_seq,
+                        "GetScpState should contain ledger_seq {}, got {}",
+                        ledger_seq, seq
+                    );
+                }
+                other => {
+                    panic!(
+                        "Expected OutboundMessage::Send(GetScpState({})), got {:?}",
+                        ledger_seq, other
+                    );
+                }
+            }
+        }
     }
 }

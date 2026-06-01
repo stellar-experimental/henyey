@@ -2683,7 +2683,12 @@ impl App {
         self.herder.get_min_ledger_seq_to_ask_peers()
     }
 
-    /// Request SCP state from all connected peers.
+    /// Request SCP state from up to 2 random authenticated peers using the
+    /// shared low-watermark. This is the canonical dispatch point for all
+    /// GetScpState pulls (lifecycle, recovery, catchup, simulation).
+    ///
+    /// Parity: mirrors stellar-core's `getMoreSCPState()` bounded-pull
+    /// semantics (HerderImpl.cpp:2643-2658).
     pub async fn request_scp_state_from_peers(&self) {
         let Some(overlay) = self.overlay().await else {
             return;
@@ -2695,14 +2700,13 @@ impl App {
             return;
         }
 
-        // Request SCP state from a low watermark similar to stellar-core behavior.
-        let ledger_seq = self.herder.get_min_ledger_seq_to_ask_peers();
-        match overlay.request_scp_state(ledger_seq).await {
+        let ledger_seq = self.scp_state_request_ledger_seq();
+        match overlay.request_scp_state(ledger_seq) {
             Ok(count) => {
                 tracing::info!(
                     ledger_seq,
                     peers_sent = count,
-                    "Requested SCP state from peers"
+                    "Requested SCP state from peers (bounded pull)"
                 );
             }
             Err(e) => {
@@ -12429,5 +12433,258 @@ mod tests {
                 let _ = task.await;
             }
         }
+    }
+
+    /// Regression test for #2909: request_scp_state_from_peers uses the
+    /// low-watermark ledger seq from scp_state_request_ledger_seq() and
+    /// request_scp_state_and_record advances the timestamp.
+    #[tokio::test]
+    async fn test_request_scp_state_from_peers_records_attempt_and_uses_low_watermark() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-test.db");
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
+        let app = App::new(config).await.unwrap();
+
+        // Inject 3 test peers so bounded pull has targets.
+        let overlay_config = OverlayManagerConfig::default();
+        let local_node = LocalNode::new_testnet(henyey_crypto::SecretKey::generate());
+        let overlay = OverlayManager::new(overlay_config, local_node).unwrap();
+        let peer1 = PeerId::from_bytes([0xA1; 32]);
+        let peer2 = PeerId::from_bytes([0xA2; 32]);
+        let peer3 = PeerId::from_bytes([0xA3; 32]);
+        let mut rx1 = overlay.inject_test_peer(peer1, 64);
+        let mut rx2 = overlay.inject_test_peer(peer2, 64);
+        let mut rx3 = overlay.inject_test_peer(peer3, 64);
+        *app.overlay.write().await = Some(Arc::new(overlay));
+
+        // Record timestamp before the request.
+        let before = *app.last_scp_state_request_at.read().await;
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+
+        // Execute the shared request path.
+        app.request_scp_state_and_record().await;
+
+        // Assert: timestamp advanced.
+        let after = *app.last_scp_state_request_at.read().await;
+        assert!(
+            after > before,
+            "request_scp_state_and_record must advance last_scp_state_request_at"
+        );
+
+        // Assert: exactly 2 of 3 peers received GetScpState with the low-watermark seq.
+        let expected_seq = app.scp_state_request_ledger_seq();
+        let msg1 = rx1.try_recv();
+        let msg2 = rx2.try_recv();
+        let msg3 = rx3.try_recv();
+        let received: Vec<_> = [msg1, msg2, msg3].into_iter().flatten().collect();
+        assert_eq!(
+            received.len(),
+            2,
+            "Bounded pull should send to exactly 2 of 3 peers, got {}",
+            received.len()
+        );
+        for msg in &received {
+            match msg {
+                stellar_xdr::curr::StellarMessage::GetScpState(seq) => {
+                    assert_eq!(
+                        *seq, expected_seq,
+                        "GetScpState should use low-watermark seq {}, got {}",
+                        expected_seq, seq
+                    );
+                }
+                other => {
+                    panic!("Expected GetScpState({}), got {:?}", expected_seq, other);
+                }
+            }
+        }
+    }
+
+    /// Regression test for #2909: out-of-sync recovery rebroadcasts only
+    /// current-slot latest envelopes (get_latest_messages_send(current_ledger+1))
+    /// and then issues bounded GetScpState to at most 2 peers.
+    ///
+    /// This test seeds the herder with both current-slot and older-slot SCP
+    /// history, then asserts that only the current-slot envelope is rebroadcast.
+    /// On origin/main (pre-fix), the recovery path used get_scp_state(current_ledger - 5)
+    /// which would have broadcast the older envelopes too.
+    #[tokio::test]
+    async fn test_out_of_sync_recovery_uses_latest_slot_rebroadcast_then_bounded_scp_pull() {
+        use stellar_xdr::curr::{
+            NodeId, PublicKey, ScpNomination, ScpStatement, ScpStatementPledges, Signature, Uint256,
+        };
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-test.db");
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
+        let app = App::new(config).await.unwrap();
+
+        // Inject 3 test peers.
+        let overlay_config = OverlayManagerConfig::default();
+        let local_node = LocalNode::new_testnet(henyey_crypto::SecretKey::generate());
+        let overlay = OverlayManager::new(overlay_config, local_node).unwrap();
+        let peer1 = PeerId::from_bytes([0xB1; 32]);
+        let peer2 = PeerId::from_bytes([0xB2; 32]);
+        let peer3 = PeerId::from_bytes([0xB3; 32]);
+        let mut rx1 = overlay.inject_test_peer(peer1, 64);
+        let mut rx2 = overlay.inject_test_peer(peer2, 64);
+        let mut rx3 = overlay.inject_test_peer(peer3, 64);
+        // Mark overlay as running so broadcast() doesn't bail with NotStarted.
+        overlay.set_running_for_test();
+        *app.overlay.write().await = Some(Arc::new(overlay));
+
+        // Current ledger for this test.
+        let current_ledger: u32 = 100;
+        let next_slot: u64 = current_ledger as u64 + 1; // 101
+
+        // Helper to create a test nomination envelope for a given slot.
+        let make_nom_envelope = |slot_index: u64, node_bytes: u8| -> ScpEnvelope {
+            let node_id = NodeId(PublicKey::PublicKeyTypeEd25519(Uint256([node_bytes; 32])));
+            let nomination = ScpNomination {
+                quorum_set_hash: stellar_xdr::curr::Hash([0xAA; 32]),
+                votes: vec![vec![slot_index as u8].try_into().unwrap()]
+                    .try_into()
+                    .unwrap(),
+                accepted: vec![].try_into().unwrap(),
+            };
+            ScpEnvelope {
+                statement: ScpStatement {
+                    node_id,
+                    slot_index,
+                    pledges: ScpStatementPledges::Nominate(nomination),
+                },
+                signature: Signature(Vec::new().try_into().unwrap_or_default()),
+            }
+        };
+
+        // Seed the SCP with a CURRENT-SLOT envelope (slot 101).
+        // This should be returned by get_latest_messages_send(101).
+        let current_slot_env = make_nom_envelope(next_slot, 0x01);
+        app.herder
+            .scp()
+            .test_inject_nomination_envelope(next_slot, current_slot_env.clone());
+
+        // Seed OLDER slots (95, 96) with envelopes that would appear in
+        // get_scp_state(current_ledger - 5) = get_scp_state(95).
+        // These must NOT be rebroadcast by the fixed recovery path.
+        let old_node_id = NodeId(PublicKey::PublicKeyTypeEd25519(Uint256([0x02; 32])));
+        let old_env_95 = make_nom_envelope(95, 0x02);
+        let old_env_96 = make_nom_envelope(96, 0x03);
+        app.herder
+            .scp()
+            .test_inject_slot_state(95, old_node_id.clone(), old_env_95);
+        let old_node_id_2 = NodeId(PublicKey::PublicKeyTypeEd25519(Uint256([0x03; 32])));
+        app.herder
+            .scp()
+            .test_inject_slot_state(96, old_node_id_2, old_env_96);
+
+        // Verify preconditions: get_scp_state(95) returns the older envelopes.
+        let old_state = app.herder.get_scp_state(95);
+        assert!(
+            !old_state.is_empty(),
+            "Precondition: older slots should have SCP state seeded"
+        );
+
+        // Verify precondition: get_latest_messages_send(101) returns only current-slot.
+        let latest_msgs = app.herder.scp().get_latest_messages_send(next_slot);
+        assert_eq!(
+            latest_msgs.len(),
+            1,
+            "Precondition: current slot should have exactly 1 latest message"
+        );
+
+        // Record timestamp before the call.
+        let before = *app.last_scp_state_request_at.read().await;
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+
+        // Execute the recovery broadcast path directly.
+        app.broadcast_recovery_scp_state(current_ledger).await;
+
+        // Assert: timestamp advanced (recovery records the attempt).
+        let after = *app.last_scp_state_request_at.read().await;
+        assert!(
+            after > before,
+            "broadcast_recovery_scp_state must advance last_scp_state_request_at"
+        );
+
+        // Give the spawned task a moment to complete.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // Drain all messages from peers.
+        let drain =
+            |rx: &mut henyey_overlay::TestPeerReceiver| -> Vec<stellar_xdr::curr::StellarMessage> {
+                let mut msgs = Vec::new();
+                while let Some(msg) = rx.try_recv() {
+                    msgs.push(msg);
+                }
+                msgs
+            };
+        let msgs1 = drain(&mut rx1);
+        let msgs2 = drain(&mut rx2);
+        let msgs3 = drain(&mut rx3);
+
+        // Collect ScpMessage envelopes sent to peers (the rebroadcast leg).
+        let all_scp_msgs: Vec<&ScpEnvelope> = [&msgs1, &msgs2, &msgs3]
+            .iter()
+            .flat_map(|msgs| {
+                msgs.iter().filter_map(|m| match m {
+                    stellar_xdr::curr::StellarMessage::ScpMessage(env) => Some(env),
+                    _ => None,
+                })
+            })
+            .collect();
+
+        // Assert: only current-slot envelopes are rebroadcast, NOT historical ones.
+        // The current-slot envelope is broadcast to ALL peers (broadcast()),
+        // so we expect it to appear 3 times (once per peer).
+        assert!(
+            !all_scp_msgs.is_empty(),
+            "Recovery should rebroadcast at least the current-slot envelope"
+        );
+        for env in &all_scp_msgs {
+            assert_eq!(
+                env.statement.slot_index, next_slot,
+                "Only current-slot (101) envelopes should be rebroadcast, \
+                 but found envelope for slot {}. This means the old \
+                 get_scp_state(current_ledger - 5) path is still active.",
+                env.statement.slot_index
+            );
+        }
+
+        // Assert: no older-slot envelopes leaked through.
+        let older_slot_msgs: Vec<_> = all_scp_msgs
+            .iter()
+            .filter(|env| env.statement.slot_index < next_slot)
+            .collect();
+        assert!(
+            older_slot_msgs.is_empty(),
+            "Historical envelopes from older slots must not be rebroadcast, \
+             but found {} from slots: {:?}",
+            older_slot_msgs.len(),
+            older_slot_msgs
+                .iter()
+                .map(|e| e.statement.slot_index)
+                .collect::<Vec<_>>()
+        );
+
+        // Collect GetScpState messages (the bounded pull leg).
+        let expected_seq = app.scp_state_request_ledger_seq();
+        let get_scp_state_count: usize = [&msgs1, &msgs2, &msgs3]
+            .iter()
+            .map(|msgs| {
+                msgs.iter()
+                    .filter(|m| matches!(m, stellar_xdr::curr::StellarMessage::GetScpState(s) if *s == expected_seq))
+                    .count()
+            })
+            .sum();
+
+        assert_eq!(
+            get_scp_state_count, 2,
+            "Bounded pull should send GetScpState to exactly 2 of 3 peers, got {}",
+            get_scp_state_count
+        );
     }
 }
