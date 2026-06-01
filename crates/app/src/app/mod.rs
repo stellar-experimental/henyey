@@ -12434,4 +12434,166 @@ mod tests {
             }
         }
     }
+
+    /// Regression test for #2909: request_scp_state_from_peers uses the
+    /// low-watermark ledger seq from scp_state_request_ledger_seq() and
+    /// request_scp_state_and_record advances the timestamp.
+    #[tokio::test]
+    async fn test_request_scp_state_from_peers_records_attempt_and_uses_low_watermark() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-test.db");
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
+        let app = App::new(config).await.unwrap();
+
+        // Inject 3 test peers so bounded pull has targets.
+        let overlay_config = OverlayManagerConfig::default();
+        let local_node = LocalNode::new_testnet(henyey_crypto::SecretKey::generate());
+        let overlay = OverlayManager::new(overlay_config, local_node).unwrap();
+        let peer1 = PeerId::from_bytes([0xA1; 32]);
+        let peer2 = PeerId::from_bytes([0xA2; 32]);
+        let peer3 = PeerId::from_bytes([0xA3; 32]);
+        let mut rx1 = overlay.inject_test_peer(peer1, 64);
+        let mut rx2 = overlay.inject_test_peer(peer2, 64);
+        let mut rx3 = overlay.inject_test_peer(peer3, 64);
+        *app.overlay.write().await = Some(Arc::new(overlay));
+
+        // Record timestamp before the request.
+        let before = *app.last_scp_state_request_at.read().await;
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+
+        // Execute the shared request path.
+        app.request_scp_state_and_record().await;
+
+        // Assert: timestamp advanced.
+        let after = *app.last_scp_state_request_at.read().await;
+        assert!(
+            after > before,
+            "request_scp_state_and_record must advance last_scp_state_request_at"
+        );
+
+        // Assert: exactly 2 of 3 peers received GetScpState with the low-watermark seq.
+        let expected_seq = app.scp_state_request_ledger_seq();
+        let msg1 = rx1.try_recv();
+        let msg2 = rx2.try_recv();
+        let msg3 = rx3.try_recv();
+        let received: Vec<_> = [msg1, msg2, msg3].into_iter().flatten().collect();
+        assert_eq!(
+            received.len(),
+            2,
+            "Bounded pull should send to exactly 2 of 3 peers, got {}",
+            received.len()
+        );
+        for msg in &received {
+            match msg {
+                stellar_xdr::curr::StellarMessage::GetScpState(seq) => {
+                    assert_eq!(
+                        *seq, expected_seq,
+                        "GetScpState should use low-watermark seq {}, got {}",
+                        expected_seq, seq
+                    );
+                }
+                other => {
+                    panic!("Expected GetScpState({}), got {:?}", expected_seq, other);
+                }
+            }
+        }
+    }
+
+    /// Regression test for #2909: out-of-sync recovery rebroadcasts only
+    /// current-slot latest envelopes (get_latest_messages_send(current_ledger+1))
+    /// and then issues bounded GetScpState to at most 2 peers.
+    #[tokio::test]
+    async fn test_out_of_sync_recovery_uses_latest_slot_rebroadcast_then_bounded_scp_pull() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-test.db");
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
+        let app = App::new(config).await.unwrap();
+
+        // Inject 3 test peers.
+        let overlay_config = OverlayManagerConfig::default();
+        let local_node = LocalNode::new_testnet(henyey_crypto::SecretKey::generate());
+        let overlay = OverlayManager::new(overlay_config, local_node).unwrap();
+        let peer1 = PeerId::from_bytes([0xB1; 32]);
+        let peer2 = PeerId::from_bytes([0xB2; 32]);
+        let peer3 = PeerId::from_bytes([0xB3; 32]);
+        let mut rx1 = overlay.inject_test_peer(peer1, 64);
+        let mut rx2 = overlay.inject_test_peer(peer2, 64);
+        let mut rx3 = overlay.inject_test_peer(peer3, 64);
+        *app.overlay.write().await = Some(Arc::new(overlay));
+
+        // Current ledger for this test.
+        let current_ledger: u32 = 100;
+
+        // Record timestamp before the call.
+        let before = *app.last_scp_state_request_at.read().await;
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+
+        // Execute the recovery broadcast path directly.
+        app.broadcast_recovery_scp_state(current_ledger).await;
+
+        // Assert: timestamp advanced (recovery records the attempt).
+        let after = *app.last_scp_state_request_at.read().await;
+        assert!(
+            after > before,
+            "broadcast_recovery_scp_state must advance last_scp_state_request_at"
+        );
+
+        // Give the spawned task a moment to complete.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // Drain all messages from peers. Since get_latest_messages_send returns
+        // empty in unit tests (no SCP slot state), only the GetScpState bounded
+        // pull should be present. Exactly 2 of 3 peers should receive it.
+        let drain =
+            |rx: &mut henyey_overlay::TestPeerReceiver| -> Vec<stellar_xdr::curr::StellarMessage> {
+                let mut msgs = Vec::new();
+                while let Some(msg) = rx.try_recv() {
+                    msgs.push(msg);
+                }
+                msgs
+            };
+        let msgs1 = drain(&mut rx1);
+        let msgs2 = drain(&mut rx2);
+        let msgs3 = drain(&mut rx3);
+
+        // Collect GetScpState messages.
+        let expected_seq = app.scp_state_request_ledger_seq();
+        let get_scp_state_count: usize = [&msgs1, &msgs2, &msgs3]
+            .iter()
+            .map(|msgs| {
+                msgs.iter()
+                    .filter(|m| matches!(m, stellar_xdr::curr::StellarMessage::GetScpState(s) if *s == expected_seq))
+                    .count()
+            })
+            .sum();
+
+        assert_eq!(
+            get_scp_state_count, 2,
+            "Bounded pull should send GetScpState to exactly 2 of 3 peers, got {}",
+            get_scp_state_count
+        );
+
+        // Assert no historical envelope broadcast (no ScpMessage from
+        // get_scp_state(current_ledger - 5) pattern — only current-slot
+        // envelopes from get_latest_messages_send would appear as ScpMessage).
+        // In unit tests, get_latest_messages_send returns empty so there should
+        // be no ScpMessage at all.
+        let scp_msg_count: usize = [&msgs1, &msgs2, &msgs3]
+            .iter()
+            .map(|msgs| {
+                msgs.iter()
+                    .filter(|m| matches!(m, stellar_xdr::curr::StellarMessage::ScpMessage(_)))
+                    .count()
+            })
+            .sum();
+        assert_eq!(
+            scp_msg_count, 0,
+            "No historical SCP envelopes should be broadcast (get_latest_messages_send is empty in unit test), got {}",
+            scp_msg_count
+        );
+    }
 }

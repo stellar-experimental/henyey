@@ -396,6 +396,7 @@ pub(super) struct PeerHandle {
 }
 
 /// Messages sent to a peer task via the outbound channel.
+#[derive(Debug)]
 pub(super) enum OutboundMessage {
     /// Direct send (non-flood, e.g. GetTxSet, ScpQuorumset response).
     Send(StellarMessage),
@@ -1721,7 +1722,6 @@ impl OverlayManager {
         *advertised_inbound = inbound_peers;
     }
 
-    /// Request SCP state from all peers.
     /// Request SCP state from up to 2 random authenticated peers.
     ///
     /// Parity: stellar-core `HerderImpl::getMoreSCPState()` (HerderImpl.cpp:2643-2658)
@@ -4380,31 +4380,46 @@ mod tests {
         let ledger_seq = 100u32;
         let result = manager.request_scp_state(ledger_seq).unwrap();
 
-        // At most 2 peers should receive the message.
-        assert!(
-            result <= 2,
-            "request_scp_state should target at most 2 peers, got {}",
+        // Exactly 2 peers should receive the message (3 connected, bound is 2,
+        // channels have ample capacity so no send failures).
+        assert_eq!(
+            result, 2,
+            "request_scp_state should target exactly 2 peers when 3 are connected, got {}",
             result
         );
-        assert!(
-            result >= 1,
-            "request_scp_state should target at least 1 peer when peers are connected"
-        );
 
-        // Count how many peers actually received the message.
-        let got1 = rx1.try_recv().is_ok();
-        let got2 = rx2.try_recv().is_ok();
-        let got3 = rx3.try_recv().is_ok();
-        let total_received = [got1, got2, got3].iter().filter(|&&x| x).count();
+        // Validate that exactly 2 peers received GetScpState(ledger_seq).
+        let msg1 = rx1.try_recv().ok();
+        let msg2 = rx2.try_recv().ok();
+        let msg3 = rx3.try_recv().ok();
 
+        let received: Vec<_> = [msg1, msg2, msg3].into_iter().flatten().collect();
         assert_eq!(
-            total_received, result as usize,
-            "Number of peers that received the message should match return count"
+            received.len(),
+            2,
+            "Exactly 2 of 3 peers should receive GetScpState, got {}",
+            received.len()
         );
-        assert!(
-            total_received <= 2,
-            "At most 2 peers should receive GetScpState, got {}",
-            total_received
-        );
+
+        // Verify each received message is the correct GetScpState(ledger_seq).
+        for msg in &received {
+            match msg {
+                super::OutboundMessage::Send(stellar_xdr::curr::StellarMessage::GetScpState(
+                    seq,
+                )) => {
+                    assert_eq!(
+                        *seq, ledger_seq,
+                        "GetScpState should contain ledger_seq {}, got {}",
+                        ledger_seq, seq
+                    );
+                }
+                other => {
+                    panic!(
+                        "Expected OutboundMessage::Send(GetScpState({})), got {:?}",
+                        ledger_seq, other
+                    );
+                }
+            }
+        }
     }
 }

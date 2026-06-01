@@ -957,7 +957,7 @@ impl App {
     /// Broadcast recent SCP envelopes and request SCP state from peers.
     ///
     /// Spawns a background task to avoid blocking the event loop.
-    async fn broadcast_recovery_scp_state(&self, current_ledger: u32) {
+    pub(crate) async fn broadcast_recovery_scp_state(&self, current_ledger: u32) {
         // Parity: stellar-core `HerderImpl::maybeTriggerNextLedger` (HerderImpl.cpp:554-560)
         // rebroadcasts only the current slot's latest messages, then issues a
         // bounded GetScpState pull. Previously we dumped historical envelopes
