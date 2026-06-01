@@ -18,14 +18,17 @@ name: Quickstart
 #     against stellar-core at crates/common/src/xdr_stream.rs).
 #   * JSON-RPC HTTP surface: crates/rpc/tests/http_dispatch.rs.
 #
-# Reusable-workflow behaviour: stellar/quickstart injects an implicit
-# matrix of network=["local"] × enable=["core","rpc","core,rpc,horizon",
-# "galexie"] for every image. Failures in these shards (and the
-# additional testnet shard) are treated the same as any other CI failure
-# — continue-on-error is not used here. Policy: every job must either
-# pass or the build goes red. If a shard flakes for reasons outside
-# henyey's control, file an issue and either skip that shard explicitly
-# or fix the flake; do not silently swallow the failure.
+# Test orchestration (#2916):
+#
+# Image building is delegated to stellar/quickstart's reusable build
+# workflow with test: false. Test orchestration lives in this repo so we
+# can apply a timeout-only retry to the flaky testnet/core,horizon/
+# horizon-core-up probe without forking the entire upstream test matrix.
+# Each probe is run through scripts/ci/run-quickstart-test.sh which adds:
+#   * GNU timeout with diagnostics capture on failure
+#   * Exactly one retry for testnet/core,horizon/horizon-core-up when the
+#     exit is timeout-classified (exit 124)
+#   * No retry for any other shard or non-timeout failure
 #
 # Testnet shard (#1848): Temporarily downgraded from core,rpc,horizon to
 # core,horizon. The test_stellar_rpc_healthy step requires continuous
@@ -57,10 +60,27 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  build:
+  # Resolve the quickstart SHA once so build and test use the same version.
+  setup:
     if: github.event_name == 'push' || github.event.pull_request.head.repo.private == false
+    runs-on: ubuntu-latest
+    outputs:
+      quickstart-sha: ${{ steps.resolve.outputs.sha }}
+    steps:
+      - name: Resolve stellar/quickstart SHA
+        id: resolve
+        run: |
+          SHA=$(git ls-remote https://github.com/stellar/quickstart.git HEAD | cut -f1)
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "Resolved stellar/quickstart SHA: $SHA"
+
+  # Build the quickstart image with test: false — testing is handled locally.
+  build:
+    needs: setup
     uses: stellar/quickstart/.github/workflows/build.yml@main
     with:
+      ref: ${{ needs.setup.outputs.quickstart-sha }}
+      test: false
       images: |
         [
           {
@@ -71,13 +91,104 @@ jobs:
             },
             "deps": [
               { "name": "core", "repo": "${{ github.event.pull_request.head.repo.full_name || github.repository }}", "ref": "${{ github.event.pull_request.head.sha || github.sha }}" }
-            ],
-            "tests": {
-              "additional-tests": [
-                { "arch": "amd64", "network": "testnet", "enable": "core,horizon" },
-                { "arch": "amd64", "network": "pubnet", "enable": "core,rpc,horizon" }
-              ]
-            }
+            ]
           }
         ]
       archs: '["amd64"]'
+
+  # Run upstream Go probes locally through the timeout/retry wrapper.
+  test:
+    needs: [setup, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Local shards (network=local)
+          - network: local
+            enable: core
+            probes: "test_core.go"
+          - network: local
+            enable: rpc
+            probes: "test_stellar_rpc_up.go test_stellar_rpc_healthy.go"
+          - network: local
+            enable: "core,rpc,horizon"
+            probes: "test_core.go test_horizon_up.go test_horizon_core_up.go test_horizon_ingesting.go test_stellar_rpc_up.go test_stellar_rpc_healthy.go test_friendbot.go"
+          - network: local
+            enable: galexie
+            probes: "test_galexie.go"
+          # Additional testnet shard
+          - network: testnet
+            enable: "core,horizon"
+            probes: "test_core.go test_horizon_up.go test_horizon_core_up.go test_horizon_ingesting.go"
+          # Additional pubnet shard
+          - network: pubnet
+            enable: "core,rpc,horizon"
+            probes: "test_core.go test_stellar_rpc_up.go test_stellar_rpc_healthy.go"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download quickstart image
+        uses: actions/download-artifact@v4
+        with:
+          name: image-quickstart-testing-with-pr-amd64
+          path: /tmp/quickstart-image
+
+      - name: Load Docker image
+        run: docker load < /tmp/quickstart-image/*.tar
+
+      - name: Checkout stellar/quickstart (tests)
+        uses: actions/checkout@v4
+        with:
+          repository: stellar/quickstart
+          ref: ${{ needs.setup.outputs.quickstart-sha }}
+          path: quickstart
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+          cache: false
+
+      - name: Run quickstart container
+        run: |
+          docker run -d --name quickstart \
+            -p 8000:8000 -p 11626:11626 -p 8001:8001 \
+            -e NETWORK=${{ matrix.network }} \
+            -e ENABLE=${{ matrix.enable }} \
+            stellar/quickstart:testing-with-pr
+
+      - name: Run probes through wrapper
+        env:
+          NETWORK: ${{ matrix.network }}
+          ENABLE: ${{ matrix.enable }}
+        run: |
+          PROBE_TIMEOUT=600
+          DIAG_DIR="/tmp/quickstart-diagnostics"
+
+          for probe_file in ${{ matrix.probes }}; do
+            probe_name="${probe_file%.go}"
+            probe_name="${probe_name#test_}"
+
+            scripts/ci/run-quickstart-test.sh \
+              --network "$NETWORK" \
+              --enable "$ENABLE" \
+              --probe "$probe_name" \
+              --timeout "$PROBE_TIMEOUT" \
+              --diagnostics-dir "$DIAG_DIR/$NETWORK-$ENABLE-$probe_name" \
+              -- go run "quickstart/tests/$probe_file"
+          done
+
+      - name: Upload diagnostics on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: quickstart-diagnostics-${{ matrix.network }}-${{ matrix.enable }}
+          path: /tmp/quickstart-diagnostics/
+          retention-days: 7
+
+      - name: Cleanup
+        if: always()
+        run: |
+          docker stop quickstart 2>/dev/null || true
+          docker rm quickstart 2>/dev/null || true

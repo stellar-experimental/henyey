@@ -135,3 +135,12 @@ jobs:
       - uses: actions/checkout@v4
       - name: Verify agent workspace contract
         run: bash scripts/test-agent-worktree-contract.sh
+
+  quickstart-harness:
+    name: Quickstart Harness
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run quickstart test harness
+        run: bash scripts/test-quickstart-harness.sh
