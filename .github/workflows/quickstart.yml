@@ -39,6 +39,9 @@ name: Quickstart
 # upstream timeout is configurable or the RPC healthy test is skipped
 # for testnet (matching the pubnet precedent).
 
+permissions:
+  contents: read
+
 on:
   pull_request:
   push:
@@ -123,20 +126,24 @@ jobs:
             enable: "core,horizon"
             probes: "test_core.go test_horizon_up.go test_horizon_core_up.go test_horizon_ingesting.go"
           # Additional pubnet shard
+          # Note: upstream excludes horizon_core_up, horizon_ingesting, and
+          # stellar_rpc_healthy on pubnet (see internal-test.yml conditionals).
           - network: pubnet
             enable: "core,rpc,horizon"
-            probes: "test_core.go test_stellar_rpc_up.go test_stellar_rpc_healthy.go"
+            probes: "test_core.go test_horizon_up.go test_stellar_rpc_up.go"
     steps:
       - uses: actions/checkout@v4
 
       - name: Download quickstart image
         uses: actions/download-artifact@v4
         with:
-          name: image-quickstart-testing-with-pr-amd64
+          name: image-quickstart-testing-with-pr-amd64.tar
           path: /tmp/quickstart-image
 
       - name: Load Docker image
-        run: docker load < /tmp/quickstart-image/*.tar
+        run: |
+          tarball="$(ls /tmp/quickstart-image/image 2>/dev/null || ls /tmp/quickstart-image/*.tar 2>/dev/null | head -1)"
+          docker load -i "$tarball"
 
       - name: Checkout stellar/quickstart (tests)
         uses: actions/checkout@v4
@@ -154,9 +161,9 @@ jobs:
         run: |
           docker run -d --name quickstart \
             -p 8000:8000 -p 11626:11626 -p 8001:8001 \
-            -e NETWORK=${{ matrix.network }} \
-            -e ENABLE=${{ matrix.enable }} \
-            stellar/quickstart:testing-with-pr
+            quickstart:testing-with-pr-amd64 \
+            --${{ matrix.network }} \
+            --enable ${{ matrix.enable }}
 
       - name: Run probes through wrapper
         env:
@@ -169,6 +176,9 @@ jobs:
           for probe_file in ${{ matrix.probes }}; do
             probe_name="${probe_file%.go}"
             probe_name="${probe_name#test_}"
+            # Normalize underscores to hyphens so probe names match the
+            # retry policy (e.g. horizon_core_up → horizon-core-up).
+            probe_name="${probe_name//_/-}"
 
             scripts/ci/run-quickstart-test.sh \
               --network "$NETWORK" \

@@ -160,8 +160,8 @@ test_workflow_shard_probe_contract() {
         tap_not_ok "workflow_disables_upstream_testing" "test: false not found in workflow"
     fi
 
-    # Check: workflow has a local test job
-    if grep -q '^\s*test:' "$WORKFLOW" 2>/dev/null; then
+    # Check: workflow has a local test job (match the YAML job key at top level)
+    if grep -q '^  test:' "$WORKFLOW" 2>/dev/null; then
         tap_ok "workflow_has_local_test_job"
     else
         tap_not_ok "workflow_has_local_test_job" "no local test job found"
@@ -179,6 +179,43 @@ test_workflow_shard_probe_contract() {
         tap_ok "workflow_has_testnet_core_horizon_shard"
     else
         tap_not_ok "workflow_has_testnet_core_horizon_shard" "testnet core,horizon shard not found"
+    fi
+
+    # Check: artifact name includes .tar suffix (upstream contract)
+    if grep -q 'image-quickstart-testing-with-pr-amd64\.tar' "$WORKFLOW"; then
+        tap_ok "workflow_artifact_name_matches_upstream"
+    else
+        tap_not_ok "workflow_artifact_name_matches_upstream" "artifact name missing .tar suffix"
+    fi
+
+    # Check: docker image tag matches upstream build output (quickstart:tag-arch)
+    if grep -q 'quickstart:testing-with-pr-amd64' "$WORKFLOW"; then
+        tap_ok "workflow_image_tag_matches_upstream"
+    else
+        tap_not_ok "workflow_image_tag_matches_upstream" "image tag does not match quickstart:testing-with-pr-amd64"
+    fi
+
+    # Check: probe names are normalized (underscores → hyphens)
+    if grep -q 'probe_name.*_/-' "$WORKFLOW" || grep -q 'probe_name="${probe_name//_/-}"' "$WORKFLOW"; then
+        tap_ok "workflow_normalizes_probe_names"
+    else
+        tap_not_ok "workflow_normalizes_probe_names" "probe name underscore-to-hyphen normalization missing"
+    fi
+
+    # Check: pubnet shard does NOT include stellar_rpc_healthy (excluded upstream)
+    local pubnet_line
+    pubnet_line=$(grep -n 'pubnet' "$WORKFLOW" | grep -v '#' | head -1 | cut -d: -f1)
+    if [[ -n "$pubnet_line" ]]; then
+        # Get the probes line for the pubnet entry (within ~5 lines after)
+        local pubnet_probes
+        pubnet_probes=$(sed -n "$((pubnet_line)),+5p" "$WORKFLOW" | grep 'probes:')
+        if echo "$pubnet_probes" | grep -q 'test_stellar_rpc_healthy'; then
+            tap_not_ok "pubnet_excludes_rpc_healthy" "pubnet shard includes stellar_rpc_healthy (excluded upstream)"
+        else
+            tap_ok "pubnet_excludes_rpc_healthy"
+        fi
+    else
+        tap_not_ok "pubnet_excludes_rpc_healthy" "no pubnet shard found"
     fi
 }
 
@@ -276,7 +313,7 @@ test_success_no_retry_artifacts() {
 }
 
 # --- Run all tests ---
-tap_plan 14
+tap_plan 18
 
 test_timeout_retry_on_targeted_shard
 test_non_timeout_failure_no_retry

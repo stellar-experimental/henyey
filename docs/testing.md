@@ -52,7 +52,7 @@ fmt ──┬── clippy     (lint, -D warnings)
 
 ### Quickstart Workflow (`quickstart.yml`)
 
-Uses the upstream [stellar/quickstart](https://github.com/stellar/docker-stellar-core-horizon) reusable build workflow to **build** the Docker image, then runs test orchestration **locally** in this repo (see [#2916](https://github.com/stellar-experimental/henyey/issues/2916)).
+Uses the upstream [stellar/quickstart](https://github.com/stellar/quickstart) reusable build workflow to **build** the Docker image, then runs test orchestration **locally** in this repo (see [#2916](https://github.com/stellar-experimental/henyey/issues/2916)).
 
 **Architecture:**
 1. **Setup job** — resolves the `stellar/quickstart` SHA once per run.
@@ -68,7 +68,7 @@ Uses the upstream [stellar/quickstart](https://github.com/stellar/docker-stellar
 | local | core,rpc,horizon | `test_core.go`, `test_horizon_up.go`, `test_horizon_core_up.go`, `test_horizon_ingesting.go`, `test_stellar_rpc_up.go`, `test_stellar_rpc_healthy.go`, `test_friendbot.go` |
 | local | galexie | `test_galexie.go` |
 | testnet | core,horizon | `test_core.go`, `test_horizon_up.go`, `test_horizon_core_up.go`, `test_horizon_ingesting.go` |
-| pubnet | core,rpc,horizon | `test_core.go`, `test_stellar_rpc_up.go`, `test_stellar_rpc_healthy.go` |
+| pubnet | core,rpc,horizon | `test_core.go`, `test_horizon_up.go`, `test_stellar_rpc_up.go` |
 
 **Timeout-only retry (#2916):** The `testnet/core,horizon/horizon-core-up` probe is known to flake due to cold-start timeouts under CI load. The wrapper retries exactly once when the first exit is timeout-classified (GNU `timeout` exit 124). Non-timeout failures and all other shards fail immediately — no silent masking.
 

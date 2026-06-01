@@ -39,7 +39,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ -z "$NETWORK" || -z "$ENABLE" || -z "$PROBE" || ${#PROBE_CMD[@]} -eq 0 ]]; then
-    echo "Usage: run-quickstart-test.sh --network <net> --enable <services> --probe <name> --timeout <seconds> --diagnostics-dir <dir> -- <cmd...>" >&2
+    echo "Usage: run-quickstart-test.sh --network <net> --enable <services> --probe <name> --timeout <seconds> [--diagnostics-dir <dir>] -- <cmd...>" >&2
     exit 2
 fi
 
@@ -82,7 +82,11 @@ run_probe() {
     echo "=== Attempt $attempt: $PROBE ($NETWORK/$ENABLE) ===" >&2
     echo "Command: timeout ${TIMEOUT}s ${PROBE_CMD[*]}" >&2
 
-    timeout "$TIMEOUT" "${PROBE_CMD[@]}" 2>&1 | tee "$DIAGNOSTICS_DIR/attempt-${attempt}-output.log" || exit_code=$?
+    # Use PIPESTATUS[0] to capture the timeout exit code, not the tee exit.
+    set +o pipefail
+    timeout "$TIMEOUT" "${PROBE_CMD[@]}" 2>&1 | tee "$DIAGNOSTICS_DIR/attempt-${attempt}-output.log"
+    exit_code=${PIPESTATUS[0]}
+    set -o pipefail
 
     if [[ $exit_code -ne 0 ]]; then
         capture_diagnostics "$attempt"
