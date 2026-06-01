@@ -12504,8 +12504,17 @@ mod tests {
     /// Regression test for #2909: out-of-sync recovery rebroadcasts only
     /// current-slot latest envelopes (get_latest_messages_send(current_ledger+1))
     /// and then issues bounded GetScpState to at most 2 peers.
+    ///
+    /// This test seeds the herder with both current-slot and older-slot SCP
+    /// history, then asserts that only the current-slot envelope is rebroadcast.
+    /// On origin/main (pre-fix), the recovery path used get_scp_state(current_ledger - 5)
+    /// which would have broadcast the older envelopes too.
     #[tokio::test]
     async fn test_out_of_sync_recovery_uses_latest_slot_rebroadcast_then_bounded_scp_pull() {
+        use stellar_xdr::curr::{
+            NodeId, PublicKey, ScpNomination, ScpStatement, ScpStatementPledges, Signature, Uint256,
+        };
+
         let dir = tempfile::tempdir().expect("temp dir");
         let db_path = dir.path().join("rs-stellar-test.db");
         let config = crate::config::ConfigBuilder::new()
@@ -12523,10 +12532,69 @@ mod tests {
         let mut rx1 = overlay.inject_test_peer(peer1, 64);
         let mut rx2 = overlay.inject_test_peer(peer2, 64);
         let mut rx3 = overlay.inject_test_peer(peer3, 64);
+        // Mark overlay as running so broadcast() doesn't bail with NotStarted.
+        overlay.set_running_for_test();
         *app.overlay.write().await = Some(Arc::new(overlay));
 
         // Current ledger for this test.
         let current_ledger: u32 = 100;
+        let next_slot: u64 = current_ledger as u64 + 1; // 101
+
+        // Helper to create a test nomination envelope for a given slot.
+        let make_nom_envelope = |slot_index: u64, node_bytes: u8| -> ScpEnvelope {
+            let node_id = NodeId(PublicKey::PublicKeyTypeEd25519(Uint256([node_bytes; 32])));
+            let nomination = ScpNomination {
+                quorum_set_hash: stellar_xdr::curr::Hash([0xAA; 32]),
+                votes: vec![vec![slot_index as u8].try_into().unwrap()]
+                    .try_into()
+                    .unwrap(),
+                accepted: vec![].try_into().unwrap(),
+            };
+            ScpEnvelope {
+                statement: ScpStatement {
+                    node_id,
+                    slot_index,
+                    pledges: ScpStatementPledges::Nominate(nomination),
+                },
+                signature: Signature(Vec::new().try_into().unwrap_or_default()),
+            }
+        };
+
+        // Seed the SCP with a CURRENT-SLOT envelope (slot 101).
+        // This should be returned by get_latest_messages_send(101).
+        let current_slot_env = make_nom_envelope(next_slot, 0x01);
+        app.herder
+            .scp()
+            .test_inject_nomination_envelope(next_slot, current_slot_env.clone());
+
+        // Seed OLDER slots (95, 96) with envelopes that would appear in
+        // get_scp_state(current_ledger - 5) = get_scp_state(95).
+        // These must NOT be rebroadcast by the fixed recovery path.
+        let old_node_id = NodeId(PublicKey::PublicKeyTypeEd25519(Uint256([0x02; 32])));
+        let old_env_95 = make_nom_envelope(95, 0x02);
+        let old_env_96 = make_nom_envelope(96, 0x03);
+        app.herder
+            .scp()
+            .test_inject_slot_state(95, old_node_id.clone(), old_env_95);
+        let old_node_id_2 = NodeId(PublicKey::PublicKeyTypeEd25519(Uint256([0x03; 32])));
+        app.herder
+            .scp()
+            .test_inject_slot_state(96, old_node_id_2, old_env_96);
+
+        // Verify preconditions: get_scp_state(95) returns the older envelopes.
+        let old_state = app.herder.get_scp_state(95);
+        assert!(
+            !old_state.is_empty(),
+            "Precondition: older slots should have SCP state seeded"
+        );
+
+        // Verify precondition: get_latest_messages_send(101) returns only current-slot.
+        let latest_msgs = app.herder.scp().get_latest_messages_send(next_slot);
+        assert_eq!(
+            latest_msgs.len(),
+            1,
+            "Precondition: current slot should have exactly 1 latest message"
+        );
 
         // Record timestamp before the call.
         let before = *app.last_scp_state_request_at.read().await;
@@ -12545,9 +12613,7 @@ mod tests {
         // Give the spawned task a moment to complete.
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-        // Drain all messages from peers. Since get_latest_messages_send returns
-        // empty in unit tests (no SCP slot state), only the GetScpState bounded
-        // pull should be present. Exactly 2 of 3 peers should receive it.
+        // Drain all messages from peers.
         let drain =
             |rx: &mut henyey_overlay::TestPeerReceiver| -> Vec<stellar_xdr::curr::StellarMessage> {
                 let mut msgs = Vec::new();
@@ -12560,7 +12626,51 @@ mod tests {
         let msgs2 = drain(&mut rx2);
         let msgs3 = drain(&mut rx3);
 
-        // Collect GetScpState messages.
+        // Collect ScpMessage envelopes sent to peers (the rebroadcast leg).
+        let all_scp_msgs: Vec<&ScpEnvelope> = [&msgs1, &msgs2, &msgs3]
+            .iter()
+            .flat_map(|msgs| {
+                msgs.iter().filter_map(|m| match m {
+                    stellar_xdr::curr::StellarMessage::ScpMessage(env) => Some(env),
+                    _ => None,
+                })
+            })
+            .collect();
+
+        // Assert: only current-slot envelopes are rebroadcast, NOT historical ones.
+        // The current-slot envelope is broadcast to ALL peers (broadcast()),
+        // so we expect it to appear 3 times (once per peer).
+        assert!(
+            !all_scp_msgs.is_empty(),
+            "Recovery should rebroadcast at least the current-slot envelope"
+        );
+        for env in &all_scp_msgs {
+            assert_eq!(
+                env.statement.slot_index, next_slot,
+                "Only current-slot (101) envelopes should be rebroadcast, \
+                 but found envelope for slot {}. This means the old \
+                 get_scp_state(current_ledger - 5) path is still active.",
+                env.statement.slot_index
+            );
+        }
+
+        // Assert: no older-slot envelopes leaked through.
+        let older_slot_msgs: Vec<_> = all_scp_msgs
+            .iter()
+            .filter(|env| env.statement.slot_index < next_slot)
+            .collect();
+        assert!(
+            older_slot_msgs.is_empty(),
+            "Historical envelopes from older slots must not be rebroadcast, \
+             but found {} from slots: {:?}",
+            older_slot_msgs.len(),
+            older_slot_msgs
+                .iter()
+                .map(|e| e.statement.slot_index)
+                .collect::<Vec<_>>()
+        );
+
+        // Collect GetScpState messages (the bounded pull leg).
         let expected_seq = app.scp_state_request_ledger_seq();
         let get_scp_state_count: usize = [&msgs1, &msgs2, &msgs3]
             .iter()
@@ -12575,25 +12685,6 @@ mod tests {
             get_scp_state_count, 2,
             "Bounded pull should send GetScpState to exactly 2 of 3 peers, got {}",
             get_scp_state_count
-        );
-
-        // Assert no historical envelope broadcast (no ScpMessage from
-        // get_scp_state(current_ledger - 5) pattern — only current-slot
-        // envelopes from get_latest_messages_send would appear as ScpMessage).
-        // In unit tests, get_latest_messages_send returns empty so there should
-        // be no ScpMessage at all.
-        let scp_msg_count: usize = [&msgs1, &msgs2, &msgs3]
-            .iter()
-            .map(|msgs| {
-                msgs.iter()
-                    .filter(|m| matches!(m, stellar_xdr::curr::StellarMessage::ScpMessage(_)))
-                    .count()
-            })
-            .sum();
-        assert_eq!(
-            scp_msg_count, 0,
-            "No historical SCP envelopes should be broadcast (get_latest_messages_send is empty in unit test), got {}",
-            scp_msg_count
         );
     }
 }

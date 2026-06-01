@@ -2004,6 +2004,16 @@ impl OverlayManager {
         );
         TestPeerReceiver { rx: outbound_rx }
     }
+
+    /// Mark the overlay as running for testing purposes.
+    ///
+    /// This allows `broadcast()` to proceed without calling `start()`,
+    /// which would spin up listener/connector background tasks.
+    #[doc(hidden)]
+    pub fn set_running_for_test(&self) {
+        self.running
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 #[cfg(test)]

@@ -411,6 +411,34 @@ impl<D: SCPDriver> SCP<D> {
         slot.test_set_got_v_blocking(true);
     }
 
+    /// Test-only: inject a nomination envelope into a slot's latest messages.
+    ///
+    /// Creates the slot if needed, marks it `fully_validated`, and sets the
+    /// envelope as the nomination protocol's `last_envelope`. This makes
+    /// `get_latest_messages_send(slot_index)` return the injected envelope.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn test_inject_nomination_envelope(&self, slot_index: u64, envelope: ScpEnvelope) {
+        let mut slots = self.slots.write();
+        let slot = self.get_or_create_slot(&mut slots, slot_index);
+        slot.test_set_fully_validated(true);
+        slot.nomination_mut().test_set_last_envelope(envelope);
+    }
+
+    /// Test-only: inject a nomination envelope into a slot's `latest_nominations`
+    /// map (keyed by `node_id`).
+    ///
+    /// Creates the slot if needed and marks it `fully_validated`. This makes
+    /// `get_scp_state(from_slot)` (via `process_current_state`) return the
+    /// envelope when iterating the slot.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn test_inject_slot_state(&self, slot_index: u64, node_id: NodeId, envelope: ScpEnvelope) {
+        let mut slots = self.slots.write();
+        let slot = self.get_or_create_slot(&mut slots, slot_index);
+        slot.test_set_fully_validated(true);
+        slot.nomination_mut()
+            .test_inject_latest_nomination(node_id, envelope);
+    }
+
     /// Get all envelopes for a specific slot.
     pub fn get_slot_envelopes(&self, slot_index: u64) -> Vec<ScpEnvelope> {
         let slots = self.slots.read();
