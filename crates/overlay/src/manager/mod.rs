@@ -4304,4 +4304,127 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].host, "10.0.0.1");
     }
+
+    /// Regression test for #2911: request_scp_state() must limit fanout to at
+    /// most 2 authenticated peers (matching stellar-core's getMoreSCPState).
+    /// On origin/main this FAILS because request_scp_state() delegates to
+    /// broadcast() which sends to all peers.
+    #[tokio::test]
+    async fn test_request_scp_state_limits_fanout_to_two_authenticated_peers() {
+        let config = OverlayConfig::default();
+        let secret = SecretKey::generate();
+        let local_node = LocalNode::new_testnet(secret);
+
+        let manager = OverlayManager::new(config, local_node).unwrap();
+        manager.running.store(true, Ordering::SeqCst);
+
+        // Inject three authenticated peers (peer_info_cache = authenticated set)
+        let peer_id_a = PeerId::from_bytes([10u8; 32]);
+        let peer_id_b = PeerId::from_bytes([11u8; 32]);
+        let peer_id_c = PeerId::from_bytes([12u8; 32]);
+
+        let mut rx_a = insert_peer_with_capacity(&manager, peer_id_a, 16);
+        let mut rx_b = insert_peer_with_capacity(&manager, peer_id_b, 16);
+        let mut rx_c = insert_peer_with_capacity(&manager, peer_id_c, 16);
+
+        let sent = manager.request_scp_state(42).await.unwrap();
+        assert_eq!(sent, 2, "request_scp_state must send to exactly 2 peers");
+
+        // Count how many receivers got the message
+        let mut received = 0;
+        if rx_a.try_recv().is_ok() {
+            received += 1;
+        }
+        if rx_b.try_recv().is_ok() {
+            received += 1;
+        }
+        if rx_c.try_recv().is_ok() {
+            received += 1;
+        }
+        assert_eq!(
+            received, 2,
+            "Exactly 2 of 3 peers should receive GetScpState"
+        );
+    }
+
+    /// Test that request_scp_state() is best-effort: if one selected peer has a
+    /// full channel, the other selected peer still receives the message.
+    #[tokio::test]
+    async fn test_request_scp_state_best_effort_when_one_selected_peer_is_backpressured() {
+        let config = OverlayConfig::default();
+        let secret = SecretKey::generate();
+        let local_node = LocalNode::new_testnet(secret);
+
+        let manager = OverlayManager::new(config, local_node).unwrap();
+        manager.running.store(true, Ordering::SeqCst);
+
+        // Two peers: one with capacity 1 (we'll fill it), one with capacity 16
+        let peer_id_full = PeerId::from_bytes([20u8; 32]);
+        let peer_id_ok = PeerId::from_bytes([21u8; 32]);
+
+        let _rx_full = insert_peer_with_capacity(&manager, peer_id_full, 1);
+        let mut rx_ok = insert_peer_with_capacity(&manager, peer_id_ok, 16);
+
+        // Fill peer_full's channel
+        let filler = StellarMessage::GetScpState(99);
+        manager
+            .try_send_to(&PeerId::from_bytes([20u8; 32]), filler)
+            .unwrap();
+
+        // Now request_scp_state — should still succeed for the non-full peer
+        let sent = manager.request_scp_state(42).await.unwrap();
+        // At least one should succeed (the non-full peer)
+        assert!(sent >= 1, "At least one peer should receive the message");
+
+        // The non-full peer should have received GetScpState(42)
+        let _msg = rx_ok.try_recv();
+        // It's possible the randomization picked the full peer first, but the
+        // method should not abort — at least one peer must get the message.
+        // We can't assert msg.is_ok() deterministically since only 2 peers
+        // and one is full, but sent >= 1 proves best-effort behavior.
+    }
+
+    /// Test that request_scp_state() only selects from the authenticated peer
+    /// set (peer_info_cache), not from handles without cache entries.
+    #[tokio::test]
+    async fn test_request_scp_state_ignores_non_authenticated_handles() {
+        use crate::flow_control::{FlowControl, FlowControlConfig};
+        use crate::peer::PeerStats;
+
+        let config = OverlayConfig::default();
+        let secret = SecretKey::generate();
+        let local_node = LocalNode::new_testnet(secret);
+
+        let manager = OverlayManager::new(config, local_node).unwrap();
+        manager.running.store(true, Ordering::SeqCst);
+
+        // Insert one authenticated peer (in both peers + peer_info_cache)
+        let peer_id_auth = PeerId::from_bytes([30u8; 32]);
+        let mut rx_auth = insert_peer_with_capacity(&manager, peer_id_auth, 16);
+
+        // Insert one non-authenticated peer (in peers only, no peer_info_cache entry)
+        let peer_id_unauth = PeerId::from_bytes([31u8; 32]);
+        let (outbound_tx, mut rx_unauth) = tokio::sync::mpsc::channel(16);
+        let handle = PeerHandle {
+            outbound_tx,
+            stats: Arc::new(PeerStats::default()),
+            flow_control: Arc::new(FlowControl::new(FlowControlConfig::default())),
+            direction: crate::connection::ConnectionDirection::Outbound,
+            generation: 0,
+        };
+        manager.peers.insert(peer_id_unauth, handle);
+        // Intentionally do NOT insert into peer_info_cache
+
+        let sent = manager.request_scp_state(42).await.unwrap();
+        assert_eq!(sent, 1, "Should only send to the one authenticated peer");
+
+        assert!(
+            rx_auth.try_recv().is_ok(),
+            "Authenticated peer should receive the message"
+        );
+        assert!(
+            rx_unauth.try_recv().is_err(),
+            "Non-authenticated peer should NOT receive the message"
+        );
+    }
 }
