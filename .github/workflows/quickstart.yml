@@ -30,6 +30,15 @@ name: Quickstart
 #     exit is timeout-classified (exit 124)
 #   * No retry for any other shard or non-timeout failure
 #
+# Upstream contract validation:
+#   The validate-contract job fetches both build.yml and internal-build.yml
+#   from the resolved SHA and validates them against the pinned contract at
+#   scripts/ci/upstream-quickstart-contract.yml. This catches drift in the
+#   input interface (build.yml) and the artifact/image interface
+#   (internal-build.yml). Note: the `uses:` field calls build.yml@main
+#   because GitHub Actions does not support dynamic refs for reusable
+#   workflows. See the contract file header for the full limitation.
+#
 # Testnet shard (#1848): Temporarily downgraded from core,rpc,horizon to
 # core,horizon. The test_stellar_rpc_healthy step requires continuous
 # ledger close, but after initial catchup the node waits up to ~5 min
@@ -78,71 +87,146 @@ jobs:
           echo "Resolved stellar/quickstart SHA: $SHA"
 
   # Validate that our assumptions about the upstream contract still hold.
-  # This fetches the upstream build workflow and checks it against our pinned
-  # contract expectations. Fails fast if upstream has drifted.
+  # Fetches both the top-level build.yml (input contract) and the delegated
+  # internal-build.yml (artifact/image contract) from the resolved SHA, then
+  # validates both against scripts/ci/upstream-quickstart-contract.yml.
+  #
+  # Limitation: GitHub Actions does not support dynamic refs in reusable
+  # workflow `uses:` — the build job below calls build.yml@main. This means
+  # the executed workflow definition can drift independently of the SHA we
+  # validate here. This step catches contract drift *at the resolved SHA*
+  # as a best-effort early signal; it does NOT guarantee the @main definition
+  # is identical. If upstream makes a breaking change to main without also
+  # changing the contract at HEAD, a false-green is possible. True pinning
+  # requires vendoring the upstream workflow (tracked as future work).
   validate-contract:
     needs: setup
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Fetch upstream build workflow
+      - name: Fetch upstream workflows
         run: |
-          curl -sf "https://raw.githubusercontent.com/stellar/quickstart/${{ needs.setup.outputs.quickstart-sha }}/.github/workflows/build.yml" \
+          SHA="${{ needs.setup.outputs.quickstart-sha }}"
+          curl -sf "https://raw.githubusercontent.com/stellar/quickstart/$SHA/.github/workflows/build.yml" \
             -o /tmp/upstream-build.yml
+          # internal-build.yml is the delegated workflow that produces artifacts.
+          # It may not exist (older upstream versions inline it) — handle gracefully.
+          curl -sf "https://raw.githubusercontent.com/stellar/quickstart/$SHA/.github/workflows/internal-build.yml" \
+            -o /tmp/upstream-internal-build.yml || true
 
       - name: Validate upstream contract
         run: |
           CONTRACT="scripts/ci/upstream-quickstart-contract.yml"
           UPSTREAM="/tmp/upstream-build.yml"
+          INTERNAL="/tmp/upstream-internal-build.yml"
 
           echo "=== Validating upstream quickstart contract ==="
+          echo "SHA: ${{ needs.setup.outputs.quickstart-sha }}"
+          echo "Contract file: $CONTRACT"
+          echo ""
 
-          # Check that upstream build.yml accepts 'test' input (our test: false depends on it)
+          ERRORS=0
+
+          # --- 1. Validate build.yml input contract ---
+          echo "--- build.yml input contract ---"
+
+          # Read expected inputs from contract file
+          if ! grep -q '^build_inputs:' "$CONTRACT"; then
+            echo "✗ contract file missing build_inputs section"
+            ERRORS=$((ERRORS + 1))
+          else
+            for input in ref test images archs; do
+              if grep -q "  - $input" "$CONTRACT"; then
+                if grep -q "$input:" "$UPSTREAM"; then
+                  echo "✓ upstream accepts '$input' input (matches contract)"
+                else
+                  echo "✗ upstream missing '$input' input (contract expects it)"
+                  ERRORS=$((ERRORS + 1))
+                fi
+              fi
+            done
+          fi
+
+          # Verify 'test' is boolean-typed (we depend on test: false)
           if grep -q 'test:' "$UPSTREAM" && grep -A5 'test:' "$UPSTREAM" | grep -q 'type: boolean\|type:.*bool'; then
-            echo "✓ upstream accepts 'test' boolean input"
+            echo "✓ 'test' input is boolean-typed"
           else
-            echo "✗ upstream 'test' input not found or not boolean — contract may have drifted"
-            exit 1
-          fi
-
-          # Check that upstream build.yml accepts 'images' input
-          if grep -q 'images:' "$UPSTREAM"; then
-            echo "✓ upstream accepts 'images' input"
-          else
-            echo "✗ upstream 'images' input not found — contract may have drifted"
-            exit 1
-          fi
-
-          # Check that upstream build.yml accepts 'archs' input
-          if grep -q 'archs:' "$UPSTREAM"; then
-            echo "✓ upstream accepts 'archs' input"
-          else
-            echo "✗ upstream 'archs' input not found — contract may have drifted"
-            exit 1
-          fi
-
-          # Check that upstream build.yml accepts 'ref' input
-          if grep -q 'ref:' "$UPSTREAM"; then
-            echo "✓ upstream accepts 'ref' input"
-          else
-            echo "✗ upstream 'ref' input not found — contract may have drifted"
-            exit 1
-          fi
-
-          # Check that upstream produces artifacts matching our expected naming
-          # The artifact name pattern from our contract: image-quickstart-{tag}-{arch}.tar
-          if grep -q 'image-quickstart' "$UPSTREAM" || grep -q 'upload-artifact' "$UPSTREAM"; then
-            echo "✓ upstream produces image artifacts"
-          else
-            echo "⚠ could not confirm artifact naming in upstream (non-blocking)"
+            echo "✗ 'test' input not found or not boolean-typed"
+            ERRORS=$((ERRORS + 1))
           fi
 
           echo ""
-          echo "=== Upstream contract validation passed ==="
-          echo "SHA: ${{ needs.setup.outputs.quickstart-sha }}"
+
+          # --- 2. Validate artifact/image contract (internal-build.yml) ---
+          echo "--- internal-build.yml artifact contract ---"
+
+          # Read expected artifact name from contract
+          EXPECTED_ARTIFACT=$(grep '^expected_artifact_name:' "$CONTRACT" | sed 's/.*: *"\(.*\)"/\1/')
+          EXPECTED_TAG=$(grep '^expected_image_tag:' "$CONTRACT" | sed 's/.*: *"\(.*\)"/\1/')
+          ARTIFACT_PATTERN=$(grep '^artifact_name_pattern:' "$CONTRACT" | sed 's/.*: *"\(.*\)"/\1/')
+
+          if [[ -f "$INTERNAL" ]]; then
+            echo "✓ internal-build.yml found at resolved SHA"
+
+            # Check artifact upload naming pattern.
+            # upstream uses: image-quickstart-${{ inputs.tag || ... }}-${{ matrix.arch }}
+            if grep -q 'image-quickstart' "$INTERNAL"; then
+              echo "✓ internal-build.yml uses 'image-quickstart' artifact naming"
+            else
+              echo "✗ internal-build.yml does not contain 'image-quickstart' artifact naming"
+              echo "  Expected pattern: $ARTIFACT_PATTERN"
+              ERRORS=$((ERRORS + 1))
+            fi
+
+            # Check that it uploads artifacts (upload-artifact action present)
+            if grep -q 'upload-artifact' "$INTERNAL"; then
+              echo "✓ internal-build.yml uploads artifacts"
+            else
+              echo "✗ internal-build.yml does not use upload-artifact"
+              ERRORS=$((ERRORS + 1))
+            fi
+
+            # Check docker save / image export pattern (/tmp/image is the conventional path)
+            if grep -q '/tmp/image\|docker save' "$INTERNAL"; then
+              echo "✓ internal-build.yml uses docker image export (matches artifact_layout)"
+            else
+              echo "⚠ could not confirm /tmp/image or docker save in internal-build.yml (non-blocking)"
+            fi
+          else
+            # internal-build.yml not found — check if build.yml itself handles artifacts
+            echo "⚠ internal-build.yml not found at resolved SHA (may be inlined in build.yml)"
+            if grep -q 'image-quickstart' "$UPSTREAM" && grep -q 'upload-artifact' "$UPSTREAM"; then
+              echo "✓ build.yml directly handles artifact upload with expected naming"
+            else
+              echo "✗ neither build.yml nor internal-build.yml confirms artifact contract"
+              echo "  Expected artifact: $EXPECTED_ARTIFACT"
+              ERRORS=$((ERRORS + 1))
+            fi
+          fi
+
+          echo ""
+
+          # --- 3. Summary ---
+          if [[ $ERRORS -gt 0 ]]; then
+            echo "=== FAILED: $ERRORS contract violation(s) detected ==="
+            echo "The upstream stellar/quickstart workflows at SHA ${{ needs.setup.outputs.quickstart-sha }}"
+            echo "no longer match our pinned contract at $CONTRACT."
+            echo "Update the contract file and workflow if the upstream change is intentional."
+            exit 1
+          fi
+
+          echo "=== Upstream contract validation passed (${{ needs.setup.outputs.quickstart-sha }}) ==="
 
   # Build the quickstart image with test: false — testing is handled locally.
+  #
+  # NOTE: GitHub Actions does not support dynamic refs in `uses:` for reusable
+  # workflows (expressions like ${{ ... }} are not evaluated in this field).
+  # We call build.yml@main, meaning the executed workflow definition tracks
+  # upstream's main branch. The `validate-contract` job above validates the
+  # contract *at the resolved SHA*, providing best-effort drift detection, but
+  # cannot guarantee the @main definition matches that SHA. If this becomes a
+  # source of flakes, the next step is to vendor the build logic locally.
   build:
     needs: [setup, validate-contract]
     uses: stellar/quickstart/.github/workflows/build.yml@main

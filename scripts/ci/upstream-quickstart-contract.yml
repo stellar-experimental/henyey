@@ -7,8 +7,16 @@
 # breaks these, we'll get a clear failure here rather than a mysterious
 # flake in the test matrix.
 #
+# IMPORTANT LIMITATION: GitHub Actions does not support dynamic refs in
+# reusable workflow `uses:`. Our workflow calls build.yml@main, so the
+# executed workflow definition can drift independently of the SHA validated
+# here. This contract provides best-effort drift detection at the resolved
+# SHA. True pinning requires vendoring (tracked as future work).
+#
 # Last verified against: stellar/quickstart main (2026-05-31)
-# Upstream workflow: .github/workflows/build.yml
+# Upstream workflows validated:
+#   - .github/workflows/build.yml (input contract)
+#   - .github/workflows/internal-build.yml (artifact/image contract)
 
 # Build workflow outputs an artifact with this naming pattern.
 # Pattern: image-quickstart-{tag}-{arch}.tar
@@ -51,3 +59,17 @@ pubnet_excluded_probes:
   - horizon-core-up
   - horizon-ingesting
   - stellar-rpc-healthy
+
+# --- Delegated artifact contract (internal-build.yml) ---
+# The build.yml workflow delegates actual image building and artifact upload
+# to internal-build.yml. The following fields document what internal-build.yml
+# must provide for our test job to consume the artifact correctly.
+delegated_artifact_contract:
+  # internal-build.yml uploads the image tarball as a GitHub Actions artifact
+  upload_action: "actions/upload-artifact"
+  # Artifact naming follows this pattern (must contain "image-quickstart")
+  artifact_name_contains: "image-quickstart"
+  # Docker image is exported via `docker save` to a tarball
+  image_export_method: "docker save"
+  # The tarball is placed in /tmp/image/ or as a top-level file in the artifact
+  tarball_location: "/tmp/image/ directory or top-level in artifact"

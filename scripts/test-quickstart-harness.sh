@@ -321,6 +321,9 @@ test_success_no_retry_artifacts() {
 # artifact naming, image tags, or probe layout, the contract file must be
 # updated explicitly (forcing a human review of whether our workflow still
 # works).
+#
+# Also validates that the validate-contract CI job references both build.yml
+# AND internal-build.yml, ensuring the delegated artifact contract is checked.
 # ============================================================
 test_upstream_contract_validation() {
     if [[ ! -f "$CONTRACT" ]]; then
@@ -330,6 +333,10 @@ test_upstream_contract_validation() {
         tap_not_ok "workflow_build_inputs_match_contract" "skipped (no contract)"
         tap_not_ok "workflow_pubnet_exclusions_match_contract" "skipped (no contract)"
         tap_not_ok "workflow_probe_normalization_matches_contract" "skipped (no contract)"
+        tap_not_ok "workflow_validates_internal_build" "skipped (no contract)"
+        tap_not_ok "workflow_reads_contract_file" "skipped (no contract)"
+        tap_not_ok "contract_documents_limitation" "skipped (no contract)"
+        tap_not_ok "contract_documents_delegated_artifact" "skipped (no contract)"
         return
     fi
 
@@ -384,10 +391,39 @@ test_upstream_contract_validation() {
     else
         tap_not_ok "workflow_probe_normalization_matches_contract" "underscore-to-hyphen normalization missing"
     fi
+
+    # Validate that the workflow's validate-contract job fetches internal-build.yml
+    if grep -q 'internal-build.yml' "$WORKFLOW"; then
+        tap_ok "workflow_validates_internal_build"
+    else
+        tap_not_ok "workflow_validates_internal_build" "workflow does not fetch/validate internal-build.yml"
+    fi
+
+    # Validate that the workflow's validate-contract job reads the contract file
+    if grep -q 'CONTRACT="scripts/ci/upstream-quickstart-contract.yml"' "$WORKFLOW" && \
+       grep -q 'grep.*"$CONTRACT"' "$WORKFLOW"; then
+        tap_ok "workflow_reads_contract_file"
+    else
+        tap_not_ok "workflow_reads_contract_file" "workflow does not read contract file in validation"
+    fi
+
+    # Validate contract documents the @main limitation
+    if grep -q 'does not support dynamic refs' "$CONTRACT" || grep -q 'IMPORTANT LIMITATION' "$CONTRACT"; then
+        tap_ok "contract_documents_limitation"
+    else
+        tap_not_ok "contract_documents_limitation" "contract should document @main pinning limitation"
+    fi
+
+    # Validate contract documents the delegated artifact contract
+    if grep -q 'delegated_artifact_contract\|internal-build.yml' "$CONTRACT"; then
+        tap_ok "contract_documents_delegated_artifact"
+    else
+        tap_not_ok "contract_documents_delegated_artifact" "contract should document internal-build.yml artifact expectations"
+    fi
 }
 
 # --- Run all tests ---
-tap_plan 24
+tap_plan 28
 
 test_timeout_retry_on_targeted_shard
 test_non_timeout_failure_no_retry
