@@ -2683,7 +2683,7 @@ impl App {
         self.herder.get_min_ledger_seq_to_ask_peers()
     }
 
-    /// Request SCP state from all connected peers.
+    /// Request SCP state from up to two random authenticated peers.
     pub async fn request_scp_state_from_peers(&self) {
         let Some(overlay) = self.overlay().await else {
             return;

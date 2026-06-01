@@ -318,11 +318,12 @@ Corresponds to: `OverlayManager.h`, `OverlayManagerImpl.h`
 | `isShuttingDown()` | `is_running()` (inverted) | Full |
 | `clearLedgersBelow()` | `clear_ledgers_below()` | Full |
 | `broadcastMessage()` | (via broadcast channel + flood gate) | Full |
+| `getMoreSCPState()` (herder) | `OverlayManager::request_scp_state()` — selects up to 2 random authenticated peers from `peer_info_cache`, sends `GetScpState` via direct `Send` path (not broadcast) | Full |
 | `recvFloodedMsgID()` | `FloodGate::record_inbound_relay()` / `record_local_broadcast()` | Full |
 | `recvTransaction()` | (via broadcast channel + flood gate) | Full |
 | `forgetFloodedMsg()` | `forget_flooded_msg()` — called on SCP discard and tx rejection; also cleared via `clear_below()` at ledger close | Full |
 | `recvTxDemand()` | Handled in app crate (`App::handle_flood_demand`) | Full (moved to app layer) |
-| `getRandomAuthenticatedPeers()` | (shuffled peer list) | Full |
+| `getRandomAuthenticatedPeers()` | (shuffled peer list via `peer_info_cache`) | Full |
 | `getRandomInboundAuthenticatedPeers()` | N/A | None |
 | `getRandomOutboundAuthenticatedPeers()` | N/A | None |
 | `getConnectedPeer()` | (via DashMap lookup) | Full |

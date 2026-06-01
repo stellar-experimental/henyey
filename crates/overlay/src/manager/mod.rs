@@ -1721,10 +1721,75 @@ impl OverlayManager {
         *advertised_inbound = inbound_peers;
     }
 
-    /// Request SCP state from all peers.
+    /// Request SCP state from up to two random authenticated peers.
+    ///
+    /// Matches stellar-core's `HerderImpl::getMoreSCPState()` which calls
+    /// `getRandomAuthenticatedPeers()` (shuffle full authenticated set) then
+    /// sends `GetScpState` to at most `NB_PEERS_TO_ASK = 2` peers via direct
+    /// per-peer sends, not an overlay-wide broadcast.
     pub async fn request_scp_state(&self, ledger_seq: u32) -> Result<usize> {
+        if !self.running.load(Ordering::Relaxed) {
+            return Err(OverlayError::NotStarted);
+        }
+
+        const NB_PEERS_TO_ASK: usize = 2;
+
+        // Select from the authenticated peer set (peer_info_cache), matching
+        // stellar-core's getRandomAuthenticatedPeers().
+        let mut authenticated_peers: Vec<PeerId> = self
+            .peer_info_cache
+            .iter()
+            .map(|entry| entry.key().clone())
+            .collect();
+
+        // Shuffle the full set, then truncate to NB_PEERS_TO_ASK.
+        authenticated_peers.shuffle(&mut rand::thread_rng());
+        authenticated_peers.truncate(NB_PEERS_TO_ASK);
+
         let message = StellarMessage::GetScpState(ledger_seq);
-        self.broadcast(message).await
+        let num_targets = authenticated_peers.len();
+        let mut sent = 0usize;
+        let mut dropped = 0usize;
+        let mut message = Some(message);
+
+        for (i, peer_id) in authenticated_peers.iter().enumerate() {
+            let is_last = i + 1 == num_targets;
+            let outbound_msg = if is_last {
+                OutboundMessage::Send(message.take().unwrap())
+            } else {
+                OutboundMessage::Send(message.as_ref().unwrap().clone())
+            };
+
+            if let Some(entry) = self.peers.get(peer_id) {
+                match entry.value().outbound_tx.try_send(outbound_msg) {
+                    Ok(()) => sent += 1,
+                    Err(mpsc::error::TrySendError::Full(_)) => {
+                        dropped += 1;
+                        debug!(
+                            "Outbound channel full for {}, dropping GetScpState",
+                            peer_id
+                        );
+                    }
+                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                        debug!("Outbound channel closed for {}", peer_id);
+                    }
+                }
+            }
+        }
+
+        if dropped > 0 {
+            self.metrics.messages_dropped.add(dropped as u64);
+            warn!(
+                dropped,
+                sent, "GetScpState backpressure: messages dropped due to full peer channels"
+            );
+        }
+
+        debug!(
+            "Sent GetScpState({}) to {} of {} selected peers",
+            ledger_seq, sent, num_targets
+        );
+        Ok(sent)
     }
 
     /// Request a transaction set by hash from all peers.
