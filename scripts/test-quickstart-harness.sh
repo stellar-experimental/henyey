@@ -218,6 +218,33 @@ test_workflow_shard_probe_contract() {
     else
         tap_not_ok "pubnet_excludes_rpc_healthy" "no pubnet shard found"
     fi
+
+    # Check: local rpc shard includes test_friendbot.go (upstream runs friendbot
+    # for any local shard whose enable contains rpc or horizon)
+    local rpc_line
+    rpc_line=$(grep -n 'enable: rpc$' "$WORKFLOW" | head -1 | cut -d: -f1)
+    if [[ -n "$rpc_line" ]]; then
+        local rpc_probes
+        rpc_probes=$(sed -n "$((rpc_line)),+3p" "$WORKFLOW" | grep 'probes:')
+        if echo "$rpc_probes" | grep -q 'test_friendbot.go'; then
+            tap_ok "local_rpc_shard_includes_friendbot"
+        else
+            tap_not_ok "local_rpc_shard_includes_friendbot" \
+                "local rpc shard missing test_friendbot.go (upstream runs it for enable:rpc)"
+        fi
+    else
+        tap_not_ok "local_rpc_shard_includes_friendbot" "no local rpc shard found"
+    fi
+
+    # Check: artifact-layout validation is blocking (not a warning)
+    # The validate-contract step must error (increment ERRORS) if docker save /
+    # /tmp/image pattern is missing from internal-build.yml.
+    if grep -q 'could not confirm /tmp/image.*non-blocking' "$WORKFLOW"; then
+        tap_not_ok "artifact_layout_check_is_blocking" \
+            "artifact-layout check is still non-blocking (⚠ warning instead of ✗ error)"
+    else
+        tap_ok "artifact_layout_check_is_blocking"
+    fi
 }
 
 # ============================================================
@@ -450,7 +477,7 @@ test_upstream_contract_validation() {
 }
 
 # --- Run all tests ---
-tap_plan 30
+tap_plan 32
 
 test_timeout_retry_on_targeted_shard
 test_non_timeout_failure_no_retry

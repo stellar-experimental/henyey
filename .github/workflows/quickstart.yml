@@ -234,7 +234,9 @@ jobs:
             if grep -q '/tmp/image\|docker save' "$INTERNAL"; then
               echo "✓ internal-build.yml uses docker image export (matches artifact_layout)"
             else
-              echo "⚠ could not confirm /tmp/image or docker save in internal-build.yml (non-blocking)"
+              echo "✗ could not confirm /tmp/image or docker save in internal-build.yml"
+              echo "  The 'Load Docker image' step depends on this layout — drift will break test runs."
+              ERRORS=$((ERRORS + 1))
             fi
           else
             # internal-build.yml not found — check if build.yml itself handles artifacts
@@ -306,7 +308,7 @@ jobs:
             probes: "test_core.go"
           - network: local
             enable: rpc
-            probes: "test_stellar_rpc_up.go test_stellar_rpc_healthy.go"
+            probes: "test_stellar_rpc_up.go test_stellar_rpc_healthy.go test_friendbot.go"
           - network: local
             enable: "core,rpc,horizon"
             probes: "test_core.go test_horizon_up.go test_horizon_core_up.go test_horizon_ingesting.go test_stellar_rpc_up.go test_stellar_rpc_healthy.go test_friendbot.go"
