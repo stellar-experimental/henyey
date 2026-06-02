@@ -449,23 +449,35 @@ test_upstream_contract_validation() {
     # --- Negative cases: incompatible suffixes must be REJECTED ---
     # A future relaxation of the anchored regexes to a substring match would
     # let these through and turn these assertions red — that is the point.
-    if [[ -n "$artifact_regex" ]] && ! echo "image-quickstart-testing-with-pr-amd64.zip" | grep -Eq "$artifact_regex"; then
+    # Derive the negative fixtures from the contract's expected values so they
+    # track the contract as it evolves: if expected_artifact_name /
+    # expected_image_tag ever change, these still exercise genuine suffix
+    # rejection (rather than passing because a stale hard-coded tag/arch no
+    # longer matches the regex for an unrelated reason).
+    #   - .zip      : swap the trailing .tar for .zip
+    #   - .tar.gz   : append .gz to the full .tar artifact name
+    #   - -debug    : append -debug to the full image tag
+    local negative_artifact_zip negative_artifact_double_ext negative_tag_debug
+    negative_artifact_zip="${expected_artifact%.tar}.zip"
+    negative_artifact_double_ext="${expected_artifact}.gz"
+    negative_tag_debug="${expected_tag}-debug"
+    if [[ -n "$artifact_regex" ]] && ! echo "$negative_artifact_zip" | grep -Eq "$artifact_regex"; then
         tap_ok "workflow_artifact_regex_rejects_zip"
     else
         tap_not_ok "workflow_artifact_regex_rejects_zip" \
-            "anchored artifact regex must reject the .zip suffix"
+            "anchored artifact regex must reject the .zip suffix ($negative_artifact_zip)"
     fi
-    if [[ -n "$artifact_regex" ]] && ! echo "image-quickstart-testing-with-pr-amd64.tar.gz" | grep -Eq "$artifact_regex"; then
+    if [[ -n "$artifact_regex" ]] && ! echo "$negative_artifact_double_ext" | grep -Eq "$artifact_regex"; then
         tap_ok "workflow_artifact_regex_rejects_double_ext"
     else
         tap_not_ok "workflow_artifact_regex_rejects_double_ext" \
-            "anchored artifact regex must reject the .tar.gz double extension"
+            "anchored artifact regex must reject the .tar.gz double extension ($negative_artifact_double_ext)"
     fi
-    if [[ -n "$image_tag_regex" ]] && ! echo "quickstart:testing-with-pr-amd64-debug" | grep -Eq "$image_tag_regex"; then
+    if [[ -n "$image_tag_regex" ]] && ! echo "$negative_tag_debug" | grep -Eq "$image_tag_regex"; then
         tap_ok "workflow_image_tag_regex_rejects_debug_suffix"
     else
         tap_not_ok "workflow_image_tag_regex_rejects_debug_suffix" \
-            "anchored image-tag regex must reject the -debug suffix"
+            "anchored image-tag regex must reject the -debug suffix ($negative_tag_debug)"
     fi
 
     # --- Workflow consumer-side checks use anchored grep -Eq (not bare prefix) ---
