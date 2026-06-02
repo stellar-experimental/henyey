@@ -91,13 +91,37 @@ while true; do
   # FD-scoped flock taken inside copilot.
   export TICK_PID="$LOOP_PID"
   tick_exit=0
-  timeout "$LOOP_TICK_TIMEOUT" copilot \
+
+  # Launch the dispatch as its OWN process-group leader (#2934/#2957). reap-
+  # stale-dispatch.sh reaps a dead prior dispatch by `kill -- -<pgid>`; that is
+  # only safe if the recorded pgid covers JUST the copilot dispatch tree and not
+  # this loop or unrelated siblings. `setsid` puts copilot in a fresh session /
+  # process group, so acquire-issue-lock.sh (sourced INSIDE that copilot tree)
+  # self-records `/proc/self`'s pgid as the dispatch group leader — no fragile
+  # post-spawn env handoff to an already-exec'd child (#2956).
+  #
+  # Order matters: `setsid --wait timeout … copilot`, NOT
+  # `timeout … setsid --wait copilot`. If `timeout` were the OUTER command it
+  # would supervise the `setsid` wrapper, but `setsid` forks `copilot` into a
+  # NEW session/process-group; on timeout the signal reaches the wrapper (or its
+  # group) while the detached `copilot` tree keeps running — exactly the orphan
+  # this PR exists to prevent (Copilot review #2960). With `timeout` INSIDE the
+  # `setsid` session, `timeout` is the session/group leader and `copilot` is its
+  # child in the SAME group, so `timeout` directly supervises and terminates the
+  # copilot tree, and the self-recorded pgid (from `/proc/self` inside copilot)
+  # still covers just this dispatch group. `setsid --wait` blocks until that
+  # session leader (`timeout`) exits, so the propagated exit status is the real
+  # dispatch's (124 on timeout — #2957), not a short-lived wrapper's. We
+  # background it and `wait` so the trap-based signal handling stays responsive.
+  setsid --wait timeout "$LOOP_TICK_TIMEOUT" copilot \
     --model "$LOOP_MODEL" \
     --autopilot \
     --allow-all-tools \
     --allow-all-paths \
     -p "$prompt" \
-    >>"$log_file" 2>&1 || tick_exit=$?
+    >>"$log_file" 2>&1 &
+  dispatch_pid=$!
+  wait "$dispatch_pid" || tick_exit=$?
 
   if [[ $tick_exit -eq 124 ]]; then
     log "Tick TIMED OUT after ${LOOP_TICK_TIMEOUT}s. Sleeping ${LOOP_FAILURE_SLEEP}s."

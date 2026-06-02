@@ -54,7 +54,46 @@
 #   1  back off — lock held by a live tick (or flock missing / preflight failed);
 #                 no sentinel posted, nothing dispatched; a #2822 per-loop
 #                 cooldown line is appended for the picker to skip this issue.
+# ── Source-safe shell-option handling (#2934 FD-survival fix) ────────────────
+# This file is `source`d by the tick process (see the termination note below),
+# so a bare top-level `set -uo pipefail` would LEAK those options into the
+# caller's shell and could abort an otherwise-fine tick on a later unset-var
+# reference. Snapshot the caller's option state first, apply our options for the
+# script body, and restore the caller's state on every termination path (in
+# `_acq_end`). When RUN directly there is no caller to protect, so the snapshot
+# is a harmless no-op.
+_ACQ_SAVED_OPTS="$(set +o)"
 set -uo pipefail
+
+# ── Source-safe termination (#2934 FD-survival fix) ──────────────────────────
+# The tick process MUST `source` this script (NOT run it in a `$(...)` command-
+# substitution subshell) so the lock FD opened below via `exec {LOCK_FD}>` stays
+# open in the caller's shell and the flock is held across Step-5 dispatch. A
+# command-substitution subshell would close that FD the instant `$()` returns,
+# silently releasing the lock and reintroducing #2917 — and worse, letting a
+# second tick's reaper positively-identify and KILL the still-live first
+# dispatch (the PR #2960 round-1 blocking defect). So this file is designed to
+# be sourced. When sourced, a top-level `exit` would terminate the CALLER's
+# shell, so every termination here goes through `_acq_end <rc>`, which `return`s
+# when sourced (leaving the caller alive with LOCK_FD held) and `exit`s when run
+# directly (the standalone/test path). It is detected once, at parse time.
+case "${BASH_SOURCE[0]}" in
+  "$0") _ACQ_SOURCED=0 ;;   # executed directly (bash acquire-issue-lock.sh ...)
+  *)    _ACQ_SOURCED=1 ;;   # sourced (. acquire-issue-lock.sh ...)
+esac
+# `_acq_end <rc>` exits the process when this file was RUN directly. When it was
+# SOURCED it is a no-op (a `return` inside a function only pops the function, not
+# the sourced script), so every call site pairs it with a top-level
+# `return <rc>` which IS valid in a sourced script and unwinds it cleanly:
+#     _acq_end 1; return 1     # sourced: _acq_end no-ops, `return 1` unwinds
+#                              # run:     _acq_end 1 exits, `return` never runs
+_acq_end() {
+  [ "$_ACQ_SOURCED" -eq 0 ] && exit "${1:-0}"
+  # Sourced: restore the caller's original shell options so we don't leak
+  # `set -u`/`pipefail` into the tick shell, then let the call site `return`.
+  eval "$_ACQ_SAVED_OPTS" 2>/dev/null || true
+  return 0
+}
 
 ISSUE="${1:?issue number required}"
 STATUS="${2:?status required}"
@@ -67,7 +106,7 @@ REPO="henyey"
 # scheme — that would reintroduce #2917. Backing off is the safe choice.
 if ! command -v flock >/dev/null 2>&1; then
   echo "ERROR: flock not available — cannot acquire host-local lock; backing off (#2917)" >&2
-  exit 1
+  _acq_end 1; return 1
 fi
 
 # ── Derive the lock path under the ~/data workspace contract root (#2843) ────
@@ -87,7 +126,7 @@ fi
 # anything non-numeric to prevent path traversal / unexpected lockfile names.
 if ! [[ "$ISSUE" =~ ^[0-9]+$ ]]; then
   echo "ERROR: issue id '$ISSUE' is not numeric; refusing to derive a lock path; backing off" >&2
-  exit 1
+  _acq_end 1; return 1
 fi
 
 # ── Lock namespace: host-stable and issue-scoped, NOT per-process (#2917) ────
@@ -139,26 +178,77 @@ if ! flock -n "$LOCK_FD"; then
   # this issue and falls through to lower-priority actionable items (#2822).
   COOLDOWN_FILE="/tmp/project-tick-cooldown-${LOOP_PID:-default}"
   echo "$ISSUE $(( $(date +%s) + 300 ))" >> "$COOLDOWN_FILE"
-  exit 1
+  _acq_end 1; return 1
 fi
 
-# ── We hold the lock. Self-assign @me (in-review picks included — #2909). ────
+# ── We hold the lock — reap any orphaned PRIOR dispatch for this issue (#2934).
+# Holding the flock proves no other live LOCK-HOLDER exists; it does NOT by
+# itself prove the prior dispatch's whole tree is gone. That is precisely the
+# residual window: the prior tick (the lock holder) died and the kernel released
+# its FD-scoped flock, but a specialist it had forked as a CHILD may still be
+# running detached. The newest sentinel records that prior dispatch's process-
+# group + leader start-time; reap re-verifies that identity against /proc and
+# kills the group ONLY if the recorded leader is still positively ALIVE (same
+# host + PGID + start-time match + signalable). A gone/reused/EPERM leader is
+# never signalled — its workspace is still reclaimed. This runs BEFORE we
+# overwrite the sentinel below (so reap reads the PRIOR owner's identity, not
+# our own). Best-effort and non-fatal: a reap failure must never block dispatch.
+_REAP_SCRIPT="$_SELF_DIR/reap-stale-dispatch.sh"
+if [ -x "$_REAP_SCRIPT" ]; then
+  "$_REAP_SCRIPT" "$ISSUE" || true
+fi
+
+# ── Self-assign @me (in-review picks included — #2909). ──────────────────────
 # Self-assign is necessary so /project-tick filters us out of future picker
 # runs. It was empty during the #2909 incident for an in-review pick, so we
 # always assign regardless of $STATUS.
 gh issue edit "$ISSUE" --repo "$OWNER/$REPO" --add-assignee @me >/dev/null 2>&1 || true
 
+# ── Self-record THIS dispatch's process-group identity (#2934 / #2956). ──────
+# The sentinel must carry an identity that reap-stale-dispatch.sh can later use
+# to positively identify (and only then kill) THIS dispatch's orphaned process-
+# group if we die with a surviving child. The robust source is THIS process's
+# own /proc, NOT an env var handed down from the loop after the child launched
+# (that env export can never reach an already-exec'd child — the round-2
+# correctness concern, #2956). This script is sourced by the long-lived tick
+# (the copilot dispatch), so /proc/self's pgid IS the dispatch group leader,
+# provided the loop launched the dispatch as its own group leader via setsid
+# (#2957). We record the leader's pid (== pgid) and its start-time (field 22 of
+# /proc/<pgid>/stat, clock-ticks-since-boot — monotonic, not recycled in a boot)
+# so the reaper can detect PID reuse and refuse to signal a recycled pid (#2958).
+_self_pgid=""; _self_starttime=""
+if _stat_line="$(cat /proc/self/stat 2>/dev/null)"; then
+  # comm (field 2) may contain spaces/parens; strip through the final ") ".
+  _stat_rest="${_stat_line##*) }"
+  # shellcheck disable=SC2086
+  set -- $_stat_rest
+  # In the post-comm fields, pgrp is index 3, starttime is index 20.
+  _self_pgid="${3:-}"
+  _self_starttime="${20:-}"
+fi
+# Re-read the GROUP LEADER's start-time (the leader pid == _self_pgid). When the
+# dispatch is its own group leader these are identical; reading the leader's own
+# /proc entry is what the reaper compares against, so record that explicitly.
+_leader_starttime="$_self_starttime"
+if [ -n "$_self_pgid" ] && _ldr_line="$(cat "/proc/$_self_pgid/stat" 2>/dev/null)"; then
+  _ldr_rest="${_ldr_line##*) }"
+  # shellcheck disable=SC2086
+  set -- $_ldr_rest
+  _leader_starttime="${20:-$_self_starttime}"
+fi
+
 # ── Post the sentinel comment (best-effort cross-host audit signal only). ────
 # The authoritative same-host guard is the flock above; the sentinel records
-# host + posted time + the OWNING TICK_PID (the long-lived process that holds
-# the lock — NOT $$, which is this ephemeral shell that exits before dispatch).
+# host + posted time + the OWNING TICK_PID (the long-lived loop process — kept
+# for backward-compat / cross-host kill-0 liveness) PLUS the per-dispatch
+# process-group identity (dispatch_pgid + dispatch_starttime) used by the reaper.
 OWNER_PID="${TICK_PID:-$$}"
 TICK_ID="tick-$(date +%s%N)-$OWNER_PID"
 SENTINEL_ID=$(gh api "repos/$OWNER/$REPO/issues/$ISSUE/comments" \
   --method POST \
   -f body="## 🔒 acquired-by:$TICK_ID
 
-posted=$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ), host=$(hostname), tick_pid=$OWNER_PID" \
+posted=$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ), host=$(hostname), tick_pid=$OWNER_PID, dispatch_pgid=${_self_pgid:-}, dispatch_starttime=${_leader_starttime:-}" \
   --jq '.id' 2>/dev/null || true)
 
 # Emit the held-lock FD + path + sentinel id for the caller to retain.
@@ -167,4 +257,4 @@ echo "LOCK_PATH=$LOCK_PATH"
 echo "SENTINEL_ID=${SENTINEL_ID:-}"
 echo "TICK_ID=$TICK_ID"
 echo "Won acquisition on #$ISSUE (flock held by tick_pid=$OWNER_PID). Proceeding." >&2
-exit 0
+_acq_end 0; return 0
