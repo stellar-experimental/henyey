@@ -35,6 +35,16 @@ LOOP_DRY_RUN="${LOOP_DRY_RUN:-0}"
 export LOOP_PID=$$
 rm -f "/tmp/project-tick-cooldown-${LOOP_PID}" 2>/dev/null || true
 
+# Lock owner identity for /project-tick Step 4 (acquire-issue-lock.sh, #2917).
+# Each tick is one long-lived `copilot` process (launched below); that process
+# sources acquire-issue-lock.sh, which takes a host-local flock and holds the
+# FD for the whole dispatch. The sentinel comment records this owning PID
+# (never the ephemeral `$$` of an inline shell), and because the lock is FD-
+# scoped the kernel releases it automatically when the copilot tick process
+# exits or is killed — no manual reaping needed (reap-on-override is the
+# separate follow-up #2934). We export the per-iteration value just before each
+# `copilot` invocation so it reflects the actual owning process.
+
 log() { printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"; }
 
 on_signal() {
@@ -75,6 +85,11 @@ while true; do
 
   # Single-issue tick. copilot returns 0 on success (whether or not it picked
   # an issue); non-zero indicates a hard error (GH API failure, etc.).
+  # Export TICK_PID (the loop process; copilot inherits it) as the lock-owner
+  # identity recorded in the sentinel comment for the best-effort cross-host
+  # `kill -0` liveness check (#2917). The authoritative same-host guard is the
+  # FD-scoped flock taken inside copilot.
+  export TICK_PID="$LOOP_PID"
   tick_exit=0
   timeout "$LOOP_TICK_TIMEOUT" copilot \
     --model "$LOOP_MODEL" \
