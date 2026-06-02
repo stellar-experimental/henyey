@@ -446,8 +446,24 @@ impl CatchupManager {
         // currentLedger is behind the target checkpoint yields the transient
         // CheckpointNotYetPublished so the attempt is retried, not wiped.
         let target_checkpoint = crate::checkpoint::checkpoint_containing(target);
-        let (target_has, _has_archive) = self.download_has(target_checkpoint).await?;
+        let (target_has, gate_archive) = self.download_has(target_checkpoint).await?;
         checkpoint_publication_gate(target_has.current_ledger(), target)?;
+
+        // #2940: pin every ledger-data download in this attempt to the exact
+        // archive that served `target_has` and passed the publication gate.
+        // This guarantees the archive whose published frontier satisfied the
+        // gate is the same archive that supplies the LCL header and checkpoint
+        // payloads — closing the cross-archive bypass where a different stale-
+        // but-serving archive could supply ledger data that never satisfied the
+        // gate (#2931 knit-to-LCL / state-wipe path under archive asymmetry).
+        //
+        // The pin is re-derived on every call to this method (i.e. per replay
+        // attempt) — never cached across attempts — since `download_has`
+        // re-scans archives from index 0 each time. A pinned download that
+        // fails returns an error for this attempt (no intra-attempt cross-
+        // archive fallback); the outer retry loop then re-runs the whole
+        // attempt, re-running the gate and re-selecting the archive, so a down
+        // archive is still rotated at the attempt boundary.
 
         // Download ledger data for replay
         self.update_progress(
@@ -456,7 +472,7 @@ impl CatchupManager {
             "Downloading ledger data",
         );
         let (ledger_data, knit_entries, archive_name) = self
-            .download_ledger_data(download_from, target, lcl)
+            .download_ledger_data(download_from, target, lcl, Some(&gate_archive))
             .await?;
 
         // CATCHUP_SPEC §11.2: apply the 5-case knit-to-LCL decision matrix
