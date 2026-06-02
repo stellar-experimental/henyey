@@ -573,6 +573,57 @@ test_direct_source_keeps_lock_fd_open() {
 }
 
 # ---------------------------------------------------------------------------
+# Test 10 (#2948): with TICK_PID UNSET, the sentinel records the acquiring
+# process's OWN pid (the `${TICK_PID:-$$}` fallback fires and self-keys).
+#
+# project-tick-loop.sh used to `export TICK_PID="$LOOP_PID"`, so every dispatch
+# inherited the long-lived LOOP pid as its sentinel `tick_pid=` identity — a
+# stale liveness handle (the loop outlives any single tick, so a cross-host
+# `kill -0 <loop_pid>` stays "alive" after the real flock-holding tick has
+# died). #2948 stops the loop from exporting TICK_PID at all, so the tick
+# self-keys its own `$$` via the `OWNER_PID="${TICK_PID:-$$}"` fallback.
+#
+# This guards that contract: invoke the script with TICK_PID EXPLICITLY CLEARED
+# (`env -u TICK_PID`), as its own backgrounded process so we know its pid (`$!`),
+# and assert the sentinel POST body carries `tick_pid=<that-pid>` — the script's
+# own `$$`, NOT the harness's. A re-introduced loop-level TICK_PID alias (or a
+# fallback regression) would break this. Fails on origin/main only in the sense
+# that the loop's old behavior is the thing this removes; the script itself
+# already honors the fallback, so this test documents and pins the self-keying
+# guarantee the issue establishes.
+# ---------------------------------------------------------------------------
+test_sentinel_records_own_pid_when_tick_pid_unset() {
+  local name="test_sentinel_records_own_pid_when_tick_pid_unset"
+  local tmpdir; tmpdir="$(mktemp -d)"
+  make_mock_gh "$tmpdir"
+
+  local namespace="$RUN_NONCE-t10"
+  local issue=4252
+  CLEANUP_DIRS+=("$REAL_HOME/data/$namespace")
+
+  # Run the target as its OWN backgrounded process with TICK_PID explicitly
+  # cleared, so `$!` is the pid of the `bash "$TARGET_SCRIPT"` process whose
+  # `$$` the `${TICK_PID:-$$}` fallback must resolve to. We must NOT use the
+  # harness's own `$$` here — that is exactly what the other tests pass via
+  # `TICK_PID=$$`, the branch this test deliberately avoids.
+  env -u TICK_PID PATH="$tmpdir:$PATH" PROJECT_TICK_LOCK_SESSION_ID="$namespace" \
+    GH_CALLS_LOG="$tmpdir/gh-calls.log" LOOP_PID="t10" \
+    bash "$TARGET_SCRIPT" "$issue" ready-for-doing >/dev/null 2>&1 &
+  local script_pid=$!
+  wait "$script_pid"
+  local exit_code=$?
+
+  if [ "$exit_code" -ne 0 ]; then
+    echo "FAIL: $name — expected exit 0 (lock free), got $exit_code"; FAILED=$((FAILED + 1)); rm -rf "$tmpdir"; return
+  fi
+  if ! grep -q "tick_pid=$script_pid" "$tmpdir/gh-calls.log" 2>/dev/null; then
+    echo "FAIL: $name — sentinel did not self-key tick_pid=$script_pid (the \${TICK_PID:-\$\$} fallback did not fire to the script's own \$\$)"
+    echo "  gh calls: $(cat "$tmpdir/gh-calls.log" 2>/dev/null)"; FAILED=$((FAILED + 1)); rm -rf "$tmpdir"; return
+  fi
+  echo "PASS: $name"; PASSED=$((PASSED + 1)); rm -rf "$tmpdir"
+}
+
+# ---------------------------------------------------------------------------
 # Run all tests.
 # ---------------------------------------------------------------------------
 test_flock_held_blocks_second_acquire
@@ -584,6 +635,7 @@ test_cross_session_serializes
 test_acquire_invokes_reap_on_success
 test_sentinel_records_dispatch_fields
 test_direct_source_keeps_lock_fd_open
+test_sentinel_records_own_pid_when_tick_pid_unset
 
 echo
 echo "Results: ${PASSED} passed, ${FAILED} failed"
