@@ -39,7 +39,7 @@ export REVIEW_PR_SCRATCH_DIR="$TEST_ROOT/merge-scratch"
 mkdir -p "$REVIEW_PR_SCRATCH_DIR"
 
 # ── TAP state ────────────────────────────────────────────────────────────────
-TAP_PLAN=47
+TAP_PLAN=49
 TAP_CURRENT=0
 TAP_FAILURES=0
 
@@ -243,7 +243,7 @@ assert_eq "APPROVE" "$STATE" "latest comment wins when multiple verdicts exist"
 
 MERGE_CALL_NUM=0
 mock_merge_auto_hint() {
-  local pr_num="$1" repo="$2" flags="$3"
+  local pr_num="$1"; shift 2; local flags="$*"   # ignore repo
   MERGE_CALL_NUM=$((MERGE_CALL_NUM + 1))
   if [[ "$flags" == *"--admin"* ]]; then
     echo "X Pull request stellar-experimental/henyey#$pr_num is not mergeable: the merge commit cannot be cleanly created." >&2
@@ -291,7 +291,7 @@ unset REVIEW_PR_AUTO_MERGE_FILE
 # When --auto also fails (e.g. autoMergeAllowed: false), result is hard-failure.
 
 mock_merge_auto_both_fail() {
-  local pr_num="$1" repo="$2" flags="$3"
+  shift 2; local flags="$*"   # ignore pr_num/repo; classify by flags
   if [[ "$flags" == *"--admin"* ]]; then
     echo "To have the pull request merged after all the requirements have been met, add the \`--auto\` flag." >&2
     return 1
@@ -316,7 +316,7 @@ unset REVIEW_PR_MERGE_CMD
 # ══════════════════════════════════════════════════════════════════════════════
 
 mock_merge_other_failure() {
-  local pr_num="$1" repo="$2" flags="$3"
+  shift 2; local flags="$*"   # ignore pr_num/repo; classify by flags
   if [[ "$flags" == *"--admin"* ]]; then
     echo "permission denied: token lacks admin access" >&2
     return 1
@@ -334,6 +334,44 @@ set -e
 [[ "$RESULT" == "hard-failure:permission denied: token lacks admin access" ]] && \
   tap_ok "unexpected admin merge failure stays terminal" || \
   tap_fail "unexpected admin merge failure stays terminal" "got: $RESULT"
+unset REVIEW_PR_MERGE_CMD
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TEST 13b: attempt_merge passes --squash --admin as SEPARATE argv entries (#2949)
+# ══════════════════════════════════════════════════════════════════════════════
+# Regression for #2949: the merge flags must reach `gh pr merge` as two distinct
+# arguments (`--squash` `--admin`), NOT as a single quoted "--squash --admin"
+# string (which gh rejects with "unknown flag: --squash --admin"). The mock
+# records the flag argv count and the individual flag tokens it received.
+#
+# Contract: _review_pr_exec_merge passes the flags as trailing positional args
+# (argv index 3..N), so a mock sees pr_num=$1, repo=$2, and each flag as its
+# own $3, $4, ... — `$# - 2` is the flag count.
+
+MOCK_FLAG_ARGC=0
+MOCK_FLAG_TOKENS=""
+mock_merge_record_argv() {
+  # $1=pr_num, $2=repo (both ignored); $3.. are the individual merge flags.
+  shift 2
+  MOCK_FLAG_ARGC="$#"
+  MOCK_FLAG_TOKENS="$*"
+  return 0
+}
+
+export REVIEW_PR_MERGE_CMD=mock_merge_record_argv
+MOCK_FLAG_ARGC=0
+MOCK_FLAG_TOKENS=""
+RESULT=$(attempt_merge 2949)
+# Re-run without subshell capture so the mock's variable writes are visible
+# (the command-substitution above runs the mock in a subshell, discarding its
+# variable mutations). attempt_merge is idempotent for a "merged" result.
+MOCK_FLAG_ARGC=0
+MOCK_FLAG_TOKENS=""
+attempt_merge 2949 >/dev/null
+assert_eq "2" "$MOCK_FLAG_ARGC" \
+  "attempt_merge passes admin merge flags as 2 separate argv entries (#2949)"
+assert_eq "--squash --admin" "$MOCK_FLAG_TOKENS" \
+  "attempt_merge admin flags are --squash and --admin (#2949)"
 unset REVIEW_PR_MERGE_CMD
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -387,7 +425,7 @@ mkdir -p "$CUSTOM_SCRATCH"
 export REVIEW_PR_SCRATCH_DIR="$CUSTOM_SCRATCH"
 
 mock_merge_success() {
-  local pr_num="$1" repo="$2" flags="$3"
+  # Args (pr_num, repo, flags...) are intentionally ignored; always succeeds.
   return 0
 }
 export REVIEW_PR_MERGE_CMD=mock_merge_success
