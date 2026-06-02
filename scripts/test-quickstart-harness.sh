@@ -215,8 +215,22 @@ test_workflow_shard_probe_contract() {
         else
             tap_ok "pubnet_excludes_rpc_healthy"
         fi
+
+        # Check: pubnet shard DOES include stellar_rpc_up. Upstream
+        # internal-test.yml runs test_stellar_rpc_up.go on every shard whose
+        # `enable` contains 'rpc' (`if: contains(matrix.enable, 'rpc')`) with
+        # no pubnet exclusion — only rpc_healthy is gated off on pubnet. This
+        # positive assertion guards against silently dropping RPC-up coverage
+        # from the pubnet/core,rpc,horizon shard (parity residual from #2916,
+        # tracked in #2919).
+        if echo "$pubnet_probes" | grep -q 'test_stellar_rpc_up'; then
+            tap_ok "pubnet_includes_rpc_up"
+        else
+            tap_not_ok "pubnet_includes_rpc_up" "pubnet shard missing stellar_rpc_up (upstream runs it on every rpc-enabled shard)"
+        fi
     else
         tap_not_ok "pubnet_excludes_rpc_healthy" "no pubnet shard found"
+        tap_not_ok "pubnet_includes_rpc_up" "no pubnet shard found"
     fi
 
     # Check: local rpc shard includes test_friendbot.go (upstream runs friendbot
@@ -484,7 +498,7 @@ test_upstream_contract_validation() {
 }
 
 # --- Run all tests ---
-tap_plan 33
+tap_plan 34
 
 test_timeout_retry_on_targeted_shard
 test_non_timeout_failure_no_retry
