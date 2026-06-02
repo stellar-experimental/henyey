@@ -38,12 +38,17 @@ rm -f "/tmp/project-tick-cooldown-${LOOP_PID}" 2>/dev/null || true
 # Lock owner identity for /project-tick Step 4 (acquire-issue-lock.sh, #2917).
 # Each tick is one long-lived `copilot` process (launched below); that process
 # sources acquire-issue-lock.sh, which takes a host-local flock and holds the
-# FD for the whole dispatch. The sentinel comment records this owning PID
-# (never the ephemeral `$$` of an inline shell), and because the lock is FD-
-# scoped the kernel releases it automatically when the copilot tick process
-# exits or is killed — no manual reaping needed (reap-on-override is the
-# separate follow-up #2934). We export the per-iteration value just before each
-# `copilot` invocation so it reflects the actual owning process.
+# FD for the whole dispatch. The sentinel's `tick_pid=` field is keyed off
+# `${TICK_PID:-$$}` inside the script, so with TICK_PID UNSET (#2948) it
+# resolves to the tick's OWN `$$` — the actual flock holder — rather than this
+# loop's pid. The loop therefore deliberately exports NO TICK_PID; the tick
+# self-keys its sentinel identity. (A loop-supplied TICK_PID would be a stale
+# liveness handle: the loop outlives any single tick, so a cross-host
+# `kill -0 <loop_pid>` would stay "alive" after the real tick died.) Because the
+# lock is FD-scoped the kernel releases it automatically when the copilot tick
+# process exits or is killed — no manual reaping needed for prevention; the
+# authoritative reaper identity is the self-recorded dispatch_pgid +
+# dispatch_starttime (#2934/#2960), not this legacy field.
 
 log() { printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"; }
 
@@ -85,11 +90,16 @@ while true; do
 
   # Single-issue tick. copilot returns 0 on success (whether or not it picked
   # an issue); non-zero indicates a hard error (GH API failure, etc.).
-  # Export TICK_PID (the loop process; copilot inherits it) as the lock-owner
-  # identity recorded in the sentinel comment for the best-effort cross-host
-  # `kill -0` liveness check (#2917). The authoritative same-host guard is the
-  # FD-scoped flock taken inside copilot.
-  export TICK_PID="$LOOP_PID"
+  # Explicitly UNSET TICK_PID (#2948) so the dispatched copilot does NOT inherit
+  # a loop-supplied value: acquire-issue-lock.sh's `${TICK_PID:-$$}` then falls
+  # back to the tick's OWN `$$` (the actual flock holder) for the sentinel
+  # `tick_pid=` field, instead of this loop's pid (a stale cross-host liveness
+  # handle). The unset is explicit rather than a bare omission so any ambient
+  # TICK_PID inherited into THIS loop's environment cannot leak into copilot and
+  # defeat the fallback. The authoritative same-host guard is the FD-scoped
+  # flock taken inside copilot; the reaper identity is the self-recorded
+  # dispatch_pgid + dispatch_starttime (#2960), not this best-effort field.
+  unset TICK_PID
   tick_exit=0
 
   # Launch the dispatch as its OWN process-group leader (#2934/#2957). reap-

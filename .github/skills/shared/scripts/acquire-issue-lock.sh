@@ -25,8 +25,9 @@
 # non-blocking `flock -n` on a per-issue lockfile under a HOST-STABLE namespace
 # in ~/data (keyed only on the host + issue number, NOT the per-process session
 # — see #2936), held on an FD
-# owned by the LONG-LIVED tick process (TICK_PID) for the entire dispatch
-# lifetime. A concurrent live tick's flock fails immediately → exit 1 (kernel-
+# owned by the dispatching tick process for the entire dispatch lifetime (its
+# pid is self-recorded via `${TICK_PID:-$$}` → the tick's own `$$`, since the
+# loop no longer exports TICK_PID — #2948). A concurrent live tick's flock fails immediately → exit 1 (kernel-
 # atomic, race-free, independent of elapsed wall-time). The lock auto-releases
 # when the FD closes on tick exit — so even a crashed/killed tick frees it with
 # no manual reaping (which is why reap-on-override is cleanly separable into the
@@ -239,9 +240,11 @@ fi
 
 # ── Post the sentinel comment (best-effort cross-host audit signal only). ────
 # The authoritative same-host guard is the flock above; the sentinel records
-# host + posted time + the OWNING TICK_PID (the long-lived loop process — kept
-# for backward-compat / cross-host kill-0 liveness) PLUS the per-dispatch
-# process-group identity (dispatch_pgid + dispatch_starttime) used by the reaper.
+# host + posted time + this tick's OWN pid via `${TICK_PID:-$$}` — the loop no
+# longer exports TICK_PID (#2948), so this falls back to the tick's own `$$`,
+# the actual flock holder (kept for backward-compat / cross-host kill-0
+# liveness) PLUS the per-dispatch process-group identity (dispatch_pgid +
+# dispatch_starttime) used by the reaper.
 OWNER_PID="${TICK_PID:-$$}"
 TICK_ID="tick-$(date +%s%N)-$OWNER_PID"
 SENTINEL_ID=$(gh api "repos/$OWNER/$REPO/issues/$ISSUE/comments" \
