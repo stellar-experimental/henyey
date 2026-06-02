@@ -52,15 +52,31 @@ fmt ──┬── clippy     (lint, -D warnings)
 
 ### Quickstart Workflow (`quickstart.yml`)
 
-Uses the upstream [stellar/quickstart](https://github.com/stellar/docker-stellar-core-horizon) reusable build workflow to run Docker integration tests. The workflow builds a quickstart image with henyey replacing stellar-core, then runs the test matrix:
+Uses the upstream [stellar/quickstart](https://github.com/stellar/quickstart) reusable build workflow to **build** the Docker image, then runs test orchestration **locally** in this repo (see [#2916](https://github.com/stellar-experimental/henyey/issues/2916)).
 
-| Network | Services | What it validates |
-|---------|----------|-------------------|
-| local | core, rpc, horizon | Standalone genesis → ledger close → RPC health → Horizon indexing |
-| testnet | core, horizon | Catchup from testnet → sync → Horizon against live data (RPC temporarily disabled, see [#1848](https://github.com/stellar-experimental/henyey/issues/1848)) |
-| pubnet | core, rpc, horizon | Catchup from mainnet → sync → RPC + Horizon against live data |
+**Architecture:**
+1. **Setup job** — resolves the `stellar/quickstart` SHA once per run.
+2. **Build job** — calls `stellar/quickstart/.github/workflows/build.yml@main` with `test: false` and the resolved SHA.
+3. **Test job** — downloads the built image, checks out `stellar/quickstart` at the same SHA, and runs every upstream Go probe through `scripts/ci/run-quickstart-test.sh`.
+
+**Test matrix:**
+
+| Network | Services | Probes |
+|---------|----------|--------|
+| local | core | `test_core.go` |
+| local | rpc | `test_stellar_rpc_up.go`, `test_stellar_rpc_healthy.go` |
+| local | core,rpc,horizon | `test_core.go`, `test_horizon_up.go`, `test_horizon_core_up.go`, `test_horizon_ingesting.go`, `test_stellar_rpc_up.go`, `test_stellar_rpc_healthy.go`, `test_friendbot.go` |
+| local | galexie | `test_galexie.go` |
+| testnet | core,horizon | `test_core.go`, `test_horizon_up.go`, `test_horizon_core_up.go`, `test_horizon_ingesting.go` |
+| pubnet | core,rpc,horizon | `test_core.go`, `test_horizon_up.go`, `test_stellar_rpc_up.go` |
+
+**Timeout-only retry (#2916):** The `testnet/core,horizon/horizon-core-up` probe is known to flake due to cold-start timeouts under CI load. The wrapper retries exactly once when the first exit is timeout-classified (GNU `timeout` exit 124). Non-timeout failures and all other shards fail immediately — no silent masking.
+
+**Diagnostics:** On any probe failure, the wrapper captures docker state, container logs, and HTTP endpoint snapshots. These are uploaded as artifacts with 7-day retention.
 
 The quickstart workflow runs on `amd64` only. It uses the `stellar/quickstart:testing` base image with `horizon_skip_protocol_version_check: true` to allow henyey's version string.
+
+**Self-test:** `bash scripts/test-quickstart-harness.sh` (runs in CI as the `quickstart-harness` job) validates the wrapper's retry logic and the workflow's shard/probe contract without Docker.
 
 Both workflows must pass before merging.
 

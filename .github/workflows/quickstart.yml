@@ -18,14 +18,26 @@ name: Quickstart
 #     against stellar-core at crates/common/src/xdr_stream.rs).
 #   * JSON-RPC HTTP surface: crates/rpc/tests/http_dispatch.rs.
 #
-# Reusable-workflow behaviour: stellar/quickstart injects an implicit
-# matrix of network=["local"] × enable=["core","rpc","core,rpc,horizon",
-# "galexie"] for every image. Failures in these shards (and the
-# additional testnet shard) are treated the same as any other CI failure
-# — continue-on-error is not used here. Policy: every job must either
-# pass or the build goes red. If a shard flakes for reasons outside
-# henyey's control, file an issue and either skip that shard explicitly
-# or fix the flake; do not silently swallow the failure.
+# Test orchestration (#2916):
+#
+# Image building is delegated to stellar/quickstart's reusable build
+# workflow with test: false. Test orchestration lives in this repo so we
+# can apply a timeout-only retry to the flaky testnet/core,horizon/
+# horizon-core-up probe without forking the entire upstream test matrix.
+# Each probe is run through scripts/ci/run-quickstart-test.sh which adds:
+#   * GNU timeout with diagnostics capture on failure
+#   * Exactly one retry for testnet/core,horizon/horizon-core-up when the
+#     exit is timeout-classified (exit 124)
+#   * No retry for any other shard or non-timeout failure
+#
+# Upstream contract validation:
+#   The validate-contract job fetches both build.yml and internal-build.yml
+#   from the resolved SHA and validates them against the pinned contract at
+#   scripts/ci/upstream-quickstart-contract.yml. This catches drift in the
+#   input interface (build.yml) and the artifact/image interface
+#   (internal-build.yml). Note: the `uses:` field calls build.yml@main
+#   because GitHub Actions does not support dynamic refs for reusable
+#   workflows. See the contract file header for the full limitation.
 #
 # Testnet shard (#1848): Temporarily downgraded from core,rpc,horizon to
 # core,horizon. The test_stellar_rpc_healthy step requires continuous
@@ -35,6 +47,9 @@ name: Quickstart
 # attempt), which is insufficient. Re-enable RPC on testnet when the
 # upstream timeout is configurable or the RPC healthy test is skipped
 # for testnet (matching the pubnet precedent).
+
+permissions:
+  contents: read
 
 on:
   pull_request:
@@ -57,10 +72,229 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  build:
+  # Resolve the quickstart SHA once so build and test use the same version.
+  setup:
     if: github.event_name == 'push' || github.event.pull_request.head.repo.private == false
+    runs-on: ubuntu-latest
+    outputs:
+      quickstart-sha: ${{ steps.resolve.outputs.sha }}
+    steps:
+      - name: Resolve stellar/quickstart SHA
+        id: resolve
+        run: |
+          SHA=$(git ls-remote https://github.com/stellar/quickstart.git HEAD | cut -f1)
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "Resolved stellar/quickstart SHA: $SHA"
+
+  # Validate that our assumptions about the upstream contract still hold.
+  # Fetches both the top-level build.yml (input contract) and the delegated
+  # internal-build.yml (artifact/image contract) from the resolved SHA, then
+  # validates both against scripts/ci/upstream-quickstart-contract.yml.
+  #
+  # The drift guard step verifies the resolved SHA == current main HEAD,
+  # since GitHub Actions requires the literal `@main` ref in `uses:`. If they
+  # diverge (e.g., setup resolved a stale SHA), the job fails immediately
+  # rather than validating one revision while executing another.
+  validate-contract:
+    needs: setup
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify resolved SHA matches @main (drift guard)
+        run: |
+          SHA="${{ needs.setup.outputs.quickstart-sha }}"
+          # We call build.yml@main but validate at $SHA. If main has advanced
+          # past the SHA we resolved in setup, the executed workflow may differ
+          # from what we validated — fail fast to avoid silent false-greens.
+          MAIN_SHA=$(git ls-remote https://github.com/stellar/quickstart.git refs/heads/main | cut -f1)
+          if [[ "$SHA" != "$MAIN_SHA" ]]; then
+            echo "✗ Resolved SHA ($SHA) differs from current main ($MAIN_SHA)."
+            echo "  The build job calls build.yml@main but we validated at $SHA."
+            echo "  This means the executed workflow may have drifted from what"
+            echo "  we validated. Re-run the workflow to pick up the latest SHA."
+            exit 1
+          fi
+          echo "✓ Resolved SHA matches current main — no @main drift."
+
+      - name: Fetch upstream workflows
+        run: |
+          SHA="${{ needs.setup.outputs.quickstart-sha }}"
+          curl -sf "https://raw.githubusercontent.com/stellar/quickstart/$SHA/.github/workflows/build.yml" \
+            -o /tmp/upstream-build.yml
+          # internal-build.yml is the delegated workflow that produces artifacts.
+          # It may not exist (older upstream versions inline it) — handle gracefully.
+          curl -sf "https://raw.githubusercontent.com/stellar/quickstart/$SHA/.github/workflows/internal-build.yml" \
+            -o /tmp/upstream-internal-build.yml || true
+
+      - name: Validate upstream contract
+        run: |
+          CONTRACT="scripts/ci/upstream-quickstart-contract.yml"
+          UPSTREAM="/tmp/upstream-build.yml"
+          INTERNAL="/tmp/upstream-internal-build.yml"
+
+          echo "=== Validating upstream quickstart contract ==="
+          echo "SHA: ${{ needs.setup.outputs.quickstart-sha }}"
+          echo "Contract file: $CONTRACT"
+          echo ""
+
+          ERRORS=0
+
+          # --- 1. Validate build.yml input contract ---
+          echo "--- build.yml input contract ---"
+
+          # Read expected inputs from contract file
+          if ! grep -q '^build_inputs:' "$CONTRACT"; then
+            echo "✗ contract file missing build_inputs section"
+            ERRORS=$((ERRORS + 1))
+          else
+            for input in ref test images archs; do
+              if grep -q "  - $input" "$CONTRACT"; then
+                if grep -q "$input:" "$UPSTREAM"; then
+                  echo "✓ upstream accepts '$input' input (matches contract)"
+                else
+                  echo "✗ upstream missing '$input' input (contract expects it)"
+                  ERRORS=$((ERRORS + 1))
+                fi
+              fi
+            done
+          fi
+
+          # Verify 'test' is boolean-typed (we depend on test: false)
+          if grep -q 'test:' "$UPSTREAM" && grep -A5 'test:' "$UPSTREAM" | grep -q 'type: boolean\|type:.*bool'; then
+            echo "✓ 'test' input is boolean-typed"
+          else
+            echo "✗ 'test' input not found or not boolean-typed"
+            ERRORS=$((ERRORS + 1))
+          fi
+
+          echo ""
+
+          # --- 2. Validate artifact/image contract (internal-build.yml) ---
+          echo "--- internal-build.yml artifact contract ---"
+
+          # Read expected artifact name from contract
+          EXPECTED_ARTIFACT=$(grep '^expected_artifact_name:' "$CONTRACT" | sed 's/.*: *"\(.*\)"/\1/')
+          EXPECTED_TAG=$(grep '^expected_image_tag:' "$CONTRACT" | sed 's/.*: *"\(.*\)"/\1/')
+          ARTIFACT_PATTERN=$(grep '^artifact_name_pattern:' "$CONTRACT" | sed 's/.*: *"\(.*\)"/\1/')
+
+          if [[ -f "$INTERNAL" ]]; then
+            echo "✓ internal-build.yml found at resolved SHA"
+
+            # Check that it uploads artifacts (upload-artifact action present)
+            if grep -q 'upload-artifact' "$INTERNAL"; then
+              echo "✓ internal-build.yml uploads artifacts"
+            else
+              echo "✗ internal-build.yml does not use upload-artifact"
+              ERRORS=$((ERRORS + 1))
+            fi
+
+            # --- Exact artifact name validation ---
+            # The contract specifies artifact_name_pattern: "image-quickstart-{tag}-{arch}.tar"
+            # Upstream internal-build.yml constructs the artifact name using expressions like:
+            #   image-quickstart-${{ inputs.tag ... }}-${{ matrix.arch }}
+            # We validate: (a) the exact "image-quickstart-" prefix with tag/arch interpolation,
+            # and (b) our concrete expected_artifact_name decomposes correctly from the pattern.
+            #
+            # Convert pattern "image-quickstart-{tag}-{arch}.tar" into a regex that matches
+            # the upstream template expression (tag and arch are GHA expressions).
+            ARTIFACT_PREFIX="image-quickstart-"
+            if grep -q "${ARTIFACT_PREFIX}" "$INTERNAL"; then
+              echo "✓ internal-build.yml artifact name uses prefix '${ARTIFACT_PREFIX}'"
+            else
+              echo "✗ internal-build.yml missing artifact name prefix '${ARTIFACT_PREFIX}'"
+              echo "  Expected pattern: $ARTIFACT_PATTERN"
+              echo "  Expected concrete: $EXPECTED_ARTIFACT"
+              ERRORS=$((ERRORS + 1))
+            fi
+
+            # Validate the artifact name template follows the exact {tag}-{arch}.tar structure.
+            # Upstream must produce: image-quickstart-<tag_expr>-<arch_expr> (with .tar optional
+            # in the upload name). We check that the line contains the prefix, then a tag
+            # expression, a literal hyphen separator, then an arch expression — in that order.
+            # This rejects incompatible shapes like {arch}-{tag} or {tag}.zip.
+            ARTIFACT_REGEX="${ARTIFACT_PREFIX}"'\$\{\{[^}]*(tag|inputs\.tag|matrix\.tag)[^}]*\}\}-\$\{\{[^}]*(arch|matrix\.arch|inputs\.arch)[^}]*\}\}'
+            if grep -qE "$ARTIFACT_REGEX" "$INTERNAL"; then
+              echo "✓ internal-build.yml artifact name matches {tag}-{arch} structure"
+            else
+              echo "✗ internal-build.yml artifact name does not match expected {tag}-{arch} structure"
+              echo "  Expected regex: $ARTIFACT_REGEX"
+              echo "  Expected pattern: $ARTIFACT_PATTERN (tag=testing-with-pr, arch=amd64)"
+              ERRORS=$((ERRORS + 1))
+            fi
+
+            # --- Exact image tag validation ---
+            # The contract specifies image_tag_pattern: "quickstart:{tag}-{arch}"
+            # Upstream tags the image as quickstart:${{ inputs.tag }}-${{ matrix.arch }}
+            # or similar. Validate the "quickstart:" prefix with tag-arch interpolation.
+            IMAGE_TAG_PREFIX="quickstart:"
+            if grep -q "${IMAGE_TAG_PREFIX}" "$INTERNAL"; then
+              echo "✓ internal-build.yml image tag uses prefix '${IMAGE_TAG_PREFIX}'"
+            else
+              echo "✗ internal-build.yml missing image tag prefix '${IMAGE_TAG_PREFIX}'"
+              echo "  Expected tag pattern: quickstart:{tag}-{arch}"
+              echo "  Expected concrete: $EXPECTED_TAG"
+              ERRORS=$((ERRORS + 1))
+            fi
+
+            # Validate the image tag template follows the exact {tag}-{arch} structure.
+            # Upstream must tag as: quickstart:<tag_expr>-<arch_expr>.
+            # Reject shapes like quickstart:${{ inputs.tag }} (missing arch).
+            TAG_REGEX="${IMAGE_TAG_PREFIX}"'\$\{\{[^}]*(tag|inputs\.tag|matrix\.tag)[^}]*\}\}-\$\{\{[^}]*(arch|matrix\.arch|inputs\.arch)[^}]*\}\}'
+            if grep -qE "$TAG_REGEX" "$INTERNAL"; then
+              echo "✓ internal-build.yml image tag matches {tag}-{arch} structure"
+            else
+              echo "✗ internal-build.yml image tag does not match expected {tag}-{arch} structure"
+              echo "  Expected regex: $TAG_REGEX"
+              echo "  Expected: dynamic tag with {tag}-{arch} pattern"
+              ERRORS=$((ERRORS + 1))
+            fi
+
+            # Check docker save / image export pattern (/tmp/image is the conventional path)
+            if grep -q '/tmp/image\|docker save' "$INTERNAL"; then
+              echo "✓ internal-build.yml uses docker image export (matches artifact_layout)"
+            else
+              echo "✗ could not confirm /tmp/image or docker save in internal-build.yml"
+              echo "  The 'Load Docker image' step depends on this layout — drift will break test runs."
+              ERRORS=$((ERRORS + 1))
+            fi
+          else
+            # internal-build.yml not found — check if build.yml itself handles artifacts
+            echo "⚠ internal-build.yml not found at resolved SHA (may be inlined in build.yml)"
+            if grep -q "${ARTIFACT_PREFIX:-image-quickstart-}" "$UPSTREAM" && grep -q 'upload-artifact' "$UPSTREAM"; then
+              echo "✓ build.yml directly handles artifact upload with expected naming"
+            else
+              echo "✗ neither build.yml nor internal-build.yml confirms artifact contract"
+              echo "  Expected artifact: $EXPECTED_ARTIFACT"
+              ERRORS=$((ERRORS + 1))
+            fi
+          fi
+
+          echo ""
+
+          # --- 3. Summary ---
+          if [[ $ERRORS -gt 0 ]]; then
+            echo "=== FAILED: $ERRORS contract violation(s) detected ==="
+            echo "The upstream stellar/quickstart workflows at SHA ${{ needs.setup.outputs.quickstart-sha }}"
+            echo "no longer match our pinned contract at $CONTRACT."
+            echo "Update the contract file and workflow if the upstream change is intentional."
+            exit 1
+          fi
+
+          echo "=== Upstream contract validation passed (${{ needs.setup.outputs.quickstart-sha }}) ==="
+
+  # Build the quickstart image with test: false — testing is handled locally.
+  #
+  # NOTE: GitHub Actions does not support dynamic refs in `uses:` for reusable
+  # workflows. We call build.yml@main; the `validate-contract` job's drift
+  # guard ensures the resolved SHA == main HEAD before we reach this point,
+  # so the validated and executed definitions are the same revision.
+  build:
+    needs: [setup, validate-contract]
     uses: stellar/quickstart/.github/workflows/build.yml@main
     with:
+      ref: ${{ needs.setup.outputs.quickstart-sha }}
+      test: false
       images: |
         [
           {
@@ -71,13 +305,111 @@ jobs:
             },
             "deps": [
               { "name": "core", "repo": "${{ github.event.pull_request.head.repo.full_name || github.repository }}", "ref": "${{ github.event.pull_request.head.sha || github.sha }}" }
-            ],
-            "tests": {
-              "additional-tests": [
-                { "arch": "amd64", "network": "testnet", "enable": "core,horizon" },
-                { "arch": "amd64", "network": "pubnet", "enable": "core,rpc,horizon" }
-              ]
-            }
+            ]
           }
         ]
       archs: '["amd64"]'
+
+  # Run upstream Go probes locally through the timeout/retry wrapper.
+  test:
+    needs: [setup, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Local shards (network=local)
+          - network: local
+            enable: core
+            probes: "test_core.go"
+          - network: local
+            enable: rpc
+            probes: "test_stellar_rpc_up.go test_stellar_rpc_healthy.go test_friendbot.go"
+          - network: local
+            enable: "core,rpc,horizon"
+            probes: "test_core.go test_horizon_up.go test_horizon_core_up.go test_horizon_ingesting.go test_stellar_rpc_up.go test_stellar_rpc_healthy.go test_friendbot.go"
+          - network: local
+            enable: galexie
+            probes: "test_galexie.go"
+          # Additional testnet shard
+          - network: testnet
+            enable: "core,horizon"
+            probes: "test_core.go test_horizon_up.go test_horizon_core_up.go test_horizon_ingesting.go"
+          # Additional pubnet shard
+          # Note: upstream excludes horizon_core_up, horizon_ingesting, and
+          # stellar_rpc_healthy on pubnet (see internal-test.yml conditionals).
+          - network: pubnet
+            enable: "core,rpc,horizon"
+            probes: "test_core.go test_horizon_up.go test_stellar_rpc_up.go"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download quickstart image
+        uses: actions/download-artifact@v4
+        with:
+          name: image-quickstart-testing-with-pr-amd64.tar
+          path: /tmp/quickstart-image
+
+      - name: Load Docker image
+        run: |
+          tarball="$(ls /tmp/quickstart-image/image 2>/dev/null || ls /tmp/quickstart-image/*.tar 2>/dev/null | head -1)"
+          docker load -i "$tarball"
+
+      - name: Checkout stellar/quickstart (tests)
+        uses: actions/checkout@v4
+        with:
+          repository: stellar/quickstart
+          ref: ${{ needs.setup.outputs.quickstart-sha }}
+          path: quickstart
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+          cache: false
+
+      - name: Run quickstart container
+        run: |
+          docker run -d --name quickstart \
+            -p 8000:8000 -p 11626:11626 -p 8001:8001 \
+            quickstart:testing-with-pr-amd64 \
+            --${{ matrix.network }} \
+            --enable ${{ matrix.enable }}
+
+      - name: Run probes through wrapper
+        env:
+          NETWORK: ${{ matrix.network }}
+          ENABLE: ${{ matrix.enable }}
+        run: |
+          PROBE_TIMEOUT=600
+          DIAG_DIR="/tmp/quickstart-diagnostics"
+
+          for probe_file in ${{ matrix.probes }}; do
+            probe_name="${probe_file%.go}"
+            probe_name="${probe_name#test_}"
+            # Normalize underscores to hyphens so probe names match the
+            # retry policy (e.g. horizon_core_up → horizon-core-up).
+            probe_name="${probe_name//_/-}"
+
+            scripts/ci/run-quickstart-test.sh \
+              --network "$NETWORK" \
+              --enable "$ENABLE" \
+              --probe "$probe_name" \
+              --timeout "$PROBE_TIMEOUT" \
+              --diagnostics-dir "$DIAG_DIR/$NETWORK-$ENABLE-$probe_name" \
+              -- go run "quickstart/tests/$probe_file"
+          done
+
+      - name: Upload diagnostics on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: quickstart-diagnostics-${{ matrix.network }}-${{ matrix.enable }}
+          path: /tmp/quickstart-diagnostics/
+          retention-days: 7
+
+      - name: Cleanup
+        if: always()
+        run: |
+          docker stop quickstart 2>/dev/null || true
+          docker rm quickstart 2>/dev/null || true

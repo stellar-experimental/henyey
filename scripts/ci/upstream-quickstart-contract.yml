@@ -1,0 +1,73 @@
+# upstream-quickstart-contract.yml — Pinned expectations about the
+# stellar/quickstart reusable build workflow contract.
+#
+# This file documents what our quickstart.yml depends on from upstream.
+# When the upstream SHA is updated (resolved at runtime via git ls-remote),
+# a CI step validates these invariants still hold. If upstream drifts and
+# breaks these, we'll get a clear failure here rather than a mysterious
+# flake in the test matrix.
+#
+# Drift guard: The validate-contract job verifies that the resolved SHA
+# matches the current main HEAD before proceeding, ensuring the validated
+# and executed (build.yml@main) workflow definitions are the same revision.
+#
+# Last verified against: stellar/quickstart main (2026-05-31)
+# Upstream workflows validated:
+#   - .github/workflows/build.yml (input contract)
+#   - .github/workflows/internal-build.yml (artifact/image contract)
+
+# Build workflow outputs an artifact with this naming pattern.
+# Pattern: image-quickstart-{tag}-{arch}.tar
+artifact_name_pattern: "image-quickstart-{tag}-{arch}.tar"
+
+# The built image is tagged as quickstart:{tag}-{arch}
+image_tag_pattern: "quickstart:{tag}-{arch}"
+
+# Our concrete values (tag=testing-with-pr, arch=amd64):
+expected_artifact_name: "image-quickstart-testing-with-pr-amd64.tar"
+expected_image_tag: "quickstart:testing-with-pr-amd64"
+
+# The artifact contains a docker image tarball inside an `image` directory
+# or as a top-level .tar file.
+artifact_layout: "image/ directory or top-level .tar"
+
+# Build workflow accepts these inputs:
+build_inputs:
+  - ref        # SHA to check out
+  - test       # bool — whether to run tests (we pass false)
+  - images     # JSON array of image configs
+  - archs      # JSON array of architectures
+
+# Each image config accepts:
+image_config_fields:
+  - tag        # string — becomes the image tag suffix
+  - inherit    # string — base config to inherit from (e.g. "testing")
+  - config     # object — horizon/core config overrides
+  - deps       # array — {name, repo, ref} dependencies
+
+# Probe files in upstream tests/ directory follow this naming:
+# test_{probe_name}.go where probe_name uses underscores.
+# Our normalization: strip "test_" prefix, strip ".go" suffix, replace _ with -.
+probe_naming:
+  upstream_pattern: "test_{name}.go"
+  our_normalization: "strip test_ prefix, strip .go suffix, underscores to hyphens"
+
+# Probes known to be excluded on pubnet (from upstream internal-test.yml):
+pubnet_excluded_probes:
+  - horizon-core-up
+  - horizon-ingesting
+  - stellar-rpc-healthy
+
+# --- Delegated artifact contract (internal-build.yml) ---
+# The build.yml workflow delegates actual image building and artifact upload
+# to internal-build.yml. The following fields document what internal-build.yml
+# must provide for our test job to consume the artifact correctly.
+delegated_artifact_contract:
+  # internal-build.yml uploads the image tarball as a GitHub Actions artifact
+  upload_action: "actions/upload-artifact"
+  # Artifact naming follows this pattern (must contain "image-quickstart")
+  artifact_name_contains: "image-quickstart"
+  # Docker image is exported via `docker save` to a tarball
+  image_export_method: "docker save"
+  # The tarball is placed in /tmp/image/ or as a top-level file in the artifact
+  tarball_location: "/tmp/image/ directory or top-level in artifact"
