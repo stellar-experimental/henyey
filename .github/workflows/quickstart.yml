@@ -57,8 +57,11 @@ permissions:
 # `github.run_attempt * timeout_multiplier`. We reproduce the same multiplier
 # here so the in-repo orchestration preserves upstream timeout semantics (4 min
 # on attempt 1, escalating on manual re-runs) instead of diverging silently.
-# Pinned in scripts/ci/upstream-quickstart-contract.yml (timeout_multiplier: 4)
-# so multiplier drift is caught by validate-contract and the harness (#2920).
+# Pinned in scripts/ci/upstream-quickstart-contract.yml (timeout_multiplier: 4).
+# Note: the validate-contract job only fetches/validates upstream build.yml and
+# internal-build.yml, not internal-test.yml (where the multiplier lives), so it
+# does NOT catch multiplier drift. Drift is caught by the harness/text
+# assertions in scripts/test-quickstart-harness.sh instead (#2920).
 env:
   timeout_multiplier: 4
 
