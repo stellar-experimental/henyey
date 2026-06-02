@@ -116,6 +116,42 @@ pub(super) fn knit_to_lcl_decision(
     Ok(KnitDecision::Apply)
 }
 
+/// Published-checkpoint precondition gate for the knit/replay path (#2931).
+///
+/// Mirrors stellar-core's `GetHistoryArchiveStateWork` retry-until-published
+/// precondition (`CatchupWork.cpp` HAS fetch with retries; covered by
+/// `LedgerApplyManagerImpl`'s wait for the following checkpoint) that
+/// henyey's cloned-local `ReplayOnly` fast path optimized away. stellar-core
+/// has no such fast path and always fetches the HAS before applying a
+/// checkpoint, so a target whose covering checkpoint is not yet published is
+/// never attempted upstream.
+///
+/// The gate keys off **archive HAS truth** (`has_current_ledger`, the
+/// archive's published frontier), NOT the local externalized counter — using
+/// the local counter would reintroduce the stale-counter deadlock that the
+/// original `catchup_impl` guard removal (proceeding anyway) addressed.
+///
+/// Returns:
+/// - `Ok(())` when `has_current_ledger >= checkpoint_containing(target)` (the
+///   covering checkpoint is published; proceed to knit/replay).
+/// - `Err(CheckpointNotYetPublished { .. })` (transient) otherwise, so the
+///   attempt is retried with backoff instead of triggering a FATAL
+///   state-wipe on a knit-to-LCL mismatch against a stale archive header.
+///
+/// HAS **unreachability** (network/404) is handled by the caller as a
+/// transient download error and never reaches this gate — keeping the error
+/// taxonomy distinct (HAS-unreachable vs HAS-behind).
+pub(super) fn checkpoint_publication_gate(has_current_ledger: u32, target: u32) -> Result<()> {
+    let target_checkpoint = crate::checkpoint::checkpoint_containing(target);
+    if has_current_ledger < target_checkpoint {
+        return Err(HistoryError::CheckpointNotYetPublished {
+            target,
+            has_current: has_current_ledger,
+        });
+    }
+    Ok(())
+}
+
 /// Maximum number of retry attempts for the download-and-replay pipeline.
 ///
 /// Matches stellar-core's `BasicWork::RETRY_A_FEW` used by
@@ -396,6 +432,21 @@ impl CatchupManager {
         ledger_manager: &LedgerManager,
     ) -> Result<(HeaderSnapshot, u32, String)> {
         use henyey_common::NetworkId;
+
+        // #2931: published-checkpoint precondition gate. Runs BEFORE any
+        // checkpoint-file / LCL-header fetch in this attempt so the stale
+        // archive header at the LCL (refetched in download_ledger_data) can
+        // never surface a knit-to-LCL mismatch against an unpublished target.
+        //
+        // Fetch the HAS for the target's covering checkpoint and require the
+        // archive's published frontier (currentLedger) to cover it. HAS
+        // unreachability (network/404) maps to a transient download/
+        // CatchupFailed error here (distinct taxonomy); a reachable HAS whose
+        // currentLedger is behind the target checkpoint yields the transient
+        // CheckpointNotYetPublished so the attempt is retried, not wiped.
+        let target_checkpoint = crate::checkpoint::checkpoint_containing(target);
+        let (target_has, _has_archive) = self.download_has(target_checkpoint).await?;
+        checkpoint_publication_gate(target_has.current_ledger(), target)?;
 
         // Download ledger data for replay
         self.update_progress(

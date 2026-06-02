@@ -49,6 +49,37 @@ fn make_test_hot_archive_buckets() -> Option<Vec<HASBucketLevel>> {
     )
 }
 
+/// #2931: register a published-frontier HAS for the catchup target's covering
+/// checkpoint so the replay path's published-checkpoint precondition gate
+/// (`checkpoint_publication_gate`) passes. The replay path now fetches the HAS
+/// at `checkpoint_containing(target)` and requires its `currentLedger` to cover
+/// that checkpoint before knit/replay — mirroring an archive that has already
+/// published the target. Idempotent: safe to call even if a HAS is already
+/// registered at the covering checkpoint.
+fn register_published_target_has(fixtures: &mut HashMap<String, Vec<u8>>, target: u32) {
+    let target_checkpoint = henyey_history::checkpoint::checkpoint_containing(target);
+    let mut levels = Vec::with_capacity(BUCKET_LIST_LEVELS);
+    for _ in 0..BUCKET_LIST_LEVELS {
+        levels.push(HASBucketLevel {
+            curr: "0".repeat(64),
+            snap: "0".repeat(64),
+            next: Default::default(),
+        });
+    }
+    let has = HistoryArchiveState {
+        version: 2,
+        server: Some("rs-stellar-core test".to_string()),
+        current_ledger: target_checkpoint,
+        network_passphrase: Some("Test SDF Network ; September 2015".to_string()),
+        current_buckets: levels,
+        hot_archive_buckets: make_test_hot_archive_buckets(),
+    };
+    fixtures.insert(
+        checkpoint_path("history", target_checkpoint, "json"),
+        has.to_json().unwrap().into_bytes(),
+    );
+}
+
 fn record_marked(entries: &[Vec<u8>]) -> Vec<u8> {
     let mut out = Vec::new();
     for entry in entries {
@@ -280,6 +311,10 @@ async fn test_catchup_replay_bucket_hash_verification() {
         gzip_bytes(&tx_result_xdr),
     );
 
+    // #2931: serve the published-frontier HAS at the target's covering
+    // checkpoint so the replay path's publication gate passes.
+    register_published_target_has(&mut fixtures, target);
+
     let fixtures = Arc::new(fixtures);
     let app =
         Router::new()
@@ -485,6 +520,12 @@ async fn test_catchup_recent_large_gap_replays_with_parity() {
             gzip_bytes(&[]),
         );
     }
+
+    // #2931: the replay path now fetches the HAS for the target's covering
+    // checkpoint and requires the archive's published frontier (currentLedger)
+    // to cover it before knit/replay. Serve a published-frontier HAS at the
+    // covering checkpoint so the publication gate passes.
+    register_published_target_has(&mut fixtures, target);
 
     // Serve fixtures via Axum
     let fixtures = Arc::new(fixtures);
@@ -824,6 +865,10 @@ async fn test_catchup_self_corrects_lcl_protocol_from_archive() {
         has.to_json().unwrap().into_bytes(),
     );
 
+    // #2931: serve the published-frontier HAS at the target's covering
+    // checkpoint so the replay path's publication gate passes.
+    register_published_target_has(&mut fixtures, target);
+
     // Serve via Axum
     let fixtures = Arc::new(fixtures);
     let app =
@@ -1063,6 +1108,10 @@ async fn test_replay_hash_mismatch_produces_replay_hash_mismatch_error() {
         checkpoint_path("results", data_checkpoint, "xdr.gz"),
         gzip_bytes(&tx_result_xdr),
     );
+
+    // #2931: serve the published-frontier HAS at the target's covering
+    // checkpoint so the replay path's publication gate passes.
+    register_published_target_has(&mut fixtures, target);
 
     let fixtures = Arc::new(fixtures);
     let app =
@@ -1349,6 +1398,10 @@ async fn test_replay_with_validate_bucket_hash_enabled() {
         checkpoint_path("results", data_checkpoint, "xdr.gz"),
         gzip_bytes(&tx_result_xdr),
     );
+
+    // #2931: serve the published-frontier HAS at the target's covering
+    // checkpoint so the replay path's publication gate passes.
+    register_published_target_has(&mut fixtures, target);
 
     let fixtures = Arc::new(fixtures);
     let app =
