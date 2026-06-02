@@ -74,10 +74,9 @@ fn register_published_target_has(fixtures: &mut HashMap<String, Vec<u8>>, target
         current_buckets: levels,
         hot_archive_buckets: make_test_hot_archive_buckets(),
     };
-    fixtures.insert(
-        checkpoint_path("history", target_checkpoint, "json"),
-        has.to_json().unwrap().into_bytes(),
-    );
+    fixtures
+        .entry(checkpoint_path("history", target_checkpoint, "json"))
+        .or_insert_with(|| has.to_json().unwrap().into_bytes());
 }
 
 fn record_marked(entries: &[Vec<u8>]) -> Vec<u8> {
