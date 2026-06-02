@@ -497,8 +497,181 @@ test_upstream_contract_validation() {
     fi
 }
 
+# ============================================================
+# Test 8: test_workflow_uses_upstream_run_attempt_timeout_budget
+#
+# Regression for #2920. The #2916 rewrite hardcoded PROBE_TIMEOUT=600 (a flat
+# 10-min per-probe budget), silently diverging from upstream
+# stellar/quickstart/.github/workflows/internal-test.yml, which computes the
+# per-probe timeout as `github.run_attempt * timeout_multiplier` minutes with
+# timeout_multiplier=4 (4 min on attempt 1, escalating on manual re-runs).
+#
+# This test locks the restored upstream formula: the workflow must (a) define
+# a workflow-level `timeout_multiplier: 4`, (b) compute PROBE_TIMEOUT from
+# github.run_attempt, timeout_multiplier, and a *60 minutes→seconds
+# conversion, and (c) NOT hardcode the divergent PROBE_TIMEOUT=600.
+# ============================================================
+test_workflow_uses_upstream_run_attempt_timeout_budget() {
+    if [[ ! -f "$WORKFLOW" ]]; then
+        tap_not_ok "workflow_defines_timeout_multiplier_4" "workflow file not found"
+        tap_not_ok "workflow_computes_probe_timeout_from_run_attempt" "workflow file not found"
+        tap_not_ok "workflow_does_not_hardcode_probe_timeout_600" "workflow file not found"
+        return
+    fi
+
+    # (a) workflow-level env defines timeout_multiplier: 4 (mirrors upstream).
+    if grep -qE '^[[:space:]]*timeout_multiplier:[[:space:]]*4[[:space:]]*$' "$WORKFLOW"; then
+        tap_ok "workflow_defines_timeout_multiplier_4"
+    else
+        tap_not_ok "workflow_defines_timeout_multiplier_4" \
+            "workflow must define 'timeout_multiplier: 4' (upstream internal-test.yml env)"
+    fi
+
+    # (b) PROBE_TIMEOUT is computed from run_attempt * timeout_multiplier * 60.
+    # `|| true` so a no-match doesn't abort under `set -e`.
+    local probe_timeout_expr
+    probe_timeout_expr=$( (grep -E 'PROBE_TIMEOUT=' "$WORKFLOW" || true) | head -1)
+    if echo "$probe_timeout_expr" | grep -q 'github.run_attempt' && \
+       echo "$probe_timeout_expr" | grep -q 'timeout_multiplier' && \
+       echo "$probe_timeout_expr" | grep -q '\* 60'; then
+        tap_ok "workflow_computes_probe_timeout_from_run_attempt"
+    else
+        tap_not_ok "workflow_computes_probe_timeout_from_run_attempt" \
+            "PROBE_TIMEOUT must be github.run_attempt * timeout_multiplier * 60; got: $probe_timeout_expr"
+    fi
+
+    # (c) the divergent hardcoded 600 literal must be gone.
+    if grep -qE 'PROBE_TIMEOUT=600([^0-9]|$)' "$WORKFLOW"; then
+        tap_not_ok "workflow_does_not_hardcode_probe_timeout_600" \
+            "workflow still hardcodes PROBE_TIMEOUT=600 (divergent flat 10-min budget)"
+    else
+        tap_ok "workflow_does_not_hardcode_probe_timeout_600"
+    fi
+}
+
+# ============================================================
+# Test 9: test_timeout_budget_matches_upstream_formula
+#
+# Text/structure assertion (the harness runs locally and cannot evaluate the
+# GitHub `github.run_attempt` expression — per Critic A). Asserts the
+# workflow's PROBE_TIMEOUT expression text contains all three upstream-formula
+# terms (run_attempt, the timeout_multiplier env, and the *60 conversion) and
+# that the multiplier value the workflow uses equals upstream's 4.
+# ============================================================
+test_timeout_budget_matches_upstream_formula() {
+    if [[ ! -f "$WORKFLOW" ]]; then
+        tap_not_ok "workflow_timeout_expression_has_all_upstream_terms" "workflow file not found"
+        tap_not_ok "workflow_multiplier_equals_upstream_4" "workflow file not found"
+        return
+    fi
+
+    # All three formula terms present in the single PROBE_TIMEOUT expression.
+    # `|| true` so a no-match doesn't abort under `set -e`.
+    local probe_timeout_expr
+    probe_timeout_expr=$( (grep -E 'PROBE_TIMEOUT=' "$WORKFLOW" || true) | head -1)
+    if echo "$probe_timeout_expr" | grep -q 'github.run_attempt' && \
+       echo "$probe_timeout_expr" | grep -q 'timeout_multiplier' && \
+       echo "$probe_timeout_expr" | grep -q '\* 60'; then
+        tap_ok "workflow_timeout_expression_has_all_upstream_terms"
+    else
+        tap_not_ok "workflow_timeout_expression_has_all_upstream_terms" \
+            "expression must contain github.run_attempt, timeout_multiplier, and * 60; got: $probe_timeout_expr"
+    fi
+
+    # The multiplier value equals upstream's 4.
+    # `|| true` so a no-match doesn't abort under `set -e`.
+    local workflow_multiplier
+    workflow_multiplier=$( (grep -E '^[[:space:]]*timeout_multiplier:[[:space:]]*[0-9]+' "$WORKFLOW" || true) \
+        | head -1 | sed -E 's/.*timeout_multiplier:[[:space:]]*([0-9]+).*/\1/')
+    if [[ "$workflow_multiplier" == "4" ]]; then
+        tap_ok "workflow_multiplier_equals_upstream_4"
+    else
+        tap_not_ok "workflow_multiplier_equals_upstream_4" \
+            "workflow timeout_multiplier='$workflow_multiplier', upstream is 4"
+    fi
+}
+
+# ============================================================
+# Test 10: test_contract_pins_timeout_multiplier
+#
+# The pinned upstream contract must record timeout_multiplier: 4 so that
+# multiplier drift in upstream internal-test.yml is caught by validate-contract
+# and by the harness rather than silently diverging again (the #2920 goal).
+# ============================================================
+test_contract_pins_timeout_multiplier() {
+    if [[ ! -f "$CONTRACT" ]]; then
+        tap_not_ok "contract_pins_timeout_multiplier_4" "contract file not found"
+        return
+    fi
+
+    if grep -qE '^[[:space:]]*timeout_multiplier:[[:space:]]*4[[:space:]]*$' "$CONTRACT"; then
+        tap_ok "contract_pins_timeout_multiplier_4"
+    else
+        tap_not_ok "contract_pins_timeout_multiplier_4" \
+            "contract must pin 'timeout_multiplier: 4'"
+    fi
+}
+
+# ============================================================
+# Test 11: test_retry_is_layered_on_top_of_budget
+#
+# Triage test obligation #3: the single targeted retry must be layered ON TOP
+# OF the upstream per-attempt budget, not a replacement of it. We drive the
+# wrapper with a probe that times out once (exit 124) then succeeds on the
+# targeted shard, capturing the `timeout <seconds>` command line the wrapper
+# logs for each attempt. Both attempt 1 and attempt 2 must use the SAME
+# --timeout budget that was passed in (here 3s), proving the retry adds an
+# extra attempt at the same per-attempt budget rather than shrinking/growing it.
+# ============================================================
+test_retry_is_layered_on_top_of_budget() {
+    local diag_dir="$TMPDIR_BASE/diag-test11"
+    mkdir -p "$diag_dir"
+
+    # Probe: times out (sleep 999) on attempt 1, succeeds on attempt 2.
+    local state_file="$TMPDIR_BASE/state-test11"
+    echo "0" > "$state_file"
+    local probe="$TMPDIR_BASE/probe-test11.sh"
+    cat > "$probe" <<'EOF'
+#!/bin/bash
+STATE_FILE="__STATE__"
+COUNT=$(cat "$STATE_FILE")
+COUNT=$((COUNT + 1))
+echo "$COUNT" > "$STATE_FILE"
+if [[ $COUNT -eq 1 ]]; then
+    sleep 999
+fi
+exit 0
+EOF
+    sed -i "s|__STATE__|$state_file|g" "$probe"
+    chmod +x "$probe"
+
+    local wrapper_log="$TMPDIR_BASE/wrapper-log-test11.txt"
+    local budget=3
+    local exit_code=0
+    "$WRAPPER" \
+        --network testnet --enable "core,horizon" --probe horizon-core-up \
+        --timeout "$budget" --diagnostics-dir "$diag_dir" \
+        -- "$probe" >/dev/null 2>"$wrapper_log" || exit_code=$?
+
+    # The wrapper logs "Command: timeout <budget>s ..." for each attempt.
+    # Both attempts must use the same budget that was passed in.
+    # `|| true` so a no-match (grep exit 1) doesn't abort under `set -e`.
+    local attempt_budgets
+    attempt_budgets=$( (grep -oE "timeout ${budget}s" "$wrapper_log" || true) | wc -l | tr -d ' ')
+    local other_budgets
+    other_budgets=$( (grep -oE 'timeout [0-9]+s' "$wrapper_log" || true) \
+        | (grep -vE "timeout ${budget}s" || true) | wc -l | tr -d ' ')
+
+    if [[ $exit_code -eq 0 && "$attempt_budgets" == "2" && "$other_budgets" == "0" ]]; then
+        tap_ok "retry_uses_same_budget_as_first_attempt"
+    else
+        tap_not_ok "retry_uses_same_budget_as_first_attempt" \
+            "exit=$exit_code attempts_at_${budget}s=$attempt_budgets other_budgets=$other_budgets"
+    fi
+}
+
 # --- Run all tests ---
-tap_plan 34
+tap_plan 41
 
 test_timeout_retry_on_targeted_shard
 test_non_timeout_failure_no_retry
@@ -507,6 +680,10 @@ test_double_timeout_fails
 test_non_targeted_timeout_no_retry
 test_success_no_retry_artifacts
 test_upstream_contract_validation
+test_workflow_uses_upstream_run_attempt_timeout_budget
+test_timeout_budget_matches_upstream_formula
+test_contract_pins_timeout_multiplier
+test_retry_is_layered_on_top_of_budget
 
 echo ""
 echo "# Results: $PASS_COUNT/$TEST_COUNT passed, $FAIL_COUNT failed"

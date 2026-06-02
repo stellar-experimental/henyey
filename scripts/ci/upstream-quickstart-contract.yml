@@ -52,6 +52,17 @@ probe_naming:
   upstream_pattern: "test_{name}.go"
   our_normalization: "strip test_ prefix, strip .go suffix, underscores to hyphens"
 
+# Per-probe timeout budget contract (from upstream internal-test.yml).
+# Upstream sets `env.timeout_multiplier: 4` and computes each probe step's
+# `timeout-minutes` as `github.run_attempt * timeout_multiplier`. Our
+# quickstart.yml mirrors this multiplier and computes
+# `PROBE_TIMEOUT = github.run_attempt * timeout_multiplier * 60` seconds for
+# GNU `timeout`. Pinning the multiplier here means a future upstream bump
+# (e.g. 4 -> 5) surfaces as a contract mismatch in the harness/validate-contract
+# rather than silently diverging again (#2920).
+timeout_multiplier: 4
+timeout_formula: "github.run_attempt * timeout_multiplier minutes per probe (x 60 for GNU timeout seconds)"
+
 # Probes known to be excluded on pubnet (from upstream internal-test.yml):
 pubnet_excluded_probes:
   - horizon-core-up

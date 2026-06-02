@@ -12,9 +12,19 @@
 #   1 — probe failed (non-timeout, or second timeout on retryable shard)
 #   2 — usage error
 #
+# Timeout budget: the caller (.github/workflows/quickstart.yml) is responsible
+# for supplying the per-probe budget via --timeout <seconds>. That budget
+# mirrors upstream stellar/quickstart/.github/workflows/internal-test.yml:
+# `github.run_attempt * timeout_multiplier (4) * 60` seconds (4 min on attempt
+# 1, escalating on manual re-runs). This wrapper does not compute the budget;
+# it applies the given --timeout via GNU `timeout` and layers the targeted
+# single retry on top of it (see below).
+#
 # The ONLY retryable case: network=testnet, enable=core,horizon,
 # probe=horizon-core-up, and exit was timeout-classified (exit 124 from
-# GNU timeout).
+# GNU timeout). The retry re-runs the probe under the SAME --timeout budget —
+# it is an additional attempt at the same per-attempt budget, not a change to
+# the budget (#2920).
 
 set -euo pipefail
 
