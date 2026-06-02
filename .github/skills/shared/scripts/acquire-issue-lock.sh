@@ -182,10 +182,15 @@ if ! flock -n "$LOCK_FD"; then
 fi
 
 # ── We hold the lock — reap any orphaned PRIOR dispatch for this issue (#2934).
-# Because we hold the issue's flock now, any other same-issue dispatch is dead
-# (the flock auto-released on its death). The newest sentinel may still record
-# that dead dispatch's process-group + start-time; reap kills a positively-
-# verified-dead group and reclaims its ~/data workspace. This runs BEFORE we
+# Holding the flock proves no other live LOCK-HOLDER exists; it does NOT by
+# itself prove the prior dispatch's whole tree is gone. That is precisely the
+# residual window: the prior tick (the lock holder) died and the kernel released
+# its FD-scoped flock, but a specialist it had forked as a CHILD may still be
+# running detached. The newest sentinel records that prior dispatch's process-
+# group + leader start-time; reap re-verifies that identity against /proc and
+# kills the group ONLY if the recorded leader is still positively ALIVE (same
+# host + PGID + start-time match + signalable). A gone/reused/EPERM leader is
+# never signalled — its workspace is still reclaimed. This runs BEFORE we
 # overwrite the sentinel below (so reap reads the PRIOR owner's identity, not
 # our own). Best-effort and non-fatal: a reap failure must never block dispatch.
 _REAP_SCRIPT="$_SELF_DIR/reap-stale-dispatch.sh"

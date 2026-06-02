@@ -100,13 +100,20 @@ while true; do
   # self-records `/proc/self`'s pgid as the dispatch group leader — no fragile
   # post-spawn env handoff to an already-exec'd child (#2956).
   #
-  # `setsid --wait` blocks until the session leader exits (so it propagates the
-  # real dispatch's exit status, not a short-lived wrapper's — #2957), and
-  # `timeout` still bounds the whole tree. We background the timeout pipeline and
-  # `wait` on it so the trap-based signal handling above stays responsive; `wait`
-  # tracks the real long-lived child because `setsid --wait` does not return
-  # early. We capture the real exit code from `wait`.
-  timeout "$LOOP_TICK_TIMEOUT" setsid --wait copilot \
+  # Order matters: `setsid --wait timeout … copilot`, NOT
+  # `timeout … setsid --wait copilot`. If `timeout` were the OUTER command it
+  # would supervise the `setsid` wrapper, but `setsid` forks `copilot` into a
+  # NEW session/process-group; on timeout the signal reaches the wrapper (or its
+  # group) while the detached `copilot` tree keeps running — exactly the orphan
+  # this PR exists to prevent (Copilot review #2960). With `timeout` INSIDE the
+  # `setsid` session, `timeout` is the session/group leader and `copilot` is its
+  # child in the SAME group, so `timeout` directly supervises and terminates the
+  # copilot tree, and the self-recorded pgid (from `/proc/self` inside copilot)
+  # still covers just this dispatch group. `setsid --wait` blocks until that
+  # session leader (`timeout`) exits, so the propagated exit status is the real
+  # dispatch's (124 on timeout — #2957), not a short-lived wrapper's. We
+  # background it and `wait` so the trap-based signal handling stays responsive.
+  setsid --wait timeout "$LOOP_TICK_TIMEOUT" copilot \
     --model "$LOOP_MODEL" \
     --autopilot \
     --allow-all-tools \
