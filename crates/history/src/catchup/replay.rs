@@ -146,6 +146,7 @@ pub(super) fn checkpoint_publication_gate(has_current_ledger: u32, target: u32) 
     if has_current_ledger < target_checkpoint {
         return Err(HistoryError::CheckpointNotYetPublished {
             target,
+            covering_checkpoint: target_checkpoint,
             has_current: has_current_ledger,
         });
     }
@@ -1380,10 +1381,18 @@ mod tests {
         match err {
             HistoryError::CheckpointNotYetPublished {
                 target: t,
+                covering_checkpoint: cp,
                 has_current: hc,
             } => {
                 assert_eq!(t, target);
+                assert_eq!(cp, target_ckpt);
                 assert_eq!(hc, has_current);
+                // The covering checkpoint must surface in the rendered message
+                // so on-call debugging needn't recompute checkpoint math.
+                assert!(
+                    err.to_string().contains(&target_ckpt.to_string()),
+                    "error message must include the covering checkpoint value"
+                );
             }
             other => panic!("expected CheckpointNotYetPublished, got {other:?}"),
         }
