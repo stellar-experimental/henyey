@@ -703,6 +703,27 @@ mod tests {
     }
 
     #[test]
+    fn test_checkpoint_not_yet_published_is_transient() {
+        // #2931: a knit/replay attempt against an archive checkpoint that has
+        // not yet been published is a TRANSIENT archive-not-ready condition.
+        // It must NOT be classified as a fatal catchup failure (which would
+        // trigger a state-wipe) nor as a typed hash mismatch (which would
+        // force a full bucket-apply reset).
+        let err = HistoryError::CheckpointNotYetPublished {
+            target: 62845439,
+            has_current: 62845375,
+        };
+        assert!(
+            !err.is_fatal_catchup_failure(),
+            "CheckpointNotYetPublished must be transient, not fatal"
+        );
+        assert!(
+            !err.is_hash_mismatch(),
+            "CheckpointNotYetPublished must not be treated as a hash mismatch"
+        );
+    }
+
+    #[test]
     fn test_verify_hash_mismatch_info_new_unlogged_and_into() {
         let expected = Hash256::ZERO;
         let actual = Hash256::from([0xAB; 32]);

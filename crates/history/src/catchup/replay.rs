@@ -1297,4 +1297,86 @@ mod tests {
             "expected InvalidPreviousHash without SCP anchor, got: {err}"
         );
     }
+
+    // ---------------------------------------------------------------
+    // #2931: published-checkpoint precondition gate.
+    //
+    // Restores the upstream HAS-publication gate (stellar-core
+    // `GetHistoryArchiveStateWork` retry-until-published) that henyey's
+    // cloned-local ReplayOnly fast path omitted. The gate keys off archive
+    // HAS truth (`currentLedger`), NOT the local externalized counter.
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_knit_lcl_mismatch_unpublished_checkpoint_is_transient() {
+        // Mirrors the #2931 crash scenario: a ReplayOnly attempt targets
+        // ledgers in checkpoint 62845439 while the archive's published
+        // frontier (HAS currentLedger) is still on the prior checkpoint.
+        //
+        // The archive's checkpoint header at the LCL diverges from the
+        // (correct) local LCL — on origin/main this surfaces as a fatal
+        // KnitLclHashMismatch and wipes state. With the publication gate the
+        // attempt is short-circuited as a TRANSIENT CheckpointNotYetPublished
+        // BEFORE any knit/replay, so it is retried instead of wiping.
+        let target = 62845437; // in checkpoint 62845439
+        let target_ckpt = crate::checkpoint::checkpoint_containing(target);
+        // Archive has only published through the prior checkpoint.
+        let has_current = target_ckpt - crate::checkpoint::checkpoint_frequency();
+
+        let err = checkpoint_publication_gate(has_current, target)
+            .expect_err("gate must reject an unpublished target checkpoint");
+
+        match err {
+            HistoryError::CheckpointNotYetPublished {
+                target: t,
+                has_current: hc,
+            } => {
+                assert_eq!(t, target);
+                assert_eq!(hc, has_current);
+            }
+            other => panic!("expected CheckpointNotYetPublished, got {other:?}"),
+        }
+        assert!(
+            !err.is_fatal_catchup_failure(),
+            "unpublished-checkpoint knit attempt must be transient, not fatal"
+        );
+        assert!(
+            !err.is_hash_mismatch(),
+            "unpublished-checkpoint knit attempt must not be a hash mismatch"
+        );
+    }
+
+    #[test]
+    fn test_knit_lcl_mismatch_published_checkpoint_remains_fatal() {
+        // When the target checkpoint IS published (HAS currentLedger covers
+        // it), the publication gate passes and a genuine knit divergence
+        // against the local LCL stays fatal — preserving §11.2 parity for
+        // real local corruption (no over-broadening of the transient path).
+        let target = 62845437;
+        let target_ckpt = crate::checkpoint::checkpoint_containing(target);
+
+        // Gate passes: archive has published the covering checkpoint.
+        assert!(
+            checkpoint_publication_gate(target_ckpt, target).is_ok(),
+            "gate must pass once the covering checkpoint is published"
+        );
+        // The gate must also pass when the archive frontier is well ahead
+        // of the covering checkpoint (steady-state operation).
+        assert!(
+            checkpoint_publication_gate(target_ckpt + 1000, target).is_ok(),
+            "gate must pass when the archive frontier is ahead of the target"
+        );
+        // And a current-checkpoint divergence is still fatal (case 3).
+        let lcl = make_test_lcl(100, h(0x10), h(0x09));
+        let entry = make_test_entry(100, h(0xBB), h(0x09));
+        let err = knit_to_lcl_decision(&entry, &lcl).unwrap_err();
+        assert!(
+            matches!(err, HistoryError::KnitLclHashMismatch { .. }),
+            "published-checkpoint divergence must stay KnitLclHashMismatch"
+        );
+        assert!(
+            err.is_fatal_catchup_failure(),
+            "published-checkpoint knit divergence must remain fatal"
+        );
+    }
 }
