@@ -525,19 +525,19 @@ pub enum HistoryError {
     /// **retried**, not treated as local-state corruption. It is therefore
     /// **excluded** from [`is_fatal_catchup_failure`](HistoryError::is_fatal_catchup_failure)
     /// and [`is_hash_mismatch`](HistoryError::is_hash_mismatch). See #2931.
+    ///
+    /// The covering checkpoint (`checkpoint_containing(target)`) is *derived*
+    /// from `target` rather than stored, so the variant's public shape stays
+    /// minimal; read it via [`covering_checkpoint`](HistoryError::covering_checkpoint).
     #[error(
         "catchup target checkpoint not yet published: target ledger {target} \
          requires archive currentLedger >= its covering checkpoint \
-         {covering_checkpoint}, but archive HAS currentLedger is {has_current}"
+         {covering}, but archive HAS currentLedger is {has_current}",
+        covering = crate::checkpoint::checkpoint_containing(*target)
     )]
     CheckpointNotYetPublished {
         /// The catchup target ledger sequence.
         target: u32,
-        /// The covering checkpoint for `target` (`checkpoint_containing(target)`),
-        /// i.e. the archive `currentLedger` value required for the target to be
-        /// considered published. Included so on-call debugging does not have to
-        /// recompute the checkpoint math from the log line.
-        covering_checkpoint: u32,
         /// The archive HAS `currentLedger` observed at gate time.
         has_current: u32,
     },
@@ -618,6 +618,23 @@ impl HistoryError {
                 | HistoryError::InvalidTxSetHash { .. }
                 | HistoryError::ReplayHashMismatch { .. }
         )
+    }
+
+    /// The covering checkpoint for a
+    /// [`CheckpointNotYetPublished`](HistoryError::CheckpointNotYetPublished)
+    /// error — `checkpoint_containing(target)`, i.e. the archive `currentLedger`
+    /// value required for the target to be considered published — or `None` for
+    /// any other variant.
+    ///
+    /// Derived from `target` rather than stored on the variant, keeping the
+    /// crate-root-re-exported enum's public shape minimal (see #2950).
+    pub fn covering_checkpoint(&self) -> Option<u32> {
+        match self {
+            HistoryError::CheckpointNotYetPublished { target, .. } => {
+                Some(crate::checkpoint::checkpoint_containing(*target))
+            }
+            _ => None,
+        }
     }
 }
 
@@ -738,15 +755,32 @@ mod tests {
         // It must NOT be classified as a fatal catchup failure (which would
         // trigger a state-wipe) nor as a typed hash mismatch (which would
         // force a full bucket-apply reset).
-        // Use DISTINCT values for every field so each assertion below
-        // independently proves that its own field is rendered. If `target` and
-        // `covering_checkpoint` shared a value, a message that only printed
-        // `target` would still satisfy the covering-checkpoint assertion by
-        // coincidence (#2953).
+        //
+        // #2950: the covering checkpoint is now DERIVED from `target` via
+        // `checkpoint_containing`, not stored as an independent field. The
+        // #2962 "distinct value per field" premise (which set
+        // `covering_checkpoint` independently of `target` to prove the message
+        // rendered the stored field) is intentionally superseded: a covering
+        // value distinct from `checkpoint_containing(target)` is no longer
+        // representable. We instead use semantically valid distinct values for
+        // the two intrinsic inputs — `target` mid-checkpoint and `has_current`
+        // on a prior published frontier — so `target`, the derived covering
+        // checkpoint, and `has_current` still render as three distinct numbers.
+        // `target` sits mid-checkpoint; its covering checkpoint is 62845439.
+        let target = 62845437;
+        let covering = crate::checkpoint::checkpoint_containing(target);
+        // Archive frontier still on the prior checkpoint (62845375), distinct
+        // from both `target` and `covering`.
+        let has_current = covering - crate::checkpoint::checkpoint_frequency();
+        // Sanity: all three values are distinct so each assertion below
+        // independently proves its own value is rendered.
+        assert_ne!(target, covering);
+        assert_ne!(target, has_current);
+        assert_ne!(covering, has_current);
+
         let err = HistoryError::CheckpointNotYetPublished {
-            target: 62845439,
-            covering_checkpoint: 62845280,
-            has_current: 62845375,
+            target,
+            has_current,
         };
         assert!(
             !err.is_fatal_catchup_failure(),
@@ -756,19 +790,31 @@ mod tests {
             !err.is_hash_mismatch(),
             "CheckpointNotYetPublished must not be treated as a hash mismatch"
         );
-        // Each distinct field value must appear in the rendered message so
-        // on-call debugging needn't recompute checkpoint math from the log line.
+        // The accessor derives the covering checkpoint from `target`.
+        assert_eq!(
+            err.covering_checkpoint(),
+            Some(covering),
+            "covering_checkpoint() must derive checkpoint_containing(target)"
+        );
+        // A non-matching variant returns None.
+        assert_eq!(
+            HistoryError::FatalChainDisagreement.covering_checkpoint(),
+            None,
+            "covering_checkpoint() must be None for non-CheckpointNotYetPublished variants"
+        );
+        // Each distinct value must appear in the rendered message so on-call
+        // debugging needn't recompute checkpoint math from the log line.
         let msg = err.to_string();
         assert!(
-            msg.contains("62845439"),
+            msg.contains(&target.to_string()),
             "message must include the target ledger value: {msg}"
         );
         assert!(
-            msg.contains("62845280"),
-            "message must include the covering checkpoint value: {msg}"
+            msg.contains(&covering.to_string()),
+            "message must include the derived covering checkpoint value: {msg}"
         );
         assert!(
-            msg.contains("62845375"),
+            msg.contains(&has_current.to_string()),
             "message must still include the archive HAS currentLedger: {msg}"
         );
     }
