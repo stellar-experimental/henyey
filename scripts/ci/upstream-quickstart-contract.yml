@@ -57,9 +57,11 @@ probe_naming:
 # `timeout-minutes` as `github.run_attempt * timeout_multiplier`. Our
 # quickstart.yml mirrors this multiplier and computes
 # `PROBE_TIMEOUT = github.run_attempt * timeout_multiplier * 60` seconds for
-# GNU `timeout`. Pinning the multiplier here means a future upstream bump
-# (e.g. 4 -> 5) surfaces as a contract mismatch in the harness/validate-contract
-# rather than silently diverging again (#2920).
+# GNU `timeout`. This value is documented here as a tracked expectation; note
+# that `validate-contract` only fetches build.yml/internal-build.yml, not
+# internal-test.yml, so a future upstream bump (e.g. 4 -> 5) is NOT caught by
+# validate-contract — it must be reconciled manually against this file when
+# upstream changes (#2920).
 timeout_multiplier: 4
 timeout_formula: "github.run_attempt * timeout_multiplier minutes per probe (x 60 for GNU timeout seconds)"
 
