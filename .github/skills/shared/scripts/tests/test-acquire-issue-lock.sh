@@ -34,6 +34,13 @@
 #   5. test_lost_race_writes_cooldown
 #        Held-lock loss → assert /tmp/project-tick-cooldown-$LOOP_PID gets a
 #        `<issue> <expiry>` line (the #2822 per-loop cooldown is preserved).
+#   6. test_cross_session_serializes
+#        The #2936 bounce defect: holder takes the lock at the host-stable
+#        DEFAULT namespace, acquirer runs under a DIFFERENT CLAUDE_SESSION_ID
+#        with no namespace override and MUST still exit 1. Fails on the old
+#        per-session keying (acquirer locks a different inode → exit 0), passes
+#        with the host-stable namespace. Tests 1/5 can't catch this because they
+#        pre-hold under the same session/namespace they pass to the script.
 #
 # Usage:
 #   bash .github/skills/shared/scripts/tests/test-acquire-issue-lock.sh
@@ -76,11 +83,16 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# Compute the lockfile path the script will use for a given issue + session,
-# mirroring acquire-issue-lock.sh's derivation so the test can pre-hold it.
+# Compute the lockfile path the script will use for a given lock-namespace +
+# issue, mirroring acquire-issue-lock.sh's derivation so the test can pre-hold
+# it. The namespace is the value of PROJECT_TICK_LOCK_SESSION_ID the script is
+# invoked with (default "project-tick"); it is host-stable and issue-scoped,
+# NEVER keyed on the per-process CLAUDE_SESSION_ID (that was the #2917 defect:
+# two ticks with distinct session ids locked distinct inodes, so flock never
+# serialized them — see PR #2936 review bounce).
 lock_path_for() {
-  local session="$1" issue="$2"
-  echo "$REAL_HOME/data/$session/tick-locks/$issue.lock"
+  local namespace="$1" issue="$2"
+  echo "$REAL_HOME/data/$namespace/tick-locks/$issue.lock"
 }
 
 # ---------------------------------------------------------------------------
@@ -115,11 +127,11 @@ test_flock_held_blocks_second_acquire() {
   local tmpdir; tmpdir="$(mktemp -d)"
   make_mock_gh "$tmpdir"
 
-  local session="$RUN_NONCE-t1"
+  local namespace="$RUN_NONCE-t1"
   local issue=4242
-  local lockfile; lockfile="$(lock_path_for "$session" "$issue")"
+  local lockfile; lockfile="$(lock_path_for "$namespace" "$issue")"
   mkdir -p "$(dirname "$lockfile")"
-  CLEANUP_DIRS+=("$REAL_HOME/data/$session")
+  CLEANUP_DIRS+=("$REAL_HOME/data/$namespace")
 
   # A live tick holds the lock for the whole "dispatch".
   exec {hold_fd}>"$lockfile"
@@ -128,7 +140,7 @@ test_flock_held_blocks_second_acquire() {
   fi
 
   local output exit_code
-  output=$(PATH="$tmpdir:$PATH" SESSION_ID="$session" CLAUDE_SESSION_ID="$session" \
+  output=$(PATH="$tmpdir:$PATH" PROJECT_TICK_LOCK_SESSION_ID="$namespace" \
            GH_CALLS_LOG="$tmpdir/gh-calls.log" LOOP_PID="t1" TICK_PID=$$ \
            bash "$TARGET_SCRIPT" "$issue" ready-for-doing 2>&1)
   exit_code=$?
@@ -155,12 +167,12 @@ test_acquire_succeeds_when_lock_free() {
   local tmpdir; tmpdir="$(mktemp -d)"
   make_mock_gh "$tmpdir"
 
-  local session="$RUN_NONCE-t2"
+  local namespace="$RUN_NONCE-t2"
   local issue=4243
-  CLEANUP_DIRS+=("$REAL_HOME/data/$session")
+  CLEANUP_DIRS+=("$REAL_HOME/data/$namespace")
 
   local output exit_code
-  output=$(PATH="$tmpdir:$PATH" SESSION_ID="$session" CLAUDE_SESSION_ID="$session" \
+  output=$(PATH="$tmpdir:$PATH" PROJECT_TICK_LOCK_SESSION_ID="$namespace" \
            GH_CALLS_LOG="$tmpdir/gh-calls.log" LOOP_PID="t2" TICK_PID=$$ \
            bash "$TARGET_SCRIPT" "$issue" ready-for-doing 2>&1)
   exit_code=$?
@@ -189,11 +201,11 @@ test_dead_holder_lock_is_acquirable() {
   local tmpdir; tmpdir="$(mktemp -d)"
   make_mock_gh "$tmpdir"
 
-  local session="$RUN_NONCE-t3"
+  local namespace="$RUN_NONCE-t3"
   local issue=4244
-  local lockfile; lockfile="$(lock_path_for "$session" "$issue")"
+  local lockfile; lockfile="$(lock_path_for "$namespace" "$issue")"
   mkdir -p "$(dirname "$lockfile")"
-  CLEANUP_DIRS+=("$REAL_HOME/data/$session")
+  CLEANUP_DIRS+=("$REAL_HOME/data/$namespace")
 
   # Hold the lock in a background process group, then kill the whole group and
   # poll until the lock is actually free. When the holder dies the kernel closes
@@ -217,7 +229,7 @@ test_dead_holder_lock_is_acquirable() {
   done
 
   local output exit_code
-  output=$(PATH="$tmpdir:$PATH" SESSION_ID="$session" CLAUDE_SESSION_ID="$session" \
+  output=$(PATH="$tmpdir:$PATH" PROJECT_TICK_LOCK_SESSION_ID="$namespace" \
            GH_CALLS_LOG="$tmpdir/gh-calls.log" LOOP_PID="t3" TICK_PID=$$ \
            bash "$TARGET_SCRIPT" "$issue" ready-for-doing 2>&1)
   exit_code=$?
@@ -238,12 +250,12 @@ test_in_review_pick_sets_assignee() {
   local tmpdir; tmpdir="$(mktemp -d)"
   make_mock_gh "$tmpdir"
 
-  local session="$RUN_NONCE-t4"
+  local namespace="$RUN_NONCE-t4"
   local issue=4245
-  CLEANUP_DIRS+=("$REAL_HOME/data/$session")
+  CLEANUP_DIRS+=("$REAL_HOME/data/$namespace")
 
   local output exit_code
-  output=$(PATH="$tmpdir:$PATH" SESSION_ID="$session" CLAUDE_SESSION_ID="$session" \
+  output=$(PATH="$tmpdir:$PATH" PROJECT_TICK_LOCK_SESSION_ID="$namespace" \
            GH_CALLS_LOG="$tmpdir/gh-calls.log" LOOP_PID="t4" TICK_PID=$$ \
            bash "$TARGET_SCRIPT" "$issue" in-review 2>&1)
   exit_code=$?
@@ -268,15 +280,15 @@ test_lost_race_writes_cooldown() {
   local tmpdir; tmpdir="$(mktemp -d)"
   make_mock_gh "$tmpdir"
 
-  local session="$RUN_NONCE-t5"
+  local namespace="$RUN_NONCE-t5"
   local issue=4246
   local loop_pid="t5-$$"
   local cooldown_file="/tmp/project-tick-cooldown-$loop_pid"
   rm -f "$cooldown_file"
 
-  local lockfile; lockfile="$(lock_path_for "$session" "$issue")"
+  local lockfile; lockfile="$(lock_path_for "$namespace" "$issue")"
   mkdir -p "$(dirname "$lockfile")"
-  CLEANUP_DIRS+=("$REAL_HOME/data/$session")
+  CLEANUP_DIRS+=("$REAL_HOME/data/$namespace")
 
   # A live tick holds the lock → acquire loses the race.
   exec {hold_fd}>"$lockfile"
@@ -284,7 +296,7 @@ test_lost_race_writes_cooldown() {
     echo "FAIL: $name — could not pre-hold lock"; FAILED=$((FAILED+1)); rm -rf "$tmpdir"; return
   fi
 
-  PATH="$tmpdir:$PATH" SESSION_ID="$session" CLAUDE_SESSION_ID="$session" \
+  PATH="$tmpdir:$PATH" PROJECT_TICK_LOCK_SESSION_ID="$namespace" \
     GH_CALLS_LOG="$tmpdir/gh-calls.log" LOOP_PID="$loop_pid" TICK_PID=$$ \
     bash "$TARGET_SCRIPT" "$issue" ready-for-doing >/dev/null 2>&1
   local exit_code=$?
@@ -308,6 +320,75 @@ test_lost_race_writes_cooldown() {
 }
 
 # ---------------------------------------------------------------------------
+# Test 6: cross-session serialization — the #2917 / PR #2936 bounce defect.
+#
+# This is the test the previous (per-session-keyed) implementation could NOT
+# catch: tests 1 and 5 pre-hold the lock under the SAME session id they pass to
+# the script, so they pass even with a session-keyed path. The real deployment
+# topology is two distinct copilot processes, each with its OWN CLAUDE_SESSION_ID,
+# contending for the same issue. If the lock path is keyed on CLAUDE_SESSION_ID
+# the two processes lock DIFFERENT inodes and flock never serializes them — the
+# duplicate-dispatch race stays live.
+#
+# Here the holder takes the lock at the host-stable DEFAULT namespace path
+# (the path the script derives when PROJECT_TICK_LOCK_SESSION_ID is unset),
+# while the acquirer runs under a DIFFERENT CLAUDE_SESSION_ID and does NOT set
+# PROJECT_TICK_LOCK_SESSION_ID. With a session-keyed path the acquirer would
+# compute a different inode and exit 0 (FAIL — the bug). With the host-stable
+# namespace the acquirer contends on the same inode and exits 1 (PASS).
+# ---------------------------------------------------------------------------
+test_cross_session_serializes() {
+  local name="test_cross_session_serializes"
+  local tmpdir; tmpdir="$(mktemp -d)"
+  make_mock_gh "$tmpdir"
+
+  # Use a unique issue number so this run never collides with a real lockfile
+  # at the shared default namespace, but exercise the SAME default-namespace
+  # derivation the script uses when PROJECT_TICK_LOCK_SESSION_ID is unset.
+  local default_namespace="project-tick"
+  local issue="4247$$"
+  local lockfile; lockfile="$(lock_path_for "$default_namespace" "$issue")"
+  mkdir -p "$(dirname "$lockfile")"
+  # Clean up only the per-issue lockfile we create (the default-namespace dir
+  # is shared with real ticks — do NOT rm -rf it).
+  local created_lockfile="$lockfile"
+
+  # Holder: a live tick under session A holds the default-namespace lock.
+  exec {hold_fd}>"$lockfile"
+  if ! flock -n "$hold_fd"; then
+    echo "FAIL: $name — could not pre-hold lock"; FAILED=$((FAILED+1))
+    rm -f "$created_lockfile"; rm -rf "$tmpdir"; return
+  fi
+
+  # Acquirer: a SECOND tick under a DIFFERENT session B, with NO namespace
+  # override — it must still contend on the same host-stable inode and lose.
+  local output exit_code
+  output=$(PATH="$tmpdir:$PATH" \
+           CLAUDE_SESSION_ID="session-B-$$-$(date +%s%N)" \
+           GH_CALLS_LOG="$tmpdir/gh-calls.log" LOOP_PID="t6" TICK_PID=$$ \
+           bash "$TARGET_SCRIPT" "$issue" ready-for-doing 2>&1)
+  exit_code=$?
+
+  exec {hold_fd}>&-
+
+  if [ "$exit_code" -ne 1 ]; then
+    echo "FAIL: $name — second session acquired despite a live cross-session holder"
+    echo "       (lock is keyed on per-process session, not host-stable — #2917 race live)"
+    echo "  expected exit 1, got $exit_code"
+    echo "  output: $output"; FAILED=$((FAILED + 1))
+    rm -f "$created_lockfile"; rm -rf "$tmpdir"; return
+  fi
+  if [ -f "$tmpdir/gh-calls.log" ] && grep -q "POST" "$tmpdir/gh-calls.log"; then
+    echo "FAIL: $name — sentinel POST issued by the second session despite held lock"
+    echo "  gh calls: $(cat "$tmpdir/gh-calls.log")"; FAILED=$((FAILED + 1))
+    rm -f "$created_lockfile"; rm -rf "$tmpdir"; return
+  fi
+
+  echo "PASS: $name"; PASSED=$((PASSED + 1))
+  rm -f "$created_lockfile"; rm -rf "$tmpdir"
+}
+
+# ---------------------------------------------------------------------------
 # Run all tests.
 # ---------------------------------------------------------------------------
 test_flock_held_blocks_second_acquire
@@ -315,6 +396,7 @@ test_acquire_succeeds_when_lock_free
 test_dead_holder_lock_is_acquirable
 test_in_review_pick_sets_assignee
 test_lost_race_writes_cooldown
+test_cross_session_serializes
 
 echo
 echo "Results: ${PASSED} passed, ${FAILED} failed"

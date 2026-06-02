@@ -22,7 +22,9 @@
 # FIX
 # ---
 # Replace the time-window predicate with OS-enforced mutual exclusion: a
-# non-blocking `flock -n` on a per-issue lockfile under ~/data, held on an FD
+# non-blocking `flock -n` on a per-issue lockfile under a HOST-STABLE namespace
+# in ~/data (keyed only on the host + issue number, NOT the per-process session
+# — see #2936), held on an FD
 # owned by the LONG-LIVED tick process (TICK_PID) for the entire dispatch
 # lifetime. A concurrent live tick's flock fails immediately → exit 1 (kernel-
 # atomic, race-free, independent of elapsed wall-time). The lock auto-releases
@@ -80,7 +82,27 @@ if [ -f "$_CONTRACT_LIB" ]; then
   . "$_CONTRACT_LIB"
 fi
 
-SESSION_ID="${CLAUDE_SESSION_ID:-${SESSION_ID:-$(date +%Y%m%d-%H%M%S)}}"
+# ── Validate $ISSUE as a numeric issue id (#2936 review) ─────────────────────
+# $ISSUE is interpolated into the lockfile path and passed to `gh`. Reject
+# anything non-numeric to prevent path traversal / unexpected lockfile names.
+if ! [[ "$ISSUE" =~ ^[0-9]+$ ]]; then
+  echo "ERROR: issue id '$ISSUE' is not numeric; refusing to derive a lock path; backing off" >&2
+  exit 1
+fi
+
+# ── Lock namespace: host-stable and issue-scoped, NOT per-process (#2917) ────
+# The lock identity MUST depend only on the host + $ISSUE — never on the
+# per-process CLAUDE_SESSION_ID. Keying on CLAUDE_SESSION_ID was the defect
+# flagged in the PR #2936 review: the real deployment topology is two distinct
+# copilot processes (each with its own CLAUDE_SESSION_ID) contending for the
+# same issue, so a session-keyed path made them lock DIFFERENT inodes and
+# `flock` never serialized them — the duplicate-dispatch race stayed live.
+#
+# Use a fixed namespace ("project-tick") so all ticks/loops on the host share
+# one lockfile per issue. PROJECT_TICK_LOCK_SESSION_ID overrides the namespace
+# for TEST isolation only; it defaults to the constant and is never derived
+# from the session. Real ticks leave it unset → they all share "project-tick".
+LOCK_NAMESPACE="${PROJECT_TICK_LOCK_SESSION_ID:-project-tick}"
 
 # Derive the contract root from the passwd-anchored real home (immune to
 # $HOME poisoning) when the helper is available; otherwise fall back to $HOME.
@@ -89,7 +111,7 @@ if command -v _contract_real_home >/dev/null 2>&1; then
 else
   _REAL_HOME="$HOME"
 fi
-LOCK_DIR="$_REAL_HOME/data/$SESSION_ID/tick-locks"
+LOCK_DIR="$_REAL_HOME/data/$LOCK_NAMESPACE/tick-locks"
 LOCK_PATH="$LOCK_DIR/$ISSUE.lock"
 
 # Validate the lock dir is inside the contract boundary when the helper is
