@@ -2139,3 +2139,325 @@ async fn test_checkpoint_data_config_rejects_non_minimal_depth() {
         "error should mention Minimal requirement, got: {msg2}"
     );
 }
+
+/// Regression test for #2940: a gated catchup replay attempt must download
+/// ledger data ONLY from the archive that served `target_has` and passed the
+/// #2937 publication gate — it must never fall back to a different archive for
+/// the LCL header or checkpoint payload within the same attempt.
+///
+/// Setup: two archives ordered [B, A].
+/// - Archive A ("good"): serves the bucket-apply checkpoint HAS, the gate HAS
+///   at the target's covering checkpoint, and a *correct* `ledger/{ckpt}.xdr.gz`
+///   for the data checkpoint (header chain that knits to LCL and replays
+///   cleanly).
+/// - Archive B ("divergent"): serves the bucket-apply checkpoint HAS so the
+///   out-of-scope bucket-apply phase can proceed, but **404s the gate HAS**
+///   (`history/{target_checkpoint}.json`) and serves a *divergent*
+///   `ledger/{ckpt}.xdr.gz` whose header64 hash differs from A's.
+///
+/// Because B is first in the list, the publication gate's `download_has`
+/// rotation tries B (404 on the gate HAS), then A (serves it) → the gate
+/// archive is A. Under the pre-#2940 unpinned behaviour, the subsequent
+/// fixed-order ledger-data download would hit B first and consume B's
+/// divergent header64 → knit/chain mismatch and catchup failure. With the
+/// pin, ledger data is fetched from A only and catchup succeeds against A's
+/// data.
+#[tokio::test]
+async fn test_catchup_pins_downloads_to_gate_archive() {
+    let checkpoint = 63u32;
+    let target = 64u32;
+    let data_checkpoint = henyey_history::checkpoint::checkpoint_containing(target);
+
+    let bucket_list = empty_bucket_list();
+    let checkpoint_bucket_hash = combined_bucket_list_hash(bucket_list.hash());
+    let mut bucket_list_after = bucket_list.clone();
+    let default_next_states: Vec<Option<henyey_bucket::PendingMergeState>> =
+        vec![None; BUCKET_LIST_LEVELS];
+    let load_empty = |_hash: &Hash256| -> henyey_bucket::Result<Bucket> { Ok(Bucket::empty()) };
+    bucket_list_after
+        .restart_merges_from_has(checkpoint, 25, &default_next_states, load_empty, true)
+        .await
+        .expect("restart merges");
+    bucket_list_after
+        .add_batch(
+            target,
+            25,
+            stellar_xdr::curr::BucketListType::Live,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        )
+        .expect("bucket add batch");
+    let replay_bucket_hash = combined_bucket_list_hash(bucket_list_after.hash());
+
+    let header63 = make_header(
+        checkpoint,
+        Hash256::ZERO,
+        checkpoint_bucket_hash,
+        Hash256::ZERO,
+        Hash256::ZERO,
+    );
+    let header63_hash = verify::compute_header_hash(&header63).expect("header63 hash");
+
+    let tx_set = TransactionSet {
+        previous_ledger_hash: Hash(*header63_hash.as_bytes()),
+        txs: VecM::default(),
+    };
+    let tx_set_hash = verify::compute_tx_set_hash(&TransactionSetVariant::Classic(tx_set.clone()))
+        .expect("tx set hash");
+
+    let result_set = TransactionResultSet {
+        results: VecM::default(),
+    };
+    let result_xdr = result_set
+        .to_xdr(stellar_xdr::curr::Limits::none())
+        .expect("tx result xdr");
+    let tx_result_hash = Hash256::hash(&result_xdr);
+
+    // Archive A's correct header64 (knits to LCL=63, replays cleanly).
+    let header64 = make_header(
+        target,
+        header63_hash,
+        replay_bucket_hash,
+        tx_set_hash,
+        tx_result_hash,
+    );
+    let header64_hash = verify::compute_header_hash(&header64).expect("header64 hash");
+
+    // Archive B's DIVERGENT header64: a *different* previous_ledger_hash so it
+    // cannot knit to LCL=63. If B's ledger data is consumed, the §11.2
+    // knit-to-LCL decision matrix (which runs unconditionally, independent of
+    // replay_config) rejects it with a fatal KnitCurrentLedgerPrevHashMismatch
+    // → catchup fails. So success vs failure cleanly distinguishes "used A"
+    // (knits) from "used B" (does not knit).
+    let header64_divergent = make_header(
+        target,
+        Hash256::from_bytes([0xAB; 32]),
+        replay_bucket_hash,
+        tx_set_hash,
+        tx_result_hash,
+    );
+    let header64_divergent_hash =
+        verify::compute_header_hash(&header64_divergent).expect("divergent header64 hash");
+    assert_ne!(
+        header64_hash, header64_divergent_hash,
+        "divergent header must differ from the good header"
+    );
+
+    // Checkpoint-63 headers (ledgers 63) — identical on both archives so the
+    // out-of-scope bucket-apply phase succeeds regardless of which archive
+    // serves it.
+    let headers_xdr_ckpt63 = {
+        let entry63 = LedgerHeaderHistoryEntry {
+            hash: header63_hash.into(),
+            header: header63.clone(),
+            ext: LedgerHeaderHistoryEntryExt::default(),
+        };
+        record_marked(&[entry63
+            .to_xdr(stellar_xdr::curr::Limits::none())
+            .expect("header63 xdr")])
+    };
+
+    let make_data_checkpoint_headers = |entry_hash: Hash256, header: LedgerHeader| -> Vec<u8> {
+        let entry64 = LedgerHeaderHistoryEntry {
+            hash: entry_hash.into(),
+            header,
+            ext: LedgerHeaderHistoryEntryExt::default(),
+        };
+        record_marked(&[entry64
+            .to_xdr(stellar_xdr::curr::Limits::none())
+            .expect("header64 xdr")])
+    };
+    let headers_xdr_good = make_data_checkpoint_headers(header64_hash, header64.clone());
+    let headers_xdr_divergent =
+        make_data_checkpoint_headers(header64_divergent_hash, header64_divergent);
+
+    let tx_history_entry = TransactionHistoryEntry {
+        ledger_seq: target,
+        tx_set: tx_set.clone(),
+        ext: TransactionHistoryEntryExt::V0,
+    };
+    let tx_history_xdr = record_marked(&[tx_history_entry
+        .to_xdr(stellar_xdr::curr::Limits::none())
+        .expect("tx history xdr")]);
+    let tx_result_entry = TransactionHistoryResultEntry {
+        ledger_seq: target,
+        tx_result_set: result_set,
+        ext: TransactionHistoryResultEntryExt::default(),
+    };
+    let tx_result_xdr = record_marked(&[tx_result_entry
+        .to_xdr(stellar_xdr::curr::Limits::none())
+        .expect("tx result history xdr")]);
+
+    let mut levels = Vec::with_capacity(BUCKET_LIST_LEVELS);
+    for _ in 0..BUCKET_LIST_LEVELS {
+        levels.push(HASBucketLevel {
+            curr: "0".repeat(64),
+            snap: "0".repeat(64),
+            next: Default::default(),
+        });
+    }
+    let has_ckpt63 = HistoryArchiveState {
+        version: 2,
+        server: Some("rs-stellar-core test".to_string()),
+        current_ledger: checkpoint,
+        network_passphrase: Some("Test SDF Network ; September 2015".to_string()),
+        current_buckets: levels,
+        hot_archive_buckets: make_test_hot_archive_buckets(),
+    };
+
+    // Build the per-archive fixture map. `good = true` produces archive A
+    // (correct ledger data + gate HAS); `good = false` produces archive B
+    // (divergent ledger data, no gate HAS).
+    let build_fixtures = |good: bool| -> HashMap<String, Vec<u8>> {
+        let mut fixtures: HashMap<String, Vec<u8>> = HashMap::new();
+        // Bucket-apply checkpoint HAS + headers + (empty) tx/results — shared.
+        fixtures.insert(
+            checkpoint_path("history", checkpoint, "json"),
+            has_ckpt63.to_json().unwrap().into_bytes(),
+        );
+        fixtures.insert(
+            checkpoint_path("ledger", checkpoint, "xdr.gz"),
+            gzip_bytes(&headers_xdr_ckpt63),
+        );
+        fixtures.insert(
+            checkpoint_path("transactions", checkpoint, "xdr.gz"),
+            gzip_bytes(&[]),
+        );
+        fixtures.insert(
+            checkpoint_path("results", checkpoint, "xdr.gz"),
+            gzip_bytes(&[]),
+        );
+
+        // Data-checkpoint ledger data: correct on A, divergent on B.
+        fixtures.insert(
+            checkpoint_path("ledger", data_checkpoint, "xdr.gz"),
+            gzip_bytes(if good {
+                &headers_xdr_good
+            } else {
+                &headers_xdr_divergent
+            }),
+        );
+        fixtures.insert(
+            checkpoint_path("transactions", data_checkpoint, "xdr.gz"),
+            gzip_bytes(&tx_history_xdr),
+        );
+        fixtures.insert(
+            checkpoint_path("results", data_checkpoint, "xdr.gz"),
+            gzip_bytes(&tx_result_xdr),
+        );
+
+        // Gate HAS at the target's covering checkpoint — only archive A serves
+        // it. Archive B 404s, forcing `download_has` rotation to pick A as the
+        // gate archive.
+        if good {
+            register_published_target_has(&mut fixtures, target);
+        }
+        fixtures
+    };
+
+    async fn serve(
+        fixtures: HashMap<String, Vec<u8>>,
+    ) -> Option<(String, tokio::task::JoinHandle<()>)> {
+        let fixtures = Arc::new(fixtures);
+        let app = Router::new()
+            .route(
+                "/*path",
+                get(
+                    |Path(path): Path<String>,
+                     State(state): State<Arc<HashMap<String, Vec<u8>>>>| async move {
+                        let key = path.trim_start_matches('/');
+                        if let Some(body) = state.get(key) {
+                            (StatusCode::OK, body.clone())
+                        } else {
+                            (StatusCode::NOT_FOUND, Vec::new())
+                        }
+                    },
+                ),
+            )
+            .with_state(Arc::clone(&fixtures));
+        let listener = match TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => return None,
+            Err(err) => panic!("bind: {err}"),
+        };
+        let addr = listener.local_addr().expect("addr");
+        let handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        Some((format!("http://{}/", addr), handle))
+    }
+
+    // Archive A (good) and archive B (divergent).
+    let (url_a, _h_a) = match serve(build_fixtures(true)).await {
+        Some(v) => v,
+        None => {
+            eprintln!("skipping test: tcp bind not permitted in this environment");
+            return;
+        }
+    };
+    let (url_b, _h_b) = match serve(build_fixtures(false)).await {
+        Some(v) => v,
+        None => {
+            eprintln!("skipping test: tcp bind not permitted in this environment");
+            return;
+        }
+    };
+
+    let archive_a = HistoryArchive::new(&url_a).expect("archive A");
+    let archive_b = HistoryArchive::new(&url_b).expect("archive B");
+
+    let bucket_dir = tempfile::tempdir().expect("bucket dir");
+    let bucket_manager =
+        henyey_bucket::BucketManager::new(bucket_dir.path().to_path_buf()).expect("bucket manager");
+    let db = Database::open_in_memory().expect("db");
+
+    let ledger_manager = henyey_ledger::LedgerManager::new(
+        "Test SDF Network ; September 2015".to_string(),
+        henyey_ledger::LedgerManagerConfig {
+            validate_bucket_hash: false,
+            ..Default::default()
+        },
+    );
+
+    // Order [B, A]: B is tried first for ledger data under the old fixed-order
+    // rotation, so an unpinned attempt would consume B's divergent bytes.
+    let mut manager = CatchupManagerBuilder::new()
+        .add_archive(archive_b)
+        .add_archive(archive_a)
+        .bucket_manager(bucket_manager)
+        .database(db)
+        .options(CatchupOptions {
+            verify_buckets: false,
+            verify_headers: false,
+        })
+        .build()
+        .expect("catchup manager");
+
+    manager.set_replay_config(henyey_history::ReplayConfig {
+        verify_bucket_list: false,
+        verify_header_chain: false,
+        verify_tx_set: false,
+        verify_tx_results: false,
+        verify_header_hash: false,
+        ..Default::default()
+    });
+
+    // Catchup must SUCCEED. The publication gate selects archive A (the only
+    // archive serving the gate HAS). With the #2940 pin, the LCL header and
+    // checkpoint payload are fetched from A only — A's header64 knits to LCL
+    // and replays cleanly. Without the pin, fixed-order rotation would fetch
+    // archive B's divergent header64 first (B is index 0), whose mismatched
+    // previous_ledger_hash fails the unconditional §11.2 knit-to-LCL check
+    // with a fatal KnitCurrentLedgerPrevHashMismatch → catchup fails. So a
+    // successful catchup proves B's divergent ledger data was never consumed.
+    let output = manager
+        .catchup_to_ledger(target, &ledger_manager)
+        .await
+        .expect("catchup must succeed using the gate archive's ledger data only");
+
+    assert_eq!(output.ledger_seq, target);
+    assert_eq!(output.ledgers_applied, 1);
+    let final_header = ledger_manager.current_header();
+    assert_eq!(final_header.ledger_seq, target);
+}

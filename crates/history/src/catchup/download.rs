@@ -111,15 +111,23 @@ impl CatchupManager {
     ///
     /// Uses archive rotation: each attempt tries a different archive, cycling
     /// through them to provide failover when one archive is unavailable.
+    ///
+    /// Returns the parsed HAS together with the `Arc<HistoryArchive>` that
+    /// served it. Callers in the gated replay path (#2940) pin subsequent
+    /// ledger-data downloads to this exact archive so the archive that passed
+    /// the #2937 publication gate is the same one that supplies the ledger
+    /// data — closing the cross-archive bypass where a second stale-but-serving
+    /// archive could serve data that never satisfied the gate. The archive's
+    /// name (for metric labels) is derived via `archive.name()` at call sites.
     pub(super) async fn download_has(
         &self,
         checkpoint_seq: u32,
-    ) -> Result<(HistoryArchiveState, String)> {
+    ) -> Result<(HistoryArchiveState, Arc<HistoryArchive>)> {
         let num_archives = self.archives.len() as u32;
         for attempt in 0..num_archives {
             let archive = self.select_archive(attempt);
             match archive.fetch_checkpoint_has(checkpoint_seq).await {
-                Ok(has) => return Ok((has, archive.name().to_owned())),
+                Ok(has) => return Ok((has, Arc::clone(archive))),
                 Err(e) => {
                     warn!(
                         "Failed to download HAS from archive {}: {}",
@@ -328,11 +336,23 @@ impl CatchupManager {
     /// is empty when `from_ledger == 0` (genesis), when LCL sits on a
     /// checkpoint boundary (LCL-1 in a prior file, no overlap), or when
     /// there is no work to do.
+    ///
+    /// # Pinning (#2940)
+    ///
+    /// When `pinned` is `Some(archive)`, every download issued here (the LCL
+    /// header via `download_checkpoint_header` and each checkpoint payload via
+    /// `download_checkpoint_ledger_data`) is served from that archive **only**
+    /// — no rotation, no cross-archive fallback. This is used by the gated
+    /// replay path so the archive that passed the #2937 publication gate is the
+    /// same archive that supplies the ledger data. When `pinned` is `None`
+    /// (bucket-apply phase / non-gated callers), the existing fixed-order
+    /// rotation over `&self.archives` is used.
     pub(super) async fn download_ledger_data(
         &mut self,
         from_ledger: u32,
         to_ledger: u32,
         initial_lcl: LclContext,
+        pinned: Option<&Arc<HistoryArchive>>,
     ) -> Result<(Vec<LedgerData>, Vec<LedgerHeaderHistoryEntry>, String)> {
         let mut data = Vec::new();
         let mut knit_entries: Vec<LedgerHeaderHistoryEntry> = Vec::new();
@@ -367,7 +387,8 @@ impl CatchupManager {
         // We use download_checkpoint_header (lightweight single-header fetch)
         // rather than downloading the full checkpoint data.
         let mut current_lcl = if from_ledger > 0 {
-            let (lcl_header, lcl_hash) = self.download_checkpoint_header(from_ledger).await?;
+            let (lcl_header, lcl_hash) =
+                self.download_checkpoint_header(from_ledger, pinned).await?;
             LclContext::new(lcl_header.ledger_version, lcl_hash)
         } else {
             // from_ledger == 0 means "before genesis"; use caller-provided context.
@@ -380,8 +401,9 @@ impl CatchupManager {
 
             if let std::collections::hash_map::Entry::Vacant(e) = checkpoint_cache.entry(checkpoint)
             {
-                let (downloaded, archive_name) =
-                    self.download_checkpoint_ledger_data(checkpoint).await?;
+                let (downloaded, archive_name) = self
+                    .download_checkpoint_ledger_data(checkpoint, pinned)
+                    .await?;
                 last_archive_name = archive_name;
                 e.insert(downloaded);
             }
@@ -453,10 +475,22 @@ impl CatchupManager {
     async fn download_checkpoint_ledger_data(
         &self,
         checkpoint: u32,
+        pinned: Option<&Arc<HistoryArchive>>,
     ) -> Result<(CheckpointLedgerData, String)> {
+        // #2940: when pinned, serve from that archive only (no rotation). The
+        // single-element slice keeps the rotation loop below uniform.
+        let pinned_slice;
+        let archives: &[Arc<HistoryArchive>] = match pinned {
+            Some(archive) => {
+                pinned_slice = [Arc::clone(archive)];
+                &pinned_slice
+            }
+            None => &self.archives,
+        };
+
         // Try each archive until one succeeds
         let mut last_archive_name = String::new();
-        for archive in &self.archives {
+        for archive in archives {
             last_archive_name = archive.name().to_owned();
             match self.try_download_checkpoint(archive, checkpoint).await {
                 Ok(data) => {
@@ -566,8 +600,19 @@ impl CatchupManager {
     pub(super) async fn download_checkpoint_header(
         &self,
         ledger_seq: u32,
+        pinned: Option<&Arc<HistoryArchive>>,
     ) -> Result<(LedgerHeader, Hash256)> {
-        for archive in &self.archives {
+        // #2940: when pinned, serve from that archive only (no rotation).
+        let pinned_slice;
+        let archives: &[Arc<HistoryArchive>] = match pinned {
+            Some(archive) => {
+                pinned_slice = [Arc::clone(archive)];
+                &pinned_slice
+            }
+            None => &self.archives,
+        };
+
+        for archive in archives {
             match archive.fetch_ledger_header_with_hash(ledger_seq).await {
                 Ok((header, hash)) => {
                     debug!(
@@ -700,6 +745,97 @@ mod tests {
                 "expected metric literal {literal} in catchup/download.rs",
             );
         }
+    }
+
+    /// Build a `CatchupManager` over the given archive URLs (in order), backed
+    /// by a temp bucket dir + in-memory DB. Returns the `TempDir` guard first so
+    /// callers destructure `let (_tmp, mgr) = ...` (drop order: mgr before tmp).
+    fn make_manager_with_archives(urls: &[&str]) -> (tempfile::TempDir, CatchupManager) {
+        let db = Database::open_in_memory().expect("in-memory db");
+        let tmp_dir = tempfile::tempdir().expect("temp dir");
+        let bucket_manager =
+            BucketManager::new(tmp_dir.path().to_path_buf()).expect("bucket manager");
+        let archives: Vec<_> = urls
+            .iter()
+            .map(|u| crate::HistoryArchive::new(u).expect("archive"))
+            .collect();
+        (
+            tmp_dir,
+            super::super::CatchupManager::new(archives, bucket_manager, db),
+        )
+    }
+
+    /// #2940: `download_has` returns the `Arc<HistoryArchive>` that actually
+    /// served the HAS — not merely the first archive in the list. Here the
+    /// first archive is dead (bad host) and the second serves the checkpoint,
+    /// so the returned archive's `base_url` must be the second fixture's.
+    #[tokio::test]
+    async fn test_download_has_returns_serving_archive() {
+        let checkpoint = 63u32;
+        let fixture = match crate::test_utils::build_single_checkpoint_archive(checkpoint).await {
+            Ok(f) => f,
+            Err(e) => {
+                eprintln!("skipping test: {e}");
+                return;
+            }
+        };
+        // First archive: an unreachable host (HAS fetch fails); second: the
+        // live fixture. download_has must rotate to and return the live one.
+        let dead_url = "http://127.0.0.1:1/";
+        let (_tmp, mgr) = make_manager_with_archives(&[dead_url, &fixture.base_url]);
+
+        let (has, archive) = mgr.download_has(checkpoint).await.expect("download_has");
+        assert_eq!(has.current_ledger(), checkpoint);
+        assert_eq!(
+            archive.base_url().as_str(),
+            fixture.base_url.as_str(),
+            "returned archive must be the one that actually served the HAS"
+        );
+    }
+
+    /// #2940: a pinned `download_checkpoint_header` issues the request against
+    /// the pinned archive ONLY. Pinning to the live fixture succeeds even when
+    /// it is not first in the list; pinning to a dead archive fails without
+    /// falling back; and `None` preserves rotation (finds the live archive).
+    #[tokio::test]
+    async fn test_download_checkpoint_header_pin_targets_only_pinned() {
+        let checkpoint = 63u32;
+        let fixture = match crate::test_utils::build_single_checkpoint_archive(checkpoint).await {
+            Ok(f) => f,
+            Err(e) => {
+                eprintln!("skipping test: {e}");
+                return;
+            }
+        };
+        let dead_url = "http://127.0.0.1:1/";
+        // Order [live, dead]: the live archive is index 0.
+        let (_tmp, mgr) = make_manager_with_archives(&[&fixture.base_url, dead_url]);
+        let live = Arc::clone(&mgr.archives[0]);
+        let dead = Arc::clone(&mgr.archives[1]);
+
+        // Pinned to the live archive → succeeds.
+        let (header, _hash) = mgr
+            .download_checkpoint_header(checkpoint, Some(&live))
+            .await
+            .expect("pinned-to-live header download");
+        assert_eq!(header.ledger_seq, checkpoint);
+
+        // Pinned to the dead archive → fails, with NO fallback to the live one.
+        let err = mgr
+            .download_checkpoint_header(checkpoint, Some(&dead))
+            .await
+            .expect_err("pinned-to-dead header download must fail without fallback");
+        assert!(
+            matches!(err, HistoryError::CatchupFailed(_)),
+            "expected CatchupFailed, got: {err:?}"
+        );
+
+        // None → rotation finds the live archive (index 0) and succeeds.
+        let (header, _hash) = mgr
+            .download_checkpoint_header(checkpoint, None)
+            .await
+            .expect("unpinned header download rotates to live archive");
+        assert_eq!(header.ledger_seq, checkpoint);
     }
 
     /// Stage E: download counters in this module must carry the `"archive"` label.
