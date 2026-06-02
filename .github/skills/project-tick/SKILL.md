@@ -184,28 +184,35 @@ The assignee field alone is NOT enough to detect a race when multiple loops run 
 
 The fix is **OS-enforced mutual exclusion**: a non-blocking host-local `flock` on a per-issue lockfile, held by the live tick process for the whole dispatch. All of the acquisition logic (preflight, lock, self-assign, sentinel post, cooldown-on-loss) lives in `acquire-issue-lock.sh` — the **single source of truth** (mirrors the `bounce-cap-check.sh` extraction pattern). This SKILL only invokes it and branches on the exit code; do NOT re-describe the algorithm here.
 
-**Critical: the flock FD must be held by the tick process across Step 5 dispatch and released only in Step 6 (or implicitly on tick exit).** A subshell-scoped flock that releases at the end of Step 4 would silently reintroduce #2917. The way to keep the FD alive is to `source` the script in the tick process's shell so the FD it opens (`exec {LOCK_FD}>…`) survives into the caller, then hold it open until Step 6:
+**Critical: the flock FD must be held by the tick process across Step 5 dispatch and released only in Step 6 (or implicitly on tick exit).** The lock lives on the FD opened by `exec {LOCK_FD}>…` inside `acquire-issue-lock.sh`; that FD only survives into the tick process if the script is `source`d **directly in the tick's shell**.
+
+**Do NOT wrap the source in a command substitution** — `ACQUIRE_OUT="$( . acquire-issue-lock.sh … )"` runs the source in a forked `$()` subshell with its own FD table, so `exec {LOCK_FD}>` opens the lock FD in *that subshell*; when `$()` returns the subshell exits, the FD closes, and the flock is **released immediately**. The parent inherits `LOCK_FD=N` as a plain integer pointing at an already-closed descriptor. That silently reintroduces #2917 — and, with the #2934 reaper live, is actively dangerous: a second tick could then win the flock while this dispatch is still alive, and its reaper would positively-identify (host + PGID + start-time all match) and **kill this live dispatch's process-group** (the PR #2960 round-1 blocking defect).
+
+Instead, source the script **directly** (no `$()`), redirecting only its stdout to a temp file so the opened FD survives into the calling shell. `acquire-issue-lock.sh` is source-safe: it terminates via `return` (not `exit`) when sourced, snapshots/restores your shell options, and leaves `LOCK_FD` open in your shell on success.
 
 ```bash
 # Run in the LONG-LIVED tick process (the copilot process from
-# scripts/project-tick-loop.sh, exported as $TICK_PID). Sourcing keeps the
-# lock FD open in this shell after the script returns.
+# scripts/project-tick-loop.sh, exported as $TICK_PID). Sourcing DIRECTLY (not
+# inside $()) keeps the lock FD open in this shell after the script returns.
 TICK_PID="${TICK_PID:-$$}"; export TICK_PID
 
-ACQUIRE_OUT="$(. .github/skills/shared/scripts/acquire-issue-lock.sh "$ISSUE" "$STATUS")"
+_acq_tmp="$(mktemp)"
+. .github/skills/shared/scripts/acquire-issue-lock.sh "$ISSUE" "$STATUS" >"$_acq_tmp"
 ACQUIRE_RC=$?
 
 if [ "$ACQUIRE_RC" -ne 0 ]; then
   # Lock held by a live tick (or flock missing / preflight failed). The script
   # has already written the per-loop #2822 cooldown and posted no sentinel.
   # Back off — the next /project-tick picks a different issue.
+  rm -f "$_acq_tmp"
   echo "Backed off on #$ISSUE (acquire-issue-lock.sh rc=$ACQUIRE_RC)"
   exit 0
 fi
 
-# Acquired. The script emitted (on stdout, captured above): LOCK_FD, LOCK_PATH,
+# Acquired. The script emitted (on stdout, redirected above): LOCK_FD, LOCK_PATH,
 # SENTINEL_ID, TICK_ID. The lock is held on $LOCK_FD in THIS shell. Parse them:
-eval "$(echo "$ACQUIRE_OUT" | grep -E '^(LOCK_FD|LOCK_PATH|SENTINEL_ID|TICK_ID)=')"
+eval "$(grep -E '^(LOCK_FD|LOCK_PATH|SENTINEL_ID|TICK_ID)=' "$_acq_tmp")"
+rm -f "$_acq_tmp"
 echo "Won acquisition on #$ISSUE; proceeding to dispatch holding fd=$LOCK_FD."
 ```
 

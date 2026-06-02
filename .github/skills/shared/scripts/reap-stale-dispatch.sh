@@ -38,7 +38,12 @@
 #          The original dispatch is gone; the live process at that pid is some
 #          unrelated program. SKIP the kill. (#2958)
 #        - start-time MATCH, signalable ⇒ POSITIVELY the original dispatch
-#          leader, still alive. This is the only case we kill the group.
+#          leader, still alive. This is the only case we kill the group — AND we
+#          re-read the start-time once more IMMEDIATELY before each `kill`
+#          (TERM and KILL) to close the TOCTOU window: if the leader exited and
+#          the bare PID was recycled between the identity check and the signal,
+#          the re-read start-time will differ and we abort the signal. A
+#          `kill -0` alone is insufficient — it succeeds against a recycled PID.
 #        - kill -0 returns EPERM        ⇒ a live process we don't own occupies
 #          the pid (recycled to another user). Treat as alive/foreign → SKIP.
 #
@@ -68,6 +73,11 @@
 #   REAP_HOSTNAME        — override the "current hostname" used for the host gate.
 #   REAP_DRY_RUN=1       — log the kill/rm decisions but do not execute them.
 #   REAP_LOG_FILE        — append a structured decision log here (for assertions).
+#   REAP_PRE_SIGNAL_HOOK — a command run exactly ONCE, in the TOCTOU window
+#                          between the post-identity-check decision to kill and
+#                          the signal-point start-time re-validation. Lets a test
+#                          kill the verified leader inside that window to prove
+#                          the re-validation aborts the signal (PID-reuse race).
 set -uo pipefail
 
 ISSUE="${1:?issue number required}"
@@ -171,22 +181,25 @@ maybe_kill_group() {
   fi
 
   # start-time matches ⇒ positively the original dispatch leader. Confirm we may
-  # signal it before touching the group. Probe the LEADER pid (not the group) so
-  # we can read errno cleanly:
+  # signal it before touching the group. Probe the LEADER pid (not the group):
   #   rc 0     → alive and ours → kill the group.
   #   ESRCH    → leader exited between the start-time read and now → nothing to
   #              kill (the group is empty); skip (no-op, not an error).
   #   EPERM    → a live process we don't own holds the pid → foreign → skip.
-  local kill0_err
-  kill0_err="$(kill -0 "$sentinel_pgid" 2>&1)"
-  local kill0_rc=$?
-  if [ "$kill0_rc" -ne 0 ]; then
-    case "$kill0_err" in
-      *[Pp]ermission*|*EPERM*)
-        _reap_log "skip-kill: pid=$sentinel_pgid is EPERM (foreign-owned live process); not signalling" ;;
-      *)
-        _reap_log "skip-kill: pid=$sentinel_pgid leader exited (ESRCH); group empty, nothing to kill" ;;
-    esac
+  # We distinguish EPERM from ESRCH by /proc presence rather than by parsing the
+  # `kill` error string: that string is shell- and locale-dependent ("Operation
+  # not permitted" vs "Permission denied" vs localized text), so text-matching is
+  # fragile and silently misclassified EPERM as ESRCH in bash (round-1 latent
+  # bug). The robust, portable signal: if `kill -0` fails but /proc/<pid> still
+  # exists and is start-time-consistent, the process is ALIVE and we simply lack
+  # permission ⇒ EPERM (foreign). If /proc/<pid> is gone ⇒ ESRCH.
+  if ! kill -0 "$sentinel_pgid" 2>/dev/null; then
+    local still_st
+    if still_st="$(_proc_starttime "$sentinel_pgid")" && [ "$still_st" = "$sentinel_starttime" ]; then
+      _reap_log "skip-kill: pid=$sentinel_pgid is EPERM (foreign-owned live process); not signalling"
+    else
+      _reap_log "skip-kill: pid=$sentinel_pgid leader exited (ESRCH); group empty, nothing to kill"
+    fi
     return 0
   fi
 
@@ -194,13 +207,48 @@ maybe_kill_group() {
   if [ "${REAP_DRY_RUN:-0}" = "1" ]; then
     return 0
   fi
-  # TERM the whole group, give it a moment, then KILL any survivors.
-  kill -TERM -- "-$sentinel_pgid" 2>/dev/null || true
+
+  # ── Re-validate start-time at the SIGNAL POINT (#2934 TOCTOU fix) ───────────
+  # Between the identity check above and the actual group-signal, the leader
+  # could have exited and its bare numeric PID been recycled to an UNRELATED
+  # live process (which would then anchor a new, unrelated process-group). A
+  # `kill -0` alone cannot distinguish that — it succeeds against the recycled
+  # PID just the same. So immediately before every signal we re-read
+  # /proc/<pgid>/stat field-22 and confirm it STILL equals the recorded
+  # start-time. start-time is monotonic clock-ticks-since-boot and is never
+  # reused within a boot, so a continued match proves we are still looking at
+  # the SAME original dispatch leader and `kill -- -<pgid>` cannot land on a
+  # recycled victim. Any mismatch / gone-entry ⇒ abort the kill (the original
+  # is already gone; there is nothing of ours left to signal).
+  _reap_signal_group_if_still_ours() {
+    local sig="$1" now_st
+    # Test seam: run the injected hook exactly once, simulating the leader
+    # exiting (and its PID being recycled) inside the TOCTOU window. Production
+    # leaves REAP_PRE_SIGNAL_HOOK unset, so this is a no-op there.
+    if [ -n "${REAP_PRE_SIGNAL_HOOK:-}" ]; then
+      eval "$REAP_PRE_SIGNAL_HOOK" || true
+      unset REAP_PRE_SIGNAL_HOOK
+    fi
+    if ! now_st="$(_proc_starttime "$sentinel_pgid")"; then
+      _reap_log "abort-kill ($sig): leader pgid=$sentinel_pgid vanished before signal; not signalling a possibly-recycled group"
+      return 1
+    fi
+    if [ "$now_st" != "$sentinel_starttime" ]; then
+      _reap_log "abort-kill ($sig): pgid=$sentinel_pgid start-time changed ($now_st != recorded $sentinel_starttime) before signal; PID recycled, not signalling"
+      return 1
+    fi
+    kill "-$sig" -- "-$sentinel_pgid" 2>/dev/null || true
+    return 0
+  }
+
+  # TERM (re-validated), give it a moment, then KILL any survivors (re-validated
+  # again — the gap before KILL is itself a fresh TOCTOU window).
+  _reap_signal_group_if_still_ours TERM || return 0
   local n=0
   while [ "$n" -lt 20 ] && kill -0 -- "-$sentinel_pgid" 2>/dev/null; do
     sleep 0.1; n=$((n + 1))
   done
-  kill -KILL -- "-$sentinel_pgid" 2>/dev/null || true
+  _reap_signal_group_if_still_ours KILL || return 0
   return 0
 }
 

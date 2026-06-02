@@ -54,7 +54,46 @@
 #   1  back off — lock held by a live tick (or flock missing / preflight failed);
 #                 no sentinel posted, nothing dispatched; a #2822 per-loop
 #                 cooldown line is appended for the picker to skip this issue.
+# ── Source-safe shell-option handling (#2934 FD-survival fix) ────────────────
+# This file is `source`d by the tick process (see the termination note below),
+# so a bare top-level `set -uo pipefail` would LEAK those options into the
+# caller's shell and could abort an otherwise-fine tick on a later unset-var
+# reference. Snapshot the caller's option state first, apply our options for the
+# script body, and restore the caller's state on every termination path (in
+# `_acq_end`). When RUN directly there is no caller to protect, so the snapshot
+# is a harmless no-op.
+_ACQ_SAVED_OPTS="$(set +o)"
 set -uo pipefail
+
+# ── Source-safe termination (#2934 FD-survival fix) ──────────────────────────
+# The tick process MUST `source` this script (NOT run it in a `$(...)` command-
+# substitution subshell) so the lock FD opened below via `exec {LOCK_FD}>` stays
+# open in the caller's shell and the flock is held across Step-5 dispatch. A
+# command-substitution subshell would close that FD the instant `$()` returns,
+# silently releasing the lock and reintroducing #2917 — and worse, letting a
+# second tick's reaper positively-identify and KILL the still-live first
+# dispatch (the PR #2960 round-1 blocking defect). So this file is designed to
+# be sourced. When sourced, a top-level `exit` would terminate the CALLER's
+# shell, so every termination here goes through `_acq_end <rc>`, which `return`s
+# when sourced (leaving the caller alive with LOCK_FD held) and `exit`s when run
+# directly (the standalone/test path). It is detected once, at parse time.
+case "${BASH_SOURCE[0]}" in
+  "$0") _ACQ_SOURCED=0 ;;   # executed directly (bash acquire-issue-lock.sh ...)
+  *)    _ACQ_SOURCED=1 ;;   # sourced (. acquire-issue-lock.sh ...)
+esac
+# `_acq_end <rc>` exits the process when this file was RUN directly. When it was
+# SOURCED it is a no-op (a `return` inside a function only pops the function, not
+# the sourced script), so every call site pairs it with a top-level
+# `return <rc>` which IS valid in a sourced script and unwinds it cleanly:
+#     _acq_end 1; return 1     # sourced: _acq_end no-ops, `return 1` unwinds
+#                              # run:     _acq_end 1 exits, `return` never runs
+_acq_end() {
+  [ "$_ACQ_SOURCED" -eq 0 ] && exit "${1:-0}"
+  # Sourced: restore the caller's original shell options so we don't leak
+  # `set -u`/`pipefail` into the tick shell, then let the call site `return`.
+  eval "$_ACQ_SAVED_OPTS" 2>/dev/null || true
+  return 0
+}
 
 ISSUE="${1:?issue number required}"
 STATUS="${2:?status required}"
@@ -67,7 +106,7 @@ REPO="henyey"
 # scheme — that would reintroduce #2917. Backing off is the safe choice.
 if ! command -v flock >/dev/null 2>&1; then
   echo "ERROR: flock not available — cannot acquire host-local lock; backing off (#2917)" >&2
-  exit 1
+  _acq_end 1; return 1
 fi
 
 # ── Derive the lock path under the ~/data workspace contract root (#2843) ────
@@ -87,7 +126,7 @@ fi
 # anything non-numeric to prevent path traversal / unexpected lockfile names.
 if ! [[ "$ISSUE" =~ ^[0-9]+$ ]]; then
   echo "ERROR: issue id '$ISSUE' is not numeric; refusing to derive a lock path; backing off" >&2
-  exit 1
+  _acq_end 1; return 1
 fi
 
 # ── Lock namespace: host-stable and issue-scoped, NOT per-process (#2917) ────
@@ -139,7 +178,7 @@ if ! flock -n "$LOCK_FD"; then
   # this issue and falls through to lower-priority actionable items (#2822).
   COOLDOWN_FILE="/tmp/project-tick-cooldown-${LOOP_PID:-default}"
   echo "$ISSUE $(( $(date +%s) + 300 ))" >> "$COOLDOWN_FILE"
-  exit 1
+  _acq_end 1; return 1
 fi
 
 # ── We hold the lock — reap any orphaned PRIOR dispatch for this issue (#2934).
@@ -213,4 +252,4 @@ echo "LOCK_PATH=$LOCK_PATH"
 echo "SENTINEL_ID=${SENTINEL_ID:-}"
 echo "TICK_ID=$TICK_ID"
 echo "Won acquisition on #$ISSUE (flock held by tick_pid=$OWNER_PID). Proceeding." >&2
-exit 0
+_acq_end 0; return 0

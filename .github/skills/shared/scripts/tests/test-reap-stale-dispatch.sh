@@ -309,14 +309,43 @@ EOF
   pass "$name"
 }
 
+# Find a foreign-owned (not our uid), kill -0-EPERM, pid > 1 with a readable
+# /proc/<pid>/stat. Echoes "<pid> <starttime>" or empty if none is available.
+# Round-1 bounce defect (#2934): the prior EPERM test fed dispatch_pgid=1, which
+# maybe_kill_group() rejects at the `<=1` guard BEFORE the kill -0 probe — so the
+# EPERM branch was never reached. We need a plausible pgid (>1) whose recorded
+# start-time matches its real /proc value (so host + plausibility + start-time
+# gates all pass) but which we cannot signal (kill -0 → EPERM).
+find_foreign_eperm_pid() {
+  local pid owner st procdir
+  for procdir in /proc/[0-9]*; do
+    pid="${procdir#/proc/}"
+    [ "$pid" -le 1 ] && continue
+    owner="$(stat -c '%u' "/proc/$pid" 2>/dev/null)" || continue
+    [ -n "$owner" ] && [ "$owner" != "$(id -u)" ] || continue
+    [ -r "/proc/$pid/stat" ] || continue
+    # We need a pid that is ALIVE (so the start-time gate passes) but unsignalable
+    # (kill -0 fails ⇒ EPERM, since it is foreign-owned and still present in
+    # /proc). kill -0 succeeding ⇒ ours, skip; kill -0 failing while /proc is
+    # still present ⇒ EPERM, which is what we want.
+    if kill -0 "$pid" 2>/dev/null; then continue; fi
+    [ -e "/proc/$pid" ] || continue   # gone ⇒ ESRCH, not EPERM
+    st="$(proc_starttime "$pid")" || continue
+    [ -n "$st" ] || continue
+    printf '%s %s\n' "$pid" "$st"
+    return 0
+  done
+  return 1
+}
+
 # ---------------------------------------------------------------------------
 # Test 8 (SAFETY): EPERM (foreign-owned live pid) treated as alive → NOT killed.
-# We can't easily own another user's process in a unit test, so we assert the
-# decision logic via the live-and-matching path under DRY_RUN combined with a
-# pid we DO own (covered by test 2/7); the EPERM branch is exercised by pointing
-# at pid 1 (init) which we cannot signal. pid 1's start-time will not match our
-# fake, so we instead set the recorded start-time to pid 1's real start-time to
-# force the EPERM branch.
+# Use a REAL foreign-owned process with pid > 1 (so the `<=1` guard does not
+# short-circuit) and record its REAL start-time (so host + plausibility +
+# start-time gates all PASS and execution reaches the `kill -0` probe). Because
+# the process is foreign-owned, `kill -0` returns EPERM and the script must take
+# the skip-kill-on-EPERM branch and NOT signal the group. This is the branch the
+# round-1 test (dispatch_pgid=1) never reached.
 # ---------------------------------------------------------------------------
 test_kill_0_eperm_treated_as_alive() {
   local name="test_kill_0_eperm_treated_as_alive"
@@ -324,62 +353,164 @@ test_kill_0_eperm_treated_as_alive() {
   local sentinel="$TMPROOT/sent8"; local log="$TMPROOT/log8"
 
   if [ "$(id -u)" -eq 0 ]; then
-    echo "SKIP: $name — running as root, cannot exercise EPERM against pid 1"
+    echo "SKIP: $name — running as root; no process yields EPERM to exercise the branch"
     PASSED=$((PASSED + 1)); return
   fi
-  local init_st; init_st="$(proc_starttime 1)"
-  if [ -z "$init_st" ]; then
-    echo "SKIP: $name — cannot read pid 1 start-time"; PASSED=$((PASSED + 1)); return
+  local fpid fst rest
+  if ! read -r fpid fst rest < <(find_foreign_eperm_pid); then
+    echo "SKIP: $name — no foreign-owned pid>1 available on this host to exercise EPERM"
+    PASSED=$((PASSED + 1)); return
   fi
-  make_sentinel "$sentinel" "$(hostname)" 1 "$init_st"
+  make_sentinel "$sentinel" "$(hostname)" "$fpid" "$fst"
 
   REAP_SENTINEL_FILE="$sentinel" REAP_LOG_FILE="$log" \
     bash "$TARGET_SCRIPT" "$issue" >/dev/null 2>&1
 
-  # pgid=1 is implausible (<=1 guard) OR EPERM — either way must NOT kill.
-  if grep -q "kill: process-group 1" "$log" 2>/dev/null; then
-    fail "$name" "SAFETY VIOLATION: attempted to kill pgid 1" "log: $(cat "$log" 2>/dev/null)"; return
+  # MUST take the EPERM skip branch (the gates up to the kill -0 probe passed:
+  # pid>1, host match, start-time match — only EPERM stops the signal).
+  if ! grep -q "skip-kill: pid=$fpid is EPERM" "$log" 2>/dev/null; then
+    fail "$name" "expected EPERM skip-kill branch for foreign-owned pid=$fpid" \
+      "log: $(cat "$log" 2>/dev/null)"; return
+  fi
+  # And it must never have decided to kill the group.
+  if grep -q "kill: process-group $fpid" "$log" 2>/dev/null; then
+    fail "$name" "SAFETY VIOLATION: attempted to kill foreign-owned pgid=$fpid" \
+      "log: $(cat "$log" 2>/dev/null)"; return
+  fi
+  pass "$name"
+}
+
+# ---------------------------------------------------------------------------
+# Test 8b (SAFETY / TOCTOU #2934): leader is alive + identity-matched at the
+# decision point, but EXITS inside the window between the decision and the
+# signal (simulating PID reuse). The signal-point start-time re-validation MUST
+# abort the kill rather than blind-signal a possibly-recycled group.
+#
+# We use the REAP_PRE_SIGNAL_HOOK seam to kill the verified leader exactly in
+# that window. After the hook, /proc/<pgid> is gone, so the re-read start-time
+# read fails and the script logs an "abort-kill" and does NOT issue the signal.
+# Without the signal-point re-check (the round-1 code), the script would have
+# proceeded to `kill -- -<pgid>` on a PID that could have been recycled.
+# ---------------------------------------------------------------------------
+test_no_signal_when_leader_exits_in_toctou_window() {
+  local name="test_no_signal_when_leader_exits_in_toctou_window"
+  local issue="93085$$"
+  local sentinel="$TMPROOT/sent8b"; local log="$TMPROOT/log8b"
+
+  read -r pgid st < <(spawn_group_leader)
+  make_sentinel "$sentinel" "$(hostname)" "$pgid" "$st"
+
+  # Hook: kill the leader's group and wait for the /proc entry to disappear, so
+  # the signal-point re-validation sees it gone (the TOCTOU window).
+  local hook="kill -9 -- -$pgid 2>/dev/null; kill -9 $pgid 2>/dev/null; \
+n=0; while [ \$n -lt 30 ] && [ -e /proc/$pgid ]; do sleep 0.05; n=\$((n+1)); done"
+
+  REAP_SENTINEL_FILE="$sentinel" REAP_LOG_FILE="$log" REAP_PRE_SIGNAL_HOOK="$hook" \
+    bash "$TARGET_SCRIPT" "$issue" >/dev/null 2>&1
+
+  # It reached the kill DECISION (gates passed) ...
+  if ! grep -q "kill: process-group $pgid" "$log" 2>/dev/null; then
+    fail "$name" "expected to reach the kill decision before the TOCTOU window" \
+      "log: $(cat "$log" 2>/dev/null)"; return
+  fi
+  # ... but the signal-point re-validation ABORTED the actual TERM signal.
+  if ! grep -q "abort-kill (TERM): leader pgid=$pgid vanished" "$log" 2>/dev/null; then
+    fail "$name" "expected signal-point re-validation to abort TERM after leader vanished" \
+      "log: $(cat "$log" 2>/dev/null)"; return
+  fi
+  pass "$name"
+}
+
+# ---------------------------------------------------------------------------
+# Test 8c (SAFETY / TOCTOU #2934): leader exits AND the PID is recycled to a
+# DIFFERENT live process inside the TOCTOU window (start-time differs). The
+# signal-point re-validation must abort on the start-time mismatch and the
+# recycled live process must survive. This is the precise blast-radius the
+# round-1 `kill -0`-only check failed to prevent.
+# ---------------------------------------------------------------------------
+test_no_signal_on_pid_reuse_in_toctou_window() {
+  local name="test_no_signal_on_pid_reuse_in_toctou_window"
+  local issue="93086$$"
+  local sentinel="$TMPROOT/sent8c"; local log="$TMPROOT/log8c"
+
+  read -r pgid st < <(spawn_group_leader)
+  make_sentinel "$sentinel" "$(hostname)" "$pgid" "$st"
+
+  # Hook: monkeypatch _proc_starttime so that the SIGNAL-point re-read returns a
+  # DIFFERENT start-time than the recorded one, simulating the PID having been
+  # recycled to an unrelated live process in the window. (The gate read already
+  # happened with the real value; the override only affects the re-read.) The
+  # leader sleeper stays alive and must NOT be signalled.
+  local recycled_st=$(( st + 7 ))
+  local hook="_proc_starttime() { printf '%s\\n' $recycled_st; }"
+
+  REAP_SENTINEL_FILE="$sentinel" REAP_LOG_FILE="$log" REAP_PRE_SIGNAL_HOOK="$hook" \
+    bash "$TARGET_SCRIPT" "$issue" >/dev/null 2>&1
+
+  if ! grep -q "abort-kill (TERM): pgid=$pgid start-time changed" "$log" 2>/dev/null; then
+    fail "$name" "expected signal-point re-validation to abort on start-time mismatch" \
+      "log: $(cat "$log" 2>/dev/null)"; return
+  fi
+  # CRITICAL: the still-live process at that pgid must be untouched.
+  if ! kill -0 "$pgid" 2>/dev/null; then
+    fail "$name" "SAFETY VIOLATION: signalled a recycled-pid live process pgid=$pgid"; return
   fi
   pass "$name"
 }
 
 # ---------------------------------------------------------------------------
 # Test 9 (SAFETY): a workspace path OUTSIDE ~/data is NOT removed.
-# We forge a sentinel-less run and a workspace that resolves outside ~/data via
-# a symlink; the contract guard must refuse it. We exercise the guard directly
-# by planting a symlinked session dir under ~/data whose target is /tmp.
+#
+# Round-1 bounce defect (#2934): the prior version used an EMPTY sentinel
+# (`: > "$sentinel"`), but reap-stale-dispatch.sh exits 0 on an empty sentinel
+# BEFORE reaching reap_workspaces() — so the symlink-escape rm guard it claimed
+# to cover was never executed. The test passed even if require_home_data_path
+# were removed entirely.
+#
+# This version uses a NON-EMPTY old-format sentinel (host + tick_pid, but NO
+# dispatch_pgid) so the script proceeds: maybe_kill_group() skip-kills (no
+# identity), and reap_workspaces() ACTUALLY RUNS against the planted symlink-
+# escape candidate. The assertion target is the out-of-~/data victim surviving
+# AND the explicit "skip-rm:" refusal in the log — so the test FAILS if
+# require_home_data_path is removed (the victim would be deleted).
 # ---------------------------------------------------------------------------
 test_workspace_outside_contract_not_removed() {
   local name="test_workspace_outside_contract_not_removed"
   local issue="93090$$"
   local sentinel="$TMPROOT/sent9"; local log="$TMPROOT/log9"
-  : > "$sentinel"  # no kill; we only test the rm guard
 
-  # Outside-contract victim dir we must NOT delete.
-  local victim="$TMPROOT/victim-$issue"
-  mkdir -p "$victim"; echo "precious" > "$victim/keep.txt"
+  # Old-format sentinel: non-empty (so get_sentinel_body returns it and the
+  # script does NOT early-exit), but no dispatch_pgid ⇒ skip-kill, then on to
+  # the workspace reap which is what we are exercising.
+  cat > "$sentinel" <<EOF
+## 🔒 acquired-by:tick-oldfmt-$$
 
-  # Plant a session dir under ~/data that is a SYMLINK to a parent of the victim,
-  # so the glob ~/data/<session>/do-<issue> resolves (via the symlink) to the
-  # victim — require_home_data_path must canonicalize through the symlink and
-  # refuse it (target is under $TMPROOT, not ~/data).
+posted=2026-06-02T16:00:00.000Z, host=$(hostname), tick_pid=999
+EOF
+
+  # Plant a session dir under ~/data that is a SYMLINK to $TMPROOT, so the glob
+  # ~/data/<session>/do-<issue> resolves (via the symlink) to $TMPROOT/do-<issue>.
+  # require_home_data_path must canonicalize through the symlink and REFUSE it
+  # (the real target is under $TMPROOT, not under <real-home>/data).
   local sess="reaptest-evil-$$"
   local sessdir="$REAL_HOME/data/$sess"
   CLEANUP+=("$sessdir")
-  # ~/data/<sess> -> $TMPROOT  ; then do-<issue> lives at $TMPROOT/do-<issue>
   ln -s "$TMPROOT" "$sessdir"
   mkdir -p "$TMPROOT/do-$issue"; echo "precious" > "$TMPROOT/do-$issue/keep.txt"
 
   REAP_SENTINEL_FILE="$sentinel" REAP_LOG_FILE="$log" \
     bash "$TARGET_SCRIPT" "$issue" >/dev/null 2>&1
 
+  # CRITICAL: the out-of-contract victim must survive.
   if [ ! -e "$TMPROOT/do-$issue/keep.txt" ]; then
     fail "$name" "SAFETY VIOLATION: removed an out-of-contract workspace via symlink escape"; return
   fi
-  if ! grep -q "skip-rm:" "$log" 2>/dev/null; then
-    # If the glob didn't even match through the symlink, that's also safe, but
-    # we want to confirm the guard fired when it did match.
-    : # acceptable: nothing matched (still safe)
+  # And the guard must have actually FIRED on the matched candidate — proving
+  # reap_workspaces() ran and require_home_data_path refused the escape (without
+  # this assertion the test could pass merely because the glob never matched).
+  if ! grep -q "skip-rm:.*do-$issue.*outside ~/data\|skip-rm:.*failed require_home_data_path" "$log" 2>/dev/null; then
+    fail "$name" "expected require_home_data_path to refuse the symlink-escape candidate" \
+      "log: $(cat "$log" 2>/dev/null)"; return
   fi
   rm -f "$sessdir"
   pass "$name"
@@ -432,6 +563,8 @@ test_no_reap_when_no_sentinel
 test_no_reap_on_malformed_sentinel
 test_selects_most_recent_sentinel
 test_kill_0_eperm_treated_as_alive
+test_no_signal_when_leader_exits_in_toctou_window
+test_no_signal_on_pid_reuse_in_toctou_window
 test_workspace_outside_contract_not_removed
 test_reap_is_nonfatal
 test_rejects_non_numeric_issue
