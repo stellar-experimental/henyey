@@ -380,6 +380,13 @@ test_upstream_contract_validation() {
         tap_not_ok "contract_documents_delegated_artifact" "skipped (no contract)"
         tap_not_ok "workflow_enforces_exact_artifact_pattern" "skipped (no contract)"
         tap_not_ok "workflow_enforces_exact_image_tag_pattern" "skipped (no contract)"
+        tap_not_ok "contract_defines_anchored_regexes" "skipped (no contract)"
+        tap_not_ok "workflow_artifact_regex_accepts_exact_tar" "skipped (no contract)"
+        tap_not_ok "workflow_image_tag_regex_accepts_exact_tag" "skipped (no contract)"
+        tap_not_ok "workflow_artifact_regex_rejects_zip" "skipped (no contract)"
+        tap_not_ok "workflow_artifact_regex_rejects_double_ext" "skipped (no contract)"
+        tap_not_ok "workflow_image_tag_regex_rejects_debug_suffix" "skipped (no contract)"
+        tap_not_ok "workflow_uses_anchored_grep" "skipped (no contract)"
         return
     fi
 
@@ -387,22 +394,87 @@ test_upstream_contract_validation() {
 
     # Extract expected values from contract (simple grep — no YAML parser needed)
     local expected_artifact expected_tag artifact_pattern
+    local artifact_regex image_tag_regex
     expected_artifact=$(grep '^expected_artifact_name:' "$CONTRACT" | sed 's/.*: *"\(.*\)"/\1/')
     expected_tag=$(grep '^expected_image_tag:' "$CONTRACT" | sed 's/.*: *"\(.*\)"/\1/')
     artifact_pattern=$(grep '^artifact_name_pattern:' "$CONTRACT" | sed 's/.*: *"\(.*\)"/\1/')
+    # Anchored ERE patterns — the single source of truth shared with the
+    # validate-contract workflow job. These enforce the EXACT consumer-facing
+    # shape (image-quickstart-{tag}-{arch}.tar / quickstart:{tag}-{arch}) so a
+    # suffix drift like .zip / .tar.gz / -debug is rejected, not silently
+    # accepted by a substring match.
+    # `|| true` so a missing field yields an empty string (reported as a failed
+    # assertion below) rather than aborting under `set -euo pipefail`.
+    artifact_regex=$(grep '^artifact_name_regex:' "$CONTRACT" | sed 's/^artifact_name_regex: *"\(.*\)"$/\1/' || true)
+    image_tag_regex=$(grep '^image_tag_regex:' "$CONTRACT" | sed 's/^image_tag_regex: *"\(.*\)"$/\1/' || true)
 
-    # Validate artifact name in workflow matches contract
-    if grep -q "$expected_artifact" "$WORKFLOW"; then
+    # Validate artifact name in workflow matches contract (anchored to the exact
+    # image-quickstart-{tag}-{arch}.tar shape, not a substring).
+    if [[ -n "$artifact_regex" ]] && grep -Eq "$artifact_regex" "$WORKFLOW"; then
         tap_ok "workflow_artifact_matches_contract"
     else
-        tap_not_ok "workflow_artifact_matches_contract" "expected '$expected_artifact' in workflow"
+        tap_not_ok "workflow_artifact_matches_contract" "expected exact '$expected_artifact' (regex: $artifact_regex) in workflow"
     fi
 
-    # Validate image tag in workflow matches contract
-    if grep -q "$expected_tag" "$WORKFLOW"; then
+    # Validate image tag in workflow matches contract (anchored to the exact
+    # quickstart:{tag}-{arch} shape, not a substring).
+    if [[ -n "$image_tag_regex" ]] && grep -Eq "$image_tag_regex" "$WORKFLOW"; then
         tap_ok "workflow_image_tag_matches_contract"
     else
-        tap_not_ok "workflow_image_tag_matches_contract" "expected '$expected_tag' in workflow"
+        tap_not_ok "workflow_image_tag_matches_contract" "expected exact '$expected_tag' (regex: $image_tag_regex) in workflow"
+    fi
+
+    # --- Contract defines the anchored ERE regexes (single source of truth) ---
+    if [[ -n "$artifact_regex" && -n "$image_tag_regex" ]]; then
+        tap_ok "contract_defines_anchored_regexes"
+    else
+        tap_not_ok "contract_defines_anchored_regexes" \
+            "contract must define artifact_name_regex: and image_tag_regex: anchored ERE strings"
+    fi
+
+    # --- Positive controls: anchored regexes accept the exact expected strings ---
+    if [[ -n "$artifact_regex" ]] && echo "$expected_artifact" | grep -Eq "$artifact_regex"; then
+        tap_ok "workflow_artifact_regex_accepts_exact_tar"
+    else
+        tap_not_ok "workflow_artifact_regex_accepts_exact_tar" \
+            "anchored artifact regex must accept '$expected_artifact'"
+    fi
+    if [[ -n "$image_tag_regex" ]] && echo "$expected_tag" | grep -Eq "$image_tag_regex"; then
+        tap_ok "workflow_image_tag_regex_accepts_exact_tag"
+    else
+        tap_not_ok "workflow_image_tag_regex_accepts_exact_tag" \
+            "anchored image-tag regex must accept '$expected_tag'"
+    fi
+
+    # --- Negative cases: incompatible suffixes must be REJECTED ---
+    # A future relaxation of the anchored regexes to a substring match would
+    # let these through and turn these assertions red — that is the point.
+    if [[ -n "$artifact_regex" ]] && ! echo "image-quickstart-testing-with-pr-amd64.zip" | grep -Eq "$artifact_regex"; then
+        tap_ok "workflow_artifact_regex_rejects_zip"
+    else
+        tap_not_ok "workflow_artifact_regex_rejects_zip" \
+            "anchored artifact regex must reject the .zip suffix"
+    fi
+    if [[ -n "$artifact_regex" ]] && ! echo "image-quickstart-testing-with-pr-amd64.tar.gz" | grep -Eq "$artifact_regex"; then
+        tap_ok "workflow_artifact_regex_rejects_double_ext"
+    else
+        tap_not_ok "workflow_artifact_regex_rejects_double_ext" \
+            "anchored artifact regex must reject the .tar.gz double extension"
+    fi
+    if [[ -n "$image_tag_regex" ]] && ! echo "quickstart:testing-with-pr-amd64-debug" | grep -Eq "$image_tag_regex"; then
+        tap_ok "workflow_image_tag_regex_rejects_debug_suffix"
+    else
+        tap_not_ok "workflow_image_tag_regex_rejects_debug_suffix" \
+            "anchored image-tag regex must reject the -debug suffix"
+    fi
+
+    # --- Workflow consumer-side checks use anchored grep -Eq (not bare prefix) ---
+    if grep -q 'grep -Eq "\$ARTIFACT_NAME_REGEX"' "$WORKFLOW" && \
+       grep -q 'grep -Eq "\$IMAGE_TAG_REGEX"' "$WORKFLOW"; then
+        tap_ok "workflow_uses_anchored_grep"
+    else
+        tap_not_ok "workflow_uses_anchored_grep" \
+            "validate-contract must read the anchored regexes and check the consumer lines with grep -Eq"
     fi
 
     # Validate workflow passes test: false (matches contract's build_inputs)
@@ -671,7 +743,7 @@ EOF
 }
 
 # --- Run all tests ---
-tap_plan 41
+tap_plan 48
 
 test_timeout_retry_on_targeted_shard
 test_non_timeout_failure_no_retry

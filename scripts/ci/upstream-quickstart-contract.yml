@@ -27,6 +27,27 @@ image_tag_pattern: "quickstart:{tag}-{arch}"
 expected_artifact_name: "image-quickstart-testing-with-pr-amd64.tar"
 expected_image_tag: "quickstart:testing-with-pr-amd64"
 
+# Anchored ERE patterns — the single source of truth for the consumer-side
+# shape, shared by the validate-contract workflow job and the local harness
+# (scripts/test-quickstart-harness.sh). These enforce the EXACT artifact
+# filename / image-tag shape that our quickstart.yml consumes (the
+# download-artifact `name:` line and the `docker run ... <tag>` line), so a
+# future drift to an incompatible suffix is rejected rather than silently
+# accepted by a substring match:
+#   - image-quickstart-testing-with-pr-amd64.zip      -> REJECTED (not .tar)
+#   - image-quickstart-testing-with-pr-amd64.tar.gz   -> REJECTED (double ext)
+#   - quickstart:testing-with-pr-amd64-debug          -> REJECTED (tag suffix)
+# The leading/trailing character classes anchor the token at word-ish
+# boundaries (start/end of line or a non-identifier char) without requiring the
+# token to occupy the whole line, so they still match inside the real workflow
+# lines (`name: image-quickstart-...`, `docker run ... quickstart:... \`). The
+# trailing class excludes `.` so `.tar.gz` cannot slip past the `.tar` anchor.
+# Used with `grep -Eq`; keep these ERE-compatible (no PCRE constructs). NOTE:
+# both consumers extract the value with a raw `grep | sed` (no YAML parser), so
+# the quoted body is used verbatim — write a single backslash before `.` here.
+artifact_name_regex: "(^|[^[:alnum:]_-])image-quickstart-testing-with-pr-amd64\.tar([^[:alnum:]_.-]|$)"
+image_tag_regex: "(^|[^[:alnum:]_-])quickstart:testing-with-pr-amd64($|[^[:alnum:]_.-])"
+
 # The artifact contains a docker image tarball inside an `image` directory
 # or as a top-level .tar file.
 artifact_layout: "image/ directory or top-level .tar"
