@@ -49,8 +49,10 @@ attempt_merge() {
   mkdir -p "$scratch_dir"
   local stderr_file="$scratch_dir/merge-stderr-$$-$pr_num.tmp"
 
-  # Try admin merge first
-  if _review_pr_exec_merge "$pr_num" "$repo" "--squash --admin" "$stderr_file"; then
+  # Try admin merge first. Flags are passed as SEPARATE arguments (not a single
+  # "--squash --admin" string) so gh receives two distinct flags rather than one
+  # bogus "--squash --admin" flag it rejects with "unknown flag" (see #2949).
+  if _review_pr_exec_merge "$pr_num" "$repo" "$stderr_file" --squash --admin; then
     rm -f "$stderr_file"
     echo "merged"
     return 0
@@ -61,8 +63,9 @@ attempt_merge() {
 
   # Classify the failure: does it contain the exact auto-merge hint?
   if _is_auto_hint_failure "$stderr_content"; then
-    # Retry with --auto (without --admin since GH CLI rejects that combo)
-    if _review_pr_exec_merge "$pr_num" "$repo" "--squash --auto" "$stderr_file"; then
+    # Retry with --auto (without --admin since GH CLI rejects that combo).
+    # Flags passed as separate arguments (see #2949).
+    if _review_pr_exec_merge "$pr_num" "$repo" "$stderr_file" --squash --auto; then
       rm -f "$stderr_file"
       echo "auto-merge-armed"
       return 0
@@ -308,20 +311,24 @@ check_armed_pr_health() {
 # Internal helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
-# _review_pr_exec_merge PR_NUM REPO FLAGS STDERR_FILE
-# Execute gh pr merge with given flags. Mockable via REVIEW_PR_MERGE_CMD.
+# _review_pr_exec_merge PR_NUM REPO STDERR_FILE FLAG...
+# Execute gh pr merge with the given flags. Each merge flag is a SEPARATE
+# trailing argument (e.g. `--squash --admin`), NOT a single space-joined string,
+# so gh receives distinct flags rather than one bogus "--squash --admin" flag
+# (see #2949). Mockable via REVIEW_PR_MERGE_CMD.
 # Returns: exit code of the merge command.
 _review_pr_exec_merge() {
   local pr_num="$1"
   local repo="$2"
-  local flags="$3"
-  local stderr_file="$4"
+  local stderr_file="$3"
+  shift 3
+  # Remaining positional args ("$@") are the individual merge flags.
 
   if [[ -n "${REVIEW_PR_MERGE_CMD:-}" ]]; then
-    # Test mode: call the mock function
-    $REVIEW_PR_MERGE_CMD "$pr_num" "$repo" "$flags" 2>"$stderr_file"
+    # Test mode: call the mock function, forwarding each flag as its own arg.
+    $REVIEW_PR_MERGE_CMD "$pr_num" "$repo" "$@" 2>"$stderr_file"
   else
-    gh pr merge "$pr_num" --repo "$repo" $flags 2>"$stderr_file"
+    gh pr merge "$pr_num" --repo "$repo" "$@" 2>"$stderr_file"
   fi
 }
 
