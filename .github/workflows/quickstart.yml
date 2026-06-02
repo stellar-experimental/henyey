@@ -51,6 +51,17 @@ name: Quickstart
 permissions:
   contents: read
 
+# Per-probe timeout budget, mirroring upstream
+# stellar/quickstart/.github/workflows/internal-test.yml, which sets
+# `env.timeout_multiplier: 4` and computes each probe step's timeout-minutes as
+# `github.run_attempt * timeout_multiplier`. We reproduce the same multiplier
+# here so the in-repo orchestration preserves upstream timeout semantics (4 min
+# on attempt 1, escalating on manual re-runs) instead of diverging silently.
+# Pinned in scripts/ci/upstream-quickstart-contract.yml (timeout_multiplier: 4)
+# so multiplier drift is caught by validate-contract and the harness (#2920).
+env:
+  timeout_multiplier: 4
+
 on:
   pull_request:
   push:
@@ -381,7 +392,17 @@ jobs:
           NETWORK: ${{ matrix.network }}
           ENABLE: ${{ matrix.enable }}
         run: |
-          PROBE_TIMEOUT=600
+          # Per-probe budget = github.run_attempt * timeout_multiplier minutes,
+          # converted to seconds for GNU `timeout` (* 60). Mirrors upstream
+          # internal-test.yml's `minutes = github.run_attempt * timeout_multiplier`
+          # applied as each probe step's timeout-minutes (attempt 1 -> 4 min;
+          # manual re-runs escalate to 8, 12, ...). github.run_attempt is constant
+          # across a job's steps, so computing it once here is equivalent to
+          # upstream's per-step timeout-minutes. The budget is applied per-probe;
+          # a shard running N probes can use up to N * budget wall-clock, bounded
+          # overall by this job's timeout-minutes: 45. The targeted single retry
+          # in run-quickstart-test.sh is layered on top of this budget (#2920).
+          PROBE_TIMEOUT=$(( ${{ github.run_attempt }} * timeout_multiplier * 60 ))
           DIAG_DIR="/tmp/quickstart-diagnostics"
 
           for probe_file in ${{ matrix.probes }}; do
