@@ -5,7 +5,7 @@
 #
 # Usage:
 #   run-quickstart-test.sh --network <net> --enable <services> --probe <name> \
-#       --timeout <seconds> --diagnostics-dir <dir> -- <probe_command...>
+#       --timeout <seconds> (default: 600) --diagnostics-dir <dir> -- <probe_command...>
 #
 # Exit codes:
 #   0 — probe passed (possibly after one retry)
