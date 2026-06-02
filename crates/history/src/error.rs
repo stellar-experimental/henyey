@@ -527,12 +527,17 @@ pub enum HistoryError {
     /// and [`is_hash_mismatch`](HistoryError::is_hash_mismatch). See #2931.
     #[error(
         "catchup target checkpoint not yet published: target ledger {target} \
-         requires archive currentLedger >= its covering checkpoint, but archive \
-         HAS currentLedger is {has_current}"
+         requires archive currentLedger >= its covering checkpoint \
+         {covering_checkpoint}, but archive HAS currentLedger is {has_current}"
     )]
     CheckpointNotYetPublished {
         /// The catchup target ledger sequence.
         target: u32,
+        /// The covering checkpoint for `target` (`checkpoint_containing(target)`),
+        /// i.e. the archive `currentLedger` value required for the target to be
+        /// considered published. Included so on-call debugging does not have to
+        /// recompute the checkpoint math from the log line.
+        covering_checkpoint: u32,
         /// The archive HAS `currentLedger` observed at gate time.
         has_current: u32,
     },
@@ -735,6 +740,7 @@ mod tests {
         // force a full bucket-apply reset).
         let err = HistoryError::CheckpointNotYetPublished {
             target: 62845439,
+            covering_checkpoint: 62845439,
             has_current: 62845375,
         };
         assert!(
@@ -744,6 +750,17 @@ mod tests {
         assert!(
             !err.is_hash_mismatch(),
             "CheckpointNotYetPublished must not be treated as a hash mismatch"
+        );
+        // The covering checkpoint value must appear in the rendered message so
+        // on-call debugging needn't recompute checkpoint math from the log line.
+        let msg = err.to_string();
+        assert!(
+            msg.contains("62845439"),
+            "message must include the covering checkpoint value: {msg}"
+        );
+        assert!(
+            msg.contains("62845375"),
+            "message must still include the archive HAS currentLedger: {msg}"
         );
     }
 
