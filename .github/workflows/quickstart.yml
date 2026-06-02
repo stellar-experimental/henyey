@@ -203,7 +203,10 @@ jobs:
             # --- Exact artifact name validation ---
             # The contract specifies artifact_name_pattern: "image-quickstart-{tag}-{arch}.tar"
             # Upstream internal-build.yml constructs the artifact name using expressions like:
-            #   image-quickstart-${{ inputs.tag ... }}-${{ matrix.arch }}
+            #   image-quickstart-<inputs.tag expr>-<matrix.arch expr>
+            # (the angle-bracket placeholders stand in for GHA expression syntax;
+            #  literal expression delimiters are avoided here so the workflow file
+            #  itself stays parseable — see #2933.)
             # We validate: (a) the exact "image-quickstart-" prefix with tag/arch interpolation,
             # and (b) our concrete expected_artifact_name decomposes correctly from the pattern.
             #
@@ -236,7 +239,7 @@ jobs:
 
             # --- Exact image tag validation ---
             # The contract specifies image_tag_pattern: "quickstart:{tag}-{arch}"
-            # Upstream tags the image as quickstart:${{ inputs.tag }}-${{ matrix.arch }}
+            # Upstream tags the image as quickstart:<inputs.tag expr>-<matrix.arch expr>
             # or similar. Validate the "quickstart:" prefix with tag-arch interpolation.
             IMAGE_TAG_PREFIX="quickstart:"
             if grep -q "${IMAGE_TAG_PREFIX}" "$INTERNAL"; then
@@ -250,7 +253,7 @@ jobs:
 
             # Validate the image tag template follows the exact {tag}-{arch} structure.
             # Upstream must tag as: quickstart:<tag_expr>-<arch_expr>.
-            # Reject shapes like quickstart:${{ inputs.tag }} (missing arch).
+            # Reject shapes like quickstart:<inputs.tag expr> (missing arch).
             TAG_REGEX="${IMAGE_TAG_PREFIX}"'\$\{\{[^}]*(tag|inputs\.tag|matrix\.tag)[^}]*\}\}-\$\{\{[^}]*(arch|matrix\.arch|inputs\.arch)[^}]*\}\}'
             if grep -qE "$TAG_REGEX" "$INTERNAL"; then
               echo "✓ internal-build.yml image tag matches {tag}-{arch} structure"
