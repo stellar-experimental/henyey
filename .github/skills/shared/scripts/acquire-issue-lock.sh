@@ -142,23 +142,69 @@ if ! flock -n "$LOCK_FD"; then
   exit 1
 fi
 
-# ── We hold the lock. Self-assign @me (in-review picks included — #2909). ────
+# ── We hold the lock — reap any orphaned PRIOR dispatch for this issue (#2934).
+# Because we hold the issue's flock now, any other same-issue dispatch is dead
+# (the flock auto-released on its death). The newest sentinel may still record
+# that dead dispatch's process-group + start-time; reap kills a positively-
+# verified-dead group and reclaims its ~/data workspace. This runs BEFORE we
+# overwrite the sentinel below (so reap reads the PRIOR owner's identity, not
+# our own). Best-effort and non-fatal: a reap failure must never block dispatch.
+_REAP_SCRIPT="$_SELF_DIR/reap-stale-dispatch.sh"
+if [ -x "$_REAP_SCRIPT" ]; then
+  "$_REAP_SCRIPT" "$ISSUE" || true
+fi
+
+# ── Self-assign @me (in-review picks included — #2909). ──────────────────────
 # Self-assign is necessary so /project-tick filters us out of future picker
 # runs. It was empty during the #2909 incident for an in-review pick, so we
 # always assign regardless of $STATUS.
 gh issue edit "$ISSUE" --repo "$OWNER/$REPO" --add-assignee @me >/dev/null 2>&1 || true
 
+# ── Self-record THIS dispatch's process-group identity (#2934 / #2956). ──────
+# The sentinel must carry an identity that reap-stale-dispatch.sh can later use
+# to positively identify (and only then kill) THIS dispatch's orphaned process-
+# group if we die with a surviving child. The robust source is THIS process's
+# own /proc, NOT an env var handed down from the loop after the child launched
+# (that env export can never reach an already-exec'd child — the round-2
+# correctness concern, #2956). This script is sourced by the long-lived tick
+# (the copilot dispatch), so /proc/self's pgid IS the dispatch group leader,
+# provided the loop launched the dispatch as its own group leader via setsid
+# (#2957). We record the leader's pid (== pgid) and its start-time (field 22 of
+# /proc/<pgid>/stat, clock-ticks-since-boot — monotonic, not recycled in a boot)
+# so the reaper can detect PID reuse and refuse to signal a recycled pid (#2958).
+_self_pgid=""; _self_starttime=""
+if _stat_line="$(cat /proc/self/stat 2>/dev/null)"; then
+  # comm (field 2) may contain spaces/parens; strip through the final ") ".
+  _stat_rest="${_stat_line##*) }"
+  # shellcheck disable=SC2086
+  set -- $_stat_rest
+  # In the post-comm fields, pgrp is index 3, starttime is index 20.
+  _self_pgid="${3:-}"
+  _self_starttime="${20:-}"
+fi
+# Re-read the GROUP LEADER's start-time (the leader pid == _self_pgid). When the
+# dispatch is its own group leader these are identical; reading the leader's own
+# /proc entry is what the reaper compares against, so record that explicitly.
+_leader_starttime="$_self_starttime"
+if [ -n "$_self_pgid" ] && _ldr_line="$(cat "/proc/$_self_pgid/stat" 2>/dev/null)"; then
+  _ldr_rest="${_ldr_line##*) }"
+  # shellcheck disable=SC2086
+  set -- $_ldr_rest
+  _leader_starttime="${20:-$_self_starttime}"
+fi
+
 # ── Post the sentinel comment (best-effort cross-host audit signal only). ────
 # The authoritative same-host guard is the flock above; the sentinel records
-# host + posted time + the OWNING TICK_PID (the long-lived process that holds
-# the lock — NOT $$, which is this ephemeral shell that exits before dispatch).
+# host + posted time + the OWNING TICK_PID (the long-lived loop process — kept
+# for backward-compat / cross-host kill-0 liveness) PLUS the per-dispatch
+# process-group identity (dispatch_pgid + dispatch_starttime) used by the reaper.
 OWNER_PID="${TICK_PID:-$$}"
 TICK_ID="tick-$(date +%s%N)-$OWNER_PID"
 SENTINEL_ID=$(gh api "repos/$OWNER/$REPO/issues/$ISSUE/comments" \
   --method POST \
   -f body="## 🔒 acquired-by:$TICK_ID
 
-posted=$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ), host=$(hostname), tick_pid=$OWNER_PID" \
+posted=$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ), host=$(hostname), tick_pid=$OWNER_PID, dispatch_pgid=${_self_pgid:-}, dispatch_starttime=${_leader_starttime:-}" \
   --jq '.id' 2>/dev/null || true)
 
 # Emit the held-lock FD + path + sentinel id for the caller to retain.

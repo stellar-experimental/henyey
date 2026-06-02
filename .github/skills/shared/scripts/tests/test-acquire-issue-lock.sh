@@ -389,6 +389,106 @@ test_cross_session_serializes() {
 }
 
 # ---------------------------------------------------------------------------
+# Test 7 (#2934): on a successful acquire, reap-stale-dispatch.sh is invoked
+# BEFORE the new sentinel is posted (so it reads the PRIOR owner's identity).
+# We shim reap-stale-dispatch.sh with a recorder by pointing the script at a
+# copy of acquire-issue-lock.sh in a temp dir alongside a fake reaper, so the
+# `$_SELF_DIR/reap-stale-dispatch.sh` it invokes is our recorder.
+# ---------------------------------------------------------------------------
+test_acquire_invokes_reap_on_success() {
+  local name="test_acquire_invokes_reap_on_success"
+  local tmpdir; tmpdir="$(mktemp -d)"
+  make_mock_gh "$tmpdir"
+
+  # Build a shim script dir: copy acquire-issue-lock.sh + a recording reaper.
+  local shimdir="$tmpdir/scripts"; mkdir -p "$shimdir"
+  cp "$TARGET_SCRIPT" "$shimdir/acquire-issue-lock.sh"
+  local reap_marker="$tmpdir/reap-invoked"
+  cat > "$shimdir/reap-stale-dispatch.sh" <<EOF
+#!/usr/bin/env bash
+echo "reaped \$1" > "$reap_marker"
+exit 0
+EOF
+  chmod +x "$shimdir/reap-stale-dispatch.sh"
+  # The contract lib is resolved relative to _SELF_DIR (../../../../scripts/lib);
+  # acquire-issue-lock.sh tolerates its absence, so the shim dir need not provide
+  # it. Lock derivation then falls back to $HOME — fine for this test.
+
+  local namespace="$RUN_NONCE-t7"
+  local issue=4248
+  CLEANUP_DIRS+=("$REAL_HOME/data/$namespace")
+
+  local exit_code
+  PATH="$tmpdir:$PATH" PROJECT_TICK_LOCK_SESSION_ID="$namespace" \
+    GH_CALLS_LOG="$tmpdir/gh-calls.log" LOOP_PID="t7" TICK_PID=$$ \
+    bash "$shimdir/acquire-issue-lock.sh" "$issue" ready-for-doing >/dev/null 2>&1
+  exit_code=$?
+
+  if [ "$exit_code" -ne 0 ]; then
+    echo "FAIL: $name — expected exit 0, got $exit_code"; FAILED=$((FAILED + 1)); rm -rf "$tmpdir"; return
+  fi
+  if [ ! -f "$reap_marker" ] || ! grep -q "reaped $issue" "$reap_marker"; then
+    echo "FAIL: $name — reap-stale-dispatch.sh was not invoked on acquire success"
+    FAILED=$((FAILED + 1)); rm -rf "$tmpdir"; return
+  fi
+  echo "PASS: $name"; PASSED=$((PASSED + 1)); rm -rf "$tmpdir"
+}
+
+# ---------------------------------------------------------------------------
+# Test 8 (#2934 / #2956 / #2959): the sentinel records a NON-EMPTY per-dispatch
+# process-group identity (dispatch_pgid + dispatch_starttime) self-sourced from
+# the acquiring process's own /proc — NOT from a post-spawn env handoff. This is
+# the launcher-handoff guard: the identity must come from the real running
+# dispatch, and the recorded pgid + start-time must match this process's actual
+# values (proving it self-recorded /proc/self, not an empty/handed-down value).
+# ---------------------------------------------------------------------------
+test_sentinel_records_dispatch_fields() {
+  local name="test_sentinel_records_dispatch_fields"
+  local tmpdir; tmpdir="$(mktemp -d)"
+  make_mock_gh "$tmpdir"
+
+  local namespace="$RUN_NONCE-t8"
+  local issue=4249
+  CLEANUP_DIRS+=("$REAL_HOME/data/$namespace")
+
+  # Run the acquire script as its OWN process-group leader (setsid), mirroring
+  # how project-tick-loop.sh launches the dispatch. Capture the leader's real
+  # pgid + start-time from the SAME setsid tree, then assert the sentinel body
+  # the script POSTed records exactly those values. This is the end-to-end
+  # launcher-handoff test (#2959): real launched dispatch → real recorded id.
+  local idfile="$tmpdir/leader-id"
+  setsid --wait bash -c '
+    pgid=$(awk "{r=\$0; sub(/.*\) /,\"\",r); split(r,a,\" \"); print a[3]}" /proc/self/stat)
+    st=$(awk "{r=\$0; sub(/.*\) /,\"\",r); split(r,a,\" \"); print a[20]}" /proc/$pgid/stat)
+    echo "$pgid $st" > "'"$idfile"'"
+    PATH="'"$tmpdir"':$PATH" PROJECT_TICK_LOCK_SESSION_ID="'"$namespace"'" \
+      GH_CALLS_LOG="'"$tmpdir"'/gh-calls.log" LOOP_PID="t8" TICK_PID=$$ \
+      bash "'"$TARGET_SCRIPT"'" "'"$issue"'" ready-for-doing >/dev/null 2>&1
+  '
+
+  local leader_pgid leader_st
+  read -r leader_pgid leader_st < "$idfile"
+
+  # The mock gh logged the POST call (with -f body=...). Assert the body carries
+  # the leader's pgid + start-time (non-empty AND matching the real process).
+  if ! grep -q "dispatch_pgid=$leader_pgid" "$tmpdir/gh-calls.log" 2>/dev/null; then
+    echo "FAIL: $name — sentinel did not record dispatch_pgid=$leader_pgid (self-record from /proc/self failed)"
+    echo "  gh calls: $(cat "$tmpdir/gh-calls.log" 2>/dev/null)"; FAILED=$((FAILED + 1)); rm -rf "$tmpdir"; return
+  fi
+  if ! grep -q "dispatch_starttime=$leader_st" "$tmpdir/gh-calls.log" 2>/dev/null; then
+    echo "FAIL: $name — sentinel did not record dispatch_starttime=$leader_st"
+    echo "  gh calls: $(cat "$tmpdir/gh-calls.log" 2>/dev/null)"; FAILED=$((FAILED + 1)); rm -rf "$tmpdir"; return
+  fi
+  # Guard against the #2956 regression: an empty field would mean the identity
+  # was handed-down-and-lost rather than self-sourced.
+  if grep -qE "dispatch_pgid=,|dispatch_pgid= " "$tmpdir/gh-calls.log" 2>/dev/null; then
+    echo "FAIL: $name — dispatch_pgid recorded EMPTY (env-handoff regression #2956)"
+    FAILED=$((FAILED + 1)); rm -rf "$tmpdir"; return
+  fi
+  echo "PASS: $name"; PASSED=$((PASSED + 1)); rm -rf "$tmpdir"
+}
+
+# ---------------------------------------------------------------------------
 # Run all tests.
 # ---------------------------------------------------------------------------
 test_flock_held_blocks_second_acquire
@@ -397,6 +497,8 @@ test_dead_holder_lock_is_acquirable
 test_in_review_pick_sets_assignee
 test_lost_race_writes_cooldown
 test_cross_session_serializes
+test_acquire_invokes_reap_on_success
+test_sentinel_records_dispatch_fields
 
 echo
 echo "Results: ${PASSED} passed, ${FAILED} failed"
