@@ -738,9 +738,14 @@ mod tests {
         // It must NOT be classified as a fatal catchup failure (which would
         // trigger a state-wipe) nor as a typed hash mismatch (which would
         // force a full bucket-apply reset).
+        // Use DISTINCT values for every field so each assertion below
+        // independently proves that its own field is rendered. If `target` and
+        // `covering_checkpoint` shared a value, a message that only printed
+        // `target` would still satisfy the covering-checkpoint assertion by
+        // coincidence (#2953).
         let err = HistoryError::CheckpointNotYetPublished {
             target: 62845439,
-            covering_checkpoint: 62845439,
+            covering_checkpoint: 62845280,
             has_current: 62845375,
         };
         assert!(
@@ -751,11 +756,15 @@ mod tests {
             !err.is_hash_mismatch(),
             "CheckpointNotYetPublished must not be treated as a hash mismatch"
         );
-        // The covering checkpoint value must appear in the rendered message so
+        // Each distinct field value must appear in the rendered message so
         // on-call debugging needn't recompute checkpoint math from the log line.
         let msg = err.to_string();
         assert!(
             msg.contains("62845439"),
+            "message must include the target ledger value: {msg}"
+        );
+        assert!(
+            msg.contains("62845280"),
             "message must include the covering checkpoint value: {msg}"
         );
         assert!(
