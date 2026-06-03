@@ -232,3 +232,121 @@ review_pr_bootstrap() {
   fi
   export REVIEWER_WORKTREE
 }
+
+# do_bootstrap <issue>
+# Derives and validates the full workspace layout for a /do implementation run.
+# Exports: WORKTREE_BASE, CARGO_TARGET_DIR, DO_WORKTREE
+# DO_WORKTREE is the implementation worktree (under ~/data, NOT in the repo tree).
+# Validates pre-seeded env vars against both ~/data boundary AND session prefix.
+# On failure, clears all derived vars to prevent stale-env escape.
+do_bootstrap() {
+  local issue="$1"
+  local session_id="${CLAUDE_SESSION_ID:-${SESSION_ID:-$(date +%Y%m%d-%H%M%S)}}"
+  local real_home
+  real_home="$(_contract_real_home)"
+
+  # The expected session prefix for do operations
+  local expected_prefix="$real_home/data/$session_id/do-$issue"
+
+  # Capture incoming overrides before clearing, so we can validate them.
+  local incoming_base="${WORKTREE_BASE:-}"
+  local incoming_cargo="${CARGO_TARGET_DIR:-}"
+
+  # Clear derived vars on entry to prevent stale values from surviving a failure.
+  unset WORKTREE_BASE CARGO_TARGET_DIR DO_WORKTREE
+
+  # Derive or validate WORKTREE_BASE
+  local candidate_base="${incoming_base:-$real_home/data/$session_id/do-$issue}"
+  if ! WORKTREE_BASE="$(require_home_data_path "$candidate_base" "WORKTREE_BASE")"; then
+    unset WORKTREE_BASE CARGO_TARGET_DIR DO_WORKTREE
+    return 1
+  fi
+  # Enforce session-prefix isolation for pre-seeded overrides
+  if [[ -n "$incoming_base" ]]; then
+    if ! require_session_prefix "$WORKTREE_BASE" "$expected_prefix" "WORKTREE_BASE"; then
+      unset WORKTREE_BASE CARGO_TARGET_DIR DO_WORKTREE
+      return 1
+    fi
+  fi
+  export WORKTREE_BASE
+
+  # Derive or validate CARGO_TARGET_DIR
+  local candidate_cargo="${incoming_cargo:-$WORKTREE_BASE/cargo-target}"
+  if ! CARGO_TARGET_DIR="$(require_home_data_path "$candidate_cargo" "CARGO_TARGET_DIR")"; then
+    unset WORKTREE_BASE CARGO_TARGET_DIR DO_WORKTREE
+    return 1
+  fi
+  # Enforce session-prefix isolation for pre-seeded overrides
+  if [[ -n "$incoming_cargo" ]]; then
+    if ! require_session_prefix "$CARGO_TARGET_DIR" "$expected_prefix" "CARGO_TARGET_DIR"; then
+      unset WORKTREE_BASE CARGO_TARGET_DIR DO_WORKTREE
+      return 1
+    fi
+  fi
+  export CARGO_TARGET_DIR
+
+  # Derive the implementation worktree (under ~/data, never inside the repo).
+  DO_WORKTREE="$WORKTREE_BASE/worktree"
+  if ! DO_WORKTREE="$(require_home_data_path "$DO_WORKTREE" "DO_WORKTREE")"; then
+    unset WORKTREE_BASE CARGO_TARGET_DIR DO_WORKTREE
+    return 1
+  fi
+  export DO_WORKTREE
+}
+
+# assert_no_repo_tree_scratch <repo_root>
+# Detection-only guard (NO deletion, NO recursive sweeps) that fails fast if any
+# of the fixed, enumerated agent-scratch leak patterns (issue #2843) exists in
+# the repo working tree or as a "<basename>-pr<N>" sibling of the repo parent.
+# Prints each offender to stderr and returns non-zero if any are found.
+#
+# This is a fixed enumeration of the OBSERVED leak patterns — intentionally not
+# a generalized filesystem janitor. Skills invoke it as a pre/post assertion so a
+# leak is caught while still on disk; CI exercises it via a planted fixture.
+assert_no_repo_tree_scratch() {
+  local repo_root="$1"
+  if [[ -z "$repo_root" ]]; then
+    echo "ERROR: assert_no_repo_tree_scratch: repo_root argument is required" >&2
+    return 2
+  fi
+
+  # Fixed enumeration of observed out-of-~/data scratch directory names.
+  local leak_dirs=(
+    ".review-data"
+    ".review-worktrees"
+    ".worktrees"
+    ".copilot-tmp"
+    ".opencode/worktrees"
+  )
+
+  local found=0
+  local d
+  for d in "${leak_dirs[@]}"; do
+    if [[ -e "$repo_root/$d" ]]; then
+      echo "ERROR: agent scratch leak detected in repo tree: $repo_root/$d (see #2843)" >&2
+      found=1
+    fi
+  done
+
+  # Sibling worktrees named "<basename>-pr<N>" alongside the repo (e.g. a
+  # /tmp/henyey-pr2797 sibling, or <repo>-pr42). Match only the parent dir.
+  # Enumerate via `find` (depth 1) rather than a shell glob: a bare glob is
+  # not portable across shells — zsh's default `nomatch` makes an unmatched
+  # pattern a hard error, while bash leaves the literal string. `find` is
+  # immune to both and to the no-match case.
+  local parent base sib
+  parent="$(dirname "$repo_root")"
+  base="$(basename "$repo_root")"
+  if [[ -d "$parent" ]]; then
+    while IFS= read -r sib; do
+      [[ -n "$sib" ]] || continue
+      echo "ERROR: agent scratch leak detected as repo sibling: $sib (see #2843)" >&2
+      found=1
+    done < <(find "$parent" -mindepth 1 -maxdepth 1 -name "$base-pr*" 2>/dev/null)
+  fi
+
+  if [[ "$found" -ne 0 ]]; then
+    return 1
+  fi
+  return 0
+}

@@ -72,26 +72,48 @@ If neither exists, post `## Do: Missing Plan` and route the issue back to `ready
 
 ### A.2 Set up the worktree
 
+ALL scratch — the worktree, the cargo target, and the `.session-id` marker —
+lives under `~/data/<session>/do-$ISSUE/`, **never inside the repo tree**. Derive
+the paths from the shared contract helper (`do_bootstrap`), which validates them
+against the passwd-anchored `~/data` boundary and the per-session prefix.
+
 ```bash
 REPO_ROOT="$(git rev-parse --show-toplevel)"
-WORKTREE="$REPO_ROOT/data/do-$ISSUE/worktree"
 BRANCH="do/issue-$ISSUE"
-SESSION_ID="${CLAUDE_SESSION_ID:-$(date +%Y%m%d-%H%M%S)}"
-export CARGO_TARGET_DIR="$HOME/data/$SESSION_ID/do-$ISSUE/cargo-target"
 
-mkdir -p "$REPO_ROOT/data" "$HOME/data/$SESSION_ID/do-$ISSUE"
+# Derive + validate the workspace. Exports WORKTREE_BASE, CARGO_TARGET_DIR, and
+# DO_WORKTREE, all under ~/data/$SESSION_ID/do-$ISSUE. Fails closed on any path
+# that escapes ~/data — the `|| exit 1` guard prevents the mkdir below from
+# running on a rejected (hostile/stale) path.
+source "$REPO_ROOT/scripts/lib/agent-worktree-contract.sh"
+do_bootstrap "$ISSUE" || exit 1
+export CARGO_TARGET_DIR
 
-# Persist the session ID alongside the worktree so /review-pr can clean up
-# the cargo target dir on merge (avoids accumulating multi-GB stale caches).
-echo "$SESSION_ID" > "$REPO_ROOT/data/do-$ISSUE/.session-id"
+mkdir -p "$WORKTREE_BASE"
 
-# Fresh worktree off origin/main.
+# Persist the session ID alongside the workspace (under ~/data, NOT in the repo)
+# so /review-pr can clean up the cargo target dir on merge.
+echo "${CLAUDE_SESSION_ID:-$SESSION_ID}" > "$WORKTREE_BASE/.session-id"
+
+# Fresh worktree off origin/main, under ~/data (DO_WORKTREE).
 git fetch origin main
-git -C "$REPO_ROOT" worktree add -B "$BRANCH" "$WORKTREE" origin/main
-cd "$WORKTREE"
+git -C "$REPO_ROOT" worktree add -B "$BRANCH" "$DO_WORKTREE" origin/main
+cd "$DO_WORKTREE"
 ```
 
-`/data/` is gitignored in the repo. `~/data/` is the shared volume per CLAUDE.md.
+The worktree, cargo target, and review-comments scratch (B.1) all live under
+`~/data` — the shared volume per CLAUDE.md. **Forbidden scratch locations** (these
+are the observed disk-leak patterns from #2843 — never create any of them, whether
+in the repo tree, as a `<repo>-pr<N>` sibling, or under `/tmp`):
+`.review-data/`, `.review-worktrees/`, `.worktrees/`, `.copilot-tmp/`,
+`.opencode/worktrees/`, and any path under `/tmp`. After the build (A.4) and on
+every failure/`blocked` exit, assert the repo tree is clean:
+
+```bash
+assert_no_repo_tree_scratch "$REPO_ROOT" || {
+  echo "Scratch leak detected — clean it before exiting." >&2
+}
+```
 
 ### A.2.5 Write the failing test FIRST (TDD)
 
@@ -148,10 +170,16 @@ Then run tests with scope chosen from the plan:
 - **Plan touches a single crate** → `cargo test -p henyey-<crate>` (faster).
 - **Plan touches multiple crates or shared types** → `cargo test --all`.
 
+After the build, assert no scratch leaked into the repo tree:
+
+```bash
+assert_no_repo_tree_scratch "$REPO_ROOT" || exit 1
+```
+
 If anything fails:
 
 - Fix attempts: up to 3.
-- After 3 failed fixes, post `## Do: Local Verification Failed` with the relevant error output, move to `blocked`, unassign, exit.
+- After 3 failed fixes, post `## Do: Local Verification Failed` with the relevant error output, move to `blocked`, unassign, **reap your own workspace** (`git -C "$REPO_ROOT" worktree remove --force "$DO_WORKTREE" 2>/dev/null; rm -rf "$WORKTREE_BASE"`), exit.
 
 ### A.5 Commit and push
 
@@ -236,14 +264,22 @@ LAST_PUSH=$(gh pr view $PR_NUM --repo stellar-experimental/henyey \
   --json commits --jq '.commits | sort_by(.committedDate) | last | .committedDate')
 ```
 
-Fetch inline review-comments WITH IDs (you'll need these to reply):
+Fetch inline review-comments WITH IDs (you'll need these to reply). Write the
+scratch JSON under the `~/data` workspace — **never under `/tmp`** (see #2843):
 
 ```bash
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+source "$REPO_ROOT/scripts/lib/agent-worktree-contract.sh"
+do_bootstrap "$ISSUE" || exit 1
+export CARGO_TARGET_DIR
+mkdir -p "$WORKTREE_BASE"
+COMMENTS_JSON="$WORKTREE_BASE/review-comments-$PR_NUM.json"
+
 gh api "repos/stellar-experimental/henyey/pulls/$PR_NUM/comments" --paginate \
   --jq --arg cutoff "$LAST_PUSH" '
     [.[] | select(.created_at > $cutoff) |
      {id, path, line, body, in_reply_to: .in_reply_to_id, url: .html_url}]' \
-  > /tmp/review-comments-$PR_NUM.json
+  > "$COMMENTS_JSON"
 ```
 
 Also fetch PR-level reviews (the structured `## 🔍 Reviewer:` comments from /review-pr are issue-level, NOT review-comments):
@@ -255,7 +291,7 @@ gh api "repos/stellar-experimental/henyey/issues/$PR_NUM/comments" --paginate \
      {id, body, url: .html_url}]'
 ```
 
-Items in `/tmp/review-comments-$PR_NUM.json` are the inline ones with `.id` you'll iterate over in B.6 to post replies. Items not in `in_reply_to` chains (i.e. `in_reply_to: null`) are top-level thread comments; replying to those creates a follow-up in the same thread.
+Items in `$COMMENTS_JSON` (under `~/data`) are the inline ones with `.id` you'll iterate over in B.6 to post replies. Items not in `in_reply_to` chains (i.e. `in_reply_to: null`) are top-level thread comments; replying to those creates a follow-up in the same thread.
 
 ### B.2 Group the feedback
 
@@ -267,22 +303,28 @@ For each comment, classify:
 
 ### B.3 Re-enter the worktree
 
+The worktree lives under `~/data` (`DO_WORKTREE`), **never in the repo tree**.
+If B.1 already ran `do_bootstrap` in this shell, `DO_WORKTREE`/`WORKTREE_BASE`/
+`CARGO_TARGET_DIR` are set; otherwise derive them now via the helper.
+
 ```bash
-WORKTREE="$REPO_ROOT/data/do-$ISSUE/worktree"
-export CARGO_TARGET_DIR="$HOME/data/$SESSION_ID/do-$ISSUE/cargo-target"
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+source "$REPO_ROOT/scripts/lib/agent-worktree-contract.sh"
+do_bootstrap "$ISSUE" || exit 1
+export CARGO_TARGET_DIR
 BRANCH="do/issue-$ISSUE"
 
 # Re-enter or re-create the worktree. The worktree may have been cleaned up
 # by /review-pr after a previous merge attempt, or never existed if this is
 # the first Mode B run on a re-bounced issue.
-if [ ! -d "$WORKTREE/.git" ] && [ ! -f "$WORKTREE/.git" ]; then
-  # No worktree — recreate from origin/$BRANCH (PR head).
+if [ ! -d "$DO_WORKTREE/.git" ] && [ ! -f "$DO_WORKTREE/.git" ]; then
+  # No worktree — recreate from origin/$BRANCH (PR head), under ~/data.
   git -C "$REPO_ROOT" fetch origin "$BRANCH"
-  mkdir -p "$(dirname "$WORKTREE")"
-  git -C "$REPO_ROOT" worktree add -B "$BRANCH" "$WORKTREE" "origin/$BRANCH"
+  mkdir -p "$WORKTREE_BASE"
+  git -C "$REPO_ROOT" worktree add -B "$BRANCH" "$DO_WORKTREE" "origin/$BRANCH"
 fi
 
-cd "$WORKTREE"
+cd "$DO_WORKTREE"
 git fetch origin
 git rebase origin/main  # In case main moved during review.
 ```
@@ -299,12 +341,12 @@ Same as Mode A.5.
 
 ### B.6 Reply inline and push
 
-Iterate over every inline comment in `/tmp/review-comments-$PR_NUM.json` and reply within the same thread. The endpoint `POST /repos/.../pulls/{pr}/comments/{comment_id}/replies` creates a reply IN the thread containing `{comment_id}`, which is what `/review-pr`'s "addressed" heuristic looks for (it scans `reviewThreads { comments }` for `Addressed in` / `Fixed in` / `Done in`).
+Iterate over every inline comment in `$COMMENTS_JSON` (under `~/data`, from B.1) and reply within the same thread. The endpoint `POST /repos/.../pulls/{pr}/comments/{comment_id}/replies` creates a reply IN the thread containing `{comment_id}`, which is what `/review-pr`'s "addressed" heuristic looks for (it scans `reviewThreads { comments }` for `Addressed in` / `Fixed in` / `Done in`).
 
 ```bash
 FIX_SHA=$(git rev-parse HEAD)   # captured AFTER the fix commit in B.5/B.7
 
-jq -r '.[] | .id' /tmp/review-comments-$PR_NUM.json | while read CID; do
+jq -r '.[] | .id' "$COMMENTS_JSON" | while read CID; do
   # classify: actionable / question / disagree (per B.2)
   # then reply with the appropriate template:
   gh api -X POST \
@@ -382,6 +424,10 @@ Exit.
 
 ## Cleanup
 
-- **Worktree at `$REPO_ROOT/data/do-$ISSUE/worktree`:** cleaned up by `/review-pr` after merge.
-- **Build cache at `~/data/$SESSION_ID/do-$ISSUE/cargo-target`:** also cleaned up by `/review-pr` after merge.
-- If you `blocked` mid-flow, leave both in place — the operator may want to inspect.
+The entire workspace — worktree, cargo cache, scratch JSON — lives under
+`$WORKTREE_BASE` (= `~/data/$SESSION_ID/do-$ISSUE`), **never inside the repo tree**.
+
+- **Worktree at `$DO_WORKTREE` (under `~/data`):** cleaned up by `/review-pr` after merge.
+- **Build cache at `$CARGO_TARGET_DIR` (under `~/data`):** also cleaned up by `/review-pr` after merge.
+- On `blocked` mid-flow, leave the workspace in place for operator inspection — **except** the local-verification-failed and unrecoverable failure exits, which reap their own `$WORKTREE_BASE` (the leak this skill exists to prevent: orphaned in-bounds workspaces that never produced a merged artifact).
+- The repo tree must stay clean: no `.review-data/`, `.review-worktrees/`, `.worktrees/`, `.copilot-tmp/`, `.opencode/worktrees/`, `<repo>-pr<N>` siblings, or `/tmp` scratch. `assert_no_repo_tree_scratch "$REPO_ROOT"` (from the contract helper) asserts this.
