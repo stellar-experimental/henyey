@@ -286,6 +286,10 @@ Otherwise, the PR is **non-parity** — Reviewer B uses risk lens.
 
 Launch both as `general-purpose` foreground sub-agents. Do not wait between them. **Each reviewer must be spawned with `--model gpt-5.4`** (or equivalent model parameter) explicitly — do not inherit from the parent. Cross-model diversity catches issues a same-model pipeline would miss.
 
+**Workspace binding (issue #2843 — pass into every reviewer prompt).** Before spawning, run the Workspace-contract bootstrap to derive `$REVIEWER_WORKTREE` (under `~/data/$SESSION_ID/review-pr-$ISSUE/reviewer`). Pass that exact path into each reviewer prompt and require it as the ONLY scratch location:
+
+> Your working directory and any checkout/build scratch MUST be `$REVIEWER_WORKTREE` (`<resolved-path>`). If you need a git worktree, run `git worktree add "$REVIEWER_WORKTREE/<sub>"`; if you build, set `CARGO_TARGET_DIR="$REVIEWER_WORKTREE/cargo-target"`. You are FORBIDDEN from creating `.review-data/`, `.review-worktrees/`, `.worktrees/`, `.copilot-tmp/`, `.opencode/worktrees/`, any `<repo>-pr<N>` sibling, or any path under `/tmp`. These are the disk-leak patterns from #2843 and have repeatedly filled the root FS.
+
 **Why structured comments, not `gh pr review --approve`:** the authenticated GH user is the PR author (the same user opened the PR via `/do` and now reviews it). GitHub disallows author self-approval, so `gh pr review --approve` is silently downgraded to a comment by `gh`. Instead, each reviewer posts a structured comment with a verdict marker that `/review-pr` parses in Step 6.
 
 **Verdict comment format** — each reviewer MUST post exactly one comment with this exact shape:
@@ -990,6 +994,28 @@ resolve under `~/data` and within the session prefix.
 
 **Never create worktrees at the repo root or outside `~/data`.** All worktrees
 must be under `~/data/$SESSION_ID/` to avoid polluting the shared checkout.
+
+**Forbidden scratch patterns (issue #2843 — hard requirement).** Every reviewer
+sub-agent (and any `/review`, `/spec-adhere`, `/review-fix` it invokes) is bound
+to `$REVIEWER_WORKTREE` and must NEVER create any of these observed disk-leak
+patterns — not in the repo tree, not as a `<repo>-pr<N>` sibling, not under `/tmp`:
+
+- `.review-data/`
+- `.review-worktrees/`
+- `.worktrees/`
+- `.copilot-tmp/`
+- `.opencode/worktrees/`
+- any path under `/tmp` (e.g. `/tmp/pr<N>-review`)
+
+These are the exact paths prior review cycles leaked (an 11 GB `/tmp/pr2797-review`
+near-OOM'd the root FS). On every exit path — including the Step 7 cleanup of
+`WORKTREE_BASE` — assert the repo tree is clean:
+
+```bash
+assert_no_repo_tree_scratch "$REPO_ROOT" || {
+  echo "Reviewer scratch leaked into the repo tree or a sibling — clean it now." >&2
+}
+```
 
 ## Branch protection
 

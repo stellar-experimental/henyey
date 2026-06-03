@@ -17,7 +17,20 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 REVIEW_PR_SKILL="$REPO_ROOT/.github/skills/review-pr/SKILL.md"
 PLAN_SKILL="$REPO_ROOT/.github/skills/plan/SKILL.md"
+DO_SKILL="$REPO_ROOT/.github/skills/do/SKILL.md"
 CONTRACT_HELPER="$REPO_ROOT/scripts/lib/agent-worktree-contract.sh"
+
+# Observed disk-leak scratch patterns (issue #2843). These are out-of-~/data
+# scratch dirs that prior /do, /review-pr, and /plan runs created. Every skill
+# that spawns sub-agents must explicitly forbid these, and the detection guard
+# (assert_no_repo_tree_scratch) must recognize them as leaks.
+LEAK_PATTERNS=(
+  ".review-data"
+  ".review-worktrees"
+  ".worktrees"
+  ".copilot-tmp"
+  ".opencode/worktrees"
+)
 
 PASS=0
 FAIL=0
@@ -1091,6 +1104,229 @@ STUB
 }
 
 # --------------------------------------------------------------------------
+# Test: do_bootstrap rejects hostile WORKTREE_BASE/CARGO_TARGET_DIR, sibling
+# prefixes, and cross-session bases; clears stale DO_WORKTREE on failure.
+# --------------------------------------------------------------------------
+test_do_bootstrap_rejects_hostile_and_sibling_paths() {
+  local desc="do_bootstrap rejects hostile and sibling paths"
+
+  local real_home
+  real_home="$(_test_real_home)"
+
+  # Hostile absolute WORKTREE_BASE outside ~/data
+  local output
+  if output=$(WORKTREE_BASE="/tmp/evil" CARGO_TARGET_DIR="" CLAUDE_SESSION_ID="test-session" \
+    bash -c "source '$CONTRACT_HELPER' && do_bootstrap 999" 2>&1); then
+    tap_not_ok "$desc (hostile base)" "Should have failed but succeeded: $output"
+    return
+  fi
+
+  # Traversal escaping ~/data
+  if output=$(WORKTREE_BASE="$HOME/data/../escape" CARGO_TARGET_DIR="" CLAUDE_SESSION_ID="test-session" \
+    bash -c "source '$CONTRACT_HELPER' && do_bootstrap 999" 2>&1); then
+    tap_not_ok "$desc (traversal)" "Should have failed but succeeded: $output"
+    return
+  fi
+
+  # Sibling-prefix ~/data-evil
+  if output=$(WORKTREE_BASE="$HOME/data-evil/do-999" CARGO_TARGET_DIR="" CLAUDE_SESSION_ID="test-session" \
+    bash -c "source '$CONTRACT_HELPER' && do_bootstrap 999" 2>&1); then
+    tap_not_ok "$desc (sibling prefix)" "Should have failed but succeeded: $output"
+    return
+  fi
+
+  # Hostile CARGO_TARGET_DIR with valid base
+  if output=$(WORKTREE_BASE="$real_home/data/test-session/do-999" \
+    CARGO_TARGET_DIR="/tmp/evil-cargo" CLAUDE_SESSION_ID="test-session" \
+    bash -c "source '$CONTRACT_HELPER' && do_bootstrap 999" 2>&1); then
+    tap_not_ok "$desc (hostile cargo)" "Should have failed but succeeded: $output"
+    return
+  fi
+
+  # Cross-session base under ~/data but wrong session prefix
+  if output=$(WORKTREE_BASE="$real_home/data/other-session/do-999" \
+    CARGO_TARGET_DIR="" CLAUDE_SESSION_ID="test-session" \
+    bash -c "source '$CONTRACT_HELPER' && do_bootstrap 999" 2>&1); then
+    tap_not_ok "$desc (cross-session)" "Should have failed but succeeded: $output"
+    return
+  fi
+
+  # Stale-env escape: stale DO_WORKTREE must be cleared after a rejection
+  output=$(DO_WORKTREE="/tmp/stale-do" \
+    WORKTREE_BASE="/tmp/evil-base" \
+    CARGO_TARGET_DIR="" \
+    CLAUDE_SESSION_ID="test-session" \
+    bash -c '
+      source "'"$CONTRACT_HELPER"'"
+      do_bootstrap 999
+      rc=$?
+      echo "rc=$rc"
+      echo "DO_WORKTREE=${DO_WORKTREE:-EMPTY}"
+    ' 2>&1)
+  if ! echo "$output" | grep -q "rc=1"; then
+    tap_not_ok "$desc (stale-clear rc)" "Expected rc=1, got: $output"
+    return
+  fi
+  if echo "$output" | grep -q "DO_WORKTREE=/tmp/stale-do"; then
+    tap_not_ok "$desc (stale-clear)" "DO_WORKTREE retained stale value: $output"
+    return
+  fi
+  if ! echo "$output" | grep -q "DO_WORKTREE=EMPTY"; then
+    tap_not_ok "$desc (stale-clear empty)" "DO_WORKTREE not cleared: $output"
+    return
+  fi
+
+  tap_ok "$desc"
+}
+
+# --------------------------------------------------------------------------
+# Test: do_bootstrap default layout resolves under ~/data/<session>/do-<issue>
+# --------------------------------------------------------------------------
+test_do_bootstrap_default_under_home_data() {
+  local desc="do_bootstrap default layout under HOME/data/<session>/do-<issue>"
+
+  local output
+  if ! output=$(WORKTREE_BASE="" CARGO_TARGET_DIR="" CLAUDE_SESSION_ID="default-test" \
+    bash -c "source '$CONTRACT_HELPER' && do_bootstrap 55 && echo \$WORKTREE_BASE && echo \$CARGO_TARGET_DIR && echo \$DO_WORKTREE" 2>&1); then
+    tap_not_ok "$desc" "Default do_bootstrap failed: $output"
+    return
+  fi
+
+  local home_data
+  home_data="$(source "$CONTRACT_HELPER" && canonicalize_contract_path "$HOME/data")"
+  local line
+  while IFS= read -r line; do
+    if [[ -n "$line" && "$line" != "$home_data" && "$line" != "$home_data/"* ]]; then
+      tap_not_ok "$desc" "Path escapes \$HOME/data: $line"
+      return
+    fi
+  done <<< "$output"
+
+  if ! echo "$output" | grep -q "data/default-test/do-55"; then
+    tap_not_ok "$desc" "Layout missing expected session/do structure: $output"
+    return
+  fi
+  # DO_WORKTREE must be the worktree subdir, not the bare base.
+  if ! echo "$output" | grep -q "data/default-test/do-55/worktree"; then
+    tap_not_ok "$desc" "DO_WORKTREE missing worktree subdir: $output"
+    return
+  fi
+
+  tap_ok "$desc"
+}
+
+# --------------------------------------------------------------------------
+# Test: /do uses the shared contract helper, not an in-repo worktree
+# --------------------------------------------------------------------------
+test_do_skill_uses_contract_helper_not_repo_tree() {
+  local desc="do/SKILL.md uses do_bootstrap and no in-repo worktree"
+
+  if [[ ! -f "$DO_SKILL" ]]; then
+    tap_not_ok "$desc" "do/SKILL.md not found at $DO_SKILL"
+    return
+  fi
+
+  # Must reference the shared helper bootstrap.
+  if ! grep -q 'do_bootstrap' "$DO_SKILL"; then
+    tap_not_ok "$desc" "do/SKILL.md does not reference do_bootstrap"
+    return
+  fi
+  if ! grep -q 'agent-worktree-contract.sh' "$DO_SKILL"; then
+    tap_not_ok "$desc" "do/SKILL.md does not source the contract helper"
+    return
+  fi
+
+  # Must NOT create a worktree inside the repo tree ($REPO_ROOT/data/do-...).
+  if grep -Eq 'REPO_ROOT/data/do-' "$DO_SKILL"; then
+    tap_not_ok "$desc" "do/SKILL.md still references in-repo \$REPO_ROOT/data/do- worktree"
+    return
+  fi
+
+  tap_ok "$desc"
+}
+
+# --------------------------------------------------------------------------
+# Test: every spawning skill enumerates the observed forbidden leak patterns
+# --------------------------------------------------------------------------
+test_skill_prompts_forbid_known_leak_patterns() {
+  local desc="skill prompts forbid all observed leak patterns"
+
+  local skill_file pat missing
+  for skill_file in "$DO_SKILL" "$PLAN_SKILL" "$REVIEW_PR_SKILL"; do
+    if [[ ! -f "$skill_file" ]]; then
+      tap_not_ok "$desc" "Skill file not found: $skill_file"
+      return
+    fi
+    for pat in "${LEAK_PATTERNS[@]}"; do
+      if ! grep -qF "$pat" "$skill_file"; then
+        tap_not_ok "$desc" "$skill_file does not forbid leak pattern '$pat'"
+        return
+      fi
+    done
+    # Also require an explicit /tmp prohibition.
+    if ! grep -qF '/tmp' "$skill_file"; then
+      tap_not_ok "$desc" "$skill_file does not mention forbidden /tmp scratch"
+      return
+    fi
+    missing=""
+  done
+  : "${missing:-}"
+
+  tap_ok "$desc"
+}
+
+# --------------------------------------------------------------------------
+# Test: assert_no_repo_tree_scratch detects planted leak dirs, passes clean tree
+# --------------------------------------------------------------------------
+test_assert_no_repo_tree_scratch_detects_leak_dirs() {
+  local desc="assert_no_repo_tree_scratch detects leak dirs and passes clean tree"
+
+  local fixture
+  fixture="$(mktemp -d)"
+  # Build a fake repo tree.
+  mkdir -p "$fixture/repo/crates/foo"
+  touch "$fixture/repo/crates/foo/lib.rs"
+
+  # Clean tree → guard must return 0.
+  local output
+  if ! output=$(source "$CONTRACT_HELPER" && assert_no_repo_tree_scratch "$fixture/repo" 2>&1); then
+    rm -rf "$fixture"
+    tap_not_ok "$desc (clean)" "Guard failed on clean tree: $output"
+    return
+  fi
+
+  # Plant a leak dir → guard must return non-zero AND name the offender.
+  mkdir -p "$fixture/repo/.review-data/pr1/target"
+  if output=$(source "$CONTRACT_HELPER" && assert_no_repo_tree_scratch "$fixture/repo" 2>&1); then
+    rm -rf "$fixture"
+    tap_not_ok "$desc (planted)" "Guard passed despite planted .review-data: $output"
+    return
+  fi
+  if ! echo "$output" | grep -qF ".review-data"; then
+    rm -rf "$fixture"
+    tap_not_ok "$desc (names offender)" "Guard did not name the offender: $output"
+    return
+  fi
+
+  # Remove the leak, plant a sibling-prefixed worktree (<basename>-pr<N>).
+  rm -rf "$fixture/repo/.review-data"
+  mkdir -p "$fixture/repo-pr42/target"
+  if output=$(source "$CONTRACT_HELPER" && assert_no_repo_tree_scratch "$fixture/repo" 2>&1); then
+    rm -rf "$fixture"
+    tap_not_ok "$desc (sibling)" "Guard passed despite sibling repo-pr42: $output"
+    return
+  fi
+  if ! echo "$output" | grep -qF "repo-pr42"; then
+    rm -rf "$fixture"
+    tap_not_ok "$desc (names sibling)" "Guard did not name the sibling offender: $output"
+    return
+  fi
+
+  rm -rf "$fixture"
+  tap_ok "$desc"
+}
+
+# --------------------------------------------------------------------------
 # Run all tests
 # --------------------------------------------------------------------------
 echo "TAP version 13"
@@ -1118,6 +1354,11 @@ test_bootstraps_fallback_when_realpath_is_missing
 test_bootstraps_fallback_when_realpath_rejects_dash_m
 test_symlinked_home_alias_overrides_are_accepted
 test_poisoned_python_on_path_ignored
+test_do_bootstrap_rejects_hostile_and_sibling_paths
+test_do_bootstrap_default_under_home_data
+test_do_skill_uses_contract_helper_not_repo_tree
+test_skill_prompts_forbid_known_leak_patterns
+test_assert_no_repo_tree_scratch_detects_leak_dirs
 
 echo "1..$TEST_NUM"
 echo "# pass: $PASS"
