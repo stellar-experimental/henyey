@@ -393,6 +393,63 @@ fn test_conservation_inflation_branch_balanced() {
 }
 
 #[test]
+fn test_conservation_mismatched_update_lengths_fail_fast() {
+    // #2997: `updated` and `update_states` must be parallel. If their lengths
+    // diverge, the invariant must error early rather than silently truncating
+    // the longer slice via `zip` (which would skip the trailing entries and
+    // could mask a real imbalance). Build a divergent delta directly, bypassing
+    // the lockstep `DeltaBuilder` helper.
+    let inv = ConservationOfLumens::new();
+    let h = header(1_000_000, 0);
+    let network_id = [0u8; 32];
+    let deleted_keys: Vec<stellar_xdr::curr::LedgerKey> = vec![];
+
+    // Two post-states but only one pre-state → length divergence.
+    let updated = vec![account_entry(2, 500), account_entry(3, 2500)];
+    let update_states = vec![account_entry(2, 1000)];
+
+    let delta = OperationDelta {
+        created: &[],
+        updated: &updated,
+        update_states: &update_states,
+        deleted: &deleted_keys,
+        delete_states: &[],
+        ledger_seq: 100,
+        ledger_version: 24,
+        header_current: Some(&h),
+        header_previous: Some(&h),
+        network_id: &network_id,
+    };
+    let res = inv.check_on_operation_apply(&dummy_op(), &payment_result(), &delta, &[]);
+    let err = res.expect_err("mismatched updated/update_states lengths must fail fast");
+    assert!(
+        err.contains("updated") && err.contains("update_states"),
+        "unexpected message: {err}"
+    );
+}
+
+#[test]
+fn test_conservation_inflation_payout_sum_overflow_detected() {
+    // #2998: the inflation-payout sum must use checked accumulation. Two payouts
+    // each near i64::MAX overflow the sum; this must surface a detectable error
+    // rather than silently wrapping to a misleading value.
+    let inv = ConservationOfLumens::new();
+    let prev = header(1_000_000, 0);
+    let curr = header(1_000_000, 0);
+    let res = DeltaBuilder::new().check(
+        &inv,
+        &inflation_result(vec![(2, i64::MAX), (3, i64::MAX)]),
+        Some(&curr),
+        Some(&prev),
+    );
+    let err = res.expect_err("overflowing inflation payout sum must fail");
+    assert!(
+        err.contains("Overflow") && err.contains("inflation payouts"),
+        "unexpected message: {err}"
+    );
+}
+
+#[test]
 fn test_conservation_manager_registers_and_enables() {
     let mut mgr = InvariantManager::new();
     mgr.register(Arc::new(ConservationOfLumens::new()));
