@@ -6784,10 +6784,44 @@ mod tests {
             "externalized slot should return non-empty externalizing state"
         );
 
-        // All returned envelopes should be for the correct slot.
+        // The externalizing snapshot is the EXTERNALIZE-phase state, not the
+        // full set of recorded envelopes: every returned statement must be an
+        // EXTERNALIZE pledge (matching stellar-core's getExternalizingState,
+        // which returns only the commit-phase envelopes that justify the slot's
+        // externalization). This is the property that distinguishes the
+        // accessor from get_scp_envelopes(), which returns all recorded
+        // envelopes (nominate/prepare/confirm/externalize) for the slot.
         for env in &state {
-            assert_eq!(env.statement.slot_index, tracking);
+            assert_eq!(
+                env.statement.slot_index, tracking,
+                "externalizing envelope should be for the externalized slot"
+            );
+            assert!(
+                matches!(env.statement.pledges, ScpStatementPledges::Externalize(_)),
+                "externalizing state should contain only EXTERNALIZE pledges, \
+                 got {:?}",
+                env.statement.pledges
+            );
         }
+
+        // The externalizing-state accessor returns a different view than
+        // get_scp_envelopes(): get_scp_envelopes() returns the slot's recorded
+        // envelopes (here, the single received EXTERNALIZE), whereas the
+        // externalizing state additionally includes the local node's own
+        // commit-phase envelope synthesized when the slot externalizes — so the
+        // two collections are not identical. Asserting they differ is what
+        // validates the accessor is the externalizing snapshot and not a thin
+        // alias for the recorded-envelope set.
+        let all_envelopes = herder.get_scp_envelopes(tracking);
+        assert!(
+            !all_envelopes.is_empty(),
+            "externalized slot should have recorded envelopes"
+        );
+        assert_ne!(
+            state, all_envelopes,
+            "externalizing state should differ from the full recorded-envelope \
+             set (it is the EXTERNALIZE-phase snapshot, not all envelopes)"
+        );
     }
 
     /// get_currently_tracked_quorum() returns hash→qset pairs for all tracked
