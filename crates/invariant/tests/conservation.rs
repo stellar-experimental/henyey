@@ -12,11 +12,13 @@ use henyey_invariant::{ConservationOfLumens, Invariant, InvariantManager, Operat
 use stellar_xdr::curr::{
     AccountEntry, AccountEntryExt, AccountId, AlphaNum4, Asset, AssetCode4, ClaimPredicate,
     ClaimableBalanceEntry, ClaimableBalanceEntryExt, ClaimableBalanceId, Claimant, ClaimantV0,
-    Hash, InflationResult, LedgerEntry, LedgerEntryData, LedgerEntryExt, LedgerHeader,
-    LedgerHeaderExt, LiquidityPoolConstantProductParameters, LiquidityPoolEntry,
-    LiquidityPoolEntryBody, LiquidityPoolEntryConstantProduct, Operation, OperationBody,
-    OperationResult, OperationResultTr, PoolId, PublicKey, SequenceNumber, StellarValue,
-    StellarValueExt, String32, Thresholds, TimePoint, Uint256, VecM,
+    ContractDataDurability, ContractDataEntry, ContractId, ContractIdPreimage, ExtensionPoint,
+    Hash, HashIdPreimage, HashIdPreimageContractId, InflationResult, Int128Parts, LedgerEntry,
+    LedgerEntryData, LedgerEntryExt, LedgerHeader, LedgerHeaderExt,
+    LiquidityPoolConstantProductParameters, LiquidityPoolEntry, LiquidityPoolEntryBody,
+    LiquidityPoolEntryConstantProduct, Operation, OperationBody, OperationResult,
+    OperationResultTr, PoolId, PublicKey, ScAddress, ScMap, ScMapEntry, ScSymbol, ScVal, ScVec,
+    SequenceNumber, StellarValue, StellarValueExt, String32, Thresholds, TimePoint, Uint256, VecM,
 };
 
 // ---------------------------------------------------------------------------
@@ -99,6 +101,63 @@ fn liquidity_pool_entry(
             ),
         }),
         ext: LedgerEntryExt::V0,
+    }
+}
+
+/// Derives the native-XLM Stellar-Asset-Contract id for a given network id,
+/// mirroring stellar-core's `getAssetContractID(networkID, Asset::Native)`.
+fn native_sac_contract_id(network_id: &[u8; 32]) -> ContractId {
+    let preimage = HashIdPreimage::ContractId(HashIdPreimageContractId {
+        network_id: Hash(*network_id),
+        contract_id_preimage: ContractIdPreimage::Asset(Asset::Native),
+    });
+    let hash = henyey_common::Hash256::hash_xdr(&preimage);
+    ContractId(Hash(hash.0))
+}
+
+fn symbol_scval(s: &str) -> ScVal {
+    ScVal::Symbol(ScSymbol(s.as_bytes().to_vec().try_into().unwrap()))
+}
+
+/// Builds a SAC native-balance `ContractData` entry for `network_id` holding
+/// `amount`, keyed as core's `getAssetBalance` CONTRACT_DATA branch expects:
+/// `contract == Contract(nativeSacId)`, `key == Vec[Symbol("Balance"), Account(holder)]`,
+/// `val == Map{ "amount" => I128(parts) }`.
+fn sac_native_balance_entry(network_id: &[u8; 32], holder: u8, parts: Int128Parts) -> LedgerEntry {
+    let key = ScVal::Vec(Some(ScVec(
+        vec![
+            symbol_scval("Balance"),
+            ScVal::Address(ScAddress::Account(account_id(holder))),
+        ]
+        .try_into()
+        .unwrap(),
+    )));
+    let val = ScVal::Map(Some(ScMap(
+        vec![ScMapEntry {
+            key: symbol_scval("amount"),
+            val: ScVal::I128(parts),
+        }]
+        .try_into()
+        .unwrap(),
+    )));
+    LedgerEntry {
+        last_modified_ledger_seq: 1,
+        data: LedgerEntryData::ContractData(ContractDataEntry {
+            ext: ExtensionPoint::V0,
+            contract: ScAddress::Contract(native_sac_contract_id(network_id)),
+            key,
+            durability: ContractDataDurability::Persistent,
+            val,
+        }),
+        ext: LedgerEntryExt::V0,
+    }
+}
+
+/// `Int128Parts` for a non-negative `i64` amount (hi = 0).
+fn i128_amount(amount: i64) -> Int128Parts {
+    Int128Parts {
+        hi: 0,
+        lo: amount as u64,
     }
 }
 
@@ -335,6 +394,156 @@ fn test_conservation_liquidity_pool_native_leg() {
         )
         .check(&inv, &payment_result(), Some(&h), Some(&h));
     assert!(bad.is_err(), "unmatched LP native-leg change should fail");
+}
+
+// ---------------------------------------------------------------------------
+// SAC ContractData native balances (#2987)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_conservation_sac_native_transfer_account_to_contract() {
+    let inv = ConservationOfLumens::new();
+    let h = header(1_000_000, 0);
+    let net = [0u8; 32]; // matches DeltaBuilder::check's network_id
+                         // Account debited 500; an offsetting SAC native-balance ContractData entry
+                         // of 500 is created → net delta 0. (On origin/main the ContractData credit
+                         // is uncounted → delta -500 → false-alarm violation.)
+    let ok = DeltaBuilder::new()
+        .updated(account_entry(2, 1000), account_entry(2, 500))
+        .created(sac_native_balance_entry(&net, 2, i128_amount(500)))
+        .check(&inv, &payment_result(), Some(&h), Some(&h));
+    assert!(
+        ok.is_ok(),
+        "balanced Account→Contract SAC transfer should hold: {ok:?}"
+    );
+
+    // Unbalanced: account debited 500, SAC credited only 300 → delta -200.
+    let bad = DeltaBuilder::new()
+        .updated(account_entry(2, 1000), account_entry(2, 500))
+        .created(sac_native_balance_entry(&net, 2, i128_amount(300)))
+        .check(&inv, &payment_result(), Some(&h), Some(&h));
+    assert!(bad.is_err(), "unbalanced SAC transfer should fail");
+}
+
+#[test]
+fn test_conservation_sac_native_transfer_contract_to_account() {
+    let inv = ConservationOfLumens::new();
+    let h = header(1_000_000, 0);
+    let net = [0u8; 32];
+    // SAC balance drops 1000 → 400 (−600); account credited +600 → net 0.
+    let ok = DeltaBuilder::new()
+        .updated(
+            sac_native_balance_entry(&net, 2, i128_amount(1000)),
+            sac_native_balance_entry(&net, 2, i128_amount(400)),
+        )
+        .updated(account_entry(3, 2000), account_entry(3, 2600))
+        .check(&inv, &payment_result(), Some(&h), Some(&h));
+    assert!(
+        ok.is_ok(),
+        "balanced Contract→Account SAC transfer should hold: {ok:?}"
+    );
+}
+
+#[test]
+fn test_conservation_sac_unrelated_contract_id_ignored() {
+    let inv = ConservationOfLumens::new();
+    let h = header(1_000_000, 0);
+    let net = [0u8; 32];
+    // A ContractData entry under a WRONG contract id (not the native SAC id)
+    // contributes 0, so a standalone create does not perturb conservation.
+    let mut entry = sac_native_balance_entry(&net, 2, i128_amount(500));
+    if let LedgerEntryData::ContractData(cd) = &mut entry.data {
+        cd.contract = ScAddress::Contract(ContractId(Hash([0x42; 32])));
+    }
+    let ok = DeltaBuilder::new()
+        .created(entry)
+        .check(&inv, &payment_result(), Some(&h), Some(&h));
+    assert!(
+        ok.is_ok(),
+        "ContractData under non-native contract id must contribute 0: {ok:?}"
+    );
+}
+
+#[test]
+fn test_conservation_sac_malformed_key_or_val_ignored() {
+    let inv = ConservationOfLumens::new();
+    let h = header(1_000_000, 0);
+    let net = [0u8; 32];
+
+    // Correct native contract id but wrong key first symbol ("NotBalance").
+    let mut bad_key = sac_native_balance_entry(&net, 2, i128_amount(500));
+    if let LedgerEntryData::ContractData(cd) = &mut bad_key.data {
+        cd.key = ScVal::Vec(Some(ScVec(
+            vec![symbol_scval("NotBalance")].try_into().unwrap(),
+        )));
+    }
+    let ok_key =
+        DeltaBuilder::new()
+            .created(bad_key)
+            .check(&inv, &payment_result(), Some(&h), Some(&h));
+    assert!(
+        ok_key.is_ok(),
+        "wrong key symbol must contribute 0: {ok_key:?}"
+    );
+
+    // Correct native contract id and key, but the amount is not an I128.
+    let mut bad_val = sac_native_balance_entry(&net, 2, i128_amount(500));
+    if let LedgerEntryData::ContractData(cd) = &mut bad_val.data {
+        cd.val = ScVal::Map(Some(ScMap(
+            vec![ScMapEntry {
+                key: symbol_scval("amount"),
+                val: ScVal::U32(500),
+            }]
+            .try_into()
+            .unwrap(),
+        )));
+    }
+    let ok_val =
+        DeltaBuilder::new()
+            .created(bad_val)
+            .check(&inv, &payment_result(), Some(&h), Some(&h));
+    assert!(
+        ok_val.is_ok(),
+        "non-i128 amount must contribute 0 (not an error): {ok_val:?}"
+    );
+}
+
+#[test]
+fn test_conservation_sac_i128_overflow_detected() {
+    let inv = ConservationOfLumens::new();
+    let h = header(1_000_000, 0);
+    let net = [0u8; 32];
+
+    // hi > 0 → out of i64 range → distinct overflow error.
+    let hi_overflow = sac_native_balance_entry(&net, 2, Int128Parts { hi: 1, lo: 0 });
+    let res_hi =
+        DeltaBuilder::new()
+            .created(hi_overflow)
+            .check(&inv, &payment_result(), Some(&h), Some(&h));
+    let err_hi = res_hi.expect_err("hi>0 SAC amount must fail the invariant");
+    assert_eq!(
+        err_hi, "Could not calculate lumen balance delta for an entry",
+        "unexpected message: {err_hi}"
+    );
+
+    // lo > i64::MAX (hi == 0) → also out of range.
+    let lo_overflow = sac_native_balance_entry(
+        &net,
+        2,
+        Int128Parts {
+            hi: 0,
+            lo: i64::MAX as u64 + 1,
+        },
+    );
+    let res_lo =
+        DeltaBuilder::new()
+            .created(lo_overflow)
+            .check(&inv, &payment_result(), Some(&h), Some(&h));
+    let err_lo = res_lo.expect_err("lo>i64::MAX SAC amount must fail the invariant");
+    assert_eq!(
+        err_lo, "Could not calculate lumen balance delta for an entry",
+        "unexpected message: {err_lo}"
+    );
 }
 
 #[test]
