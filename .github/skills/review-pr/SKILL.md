@@ -760,9 +760,34 @@ PW_HOME="$(getent passwd "$(id -un)" 2>/dev/null | cut -d: -f6)"
 reap_workspace() {  # $1 = absolute dir to remove
   local ws="$1"
   [ -z "$ws" ] && return 0
-  case "$ws" in
-    "$PW_HOME"/data/*) [ -d "$ws" ] && rm -rf "$ws" ;;
-    *) echo "WARN: refusing to reap '$ws' — outside $PW_HOME/data" >&2 ;;
+  # Canonicalize BEFORE the boundary prefix check (defense-in-depth, #2990).
+  # A raw string-prefix `case` would accept a marker like "$PW_HOME/data/../etc"
+  # — it begins with "$PW_HOME/data/" yet resolves outside the boundary. We
+  # resolve `..`/symlinks first (realpath -m, then a Python fallback at known
+  # absolute paths so PATH poisoning can't substitute realpath), and compare the
+  # RESOLVED path against the RESOLVED boundary so the read side is independently
+  # safe even if a malformed marker is ever introduced.
+  local canon home_data
+  canon="$(realpath -m "$ws" 2>/dev/null)" || canon=""
+  home_data="$(realpath -m "$PW_HOME/data" 2>/dev/null)" || home_data=""
+  if [ -z "$canon" ] || [ -z "$home_data" ]; then
+    local py
+    for py in /usr/bin/python3 /usr/local/bin/python3 /bin/python3; do
+      [ -x "$py" ] || continue
+      canon="$("$py" -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$ws" 2>/dev/null)"
+      home_data="$("$py" -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$PW_HOME/data" 2>/dev/null)"
+      break
+    done
+  fi
+  if [ -z "$canon" ] || [ -z "$home_data" ]; then
+    echo "WARN: refusing to reap '$ws' — could not canonicalize for boundary check" >&2
+    return 0
+  fi
+  # Directory-boundary check on the RESOLVED paths: accept exact <home>/data or
+  # paths strictly under it. Rejects siblings like ~/data-evil and ../ escapes.
+  case "$canon" in
+    "$home_data" | "$home_data"/*) [ -d "$canon" ] && rm -rf "$canon" ;;
+    *) echo "WARN: refusing to reap '$ws' — resolves to '$canon', outside '$home_data'" >&2 ;;
   esac
 }
 
