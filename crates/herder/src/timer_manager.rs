@@ -618,6 +618,8 @@ mod tests {
     struct TestCallback {
         nomination_fired: AtomicU64,
         ballot_fired: AtomicU64,
+        /// Slot of the most recent trigger-next-ledger callback (#2702).
+        trigger_fired: AtomicU64,
         /// Epoch carried by the most recent nomination callback. Sentinel
         /// `u64::MAX` means "no nomination has fired yet".
         last_nomination_epoch: AtomicU64,
@@ -631,6 +633,7 @@ mod tests {
             Self {
                 nomination_fired: AtomicU64::new(0),
                 ballot_fired: AtomicU64::new(0),
+                trigger_fired: AtomicU64::new(0),
                 last_nomination_epoch: AtomicU64::new(u64::MAX),
                 last_ballot_epoch: AtomicU64::new(u64::MAX),
             }
@@ -647,6 +650,114 @@ mod tests {
             self.ballot_fired.store(slot, Ordering::SeqCst);
             self.last_ballot_epoch.store(epoch, Ordering::SeqCst);
         }
+
+        fn on_trigger_next_ledger(&self, slot: SlotIndex, _epoch: u64) {
+            self.trigger_fired.store(slot, Ordering::SeqCst);
+        }
+    }
+
+    /// #2702: the event-driven consensus trigger timer (`TriggerNextLedger`)
+    /// must fire its callback after the scheduled duration. Fails to compile on
+    /// pre-#2702 main because `TimerType::TriggerNextLedger`,
+    /// `schedule_trigger_next_ledger`, and `on_trigger_next_ledger` do not exist.
+    #[tokio::test]
+    async fn test_trigger_next_ledger_fires() {
+        let callback = Arc::new(TestCallback::new());
+        let (handle, manager) = TimerManager::new(callback.clone(), Arc::new(AtomicU64::new(0)));
+
+        let manager_task = tokio::spawn(manager.run());
+
+        handle
+            .schedule_trigger_next_ledger(7, Duration::from_millis(50))
+            .await;
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        assert_eq!(callback.trigger_fired.load(Ordering::SeqCst), 7);
+
+        handle.shutdown().await;
+        let _ = timeout(Duration::from_millis(100), manager_task).await;
+    }
+
+    /// #2702: rescheduling the trigger timer cancels the prior arming, and
+    /// `cancel_trigger_next_ledger` prevents an armed trigger from firing.
+    #[tokio::test]
+    async fn test_trigger_next_ledger_cancel_prevents_firing() {
+        let callback = Arc::new(TestCallback::new());
+        let (handle, manager) = TimerManager::new(callback.clone(), Arc::new(AtomicU64::new(0)));
+
+        let manager_task = tokio::spawn(manager.run());
+
+        handle
+            .schedule_trigger_next_ledger(9, Duration::from_millis(100))
+            .await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        handle.cancel_trigger_next_ledger(9).await;
+
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        assert_eq!(callback.trigger_fired.load(Ordering::SeqCst), 0);
+
+        handle.shutdown().await;
+        let _ = timeout(Duration::from_millis(100), manager_task).await;
+    }
+
+    /// #2702: a trigger timer is independent of the nomination/ballot timers for
+    /// the same slot — cancelling the trigger leaves SCP timers intact and vice
+    /// versa, and `cancel_slot_timers` / `cancel_all_timers` / `purge_old_slots`
+    /// all account for the trigger variant.
+    #[tokio::test]
+    async fn test_trigger_next_ledger_independent_of_scp_timers() {
+        let callback = Arc::new(TestCallback::new());
+        let (handle, manager) = TimerManager::new(callback.clone(), Arc::new(AtomicU64::new(0)));
+
+        let manager_task = tokio::spawn(manager.run());
+
+        // Arm both a nomination timer and a trigger timer for slot 5.
+        handle
+            .schedule_nomination_timeout(5, Duration::from_millis(60))
+            .await;
+        handle
+            .schedule_trigger_next_ledger(5, Duration::from_millis(60))
+            .await;
+        // Cancelling just the trigger leaves the nomination timer to fire.
+        handle.cancel_trigger_next_ledger(5).await;
+
+        tokio::time::sleep(Duration::from_millis(120)).await;
+
+        assert_eq!(callback.nomination_fired.load(Ordering::SeqCst), 5);
+        assert_eq!(callback.trigger_fired.load(Ordering::SeqCst), 0);
+
+        handle.shutdown().await;
+        let _ = timeout(Duration::from_millis(100), manager_task).await;
+    }
+
+    /// #2702: `cancel_all_timers` and `purge_old_slots` must remove trigger
+    /// timers along with SCP timers.
+    #[tokio::test]
+    async fn test_trigger_next_ledger_purged_by_cancel_all_and_purge() {
+        let callback = Arc::new(TestCallback::new());
+        let (handle, manager) = TimerManager::new(callback.clone(), Arc::new(AtomicU64::new(0)));
+        let manager_task = tokio::spawn(manager.run());
+
+        // purge_old_slots removes a stale trigger timer.
+        handle
+            .schedule_trigger_next_ledger(3, Duration::from_millis(80))
+            .await;
+        handle.purge_old_slots(10).await;
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        assert_eq!(callback.trigger_fired.load(Ordering::SeqCst), 0);
+
+        // cancel_all_timers removes a live trigger timer.
+        handle
+            .schedule_trigger_next_ledger(11, Duration::from_millis(80))
+            .await;
+        handle.cancel_all_timers().await;
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        assert_eq!(callback.trigger_fired.load(Ordering::SeqCst), 0);
+
+        handle.shutdown().await;
+        let _ = timeout(Duration::from_millis(100), manager_task).await;
     }
 
     #[tokio::test]
