@@ -268,33 +268,6 @@ impl TimerManagerHandle {
         }
     }
 
-    /// Schedule the consensus trigger timer (non-blocking). Used from the
-    /// synchronous post-close / cold-start arming paths (#2702).
-    pub fn schedule_trigger_next_ledger_nonblocking(&self, slot: SlotIndex, duration: Duration) {
-        if self
-            .sender
-            .send(TimerCommand::ScheduleTriggerNextLedger {
-                slot,
-                duration,
-                epoch: None,
-            })
-            .is_err()
-        {
-            tracing::warn!(slot, "timer channel closed: schedule trigger dropped");
-        }
-    }
-
-    /// Cancel the consensus trigger timer for a slot (non-blocking) (#2702).
-    pub fn cancel_trigger_next_ledger_nonblocking(&self, slot: SlotIndex) {
-        if self
-            .sender
-            .send(TimerCommand::CancelTriggerNextLedger { slot })
-            .is_err()
-        {
-            tracing::warn!(slot, "timer channel closed: cancel trigger dropped");
-        }
-    }
-
     /// Cancel all timers for a slot (non-blocking).
     pub fn cancel_slot_timers_nonblocking(&self, slot: SlotIndex) {
         if self
