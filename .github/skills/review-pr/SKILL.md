@@ -763,13 +763,20 @@ reap_workspace() {  # $1 = absolute dir to remove
   # Canonicalize BEFORE the boundary prefix check (defense-in-depth, #2990).
   # A raw string-prefix `case` would accept a marker like "$PW_HOME/data/../etc"
   # — it begins with "$PW_HOME/data/" yet resolves outside the boundary. We
-  # resolve `..`/symlinks first (realpath -m, then a Python fallback at known
-  # absolute paths so PATH poisoning can't substitute realpath), and compare the
-  # RESOLVED path against the RESOLVED boundary so the read side is independently
-  # safe even if a malformed marker is ever introduced.
-  local canon home_data
-  canon="$(realpath -m "$ws" 2>/dev/null)" || canon=""
-  home_data="$(realpath -m "$PW_HOME/data" 2>/dev/null)" || home_data=""
+  # resolve `..`/symlinks first (realpath -m at a KNOWN ABSOLUTE PATH — never a
+  # bare PATH lookup — then a Python fallback at known absolute paths so PATH
+  # poisoning can't substitute realpath/python3), and compare the RESOLVED path
+  # against the RESOLVED boundary so the read side is independently safe even if
+  # a malformed marker is ever introduced. A bare `realpath` on the fast path
+  # would defeat the hardening, since the Python fallback only runs when the
+  # fast path returns empty (matches the #3005 fix in agent-worktree-contract.sh).
+  local canon home_data rp
+  for rp in /usr/bin/realpath /bin/realpath /usr/local/bin/realpath; do
+    [ -x "$rp" ] || continue
+    canon="$("$rp" -m "$ws" 2>/dev/null)" || canon=""
+    home_data="$("$rp" -m "$PW_HOME/data" 2>/dev/null)" || home_data=""
+    [ -n "$canon" ] && [ -n "$home_data" ] && break
+  done
   if [ -z "$canon" ] || [ -z "$home_data" ]; then
     local py
     for py in /usr/bin/python3 /usr/local/bin/python3 /bin/python3; do
@@ -790,7 +797,7 @@ reap_workspace() {  # $1 = absolute dir to remove
   # against a canon that begins with a dash being parsed as an rm option.
   case "$canon" in
     "$home_data"/*) [ -d "$canon" ] && rm -rf -- "$canon" ;;
-    *) echo "WARN: refusing to reap '$ws' — resolves to '$canon', outside '$home_data/'" >&2 ;;
+    *) echo "WARN: refusing to reap '$ws' — resolves to '$canon', not strictly under '$home_data/' (the bare data root and any path outside it are both rejected)" >&2 ;;
   esac
 }
 
