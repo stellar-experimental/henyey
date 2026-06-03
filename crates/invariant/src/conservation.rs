@@ -137,7 +137,18 @@ impl Invariant for ConservationOfLumens {
         for entry in delta.created {
             accumulate(calculate_delta_balance(Some(entry), None))?;
         }
-        // Updated: (current, previous) pairs.
+        // Updated: (current, previous) pairs. `updated` and `update_states` are
+        // documented as parallel slices; a length divergence is a caller bug.
+        // Fail fast instead of letting `zip` silently truncate to the shorter
+        // slice (which would drop trailing entries and could mask a real
+        // imbalance). See #2997.
+        if delta.updated.len() != delta.update_states.len() {
+            return Err(format!(
+                "OperationDelta updated ({}) and update_states ({}) lengths diverge",
+                delta.updated.len(),
+                delta.update_states.len()
+            ));
+        }
         for (current, previous) in delta.updated.iter().zip(delta.update_states.iter()) {
             accumulate(calculate_delta_balance(Some(current), Some(previous)))?;
         }
@@ -165,10 +176,22 @@ impl Invariant for ConservationOfLumens {
 
         if is_inflation {
             // Retained for parity; dead in 24+ (inflation always NotTime/empty).
+            // Use checked accumulation so a pathological payout set (only
+            // reachable via tests / unexpected result variants) surfaces a
+            // detectable error rather than wrapping silently and producing a
+            // misleading invariant message. See #2998.
             let inflation_payouts: i64 = match op_result {
                 OperationResult::OpInner(OperationResultTr::Inflation(
                     stellar_xdr::curr::InflationResult::Success(payouts),
-                )) => payouts.iter().map(|p| p.amount).sum(),
+                )) => {
+                    let mut sum: i64 = 0;
+                    for p in payouts.iter() {
+                        sum = sum.checked_add(p.amount).ok_or_else(|| {
+                            "Overflow detected when summing inflation payouts".to_string()
+                        })?;
+                    }
+                    sum
+                }
                 _ => 0,
             };
 
@@ -180,6 +203,14 @@ impl Invariant for ConservationOfLumens {
                 ));
             }
             if delta_balances != inflation_payouts {
+                // #2999: "LedgerEntry account balances" is upstream-verbatim by
+                // design. `delta_balances` also covers native claimable-balance
+                // and the native leg of liquidity-pool reserves, but the wording
+                // is a byte-for-byte match to stellar-core's
+                // ConservationOfLumens.cpp error string (FMT_STRING at
+                // "LedgerEntry account balances change ({:d}) did not match
+                // inflation payouts ({:d})"). Rewording would deviate from
+                // message parity, so we keep the upstream phrasing intentionally.
                 return Err(format!(
                     "LedgerEntry account balances change ({}) did not match inflation payouts ({})",
                     delta_balances, inflation_payouts
@@ -199,6 +230,12 @@ impl Invariant for ConservationOfLumens {
                 ));
             }
             if delta_balances != 0 {
+                // #2999: "LedgerEntry account balances" is upstream-verbatim by
+                // design (covers native CB amounts and native LP reserve legs in
+                // addition to account balances). Byte-for-byte match to
+                // stellar-core's ConservationOfLumens.cpp FMT_STRING
+                // "LedgerEntry account balances changed by {:d} without
+                // inflation"; kept unchanged for message parity.
                 return Err(format!(
                     "LedgerEntry account balances changed by {} without inflation",
                     delta_balances
