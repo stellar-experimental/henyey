@@ -2,11 +2,11 @@
 
 **Spec version:** 26 (Overlay Protocol v38–v39)
 **Crate:** crates/overlay
-**Last updated:** 2026-05-28
-**Overall adherence:** 79%
+**Last updated:** 2026-06-03
+**Overall adherence:** 83%
 
 Counts (excluding Drift and N/A from denominator):
-**Full 78 | Partial 18 | Absent 3 | Drift 2 | N/A 2**
+**Full 82 | Partial 17 | Absent 0 | Drift 2 | N/A 2**
 
 ## Summary table
 
@@ -36,7 +36,7 @@ Counts (excluding Drift and N/A from denominator):
 | §7.1 | Dual-axis (msg+byte) flow control | Full | `flow_control.rs:308-439` |
 | §7.2 | `getFlowControlBytesTotal` auto-compute | Full | `flow_control.rs:119-135` |
 | §7.3 | begin/endMessageProcessing capacity bookkeeping | Full | `flow_control.rs:1021-1065` |
-| §7.3 | `releaseAssert(processed <= batch_size)` | Absent | Not enforced; release counter can drift |
+| §7.3 | `releaseAssert(processed <= batch_size)` | Full | `flow_control.rs:1045-1056` hard `assert!(flood_data_processed <= batch_size)` after the counter increment; message send-more uses `==` (bytes `>=`), mirroring `FlowControl.cpp:303-311` |
 | §7.4 | Reading throttling on total capacity | Full | `flow_control.rs:1068-1071, 1084-1094` |
 | §7.5 | Outbound priority queues (SCP/TX/Demand/Advert) | Full | `flow_control.rs:236-281,516-534` |
 | §7.5 | SCP queue trimming (slot floor + nomination/ballot replace) | Full | `flow_control.rs:826-927` |
@@ -68,7 +68,7 @@ Counts (excluding Drift and N/A from denominator):
 | §10.4 | Tick period 3 s (`PEER_AUTHENTICATION_TIMEOUT + 1`) | Full | `manager/tick.rs:26` |
 | §10.4 | DNS resolution every 600 s w/ linear backoff | Full | `manager/tick.rs:31-40,176-198` |
 | §10.4 | Random out-of-sync drop after 60 s | Partial | `manager/tick.rs:589-670` `maybe_drop_random_peer()` with `OUT_OF_SYNC_RECONNECT_DELAY = 60s`; tested via `test_maybe_drop_random_peer_drops_after_cooldown` et al. See §10.4 detailed note for remaining divergences. |
-| §10.4 | Promote inbound (open parallel outbound) | Absent | No promote-inbound logic found in `tick.rs` |
+| §10.4 | Promote inbound (open parallel outbound) | Full | `manager/tick.rs` `promote_inbound_peers()` runs last in the tick, dialing authenticated inbound peers' advertised listening addresses; `fill_outbound_slots` reserves `RESERVED_FOR_PROMOTION = 1` pending slot when promotable inbound peers exist, mirroring `OverlayManagerImpl.cpp:782-794` |
 | §10.5 | IPv6 silently ignored | Full | `lib.rs:530-535`, `manager/mod.rs:1398-1400` |
 | §10.5 | Private/localhost addresses ignored | Full | `lib.rs:457-483`, `manager/mod.rs:1431-1433` |
 | §10.6 | `PEERS` sample size 50 | Full | `manager/mod.rs:85` defines `MAX_PEERS_PER_MESSAGE = 50`; enforced at `mod.rs:1386` |
@@ -85,7 +85,7 @@ Counts (excluding Drift and N/A from denominator):
 | §12.1 | ERROR_MSG drops connection | Full | `manager/peer_loop.rs:1046-1064` |
 | §12.2 | ERR_MISC/ERR_DATA/ERR_CONF/ERR_AUTH/ERR_LOAD usage | Full | `peer.rs:557-576`, `manager/connection.rs:224`, `manager/peer_loop.rs:1079-1082` |
 | §12.3 | Drop-once idempotence (INV-O19) | Partial | No `mDropStarted`-style atomic flag in `peer.rs::close`; instead state machine + tokio drop semantics. Idempotence relies on `state != PeerState::Disconnected` guard (`peer.rs:932-939`), which is single-threaded per peer. |
-| §12.3 | 5-second drain delay before socket close | Absent | Connection close is immediate (`connection.rs:285-290`); no 5 s deferred shutdown |
+| §12.3 | 5-second drain delay before socket close | Full | `manager/peer_loop.rs` `OutboundMessage::ShutdownAfterError` + `wait_error_drop_drain()`: error-drop path flushes the queued `ERROR_MSG`, then defers the close by `ERROR_DROP_DRAIN_DELAY = 5s` (interruptible by node shutdown), mirroring `TCPPeer.cpp:835-862`. Plain teardown (`Shutdown`) stays immediate |
 | §13.4 | Pre-auth payload limit 4 KiB | Full | `codec.rs:194-206` |
 | §13.4 | Pending connection caps | Full | `connection.rs:473-529` |
 | §13.4 | Handshake timeout 2 s | Full | `lib.rs:225-232,315` |
@@ -111,7 +111,7 @@ Counts (excluding Drift and N/A from denominator):
 | INV-O8 (Initial credit precedence) | Full | `peer.rs:460-477` — SEND_MORE_EXTENDED sent before `set_authenticated()` enables flood reads; first flood-controlled traffic only after this. |
 | INV-O9 (Capacity non-overshoot) | Full | `flow_control.rs:1021-1033`, `manager/peer_loop.rs:1069-1089` |
 | INV-O10 (SEND_MORE_EXTENDED validation) | Full | `flow_control.rs:979-1010` (numBytes!=0 + overflow guards) |
-| INV-O11 (Recv-side batch grants) | Partial | `flow_control.rs:1038-1065` emits SEND_MORE_EXTENDED on batch threshold, but the spec's `releaseAssert(mFloodDataProcessed <= BATCH_SIZE)` upper bound is not asserted |
+| INV-O11 (Recv-side batch grants) | Full | `flow_control.rs:1038-1065` emits SEND_MORE_EXTENDED on the batch threshold and now enforces the spec's `releaseAssert(mFloodDataProcessed <= BATCH_SIZE)` upper bound via a hard `assert!` (`flow_control.rs:1045-1056`) |
 | INV-O12 (One PEERS per connection) | Full | `manager/peer_loop.rs:512-531,712-717` |
 | INV-O13 (Inbound role rejects PEERS) | Full | `manager/peer_loop.rs:522-524` rejects PEERS from **Inbound** direction peers (`REMOTE_CALLED_US`); spec says "an inbound role peer MUST NOT receive `PEERS`" — Rust enforces the same. |
 | INV-O14 (No flood while not synced) | Full | `manager/peer_loop.rs:693-697` |
@@ -123,7 +123,7 @@ Counts (excluding Drift and N/A from denominator):
 
 Re-evaluation: INV-O13 — code is correct. Spec says "An inbound role peer (`REMOTE_CALLED_US`) MUST NOT receive `PEERS`"; the Rust code `if direction == ConnectionDirection::Inbound { return RejectWrongDirection }` matches that exactly. The invariant name is corrected to "Inbound role rejects PEERS" to align with the spec language. Reclassified to **Full** in the summary count.
 
-Corrected invariant tally: **Full 17 | Partial 2 | Absent 0**.
+Corrected invariant tally: **Full 18 | Partial 1 | Absent 0**.
 
 ## Detailed findings
 
@@ -156,10 +156,10 @@ Corrected invariant tally: **Full 17 | Partial 2 | Absent 0**.
   5. `crates/app/src/app/survey_impl.rs:786-793` decrypts response bodies via `henyey_crypto::open_from_curve25519_secret_key`.
   6. Rate limiting is enforced via `survey.rs:268-356` (`SurveyMessageLimiter`) in the overlay crate.
 
-### §12.3 — Drop-to-close 5 s delay (Absent)
+### §12.3 — Drop-to-close 5 s delay (Full)
 - **Claim**: Drop schedules `TCPPeer::shutdown` 5 s later to drain the final `ERROR_MSG`.
-- **Rust**: `connection.rs:285-290` closes immediately on drop; `peer.rs:932-939` likewise.
-- **Notes**: Wire-observable difference: an `ERR_LOAD` or `ERR_CONF` sent immediately before close may not reach the peer because the socket is RST'd. Possible operational impact: peers don't know why we rejected them. Not consensus-affecting.
+- **Rust**: `send_error_and_drop` (`manager/peer_loop.rs`) queues `Send(err)` then `OutboundMessage::ShutdownAfterError` on the same outbound channel. The loop flushes `Send(err)` to the socket first (FIFO), then the `ShutdownAfterError` arm calls `wait_error_drop_drain()`, which sleeps `ERROR_DROP_DRAIN_DELAY = 5s` before breaking. Plain `Shutdown` (idle/normal teardown) stays immediate. Mirrors `TCPPeer.cpp:835-862`.
+- **Notes**: The 5 s sleep is per-peer-task and interruptible by node shutdown (`state.running` going false, polled every 100 ms), so overlay teardown is never delayed 5 s per peer. Covered by `test_error_drop_drains_before_close` and `test_error_drop_drain_interrupted_by_shutdown`.
 
 ### §13.4 — Crypto-error → ERR_DATA (Partial)
 - **Claim**: any `xdr_runtime_error` or `CryptoError` during message receive triggers `ERR_DATA` and drop.
@@ -172,9 +172,10 @@ Corrected invariant tally: **Full 17 | Partial 2 | Absent 0**.
 - **Send side (divergence)**: Post-auth ERROR_MSG goes through `send_error_and_drop` (`peer_loop.rs:306-314`) → `OutboundMessage::Send` → `peer.send()` (`peer.rs:738-751`) → `auth.wrap_message()`, which applies normal MAC/sequence. Stellar-core exempts outbound ERROR_MSG from MAC in `Hmac.cpp:72-79`. Pre-auth errors use `send_raw` (`peer.rs:573`) which is correct (no MAC before keys).
 - **Notes**: Partial because receive-side matches but outbound path diverges. The divergence is benign (peers accept MACed ERROR_MSG) but not spec-identical.
 
-### §10.4 — Tick promote-inbound (Absent)
+### §10.4 — Tick promote-inbound (Full)
 - **Claim**: Step 8: "Promote inbound peers (open a parallel outbound connection to their address) to fill any leftover pending slots."
-- **Rust**: `tick.rs:1-200` covers DNS, preferred peers, random drop; no code opens a parallel outbound to an existing inbound peer.
+- **Rust**: `promote_inbound_peers()` (`manager/tick.rs`) runs strictly last in the tick loop. It enumerates authenticated inbound peers via `enumerate_promotable_inbound_peers()` — skipping those we already have an outbound to or under a dial cooldown — shuffles them, and dials their advertised listening address (rewritten into `PeerInfo.address` at Hello, `peer.rs:687-691`) via `connect_to_explicit_peer`. To keep promotion reachable under outbound saturation, `fill_outbound_slots` leaves `RESERVED_FOR_PROMOTION = 1` pending slot free when promotable inbound peers exist. Mirrors `OverlayManagerImpl.cpp:782-794`.
+- **Notes**: Covered by `test_promote_inbound_dials_inbound_peer_address`, `test_promote_inbound_skips_existing_outbound`, `test_promote_inbound_respects_pending_budget`, `test_fill_outbound_reserves_promotion_slot`, `test_enumerate_promotable_excludes_outbound_only`.
 
 ### §10.4 — Random out-of-sync drop (Partial)
 - **Claim**: Step 6: when `availableAuthSlots == 0` and out-of-sync ≥ 60 s, drop one random non-preferred outbound.
@@ -205,9 +206,8 @@ No dangling anchors. (Older codebase comments cite §5.4 as well — also valid.
 
 ## Recommendations
 
-1. **Medium — §12.3 drop-to-close delay**: Add a 5 s deferred socket shutdown so peers receive the final `ERROR_MSG` before RST. Helps operational debugging.
-2. **Medium — §5.4.4 `GET_SCP_STATE` min-ledger seq**: Add app callback or local state to compute `getMinLedgerSeqToAskPeers()`; currently sends 0.
-3. **Medium — §10.4 promote-inbound**: Implement step 8 of the tick algorithm (open parallel outbound to existing inbound peers). Important for connection diversity under load.
-4. **Low — §5.4.2 cert refresh**: Currently one cert per `AuthContext`; could move to a process-lifetime shared cert with 30-min refresh, but functionally equivalent and not consensus-affecting.
-5. **Low — §13.4 explicit `ERR_DATA` on crypto failure**: Emit an outbound `ERROR_MSG(ERR_DATA, ...)` before dropping on XDR/HMAC decode errors, instead of silent close.
-6. **Cosmetic — INV-O11 assert**: Add `debug_assert!(state.flood_data_processed <= self.config.flow_control_send_more_batch_size)` after each batch increment in `flow_control.rs::end_message_processing`.
+1. **Medium — §5.4.4 `GET_SCP_STATE` min-ledger seq**: Add app callback or local state to compute `getMinLedgerSeqToAskPeers()`; currently sends 0.
+2. **Low — §5.4.2 cert refresh**: Currently one cert per `AuthContext`; could move to a process-lifetime shared cert with 30-min refresh, but functionally equivalent and not consensus-affecting.
+3. **Low — §13.4 explicit `ERR_DATA` on crypto failure**: Emit an outbound `ERROR_MSG(ERR_DATA, ...)` before dropping on XDR/HMAC decode errors, instead of silent close.
+
+Resolved in #2802: §7.3 `releaseAssert(processed <= batch_size)` (hard `assert!`), §10.4 promote-inbound, §12.3 5 s drop-to-close drain, INV-O11 recv-side assert.

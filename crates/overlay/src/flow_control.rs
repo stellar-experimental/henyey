@@ -1042,8 +1042,22 @@ impl FlowControl {
         state.flood_data_processed_bytes += state.byte_capacity.release_local_capacity(msg);
         state.total_msgs_processed += 1;
 
+        // Parity: FlowControl.cpp:303-310. The message-capacity counter rises
+        // by exactly 1 per flood message and resets to 0 on each send-more
+        // grant, so it can never exceed the batch size. Mirror stellar-core's
+        // `releaseAssert` with a hard `assert!` (not `debug_assert!`) — the
+        // invariant is load-bearing for the `==` send-more check below.
+        assert!(
+            state.flood_data_processed <= self.config.flow_control_send_more_batch_size,
+            "flood_data_processed ({}) exceeded send-more batch size ({})",
+            state.flood_data_processed,
+            self.config.flow_control_send_more_batch_size
+        );
+
+        // Messages: grant exactly at the batch boundary (`==`); bytes: at or
+        // past the byte batch (`>=`). Matches FlowControl.cpp:305-311.
         let should_send_more = state.flood_data_processed
-            >= self.config.flow_control_send_more_batch_size
+            == self.config.flow_control_send_more_batch_size
             || state.flood_data_processed_bytes >= self.config.flow_control_bytes_batch_size;
 
         let mut result = SendMoreCapacity::default();
@@ -1841,6 +1855,49 @@ mod tests {
                 assert!(cap.num_flood_messages > 0);
             }
         }
+    }
+
+    #[test]
+    fn test_should_send_more_exact_batch_equality() {
+        // §7.3 / FlowControl.cpp:303-311: the message-capacity counter rises by
+        // exactly 1 per flood message and the send-more grant fires at the
+        // exact batch boundary (`==`), resetting the counter to 0. The hard
+        // `assert!(flood_data_processed <= batch_size)` is exercised on every
+        // increment along the way (it can never trip on the legitimate path —
+        // the counter cannot exceed the batch by construction).
+        let mut config = FlowControlConfig::default();
+        // Use a large byte batch so only the message counter drives send-more.
+        config.flow_control_send_more_batch_size = 3;
+        config.flow_control_bytes_batch_size = u64::MAX;
+        config.peer_reading_capacity = 1000;
+        config.peer_flood_reading_capacity = 1000;
+        let fc = Arc::new(FlowControl::new(config));
+        let tx = make_tx_message();
+
+        // Messages 1 and 2: below the batch boundary, no grant.
+        for i in 1..3u64 {
+            assert!(fc.begin_message_processing(&tx));
+            let res = fc.end_message_processing(&tx);
+            assert!(
+                res.num_flood_messages == 0,
+                "no grant expected at count {i} (< batch)"
+            );
+            // Counter is strictly below the batch and never exceeds it.
+            assert_eq!(fc.state.lock().unwrap().flood_data_processed, i);
+        }
+
+        // Message 3: hits the batch boundary exactly ⇒ grant, counter resets.
+        assert!(fc.begin_message_processing(&tx));
+        let res = fc.end_message_processing(&tx);
+        assert_eq!(
+            res.num_flood_messages, 3,
+            "grant must fire at exactly batch_size, not batch_size-1"
+        );
+        assert_eq!(
+            fc.state.lock().unwrap().flood_data_processed,
+            0,
+            "counter resets to 0 after the grant"
+        );
     }
 
     #[test]
