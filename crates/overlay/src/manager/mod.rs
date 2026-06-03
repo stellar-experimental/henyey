@@ -1740,6 +1740,10 @@ impl OverlayManager {
     pub fn request_scp_state(&self, ledger_seq: u32) -> Result<usize> {
         use rand::seq::SliceRandom;
 
+        if !self.running.load(Ordering::Relaxed) {
+            return Err(OverlayError::NotStarted);
+        }
+
         let message = StellarMessage::GetScpState(ledger_seq);
         let peers = self.connected_peers();
         if peers.is_empty() {
@@ -4356,6 +4360,28 @@ mod tests {
 
     // ──────── request_scp_state §15.3 parity tests ────────
 
+    /// Regression test for #2980: request_scp_state must return
+    /// Err(NotStarted) when the overlay has not been started, matching the
+    /// guard on broadcast()/connect() and stellar-core's shutdown guard,
+    /// instead of silently returning Ok(0) (which is indistinguishable from
+    /// "started, no peers").
+    #[test]
+    fn test_request_scp_state_returns_not_started_when_not_started() {
+        let config = OverlayConfig::default();
+        let secret = SecretKey::generate();
+        let local_node = LocalNode::new_testnet(secret);
+
+        // new() leaves running=false; the manager is never started.
+        let manager = OverlayManager::new(config, local_node).unwrap();
+
+        let result = manager.request_scp_state(42);
+        assert!(
+            matches!(result, Err(OverlayError::NotStarted)),
+            "request_scp_state should return Err(NotStarted) before start, got {:?}",
+            result
+        );
+    }
+
     #[tokio::test]
     async fn test_request_scp_state_with_single_peer_sends_once() {
         let config = OverlayConfig::default();
@@ -4363,6 +4389,9 @@ mod tests {
         let local_node = LocalNode::new_testnet(secret);
 
         let manager = OverlayManager::new(config, local_node).unwrap();
+        // Mark the manager started so request_scp_state passes the NotStarted
+        // guard (see #2980).
+        manager.running.store(true, Ordering::Relaxed);
 
         let peer_id = PeerId::from_bytes([42u8; 32]);
         let mut rx = insert_peer_with_capacity(&manager, peer_id, 16);
@@ -4386,6 +4415,9 @@ mod tests {
         let local_node = LocalNode::new_testnet(secret);
 
         let manager = OverlayManager::new(config, local_node).unwrap();
+        // Mark the manager started; started-but-no-peers must still yield 0
+        // (distinct from the NotStarted error path, see #2980).
+        manager.running.store(true, Ordering::Relaxed);
 
         let sent = manager.request_scp_state(100).unwrap();
         assert_eq!(sent, 0, "should return 0 when no peers connected");
