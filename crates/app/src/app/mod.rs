@@ -12457,6 +12457,10 @@ mod tests {
         let mut rx1 = overlay.inject_test_peer(peer1, 64);
         let mut rx2 = overlay.inject_test_peer(peer2, 64);
         let mut rx3 = overlay.inject_test_peer(peer3, 64);
+        // Mark the manager started so request_scp_state passes the NotStarted
+        // guard restored in #2980; otherwise the bounded pull bails early and
+        // no peers receive GetScpState.
+        overlay.set_running_for_test();
         *app.overlay.write().await = Some(Arc::new(overlay));
 
         // Record timestamp before the request.
