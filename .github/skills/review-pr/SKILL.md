@@ -744,17 +744,44 @@ gh issue edit $ISSUE --repo stellar-experimental/henyey --remove-assignee @me
 
 REPO_ROOT="$(git rev-parse --show-toplevel)"
 
-# Recover session ID from the sidecar /do persisted (see do/SKILL.md A.2).
-# Build cache lives at $HOME/data/<session-id>/do-$ISSUE/cargo-target/ — can be
-# 25-50 GB per issue. Clean it up here; otherwise nothing else will.
-if [ -f "$REPO_ROOT/data/do-$ISSUE/.session-id" ]; then
+# Reap the /do session workspace (worktree + cargo target — 25-50 GB per issue).
+# /do persists the fully-resolved ABSOLUTE workspace path in a flat, per-issue,
+# session-independent marker under <real-home>/data/do-$ISSUE.workspace (see
+# do/SKILL.md A.2). We reap that exact string verbatim — no recombination from a
+# session id or $HOME — so the write path and the read path cannot diverge
+# (#2979, #2978).
+#
+# Boundary guard: only `rm -rf` paths under <real-home>/data, where <real-home>
+# is the PASSWD-derived home (NOT $HOME — $HOME may be poisoned). This fails
+# closed if a marker ever contains a path outside the contract boundary.
+PW_HOME="$(getent passwd "$(id -un)" 2>/dev/null | cut -d: -f6)"
+[ -z "$PW_HOME" ] && PW_HOME="$(eval echo "~$(id -un)")"
+
+reap_workspace() {  # $1 = absolute dir to remove
+  local ws="$1"
+  [ -z "$ws" ] && return 0
+  case "$ws" in
+    "$PW_HOME"/data/*) [ -d "$ws" ] && rm -rf "$ws" ;;
+    *) echo "WARN: refusing to reap '$ws' — outside $PW_HOME/data" >&2 ;;
+  esac
+}
+
+WORKSPACE_MARKER="$PW_HOME/data/do-$ISSUE.workspace"
+if [ -f "$WORKSPACE_MARKER" ]; then
+  # Current marker: contents are the resolved absolute workspace dir. Reap it
+  # verbatim, then remove the marker itself.
+  reap_workspace "$(cat "$WORKSPACE_MARKER")"
+  rm -f "$WORKSPACE_MARKER"
+elif [ -f "$REPO_ROOT/data/do-$ISSUE/.session-id" ]; then
+  # Legacy marker (pre-#2979 /do wrote a bare session id into the repo tree).
+  # Reconstruct <real-home>/data/<id>/do-$ISSUE using the SAME passwd-home
+  # boundary guard (NOT $HOME) before any rm -rf. Handles in-flight PRs opened
+  # by the pre-fix /do.
   SESSION_ID=$(cat "$REPO_ROOT/data/do-$ISSUE/.session-id")
-  if [ -n "$SESSION_ID" ] && [ -d "$HOME/data/$SESSION_ID/do-$ISSUE" ]; then
-    rm -rf "$HOME/data/$SESSION_ID/do-$ISSUE"
-  fi
+  [ -n "$SESSION_ID" ] && reap_workspace "$PW_HOME/data/$SESSION_ID/do-$ISSUE"
 fi
 
-# Worktree dir cleanup.
+# Repo-tree cleanup: legacy marker dir (if any) + any pruned worktree refs.
 rm -rf "$REPO_ROOT/data/do-$ISSUE"
 git worktree prune
 ```

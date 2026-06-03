@@ -138,6 +138,8 @@ jobs:
       - uses: actions/checkout@v4
       - name: Verify agent workspace contract
         run: bash scripts/test-agent-worktree-contract.sh
+      - name: Verify do_bootstrap workspace persist/reap contract
+        run: bash scripts/lib/tests/test-do-bootstrap.bats
 
   quickstart-harness:
     name: Quickstart Harness
