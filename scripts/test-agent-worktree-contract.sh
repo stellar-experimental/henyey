@@ -1389,6 +1389,137 @@ test_reap_guard_canonicalizes_before_prefix_check() {
 }
 
 # --------------------------------------------------------------------------
+# Test: review-pr reap guard rejects the bare <home>/data root but reaps a
+# strict descendant (issue #3004 — defense-in-depth). A marker that resolved
+# to exactly <home>/data must NOT be reaped (it would `rm -rf` every other
+# agent's workspace); only paths strictly under <home>/data/ are reapable.
+# We extract the real reap_workspace function from the skill doc and exercise
+# both the exact-root and strict-descendant cases against a sandbox home.
+# --------------------------------------------------------------------------
+test_reap_guard_rejects_exact_data_root_allows_descendant() {
+  local desc="review-pr reap guard rejects exact <home>/data, reaps strict descendant (#3004)"
+
+  local reap_fn
+  reap_fn=$(awk '
+    /^reap_workspace\(\) \{/ { capture = 1 }
+    capture { print }
+    capture && /^\}/ { exit }
+  ' "$REVIEW_PR_SKILL")
+
+  if [[ -z "$reap_fn" ]] || ! grep -q 'rm -rf' <<< "$reap_fn"; then
+    tap_not_ok "$desc" "could not extract reap_workspace() from $REVIEW_PR_SKILL"
+    return
+  fi
+
+  # Sandbox home so the data root we point the guard at is disposable — we must
+  # never risk reaping a real ~/data during the test.
+  local sandbox sandbox_data
+  sandbox="$(mktemp -d)"
+  sandbox_data="$sandbox/data"
+  mkdir -p "$sandbox_data"
+  local sentinel="$sandbox_data/SHOULD_NOT_BE_REAPED"
+  : > "$sentinel"
+
+  # Case 1: feed the guard the bare data root itself — it must REFUSE and the
+  # data root (and its sentinel) must survive.
+  local output
+  output=$(PW_HOME="$sandbox" bash -c '
+    set -uo pipefail
+    '"$reap_fn"'
+    reap_workspace "'"$sandbox_data"'"
+    echo "REAP_RETURNED:$?"
+  ' 2>&1) || true
+
+  if [[ ! -d "$sandbox_data" || ! -f "$sentinel" ]]; then
+    rm -rf "$sandbox"
+    tap_not_ok "$desc" "reap_workspace DELETED the bare data root: $output"
+    return
+  fi
+  if ! grep -q 'refusing to reap' <<< "$output"; then
+    rm -rf "$sandbox"
+    tap_not_ok "$desc" "reap_workspace did not refuse the exact data root: $output"
+    return
+  fi
+
+  # Case 2: a strict descendant under the data root must be reaped.
+  local descendant="$sandbox_data/do-3004/worktree"
+  mkdir -p "$descendant"
+  PW_HOME="$sandbox" bash -c '
+    set -uo pipefail
+    '"$reap_fn"'
+    reap_workspace "'"$descendant"'"
+  ' >/dev/null 2>&1 || true
+  if [[ -d "$descendant" ]]; then
+    rm -rf "$sandbox"
+    tap_not_ok "$desc" "reap_workspace refused a legitimate strict descendant: $descendant"
+    return
+  fi
+  # The data root must still be intact after reaping the descendant.
+  if [[ ! -d "$sandbox_data" || ! -f "$sentinel" ]]; then
+    rm -rf "$sandbox"
+    tap_not_ok "$desc" "reaping a descendant clobbered the data root"
+    return
+  fi
+
+  rm -rf "$sandbox"
+  tap_ok "$desc"
+}
+
+# --------------------------------------------------------------------------
+# Test: a PATH-poisoned `realpath` is ignored by the contract canonicalizer
+# (issue #3005). canonicalize_contract_path invokes realpath via an absolute
+# path, so a malicious `realpath` stub earlier on PATH that prints attacker-
+# controlled output (/etc) must NOT be trusted — the helper either uses the
+# real absolute-path realpath (correct output) or fails closed, but never
+# returns the poisoned value.
+# --------------------------------------------------------------------------
+test_poisoned_realpath_on_path_ignored() {
+  local desc="poisoned realpath on PATH is ignored (uses absolute path only) (#3005)"
+
+  local real_home
+  real_home="$(_test_real_home)"
+
+  local stub_dir
+  stub_dir="$(mktemp -d)"
+  cat > "$stub_dir/realpath" << 'STUB'
+#!/usr/bin/env bash
+# Malicious: always outputs /etc regardless of input
+echo "/etc"
+STUB
+  chmod +x "$stub_dir/realpath"
+
+  # Resolve a known in-boundary path through the helper with the poisoned PATH.
+  local probe="$real_home/data/poison-realpath-probe-$$"
+  local output rc
+  output=$(PATH="$stub_dir:$PATH" \
+    bash -c "source '$CONTRACT_HELPER' && canonicalize_contract_path '$probe'" 2>&1) && rc=0 || rc=$?
+
+  if [[ $rc -eq 0 ]]; then
+    # Succeeded — the result must be the real resolution, never the poisoned /etc.
+    if [[ "$output" == "/etc" || "$output" == "/etc/"* ]]; then
+      rm -rf "$stub_dir"
+      tap_not_ok "$desc" "PATH-poisoned realpath was trusted! Got: $output"
+      return
+    fi
+    if [[ "$output" != "$real_home/data/"* ]]; then
+      rm -rf "$stub_dir"
+      tap_not_ok "$desc" "Unexpected resolution: '$output' (expected under $real_home/data/)"
+      return
+    fi
+  else
+    # Fail-closed is acceptable, as long as it never echoed the poisoned value.
+    if [[ "$output" == "/etc"* ]]; then
+      rm -rf "$stub_dir"
+      tap_not_ok "$desc" "canonicalizer emitted poisoned /etc before failing: $output"
+      return
+    fi
+  fi
+
+  rm -rf "$stub_dir"
+  tap_ok "$desc"
+}
+
+# --------------------------------------------------------------------------
 # Test: /do uses the shared contract helper, not an in-repo worktree
 # --------------------------------------------------------------------------
 test_do_skill_uses_contract_helper_not_repo_tree() {
@@ -1533,6 +1664,8 @@ test_do_bootstrap_exports_workspace_alias
 test_do_bootstrap_clears_workspace_on_failure
 test_workspace_marker_persist_reap_contract
 test_reap_guard_canonicalizes_before_prefix_check
+test_reap_guard_rejects_exact_data_root_allows_descendant
+test_poisoned_realpath_on_path_ignored
 test_do_skill_uses_contract_helper_not_repo_tree
 test_skill_prompts_forbid_known_leak_patterns
 test_assert_no_repo_tree_scratch_detects_leak_dirs

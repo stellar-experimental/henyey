@@ -35,18 +35,28 @@ _contract_real_home() {
 # Tries GNU realpath -m first, falls back to Python os.path.realpath at a known
 # absolute path, then fails closed (returns non-zero) if neither backend is available.
 #
-# SECURITY: The Python fallback uses absolute paths (/usr/bin/python3, /usr/bin/python)
-# rather than PATH lookup. This prevents PATH-poisoning attacks where a malicious
-# python3 stub could feed arbitrary output into the canonicalization trust chain.
+# SECURITY: Both backends are invoked via absolute paths (/usr/bin/realpath,
+# /usr/bin/python3, ...) rather than a bare PATH lookup. This prevents
+# PATH-poisoning attacks where a malicious `realpath`/`python3` stub on PATH
+# could feed arbitrary output into the canonicalization trust chain. A bare
+# `realpath` on the fast path would have defeated this, since the Python
+# fallback only runs when the fast path returns empty.
 canonicalize_contract_path() {
   local path="$1"
   local result
 
-  # Fast path: GNU realpath -m (works on Linux with coreutils)
-  if result="$(realpath -m "$path" 2>/dev/null)" && [[ -n "$result" ]]; then
-    echo "$result"
-    return 0
-  fi
+  # Fast path: GNU realpath -m (works on Linux with coreutils). Invoked via a
+  # known absolute path (never a PATH lookup) so a poisoned `realpath` on PATH
+  # cannot subvert the trust chain — see the SECURITY note above.
+  local rp
+  for rp in /usr/bin/realpath /bin/realpath /usr/local/bin/realpath; do
+    if [[ -x "$rp" ]]; then
+      if result="$("$rp" -m "$path" 2>/dev/null)" && [[ -n "$result" ]]; then
+        echo "$result"
+        return 0
+      fi
+    fi
+  done
 
   # Fallback: Python os.path.realpath at known absolute paths (immune to PATH poisoning)
   local py
