@@ -181,6 +181,10 @@ pub enum TriggerOutcome {
     /// `HerderImpl::triggerNextLedger` lines 1546-1625 — observers stop
     /// after `addTxSet` / cache publication and before `makeStellarValue`.
     ObserverCached,
+    /// The proposed close time is too far ahead of the wall clock; nomination
+    /// skipped to avoid building an invalid StellarValue.
+    /// Parity: stellar-core triggerNextLedger far-ahead abort.
+    SkippedInvalidCloseTime,
 }
 
 /// Intermediate result from [`Herder::build_and_cache_candidate_tx_set`]
@@ -206,6 +210,8 @@ pub enum TimeoutOutcome {
     /// LCL advanced during build/drain; the value is for an already-closed
     /// slot and was not broadcast.
     SkippedStale,
+    /// Close time still invalid on cache-miss rebuild; nomination skipped.
+    SkippedInvalidCloseTime,
     /// No-op: build returned None, or `scp.nominate_timeout` was a no-op
     /// (e.g., slot already externalized).
     NoOp,
@@ -1299,6 +1305,40 @@ impl Herder {
     /// to `u64` is lossless.
     pub fn ledger_close_duration(&self) -> Duration {
         self.ledger_manager.expected_ledger_close_duration()
+    }
+
+    /// Get the ballot-start instant for the given slot.
+    /// Parity: stellar-core `mLastTrigger` (HerderImpl.cpp), exposed as "prepare start".
+    pub fn prepare_start(&self, slot: SlotIndex) -> Option<std::time::Instant> {
+        self.scp_driver.prepare_start(slot)
+    }
+
+    /// Get the LCL close time from the current ledger header.
+    pub fn lcl_close_time(&self) -> u64 {
+        self.ledger_manager.current_header().scp_value.close_time.0
+    }
+
+    /// Compute the close-time validity offset.
+    ///
+    /// Parity: stellar-core `HerderImpl::ctValidityOffset(lastCtTrigger, ct)`.
+    /// Returns the number of seconds we must wait before `close_time` falls
+    /// within the `now + MAX_TIME_SLIP_SECONDS` validity window.
+    /// Returns 0 when `close_time` is already valid.
+    ///
+    /// Stellar-core adds +1ms to the result as a boundary guard (ensuring the
+    /// timer fires strictly after the boundary). In henyey's second-granularity
+    /// polling architecture, we add +1 second to be conservative.
+    pub fn ct_validity_offset(&self, close_time: u64, max_ct_offset: u64) -> u64 {
+        let now = self.scp_driver.now_seconds();
+        let boundary = now
+            .saturating_add(MAX_TIME_SLIP_SECONDS)
+            .saturating_add(max_ct_offset);
+        if close_time <= boundary {
+            0
+        } else {
+            // +1 second boundary guard (parity: stellar-core adds +1ms)
+            (close_time - boundary).saturating_add(1)
+        }
     }
 
     /// Get the maximum size of a transaction set (ops).
@@ -2564,6 +2604,20 @@ impl Herder {
             return Ok(TriggerOutcome::SkippedStale);
         }
 
+        let now_secs = self.scp_driver.now_seconds();
+        let lcl_close_time = self.lcl_close_time();
+        let next_close_time = now_secs.max(lcl_close_time.saturating_add(1));
+        if next_close_time > now_secs.saturating_add(MAX_TIME_SLIP_SECONDS) {
+            tracing::info!(
+                slot,
+                next_close_time,
+                now = now_secs,
+                max_slip = MAX_TIME_SLIP_SECONDS,
+                "Skipping nomination: proposed close time too far ahead"
+            );
+            return Ok(TriggerOutcome::SkippedInvalidCloseTime);
+        }
+
         tracing::debug!("Triggering consensus for ledger {}", ledger_seq);
 
         // Record when we first started processing this slot (for timing metrics).
@@ -2576,8 +2630,21 @@ impl Herder {
             // Parity: stellar-core HerderImpl.cpp:1546-1625 — observers build
             // the candidate tx set, self-validate, and publish it into the
             // pending/fetch cache, then stop before `makeStellarValue`/`nominate`.
-            self.build_and_cache_candidate_tx_set()
-                .ok_or_else(|| HerderError::Internal("Failed to build candidate tx set".into()))?;
+            //
+            // A None result here means the candidate build aborted on a benign
+            // retryable condition (LCL advanced concurrently, or the defensive
+            // close-time gate rejected). Map it to SkippedStale rather than a
+            // hard error so callers retry on the next tick (review feedback).
+            if self
+                .build_and_cache_candidate_tx_set(next_close_time)
+                .is_none()
+            {
+                tracing::warn!(
+                    slot,
+                    "trigger_next_ledger: candidate tx-set build returned None (stale race)"
+                );
+                return Ok(TriggerOutcome::SkippedStale);
+            }
             let build_value_ms = t0.elapsed().as_millis();
 
             // Drain ready fetching envelopes after cache publication.
@@ -2605,9 +2672,19 @@ impl Herder {
         }
 
         // --- Validator path ---
-        let value = self
-            .build_nomination_value()
-            .ok_or_else(|| HerderError::Internal("Failed to build nomination value".into()))?;
+        let value = match self.build_nomination_value(next_close_time) {
+            Some(v) => v,
+            None => {
+                // build_nomination_value returns None when LCL advanced
+                // concurrently (stale close_time race). This is benign and
+                // retryable — map to SkippedStale rather than a hard error.
+                tracing::warn!(
+                    slot,
+                    "trigger_next_ledger: build_nomination_value returned None (stale race)"
+                );
+                return Ok(TriggerOutcome::SkippedStale);
+            }
+        };
         let build_value_ms = t0.elapsed().as_millis();
 
         // build_nomination_value() caches the tx set but no longer drains
@@ -2963,7 +3040,21 @@ impl Herder {
         // trigger_next_ledger wasn't called for this slot).
         let (value, built_fresh) = match cached_value {
             Some(v) => (Some(v), false),
-            None => (self.build_nomination_value(), true),
+            None => {
+                let now_secs = self.scp_driver.now_seconds();
+                let lcl_close_time = self.lcl_close_time();
+                let next_close_time = now_secs.max(lcl_close_time.saturating_add(1));
+                if next_close_time > now_secs.saturating_add(MAX_TIME_SLIP_SECONDS) {
+                    tracing::info!(
+                        slot,
+                        next_close_time,
+                        now = now_secs,
+                        "Nomination timeout: close time still invalid, returning NoOp"
+                    );
+                    return TimeoutOutcome::SkippedInvalidCloseTime;
+                }
+                (self.build_nomination_value(next_close_time), true)
+            }
         };
 
         // build_nomination_value() caches a tx set but no longer drains
@@ -3030,8 +3121,15 @@ impl Herder {
     /// nomination value. Delegates the heavy build/validate/cache work to
     /// [`build_and_cache_candidate_tx_set`] then adds the validator-only
     /// signing step (upgrades + `make_stellar_value`).
-    fn build_nomination_value(&self) -> Option<Value> {
-        let parts = self.build_and_cache_candidate_tx_set()?;
+    ///
+    /// `close_time` is the caller-validated nomination close time (#2816):
+    /// `trigger_next_ledger`/`handle_nomination_timeout` compute it once via
+    /// the monotonic clamp + far-ahead `ctValidityOffset` check, mirroring
+    /// stellar-core `HerderImpl::triggerNextLedger` which derives
+    /// `nextCloseTime` once before `addTxSet`/`makeStellarValue`. The builder
+    /// must therefore never re-read `SystemTime::now()` itself.
+    fn build_nomination_value(&self, close_time: u64) -> Option<Value> {
+        let parts = self.build_and_cache_candidate_tx_set(close_time)?;
 
         // 4. Upgrades: config + runtime, filtered against current state.
         // Use lcl_close_time (not candidate close_time) for upgrade parameter
@@ -3159,12 +3257,19 @@ impl Herder {
     /// all work up to (but not including) `makeStellarValue` and `nominate`.
     /// Both validators and observers execute this path; observers stop here.
     ///
+    /// `close_time` is supplied by the caller (#2816): `trigger_next_ledger`
+    /// and the cache-miss rebuild in `handle_nomination_timeout` compute and
+    /// validate it once (monotonic clamp + far-ahead `ctValidityOffset`
+    /// check) before invoking this builder. This mirrors stellar-core where
+    /// `nextCloseTime` is derived once in `triggerNextLedger` before
+    /// `addTxSet`/`makeStellarValue`. The builder must not re-read the clock.
+    ///
     /// Steps:
     ///   1. Read ledger state (previous_hash, max_txs, starting_seq)
-    ///   2. Compute close_time with monotonic clamp
+    ///   2. Use the caller-supplied validated close_time
     ///   3. Build generalized transaction set
     ///   3.5. Self-validate and cache the built tx set
-    fn build_and_cache_candidate_tx_set(&self) -> Option<CandidateTxSetParts> {
+    fn build_and_cache_candidate_tx_set(&self, close_time: u64) -> Option<CandidateTxSetParts> {
         // 1. Ledger state — create ONE snapshot for the entire nomination pass.
         // This snapshot is shared between build_starting_seq_map, the
         // trim_invalid_two_phase validation, and config upgrade context.
@@ -3269,17 +3374,25 @@ impl Herder {
             )
         };
 
-        // 2. Close time with monotonic clamp (parity: HerderImpl.cpp triggerNextLedger).
-        // Computed BEFORE tx-set building so the offset can be used to trim
-        // transactions that would expire at the proposed close time (#1192).
-        let mut close_time = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("system clock before UNIX epoch")
-            .as_secs();
-        if close_time <= lcl_close_time {
-            close_time = lcl_close_time + 1;
-        }
-        let close_time_offset = close_time - lcl_close_time;
+        // 2. Caller supplied a validated close time. Use its offset so tx-set
+        // trimming still sees the proposed close time (#1192).
+        // Use checked subtraction: if LCL advanced concurrently (race between
+        // the caller's lcl_close_time() read and our snapshot), abort nomination
+        // rather than wrapping to a huge offset.
+        let close_time_offset = match close_time.checked_sub(lcl_close_time) {
+            Some(0) | None => {
+                // close_time <= lcl_close_time from snapshot: LCL advanced
+                // between caller's read and our snapshot, making the proposed
+                // close time stale. Abort — caller will retry next tick.
+                tracing::warn!(
+                    close_time,
+                    lcl_close_time,
+                    "build_nomination_value: close_time stale vs snapshot LCL; aborting"
+                );
+                return None;
+            }
+            Some(offset) => offset,
+        };
 
         // 2.5. Close-time validity gate (parity: stellar-core HerderImpl.cpp:1524).
         // stellar-core calls `ctValidityOffset(nextCloseTime)` which checks
@@ -6339,12 +6452,15 @@ mod tests {
         );
     }
 
-    /// Regression test for #2869 review feedback — close-time validity gate.
+    /// Regression test for #2869 review feedback + #2816 — close-time validity gate.
     ///
     /// Verifies that `trigger_next_ledger` on an observer performs NO
     /// build/cache/publish side effects when the locally-selected close time
     /// is invalid (too far in the future relative to wall clock).
-    /// Mirrors stellar-core's `ctValidityOffset` gate in `triggerNextLedger`.
+    /// Mirrors stellar-core's `ctValidityOffset` gate in `triggerNextLedger`,
+    /// which aborts (without error or side effects) before `addTxSet` for both
+    /// validators and observers. After #2816 the abort is surfaced as the typed
+    /// `TriggerOutcome::SkippedInvalidCloseTime` instead of a hard error.
     #[test]
     fn test_trigger_next_ledger_observer_skips_build_on_invalid_close_time() {
         // Create a LedgerManager whose LCL has a close_time far in the future.
@@ -6414,12 +6530,15 @@ mod tests {
         let valid_before = herder.scp_driver.cache_sizes().tx_set_valid_cache;
         assert_eq!(valid_before, 0);
 
-        // Trigger for slot 1 — should fail the close-time validity gate.
+        // Trigger for slot 1 — the far-ahead close-time abort in
+        // trigger_next_ledger fires before the observer build, returning the
+        // typed SkippedInvalidCloseTime outcome (no error, no side effects).
         let result = herder.trigger_next_ledger(1);
-        assert!(
-            result.is_err(),
-            "observer trigger should fail when close time is invalid \
-             (returns Err because build_and_cache returns None)"
+        assert_eq!(
+            result.expect("trigger_next_ledger should not hard-error on invalid close time"),
+            TriggerOutcome::SkippedInvalidCloseTime,
+            "observer trigger must return SkippedInvalidCloseTime when close \
+             time is too far ahead (parity: ctValidityOffset abort in triggerNextLedger)"
         );
 
         // Verify NO side effects: tx-set cache and validity cache stay empty.
@@ -6478,6 +6597,404 @@ mod tests {
             TimeoutOutcome::SkippedStale,
             "timeout should report SkippedStale when slot != LCL+1"
         );
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // #2816: ctValidityOffset / far-ahead close-time tests
+    // ─────────────────────────────────────────────────────────────────
+
+    /// Helper: creates a LedgerManager at `ledger_seq` with a custom close_time.
+    fn make_lm_with_close_time(
+        ledger_seq: u32,
+        close_time: u64,
+    ) -> Arc<henyey_ledger::LedgerManager> {
+        use henyey_ledger::{LedgerManager, LedgerManagerConfig};
+        use stellar_xdr::curr::{
+            Hash, LedgerHeader, LedgerHeaderExt, StellarValue, StellarValueExt, TimePoint, VecM,
+        };
+        let config = LedgerManagerConfig {
+            validate_bucket_hash: false,
+            ..Default::default()
+        };
+        let lm = LedgerManager::new("Test Network".to_string(), config);
+        let header = LedgerHeader {
+            ledger_version: 0,
+            previous_ledger_hash: Hash([0u8; 32]),
+            scp_value: StellarValue {
+                tx_set_hash: Hash([0u8; 32]),
+                close_time: TimePoint(close_time),
+                upgrades: VecM::default(),
+                ext: StellarValueExt::Basic,
+            },
+            tx_set_result_hash: Hash([0u8; 32]),
+            bucket_list_hash: Hash([0u8; 32]),
+            ledger_seq,
+            total_coins: 1_000_000_000_000,
+            fee_pool: 0,
+            inflation_seq: 0,
+            id_pool: 0,
+            base_fee: 100,
+            base_reserve: 5_000_000,
+            max_tx_set_size: 100,
+            skip_list: [
+                Hash([0u8; 32]),
+                Hash([0u8; 32]),
+                Hash([0u8; 32]),
+                Hash([0u8; 32]),
+            ],
+            ext: LedgerHeaderExt::V0,
+        };
+        let header_hash = henyey_ledger::compute_header_hash(&header).expect("hash");
+        lm.initialize(
+            henyey_bucket::BucketList::new(),
+            henyey_bucket::HotArchiveBucketList::new(),
+            header,
+            header_hash,
+        )
+        .expect("init");
+        Arc::new(lm)
+    }
+
+    /// Regression test for #2816: `trigger_next_ledger` must return
+    /// `SkippedInvalidCloseTime` when the LCL close time is more than
+    /// MAX_TIME_SLIP_SECONDS ahead of the wall clock.
+    #[test]
+    fn test_trigger_next_ledger_skips_far_ahead_close_time() {
+        let seed = [50u8; 32];
+        let secret = SecretKey::from_seed(&seed);
+        let public = secret.public_key();
+        let local_node_id =
+            stellar_xdr::curr::NodeId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
+                stellar_xdr::curr::Uint256(*public.as_bytes()),
+            ));
+        let quorum_set = ScpQuorumSet {
+            threshold: 1,
+            validators: vec![local_node_id].try_into().unwrap(),
+            inner_sets: vec![].try_into().unwrap(),
+        };
+        let config = HerderConfig {
+            is_validator: true,
+            node_public_key: public,
+            local_quorum_set: Some(quorum_set),
+            ..HerderConfig::default()
+        };
+
+        // Set the test clock to "now" = 1000, but make the LCL close time
+        // far ahead at now + MAX_TIME_SLIP_SECONDS + 10.
+        let now = 1000u64;
+        let far_ahead_close_time = now + MAX_TIME_SLIP_SECONDS + 10;
+
+        let herder = Herder::with_secret_key(
+            config,
+            secret,
+            make_lm_with_close_time(0, far_ahead_close_time),
+            TimerManagerHandle::no_op(),
+        );
+        herder.scp_driver.set_test_clock(now);
+        herder.bootstrap(0);
+
+        // trigger_next_ledger(1) should see next_close_time = lcl + 1 = far_ahead + 1
+        // which is > now + MAX_TIME_SLIP_SECONDS, so it should abort.
+        let result = herder.trigger_next_ledger(1);
+        assert_eq!(
+            result.expect("should not error"),
+            TriggerOutcome::SkippedInvalidCloseTime,
+            "trigger_next_ledger must skip when close time is too far ahead"
+        );
+
+        // No SCP slot state should exist — we aborted before scp.nominate.
+        let slot_state = herder.scp().get_slot_state(1);
+        assert!(
+            slot_state.map_or(true, |s| !s.is_nominating),
+            "far-ahead slot must not enter nomination"
+        );
+    }
+
+    /// Regression test for #2816: `handle_nomination_timeout` cache-miss
+    /// rebuild must return `SkippedInvalidCloseTime` when the close time
+    /// is still invalid.
+    #[test]
+    fn test_handle_nomination_timeout_far_ahead_cache_miss_returns_noop_without_state() {
+        let seed = [51u8; 32];
+        let secret = SecretKey::from_seed(&seed);
+        let public = secret.public_key();
+        let local_node_id =
+            stellar_xdr::curr::NodeId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
+                stellar_xdr::curr::Uint256(*public.as_bytes()),
+            ));
+        let quorum_set = ScpQuorumSet {
+            threshold: 1,
+            validators: vec![local_node_id].try_into().unwrap(),
+            inner_sets: vec![].try_into().unwrap(),
+        };
+        let config = HerderConfig {
+            is_validator: true,
+            node_public_key: public,
+            local_quorum_set: Some(quorum_set),
+            ..HerderConfig::default()
+        };
+
+        let now = 2000u64;
+        let far_ahead_close_time = now + MAX_TIME_SLIP_SECONDS + 5;
+
+        let herder = Herder::with_secret_key(
+            config,
+            secret,
+            make_lm_with_close_time(0, far_ahead_close_time),
+            TimerManagerHandle::no_op(),
+        );
+        herder.scp_driver.set_test_clock(now);
+        herder.bootstrap(0);
+
+        // No cached value for slot 1, so the cache-miss path fires.
+        let outcome = herder.handle_nomination_timeout(1);
+        assert_eq!(
+            outcome,
+            TimeoutOutcome::SkippedInvalidCloseTime,
+            "cache-miss rebuild must abort when close time is too far ahead"
+        );
+
+        // No SCP slot state should be created.
+        let slot_state = herder.scp().get_slot_state(1);
+        assert!(
+            slot_state.map_or(true, |s| !s.is_nominating),
+            "must not enter nomination on far-ahead cache-miss rebuild"
+        );
+    }
+
+    /// Unit test for #2816: `ct_validity_offset` returns 0 at the exact
+    /// validity boundary.
+    #[test]
+    fn test_ct_validity_offset_zero_at_validity_boundary() {
+        let (herder, _) = make_validator_herder();
+        let now = 5000u64;
+        herder.scp_driver.set_test_clock(now);
+
+        // close_time = now + MAX_TIME_SLIP_SECONDS = exactly at boundary with offset=0
+        let close_time = now + MAX_TIME_SLIP_SECONDS;
+        let offset = herder.ct_validity_offset(close_time, 0);
+        assert_eq!(offset, 0, "at boundary with zero trigger offset → no delay");
+    }
+
+    /// Unit test for #2816: `ct_validity_offset` returns positive offset
+    /// one second past the boundary (includes +1 boundary guard).
+    #[test]
+    fn test_ct_validity_offset_positive_one_second_past_boundary() {
+        let (herder, _) = make_validator_herder();
+        let now = 5000u64;
+        herder.scp_driver.set_test_clock(now);
+
+        // close_time = now + MAX_TIME_SLIP_SECONDS + 1 = one past boundary with offset=0
+        let close_time = now + MAX_TIME_SLIP_SECONDS + 1;
+        let offset = herder.ct_validity_offset(close_time, 0);
+        // Parity: stellar-core returns (1s + 1ms), in whole seconds = 2
+        assert_eq!(
+            offset, 2,
+            "one second past boundary + 1s guard → need 2 seconds delay"
+        );
+    }
+
+    /// Unit test for #2816: `ct_validity_offset` accounts for max_ct_offset
+    /// (trigger offset widens the validity window).
+    #[test]
+    fn test_ct_validity_offset_trigger_offset_widens_window() {
+        let (herder, _) = make_validator_herder();
+        let now = 5000u64;
+        herder.scp_driver.set_test_clock(now);
+
+        // close_time = now + 65 (5 past the 60s boundary), but trigger_offset = 5
+        // boundary = now + 60 + 5 = now + 65, so close_time <= boundary → 0
+        let close_time = now + 65;
+        let offset = herder.ct_validity_offset(close_time, 5);
+        assert_eq!(offset, 0, "trigger offset should widen validity window");
+
+        // close_time = now + 66, trigger_offset = 5 → boundary = now+65, need 1s + 1 guard = 2
+        let offset2 = herder.ct_validity_offset(now + 66, 5);
+        assert_eq!(offset2, 2);
+    }
+
+    /// Unit test for #2816: `Herder::prepare_start` forwards to the driver.
+    #[test]
+    fn test_herder_prepare_start_forwards_driver_timing() {
+        let (herder, _) = make_validator_herder();
+        herder.bootstrap(0);
+
+        // Before any ballot start, prepare_start returns None.
+        assert!(
+            herder.prepare_start(1).is_none(),
+            "prepare_start must be None before ballot start"
+        );
+
+        // Record a ballot start for slot 1.
+        herder.scp_driver().record_ballot_start(1);
+        let ps = herder.prepare_start(1);
+        assert!(
+            ps.is_some(),
+            "prepare_start must return Some after ballot start"
+        );
+
+        // After purging, it should be None again.
+        herder.scp_driver().purge_slots_below(2);
+        assert!(
+            herder.prepare_start(1).is_none(),
+            "prepare_start must return None after slot is purged"
+        );
+    }
+
+    /// Regression test for #2816 Parity review: when `prepareStart + expectedClose <= now`
+    /// (trigger_time is clamped to `now`), the triggerOffset passed to `ct_validity_offset`
+    /// must be 0 (remaining time until trigger = 0), NOT `expectedClose` (elapsed time).
+    /// This ensures we don't widen the validity window by `expectedClose` seconds.
+    ///
+    /// Concrete case: now=1000, expectedClose=5s, lcl.close_time=1070.
+    /// minCandidateCt=1071. With triggerOffset=0: boundary=1060, offset=12 (blocks).
+    /// With the OLD (wrong) triggerOffset=5: boundary=1065, offset=7 (would fire too early).
+    #[test]
+    fn test_ct_validity_offset_clamped_trigger_time_gives_zero_offset() {
+        let (herder, _) = make_validator_herder();
+        let now = 1000u64;
+        herder.scp_driver.set_test_clock(now);
+
+        let lcl_close_time = 1070u64;
+        let min_candidate_ct = lcl_close_time + 1; // 1071
+
+        // Correct behavior: triggerOffset = 0 (trigger_time clamped to now)
+        let offset = herder.ct_validity_offset(min_candidate_ct, 0);
+        // boundary = 1000 + 60 + 0 = 1060, excess = 1071 - 1060 = 11, +1 guard = 12
+        assert_eq!(offset, 12, "clamped trigger must not widen validity window");
+
+        // Wrong behavior would pass expectedClose=5 as offset:
+        let wrong_offset = herder.ct_validity_offset(min_candidate_ct, 5);
+        // boundary = 1000 + 60 + 5 = 1065, excess = 1071 - 1065 = 6, +1 guard = 7
+        assert_eq!(
+            wrong_offset, 7,
+            "wider window from elapsed time = incorrect"
+        );
+
+        // The correct offset (12) must be larger than the wrong one (7),
+        // proving we'd wait longer and not nominate too early.
+        assert!(offset > wrong_offset);
+    }
+
+    /// Regression test for #2816 Correctness review: `build_nomination_value`
+    /// must not underflow when the snapshot's LCL has advanced past the
+    /// caller-provided close_time. Instead it returns None (abort).
+    #[test]
+    fn test_build_nomination_value_aborts_on_stale_close_time() {
+        let (herder, _) = make_validator_herder();
+        herder.bootstrap(0);
+        let now = 5000u64;
+        herder.scp_driver.set_test_clock(now);
+
+        // The default LM has lcl_close_time = 0.
+        // Pass close_time = 0 to trigger the checked_sub guard (offset = 0 → abort).
+        let lcl_ct = herder.lcl_close_time();
+        let result = herder.build_nomination_value(lcl_ct);
+        assert!(
+            result.is_none(),
+            "build_nomination_value must abort when close_time <= snapshot lcl_close_time"
+        );
+    }
+
+    /// Regression test for #2816 Correctness review round 2:
+    /// `trigger_next_ledger()` must return `Ok(SkippedStale)` (not a hard
+    /// `Err(Internal)`) when `build_nomination_value()` returns None.
+    /// Simulates the race by resetting the LedgerManager (making
+    /// `create_snapshot()` fail with NotInitialized) after the entry guards
+    /// pass but before the snapshot is taken inside `build_nomination_value`.
+    #[test]
+    fn test_trigger_next_ledger_returns_skipped_stale_on_build_none() {
+        let now = 5000u64;
+        let seed = [70u8; 32];
+        let secret = SecretKey::from_seed(&seed);
+        let public = secret.public_key();
+        let local_node_id =
+            stellar_xdr::curr::NodeId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
+                stellar_xdr::curr::Uint256(*public.as_bytes()),
+            ));
+        let quorum_set = ScpQuorumSet {
+            threshold: 1,
+            validators: vec![local_node_id].try_into().unwrap(),
+            inner_sets: vec![].try_into().unwrap(),
+        };
+        let config = HerderConfig {
+            is_validator: true,
+            node_public_key: public,
+            local_quorum_set: Some(quorum_set),
+            ..HerderConfig::default()
+        };
+
+        let lm = make_lm_with_close_time(0, now);
+        let herder =
+            Herder::with_secret_key(config, secret, lm.clone(), TimerManagerHandle::no_op());
+        herder.scp_driver.set_test_clock(now);
+        herder.bootstrap(0);
+
+        // Reset the LedgerManager so `create_snapshot()` returns Err(NotInitialized).
+        // Entry guards still pass: lcl_matches_slot(1) checks current_ledger_seq()
+        // which reads from the reset genesis header (seq=0), so 0+1=1 matches.
+        // But build_nomination_value → create_snapshot → Err → returns None.
+        lm.reset();
+
+        let result = herder.trigger_next_ledger(1);
+        assert_eq!(
+            result.expect(
+                "must not be a hard error — the old code erroneously returned Err(Internal)"
+            ),
+            TriggerOutcome::SkippedStale,
+            "trigger_next_ledger must return SkippedStale when build_nomination_value returns None"
+        );
+    }
+
+    /// Regression test for #2816 Correctness review round 2:
+    /// `ScpDriver::slot_trigger_time()` returns the first_seen instant for
+    /// a slot after `record_slot_activity` is called.
+    #[test]
+    fn test_slot_trigger_time_returns_recorded_instant() {
+        let (herder, _) = make_validator_herder();
+        herder.bootstrap(0);
+
+        // Before recording activity, slot_trigger_time should be None.
+        assert!(
+            herder.scp_driver.slot_trigger_time(1).is_none(),
+            "slot_trigger_time must be None before record_slot_activity"
+        );
+
+        // Record activity for slot 1.
+        herder.scp_driver.record_slot_activity(1);
+
+        // After recording, slot_trigger_time should be Some.
+        let trigger_time = herder.scp_driver.slot_trigger_time(1);
+        assert!(
+            trigger_time.is_some(),
+            "slot_trigger_time must be Some after record_slot_activity"
+        );
+
+        // The recorded time should be very recent (within 1 second of now).
+        let elapsed = trigger_time.unwrap().elapsed();
+        assert!(
+            elapsed.as_secs() < 1,
+            "slot_trigger_time should be very recent, got {:?} ago",
+            elapsed
+        );
+    }
+
+    /// Regression test for #2816 Correctness review: `lcl_close_time()` is
+    /// a public accessor that reads the current LCL close time.
+    #[test]
+    fn test_lcl_close_time_accessor() {
+        let now = 3000u64;
+        let herder = Herder::with_secret_key(
+            HerderConfig {
+                is_validator: true,
+                ..HerderConfig::default()
+            },
+            SecretKey::from_seed(&[60u8; 32]),
+            make_lm_with_close_time(0, now),
+            TimerManagerHandle::no_op(),
+        );
+        herder.bootstrap(0);
+        assert_eq!(herder.lcl_close_time(), now);
     }
 
     /// Direct regression test for the `lcl_matches_slot` helper used by the
@@ -11396,8 +11913,12 @@ mod advance_tracking_slot_tests {
         herder.bootstrap(10);
 
         // Empty tx queue → empty 2-phase tx set → passes self-validation.
+        let close_time = herder
+            .scp_driver
+            .now_seconds()
+            .max(herder.lcl_close_time() + 1);
         let value = herder
-            .build_nomination_value()
+            .build_nomination_value(close_time)
             .expect("nomination value must be Some when self-validation passes");
 
         // Decode the StellarValue to extract the tx_set_hash and verify the

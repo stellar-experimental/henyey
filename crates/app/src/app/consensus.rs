@@ -188,16 +188,50 @@ impl App {
 
             tracing::debug!(next_slot, "Checking if we should trigger consensus");
 
-            // Record local close time for drift tracking before triggering consensus.
-            // This captures when we started the consensus round.
-            let local_time = self
-                .clock
-                .system_now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("system clock before UNIX epoch")
+            // Parity: HerderImpl::setupTriggerNextLedger — delay nomination until
+            // prepareStart + expectedClose + ctValidityOffset says the proposed
+            // close time is valid. This preserves the poller architecture while
+            // preventing earlier triggers than stellar-core would allow.
+            let expected_close = self.herder.ledger_close_duration();
+            let last_slot = current_ledger as u64;
+            let last_ballot_start = self.herder.prepare_start(last_slot);
+            let now_instant = std::time::Instant::now();
+            let trigger_time = match last_ballot_start {
+                Some(ballot_start) => ballot_start + expected_close,
+                None => now_instant,
+            };
+            if trigger_time > now_instant {
+                tracing::debug!(
+                    next_slot,
+                    "Skipping consensus trigger: trigger_time not yet reached (setupTriggerNextLedger parity)"
+                );
+                // Roll back the latch we just claimed so a later tick — once
+                // the trigger time is reached — can re-attempt this slot.
+                self.rollback_watcher_latch(next_slot);
+                return;
+            }
+
+            // Parity: stellar-core HerderImpl.cpp:1281-1282
+            // triggerOffset = triggerTime - now (always >= 0 because triggerTime
+            // was clamped to max(lastBallotStart + expectedClose, now) above).
+            // This is the *remaining* time until trigger, not elapsed time.
+            let trigger_offset_secs = trigger_time
+                .saturating_duration_since(now_instant)
                 .as_secs();
-            if let Ok(mut tracker) = self.drift_tracker.lock() {
-                tracker.record_local_close_time(next_slot, local_time);
+            let ct_offset = self.herder.ct_validity_offset(
+                self.herder.lcl_close_time().saturating_add(1),
+                trigger_offset_secs,
+            );
+            if ct_offset > 0 {
+                tracing::debug!(
+                    next_slot,
+                    ct_offset,
+                    "Skipping consensus trigger: ctValidityOffset requires additional delay"
+                );
+                // Roll back the latch so a later tick — once the proposed
+                // close time falls within the validity window — can retry.
+                self.rollback_watcher_latch(next_slot);
+                return;
             }
 
             // In a full implementation, we would:
@@ -220,12 +254,30 @@ impl App {
             .await
             {
                 Ok(Ok(henyey_herder::TriggerOutcome::Triggered)) => {
+                    // Record local close time for drift tracking only after
+                    // nomination actually starts. Recording before
+                    // trigger_next_ledger() would poison the drift tracker
+                    // on retryable skips (e.g. SkippedInvalidCloseTime).
+                    let local_time = self
+                        .clock
+                        .system_now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .expect("system clock before UNIX epoch")
+                        .as_secs();
+                    if let Ok(mut tracker) = self.drift_tracker.lock() {
+                        tracker.record_local_close_time(next_slot, local_time);
+                    }
                     self.consensus_trigger_successes
                         .fetch_add(1, Ordering::Relaxed);
                 }
                 Ok(Ok(henyey_herder::TriggerOutcome::SkippedStale)) => {
                     self.consensus_trigger_skipped_stale
                         .fetch_add(1, Ordering::Relaxed);
+                    // Benign retryable skip — roll back the watcher per-slot
+                    // latch so the next tick can re-attempt this slot (the
+                    // skip did not build/cache anything). Only clear if the
+                    // latch still holds OUR slot.
+                    self.rollback_watcher_latch(next_slot);
                 }
                 Ok(Ok(henyey_herder::TriggerOutcome::AlreadyNominating)) => {
                     // Idempotent re-trigger; not a new success, not an error.
@@ -236,39 +288,51 @@ impl App {
                     // Latch was already set before spawning (compare_exchange
                     // above), so no need to store again here.
                 }
+                Ok(Ok(henyey_herder::TriggerOutcome::SkippedInvalidCloseTime)) => {
+                    tracing::debug!(
+                        slot = next_slot,
+                        "Consensus trigger: close time invalid, will retry"
+                    );
+                    // Benign retryable skip (close time too far ahead of the
+                    // wall clock). Roll back the latch so a later tick — once
+                    // the clock catches up — can re-attempt this slot.
+                    self.rollback_watcher_latch(next_slot);
+                }
                 Ok(Err(e)) => {
                     self.consensus_trigger_failures
                         .fetch_add(1, Ordering::Relaxed);
                     // Roll back the watcher per-slot latch so a retry can
                     // re-attempt the build for this slot on the next tick.
-                    // Only clear if the latch still holds OUR slot — a newer
-                    // slot may have been claimed while we were awaiting.
-                    if !self.is_validator {
-                        let _ = self.watcher_last_triggered_slot.compare_exchange(
-                            next_slot as u64,
-                            0,
-                            Ordering::AcqRel,
-                            Ordering::Relaxed,
-                        );
-                    }
+                    self.rollback_watcher_latch(next_slot);
                     tracing::error!(error = %e, slot = next_slot, "Failed to trigger ledger");
                 }
                 Err(_join_error) => {
                     // Already logged by spawn_blocking_logged
                     self.consensus_trigger_failures
                         .fetch_add(1, Ordering::Relaxed);
-                    // Roll back latch on join failure as well — only if our
-                    // slot is still current (same race-safety as above).
-                    if !self.is_validator {
-                        let _ = self.watcher_last_triggered_slot.compare_exchange(
-                            next_slot as u64,
-                            0,
-                            Ordering::AcqRel,
-                            Ordering::Relaxed,
-                        );
-                    }
+                    // Roll back latch on join failure as well.
+                    self.rollback_watcher_latch(next_slot);
                 }
             }
+        }
+    }
+
+    /// Roll back the watcher per-slot trigger latch for `slot` after a
+    /// non-success trigger outcome (hard error, join failure, or a benign
+    /// retryable skip such as `SkippedStale` / `SkippedInvalidCloseTime`).
+    ///
+    /// Only clears the latch if it still holds OUR slot — a newer slot may
+    /// have been claimed while we were awaiting, and that claim must survive
+    /// (regression: stale rollback must not wipe a newer claim). No-op for
+    /// validators, which do not use the watcher latch.
+    fn rollback_watcher_latch(&self, slot: u32) {
+        if !self.is_validator {
+            let _ = self.watcher_last_triggered_slot.compare_exchange(
+                slot as u64,
+                0,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            );
         }
     }
 

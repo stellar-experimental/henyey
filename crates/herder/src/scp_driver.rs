@@ -686,6 +686,13 @@ impl ScpDriver {
         self.qset_tracker.store(node_id, qset);
     }
 
+    /// Crate-internal test access to the clock override.
+    #[cfg(test)]
+    pub(crate) fn set_test_clock(&self, now: u64) {
+        self.test_clock
+            .store(now, std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// Create a new SCP driver with a secret key for signing.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn with_secret_key(
@@ -1154,6 +1161,26 @@ impl ScpDriver {
         state
             .ballot_start
             .get_or_insert_with(std::time::Instant::now);
+    }
+
+    /// Get the ballot start instant for a slot.
+    ///
+    /// Parity: stellar-core `HerderSCPDriver::getPrepareStart()` returns
+    /// `mPrepareStart`, which is recorded in `startedBallotProtocol`.
+    /// This correctly maps to `ballot_start` in henyey (not `first_seen`).
+    /// Returns `None` if `record_ballot_start()` hasn't been called yet for this slot.
+    pub fn prepare_start(&self, slot: SlotIndex) -> Option<std::time::Instant> {
+        let map = self.slot_timing.read();
+        map.get(&slot).and_then(|s| s.ballot_start)
+    }
+
+    /// Get the trigger instant for a slot (when `trigger_next_ledger` first ran).
+    ///
+    /// This is the `first_seen` timestamp — the actual moment the slot was
+    /// triggered. Useful for measuring total slot latency.
+    pub fn slot_trigger_time(&self, slot: SlotIndex) -> Option<std::time::Instant> {
+        let map = self.slot_timing.read();
+        map.get(&slot).and_then(|s| s.first_seen)
     }
 
     /// Duration of the highest externalized slot (first-seen → externalized).
@@ -4619,6 +4646,54 @@ mod tests {
         let map = driver.slot_timing.read();
         assert!(!map.contains_key(&50));
         assert!(map.contains_key(&100));
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // #2816: prepare_start() tests
+    // ─────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_prepare_start_returns_none_before_ballot_start() {
+        let driver = make_test_driver();
+        // No ballot recorded → prepare_start returns None.
+        assert!(
+            driver.prepare_start(100).is_none(),
+            "prepare_start must return None before record_ballot_start"
+        );
+    }
+
+    #[test]
+    fn test_prepare_start_returns_recorded_ballot_start() {
+        let driver = make_test_driver();
+        driver.record_ballot_start(100);
+        let ps = driver.prepare_start(100);
+        assert!(
+            ps.is_some(),
+            "prepare_start must return Some after record_ballot_start"
+        );
+        // Verify it matches the stored value.
+        let map = driver.slot_timing.read();
+        let expected = map.get(&100).unwrap().ballot_start.unwrap();
+        assert_eq!(ps.unwrap(), expected);
+    }
+
+    #[test]
+    fn test_prepare_start_purged_with_slot_trim() {
+        let driver = make_test_driver();
+        driver.record_ballot_start(50);
+        driver.record_ballot_start(100);
+
+        // Purge slots below 80 — slot 50 should be gone.
+        driver.purge_slots_below(80);
+
+        assert!(
+            driver.prepare_start(50).is_none(),
+            "prepare_start must return None after slot is purged"
+        );
+        assert!(
+            driver.prepare_start(100).is_some(),
+            "prepare_start must still return Some for un-purged slot"
+        );
     }
 
     #[test]
