@@ -1960,7 +1960,7 @@ impl TestPeerReceiver {
     pub async fn recv(&mut self) -> Option<StellarMessage> {
         match self.rx.recv().await? {
             OutboundMessage::Send(msg) | OutboundMessage::Flood(msg) => Some(msg),
-            OutboundMessage::Shutdown => None,
+            OutboundMessage::Shutdown | OutboundMessage::ShutdownAfterError => None,
         }
     }
 
@@ -1968,7 +1968,7 @@ impl TestPeerReceiver {
     pub fn try_recv(&mut self) -> Option<StellarMessage> {
         match self.rx.try_recv().ok()? {
             OutboundMessage::Send(msg) | OutboundMessage::Flood(msg) => Some(msg),
-            OutboundMessage::Shutdown => None,
+            OutboundMessage::Shutdown | OutboundMessage::ShutdownAfterError => None,
         }
     }
 }
