@@ -1733,6 +1733,10 @@ impl OverlayManager {
     pub fn request_scp_state(&self, ledger_seq: u32) -> Result<usize> {
         use rand::seq::SliceRandom;
 
+        if !self.running.load(Ordering::Relaxed) {
+            return Err(OverlayError::NotStarted);
+        }
+
         let message = StellarMessage::GetScpState(ledger_seq);
         let peers = self.connected_peers();
         if peers.is_empty() {
@@ -4378,6 +4382,9 @@ mod tests {
         let local_node = LocalNode::new_testnet(secret);
 
         let manager = OverlayManager::new(config, local_node).unwrap();
+        // Mark the manager started so request_scp_state passes the NotStarted
+        // guard (see #2980).
+        manager.running.store(true, Ordering::Relaxed);
 
         let peer_id = PeerId::from_bytes([42u8; 32]);
         let mut rx = insert_peer_with_capacity(&manager, peer_id, 16);
@@ -4401,6 +4408,9 @@ mod tests {
         let local_node = LocalNode::new_testnet(secret);
 
         let manager = OverlayManager::new(config, local_node).unwrap();
+        // Mark the manager started; started-but-no-peers must still yield 0
+        // (distinct from the NotStarted error path, see #2980).
+        manager.running.store(true, Ordering::Relaxed);
 
         let sent = manager.request_scp_state(100).unwrap();
         assert_eq!(sent, 0, "should return 0 when no peers connected");
