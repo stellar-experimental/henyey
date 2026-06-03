@@ -1216,6 +1216,93 @@ test_do_bootstrap_default_under_home_data() {
 }
 
 # --------------------------------------------------------------------------
+# Test: do_bootstrap exports DO_WORKSPACE == WORKTREE_BASE (the canonical,
+# ~/data-validated session-workspace dir /review-pr reaps on merge — #2979/#2978)
+# --------------------------------------------------------------------------
+test_do_bootstrap_exports_workspace_alias() {
+  local desc="do_bootstrap exports DO_WORKSPACE == WORKTREE_BASE"
+
+  local output
+  if ! output=$(WORKTREE_BASE="" CARGO_TARGET_DIR="" DO_WORKSPACE="" CLAUDE_SESSION_ID="ws-test" \
+    bash -c "source '$CONTRACT_HELPER' && do_bootstrap 42 && echo \$DO_WORKSPACE && echo \$WORKTREE_BASE" 2>&1); then
+    tap_not_ok "$desc" "do_bootstrap failed: $output"
+    return
+  fi
+  local ws base
+  ws=$(echo "$output" | sed -n '1p')
+  base=$(echo "$output" | sed -n '2p')
+  if [[ -z "$ws" ]]; then
+    tap_not_ok "$desc" "DO_WORKSPACE empty: $output"
+    return
+  fi
+  if [[ "$ws" != "$base" ]]; then
+    tap_not_ok "$desc" "DO_WORKSPACE ('$ws') != WORKTREE_BASE ('$base')"
+    return
+  fi
+  if ! echo "$ws" | grep -q "data/ws-test/do-42"; then
+    tap_not_ok "$desc" "DO_WORKSPACE not under expected session/do dir: $ws"
+    return
+  fi
+  tap_ok "$desc"
+}
+
+# --------------------------------------------------------------------------
+# Test: do_bootstrap clears DO_WORKSPACE on a rejected hostile override (no
+# stale workspace path survives to be reaped)
+# --------------------------------------------------------------------------
+test_do_bootstrap_clears_workspace_on_failure() {
+  local desc="do_bootstrap clears DO_WORKSPACE on rejection"
+  local output
+  output=$(WORKTREE_BASE="/tmp/evil-do" DO_WORKSPACE="/tmp/stale-ws" \
+    bash -c "source '$CONTRACT_HELPER'; do_bootstrap 999; echo \"DO_WORKSPACE=\${DO_WORKSPACE:-EMPTY}\"" 2>&1)
+  if echo "$output" | grep -q "DO_WORKSPACE=/tmp/stale-ws"; then
+    tap_not_ok "$desc" "DO_WORKSPACE retained stale value: $output"
+    return
+  fi
+  if ! echo "$output" | grep -q "DO_WORKSPACE=EMPTY"; then
+    tap_not_ok "$desc" "DO_WORKSPACE not cleared on failure: $output"
+    return
+  fi
+  tap_ok "$desc"
+}
+
+# --------------------------------------------------------------------------
+# Test: the /do persist + /review-pr reap docs form a single-source-of-truth
+# contract — /do writes the flat ~/data marker from $DO_WORKSPACE, /review-pr
+# reads do-$ISSUE.workspace behind a passwd-home guard, with a legacy fallback.
+# --------------------------------------------------------------------------
+test_workspace_marker_persist_reap_contract() {
+  local desc="do persists DO_WORKSPACE marker; review-pr reaps it under passwd-home guard"
+
+  # /do A.2 must write the flat per-issue marker from the resolved DO_WORKSPACE.
+  if ! grep -q 'DO_WORKSPACE' "$DO_SKILL"; then
+    tap_not_ok "$desc" "do/SKILL.md does not reference DO_WORKSPACE"
+    return
+  fi
+  if ! grep -q 'do-\$ISSUE\.workspace' "$DO_SKILL"; then
+    tap_not_ok "$desc" "do/SKILL.md does not write the flat do-\$ISSUE.workspace marker"
+    return
+  fi
+
+  # /review-pr Step 7.4 must read the same flat marker and guard rm -rf with the
+  # passwd-derived home (getent), NOT $HOME.
+  if ! grep -q 'do-\$ISSUE\.workspace' "$REVIEW_PR_SKILL"; then
+    tap_not_ok "$desc" "review-pr/SKILL.md does not read the flat do-\$ISSUE.workspace marker"
+    return
+  fi
+  if ! grep -q 'getent passwd' "$REVIEW_PR_SKILL"; then
+    tap_not_ok "$desc" "review-pr/SKILL.md reap path does not use passwd-derived home guard"
+    return
+  fi
+  # Legacy fallback for pre-fix /do markers must remain.
+  if ! grep -q '\.session-id' "$REVIEW_PR_SKILL"; then
+    tap_not_ok "$desc" "review-pr/SKILL.md dropped the legacy .session-id fallback"
+    return
+  fi
+  tap_ok "$desc"
+}
+
+# --------------------------------------------------------------------------
 # Test: /do uses the shared contract helper, not an in-repo worktree
 # --------------------------------------------------------------------------
 test_do_skill_uses_contract_helper_not_repo_tree() {
@@ -1356,6 +1443,9 @@ test_symlinked_home_alias_overrides_are_accepted
 test_poisoned_python_on_path_ignored
 test_do_bootstrap_rejects_hostile_and_sibling_paths
 test_do_bootstrap_default_under_home_data
+test_do_bootstrap_exports_workspace_alias
+test_do_bootstrap_clears_workspace_on_failure
+test_workspace_marker_persist_reap_contract
 test_do_skill_uses_contract_helper_not_repo_tree
 test_skill_prompts_forbid_known_leak_patterns
 test_assert_no_repo_tree_scratch_detects_leak_dirs

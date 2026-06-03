@@ -235,8 +235,14 @@ review_pr_bootstrap() {
 
 # do_bootstrap <issue>
 # Derives and validates the full workspace layout for a /do implementation run.
-# Exports: WORKTREE_BASE, CARGO_TARGET_DIR, DO_WORKTREE
+# Exports: WORKTREE_BASE, CARGO_TARGET_DIR, DO_WORKTREE, DO_WORKSPACE
 # DO_WORKTREE is the implementation worktree (under ~/data, NOT in the repo tree).
+# DO_WORKSPACE is the canonical, fully-resolved absolute session-workspace dir
+# (== WORKTREE_BASE) — the SINGLE source of truth for the directory /review-pr
+# reaps on merge (issue #2979/#2978). /do persists this exact string to a
+# session-independent marker; /review-pr reads and `rm -rf`s it verbatim, with no
+# downstream recombination of the session id or $HOME, so the write path and the
+# read path cannot diverge regardless of CLAUDE_SESSION_ID state or $HOME value.
 # Validates pre-seeded env vars against both ~/data boundary AND session prefix.
 # On failure, clears all derived vars to prevent stale-env escape.
 do_bootstrap() {
@@ -253,18 +259,18 @@ do_bootstrap() {
   local incoming_cargo="${CARGO_TARGET_DIR:-}"
 
   # Clear derived vars on entry to prevent stale values from surviving a failure.
-  unset WORKTREE_BASE CARGO_TARGET_DIR DO_WORKTREE
+  unset WORKTREE_BASE CARGO_TARGET_DIR DO_WORKTREE DO_WORKSPACE
 
   # Derive or validate WORKTREE_BASE
   local candidate_base="${incoming_base:-$real_home/data/$session_id/do-$issue}"
   if ! WORKTREE_BASE="$(require_home_data_path "$candidate_base" "WORKTREE_BASE")"; then
-    unset WORKTREE_BASE CARGO_TARGET_DIR DO_WORKTREE
+    unset WORKTREE_BASE CARGO_TARGET_DIR DO_WORKTREE DO_WORKSPACE
     return 1
   fi
   # Enforce session-prefix isolation for pre-seeded overrides
   if [[ -n "$incoming_base" ]]; then
     if ! require_session_prefix "$WORKTREE_BASE" "$expected_prefix" "WORKTREE_BASE"; then
-      unset WORKTREE_BASE CARGO_TARGET_DIR DO_WORKTREE
+      unset WORKTREE_BASE CARGO_TARGET_DIR DO_WORKTREE DO_WORKSPACE
       return 1
     fi
   fi
@@ -273,13 +279,13 @@ do_bootstrap() {
   # Derive or validate CARGO_TARGET_DIR
   local candidate_cargo="${incoming_cargo:-$WORKTREE_BASE/cargo-target}"
   if ! CARGO_TARGET_DIR="$(require_home_data_path "$candidate_cargo" "CARGO_TARGET_DIR")"; then
-    unset WORKTREE_BASE CARGO_TARGET_DIR DO_WORKTREE
+    unset WORKTREE_BASE CARGO_TARGET_DIR DO_WORKTREE DO_WORKSPACE
     return 1
   fi
   # Enforce session-prefix isolation for pre-seeded overrides
   if [[ -n "$incoming_cargo" ]]; then
     if ! require_session_prefix "$CARGO_TARGET_DIR" "$expected_prefix" "CARGO_TARGET_DIR"; then
-      unset WORKTREE_BASE CARGO_TARGET_DIR DO_WORKTREE
+      unset WORKTREE_BASE CARGO_TARGET_DIR DO_WORKTREE DO_WORKSPACE
       return 1
     fi
   fi
@@ -288,10 +294,17 @@ do_bootstrap() {
   # Derive the implementation worktree (under ~/data, never inside the repo).
   DO_WORKTREE="$WORKTREE_BASE/worktree"
   if ! DO_WORKTREE="$(require_home_data_path "$DO_WORKTREE" "DO_WORKTREE")"; then
-    unset WORKTREE_BASE CARGO_TARGET_DIR DO_WORKTREE
+    unset WORKTREE_BASE CARGO_TARGET_DIR DO_WORKTREE DO_WORKSPACE
     return 1
   fi
   export DO_WORKTREE
+
+  # DO_WORKSPACE is the canonical session-workspace dir to reap on merge. It is
+  # exactly the validated, canonicalized WORKTREE_BASE — a stable alias so the
+  # persist/reap contract refers to one named, fully-resolved absolute path
+  # rather than re-deriving it from the session id downstream.
+  DO_WORKSPACE="$WORKTREE_BASE"
+  export DO_WORKSPACE
 }
 
 # assert_no_repo_tree_scratch <repo_root>

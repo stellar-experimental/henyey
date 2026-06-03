@@ -81,19 +81,31 @@ against the passwd-anchored `~/data` boundary and the per-session prefix.
 REPO_ROOT="$(git rev-parse --show-toplevel)"
 BRANCH="do/issue-$ISSUE"
 
-# Derive + validate the workspace. Exports WORKTREE_BASE, CARGO_TARGET_DIR, and
-# DO_WORKTREE, all under ~/data/$SESSION_ID/do-$ISSUE. Fails closed on any path
-# that escapes ~/data — the `|| exit 1` guard prevents the mkdir below from
-# running on a rejected (hostile/stale) path.
+# Derive + validate the workspace. Exports WORKTREE_BASE, CARGO_TARGET_DIR,
+# DO_WORKTREE, and DO_WORKSPACE, all under ~/data/$SESSION_ID/do-$ISSUE. Fails
+# closed on any path that escapes ~/data — the `|| exit 1` guard prevents the
+# mkdir and marker write below from running on a rejected (hostile/stale) path.
 source "$REPO_ROOT/scripts/lib/agent-worktree-contract.sh"
 do_bootstrap "$ISSUE" || exit 1
 export CARGO_TARGET_DIR
 
 mkdir -p "$WORKTREE_BASE"
 
-# Persist the session ID alongside the workspace (under ~/data, NOT in the repo)
-# so /review-pr can clean up the cargo target dir on merge.
-echo "${CLAUDE_SESSION_ID:-$SESSION_ID}" > "$WORKTREE_BASE/.session-id"
+# Persist the fully-resolved ABSOLUTE workspace path so /review-pr reaps EXACTLY
+# the directory we created on merge. DO_WORKSPACE is the single source of truth
+# (== WORKTREE_BASE, canonicalized + ~/data-validated by do_bootstrap); we write
+# it verbatim and /review-pr reads it verbatim, so the write and read paths can
+# never diverge regardless of CLAUDE_SESSION_ID state or $HOME poisoning (#2979,
+# #2978). The marker is a flat, per-issue, session-INDEPENDENT file directly
+# under <real-home>/data — so /review-pr (a different session) can locate it
+# without knowing /do's session id, while keeping ALL scratch under ~/data and
+# OUT of the repo tree (the #2843 contract). Its CONTENTS are the ~/data
+# absolute workspace path. Use the passwd-derived home (NOT $HOME, which may be
+# poisoned). Written ONLY after do_bootstrap succeeds.
+PW_HOME="$(getent passwd "$(id -un)" 2>/dev/null | cut -d: -f6)"
+[ -z "$PW_HOME" ] && PW_HOME="$(eval echo "~$(id -un)")"
+mkdir -p "$PW_HOME/data"
+printf '%s\n' "$DO_WORKSPACE" > "$PW_HOME/data/do-$ISSUE.workspace"
 
 # Fresh worktree off origin/main, under ~/data (DO_WORKTREE).
 git fetch origin main
