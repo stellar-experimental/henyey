@@ -20,13 +20,11 @@
 //! - `LiquidityPool` constant-product `reserveA`/`reserveB` — for whichever leg
 //!   is the native asset.
 //!
-//! `ContractData` (Stellar Asset Contract native balances) is NOT counted in
-//! this implementation. An Account↔Contract native SAC transfer would show a
-//! non-zero Account-side delta with the offsetting `ContractData` credit
-//! uncounted, producing a spurious violation (a **false alarm**, not a missed
-//! imbalance). Because this invariant is non-strict, that is log noise rather
-//! than a crash. Counting SAC `ContractData` native balances is tracked as a
-//! follow-up in #2987.
+//! - `ContractData` (Stellar Asset Contract native balances) — only the native
+//!   SAC's `Balance` entries, mirroring core's `getAssetBalance` CONTRACT_DATA
+//!   branch (see [`native_balance`]). The native SAC contract id is derived
+//!   per-op from `delta.network_id` (a pure function of the network passphrase,
+//!   identical to core's precomputed `mLumenContractInfo`).
 //!
 //! # Parity
 //!
@@ -36,8 +34,9 @@
 //! hook). Strictness: non-strict (`Invariant(false)`).
 
 use stellar_xdr::curr::{
-    Asset, ContractEvent, LedgerEntry, LedgerEntryData, LiquidityPoolEntryBody, Operation,
-    OperationResult, OperationResultTr,
+    Asset, ContractEvent, ContractId, ContractIdPreimage, Hash, HashIdPreimage,
+    HashIdPreimageContractId, LedgerEntry, LedgerEntryData, LiquidityPoolEntryBody, Operation,
+    OperationResult, OperationResultTr, ScAddress, ScVal,
 };
 
 use crate::{Invariant, OperationDelta};
@@ -57,46 +56,149 @@ impl Default for ConservationOfLumens {
     }
 }
 
-/// Returns the native-XLM balance held by a single ledger entry, or `None` if
-/// the entry holds no native balance (the asset doesn't match / not a
-/// balance-bearing type).
+/// Outcome of inspecting one ledger entry for a native-XLM balance.
+///
+/// Mirrors the relevant part of stellar-core's `AssetBalanceResult`
+/// (`{overflowed, assetMatched, balance}`): an entry either holds no native
+/// balance (`None` → contributes 0), holds a representable native balance
+/// (`Balance(i64)`), or — only in the SAC `ContractData` case — holds an i128
+/// amount outside the `i64` range (`Overflow`), which fails the invariant.
+enum NativeBalance {
+    /// No native balance (asset mismatch, non-balance-bearing type, or a
+    /// matched-but-malformed SAC entry). Contributes 0, never an error.
+    None,
+    /// A representable native balance.
+    Balance(i64),
+    /// SAC i128 amount out of `i64` range (`hi > 0 || lo > i64::MAX`).
+    Overflow,
+}
+
+/// Derives the native-XLM Stellar-Asset-Contract id for `network_id`, mirroring
+/// stellar-core's `getAssetContractID(networkID, Asset(ASSET_TYPE_NATIVE))`.
+///
+/// This is a pure function of the network passphrase, so deriving it per-op is
+/// behaviorally identical to core's precomputed `mLumenContractInfo`.
+fn native_sac_contract_id(network_id: &[u8; 32]) -> ContractId {
+    let preimage = HashIdPreimage::ContractId(HashIdPreimageContractId {
+        network_id: Hash(*network_id),
+        contract_id_preimage: ContractIdPreimage::Asset(Asset::Native),
+    });
+    let hash = henyey_common::Hash256::hash_xdr(&preimage);
+    ContractId(Hash(hash.0))
+}
+
+/// Returns the native-XLM balance held by a single ledger entry.
 ///
 /// Mirrors `getAssetBalance(le, Asset(ASSET_TYPE_NATIVE), lumenContractInfo)`
-/// for the native asset, excluding the SAC `ContractData` case (see module
-/// docs / #2987).
-fn native_balance(entry: &LedgerEntry) -> Option<i64> {
+/// for the native asset, including the SAC `ContractData` branch
+/// (`TransactionUtils.cpp` `getAssetBalance`): an entry is the native SAC
+/// balance iff its `contract` is `Contract(native_sac_id)`, its `key` is a
+/// non-empty `Vec` whose first element is `Symbol("Balance")`, and its `val` is
+/// a non-empty `Map` whose first entry is keyed `Symbol("amount")` with an
+/// `I128` value. A matched-contract-but-malformed entry contributes 0 (not an
+/// error); only an in-range-failing i128 (`hi > 0 || lo > i64::MAX`) is an
+/// [`NativeBalance::Overflow`].
+fn native_balance(entry: &LedgerEntry, native_sac_id: &ContractId) -> NativeBalance {
     match &entry.data {
-        LedgerEntryData::Account(acc) => Some(acc.balance),
-        LedgerEntryData::ClaimableBalance(cb) => {
-            matches!(cb.asset, Asset::Native).then_some(cb.amount)
-        }
+        LedgerEntryData::Account(acc) => NativeBalance::Balance(acc.balance),
+        LedgerEntryData::ClaimableBalance(cb) => match cb.asset {
+            Asset::Native => NativeBalance::Balance(cb.amount),
+            _ => NativeBalance::None,
+        },
         LedgerEntryData::LiquidityPool(lp) => {
             let LiquidityPoolEntryBody::LiquidityPoolConstantProduct(cp) = &lp.body;
             if matches!(cp.params.asset_a, Asset::Native) {
-                Some(cp.reserve_a)
+                NativeBalance::Balance(cp.reserve_a)
             } else if matches!(cp.params.asset_b, Asset::Native) {
-                Some(cp.reserve_b)
+                NativeBalance::Balance(cp.reserve_b)
             } else {
-                None
+                NativeBalance::None
             }
         }
+        LedgerEntryData::ContractData(cd) => sac_native_balance(cd, native_sac_id),
         // Trustlines never hold the native asset; offers/data/contract code/
-        // config/TTL hold no asset balance. ContractData (SAC) deferred to #2987.
-        _ => None,
+        // config/TTL hold no asset balance.
+        _ => NativeBalance::None,
     }
+}
+
+/// Extracts the native-XLM balance from a `ContractData` entry, mirroring the
+/// CONTRACT_DATA branch of stellar-core's `getAssetBalance`.
+fn sac_native_balance(
+    cd: &stellar_xdr::curr::ContractDataEntry,
+    native_sac_id: &ContractId,
+) -> NativeBalance {
+    // The entry must be stored under the native SAC contract address.
+    let ScAddress::Contract(contract_id) = &cd.contract else {
+        return NativeBalance::None;
+    };
+    if contract_id != native_sac_id {
+        return NativeBalance::None;
+    }
+    // key == Vec(Some(v)), non-empty, v[0] == Symbol("Balance").
+    let ScVal::Vec(Some(key_vec)) = &cd.key else {
+        return NativeBalance::None;
+    };
+    match key_vec.first() {
+        Some(ScVal::Symbol(sym)) if sym.0.as_slice() == b"Balance" => {}
+        _ => return NativeBalance::None,
+    }
+    // val == Map(Some(m)), non-empty, m[0].key == Symbol("amount"),
+    // m[0].val == I128(parts).
+    let ScVal::Map(Some(val_map)) = &cd.val else {
+        return NativeBalance::None;
+    };
+    let Some(amount_entry) = val_map.first() else {
+        return NativeBalance::None;
+    };
+    match &amount_entry.key {
+        ScVal::Symbol(sym) if sym.0.as_slice() == b"amount" => {}
+        _ => return NativeBalance::None,
+    }
+    let ScVal::I128(parts) = &amount_entry.val else {
+        return NativeBalance::None;
+    };
+    // Out of i64 range (`hi > 0 || lo > i64::MAX`) → overflow; mirror core's
+    // `hi > 0` (not `hi != 0`) exactly. `hi` is `i64` in this XDR version, so
+    // `hi > 0` is byte-for-byte equivalent to core's unsigned check for the
+    // representable cases (any high word means out of range).
+    if parts.hi > 0 || parts.lo > i64::MAX as u64 {
+        return NativeBalance::Overflow;
+    }
+    NativeBalance::Balance(parts.lo as i64)
 }
 
 /// Computes the native-balance delta for a single changed entry:
 /// `native_balance(current) - native_balance(previous)`, treating a missing
-/// entry as contributing 0.
+/// entry (or a non-balance-bearing one) as contributing 0.
 ///
-/// Mirrors stellar-core's `calculateDeltaBalance`. Both inputs cannot be
-/// `None` (every changed entry has at least one side); the caller guarantees
-/// this.
-fn calculate_delta_balance(current: Option<&LedgerEntry>, previous: Option<&LedgerEntry>) -> i64 {
-    let cur = current.and_then(native_balance).unwrap_or(0);
-    let prev = previous.and_then(native_balance).unwrap_or(0);
-    cur - prev
+/// Mirrors stellar-core's `calculateDeltaBalance`: if either side reports an
+/// i128 overflow, the delta cannot be computed and the invariant fails with
+/// core's verbatim error string. Both inputs cannot be `None` (every changed
+/// entry has at least one side); the caller guarantees this.
+fn calculate_delta_balance(
+    current: Option<&LedgerEntry>,
+    previous: Option<&LedgerEntry>,
+    native_sac_id: &ContractId,
+) -> Result<i64, String> {
+    let cur = current.map_or(NativeBalance::Balance(0), |e| {
+        native_balance(e, native_sac_id)
+    });
+    let prev = previous.map_or(NativeBalance::Balance(0), |e| {
+        native_balance(e, native_sac_id)
+    });
+    if matches!(cur, NativeBalance::Overflow) || matches!(prev, NativeBalance::Overflow) {
+        return Err("Could not calculate lumen balance delta for an entry".to_string());
+    }
+    let cur = match cur {
+        NativeBalance::Balance(b) => b,
+        NativeBalance::None | NativeBalance::Overflow => 0,
+    };
+    let prev = match prev {
+        NativeBalance::Balance(b) => b,
+        NativeBalance::None | NativeBalance::Overflow => 0,
+    };
+    Ok(cur - prev)
 }
 
 impl Invariant for ConservationOfLumens {
@@ -120,6 +222,10 @@ impl Invariant for ConservationOfLumens {
         // underflow guards.
         let mut delta_balances: i64 = 0;
 
+        // The native SAC contract id is a pure function of the network id;
+        // derive it once per op (core precomputes it as `mLumenContractInfo`).
+        let native_sac_id = native_sac_contract_id(delta.network_id);
+
         let mut accumulate = |d: i64| -> Result<(), String> {
             // Overflow: positive d pushing past i64::MAX.
             if d > 0 && delta_balances > i64::MAX - d {
@@ -135,7 +241,7 @@ impl Invariant for ConservationOfLumens {
 
         // Created: (current = Some, previous = None).
         for entry in delta.created {
-            accumulate(calculate_delta_balance(Some(entry), None))?;
+            accumulate(calculate_delta_balance(Some(entry), None, &native_sac_id)?)?;
         }
         // Updated: (current, previous) pairs. `updated` and `update_states` are
         // documented as parallel slices; a length divergence is a caller bug.
@@ -150,11 +256,19 @@ impl Invariant for ConservationOfLumens {
             ));
         }
         for (current, previous) in delta.updated.iter().zip(delta.update_states.iter()) {
-            accumulate(calculate_delta_balance(Some(current), Some(previous)))?;
+            accumulate(calculate_delta_balance(
+                Some(current),
+                Some(previous),
+                &native_sac_id,
+            )?)?;
         }
         // Deleted: (current = None, previous = Some).
         for previous in delta.delete_states {
-            accumulate(calculate_delta_balance(None, Some(previous)))?;
+            accumulate(calculate_delta_balance(
+                None,
+                Some(previous),
+                &native_sac_id,
+            )?)?;
         }
 
         // Header deltas. If either header is missing, skip the header-delta
@@ -187,7 +301,18 @@ impl Invariant for ConservationOfLumens {
                     let mut sum: i64 = 0;
                     for p in payouts.iter() {
                         sum = sum.checked_add(p.amount).ok_or_else(|| {
-                            "Overflow detected when summing inflation payouts".to_string()
+                            // `checked_add` returns `None` on both overflow
+                            // (positive addend) and underflow (negative addend);
+                            // distinguish so the message reports the actual
+                            // condition rather than always saying "Overflow"
+                            // (#3007). Inflation payouts are non-negative in
+                            // practice, but a corrupt/unexpected meta could carry
+                            // a negative amount.
+                            if p.amount >= 0 {
+                                "Overflow detected when summing inflation payouts".to_string()
+                            } else {
+                                "Underflow detected when summing inflation payouts".to_string()
+                            }
                         })?;
                     }
                     sum
