@@ -2,10 +2,12 @@
 #
 # Tests for do_bootstrap in scripts/lib/agent-worktree-contract.sh (issue #2979/#2978).
 #
-# Written in a BATS-compatible style (each test is a function named test_*) but
-# also runs as a plain-bash TAP-style runner, matching the convention used by
-# .github/skills/shared/tests/bounce-cap-check.bats. We default to the plain-bash
-# fallback since BATS isn't part of the project's required toolchain.
+# Despite the .bats extension, this file does NOT use BATS @test blocks: each
+# test is a plain bash function named test_*, and the file ships its own
+# TAP-style runner (see main() at the bottom). It is invoked with `bash`, not
+# the BATS runner — running it under real `bats` would execute 0 @test blocks.
+# This matches the convention used by .github/skills/shared/tests/bounce-cap-check.bats;
+# BATS is not part of the project's required toolchain.
 #
 # What we assert:
 #   1. With CLAUDE_SESSION_ID unset, do_bootstrap exports DO_WORKSPACE (the
@@ -17,8 +19,7 @@
 #      rejection writes no marker.
 #
 # Usage:
-#   bash scripts/lib/tests/test-do-bootstrap.bats     # plain
-#   bats scripts/lib/tests/test-do-bootstrap.bats     # BATS
+#   bash scripts/lib/tests/test-do-bootstrap.bats     # the only supported runner
 #
 # Output: TAP. Exit: 0 if all tests pass, non-zero otherwise.
 
