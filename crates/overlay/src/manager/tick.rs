@@ -9,8 +9,8 @@ use crate::{connection::ConnectionPool, peer::PeerInfo, DialKey, PeerAddress, Pe
 use dashmap::DashMap;
 use parking_lot::RwLock;
 use rand::seq::SliceRandom;
-use std::collections::HashMap;
-use std::net::IpAddr;
+use std::collections::{HashMap, HashSet};
+use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -612,6 +612,36 @@ impl OverlayManager {
     /// dials (OverlayManagerImpl.cpp:790-794).
     fn enumerate_promotable_inbound_peers(shared: &SharedPeerState) -> Vec<PeerAddress> {
         let now = std::time::Instant::now();
+
+        // Precompute the outbound peers' match keys in a single pass so the
+        // per-candidate "already have an outbound connection?" check is O(1)
+        // instead of re-scanning `peer_info_cache` for every inbound peer
+        // (which made the whole enumeration O(n²) per tick). The two sets
+        // mirror `peer_info_matches_address` exactly: `orig` is the
+        // advertised host:port, `resolved` is the connected IP:port.
+        let mut outbound_orig: HashSet<(String, u16)> = HashSet::new();
+        let mut outbound_resolved: HashSet<SocketAddr> = HashSet::new();
+        for entry in shared.peer_info_cache.iter() {
+            let info = entry.value();
+            if !info.direction.we_called_remote() {
+                continue;
+            }
+            if let Some(ref orig) = info.original_address {
+                outbound_orig.insert((orig.host.clone(), orig.port));
+            }
+            outbound_resolved.insert(info.address);
+        }
+        // Mirrors `peer_info_matches_address` against the precomputed sets.
+        let has_outbound = |addr: &PeerAddress| -> bool {
+            if outbound_orig.contains(&(addr.host.clone(), addr.port)) {
+                return true;
+            }
+            addr.host
+                .parse::<IpAddr>()
+                .map(|ip| outbound_resolved.contains(&SocketAddr::new(ip, addr.port)))
+                .unwrap_or(false)
+        };
+
         let mut out = Vec::new();
         for entry in shared.peer_info_cache.iter() {
             let info = entry.value();
@@ -621,7 +651,7 @@ impl OverlayManager {
             }
             let addr = PeerAddress::from(info.address);
             // Skip if we already have an outbound connection to this address.
-            if Self::has_outbound_connection_to(&shared.peer_info_cache, &addr) {
+            if has_outbound(&addr) {
                 continue;
             }
             // Skip if within reconnection cooldown (mutual-dial oscillation guard).

@@ -870,12 +870,17 @@ impl OverlayManager {
     /// poll loop keeps node-wide shutdown responsive (≤100 ms) instead of
     /// blocking each peer task for a full 5 s.
     async fn wait_error_drop_drain(running: &AtomicBool) {
-        let deadline = Instant::now() + ERROR_DROP_DRAIN_DELAY;
-        while Instant::now() < deadline {
+        // Use `tokio::time::Instant` (not `std::time::Instant`) for both the
+        // deadline and the elapsed check so the delay is driven by Tokio's
+        // clock. Under paused/advanced time in tests this stays deterministic
+        // and fast; mixing std `Instant` with `tokio::time::sleep` would tie
+        // the loop to wall-clock and busy-loop for ~5 real seconds.
+        let deadline = tokio::time::Instant::now() + ERROR_DROP_DRAIN_DELAY;
+        while tokio::time::Instant::now() < deadline {
             if !running.load(Ordering::Relaxed) {
                 return;
             }
-            let remaining = deadline.saturating_duration_since(Instant::now());
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             tokio::time::sleep(remaining.min(ERROR_DROP_DRAIN_POLL)).await;
         }
     }
