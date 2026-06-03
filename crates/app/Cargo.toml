@@ -104,5 +104,8 @@ henyey-herder = { workspace = true, features = ["test-utils", "test-support"] }
 # Enable test-only instrumentation on henyey-overlay (e.g.
 # `OverlayManager::inject_test_peer`) for handle_flood_demand regression tests.
 henyey-overlay = { workspace = true, features = ["test-utils"] }
+# Enable test-only helpers on henyey-scp (e.g. test_inject_nomination_envelope)
+# for the #2909 recovery rebroadcast regression test.
+henyey-scp = { workspace = true, features = ["test-helpers"] }
 serde_yaml = "0.9"
 regex = "1"

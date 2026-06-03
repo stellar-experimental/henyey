@@ -513,6 +513,35 @@ pub enum HistoryError {
     #[error("fatal: ledger chain disagrees with local state (§9.5 fatal failure)")]
     FatalChainDisagreement,
 
+    /// Transient: the catchup target's covering checkpoint has not yet been
+    /// published to the history archive (the archive HAS `currentLedger` is
+    /// still behind `checkpoint_containing(target)`).
+    ///
+    /// This restores the precondition stellar-core enforces via
+    /// `GetHistoryArchiveStateWork` (retry-until-published) before knit/replay,
+    /// which henyey's cloned-local `ReplayOnly` fast path optimized away. A
+    /// knit-to-LCL boundary mismatch produced against an unpublished/stale
+    /// archive checkpoint is an archive-not-ready condition that must be
+    /// **retried**, not treated as local-state corruption. It is therefore
+    /// **excluded** from [`is_fatal_catchup_failure`](HistoryError::is_fatal_catchup_failure)
+    /// and [`is_hash_mismatch`](HistoryError::is_hash_mismatch). See #2931.
+    ///
+    /// The covering checkpoint (`checkpoint_containing(target)`) is *derived*
+    /// from `target` rather than stored, so the variant's public shape stays
+    /// minimal; read it via [`covering_checkpoint`](HistoryError::covering_checkpoint).
+    #[error(
+        "catchup target checkpoint not yet published: target ledger {target} \
+         requires archive currentLedger >= its covering checkpoint \
+         {covering}, but archive HAS currentLedger is {has_current}",
+        covering = crate::checkpoint::checkpoint_containing(*target)
+    )]
+    CheckpointNotYetPublished {
+        /// The catchup target ledger sequence.
+        target: u32,
+        /// The archive HAS `currentLedger` observed at gate time.
+        has_current: u32,
+    },
+
     /// Unsupported ledger version detected during chain verification (§9.3 step 2e).
     #[error("unsupported ledger version {version} at ledger {ledger} (supported: {min}..={max})")]
     UnsupportedLedgerVersion {
@@ -589,6 +618,23 @@ impl HistoryError {
                 | HistoryError::InvalidTxSetHash { .. }
                 | HistoryError::ReplayHashMismatch { .. }
         )
+    }
+
+    /// The covering checkpoint for a
+    /// [`CheckpointNotYetPublished`](HistoryError::CheckpointNotYetPublished)
+    /// error — `checkpoint_containing(target)`, i.e. the archive `currentLedger`
+    /// value required for the target to be considered published — or `None` for
+    /// any other variant.
+    ///
+    /// Derived from `target` rather than stored on the variant, keeping the
+    /// crate-root-re-exported enum's public shape minimal (see #2950).
+    pub fn covering_checkpoint(&self) -> Option<u32> {
+        match self {
+            HistoryError::CheckpointNotYetPublished { target, .. } => {
+                Some(crate::checkpoint::checkpoint_containing(*target))
+            }
+            _ => None,
+        }
     }
 }
 
@@ -700,6 +746,77 @@ mod tests {
         // Negative: Other LedgerError variants are NOT hash mismatches
         let err = HistoryError::Ledger(henyey_ledger::LedgerError::Internal("bug".into()));
         assert!(!err.is_hash_mismatch());
+    }
+
+    #[test]
+    fn test_checkpoint_not_yet_published_is_transient() {
+        // #2931: a knit/replay attempt against an archive checkpoint that has
+        // not yet been published is a TRANSIENT archive-not-ready condition.
+        // It must NOT be classified as a fatal catchup failure (which would
+        // trigger a state-wipe) nor as a typed hash mismatch (which would
+        // force a full bucket-apply reset).
+        //
+        // #2950: the covering checkpoint is now DERIVED from `target` via
+        // `checkpoint_containing`, not stored as an independent field. The
+        // #2962 "distinct value per field" premise (which set
+        // `covering_checkpoint` independently of `target` to prove the message
+        // rendered the stored field) is intentionally superseded: a covering
+        // value distinct from `checkpoint_containing(target)` is no longer
+        // representable. We instead use semantically valid distinct values for
+        // the two intrinsic inputs — `target` mid-checkpoint and `has_current`
+        // on a prior published frontier — so `target`, the derived covering
+        // checkpoint, and `has_current` still render as three distinct numbers.
+        // `target` sits mid-checkpoint; its covering checkpoint is 62845439.
+        let target = 62845437;
+        let covering = crate::checkpoint::checkpoint_containing(target);
+        // Archive frontier still on the prior checkpoint (62845375), distinct
+        // from both `target` and `covering`.
+        let has_current = covering - crate::checkpoint::checkpoint_frequency();
+        // Sanity: all three values are distinct so each assertion below
+        // independently proves its own value is rendered.
+        assert_ne!(target, covering);
+        assert_ne!(target, has_current);
+        assert_ne!(covering, has_current);
+
+        let err = HistoryError::CheckpointNotYetPublished {
+            target,
+            has_current,
+        };
+        assert!(
+            !err.is_fatal_catchup_failure(),
+            "CheckpointNotYetPublished must be transient, not fatal"
+        );
+        assert!(
+            !err.is_hash_mismatch(),
+            "CheckpointNotYetPublished must not be treated as a hash mismatch"
+        );
+        // The accessor derives the covering checkpoint from `target`.
+        assert_eq!(
+            err.covering_checkpoint(),
+            Some(covering),
+            "covering_checkpoint() must derive checkpoint_containing(target)"
+        );
+        // A non-matching variant returns None.
+        assert_eq!(
+            HistoryError::FatalChainDisagreement.covering_checkpoint(),
+            None,
+            "covering_checkpoint() must be None for non-CheckpointNotYetPublished variants"
+        );
+        // Each distinct value must appear in the rendered message so on-call
+        // debugging needn't recompute checkpoint math from the log line.
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&target.to_string()),
+            "message must include the target ledger value: {msg}"
+        );
+        assert!(
+            msg.contains(&covering.to_string()),
+            "message must include the derived covering checkpoint value: {msg}"
+        );
+        assert!(
+            msg.contains(&has_current.to_string()),
+            "message must still include the archive HAS currentLedger: {msg}"
+        );
     }
 
     #[test]

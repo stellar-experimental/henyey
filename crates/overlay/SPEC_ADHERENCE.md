@@ -2,11 +2,11 @@
 
 **Spec version:** 26 (Overlay Protocol v38–v39)
 **Crate:** crates/overlay
-**Last updated:** 2026-05-21
-**Overall adherence:** 80%
+**Last updated:** 2026-05-28
+**Overall adherence:** 79%
 
 Counts (excluding Drift and N/A from denominator):
-**Full 79 | Partial 17 | Absent 3 | Drift 2 | N/A 2**
+**Full 78 | Partial 18 | Absent 3 | Drift 2 | N/A 2**
 
 ## Summary table
 
@@ -67,7 +67,7 @@ Counts (excluding Drift and N/A from denominator):
 | §10.3 | `PREFERRED_PEERS_ONLY` reject | Full | `manager/connection.rs:211-216,711-715` |
 | §10.4 | Tick period 3 s (`PEER_AUTHENTICATION_TIMEOUT + 1`) | Full | `manager/tick.rs:26` |
 | §10.4 | DNS resolution every 600 s w/ linear backoff | Full | `manager/tick.rs:31-40,176-198` |
-| §10.4 | Random out-of-sync drop after 60 s | Full | `manager/tick.rs:589-670` `maybe_drop_random_peer()` with `OUT_OF_SYNC_RECONNECT_DELAY = 60s`; tested via `test_maybe_drop_random_peer_drops_after_cooldown` et al. |
+| §10.4 | Random out-of-sync drop after 60 s | Partial | `manager/tick.rs:589-670` `maybe_drop_random_peer()` with `OUT_OF_SYNC_RECONNECT_DELAY = 60s`; tested via `test_maybe_drop_random_peer_drops_after_cooldown` et al. See §10.4 detailed note for remaining divergences. |
 | §10.4 | Promote inbound (open parallel outbound) | Absent | No promote-inbound logic found in `tick.rs` |
 | §10.5 | IPv6 silently ignored | Full | `lib.rs:530-535`, `manager/mod.rs:1398-1400` |
 | §10.5 | Private/localhost addresses ignored | Full | `lib.rs:457-483`, `manager/mod.rs:1431-1433` |
@@ -176,9 +176,13 @@ Corrected invariant tally: **Full 17 | Partial 2 | Absent 0**.
 - **Claim**: Step 8: "Promote inbound peers (open a parallel outbound connection to their address) to fill any leftover pending slots."
 - **Rust**: `tick.rs:1-200` covers DNS, preferred peers, random drop; no code opens a parallel outbound to an existing inbound peer.
 
-### §10.4 — Random out-of-sync drop (Full)
+### §10.4 — Random out-of-sync drop (Partial)
 - **Claim**: Step 6: when `availableAuthSlots == 0` and out-of-sync ≥ 60 s, drop one random non-preferred outbound.
-- **Status**: **Full**. The stale 2026-05-13 audit missed `maybe_drop_random_peer` at `manager/tick.rs:589-670`. The function implements the exact spec behavior: when not tracking consensus and outbound slots are full, starts a cooldown timer (`OUT_OF_SYNC_RECONNECT_DELAY = 60s` at tick.rs:572), and after cooldown drops a random non-preferred outbound peer. Called from the tick loop at tick.rs:287-291. Comprehensively tested (`test_maybe_drop_random_peer_drops_after_cooldown`, `test_maybe_drop_random_peer_skips_preferred`, `test_maybe_drop_random_peer_only_drops_outbound`, etc.).
+- **Status**: **Partial**. henyey implements the random out-of-sync drop path via `maybe_drop_random_peer` at `manager/tick.rs:589-670`. The function starts a cooldown timer (`OUT_OF_SYNC_RECONNECT_DELAY = 60s` at tick.rs:572), and after cooldown drops a random non-preferred outbound peer. Called from the tick loop at tick.rs:287-291. Comprehensively tested (`test_maybe_drop_random_peer_drops_after_cooldown`, `test_maybe_drop_random_peer_skips_preferred`, `test_maybe_drop_random_peer_only_drops_outbound`, etc.).
+- **Divergence 1 — later cooldown start**: In stellar-core, `OverlayManagerImpl::tick()` enters `updateTimerAndMaybeDropRandomPeer(shouldDrop)` whenever `availablePendingSlots > 0` (`OverlayManagerImpl.cpp:764-766`), and the helper arms `mLastOutOfSyncReconnect` on the very first unsynced tick even when `shouldDrop == false` (`OverlayManagerImpl.cpp:604-635`). In henyey, the cooldown is only started once the node is out of sync **and** outbound peers are already full (`outbound_count >= max_outbound`, tick.rs:604-605,607-609). This means henyey starts the 60 s cooldown later than stellar-core in cases where the node goes out of sync before outbound slots are saturated.
+- **Divergence 3 — missing pending-slot precondition**: In stellar-core, the random-drop path is only entered when `availableOutboundPendingSlots() > 0` (`OverlayManagerImpl.cpp:735-740,798-810`); if both authenticated outbound slots and pending slots are exhausted, stellar-core returns from `tick()` before reaching `updateTimerAndMaybeDropRandomPeer()`. In henyey, `maybe_drop_random_peer()` is called unconditionally each tick (tick.rs:291) and only checks `outbound_count >= max_outbound` (tick.rs:604-605). This means henyey can enter the random-drop path even when pending connection slots are exhausted — a case where stellar-core would skip the drop entirely. The divergence is non-consensus-affecting but may cause unnecessary disconnects when the node cannot immediately use the freed slot.
+- **Divergence 2 — missing timer reset when all peers are preferred**: In stellar-core, when the cooldown elapses and the drop path fires, `mLastOutOfSyncReconnect` is reset to `mApp.getClock().now()` unconditionally (throttling subsequent drops), even if no non-preferred peer was found to drop (`OverlayManagerImpl.cpp:626-633`). In henyey, when `candidates.is_empty()` the function returns early without updating the timestamp (tick.rs:637-639). This means that on subsequent ticks henyey will re-enter the drop logic immediately (cooldown already expired, still no candidates), whereas stellar-core throttles to one attempt per 60 s interval regardless.
+- **Notes**: All three divergences are non-consensus-affecting — they only influence connection churn timing under out-of-sync conditions. The core mechanism (cooldown → random non-preferred drop) is implemented correctly.
 
 ### §10.6 — PEERS sample size (Full)
 - **Claim**: "Up to 50 entries" (XDR vector ≤ 100).

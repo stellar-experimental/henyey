@@ -92,7 +92,14 @@ impl TxSetTracker {
         match self.pending.entry(hash) {
             dashmap::mapref::entry::Entry::Occupied(mut entry) => {
                 // Always increment — cap does not apply to existing entries.
-                entry.get_mut().request_count += 1;
+                let pending = entry.get_mut();
+                pending.request_count += 1;
+                // Propagate max slot: a later slot referencing the same hash
+                // should keep the entry alive longer during slot-based eviction
+                // (matches stellar-core's last-seen-slot semantics).
+                if slot > pending.slot {
+                    pending.slot = slot;
+                }
                 false
             }
             dashmap::mapref::entry::Entry::Vacant(entry) => {
@@ -182,6 +189,16 @@ impl TxSetTracker {
     ///   may briefly overshoot `max_cache_size` by one entry (acceptable, same as
     ///   the pre-fix behavior).
     pub(crate) fn store(&self, tx_set: TransactionSet) {
+        self.store_inner(tx_set, None);
+    }
+
+    /// Cache a parsed tx set with slot provenance (from pending→cached promotion).
+    /// If the hash already exists, keeps the **max** slot seen.
+    pub(crate) fn store_with_slot(&self, tx_set: TransactionSet, slot: u64) {
+        self.store_inner(tx_set, Some(slot));
+    }
+
+    fn store_inner(&self, tx_set: TransactionSet, slot: Option<u64>) {
         let hash = *tx_set.hash();
         let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
 
@@ -196,7 +213,17 @@ impl TxSetTracker {
         match self.cache.entry(hash) {
             dashmap::mapref::entry::Entry::Occupied(mut entry) => {
                 // Already cached — atomic in-place update, no eviction needed.
-                *entry.get_mut() = CachedTxSet::new(tx_set, seq);
+                // Keep max slot: if existing has a higher slot, preserve it.
+                let existing_slot = entry.get().slot;
+                let merged_slot = match (existing_slot, slot) {
+                    (Some(a), Some(b)) => Some(a.max(b)),
+                    (Some(a), None) => Some(a),
+                    (None, Some(b)) => Some(b),
+                    (None, None) => None,
+                };
+                let mut new_entry = CachedTxSet::new(tx_set, seq);
+                new_entry.slot = merged_slot;
+                *entry.get_mut() = new_entry;
             }
             dashmap::mapref::entry::Entry::Vacant(entry) => {
                 if at_capacity {
@@ -213,10 +240,21 @@ impl TxSetTracker {
                     }
                     // Best-effort insert after eviction. Not atomic with the
                     // vacancy check, but the common Occupied path is now race-free.
-                    self.cache.insert(hash, CachedTxSet::new(tx_set, seq));
+                    let new_entry = if let Some(s) = slot {
+                        CachedTxSet::new_with_slot(tx_set, seq, s)
+                    } else {
+                        CachedTxSet::new(tx_set, seq)
+                    };
+                    // slot already set via constructor
+                    self.cache.insert(hash, new_entry);
                 } else {
                     // Under capacity — fully atomic insert via entry guard.
-                    entry.insert(CachedTxSet::new(tx_set, seq));
+                    let new_entry = if let Some(s) = slot {
+                        CachedTxSet::new_with_slot(tx_set, seq, s)
+                    } else {
+                        CachedTxSet::new(tx_set, seq)
+                    };
+                    entry.insert(new_entry);
                 }
             }
         }
@@ -241,9 +279,9 @@ impl TxSetTracker {
         let pending = self.pending.remove(&hash);
         let slot = pending.map(|(_, p)| p.slot);
 
-        if slot.is_some() {
-            // Only cache tx sets we actually requested.
-            self.store(tx_set);
+        if let Some(s) = slot {
+            // Only cache tx sets we actually requested — with slot provenance.
+            self.store_with_slot(tx_set, s);
         } else {
             debug!(%hash, "Ignoring unsolicited tx set (not pending)");
         }
@@ -270,9 +308,20 @@ impl TxSetTracker {
 
     /// Check if a tx set is cached, and refresh its LRU touch_seq if so.
     /// This prevents eviction of tx-sets still referenced by buffered envelopes.
+    #[cfg(test)]
     pub fn is_cached_and_touch(&self, hash: &Hash256) -> bool {
+        self.is_cached_and_touch_slot(hash, None)
+    }
+
+    /// Check if a tx set is cached, refresh its LRU touch_seq, and optionally
+    /// propagate `slot` to `max(current, new)` — matching stellar-core's
+    /// last-seen-slot semantics (`touchFetchCache` / `getKnownTxSet`).
+    pub fn is_cached_and_touch_slot(&self, hash: &Hash256, slot: Option<u64>) -> bool {
         if let Some(mut entry) = self.cache.get_mut(hash) {
             entry.touch_seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
+            if let Some(new_slot) = slot {
+                entry.slot = Some(entry.slot.map_or(new_slot, |s| s.max(new_slot)));
+            }
             true
         } else {
             false
@@ -346,6 +395,64 @@ impl TxSetTracker {
         if count > 0 {
             info!(count, "Cleared tx_set_cache");
         }
+    }
+
+    /// Evict cached tx sets with a known slot <= `keep_after_slot`.
+    /// Entries with `slot: None` (unknown-slot sentinel from direct `cache_tx_set()`)
+    /// are preserved — they were not learned from pending fetches and must not be
+    /// over-pruned by slot-range cleanup.
+    /// Returns the number of entries evicted.
+    pub fn trim_stale_cached(&self, keep_after_slot: u64) -> usize {
+        let before = self.cache.len();
+        self.cache
+            .retain(|_, entry| entry.slot.map_or(true, |s| s > keep_after_slot));
+        before - self.cache.len()
+    }
+
+    /// Evict cached tx sets with a known slot < `cutoff`.
+    /// Entries with `slot: None` are preserved (unknown-slot sentinel).
+    /// Returns the number of entries evicted.
+    pub fn purge_cached_below(&self, cutoff: u64) -> usize {
+        let before = self.cache.len();
+        self.cache
+            .retain(|_, entry| entry.slot.map_or(true, |s| s >= cutoff));
+        before - self.cache.len()
+    }
+
+    /// Evict cached tx sets whose slot is in the given set of removed slots.
+    /// Entries with `slot: None` are preserved (unknown-slot sentinel).
+    /// Returns the number of entries evicted.
+    pub fn evict_cached_for_slots(&self, slots: &[u64]) -> usize {
+        if slots.is_empty() {
+            return 0;
+        }
+        let slot_set: std::collections::HashSet<u64> = slots.iter().copied().collect();
+        let before = self.cache.len();
+        self.cache
+            .retain(|_, entry| entry.slot.map_or(true, |s| !slot_set.contains(&s)));
+        before - self.cache.len()
+    }
+
+    /// Evict cached tx sets with a known slot > `max_slot`.
+    /// Entries with `slot: None` are preserved (unknown-slot sentinel).
+    /// Parity: stellar-core `PendingEnvelopes::eraseOutsideRange` evicts tx-set
+    /// cache entries with `slot > maxSlot` during `newSlotExternalized`.
+    /// Returns the number of entries evicted.
+    pub fn evict_cached_above(&self, max_slot: u64) -> usize {
+        let before = self.cache.len();
+        self.cache
+            .retain(|_, entry| entry.slot.map_or(true, |s| s <= max_slot));
+        before - self.cache.len()
+    }
+
+    /// Count cached tx sets whose slot falls within [from_slot, to_slot] (inclusive).
+    /// Entries with `slot: None` are NOT counted (they are from direct inserts,
+    /// not from pending fetches in the active catchup window).
+    pub fn cached_count_in_window(&self, from_slot: u64, to_slot: u64) -> usize {
+        self.cache
+            .iter()
+            .filter(|entry| entry.slot.map_or(false, |s| s >= from_slot && s <= to_slot))
+            .count()
     }
 
     // --- Diagnostics ---
@@ -1184,5 +1291,162 @@ mod tests {
             msg.contains(&hash_hex),
             "panic message must contain tx-set hash {hash_hex}, got: {msg}"
         );
+    }
+
+    #[test]
+    fn test_range_cleanup_preserves_unknown_slot_cached_entries() {
+        let tracker = TxSetTracker::new(256);
+
+        // Store a tx set through the direct `store()` path (no slot provenance)
+        let ts_direct = make_tx_set(50);
+        let hash_direct = *ts_direct.hash();
+        tracker.store(ts_direct);
+
+        // Store a tx set with slot provenance (via request+receive)
+        let ts_slotted_old = make_tx_set(51);
+        let hash_old = *ts_slotted_old.hash();
+        tracker.request(hash_old, 90);
+        tracker.receive(ts_slotted_old);
+
+        let ts_slotted_new = make_tx_set(52);
+        let hash_new = *ts_slotted_new.hash();
+        tracker.request(hash_new, 110);
+        tracker.receive(ts_slotted_new);
+
+        // Verify all three are cached
+        assert!(tracker.is_cached(&hash_direct));
+        assert!(tracker.is_cached(&hash_old));
+        assert!(tracker.is_cached(&hash_new));
+
+        // Run slot-range cleanup: trim stale cached with keep_after_slot = 100
+        let evicted = tracker.trim_stale_cached(100);
+        assert_eq!(evicted, 1); // Only the old slotted entry (slot 90)
+
+        // Unknown-slot entry is preserved
+        assert!(tracker.is_cached(&hash_direct));
+        // Old slotted entry (slot 90 <= 100) is evicted
+        assert!(!tracker.is_cached(&hash_old));
+        // New slotted entry (slot 110 > 100) is preserved
+        assert!(tracker.is_cached(&hash_new));
+    }
+
+    #[test]
+    fn test_cached_count_in_window() {
+        let tracker = TxSetTracker::new(256);
+
+        // Direct store (no slot) — should NOT count in any window
+        let ts_direct = make_tx_set(60);
+        tracker.store(ts_direct);
+
+        // Slotted entries
+        let ts1 = make_tx_set(61);
+        let h1 = *ts1.hash();
+        tracker.request(h1, 50);
+        tracker.receive(ts1);
+
+        let ts2 = make_tx_set(62);
+        let h2 = *ts2.hash();
+        tracker.request(h2, 100);
+        tracker.receive(ts2);
+
+        let ts3 = make_tx_set(63);
+        let h3 = *ts3.hash();
+        tracker.request(h3, 150);
+        tracker.receive(ts3);
+
+        // Window [51, 120] should only include slot 100
+        assert_eq!(tracker.cached_count_in_window(51, 120), 1);
+        // Window [50, 150] should include all slotted entries
+        assert_eq!(tracker.cached_count_in_window(50, 150), 3);
+        // Window [200, 300] should include none
+        assert_eq!(tracker.cached_count_in_window(200, 300), 0);
+    }
+
+    #[test]
+    fn test_request_propagates_max_slot() {
+        let tracker = TxSetTracker::new(256);
+        let hash = Hash256::from_bytes([0xAA; 32]);
+
+        // First request at slot 10
+        assert!(tracker.request(hash, 10));
+        assert_eq!(tracker.pending.get(&hash).unwrap().slot, 10);
+
+        // Duplicate request at slot 20 — should propagate max
+        assert!(!tracker.request(hash, 20));
+        assert_eq!(tracker.pending.get(&hash).unwrap().slot, 20);
+
+        // Duplicate request at slot 5 — should NOT regress
+        assert!(!tracker.request(hash, 5));
+        assert_eq!(tracker.pending.get(&hash).unwrap().slot, 20);
+    }
+
+    #[test]
+    fn test_is_cached_and_touch_slot_propagates_max() {
+        let tracker = TxSetTracker::new(256);
+        let ts = make_tx_set(42);
+        let hash = *ts.hash();
+
+        // Request at slot 10, receive it → cached with slot=10
+        tracker.request(hash, 10);
+        tracker.receive(ts);
+        assert_eq!(tracker.cache.get(&hash).unwrap().slot, Some(10));
+
+        // Touch with slot 20 → should update to 20
+        assert!(tracker.is_cached_and_touch_slot(&hash, Some(20)));
+        assert_eq!(tracker.cache.get(&hash).unwrap().slot, Some(20));
+
+        // Touch with slot 5 → should NOT regress
+        assert!(tracker.is_cached_and_touch_slot(&hash, Some(5)));
+        assert_eq!(tracker.cache.get(&hash).unwrap().slot, Some(20));
+
+        // Touch with None → should keep 20
+        assert!(tracker.is_cached_and_touch_slot(&hash, None));
+        assert_eq!(tracker.cache.get(&hash).unwrap().slot, Some(20));
+    }
+
+    #[test]
+    fn test_evict_cached_above_drops_entries_above_max_slot() {
+        let tracker = TxSetTracker::new(256);
+
+        // Direct store (no slot) — should be preserved
+        let ts_direct = make_tx_set(70);
+        let hash_direct = *ts_direct.hash();
+        tracker.store(ts_direct);
+
+        // Slotted entries
+        let ts_within = make_tx_set(71);
+        let hash_within = *ts_within.hash();
+        tracker.request(hash_within, 100);
+        tracker.receive(ts_within);
+
+        let ts_at_boundary = make_tx_set(72);
+        let hash_at = *ts_at_boundary.hash();
+        tracker.request(hash_at, 200);
+        tracker.receive(ts_at_boundary);
+
+        let ts_above = make_tx_set(73);
+        let hash_above = *ts_above.hash();
+        tracker.request(hash_above, 201);
+        tracker.receive(ts_above);
+
+        let ts_far_above = make_tx_set(74);
+        let hash_far = *ts_far_above.hash();
+        tracker.request(hash_far, 9999);
+        tracker.receive(ts_far_above);
+
+        // Evict entries with slot > 200
+        let evicted = tracker.evict_cached_above(200);
+        assert_eq!(evicted, 2); // ts_above (201) and ts_far_above (9999)
+
+        // Direct-store (no slot) preserved
+        assert!(tracker.is_cached(&hash_direct));
+        // slot 100 preserved
+        assert!(tracker.is_cached(&hash_within));
+        // slot 200 (boundary, <=) preserved
+        assert!(tracker.is_cached(&hash_at));
+        // slot 201 evicted
+        assert!(!tracker.is_cached(&hash_above));
+        // slot 9999 evicted
+        assert!(!tracker.is_cached(&hash_far));
     }
 }

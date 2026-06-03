@@ -178,70 +178,59 @@ fi
 
 Pick the head of the post-filter sorted list. If the list is empty, print `no actionable issues` and exit 0.
 
-### Step 4 — Acquire the issue (sentinel-comment lock)
+### Step 4 — Acquire the issue (host-local flock lock)
 
-The assignee field alone is NOT enough to detect a race when multiple loops run as the same GitHub user — both can self-assign and both think they won (see #2739). The fix is a **sentinel-comment lock**: each tick posts a uniquely-tagged comment, then verifies via comment ordering that its comment was the earliest one posted within a short grace window.
+The assignee field alone is NOT enough to detect a race when multiple loops run as the same GitHub user — both can self-assign and both think they won (see #2739). The **previous** guard was a sentinel-comment lock whose race check filtered comments to a 60-second window (`select(.created_at | fromdate > (now - 60))`). That window was the root cause of #2917: a sentinel older than 60s became invisible to a later tick's check, so the later tick declared itself winner and dispatched a **duplicate** specialist while the original was still running (review-pr can run 40+ min) — orphaning a reviewer, risking head-scoped bounce double-increment, starving the queue, and leaking a 24G worktree.
+
+The fix is **OS-enforced mutual exclusion**: a non-blocking host-local `flock` on a per-issue lockfile, held by the live tick process for the whole dispatch. All of the acquisition logic (preflight, lock, self-assign, sentinel post, cooldown-on-loss) lives in `acquire-issue-lock.sh` — the **single source of truth** (mirrors the `bounce-cap-check.sh` extraction pattern). This SKILL only invokes it and branches on the exit code; do NOT re-describe the algorithm here.
+
+**Critical: the flock FD must be held by the tick process across Step 5 dispatch and released only in Step 6 (or implicitly on tick exit).** The lock lives on the FD opened by `exec {LOCK_FD}>…` inside `acquire-issue-lock.sh`; that FD only survives into the tick process if the script is `source`d **directly in the tick's shell**.
+
+**Do NOT wrap the source in a command substitution** — `ACQUIRE_OUT="$( . acquire-issue-lock.sh … )"` runs the source in a forked `$()` subshell with its own FD table, so `exec {LOCK_FD}>` opens the lock FD in *that subshell*; when `$()` returns the subshell exits, the FD closes, and the flock is **released immediately**. The parent inherits `LOCK_FD=N` as a plain integer pointing at an already-closed descriptor. That silently reintroduces #2917 — and, with the #2934 reaper live, is actively dangerous: a second tick could then win the flock while this dispatch is still alive, and its reaper would positively-identify (host + PGID + start-time all match) and **kill this live dispatch's process-group** (the PR #2960 round-1 blocking defect).
+
+Instead, source the script **directly** (no `$()`), redirecting only its stdout to a temp file so the opened FD survives into the calling shell. `acquire-issue-lock.sh` is source-safe: it terminates via `return` (not `exit`) when sourced, snapshots/restores your shell options, and leaves `LOCK_FD` open in your shell on success.
 
 ```bash
-# Generate a unique tick ID. Includes PID and nanosecond timestamp so two
-# ticks in the same second still differ.
-TICK_ID="tick-$(date +%s%N)-$$"
+# Run in the LONG-LIVED tick process (the copilot process from
+# scripts/project-tick-loop.sh). The loop leaves TICK_PID UNSET (#2948), so the
+# `${TICK_PID:-$$}` fallback below derives this tick's OWN $$ — the actual
+# flock holder — as the sentinel identity. Sourcing DIRECTLY (not inside $())
+# keeps the lock FD open in this shell after the script returns.
+TICK_PID="${TICK_PID:-$$}"; export TICK_PID
 
-# Self-assign. This is necessary (so /project-tick filters us out of future
-# picker runs) but no longer SUFFICIENT for race detection.
-gh issue edit "$ISSUE" --repo stellar-experimental/henyey --add-assignee @me
+_acq_tmp="$(mktemp)"
+. .github/skills/shared/scripts/acquire-issue-lock.sh "$ISSUE" "$STATUS" >"$_acq_tmp"
+ACQUIRE_RC=$?
 
-# Post the sentinel comment. Capture the comment ID so we can clean it up.
-SENTINEL_ID=$(gh api "repos/stellar-experimental/henyey/issues/$ISSUE/comments" \
-  --method POST \
-  -f body="## 🔒 acquired-by:$TICK_ID
-
-posted=$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ), host=$(hostname), pid=$$" \
-  --jq '.id')
-
-if [ -z "$SENTINEL_ID" ]; then
-  echo "Sentinel post failed — backing off"
-  gh issue edit "$ISSUE" --repo stellar-experimental/henyey --remove-assignee @me 2>/dev/null || true
+if [ "$ACQUIRE_RC" -ne 0 ]; then
+  # Lock held by a live tick (or flock missing / preflight failed). The script
+  # has already written the per-loop #2822 cooldown and posted no sentinel.
+  # Back off — the next /project-tick picks a different issue.
+  rm -f "$_acq_tmp"
+  echo "Backed off on #$ISSUE (acquire-issue-lock.sh rc=$ACQUIRE_RC)"
   exit 0
 fi
 
-# Grace window — sleep long enough for any concurrent tick to also post
-# its sentinel. 5 seconds is enough; the cost is bounded per tick.
-sleep 5
-
-# Fetch all recent sentinel comments and find the earliest one within the
-# past 60 seconds. Tie-break by comment ID (which is monotonic at the API
-# level). If our sentinel is the earliest, we won.
-WINNER_TICK=$(gh api "repos/stellar-experimental/henyey/issues/$ISSUE/comments" \
-  --paginate \
-  --jq '[.[] | select(.body | startswith("## 🔒 acquired-by:")) |
-    select(.created_at | fromdate > (now - 60)) |
-    {id, created_at, tick: (.body | split("\n")[0] | sub("^## 🔒 acquired-by:"; ""))}] |
-    sort_by(.created_at, .id) | .[0].tick // ""')
-
-if [ "$WINNER_TICK" != "$TICK_ID" ]; then
-  echo "race lost on #$ISSUE (winner: $WINNER_TICK, us: $TICK_ID) — exiting"
-  # Clean up our sentinel only. DO NOT unassign — multiple ticks running as the
-  # same GitHub user share one assignment record, so removing it would yank
-  # the winner's assignment out from under it (see #2787 / audit M1). The
-  # winner retains the assignment and proceeds; we just step back.
-  gh api "repos/stellar-experimental/henyey/issues/comments/$SENTINEL_ID" --method DELETE 2>/dev/null || true
-  # Record a 5-minute cooldown so the next tick from this loop skips this
-  # issue and falls through to lower-priority actionable items (#2822). The
-  # foreign loop's specialist typically runs 5–30 min; if it finishes before
-  # the cooldown expires, the natural state transition removes the item from
-  # the actionable list anyway and the cooldown entry harmlessly expires.
-  COOLDOWN_FILE="/tmp/project-tick-cooldown-${LOOP_PID:-default}"
-  echo "$ISSUE $(( $(date +%s) + 300 ))" >> "$COOLDOWN_FILE"
-  exit 0
-fi
-
-echo "Won race on #$ISSUE (sentinel $TICK_ID is earliest). Proceeding."
+# Acquired. The script emitted (on stdout, redirected above): LOCK_FD, LOCK_PATH,
+# SENTINEL_ID, TICK_ID. The lock is held on $LOCK_FD in THIS shell. Parse them:
+eval "$(grep -E '^(LOCK_FD|LOCK_PATH|SENTINEL_ID|TICK_ID)=' "$_acq_tmp")"
+rm -f "$_acq_tmp"
+echo "Won acquisition on #$ISSUE; proceeding to dispatch holding fd=$LOCK_FD."
 ```
 
-If we lose the race, exit cleanly — the next `/project-tick` will pick a different issue.
+What `acquire-issue-lock.sh` guarantees (so you don't have to reason about it inline):
 
-**Sentinel cleanup** is important to avoid issues accumulating dozens of `## 🔒` comments over time. The losing tick deletes its sentinel immediately. The winning tick MUST delete its sentinel after the specialist returns (or on any exit path) — see Step 6.
+- **flock preflight is fail-closed:** if `flock` is absent (host without util-linux) the script exits 1 (back off). It never falls back to the racy time-window scheme.
+- **lock path** is derived under the `~/data` workspace contract root (`agent-worktree-contract.sh`) on a **host-stable, issue-scoped** namespace: `<real-home>/data/project-tick/tick-locks/<ISSUE>.lock`. The namespace is a fixed constant (`project-tick`), NOT the per-process session — so every tick/loop on the host shares one lockfile per issue and `flock` actually serializes them. Keying on the per-process `CLAUDE_SESSION_ID` was the #2936 review defect: two copilot processes computed different inodes and never mutually excluded. `PROJECT_TICK_LOCK_SESSION_ID` overrides the namespace for test isolation only; real ticks leave it unset.
+- **non-blocking `flock -n`:** if a concurrent live tick holds the lock, the call fails immediately → exit 1 (kernel-atomic, race-free, independent of elapsed wall-time — this is what fixes #2917).
+- **auto-release on death:** the lock is released when the FD closes, so a crashed/killed tick frees it with no manual reaping.
+- **reap-on-acquire-success (#2934):** immediately after winning the flock — and *before* posting its own sentinel — the script invokes `reap-stale-dispatch.sh "$ISSUE"` (best-effort, non-fatal). This closes the former residual window below. Winning the flock proves no other live *lock holder* exists; it does NOT by itself prove the prior dispatch's whole process tree is gone — the residual-window scenario is exactly that the prior lock holder died (releasing its FD-scoped flock) while a specialist it forked as a child kept running detached. So the reaper does NOT assume the prior dispatch is dead: it reads the prior sentinel's recorded **process-group + leader start-time** and kills that orphaned process-group **only if it re-verifies the recorded leader is still positively ALIVE** — gated on **same-host + PGID + start-time positive match + signalable**, re-checked again at the signal point (a gone/reused PID or an `EPERM`/foreign process is never signalled — see the script header). It always `rm -rf`s the prior dispatch's `~/data/<session>/{plan,review-pr,do}-<ISSUE>` workspace, guarded by `require_home_data_path` (refuses any path that does not canonicalize under `~/data`). The in-repo `$REPO_ROOT/data/do-<ISSUE>` worktree is intentionally NOT touched (tracked separately as #2843).
+  - **Former residual window (now closed by #2934):** the lock lives on the tick process's FD. If the tick process died (crash/kill) while a specialist it dispatched as a *child* survived the parent, the kernel released the lock while the orphaned specialist kept running, and a new tick could dispatch a second specialist for the same issue. Reap-on-acquire now kills that orphaned group when the new tick wins the lock.
+- **self-assign always:** runs `gh issue edit --add-assignee @me` for **every** pick including `in-review` (the empty-assignee gap from the #2909 incident).
+- **sentinel comment is best-effort only:** still posted as a board-visible audit artifact + best-effort cross-host signal. It records `host`, `posted`, the owning tick's pid via `${TICK_PID:-$$}` (the loop leaves `TICK_PID` unset — #2948 — so this is the tick's own `$$`, the actual flock holder, not the long-lived loop pid), **plus the per-dispatch process-group identity `dispatch_pgid` + `dispatch_starttime`** (#2934). These last two are **self-recorded from the acquiring process's own `/proc/self`** — NOT handed down from the loop via a post-spawn env export, which could never reach an already-exec'd child (#2956). For the recorded `dispatch_pgid` to cover only the dispatch tree, `project-tick-loop.sh` launches each tick as its own process-group leader via `setsid --wait` (#2957). The authoritative same-host guard remains the flock. **Cross-host limitation:** flock is host-local; on a multi-host fleet the sentinel host-match + start-time check is forward-proofing only. Single-host is the live deployment.
+- **lost-race cooldown:** on exit 1 the script appends a 5-minute `<issue> <expiry>` line to `/tmp/project-tick-cooldown-${LOOP_PID}` (#2822) so the next tick from this loop skips this issue.
+
+If we lose the race (rc != 0), exit cleanly — the next `/project-tick` will pick a different issue. Do **not** unassign on loss: multiple ticks running as the same GitHub user share one assignment record, so removing it would yank the winner's assignment out from under it (see #2787 / audit M1).
 
 ### Step 5 — Dispatch
 
@@ -270,13 +259,23 @@ The specialist is responsible for:
 - Unassigning itself on completion (`gh issue edit --remove-assignee @me`).
 - Posting any required artifacts (triage report, converged plan, PR, review).
 
-`/project-tick` IS responsible for one cleanup: **deleting its sentinel-lock comment** (from Step 4). Always run this, regardless of the specialist's exit status:
+`/project-tick` IS responsible for releasing the Step-4 acquisition. Always run this, regardless of the specialist's exit status:
 
 ```bash
-gh api "repos/stellar-experimental/henyey/issues/comments/$SENTINEL_ID" --method DELETE 2>/dev/null || true
+# Release the host-local flock by closing its FD. This is the authoritative
+# release — the lock is held for the whole dispatch and freed here (or, if the
+# tick crashes/is killed, implicitly when the process dies). Held since Step 4.
+[ -n "${LOCK_FD:-}" ] && eval "exec ${LOCK_FD}>&-" 2>/dev/null || true
+
+# Delete the best-effort sentinel comment so issues don't accumulate dozens of
+# `## 🔒` audit comments over time.
+[ -n "${SENTINEL_ID:-}" ] && \
+  gh api "repos/stellar-experimental/henyey/issues/comments/$SENTINEL_ID" --method DELETE 2>/dev/null || true
 ```
 
-If the sub-agent fails (non-zero exit), leave the issue's state and assignee as-is — the next tick will see we're still assigned and skip it. The operator will see the stuck assignment in the daily summary / loop log. The sentinel still gets deleted so it doesn't pollute future race detection.
+The flock is the lock that mattered; the sentinel was only a best-effort cross-host signal + audit artifact. Closing the FD is what frees a concurrent tick to pick this issue next.
+
+If the sub-agent fails (non-zero exit), leave the issue's state and assignee as-is — the next tick will see we're still assigned and skip it. The operator will see the stuck assignment in the daily summary / loop log. The lock and sentinel still get released so they don't block or pollute future acquisition.
 
 ## Flags
 

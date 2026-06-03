@@ -644,7 +644,7 @@ impl Herder {
         };
         let fetching_envelopes = FetchingEnvelopes::new(
             fetching_config,
-            Box::new(move |hash| scp_driver_for_fetching.has_tx_set_and_touch(hash)),
+            Box::new(move |hash, slot| scp_driver_for_fetching.has_tx_set_and_touch(hash, slot)),
         );
 
         // Pre-cache the local quorum set in fetching_envelopes so envelopes
@@ -1260,15 +1260,20 @@ impl Herder {
 
     /// Compute the minimum ledger sequence to ask peers for SCP state.
     ///
-    /// Matches stellar-core's `HerderImpl::getMinLedgerSeqToAskPeers()`:
-    /// the computed low watermark is clamped so it never drops below
-    /// `get_min_ledger_seq_to_remember()`.
+    /// Parity: stellar-core `HerderImpl::getMinLedgerSeqToAskPeers()`
+    /// (HerderImpl.cpp:1386-1411) — computes a lookback from LCL using
+    /// `min(MAX_SLOTS_TO_REMEMBER, SCP_EXTRA_LOOKBACK_LEDGERS)`, then clamps
+    /// upward against `getMinLedgerSeqToRemember()` so we never ask for slots
+    /// the herder would immediately forget.
     pub fn get_min_ledger_seq_to_ask_peers(&self) -> u32 {
         let lcl = self.ledger_manager.current_ledger_seq();
         let mut low = lcl.saturating_add(1);
-        // stellar-core uses min(MAX_SLOTS_TO_REMEMBER, SCP_EXTRA_LOOKBACK_LEDGERS)
-        // where SCP_EXTRA_LOOKBACK_LEDGERS = 3. Use the same fixed constants to
-        // ensure parity regardless of the configurable max_externalized_slots.
+        // stellar-core uses `std::min(Config::MAX_SLOTS_TO_REMEMBER,
+        // SCP_EXTRA_LOOKBACK_LEDGERS)` where SCP_EXTRA_LOOKBACK_LEDGERS = 3.
+        // Use the same `MAX_SLOTS_TO_REMEMBER` constant that the sibling
+        // `get_min_ledger_seq_to_remember()` floor uses, so both halves of the
+        // clamp read the same retention window (stellar-core reads
+        // `Config::MAX_SLOTS_TO_REMEMBER` in both).
         const SCP_EXTRA_LOOKBACK_LEDGERS: u32 = 3;
         let window = (MAX_SLOTS_TO_REMEMBER as u32).min(SCP_EXTRA_LOOKBACK_LEDGERS);
         if low > window {
@@ -1276,8 +1281,9 @@ impl Herder {
         } else {
             low = 1;
         }
-        // Clamp against the remember floor so we never ask for slots that are
-        // too old to be useful (parity with stellar-core §15.3).
+
+        // Do not ask for slots we'd be dropping anyway (stellar-core parity:
+        // `low = std::max<uint32>(low, getMinLedgerSeqToRemember())`).
         let remember_floor = self.get_min_ledger_seq_to_remember() as u32;
         low.max(remember_floor)
     }
@@ -2875,6 +2881,16 @@ impl Herder {
         self.fetching_envelopes
             .erase_outside_range(min_slot, max_slot, keep_slot);
 
+        // Evict cached tx sets outside the valid slot range in scp_driver.
+        // Parity: stellar-core PendingEnvelopes::eraseOutsideRange (line 726-731)
+        // also prunes the tx-set cache for entries outside [min, max].
+        // The lower bound is already handled by purge_slots_below / trim_stale_caches;
+        // this covers the upper bound so far-future slot touches cannot pin tx-sets
+        // indefinitely outside the active window.
+        if let Some(max) = max_slot {
+            self.scp_driver.evict_cached_above(max);
+        }
+
         // Clean up old data
         self.cleanup();
 
@@ -3798,6 +3814,16 @@ impl Herder {
     /// Check if we need a transaction set.
     pub fn needs_tx_set(&self, hash: &Hash256) -> bool {
         self.scp_driver.needs_tx_set(hash)
+    }
+
+    /// Count tx-set backlog (cached + pending) in the active catchup window.
+    /// Used by app-side scheduling to bound outbound `GetTxSet` demand.
+    pub fn tx_set_backlog_in_window(&self, from_slot: u64, to_slot: u64) -> usize {
+        // Only count cached tx-sets (which consume memory) — not pending hashes
+        // (which are small metadata). Counting pending against the budget would
+        // prevent GetTxSet from ever being issued when many hashes arrive during
+        // catchup, causing a liveness deadlock.
+        self.scp_driver.cached_tx_sets_in_window(from_slot, to_slot)
     }
 
     /// Receive a transaction set from the network.
@@ -13087,6 +13113,37 @@ mod required_lm_behavioral_tests {
         // Slot 0 also empty.
         let state = herder.get_scp_externalizing_state(0);
         assert!(state.is_empty());
+    }
+
+    /// Regression test for #2904: when the herder's tracking consensus index
+    /// is far ahead of LCL (e.g. tracking = 200, LCL = 50), the unclamped
+    /// formula returns a low watermark below get_min_ledger_seq_to_remember().
+    /// stellar-core clamps with `max(low, getMinLedgerSeqToRemember())`.
+    #[test]
+    fn test_get_min_ledger_seq_to_ask_peers_clamps_to_remember_floor_when_tracking_ahead() {
+        let lm = make_ledger_manager_at_seq(50);
+        let herder = Herder::new(HerderConfig::default(), lm, TimerManagerHandle::no_op());
+        // Set to Tracking state with tracking_slot=201 → consensus_index=200
+        {
+            let mut state = tracked_write(LOCK_HERDER_STATE, &herder.state);
+            *state = HerderState::Tracking;
+        }
+        {
+            let mut ts = tracked_write(LOCK_TRACKING_STATE, &herder.tracking_state);
+            ts.is_tracking = true;
+            ts.consensus_index = 201;
+        }
+
+        // get_min_ledger_seq_to_remember() = 200 - 12 + 1 = 189
+        let min_seq = herder.get_min_ledger_seq_to_ask_peers();
+
+        // Without clamp: lcl=50, low=51, window=3, low=48
+        // With clamp: max(48, 189) = 189
+        assert_eq!(
+            min_seq, 189,
+            "get_min_ledger_seq_to_ask_peers must clamp to get_min_ledger_seq_to_remember \
+             when tracking is ahead of LCL (stellar-core parity)"
+        );
     }
 
     /// ledger_close_duration() delegates directly to LedgerManager.

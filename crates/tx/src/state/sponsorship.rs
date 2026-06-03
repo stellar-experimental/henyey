@@ -236,7 +236,8 @@ impl LedgerStateManager {
         sponsored: &AccountId,
         multiplier: i64,
     ) -> Result<Option<AccountId>> {
-        if self.entry_sponsor(key).is_none() {
+        let phase1_sponsor = self.entry_sponsor(key);
+        if phase1_sponsor.is_none() {
             return Ok(None);
         }
         if multiplier < 0 {
@@ -246,9 +247,9 @@ impl LedgerStateManager {
         }
         // Validate before any mutation.
         self.validate_can_remove_sponsorship(key, Some(sponsored), multiplier)?;
-        let sponsor = self
-            .remove_entry_sponsor(key)
-            .expect("sponsor verified present");
+        // Use Phase-1 captured sponsor for count updates (issue #2900).
+        let sponsor = phase1_sponsor.unwrap();
+        self.remove_entry_sponsor(key);
         self.update_num_sponsoring(&sponsor, -multiplier)?;
         self.update_num_sponsored(sponsored, -multiplier)?;
         Ok(Some(sponsor))
@@ -263,7 +264,8 @@ impl LedgerStateManager {
         sponsored: Option<&AccountId>,
         multiplier: i64,
     ) -> Result<Option<AccountId>> {
-        if self.entry_sponsor(key).is_none() {
+        let phase1_sponsor = self.entry_sponsor(key);
+        if phase1_sponsor.is_none() {
             return Ok(None);
         }
         if multiplier < 0 {
@@ -273,9 +275,9 @@ impl LedgerStateManager {
         }
         // Validate before any mutation.
         self.validate_can_remove_sponsorship(key, sponsored, multiplier)?;
-        let sponsor = self
-            .remove_entry_sponsor(key)
-            .expect("sponsor verified present");
+        // Use Phase-1 captured sponsor for count updates (issue #2900).
+        let sponsor = phase1_sponsor.unwrap();
+        self.remove_entry_sponsor(key);
         self.update_num_sponsoring(&sponsor, -multiplier)?;
         if let Some(sponsored) = sponsored {
             self.update_num_sponsored(sponsored, -multiplier)?;
@@ -343,11 +345,12 @@ impl LedgerStateManager {
 
         // ── Phase 1: validate ────────────────────────────────────────
         //
-        // Load the sponsored account explicitly. `validate_can_remove_sponsorship`
-        // only loads it when there *is* a sponsor; we need it loaded
-        // unconditionally because Phase 2 unconditionally decrements
-        // `num_sub_entries` on it.
+        // Capture the sponsor identity once. This snapshot is the single
+        // source of truth for Phase 2 — no second lookup is performed.
+        // (Fixes issue #2900: remove_entry_sponsorship could previously
+        // return None for offer keys with stale fallback entries.)
         self.ensure_account_loaded(sponsored)?;
+        let phase1_sponsor = self.entry_sponsor(key);
         self.validate_can_remove_sponsorship(key, Some(sponsored), multiplier)?;
 
         // ── Phase 2: mutate (infallible — direct field writes) ───────
@@ -359,11 +362,10 @@ impl LedgerStateManager {
             .expect("sponsored account loaded in Phase 1");
         henyey_common::checked_types::dec_sub_entries(acc, multiplier as u32);
 
-        // (b) If sponsored, clear metadata and decrement counts.
-        if self.entry_sponsor(key).is_some() {
-            let sponsor = self
-                .remove_entry_sponsor(key)
-                .expect("sponsor verified present in Phase 1");
+        // (b) If sponsored, clear metadata and decrement counts using
+        //     the Phase-1 captured sponsor identity.
+        if let Some(sponsor) = phase1_sponsor {
+            self.remove_entry_sponsor(key);
 
             let sponsor_acc = self
                 .get_account_mut(&sponsor)
@@ -456,10 +458,8 @@ impl LedgerStateManager {
         self.validate_can_remove_sponsorship(&key, Some(source), multiplier)?;
 
         // Phase 2: mutate (direct field writes — preconditions verified).
-        let sponsor_removed = self
-            .remove_entry_sponsor(&key)
-            .expect("sponsor verified present in Phase 1");
-        debug_assert_eq!(sponsor_removed, sponsor);
+        // Use Phase-1 captured `sponsor` for count updates (issue #2900).
+        self.remove_entry_sponsor(&key);
 
         let sponsor_acc = self
             .get_account_mut(&sponsor)
@@ -504,16 +504,15 @@ impl LedgerStateManager {
                 "negative sponsorship multiplier".to_string(),
             ));
         }
-        if self.entry_sponsor(key).is_none() {
+        // Phase 1: capture sponsor and validate.
+        let phase1_sponsor = self.entry_sponsor(key);
+        let Some(sponsor) = phase1_sponsor else {
             return Ok(()); // No sponsor — nothing to validate or decrement.
-        }
-        // Phase 1: validate (loads sponsor, verifies num_sponsoring >= multiplier).
+        };
         self.validate_can_remove_sponsorship(key, None, multiplier)?;
 
-        // Phase 2: mutate (direct field writes — preconditions verified).
-        let sponsor = self
-            .remove_entry_sponsor(key)
-            .expect("sponsor verified present in Phase 1");
+        // Phase 2: mutate using Phase-1 captured sponsor (issue #2900).
+        self.remove_entry_sponsor(key);
         let sponsor_acc = self
             .get_account_mut(&sponsor)
             .expect("sponsor account loaded by validate_can_remove_sponsorship");
@@ -1927,5 +1926,278 @@ mod tests {
         assert_eq!(v2.num_sponsored, 2);
         assert_eq!(v2.num_sponsoring, 2);
         assert!(state.entry_sponsor(&key).is_some());
+    }
+
+    // ========================================================================
+    // Regression test for #2900 — L62759194 panic
+    // ========================================================================
+
+    /// Regression test for #2900: remove_sponsored_subentry must not panic when
+    /// an offer key has sponsorship metadata split between the offer store
+    /// record (sponsor: None) and the entry_sponsorships fallback map
+    /// (Some(sponsor)).
+    ///
+    /// This reproduces the exact crash at sponsorship.rs:366 ("sponsor verified
+    /// present in Phase 1") by engineering the inconsistent state that arises
+    /// when a rollback restores sponsorship via insert_entry_sponsorship while
+    /// the offer record already exists in the store with sponsor: None.
+    ///
+    /// Pre-fix: panics at `.expect("sponsor verified present in Phase 1")`.
+    /// Post-fix: completes successfully, clears metadata, decrements all counts.
+    #[test]
+    fn test_l62759194_replay_subentry_removal_uses_phase1_sponsor_snapshot() {
+        use stellar_xdr::curr::{LedgerKeyOffer, OfferEntry, OfferEntryExt, Price};
+
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+
+        let sponsored_id = create_test_account_id(220);
+        let sponsor_id = create_test_account_id(221);
+        let offer_id: i64 = 99001;
+
+        // Create accounts with proper counts.
+        // Sponsored: num_sub_entries=1, num_sponsored=1
+        // Sponsor: num_sponsoring=1
+        state.create_account(create_test_account_with_sponsorship(
+            sponsored_id.clone(),
+            100_000_000,
+            1, // num_sub_entries (the offer counts as a subentry)
+            1, // num_sponsored
+            0,
+        ));
+        state.create_account(create_test_account_with_sponsorship(
+            sponsor_id.clone(),
+            100_000_000,
+            0,
+            0,
+            1, // num_sponsoring
+        ));
+
+        // Create the offer in the store WITHOUT sponsor on the record.
+        // This simulates an offer loaded from bucket list or created without
+        // picking up its pre-existing sponsorship from the fallback map.
+        let offer_entry = OfferEntry {
+            seller_id: sponsored_id.clone(),
+            offer_id,
+            selling: Asset::Native,
+            buying: Asset::Native,
+            amount: 1_000_000,
+            price: Price { n: 1, d: 1 },
+            flags: 0,
+            ext: OfferEntryExt::V0,
+        };
+        // Insert directly into the offer store with sponsor=None.
+        {
+            let record = super::super::offer_store::OfferRecord {
+                entry: offer_entry,
+                last_modified: 100,
+                sponsor: None, // KEY: record has no sponsor
+                has_ext: false,
+            };
+            let mut store = state.offer_store_lock();
+            store.insert_record(record);
+        }
+
+        // Now insert the STALE sponsorship into the fallback entry_sponsorships
+        // map. This is the state that arises after a rollback restores
+        // sponsorship for an offer key that already has a record in the store.
+        let offer_key = LedgerKey::Offer(LedgerKeyOffer {
+            seller_id: sponsored_id.clone(),
+            offer_id,
+        });
+        state
+            .entry_sponsorships
+            .insert(offer_key.clone(), sponsor_id.clone());
+
+        // Verify precondition: entry_sponsor sees the sponsor (via fallback).
+        assert!(
+            state.entry_sponsor(&offer_key).is_some(),
+            "precondition: entry_sponsor must see the sponsor via fallback map"
+        );
+
+        // This call panics on origin/main with:
+        //   "sponsor verified present in Phase 1"
+        // because remove_entry_sponsorship only checks the offer store record
+        // (which has sponsor=None) and not the fallback.
+        let result = state.remove_sponsored_subentry(&offer_key, &sponsored_id, 1);
+        assert!(
+            result.is_ok(),
+            "remove_sponsored_subentry must not panic; got: {:?}",
+            result.err()
+        );
+
+        // Verify post-conditions match stellar-core behavior.
+        let sponsored_acc = state.get_account(&sponsored_id).unwrap();
+        assert_eq!(
+            sponsored_acc.num_sub_entries, 0,
+            "num_sub_entries must be decremented"
+        );
+        let v2 = get_ext_v2(sponsored_acc);
+        assert_eq!(v2.num_sponsored, 0, "num_sponsored must be decremented");
+
+        let sponsor_acc = state.get_account(&sponsor_id).unwrap();
+        let sv2 = get_ext_v2(sponsor_acc);
+        assert_eq!(sv2.num_sponsoring, 0, "num_sponsoring must be decremented");
+
+        assert!(
+            state.entry_sponsor(&offer_key).is_none(),
+            "sponsorship metadata must be cleared"
+        );
+    }
+
+    /// Regression test for #2900: remove_account_merge_sponsorship must use
+    /// the Phase-1 captured sponsor snapshot, not a second lookup.
+    #[test]
+    fn test_remove_account_merge_sponsorship_uses_phase1_sponsor_snapshot() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let source_id = create_test_account_id(230);
+        let sponsor_id = create_test_account_id(231);
+
+        state.create_account(create_test_account_with_sponsorship(
+            source_id.clone(),
+            100_000_000,
+            5, // num_sub_entries — must not be touched
+            2, // num_sponsored
+            0,
+        ));
+        state.create_account(create_test_account_with_sponsorship(
+            sponsor_id.clone(),
+            100_000_000,
+            0,
+            0,
+            2, // num_sponsoring
+        ));
+
+        let key = LedgerKey::Account(LedgerKeyAccount {
+            account_id: source_id.clone(),
+        });
+        state.set_entry_sponsor(key.clone(), sponsor_id.clone());
+
+        // Uses captured Phase-1 sponsor. On current code this works fine for
+        // non-offer keys, but verifies the pattern post-refactor.
+        state
+            .remove_account_merge_sponsorship(&source_id, 2)
+            .unwrap();
+
+        let source = state.get_account(&source_id).unwrap();
+        assert_eq!(source.num_sub_entries, 5, "num_sub_entries must not change");
+        let v2 = get_ext_v2(source);
+        assert_eq!(v2.num_sponsored, 0);
+
+        let sponsor = state.get_account(&sponsor_id).unwrap();
+        let sv2 = get_ext_v2(sponsor);
+        assert_eq!(sv2.num_sponsoring, 0);
+
+        assert!(state.entry_sponsor(&key).is_none());
+    }
+
+    /// Regression test for #2900: remove_sponsored_claimable_balance must use
+    /// the Phase-1 captured sponsor snapshot.
+    #[test]
+    fn test_remove_sponsored_claimable_balance_uses_phase1_sponsor_snapshot() {
+        use stellar_xdr::curr::{ClaimableBalanceId, Hash, LedgerKeyClaimableBalance};
+
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let sponsor_id = create_test_account_id(240);
+
+        state.create_account(create_test_account_with_sponsorship(
+            sponsor_id.clone(),
+            100_000_000,
+            0,
+            0,
+            1, // num_sponsoring
+        ));
+
+        let balance_id = ClaimableBalanceId::ClaimableBalanceIdTypeV0(Hash([240; 32]));
+        let key = LedgerKey::ClaimableBalance(LedgerKeyClaimableBalance {
+            balance_id: balance_id.clone(),
+        });
+
+        // Set sponsor via the normal public API (non-offer key, so no
+        // store/fallback inconsistency issue — but verifies the refactored
+        // helper uses Phase-1 capture).
+        state.set_entry_sponsor(key.clone(), sponsor_id.clone());
+
+        let result = state.remove_sponsored_claimable_balance(&key, 1);
+        assert!(result.is_ok());
+
+        let sponsor = state.get_account(&sponsor_id).unwrap();
+        let sv2 = get_ext_v2(sponsor);
+        assert_eq!(sv2.num_sponsoring, 0);
+
+        assert!(state.entry_sponsor(&key).is_none());
+    }
+
+    /// Regression test for #2900: remove_entry_sponsorship_and_update_counts
+    /// must use the Phase-1 captured sponsor snapshot.
+    #[test]
+    fn test_remove_entry_sponsorship_and_update_counts_uses_phase1_sponsor_snapshot() {
+        use stellar_xdr::curr::{LedgerKeyOffer, OfferEntry, OfferEntryExt, Price};
+
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+
+        let sponsored_id = create_test_account_id(250);
+        let sponsor_id = create_test_account_id(251);
+        let offer_id: i64 = 99002;
+
+        state.create_account(create_test_account_with_sponsorship(
+            sponsored_id.clone(),
+            100_000_000,
+            1,
+            1, // num_sponsored
+            0,
+        ));
+        state.create_account(create_test_account_with_sponsorship(
+            sponsor_id.clone(),
+            100_000_000,
+            0,
+            0,
+            1, // num_sponsoring
+        ));
+
+        // Same inconsistent state as L62759194: offer in store with no
+        // sponsor, but fallback has the sponsor.
+        let offer_entry = OfferEntry {
+            seller_id: sponsored_id.clone(),
+            offer_id,
+            selling: Asset::Native,
+            buying: Asset::Native,
+            amount: 1_000_000,
+            price: Price { n: 1, d: 1 },
+            flags: 0,
+            ext: OfferEntryExt::V0,
+        };
+        {
+            let record = super::super::offer_store::OfferRecord {
+                entry: offer_entry,
+                last_modified: 100,
+                sponsor: None,
+                has_ext: false,
+            };
+            let mut store = state.offer_store_lock();
+            store.insert_record(record);
+        }
+
+        let offer_key = LedgerKey::Offer(LedgerKeyOffer {
+            seller_id: sponsored_id.clone(),
+            offer_id,
+        });
+        state
+            .entry_sponsorships
+            .insert(offer_key.clone(), sponsor_id.clone());
+
+        // This should work without panic — uses Phase-1 captured sponsor.
+        let result = state.remove_entry_sponsorship_and_update_counts(&offer_key, &sponsored_id, 1);
+        assert!(result.is_ok(), "must not panic; got: {:?}", result.err());
+
+        // The sponsor was removed and counts decremented.
+        let sponsor = state.get_account(&sponsor_id).unwrap();
+        let sv2 = get_ext_v2(sponsor);
+        assert_eq!(sv2.num_sponsoring, 0);
+
+        let sponsored = state.get_account(&sponsored_id).unwrap();
+        let v2 = get_ext_v2(sponsored);
+        assert_eq!(v2.num_sponsored, 0);
+
+        assert!(state.entry_sponsor(&offer_key).is_none());
     }
 }

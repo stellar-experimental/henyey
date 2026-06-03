@@ -1,0 +1,107 @@
+# upstream-quickstart-contract.yml — Pinned expectations about the
+# stellar/quickstart reusable build workflow contract.
+#
+# This file documents what our quickstart.yml depends on from upstream.
+# When the upstream SHA is updated (resolved at runtime via git ls-remote),
+# a CI step validates these invariants still hold. If upstream drifts and
+# breaks these, we'll get a clear failure here rather than a mysterious
+# flake in the test matrix.
+#
+# Drift guard: The validate-contract job verifies that the resolved SHA
+# matches the current main HEAD before proceeding, ensuring the validated
+# and executed (build.yml@main) workflow definitions are the same revision.
+#
+# Last verified against: stellar/quickstart main (2026-05-31)
+# Upstream workflows validated:
+#   - .github/workflows/build.yml (input contract)
+#   - .github/workflows/internal-build.yml (artifact/image contract)
+
+# Build workflow outputs an artifact with this naming pattern.
+# Pattern: image-quickstart-{tag}-{arch}.tar
+artifact_name_pattern: "image-quickstart-{tag}-{arch}.tar"
+
+# The built image is tagged as quickstart:{tag}-{arch}
+image_tag_pattern: "quickstart:{tag}-{arch}"
+
+# Our concrete values (tag=testing-with-pr, arch=amd64):
+expected_artifact_name: "image-quickstart-testing-with-pr-amd64.tar"
+expected_image_tag: "quickstart:testing-with-pr-amd64"
+
+# Anchored ERE patterns — the single source of truth for the consumer-side
+# shape, shared by the validate-contract workflow job and the local harness
+# (scripts/test-quickstart-harness.sh). These enforce the EXACT artifact
+# filename / image-tag shape that our quickstart.yml consumes (the
+# download-artifact `name:` line and the `docker run ... <tag>` line), so a
+# future drift to an incompatible suffix is rejected rather than silently
+# accepted by a substring match:
+#   - image-quickstart-testing-with-pr-amd64.zip      -> REJECTED (not .tar)
+#   - image-quickstart-testing-with-pr-amd64.tar.gz   -> REJECTED (double ext)
+#   - quickstart:testing-with-pr-amd64-debug          -> REJECTED (tag suffix)
+# The leading/trailing character classes anchor the token at word-ish
+# boundaries (start/end of line or a non-identifier char) without requiring the
+# token to occupy the whole line, so they still match inside the real workflow
+# lines (`name: image-quickstart-...`, `docker run ... quickstart:... \`). The
+# trailing class excludes `.` so `.tar.gz` cannot slip past the `.tar` anchor.
+# Used with `grep -Eq`; keep these ERE-compatible (no PCRE constructs). NOTE:
+# both consumers extract the value with a raw `grep | sed` (no YAML parser), so
+# the quoted body is used verbatim — write a single backslash before `.` here.
+artifact_name_regex: "(^|[^[:alnum:]_-])image-quickstart-testing-with-pr-amd64\.tar([^[:alnum:]_.-]|$)"
+image_tag_regex: "(^|[^[:alnum:]_-])quickstart:testing-with-pr-amd64($|[^[:alnum:]_.-])"
+
+# The artifact contains a docker image tarball inside an `image` directory
+# or as a top-level .tar file.
+artifact_layout: "image/ directory or top-level .tar"
+
+# Build workflow accepts these inputs:
+build_inputs:
+  - ref        # SHA to check out
+  - test       # bool — whether to run tests (we pass false)
+  - images     # JSON array of image configs
+  - archs      # JSON array of architectures
+
+# Each image config accepts:
+image_config_fields:
+  - tag        # string — becomes the image tag suffix
+  - inherit    # string — base config to inherit from (e.g. "testing")
+  - config     # object — horizon/core config overrides
+  - deps       # array — {name, repo, ref} dependencies
+
+# Probe files in upstream tests/ directory follow this naming:
+# test_{probe_name}.go where probe_name uses underscores.
+# Our normalization: strip "test_" prefix, strip ".go" suffix, replace _ with -.
+probe_naming:
+  upstream_pattern: "test_{name}.go"
+  our_normalization: "strip test_ prefix, strip .go suffix, underscores to hyphens"
+
+# Per-probe timeout budget contract (from upstream internal-test.yml).
+# Upstream sets `env.timeout_multiplier: 4` and computes each probe step's
+# `timeout-minutes` as `github.run_attempt * timeout_multiplier`. Our
+# quickstart.yml mirrors this multiplier and computes
+# `PROBE_TIMEOUT = github.run_attempt * timeout_multiplier * 60` seconds for
+# GNU `timeout`. This value is documented here as a tracked expectation; note
+# that `validate-contract` only fetches build.yml/internal-build.yml, not
+# internal-test.yml, so a future upstream bump (e.g. 4 -> 5) is NOT caught by
+# validate-contract — it must be reconciled manually against this file when
+# upstream changes (#2920).
+timeout_multiplier: 4
+timeout_formula: "github.run_attempt * timeout_multiplier minutes per probe (x 60 for GNU timeout seconds)"
+
+# Probes known to be excluded on pubnet (from upstream internal-test.yml):
+pubnet_excluded_probes:
+  - horizon-core-up
+  - horizon-ingesting
+  - stellar-rpc-healthy
+
+# --- Delegated artifact contract (internal-build.yml) ---
+# The build.yml workflow delegates actual image building and artifact upload
+# to internal-build.yml. The following fields document what internal-build.yml
+# must provide for our test job to consume the artifact correctly.
+delegated_artifact_contract:
+  # internal-build.yml uploads the image tarball as a GitHub Actions artifact
+  upload_action: "actions/upload-artifact"
+  # Artifact naming follows this pattern (must contain "image-quickstart")
+  artifact_name_contains: "image-quickstart"
+  # Docker image is exported via `docker save` to a tarball
+  image_export_method: "docker save"
+  # The tarball is placed in /tmp/image/ or as a top-level file in the artifact
+  tarball_location: "/tmp/image/ directory or top-level in artifact"

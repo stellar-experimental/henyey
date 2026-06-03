@@ -2543,25 +2543,11 @@ impl App {
                     // pending_catchup_complete branch also kicks off
                     // try_start_ledger_close immediately for any buffered
                     // ledgers that are already ready.
-                    if let Some(overlay) = self.overlay().await {
-                        let current_ledger = self.current_ledger_seq();
-                        // Record timestamp before spawning so heartbeat/gap
-                        // throttle sees this attempt and does not duplicate it.
-                        *self.last_scp_state_request_at.write().await = self.clock.now();
-                        // Use low watermark per §15.3 parity with stellar-core.
-                        let ledger_seq = self.herder.get_min_ledger_seq_to_ask_peers();
-                        henyey_common::spawn_observed(
-                            "scp_state_request_after_catchup",
-                            async move {
-                                let _ = overlay.request_scp_state(ledger_seq).await;
-                            },
-                        );
-                        tracing::info!(
-                            current_ledger,
-                            ledger_seq,
-                            "Spawned SCP state request after catchup"
-                        );
-                    }
+                    // Use the shared helper which records the request timestamp,
+                    // computes the §15.3 low-watermark via
+                    // `Herder::get_min_ledger_seq_to_ask_peers()`, and dispatches
+                    // the bounded GetScpState pull (#2909).
+                    self.request_scp_state_and_record().await;
                 } else {
                     tracing::info!(
                         ledger_seq = result.ledger_seq,
