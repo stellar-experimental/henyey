@@ -1725,8 +1725,11 @@ impl OverlayManager {
     /// Request SCP state from up to 2 random authenticated peers.
     ///
     /// Parity: stellar-core `HerderImpl::getMoreSCPState()` (HerderImpl.cpp:2643-2658)
-    /// selects up to 2 random authenticated peers for `GetScpState` requests
-    /// rather than flooding all connected peers.
+    /// + `OverlayManagerImpl::getRandomAuthenticatedPeers()`
+    /// (OverlayManagerImpl.cpp:1133-1142): snapshot the authenticated peers
+    /// once, shuffle, and send `GetScpState` to at most 2 of them rather than
+    /// flooding all connected peers (§15.3). `connected_peers()` enumerates the
+    /// authenticated peer set (the same map `try_send_to` routes through).
     pub fn request_scp_state(&self, ledger_seq: u32) -> Result<usize> {
         use rand::seq::SliceRandom;
 
@@ -4342,6 +4345,43 @@ mod tests {
         // Dedup: config resolved and discovered have same canonical_key
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].host, "10.0.0.1");
+    }
+
+    // ──────── request_scp_state §15.3 parity tests ────────
+
+    #[tokio::test]
+    async fn test_request_scp_state_with_single_peer_sends_once() {
+        let config = OverlayConfig::default();
+        let secret = SecretKey::generate();
+        let local_node = LocalNode::new_testnet(secret);
+
+        let manager = OverlayManager::new(config, local_node).unwrap();
+
+        let peer_id = PeerId::from_bytes([42u8; 32]);
+        let mut rx = insert_peer_with_capacity(&manager, peer_id, 16);
+
+        let sent = manager.request_scp_state(50).unwrap();
+        assert_eq!(sent, 1, "should send to the single available peer");
+
+        let msg = rx.try_recv().unwrap();
+        match msg {
+            OutboundMessage::Send(StellarMessage::GetScpState(seq)) => {
+                assert_eq!(seq, 50);
+            }
+            _ => panic!("expected Send(GetScpState(50))"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_request_scp_state_with_zero_peers_returns_zero() {
+        let config = OverlayConfig::default();
+        let secret = SecretKey::generate();
+        let local_node = LocalNode::new_testnet(secret);
+
+        let manager = OverlayManager::new(config, local_node).unwrap();
+
+        let sent = manager.request_scp_state(100).unwrap();
+        assert_eq!(sent, 0, "should return 0 when no peers connected");
     }
 
     /// Regression test for #2909: request_scp_state targets at most 2 random

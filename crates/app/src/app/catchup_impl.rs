@@ -2543,8 +2543,10 @@ impl App {
                     // pending_catchup_complete branch also kicks off
                     // try_start_ledger_close immediately for any buffered
                     // ledgers that are already ready.
-                    // Use the shared helper which records timestamp + computes
-                    // low-watermark + dispatches bounded pull (#2909).
+                    // Use the shared helper which records the request timestamp,
+                    // computes the §15.3 low-watermark via
+                    // `Herder::get_min_ledger_seq_to_ask_peers()`, and dispatches
+                    // the bounded GetScpState pull (#2909).
                     self.request_scp_state_and_record().await;
                 } else {
                     tracing::info!(

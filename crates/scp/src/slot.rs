@@ -233,6 +233,25 @@ impl Slot {
         self.set_fully_validated(validated);
     }
 
+    /// Test-only: inject an envelope into the ballot's latest_envelopes in
+    /// Externalize phase so `get_externalizing_state()` returns it.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn test_inject_externalizing_envelope(&mut self, envelope: ScpEnvelope) {
+        use stellar_xdr::curr::ScpStatementPledges;
+
+        // Ensure the ballot is in Externalize phase with a commit value.
+        if self.ballot.phase() != crate::ballot::BallotPhase::Externalize {
+            // Extract value from the envelope for force_externalize.
+            let value = match &envelope.statement.pledges {
+                ScpStatementPledges::Externalize(ext) => ext.commit.value.clone(),
+                _ => stellar_xdr::curr::Value(vec![0u8].try_into().unwrap()),
+            };
+            self.ballot.force_externalize(value);
+        }
+        self.set_fully_validated(true);
+        self.ballot.test_inject_latest_envelope(envelope);
+    }
+
     /// Test-only: directly set the `got_v_blocking` flag.
     #[cfg(any(test, feature = "test-helpers"))]
     pub fn test_set_got_v_blocking(&mut self, v_blocking: bool) {

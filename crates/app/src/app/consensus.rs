@@ -990,6 +990,8 @@ impl App {
         let overlay_clone = Arc::clone(&overlay);
         let envelope_count = envelopes.len();
         // Step 2: Bounded pull — GetScpState to up to 2 random peers.
+        // `scp_state_request_ledger_seq()` delegates to
+        // `Herder::get_min_ledger_seq_to_ask_peers()` (§15.3 parity).
         let ledger_seq = self.scp_state_request_ledger_seq();
 
         henyey_common::spawn_observed("scp_envelope_forwarding", async move {
@@ -1562,7 +1564,10 @@ impl App {
                     // Record timestamp before spawning so heartbeat/gap throttle
                     // sees this attempt and does not immediately duplicate it.
                     *self.last_scp_state_request_at.write().await = self.clock.now();
-                    // Use the shared low-watermark helper instead of raw current_ledger (#2904).
+                    // Use the shared low-watermark helper (delegates to
+                    // `Herder::get_min_ledger_seq_to_ask_peers()`, §15.3 parity)
+                    // instead of raw current_ledger (#2904). `request_scp_state`
+                    // is non-blocking, so call it inline rather than spawning.
                     let ledger = self.scp_state_request_ledger_seq();
                     if let Err(e) = overlay.request_scp_state(ledger) {
                         tracing::debug!(

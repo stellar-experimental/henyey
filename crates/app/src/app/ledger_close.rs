@@ -76,6 +76,17 @@ fn consume_skip_marker_if_matches(
     }
 }
 
+/// A single SCP history persistence batch for one slot.
+///
+/// Matches stellar-core's `saveSCPHistory(slot, envelopes, qmap)` contract.
+/// The close pipeline builds ordered batches (slot N-1 first, then N) so the
+/// DB write preserves the same ordering as `processExternalized()`.
+struct ScpHistoryBatch {
+    ledger_seq: u32,
+    envelopes: Vec<stellar_xdr::curr::ScpEnvelope>,
+    quorum_sets: Vec<(Hash256, stellar_xdr::curr::ScpQuorumSet)>,
+}
+
 /// Raw inputs for a ledger-close persist job, captured on the event loop.
 ///
 /// Phase A of #1733: the event loop captures only cheap clones (no XDR/JSON
@@ -90,8 +101,9 @@ struct LedgerPersistInputs {
     tx_metas: Option<Vec<TransactionMeta>>,
     tx_count: usize,
     network_id: NetworkId,
-    scp_envelopes: Vec<stellar_xdr::curr::ScpEnvelope>,
-    scp_quorum_sets: Vec<(Hash256, stellar_xdr::curr::ScpQuorumSet)>,
+    /// Ordered SCP history batches: previous slot (N-1) first, then current (N).
+    /// Matches stellar-core's `processExternalized()` persistence ordering (§5.3).
+    scp_history_batches: Vec<ScpHistoryBatch>,
     /// HAS struct built on the event loop under bucket-list read guards.
     /// JSON serialization happens later on the blocking thread.
     has: HistoryArchiveState,
@@ -212,9 +224,14 @@ impl LedgerPersistInputs {
                 }
             }
 
-            conn.store_scp_history(self.header.ledger_seq, &self.scp_envelopes)?;
-            for (hash, qset) in &self.scp_quorum_sets {
-                conn.store_scp_quorum_set(hash, self.header.ledger_seq, qset)?;
+            // Persist SCP history in ordered batches: previous slot (N-1) first,
+            // then current slot (N), matching stellar-core's processExternalized()
+            // persistence ordering (§5.3).
+            for batch in &self.scp_history_batches {
+                conn.store_scp_history(batch.ledger_seq, &batch.envelopes)?;
+                for (hash, qset) in &batch.quorum_sets {
+                    conn.store_scp_quorum_set(hash, batch.ledger_seq, qset)?;
+                }
             }
 
             conn.set_state(state_keys::HISTORY_ARCHIVE_STATE, &has_json)?;
@@ -296,6 +313,66 @@ fn merge_into_buffer_entry(
     }
 }
 
+/// Build ordered SCP history batches for persistence: previous slot (N-1)
+/// first, then current slot (N), matching stellar-core's processExternalized()
+/// §5.3 ordering contract.
+///
+/// Extracted from `App::build_persist_inputs()` so it can be tested with a real
+/// `Herder` without requiring a full `App` instance.
+fn build_scp_history_batches(
+    herder: &henyey_herder::Herder,
+    current_slot: u64,
+) -> Vec<ScpHistoryBatch> {
+    let mut batches = Vec::new();
+
+    // Helper to build a batch from externalizing state for a slot.
+    let build_batch = |slot: u64| -> ScpHistoryBatch {
+        let envelopes = herder.get_scp_externalizing_state(slot);
+        let mut quorum_sets = Vec::new();
+        for envelope in &envelopes {
+            let hash = henyey_common::scp_quorum_set_hash(&envelope.statement);
+            let hash256 = Hash256::from_bytes(hash.0);
+            if let Some(qset) = herder.get_quorum_set_by_hash(&hash256) {
+                quorum_sets.push((hash256, qset));
+            } else {
+                tracing::debug!(
+                    hash = %hash256.to_hex(),
+                    slot,
+                    "Missing quorum set for SCP history batch"
+                );
+            }
+        }
+        ScpHistoryBatch {
+            ledger_seq: slot as u32,
+            envelopes,
+            quorum_sets,
+        }
+    };
+
+    // Previous slot first (if available).
+    if current_slot > 1 {
+        let prev_batch = build_batch(current_slot - 1);
+        if !prev_batch.envelopes.is_empty() {
+            batches.push(prev_batch);
+        }
+    }
+
+    // Current slot — includes tracked quorum map qsets per stellar-core's
+    // saveSCPHistory(slotN, envelopes, getCurrentlyTrackedQuorum()).
+    let mut current_batch = build_batch(current_slot);
+    // Merge in quorum sets from the tracked quorum map that aren't already
+    // present from the externalizing envelopes (§5.3 parity).
+    let tracked_qsets = herder.get_currently_tracked_quorum();
+    for (hash, qset) in tracked_qsets {
+        if !current_batch.quorum_sets.iter().any(|(h, _)| *h == hash) {
+            current_batch.quorum_sets.push((hash, qset));
+        }
+    }
+    batches.push(current_batch);
+
+    batches
+}
+
 impl App {
     pub(crate) fn externalized_iteration_window(
         last_processed: u64,
@@ -371,17 +448,9 @@ impl App {
         }
         let tx_count = ordered_txs.len();
 
-        let scp_envelopes = self.herder.get_scp_envelopes(header.ledger_seq as u64);
-        let mut scp_quorum_sets = Vec::new();
-        for envelope in &scp_envelopes {
-            let hash = henyey_common::scp_quorum_set_hash(&envelope.statement);
-            let hash256 = Hash256::from_bytes(hash.0);
-            if let Some(qset) = self.herder.get_quorum_set_by_hash(&hash256) {
-                scp_quorum_sets.push((hash256, qset));
-            } else {
-                tracing::debug!(hash = %hash256.to_hex(), "Missing quorum set for SCP history — export will skip this envelope");
-            }
-        }
+        // Build ordered SCP history batches: previous slot (N-1) first, then
+        // current slot (N), matching stellar-core's processExternalized() §5.3.
+        let scp_history_batches = build_scp_history_batches(&self.herder, header.ledger_seq as u64);
 
         let tx_set_entry = match tx_set_variant {
             TransactionSetVariant::Classic(set) => set.clone(),
@@ -449,8 +518,7 @@ impl App {
             tx_metas: tx_metas.map(|m| m.to_vec()),
             tx_count,
             network_id,
-            scp_envelopes,
-            scp_quorum_sets,
+            scp_history_batches,
             has,
             bucket_list_levels,
             publish_enabled: self.is_validator && self.config.history.publish_enabled(),
@@ -3869,5 +3937,482 @@ mod publish_skip_marker_tests {
         };
         let xdr = header.to_xdr(Limits::none()).unwrap();
         (header, xdr)
+    }
+}
+
+/// Regression test for #2820: SCP history persistence ordering and tracked
+/// Production-path SCP history persistence tests.
+///
+/// These tests exercise the real `build_scp_history_batches()` → `LedgerPersistInputs` →
+/// `serialize_and_write_to_db()` pipeline end-to-end, verifying that the production
+/// persistence code correctly:
+/// (1) persists N-1 before N (ordering guarantee),
+/// (2) persists previous-slot quorum sets,
+/// (3) persists tracked current-slot quorum sets even when no envelope references them.
+#[cfg(test)]
+mod scp_history_persistence_ordering_tests {
+    use henyey_db::queries::ScpQueries;
+    use henyey_db::Database;
+    use henyey_herder::{Herder, HerderConfig, TimerManagerHandle};
+    use henyey_history::HistoryArchiveState;
+    use henyey_scp::hash_quorum_set;
+    use std::sync::Arc;
+    use stellar_xdr::curr::{
+        Hash, LedgerHeader, LedgerHeaderExt, NodeId, PublicKey, ScpBallot, ScpEnvelope,
+        ScpQuorumSet, ScpStatement, ScpStatementExternalize, ScpStatementPledges, Signature,
+        StellarValue, StellarValueExt, TimePoint, TransactionHistoryEntry,
+        TransactionHistoryEntryExt, TransactionHistoryResultEntry,
+        TransactionHistoryResultEntryExt, TransactionResultSet, TransactionSet, Uint256, Value,
+        VecM,
+    };
+
+    use henyey_common::NetworkId;
+
+    /// Build a structurally valid HAS JSON for the given ledger.
+    fn make_test_has_json(ledger: u32) -> String {
+        let zero = "0".repeat(64);
+        let zero_level = format!(
+            r#"{{"curr":"{}","snap":"{}","next":{{"state":0}}}}"#,
+            zero, zero
+        );
+        let levels: Vec<_> = (0..henyey_bucket::BUCKET_LIST_LEVELS)
+            .map(|_| zero_level.clone())
+            .collect();
+        format!(
+            r#"{{"version":1,"currentLedger":{},"currentBuckets":[{}]}}"#,
+            ledger,
+            levels.join(",")
+        )
+    }
+
+    fn make_lm() -> Arc<henyey_ledger::LedgerManager> {
+        use henyey_ledger::{LedgerManager, LedgerManagerConfig};
+        let config = LedgerManagerConfig {
+            validate_bucket_hash: false,
+            ..Default::default()
+        };
+        let lm = LedgerManager::new("Test Network".to_string(), config);
+        let header = LedgerHeader {
+            ledger_version: 0,
+            previous_ledger_hash: Hash([0u8; 32]),
+            scp_value: StellarValue {
+                tx_set_hash: Hash([0u8; 32]),
+                close_time: TimePoint(0),
+                upgrades: VecM::default(),
+                ext: StellarValueExt::Basic,
+            },
+            tx_set_result_hash: Hash([0u8; 32]),
+            bucket_list_hash: Hash([0u8; 32]),
+            ledger_seq: 0,
+            total_coins: 1_000_000_000_000,
+            fee_pool: 0,
+            inflation_seq: 0,
+            id_pool: 0,
+            base_fee: 100,
+            base_reserve: 5_000_000,
+            max_tx_set_size: 100,
+            skip_list: [
+                Hash([0u8; 32]),
+                Hash([0u8; 32]),
+                Hash([0u8; 32]),
+                Hash([0u8; 32]),
+            ],
+            ext: LedgerHeaderExt::V0,
+        };
+        let header_hash = henyey_ledger::compute_header_hash(&header).expect("hash");
+        lm.initialize(
+            henyey_bucket::BucketList::new(),
+            henyey_bucket::HotArchiveBucketList::new(),
+            header,
+            header_hash,
+        )
+        .expect("init");
+        Arc::new(lm)
+    }
+
+    fn make_node_id(seed: u8) -> NodeId {
+        let mut bytes = [0u8; 32];
+        bytes[0] = seed;
+        NodeId(PublicKey::PublicKeyTypeEd25519(Uint256(bytes)))
+    }
+
+    fn make_externalize_envelope(node_seed: u8, slot_index: u64, qset_hash: Hash) -> ScpEnvelope {
+        let node_id = make_node_id(node_seed);
+        ScpEnvelope {
+            statement: ScpStatement {
+                node_id,
+                slot_index,
+                pledges: ScpStatementPledges::Externalize(ScpStatementExternalize {
+                    commit: ScpBallot {
+                        counter: 1,
+                        value: Value(vec![0u8].try_into().unwrap()),
+                    },
+                    n_h: 1,
+                    commit_quorum_set_hash: qset_hash,
+                }),
+            },
+            signature: Signature::default(),
+        }
+    }
+
+    fn make_qset(threshold: u32) -> ScpQuorumSet {
+        ScpQuorumSet {
+            threshold,
+            validators: vec![].try_into().unwrap(),
+            inner_sets: vec![].try_into().unwrap(),
+        }
+    }
+
+    /// Build a minimal `LedgerPersistInputs` that exercises the real
+    /// `serialize_and_write_to_db()` production code path. The SCP history
+    /// batches come from `build_scp_history_batches()` — the same function
+    /// that `App::build_persist_inputs()` delegates to.
+    fn make_persist_inputs(
+        scp_history_batches: Vec<super::ScpHistoryBatch>,
+        ledger_seq: u32,
+    ) -> super::LedgerPersistInputs {
+        let header = LedgerHeader {
+            ledger_version: 22,
+            previous_ledger_hash: Hash([0u8; 32]),
+            scp_value: StellarValue {
+                tx_set_hash: Hash([0u8; 32]),
+                close_time: TimePoint(0),
+                upgrades: VecM::default(),
+                ext: StellarValueExt::Basic,
+            },
+            tx_set_result_hash: Hash([0u8; 32]),
+            bucket_list_hash: Hash([0u8; 32]),
+            ledger_seq,
+            total_coins: 1_000_000_000_000,
+            fee_pool: 0,
+            inflation_seq: 0,
+            id_pool: 0,
+            base_fee: 100,
+            base_reserve: 5_000_000,
+            max_tx_set_size: 100,
+            skip_list: [
+                Hash([0u8; 32]),
+                Hash([0u8; 32]),
+                Hash([0u8; 32]),
+                Hash([0u8; 32]),
+            ],
+            ext: LedgerHeaderExt::V0,
+        };
+        let has = HistoryArchiveState::from_json(&make_test_has_json(ledger_seq)).unwrap();
+        super::LedgerPersistInputs {
+            header,
+            tx_history_entry: TransactionHistoryEntry {
+                ledger_seq,
+                tx_set: TransactionSet {
+                    previous_ledger_hash: Hash([0u8; 32]),
+                    txs: VecM::default(),
+                },
+                ext: TransactionHistoryEntryExt::V0,
+            },
+            tx_result_entry: TransactionHistoryResultEntry {
+                ledger_seq,
+                tx_result_set: TransactionResultSet {
+                    results: VecM::default(),
+                },
+                ext: TransactionHistoryResultEntryExt::default(),
+            },
+            ordered_txs: vec![],
+            tx_results: vec![],
+            tx_metas: None,
+            tx_count: 0,
+            network_id: NetworkId::from_passphrase("Test Network"),
+            scp_history_batches,
+            has,
+            bucket_list_levels: None,
+            publish_enabled: false,
+        }
+    }
+
+    /// End-to-end production-path test: builds SCP batches via the real
+    /// `build_scp_history_batches()` (same function called by `build_persist_inputs()`),
+    /// constructs a `LedgerPersistInputs`, calls the real `serialize_and_write_to_db()`,
+    /// and verifies:
+    /// (1) N-1 is persisted before N,
+    /// (2) previous-slot quorum sets are persisted,
+    /// (3) tracked current-slot quorum sets (not in any envelope) are persisted.
+    #[test]
+    fn test_serialize_and_write_to_db_persists_scp_history_end_to_end() {
+        // Set up a Herder with a local quorum set that includes node 0xCC
+        // so we can expand the quorum tracker for that node later.
+        let tracked_node = make_node_id(0xCC);
+        let local_qset = ScpQuorumSet {
+            threshold: 1,
+            validators: vec![tracked_node.clone()].try_into().unwrap(),
+            inner_sets: vec![].try_into().unwrap(),
+        };
+        let config = HerderConfig {
+            local_quorum_set: Some(local_qset),
+            ..HerderConfig::default()
+        };
+        let herder = Herder::new(config, make_lm(), TimerManagerHandle::no_op());
+
+        // Create quorum sets for previous and current slots.
+        let qset_prev = make_qset(1);
+        let qset_prev_hash = hash_quorum_set(&qset_prev);
+        let qset_prev_xdr_hash = Hash(qset_prev_hash.0);
+
+        let qset_curr = make_qset(2);
+        let qset_curr_hash = hash_quorum_set(&qset_curr);
+        let qset_curr_xdr_hash = Hash(qset_curr_hash.0);
+
+        // Register quorum sets so get_quorum_set_by_hash() can find them.
+        let node_prev = make_node_id(0xAA);
+        let node_curr = make_node_id(0xBB);
+        herder
+            .scp_driver()
+            .test_store_quorum_set(&node_prev, qset_prev.clone());
+        herder
+            .scp_driver()
+            .test_store_quorum_set(&node_curr, qset_curr.clone());
+
+        // Inject EXTERNALIZE envelopes for slots 9 (previous) and 10 (current).
+        let env_prev = make_externalize_envelope(0xAA, 9, qset_prev_xdr_hash);
+        let env_curr = make_externalize_envelope(0xBB, 10, qset_curr_xdr_hash);
+        herder.test_inject_externalizing_envelope(9, env_prev);
+        herder.test_inject_externalizing_envelope(10, env_curr);
+
+        // Add a tracked quorum set that is NOT referenced by any envelope.
+        let qset_tracked = make_qset(3);
+        let tracked_node = make_node_id(0xCC);
+        herder
+            .expand_quorum_tracker_for_testing(&tracked_node, qset_tracked.clone())
+            .unwrap();
+        let tracked_hash = hash_quorum_set(&qset_tracked);
+
+        // Exercise the real build_scp_history_batches function (same code path
+        // as App::build_persist_inputs() at ledger_close.rs:453).
+        let batches = super::build_scp_history_batches(&herder, 10);
+
+        // Verify batch structure before persistence.
+        assert_eq!(batches.len(), 2, "should have previous + current batches");
+        assert_eq!(
+            batches[0].ledger_seq, 9,
+            "first batch must be previous slot"
+        );
+        assert_eq!(
+            batches[1].ledger_seq, 10,
+            "second batch must be current slot"
+        );
+
+        // Build a LedgerPersistInputs and call the REAL serialize_and_write_to_db().
+        let persist_inputs = make_persist_inputs(batches, 10);
+        let db = Database::open_in_memory().unwrap();
+        persist_inputs
+            .serialize_and_write_to_db(&db)
+            .expect("serialize_and_write_to_db must succeed");
+
+        // (1) Verify ordering: both slots are persisted (the production code
+        // iterates scp_history_batches in order, so N-1 is written first).
+        let loaded_prev = db.with_connection(|c| c.load_scp_history(9)).unwrap();
+        assert_eq!(loaded_prev.len(), 1, "previous slot should have 1 envelope");
+        assert_eq!(
+            loaded_prev[0].statement.slot_index, 9,
+            "persisted envelope must carry correct slot_index for previous slot"
+        );
+        let loaded_curr = db.with_connection(|c| c.load_scp_history(10)).unwrap();
+        assert_eq!(loaded_curr.len(), 1, "current slot should have 1 envelope");
+        assert_eq!(
+            loaded_curr[0].statement.slot_index, 10,
+            "persisted envelope must carry correct slot_index for current slot"
+        );
+
+        // (2) Verify previous-slot quorum set is persisted.
+        let prev_qs = db
+            .with_connection(|c| c.load_scp_quorum_set(&qset_prev_hash))
+            .unwrap();
+        assert!(prev_qs.is_some(), "previous slot qset must be in DB");
+        assert_eq!(prev_qs.unwrap().threshold, 1);
+
+        // (3) Verify current-slot quorum sets: both the envelope-referenced
+        // one AND the tracked one (not in any envelope) are persisted.
+        let curr_qs = db
+            .with_connection(|c| c.load_scp_quorum_set(&qset_curr_hash))
+            .unwrap();
+        assert!(curr_qs.is_some(), "current slot qset must be in DB");
+        assert_eq!(curr_qs.unwrap().threshold, 2);
+
+        let tracked_qs = db
+            .with_connection(|c| c.load_scp_quorum_set(&tracked_hash))
+            .unwrap();
+        assert!(
+            tracked_qs.is_some(),
+            "tracked quorum set (not in any envelope) must be in DB"
+        );
+        assert_eq!(tracked_qs.unwrap().threshold, 3);
+    }
+
+    /// Verifies that the production `serialize_and_write_to_db()` correctly
+    /// handles the slot-1 edge case (no previous slot to persist).
+    #[test]
+    fn test_serialize_and_write_to_db_slot_one_no_previous() {
+        let herder = Herder::new(
+            HerderConfig::default(),
+            make_lm(),
+            TimerManagerHandle::no_op(),
+        );
+
+        let qset = make_qset(1);
+        let qset_hash = hash_quorum_set(&qset);
+        let xdr_hash = Hash(qset_hash.0);
+
+        let node = make_node_id(0xAA);
+        herder
+            .scp_driver()
+            .test_store_quorum_set(&node, qset.clone());
+
+        let env = make_externalize_envelope(0xAA, 1, xdr_hash);
+        herder.test_inject_externalizing_envelope(1, env);
+
+        // Slot 1 — no previous slot to persist.
+        let batches = super::build_scp_history_batches(&herder, 1);
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].ledger_seq, 1);
+
+        // Run through real production persistence path.
+        let persist_inputs = make_persist_inputs(batches, 1);
+        let db = Database::open_in_memory().unwrap();
+        persist_inputs
+            .serialize_and_write_to_db(&db)
+            .expect("serialize_and_write_to_db must succeed");
+
+        let loaded = db.with_connection(|c| c.load_scp_history(1)).unwrap();
+        assert_eq!(loaded.len(), 1, "slot 1 should have 1 envelope");
+        assert_eq!(
+            loaded[0].statement.slot_index, 1,
+            "persisted envelope must carry correct slot_index for slot 1"
+        );
+
+        let qs = db
+            .with_connection(|c| c.load_scp_quorum_set(&qset_hash))
+            .unwrap();
+        assert!(qs.is_some(), "slot 1 qset must be in DB");
+    }
+
+    /// Verifies that `serialize_and_write_to_db()` skips the previous slot
+    /// when it has no externalizing envelopes (empty batch is not emitted
+    /// by `build_scp_history_batches()`).
+    #[test]
+    fn test_serialize_and_write_to_db_empty_previous_slot_skipped() {
+        let herder = Herder::new(
+            HerderConfig::default(),
+            make_lm(),
+            TimerManagerHandle::no_op(),
+        );
+
+        let qset = make_qset(1);
+        let qset_hash = hash_quorum_set(&qset);
+        let xdr_hash = Hash(qset_hash.0);
+
+        let node = make_node_id(0xAA);
+        herder
+            .scp_driver()
+            .test_store_quorum_set(&node, qset.clone());
+
+        // Only inject current slot (10), not previous (9).
+        let env = make_externalize_envelope(0xAA, 10, xdr_hash);
+        herder.test_inject_externalizing_envelope(10, env);
+
+        let batches = super::build_scp_history_batches(&herder, 10);
+        assert_eq!(batches.len(), 1);
+
+        // Run through real production persistence path.
+        let persist_inputs = make_persist_inputs(batches, 10);
+        let db = Database::open_in_memory().unwrap();
+        persist_inputs
+            .serialize_and_write_to_db(&db)
+            .expect("serialize_and_write_to_db must succeed");
+
+        // Only current slot persisted.
+        let loaded_prev = db.with_connection(|c| c.load_scp_history(9)).unwrap();
+        assert!(
+            loaded_prev.is_empty(),
+            "previous slot should not be persisted"
+        );
+        let loaded_curr = db.with_connection(|c| c.load_scp_history(10)).unwrap();
+        assert_eq!(loaded_curr.len(), 1, "current slot should have 1 envelope");
+        assert_eq!(
+            loaded_curr[0].statement.slot_index, 10,
+            "persisted envelope must carry correct slot_index for current slot"
+        );
+    }
+
+    /// Verifies the ordering guarantee: in the production `serialize_and_write_to_db()`
+    /// loop, the previous slot (N-1) batch is written before the current slot (N).
+    /// This test constructs batches and verifies the DB state reflects the ordering.
+    #[test]
+    fn test_serialize_and_write_to_db_ordering_previous_before_current() {
+        let herder = Herder::new(
+            HerderConfig::default(),
+            make_lm(),
+            TimerManagerHandle::no_op(),
+        );
+
+        let qset_prev = make_qset(1);
+        let qset_prev_hash = hash_quorum_set(&qset_prev);
+        let prev_xdr_hash = Hash(qset_prev_hash.0);
+
+        let qset_curr = make_qset(2);
+        let qset_curr_hash = hash_quorum_set(&qset_curr);
+        let curr_xdr_hash = Hash(qset_curr_hash.0);
+
+        let node_prev = make_node_id(0xAA);
+        let node_curr = make_node_id(0xBB);
+        herder
+            .scp_driver()
+            .test_store_quorum_set(&node_prev, qset_prev.clone());
+        herder
+            .scp_driver()
+            .test_store_quorum_set(&node_curr, qset_curr.clone());
+
+        herder.test_inject_externalizing_envelope(
+            99,
+            make_externalize_envelope(0xAA, 99, prev_xdr_hash),
+        );
+        herder.test_inject_externalizing_envelope(
+            100,
+            make_externalize_envelope(0xBB, 100, curr_xdr_hash),
+        );
+
+        let batches = super::build_scp_history_batches(&herder, 100);
+        assert_eq!(batches.len(), 2);
+        assert_eq!(batches[0].ledger_seq, 99);
+        assert_eq!(batches[1].ledger_seq, 100);
+
+        // Run through the real production persistence path.
+        let persist_inputs = make_persist_inputs(batches, 100);
+        let db = Database::open_in_memory().unwrap();
+        persist_inputs
+            .serialize_and_write_to_db(&db)
+            .expect("serialize_and_write_to_db must succeed");
+
+        // Both slots persisted correctly with correct slot_index.
+        let loaded_prev = db.with_connection(|c| c.load_scp_history(99)).unwrap();
+        assert_eq!(loaded_prev.len(), 1, "previous slot should have 1 envelope");
+        assert_eq!(
+            loaded_prev[0].statement.slot_index, 99,
+            "persisted envelope must carry correct slot_index for previous slot"
+        );
+        let loaded_curr = db.with_connection(|c| c.load_scp_history(100)).unwrap();
+        assert_eq!(loaded_curr.len(), 1, "current slot should have 1 envelope");
+        assert_eq!(
+            loaded_curr[0].statement.slot_index, 100,
+            "persisted envelope must carry correct slot_index for current slot"
+        );
+
+        // Quorum sets for both slots.
+        let prev_qs = db
+            .with_connection(|c| c.load_scp_quorum_set(&qset_prev_hash))
+            .unwrap();
+        assert!(prev_qs.is_some(), "previous slot qset must be in DB");
+
+        let curr_qs = db
+            .with_connection(|c| c.load_scp_quorum_set(&qset_curr_hash))
+            .unwrap();
+        assert!(curr_qs.is_some(), "current slot qset must be in DB");
     }
 }

@@ -411,6 +411,17 @@ impl<D: SCPDriver> SCP<D> {
         slot.test_set_got_v_blocking(true);
     }
 
+    /// Test-only: inject an envelope into a slot's ballot protocol in
+    /// Externalize phase so that `get_externalizing_state()` returns it.
+    /// Used by app-level tests that exercise the SCP history persistence
+    /// path without needing to go through the full consensus flow.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn test_inject_externalizing_envelope(&self, slot_index: u64, envelope: ScpEnvelope) {
+        let mut slots = self.slots.write();
+        let slot = self.get_or_create_slot(&mut slots, slot_index);
+        slot.test_inject_externalizing_envelope(envelope);
+    }
+
     /// Test-only: inject a nomination envelope into a slot's latest messages.
     ///
     /// Creates the slot if needed, marks it `fully_validated`, and sets the

@@ -29,9 +29,9 @@ excluded. SHOULD claims and operational defaults excluded.
 | §5.2 | ctValidityOffset abort on far-ahead clock | Drift | guarded only by `>= UNIX_EPOCH` + monotonic clamp |
 | §5.2 | Cache tx set valid + ban invalid | Full | herder.rs:3054 + tx_set_tracker.rs |
 | §5.2 | Drop oversized upgrades | Full | herder.rs:3155-3172 |
-| §5.2 | Non-validator builds + caches | Partial | trigger_next_ledger requires is_validator |
+| §5.2 | Non-validator builds + caches | Full | lifecycle.rs: watchers also call try_trigger_consensus for tx-set build/cache |
 | §5.3 | Externalize handler (Latest vs Older) | Full | scp_driver.rs:value_externalized → herder.rs |
-| §5.3 | SCP history persistence ordering | Partial | persistence.rs (no explicit prev-slot-first) |
+| §5.3 | SCP history persistence ordering | Full | ledger_close.rs: ordered ScpHistoryBatch (prev slot N-1 first, then N) via get_scp_externalizing_state |
 | §5.4 | computeTimeout formula | Full | scp_driver.rs:3709-3735 |
 | §5.4 | Future-slot timer reschedule | Absent | timer_manager — direct schedule, no 1s defer |
 | §5.4 | Erase timers for closed slots | Full | scp_driver.rs:3749-3753 |
@@ -87,7 +87,7 @@ excluded. SHOULD claims and operational defaults excluded.
 | §15.2 | ItemFetcher get/peerDoesntHave | Full | fetching_envelopes.rs |
 | §15.2 | Broadcast onward after fetch | Full | fetching_envelopes.rs:280-286 |
 | §15.3 | Out-of-sync recovery loop | Full | sync_recovery.rs |
-| §15.3 | sendGetScpState low-bound clamp | Partial | herder.rs:1187 (clamped, but no max 2-peer randomization site found in this crate) |
+| §15.3 | sendGetScpState low-bound clamp | Full | herder.rs:get_min_ledger_seq_to_ask_peers (clamped to remember floor) + overlay manager 2-peer randomized fanout |
 | §15.4 | eraseOutsideRange + checkpoint preservation | Full | fetching_envelopes.rs:689 + herder.rs:2718 |
 | §15.5 | Persist envelope + qset + tx set | Full | persistence.rs |
 | §15.5 | TX_SET_GC_DELAY garbage collector | Full | herder.rs:879 + persistence.rs:206 |
@@ -249,12 +249,12 @@ excluded. SHOULD claims and operational defaults excluded.
 - **§5.3-2 (MUST)** "`processExternalized` MUST persist SCP history for the
   previous slot (without quorum map) before persisting the current slot
   (with the current quorum map)."
-  - **Rust:** `persistence.rs` persists envelopes / qsets / tx sets per
-    slot, but no explicit ordering enforcement that the previous slot is
-    written first.
-  - **Status:** Partial. The spec ordering matters for restart consistency
-    (so that quorum-map history isn't lost mid-checkpoint); evaluation by a
-    human is warranted.
+  - **Rust:** `ledger_close.rs` builds ordered `ScpHistoryBatch` entries
+    (slot N-1 first, then N) using `herder.get_scp_externalizing_state(slot)`.
+    The current-slot batch additionally includes all quorum sets from
+    `herder.get_currently_tracked_quorum()`, matching stellar-core's
+    `saveSCPHistory(slotN, envelopes, getCurrentlyTrackedQuorum())`.
+  - **Status:** Full. Implemented in #2820.
 
 ### §5.4 — Timers
 
@@ -602,12 +602,13 @@ excluded. SHOULD claims and operational defaults excluded.
   - **Rust:** `sync_recovery.rs:59 CONSENSUS_STUCK_TIMEOUT = 35s`, `:63
     OUT_OF_SYNC_RECOVERY_INTERVAL = 10s`, `:69 LEDGER_VALIDITY_BRACKET =
     100`. Recovery loop: `sync_recovery.rs:228-376`. SCP state lower
-    bound: `herder.rs:1187 get_min_ledger_seq_to_ask_peers`. The
-    "up to 2 random peers" / per-peer randomization is not implemented in
-    this crate (the `request_scp_state_from_peers` callback is delegated to
-    the app/overlay layer).
-  - **Sub-status:** Partial — clamp is enforced; randomization site is
-    cross-crate.
+    bound: `herder.rs get_min_ledger_seq_to_ask_peers` (clamped against
+    `get_min_ledger_seq_to_remember()` floor). Peer selection:
+    `OverlayManager::request_scp_state()` snapshots authenticated peers,
+    shuffles, sends to at most 2 (matching `getRandomAuthenticatedPeers(2)`).
+    All app-level callers (consensus.rs, catchup_impl.rs, mod.rs) now route
+    through `get_min_ledger_seq_to_ask_peers()`.
+  - **Status:** Full. Implemented in #2820.
 
 - **§15.3 (MUST)** "`sendSCPStateToPeer` for a requesting peer MUST send up
   to `LEDGER_VALIDITY_BRACKET` slots' worth of envelopes" + checkpoint
@@ -780,9 +781,9 @@ sections present in the current spec:
    in #2871 — early `check_cross_type_conflict` guard now runs before
    `validate_transaction` in `try_add`.
 
-5. **Verify §15.3 random-peer ask path** is wired in the overlay /
-   sync_recovery integration; the herder side only exposes the slot
-   bounds.
+5. ~~**Verify §15.3 random-peer ask path** is wired in the overlay /
+   sync_recovery integration.~~ Implemented in #2820 — `OverlayManager::request_scp_state()`
+   now uses 2-peer randomized fanout with clamped low-watermark.
 
 6. **Wire a §16.7 `handle_max_tx_size_increase` notification hook** so
    the herder explicitly triggers the peer-notify on detected

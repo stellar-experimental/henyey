@@ -1008,6 +1008,32 @@ impl Herder {
         self.fetching_envelopes.set_current_slot(slot);
     }
 
+    /// Test-only: inject an envelope into a slot's externalizing state.
+    /// Used by app-level tests that exercise the SCP history persistence path
+    /// without needing to go through the full consensus/validation flow.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn test_inject_externalizing_envelope(
+        &self,
+        slot: u64,
+        envelope: stellar_xdr::curr::ScpEnvelope,
+    ) {
+        self.scp.test_inject_externalizing_envelope(slot, envelope);
+    }
+
+    /// Test-only: register a quorum set so `get_quorum_set_by_hash()` can
+    /// find it. Used alongside `test_inject_externalizing_envelope` to set
+    /// up the full SCP persistence path for tests.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn test_store_quorum_set(
+        &self,
+        node_id: &stellar_xdr::curr::NodeId,
+        qset: stellar_xdr::curr::ScpQuorumSet,
+    ) {
+        self.scp_driver.test_store_quorum_set(node_id, qset);
+    }
+
     /// Test-only: arm the closing gate for a specific slot.
     ///
     /// In production, the gate is set to `externalized_slot + 1` when a slot
@@ -1234,17 +1260,22 @@ impl Herder {
 
     /// Compute the minimum ledger sequence to ask peers for SCP state.
     ///
-    /// Parity: stellar-core `HerderImpl::getMinLedgerSeqToAskPeers()` —
-    /// computes a lookback from LCL, then clamps upward so we never ask for
-    /// slots the herder would immediately forget.
+    /// Parity: stellar-core `HerderImpl::getMinLedgerSeqToAskPeers()`
+    /// (HerderImpl.cpp:1386-1411) — computes a lookback from LCL using
+    /// `min(MAX_SLOTS_TO_REMEMBER, SCP_EXTRA_LOOKBACK_LEDGERS)`, then clamps
+    /// upward against `getMinLedgerSeqToRemember()` so we never ask for slots
+    /// the herder would immediately forget.
     pub fn get_min_ledger_seq_to_ask_peers(&self) -> u32 {
         let lcl = self.ledger_manager.current_ledger_seq();
         let mut low = lcl.saturating_add(1);
-        let max_slots = self.config.max_externalized_slots.max(1) as u32;
-        // Number of extra ledgers to keep beyond max_externalized_slots, matching
-        // stellar-core's SCP_EXTRA_LOOKBACK_LEDGERS.
-        const PEER_LEDGER_WINDOW: u32 = 3;
-        let window = max_slots.min(PEER_LEDGER_WINDOW);
+        // stellar-core uses `std::min(Config::MAX_SLOTS_TO_REMEMBER,
+        // SCP_EXTRA_LOOKBACK_LEDGERS)` where SCP_EXTRA_LOOKBACK_LEDGERS = 3.
+        // Use the same `MAX_SLOTS_TO_REMEMBER` constant that the sibling
+        // `get_min_ledger_seq_to_remember()` floor uses, so both halves of the
+        // clamp read the same retention window (stellar-core reads
+        // `Config::MAX_SLOTS_TO_REMEMBER` in both).
+        const SCP_EXTRA_LOOKBACK_LEDGERS: u32 = 3;
+        let window = (MAX_SLOTS_TO_REMEMBER as u32).min(SCP_EXTRA_LOOKBACK_LEDGERS);
         if low > window {
             low = low.saturating_sub(window);
         } else {
@@ -1253,10 +1284,8 @@ impl Herder {
 
         // Do not ask for slots we'd be dropping anyway (stellar-core parity:
         // `low = std::max<uint32>(low, getMinLedgerSeqToRemember())`).
-        let herder_low = self.get_min_ledger_seq_to_remember() as u32;
-        low = low.max(herder_low);
-
-        low
+        let remember_floor = self.get_min_ledger_seq_to_remember() as u32;
+        low.max(remember_floor)
     }
 
     /// Get the expected ledger close duration.
@@ -1352,6 +1381,24 @@ impl Herder {
     /// Get a quorum set by hash if available.
     pub fn get_quorum_set_by_hash(&self, hash: &Hash256) -> Option<ScpQuorumSet> {
         self.scp_driver.get_quorum_set_by_hash(hash)
+    }
+
+    /// Get the currently tracked quorum map.
+    ///
+    /// Returns all node→quorum-set pairs known to the transitive quorum tracker.
+    /// Matches stellar-core's `mPendingEnvelopes.getCurrentlyTrackedQuorum()`.
+    /// Used by `saveSCPHistory(slot_N, envelopes, qmap)` to persist the full
+    /// quorum-map-derived qsets for the current slot.
+    pub fn get_currently_tracked_quorum(&self) -> Vec<(Hash256, ScpQuorumSet)> {
+        let tracker = self.quorum_tracker.read();
+        let mut result = Vec::new();
+        for (_node_id, info) in tracker.quorum_map() {
+            if let Some(ref qset) = info.quorum_set {
+                let hash = henyey_scp::hash_quorum_set(qset);
+                result.push((hash, qset.clone()));
+            }
+        }
+        result
     }
 
     /// Whether we already have a quorum set with the given hash.
@@ -3634,6 +3681,15 @@ impl Herder {
     /// Get all SCP envelopes recorded for a slot.
     pub fn get_scp_envelopes(&self, slot: u64) -> Vec<ScpEnvelope> {
         self.scp.get_slot_envelopes(slot)
+    }
+
+    /// Get the externalizing state for a slot.
+    ///
+    /// Returns envelopes that contribute to the externalized state of a slot,
+    /// matching stellar-core's `getExternalizingState(slot)` used in
+    /// `processExternalized()` for SCP history persistence.
+    pub fn get_scp_externalizing_state(&self, slot: u64) -> Vec<ScpEnvelope> {
+        self.scp.get_externalizing_state(slot)
     }
 
     /// Get the current sendable SCP state for a specific slot.
@@ -6658,6 +6714,136 @@ mod tests {
             has_externalize,
             "SCP should emit its own EXTERNALIZE message"
         );
+    }
+
+    /// get_scp_externalizing_state() returns the externalizing state snapshot
+    /// (non-empty) for an externalized slot, and empty for unknown slots.
+    /// Exercises the accessor with a real externalized slot, not just empty cases.
+    #[test]
+    fn test_get_scp_externalizing_state_uses_externalizing_snapshot() {
+        let local_secret = SecretKey::from_seed(&[7u8; 32]);
+        let local_public = local_secret.public_key();
+        let local_node_id = node_id_from_public_key(&local_public);
+
+        let other_secret = SecretKey::from_seed(&[1u8; 32]);
+        let other_public = other_secret.public_key();
+        let other_node_id = node_id_from_public_key(&other_public);
+
+        let quorum_set = ScpQuorumSet {
+            threshold: 1,
+            validators: vec![local_node_id.clone(), other_node_id.clone()]
+                .try_into()
+                .unwrap(),
+            inner_sets: vec![].try_into().unwrap(),
+        };
+
+        let config = HerderConfig {
+            is_validator: true,
+            node_public_key: local_public,
+            local_quorum_set: Some(quorum_set.clone()),
+            ..HerderConfig::default()
+        };
+
+        let herder = Herder::with_secret_key(
+            config,
+            local_secret,
+            make_default_lm(),
+            TimerManagerHandle::no_op(),
+        );
+        herder.start_syncing();
+        herder.bootstrap(0);
+
+        herder
+            .quorum_tracker
+            .write()
+            .expand(&other_node_id, quorum_set)
+            .unwrap();
+
+        let tracking = herder.tracking_slot().get();
+
+        // Non-externalized slot → empty.
+        let state = herder.get_scp_externalizing_state(42);
+        assert!(
+            state.is_empty(),
+            "non-externalized slot should return empty"
+        );
+
+        // Externalize the tracking slot via a valid EXTERNALIZE envelope.
+        let envelope = make_signed_externalize_from(tracking, &herder, &other_secret);
+        let result = herder.receive_scp_envelope(envelope);
+        assert_eq!(result, EnvelopeState::Valid);
+        assert!(
+            herder.scp().is_slot_externalized(tracking),
+            "slot should be externalized after processing EXTERNALIZE"
+        );
+
+        // Now get_scp_externalizing_state should return non-empty envelopes.
+        let state = herder.get_scp_externalizing_state(tracking);
+        assert!(
+            !state.is_empty(),
+            "externalized slot should return non-empty externalizing state"
+        );
+
+        // All returned envelopes should be for the correct slot.
+        for env in &state {
+            assert_eq!(env.statement.slot_index, tracking);
+        }
+    }
+
+    /// get_currently_tracked_quorum() returns hash→qset pairs for all tracked
+    /// nodes, matching stellar-core's getCurrentlyTrackedQuorum() semantics.
+    #[test]
+    fn test_get_currently_tracked_quorum_returns_tracked_qsets() {
+        let local_secret = SecretKey::from_seed(&[7u8; 32]);
+        let local_public = local_secret.public_key();
+        let local_node_id = node_id_from_public_key(&local_public);
+
+        let other_secret = SecretKey::from_seed(&[1u8; 32]);
+        let other_public = other_secret.public_key();
+        let other_node_id = node_id_from_public_key(&other_public);
+
+        let quorum_set = ScpQuorumSet {
+            threshold: 1,
+            validators: vec![local_node_id.clone(), other_node_id.clone()]
+                .try_into()
+                .unwrap(),
+            inner_sets: vec![].try_into().unwrap(),
+        };
+
+        let config = HerderConfig {
+            is_validator: true,
+            node_public_key: local_public,
+            local_quorum_set: Some(quorum_set.clone()),
+            ..HerderConfig::default()
+        };
+
+        let herder = Herder::with_secret_key(
+            config,
+            local_secret,
+            make_default_lm(),
+            TimerManagerHandle::no_op(),
+        );
+
+        // Expand quorum tracker with the other node.
+        herder
+            .quorum_tracker
+            .write()
+            .expand(&other_node_id, quorum_set.clone())
+            .unwrap();
+
+        let tracked = herder.get_currently_tracked_quorum();
+        // Should have at least the local node's qset (from init) and the other
+        // node's qset (from expand).
+        assert!(
+            !tracked.is_empty(),
+            "tracked quorum should contain at least one entry"
+        );
+
+        // Verify that the hash matches the actual quorum set hash.
+        for (hash, qset) in &tracked {
+            let expected_hash = hash_quorum_set(qset);
+            assert_eq!(*hash, expected_hash, "hash should match computed qset hash");
+        }
     }
 
     /// Regression test for AUDIT-004: `store_quorum_set` must mirror the
@@ -12865,10 +13051,68 @@ mod required_lm_behavioral_tests {
         let herder = Herder::new(HerderConfig::default(), lm, TimerManagerHandle::no_op());
 
         let min_seq = herder.get_min_ledger_seq_to_ask_peers();
-        // lcl = 100, low = 101, window = min(max_externalized_slots, 3)
-        // Default max_externalized_slots is > 3, so window = 3
+        // lcl = 100, low = 101, window = min(MAX_SLOTS_TO_REMEMBER=12, 3) = 3
         // low = 101 - 3 = 98
         assert_eq!(min_seq, 98);
+    }
+
+    /// get_min_ledger_seq_to_ask_peers() uses the fixed MAX_SLOTS_TO_REMEMBER constant
+    /// for its pre-clamp lookback, NOT max_externalized_slots. This ensures parity
+    /// with stellar-core even when max_externalized_slots < 3.
+    #[test]
+    fn test_get_min_ledger_seq_to_ask_peers_ignores_low_max_externalized_slots() {
+        let lm = make_ledger_manager_at_seq(100);
+        let mut config = HerderConfig::default();
+        config.max_externalized_slots = 1; // below 3
+        let herder = Herder::new(config, lm, TimerManagerHandle::no_op());
+
+        let min_seq = herder.get_min_ledger_seq_to_ask_peers();
+        // stellar-core: min(MAX_SLOTS_TO_REMEMBER, SCP_EXTRA_LOOKBACK_LEDGERS) = min(12, 3) = 3
+        // lcl = 100, low = 101 - 3 = 98
+        // Before the fix, this would have been 101 - min(1, 3) = 100.
+        assert_eq!(min_seq, 98);
+    }
+
+    /// get_min_ledger_seq_to_ask_peers() clamps against get_min_ledger_seq_to_remember()
+    /// so the returned value never drops below the remember floor (§15.3 parity).
+    #[test]
+    fn test_get_min_ledger_seq_to_ask_peers_clamps_to_remember_floor() {
+        // Create a herder at a high ledger seq with tracking set high enough
+        // that the remember floor exceeds the lookback window.
+        let lm = make_ledger_manager_at_seq(50);
+        let herder = Herder::new(HerderConfig::default(), lm, TimerManagerHandle::no_op());
+
+        // Bootstrap so tracking_consensus_ledger_index = 100 (tracking_slot = 101)
+        herder.start_syncing();
+        herder.bootstrap(100);
+
+        // tracking_consensus_ledger_index = 100
+        // get_min_ledger_seq_to_remember: current_slot=100, 100 > 12, so 100-12+1 = 89
+        let remember_floor = herder.get_min_ledger_seq_to_remember();
+        assert_eq!(remember_floor, 89);
+
+        // get_min_ledger_seq_to_ask_peers: lcl=50, low=51, window=3, low=51-3=48
+        // But 48 < 89 (remember floor), so clamp to 89.
+        let min_seq = herder.get_min_ledger_seq_to_ask_peers();
+        assert_eq!(min_seq, remember_floor as u32);
+    }
+
+    /// get_scp_externalizing_state() returns the externalizing state snapshot for
+    /// an externalized slot, and empty for a slot with no externalizing state.
+    /// (Full test exercising non-empty externalized slot lives in the main `tests`
+    /// module as `test_get_scp_externalizing_state_uses_externalizing_snapshot`.)
+    #[test]
+    fn test_get_scp_externalizing_state_empty_for_unknown_slot() {
+        let lm = make_ledger_manager_at_seq(1);
+        let herder = Herder::new(HerderConfig::default(), lm, TimerManagerHandle::no_op());
+
+        // Slot 42 has no externalizing state → empty.
+        let state = herder.get_scp_externalizing_state(42);
+        assert!(state.is_empty());
+
+        // Slot 0 also empty.
+        let state = herder.get_scp_externalizing_state(0);
+        assert!(state.is_empty());
     }
 
     /// Regression test for #2904: when the herder's tracking consensus index
