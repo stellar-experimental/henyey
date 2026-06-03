@@ -234,6 +234,31 @@ impl App {
         self.herder.bootstrap(ledger_seq);
         tracing::info!(ledger_seq, "Herder bootstrapped");
 
+        // Restore persisted SCP state so a node recovering from a crash resumes
+        // local SCP tracking from the last persisted slot instead of waiting for
+        // fresh network envelopes. Parity: stellar-core invokes
+        // `HerderImpl::restoreSCPState()` from `HerderImpl::start()` after
+        // `setTrackingSCPState(..., /*isTrackingNetwork*/ true)` and before
+        // `startTxSetGCTimer()` (`stellar-core/src/herder/HerderImpl.cpp:2406-2419`).
+        // henyey's `bootstrap(ledger_seq)` above is the split equivalent of that
+        // tracking-establishment step, so restore runs here, immediately after
+        // bootstrap and before `request_scp_state_and_record()` asks peers for
+        // SCP state.
+        //
+        // Gate: stellar-core only reaches `restoreSCPState()` on the
+        // non-genesis / FORCE_SCP tracking branch — it skips restore when
+        // `!FORCE_SCP && lcl == GENESIS_LEDGER_SEQ` (HerderImpl.cpp:2401-2408).
+        // We mirror that with `ledger_seq > GENESIS_LEDGER_SEQ`: a fresh genesis
+        // boot (lcl == 1, no FORCE_SCP) skips restore. The FORCE_SCP-on-genesis
+        // edge (flag is consumed by `run_main_loop::bootstrap_from_db` before
+        // this point) is still correct because `Herder::restore_persisted_scp_state`
+        // replays only `slot > lcl` envelopes, and genesis has no persisted
+        // slot above 1 to replay.
+        const GENESIS_LEDGER_SEQ: u32 = 1;
+        if ledger_seq > GENESIS_LEDGER_SEQ {
+            self.herder.restore_persisted_scp_state(ledger_seq as u64);
+        }
+
         // Wire overlay tracking state to herder. The herder is now syncing,
         // so the overlay's maybe_drop_random_peer() should know the node is
         // tracking (parity: stellar-core Config::REALLY_DEAD_NUM_FAILURES_CUTOFF

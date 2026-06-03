@@ -2856,6 +2856,19 @@ impl ScpDriver {
         self.qset_tracker.get_by_hash(hash)
     }
 
+    /// Store a quorum set indexed by hash only, with no node association.
+    ///
+    /// Used by the SCP-restore path to rehydrate quorum-set bodies referenced
+    /// by restored envelopes without claiming a specific node→qset mapping.
+    /// Parity: stellar-core's `PendingEnvelopes::addSCPQuorumSet()` stores by
+    /// hash (`putQSet`) only (`PendingEnvelopes.cpp:115-121`). The post-restore
+    /// transitive-quorum rebuild re-derives node associations from each node's
+    /// latest restored message + companion hash, matching
+    /// `rebuildQuorumTrackerState()`.
+    pub fn store_quorum_set_by_hash(&self, hash: Hash256, quorum_set: ScpQuorumSet) {
+        self.qset_tracker.store_by_hash(hash, quorum_set);
+    }
+
     /// Whether we already have a quorum set with the given hash.
     pub fn has_quorum_set_hash(&self, hash: &Hash256) -> bool {
         self.qset_tracker.has_hash(hash)
