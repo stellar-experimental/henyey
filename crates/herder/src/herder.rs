@@ -6452,12 +6452,15 @@ mod tests {
         );
     }
 
-    /// Regression test for #2869 review feedback — close-time validity gate.
+    /// Regression test for #2869 review feedback + #2816 — close-time validity gate.
     ///
     /// Verifies that `trigger_next_ledger` on an observer performs NO
     /// build/cache/publish side effects when the locally-selected close time
     /// is invalid (too far in the future relative to wall clock).
-    /// Mirrors stellar-core's `ctValidityOffset` gate in `triggerNextLedger`.
+    /// Mirrors stellar-core's `ctValidityOffset` gate in `triggerNextLedger`,
+    /// which aborts (without error or side effects) before `addTxSet` for both
+    /// validators and observers. After #2816 the abort is surfaced as the typed
+    /// `TriggerOutcome::SkippedInvalidCloseTime` instead of a hard error.
     #[test]
     fn test_trigger_next_ledger_observer_skips_build_on_invalid_close_time() {
         // Create a LedgerManager whose LCL has a close_time far in the future.
@@ -6527,12 +6530,15 @@ mod tests {
         let valid_before = herder.scp_driver.cache_sizes().tx_set_valid_cache;
         assert_eq!(valid_before, 0);
 
-        // Trigger for slot 1 — should fail the close-time validity gate.
+        // Trigger for slot 1 — the far-ahead close-time abort in
+        // trigger_next_ledger fires before the observer build, returning the
+        // typed SkippedInvalidCloseTime outcome (no error, no side effects).
         let result = herder.trigger_next_ledger(1);
-        assert!(
-            result.is_err(),
-            "observer trigger should fail when close time is invalid \
-             (returns Err because build_and_cache returns None)"
+        assert_eq!(
+            result.expect("trigger_next_ledger should not hard-error on invalid close time"),
+            TriggerOutcome::SkippedInvalidCloseTime,
+            "observer trigger must return SkippedInvalidCloseTime when close \
+             time is too far ahead (parity: ctValidityOffset abort in triggerNextLedger)"
         );
 
         // Verify NO side effects: tx-set cache and validity cache stay empty.

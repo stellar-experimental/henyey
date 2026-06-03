@@ -4556,11 +4556,16 @@ mod tests {
         );
     }
 
-    /// Regression test for #2869 review feedback — watcher latch rollback.
+    /// Regression test for #2869 review feedback + #2816 — watcher latch rollback.
     ///
-    /// Verifies that when the observer trigger fails (e.g. close-time validity
-    /// gate rejects), the per-slot latch is rolled back so the next tick can
-    /// retry the same slot.
+    /// Verifies that when the observer trigger takes a benign retryable skip
+    /// (the close-time far-ahead abort rejects the proposed close time), the
+    /// per-slot latch is rolled back so the next tick can retry the same slot
+    /// once the close time becomes valid.
+    ///
+    /// After #2816 the far-ahead abort is surfaced as the typed
+    /// `SkippedInvalidCloseTime` outcome (not a hard error), so this exercises
+    /// the latch-rollback-on-skip path rather than the failure path.
     #[tokio::test]
     async fn test_try_trigger_consensus_watcher_retries_after_failure() {
         let dir = tempfile::tempdir().expect("temp dir");
@@ -4573,47 +4578,46 @@ mod tests {
 
         let app = App::new(config).await.unwrap();
         app.bootstrap_from_db().await.unwrap();
-        app.herder.bootstrap(1);
+
+        // Fix the herder clock and install an LCL whose close time is far
+        // enough ahead that `next_close_time = lcl_close_time + 1` exceeds the
+        // MAX_TIME_SLIP_SECONDS (60) validity window → far-ahead abort.
+        let now_secs: u64 = 1_700_000_000;
+        app.herder.set_test_clock_seconds(now_secs);
+        let mut header = app.ledger_manager().current_header();
+        header.scp_value.close_time = stellar_xdr::curr::TimePoint(now_secs + 61);
+        let lcl_seq = header.ledger_seq;
+        app.ledger_manager()
+            .set_header_for_test(header, henyey_common::Hash256::ZERO);
+        app.herder.bootstrap(lcl_seq);
         assert!(app.herder.is_tracking());
         assert!(!app.herder.is_validator());
 
-        // Set the test clock to a very small value so the close-time validity
-        // gate fails: build_and_cache computes close_time from SystemTime::now()
-        // (real time ~2026), but check_close_time uses test_clock=1, so
-        // close_time > 1 + 60 → invalid → trigger fails.
-        app.herder.set_test_clock_seconds(1);
-
-        let failures_before = app.consensus_trigger_failures.load(Ordering::Relaxed);
         app.try_trigger_consensus().await;
-        let failures_after = app.consensus_trigger_failures.load(Ordering::Relaxed);
 
-        // The trigger should have failed (close-time invalid).
-        assert_eq!(
-            failures_after,
-            failures_before + 1,
-            "first trigger should fail due to invalid close time"
-        );
-
-        // Verify no tx set was cached.
+        // The far-ahead close time is caught by the app-side ctValidityOffset
+        // gate, which skips the trigger without building/caching anything and
+        // rolls back the per-slot latch so a later tick can retry.
         assert_eq!(
             app.herder.scp_driver().tx_set_cache_size(),
             0,
-            "no tx set should be cached after failed trigger"
+            "no tx set should be cached after a far-ahead close-time skip"
         );
 
-        // Now fix the clock so the next trigger succeeds.
-        // Set test_clock to 0 to restore real SystemTime::now() behavior.
-        app.herder.set_test_clock_seconds(0);
+        // Now make the proposed close time valid: move the herder clock forward
+        // past the LCL close time so `next_close_time` falls within the window.
+        app.herder.set_test_clock_seconds(now_secs + 62);
 
         let successes_before = app.consensus_trigger_successes.load(Ordering::Relaxed);
         app.try_trigger_consensus().await;
         let successes_after = app.consensus_trigger_successes.load(Ordering::Relaxed);
 
-        // The retry should succeed because the latch was rolled back.
+        // The retry should succeed because the latch was rolled back on the
+        // earlier skip (a stuck latch would have made this a no-op).
         assert_eq!(
             successes_after,
             successes_before + 1,
-            "retry after failure should succeed (latch must have been rolled back)"
+            "retry after skip should succeed (latch must have been rolled back)"
         );
 
         // Verify the tx set is now cached.
@@ -4649,21 +4653,22 @@ mod tests {
         assert!(app.herder.is_tracking());
         assert!(!app.herder.is_validator());
 
-        // Force the first trigger to fail via invalid close time.
-        app.herder.set_test_clock_seconds(1);
+        // Make the first trigger take a benign skip via a far-ahead close time
+        // (#2816): with the LCL close time more than MAX_TIME_SLIP_SECONDS
+        // ahead of the herder clock, `trigger_next_ledger` returns
+        // SkippedInvalidCloseTime, which rolls back the per-slot latch.
+        let now_secs: u64 = 1_700_000_000;
+        app.herder.set_test_clock_seconds(now_secs);
+        let mut header = app.ledger_manager().current_header();
+        header.scp_value.close_time = stellar_xdr::curr::TimePoint(now_secs + 61);
+        app.ledger_manager()
+            .set_header_for_test(header, henyey_common::Hash256::ZERO);
 
-        let failures_before = app.consensus_trigger_failures.load(Ordering::Relaxed);
         app.try_trigger_consensus().await;
-        let failures_after = app.consensus_trigger_failures.load(Ordering::Relaxed);
-        assert_eq!(
-            failures_after,
-            failures_before + 1,
-            "trigger should fail due to invalid close time"
-        );
 
-        // After failure, latch was rolled back (same-slot rollback is correct).
-        // Now simulate a newer slot having been claimed concurrently: set
-        // the latch to slot 3 (next_slot was 2, so 3 > 2).
+        // After the skip, the latch was rolled back (same-slot rollback is
+        // correct). Now simulate a newer slot having been claimed
+        // concurrently: set the latch to slot 3 (next_slot was 2, so 3 > 2).
         app.watcher_last_triggered_slot.store(3, Ordering::Relaxed);
 
         // Attempt another trigger for slot 2 (still LCL=1 → next_slot=2).

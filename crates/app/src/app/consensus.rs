@@ -205,6 +205,9 @@ impl App {
                     next_slot,
                     "Skipping consensus trigger: trigger_time not yet reached (setupTriggerNextLedger parity)"
                 );
+                // Roll back the latch we just claimed so a later tick — once
+                // the trigger time is reached — can re-attempt this slot.
+                self.rollback_watcher_latch(next_slot);
                 return;
             }
 
@@ -225,6 +228,9 @@ impl App {
                     ct_offset,
                     "Skipping consensus trigger: ctValidityOffset requires additional delay"
                 );
+                // Roll back the latch so a later tick — once the proposed
+                // close time falls within the validity window — can retry.
+                self.rollback_watcher_latch(next_slot);
                 return;
             }
 
@@ -267,6 +273,11 @@ impl App {
                 Ok(Ok(henyey_herder::TriggerOutcome::SkippedStale)) => {
                     self.consensus_trigger_skipped_stale
                         .fetch_add(1, Ordering::Relaxed);
+                    // Benign retryable skip — roll back the watcher per-slot
+                    // latch so the next tick can re-attempt this slot (the
+                    // skip did not build/cache anything). Only clear if the
+                    // latch still holds OUR slot.
+                    self.rollback_watcher_latch(next_slot);
                 }
                 Ok(Ok(henyey_herder::TriggerOutcome::AlreadyNominating)) => {
                     // Idempotent re-trigger; not a new success, not an error.
@@ -282,40 +293,46 @@ impl App {
                         slot = next_slot,
                         "Consensus trigger: close time invalid, will retry"
                     );
+                    // Benign retryable skip (close time too far ahead of the
+                    // wall clock). Roll back the latch so a later tick — once
+                    // the clock catches up — can re-attempt this slot.
+                    self.rollback_watcher_latch(next_slot);
                 }
                 Ok(Err(e)) => {
                     self.consensus_trigger_failures
                         .fetch_add(1, Ordering::Relaxed);
                     // Roll back the watcher per-slot latch so a retry can
                     // re-attempt the build for this slot on the next tick.
-                    // Only clear if the latch still holds OUR slot — a newer
-                    // slot may have been claimed while we were awaiting.
-                    if !self.is_validator {
-                        let _ = self.watcher_last_triggered_slot.compare_exchange(
-                            next_slot as u64,
-                            0,
-                            Ordering::AcqRel,
-                            Ordering::Relaxed,
-                        );
-                    }
+                    self.rollback_watcher_latch(next_slot);
                     tracing::error!(error = %e, slot = next_slot, "Failed to trigger ledger");
                 }
                 Err(_join_error) => {
                     // Already logged by spawn_blocking_logged
                     self.consensus_trigger_failures
                         .fetch_add(1, Ordering::Relaxed);
-                    // Roll back latch on join failure as well — only if our
-                    // slot is still current (same race-safety as above).
-                    if !self.is_validator {
-                        let _ = self.watcher_last_triggered_slot.compare_exchange(
-                            next_slot as u64,
-                            0,
-                            Ordering::AcqRel,
-                            Ordering::Relaxed,
-                        );
-                    }
+                    // Roll back latch on join failure as well.
+                    self.rollback_watcher_latch(next_slot);
                 }
             }
+        }
+    }
+
+    /// Roll back the watcher per-slot trigger latch for `slot` after a
+    /// non-success trigger outcome (hard error, join failure, or a benign
+    /// retryable skip such as `SkippedStale` / `SkippedInvalidCloseTime`).
+    ///
+    /// Only clears the latch if it still holds OUR slot — a newer slot may
+    /// have been claimed while we were awaiting, and that claim must survive
+    /// (regression: stale rollback must not wipe a newer claim). No-op for
+    /// validators, which do not use the watcher latch.
+    fn rollback_watcher_latch(&self, slot: u32) {
+        if !self.is_validator {
+            let _ = self.watcher_last_triggered_slot.compare_exchange(
+                slot as u64,
+                0,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            );
         }
     }
 
