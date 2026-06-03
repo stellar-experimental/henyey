@@ -1308,7 +1308,9 @@ impl Herder {
     }
 
     /// Get the ballot-start instant for the given slot.
-    /// Parity: stellar-core `mLastTrigger` (HerderImpl.cpp), exposed as "prepare start".
+    /// Parity: stellar-core `getPrepareStart(slot)` / `mPrepareStart`
+    /// (HerderSCPDriver), as consumed by `setupTriggerNextLedger`
+    /// (HerderImpl.cpp:1266). Exposed here as "prepare start".
     pub fn prepare_start(&self, slot: SlotIndex) -> Option<std::time::Instant> {
         self.scp_driver.prepare_start(slot)
     }
@@ -7323,21 +7325,52 @@ mod tests {
 
         // The externalizing-state accessor returns a different view than
         // get_scp_envelopes(): get_scp_envelopes() returns the slot's recorded
-        // envelopes (here, the single received EXTERNALIZE), whereas the
-        // externalizing state additionally includes the local node's own
-        // commit-phase envelope synthesized when the slot externalizes — so the
-        // two collections are not identical. Asserting they differ is what
-        // validates the accessor is the externalizing snapshot and not a thin
-        // alias for the recorded-envelope set.
+        // (peer-received) envelopes — here, the single received EXTERNALIZE from
+        // `other_node` — whereas the externalizing state additionally includes
+        // the local node's own commit-phase envelope synthesized when the slot
+        // externalizes. We assert this as a *semantic*, order-insensitive
+        // difference rather than `assert_ne!` on the Vecs (which would pass even
+        // if both accessors returned the same set in a different order): the
+        // local node's synthesized EXTERNALIZE must be present in the
+        // externalizing snapshot and absent from the recorded-envelope set.
         let all_envelopes = herder.get_scp_envelopes(tracking);
         assert!(
             !all_envelopes.is_empty(),
             "externalized slot should have recorded envelopes"
         );
+
+        let local_in_state = state
+            .iter()
+            .any(|env| env.statement.node_id == local_node_id);
+        let local_in_recorded = all_envelopes
+            .iter()
+            .any(|env| env.statement.node_id == local_node_id);
+        assert!(
+            local_in_state,
+            "externalizing state must include the local node's synthesized \
+             EXTERNALIZE envelope"
+        );
+        assert!(
+            !local_in_recorded,
+            "recorded-envelope set must NOT include the local node's \
+             synthesized EXTERNALIZE (it holds only peer-received envelopes)"
+        );
+
+        // As a backstop, compare the two views as node-id sets so the check
+        // stays order-insensitive: the externalizing snapshot adds the local
+        // node, so the sets must differ.
+        let state_nodes: std::collections::BTreeSet<_> = state
+            .iter()
+            .map(|env| env.statement.node_id.clone())
+            .collect();
+        let recorded_nodes: std::collections::BTreeSet<_> = all_envelopes
+            .iter()
+            .map(|env| env.statement.node_id.clone())
+            .collect();
         assert_ne!(
-            state, all_envelopes,
-            "externalizing state should differ from the full recorded-envelope \
-             set (it is the EXTERNALIZE-phase snapshot, not all envelopes)"
+            state_nodes, recorded_nodes,
+            "externalizing state and recorded-envelope set should differ as \
+             node-id sets (the externalizing snapshot adds the local node)"
         );
     }
 

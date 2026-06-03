@@ -258,17 +258,16 @@ impl App {
                 return;
             }
 
-            // Parity: stellar-core HerderImpl.cpp:1281-1282
-            // triggerOffset = triggerTime - now (always >= 0 because triggerTime
-            // was clamped to max(lastBallotStart + expectedClose, now) above).
-            // This is the *remaining* time until trigger, not elapsed time.
-            let trigger_offset_secs = trigger_time
-                .saturating_duration_since(now_instant)
-                .as_secs();
-            let ct_offset = self.herder.ct_validity_offset(
-                self.herder.lcl_close_time().saturating_add(1),
-                trigger_offset_secs,
-            );
+            // Parity: stellar-core HerderImpl.cpp:1281-1282 passes
+            // `triggerTime - now` as the trigger offset. In this poller, we only
+            // reach this point once `trigger_time <= now_instant` (the
+            // early-return above bails out otherwise), so that offset is always
+            // 0 — the trigger fires at or after its scheduled time, never ahead.
+            // Pass 0 directly rather than computing a value that is provably
+            // zero on this path.
+            let ct_offset = self
+                .herder
+                .ct_validity_offset(self.herder.lcl_close_time().saturating_add(1), 0);
             if ct_offset > 0 {
                 tracing::debug!(
                     next_slot,
