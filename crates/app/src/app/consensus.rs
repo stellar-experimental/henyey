@@ -1435,16 +1435,36 @@ impl App {
                 // Spec: HERDER_SPEC §5.4-2: stellar-core's timerCallbackWrapper
                 // defers future-slot timer callbacks by re-scheduling them at a
                 // 1-second interval until the slot becomes current.
+                //
+                // Preserve the *originating* epoch (`event.epoch`) across the
+                // defer loop rather than letting the timer manager re-sample the
+                // current global epoch. Otherwise, if on_lost_sync() bumps the
+                // epoch between this event firing and the re-arm command being
+                // processed, the re-armed timer would be stamped with the new
+                // epoch and survive into Syncing — a "rebirth" that stellar-core
+                // cannot do, since its timerCallbackWrapper/setupTimer defer loop
+                // operates on the same in-process timer state. The event already
+                // passed the epoch guard above (event.epoch == current_epoch), so
+                // carrying event.epoch keeps the re-armed timer rejectable once
+                // the epoch advances.
                 let one_second = std::time::Duration::from_secs(1);
                 match event.timer_type {
                     henyey_herder::TimerType::Nomination => {
                         self.timer_manager_handle
-                            .schedule_nomination_timeout(event.slot, one_second)
+                            .reschedule_nomination_timeout_with_epoch(
+                                event.slot,
+                                one_second,
+                                event.epoch,
+                            )
                             .await;
                     }
                     henyey_herder::TimerType::Ballot => {
                         self.timer_manager_handle
-                            .schedule_ballot_timeout(event.slot, one_second)
+                            .reschedule_ballot_timeout_with_epoch(
+                                event.slot,
+                                one_second,
+                                event.epoch,
+                            )
                             .await;
                     }
                 }
@@ -2645,6 +2665,108 @@ mod tests {
             app.ballot_timeout_fires.load(Ordering::Relaxed),
             fires_before_current + 1,
             "event with current epoch must pass the epoch guard and fire"
+        );
+    }
+
+    /// Regression test for #2803 (PR #2821 final bounce, Parity comment 30):
+    /// the future-slot 1-second defer loop must NOT "rebirth" a pre-sync-loss
+    /// timer into the new epoch.
+    ///
+    /// Scenario: tracking at slot 2. A future-slot nomination timer (slot 5,
+    /// epoch 0) fires and is classified `Rearm`, re-scheduling for 1 second.
+    /// Before the re-armed timer fires, `on_lost_sync()` bumps the tracking
+    /// epoch to 1. When the re-armed timer finally fires and is re-delivered
+    /// through the production TimerManager → ScpTimerBridge path, it must carry
+    /// the ORIGINATING epoch (0), not the bumped epoch (1) — so the epoch guard
+    /// in `handle_scp_timer_event()` rejects it instead of firing it into the
+    /// timeout handler while the node is Syncing.
+    ///
+    /// stellar-core's in-process `timerCallbackWrapper`/`setupTimer` defer loop
+    /// cannot rebirth a pre-sync-loss timer this way; this test pins henyey's
+    /// split-architecture equivalent.
+    #[tokio::test(start_paused = true)]
+    async fn test_handle_scp_timer_event_e2e_rearm_preserves_epoch_across_sync_loss() {
+        use henyey_herder::sync_recovery::SyncRecoveryCallback;
+
+        let (_dir, app) = mk_validator_app().await;
+
+        // Bootstrap at ledger 1 → tracking slot = 2, is_tracking = true.
+        app.herder.bootstrap(1);
+        assert!(app.herder.is_tracking());
+        assert_eq!(app.herder.next_consensus_ledger_index().get(), 2);
+        assert_eq!(app.scp_timer_epoch.load(Ordering::Acquire), 0);
+
+        // Future-slot nomination event from the current (epoch 0) tracking
+        // epoch — classified Rearm and re-scheduled for 1 second carrying
+        // epoch 0.
+        let future_slot = 5u64;
+        let event = super::super::scp_timer_bridge::ScpTimerEvent {
+            slot: future_slot,
+            timer_type: henyey_herder::TimerType::Nomination,
+            epoch: 0,
+        };
+        app.handle_scp_timer_event(event).await;
+
+        // Let the timer manager process the re-arm command.
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+
+        // Lose sync mid-defer: bump the global epoch to 1 (and cancel timers).
+        // The re-arm command was already processed above, so the re-armed timer
+        // is in flight with its originating epoch 0.
+        app.on_lost_sync();
+        assert!(!app.herder.is_tracking());
+        assert_eq!(app.scp_timer_epoch.load(Ordering::Acquire), 1);
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+
+        // Note: on_lost_sync() also cancels all timers, but to prove the
+        // epoch-preservation property independently of cancellation ordering we
+        // re-arm explicitly with the originating epoch (this is exactly what the
+        // Rearm branch does) and then advance time. Whichever wins the race, the
+        // re-delivered event must carry epoch 0.
+        app.timer_manager_handle
+            .reschedule_nomination_timeout_with_epoch(
+                future_slot,
+                std::time::Duration::from_secs(1),
+                0,
+            )
+            .await;
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+
+        // Advance past the 1-second defer; the re-armed timer fires and is
+        // re-delivered through the production bridge.
+        let redelivered = {
+            let mut rx = app.scp_timer_rx.lock().await;
+            tokio::time::advance(std::time::Duration::from_millis(1001)).await;
+            for _ in 0..10 {
+                tokio::task::yield_now().await;
+            }
+            rx.try_recv()
+                .expect("expected re-delivered nomination timer event")
+        };
+
+        // The re-delivered event MUST carry the originating epoch (0), not the
+        // bumped global epoch (1). This is the core of the fix.
+        assert_eq!(
+            redelivered.epoch, 0,
+            "re-armed timer must carry the originating epoch across sync loss, not be reborn into the new epoch"
+        );
+        assert_eq!(redelivered.slot, future_slot);
+
+        // Feeding the re-delivered event back into the handler must DROP it via
+        // the epoch guard (event.epoch 0 != current_epoch 1) — no fire, no SCP
+        // state mutation while Syncing.
+        let nom_fires_before = app.nomination_timeout_fires.load(Ordering::Relaxed);
+        app.handle_scp_timer_event(redelivered).await;
+        assert_eq!(
+            app.nomination_timeout_fires.load(Ordering::Relaxed),
+            nom_fires_before,
+            "re-delivered timer from the prior epoch must be dropped after sync loss, not fired"
         );
     }
 }
