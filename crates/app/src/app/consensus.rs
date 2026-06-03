@@ -382,6 +382,74 @@ impl App {
         }
     }
 
+    /// Arm the event-driven consensus-trigger timer for the next ledger (#2702).
+    ///
+    /// Port of stellar-core's `HerderImpl::setupTriggerNextLedger`
+    /// (HerderImpl.cpp:1236-1303): compute the instant at which the next ledger
+    /// should be nominated (`prepareStart(lastSlot) + expectedClose`, clamped to
+    /// `now`, plus any `ctValidityOffset` delay) and arm a single-shot
+    /// `TimerType::TriggerNextLedger` timer for that delay. When the timer fires,
+    /// the main loop calls [`Self::try_trigger_consensus`] for the slot.
+    ///
+    /// This is the *primary* nomination scheduler. The 1-second maintenance tick
+    /// retains a now-idempotent `try_trigger_consensus()` call as a safety-net:
+    /// because `try_trigger_consensus` self-gates on the same trigger-time /
+    /// `ctValidityOffset` boundary (#2816), the tick can never trigger earlier
+    /// than this timer would, and a redundant call is absorbed by the herder's
+    /// `AlreadyNominating` guard / the watcher per-slot latch.
+    ///
+    /// Self-gates on `manual_close` (stellar-core skips `async_wait` under
+    /// MANUAL_CLOSE, HerderImpl.cpp:1298-1303) and on `is_tracking`. Always
+    /// cancels any prior trigger timer for the next slot before re-arming.
+    pub(super) async fn setup_trigger_next_ledger(&self) {
+        // Parity: MANUAL_CLOSE skips arming the trigger timer.
+        if self.config.node.manual_close {
+            return;
+        }
+        // Only arm while tracking — mirrors stellar-core arming the trigger from
+        // `lastClosedLedgerIncreased`, which only runs once the node is in-sync.
+        if !self.herder.is_tracking() {
+            return;
+        }
+
+        let current_ledger = self.current_ledger_seq();
+        let next_slot = current_ledger as u64 + 1;
+
+        // Compute the trigger instant exactly as `try_trigger_consensus` does
+        // (kept in lock-step so the timer and the safety-net agree on timing).
+        let expected_close = self.herder.ledger_close_duration();
+        let last_slot = current_ledger as u64;
+        let now_instant = std::time::Instant::now();
+        let trigger_time = match self.herder.prepare_start(last_slot) {
+            Some(ballot_start) => ballot_start + expected_close,
+            None => now_instant,
+        };
+        // Base delay from prepareStart + expectedClose, clamped to "now".
+        let base_delay = trigger_time.saturating_duration_since(now_instant);
+        // ctValidityOffset (seconds) — additional delay when the proposed close
+        // time (lcl.closeTime + 1) is still ahead of the wall-clock validity
+        // window. Mirrors HerderImpl.cpp:1281-1291.
+        let ct_offset_secs = self
+            .herder
+            .ct_validity_offset(self.herder.lcl_close_time().saturating_add(1), 0);
+        let delay = base_delay + std::time::Duration::from_secs(ct_offset_secs);
+
+        // Always cancel any prior trigger timer for this slot before re-arming
+        // (parity: `mTriggerTimer.cancel()` at the top of setupTriggerNextLedger).
+        self.timer_manager_handle
+            .cancel_trigger_next_ledger(next_slot)
+            .await;
+        self.timer_manager_handle
+            .schedule_trigger_next_ledger(next_slot, delay)
+            .await;
+        tracing::debug!(
+            next_slot,
+            delay_ms = delay.as_millis(),
+            ct_offset_secs,
+            "Armed event-driven consensus trigger timer (setupTriggerNextLedger)"
+        );
+    }
+
     /// Perform out-of-sync recovery matching stellar-core's outOfSyncRecovery().
     ///
     /// This broadcasts recent SCP messages to peers and requests SCP state,
@@ -1385,14 +1453,30 @@ impl App {
     ///
     /// This replaces the 500ms polling `check_scp_timeouts()` with precise
     /// single-shot timer delivery matching stellar-core's VirtualTimer pattern.
-    pub(super) async fn handle_scp_timer_event(&self, event: scp_timer_bridge::ScpTimerEvent) {
+    ///
+    /// Returns `true` if the caller should pump the close pipeline
+    /// (`process_externalized_slots()` + `try_start_ledger_close()`) after this
+    /// event. This is `true` only for a fired `TriggerNextLedger` event (#2702):
+    /// on a solo validator, `try_trigger_consensus()` externalizes the node's
+    /// *own* slot synchronously, and `publish_externalized()` does NOT wake the
+    /// event loop (unlike a network EXTERNALIZE arriving over `scp_message_rx`,
+    /// which the corresponding select arm already follows with a pipeline pump).
+    /// Without this signal, a self-externalized slot would not be applied until
+    /// the next 1-second maintenance tick — the cold-start ledger-production
+    /// stall behind the `test_horizon_ingesting` Quickstart failure. stellar-core
+    /// has no analog because its asio externalize callback drives the close
+    /// directly; this return is henyey-specific glue, not a parity divergence.
+    pub(super) async fn handle_scp_timer_event(
+        &self,
+        event: scp_timer_bridge::ScpTimerEvent,
+    ) -> bool {
         // Gate: only validators process SCP timeouts
         if !self.is_validator {
-            return;
+            return false;
         }
         // Gate: must be in a state that can receive SCP messages
         if !self.herder.state().can_receive_scp() {
-            return;
+            return false;
         }
         // Gate: reject events from a prior tracking epoch. These were already
         // queued in scp_timer_rx before on_lost_sync() incremented the epoch,
@@ -1405,7 +1489,26 @@ impl App {
                 current_epoch,
                 "Dropping stale timer event from prior tracking epoch"
             );
-            return;
+            return false;
+        }
+
+        // Event-driven consensus trigger (#2702). This is NOT an SCP
+        // nomination/ballot timeout, so it bypasses the future-slot defer /
+        // old-slot drop classification below (which is specific to SCP timers).
+        // A trigger for a stale slot (already closed) is harmlessly absorbed by
+        // try_trigger_consensus's own LCL/tracking gates.
+        if event.timer_type == henyey_herder::TimerType::TriggerNextLedger {
+            self.consensus_trigger_timer_fires
+                .fetch_add(1, Ordering::Relaxed);
+            self.try_trigger_consensus().await;
+            // Re-arm the trigger for the following slot so the event-driven
+            // schedule continues even if this attempt did not (yet) externalize
+            // (e.g. multi-node nomination still in flight, or a gated skip).
+            // setup_trigger_next_ledger is idempotent w.r.t. the per-slot timer.
+            self.setup_trigger_next_ledger().await;
+            // Signal the caller to pump the close pipeline for a possible
+            // self-externalized slot (see the doc comment).
+            return true;
         }
 
         // Use max(tracking_slot, current_ledger + 1) as the effective next slot.
@@ -1466,6 +1569,9 @@ impl App {
                             )
                             .await;
                     }
+                    // TriggerNextLedger is handled by the early return above and
+                    // never reaches the SCP-timeout defer/drop classification.
+                    henyey_herder::TimerType::TriggerNextLedger => {}
                 }
             }
             TimerEventAction::Fire => {
@@ -1487,9 +1593,14 @@ impl App {
                         self.ballot_timeout_fires.fetch_add(1, Ordering::Relaxed);
                         self.herder.handle_ballot_timeout(event.slot);
                     }
+                    // TriggerNextLedger is handled by the early return above.
+                    henyey_herder::TimerType::TriggerNextLedger => {}
                 }
             }
         }
+        // SCP nomination/ballot timeouts do not externalize a new slot, so the
+        // caller need not pump the close pipeline.
+        false
     }
 
     /// Trigger a recovery catchup: clear stale state and run catchup to current.
@@ -2766,6 +2877,112 @@ mod tests {
             app.nomination_timeout_fires.load(Ordering::Relaxed),
             nom_fires_before,
             "re-delivered timer from the prior epoch must be dropped after sync loss, not fired"
+        );
+    }
+
+    // ── Event-driven consensus trigger (#2702) ──────────────────────────
+
+    /// #2702: once tracking, `setup_trigger_next_ledger` arms a single-shot
+    /// `TriggerNextLedger` timer that fires back through the bridge as a
+    /// `TriggerNextLedger` event. Drives the primary event-driven nomination
+    /// schedule (replacing the 1-second poll as the primary trigger).
+    #[tokio::test(start_paused = true)]
+    async fn test_setup_trigger_next_ledger_arms_timer_when_tracking() {
+        let (_dir, app) = mk_validator_app().await;
+        app.herder.bootstrap(1);
+        assert!(app.herder.is_tracking());
+
+        app.setup_trigger_next_ledger().await;
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+
+        // prepare_start is None on cold start, so the delay is just the
+        // ctValidityOffset (0 here) → fires effectively immediately.
+        let mut rx = app.scp_timer_rx.lock().await;
+        tokio::time::advance(std::time::Duration::from_secs(2)).await;
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        let delivered = rx
+            .try_recv()
+            .expect("expected a TriggerNextLedger timer event to be delivered");
+        assert_eq!(
+            delivered.timer_type,
+            henyey_herder::TimerType::TriggerNextLedger
+        );
+        // Slot is current_ledger + 1 (LCL 1 → slot 2).
+        assert_eq!(delivered.slot, 2);
+    }
+
+    /// #2702: `setup_trigger_next_ledger` is a no-op before the herder is
+    /// tracking (cold start before bootstrap) — mirrors stellar-core arming
+    /// only from `lastClosedLedgerIncreased` while in-sync.
+    #[tokio::test(start_paused = true)]
+    async fn test_setup_trigger_next_ledger_skips_when_not_tracking() {
+        let (_dir, app) = mk_validator_app().await;
+        // No bootstrap → not tracking.
+        assert!(!app.herder.is_tracking());
+
+        app.setup_trigger_next_ledger().await;
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        let mut rx = app.scp_timer_rx.lock().await;
+        tokio::time::advance(std::time::Duration::from_secs(5)).await;
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            rx.try_recv().is_err(),
+            "no trigger timer should be armed while not tracking"
+        );
+    }
+
+    /// #2702: handling a fired `TriggerNextLedger` event increments the
+    /// `consensus_trigger_timer_fires` counter and returns `true` to signal the
+    /// caller to pump the close pipeline (the cold-start self-externalize fix).
+    #[tokio::test(start_paused = true)]
+    async fn test_trigger_next_ledger_event_fires_counter_and_signals_pump() {
+        let (_dir, app) = mk_validator_app().await;
+        app.herder.bootstrap(1);
+
+        let fires_before = app.consensus_trigger_timer_fires.load(Ordering::Relaxed);
+        let event = super::super::scp_timer_bridge::ScpTimerEvent {
+            slot: 2,
+            timer_type: henyey_herder::TimerType::TriggerNextLedger,
+            epoch: 0,
+        };
+        let pump = app.handle_scp_timer_event(event).await;
+
+        assert!(
+            pump,
+            "a fired TriggerNextLedger event must signal the caller to pump the close pipeline"
+        );
+        assert_eq!(
+            app.consensus_trigger_timer_fires.load(Ordering::Relaxed),
+            fires_before + 1,
+            "consensus_trigger_timer_fires must increment on a fired trigger event"
+        );
+    }
+
+    /// #2702: an SCP nomination/ballot timeout event must NOT signal a
+    /// close-pipeline pump (only the trigger event does).
+    #[tokio::test(start_paused = true)]
+    async fn test_scp_timeout_event_does_not_signal_pump() {
+        let (_dir, app) = mk_validator_app().await;
+        app.herder.bootstrap(1);
+        let next_slot = app.herder.next_consensus_ledger_index().get();
+
+        let event = super::super::scp_timer_bridge::ScpTimerEvent {
+            slot: next_slot,
+            timer_type: henyey_herder::TimerType::Nomination,
+            epoch: 0,
+        };
+        let pump = app.handle_scp_timer_event(event).await;
+        assert!(
+            !pump,
+            "SCP nomination timeout must not signal a close-pipeline pump"
         );
     }
 }

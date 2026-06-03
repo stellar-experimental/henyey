@@ -1851,6 +1851,9 @@ impl App {
             // Trigger consensus immediately after close, matching stellar-core.
             // Both validators and watchers participate (HERDER §5.2).
             self.try_trigger_consensus().await;
+            // Arm the event-driven trigger for the next ledger (#2702), the
+            // henyey analog of lastClosedLedgerIncreased → setupTriggerNextLedger.
+            self.setup_trigger_next_ledger().await;
 
             *self.last_externalized_at.write().await = self.clock.now();
             self.reset_tx_set_tracking().await;

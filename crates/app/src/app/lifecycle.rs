@@ -422,6 +422,14 @@ impl App {
             self.reset_tx_set_tracking().await;
         }
 
+        // Cold-start arm of the event-driven consensus trigger (#2702). Runs
+        // after restore_operational_state() (which set herder tracking state)
+        // and after the pre-loop process_externalized_slots(), so by now a
+        // tracking validator has a stable LCL to schedule the next ledger from.
+        // Self-gates on is_tracking()/manual_close; if not yet tracking, it is a
+        // no-op and the post-close path / 1-second tick safety-net arm it later.
+        self.setup_trigger_next_ledger().await;
+
         tracing::info!("Entering main event loop");
 
         // Start the std::thread watchdog (independent of tokio runtime).
@@ -531,6 +539,14 @@ impl App {
                         // (parity: HERDER §5.2).
                         self.set_phase_sub(super::phase::PHASE_6_10_TRY_TRIGGER_CONSENSUS);
                         self.try_trigger_consensus().await;
+
+                        // Arm the event-driven trigger for the *next* ledger
+                        // (#2702). This is the henyey analog of stellar-core's
+                        // `lastClosedLedgerIncreased` → `setupTriggerNextLedger`:
+                        // a close just advanced LCL, so schedule the next
+                        // nomination via a single-shot timer instead of relying
+                        // on the 1-second poll.
+                        self.setup_trigger_next_ledger().await;
 
                         // Drain SCP + fetch response channels.
                         // Timed (#1759 diagnostics): if either drain takes
@@ -1042,8 +1058,18 @@ impl App {
                         self.maybe_publish_history().await;
                     }
 
-                    // Try to trigger next round (validators nominate; watchers
-                    // build/cache the next-slot tx set per HERDER §5.2).
+                    // Safety-net trigger (#2702). The *primary* nomination
+                    // scheduler is now the event-driven TriggerNextLedger timer
+                    // (armed by setup_trigger_next_ledger after each close and at
+                    // cold start). This retained 1-second call is an idempotent
+                    // backstop: try_trigger_consensus self-gates on the same
+                    // prepareStart + expectedClose + ctValidityOffset boundary
+                    // (#2816), so it can never trigger earlier than the timer
+                    // would, and a redundant attempt is absorbed by the herder's
+                    // AlreadyNominating guard / the watcher per-slot latch. It
+                    // covers the case where a trigger timer was never armed (e.g.
+                    // arming was gated out at cold start before tracking settled)
+                    // — without it, a missed arm could stall ledger production.
                     self.try_trigger_consensus().await;
                 }
 
@@ -1089,10 +1115,29 @@ impl App {
                     self.update_survey_phase().await;
                 }
 
-                // SCP nomination/ballot timeouts (single-shot via TimerManager)
+                // SCP nomination/ballot timeouts + event-driven consensus
+                // trigger (#2702), single-shot via TimerManager.
                 Some(event) = scp_timer_rx.recv() => {
                     self.set_phase(26); // 26 = scp_timeout
-                    self.handle_scp_timer_event(event).await;
+                    let pump = self.handle_scp_timer_event(event).await;
+                    // A fired TriggerNextLedger may have self-externalized this
+                    // node's own slot (solo validator). publish_externalized()
+                    // does not wake the loop, so pump the close pipeline here —
+                    // mirroring what the scp_message_rx / verified_rx arms do
+                    // after a network EXTERNALIZE. Without this, a solo
+                    // validator stalls until the 1-second maintenance tick
+                    // (the test_horizon_ingesting cold-start failure mode).
+                    if pump {
+                        if pending_catchup.is_none() {
+                            if let Some(pc) = self.process_externalized_slots().await {
+                                pending_catchup = Some(pc);
+                            }
+                        }
+                        if close_pipeline.is_idle() && pending_catchup.is_none() {
+                            let next = self.try_start_ledger_close().await;
+                            close_pipeline.try_start_close(next);
+                        }
+                    }
                 }
 
                 // Ping peers for latency measurements

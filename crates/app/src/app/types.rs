@@ -171,6 +171,8 @@ pub struct SimulationDebugStats {
     pub heard_from_quorum: bool,
     pub is_v_blocking: bool,
     pub slot: Option<ScpSlotDebugStats>,
+    /// Event-driven consensus-trigger timer firings (#2702).
+    pub consensus_trigger_timer_fires: u64,
     pub nomination_timeout_fires: u64,
     pub ballot_timeout_fires: u64,
     pub scp_messages_sent: u64,
@@ -380,6 +382,8 @@ pub struct AppMetricsSnapshot {
     pub scp: henyey_herder::ScpMetricsSnapshot,
     pub scp_phase: u8,
     pub scp_cumulative_statements: u64,
+    /// Event-driven consensus-trigger timer firings (#2702).
+    pub consensus_trigger_timer_fires: u64,
     pub nomination_timeout_fires: u64,
     pub ballot_timeout_fires: u64,
     /// Times `try_trigger_consensus` skipped because a ledger close was in
