@@ -4349,6 +4349,28 @@ mod tests {
 
     // ──────── request_scp_state §15.3 parity tests ────────
 
+    /// Regression test for #2980: request_scp_state must return
+    /// Err(NotStarted) when the overlay has not been started, matching the
+    /// guard on broadcast()/connect() and stellar-core's shutdown guard,
+    /// instead of silently returning Ok(0) (which is indistinguishable from
+    /// "started, no peers").
+    #[test]
+    fn test_request_scp_state_returns_not_started_when_not_started() {
+        let config = OverlayConfig::default();
+        let secret = SecretKey::generate();
+        let local_node = LocalNode::new_testnet(secret);
+
+        // new() leaves running=false; the manager is never started.
+        let manager = OverlayManager::new(config, local_node).unwrap();
+
+        let result = manager.request_scp_state(42);
+        assert!(
+            matches!(result, Err(OverlayError::NotStarted)),
+            "request_scp_state should return Err(NotStarted) before start, got {:?}",
+            result
+        );
+    }
+
     #[tokio::test]
     async fn test_request_scp_state_with_single_peer_sends_once() {
         let config = OverlayConfig::default();
