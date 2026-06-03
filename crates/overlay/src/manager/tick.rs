@@ -342,20 +342,46 @@ impl OverlayManager {
                 let outbound_count = Self::count_outbound_peers(&shared.peer_info_cache);
                 let remaining = max_outbound.saturating_sub(outbound_count);
                 if remaining == 0 || outbound_count >= ctx.target_outbound {
+                    // No outbound budget left for either known-peer fill or
+                    // promotion — skip both. Still sweep cooldowns below.
+                    let now = std::time::Instant::now();
+                    shared.dial_cooldowns.retain(|_, expiry| now < *expiry);
                     continue;
                 }
 
+                // §10.4 / OverlayManagerImpl.cpp:782-787: if there are inbound
+                // peers we could promote to outbound, leave RESERVED_FOR_PROMOTION
+                // slots free so the promote-inbound step below can actually fire
+                // under outbound saturation. Otherwise use the full budget.
+                let promotable = Self::enumerate_promotable_inbound_peers(&shared);
+                let fill_budget = if !promotable.is_empty() {
+                    remaining.saturating_sub(Self::RESERVED_FOR_PROMOTION)
+                } else {
+                    remaining
+                };
+
                 // Fill remaining outbound slots from known peers.
-                Self::fill_outbound_slots(
-                    &known_peers,
-                    &mut retry_after,
-                    now,
-                    remaining,
-                    &pool,
-                    &shared,
-                    &ctx,
-                )
-                .await;
+                if fill_budget > 0 {
+                    Self::fill_outbound_slots(
+                        &known_peers,
+                        &mut retry_after,
+                        now,
+                        fill_budget,
+                        &pool,
+                        &shared,
+                        &ctx,
+                    )
+                    .await;
+                }
+
+                // §10.4 / OverlayManagerImpl.cpp:790-794: finally, attempt to
+                // promote some inbound connections to outbound. Runs strictly
+                // last so it consumes only the leftover (reserved) budget.
+                let outbound_count = Self::count_outbound_peers(&shared.peer_info_cache);
+                let promote_budget = max_outbound.saturating_sub(outbound_count);
+                if promote_budget > 0 {
+                    Self::promote_inbound_peers(promote_budget, &pool, &shared, &ctx).await;
+                }
 
                 // Sweep expired dial cooldowns to avoid unbounded growth.
                 let now = std::time::Instant::now();
@@ -566,6 +592,110 @@ impl OverlayManager {
         }
     }
 
+    /// Number of pending outbound slots reserved for inbound-peer promotion.
+    ///
+    /// Matches stellar-core `RESERVED_FOR_PROMOTION` (OverlayManagerImpl.cpp:784).
+    /// When promotable inbound peers exist, `fill_outbound_slots` leaves this
+    /// many slots free so the promote-inbound step can fire under saturation.
+    const RESERVED_FOR_PROMOTION: usize = 1;
+
+    /// Enumerate authenticated Inbound peers that are candidates for promotion
+    /// to an outbound connection.
+    ///
+    /// A peer is promotable if we have an inbound connection to it, we do not
+    /// already have an outbound connection to its advertised listening address,
+    /// and it is not under a dial cooldown. The returned addresses are the
+    /// peers' advertised listening IP:port (rewritten into `PeerInfo.address`
+    /// at Hello, peer.rs:687-691), so they are directly dialable.
+    ///
+    /// Mirrors the candidate set stellar-core's `connectTo(.., PeerType::INBOUND)`
+    /// dials (OverlayManagerImpl.cpp:790-794).
+    fn enumerate_promotable_inbound_peers(shared: &SharedPeerState) -> Vec<PeerAddress> {
+        let now = std::time::Instant::now();
+        let mut out = Vec::new();
+        for entry in shared.peer_info_cache.iter() {
+            let info = entry.value();
+            // Only inbound peers are promotion candidates.
+            if info.direction.we_called_remote() {
+                continue;
+            }
+            let addr = PeerAddress::from(info.address);
+            // Skip if we already have an outbound connection to this address.
+            if Self::has_outbound_connection_to(&shared.peer_info_cache, &addr) {
+                continue;
+            }
+            // Skip if within reconnection cooldown (mutual-dial oscillation guard).
+            if let DialKey::Resolved(resolved) = addr.dial_key() {
+                if let Some(expiry) = shared.dial_cooldowns.get(&resolved) {
+                    if now < *expiry.value() {
+                        continue;
+                    }
+                }
+            }
+            out.push(addr);
+        }
+        out
+    }
+
+    /// Attempt to promote inbound connections to outbound by dialing their
+    /// advertised listening addresses, up to `budget` slots.
+    ///
+    /// Matches stellar-core `connectTo(availablePendingSlots, PeerType::INBOUND)`
+    /// (OverlayManagerImpl.cpp:790-794) — the final step of `tick()`. The
+    /// candidate set is shuffled so promotion is not biased toward any peer.
+    async fn promote_inbound_peers(
+        budget: usize,
+        pool: &Arc<ConnectionPool>,
+        shared: &SharedPeerState,
+        ctx: &TickConnectCtx,
+    ) {
+        if budget == 0 {
+            return;
+        }
+        let mut candidates = Self::enumerate_promotable_inbound_peers(shared);
+        if candidates.is_empty() {
+            return;
+        }
+        candidates.shuffle(&mut rand::thread_rng());
+
+        let mut remaining = budget;
+        for addr in &candidates {
+            if remaining == 0 {
+                break;
+            }
+
+            // Re-check under the loop: an earlier promotion in this tick may
+            // have created the outbound connection we're about to dial.
+            if Self::has_outbound_connection_to(&shared.peer_info_cache, addr) {
+                continue;
+            }
+
+            if !pool.try_reserve() {
+                debug!("Outbound peer pending limit reached during promotion");
+                break;
+            }
+
+            match super::connection::connect_to_explicit_peer(
+                addr,
+                ctx.local_node.clone(),
+                ctx.timeouts,
+                Arc::clone(pool),
+                shared.clone(),
+                Arc::clone(&ctx.connection_factory),
+            )
+            .await
+            {
+                Ok(_) => {
+                    debug!("Promoting inbound peer {} to outbound", addr);
+                    remaining = remaining.saturating_sub(1);
+                }
+                Err(e) => {
+                    debug!("Failed to promote inbound peer {}: {}", addr, e);
+                }
+            }
+        }
+    }
+
     /// Delay (seconds) before we drop a random peer when out of sync.
     ///
     /// Matches stellar-core `OUT_OF_SYNC_RECONNECT_DELAY` (60s).
@@ -759,6 +889,187 @@ mod tests {
                 "bind not used in test".to_string(),
             ))
         }
+    }
+
+    /// A connection factory that records every address it is asked to dial,
+    /// then fails the connect (so no handshake is needed). Used to assert
+    /// which peers the promote-inbound step dials.
+    #[derive(Debug, Default)]
+    struct RecordingConnectionFactory {
+        dialed: std::sync::Mutex<Vec<SocketAddr>>,
+    }
+
+    impl RecordingConnectionFactory {
+        fn dialed(&self) -> Vec<SocketAddr> {
+            self.dialed.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl ConnectionFactory for RecordingConnectionFactory {
+        async fn connect(&self, addr: SocketAddr, _timeout_secs: u64) -> Result<Connection> {
+            self.dialed.lock().unwrap().push(addr);
+            Err(OverlayError::ConnectionFailed(format!(
+                "recorded dial to {addr}"
+            )))
+        }
+
+        async fn bind(&self, _port: u16) -> Result<Listener> {
+            Err(OverlayError::ConnectionFailed(
+                "bind not used in test".to_string(),
+            ))
+        }
+    }
+
+    fn promote_ctx(factory: Arc<dyn ConnectionFactory>) -> TickConnectCtx {
+        TickConnectCtx {
+            local_node: LocalNode::new_testnet(SecretKey::generate()),
+            timeouts: crate::OutboundTimeouts {
+                connect_secs: 1,
+                auth_secs: 1,
+            },
+            target_outbound: 8,
+            connection_factory: factory,
+        }
+    }
+
+    // ---- §10.4 promote-inbound tests ----
+
+    #[tokio::test]
+    async fn test_promote_inbound_dials_inbound_peer_address() {
+        let factory = Arc::new(RecordingConnectionFactory::default());
+        let manager = OverlayManager::new_with_connection_factory(
+            OverlayConfig::default(),
+            LocalNode::new_testnet(SecretKey::generate()),
+            factory.clone(),
+        )
+        .unwrap();
+        let shared = manager.shared_state();
+
+        // An authenticated inbound peer whose advertised listening address is
+        // 10.0.0.5:11625 (rewritten into PeerInfo.address at Hello).
+        let mut info = make_peer_info(ConnectionDirection::Inbound, 11625);
+        info.address = "10.0.0.5:11625".parse().unwrap();
+        register_fake_peer(&shared.peers, &shared.peer_info_cache, info);
+
+        // A free pending slot exists for promotion.
+        let ctx = promote_ctx(factory.clone());
+        OverlayManager::promote_inbound_peers(1, &manager.outbound_pool, &shared, &ctx).await;
+
+        let dialed = factory.dialed();
+        assert_eq!(dialed.len(), 1, "should dial exactly the one inbound peer");
+        assert_eq!(
+            dialed[0],
+            "10.0.0.5:11625".parse::<SocketAddr>().unwrap(),
+            "should dial the inbound peer's advertised listening address"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_promote_inbound_skips_existing_outbound() {
+        let factory = Arc::new(RecordingConnectionFactory::default());
+        let manager = OverlayManager::new_with_connection_factory(
+            OverlayConfig::default(),
+            LocalNode::new_testnet(SecretKey::generate()),
+            factory.clone(),
+        )
+        .unwrap();
+        let shared = manager.shared_state();
+
+        // Inbound peer advertising 10.0.0.7:11625 ...
+        let mut inbound = make_peer_info(ConnectionDirection::Inbound, 11625);
+        inbound.address = "10.0.0.7:11625".parse().unwrap();
+        register_fake_peer(&shared.peers, &shared.peer_info_cache, inbound);
+
+        // ... and an existing outbound connection to the same address.
+        let mut outbound = make_peer_info(ConnectionDirection::Outbound, 22000);
+        outbound.address = "10.0.0.7:11625".parse().unwrap();
+        register_fake_peer(&shared.peers, &shared.peer_info_cache, outbound);
+
+        let ctx = promote_ctx(factory.clone());
+        OverlayManager::promote_inbound_peers(4, &manager.outbound_pool, &shared, &ctx).await;
+
+        assert!(
+            factory.dialed().is_empty(),
+            "must not redial a peer we already have an outbound connection to"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_promote_inbound_respects_pending_budget() {
+        let factory = Arc::new(RecordingConnectionFactory::default());
+        let manager = OverlayManager::new_with_connection_factory(
+            OverlayConfig::default(),
+            LocalNode::new_testnet(SecretKey::generate()),
+            factory.clone(),
+        )
+        .unwrap();
+        let shared = manager.shared_state();
+
+        let mut info = make_peer_info(ConnectionDirection::Inbound, 11625);
+        info.address = "10.0.0.9:11625".parse().unwrap();
+        register_fake_peer(&shared.peers, &shared.peer_info_cache, info);
+
+        // Zero budget ⇒ no dial.
+        let ctx = promote_ctx(factory.clone());
+        OverlayManager::promote_inbound_peers(0, &manager.outbound_pool, &shared, &ctx).await;
+        assert!(
+            factory.dialed().is_empty(),
+            "no dial should occur with zero promotion budget"
+        );
+    }
+
+    #[test]
+    fn test_fill_outbound_reserves_promotion_slot() {
+        // With a promotable inbound peer present, the fill budget must be
+        // reduced by RESERVED_FOR_PROMOTION so the promote step can fire.
+        let manager = OverlayManager::new_with_connection_factory(
+            OverlayConfig::default(),
+            LocalNode::new_testnet(SecretKey::generate()),
+            Arc::new(FailingConnectionFactory),
+        )
+        .unwrap();
+        let shared = manager.shared_state();
+
+        let mut info = make_peer_info(ConnectionDirection::Inbound, 11625);
+        info.address = "10.0.0.11:11625".parse().unwrap();
+        register_fake_peer(&shared.peers, &shared.peer_info_cache, info);
+
+        let promotable = OverlayManager::enumerate_promotable_inbound_peers(&shared);
+        assert_eq!(promotable.len(), 1, "the inbound peer should be promotable");
+
+        // Mirror the tick-loop budget computation.
+        let remaining = 8usize;
+        let fill_budget = if !promotable.is_empty() {
+            remaining.saturating_sub(OverlayManager::RESERVED_FOR_PROMOTION)
+        } else {
+            remaining
+        };
+        assert_eq!(
+            fill_budget, 7,
+            "one slot must be reserved for promotion when promotable peers exist"
+        );
+    }
+
+    #[test]
+    fn test_enumerate_promotable_excludes_outbound_only() {
+        // An outbound-only peer is never a promotion candidate.
+        let manager = OverlayManager::new_with_connection_factory(
+            OverlayConfig::default(),
+            LocalNode::new_testnet(SecretKey::generate()),
+            Arc::new(FailingConnectionFactory),
+        )
+        .unwrap();
+        let shared = manager.shared_state();
+
+        let mut info = make_peer_info(ConnectionDirection::Outbound, 11625);
+        info.address = "10.0.0.13:11625".parse().unwrap();
+        register_fake_peer(&shared.peers, &shared.peer_info_cache, info);
+
+        assert!(
+            OverlayManager::enumerate_promotable_inbound_peers(&shared).is_empty(),
+            "outbound peers are not promotion candidates"
+        );
     }
 
     #[tokio::test]

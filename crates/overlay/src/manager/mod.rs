@@ -402,8 +402,15 @@ pub(super) enum OutboundMessage {
     Send(StellarMessage),
     /// Flood message (goes through FlowControl outbound queue).
     Flood(StellarMessage),
-    /// Close the connection.
+    /// Close the connection immediately (idle/normal teardown).
     Shutdown,
+    /// Close the connection after a 5 s drain delay (error-drop path).
+    ///
+    /// §12.3 / TCPPeer.cpp:835-862: after the final `ERROR_MSG` has been
+    /// flushed to the socket, defer the actual close by 5 s so the peer
+    /// receives the error rather than an RST. Only the error-drop path uses
+    /// this; plain teardown stays immediate (`Shutdown`).
+    ShutdownAfterError,
 }
 
 /// Bundled connection parameters for the tick-loop helpers

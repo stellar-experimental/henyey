@@ -14,7 +14,7 @@ use crate::{
     PeerId,
 };
 use sha2::Digest;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use stellar_xdr::curr::{ErrorCode, SError, StellarMessage, StringM, Uint256};
@@ -270,6 +270,16 @@ impl PeerRateLimiter {
 /// Matches stellar-core `RECURRENT_TIMER_PERIOD` (5 seconds).
 const PING_INTERVAL_TICKS: u32 = 5;
 
+/// Delay before closing the socket on the error-drop path, after the final
+/// `ERROR_MSG` has been flushed.
+///
+/// §12.3 / TCPPeer.cpp:849: `expires_from_now(std::chrono::seconds(5))`.
+const ERROR_DROP_DRAIN_DELAY: Duration = Duration::from_secs(5);
+
+/// Poll interval used to make the error-drop drain delay interruptible by
+/// node shutdown without depending on a per-peer shutdown channel.
+const ERROR_DROP_DRAIN_POLL: Duration = Duration::from_millis(100);
+
 /// Truncate an error message to fit within the XDR `string msg<100>` limit.
 ///
 /// If the message exceeds 100 bytes it is truncated at a valid UTF-8 boundary
@@ -311,7 +321,12 @@ pub(super) fn send_error_and_drop(
 ) -> bool {
     let err_msg = make_error_msg(code, message);
     let _ = outbound_tx.try_send(OutboundMessage::Send(err_msg));
-    let shutdown_queued = match outbound_tx.try_send(OutboundMessage::Shutdown) {
+    // §12.3 / TCPPeer.cpp:835-862: use the deferred-shutdown variant so the
+    // loop flushes the queued ERROR_MSG and then waits 5 s before closing the
+    // socket, letting the peer actually receive the error. The `Send(err)` is
+    // dequeued and flushed before `ShutdownAfterError` (same channel, FIFO),
+    // so the drain delay is guaranteed to run post-flush.
+    let shutdown_queued = match outbound_tx.try_send(OutboundMessage::ShutdownAfterError) {
         Ok(()) | Err(TrySendError::Closed(_)) => true,
         Err(TrySendError::Full(_)) => false,
     };
@@ -848,6 +863,23 @@ impl OverlayManager {
     /// The peer is owned by this task (no mutex). Outbound messages arrive
     /// via `outbound_rx`. The `tokio::select!` multiplexes between network
     /// recv, outbound channel, and periodic timers without blocking.
+    /// Sleep for `ERROR_DROP_DRAIN_DELAY`, returning early if the overlay is
+    /// shutting down (`running` flips to false).
+    ///
+    /// §12.3 / TCPPeer.cpp:835-862: the per-peer 5 s deferred-close timer. The
+    /// poll loop keeps node-wide shutdown responsive (≤100 ms) instead of
+    /// blocking each peer task for a full 5 s.
+    async fn wait_error_drop_drain(running: &AtomicBool) {
+        let deadline = Instant::now() + ERROR_DROP_DRAIN_DELAY;
+        while Instant::now() < deadline {
+            if !running.load(Ordering::Relaxed) {
+                return;
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            tokio::time::sleep(remaining.min(ERROR_DROP_DRAIN_POLL)).await;
+        }
+    }
+
     pub(super) async fn run_peer_loop(
         peer_id: PeerId,
         mut peer: Peer,
@@ -927,6 +959,21 @@ impl OverlayManager {
                         }
                         Some(OutboundMessage::Shutdown) => {
                             info!("Peer {} loop exiting: shutdown requested", peer_id);
+                            break;
+                        }
+                        Some(OutboundMessage::ShutdownAfterError) => {
+                            // §12.3 / TCPPeer.cpp:835-862: the preceding
+                            // `Send(err)` has already been flushed to the socket
+                            // (same channel, FIFO). Defer the close by 5 s so the
+                            // ERROR_MSG drains rather than being RST'd. The sleep
+                            // is per-peer-task and interruptible by node shutdown
+                            // (`state.running` going false), so it never delays
+                            // overlay teardown by 5 s per peer.
+                            info!(
+                                "Peer {} loop exiting: error drop, draining for {:?}",
+                                peer_id, ERROR_DROP_DRAIN_DELAY
+                            );
+                            Self::wait_error_drop_drain(running).await;
                             break;
                         }
                         None => {
@@ -1376,14 +1423,43 @@ mod tests {
             ),
         }
 
-        // Second message should be shutdown
+        // Second message should be the deferred (error-drop) shutdown so the
+        // loop drains the ERROR_MSG for 5 s before closing the socket.
         match rx.recv().await.unwrap() {
-            OutboundMessage::Shutdown => {}
+            OutboundMessage::ShutdownAfterError => {}
             other => panic!(
-                "expected Shutdown, got {:?}",
+                "expected ShutdownAfterError, got {:?}",
                 std::mem::discriminant(&other)
             ),
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_error_drop_drains_before_close() {
+        // §12.3: on the error-drop path the loop waits the full 5 s drain
+        // before returning, when the node stays up.
+        let running = AtomicBool::new(true);
+        let start = tokio::time::Instant::now();
+        OverlayManager::wait_error_drop_drain(&running).await;
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed >= ERROR_DROP_DRAIN_DELAY,
+            "error-drop drain must wait the full {ERROR_DROP_DRAIN_DELAY:?}, waited {elapsed:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_error_drop_drain_interrupted_by_shutdown() {
+        // Node shutdown (`running` → false) cuts the 5 s drain short so overlay
+        // teardown is never blocked 5 s per peer.
+        let running = AtomicBool::new(false);
+        let start = tokio::time::Instant::now();
+        OverlayManager::wait_error_drop_drain(&running).await;
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < ERROR_DROP_DRAIN_DELAY,
+            "shutdown must interrupt the drain well before {ERROR_DROP_DRAIN_DELAY:?}, waited {elapsed:?}"
+        );
     }
 
     #[test]
