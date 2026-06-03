@@ -22,7 +22,7 @@ integrity checks during ledger close.
 | AccountSubEntriesCountIsValid | ✅ | ✅ | No | Pool share trustlines count as 2 |
 | LedgerEntryIsValid | ✅ | ⚠️ Partial | No | Missing: Soroban entries, asset validity, claim predicates |
 | SponsorshipCountIsValid | ✅ | ✅ | No | Full sponsorship accounting |
-| ConservationOfLumens | ✅ | ❌ | No | Deferred (needs header access) |
+| ConservationOfLumens | ✅ | ⚠️ Partial | No | Per-op native-XLM conservation; SAC ContractData balances not counted (#2987); `checkSnapshot` bucket-scan out of scope |
 | LiabilitiesMatchOffers | ✅ | ❌ | No | Deferred |
 | BucketListIsConsistentWithDatabase | ✅ | ❌ | Yes | Deferred (bucket-apply hook) |
 | BucketListStateConsistency | ✅ | ❌ | Yes | Deferred (snapshot hook) |
