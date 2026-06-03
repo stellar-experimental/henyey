@@ -12747,9 +12747,23 @@ mod tests {
         app.recovery_baseline_ledger
             .store(current_ledger as u64, Ordering::SeqCst);
 
-        // Record timestamp before the call.
-        let before = *app.last_scp_state_request_at.read().await;
-        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        // Force the "before" timestamp into the known past so the post-call
+        // assertion is deterministic. The call sets last_scp_state_request_at
+        // to clock.now() (a real Instant); pinning `before` slightly earlier
+        // guarantees `after > before` without relying on a real sleep to make
+        // Instant::now() advance (flaky on coarse-resolution timers, #2923).
+        //
+        // Use checked_sub with a small 1ms delta so this never underflow-panics
+        // on hosts whose monotonic clock origin is younger than the delta (e.g.
+        // freshly-booted CI VMs with uptime < 1h). A 1ms back-date is enough to
+        // beat the timer resolution while staying within any realistic uptime;
+        // the unwrap_or fallback degrades to the current instant only on the
+        // (practically impossible) sub-1ms-uptime path, never panicking.
+        let now = app.clock.now();
+        let before = now
+            .checked_sub(std::time::Duration::from_millis(1))
+            .unwrap_or(now);
+        *app.last_scp_state_request_at.write().await = before;
 
         // Drive recovery through the fast-track → trigger_recovery_catchup path.
         let result = app.out_of_sync_recovery(current_ledger).await;
