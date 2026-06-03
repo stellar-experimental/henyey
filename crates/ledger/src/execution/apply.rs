@@ -444,6 +444,45 @@ pub(super) fn collect_soroban_restored_entries(
 }
 
 impl TransactionExecutor {
+    /// Build an op-scoped [`stellar_xdr::curr::LedgerHeader`] used as both the
+    /// `current` and `previous` header for `ConservationOfLumens`.
+    ///
+    /// Only `total_coins`/`fee_pool` are read by the invariant, and it reads
+    /// only their *delta* between current and previous. Because the same header
+    /// value is passed for both sides, that delta is always 0 — which is correct
+    /// for henyey: no operation mutates `totalCoins`/`feePool` within op scope
+    /// (inflation is unsupported in 24+ and always returns `NotTime`/empty
+    /// payouts; fee-pool changes are applied at tx-set level via
+    /// `record_fee_pool_delta`, outside the per-op delta). The concrete field
+    /// values are therefore irrelevant; we emit a minimal header.
+    fn op_scoped_header(&self) -> stellar_xdr::curr::LedgerHeader {
+        use stellar_xdr::curr::{
+            Hash, LedgerHeader, LedgerHeaderExt, StellarValue, StellarValueExt, TimePoint,
+        };
+        LedgerHeader {
+            ledger_version: self.protocol_version,
+            previous_ledger_hash: Hash([0; 32]),
+            scp_value: StellarValue {
+                tx_set_hash: Hash([0; 32]),
+                close_time: TimePoint(self.close_time),
+                upgrades: Default::default(),
+                ext: StellarValueExt::Basic,
+            },
+            tx_set_result_hash: Hash([0; 32]),
+            bucket_list_hash: Hash([0; 32]),
+            ledger_seq: self.ledger_seq,
+            total_coins: 0,
+            fee_pool: 0,
+            inflation_seq: 0,
+            id_pool: 0,
+            base_fee: 0,
+            base_reserve: self.base_reserve,
+            max_tx_set_size: 0,
+            skip_list: [Hash([0; 32]), Hash([0; 32]), Hash([0; 32]), Hash([0; 32])],
+            ext: LedgerHeaderExt::V0,
+        }
+    }
+
     /// Apply phase: execute operations, build meta, handle rollback on failure.
     ///
     /// This is the second half of transaction execution, consuming the
@@ -804,6 +843,15 @@ impl TransactionExecutor {
 
                         // Run invariant checks on the operation delta.
                         if let Some(ref invariant_mgr) = self.invariant_manager {
+                            // Op-scoped header pair for ConservationOfLumens. No
+                            // henyey operation mutates totalCoins/feePool within
+                            // op scope (inflation always returns NotTime/empty
+                            // payouts — operations/execute/inflation.rs; fee
+                            // charging is tx-set-level via record_fee_pool_delta),
+                            // so current == previous yields
+                            // deltaTotalCoins = deltaFeePool = 0. The shared
+                            // values are irrelevant since only the delta is read.
+                            let op_scoped_header = self.op_scoped_header();
                             let inv_delta = henyey_invariant::OperationDelta {
                                 created: delta_slice.created(),
                                 updated: delta_slice.updated(),
@@ -812,8 +860,8 @@ impl TransactionExecutor {
                                 delete_states: delta_slice.delete_states(),
                                 ledger_seq: self.ledger_seq,
                                 ledger_version: self.protocol_version,
-                                header_current: None,
-                                header_previous: None,
+                                header_current: Some(&op_scoped_header),
+                                header_previous: Some(&op_scoped_header),
                                 network_id: &self.network_id.0 .0,
                             };
                             invariant_mgr.check_on_operation_apply(

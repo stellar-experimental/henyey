@@ -11,10 +11,12 @@
 //! - All invariants use `Invariant(false)` (non-strict) unless otherwise noted.
 //! - Strict invariants panic on failure; non-strict invariants log and continue.
 
+mod conservation;
 mod entry_valid;
 mod sponsorship;
 mod sub_entries;
 
+pub use conservation::ConservationOfLumens;
 pub use entry_valid::LedgerEntryIsValid;
 pub use sponsorship::SponsorshipCountIsValid;
 pub use sub_entries::AccountSubEntriesCountIsValid;
@@ -52,10 +54,12 @@ pub struct OperationDelta<'a> {
     /// Current protocol version.
     pub ledger_version: u32,
     /// Current ledger header (after this operation's header mutations).
-    /// `None` until ConservationOfLumens invariant is implemented.
+    /// Consumed by [`ConservationOfLumens`] for the `totalCoins`/`feePool`
+    /// delta checks. `None` callers skip those header-delta checks (the
+    /// `deltaBalances` portion is still evaluated).
     pub header_current: Option<&'a LedgerHeader>,
     /// Previous ledger header (before this ledger's transactions).
-    /// `None` until ConservationOfLumens invariant is implemented.
+    /// See [`Self::header_current`]; `None` skips the header-delta checks.
     pub header_previous: Option<&'a LedgerHeader>,
     /// Network ID (SHA-256 of passphrase).
     pub network_id: &'a [u8; 32],

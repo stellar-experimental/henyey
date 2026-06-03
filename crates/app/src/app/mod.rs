@@ -1199,6 +1199,9 @@ impl App {
             inv_mgr.register(std::sync::Arc::new(
                 henyey_invariant::SponsorshipCountIsValid,
             ));
+            inv_mgr.register(std::sync::Arc::new(
+                henyey_invariant::ConservationOfLumens::new(),
+            ));
             // Enable invariants matching configured patterns.
             for pattern in &config.invariants.checks {
                 inv_mgr.enable(pattern).unwrap_or_else(|e| {

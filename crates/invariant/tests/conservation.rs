@@ -235,6 +235,25 @@ fn test_conservation_fails_on_minted_lumens() {
 // ---------------------------------------------------------------------------
 
 #[test]
+fn test_conservation_holds_on_balanced_delete_and_credit() {
+    let inv = ConservationOfLumens::new();
+    let h = header(1_000_000, 0);
+    // A native claimable balance of 700 is deleted (claimed); the destination
+    // account is credited 700 → net zero.
+    let res = DeltaBuilder::new()
+        .deleted(claimable_balance_entry(5, Asset::Native, 700))
+        .updated(account_entry(3, 1000), account_entry(3, 1700))
+        .check(&inv, &payment_result(), Some(&h), Some(&h));
+    assert!(res.is_ok(), "balanced delete+credit should hold: {res:?}");
+
+    // Deleting the native CB without crediting anyone → lumens vanish → fails.
+    let bad = DeltaBuilder::new()
+        .deleted(claimable_balance_entry(5, Asset::Native, 700))
+        .check(&inv, &payment_result(), Some(&h), Some(&h));
+    assert!(bad.is_err(), "unmatched CB delete should fail");
+}
+
+#[test]
 fn test_conservation_holds_on_balanced_transfer() {
     let inv = ConservationOfLumens::new();
     let h = header(1_000_000, 0);
