@@ -104,8 +104,8 @@ Corresponds to: `Herder.h`, `HerderImpl.h`
 | `emitEnvelope()` | handled by `ScpDriver` | Full |
 | `lostSync()` | `SyncRecoveryManager::record_lost_sync()` | Full |
 | `checkCloseTime()` | `check_envelope_close_time()` | Full |
-| `ctValidityOffset()` | `Herder::ct_validity_offset()` | Partial | Close-time validity offset (#2816) computed per stellar-core HerderImpl.cpp:1158-1172 and used by both the app-side trigger delay (`try_trigger_consensus`) and the herder-side far-ahead abort (`trigger_next_ledger`); exact event-driven timer scheduling remains in #2702. |
-| `setupTriggerNextLedger()` | Split: `App::try_trigger_consensus()` + `Herder::trigger_next_ledger()` | Partial | App-side polling loop now enforces the `prepareStart + expectedClose` trigger-time delay and the `ctValidityOffset` adjustment before calling `trigger_next_ledger()` (#2816), so henyey never triggers earlier than stellar-core's computed boundary (it may trigger up to one poll tick later). Pre-entry behind/applying/not-tracking guards match; `LCL >= tracking` uses corrective recovery instead of stellar-core's fail-fast assertion, and `is_applying()` is re-checked post-build inside `trigger_next_ledger`. Exact timer-based (event-driven) scheduling remains in #2702. |
+| `ctValidityOffset()` | `Herder::ct_validity_offset()` | Full | Close-time validity offset (#2816) computed per stellar-core HerderImpl.cpp:1158-1172 and used by both the event-driven trigger arming (`setup_trigger_next_ledger`, #2702) and the herder-side far-ahead abort (`trigger_next_ledger`). |
+| `setupTriggerNextLedger()` | `App::setup_trigger_next_ledger()` (arms `TimerType::TriggerNextLedger`) + `App::try_trigger_consensus()` + `Herder::trigger_next_ledger()` | Full | Event-driven (#2702): a single-shot `TriggerNextLedger` timer is armed (via `TimerManager`) at `prepareStart + expectedClose + ctValidityOffset` from the post-close path (henyey analog of `lastClosedLedgerIncreased`) and at cold start once tracking; on fire the main loop calls `try_trigger_consensus()` and pumps the close pipeline (henyey-specific glue — `publish_externalized()` does not wake the loop, unlike stellar-core's asio externalize callback). The 1-second maintenance tick retains an idempotent `try_trigger_consensus()` safety-net (self-gated on the same trigger-time / `ctValidityOffset` boundary, so it can never trigger earlier than the timer). Pre-entry behind/applying/not-tracking guards match; `LCL >= tracking` uses corrective recovery instead of stellar-core's fail-fast assertion; `is_applying()` is re-checked post-build inside `trigger_next_ledger`. |
 | `startOutOfSyncTimer()` | `SyncRecoveryManager` | Full |
 | `outOfSyncRecovery()` | `out_of_sync_recovery()` | Full |
 | `broadcast()` | `flush_tx_adverts()` in `App` | Partial — priority-ordered via `TransactionQueue::broadcast_with_visitor()` with DEX-lane flood budget, budget-neutral skipped txs, arb flood damping, and ban-on-damping; broadcast period uses `flood_tx_period_ms` (200 ms) matching stellar-core `FLOOD_TX_PERIOD_MS`; missing dedicated flood queue, mark-on-attempt, separate advert flush timer |
@@ -576,12 +576,16 @@ Features not yet implemented. These ARE counted against parity %.
      before peer envelopes for the next tracking slot are processed.
      `setupTriggerNextLedger` (`HerderImpl.cpp:1237-1254`) asserts that
      apply is not in flight and tracking equals the LCL. As of #2816,
-     henyey's `try_trigger_consensus()` enforces the `prepareStart +
-     expectedClose` delay and `ctValidityOffset` check before calling
+     henyey's trigger path enforces the `prepareStart + expectedClose`
+     delay and `ctValidityOffset` check before calling
      `trigger_next_ledger()`, and the herder-side far-ahead abort in
      `trigger_next_ledger()` refuses to build/nominate when the proposed
-     close time exceeds `now + MAX_TIME_SLIP_SECONDS`. Full event-driven
-     timer scheduling (#2702) is not yet ported.
+     close time exceeds `now + MAX_TIME_SLIP_SECONDS`. As of #2702 the
+     scheduling is event-driven: `App::setup_trigger_next_ledger()` arms a
+     single-shot `TimerType::TriggerNextLedger` timer at that computed
+     instant (from the post-close path and at cold start), with the
+     1-second maintenance tick retaining an idempotent
+     `try_trigger_consensus()` safety-net.
    - **Rust**: `process_scp_envelope` forwards peer EXTERNALIZE to SCP
      before the tx_set is fetched, so tracking advance can proceed
      during catchup (#1795). Pending envelope drain now runs post-apply

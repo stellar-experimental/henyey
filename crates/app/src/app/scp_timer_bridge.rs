@@ -49,4 +49,12 @@ impl TimerCallback for ScpTimerBridge {
             epoch,
         });
     }
+
+    fn on_trigger_next_ledger(&self, slot: SlotIndex, epoch: u64) {
+        let _ = self.sender.send(ScpTimerEvent {
+            slot,
+            timer_type: TimerType::TriggerNextLedger,
+            epoch,
+        });
+    }
 }

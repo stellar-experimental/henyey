@@ -715,6 +715,11 @@ metric_catalog! {
             "henyey_nomination_timeout_skipped_stale_total"
             => "Total handle_nomination_timeout invocations that returned \
                 SkippedStale because LCL advanced during build/drain";
+        CONSENSUS_TRIGGER_TIMER_FIRES_TOTAL =
+            "henyey_consensus_trigger_timer_fires_total"
+            => "Total event-driven consensus-trigger timer firings (#2702); each \
+                drives one try_trigger_consensus attempt, mirroring stellar-core's \
+                mTriggerTimer → triggerNextLedger";
 
         // Stage E: History archive lifecycle counters (10334 dashboard).
         // All count terminal outcomes; retries within an operation are not counted.
@@ -1269,6 +1274,7 @@ pub(crate) async fn refresh_gauges(state: &ServerState) {
     CONSENSUS_TRIGGER_SKIPPED_APPLYING_TOTAL.absolute(snap.consensus_trigger_skipped_applying);
     CONSENSUS_TRIGGER_SKIPPED_STALE_TOTAL.absolute(snap.consensus_trigger_skipped_stale);
     NOMINATION_TIMEOUT_SKIPPED_STALE_TOTAL.absolute(snap.nomination_timeout_skipped_stale);
+    CONSENSUS_TRIGGER_TIMER_FIRES_TOTAL.absolute(snap.consensus_trigger_timer_fires);
     SCP_ENVELOPE_VALIDSIG_TOTAL.absolute(snap.scp.envelope_validsig_total);
     SCP_ENVELOPE_INVALIDSIG_TOTAL.absolute(snap.scp.envelope_invalidsig_total);
     SCP_ENVELOPE_SIGN_TOTAL.absolute(snap.scp.envelope_sign_total);

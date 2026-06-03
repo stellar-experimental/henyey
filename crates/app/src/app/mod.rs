@@ -676,6 +676,11 @@ pub struct App {
     /// rebuilds from periodic polling (henyey's equivalent of stellar-core's
     /// one-shot timer scheduling in `setupTriggerNextLedger`).
     pub(crate) watcher_last_triggered_slot: AtomicU64,
+    /// Number of event-driven consensus-trigger timer firings (#2702). Each
+    /// fire of the `TimerType::TriggerNextLedger` timer drives one
+    /// `try_trigger_consensus()` attempt, mirroring stellar-core's
+    /// `mTriggerTimer` → `triggerNextLedger`.
+    pub(crate) consensus_trigger_timer_fires: AtomicU64,
     /// Number of nomination timeout firings.
     nomination_timeout_fires: AtomicU64,
     /// Number of nomination timeout invocations that returned
@@ -1361,6 +1366,7 @@ impl App {
             consensus_trigger_skipped_applying: AtomicU64::new(0),
             consensus_trigger_skipped_stale: AtomicU64::new(0),
             watcher_last_triggered_slot: AtomicU64::new(0),
+            consensus_trigger_timer_fires: AtomicU64::new(0),
             nomination_timeout_fires: AtomicU64::new(0),
             nomination_timeout_skipped_stale: AtomicU64::new(0),
             ballot_timeout_fires: AtomicU64::new(0),
@@ -2497,6 +2503,9 @@ impl App {
             heard_from_quorum: self.herder.heard_from_quorum(quorum_slot),
             is_v_blocking: self.herder.is_v_blocking(quorum_slot),
             slot: slot_state.map(Into::into),
+            consensus_trigger_timer_fires: self
+                .consensus_trigger_timer_fires
+                .load(Ordering::Relaxed),
             nomination_timeout_fires: self.nomination_timeout_fires.load(Ordering::Relaxed),
             ballot_timeout_fires: self.ballot_timeout_fires.load(Ordering::Relaxed),
             scp_messages_sent: self.scp_messages_sent.load(Ordering::Relaxed),
@@ -2860,6 +2869,9 @@ impl App {
             scp: self.herder.scp_metrics_snapshot(),
             scp_phase: self.herder.tracking_slot_ballot_phase(),
             scp_cumulative_statements: self.herder.scp_cumulative_statement_count() as u64,
+            consensus_trigger_timer_fires: self
+                .consensus_trigger_timer_fires
+                .load(Ordering::Relaxed),
             nomination_timeout_fires: self.nomination_timeout_fires.load(Ordering::Relaxed),
             ballot_timeout_fires: self.ballot_timeout_fires.load(Ordering::Relaxed),
             consensus_trigger_skipped_applying: self
