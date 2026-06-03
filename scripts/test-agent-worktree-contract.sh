@@ -1303,6 +1303,92 @@ test_workspace_marker_persist_reap_contract() {
 }
 
 # --------------------------------------------------------------------------
+# Test: review-pr reap guard canonicalizes the marker path BEFORE the
+# boundary prefix check (issue #2990 — defense-in-depth against a malformed
+# marker containing ../ that string-prefix-matches $PW_HOME/data but resolves
+# outside it). We extract the real reap_workspace function from the skill doc
+# and feed it a hostile escape path; the guard must REFUSE to rm -rf it.
+# --------------------------------------------------------------------------
+test_reap_guard_canonicalizes_before_prefix_check() {
+  local desc="review-pr reap guard canonicalizes marker before boundary check (#2990)"
+
+  # Extract the reap_workspace function body verbatim from the skill doc:
+  # everything from the `reap_workspace() {` line up to the closing `}` at
+  # column 0. The skill defines it exactly once.
+  local reap_fn
+  reap_fn=$(awk '
+    /^reap_workspace\(\) \{/ { capture = 1 }
+    capture { print }
+    capture && /^\}/ { exit }
+  ' "$REVIEW_PR_SKILL")
+
+  if [[ -z "$reap_fn" ]] || ! grep -q 'rm -rf' <<< "$reap_fn"; then
+    tap_not_ok "$desc" "could not extract reap_workspace() from $REVIEW_PR_SKILL"
+    return
+  fi
+
+  local real_home
+  real_home="$(_test_real_home)"
+
+  # Stage a real directory OUTSIDE the contract boundary, then a hostile path
+  # that string-prefix-matches "$PW_HOME/data/" but canonicalizes to that
+  # outside directory via a ../ traversal. The pre-fix raw `case` glob accepts
+  # this (it begins with "$PW_HOME/data/"); a canonicalize-first guard rejects it.
+  local victim
+  victim="$(mktemp -d)"
+  local sentinel="$victim/SHOULD_NOT_BE_REAPED"
+  : > "$sentinel"
+
+  # Build the escape: $PW_HOME/data/../<...>/<victim-tail> resolving to $victim.
+  # Walk up from $PW_HOME/data to filesystem root, then back down to $victim.
+  local up_count escape
+  up_count=$(awk -F/ '{print NF-1}' <<< "$real_home/data")
+  escape="$real_home/data"
+  local i
+  for ((i = 0; i < up_count; i++)); do escape="$escape/.."; done
+  # $escape now resolves to "/"; append the absolute victim path (sans leading /).
+  escape="$escape${victim}"
+
+  local output
+  output=$(PW_HOME="$real_home" bash -c '
+    set -uo pipefail
+    '"$reap_fn"'
+    reap_workspace "'"$escape"'"
+    echo "REAP_RETURNED:$?"
+  ' 2>&1) || true
+
+  if [[ ! -f "$sentinel" ]]; then
+    rm -rf "$victim"
+    tap_not_ok "$desc" "reap_workspace DELETED an outside-boundary path via ../ escape: $output"
+    return
+  fi
+
+  if ! grep -q 'refusing to reap' <<< "$output"; then
+    rm -rf "$victim"
+    tap_not_ok "$desc" "reap_workspace did not refuse the ../ escape path: $output"
+    return
+  fi
+
+  # Sanity: the guard must still reap a legitimate in-boundary directory.
+  local legit
+  legit="$real_home/data/.reap-guard-test-$$"
+  mkdir -p "$legit"
+  PW_HOME="$real_home" bash -c '
+    set -uo pipefail
+    '"$reap_fn"'
+    reap_workspace "'"$legit"'"
+  ' >/dev/null 2>&1 || true
+  if [[ -d "$legit" ]]; then
+    rm -rf "$victim" "$legit"
+    tap_not_ok "$desc" "reap_workspace refused a legitimate in-boundary path: $legit"
+    return
+  fi
+
+  rm -rf "$victim" "$legit"
+  tap_ok "$desc"
+}
+
+# --------------------------------------------------------------------------
 # Test: /do uses the shared contract helper, not an in-repo worktree
 # --------------------------------------------------------------------------
 test_do_skill_uses_contract_helper_not_repo_tree() {
@@ -1446,6 +1532,7 @@ test_do_bootstrap_default_under_home_data
 test_do_bootstrap_exports_workspace_alias
 test_do_bootstrap_clears_workspace_on_failure
 test_workspace_marker_persist_reap_contract
+test_reap_guard_canonicalizes_before_prefix_check
 test_do_skill_uses_contract_helper_not_repo_tree
 test_skill_prompts_forbid_known_leak_patterns
 test_assert_no_repo_tree_scratch_detects_leak_dirs
