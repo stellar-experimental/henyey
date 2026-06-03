@@ -783,11 +783,14 @@ reap_workspace() {  # $1 = absolute dir to remove
     echo "WARN: refusing to reap '$ws' — could not canonicalize for boundary check" >&2
     return 0
   fi
-  # Directory-boundary check on the RESOLVED paths: accept exact <home>/data or
-  # paths strictly under it. Rejects siblings like ~/data-evil and ../ escapes.
+  # Directory-boundary check on the RESOLVED paths: accept ONLY paths strictly
+  # under <home>/data. The bare <home>/data root is rejected — a marker that
+  # resolved to exactly the data root would otherwise `rm -rf` every workspace.
+  # Also rejects siblings like ~/data-evil and ../ escapes. The `--` guards
+  # against a canon that begins with a dash being parsed as an rm option.
   case "$canon" in
-    "$home_data" | "$home_data"/*) [ -d "$canon" ] && rm -rf "$canon" ;;
-    *) echo "WARN: refusing to reap '$ws' — resolves to '$canon', outside '$home_data'" >&2 ;;
+    "$home_data"/*) [ -d "$canon" ] && rm -rf -- "$canon" ;;
+    *) echo "WARN: refusing to reap '$ws' — resolves to '$canon', outside '$home_data/'" >&2 ;;
   esac
 }
 
