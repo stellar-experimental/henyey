@@ -763,6 +763,9 @@ pub struct App {
     survey_reporting: RwLock<SurveyReportingState>,
     /// SCP timer manager handle for scheduling/cancelling timers.
     timer_manager_handle: henyey_herder::TimerManagerHandle,
+    /// Tracking epoch counter — incremented on sync loss to invalidate
+    /// in-flight timer events that were queued during the previous epoch.
+    scp_timer_epoch: Arc<AtomicU64>,
     /// SCP timer event receiver for the main loop.
     scp_timer_rx: TokioMutex<tokio::sync::mpsc::UnboundedReceiver<scp_timer_bridge::ScpTimerEvent>>,
     /// JoinHandle for the timer manager background task.
@@ -1223,8 +1226,10 @@ impl App {
         // Replaces the 500ms polling interval with exact-expiry timers
         // matching stellar-core's VirtualTimer pattern.
         let (scp_timer_tx, scp_timer_rx) = tokio::sync::mpsc::unbounded_channel();
+        let scp_timer_epoch = Arc::new(AtomicU64::new(0));
         let timer_bridge = std::sync::Arc::new(scp_timer_bridge::ScpTimerBridge::new(scp_timer_tx));
-        let (timer_manager_handle, timer_manager) = henyey_herder::TimerManager::new(timer_bridge);
+        let (timer_manager_handle, timer_manager) =
+            henyey_herder::TimerManager::new(timer_bridge, Arc::clone(&scp_timer_epoch));
         let timer_manager_join = tokio::spawn(timer_manager.run());
 
         let herder_config = Self::build_herder_config(&config, &keypair, local_quorum_set);
@@ -1388,6 +1393,7 @@ impl App {
             survey_throttle,
             survey_reporting: RwLock::new(SurveyReportingState::new(now)),
             timer_manager_handle,
+            scp_timer_epoch,
             scp_timer_rx: TokioMutex::new(scp_timer_rx),
             timer_manager_join: TokioMutex::new(Some(timer_manager_join)),
             meta_stream: std::sync::Mutex::new(meta_stream_for_mutex),

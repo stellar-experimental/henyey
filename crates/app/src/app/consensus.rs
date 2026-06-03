@@ -111,6 +111,53 @@ pub(super) fn should_delay_checkpoint(checkpoint: u64, first_sequential_ledger: 
     checkpoint < first_sequential_ledger
 }
 
+/// The action to take when an SCP timer event fires.
+///
+/// Pure classification of the three-way split from stellar-core's
+/// `HerderSCPDriver::timerCallbackWrapper`: old-slot timers are dropped,
+/// future-slot timers are re-armed at 1 second while tracking, and
+/// current-slot timers fire immediately.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum TimerEventAction {
+    /// Old-slot timer — discard without re-arming.
+    Drop,
+    /// Future-slot timer while tracking — re-arm with 1-second delay.
+    Rearm,
+    /// Current slot or non-tracking — execute the timeout handler.
+    Fire,
+}
+
+/// Classify a timer event into an action based on the event's slot, the next
+/// consensus slot, and whether the herder is currently tracking.
+///
+/// Spec: HERDER_SPEC §5.4-2 (future-slot timer reschedule).
+///
+/// Parity: stellar-core's `timerCallbackWrapper` only applies the slot-based
+/// defer/drop logic when `isTracking()` is true. When not tracking, all timer
+/// callbacks fire immediately regardless of slot relationship to
+/// `nextConsensusLedgerIndex()`. We match this behavior exactly — stale events
+/// from prior tracking epochs are rejected by the epoch guard in
+/// `handle_scp_timer_event()` before reaching this classifier.
+pub(super) fn classify_timer_event(
+    event_slot: u64,
+    next_consensus_slot: u64,
+    is_tracking: bool,
+) -> TimerEventAction {
+    if !is_tracking {
+        // Not tracking: fire unconditionally. Matches stellar-core's
+        // timerCallbackWrapper which only gates on slot when isTracking().
+        // Stale events from prior epochs are already rejected by the
+        // epoch guard before reaching this point.
+        TimerEventAction::Fire
+    } else if event_slot < next_consensus_slot {
+        TimerEventAction::Drop
+    } else if event_slot > next_consensus_slot {
+        TimerEventAction::Rearm
+    } else {
+        TimerEventAction::Fire
+    }
+}
+
 impl App {
     /// Try to trigger consensus for the next ledger.
     ///
@@ -1348,34 +1395,100 @@ impl App {
         if !self.herder.state().can_receive_scp() {
             return;
         }
-
-        // Staleness guard: compute the active slot exactly as the old
-        // check_scp_timeouts did (consensus.rs:1157-1158).
-        let current_ledger = self.current_ledger_seq() as u64;
-        let active_slot = self.herder.tracking_slot().get().max(current_ledger + 1);
-        if event.slot != active_slot {
-            // Stale event — slot advanced past this timer
+        // Gate: reject events from a prior tracking epoch. These were already
+        // queued in scp_timer_rx before on_lost_sync() incremented the epoch,
+        // so cancel_all_timers_nonblocking() could not retract them.
+        let current_epoch = self.scp_timer_epoch.load(Ordering::Acquire);
+        if event.epoch != current_epoch {
+            tracing::debug!(
+                slot = event.slot,
+                event_epoch = event.epoch,
+                current_epoch,
+                "Dropping stale timer event from prior tracking epoch"
+            );
             return;
         }
 
-        // Fire the timeout handler, preserving counters and spawn_blocking
-        // for nomination (parity with the removed check_scp_timeouts).
-        match event.timer_type {
-            henyey_herder::TimerType::Nomination => {
-                self.nomination_timeout_fires
-                    .fetch_add(1, Ordering::Relaxed);
-                let outcome = self
-                    .herder
-                    .handle_nomination_timeout_blocking(event.slot)
+        // Use max(tracking_slot, current_ledger + 1) as the effective next slot.
+        // In the INV-H2 corrective window where LCL + 1 > tracking_slot, a timer
+        // for LCL + 1 is current from the app's perspective and must fire immediately
+        // rather than being deferred as a "future" slot.
+        let tracking_next = self.herder.next_consensus_ledger_index().get();
+        let lcl_next = self.current_ledger_seq() as u64 + 1;
+        let next_slot = tracking_next.max(lcl_next);
+        let action = classify_timer_event(event.slot, next_slot, self.herder.is_tracking());
+
+        match action {
+            TimerEventAction::Drop => {
+                // Stale old-slot timer — cancel all timers for this slot.
+                // Parity: stellar-core's timerCallbackWrapper routes mismatched
+                // slots through setupTimer(), which erases the entire slot's
+                // timer set when slotIndex <= trackingConsensusLedgerIndex().
+                // This ensures sibling timers for the same stale slot are also
+                // cleaned up rather than firing later.
+                self.timer_manager_handle
+                    .cancel_slot_timers(event.slot)
                     .await;
-                if matches!(outcome, henyey_herder::TimeoutOutcome::SkippedStale) {
-                    self.nomination_timeout_skipped_stale
-                        .fetch_add(1, Ordering::Relaxed);
+            }
+            TimerEventAction::Rearm => {
+                // Future-slot timer while tracking — re-arm for 1 second.
+                // Spec: HERDER_SPEC §5.4-2: stellar-core's timerCallbackWrapper
+                // defers future-slot timer callbacks by re-scheduling them at a
+                // 1-second interval until the slot becomes current.
+                //
+                // Preserve the *originating* epoch (`event.epoch`) across the
+                // defer loop rather than letting the timer manager re-sample the
+                // current global epoch. Otherwise, if on_lost_sync() bumps the
+                // epoch between this event firing and the re-arm command being
+                // processed, the re-armed timer would be stamped with the new
+                // epoch and survive into Syncing — a "rebirth" that stellar-core
+                // cannot do, since its timerCallbackWrapper/setupTimer defer loop
+                // operates on the same in-process timer state. The event already
+                // passed the epoch guard above (event.epoch == current_epoch), so
+                // carrying event.epoch keeps the re-armed timer rejectable once
+                // the epoch advances.
+                let one_second = std::time::Duration::from_secs(1);
+                match event.timer_type {
+                    henyey_herder::TimerType::Nomination => {
+                        self.timer_manager_handle
+                            .reschedule_nomination_timeout_with_epoch(
+                                event.slot,
+                                one_second,
+                                event.epoch,
+                            )
+                            .await;
+                    }
+                    henyey_herder::TimerType::Ballot => {
+                        self.timer_manager_handle
+                            .reschedule_ballot_timeout_with_epoch(
+                                event.slot,
+                                one_second,
+                                event.epoch,
+                            )
+                            .await;
+                    }
                 }
             }
-            henyey_herder::TimerType::Ballot => {
-                self.ballot_timeout_fires.fetch_add(1, Ordering::Relaxed);
-                self.herder.handle_ballot_timeout(event.slot);
+            TimerEventAction::Fire => {
+                // Current slot or non-tracking — execute the timeout handler.
+                match event.timer_type {
+                    henyey_herder::TimerType::Nomination => {
+                        self.nomination_timeout_fires
+                            .fetch_add(1, Ordering::Relaxed);
+                        let outcome = self
+                            .herder
+                            .handle_nomination_timeout_blocking(event.slot)
+                            .await;
+                        if matches!(outcome, henyey_herder::TimeoutOutcome::SkippedStale) {
+                            self.nomination_timeout_skipped_stale
+                                .fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                    henyey_herder::TimerType::Ballot => {
+                        self.ballot_timeout_fires.fetch_add(1, Ordering::Relaxed);
+                        self.herder.handle_ballot_timeout(event.slot);
+                    }
+                }
             }
         }
     }
@@ -2016,5 +2129,644 @@ mod tests {
     #[test]
     fn test_should_delay_checkpoint_first_checkpoint_behind() {
         assert!(should_delay_checkpoint(1, 5));
+    }
+
+    // ── TimerEventAction / classify_timer_event tests ────────────────────
+
+    use super::{classify_timer_event, TimerEventAction};
+
+    /// Future-slot nomination timer while tracking → Rearm (1-second defer).
+    /// Spec: HERDER_SPEC §5.4-2.
+    #[test]
+    fn test_classify_timer_event_future_nomination_tracking_rearms() {
+        // next_slot = 100, event_slot = 105, tracking = true → Rearm
+        assert_eq!(
+            classify_timer_event(105, 100, true),
+            TimerEventAction::Rearm
+        );
+    }
+
+    /// Future-slot ballot timer while tracking → Rearm (1-second defer).
+    /// Spec: HERDER_SPEC §5.4-2.
+    #[test]
+    fn test_classify_timer_event_future_ballot_tracking_rearms() {
+        // next_slot = 50, event_slot = 51, tracking = true → Rearm
+        assert_eq!(classify_timer_event(51, 50, true), TimerEventAction::Rearm);
+    }
+
+    /// Old-slot timer while tracking → Drop without re-arming.
+    #[test]
+    fn test_classify_timer_event_old_slot_tracking_drops() {
+        // next_slot = 100, event_slot = 99, tracking = true → Drop
+        assert_eq!(classify_timer_event(99, 100, true), TimerEventAction::Drop);
+        // Far behind, tracking
+        assert_eq!(classify_timer_event(1, 100, true), TimerEventAction::Drop);
+    }
+
+    /// Old-slot timer while NOT tracking → Drop (defense-in-depth).
+    /// Parity: stellar-core fires timer callbacks unconditionally when !isTracking().
+    /// Old-slot timers from prior tracking epochs are rejected by the epoch guard
+    /// before reaching the classifier, so this path is safe.
+    #[test]
+    fn test_classify_timer_event_old_slot_not_tracking_fires() {
+        // Not tracking: all timers fire (parity with stellar-core timerCallbackWrapper).
+        assert_eq!(classify_timer_event(99, 100, false), TimerEventAction::Fire);
+        assert_eq!(classify_timer_event(1, 100, false), TimerEventAction::Fire);
+    }
+
+    /// Current-slot timer → Fire immediately regardless of tracking state.
+    #[test]
+    fn test_classify_timer_event_current_slot_fires() {
+        assert_eq!(classify_timer_event(100, 100, true), TimerEventAction::Fire);
+        assert_eq!(
+            classify_timer_event(100, 100, false),
+            TimerEventAction::Fire
+        );
+    }
+
+    /// Future-slot timer while NOT tracking → Fire (don't enter defer loop).
+    #[test]
+    fn test_classify_timer_event_future_slot_not_tracking_fires() {
+        // Not tracking: even future-slot events should fire, not rearm.
+        assert_eq!(
+            classify_timer_event(105, 100, false),
+            TimerEventAction::Fire
+        );
+    }
+
+    /// Edge case: event_slot == next_slot + 1 while tracking → Rearm (just barely future).
+    #[test]
+    fn test_classify_timer_event_one_ahead_tracking_rearms() {
+        assert_eq!(
+            classify_timer_event(101, 100, true),
+            TimerEventAction::Rearm
+        );
+    }
+
+    // ── End-to-end handle_scp_timer_event tests ─────────────────────────
+    //
+    // These exercise the full App::handle_scp_timer_event path including the
+    // timer_manager_handle scheduling and fire-counter side effects. Uses
+    // paused tokio time to verify exact 1-second rearm timing.
+
+    use super::super::App;
+    use std::sync::atomic::Ordering;
+
+    /// Helper: build a minimal validator App with paused-time-compatible config.
+    async fn mk_validator_app() -> (tempfile::TempDir, App) {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("timer-event-test.db");
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .validator(true)
+            .node_seed("SAFTEV5U6QDFE2DRMSD7HBE76XG7SQZJD6VIUTHIXTJGO77RUQYVURLA")
+            .build();
+        let app = App::new(config).await.unwrap();
+        (dir, app)
+    }
+
+    /// End-to-end: future-slot nomination timer while tracking is re-armed at
+    /// exactly 1 second and fires back through the timer bridge.
+    ///
+    /// Verifies:
+    /// - nomination_timeout_fires counter does NOT increment on the defer path
+    /// - the same timer type (nomination) is re-delivered after exactly 1 second
+    #[tokio::test(start_paused = true)]
+    async fn test_handle_scp_timer_event_e2e_future_nomination_rearms_one_second() {
+        let (_dir, app) = mk_validator_app().await;
+
+        // Bootstrap herder at ledger 1 → tracking slot = 2, is_tracking = true
+        app.herder.bootstrap(1);
+        assert!(app.herder.is_tracking());
+        let next_slot = app.herder.next_consensus_ledger_index().get();
+        assert_eq!(next_slot, 2);
+
+        // Inject a nomination timer event for a future slot (slot 5 > next_slot 2)
+        let future_slot = 5u64;
+        let event = super::super::scp_timer_bridge::ScpTimerEvent {
+            slot: future_slot,
+            timer_type: henyey_herder::TimerType::Nomination,
+            epoch: 0,
+        };
+
+        let fires_before = app.nomination_timeout_fires.load(Ordering::Relaxed);
+
+        app.handle_scp_timer_event(event).await;
+
+        // Fire counter must NOT have incremented (defer path, not fire path)
+        assert_eq!(
+            app.nomination_timeout_fires.load(Ordering::Relaxed),
+            fires_before,
+            "nomination_timeout_fires must not increment on the rearm path"
+        );
+
+        // Give the timer manager task a chance to receive and process the
+        // ScheduleNominationTimeout command before we advance time.
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+
+        // The timer manager should have scheduled a 1-second timeout.
+        // Advance time by just under 1 second — no event should arrive yet.
+        let mut rx = app.scp_timer_rx.lock().await;
+        tokio::time::advance(std::time::Duration::from_millis(999)).await;
+        // Yield multiple times to let the timer manager task process
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            rx.try_recv().is_err(),
+            "timer must not fire before 1 second"
+        );
+
+        // Advance past the 1-second mark
+        tokio::time::advance(std::time::Duration::from_millis(2)).await;
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+
+        // The timer bridge should have delivered a new ScpTimerEvent
+        let redelivered = rx
+            .try_recv()
+            .expect("expected re-delivered nomination timer event");
+        assert_eq!(redelivered.slot, future_slot);
+        assert_eq!(redelivered.timer_type, henyey_herder::TimerType::Nomination);
+    }
+
+    /// End-to-end: future-slot ballot timer while tracking is re-armed at
+    /// exactly 1 second and fires back through the timer bridge.
+    #[tokio::test(start_paused = true)]
+    async fn test_handle_scp_timer_event_e2e_future_ballot_rearms_one_second() {
+        let (_dir, app) = mk_validator_app().await;
+
+        app.herder.bootstrap(1);
+        let next_slot = app.herder.next_consensus_ledger_index().get();
+
+        // Future-slot ballot event
+        let future_slot = next_slot + 3;
+        let event = super::super::scp_timer_bridge::ScpTimerEvent {
+            slot: future_slot,
+            timer_type: henyey_herder::TimerType::Ballot,
+            epoch: 0,
+        };
+
+        let fires_before = app.ballot_timeout_fires.load(Ordering::Relaxed);
+
+        app.handle_scp_timer_event(event).await;
+
+        // Fire counter must NOT have incremented
+        assert_eq!(
+            app.ballot_timeout_fires.load(Ordering::Relaxed),
+            fires_before,
+            "ballot_timeout_fires must not increment on the rearm path"
+        );
+
+        // Give the timer manager task a chance to process the schedule command
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+
+        // Advance time past 1 second and verify the ballot timer re-fires
+        let mut rx = app.scp_timer_rx.lock().await;
+        tokio::time::advance(std::time::Duration::from_millis(1001)).await;
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+
+        let redelivered = rx
+            .try_recv()
+            .expect("expected re-delivered ballot timer event");
+        assert_eq!(redelivered.slot, future_slot);
+        assert_eq!(redelivered.timer_type, henyey_herder::TimerType::Ballot);
+    }
+
+    /// End-to-end: old-slot timer while tracking is dropped — no re-arm occurs,
+    /// no fire counters advance, and no timer event is re-delivered.
+    #[tokio::test(start_paused = true)]
+    async fn test_handle_scp_timer_event_e2e_old_slot_drops_without_rearm() {
+        let (_dir, app) = mk_validator_app().await;
+
+        app.herder.bootstrap(5);
+        let next_slot = app.herder.next_consensus_ledger_index().get();
+        assert_eq!(next_slot, 6);
+
+        // Old-slot nomination event (slot 3 < next_slot 6)
+        let old_slot = 3u64;
+        let event = super::super::scp_timer_bridge::ScpTimerEvent {
+            slot: old_slot,
+            timer_type: henyey_herder::TimerType::Nomination,
+            epoch: 0,
+        };
+
+        let nom_fires_before = app.nomination_timeout_fires.load(Ordering::Relaxed);
+        let ballot_fires_before = app.ballot_timeout_fires.load(Ordering::Relaxed);
+
+        app.handle_scp_timer_event(event).await;
+
+        // No fire counters should have incremented
+        assert_eq!(
+            app.nomination_timeout_fires.load(Ordering::Relaxed),
+            nom_fires_before,
+            "nomination_timeout_fires must not increment on the drop path"
+        );
+        assert_eq!(
+            app.ballot_timeout_fires.load(Ordering::Relaxed),
+            ballot_fires_before,
+            "ballot_timeout_fires must not increment on the drop path"
+        );
+
+        // Advance time well past any possible re-arm delay and verify nothing arrives
+        let mut rx = app.scp_timer_rx.lock().await;
+        tokio::time::advance(std::time::Duration::from_secs(5)).await;
+        tokio::task::yield_now().await;
+
+        assert!(
+            rx.try_recv().is_err(),
+            "no timer event should be re-delivered for a dropped old-slot timer"
+        );
+    }
+
+    /// End-to-end: old-slot timer cancels sibling timers for the same slot.
+    ///
+    /// Parity: stellar-core's setupTimer() erases the entire slot's timer set
+    /// when slotIndex <= trackingConsensusLedgerIndex(). This test verifies
+    /// that when an old-slot timer fires through the Drop path, any
+    /// previously-scheduled sibling timer for the same slot is also cancelled.
+    #[tokio::test(start_paused = true)]
+    async fn test_handle_scp_timer_event_e2e_old_slot_cancels_sibling_timers() {
+        let (_dir, app) = mk_validator_app().await;
+
+        // Bootstrap at ledger 1 → next_slot = 2, tracking
+        app.herder.bootstrap(1);
+        assert!(app.herder.is_tracking());
+        assert_eq!(app.herder.next_consensus_ledger_index().get(), 2);
+
+        // Schedule a ballot timer for slot 3 (currently a future slot) via the
+        // Rearm path. This simulates a ballot timer that was deferred.
+        let slot = 3u64;
+        app.timer_manager_handle
+            .schedule_ballot_timeout(slot, std::time::Duration::from_secs(2))
+            .await;
+
+        // Yield to let the timer manager process the schedule command
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+
+        // Now advance herder so slot 3 becomes an old slot (bootstrap at 5 →
+        // next_slot = 6, so slot 3 < 6).
+        app.herder.bootstrap(5);
+        assert_eq!(app.herder.next_consensus_ledger_index().get(), 6);
+        assert!(app.herder.is_tracking());
+
+        // Fire a nomination timer event for the now-old slot 3.
+        // This should hit the Drop path AND cancel all timers for slot 3.
+        let event = super::super::scp_timer_bridge::ScpTimerEvent {
+            slot,
+            timer_type: henyey_herder::TimerType::Nomination,
+            epoch: 0,
+        };
+        app.handle_scp_timer_event(event).await;
+
+        // Yield to let cancel propagate
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+
+        // Advance time well past the 2-second ballot timer and verify it was
+        // cancelled — no timer event should arrive from the sibling ballot.
+        let mut rx = app.scp_timer_rx.lock().await;
+        tokio::time::advance(std::time::Duration::from_secs(5)).await;
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+
+        assert!(
+            rx.try_recv().is_err(),
+            "sibling ballot timer for the old slot must be cancelled"
+        );
+    }
+
+    /// Regression test for INV-H2 corrective window: when LCL + 1 > tracking_slot,
+    /// a timer for LCL + 1 must fire immediately (not be deferred as a "future" slot).
+    ///
+    /// This exercises the max(tracking_slot, current_ledger + 1) floor that prevents
+    /// an unintended 1-second delay in the corrective recovery path.
+    #[tokio::test(start_paused = true)]
+    async fn test_handle_scp_timer_event_e2e_lcl_ahead_of_tracking_fires_immediately() {
+        let (_dir, app) = mk_validator_app().await;
+
+        // Bootstrap herder at ledger 1 → tracking slot = 2, is_tracking = true
+        app.herder.bootstrap(1);
+        assert!(app.herder.is_tracking());
+        assert_eq!(app.herder.next_consensus_ledger_index().get(), 2);
+
+        // Advance the LCL to ledger 5 without advancing herder tracking.
+        // This creates the INV-H2 corrective window: LCL=5, tracking_slot=2,
+        // so current_ledger + 1 = 6 > tracking_slot = 2.
+        {
+            let mut header = app.ledger_manager().current_header();
+            header.ledger_seq = 5;
+            app.ledger_manager()
+                .set_header_for_test(header, henyey_common::Hash256::default());
+        }
+        assert_eq!(app.current_ledger_seq(), 5);
+
+        // A nomination timer for slot 6 (= current_ledger + 1) should fire
+        // immediately — it is "current" from the app's perspective even though
+        // it's ahead of the tracking slot.
+        let event = super::super::scp_timer_bridge::ScpTimerEvent {
+            slot: 6,
+            timer_type: henyey_herder::TimerType::Nomination,
+            epoch: 0,
+        };
+
+        let fires_before = app.nomination_timeout_fires.load(Ordering::Relaxed);
+        app.handle_scp_timer_event(event).await;
+
+        // The fire counter must increment — this timer should NOT be rearmed.
+        assert_eq!(
+            app.nomination_timeout_fires.load(Ordering::Relaxed),
+            fires_before + 1,
+            "timer for LCL+1 must fire immediately in the corrective window, not be rearmed"
+        );
+    }
+
+    /// Regression test: stale SCP timers must NOT fire after Tracking → Syncing.
+    ///
+    /// Scenario: the node was tracking at slot 2 and loses sync. While syncing,
+    /// the LCL advances (via catchup) to ledger 5. A stale ballot timer from the
+    /// old tracking epoch (slot 2) fires. The handler must drop it because
+    /// slot 2 < next_slot (6), not execute bump_ballot on outdated state.
+    ///
+    /// This regression was introduced when the non-tracking path unconditionally
+    /// returned `Fire` for all slots. The fix drops old-slot timers regardless
+    /// of tracking state.
+    #[tokio::test(start_paused = true)]
+    async fn test_handle_scp_timer_event_e2e_stale_timer_after_sync_loss_drops() {
+        use henyey_herder::sync_recovery::SyncRecoveryCallback;
+
+        let (_dir, app) = mk_validator_app().await;
+
+        // Bootstrap herder at ledger 1 → tracking slot = 2, is_tracking = true
+        app.herder.bootstrap(1);
+        assert!(app.herder.is_tracking());
+        assert_eq!(app.herder.next_consensus_ledger_index().get(), 2);
+
+        // Simulate losing sync — transitions herder to Syncing and cancels timers
+        app.on_lost_sync();
+        assert!(!app.herder.is_tracking());
+        assert_eq!(app.herder.state(), henyey_herder::HerderState::Syncing);
+
+        // Allow timer manager to process the cancel command
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+
+        // Simulate LCL advancing via catchup while syncing (ledger 5 → next = 6)
+        {
+            let mut header = app.ledger_manager().current_header();
+            header.ledger_seq = 5;
+            app.ledger_manager()
+                .set_header_for_test(header, henyey_common::Hash256::default());
+        }
+        assert_eq!(app.current_ledger_seq(), 5);
+
+        // Now inject a stale ballot timer event from the old tracking epoch (slot 2).
+        // This simulates a timer that was already in-flight in the event channel
+        // when on_lost_sync cancelled timers.
+        let stale_event = super::super::scp_timer_bridge::ScpTimerEvent {
+            slot: 2,
+            timer_type: henyey_herder::TimerType::Ballot,
+            epoch: 0,
+        };
+
+        let fires_before = app.ballot_timeout_fires.load(Ordering::Relaxed);
+        app.handle_scp_timer_event(stale_event).await;
+
+        // The stale timer must NOT have fired — slot 2 < next_slot 6, so it's dropped.
+        assert_eq!(
+            app.ballot_timeout_fires.load(Ordering::Relaxed),
+            fires_before,
+            "stale ballot timer from prior tracking epoch must not fire after sync loss"
+        );
+
+        // Also verify a stale nomination timer for the old tracking slot is dropped.
+        let stale_nom_event = super::super::scp_timer_bridge::ScpTimerEvent {
+            slot: 2,
+            timer_type: henyey_herder::TimerType::Nomination,
+            epoch: 0,
+        };
+
+        let nom_fires_before = app.nomination_timeout_fires.load(Ordering::Relaxed);
+        app.handle_scp_timer_event(stale_nom_event).await;
+
+        assert_eq!(
+            app.nomination_timeout_fires.load(Ordering::Relaxed),
+            nom_fires_before,
+            "stale nomination timer from prior tracking epoch must not fire after sync loss"
+        );
+    }
+
+    /// Regression test: future-slot timers queued before sync loss must be
+    /// dropped after the epoch advances, even when their slot >= next_slot.
+    ///
+    /// Scenario: the node is tracking at slot 2. A future-slot ballot timer
+    /// for slot 5 fires and gets queued in scp_timer_rx (the channel). Before
+    /// the main loop processes it, on_lost_sync() is called, incrementing the
+    /// tracking epoch. When the event is finally dequeued, its epoch (0) does
+    /// not match the current epoch (1), so it must be dropped — even though
+    /// slot 5 >= next_slot and would otherwise hit the Fire branch.
+    ///
+    /// Without the epoch guard, this would call handle_ballot_timeout() /
+    /// handle_nomination_timeout() against stale consensus state.
+    #[tokio::test(start_paused = true)]
+    async fn test_handle_scp_timer_event_future_slot_stale_epoch_drops() {
+        use henyey_herder::sync_recovery::SyncRecoveryCallback;
+
+        let (_dir, app) = mk_validator_app().await;
+
+        // Bootstrap herder at ledger 1 → tracking slot = 2, is_tracking = true
+        app.herder.bootstrap(1);
+        assert!(app.herder.is_tracking());
+        assert_eq!(app.herder.next_consensus_ledger_index().get(), 2);
+
+        // The timer epoch starts at 0
+        assert_eq!(
+            app.scp_timer_epoch
+                .load(std::sync::atomic::Ordering::Acquire),
+            0
+        );
+
+        // Simulate losing sync — this increments the epoch to 1
+        app.on_lost_sync();
+        assert!(!app.herder.is_tracking());
+        assert_eq!(
+            app.scp_timer_epoch
+                .load(std::sync::atomic::Ordering::Acquire),
+            1
+        );
+
+        // Allow timer manager to process the cancel command
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+
+        // Inject a FUTURE-slot ballot timer event from the OLD epoch (epoch 0).
+        // This simulates a timer that was already queued in scp_timer_rx before
+        // on_lost_sync() was called. Slot 5 >= next_slot (2), so without the
+        // epoch guard it would hit the Fire branch.
+        let stale_future_ballot = super::super::scp_timer_bridge::ScpTimerEvent {
+            slot: 5,
+            timer_type: henyey_herder::TimerType::Ballot,
+            epoch: 0, // old epoch — before sync loss
+        };
+
+        let fires_before = app.ballot_timeout_fires.load(Ordering::Relaxed);
+        app.handle_scp_timer_event(stale_future_ballot).await;
+
+        assert_eq!(
+            app.ballot_timeout_fires.load(Ordering::Relaxed),
+            fires_before,
+            "future-slot ballot timer from prior epoch must not fire after sync loss"
+        );
+
+        // Same for nomination timers — verify uniform rejection
+        let stale_future_nom = super::super::scp_timer_bridge::ScpTimerEvent {
+            slot: 5,
+            timer_type: henyey_herder::TimerType::Nomination,
+            epoch: 0, // old epoch
+        };
+
+        let nom_fires_before = app.nomination_timeout_fires.load(Ordering::Relaxed);
+        app.handle_scp_timer_event(stale_future_nom).await;
+
+        assert_eq!(
+            app.nomination_timeout_fires.load(Ordering::Relaxed),
+            nom_fires_before,
+            "future-slot nomination timer from prior epoch must not fire after sync loss"
+        );
+
+        // Verify that a timer with the CURRENT epoch (1) IS processed normally.
+        // This confirms the epoch guard is checking the right thing and not
+        // blanket-rejecting all post-sync-loss timers.
+        let current_epoch_event = super::super::scp_timer_bridge::ScpTimerEvent {
+            slot: 5,
+            timer_type: henyey_herder::TimerType::Ballot,
+            epoch: 1, // current epoch — after sync loss
+        };
+
+        // This event passes the epoch check, passes can_receive_scp (Syncing allows it),
+        // and hits the Fire branch (non-tracking, slot >= next_slot). It will actually
+        // call handle_ballot_timeout — confirming the epoch guard is selective.
+        let fires_before_current = app.ballot_timeout_fires.load(Ordering::Relaxed);
+        app.handle_scp_timer_event(current_epoch_event).await;
+        assert_eq!(
+            app.ballot_timeout_fires.load(Ordering::Relaxed),
+            fires_before_current + 1,
+            "event with current epoch must pass the epoch guard and fire"
+        );
+    }
+
+    /// Regression test for #2803 (PR #2821 final bounce, Parity comment 30):
+    /// the future-slot 1-second defer loop must NOT "rebirth" a pre-sync-loss
+    /// timer into the new epoch.
+    ///
+    /// Scenario: tracking at slot 2. A future-slot nomination timer (slot 5,
+    /// epoch 0) fires and is classified `Rearm`, re-scheduling for 1 second.
+    /// Before the re-armed timer fires, `on_lost_sync()` bumps the tracking
+    /// epoch to 1. When the re-armed timer finally fires and is re-delivered
+    /// through the production TimerManager → ScpTimerBridge path, it must carry
+    /// the ORIGINATING epoch (0), not the bumped epoch (1) — so the epoch guard
+    /// in `handle_scp_timer_event()` rejects it instead of firing it into the
+    /// timeout handler while the node is Syncing.
+    ///
+    /// stellar-core's in-process `timerCallbackWrapper`/`setupTimer` defer loop
+    /// cannot rebirth a pre-sync-loss timer this way; this test pins henyey's
+    /// split-architecture equivalent.
+    #[tokio::test(start_paused = true)]
+    async fn test_handle_scp_timer_event_e2e_rearm_preserves_epoch_across_sync_loss() {
+        use henyey_herder::sync_recovery::SyncRecoveryCallback;
+
+        let (_dir, app) = mk_validator_app().await;
+
+        // Bootstrap at ledger 1 → tracking slot = 2, is_tracking = true.
+        app.herder.bootstrap(1);
+        assert!(app.herder.is_tracking());
+        assert_eq!(app.herder.next_consensus_ledger_index().get(), 2);
+        assert_eq!(app.scp_timer_epoch.load(Ordering::Acquire), 0);
+
+        // Future-slot nomination event from the current (epoch 0) tracking
+        // epoch — classified Rearm and re-scheduled for 1 second carrying
+        // epoch 0.
+        let future_slot = 5u64;
+        let event = super::super::scp_timer_bridge::ScpTimerEvent {
+            slot: future_slot,
+            timer_type: henyey_herder::TimerType::Nomination,
+            epoch: 0,
+        };
+        app.handle_scp_timer_event(event).await;
+
+        // Let the timer manager process the re-arm command.
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+
+        // Lose sync mid-defer: bump the global epoch to 1 (and cancel timers).
+        // The re-arm command was already processed above, so the re-armed timer
+        // is in flight with its originating epoch 0.
+        app.on_lost_sync();
+        assert!(!app.herder.is_tracking());
+        assert_eq!(app.scp_timer_epoch.load(Ordering::Acquire), 1);
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+
+        // Note: on_lost_sync() also cancels all timers, but to prove the
+        // epoch-preservation property independently of cancellation ordering we
+        // re-arm explicitly with the originating epoch (this is exactly what the
+        // Rearm branch does) and then advance time. Whichever wins the race, the
+        // re-delivered event must carry epoch 0.
+        app.timer_manager_handle
+            .reschedule_nomination_timeout_with_epoch(
+                future_slot,
+                std::time::Duration::from_secs(1),
+                0,
+            )
+            .await;
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+
+        // Advance past the 1-second defer; the re-armed timer fires and is
+        // re-delivered through the production bridge.
+        let redelivered = {
+            let mut rx = app.scp_timer_rx.lock().await;
+            tokio::time::advance(std::time::Duration::from_millis(1001)).await;
+            for _ in 0..10 {
+                tokio::task::yield_now().await;
+            }
+            rx.try_recv()
+                .expect("expected re-delivered nomination timer event")
+        };
+
+        // The re-delivered event MUST carry the originating epoch (0), not the
+        // bumped global epoch (1). This is the core of the fix.
+        assert_eq!(
+            redelivered.epoch, 0,
+            "re-armed timer must carry the originating epoch across sync loss, not be reborn into the new epoch"
+        );
+        assert_eq!(redelivered.slot, future_slot);
+
+        // Feeding the re-delivered event back into the handler must DROP it via
+        // the epoch guard (event.epoch 0 != current_epoch 1) — no fire, no SCP
+        // state mutation while Syncing.
+        let nom_fires_before = app.nomination_timeout_fires.load(Ordering::Relaxed);
+        app.handle_scp_timer_event(redelivered).await;
+        assert_eq!(
+            app.nomination_timeout_fires.load(Ordering::Relaxed),
+            nom_fires_before,
+            "re-delivered timer from the prior epoch must be dropped after sync loss, not fired"
+        );
     }
 }
