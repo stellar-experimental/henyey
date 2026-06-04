@@ -364,6 +364,50 @@ fn test_config_upgrade_sees_stale_protocol_version() {
 }
 
 // ===========================================================================
+// Test: #3060 — apply-time upgrade re-validation (LEDGER §7.3.4-2)
+// ===========================================================================
+
+/// Integration regression test for #3060 (`LEDGER §7.3.4-2`).
+///
+/// An upgrade set that was valid at nomination time but contains an upgrade
+/// invalid at apply time (a `Version` regression: header already at 26, the
+/// upgrade proposes 25) must be skipped at apply time — `apply_to_header`
+/// leaves `ledger_version` unchanged — while a co-present valid upgrade still
+/// applies. Mirrors stellar-core `LedgerManagerImpl.cpp:1660-1711`.
+#[test]
+fn test_apply_time_revalidation_skips_invalid_version_at_header() {
+    // Header is already at protocol 26.
+    let mut header = make_genesis_header(26);
+    header.base_reserve = 5_000_000;
+
+    let mut ctx = UpgradeContext::new(26);
+    // Version(25) is a regression (invalid at apply time) — must be skipped.
+    ctx.add_upgrade(LedgerUpgrade::Version(25));
+    // BaseReserve(10_000_000) is valid and must still apply.
+    ctx.add_upgrade(LedgerUpgrade::BaseReserve(10_000_000));
+
+    // The skip-set marks only the regression upgrade.
+    let skips = ctx.apply_time_skip_set(henyey_common::CURRENT_LEDGER_PROTOCOL_VERSION);
+    assert_eq!(
+        skips,
+        vec![true, false],
+        "Version(25) regression skipped; BaseReserve accepted"
+    );
+
+    let mut upgraded = header.clone();
+    ctx.apply_to_header(&mut upgraded);
+
+    assert_eq!(
+        upgraded.ledger_version, 26,
+        "skipped Version(25) must NOT lower ledger_version below 26"
+    );
+    assert_eq!(
+        upgraded.base_reserve, 10_000_000,
+        "valid BaseReserve upgrade must still apply"
+    );
+}
+
+// ===========================================================================
 // Test: #1125 — Config upgrade TTL check uses snapshot.ledger_seq (N-1)
 // ===========================================================================
 
