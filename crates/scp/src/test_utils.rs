@@ -147,6 +147,20 @@ impl MockDriver {
 }
 
 impl SCPDriver for MockDriver {
+    // Upgrade-stripping primitives are required (no trait default); this test
+    // driver reproduces the historical no-op behavior (false / None / u32::MAX).
+    fn has_upgrades(&self, _value: &Value) -> bool {
+        false
+    }
+
+    fn strip_all_upgrades(&self, _value: &Value) -> Option<Value> {
+        None
+    }
+
+    fn get_upgrade_nomination_timeout_limit(&self) -> u32 {
+        u32::MAX
+    }
+
     fn validate_value(
         &self,
         _slot_index: u64,
