@@ -282,6 +282,20 @@ pub trait SCPDriver: Send + Sync {
     /// Called when we heard from a quorum for the current ballot.
     fn ballot_did_hear_from_quorum(&self, _slot_index: u64, _ballot: &ScpBallot) {}
 
+    /// Called when this node accepts `commit` for a ballot (the accept-commit
+    /// transition in the ballot protocol).
+    ///
+    /// Fired exactly once per accept-commit transition from
+    /// `BallotProtocol::set_accept_commit`, with `ballot` being the high
+    /// ballot `h`. Mirrors stellar-core `SCPDriver::acceptedCommit`
+    /// (`stellar-core/src/scp/SCPDriver.h:246-250`), invoked from
+    /// `BallotProtocol::setAcceptCommit` (`BallotProtocol.cpp:1343-1349`).
+    /// Closes spec gap SCP §6.5-2.
+    ///
+    /// The default implementation does nothing — like stellar-core's empty
+    /// base method, which `HerderSCPDriver` does not override.
+    fn accepted_commit(&self, _slot_index: u64, _ballot: &ScpBallot) {}
+
     /// Called when the ballot protocol is started for a slot.
     ///
     /// This is called when we transition from nomination to the ballot protocol,
