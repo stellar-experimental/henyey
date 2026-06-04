@@ -74,11 +74,21 @@ fn test_trim_retains_last_checkpoint_plus_boundary() {
 }
 
 /// §7.4 step 1: stale ledgers (`< last_queued_to_apply + 1`) are always removed.
+/// After stale removal the §7.4 checkpoint-boundary trim still applies, so for a
+/// mid-checkpoint `last_buffered = 70` (checkpoint_start = 64) the surviving
+/// floor is the larger of the stale floor (61) and the checkpoint floor (64).
 #[test]
 fn test_trim_removes_stale() {
+    // Stale floor 61 is below the checkpoint floor 64 → checkpoint floor wins.
     let mut buf: BTreeMap<u32, ()> = (50u32..=70).map(|s| (s, ())).collect();
     trim_syncing_buffer(&mut buf, /* last_queued_to_apply */ 60);
-    assert_eq!(*buf.keys().next().unwrap(), 61);
+    assert_eq!(*buf.keys().next().unwrap(), 64);
+
+    // Stale floor 100 is above the checkpoint floor (64) → stale removal alone
+    // governs; entry 99 and below are gone, last_buffered 120 keeps from 100.
+    let mut buf2: BTreeMap<u32, ()> = (90u32..=120).map(|s| (s, ())).collect();
+    trim_syncing_buffer(&mut buf2, /* last_queued_to_apply */ 99);
+    assert_eq!(*buf2.keys().next().unwrap(), 100);
 }
 
 /// §7.2 step 3: `S <= last_queued_to_apply` ⇒ the ledger is silently dropped.

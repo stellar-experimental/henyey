@@ -71,7 +71,7 @@ use henyey_herder::{
     HerderStats, TxQueueConfig, TxSetValidationContext,
 };
 use henyey_history::{
-    build_history_archive_state, checkpoint_containing, checkpoint_frequency, checkpoint_start,
+    build_history_archive_state, checkpoint_containing, checkpoint_frequency,
     first_ledger_after_checkpoint_containing, is_checkpoint_ledger, is_checkpoint_start,
     last_ledger_before_checkpoint_containing, latest_checkpoint_before_or_at, CatchupConfiguration,
     CatchupManager, CatchupMode, CatchupResult as HistoryCatchupResult, CatchupRunMode,
