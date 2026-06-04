@@ -738,8 +738,49 @@ impl NominationProtocol {
 
         ctx.driver.sign_envelope(&mut envelope);
 
-        // Step 1: Record the envelope ( stellar-core recordEnvelope inside processEnvelope).
-        // This stores in latest_nominations so quorum checks see our own state.
+        // Self-process the freshly built nomination through the full gate before
+        // recording/promoting/emitting, mirroring stellar-core
+        // `NominationProtocol::emitNomination` -> `processEnvelope(env, self=true)`
+        // (`NominationProtocol.cpp:147-189`): `isNewerStatement` (411-412) then
+        // `isSane` (414-417) then `recordEnvelope` (420). stellar-core throws
+        // `runtime_error("moved to a bad state (nomination)")` on any non-VALID
+        // result; henyey deliberately logs and returns instead of panicking, so a
+        // self-inconsistency bug does not crash the validator and break
+        // determinism — the same precedent as ballot `emit_current_state`
+        // (`ballot/envelope.rs:158-185`).
+        //
+        // Asymmetry (documented so a future parity audit does not re-flag it):
+        // stellar-core throws on BOTH the freshness-false and sanity-false
+        // branches. henyey treats freshness-false as a benign monotonic stop
+        // (silent `return`, matching ballot `emit_current_state:170-172`) and only
+        // surfaces an error on sanity-false. This is sound because
+        // `emit_nomination` is only reached after genuine state growth (so
+        // freshness-false is a should-not-happen monotonic stop), and
+        // `sorted_values` above guarantees sorted-unique `votes`/`accepted` — so
+        // the only reachable non-sane self condition is empty votes AND accepted.
+
+        // Gate 1: freshness (stellar-core `isNewerStatement`). Benign monotonic
+        // stop — silent return, matching ballot `emit_current_state`.
+        if !self.is_newer_nomination_internal(ctx.local_node_id, &nomination) {
+            return;
+        }
+
+        // Gate 2: sanity (stellar-core `isSane`). A non-sane self-statement is a
+        // bad-state bug; surface it (logged, not panic) and return without
+        // recording/promoting/emitting.
+        if !Self::is_sane_statement(&nomination) {
+            tracing::error!(
+                target: "henyey::envelope_path",
+                slot = ctx.slot_index,
+                "not sane statement from self in emit_nomination, skipping",
+            );
+            return;
+        }
+
+        // Step 1: Record the envelope (stellar-core `recordEnvelope` inside
+        // `processEnvelope`). This stores in latest_nominations so quorum checks
+        // see our own state. The freshness check inside `record_local_nomination`
+        // is now redundant with Gate 1 above but harmless (idempotent).
         if !self.record_local_nomination(ctx.local_node_id, &statement, envelope.clone()) {
             return;
         }
