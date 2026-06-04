@@ -2733,3 +2733,191 @@ fn test_execute_transaction_rejects_over_depth_envelope() {
         "over-depth envelope must be rejected as TxMalformed"
     );
 }
+
+/// Regression for #3104 (TX §4.6-1): the fee source's *available* balance —
+/// `balance - minBalance - sellingLiabilities` — must be >= the (capped) fee,
+/// matching stellar-core's `commonValid` affordability guard. Here balance=100,
+/// num_sub_entries=1, base_reserve=25 => minBalance=(2+1)*25=75. A 1-op payment
+/// with fee=50 (base_fee=50 so the fee passes the insufficient-fee check and
+/// fee_to_charge=50) leaves available = 100 - 50 - 75 = -25 < 0, so the tx must
+/// be rejected with TxInsufficientBalance.
+///
+/// FAILS on main: with no affordability guard the fee is silently capped at the
+/// balance and the tx is ACCEPTED (body runs), violating the ledger invariant.
+#[test]
+fn test_execute_transaction_insufficient_available_balance_rejects() {
+    let secret = SecretKey::from_seed(&[71u8; 32]);
+    let account_id: AccountId = (&secret.public_key()).into();
+
+    // balance=100, num_sub_entries=1 (V0 ext). minBalance with base_reserve=25
+    // is (2 + 1) * 25 = 75. Available after fee=50 is 100 - 50 - 75 = -25.
+    let key = LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
+        account_id: account_id.clone(),
+    });
+    let entry = LedgerEntry {
+        last_modified_ledger_seq: 1,
+        data: LedgerEntryData::Account(AccountEntry {
+            account_id: account_id.clone(),
+            balance: 100,
+            seq_num: SequenceNumber(1),
+            num_sub_entries: 1,
+            inflation_dest: None,
+            flags: 0,
+            home_domain: String32::default(),
+            thresholds: Thresholds([1, 0, 0, 0]),
+            signers: VecM::default(),
+            ext: AccountEntryExt::V0,
+        }),
+        ext: LedgerEntryExt::V0,
+    };
+    let snapshot = SnapshotBuilder::new(1)
+        .add_entry(key, entry)
+        .build_with_default_header();
+    let snapshot = SnapshotHandle::new(snapshot);
+
+    let operation = Operation {
+        source_account: None,
+        body: OperationBody::Payment(stellar_xdr::curr::PaymentOp {
+            destination: MuxedAccount::Ed25519(Uint256([9u8; 32])),
+            asset: stellar_xdr::curr::Asset::Native,
+            amount: 1,
+        }),
+    };
+
+    let tx = Transaction {
+        source_account: MuxedAccount::Ed25519(Uint256(*secret.public_key().as_bytes())),
+        fee: 50,
+        seq_num: SequenceNumber(2),
+        cond: Preconditions::None,
+        memo: Memo::None,
+        operations: vec![operation].try_into().unwrap(),
+        ext: TransactionExt::V0,
+    };
+
+    let mut envelope = TransactionEnvelope::Tx(TransactionV1Envelope {
+        tx,
+        signatures: VecM::default(),
+    });
+    let network_id = NetworkId::testnet();
+    let decorated = sign_envelope(&envelope, &secret, &network_id);
+    if let TransactionEnvelope::Tx(ref mut env) = envelope {
+        env.signatures = vec![decorated].try_into().unwrap();
+    }
+
+    // base_reserve=25, base_fee=50 (so fee=50 passes the insufficient-fee gate
+    // and fee_to_charge = min(inclusion_fee=50, min_inclusion_fee=50) = 50).
+    let context = henyey_tx::LedgerContext::new(1, 1_000, 50, 25, 25, network_id);
+    let mut executor = TransactionExecutor::new(
+        &context,
+        0,
+        SorobanConfig::default(),
+        ClassicEventConfig::default(),
+    );
+
+    let result = executor
+        .execute_transaction(&snapshot, &envelope, 50, None)
+        .expect("execute");
+
+    assert!(!result.success);
+    assert_eq!(
+        result.failure,
+        Some(ExecutionFailure::TxInsufficientBalance),
+        "available balance (100 - 50 fee - 75 minBalance = -25) < 0 must reject \
+         with TxInsufficientBalance, not silently cap the fee and ACCEPT"
+    );
+}
+
+/// Regression for #3104 (TX §4.6-1): the affordability guard must subtract
+/// selling liabilities (V10+ semantics), not only the minimum balance. Here the
+/// balance comfortably exceeds minBalance, but non-zero selling liabilities push
+/// the available balance negative once the fee is charged.
+///
+/// balance=200, num_sub_entries=0, base_reserve=25 => minBalance=50.
+/// selling liabilities=110. fee=50. Available = 200 - 50 - 50 - 110 = -10 < 0.
+///
+/// FAILS on main: the (absent) guard ignores selling liabilities on this path.
+#[test]
+fn test_execute_transaction_insufficient_balance_via_selling_liabilities() {
+    let secret = SecretKey::from_seed(&[72u8; 32]);
+    let account_id: AccountId = (&secret.public_key()).into();
+
+    let key = LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
+        account_id: account_id.clone(),
+    });
+    let entry = LedgerEntry {
+        last_modified_ledger_seq: 1,
+        data: LedgerEntryData::Account(AccountEntry {
+            account_id: account_id.clone(),
+            balance: 200,
+            seq_num: SequenceNumber(1),
+            num_sub_entries: 0,
+            inflation_dest: None,
+            flags: 0,
+            home_domain: String32::default(),
+            thresholds: Thresholds([1, 0, 0, 0]),
+            signers: VecM::default(),
+            ext: AccountEntryExt::V1(AccountEntryExtensionV1 {
+                liabilities: Liabilities {
+                    buying: 0,
+                    selling: 110,
+                },
+                ext: AccountEntryExtensionV1Ext::V0,
+            }),
+        }),
+        ext: LedgerEntryExt::V0,
+    };
+    let snapshot = SnapshotBuilder::new(1)
+        .add_entry(key, entry)
+        .build_with_default_header();
+    let snapshot = SnapshotHandle::new(snapshot);
+
+    let operation = Operation {
+        source_account: None,
+        body: OperationBody::Payment(stellar_xdr::curr::PaymentOp {
+            destination: MuxedAccount::Ed25519(Uint256([9u8; 32])),
+            asset: stellar_xdr::curr::Asset::Native,
+            amount: 1,
+        }),
+    };
+
+    let tx = Transaction {
+        source_account: MuxedAccount::Ed25519(Uint256(*secret.public_key().as_bytes())),
+        fee: 50,
+        seq_num: SequenceNumber(2),
+        cond: Preconditions::None,
+        memo: Memo::None,
+        operations: vec![operation].try_into().unwrap(),
+        ext: TransactionExt::V0,
+    };
+
+    let mut envelope = TransactionEnvelope::Tx(TransactionV1Envelope {
+        tx,
+        signatures: VecM::default(),
+    });
+    let network_id = NetworkId::testnet();
+    let decorated = sign_envelope(&envelope, &secret, &network_id);
+    if let TransactionEnvelope::Tx(ref mut env) = envelope {
+        env.signatures = vec![decorated].try_into().unwrap();
+    }
+
+    let context = henyey_tx::LedgerContext::new(1, 1_000, 50, 25, 25, network_id);
+    let mut executor = TransactionExecutor::new(
+        &context,
+        0,
+        SorobanConfig::default(),
+        ClassicEventConfig::default(),
+    );
+
+    let result = executor
+        .execute_transaction(&snapshot, &envelope, 50, None)
+        .expect("execute");
+
+    assert!(!result.success);
+    assert_eq!(
+        result.failure,
+        Some(ExecutionFailure::TxInsufficientBalance),
+        "available balance (200 - 50 fee - 50 minBalance - 110 selling = -10) < 0 \
+         must reject with TxInsufficientBalance; the guard must subtract selling \
+         liabilities"
+    );
+}
