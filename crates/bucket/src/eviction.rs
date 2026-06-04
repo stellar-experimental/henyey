@@ -1412,6 +1412,93 @@ mod tests {
         assert_eq!(resolved.end_iterator, scan_end);
     }
 
+    // --- EvictionResult::is_valid() tests (BUCKETLISTDB §12.5/§12.6) ---
+
+    fn make_eviction_result_with_initial(
+        initial_ledger_seq: u32,
+        initial_ledger_version: u32,
+        initial_archival_settings: StateArchivalSettings,
+    ) -> EvictionResult {
+        EvictionResult {
+            candidates: Vec::new(),
+            end_iterator: EvictionIterator::with_default_level(),
+            bytes_scanned: 0,
+            scan_complete: true,
+            initial_ledger_seq,
+            initial_ledger_version,
+            initial_archival_settings,
+        }
+    }
+
+    #[test]
+    fn test_eviction_result_is_valid_rejects_ledger_seq_change() {
+        let sas = default_state_archival_settings();
+        let result = make_eviction_result_with_initial(100, 23, sas.clone());
+
+        // Same ledger_seq → valid.
+        assert!(result.is_valid(100, 23, &sas));
+        // Different ledger_seq → invalid (scan was based on a different ledger).
+        assert!(!result.is_valid(150, 23, &sas));
+    }
+
+    #[test]
+    fn test_eviction_result_is_valid_rejects_v23_crossing() {
+        let sas = default_state_archival_settings();
+
+        // Scan started pre-V23 (22), resolve ledger crosses into V23 → invalid.
+        let pre_v23 = make_eviction_result_with_initial(100, 22, sas.clone());
+        assert!(!pre_v23.is_valid(100, 23, &sas));
+
+        // Scan started at V23, resolve at V24 → no crossing into V23 → valid.
+        let at_v23 = make_eviction_result_with_initial(100, 23, sas.clone());
+        assert!(at_v23.is_valid(100, 24, &sas));
+    }
+
+    #[test]
+    fn test_eviction_result_is_valid_rejects_archival_setting_change() {
+        let base = default_state_archival_settings();
+        let result = make_eviction_result_with_initial(100, 23, base.clone());
+
+        // Each of the three relevant fields changing → invalid.
+        let mut changed_max = base.clone();
+        changed_max.max_entries_to_archive += 1;
+        assert!(!result.is_valid(100, 23, &changed_max));
+
+        let mut changed_scan_size = base.clone();
+        changed_scan_size.eviction_scan_size += 1;
+        assert!(!result.is_valid(100, 23, &changed_scan_size));
+
+        let mut changed_level = base.clone();
+        changed_level.starting_eviction_scan_level += 1;
+        assert!(!result.is_valid(100, 23, &changed_level));
+
+        // Changing an unrelated field (min_temporary_ttl) → still valid.
+        // Parity: stellar-core's isValid compares only the three eviction fields.
+        let mut changed_unrelated = base.clone();
+        changed_unrelated.min_temporary_ttl += 1;
+        assert!(result.is_valid(100, 23, &changed_unrelated));
+    }
+
+    #[test]
+    fn test_eviction_result_captures_initial_state() {
+        // New coverage: scan_for_eviction_incremental must populate the three
+        // initial_* fields from its inputs so is_valid can be enforced later.
+        use crate::bucket_list::BucketList;
+
+        let bl = BucketList::new();
+        let mut settings = default_state_archival_settings();
+        settings.max_entries_to_archive = 7;
+        let iter = EvictionIterator::with_default_level();
+
+        let result = bl
+            .scan_for_eviction_incremental(iter, 42, 23, &settings)
+            .expect("scan should succeed on empty bucket list");
+
+        assert_eq!(result.initial_ledger_seq, 42);
+        assert_eq!(result.initial_ledger_version, 23);
+        assert_eq!(result.initial_archival_settings.max_entries_to_archive, 7);
+    }
+
     #[test]
     fn test_resolve_filtered_before_limit_uses_last_evicted_position() {
         // Candidates: [filtered, kept, kept] with max_entries=2
