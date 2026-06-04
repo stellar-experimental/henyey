@@ -672,10 +672,34 @@ impl AuthContext {
             )));
         }
 
-        // AUTH messages consume sequence 0 on both sides
-        // So first post-auth messages use sequence 1
-        self.recv_sequence = 1;
-        self.send_sequence = 1;
+        // Sequence-counter bookkeeping (OVERLAY §5.3-1): process_auth no longer
+        // touches the counters — each is advanced naturally, on its own side, by
+        // the AUTH exchange (mirroring stellar-core, which has no
+        // process_auth-equivalent reset):
+        //   - recv_sequence: recv_auth -> unwrap_message verifies the peer's AUTH
+        //     MAC at seq 0 and advances recv_sequence 0 -> 1. The recv MAC key is
+        //     established by process_hello, which ALWAYS precedes recv_auth on
+        //     both the initiator and responder paths in peer.rs (see the
+        //     `recv_hello` -> `recv_auth` ordering invariant below).
+        //   - send_sequence: send_auth_msg -> wrap_auth_message consumes seq 0
+        //     for our own AUTH and advances send_sequence 0 -> 1
+        //     (Hmac::setAuthenticatedMessageBody).
+        //
+        // Ordering invariant: `recv_hello` always precedes `recv_auth`, so the
+        // recv MAC key is in place when the AUTH frame is verified. The two roles
+        // sequence the AUTH steps differently around process_auth, and that is
+        // why no reset is performed here:
+        //   - Initiator (peer.rs send-then-recv): send_auth_msg (send 0->1) THEN
+        //     recv_auth -> unwrap (recv 0->1) -> process_auth. Both counters are
+        //     already 1 at process_auth.
+        //   - Responder (peer.rs recv-then-send): recv_auth -> unwrap (recv 0->1)
+        //     -> process_auth (send_sequence STILL 0 here) THEN send_auth_msg
+        //     (send 0->1). The responder's send_sequence reaches 1 just after
+        //     process_auth, when it wraps its own AUTH.
+        // Either way the wire sequence is identical: the AUTH frame is seq 0 and
+        // the first post-AUTH message is seq 1, then 2, ... — so resetting the
+        // counters in process_auth was redundant (initiator) or premature
+        // (responder) and is therefore removed.
 
         // Mark as authenticated
         self.state = AuthState::Authenticated;
@@ -837,11 +861,18 @@ impl AuthContext {
     /// Auth messages are special: they use sequence 0 (like Hello) but include
     /// a valid MAC to prove we derived the correct keys. This proves to the peer
     /// that we successfully completed the key exchange.
-    pub fn wrap_auth_message(&self, message: StellarMessage) -> Result<AuthenticatedMessage> {
+    ///
+    /// Like [`wrap_message`](Self::wrap_message), this consumes the current
+    /// `send_sequence` (0 for AUTH) and then advances it to 1, so the first
+    /// post-AUTH message uses sequence 1. This mirrors stellar-core
+    /// `Hmac::setAuthenticatedMessageBody` (Hmac.cpp:64-79), which increments
+    /// `mSendMacSeq` for every non-HELLO/non-ERROR message including AUTH.
+    pub fn wrap_auth_message(&mut self, message: StellarMessage) -> Result<AuthenticatedMessage> {
         self.check_send_key()?;
 
-        // Auth message uses sequence 0
-        let sequence = 0u64;
+        // Auth message uses sequence 0, then the send counter advances 0 -> 1.
+        let sequence = self.send_sequence;
+        self.send_sequence += 1;
 
         // Compute MAC
         let mac = self.compute_mac(self.send_mac_key.as_ref().unwrap(), sequence, &message)?;
@@ -920,9 +951,24 @@ mod tests {
             .process_hello(&hello_b)
             .expect("A should accept B's hello");
 
-        // Exchange Auth messages
+        // Exchange Auth messages through the real wrap/unwrap path so the
+        // sequence counters advance naturally (AUTH consumes seq 0 on both
+        // sides, leaving send_sequence == recv_sequence == 1). This mirrors the
+        // peer.rs handshake and is required now that process_auth no longer
+        // manually resets the counters (OVERLAY §5.3-1).
+        let auth_a = ctx_a
+            .wrap_auth_message(StellarMessage::Auth(xdr::Auth { flags: 100 }))
+            .expect("A should wrap auth");
+        let auth_b = ctx_b
+            .wrap_auth_message(StellarMessage::Auth(xdr::Auth { flags: 100 }))
+            .expect("B should wrap auth");
+
         ctx_a.auth_sent();
         ctx_b.auth_sent();
+
+        ctx_b.unwrap_message(auth_a).expect("B unwraps A's auth");
+        ctx_a.unwrap_message(auth_b).expect("A unwraps B's auth");
+
         ctx_a.process_auth().expect("A should complete auth");
         ctx_b.process_auth().expect("B should complete auth");
 
@@ -1469,7 +1515,7 @@ mod tests {
         // The bug: unwrap_message gates on is_authenticated() (state ==
         // Authenticated), but Auth arrives when state is HelloReceived.
         // This means a corrupted MAC on the Auth message is silently accepted.
-        let (ctx_a, mut ctx_b) = complete_hello_exchange();
+        let (mut ctx_a, mut ctx_b) = complete_hello_exchange();
 
         // Wrap an Auth message with a valid MAC
         let auth_msg = StellarMessage::Auth(xdr::Auth { flags: 200 });
@@ -1499,6 +1545,175 @@ mod tests {
             matches!(result, Err(OverlayError::MacVerificationFailed)),
             "expected MacVerificationFailed, got: {:?}",
             result
+        );
+    }
+
+    // ---- OVERLAY §5.3-1: Auth sequence-counter bookkeeping ----
+
+    #[test]
+    fn test_wrap_auth_message_increments_send_sequence() {
+        // OVERLAY §5.3-1: wrap_auth_message must consume sequence 0 for the AUTH
+        // message and advance send_sequence to 1 — mirroring stellar-core
+        // Hmac::setAuthenticatedMessageBody, which increments mSendMacSeq for
+        // every non-HELLO/non-ERROR message including AUTH.
+        let (mut ctx_a, _ctx_b) = complete_hello_exchange();
+
+        // After Hello exchange, send_sequence is still 0.
+        assert_eq!(
+            ctx_a.send_sequence, 0,
+            "send_sequence starts at 0 post-Hello"
+        );
+
+        let auth_msg = StellarMessage::Auth(xdr::Auth { flags: 100 });
+        let wrapped = ctx_a
+            .wrap_auth_message(auth_msg)
+            .expect("wrap should succeed");
+
+        // The AUTH message itself goes out on the wire with sequence 0.
+        match &wrapped {
+            AuthenticatedMessage::V0(v0) => {
+                assert_eq!(v0.sequence, 0, "AUTH message uses wire sequence 0");
+            }
+        }
+
+        // wrap_auth_message must have advanced the send counter to 1, so the
+        // first post-AUTH message uses sequence 1.
+        assert_eq!(
+            ctx_a.send_sequence, 1,
+            "wrap_auth_message must increment send_sequence 0->1"
+        );
+    }
+
+    #[test]
+    fn test_auth_handshake_seq_state_transitions() {
+        // OVERLAY §5.3-1: drive a full two-party AUTH exchange through the real
+        // wrap_auth_message/unwrap_message on BOTH sides, faithfully modelling
+        // the two peer.rs orderings around process_auth:
+        //   - Initiator (ctx_a): send AUTH (send 0->1) -> recv peer AUTH
+        //     (recv 0->1) -> process_auth.
+        //   - Responder (ctx_b): recv peer AUTH (recv 0->1) -> process_auth
+        //     (send_sequence STILL 0 here) -> send AUTH (send 0->1).
+        // Both terminate with the AUTH frame at wire seq 0 and the first
+        // post-AUTH message at seq 1, then 2 — byte-identical before/after.
+        let (mut ctx_a, mut ctx_b) = complete_hello_exchange();
+
+        // Both counters start at 0 after the Hello exchange.
+        assert_eq!(ctx_a.send_sequence, 0);
+        assert_eq!(ctx_a.recv_sequence, 0);
+        assert_eq!(ctx_b.send_sequence, 0);
+        assert_eq!(ctx_b.recv_sequence, 0);
+
+        // --- Initiator (ctx_a) sends first ---
+        let auth_a = ctx_a
+            .wrap_auth_message(StellarMessage::Auth(xdr::Auth { flags: 100 }))
+            .expect("A wraps auth");
+        match &auth_a {
+            AuthenticatedMessage::V0(v0) => assert_eq!(v0.sequence, 0, "A's AUTH on wire seq 0"),
+        }
+        assert_eq!(ctx_a.send_sequence, 1, "A send advanced 0->1 by wrap");
+
+        // --- Responder (ctx_b): recv -> process_auth BEFORE its own send ---
+        ctx_b.unwrap_message(auth_a).expect("B unwraps A's auth");
+        assert_eq!(ctx_b.recv_sequence, 1, "B recv advanced 0->1 by unwrap");
+        // Responder reaches process_auth with send_sequence STILL 0.
+        assert_eq!(ctx_b.send_sequence, 0, "B send still 0 at process_auth");
+        ctx_b.process_auth().expect("B completes auth");
+        assert_eq!(ctx_b.send_sequence, 0, "process_auth must not bump B send");
+        assert_eq!(ctx_b.recv_sequence, 1, "process_auth must not bump B recv");
+
+        // Responder now sends its own AUTH (send 0->1).
+        let auth_b = ctx_b
+            .wrap_auth_message(StellarMessage::Auth(xdr::Auth { flags: 100 }))
+            .expect("B wraps auth");
+        match &auth_b {
+            AuthenticatedMessage::V0(v0) => assert_eq!(v0.sequence, 0, "B's AUTH on wire seq 0"),
+        }
+        assert_eq!(ctx_b.send_sequence, 1, "B send advanced 0->1 by wrap");
+
+        // --- Initiator receives responder's AUTH, then process_auth ---
+        ctx_a.unwrap_message(auth_b).expect("A unwraps B's auth");
+        assert_eq!(ctx_a.recv_sequence, 1, "A recv advanced 0->1 by unwrap");
+        // Initiator reaches process_auth with both counters already at 1.
+        assert_eq!(ctx_a.send_sequence, 1, "A send already 1 at process_auth");
+        ctx_a.process_auth().expect("A completes auth");
+        assert_eq!(ctx_a.send_sequence, 1, "process_auth must not bump A send");
+        assert_eq!(ctx_a.recv_sequence, 1, "process_auth must not bump A recv");
+
+        // Both sides now at (send=1, recv=1) regardless of ordering.
+        assert_eq!(ctx_a.send_sequence, 1);
+        assert_eq!(ctx_a.recv_sequence, 1);
+        assert_eq!(ctx_b.send_sequence, 1);
+        assert_eq!(ctx_b.recv_sequence, 1);
+
+        // First post-AUTH message uses wire sequence 1, next uses 2.
+        let msg1 = ctx_a
+            .wrap_message(StellarMessage::Peers(xdr::VecM::default()))
+            .unwrap();
+        match &msg1 {
+            AuthenticatedMessage::V0(v0) => {
+                assert_eq!(v0.sequence, 1, "first post-AUTH message uses seq 1");
+            }
+        }
+        ctx_b
+            .unwrap_message(msg1)
+            .expect("B unwraps post-AUTH msg1");
+
+        let msg2 = ctx_a
+            .wrap_message(StellarMessage::Peers(xdr::VecM::default()))
+            .unwrap();
+        match &msg2 {
+            AuthenticatedMessage::V0(v0) => {
+                assert_eq!(v0.sequence, 2, "second post-AUTH message uses seq 2");
+            }
+        }
+        ctx_b
+            .unwrap_message(msg2)
+            .expect("B unwraps post-AUTH msg2");
+    }
+
+    #[test]
+    fn test_process_auth_no_longer_resets_counters() {
+        // OVERLAY §5.3-1: process_auth must NOT clobber the sequence counters —
+        // it only transitions state to Authenticated. Exercises the RESPONDER
+        // ordering (recv -> process_auth -> send), where send_sequence is still
+        // 0 at process_auth: the removed `send_sequence = 1` reset would have
+        // PREMATURELY bumped it, and the removed `recv_sequence = 1` reset was
+        // REDUNDANT (unwrap already advanced it).
+        let (mut ctx_a, mut ctx_b) = complete_hello_exchange();
+
+        // A (initiator) sends AUTH; B (responder) receives it.
+        let auth_a = ctx_a
+            .wrap_auth_message(StellarMessage::Auth(xdr::Auth { flags: 100 }))
+            .expect("A wraps auth");
+        ctx_b.unwrap_message(auth_a).expect("B unwraps A's auth");
+
+        // Responder state at process_auth: recv advanced to 1, send still 0.
+        assert_eq!(ctx_b.recv_sequence, 1);
+        assert_eq!(ctx_b.send_sequence, 0);
+
+        // process_auth leaves the counters exactly as they were.
+        ctx_b.process_auth().expect("B completes auth");
+        assert_eq!(
+            ctx_b.recv_sequence, 1,
+            "process_auth must not reset recv_sequence"
+        );
+        assert_eq!(
+            ctx_b.send_sequence, 0,
+            "process_auth must not prematurely bump send_sequence"
+        );
+        assert!(ctx_b.is_authenticated());
+
+        // The responder's own AUTH wrap then advances send 0->1 on the wire at
+        // seq 0, keeping the wire sequence identical.
+        let auth_b = ctx_b
+            .wrap_auth_message(StellarMessage::Auth(xdr::Auth { flags: 100 }))
+            .expect("B wraps auth");
+        match &auth_b {
+            AuthenticatedMessage::V0(v0) => assert_eq!(v0.sequence, 0, "B's AUTH on wire seq 0"),
+        }
+        assert_eq!(
+            ctx_b.send_sequence, 1,
+            "B send advanced to 1 by its own AUTH wrap"
         );
     }
 
@@ -1780,8 +1995,25 @@ mod tests {
                 .process_hello(&hello_peer)
                 .expect("A should accept peer's hello (secret reused)");
 
+            // Route AUTH through the real wrap/unwrap path so the sequence
+            // counters advance naturally before process_auth (OVERLAY §5.3-1).
+            let auth_a = ctx_a
+                .wrap_auth_message(StellarMessage::Auth(xdr::Auth { flags: 100 }))
+                .expect("A wraps auth");
+            let auth_peer = ctx_peer
+                .wrap_auth_message(StellarMessage::Auth(xdr::Auth { flags: 100 }))
+                .expect("peer wraps auth");
+
             ctx_a.auth_sent();
             ctx_peer.auth_sent();
+
+            ctx_peer
+                .unwrap_message(auth_a)
+                .expect("peer unwraps A's auth");
+            ctx_a
+                .unwrap_message(auth_peer)
+                .expect("A unwraps peer's auth");
+
             ctx_a.process_auth().expect("A completes auth");
             ctx_peer.process_auth().expect("peer completes auth");
 
