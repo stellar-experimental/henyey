@@ -10,7 +10,7 @@
 //! |------|-----------|--------|
 //! | 0 | Complete mode, LCL == genesis | Replay from genesis+1 to target |
 //! | 1 | LCL > genesis | Replay from LCL+1 to target (no buckets) |
-//! | 2 | count >= full replay count, LCL > genesis | Full replay from LCL+1 |
+//! | 2 | count >= full replay count, LCL == genesis | Full replay from genesis+1 |
 //! | 3 | count=0 AND target is checkpoint | Buckets only, no replay |
 //! | 4 | target start in first checkpoint | Full replay from genesis+1 |
 //! | 5 | default (LCL == genesis) | Apply buckets at prior checkpoint, replay from there |
@@ -337,18 +337,17 @@ impl CatchupRange {
         // full_replay covers from lcl+1 (genesis+1) to target.
         let full_replay = LedgerRange::new(lcl + 1, full_replay_count);
 
-        // Case 2: count >= full replay count — full replay from genesis.
+        // Case 2: count >= full replay count — full replay from genesis+1.
         //
-        // When lcl == genesis, prefer bucket-apply over full replay. Replaying
-        // through protocol upgrades from genesis (e.g. 0→25) produces different
-        // state hashes than the live network because `apply_upgrades_to_delta`
-        // creates intermediate config entries that differ from the validator's
-        // live upgrade path. stellar-core handles this the same way: online
-        // catchup always involves a bucket-apply step, never raw replay from
-        // genesis.
-        // Note: lcl == genesis at this point (Case 1 returns for lcl > genesis),
-        // so this case is unreachable. Kept for documentation/safety.
-        if count >= full_replay_count && lcl > GENESIS_LEDGER_SEQ {
+        // Per CATCHUP_SPEC §6.3 Case 2 and stellar-core `calculateCatchupRange`
+        // (CatchupRange.cpp): with lcl == genesis (guaranteed here, since Case 1
+        // returns for lcl > genesis), `count >= fullReplayCount` yields a full
+        // replay of the entire gap [genesis+1, target] for every mode — there is
+        // no lcl guard on this case in stellar-core (`releaseAssert(lcl == init)`
+        // sits directly above it). Complete mode is a strict subset already
+        // handled by Case 0; Recent(N)/Minimal with a large enough count converge
+        // to the same full-replay result here.
+        if count >= full_replay_count {
             return Self::replay_only(full_replay);
         }
 
@@ -632,13 +631,44 @@ mod tests {
     #[test]
     fn test_recent_from_genesis_large_count() {
         // Recent mode from genesis where count >= full_replay_count.
-        // The lcl > GENESIS guard on Case 2 prevents a full replay from
-        // genesis; should fall through to bucket-apply.
+        // Per CATCHUP_SPEC §6.3 Case 2 and stellar-core calculateCatchupRange,
+        // lcl == genesis with count >= fullReplayCount yields a full replay from
+        // genesis+1 (no lcl guard on Case 2).
         let range = CatchupRange::calculate(1, 63, CatchupMode::Recent(100));
         assert_eq!(
             range,
-            CatchupRange::BucketsOnly { checkpoint: 63 },
-            "Recent with large count from genesis should bucket-apply, not replay"
+            CatchupRange::ReplayOnly {
+                replay: LedgerRange::new(2, 62)
+            },
+            "Recent with count >= full_replay_count from genesis should full-replay (Case 2)"
+        );
+    }
+
+    #[test]
+    fn test_case2_recent_from_genesis_full_replay() {
+        // Case 2 regression (#3033): lcl == genesis, count (100) >= full_replay_count
+        // (62) → full replay [genesis+1, target] for Recent mode, matching spec §6.3
+        // and stellar-core. Pre-fix: returned BucketsOnly { checkpoint: 63 }.
+        let range = CatchupRange::calculate(1, 63, CatchupMode::Recent(100));
+        assert_eq!(
+            range,
+            CatchupRange::ReplayOnly {
+                replay: LedgerRange::new(2, 62)
+            }
+        );
+    }
+
+    #[test]
+    fn test_case2_recent_from_genesis_checkpoint_target() {
+        // Case 2 regression (#3033): lcl == genesis, target 127 is a checkpoint,
+        // count (200) >= full_replay_count (126) → full replay [2, 126]. Pre-fix:
+        // routed to Case 4b checkpoint branch returning BucketsOnly { checkpoint: 127 }.
+        let range = CatchupRange::calculate(1, 127, CatchupMode::Recent(200));
+        assert_eq!(
+            range,
+            CatchupRange::ReplayOnly {
+                replay: LedgerRange::new(2, 126)
+            }
         );
     }
 
