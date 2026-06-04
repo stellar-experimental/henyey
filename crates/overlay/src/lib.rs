@@ -125,6 +125,7 @@ pub use survey::{
 };
 
 use std::collections::HashSet;
+use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 
 /// Result type for overlay operations.
@@ -812,6 +813,31 @@ pub struct LocalNode {
     ///
     /// Sent to peers in Hello messages so they know how to connect back.
     pub listening_port: u16,
+
+    /// Process-lifetime Curve25519 secret used for X25519 key exchange.
+    ///
+    /// Generated once at startup (in [`LocalNode::with_network`]) and shared by
+    /// every per-connection [`AuthContext`] via the `Arc` — cloning a
+    /// `LocalNode` per connection only bumps the refcount, so all connections
+    /// reuse the **same** ephemeral keypair. This mirrors stellar-core
+    /// `PeerAuth`, which builds `mECDHSecretKey`/`mECDHPublicKey` once in its
+    /// constructor (OVERLAY §4.4.3-rotate). A `StaticSecret` is used (not an
+    /// `EphemeralSecret`) because `StaticSecret::diffie_hellman(&self, …)`
+    /// borrows rather than consumes, allowing reuse across connections.
+    pub(crate) x25519_secret: Arc<x25519_dalek::StaticSecret>,
+
+    /// Public half of [`Self::x25519_secret`], cached for cert construction and
+    /// key derivation. Stable for the process lifetime.
+    pub(crate) x25519_public: x25519_dalek::PublicKey,
+
+    /// The rotatable authentication certificate cell, shared by all connections.
+    ///
+    /// Behind an `Arc<Mutex<_>>` so all cloned-per-connection `LocalNode`s share
+    /// one cert that is lazily re-signed by [`Self::get_auth_cert`] when fewer
+    /// than 1800 s of validity remain — matching `PeerAuth::getAuthCert()`. The
+    /// underlying pubkey is never reassigned; only the expiration and signature
+    /// are refreshed.
+    pub(crate) auth_cert: Arc<Mutex<AuthCert>>,
 }
 
 const LEDGER_VERSION: u32 = henyey_common::protocol::CURRENT_LEDGER_PROTOCOL_VERSION;
@@ -821,11 +847,39 @@ const OVERLAY_VERSION: u32 = 40;
 const OVERLAY_MIN_VERSION: u32 = 38;
 const DEFAULT_LISTENING_PORT: u16 = 11625;
 
+/// Validity window of a freshly signed AuthCert, in seconds.
+///
+/// Parity: stellar-core `PeerAuth.cpp` `expirationLimit` (3600 s).
+pub(crate) const AUTH_CERT_EXPIRATION_SECS: u64 = 3600;
+
+/// Re-sign the AuthCert once fewer than this many seconds of validity remain.
+///
+/// Parity: stellar-core `PeerAuth::getAuthCert()` re-issues when
+/// `mCert.expiration < timeNow() + 1800`.
+const AUTH_CERT_REISSUE_MARGIN_SECS: u64 = 1800;
+
 impl LocalNode {
     fn with_network(
         secret_key: henyey_crypto::SecretKey,
         network_id: henyey_common::NetworkId,
     ) -> Self {
+        // Generate the process-lifetime Curve25519 keypair ONCE. Shared across
+        // every per-connection AuthContext via the Arc (OVERLAY §4.4.3-rotate).
+        let x25519_secret = x25519_dalek::StaticSecret::random_from_rng(rand::rngs::OsRng);
+        let x25519_public = x25519_dalek::PublicKey::from(&x25519_secret);
+
+        // Sign the initial AuthCert over the (stable) ephemeral pubkey.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let initial_cert = auth::make_auth_cert(
+            &secret_key,
+            &network_id,
+            x25519_public.as_bytes(),
+            now + AUTH_CERT_EXPIRATION_SECS,
+        );
+
         Self {
             secret_key,
             network_id,
@@ -834,7 +888,34 @@ impl LocalNode {
             overlay_version: OVERLAY_VERSION,
             overlay_min_version: OVERLAY_MIN_VERSION,
             listening_port: DEFAULT_LISTENING_PORT,
+            x25519_secret: Arc::new(x25519_secret),
+            x25519_public,
+            auth_cert: Arc::new(Mutex::new(initial_cert)),
         }
+    }
+
+    /// Returns the current authentication certificate, lazily re-signing it when
+    /// fewer than 1800 s of validity remain.
+    ///
+    /// The ephemeral pubkey is never changed — only the expiration (`now + 3600`)
+    /// and signature are refreshed, matching stellar-core `PeerAuth::getAuthCert()`
+    /// (OVERLAY §4.4.3-rotate). All connections from this node share one cert cell
+    /// (behind the `Arc<Mutex<_>>`), so rotation is observed by every connection.
+    ///
+    /// `now` is the current UNIX time in seconds; it is injected so rotation can
+    /// be tested without sleeping. Production callers pass `SystemTime::now()`.
+    pub(crate) fn get_auth_cert(&self, now: u64) -> AuthCert {
+        let mut cert = self.auth_cert.lock().unwrap();
+        if cert.expiration < now + AUTH_CERT_REISSUE_MARGIN_SECS {
+            let expiration = now + AUTH_CERT_EXPIRATION_SECS;
+            *cert = auth::make_auth_cert(
+                &self.secret_key,
+                &self.network_id,
+                self.x25519_public.as_bytes(),
+                expiration,
+            );
+        }
+        cert.clone()
     }
 
     /// Set the version string to include a commit hash for P2P identification.
