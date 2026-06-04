@@ -2867,10 +2867,13 @@ impl App {
         // Signal heartbeat to sync recovery.
         self.sync_recovery_heartbeat();
 
-        // Periodically garbage collect stale bucket files.
-        if pending.ledger_seq % 100 == 0 {
-            self.cleanup_stale_bucket_files_background();
-        }
+        // Garbage collect stale bucket files after every ledger close, matching
+        // stellar-core's unconditional `forgetUnreferencedBuckets` in
+        // `advanceLedgerStateAndPublish` (LedgerManagerImpl.cpp:1429). The work
+        // runs on the blocking pool and is self-coalescing via the
+        // `bucket_gc_in_flight` re-entrancy guard, so per-ledger invocation
+        // cannot stack overlapping GC tasks (#3028).
+        self.cleanup_stale_bucket_files_background();
 
         self.clear_tx_set_exhausted();
 
