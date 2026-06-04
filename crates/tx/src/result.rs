@@ -988,6 +988,41 @@ mod tests {
         assert_eq!(result.result_code(), TxResultCode::TxBadSeq);
     }
 
+    // Mirrors stellar-core MutableTransactionResultBase::setError monotonicity
+    // (MutableTransactionResult.cpp:148-160): once an error code is set it may
+    // only be re-set to the same code (idempotent) or be set from a success
+    // state — never changed to a different error. Gated to debug builds because
+    // the guard is a `debug_assert!` (compiled out in release).
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "set_error must be monotonic")]
+    fn test_set_error_rejects_error_to_different_error() {
+        let mut result = MutableTransactionResult::new(100);
+        result.set_error(stellar_xdr::curr::TransactionResultCode::TxBadSeq);
+        // Changing to a different error code must panic via the entry guard.
+        result.set_error(stellar_xdr::curr::TransactionResultCode::TxInsufficientFee);
+    }
+
+    #[test]
+    fn test_set_error_idempotent_same_code_ok() {
+        let mut result = MutableTransactionResult::new(100);
+        result.set_error(stellar_xdr::curr::TransactionResultCode::TxBadSeq);
+        // Re-setting the same error code is idempotent and must not panic.
+        result.set_error(stellar_xdr::curr::TransactionResultCode::TxBadSeq);
+        assert!(!result.is_success());
+        assert_eq!(result.result_code(), TxResultCode::TxBadSeq);
+    }
+
+    #[test]
+    fn test_set_error_from_success_ok() {
+        let mut result = MutableTransactionResult::new(100);
+        assert!(result.is_success());
+        // Transitioning from a success state to an error is always allowed.
+        result.set_error(stellar_xdr::curr::TransactionResultCode::TxBadSeq);
+        assert!(!result.is_success());
+        assert_eq!(result.result_code(), TxResultCode::TxBadSeq);
+    }
+
     #[test]
     fn test_mutable_result_error_resets_refundable_fees() {
         let mut result = MutableTransactionResult::new(1000);
