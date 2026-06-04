@@ -37,6 +37,12 @@ It reuses `/project-tick`'s board query (Step 1), actionability filter (Step 2 +
 
 ## Main loop
 
+**Loop init (once, before the first pass):** source the anomaly-log helper so its functions (`anomaly_log_append` / `anomaly_log_dump` / `anomaly_log_clear`) are in scope for the whole session:
+
+```bash
+source scripts/lib/pipeline-anomaly-log.sh
+```
+
 Repeat forever:
 
 ### Step A — Sync new repo issues onto the board
@@ -44,15 +50,19 @@ Repeat forever:
 Before querying, make sure freshly filed repo issues are tracked on project #2 (otherwise the picker never sees them). List open repo issues, diff against the board item set from the last board query, and add any untracked ones:
 
 ```bash
-# Open repo issues not yet on the project board → add them (lands in default
-# column; /triage will move them through backlog). Best-effort; skip on error.
+# Open repo issues not yet on the project board → add them. `item-add` adds the
+# item with an EMPTY Status field, which the picker (Step C) never sees — so we
+# immediately set Status to `backlog` (idempotent adds-then-sets) so /triage can
+# move it through the pipeline. Best-effort; skip on error.
 for N in $(gh issue list --repo stellar-experimental/henyey --state open \
             --json number --jq '.[].number'); do
   case " $TRACKED_ISSUE_NUMBERS " in
     *" $N "*) : ;;                       # already on the board
     *) gh project item-add 2 --owner stellar-experimental \
          --url "https://github.com/stellar-experimental/henyey/issues/$N" \
-         2>/dev/null || true ;;
+         2>/dev/null \
+         && bash .github/skills/shared/scripts/move-issue-status.sh "$N" backlog \
+              2>/dev/null || true ;;
   esac
 done
 ```
@@ -114,7 +124,7 @@ Then handle these special cases before the next pass:
       ROLLUP=$(gh pr view "$PR_NUM" --repo stellar-experimental/henyey \
                  --json statusCheckRollup --jq '.statusCheckRollup')
       TOTAL=$(echo "$ROLLUP" | jq 'length')
-      PENDING=$(echo "$ROLLUP" | jq '[.[]|select((.status//""|ascii_upcase)!="COMPLETED" and .status!=null)]|length')
+      PENDING=$(echo "$ROLLUP" | jq '[.[]|select((.status != null and (.status|ascii_upcase)!="COMPLETED") or (.status==null and (.state|ascii_upcase)=="PENDING"))]|length')
       [ "$TOTAL" -gt 0 ] && [ "$PENDING" -eq 0 ] && break
       sleep 120
     done
@@ -145,7 +155,7 @@ When no actionable items remain (board drained for now):
 
 1. Run the **self-reflection pass** (Step H) **if due** (always on an idle transition; at most ~once/hour while busy — track the last reflection time).
 2. Schedule the next pass after a **backoff**: escalating intervals — start short (~30s), then grow (1m → 2m → 5m → 10m), **capped at ~15–30 min**. Reset the backoff to the short interval as soon as a pass does real work (picked/dispatched something) or a `CI_WAITER` fires.
-3. Wake mechanism: use a **detached background poller** (Bash tool `run_in_background`) that sleeps the backoff interval and then re-invokes you, OR a self-scheduled wake — so the loop is genuinely continuous without a foreground `sleep` blocking the session. A `CI_WAITER` completing also wakes you (to dispatch the now-actionable `/review-pr`).
+3. Wake mechanism: use a **detached background poller** (Bash tool `run_in_background`) that sleeps the backoff interval and then re-invokes you, OR a self-scheduled wake — so the loop is genuinely continuous without a foreground `sleep` blocking the session. A `CI_WAITER` completing also wakes you (to dispatch the now-actionable `/review-pr`). **Caveat:** the orchestrator only runs while its Claude session is alive — a detached background poller can only re-invoke you via the harness on process exit, so it cannot wake a dead session; for true 24/7 operation, pair `/project-loop` with an external scheduler (cron / the `schedule` skill) that relaunches it.
 
 Then loop back to **Step A**.
 
@@ -178,13 +188,19 @@ Run reflection on **each idle transition** (board drained — you have the fulle
 
 Spawn **one** `opus` "meta-reviewer" Agent sub-agent (`subagent_type: general-purpose`, foreground) over `anomaly_log_dump` + recent `PASS_HISTORY`. Its instructions:
 
-1. **Dedupe** against open issues labeled `pipeline` or `self-improvement` (`gh issue list --label self-improvement --label pipeline --state open`). For a recurrence of an already-filed finding, **comment on the existing issue** (note the new occurrence + evidence) — do **NOT** refile.
+1. **Dedupe** against open issues labeled `pipeline` or `self-improvement` (`gh issue list --state open --search 'label:self-improvement,pipeline'` — the comma is OR in gh search, so this matches issues with EITHER label; multiple `--label` flags would AND them and miss `self-improvement`-only issues). For a recurrence of an already-filed finding, **comment on the existing issue** (note the new occurrence + evidence) — do **NOT** refile.
 2. **Classify** each genuine, non-duplicate finding as `trivial` (clear, low-risk fix — the pipeline can auto-implement it next pass) or `needs-design` (requires operator triage).
 3. **File** the issues via `gh issue create`, labeled `self-improvement` (plus `trivial` where apt), with reproduction steps and evidence (PR/run/issue links). For `needs-design`, write enough for an operator to triage.
 4. It must **NOT** edit any live skill or script — it only files issues. Self-changes are implemented by the normal pipeline (triage → plan → do → review-pr), so every self-edit is adversarially reviewed + CI-gated.
 5. **Cap: ≤3 new self-issues per cycle.** If more than 3 genuine findings exist, file the top 3 by severity and note the remainder in the highest-priority issue's body.
 
 The filed `self-improvement` issues are picked up by subsequent passes like any other work — the pipeline improves itself through its own machinery. (`trivial` → auto-implemented next pass; `needs-design` → waits for operator triage.)
+
+After the meta-reviewer sub-agent returns and its issues are filed, **clear the anomaly log** so the next cycle starts fresh (matches the helper header's documented contract: "dumps the log, files `self-improvement` issues, then clears it"):
+
+```bash
+anomaly_log_clear
+```
 
 ## When NOT to use
 

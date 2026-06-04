@@ -97,15 +97,19 @@ Skip items where any check fails. Skip items whose status is `planning` (always 
 
 `/review-pr`'s only useful work when CI is pending is to post "Waiting on CI" and unassign. Picking such items burns reviewer-agent spawns just to find CI hasn't finished — wasteful. Filter them at the dispatcher:
 
-For each in-review candidate after the actionability filter above, look up the linked PR's CI summary and skip the item if CI is still running:
+For each in-review candidate after the actionability filter above, look up the linked PR's CI summary and skip the item if CI is still running.
+
+**Resolve the open PR number from the Step-1 GraphQL result — do NOT re-fetch via `gh issue view`.** Step 1's board query already fetches `closedByPullRequestsReferences(first: 5) { nodes { number state url } }` per issue, including the `state` subfield. Critically, `gh issue view --json closedByPullRequestsReferences` does **not** expose `.state` on that field (only the GraphQL endpoint does — see `do/SKILL.md` Step 0), so a `select(.state == "OPEN")` against `gh issue view` always yields empty and Step 2b silently becomes a no-op. Consume the per-issue `closedByPullRequestsReferences.nodes` already in hand from Step 1 instead:
 
 ```bash
 for ISSUE in <in-review candidates>; do
-  PR_NUM=$(gh issue view "$ISSUE" --repo stellar-experimental/henyey \
-    --json closedByPullRequestsReferences \
-    --jq '.closedByPullRequestsReferences | map(select(.state == "OPEN")) | .[0].number // empty')
+  # Resolve the open PR number from the Step-1 GraphQL node for this issue
+  # (content.closedByPullRequestsReferences.nodes — already fetched, with .state).
+  PR_NUM=$(echo "$STEP1_NODE_FOR_ISSUE" | jq -r \
+    '.content.closedByPullRequestsReferences.nodes
+     | map(select(.state == "OPEN")) | .[0].number // empty')
 
-  # No PR linked = broken state; let /review-pr handle the recovery.
+  # No open PR linked = broken state; let /review-pr handle the recovery.
   [ -z "$PR_NUM" ] && continue
 
   # Fetch the rollup once.
@@ -186,7 +190,7 @@ Based on the issue's status, invoke the specialist skill **as a foreground sub-a
 
 **Rationale:** triage is a simple decision task (haiku is plenty). Planning, implementation, and review need strong code/plan reasoning (opus). The cross-model diversity that a second model family used to provide on plan-critics and PR-reviewers is now supplied by the **adversarial refute pass** built into `/plan` and `/review-pr` (an independent opus "skeptic" sub-agent tries to refute each blocking finding; a finding only stands if it survives refutation) — so an all-opus pipeline no longer risks the false-positive blind spot a single model family otherwise would.
 
-**Critical: the sub-agent MUST run in the foreground.** Do not set `run_in_background: true`. The dispatcher's job is to block until the specialist either completes the full state transition OR posts a recognized failure marker (e.g. `## Plan: Did Not Converge`, `## Plan: Triage Disagreement`, `## Do: Plan Wrong`, `## Do: Local Verification Failed`, `## Review: Cycle Cap Reached`, `## Review: No PR Linked`) — anything less leaves work orphaned mid-flight (commit pushed but no PR open, etc.).
+**Critical: the sub-agent MUST run in the foreground.** Do not set `run_in_background: true`. The dispatcher's job is to block until the specialist either completes the full state transition OR posts a recognized failure marker (e.g. `## Plan: Triage Disagreement`, `## Plan: Scope Mismatch`, `## ⚠️ Plan: Force-Converged`, `## Do: Plan Wrong`, `## Do: Local Verification Failed`, `## Review: Cycle Cap Reached`, `## Review: No PR Linked`) — anything less leaves work orphaned mid-flight (commit pushed but no PR open, etc.).
 
 Wait for the sub-agent to complete. Do not try to summarize or second-guess its work — the specialist's commit history, issue comments, and PR reviews are the audit trail. After the sub-agent returns, report a one-line summary of the state transition it accomplished and exit.
 

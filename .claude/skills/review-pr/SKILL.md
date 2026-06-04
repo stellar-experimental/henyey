@@ -492,12 +492,12 @@ SELF_MOD_FILES=$(gh pr view $PR_NUM --repo stellar-experimental/henyey \
 The PR is **self-modifying** if any changed path matches one of these patterns:
 
 - `.claude/skills/{project-loop,project-tick,plan,do,review-pr,triage}/...` (any file under those skill dirs)
-- `scripts/lib/{review-pr-merge,agent-worktree-contract,pipeline-anomaly-log}.sh`
+- `scripts/lib/{review-pr-merge,review-pr-verdicts,agent-worktree-contract,pipeline-anomaly-log}.sh`
 - `.github/skills/shared/scripts/...`
 
 ```bash
 IS_SELF_MOD=$(echo "$SELF_MOD_FILES" | grep -Eq \
-  '^\.claude/skills/(project-loop|project-tick|plan|do|review-pr|triage)/|^scripts/lib/(review-pr-merge|agent-worktree-contract|pipeline-anomaly-log)\.sh$|^\.github/skills/shared/scripts/' \
+  '^\.claude/skills/(project-loop|project-tick|plan|do|review-pr|triage)/|^scripts/lib/(review-pr-merge|review-pr-verdicts|agent-worktree-contract|pipeline-anomaly-log)\.sh$|^\.github/skills/shared/scripts/' \
   && echo "true" || echo "false")
 ```
 
