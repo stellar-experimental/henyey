@@ -187,6 +187,49 @@ fn test_count_constant_is_478() {
 }
 
 // ---------------------------------------------------------------------------
+// Note on manager-level coverage
+//
+// stellar-core gates the fix on the mainnet p23→p24 *upgrade ledger*, i.e.
+// `prev_version == 23` (initialLedgerVers) with the closing ledger at v24. In
+// the henyey injection point (`manager.rs`), the fix runs inside the
+// `protocol_version_starts_from(prev_version, V23)` hot-archive branch under
+// the additional gate `prev_version < 24 && protocol_version >= 24 &&
+// network_id.is_mainnet()`.
+//
+// That close path is NOT reachable through the public `initialize` +
+// `close_ledger` API: henyey supports protocol 24+ only, and the ledger
+// manager panics on any genesis/init at a version in 1..=23 (manager.rs ~2085,
+// "unsupported protocol version"). Reaching `prev_version == 23` would require
+// first closing a v23 ledger, which requires initializing at v23 — rejected.
+// The pre-existing mainnet p23→p24 fee-pool correction (`prev_version == 23`,
+// manager.rs ~3011) is likewise exercised only at the function level for the
+// same reason.
+//
+// The gate itself is three plain conjunctions over `prev_version`,
+// `protocol_version`, and `network_id.is_mainnet()` (verified by the
+// `is_mainnet()` equality check below); the batch-construction behavior it
+// guards is fully covered by the `add_hot_archive_batch_with_p23_fix` tests
+// above, which decode the real hardcoded data and assert the structural
+// outcome. So the close-driven assertion reduces to those function-level tests
+// plus the gate's boolean logic.
+// ---------------------------------------------------------------------------
+
+use henyey_common::NetworkId;
+
+/// Pin the production-network gate: only the real mainnet passphrase trips
+/// `is_mainnet()` (a synthesized id will not), and testnet does not — matching
+/// stellar-core's `gIsProductionNetwork`.
+#[test]
+fn test_is_mainnet_gate() {
+    assert!(
+        NetworkId::from_passphrase("Public Global Stellar Network ; September 2015").is_mainnet()
+    );
+    assert!(NetworkId::mainnet().is_mainnet());
+    assert!(!NetworkId::from_passphrase("Test SDF Network ; September 2015").is_mainnet());
+    assert!(!NetworkId::testnet().is_mainnet());
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
