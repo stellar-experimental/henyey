@@ -82,7 +82,12 @@ fn run_eviction_scan(
         EvictionIterator::new(context.eviction_settings.starting_eviction_scan_level)
     });
     let eviction_result = bucket_list
-        .scan_for_eviction_incremental(iter, context.header.ledger_seq, context.eviction_settings)
+        .scan_for_eviction_incremental(
+            iter,
+            context.header.ledger_seq,
+            context.header.ledger_version,
+            context.eviction_settings,
+        )
         .map_err(HistoryError::Bucket)?;
 
     tracing::info!(

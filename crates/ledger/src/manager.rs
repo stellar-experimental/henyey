@@ -151,7 +151,6 @@ pub fn prepend_fee_event(
 struct PendingEvictionScan {
     handle: std::thread::JoinHandle<henyey_bucket::Result<EvictionResult>>,
     target_ledger_seq: u32,
-    settings: StateArchivalSettings,
 }
 
 /// Pre-computed cache data from a bucket list scan.
@@ -5017,6 +5016,10 @@ impl LedgerCloseContext<'_> {
                     let eviction_result = {
                         let pending = self.manager.pending_eviction_scan.lock().take();
                         let background_result = pending.and_then(|scan| {
+                            // Cheap pre-filter: a scan launched for a different
+                            // target ledger can't be reused (and lets us skip
+                            // joining the thread). The authoritative validity
+                            // check is `EvictionResult::is_valid` below.
                             if scan.target_ledger_seq != self.close_data.ledger_seq {
                                 tracing::debug!(
                                     ledger_seq = self.close_data.ledger_seq,
@@ -5025,15 +5028,28 @@ impl LedgerCloseContext<'_> {
                                 );
                                 return None;
                             }
-                            if scan.settings != eviction_settings {
-                                tracing::debug!(
-                                    ledger_seq = self.close_data.ledger_seq,
-                                    "Discarding background eviction scan: settings changed"
-                                );
-                                return None;
-                            }
                             match scan.handle.join() {
                                 Ok(Ok(result)) => {
+                                    // Authoritative spec check (BUCKETLISTDB
+                                    // §12.5/§12.6): discard a stale scan whose
+                                    // ledger_seq / eviction settings changed, or
+                                    // that crossed into V23 before resolve.
+                                    // `prev_version` is the resolve ledger's
+                                    // pre-transaction version (core's
+                                    // `currLedgerVers`). On invalid, fall through
+                                    // to the inline rescan with current state.
+                                    if !result.is_valid(
+                                        self.close_data.ledger_seq,
+                                        prev_version,
+                                        &eviction_settings,
+                                    ) {
+                                        tracing::debug!(
+                                            ledger_seq = self.close_data.ledger_seq,
+                                            "Discarding background eviction scan: \
+                                             invalid (ledger/version/settings changed)"
+                                        );
+                                        return None;
+                                    }
                                     tracing::debug!(
                                         ledger_seq = self.close_data.ledger_seq,
                                         candidates = result.candidates.len(),
@@ -5069,6 +5085,7 @@ impl LedgerCloseContext<'_> {
                                     .scan_for_eviction_incremental(
                                         iter,
                                         self.close_data.ledger_seq,
+                                        prev_version,
                                         &eviction_settings,
                                     )
                                     .map_err(LedgerError::Bucket)?
@@ -5512,7 +5529,11 @@ impl LedgerCloseContext<'_> {
                         let snapshot =
                             BucketListSnapshot::new(&bucket_list, self.prev_header.clone());
                         let iter = load_eviction_iterator_from_bucket_list(&bucket_list)?;
-                        Some((snapshot, iter, settings))
+                        // The scan for ledger N+1 runs on the just-closed
+                        // ledger's protocol version (`prev_version`); that value
+                        // becomes the result's `initial_ledger_version` so a
+                        // V23 crossing at N+1 invalidates it (is_valid).
+                        Some((snapshot, iter, prev_version, settings))
                     } else {
                         None
                     }
@@ -5537,16 +5558,19 @@ impl LedgerCloseContext<'_> {
         // Start background eviction scan for the next ledger.
         // The scan runs on a snapshot of the bucket list (taken above while the write
         // lock was held), so it doesn't interfere with subsequent operations.
-        if let Some((snapshot, iter, settings)) = bg_eviction_data {
+        if let Some((snapshot, iter, scan_version, settings)) = bg_eviction_data {
             let target_ledger_seq = self.close_data.ledger_seq + 1;
-            let settings_clone = settings.clone();
             let handle = std::thread::spawn(move || {
-                snapshot.scan_for_eviction_incremental(iter, target_ledger_seq, &settings_clone)
+                snapshot.scan_for_eviction_incremental(
+                    iter,
+                    target_ledger_seq,
+                    scan_version,
+                    &settings,
+                )
             });
             *self.manager.pending_eviction_scan.lock() = Some(PendingEvictionScan {
                 handle,
                 target_ledger_seq,
-                settings,
             });
         }
 
@@ -7639,14 +7663,12 @@ mod tests {
         let snapshot = BucketListSnapshot::new(&BucketList::default(), create_genesis_header());
         let settings = StateArchivalSettings::default();
         let iter = EvictionIterator::new(settings.starting_eviction_scan_level);
-        let settings_clone = settings.clone();
         let handle = std::thread::spawn(move || {
-            snapshot.scan_for_eviction_incremental(iter, 2, &settings_clone)
+            snapshot.scan_for_eviction_incremental(iter, 2, 23, &settings)
         });
         *manager.pending_eviction_scan.lock() = Some(PendingEvictionScan {
             handle,
             target_ledger_seq: 2,
-            settings,
         });
 
         assert!(manager.pending_eviction_scan.lock().is_some());
@@ -7729,8 +7751,9 @@ mod tests {
             bucket_file_offset: 0,
         };
 
-        let handle =
-            std::thread::spawn(move || snapshot.scan_for_eviction_incremental(iter, 5, &settings));
+        let handle = std::thread::spawn(move || {
+            snapshot.scan_for_eviction_incremental(iter, 5, 23, &settings)
+        });
 
         let result = handle.join().expect("thread should not panic").unwrap();
         assert_eq!(result.candidates.len(), 3, "Should find 3 expired entries");

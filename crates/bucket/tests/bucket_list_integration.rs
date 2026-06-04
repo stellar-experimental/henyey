@@ -964,7 +964,7 @@ async fn test_eviction_scan_incremental() {
 
     // Perform incremental scan at ledger 5 (after expiration)
     let result = bl
-        .scan_for_eviction_incremental(iter, 5, &settings)
+        .scan_for_eviction_incremental(iter, 5, 23, &settings)
         .unwrap();
 
     // Should have scanned some bytes
@@ -1040,7 +1040,7 @@ async fn test_snapshot_eviction_scan_matches_bucket_list() {
 
     // Run scan on the bucket list directly
     let bl_result = bl
-        .scan_for_eviction_incremental(iter.clone(), scan_ledger, &settings)
+        .scan_for_eviction_incremental(iter.clone(), scan_ledger, 23, &settings)
         .unwrap();
 
     // Take a snapshot and run the same scan on it
@@ -1068,7 +1068,7 @@ async fn test_snapshot_eviction_scan_matches_bucket_list() {
     };
     let snapshot = BucketListSnapshot::new(&bl, header);
     let snap_result = snapshot
-        .scan_for_eviction_incremental(iter, scan_ledger, &settings)
+        .scan_for_eviction_incremental(iter, scan_ledger, 23, &settings)
         .unwrap();
 
     // Results must be identical
@@ -1196,7 +1196,7 @@ async fn test_snapshot_eviction_scan_on_background_thread() {
     let snapshot = BucketListSnapshot::new(&bl, header);
 
     let handle = std::thread::spawn(move || {
-        snapshot.scan_for_eviction_incremental(iter, target_ledger, &settings)
+        snapshot.scan_for_eviction_incremental(iter, target_ledger, 23, &settings)
     });
 
     let result = handle.join().expect("thread should not panic").unwrap();
@@ -1307,7 +1307,7 @@ async fn test_snapshot_eviction_scan_respects_extended_ttl() {
 
     // Scan at ledger 10: after original TTL (4) but before extended TTL (20)
     let result = snapshot
-        .scan_for_eviction_incremental(iter.clone(), 10, &settings)
+        .scan_for_eviction_incremental(iter.clone(), 10, 23, &settings)
         .unwrap();
 
     // Entry should NOT be evicted because the snapshot sees the extended TTL
@@ -1319,7 +1319,7 @@ async fn test_snapshot_eviction_scan_respects_extended_ttl() {
 
     // Now scan at ledger 25: after the extended TTL
     let result2 = snapshot
-        .scan_for_eviction_incremental(iter, 25, &settings)
+        .scan_for_eviction_incremental(iter, 25, 23, &settings)
         .unwrap();
 
     // Entry SHOULD be evicted now
@@ -1408,7 +1408,7 @@ async fn test_snapshot_eviction_scan_temporary_entries() {
     };
 
     let result = snapshot
-        .scan_for_eviction_incremental(iter, 5, &settings)
+        .scan_for_eviction_incremental(iter, 5, 23, &settings)
         .unwrap();
 
     // Should find all 5 expired entries (3 temporary + 2 persistent)
@@ -2046,7 +2046,7 @@ async fn test_eviction_scan_zero_budget_does_not_advance_iterator() {
 
     // Scan at a ledger past expiration
     let result = bl
-        .scan_for_eviction_incremental(start_iter.clone(), 100, &settings)
+        .scan_for_eviction_incremental(start_iter.clone(), 100, 23, &settings)
         .unwrap();
 
     // stellar-core returns immediately with no work when bytesToScan == 0
@@ -2136,7 +2136,7 @@ fn test_audit_156_incremental_eviction_panics_on_dead_persistent_entry() {
     };
 
     // Should panic: persistent entry lookup returns None (DEAD tombstone)
-    let _ = bl.scan_for_eviction_incremental(iter, 100, &settings);
+    let _ = bl.scan_for_eviction_incremental(iter, 100, 23, &settings);
 }
 
 /// Same as above but exercises the BucketListSnapshot path.
@@ -2222,5 +2222,5 @@ fn test_audit_156_snapshot_incremental_eviction_panics_on_dead_persistent_entry(
     };
 
     // Should panic: snapshot lookup also returns None for DEAD-shadowed key
-    let _ = snapshot.scan_for_eviction_incremental(iter, 100, &settings);
+    let _ = snapshot.scan_for_eviction_incremental(iter, 100, 23, &settings);
 }

@@ -232,6 +232,7 @@ Corresponds to: `LiveBucketIndex.h`, `DiskIndex.h`, `InMemoryIndex.h`, `BucketIn
 | `LedgerEntryIdCmp` / `BucketEntryIdCmp` | `compare_keys()` / `compare_entries()` | Full |
 | `MergeCounters` / `BucketEntryCounters` | Same-named Rust structs | Full |
 | `EvictionResultEntry` / `EvictionResultCandidates` / `EvictedStateVectors` | `EvictionCandidate` / `EvictionResult` / `ResolvedEviction` | Full |
+| `EvictionResultCandidates::isValid()` (BUCKETLISTDB §12.5/§12.6 scan-validity check) | `EvictionResult::is_valid()` (V23-crossing + ledger_seq + 3 archival-settings fields), enforced on the background-scan reuse path in `henyey-ledger` `manager.rs` | Full |
 | `EvictionMetrics` / `EvictionStatistics::recordEvictedEntry()` | `EvictionCounters` / eviction stats | Full |
 | `EvictionStatistics::submitMetricsAndRestartCycle()` | Simplified eviction statistics only | Partial |
 | Binary fuse filter and random-eviction cache | `BucketBloomFilter` / `RandomEvictionCache` | Full |

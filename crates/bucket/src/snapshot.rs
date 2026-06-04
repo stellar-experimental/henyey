@@ -509,10 +509,17 @@ impl BucketListSnapshot {
     /// Used by the background eviction scan: a snapshot is taken after committing ledger N,
     /// and the scan runs on a background thread targeting ledger N+1. When N+1 arrives,
     /// the result is resolved with that ledger's modified TTL keys.
+    ///
+    /// `ledger_version` is the protocol version the scan is based on (the
+    /// just-closed ledger's version when launched as a background scan for the
+    /// next ledger). It is captured on the result so a stale scan can be
+    /// invalidated at resolve time via [`EvictionResult::is_valid`]
+    /// (BUCKETLISTDB §12.5/§12.6).
     pub fn scan_for_eviction_incremental(
         &self,
         mut iter: EvictionIterator,
         current_ledger: u32,
+        ledger_version: u32,
         settings: &StateArchivalSettings,
     ) -> crate::Result<EvictionResult> {
         let mut result = EvictionResult {
@@ -520,6 +527,9 @@ impl BucketListSnapshot {
             end_iterator: iter.clone(),
             bytes_scanned: 0,
             scan_complete: false,
+            initial_ledger_seq: current_ledger,
+            initial_ledger_version: ledger_version,
+            initial_archival_settings: settings.clone(),
         };
 
         // Update iterator based on spills (reset offset if bucket received new data)

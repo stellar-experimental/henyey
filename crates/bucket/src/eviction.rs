@@ -65,7 +65,7 @@
 //! update_starting_eviction_iterator(&mut iter, 6, current_ledger);
 //!
 //! // Perform the scan (handled by BucketList::scan_for_eviction_incremental)
-//! let result = bucket_list.scan_for_eviction_incremental(iter, current_ledger, &settings)?;
+//! let result = bucket_list.scan_for_eviction_incremental(iter, current_ledger, ledger_version, &settings)?;
 //!
 //! // Update iterator for next ledger
 //! iter = result.end_iterator;
@@ -257,6 +257,24 @@ pub struct EvictionResult {
     pub bytes_scanned: u64,
     /// Whether the scan completed its byte quota (vs hitting bucket end early).
     pub scan_complete: bool,
+    /// Ledger sequence the scan was based on (captured at scan start).
+    ///
+    /// Used by [`EvictionResult::is_valid`] to reject a stale background scan
+    /// whose ledger no longer matches the resolve-time ledger.
+    pub initial_ledger_seq: u32,
+    /// Protocol version the scan was based on (captured at scan start).
+    ///
+    /// A background scan for ledger N is started immediately after N-1 closes,
+    /// so this is the *just-closed* ledger's protocol version. At resolve time
+    /// it is compared against the resolve ledger's pre-transaction version
+    /// (post any upgrade) to detect a crossing into the first protocol that
+    /// supports persistent eviction (V23).
+    pub initial_ledger_version: u32,
+    /// State archival settings the scan was based on (captured at scan start).
+    ///
+    /// Used by [`EvictionResult::is_valid`] to reject a scan whose eviction
+    /// parameters changed via a config upgrade before resolve.
+    pub initial_archival_settings: StateArchivalSettings,
 }
 
 /// Result of resolving eviction candidates.
@@ -295,6 +313,58 @@ impl ResolvedEviction {
 }
 
 impl EvictionResult {
+    /// Returns true if this scan is still a valid basis for eviction at the
+    /// given current ledger / protocol version / archival settings.
+    ///
+    /// Mirrors stellar-core `EvictionResultCandidates::isValid`
+    /// (`src/bucket/BucketUtils.cpp`, v26.0.1). A background eviction scan for
+    /// ledger N is started immediately after N-1 closes, but ledger N may apply
+    /// a network upgrade that changes eviction behavior. Such a scan must be
+    /// discarded and restarted with the post-upgrade state.
+    ///
+    /// Invalid (returns false) when ANY of:
+    /// - The protocol crosses *into* V23 (the first protocol supporting
+    ///   persistent eviction) between scan start and resolve. Other protocol
+    ///   upgrades do not affect eviction scans.
+    /// - The resolve ledger_seq differs from the scan's captured ledger_seq.
+    /// - Any of the three eviction-relevant archival-settings fields changed:
+    ///   `max_entries_to_archive`, `eviction_scan_size`,
+    ///   `starting_eviction_scan_level`.
+    ///
+    /// Parity: compares ONLY those three settings fields — NOT the full
+    /// `StateArchivalSettings` struct. stellar-core deliberately ignores
+    /// TTL/rent fields (e.g. `min_temporary_ttl`) here; a full-struct equality
+    /// check would be over-strict and diverge from core.
+    ///
+    /// Version mapping: `curr_ledger_seq` / `curr_ledger_vers` / `curr_sas`
+    /// are the resolve ledger's pre-transaction values (core's `currLedger*`),
+    /// while `initial_*` were captured at scan start (the just-closed ledger).
+    pub fn is_valid(
+        &self,
+        curr_ledger_seq: u32,
+        curr_ledger_vers: u32,
+        curr_sas: &StateArchivalSettings,
+    ) -> bool {
+        use henyey_common::protocol::{
+            protocol_version_is_before, protocol_version_starts_from, ProtocolVersion,
+        };
+
+        // If the scan started before V23 and the resolve ledger crosses into
+        // V23, eviction behavior changed mid-scan — restart.
+        if protocol_version_is_before(self.initial_ledger_version, ProtocolVersion::V23)
+            && protocol_version_starts_from(curr_ledger_vers, ProtocolVersion::V23)
+        {
+            return false;
+        }
+
+        self.initial_ledger_seq == curr_ledger_seq
+            && self.initial_archival_settings.max_entries_to_archive
+                == curr_sas.max_entries_to_archive
+            && self.initial_archival_settings.eviction_scan_size == curr_sas.eviction_scan_size
+            && self.initial_archival_settings.starting_eviction_scan_level
+                == curr_sas.starting_eviction_scan_level
+    }
+
     /// Resolve eviction candidates by applying TTL filtering and max_entries limit.
     ///
     /// This matches stellar-core's `resolveBackgroundEvictionScan`:
@@ -1032,6 +1102,7 @@ mod tests {
             end_iterator: EvictionIterator::with_default_level(),
             bytes_scanned: 1000,
             scan_complete: true,
+            ..Default::default()
         };
 
         let mut modified = std::collections::HashSet::new();
@@ -1053,6 +1124,7 @@ mod tests {
             end_iterator: EvictionIterator::with_default_level(),
             bytes_scanned: 1000,
             scan_complete: true,
+            ..Default::default()
         };
 
         let modified = std::collections::HashSet::new(); // empty
@@ -1078,6 +1150,7 @@ mod tests {
             end_iterator: EvictionIterator::with_default_level(),
             bytes_scanned: 1000,
             scan_complete: true,
+            ..Default::default()
         };
 
         let mut modified = std::collections::HashSet::new();
@@ -1107,6 +1180,7 @@ mod tests {
             end_iterator: EvictionIterator::with_default_level(),
             bytes_scanned: 1000,
             scan_complete: true,
+            ..Default::default()
         };
 
         let mut modified = std::collections::HashSet::new();
@@ -1131,6 +1205,7 @@ mod tests {
             end_iterator: EvictionIterator::with_default_level(),
             bytes_scanned: 3000,
             scan_complete: true,
+            ..Default::default()
         };
 
         let modified = std::collections::HashSet::new();
@@ -1153,6 +1228,7 @@ mod tests {
             end_iterator: EvictionIterator::with_default_level(),
             bytes_scanned: 1000,
             scan_complete: true,
+            ..Default::default()
         };
 
         let modified = std::collections::HashSet::new();
@@ -1204,6 +1280,7 @@ mod tests {
             end_iterator: EvictionIterator::with_default_level(),
             bytes_scanned: 4000,
             scan_complete: true,
+            ..Default::default()
         };
 
         let modified = std::collections::HashSet::new();
@@ -1249,6 +1326,7 @@ mod tests {
             end_iterator: EvictionIterator::with_default_level(),
             bytes_scanned: 3000,
             scan_complete: true,
+            ..Default::default()
         };
 
         let modified = std::collections::HashSet::new();
@@ -1282,6 +1360,7 @@ mod tests {
             end_iterator: EvictionIterator::with_default_level(),
             bytes_scanned: 2000,
             scan_complete: true,
+            ..Default::default()
         };
 
         let modified = std::collections::HashSet::new();
@@ -1370,6 +1449,7 @@ mod tests {
             end_iterator: scan_end.clone(),
             bytes_scanned: 1000,
             scan_complete: true,
+            ..Default::default()
         };
 
         let modified = std::collections::HashSet::new();
@@ -1398,6 +1478,7 @@ mod tests {
             end_iterator: scan_end.clone(),
             bytes_scanned: 2000,
             scan_complete: true,
+            ..Default::default()
         };
 
         // All TTL keys are modified — all candidates filtered out
@@ -1410,6 +1491,93 @@ mod tests {
         assert!(resolved.archived_entries.is_empty());
         // When all are filtered (remaining > 0), use scan end iterator
         assert_eq!(resolved.end_iterator, scan_end);
+    }
+
+    // --- EvictionResult::is_valid() tests (BUCKETLISTDB §12.5/§12.6) ---
+
+    fn make_eviction_result_with_initial(
+        initial_ledger_seq: u32,
+        initial_ledger_version: u32,
+        initial_archival_settings: StateArchivalSettings,
+    ) -> EvictionResult {
+        EvictionResult {
+            candidates: Vec::new(),
+            end_iterator: EvictionIterator::with_default_level(),
+            bytes_scanned: 0,
+            scan_complete: true,
+            initial_ledger_seq,
+            initial_ledger_version,
+            initial_archival_settings,
+        }
+    }
+
+    #[test]
+    fn test_eviction_result_is_valid_rejects_ledger_seq_change() {
+        let sas = default_state_archival_settings();
+        let result = make_eviction_result_with_initial(100, 23, sas.clone());
+
+        // Same ledger_seq → valid.
+        assert!(result.is_valid(100, 23, &sas));
+        // Different ledger_seq → invalid (scan was based on a different ledger).
+        assert!(!result.is_valid(150, 23, &sas));
+    }
+
+    #[test]
+    fn test_eviction_result_is_valid_rejects_v23_crossing() {
+        let sas = default_state_archival_settings();
+
+        // Scan started pre-V23 (22), resolve ledger crosses into V23 → invalid.
+        let pre_v23 = make_eviction_result_with_initial(100, 22, sas.clone());
+        assert!(!pre_v23.is_valid(100, 23, &sas));
+
+        // Scan started at V23, resolve at V24 → no crossing into V23 → valid.
+        let at_v23 = make_eviction_result_with_initial(100, 23, sas.clone());
+        assert!(at_v23.is_valid(100, 24, &sas));
+    }
+
+    #[test]
+    fn test_eviction_result_is_valid_rejects_archival_setting_change() {
+        let base = default_state_archival_settings();
+        let result = make_eviction_result_with_initial(100, 23, base.clone());
+
+        // Each of the three relevant fields changing → invalid.
+        let mut changed_max = base.clone();
+        changed_max.max_entries_to_archive += 1;
+        assert!(!result.is_valid(100, 23, &changed_max));
+
+        let mut changed_scan_size = base.clone();
+        changed_scan_size.eviction_scan_size += 1;
+        assert!(!result.is_valid(100, 23, &changed_scan_size));
+
+        let mut changed_level = base.clone();
+        changed_level.starting_eviction_scan_level += 1;
+        assert!(!result.is_valid(100, 23, &changed_level));
+
+        // Changing an unrelated field (min_temporary_ttl) → still valid.
+        // Parity: stellar-core's isValid compares only the three eviction fields.
+        let mut changed_unrelated = base.clone();
+        changed_unrelated.min_temporary_ttl += 1;
+        assert!(result.is_valid(100, 23, &changed_unrelated));
+    }
+
+    #[test]
+    fn test_eviction_result_captures_initial_state() {
+        // New coverage: scan_for_eviction_incremental must populate the three
+        // initial_* fields from its inputs so is_valid can be enforced later.
+        use crate::bucket_list::BucketList;
+
+        let bl = BucketList::new();
+        let mut settings = default_state_archival_settings();
+        settings.max_entries_to_archive = 7;
+        let iter = EvictionIterator::with_default_level();
+
+        let result = bl
+            .scan_for_eviction_incremental(iter, 42, 23, &settings)
+            .expect("scan should succeed on empty bucket list");
+
+        assert_eq!(result.initial_ledger_seq, 42);
+        assert_eq!(result.initial_ledger_version, 23);
+        assert_eq!(result.initial_archival_settings.max_entries_to_archive, 7);
     }
 
     #[test]
@@ -1433,6 +1601,7 @@ mod tests {
             end_iterator: scan_end.clone(),
             bytes_scanned: 3000,
             scan_complete: true,
+            ..Default::default()
         };
 
         // Only c1's TTL is modified — c1 filtered, c2 and c3 are evicted
