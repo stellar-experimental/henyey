@@ -267,7 +267,7 @@ impl BallotProtocol {
             }
         }
 
-        did_work = self.update_current_if_needed(&new_h) || did_work;
+        did_work = self.update_current_if_needed(&new_h, ctx) || did_work;
         if did_work {
             self.emit_current_state(ctx);
         }
@@ -359,7 +359,7 @@ impl BallotProtocol {
             self.phase = BallotPhase::Confirm;
             if let Some(current) = &self.current_ballot {
                 if !are_ballots_less_and_compatible(&h, current) {
-                    self.bump_to_ballot(&h, false);
+                    self.bump_to_ballot(&h, false, ctx);
                 }
             }
             self.prepared_prime = None;
@@ -367,7 +367,7 @@ impl BallotProtocol {
         }
 
         if did_work {
-            self.update_current_if_needed(&h);
+            self.update_current_if_needed(&h, ctx);
             // Fire the accept-commit notification callback (SCP §6.5-2),
             // ordered update_current_if_needed -> accepted_commit ->
             // emit_current_state to match stellar-core
@@ -433,7 +433,7 @@ impl BallotProtocol {
         h: ScpBallot,
         ctx: &SlotContext<'_, D>,
     ) -> bool {
-        self.update_current_if_needed(&h);
+        self.update_current_if_needed(&h, ctx);
         self.commit = Some(c);
         self.high_ballot = Some(h);
         self.phase = BallotPhase::Externalize;
@@ -511,14 +511,18 @@ impl BallotProtocol {
         }
     }
 
-    fn update_current_if_needed(&mut self, ballot: &ScpBallot) -> bool {
+    fn update_current_if_needed<D: SCPDriver>(
+        &mut self,
+        ballot: &ScpBallot,
+        ctx: &SlotContext<'_, D>,
+    ) -> bool {
         if self
             .current_ballot
             .as_ref()
             .map(|b| ballot_compare(b, ballot) == Ordering::Less)
             .unwrap_or(true)
         {
-            return self.bump_to_ballot(ballot, true);
+            return self.bump_to_ballot(ballot, true, ctx);
         }
         false
     }
@@ -527,13 +531,17 @@ impl BallotProtocol {
     ///
     /// This is more thorough than `update_current_if_needed`: it checks phase
     /// and commit compatibility before bumping.
-    pub(super) fn update_current_value(&mut self, ballot: &ScpBallot) -> bool {
+    pub(super) fn update_current_value<D: SCPDriver>(
+        &mut self,
+        ballot: &ScpBallot,
+        ctx: &SlotContext<'_, D>,
+    ) -> bool {
         if self.phase != BallotPhase::Prepare && self.phase != BallotPhase::Confirm {
             return false;
         }
 
         let updated = if self.current_ballot.is_none() {
-            self.bump_to_ballot(ballot, true);
+            self.bump_to_ballot(ballot, true, ctx);
             true
         } else {
             // If we have a commit and the new ballot is incompatible, reject
@@ -545,7 +553,7 @@ impl BallotProtocol {
 
             let comp = ballot_compare(self.current_ballot.as_ref().unwrap(), ballot);
             match comp {
-                Ordering::Less => self.bump_to_ballot(ballot, true),
+                Ordering::Less => self.bump_to_ballot(ballot, true, ctx),
                 _ => false,
             }
         };
@@ -563,7 +571,12 @@ impl BallotProtocol {
         updated
     }
 
-    pub(super) fn bump_to_ballot(&mut self, ballot: &ScpBallot, check: bool) -> bool {
+    pub(super) fn bump_to_ballot<D: SCPDriver>(
+        &mut self,
+        ballot: &ScpBallot,
+        check: bool,
+        ctx: &SlotContext<'_, D>,
+    ) -> bool {
         if check {
             if let Some(current) = &self.current_ballot {
                 if ballot_compare(ballot, current) != Ordering::Greater {
@@ -576,6 +589,18 @@ impl BallotProtocol {
             None => true,
             Some(current) => current.counter != ballot.counter,
         };
+
+        // Fire `started_ballot_protocol` exactly once per slot, on the
+        // `current_ballot` null→set transition — matching stellar-core
+        // `BallotProtocol::bumpToBallot` (BallotProtocol.cpp:469-474), guarded on
+        // `!mCurrentBallot`. The argument is the new ballot (not the composite
+        // nomination value). Every production path that first-sets
+        // `current_ballot` flows through here (nomination, follower-receive,
+        // recovery), so this is the single firing site. The catchup helper
+        // `force_externalize` (no stellar-core analog) does not reach it.
+        if self.current_ballot.is_none() {
+            ctx.driver.started_ballot_protocol(ctx.slot_index, ballot);
+        }
 
         self.current_ballot = Some(ballot.clone());
 

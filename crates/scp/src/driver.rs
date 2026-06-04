@@ -298,9 +298,17 @@ pub trait SCPDriver: Send + Sync {
 
     /// Called when the ballot protocol is started for a slot.
     ///
-    /// This is called when we transition from nomination to the ballot protocol,
-    /// indicating that we have candidate values and are beginning voting.
-    fn started_ballot_protocol(&self, _slot_index: u64, _value: &Value) {}
+    /// Fired exactly once per slot, at the moment `current_ballot` transitions
+    /// from null to set inside `BallotProtocol::bump_to_ballot`, with `ballot`
+    /// being the new `ScpBallot` (not the composite nomination value). Mirrors
+    /// stellar-core `SCPDriver::startedBallotProtocol(uint64, SCPBallot const&)`
+    /// (`stellar-core/src/scp/SCPDriver.h:227-230`), invoked from
+    /// `BallotProtocol::bumpToBallot` (`BallotProtocol.cpp:469-474`), guarded on
+    /// `!mCurrentBallot`. Every production path that first-sets `current_ballot`
+    /// flows through `bump_to_ballot` — including recovery
+    /// (`set_state_from_envelope`) — so this fires for all of them. The catchup
+    /// helper `force_externalize` (no stellar-core analog) does not fire it.
+    fn started_ballot_protocol(&self, _slot_index: u64, _ballot: &ScpBallot) {}
 
     /// Called when the composite candidate value is updated during nomination.
     ///

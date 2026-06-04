@@ -47,8 +47,8 @@ use henyey_crypto::{PublicKey, SecretKey, Signature};
 use henyey_ledger::LedgerManager;
 use henyey_scp::{SCPDriver, SlotIndex, ValidationLevel};
 use stellar_xdr::curr::{
-    EnvelopeType, LedgerUpgrade, NodeId, ReadXdr, ScpEnvelope, ScpQuorumSet, ScpStatement,
-    StellarValue, StellarValueExt, Value, WriteXdr,
+    EnvelopeType, LedgerUpgrade, NodeId, ReadXdr, ScpBallot, ScpEnvelope, ScpQuorumSet,
+    ScpStatement, StellarValue, StellarValueExt, Value, WriteXdr,
 };
 
 use crate::error::HerderError;
@@ -3965,7 +3965,7 @@ impl SCPDriver for HerderScpCallback {
         self.driver.record_nomination_start(slot_index);
     }
 
-    fn started_ballot_protocol(&self, slot_index: u64, _value: &Value) {
+    fn started_ballot_protocol(&self, slot_index: u64, _ballot: &ScpBallot) {
         self.driver.record_ballot_start(slot_index);
     }
 

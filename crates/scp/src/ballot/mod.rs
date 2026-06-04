@@ -850,15 +850,24 @@ impl BallotProtocol {
     /// # Panics
     /// Panics if the envelope contains a non-ballot statement type (Nominate).
     /// Callers must route nomination envelopes to the nomination protocol.
-    pub(crate) fn set_state_from_envelope(&mut self, envelope: &ScpEnvelope) -> Result<(), String> {
+    pub(crate) fn set_state_from_envelope<D: SCPDriver>(
+        &mut self,
+        envelope: &ScpEnvelope,
+        ctx: &SlotContext<'_, D>,
+    ) -> Result<(), String> {
         if self.current_ballot.is_some() {
             return Err("Cannot set state after starting ballot protocol".into());
         }
 
+        // Recovery first-sets `current_ballot` through `bump_to_ballot` (BEFORE
+        // assigning `phase`), so the `started_ballot_protocol` callback fires for
+        // recovery-driven slots too. Matches stellar-core `setStateFromEnvelope`
+        // (BallotProtocol.cpp:1754/1778/1789), which calls `bumpToBallot` for all
+        // three pledge types before setting `mPhase`.
         match &envelope.statement.pledges {
             ScpStatementPledges::Prepare(prep) => {
                 let value = prep.ballot.value.clone();
-                self.current_ballot = Some(prep.ballot.clone());
+                self.bump_to_ballot(&prep.ballot, true, ctx);
                 self.prepared = prep.prepared.clone();
                 self.prepared_prime = prep.prepared_prime.clone();
                 if prep.n_c != 0 {
@@ -877,7 +886,7 @@ impl BallotProtocol {
             }
             ScpStatementPledges::Confirm(conf) => {
                 let value = conf.ballot.value.clone();
-                self.current_ballot = Some(conf.ballot.clone());
+                self.bump_to_ballot(&conf.ballot, true, ctx);
                 self.prepared = Some(ScpBallot {
                     counter: conf.n_prepared,
                     value: value.clone(),
@@ -900,10 +909,14 @@ impl BallotProtocol {
                     counter: ext.n_h,
                     value: value.clone(),
                 });
-                self.current_ballot = Some(ScpBallot {
-                    counter: u32::MAX,
-                    value: value.clone(),
-                });
+                self.bump_to_ballot(
+                    &ScpBallot {
+                        counter: u32::MAX,
+                        value: value.clone(),
+                    },
+                    true,
+                    ctx,
+                );
                 self.prepared = Some(ScpBallot {
                     counter: u32::MAX,
                     value: value.clone(),
@@ -963,7 +976,7 @@ impl BallotProtocol {
             value: effective_value,
         };
 
-        let updated = self.update_current_value(&ballot);
+        let updated = self.update_current_value(&ballot, ctx);
 
         if updated {
             self.emit_current_state(ctx);
@@ -1064,6 +1077,29 @@ mod tests {
                 slot_index: $slot,
             }
         };
+    }
+
+    /// Call `BallotProtocol::set_state_from_envelope` with a throwaway driver
+    /// and context, for the many recovery tests that don't assert on the
+    /// `started_ballot_protocol` callback (they only need the call to compile
+    /// after the driver/ctx parameter was added). Returns the `Result`.
+    macro_rules! ssfe {
+        ($bp:expr, $env:expr, $node:expr, $qs:expr) => {{
+            let __drv = Arc::new(MockDriver::with_quorum_set($qs.clone()));
+            let __ctx = ctx!($node, $qs, &__drv, 1);
+            $bp.set_state_from_envelope($env, &__ctx)
+        }};
+    }
+
+    /// Owned node/quorum-set/driver triple for the `bump_to_ballot` /
+    /// `update_current_value` unit tests that pre-seed `current_ballot` directly
+    /// and only need a valid `SlotContext` to satisfy the signature (they do not
+    /// assert on the `started_ballot_protocol` callback).
+    fn bare_ctx_parts() -> (NodeId, ScpQuorumSet, Arc<MockDriver>) {
+        let node = make_node_id(1);
+        let qs = make_quorum_set(vec![node.clone()], 1);
+        let driver = Arc::new(MockDriver::with_quorum_set(qs.clone()));
+        (node, qs, driver)
     }
 
     #[test]
@@ -2480,7 +2516,7 @@ mod tests {
             signature: stellar_xdr::curr::Signature(Vec::new().try_into().unwrap_or_default()),
         };
 
-        ballot.set_state_from_envelope(&envelope).unwrap();
+        ssfe!(ballot, &envelope, &node, &quorum_set).unwrap();
         assert_eq!(ballot.phase(), BallotPhase::Prepare);
         assert_eq!(ballot.current_ballot(), Some(&ballot_val));
         assert_eq!(ballot.prepared(), Some(&prepared));
@@ -2517,7 +2553,7 @@ mod tests {
             signature: stellar_xdr::curr::Signature(Vec::new().try_into().unwrap_or_default()),
         };
 
-        ballot.set_state_from_envelope(&envelope).unwrap();
+        ssfe!(ballot, &envelope, &node, &quorum_set).unwrap();
         assert_eq!(ballot.phase(), BallotPhase::Confirm);
         assert_eq!(ballot.current_ballot(), Some(&ballot_val));
         assert_eq!(ballot.prepared().map(|b| b.counter), Some(8));
@@ -2552,7 +2588,7 @@ mod tests {
             signature: stellar_xdr::curr::Signature(Vec::new().try_into().unwrap_or_default()),
         };
 
-        ballot.set_state_from_envelope(&envelope).unwrap();
+        ssfe!(ballot, &envelope, &node, &quorum_set).unwrap();
         assert_eq!(ballot.phase(), BallotPhase::Externalize);
         assert!(ballot.is_externalized());
         assert_eq!(ballot.commit(), Some(&commit));
@@ -2582,7 +2618,7 @@ mod tests {
             signature: stellar_xdr::curr::Signature(Vec::new().try_into().unwrap_or_default()),
         };
 
-        let _ = ballot.set_state_from_envelope(&envelope);
+        let _ = ssfe!(ballot, &envelope, &node, &quorum_set);
     }
 
     #[test]
@@ -2639,7 +2675,7 @@ mod tests {
             statement,
             signature: stellar_xdr::curr::Signature(Vec::new().try_into().unwrap_or_default()),
         };
-        ballot.set_state_from_envelope(&envelope).unwrap();
+        ssfe!(ballot, &envelope, &node, &quorum_set).unwrap();
 
         // Cannot bump when externalized
         assert!(!ballot.bump_state(&ctx!(&node, &quorum_set, &driver, 1), value.clone(), 10));
@@ -2923,7 +2959,7 @@ mod tests {
             ScpBallot { counter: 5, value },
         );
 
-        let result = bp.set_state_from_envelope(&envelope);
+        let result = ssfe!(bp, &envelope, &node, &quorum_set);
         assert!(result.is_err(), "Should reject when current_ballot is set");
 
         // All state unchanged
@@ -2963,7 +2999,7 @@ mod tests {
                 n_c: 2,
             },
         );
-        bp.set_state_from_envelope(&envelope).unwrap();
+        ssfe!(bp, &envelope, &node, &quorum_set).unwrap();
         assert!(
             bp.check_invariants().is_ok(),
             "PREPARE state should be valid"
@@ -2990,7 +3026,7 @@ mod tests {
             statement,
             signature: stellar_xdr::curr::Signature(Vec::new().try_into().unwrap_or_default()),
         };
-        bp.set_state_from_envelope(&envelope).unwrap();
+        ssfe!(bp, &envelope, &node, &quorum_set).unwrap();
         assert!(
             bp.check_invariants().is_ok(),
             "CONFIRM state should be valid"
@@ -3015,7 +3051,7 @@ mod tests {
             statement,
             signature: stellar_xdr::curr::Signature(Vec::new().try_into().unwrap_or_default()),
         };
-        bp.set_state_from_envelope(&envelope).unwrap();
+        ssfe!(bp, &envelope, &node, &quorum_set).unwrap();
         assert!(
             bp.check_invariants().is_ok(),
             "EXTERNALIZE state should be valid"
@@ -3295,6 +3331,8 @@ mod tests {
     #[test]
     fn test_bump_to_ballot_resets_incompatible_high_commit() {
         let mut bp = BallotProtocol::new();
+        let (node, qs, driver) = bare_ctx_parts();
+        let ctx = ctx!(&node, &qs, &driver, 1);
         let value_a = make_value(&[1]);
         let value_b = make_value(&[2]);
 
@@ -3317,7 +3355,7 @@ mod tests {
             counter: 2,
             value: value_b.clone(),
         };
-        assert!(bp.bump_to_ballot(&new_ballot, false));
+        assert!(bp.bump_to_ballot(&new_ballot, false, &ctx));
 
         // h and c should be cleared because value_b != value_a
         assert!(
@@ -3335,6 +3373,8 @@ mod tests {
     #[test]
     fn test_bump_to_ballot_preserves_compatible_high_commit() {
         let mut bp = BallotProtocol::new();
+        let (node, qs, driver) = bare_ctx_parts();
+        let ctx = ctx!(&node, &qs, &driver, 1);
         let value_a = make_value(&[1]);
 
         // Set up state with high and commit
@@ -3356,7 +3396,7 @@ mod tests {
             counter: 2,
             value: value_a.clone(),
         };
-        assert!(bp.bump_to_ballot(&new_ballot, false));
+        assert!(bp.bump_to_ballot(&new_ballot, false, &ctx));
 
         // h and c should be preserved because same value
         assert!(
@@ -3373,6 +3413,8 @@ mod tests {
     #[test]
     fn test_bump_to_ballot_heard_from_quorum_counter_change() {
         let mut bp = BallotProtocol::new();
+        let (node, qs, driver) = bare_ctx_parts();
+        let ctx = ctx!(&node, &qs, &driver, 1);
         let value_a = make_value(&[1]);
 
         // Set initial ballot and heard_from_quorum
@@ -3387,7 +3429,7 @@ mod tests {
             counter: 1,
             value: make_value(&[2]),
         };
-        bp.bump_to_ballot(&same_counter_ballot, false);
+        bp.bump_to_ballot(&same_counter_ballot, false, &ctx);
         assert!(
             bp.heard_from_quorum,
             "heard_from_quorum should not reset when counter stays the same"
@@ -3398,7 +3440,7 @@ mod tests {
             counter: 2,
             value: make_value(&[2]),
         };
-        bp.bump_to_ballot(&new_counter_ballot, false);
+        bp.bump_to_ballot(&new_counter_ballot, false, &ctx);
         assert!(
             !bp.heard_from_quorum,
             "heard_from_quorum should reset when counter changes"
@@ -3782,6 +3824,8 @@ mod tests {
     #[test]
     fn test_update_current_value_rejects_externalize_phase() {
         let mut bp = BallotProtocol::new();
+        let (node, qs, driver) = bare_ctx_parts();
+        let ctx = ctx!(&node, &qs, &driver, 1);
         let value = make_value(&[1]);
 
         bp.phase = BallotPhase::Externalize;
@@ -3792,7 +3836,7 @@ mod tests {
         };
 
         assert!(
-            !bp.update_current_value(&ballot),
+            !bp.update_current_value(&ballot, &ctx),
             "update_current_value should reject in Externalize phase"
         );
     }
@@ -3801,6 +3845,8 @@ mod tests {
     #[test]
     fn test_update_current_value_rejects_commit_incompatible() {
         let mut bp = BallotProtocol::new();
+        let (node, qs, driver) = bare_ctx_parts();
+        let ctx = ctx!(&node, &qs, &driver, 1);
         let value_a = make_value(&[1]);
         let value_b = make_value(&[2]);
 
@@ -3819,7 +3865,7 @@ mod tests {
         };
 
         assert!(
-            !bp.update_current_value(&incompatible_ballot),
+            !bp.update_current_value(&incompatible_ballot, &ctx),
             "update_current_value should reject ballot incompatible with commit"
         );
     }
@@ -3889,7 +3935,7 @@ mod tests {
             },
         );
 
-        bp.set_state_from_envelope(&envelope).unwrap();
+        ssfe!(bp, &envelope, &node, &quorum_set).unwrap();
         assert_eq!(
             bp.last_envelope_emit.as_ref(),
             Some(&envelope),
@@ -3922,7 +3968,7 @@ mod tests {
             9,
         );
 
-        bp.set_state_from_envelope(&envelope).unwrap();
+        ssfe!(bp, &envelope, &node, &quorum_set).unwrap();
         assert_eq!(
             bp.last_envelope_emit.as_ref(),
             Some(&envelope),
@@ -3948,7 +3994,7 @@ mod tests {
             5,
         );
 
-        bp.set_state_from_envelope(&envelope).unwrap();
+        ssfe!(bp, &envelope, &node, &quorum_set).unwrap();
         assert_eq!(
             bp.last_envelope_emit.as_ref(),
             Some(&envelope),
@@ -3965,7 +4011,7 @@ mod tests {
 
         let envelope = make_nomination_envelope(node.clone(), 4, &quorum_set);
 
-        let _ = bp.set_state_from_envelope(&envelope);
+        let _ = ssfe!(bp, &envelope, &node, &quorum_set);
     }
 
     #[test]
@@ -3986,7 +4032,7 @@ mod tests {
             ScpBallot { counter: 1, value },
         );
 
-        bp.set_state_from_envelope(&envelope).unwrap();
+        ssfe!(bp, &envelope, &node, &quorum_set).unwrap();
 
         let emit_before = driver.emit_count.load(Ordering::SeqCst);
         bp.send_latest_envelope(&driver);
@@ -4710,10 +4756,13 @@ mod tests {
 
         // Bump to set current_ballot (counter=1, value=[42])
         let ctx = ctx!(&node, &qs, &driver, 1);
-        ballot.update_current_value(&ScpBallot {
-            counter: 1,
-            value: value.clone(),
-        });
+        ballot.update_current_value(
+            &ScpBallot {
+                counter: 1,
+                value: value.clone(),
+            },
+            &ctx,
+        );
 
         // Now emit — validation should reject
         ballot.emit_current_state(&ctx);
@@ -4756,10 +4805,13 @@ mod tests {
         let value = make_value(&[42]);
 
         let ctx = ctx!(&node, &qs, &driver, 1);
-        ballot.update_current_value(&ScpBallot {
-            counter: 1,
-            value: value.clone(),
-        });
+        ballot.update_current_value(
+            &ScpBallot {
+                counter: 1,
+                value: value.clone(),
+            },
+            &ctx,
+        );
 
         ballot.emit_current_state(&ctx);
 
@@ -4803,10 +4855,13 @@ mod tests {
         let value = make_value(&[42]);
 
         let ctx = ctx!(&node, &qs, &driver, 1);
-        ballot.update_current_value(&ScpBallot {
-            counter: 1,
-            value: value.clone(),
-        });
+        ballot.update_current_value(
+            &ScpBallot {
+                counter: 1,
+                value: value.clone(),
+            },
+            &ctx,
+        );
 
         ballot.emit_current_state(&ctx);
 
@@ -4846,10 +4901,13 @@ mod tests {
         let value = make_value(&[42]);
 
         let ctx = ctx!(&node, &qs, &driver, 1);
-        ballot.update_current_value(&ScpBallot {
-            counter: 1,
-            value: value.clone(),
-        });
+        ballot.update_current_value(
+            &ScpBallot {
+                counter: 1,
+                value: value.clone(),
+            },
+            &ctx,
+        );
 
         ballot.emit_current_state(&ctx);
 
@@ -5288,6 +5346,8 @@ mod tests {
         let value_a: Value = vec![1u8, 0].try_into().unwrap();
 
         let mut bp = BallotProtocol::new();
+        let (node, qs, driver) = bare_ctx_parts();
+        let ctx = ctx!(&node, &qs, &driver, 1);
         // Force a structurally-invalid CONFIRM state: current_ballot is set but
         // prepared/commit/high_ballot are all None. INV-S8 requires all four
         // fields in CONFIRM, so check_invariants() returns Err. current_ballot
@@ -5308,7 +5368,7 @@ mod tests {
         };
 
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            bp.update_current_value(&ballot)
+            bp.update_current_value(&ballot, &ctx)
         }));
 
         if cfg!(debug_assertions) {
@@ -5372,5 +5432,141 @@ mod tests {
                 "release builds must NOT panic — matches stellar-core dbgAssert under NDEBUG"
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // SCP §9.10-1 regression tests (issue #3089): started_ballot_protocol must
+    // fire from bump_to_ballot on the current_ballot null→set transition, with
+    // the actual ScpBallot, including the recovery path.
+    // -----------------------------------------------------------------------
+
+    /// Regression for #3089: restoring ballot state via `set_state_from_envelope`
+    /// (crash recovery) must fire `started_ballot_protocol` exactly once with a
+    /// ballot equal to the envelope's PREPARE ballot.
+    ///
+    /// FAILS on origin/main: recovery assigned `current_ballot` directly,
+    /// bypassing `bump_to_ballot`, so the callback fired 0 times.
+    #[test]
+    fn test_set_state_from_envelope_fires_started_ballot_protocol_prepare() {
+        let node = make_node_id(1);
+        let quorum_set = make_quorum_set(vec![node.clone()], 1);
+        let driver = Arc::new(MockDriver::with_quorum_set(quorum_set.clone()));
+        let mut bp = BallotProtocol::new();
+
+        let ballot_val = ScpBallot {
+            counter: 5,
+            value: make_value(&[1, 2, 3]),
+        };
+        let envelope = make_prepare_envelope(node.clone(), 7, &quorum_set, ballot_val.clone());
+
+        let ctx = ctx!(&node, &quorum_set, &driver, 7);
+        bp.set_state_from_envelope(&envelope, &ctx).unwrap();
+
+        let starts = driver.ballot_starts.lock().unwrap();
+        assert_eq!(
+            starts.len(),
+            1,
+            "recovery must fire started_ballot_protocol exactly once"
+        );
+        assert_eq!(
+            starts[0], ballot_val,
+            "started_ballot_protocol must receive the envelope's ballot"
+        );
+    }
+
+    /// Regression for #3089 (CONFIRM recovery variant).
+    #[test]
+    fn test_set_state_from_envelope_fires_started_ballot_protocol_confirm() {
+        let node = make_node_id(1);
+        let quorum_set = make_quorum_set(vec![node.clone()], 1);
+        let driver = Arc::new(MockDriver::with_quorum_set(quorum_set.clone()));
+        let mut bp = BallotProtocol::new();
+
+        let ballot_val = ScpBallot {
+            counter: 10,
+            value: make_value(&[4, 5, 6]),
+        };
+        let envelope = make_confirm_envelope_with_counters(
+            node.clone(),
+            7,
+            &quorum_set,
+            ballot_val.clone(),
+            8,
+            5,
+            9,
+        );
+
+        let ctx = ctx!(&node, &quorum_set, &driver, 7);
+        bp.set_state_from_envelope(&envelope, &ctx).unwrap();
+
+        let starts = driver.ballot_starts.lock().unwrap();
+        assert_eq!(starts.len(), 1);
+        assert_eq!(starts[0], ballot_val);
+    }
+
+    /// Regression for #3089 (EXTERNALIZE recovery variant): the fired ballot has
+    /// counter `u32::MAX` and the externalized value, matching the recovered
+    /// `current_ballot`.
+    #[test]
+    fn test_set_state_from_envelope_fires_started_ballot_protocol_externalize() {
+        let node = make_node_id(1);
+        let quorum_set = make_quorum_set(vec![node.clone()], 1);
+        let driver = Arc::new(MockDriver::with_quorum_set(quorum_set.clone()));
+        let mut bp = BallotProtocol::new();
+
+        let value = make_value(&[7, 8, 9]);
+        let commit = ScpBallot {
+            counter: 3,
+            value: value.clone(),
+        };
+        let envelope = make_externalize_envelope(node.clone(), 7, &quorum_set, commit, 5);
+
+        let ctx = ctx!(&node, &quorum_set, &driver, 7);
+        bp.set_state_from_envelope(&envelope, &ctx).unwrap();
+
+        let starts = driver.ballot_starts.lock().unwrap();
+        assert_eq!(starts.len(), 1);
+        assert_eq!(
+            starts[0],
+            ScpBallot {
+                counter: u32::MAX,
+                value,
+            }
+        );
+    }
+
+    /// Regression for #3089: `started_ballot_protocol` fires at most once per
+    /// slot even when the ballot counter is later bumped in-phase. The null→set
+    /// transition happens exactly once, so the recorder length stays 1.
+    #[test]
+    fn test_started_ballot_protocol_fires_once() {
+        let node = make_node_id(1);
+        let quorum_set = make_quorum_set(vec![node.clone()], 1);
+        let driver = Arc::new(MockDriver::with_quorum_set(quorum_set.clone()));
+        let mut bp = BallotProtocol::new();
+
+        let value = make_value(&[1, 2, 3]);
+
+        // First bump: current_ballot null→set, fires with counter 1.
+        assert!(bp.bump(&ctx!(&node, &quorum_set, &driver, 1), value.clone(), false));
+        assert_eq!(bp.current_ballot().map(|b| b.counter), Some(1));
+
+        // Further in-protocol bumps re-enter bump_to_ballot with current_ballot
+        // already set, so the null→set arm — and the fire — never triggers again.
+        // (The bump itself may be a no-op if the solo validator already
+        // externalized; what matters is that no second fire is recorded.)
+        let _ = bp.bump(&ctx!(&node, &quorum_set, &driver, 1), value.clone(), true);
+
+        let starts = driver.ballot_starts.lock().unwrap();
+        assert_eq!(
+            starts.len(),
+            1,
+            "started_ballot_protocol must fire exactly once per slot"
+        );
+        assert_eq!(
+            starts[0],
+            ScpBallot { counter: 1, value },
+            "the single fire carries the first ballot (counter 1, composite value)"
+        );
     }
 }
