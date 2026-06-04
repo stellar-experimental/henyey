@@ -464,11 +464,19 @@ impl AuthContext {
     /// malformed, too old, or too new; `NetworkMismatch` if the network IDs
     /// differ.
     pub fn validate_hello_post_send(&self, hello: &Hello) -> Result<()> {
-        // Check overlay version range compatibility (matching stellar-core Peer::recvHello)
-        // Three conditions that cause version rejection:
-        // 1. Peer's range is malformed (min > max)
-        // 2. Peer's max version is below our minimum (peer too old)
-        // 3. Peer's min version is above our maximum (peer too new)
+        // Auth-level phase-2 checks, version before network (matching the
+        // stellar-core ordering). The peer-level self-connection check is
+        // interposed between these two by the responder caller (peer.rs).
+        self.validate_overlay_version(hello)?;
+        self.validate_network_id(hello)
+    }
+
+    /// Overlay-version range check (auth-level phase-2).
+    ///
+    /// Returns `VersionMismatch` if the peer's advertised overlay version range
+    /// is malformed (min > max), too old (max below our minimum), or too new
+    /// (min above our maximum). Matches stellar-core `Peer::recvHello`.
+    pub fn validate_overlay_version(&self, hello: &Hello) -> Result<()> {
         if hello.overlay_min_version > hello.overlay_version {
             return Err(OverlayError::VersionMismatch(format!(
                 "peer overlay version range malformed: min {} > max {}",
@@ -487,13 +495,17 @@ impl AuthContext {
                 hello.overlay_min_version, self.local_node.overlay_version
             )));
         }
+        Ok(())
+    }
 
-        // Check network ID
+    /// Network-ID check (auth-level phase-2).
+    ///
+    /// Returns `NetworkMismatch` if the peer is on a different network.
+    pub fn validate_network_id(&self, hello: &Hello) -> Result<()> {
         let network_id_bytes = hello.network_id.0;
         if network_id_bytes != *self.local_node.network_id.as_bytes() {
             return Err(OverlayError::NetworkMismatch);
         }
-
         Ok(())
     }
 

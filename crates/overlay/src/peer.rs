@@ -343,8 +343,16 @@ impl Peer {
 
         if self.connection.we_called_remote() {
             // --- Initiator (outbound): Send HELLO first, then receive ---
+            // The initiator already sent its HELLO, so it runs both phases of
+            // HELLO processing back-to-back: recv_hello (phase-1) then phase-2
+            // (version → self → network → port). On a phase-2 failure it sends
+            // ERR_CONF then drops — observably identical to the prior behavior.
             self.send_hello().await?;
-            self.recv_hello(auth_timeout_secs).await?;
+            let peer_hello = self.recv_hello(auth_timeout_secs).await?;
+            if let Err(e) = self.validate_hello_phase2(&peer_hello) {
+                self.try_send_err_conf(&e).await;
+                return Err(e);
+            }
 
             // Reserve pending peer_id after learning remote identity.
             // Matches stellar-core Peer::recvHello() duplicate check.
@@ -384,7 +392,12 @@ impl Peer {
             }
         } else {
             // --- Responder (inbound): Receive HELLO first, then reply ---
-            self.recv_hello(auth_timeout_secs).await?;
+            // OVERLAY §4.4.2-6: HELLO must be echoed BEFORE the
+            // overlay-version / self-connection / network-ID / port checks, so
+            // the remote (still awaiting an unauthenticated HELLO) can decode
+            // the subsequent seq-0 / zero-MAC ERROR_MSG. recv_hello runs only
+            // phase-1 here (cert + keys + state); phase-2 runs after send_hello.
+            let peer_hello = self.recv_hello(auth_timeout_secs).await?;
 
             // Check ban status immediately after learning peer identity,
             // before sending any response. Mirrors stellar-core's
@@ -440,8 +453,17 @@ impl Peer {
             // Remaining handshake steps after peer_id reservation.
             // If any step fails, clean up the pending peer_id reservation
             // only if we own it.
+            //
+            // Ordering (OVERLAY §4.4.2-6): send_hello FIRST, then phase-2
+            // validation. On a phase-2 failure we send an (unauthenticated)
+            // ERR_CONF and drop — but the HELLO was already on the wire, so the
+            // remote can decode the ERROR_MSG.
             let result: Result<()> = async {
                 self.send_hello().await?;
+                if let Err(e) = self.validate_hello_phase2(&peer_hello) {
+                    self.try_send_err_conf(&e).await;
+                    return Err(e);
+                }
                 self.recv_auth(auth_timeout_secs).await?;
                 self.send_auth_msg().await?;
                 Ok(())
@@ -502,8 +524,17 @@ impl Peer {
         Ok(())
     }
 
-    /// Receive and process the peer's HELLO message.
-    async fn recv_hello(&mut self, timeout_secs: u64) -> Result<()> {
+    /// Receive the peer's HELLO message and run phase-1 processing.
+    ///
+    /// Phase-1 = AuthCert verification + X25519 key derivation + the
+    /// `HelloReceived` state transition (and peer-identity bookkeeping). It does
+    /// NOT run the overlay-version / self-connection / network-ID / port checks —
+    /// those are phase-2 ([`validate_hello_phase2`]). On the responder path the
+    /// caller echoes its own HELLO between phase-1 and phase-2 so that HELLO
+    /// always precedes any ERROR_MSG (OVERLAY §4.4.2-6).
+    ///
+    /// Returns the received `Hello` so the caller can run phase-2 against it.
+    async fn recv_hello(&mut self, timeout_secs: u64) -> Result<Hello> {
         let start = Instant::now();
         let result = self.recv_hello_inner(timeout_secs).await;
 
@@ -518,7 +549,7 @@ impl Peer {
         result
     }
 
-    async fn recv_hello_inner(&mut self, timeout_secs: u64) -> Result<()> {
+    async fn recv_hello_inner(&mut self, timeout_secs: u64) -> Result<Hello> {
         let frame = self
             .connection
             .recv_timeout(timeout_secs)
@@ -532,22 +563,19 @@ impl Peer {
 
         match message {
             StellarMessage::Hello(peer_hello) => {
-                if let Err(e) = self.process_hello(peer_hello) {
+                if let Err(e) = self.process_hello_phase1(&peer_hello) {
                     // Best-effort ERR_CONF before dropping, matching
                     // stellar-core Peer::recvHello() → sendErrorAndDrop().
                     self.try_send_err_conf(&e).await;
                     return Err(e);
                 }
+                Ok(peer_hello)
             }
-            other => {
-                return Err(OverlayError::InvalidMessage(format!(
-                    "expected Hello, got {}",
-                    helpers::message_type_name(&other)
-                )));
-            }
+            other => Err(OverlayError::InvalidMessage(format!(
+                "expected Hello, got {}",
+                helpers::message_type_name(&other)
+            ))),
         }
-
-        Ok(())
     }
 
     /// Best-effort send of ERR_CONF for HELLO failures.
@@ -641,7 +669,17 @@ impl Peer {
 
         Ok(())
     }
-    fn process_hello(&mut self, hello: Hello) -> Result<()> {
+    /// Phase-1 of peer-level HELLO processing.
+    ///
+    /// Verifies the AuthCert, derives MAC keys, transitions the auth state to
+    /// `HelloReceived` (via [`AuthContext::process_hello_phase1`]), and records
+    /// the peer identity / advertised versions on `self.info` so the post-HELLO
+    /// ban check has the peer id available.
+    ///
+    /// Deliberately does NOT run the overlay-version / self-connection /
+    /// network-ID / port checks — those are deferred to [`validate_hello_phase2`]
+    /// so the responder can echo its HELLO first (OVERLAY §4.4.2-6).
+    fn process_hello_phase1(&mut self, hello: &Hello) -> Result<()> {
         // State guard: reject if not in Handshaking state
         if self.state != PeerState::Handshaking {
             return Err(OverlayError::InvalidMessage(format!(
@@ -650,18 +688,8 @@ impl Peer {
             )));
         }
 
-        // Port validation: XDR uses i32, but valid ports are 1-65535.
-        // Reject port 0 — matches stellar-core Peer::recvHello() which rejects
-        // listeningPort <= 0 to prevent poisoning peer gossip with ephemeral ports.
-        if hello.listening_port <= 0 || hello.listening_port > u16::MAX as i32 {
-            return Err(OverlayError::InvalidMessage(format!(
-                "invalid listening port: {}",
-                hello.listening_port
-            )));
-        }
-
-        // Let auth context process it (network ID, version, cert checks)
-        self.auth.process_hello(&hello)?;
+        // AuthCert verify + X25519 key derivation + HelloReceived state.
+        self.auth.process_hello_phase1(hello)?;
 
         // Extract peer info
         let peer_id = self
@@ -670,30 +698,60 @@ impl Peer {
             .cloned()
             .ok_or_else(|| OverlayError::AuthenticationFailed("no peer ID".to_string()))?;
 
-        // Self-connection check: reject if peer is ourselves
-        let local_peer_id = self.auth.local_peer_id();
-        if peer_id == local_peer_id {
-            return Err(OverlayError::InvalidMessage(
-                "received Hello from self".to_string(),
-            ));
-        }
-
-        let version_string: String = hello.version_str.to_string();
-
         self.info.peer_id = peer_id;
-        self.info.version_string = version_string;
+        self.info.version_string = hello.version_str.to_string();
         self.info.overlay_version = hello.overlay_version;
         self.info.ledger_version = hello.ledger_version;
-        if hello.listening_port > 0 {
-            let port = hello.listening_port as u16;
-            let ip = self.info.address.ip();
-            self.info.address = SocketAddr::new(ip, port);
-        }
 
         debug!(
             "Received Hello from {} (version: {}, overlay: {})",
             self.info.peer_id, self.info.version_string, self.info.overlay_version
         );
+
+        Ok(())
+    }
+
+    /// Phase-2 of peer-level HELLO processing — the validation checks that, on
+    /// the responder path, run AFTER the local HELLO has been echoed.
+    ///
+    /// Check order matches stellar-core `Peer::recvHello`: overlay version →
+    /// self-connection → network ID → listening port. On the first failure the
+    /// caller emits an (unauthenticated) ERR_CONF and drops the connection.
+    fn validate_hello_phase2(&mut self, hello: &Hello) -> Result<()> {
+        // 1. Overlay-version range + network-ID checks (auth-level).
+        //    Note: validate_hello_post_send checks version BEFORE network, so
+        //    the version error takes precedence — matching stellar-core order.
+        //    The network check is the last of the auth-level checks; the
+        //    self-connection check (peer-level) is interposed between them
+        //    below to mirror stellar-core's version → self → network ordering.
+        self.auth.validate_overlay_version(hello)?;
+
+        // 2. Self-connection check: reject if peer is ourselves.
+        let local_peer_id = self.auth.local_peer_id();
+        if self.info.peer_id == local_peer_id {
+            return Err(OverlayError::InvalidMessage(
+                "received Hello from self".to_string(),
+            ));
+        }
+
+        // 3. Network-ID check (auth-level).
+        self.auth.validate_network_id(hello)?;
+
+        // 4. Listening-port validation: XDR uses i32, but valid ports are
+        //    1-65535. Reject port 0 — matches stellar-core Peer::recvHello()
+        //    which rejects listeningPort <= 0 to prevent poisoning peer gossip
+        //    with ephemeral ports.
+        if hello.listening_port <= 0 || hello.listening_port > u16::MAX as i32 {
+            return Err(OverlayError::InvalidMessage(format!(
+                "invalid listening port: {}",
+                hello.listening_port
+            )));
+        }
+
+        // All checks passed — record the peer's advertised listening port.
+        let port = hello.listening_port as u16;
+        let ip = self.info.address.ip();
+        self.info.address = SocketAddr::new(ip, port);
 
         Ok(())
     }
