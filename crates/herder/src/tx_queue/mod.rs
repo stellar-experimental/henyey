@@ -129,7 +129,7 @@ const EXPECTED_CLOSE_TIME_MULT: u64 = 2;
 ///
 /// Parity: stellar-core `Config::TRANSACTION_QUEUE_SIZE_MULTIPLIER`
 /// (`src/main/Config.cpp:205`, default `2`) and HERDER_SPEC §12.6. This is
-/// distinct from the pending depth (`DEFAULT_PENDING_DEPTH = 4`); the multiplier
+/// distinct from the pending depth (`TRANSACTION_QUEUE_TIMEOUT_LEDGERS = 4`); the multiplier
 /// scales the resource-based pool capacity, not the number of ledgers a tx may
 /// remain pending.
 pub const TRANSACTION_QUEUE_SIZE_MULTIPLIER: u32 = 2;
@@ -638,7 +638,9 @@ const FEE_MULTIPLIER: u64 = 10;
 
 /// Default pending depth (number of ledgers before auto-ban).
 /// Spec: HERDER_SPEC §17 — TRANSACTION_QUEUE_TIMEOUT_LEDGERS = 4.
-const DEFAULT_PENDING_DEPTH: u32 = 4;
+/// Parity: stellar-core `HerderImpl.cpp:65` —
+/// `constexpr uint32 const TRANSACTION_QUEUE_TIMEOUT_LEDGERS = 4;`.
+const TRANSACTION_QUEUE_TIMEOUT_LEDGERS: u32 = 4;
 
 pub(super) fn envelope_fee_per_op(envelope: &TransactionEnvelope) -> Option<(u64, FeeRate)> {
     QueuedTransaction::extract_fees_and_ops(envelope)
@@ -1322,17 +1324,24 @@ pub struct TransactionQueue {
 }
 
 /// Default ban depth (number of ledgers transactions stay banned).
-const DEFAULT_BAN_DEPTH: u32 = 10;
+/// Spec: HERDER_SPEC §11.7 — TRANSACTION_QUEUE_BAN_LEDGERS = 10.
+/// Parity: stellar-core `HerderImpl.cpp:66` —
+/// `constexpr uint32 const TRANSACTION_QUEUE_BAN_LEDGERS = 10;`.
+const TRANSACTION_QUEUE_BAN_LEDGERS: u32 = 10;
 
 impl TransactionQueue {
     /// Create a new transaction queue.
     pub fn new(config: TxQueueConfig) -> Self {
-        Self::with_depths(config, DEFAULT_BAN_DEPTH, DEFAULT_PENDING_DEPTH)
+        Self::with_depths(
+            config,
+            TRANSACTION_QUEUE_BAN_LEDGERS,
+            TRANSACTION_QUEUE_TIMEOUT_LEDGERS,
+        )
     }
 
     /// Create a new transaction queue with custom ban depth.
     pub fn with_ban_depth(config: TxQueueConfig, ban_depth: u32) -> Self {
-        Self::with_depths(config, ban_depth, DEFAULT_PENDING_DEPTH)
+        Self::with_depths(config, ban_depth, TRANSACTION_QUEUE_TIMEOUT_LEDGERS)
     }
 
     /// Create a new transaction queue with custom ban and pending depths.
@@ -8452,12 +8461,21 @@ mod pending_depth_tests {
     }
 
     // =========================================================================
-    // DEFAULT_PENDING_DEPTH auto-ban tests
+    // TRANSACTION_QUEUE_TIMEOUT_LEDGERS auto-ban tests
     // =========================================================================
 
     #[test]
     fn test_default_pending_depth_is_4() {
-        assert_eq!(DEFAULT_PENDING_DEPTH, 4);
+        assert_eq!(TRANSACTION_QUEUE_TIMEOUT_LEDGERS, 4);
+    }
+
+    /// Parity pin: both depth constants must match stellar-core
+    /// `HerderImpl.cpp:65-66` exactly. A change here is a deliberate
+    /// protocol-parity decision, not an incidental edit.
+    #[test]
+    fn test_transaction_queue_depth_constants_parity() {
+        assert_eq!(TRANSACTION_QUEUE_BAN_LEDGERS, 10);
+        assert_eq!(TRANSACTION_QUEUE_TIMEOUT_LEDGERS, 4);
     }
 
     #[test]
