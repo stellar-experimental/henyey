@@ -1697,17 +1697,12 @@ impl App {
     /// Returns `None` if no trimming should occur (last_buffered <= 1 and is a
     /// checkpoint start). Otherwise returns `Some(trim_before)` — entries below
     /// this value should be removed.
+    ///
+    /// Delegates to the spec §7.4 pure boundary logic in
+    /// `henyey_history::ledger_apply_manager` (parity:
+    /// `LedgerApplyManagerImpl::trimSyncingLedgers`).
     pub(super) fn trim_boundary_for_last_buffered(last_buffered: u32) -> Option<u32> {
-        if is_checkpoint_start(last_buffered) {
-            if last_buffered <= 1 {
-                None
-            } else {
-                let prev = last_buffered - 1;
-                Some(checkpoint_start(prev))
-            }
-        } else {
-            Some(checkpoint_start(last_buffered))
-        }
+        henyey_history::trim_boundary_for_last_buffered(last_buffered)
     }
 
     /// Ensure a slot is in the syncing_ledgers buffer with the best
@@ -1883,6 +1878,23 @@ impl App {
 
         let current_ledger = self.get_current_ledger().await.ok()?;
         let next_seq = current_ledger.saturating_add(1);
+
+        // CATCHUP_SPEC §7.3 sequential-apply drift stop-condition
+        // (parity: LedgerApplyManagerImpl.cpp:516). If the next ledger to apply
+        // is too far ahead of the last-closed ledger, stop scheduling and let
+        // the node gracefully fall into catchup. Henyey applies inline, so
+        // `next_seq == current_ledger + 1` always and this gate is
+        // faithful-but-dormant — exactly as in stellar-core, where it only
+        // fires under parallel-close queue depth. `next_seq` is the
+        // `nextToApply` (= last-queued + 1) that core compares against `lcl`.
+        if henyey_history::apply_drift_exceeded(next_seq, current_ledger) {
+            tracing::info!(
+                next_to_apply = next_seq,
+                lcl = current_ledger,
+                "Next ledger to apply is too far ahead of LCL; waiting (drift gate)"
+            );
+            return None;
+        }
 
         let close_info = {
             let mut buffer =

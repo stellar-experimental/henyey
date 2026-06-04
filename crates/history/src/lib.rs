@@ -106,6 +106,7 @@ pub mod paths;
 pub mod catchup;
 pub mod catchup_range;
 pub mod checkpoint;
+pub mod ledger_apply_manager;
 pub mod replay;
 pub mod verify;
 
@@ -160,6 +161,11 @@ pub use checkpoint_builder::write_record_marked_xdr;
 pub use compare::{compare_checkpoint, Category, CheckpointComparison, Mismatch};
 pub use download::DownloadConfig;
 pub use error::{HistoryError, TxSetHashMismatchInfo, VerifyHashKind, VerifyHashMismatchInfo};
+pub use ledger_apply_manager::{
+    apply_drift_exceeded, classify_process_ledger, max_buffer_invariant_entries,
+    trim_boundary_for_last_buffered, trim_syncing_buffer, ProcessLedgerDecision,
+    MAX_EXTERNALIZE_LEDGER_APPLY_DRIFT,
+};
 pub use paths::{
     bucket_path, checkpoint_path, checkpoint_path_dirty, dirty_to_final_path, final_to_dirty_path,
     is_dirty_path,
