@@ -1063,11 +1063,24 @@ fn extract_metadata(entries: &[BucketEntry]) -> Option<BucketMetadata> {
 ///   Matches stellar-core's `LiveBucket::mergeInMemory` (`LiveBucket.cpp:569`).
 ///   Used for level-0 merges.
 ///
-/// NOTE (BUCKETLISTDB_SPEC §6.1 / §7.2 / INV-B4): stellar-core also includes
-/// shadow bucket versions in the max calculation. Since shadow filtering was
-/// removed in protocol 12, and henyey only supports protocol 24+, shadow
-/// versions are never present and can be safely ignored here. Textually
-/// divergent from spec but correct under P24+ scope.
+/// NOTE (BUCKETLISTDB_SPEC §6.1 / §7.2 / INV-B4): stellar-core's
+/// `calculateMergeProtocolVersion()` takes the max over the new, old, AND
+/// shadow bucket versions. The shadow contribution is gated behind the spec
+/// §6.1 guard `if s.metadata.ledgerVersion < FIRST_PROTOCOL_SHADOWS_REMOVED`
+/// (stellar-core `BucketBase.cpp`), where `FIRST_PROTOCOL_SHADOWS_REMOVED`
+/// is protocol 12 — i.e. shadows are only ever populated, and thus only ever
+/// contribute to the max, for buckets produced under protocol < 12.
+///
+/// henyey supports protocol 24+ only (see CLAUDE.md), so the shadow list is
+/// always empty and the guard `ledgerVersion < 12` can never be true. The
+/// shadow term in the max() is therefore unreachable dead code under
+/// henyey's scope and is omitted entirely rather than written as an
+/// always-false loop. Computing the max over only `old_meta`/`new_meta`
+/// below produces output byte-identical to stellar-core for every input
+/// henyey can ever construct — this is a documentation-only divergence from
+/// the spec's literal text, with zero behavioral difference. If pre-protocol-12
+/// support is ever reintroduced, the shadow versions must be folded back into
+/// the max() here per spec §6.1.
 fn build_output_metadata(
     old_meta: Option<&BucketMetadata>,
     new_meta: Option<&BucketMetadata>,
