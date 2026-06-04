@@ -1231,6 +1231,27 @@ impl OverlayManager {
         true
     }
 
+    /// Send an `ERROR_MSG` to a peer and then drop the connection.
+    ///
+    /// Thin public wrapper over [`peer_loop::send_error_and_drop`] (the
+    /// FIFO `Send(ErrorMsg)` → `ShutdownAfterError` flush-then-close path).
+    /// Returns `false` if the peer is unknown or its outbound channel is full
+    /// (non-blocking, like [`Self::try_send_to`]/[`Self::disconnect`]).
+    ///
+    /// Matches stellar-core `Peer::sendErrorAndDrop` (Peer.cpp:722-729),
+    /// reached e.g. from `SurveyManager::dropPeerIfSigInvalid`.
+    pub fn send_error_and_drop(
+        &self,
+        peer_id: &PeerId,
+        code: stellar_xdr::curr::ErrorCode,
+        message: &str,
+    ) -> bool {
+        let Some(entry) = self.peers.get(peer_id) else {
+            return false;
+        };
+        peer_loop::send_error_and_drop(peer_id, &entry.value().outbound_tx, code, message)
+    }
+
     /// Ban a peer by node ID and disconnect if connected.
     pub async fn ban_peer(&self, peer_id: PeerId) {
         self.banned_peers.write().insert(peer_id.clone());
@@ -4510,5 +4531,64 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[tokio::test]
+    async fn test_send_error_and_drop_sends_misc_error_then_shutdown() {
+        let manager = OverlayManager::new(
+            OverlayConfig::default(),
+            LocalNode::new_testnet(SecretKey::generate()),
+        )
+        .unwrap();
+        let peer_id = PeerId::from_bytes([7u8; 32]);
+        let mut rx = insert_peer_with_capacity(&manager, peer_id.clone(), 16);
+
+        assert!(
+            manager.send_error_and_drop(
+                &peer_id,
+                stellar_xdr::curr::ErrorCode::Misc,
+                "Survey has invalid signature",
+            ),
+            "send_error_and_drop should queue the shutdown for a connected peer"
+        );
+
+        // First the ERROR_MSG with the exact survey code/string.
+        match rx.recv().await.unwrap() {
+            OutboundMessage::Send(StellarMessage::ErrorMsg(err)) => {
+                assert_eq!(err.code, stellar_xdr::curr::ErrorCode::Misc);
+                assert_eq!(err.msg.to_string(), "Survey has invalid signature");
+            }
+            other => panic!(
+                "expected Send(ErrorMsg), got {:?}",
+                std::mem::discriminant(&other)
+            ),
+        }
+
+        // Then the deferred shutdown (flush-then-close).
+        match rx.recv().await.unwrap() {
+            OutboundMessage::ShutdownAfterError => {}
+            other => panic!(
+                "expected ShutdownAfterError, got {:?}",
+                std::mem::discriminant(&other)
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_send_error_and_drop_unknown_peer_returns_false() {
+        let manager = OverlayManager::new(
+            OverlayConfig::default(),
+            LocalNode::new_testnet(SecretKey::generate()),
+        )
+        .unwrap();
+        let peer_id = PeerId::from_bytes([8u8; 32]);
+        assert!(
+            !manager.send_error_and_drop(
+                &peer_id,
+                stellar_xdr::curr::ErrorCode::Misc,
+                "Survey has invalid signature",
+            ),
+            "send_error_and_drop should report false for an unknown peer"
+        );
     }
 }

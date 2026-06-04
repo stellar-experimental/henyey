@@ -412,10 +412,13 @@ impl App {
             &local_node_id,
             nonce,
             || {
-                self.verify_survey_signature(
+                // Self-originated survey: no relaying peer to drop (matches
+                // stellar-core's `peer == nullptr` case).
+                self.verify_survey_signature_or_drop(
                     &signed.request.request.surveyor_peer_id,
                     &message_bytes,
                     &signed.request_signature,
+                    None,
                 )
             },
         );
@@ -501,13 +504,15 @@ impl App {
         if !self.surveyor_permitted(&message.surveyor_id) {
             return;
         }
+        let overlay = self.overlay().await;
         let is_valid = {
             let survey_state = self.survey_state.read().await;
             survey_state.validate_start_collecting(message, || {
-                self.verify_survey_signature(
+                self.verify_survey_signature_or_drop(
                     &message.surveyor_id,
                     &message_bytes,
                     &signed.signature,
+                    overlay.as_ref().map(|o| (o, peer_id)),
                 )
             })
         };
@@ -565,13 +570,15 @@ impl App {
         if !self.surveyor_permitted(&message.surveyor_id) {
             return;
         }
+        let overlay = self.overlay().await;
         let is_valid = {
             let survey_state = self.survey_state.read().await;
             survey_state.validate_stop_collecting(message, || {
-                self.verify_survey_signature(
+                self.verify_survey_signature_or_drop(
                     &message.surveyor_id,
                     &message_bytes,
                     &signed.signature,
+                    overlay.as_ref().map(|o| (o, peer_id)),
                 )
             })
         };
@@ -624,6 +631,7 @@ impl App {
         }
 
         let local_node_id = self.local_node_id();
+        let overlay = self.overlay().await;
         let is_valid = {
             let mut survey_state = self.survey_state.write().await;
             survey_state.add_and_validate_request(
@@ -631,10 +639,11 @@ impl App {
                 &local_node_id,
                 request.nonce,
                 || {
-                    self.verify_survey_signature(
+                    self.verify_survey_signature_or_drop(
                         &request.request.surveyor_peer_id,
                         &request_bytes,
                         &signed.request_signature,
+                        overlay.as_ref().map(|o| (o, peer_id)),
                     )
                 },
             )
@@ -741,16 +750,18 @@ impl App {
             }
         };
 
+        let overlay = self.overlay().await;
         let is_valid = {
             let mut survey_state = self.survey_state.write().await;
             survey_state.record_and_validate_response(
                 &response_message.response,
                 response_message.nonce,
                 || {
-                    self.verify_survey_signature(
+                    self.verify_survey_signature_or_drop(
                         &response_message.response.surveyed_peer_id,
                         &response_bytes,
                         &signed.response_signature,
+                        overlay.as_ref().map(|o| (o, peer_id)),
                     )
                 },
             )
@@ -936,6 +947,42 @@ impl App {
             .collect::<Vec<_>>();
         outbound.extend(incoming.outbound_peers.0.iter().cloned());
         existing.outbound_peers.0 = outbound.try_into().unwrap_or_default();
+    }
+
+    /// Verify a survey message's Ed25519 signature and, on failure, drop the
+    /// relaying peer with `ERROR_MSG(ERR_MISC, "Survey has invalid signature")`.
+    ///
+    /// Matches stellar-core `SurveyManager::dropPeerIfSigInvalid`
+    /// (SurveyManager.cpp:807-819): the drop is performed *only* on a genuine
+    /// signature-verification failure, and only when a relaying peer is present.
+    /// Self-originated surveys (`send_survey_request`) pass `None` — matching
+    /// stellar-core's `peer == nullptr` case, which does not drop.
+    ///
+    /// This helper is invoked from inside the limiter's success-validation
+    /// closure, which the limiter only calls after its non-signature gates
+    /// (ledger range, duplicate, max-request) and the nonce check pass. So a
+    /// `false` return here is unambiguously a signature failure — it can never
+    /// be confused with a rate-limit/nonce/duplicate rejection, and the drop
+    /// therefore never over-penalizes a peer relaying a validly-signed-but-
+    /// rejected message.
+    fn verify_survey_signature_or_drop(
+        &self,
+        node_id: &stellar_xdr::curr::NodeId,
+        message: &[u8],
+        signature: &stellar_xdr::curr::Signature,
+        relaying_peer: Option<(&Arc<OverlayManager>, &henyey_overlay::PeerId)>,
+    ) -> bool {
+        if self.verify_survey_signature(node_id, message, signature) {
+            return true;
+        }
+        if let Some((overlay, peer_id)) = relaying_peer {
+            overlay.send_error_and_drop(
+                peer_id,
+                stellar_xdr::curr::ErrorCode::Misc,
+                "Survey has invalid signature",
+            );
+        }
+        false
     }
 
     fn verify_survey_signature(
@@ -1323,5 +1370,163 @@ impl App {
             dropped,
             lost_sync,
         );
+    }
+}
+
+#[cfg(test)]
+mod survey_invalid_signature_tests {
+    use super::*;
+
+    /// Build an App whose configured surveyor key is the public key of
+    /// `surveyor_secret`, with an injected overlay holding one test peer.
+    /// Returns (app, relaying_peer_id, TestPeerReceiver).
+    async fn app_with_permitted_surveyor(
+        surveyor_secret: &henyey_crypto::SecretKey,
+    ) -> (
+        App,
+        henyey_overlay::PeerId,
+        henyey_overlay::TestPeerReceiver,
+    ) {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-test.db");
+        let mut config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
+        // Permit the surveyor by its public strkey so `surveyor_permitted`
+        // returns true and the limiter reaches the signature closure.
+        config.overlay.surveyor_keys = vec![surveyor_secret.public_key().to_strkey()];
+        let app = App::new(config).await.unwrap();
+        // Keep the tempdir alive for the App's lifetime.
+        std::mem::forget(dir);
+
+        let overlay = OverlayManager::new(
+            OverlayManagerConfig::default(),
+            LocalNode::new_testnet(henyey_crypto::SecretKey::generate()),
+        )
+        .unwrap();
+        let peer_id = PeerId::from_bytes([0x11; 32]);
+        let receiver = overlay.inject_test_peer(peer_id.clone(), 16);
+        *app.overlay.write().await = Some(Arc::new(overlay));
+
+        (app, peer_id, receiver)
+    }
+
+    fn surveyor_node_id(secret: &henyey_crypto::SecretKey) -> stellar_xdr::curr::NodeId {
+        stellar_xdr::curr::NodeId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
+            stellar_xdr::curr::Uint256(*secret.public_key().as_bytes()),
+        ))
+    }
+
+    /// Build a start-collecting message for the given surveyor at the app's
+    /// current survey ledger, signed by `signing_secret` (which may differ
+    /// from the surveyor to forge an invalid signature).
+    fn build_signed_start(
+        app: &App,
+        surveyor_secret: &henyey_crypto::SecretKey,
+        signing_secret: &henyey_crypto::SecretKey,
+    ) -> stellar_xdr::curr::SignedTimeSlicedSurveyStartCollectingMessage {
+        let start = stellar_xdr::curr::TimeSlicedSurveyStartCollectingMessage {
+            surveyor_id: surveyor_node_id(surveyor_secret),
+            nonce: 1,
+            ledger_num: app.survey_local_ledger(),
+        };
+        let bytes = start.to_xdr(stellar_xdr::curr::Limits::none()).unwrap();
+        let signature: stellar_xdr::curr::Signature = signing_secret.sign(&bytes).into();
+        stellar_xdr::curr::SignedTimeSlicedSurveyStartCollectingMessage {
+            signature,
+            start_collecting: start,
+        }
+    }
+
+    /// Regression for #3071: an authenticated peer relaying a survey message
+    /// with an invalid signature must be dropped with
+    /// `ERROR_MSG(Misc, "Survey has invalid signature")`. On main the handler
+    /// only logs and returns — the peer stays connected and the channel is
+    /// empty.
+    #[tokio::test]
+    async fn test_survey_invalid_signature_drops_peer() {
+        let surveyor = henyey_crypto::SecretKey::generate();
+        let forger = henyey_crypto::SecretKey::generate();
+        let (app, peer_id, mut receiver) = app_with_permitted_surveyor(&surveyor).await;
+
+        // Signed by a DIFFERENT key than the surveyor → invalid signature.
+        let signed = build_signed_start(&app, &surveyor, &forger);
+        app.handle_survey_start_collecting(&peer_id, signed).await;
+
+        match receiver.try_recv() {
+            Some(stellar_xdr::curr::StellarMessage::ErrorMsg(err)) => {
+                assert_eq!(err.code, stellar_xdr::curr::ErrorCode::Misc);
+                assert_eq!(err.msg.to_string(), "Survey has invalid signature");
+            }
+            other => {
+                panic!("expected ErrorMsg(Misc, \"Survey has invalid signature\"), got {other:?}")
+            }
+        }
+    }
+
+    /// Guard against over-drop: a correctly-signed survey message must NOT
+    /// drop the relaying peer.
+    #[tokio::test]
+    async fn test_survey_valid_signature_does_not_drop_peer() {
+        let surveyor = henyey_crypto::SecretKey::generate();
+        let (app, peer_id, mut receiver) = app_with_permitted_surveyor(&surveyor).await;
+
+        // Signed by the surveyor itself → valid signature.
+        let signed = build_signed_start(&app, &surveyor, &surveyor);
+        app.handle_survey_start_collecting(&peer_id, signed).await;
+
+        assert!(
+            receiver.try_recv().is_none(),
+            "valid-signature survey must not send an ERROR_MSG or drop the peer"
+        );
+    }
+
+    /// Over-drop guard: a message rejected by the limiter for a non-signature
+    /// reason (here, an out-of-range ledger number) must NOT drop the peer,
+    /// even though the closure never runs and the message is dropped silently.
+    #[tokio::test]
+    async fn test_survey_limiter_rejection_does_not_drop_peer() {
+        let surveyor = henyey_crypto::SecretKey::generate();
+        let (app, peer_id, mut receiver) = app_with_permitted_surveyor(&surveyor).await;
+
+        // Build a VALIDLY-signed message but with a wildly out-of-range ledger
+        // so the limiter's ledger gate rejects it before the signature closure.
+        let start = stellar_xdr::curr::TimeSlicedSurveyStartCollectingMessage {
+            surveyor_id: surveyor_node_id(&surveyor),
+            nonce: 1,
+            ledger_num: 1_000_000,
+        };
+        let bytes = start.to_xdr(stellar_xdr::curr::Limits::none()).unwrap();
+        let signature: stellar_xdr::curr::Signature = surveyor.sign(&bytes).into();
+        let signed = stellar_xdr::curr::SignedTimeSlicedSurveyStartCollectingMessage {
+            signature,
+            start_collecting: start,
+        };
+        app.handle_survey_start_collecting(&peer_id, signed).await;
+
+        assert!(
+            receiver.try_recv().is_none(),
+            "limiter (non-signature) rejection must not drop the peer"
+        );
+    }
+
+    /// `verify_survey_signature_or_drop` with `None` relaying peer (self-survey)
+    /// must not panic and must not attempt a drop on invalid signature.
+    #[tokio::test]
+    async fn test_verify_survey_signature_or_drop_none_peer_no_drop() {
+        let surveyor = henyey_crypto::SecretKey::generate();
+        let forger = henyey_crypto::SecretKey::generate();
+        let (app, _peer_id, _receiver) = app_with_permitted_surveyor(&surveyor).await;
+
+        let message = b"some survey bytes";
+        let signature: stellar_xdr::curr::Signature = forger.sign(message).into();
+        // Invalid signature (wrong key), but None peer → returns false, no drop.
+        let result = app.verify_survey_signature_or_drop(
+            &surveyor_node_id(&surveyor),
+            message,
+            &signature,
+            None,
+        );
+        assert!(!result, "forged signature must verify as invalid");
     }
 }
