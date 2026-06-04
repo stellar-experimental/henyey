@@ -2213,11 +2213,26 @@ impl App {
                         tracked_lock::tracked_write("syncing_ledgers", &self.syncing_ledgers).await;
                     let cleared_count = buffer.len();
                     buffer.clear();
+                    drop(buffer);
                     tracing::warn!(
                         ledger_seq = pending.ledger_seq,
                         cleared_count,
-                        "Hash mismatch detected - cleared all buffered ledgers, will trigger catchup"
+                        "Hash mismatch detected during live close - local state corrupted"
                     );
+                    // Spec LEDGER §4.2-Step15 / §4.10-Step25 (MUST): an
+                    // expected/computed LCL hash mismatch on the live
+                    // post-close path is an SCP/local-corruption divergence
+                    // and is FATAL — it is NOT a recoverable re-sync. This
+                    // mirrors stellar-core `LedgerManagerImpl::closeLedger`
+                    // (LedgerManagerImpl.cpp:1738-1752), which throws
+                    // "Local node's ledger corrupted during close" rather than
+                    // swallowing the divergence into a catchup. The genuinely
+                    // recoverable bucket-apply re-sync lives in catchup_impl.rs
+                    // (a different path) and is intentionally untouched.
+                    self.trigger_fatal_shutdown(&format!(
+                        "local node's ledger corrupted during close (ledger {})",
+                        pending.ledger_seq
+                    ));
                 }
                 // Clear the closing gate — LCL hasn't advanced, so buffered
                 // envelopes would still hit the apply-lag path (issue #2122).
