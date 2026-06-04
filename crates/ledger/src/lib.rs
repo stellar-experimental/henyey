@@ -80,6 +80,8 @@ mod manager;
 pub mod memory_report;
 pub mod offer;
 pub mod offer_store;
+pub mod p23_hot_archive_bug;
+mod p23_hot_archive_bug_data;
 mod prepare_liabilities;
 mod snapshot;
 mod soroban_state;

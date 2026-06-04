@@ -5478,11 +5478,45 @@ impl LedgerCloseContext<'_> {
                                 .advance_to_ledger(self.close_data.ledger_seq, protocol_version)?;
                         }
 
+                        // CAP-0076 / Protocol 23 hot-archive bug remediation
+                        // (issue #3061). On the mainnet p23→p24 upgrade ledger
+                        // ONLY, append the 478 hardcoded corrected hot-archive
+                        // entries to the batch before add_batch, matching
+                        // stellar-core's addHotArchiveBatchWithP23HotArchiveFix
+                        // (P23HotArchiveBug.cpp:37-109 / LedgerManagerImpl.cpp:
+                        // 2905-2915). The gate mirrors stellar-core's
+                        // `protocolVersionIsBefore(initialLedgerVers, V_24) &&
+                        // protocolVersionStartsFrom(lh.ledgerVersion, V_24) &&
+                        // gIsProductionNetwork`. We use the literal
+                        // `prev_version < 24` form for verbatim parity with
+                        // protocolVersionIsBefore; in 24+-only Henyey this is
+                        // equivalent to the existing fee-pool `prev==23` gate.
+                        let final_archived_entries = if prev_version < 24
+                            && protocol_version >= 24
+                            && self.manager.network_id().is_mainnet()
+                        {
+                            // Preconditions are evaluated against the hot
+                            // archive as it stands BEFORE this batch is applied
+                            // (matching copySearchableHotArchiveBucketListSnapshot)
+                            // and against the live bucket list (matching
+                            // ltx.loadWithoutRecord). self.ltx is dead at this
+                            // point (drained for the bucket update), so we query
+                            // the live `bucket_list` snapshot in scope here for
+                            // the live-state-absence precondition (#4).
+                            crate::p23_hot_archive_bug::add_hot_archive_batch_with_p23_fix(
+                                archived_entries,
+                                |key| hot_archive.get(key).map_err(LedgerError::from),
+                                |key| bucket_list.get(key).map_err(LedgerError::from),
+                            )?
+                        } else {
+                            archived_entries
+                        };
+
                         // Add archived entries to hot archive bucket list
                         hot_archive.add_batch(
                             self.close_data.ledger_seq,
                             protocol_version,
-                            archived_entries,
+                            final_archived_entries,
                             std::mem::take(&mut self.hot_archive_restored_keys),
                         )?;
                     }
