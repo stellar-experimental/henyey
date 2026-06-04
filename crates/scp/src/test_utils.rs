@@ -188,6 +188,10 @@ impl SCPDriver for MockDriver {
         self.heard_from_quorum.fetch_add(1, Ordering::SeqCst);
     }
 
+    fn accepted_commit(&self, _slot_index: u64, _ballot: &ScpBallot) {
+        self.accepted_commit_count.fetch_add(1, Ordering::SeqCst);
+    }
+
     fn compute_hash_node(
         &self,
         _slot_index: u64,

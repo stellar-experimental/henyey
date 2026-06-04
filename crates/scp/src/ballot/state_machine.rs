@@ -368,6 +368,12 @@ impl BallotProtocol {
 
         if did_work {
             self.update_current_if_needed(&h);
+            // Fire the accept-commit notification callback (SCP §6.5-2),
+            // ordered update_current_if_needed -> accepted_commit ->
+            // emit_current_state to match stellar-core
+            // BallotProtocol::setAcceptCommit (BallotProtocol.cpp:1343-1349).
+            // The argument is the high ballot `h`.
+            ctx.driver.accepted_commit(ctx.slot_index, &h);
             self.emit_current_state(ctx);
         }
 
