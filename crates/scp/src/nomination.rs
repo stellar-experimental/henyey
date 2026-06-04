@@ -228,6 +228,30 @@ impl NominationProtocol {
         self.previous_value = value;
     }
 
+    /// Test helper: force `votes`/`accepted`/`started` so a test can drive
+    /// `emit_nomination` into states the public `nominate` path cannot reach
+    /// (e.g. an empty, non-sane self-statement). The public path always grows
+    /// `votes` before emitting and re-sorts/dedups via `sorted_values`, so the
+    /// only reachable non-sane self condition (empty votes AND accepted) cannot
+    /// be produced through `nominate`. See issue #3090.
+    #[cfg(test)]
+    pub(crate) fn force_nomination_state_for_test(
+        &mut self,
+        votes: Vec<Value>,
+        accepted: Vec<Value>,
+        started: bool,
+    ) {
+        self.votes = votes;
+        self.accepted = accepted;
+        self.started = started;
+    }
+
+    /// Test helper: directly invoke the self-emit gate path (`emit_nomination`).
+    #[cfg(test)]
+    pub(crate) fn emit_nomination_for_test<D: SCPDriver>(&mut self, ctx: &SlotContext<'_, D>) {
+        self.emit_nomination(ctx);
+    }
+
     /// Get the last envelope constructed by this node.
     pub fn get_last_envelope(&self) -> Option<&ScpEnvelope> {
         self.last_envelope.as_ref()
@@ -714,8 +738,49 @@ impl NominationProtocol {
 
         ctx.driver.sign_envelope(&mut envelope);
 
-        // Step 1: Record the envelope ( stellar-core recordEnvelope inside processEnvelope).
-        // This stores in latest_nominations so quorum checks see our own state.
+        // Self-process the freshly built nomination through the full gate before
+        // recording/promoting/emitting, mirroring stellar-core
+        // `NominationProtocol::emitNomination` -> `processEnvelope(env, self=true)`
+        // (`NominationProtocol.cpp:147-189`): `isNewerStatement` (411-412) then
+        // `isSane` (414-417) then `recordEnvelope` (420). stellar-core throws
+        // `runtime_error("moved to a bad state (nomination)")` on any non-VALID
+        // result; henyey deliberately logs and returns instead of panicking, so a
+        // self-inconsistency bug does not crash the validator and break
+        // determinism — the same precedent as ballot `emit_current_state`
+        // (`ballot/envelope.rs:158-185`).
+        //
+        // Asymmetry (documented so a future parity audit does not re-flag it):
+        // stellar-core throws on BOTH the freshness-false and sanity-false
+        // branches. henyey treats freshness-false as a benign monotonic stop
+        // (silent `return`, matching ballot `emit_current_state:170-172`) and only
+        // surfaces an error on sanity-false. This is sound because
+        // `emit_nomination` is only reached after genuine state growth (so
+        // freshness-false is a should-not-happen monotonic stop), and
+        // `sorted_values` above guarantees sorted-unique `votes`/`accepted` — so
+        // the only reachable non-sane self condition is empty votes AND accepted.
+
+        // Gate 1: freshness (stellar-core `isNewerStatement`). Benign monotonic
+        // stop — silent return, matching ballot `emit_current_state`.
+        if !self.is_newer_nomination_internal(ctx.local_node_id, &nomination) {
+            return;
+        }
+
+        // Gate 2: sanity (stellar-core `isSane`). A non-sane self-statement is a
+        // bad-state bug; surface it (logged, not panic) and return without
+        // recording/promoting/emitting.
+        if !Self::is_sane_statement(&nomination) {
+            tracing::error!(
+                target: "henyey::envelope_path",
+                slot = ctx.slot_index,
+                "not sane statement from self in emit_nomination, skipping",
+            );
+            return;
+        }
+
+        // Step 1: Record the envelope (stellar-core `recordEnvelope` inside
+        // `processEnvelope`). This stores in latest_nominations so quorum checks
+        // see our own state. The freshness check inside `record_local_nomination`
+        // is now redundant with Gate 1 above but harmless (idempotent).
         if !self.record_local_nomination(ctx.local_node_id, &statement, envelope.clone()) {
             return;
         }
@@ -3094,5 +3159,94 @@ mod tests {
 
         // This should panic after 1000 iterations
         nom.update_round_leaders_for_test(&ctx, &prev);
+    }
+
+    /// Regression test for issue #3090 (SCP §8.7-1): `emit_nomination` must
+    /// route the self-emitted nomination through the sanity gate
+    /// (`is_sane_statement`) before recording/promoting/emitting, mirroring
+    /// stellar-core `processEnvelope(env, self=true)`.
+    ///
+    /// We force the protocol into a state the public `nominate` path cannot
+    /// reach: empty `votes` AND empty `accepted` with `started == true`. The
+    /// built self-statement is therefore non-sane. The fixed code must detect
+    /// this (logged bad-state error) and return WITHOUT recording into
+    /// `latest_nominations`, promoting any candidates, or emitting an envelope.
+    ///
+    /// Fails on `origin/main`: pre-fix `emit_nomination` has no sanity gate, so
+    /// the empty self-statement is passed to `record_local_nomination` (which
+    /// inserts it into `latest_nominations`) and `attempt_promote`, with no
+    /// bad-state surfacing.
+    #[test]
+    fn test_emit_nomination_rejects_non_sane_self_statement() {
+        let node = make_node_id(1);
+        let node2 = make_node_id(2);
+        let node3 = make_node_id(3);
+        let quorum_set = make_quorum_set(vec![node.clone(), node2, node3], 2);
+        let driver = Arc::new(ParityMockDriver::new(quorum_set.clone()));
+        let mut nom = NominationProtocol::new();
+
+        // Force the non-sane self condition (empty votes + accepted) with
+        // nomination "started". This is unreachable via `nominate`.
+        nom.force_nomination_state_for_test(Vec::new(), Vec::new(), true);
+
+        nom.emit_nomination_for_test(&ctx!(&node, &quorum_set, &driver, 7));
+
+        // No envelope emitted.
+        assert_eq!(
+            driver.emit_count.load(Ordering::SeqCst),
+            0,
+            "non-sane self-statement must not be emitted"
+        );
+        // No record into latest_nominations (gate returns before record).
+        assert!(
+            nom.latest_nominations.get(&node).is_none(),
+            "non-sane self-statement must not be recorded"
+        );
+        // No promotion / state growth.
+        assert!(
+            nom.candidates().is_empty(),
+            "no candidates should be promoted"
+        );
+        assert!(nom.accepted().is_empty(), "accepted must stay empty");
+        assert!(
+            nom.get_last_envelope().is_none(),
+            "last_envelope must not be set for a non-sane self-statement"
+        );
+    }
+
+    /// Regression test for issue #3090: the freshness early-return (monotonic
+    /// stop, stellar-core `isNewerStatement`) is preserved by the rework. After
+    /// emitting once via `nominate`, a second self-emit with no intervening
+    /// state growth must NOT emit a duplicate envelope.
+    #[test]
+    fn test_emit_nomination_stale_self_statement_does_not_re_emit() {
+        let node = make_node_id(1);
+        let node2 = make_node_id(2);
+        let node3 = make_node_id(3);
+        let quorum_set = make_quorum_set(vec![node.clone(), node2, node3], 2);
+        let driver = Arc::new(ParityMockDriver::new(quorum_set.clone()));
+        let mut nom = NominationProtocol::new();
+
+        let value = make_value(&[5]);
+
+        // Force a sane self-statement (non-empty votes) with nomination started,
+        // so `emit_nomination` is reached deterministically (independent of
+        // round-leader election).
+        nom.force_nomination_state_for_test(vec![value], Vec::new(), true);
+
+        // First self-emit: builds a sane self-statement, passes freshness +
+        // sanity, and emits.
+        nom.emit_nomination_for_test(&ctx!(&node, &quorum_set, &driver, 1));
+        let after_first = driver.emit_count.load(Ordering::SeqCst);
+        assert!(after_first >= 1, "first self-emit should emit");
+
+        // Second self-emit with no state growth: the freshness gate sees the
+        // identical (not newer) self-statement and must not re-emit.
+        nom.emit_nomination_for_test(&ctx!(&node, &quorum_set, &driver, 1));
+        assert_eq!(
+            driver.emit_count.load(Ordering::SeqCst),
+            after_first,
+            "stale (not-newer) self-statement must not be re-emitted"
+        );
     }
 }
