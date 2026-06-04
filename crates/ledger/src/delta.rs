@@ -921,8 +921,17 @@ fn categorize_changes(
     let mut offer_pool_changes = Vec::new();
 
     for mut change in changes {
-        // TDD-COMMIT1-PLACEHOLDER: central stamping added in the following commit.
-        let _ = (&mut change, ledger_seq);
+        // Central last_modified_ledger_seq enforcement (stellar-core
+        // LedgerTxn::maybeUpdateLastModified parity): stamp every non-deleted
+        // entry to the current ledger_seq in place, BEFORE the offer_pool clone
+        // below, so both the offer-store index and the bucket-bound init/live
+        // entries observe the stamped value. Deleted entries are left untouched
+        // (parity with stellar-core isDeleted() skip).
+        match &mut change {
+            EntryChange::Created(e) => e.last_modified_ledger_seq = ledger_seq,
+            EntryChange::Updated { current, .. } => current.last_modified_ledger_seq = ledger_seq,
+            EntryChange::Deleted { .. } => {}
+        }
         let entry_ref = match &change {
             EntryChange::Created(e) | EntryChange::Deleted { previous: e } => e,
             EntryChange::Updated { current, .. } => current,
