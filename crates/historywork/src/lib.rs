@@ -293,7 +293,7 @@ pub async fn build_checkpoint_data(state: &SharedHistoryState) -> Result<Checkpo
 
 #[cfg(test)]
 mod tests {
-    use henyey_history::download::{RETRY_A_FEW, RETRY_A_LOT};
+    use henyey_history::download::{HAS_RETRIES, RETRY_A_FEW, RETRY_A_LOT};
 
     // ── CATCHUP_SPEC §9.1: Retry constants re-exported from download ─
 
@@ -310,6 +310,16 @@ mod tests {
         assert_eq!(
             RETRY_A_LOT, 32,
             "RETRY_A_LOT must be 32 (matches stellar-core)"
+        );
+    }
+
+    #[test]
+    fn test_has_retries_constant() {
+        // CATCHUP_SPEC §13.1-1: HAS download retries to 10, matching
+        // stellar-core CatchupWork's override of RETRY_A_FEW.
+        assert_eq!(
+            HAS_RETRIES, 10,
+            "HAS_RETRIES must be 10 (matches stellar-core CatchupWork)"
         );
     }
 }
