@@ -632,13 +632,44 @@ mod tests {
     #[test]
     fn test_recent_from_genesis_large_count() {
         // Recent mode from genesis where count >= full_replay_count.
-        // The lcl > GENESIS guard on Case 2 prevents a full replay from
-        // genesis; should fall through to bucket-apply.
+        // Per CATCHUP_SPEC §6.3 Case 2 and stellar-core calculateCatchupRange,
+        // lcl == genesis with count >= fullReplayCount yields a full replay from
+        // genesis+1 (no lcl guard on Case 2).
         let range = CatchupRange::calculate(1, 63, CatchupMode::Recent(100));
         assert_eq!(
             range,
-            CatchupRange::BucketsOnly { checkpoint: 63 },
-            "Recent with large count from genesis should bucket-apply, not replay"
+            CatchupRange::ReplayOnly {
+                replay: LedgerRange::new(2, 62)
+            },
+            "Recent with count >= full_replay_count from genesis should full-replay (Case 2)"
+        );
+    }
+
+    #[test]
+    fn test_case2_recent_from_genesis_full_replay() {
+        // Case 2 regression (#3033): lcl == genesis, count (100) >= full_replay_count
+        // (62) → full replay [genesis+1, target] for Recent mode, matching spec §6.3
+        // and stellar-core. Pre-fix: returned BucketsOnly { checkpoint: 63 }.
+        let range = CatchupRange::calculate(1, 63, CatchupMode::Recent(100));
+        assert_eq!(
+            range,
+            CatchupRange::ReplayOnly {
+                replay: LedgerRange::new(2, 62)
+            }
+        );
+    }
+
+    #[test]
+    fn test_case2_recent_from_genesis_checkpoint_target() {
+        // Case 2 regression (#3033): lcl == genesis, target 127 is a checkpoint,
+        // count (200) >= full_replay_count (126) → full replay [2, 126]. Pre-fix:
+        // routed to Case 4b checkpoint branch returning BucketsOnly { checkpoint: 127 }.
+        let range = CatchupRange::calculate(1, 127, CatchupMode::Recent(200));
+        assert_eq!(
+            range,
+            CatchupRange::ReplayOnly {
+                replay: LedgerRange::new(2, 126)
+            }
         );
     }
 
