@@ -1633,4 +1633,130 @@ mod tests {
             "compatible peer must pass phase-2"
         );
     }
+
+    // ── OVERLAY §4.4.3-rotate: process-lifetime keypair + cert rotation ──
+
+    #[test]
+    fn test_ephemeral_pubkey_stable_across_contexts() {
+        // The Curve25519 keypair is generated once per process (per LocalNode)
+        // and reused across all connections, matching stellar-core PeerAuth.
+        // Two AuthContexts built from the SAME LocalNode must expose the SAME
+        // ephemeral pubkey in their auth certs.
+        //
+        // Pre-fix (per-connection `EphemeralSecret::random_from_rng`): the two
+        // pubkeys differ ⇒ FAILS. Post-fix (shared `StaticSecret`): identical.
+        let secret = SecretKey::generate();
+        let local_node = LocalNode::new_testnet(secret);
+
+        let ctx1 = AuthContext::new(local_node.clone(), true);
+        let ctx2 = AuthContext::new(local_node.clone(), false);
+
+        let cert1 = ctx1.create_hello().cert;
+        let cert2 = ctx2.create_hello().cert;
+
+        assert_eq!(
+            cert1.pubkey.key, cert2.pubkey.key,
+            "ephemeral pubkey must be stable across connections from one node"
+        );
+    }
+
+    #[test]
+    fn test_authcert_rotation_keeps_pubkey_refreshes_sig() {
+        // get_auth_cert(now) lazily re-signs the cert over the UNCHANGED pubkey
+        // when fewer than 1800 s of validity remain, mirroring
+        // PeerAuth::getAuthCert(): same pubkey, fresh expiration + signature.
+        //
+        // Pre-fix: no rotation path / get_auth_cert does not exist ⇒ FAILS.
+        let secret = SecretKey::generate();
+        let local_node = LocalNode::new_testnet(secret);
+
+        // Cert issued "now" expires at now + 3600.
+        let now = 1_000_000u64;
+        let cert_initial = local_node.get_auth_cert(now);
+        assert_eq!(
+            cert_initial.expiration,
+            now + 3600,
+            "initial cert expires 3600 s out"
+        );
+
+        // A `now` still comfortably inside the window does NOT rotate.
+        let cert_same = local_node.get_auth_cert(now + 100);
+        assert_eq!(
+            cert_same.expiration, cert_initial.expiration,
+            "cert must not rotate while > 1800 s of validity remain"
+        );
+        assert_eq!(cert_same.sig, cert_initial.sig, "signature unchanged");
+
+        // Advance `now` so that expiration < now + 1800 ⇒ re-sign.
+        let now_rotate = cert_initial.expiration - 1799;
+        let cert_rotated = local_node.get_auth_cert(now_rotate);
+        assert_eq!(
+            cert_rotated.pubkey.key, cert_initial.pubkey.key,
+            "rotation must reuse the same ephemeral pubkey"
+        );
+        assert_eq!(
+            cert_rotated.expiration,
+            now_rotate + 3600,
+            "rotation must refresh the expiration to now + 3600"
+        );
+        assert_ne!(
+            cert_rotated.expiration, cert_initial.expiration,
+            "rotation must change the expiration"
+        );
+        assert_ne!(
+            cert_rotated.sig, cert_initial.sig,
+            "rotation must produce a fresh signature"
+        );
+
+        // The rotated cert still verifies against our own identity.
+        assert!(cert_rotated
+            .verify(&local_node.network_id, &local_node.public_key())
+            .is_ok());
+    }
+
+    #[test]
+    fn test_handshake_still_succeeds_with_shared_static_secret() {
+        // Full two-node handshake must still authenticate after switching from
+        // a consume-on-use EphemeralSecret to a reusable StaticSecret.
+        let (ctx_a, ctx_b) = complete_handshake();
+        assert!(ctx_a.is_authenticated());
+        assert!(ctx_b.is_authenticated());
+    }
+
+    #[test]
+    fn test_two_connections_same_localnode_both_handshake() {
+        // Two sequential handshakes from the SAME LocalNode to two distinct
+        // peers must both succeed. This exercises secret reuse, which was
+        // impossible under the old consume-on-use EphemeralSecret.
+        let secret_a = SecretKey::generate();
+        let node_a = LocalNode::new_testnet(secret_a);
+
+        for _ in 0..2 {
+            let node_peer = LocalNode::new_testnet(SecretKey::generate());
+
+            let mut ctx_a = AuthContext::new(node_a.clone(), true); // initiator, shared node_a
+            let mut ctx_peer = AuthContext::new(node_peer, false); // acceptor
+
+            let hello_a = ctx_a.create_hello();
+            let hello_peer = ctx_peer.create_hello();
+
+            ctx_a.hello_sent();
+            ctx_peer.hello_sent();
+
+            ctx_peer
+                .process_hello(&hello_a)
+                .expect("peer should accept A's hello");
+            ctx_a
+                .process_hello(&hello_peer)
+                .expect("A should accept peer's hello (secret reused)");
+
+            ctx_a.auth_sent();
+            ctx_peer.auth_sent();
+            ctx_a.process_auth().expect("A completes auth");
+            ctx_peer.process_auth().expect("peer completes auth");
+
+            assert!(ctx_a.is_authenticated());
+            assert!(ctx_peer.is_authenticated());
+        }
+    }
 }
