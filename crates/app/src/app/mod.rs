@@ -829,6 +829,21 @@ pub struct App {
     /// in `HerderImpl::triggerNextLedger` (HerderImpl.cpp:1583).
     is_applying_ledger: Arc<AtomicBool>,
 
+    /// Re-entrancy guard for per-ledger background stale-bucket GC (#3028).
+    ///
+    /// Stale-bucket GC now runs on every ledger close (matching stellar-core's
+    /// unconditional `forgetUnreferencedBuckets`), rather than every 100 ledgers.
+    /// At ~5s cadence a GC run that blocks in `resolve_pending_bucket_merges()`
+    /// during a merge backlog could still be running when the next close fires.
+    /// This flag makes per-ledger GC self-coalescing: at most one background GC
+    /// at a time. If a run falls behind, subsequent ledgers skip GC (deferring
+    /// cleanup by ≤1 ledger — within stellar-core's "retain a few too many
+    /// buckets a little longer" tolerance) until the in-flight run finishes.
+    ///
+    /// The flag is reset panic-safely (see `cleanup_stale_bucket_files_background`)
+    /// so a single panicked GC run cannot permanently disable GC.
+    bucket_gc_in_flight: Arc<AtomicBool>,
+
     /// Wall-clock of the last deferred-pipeline close-complete entry.
     /// Used to compute `henyey_ledger_close_cycle_seconds` — the time between
     /// consecutive production close-complete events.
@@ -1031,6 +1046,21 @@ fn collect_gc_roots(
     }
 
     Some(hashes)
+}
+
+/// RAII guard that clears the bucket-GC re-entrancy flag on drop (#3028).
+///
+/// Held by the detached awaiter task in `cleanup_stale_bucket_files_background`
+/// so the flag is reset on EVERY exit path — normal completion, the inner GC
+/// task erroring or panicking (surfaced as a `JoinError`), or the awaiter task
+/// itself being cancelled. This is the panic-safety mechanism: a single failed
+/// GC run re-arms GC rather than wedging it off permanently.
+struct ResetGuard(Arc<AtomicBool>);
+
+impl Drop for ResetGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
 }
 
 /// Collect bucket hashes referenced only by publish-queue HAS entries.
@@ -1428,6 +1458,7 @@ impl App {
             sync_recovery_handle: parking_lot::RwLock::new(None), // Initialized in run() when needed
             sync_recovery_task: parking_lot::RwLock::new(None),
             is_applying_ledger,
+            bucket_gc_in_flight: Arc::new(AtomicBool::new(false)),
             close_cycle_last_start: parking_lot::Mutex::new(None),
             #[cfg(test)]
             close_complete_inject_blocking_ms: AtomicU64::new(0),
@@ -1906,6 +1937,16 @@ impl App {
     /// populated during startup.
     pub fn query_is_ready(&self) -> &Arc<AtomicBool> {
         &self.query_is_ready
+    }
+
+    /// Test-only accessor for the per-ledger bucket-GC re-entrancy guard (#3028).
+    ///
+    /// Exposed so integration tests in `crates/app/tests/bucket_gc.rs` can assert
+    /// the coalescing + panic-safe reset behavior of
+    /// `cleanup_stale_bucket_files_background`. Not part of the stable API.
+    #[doc(hidden)]
+    pub fn bucket_gc_in_flight(&self) -> &Arc<AtomicBool> {
+        &self.bucket_gc_in_flight
     }
 
     /// Update the bucket snapshot manager with fresh snapshots from the
@@ -2636,7 +2677,36 @@ impl App {
     ///
     /// Spawns on tokio's blocking thread pool so that merge resolution (which may
     /// block) does not stall the async event loop.
-    pub(crate) fn cleanup_stale_bucket_files_background(&self) {
+    ///
+    /// # Re-entrancy guard (#3028)
+    ///
+    /// Because this now runs on every ledger close (~5s) rather than every 100th,
+    /// a slow run (blocked in `resolve_pending_bucket_merges()` during a merge
+    /// backlog) could still be in flight when the next close fires. The
+    /// `bucket_gc_in_flight` flag coalesces overlapping invocations: at most one
+    /// background GC runs at a time, and a ledger whose GC would overlap an
+    /// in-flight run simply skips (deferring cleanup by ≤1 ledger). The flag is
+    /// reset in the detached awaiter regardless of Ok/Err/panic, so a panicked GC
+    /// re-arms rather than permanently disabling GC.
+    ///
+    /// Returns `true` if a GC task was launched, `false` if it coalesced (a GC was
+    /// already in flight).
+    ///
+    /// `#[doc(hidden)] pub` rather than `pub(crate)` so integration tests in
+    /// `crates/app/tests/bucket_gc.rs` can drive it directly; not part of the
+    /// stable API.
+    #[doc(hidden)]
+    pub fn cleanup_stale_bucket_files_background(&self) -> bool {
+        // Acquire the re-entrancy guard. If a GC is already in flight, skip this
+        // ledger — the in-flight run will pick up everything stale.
+        if self
+            .bucket_gc_in_flight
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            return false;
+        }
+
         let lm = self.ledger_manager.clone();
         let bm = self.bucket_manager.clone();
         let db = self.db.clone();
@@ -2658,10 +2728,18 @@ impl App {
             }
         });
         // Log any panic/cancellation in a detached task — cleanup is
-        // best-effort and the caller doesn't wait for it.
+        // best-effort and the caller doesn't wait for it. The flag reset lives
+        // here (after the await) so it runs regardless of Ok/Err/panic: a
+        // `ResetGuard` whose Drop clears the flag re-arms GC even if this task
+        // itself is cancelled or panics.
+        let gc_in_flight = self.bucket_gc_in_flight.clone();
         tokio::spawn(async move {
+            // Reset on every exit path (normal, error, panic, cancellation).
+            let _reset = ResetGuard(gc_in_flight);
             let _ = henyey_common::await_blocking_logged("stale-bucket-cleanup", handle).await;
         });
+
+        true
     }
 
     pub fn scp_slot_snapshots(&self, limit: usize) -> Vec<ScpSlotSnapshot> {
@@ -3651,6 +3729,45 @@ mod tests {
     use super::*;
     use stellar_xdr::curr::StellarValueExt;
     use tempfile;
+
+    /// Panic-safety of the bucket-GC re-entrancy guard (#3028): `ResetGuard`
+    /// MUST clear the in-flight flag on drop even when the surrounding scope
+    /// unwinds via panic. This is the mechanism that prevents a single panicked
+    /// GC run from permanently disabling GC.
+    #[test]
+    fn test_bucket_gc_reset_guard_clears_flag_on_panic() {
+        let flag = Arc::new(AtomicBool::new(true));
+        let flag_clone = flag.clone();
+
+        // Run the guard inside a scope that panics. The guard's Drop must still
+        // fire during unwinding and reset the flag to false.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _reset = ResetGuard(flag_clone);
+            assert!(flag.load(Ordering::Acquire), "flag is set while guard held");
+            panic!("simulated GC task panic");
+        }));
+
+        assert!(result.is_err(), "the closure must have panicked");
+        assert!(
+            !flag.load(Ordering::Acquire),
+            "ResetGuard must clear the in-flight flag even when the scope panics, \
+             so a panicked GC run re-arms rather than wedging GC off permanently"
+        );
+    }
+
+    /// Happy-path companion: `ResetGuard` clears the flag on normal drop.
+    #[test]
+    fn test_bucket_gc_reset_guard_clears_flag_on_normal_drop() {
+        let flag = Arc::new(AtomicBool::new(true));
+        {
+            let _reset = ResetGuard(flag.clone());
+            assert!(flag.load(Ordering::Acquire));
+        }
+        assert!(
+            !flag.load(Ordering::Acquire),
+            "ResetGuard must clear the in-flight flag on normal drop"
+        );
+    }
 
     /// Construct a `PendingLedgerClose` with default tx_set/upgrades.
     ///

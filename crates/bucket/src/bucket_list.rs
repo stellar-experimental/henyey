@@ -4142,6 +4142,127 @@ mod tests {
         );
     }
 
+    /// Resolve-first GC safety contract (issue #3028): when stale-bucket GC runs
+    /// immediately after a ledger close that still has a live (unresolved) async
+    /// merge, the merge OUTPUT file must survive `retain_buckets`. This holds only
+    /// because the caller resolves pending merges BEFORE collecting the keep-set.
+    ///
+    /// This is the end-to-end retain assertion complementing
+    /// `test_all_referenced_hashes_includes_pending_merge_output` (which covers
+    /// the keep-set side only). It proves both directions:
+    ///   - WITHOUT resolving first, the output hash is absent from the keep-set
+    ///     and `retain_buckets` would delete the on-disk output file.
+    ///   - WITH resolve-first, the output hash is in the keep-set and the file
+    ///     is retained.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_resolve_first_retains_pending_merge_output() {
+        use crate::bucket::Bucket;
+        use crate::manager::{canonical_bucket_filename, BucketManager};
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let dir = temp_dir.path().to_path_buf();
+        let manager = BucketManager::new(dir.clone()).unwrap();
+
+        // Two disjoint input buckets, persisted to disk and loaded disk-backed so
+        // the async merge has real input files to read (and so list_buckets() sees
+        // them as `.bucket.xdr` candidates for GC).
+        let entry1 = make_account_entry([1u8; 32], 100);
+        let entry2 = make_account_entry([2u8; 32], 200);
+        let bucket1_mem = Bucket::from_entries(vec![BucketListEntry::Liveentry(entry1)]).unwrap();
+        let bucket2_mem = Bucket::from_entries(vec![BucketListEntry::Liveentry(entry2)]).unwrap();
+
+        let path1 = dir.join(canonical_bucket_filename(&bucket1_mem.hash()));
+        let path2 = dir.join(canonical_bucket_filename(&bucket2_mem.hash()));
+        bucket1_mem.save_to_xdr_file(&path1).unwrap();
+        bucket2_mem.save_to_xdr_file(&path2).unwrap();
+
+        let bucket1 = Arc::new(Bucket::from_xdr_file_disk_backed(&path1).unwrap());
+        let bucket2 = Arc::new(Bucket::from_xdr_file_disk_backed(&path2).unwrap());
+
+        // Start a disk-backed async merge: its output is written to `dir` as
+        // `<output_hash>.bucket.xdr`.
+        let handle = AsyncMergeHandle::start_merge(AsyncMergeRequest {
+            curr: bucket1.clone(),
+            snap: bucket2.clone(),
+            keep_dead_entries: DeadEntryPolicy::Remove,
+            protocol_version: TEST_PROTOCOL,
+            normalize_init: InitEntryPolicy::NormalizeToLive,
+            shadow_buckets: vec![],
+            level: 1,
+            bucket_dir: Some(dir.clone()),
+            counters: None,
+        });
+
+        let mut bl = BucketList::new();
+        bl.levels[1].next = Some(PendingMerge::Async(handle));
+
+        // Resolve once on a throwaway clone to learn the deterministic output hash
+        // and ensure the output file has been promoted to its canonical path.
+        let output_hash = {
+            let mut probe = BucketList::new();
+            let probe_handle = AsyncMergeHandle::start_merge(AsyncMergeRequest {
+                curr: bucket1.clone(),
+                snap: bucket2.clone(),
+                keep_dead_entries: DeadEntryPolicy::Remove,
+                protocol_version: TEST_PROTOCOL,
+                normalize_init: InitEntryPolicy::NormalizeToLive,
+                shadow_buckets: vec![],
+                level: 1,
+                bucket_dir: Some(dir.clone()),
+                counters: None,
+            });
+            probe.levels[1].next = Some(PendingMerge::Async(probe_handle));
+            probe.resolve_all_pending_merges().unwrap();
+            probe.levels[1].next().unwrap().hash()
+        };
+
+        let output_path = dir.join(canonical_bucket_filename(&output_hash));
+        assert!(
+            output_path.exists(),
+            "merge output file must be on disk after the merge completes"
+        );
+
+        // BEFORE resolving `bl`'s pending merge: the keep-set must NOT contain the
+        // output hash (only the inputs are tracked while Pending). A retain with
+        // this keep-set would delete the output file — exactly the hazard the
+        // resolve-first contract prevents.
+        let pre_resolve_keep = bl.all_referenced_hashes();
+        assert!(
+            !pre_resolve_keep.contains(&output_hash),
+            "pre-resolve keep-set must omit the not-yet-resolved merge output hash"
+        );
+
+        // Now honor the resolve-first contract.
+        bl.resolve_all_pending_merges().unwrap();
+        let keep = bl.all_referenced_hashes();
+        assert!(
+            keep.contains(&output_hash),
+            "post-resolve keep-set must include the merge output hash"
+        );
+        assert!(
+            keep.contains(&bucket1.hash()) && keep.contains(&bucket2.hash()),
+            "post-resolve keep-set must include the merge input hashes"
+        );
+
+        // End-to-end retain: with the resolve-first keep-set, the output file
+        // survives GC.
+        manager.retain_buckets(&keep).unwrap();
+        assert!(
+            output_path.exists(),
+            "resolve-first retain_buckets must keep the merge output file"
+        );
+
+        // Counter-check: had we GC'd with the pre-resolve keep-set, the output
+        // file would have been deleted (it is unreferenced from that set).
+        manager.retain_buckets(&pre_resolve_keep).unwrap();
+        assert!(
+            !output_path.exists(),
+            "GC with the pre-resolve keep-set deletes the unreferenced output — \
+             confirming resolve-first is load-bearing"
+        );
+    }
+
     // ============ P1-1: BucketList sizes at ledger 1 ============
     //
     // stellar-core: BucketListTests.cpp "BucketList sizes at ledger 1"
