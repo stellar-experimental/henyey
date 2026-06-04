@@ -1379,6 +1379,36 @@ mod tests {
         assert_eq!(truncate_error_msg(""), "");
     }
 
+    // OVERLAY §7.1.3-1: ERROR_MSG sanitization on receipt. Mirrors
+    // stellar-core `Peer::recvError` (Peer.cpp:1698-1733): every byte that is
+    // not ASCII-alphanumeric and not a space is replaced with `*`.
+
+    #[test]
+    fn test_sanitize_error_msg_replaces_control_and_ansi() {
+        // `error` kept, ESC(0x1b)->*, `[`->*, `31` kept, `m` kept, `red` kept,
+        // NUL(0x00)->*.
+        assert_eq!(
+            sanitize_error_msg(b"error\x1b[31mred\x00"),
+            "error**31mred*"
+        );
+    }
+
+    #[test]
+    fn test_sanitize_error_msg_high_bytes() {
+        // Bytes > 0x7f are non-ASCII-alphanumeric -> `*`.
+        assert_eq!(sanitize_error_msg(b"a\xff\x80z"), "a**z");
+    }
+
+    #[test]
+    fn test_sanitize_error_msg_preserves_alnum_space() {
+        assert_eq!(sanitize_error_msg(b"valid error 123"), "valid error 123");
+    }
+
+    #[test]
+    fn test_sanitize_error_msg_empty() {
+        assert_eq!(sanitize_error_msg(b""), "");
+    }
+
     #[test]
     fn test_make_error_msg_creates_valid_xdr() {
         let msg = make_error_msg(ErrorCode::Load, "peer rejected");
