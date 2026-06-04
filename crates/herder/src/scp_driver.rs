@@ -3852,31 +3852,6 @@ impl HerderScpCallback {
     pub fn new(driver: Arc<ScpDriver>) -> Self {
         Self { driver }
     }
-
-    fn hash_helper<F>(&self, slot_index: u64, prev_value: &Value, extra: F) -> u64
-    where
-        F: FnOnce(&mut Vec<Vec<u8>>),
-    {
-        let mut values = Vec::new();
-        values.push(Self::xdr_bytes(&slot_index));
-        values.push(Self::xdr_bytes(prev_value));
-        extra(&mut values);
-
-        let mut data = Vec::new();
-        for value in values {
-            data.extend_from_slice(&value);
-        }
-        let hash = Hash256::hash(&data);
-        let mut result = 0u64;
-        for byte in &hash.as_bytes()[0..8] {
-            result = (result << 8) | (*byte as u64);
-        }
-        result
-    }
-
-    fn xdr_bytes<T: stellar_xdr::curr::WriteXdr>(value: &T) -> Vec<u8> {
-        henyey_common::xdr_stream::xdr_to_bytes(value)
-    }
 }
 
 impl SCPDriver for HerderScpCallback {
@@ -3985,38 +3960,12 @@ impl SCPDriver for HerderScpCallback {
         // Logging only
     }
 
-    fn compute_hash_node(
-        &self,
-        slot_index: u64,
-        prev_value: &Value,
-        is_priority: bool,
-        round: u32,
-        node_id: &stellar_xdr::curr::NodeId,
-    ) -> u64 {
-        const HASH_N: u32 = 1;
-        const HASH_P: u32 = 2;
-        self.hash_helper(slot_index, prev_value, |values| {
-            let tag = if is_priority { HASH_P } else { HASH_N };
-            values.push(Self::xdr_bytes(&tag));
-            values.push(Self::xdr_bytes(&round));
-            values.push(Self::xdr_bytes(node_id));
-        })
-    }
-
-    fn compute_value_hash(
-        &self,
-        slot_index: u64,
-        prev_value: &Value,
-        round: u32,
-        value: &Value,
-    ) -> u64 {
-        const HASH_K: u32 = 3;
-        self.hash_helper(slot_index, prev_value, |values| {
-            values.push(Self::xdr_bytes(&HASH_K));
-            values.push(Self::xdr_bytes(&round));
-            values.push(Self::xdr_bytes(value));
-        })
-    }
+    // `compute_hash_node` / `compute_value_hash` intentionally omitted: the
+    // herder inherits the byte-exact default impls on the `SCPDriver` trait
+    // (see crates/scp/src/driver.rs). The default reproduces the same
+    // algorithm this impl previously hand-rolled — verified byte-identical and
+    // locked by `test_default_matches_legacy_herder_algorithm` plus the
+    // absolute-vector tests in the scp crate.
 
     /// Compute the SCP timeout for a given round number.
     ///
