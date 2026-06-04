@@ -28,6 +28,18 @@ impl TransactionExecutor {
         snapshot: &SnapshotHandle,
         tx_envelope: &Arc<TransactionEnvelope>,
         base_fee: u32,
+        // The fee that processFeeSeqNum will charge (or has charged) against the
+        // fee source, used by the final affordability guard to evaluate
+        // stellar-core's post-fee, applying=true predicate. The guard caps this
+        // at the fee source's balance (mirroring `fee = min(balance, fee)`)
+        // before subtracting, so the value passed here is the UNCAPPED fee:
+        //   - Production tx-set path (`FeeMode::Skip`): `process_fee_only`
+        //     already deducted the capped fee from `self.state`, so the
+        //     fee-source balance read by the guard is already net — pass 0.
+        //   - Single-phase `FeeMode::Deduct`: validation runs before the inline
+        //     deduction, so the balance is pre-fee — pass `fee_to_charge`
+        //     (the guard caps it against the balance it reads).
+        fee_to_charge: i64,
     ) -> Result<std::result::Result<ValidatedTransaction, ValidationFailure>> {
         let val_start = std::time::Instant::now();
         let frame = TransactionFrame::with_network(Arc::clone(tx_envelope), self.network_id);
@@ -534,6 +546,61 @@ impl TransactionExecutor {
                     TransactionResultCode::TxFrozenKeyAccessed,
                     "Transaction accesses frozen ledger key",
                 )));
+            }
+        }
+
+        // Fee affordability guard — final step of stellar-core's commonValid
+        // (applying=true). The fee source's *available* balance must cover the
+        // (capped) fee, where available = balance − minBalance − sellingLiab,
+        // computed WITHOUT saturation (TransactionUtils.cpp:752-778,
+        // getAvailableBalance). With applying=true, feeToPay is 0 because the
+        // fee was (or will be) charged by processFeeSeqNum, so the predicate
+        // reduces to `(balance − chargedFee) − minBalance − sellingLiab < 0`.
+        //
+        // We deliberately compute the three-term subtraction directly in i64
+        // rather than reuse `reserves::available_to_send`, which saturates the
+        // intermediate result to 0 and would make the `< 0` test unreachable.
+        //
+        // The guard checks the FEE SOURCE account for both fee-bump and
+        // non-fee-bump transactions, mirroring:
+        //   - TransactionFrame::commonValid (TransactionFrame.cpp:1742-1755),
+        //     setInnermostError(txINSUFFICIENT_BALANCE) ⇒ post_seq_fail.
+        //   - FeeBumpTransactionFrame::commonValid's independent fee-source
+        //     guard (FeeBumpTransactionFrame.cpp:466-475),
+        //     setError(txINSUFFICIENT_BALANCE) ⇒ fee_bump_outer_fail.
+        //
+        // Read the fee-source balance from `self.state` and cap the fee against
+        // it at the same point the deduction caps (`fee = min(balance, fee)`),
+        // so the charged amount matches the actual deduction.
+        if let Some(fee_source) = self.state.get_account(&fee_source_id) {
+            let charged_fee = std::cmp::min(fee_source.balance, fee_to_charge);
+            let min_balance = crate::reserves::minimum_balance(fee_source, self.base_reserve);
+            let selling_liabilities = crate::reserves::selling_liabilities(fee_source);
+            let available_balance = fee_source
+                .balance
+                .saturating_sub(charged_fee)
+                .saturating_sub(min_balance)
+                .saturating_sub(selling_liabilities);
+            if available_balance < 0 {
+                tracing::debug!(
+                    balance = fee_source.balance,
+                    charged_fee = charged_fee,
+                    min_balance = min_balance,
+                    selling_liabilities = selling_liabilities,
+                    is_fee_bump = is_fee_bump,
+                    "Fee source available balance below zero after fee"
+                );
+                return Ok(Err(if is_fee_bump {
+                    fee_bump_outer_fail(
+                        TransactionResultCode::TxInsufficientBalance,
+                        "Fee source available balance insufficient for fee",
+                    )
+                } else {
+                    post_seq_fail(
+                        TransactionResultCode::TxInsufficientBalance,
+                        "Fee source available balance insufficient for fee",
+                    )
+                }));
             }
         }
 

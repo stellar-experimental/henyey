@@ -1824,8 +1824,29 @@ impl TransactionExecutor {
             }
         };
 
+        // Fee the affordability guard in validate_preconditions must account
+        // for, mirroring stellar-core's processFeeSeqNum cap then
+        // commonValid(applying=true). The guard caps this against the
+        // fee-source balance itself, so we pass the UNCAPPED fee here.
+        //   - FeeMode::Skip (production tx-set path): process_fee_only already
+        //     deducted the capped fee into self.state, so the fee-source
+        //     balance the guard reads is already net — pass 0.
+        //   - Otherwise (FeeMode::Deduct, single-phase): validation runs before
+        //     the inline deduction below — pass fee_to_charge(base_fee).
+        let guard_fee_to_charge = if fee_mode == FeeMode::Skip {
+            0
+        } else {
+            TransactionFrame::with_network(Arc::clone(tx_envelope), self.network_id)
+                .fee_to_charge(base_fee as i64)
+        };
+
         // Phase 1-6: Validate structure, accounts, fees, preconditions, sequence, signatures
-        let validated = match self.validate_preconditions(snapshot, tx_envelope, base_fee)? {
+        let validated = match self.validate_preconditions(
+            snapshot,
+            tx_envelope,
+            base_fee,
+            guard_fee_to_charge,
+        )? {
             Ok(v) => v,
             Err(validation_failure) => {
                 let mut failure_result = validation_failure.result;
@@ -4468,8 +4489,11 @@ mod tests {
     /// - The executor sees post-fee-deduction balances
     /// - On body failure, rollback doesn't re-add fee (FeeMode::Skip)
     ///
-    /// We simulate this by setting balance=0 (as if fee was already deducted from
-    /// original 50), using FeeMode::Skip, and verifying rollback integrity.
+    /// We simulate this by setting a post-fee balance (as if the fee was already
+    /// deducted on the main delta), using FeeMode::Skip, and verifying rollback
+    /// integrity. The post-fee balance must stay above minBalance so the
+    /// affordability guard (commonValid, applying=true) accepts it — exactly as
+    /// a real funded account would after its fee was charged.
     #[test]
     fn test_execute_with_pre_apply_result_partial_fee_failing_body() {
         use henyey_crypto::{sign_hash, SecretKey};
@@ -4484,9 +4508,12 @@ mod tests {
         let base_fee: u32 = 100;
         let protocol_version: u32 = 25;
 
-        // Source account with balance=0 — simulating post-fee-deduction state.
-        // In the real parallel path, `pre_deduct_soroban_fees` already took the
-        // partial fee (50) from the account (original balance 50 → 0).
+        // Source account with a post-fee-deduction balance that stays above
+        // minBalance (base_reserve 5_000_000 ⇒ minBalance 10_000_000 with no
+        // sub-entries). In the real parallel path, `pre_deduct_soroban_fees`
+        // already took the fee on the main delta; here we model the resulting
+        // net balance. It must clear the affordability guard, as a real funded
+        // account would.
         let secret = SecretKey::from_seed(&[42u8; 32]);
         let source_id = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(
             *secret.public_key().as_bytes(),
@@ -4499,7 +4526,7 @@ mod tests {
             last_modified_ledger_seq: 1,
             data: LedgerEntryData::Account(AccountEntry {
                 account_id: source_id.clone(),
-                balance: 0, // Post-fee-deduction: original 50 - partial fee 50 = 0
+                balance: 20_000_000, // Post-fee-deduction; above minBalance (10_000_000).
                 seq_num: SequenceNumber(1),
                 num_sub_entries: 0,
                 inflation_dest: None,
@@ -4596,8 +4623,8 @@ mod tests {
         {
             let acc = executor.state.get_account(&source_id).unwrap();
             assert_eq!(
-                acc.balance, 0,
-                "balance must remain 0 (FeeMode::Skip, no deduction)"
+                acc.balance, 20_000_000,
+                "balance must remain unchanged (FeeMode::Skip, no deduction)"
             );
             assert_eq!(acc.seq_num.0, 2, "seq_num must be bumped to 2");
         }
@@ -4616,8 +4643,8 @@ mod tests {
         // DeltaEntries, so rollback_failed_tx cannot replay seq/signer mutations.
         let acc = executor.state.get_account(&source_id).unwrap();
         assert_eq!(
-            acc.balance, 0,
-            "balance must remain 0 — no fee re-deduction from rollback"
+            acc.balance, 20_000_000,
+            "balance must remain unchanged — no fee re-deduction from rollback"
         );
         assert_eq!(
             acc.seq_num.0, 2,

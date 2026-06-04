@@ -673,7 +673,10 @@ fn test_operation_failure_rolls_back_changes() {
     let secret = SecretKey::from_seed(&[11u8; 32]);
     let account_id: AccountId = (&secret.public_key()).into();
 
-    let (key, entry) = create_account_entry(account_id.clone(), 1, 10_000_000);
+    // Balance must clear minBalance (base_reserve 5_000_000, no sub-entries ⇒
+    // 10_000_000) plus the fee so the affordability guard accepts the tx and the
+    // body actually runs (the body then fails on the non-existent destination).
+    let (key, entry) = create_account_entry(account_id.clone(), 1, 20_000_000);
     let snapshot = SnapshotBuilder::new(1)
         .add_entry(key, entry)
         .build_with_default_header();
@@ -739,7 +742,7 @@ fn test_operation_failure_rolls_back_changes() {
 
     let source = state.get_account(&account_id).expect("source account");
     assert_eq!(source.seq_num.0, 2);
-    assert_eq!(source.balance, 10_000_000 - 200);
+    assert_eq!(source.balance, 20_000_000 - 200);
 }
 
 /// Regression test: fee-bump inner TX source account signature must be checked
