@@ -240,6 +240,79 @@ pub fn hot_archive_supported(protocol_version: u32) -> bool {
 }
 
 // =============================================================================
+// Apply-time upgrade validity (non-Config)
+// =============================================================================
+
+/// Bitmask of valid ledger-header flags (`MASK_LEDGER_HEADER_FLAGS`).
+///
+/// Mirrors stellar-core's `MASK_LEDGER_HEADER_FLAGS = 0x7` (bits 0-2). A
+/// `LedgerUpgrade::Flags` upgrade is only valid if no bits outside this mask
+/// are set.
+pub const MASK_LEDGER_HEADER_FLAGS: u32 = 0x7;
+
+/// Re-validate a non-`Config` ledger upgrade for application, mirroring
+/// stellar-core `Upgrades::isValidForApply` (Upgrades.cpp:565-637) for the
+/// scalar (non-Config) arms.
+///
+/// This is the single shared source of truth for the apply-time re-check
+/// performed by the ledger close path (LEDGER_SPEC §7.3.4 step 2). It lives in
+/// `henyey-common` because `henyey-ledger` cannot depend on `henyey-herder`
+/// (herder depends on ledger — a cycle), and herder's nomination-time validity
+/// rules cannot be reused directly from the ledger apply path.
+///
+/// The `Config` variant is deliberately out of this helper's remit: Config
+/// validity requires ledger-state lookups (the config upgrade set must be
+/// loadable and structurally valid), which is performed by the ledger-side
+/// `apply_config_upgrades`. Callers must branch on `Config` themselves; this
+/// function returns `true` for `Config` so a caller that forwards every upgrade
+/// here does not incorrectly skip a Config upgrade that the ledger-side path
+/// will validate.
+///
+/// # Arguments
+///
+/// * `upgrade` - the upgrade to validate
+/// * `current_version` - the protocol version in effect *before* this upgrade
+///   (callers thread an `effective_version` that advances as valid `Version`
+///   upgrades are accepted, mirroring core re-reading the header per upgrade)
+/// * `max_protocol_version` - the maximum protocol version this node supports
+///
+/// # Parity
+///
+/// Matches the non-Config arms of stellar-core `Upgrades::isValidForApply`:
+/// - `Version`: `new > current && new <= max`
+/// - `BaseFee`: `fee != 0`
+/// - `MaxTxSetSize`: always valid
+/// - `BaseReserve`: `reserve != 0`
+/// - `Flags`: protocol >= V18 and no bits outside `MASK_LEDGER_HEADER_FLAGS`
+/// - `MaxSorobanTxSetSize`: protocol >= V20
+pub fn upgrade_valid_for_apply_non_config(
+    upgrade: &stellar_xdr::curr::LedgerUpgrade,
+    current_version: u32,
+    max_protocol_version: u32,
+) -> bool {
+    use stellar_xdr::curr::LedgerUpgrade;
+    match upgrade {
+        LedgerUpgrade::Version(new_version) => {
+            *new_version <= max_protocol_version && *new_version > current_version
+        }
+        LedgerUpgrade::BaseFee(fee) => *fee != 0,
+        LedgerUpgrade::MaxTxSetSize(_) => true,
+        LedgerUpgrade::BaseReserve(reserve) => *reserve != 0,
+        LedgerUpgrade::Flags(flags) => {
+            protocol_version_starts_from(current_version, ProtocolVersion::V18)
+                && (*flags & !MASK_LEDGER_HEADER_FLAGS) == 0
+        }
+        LedgerUpgrade::MaxSorobanTxSetSize(_) => {
+            protocol_version_starts_from(current_version, ProtocolVersion::V20)
+        }
+        // Config validity is delegated to the ledger-side apply path (it
+        // requires ledger-state lookups). Treat as valid here so a caller that
+        // forwards every upgrade does not skip a Config upgrade.
+        LedgerUpgrade::Config(_) => true,
+    }
+}
+
+// =============================================================================
 // LCL Context
 // =============================================================================
 
@@ -345,5 +418,135 @@ mod tests {
         let lcl = LclContext::new(23, hash);
         assert_eq!(lcl.protocol_version(), 23);
         assert_eq!(lcl.lcl_hash(), &stellar_xdr::curr::Hash([42u8; 32]));
+    }
+
+    // ---- upgrade_valid_for_apply_non_config -------------------------------
+
+    #[test]
+    fn test_upgrade_valid_version_monotonic_and_range() {
+        use stellar_xdr::curr::LedgerUpgrade;
+        // Strictly increasing and within max → valid.
+        assert!(upgrade_valid_for_apply_non_config(
+            &LedgerUpgrade::Version(26),
+            25,
+            26
+        ));
+        // Regression (new <= current) → invalid.
+        assert!(!upgrade_valid_for_apply_non_config(
+            &LedgerUpgrade::Version(25),
+            26,
+            26
+        ));
+        // Equal to current → invalid (not strictly increasing).
+        assert!(!upgrade_valid_for_apply_non_config(
+            &LedgerUpgrade::Version(25),
+            25,
+            26
+        ));
+        // Above max supported → invalid.
+        assert!(!upgrade_valid_for_apply_non_config(
+            &LedgerUpgrade::Version(27),
+            25,
+            26
+        ));
+    }
+
+    #[test]
+    fn test_upgrade_valid_base_fee_nonzero() {
+        use stellar_xdr::curr::LedgerUpgrade;
+        assert!(upgrade_valid_for_apply_non_config(
+            &LedgerUpgrade::BaseFee(100),
+            25,
+            26
+        ));
+        assert!(!upgrade_valid_for_apply_non_config(
+            &LedgerUpgrade::BaseFee(0),
+            25,
+            26
+        ));
+    }
+
+    #[test]
+    fn test_upgrade_valid_base_reserve_nonzero() {
+        use stellar_xdr::curr::LedgerUpgrade;
+        assert!(upgrade_valid_for_apply_non_config(
+            &LedgerUpgrade::BaseReserve(5_000_000),
+            25,
+            26
+        ));
+        assert!(!upgrade_valid_for_apply_non_config(
+            &LedgerUpgrade::BaseReserve(0),
+            25,
+            26
+        ));
+    }
+
+    #[test]
+    fn test_upgrade_valid_max_tx_set_size_always_valid() {
+        use stellar_xdr::curr::LedgerUpgrade;
+        assert!(upgrade_valid_for_apply_non_config(
+            &LedgerUpgrade::MaxTxSetSize(0),
+            25,
+            26
+        ));
+        assert!(upgrade_valid_for_apply_non_config(
+            &LedgerUpgrade::MaxTxSetSize(1000),
+            25,
+            26
+        ));
+    }
+
+    #[test]
+    fn test_upgrade_valid_flags_mask_and_protocol() {
+        use stellar_xdr::curr::LedgerUpgrade;
+        // Valid: within mask, protocol >= V18.
+        assert!(upgrade_valid_for_apply_non_config(
+            &LedgerUpgrade::Flags(MASK_LEDGER_HEADER_FLAGS),
+            25,
+            26
+        ));
+        // Invalid: bit outside the mask.
+        assert!(!upgrade_valid_for_apply_non_config(
+            &LedgerUpgrade::Flags(MASK_LEDGER_HEADER_FLAGS | 0x8),
+            25,
+            26
+        ));
+        // Invalid: protocol below V18 (not reachable in henyey's 24+ floor,
+        // but the rule must still hold).
+        assert!(!upgrade_valid_for_apply_non_config(
+            &LedgerUpgrade::Flags(0x1),
+            17,
+            26
+        ));
+    }
+
+    #[test]
+    fn test_upgrade_valid_max_soroban_tx_set_size_protocol_gate() {
+        use stellar_xdr::curr::LedgerUpgrade;
+        assert!(upgrade_valid_for_apply_non_config(
+            &LedgerUpgrade::MaxSorobanTxSetSize(100),
+            20,
+            26
+        ));
+        assert!(!upgrade_valid_for_apply_non_config(
+            &LedgerUpgrade::MaxSorobanTxSetSize(100),
+            19,
+            26
+        ));
+    }
+
+    #[test]
+    fn test_upgrade_valid_config_delegated_returns_true() {
+        use stellar_xdr::curr::{ConfigUpgradeSetKey, ContractId, Hash, LedgerUpgrade};
+        let key = ConfigUpgradeSetKey {
+            contract_id: ContractId(Hash([0u8; 32])),
+            content_hash: Hash([0u8; 32]),
+        };
+        // Config is delegated to ledger-side validation → helper returns true.
+        assert!(upgrade_valid_for_apply_non_config(
+            &LedgerUpgrade::Config(key),
+            25,
+            26
+        ));
     }
 }

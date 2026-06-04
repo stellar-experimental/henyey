@@ -1268,6 +1268,54 @@ impl UpgradeContext {
             .any(|u| matches!(u, LedgerUpgrade::Config(_)))
     }
 
+    /// Compute the apply-time skip decision for every upgrade in `self.upgrades`,
+    /// in list order, mirroring stellar-core `LedgerManagerImpl.cpp:1660-1711`.
+    ///
+    /// LEDGER_SPEC §7.3.4 step 2 (`LEDGER §7.3.4-2`): each upgrade is
+    /// re-validated via `isValidForApply` at apply time; invalid upgrades are
+    /// skipped with a warning rather than aborting the ledger close.
+    ///
+    /// Returns a parallel `Vec<bool>` (one entry per upgrade, same order) where
+    /// `true` means "skip this upgrade at apply time". A skipped upgrade must
+    /// neither mutate header fields ([`apply_to_header`]) nor produce an
+    /// `UpgradeEntryMeta` — but it REMAINS in the header's `scpValue.upgrades`
+    /// (the full nominated set), preserving header-hash parity.
+    ///
+    /// The running `effective_version` starts at `self.current_version` (the
+    /// pre-upgrade protocol version) and advances when a valid `Version`
+    /// upgrade is accepted, so a later upgrade gated on a higher protocol (e.g.
+    /// a `Flags` or `MaxSorobanTxSetSize` upgrade following a `Version` upgrade)
+    /// is evaluated against the version that prior upgrades would have
+    /// established. This mirrors core re-reading the header version per upgrade
+    /// after each prior upgrade commits. SCP emits at most one upgrade per type,
+    /// so the only real cross-upgrade dependency is a single `Version` upgrade
+    /// raising the version — hence a single `effective_version` step suffices.
+    ///
+    /// `Config` upgrades are validated by [`apply_config_upgrades`] (which
+    /// requires ledger-state lookups); the common helper treats them as valid
+    /// here, so a `Config` entry is never skipped by this pass. Its skip is
+    /// decided by the config apply path instead.
+    pub fn apply_time_skip_set(&self, max_protocol_version: u32) -> Vec<bool> {
+        let mut effective_version = self.current_version;
+        let mut skips = Vec::with_capacity(self.upgrades.len());
+        for upgrade in &self.upgrades {
+            let valid = henyey_common::upgrade_valid_for_apply_non_config(
+                upgrade,
+                effective_version,
+                max_protocol_version,
+            );
+            // Advance the running version when a valid Version upgrade is
+            // accepted, so subsequent version-gated upgrades see the new value.
+            if valid {
+                if let LedgerUpgrade::Version(v) = upgrade {
+                    effective_version = *v;
+                }
+            }
+            skips.push(!valid);
+        }
+        skips
+    }
+
     /// Apply all config upgrades to the ledger.
     ///
     /// Loads and validates each config upgrade, then applies the configuration

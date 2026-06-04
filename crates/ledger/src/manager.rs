@@ -8495,6 +8495,171 @@ mod tests {
         assert!(matches!(decoded[1], LedgerUpgrade::BaseReserve(5_000_000)));
     }
 
+    /// Regression test for #3060 (LEDGER §7.3.4-2): an upgrade that was valid
+    /// at nomination time but is invalid at apply time (a `Version` regression:
+    /// the header is already at 26, the upgrade proposes 25) must be SKIPPED at
+    /// apply time — the header field is left unchanged and no `UpgradeEntryMeta`
+    /// is emitted — while the full nominated set remains in
+    /// `scp_value.upgrades` (header-hash parity).
+    ///
+    /// Mirrors stellar-core `LedgerManagerImpl.cpp:1660-1711`.
+    #[test]
+    fn test_apply_time_revalidation_skips_version_regression() {
+        use stellar_xdr::curr::{LedgerUpgrade, Limits, ReadXdr};
+
+        let manager = LedgerManager::new(
+            "Test SDF Network ; September 2015".to_string(),
+            LedgerManagerConfig {
+                validate_bucket_hash: false,
+                ..Default::default()
+            },
+        );
+
+        let mut ctx = make_test_close_context(&manager, 2);
+        // Header is already at protocol 26.
+        ctx.prev_header.ledger_version = 26;
+        ctx.upgrade_ctx = UpgradeContext::new(26);
+
+        // A version-regression upgrade: valid-at-nomination, invalid-at-apply.
+        let upgrade = LedgerUpgrade::Version(25);
+        ctx.close_data.upgrades = vec![upgrade.clone()];
+        ctx.upgrade_ctx.add_upgrade(upgrade.clone());
+
+        // (b) The skip decision: the regression upgrade must be marked skipped,
+        // so the meta-building loop emits no UpgradeEntryMeta for it.
+        let skips = ctx
+            .upgrade_ctx
+            .apply_time_skip_set(henyey_common::CURRENT_LEDGER_PROTOCOL_VERSION);
+        assert_eq!(
+            skips,
+            vec![true],
+            "version-regression upgrade must be skipped"
+        );
+
+        // (a) The header field must NOT be mutated to 25.
+        let (header, _hash) = ctx
+            .build_and_hash_header(Hash256::ZERO, Hash256::ZERO, false, false)
+            .expect("build_and_hash_header should succeed");
+        assert_eq!(
+            header.ledger_version, 26,
+            "skipped version-regression upgrade must NOT lower ledger_version"
+        );
+
+        // (c) The full nominated set must remain in scp_value.upgrades.
+        assert_eq!(
+            header.scp_value.upgrades.len(),
+            1,
+            "scp_value.upgrades must remain unfiltered (full nominated set)"
+        );
+        let decoded =
+            LedgerUpgrade::from_xdr(&header.scp_value.upgrades[0].0, Limits::none()).unwrap();
+        assert!(
+            matches!(decoded, LedgerUpgrade::Version(25)),
+            "scp_value.upgrades must still contain the nominated Version(25)"
+        );
+    }
+
+    /// Regression test for #3060: an invalid `BaseFee(0)` upgrade is skipped at
+    /// apply time (header `base_fee` unchanged, no meta), while a valid upgrade
+    /// in the same set still applies and the header retains the full nominated
+    /// set in `scp_value.upgrades`.
+    #[test]
+    fn test_apply_time_revalidation_skips_invalid_base_fee() {
+        use stellar_xdr::curr::{LedgerUpgrade, Limits, ReadXdr};
+
+        let manager = LedgerManager::new(
+            "Test SDF Network ; September 2015".to_string(),
+            LedgerManagerConfig {
+                validate_bucket_hash: false,
+                ..Default::default()
+            },
+        );
+
+        let mut ctx = make_test_close_context(&manager, 2);
+        ctx.prev_header.ledger_version = 26;
+        ctx.prev_header.base_fee = 100;
+        ctx.upgrade_ctx = UpgradeContext::new(26);
+
+        // Invalid BaseFee(0) alongside a valid MaxTxSetSize upgrade.
+        let bad = LedgerUpgrade::BaseFee(0);
+        let good = LedgerUpgrade::MaxTxSetSize(5000);
+        ctx.close_data.upgrades = vec![bad.clone(), good.clone()];
+        ctx.upgrade_ctx.add_upgrade(bad.clone());
+        ctx.upgrade_ctx.add_upgrade(good.clone());
+
+        // Skip-set: BaseFee(0) skipped, MaxTxSetSize accepted.
+        let skips = ctx
+            .upgrade_ctx
+            .apply_time_skip_set(henyey_common::CURRENT_LEDGER_PROTOCOL_VERSION);
+        assert_eq!(
+            skips,
+            vec![true, false],
+            "BaseFee(0) must be skipped, MaxTxSetSize accepted"
+        );
+
+        let (header, _hash) = ctx
+            .build_and_hash_header(Hash256::ZERO, Hash256::ZERO, false, false)
+            .expect("build_and_hash_header should succeed");
+
+        // base_fee must NOT be zeroed by the skipped upgrade.
+        assert_eq!(
+            header.base_fee, 100,
+            "skipped BaseFee(0) must NOT mutate header.base_fee"
+        );
+        // The valid upgrade still applies.
+        assert_eq!(
+            header.max_tx_set_size, 5000,
+            "valid MaxTxSetSize upgrade must still apply"
+        );
+
+        // Full nominated set preserved (unfiltered).
+        assert_eq!(header.scp_value.upgrades.len(), 2);
+        let decoded: Vec<LedgerUpgrade> = header
+            .scp_value
+            .upgrades
+            .iter()
+            .map(|u| LedgerUpgrade::from_xdr(&u.0, Limits::none()).unwrap())
+            .collect();
+        assert!(matches!(decoded[0], LedgerUpgrade::BaseFee(0)));
+        assert!(matches!(decoded[1], LedgerUpgrade::MaxTxSetSize(5000)));
+    }
+
+    /// #3060 ordering: a `Flags` upgrade gated on protocol >= V18 alongside a
+    /// `Version` upgrade is evaluated against the running `effective_version`.
+    /// Both are valid here (header already >= V18), confirming the
+    /// `effective_version` threading accepts a Flags upgrade after a Version
+    /// upgrade in the same set.
+    #[test]
+    fn test_apply_time_revalidation_effective_version_ordering() {
+        use stellar_xdr::curr::LedgerUpgrade;
+
+        let manager = LedgerManager::new(
+            "Test SDF Network ; September 2015".to_string(),
+            LedgerManagerConfig {
+                validate_bucket_hash: false,
+                ..Default::default()
+            },
+        );
+
+        let mut ctx = make_test_close_context(&manager, 2);
+        ctx.prev_header.ledger_version = 25;
+        ctx.upgrade_ctx = UpgradeContext::new(25);
+
+        // Version(26) then Flags(0x1): both valid; Flags evaluated at the
+        // advanced effective_version (26).
+        ctx.upgrade_ctx.add_upgrade(LedgerUpgrade::Version(26));
+        ctx.upgrade_ctx.add_upgrade(LedgerUpgrade::Flags(0x1));
+
+        let skips = ctx
+            .upgrade_ctx
+            .apply_time_skip_set(henyey_common::CURRENT_LEDGER_PROTOCOL_VERSION);
+        assert_eq!(
+            skips,
+            vec![false, false],
+            "Version(26) and Flags(0x1) must both be accepted"
+        );
+    }
+
     /// Regression test: bucket_list() read guard must be dropped before
     /// bucket_list_mut() write guard is acquired on the same RwLock.
     /// Holding both simultaneously deadlocks (parking_lot RwLock is not
