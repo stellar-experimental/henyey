@@ -9,14 +9,14 @@ description: |
   residual REVISE-MAJOR concern is filed as a follow-up issue for operator
   triage. Use when invoked by /project-tick with an issue in
   ready-for-planning, or manually as /plan <issue>.
-model: gpt-5.4
+argument-hint: <issue-number>
 ---
 
 # /plan <issue> — adversarial plan drafting
 
 You produce a single, converged implementation plan for one issue. The plan is what `/do` will execute, so it must be specific: file paths, function names, test approach, parity considerations.
 
-You are not alone — three independent critics evaluate every draft in parallel. The plan converges when all three approve (or downgrade to `REVISE-MINOR`).
+You are not alone — three independent critics (correctness / parity / scope) evaluate every draft in parallel. The plan converges when all three approve (or downgrade to `REVISE-MINOR`). Each REVISE-MAJOR concern is then subjected to an **adversarial refute pass** (an independent skeptic sub-agent argues the concern is wrong or non-blocking) before it is allowed to cost a revision round — the distinct correctness/parity/scope lenses remain the primary defense against missed bugs, while the refute pass kills false-positive concerns.
 
 **Hard cap: 2 rounds.** If round 2 still has REVISE-MAJOR verdicts, the plan **force-converges**: ship the round-2 plan as-is, file one follow-up issue per residual REVISE-MAJOR concern (so the disagreement is preserved as backlog rather than blocking the pipeline), and advance to `ready-for-doing`. The doer reads the converged plan and the follow-up list as "minor items to consider during implementation."
 
@@ -117,7 +117,7 @@ Include this bootstrap verbatim in each critic's prompt so the sub-agent knows w
 
 These are the exact out-of-`~/data` scratch dirs that prior pipeline runs leaked and that repeatedly filled the root FS. A critic that needs a checkout uses `$CRITIC_WORKTREE` and nothing else.
 
-Launch three `general-purpose` agents in parallel — do not wait between them. **Each critic must be spawned with `--model gpt-5.4`** (or equivalent model parameter) explicitly — do not inherit from the parent. Cross-model diversity is the whole point of the critic step. Each gets the issue number, the plan-draft comment ID, and a focused brief:
+Launch three `general-purpose` sub-agents via the **Agent/Task tool** in a single message (so they run in parallel — do not dispatch them one at a time). Each is spawned with `model: opus` and `run_in_background: false`. Three distinct lenses (correctness / parity / scope) are the primary defense against missed bugs. Each gets the issue number, the plan-draft comment ID, and a focused brief:
 
 ### Critic A — Correctness
 
@@ -187,17 +187,51 @@ Launch three `general-purpose` agents in parallel — do not wait between them. 
 
 Wait for all three critics to post. Read their verdicts.
 
-## Step 4 — Decide: converge or revise
+## Step 4 — Adversarial refute pass (REVISE-MAJOR concerns only)
 
 **Convergence rule:** all three verdicts are `APPROVE` or `REVISE-MINOR`.
 
-If converged in round 1 → skip to Step 6 (post Converged Plan).
+If all three converged in round 1 (no `REVISE-MAJOR`) → skip to Step 6 (post Converged Plan).
 
-If any critic returned `REVISE-MAJOR` → go to Step 5 (round 2).
+If any critic returned `REVISE-MAJOR`, do **not** immediately revise. First subject each REVISE-MAJOR concern to an independent adversarial refute pass — this replaces the cross-model diversity the pipeline used to get from a second model, and directly attacks the false-positive concerns that otherwise cost a wasted round.
+
+Enumerate every distinct `REVISE-MAJOR` concern across the three critic comments (one concern = one bullet from a critic's "Key concerns" / details block). For each such concern, spawn an independent `general-purpose` **skeptic** sub-agent via the Agent/Task tool, all in a **single message** so they run in parallel, each with `model: opus` and `run_in_background: false`. The skeptic does NOT inherit the critic's framing — its job is to *refute* the concern:
+
+> A critic raised the following REVISE-MAJOR concern about the plan on issue
+> #$ISSUE (plan-draft comment <comment-id>):
+>
+> <verbatim concern bullet + the critic lens it came from>
+>
+> Your job is to REFUTE this concern. Argue, with evidence, that it is one of:
+> (a) **wrong** — the plan already handles this, or the critic misread the
+> plan / the code; (b) **already-satisfied on current `origin/main`** — the
+> behavior the critic wants already exists (read the relevant source to
+> confirm); or (c) **non-blocking** — even if technically true, it does not
+> invalidate the plan and is at most a REVISE-MINOR / follow-up item.
+>
+> You may read the issue, the plan draft, and any source files (read-only; if
+> you need a scratch checkout use the workspace contract from Step 3 with a
+> `skeptic-<n>` slot — never the repo tree, a sibling, or `/tmp`). Be honest:
+> if you genuinely cannot refute it on any of the three grounds, say so
+> explicitly. The concern only **stands** if it cannot be refuted.
+>
+> Post your finding as a comment headed `## 🥊 Refute — <critic lens>: <short
+> concern summary>` with a `**Outcome:** REFUTED | STANDS` line, followed by a
+> 2–4 bullet justification (cite files/functions for ground (b)).
+
+Wait for all skeptics to post. Then:
+
+- A concern is **dropped** if its skeptic returned `REFUTED`. Record it in the eventual plan comment under a "Refuted concerns" note as `refuted: <reason>` so the audit trail shows why a flagged concern did not drive a revision.
+- A concern **stands** if its skeptic returned `STANDS` (or failed to post / errored after one retry — an un-refuted concern stands, fail-safe toward the critic).
+
+**Decision after the refute pass:**
+
+- If **no** REVISE-MAJOR concern survives refutation (all refuted) → treat the round as converged; skip to Step 6 (post Converged Plan, listing the refuted concerns).
+- If **at least one** REVISE-MAJOR concern survives → go to Step 5 (round 2), addressing only the surviving concerns.
 
 ## Step 5 — Round 2: Revise
 
-Reconcile the feedback into a revised plan. Address every `REVISE-MAJOR` concern. You may also address `REVISE-MINOR` concerns at your discretion (note which you fixed, which you defer to `/do`).
+Reconcile the feedback into a revised plan. Address every `REVISE-MAJOR` concern **that survived the Step 4 refute pass** (refuted concerns are dropped — do not revise for them). You may also address `REVISE-MINOR` concerns at your discretion (note which you fixed, which you defer to `/do`).
 
 ### Special handling for scope `REVISE-MAJOR`
 
@@ -233,20 +267,20 @@ Expand the plan to address the root cause. If expansion would now make the plan 
 **Followup sub-issues filed:** #N1, #N2 (if scope was narrowed)
 ```
 
-Spawn the same three critics again in parallel with the same briefs, but with "Round 2" in the comment heading. Wait for verdicts.
+Spawn the same three critics again via the Agent/Task tool in a single message (parallel, `model: opus`, `run_in_background: false`), with the same briefs but with "Round 2" in the comment heading. Wait for verdicts. Then run the **same Step 4 adversarial refute pass** on any round-2 `REVISE-MAJOR` concern (parallel `opus` skeptics, one per concern); refuted concerns are dropped and only surviving concerns count below.
 
-**Round 2 outcomes:**
+**Round 2 outcomes (after the refute pass):**
 
-- All approve or REVISE-MINOR → converge (Step 6).
-- Any `REVISE-MAJOR` → **force-converge** (Step 5-bis below). The round-2 plan ships as-is; residual REVISE-MAJOR concerns become follow-up issues for operator triage. The pipeline advances to `ready-for-doing` rather than stalling at `blocked`.
+- All approve or REVISE-MINOR, or every round-2 REVISE-MAJOR was refuted → converge (Step 6); note the refuted concerns.
+- Any `REVISE-MAJOR` **survives refutation** → **force-converge** (Step 5-bis below). The round-2 plan ships as-is; surviving REVISE-MAJOR concerns become follow-up issues for operator triage. The pipeline advances to `ready-for-doing` rather than stalling at `blocked`.
 
 ## Step 5-bis — Force-converge (round-2 REVISE-MAJOR)
 
-Only entered when round-2 critics still produced any `REVISE-MAJOR` verdict.
+Only entered when a round-2 `REVISE-MAJOR` concern **survived the refute pass**.
 
-### 5-bis.1 File one follow-up issue per residual REVISE-MAJOR concern
+### 5-bis.1 File one follow-up issue per surviving REVISE-MAJOR concern
 
-For each round-2 critic comment with verdict `REVISE-MAJOR`, extract each concern bullet from its body and file:
+For each round-2 REVISE-MAJOR concern that survived refutation, file (do NOT file follow-ups for refuted concerns):
 
 ```bash
 gh issue create --repo stellar-experimental/henyey \
@@ -345,9 +379,12 @@ Post the final plan as a clean, scannable comment. This is the single document `
 **Minor items to consider during implementation:**
 - <any REVISE-MINOR points the doer should keep in mind>
 
+**Refuted concerns (raised REVISE-MAJOR, dropped by the refute pass — omit if none):**
+- <critic lens> `<short concern summary>` — refuted: <reason from the skeptic, e.g. "already satisfied on main: foo() already guards N==0">
+
 **Sub-issues filed (if scope was narrowed):** #N1, #N2
 
-**Convergence:** Round <1|2>, verdicts: A=APPROVE, B=APPROVE, C=APPROVE
+**Convergence:** Round <1|2>, verdicts: A=APPROVE, B=APPROVE, C=APPROVE *(+ M REVISE-MAJOR concern(s) refuted, if any)*
 ```
 
 Then transition:
@@ -360,14 +397,16 @@ gh issue edit $ISSUE --repo stellar-experimental/henyey --remove-assignee @me
 ## What you do NOT do
 
 - **Do not** write or commit code. `/do` does that.
-- **Do not** run sequential critic rounds — critics run in parallel.
-- **Do not** exceed 2 rounds. If round 2 still has REVISE-MAJOR verdicts, force-converge (Step 5-bis) — file follow-ups for the residuals and ship the round-2 plan to `ready-for-doing`. Do NOT spin a third round.
-- **Do not** "argue back" with a critic by re-opening the same plan. If you genuinely disagree, post your reasoning in the revised plan and let the round-2 critic re-evaluate. If round 2 still REVISE-MAJOR, force-converge with the disagreement preserved as follow-up issues — don't block the pipeline.
+- **Do not** run sequential critic rounds — the three critics (and the per-concern refute skeptics) are each launched in a single Agent/Task-tool message so they run in parallel.
+- **Do not** revise for a REVISE-MAJOR concern before running the refute pass. Only concerns that survive refutation drive a round-2 revision; refuted concerns are dropped (recorded as `refuted: <reason>` in the plan comment).
+- **Do not** exceed 2 rounds. If a round-2 REVISE-MAJOR concern survives refutation, force-converge (Step 5-bis) — file follow-ups for the surviving concerns and ship the round-2 plan to `ready-for-doing`. Do NOT spin a third round.
+- **Do not** "argue back" with a critic by re-opening the same plan. If you genuinely disagree, post your reasoning in the revised plan and let the round-2 critic re-evaluate. If round 2 still has a surviving REVISE-MAJOR, force-converge with the disagreement preserved as follow-up issues — don't block the pipeline.
 - **Do not** explore the codebase open-endedly. Each round, you read at most ~15 files of new context. Critics may read additional files independently.
 
 ## Failure handling
 
-- **Critic agent failure:** if one of the three critics fails to post (timed out, errored), retry that critic once. If still failing, treat its verdict as REVISE-MAJOR and proceed to round 2; if round 2 also has a critic failure, `blocked` with that reason.
+- **Critic agent failure:** if one of the three critics fails to post (timed out, errored), retry that critic once. If still failing, treat its verdict as REVISE-MAJOR and proceed to the refute pass / round 2; if round 2 also has a critic failure, `blocked` with that reason.
+- **Skeptic agent failure:** if a refute skeptic fails to post after one retry, the concern it was evaluating **stands** (fail-safe toward the critic) — it drives a revision as if un-refuted.
 - **Triage Report missing:** route the issue back to `backlog` with a comment explaining; this is a `/triage` bug, not ours to fix.
 - **GH API failure:** retry once after 5 seconds; if still failing, leave the issue assigned and exit non-zero.
 
@@ -377,11 +416,17 @@ gh issue edit $ISSUE --repo stellar-experimental/henyey --remove-assignee @me
 - A: APPROVE, B: APPROVE, C: REVISE-MINOR ("consider testing the empty-input case")
 - → Post Converged Plan noting the minor item; move to `ready-for-doing`.
 
-**Round 2 converges:**
+**Round 1 REVISE-MAJOR refuted → converges:**
 - Round 1: A: APPROVE, B: REVISE-MAJOR ("misses stellar-core's pre-protocol-26 fallback"), C: APPROVE.
-- → Revise to add the fallback handling. Round 2: A: APPROVE, B: APPROVE, C: REVISE-MINOR. → Converge.
+- → Refute pass: the skeptic reads `stellar-core/` and the plan, finds protocol 24+ is the minimum supported (CLAUDE.md), so the pre-protocol-26 fallback is dead code and out of scope → `REFUTED`.
+- → No surviving concern. Converge in round 1; note `refuted: parity — pre-p26 fallback is unreachable (protocol 24+ only)` in the plan comment.
+
+**Round 2 converges:**
+- Round 1: A: APPROVE, B: REVISE-MAJOR ("misses a real edge case at slot boundary"), C: APPROVE.
+- → Refute pass: skeptic cannot refute (the edge case is genuinely unhandled) → `STANDS`.
+- → Revise to handle the edge case. Round 2: A: APPROVE, B: APPROVE, C: REVISE-MINOR. → Converge.
 
 **Round 2 force-converges:**
-- Round 1: C: REVISE-MAJOR ("too broad — splits across 3 crates")
-- → File sub-issues, narrow plan. Round 2: A: REVISE-MAJOR ("narrowed plan no longer addresses original problem"), B: APPROVE, C: APPROVE.
-- → Force-converge (Step 5-bis): file follow-up issue capturing A's "narrowed plan misses original problem" concern, post `## ⚠️ Plan: Force-Converged (Round 2 Cap)` with the round-2 plan body and a reference to the follow-up, advance to `ready-for-doing`. The operator triages the follow-up — close as won't-fix if the original problem is genuinely covered by the narrowed plan + sub-issues, or schedule a follow-up PR if A was right.
+- Round 1: C: REVISE-MAJOR ("too broad — splits across 3 crates") → refute pass: `STANDS` (genuinely 3 crates).
+- → File sub-issues, narrow plan. Round 2: A: REVISE-MAJOR ("narrowed plan no longer addresses original problem"), B: APPROVE, C: APPROVE → refute pass on A's concern: `STANDS`.
+- → Force-converge (Step 5-bis): file follow-up issue capturing A's surviving "narrowed plan misses original problem" concern, post `## ⚠️ Plan: Force-Converged (Round 2 Cap)` with the round-2 plan body and a reference to the follow-up, advance to `ready-for-doing`. The operator triages the follow-up — close as won't-fix if the original problem is genuinely covered by the narrowed plan + sub-issues, or schedule a follow-up PR if A was right.

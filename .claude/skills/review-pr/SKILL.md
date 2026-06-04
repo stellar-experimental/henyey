@@ -16,7 +16,7 @@ description: |
   become follow-up issues; only red/pending CI at the cap still blocks. Use
   when invoked by /project-tick with an issue in in-review, or manually as
   /review-pr <issue>.
-model: gpt-5.4
+argument-hint: <issue-number>
 ---
 
 # /review-pr <issue> — adversarial PR review
@@ -284,7 +284,9 @@ Otherwise, the PR is **non-parity** — Reviewer B uses risk lens.
 
 ## Step 4 — Spawn 2 reviewers in parallel
 
-Launch both as `general-purpose` foreground sub-agents. Do not wait between them. **Each reviewer must be spawned with `--model gpt-5.4`** (or equivalent model parameter) explicitly — do not inherit from the parent. Cross-model diversity catches issues a same-model pipeline would miss.
+Launch both `general-purpose` reviewers via the **Agent/Task tool** in a single message (so they run in parallel — do not dispatch them one at a time). Each is spawned with `model: opus` and `run_in_background: false`. The two distinct lenses (correctness + parity-or-risk) are the primary missed-bug defense; the adversarial refute pass in Step 6.1c is what trims the false-positive bounces.
+
+**Review against current `origin/main` (do not review stale state).** Each reviewer prompt must instruct the sub-agent to `git fetch origin` and check out the PR head **rebased onto / merged with the latest `origin/main`** before reviewing or running anything — e.g. `git fetch origin && git checkout pr-$PR_NUM && git merge --no-edit origin/main` inside `$REVIEWER_WORKTREE`. Reviewing on a stale base is what caused historical merge-helper failures (the PR looked clean against an old main but conflicted or regressed against current main); always evaluate the PR as it will actually land.
 
 **Workspace binding (issue #2843 — pass into every reviewer prompt).** Before spawning, run the Workspace-contract bootstrap to derive `$REVIEWER_WORKTREE` (under `~/data/$SESSION_ID/review-pr-$ISSUE/reviewer`). Pass that exact path into each reviewer prompt and require it as the ONLY scratch location:
 
@@ -476,6 +478,57 @@ else
 fi
 ```
 
+## Step 5.5 — Self-modifying gate (BEFORE the merge decision)
+
+A PR that edits the project-management pipeline's **own** skills or scripts must never auto-merge unattended — even on triple-green — because a bad self-edit could break the next orchestrator run (the very machinery that would otherwise catch and revert it). Detect this before deciding the merge.
+
+Fetch the PR's changed file paths:
+
+```bash
+SELF_MOD_FILES=$(gh pr view $PR_NUM --repo stellar-experimental/henyey \
+  --json files --jq '.files[].path')
+```
+
+The PR is **self-modifying** if any changed path matches one of these patterns:
+
+- `.claude/skills/{project-loop,project-tick,plan,do,review-pr,triage}/...` (any file under those skill dirs)
+- `scripts/lib/{review-pr-merge,agent-worktree-contract,pipeline-anomaly-log}.sh`
+- `.github/skills/shared/scripts/...`
+
+```bash
+IS_SELF_MOD=$(echo "$SELF_MOD_FILES" | grep -Eq \
+  '^\.claude/skills/(project-loop|project-tick|plan|do|review-pr|triage)/|^scripts/lib/(review-pr-merge|agent-worktree-contract|pipeline-anomaly-log)\.sh$|^\.github/skills/shared/scripts/' \
+  && echo "true" || echo "false")
+```
+
+If `IS_SELF_MOD == true`, the PR is gated regardless of reviewer/CI state. Still run the reviewers and the refute pass (Step 6.1/6.1c) and recheck CI (Step 5) so the operator sees full verdicts, but do **NOT** auto-merge, bounce, or block. Instead post a summary and stop:
+
+```markdown
+## Review: Self-Modifying — Operator Approval Required
+
+This PR changes the project-management pipeline's own skills/scripts, so it does **not** auto-merge even on triple-green. A bad self-edit could break the next orchestrator run — these changes require an operator to review and merge by hand.
+
+**Self-modifying paths touched:**
+- <each matched path>
+
+**Reviewer verdicts:**
+- Correctness: APPROVE | CHANGES_REQUESTED — <one-line summary> <(N finding(s) refuted)>
+- <Parity|Risk>: APPROVE | CHANGES_REQUESTED — <one-line summary>
+
+**External reviewers:** <"user: STATE" list, or "none">
+
+**CI:** green | red | running | empty
+
+Leaving the issue in `in-review`. An operator should review the diff and merge manually (e.g. `gh pr merge $PR_NUM --squash --admin`) once satisfied.
+```
+
+```bash
+# Leave the issue in in-review; unassign so it isn't re-picked into an auto-merge attempt.
+gh issue edit $ISSUE --repo stellar-experimental/henyey --remove-assignee @me
+```
+
+Exit. Do not move the board state.
+
 ## Step 6 — Decide
 
 ### 6.1 Parse the reviewer verdicts from PR comments
@@ -519,9 +572,44 @@ Each external reviewer's verdict is the `state` of their latest review:
 - `CHANGES_REQUESTED` → blocker, treated identically to an agent reviewer's CHANGES_REQUESTED
 - `COMMENTED` → neutral (notes; doesn't gate). The body still gets captured at merge time via the inline-comment follow-up logic in Step 7.
 
+### 6.1c Adversarial refute pass (agent CHANGES_REQUESTED findings only)
+
+This replaces the cross-model diversity the pipeline used to get from a second model, and directly cuts the false-positive bounces. Run it **after** the reviewers post and **before** applying the matrix.
+
+Enumerate every distinct blocking finding from the **agent** reviewers' latest `CHANGES_REQUESTED` verdicts (one finding = one concern bullet from a reviewer's `<details>` change-list). For each, spawn an independent `general-purpose` **skeptic** sub-agent via the Agent/Task tool, all in a **single message** so they run in parallel, each with `model: opus` and `run_in_background: false`. Each skeptic checks out the PR against current `origin/main` (same `git fetch origin` + merge instruction as Step 4) so it refutes on fresh state:
+
+> Reviewer <Correctness|Parity|Risk> raised this blocking finding (CHANGES_REQUESTED)
+> on PR #$PR_NUM in stellar-experimental/henyey:
+>
+> <verbatim finding bullet>
+>
+> Your job is to REFUTE this finding. First `git fetch origin` and check out the
+> PR head merged with the latest `origin/main` inside `$REVIEWER_WORKTREE` (do
+> NOT review stale state). Then argue, with evidence, that the finding is one of:
+> (a) **wrong** — the diff already handles this, or the reviewer misread the
+> code; (b) **already-fixed on current `origin/main`** — the change the reviewer
+> wants already exists once the PR is rebased (confirm by reading the merged
+> tree); or (c) **non-blocking** — even if true, it does not warrant bouncing
+> the PR and is at most an inline / follow-up-issue item. Be honest: if you
+> cannot refute it on any of the three grounds, say so. The finding only
+> **stands** if it cannot be refuted.
+>
+> Post your finding as a comment headed `## 🥊 Refute — <reviewer lens>: <short
+> finding summary>` with an `**Outcome:** REFUTED | STANDS` line and a 2–4
+> bullet justification (cite files/lines for ground (b)).
+
+Wait for all skeptics. Then:
+
+- A finding is **dropped** if its skeptic returned `REFUTED` — it does NOT bounce the PR. Record it as `refuted: <reason>` in the eventual verdict comment.
+- A finding **stands** if its skeptic returned `STANDS` (or failed to post / errored after one retry — un-refuted findings stand, fail-safe toward the reviewer).
+
+For the matrix below, an **agent** reviewer's verdict is treated as `CHANGES_REQUESTED` only if **at least one** of its findings survived refutation. If every finding from that reviewer was refuted, treat that reviewer's verdict as `APPROVE` for matrix purposes (the dropped findings are still recorded in the verdict comment).
+
+**External CHANGES_REQUESTED reviews (GH Copilot bot, humans, other bots) are NOT subject to the refute pass** — they gate exactly as before (Step 6.1b). Only the agent reviewers' own findings are refutable.
+
 ### 6.2 Combine all signals
 
-Required signals — both must be APPROVE or the matrix bounces / waits:
+Required signals — both must be APPROVE (post-refute, per Step 6.1c) or the matrix bounces / waits:
 
 - **Reviewer A verdict** (agent, Correctness): APPROVE / CHANGES_REQUESTED / pending.
 - **Reviewer B verdict** (agent, Parity-or-Risk): APPROVE / CHANGES_REQUESTED / pending.
@@ -1012,8 +1100,10 @@ Exit.
 ## What you do NOT do
 
 - **Do not** post a review yourself. Spawn sub-agents that post their own structured comments — you only orchestrate and combine.
-- **Do not** override or summarize the reviewers' verdicts. Their `**Verdict:**` line is the verdict. You read it; you don't rewrite it.
-- **Do not** merge if any of the three signals is not green. The matrix is the rule. *(Exception: the force-converge override at the lifetime cap merges on green CI alone — see Step 7-bis. Reviewer verdicts become follow-up issues rather than merge gates.)*
+- **Do not** override or summarize the reviewers' verdicts. Their `**Verdict:**` line is the verdict. You read it; you don't rewrite it — except that an agent reviewer's CHANGES_REQUESTED finding is dropped if the Step 6.1c refute pass returns `REFUTED` (recorded as `refuted: <reason>`).
+- **Do not** run the refute pass on **external** CHANGES_REQUESTED reviews (GH Copilot bot, humans, other bots). Only the agent reviewers' own findings are refutable; external reviews gate as-is.
+- **Do not** auto-merge a **self-modifying** PR (touches the pipeline's own skills/scripts — see Step 5.5), even on triple-green. Post the operator-approval note and leave it in `in-review`.
+- **Do not** merge if any of the three signals is not green. The matrix is the rule. *(Exception: the force-converge override at the lifetime cap merges on green CI alone — see Step 7-bis. Reviewer verdicts become follow-up issues rather than merge gates. The self-modifying gate overrides even force-converge — a self-modifying PR never auto-merges.)*
 - **Do not** wait synchronously on long-running CI. If CI is `running`, unassign and exit — the next tick re-picks the issue.
 - **Do not** use `gh pr review --approve` — GH silently downgrades it to a comment because the agent is the PR author. Use structured PR comments via `gh pr comment` instead.
 
@@ -1022,6 +1112,7 @@ Exit.
 | Failure | Action |
 |---|---|
 | Reviewer sub-agent fails to post | Retry once. If still failing, treat as `CHANGES_REQUESTED` and bounce. |
+| Refute skeptic fails to post (Step 6.1c) | Retry once. If still failing, the finding **stands** (fail-safe toward the reviewer) — it gates the matrix as a surviving CHANGES_REQUESTED. |
 | Reviewer's comment doesn't match the expected header/verdict shape | Treat as `pending`; if it stays malformed after Step 4 completes, bounce with a `## Review: Malformed Verdict` note. |
 | No PR linked | Bounce to `ready-for-doing` with `## Review: No PR Linked`. |
 | `gh pr merge --admin` fails with auto-merge hint | Retry with `--auto` (deferred merge). If `--auto` also fails, hard failure. See Step 7.3. |
