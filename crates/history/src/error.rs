@@ -56,6 +56,70 @@ impl std::fmt::Display for VerifyHashKind {
     }
 }
 
+/// Ledger-chain verification status taxonomy (CATCHUP §3.9-1).
+///
+/// Mirrors stellar-core's `HistoryManager::LedgerVerificationStatus`
+/// (`stellar-core/src/history/HistoryManager.h:195-204`), the status code
+/// returned from `LedgerManager::verifyCatchupCandidate` /
+/// `VerifyLedgerChainWork`. henyey keeps its richer typed [`HistoryError`]
+/// variants as the live error currency; this enum is a discoverability and
+/// classification overlay reached via [`HistoryError::verify_status`]. It is
+/// **not** a return type of [`crate::verify::verify_reverse_walk`] and
+/// changes no control flow — adding it is behavior-neutral.
+///
+/// See also `CATCHUP_SPEC.md` §3.9 (status table) and §9.2 (per-step status
+/// assignment).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LedgerVerifyStatus {
+    /// Verification succeeded. Mirrors `VERIFY_STATUS_OK`.
+    ///
+    /// Note: this variant is **unreachable** through
+    /// [`HistoryError::verify_status`] — an error is never "OK". It exists
+    /// solely for spec-mirroring completeness (the success path is the
+    /// *absence* of a `HistoryError`).
+    Ok,
+    /// A hash comparison failed (header/chain/bucket-list/tx-set/replay/LCL
+    /// hash). Mirrors `VERIFY_STATUS_ERR_BAD_HASH`.
+    ErrBadHash,
+    /// A ledger header carried an unsupported protocol version. Mirrors
+    /// `VERIFY_STATUS_ERR_BAD_LEDGER_VERSION`.
+    ErrBadLedgerVersion,
+    /// The chain advanced past the expected next sequence (got > expected).
+    /// Mirrors `VERIFY_STATUS_ERR_OVERSHOT`.
+    ErrOvershot,
+    /// The chain fell short of the expected next sequence (got < expected).
+    /// Mirrors `VERIFY_STATUS_ERR_UNDERSHOT`.
+    ErrUndershot,
+    /// A checkpoint range was missing required entries. Mirrors
+    /// `VERIFY_STATUS_ERR_MISSING_ENTRIES`.
+    ///
+    /// Taxonomy-only in henyey: stellar-core surfaces this at the
+    /// checkpoint-start and end-of-range completeness checks
+    /// (`VerifyLedgerChainWork.cpp:276,339`), which henyey's
+    /// checkpoint-grouped reverse walk does not currently emit as a dedicated
+    /// error. No live [`HistoryError`] maps to it today; it is retained for
+    /// spec parity and reached only by direct construction in tests.
+    ErrMissingEntries,
+    /// Ledger-header material from the archive failed to parse / was corrupt.
+    /// Mirrors `VERIFY_STATUS_ERR_CORRUPT_HEADER`.
+    ErrCorruptHeader,
+}
+
+impl std::fmt::Display for LedgerVerifyStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            Self::Ok => "VERIFY_STATUS_OK",
+            Self::ErrBadHash => "VERIFY_STATUS_ERR_BAD_HASH",
+            Self::ErrBadLedgerVersion => "VERIFY_STATUS_ERR_BAD_LEDGER_VERSION",
+            Self::ErrOvershot => "VERIFY_STATUS_ERR_OVERSHOT",
+            Self::ErrUndershot => "VERIFY_STATUS_ERR_UNDERSHOT",
+            Self::ErrMissingEntries => "VERIFY_STATUS_ERR_MISSING_ENTRIES",
+            Self::ErrCorruptHeader => "VERIFY_STATUS_ERR_CORRUPT_HEADER",
+        };
+        f.write_str(s)
+    }
+}
+
 /// Diagnostic info for a verification hash mismatch.
 ///
 /// Boxed inside [`HistoryError::VerificationHashMismatch`] to keep the
@@ -618,6 +682,70 @@ impl HistoryError {
                 | HistoryError::InvalidTxSetHash { .. }
                 | HistoryError::ReplayHashMismatch { .. }
         )
+    }
+
+    /// Classify this error onto the ledger-chain verification taxonomy
+    /// ([`LedgerVerifyStatus`], CATCHUP §3.9-1), or `None` if it is not a
+    /// verification failure.
+    ///
+    /// This is a **read-only classifier** — it inspects an existing error and
+    /// does not change any control flow or which error a path returns. The
+    /// "verification-related" variant set it recognizes is:
+    /// `UnsupportedLedgerVersion`, `InvalidPreviousHash`,
+    /// `VerificationHashMismatch`, `FatalChainDisagreement`,
+    /// `KnitLclHashMismatch`, `KnitLclPredecessorHashMismatch`,
+    /// `KnitCurrentLedgerPrevHashMismatch`, `InvalidTxSetHash`,
+    /// `ReplayHashMismatch`, `Ledger(LedgerError::HashMismatch)`,
+    /// `KnitOvershot`, `CorruptHeader`, and `InvalidSequence`. All other
+    /// variants — transient (network, IO, download, archive-not-ready) and
+    /// non-verification — return `None`.
+    ///
+    /// Notes on faithfulness to stellar-core
+    /// (`VerifyLedgerChainWork.cpp:296-311`):
+    /// - [`LedgerVerifyStatus::Ok`] is **never** returned here — an error is
+    ///   never "OK". The success path is the absence of a `HistoryError`.
+    /// - [`LedgerVerifyStatus::ErrMissingEntries`] has no henyey producer and
+    ///   is therefore never returned by this classifier (see its doc comment).
+    /// - For [`HistoryError::InvalidSequence`] the overshot/undershot split is
+    ///   a *field-based approximation*: `got > expected` ⇒ overshot,
+    ///   `got < expected` ⇒ undershot (matching stellar-core, since
+    ///   `verify.rs:318` constructs it as `expected = prev.seq + 1`,
+    ///   `got = curr.seq`). The trust-anchor-range sites (`verify.rs:361,416`)
+    ///   also construct `InvalidSequence` for what are semantically
+    ///   range/missing-entries conditions; those are classified by the same
+    ///   `got`-vs-`expected` rule, a known imprecision that is acceptable
+    ///   because the live error returned is unchanged. `got == expected` is
+    ///   unreachable (the variant is only built on mismatch); the equal arm
+    ///   deterministically falls through to undershot rather than panicking.
+    pub fn verify_status(&self) -> Option<LedgerVerifyStatus> {
+        match self {
+            HistoryError::UnsupportedLedgerVersion { .. } => {
+                Some(LedgerVerifyStatus::ErrBadLedgerVersion)
+            }
+            HistoryError::InvalidPreviousHash { .. }
+            | HistoryError::VerificationHashMismatch(_)
+            | HistoryError::FatalChainDisagreement
+            | HistoryError::KnitLclHashMismatch { .. }
+            | HistoryError::KnitLclPredecessorHashMismatch { .. }
+            | HistoryError::KnitCurrentLedgerPrevHashMismatch { .. }
+            | HistoryError::InvalidTxSetHash { .. }
+            | HistoryError::ReplayHashMismatch { .. }
+            | HistoryError::Ledger(henyey_ledger::LedgerError::HashMismatch { .. }) => {
+                Some(LedgerVerifyStatus::ErrBadHash)
+            }
+            HistoryError::KnitOvershot { .. } => Some(LedgerVerifyStatus::ErrOvershot),
+            HistoryError::CorruptHeader { .. } => Some(LedgerVerifyStatus::ErrCorruptHeader),
+            HistoryError::InvalidSequence { expected, got } => {
+                if got > expected {
+                    Some(LedgerVerifyStatus::ErrOvershot)
+                } else {
+                    // got < expected (undershot); got == expected is
+                    // unreachable but deterministically classified here.
+                    Some(LedgerVerifyStatus::ErrUndershot)
+                }
+            }
+            _ => None,
+        }
     }
 
     /// The covering checkpoint for a
