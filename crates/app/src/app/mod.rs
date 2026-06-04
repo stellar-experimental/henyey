@@ -8704,6 +8704,72 @@ mod tests {
         );
     }
 
+    /// Regression for #3056 (spec LEDGER §4.2-Step15 / §4.10-Step25): a live
+    /// post-close expected-hash mismatch is an SCP/local-corruption divergence
+    /// that MUST be fatal, matching stellar-core
+    /// `LedgerManagerImpl::closeLedger`'s "Local node's ledger corrupted during
+    /// close" throw. The background close task returning
+    /// `Err(LedgerError::HashMismatch{..})` must drive
+    /// `handle_close_complete` to set `fatal_state_failure = true` (and still
+    /// return false / drop the deferred sender). On `origin/main` this arm only
+    /// set a recovery phase + cleared the buffer, leaving the flag false — so
+    /// this test FAILS before the fix and PASSES after.
+    #[tokio::test]
+    async fn test_post_close_hash_mismatch_triggers_fatal_shutdown() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-test.db");
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
+        let app = App::new(config).await.unwrap();
+        app.set_applying_ledger(true);
+
+        // Sanity: not already in a fatal state.
+        assert!(
+            !app.fatal_state_failure.load(Ordering::SeqCst),
+            "fatal_state_failure should start false"
+        );
+
+        let mut pending = make_test_pending_close(
+            tokio::task::spawn_blocking(|| {
+                Err(henyey_ledger::LedgerError::HashMismatch {
+                    expected: "expected_hash".to_string(),
+                    actual: "actual_hash".to_string(),
+                })
+            }),
+            1,
+        );
+        let join_result = (&mut pending.handle).await;
+
+        let (persist_tx, mut persist_rx) = tokio::sync::oneshot::channel();
+        let success = app
+            .handle_close_complete(
+                pending,
+                join_result,
+                super::persist::LedgerCloseFinalizer::deferred(persist_tx),
+            )
+            .await;
+
+        assert!(
+            !success,
+            "handle_close_complete should return false on hash mismatch"
+        );
+        // The load-bearing assertion: a live post-close hash mismatch must be
+        // fatal, not a recoverable re-sync.
+        assert!(
+            app.fatal_state_failure.load(Ordering::SeqCst),
+            "post-close hash mismatch must trigger fatal shutdown (#3056)"
+        );
+        // The deferred sender is still dropped (no persist) on the error path.
+        assert!(
+            matches!(
+                persist_rx.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Closed)
+            ),
+            "deferred sender must be dropped (not sent) on hash mismatch path"
+        );
+    }
+
     #[tokio::test]
     async fn test_deferred_close_persist_lifecycle() {
         let dir = tempfile::tempdir().expect("temp dir");
