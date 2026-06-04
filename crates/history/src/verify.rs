@@ -390,16 +390,28 @@ pub fn verify_reverse_walk(
             Hash256::from(first.previous_ledger_hash.clone()),
         ));
 
-        // LCL+1 comparison (§9.3 step 2d): if the first header in this group
-        // is at lcl_seq + 1, verify its previous_ledger_hash matches lcl_hash.
+        // LCL-overlap (§9.3 step 2c) and LCL+1 (§9.3 step 2d) comparisons.
+        // Mirrors stellar-core VerifyLedgerChainWork.cpp:222-235: step 2c (a
+        // downloaded header sitting exactly at lcl_seq must hash-match the local
+        // LCL) and step 2d (the header at lcl_seq + 1 must link back to the LCL
+        // hash) are mutually exclusive per header (distinct seqs), so they form
+        // an if / else if. On disagreement we set the flag and continue — the
+        // §9.5 block below converts it to fatal (SCP trust) or retriable (None).
         if let Some((lcl_seq, lcl_hash)) = &config.lcl {
             for header in group.iter() {
-                if header.ledger_seq == lcl_seq + 1 {
+                if header.ledger_seq == *lcl_seq {
+                    // Step 2c: header at lcl_seq — its content hash must match.
+                    let header_hash = compute_header_hash(header)?;
+                    if header_hash != *lcl_hash {
+                        local_state_disagrees = true;
+                    }
+                } else if header.ledger_seq == lcl_seq + 1 {
+                    // Step 2d: header at lcl_seq + 1 — its previous_ledger_hash
+                    // must link back to the local LCL hash.
                     let prev_hash = Hash256::from(header.previous_ledger_hash.clone());
                     if prev_hash != *lcl_hash {
                         local_state_disagrees = true;
                     }
-                    break;
                 }
             }
         }
@@ -1924,6 +1936,83 @@ mod tests {
         let config = ReverseWalkConfig {
             trust_source: TrustSource::None,
             lcl: Some((9, lcl_hash)),
+            max_supported_version: 26,
+            min_supported_version: 24,
+        };
+        let result = verify_reverse_walk(&headers, &config).unwrap();
+        assert!(!result.fatal_failure);
+    }
+
+    #[test]
+    fn test_reverse_walk_lcl_seq_overlap_mismatch_with_scp_trust() {
+        // §9.3 step 2c: a downloaded header sits exactly at lcl_seq, but its
+        // content hash disagrees with the local LCL hash. With an SCP trust
+        // anchor this is a fatal chain disagreement.
+        //
+        // The LCL seq (10) is the HIGHEST downloaded header, so step 2d
+        // (lcl_seq + 1 == 11) never matches the range — this isolates step 2c.
+        let headers = make_chain(6, 5, 25); // seqs 6..=10; headers.last() is at lcl_seq (10).
+        let top = headers.last().unwrap();
+        assert_eq!(top.ledger_seq, 10);
+        let top_hash = compute_header_hash(top).unwrap();
+
+        // Wrong hash for the header at lcl_seq (10).
+        let wrong_lcl_hash = Hash256([0xAA; 32]);
+        assert_ne!(wrong_lcl_hash, top_hash);
+
+        let config = ReverseWalkConfig {
+            trust_source: TrustSource::Scp {
+                seq: 10,
+                hash: top_hash,
+            },
+            lcl: Some((10, wrong_lcl_hash)),
+            max_supported_version: 26,
+            min_supported_version: 24,
+        };
+        let err = verify_reverse_walk(&headers, &config).unwrap_err();
+        assert!(
+            matches!(err, HistoryError::FatalChainDisagreement),
+            "expected FatalChainDisagreement, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_reverse_walk_lcl_seq_overlap_mismatch_no_trust() {
+        // Same step-2c overlap mismatch but without SCP trust — retriable, so
+        // it surfaces as InvalidPreviousHash rather than a fatal disagreement.
+        let headers = make_chain(6, 5, 25); // seqs 6..=10; headers.last() is at lcl_seq (10).
+        let top = headers.last().unwrap();
+        assert_eq!(top.ledger_seq, 10);
+        let wrong_lcl_hash = Hash256([0xAA; 32]);
+        assert_ne!(wrong_lcl_hash, compute_header_hash(top).unwrap());
+
+        let config = ReverseWalkConfig {
+            trust_source: TrustSource::None,
+            lcl: Some((10, wrong_lcl_hash)),
+            max_supported_version: 26,
+            min_supported_version: 24,
+        };
+        let err = verify_reverse_walk(&headers, &config).unwrap_err();
+        assert!(
+            matches!(err, HistoryError::InvalidPreviousHash { .. }),
+            "expected InvalidPreviousHash, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_reverse_walk_lcl_seq_overlap_matches() {
+        // §9.3 step 2c: the header at lcl_seq has the CORRECT content hash as the
+        // local LCL hash — no disagreement should be flagged.
+        let headers = make_chain(6, 5, 25); // seqs 6..=10; headers.last() is at lcl_seq (10).
+        let top = headers.last().unwrap();
+        assert_eq!(top.ledger_seq, 10);
+        let top_hash = compute_header_hash(top).unwrap();
+        let config = ReverseWalkConfig {
+            trust_source: TrustSource::Scp {
+                seq: 10,
+                hash: top_hash,
+            },
+            lcl: Some((10, top_hash)),
             max_supported_version: 26,
             min_supported_version: 24,
         };
