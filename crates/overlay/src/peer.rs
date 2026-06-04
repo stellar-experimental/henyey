@@ -1251,4 +1251,274 @@ mod tests {
         assert_eq!(snap.outbound_drop, 23);
         assert_eq!(snap.outbound_reject, 24);
     }
+
+    // ── OVERLAY §4.4.2-6: responder sends HELLO before ERROR_MSG (#3067) ──
+
+    use crate::auth::AuthContext;
+    use crate::connection::Connection;
+    use henyey_crypto::SecretKey;
+    use stellar_xdr::curr::Hello;
+
+    /// Build a responder `Peer` (inbound, `Handshaking`) wired over an in-memory
+    /// duplex to a raw client-side `(Connection, AuthContext)` initiator pair.
+    /// The responder is driven via `handshake()`; the client crafts and sends a
+    /// HELLO, then reads the responder's reply frames.
+    fn make_responder_and_client(client_local: LocalNode) -> (Peer, Connection, AuthContext) {
+        let (client_io, server_io) = tokio::io::duplex(1024 * 1024);
+        let client_addr: SocketAddr = "127.0.0.1:11625".parse().unwrap();
+        let server_addr: SocketAddr = "127.0.0.1:11626".parse().unwrap();
+
+        let client_conn =
+            Connection::from_io(client_io, server_addr, ConnectionDirection::Outbound).unwrap();
+        let server_conn =
+            Connection::from_io(server_io, client_addr, ConnectionDirection::Inbound).unwrap();
+
+        let responder_local = LocalNode::new_testnet(SecretKey::generate());
+        let responder_auth = AuthContext::new(responder_local, false); // they called us
+        let client_auth = AuthContext::new(client_local, true); // we called remote
+
+        let responder = Peer {
+            info: PeerInfo {
+                peer_id: PeerId::from_bytes([0u8; 32]),
+                address: client_addr,
+                direction: ConnectionDirection::Inbound,
+                version_string: String::new(),
+                overlay_version: 0,
+                ledger_version: 0,
+                connected_at: Instant::now(),
+                original_address: None,
+            },
+            state: PeerState::Connecting,
+            connection: server_conn,
+            auth: responder_auth,
+            stats: Arc::new(PeerStats::default()),
+            metrics: Arc::new(OverlayMetrics::new()),
+            holds_pending_peer_id: false,
+        };
+
+        (responder, client_conn, client_auth)
+    }
+
+    /// Drive the responder handshake against a client that sends `hello`, then
+    /// collect the StellarMessages the responder sent back (in order) until the
+    /// connection closes or two frames have been read.
+    async fn responder_reply_frames(
+        client_local: LocalNode,
+        mutate_hello: impl FnOnce(&mut Hello),
+    ) -> Vec<StellarMessage> {
+        let (mut responder, mut client_conn, mut client_auth) =
+            make_responder_and_client(client_local);
+
+        // Build the client's HELLO and apply the test mutation.
+        let mut hello = client_auth.create_hello();
+        mutate_hello(&mut hello);
+
+        // Spawn the responder's full handshake. It will receive HELLO, run
+        // phase-1, ban check, send_hello(), then phase-2 — which fails for the
+        // mismatched HELLO, sends ERR_CONF, and drops.
+        let responder_task = tokio::spawn(async move {
+            let res = responder.handshake(5, None, None, 0, 0).await;
+            // Return the result so the test can assert the responder dropped.
+            res
+        });
+
+        // Client sends its (mismatched) HELLO unauthenticated.
+        let hello_frame = client_auth.wrap_unauthenticated(StellarMessage::Hello(hello));
+        client_conn
+            .send(hello_frame)
+            .await
+            .expect("client send hello");
+
+        // Read frames the responder sends back. Expect HELLO then ERR_CONF.
+        let mut frames = Vec::new();
+        for _ in 0..2 {
+            match client_conn.recv_timeout(5).await {
+                Ok(Some(frame)) => {
+                    // Pre-auth framing: unwrap without MAC enforcement.
+                    let msg = client_auth
+                        .unwrap_message(frame.message)
+                        .expect("unwrap responder frame");
+                    frames.push(msg);
+                }
+                _ => break,
+            }
+        }
+
+        // The responder must have dropped with an error (not authenticated).
+        let res = responder_task.await.expect("responder task join");
+        assert!(
+            res.is_err(),
+            "responder must drop after a mismatched HELLO, got {:?}",
+            res
+        );
+
+        frames
+    }
+
+    #[tokio::test]
+    async fn test_responder_sends_hello_before_error_on_version_mismatch() {
+        // Regression for #3067: on an overlay-version mismatch the responder
+        // MUST send its HELLO before the ERROR_MSG(Conf). On main the version
+        // check runs before send_hello(), so the first (and only) frame is the
+        // ERR_CONF — this test FAILS on main and PASSES after the reorder.
+        let client_local = LocalNode::new_testnet(SecretKey::generate());
+        let frames = responder_reply_frames(client_local, |hello| {
+            // Advertise an incompatible (too-old) overlay version range.
+            hello.overlay_version = 5;
+            hello.overlay_min_version = 1;
+        })
+        .await;
+
+        assert!(
+            frames.len() >= 2,
+            "responder must send HELLO then ERROR, got {} frame(s): {:?}",
+            frames.len(),
+            frames
+                .iter()
+                .map(helpers::message_type_name)
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            matches!(frames[0], StellarMessage::Hello(_)),
+            "first frame must be HELLO, got {}",
+            helpers::message_type_name(&frames[0])
+        );
+        match &frames[1] {
+            StellarMessage::ErrorMsg(e) => {
+                assert_eq!(
+                    e.code,
+                    stellar_xdr::curr::ErrorCode::Conf,
+                    "second frame must be ERR_CONF"
+                );
+            }
+            other => panic!(
+                "second frame must be ERROR_MSG, got {}",
+                helpers::message_type_name(other)
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_responder_sends_hello_before_error_on_network_mismatch() {
+        // Regression for #3067: same ordering requirement on a network-ID
+        // mismatch.
+        let client_local = LocalNode::new_testnet(SecretKey::generate());
+        let frames = responder_reply_frames(client_local, |hello| {
+            // Wrong network id (compatible overlay version preserved).
+            hello.network_id = stellar_xdr::curr::Hash([0xAB; 32]);
+        })
+        .await;
+
+        assert!(
+            frames.len() >= 2,
+            "responder must send HELLO then ERROR, got {} frame(s): {:?}",
+            frames.len(),
+            frames
+                .iter()
+                .map(helpers::message_type_name)
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            matches!(frames[0], StellarMessage::Hello(_)),
+            "first frame must be HELLO, got {}",
+            helpers::message_type_name(&frames[0])
+        );
+        assert!(
+            matches!(frames[1], StellarMessage::ErrorMsg(_)),
+            "second frame must be ERROR_MSG, got {}",
+            helpers::message_type_name(&frames[1])
+        );
+    }
+
+    #[tokio::test]
+    async fn test_responder_sends_hello_before_error_on_port_mismatch() {
+        // Regression for #3067: a bad listening port is a peer-level check that
+        // must also run AFTER the HELLO echo on the responder path.
+        let client_local = LocalNode::new_testnet(SecretKey::generate());
+        let frames = responder_reply_frames(client_local, |hello| {
+            hello.listening_port = 0; // invalid
+        })
+        .await;
+
+        assert!(
+            matches!(frames.first(), Some(StellarMessage::Hello(_))),
+            "first frame must be HELLO, got {:?}",
+            frames
+                .iter()
+                .map(helpers::message_type_name)
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            matches!(frames.get(1), Some(StellarMessage::ErrorMsg(_))),
+            "second frame must be ERROR_MSG, got {:?}",
+            frames
+                .iter()
+                .map(helpers::message_type_name)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_initiator_still_rejects_version_mismatch() {
+        // Guard for #3067: the initiator path still runs the full phase-2
+        // checks. We construct an initiator Peer and feed it a HELLO with an
+        // incompatible overlay version; it must reject (drop) rather than
+        // silently dropping the check after the responder reorder.
+        let (client_io, server_io) = tokio::io::duplex(1024 * 1024);
+        let initiator_addr: SocketAddr = "127.0.0.1:11625".parse().unwrap();
+        let remote_addr: SocketAddr = "127.0.0.1:11626".parse().unwrap();
+
+        let initiator_conn =
+            Connection::from_io(client_io, remote_addr, ConnectionDirection::Outbound).unwrap();
+        let mut remote_conn =
+            Connection::from_io(server_io, initiator_addr, ConnectionDirection::Inbound).unwrap();
+
+        let initiator_local = LocalNode::new_testnet(SecretKey::generate());
+        let initiator_auth = AuthContext::new(initiator_local, true);
+
+        let mut initiator = Peer {
+            info: PeerInfo {
+                peer_id: PeerId::from_bytes([0u8; 32]),
+                address: remote_addr,
+                direction: ConnectionDirection::Outbound,
+                version_string: String::new(),
+                overlay_version: 0,
+                ledger_version: 0,
+                connected_at: Instant::now(),
+                original_address: None,
+            },
+            state: PeerState::Connecting,
+            connection: initiator_conn,
+            auth: initiator_auth,
+            stats: Arc::new(PeerStats::default()),
+            metrics: Arc::new(OverlayMetrics::new()),
+            holds_pending_peer_id: false,
+        };
+
+        // The remote side: a raw responder AuthContext that replies to the
+        // initiator's HELLO with an incompatible-version HELLO of its own.
+        let remote_local = LocalNode::new_testnet(SecretKey::generate());
+        let remote_auth = AuthContext::new(remote_local, false);
+
+        let task = tokio::spawn(async move { initiator.handshake(5, None, None, 0, 0).await });
+
+        // Read the initiator's HELLO (so the duplex doesn't stall), then send
+        // back a mismatched HELLO.
+        let _ = remote_conn
+            .recv_timeout(5)
+            .await
+            .expect("recv initiator hello");
+        let mut bad_hello = remote_auth.create_hello();
+        bad_hello.overlay_version = 5;
+        bad_hello.overlay_min_version = 1;
+        let frame = remote_auth.wrap_unauthenticated(StellarMessage::Hello(bad_hello));
+        remote_conn.send(frame).await.expect("send bad hello");
+
+        let res = task.await.expect("initiator task join");
+        assert!(
+            matches!(res, Err(OverlayError::VersionMismatch(_))),
+            "initiator must reject incompatible overlay version, got {:?}",
+            res
+        );
+    }
 }
