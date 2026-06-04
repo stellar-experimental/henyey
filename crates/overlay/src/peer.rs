@@ -26,7 +26,7 @@ use crate::{
     codec::helpers,
     connection::{Connection, ConnectionDirection},
     flow_control::msg_body_size,
-    manager::PendingPeerEntry,
+    manager::{sanitize_error_msg, PendingPeerEntry},
     metrics::{OverlayMessageKind, OverlayMetrics},
     LocalNode, OverlayError, PeerAddress, PeerId, Result,
 };
@@ -652,7 +652,10 @@ impl Peer {
                 self.auth.process_auth()?;
             }
             StellarMessage::ErrorMsg(err) => {
-                let err_msg: String = err.msg.to_string();
+                // OVERLAY §7.1.3-1: sanitize raw message bytes before logging /
+                // storing (NOT `to_string()`, which escapes instead of
+                // collapsing non-printable bytes to `*`).
+                let err_msg: String = sanitize_error_msg(&err.msg[..]);
                 warn!("Peer sent error: code={:?}, msg={}", err.code, err_msg);
                 return Err(OverlayError::InvalidMessage(format!(
                     "peer sent ERROR: code={:?}, msg={}",

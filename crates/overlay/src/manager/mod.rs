@@ -37,6 +37,7 @@ mod peer_loop;
 mod tick;
 
 pub use connection::AddPeerOutcome;
+pub(crate) use peer_loop::sanitize_error_msg;
 
 use crate::{
     codec::helpers,
