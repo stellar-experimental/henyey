@@ -45,7 +45,14 @@ use crate::entry::{ledger_entry_data_type, ledger_key_type, BucketEntry};
 use crate::Result;
 
 /// Default number of entries to process in each chunk.
-pub const DEFAULT_CHUNK_SIZE: usize = 10_000;
+///
+/// Matches stellar-core's `LEDGER_ENTRY_BATCH_COMMIT_SIZE` (`0xfff` = 4095) in
+/// `src/ledger/LedgerTxn.h`. Per BUCKETLISTDB spec §16.2 this is a
+/// performance/memory-chunking parameter only: it controls the interleaving
+/// granularity and per-batch memory footprint during catchup. It does NOT
+/// affect the `bucketListHash` or any other consensus-deterministic output —
+/// the applicator yields identical entries regardless of batch size.
+pub const DEFAULT_CHUNK_SIZE: usize = 4095;
 
 // ============================================================================
 // Applicator Counters
