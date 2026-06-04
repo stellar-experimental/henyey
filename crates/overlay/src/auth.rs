@@ -367,6 +367,33 @@ impl AuthContext {
     /// - Auth certificate signature is invalid or expired
     /// - Key derivation fails
     pub fn process_hello(&mut self, hello: &Hello) -> Result<()> {
+        // Combined wrapper preserving the original semantics for the initiator
+        // path and tests: phase-1 (cert + keys + state) followed by phase-2
+        // (overlay-version + network-ID checks).
+        //
+        // The responder path (peer.rs) runs these phases separately so it can
+        // echo its own HELLO between phase-1 and phase-2 — OVERLAY §4.4.2-6.
+        self.process_hello_phase1(hello)?;
+        self.validate_hello_post_send(hello)
+    }
+
+    /// Phase-1 of HELLO processing: AuthCert verification, X25519 key exchange,
+    /// MAC-key derivation, and the `HelloReceived` state transition.
+    ///
+    /// This MUST run before the responder echoes its own HELLO so that the
+    /// MAC keys exist (and a duplicate HELLO is rejected) — but it deliberately
+    /// does NOT run the overlay-version or network-ID checks. Those are deferred
+    /// to [`validate_hello_post_send`] (phase-2), matching stellar-core
+    /// `Peer::recvHello` which sends HELLO before those checks (OVERLAY §4.4.2-6).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - Called in an invalid state (not `Initial`/`HelloSent`) — INV-O3/INV-O4
+    /// - The peer's public key is malformed
+    /// - The auth certificate signature is invalid or expired
+    /// - Key derivation fails (including a small-order shared secret)
+    pub fn process_hello_phase1(&mut self, hello: &Hello) -> Result<()> {
         // State guard: process_hello is only valid in Initial or HelloSent states.
         // Rejecting other states prevents MAC key clobbering from a duplicate HELLO
         // (INV-O3) and enforces the handshake state machine (INV-O4).
@@ -374,36 +401,6 @@ impl AuthContext {
             return Err(OverlayError::AuthenticationFailed(format!(
                 "process_hello called in invalid state {:?} (expected Initial or HelloSent)",
                 self.state
-            )));
-        }
-
-        // Check network ID
-        let network_id_bytes = hello.network_id.0;
-        if network_id_bytes != *self.local_node.network_id.as_bytes() {
-            return Err(OverlayError::NetworkMismatch);
-        }
-
-        // Check overlay version range compatibility (matching stellar-core Peer::recvHello)
-        // Three conditions that cause version rejection:
-        // 1. Peer's range is malformed (min > max)
-        // 2. Peer's max version is below our minimum (peer too old)
-        // 3. Peer's min version is above our maximum (peer too new)
-        if hello.overlay_min_version > hello.overlay_version {
-            return Err(OverlayError::VersionMismatch(format!(
-                "peer overlay version range malformed: min {} > max {}",
-                hello.overlay_min_version, hello.overlay_version
-            )));
-        }
-        if hello.overlay_version < self.local_node.overlay_min_version {
-            return Err(OverlayError::VersionMismatch(format!(
-                "peer overlay version {} below minimum {}",
-                hello.overlay_version, self.local_node.overlay_min_version
-            )));
-        }
-        if hello.overlay_min_version > self.local_node.overlay_version {
-            return Err(OverlayError::VersionMismatch(format!(
-                "peer overlay min version {} above our maximum {}",
-                hello.overlay_min_version, self.local_node.overlay_version
             )));
         }
 
@@ -450,6 +447,65 @@ impl AuthContext {
         self.recv_mac_key = Some(recv_key);
         self.state = AuthState::HelloReceived;
 
+        Ok(())
+    }
+
+    /// Phase-2 of HELLO processing: overlay-version-range and network-ID checks.
+    ///
+    /// On the responder path this runs AFTER the local HELLO has been sent, so a
+    /// failure here is reported to the peer via an (unauthenticated) ERR_CONF
+    /// that the peer can decode now that it has consumed our HELLO
+    /// (OVERLAY §4.4.2-6). On the initiator path it runs immediately after
+    /// phase-1 (the initiator already sent its HELLO first).
+    ///
+    /// # Errors
+    ///
+    /// Returns `VersionMismatch` if the peer's overlay version range is
+    /// malformed, too old, or too new; `NetworkMismatch` if the network IDs
+    /// differ.
+    pub fn validate_hello_post_send(&self, hello: &Hello) -> Result<()> {
+        // Auth-level phase-2 checks, version before network (matching the
+        // stellar-core ordering). The peer-level self-connection check is
+        // interposed between these two by the responder caller (peer.rs).
+        self.validate_overlay_version(hello)?;
+        self.validate_network_id(hello)
+    }
+
+    /// Overlay-version range check (auth-level phase-2).
+    ///
+    /// Returns `VersionMismatch` if the peer's advertised overlay version range
+    /// is malformed (min > max), too old (max below our minimum), or too new
+    /// (min above our maximum). Matches stellar-core `Peer::recvHello`.
+    pub fn validate_overlay_version(&self, hello: &Hello) -> Result<()> {
+        if hello.overlay_min_version > hello.overlay_version {
+            return Err(OverlayError::VersionMismatch(format!(
+                "peer overlay version range malformed: min {} > max {}",
+                hello.overlay_min_version, hello.overlay_version
+            )));
+        }
+        if hello.overlay_version < self.local_node.overlay_min_version {
+            return Err(OverlayError::VersionMismatch(format!(
+                "peer overlay version {} below minimum {}",
+                hello.overlay_version, self.local_node.overlay_min_version
+            )));
+        }
+        if hello.overlay_min_version > self.local_node.overlay_version {
+            return Err(OverlayError::VersionMismatch(format!(
+                "peer overlay min version {} above our maximum {}",
+                hello.overlay_min_version, self.local_node.overlay_version
+            )));
+        }
+        Ok(())
+    }
+
+    /// Network-ID check (auth-level phase-2).
+    ///
+    /// Returns `NetworkMismatch` if the peer is on a different network.
+    pub fn validate_network_id(&self, hello: &Hello) -> Result<()> {
+        let network_id_bytes = hello.network_id.0;
+        if network_id_bytes != *self.local_node.network_id.as_bytes() {
+            return Err(OverlayError::NetworkMismatch);
+        }
         Ok(())
     }
 
@@ -1469,5 +1525,112 @@ mod tests {
 
         let result = ctx_b.process_auth();
         assert!(result.is_err(), "duplicate process_auth must be rejected");
+    }
+
+    // ── OVERLAY §4.4.2-6: handshake ordering — phase split ─────────────
+
+    #[test]
+    fn test_process_hello_phase1_succeeds_before_version_check() {
+        // Regression for #3067: phase-1 (cert verify + key derivation +
+        // HelloReceived) MUST succeed even when the peer advertises an
+        // incompatible overlay version. The version check is deferred to
+        // phase-2 so the responder can echo HELLO before any ERROR_MSG.
+        //
+        // Before the split, process_hello() ran the version check first and
+        // returned Err, so no keys were derived and state stayed Initial —
+        // this test FAILS on main (no phase-1 method exists / version rejected).
+        let secret = SecretKey::generate();
+        let local_node = LocalNode::new_testnet(secret);
+        let mut ctx = AuthContext::new(local_node.clone(), false); // responder
+        ctx.hello_sent();
+
+        // Peer is "too old" (overlay_version 37 < our minimum 38), which would
+        // be rejected by the version check.
+        let hello = make_hello_with_versions(37, 35, &local_node);
+
+        let result = ctx.process_hello_phase1(&hello);
+        assert!(
+            result.is_ok(),
+            "phase-1 must succeed despite incompatible version: {:?}",
+            result
+        );
+        assert_eq!(
+            ctx.state(),
+            AuthState::HelloReceived,
+            "phase-1 must transition to HelloReceived"
+        );
+        assert!(
+            ctx.recv_mac_key.is_some() && ctx.send_mac_key.is_some(),
+            "phase-1 must derive MAC keys"
+        );
+        assert!(ctx.peer_id().is_some(), "phase-1 must record peer id");
+    }
+
+    #[test]
+    fn test_validate_hello_post_send_rejects_version_and_network() {
+        // New coverage for #3067: phase-2 (validate_hello_post_send) returns
+        // the same VersionMismatch / NetworkMismatch errors the old
+        // process_hello produced.
+        let secret = SecretKey::generate();
+        let local_node = LocalNode::new_testnet(secret);
+
+        // Peer too old.
+        let mut ctx = AuthContext::new(local_node.clone(), false);
+        ctx.hello_sent();
+        let hello = make_hello_with_versions(37, 35, &local_node);
+        ctx.process_hello_phase1(&hello).unwrap();
+        let r = ctx.validate_hello_post_send(&hello);
+        assert!(
+            matches!(&r, Err(OverlayError::VersionMismatch(m)) if m.contains("below minimum")),
+            "expected VersionMismatch(below minimum), got {:?}",
+            r
+        );
+
+        // Peer too new.
+        let mut ctx = AuthContext::new(local_node.clone(), false);
+        ctx.hello_sent();
+        let hello = make_hello_with_versions(43, 41, &local_node);
+        ctx.process_hello_phase1(&hello).unwrap();
+        let r = ctx.validate_hello_post_send(&hello);
+        assert!(
+            matches!(&r, Err(OverlayError::VersionMismatch(m)) if m.contains("above our maximum")),
+            "expected VersionMismatch(above our maximum), got {:?}",
+            r
+        );
+
+        // Malformed range.
+        let mut ctx = AuthContext::new(local_node.clone(), false);
+        ctx.hello_sent();
+        let hello = make_hello_with_versions(38, 40, &local_node);
+        ctx.process_hello_phase1(&hello).unwrap();
+        let r = ctx.validate_hello_post_send(&hello);
+        assert!(
+            matches!(&r, Err(OverlayError::VersionMismatch(m)) if m.contains("malformed")),
+            "expected VersionMismatch(malformed), got {:?}",
+            r
+        );
+
+        // Network mismatch (compatible version, wrong network id).
+        let mut ctx = AuthContext::new(local_node.clone(), false);
+        ctx.hello_sent();
+        let mut hello = make_hello_with_versions(39, 38, &local_node);
+        hello.network_id = xdr::Hash([0xAB; 32]);
+        ctx.process_hello_phase1(&hello).unwrap();
+        let r = ctx.validate_hello_post_send(&hello);
+        assert!(
+            matches!(r, Err(OverlayError::NetworkMismatch)),
+            "expected NetworkMismatch, got {:?}",
+            r
+        );
+
+        // Fully compatible: phase-2 returns Ok.
+        let mut ctx = AuthContext::new(local_node.clone(), false);
+        ctx.hello_sent();
+        let hello = make_hello_with_versions(39, 38, &local_node);
+        ctx.process_hello_phase1(&hello).unwrap();
+        assert!(
+            ctx.validate_hello_post_send(&hello).is_ok(),
+            "compatible peer must pass phase-2"
+        );
     }
 }
