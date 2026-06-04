@@ -163,6 +163,7 @@ pub use state::HerderState;
 pub use tx_queue::{
     BroadcastBudget, BroadcastCandidate, BroadcastVisitResult, QueuedTransaction, SorobanTxLimits,
     TransactionQueue, TransactionSet, TxQueueConfig, TxQueueResult, TxQueueStats, TxSetBody,
+    SOROBAN_TRANSACTION_QUEUE_SIZE_MULTIPLIER, TRANSACTION_QUEUE_SIZE_MULTIPLIER,
 };
 
 // Persistence

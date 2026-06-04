@@ -123,6 +123,25 @@ const DEFAULT_MIN_FEE_PER_OP: u32 = 100;
 /// Parity: stellar-core `EXPECTED_CLOSE_TIME_MULT` in TransactionUtils.h.
 const EXPECTED_CLOSE_TIME_MULT: u64 = 2;
 
+/// Multiplier applied to the per-ledger resource limits to derive the classic
+/// transaction queue's admission capacity:
+/// `maxQueueResources = maxLedgerResources × TRANSACTION_QUEUE_SIZE_MULTIPLIER`.
+///
+/// Parity: stellar-core `Config::TRANSACTION_QUEUE_SIZE_MULTIPLIER`
+/// (`src/main/Config.cpp:205`, default `2`) and HERDER_SPEC §12.6. This is
+/// distinct from the pending depth (`DEFAULT_PENDING_DEPTH = 4`); the multiplier
+/// scales the resource-based pool capacity, not the number of ledgers a tx may
+/// remain pending.
+pub const TRANSACTION_QUEUE_SIZE_MULTIPLIER: u32 = 2;
+
+/// Multiplier applied to the per-ledger resource limits to derive the Soroban
+/// transaction queue's admission capacity:
+/// `maxQueueResources = maxLedgerResources × SOROBAN_TRANSACTION_QUEUE_SIZE_MULTIPLIER`.
+///
+/// Parity: stellar-core `Config::SOROBAN_TRANSACTION_QUEUE_SIZE_MULTIPLIER`
+/// (`src/main/Config.cpp:206`, default `2`) and HERDER_SPEC §12.6.
+pub const SOROBAN_TRANSACTION_QUEUE_SIZE_MULTIPLIER: u32 = 2;
+
 /// Trait for providing ledger account balance information.
 ///
 /// This trait is used for fee balance validation during transaction queue
@@ -1290,7 +1309,8 @@ pub struct TransactionQueue {
     /// `SorobanNetworkInfo`.  Takes precedence over `config.max_queue_soroban_resources`.
     dynamic_queue_soroban_resources: RwLock<Option<Resource>>,
     /// Dynamic Soroban resource limits for tx-set selection (1x ledger max).
-    /// Separate from queue-admission limits which use POOL_LEDGER_MULTIPLIER (2x).
+    /// Separate from queue-admission limits which apply
+    /// `SOROBAN_TRANSACTION_QUEUE_SIZE_MULTIPLIER` (2x).
     dynamic_selection_soroban_resources: RwLock<Option<Resource>>,
     /// Arbitrage flood damper. Acquired after `store` lock in `broadcast_with_visitor`
     /// and `shift()`. Cleared by `shift()`, preserved by `reset_and_rebuild()`.
@@ -1415,7 +1435,7 @@ impl TransactionQueue {
     /// Update Soroban resource limits dynamically after ledger close.
     ///
     /// Called with limits derived from `SorobanNetworkInfo` multiplied by
-    /// the pool ledger multiplier.
+    /// `SOROBAN_TRANSACTION_QUEUE_SIZE_MULTIPLIER`.
     pub fn update_soroban_resource_limits(&self, resources: Resource) {
         *self.dynamic_queue_soroban_resources.write() = Some(resources);
         // Invalidate Soroban eviction state: persistent queue + cached thresholds.
@@ -1424,7 +1444,7 @@ impl TransactionQueue {
 
     /// Update Soroban resource limits for tx-set selection (1x ledger max).
     /// Called alongside `update_soroban_resource_limits` but without the
-    /// POOL_LEDGER_MULTIPLIER scaling.
+    /// `SOROBAN_TRANSACTION_QUEUE_SIZE_MULTIPLIER` scaling.
     pub fn update_soroban_selection_limits(&self, resources: Resource) {
         *self.dynamic_selection_soroban_resources.write() = Some(resources);
     }
@@ -5674,13 +5694,24 @@ mod tests {
         assert_eq!(limit.get_val(ResourceType::WriteLedgerEntries), 4);
     }
 
+    /// Parity pin: the queue-size multipliers must match stellar-core
+    /// `Config::TRANSACTION_QUEUE_SIZE_MULTIPLIER` /
+    /// `Config::SOROBAN_TRANSACTION_QUEUE_SIZE_MULTIPLIER` (both default `2`,
+    /// `src/main/Config.cpp:205-206`) and HERDER_SPEC §12.6. A change here would
+    /// silently diverge queue admission capacity from upstream.
+    #[test]
+    fn test_transaction_queue_size_multipliers_match_stellar_core() {
+        assert_eq!(TRANSACTION_QUEUE_SIZE_MULTIPLIER, 2);
+        assert_eq!(SOROBAN_TRANSACTION_QUEUE_SIZE_MULTIPLIER, 2);
+    }
+
     /// Regression: a Soroban tx whose byte size exceeds the initial min
     /// read-ledger-entries limit (6) should still be admitted when the
     /// dynamic resource limits (with correct ordering) allow it.
     #[test]
     fn test_soroban_tx_admitted_with_restrictive_initial_limits() {
         // Simulate the initial Soroban limits on a fresh protocol 25 network
-        // multiplied by POOL_LEDGER_MULTIPLIER (2).
+        // multiplied by SOROBAN_TRANSACTION_QUEUE_SIZE_MULTIPLIER (2).
         let limit = Resource::soroban_ledger_limits(
             2,         // 1 * 2 tx_count
             5_000_000, // 2_500_000 * 2 instructions
