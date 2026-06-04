@@ -7,7 +7,7 @@ description: |
   directly to `ready-for-doing`, and malformed/duplicate/oversized issues to
   `blocked` with a reason. Use when invoked by /project-tick with an issue in
   backlog, or manually as /triage <issue>.
-model: claude-haiku-4.5
+argument-hint: <issue-number> [--force]
 ---
 
 # /triage <issue> — backlog gate

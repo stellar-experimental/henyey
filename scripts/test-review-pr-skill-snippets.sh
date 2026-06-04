@@ -378,7 +378,7 @@ unset REVIEW_PR_MERGE_CMD
 # TEST 14: SKILL.md references merge helper and wait path
 # ══════════════════════════════════════════════════════════════════════════════
 
-SKILL_FILE="$REPO_ROOT/.github/skills/review-pr/SKILL.md"
+SKILL_FILE="$REPO_ROOT/.claude/skills/review-pr/SKILL.md"
 if grep -q 'review-pr-merge.sh' "$SKILL_FILE" && grep -q 'auto-merge.*armed' "$SKILL_FILE"; then
   tap_ok "SKILL.md references merge helper and auto-merge armed path"
 else
@@ -437,7 +437,7 @@ unset REVIEW_PR_MERGE_CMD REVIEW_PR_SCRATCH_DIR
 # TEST 18: SKILL.md documents PR_NUM extraction from PR_STATE
 # ══════════════════════════════════════════════════════════════════════════════
 
-SKILL_FILE="$REPO_ROOT/.github/skills/review-pr/SKILL.md"
+SKILL_FILE="$REPO_ROOT/.claude/skills/review-pr/SKILL.md"
 if grep -q 'PR_NUM=.*PR_STATE#open:' "$SKILL_FILE"; then
   tap_ok "SKILL.md documents explicit PR_NUM extraction from PR_STATE"
 else
@@ -486,7 +486,7 @@ fi
 # TEST 22: SKILL.md exports REVIEW_PR_SCRATCH_DIR before attempt_merge
 # ══════════════════════════════════════════════════════════════════════════════
 
-SKILL_FILE="$REPO_ROOT/.github/skills/review-pr/SKILL.md"
+SKILL_FILE="$REPO_ROOT/.claude/skills/review-pr/SKILL.md"
 if grep -B5 'attempt_merge' "$SKILL_FILE" | grep -qF "REVIEW_PR_SCRATCH_DIR"; then
   tap_ok "SKILL.md exports REVIEW_PR_SCRATCH_DIR before calling attempt_merge"
 else
@@ -614,7 +614,7 @@ unset REVIEW_PR_ARMED_HEALTH_FILE
 # TEST 29: SKILL.md uses check_armed_pr_health in OPEN+armed path
 # ══════════════════════════════════════════════════════════════════════════════
 
-SKILL_FILE="$REPO_ROOT/.github/skills/review-pr/SKILL.md"
+SKILL_FILE="$REPO_ROOT/.claude/skills/review-pr/SKILL.md"
 if grep -q 'check_armed_pr_health' "$SKILL_FILE" && grep -q 'ci-red' "$SKILL_FILE"; then
   tap_ok "SKILL.md uses check_armed_pr_health with CI-red handling in armed path"
 else
@@ -628,7 +628,7 @@ fi
 # Structural assertion: the SKILL.md armed path must check health before exiting.
 # The old bug was: `exit 0` immediately after detecting armed state without CI check.
 
-SKILL_FILE="$REPO_ROOT/.github/skills/review-pr/SKILL.md"
+SKILL_FILE="$REPO_ROOT/.claude/skills/review-pr/SKILL.md"
 # Verify the pattern: after is_auto_merge_armed == "true", the next action is
 # check_armed_pr_health (not an immediate exit 0).
 if grep -A5 'AUTO_MERGE_STATE.*==.*true' "$SKILL_FILE" | grep -q 'check_armed_pr_health'; then
@@ -656,7 +656,7 @@ unset REVIEW_PR_ARMED_HEALTH_FILE
 # TEST 32: SKILL.md handles no-ci case in OPEN+armed path
 # ══════════════════════════════════════════════════════════════════════════════
 
-SKILL_FILE="$REPO_ROOT/.github/skills/review-pr/SKILL.md"
+SKILL_FILE="$REPO_ROOT/.claude/skills/review-pr/SKILL.md"
 if grep -q 'no-ci' "$SKILL_FILE" && grep -q 'no CI detected' "$SKILL_FILE"; then
   tap_ok "SKILL.md handles no-ci case in OPEN+armed path"
 else
@@ -726,7 +726,7 @@ unset REVIEW_PR_ARMED_HEALTH_FILE
 # TEST 37: SKILL.md uses errexit-safe patterns for command substitutions
 # ══════════════════════════════════════════════════════════════════════════════
 
-SKILL_FILE="$REPO_ROOT/.github/skills/review-pr/SKILL.md"
+SKILL_FILE="$REPO_ROOT/.claude/skills/review-pr/SKILL.md"
 # Verify the old unsafe pattern (VAR=$(...) followed by $?) is gone
 if grep -q 'PR_STATE_RC=\$?' "$SKILL_FILE"; then
   tap_fail "SKILL.md uses errexit-safe command substitutions" \
@@ -748,7 +748,7 @@ fi
 # TEST 38: SKILL.md CI classifier requires positive green match (not fallthrough)
 # ══════════════════════════════════════════════════════════════════════════════
 
-SKILL_FILE="$REPO_ROOT/.github/skills/review-pr/SKILL.md"
+SKILL_FILE="$REPO_ROOT/.claude/skills/review-pr/SKILL.md"
 # The Step 5 classifier should explicitly check for SUCCESS/SKIPPED/NEUTRAL,
 # not use a bare 'else CI_STATE="green"' which lets ACTION_REQUIRED through.
 if grep -A2 'CI_STATE="green"' "$SKILL_FILE" | grep -q 'SUCCESS.*SKIPPED.*NEUTRAL'; then

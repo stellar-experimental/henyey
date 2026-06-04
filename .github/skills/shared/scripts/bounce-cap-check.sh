@@ -18,7 +18,7 @@
 #   COUNT=3/3 BASELINE=RESET_MARKER@2026-05-18T01:23:45Z (head pushed earlier)
 #
 # The algorithm and jq queries are copied VERBATIM from
-# .github/skills/review-pr/SKILL.md (Step 2 as of commit c51e8ac9) so the
+# .claude/skills/review-pr/SKILL.md (Step 2 as of commit c51e8ac9) so the
 # script is the single source of truth — the SKILL.md prose should not
 # re-describe the algorithm, only invoke this script. See issue #2787 for
 # the rationale (agents paraphrased the prose into the old lifetime-count

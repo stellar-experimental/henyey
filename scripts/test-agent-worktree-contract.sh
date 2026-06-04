@@ -4,8 +4,7 @@
 # Verifies that /review-pr and /plan skill bootstraps enforce the ~/data workspace
 # contract: all worktrees, cargo targets, and scratch dirs resolve under
 # $HOME/data/$SESSION_ID/..., and hostile/traversal env overrides are rejected.
-# Also verifies that .claude/skills/ copies remain synchronized with their
-# .github/skills/ counterparts and that skill docs reference the shared helper.
+# Also verifies that the .claude/skills/ docs reference the shared helper.
 #
 # Usage: bash scripts/test-agent-worktree-contract.sh
 # Exit: 0 if all tests pass, 1 otherwise.
@@ -15,9 +14,9 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-REVIEW_PR_SKILL="$REPO_ROOT/.github/skills/review-pr/SKILL.md"
-PLAN_SKILL="$REPO_ROOT/.github/skills/plan/SKILL.md"
-DO_SKILL="$REPO_ROOT/.github/skills/do/SKILL.md"
+REVIEW_PR_SKILL="$REPO_ROOT/.claude/skills/review-pr/SKILL.md"
+PLAN_SKILL="$REPO_ROOT/.claude/skills/plan/SKILL.md"
+DO_SKILL="$REPO_ROOT/.claude/skills/do/SKILL.md"
 CONTRACT_HELPER="$REPO_ROOT/scripts/lib/agent-worktree-contract.sh"
 
 # Observed disk-leak scratch patterns (issue #2843). These are out-of-~/data
@@ -273,76 +272,6 @@ test_skill_files_reference_shared_contract_helper() {
     $plan_refs || missing="plan"
     $review_refs || missing="${missing:+$missing, }review-pr"
     tap_not_ok "$desc" "Missing helper reference in: $missing"
-  fi
-}
-
-# --------------------------------------------------------------------------
-# Test: .claude/skills/review-pr is synchronized with .github/skills/review-pr
-# --------------------------------------------------------------------------
-test_claude_review_pr_synced() {
-  local desc=".claude/skills/review-pr is synchronized with .github/skills/review-pr"
-  local claude_path="$REPO_ROOT/.claude/skills/review-pr"
-  local github_path="$REPO_ROOT/.github/skills/review-pr"
-
-  if [ -L "$claude_path" ]; then
-    local target resolved expected
-    target="$(readlink "$claude_path")"
-    if resolved="$(cd "$(dirname "$claude_path")" && cd "$target" 2>/dev/null && pwd)"; then
-      if expected="$(cd "$github_path" 2>/dev/null && pwd)"; then
-        if [ "$resolved" = "$expected" ]; then
-          tap_ok "$desc (symlink)"
-        else
-          tap_not_ok "$desc" "Symlink points to $resolved, expected $expected"
-        fi
-      else
-        tap_not_ok "$desc" "Expected path '$github_path' does not exist"
-      fi
-    else
-      tap_not_ok "$desc" "Symlink target '$target' does not resolve"
-    fi
-  elif [ -d "$claude_path" ]; then
-    if diff -r "$claude_path" "$github_path" > /dev/null 2>&1; then
-      tap_ok "$desc (identical copy)"
-    else
-      tap_not_ok "$desc" ".claude/skills/review-pr differs from .github/skills/review-pr"
-    fi
-  else
-    tap_not_ok "$desc" ".claude/skills/review-pr does not exist"
-  fi
-}
-
-# --------------------------------------------------------------------------
-# Test: .claude/skills/plan is synchronized with .github/skills/plan
-# --------------------------------------------------------------------------
-test_claude_plan_synced() {
-  local desc=".claude/skills/plan is synchronized with .github/skills/plan"
-  local claude_path="$REPO_ROOT/.claude/skills/plan"
-  local github_path="$REPO_ROOT/.github/skills/plan"
-
-  if [ -L "$claude_path" ]; then
-    local target resolved expected
-    target="$(readlink "$claude_path")"
-    if resolved="$(cd "$(dirname "$claude_path")" && cd "$target" 2>/dev/null && pwd)"; then
-      if expected="$(cd "$github_path" 2>/dev/null && pwd)"; then
-        if [ "$resolved" = "$expected" ]; then
-          tap_ok "$desc (symlink)"
-        else
-          tap_not_ok "$desc" "Symlink points to $resolved, expected $expected"
-        fi
-      else
-        tap_not_ok "$desc" "Expected path '$github_path' does not exist"
-      fi
-    else
-      tap_not_ok "$desc" "Symlink target '$target' does not resolve"
-    fi
-  elif [ -d "$claude_path" ]; then
-    if diff -r "$claude_path" "$github_path" > /dev/null 2>&1; then
-      tap_ok "$desc (identical copy)"
-    else
-      tap_not_ok "$desc" ".claude/skills/plan differs from .github/skills/plan"
-    fi
-  else
-    tap_not_ok "$desc" ".claude/skills/plan does not exist"
   fi
 }
 
@@ -1652,8 +1581,6 @@ test_home_poisoning_explicit_override
 test_shared_inbounds_directory_rejected
 test_correct_session_prefix_overrides_accepted
 test_skill_files_reference_shared_contract_helper
-test_claude_review_pr_synced
-test_claude_plan_synced
 test_bootstraps_fallback_when_realpath_is_missing
 test_bootstraps_fallback_when_realpath_rejects_dash_m
 test_symlinked_home_alias_overrides_are_accepted

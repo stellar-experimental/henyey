@@ -8,7 +8,7 @@ description: |
   or re-review request (Mode B). `blocked` on unrecoverable failure. Use when
   invoked by /project-tick with an issue in ready-for-doing, or manually as
   /do <issue>.
-model: claude-opus-4.6
+argument-hint: <issue-number>
 ---
 
 # /do <issue> — implementation
@@ -107,7 +107,11 @@ PW_HOME="$(getent passwd "$(id -un)" 2>/dev/null | cut -d: -f6)"
 mkdir -p "$PW_HOME/data"
 printf '%s\n' "$DO_WORKSPACE" > "$PW_HOME/data/do-$ISSUE.workspace"
 
-# Fresh worktree off origin/main, under ~/data (DO_WORKTREE).
+# Fresh worktree off CURRENT origin/main, under ~/data (DO_WORKTREE). Always
+# fetch first so the branch is cut from the latest main — never a stale local
+# ref. Branching off stale main is the root cause of spurious merge/review
+# failures (see the migration plan), so the fetch immediately before the
+# worktree add is load-bearing, not optional.
 git fetch origin main
 git -C "$REPO_ROOT" worktree add -B "$BRANCH" "$DO_WORKTREE" origin/main
 cd "$DO_WORKTREE"
