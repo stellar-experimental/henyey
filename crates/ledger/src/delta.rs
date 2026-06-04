@@ -710,7 +710,7 @@ impl LedgerDelta {
 
     /// Result of categorizing delta entries for bucket list update.
     pub fn categorize_for_bucket_update(&self) -> DeltaCategorization {
-        categorize_changes(self.changes().cloned(), false)
+        categorize_changes(self.changes().cloned(), false, self.ledger_seq)
     }
 
     /// Drains entries from the delta, categorizing them for bucket list update.
@@ -721,11 +721,12 @@ impl LedgerDelta {
         // Iterate using change_order for deterministic ordering.
         // drain() on a HashMap iterates in arbitrary order, which would
         // produce non-deterministic bucket list updates across nodes.
+        let ledger_seq = self.ledger_seq;
         let order = std::mem::take(&mut self.change_order);
         let changes = order
             .into_iter()
             .filter_map(|key| self.changes.remove(&key));
-        categorize_changes(changes, true)
+        categorize_changes(changes, true, ledger_seq)
     }
 
     /// Get a specific change by key.
@@ -891,9 +892,23 @@ impl LedgerDelta {
 ///
 /// When `collect_offer_pool` is true, offer and pool-share trustline changes
 /// are cloned into `offer_pool_changes` for commit_close processing.
+///
+/// `ledger_seq` is the current ledger sequence. Mirroring stellar-core
+/// `LedgerTxn::Impl::maybeUpdateLastModified()` (`LedgerTxn.cpp:2318`), every
+/// non-deleted entry (Created/Updated) has its `last_modified_ledger_seq`
+/// stamped to `ledger_seq` at this commit-time drain chokepoint, BEFORE the
+/// `offer_pool_changes` clone so the offer-store index and bucket-bound entries
+/// stay byte-identical. Deleted entries are skipped (parity with stellar-core
+/// `isDeleted()`). Because every write site already stamps `ledger_seq`
+/// correctly, this central pass overwrites correct values with identical
+/// values — a provable no-op on every observable hash (see the golden-vector
+/// tests `ledger_close_meta_vectors.rs` / `tx_meta_hash_vectors.rs`). It is a
+/// last-line defense-in-depth guarantee for the consensus-observable
+/// bucket-list-bound entries.
 fn categorize_changes(
     changes: impl Iterator<Item = EntryChange>,
     collect_offer_pool: bool,
+    ledger_seq: u32,
 ) -> DeltaCategorization {
     let mut init = Vec::new();
     let mut live = Vec::new();
@@ -905,7 +920,18 @@ fn categorize_changes(
     let mut has_pool_share_trustlines = false;
     let mut offer_pool_changes = Vec::new();
 
-    for change in changes {
+    for mut change in changes {
+        // Central last_modified_ledger_seq enforcement (stellar-core
+        // LedgerTxn::maybeUpdateLastModified parity): stamp every non-deleted
+        // entry to the current ledger_seq in place, BEFORE the offer_pool clone
+        // below, so both the offer-store index and the bucket-bound init/live
+        // entries observe the stamped value. Deleted entries are left untouched
+        // (parity with stellar-core isDeleted() skip).
+        match &mut change {
+            EntryChange::Created(e) => e.last_modified_ledger_seq = ledger_seq,
+            EntryChange::Updated { current, .. } => current.last_modified_ledger_seq = ledger_seq,
+            EntryChange::Deleted { .. } => {}
+        }
         let entry_ref = match &change {
             EntryChange::Created(e) | EntryChange::Deleted { previous: e } => e,
             EntryChange::Updated { current, .. } => current,
@@ -2036,6 +2062,72 @@ mod tests {
             vec![10, 5, 20, 1, 15, 8, 25, 3],
             "drain_categorization_for_bucket_update must preserve insertion order"
         );
+    }
+
+    /// Regression test for #3059 (LEDGER §6.6.1): the bucket-update drain is the
+    /// commit-time chokepoint that MUST stamp `last_modified_ledger_seq` to the
+    /// current ledger sequence on every non-deleted entry, mirroring
+    /// stellar-core `LedgerTxn::maybeUpdateLastModified()`. We artificially set
+    /// stale `last_modified_ledger_seq` values on a created and an updated entry,
+    /// then assert the drain re-stamps them to the delta's ledger_seq.
+    ///
+    /// Fails on origin/main (the drain performed no rewrite); passes after the
+    /// central enforcement pass is added to `categorize_changes`.
+    #[test]
+    fn test_drain_enforces_last_modified_on_stale_entry() {
+        let ledger_seq = 100u32;
+        let mut delta = LedgerDelta::new(ledger_seq);
+
+        // Created entry with an artificially stale last_modified_ledger_seq.
+        let mut created = create_test_account(1);
+        created.last_modified_ledger_seq = ledger_seq - 5;
+        delta.record_create(created).unwrap();
+
+        // Updated entry whose `current` value is artificially stale.
+        let prev = create_test_account(2);
+        let mut updated = create_test_account_with_balance(2, 5_000);
+        updated.last_modified_ledger_seq = ledger_seq - 5;
+        delta.record_update(prev, updated).unwrap();
+
+        let cat = delta.drain_categorization_for_bucket_update();
+
+        for entry in &cat.init_entries {
+            assert_eq!(
+                entry.last_modified_ledger_seq, ledger_seq,
+                "drain must stamp created entry to current ledger_seq"
+            );
+        }
+        for entry in &cat.live_entries {
+            assert_eq!(
+                entry.last_modified_ledger_seq, ledger_seq,
+                "drain must stamp updated entry to current ledger_seq"
+            );
+        }
+        assert_eq!(cat.init_entries.len(), 1, "expected one created entry");
+        assert_eq!(cat.live_entries.len(), 1, "expected one updated entry");
+    }
+
+    /// Parity with stellar-core `isDeleted()` skip: the central
+    /// last_modified_ledger_seq pass must NOT mutate a Deleted entry's
+    /// `previous` value (deleted entries contribute only dead keys; their
+    /// previous value is never re-stamped). #3059.
+    #[test]
+    fn test_drain_does_not_stamp_deleted_previous() {
+        let ledger_seq = 100u32;
+        let mut delta = LedgerDelta::new(ledger_seq);
+
+        // Delete an entry whose previous value has a stale last_modified_ledger_seq.
+        let mut deleted = create_test_account(3);
+        deleted.last_modified_ledger_seq = ledger_seq - 5;
+        delta.record_delete(deleted).unwrap();
+
+        let cat = delta.drain_categorization_for_bucket_update();
+
+        // Deleted entries produce only dead keys, no init/live entries.
+        assert!(cat.init_entries.is_empty());
+        assert!(cat.live_entries.is_empty());
+        assert_eq!(cat.dead_keys.len(), 1, "expected one dead key");
+        assert_eq!(cat.deleted_count, 1);
     }
 
     /// Regression test for AUDIT-067: apply_refund_to_account returns false
