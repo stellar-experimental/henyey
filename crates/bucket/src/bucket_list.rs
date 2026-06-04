@@ -3320,10 +3320,15 @@ impl BucketList {
     /// - Returns evicted entries (archived persistent + deleted temporary)
     ///
     /// The scan automatically advances through buckets when reaching the end of one.
+    ///
+    /// `ledger_version` is the protocol version the scan is based on; it is
+    /// captured on the result so a stale background scan can be invalidated at
+    /// resolve time via [`EvictionResult::is_valid`] (BUCKETLISTDB §12.5/§12.6).
     pub fn scan_for_eviction_incremental(
         &self,
         mut iter: EvictionIterator,
         current_ledger: u32,
+        ledger_version: u32,
         settings: &StateArchivalSettings,
     ) -> Result<EvictionResult> {
         let mut result = EvictionResult {
@@ -3331,6 +3336,12 @@ impl BucketList {
             end_iterator: iter.clone(),
             bytes_scanned: 0,
             scan_complete: false,
+            // Capture the network state this scan is based on so a stale
+            // background scan can be invalidated at resolve time
+            // (EvictionResult::is_valid). Spec: BUCKETLISTDB §12.5/§12.6.
+            initial_ledger_seq: current_ledger,
+            initial_ledger_version: ledger_version,
+            initial_archival_settings: settings.clone(),
         };
 
         // Update iterator based on spills (reset offset if bucket received new data)
@@ -5127,7 +5138,7 @@ mod tests {
         };
 
         // Should panic: persistent entry lookup returns None (DEAD tombstone)
-        let _ = bl.scan_for_eviction_incremental(iter, current_ledger, &settings);
+        let _ = bl.scan_for_eviction_incremental(iter, current_ledger, 23, &settings);
     }
 
     // ============ hash assertion tests ============
