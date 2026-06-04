@@ -48,7 +48,7 @@ impl BallotProtocol {
         }
     }
 
-    fn attempt_accept_prepared<D: SCPDriver>(
+    pub(super) fn attempt_accept_prepared<D: SCPDriver>(
         &mut self,
         hint: &ScpStatement,
         ctx: &SlotContext<'_, D>,
