@@ -10,7 +10,7 @@
 //! |------|-----------|--------|
 //! | 0 | Complete mode, LCL == genesis | Replay from genesis+1 to target |
 //! | 1 | LCL > genesis | Replay from LCL+1 to target (no buckets) |
-//! | 2 | count >= full replay count, LCL > genesis | Full replay from LCL+1 |
+//! | 2 | count >= full replay count, LCL == genesis | Full replay from genesis+1 |
 //! | 3 | count=0 AND target is checkpoint | Buckets only, no replay |
 //! | 4 | target start in first checkpoint | Full replay from genesis+1 |
 //! | 5 | default (LCL == genesis) | Apply buckets at prior checkpoint, replay from there |
@@ -337,18 +337,17 @@ impl CatchupRange {
         // full_replay covers from lcl+1 (genesis+1) to target.
         let full_replay = LedgerRange::new(lcl + 1, full_replay_count);
 
-        // Case 2: count >= full replay count — full replay from genesis.
+        // Case 2: count >= full replay count — full replay from genesis+1.
         //
-        // When lcl == genesis, prefer bucket-apply over full replay. Replaying
-        // through protocol upgrades from genesis (e.g. 0→25) produces different
-        // state hashes than the live network because `apply_upgrades_to_delta`
-        // creates intermediate config entries that differ from the validator's
-        // live upgrade path. stellar-core handles this the same way: online
-        // catchup always involves a bucket-apply step, never raw replay from
-        // genesis.
-        // Note: lcl == genesis at this point (Case 1 returns for lcl > genesis),
-        // so this case is unreachable. Kept for documentation/safety.
-        if count >= full_replay_count && lcl > GENESIS_LEDGER_SEQ {
+        // Per CATCHUP_SPEC §6.3 Case 2 and stellar-core `calculateCatchupRange`
+        // (CatchupRange.cpp): with lcl == genesis (guaranteed here, since Case 1
+        // returns for lcl > genesis), `count >= fullReplayCount` yields a full
+        // replay of the entire gap [genesis+1, target] for every mode — there is
+        // no lcl guard on this case in stellar-core (`releaseAssert(lcl == init)`
+        // sits directly above it). Complete mode is a strict subset already
+        // handled by Case 0; Recent(N)/Minimal with a large enough count converge
+        // to the same full-replay result here.
+        if count >= full_replay_count {
             return Self::replay_only(full_replay);
         }
 
