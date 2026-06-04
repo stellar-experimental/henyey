@@ -4377,6 +4377,33 @@ impl LedgerCloseContext<'_> {
     ) -> Result<(bool, bool, Vec<UpgradeEntryMeta>)> {
         use stellar_xdr::curr::{LedgerEntryChanges, LedgerUpgrade, Limits, WriteXdr};
 
+        // LEDGER_SPEC §7.3.4 step 2 (LEDGER §7.3.4-2): re-validate each upgrade
+        // via isValidForApply at apply time and SKIP invalid ones with a
+        // warning, rather than aborting the ledger close. Mirrors stellar-core
+        // LedgerManagerImpl.cpp:1660-1711.
+        //
+        // The skip-set is computed against prev_version (the pre-upgrade
+        // protocol, == upgrade_ctx.current_version) with the node's max
+        // supported version as the ceiling. A skipped upgrade must produce NO
+        // UpgradeEntryMeta and must not mutate header fields (handled in
+        // UpgradeContext::apply_to_header). The full nominated set still goes
+        // into scp_value.upgrades unchanged (header-hash parity).
+        //
+        // Spec wording is "skip with a warning"; stellar-core logs at ERROR. We
+        // use warn! to match the spec text — log level is not consensus-observable.
+        let skip_set = self
+            .upgrade_ctx
+            .apply_time_skip_set(henyey_common::CURRENT_LEDGER_PROTOCOL_VERSION);
+        for (upgrade, skip) in self.upgrade_ctx.upgrades.iter().zip(skip_set.iter()) {
+            if *skip {
+                tracing::warn!(
+                    ledger_seq = self.close_data.ledger_seq,
+                    upgrade = ?upgrade,
+                    "Skipping upgrade that is invalid at apply time (LEDGER §7.3.4-2)"
+                );
+            }
+        }
+
         // Parity: Upgrades.cpp:1229-1242 applyVersionUpgrade
         // Version upgrades may create/modify config setting entries in the
         // ledger (e.g. new cost types for V25, state size window for V23+).
@@ -4564,7 +4591,16 @@ impl LedgerCloseContext<'_> {
         // Parity: LedgerManagerImpl.cpp:1671-1680 — stellar-core only appends
         // meta after a successful child-txn commit; failed upgrades produce no meta.
         let mut upgrades_meta = Vec::new();
-        for upgrade in std::mem::take(&mut self.close_data.upgrades) {
+        for (idx, upgrade) in std::mem::take(&mut self.close_data.upgrades)
+            .into_iter()
+            .enumerate()
+        {
+            // LEDGER §7.3.4-2: an upgrade invalid at apply time is skipped —
+            // it produces NO UpgradeEntryMeta. This covers every non-Config
+            // arm, including the header-only `_ => (true, ...)` arm below.
+            if skip_set.get(idx).copied().unwrap_or(false) {
+                continue;
+            }
             let (succeeded, changes) = match &upgrade {
                 LedgerUpgrade::Version(_) => (version_upgrade_succeeded, version_changes.clone()),
                 LedgerUpgrade::Config(key) => {

@@ -1413,9 +1413,23 @@ impl UpgradeContext {
         })
     }
 
-    /// Apply upgrades to a header, returning the modified values.
+    /// Apply upgrades to a header, mutating the scalar header fields.
+    ///
+    /// LEDGER_SPEC §7.3.4 step 2 (`LEDGER §7.3.4-2`): upgrades that are invalid
+    /// at apply time (per [`apply_time_skip_set`]) are SKIPPED — their header
+    /// field is left unchanged — mirroring stellar-core
+    /// `LedgerManagerImpl.cpp:1660-1711`. The full nominated set still goes into
+    /// `scpValue.upgrades` elsewhere, so header-hash parity is preserved.
+    ///
+    /// The skip-set is computed against [`henyey_common::CURRENT_LEDGER_PROTOCOL_VERSION`]
+    /// as the max supported version, matching the manager-side re-check.
     pub fn apply_to_header(&self, header: &mut LedgerHeader) {
-        for upgrade in &self.upgrades {
+        let skips = self.apply_time_skip_set(henyey_common::CURRENT_LEDGER_PROTOCOL_VERSION);
+        for (upgrade, skip) in self.upgrades.iter().zip(skips.iter()) {
+            if *skip {
+                // Invalid at apply time — leave the header field unchanged.
+                continue;
+            }
             match upgrade {
                 LedgerUpgrade::Version(v) => {
                     header.ledger_version = *v;
