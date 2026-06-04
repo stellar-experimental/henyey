@@ -1598,6 +1598,7 @@ fn local_config() -> AppConfig {
                     dir = data_dir.join("history").display()
                 )),
             }],
+            publish_to_archive_delay_seconds: 0,
         },
         overlay: OverlayConfig {
             known_peers: vec![],
