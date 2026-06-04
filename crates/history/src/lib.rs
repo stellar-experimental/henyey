@@ -160,7 +160,9 @@ pub use checkpoint::{
 pub use checkpoint_builder::write_record_marked_xdr;
 pub use compare::{compare_checkpoint, Category, CheckpointComparison, Mismatch};
 pub use download::DownloadConfig;
-pub use error::{HistoryError, TxSetHashMismatchInfo, VerifyHashKind, VerifyHashMismatchInfo};
+pub use error::{
+    HistoryError, LedgerVerifyStatus, TxSetHashMismatchInfo, VerifyHashKind, VerifyHashMismatchInfo,
+};
 pub use ledger_apply_manager::{
     apply_drift_exceeded, classify_process_ledger, max_buffer_invariant_entries,
     trim_boundary_for_last_buffered, trim_syncing_buffer, ProcessLedgerDecision,
