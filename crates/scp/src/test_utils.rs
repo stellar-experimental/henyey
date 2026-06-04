@@ -32,6 +32,8 @@ pub struct MockDriver {
     pub emit_count: AtomicU32,
     /// Counts how many times `ballot_did_hear_from_quorum` was called.
     pub heard_from_quorum: AtomicU32,
+    /// Counts how many times `accepted_commit` was called.
+    pub accepted_commit_count: AtomicU32,
     /// If true, `get_quorum_set_by_hash` returns the configured quorum set
     /// regardless of the hash. Useful for testing quorum info methods.
     pub return_qset_by_hash: bool,
@@ -112,6 +114,7 @@ impl MockDriverBuilder {
             timeout_mode: self.timeout_mode,
             emit_count: AtomicU32::new(0),
             heard_from_quorum: AtomicU32::new(0),
+            accepted_commit_count: AtomicU32::new(0),
             return_qset_by_hash: self.return_qset_by_hash,
             custom_node_weight: None,
         }
