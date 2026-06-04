@@ -1058,4 +1058,151 @@ mod tests {
             "new_unlogged should not emit any tracing events"
         );
     }
+
+    // ---- LedgerVerifyStatus taxonomy + classifier (CATCHUP §3.9-1, #3036) ----
+
+    #[test]
+    fn test_verify_status_maps_verification_variants() {
+        // ErrBadLedgerVersion
+        assert_eq!(
+            HistoryError::UnsupportedLedgerVersion {
+                ledger: 10,
+                version: 99,
+                min: 20,
+                max: 23,
+            }
+            .verify_status(),
+            Some(LedgerVerifyStatus::ErrBadLedgerVersion),
+        );
+
+        // ErrBadHash — a representative hash-class variant.
+        assert_eq!(
+            HistoryError::InvalidPreviousHash { ledger: 5 }.verify_status(),
+            Some(LedgerVerifyStatus::ErrBadHash),
+        );
+        let mismatch: HistoryError = VerifyHashMismatchInfo::new_unlogged(
+            VerifyHashKind::BucketList,
+            Some(7),
+            Hash256::ZERO,
+            Hash256::from([0xAB; 32]),
+        )
+        .into();
+        assert_eq!(
+            mismatch.verify_status(),
+            Some(LedgerVerifyStatus::ErrBadHash)
+        );
+        assert_eq!(
+            HistoryError::Ledger(henyey_ledger::LedgerError::HashMismatch {
+                expected: "abc".into(),
+                actual: "def".into(),
+            })
+            .verify_status(),
+            Some(LedgerVerifyStatus::ErrBadHash),
+        );
+
+        // ErrOvershot via KnitOvershot.
+        assert_eq!(
+            HistoryError::KnitOvershot {
+                entry_seq: 12,
+                lcl_seq: 10,
+            }
+            .verify_status(),
+            Some(LedgerVerifyStatus::ErrOvershot),
+        );
+
+        // ErrCorruptHeader.
+        assert_eq!(
+            HistoryError::CorruptHeader {
+                ledger: 100,
+                detail: "bad XDR".into(),
+            }
+            .verify_status(),
+            Some(LedgerVerifyStatus::ErrCorruptHeader),
+        );
+    }
+
+    #[test]
+    fn test_verify_status_invalid_sequence_overshot_vs_undershot() {
+        // got > expected => overshot.
+        assert_eq!(
+            HistoryError::InvalidSequence {
+                expected: 5,
+                got: 7,
+            }
+            .verify_status(),
+            Some(LedgerVerifyStatus::ErrOvershot),
+        );
+        // got < expected => undershot.
+        assert_eq!(
+            HistoryError::InvalidSequence {
+                expected: 7,
+                got: 5,
+            }
+            .verify_status(),
+            Some(LedgerVerifyStatus::ErrUndershot),
+        );
+    }
+
+    #[test]
+    fn test_verify_status_none_for_transient() {
+        assert_eq!(
+            HistoryError::ArchiveUnreachable("timeout".into()).verify_status(),
+            None,
+        );
+        assert_eq!(
+            HistoryError::DownloadFailed("404".into()).verify_status(),
+            None,
+        );
+        assert_eq!(
+            HistoryError::Io(std::io::Error::other("disk")).verify_status(),
+            None,
+        );
+        assert_eq!(HistoryError::NotFound("x".into()).verify_status(), None);
+        assert_eq!(
+            HistoryError::CheckpointNotYetPublished {
+                target: 100,
+                has_current: 50,
+            }
+            .verify_status(),
+            None,
+        );
+    }
+
+    #[test]
+    fn test_ledger_verify_status_display() {
+        assert_eq!(LedgerVerifyStatus::Ok.to_string(), "VERIFY_STATUS_OK");
+        assert_eq!(
+            LedgerVerifyStatus::ErrBadHash.to_string(),
+            "VERIFY_STATUS_ERR_BAD_HASH"
+        );
+        assert_eq!(
+            LedgerVerifyStatus::ErrBadLedgerVersion.to_string(),
+            "VERIFY_STATUS_ERR_BAD_LEDGER_VERSION"
+        );
+        assert_eq!(
+            LedgerVerifyStatus::ErrOvershot.to_string(),
+            "VERIFY_STATUS_ERR_OVERSHOT"
+        );
+        assert_eq!(
+            LedgerVerifyStatus::ErrUndershot.to_string(),
+            "VERIFY_STATUS_ERR_UNDERSHOT"
+        );
+        assert_eq!(
+            LedgerVerifyStatus::ErrMissingEntries.to_string(),
+            "VERIFY_STATUS_ERR_MISSING_ENTRIES"
+        );
+        assert_eq!(
+            LedgerVerifyStatus::ErrCorruptHeader.to_string(),
+            "VERIFY_STATUS_ERR_CORRUPT_HEADER"
+        );
+    }
+
+    #[test]
+    fn test_verify_status_err_missing_entries_taxonomy() {
+        // ErrMissingEntries is a taxonomy-only variant (no distinct henyey
+        // producer today); assert it exists and renders correctly.
+        let s = LedgerVerifyStatus::ErrMissingEntries;
+        assert_eq!(s, LedgerVerifyStatus::ErrMissingEntries);
+        assert_eq!(s.to_string(), "VERIFY_STATUS_ERR_MISSING_ENTRIES");
+    }
 }
