@@ -33,7 +33,7 @@ use crate::error::HistoryError;
 /// Default timeout for HTTP requests.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// Retry count for operations that should retry a few times (e.g. HAS downloads).
+/// Retry count for operations that should retry a few times (e.g. SCP downloads).
 ///
 /// Matches stellar-core's `RETRY_A_FEW = 5`.
 pub const RETRY_A_FEW: u32 = 5;
@@ -42,6 +42,14 @@ pub const RETRY_A_FEW: u32 = 5;
 ///
 /// Matches stellar-core's `RETRY_A_LOT = 32`.
 pub const RETRY_A_LOT: u32 = 32;
+
+/// Retry count for the History Archive State (HAS) download.
+///
+/// CATCHUP_SPEC §13.1-1: stellar-core's `CatchupWork` overrides the default
+/// `RETRY_A_FEW` and constructs `GetHistoryArchiveStateWork` with `10` retries
+/// "to ensure we retry enough in case current checkpoint isn't published yet"
+/// (see `stellar-core/src/catchup/CatchupWork.cpp`). Matches that value.
+pub const HAS_RETRIES: u32 = 10;
 
 /// Default number of retry attempts (uses `RETRY_A_FEW`).
 pub const DEFAULT_RETRIES: u32 = RETRY_A_FEW;
@@ -473,6 +481,15 @@ mod tests {
     #[test]
     fn test_retry_a_lot_is_32() {
         assert_eq!(RETRY_A_LOT, 32, "CATCHUP_SPEC §9.1: RETRY_A_LOT must be 32");
+    }
+
+    #[test]
+    fn test_has_retries_is_10() {
+        assert_eq!(
+            HAS_RETRIES, 10,
+            "CATCHUP_SPEC §13.1-1: HAS download must use 10 retries \
+             (stellar-core CatchupWork overrides RETRY_A_FEW)"
+        );
     }
 
     #[test]

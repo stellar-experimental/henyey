@@ -8,14 +8,16 @@
 //! The builder creates the following work DAG:
 //!
 //! ```text
-//!   get_has ──┬── download_buckets    (RETRY_A_LOT)
+//!   get_has ──┬── download_buckets    (RETRY_A_LOT)   [get_has uses HAS_RETRIES]
 //!             └── download_headers ──┬── download_tx        (RETRY_A_LOT)
 //!                                    ├── download_tx_results (RETRY_A_LOT, after tx)
 //!                                    └── download_scp       (RETRY_A_FEW)
 //! ```
 //!
-//! Work items are retried per CATCHUP_SPEC §9.1:
-//! - `RETRY_A_FEW` (5): lightweight metadata downloads (HAS, SCP)
+//! Work items are retried per CATCHUP_SPEC §9.1 and §13.1-1:
+//! - `HAS_RETRIES` (10): HAS download (stellar-core `CatchupWork` overrides the
+//!   default to retry enough in case the current checkpoint isn't published yet)
+//! - `RETRY_A_FEW` (5): lightweight metadata downloads (SCP)
 //! - `RETRY_A_LOT` (32): bulk data downloads (buckets, headers, txs, results)
 
 use std::path::PathBuf;
@@ -23,7 +25,7 @@ use std::sync::Arc;
 
 use henyey_history::{
     archive::HistoryArchive,
-    download::{RETRY_A_FEW, RETRY_A_LOT},
+    download::{HAS_RETRIES, RETRY_A_FEW, RETRY_A_LOT},
 };
 use henyey_work::{WorkId, WorkScheduler};
 
@@ -116,8 +118,9 @@ impl HistoryWorkBuilder {
     ///
     /// Creates and registers all download work items (HAS, buckets, headers,
     /// transactions, results, SCP) with proper dependency ordering. Each work
-    /// item is configured with appropriate retry counts per CATCHUP_SPEC §9.1:
-    /// HAS downloads use `RETRY_A_FEW` (5), bulk downloads use `RETRY_A_LOT` (32).
+    /// item is configured with appropriate retry counts per CATCHUP_SPEC §9.1
+    /// and §13.1-1: HAS downloads use `HAS_RETRIES` (10), bulk downloads use
+    /// `RETRY_A_LOT` (32).
     ///
     /// # Returns
     ///
@@ -130,7 +133,9 @@ impl HistoryWorkBuilder {
                 state: Arc::clone(&self.state),
             }),
             vec![],
-            RETRY_A_FEW,
+            // Spec: CATCHUP_SPEC §13.1-1 — HAS download uses HAS_RETRIES (10),
+            // matching stellar-core's CatchupWork override of RETRY_A_FEW.
+            HAS_RETRIES,
         );
 
         // Spec: CATCHUP_SPEC §9.1 — bucket downloads use RETRY_A_LOT (32).
