@@ -544,9 +544,14 @@ impl BallotProtocol {
             }
         };
 
-        // Matches stellar-core BallotProtocol.cpp:442
+        // Matches stellar-core BallotProtocol.cpp:442. stellar-core's
+        // checkInvariants() is a sequence of dbgAssert(...) — a debug-only abort
+        // that is compiled out under NDEBUG. The Rust analogue is debug_assert!:
+        // abort in debug/test builds, no-op (and stripped) under --release. Keep
+        // the warn! so release builds retain the observability they have today.
         if let Err(e) = self.check_invariants() {
             tracing::warn!("Invariant violation after update_current_value: {e}");
+            debug_assert!(false, "Invariant violation after update_current_value: {e}");
         }
 
         updated

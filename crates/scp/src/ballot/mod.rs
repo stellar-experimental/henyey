@@ -3487,6 +3487,13 @@ mod tests {
             counter: 1,
             value: value.clone(),
         });
+        // The real protocol path reaches set_confirm_commit only from CONFIRM,
+        // where prepared is already set; mirror that so check_invariants() holds
+        // once the phase becomes Externalize (INV-S8: all four fields required).
+        bp.prepared = Some(ScpBallot {
+            counter: 1,
+            value: value.clone(),
+        });
 
         let c = ScpBallot {
             counter: 1,
@@ -3524,6 +3531,12 @@ mod tests {
         let value = make_value(&[42]);
 
         bp.current_ballot = Some(ScpBallot {
+            counter: 1,
+            value: value.clone(),
+        });
+        // CONFIRM→EXTERNALIZE always carries a prepared ballot in the real path;
+        // set it so check_invariants() holds once the phase becomes Externalize.
+        bp.prepared = Some(ScpBallot {
             counter: 1,
             value: value.clone(),
         });
@@ -4911,6 +4924,12 @@ mod tests {
             counter: 2,
             value: value.clone(),
         });
+        // CONFIRM phase requires prepared (INV-S8); set it so the EXTERNALIZE
+        // transition driven below keeps check_invariants() satisfied.
+        bp.prepared = Some(ScpBallot {
+            counter: 2,
+            value: value.clone(),
+        });
 
         let env_b = ScpEnvelope {
             statement: ScpStatement {
@@ -5163,6 +5182,107 @@ mod tests {
             assert!(
                 bp.commit().is_none(),
                 "commit must be cleared in release builds even if phase is CONFIRM"
+            );
+        }
+    }
+
+    /// SCP §13.1-6 / INV-S8 parity regression: `update_current_value` must abort
+    /// (not merely `tracing::warn!`) when `check_invariants()` fails, mirroring
+    /// stellar-core's `dbgAssert` at `BallotProtocol.cpp:442`. `debug_assert!` is
+    /// the exact analogue: it panics in debug/test builds and is compiled out
+    /// under `--release` (NDEBUG), so release/mainnet behavior is unchanged.
+    ///
+    /// FAILS on `origin/main` (the site only warns → `catch_unwind` returns `Ok`
+    /// even in a debug build, so the `is_err()` assertion fails); PASSES after the
+    /// `debug_assert!` lands. Pattern follows
+    /// `test_set_accept_prepared_phase_guard_matches_debug_assert_semantics`.
+    #[test]
+    fn test_check_invariants_violation_aborts_in_debug_via_update_current_value() {
+        let value_a: Value = vec![1u8, 0].try_into().unwrap();
+
+        let mut bp = BallotProtocol::new();
+        // Force a structurally-invalid CONFIRM state: current_ballot is set but
+        // prepared/commit/high_ballot are all None. INV-S8 requires all four
+        // fields in CONFIRM, so check_invariants() returns Err. current_ballot
+        // being Some routes update_current_value down the path that reaches the
+        // unconditional check_invariants() call (state_machine.rs:548).
+        bp.set_phase_for_test(BallotPhase::Confirm);
+        bp.set_current_ballot_for_test(Some(ScpBallot {
+            counter: 2,
+            value: value_a.clone(),
+        }));
+
+        // A ballot that is not greater than current_ballot, so the body takes the
+        // `_ => false` arm and falls through to check_invariants() without
+        // mutating state.
+        let ballot = ScpBallot {
+            counter: 1,
+            value: value_a.clone(),
+        };
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            bp.update_current_value(&ballot)
+        }));
+
+        if cfg!(debug_assertions) {
+            assert!(
+                result.is_err(),
+                "debug builds must panic on invariant violation in update_current_value \
+                 (matches stellar-core dbgAssert at BallotProtocol.cpp:442)"
+            );
+        } else {
+            assert!(
+                result.is_ok(),
+                "release builds must NOT panic — matches stellar-core dbgAssert under NDEBUG"
+            );
+        }
+    }
+
+    /// SCP §13.1-6 / INV-S8 parity regression: `emit_current_state` must abort
+    /// (not merely `tracing::warn!`) when `check_invariants()` fails, mirroring
+    /// stellar-core's `dbgAssert` at `BallotProtocol.cpp:529`. Same debug/release
+    /// split as the `update_current_value` test above.
+    ///
+    /// FAILS on `origin/main` (only warns → `Ok` in debug); PASSES after the
+    /// `debug_assert!` lands.
+    #[test]
+    fn test_check_invariants_violation_aborts_in_debug_via_emit_current_state() {
+        let node_self = make_node_id(0);
+        let node_b = make_node_id(1);
+        let node_c = make_node_id(2);
+        let value_a: Value = vec![1u8, 0].try_into().unwrap();
+        let quorum_set =
+            make_quorum_set(vec![node_self.clone(), node_b.clone(), node_c.clone()], 3);
+        let driver = Arc::new(
+            MockDriverBuilder::new()
+                .quorum_set(quorum_set.clone())
+                .build(),
+        );
+        let ctx = ctx!(&node_self, &quorum_set, &driver, 1);
+
+        let mut bp = BallotProtocol::new();
+        // Same invariant-violating CONFIRM state: current_ballot set, the other
+        // three required fields None. emit_current_state calls check_invariants()
+        // at the top (envelope.rs:142) before doing any phase-specific work.
+        bp.set_phase_for_test(BallotPhase::Confirm);
+        bp.set_current_ballot_for_test(Some(ScpBallot {
+            counter: 2,
+            value: value_a.clone(),
+        }));
+
+        let result =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| bp.emit_current_state(&ctx)));
+
+        if cfg!(debug_assertions) {
+            assert!(
+                result.is_err(),
+                "debug builds must panic on invariant violation in emit_current_state \
+                 (matches stellar-core dbgAssert at BallotProtocol.cpp:529)"
+            );
+        } else {
+            assert!(
+                result.is_ok(),
+                "release builds must NOT panic — matches stellar-core dbgAssert under NDEBUG"
             );
         }
     }

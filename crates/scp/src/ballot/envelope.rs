@@ -138,10 +138,17 @@ impl BallotProtocol {
     /// 8. Advance slot (non-Externalize) or just record (Externalize)
     /// 9. Emit via `send_latest_envelope`
     pub(super) fn emit_current_state<D: SCPDriver>(&mut self, ctx: &SlotContext<'_, D>) {
-        // Matches stellar-core BallotProtocol.cpp:529
+        // Matches stellar-core BallotProtocol.cpp:529. checkInvariants() upstream
+        // is a sequence of dbgAssert(...) — a debug-only abort compiled out under
+        // NDEBUG. debug_assert! is the Rust analogue: abort in debug/test builds,
+        // stripped under --release. Keep the warn! so release retains observability.
         if let Err(e) = self.check_invariants() {
             tracing::warn!(
                 slot = ctx.slot_index,
+                "Invariant violation at start of emit_current_state: {e}"
+            );
+            debug_assert!(
+                false,
                 "Invariant violation at start of emit_current_state: {e}"
             );
         }
