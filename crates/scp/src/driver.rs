@@ -467,33 +467,28 @@ pub trait SCPDriver: Send + Sync {
     /// are causing consensus timeouts. When too many timeouts occur,
     /// upgrades may be stripped to allow consensus to proceed.
     ///
-    /// # Default Implementation
-    /// Returns false (no upgrades).
-    fn has_upgrades(&self, _value: &Value) -> bool {
-        false
-    }
+    /// Required method (no default) — mirrors stellar-core's pure-virtual
+    /// `SCPDriver::haveUpgrades` (`SCPDriver.h:171`). Every driver must make a
+    /// conscious choice; there is intentionally no silent no-op fallback.
+    fn has_upgrades(&self, value: &Value) -> bool;
 
     /// Strip all upgrades from a value.
     ///
     /// Returns a new value with all upgrades removed, or None if the
     /// value cannot have upgrades stripped (e.g., it has no upgrades).
     ///
-    /// # Default Implementation
-    /// Returns None.
-    fn strip_all_upgrades(&self, _value: &Value) -> Option<Value> {
-        None
-    }
+    /// Required method (no default) — mirrors stellar-core's pure-virtual
+    /// `SCPDriver::stripUpgrades` (`SCPDriver.h:174`).
+    fn strip_all_upgrades(&self, value: &Value) -> Option<Value>;
 
     /// Get the number of nomination timeouts before upgrades are stripped.
     ///
     /// When the nomination timer expires this many times, values with
     /// upgrades will have their upgrades stripped to help consensus proceed.
     ///
-    /// # Default Implementation
-    /// Returns `u32::MAX` (effectively never strip).
-    fn get_upgrade_nomination_timeout_limit(&self) -> u32 {
-        u32::MAX
-    }
+    /// Required method (no default) — mirrors stellar-core's pure-virtual
+    /// `SCPDriver::getUpgradeNominationTimeoutLimit` (`SCPDriver.h:179`).
+    fn get_upgrade_nomination_timeout_limit(&self) -> u32;
 }
 
 /// Compute weight as `ceil(m * threshold / total)`.
