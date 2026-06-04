@@ -6,16 +6,17 @@ use henyey_ledger::{
     compute_header_hash, LedgerCloseData, LedgerManager, LedgerManagerConfig, TransactionSetVariant,
 };
 use stellar_xdr::curr::{
-    AccountEntry, AccountEntryExt, AccountId, BucketListType, BytesM, ContractCodeEntry,
-    ContractCodeEntryExt, ContractEventBody, DecoratedSignature, ExtendFootprintTtlOp,
-    ExtensionPoint, FeeBumpTransaction, FeeBumpTransactionEnvelope, FeeBumpTransactionInnerTx,
-    Hash, LedgerCloseMeta, LedgerEntry, LedgerEntryData, LedgerEntryExt, LedgerFootprint,
-    LedgerHeader, LedgerHeaderExt, LedgerKey, LedgerKeyContractCode, Memo, MuxedAccount, Operation,
-    OperationBody, Preconditions, PublicKey, ScVal, SequenceNumber, Signature as XdrSignature,
-    SignatureHint, SorobanResources, SorobanTransactionData, SorobanTransactionDataExt,
-    StellarValue, StellarValueExt, Thresholds, TimePoint, Transaction, TransactionEnvelope,
-    TransactionEventStage, TransactionExt, TransactionMeta, TransactionResultSet, TransactionSet,
-    TransactionV1Envelope, TtlEntry, Uint256, VecM,
+    AccountEntry, AccountEntryExt, AccountId, Asset, BucketListType, BytesM, ContractCodeEntry,
+    ContractCodeEntryExt, ContractEventBody, CreateAccountOp, DecoratedSignature,
+    ExtendFootprintTtlOp, ExtensionPoint, FeeBumpTransaction, FeeBumpTransactionEnvelope,
+    FeeBumpTransactionInnerTx, Hash, LedgerCloseMeta, LedgerEntry, LedgerEntryData, LedgerEntryExt,
+    LedgerFootprint, LedgerHeader, LedgerHeaderExt, LedgerKey, LedgerKeyAccount,
+    LedgerKeyContractCode, Memo, MuxedAccount, Operation, OperationBody, PaymentOp, Preconditions,
+    PublicKey, ScVal, SequenceNumber, Signature as XdrSignature, SignatureHint, SorobanResources,
+    SorobanTransactionData, SorobanTransactionDataExt, StellarValue, StellarValueExt, Thresholds,
+    TimePoint, Transaction, TransactionEnvelope, TransactionEventStage, TransactionExt,
+    TransactionMeta, TransactionResultSet, TransactionSet, TransactionV1Envelope, TtlEntry,
+    Uint256, VecM,
 };
 
 fn make_genesis_header() -> LedgerHeader {
@@ -1646,4 +1647,148 @@ async fn test_close_ledger_with_held_snapshot_preserves_results() {
         .expect("spawn_blocking")
         .expect("close 3 after snapshot drop");
     assert_eq!(result3.header.ledger_seq, 3);
+}
+
+/// Close-level invariant for #3059 (LEDGER §6.6.1): after a ledger close that
+/// creates and updates entries, every entry bound to the bucket list reads
+/// `last_modified_ledger_seq == close_ledger_seq`. The central enforcement pass
+/// in the bucket-update drain (mirroring stellar-core
+/// `LedgerTxn::maybeUpdateLastModified()`) guarantees this for the
+/// consensus-observable bucket-list entries.
+///
+/// This asserts the post-close invariant only; the no-op proof (that the pass
+/// changed no observable hash) is provided by the golden-vector tests in
+/// `ledger_close_meta_vectors.rs` / `tx_meta_hash_vectors.rs`, not by a
+/// before/after diff here.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_close_stamps_last_modified_on_all_entries() {
+    let network_id = NetworkId::testnet();
+    let secret = SecretKey::from_seed(&[7u8; 32]);
+    let source_id = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(
+        *secret.public_key().as_bytes(),
+    )));
+    let dest_secret = SecretKey::from_seed(&[8u8; 32]);
+    let dest_id = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(
+        *dest_secret.public_key().as_bytes(),
+    )));
+
+    // Seed the bucket list with a source account stamped at a stale ledger seq
+    // (ledger 1). After the close at ledger 100 it must be re-stamped to 100.
+    let mut bucket_list = henyey_ledger::new_bucket_list_with_soroban_config();
+    let source_entry = make_source_account_entry(source_id.clone(), 1, 1_000_000_000);
+    bucket_list
+        .add_batch(
+            1,
+            25,
+            BucketListType::Live,
+            vec![source_entry],
+            vec![],
+            vec![],
+        )
+        .expect("add_batch");
+
+    let config = LedgerManagerConfig {
+        validate_bucket_hash: false,
+        ..Default::default()
+    };
+    let ledger = Arc::new(LedgerManager::new(
+        "Test SDF Network ; September 2015".to_string(),
+        config,
+    ));
+    let hot_archive = HotArchiveBucketList::new();
+    // Start at ledger 99 so the close produces ledger 100 — distinct from the
+    // stale seed seq (1) of the source account.
+    let mut header = make_genesis_header();
+    header.ledger_seq = 99;
+    let header_hash = compute_header_hash(&header).expect("hash");
+    ledger
+        .initialize(bucket_list, hot_archive, header, header_hash)
+        .expect("init");
+
+    // Transaction 1: source creates a new destination account (init entry) and
+    // pays it (the new account + the source are updated within the same close).
+    let tx = Transaction {
+        source_account: MuxedAccount::Ed25519(Uint256(*secret.public_key().as_bytes())),
+        fee: 200,
+        seq_num: SequenceNumber(2),
+        cond: Preconditions::None,
+        memo: Memo::None,
+        operations: vec![
+            Operation {
+                source_account: None,
+                body: OperationBody::CreateAccount(CreateAccountOp {
+                    destination: dest_id.clone(),
+                    starting_balance: 100_000_000,
+                }),
+            },
+            Operation {
+                source_account: None,
+                body: OperationBody::Payment(PaymentOp {
+                    destination: MuxedAccount::Ed25519(Uint256(
+                        *dest_secret.public_key().as_bytes(),
+                    )),
+                    asset: Asset::Native,
+                    amount: 1_000,
+                }),
+            },
+        ]
+        .try_into()
+        .unwrap(),
+        ext: TransactionExt::V0,
+    };
+
+    let mut envelope = TransactionEnvelope::Tx(TransactionV1Envelope {
+        tx,
+        signatures: VecM::default(),
+    });
+    let decorated = sign_envelope(&envelope, &secret, &network_id);
+    if let TransactionEnvelope::Tx(ref mut env) = envelope {
+        env.signatures = vec![decorated].try_into().unwrap();
+    }
+
+    let prev_hash = ledger.current_header_hash();
+    let close_ledger_seq = 100u32;
+    let close_data = LedgerCloseData::new(
+        close_ledger_seq,
+        TransactionSetVariant::Classic(TransactionSet {
+            previous_ledger_hash: Hash::from(prev_hash),
+            txs: vec![envelope].try_into().unwrap(),
+        }),
+        100,
+        prev_hash,
+    );
+
+    let handle = tokio::runtime::Handle::current();
+    let lm = ledger.clone();
+    let result = tokio::task::spawn_blocking(move || lm.close_ledger(close_data, Some(handle)))
+        .await
+        .expect("spawn_blocking task")
+        .expect("close ledger");
+    assert_eq!(result.header.ledger_seq, close_ledger_seq);
+    assert!(
+        matches!(
+            result.tx_results[0].result.result,
+            stellar_xdr::curr::TransactionResultResult::TxSuccess(_)
+        ),
+        "tx should succeed, got {:?}",
+        result.tx_results[0].result.result
+    );
+
+    // Read the bucket-list-bound entries back and assert they were re-stamped to
+    // the close ledger seq. The source account was seeded at ledger 1 (stale);
+    // the destination was created this ledger.
+    let bl = ledger.bucket_list();
+    for (label, account_id) in [("source", &source_id), ("destination", &dest_id)] {
+        let key = LedgerKey::Account(LedgerKeyAccount {
+            account_id: account_id.clone(),
+        });
+        let entry = bl
+            .get(&key)
+            .expect("bucket list get")
+            .unwrap_or_else(|| panic!("{label} account must exist after close"));
+        assert_eq!(
+            entry.last_modified_ledger_seq, close_ledger_seq,
+            "{label} account last_modified_ledger_seq must equal the close ledger seq"
+        );
+    }
 }
