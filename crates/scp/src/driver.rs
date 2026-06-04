@@ -200,6 +200,49 @@ impl ValidationLevel {
 /// - **Network**: [`emit_envelope`](Self::emit_envelope)
 /// - **Notifications**: [`nominating_value`](Self::nominating_value), [`value_externalized`](Self::value_externalized), etc.
 /// - **Timing**: [`compute_timeout`](Self::compute_timeout)
+/// Encode a value to its canonical XDR wire bytes.
+///
+/// Module-private helper shared by the default [`SCPDriver::compute_hash_node`]
+/// and [`SCPDriver::compute_value_hash`] implementations. Uses
+/// `to_xdr(Limits::none())` (via [`henyey_common::xdr_stream::xdr_to_bytes`]),
+/// which produces the exact wire bytes stellar-core's `xdr::xdr_to_opaque`
+/// produces for these types. Kept as a free function (not a trait method) so it
+/// does not widen the public trait surface.
+fn scp_xdr_bytes<T: stellar_xdr::curr::WriteXdr>(value: &T) -> Vec<u8> {
+    henyey_common::xdr_stream::xdr_to_bytes(value)
+}
+
+/// Compute `first8BE(SHA-256(xdr(slotIndex) ‖ xdr(prevValue) ‖ <extras>))`.
+///
+/// Reproduces stellar-core `SCPDriver::hashHelper` (`SCPDriver.cpp:98-118`)
+/// byte-for-byte: it builds the ordered list `[xdr(slotIndex), xdr(prevValue),
+/// <extras>]`, SHA-256s the concatenation of those raw XDR byte runs (core's
+/// `getHashOf` over `vector<opaque_vec>` concatenates element bytes with no
+/// inter-element framing), then folds the first 8 bytes big-endian
+/// (`res = (res << 8) | t[i]`, `i ∈ 0..8`) into a `u64`. Module-private so it
+/// does not widen the public trait surface. CONSENSUS-CRITICAL — see the
+/// callers' doc comments.
+fn scp_hash_helper<F>(slot_index: u64, prev_value: &Value, extra: F) -> u64
+where
+    F: FnOnce(&mut Vec<Vec<u8>>),
+{
+    let mut values = Vec::new();
+    values.push(scp_xdr_bytes(&slot_index));
+    values.push(scp_xdr_bytes(prev_value));
+    extra(&mut values);
+
+    let mut data = Vec::new();
+    for value in values {
+        data.extend_from_slice(&value);
+    }
+    let hash = Hash256::hash(&data);
+    let mut result = 0u64;
+    for byte in &hash.as_bytes()[0..8] {
+        result = (result << 8) | (*byte as u64);
+    }
+    result
+}
+
 pub trait SCPDriver: Send + Sync {
     /// Validate a value.
     ///
@@ -320,6 +363,17 @@ pub trait SCPDriver: Send + Sync {
     ///
     /// This is used to deterministically order nodes during nomination
     /// to ensure consistent behavior across the network.
+    ///
+    /// # Default implementation
+    ///
+    /// The default mirrors stellar-core `SCPDriver::computeHashNode`
+    /// (`SCPDriver.cpp:98-144`) byte-for-byte:
+    /// `first8BE(SHA-256(xdr(slotIndex) ‖ xdr(prevValue) ‖ xdr(tag) ‖
+    /// xdr(round) ‖ xdr(nodeId)))`, where `tag = hash_P (2)` when
+    /// `is_priority` else `hash_N (1)`. CONSENSUS-CRITICAL: these hashes
+    /// drive nomination leader selection, so the wire bytes must match
+    /// stellar-core exactly. Overriding implementations must preserve this
+    /// algorithm in production (test drivers may diverge intentionally).
     fn compute_hash_node(
         &self,
         slot_index: u64,
@@ -327,16 +381,41 @@ pub trait SCPDriver: Send + Sync {
         is_priority: bool,
         round: u32,
         node_id: &NodeId,
-    ) -> u64;
+    ) -> u64 {
+        // hash_N = 1, hash_P = 2 (stellar-core SCPDriver.cpp:84-86).
+        let tag: u32 = if is_priority { 2 } else { 1 };
+        scp_hash_helper(slot_index, prev_value, |values| {
+            values.push(scp_xdr_bytes(&tag));
+            values.push(scp_xdr_bytes(&round));
+            values.push(scp_xdr_bytes(node_id));
+        })
+    }
 
     /// Compute value hash for nomination ordering.
+    ///
+    /// # Default implementation
+    ///
+    /// The default mirrors stellar-core `SCPDriver::computeValueHash`
+    /// (`SCPDriver.cpp:98-144`) byte-for-byte:
+    /// `first8BE(SHA-256(xdr(slotIndex) ‖ xdr(prevValue) ‖ xdr(hash_K) ‖
+    /// xdr(round) ‖ xdr(value)))`, where `hash_K = 3`. CONSENSUS-CRITICAL:
+    /// these hashes drive value priority ranking, so the wire bytes must
+    /// match stellar-core exactly.
     fn compute_value_hash(
         &self,
         slot_index: u64,
         prev_value: &Value,
         round: u32,
         value: &Value,
-    ) -> u64;
+    ) -> u64 {
+        // hash_K = 3 (stellar-core SCPDriver.cpp:87).
+        let tag: u32 = 3;
+        scp_hash_helper(slot_index, prev_value, |values| {
+            values.push(scp_xdr_bytes(&tag));
+            values.push(scp_xdr_bytes(&round));
+            values.push(scp_xdr_bytes(value));
+        })
+    }
 
     /// Compute timeout for a nomination or ballot round.
     ///
@@ -698,5 +777,213 @@ mod tests {
 
         let result = base_get_node_weight(&node4, &qset, false);
         assert!(is_near_weight(result, 0.6 * 0.5));
+    }
+}
+
+/// Tests for the byte-exact default `compute_hash_node` / `compute_value_hash`
+/// implementations on the `SCPDriver` trait (issue #3094).
+///
+/// CONSENSUS-CRITICAL: these lock the default to stellar-core's
+/// `SCPDriver::computeHashNode` / `computeValueHash` (`SCPDriver.cpp:98-144`)
+/// and to the legacy hand-rolled herder algorithm that was collapsed onto the
+/// default. Any byte drift would fork consensus and is caught here.
+#[cfg(test)]
+mod default_hash_tests {
+    use super::*;
+    use stellar_xdr::curr::{BytesM, Limits, PublicKey, Uint256, WriteXdr};
+
+    /// A minimal `SCPDriver` impl that does NOT override `compute_hash_node`
+    /// or `compute_value_hash`, so it exercises the trait DEFAULTS.
+    struct DefaultDriver;
+
+    impl SCPDriver for DefaultDriver {
+        fn validate_value(&self, _: u64, _: &Value, _: bool) -> ValidationLevel {
+            ValidationLevel::FullyValidated
+        }
+        fn combine_candidates(&self, _: u64, _: &[Value]) -> Option<Value> {
+            None
+        }
+        fn extract_valid_value(&self, _: u64, value: &Value) -> Option<Value> {
+            Some(value.clone())
+        }
+        fn emit_envelope(&self, _: &ScpEnvelope) {}
+        fn get_quorum_set(&self, _: &NodeId) -> Option<ScpQuorumSet> {
+            None
+        }
+        fn nominating_value(&self, _: u64, _: &Value) {}
+        fn value_externalized(&self, _: u64, _: &Value) {}
+        fn ballot_did_prepare(&self, _: u64, _: &ScpBallot) {}
+        fn ballot_did_confirm(&self, _: u64, _: &ScpBallot) {}
+        fn compute_timeout(&self, _: u32, _: bool) -> Duration {
+            Duration::from_secs(1)
+        }
+        fn sign_envelope(&self, _: &mut ScpEnvelope) {}
+        fn verify_envelope(&self, _: &ScpEnvelope) -> bool {
+            true
+        }
+        fn get_node_weight(&self, _: &NodeId, _: &ScpQuorumSet, _: bool) -> u64 {
+            0
+        }
+        fn has_upgrades(&self, _: &Value) -> bool {
+            false
+        }
+        fn strip_all_upgrades(&self, _: &Value) -> Option<Value> {
+            None
+        }
+        fn get_upgrade_nomination_timeout_limit(&self) -> u32 {
+            0
+        }
+    }
+
+    fn value(bytes: &[u8]) -> Value {
+        Value(BytesM::try_from(bytes.to_vec()).unwrap())
+    }
+
+    fn node(seed: u8) -> NodeId {
+        let mut b = [0u8; 32];
+        b[0] = seed;
+        b[31] = seed.wrapping_add(1);
+        NodeId(PublicKey::PublicKeyTypeEd25519(Uint256(b)))
+    }
+
+    /// Reproduce the OLD hand-rolled herder algorithm independently of the
+    /// production code, so we can assert byte-for-byte equivalence with the
+    /// new trait default. This is the regression guard for the collapse.
+    fn legacy_hash(slot_index: u64, prev_value: &Value, extras: &[Vec<u8>]) -> u64 {
+        let mut values: Vec<Vec<u8>> = Vec::new();
+        values.push(slot_index.to_xdr(Limits::none()).unwrap());
+        values.push(prev_value.to_xdr(Limits::none()).unwrap());
+        for e in extras {
+            values.push(e.clone());
+        }
+        let mut data = Vec::new();
+        for v in values {
+            data.extend_from_slice(&v);
+        }
+        let hash = Hash256::hash(&data);
+        let mut result = 0u64;
+        for byte in &hash.as_bytes()[0..8] {
+            result = (result << 8) | (*byte as u64);
+        }
+        result
+    }
+
+    fn legacy_hash_node(
+        slot_index: u64,
+        prev_value: &Value,
+        is_priority: bool,
+        round: u32,
+        node_id: &NodeId,
+    ) -> u64 {
+        let tag: u32 = if is_priority { 2 } else { 1 };
+        legacy_hash(
+            slot_index,
+            prev_value,
+            &[
+                tag.to_xdr(Limits::none()).unwrap(),
+                round.to_xdr(Limits::none()).unwrap(),
+                node_id.to_xdr(Limits::none()).unwrap(),
+            ],
+        )
+    }
+
+    fn legacy_value_hash(slot_index: u64, prev_value: &Value, round: u32, val: &Value) -> u64 {
+        let tag: u32 = 3;
+        legacy_hash(
+            slot_index,
+            prev_value,
+            &[
+                tag.to_xdr(Limits::none()).unwrap(),
+                round.to_xdr(Limits::none()).unwrap(),
+                val.to_xdr(Limits::none()).unwrap(),
+            ],
+        )
+    }
+
+    /// Absolute locked vector for `compute_hash_node`, BOTH priority branches.
+    ///
+    /// The expected `u64`s are hard-coded so a future change to the encoding,
+    /// tag, fold, or hash function fails this test loudly. They were produced
+    /// by the verified default implementation and cross-checked against the
+    /// independently-reproduced `legacy_hash_node` algorithm.
+    #[test]
+    fn test_compute_hash_node_matches_locked_vector() {
+        let d = DefaultDriver;
+        let prev = value(&[0xde, 0xad, 0xbe, 0xef, 0x01]);
+        let n = node(7);
+
+        // is_priority = false → tag = hash_N (1)
+        let h_n = d.compute_hash_node(42, &prev, false, 3, &n);
+        assert_eq!(
+            h_n, 0xe5aa_91f7_4e4a_3212,
+            "compute_hash_node (hash_N) drifted from locked vector"
+        );
+
+        // is_priority = true → tag = hash_P (2)
+        let h_p = d.compute_hash_node(42, &prev, true, 3, &n);
+        assert_eq!(
+            h_p, 0x2249_8d5a_6856_051f,
+            "compute_hash_node (hash_P) drifted from locked vector"
+        );
+
+        // The two tag branches must differ.
+        assert_ne!(h_n, h_p);
+    }
+
+    /// Absolute locked vector for `compute_value_hash` (tag = hash_K = 3).
+    #[test]
+    fn test_compute_value_hash_matches_locked_vector() {
+        let d = DefaultDriver;
+        let prev = value(&[0xde, 0xad, 0xbe, 0xef, 0x01]);
+        let val = value(&[0xca, 0xfe, 0xba, 0xbe]);
+
+        let h = d.compute_value_hash(42, &prev, 3, &val);
+        assert_eq!(
+            h, 0xd3e2_bd61_fc70_aece,
+            "compute_value_hash (hash_K) drifted from locked vector"
+        );
+    }
+
+    /// Lock byte-for-byte equivalence between the trait default and the
+    /// independently-reproduced legacy herder algorithm across representative
+    /// inputs (varying slot, prev, round, priority, node/value). This is the
+    /// guard that justifies collapsing the herder production impl onto the
+    /// default.
+    #[test]
+    fn test_default_matches_legacy_herder_algorithm() {
+        let d = DefaultDriver;
+
+        let slots: [u64; 4] = [0, 1, 42, u64::MAX];
+        let rounds: [u32; 3] = [0, 1, 1000];
+        let prevs = [value(&[]), value(&[0x00]), value(&[1, 2, 3, 4, 5, 6, 7])];
+        let inputs = [
+            value(&[]),
+            value(&[0xff]),
+            value(&[9, 8, 7, 6, 5, 4, 3, 2, 1]),
+        ];
+
+        for &slot in &slots {
+            for &round in &rounds {
+                for prev in &prevs {
+                    for &is_priority in &[false, true] {
+                        for seed in [0u8, 1, 7, 200, 255] {
+                            let n = node(seed);
+                            assert_eq!(
+                                d.compute_hash_node(slot, prev, is_priority, round, &n),
+                                legacy_hash_node(slot, prev, is_priority, round, &n),
+                                "compute_hash_node diverged from legacy: slot={slot} round={round} priority={is_priority} seed={seed}"
+                            );
+                        }
+                    }
+                    for val in &inputs {
+                        assert_eq!(
+                            d.compute_value_hash(slot, prev, round, val),
+                            legacy_value_hash(slot, prev, round, val),
+                            "compute_value_hash diverged from legacy: slot={slot} round={round}"
+                        );
+                    }
+                }
+            }
+        }
     }
 }
