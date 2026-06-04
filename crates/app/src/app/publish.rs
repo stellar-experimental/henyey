@@ -83,6 +83,48 @@ impl App {
             return;
         }
 
+        // PUBLISH_TO_ARCHIVE_DELAY gate (#3032). Mirrors stellar-core's
+        // `ConditionalWork("delay-publishing-to-archive", ...)`: the clock
+        // starts at "checkpoint is ready to publish" (this point), and the
+        // publish does not proceed until `elapsed >= delay`. henyey has no
+        // WorkScheduler, so the re-poll loop is realized by the existing
+        // post-close + ~1s validator-tick polling of `maybe_publish_history`.
+        //
+        // Stamp-once rule: stamp the marker only when the slot is empty or the
+        // stored seq differs from the current head; never re-stamp a matching
+        // marker. This measures the delay per-checkpoint from first-eligibility
+        // and prevents a repeatedly-failing publish (permit acquired, publish
+        // errors, checkpoint stays at head) from re-arming the delay on every
+        // poll. At the default delay of 0, the gate passes on the first poll
+        // (`elapsed >= ZERO` is always true) ⇒ zero behavioral change.
+        let delay =
+            std::time::Duration::from_secs(self.config.history.publish_to_archive_delay_seconds);
+        {
+            let mut ready = self
+                .publish_ready_since
+                .lock()
+                .expect("publish_ready_since mutex poisoned");
+            let stamp = match *ready {
+                Some((seq, since)) if seq == checkpoint => since,
+                _ => {
+                    // First time this checkpoint reached the head (or the head
+                    // advanced): stamp the eligibility instant exactly once.
+                    let now = std::time::Instant::now();
+                    *ready = Some((checkpoint, now));
+                    now
+                }
+            };
+            if stamp.elapsed() < delay {
+                tracing::debug!(
+                    checkpoint,
+                    delay_secs = self.config.history.publish_to_archive_delay_seconds,
+                    elapsed_secs = stamp.elapsed().as_secs(),
+                    "publish: delaying checkpoint per PUBLISH_TO_ARCHIVE_DELAY"
+                );
+                return;
+            }
+        }
+
         // Upgrade self_arc before acquiring the permit so that failure
         // doesn't require releasing the flag.
         let app = {
@@ -150,6 +192,15 @@ impl App {
                         henyey_history::publish::delete_published_files(checkpoint, &publish_dir);
                     if cleaned > 0 {
                         tracing::debug!(checkpoint, cleaned, "Deleted local published files");
+                    }
+                    // Clear the delay marker for this checkpoint so the next
+                    // head-of-queue checkpoint re-arms its own delay from
+                    // first-eligibility. (The stamp-once rule would re-stamp on
+                    // seq mismatch anyway; clearing keeps the slot tidy.)
+                    if let Ok(mut ready) = app.publish_ready_since.lock() {
+                        if matches!(*ready, Some((seq, _)) if seq == checkpoint) {
+                            *ready = None;
+                        }
                     }
                     tracing::info!(checkpoint, "Checkpoint published successfully");
                 }
@@ -939,6 +990,72 @@ mod tests {
             custom_bucket_dir.as_path()
         );
         assert_eq!(canonical_bucket_file_count(&derived_bucket_dir), 0);
+    }
+
+    #[tokio::test]
+    async fn test_publish_delay_gates_then_publishes() {
+        // With a large PUBLISH_TO_ARCHIVE_DELAY, the first poll must NOT publish
+        // (the checkpoint is gated), but it must stamp the eligibility marker.
+        let fixture = setup_publish_fixture("delay-gate", |dir, config| {
+            let archive_dir = dir.join("archive");
+            config.history.archives = vec![test_archive_entry("delay-gate", &archive_dir)];
+            config.history.publish_to_archive_delay_seconds = 3600;
+        })
+        .await;
+
+        // First poll: gated, archive stays empty.
+        fixture.app.maybe_publish_history().await;
+        // Nothing should be in flight, and the queue should still hold CHECKPOINT.
+        assert!(!fixture.app.publish_in_progress.load(Ordering::SeqCst));
+        assert_eq!(archive_bucket_file_count(&fixture.archive_dir), 0);
+
+        // The marker must have been stamped for the head-of-queue checkpoint.
+        let marked = {
+            let guard = fixture.app.publish_ready_since.lock().unwrap();
+            *guard
+        };
+        assert_eq!(
+            marked.map(|(seq, _)| seq),
+            Some(CHECKPOINT),
+            "delay marker should be stamped for the head-of-queue checkpoint"
+        );
+
+        // Seed a back-dated Instant older than the delay, simulating elapsed
+        // wall-clock time without sleeping. The gate should now pass.
+        {
+            let mut guard = fixture.app.publish_ready_since.lock().unwrap();
+            let back_dated = std::time::Instant::now()
+                .checked_sub(Duration::from_secs(7200))
+                .expect("instant back-date");
+            *guard = Some((CHECKPOINT, back_dated));
+        }
+
+        fixture.app.maybe_publish_history().await;
+        wait_for_publish_queue_to_drain(&fixture.app).await;
+        assert!(
+            archive_bucket_file_count(&fixture.archive_dir) > 0,
+            "checkpoint should publish once the delay has elapsed"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_publish_delay_zero_publishes_immediately() {
+        // With the default delay of 0, the first poll publishes immediately —
+        // guards the default path against an accidental delay regression.
+        let fixture = setup_publish_fixture("delay-zero", |dir, config| {
+            let archive_dir = dir.join("archive");
+            config.history.archives = vec![test_archive_entry("delay-zero", &archive_dir)];
+            // publish_to_archive_delay_seconds left at its default of 0.
+        })
+        .await;
+        assert_eq!(fixture.config.history.publish_to_archive_delay_seconds, 0);
+
+        fixture.app.maybe_publish_history().await;
+        wait_for_publish_queue_to_drain(&fixture.app).await;
+        assert!(
+            archive_bucket_file_count(&fixture.archive_dir) > 0,
+            "default delay 0 should publish on the first poll"
+        );
     }
 
     #[test]

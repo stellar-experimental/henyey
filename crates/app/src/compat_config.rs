@@ -26,7 +26,7 @@
 
 use crate::config::{
     AppConfig, CompatHttpConfig, CompatQuorumSafety, DatabaseConfig, FailureSafety,
-    HistoryArchiveEntry, HistoryConfig, ValidationThresholdLevel,
+    HistoryArchiveEntry, ValidationThresholdLevel,
 };
 use henyey_herder::{ValidatorEntryInfo, ValidatorQuality, ValidatorWeightConfig};
 use henyey_overlay::PeerAddress;
@@ -73,6 +73,7 @@ const SUPPORTED_KEYS: &[&str] = &[
     "CATCHUP_RECENT",
     "AUTOMATIC_MAINTENANCE_PERIOD",
     "AUTOMATIC_MAINTENANCE_COUNT",
+    "PUBLISH_TO_ARCHIVE_DELAY",
     "ARTIFICIALLY_GENERATE_LOAD_FOR_TESTING",
     "GENESIS_TEST_ACCOUNT_COUNT",
     "RUN_STANDALONE",
@@ -407,6 +408,13 @@ pub fn translate_stellar_core_config(raw: &toml::Value) -> anyhow::Result<AppCon
         }
     }
 
+    // --- Publish-to-archive delay ---
+    // stellar-core: PUBLISH_TO_ARCHIVE_DELAY (seconds, default 0). Gates the
+    // start of checkpoint publishing on a wall-clock delay. See #3032.
+    if let Some(v) = get_u32(table, "PUBLISH_TO_ARCHIVE_DELAY") {
+        config.history.publish_to_archive_delay_seconds = v as u64;
+    }
+
     // --- History archives ---
     // stellar-core format: [HISTORY.name] with get="cmd {0}" sub-tables
     if let Some(history_table) = get_table_strict(table, "HISTORY")
@@ -448,7 +456,9 @@ pub fn translate_stellar_core_config(raw: &toml::Value) -> anyhow::Result<AppCon
             });
         }
         if !archives.is_empty() {
-            config.history = HistoryConfig { archives };
+            // Preserve the already-parsed publish delay; only the archive list
+            // is sourced from the [HISTORY.*] sub-tables.
+            config.history.archives = archives;
         }
     }
 
@@ -1461,6 +1471,48 @@ mod tests {
         );
         assert!(config.history.archives[0].get_enabled);
         assert!(!config.history.archives[0].put_enabled);
+    }
+
+    #[test]
+    fn test_publish_to_archive_delay_parsed() {
+        // Present: top-level PUBLISH_TO_ARCHIVE_DELAY maps to the history field.
+        let core_toml: toml::Value = toml::from_str(
+            r#"
+            NETWORK_PASSPHRASE = "Test SDF Network ; September 2015"
+            PUBLISH_TO_ARCHIVE_DELAY = 7
+            "#,
+        )
+        .unwrap();
+        let config = translate_stellar_core_config(&core_toml).unwrap();
+        assert_eq!(config.history.publish_to_archive_delay_seconds, 7);
+
+        // The key must be classified as supported, not unknown.
+        let table = core_toml.as_table().unwrap();
+        let classified = classify_keys(table).unwrap();
+        assert!(
+            !classified
+                .unknown
+                .iter()
+                .any(|k| k == "PUBLISH_TO_ARCHIVE_DELAY"),
+            "PUBLISH_TO_ARCHIVE_DELAY should not be reported unknown"
+        );
+        assert!(
+            !classified
+                .unsupported
+                .iter()
+                .any(|k| k == "PUBLISH_TO_ARCHIVE_DELAY"),
+            "PUBLISH_TO_ARCHIVE_DELAY should be supported, not unsupported-known"
+        );
+
+        // Absent: defaults to 0.
+        let no_delay_toml: toml::Value = toml::from_str(
+            r#"
+            NETWORK_PASSPHRASE = "Test SDF Network ; September 2015"
+            "#,
+        )
+        .unwrap();
+        let config = translate_stellar_core_config(&no_delay_toml).unwrap();
+        assert_eq!(config.history.publish_to_archive_delay_seconds, 0);
     }
 
     #[test]

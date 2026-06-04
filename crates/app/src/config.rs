@@ -854,6 +854,17 @@ pub struct HistoryConfig {
     /// Archives for reading history.
     #[serde(default)]
     pub archives: Vec<HistoryArchiveEntry>,
+
+    /// Delay, in wall-clock seconds, before a ready checkpoint begins
+    /// publishing to the history archive.
+    ///
+    /// Mirrors stellar-core's `PUBLISH_TO_ARCHIVE_DELAY` (default `seconds{0}`),
+    /// which wraps the publish pipeline in a `ConditionalWork` whose timeout
+    /// fires once `now - start >= PUBLISH_TO_ARCHIVE_DELAY`. At the default of
+    /// `0` there is no delay and publishing proceeds immediately, matching
+    /// stellar-core's immediate-publish default.
+    #[serde(default)]
+    pub publish_to_archive_delay_seconds: u64,
 }
 
 impl HistoryConfig {
@@ -1676,6 +1687,7 @@ impl AppConfig {
                         mkdir: None,
                     },
                 ],
+                publish_to_archive_delay_seconds: 0,
             },
             overlay: OverlayConfig {
                 known_peers: vec![
@@ -1752,6 +1764,7 @@ impl AppConfig {
                         mkdir: None,
                     },
                 ],
+                publish_to_archive_delay_seconds: 0,
             },
             overlay: OverlayConfig {
                 known_peers: vec![
@@ -4067,8 +4080,26 @@ name = "test"
     }
 
     #[test]
+    fn test_history_config_publish_delay_defaults_to_zero() {
+        // Default HistoryConfig has the field == 0.
+        let config = HistoryConfig::default();
+        assert_eq!(config.publish_to_archive_delay_seconds, 0);
+
+        // A [history] table without the field deserializes to 0.
+        let without: HistoryConfig = toml::from_str("").unwrap();
+        assert_eq!(without.publish_to_archive_delay_seconds, 0);
+
+        // An explicit value is honored.
+        let with: HistoryConfig = toml::from_str("publish_to_archive_delay_seconds = 5").unwrap();
+        assert_eq!(with.publish_to_archive_delay_seconds, 5);
+    }
+
+    #[test]
     fn test_publish_enabled_with_no_archives() {
-        let config = HistoryConfig { archives: vec![] };
+        let config = HistoryConfig {
+            archives: vec![],
+            ..Default::default()
+        };
         assert!(!config.publish_enabled());
     }
 
@@ -4083,6 +4114,7 @@ name = "test"
                 put: None,
                 mkdir: None,
             }],
+            ..Default::default()
         };
         assert!(!config.publish_enabled());
     }
@@ -4098,6 +4130,7 @@ name = "test"
                 put: Some("cp {0} {1}".to_string()),
                 mkdir: Some("mkdir -p {0}".to_string()),
             }],
+            ..Default::default()
         };
         assert!(config.publish_enabled());
     }
@@ -4114,6 +4147,7 @@ name = "test"
                 put: None,
                 mkdir: None,
             }],
+            ..Default::default()
         };
         assert!(!config.publish_enabled());
     }

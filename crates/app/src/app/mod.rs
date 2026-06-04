@@ -570,6 +570,17 @@ pub struct App {
     /// Prevent concurrent history publish operations.
     /// When set, a background task is publishing a checkpoint.
     publish_in_progress: AtomicBool,
+    /// Tracks when the head-of-queue checkpoint first became eligible to
+    /// publish, for enforcing `PUBLISH_TO_ARCHIVE_DELAY` (#3032).
+    ///
+    /// Holds `Some((checkpoint_seq, instant))` where `instant` is the moment
+    /// the checkpoint at `checkpoint_seq` first reached the head of the publish
+    /// queue and was otherwise ready. `maybe_publish_history` early-returns
+    /// until `instant.elapsed() >= delay`, mirroring stellar-core's
+    /// `ConditionalWork` delay timer. The marker is stamped once per checkpoint
+    /// (see the stamp-once rule in `maybe_publish_history`) so a
+    /// failing-and-retrying checkpoint never re-arms the delay.
+    pub(crate) publish_ready_since: std::sync::Mutex<Option<(u32, std::time::Instant)>>,
     /// One-shot panic injection for publish tests. When `true`, the next call
     /// to `publish_single_checkpoint` will swap it to `false` and panic.
     #[cfg(test)]
@@ -1339,6 +1350,7 @@ impl App {
             fatal_state_failure: AtomicBool::new(false),
             catchup_needs_full_reset: AtomicBool::new(force_full_catchup),
             publish_in_progress: AtomicBool::new(false),
+            publish_ready_since: std::sync::Mutex::new(None),
             #[cfg(test)]
             publish_panic_inject: AtomicBool::new(false),
             #[cfg(test)]
