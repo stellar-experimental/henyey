@@ -700,12 +700,36 @@ impl MutableTransactionResult {
     /// This also resets any consumed refundable fees (for Soroban) so that
     /// the maximum refund is returned to the fee source.
     pub fn set_error(&mut self, code: stellar_xdr::curr::TransactionResultCode) {
+        // Mirror stellar-core MutableTransactionResultBase::setError monotonicity
+        // (MutableTransactionResult.cpp:148-160): an error result may only be
+        // re-set to the same code (idempotent) or set from a success state —
+        // never changed to a different error. Use the cheap discriminant
+        // accessor (not result_code(), which clones + round-trips through XDR).
+        // `debug_assert!` is the project-idiomatic mirror of stellar-core's
+        // `releaseAssert` for programming-error invariants on currently-
+        // unreachable paths (cf. meta_builder.rs:149,293): fires in debug/test
+        // builds, compiled out (zero cost) in release.
+        debug_assert!(
+            code == self.inner.result.discriminant() || self.is_success(),
+            "set_error must be monotonic: cannot change error code from {:?} to {:?}",
+            self.inner.result.discriminant(),
+            code
+        );
+
         self.inner.result = code_to_result(code);
 
         // Reset refundable fees on error
         if let Some(ref mut tracker) = self.refundable_fee_tracker {
             tracker.reset_consumed_fee();
         }
+
+        // The new code must itself be a failure (mirrors the trailing
+        // releaseAssert(!isSuccess()) in stellar-core).
+        debug_assert!(
+            !self.is_success(),
+            "set_error called with a success code: {:?}",
+            code
+        );
     }
 
     /// Initialize refundable fee tracker for Soroban transactions.
