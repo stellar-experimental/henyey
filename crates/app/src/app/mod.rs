@@ -430,6 +430,10 @@ mod types;
 mod upgrades;
 
 pub use persist::CatchupFinalizer;
+pub(crate) use tx_flooding::{
+    FLOOD_OP_RATE_PER_LEDGER, FLOOD_SOROBAN_RATE_PER_LEDGER, FLOOD_SOROBAN_TX_PERIOD_MS,
+    FLOOD_TX_PERIOD_MS,
+};
 use types::*;
 pub use types::{
     AppInfo, AppMetricsSnapshot, AppState, CatchupResult, CatchupTarget, FallbackCatchup,

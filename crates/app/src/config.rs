@@ -1573,11 +1573,11 @@ fn default_target_outbound() -> usize {
 }
 
 fn default_flood_op_rate_per_ledger() -> f64 {
-    1.0
+    crate::app::FLOOD_OP_RATE_PER_LEDGER
 }
 
 fn default_flood_soroban_rate_per_ledger() -> f64 {
-    1.0
+    crate::app::FLOOD_SOROBAN_RATE_PER_LEDGER
 }
 
 fn default_flood_demand_period_ms() -> u64 {
@@ -1589,7 +1589,18 @@ fn default_flood_advert_period_ms() -> u64 {
 }
 
 fn default_flood_tx_period_ms() -> u64 {
-    200
+    // henyey drives both the classic and Soroban broadcasts from a single
+    // unified flood queue (see `app::tx_flooding::compute_flood_ops_budget`),
+    // so this one period governs both. stellar-core keeps them separate but
+    // defaults both to 200 ms, so the values are behavior-equivalent:
+    // `FLOOD_TX_PERIOD_MS == FLOOD_SOROBAN_TX_PERIOD_MS`.
+    debug_assert_eq!(
+        crate::app::FLOOD_TX_PERIOD_MS,
+        crate::app::FLOOD_SOROBAN_TX_PERIOD_MS,
+        "henyey's unified flood period assumes the classic and Soroban \
+         stellar-core periods are equal"
+    );
+    crate::app::FLOOD_TX_PERIOD_MS
 }
 
 fn default_flood_demand_backoff_delay_ms() -> u64 {
