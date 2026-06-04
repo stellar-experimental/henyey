@@ -390,16 +390,28 @@ pub fn verify_reverse_walk(
             Hash256::from(first.previous_ledger_hash.clone()),
         ));
 
-        // LCL+1 comparison (§9.3 step 2d): if the first header in this group
-        // is at lcl_seq + 1, verify its previous_ledger_hash matches lcl_hash.
+        // LCL-overlap (§9.3 step 2c) and LCL+1 (§9.3 step 2d) comparisons.
+        // Mirrors stellar-core VerifyLedgerChainWork.cpp:222-235: step 2c (a
+        // downloaded header sitting exactly at lcl_seq must hash-match the local
+        // LCL) and step 2d (the header at lcl_seq + 1 must link back to the LCL
+        // hash) are mutually exclusive per header (distinct seqs), so they form
+        // an if / else if. On disagreement we set the flag and continue — the
+        // §9.5 block below converts it to fatal (SCP trust) or retriable (None).
         if let Some((lcl_seq, lcl_hash)) = &config.lcl {
             for header in group.iter() {
-                if header.ledger_seq == lcl_seq + 1 {
+                if header.ledger_seq == *lcl_seq {
+                    // Step 2c: header at lcl_seq — its content hash must match.
+                    let header_hash = compute_header_hash(header)?;
+                    if header_hash != *lcl_hash {
+                        local_state_disagrees = true;
+                    }
+                } else if header.ledger_seq == lcl_seq + 1 {
+                    // Step 2d: header at lcl_seq + 1 — its previous_ledger_hash
+                    // must link back to the local LCL hash.
                     let prev_hash = Hash256::from(header.previous_ledger_hash.clone());
                     if prev_hash != *lcl_hash {
                         local_state_disagrees = true;
                     }
-                    break;
                 }
             }
         }
