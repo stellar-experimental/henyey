@@ -725,7 +725,7 @@ impl<D: SCPDriver> SCP<D> {
 
         let slot = self.get_or_create_slot(&mut slots, slot_index);
 
-        slot.set_state_from_envelope(envelope)
+        slot.set_state_from_envelope(envelope, self.driver())
     }
 
     /// Abandon the current ballot for a slot.

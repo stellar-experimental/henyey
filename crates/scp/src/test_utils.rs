@@ -34,6 +34,9 @@ pub struct MockDriver {
     pub heard_from_quorum: AtomicU32,
     /// Counts how many times `accepted_commit` was called.
     pub accepted_commit_count: AtomicU32,
+    /// Records the `ScpBallot` passed to each `started_ballot_protocol` call,
+    /// in order. Lets tests assert fire-once and the exact ballot fired.
+    pub ballot_starts: std::sync::Mutex<Vec<ScpBallot>>,
     /// If true, `get_quorum_set_by_hash` returns the configured quorum set
     /// regardless of the hash. Useful for testing quorum info methods.
     pub return_qset_by_hash: bool,
@@ -115,6 +118,7 @@ impl MockDriverBuilder {
             emit_count: AtomicU32::new(0),
             heard_from_quorum: AtomicU32::new(0),
             accepted_commit_count: AtomicU32::new(0),
+            ballot_starts: std::sync::Mutex::new(Vec::new()),
             return_qset_by_hash: self.return_qset_by_hash,
             custom_node_weight: None,
         }
@@ -190,6 +194,10 @@ impl SCPDriver for MockDriver {
 
     fn accepted_commit(&self, _slot_index: u64, _ballot: &ScpBallot) {
         self.accepted_commit_count.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn started_ballot_protocol(&self, _slot_index: u64, ballot: &ScpBallot) {
+        self.ballot_starts.lock().unwrap().push(ballot.clone());
     }
 
     fn compute_hash_node(

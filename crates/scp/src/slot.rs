@@ -665,10 +665,12 @@ impl Slot {
             // Stop the nomination timer though (candidates already confirmed).
             driver.stop_timer(self.slot_index, crate::driver::SCPTimerType::Nomination);
 
-            // Notify driver that ballot protocol is starting
-            driver.started_ballot_protocol(self.slot_index, &composite);
-
-            // Start ballot protocol with the composite value
+            // Start ballot protocol with the composite value. The
+            // `started_ballot_protocol` callback is fired from inside
+            // `BallotProtocol::bump_to_ballot` on the `current_ballot` null→set
+            // transition (matching stellar-core BallotProtocol.cpp:469-474), not
+            // here — this reaches it via `bump` → `bump_state` →
+            // `update_current_value` → `bump_to_ballot`.
             let ctx = slot_ctx!(self, driver);
             self.ballot.bump(&ctx, composite.clone(), false);
 
@@ -824,7 +826,11 @@ impl Slot {
     /// (i.e. ballot protocol already started). This matches stellar-core's
     /// `throw runtime_error` semantics — it is a programming error, not a
     /// recoverable condition.
-    pub fn set_state_from_envelope(&mut self, envelope: &ScpEnvelope) -> bool {
+    pub fn set_state_from_envelope<D: SCPDriver>(
+        &mut self,
+        envelope: &ScpEnvelope,
+        driver: &Arc<D>,
+    ) -> bool {
         // stellar-core validates nodeID and slotIndex
         if envelope.statement.node_id != self.local_node_id
             || envelope.statement.slot_index != self.slot_index
@@ -844,8 +850,12 @@ impl Slot {
             ScpStatementPledges::Prepare(_)
             | ScpStatementPledges::Confirm(_)
             | ScpStatementPledges::Externalize(_) => {
+                // Build the slot context so `bump_to_ballot` (reached from
+                // `BallotProtocol::set_state_from_envelope`) can fire the
+                // `started_ballot_protocol` callback for recovery-driven slots.
+                let ctx = slot_ctx!(self, driver);
                 self.ballot
-                    .set_state_from_envelope(envelope)
+                    .set_state_from_envelope(envelope, &ctx)
                     .expect("Cannot set state after starting ballot protocol");
                 self.sync_externalized_value_from_ballot();
                 true
@@ -1129,7 +1139,7 @@ mod tests {
             signature: stellar_xdr::curr::Signature(Vec::new().try_into().unwrap_or_default()),
         };
 
-        assert!(slot.set_state_from_envelope(&envelope));
+        assert!(slot.set_state_from_envelope(&envelope, &Arc::new(MockDriver::bare())));
         // stellar-core setStateFromEnvelope does NOT set mNominationStarted = true
         assert!(!slot.nomination().is_started());
     }
@@ -1165,7 +1175,7 @@ mod tests {
             signature: stellar_xdr::curr::Signature(Vec::new().try_into().unwrap_or_default()),
         };
 
-        assert!(slot.set_state_from_envelope(&envelope));
+        assert!(slot.set_state_from_envelope(&envelope, &Arc::new(MockDriver::bare())));
         assert_eq!(slot.ballot().phase(), crate::ballot::BallotPhase::Prepare);
         assert_eq!(slot.ballot().current_ballot().map(|b| b.counter), Some(3));
     }
@@ -1195,7 +1205,7 @@ mod tests {
             signature: stellar_xdr::curr::Signature(Vec::new().try_into().unwrap_or_default()),
         };
 
-        assert!(slot.set_state_from_envelope(&envelope));
+        assert!(slot.set_state_from_envelope(&envelope, &Arc::new(MockDriver::bare())));
         assert!(slot.is_externalized());
         assert_eq!(slot.get_externalized_value(), Some(&value));
     }
@@ -1232,7 +1242,7 @@ mod tests {
             statement,
             signature: stellar_xdr::curr::Signature(Vec::new().try_into().unwrap_or_default()),
         };
-        slot.set_state_from_envelope(&envelope);
+        slot.set_state_from_envelope(&envelope, &Arc::new(MockDriver::bare()));
 
         // Abandon to counter 5
         assert!(slot.abandon_ballot(&driver, 5));
@@ -1396,7 +1406,7 @@ mod tests {
             statement,
             signature: stellar_xdr::curr::Signature(Vec::new().try_into().unwrap_or_default()),
         };
-        slot.set_state_from_envelope(&envelope);
+        slot.set_state_from_envelope(&envelope, &Arc::new(MockDriver::bare()));
 
         // Even though we have state, should return empty since not fully validated
         let messages = slot.get_latest_messages_send();
@@ -1407,7 +1417,7 @@ mod tests {
 
         // Now test with fully validated slot
         let mut slot2 = Slot::new(1, node.clone(), quorum_set.clone(), true);
-        slot2.set_state_from_envelope(&envelope);
+        slot2.set_state_from_envelope(&envelope, &Arc::new(MockDriver::bare()));
         let messages2 = slot2.get_latest_messages_send();
         assert!(
             !messages2.is_empty(),
@@ -1457,7 +1467,7 @@ mod tests {
             },
             signature: stellar_xdr::curr::Signature(Vec::new().try_into().unwrap_or_default()),
         };
-        slot.set_state_from_envelope(&own_envelope);
+        slot.set_state_from_envelope(&own_envelope, &Arc::new(MockDriver::bare()));
 
         // After adding one node (self), check got_v_blocking
         // With threshold=2, one node out of 3 is not v-blocking
@@ -1509,7 +1519,7 @@ mod tests {
             statement,
             signature: stellar_xdr::curr::Signature(Vec::new().try_into().unwrap_or_default()),
         };
-        slot.set_state_from_envelope(&envelope);
+        slot.set_state_from_envelope(&envelope, &Arc::new(MockDriver::bare()));
 
         assert!(slot.is_externalized());
         // Since slot is fully validated and we externalized, should include our envelope
@@ -1548,7 +1558,7 @@ mod tests {
 
         // Note: set_state_from_envelope for EXTERNALIZE sets fully_validated=true
         // So we need to reset it after
-        slot.set_state_from_envelope(&envelope);
+        slot.set_state_from_envelope(&envelope, &Arc::new(MockDriver::bare()));
         // Manually override fully_validated back to false for this test
         slot.fully_validated = false;
 
@@ -1586,7 +1596,7 @@ mod tests {
         };
 
         assert!(
-            !slot.set_state_from_envelope(&envelope),
+            !slot.set_state_from_envelope(&envelope, &Arc::new(MockDriver::bare())),
             "set_state_from_envelope should reject envelope from wrong node"
         );
     }
@@ -1615,7 +1625,7 @@ mod tests {
         };
 
         assert!(
-            !slot.set_state_from_envelope(&envelope),
+            !slot.set_state_from_envelope(&envelope, &Arc::new(MockDriver::bare())),
             "set_state_from_envelope should reject envelope for wrong slot"
         );
     }
@@ -1646,7 +1656,7 @@ mod tests {
             signature: stellar_xdr::curr::Signature(Vec::new().try_into().unwrap_or_default()),
         };
 
-        assert!(slot.set_state_from_envelope(&envelope));
+        assert!(slot.set_state_from_envelope(&envelope, &Arc::new(MockDriver::bare())));
 
         // stellar-core sets mPrepared = makeBallot(UINT32_MAX, v) for EXTERNALIZE
         let prepared = slot.ballot().prepared();
@@ -1799,7 +1809,7 @@ mod tests {
             },
             signature: stellar_xdr::curr::Signature(Vec::new().try_into().unwrap_or_default()),
         };
-        slot.set_state_from_envelope(&nom_envelope);
+        slot.set_state_from_envelope(&nom_envelope, &Arc::new(MockDriver::bare()));
 
         // Now should find the nomination envelope
         let env = slot.get_latest_envelope(&node);
@@ -1832,7 +1842,7 @@ mod tests {
             },
             signature: stellar_xdr::curr::Signature(Vec::new().try_into().unwrap_or_default()),
         };
-        slot.set_state_from_envelope(&ballot_envelope);
+        slot.set_state_from_envelope(&ballot_envelope, &Arc::new(MockDriver::bare()));
 
         // Now should find the ballot envelope (ballot protocol checked first)
         let env = slot.get_latest_envelope(&node);
@@ -1884,7 +1894,7 @@ mod tests {
             statement,
             signature: stellar_xdr::curr::Signature(Vec::new().try_into().unwrap_or_default()),
         };
-        slot.set_state_from_envelope(&envelope);
+        slot.set_state_from_envelope(&envelope, &Arc::new(MockDriver::bare()));
 
         // After externalization, sync_externalized_value_from_ballot should
         // NOT have restored fully_validated — it should still be false.
@@ -2190,7 +2200,7 @@ mod tests {
             statement,
             signature: stellar_xdr::curr::Signature(Vec::new().try_into().unwrap_or_default()),
         };
-        slot.set_state_from_envelope(&envelope);
+        slot.set_state_from_envelope(&envelope, &Arc::new(MockDriver::bare()));
         assert!(
             slot.is_fully_validated(),
             "validator slot starts fully_validated"
@@ -2363,7 +2373,7 @@ mod tests {
             statement,
             signature: stellar_xdr::curr::Signature(Vec::new().try_into().unwrap_or_default()),
         };
-        slot.set_state_from_envelope(&envelope);
+        slot.set_state_from_envelope(&envelope, &Arc::new(MockDriver::bare()));
         assert!(slot.is_fully_validated());
         assert_eq!(slot.ballot().current_ballot().map(|b| b.counter), Some(1));
         (slot, value)
@@ -2730,6 +2740,40 @@ mod tests {
         assert!(
             slot.got_v_blocking(),
             "v-blocking must remain set after bump_ballot_on_timeout"
+        );
+    }
+
+    /// Regression for #3089 (SCP §9.10-1): the nomination→ballot transition must
+    /// fire `started_ballot_protocol` with the actual `ScpBallot` (counter 1,
+    /// composite value), not the composite `Value`.
+    ///
+    /// FAILS on origin/main: the callback was fired from
+    /// `check_nomination_to_ballot` with a `&Value` (composite) — the old
+    /// signature could not carry a ballot, so this assertion is unrepresentable
+    /// there.
+    #[test]
+    fn test_nomination_ballot_start_fires_with_ballot_not_value() {
+        use crate::test_utils::make_quorum_set as make_qs;
+
+        let node = make_node_id(1);
+        let qs = Arc::new(make_qs(vec![node.clone()], 1));
+        let driver = Arc::new(MockDriver::with_quorum_set((*qs).clone()));
+        let mut slot = Slot::new(1, node.clone(), qs.clone(), true);
+
+        let value: Value = vec![1, 2, 3].try_into().unwrap();
+        let prev_value: Value = vec![].try_into().unwrap();
+        slot.nominate(value.clone(), &prev_value, false, &driver);
+
+        let starts = driver.ballot_starts.lock().unwrap();
+        assert_eq!(
+            starts.len(),
+            1,
+            "nomination→ballot must fire started_ballot_protocol exactly once"
+        );
+        assert_eq!(starts[0].counter, 1, "the first ballot has counter 1");
+        assert_eq!(
+            starts[0].value, value,
+            "started_ballot_protocol must receive the composite value as the ballot value"
         );
     }
 }
