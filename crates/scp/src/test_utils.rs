@@ -34,6 +34,8 @@ pub struct MockDriver {
     pub heard_from_quorum: AtomicU32,
     /// Counts how many times `accepted_commit` was called.
     pub accepted_commit_count: AtomicU32,
+    /// Counts how many times `ballot_did_confirm` was called.
+    pub confirmed_prepared_count: AtomicU32,
     /// Records the `ScpBallot` passed to each `started_ballot_protocol` call,
     /// in order. Lets tests assert fire-once and the exact ballot fired.
     pub ballot_starts: std::sync::Mutex<Vec<ScpBallot>>,
@@ -118,6 +120,7 @@ impl MockDriverBuilder {
             emit_count: AtomicU32::new(0),
             heard_from_quorum: AtomicU32::new(0),
             accepted_commit_count: AtomicU32::new(0),
+            confirmed_prepared_count: AtomicU32::new(0),
             ballot_starts: std::sync::Mutex::new(Vec::new()),
             return_qset_by_hash: self.return_qset_by_hash,
             custom_node_weight: None,
@@ -200,7 +203,9 @@ impl SCPDriver for MockDriver {
 
     fn ballot_did_prepare(&self, _slot_index: u64, _ballot: &ScpBallot) {}
 
-    fn ballot_did_confirm(&self, _slot_index: u64, _ballot: &ScpBallot) {}
+    fn ballot_did_confirm(&self, _slot_index: u64, _ballot: &ScpBallot) {
+        self.confirmed_prepared_count.fetch_add(1, Ordering::SeqCst);
+    }
 
     fn ballot_did_hear_from_quorum(&self, _slot_index: u64, _ballot: &ScpBallot) {
         self.heard_from_quorum.fetch_add(1, Ordering::SeqCst);

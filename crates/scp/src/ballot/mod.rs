@@ -2232,6 +2232,97 @@ mod tests {
     }
 
     #[test]
+    fn test_ballot_confirmed_prepared_callback() {
+        // SCP §6.5-1: `set_confirm_prepared` must fire the `ballot_did_confirm`
+        // (confirmedBallotPrepared) SCPDriver callback when a ballot is
+        // confirmed prepared (high ballot raised inside the `did_work` block),
+        // mirroring stellar-core `BallotProtocol::setConfirmPrepared`
+        // (BallotProtocol.cpp:1074-1075).
+        //
+        // Drives prepare -> confirm-prepared following the same proven envelope
+        // pattern as `test_ballot_accepted_commit_callback`: a fresh ballot
+        // bumped to a value, then a quorum's worth of PREPARE statements
+        // carrying `prepared`/`n_c`/`n_h` to confirm the ballot prepared (which
+        // also drives the slot into the Confirm phase). The callback must fire
+        // on that transition.
+        let node = make_node_id(1);
+        let node2 = make_node_id(2);
+        let node3 = make_node_id(3);
+        let node4 = make_node_id(4);
+        let node5 = make_node_id(5);
+        let quorum_set = make_quorum_set(
+            vec![
+                node.clone(),
+                node2.clone(),
+                node3.clone(),
+                node4.clone(),
+                node5.clone(),
+            ],
+            4,
+        );
+        let driver = Arc::new(MockDriver::with_quorum_set(quorum_set.clone()));
+        let mut ballot = BallotProtocol::new();
+
+        let value = make_value(&[9]);
+        assert!(ballot.bump(&ctx!(&node, &quorum_set, &driver, 16), value.clone(), false));
+
+        // A plain bump (PREPARE only, no confirm-prepared) must NOT fire the
+        // callback — it lives strictly inside the `did_work` confirm-prepared
+        // path.
+        assert_eq!(driver.confirmed_prepared_count.load(Ordering::SeqCst), 0);
+
+        let current = ballot.current_ballot().expect("current ballot").clone();
+        let prep2 = make_prepare_envelope(node2.clone(), 16, &quorum_set, current.clone());
+        let prep3 = make_prepare_envelope(node3.clone(), 16, &quorum_set, current.clone());
+        let prep4 = make_prepare_envelope(node4.clone(), 16, &quorum_set, current.clone());
+        let prep5 = make_prepare_envelope(node5.clone(), 16, &quorum_set, current.clone());
+
+        for env in [&prep2, &prep3, &prep4, &prep5] {
+            ballot.process_envelope(
+                env,
+                &ctx!(&node, &quorum_set, &driver, 16),
+                crate::ValidationLevel::FullyValidated,
+            );
+        }
+
+        // Still only accept-prepared (no quorum confirming the ballot prepared
+        // yet) — confirm-prepared has not happened.
+        assert_eq!(driver.confirmed_prepared_count.load(Ordering::SeqCst), 0);
+
+        let make_prepared = |n: NodeId| {
+            make_prepare_envelope_with_counters(
+                n,
+                16,
+                &quorum_set,
+                current.clone(),
+                PrepareEnvelopeCounters {
+                    prepared: Some(current.clone()),
+                    prepared_prime: None,
+                    n_c: current.counter,
+                    n_h: current.counter,
+                },
+            )
+        };
+        let prepared2 = make_prepared(node2.clone());
+        let prepared3 = make_prepared(node3.clone());
+        let prepared4 = make_prepared(node4.clone());
+        let prepared5 = make_prepared(node5.clone());
+
+        for env in [&prepared2, &prepared3, &prepared4, &prepared5] {
+            ballot.process_envelope(
+                env,
+                &ctx!(&node, &quorum_set, &driver, 16),
+                crate::ValidationLevel::FullyValidated,
+            );
+        }
+
+        // Confirm-prepared reached: the high ballot was raised inside the
+        // `did_work` block, so the callback fired at least once.
+        assert!(matches!(ballot.phase(), BallotPhase::Confirm));
+        assert!(driver.confirmed_prepared_count.load(Ordering::SeqCst) >= 1);
+    }
+
+    #[test]
     fn test_ballot_statement_sanity_prepare_constraints() {
         let node = make_node_id(1);
         let quorum_set = make_quorum_set(vec![node.clone()], 1);
