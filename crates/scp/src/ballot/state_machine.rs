@@ -48,7 +48,7 @@ impl BallotProtocol {
         }
     }
 
-    fn attempt_accept_prepared<D: SCPDriver>(
+    pub(super) fn attempt_accept_prepared<D: SCPDriver>(
         &mut self,
         hint: &ScpStatement,
         ctx: &SlotContext<'_, D>,
@@ -66,11 +66,21 @@ impl BallotProtocol {
                         continue;
                     }
                 }
-                if let Some(commit) = &self.commit {
-                    if !ballot_compatible(commit, ballot) {
-                        continue;
-                    }
-                }
+                // stellar-core BallotProtocol.cpp:823 —
+                // dbgAssert(areBallotsCompatible(mCommit, ballot)). Commit-compat
+                // is an invariant guaranteed by `p ~ c` in CONFIRM, not a defensive
+                // filter; a violation is a bug that must surface (panic in
+                // debug/test) rather than being silently masked. `debug_assert!` is
+                // the exact analogue of `dbgAssert`: compiled out under `--release`
+                // (NDEBUG), so release behavior is unchanged under the invariant.
+                debug_assert!(
+                    self.commit
+                        .as_ref()
+                        .map_or(true, |c| ballot_compatible(c, ballot)),
+                    "p ~ c invariant violated in attempt_accept_prepared: commit={:?} incompatible with candidate ballot={:?}",
+                    self.commit,
+                    ballot,
+                );
             }
 
             if let Some(prepared_prime) = &self.prepared_prime {

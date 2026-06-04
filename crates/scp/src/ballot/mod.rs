@@ -1052,6 +1052,16 @@ impl BallotProtocol {
     ) -> bool {
         self.set_accept_prepared(ballot, ctx)
     }
+
+    /// Test helper: expose attempt_accept_prepared for direct testing.
+    #[cfg(test)]
+    pub(crate) fn attempt_accept_prepared_for_test<D: SCPDriver>(
+        &mut self,
+        hint: &ScpStatement,
+        ctx: &SlotContext<'_, D>,
+    ) -> bool {
+        self.attempt_accept_prepared(hint, ctx)
+    }
 }
 
 #[cfg(test)]
@@ -5369,6 +5379,104 @@ mod tests {
             assert!(
                 bp.commit().is_none(),
                 "commit must be cleared in release builds even if phase is CONFIRM"
+            );
+        }
+    }
+
+    /// SCP §9.5-1 parity regression: the commit-compat check in
+    /// `attempt_accept_prepared` (CONFIRM branch) must be a `debug_assert!`
+    /// mirroring stellar-core's `dbgAssert(areBallotsCompatible(mCommit, ballot))`
+    /// (`BallotProtocol.cpp:823`), NOT a silent `continue` filter. The `p ~ c`
+    /// invariant guarantees commit-compat in CONFIRM, so a violation is a bug that
+    /// must surface (panic in debug/test) rather than being masked.
+    ///
+    /// FAILS on `origin/main` (the site is a silent `continue` → `catch_unwind`
+    /// returns `Ok` even in a debug build, so the `is_err()` assertion fails);
+    /// PASSES after the `debug_assert!` lands. `debug_assert!` is the exact
+    /// analogue of `dbgAssert`: it panics in debug/test and is compiled out under
+    /// `--release` (NDEBUG), so release/mainnet behavior is unchanged. Pattern
+    /// follows `test_set_accept_prepared_phase_guard_matches_debug_assert_semantics`.
+    #[test]
+    fn test_attempt_accept_prepared_commit_compat_invariant_asserts_in_debug() {
+        let node_self = make_node_id(0);
+        let node_b = make_node_id(1);
+        let value_a: Value = vec![1u8, 0].try_into().unwrap();
+        let value_b: Value = vec![2u8, 0].try_into().unwrap();
+        let quorum_set = make_quorum_set(vec![node_self.clone(), node_b.clone()], 1);
+        let driver = Arc::new(
+            MockDriverBuilder::new()
+                .quorum_set(quorum_set.clone())
+                .build(),
+        );
+        let ctx = ctx!(&node_self, &quorum_set, &driver, 1);
+
+        let mut bp = BallotProtocol::new();
+        // CONFIRM phase with a `p ~ c`-violating state: `prepared` is on value_a but
+        // `commit` is on value_b. The candidate C={2, value_a} passes the
+        // prepared-compat filter (prepared={1, value_a} is less-and-compatible with
+        // C) but is commit-INCOMPATIBLE with commit={1, value_b} — violating p ~ c.
+        bp.set_phase_for_test(BallotPhase::Confirm);
+        bp.set_current_ballot_for_test(Some(ScpBallot {
+            counter: 2,
+            value: value_a.clone(),
+        }));
+        bp.set_prepared_ballot_for_test(Some(ScpBallot {
+            counter: 1,
+            value: value_a.clone(),
+        }));
+        bp.set_commit_for_test(Some(ScpBallot {
+            counter: 1,
+            value: value_b.clone(),
+        }));
+
+        // Inject an envelope whose Prepare ballot is C={2, value_a}, so that
+        // `get_prepare_candidates` (driven by the hint top_vote below) yields C.
+        let envelope = make_prepare_envelope(
+            node_b.clone(),
+            1,
+            &quorum_set,
+            ScpBallot {
+                counter: 2,
+                value: value_a.clone(),
+            },
+        );
+        bp.latest_envelopes.insert(node_b.clone(), envelope);
+
+        // Hint with top_vote = C={2, value_a}, so the injected Prepare ballot
+        // (which is less-and-compatible with the top_vote) becomes a candidate.
+        let qs_hash = hash_quorum_set(&quorum_set);
+        let hint = ScpStatement {
+            node_id: node_b.clone(),
+            slot_index: 1,
+            pledges: ScpStatementPledges::Prepare(ScpStatementPrepare {
+                ballot: ScpBallot {
+                    counter: 2,
+                    value: value_a.clone(),
+                },
+                prepared: None,
+                prepared_prime: None,
+                n_c: 0,
+                n_h: 0,
+                quorum_set_hash: qs_hash.into(),
+            }),
+        };
+
+        // In debug builds, the debug_assert! should fire (panic) when the
+        // commit-incompatible candidate reaches the invariant check.
+        // In release builds, the assert compiles out and no panic occurs.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            bp.attempt_accept_prepared_for_test(&hint, &ctx)
+        }));
+
+        if cfg!(debug_assertions) {
+            assert!(
+                result.is_err(),
+                "debug builds must panic on p ~ c invariant violation in attempt_accept_prepared"
+            );
+        } else {
+            assert!(
+                result.is_ok(),
+                "release builds must NOT panic — matches stellar-core dbgAssert semantics"
             );
         }
     }
