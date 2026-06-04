@@ -3487,6 +3487,13 @@ mod tests {
             counter: 1,
             value: value.clone(),
         });
+        // The real protocol path reaches set_confirm_commit only from CONFIRM,
+        // where prepared is already set; mirror that so check_invariants() holds
+        // once the phase becomes Externalize (INV-S8: all four fields required).
+        bp.prepared = Some(ScpBallot {
+            counter: 1,
+            value: value.clone(),
+        });
 
         let c = ScpBallot {
             counter: 1,
@@ -3524,6 +3531,12 @@ mod tests {
         let value = make_value(&[42]);
 
         bp.current_ballot = Some(ScpBallot {
+            counter: 1,
+            value: value.clone(),
+        });
+        // CONFIRM→EXTERNALIZE always carries a prepared ballot in the real path;
+        // set it so check_invariants() holds once the phase becomes Externalize.
+        bp.prepared = Some(ScpBallot {
             counter: 1,
             value: value.clone(),
         });
@@ -4908,6 +4921,12 @@ mod tests {
             value: value.clone(),
         });
         bp.current_ballot = Some(ScpBallot {
+            counter: 2,
+            value: value.clone(),
+        });
+        // CONFIRM phase requires prepared (INV-S8); set it so the EXTERNALIZE
+        // transition driven below keeps check_invariants() satisfied.
+        bp.prepared = Some(ScpBallot {
             counter: 2,
             value: value.clone(),
         });
