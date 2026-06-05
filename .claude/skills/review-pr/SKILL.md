@@ -286,6 +286,8 @@ Otherwise, the PR is **non-parity** — Reviewer B uses risk lens.
 
 Launch both `general-purpose` reviewers via the **Agent/Task tool** in a single message (so they run in parallel — do not dispatch them one at a time). Each is spawned with `model: opus` and `run_in_background: false`. The two distinct lenses (correctness + parity-or-risk) are the primary missed-bug defense; the adversarial refute pass in Step 6.1c is what trims the false-positive bounces.
 
+**Self-modifying detection (do the Step 5.5 path-match now, before spawning).** Compute `IS_SELF_MOD` per Step 5.5 first. If the PR is self-modifying, append the **extra-scrutiny checklist** from Step 5.5 to BOTH reviewer prompts below (skill frontmatter/markdown parses, scripts `bash -n` / source cleanly, no dispatch-table/step-numbering breakage). A self-modifying PR is NOT gated — it still auto-merges on triple-green — but the reviewers must confirm it cannot break the orchestrator's or specialists' next run.
+
 **Review against current `origin/main` (do not review stale state).** Each reviewer prompt must instruct the sub-agent to `git fetch origin` and check out the PR head **rebased onto / merged with the latest `origin/main`** before reviewing or running anything — e.g. `git fetch origin && git checkout pr-$PR_NUM && git merge --no-edit origin/main` inside `$REVIEWER_WORKTREE`. Reviewing on a stale base is what caused historical merge-helper failures (the PR looked clean against an old main but conflicted or regressed against current main); always evaluate the PR as it will actually land.
 
 **Workspace binding (issue #2843 — pass into every reviewer prompt).** Before spawning, run the Workspace-contract bootstrap to derive `$REVIEWER_WORKTREE` (under `~/data/$SESSION_ID/review-pr-$ISSUE/reviewer`). Pass that exact path into each reviewer prompt and require it as the ONLY scratch location:
@@ -480,7 +482,7 @@ fi
 
 ## Step 5.5 — Self-modifying gate (BEFORE the merge decision)
 
-A PR that edits the project-management pipeline's **own** skills or scripts must never auto-merge unattended — even on triple-green — because a bad self-edit could break the next orchestrator run (the very machinery that would otherwise catch and revert it). Detect this before deciding the merge.
+A PR that edits the project-management pipeline's **own** skills or scripts is higher-risk — a bad self-edit could break the next orchestrator run (the very machinery that would otherwise catch and revert it). Such a PR still merges autonomously on triple-green like any other PR, but the reviewers apply **extra scrutiny** to confirm the change cannot break the next run. Detect this before deciding the merge so the extra checks and flagging are applied.
 
 Fetch the PR's changed file paths:
 
@@ -501,33 +503,24 @@ IS_SELF_MOD=$(echo "$SELF_MOD_FILES" | grep -Eq \
   && echo "true" || echo "false")
 ```
 
-If `IS_SELF_MOD == true`, the PR is gated regardless of reviewer/CI state. Still run the reviewers and the refute pass (Step 6.1/6.1c) and recheck CI (Step 5) so the operator sees full verdicts, but do **NOT** auto-merge, bounce, or block. Instead post a summary and stop:
+If `IS_SELF_MOD == true`, the PR is **flagged** as self-modifying and the reviewers apply **extra scrutiny** — but it is **not** gated or escalated. It proceeds through the normal merge decision (Step 6) and auto-merges autonomously on triple-green, exactly like any other PR. Adversarial review + CI are the gate; there is no separate operator-approval hold.
+
+When the PR is self-modifying, instruct both reviewer sub-agents (Step 4) to explicitly verify the change cannot break the orchestrator's or specialists' next run, in addition to their normal lens. Add this checklist to their brief:
+
+- **Skill files still parse**: every changed `.claude/skills/*/SKILL.md` has valid YAML frontmatter (`name` / `description` / `argument-hint`) and is well-formed markdown — no truncated frontmatter, no broken fences.
+- **Scripts still source cleanly**: every changed `*.sh` passes `bash -n` (syntax check) and, for sourced libraries, `bash -c 'source <file>'` without error.
+- **No dispatch-table / step-numbering breakage**: dispatch tables, state→skill routing, and step references (e.g. "see Step 5.5") are still internally consistent — the edit didn't orphan a step, renumber a referenced step, or break a routing entry the orchestrator relies on.
+
+If this extra scrutiny passes and the PR is triple-green (both agent reviewers APPROVE post-refute + CI green), **merge autonomously via `attempt_merge`** in Step 7, the same as any PR.
+
+**Safety note:** because a self-modifying change is higher-risk, if a reviewer has genuine doubt the change could break the live pipeline, that reviewer returns `CHANGES_REQUESTED` (a normal bounce back to `ready-for-doing`) — *not* an operator escalation. The bounce / refute / lifetime-cap machinery handles it like any other concern.
+
+Record that the PR is self-modifying in the eventual verdict comment (so the flag is visible), then fall through to Step 6. Do not stop here.
 
 ```markdown
-## Review: Self-Modifying — Operator Approval Required
-
-This PR changes the project-management pipeline's own skills/scripts, so it does **not** auto-merge even on triple-green. A bad self-edit could break the next orchestrator run — these changes require an operator to review and merge by hand.
-
-**Self-modifying paths touched:**
+**Self-modifying paths touched (extra reviewer scrutiny applied):**
 - <each matched path>
-
-**Reviewer verdicts:**
-- Correctness: APPROVE | CHANGES_REQUESTED — <one-line summary> <(N finding(s) refuted)>
-- <Parity|Risk>: APPROVE | CHANGES_REQUESTED — <one-line summary>
-
-**External reviewers:** <"user: STATE" list, or "none">
-
-**CI:** green | red | running | empty
-
-Leaving the issue in `in-review`. An operator should review the diff and merge manually (e.g. `gh pr merge $PR_NUM --squash --admin`) once satisfied.
 ```
-
-```bash
-# Leave the issue in in-review; unassign so it isn't re-picked into an auto-merge attempt.
-gh issue edit $ISSUE --repo stellar-experimental/henyey --remove-assignee @me
-```
-
-Exit. Do not move the board state.
 
 ## Step 6 — Decide
 
@@ -1102,8 +1095,8 @@ Exit.
 - **Do not** post a review yourself. Spawn sub-agents that post their own structured comments — you only orchestrate and combine.
 - **Do not** override or summarize the reviewers' verdicts. Their `**Verdict:**` line is the verdict. You read it; you don't rewrite it — except that an agent reviewer's CHANGES_REQUESTED finding is dropped if the Step 6.1c refute pass returns `REFUTED` (recorded as `refuted: <reason>`).
 - **Do not** run the refute pass on **external** CHANGES_REQUESTED reviews (GH Copilot bot, humans, other bots). Only the agent reviewers' own findings are refutable; external reviews gate as-is.
-- **Do not** auto-merge a **self-modifying** PR (touches the pipeline's own skills/scripts — see Step 5.5), even on triple-green. Post the operator-approval note and leave it in `in-review`.
-- **Do not** merge if any of the three signals is not green. The matrix is the rule. *(Exception: the force-converge override at the lifetime cap merges on green CI alone — see Step 7-bis. Reviewer verdicts become follow-up issues rather than merge gates. The self-modifying gate overrides even force-converge — a self-modifying PR never auto-merges.)*
+- **Do** flag a **self-modifying** PR (touches the pipeline's own skills/scripts — see Step 5.5) and apply extra reviewer scrutiny, but **do not** hold it for operator approval — it auto-merges autonomously on triple-green like any other PR. If a reviewer genuinely doubts the change is safe for the live pipeline, that's a CHANGES_REQUESTED bounce, not an operator escalation.
+- **Do not** merge if any of the three signals is not green. The matrix is the rule. *(Exception: the force-converge override at the lifetime cap merges on green CI alone — see Step 7-bis. Reviewer verdicts become follow-up issues rather than merge gates.)*
 - **Do not** wait synchronously on long-running CI. If CI is `running`, unassign and exit — the next tick re-picks the issue.
 - **Do not** use `gh pr review --approve` — GH silently downgrades it to a comment because the agent is the PR author. Use structured PR comments via `gh pr comment` instead.
 
