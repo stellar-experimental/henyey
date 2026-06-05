@@ -798,11 +798,15 @@ EOF
         tap_not_ok "test_runner_shutdown_exit143_retries_on_targeted_shard" "exit=$exit_code (expected 0 via retry)"
     fi
 
-    # The retry must have happened — attempt-2 diagnostics present.
-    if [[ -d "$diag_dir/attempt-2" ]]; then
-        tap_ok "exit143_retry_made_second_attempt"
+    # The first (exit-143) attempt must have captured diagnostics, proving the
+    # probe failed on attempt 1 and the overall exit 0 came from the retry path.
+    # (A successful retry exits 0 and so leaves no attempt-2 diagnostics dir —
+    # diagnostics are only captured on a non-zero attempt; this mirrors the
+    # exit-124 retry test's attempt-1 assertion.)
+    if [[ -d "$diag_dir/attempt-1" ]]; then
+        tap_ok "exit143_retry_captured_attempt1_diagnostics"
     else
-        tap_not_ok "exit143_retry_made_second_attempt" "no attempt-2 dir (retry did not fire)"
+        tap_not_ok "exit143_retry_captured_attempt1_diagnostics" "no attempt-1 dir (first failure not captured)"
     fi
 }
 

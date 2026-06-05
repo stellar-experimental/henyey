@@ -21,10 +21,18 @@
 # single retry on top of it (see below).
 #
 # The ONLY retryable case: network=testnet, enable=core,horizon,
-# probe=horizon-core-up, and exit was timeout-classified (exit 124 from
-# GNU timeout). The retry re-runs the probe under the SAME --timeout budget —
-# it is an additional attempt at the same per-attempt budget, not a change to
-# the budget (#2920).
+# probe=horizon-core-up, and exit was a transient-infra-classified code:
+#   * exit 124 — GNU `timeout` killed a slow start (the original #2916 flake).
+#   * exit 143 — the probe (or the runner) received SIGTERM (128+15=143),
+#     i.e. "the runner has received a shutdown signal" spot-runner reclamation
+#     (#3131). When the runner survives the SIGTERM long enough for the wrapper
+#     to observe the probe's 143, re-running once self-heals without a manual
+#     orchestrator re-run; if the runner is fully reclaimed the wrapper dies
+#     too and the workflow's normal re-run path applies.
+# The retry re-runs the probe under the SAME --timeout budget — it is an
+# additional attempt at the same per-attempt budget, not a change to the
+# budget (#2920). It stays scoped to the targeted shard so a genuine probe
+# failure (exit 1, etc.) or any failure on another shard still fails loudly.
 
 set -euo pipefail
 
@@ -59,6 +67,14 @@ mkdir -p "$DIAGNOSTICS_DIR"
 # --- Helper: is this the retryable shard? ---
 is_retryable_shard() {
     [[ "$NETWORK" == "testnet" && "$ENABLE" == "core,horizon" && "$PROBE" == "horizon-core-up" ]]
+}
+
+# --- Helper: is this exit code a retryable transient-infra failure? ---
+# 124: GNU `timeout` killed a slow start (#2916). 143: SIGTERM (128+15) —
+# runner-shutdown / spot-runner reclamation (#3131). Both are infra-transient,
+# not test-logic failures, so they are retried once on the targeted shard only.
+is_retryable_exit() {
+    [[ "$1" -eq 124 || "$1" -eq 143 ]]
 }
 
 # --- Helper: capture diagnostics ---
@@ -114,9 +130,10 @@ if [[ $EXIT_CODE -eq 0 ]]; then
     exit 0
 fi
 
-if [[ $EXIT_CODE -eq 124 ]] && is_retryable_shard; then
-    # Timeout on the known-flaky shard — retry once
-    echo "=== Timeout on retryable shard ($NETWORK/$ENABLE/$PROBE), retrying ===" >&2
+if is_retryable_exit "$EXIT_CODE" && is_retryable_shard; then
+    # Transient-infra failure (timeout 124 / runner-shutdown 143) on the
+    # known-flaky shard — retry once under the same per-attempt budget.
+    echo "=== Transient-infra failure (exit $EXIT_CODE) on retryable shard ($NETWORK/$ENABLE/$PROBE), retrying ===" >&2
     EXIT_CODE=0
     run_probe 2 || EXIT_CODE=$?
 
@@ -129,6 +146,7 @@ if [[ $EXIT_CODE -eq 124 ]] && is_retryable_shard; then
     exit 1
 fi
 
-# Non-timeout failure, or timeout on non-retryable shard — fail immediately
+# Non-transient failure, or transient failure on a non-retryable shard —
+# fail immediately so genuine test failures stay loud.
 echo "=== Failed (exit $EXIT_CODE), not retryable ===" >&2
 exit 1
