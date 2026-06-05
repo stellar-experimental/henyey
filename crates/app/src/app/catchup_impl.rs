@@ -1883,8 +1883,15 @@ impl App {
         // (see: "Buffered gap exceeds checkpoint; starting catchup" log spam).
         // First buffered is checkpoint boundary AND we have multiple buffered ledgers.
         // This matches stellar-core: catchup to first_buffered - 1.
+        //
+        // The §7.2 trigger decision (the `can_trigger_immediate` boolean and, for
+        // the wait branch, the `(required_first, trigger)` pair) is delegated to
+        // the pure history classifier `classify_buffered_catchup_trigger`, the
+        // single source of truth for this decision. Lock/async machinery,
+        // logging, and the stuck-timeout path remain App-owned and unchanged.
+        let trigger_decision = classify_buffered_catchup_trigger(first_buffered, last_buffered);
         let can_trigger_immediate =
-            is_checkpoint_start(first_buffered) && first_buffered < last_buffered;
+            matches!(trigger_decision, BufferedCatchupTrigger::TriggerImmediate);
 
         tracing::debug!(
             can_trigger_immediate,
@@ -1896,14 +1903,11 @@ impl App {
 
         // If we can't trigger immediate catchup, check if we should wait for trigger
         // or if we're stuck and need timeout-based catchup
-        if !can_trigger_immediate {
-            let (required_first, trigger) = if is_checkpoint_start(first_buffered) {
-                (first_buffered, first_buffered.saturating_add(1))
-            } else {
-                let required_first = first_ledger_after_checkpoint_containing(first_buffered);
-                (required_first, required_first.saturating_add(1))
-            };
-
+        if let BufferedCatchupTrigger::Wait {
+            required_first,
+            trigger,
+        } = trigger_decision
+        {
             // Check if we have the trigger ledger
             if last_buffered >= trigger {
                 // We have enough buffered ledgers - proceed to catchup below
