@@ -732,8 +732,10 @@ impl Peer {
         // 2. Self-connection check: reject if peer is ourselves.
         let local_peer_id = self.auth.local_peer_id();
         if self.info.peer_id == local_peer_id {
+            // "connecting to self" mirrors stellar-core Peer.cpp:1857 /
+            // OVERLAY_SPEC §4.4.2-8 (the exact on-the-wire handshake error).
             return Err(OverlayError::InvalidMessage(
-                "received Hello from self".to_string(),
+                "connecting to self".to_string(),
             ));
         }
 
@@ -745,10 +747,9 @@ impl Peer {
         //    which rejects listeningPort <= 0 to prevent poisoning peer gossip
         //    with ephemeral ports.
         if hello.listening_port <= 0 || hello.listening_port > u16::MAX as i32 {
-            return Err(OverlayError::InvalidMessage(format!(
-                "invalid listening port: {}",
-                hello.listening_port
-            )));
+            // "bad address" mirrors stellar-core Peer.cpp:1875 / OVERLAY_SPEC
+            // §4.4.2-10 (the exact on-the-wire handshake error string).
+            return Err(OverlayError::InvalidMessage("bad address".to_string()));
         }
 
         // All checks passed — record the peer's advertised listening port.
@@ -1132,6 +1133,87 @@ mod tests {
             holds_pending_peer_id: false,
         };
         (peer_a, peer_b)
+    }
+
+    /// Build a single inbound `Peer` in `Handshaking` state plus a valid
+    /// `Hello` (correct network + in-range overlay version) crafted by a
+    /// remote node, so `validate_hello_phase2` reaches the peer-level
+    /// self-connection / bad-address checks. Returns the peer and the hello.
+    fn make_peer_for_phase2() -> (Peer, Hello) {
+        use crate::auth::{AuthCert, AuthCertExt, AuthContext};
+        use crate::connection::Connection;
+        use henyey_crypto::SecretKey;
+        use stellar_xdr::curr as xdr;
+        use x25519_dalek::EphemeralSecret;
+
+        let (_client, server) = tokio::io::duplex(1024 * 1024);
+        let addr_local: SocketAddr = "127.0.0.1:11625".parse().unwrap();
+        let addr_remote: SocketAddr = "127.0.0.1:11626".parse().unwrap();
+        let conn = Connection::from_io(server, addr_remote, ConnectionDirection::Inbound).unwrap();
+
+        let local = LocalNode::new_testnet(SecretKey::generate());
+        let remote = LocalNode::new_testnet(SecretKey::generate());
+        let auth = AuthContext::new(local, false);
+
+        // A hello from the remote node: same network + matching overlay version
+        // range (both testnet nodes share these), so the auth-level checks pass
+        // and `validate_hello_phase2` reaches the peer-level checks.
+        let ephemeral = EphemeralSecret::random_from_rng(rand::rngs::OsRng);
+        let cert = AuthCert::new_cert(&remote, &ephemeral);
+        let hello = Hello {
+            ledger_version: 25,
+            overlay_version: remote.overlay_version,
+            overlay_min_version: remote.overlay_min_version,
+            network_id: xdr::Hash(*remote.network_id.as_bytes()),
+            version_str: remote.version_string.clone().try_into().unwrap(),
+            listening_port: remote.listening_port as i32,
+            peer_id: xdr::NodeId(remote.xdr_public_key()),
+            cert,
+            nonce: xdr::Uint256([42u8; 32]),
+        };
+
+        let peer = Peer {
+            info: PeerInfo {
+                peer_id: PeerId::from_xdr(remote.xdr_public_key()),
+                address: addr_local,
+                direction: ConnectionDirection::Inbound,
+                version_string: String::new(),
+                overlay_version: 0,
+                ledger_version: 0,
+                connected_at: Instant::now(),
+                original_address: None,
+            },
+            state: PeerState::Handshaking,
+            connection: conn,
+            auth,
+            stats: Arc::new(PeerStats::default()),
+            metrics: Arc::new(OverlayMetrics::new()),
+            holds_pending_peer_id: false,
+        };
+        (peer, hello)
+    }
+
+    /// §4.4.2-8 / Peer.cpp:1857: the self-connection rejection error string
+    /// must be exactly "connecting to self" (issue #3080).
+    #[test]
+    fn test_self_connection_error_string_matches_spec() {
+        let (mut peer, hello) = make_peer_for_phase2();
+        // Force the self-connection branch: recorded peer id == our own id.
+        peer.info.peer_id = peer.auth.local_peer_id();
+
+        let err = peer.validate_hello_phase2(&hello).unwrap_err();
+        assert_eq!(err.to_string(), "invalid message: connecting to self");
+    }
+
+    /// §4.4.2-10 / Peer.cpp:1875: the bad-address rejection error string must
+    /// be exactly "bad address" (issue #3080).
+    #[test]
+    fn test_bad_address_error_string_matches_spec() {
+        let (mut peer, mut hello) = make_peer_for_phase2();
+        hello.listening_port = 0; // invalid — triggers the bad-address check
+
+        let err = peer.validate_hello_phase2(&hello).unwrap_err();
+        assert_eq!(err.to_string(), "invalid message: bad address");
     }
 
     /// Verify that the byte and async I/O counters are zero on a fresh peer

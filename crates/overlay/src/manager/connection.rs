@@ -279,7 +279,7 @@ impl OverlayManager {
                 let existing_direction = e.get().direction;
                 if existing_direction == new_direction {
                     // Same-direction duplicate — always reject.
-                    return Err(OverlayError::AlreadyConnected);
+                    return Err(OverlayError::AlreadyConnected(peer_id.to_string()));
                 }
                 // Cross-direction collision (mutual-dial).
                 // Tiebreaker: higher peer ID keeps outbound.
@@ -318,7 +318,7 @@ impl OverlayManager {
                         "Mutual-dial tiebreaker: keeping existing {:?} for peer {}, rejecting {:?}",
                         existing_direction, peer_id, new_direction
                     );
-                    return Err(OverlayError::AlreadyConnected);
+                    return Err(OverlayError::AlreadyConnected(peer_id.to_string()));
                 }
             }
         };
@@ -1055,7 +1055,7 @@ pub(super) async fn connect_to_explicit_peer(
             peer.close().await;
             shared.pending_connections.release_peer_id(&peer_id);
             pool.release_pending();
-            return Err(OverlayError::AlreadyConnected);
+            return Err(OverlayError::AlreadyConnected(peer_id.to_string()));
         }
         drop(existing);
     }
