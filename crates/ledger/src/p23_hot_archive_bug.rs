@@ -32,13 +32,15 @@
 //!
 //! stellar-core's `Protocol23CorruptionDataVerifier` (CSV-file-driven catchup
 //! verification) and `Protocol23CorruptionEventReconciler` (SAC mint/burn
-//! event reconciliation) live in the same upstream file but are config-gated
-//! optional machinery that never mutate the hot-archive batch:
+//! event reconciliation) live in the same upstream file:
 //!  - The data verifier is a pure no-op exclusion here — Henyey has no
 //!    corruption-file config concept, so there is nothing to wire up.
-//!  - The SAC-event reconciler (gated on `BACKFILL_STELLAR_ASSET_EVENTS`) is a
-//!    distinct spec gap tracked separately; it has zero `bucketListHash`
-//!    effect and is out of scope for this remediation.
+//!  - The SAC-event reconciler (gated on `BACKFILL_STELLAR_ASSET_EVENTS`) is
+//!    ported in `henyey_tx::events` (issue #3126). It consumes the
+//!    [`P23_CORRUPTED_AFFECTED_ASSETS`] array re-exported below plus the 478
+//!    corrupted/correct pairs above; it has zero `bucketListHash` effect
+//!    (events are op-meta-only, hashed after the success preimage) and is
+//!    off by default.
 
 use stellar_xdr::curr::{LedgerEntry, LedgerKey, Limits, ReadXdr};
 
@@ -48,6 +50,7 @@ use crate::error::LedgerError;
 use crate::Result;
 
 pub use crate::p23_hot_archive_bug_data::{
+    P23_CORRUPTED_AFFECTED_ASSETS, P23_CORRUPTED_AFFECTED_ASSETS_COUNT,
     P23_CORRUPTED_HOT_ARCHIVE_ENTRIES, P23_CORRUPTED_HOT_ARCHIVE_ENTRIES_COUNT,
     P23_CORRUPTED_HOT_ARCHIVE_ENTRY_CORRECT_STATE,
 };
@@ -213,5 +216,24 @@ mod tests {
             let correct = decode_correct_entry(i).unwrap();
             assert_ne!(corrupted, correct, "entry {i} should have been corrected");
         }
+    }
+
+    /// The affected-asset array (issue #3126) has exactly 12 entries, each of
+    /// which decodes to a valid `Asset` (mirrors `P23HotArchiveBug.h:31`
+    /// `P23_CORRUPTED_AFFECTED_ASSETS_COUNT = 12`).
+    #[test]
+    fn affected_assets_array_is_12_and_decodes() {
+        use stellar_xdr::curr::{Asset, ReadXdr};
+        assert_eq!(P23_CORRUPTED_AFFECTED_ASSETS_COUNT, 12);
+        assert_eq!(P23_CORRUPTED_AFFECTED_ASSETS.len(), 12);
+        for (i, s) in P23_CORRUPTED_AFFECTED_ASSETS.iter().enumerate() {
+            Asset::from_xdr_base64(s, Limits::none())
+                .unwrap_or_else(|e| panic!("affected asset {i} failed to decode: {e}"));
+        }
+        // First entry is the native asset (`AAAAAA==`), matching the C++ source.
+        assert_eq!(
+            Asset::from_xdr_base64(P23_CORRUPTED_AFFECTED_ASSETS[0], Limits::none()).unwrap(),
+            Asset::Native
+        );
     }
 }

@@ -2474,6 +2474,8 @@ mod tests {
             module_cache: None,
             guarded_hot_archive: None,
             ttl_key_cache: None,
+            classic_events: crate::events::ClassicEventConfig::default(),
+            p23_sac_reconciler: None,
         });
 
         // Build RestoreFootprint operation

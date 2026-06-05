@@ -145,6 +145,15 @@ pub struct SorobanContext<'a> {
     pub module_cache: Option<&'a PersistentModuleCache>,
     pub guarded_hot_archive: Option<GuardedHotArchive<'a>>,
     pub ttl_key_cache: Option<&'a TtlKeyCache>,
+    /// Classic-event configuration. Drives the protocol-23 SAC mint/burn event
+    /// reconciliation backfill (off by default). Observability-only — never
+    /// affects any consensus hash.
+    pub classic_events: crate::events::ClassicEventConfig,
+    /// Optional protocol-23 SAC corruption event reconciler. Present only when
+    /// `classic_events.backfill_stellar_asset_events` is enabled (built once by
+    /// the caller from the hardcoded P23 data table). Used to prepend synthetic
+    /// mint/burn events to InvokeHostFunction op-meta on hot-archive restore.
+    pub p23_sac_reconciler: Option<&'a crate::events::P23SacReconciler>,
 }
 
 /// Cache of pre-computed TTL key hashes. Built during footprint loading,
