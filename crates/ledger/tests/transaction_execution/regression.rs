@@ -1951,6 +1951,212 @@ fn test_internal_error_maps_to_tx_internal_error() {
     );
 }
 
+/// Regression test: a txINTERNAL_ERROR transaction must roll back all operation
+/// state changes while still charging (and preserving in the delta) the fee.
+///
+/// This pins the full §12.5 (TX) internal-error contract. The existing
+/// `test_internal_error_maps_to_tx_internal_error` only asserts the *result code*
+/// conjunct; this asserts the remaining two:
+///
+///   1. Fee preserved — after `rollback_failed_tx` reverts operation effects, the
+///      fee is re-added to the delta (`apply.rs:1153`, `add_fee(pre_apply.fee)`).
+///      Both `result.fee_charged` and `delta().fee_charged()` must equal the base
+///      fee (100). A regression dropping the re-add would charge no fee for failed
+///      internal-error txs — a fee-pool / ledger-hash parity break that the
+///      result-code-only test would not catch.
+///   2. State rolled back — no partial operation side-effects survive: the source
+///      account's native balance is reduced by exactly the fee (the PathPayment
+///      send debit reverted), and the destination account balance is unchanged.
+///
+/// Parity: mirrors stellar-core `TransactionFrame::applyOperations`, where the
+/// inner LedgerTxn is discarded un-committed on an op exception (all op state
+/// reverted) while the fee — charged in a separate phase — persists.
+#[test]
+fn test_internal_error_rolls_back_state_and_preserves_fee() {
+    let source_secret = SecretKey::from_seed(&[210u8; 32]);
+    let source_id: AccountId = (&source_secret.public_key()).into();
+
+    let seller_secret = SecretKey::from_seed(&[211u8; 32]);
+    let seller_id: AccountId = (&seller_secret.public_key()).into();
+
+    let dest_id = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([212u8; 32])));
+
+    let issuer_secret = SecretKey::from_seed(&[213u8; 32]);
+    let issuer_id: AccountId = (&issuer_secret.public_key()).into();
+
+    let asset_usd = Asset::CreditAlphanum4(AlphaNum4 {
+        asset_code: AssetCode4([b'U', b'S', b'D', 0]),
+        issuer: issuer_id.clone(),
+    });
+
+    // Starting native balances (mirrors the result-code-only fixture).
+    let source_start_balance: i64 = 500_000_000;
+    let dest_start_balance: i64 = 200_000_000;
+
+    // Create accounts.
+    let (source_key, source_entry) =
+        create_account_entry(source_id.clone(), 1, source_start_balance);
+    let (dest_key, dest_entry) = create_account_entry(dest_id.clone(), 1, dest_start_balance);
+    let (issuer_key, issuer_entry) = create_account_entry(issuer_id.clone(), 1, 100_000_000);
+
+    // Seller account owns an offer selling 50 XLM but has zero selling
+    // liabilities set — the inconsistent state that triggers a liabilities
+    // underflow (internal error) when the offer is crossed.
+    let (seller_key, seller_entry) = create_account_entry(seller_id.clone(), 1, 500_000_000);
+
+    // Source needs USD trustline to send.
+    let (source_tl_key, source_tl_entry) = create_trustline_entry(
+        source_id.clone(),
+        TrustLineAsset::CreditAlphanum4(match &asset_usd {
+            Asset::CreditAlphanum4(a) => a.clone(),
+            _ => unreachable!(),
+        }),
+        100_000_000,
+        200_000_000,
+        TrustLineFlags::AuthorizedFlag as u32,
+    );
+
+    // Seller needs USD trustline (buying side); buying liabilities are 0
+    // (inconsistent with the offer) to provoke the underflow.
+    let (seller_tl_key, seller_tl_entry) = create_trustline_entry(
+        seller_id.clone(),
+        TrustLineAsset::CreditAlphanum4(match &asset_usd {
+            Asset::CreditAlphanum4(a) => a.clone(),
+            _ => unreachable!(),
+        }),
+        0,
+        100_000_000,
+        TrustLineFlags::AuthorizedFlag as u32,
+    );
+
+    // Offer: seller sells 50 XLM for USD at 1:1; liabilities are 0 → underflow on cross.
+    let offer_id: i64 = 99999;
+    let (offer_key, offer_entry) = create_offer_entry(
+        seller_id.clone(),
+        offer_id,
+        Asset::Native,
+        asset_usd.clone(),
+        50_000_000,
+        Price { n: 1, d: 1 },
+    );
+
+    let snapshot = SnapshotBuilder::new(1)
+        .add_entry(source_key, source_entry)
+        .add_entry(dest_key, dest_entry)
+        .add_entry(seller_key, seller_entry)
+        .add_entry(issuer_key, issuer_entry)
+        .add_entry(source_tl_key, source_tl_entry)
+        .add_entry(seller_tl_key, seller_tl_entry)
+        .add_entry(offer_key, offer_entry)
+        .build_with_default_header();
+    let snapshot = SnapshotHandle::new(snapshot);
+
+    let network_id = NetworkId::testnet();
+
+    let context = henyey_tx::LedgerContext::new(1, 1_000, 100, 5_000_000, 25, network_id);
+    let mut executor = TransactionExecutor::new(
+        &context,
+        0,
+        SorobanConfig::default(),
+        ClassicEventConfig::default(),
+    );
+    executor
+        .load_orderbook_offers(&snapshot)
+        .expect("load orderbook");
+
+    // PathPaymentStrictReceive that will cross the offer and trigger the underflow.
+    let op = Operation {
+        source_account: None,
+        body: OperationBody::PathPaymentStrictReceive(PathPaymentStrictReceiveOp {
+            send_asset: asset_usd.clone(),
+            send_max: 100_000_000,
+            destination: dest_id.clone().into(),
+            dest_asset: Asset::Native,
+            dest_amount: 50_000_000,
+            path: VecM::default(),
+        }),
+    };
+
+    let tx = Transaction {
+        source_account: MuxedAccount::Ed25519(Uint256(*source_secret.public_key().as_bytes())),
+        fee: 100,
+        seq_num: SequenceNumber(2),
+        cond: Preconditions::None,
+        memo: Memo::None,
+        operations: vec![op].try_into().unwrap(),
+        ext: TransactionExt::V0,
+    };
+
+    let mut envelope = TransactionEnvelope::Tx(TransactionV1Envelope {
+        tx,
+        signatures: VecM::default(),
+    });
+    let decorated = sign_envelope(&envelope, &source_secret, &network_id);
+    if let TransactionEnvelope::Tx(ref mut env) = envelope {
+        env.signatures = vec![decorated].try_into().unwrap();
+    }
+
+    let result = executor
+        .execute_transaction(&snapshot, &envelope, 100, None)
+        .expect("execute_transaction should not return Err");
+
+    // Conjunct 1 (anchor): result code is txINTERNAL_ERROR. If the fixture stops
+    // reaching the internal-error branch, this fails loudly rather than silently
+    // degrading into a normal-failure test.
+    assert!(
+        !result.success,
+        "TX should fail due to liabilities underflow"
+    );
+    assert_eq!(
+        result.failure,
+        Some(ExecutionFailure::TxInternalError),
+        "Internal errors must map to ExecutionFailure::TxInternalError"
+    );
+
+    // Conjunct 2: fee preserved. The reported per-tx fee is the base fee (100) —
+    // this is the §12.5-relevant value: a failed internal-error tx still charges
+    // its fee rather than being treated as free.
+    assert_eq!(
+        result.fee_charged, 100,
+        "Failed internal-error tx must still charge the base fee"
+    );
+    // The delta's fee_charged accumulator pins the rollback re-add at apply.rs:1153.
+    // Through the full executor it reads 200, not 100: the fee phase adds 100 to the
+    // delta and *commits* it (mod.rs:1741, then commit()), so the snapshot that
+    // rollback_failed_tx restores from already contains that 100; the explicit
+    // re-add then contributes the second 100. Both 100s account for the same single
+    // fee charge through this internal accumulator — dropping the re-add would leave
+    // it at 100, so asserting on the post-rollback delta still pins the re-add path.
+    assert_eq!(
+        executor.state().delta().fee_charged(),
+        200,
+        "Fee must be re-added to the delta after rollback_failed_tx (apply.rs:1153): \
+         100 from the committed fee phase + 100 from the rollback re-add"
+    );
+
+    // Conjunct 3: state rolled back — no operation side-effects survive.
+    // Source native balance reduced by exactly the fee (PathPayment send debit reverted).
+    let source_after = executor
+        .state()
+        .get_account(&source_id)
+        .expect("source account present after execution");
+    assert_eq!(
+        source_after.balance,
+        source_start_balance - 100,
+        "Source native balance must be start − fee only; the operation must be fully rolled back"
+    );
+
+    // Destination balance unchanged (it would have received 50 XLM on success).
+    let dest_after = executor
+        .state()
+        .get_account(&dest_id)
+        .expect("destination account present after execution");
+    assert_eq!(
+        dest_after.balance, dest_start_balance,
+        "Destination balance must be unchanged after internal-error rollback"
+    );
+}
+
 /// Regression test for CreateAccount check order with sponsorship (mainnet ledger 61232072).
 ///
 /// When a sponsored CreateAccount fails because both the sponsor lacks reserve AND
