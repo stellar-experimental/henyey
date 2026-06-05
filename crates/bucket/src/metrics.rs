@@ -14,7 +14,7 @@
 //! Counters are typically updated during bucket operations and can be queried
 //! for monitoring purposes.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::bucket_list::BUCKET_LIST_LEVELS;
 
@@ -226,6 +226,44 @@ pub struct EvictionCounters {
     pub scan_cycles_completed: AtomicU64,
     /// Total scan time in microseconds.
     pub scan_time_us: AtomicU64,
+
+    // ------------------------------------------------------------------
+    // Cycle gauges (last completed cycle), mirroring stellar-core's
+    // `EvictionStatistics`/`EvictionMetrics` (BucketUtils.cpp:189-220).
+    //
+    // Unlike the monotonic `fetch_add` counters above, these two are
+    // SET-semantics gauges: each completed cycle OVERWRITES them via
+    // `store` (matching medida `Counter::set_count`), so they reflect only
+    // the most recently completed cycle, not a running total.
+    // ------------------------------------------------------------------
+    /// Ledger span of the most recently completed eviction cycle
+    /// (`currLedgerSeq - cycleStartLedger`). Last-cycle gauge (set, not
+    /// monotonic). Mirrors stellar-core `evictionCyclePeriod`.
+    pub eviction_cycle_period: AtomicU64,
+    /// Integer mean age of entries evicted during the most recently
+    /// completed cycle (`sum_age / count`, or 0 when the cycle evicted
+    /// nothing). Last-cycle gauge (set, not monotonic). Mirrors
+    /// stellar-core `averageEvictedEntryAge`.
+    pub average_evicted_entry_age: AtomicU64,
+
+    // ------------------------------------------------------------------
+    // Private cycle accumulators (not exposed in the snapshot). These back
+    // the two gauges above and mirror stellar-core's `EvictionStatistics`
+    // private members.
+    // ------------------------------------------------------------------
+    /// Running sum of evicted entry ages within the in-progress cycle.
+    /// Mirrors `mEvictedEntriesAgeSum`.
+    evicted_age_sum: AtomicU64,
+    /// Number of entries evicted within the in-progress cycle.
+    /// Mirrors `mNumEntriesEvicted`.
+    evicted_count_for_cycle: AtomicU64,
+    /// Ledger sequence at which the in-progress cycle started.
+    /// Mirrors `mEvictionCycleStartLedger`.
+    cycle_start_ledger: AtomicU64,
+    /// Whether at least one full cycle has elapsed; gates metric recording
+    /// to avoid noise from the first (baseline) cycle. Mirrors
+    /// `mCompleteCycle`.
+    complete_cycle: AtomicBool,
 }
 
 impl EvictionCounters {
@@ -259,6 +297,61 @@ impl EvictionCounters {
         self.scan_time_us.fetch_add(duration_us, Ordering::Relaxed);
     }
 
+    /// Records the age of a single evicted entry within the current cycle.
+    ///
+    /// `age` is the entry's lifetime in ledgers
+    /// (`liveUntilLedger - evictionLedger`). Mirrors stellar-core
+    /// `EvictionStatistics::recordEvictedEntry`: accumulates into the
+    /// per-cycle age sum and count, which are folded into the
+    /// `average_evicted_entry_age` gauge when the cycle closes via
+    /// [`submit_metrics_and_restart_cycle`](Self::submit_metrics_and_restart_cycle).
+    pub fn record_evicted_entry_age(&self, age: u64) {
+        self.evicted_age_sum.fetch_add(age, Ordering::Relaxed);
+        self.evicted_count_for_cycle.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Closes the current eviction cycle and starts a new one at
+    /// `curr_ledger_seq`.
+    ///
+    /// Mirrors stellar-core `EvictionStatistics::submitMetricsAndRestartCycle`:
+    /// only if a full cycle has already elapsed (`complete_cycle`) does it
+    /// publish the two last-cycle gauges:
+    /// - `eviction_cycle_period = curr_ledger_seq - cycle_start_ledger`
+    ///   (ledger span of the cycle just completed), and
+    /// - `average_evicted_entry_age = count == 0 ? 0 : sum / count`
+    ///   (integer mean; no divide-by-zero).
+    ///
+    /// It then resets the per-cycle accumulators, advances the cycle start
+    /// to `curr_ledger_seq`, and marks the cycle complete. The first call
+    /// establishes the baseline and publishes nothing.
+    pub fn submit_metrics_and_restart_cycle(&self, curr_ledger_seq: u32) {
+        // Only record metrics once we've observed a complete cycle, to avoid
+        // noise from the initial (baseline) cycle.
+        if self.complete_cycle.load(Ordering::Relaxed) {
+            let period = u64::from(curr_ledger_seq)
+                .saturating_sub(self.cycle_start_ledger.load(Ordering::Relaxed));
+            self.eviction_cycle_period.store(period, Ordering::Relaxed);
+
+            // count == 0 → 0 (no divide-by-zero), matching stellar-core's
+            // `mNumEntriesEvicted == 0 ? 0 : sum / count`.
+            let count = self.evicted_count_for_cycle.load(Ordering::Relaxed);
+            let average_age = self
+                .evicted_age_sum
+                .load(Ordering::Relaxed)
+                .checked_div(count)
+                .unwrap_or(0);
+            self.average_evicted_entry_age
+                .store(average_age, Ordering::Relaxed);
+        }
+
+        // Reset to start a new cycle.
+        self.complete_cycle.store(true, Ordering::Relaxed);
+        self.evicted_age_sum.store(0, Ordering::Relaxed);
+        self.evicted_count_for_cycle.store(0, Ordering::Relaxed);
+        self.cycle_start_ledger
+            .store(u64::from(curr_ledger_seq), Ordering::Relaxed);
+    }
+
     /// Returns a snapshot of the counters.
     pub fn snapshot(&self) -> EvictionCountersSnapshot {
         EvictionCountersSnapshot {
@@ -269,6 +362,8 @@ impl EvictionCounters {
             incomplete_bucket_scans: self.incomplete_bucket_scans.load(Ordering::Relaxed),
             scan_cycles_completed: self.scan_cycles_completed.load(Ordering::Relaxed),
             scan_time_us: self.scan_time_us.load(Ordering::Relaxed),
+            eviction_cycle_period: self.eviction_cycle_period.load(Ordering::Relaxed),
+            average_evicted_entry_age: self.average_evicted_entry_age.load(Ordering::Relaxed),
         }
     }
 
@@ -281,6 +376,12 @@ impl EvictionCounters {
         self.incomplete_bucket_scans.store(0, Ordering::Relaxed);
         self.scan_cycles_completed.store(0, Ordering::Relaxed);
         self.scan_time_us.store(0, Ordering::Relaxed);
+        self.eviction_cycle_period.store(0, Ordering::Relaxed);
+        self.average_evicted_entry_age.store(0, Ordering::Relaxed);
+        self.evicted_age_sum.store(0, Ordering::Relaxed);
+        self.evicted_count_for_cycle.store(0, Ordering::Relaxed);
+        self.cycle_start_ledger.store(0, Ordering::Relaxed);
+        self.complete_cycle.store(false, Ordering::Relaxed);
     }
 }
 
@@ -294,6 +395,13 @@ pub struct EvictionCountersSnapshot {
     pub incomplete_bucket_scans: u64,
     pub scan_cycles_completed: u64,
     pub scan_time_us: u64,
+    /// Ledger span of the most recently completed eviction cycle.
+    /// Last-cycle gauge. Mirrors stellar-core `evictionCyclePeriod`.
+    pub eviction_cycle_period: u64,
+    /// Integer mean age of entries evicted during the most recently
+    /// completed cycle. Last-cycle gauge. Mirrors stellar-core
+    /// `averageEvictedEntryAge`.
+    pub average_evicted_entry_age: u64,
 }
 
 impl EvictionCountersSnapshot {
