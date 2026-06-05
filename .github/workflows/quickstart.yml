@@ -26,9 +26,12 @@ name: Quickstart
 # horizon-core-up probe without forking the entire upstream test matrix.
 # Each probe is run through scripts/ci/run-quickstart-test.sh which adds:
 #   * GNU timeout with diagnostics capture on failure
-#   * Exactly one retry for testnet/core,horizon/horizon-core-up when the
-#     exit is timeout-classified (exit 124)
-#   * No retry for any other shard or non-timeout failure
+#   * Exactly one retry for testnet/core,horizon/horizon-core-up when the exit
+#     is a transient-infra signature: exit 124 (timeout / slow start, #2916) or
+#     exit 143 (SIGTERM — "runner has received a shutdown signal" / spot-runner
+#     reclamation, #3131). The retry is scoped to that one shard only.
+#   * No retry for any other shard, or for any non-transient failure (e.g. a
+#     genuine probe failure exit 1) — those still fail loudly.
 #
 # Upstream contract validation:
 #   The validate-contract job fetches both build.yml and internal-build.yml

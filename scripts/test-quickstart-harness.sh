@@ -754,8 +754,132 @@ EOF
     fi
 }
 
+# ============================================================
+# Test 12: test_runner_shutdown_exit143_retries_on_targeted_shard
+#
+# Regression for #3131. The testnet/core,horizon/horizon-core-up probe flakes
+# with exit 143 ("the runner has received a shutdown signal" — spot-runner
+# reclamation / the probe subprocess receiving SIGTERM, 128+15=143) in addition
+# to the timeout (exit 124) class already handled. The wrapper must treat
+# exit 143 as a retryable transient on the targeted shard, exactly like exit
+# 124: re-run once, and pass if the retry succeeds.
+# ============================================================
+test_runner_shutdown_exit143_retries_on_targeted_shard() {
+    local diag_dir="$TMPDIR_BASE/diag-test12"
+    mkdir -p "$diag_dir"
+
+    # Probe: exits 143 (runner-shutdown signature) on attempt 1, succeeds on 2.
+    local state_file="$TMPDIR_BASE/state-test12"
+    echo "0" > "$state_file"
+    local probe="$TMPDIR_BASE/probe-test12.sh"
+    cat > "$probe" <<'EOF'
+#!/bin/bash
+STATE_FILE="__STATE__"
+COUNT=$(cat "$STATE_FILE")
+COUNT=$((COUNT + 1))
+echo "$COUNT" > "$STATE_FILE"
+if [[ $COUNT -eq 1 ]]; then
+    exit 143
+fi
+exit 0
+EOF
+    sed -i "s|__STATE__|$state_file|g" "$probe"
+    chmod +x "$probe"
+
+    local exit_code=0
+    "$WRAPPER" \
+        --network testnet --enable "core,horizon" --probe horizon-core-up \
+        --timeout 10 --diagnostics-dir "$diag_dir" \
+        -- "$probe" >/dev/null 2>&1 || exit_code=$?
+
+    if [[ $exit_code -eq 0 ]]; then
+        tap_ok "test_runner_shutdown_exit143_retries_on_targeted_shard"
+    else
+        tap_not_ok "test_runner_shutdown_exit143_retries_on_targeted_shard" "exit=$exit_code (expected 0 via retry)"
+    fi
+
+    # The first (exit-143) attempt must have captured diagnostics, proving the
+    # probe failed on attempt 1 and the overall exit 0 came from the retry path.
+    # (A successful retry exits 0 and so leaves no attempt-2 diagnostics dir —
+    # diagnostics are only captured on a non-zero attempt; this mirrors the
+    # exit-124 retry test's attempt-1 assertion.)
+    if [[ -d "$diag_dir/attempt-1" ]]; then
+        tap_ok "exit143_retry_captured_attempt1_diagnostics"
+    else
+        tap_not_ok "exit143_retry_captured_attempt1_diagnostics" "no attempt-1 dir (first failure not captured)"
+    fi
+}
+
+# ============================================================
+# Test 13: test_runner_shutdown_exit143_does_not_retry_on_non_targeted_shard
+#
+# The exit-143 retry must be scoped to the same targeted shard as the exit-124
+# retry — a non-targeted shard exiting 143 must fail immediately with no retry,
+# so a genuine henyey failure elsewhere stays loud.
+# ============================================================
+test_runner_shutdown_exit143_no_retry_on_non_targeted_shard() {
+    local diag_dir="$TMPDIR_BASE/diag-test13"
+    mkdir -p "$diag_dir"
+
+    # Probe exits 143 immediately on a non-targeted shard.
+    local probe
+    probe=$(make_probe "test13" 143 0)
+
+    local exit_code=0
+    "$WRAPPER" \
+        --network local --enable "core" --probe core \
+        --timeout 10 --diagnostics-dir "$diag_dir" \
+        -- "$probe" >/dev/null 2>&1 || exit_code=$?
+
+    if [[ $exit_code -ne 0 ]]; then
+        tap_ok "test_runner_shutdown_exit143_does_not_retry_on_non_targeted_shard"
+    else
+        tap_not_ok "test_runner_shutdown_exit143_does_not_retry_on_non_targeted_shard" "expected failure"
+    fi
+
+    if [[ ! -d "$diag_dir/attempt-2" ]]; then
+        tap_ok "non_targeted_exit143_single_attempt"
+    else
+        tap_not_ok "non_targeted_exit143_single_attempt" "unexpected retry on non-targeted shard"
+    fi
+}
+
+# ============================================================
+# Test 14: test_runner_shutdown_exit143_still_fails_after_second_attempt
+#
+# If exit 143 recurs on the retry, the wrapper must still fail (the retry is a
+# single additional attempt, not an unbounded loop). This proves the exit-143
+# retry mirrors the exit-124 double-failure semantics.
+# ============================================================
+test_runner_shutdown_exit143_double_failure_fails() {
+    local diag_dir="$TMPDIR_BASE/diag-test14"
+    mkdir -p "$diag_dir"
+
+    # Probe always exits 143.
+    local probe
+    probe=$(make_probe "test14" 143 0)
+
+    local exit_code=0
+    "$WRAPPER" \
+        --network testnet --enable "core,horizon" --probe horizon-core-up \
+        --timeout 10 --diagnostics-dir "$diag_dir" \
+        -- "$probe" >/dev/null 2>&1 || exit_code=$?
+
+    if [[ $exit_code -ne 0 ]]; then
+        tap_ok "test_runner_shutdown_exit143_still_fails_after_second_attempt"
+    else
+        tap_not_ok "test_runner_shutdown_exit143_still_fails_after_second_attempt" "expected failure"
+    fi
+
+    if [[ -d "$diag_dir/attempt-1" && -d "$diag_dir/attempt-2" ]]; then
+        tap_ok "exit143_double_failure_preserves_both_diagnostics"
+    else
+        tap_not_ok "exit143_double_failure_preserves_both_diagnostics" "missing attempt dirs"
+    fi
+}
+
 # --- Run all tests ---
-tap_plan 48
+tap_plan 54
 
 test_timeout_retry_on_targeted_shard
 test_non_timeout_failure_no_retry
@@ -768,6 +892,9 @@ test_workflow_uses_upstream_run_attempt_timeout_budget
 test_timeout_budget_matches_upstream_formula
 test_contract_pins_timeout_multiplier
 test_retry_is_layered_on_top_of_budget
+test_runner_shutdown_exit143_retries_on_targeted_shard
+test_runner_shutdown_exit143_no_retry_on_non_targeted_shard
+test_runner_shutdown_exit143_double_failure_fails
 
 echo ""
 echo "# Results: $PASS_COUNT/$TEST_COUNT passed, $FAIL_COUNT failed"
