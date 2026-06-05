@@ -878,8 +878,148 @@ test_runner_shutdown_exit143_double_failure_fails() {
     fi
 }
 
+# ============================================================
+# Test 15: test_transient_retry_covers_whole_testnet_shard_not_just_horizon_core_up
+#
+# Regression for #3185. The retry was originally scoped to the single probe
+# horizon-core-up. But testnet stellar-core's slow catchup propagates to the
+# NEXT startup-dependent probe: in run 27019344504 (069ebfcc), horizon-ingesting
+# timed out (exit 124) right after horizon-core-up finally came up, and because
+# the retry only matched horizon-core-up it hard-failed as "not retryable".
+# The retry is now scoped to the whole testnet/core,horizon shard, so a
+# transient-infra exit on ANY probe of that shard (here: horizon-ingesting)
+# self-heals via the single retry.
+# ============================================================
+test_transient_retry_covers_whole_testnet_shard() {
+    local diag_dir="$TMPDIR_BASE/diag-test15"
+    mkdir -p "$diag_dir"
+
+    # Probe times out (124) on first attempt, succeeds on second — same shape
+    # as the green-baseline horizon-core-up flake, but on horizon-ingesting.
+    local state_file="$TMPDIR_BASE/state-test15"
+    echo "0" > "$state_file"
+    local probe="$TMPDIR_BASE/probe-test15.sh"
+    cat > "$probe" <<'EOF'
+#!/bin/bash
+STATE_FILE="__STATE__"
+COUNT=$(cat "$STATE_FILE")
+COUNT=$((COUNT + 1))
+echo "$COUNT" > "$STATE_FILE"
+if [[ $COUNT -eq 1 ]]; then
+    sleep 999
+fi
+exit 0
+EOF
+    sed -i "s|__STATE__|$state_file|g" "$probe"
+    chmod +x "$probe"
+
+    local exit_code=0
+    "$WRAPPER" \
+        --network testnet --enable "core,horizon" --probe horizon-ingesting \
+        --timeout 2 --diagnostics-dir "$diag_dir" \
+        -- "$probe" >/dev/null 2>&1 || exit_code=$?
+
+    if [[ $exit_code -eq 0 ]]; then
+        tap_ok "test_transient_retry_covers_whole_testnet_shard_not_just_horizon_core_up"
+    else
+        tap_not_ok "test_transient_retry_covers_whole_testnet_shard_not_just_horizon_core_up" "exit=$exit_code (horizon-ingesting on testnet/core,horizon should retry)"
+    fi
+
+    # Attempt 1 failed (timeout 124) so its diagnostics were captured; the
+    # overall exit 0 above proves attempt 2 ran and passed. A successful retry
+    # captures no diagnostics (capture is failure-only), so we assert on the
+    # attempt-1 dir, not attempt-2.
+    if [[ -d "$diag_dir/attempt-1" ]]; then
+        tap_ok "shard_scope_retry_captured_failed_first_attempt"
+    else
+        tap_not_ok "shard_scope_retry_captured_failed_first_attempt" "no attempt-1 dir (first attempt not captured)"
+    fi
+}
+
+# ============================================================
+# Test 16: test_exit143_retries_on_non_horizon_core_up_testnet_probe
+#
+# Regression for #3185. The exit-143 (SIGTERM) retry must also cover the whole
+# testnet/core,horizon shard, not just horizon-core-up — a runner SIGTERM can
+# land on any probe. Here a horizon-ingesting probe exits 143 once then passes.
+# ============================================================
+test_exit143_retries_on_non_horizon_core_up_testnet_probe() {
+    local diag_dir="$TMPDIR_BASE/diag-test16"
+    mkdir -p "$diag_dir"
+
+    local state_file="$TMPDIR_BASE/state-test16"
+    echo "0" > "$state_file"
+    local probe="$TMPDIR_BASE/probe-test16.sh"
+    cat > "$probe" <<'EOF'
+#!/bin/bash
+STATE_FILE="__STATE__"
+COUNT=$(cat "$STATE_FILE")
+COUNT=$((COUNT + 1))
+echo "$COUNT" > "$STATE_FILE"
+if [[ $COUNT -eq 1 ]]; then
+    exit 143
+fi
+exit 0
+EOF
+    sed -i "s|__STATE__|$state_file|g" "$probe"
+    chmod +x "$probe"
+
+    local exit_code=0
+    "$WRAPPER" \
+        --network testnet --enable "core,horizon" --probe horizon-ingesting \
+        --timeout 10 --diagnostics-dir "$diag_dir" \
+        -- "$probe" >/dev/null 2>&1 || exit_code=$?
+
+    if [[ $exit_code -eq 0 ]]; then
+        tap_ok "test_exit143_retries_on_non_horizon_core_up_testnet_probe"
+    else
+        tap_not_ok "test_exit143_retries_on_non_horizon_core_up_testnet_probe" "exit=$exit_code"
+    fi
+}
+
+# ============================================================
+# Test 17: test_workflow_auto_reruns_on_whole_runner_sigterm
+#
+# Regression for #3185. The in-wrapper retry cannot recover a reclaimed runner
+# (the wrapper is SIGTERM'd too). The workflow must therefore carry a separate
+# job that re-dispatches the failed jobs once on the first attempt. Assert the
+# job exists, is gated on run_attempt == 1 (single extra attempt), holds the
+# actions:write permission needed to re-run, and re-dispatches via
+# `gh run rerun --failed`.
+# ============================================================
+test_workflow_auto_reruns_on_whole_runner_sigterm() {
+    if [[ ! -f "$WORKFLOW" ]]; then
+        tap_not_ok "test_workflow_auto_reruns_on_whole_runner_sigterm" "workflow file not found"
+        tap_not_ok "rerun_job_gated_on_first_attempt" "workflow file not found"
+        tap_not_ok "rerun_job_has_actions_write_permission" "workflow file not found"
+        return
+    fi
+
+    if grep -q '^  rerun-on-transient:' "$WORKFLOW" \
+        && grep -q 'gh run rerun' "$WORKFLOW" \
+        && grep -q -- '--failed' "$WORKFLOW"; then
+        tap_ok "test_workflow_auto_reruns_on_whole_runner_sigterm"
+    else
+        tap_not_ok "test_workflow_auto_reruns_on_whole_runner_sigterm" "rerun-on-transient job or gh run rerun --failed missing"
+    fi
+
+    # Must be bounded to one extra attempt (run_attempt == 1 guard).
+    if grep -q "github.run_attempt == 1" "$WORKFLOW"; then
+        tap_ok "rerun_job_gated_on_first_attempt"
+    else
+        tap_not_ok "rerun_job_gated_on_first_attempt" "missing run_attempt == 1 guard (would loop unboundedly)"
+    fi
+
+    # Must grant actions:write so `gh run rerun` is authorized.
+    if grep -q 'actions: write' "$WORKFLOW"; then
+        tap_ok "rerun_job_has_actions_write_permission"
+    else
+        tap_not_ok "rerun_job_has_actions_write_permission" "missing actions: write permission for rerun"
+    fi
+}
+
 # --- Run all tests ---
-tap_plan 54
+tap_plan 60
 
 test_timeout_retry_on_targeted_shard
 test_non_timeout_failure_no_retry
@@ -895,6 +1035,9 @@ test_retry_is_layered_on_top_of_budget
 test_runner_shutdown_exit143_retries_on_targeted_shard
 test_runner_shutdown_exit143_no_retry_on_non_targeted_shard
 test_runner_shutdown_exit143_double_failure_fails
+test_transient_retry_covers_whole_testnet_shard
+test_exit143_retries_on_non_horizon_core_up_testnet_probe
+test_workflow_auto_reruns_on_whole_runner_sigterm
 
 echo ""
 echo "# Results: $PASS_COUNT/$TEST_COUNT passed, $FAIL_COUNT failed"
