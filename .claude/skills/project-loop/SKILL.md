@@ -100,7 +100,7 @@ Dispatch the picked issues **in parallel** — emit all the Agent/Task tool call
 | `ready-for-doing` | `opus` | `Run /do <ISSUE> and report the final board state transition.` |
 | `in-review` | `opus` | `Run /review-pr <ISSUE> and report the final board state transition.` |
 
-Same rationale as `/project-tick`: haiku for triage, opus for plan/code/review. Cross-model diversity is now provided by the **adversarial refute pass** inside `/plan` and `/review-pr`, not a second model family.
+Same rationale as `/project-tick`: haiku for triage, opus for plan/code/review. Cross-model diversity is now provided by the **adversarial refute pass (run in-agent)** inside `/plan` and `/review-pr`, not a second model family. Under this single-level dispatch model the specialists run their adversarial lenses (the `/plan` critics + refute, the `/review-pr` reviewers + refute) as **in-agent multi-lens passes** — the supported mode — because a dispatched specialist cannot itself spawn nested sub-agents. Option 1 (the orchestrator spawning the adversarial lenses as sibling sub-agents for true OS-level independence) is recorded as a documented **future upgrade hook**, to be wired here should a nested-spawn capability later become available.
 
 All sub-agents run in the **foreground** (`run_in_background: false`) so you block on the batch and collect their reported state transitions. Sub-agent build artifacts (worktrees, cargo-targets) must stay under `~/data/<session>/` — the worktree-contract helper (`scripts/lib/agent-worktree-contract.sh`) enforces this; if a sub-agent reports a workspace that escaped `~/data`, record an anomaly (below).
 

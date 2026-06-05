@@ -16,7 +16,7 @@ argument-hint: <issue-number>
 
 You produce a single, converged implementation plan for one issue. The plan is what `/do` will execute, so it must be specific: file paths, function names, test approach, parity considerations.
 
-You are not alone — three independent critics (correctness / parity / scope) evaluate every draft in parallel. The plan converges when all three approve (or downgrade to `REVISE-MINOR`). Each REVISE-MAJOR concern is then subjected to an **adversarial refute pass** (an independent skeptic sub-agent argues the concern is wrong or non-blocking) before it is allowed to cost a revision round — the distinct correctness/parity/scope lenses remain the primary defense against missed bugs, while the refute pass kills false-positive concerns.
+You are not alone — three independent critic **lenses** (correctness / parity / scope) evaluate every draft. Under the pipeline's current single-level dispatch model (the orchestrator spawns one specialist per issue; that specialist cannot itself spawn nested sub-agents), **you run these three lenses yourself, as clearly-delimited in-agent passes** rather than as nested sub-agents — see the multi-lens discipline in Step 3. The plan converges when all three approve (or downgrade to `REVISE-MINOR`). Each REVISE-MAJOR concern is then subjected to an **adversarial refute pass** (an in-agent skeptic pass argues the concern is wrong or non-blocking) before it is allowed to cost a revision round — the distinct correctness/parity/scope lenses remain the primary defense against missed bugs, while the refute pass kills false-positive concerns.
 
 **Hard cap: 2 rounds.** If round 2 still has REVISE-MAJOR verdicts, the plan **force-converges**: ship the round-2 plan as-is, file one follow-up issue per residual REVISE-MAJOR concern (so the disagreement is preserved as backlog rather than blocking the pipeline), and advance to `ready-for-doing`. The doer reads the converged plan and the follow-up list as "minor items to consider during implementation."
 
@@ -84,11 +84,22 @@ must be preserved. If not parity-critical: write "n/a — non-parity path".>
 <Known unknowns, edge cases, things that might bite at review time. Be honest.>
 ```
 
-## Step 3 — Round 1: Spawn 3 critics in parallel
+## Step 3 — Round 1: Run 3 critic lenses (in-agent multi-lens)
+
+### Multi-lens discipline (how to run the three lenses yourself)
+
+Under the current dispatch model you cannot spawn nested critic sub-agents, so **you run the three lenses (correctness / parity / scope) as three clearly-delimited passes within this agent**. The downstream contract is the **structured comments + verdict markers**, not the number of OS-level agents — so a disciplined in-agent multi-lens pass satisfies every parser as long as you hold to these four properties:
+
+1. **Distinct framing per lens.** Before each pass, adopt ONLY that lens's brief (Critic A / B / C below is the per-pass framing). Do not carry forward the previous lens's conclusions into the next.
+2. **No cross-lens peeking.** Form and **post each lens's verdict as its own separate comment** (a separate `gh pr comment` / issue-comment call) *before* starting the next lens. Never merge the three lenses into one block — the Step 4 / Step 6 parsers key on the `## 🔍 Critic X` header line and keep the latest comment per critic name, so each lens MUST be its own comment.
+3. **Explicit reset between lenses.** When you move to the next lens, evaluate it as if you had not authored the prior one — re-read the plan fresh through the new lens, do not anchor on what you just concluded.
+4. **Refute as a genuine adversary** (Step 4). The refute pass argues the *opposing* case as if it must prove a different reviewer wrong — see Step 4 for the stance-switch wording.
+
+(If a future nested-spawn capability lands, these same three briefs can be dispatched as parallel sub-agents instead — the per-lens framing and comment shapes are unchanged. The workspace-contract / forbidden-scratch sections below still bind any shell-out a lens performs.)
 
 ### Critic workspace contract
 
-**All critic scratch work must live only under `~/data` (the real home directory's `data/` subdirectory, derived from the passwd entry — immune to `$HOME` poisoning).** Critics should prefer the existing checkout for read-only inspection. If a critic needs a scratch checkout (e.g. to run a test or verify a claim), it must live under `~/data`, never in the repo root, the repo parent, or anywhere outside `~/data`. Each critic derives its workspace by sourcing the shared contract helper:
+**All critic scratch work must live only under `~/data` (the real home directory's `data/` subdirectory, derived from the passwd entry — immune to `$HOME` poisoning).** A lens should prefer the existing checkout for read-only inspection. If a lens needs a scratch checkout (e.g. to run a test or verify a claim), it must live under `~/data`, never in the repo root, the repo parent, or anywhere outside `~/data`. Derive the workspace by sourcing the shared contract helper:
 
 ```bash
 REPO_ROOT="$(git rev-parse --show-toplevel)"
@@ -104,9 +115,9 @@ plan_critic_bootstrap "$ISSUE" "critic-a" || exit 1  # or critic-b, critic-c
 mkdir -p "$CRITIC_WORKTREE"
 ```
 
-Include this bootstrap verbatim in each critic's prompt so the sub-agent knows where to place any checkout or build output. The bootstrap is self-seeding: if the parent runtime pre-sets `WORKTREE_BASE` or `CARGO_TARGET_DIR`, the critic respects those only if they resolve under the real `~/data` AND under the expected session/issue prefix (`~/data/$SESSION_ID/plan-$ISSUE/...`); otherwise the bootstrap rejects the value and exits non-zero — the `|| exit 1` guard ensures no subsequent commands run with stale env vars. Hostile overrides (paths outside `~/data`, traversal like `~/data/../escape`, HOME-poisoned paths, or cross-session shared directories) are rejected before any `mkdir`, `git clone`, or cargo command runs.
+Use this bootstrap before any lens shell-out so you know where to place any checkout or build output. The bootstrap is self-seeding: if the runtime pre-sets `WORKTREE_BASE` or `CARGO_TARGET_DIR`, it respects those only if they resolve under the real `~/data` AND under the expected session/issue prefix (`~/data/$SESSION_ID/plan-$ISSUE/...`); otherwise the bootstrap rejects the value and exits non-zero — the `|| exit 1` guard ensures no subsequent commands run with stale env vars. Hostile overrides (paths outside `~/data`, traversal like `~/data/../escape`, HOME-poisoned paths, or cross-session shared directories) are rejected before any `mkdir`, `git clone`, or cargo command runs.
 
-**Forbidden scratch patterns (issue #2843 — hard requirement).** Every critic prompt must bind the sub-agent to `$CRITIC_WORKTREE` and explicitly forbid the observed disk-leak patterns — not in the repo tree, not as a `<repo>-pr<N>` sibling, not under `/tmp`:
+**Forbidden scratch patterns (issue #2843 — hard requirement).** Every lens shell-out is bound to `$CRITIC_WORKTREE` and must explicitly avoid the observed disk-leak patterns — not in the repo tree, not as a `<repo>-pr<N>` sibling, not under `/tmp`:
 
 - `.review-data/`
 - `.review-worktrees/`
@@ -115,9 +126,9 @@ Include this bootstrap verbatim in each critic's prompt so the sub-agent knows w
 - `.opencode/worktrees/`
 - any path under `/tmp`
 
-These are the exact out-of-`~/data` scratch dirs that prior pipeline runs leaked and that repeatedly filled the root FS. A critic that needs a checkout uses `$CRITIC_WORKTREE` and nothing else.
+These are the exact out-of-`~/data` scratch dirs that prior pipeline runs leaked and that repeatedly filled the root FS. A lens that needs a checkout uses `$CRITIC_WORKTREE` and nothing else.
 
-Launch three `general-purpose` sub-agents via the **Agent/Task tool** in a single message (so they run in parallel — do not dispatch them one at a time). Each is spawned with `model: opus` and `run_in_background: false`. Three distinct lenses (correctness / parity / scope) are the primary defense against missed bugs. Each gets the issue number, the plan-draft comment ID, and a focused brief:
+Run three lens passes in sequence (correctness / parity / scope), each as its own delimited pass per the multi-lens discipline above. Three distinct lenses are the primary defense against missed bugs. For each pass, frame yourself with that lens's brief, evaluate against the issue number and the plan-draft comment, and **post that lens's verdict as its own separate comment before moving to the next lens**:
 
 ### Critic A — Correctness
 
@@ -195,14 +206,16 @@ If all three converged in round 1 (no `REVISE-MAJOR`) → skip to Step 6 (post C
 
 If any critic returned `REVISE-MAJOR`, do **not** immediately revise. First subject each REVISE-MAJOR concern to an independent adversarial refute pass — this replaces the cross-model diversity the pipeline used to get from a second model, and directly attacks the false-positive concerns that otherwise cost a wasted round.
 
-Enumerate every distinct `REVISE-MAJOR` concern across the three critic comments (one concern = one bullet from a critic's "Key concerns" / details block). For each such concern, spawn an independent `general-purpose` **skeptic** sub-agent via the Agent/Task tool, all in a **single message** so they run in parallel, each with `model: opus` and `run_in_background: false`. The skeptic does NOT inherit the critic's framing — its job is to *refute* the concern:
+Enumerate every distinct `REVISE-MAJOR` concern across the three critic comments (one concern = one bullet from a critic's "Key concerns" / details block). For each such concern, run an independent **refute pass** in-agent — one delimited pass per concern. The refute pass does NOT inherit the critic's framing: switch stance and **argue the opposing case as if you must prove a different reviewer wrong**. Its job is to *refute* the concern. Apply the same multi-lens discipline (Step 3): distinct framing per refute, explicit reset from the critic pass that raised it, and **post each refute as its own separate comment**. Use this framing for each:
 
 > A critic raised the following REVISE-MAJOR concern about the plan on issue
 > #$ISSUE (plan-draft comment <comment-id>):
 >
 > <verbatim concern bullet + the critic lens it came from>
 >
-> Your job is to REFUTE this concern. Argue, with evidence, that it is one of:
+> Switch stance and REFUTE this concern as a genuine adversary — argue the
+> opposing case as if you must prove a different reviewer wrong. Argue, with
+> evidence, that it is one of:
 > (a) **wrong** — the plan already handles this, or the critic misread the
 > plan / the code; (b) **already-satisfied on current `origin/main`** — the
 > behavior the critic wants already exists (read the relevant source to
@@ -215,14 +228,14 @@ Enumerate every distinct `REVISE-MAJOR` concern across the three critic comments
 > if you genuinely cannot refute it on any of the three grounds, say so
 > explicitly. The concern only **stands** if it cannot be refuted.
 >
-> Post your finding as a comment headed `## 🥊 Refute — <critic lens>: <short
+> Post the refute as its own comment headed `## 🥊 Refute — <critic lens>: <short
 > concern summary>` with a `**Outcome:** REFUTED | STANDS` line, followed by a
 > 2–4 bullet justification (cite files/functions for ground (b)).
 
-Wait for all skeptics to post. Then:
+After every refute pass has posted, read the outcomes. Then:
 
-- A concern is **dropped** if its skeptic returned `REFUTED`. Record it in the eventual plan comment under a "Refuted concerns" note as `refuted: <reason>` so the audit trail shows why a flagged concern did not drive a revision.
-- A concern **stands** if its skeptic returned `STANDS` (or failed to post / errored after one retry — an un-refuted concern stands, fail-safe toward the critic).
+- A concern is **dropped** if its refute pass returned `REFUTED`. Record it in the eventual plan comment under a "Refuted concerns" note as `refuted: <reason>` so the audit trail shows why a flagged concern did not drive a revision.
+- A concern **stands** if its refute pass returned `STANDS` (or you could not produce an outcome after one retry — an un-refuted concern stands, fail-safe toward the critic).
 
 **Decision after the refute pass:**
 
@@ -267,7 +280,7 @@ Expand the plan to address the root cause. If expansion would now make the plan 
 **Followup sub-issues filed:** #N1, #N2 (if scope was narrowed)
 ```
 
-Spawn the same three critics again via the Agent/Task tool in a single message (parallel, `model: opus`, `run_in_background: false`), with the same briefs but with "Round 2" in the comment heading. Wait for verdicts. Then run the **same Step 4 adversarial refute pass** on any round-2 `REVISE-MAJOR` concern (parallel `opus` skeptics, one per concern); refuted concerns are dropped and only surviving concerns count below.
+Run the same three critic lenses again as in-agent passes (per the Step 3 multi-lens discipline), with the same briefs but with "Round 2" in the comment heading, posting each lens as its own separate comment. Then run the **same Step 4 adversarial refute pass** on any round-2 `REVISE-MAJOR` concern (one in-agent refute pass per concern); refuted concerns are dropped and only surviving concerns count below.
 
 **Round 2 outcomes (after the refute pass):**
 
@@ -397,7 +410,7 @@ gh issue edit $ISSUE --repo stellar-experimental/henyey --remove-assignee @me
 ## What you do NOT do
 
 - **Do not** write or commit code. `/do` does that.
-- **Do not** run sequential critic rounds — the three critics (and the per-concern refute skeptics) are each launched in a single Agent/Task-tool message so they run in parallel.
+- **Do not** collapse the three lenses into one block — run them as three separate in-agent passes and post each as its own comment (the parsers key on the per-critic header). The per-concern refute passes are likewise each their own delimited pass with their own comment. (You do not run "rounds" of a single lens; each lens is evaluated once per plan round, with an explicit reset between lenses.)
 - **Do not** revise for a REVISE-MAJOR concern before running the refute pass. Only concerns that survive refutation drive a round-2 revision; refuted concerns are dropped (recorded as `refuted: <reason>` in the plan comment).
 - **Do not** exceed 2 rounds. If a round-2 REVISE-MAJOR concern survives refutation, force-converge (Step 5-bis) — file follow-ups for the surviving concerns and ship the round-2 plan to `ready-for-doing`. Do NOT spin a third round.
 - **Do not** "argue back" with a critic by re-opening the same plan. If you genuinely disagree, post your reasoning in the revised plan and let the round-2 critic re-evaluate. If round 2 still has a surviving REVISE-MAJOR, force-converge with the disagreement preserved as follow-up issues — don't block the pipeline.
@@ -405,8 +418,8 @@ gh issue edit $ISSUE --repo stellar-experimental/henyey --remove-assignee @me
 
 ## Failure handling
 
-- **Critic agent failure:** if one of the three critics fails to post (timed out, errored), retry that critic once. If still failing, treat its verdict as REVISE-MAJOR and proceed to the refute pass / round 2; if round 2 also has a critic failure, `blocked` with that reason.
-- **Skeptic agent failure:** if a refute skeptic fails to post after one retry, the concern it was evaluating **stands** (fail-safe toward the critic) — it drives a revision as if un-refuted.
+- **Critic lens failure:** if one of the three lens passes fails to produce its verdict comment (errored, interrupted), retry that lens pass once. If still failing, treat its verdict as REVISE-MAJOR and proceed to the refute pass / round 2; if round 2 also has a lens failure, `blocked` with that reason.
+- **Refute pass failure:** if a refute pass fails to produce its outcome comment after one retry, the concern it was evaluating **stands** (fail-safe toward the critic) — it drives a revision as if un-refuted.
 - **Triage Report missing:** route the issue back to `backlog` with a comment explaining; this is a `/triage` bug, not ours to fix.
 - **GH API failure:** retry once after 5 seconds; if still failing, leave the issue assigned and exit non-zero.
 
