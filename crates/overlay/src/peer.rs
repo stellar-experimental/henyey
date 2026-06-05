@@ -975,12 +975,6 @@ impl Peer {
 
     /// Request peers from this peer.
     /// Note: GetPeers was removed in Protocol 24. This is a no-op.
-    /// Send flow control message.
-    pub async fn send_more(&mut self, num_messages: u32) -> Result<()> {
-        let message = StellarMessage::SendMore(stellar_xdr::curr::SendMore { num_messages });
-        self.send(message).await
-    }
-
     /// Send extended flow control message with byte limit.
     pub async fn send_more_extended(&mut self, num_messages: u32, num_bytes: u32) -> Result<()> {
         let message = StellarMessage::SendMoreExtended(stellar_xdr::curr::SendMoreExtended {
