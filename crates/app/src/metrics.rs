@@ -782,7 +782,7 @@ metric_catalog! {
             => "Recovery stalled ticks by reason",
             "reason", ["backoff_active", "forcing_catchup_not_behind", "forcing_catchup_behind",
                        "at_tip_no_scp_hard_reset", "archive_behind_peer_ahead_hard_reset",
-                       "hard_reset_suppressed_archive_behind"];
+                       "hard_reset_suppressed_archive_behind", "near_tip_peer_scp_recovery"];
     }
 
     histograms {

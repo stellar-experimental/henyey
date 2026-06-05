@@ -1791,27 +1791,71 @@ impl App {
                 let archive_is_confirmed_behind =
                     self.archive_recovery_snapshot().await.is_confirmed_behind();
                 let peer_gap = self.effective_peer_gap(current_ledger);
-                // Near-tip band (#3181): peers verified ahead by less than one
-                // checkpoint interval. Combined with the gate's existing
-                // `peer_gap >= PEER_AHEAD_ESCALATION_THRESHOLD` precondition this
-                // yields the same predicate as the StuckSignals build site
-                // (PEER_AHEAD_ESCALATION_THRESHOLD <= peer_gap <
-                // checkpoint_frequency()). In this band, with the archive
-                // confirmed behind, archive catchup is structurally
-                // impossible-yet-imminent, so lower the escalation attempt
-                // threshold (~1–2 ticks / ~10–20s) instead of the default ~11
-                // ticks / ~120s. The far-behind (#1862) path keeps the
-                // unchanged threshold. Read checkpoint_frequency() live (64
+                // Near-tip band (#3181/#3197): peers verified ahead by less
+                // than one checkpoint interval. Combined with the gate's
+                // existing `peer_gap >= PEER_AHEAD_ESCALATION_THRESHOLD`
+                // precondition this is the same predicate as the StuckSignals
+                // build site (PEER_AHEAD_ESCALATION_THRESHOLD <= peer_gap <
+                // checkpoint_frequency()). Read checkpoint_frequency() live (64
                 // default / 8 accelerated) for parity.
                 let near_tip = peer_gap < checkpoint_frequency() as u64;
-                let escalation_attempts = if near_tip && archive_is_confirmed_behind {
-                    RECOVERY_HARD_RESET_ESCALATION_ATTEMPTS_NEAR_TIP
-                } else {
-                    RECOVERY_HARD_RESET_ESCALATION_ATTEMPTS
-                };
+
+                // Recovery-ROUTING fix (#3197, PRIMARY — this is the dominant
+                // production path because escalate_recovery_to_catchup() pins
+                // recovery attempts at RECOVERY_ESCALATION_CATCHUP on every
+                // far-ahead EXTERNALIZE, short-circuiting out_of_sync_recovery
+                // into this function before it reaches its own
+                // broadcast_recovery_scp_state tail). In the near-tip /
+                // archive-confirmed-behind band, archive catchup is
+                // structurally doomed: the next checkpoint is unpublished, so
+                // the ProbeAhead fetch in force_post_catchup_hard_reset bails
+                // on every fire (#3187 escalated the TIMING but routed here).
+                // stellar-core in this regime does NO archive interaction — it
+                // re-broadcasts its own latest SCP from lcl+1 and pulls SCP
+                // state from 2 peers (HerderImpl::outOfSyncRecovery,
+                // HerderImpl.cpp:521-561), then applies the buffered ledgers
+                // once the gap is back-filled (tryApplySyncingLedgers,
+                // LedgerApplyManagerImpl.cpp:156-160). So instead of the doomed
+                // ProbeAhead HardReset, run the EXISTING full outOfSyncRecovery
+                // analog (broadcast_recovery_scp_state — re-broadcast + bounded
+                // peer pull) every recovery tick and return None, letting the
+                // buffered-apply path advance. The genuine 120s wall-clock
+                // stall backstop (#2789) still escalates via the decide-fn
+                // (ArchiveBehindStallWallClock), so peer-SCP failure cannot
+                // wedge the node forever. The far-behind (#1862) band keeps the
+                // unchanged ProbeAhead/archive escalation below.
+                if near_tip && archive_is_confirmed_behind {
+                    tracing::info!(
+                        current_ledger,
+                        peer_max_verified = self.max_verified_scp_slot.load(Ordering::Relaxed),
+                        peer_gap,
+                        attempts,
+                        next_checkpoint = next_cp,
+                        "Near-tip recovery: archive confirmed behind unpublished checkpoint \
+                         — routing to peer-SCP back-fill (no archive catchup), mirroring \
+                         stellar-core outOfSyncRecovery"
+                    );
+                    crate::metrics::RECOVERY_STALLED_TICK_TOTAL
+                        .increment("near_tip_peer_scp_recovery", 1);
+                    // Full outOfSyncRecovery analog: re-broadcast own latest
+                    // SCP from lcl+1 + bounded peer SCP pull (#3197 parity gap:
+                    // the inline fallback below only does the request half).
+                    self.broadcast_recovery_scp_state(current_ledger).await;
+                    // Also retry exhausted tx_set fetches so the small
+                    // contiguous gap can be back-filled from peers that
+                    // re-acquired the tx_sets.
+                    self.retry_exhausted_tx_sets().await;
+                    // Do NOT re-arm sync_recovery_pending; the recovery timer
+                    // drives the next tick (avoids a 1s spin loop).
+                    return None;
+                }
+
+                // Far-behind (#1862) path: not near-tip (the near-tip band
+                // returned early above into peer-SCP recovery). Keep the
+                // unchanged 11-tick archive HardReset/ProbeAhead escalation.
                 if archive_is_confirmed_behind
                     && peer_gap >= PEER_AHEAD_ESCALATION_THRESHOLD
-                    && attempts >= escalation_attempts
+                    && attempts >= RECOVERY_HARD_RESET_ESCALATION_ATTEMPTS
                     && !self.is_hard_reset_on_cooldown(peer_gap)
                 {
                     use super::types::HardResetReason;

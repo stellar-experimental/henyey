@@ -1321,36 +1321,50 @@ impl App {
             // force_post_catchup_hard_reset() blocks it, causing
             // maybe_start_buffered_catchup() to return None on every tick.
             if s.schedule_due {
-                // Near-tip escalation (#3181): when peers are verified ahead
-                // by less than one checkpoint interval, archive catchup is
-                // structurally impossible-yet-imminent (the unblocking
-                // checkpoint publishes within one interval). Escalate to the
-                // state-changing HardReset immediately rather than spinning on
-                // per-tick archive probes for the full wall-clock stall. The
-                // far-behind (#1862) path keeps its unchanged thresholds.
+                // Recovery-ROUTING fix (#3197): the near-tip band
+                // (PEER_AHEAD_ESCALATION_THRESHOLD <= peer_gap <
+                // checkpoint_frequency()) must route to peer-SCP recovery
+                // (AttemptRecovery), NOT to an archive HardReset. #3187 made
+                // near-tip escalate EARLY, but the escalation terminated in a
+                // ProbeAhead archive fetch that is structurally doomed near
+                // tip (the next checkpoint is unpublished — same root as
+                // #1862), so it never shortened the outage and the 60s
+                // cooldown then gated the only useful action. stellar-core in
+                // this regime does pure peer-SCP back-fill + buffered-apply
+                // (HerderImpl::outOfSyncRecovery + tryApplySyncingLedgers) and
+                // never touches the archive. So `near_tip` is NO LONGER a
+                // HardReset trigger here. The near-tip PREDICATE and its
+                // constants are preserved (only the consequent action
+                // changes): see the `trigger_recovery_catchup` near-tip arm,
+                // which runs the full `broadcast_recovery_scp_state` analog.
+                //
+                // The genuine escalations still hard-reset: recovery
+                // exhaustion (#1831), tx_set exhaustion, and — critically —
+                // the 120s wall-clock stall backstop (#2789 anti-wedge), so a
+                // peer-SCP back-fill that never resyncs cannot wedge the node
+                // forever. The far-behind (#1862) archive-catchup path is in a
+                // disjoint band (peer_gap >= checkpoint_frequency() →
+                // near_tip == false) and is untouched.
                 let would_hard_reset = recovery_exhausted
                     || s.tx_set_exhausted
-                    || s.stuck_duration >= HARD_RESET_STALL_SECS
-                    || s.near_tip;
+                    || s.stuck_duration >= HARD_RESET_STALL_SECS;
 
                 if would_hard_reset && s.hard_reset_cooldown_active {
                     // Cooldown active — fall back to peer-SCP recovery
                     // while waiting for the archive to publish. The first
                     // HardReset already cleared stale state; repeating it
-                    // before the cooldown expires is futile. Preserves #1843
-                    // (and applies equally to the near-tip path).
+                    // before the cooldown expires is futile. Preserves #1843.
                     ConsensusStuckAction::AttemptRecovery
                 } else if recovery_exhausted {
                     ConsensusStuckAction::HardReset(HardResetReason::ArchiveBehindRecoveryExhausted)
                 } else if s.tx_set_exhausted {
                     ConsensusStuckAction::HardReset(HardResetReason::ArchiveBehindTxSetExhausted)
-                } else if s.stuck_duration >= HARD_RESET_STALL_SECS || s.near_tip {
-                    // Either the wall-clock stall threshold was reached, or the
-                    // node is in the near-tip band (#3181) — both escalate via
-                    // the same ArchiveBehindStallWallClock reset, which spawns
-                    // the peer-SCP ProbeAhead fetch + request_scp_state.
+                } else if s.stuck_duration >= HARD_RESET_STALL_SECS {
+                    // The genuine 120s wall-clock stall backstop (#2789).
                     ConsensusStuckAction::HardReset(HardResetReason::ArchiveBehindStallWallClock)
                 } else {
+                    // Near-tip (or any non-escalating archive-behind) stall →
+                    // peer-SCP recovery (#3197).
                     ConsensusStuckAction::AttemptRecovery
                 }
             } else {
@@ -3116,22 +3130,28 @@ mod tests {
     }
 
     // ================================================================
-    // #3181: near-tip early escalation (archive behind, peers ahead by
-    // < one checkpoint interval). The escalation must fire on the first
-    // due tick — NOT after the full wall-clock stall — without waiting on
-    // recovery exhaustion, tx_set exhaustion, or stuck_duration. The 60s
-    // cooldown floor (#1843) and the far-behind (#1862) path are preserved.
+    // #3181/#3197: near-tip ROUTING (archive behind, peers ahead by
+    // < one checkpoint interval). #3187 made near-tip escalate EARLY to a
+    // HardReset, but the escalation routed to a doomed archive ProbeAhead.
+    // #3197 corrects the routing: the near-tip band now goes to peer-SCP
+    // recovery (AttemptRecovery), mirroring stellar-core. The #3187
+    // assertions below are intentionally FLIPPED from HardReset to
+    // AttemptRecovery — they encode the now-corrected behavior. The 120s
+    // wall-clock backstop (#2789), the cooldown floor (#1843), and the
+    // far-behind (#1862) path are preserved.
     // ================================================================
 
     #[test]
     fn test_decide_near_tip_archive_behind_escalates_early() {
-        // archive_behind + near_tip + schedule_due, but NONE of the legacy
-        // hard-reset gates met (attempts=0, no tx_set exhaustion,
-        // stuck_duration=0) and no cooldown → HardReset immediately.
+        // archive_behind + near_tip + schedule_due, but NONE of the genuine
+        // escalation gates met (attempts=0, no tx_set exhaustion,
+        // stuck_duration=0) and no cooldown.
         //
-        // On origin/main (no `near_tip` field) these signals fall through
-        // every `would_hard_reset` gate and return AttemptRecovery; the
-        // near-tip branch makes the state-changing escalation fire early.
+        // #3187 returned HardReset here (doomed archive ProbeAhead). #3197
+        // corrects the routing: near-tip must go to peer-SCP recovery
+        // (AttemptRecovery), since the archive cannot supply the next,
+        // unpublished checkpoint near tip — stellar-core uses pure peer-SCP +
+        // buffered-apply in this regime. Assertion FLIPPED to AttemptRecovery.
         let action = App::decide_consensus_stuck_action(StuckSignals {
             catchup_in_progress: false,
             archive_behind: true,
@@ -3142,27 +3162,29 @@ mod tests {
             hard_reset_cooldown_active: false,
             near_tip: true,
         });
-        assert!(
-            matches!(
-                action,
-                ConsensusStuckAction::HardReset(HardResetReason::ArchiveBehindStallWallClock)
-            ),
-            "near-tip + archive-behind must escalate to HardReset on the first \
-             due tick, not after the full wall-clock stall (#3181); got {action:?}"
+        assert_eq!(
+            action,
+            ConsensusStuckAction::AttemptRecovery,
+            "near-tip + archive-behind must route to peer-SCP recovery, NOT a \
+             doomed archive HardReset/ProbeAhead (#3197 corrects #3187's \
+             routing); got {action:?}"
         );
     }
 
     #[test]
     fn test_decide_near_tip_respects_cooldown() {
-        // Same near-tip signals, but the HardReset cooldown is active.
-        // Must fall back to AttemptRecovery — the early-escalation path is
-        // still cooldown-gated, preserving #1843 (no reset storms).
+        // A near-tip stall that WOULD hard-reset (120s wall-clock stall) but
+        // with the HardReset cooldown active must fall back to AttemptRecovery,
+        // preserving #1843 (no reset storms). (Pre-#3197 this used a near-tip
+        // early-escalation; post-#3197 the would-hard-reset comes from the
+        // genuine 120s stall, but the cooldown-fallback semantics are
+        // unchanged.)
         let action = App::decide_consensus_stuck_action(StuckSignals {
             catchup_in_progress: false,
             archive_behind: true,
             tx_set_exhausted: false,
             schedule_due: true,
-            stuck_duration: 0,
+            stuck_duration: HARD_RESET_STALL_SECS,
             recovery_attempts: 0,
             hard_reset_cooldown_active: true,
             near_tip: true,
@@ -3170,7 +3192,8 @@ mod tests {
         assert_eq!(
             action,
             ConsensusStuckAction::AttemptRecovery,
-            "near-tip escalation must respect the 60s HardReset cooldown (#1843)"
+            "a would-hard-reset near-tip stall must respect the 60s HardReset \
+             cooldown (#1843)"
         );
     }
 

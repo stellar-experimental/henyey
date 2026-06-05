@@ -765,14 +765,22 @@ pub(super) struct StuckSignals {
     /// `PEER_AHEAD_ESCALATION_THRESHOLD <= peer_gap < checkpoint_frequency()`.
     /// In this band, with the archive confirmed behind, the next checkpoint
     /// that unblocks recovery publishes within one interval, so archive
-    /// catchup is structurally impossible-yet-imminent. When set (and the
-    /// HardReset cooldown is inactive), `decide_consensus_stuck_action`
-    /// escalates to `HardReset(ArchiveBehindStallWallClock)` immediately
-    /// without waiting for the full wall-clock stall, eliminating the
-    /// ~4.5-min archive-probe spin. False whenever there is no peer-ahead
-    /// evidence (`peer_gap < PEER_AHEAD_ESCALATION_THRESHOLD`) or the node is
-    /// genuinely far behind (`peer_gap >= checkpoint_frequency()`, the #1862
-    /// path, which keeps the unchanged escalation threshold).
+    /// catchup is structurally impossible-yet-imminent.
+    ///
+    /// ROUTING (#3197): `decide_consensus_stuck_action` no longer branches on
+    /// this field — the near-tip / archive-behind band is routed to peer-SCP
+    /// recovery (`AttemptRecovery` here, and the full
+    /// `broadcast_recovery_scp_state` analog in
+    /// `trigger_recovery_catchup`), mirroring stellar-core's
+    /// `HerderImpl::outOfSyncRecovery`, instead of the doomed archive
+    /// HardReset/ProbeAhead that #3187 used. The detected near-tip state is
+    /// retained in the snapshot for diagnostics and to keep the band-detection
+    /// predicate (computed at the build site) a single source of truth with
+    /// the `consensus.rs` escalation gate (#1831). `#[allow(dead_code)]`
+    /// because the field is now computed-and-recorded but not action-branched
+    /// in this pure function; the load-bearing near-tip routing is in
+    /// `trigger_recovery_catchup`.
+    #[allow(dead_code)]
     pub near_tip: bool,
 }
 
