@@ -1314,21 +1314,34 @@ impl App {
             // force_post_catchup_hard_reset() blocks it, causing
             // maybe_start_buffered_catchup() to return None on every tick.
             if s.schedule_due {
+                // Near-tip escalation (#3181): when peers are verified ahead
+                // by less than one checkpoint interval, archive catchup is
+                // structurally impossible-yet-imminent (the unblocking
+                // checkpoint publishes within one interval). Escalate to the
+                // state-changing HardReset immediately rather than spinning on
+                // per-tick archive probes for the full wall-clock stall. The
+                // far-behind (#1862) path keeps its unchanged thresholds.
                 let would_hard_reset = recovery_exhausted
                     || s.tx_set_exhausted
-                    || s.stuck_duration >= HARD_RESET_STALL_SECS;
+                    || s.stuck_duration >= HARD_RESET_STALL_SECS
+                    || s.near_tip;
 
                 if would_hard_reset && s.hard_reset_cooldown_active {
                     // Cooldown active — fall back to peer-SCP recovery
                     // while waiting for the archive to publish. The first
                     // HardReset already cleared stale state; repeating it
-                    // before the cooldown expires is futile.
+                    // before the cooldown expires is futile. Preserves #1843
+                    // (and applies equally to the near-tip path).
                     ConsensusStuckAction::AttemptRecovery
                 } else if recovery_exhausted {
                     ConsensusStuckAction::HardReset(HardResetReason::ArchiveBehindRecoveryExhausted)
                 } else if s.tx_set_exhausted {
                     ConsensusStuckAction::HardReset(HardResetReason::ArchiveBehindTxSetExhausted)
                 } else if s.stuck_duration >= HARD_RESET_STALL_SECS {
+                    // Either the wall-clock stall threshold was reached, or the
+                    // node is in the near-tip band (#3181) — both escalate via
+                    // the same ArchiveBehindStallWallClock reset, which spawns
+                    // the peer-SCP ProbeAhead fetch + request_scp_state.
                     ConsensusStuckAction::HardReset(HardResetReason::ArchiveBehindStallWallClock)
                 } else {
                     ConsensusStuckAction::AttemptRecovery
@@ -1985,6 +1998,20 @@ impl App {
                     let current_gap = latest_ext.saturating_sub(current_ledger as u64);
                     let hard_reset_cooldown_active = self.is_hard_reset_on_cooldown(current_gap);
 
+                    // Near-tip predicate (#3181): peers verified ahead by at
+                    // least PEER_AHEAD_ESCALATION_THRESHOLD but less than one
+                    // checkpoint interval. Uses the verified peer-gap (not the
+                    // raw latest_externalized), matching the consensus.rs
+                    // escalation gate so both paths agree (single source of
+                    // truth, #1831). False when there is no peer-ahead evidence
+                    // (gap < threshold) or the node is genuinely far behind
+                    // (gap >= checkpoint_frequency() — the #1862 path). Read
+                    // checkpoint_frequency() live for parity (64 default / 8
+                    // accelerated).
+                    let peer_gap = self.effective_peer_gap(current_ledger);
+                    let near_tip = peer_gap >= PEER_AHEAD_ESCALATION_THRESHOLD
+                        && peer_gap < checkpoint_frequency() as u64;
+
                     let signals = StuckSignals {
                         catchup_in_progress: self.catchup_in_progress.load(Ordering::SeqCst),
                         archive_behind,
@@ -1993,6 +2020,7 @@ impl App {
                         stuck_duration,
                         recovery_attempts: effective_attempts,
                         hard_reset_cooldown_active,
+                        near_tip,
                     };
 
                     let decision = Self::decide_consensus_stuck_action(signals);
@@ -2906,6 +2934,7 @@ mod tests {
             stuck_duration: 0,
             recovery_attempts,
             hard_reset_cooldown_active: false,
+            near_tip: false,
         })
     }
 
@@ -3001,6 +3030,7 @@ mod tests {
             stuck_duration: 30,
             recovery_attempts: 0,
             hard_reset_cooldown_active: false,
+            near_tip: false,
         });
         assert!(matches!(
             action,
@@ -3019,6 +3049,7 @@ mod tests {
             stuck_duration: HARD_RESET_STALL_SECS,
             recovery_attempts: 0,
             hard_reset_cooldown_active: false,
+            near_tip: false,
         });
         assert!(matches!(
             action,
@@ -3037,6 +3068,7 @@ mod tests {
             stuck_duration: 60,
             recovery_attempts: 0,
             hard_reset_cooldown_active: false,
+            near_tip: false,
         });
         assert_eq!(action, ConsensusStuckAction::AttemptRecovery);
     }
@@ -3052,6 +3084,7 @@ mod tests {
             stuck_duration: HARD_RESET_STALL_SECS + 100,
             recovery_attempts: MAX,
             hard_reset_cooldown_active: false,
+            near_tip: false,
         });
         assert_eq!(action, ConsensusStuckAction::TriggerCatchup);
     }
@@ -3067,11 +3100,133 @@ mod tests {
             stuck_duration: 0,
             recovery_attempts: MAX,
             hard_reset_cooldown_active: false,
+            near_tip: false,
         });
         assert!(matches!(
             action,
             ConsensusStuckAction::HardReset(HardResetReason::ArchiveBehindRecoveryExhausted)
         ));
+    }
+
+    // ================================================================
+    // #3181: near-tip early escalation (archive behind, peers ahead by
+    // < one checkpoint interval). The escalation must fire on the first
+    // due tick — NOT after the full wall-clock stall — without waiting on
+    // recovery exhaustion, tx_set exhaustion, or stuck_duration. The 60s
+    // cooldown floor (#1843) and the far-behind (#1862) path are preserved.
+    // ================================================================
+
+    #[test]
+    fn test_decide_near_tip_archive_behind_escalates_early() {
+        // archive_behind + near_tip + schedule_due, but NONE of the legacy
+        // hard-reset gates met (attempts=0, no tx_set exhaustion,
+        // stuck_duration=0) and no cooldown → HardReset immediately.
+        //
+        // On origin/main (no `near_tip` field) these signals fall through
+        // every `would_hard_reset` gate and return AttemptRecovery; the
+        // near-tip branch makes the state-changing escalation fire early.
+        let action = App::decide_consensus_stuck_action(StuckSignals {
+            catchup_in_progress: false,
+            archive_behind: true,
+            tx_set_exhausted: false,
+            schedule_due: true,
+            stuck_duration: 0,
+            recovery_attempts: 0,
+            hard_reset_cooldown_active: false,
+            near_tip: true,
+        });
+        assert!(
+            matches!(
+                action,
+                ConsensusStuckAction::HardReset(HardResetReason::ArchiveBehindStallWallClock)
+            ),
+            "near-tip + archive-behind must escalate to HardReset on the first \
+             due tick, not after the full wall-clock stall (#3181); got {action:?}"
+        );
+    }
+
+    #[test]
+    fn test_decide_near_tip_respects_cooldown() {
+        // Same near-tip signals, but the HardReset cooldown is active.
+        // Must fall back to AttemptRecovery — the early-escalation path is
+        // still cooldown-gated, preserving #1843 (no reset storms).
+        let action = App::decide_consensus_stuck_action(StuckSignals {
+            catchup_in_progress: false,
+            archive_behind: true,
+            tx_set_exhausted: false,
+            schedule_due: true,
+            stuck_duration: 0,
+            recovery_attempts: 0,
+            hard_reset_cooldown_active: true,
+            near_tip: true,
+        });
+        assert_eq!(
+            action,
+            ConsensusStuckAction::AttemptRecovery,
+            "near-tip escalation must respect the 60s HardReset cooldown (#1843)"
+        );
+    }
+
+    #[test]
+    fn test_decide_not_near_tip_archive_behind_unchanged() {
+        // Far-behind case (#1862): near_tip is false (peer_gap >=
+        // checkpoint_frequency()), and none of the legacy gates are met
+        // (attempts < MAX, no tx_set exhaustion, stuck_duration short).
+        // The decision must remain AttemptRecovery — NOT an early HardReset —
+        // proving the far-behind archive-catchup path is untouched.
+        let action = App::decide_consensus_stuck_action(StuckSignals {
+            catchup_in_progress: false,
+            archive_behind: true,
+            tx_set_exhausted: false,
+            schedule_due: true,
+            stuck_duration: 0,
+            recovery_attempts: 0,
+            hard_reset_cooldown_active: false,
+            near_tip: false,
+        });
+        assert_eq!(
+            action,
+            ConsensusStuckAction::AttemptRecovery,
+            "not-near-tip (far-behind #1862) must keep the unchanged behavior: \
+             AttemptRecovery until the legacy hard-reset gates fire"
+        );
+    }
+
+    #[test]
+    fn test_near_tip_predicate_boundary() {
+        // The near-tip predicate is true for
+        // PEER_AHEAD_ESCALATION_THRESHOLD <= peer_gap < checkpoint_frequency(),
+        // and false at/below the lower threshold and at/above the checkpoint
+        // interval. This mirrors both the StuckSignals build site and the
+        // consensus.rs escalation gate (single source of truth, #1831).
+        let freq = checkpoint_frequency() as u64;
+        let near_tip =
+            |peer_gap: u64| peer_gap >= PEER_AHEAD_ESCALATION_THRESHOLD && peer_gap < freq;
+
+        // Below the lower threshold: no peer-ahead evidence → not near-tip.
+        assert!(!near_tip(0), "peer_gap=0 must not be near-tip");
+        assert!(
+            !near_tip(PEER_AHEAD_ESCALATION_THRESHOLD - 1),
+            "just below PEER_AHEAD_ESCALATION_THRESHOLD must not be near-tip"
+        );
+        // At the lower threshold and within the band: near-tip.
+        assert!(
+            near_tip(PEER_AHEAD_ESCALATION_THRESHOLD),
+            "peer_gap == PEER_AHEAD_ESCALATION_THRESHOLD must be near-tip"
+        );
+        assert!(
+            near_tip(freq - 1),
+            "one below checkpoint interval is near-tip"
+        );
+        // At/above the checkpoint interval: far-behind (#1862) → not near-tip.
+        assert!(
+            !near_tip(freq),
+            "peer_gap == checkpoint_frequency() is far-behind"
+        );
+        assert!(
+            !near_tip(freq + 100),
+            "well past checkpoint interval is far-behind"
+        );
     }
 
     #[test]
@@ -3085,6 +3240,7 @@ mod tests {
             stuck_duration: HARD_RESET_STALL_SECS + 100,
             recovery_attempts: MAX,
             hard_reset_cooldown_active: false,
+            near_tip: false,
         });
         assert_eq!(action, ConsensusStuckAction::Wait);
     }
@@ -3099,6 +3255,7 @@ mod tests {
             stuck_duration: HARD_RESET_STALL_SECS + 100,
             recovery_attempts: MAX,
             hard_reset_cooldown_active: false,
+            near_tip: false,
         });
         assert_eq!(action, ConsensusStuckAction::AttemptRecovery);
     }
@@ -3120,6 +3277,7 @@ mod tests {
             stuck_duration: 130,
             recovery_attempts: 7, // from atomic counter (> MAX_POST_CATCHUP_RECOVERY_ATTEMPTS)
             hard_reset_cooldown_active: false,
+            near_tip: false,
         });
         assert!(matches!(action, ConsensusStuckAction::HardReset(_)));
     }
@@ -3136,6 +3294,7 @@ mod tests {
             stuck_duration: HARD_RESET_STALL_SECS + 10,
             recovery_attempts: MAX,
             hard_reset_cooldown_active: false,
+            near_tip: false,
         });
         // recovery_exhausted wins because it's checked first.
         assert!(matches!(
@@ -3152,6 +3311,7 @@ mod tests {
             stuck_duration: HARD_RESET_STALL_SECS + 10,
             recovery_attempts: 0,
             hard_reset_cooldown_active: false,
+            near_tip: false,
         });
         // tx_set_exhausted wins over wall_clock.
         assert!(matches!(
@@ -3173,6 +3333,7 @@ mod tests {
                 stuck_duration: sd,
                 recovery_attempts: re,
                 hard_reset_cooldown_active: false,
+                near_tip: false,
             })
         };
 
@@ -4087,6 +4248,7 @@ mod tests {
             stuck_duration: 0,
             catchup_in_progress: false,
             hard_reset_cooldown_active: false,
+            near_tip: false,
         };
         let action = App::decide_consensus_stuck_action(signals_stuck_higher);
         // With recovery_attempts=8 (> MAX_RECOVERY_ATTEMPTS=6) and
@@ -4114,6 +4276,7 @@ mod tests {
             stuck_duration: 0,
             catchup_in_progress: false,
             hard_reset_cooldown_active: false,
+            near_tip: false,
         };
         let action = App::decide_consensus_stuck_action(signals_atomic_higher);
         assert!(
@@ -4142,6 +4305,7 @@ mod tests {
             stuck_duration: 0,
             recovery_attempts: MAX,
             hard_reset_cooldown_active: true,
+            near_tip: false,
         });
         assert_eq!(
             action,
@@ -4162,6 +4326,7 @@ mod tests {
             stuck_duration: 30,
             recovery_attempts: 0,
             hard_reset_cooldown_active: true,
+            near_tip: false,
         });
         assert_eq!(
             action,
@@ -4182,6 +4347,7 @@ mod tests {
             stuck_duration: HARD_RESET_STALL_SECS + 10,
             recovery_attempts: 0,
             hard_reset_cooldown_active: true,
+            near_tip: false,
         });
         assert_eq!(
             action,
@@ -4202,6 +4368,7 @@ mod tests {
             stuck_duration: 0,
             recovery_attempts: MAX,
             hard_reset_cooldown_active: false,
+            near_tip: false,
         });
         assert!(
             matches!(
@@ -4224,6 +4391,7 @@ mod tests {
             stuck_duration: HARD_RESET_STALL_SECS + 100,
             recovery_attempts: MAX,
             hard_reset_cooldown_active: true,
+            near_tip: false,
         });
         assert_eq!(
             action,
@@ -4244,6 +4412,7 @@ mod tests {
             stuck_duration: 30,
             recovery_attempts: 0,
             hard_reset_cooldown_active: true,
+            near_tip: false,
         });
         assert_eq!(action, ConsensusStuckAction::AttemptRecovery);
     }
@@ -5011,6 +5180,7 @@ mod tests {
             stuck_duration: HARD_RESET_STALL_SECS + 100,
             recovery_attempts: MAX,
             hard_reset_cooldown_active: false,
+            near_tip: false,
         };
 
         let action = App::decide_consensus_stuck_action(signals);
@@ -6054,6 +6224,7 @@ mod tests {
             stuck_duration: HARD_RESET_STALL_SECS + 100,
             recovery_attempts: MAX_POST_CATCHUP_RECOVERY_ATTEMPTS + 1,
             hard_reset_cooldown_active: true,
+            near_tip: false,
         };
 
         let action = App::decide_consensus_stuck_action(signals);

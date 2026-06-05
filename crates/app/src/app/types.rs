@@ -761,6 +761,19 @@ pub(super) struct StuckSignals {
     /// archive is behind — prevents the livelock described in #1843 where
     /// the decision keeps choosing HardReset but the cooldown blocks it.
     pub hard_reset_cooldown_active: bool,
+    /// When `true`, the node is in the near-tip stall band (issue #3181):
+    /// `PEER_AHEAD_ESCALATION_THRESHOLD <= peer_gap < checkpoint_frequency()`.
+    /// In this band, with the archive confirmed behind, the next checkpoint
+    /// that unblocks recovery publishes within one interval, so archive
+    /// catchup is structurally impossible-yet-imminent. When set (and the
+    /// HardReset cooldown is inactive), `decide_consensus_stuck_action`
+    /// escalates to `HardReset(ArchiveBehindStallWallClock)` immediately
+    /// without waiting for the full wall-clock stall, eliminating the
+    /// ~4.5-min archive-probe spin. False whenever there is no peer-ahead
+    /// evidence (`peer_gap < PEER_AHEAD_ESCALATION_THRESHOLD`) or the node is
+    /// genuinely far behind (`peer_gap >= checkpoint_frequency()`, the #1862
+    /// path, which keeps the unchanged escalation threshold).
+    pub near_tip: bool,
 }
 
 /// Actions to take when consensus is stuck.
