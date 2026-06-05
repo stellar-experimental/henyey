@@ -830,6 +830,18 @@ pub struct BucketConfig {
     /// concurrent scans would exceed available RAM.
     #[serde(default = "default_scan_thread_count")]
     pub scan_thread_count: usize,
+
+    /// Disable on-disk bucket garbage collection (forensic / debugging
+    /// kill-switch).
+    ///
+    /// Mirrors stellar-core's `DISABLE_BUCKET_GC` (`Config.h:590`, default
+    /// `false` at `Config.cpp:202`). When `true`, henyey never deletes
+    /// unreferenced bucket files from disk: both the periodic close-path GC
+    /// (`cleanup_stale_bucket_files_background`) and the catchup-path GC are
+    /// suppressed. Intended for operators who need to retain all on-disk
+    /// bucket files for debugging. Off by default (GC enabled).
+    #[serde(default)]
+    pub disable_bucket_gc: bool,
 }
 
 fn default_scan_thread_count() -> usize {
@@ -843,6 +855,7 @@ impl Default for BucketConfig {
             cache_size: default_bucket_cache_size(),
             bucket_list_db: BucketListDbConfig::default(),
             scan_thread_count: default_scan_thread_count(),
+            disable_bucket_gc: false,
         }
     }
 }
@@ -2572,6 +2585,45 @@ debug_ledgers = 200
             Some("/tmp/meta.pipe")
         );
         assert_eq!(config.metadata.debug_ledgers, 200);
+    }
+
+    #[test]
+    fn test_bucket_config_disable_gc_defaults_false() {
+        // #3153: the DISABLE_BUCKET_GC kill-switch defaults to false (GC enabled),
+        // mirroring stellar-core (Config.cpp:202).
+        assert!(
+            !BucketConfig::default().disable_bucket_gc,
+            "disable_bucket_gc must default to false"
+        );
+
+        // Absent from TOML => false (the #[serde(default)] path).
+        let toml_str = r#"
+[network]
+passphrase = "Test SDF Network ; September 2015"
+
+[buckets]
+directory = "buckets"
+"#;
+        let config: AppConfig = toml::from_str(toml_str).unwrap();
+        assert!(
+            !config.buckets.disable_bucket_gc,
+            "disable_bucket_gc must default to false when absent from TOML"
+        );
+
+        // Explicit true round-trips through TOML.
+        let toml_str_true = r#"
+[network]
+passphrase = "Test SDF Network ; September 2015"
+
+[buckets]
+directory = "buckets"
+disable_bucket_gc = true
+"#;
+        let config: AppConfig = toml::from_str(toml_str_true).unwrap();
+        assert!(
+            config.buckets.disable_bucket_gc,
+            "disable_bucket_gc = true must parse to true"
+        );
     }
 
     #[test]

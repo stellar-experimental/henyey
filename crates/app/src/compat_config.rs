@@ -51,6 +51,7 @@ const SUPPORTED_KEYS: &[&str] = &[
     "NETWORK_PASSPHRASE",
     "DATABASE",
     "BUCKET_DIR_PATH",
+    "DISABLE_BUCKET_GC",
     "HTTP_PORT",
     "PUBLIC_HTTP_PORT",
     "HTTP_QUERY_PORT",
@@ -218,6 +219,12 @@ pub fn translate_stellar_core_config(raw: &toml::Value) -> anyhow::Result<AppCon
     // --- Buckets ---
     if let Some(dir) = get_str(table, "BUCKET_DIR_PATH") {
         config.buckets.directory = PathBuf::from(dir);
+    }
+    // stellar-core's DISABLE_BUCKET_GC kill-switch (Config.h:590, default false).
+    // Carry a drop-in core config's operator intent through to henyey's native
+    // `buckets.disable_bucket_gc` flag; absent ⇒ stays false (GC enabled).
+    if let Some(disable_gc) = get_bool(table, "DISABLE_BUCKET_GC") {
+        config.buckets.disable_bucket_gc = disable_gc;
     }
 
     // --- HTTP ---
@@ -2705,6 +2712,48 @@ NODE_SEED="SBXTJSLKQ2VZUEQNYU5EC6ZGQOONCX3JCFBK57R56YLYMUW76B2FMCJH self"
     fn translate(config_str: &str) -> anyhow::Result<crate::config::AppConfig> {
         let raw: toml::Value = toml::from_str(config_str).unwrap();
         translate_stellar_core_config(&raw)
+    }
+
+    #[test]
+    fn test_translate_disable_bucket_gc() {
+        // #3153: a drop-in stellar-core config's DISABLE_BUCKET_GC kill-switch
+        // translates to henyey's native buckets.disable_bucket_gc.
+        let config = translate(
+            r#"
+            NETWORK_PASSPHRASE = "Test SDF Network ; September 2015"
+            DISABLE_BUCKET_GC = true
+            "#,
+        )
+        .unwrap();
+        assert!(
+            config.buckets.disable_bucket_gc,
+            "DISABLE_BUCKET_GC = true must translate to disable_bucket_gc = true"
+        );
+
+        // Explicit false translates to false.
+        let config = translate(
+            r#"
+            NETWORK_PASSPHRASE = "Test SDF Network ; September 2015"
+            DISABLE_BUCKET_GC = false
+            "#,
+        )
+        .unwrap();
+        assert!(
+            !config.buckets.disable_bucket_gc,
+            "DISABLE_BUCKET_GC = false must translate to disable_bucket_gc = false"
+        );
+
+        // Absent => default false (GC enabled).
+        let config = translate(
+            r#"
+            NETWORK_PASSPHRASE = "Test SDF Network ; September 2015"
+            "#,
+        )
+        .unwrap();
+        assert!(
+            !config.buckets.disable_bucket_gc,
+            "absent DISABLE_BUCKET_GC must default to disable_bucket_gc = false"
+        );
     }
 
     #[test]

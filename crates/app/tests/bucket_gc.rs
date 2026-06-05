@@ -22,13 +22,38 @@ use henyey_app::App;
 /// no network — sufficient to exercise the bucket-GC re-entrancy guard, which
 /// only touches the bucket manager / ledger manager / DB.
 async fn build_test_app(db_dir: &std::path::Path) -> Arc<App> {
+    build_test_app_with(db_dir, false).await
+}
+
+/// Like `build_test_app`, but lets the caller pick the `disable_bucket_gc`
+/// kill-switch (#3153) and pins the bucket directory under `db_dir/buckets` so
+/// the test can drop a stale file there directly.
+async fn build_test_app_with(db_dir: &std::path::Path, disable_bucket_gc: bool) -> Arc<App> {
     let db_path = db_dir.join("bucket_gc_test.db");
-    let mut config = ConfigBuilder::new().database_path(&db_path).build();
+    let mut config = ConfigBuilder::new()
+        .database_path(&db_path)
+        .bucket_directory(db_dir.join("buckets"))
+        .build();
     config.is_compat_config = true;
     config.overlay.known_peers = vec![];
     config.overlay.target_outbound_peers = 0;
     config.overlay.max_outbound_peers = 0;
+    config.buckets.disable_bucket_gc = disable_bucket_gc;
     Arc::new(App::new(config).await.expect("failed to build App"))
+}
+
+/// Write a syntactically-valid-but-unreferenced bucket file (64-hex name with
+/// the canonical `.bucket.xdr` suffix) into `bucket_dir`. `list_buckets()` keys
+/// off the filename pattern, so GC will see this as an on-disk bucket that is
+/// not a GC root — it is deleted when GC is enabled and retained when disabled.
+/// Returns the file path.
+fn write_stale_bucket_file(bucket_dir: &std::path::Path) -> std::path::PathBuf {
+    std::fs::create_dir_all(bucket_dir).expect("create bucket dir");
+    // A 64-char hex hash that will not appear among the genesis GC roots.
+    let stale_hash = "ab".repeat(32);
+    let path = bucket_dir.join(format!("{stale_hash}.bucket.xdr"));
+    std::fs::write(&path, b"stale-not-a-real-bucket").expect("write stale bucket file");
+    path
 }
 
 /// Spin until `flag` reaches `expected` or the deadline elapses. Returns whether
@@ -97,5 +122,76 @@ async fn test_gc_reentrancy_guard_coalesces() {
     assert!(
         await_flag(&flag, false).await,
         "flag must reset again after the second run"
+    );
+}
+
+/// #3153 behavioral guarantee: with `disable_bucket_gc = true`, a stale
+/// (unreferenced) on-disk bucket file SURVIVES a call to
+/// `cleanup_stale_bucket_files_background()`. The kill-switch early-returns
+/// before any blocking task spawns, so no file is deleted — mirroring
+/// stellar-core's `!mConfig.DISABLE_BUCKET_GC` guard.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_disable_bucket_gc_retains_stale_files() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let app = build_test_app_with(tmp.path(), /* disable_bucket_gc */ true).await;
+
+    assert!(
+        !app.bucket_gc_enabled(),
+        "bucket_gc_enabled() must be false when disable_bucket_gc = true"
+    );
+
+    let stale = write_stale_bucket_file(&tmp.path().join("buckets"));
+    assert!(stale.exists(), "precondition: stale file written");
+
+    // GC is disabled: the call must coalesce-out (return false, no task) without
+    // ever touching the in-flight guard.
+    let flag = app.bucket_gc_in_flight().clone();
+    assert!(
+        !app.cleanup_stale_bucket_files_background(),
+        "with GC disabled, cleanup must not launch a task (return false)"
+    );
+    assert!(
+        !flag.load(Ordering::Acquire),
+        "GC-disabled early return must not acquire the in-flight guard"
+    );
+
+    // Give any (erroneously) spawned task a chance to run, then assert survival.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        stale.exists(),
+        "stale bucket file must SURVIVE cleanup when disable_bucket_gc = true"
+    );
+}
+
+/// Companion control: with GC enabled (the default), the same stale,
+/// unreferenced bucket file IS removed — proving the survival above is the
+/// kill-switch's doing, not an inert no-op.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_enabled_bucket_gc_removes_stale_files() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let app = build_test_app_with(tmp.path(), /* disable_bucket_gc */ false).await;
+
+    assert!(
+        app.bucket_gc_enabled(),
+        "bucket_gc_enabled() must be true by default"
+    );
+
+    let stale = write_stale_bucket_file(&tmp.path().join("buckets"));
+    assert!(stale.exists(), "precondition: stale file written");
+
+    let flag = app.bucket_gc_in_flight().clone();
+    assert!(
+        app.cleanup_stale_bucket_files_background(),
+        "with GC enabled, cleanup must launch a task (return true)"
+    );
+
+    // Wait for the detached GC task to finish (flag resets on completion).
+    assert!(
+        await_flag(&flag, false).await,
+        "GC task must complete and reset the in-flight flag"
+    );
+    assert!(
+        !stale.exists(),
+        "unreferenced stale bucket file must be removed when GC is enabled"
     );
 }
