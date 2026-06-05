@@ -245,6 +245,7 @@ Corresponds to: `EventManager.h`, `LumenEventReconciler.h`
 | `setEvents()` | `set_events()` | Full |
 | `newFeeEvent()` | `new_fee_event()` | Full |
 | `reconcileEvents()` | `reconcile_events()` | Full |
+| `Protocol23CorruptionEventReconciler` (`P23HotArchiveBug.cpp:456-615`) | `P23SacReconciler` (`events.rs`) | Full — issue #3126; observability-only SAC mint/burn backfill on p23 hot-archive auto-restore, gated on `BACKFILL_STELLAR_ASSET_EVENTS` (off by default), zero consensus-hash effect (events prepended to op-meta after the success preimage is hashed). Omits `hasReconciliationAmount`/`mReconciliationAmounts` (only feeds the unimplemented `EventsAreConsistentWithEntryDiffs` invariant) |
 | `getAssetFromEvent()` | Not needed (reconciliation uses different approach) | Full |
 | Muxed account handling | `make_muxed_account_address()` | Full |
 | Contract ID computation | `contract_id_from_asset()` | Full |

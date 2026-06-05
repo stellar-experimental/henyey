@@ -5,11 +5,15 @@
 # Extraction/verification script for the CAP-0076 P23 hot-archive bug
 # remediation data table (issue #3061).
 #
-# Reads the two 478-entry base64-XDR string arrays from stellar-core's
+# Reads the two 478-entry base64-XDR string arrays plus the 12-entry
+# P23_CORRUPTED_AFFECTED_ASSETS array from stellar-core's
 #   stellar-core/src/ledger/P23HotArchiveBugData.cpp
 # and emits the generated Rust module
 #   crates/ledger/src/p23_hot_archive_bug_data.rs
 # transcribing the literals *verbatim* (we transcribe, we do not author them).
+#
+# The 12-entry P23_CORRUPTED_AFFECTED_ASSETS array drives the SAC mint/burn
+# event reconciler (Protocol23CorruptionEventReconciler), ported in issue #3126.
 #
 # Provenance: stellar-core v26.0.1, commit e78c97ed0.
 #
@@ -24,16 +28,33 @@ import os
 import re
 import sys
 
-EXPECTED_COUNT = 478
+ENTRIES_COUNT = 478
+AFFECTED_ASSETS_COUNT = 12
 
-# The two arrays we need. The third array in the source file
-# (P23_CORRUPTED_AFFECTED_ASSETS) drives the SAC-event reconciler, which is out
-# of scope for the bucketListHash remediation (see issue #3061 plan).
+# The three arrays we need. The first two are the 478 corrupted/correct
+# hot-archive LedgerEntry pairs (issue #3061). The third
+# (P23_CORRUPTED_AFFECTED_ASSETS) is the 12 affected SAC assets driving the
+# event reconciler (issue #3126).
+#
+# Each entry is (cpp_decl_name, rust_name, count_const, expected_count).
 ARRAYS = [
-    ("P23_CORRUPTED_HOT_ARCHIVE_ENTRIES", "P23_CORRUPTED_HOT_ARCHIVE_ENTRIES"),
+    (
+        "P23_CORRUPTED_HOT_ARCHIVE_ENTRIES",
+        "P23_CORRUPTED_HOT_ARCHIVE_ENTRIES",
+        "P23_CORRUPTED_HOT_ARCHIVE_ENTRIES_COUNT",
+        ENTRIES_COUNT,
+    ),
     (
         "P23_CORRUPTED_HOT_ARCHIVE_ENTRY_CORRECT_STATE",
         "P23_CORRUPTED_HOT_ARCHIVE_ENTRY_CORRECT_STATE",
+        "P23_CORRUPTED_HOT_ARCHIVE_ENTRIES_COUNT",
+        ENTRIES_COUNT,
+    ),
+    (
+        "P23_CORRUPTED_AFFECTED_ASSETS",
+        "P23_CORRUPTED_AFFECTED_ASSETS",
+        "P23_CORRUPTED_AFFECTED_ASSETS_COUNT",
+        AFFECTED_ASSETS_COUNT,
     ),
 ]
 
@@ -145,11 +166,11 @@ def main():
     src_sha = hashlib.sha256(src.encode("utf-8")).hexdigest()
 
     extracted = {}
-    for decl_name, _ in ARRAYS:
+    for decl_name, _rust_name, _count_const, expected_count in ARRAYS:
         entries = extract_array(src, decl_name)
-        if len(entries) != EXPECTED_COUNT:
+        if len(entries) != expected_count:
             raise SystemExit(
-                f"{decl_name}: expected {EXPECTED_COUNT} entries, got {len(entries)}"
+                f"{decl_name}: expected {expected_count} entries, got {len(entries)}"
             )
         extracted[decl_name] = entries
 
@@ -157,9 +178,12 @@ def main():
     lines.append(
         "// GENERATED FILE — DO NOT EDIT BY HAND.\n"
         "//\n"
-        "// CAP-0076 / Protocol 23 hot-archive bug remediation data table\n"
-        "// (478 corrupted/correct base64-XDR `LedgerEntry` pairs), transcribed\n"
-        "// verbatim from stellar-core's `P23HotArchiveBugData.cpp`.\n"
+        "// CAP-0076 / Protocol 23 hot-archive bug remediation data table,\n"
+        "// transcribed verbatim from stellar-core's `P23HotArchiveBugData.cpp`:\n"
+        f"//   - {ENTRIES_COUNT} corrupted/correct base64-XDR `LedgerEntry` pairs\n"
+        "//     (issue #3061, bucketListHash remediation), and\n"
+        f"//   - {AFFECTED_ASSETS_COUNT} base64-XDR `Asset` literals for the SAC\n"
+        "//     mint/burn event reconciler (issue #3126, observability-only).\n"
         "//\n"
         "// Provenance: stellar-core v26.0.1, commit e78c97ed0.\n"
         f"// Source file SHA-256: {src_sha}\n"
@@ -167,23 +191,29 @@ def main():
         "// Regenerate with:\n"
         "//   python3 crates/ledger/scripts/extract_p23_hot_archive_bug_data.py\n"
         "//\n"
-        "// See issue #3061 and `p23_hot_archive_bug.rs`.\n"
+        "// See issues #3061 / #3126 and `p23_hot_archive_bug.rs`.\n"
     )
     lines.append(
-        f"/// Number of hardcoded corrupted hot-archive entries ({EXPECTED_COUNT})."
+        f"/// Number of hardcoded corrupted hot-archive entries ({ENTRIES_COUNT})."
     )
     lines.append(
-        f"pub const P23_CORRUPTED_HOT_ARCHIVE_ENTRIES_COUNT: usize = {EXPECTED_COUNT};\n"
+        f"pub const P23_CORRUPTED_HOT_ARCHIVE_ENTRIES_COUNT: usize = {ENTRIES_COUNT};\n"
+    )
+    lines.append(
+        f"/// Number of affected SAC assets for the event reconciler ({AFFECTED_ASSETS_COUNT})."
+    )
+    lines.append(
+        f"pub const P23_CORRUPTED_AFFECTED_ASSETS_COUNT: usize = {AFFECTED_ASSETS_COUNT};\n"
     )
 
-    for decl_name, rust_name in ARRAYS:
+    for decl_name, rust_name, count_const, _expected_count in ARRAYS:
         entries = extracted[decl_name]
-        lines.append(
-            f"/// Base64-XDR `LedgerEntry` literals: {rust_name}."
-        )
-        lines.append(
-            f"pub static {rust_name}: [&str; P23_CORRUPTED_HOT_ARCHIVE_ENTRIES_COUNT] = ["
-        )
+        if rust_name == "P23_CORRUPTED_AFFECTED_ASSETS":
+            doc = f"/// Base64-XDR `Asset` literals: {rust_name}."
+        else:
+            doc = f"/// Base64-XDR `LedgerEntry` literals: {rust_name}."
+        lines.append(doc)
+        lines.append(f"pub static {rust_name}: [&str; {count_const}] = [")
         for e in entries:
             # Rust raw-free string; base64 contains only [A-Za-z0-9+/=], no
             # escaping required, but use a debug-safe quoting just in case.
@@ -196,7 +226,7 @@ def main():
 
     print(f"Wrote {out_path}")
     print(f"Source SHA-256: {src_sha}")
-    for decl_name, _ in ARRAYS:
+    for decl_name, _rust_name, _count_const, _expected_count in ARRAYS:
         print(f"  {decl_name}: {len(extracted[decl_name])} entries")
 
 

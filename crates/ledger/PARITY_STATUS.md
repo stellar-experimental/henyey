@@ -329,7 +329,6 @@ Features excluded by design. These are NOT counted against parity %.
 | `InMemoryLedgerTxn` / `InMemoryLedgerTxnRoot` (test utilities) | Test-only in-memory backend |
 | `InflationWinner` / inflation queries | Inflation disabled in protocol 12+ |
 | `P23HotArchiveBug::Protocol23CorruptionDataVerifier` | CSV-file-driven catchup verification; Henyey has no corruption-file config concept and it has zero `bucketListHash` effect (no-op exclusion). The `addHotArchiveBatchWithP23HotArchiveFix` batch fix itself IS implemented (`p23_hot_archive_bug.rs`, #3061) |
-| `P23HotArchiveBug::Protocol23CorruptionEventReconciler` | SAC mint/burn event reconciliation (gated on `BACKFILL_STELLAR_ASSET_EVENTS`); distinct SAC-event spec gap, no `bucketListHash` effect (tracked as a follow-up) |
 | `FlushAndRotateMetaDebugWork.h/.cpp` | Operational debug tooling |
 | `LedgerManager::ledgerAbbrev()` | Logging helper, not protocol behavior |
 | Postgres-specific code (`USE_POSTGRES` blocks) | SQLite only per project guidelines |
@@ -439,7 +438,7 @@ The 139 implemented items cover: LedgerManager core operations (31, including `a
 
 The 8 gap items include: timing utilities (2), metrics methods (2), multi-threaded module cache compilation (1 Partial), CompleteConstLedgerState (1 Partial), prefetch (1), and meta streaming (1).
 
-The 31 intentional omissions are primarily SQL backend features (LedgerTxnRoot, offer SQL, header SQL operations), debug tooling (FlushAndRotateMetaDebugWork), the config-gated P23 corruption verifier/reconciler (the `addHotArchiveBatchWithP23HotArchiveFix` batch fix itself is implemented), deprecated functionality (inflation), C++ implementation artifacts (InternalLedgerEntry, EntryPtrState, ThreadInvariant, LedgerEntryScope), features handled by other crates (catchup, checkpoint ranges, app state machine).
+The 30 intentional omissions are primarily SQL backend features (LedgerTxnRoot, offer SQL, header SQL operations), debug tooling (FlushAndRotateMetaDebugWork), the config-gated P23 corruption data verifier (the `addHotArchiveBatchWithP23HotArchiveFix` batch fix is implemented in `p23_hot_archive_bug.rs`, #3061; the `Protocol23CorruptionEventReconciler` SAC mint/burn backfill is implemented in `henyey-tx` `events.rs`, #3126 — observability-only, gated on `BACKFILL_STELLAR_ASSET_EVENTS`, no `bucketListHash` effect), deprecated functionality (inflation), C++ implementation artifacts (InternalLedgerEntry, EntryPtrState, ThreadInvariant, LedgerEntryScope), features handled by other crates (catchup, checkpoint ranges, app state machine).
 
 ## Spec Adherence Notes
 
