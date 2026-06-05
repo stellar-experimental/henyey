@@ -36,6 +36,13 @@ pub struct MockDriver {
     pub accepted_commit_count: AtomicU32,
     /// Counts how many times `ballot_did_confirm` was called.
     pub confirmed_prepared_count: AtomicU32,
+    /// Records the `ScpBallot` passed to each `ballot_did_confirm` call, in
+    /// order. Lets tests assert the exact ballot confirmed prepared.
+    pub confirmed_prepared_ballots: std::sync::Mutex<Vec<ScpBallot>>,
+    /// Ordered log of selected driver-callback names as they fire. Lets tests
+    /// assert relative ordering between callbacks within a single ballot-protocol
+    /// invocation (e.g. `ballot_did_confirm` before `started_ballot_protocol`).
+    pub callback_sequence: std::sync::Mutex<Vec<&'static str>>,
     /// Records the `ScpBallot` passed to each `started_ballot_protocol` call,
     /// in order. Lets tests assert fire-once and the exact ballot fired.
     pub ballot_starts: std::sync::Mutex<Vec<ScpBallot>>,
@@ -121,6 +128,8 @@ impl MockDriverBuilder {
             heard_from_quorum: AtomicU32::new(0),
             accepted_commit_count: AtomicU32::new(0),
             confirmed_prepared_count: AtomicU32::new(0),
+            confirmed_prepared_ballots: std::sync::Mutex::new(Vec::new()),
+            callback_sequence: std::sync::Mutex::new(Vec::new()),
             ballot_starts: std::sync::Mutex::new(Vec::new()),
             return_qset_by_hash: self.return_qset_by_hash,
             custom_node_weight: None,
@@ -203,8 +212,16 @@ impl SCPDriver for MockDriver {
 
     fn ballot_did_prepare(&self, _slot_index: u64, _ballot: &ScpBallot) {}
 
-    fn ballot_did_confirm(&self, _slot_index: u64, _ballot: &ScpBallot) {
+    fn ballot_did_confirm(&self, _slot_index: u64, ballot: &ScpBallot) {
         self.confirmed_prepared_count.fetch_add(1, Ordering::SeqCst);
+        self.confirmed_prepared_ballots
+            .lock()
+            .unwrap()
+            .push(ballot.clone());
+        self.callback_sequence
+            .lock()
+            .unwrap()
+            .push("ballot_did_confirm");
     }
 
     fn ballot_did_hear_from_quorum(&self, _slot_index: u64, _ballot: &ScpBallot) {
@@ -217,6 +234,10 @@ impl SCPDriver for MockDriver {
 
     fn started_ballot_protocol(&self, _slot_index: u64, ballot: &ScpBallot) {
         self.ballot_starts.lock().unwrap().push(ballot.clone());
+        self.callback_sequence
+            .lock()
+            .unwrap()
+            .push("started_ballot_protocol");
     }
 
     fn compute_hash_node(
