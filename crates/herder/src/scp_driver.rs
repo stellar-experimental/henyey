@@ -1880,20 +1880,10 @@ impl ScpDriver {
         ledger_manager: &LedgerManager,
     ) -> bool {
         match upgrade {
-            LedgerUpgrade::Version(new_version) => {
-                // Must be strictly monotonic and within supported range
-                *new_version > current_version
-                    && *new_version <= henyey_common::CURRENT_LEDGER_PROTOCOL_VERSION
-            }
-            LedgerUpgrade::BaseFee(fee) => *fee != 0,
-            LedgerUpgrade::MaxTxSetSize(_) => true, // Any size allowed
-            LedgerUpgrade::BaseReserve(reserve) => *reserve != 0,
-            LedgerUpgrade::Flags(flags) => {
-                // Must be protocol >= 18 and only valid flag bits
-                const MASK_LEDGER_HEADER_FLAGS: u32 = 0x7;
-                protocol_version_starts_from(current_version, ProtocolVersion::V18)
-                    && (*flags & !MASK_LEDGER_HEADER_FLAGS) == 0
-            }
+            // Config is this site's stateful nomination-time variant: it loads
+            // the config upgrade set from ledger state and validates the frame.
+            // The shared helper deliberately does not own Config (it returns
+            // `true`), so we branch it here and never route it through the helper.
             LedgerUpgrade::Config(key) => {
                 // Config upgrades require Soroban protocol.
                 if current_version < henyey_common::MIN_SOROBAN_PROTOCOL_VERSION {
@@ -1936,9 +1926,17 @@ impl ScpDriver {
                     }
                 }
             }
-            LedgerUpgrade::MaxSorobanTxSetSize(_) => {
-                current_version >= henyey_common::MIN_SOROBAN_PROTOCOL_VERSION
-            }
+            // All non-Config (scalar) arms — Version/BaseFee/MaxTxSetSize/
+            // BaseReserve/Flags/MaxSorobanTxSetSize — delegate to the single
+            // shared source of truth in henyey-common. The Version arm's max
+            // bound was hardcoded to CURRENT_LEDGER_PROTOCOL_VERSION here, so we
+            // pass that same constant as `max_protocol_version` to preserve the
+            // bound (`new > current && new <= CURRENT`) byte-for-byte.
+            other => henyey_common::upgrade_valid_for_apply_non_config(
+                other,
+                current_version,
+                henyey_common::CURRENT_LEDGER_PROTOCOL_VERSION,
+            ),
         }
     }
 
