@@ -55,11 +55,20 @@ pub enum OverlayError {
     InvalidMessage(String),
 
     /// Peer's overlay protocol version is incompatible.
-    #[error("protocol version mismatch: {0}")]
+    ///
+    /// The `Display` string mirrors stellar-core's on-the-wire handshake error
+    /// exactly (`Peer.cpp:1851`, OVERLAY_SPEC §4.4.2-7): `"wrong protocol
+    /// version"`. The wrapped `String` carries the divergence detail (below
+    /// minimum / above maximum / malformed) for local diagnostics and tests —
+    /// stellar-core likewise logs that detail separately (`CLOG_DEBUG`) rather
+    /// than sending it to the peer.
+    #[error("wrong protocol version")]
     VersionMismatch(String),
 
-    /// Peer is on a different network (network ID doesn't match).
-    #[error("network ID mismatch")]
+    /// Peer is on a different network (network passphrase doesn't match).
+    ///
+    /// Mirrors stellar-core `Peer.cpp:1869` / OVERLAY_SPEC §4.4.2-9.
+    #[error("wrong network passphrase")]
     NetworkMismatch,
 
     // ===== Peer Management Errors =====
@@ -80,8 +89,12 @@ pub enum OverlayError {
     PeerDuplicate(String),
 
     /// Already have an active connection to this peer.
-    #[error("already connected to peer")]
-    AlreadyConnected,
+    ///
+    /// Mirrors stellar-core `Peer.cpp:1890` / OVERLAY_SPEC §4.4.2-12. The
+    /// wrapped `String` is the peer ID being rejected (stellar-core appends
+    /// `Config::toShortString(mPeerID)`); henyey renders the strkey peer ID.
+    #[error("already-connected peer: {0}")]
+    AlreadyConnected(String),
 
     // ===== State Errors =====
     /// Operation requires the overlay to be running.
@@ -155,5 +168,41 @@ impl OverlayError {
             self,
             OverlayError::NetworkMismatch | OverlayError::VersionMismatch(_)
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Handshake error strings must mirror stellar-core `Peer.cpp` and
+    // OVERLAY_SPEC §4.4.2 exactly (issue #3080). These assert the on-the-wire
+    // `Display` wording, which is what gets sent to the peer in ERROR_MSG.
+
+    #[test]
+    fn test_version_mismatch_display_matches_spec() {
+        // §4.4.2-7 / Peer.cpp:1851. The wrapped detail is for local diagnostics
+        // only and must NOT leak into the wire string.
+        let err = OverlayError::VersionMismatch("below minimum".to_string());
+        assert_eq!(err.to_string(), "wrong protocol version");
+    }
+
+    #[test]
+    fn test_network_mismatch_display_matches_spec() {
+        // §4.4.2-9 / Peer.cpp:1869.
+        let err = OverlayError::NetworkMismatch;
+        assert_eq!(err.to_string(), "wrong network passphrase");
+    }
+
+    #[test]
+    fn test_already_connected_display_matches_spec() {
+        // §4.4.2-12 / Peer.cpp:1890 — includes the rejected peer ID.
+        let err = OverlayError::AlreadyConnected(
+            "GABC123EXAMPLEPEERID00000000000000000000000000000000000".to_string(),
+        );
+        assert_eq!(
+            err.to_string(),
+            "already-connected peer: GABC123EXAMPLEPEERID00000000000000000000000000000000000"
+        );
     }
 }
