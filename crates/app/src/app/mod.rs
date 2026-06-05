@@ -72,10 +72,11 @@ use henyey_herder::{
 };
 use henyey_history::{
     build_history_archive_state, checkpoint_containing, checkpoint_frequency,
-    first_ledger_after_checkpoint_containing, is_checkpoint_ledger, is_checkpoint_start,
-    last_ledger_before_checkpoint_containing, latest_checkpoint_before_or_at, CatchupConfiguration,
-    CatchupManager, CatchupMode, CatchupResult as HistoryCatchupResult, CatchupRunMode,
-    CheckpointData, ExistingBucketState, HistoryArchive, HistoryArchiveState, GENESIS_LEDGER_SEQ,
+    classify_buffered_catchup_trigger, first_ledger_after_checkpoint_containing,
+    is_checkpoint_ledger, is_checkpoint_start, last_ledger_before_checkpoint_containing,
+    latest_checkpoint_before_or_at, BufferedCatchupTrigger, CatchupConfiguration, CatchupManager,
+    CatchupMode, CatchupResult as HistoryCatchupResult, CatchupRunMode, CheckpointData,
+    ExistingBucketState, HistoryArchive, HistoryArchiveState, GENESIS_LEDGER_SEQ,
 };
 use henyey_historywork::{
     build_checkpoint_data, get_progress, HistoryWorkBuilder, HistoryWorkState,

@@ -24,7 +24,10 @@
 
 use std::collections::BTreeMap;
 
-use crate::checkpoint::{checkpoint_frequency, checkpoint_start, is_checkpoint_start};
+use crate::checkpoint::{
+    checkpoint_frequency, checkpoint_start, first_ledger_after_checkpoint_containing,
+    is_checkpoint_start,
+};
 
 /// Maximum allowed drift, in ledgers, between the next ledger queued for
 /// sequential apply and the last-closed ledger (LCL) before the node stops
@@ -192,6 +195,90 @@ pub fn max_buffer_invariant_entries() -> usize {
     (checkpoint_frequency() + 1) as usize
 }
 
+/// The §7.2 buffered-catchup *trigger* decision over the syncing buffer's span.
+///
+/// This is distinct from [`ProcessLedgerDecision`] (the §7.2 step-3/5/6
+/// *process* classifier for a single newly-received ledger). This classifier
+/// answers the separate §7.2 question: given the current buffered span
+/// `[first_buffered, last_buffered]`, should online catchup be triggered
+/// immediately, or should the node wait until the buffer reaches the trigger
+/// ledger?
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BufferedCatchupTrigger {
+    /// §7.2: the first buffered ledger is a checkpoint start AND more ledgers
+    /// follow it (`first_buffered < last_buffered`) → start online catchup
+    /// immediately (catchup target is `first_buffered - 1`).
+    TriggerImmediate,
+    /// Otherwise the node must wait. Carries the smallest required
+    /// checkpoint-start ledger (`required_first`) and the ledger whose arrival
+    /// triggers catchup (`trigger == required_first + 1`).
+    Wait { required_first: u32, trigger: u32 },
+}
+
+/// Classify the §7.2 buffered-catchup trigger decision for the buffered span
+/// `[first_buffered, last_buffered]`.
+///
+/// Returns [`BufferedCatchupTrigger::TriggerImmediate`] when `first_buffered` is
+/// a checkpoint start and at least one further ledger is buffered; otherwise
+/// [`BufferedCatchupTrigger::Wait`] carrying the smallest checkpoint-start
+/// ledger that must be reached (`required_first`) and the trigger ledger
+/// (`required_first + 1`).
+///
+/// This is a pure function of the two scalars — it consults only the
+/// checkpoint helpers ([`is_checkpoint_start`],
+/// [`first_ledger_after_checkpoint_containing`]) and never touches buffer
+/// storage or lock state, which stay App-owned.
+///
+/// Parity: mirrors `LedgerApplyManagerImpl::processLedger`
+/// (`LedgerApplyManagerImpl.cpp:447–462`, v26.0.1):
+/// - Trigger (`.cpp:447–452`):
+///   `isFirstLedgerInCheckpoint(firstLedgerInBuffer) && firstLedgerInBuffer <
+///   lastLedgerInBuffer` (the `&& !isApplying()` clause is handled separately by
+///   the App via the sequential-apply early-return and `catchup_in_progress`
+///   checks, and `modeDoesCatchupWithBucketList()` is always-true for henyey).
+/// - Wait derivation (`.cpp:455–462`): `requiredFirst = isFirstLedgerInCheckpoint
+///   ? firstLedgerInBuffer : firstLedgerAfterCheckpointContaining(firstLedgerInBuffer)`,
+///   `trigger = requiredFirst + 1` (`HistoryManager.h:304`,
+///   `ledgerToTriggerCatchup = firstLedgerOfBufferedCheckpoint + 1`).
+///
+/// # Examples
+///
+/// ```
+/// use henyey_history::ledger_apply_manager::{
+///     classify_buffered_catchup_trigger, BufferedCatchupTrigger,
+/// };
+///
+/// // freq 64: first = 192 (checkpoint start) with followers → trigger now.
+/// assert_eq!(
+///     classify_buffered_catchup_trigger(192, 200),
+///     BufferedCatchupTrigger::TriggerImmediate
+/// );
+/// // Mid-checkpoint first = 200 → wait until the next checkpoint start + 1.
+/// assert_eq!(
+///     classify_buffered_catchup_trigger(200, 200),
+///     BufferedCatchupTrigger::Wait { required_first: 256, trigger: 257 }
+/// );
+/// ```
+#[inline]
+pub fn classify_buffered_catchup_trigger(
+    first_buffered: u32,
+    last_buffered: u32,
+) -> BufferedCatchupTrigger {
+    if is_checkpoint_start(first_buffered) && first_buffered < last_buffered {
+        BufferedCatchupTrigger::TriggerImmediate
+    } else {
+        let required_first = if is_checkpoint_start(first_buffered) {
+            first_buffered
+        } else {
+            first_ledger_after_checkpoint_containing(first_buffered)
+        };
+        BufferedCatchupTrigger::Wait {
+            required_first,
+            trigger: required_first.saturating_add(1),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -228,5 +315,131 @@ mod tests {
         trim_syncing_buffer(&mut buf, 9);
         assert!(buf.len() <= max_buffer_invariant_entries());
         assert_eq!(*buf.keys().next().unwrap(), 128);
+    }
+
+    // §7.2 buffered-catchup trigger classifier (freq 64 by default).
+
+    #[test]
+    fn test_buffered_trigger_immediate_at_checkpoint_with_followers() {
+        // first = 192 (checkpoint start), last > first → trigger immediately.
+        assert_eq!(
+            classify_buffered_catchup_trigger(192, 200),
+            BufferedCatchupTrigger::TriggerImmediate
+        );
+    }
+
+    #[test]
+    fn test_buffered_trigger_waits_when_single_ledger_at_checkpoint() {
+        // first == last == 192: checkpoint start but no follower → wait.
+        assert_eq!(
+            classify_buffered_catchup_trigger(192, 192),
+            BufferedCatchupTrigger::Wait {
+                required_first: 192,
+                trigger: 193,
+            }
+        );
+    }
+
+    #[test]
+    fn test_buffered_trigger_waits_when_not_checkpoint_start() {
+        // first = 200 (mid-checkpoint) → required_first is the next checkpoint
+        // start (256), trigger 257.
+        assert_eq!(
+            first_ledger_after_checkpoint_containing(200),
+            256,
+            "sanity: freq is 64 in this test build"
+        );
+        assert_eq!(
+            classify_buffered_catchup_trigger(200, 200),
+            BufferedCatchupTrigger::Wait {
+                required_first: 256,
+                trigger: 257,
+            }
+        );
+    }
+
+    #[test]
+    fn test_buffered_trigger_required_first_equals_first_when_checkpoint_start() {
+        // Non-immediate checkpoint-start case (first == last) → required_first
+        // equals first_buffered.
+        match classify_buffered_catchup_trigger(128, 128) {
+            BufferedCatchupTrigger::Wait { required_first, .. } => {
+                assert_eq!(required_first, 128);
+            }
+            other => panic!("expected Wait, got {other:?}"),
+        }
+    }
+
+    /// Behavior-preservation guard: the classifier must reproduce the exact
+    /// `can_trigger_immediate` boolean and `(required_first, trigger)` pair the
+    /// prior inline expression in `maybe_start_buffered_catchup` computed, across
+    /// representative `(first, last)` pairs.
+    #[test]
+    fn test_buffered_trigger_matches_inline_logic() {
+        // Reproduce the original inline logic verbatim.
+        fn inline(first_buffered: u32, last_buffered: u32) -> (bool, Option<(u32, u32)>) {
+            let can_trigger_immediate =
+                is_checkpoint_start(first_buffered) && first_buffered < last_buffered;
+            if can_trigger_immediate {
+                (true, None)
+            } else {
+                let (required_first, trigger) = if is_checkpoint_start(first_buffered) {
+                    (first_buffered, first_buffered.saturating_add(1))
+                } else {
+                    let required_first = first_ledger_after_checkpoint_containing(first_buffered);
+                    (required_first, required_first.saturating_add(1))
+                };
+                (false, Some((required_first, trigger)))
+            }
+        }
+
+        // Checkpoint-start vs mid-checkpoint; first < last vs first == last;
+        // ledger-1 edge; large values.
+        let cases = [
+            (1u32, 1u32),
+            (1, 2),
+            (64, 64),
+            (64, 65),
+            (65, 65),
+            (65, 128),
+            (128, 128),
+            (128, 200),
+            (192, 192),
+            (192, 193),
+            (200, 200),
+            (200, 256),
+            (255, 256),
+            (256, 256),
+            (256, 257),
+            (1_000_000, 1_000_001),
+        ];
+
+        for (first, last) in cases {
+            let (want_immediate, want_wait) = inline(first, last);
+            let got = classify_buffered_catchup_trigger(first, last);
+            let got_immediate = matches!(got, BufferedCatchupTrigger::TriggerImmediate);
+            assert_eq!(
+                got_immediate, want_immediate,
+                "can_trigger_immediate mismatch for (first={first}, last={last})"
+            );
+            match got {
+                BufferedCatchupTrigger::TriggerImmediate => {
+                    assert!(
+                        want_wait.is_none(),
+                        "classifier said trigger but inline waited for (first={first}, last={last})"
+                    );
+                }
+                BufferedCatchupTrigger::Wait {
+                    required_first,
+                    trigger,
+                } => {
+                    assert_eq!(
+                        Some((required_first, trigger)),
+                        want_wait,
+                        "(required_first, trigger) mismatch for (first={first}, last={last})"
+                    );
+                }
+            }
+        }
     }
 }

@@ -164,9 +164,9 @@ pub use error::{
     HistoryError, LedgerVerifyStatus, TxSetHashMismatchInfo, VerifyHashKind, VerifyHashMismatchInfo,
 };
 pub use ledger_apply_manager::{
-    apply_drift_exceeded, classify_process_ledger, max_buffer_invariant_entries,
-    trim_boundary_for_last_buffered, trim_syncing_buffer, ProcessLedgerDecision,
-    MAX_EXTERNALIZE_LEDGER_APPLY_DRIFT,
+    apply_drift_exceeded, classify_buffered_catchup_trigger, classify_process_ledger,
+    max_buffer_invariant_entries, trim_boundary_for_last_buffered, trim_syncing_buffer,
+    BufferedCatchupTrigger, ProcessLedgerDecision, MAX_EXTERNALIZE_LEDGER_APPLY_DRIFT,
 };
 pub use paths::{
     bucket_path, checkpoint_path, checkpoint_path_dirty, dirty_to_final_path, final_to_dirty_path,
