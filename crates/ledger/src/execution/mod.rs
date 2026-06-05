@@ -684,6 +684,58 @@ pub struct TransactionExecutor {
     hot_archive_restored_keys: std::collections::HashSet<LedgerKey>,
     /// Optional invariant manager for runtime integrity checks.
     invariant_manager: Option<std::sync::Arc<henyey_invariant::InvariantManager>>,
+    /// Protocol-23 SAC corruption event reconciler (issue #3126).
+    ///
+    /// Built lazily and only when `classic_events.backfill_stellar_asset_events`
+    /// is enabled AND the protocol version is exactly 23. Observability-only:
+    /// prepends synthetic SAC mint/burn events to InvokeHostFunction op-meta on
+    /// hot-archive restore, with zero effect on any consensus hash. `None` by
+    /// default (and whenever backfill is disabled or the version is not 23).
+    p23_sac_reconciler: Option<std::sync::Arc<henyey_tx::P23SacReconciler>>,
+}
+
+/// Build the protocol-23 SAC corruption event reconciler (issue #3126) if and
+/// only if the SAC-event backfill is active for this ledger.
+///
+/// Returns `None` unless `classic_events.backfill_stellar_asset_events` is
+/// enabled AND `protocol_version == 23` (the corruption only occurred during
+/// protocol 23 — equality gate, mirroring stellar-core). The reconciler decodes
+/// the hardcoded P23 data table (`crate::p23_hot_archive_bug`), so it is built
+/// at most once per executor and skipped entirely in the common (disabled)
+/// case. Observability-only: never affects any consensus hash.
+fn build_p23_sac_reconciler(
+    network_id: &NetworkId,
+    protocol_version: u32,
+    classic_events: ClassicEventConfig,
+) -> Option<std::sync::Arc<henyey_tx::P23SacReconciler>> {
+    if !classic_events.backfill_to_protocol23(protocol_version) {
+        return None;
+    }
+
+    use crate::p23_hot_archive_bug::{
+        P23_CORRUPTED_AFFECTED_ASSETS, P23_CORRUPTED_HOT_ARCHIVE_ENTRIES,
+        P23_CORRUPTED_HOT_ARCHIVE_ENTRIES_COUNT, P23_CORRUPTED_HOT_ARCHIVE_ENTRY_CORRECT_STATE,
+    };
+
+    let pairs: Vec<(&str, &str)> = (0..P23_CORRUPTED_HOT_ARCHIVE_ENTRIES_COUNT)
+        .map(|i| {
+            (
+                P23_CORRUPTED_HOT_ARCHIVE_ENTRIES[i],
+                P23_CORRUPTED_HOT_ARCHIVE_ENTRY_CORRECT_STATE[i],
+            )
+        })
+        .collect();
+
+    match henyey_tx::P23SacReconciler::new(network_id, &P23_CORRUPTED_AFFECTED_ASSETS, &pairs) {
+        Ok(reconciler) => Some(std::sync::Arc::new(reconciler)),
+        Err(e) => {
+            warn!(
+                error = %e,
+                "Failed to build P23 SAC event reconciler; SAC-event backfill disabled for this ledger"
+            );
+            None
+        }
+    }
 }
 
 impl TransactionExecutor {
@@ -696,6 +748,11 @@ impl TransactionExecutor {
     ) -> Self {
         let mut state = LedgerStateManager::new(context.base_reserve as i64, context.sequence);
         state.set_id_pool(id_pool);
+        let p23_sac_reconciler = build_p23_sac_reconciler(
+            &context.network_id,
+            context.protocol_version,
+            classic_events,
+        );
         Self {
             ledger_seq: context.sequence,
             close_time: context.close_time,
@@ -717,6 +774,7 @@ impl TransactionExecutor {
             frozen_key_config: context.frozen_key_config.clone(),
             hot_archive_restored_keys: std::collections::HashSet::new(),
             invariant_manager: None,
+            p23_sac_reconciler,
         }
     }
 
@@ -2251,6 +2309,8 @@ impl TransactionExecutor {
                 module_cache: self.module_cache.as_ref(),
                 guarded_hot_archive,
                 ttl_key_cache: self.ttl_key_cache.as_ref(),
+                classic_events: self.classic_events,
+                p23_sac_reconciler: self.p23_sac_reconciler.as_deref(),
             })
         } else {
             henyey_tx::soroban::OperationContext::Classic
