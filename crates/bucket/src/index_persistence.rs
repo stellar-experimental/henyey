@@ -166,8 +166,7 @@ struct SerializableCounters {
 }
 
 impl SerializableCounters {
-    /// Spec: BUCKETLISTDB_SPEC §9.4 — serialization mapping for BucketEntryCounters
-    /// (disk index entry counters).
+    /// Spec: BUCKETLISTDB_SPEC §3.4 — serialization mapping for BucketEntryCounters.
     fn from_counters(counters: &BucketEntryCounters) -> Self {
         Self {
             live_entries: counters

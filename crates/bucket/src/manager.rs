@@ -705,7 +705,7 @@ impl BucketManager {
 
     /// Delete all bucket files not in the given set of hashes.
     ///
-    /// Spec: BUCKETLISTDB_SPEC §8.3 — GC unreferenced buckets.
+    /// Spec: BUCKETLISTDB_SPEC §8.2 (analogue) — GC unreferenced buckets.
     ///
     /// # GC Safety Contract
     ///

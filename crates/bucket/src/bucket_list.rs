@@ -3213,7 +3213,7 @@ impl BucketList {
     /// is authoritative and a separate point-lookup is unnecessary — the
     /// iteration order itself provides deduplication.
     ///
-    /// BUCKETLISTDB_SPEC §12.5: Temporary entries are deleted; persistent entries
+    /// BUCKETLISTDB_SPEC §12.3: Temporary entries are deleted; persistent entries
     /// are archived to the hot archive bucket list.
     pub fn scan_for_eviction(
         &self,

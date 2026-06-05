@@ -339,7 +339,7 @@ impl CatchupRange {
 
         // Case 2: count >= full replay count — full replay from genesis+1.
         //
-        // Per CATCHUP_SPEC §6.2 Case 2 and stellar-core `calculateCatchupRange`
+        // Per CATCHUP_SPEC §6.3 Case 2 and stellar-core `calculateCatchupRange`
         // (CatchupRange.cpp): with lcl == genesis (guaranteed here, since Case 1
         // returns for lcl > genesis), `count >= fullReplayCount` yields a full
         // replay of the entire gap [genesis+1, target] for every mode — there is
@@ -631,7 +631,7 @@ mod tests {
     #[test]
     fn test_recent_from_genesis_large_count() {
         // Recent mode from genesis where count >= full_replay_count.
-        // Per CATCHUP_SPEC §6.2 Case 2 and stellar-core calculateCatchupRange,
+        // Per CATCHUP_SPEC §6.3 Case 2 and stellar-core calculateCatchupRange,
         // lcl == genesis with count >= fullReplayCount yields a full replay from
         // genesis+1 (no lcl guard on Case 2).
         let range = CatchupRange::calculate(1, 63, CatchupMode::Recent(100));

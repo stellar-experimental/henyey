@@ -80,7 +80,7 @@ impl RangeEntry {
 
 /// Counters for bucket entries by type and durability.
 ///
-/// Spec: BUCKETLISTDB_SPEC §9.3 — BucketEntryCounters (entry counters auxiliary data).
+/// Spec: BUCKETLISTDB_SPEC §3.4 — BucketEntryCounters.
 /// Spec uses a combined `LedgerEntryTypeAndDurability` key; henyey uses separate
 /// maps by `LedgerEntryType` plus `persistent_soroban_entries` /
 /// `temporary_soroban_entries` counters. Equivalent information, different layout.

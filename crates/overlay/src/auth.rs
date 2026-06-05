@@ -641,7 +641,7 @@ impl AuthContext {
     pub fn hello_sent(&mut self) {
         // For the initiator, this transitions Initial → HelloSent.
         // For the responder (who receives Hello first), state is already
-        // HelloReceived so this is a no-op — that's correct per OVERLAY_SPEC §4.5.
+        // HelloReceived so this is a no-op — that's correct per OVERLAY_SPEC §5.4.
         if self.state == AuthState::Initial {
             self.state = AuthState::HelloSent;
         }
@@ -804,7 +804,7 @@ impl AuthContext {
                         &expected_mac.mac[..8],
                         &v0.mac.mac[..8],
                     );
-                    // Spec: OVERLAY_SPEC §5.2 — MAC comparison MUST be constant-time
+                    // Spec: OVERLAY_SPEC §4.3 — MAC comparison MUST be constant-time
                     // to prevent timing side-channel attacks.
                     if !constant_time_eq(&expected_mac.mac, &v0.mac.mac) {
                         return Err(OverlayError::MacVerificationFailed);
@@ -1244,7 +1244,7 @@ mod tests {
         );
     }
 
-    // ── OVERLAY_SPEC §4.5: Auth state transitions ─────────────────────
+    // ── OVERLAY_SPEC §5.4: Auth state transitions ─────────────────────
 
     #[test]
     fn test_constant_time_eq_equal() {

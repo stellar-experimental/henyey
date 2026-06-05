@@ -91,7 +91,7 @@ impl Connection {
     pub fn new(stream: TcpStream, direction: ConnectionDirection) -> Result<Self> {
         let remote_addr = stream.peer_addr()?;
 
-        // Spec: OVERLAY_SPEC §4.1 — TCP_NODELAY and SO_LINGER MUST be set.
+        // Spec: OVERLAY_SPEC §5.3 — TCP_NODELAY and SO_LINGER MUST be set.
         stream.set_nodelay(true)?;
         // SO_LINGER with timeout=0 causes immediate close (RST) without waiting.
         let sock = socket2::SockRef::from(&stream);

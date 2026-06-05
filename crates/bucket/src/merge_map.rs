@@ -316,7 +316,7 @@ impl BucketMergeMap {
 
     /// Removes all merge records for outputs not in the given set.
     ///
-    /// Spec: BUCKETLISTDB_SPEC §8.3 (analogue) — housekeeping for the merge map.
+    /// Spec: BUCKETLISTDB_SPEC §8.2 (analogue) — housekeeping for the merge map.
     ///
     /// This is called by `retain_buckets()` after bucket files are deleted, to
     /// remove stale merge-map entries that reference deleted outputs. This is a
@@ -340,7 +340,7 @@ impl BucketMergeMap {
 
     /// Removes all merge records that produce the given output hash.
     ///
-    /// Spec: BUCKETLISTDB_SPEC §8.3 (analogue) — removes merge map entries producing
+    /// Spec: BUCKETLISTDB_SPEC §8.2 (analogue) — removes merge map entries producing
     /// a given output hash.
     ///
     /// Returns the set of merge keys that were removed.
