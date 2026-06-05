@@ -307,6 +307,30 @@ pub(super) fn make_error_msg(code: ErrorCode, message: &str) -> StellarMessage {
     StellarMessage::ErrorMsg(SError { code, msg })
 }
 
+/// Sanitize a received ERROR_MSG body for logging (OVERLAY §7.1.3-1).
+///
+/// Mirrors stellar-core `Peer::recvError` (Peer.cpp:1698-1733): the message is
+/// built with `std::transform` over the raw `msg.error().msg` bytes using
+/// `(isAsciiAlphaNumeric(c) || c == ' ') ? c : '*'`. Every byte that is not
+/// ASCII-alphanumeric and not a space — including control chars, ANSI escape
+/// sequences, DEL (0x7f), and high bytes (> 0x7f) — is replaced with `*`.
+///
+/// IMPORTANT: this operates on the raw `StringM` bytes (`&err.msg[..]`), NOT on
+/// `StringM::to_string()`, which already escapes non-printable bytes via
+/// `escape_bytes` (e.g. `0x1b` renders as the 4 chars `\x1b`). Sanitizing the
+/// escaped string would not match stellar-core's per-byte transform.
+pub(crate) fn sanitize_error_msg(raw: &[u8]) -> String {
+    raw.iter()
+        .map(|&b| {
+            if b.is_ascii_alphanumeric() || b == b' ' {
+                b as char
+            } else {
+                '*'
+            }
+        })
+        .collect()
+}
+
 /// Send an error to a peer then request its task to shut down.
 ///
 /// Matches stellar-core `Peer::sendErrorAndDrop` (Peer.cpp:722-729).
@@ -1094,21 +1118,23 @@ impl OverlayManager {
         let msg_type = helpers::message_type_name(&message);
         trace!("Processing message_type={} from {}", msg_type, peer_id);
 
-        // Log ERROR messages (Load rejections are expected, log at debug)
+        // Log ERROR messages (Load rejections are expected, log at debug).
+        // OVERLAY §7.1.3-1: sanitize the raw message bytes before logging (do
+        // NOT use `to_string()`, which escapes rather than collapses bytes).
         if let StellarMessage::ErrorMsg(ref err) = message {
             if err.code == ErrorCode::Load {
                 debug!(
                     "Peer sent_error peer={} code={:?} msg={}",
                     peer_id,
                     err.code,
-                    err.msg.to_string()
+                    sanitize_error_msg(&err.msg[..])
                 );
             } else {
                 warn!(
                     "Peer sent_error peer={} code={:?} msg={}",
                     peer_id,
                     err.code,
-                    err.msg.to_string()
+                    sanitize_error_msg(&err.msg[..])
                 );
             }
             // Parity: stellar-core's recvError() unconditionally
@@ -1377,6 +1403,36 @@ mod tests {
     #[test]
     fn test_truncate_error_msg_empty() {
         assert_eq!(truncate_error_msg(""), "");
+    }
+
+    // OVERLAY §7.1.3-1: ERROR_MSG sanitization on receipt. Mirrors
+    // stellar-core `Peer::recvError` (Peer.cpp:1698-1733): every byte that is
+    // not ASCII-alphanumeric and not a space is replaced with `*`.
+
+    #[test]
+    fn test_sanitize_error_msg_replaces_control_and_ansi() {
+        // `error` kept, ESC(0x1b)->*, `[`->*, `31` kept, `m` kept, `red` kept,
+        // NUL(0x00)->*.
+        assert_eq!(
+            sanitize_error_msg(b"error\x1b[31mred\x00"),
+            "error**31mred*"
+        );
+    }
+
+    #[test]
+    fn test_sanitize_error_msg_high_bytes() {
+        // Bytes > 0x7f are non-ASCII-alphanumeric -> `*`.
+        assert_eq!(sanitize_error_msg(b"a\xff\x80z"), "a**z");
+    }
+
+    #[test]
+    fn test_sanitize_error_msg_preserves_alnum_space() {
+        assert_eq!(sanitize_error_msg(b"valid error 123"), "valid error 123");
+    }
+
+    #[test]
+    fn test_sanitize_error_msg_empty() {
+        assert_eq!(sanitize_error_msg(b""), "");
     }
 
     #[test]
