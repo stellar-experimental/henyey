@@ -69,7 +69,7 @@ pub enum FutureBucketState {
 ///
 /// Used to deduplicate concurrent merge requests for the same inputs.
 ///
-/// Spec: BUCKETLISTDB_SPEC §7.3 — MergeKey intentionally omits shadowHashes,
+/// Spec: BUCKETLISTDB_SPEC §7.6 — MergeKey intentionally omits shadowHashes,
 /// normalize_init, and protocol_version fields present in stellar-core's MergeKey.
 /// Shadow buckets were removed in protocol 12; henyey supports P24+ only, so shadow
 /// vectors are always empty and excluded from merge identity. The normalize_init and

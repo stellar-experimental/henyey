@@ -484,7 +484,7 @@ impl CatchupManager {
         )
         .await?;
 
-        // Spec: CATCHUP_SPEC §8.5 — verify HAS/header seq agreement before any
+        // Spec: CATCHUP_SPEC §8.2 — verify HAS/header seq agreement before any
         // persistent side effects. Guards `catchup_to_ledger_with_checkpoint_data`
         // where HAS and header are supplied externally.
         if has.current_ledger != checkpoint_header.ledger_seq {

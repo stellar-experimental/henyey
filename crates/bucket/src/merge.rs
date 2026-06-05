@@ -800,7 +800,7 @@ fn is_shadowed(entry: &BucketEntry, cursors: &mut [ShadowCursor<'_>]) -> Result<
 /// Returns `Ok(Some(entry))` if the entry should be emitted, or `Ok(None)` if shadowed.
 /// When `shadow_cursors` is empty, this always returns `Some(entry)`.
 ///
-/// Spec: BUCKETLISTDB_SPEC §6.3 — shadow-aware entry filtering.
+/// Spec: BUCKETLISTDB_SPEC §6.4 — shadow-aware entry filtering.
 fn maybe_put(
     entry: BucketEntry,
     shadow_cursors: &mut [ShadowCursor<'_>],
@@ -853,7 +853,7 @@ fn maybe_normalize_entry(entry: BucketEntry, normalize: InitEntryPolicy) -> Buck
 ///
 /// Returns the merged entry, or None if the entry should be removed.
 ///
-/// Spec: BUCKETLISTDB_SPEC §6.4 — merge two entries with same key per CAP-0020.
+/// Spec: BUCKETLISTDB_SPEC §6.5 — merge two entries with same key per CAP-0020.
 ///
 /// Merge semantics per CAP-0020:
 /// - INITENTRY + DEADENTRY → Both annihilated (nothing output)

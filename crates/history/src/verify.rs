@@ -743,7 +743,7 @@ pub fn verify_has_structure(has: &HistoryArchiveState) -> Result<()> {
         ));
     }
 
-    // Spec: CATCHUP_SPEC §4.4 — version 2 introduced hotArchiveBuckets.
+    // Spec: CATCHUP_SPEC §3.1 — version 2 introduced hotArchiveBuckets.
     // When present, it must have exactly HOT_ARCHIVE_BUCKET_LIST_LEVELS entries.
     // Version 1 must NOT have hotArchiveBuckets.
     // Version 2 MUST have hotArchiveBuckets (stellar-core deserializes it

@@ -589,7 +589,7 @@ impl OverlayManager {
     ) -> bool {
         const PEER_TIMEOUT: Duration = Duration::from_secs(30);
         const PEER_STRAGGLER_TIMEOUT: Duration = Duration::from_secs(120);
-        // OVERLAY_SPEC §5.6 — drop peer if no SEND_MORE_EXTENDED for this long.
+        // OVERLAY_SPEC §4.6 — drop peer if no SEND_MORE_EXTENDED for this long.
         const PEER_SEND_MODE_IDLE_TIMEOUT_SECS: u64 = 60;
 
         let now = Instant::now();
@@ -735,7 +735,7 @@ impl OverlayManager {
             return Some(false);
         }
 
-        // OVERLAY_SPEC §9.4: PEERS message validation.
+        // OVERLAY_SPEC §7.2: PEERS message validation.
         match validate_incoming_peers(ctx.peer.direction(), *ctx.received_peers, message) {
             PeersValidation::NotPeers => {}
             PeersValidation::AcceptFirst => {
@@ -743,14 +743,14 @@ impl OverlayManager {
             }
             PeersValidation::RejectWrongDirection => {
                 warn!(
-                    "Peer {} sent PEERS but we are the responder — dropping (OVERLAY_SPEC §9.4)",
+                    "Peer {} sent PEERS but we are the responder — dropping (OVERLAY_SPEC §7.2)",
                     peer_id
                 );
                 return None; // signal break
             }
             PeersValidation::RejectDuplicate => {
                 warn!(
-                    "Peer {} sent duplicate PEERS — dropping (OVERLAY_SPEC §9.4)",
+                    "Peer {} sent duplicate PEERS — dropping (OVERLAY_SPEC §7.2)",
                     peer_id
                 );
                 return None; // signal break
@@ -937,7 +937,7 @@ impl OverlayManager {
         let mut periodic_interval = tokio::time::interval(Duration::from_secs(1));
         let mut ticks_since_ping: u32 = 0;
 
-        // OVERLAY_SPEC §9.4: Track whether we've received a PEERS message
+        // OVERLAY_SPEC §7.2: Track whether we've received a PEERS message
         // from this peer. At most one is allowed; duplicates cause a drop.
         let mut received_peers = false;
         let mut query_limiter = QueryRateLimiter::new();

@@ -222,7 +222,7 @@ impl Peer {
     /// `initial_byte_grant` is the byte capacity sent in the initial
     /// SEND_MORE_EXTENDED — typically from [`FlowControlBytesConfig::bytes_total`].
     /// `initial_message_grant` is the message-level flood reading capacity
-    /// (OVERLAY_SPEC §5.4.4, stellar-core `PEER_FLOOD_READING_CAPACITY`).
+    /// (OVERLAY_SPEC §8.3, stellar-core `PEER_FLOOD_READING_CAPACITY`).
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn connect_with_connection(
         addr: &PeerAddress,
@@ -271,7 +271,7 @@ impl Peer {
     /// `initial_byte_grant` is the byte capacity sent in the initial
     /// SEND_MORE_EXTENDED — typically from [`FlowControlBytesConfig::bytes_total`].
     /// `initial_message_grant` is the message-level flood reading capacity
-    /// (OVERLAY_SPEC §5.4.4, stellar-core `PEER_FLOOD_READING_CAPACITY`).
+    /// (OVERLAY_SPEC §8.3, stellar-core `PEER_FLOOD_READING_CAPACITY`).
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn accept(
         connection: Connection,
@@ -322,7 +322,7 @@ impl Peer {
 
     /// Perform the authenticated handshake with a peer.
     ///
-    /// OVERLAY_SPEC §5.4: The handshake ordering depends on direction:
+    /// OVERLAY_SPEC §4.4.2: The handshake ordering depends on direction:
     ///
     /// **Initiator (outbound)**: Send HELLO -> Receive HELLO -> Send AUTH -> Receive AUTH
     /// **Responder (inbound)**:  Receive HELLO -> Send HELLO -> Receive AUTH -> Send AUTH
@@ -490,7 +490,7 @@ impl Peer {
         // Send SEND_MORE_EXTENDED to enable flow control.
         // Matches stellar-core Peer::recvAuth() → sendSendMore().
         // Both grants are derived from configuration at overlay startup —
-        // OVERLAY_SPEC §5.4.4 / §7.2.
+        // OVERLAY_SPEC §8.3 (initial SEND_MORE_EXTENDED capacity grant).
         let send_more = StellarMessage::SendMoreExtended(stellar_xdr::curr::SendMoreExtended {
             num_messages: initial_message_grant,
             num_bytes: initial_byte_grant,
