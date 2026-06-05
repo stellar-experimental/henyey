@@ -3009,6 +3009,14 @@ impl App {
             .snapshot()
     }
 
+    /// Snapshot of live eviction counters.
+    pub fn eviction_counters_snapshot(&self) -> henyey_bucket::EvictionCountersSnapshot {
+        self.ledger_manager
+            .bucket_list()
+            .eviction_counters()
+            .snapshot()
+    }
+
     /// Snapshot of overlay metrics (if overlay is running).
     pub async fn overlay_metrics_snapshot(&self) -> Option<henyey_overlay::OverlayMetricsSnapshot> {
         let overlay = self.overlay.read().await;

@@ -120,6 +120,8 @@ fn run_eviction_scan(
     let resolved = eviction_result.resolve(
         context.eviction_settings.max_entries_to_archive,
         &modified_keys,
+        context.header.ledger_seq,
+        Some(bucket_list.eviction_counters()),
     );
 
     Ok(EvictionScanResult {
