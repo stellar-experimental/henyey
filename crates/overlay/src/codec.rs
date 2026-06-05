@@ -284,25 +284,18 @@ impl Encoder<AuthenticatedMessage> for MessageCodec {
 
 /// Helper functions for working with Stellar messages.
 ///
-/// Provides utilities for message classification, hashing, and display.
+/// Provides utilities for message classification and display.
+///
+/// # Flood deduplication hashing
+///
+/// This module does **not** provide the flood-dedup hash. Per
+/// `OVERLAY_SPEC.md` §3.3, flood message deduplication uses **BLAKE2b-256**
+/// over the XDR serialization of the entire `StellarMessage` (matching
+/// stellar-core's `xdrBlake2()` in `Floodgate::broadcast()`) — **not**
+/// SHA-256. The authoritative implementation is
+/// [`crate::flood::compute_message_hash`]; all flood-gate call sites use it.
 pub mod helpers {
-    use super::*;
     use stellar_xdr::curr::StellarMessage;
-
-    /// Computes the SHA-256 hash of a message for flood tracking.
-    ///
-    /// The hash is computed over the XDR-encoded message bytes.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the message cannot be XDR-serialized (should never happen
-    /// for valid `StellarMessage` values).
-    pub fn message_hash(message: &StellarMessage) -> henyey_common::Hash256 {
-        let bytes = message
-            .to_xdr(Limits::none())
-            .expect("StellarMessage XDR serialization must not fail");
-        henyey_common::Hash256::hash(&bytes)
-    }
 
     /// Returns true if this message type is flow-controlled (uses flood/flow
     /// capacity). This includes both globally-deduplicated flood payloads
