@@ -27,6 +27,7 @@
 use crate::{OverlayError, PeerAddress, ResolvedPeerAddr, Result};
 use parking_lot::{Mutex, RwLock};
 use rand::seq::SliceRandom;
+use rand::Rng;
 use rusqlite::{params, Connection};
 use std::collections::HashMap;
 use std::path::Path;
@@ -618,7 +619,12 @@ fn apply_type_update(record: &mut PeerRecord, update: TypeUpdate) {
 fn compute_backoff(num_failures: u32) -> Duration {
     let backoff_count = num_failures.min(MAX_BACKOFF_EXPONENT);
     let max_seconds = (1u64 << backoff_count) * SECONDS_PER_BACKOFF;
-    let random_seconds = rand::random::<u64>() % max_seconds + 1;
+    // Sample uniformly in [1, max_seconds] (inclusive), matching the spec's
+    // random_uniform(1, max_seconds). `gen_range` is unbiased, unlike the
+    // previous `rand::random() % max_seconds` which had modulo bias. See
+    // OVERLAY_SPEC §10.3 (claim OVERLAY §10.3-1). max_seconds is always >= 1
+    // since backoff_count >= 0 and SECONDS_PER_BACKOFF >= 1.
+    let random_seconds = rand::thread_rng().gen_range(1..=max_seconds);
     Duration::from_secs(random_seconds)
 }
 
