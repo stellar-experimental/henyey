@@ -79,7 +79,7 @@ Apply `/project-tick` Step 2 (OPEN, status ∈ {backlog, ready-for-planning, rea
 
 ### Step D — Central pick (up to N, conflict-avoiding)
 
-Sort the actionable list by `/project-tick` Step 3 ordering (state priority `in-review` > `ready-for-doing` > `ready-for-planning` > `backlog`; then label priority; then age). Then walk the sorted list and select up to `N − |IN_FLIGHT|` issues, applying **conflict-avoidance**:
+Sort the actionable list by `/project-tick` Step 3 ordering, which **leads with the urgent override**: any OPEN issue labeled `urgent` sorts to the **very top**, ahead of all state-priority tiers (an `urgent` `backlog` item **outranks** a non-urgent `in-review` item); then state priority `in-review` > `ready-for-doing` > `ready-for-planning` > `backlog`; then label priority; then age. An `urgent` issue still in untriaged `backlog` is therefore picked **first** and dispatched to `/triage` immediately on the next pass — never deferred behind lower-priority work. Triage urgents immediately — first, **not a triage bypass**: urgents still flow through `/triage` via the existing `backlog → haiku /triage` dispatch in Step E; they simply go first. Then walk the sorted list and select up to `N − |IN_FLIGHT|` issues, applying **conflict-avoidance**:
 
 - For each candidate, estimate the **area** it will touch:
   - `in-review` / `ready-for-doing`: the crate(s) / script(s) / skill-dir(s) named in the linked PR's changed files (for in-review) or the plan's "Files to change" section (for ready-for-doing). When unknown, treat the issue's primary label/title area as the lock.
@@ -135,13 +135,25 @@ Then handle these special cases before the next pass:
 
   Use the **Bash tool's `run_in_background`** for the poller (a detached re-invoke on completion), not a foreground `sleep`. When CI is **green**, the next pass picks the in-review item and dispatches `/review-pr` to merge. When CI is **red**, the next pass picks it and `/review-pr` bounces it.
 
-- **Known flaky testnet check (#2916 — "horizon core up"):** if the **sole** failing check on a PR is the flaky testnet "horizon core up" job and everything else is green, **re-run that one failed job once**, then re-check:
+- **Known flaky testnet check (#2916 — "horizon core up"):** if the **sole** failing check on a PR is the flaky testnet "horizon core up" job and everything else is green, you may **re-run that one failed job once** — **but only after the main-health pre-check below clears it as a genuine, PR-isolated flake.**
+
+  **Main-health pre-check (before any re-run).** A re-run is only legitimate when the failure is isolated to the PR. First check whether the **same check is systematically red on `main`**. The "horizon core up" leg is a **check within the quickstart workflow**, not a standalone workflow — so query `main`'s recent check-runs and filter **by check name** (`HEAD` + the last ~3 commits), not by a 1:1 workflow:
+
+  ```bash
+  # Per-commit conclusion of the SAME check (by name) on recent main HEAD commits.
+  gh run list --repo stellar-experimental/henyey --branch main --limit 5 \
+    --json headSha,conclusion,name,workflowName,createdAt
+  # (or `gh api` for per-check-run conclusions when the check is a job inside a workflow)
+  ```
+
+  - If the same check is **red across ≥2 recent `main` commits**, classify it as a **regression / infra-outage — NOT flaky**. Do **NOT** re-run. File (or escalate) an **`urgent`-labeled** issue capturing the **green→red commit boundary** (last green `main` sha → first red `main` sha) and record the escalation. The new `urgent` issue is then drained **first** by the urgent-override pick order (Step D), so a systematic CI regression is surfaced and prioritized instead of being masked by a blind re-run.
+  - Only treat it as **flaky and re-run** when **`main` is green** and the failure is isolated to the PR:
 
   ```bash
   gh run rerun <RUN_ID> --repo stellar-experimental/henyey --failed
   ```
 
-  Record an anomaly if you re-run the same check ≥2× (flaky-quarantine candidate). Do not re-run other failing checks automatically — those are real and go to `/review-pr` for a bounce.
+  This regression-escalation path is **distinct from** the existing `flaky-rerun` anomaly (below): `flaky-rerun` records a genuine isolated flake re-run ≥2× (flaky-quarantine candidate); the main-health guard instead escalates a *systematic* red as an `urgent` regression and does not re-run at all. Record an anomaly if you re-run the same check ≥2× on the flaky path. Do not re-run other failing checks automatically — those are real and go to `/review-pr` for a bounce.
 
 - **Sibling nit consolidation:** when several follow-up issues are sibling **nits** touching the **same file/area** (typically self-improvement or post-review follow-ups filed against one PR), consolidate them into **one** `/do` PR rather than one PR each. Dispatch a single `/do` whose prompt lists all the sibling issue numbers and instructs it to close them together (`Closes #a #b #c` in the PR body). This avoids N near-identical PRs churning the same file and N review cycles.
 
