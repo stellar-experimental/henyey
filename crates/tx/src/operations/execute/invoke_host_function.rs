@@ -468,6 +468,7 @@ pub(crate) fn execute_invoke_host_function(
             module_cache: soroban.module_cache,
             guarded_hot_archive: soroban.guarded_hot_archive,
             ttl_key_cache: soroban.ttl_key_cache,
+            p23_sac_reconciler: soroban.p23_sac_reconciler,
         },
         state,
         context,
@@ -483,6 +484,9 @@ struct ContractInvocationRequest<'a> {
     module_cache: Option<&'a PersistentModuleCache>,
     guarded_hot_archive: Option<crate::soroban::GuardedHotArchive<'a>>,
     ttl_key_cache: Option<&'a crate::soroban::TtlKeyCache>,
+    /// Protocol-23 SAC corruption event reconciler (observability-only; off by
+    /// default). Present only when `BACKFILL_STELLAR_ASSET_EVENTS` is enabled.
+    p23_sac_reconciler: Option<&'a crate::events::P23SacReconciler>,
 }
 
 fn execute_contract_invocation(
@@ -500,6 +504,7 @@ fn execute_contract_invocation(
         module_cache,
         guarded_hot_archive,
         ttl_key_cache,
+        p23_sac_reconciler,
     } = request;
 
     // Convert auth entries to a slice
@@ -660,7 +665,13 @@ fn execute_contract_invocation(
 
             Ok(OperationExecutionResult::with_soroban_meta(
                 make_result(InvokeHostFunctionResultCode::Success, result_hash),
-                build_soroban_operation_meta(&result, hot_archive_original_entries),
+                build_soroban_operation_meta(
+                    &result,
+                    hot_archive_original_entries,
+                    p23_sac_reconciler,
+                    &context.network_id,
+                    context.protocol_version,
+                ),
             ))
         }
         Err(exec_error) => {
@@ -757,11 +768,19 @@ fn compute_success_preimage_hash(return_value: &ScVal, events: &[ContractEvent])
 fn build_soroban_operation_meta(
     result: &crate::soroban::SorobanExecutionResult,
     hot_archive_restores: Vec<HotArchiveRestore>,
+    p23_sac_reconciler: Option<&crate::events::P23SacReconciler>,
+    network_id: &henyey_common::NetworkId,
+    protocol_version: u32,
 ) -> SorobanOperationMeta {
     // Use contract_events which contains the decoded Contract and System events.
-    let events = result.contract_events.clone();
+    let mut events = result.contract_events.clone();
 
-    // Build diagnostic events from the contract events
+    // Build diagnostic events from the contract events BEFORE any P23 SAC
+    // reconciliation events are prepended. stellar-core routes reconciliation
+    // events only through the op-meta event stream
+    // (`InvokeHostFunctionOpFrame.cpp:825` `setEvents`), NOT the diagnostic
+    // channel — so we deliberately compute diagnostics off the untouched host
+    // events here.
     let mut diagnostic_events: Vec<DiagnosticEvent> = events
         .iter()
         .map(|event| DiagnosticEvent {
@@ -771,6 +790,37 @@ fn build_soroban_operation_meta(
         .collect();
 
     diagnostic_events.extend(result.diagnostic_events.iter().cloned());
+
+    // Protocol-23 SAC mint/burn event reconciliation backfill (issue #3126).
+    //
+    // Observability-only and off by default: the reconciler is `Some` only when
+    // `BACKFILL_STELLAR_ASSET_EVENTS` is enabled. Synthetic reconciliation
+    // events are PREPENDED to the op-meta event stream, mirroring
+    // `InvokeHostFunctionOpFrame::setEvents` (`InvokeHostFunctionOpFrame.cpp:772-815`).
+    // Critically, this runs AFTER `compute_success_preimage_hash` has already
+    // hashed the UNTOUCHED `result.contract_events`, so it has zero effect on
+    // the InvokeHostFunction success-preimage hash, the tx-result hash, or the
+    // `bucketListHash` — exactly mirroring stellar-core hashing `success`
+    // (`InvokeHostFunctionOpFrame.cpp:821`) before `setEvents` (`:825`).
+    if let Some(reconciler) = p23_sac_reconciler {
+        let restores = hot_archive_restores
+            .iter()
+            .map(|r| (r.key().clone(), r.entry().clone()));
+        match reconciler.reconciliation_events_for_restores(network_id, restores, protocol_version)
+        {
+            Ok(recon_events) if !recon_events.is_empty() => {
+                // Prepend, preserving restore order ahead of the host events.
+                events.splice(0..0, recon_events);
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    "P23 SAC reconciliation failed; emitting no reconciliation events"
+                );
+            }
+        }
+    }
 
     SorobanOperationMeta {
         events,
@@ -1493,6 +1543,8 @@ mod tests {
             module_cache: None,
             guarded_hot_archive: None,
             ttl_key_cache: None,
+            classic_events: crate::events::ClassicEventConfig::default(),
+            p23_sac_reconciler: None,
         };
         let result = execute_invoke_host_function(&op, &source, &mut state, &context, &soroban)
             .expect("invoke host function");
@@ -1572,6 +1624,8 @@ mod tests {
             module_cache: None,
             guarded_hot_archive: None,
             ttl_key_cache: None,
+            classic_events: crate::events::ClassicEventConfig::default(),
+            p23_sac_reconciler: None,
         };
         let result = execute_invoke_host_function(&op, &source, &mut state, &context, &soroban)
             .expect("invoke host function");
@@ -1656,6 +1710,8 @@ mod tests {
             module_cache: Some(&module_cache),
             guarded_hot_archive: None,
             ttl_key_cache: None,
+            classic_events: crate::events::ClassicEventConfig::default(),
+            p23_sac_reconciler: None,
         };
         let result = execute_invoke_host_function(&op, &source, &mut state, &context, &soroban)
             .expect("invoke host function");
@@ -1741,6 +1797,8 @@ mod tests {
             module_cache: Some(&module_cache),
             guarded_hot_archive: None,
             ttl_key_cache: None,
+            classic_events: crate::events::ClassicEventConfig::default(),
+            p23_sac_reconciler: None,
         };
         let result = execute_invoke_host_function(&op, &source, &mut state, &context, &soroban)
             .expect("invoke host function");
@@ -1795,6 +1853,8 @@ mod tests {
             module_cache: None,
             guarded_hot_archive: None,
             ttl_key_cache: None,
+            classic_events: crate::events::ClassicEventConfig::default(),
+            p23_sac_reconciler: None,
         };
         let result = execute_invoke_host_function(&op, &source, &mut state, &context, &soroban)
             .expect("invoke host function");
@@ -4039,6 +4099,8 @@ mod tests {
             module_cache: None,
             guarded_hot_archive: None,
             ttl_key_cache: None,
+            classic_events: crate::events::ClassicEventConfig::default(),
+            p23_sac_reconciler: None,
         };
         let result = execute_invoke_host_function(&op, &source, &mut state, &context, &soroban)
             .expect("invoke host function");
@@ -4126,6 +4188,8 @@ mod tests {
             module_cache: None,
             guarded_hot_archive: None,
             ttl_key_cache: None,
+            classic_events: crate::events::ClassicEventConfig::default(),
+            p23_sac_reconciler: None,
         };
         let result = execute_invoke_host_function(&op, &source, &mut state, &context, &soroban)
             .expect("invoke host function");
@@ -4187,6 +4251,231 @@ mod tests {
         assert!(
             combined_size > limit,
             "Combined size exceeding limit must be rejected"
+        );
+    }
+
+    // ====================================================================
+    // Protocol 23 SAC reconciliation wire-in tests (issue #3126):
+    // reconciliation events land in op-meta (prepended) but NEVER in the
+    // hashed success preimage — i.e. zero consensus-hash impact.
+    // ====================================================================
+
+    /// Build a `SorobanExecutionResult` carrying the given host events and a
+    /// fixed return value (everything else neutral).
+    fn make_exec_result(
+        return_value: ScVal,
+        contract_events: Vec<ContractEvent>,
+    ) -> crate::soroban::SorobanExecutionResult {
+        crate::soroban::SorobanExecutionResult {
+            return_value,
+            storage_changes: vec![],
+            contract_events,
+            diagnostic_events: vec![],
+            cpu_insns: 0,
+            mem_bytes: 0,
+            contract_events_and_return_value_size: 0,
+            rent_fee: 0,
+            live_bucket_list_restores: vec![],
+            actual_restored_indices: vec![],
+        }
+    }
+
+    /// Build a SAC-balance CONTRACT_DATA entry + the reconciler that maps it to
+    /// a +diff mint, returning (reconciler, restore, expected_event).
+    fn p23_mint_fixture(
+        net: &henyey_common::NetworkId,
+    ) -> (
+        crate::events::P23SacReconciler,
+        HotArchiveRestore,
+        ContractEvent,
+    ) {
+        use stellar_xdr::curr::{
+            Asset, ContractDataDurability, ContractDataEntry, ContractId, ExtensionPoint, Hash,
+            LedgerEntry, LedgerEntryData, LedgerEntryExt, Limits, ScAddress, ScMap, ScMapEntry,
+            ScSymbol, ScVal, ScVec, WriteXdr,
+        };
+
+        let asset = Asset::CreditAlphanum4(stellar_xdr::curr::AlphaNum4 {
+            asset_code: stellar_xdr::curr::AssetCode4(*b"USDC"),
+            issuer: AccountId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
+                stellar_xdr::curr::Uint256([7u8; 32]),
+            )),
+        });
+
+        // Compute the SAC contract id the same way events.rs does.
+        use stellar_xdr::curr::{ContractIdPreimage, HashIdPreimage, HashIdPreimageContractId};
+        let preimage = HashIdPreimage::ContractId(HashIdPreimageContractId {
+            network_id: Hash::from(net.0),
+            contract_id_preimage: ContractIdPreimage::Asset(asset.clone()),
+        });
+        let cid = ContractId(Hash::from(henyey_common::Hash256::hash_xdr(&preimage)));
+
+        let owner = ScAddress::Contract(ContractId(Hash([9u8; 32])));
+        let make_entry = |amount: i64| -> LedgerEntry {
+            let key = ScVal::Vec(Some(ScVec(
+                vec![
+                    ScVal::Symbol(ScSymbol::try_from("Balance").unwrap()),
+                    ScVal::Address(owner.clone()),
+                ]
+                .try_into()
+                .unwrap(),
+            )));
+            let amt = {
+                let v = amount as i128;
+                ScVal::I128(stellar_xdr::curr::Int128Parts {
+                    hi: (v >> 64) as i64,
+                    lo: v as u64,
+                })
+            };
+            let val = ScVal::Map(Some(ScMap(
+                vec![
+                    ScMapEntry {
+                        key: ScVal::Symbol(ScSymbol::try_from("amount").unwrap()),
+                        val: amt,
+                    },
+                    ScMapEntry {
+                        key: ScVal::Symbol(ScSymbol::try_from("authorized").unwrap()),
+                        val: ScVal::Bool(true),
+                    },
+                    ScMapEntry {
+                        key: ScVal::Symbol(ScSymbol::try_from("clawback").unwrap()),
+                        val: ScVal::Bool(false),
+                    },
+                ]
+                .try_into()
+                .unwrap(),
+            )));
+            LedgerEntry {
+                last_modified_ledger_seq: 0,
+                data: LedgerEntryData::ContractData(ContractDataEntry {
+                    ext: ExtensionPoint::V0,
+                    contract: ScAddress::Contract(cid.clone()),
+                    key,
+                    durability: ContractDataDurability::Persistent,
+                    val,
+                }),
+                ext: LedgerEntryExt::V0,
+            }
+        };
+
+        // restored (corrupted) = 1000, correct = 600 → diff +400 → mint.
+        let corrupted = make_entry(1000);
+        let correct = make_entry(600);
+        let key = henyey_common::entry_to_key(&corrupted);
+
+        let reconciler = crate::events::P23SacReconciler::new(
+            net,
+            &[asset.to_xdr_base64(Limits::none()).unwrap().as_str()],
+            &[(
+                corrupted.to_xdr_base64(Limits::none()).unwrap().as_str(),
+                correct.to_xdr_base64(Limits::none()).unwrap().as_str(),
+            )],
+        )
+        .unwrap();
+
+        let restore = HotArchiveRestore::new(key, corrupted, 100);
+        let expected = reconciler
+            .reconciliation_events_for_restores(
+                net,
+                [(restore.key().clone(), restore.entry().clone())],
+                23,
+            )
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        (reconciler, restore, expected)
+    }
+
+    #[test]
+    fn test_invoke_host_function_p23_reconciliation_events_in_meta_not_hash() {
+        let net = henyey_common::NetworkId::testnet();
+        let (reconciler, restore, expected_event) = p23_mint_fixture(&net);
+
+        // A single pre-existing host event (distinct from the reconciliation
+        // event so the diagnostic-channel assertion is meaningful), plus a
+        // return value.
+        let host_event = ContractEvent {
+            ext: stellar_xdr::curr::ExtensionPoint::V0,
+            contract_id: Some(stellar_xdr::curr::ContractId(stellar_xdr::curr::Hash(
+                [123u8; 32],
+            ))),
+            type_: stellar_xdr::curr::ContractEventType::Contract,
+            body: stellar_xdr::curr::ContractEventBody::V0(stellar_xdr::curr::ContractEventV0 {
+                topics: vec![ScVal::U32(999)].try_into().unwrap(),
+                data: ScVal::U32(999),
+            }),
+        };
+        assert_ne!(host_event, expected_event);
+        let return_value = ScVal::U32(42);
+        let result = make_exec_result(return_value.clone(), vec![host_event.clone()]);
+
+        // The success-preimage hash is computed from the UNTOUCHED host events.
+        // It must be identical whether or not the reconciler runs.
+        let hash_baseline = compute_success_preimage_hash(&return_value, &result.contract_events);
+
+        // Backfill OFF (reconciler = None): events = host events only.
+        let meta_off = build_soroban_operation_meta(&result, vec![restore.clone()], None, &net, 23);
+        assert_eq!(
+            meta_off.events,
+            vec![host_event.clone()],
+            "flag off → no reconciliation events"
+        );
+
+        // Backfill ON: the mint event is PREPENDED ahead of the host event.
+        let meta_on = build_soroban_operation_meta(
+            &result,
+            vec![restore.clone()],
+            Some(&reconciler),
+            &net,
+            23,
+        );
+        assert_eq!(
+            meta_on.events.len(),
+            2,
+            "flag on → one reconciliation event prepended"
+        );
+        assert_eq!(
+            meta_on.events[0], expected_event,
+            "reconciliation event must be FIRST (prepended)"
+        );
+        assert_eq!(
+            meta_on.events[1], host_event,
+            "original host event must follow the reconciliation event"
+        );
+
+        // HASH INVARIANCE: the success-preimage hash over the host events is
+        // unaffected by the reconciler. The reconciliation events live ONLY in
+        // op-meta, never in the hashed preimage — zero consensus impact.
+        let hash_on = compute_success_preimage_hash(&return_value, &result.contract_events);
+        assert_eq!(
+            hash_baseline, hash_on,
+            "success-preimage hash must be identical with backfill on vs off"
+        );
+
+        // The diagnostic-event channel must NOT contain the reconciliation
+        // event (stellar-core routes it only through the op-meta event stream).
+        let recon_in_diag = meta_on
+            .diagnostic_events
+            .iter()
+            .any(|d| d.event == expected_event);
+        assert!(
+            !recon_in_diag,
+            "reconciliation events must not enter the diagnostic-event channel"
+        );
+    }
+
+    #[test]
+    fn test_invoke_host_function_p23_no_events_off_protocol_23() {
+        let net = henyey_common::NetworkId::testnet();
+        let (reconciler, restore, _expected) = p23_mint_fixture(&net);
+        let result = make_exec_result(ScVal::U32(1), vec![]);
+        // Even with the reconciler present, protocol != 23 → no events.
+        let meta =
+            build_soroban_operation_meta(&result, vec![restore], Some(&reconciler), &net, 24);
+        assert!(
+            meta.events.is_empty(),
+            "no reconciliation events outside protocol 23"
         );
     }
 }

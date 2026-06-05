@@ -22,16 +22,27 @@ name: Quickstart
 #
 # Image building is delegated to stellar/quickstart's reusable build
 # workflow with test: false. Test orchestration lives in this repo so we
-# can apply a timeout-only retry to the flaky testnet/core,horizon/
-# horizon-core-up probe without forking the entire upstream test matrix.
+# can apply a timeout-only retry to the flaky testnet/core,horizon shard
+# without forking the entire upstream test matrix.
 # Each probe is run through scripts/ci/run-quickstart-test.sh which adds:
 #   * GNU timeout with diagnostics capture on failure
-#   * Exactly one retry for testnet/core,horizon/horizon-core-up when the exit
-#     is a transient-infra signature: exit 124 (timeout / slow start, #2916) or
-#     exit 143 (SIGTERM — "runner has received a shutdown signal" / spot-runner
-#     reclamation, #3131). The retry is scoped to that one shard only.
+#   * Exactly one retry for ANY probe on the testnet/core,horizon shard when the
+#     exit is a transient-infra signature: exit 124 (timeout / slow start, #2916)
+#     or exit 143 (SIGTERM — "runner has received a shutdown signal" /
+#     spot-runner reclamation, #3131). Scope was widened from the single
+#     horizon-core-up probe to the whole shard in #3185: testnet stellar-core's
+#     slow catchup propagates to whichever probe runs next (horizon-ingesting
+#     timed out right after horizon-core-up came up — run 27019344504), and that
+#     probe had no retry. The retry stays scoped to this one shard.
 #   * No retry for any other shard, or for any non-transient failure (e.g. a
 #     genuine probe failure exit 1) — those still fail loudly.
+#
+# Whole-runner reclamation (#3185): when GitHub SIGTERMs the entire runner, the
+# bash wrapper is killed too and never reaches its in-script retry. The separate
+# `rerun-on-transient` job recovers that case by re-dispatching the failed jobs
+# once (run_attempt == 1 only) onto a fresh runner. A genuine failure reproduces
+# on attempt 2 and stays red, so this absorbs exactly one transient reclamation
+# without masking regressions.
 #
 # Upstream contract validation:
 #   The validate-contract job fetches both build.yml and internal-build.yml
@@ -480,3 +491,41 @@ jobs:
         run: |
           docker stop quickstart 2>/dev/null || true
           docker rm quickstart 2>/dev/null || true
+
+  # Auto-rerun on whole-runner SIGTERM (exit 143) reclamation (#3185).
+  #
+  # The in-wrapper retry in run-quickstart-test.sh self-heals a transient-infra
+  # exit (124 timeout / 143 SIGTERM) ONLY when the runner survives long enough
+  # for the bash wrapper to observe the probe's non-zero exit and re-run it.
+  # When GitHub reclaims the whole runner ("The runner has received a shutdown
+  # signal" + "Process completed with exit code 143" + "Cleaning up orphan
+  # processes", observed ~2 min into a probe with minutes left on its timeout —
+  # runs 27021800958 / 27028525980), the wrapper process is itself SIGTERM'd and
+  # never reaches its retry block. No in-job mechanism can recover a reclaimed
+  # runner; the only recovery is a fresh job attempt.
+  #
+  # This job runs on a SEPARATE runner after `test` finishes. On the FIRST run
+  # attempt only (run_attempt == 1), if `test` failed, it re-dispatches the
+  # failed jobs once via `gh run rerun --failed`. The re-dispatched attempt 2
+  # gets a fresh runner, so a one-off platform preemption self-heals without a
+  # manual re-run — mirroring the wrapper's single-retry threshold. A genuine
+  # (reproducible) test failure fails identically on attempt 2 and surfaces as a
+  # hard red, so this does not mask real regressions; it only absorbs a single
+  # transient reclamation. Subsequent attempts (run_attempt >= 2) never re-run,
+  # bounding the blast radius to exactly one extra attempt.
+  rerun-on-transient:
+    needs: test
+    if: failure() && github.run_attempt == 1
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - name: Re-dispatch failed jobs once on transient-infra failure
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          echo "test job failed on run_attempt=1; re-dispatching failed jobs once"
+          echo "(self-healing one-off runner reclamation / transient infra — #3185)."
+          gh run rerun "${{ github.run_id }}" --failed \
+            --repo "${{ github.repository }}"

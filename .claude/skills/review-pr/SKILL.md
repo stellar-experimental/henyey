@@ -23,7 +23,7 @@ argument-hint: <issue-number>
 
 You are the PR-level gate. Three independent signals decide the merge: **reviewer A**, **reviewer B**, and **CI**. All three must be green to auto-merge. Any red bounces.
 
-You do **not** review the code yourself — you orchestrate two independent reviewer sub-agents that use the existing `/review` and `/spec-adhere` skills (or `/review-fix` in review mode for risk-focused review), then combine their PR reviews with CI state.
+You do **not** review the code as one undifferentiated pass — you run two independent reviewer **lenses** that use the existing `/review` and `/spec-adhere` skills (or `/review-fix` in review mode for risk-focused review), then combine their PR reviews with CI state. Under the pipeline's current single-level dispatch model (the orchestrator spawns one specialist per issue; that specialist cannot itself spawn nested sub-agents), **you run both reviewer lenses yourself, as clearly-delimited in-agent passes** rather than as nested sub-agents — see the multi-lens discipline in Step 4.
 
 ## Inputs
 
@@ -94,7 +94,7 @@ Handle each state:
 
 ### Step 0.5 — Check if auto-merge is already armed
 
-Before spawning reviewers or filing follow-up issues, check whether this PR already has auto-merge enabled from a previous tick:
+Before running the reviewer passes or filing follow-up issues, check whether this PR already has auto-merge enabled from a previous tick:
 
 ```bash
 if ! AUTO_MERGE_STATE=$(is_auto_merge_armed $PR_NUM); then
@@ -282,15 +282,22 @@ If any path matches one of these prefixes, the PR is **parity-critical** — Rev
 
 Otherwise, the PR is **non-parity** — Reviewer B uses risk lens.
 
-## Step 4 — Spawn 2 reviewers in parallel
+## Step 4 — Run 2 reviewer lenses (in-agent multi-lens)
 
-Launch both `general-purpose` reviewers via the **Agent/Task tool** in a single message (so they run in parallel — do not dispatch them one at a time). Each is spawned with `model: opus` and `run_in_background: false`. The two distinct lenses (correctness + parity-or-risk) are the primary missed-bug defense; the adversarial refute pass in Step 6.1c is what trims the false-positive bounces.
+Run both reviewer lenses (correctness + parity-or-risk) as two clearly-delimited passes within this agent. Under the current dispatch model you cannot spawn nested reviewer sub-agents, so the downstream contract is the **structured comments + verdict markers**, not the number of OS-level agents. A disciplined in-agent multi-lens pass satisfies every Step 6 parser as long as you hold to these four properties:
 
-**Self-modifying detection (do the Step 5.5 path-match now, before spawning).** Compute `IS_SELF_MOD` per Step 5.5 first. If the PR is self-modifying, append the **extra-scrutiny checklist** from Step 5.5 to BOTH reviewer prompts below (skill frontmatter/markdown parses, scripts `bash -n` / source cleanly, no dispatch-table/step-numbering breakage). A self-modifying PR is NOT gated — it still auto-merges on triple-green — but the reviewers must confirm it cannot break the orchestrator's or specialists' next run.
+1. **Distinct framing per lens.** Before each pass, adopt ONLY that lens's brief (Reviewer A / B below is the per-pass framing). Do not carry the previous lens's conclusions into the next.
+2. **No cross-lens peeking.** Form and post each lens's verdict as its own separate comment — **two distinct `gh pr comment` calls with the two distinct headers** (`## 🔍 Reviewer: Correctness` and `## 🔍 Reviewer: <Parity|Risk>`), never one merged block — *before* starting the next lens. The Step 6.1 parser keys on the header line and keeps the latest comment per reviewer name, so each lens MUST be its own comment.
+3. **Explicit reset between lenses.** When you move to the second lens, evaluate it as if you had not authored the first — re-read the diff fresh through the new lens.
+4. **Refute as a genuine adversary** (Step 6.1c). The refute pass argues the *opposing* case as if it must prove a different reviewer wrong — see Step 6.1c for the stance-switch wording.
 
-**Review against current `origin/main` (do not review stale state).** Each reviewer prompt must instruct the sub-agent to `git fetch origin` and check out the PR head **rebased onto / merged with the latest `origin/main`** before reviewing or running anything — e.g. `git fetch origin && git checkout pr-$PR_NUM && git merge --no-edit origin/main` inside `$REVIEWER_WORKTREE`. Reviewing on a stale base is what caused historical merge-helper failures (the PR looked clean against an old main but conflicted or regressed against current main); always evaluate the PR as it will actually land.
+The two distinct lenses are the primary missed-bug defense; the adversarial refute pass in Step 6.1c is what trims the false-positive bounces. (If a future nested-spawn capability lands, these same two briefs can be dispatched as parallel sub-agents instead — the per-lens framing and comment shapes are unchanged.)
 
-**Workspace binding (issue #2843 — pass into every reviewer prompt).** Before spawning, run the Workspace-contract bootstrap to derive `$REVIEWER_WORKTREE` (under `~/data/$SESSION_ID/review-pr-$ISSUE/reviewer`). Pass that exact path into each reviewer prompt and require it as the ONLY scratch location:
+**Self-modifying detection (do the Step 5.5 path-match now, before the lens passes).** Compute `IS_SELF_MOD` per Step 5.5 first. If the PR is self-modifying, apply the **extra-scrutiny checklist** from Step 5.5 in BOTH reviewer passes below (skill frontmatter/markdown parses, scripts `bash -n` / source cleanly, no dispatch-table/step-numbering breakage). A self-modifying PR is NOT gated — it still auto-merges on triple-green — but the reviewer passes must confirm it cannot break the orchestrator's or specialists' next run.
+
+**Review against current `origin/main` (do not review stale state).** Each reviewer pass must `git fetch origin` and check out the PR head **rebased onto / merged with the latest `origin/main`** before reviewing or running anything — e.g. `git fetch origin && git checkout pr-$PR_NUM && git merge --no-edit origin/main` inside `$REVIEWER_WORKTREE`. Reviewing on a stale base is what caused historical merge-helper failures (the PR looked clean against an old main but conflicted or regressed against current main); always evaluate the PR as it will actually land.
+
+**Workspace binding (issue #2843 — applies to each reviewer pass).** Before the lens passes, run the Workspace-contract bootstrap to derive `$REVIEWER_WORKTREE` (under `~/data/$SESSION_ID/review-pr-$ISSUE/reviewer`). Use that exact path in each reviewer pass as the ONLY scratch location:
 
 > Your working directory and any checkout/build scratch MUST be `$REVIEWER_WORKTREE` (`<resolved-path>`). If you need a git worktree, run `git worktree add "$REVIEWER_WORKTREE/<sub>"`; if you build, set `CARGO_TARGET_DIR="$REVIEWER_WORKTREE/cargo-target"`. You are FORBIDDEN from creating `.review-data/`, `.review-worktrees/`, `.worktrees/`, `.copilot-tmp/`, `.opencode/worktrees/`, any `<repo>-pr<N>` sibling, or any path under `/tmp`. These are the disk-leak patterns from #2843 and have repeatedly filled the root FS.
 
@@ -434,11 +441,11 @@ Post via `gh pr comment $PR_NUM --repo stellar-experimental/henyey --body-file <
 > previously-raised classes; only add a new class with an explicit
 > \`**NEW CLASS DISCOVERED:**\` flag and rationale.
 
-Wait for both reviewers to post.
+Run both lens passes and post both verdict comments (each its own separate comment) before proceeding.
 
 ## Step 5 — Recheck CI
 
-Reviewers run in parallel with CI. By the time both have posted their reviews, CI may have finished. Re-query:
+The reviewer passes overlap with CI (CI runs on the PR head while you review). By the time both verdict comments are posted, CI may have finished. Re-query:
 
 ```bash
 ROLLUP=$(gh pr view $PR_NUM --repo stellar-experimental/henyey \
@@ -505,7 +512,7 @@ IS_SELF_MOD=$(echo "$SELF_MOD_FILES" | grep -Eq \
 
 If `IS_SELF_MOD == true`, the PR is **flagged** as self-modifying and the reviewers apply **extra scrutiny** — but it is **not** gated or escalated. It proceeds through the normal merge decision (Step 6) and auto-merges autonomously on triple-green, exactly like any other PR. Adversarial review + CI are the gate; there is no separate operator-approval hold.
 
-When the PR is self-modifying, instruct both reviewer sub-agents (Step 4) to explicitly verify the change cannot break the orchestrator's or specialists' next run, in addition to their normal lens. Add this checklist to their brief:
+When the PR is self-modifying, both reviewer passes (Step 4) must explicitly verify the change cannot break the orchestrator's or specialists' next run, in addition to their normal lens. Apply this checklist in each pass:
 
 - **Skill files still parse**: every changed `.claude/skills/*/SKILL.md` has valid YAML frontmatter (`name` / `description` / `argument-hint`) and is well-formed markdown — no truncated frontmatter, no broken fences.
 - **Scripts still source cleanly**: every changed `*.sh` passes `bash -n` (syntax check) and, for sourced libraries, `bash -c 'source <file>'` without error.
@@ -539,7 +546,7 @@ For each comment, extract the reviewer name from the first line (`## 🔍 Review
 - `Correctness` (always)
 - `Parity` or `Risk` (depending on parity-critical detection from Step 3)
 
-If only one verdict is found, **treat the missing one as `CHANGES_REQUESTED` and bounce.** A missing verdict means a reviewer sub-agent failed to post — that's the same failure mode as the "Reviewer sub-agent fails to post" entry in the failure-handling table below. Do NOT wait indefinitely on a missing verdict; bounce so `/do` Mode B can retry, and the next `/review-pr` cycle will spawn fresh reviewers. If both are present, use them. If a reviewer posted twice (e.g. revised verdict), the latest comment wins.
+If only one verdict is found, **treat the missing one as `CHANGES_REQUESTED` and bounce.** A missing verdict means a reviewer pass failed to produce its verdict comment — that's the same failure mode as the "Reviewer pass fails to produce a verdict comment" entry in the failure-handling table below. Do NOT wait indefinitely on a missing verdict; bounce so `/do` Mode B can retry, and the next `/review-pr` cycle will re-run fresh reviewer passes. If both are present, use them. If a reviewer posted twice (e.g. revised verdict), the latest comment wins.
 
 ### 6.1b Parse external reviewer verdicts (GH Copilot bot, humans, other bots)
 
@@ -569,16 +576,18 @@ Each external reviewer's verdict is the `state` of their latest review:
 
 This replaces the cross-model diversity the pipeline used to get from a second model, and directly cuts the false-positive bounces. Run it **after** the reviewers post and **before** applying the matrix.
 
-Enumerate every distinct blocking finding from the **agent** reviewers' latest `CHANGES_REQUESTED` verdicts (one finding = one concern bullet from a reviewer's `<details>` change-list). For each, spawn an independent `general-purpose` **skeptic** sub-agent via the Agent/Task tool, all in a **single message** so they run in parallel, each with `model: opus` and `run_in_background: false`. Each skeptic checks out the PR against current `origin/main` (same `git fetch origin` + merge instruction as Step 4) so it refutes on fresh state:
+Enumerate every distinct blocking finding from the **agent** reviewers' latest `CHANGES_REQUESTED` verdicts (one finding = one concern bullet from a reviewer's `<details>` change-list). For each, run an independent **refute pass** in-agent — one delimited pass per finding, per the Step 4 multi-lens discipline (distinct framing, explicit reset from the reviewer pass that raised it, **each refute posted as its own separate comment**). Switch stance and argue the opposing case as if you must prove a different reviewer wrong. Each refute pass first checks out the PR against current `origin/main` (same `git fetch origin` + merge instruction as Step 4) so it refutes on fresh state. Use this framing for each:
 
 > Reviewer <Correctness|Parity|Risk> raised this blocking finding (CHANGES_REQUESTED)
 > on PR #$PR_NUM in stellar-experimental/henyey:
 >
 > <verbatim finding bullet>
 >
-> Your job is to REFUTE this finding. First `git fetch origin` and check out the
-> PR head merged with the latest `origin/main` inside `$REVIEWER_WORKTREE` (do
-> NOT review stale state). Then argue, with evidence, that the finding is one of:
+> Switch stance and REFUTE this finding as a genuine adversary — argue the
+> opposing case as if you must prove a different reviewer wrong. First
+> `git fetch origin` and check out the PR head merged with the latest
+> `origin/main` inside `$REVIEWER_WORKTREE` (do NOT review stale state). Then
+> argue, with evidence, that the finding is one of:
 > (a) **wrong** — the diff already handles this, or the reviewer misread the
 > code; (b) **already-fixed on current `origin/main`** — the change the reviewer
 > wants already exists once the PR is rebased (confirm by reading the merged
@@ -591,10 +600,10 @@ Enumerate every distinct blocking finding from the **agent** reviewers' latest `
 > finding summary>` with an `**Outcome:** REFUTED | STANDS` line and a 2–4
 > bullet justification (cite files/lines for ground (b)).
 
-Wait for all skeptics. Then:
+After every refute pass has posted, read the outcomes. Then:
 
-- A finding is **dropped** if its skeptic returned `REFUTED` — it does NOT bounce the PR. Record it as `refuted: <reason>` in the eventual verdict comment.
-- A finding **stands** if its skeptic returned `STANDS` (or failed to post / errored after one retry — un-refuted findings stand, fail-safe toward the reviewer).
+- A finding is **dropped** if its refute pass returned `REFUTED` — it does NOT bounce the PR. Record it as `refuted: <reason>` in the eventual verdict comment.
+- A finding **stands** if its refute pass returned `STANDS` (or you could not produce an outcome after one retry — un-refuted findings stand, fail-safe toward the reviewer).
 
 For the matrix below, an **agent** reviewer's verdict is treated as `CHANGES_REQUESTED` only if **at least one** of its findings survived refutation. If every finding from that reviewer was refuted, treat that reviewer's verdict as `APPROVE` for matrix purposes (the dropped findings are still recorded in the verdict comment).
 
@@ -1092,7 +1101,7 @@ Exit.
 
 ## What you do NOT do
 
-- **Do not** post a review yourself. Spawn sub-agents that post their own structured comments — you only orchestrate and combine.
+- **Do not** post a single combined review. Run two reviewer passes that each post their own structured comment (each its own `gh pr comment` with its own header), then combine and parse those comments — do not merge the two lenses into one block (the Step 6.1 parser keys on the per-reviewer header).
 - **Do not** override or summarize the reviewers' verdicts. Their `**Verdict:**` line is the verdict. You read it; you don't rewrite it — except that an agent reviewer's CHANGES_REQUESTED finding is dropped if the Step 6.1c refute pass returns `REFUTED` (recorded as `refuted: <reason>`).
 - **Do not** run the refute pass on **external** CHANGES_REQUESTED reviews (GH Copilot bot, humans, other bots). Only the agent reviewers' own findings are refutable; external reviews gate as-is.
 - **Do** flag a **self-modifying** PR (touches the pipeline's own skills/scripts — see Step 5.5) and apply extra reviewer scrutiny, but **do not** hold it for operator approval — it auto-merges autonomously on triple-green like any other PR. If a reviewer genuinely doubts the change is safe for the live pipeline, that's a CHANGES_REQUESTED bounce, not an operator escalation.
@@ -1104,8 +1113,8 @@ Exit.
 
 | Failure | Action |
 |---|---|
-| Reviewer sub-agent fails to post | Retry once. If still failing, treat as `CHANGES_REQUESTED` and bounce. |
-| Refute skeptic fails to post (Step 6.1c) | Retry once. If still failing, the finding **stands** (fail-safe toward the reviewer) — it gates the matrix as a surviving CHANGES_REQUESTED. |
+| Reviewer pass fails to produce a verdict comment | Retry that pass once. If still failing, treat as `CHANGES_REQUESTED` and bounce. |
+| Refute pass fails to produce an outcome comment (Step 6.1c) | Retry that pass once. If still failing, the finding **stands** (fail-safe toward the reviewer) — it gates the matrix as a surviving CHANGES_REQUESTED. |
 | Reviewer's comment doesn't match the expected header/verdict shape | Treat as `pending`; if it stays malformed after Step 4 completes, bounce with a `## Review: Malformed Verdict` note. |
 | No PR linked | Bounce to `ready-for-doing` with `## Review: No PR Linked`. |
 | `gh pr merge --admin` fails with auto-merge hint | Retry with `--auto` (deferred merge). If `--auto` also fails, hard failure. See Step 7.3. |
@@ -1135,14 +1144,14 @@ mkdir -p "$REVIEWER_WORKTREE"
 
 This ensures build artifacts are isolated per-session and automatically discoverable
 for cleanup. The skill itself is read-only (no code changes), so it rarely needs a
-build cache — but if a reviewer sub-agent builds to verify, the target dir must
+build cache — but if a reviewer pass builds to verify, the target dir must
 resolve under `~/data` and within the session prefix.
 
 **Never create worktrees at the repo root or outside `~/data`.** All worktrees
 must be under `~/data/$SESSION_ID/` to avoid polluting the shared checkout.
 
 **Forbidden scratch patterns (issue #2843 — hard requirement).** Every reviewer
-sub-agent (and any `/review`, `/spec-adhere`, `/review-fix` it invokes) is bound
+pass (and any `/review`, `/spec-adhere`, `/review-fix` it invokes) is bound
 to `$REVIEWER_WORKTREE` and must NEVER create any of these observed disk-leak
 patterns — not in the repo tree, not as a `<repo>-pr<N>` sibling, not under `/tmp`:
 
