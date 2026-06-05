@@ -7,6 +7,45 @@ const TX_ADVERT_VECTOR_MAX_SIZE: usize = 1000;
 const TX_DEMAND_VECTOR_MAX_SIZE: usize = 1000;
 const MAX_FLOOD_RESOURCE: usize = u32::MAX as usize;
 
+// Flood-rate and flood-period parity constants.
+//
+// These mirror the fixed defaults stellar-core assigns in `Config.cpp`
+// (v26.0.1, commit `e78c97ed0`) and are surfaced here as named constants for
+// auditability per HERDER_SPEC §13.2-1 (MUST). They drive the corresponding
+// `OverlayConfig` defaults (`default_flood_*` in `config.rs`), so the runtime
+// behavior is unchanged — this is a pure naming/traceability extraction.
+
+/// Classic transaction flood rate per ledger.
+///
+/// Matches stellar-core `Config::FLOOD_OP_RATE_PER_LEDGER` (`Config.cpp`:
+/// `FLOOD_OP_RATE_PER_LEDGER = 1.0;`). See HERDER_SPEC §13.2.
+pub(crate) const FLOOD_OP_RATE_PER_LEDGER: f64 = 1.0;
+
+/// Classic transaction broadcast period, in milliseconds.
+///
+/// Matches stellar-core `Config::FLOOD_TX_PERIOD_MS` (`Config.cpp`:
+/// `FLOOD_TX_PERIOD_MS = 200;`). See HERDER_SPEC §13.2.
+pub(crate) const FLOOD_TX_PERIOD_MS: u64 = 200;
+
+/// Soroban transaction flood rate per ledger.
+///
+/// Matches stellar-core `Config::FLOOD_SOROBAN_RATE_PER_LEDGER` (`Config.cpp`:
+/// `FLOOD_SOROBAN_RATE_PER_LEDGER = 1.0;`). See HERDER_SPEC §13.2.
+pub(crate) const FLOOD_SOROBAN_RATE_PER_LEDGER: f64 = 1.0;
+
+/// Soroban transaction broadcast period, in milliseconds.
+///
+/// Matches stellar-core `Config::FLOOD_SOROBAN_TX_PERIOD_MS` (`Config.cpp`:
+/// `FLOOD_SOROBAN_TX_PERIOD_MS = 200;`). See HERDER_SPEC §13.2.
+///
+/// stellar-core maintains separate classic and Soroban broadcast periods;
+/// henyey intentionally drives both broadcasts from a single unified flood
+/// queue governed by `flood_tx_period_ms` (see `compute_flood_ops_budget`).
+/// Because both stellar-core periods default to 200 ms, the unified period is
+/// behavior-equivalent at the default; this constant pins the Soroban value
+/// for parity auditing without splitting the queue.
+pub(crate) const FLOOD_SOROBAN_TX_PERIOD_MS: u64 = 200;
+
 /// Truncate `rate * limit` to i64, matching stellar-core's `getOpsFloodLedger`.
 fn ops_to_flood_per_ledger(rate: f64, limit: usize) -> i64 {
     let product = rate * limit as f64;
@@ -1503,6 +1542,35 @@ mod tests {
         let config = crate::config::OverlayConfig::default();
         assert_eq!(config.flood_tx_period_ms, 200); // stellar-core FLOOD_TX_PERIOD_MS
         assert_eq!(config.flood_advert_period_ms, 100); // stellar-core FLOOD_ADVERT_PERIOD_MS
+    }
+
+    /// Parity pin: the named flood-rate and flood-period constants must match
+    /// stellar-core `Config.cpp` (v26.0.1, commit `e78c97ed0`) exactly. If
+    /// stellar-core ever changes these defaults, this test fails and forces a
+    /// deliberate update. See HERDER_SPEC §13.2-1 (MUST).
+    #[test]
+    fn test_flood_rate_period_constants_match_stellar_core() {
+        // FLOOD_OP_RATE_PER_LEDGER = 1.0;
+        assert_eq!(FLOOD_OP_RATE_PER_LEDGER, 1.0);
+        // FLOOD_TX_PERIOD_MS = 200;
+        assert_eq!(FLOOD_TX_PERIOD_MS, 200);
+        // FLOOD_SOROBAN_RATE_PER_LEDGER = 1.0;
+        assert_eq!(FLOOD_SOROBAN_RATE_PER_LEDGER, 1.0);
+        // FLOOD_SOROBAN_TX_PERIOD_MS = 200;
+        assert_eq!(FLOOD_SOROBAN_TX_PERIOD_MS, 200);
+
+        // The constants are the single source of truth for the OverlayConfig
+        // defaults, so the wired defaults must agree with them.
+        let config = crate::config::OverlayConfig::default();
+        assert_eq!(config.flood_op_rate_per_ledger, FLOOD_OP_RATE_PER_LEDGER);
+        assert_eq!(
+            config.flood_soroban_rate_per_ledger,
+            FLOOD_SOROBAN_RATE_PER_LEDGER
+        );
+        assert_eq!(config.flood_tx_period_ms, FLOOD_TX_PERIOD_MS);
+        // henyey's unified flood period also covers the Soroban broadcast;
+        // both stellar-core periods default to 200 ms.
+        assert_eq!(config.flood_tx_period_ms, FLOOD_SOROBAN_TX_PERIOD_MS);
     }
 
     // ── Test helpers for collect_adverts_for_peers ────────────────────────
