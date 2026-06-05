@@ -3236,6 +3236,145 @@ mod tests {
         );
     }
 
+    // ================================================================
+    // #3197: near-tip / archive-behind ROUTING fix. #3187 fixed the
+    // escalation TIMING (escalate early in the near-tip band) but routed
+    // to a doomed archive ProbeAhead/HardReset. The real fix is to route
+    // the near-tip / archive-behind band to peer-SCP recovery
+    // (AttemptRecovery → out_of_sync_recovery → broadcast_recovery_scp_state),
+    // mirroring stellar-core's HerderImpl::outOfSyncRecovery +
+    // tryApplySyncingLedgers, which never touch the archive near tip.
+    // The genuine 120s wall-clock stall backstop (#2789), recovery
+    // exhaustion (#1831), tx_set exhaustion, the far-behind archive path
+    // (#1862), and the cooldown fallback (#1843) all still escalate.
+    // ================================================================
+
+    /// Lead regression test (#3197). The exact production decision point:
+    /// `archive_behind + near_tip + schedule_due`, none of the genuine
+    /// escalation gates met (attempts=0, no tx_set exhaustion, no 120s
+    /// wall-clock stall, no cooldown). On the #3187 code this returns
+    /// `HardReset(ArchiveBehindStallWallClock)` (the doomed ProbeAhead path)
+    /// → FAILS pre-fix. After the routing fix it must return
+    /// `AttemptRecovery` (peer-SCP back-fill) → PASSES post-fix.
+    #[test]
+    fn test_decide_near_tip_archive_behind_routes_to_recovery_not_hardreset() {
+        let action = App::decide_consensus_stuck_action(StuckSignals {
+            catchup_in_progress: false,
+            archive_behind: true,
+            tx_set_exhausted: false,
+            schedule_due: true,
+            stuck_duration: 0,
+            recovery_attempts: 0,
+            hard_reset_cooldown_active: false,
+            near_tip: true,
+        });
+        assert_eq!(
+            action,
+            ConsensusStuckAction::AttemptRecovery,
+            "near-tip + archive-behind must route to peer-SCP recovery \
+             (AttemptRecovery), NOT a doomed archive HardReset/ProbeAhead \
+             (#3197); the archive cannot supply the next, unpublished \
+             checkpoint near tip — stellar-core uses pure peer-SCP + \
+             buffered-apply here; got {action:?}"
+        );
+    }
+
+    /// #2789 anti-wedge backstop preserved: the genuine 120s wall-clock
+    /// stall STILL escalates to HardReset even in the near-tip band, so a
+    /// peer-SCP back-fill that never resyncs cannot wedge the node forever.
+    #[test]
+    fn test_decide_near_tip_still_hardresets_on_wallclock_stall() {
+        let action = App::decide_consensus_stuck_action(StuckSignals {
+            catchup_in_progress: false,
+            archive_behind: true,
+            tx_set_exhausted: false,
+            schedule_due: true,
+            stuck_duration: HARD_RESET_STALL_SECS,
+            recovery_attempts: 0,
+            hard_reset_cooldown_active: false,
+            near_tip: true,
+        });
+        assert!(
+            matches!(
+                action,
+                ConsensusStuckAction::HardReset(HardResetReason::ArchiveBehindStallWallClock)
+            ),
+            "the genuine 120s wall-clock stall backstop (#2789) must still \
+             escalate to HardReset even in the near-tip band, so peer-SCP \
+             failure cannot wedge the node; got {action:?}"
+        );
+    }
+
+    /// #1831 recovery-exhaustion escalation preserved in the near-tip band.
+    #[test]
+    fn test_decide_near_tip_recovery_exhausted_still_hardresets() {
+        let action = App::decide_consensus_stuck_action(StuckSignals {
+            catchup_in_progress: false,
+            archive_behind: true,
+            tx_set_exhausted: false,
+            schedule_due: true,
+            stuck_duration: 0,
+            recovery_attempts: MAX,
+            hard_reset_cooldown_active: false,
+            near_tip: true,
+        });
+        assert!(
+            matches!(
+                action,
+                ConsensusStuckAction::HardReset(HardResetReason::ArchiveBehindRecoveryExhausted)
+            ),
+            "recovery exhaustion (#1831) must still escalate to HardReset in \
+             the near-tip band; got {action:?}"
+        );
+    }
+
+    /// #1862 far-behind path unchanged: not near-tip, recovery exhausted →
+    /// HardReset (the archive-catchup escalation band is disjoint).
+    #[test]
+    fn test_decide_far_behind_archive_behind_unchanged() {
+        let action = App::decide_consensus_stuck_action(StuckSignals {
+            catchup_in_progress: false,
+            archive_behind: true,
+            tx_set_exhausted: false,
+            schedule_due: true,
+            stuck_duration: 0,
+            recovery_attempts: MAX,
+            hard_reset_cooldown_active: false,
+            near_tip: false,
+        });
+        assert!(
+            matches!(
+                action,
+                ConsensusStuckAction::HardReset(HardResetReason::ArchiveBehindRecoveryExhausted)
+            ),
+            "far-behind (#1862) archive-catchup escalation must be untouched \
+             by the near-tip routing change; got {action:?}"
+        );
+    }
+
+    /// #1843 cooldown fallback preserved: a near-tip stall that WOULD
+    /// hard-reset (e.g. 120s wall-clock stall) falls back to AttemptRecovery
+    /// while the cooldown is active.
+    #[test]
+    fn test_decide_near_tip_cooldown_falls_back_to_recovery() {
+        let action = App::decide_consensus_stuck_action(StuckSignals {
+            catchup_in_progress: false,
+            archive_behind: true,
+            tx_set_exhausted: false,
+            schedule_due: true,
+            stuck_duration: HARD_RESET_STALL_SECS,
+            recovery_attempts: 0,
+            hard_reset_cooldown_active: true,
+            near_tip: true,
+        });
+        assert_eq!(
+            action,
+            ConsensusStuckAction::AttemptRecovery,
+            "HardReset cooldown (#1843) must still gate the would-hard-reset \
+             near-tip path back to peer-SCP recovery; got {action:?}"
+        );
+    }
+
     #[test]
     fn test_decide_wait_when_not_due() {
         // All hard-reset-qualifying params but schedule not due → Wait.
