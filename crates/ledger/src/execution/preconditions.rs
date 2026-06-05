@@ -86,6 +86,55 @@ impl TransactionExecutor {
             }));
         }
 
+        // Phase 1b: Soroban resource-fee bound #3 (declared >= computed).
+        //
+        // Mirrors stellar-core's TransactionFrame::commonValidPreSeqNum
+        // (TransactionFrame.cpp:1434-1460): the resource fee is computed at
+        // validation time via computePreApplySorobanResourceFee (eventsSize = 0,
+        // declared resources), then the overflow guard and bound #3
+        // (`sorobanData.resourceFee < non_refundable + refundable` ⇒
+        // txSOROBAN_INVALID) are enforced — unconditionally for any Soroban tx
+        // (NOT gated by chargeFee/validateResourceFee, unlike bound #2). This
+        // runs inside commonValidPreSeqNum, before the sequence check and the
+        // Phase 2 time/fee/account checks, so failures must NOT bump the
+        // sequence number → pre_seq_fail. Because stellar-core surfaces this via
+        // setInnermostError (the inner result), the fee-bump case also uses
+        // pre_seq_fail rather than fee_bump_outer_fail.
+        //
+        // Bounds #1 (<= MAX_RESOURCE_FEE) and #2 (<= totalFee) are enforced
+        // statelessly in Phase 1 (check_valid_pre_seq_num_with_config); only
+        // bound #3 needs the SorobanConfig, so it lives here where the frame and
+        // self.soroban_config coexist. compute_soroban_resource_fee with
+        // event_size_bytes = 0 exactly mirrors the apply-path call (mod.rs:1810)
+        // and computePreApplySorobanResourceFee. This is read-only validation: it
+        // computes a fee for comparison only and deducts nothing.
+        if frame.is_soroban() {
+            let (non_refundable, refundable) = super::compute_soroban_resource_fee(
+                &frame,
+                self.protocol_version,
+                &self.soroban_config,
+                0,
+            )
+            .unwrap_or((0, 0));
+
+            // Overflow guard: refundable + non_refundable must not exceed i64::MAX
+            // (TransactionFrame.cpp:1435-1443, also txSOROBAN_INVALID).
+            if refundable > i64::MAX - non_refundable {
+                return Ok(Err(pre_seq_fail(
+                    TransactionResultCode::TxSorobanInvalid,
+                    "Soroban resource fee overflows i64",
+                )));
+            }
+
+            // Bound #3: declared resourceFee must cover the computed resource fee.
+            if frame.declared_soroban_resource_fee().as_i64() < non_refundable + refundable {
+                return Ok(Err(pre_seq_fail(
+                    TransactionResultCode::TxSorobanInvalid,
+                    "Declared Soroban resource fee is below the computed resource fee",
+                )));
+            }
+        }
+
         // Phase 2: Fee, time/ledger bounds, and account loading.
         //
         // The ordering of these checks differs between fee-bump and non-fee-bump

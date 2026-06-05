@@ -2924,3 +2924,216 @@ fn test_execute_transaction_insufficient_balance_via_selling_liabilities() {
          liabilities"
     );
 }
+
+// =============================================================================
+// Issue #3108 — Soroban resource-fee bound #3 (TX §4.9 item 3)
+//
+// stellar-core enforces, in `TransactionFrame::commonValidPreSeqNum`
+// (TransactionFrame.cpp:1434-1460), that the declared `sorobanData.resourceFee`
+// covers the computed resource fee (`non_refundable_fee + refundable_fee`,
+// computed with `eventsSize = 0` via `computePreApplySorobanResourceFee`).
+// Under-declaration is rejected at validation/preconditions with
+// `txSOROBAN_INVALID` — NOT later at apply. henyey previously skipped this check
+// in the production preconditions path, letting under-declared txs pass
+// validation and fail at apply with a different code (InsufficientRefundableFee).
+// =============================================================================
+
+/// Build a non-default `SorobanConfig` with positive fee rates so that the
+/// computed Soroban resource fee is strictly positive. `FeeConfiguration`
+/// derives `Default` (all-zero), which would make the computed fee 0 and the
+/// under-declaration case unconstructible — so a non-default config is
+/// load-bearing for these tests. Rates mirror the soroban-env fee fixture.
+fn soroban_config_with_positive_fees() -> SorobanConfig {
+    use henyey_tx::soroban::FeeConfiguration;
+    SorobanConfig {
+        fee_config: FeeConfiguration {
+            fee_per_instruction_increment: 1000,
+            fee_per_disk_read_entry: 2000,
+            fee_per_write_entry: 3000,
+            fee_per_disk_read_1kb: 4000,
+            fee_per_write_1kb: 5000,
+            fee_per_historical_1kb: 6000,
+            fee_per_contract_event_1kb: 7000,
+            fee_per_transaction_size_1kb: 8000,
+        },
+        ..SorobanConfig::default()
+    }
+}
+
+/// Compute the resource fee (`non_refundable + refundable`) for the given
+/// Soroban transaction envelope, mirroring the production helper
+/// `compute_soroban_resource_fee(frame, pv, cfg, 0)` and stellar-core's
+/// `computePreApplySorobanResourceFee` (eventsSize = 0, declared resources).
+fn computed_resource_fee(
+    envelope: &TransactionEnvelope,
+    network_id: NetworkId,
+    protocol_version: u32,
+    config: &SorobanConfig,
+) -> i64 {
+    use henyey_tx::TransactionFrame;
+    let frame = TransactionFrame::with_network(std::sync::Arc::new(envelope.clone()), network_id);
+    let resources = frame
+        .soroban_transaction_resources(protocol_version, 0)
+        .expect("soroban tx has resources");
+    let (non_refundable, refundable) = soroban_env_host_p25::fees::compute_transaction_resource_fee(
+        &resources,
+        &config.fee_config,
+    );
+    non_refundable + refundable
+}
+
+/// Build a signed Soroban `InvokeHostFunction` envelope with the given declared
+/// resource fee and total tx fee.
+fn build_soroban_envelope(
+    secret: &SecretKey,
+    resource_fee: i64,
+    total_fee: u32,
+    network_id: NetworkId,
+) -> TransactionEnvelope {
+    let operation = Operation {
+        source_account: None,
+        body: OperationBody::InvokeHostFunction(InvokeHostFunctionOp {
+            host_function: HostFunction::InvokeContract(InvokeContractArgs {
+                contract_address: ScAddress::Contract(ContractId(Hash([0u8; 32]))),
+                function_name: ScSymbol("test".try_into().unwrap()),
+                args: VecM::default(),
+            }),
+            auth: VecM::default(),
+        }),
+    };
+
+    let soroban_data = SorobanTransactionData {
+        ext: SorobanTransactionDataExt::V0,
+        resources: SorobanResources {
+            footprint: LedgerFootprint {
+                read_only: VecM::default(),
+                read_write: VecM::default(),
+            },
+            instructions: 0,
+            disk_read_bytes: 0,
+            write_bytes: 0,
+        },
+        resource_fee,
+    };
+
+    let tx = Transaction {
+        source_account: MuxedAccount::Ed25519(Uint256(*secret.public_key().as_bytes())),
+        fee: total_fee,
+        seq_num: SequenceNumber(2),
+        cond: Preconditions::None,
+        memo: Memo::None,
+        operations: vec![operation].try_into().unwrap(),
+        ext: TransactionExt::V1(soroban_data),
+    };
+
+    let mut envelope = TransactionEnvelope::Tx(TransactionV1Envelope {
+        tx,
+        signatures: VecM::default(),
+    });
+    let decorated = sign_envelope(&envelope, secret, &network_id);
+    if let TransactionEnvelope::Tx(ref mut env) = envelope {
+        env.signatures = vec![decorated].try_into().unwrap();
+    }
+    envelope
+}
+
+/// Regression for #3108: a Soroban tx whose declared `resourceFee` is one stroop
+/// below the computed resource fee must be rejected at preconditions with
+/// `TxSorobanInvalid`, matching stellar-core's `commonValidPreSeqNum` bound #3.
+///
+/// Fails on `origin/main`: preconditions never compute the resource fee, so the
+/// under-declared tx passes `validate_preconditions` and reaches apply, failing
+/// there with a *different* code (not TxSorobanInvalid). Passes after the fix:
+/// the new bound-#3 check rejects it at preconditions with TxSorobanInvalid.
+#[test]
+fn test_soroban_under_declared_resource_fee_rejected_at_preconditions() {
+    let secret = SecretKey::from_seed(&[210u8; 32]);
+    let network_id = NetworkId::testnet();
+    let protocol_version = 25;
+    let config = soroban_config_with_positive_fees();
+
+    // Compute the resource fee with a placeholder declared fee, then set the
+    // declared fee to (computed - 1). The resource_fee field does not affect the
+    // computation (which depends only on declared resources + tx size), so the
+    // computed value is stable across the placeholder and the final envelope.
+    let probe = build_soroban_envelope(&secret, 0, 1_000_000, network_id);
+    let computed = computed_resource_fee(&probe, network_id, protocol_version, &config);
+    assert!(
+        computed > 0,
+        "test setup: computed resource fee must be positive (got {computed}) — \
+         otherwise the under-declaration case is unconstructible"
+    );
+
+    // Total fee is high enough that inclusion fee and bound #2
+    // (resourceFee <= totalFee) both pass, isolating bound #3.
+    let envelope =
+        build_soroban_envelope(&secret, computed - 1, (computed as u32) + 1_000, network_id);
+
+    // No source account in snapshot — but bound #3 fires in commonValidPreSeqNum
+    // before account load, so the result must be TxSorobanInvalid regardless.
+    let snapshot = SnapshotBuilder::new(1).build_with_default_header();
+    let snapshot = SnapshotHandle::new(snapshot);
+
+    let context =
+        henyey_tx::LedgerContext::new(1, 1_000, 100, 5_000_000, protocol_version, network_id);
+    let mut executor = TransactionExecutor::new(&context, 0, config, ClassicEventConfig::default());
+
+    let result = executor
+        .execute_transaction(&snapshot, &envelope, 100, None)
+        .expect("execute");
+
+    assert_eq!(
+        result.failure,
+        Some(ExecutionFailure::TxSorobanInvalid),
+        "#3108: under-declared Soroban resourceFee (declared={} < computed={}) \
+         must be rejected at preconditions with TxSorobanInvalid",
+        computed - 1,
+        computed
+    );
+}
+
+/// Control for #3108: a Soroban tx whose declared `resourceFee` exactly equals
+/// the computed resource fee must NOT be rejected with `TxSorobanInvalid`
+/// (guards the `<` vs `<=` off-by-one). It fails later on a *different* gate
+/// (TxNoAccount, since no source account is loaded).
+#[test]
+fn test_soroban_exactly_declared_resource_fee_accepted() {
+    let secret = SecretKey::from_seed(&[211u8; 32]);
+    let network_id = NetworkId::testnet();
+    let protocol_version = 25;
+    let config = soroban_config_with_positive_fees();
+
+    let probe = build_soroban_envelope(&secret, 0, 1_000_000, network_id);
+    let computed = computed_resource_fee(&probe, network_id, protocol_version, &config);
+    assert!(
+        computed > 0,
+        "test setup: computed resource fee must be positive"
+    );
+
+    // declared == computed: bound #3 (declared < computed) is false, so it passes.
+    let envelope = build_soroban_envelope(&secret, computed, (computed as u32) + 1_000, network_id);
+
+    let snapshot = SnapshotBuilder::new(1).build_with_default_header();
+    let snapshot = SnapshotHandle::new(snapshot);
+
+    let context =
+        henyey_tx::LedgerContext::new(1, 1_000, 100, 5_000_000, protocol_version, network_id);
+    let mut executor = TransactionExecutor::new(&context, 0, config, ClassicEventConfig::default());
+
+    let result = executor
+        .execute_transaction(&snapshot, &envelope, 100, None)
+        .expect("execute");
+
+    assert_ne!(
+        result.failure,
+        Some(ExecutionFailure::TxSorobanInvalid),
+        "#3108 control: declared resourceFee == computed must NOT fail bound #3"
+    );
+    // The next gate without a loaded source account is TxNoAccount.
+    assert_eq!(
+        result.failure,
+        Some(ExecutionFailure::TxNoAccount),
+        "#3108 control: with declared == computed and no source account, the \
+         first failure should be TxNoAccount, not TxSorobanInvalid"
+    );
+}
