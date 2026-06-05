@@ -246,7 +246,7 @@ impl BallotProtocol {
         new_c
     }
 
-    fn set_confirm_prepared<D: SCPDriver>(
+    pub(super) fn set_confirm_prepared<D: SCPDriver>(
         &mut self,
         new_c: ScpBallot,
         new_h: ScpBallot,

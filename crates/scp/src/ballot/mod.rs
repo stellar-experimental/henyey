@@ -2323,6 +2323,105 @@ mod tests {
     }
 
     #[test]
+    fn test_confirm_prepared_callback_gated_on_inner_block() {
+        // SCP §6.5-1 structural parity (issue #3165): `set_confirm_prepared`
+        // must fire `ballot_did_confirm` ONLY inside the inner ballot-compatible
+        // block, gated on the inner `did_work`, and BEFORE
+        // `update_current_if_needed` — matching stellar-core
+        // `BallotProtocol::setConfirmPrepared` (BallotProtocol.cpp:1074-1079),
+        // where `confirmedBallotPrepared` fires inside `if (didWork)` within the
+        // `areBallotsCompatible` guard.
+        //
+        // The divergence the old (outer-block) placement caused: on an
+        // incompatible-ballot path where `update_current_if_needed` returns true
+        // (a lower-counter, value-incompatible `current_ballot`), the inner block
+        // is skipped but the outer `did_work` becomes true via the update — so
+        // the outer-block placement fired the callback there, while stellar-core
+        // never does. This test pins both the negative (incompatible) and
+        // positive (compatible) paths.
+        let (node, qs, driver) = bare_ctx_parts();
+
+        // --- Incompatible path: callback must NOT fire ---
+        //
+        // `current_ballot` has a LOWER counter than `new_h` (so
+        // `update_current_if_needed` bumps and returns true) but an INCOMPATIBLE
+        // value (so the inner compatibility block is skipped and inner `did_work`
+        // stays false). stellar-core never fires `confirmedBallotPrepared` here.
+        let mut bp = BallotProtocol::new();
+        let current_incompat = ScpBallot {
+            counter: 1,
+            value: make_value(&[1]),
+        };
+        bp.current_ballot = Some(current_incompat.clone());
+
+        let new_h_incompat = ScpBallot {
+            counter: 2,
+            value: make_value(&[2]),
+        };
+        // Sanity: the precondition (lower counter, incompatible value) holds.
+        assert_eq!(
+            ballot_compare(&current_incompat, &new_h_incompat),
+            std::cmp::Ordering::Less
+        );
+        assert!(!ballot_compatible(&current_incompat, &new_h_incompat));
+
+        let did_work = bp.set_confirm_prepared(
+            ScpBallot {
+                counter: 0,
+                value: make_value(&[2]),
+            },
+            new_h_incompat.clone(),
+            &ctx!(&node, &qs, &driver, 1),
+        );
+        // `update_current_if_needed` did work (the ballot was bumped), but the
+        // inner confirm-prepared block did not — so the callback must NOT have
+        // fired even though overall `did_work` is true.
+        assert!(did_work, "update_current_if_needed should have bumped");
+        assert_eq!(
+            driver.confirmed_prepared_count.load(Ordering::SeqCst),
+            0,
+            "ballot_did_confirm must NOT fire on the incompatible-ballot path \
+             (inner block skipped) — see BallotProtocol.cpp:1074-1079"
+        );
+        assert!(driver.confirmed_prepared_ballots.lock().unwrap().is_empty());
+
+        // --- Compatible path: callback fires once, with `new_h` ---
+        //
+        // Fresh protocol with no `current_ballot` (treated as compatible). The
+        // high ballot is raised inside the inner block (inner `did_work` true),
+        // so the callback fires exactly once with the high ballot `new_h`.
+        let driver2 = Arc::new(MockDriver::with_quorum_set(qs.clone()));
+        let mut bp2 = BallotProtocol::new();
+        let new_h_compat = ScpBallot {
+            counter: 3,
+            value: make_value(&[7]),
+        };
+        let did_work2 = bp2.set_confirm_prepared(
+            ScpBallot {
+                counter: 0,
+                value: make_value(&[7]),
+            },
+            new_h_compat.clone(),
+            &ctx!(&node, &qs, &driver2, 1),
+        );
+        assert!(did_work2);
+        assert_eq!(
+            driver2.confirmed_prepared_count.load(Ordering::SeqCst),
+            1,
+            "ballot_did_confirm must fire exactly once on the compatible path"
+        );
+        assert_eq!(
+            driver2
+                .confirmed_prepared_ballots
+                .lock()
+                .unwrap()
+                .as_slice(),
+            &[new_h_compat.clone()],
+            "ballot_did_confirm must fire with the high ballot `new_h`"
+        );
+    }
+
+    #[test]
     fn test_ballot_statement_sanity_prepare_constraints() {
         let node = make_node_id(1);
         let quorum_set = make_quorum_set(vec![node.clone()], 1);
