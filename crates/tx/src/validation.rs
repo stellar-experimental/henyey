@@ -812,6 +812,54 @@ pub fn validate_basic(
     }
 }
 
+/// Compute the source account's available balance for the fee-affordability
+/// check, mirroring stellar-core's `getAvailableBalance`
+/// (`TransactionUtils.cpp:752`).
+///
+/// `available = balance − minBalance`, then (for protocol ≥ V10)
+/// `available −= sellingLiabilities`. The subtraction is **non-saturated**
+/// (plain `i64`), matching stellar-core: `getMinBalance`-based availability can
+/// legitimately be negative, and the `available < feeToPay` comparison must see
+/// the true (possibly negative) value.
+///
+/// Computed inline in the `tx` crate rather than via `henyey_ledger::fees`:
+/// `henyey-ledger` already depends on `henyey-tx`, so importing it here would
+/// create a dependency cycle. Note this deliberately does NOT reuse
+/// `henyey_ledger::fees::available_to_send`, which uses `saturating_sub` and
+/// would diverge from stellar-core's plain subtraction.
+fn available_balance_for_fee(
+    account: &AccountEntry,
+    base_reserve: u32,
+    protocol_version: u32,
+) -> i64 {
+    use stellar_xdr::curr::{AccountEntryExt, AccountEntryExtensionV1Ext};
+
+    // minBalance = (2 + numSubEntries + numSponsoring − numSponsored) * base_reserve,
+    // matching stellar-core `getMinBalance` / `henyey_ledger::fees::minimum_balance`.
+    let (num_sponsoring, num_sponsored, selling_liabilities) = match &account.ext {
+        AccountEntryExt::V0 => (0i64, 0i64, 0i64),
+        AccountEntryExt::V1(v1) => {
+            let (sponsoring, sponsored) = match &v1.ext {
+                AccountEntryExtensionV1Ext::V0 => (0i64, 0i64),
+                AccountEntryExtensionV1Ext::V2(v2) => {
+                    (v2.num_sponsoring as i64, v2.num_sponsored as i64)
+                }
+            };
+            (sponsoring, sponsored, v1.liabilities.selling)
+        }
+    };
+
+    let num_entries = 2 + account.num_sub_entries as i64 + num_sponsoring - num_sponsored;
+    let min_balance = num_entries * base_reserve as i64;
+
+    // Non-saturated (plain i64) subtraction to match stellar-core.
+    let mut available = account.balance - min_balance;
+    if protocol_version >= 10 {
+        available -= selling_liabilities;
+    }
+    available
+}
+
 // SECURITY: not the production validation path; real validation in TransactionExecutor::validate_preconditions()
 /// Full validation with account data.
 pub fn validate_full(
@@ -867,8 +915,22 @@ pub fn validate_full(
         errors.push(e);
     }
 
-    // Check account balance can cover fee
-    let available_balance = source_account.balance;
+    // Check the account's *available* balance can cover the fee.
+    //
+    // `validate_full` is a non-production, `checkValid`-style helper (it has no
+    // live caller — the production apply/checkValid path lives in
+    // `crates/ledger/src/execution/preconditions.rs` and the fee-charge cap in
+    // `crates/tx/src/live_execution.rs::process_fee_seq_num`). This block mirrors
+    // stellar-core's `getAvailableBalance` (TransactionUtils.cpp:752) so the
+    // public helper stays self-consistent with the spec; do NOT re-flag it as a
+    // production bug (cf. #3098–#3103, #3129).
+    let available_balance = available_balance_for_fee(
+        source_account,
+        context.base_reserve,
+        context.protocol_version,
+    );
+    // `feeToPay` for the non-applying validation path is `getFullFee()`, which
+    // henyey exposes as `total_fee()` (frame.rs).
     let fee = frame.total_fee().as_i64();
     if available_balance < fee {
         errors.push(ValidationError::InsufficientBalance);
@@ -1923,8 +1985,138 @@ mod tests {
         }
 
         let context = LedgerContext::testnet(1, 1000);
-        let account = create_account_entry(account_id, 1);
+        // Available-balance fee check (#3129): with V0 ext on testnet,
+        // minBalance = 2 * base_reserve = 10_000_000. The default
+        // `create_account_entry` balance of 10_000_000 leaves available = 0,
+        // which is < fee. Bump the balance so the affordability check passes and
+        // this test keeps exercising only the extra-signers path.
+        let mut account = create_account_entry(account_id, 1);
+        account.balance = 20_000_000;
         assert!(validate_full(&TransactionFrame::from_owned(envelope), &context, &account).is_ok());
+    }
+
+    /// Regression test for #3129: `validate_full` must gate fee affordability on
+    /// the *available* balance (balance − minBalance − sellingLiabilities), not
+    /// the raw balance, mirroring stellar-core's `getAvailableBalance`
+    /// (TransactionUtils.cpp:752). An account whose raw balance covers the fee
+    /// but whose available balance does not must be rejected with
+    /// `InsufficientBalance`.
+    ///
+    /// On origin/main this test FAILS: the old code compared `source_account.balance`
+    /// (raw) against the fee, and raw balance ≥ fee here, so no error is pushed.
+    /// After the fix it PASSES because available balance < fee.
+    #[test]
+    fn test_validate_full_rejects_insufficient_available_balance() {
+        use stellar_xdr::curr::{AccountEntryExtensionV1, AccountEntryExtensionV1Ext, Liabilities};
+
+        let secret = SecretKey::from_seed(&[42u8; 32]);
+        let account_id: AccountId = (&secret.public_key()).into();
+        let source = MuxedAccount::Ed25519(Uint256(*secret.public_key().as_bytes()));
+
+        let op = Operation {
+            source_account: None,
+            body: OperationBody::ManageData(ManageDataOp {
+                data_name: String64::try_from(b"afford".to_vec()).unwrap(),
+                data_value: Some(b"value".to_vec().try_into().unwrap()),
+            }),
+        };
+
+        let tx = Transaction {
+            source_account: source,
+            fee: 100,
+            // seq_num = account.seq_num + 1 so the sequence check passes and the
+            // (last-pushed) affordability check is reachable.
+            seq_num: SequenceNumber(2),
+            cond: Preconditions::None,
+            memo: Memo::None,
+            operations: vec![op].try_into().unwrap(),
+            ext: TransactionExt::V0,
+        };
+
+        let envelope = TransactionEnvelope::Tx(TransactionV1Envelope {
+            tx,
+            signatures: VecM::default(),
+        });
+
+        let context = LedgerContext::testnet(1, 1000);
+        // base_reserve = 5_000_000 → minBalance = 2 * 5_000_000 = 10_000_000.
+        // Raw balance 10_000_100 ≥ fee (100), but with selling liabilities of
+        // 50 the available balance = 10_000_100 − 10_000_000 − 50 = 50 < 100.
+        let mut account = create_account_entry(account_id, 1);
+        account.balance = 10_000_100;
+        account.ext = AccountEntryExt::V1(AccountEntryExtensionV1 {
+            liabilities: Liabilities {
+                buying: 0,
+                selling: 50,
+            },
+            ext: AccountEntryExtensionV1Ext::V0,
+        });
+
+        let result = validate_full(&TransactionFrame::from_owned(envelope), &context, &account);
+        let errors =
+            result.expect_err("validate_full should reject insufficient available balance");
+        // Membership assertion: affordability is pushed LAST, so assert presence
+        // rather than first-error.
+        assert!(
+            errors
+                .iter()
+                .any(|e| matches!(e, ValidationError::InsufficientBalance)),
+            "expected InsufficientBalance in errors, got: {:?}",
+            errors
+        );
+    }
+
+    /// Companion to the regression test: when the *available* balance covers the
+    /// fee, `validate_full` must NOT push `InsufficientBalance`.
+    #[test]
+    fn test_validate_full_accepts_sufficient_available_balance() {
+        use stellar_xdr::curr::{AccountEntryExtensionV1, AccountEntryExtensionV1Ext, Liabilities};
+
+        let secret = SecretKey::from_seed(&[43u8; 32]);
+        let account_id: AccountId = (&secret.public_key()).into();
+        let source = MuxedAccount::Ed25519(Uint256(*secret.public_key().as_bytes()));
+
+        let op = Operation {
+            source_account: None,
+            body: OperationBody::ManageData(ManageDataOp {
+                data_name: String64::try_from(b"afford".to_vec()).unwrap(),
+                data_value: Some(b"value".to_vec().try_into().unwrap()),
+            }),
+        };
+
+        let tx = Transaction {
+            source_account: source,
+            fee: 100,
+            seq_num: SequenceNumber(2),
+            cond: Preconditions::None,
+            memo: Memo::None,
+            operations: vec![op].try_into().unwrap(),
+            ext: TransactionExt::V0,
+        };
+
+        let envelope = TransactionEnvelope::Tx(TransactionV1Envelope {
+            tx,
+            signatures: VecM::default(),
+        });
+
+        let context = LedgerContext::testnet(1, 1000);
+        // available = balance − minBalance(10_000_000) − selling(50) = 950 ≥ fee.
+        let mut account = create_account_entry(account_id, 1);
+        account.balance = 10_001_000;
+        account.ext = AccountEntryExt::V1(AccountEntryExtensionV1 {
+            liabilities: Liabilities {
+                buying: 0,
+                selling: 50,
+            },
+            ext: AccountEntryExtensionV1Ext::V0,
+        });
+
+        let result = validate_full(&TransactionFrame::from_owned(envelope), &context, &account);
+        assert!(
+            result.is_ok(),
+            "expected no validation errors, got: {:?}",
+            result
+        );
     }
 
     /// validate_full must reject envelopes exceeding XDR depth limit as InvalidStructure.
