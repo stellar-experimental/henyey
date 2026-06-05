@@ -257,6 +257,21 @@ const RECOVERY_HARD_RESET_ESCALATION_ATTEMPTS: u64 =
 const RECOVERY_HARD_RESET_ESCALATION_ATTEMPTS_NO_SCP: u64 =
     (HARD_RESET_STALL_SECS * 3 / 2 / OUT_OF_SYNC_RECOVERY_TIMER_SECS) - 1;
 
+/// Near-tip escalation threshold (issue #3181). When the archive is confirmed
+/// behind, peers are verified ahead, and the peer gap is below one checkpoint
+/// interval (`PEER_AHEAD_ESCALATION_THRESHOLD <= peer_gap < checkpoint_frequency()`),
+/// archive-based catchup is structurally impossible-yet-imminent: the next
+/// checkpoint that unblocks recovery will publish within one interval. Spinning
+/// on per-tick archive probes for the full ~120s (`RECOVERY_HARD_RESET_ESCALATION_ATTEMPTS`)
+/// before escalating to the state-changing reset (which spawns a peer-SCP
+/// `ProbeAhead` blocking fetch + `request_scp_state`) produced a ~4.5-min
+/// consensus stall and a `forcing_catchup_behind` counter burst. In the near-tip
+/// band we fire that same escalation on the 2nd recovery tick (~10–20s) instead.
+/// The 60s `HARD_RESET_MIN_COOLDOWN_SECS` floor still prevents reset storms, and
+/// the far-behind (`peer_gap >= checkpoint_frequency()`) #1862 path keeps the
+/// unchanged 11-tick threshold + archive-catchup escalation.
+const RECOVERY_HARD_RESET_ESCALATION_ATTEMPTS_NEAR_TIP: u64 = 1;
+
 /// Attempt-counter seed for partial-progress resets. When the node makes
 /// progress via a fast-track jump but is still significantly behind peers,
 /// we re-seed the attempt counter to this value so re-escalation fires
@@ -11338,6 +11353,17 @@ mod tests {
             "(120 * 3/2) / 10 - 1 = 17"
         );
         assert_eq!(PEER_AHEAD_ESCALATION_THRESHOLD, 3);
+        // #3181: near-tip threshold fires on the 2nd recovery tick (~10–20s),
+        // far earlier than the default 11 ticks (~120s).
+        assert_eq!(
+            RECOVERY_HARD_RESET_ESCALATION_ATTEMPTS_NEAR_TIP, 1,
+            "near-tip escalation must fire on the 2nd recovery tick (#3181)"
+        );
+        assert!(
+            RECOVERY_HARD_RESET_ESCALATION_ATTEMPTS_NEAR_TIP
+                < RECOVERY_HARD_RESET_ESCALATION_ATTEMPTS,
+            "near-tip threshold must be strictly earlier than the default"
+        );
     }
 
     #[tokio::test]
@@ -11537,9 +11563,13 @@ mod tests {
         );
     }
 
-    /// Boundary: attempts just below threshold should NOT fire hard reset.
-    /// The fast-track path enters trigger_recovery_catchup but the
-    /// peer-ahead escalation check fails on attempts.
+    /// Boundary: in the FAR-BEHIND band (peer_gap >= checkpoint_frequency(),
+    /// the #1862 path), attempts just below the default escalation threshold
+    /// should NOT fire hard reset. The fast-track path enters
+    /// trigger_recovery_catchup but the peer-ahead escalation check fails on
+    /// attempts. (Uses a far-behind gap so the #3181 near-tip early-escalation
+    /// threshold does not apply — that path is covered by the catchup_impl
+    /// decide-fn near-tip tests and the consensus.rs near-tip gate.)
     #[tokio::test]
     async fn test_trigger_recovery_archive_behind_low_attempts_no_reset() {
         let (_dir, app) = make_app_for_peer_ahead_test().await;
@@ -11550,7 +11580,9 @@ mod tests {
                 backoff_until: None,
             };
         }
-        app.max_verified_scp_slot.store(110, Ordering::Relaxed);
+        // Far-behind: peer_gap = 200 - 100 = 100 >= checkpoint_frequency() (64),
+        // so the default (not near-tip) escalation threshold of 11 applies.
+        app.max_verified_scp_slot.store(200, Ordering::Relaxed);
         // After fetch_add(1), attempts will be ESCALATION - 1 = 10.
         app.recovery_attempts_without_progress.store(
             RECOVERY_HARD_RESET_ESCALATION_ATTEMPTS - 1,
