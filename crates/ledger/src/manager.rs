@@ -4781,7 +4781,8 @@ impl LedgerCloseContext<'_> {
 
     /// Commit the ledger close: finalize state, update bucket list, build header.
     ///
-    /// LEDGER_SPEC §4.2 / §15.13 / Appendix E — commit sequence:
+    /// LEDGER_SPEC **§4.2** / §15.13 / Appendix E — the *in-seal* 8-step commit
+    /// sequence (ledger-state sealing, all on the close thread):
     ///   1. Compute tx result hash
     ///   2. Apply upgrades
     ///   3. Update bucket list with delta
@@ -4794,6 +4795,33 @@ impl LedgerCloseContext<'_> {
     /// Henyey combines some of these steps (e.g., bucket list update and hash
     /// computation happen together under a single write lock), but the logical
     /// ordering is preserved.
+    ///
+    /// IMPORTANT — disambiguation (#3066): this **§4.2** list is NOT the same as
+    /// the spec **§4.11** 8-step *commit/persist* sequence (queue checkpoint →
+    /// commit LedgerTxn → finalize checkpoint files → start bg eviction → exit
+    /// COMMITTING → copy Soroban state for invariant → advance LCL + publish
+    /// history + GC buckets → notify herder + invariant snapshot). Both lists
+    /// happen to have eight steps and both use the word "commit", which is the
+    /// exact collision that produced the §15.13 / INV-L13 spec-adherence
+    /// finding. The two map to different henyey code:
+    ///   - §4.2 (this function): in-`commit` sealing of ledger state.
+    ///   - §4.11 (post-seal, cross-thread): realized by the persist pipeline —
+    ///     the single atomic SQLite transaction in
+    ///     `app::ledger_close::LedgerPersistInputs::serialize_and_write_to_db`
+    ///     (Steps 1-2), the bucket/hot-archive flush in
+    ///     `app::persist::PersistJob::run_blocking` (Step 3), and the
+    ///     post-persist bookkeeping (LCL advance / history publish / bucket GC /
+    ///     herder notify) in `app::ledger_close::handle_close_complete_inner`
+    ///     (Steps 7-8). See those sites for the full INV-L13 mapping.
+    ///
+    /// Note on the two lists' shared steps: §4.2 Step 4 (eviction scan) is the
+    /// same eviction work the §4.11 list calls "start bg eviction" — henyey runs
+    /// it here, inside `commit`, rather than as a separate post-commit
+    /// background scan. The §4.11 "copy Soroban state for invariant" step (its
+    /// Steps 5-6) has no henyey counterpart in either list: the state-snapshot
+    /// invariant hook is not yet wired (`crates/invariant/PARITY_STATUS.md`,
+    /// "Snapshot hook not yet wired") and is tracked as separate work, NOT part
+    /// of #3066.
     fn commit(mut self, rss_before: u64) -> Result<LedgerCloseResult> {
         tracing::debug!(
             ledger_seq = self.close_data.ledger_seq,
