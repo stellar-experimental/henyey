@@ -1791,9 +1791,27 @@ impl App {
                 let archive_is_confirmed_behind =
                     self.archive_recovery_snapshot().await.is_confirmed_behind();
                 let peer_gap = self.effective_peer_gap(current_ledger);
+                // Near-tip band (#3181): peers verified ahead by less than one
+                // checkpoint interval. Combined with the gate's existing
+                // `peer_gap >= PEER_AHEAD_ESCALATION_THRESHOLD` precondition this
+                // yields the same predicate as the StuckSignals build site
+                // (PEER_AHEAD_ESCALATION_THRESHOLD <= peer_gap <
+                // checkpoint_frequency()). In this band, with the archive
+                // confirmed behind, archive catchup is structurally
+                // impossible-yet-imminent, so lower the escalation attempt
+                // threshold (~1–2 ticks / ~10–20s) instead of the default ~11
+                // ticks / ~120s. The far-behind (#1862) path keeps the
+                // unchanged threshold. Read checkpoint_frequency() live (64
+                // default / 8 accelerated) for parity.
+                let near_tip = peer_gap < checkpoint_frequency() as u64;
+                let escalation_attempts = if near_tip && archive_is_confirmed_behind {
+                    RECOVERY_HARD_RESET_ESCALATION_ATTEMPTS_NEAR_TIP
+                } else {
+                    RECOVERY_HARD_RESET_ESCALATION_ATTEMPTS
+                };
                 if archive_is_confirmed_behind
                     && peer_gap >= PEER_AHEAD_ESCALATION_THRESHOLD
-                    && attempts >= RECOVERY_HARD_RESET_ESCALATION_ATTEMPTS
+                    && attempts >= escalation_attempts
                     && !self.is_hard_reset_on_cooldown(peer_gap)
                 {
                     use super::types::HardResetReason;

@@ -1337,7 +1337,7 @@ impl App {
                     ConsensusStuckAction::HardReset(HardResetReason::ArchiveBehindRecoveryExhausted)
                 } else if s.tx_set_exhausted {
                     ConsensusStuckAction::HardReset(HardResetReason::ArchiveBehindTxSetExhausted)
-                } else if s.stuck_duration >= HARD_RESET_STALL_SECS {
+                } else if s.stuck_duration >= HARD_RESET_STALL_SECS || s.near_tip {
                     // Either the wall-clock stall threshold was reached, or the
                     // node is in the near-tip band (#3181) — both escalate via
                     // the same ArchiveBehindStallWallClock reset, which spawns
