@@ -9,6 +9,11 @@
 #   4. Workflow shard/probe wiring contract
 #   5. Success path produces no retry artifacts
 #   6. Second timeout still fails
+#   7. Transient-infra exits 124/143/137 are retryable on the targeted shard
+#      only (#3193 adds 137 — SIGKILL runner reclamation)
+#   8. The broken in-run rerun-on-transient job is removed from quickstart.yml
+#      and recovery lives in a separate workflow_run-triggered workflow
+#      (quickstart-retry.yml) that runs AFTER the run completes (#3193)
 #
 # Run: bash scripts/test-quickstart-harness.sh
 # Requires: bash 4+, timeout (coreutils)
@@ -978,48 +983,243 @@ EOF
 }
 
 # ============================================================
-# Test 17: test_workflow_auto_reruns_on_whole_runner_sigterm
+# Test 17: test_exit137_retries_on_targeted_shard
 #
-# Regression for #3185. The in-wrapper retry cannot recover a reclaimed runner
-# (the wrapper is SIGTERM'd too). The workflow must therefore carry a separate
-# job that re-dispatches the failed jobs once on the first attempt. Assert the
-# job exists, is gated on run_attempt == 1 (single extra attempt), holds the
-# actions:write permission needed to re-run, and re-dispatches via
-# `gh run rerun --failed`.
+# Regression for #3193. Whole-runner reclamation on PR #3187's run
+# 27037187429 produced exit 137 (SIGKILL, 128+9) — "The runner has received a
+# shutdown signal" followed by "exit code 137" — NOT the 143 (SIGTERM) the
+# wrapper already covered. When the runner survives the SIGKILL of the probe
+# subprocess long enough for the wrapper to observe the 137, re-running once
+# self-heals. The wrapper must treat exit 137 as a retryable transient on the
+# targeted shard, exactly like exit 124/143.
 # ============================================================
-test_workflow_auto_reruns_on_whole_runner_sigterm() {
+test_exit137_retries_on_targeted_shard() {
+    local diag_dir="$TMPDIR_BASE/diag-test17"
+    mkdir -p "$diag_dir"
+
+    # Probe: exits 137 (SIGKILL signature) on attempt 1, succeeds on 2.
+    local state_file="$TMPDIR_BASE/state-test17"
+    echo "0" > "$state_file"
+    local probe="$TMPDIR_BASE/probe-test17.sh"
+    cat > "$probe" <<'EOF'
+#!/bin/bash
+STATE_FILE="__STATE__"
+COUNT=$(cat "$STATE_FILE")
+COUNT=$((COUNT + 1))
+echo "$COUNT" > "$STATE_FILE"
+if [[ $COUNT -eq 1 ]]; then
+    exit 137
+fi
+exit 0
+EOF
+    sed -i "s|__STATE__|$state_file|g" "$probe"
+    chmod +x "$probe"
+
+    local exit_code=0
+    "$WRAPPER" \
+        --network testnet --enable "core,horizon" --probe horizon-core-up \
+        --timeout 10 --diagnostics-dir "$diag_dir" \
+        -- "$probe" >/dev/null 2>&1 || exit_code=$?
+
+    if [[ $exit_code -eq 0 ]]; then
+        tap_ok "test_exit137_retries_on_targeted_shard"
+    else
+        tap_not_ok "test_exit137_retries_on_targeted_shard" "exit=$exit_code (expected 0 via retry)"
+    fi
+
+    if [[ -d "$diag_dir/attempt-1" ]]; then
+        tap_ok "exit137_retry_captured_attempt1_diagnostics"
+    else
+        tap_not_ok "exit137_retry_captured_attempt1_diagnostics" "no attempt-1 dir (first failure not captured)"
+    fi
+}
+
+# ============================================================
+# Test 18: test_exit137_does_not_retry_on_non_targeted_shard
+#
+# The exit-137 retry must be scoped to the same targeted shard as 124/143 — a
+# non-targeted shard exiting 137 must fail immediately with no retry, so a
+# genuine henyey failure elsewhere stays loud.
+# ============================================================
+test_exit137_no_retry_on_non_targeted_shard() {
+    local diag_dir="$TMPDIR_BASE/diag-test18"
+    mkdir -p "$diag_dir"
+
+    local probe
+    probe=$(make_probe "test18" 137 0)
+
+    local exit_code=0
+    "$WRAPPER" \
+        --network local --enable "core" --probe core \
+        --timeout 10 --diagnostics-dir "$diag_dir" \
+        -- "$probe" >/dev/null 2>&1 || exit_code=$?
+
+    if [[ $exit_code -ne 0 ]]; then
+        tap_ok "test_exit137_does_not_retry_on_non_targeted_shard"
+    else
+        tap_not_ok "test_exit137_does_not_retry_on_non_targeted_shard" "expected failure"
+    fi
+
+    if [[ ! -d "$diag_dir/attempt-2" ]]; then
+        tap_ok "non_targeted_exit137_single_attempt"
+    else
+        tap_not_ok "non_targeted_exit137_single_attempt" "unexpected retry on non-targeted shard"
+    fi
+}
+
+# ============================================================
+# Test 19: test_exit137_still_fails_after_second_attempt
+#
+# If exit 137 recurs on the retry, the wrapper must still fail (single extra
+# attempt, not an unbounded loop) — mirrors the 124/143 double-failure case.
+# ============================================================
+test_exit137_double_failure_fails() {
+    local diag_dir="$TMPDIR_BASE/diag-test19"
+    mkdir -p "$diag_dir"
+
+    local probe
+    probe=$(make_probe "test19" 137 0)
+
+    local exit_code=0
+    "$WRAPPER" \
+        --network testnet --enable "core,horizon" --probe horizon-core-up \
+        --timeout 10 --diagnostics-dir "$diag_dir" \
+        -- "$probe" >/dev/null 2>&1 || exit_code=$?
+
+    if [[ $exit_code -ne 0 ]]; then
+        tap_ok "test_exit137_still_fails_after_second_attempt"
+    else
+        tap_not_ok "test_exit137_still_fails_after_second_attempt" "expected failure"
+    fi
+
+    if [[ -d "$diag_dir/attempt-1" && -d "$diag_dir/attempt-2" ]]; then
+        tap_ok "exit137_double_failure_preserves_both_diagnostics"
+    else
+        tap_not_ok "exit137_double_failure_preserves_both_diagnostics" "missing attempt dirs"
+    fi
+}
+
+# ============================================================
+# Test 20: test_in_run_rerun_job_removed_from_quickstart_workflow
+#
+# Regression for #3193. The in-run `rerun-on-transient` job in quickstart.yml
+# tried to `gh run rerun <id> --failed` for ITS OWN still-running run, which
+# fails with "This workflow is already running" (exit 1) — the auto-retry never
+# fired, it only added a spurious FAILURE check. The broken in-run job must be
+# REMOVED from quickstart.yml entirely; recovery moves to a separate
+# workflow_run-triggered workflow (Test 21).
+# ============================================================
+test_in_run_rerun_job_removed() {
     if [[ ! -f "$WORKFLOW" ]]; then
-        tap_not_ok "test_workflow_auto_reruns_on_whole_runner_sigterm" "workflow file not found"
-        tap_not_ok "rerun_job_gated_on_first_attempt" "workflow file not found"
-        tap_not_ok "rerun_job_has_actions_write_permission" "workflow file not found"
+        tap_not_ok "test_in_run_rerun_job_removed_from_quickstart_workflow" "workflow file not found"
         return
     fi
 
-    if grep -q '^  rerun-on-transient:' "$WORKFLOW" \
-        && grep -q 'gh run rerun' "$WORKFLOW" \
-        && grep -q -- '--failed' "$WORKFLOW"; then
-        tap_ok "test_workflow_auto_reruns_on_whole_runner_sigterm"
+    # The broken in-run job key must be gone.
+    if ! grep -q '^  rerun-on-transient:' "$WORKFLOW"; then
+        tap_ok "in_run_rerun_job_key_removed"
     else
-        tap_not_ok "test_workflow_auto_reruns_on_whole_runner_sigterm" "rerun-on-transient job or gh run rerun --failed missing"
+        tap_not_ok "in_run_rerun_job_key_removed" \
+            "rerun-on-transient job still present in quickstart.yml (re-dispatches its own running run -> 'already running')"
     fi
 
-    # Must be bounded to one extra attempt (run_attempt == 1 guard).
-    if grep -q "github.run_attempt == 1" "$WORKFLOW"; then
-        tap_ok "rerun_job_gated_on_first_attempt"
+    # No `gh run rerun` left inside the main workflow at all — the same-run
+    # rerun is the exact bug; recovery belongs in the separate workflow.
+    if ! grep -q 'gh run rerun' "$WORKFLOW"; then
+        tap_ok "no_in_run_gh_run_rerun_in_quickstart"
     else
-        tap_not_ok "rerun_job_gated_on_first_attempt" "missing run_attempt == 1 guard (would loop unboundedly)"
+        tap_not_ok "no_in_run_gh_run_rerun_in_quickstart" \
+            "quickstart.yml still calls gh run rerun in-run (same-run rerun fails 'already running')"
+    fi
+}
+
+# ============================================================
+# Test 21: test_separate_workflow_run_retry_workflow_recovers_transient
+#
+# Regression for #3193. Recovery from a whole-runner reclamation must live in a
+# SEPARATE workflow triggered by `workflow_run` (types: completed) on the
+# Quickstart workflow, so it runs AFTER the Quickstart run finishes and
+# `gh run rerun <id> --failed` works (no "already running"). Assert the new
+# workflow file exists and:
+#   * triggers on workflow_run / completed
+#   * names the EXACT Quickstart workflow (must match quickstart.yml's `name:`)
+#   * is bounded: guards on conclusion == failure AND run_attempt == 1
+#   * grants actions: write
+#   * re-dispatches via `gh run rerun <workflow_run.id> --failed`
+# ============================================================
+test_separate_workflow_run_retry_workflow() {
+    local retry_wf="$REPO_ROOT/.github/workflows/quickstart-retry.yml"
+
+    if [[ ! -f "$retry_wf" ]]; then
+        tap_not_ok "retry_workflow_file_exists" "quickstart-retry.yml not found"
+        tap_not_ok "retry_workflow_triggers_on_workflow_run_completed" "no file"
+        tap_not_ok "retry_workflow_name_matches_quickstart_exactly" "no file"
+        tap_not_ok "retry_workflow_guards_on_failure_conclusion" "no file"
+        tap_not_ok "retry_workflow_bounded_to_first_attempt" "no file"
+        tap_not_ok "retry_workflow_has_actions_write_permission" "no file"
+        tap_not_ok "retry_workflow_reruns_the_triggering_run" "no file"
+        return
+    fi
+    tap_ok "retry_workflow_file_exists"
+
+    # Triggers on workflow_run / completed.
+    if grep -q 'workflow_run:' "$retry_wf" && grep -qE 'types:.*completed|-\s*completed' "$retry_wf"; then
+        tap_ok "retry_workflow_triggers_on_workflow_run_completed"
+    else
+        tap_not_ok "retry_workflow_triggers_on_workflow_run_completed" \
+            "must trigger on: workflow_run: { types: [completed] }"
     fi
 
-    # Must grant actions:write so `gh run rerun` is authorized.
-    if grep -q 'actions: write' "$WORKFLOW"; then
-        tap_ok "rerun_job_has_actions_write_permission"
+    # The workflows: list must name the EXACT Quickstart workflow name string
+    # as declared by quickstart.yml's top-level `name:` field. A mismatch means
+    # the trigger never fires.
+    local quickstart_name
+    quickstart_name=$(grep -E '^name:' "$WORKFLOW" | head -1 | sed -E 's/^name:[[:space:]]*//; s/^"(.*)"$/\1/; s/^'"'"'(.*)'"'"'$/\1/')
+    if [[ -n "$quickstart_name" ]] && grep -qF "$quickstart_name" "$retry_wf"; then
+        tap_ok "retry_workflow_name_matches_quickstart_exactly"
     else
-        tap_not_ok "rerun_job_has_actions_write_permission" "missing actions: write permission for rerun"
+        tap_not_ok "retry_workflow_name_matches_quickstart_exactly" \
+            "workflow_run.workflows must list the exact name '$quickstart_name' from quickstart.yml"
+    fi
+
+    # Guard: only act on a failure conclusion.
+    if grep -q "workflow_run.conclusion == 'failure'" "$retry_wf"; then
+        tap_ok "retry_workflow_guards_on_failure_conclusion"
+    else
+        tap_not_ok "retry_workflow_guards_on_failure_conclusion" \
+            "must guard on github.event.workflow_run.conclusion == 'failure'"
+    fi
+
+    # Bounded one-shot: only re-run when the triggering run was its first attempt
+    # (run_attempt == 1). Attempt 2 carries run_attempt == 2, so the guard fails
+    # and no further rerun is dispatched — cannot loop.
+    if grep -q 'workflow_run.run_attempt == 1' "$retry_wf"; then
+        tap_ok "retry_workflow_bounded_to_first_attempt"
+    else
+        tap_not_ok "retry_workflow_bounded_to_first_attempt" \
+            "must guard on github.event.workflow_run.run_attempt == 1 (bounded one-shot, no loop)"
+    fi
+
+    # Needs actions: write to re-dispatch.
+    if grep -q 'actions: write' "$retry_wf"; then
+        tap_ok "retry_workflow_has_actions_write_permission"
+    else
+        tap_not_ok "retry_workflow_has_actions_write_permission" "missing actions: write permission"
+    fi
+
+    # Re-dispatches the TRIGGERING run (workflow_run.id), not its own run, with --failed.
+    if grep -q 'gh run rerun' "$retry_wf" \
+        && grep -q -- '--failed' "$retry_wf" \
+        && grep -q 'workflow_run.id' "$retry_wf"; then
+        tap_ok "retry_workflow_reruns_the_triggering_run"
+    else
+        tap_not_ok "retry_workflow_reruns_the_triggering_run" \
+            "must run 'gh run rerun \${{ github.event.workflow_run.id }} --failed'"
     fi
 }
 
 # --- Run all tests ---
-tap_plan 60
+tap_plan 72
 
 test_timeout_retry_on_targeted_shard
 test_non_timeout_failure_no_retry
@@ -1037,7 +1237,11 @@ test_runner_shutdown_exit143_no_retry_on_non_targeted_shard
 test_runner_shutdown_exit143_double_failure_fails
 test_transient_retry_covers_whole_testnet_shard
 test_exit143_retries_on_non_horizon_core_up_testnet_probe
-test_workflow_auto_reruns_on_whole_runner_sigterm
+test_exit137_retries_on_targeted_shard
+test_exit137_no_retry_on_non_targeted_shard
+test_exit137_double_failure_fails
+test_in_run_rerun_job_removed
+test_separate_workflow_run_retry_workflow
 
 echo ""
 echo "# Results: $PASS_COUNT/$TEST_COUNT passed, $FAIL_COUNT failed"
