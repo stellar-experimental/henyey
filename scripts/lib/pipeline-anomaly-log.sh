@@ -39,8 +39,10 @@ anomaly_log_append() {
   # Strip embedded tabs/newlines so each anomaly stays on one TSV line.
   signal="${signal//$'\t'/ }"; signal="${signal//$'\n'/ }"
   evidence="${evidence//$'\t'/ }"; evidence="${evidence//$'\n'/ }"
+  # Fail loud on append error (e.g. read-only dir, ENOSPC) so a lost anomaly
+  # signal surfaces instead of being silently dropped.
   printf '%s\t%s\t%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$signal" "$evidence" \
-    >> "$log_file"
+    >> "$log_file" || return 1
 }
 
 # anomaly_log_dump — print the current session's log (nothing if absent).
@@ -59,8 +61,11 @@ anomaly_log_clear() {
   return 0
 }
 
-# Self-test: only runs when executed directly, never when sourced.
-if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+# Self-test: only runs when executed directly, never when sourced. The guard is
+# quoted with a :- default so it can never abort under a future `setopt nounset`
+# / `set -u` caller (zsh has no BASH_SOURCE → the default yields ""; "" never
+# equals "$0", so the self-test stays bash-execute-only — behavior unchanged).
+if [[ "${BASH_SOURCE[0]:-}" == "${0}" ]]; then
   set -euo pipefail
   tmp_log="$(mktemp)"
   trap 'rm -f "$tmp_log"' EXIT
