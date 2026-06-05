@@ -302,8 +302,19 @@ impl PersistJob {
             } => {
                 let persist_start = std::time::Instant::now();
 
+                // LEDGER_SPEC §4.11 Step 3 (#3066): "finalize checkpoint files".
+                // Henyey finalizes the on-disk bucket and hot-archive files via
+                // this flush, which runs *before* the DB write below so the
+                // bucket files referenced by the about-to-be-committed HAS are
+                // durable on disk first. (The publish-queue enqueue itself, the
+                // §4.11 Step 1 "queue checkpoint", is co-transactional inside
+                // `write_fn` — see `LedgerPersistInputs::serialize_and_write_to_db`.)
                 flush_hot_archive_and_buckets_sync(&ledger_manager, &bucket_dir);
 
+                // LEDGER_SPEC §4.11 Step 2 (#3066): "commit LedgerTxn". This is
+                // the single atomic SQLite transaction that co-writes header,
+                // HAS, and LCL (the INV-L13 agreement guarantee). Ordering is
+                // unchanged by #3066; this comment is traceability only.
                 if let Err(e) = write_fn(&db) {
                     fatal_persist_error("ledger close DB write", &e);
                 }

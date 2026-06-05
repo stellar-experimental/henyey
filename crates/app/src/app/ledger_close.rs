@@ -115,6 +115,42 @@ struct LedgerPersistInputs {
 
 impl LedgerPersistInputs {
     /// Serialize XDR/JSON and write to SQLite on a blocking thread.
+    ///
+    /// LEDGER_SPEC §4.11 / §15.13 / INV-L13 mapping (#3066). stellar-core's
+    /// §4.11 commit/persist sequence prescribes 8 ordered steps; henyey
+    /// *flattens* the durable subset of them into the single atomic
+    /// `db.transaction` closure below. This is equivalent-or-stronger than the
+    /// stepwise approach, not a regression — there is no observable window in
+    /// which the persisted state is partially advanced.
+    ///
+    ///   - **§4.11 Step 1 (queue checkpoint):** `enqueue_publish` (below) runs
+    ///     *inside* this same transaction on checkpoint ledgers, so the publish
+    ///     queue entry and the ledger state commit either both land or neither
+    ///     does (co-transactional, per #3057) — stronger than stellar-core's
+    ///     separate-step queueing.
+    ///   - **§4.11 Step 2 (commit LedgerTxn):** the header, tx history/results,
+    ///     bucket-list snapshot, per-tx rows, contract events, and SCP history
+    ///     are all written in this one transaction.
+    ///   - **INV-L13 (MUST): on reload, persisted HAS and persisted LCL header
+    ///     MUST agree on `ledgerSeq`.** Henyey satisfies this *by construction*:
+    ///     the HAS write (`set_state(HISTORY_ARCHIVE_STATE)`) and the LCL write
+    ///     (`set_last_closed_ledger`) below are both inside this single atomic
+    ///     transaction, so a crash either commits both (agreeing on `ledgerSeq`)
+    ///     or neither. No torn intermediate state is observable on reload.
+    ///   - **§4.11 Step 3 (finalize checkpoint files):** performed by the
+    ///     bucket/hot-archive flush in `persist::PersistJob::run_blocking`
+    ///     *before* this DB write — see that function.
+    ///   - **§4.11 Steps 7-8 (advance LCL+publish+GC, notify herder):** realized
+    ///     post-persist in `handle_close_complete_inner` (see the bucket-GC and
+    ///     herder-notify annotations there).
+    ///   - **§4.11 Steps 5-6 (copy Soroban state for the invariant snapshot):**
+    ///     intentionally absent — the state-snapshot invariant hook is not yet
+    ///     wired (`crates/invariant/PARITY_STATUS.md`, "Snapshot hook not yet
+    ///     wired"). That is separate work, NOT part of #3066. Do not infer from
+    ///     this comment that the snapshot copy happens here.
+    ///
+    /// No ordering, control-flow, or transaction-boundary change is implied by
+    /// this comment; it is traceability annotation only.
     fn serialize_and_write_to_db(&self, db: &henyey_db::Database) -> anyhow::Result<()> {
         use henyey_db::queries::*;
 
@@ -2882,6 +2918,24 @@ impl App {
         // Signal heartbeat to sync recovery.
         self.sync_recovery_heartbeat();
 
+        // LEDGER_SPEC §4.11 Steps 7-8 (#3066): this function is henyey's
+        // "main thread" analog for the post-seal commit sequence. stellar-core
+        // runs Steps 7-8 (advance LCL + publish queued history + GC buckets,
+        // then notify herder + take invariant snapshot) on the main thread in
+        // `advanceLedgerStateAndPublish` → `publishQueuedHistory` /
+        // `forgetUnreferencedBuckets` / `ledgerCloseComplete`. Henyey runs the
+        // equivalent work here on the single event loop:
+        //   - LCL advance / history publish are durable via the atomic
+        //     transaction in `LedgerPersistInputs::serialize_and_write_to_db`
+        //     (LCL write + checkpoint `enqueue_publish`); the publish-queue
+        //     processor drains those entries asynchronously.
+        //   - Step 7 bucket GC = `cleanup_stale_bucket_files_background()` below.
+        //   - Step 8 herder notify = the `herder.advance_tracking_to` /
+        //     `herder.bootstrap` calls earlier in this function.
+        //   - Step 8's invariant-snapshot half is intentionally absent — the
+        //     snapshot hook is not yet wired (`crates/invariant/PARITY_STATUS.md`,
+        //     "Snapshot hook not yet wired"); separate work, NOT part of #3066.
+        //
         // Garbage collect stale bucket files after every ledger close, matching
         // stellar-core's unconditional `forgetUnreferencedBuckets` in
         // `advanceLedgerStateAndPublish` (LedgerManagerImpl.cpp:1429). The work
