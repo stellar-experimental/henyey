@@ -275,17 +275,26 @@ impl BallotProtocol {
                 self.commit = Some(new_c);
                 did_work = true;
             }
+
+            if did_work {
+                // Fire the confirm-prepared notification callback (SCP §6.5-1),
+                // with `new_h` being the high ballot. This fires INSIDE the
+                // ballot-compatible block, gated on the inner `did_work` (high
+                // ballot raised or commit set), and BEFORE
+                // `update_current_if_needed` — mirroring stellar-core
+                // BallotProtocol::setConfirmPrepared (BallotProtocol.cpp:1074-1079),
+                // where `confirmedBallotPrepared` fires inside the inner
+                // `if (didWork)` within the `areBallotsCompatible` guard. The
+                // outer-block placement would have fired the callback on an
+                // incompatible-ballot path where `update_current_if_needed`
+                // alone made overall `did_work` true — which stellar-core never
+                // does (see issue #3165).
+                ctx.driver.ballot_did_confirm(ctx.slot_index, &new_h);
+            }
         }
 
         did_work = self.update_current_if_needed(&new_h, ctx) || did_work;
         if did_work {
-            // Fire the confirm-prepared notification callback (SCP §6.5-1),
-            // with `new_h` being the high ballot, mirroring stellar-core
-            // BallotProtocol::setConfirmPrepared (BallotProtocol.cpp:1074-1075).
-            // Ordered update_current_if_needed -> ballot_did_confirm ->
-            // emit_current_state, matching the accepted_commit ordering in
-            // set_accept_commit (SCP §6.5-2).
-            ctx.driver.ballot_did_confirm(ctx.slot_index, &new_h);
             self.emit_current_state(ctx);
         }
 

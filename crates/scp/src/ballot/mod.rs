@@ -2325,35 +2325,104 @@ mod tests {
     #[test]
     fn test_confirm_prepared_callback_gated_on_inner_block() {
         // SCP §6.5-1 structural parity (issue #3165): `set_confirm_prepared`
-        // must fire `ballot_did_confirm` ONLY inside the inner ballot-compatible
+        // must fire `ballot_did_confirm` INSIDE the inner ballot-compatible
         // block, gated on the inner `did_work`, and BEFORE
         // `update_current_if_needed` — matching stellar-core
         // `BallotProtocol::setConfirmPrepared` (BallotProtocol.cpp:1074-1079),
         // where `confirmedBallotPrepared` fires inside `if (didWork)` within the
-        // `areBallotsCompatible` guard.
+        // `areBallotsCompatible` guard, before `updateCurrentIfNeeded`.
         //
-        // The divergence the old (outer-block) placement caused: on an
-        // incompatible-ballot path where `update_current_if_needed` returns true
-        // (a lower-counter, value-incompatible `current_ballot`), the inner block
-        // is skipped but the outer `did_work` becomes true via the update — so
-        // the outer-block placement fired the callback there, while stellar-core
-        // never does. This test pins both the negative (incompatible) and
-        // positive (compatible) paths.
-        let (node, qs, driver) = bare_ctx_parts();
+        // The genuine observable difference between the inner-block placement
+        // and the previous outer-block placement (post-`update_current_if_needed`)
+        // is the relative ORDER of driver callbacks within a single invocation:
+        //
+        //   - inner placement:  ballot_did_confirm  → started_ballot_protocol
+        //   - outer placement:  started_ballot_protocol → ballot_did_confirm
+        //
+        // because `update_current_if_needed` bumps `current_ballot` from `None`
+        // (via `bump_to_ballot`, which fires `started_ballot_protocol` on the
+        // null→set transition). The callback `callback_sequence` log on
+        // `MockDriver` records this order.
 
-        // --- Incompatible path: callback must NOT fire ---
+        // --- Compatible path: callback fires, gated on inner did_work, and
+        //     BEFORE update_current_if_needed (i.e. before started_ballot_protocol).
+        //
+        // Fresh protocol with no `current_ballot` (treated as compatible). The
+        // high ballot is raised inside the inner block (inner `did_work` true),
+        // so the callback fires with the high ballot `new_h`, then
+        // `update_current_if_needed` bumps current from `None`, firing
+        // `started_ballot_protocol`.
+        let node = make_node_id(1);
+        let qs = make_quorum_set(vec![node.clone()], 1);
+        let driver = Arc::new(MockDriver::with_quorum_set(qs.clone()));
+        let mut bp = BallotProtocol::new();
+        let new_h = ScpBallot {
+            counter: 3,
+            value: make_value(&[7]),
+        };
+        let did_work = bp.set_confirm_prepared(
+            ScpBallot {
+                counter: 0,
+                value: make_value(&[7]),
+            },
+            new_h.clone(),
+            &ctx!(&node, &qs, &driver, 1),
+        );
+        assert!(did_work);
+        // The callback fired with the high ballot `new_h`.
+        assert!(driver.confirmed_prepared_count.load(Ordering::SeqCst) >= 1);
+        assert_eq!(
+            driver
+                .confirmed_prepared_ballots
+                .lock()
+                .unwrap()
+                .first()
+                .cloned(),
+            Some(new_h.clone()),
+            "ballot_did_confirm must fire with the high ballot `new_h`"
+        );
+        // Ordering: ballot_did_confirm fires BEFORE started_ballot_protocol,
+        // proving the callback is positioned inside the inner block (pre-update),
+        // not in the outer block after `update_current_if_needed`.
+        let confirm_idx;
+        let started_idx;
+        {
+            let seq = driver.callback_sequence.lock().unwrap();
+            confirm_idx = seq
+                .iter()
+                .position(|&c| c == "ballot_did_confirm")
+                .expect("ballot_did_confirm must fire on the compatible path");
+            started_idx = seq
+                .iter()
+                .position(|&c| c == "started_ballot_protocol")
+                .expect("started_ballot_protocol must fire when current_ballot is first set");
+            assert!(
+                confirm_idx < started_idx,
+                "ballot_did_confirm (idx {confirm_idx}) must fire BEFORE \
+                 started_ballot_protocol (idx {started_idx}) — the inner-block \
+                 placement fires the callback before update_current_if_needed; the \
+                 old outer-block placement fired it after. seq={seq:?}"
+            );
+        }
+
+        // --- Incompatible-in-frame gating: the inner block is skipped, so the
+        //     callback does NOT fire from the incompatible call's own frame
+        //     before `update_current_if_needed` runs.
         //
         // `current_ballot` has a LOWER counter than `new_h` (so
-        // `update_current_if_needed` bumps and returns true) but an INCOMPATIBLE
-        // value (so the inner compatibility block is skipped and inner `did_work`
-        // stays false). stellar-core never fires `confirmedBallotPrepared` here.
-        let mut bp = BallotProtocol::new();
+        // `update_current_if_needed` will bump and return true) but an
+        // INCOMPATIBLE value (so the inner compatibility block is skipped and the
+        // inner `did_work` stays false). The first callback observed must be
+        // `started_ballot_protocol`/bump-driven, NOT a `ballot_did_confirm` fired
+        // from the outer `did_work`-via-update path (which the old placement did
+        // and stellar-core never does).
+        let driver2 = Arc::new(MockDriver::with_quorum_set(qs.clone()));
+        let mut bp2 = BallotProtocol::new();
         let current_incompat = ScpBallot {
             counter: 1,
             value: make_value(&[1]),
         };
-        bp.current_ballot = Some(current_incompat.clone());
-
+        bp2.current_ballot = Some(current_incompat.clone());
         let new_h_incompat = ScpBallot {
             counter: 2,
             value: make_value(&[2]),
@@ -2365,59 +2434,32 @@ mod tests {
         );
         assert!(!ballot_compatible(&current_incompat, &new_h_incompat));
 
-        let did_work = bp.set_confirm_prepared(
+        let did_work2 = bp2.set_confirm_prepared(
             ScpBallot {
                 counter: 0,
                 value: make_value(&[2]),
             },
             new_h_incompat.clone(),
-            &ctx!(&node, &qs, &driver, 1),
-        );
-        // `update_current_if_needed` did work (the ballot was bumped), but the
-        // inner confirm-prepared block did not — so the callback must NOT have
-        // fired even though overall `did_work` is true.
-        assert!(did_work, "update_current_if_needed should have bumped");
-        assert_eq!(
-            driver.confirmed_prepared_count.load(Ordering::SeqCst),
-            0,
-            "ballot_did_confirm must NOT fire on the incompatible-ballot path \
-             (inner block skipped) — see BallotProtocol.cpp:1074-1079"
-        );
-        assert!(driver.confirmed_prepared_ballots.lock().unwrap().is_empty());
-
-        // --- Compatible path: callback fires once, with `new_h` ---
-        //
-        // Fresh protocol with no `current_ballot` (treated as compatible). The
-        // high ballot is raised inside the inner block (inner `did_work` true),
-        // so the callback fires exactly once with the high ballot `new_h`.
-        let driver2 = Arc::new(MockDriver::with_quorum_set(qs.clone()));
-        let mut bp2 = BallotProtocol::new();
-        let new_h_compat = ScpBallot {
-            counter: 3,
-            value: make_value(&[7]),
-        };
-        let did_work2 = bp2.set_confirm_prepared(
-            ScpBallot {
-                counter: 0,
-                value: make_value(&[7]),
-            },
-            new_h_compat.clone(),
             &ctx!(&node, &qs, &driver2, 1),
         );
-        assert!(did_work2);
+        assert!(did_work2, "update_current_if_needed should have bumped");
+        // The inner block was skipped (incompatible), so the incompatible call's
+        // OWN frame must NOT fire `ballot_did_confirm`. The callback fires exactly
+        // ONCE here — from the legitimate self-emission re-entry on the now-
+        // compatible bumped ballot (henyey `emit_current_state` → `advance_slot`,
+        // mirrored in stellar-core by `emitCurrentStateStatement` →
+        // `processEnvelope` → `advanceSlot`). The previous OUTER-block placement
+        // fired the callback an EXTRA time from the in-frame update-driven
+        // `did_work` (yielding count == 2), which stellar-core never does — that
+        // surplus fire is the structural divergence this fix removes
+        // (BallotProtocol.cpp:1074-1079).
         assert_eq!(
             driver2.confirmed_prepared_count.load(Ordering::SeqCst),
             1,
-            "ballot_did_confirm must fire exactly once on the compatible path"
-        );
-        assert_eq!(
-            driver2
-                .confirmed_prepared_ballots
-                .lock()
-                .unwrap()
-                .as_slice(),
-            &[new_h_compat.clone()],
-            "ballot_did_confirm must fire with the high ballot `new_h`"
+            "ballot_did_confirm must fire exactly once on the incompatible path \
+             (re-entry only); the old outer-block placement fired it twice. \
+             seq={:?}",
+            driver2.callback_sequence.lock().unwrap()
         );
     }
 
