@@ -20,8 +20,8 @@
 # it applies the given --timeout via GNU `timeout` and layers the targeted
 # single retry on top of it (see below).
 #
-# The ONLY retryable case: network=testnet, enable=core,horizon,
-# probe=horizon-core-up, and exit was a transient-infra-classified code:
+# The retryable case: network=testnet, enable=core,horizon (ANY probe on that
+# shard), and exit was a transient-infra-classified code:
 #   * exit 124 — GNU `timeout` killed a slow start (the original #2916 flake).
 #   * exit 143 — the probe (or the runner) received SIGTERM (128+15=143),
 #     i.e. "the runner has received a shutdown signal" spot-runner reclamation
@@ -29,6 +29,18 @@
 #     to observe the probe's 143, re-running once self-heals without a manual
 #     orchestrator re-run; if the runner is fully reclaimed the wrapper dies
 #     too and the workflow's normal re-run path applies.
+#
+# Scope widened from probe=horizon-core-up to the whole testnet/core,horizon
+# shard (#3185). Testnet stellar-core is slow to catch up; the GREEN baseline
+# (f449a5a9) routinely shows horizon-core-up timing out (124) on attempt 1 and
+# only passing on the wrapper retry. But the SAME slow-startup propagates to the
+# NEXT startup-dependent probe in the shard — horizon-ingesting timed out (124)
+# right after horizon-core-up finally came up (069ebfcc, run 27019344504) and,
+# because the retry was scoped to one probe name, hard-failed as "not retryable".
+# Any probe on this shard can be caught mid-startup by a slow core or a
+# spot-runner SIGTERM, so the transient-infra retry now covers the shard, not a
+# single probe. Non-transient exits (e.g. exit 1) still fail loudly, and other
+# networks/enable-sets (local/pubnet) are still never retried.
 # The retry re-runs the probe under the SAME --timeout budget — it is an
 # additional attempt at the same per-attempt budget, not a change to the
 # budget (#2920). It stays scoped to the targeted shard so a genuine probe
@@ -65,8 +77,14 @@ DIAGNOSTICS_DIR="${DIAGNOSTICS_DIR:-/tmp/quickstart-diagnostics/$NETWORK-$ENABLE
 mkdir -p "$DIAGNOSTICS_DIR"
 
 # --- Helper: is this the retryable shard? ---
+# The testnet/core,horizon shard is the known slow-startup shard (#2916/#3185):
+# testnet stellar-core takes minutes to catch up, so any startup-dependent probe
+# on this shard can hit a transient-infra exit (124 timeout / 143 SIGTERM). The
+# retry is scoped to this shard (not a single probe name) so whichever probe is
+# running when core is still catching up — horizon-core-up, horizon-ingesting,
+# etc. — gets the same single self-healing retry. local/pubnet shards never retry.
 is_retryable_shard() {
-    [[ "$NETWORK" == "testnet" && "$ENABLE" == "core,horizon" && "$PROBE" == "horizon-core-up" ]]
+    [[ "$NETWORK" == "testnet" && "$ENABLE" == "core,horizon" ]]
 }
 
 # --- Helper: is this exit code a retryable transient-infra failure? ---
