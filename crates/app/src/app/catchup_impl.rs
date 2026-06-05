@@ -384,7 +384,14 @@ impl App {
         // Matches stellar-core's cleanupStaleFiles() in assumeState().
         // Run on the blocking thread pool: resolve_pending_bucket_merges() inside
         // collect_gc_roots() may block waiting for in-flight async merges.
-        {
+        //
+        // Kill-switch (#3153): when `buckets.disable_bucket_gc` is set, skip the
+        // whole block before spawning the blocking task — neither
+        // collect_gc_roots() nor retain_buckets() runs, so the
+        // resolve-merges → retain ordering invariant is preserved trivially.
+        // Mirror of stellar-core's `!mConfig.DISABLE_BUCKET_GC` guard
+        // (`BucketManager.cpp:896`).
+        if self.bucket_gc_enabled() {
             let lm = self.ledger_manager.clone();
             let bm = self.bucket_manager.clone();
             let db = self.db.clone();

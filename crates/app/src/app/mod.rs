@@ -1969,6 +1969,23 @@ impl App {
         &self.bucket_gc_in_flight
     }
 
+    /// Whether on-disk bucket garbage collection is enabled.
+    ///
+    /// Mirrors stellar-core's `!mConfig.DISABLE_BUCKET_GC` guard
+    /// (`BucketManager.cpp:896`, `:987`). Returns `false` when the operator has
+    /// set `buckets.disable_bucket_gc = true` (the forensic / debugging
+    /// kill-switch), in which case both GC entry points
+    /// (`cleanup_stale_bucket_files_background` and the catchup-path cleanup)
+    /// short-circuit before deleting any unreferenced bucket files. Defaults to
+    /// `true` (GC enabled).
+    ///
+    /// `#[doc(hidden)] pub` so integration tests can assert the gate; not part
+    /// of the stable API.
+    #[doc(hidden)]
+    pub fn bucket_gc_enabled(&self) -> bool {
+        !self.config.buckets.disable_bucket_gc
+    }
+
     /// Update the bucket snapshot manager with fresh snapshots from the
     /// current bucket list state. Called after each ledger close and after
     /// catchup completes to keep the query server's view current.
@@ -2717,6 +2734,17 @@ impl App {
     /// stable API.
     #[doc(hidden)]
     pub fn cleanup_stale_bucket_files_background(&self) -> bool {
+        // Kill-switch (#3153): when `buckets.disable_bucket_gc` is set, never
+        // delete on-disk bucket files — mirror of stellar-core's
+        // `!mConfig.DISABLE_BUCKET_GC` guard (`BucketManager.cpp:896`/`:987`).
+        // Early-return BEFORE acquiring the re-entrancy guard or spawning the
+        // blocking task: neither `collect_gc_roots()` (which resolves pending
+        // merges) nor `retain_buckets()` runs, so the
+        // resolve-merges → retain ordering invariant is preserved trivially.
+        if !self.bucket_gc_enabled() {
+            return false;
+        }
+
         // Acquire the re-entrancy guard. If a GC is already in flight, skip this
         // ledger — the in-flight run will pick up everything stale.
         if self
