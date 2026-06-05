@@ -657,28 +657,23 @@ pub fn is_valid_for_apply(
     };
 
     let valid = match &upgrade {
-        LedgerUpgrade::Version(new_version) => {
-            // Only allow upgrades to supported versions, must be strictly increasing
-            *new_version <= max_protocol_version && *new_version > current_version
-        }
-        LedgerUpgrade::BaseFee(fee) => *fee != 0,
-        LedgerUpgrade::MaxTxSetSize(_) => true, // Any size allowed
-        LedgerUpgrade::BaseReserve(reserve) => *reserve != 0,
-        LedgerUpgrade::Flags(flags) => {
-            // Flags upgrade requires protocol 18+
-            // MASK_LEDGER_HEADER_FLAGS = 0x7 (bits 0-2)
-            const MASK_LEDGER_HEADER_FLAGS: u32 = 0x7;
-            protocol_version_starts_from(current_version, ProtocolVersion::V18)
-                && (*flags & !MASK_LEDGER_HEADER_FLAGS) == 0
-        }
+        // Config is this site's stateless nomination-time variant: a >= V20 gate
+        // with no ledger-state lookup. The shared helper deliberately does not
+        // own Config (it returns `true`), so we branch it here and never route
+        // it through the helper.
         LedgerUpgrade::Config(_) => {
             // Config upgrade requires Soroban (protocol 20+)
             protocol_version_starts_from(current_version, ProtocolVersion::V20)
         }
-        LedgerUpgrade::MaxSorobanTxSetSize(_) => {
-            // Soroban tx set size requires protocol 20+
-            protocol_version_starts_from(current_version, ProtocolVersion::V20)
-        }
+        // All non-Config (scalar) arms — Version/BaseFee/MaxTxSetSize/BaseReserve/
+        // Flags/MaxSorobanTxSetSize — delegate to the single shared source of
+        // truth in henyey-common. `current_version`/`max_protocol_version` are
+        // threaded straight through, preserving byte-identical behavior.
+        other => henyey_common::upgrade_valid_for_apply_non_config(
+            other,
+            current_version,
+            max_protocol_version,
+        ),
     };
 
     if valid {
