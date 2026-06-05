@@ -486,6 +486,56 @@ mod tests {
     }
 
     #[test]
+    fn test_eviction_cycle_metrics_record_on_complete_cycle() {
+        let counters = EvictionCounters::new();
+
+        // First call establishes the baseline cycle: nothing recorded yet.
+        counters.submit_metrics_and_restart_cycle(100);
+        let snap = counters.snapshot();
+        assert_eq!(snap.eviction_cycle_period, 0);
+        assert_eq!(snap.average_evicted_entry_age, 0);
+
+        // Record several entry ages during the cycle.
+        counters.record_evicted_entry_age(10);
+        counters.record_evicted_entry_age(20);
+        counters.record_evicted_entry_age(30);
+
+        // Closing the cycle at ledger 110 records the span and integer average.
+        counters.submit_metrics_and_restart_cycle(110);
+        let snap = counters.snapshot();
+        assert_eq!(snap.eviction_cycle_period, 10); // 110 - 100
+        assert_eq!(snap.average_evicted_entry_age, 20); // (10 + 20 + 30) / 3
+    }
+
+    #[test]
+    fn test_eviction_average_age_zero_when_no_evictions() {
+        let counters = EvictionCounters::new();
+
+        // Establish baseline cycle.
+        counters.submit_metrics_and_restart_cycle(100);
+        // Close a second cycle with no recorded ages: count == 0 branch.
+        counters.submit_metrics_and_restart_cycle(110);
+
+        let snap = counters.snapshot();
+        assert_eq!(snap.eviction_cycle_period, 10);
+        assert_eq!(snap.average_evicted_entry_age, 0); // no divide-by-zero
+    }
+
+    #[test]
+    fn test_eviction_cycle_period_resets_each_cycle() {
+        let counters = EvictionCounters::new();
+
+        // Baseline at 100.
+        counters.submit_metrics_and_restart_cycle(100);
+        // Second wrap at 110: period == 110 - 100.
+        counters.submit_metrics_and_restart_cycle(110);
+        assert_eq!(counters.snapshot().eviction_cycle_period, 10);
+        // Third wrap at 145: cycle start was reset to 110, so period == 145 - 110.
+        counters.submit_metrics_and_restart_cycle(145);
+        assert_eq!(counters.snapshot().eviction_cycle_period, 35);
+    }
+
+    #[test]
     fn test_bucket_list_metrics() {
         let metrics = BucketListMetrics::new();
 
@@ -511,8 +561,26 @@ mod tests {
 
         let eviction_counters = EvictionCounters::new();
         eviction_counters.record_evicted(10, 5, 5);
-        assert_eq!(eviction_counters.snapshot().entries_evicted, 10);
+        // Drive a full cycle so the cycle gauges and accumulators are non-zero.
+        eviction_counters.submit_metrics_and_restart_cycle(100);
+        eviction_counters.record_evicted_entry_age(40);
+        eviction_counters.submit_metrics_and_restart_cycle(110);
+        let snap = eviction_counters.snapshot();
+        assert_eq!(snap.entries_evicted, 10);
+        assert_eq!(snap.eviction_cycle_period, 10);
+        assert_eq!(snap.average_evicted_entry_age, 40);
         eviction_counters.reset();
-        assert_eq!(eviction_counters.snapshot().entries_evicted, 0);
+        let snap = eviction_counters.snapshot();
+        assert_eq!(snap.entries_evicted, 0);
+        assert_eq!(snap.eviction_cycle_period, 0);
+        assert_eq!(snap.average_evicted_entry_age, 0);
+        // After reset, the next cycle is again treated as a fresh baseline:
+        // a single submit records nothing.
+        eviction_counters.submit_metrics_and_restart_cycle(200);
+        eviction_counters.record_evicted_entry_age(5);
+        eviction_counters.submit_metrics_and_restart_cycle(205);
+        let snap = eviction_counters.snapshot();
+        assert_eq!(snap.eviction_cycle_period, 5);
+        assert_eq!(snap.average_evicted_entry_age, 5);
     }
 }
