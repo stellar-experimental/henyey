@@ -1,0 +1,71 @@
+name: Quickstart Retry
+
+# Out-of-run auto-retry for the Quickstart workflow on a whole-runner
+# reclamation (#3193).
+#
+# Why a SEPARATE workflow (not an in-run job): the in-wrapper retry in
+# scripts/ci/run-quickstart-test.sh self-heals a transient-infra exit
+# (124 timeout / 143 SIGTERM / 137 SIGKILL) ONLY when the runner survives long
+# enough for the bash wrapper to observe the probe's non-zero exit and re-run
+# it. When GitHub reclaims the WHOLE runner ("The runner has received a shutdown
+# signal" + "Process completed with exit code 143/137" + "Cleaning up orphan
+# processes"), the wrapper process is itself killed and never reaches its retry
+# block. The only recovery is a fresh job attempt.
+#
+# The previous design put that recovery in an in-run `rerun-on-transient` job,
+# but a job INSIDE a run cannot re-dispatch its own still-running run:
+# `gh run rerun <id> --failed` fails with "run <id> cannot be rerun; This
+# workflow is already running" (exit 1), observed on PR #3187's run
+# 27037187429. The auto-retry never fired and only added a spurious FAILURE
+# check.
+#
+# This workflow instead triggers on `workflow_run` (types: completed) for the
+# Quickstart workflow, so it runs AFTER that run has fully finished — at which
+# point `gh run rerun <id> --failed` is accepted (no "already running"). It
+# re-dispatches the failed jobs of the triggering run exactly once.
+#
+# Bounded one-shot (cannot loop): the guard requires
+#   github.event.workflow_run.conclusion == 'failure'  AND
+#   github.event.workflow_run.run_attempt == 1
+# The re-dispatched run is attempt 2 (run_attempt == 2). If attempt 2 ALSO
+# fails, this workflow fires again on its completion, but the run_attempt == 1
+# guard is now false, so no further rerun is dispatched and attempt 2's failure
+# stays red. A genuine (reproducible) failure therefore fails identically on
+# attempt 2 and surfaces as a hard red — this absorbs exactly one transient
+# reclamation without masking regressions, and the blast radius is bounded to a
+# single extra attempt.
+#
+# IMPORTANT: the `workflows:` value below MUST match the Quickstart workflow's
+# top-level `name:` field in .github/workflows/quickstart.yml ("Quickstart")
+# exactly, or this trigger never fires. The harness asserts this match
+# (scripts/test-quickstart-harness.sh::test_separate_workflow_run_retry_workflow).
+
+on:
+  workflow_run:
+    workflows: ["Quickstart"]
+    types: [completed]
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  rerun-on-transient:
+    # Only re-dispatch when the triggering Quickstart run FAILED and it was its
+    # FIRST attempt. run_attempt == 2 (the re-dispatched attempt) fails the
+    # guard, so this is a bounded one-shot — it cannot loop.
+    if: >-
+      github.event.workflow_run.conclusion == 'failure' &&
+      github.event.workflow_run.run_attempt == 1
+    runs-on: ubuntu-latest
+    steps:
+      - name: Re-dispatch failed jobs once on transient-infra failure
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+        run: |
+          echo "Quickstart run $RUN_ID failed on run_attempt=1;"
+          echo "re-dispatching its failed jobs once (out-of-run, post-completion)"
+          echo "to self-heal a one-off whole-runner reclamation (#3193)."
+          gh run rerun "$RUN_ID" --failed \
+            --repo "${{ github.repository }}"

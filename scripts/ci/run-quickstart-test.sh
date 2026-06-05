@@ -29,6 +29,11 @@
 #     to observe the probe's 143, re-running once self-heals without a manual
 #     orchestrator re-run; if the runner is fully reclaimed the wrapper dies
 #     too and the workflow's normal re-run path applies.
+#   * exit 137 — SIGKILL (128+9=137), the harsher reclamation signature observed
+#     on PR #3187's run 27037187429 ("exit code 137"). Same transient class as
+#     143; retried identically (#3193). Whole-runner reclamation kills this
+#     wrapper too, so the in-script retry only covers the case where the runner
+#     survives; the out-of-run quickstart-retry.yml workflow recovers the rest.
 #
 # Scope widened from probe=horizon-core-up to the whole testnet/core,horizon
 # shard (#3185). Testnet stellar-core is slow to catch up; the GREEN baseline
@@ -89,10 +94,16 @@ is_retryable_shard() {
 
 # --- Helper: is this exit code a retryable transient-infra failure? ---
 # 124: GNU `timeout` killed a slow start (#2916). 143: SIGTERM (128+15) —
-# runner-shutdown / spot-runner reclamation (#3131). Both are infra-transient,
-# not test-logic failures, so they are retried once on the targeted shard only.
+# runner-shutdown / spot-runner reclamation (#3131). 137: SIGKILL (128+9) —
+# the harsher runner-reclamation signature observed on PR #3187's run
+# 27037187429 ("The runner has received a shutdown signal" + "exit code 137",
+# #3193). All three are infra-transient, not test-logic failures, so they are
+# retried once on the targeted shard only. (Note: whole-runner reclamation also
+# kills this wrapper, so the in-script retry only helps when the runner survives
+# long enough to observe the probe's exit; the out-of-run quickstart-retry.yml
+# workflow recovers the fully-reclaimed case.)
 is_retryable_exit() {
-    [[ "$1" -eq 124 || "$1" -eq 143 ]]
+    [[ "$1" -eq 124 || "$1" -eq 143 || "$1" -eq 137 ]]
 }
 
 # --- Helper: capture diagnostics ---
