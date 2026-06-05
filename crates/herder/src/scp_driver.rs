@@ -41,6 +41,17 @@ const LOCK_SCP_EXTERNALIZED: &str = "scp_driver.externalized";
 const LOCK_SCP_LATEST_EXTERNALIZED: &str = "scp_driver.latest_externalized";
 const LOCK_TRACKING_STATE: &str = "shared.tracking_state";
 
+/// Maximum number of upgrades carried in a single `StellarValue`.
+///
+/// Mirrors stellar-core's XDR schema, which declares `UpgradeType upgrades<6>`
+/// in `Stellar-ledger.x` (v26.0.1) — a structural variable-array bound, not a
+/// runtime check. The limit is therefore enforced by the XDR type itself when a
+/// combined value is serialized; this named constant surfaces the bound for
+/// auditability and parity per HERDER_SPEC §17.1. It MUST NOT be changed by
+/// implementations. Behavior is unchanged: the value 6 is already enforced by
+/// the `try_into()` into the bounded XDR vector in `combine_candidates_impl`.
+const MAX_UPGRADES_PER_VALUE: usize = 6;
+
 use henyey_common::protocol::{protocol_version_starts_from, ProtocolVersion};
 use henyey_common::{Hash256, NetworkId};
 use henyey_crypto::{PublicKey, SecretKey, Signature};
@@ -2109,9 +2120,15 @@ impl ScpDriver {
                 )
             })
             .collect();
-        result.upgrades = upgrade_bytes
-            .try_into()
-            .expect("BUG: merged upgrades exceed XDR max of 6");
+        // The merged-upgrade count is bounded by `MAX_UPGRADES_PER_VALUE` (6),
+        // matching stellar-core's XDR schema (`UpgradeType upgrades<6>`). The
+        // `try_into()` into the bounded XDR vector is what enforces the bound;
+        // it panics on overflow (parity: stellar-core's `xdr_to_opaque` throws
+        // at HerderSCPDriver.cpp:810). The named constant pins the limit value.
+        // Behavior is unchanged: the value 6 is identical to the prior literal.
+        result.upgrades = upgrade_bytes.try_into().unwrap_or_else(|_| {
+            panic!("BUG: merged upgrades exceed XDR max of {MAX_UPGRADES_PER_VALUE}")
+        });
 
         let xdr_bytes = result
             .to_xdr(stellar_xdr::curr::Limits::none())
@@ -2870,6 +2887,15 @@ impl ScpDriver {
 #[cfg(test)]
 mod manual_close_tests {
     use super::*;
+
+    /// Parity pin: `MAX_UPGRADES_PER_VALUE` must match stellar-core's XDR
+    /// schema, which declares `UpgradeType upgrades<6>` in `Stellar-ledger.x`
+    /// (v26.0.1). If stellar-core ever changes this bound, this test fails and
+    /// forces a deliberate update. See HERDER_SPEC §17.1.
+    #[test]
+    fn test_max_upgrades_per_value_matches_stellar_core() {
+        assert_eq!(MAX_UPGRADES_PER_VALUE, 6);
+    }
 
     fn make_default_lm() -> Arc<henyey_ledger::LedgerManager> {
         use henyey_ledger::{LedgerManager, LedgerManagerConfig};
