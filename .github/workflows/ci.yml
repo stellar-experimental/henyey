@@ -140,6 +140,10 @@ jobs:
         run: bash scripts/test-agent-worktree-contract.sh
       - name: Verify do_bootstrap workspace persist/reap contract
         run: bash scripts/lib/tests/test-do-bootstrap.bats
+      - name: Install zsh (for cross-shell helper self-test)
+        run: sudo apt-get update && sudo apt-get install -y zsh
+      - name: Verify shell-lib helpers source clean under bash and zsh
+        run: bash scripts/test-shell-lib-cross-shell.sh
 
   quickstart-harness:
     name: Quickstart Harness

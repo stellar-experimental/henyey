@@ -1,8 +1,11 @@
 // GENERATED FILE — DO NOT EDIT BY HAND.
 //
-// CAP-0076 / Protocol 23 hot-archive bug remediation data table
-// (478 corrupted/correct base64-XDR `LedgerEntry` pairs), transcribed
-// verbatim from stellar-core's `P23HotArchiveBugData.cpp`.
+// CAP-0076 / Protocol 23 hot-archive bug remediation data table,
+// transcribed verbatim from stellar-core's `P23HotArchiveBugData.cpp`:
+//   - 478 corrupted/correct base64-XDR `LedgerEntry` pairs
+//     (issue #3061, bucketListHash remediation), and
+//   - 12 base64-XDR `Asset` literals for the SAC
+//     mint/burn event reconciler (issue #3126, observability-only).
 //
 // Provenance: stellar-core v26.0.1, commit e78c97ed0.
 // Source file SHA-256: 8d7b3a6fda453c3dcd2e3187123093856f8fc4cdd9a70a873c688663b9832e8c
@@ -10,10 +13,13 @@
 // Regenerate with:
 //   python3 crates/ledger/scripts/extract_p23_hot_archive_bug_data.py
 //
-// See issue #3061 and `p23_hot_archive_bug.rs`.
+// See issues #3061 / #3126 and `p23_hot_archive_bug.rs`.
 
 /// Number of hardcoded corrupted hot-archive entries (478).
 pub const P23_CORRUPTED_HOT_ARCHIVE_ENTRIES_COUNT: usize = 478;
+
+/// Number of affected SAC assets for the event reconciler (12).
+pub const P23_CORRUPTED_AFFECTED_ASSETS_COUNT: usize = 12;
 
 /// Base64-XDR `LedgerEntry` literals: P23_CORRUPTED_HOT_ARCHIVE_ENTRIES.
 pub static P23_CORRUPTED_HOT_ARCHIVE_ENTRIES: [&str; P23_CORRUPTED_HOT_ARCHIVE_ENTRIES_COUNT] = [
@@ -977,4 +983,20 @@ pub static P23_CORRUPTED_HOT_ARCHIVE_ENTRY_CORRECT_STATE: [&str; P23_CORRUPTED_H
     "A3XjlwAAAAYAAAAAAAAAAfBHOqv1q8THHOivBTgpKUD3M6psBCG1m97X6LNL5F21AAAAEAAAAAEAAAACAAAADwAAAAdCYWxhbmNlAAAAABIAAAABFvcX+Ntvqp5kuTuq/g6vKYzMD+llrkgr8L7C3CsJ8pwAAAABAAAAEQAAAAEAAAADAAAADwAAAAZhbW91bnQAAAAAAAoAAAAAAAAAAAAAAAAAAAAAAAAADwAAAAphdXRob3JpemVkAAAAAAAAAAAAAQAAAA8AAAAIY2xhd2JhY2sAAAAAAAAAAAAAAAA=",
     "A3lodgAAAAYAAAAAAAAAAfBHOqv1q8THHOivBTgpKUD3M6psBCG1m97X6LNL5F21AAAAEAAAAAEAAAACAAAADwAAAAdCYWxhbmNlAAAAABIAAAABNSL7pTBxyupi/W8TrdvKi44Bnrmw5RSf7iSRiYjUsTwAAAABAAAAEQAAAAEAAAADAAAADwAAAAZhbW91bnQAAAAAAAoAAAAAAAAAAAAAAAAAAAAAAAAADwAAAAphdXRob3JpemVkAAAAAAAAAAAAAQAAAA8AAAAIY2xhd2JhY2sAAAAAAAAAAAAAAAA=",
     "A35NbAAAAAYAAAAAAAAAAfBHOqv1q8THHOivBTgpKUD3M6psBCG1m97X6LNL5F21AAAAEAAAAAEAAAACAAAADwAAAAdCYWxhbmNlAAAAABIAAAABtJBfPve3i1JcJO+a6NMjAJFks1ZkA9QBP2NDGirAhKAAAAABAAAAEQAAAAEAAAADAAAADwAAAAZhbW91bnQAAAAAAAoAAAAAAAAAAAAAAAAAAAAAAAAADwAAAAphdXRob3JpemVkAAAAAAAAAAAAAQAAAA8AAAAIY2xhd2JhY2sAAAAAAAAAAAAAAAA=",
+];
+
+/// Base64-XDR `Asset` literals: P23_CORRUPTED_AFFECTED_ASSETS.
+pub static P23_CORRUPTED_AFFECTED_ASSETS: [&str; P23_CORRUPTED_AFFECTED_ASSETS_COUNT] = [
+    "AAAAAA==",
+    "AAAAAVVTREMAAAAAO5kROA7+mIugqJAOsc/kTzZvfb6Ua+0HckD39iTfFcU=",
+    "AAAAAlVTVFJZAAAAAAAAAAAAAACjihh9bUETXn31yZR0SCigSeDgfCEzu07aIZmcZ+LBNg==",
+    "AAAAAUJMTkQAAAAA0kPMJPZPS8rFR7mhiMujiCWd5dqlc77zlNPybSXzIdI=",
+    "AAAAAUFRVUEAAAAAW5QuU6wzyP0KgMx8GxqF19g4qcQZd6rRizrwV/jjPfA=",
+    "AAAAAVNIWAAAAAAA5TjI9zmT/KKxDcmCdh/l6VFSRFEDH9BHJShFf036PqQ=",
+    "AAAAAVNUSwAAAAAAfW7IaowF6psp0uDj0Z0IMxUWYHOCFHiZgj3bIdtXwQw=",
+    "AAAAAU5MVAAAAAAAL67mruJq8g1bj8lCiNVHbidAzKmg3NSrNjUbTCiAbaw=",
+    "AAAAAkxJQlJFAAAAAAAAAAAAAAAwIVlEE0w4nxTdJxIEerrFsVIN8WutTUzlhQJHaLR/Mg==",
+    "AAAAAUtQT1AAAAAA43Oh2jfBBl1sJz15HPylcD8Gbbh9XTWsf6/BAUfUlcc=",
+    "AAAAAUtBTEUAAAAAR1vypFiHKHeKgnE2nuA5VhED/841SUAs4KR5zr8bCfU=",
+    "AAAAAVNCSQAAAAAApjwUrepRcx7ax1frLCxCibZizKJrumi41+2I+RW8EAo=",
 ];

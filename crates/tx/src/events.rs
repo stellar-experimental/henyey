@@ -37,11 +37,11 @@
 use henyey_common::NetworkId;
 use henyey_crypto::PublicKey as StrKeyPublicKey;
 use stellar_xdr::curr::{
-    AccountId, Asset, ClaimableBalanceId, ContractEvent, ContractEventBody, ContractEventType,
-    ContractEventV0, ContractId, ContractIdPreimage, Hash, HashIdPreimage,
-    HashIdPreimageContractId, Int128Parts, Memo, MuxedAccount, MuxedEd25519Account,
-    PublicKey as XdrPublicKey, ScAddress, ScMap, ScMapEntry, ScString, ScVal, StringM,
-    TransactionEvent, TransactionEventStage,
+    AccountId, Asset, ClaimableBalanceId, ContractDataDurability, ContractEvent, ContractEventBody,
+    ContractEventType, ContractEventV0, ContractId, ContractIdPreimage, Hash, HashIdPreimage,
+    HashIdPreimageContractId, Int128Parts, LedgerEntry, LedgerEntryData, LedgerKey, Limits, Memo,
+    MuxedAccount, MuxedEd25519Account, PublicKey as XdrPublicKey, ReadXdr, ScAddress, ScMap,
+    ScMapEntry, ScString, ScSymbol, ScVal, StringM, TransactionEvent, TransactionEventStage,
 };
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -55,8 +55,17 @@ impl ClassicEventConfig {
         self.emit_classic_events
     }
 
-    pub fn backfill_to_protocol23(self, _protocol_version: u32) -> bool {
-        false
+    /// Whether SAC mint/burn event backfill (the P23 corruption reconciler) is
+    /// active for this ledger.
+    ///
+    /// Mirrors stellar-core's gating: the reconciler only runs when
+    /// `BACKFILL_STELLAR_ASSET_EVENTS` is enabled AND the protocol version is
+    /// **exactly** 23 (`protocolVersionEquals(pv, ProtocolVersion::V_23)` in
+    /// `Protocol23CorruptionEventReconciler::getSACReconciliationEventAndTrackDiff`,
+    /// `P23HotArchiveBug.cpp:530`). The equality (not `>=`) is load-bearing —
+    /// the corruption only occurred during protocol 23.
+    pub fn backfill_to_protocol23(self, protocol_version: u32) -> bool {
+        self.backfill_stellar_asset_events && protocol_version == 23
     }
 }
 
@@ -864,6 +873,306 @@ fn get_asset_contract_id(network_id: &NetworkId, asset: &Asset) -> ContractId {
     ContractId(Hash::from(hash))
 }
 
+// ============================================================================
+// Protocol 23 SAC mint/burn event reconciler (issue #3126).
+//
+// Port of stellar-core's `Protocol23CorruptionEventReconciler`
+// (`stellar-core/src/ledger/P23HotArchiveBug.cpp:456-615`).
+//
+// During protocol-23 catchup, when a corrupted SAC (Stellar Asset Contract)
+// balance entry is auto-restored from the hot archive, stellar-core prepends a
+// synthetic mint/burn reconciliation event to the InvokeHostFunction operation
+// meta so the off-chain event stream balances out the corruption. This is
+// observability-only: the events are added to op-meta AFTER the success
+// preimage is hashed (`InvokeHostFunctionOpFrame.cpp:821` hashes `success`
+// before `:825` `setEvents` prepends the reconciliation events), so they have
+// ZERO effect on `bucketListHash`, the tx-result hash, or the
+// `InvokeHostFunctionSuccessPreImage` hash. The whole mechanism is gated on
+// `BACKFILL_STELLAR_ASSET_EVENTS` and off by default.
+//
+// Intentional divergences from stellar-core, both parity-safe:
+//   * We omit `mReconciliationAmounts` / `hasReconciliationAmount` tracking —
+//     its only upstream consumer is the unimplemented
+//     `EventsAreConsistentWithEntryDiffs` invariant.
+//   * We drop stellar-core's `std::mutex` (henyey replays single-threaded for
+//     the reconciler input).
+// ============================================================================
+
+/// A single reconciliation event produced by [`P23SacReconciler`].
+///
+/// Mirrors `Protocol23CorruptionEventReconciler::SACReconciliationInfo`. A
+/// positive `amount` is a mint to `mint_or_burn_address`; a negative `amount`
+/// is a burn from that address (emitting `-amount` as a positive number).
+#[derive(Debug, Clone)]
+pub struct SacReconciliationInfo {
+    /// The affected SAC asset.
+    pub asset: Asset,
+    /// The balance owner address that mints (diff > 0) or burns (diff < 0).
+    pub mint_or_burn_address: ScAddress,
+    /// `restored_balance - correct_balance` (never zero — equal balances yield
+    /// no event).
+    pub amount: i64,
+}
+
+/// Reconciler for the protocol-23 hot-archive SAC corruption.
+///
+/// Built once (decoding the hardcoded data table is non-trivial), then queried
+/// for each hot-archive restore during a protocol-23 ledger.
+pub struct P23SacReconciler {
+    /// SAC contract id → affected `Asset`. Built from the 12-entry
+    /// `P23_CORRUPTED_AFFECTED_ASSETS` array via [`get_asset_contract_id`].
+    sac_asset_map: std::collections::HashMap<ScAddress, Asset>,
+    /// Corrupted-entry `LedgerKey` → (correct entry, corrupted entry), built
+    /// from the 478 corrupted/correct pairs.
+    key_to_entries: std::collections::HashMap<LedgerKey, (LedgerEntry, LedgerEntry)>,
+}
+
+impl P23SacReconciler {
+    /// Construct the reconciler from the hardcoded base64-XDR data table.
+    ///
+    /// `affected_assets` are the base64-XDR `Asset` literals
+    /// (`P23_CORRUPTED_AFFECTED_ASSETS`); `corrupted_correct_pairs` are
+    /// `(corrupted, correct)` base64-XDR `LedgerEntry` literals (the 478 pairs
+    /// from the #3061 data table, in `(P23_CORRUPTED_HOT_ARCHIVE_ENTRIES[i],
+    /// P23_CORRUPTED_HOT_ARCHIVE_ENTRY_CORRECT_STATE[i])` order).
+    ///
+    /// Mirrors `Protocol23CorruptionEventReconciler::Protocol23CorruptionEventReconciler`
+    /// (`P23HotArchiveBug.cpp:456-482`).
+    ///
+    /// # Errors
+    /// Returns `Err` if any literal fails to decode, or if two affected assets
+    /// map to the same SAC contract id (mirrors stellar-core's
+    /// `releaseAssert(inserted)`).
+    pub fn new(
+        network_id: &NetworkId,
+        affected_assets: &[&str],
+        corrupted_correct_pairs: &[(&str, &str)],
+    ) -> Result<Self, String> {
+        let mut sac_asset_map = std::collections::HashMap::new();
+        for (i, encoded) in affected_assets.iter().enumerate() {
+            let asset = Asset::from_xdr_base64(encoded, Limits::none())
+                .map_err(|e| format!("P23 reconciler: failed to decode affected asset {i}: {e}"))?;
+            let address = ScAddress::Contract(get_asset_contract_id(network_id, &asset));
+            if sac_asset_map.insert(address, asset).is_some() {
+                return Err(format!(
+                    "P23 reconciler: duplicate SAC contract id for affected asset {i}"
+                ));
+            }
+        }
+
+        let mut key_to_entries = std::collections::HashMap::new();
+        for (i, (corrupted_b64, correct_b64)) in corrupted_correct_pairs.iter().enumerate() {
+            let corrupted =
+                LedgerEntry::from_xdr_base64(corrupted_b64, Limits::none()).map_err(|e| {
+                    format!("P23 reconciler: failed to decode corrupted entry {i}: {e}")
+                })?;
+            let correct = LedgerEntry::from_xdr_base64(correct_b64, Limits::none())
+                .map_err(|e| format!("P23 reconciler: failed to decode correct entry {i}: {e}"))?;
+            let key = henyey_common::entry_to_key(&corrupted);
+            key_to_entries.insert(key, (correct, corrupted));
+        }
+
+        Ok(Self {
+            sac_asset_map,
+            key_to_entries,
+        })
+    }
+
+    /// Compute the reconciliation event for a single hot-archive restore.
+    ///
+    /// Mirrors `getSACReconciliationEventAndTrackDiff`
+    /// (`P23HotArchiveBug.cpp:524-588`). Returns `None` (no event) when:
+    ///   * `protocol_version != 23` (equality gate),
+    ///   * the restored key is not in the corrupted-entry table,
+    ///   * the restored entry is not `CONTRACT_DATA`,
+    ///   * the restored entry's contract is not one of the 12 affected SACs, or
+    ///   * the restored balance equals the correct balance.
+    ///
+    /// The restored entry MUST byte-match the hardcoded corrupted entry
+    /// (stellar-core `releaseAssert(restoredEntry == corruptedEntry)`); a
+    /// mismatch is a data/usage error and returns `Err`.
+    pub fn reconciliation_event(
+        &self,
+        restored_key: &LedgerKey,
+        restored_entry: &LedgerEntry,
+        protocol_version: u32,
+    ) -> Result<Option<SacReconciliationInfo>, String> {
+        if protocol_version != 23 {
+            return Ok(None);
+        }
+
+        let Some((correct_entry, corrupted_entry)) = self.key_to_entries.get(restored_key) else {
+            return Ok(None);
+        };
+
+        let LedgerEntryData::ContractData(cd) = &restored_entry.data else {
+            return Ok(None);
+        };
+
+        let Some(asset) = self.sac_asset_map.get(&cd.contract) else {
+            return Ok(None);
+        };
+
+        let (restored_balance, restored_owner) = get_sac_balance(restored_entry)?;
+
+        // The restored entry must be exactly the hardcoded corrupted entry.
+        if restored_entry != corrupted_entry {
+            return Err(
+                "P23 reconciler: restored entry does not match the hardcoded corrupted entry"
+                    .to_string(),
+            );
+        }
+
+        let (correct_balance, correct_owner) = get_sac_balance(correct_entry)?;
+
+        // The balance addresses must match.
+        if correct_owner != restored_owner {
+            return Err("P23 reconciler: correct/restored balance owner mismatch".to_string());
+        }
+
+        if correct_balance == restored_balance {
+            // No change in amount, no reconciliation event.
+            return Ok(None);
+        }
+
+        let amount = restored_balance - correct_balance;
+        Ok(Some(SacReconciliationInfo {
+            asset: asset.clone(),
+            mint_or_burn_address: correct_owner,
+            amount,
+        }))
+    }
+
+    /// Build the raw `ContractEvent`s for a batch of restored entries, in
+    /// restore order.
+    ///
+    /// Each non-`None` reconciliation produces a mint event (amount > 0) or a
+    /// burn event (amount < 0, emitting `-amount`). Mirrors the prepend loop in
+    /// `InvokeHostFunctionOpFrame::setEvents` (`InvokeHostFunctionOpFrame.cpp:772-815`).
+    ///
+    /// The returned events carry no muxed-id/memo data
+    /// (`allow_muxed_id_or_memo = false`), matching `makeMintEvent(.., false)` /
+    /// `makeBurnEvent(..)` upstream.
+    pub fn reconciliation_events_for_restores(
+        &self,
+        network_id: &NetworkId,
+        restores: impl IntoIterator<Item = (LedgerKey, LedgerEntry)>,
+        protocol_version: u32,
+    ) -> Result<Vec<ContractEvent>, String> {
+        let mut events = Vec::new();
+        for (key, entry) in restores {
+            if let Some(info) = self.reconciliation_event(&key, &entry, protocol_version)? {
+                // getSACReconciliationEventAndTrackDiff never returns a zero diff.
+                debug_assert_ne!(info.amount, 0);
+                let address = get_address_with_dropped_muxed_info(&info.mint_or_burn_address);
+                let event = if info.amount > 0 {
+                    make_sac_reconciliation_event(
+                        network_id,
+                        "mint",
+                        &info.asset,
+                        &address,
+                        info.amount,
+                    )
+                } else {
+                    make_sac_reconciliation_event(
+                        network_id,
+                        "burn",
+                        &info.asset,
+                        &address,
+                        -info.amount,
+                    )
+                };
+                events.push(event);
+            }
+        }
+        Ok(events)
+    }
+}
+
+/// Build a raw mint/burn `ContractEvent` for SAC reconciliation, matching
+/// `OpEventManager::makeMintEvent` / `makeBurnEvent` (no muxed-id/memo data).
+fn make_sac_reconciliation_event(
+    network_id: &NetworkId,
+    topic: &str,
+    asset: &Asset,
+    address: &ScAddress,
+    amount: i64,
+) -> ContractEvent {
+    let contract_id = get_asset_contract_id(network_id, asset);
+    let topics = vec![
+        make_symbol_scval(topic),
+        ScVal::Address(address.clone()),
+        make_sep0011_asset_string_scval(asset),
+    ];
+    make_event(contract_id, topics, make_i128_scval(amount))
+}
+
+/// Extract `(balance, owner)` from a SAC balance `CONTRACT_DATA` entry.
+///
+/// Port of `getSACBalance` (`P23HotArchiveBug.cpp:485-522`). For the affected
+/// SACs the balance always fits in `[0, i64::MAX]`; the function enforces every
+/// structural assumption as a hard error (matching stellar-core's
+/// `releaseAssert`s), since the only entries reaching it are the hardcoded
+/// corrupted/correct SAC balances.
+fn get_sac_balance(le: &LedgerEntry) -> Result<(i64, ScAddress), String> {
+    let LedgerEntryData::ContractData(cd) = &le.data else {
+        return Err("P23 getSACBalance: entry is not CONTRACT_DATA".to_string());
+    };
+
+    if cd.durability != ContractDataDurability::Persistent {
+        return Err("P23 getSACBalance: durability is not PERSISTENT".to_string());
+    }
+
+    let ScVal::Vec(Some(key_vec)) = &cd.key else {
+        return Err("P23 getSACBalance: key is not a non-null SCVec".to_string());
+    };
+    if key_vec.0.len() != 2 {
+        return Err("P23 getSACBalance: key SCVec is not length 2".to_string());
+    }
+
+    // The "Balance" symbol must be the first entry in the SCVec.
+    let balance_symbol = ScVal::Symbol(
+        ScSymbol::try_from("Balance".to_string()).expect("\"Balance\" is a valid SCSymbol"),
+    );
+    if key_vec.0[0] != balance_symbol {
+        return Err("P23 getSACBalance: first key entry is not the \"Balance\" symbol".to_string());
+    }
+
+    let ScVal::Address(balance_owner) = &key_vec.0[1] else {
+        return Err("P23 getSACBalance: second key entry is not an address".to_string());
+    };
+
+    let ScVal::Map(Some(val_map)) = &cd.val else {
+        return Err("P23 getSACBalance: val is not a non-null SCMap".to_string());
+    };
+    if val_map.0.len() != 3 {
+        return Err("P23 getSACBalance: val SCMap is not length 3".to_string());
+    }
+
+    let amount_symbol = ScVal::Symbol(
+        ScSymbol::try_from("amount".to_string()).expect("\"amount\" is a valid SCSymbol"),
+    );
+    let amount_entry = &val_map.0[0];
+    if amount_entry.key != amount_symbol {
+        return Err(
+            "P23 getSACBalance: first val entry key is not the \"amount\" symbol".to_string(),
+        );
+    }
+    let ScVal::I128(parts) = &amount_entry.val else {
+        return Err("P23 getSACBalance: amount value is not SCV_I128".to_string());
+    };
+
+    // For the range in question, hi is always 0 and lo fits in i64.
+    if parts.hi != 0 {
+        return Err("P23 getSACBalance: amount hi is not 0".to_string());
+    }
+    if parts.lo > i64::MAX as u64 {
+        return Err("P23 getSACBalance: amount lo exceeds i64::MAX".to_string());
+    }
+
+    Ok((parts.lo as i64, balance_owner.clone()))
+}
+
 fn scval_symbol_bytes(value: &ScVal) -> Option<Vec<u8>> {
     match value {
         ScVal::Symbol(sym) => {
@@ -1032,9 +1341,18 @@ mod tests {
             emit_classic_events: true,
             backfill_stellar_asset_events: true,
         };
-        // backfill_to_protocol23 always returns false in current implementation
+        // SAC-event backfill (the P23 reconciler) is active ONLY on protocol 23
+        // (equality gate, issue #3126), and only when the flag is set.
+        assert!(config.backfill_to_protocol23(23));
         assert!(!config.backfill_to_protocol23(22));
-        assert!(!config.backfill_to_protocol23(23));
+        assert!(!config.backfill_to_protocol23(24));
+
+        // Flag off → never active, even on protocol 23 (off by default).
+        let off = ClassicEventConfig {
+            emit_classic_events: true,
+            backfill_stellar_asset_events: false,
+        };
+        assert!(!off.backfill_to_protocol23(23));
     }
 
     // === OpEventManager tests ===
@@ -1910,5 +2228,307 @@ mod tests {
     #[should_panic(expected = "memo type cannot be None")]
     fn test_make_classic_memo_scval_none_panics() {
         make_classic_memo_scval(&Memo::None);
+    }
+
+    // ====================================================================
+    // Protocol 23 SAC mint/burn event reconciler tests (issue #3126).
+    // ====================================================================
+
+    use stellar_xdr::curr::{
+        ContractDataEntry, ExtensionPoint, LedgerEntryExt, ScSymbol as XdrScSymbol, ScVec, WriteXdr,
+    };
+
+    /// Build a SAC-balance `CONTRACT_DATA` LedgerEntry for the given SAC
+    /// contract id, owner, and amount, mirroring the structure `getSACBalance`
+    /// expects (key = ["Balance", owner]; val = {amount, authorized, clawback}).
+    fn sac_balance_entry(contract_id: ContractId, owner: &ScAddress, amount: i64) -> LedgerEntry {
+        let key = ScVal::Vec(Some(ScVec(
+            vec![
+                ScVal::Symbol(XdrScSymbol::try_from("Balance").unwrap()),
+                ScVal::Address(owner.clone()),
+            ]
+            .try_into()
+            .unwrap(),
+        )));
+        let val = ScVal::Map(Some(ScMap(
+            vec![
+                ScMapEntry {
+                    key: ScVal::Symbol(XdrScSymbol::try_from("amount").unwrap()),
+                    val: make_i128_scval(amount),
+                },
+                ScMapEntry {
+                    key: ScVal::Symbol(XdrScSymbol::try_from("authorized").unwrap()),
+                    val: ScVal::Bool(true),
+                },
+                ScMapEntry {
+                    key: ScVal::Symbol(XdrScSymbol::try_from("clawback").unwrap()),
+                    val: ScVal::Bool(false),
+                },
+            ]
+            .try_into()
+            .unwrap(),
+        )));
+        LedgerEntry {
+            last_modified_ledger_seq: 0,
+            data: LedgerEntryData::ContractData(ContractDataEntry {
+                ext: ExtensionPoint::V0,
+                contract: ScAddress::Contract(contract_id),
+                key,
+                durability: ContractDataDurability::Persistent,
+                val,
+            }),
+            ext: LedgerEntryExt::V0,
+        }
+    }
+
+    fn b64(entry: &LedgerEntry) -> String {
+        entry.to_xdr_base64(Limits::none()).unwrap()
+    }
+
+    fn b64_asset(asset: &Asset) -> String {
+        asset.to_xdr_base64(Limits::none()).unwrap()
+    }
+
+    /// Build a reconciler whose single affected asset is `asset`, with one
+    /// corrupted/correct pair: a SAC balance owned by `owner` that was restored
+    /// as `corrupted_amount` but should have been `correct_amount`.
+    fn single_pair_reconciler(
+        network_id: &NetworkId,
+        asset: &Asset,
+        owner: &ScAddress,
+        corrupted_amount: i64,
+        correct_amount: i64,
+    ) -> (P23SacReconciler, LedgerKey, LedgerEntry) {
+        let contract_id = get_asset_contract_id(network_id, asset);
+        let corrupted = sac_balance_entry(contract_id.clone(), owner, corrupted_amount);
+        let correct = sac_balance_entry(contract_id, owner, correct_amount);
+        let key = henyey_common::entry_to_key(&corrupted);
+
+        let asset_b64 = b64_asset(asset);
+        let corrupted_b64 = b64(&corrupted);
+        let correct_b64 = b64(&correct);
+        let reconciler = P23SacReconciler::new(
+            network_id,
+            &[asset_b64.as_str()],
+            &[(corrupted_b64.as_str(), correct_b64.as_str())],
+        )
+        .unwrap();
+        (reconciler, key, corrupted)
+    }
+
+    fn contract_owner(seed: u8) -> ScAddress {
+        ScAddress::Contract(ContractId(Hash([seed; 32])))
+    }
+
+    #[test]
+    fn test_p23_reconciler_mint_on_positive_diff() {
+        let net = NetworkId::testnet();
+        let asset = test_asset_alphanum4(7);
+        let owner = contract_owner(9);
+        // restored (corrupted) = 1000, correct = 600 → diff +400 → mint.
+        let (rec, key, corrupted) = single_pair_reconciler(&net, &asset, &owner, 1000, 600);
+        let info = rec
+            .reconciliation_event(&key, &corrupted, 23)
+            .unwrap()
+            .expect("expected a reconciliation event");
+        assert_eq!(info.asset, asset);
+        assert_eq!(info.mint_or_burn_address, owner);
+        assert_eq!(info.amount, 400);
+
+        // Built event is a mint for +400.
+        let events = rec
+            .reconciliation_events_for_restores(&net, [(key, corrupted)], 23)
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        let ContractEventBody::V0(body) = &events[0].body;
+        assert_eq!(body.topics.first().unwrap(), &make_symbol_scval("mint"));
+        assert_eq!(body.data, make_i128_scval(400));
+    }
+
+    #[test]
+    fn test_p23_reconciler_burn_on_negative_diff() {
+        let net = NetworkId::testnet();
+        let asset = test_asset_alphanum12(11);
+        let owner = contract_owner(3);
+        // restored = 250, correct = 900 → diff -650 → burn of 650.
+        let (rec, key, corrupted) = single_pair_reconciler(&net, &asset, &owner, 250, 900);
+        let info = rec
+            .reconciliation_event(&key, &corrupted, 23)
+            .unwrap()
+            .expect("expected a reconciliation event");
+        assert_eq!(info.amount, -650);
+
+        let events = rec
+            .reconciliation_events_for_restores(&net, [(key, corrupted)], 23)
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        let ContractEventBody::V0(body) = &events[0].body;
+        assert_eq!(body.topics.first().unwrap(), &make_symbol_scval("burn"));
+        // A burn emits the positive magnitude.
+        assert_eq!(body.data, make_i128_scval(650));
+    }
+
+    #[test]
+    fn test_p23_reconciler_none_on_equal_balance() {
+        let net = NetworkId::testnet();
+        let asset = test_asset_alphanum4(7);
+        let owner = contract_owner(9);
+        let (rec, key, corrupted) = single_pair_reconciler(&net, &asset, &owner, 500, 500);
+        assert!(rec
+            .reconciliation_event(&key, &corrupted, 23)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn test_p23_reconciler_none_for_non_contract_data() {
+        let net = NetworkId::testnet();
+        let asset = test_asset_alphanum4(7);
+        let owner = contract_owner(9);
+        let (rec, key, _corrupted) = single_pair_reconciler(&net, &asset, &owner, 1000, 600);
+        // An account entry is not CONTRACT_DATA → None even if the key matched.
+        let account_entry = LedgerEntry {
+            last_modified_ledger_seq: 0,
+            data: LedgerEntryData::Account(stellar_xdr::curr::AccountEntry {
+                account_id: test_account_id(1),
+                balance: 0,
+                seq_num: stellar_xdr::curr::SequenceNumber(0),
+                num_sub_entries: 0,
+                inflation_dest: None,
+                flags: 0,
+                home_domain: Default::default(),
+                thresholds: stellar_xdr::curr::Thresholds([0; 4]),
+                signers: Default::default(),
+                ext: stellar_xdr::curr::AccountEntryExt::V0,
+            }),
+            ext: LedgerEntryExt::V0,
+        };
+        assert!(rec
+            .reconciliation_event(&key, &account_entry, 23)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn test_p23_reconciler_none_for_key_not_in_corrupted_table() {
+        let net = NetworkId::testnet();
+        let asset = test_asset_alphanum4(7);
+        let owner = contract_owner(9);
+        let (rec, _key, corrupted) = single_pair_reconciler(&net, &asset, &owner, 1000, 600);
+        // A different owner → a different SAC balance key not in the table.
+        let other_owner = contract_owner(42);
+        let contract_id = get_asset_contract_id(&net, &asset);
+        let other_entry = sac_balance_entry(contract_id, &other_owner, 1000);
+        let other_key = henyey_common::entry_to_key(&other_entry);
+        assert_ne!(other_key, henyey_common::entry_to_key(&corrupted));
+        assert!(rec
+            .reconciliation_event(&other_key, &other_entry, 23)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn test_p23_reconciler_none_for_unaffected_asset() {
+        let net = NetworkId::testnet();
+        // The reconciler knows about asset A, but the restored entry belongs to
+        // asset B's SAC contract → not in sac_asset_map → None.
+        let asset_a = test_asset_alphanum4(7);
+        let owner = contract_owner(9);
+        let (rec, _key, _corrupted) = single_pair_reconciler(&net, &asset_a, &owner, 1000, 600);
+
+        let asset_b = test_asset_alphanum4(8);
+        let contract_b = get_asset_contract_id(&net, &asset_b);
+        let entry_b = sac_balance_entry(contract_b, &owner, 1000);
+        // Re-key against the corrupted table by reusing asset A's key is not
+        // possible; the entry's own key won't be in the table, so None.
+        let key_b = henyey_common::entry_to_key(&entry_b);
+        assert!(rec
+            .reconciliation_event(&key_b, &entry_b, 23)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn test_p23_reconciler_none_off_protocol_23() {
+        let net = NetworkId::testnet();
+        let asset = test_asset_alphanum4(7);
+        let owner = contract_owner(9);
+        let (rec, key, corrupted) = single_pair_reconciler(&net, &asset, &owner, 1000, 600);
+        // Same data that mints at p23, but p22/p24 → equality gate → None.
+        assert!(rec
+            .reconciliation_event(&key, &corrupted, 22)
+            .unwrap()
+            .is_none());
+        assert!(rec
+            .reconciliation_event(&key, &corrupted, 24)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn test_backfill_to_protocol23_gating() {
+        let on = ClassicEventConfig {
+            emit_classic_events: true,
+            backfill_stellar_asset_events: true,
+        };
+        assert!(on.backfill_to_protocol23(23));
+        assert!(!on.backfill_to_protocol23(22));
+        assert!(!on.backfill_to_protocol23(24));
+
+        let off = ClassicEventConfig {
+            emit_classic_events: true,
+            backfill_stellar_asset_events: false,
+        };
+        assert!(!off.backfill_to_protocol23(23));
+        assert!(!ClassicEventConfig::default().backfill_to_protocol23(23));
+    }
+
+    /// The 12 affected-asset base64 literals, transcribed verbatim from
+    /// `crates/ledger/src/p23_hot_archive_bug_data.rs`
+    /// (`P23_CORRUPTED_AFFECTED_ASSETS`, in turn from
+    /// `stellar-core/src/ledger/P23HotArchiveBugData.cpp:10040-10063`). Inlined
+    /// here because `henyey-tx` cannot depend on `henyey-ledger` (cycle); the
+    /// ledger crate owns the canonical array and feeds it to `P23SacReconciler`
+    /// at runtime. `henyey-ledger` independently asserts the count is 12.
+    const P23_AFFECTED_ASSETS_B64: [&str; 12] = [
+        "AAAAAA==",
+        "AAAAAVVTREMAAAAAO5kROA7+mIugqJAOsc/kTzZvfb6Ua+0HckD39iTfFcU=",
+        "AAAAAlVTVFJZAAAAAAAAAAAAAACjihh9bUETXn31yZR0SCigSeDgfCEzu07aIZmcZ+LBNg==",
+        "AAAAAUJMTkQAAAAA0kPMJPZPS8rFR7mhiMujiCWd5dqlc77zlNPybSXzIdI=",
+        "AAAAAUFRVUEAAAAAW5QuU6wzyP0KgMx8GxqF19g4qcQZd6rRizrwV/jjPfA=",
+        "AAAAAVNIWAAAAAAA5TjI9zmT/KKxDcmCdh/l6VFSRFEDH9BHJShFf036PqQ=",
+        "AAAAAVNUSwAAAAAAfW7IaowF6psp0uDj0Z0IMxUWYHOCFHiZgj3bIdtXwQw=",
+        "AAAAAU5MVAAAAAAAL67mruJq8g1bj8lCiNVHbidAzKmg3NSrNjUbTCiAbaw=",
+        "AAAAAkxJQlJFAAAAAAAAAAAAAAAwIVlEE0w4nxTdJxIEerrFsVIN8WutTUzlhQJHaLR/Mg==",
+        "AAAAAUtQT1AAAAAA43Oh2jfBBl1sJz15HPylcD8Gbbh9XTWsf6/BAUfUlcc=",
+        "AAAAAUtBTEUAAAAAR1vypFiHKHeKgnE2nuA5VhED/841SUAs4KR5zr8bCfU=",
+        "AAAAAVNCSQAAAAAApjwUrepRcx7ax1frLCxCibZizKJrumi41+2I+RW8EAo=",
+    ];
+
+    #[test]
+    fn test_p23_affected_assets_array_decodes() {
+        // All 12 base64 strings decode to a valid Asset, and the 12 SAC contract
+        // ids are pairwise distinct (mirrors stellar-core's
+        // releaseAssert(inserted) in the reconciler constructor).
+        let net = NetworkId::mainnet();
+        assert_eq!(P23_AFFECTED_ASSETS_B64.len(), 12);
+        let mut ids = std::collections::HashSet::new();
+        for (i, s) in P23_AFFECTED_ASSETS_B64.iter().enumerate() {
+            let asset = Asset::from_xdr_base64(s, Limits::none())
+                .unwrap_or_else(|e| panic!("affected asset {i} failed to decode: {e}"));
+            let id = get_asset_contract_id(&net, &asset);
+            assert!(ids.insert(id), "duplicate SAC contract id at index {i}");
+        }
+        assert_eq!(ids.len(), 12);
+    }
+
+    #[test]
+    fn test_p23_reconciler_constructor_rejects_duplicate_asset_ids() {
+        // Two identical assets → same SAC contract id → constructor errors,
+        // mirroring stellar-core's releaseAssert(inserted).
+        let net = NetworkId::testnet();
+        let asset = b64_asset(&test_asset_alphanum4(7));
+        let err = P23SacReconciler::new(&net, &[asset.as_str(), asset.as_str()], &[]);
+        assert!(err.is_err());
     }
 }

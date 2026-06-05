@@ -153,7 +153,8 @@ pub mod validation;
 pub use error::TxError;
 pub use events::{
     make_account_address, make_claimable_balance_address, make_muxed_account_address,
-    ClassicEventConfig, EventManagerHierarchy, OpEventManager, TxEventManager,
+    ClassicEventConfig, EventManagerHierarchy, OpEventManager, P23SacReconciler,
+    SacReconciliationInfo, TxEventManager,
 };
 
 // Re-export lumen reconciler types
