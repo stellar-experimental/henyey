@@ -812,6 +812,54 @@ pub fn validate_basic(
     }
 }
 
+/// Compute the source account's available balance for the fee-affordability
+/// check, mirroring stellar-core's `getAvailableBalance`
+/// (`TransactionUtils.cpp:752`).
+///
+/// `available = balance − minBalance`, then (for protocol ≥ V10)
+/// `available −= sellingLiabilities`. The subtraction is **non-saturated**
+/// (plain `i64`), matching stellar-core: `getMinBalance`-based availability can
+/// legitimately be negative, and the `available < feeToPay` comparison must see
+/// the true (possibly negative) value.
+///
+/// Computed inline in the `tx` crate rather than via `henyey_ledger::fees`:
+/// `henyey-ledger` already depends on `henyey-tx`, so importing it here would
+/// create a dependency cycle. Note this deliberately does NOT reuse
+/// `henyey_ledger::fees::available_to_send`, which uses `saturating_sub` and
+/// would diverge from stellar-core's plain subtraction.
+fn available_balance_for_fee(
+    account: &AccountEntry,
+    base_reserve: u32,
+    protocol_version: u32,
+) -> i64 {
+    use stellar_xdr::curr::{AccountEntryExt, AccountEntryExtensionV1Ext};
+
+    // minBalance = (2 + numSubEntries + numSponsoring − numSponsored) * base_reserve,
+    // matching stellar-core `getMinBalance` / `henyey_ledger::fees::minimum_balance`.
+    let (num_sponsoring, num_sponsored, selling_liabilities) = match &account.ext {
+        AccountEntryExt::V0 => (0i64, 0i64, 0i64),
+        AccountEntryExt::V1(v1) => {
+            let (sponsoring, sponsored) = match &v1.ext {
+                AccountEntryExtensionV1Ext::V0 => (0i64, 0i64),
+                AccountEntryExtensionV1Ext::V2(v2) => {
+                    (v2.num_sponsoring as i64, v2.num_sponsored as i64)
+                }
+            };
+            (sponsoring, sponsored, v1.liabilities.selling)
+        }
+    };
+
+    let num_entries = 2 + account.num_sub_entries as i64 + num_sponsoring - num_sponsored;
+    let min_balance = num_entries * base_reserve as i64;
+
+    // Non-saturated (plain i64) subtraction to match stellar-core.
+    let mut available = account.balance - min_balance;
+    if protocol_version >= 10 {
+        available -= selling_liabilities;
+    }
+    available
+}
+
 // SECURITY: not the production validation path; real validation in TransactionExecutor::validate_preconditions()
 /// Full validation with account data.
 pub fn validate_full(
@@ -867,8 +915,22 @@ pub fn validate_full(
         errors.push(e);
     }
 
-    // Check account balance can cover fee
-    let available_balance = source_account.balance;
+    // Check the account's *available* balance can cover the fee.
+    //
+    // `validate_full` is a non-production, `checkValid`-style helper (it has no
+    // live caller — the production apply/checkValid path lives in
+    // `crates/ledger/src/execution/preconditions.rs` and the fee-charge cap in
+    // `crates/tx/src/live_execution.rs::process_fee_seq_num`). This block mirrors
+    // stellar-core's `getAvailableBalance` (TransactionUtils.cpp:752) so the
+    // public helper stays self-consistent with the spec; do NOT re-flag it as a
+    // production bug (cf. #3098–#3103, #3129).
+    let available_balance = available_balance_for_fee(
+        source_account,
+        context.base_reserve,
+        context.protocol_version,
+    );
+    // `feeToPay` for the non-applying validation path is `getFullFee()`, which
+    // henyey exposes as `total_fee()` (frame.rs).
     let fee = frame.total_fee().as_i64();
     if available_balance < fee {
         errors.push(ValidationError::InsufficientBalance);
@@ -1923,7 +1985,13 @@ mod tests {
         }
 
         let context = LedgerContext::testnet(1, 1000);
-        let account = create_account_entry(account_id, 1);
+        // Available-balance fee check (#3129): with V0 ext on testnet,
+        // minBalance = 2 * base_reserve = 10_000_000. The default
+        // `create_account_entry` balance of 10_000_000 leaves available = 0,
+        // which is < fee. Bump the balance so the affordability check passes and
+        // this test keeps exercising only the extra-signers path.
+        let mut account = create_account_entry(account_id, 1);
+        account.balance = 20_000_000;
         assert!(validate_full(&TransactionFrame::from_owned(envelope), &context, &account).is_ok());
     }
 
