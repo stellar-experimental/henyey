@@ -208,7 +208,7 @@ impl Default for FlowControlConfig {
             flow_control_send_more_batch_size: 40,
             outbound_tx_queue_byte_limit: 3 * 1024 * 1024, // 3 MB (match stellar-core)
             max_tx_set_size_ops: 10000,
-            flow_control_bytes_batch_size: 100_000, // 100 KB (spec: OVERLAY_SPEC §7)
+            flow_control_bytes_batch_size: 100_000, // 100 KB (spec: OVERLAY_SPEC §7.2)
         }
     }
 }
@@ -1312,14 +1312,14 @@ mod tests {
         })
     }
 
-    // ── OVERLAY_SPEC §7: FlowControl default constants ─────────────
+    // ── OVERLAY_SPEC §7.2: FlowControl default constants ───────────
 
     #[test]
     fn test_default_config_byte_batch_size_is_100k() {
         let config = FlowControlConfig::default();
         assert_eq!(
             config.flow_control_bytes_batch_size, 100_000,
-            "OVERLAY_SPEC §7: byte batch size must be 100,000"
+            "OVERLAY_SPEC §7.2: byte batch size must be 100,000"
         );
     }
 

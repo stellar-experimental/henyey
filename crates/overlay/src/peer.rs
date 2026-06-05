@@ -490,7 +490,7 @@ impl Peer {
         // Send SEND_MORE_EXTENDED to enable flow control.
         // Matches stellar-core Peer::recvAuth() → sendSendMore().
         // Both grants are derived from configuration at overlay startup —
-        // OVERLAY_SPEC §5.4.4 / §7.2.
+        // OVERLAY_SPEC §7.2 (initial SEND_MORE_EXTENDED capacity grant) / §5.4.4.
         let send_more = StellarMessage::SendMoreExtended(stellar_xdr::curr::SendMoreExtended {
             num_messages: initial_message_grant,
             num_bytes: initial_byte_grant,
