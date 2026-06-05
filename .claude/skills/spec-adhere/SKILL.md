@@ -33,13 +33,28 @@ against the specs).
 
 | Spec | Primary Rust crate | Notes |
 |------|--------------------|-------|
-| `SCP_SPEC` | `crates/scp` | |
-| `OVERLAY_SPEC` | `crates/overlay` | |
-| `HERDER_SPEC` | `crates/herder` | |
+| `SCP_SPEC` | `crates/scp` | Driver/wiring also in `crates/app` (event loop owns SCP message dispatch & consensus trigger) |
+| `OVERLAY_SPEC` | `crates/overlay` | Dispatch/wiring also in `crates/app` (event loop: `survey_impl.rs`, `tx_flooding.rs`, `peers.rs`, `lifecycle.rs`) |
+| `HERDER_SPEC` | `crates/herder` | Integration/wiring also in `crates/app` (event-loop dispatch, consensus trigger) |
 | `LEDGER_SPEC` | `crates/ledger` | Some integration in `crates/app` |
 | `TX_SPEC` | `crates/tx` | Apply path also touches `crates/app` |
 | `BUCKETLISTDB_SPEC` | `crates/bucket` | |
 | `CATCHUP_SPEC` | `crates/history` | Also `crates/historywork` |
+
+> **Cross-crate caveat (the #3158 blind spot).** `crates/app` owns the live
+> overlay/herder/scp **wiring** — the event loop in `crates/app/src/app/`
+> (`lifecycle.rs`, `survey_impl.rs`, `tx_flooding.rs`, `peers.rs`) is where
+> message dispatch, survey processing, flood scheduling, and consensus triggers
+> actually run. The spec-named library crate (`crates/overlay`, `crates/herder`,
+> `crates/scp`) may contain **dead / unwired code**: a symbol can be `pub` and
+> re-exported yet never instantiated outside `#[cfg(test)]` (e.g.
+> `crates/overlay/src/survey.rs`'s `SurveyManager`, exported at `lib.rs` but only
+> constructed in tests — the real survey logic lives in `crates/app`). Therefore:
+> **never declare an OVERLAY/HERDER/SCP feature "Absent" after searching only the
+> named crate.** Grep `crates/app` (and the rest of the `crates/` tree) for the
+> wiring first. Conversely, do not treat an exported-but-never-instantiated
+> library symbol as "the implementation" — confirm it is reachable from
+> production code before classifying it Full.
 
 Output file (apply mode):
 `/Users/tomer/dev/henyey/crates/<primary-crate>/SPEC_ADHERENCE.md`
@@ -75,6 +90,23 @@ table), read all `.rs` files under `src/`. Skip `tests/`,
 `benches/`, and `#[cfg(test)]` modules — adherence is about
 production code.
 
+**Search ALL crates, not just the name-matched one (the #3158 fix).**
+Before classifying any claim, run a grep-first pass over the **entire
+`crates/` tree** for the spec-bound symbols (function names, constants,
+result-code enum values, dispatch match-arms) — do **not** scope the
+search to the primary crate alone. Henyey's event loop in `crates/app`
+owns much overlay/herder/scp **wiring** (dispatch, survey processing,
+flood scheduling, consensus trigger), so a symbol absent from the
+name-matched crate is **not** absent from the codebase. Keep the
+primary crate as the deep-read target; grep-target the rest of the
+crates (especially `crates/app`) and read only the matching files.
+Concrete command:
+
+```bash
+# Locate candidate implementations across ALL crates before reading.
+grep -rni --include='*.rs' -e '<symbol>' -e '<CONST>' -e '<RESULT_CODE>' crates/
+```
+
 Build a lightweight index of:
 - Public function names and their containing modules
 - Result-code enum values (Rust-side names; usually
@@ -97,6 +129,28 @@ For every claim from Step 1, attempt to locate the Rust enforcement:
 3. **Result-code match**: if the claim ties a check to an XDR
    result code, search for that enum value in the crate.
 4. **Free-text grep**: fall back to grep for distinctive phrases.
+   Search **all crates** (`grep -rn --include='*.rs' … crates/`), not
+   only the name-matched crate.
+
+**Reachability check (the #3158 fix) — run at every Full/Absent
+decision point.** Before recording a found symbol as **Full**, verify it
+is actually **instantiated / called in the production control path**:
+grep for a non-`#[cfg(test)]` caller or constructor.
+
+```bash
+# Is the candidate reachable from production code (not just tests)?
+grep -rn --include='*.rs' '<symbol>' crates/ | grep -v -e '#\[cfg(test)\]' -e '/tests/'
+```
+
+If the only references are tests or re-exports — the
+`crates/overlay/src/survey.rs` `SurveyManager` **dead-scaffold** case
+(exported at `lib.rs` but constructed only under `#[cfg(test)]`) — treat
+it as dead/unwired code and **keep searching** (the live implementation
+is typically the event-loop wiring in `crates/app`) rather than reporting
+it as "the implementation." Symmetrically, **never record Absent without
+an all-crates grep**: confirm the symbol/result-code is missing from the
+**entire `crates/` tree** (especially `crates/app`), using two search
+strategies across all crates, before classifying Absent.
 
 Classify the finding:
 
@@ -234,8 +288,10 @@ it.)
   fixing them is a separate decision.
 - Be precise with classifications. "I couldn't find it in a quick
   grep" is **not** Absent — confirm with at least two search
-  strategies (anchor + symbol, or symbol + result-code) before
-  marking Absent.
+  strategies (anchor + symbol, or symbol + result-code) **across all
+  crates** (grep the entire `crates/` tree, especially `crates/app`,
+  not just the name-matched crate) before marking Absent. This is the
+  #3158 cross-crate fix: overlay/herder/scp wiring lives in `crates/app`.
 - For SHOULD claims, default to noting them in the report but
   excluding from the adherence percentage calculation. Many
   SHOULDs are operational defaults (e.g., recommended timeouts),

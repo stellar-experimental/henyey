@@ -93,21 +93,24 @@ tap_plan
 # ── (a) Mapping table: crates/app is a secondary target for OVERLAY & HERDER ──
 # The OVERLAY_SPEC and HERDER_SPEC rows must reference crates/app so the auditor
 # knows the event-loop wiring lives there.
+# NOTE: use a BARE backtick (`) here, not \` — in GNU grep ERE, \` is the
+# "start of buffer" anchor, not a literal backtick, which silently breaks the
+# match. The bare ` matches the markdown code-span backtick literally.
 assert_match "OVERLAY_SPEC mapping row references crates/app" \
-  '^\|[[:space:]]*\`?OVERLAY_SPEC\`?[[:space:]]*\|.*crates/app'
+  '^\|[[:space:]]*`?OVERLAY_SPEC`?[[:space:]]*\|.*crates/app'
 assert_match "HERDER_SPEC mapping row references crates/app" \
-  '^\|[[:space:]]*\`?HERDER_SPEC\`?[[:space:]]*\|.*crates/app'
+  '^\|[[:space:]]*`?HERDER_SPEC`?[[:space:]]*\|.*crates/app'
 
 # ── (b) Step 2: an all-crates search pass, not just the named crate ───────────
 # Must instruct grepping the entire crates/ tree before classifying.
 assert_section_match "Step 2 instructs an all-crates / entire crates tree search" \
-  '### Step 2' '### Step 3' '(all crates|every crate|entire \`?crates/|whole \`?crates/|across all crates)'
+  '### Step 2' '### Step 3' '(all crates|every crate|entire `?crates/|whole `?crates/|across all crates)'
 
 # ── (c) Step 3: reachability check + no-Absent-without-all-crates-grep rule ───
 assert_section_match "Step 3 contains a reachability / instantiation check" \
   '### Step 3' '### Step 4' '(instantiat|reachab|actually called|production (caller|control path)|dead (code|scaffold))'
 assert_section_match "Step 3 forbids reporting Absent without an all-crates grep" \
-  '### Step 3' '### Step 4' '(Absent.*(all crates|every crate|entire \`?crates/)|(all crates|every crate|entire \`?crates/).*Absent)'
+  '### Step 3' '### Step 4' '(Absent.*(all crates|every crate|entire `?crates/)|(all crates|every crate|entire `?crates/).*Absent)'
 
 # ── Reinforcing assertions (document the intent in stable tokens) ─────────────
 # The dead-scaffold caveat must name the crates/app-owns-live-wiring rule so the
@@ -117,7 +120,7 @@ assert_match "doc explains crates/app owns the live overlay/herder/scp wiring" \
 assert_match "doc warns library crates may contain dead / unwired code" \
   '(dead|unwired|never instantiat|exported.*never).*(code|scaffold|symbol)'
 assert_match "doc references the cross-crate grep as a concrete auditor step" \
-  '(grep|search).*(all crates|entire \`?crates/|whole \`?crates/|every crate|crates/app)'
+  '(grep|search).*(all crates|entire `?crates/|whole `?crates/|every crate|crates/app)'
 
 # ── Summary ──────────────────────────────────────────────────────────────────
 if [[ "$TAP_FAILURES" -gt 0 ]]; then
