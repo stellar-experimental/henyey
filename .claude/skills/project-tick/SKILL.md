@@ -159,11 +159,12 @@ Wall-clock latency for the first review is unchanged in expectation because CI (
 
 ### Step 3 — Pick one issue
 
-Order actionable items by:
+Order actionable items by (this numbered list is the **canonical pick order** — `/project-loop` Step D references it):
 
-1. **Close-WIP-first state priority** — descending: `in-review` > `ready-for-doing` > `ready-for-planning` > `backlog`. Reason: prevents PRs from rotting in review while fresh backlog items pile up. (`planning` and `doing` items are never picked — they are always assigned and filtered out.)
-2. **Label priority** within state — descending: `urgent` > `high` > `medium` > `low` > (no priority label).
-3. **Age** within priority tier — oldest `createdAt` first.
+1. **Urgent override** — any OPEN issue labeled `urgent` sorts to the **very top** of the pick order, ahead of all state-priority tiers (e.g. an `urgent` `backlog` item **outranks** a non-urgent `in-review` item). This jumps the pick queue so a systematic urgent CI regression is drained first, not buried behind lower-priority work. Ties among urgents fall through to the rules below (state priority, then age).
+2. **Close-WIP-first state priority** — descending: `in-review` > `ready-for-doing` > `ready-for-planning` > `backlog`. Reason: prevents PRs from rotting in review while fresh backlog items pile up. (`planning` and `doing` items are never picked — they are always assigned and filtered out.)
+3. **Label priority** within state — descending: `urgent` > `high` > `medium` > `low` > (no priority label).
+4. **Age** within priority tier — oldest `createdAt` first.
 
 Pick the head of the sorted list. If the list is empty, print `no actionable issues` and exit 0.
 

@@ -162,3 +162,12 @@ jobs:
       - uses: actions/checkout@v4
       - name: Run spec-adhere skill snippet harness
         run: bash scripts/test-spec-adhere-skill-snippets.sh
+
+  project-loop-skill-snippets:
+    name: Project-Loop Skill Snippets
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run project-loop skill snippet harness
+        run: bash scripts/test-project-loop-skill-snippets.sh
