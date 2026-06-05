@@ -58,8 +58,8 @@ use crate::bucket::Bucket;
 use crate::cache::CacheStats;
 use crate::entry::{get_ttl_key, is_ttl_expired, BucketEntry, BucketEntryExt};
 use crate::eviction::{
-    update_starting_eviction_iterator, EvictionCandidate, EvictionIterator, EvictionIteratorExt,
-    EvictionResult,
+    eviction_scan_is_stuck, update_starting_eviction_iterator, EvictionCandidate, EvictionIterator,
+    EvictionIteratorExt, EvictionResult,
 };
 use crate::future_bucket::MergeKey;
 use crate::index::BucketEntryCounters;
@@ -70,7 +70,7 @@ use crate::merge::{
     MergeOptions, MetadataPolicy,
 };
 use crate::merge_map::BucketMergeMap;
-use crate::metrics::MergeCounters;
+use crate::metrics::{EvictionCounters, MergeCounters};
 use crate::{
     protocol_version_is_before, protocol_version_starts_from, BucketError, ProtocolVersion, Result,
 };
@@ -1374,6 +1374,10 @@ pub struct BucketList {
     merge_map: Option<std::sync::Arc<std::sync::RwLock<BucketMergeMap>>>,
     /// Counters for merge operations (shared across all merge calls).
     merge_counters: Arc<MergeCounters>,
+    /// Counters for the live eviction scan (shared across all scan calls and
+    /// with derived `BucketListSnapshot`s, so the background scan records into
+    /// the same instance the app reads). All-atomic; cheaply `Arc`-clonable.
+    eviction_counters: Arc<EvictionCounters>,
     /// Background thread handle for async bucket persistence.
     /// Bounded to one concurrent write; the next add_batch waits for completion.
     pending_persist: Option<std::thread::JoinHandle<std::result::Result<(), String>>>,
@@ -1546,6 +1550,7 @@ impl BucketList {
             completed_merges: Vec::new(),
             merge_map: None,
             merge_counters: Arc::new(MergeCounters::new()),
+            eviction_counters: Arc::new(EvictionCounters::new()),
             pending_persist: None,
         }
     }
@@ -1609,6 +1614,23 @@ impl BucketList {
     /// Returns a reference to the merge counters.
     pub fn merge_counters(&self) -> &MergeCounters {
         &self.merge_counters
+    }
+
+    /// Returns a reference to the eviction counters.
+    ///
+    /// These are shared (via `Arc`) with any `BucketListSnapshot` derived from
+    /// this list, so a background eviction scan running on a snapshot records
+    /// into the same instance an app reads here.
+    pub fn eviction_counters(&self) -> &EvictionCounters {
+        &self.eviction_counters
+    }
+
+    /// Returns the shared `Arc` to the eviction counters.
+    ///
+    /// Used when constructing a `BucketListSnapshot` so its background scan
+    /// records into the same instance as this list.
+    pub(crate) fn eviction_counters_arc(&self) -> Arc<EvictionCounters> {
+        Arc::clone(&self.eviction_counters)
     }
 
     /// Resolve all pending async merges without committing them.
@@ -2762,6 +2784,7 @@ impl BucketList {
             completed_merges: Vec::new(),
             merge_map: None,
             merge_counters: Arc::new(MergeCounters::new()),
+            eviction_counters: Arc::new(EvictionCounters::new()),
             pending_persist: None,
         })
     }
@@ -2851,6 +2874,7 @@ impl BucketList {
             completed_merges: Vec::new(),
             merge_map: None,
             merge_counters: Arc::new(MergeCounters::new()),
+            eviction_counters: Arc::new(EvictionCounters::new()),
             pending_persist: None,
         })
     }
@@ -3372,6 +3396,14 @@ impl BucketList {
                 &self.levels[level].snap
             };
 
+            // Per-bucket "stuck" check before scanning: if the bucket is too
+            // large to fully scan within its update period, record an
+            // incomplete scan. Parity: stellar-core checks this at the top of
+            // each loop iteration (LiveBucketList.cpp:158-173, BucketListSnapshot.cpp:617).
+            if eviction_scan_is_stuck(&iter, settings.eviction_scan_size, bucket.byte_size()) {
+                self.eviction_counters.record_incomplete_scan();
+            }
+
             // Scan entries in this bucket (byte-limited only, no entry count limit)
             let (_entries_scanned, bytes_used, finished_bucket) = self.scan_bucket_region(
                 bucket,
@@ -3398,7 +3430,18 @@ impl BucketList {
 
             // If we finished this bucket, move to the next one
             if finished_bucket {
-                iter.advance_to_next_bucket(settings.starting_eviction_scan_level);
+                let wrapped = iter.advance_to_next_bucket(settings.starting_eviction_scan_level);
+
+                // On a full-list wrap (return to the configured starting level
+                // after the top level), close the eviction cycle and publish
+                // the period + average-age gauges. Parity: stellar-core's
+                // updateEvictionIterAndRecordStats calls
+                // submitMetricsAndRestartCycle exactly on the kNumLevels wrap
+                // (LiveBucketList.cpp:138-143).
+                if wrapped {
+                    self.eviction_counters
+                        .submit_metrics_and_restart_cycle(current_ledger);
+                }
 
                 // Check if we've completed a full cycle - only break when we return
                 // to the exact starting bucket (same level AND same is_curr).
@@ -3410,6 +3453,12 @@ impl BucketList {
                 }
             }
         }
+
+        // Record total bytes scanned this ledger into the shared counters.
+        // Parity note: stellar-core declares `bytesScannedForEviction` but never
+        // increments it (dead there); henyey populating it is additive/benign.
+        self.eviction_counters
+            .record_bytes_scanned(result.bytes_scanned);
 
         result.end_iterator = iter;
 
@@ -3473,6 +3522,7 @@ impl Clone for BucketList {
             completed_merges: self.completed_merges.clone(),
             merge_map: self.merge_map.clone(),
             merge_counters: self.merge_counters.clone(),
+            eviction_counters: self.eviction_counters.clone(),
             pending_persist: None, // Background persist is not cloned
         }
     }
@@ -5260,6 +5310,165 @@ mod tests {
 
         // Should panic: persistent entry lookup returns None (DEAD tombstone)
         let _ = bl.scan_for_eviction_incremental(iter, current_ledger, 23, &settings);
+    }
+
+    // ============ eviction counters wiring tests (#3168) ============
+
+    /// Build a (data entry, TTL entry) pair for a temporary contract-data key,
+    /// with the TTL `live_until_ledger_seq` set to `live_until`.
+    fn make_temp_contract_data_with_ttl(seed: u8, live_until: u32) -> (LedgerEntry, LedgerEntry) {
+        use crate::entry::get_ttl_key;
+        let data = LedgerEntry {
+            last_modified_ledger_seq: 1,
+            data: LedgerEntryData::ContractData(ContractDataEntry {
+                ext: ExtensionPoint::V0,
+                contract: ScAddress::Contract(Hash([seed; 32]).into()),
+                key: ScVal::U32(seed as u32),
+                durability: ContractDataDurability::Temporary,
+                val: ScVal::Void,
+            }),
+            ext: LedgerEntryExt::V0,
+        };
+        let data_key = henyey_common::entry_to_key(&data);
+        let ttl_key = get_ttl_key(&data_key).expect("contract data has TTL key");
+        let key_hash = match &ttl_key {
+            LedgerKey::Ttl(t) => t.key_hash.clone(),
+            _ => unreachable!(),
+        };
+        let ttl = LedgerEntry {
+            last_modified_ledger_seq: 1,
+            data: LedgerEntryData::Ttl(TtlEntry {
+                key_hash,
+                live_until_ledger_seq: live_until,
+            }),
+            ext: LedgerEntryExt::V0,
+        };
+        (data, ttl)
+    }
+
+    fn eviction_test_settings(scan_size: u32, starting_level: u32) -> StateArchivalSettings {
+        StateArchivalSettings {
+            max_entry_ttl: 1_000_000,
+            min_temporary_ttl: 1,
+            min_persistent_ttl: 1,
+            persistent_rent_rate_denominator: 1,
+            temp_rent_rate_denominator: 1,
+            max_entries_to_archive: 100,
+            live_soroban_state_size_window_sample_size: 0,
+            live_soroban_state_size_window_sample_period: 0,
+            eviction_scan_size: scan_size,
+            starting_eviction_scan_level: starting_level,
+        }
+    }
+
+    /// A scan over a non-empty bucket records bytes_scanned into the bucket
+    /// list's shared eviction counters.
+    #[test]
+    fn test_scan_records_bytes_scanned_into_shared_counters() {
+        let starting_level = 2u32;
+        let current_ledger = 100u32;
+        let (data, ttl) = make_temp_contract_data_with_ttl(7, 9999); // not expired
+
+        let mut bl = BucketList::new();
+        // Put the data + TTL into the starting-scan-level curr bucket so the
+        // scan actually reads bytes for them.
+        let bucket = Bucket::from_entries(vec![
+            BucketListEntry::Metaentry(BucketMetadata {
+                ledger_version: TEST_PROTOCOL,
+                ext: BucketMetadataExt::V0,
+            }),
+            BucketListEntry::Liveentry(data),
+            BucketListEntry::Liveentry(ttl),
+        ])
+        .unwrap();
+        bl.level_mut(starting_level as usize).unwrap().curr = Arc::new(bucket);
+
+        let settings = eviction_test_settings(1_000_000, starting_level);
+        let iter = crate::EvictionIterator {
+            bucket_list_level: starting_level,
+            is_curr_bucket: true,
+            bucket_file_offset: 0,
+        };
+
+        let result = bl
+            .scan_for_eviction_incremental(iter, current_ledger, 23, &settings)
+            .expect("scan should succeed");
+
+        assert!(result.bytes_scanned > 0, "scan should read some bytes");
+        assert_eq!(
+            bl.eviction_counters().snapshot().bytes_scanned,
+            result.bytes_scanned,
+            "scan must record bytes_scanned into the shared counters"
+        );
+    }
+
+    /// A scan that wraps the full bucket list publishes the cycle period into
+    /// the shared counters. The first wrap is the baseline (publishes nothing),
+    /// so we drive two scans across two ledgers.
+    #[test]
+    fn test_scan_wrap_submits_cycle_period() {
+        // Empty bucket list with a tiny scan size forces a full wrap each scan
+        // (every bucket finishes immediately, advancing through all levels back
+        // to the starting level).
+        let starting_level = 9u32; // near the top → few buckets to traverse
+        let settings = eviction_test_settings(1_000_000, starting_level);
+        let bl = BucketList::new();
+
+        let iter0 = crate::EvictionIterator {
+            bucket_list_level: starting_level,
+            is_curr_bucket: true,
+            bucket_file_offset: 0,
+        };
+        // First scan at ledger 100 → first wrap (baseline, publishes nothing).
+        let r1 = bl
+            .scan_for_eviction_incremental(iter0, 100, 23, &settings)
+            .expect("scan 1 should succeed");
+        assert_eq!(
+            bl.eviction_counters().snapshot().eviction_cycle_period,
+            0,
+            "first wrap is the baseline; nothing published yet"
+        );
+
+        // Second scan at ledger 142 → second wrap → period = 142 - 100 = 42.
+        let _r2 = bl
+            .scan_for_eviction_incremental(r1.end_iterator, 142, 23, &settings)
+            .expect("scan 2 should succeed");
+        assert_eq!(
+            bl.eviction_counters().snapshot().eviction_cycle_period,
+            42,
+            "second wrap publishes the cycle period (142 - 100)"
+        );
+    }
+
+    /// A `BucketListSnapshot` shares the source list's eviction counters Arc:
+    /// recording into the source is observable via the snapshot, and vice versa.
+    #[test]
+    fn test_snapshot_shares_eviction_counters_arc() {
+        let bl = BucketList::new();
+        let header = LedgerHeader {
+            ledger_seq: 5,
+            ..LedgerHeader::default()
+        };
+        let snapshot = crate::snapshot::BucketListSnapshot::new(&bl, header);
+
+        // Record into the source list; the snapshot sees the same instance.
+        bl.eviction_counters().record_incomplete_scan();
+        assert_eq!(
+            snapshot
+                .eviction_counters()
+                .snapshot()
+                .incomplete_bucket_scans,
+            1,
+            "snapshot must share the source list's eviction counters Arc"
+        );
+
+        // And the reverse direction.
+        snapshot.eviction_counters().record_bytes_scanned(512);
+        assert_eq!(
+            bl.eviction_counters().snapshot().bytes_scanned,
+            512,
+            "recording via the snapshot is visible on the source list"
+        );
     }
 
     // ============ hash assertion tests ============

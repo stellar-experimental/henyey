@@ -5187,8 +5187,18 @@ impl LedgerCloseContext<'_> {
                         .collect();
 
                     let bytes_scanned = eviction_result.bytes_scanned;
-                    let resolved = eviction_result
-                        .resolve(eviction_settings.max_entries_to_archive, &modified_keys);
+                    // Record evicted count + per-entry age into the bucket list's
+                    // shared eviction counters during resolve (parity:
+                    // BucketManager.cpp:1287-1289). The scan phase (inline or
+                    // background) already recorded bytes-scanned, incomplete-scan,
+                    // and the cycle period/age on the full-list wrap into the same
+                    // shared instance.
+                    let resolved = eviction_result.resolve(
+                        eviction_settings.max_entries_to_archive,
+                        &modified_keys,
+                        self.close_data.ledger_seq,
+                        Some(bucket_list.eviction_counters()),
+                    );
 
                     // Capture evicted keys for LedgerCloseMeta.
                     // Parity: LedgerCloseMetaFrame.cpp:170-187 populateEvictedEntries()

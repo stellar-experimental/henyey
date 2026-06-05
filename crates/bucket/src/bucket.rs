@@ -686,6 +686,26 @@ impl Bucket {
         }
     }
 
+    /// Total XDR byte size of this bucket's entries.
+    ///
+    /// Mirrors stellar-core `LiveBucket::getSize()` — the on-disk byte size used
+    /// by the eviction "stuck" check (`checkIfEvictionScanIsStuck`). For
+    /// disk-backed buckets this is O(1) via the index's per-type byte totals;
+    /// for in-memory buckets it sums each entry's XDR length. Returns 0 if a
+    /// disk-backed bucket has no index counters or an in-memory entry fails to
+    /// serialize (both unexpected; the value only feeds an observability gauge).
+    pub fn byte_size(&self) -> u64 {
+        match &self.storage {
+            BucketStorage::InMemory { entries, .. } => entries
+                .iter()
+                .map(|e| e.to_xdr_bytes().map(|b| b.len() as u64).unwrap_or(0))
+                .sum(),
+            BucketStorage::DiskBacked { disk_bucket } => {
+                disk_bucket.live_index().counters().total_size()
+            }
+        }
+    }
+
     /// Check if this bucket uses disk-backed storage.
     pub fn is_disk_backed(&self) -> bool {
         matches!(&self.storage, BucketStorage::DiskBacked { .. })

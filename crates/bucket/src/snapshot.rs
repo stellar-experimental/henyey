@@ -44,10 +44,11 @@ use crate::{
     bucket_list::BUCKET_LIST_LEVELS,
     entry::{ledger_entry_data_type, ledger_key_type},
     eviction::{
-        update_starting_eviction_iterator, EvictionCandidate, EvictionIterator,
-        EvictionIteratorExt, EvictionResult,
+        eviction_scan_is_stuck, update_starting_eviction_iterator, EvictionCandidate,
+        EvictionIterator, EvictionIteratorExt, EvictionResult,
     },
     index::LiveBucketIndex,
+    metrics::EvictionCounters,
     Bucket, BucketEntry, BucketEntryExt, BucketLevel, BucketList, HotArchiveBucket,
     HotArchiveBucketLevel, HotArchiveBucketList,
 };
@@ -308,6 +309,10 @@ impl HotArchiveBucketLevelSnapshot {
 pub struct BucketListSnapshot {
     levels: Vec<BucketLevelSnapshot>,
     header: LedgerHeader,
+    /// Shared eviction counters, cloned (`Arc`) from the source `BucketList` so
+    /// a background eviction scan running on this snapshot records into the same
+    /// instance the app reads via `BucketList::eviction_counters`.
+    eviction_counters: Arc<EvictionCounters>,
 }
 
 impl BucketListSnapshot {
@@ -315,13 +320,25 @@ impl BucketListSnapshot {
     ///
     /// Per-bucket caches are stored inside each DiskBucket and shared via Arc,
     /// so snapshot lookups automatically benefit from caching.
+    ///
+    /// The source list's eviction counters are shared (`Arc`-cloned) onto the
+    /// snapshot so a background scan records into the same instance.
     pub fn new(bucket_list: &BucketList, header: LedgerHeader) -> Self {
         let levels = bucket_list
             .levels()
             .iter()
             .map(BucketLevelSnapshot::from_level)
             .collect();
-        Self { levels, header }
+        Self {
+            levels,
+            header,
+            eviction_counters: bucket_list.eviction_counters_arc(),
+        }
+    }
+
+    /// Returns a reference to the shared eviction counters.
+    pub fn eviction_counters(&self) -> &EvictionCounters {
+        &self.eviction_counters
     }
 
     /// Returns the ledger sequence number for this snapshot.
@@ -558,6 +575,12 @@ impl BucketListSnapshot {
                 self.levels[level].snap.raw_bucket()
             };
 
+            // Per-bucket "stuck" check before scanning (parity:
+            // BucketListSnapshot.cpp:617, LiveBucketList.cpp:158-173).
+            if eviction_scan_is_stuck(&iter, settings.eviction_scan_size, bucket.byte_size()) {
+                self.eviction_counters.record_incomplete_scan();
+            }
+
             let (_entries_scanned, bytes_used, finished_bucket) = self.scan_bucket_region(
                 bucket,
                 &mut iter,
@@ -581,7 +604,14 @@ impl BucketListSnapshot {
             }
 
             if finished_bucket {
-                iter.advance_to_next_bucket(settings.starting_eviction_scan_level);
+                let wrapped = iter.advance_to_next_bucket(settings.starting_eviction_scan_level);
+
+                // Close the eviction cycle on the full-list wrap (parity:
+                // LiveBucketList.cpp:138-143).
+                if wrapped {
+                    self.eviction_counters
+                        .submit_metrics_and_restart_cycle(current_ledger);
+                }
 
                 if iter.bucket_list_level == start_iter.bucket_list_level
                     && iter.is_curr_bucket == start_iter.is_curr_bucket
@@ -591,6 +621,11 @@ impl BucketListSnapshot {
                 }
             }
         }
+
+        // Record total bytes scanned this ledger (additive/benign vs core,
+        // which declares but never increments this counter).
+        self.eviction_counters
+            .record_bytes_scanned(result.bytes_scanned);
 
         result.end_iterator = iter;
 

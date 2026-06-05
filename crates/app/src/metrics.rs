@@ -569,6 +569,19 @@ metric_catalog! {
         BUCKET_MERGE_ANNIHILATED_TOTAL = "stellar_bucket_merge_annihilated_total"
             => "Total INIT+DEAD entry pairs annihilated during merges";
 
+        // State-archival eviction counters. Names mirror stellar-core's medida
+        // keys {"state-archival","eviction",*} (BucketUtils.cpp:171-181).
+        EVICTION_ENTRIES_EVICTED_TOTAL = "state_archival_eviction_entries_evicted"
+            => "Total Soroban state entries evicted from the live bucket list";
+        EVICTION_BYTES_SCANNED_TOTAL = "state_archival_eviction_bytes_scanned"
+            => "Total bytes scanned by the eviction scan";
+        EVICTION_INCOMPLETE_SCAN_TOTAL = "state_archival_eviction_incomplete_scan"
+            => "Count of buckets too large to fully scan within their update period";
+        EVICTION_PERIOD = "state_archival_eviction_period"
+            => "Ledger span of the most recently completed eviction cycle";
+        EVICTION_AGE = "state_archival_eviction_age"
+            => "Average age (ledgers) of entries evicted in the last eviction cycle";
+
         // Overlay counters.
         OVERLAY_MESSAGE_READ_TOTAL = "stellar_overlay_message_read_total"
             => "Total overlay messages read from peers";
@@ -1012,6 +1025,16 @@ pub(crate) async fn refresh_gauges(state: &ServerState) {
     BUCKET_MERGE_NEW_META_TOTAL.absolute(mc.new_meta_entries);
     BUCKET_MERGE_SHADOWED_TOTAL.absolute(mc.old_entries_shadowed);
     BUCKET_MERGE_ANNIHILATED_TOTAL.absolute(mc.entries_annihilated);
+
+    // State-archival eviction counters.
+    let ec = state.app.eviction_counters_snapshot();
+    EVICTION_ENTRIES_EVICTED_TOTAL.absolute(ec.entries_evicted);
+    EVICTION_BYTES_SCANNED_TOTAL.absolute(ec.bytes_scanned);
+    EVICTION_INCOMPLETE_SCAN_TOTAL.absolute(ec.incomplete_bucket_scans);
+    // period + age are last-cycle SET-semantics gauges; `.absolute(...)`
+    // faithfully overwrites (matching core's medida Counter::set_count).
+    EVICTION_PERIOD.absolute(ec.eviction_cycle_period);
+    EVICTION_AGE.absolute(ec.average_evicted_entry_age);
 
     // Overlay counters (if overlay is running).
     if let Some(ov) = state.app.overlay_metrics_snapshot().await {
@@ -1591,6 +1614,61 @@ mod tests {
             assert!(
                 output.contains(&format!("{} 0", name)),
                 "counter {} should be pre-registered at 0",
+                name
+            );
+        }
+    }
+
+    /// The five state-archival eviction counters (#3168) are present in the
+    /// catalog under the expected Prometheus names. The names mirror
+    /// stellar-core's medida keys {"state-archival","eviction",*}.
+    #[test]
+    fn test_eviction_counters_in_catalog() {
+        for name in [
+            "state_archival_eviction_entries_evicted",
+            "state_archival_eviction_bytes_scanned",
+            "state_archival_eviction_incomplete_scan",
+            "state_archival_eviction_period",
+            "state_archival_eviction_age",
+        ] {
+            assert!(
+                ALL_COUNTER_NAMES.contains(&name),
+                "eviction counter {} missing from catalog",
+                name
+            );
+            assert!(
+                ALL_PREREGISTERED_COUNTER_NAMES.contains(&name),
+                "eviction counter {} should be pre-registered",
+                name
+            );
+        }
+    }
+
+    /// The five eviction counters are pre-registered at 0 and carry HELP/TYPE.
+    #[test]
+    fn test_eviction_counters_preregistered_at_zero() {
+        let (recorder, handle) = fresh_local_recorder();
+        metrics::with_local_recorder(&recorder, || {
+            describe_metrics();
+            register_label_series();
+        });
+        let output = handle.render();
+
+        for name in [
+            "state_archival_eviction_entries_evicted",
+            "state_archival_eviction_bytes_scanned",
+            "state_archival_eviction_incomplete_scan",
+            "state_archival_eviction_period",
+            "state_archival_eviction_age",
+        ] {
+            assert!(
+                output.contains(&format!("{} 0", name)),
+                "eviction counter {} should be pre-registered at 0",
+                name
+            );
+            assert!(
+                output.contains(&format!("# TYPE {} counter", name)),
+                "eviction counter {} should have TYPE counter",
                 name
             );
         }

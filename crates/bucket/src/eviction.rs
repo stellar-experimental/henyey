@@ -190,23 +190,40 @@ pub struct EvictionCandidate {
     entry: LedgerEntry,
     /// The EvictionIterator position AFTER this entry (resume point).
     position: EvictionIterator,
+    /// The TTL `liveUntilLedger` of the entry, captured from the TTL entry at
+    /// scan time. Used at resolve time to compute the evicted entry's age
+    /// (`ledger_seq - live_until_ledger`) for the eviction-cycle age metric.
+    /// Mirrors stellar-core's `EvictionResultEntry::liveUntilLedger`.
+    live_until_ledger: u32,
 }
 
 impl EvictionCandidate {
     /// Create an EvictionCandidate.
+    ///
+    /// `live_until_ledger` is the entry's TTL `liveUntilLedger`, captured from
+    /// the TTL entry during the scan, so the resolve phase can record the
+    /// evicted entry's age without re-looking up the TTL.
     ///
     /// # Panics
     /// Panics if the entry is not a Soroban entry with a derivable TTL key.
     /// This constructor is `pub(crate)` — only the eviction scan path calls
     /// it, and that path filters to Soroban entries before reaching here.
     /// The panic is defense-in-depth against internal misuse.
-    pub(crate) fn new(entry: LedgerEntry, position: EvictionIterator) -> Self {
+    pub(crate) fn new(
+        entry: LedgerEntry,
+        position: EvictionIterator,
+        live_until_ledger: u32,
+    ) -> Self {
         let data_key = henyey_common::entry_to_key(&entry);
         assert!(
             get_ttl_key(&data_key).is_some(),
             "EvictionCandidate entry must be a Soroban entry with a derivable TTL key"
         );
-        Self { entry, position }
+        Self {
+            entry,
+            position,
+            live_until_ledger,
+        }
     }
 
     /// The data entry being evicted.
@@ -232,6 +249,11 @@ impl EvictionCandidate {
     /// The EvictionIterator position AFTER this entry (resume point).
     pub fn position(&self) -> &EvictionIterator {
         &self.position
+    }
+
+    /// The entry's TTL `liveUntilLedger` captured at scan time.
+    pub fn live_until_ledger(&self) -> u32 {
+        self.live_until_ledger
     }
 
     /// Consume self, returning the owned entry and position.
@@ -375,10 +397,20 @@ impl EvictionResult {
     /// 4. Set the iterator position:
     ///    - If the entry limit was hit: resume from the last evicted entry's position
     ///    - Otherwise (including max_entries=0): advance to end of scan region
+    /// `ledger_seq` is the resolve-time current ledger; together with each
+    /// evicted candidate's `live_until_ledger` it yields the entry age
+    /// (`ledger_seq - live_until_ledger`) recorded into `counters` for the
+    /// eviction-cycle age gauge. `counters`, when `Some`, also receives the
+    /// per-type evicted count. Both mirror stellar-core
+    /// `BucketManager::resolveBackgroundEvictionScan` (`BucketManager.cpp:1287-1289`):
+    /// the `entriesEvicted` counter and `recordEvictedEntry(age)` happen in the
+    /// resolve phase, per actually-evicted entry (after TTL filter + max cap).
     pub fn resolve(
         self,
         max_entries_to_archive: u32,
         modified_keys: &std::collections::HashSet<LedgerKey>,
+        ledger_seq: u32,
+        counters: Option<&crate::metrics::EvictionCounters>,
     ) -> ResolvedEviction {
         let scan_end_iterator = self.end_iterator;
 
@@ -425,6 +457,7 @@ impl EvictionResult {
             }
 
             let is_temporary = candidate.is_temporary();
+            let live_until_ledger = candidate.live_until_ledger();
             let (entry, position) = candidate.into_parts();
 
             if is_temporary {
@@ -435,6 +468,19 @@ impl EvictionResult {
             }
             // TTL key is always added to deleted_keys for both types
             deleted_keys.push(ttl_key);
+
+            // Record eviction telemetry per actually-evicted entry.
+            // Parity: stellar-core records these in the resolve phase, after the
+            // TTL filter and max-cap, per evicted entry (BucketManager.cpp:1287-1289).
+            // age = ledger_seq - live_until_ledger; saturating_sub is defensive
+            // (expired entries already guarantee live_until_ledger < ledger_seq).
+            if let Some(counters) = counters {
+                let (temp_count, persistent_count) = if is_temporary { (1, 0) } else { (0, 1) };
+                counters.record_evicted(1, temp_count, persistent_count);
+                counters.record_evicted_entry_age(u64::from(
+                    ledger_seq.saturating_sub(live_until_ledger),
+                ));
+            }
 
             last_evicted_position = Some(position);
             remaining -= 1;
@@ -548,6 +594,23 @@ pub fn bucket_update_period(level: u32, is_curr: bool) -> u32 {
 
     // Formula: 2^(2*level - 1)
     1u32 << (2 * level - 1)
+}
+
+/// Check whether the eviction scan can finish scanning the bucket at the
+/// iterator's current position before that bucket next receives an update.
+///
+/// Mirrors stellar-core `LiveBucketList::checkIfEvictionScanIsStuck`
+/// (`LiveBucketList.cpp:158-173`): if `bucketUpdatePeriod(level, isCurr) *
+/// scanSize < bucket.getSize()`, the bucket is too large to fully scan within
+/// its update period, so the scan can never complete a pass over it. Returns
+/// `true` in that "stuck" case so the caller can record an incomplete-scan.
+pub fn eviction_scan_is_stuck(
+    iter: &EvictionIterator,
+    scan_size: u32,
+    bucket_byte_size: u64,
+) -> bool {
+    let period = bucket_update_period(iter.bucket_list_level, iter.is_curr_bucket) as u64;
+    period.saturating_mul(scan_size as u64) < bucket_byte_size
 }
 
 /// Update the eviction iterator based on bucket spills.
@@ -687,6 +750,14 @@ pub(crate) fn scan_bucket_region(
                 break 'process;
             }
 
+            // Capture the TTL liveUntilLedger so resolve can compute the
+            // evicted entry's age (ledger_seq - live_until_ledger) for the
+            // eviction-cycle age metric, without re-looking up the TTL.
+            // is_ttl_expired already confirmed this is a TTL entry, so the
+            // `unwrap_or` fallback (== current_ledger → age 0) is unreachable.
+            let live_until_ledger =
+                crate::entry::get_ttl_live_until(&ttl_entry).unwrap_or(current_ledger);
+
             // Entry is expired — collect as eviction candidate.
             // Spec: BUCKETLISTDB_SPEC §12.4 — Newest-version replacement for persistent
             // entries during eviction. Spec says P24+ only (pre-P24 preserved the
@@ -716,6 +787,7 @@ pub(crate) fn scan_bucket_region(
                     is_curr_bucket: iter.is_curr_bucket,
                     bucket_file_offset: start_offset + bytes_used,
                 },
+                live_until_ledger,
             ));
         }
 
@@ -1074,6 +1146,14 @@ mod tests {
     };
 
     fn make_contract_data_candidate(key_bytes: [u8; 32], is_temporary: bool) -> EvictionCandidate {
+        make_contract_data_candidate_with_ttl(key_bytes, is_temporary, 0)
+    }
+
+    fn make_contract_data_candidate_with_ttl(
+        key_bytes: [u8; 32],
+        is_temporary: bool,
+        live_until_ledger: u32,
+    ) -> EvictionCandidate {
         let entry = LedgerEntry {
             last_modified_ledger_seq: 100,
             data: LedgerEntryData::ContractData(ContractDataEntry {
@@ -1089,7 +1169,11 @@ mod tests {
             }),
             ext: LedgerEntryExt::V0,
         };
-        EvictionCandidate::new(entry, EvictionIterator::with_default_level())
+        EvictionCandidate::new(
+            entry,
+            EvictionIterator::with_default_level(),
+            live_until_ledger,
+        )
     }
 
     #[test]
@@ -1108,7 +1192,7 @@ mod tests {
         let mut modified = std::collections::HashSet::new();
         modified.insert(ttl_key);
 
-        let resolved = result.resolve(10, &modified);
+        let resolved = result.resolve(10, &modified, 0, None);
         assert!(
             resolved.deleted_keys.is_empty(),
             "candidate with modified TTL should be filtered out"
@@ -1129,7 +1213,7 @@ mod tests {
 
         let modified = std::collections::HashSet::new(); // empty
 
-        let resolved = result.resolve(10, &modified);
+        let resolved = result.resolve(10, &modified, 0, None);
         assert_eq!(
             resolved.deleted_keys.len(),
             2,
@@ -1156,7 +1240,7 @@ mod tests {
         let mut modified = std::collections::HashSet::new();
         modified.insert(data_key); // data key modified, but TTL key is NOT
 
-        let resolved = result.resolve(10, &modified);
+        let resolved = result.resolve(10, &modified, 0, None);
         // Parity: stellar-core logs REPORT_INTERNAL_BUG but still proceeds
         // with eviction (++iter, not erase). The candidate should still be
         // evicted.
@@ -1187,7 +1271,7 @@ mod tests {
         modified.insert(data_key);
         modified.insert(ttl_key);
 
-        let resolved = result.resolve(10, &modified);
+        let resolved = result.resolve(10, &modified, 0, None);
         assert!(
             resolved.deleted_keys.is_empty(),
             "candidate should be filtered out because TTL was modified"
@@ -1211,7 +1295,7 @@ mod tests {
         let modified = std::collections::HashSet::new();
 
         // Limit to 2 entries
-        let resolved = result.resolve(2, &modified);
+        let resolved = result.resolve(2, &modified, 0, None);
         assert_eq!(
             resolved.deleted_keys.len(),
             4,
@@ -1232,7 +1316,7 @@ mod tests {
         };
 
         let modified = std::collections::HashSet::new();
-        let resolved = result.resolve(10, &modified);
+        let resolved = result.resolve(10, &modified, 0, None);
 
         assert_eq!(
             resolved.archived_entries.len(),
@@ -1284,7 +1368,7 @@ mod tests {
         };
 
         let modified = std::collections::HashSet::new();
-        let resolved = result.resolve(10, &modified);
+        let resolved = result.resolve(10, &modified, 0, None);
 
         let evicted = resolved.evicted_keys();
 
@@ -1331,7 +1415,7 @@ mod tests {
 
         let modified = std::collections::HashSet::new();
         // Only process first 2 entries (temp1 + persistent2)
-        let resolved = result.resolve(2, &modified);
+        let resolved = result.resolve(2, &modified, 0, None);
 
         let evicted = resolved.evicted_keys();
         let expected = vec![temp1_data, temp1_ttl, persistent2_ttl, persistent2_data];
@@ -1364,7 +1448,7 @@ mod tests {
         };
 
         let modified = std::collections::HashSet::new();
-        let resolved = result.resolve(10, &modified);
+        let resolved = result.resolve(10, &modified, 0, None);
 
         let evicted = resolved.evicted_keys();
         let expected = vec![p1_ttl, p2_ttl, p1_data, p2_data];
@@ -1429,7 +1513,7 @@ mod tests {
             ext: LedgerEntryExt::V0,
         };
         // Should panic — non-Soroban entries cannot be eviction candidates
-        EvictionCandidate::new(non_soroban_entry, EvictionIterator::with_default_level());
+        EvictionCandidate::new(non_soroban_entry, EvictionIterator::with_default_level(), 0);
     }
 
     // --- resolve() iterator edge case tests ---
@@ -1454,7 +1538,7 @@ mod tests {
 
         let modified = std::collections::HashSet::new();
         // max_entries_to_archive = 0 means no eviction, use scan end
-        let resolved = result.resolve(0, &modified);
+        let resolved = result.resolve(0, &modified, 0, None);
         assert!(resolved.deleted_keys.is_empty());
         assert!(resolved.archived_entries.is_empty());
         assert_eq!(resolved.end_iterator, scan_end);
@@ -1486,7 +1570,7 @@ mod tests {
         modified.insert(ttl1);
         modified.insert(ttl2);
 
-        let resolved = result.resolve(10, &modified);
+        let resolved = result.resolve(10, &modified, 0, None);
         assert!(resolved.deleted_keys.is_empty());
         assert!(resolved.archived_entries.is_empty());
         // When all are filtered (remaining > 0), use scan end iterator
@@ -1608,11 +1692,124 @@ mod tests {
         let mut modified = std::collections::HashSet::new();
         modified.insert(ttl1);
 
-        let resolved = result.resolve(2, &modified);
+        let resolved = result.resolve(2, &modified, 0, None);
         // c2 and c3 evicted: 2 data_keys + 2 ttl_keys = 4
         assert_eq!(resolved.deleted_keys.len(), 4);
         // With max_entries=2, exactly 2 evicted, remaining=0 → use last position
         // (not scan_end, because we hit the limit)
         assert_ne!(resolved.end_iterator, scan_end);
+    }
+
+    // --- EvictionCounters wiring tests (#3168) ---
+
+    #[test]
+    fn test_scan_populates_incomplete_scan_on_oversized_bucket() {
+        // `eviction_scan_is_stuck` is true when bucketUpdatePeriod * scanSize is
+        // less than the bucket byte size. At level 6 curr the update period is
+        // 2^(2*6-1) = 2048, so with scan_size=10 the budget is 20480 bytes.
+        let iter = EvictionIterator::new(6);
+        let scan_size = 10u32;
+
+        // Oversized: 30000 > 2048 * 10 → stuck.
+        assert!(
+            eviction_scan_is_stuck(&iter, scan_size, 30_000),
+            "an oversized bucket should be reported as stuck"
+        );
+        // Within budget: 5000 < 20480 → not stuck.
+        assert!(
+            !eviction_scan_is_stuck(&iter, scan_size, 5_000),
+            "a bucket smaller than the scan budget should not be stuck"
+        );
+
+        // The scan records one incomplete_bucket_scan per stuck bucket it visits.
+        let counters = crate::metrics::EvictionCounters::new();
+        if eviction_scan_is_stuck(&iter, scan_size, 30_000) {
+            counters.record_incomplete_scan();
+        }
+        assert_eq!(counters.snapshot().incomplete_bucket_scans, 1);
+    }
+
+    #[test]
+    fn test_submit_cycle_period_on_wrap() {
+        // Exercise the previously-discarded wrap signal: the eviction cycle
+        // period is published as (curr_ledger - cycle_start_ledger) on the
+        // SECOND wrap (the first establishes the baseline).
+        let counters = crate::metrics::EvictionCounters::new();
+
+        // First wrap at ledger 100: baseline, publishes nothing.
+        counters.submit_metrics_and_restart_cycle(100);
+        assert_eq!(counters.snapshot().eviction_cycle_period, 0);
+
+        // Second wrap at ledger 142: period = 142 - 100 = 42.
+        counters.submit_metrics_and_restart_cycle(142);
+        assert_eq!(counters.snapshot().eviction_cycle_period, 42);
+    }
+
+    #[test]
+    fn test_resolve_records_evicted_count_and_age() {
+        // Two evicted temp candidates with known live_until_ledger; resolve at
+        // ledger 100 should record entries_evicted == 2 and, after the cycle
+        // closes, average age = ((100-90) + (100-80)) / 2 = (10 + 20) / 2 = 15.
+        let c1 = make_contract_data_candidate_with_ttl([1u8; 32], true, 90);
+        let c2 = make_contract_data_candidate_with_ttl([2u8; 32], true, 80);
+
+        let result = EvictionResult {
+            candidates: vec![c1, c2],
+            end_iterator: EvictionIterator::with_default_level(),
+            bytes_scanned: 2000,
+            scan_complete: true,
+            ..Default::default()
+        };
+
+        let counters = crate::metrics::EvictionCounters::new();
+        // Establish the cycle baseline so the next submit publishes the gauge.
+        counters.submit_metrics_and_restart_cycle(0);
+
+        let modified = std::collections::HashSet::new();
+        let resolved = result.resolve(10, &modified, 100, Some(&counters));
+        // Both temp entries evicted: 2 data keys + 2 TTL keys.
+        assert_eq!(resolved.deleted_keys.len(), 4);
+
+        let snap = counters.snapshot();
+        assert_eq!(snap.entries_evicted, 2, "two entries evicted");
+        assert_eq!(snap.temp_entries_evicted, 2, "both were temporary");
+
+        // Close the cycle to fold per-entry ages into the average gauge.
+        counters.submit_metrics_and_restart_cycle(200);
+        assert_eq!(
+            counters.snapshot().average_evicted_entry_age,
+            15,
+            "average age = ((100-90)+(100-80))/2 = 15"
+        );
+    }
+
+    #[test]
+    fn test_resolve_does_not_record_for_filtered_or_overcap_candidates() {
+        // Three candidates; one filtered by a modified TTL, cap = 1 → only one
+        // actually evicted, so entries_evicted == 1 (not 3).
+        let c1 = make_contract_data_candidate_with_ttl([1u8; 32], true, 90);
+        let c2 = make_contract_data_candidate_with_ttl([2u8; 32], true, 90);
+        let c3 = make_contract_data_candidate_with_ttl([3u8; 32], true, 90);
+        let ttl1 = c1.ttl_key();
+
+        let result = EvictionResult {
+            candidates: vec![c1, c2, c3],
+            end_iterator: EvictionIterator::with_default_level(),
+            bytes_scanned: 3000,
+            scan_complete: true,
+            ..Default::default()
+        };
+
+        let counters = crate::metrics::EvictionCounters::new();
+        let mut modified = std::collections::HashSet::new();
+        modified.insert(ttl1); // c1 filtered out
+
+        // max=1 → only c2 evicted (c3 over cap).
+        let _ = result.resolve(1, &modified, 100, Some(&counters));
+        assert_eq!(
+            counters.snapshot().entries_evicted,
+            1,
+            "only the one actually-evicted candidate is counted"
+        );
     }
 }
