@@ -970,6 +970,40 @@ def eval_counter_ratio(
         return make_result(alarm, "ok", value=round(ratio, 4), threshold=ratio_threshold, extra_values=ev)
 
 
+def maybe_post_restart_fire(alarm: dict, cur_val: float) -> dict | None:
+    """Post-restart absolute-value check for counter-streak alarms (#3198).
+
+    On a streak baseline reset (PID/start_ticks change, or a counter reset), the
+    cross-tick delta machine cannot observe a stall that accrued during a node's
+    startup/warmup window — the burst straddles the reset tick. This evaluates
+    the absolute counter value that the reset would otherwise discard: if it
+    meets `post_restart_absolute_threshold` (a positive value enables the check;
+    0/absent disables it), return a "firing" result keyed on the ABSOLUTE value
+    with a `post_restart` marker (streak/delta semantics are meaningless on a
+    fresh incarnation). Otherwise return None so the caller falls through to
+    "collecting_baseline".
+
+    Callers MUST write the fresh baseline snapshot BEFORE invoking this, so the
+    next tick's streak machine stays consistent regardless of the fire path.
+    """
+    threshold = alarm.get("post_restart_absolute_threshold", 0)
+    if not threshold or threshold <= 0:
+        return None
+    if cur_val < threshold:
+        return None
+    abs_val = int(cur_val)
+    return make_result(
+        alarm, "firing", value=abs_val, threshold=threshold,
+        extra_values={
+            "post_restart": True,
+            "value": abs_val,
+            "threshold": threshold,
+            "streak": 0,
+            "streak_threshold": alarm.get("streak_threshold", 3),
+        },
+    )
+
+
 def eval_counter_streak(
     alarm: dict,
     current: dict,
@@ -1001,7 +1035,13 @@ def eval_counter_streak(
         if snapshot.get("version") != "1":
             snapshot = {}
         elif snapshot.get("pid") != pid or snapshot.get("start_ticks") != start_ticks:
-            # Process identity changed — invalidate
+            # Process identity changed (restart) — invalidate the streak and
+            # re-collect baseline. The cross-tick delta machine is blind to a
+            # stall that accrued during startup/warmup because the burst spans
+            # the baseline-reset tick (see #3198). Write the fresh baseline
+            # snapshot FIRST so the next tick's streak machine stays consistent,
+            # THEN evaluate the discarded absolute value: if it already crosses
+            # post_restart_absolute_threshold, fire WARN once on this reset tick.
             new_snapshot = {
                 "version": "1",
                 "pid": pid,
@@ -1010,6 +1050,9 @@ def eval_counter_streak(
                 "breach_streak": "0",
             }
             write_snapshot(snapshot_path, new_snapshot)
+            post_restart = maybe_post_restart_fire(alarm, cur_val)
+            if post_restart is not None:
+                return post_restart
             return make_result(alarm, "collecting_baseline",
                                extra_values=ev_default)
 
@@ -1029,7 +1072,12 @@ def eval_counter_streak(
     prev_counter = int(snapshot.get("counter_value", "0"))
     streak = int(snapshot.get("breach_streak", "0"))
 
-    # Counter reset
+    # Counter reset (cur_val < prev_counter): the counter regressed without a
+    # PID change (e.g. metric re-registered). cur_val here is the POST-reset
+    # absolute value, not a delta — re-collect baseline. Mirror the PID-change
+    # branch: write the fresh baseline FIRST, then evaluate the discarded
+    # absolute value for a post-restart fire (#3198). The fire here uses the
+    # absolute value, so it is not double-counting a delta.
     if cur_val < prev_counter:
         new_snapshot = {
             "version": "1",
@@ -1039,6 +1087,9 @@ def eval_counter_streak(
             "breach_streak": "0",
         }
         write_snapshot(snapshot_path, new_snapshot)
+        post_restart = maybe_post_restart_fire(alarm, cur_val)
+        if post_restart is not None:
+            return post_restart
         return make_result(alarm, "collecting_baseline",
                            extra_values=ev_default)
 

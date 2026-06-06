@@ -45,7 +45,7 @@ cleanup  # ensure fresh state
 mkdir -p "$TEST_ROOT"
 
 # ── TAP state ────────────────────────────────────────────────────────────────
-TAP_PLAN=316
+TAP_PLAN=319
 TAP_CURRENT=0
 TAP_FAILURES=0
 
@@ -1479,7 +1479,7 @@ run_tests() {
 
   # Test 41: TOML catalog file exists, is parseable, and contains recovery-stalled alarm
   # Extract recovery-stalled alarm constants from metric-alarms.toml
-  local streak_val burst_val delta_val snapshot_file mode_val metric_name metric_label
+  local streak_val burst_val delta_val post_restart_val snapshot_file mode_val metric_name metric_label
   # Use Python to extract the recovery-stalled alarm entry from the TOML
   local toml_extract
   toml_extract=$(python3 - "$constants_file" <<'PYEOF'
@@ -1495,6 +1495,7 @@ for a in data['alarm']:
         print('streak_val=' + str(a['streak_threshold']))
         print('burst_val=' + str(a['burst_threshold']))
         print('delta_val=' + str(a['delta_threshold']))
+        print('post_restart_val=' + str(a.get('post_restart_absolute_threshold', 0)))
         print('snapshot_file=' + a['snapshot_file'])
         print('metric_name=' + a['metric'])
         labels = a.get('labels', [])
@@ -1513,6 +1514,14 @@ PYEOF
   if [[ -n "$toml_extract" && "$toml_extract" != "NOT_FOUND" ]]; then
     eval "$toml_extract"
     tap_ok "metric-alarms: TOML exists and parseable (streak=$streak_val burst=$burst_val delta=$delta_val)"
+    # Test 41b: post-restart absolute threshold cross-validated against TOML (#3198).
+    # Keeps the inline SKILL.md literal (50) cross-validated against the catalog.
+    if [[ "$post_restart_val" == "50" ]]; then
+      tap_ok "metric-alarms: recovery-stalled post_restart_absolute_threshold == 50"
+    else
+      tap_not_ok "metric-alarms: recovery-stalled post_restart_absolute_threshold == 50" \
+        "expected post_restart_absolute_threshold=50, got '$post_restart_val'"
+    fi
   else
     tap_not_ok "metric-alarms: TOML exists and parseable" \
       "Failed to parse recovery-stalled alarm from metric-alarms.toml"
@@ -3679,6 +3688,107 @@ except:
   fi
   rm -f "$tick_prom_148b" "$prev_prom_148b"
   rm -rf "$state_dir_148b"
+
+  # Test 148c: recovery-stalled post-restart absolute-value fire (#3198).
+  # Scenario from #3197/#3198: a deploy restart changes the process PID. The
+  # monitor's first observation of the restarted process already shows a large
+  # forcing_catchup_behind value (213) accrued during startup/warmup. The
+  # streak machine would normally reset its baseline on the PID change and
+  # return "collecting_baseline" — silently discarding the absolute value. With
+  # post_restart_absolute_threshold=50 the discarded value is evaluated and the
+  # alarm fires WARN once. A clean restart (value 5, below threshold) must NOT
+  # fire.
+  local state_dir_148c
+  state_dir_148c=$(mktemp -d)
+  # Pre-seed a snapshot from the PRE-restart incarnation (pid=1000).
+  mkdir -p "$state_dir_148c/metrics"
+  cat > "$state_dir_148c/metrics/counter_streak_snapshot" <<'SNAP_148C'
+version=1
+pid=1000
+start_ticks=1000
+counter_value=0
+breach_streak=0
+SNAP_148C
+  local tick_prom_148c
+  tick_prom_148c=$(mktemp)
+  # First post-restart observation: PID changed to 2000, big accrued stall.
+  cat > "$tick_prom_148c" <<'TICK_PROM_148C'
+henyey_recovery_stalled_tick_total{reason="forcing_catchup_behind"} 213
+TICK_PROM_148C
+  local fire_out_148c
+  fire_out_148c=$(MONITOR_MODE=validator UPTIME_SECONDS=900 WARMUP_TICKS_REMAINING=0 \
+    PID=2000 START_TICKS=2000 \
+    python3 "$eval_script" \
+    --catalog "$catalog_file" \
+    --current "$tick_prom_148c" \
+    --state-dir "$state_dir_148c" 2>/dev/null) || true
+  local rs_state_148c rs_postrestart_148c
+  rs_state_148c=$(echo "$fire_out_148c" | python3 -c "
+import json, sys
+try:
+    data = json.load(sys.stdin)
+    for r in data.get('alarms', []):
+        if r.get('name') == 'recovery-stalled':
+            print(r.get('state', 'missing'))
+            break
+    else:
+        print('not-found')
+except:
+    print('parse-error')
+" 2>/dev/null || echo "parse-error")
+  if [[ "$rs_state_148c" == "firing" ]]; then
+    tap_ok "eval-alarms: recovery-stalled post-restart absolute fire (213 >= 50 → firing, not collecting_baseline)"
+  else
+    tap_not_ok "eval-alarms: recovery-stalled post-restart absolute fire" \
+      "expected firing on PID-change with value 213, got $rs_state_148c"
+  fi
+  rm -f "$tick_prom_148c"
+  rm -rf "$state_dir_148c"
+
+  # Test 148d: recovery-stalled clean restart below threshold does NOT fire.
+  local state_dir_148d
+  state_dir_148d=$(mktemp -d)
+  mkdir -p "$state_dir_148d/metrics"
+  cat > "$state_dir_148d/metrics/counter_streak_snapshot" <<'SNAP_148D'
+version=1
+pid=1000
+start_ticks=1000
+counter_value=0
+breach_streak=0
+SNAP_148D
+  local tick_prom_148d
+  tick_prom_148d=$(mktemp)
+  cat > "$tick_prom_148d" <<'TICK_PROM_148D'
+henyey_recovery_stalled_tick_total{reason="forcing_catchup_behind"} 5
+TICK_PROM_148D
+  local clean_out_148d rs_state_148d
+  clean_out_148d=$(MONITOR_MODE=validator UPTIME_SECONDS=900 WARMUP_TICKS_REMAINING=0 \
+    PID=2000 START_TICKS=2000 \
+    python3 "$eval_script" \
+    --catalog "$catalog_file" \
+    --current "$tick_prom_148d" \
+    --state-dir "$state_dir_148d" 2>/dev/null) || true
+  rs_state_148d=$(echo "$clean_out_148d" | python3 -c "
+import json, sys
+try:
+    data = json.load(sys.stdin)
+    for r in data.get('alarms', []):
+        if r.get('name') == 'recovery-stalled':
+            print(r.get('state', 'missing'))
+            break
+    else:
+        print('not-found')
+except:
+    print('parse-error')
+" 2>/dev/null || echo "parse-error")
+  if [[ "$rs_state_148d" == "collecting_baseline" ]]; then
+    tap_ok "eval-alarms: recovery-stalled clean restart below threshold (5 < 50 → collecting_baseline, no false-fire)"
+  else
+    tap_not_ok "eval-alarms: recovery-stalled clean restart below threshold" \
+      "expected collecting_baseline on PID-change with value 5, got $rs_state_148d"
+  fi
+  rm -f "$tick_prom_148d"
+  rm -rf "$state_dir_148d"
 
   # Test 149: alarm-surfaces.toml file-local invariants + mirrored UIDs
   #           resolve to real Grafana alert UIDs in henyey-slo-alerts.yaml.

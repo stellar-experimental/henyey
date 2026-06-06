@@ -698,6 +698,16 @@ labels = [{ key = "reason", value = "forcing_catchup_behind" }]
 delta_threshold = 1
 streak_threshold = 3
 burst_threshold = 10
+# Post-restart absolute-value fire (#3198). On a PID/start_ticks change (restart)
+# or a counter reset the streak baseline is re-collected and the cross-tick delta
+# machine is blind to a stall that accrued during startup/warmup. If the first
+# post-reset observation already shows an absolute value >= this threshold, fire
+# WARN once on the reset tick (independent of the 15m sync deadline). The #3197
+# episode accrued 213; a clean restart reaching real-time sync promptly accrues
+# only a handful. 0/absent disables the check.
+post_restart_absolute_threshold = 50
+baseline_version = 2  # bumped in #3198: add post_restart_absolute_threshold post-restart absolute fire
+semantic_change_date = "2026-06-06T00:00:00Z"
 severity = "WARN"
 gates = ["validator-only"]
 snapshot_file = "metrics/counter_streak_snapshot"
