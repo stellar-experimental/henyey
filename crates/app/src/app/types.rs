@@ -782,6 +782,20 @@ pub(super) struct StuckSignals {
     /// `trigger_recovery_catchup`.
     #[allow(dead_code)]
     pub near_tip: bool,
+    /// When `true`, peer-SCP back-fill is demonstrably making progress: the
+    /// verified peer gap (`effective_peer_gap`) has strictly shrunk across the
+    /// last few Path-A ticks of this stuck episode, encoded cumulatively as
+    /// `recovery_consecutive_no_gap_progress < RECOVERY_ZERO_PROGRESS_ESCALATION_ATTEMPTS`.
+    ///
+    /// Used by `decide_consensus_stuck_action` to SUPPRESS the count-based
+    /// `recovery_exhausted` HardReset (#3204) while #3199's peer-SCP back-fill
+    /// is shrinking the gap — restoring stellar-core's uncapped out-of-sync
+    /// recovery (`HerderImpl::outOfSyncRecovery`). It deliberately gates ONLY
+    /// the count cap; the 120s wall-clock backstop (#2789) and the tx_set
+    /// exhaustion escalation are independent and remain armed. The progress
+    /// signal is peer_gap-shrink ONLY (NOT current_ledger advance), so it never
+    /// touches `stuck_start` re-keying and cannot defeat the 120s ceiling.
+    pub recovery_making_progress: bool,
 }
 
 /// Actions to take when consensus is stuck.
