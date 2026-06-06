@@ -257,20 +257,19 @@ const RECOVERY_HARD_RESET_ESCALATION_ATTEMPTS: u64 =
 const RECOVERY_HARD_RESET_ESCALATION_ATTEMPTS_NO_SCP: u64 =
     (HARD_RESET_STALL_SECS * 3 / 2 / OUT_OF_SYNC_RECOVERY_TIMER_SECS) - 1;
 
-/// Near-tip escalation threshold (issue #3181). When the archive is confirmed
-/// behind, peers are verified ahead, and the peer gap is below one checkpoint
-/// interval (`PEER_AHEAD_ESCALATION_THRESHOLD <= peer_gap < checkpoint_frequency()`),
-/// archive-based catchup is structurally impossible-yet-imminent: the next
-/// checkpoint that unblocks recovery will publish within one interval. Spinning
-/// on per-tick archive probes for the full ~120s (`RECOVERY_HARD_RESET_ESCALATION_ATTEMPTS`)
-/// before escalating to the state-changing reset (which spawns a peer-SCP
-/// `ProbeAhead` blocking fetch + `request_scp_state`) produced a ~4.5-min
-/// consensus stall and a `forcing_catchup_behind` counter burst. In the near-tip
-/// band we fire that same escalation on the 2nd recovery tick (~10–20s) instead.
-/// The 60s `HARD_RESET_MIN_COOLDOWN_SECS` floor still prevents reset storms, and
-/// the far-behind (`peer_gap >= checkpoint_frequency()`) #1862 path keeps the
-/// unchanged 11-tick threshold + archive-catchup escalation.
-const RECOVERY_HARD_RESET_ESCALATION_ATTEMPTS_NEAR_TIP: u64 = 1;
+// Near-tip escalation threshold (issue #3181) — REMOVED by #3197.
+//
+// #3181/#3187 introduced a lowered escalation threshold so the near-tip /
+// archive-behind band would HardReset early. But that escalation routed to a
+// `ProbeAhead` archive fetch that is structurally doomed near tip (the next
+// checkpoint is unpublished), so it never shortened the outage. #3197 corrects
+// the ROUTING: the near-tip band now goes to peer-SCP back-fill + buffered-apply
+// (mirroring stellar-core's `HerderImpl::outOfSyncRecovery`), so there is no
+// longer a near-tip-specific HardReset escalation threshold. The band-DETECTION
+// constant `PEER_AHEAD_ESCALATION_THRESHOLD` is retained; only this early-
+// escalation threshold (whose sole consumer was the now-removed near-tip
+// HardReset arm in `trigger_recovery_catchup`) is gone. The far-behind (#1862)
+// path keeps the unchanged 11-tick `RECOVERY_HARD_RESET_ESCALATION_ATTEMPTS`.
 
 /// Attempt-counter seed for partial-progress resets. When the node makes
 /// progress via a fast-track jump but is still significantly behind peers,
@@ -11389,17 +11388,10 @@ mod tests {
             "(120 * 3/2) / 10 - 1 = 17"
         );
         assert_eq!(PEER_AHEAD_ESCALATION_THRESHOLD, 3);
-        // #3181: near-tip threshold fires on the 2nd recovery tick (~10–20s),
-        // far earlier than the default 11 ticks (~120s).
-        assert_eq!(
-            RECOVERY_HARD_RESET_ESCALATION_ATTEMPTS_NEAR_TIP, 1,
-            "near-tip escalation must fire on the 2nd recovery tick (#3181)"
-        );
-        assert!(
-            RECOVERY_HARD_RESET_ESCALATION_ATTEMPTS_NEAR_TIP
-                < RECOVERY_HARD_RESET_ESCALATION_ATTEMPTS,
-            "near-tip threshold must be strictly earlier than the default"
-        );
+        // #3197: the near-tip / archive-behind band routes to peer-SCP
+        // recovery (no archive HardReset), so there is no longer a near-tip-
+        // specific escalation threshold. The band-detection threshold
+        // (PEER_AHEAD_ESCALATION_THRESHOLD) is retained above.
     }
 
     #[tokio::test]
@@ -11482,12 +11474,21 @@ mod tests {
     }
 
     /// Regression test for issue #2349: when archive is confirmed behind
-    /// AND peers are verified ahead (peer_gap >= 3) AND attempts >= 11,
-    /// the fast-track → trigger_recovery_catchup path should escalate to
-    /// hard reset instead of falling through to peer SCP request.
+    /// AND peers are verified FAR ahead (peer_gap >= checkpoint_frequency(),
+    /// the #1862 far-behind band) AND attempts >= 11, the fast-track →
+    /// trigger_recovery_catchup path should escalate to hard reset instead of
+    /// falling through to peer SCP request.
     ///
     /// We exercise this through out_of_sync_recovery (the public entry point)
     /// configured to take the fast-track path (AtTip + SCP traffic).
+    ///
+    /// NOTE (#3197): this test uses a FAR-BEHIND peer_gap. The near-tip band
+    /// (3 <= peer_gap < checkpoint_frequency()) no longer fires a hard reset
+    /// here — it routes to peer-SCP recovery (broadcast_recovery_scp_state) —
+    /// so the #2349 hard-reset escalation is now specific to the far-behind
+    /// band, which #3197 leaves unchanged. See
+    /// test_decide_far_behind_archive_behind_unchanged and the near-tip
+    /// routing tests in catchup_impl.rs.
     #[tokio::test]
     async fn test_trigger_recovery_archive_behind_peer_ahead_fires_hard_reset() {
         let (_dir, app) = make_app_for_peer_ahead_test().await;
@@ -11499,7 +11500,11 @@ mod tests {
                 backoff_until: None,
             };
         }
-        app.max_verified_scp_slot.store(110, Ordering::Relaxed); // peer_gap = 10
+        // Far-behind band (#1862): peer_gap >= checkpoint_frequency() so the
+        // near-tip peer-SCP routing (#3197) does not apply and the archive
+        // hard-reset escalation fires.
+        app.max_verified_scp_slot
+            .store(current_ledger as u64 + 200, Ordering::Relaxed); // peer_gap = 200
 
         // Set attempts so that after fetch_add(1) in out_of_sync_recovery,
         // attempts == RECOVERY_HARD_RESET_ESCALATION_ATTEMPTS (11).
@@ -11531,16 +11536,21 @@ mod tests {
         );
     }
 
-    /// Regression test for #2723: when the peer-ahead escalation path fires
-    /// but the archive cache is Fresh at/below current_ledger, the #2713
+    /// Regression test for #2723: when the peer-ahead escalation would fire
+    /// but the archive cache is Fresh at/below current_ledger AND the node is
+    /// at-or-near tip (peer_gap < HARD_RESET_GAP_ESCALATION), the #2713
     /// suppression guard in `force_post_catchup_hard_reset` must suppress the
-    /// hard reset instead of proceeding. This is the mirror image of
-    /// `test_trigger_recovery_archive_behind_peer_ahead_fires_hard_reset`.
+    /// hard reset instead of proceeding.
     ///
-    /// Call chain exercised:
-    ///   out_of_sync_recovery → fast-track → trigger_recovery_catchup
-    ///   → peer-ahead escalation → force_post_catchup_hard_reset
-    ///   → #2713 suppression guard (returns None)
+    /// NOTE (#3197): this guard is exercised directly via
+    /// `force_post_catchup_hard_reset`. Previously it was reached through
+    /// `out_of_sync_recovery → trigger_recovery_catchup` with a near-tip
+    /// peer_gap, but the near-tip band now routes to peer-SCP recovery before
+    /// reaching the hard-reset path (#3197). The suppression guard itself is
+    /// unchanged; we test it at the function it guards (the same entry point
+    /// the #2789 anti-wedge tests use). The suppression regime requires
+    /// peer_gap < HARD_RESET_GAP_ESCALATION (the #2789 narrowing), so a
+    /// near-tip-eligible gap is used here.
     #[tokio::test]
     async fn test_trigger_recovery_archive_behind_peer_ahead_suppressed_by_fresh_cache() {
         let (_dir, app) = make_app_for_peer_ahead_test().await;
@@ -11556,20 +11566,20 @@ mod tests {
         // suppression guard in force_post_catchup_hard_reset.
         app.archive_checkpoint_cache.seed(current_ledger);
 
-        app.max_verified_scp_slot.store(110, Ordering::Relaxed); // peer_gap = 10
+        // peer_gap = 5 < HARD_RESET_GAP_ESCALATION (12): the at-or-near-tip
+        // regime where the #2789 narrowing leaves the #2713 suppression armed.
+        app.max_verified_scp_slot
+            .store(current_ledger as u64 + 5, Ordering::Relaxed);
 
-        // fetch_add(1) returns old value, so `attempts` == threshold when evaluated.
-        app.recovery_attempts_without_progress
-            .store(RECOVERY_HARD_RESET_ESCALATION_ATTEMPTS, Ordering::SeqCst);
-        app.recovery_baseline_ledger
-            .store(current_ledger as u64, Ordering::SeqCst);
-
-        // SCP traffic since reset → fast-track fires.
-        app.scp_messages_received.store(10, Ordering::Relaxed);
-        app.recovery_baseline_scp_received
-            .store(0, Ordering::SeqCst);
-
-        let result = app.out_of_sync_recovery(current_ledger).await;
+        // Invoke the hard-reset entry point directly: the #3197 near-tip
+        // routing diverts the out_of_sync_recovery chain away from here, so we
+        // exercise the suppression guard at its actual location.
+        let result = app
+            .force_post_catchup_hard_reset(
+                current_ledger,
+                HardResetReason::ArchiveBehindStallWallClock,
+            )
+            .await;
 
         // Suppression guard returns None — no PendingCatchup spawned.
         assert!(
@@ -11588,7 +11598,7 @@ mod tests {
         // does NOT call reset_recovery_attempts, unlike the fire path).
         assert_eq!(
             app.max_verified_scp_slot.load(Ordering::Relaxed),
-            110,
+            current_ledger as u64 + 5,
             "suppression must NOT clear max_verified_scp_slot"
         );
 
@@ -11596,6 +11606,72 @@ mod tests {
         assert!(
             app.last_hard_reset_offset.load(Ordering::Relaxed) > 0,
             "suppression must arm cooldown (last_hard_reset_offset > 0)"
+        );
+    }
+
+    /// Regression test for #3197 (PRIMARY production path): in the near-tip
+    /// band (PEER_AHEAD_ESCALATION_THRESHOLD <= peer_gap <
+    /// checkpoint_frequency()) with the archive confirmed behind and the
+    /// recovery attempts pinned past the escalation threshold (as
+    /// escalate_recovery_to_catchup does on every far-ahead EXTERNALIZE),
+    /// trigger_recovery_catchup must NOT fire an archive hard reset / ProbeAhead
+    /// (which is structurally doomed near tip). It must route to peer-SCP
+    /// recovery: the confirmed-behind status and max_verified_scp_slot are
+    /// preserved (a hard reset would clear both), and no PendingCatchup is
+    /// spawned. Mirrors stellar-core HerderImpl::outOfSyncRecovery (no archive
+    /// interaction near tip).
+    ///
+    /// Pre-#3197 (the #3187 code) this fired a hard reset and cleared
+    /// max_verified_scp_slot — the doomed routing this PR corrects.
+    #[tokio::test]
+    async fn test_trigger_recovery_near_tip_routes_to_peer_scp_not_hard_reset() {
+        let (_dir, app) = make_app_for_peer_ahead_test().await;
+        let current_ledger = 100u32;
+
+        {
+            *app.archive_recovery_status.write().await = ArchiveRecoveryStatus::ConfirmedBehind {
+                backoff_until: None,
+            };
+        }
+        // Near-tip band: peer_gap = 10 (3 <= 10 < checkpoint_frequency()=64).
+        let peer_slot = current_ledger as u64 + 10;
+        app.max_verified_scp_slot
+            .store(peer_slot, Ordering::Relaxed);
+
+        // Pin attempts past the escalation threshold (mirrors
+        // escalate_recovery_to_catchup pinning on far-ahead EXTERNALIZE).
+        app.recovery_attempts_without_progress.store(
+            RECOVERY_HARD_RESET_ESCALATION_ATTEMPTS + 5,
+            Ordering::SeqCst,
+        );
+        app.recovery_baseline_ledger
+            .store(current_ledger as u64, Ordering::SeqCst);
+        app.scp_messages_received.store(10, Ordering::Relaxed);
+        app.recovery_baseline_scp_received
+            .store(0, Ordering::SeqCst);
+
+        let result = app.out_of_sync_recovery(current_ledger).await;
+
+        // No catchup spawned — the near-tip arm returns None after running the
+        // peer-SCP back-fill.
+        assert!(
+            result.is_none(),
+            "near-tip recovery must not spawn an archive catchup"
+        );
+        // A hard reset would have cleared confirmed-behind; peer-SCP routing
+        // must preserve it.
+        assert!(
+            app.archive_recovery_snapshot().await.is_confirmed_behind(),
+            "near-tip peer-SCP routing must NOT clear confirmed-behind status \
+             (no doomed archive hard reset) — #3197"
+        );
+        // A hard reset (reset_recovery_attempts(Full)) would have cleared
+        // max_verified_scp_slot; peer-SCP routing must preserve it.
+        assert_eq!(
+            app.max_verified_scp_slot.load(Ordering::Relaxed),
+            peer_slot,
+            "near-tip peer-SCP routing must NOT clear max_verified_scp_slot \
+             (no hard reset) — #3197"
         );
     }
 
