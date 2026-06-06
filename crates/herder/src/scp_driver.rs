@@ -1959,7 +1959,7 @@ impl ScpDriver {
     /// 1. Collect upgrades from ALL candidates, merging by taking max of each type
     /// 2. Select the best tx set using compareTxSets (size comparison + tiebreak)
     /// 3. Compose result: best candidate's txSetHash/closeTime + merged upgrades
-    pub fn combine_candidates_impl(&self, _slot: SlotIndex, values: &[Value]) -> Value {
+    pub fn combine_candidates_impl(&self, slot: SlotIndex, values: &[Value]) -> Value {
         if values.is_empty() {
             return Value::default();
         }
@@ -2069,9 +2069,27 @@ impl ScpDriver {
             .collect();
 
         if selectable_candidates.is_empty() {
-            panic!(
-                "BUG: no selectable candidate in combineCandidates after previousLedgerHash filter"
+            // Issue #3220: no candidate's previousLedgerHash matches the current
+            // LCL. This is a benign catchup-vs-nomination race: catchup (or the
+            // INV-H2 corrective tracking advance) moved LCL past the slot being
+            // nominated, so every candidate references the now-superseded
+            // pre-catchup LCL. Bail gracefully with an empty Value rather than
+            // crashing the validator with a process-fatal panic. The empty Value
+            // is mapped to `None` by the `SCPDriver::combine_candidates` wrapper
+            // (HerderScpCallback::combine_candidates), and the sole caller
+            // `NominationProtocol::update_composite` treats `None` as a no-op,
+            // abandoning the superseded slot. This is the behaviorally faithful
+            // equivalent of stellar-core's recoverable handling at
+            // HerderSCPDriver.cpp:800-804 (a `throw std::runtime_error`, not a
+            // process-fatal releaseAssert) — stellar-core's synchronous design
+            // makes that path effectively unreachable, but henyey's async
+            // catchup legitimately reaches it.
+            tracing::warn!(
+                slot,
+                "combineCandidates: no candidate matches current LCL \
+                 (catchup advanced past slot); returning no combined value"
             );
+            return Value::default();
         }
 
         // Phase 4: Sort and select best candidate.
