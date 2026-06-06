@@ -1141,6 +1141,14 @@ eval_result=$(python3 scripts/lib/eval-alarms.py \
     --state-dir "$HOME/data/$MONITOR_SESSION_ID/metrics")
 ```
 
+> **Caution (#3209):** This canonical per-tick run is invoked **exactly once** and
+> advances the streak/ratio snapshots. Any ad-hoc or repeat/diagnostic eval
+> invocation within the same tick MUST pass `--no-snapshot-write` — otherwise the
+> first run consumes the streak/ratio delta and the second run masks the alarm
+> (reports `delta=0`). Also: never pipe the evaluator through `2>&1` into a JSON
+> parser — telemetry is emitted on stderr, and merging it into stdout corrupts the
+> JSON parse. Capture stderr separately (`2>telemetry.log` or `2>/dev/null`).
+
 **Process the JSON output:**
 
 1. Parse `eval_result` as JSON.
