@@ -232,14 +232,30 @@ where
         Box<dyn std::future::Future<Output = Result<(Vec<LedgerData>, u32)>> + Send + 's>,
     >,
 {
-    // NOTE (commit 1 of 2): PRE-FIX whole-gap body — downloads the entire
-    // [from, target] range in a SINGLE step and never frees between
-    // checkpoints. The #2901 regression tests FAIL against this body (peak ==
-    // whole gap; no per-batch free). Commit 2 replaces it with the
-    // per-checkpoint stream-and-free loop.
-    let (batch, _new_lcl_seq) = step(state, from, target).await?;
-    let _hold = batch;
-    Ok(target)
+    let mut batch_from = from;
+    while batch_from < target {
+        // One checkpoint's worth of apply ledgers: [batch_from+1, batch_to].
+        let batch_to = std::cmp::min(
+            crate::checkpoint::checkpoint_containing(batch_from.saturating_add(1)),
+            target,
+        );
+
+        let (batch, new_lcl_seq) = step(state, batch_from, batch_to).await?;
+
+        // Free this batch's tx/result bodies before the next download — this is
+        // what bounds peak RSS to ~one checkpoint.
+        drop(batch);
+
+        if new_lcl_seq <= batch_from {
+            // No forward progress — guard against an infinite loop.
+            return Err(HistoryError::CatchupFailed(format!(
+                "replay made no progress at ledger {} (target {})",
+                batch_from, target
+            )));
+        }
+        batch_from = new_lcl_seq;
+    }
+    Ok(batch_from)
 }
 
 /// Per-attempt mutable context threaded through [`drive_replay_batches`] for
