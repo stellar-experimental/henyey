@@ -1400,6 +1400,18 @@ def main() -> int:
     prev = parse_prom(prev_path)
 
     state_dir = Path(args.state_dir)
+    # Reject a relative --state-dir (#3201). A relative path resolves against the
+    # caller's cwd; when invoked from the repo root with e.g. `--state-dir metrics`
+    # it drops state files (gauge_persistence, scrape_identity, ...) into the
+    # tracked metrics/ dir, dirtying the working tree and hard-blocking the deploy
+    # gate. Reject (not abspath) — abspath("metrics") from the repo root still
+    # lands in the tree, so only rejection forces an absolute path under ~/data.
+    if not state_dir.is_absolute():
+        print(
+            f"ERROR: --state-dir must be an absolute path, got relative: {args.state_dir}",
+            file=sys.stderr,
+        )
+        return 1
     state_dir.mkdir(parents=True, exist_ok=True)
 
     # Persistence state for gauge for_ticks

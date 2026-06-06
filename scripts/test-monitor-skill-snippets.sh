@@ -45,7 +45,7 @@ cleanup  # ensure fresh state
 mkdir -p "$TEST_ROOT"
 
 # ── TAP state ────────────────────────────────────────────────────────────────
-TAP_PLAN=319
+TAP_PLAN=321
 TAP_CURRENT=0
 TAP_FAILURES=0
 
@@ -3123,6 +3123,79 @@ PYEOF
     fi
   else
     tap_not_ok "eval-alarms: --validate-only" \
+      "Missing eval-alarms.py or metric-alarms.toml"
+  fi
+
+  # Test 146a (regression #3201): monitor/evaluator state files under repo-root
+  # metrics/ are ignored by .gitignore so a stray write can't dirty the tree and
+  # hard-block the deploy gate. The anchored (leading-/) block must NOT ignore
+  # the tracked dashboards in metrics/ nor any crates/*/metrics path.
+  #
+  # check-ignore must run from the repo root (the .gitignore anchors are
+  # repo-root-relative). Names enumerated here EXACTLY match the .gitignore
+  # block (deduped); archive/ is a directory entry, checked via a path under it.
+  local ci_ok=true ci_detail=""
+  local stray_names=(
+    "current.prom"
+    "prev.prom"
+    "gauge_persistence"
+    "scrape_identity"
+    "counter_streak_snapshot"
+    "ratio_snapshot"
+    "counter_dynamic_snapshot"
+    "anomaly_cooldown.json"
+    "archive/some-file"
+  )
+  local n
+  for n in "${stray_names[@]}"; do
+    if ! git -C "$REPO_ROOT" check-ignore -q "metrics/$n"; then
+      ci_ok=false
+      ci_detail+="metrics/$n NOT ignored; "
+    fi
+  done
+  # Over-broad-pattern guard: the tracked dashboard must NOT be ignored.
+  if git -C "$REPO_ROOT" check-ignore -q "metrics/henyey-dashboard.json"; then
+    ci_ok=false
+    ci_detail+="metrics/henyey-dashboard.json IS ignored (over-broad); "
+  fi
+  # The anchored block must not leak into crate-local metrics dirs.
+  if git -C "$REPO_ROOT" check-ignore -q "crates/foo/metrics/gauge_persistence"; then
+    ci_ok=false
+    ci_detail+="crates/foo/metrics/gauge_persistence IS ignored (anchor leaked); "
+  fi
+  if [[ "$ci_ok" == "true" ]]; then
+    tap_ok "gitignore: monitor state under /metrics is ignored; tracked dashboards are not"
+  else
+    tap_not_ok "gitignore: monitor state under /metrics is ignored; tracked dashboards are not" \
+      "$ci_detail"
+  fi
+
+  # Test 146b (regression #3201): eval-alarms.py rejects a RELATIVE --state-dir.
+  # A relative `--state-dir metrics` resolves against the repo-root cwd and drops
+  # state files (gauge_persistence, ...) into the tracked metrics/ dir. The guard
+  # must reject (not abspath) with a non-zero exit and write nothing. Run in a
+  # subshell cd'd into a temp dir so the test itself can never dirty the repo.
+  if [[ -f "$eval_script" && -f "$catalog_file" ]]; then
+    local rel_tmp rel_current rel_rc
+    rel_tmp=$(mktemp -d)
+    rel_current="$rel_tmp/current.prom"
+    echo "# empty" > "$rel_current"
+    rel_rc=0
+    (
+      cd "$rel_tmp" || exit 99
+      MONITOR_MODE=validator UPTIME_SECONDS=900 WARMUP_TICKS_REMAINING=0 \
+        python3 "$eval_script" --catalog "$catalog_file" \
+        --current "$rel_current" --state-dir metrics >/dev/null 2>&1
+    ) || rel_rc=$?
+    if [[ "$rel_rc" -ne 0 && ! -e "$rel_tmp/metrics/gauge_persistence" && ! -d "$rel_tmp/metrics" ]]; then
+      tap_ok "eval-alarms: relative --state-dir is rejected (non-zero exit, nothing written)"
+    else
+      tap_not_ok "eval-alarms: relative --state-dir is rejected (non-zero exit, nothing written)" \
+        "rc=$rel_rc; metrics dir exists: $([[ -d "$rel_tmp/metrics" ]] && echo yes || echo no)"
+    fi
+    rm -rf "$rel_tmp"
+  else
+    tap_not_ok "eval-alarms: relative --state-dir is rejected (non-zero exit, nothing written)" \
       "Missing eval-alarms.py or metric-alarms.toml"
   fi
 
