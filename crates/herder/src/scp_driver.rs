@@ -1959,7 +1959,7 @@ impl ScpDriver {
     /// 1. Collect upgrades from ALL candidates, merging by taking max of each type
     /// 2. Select the best tx set using compareTxSets (size comparison + tiebreak)
     /// 3. Compose result: best candidate's txSetHash/closeTime + merged upgrades
-    pub fn combine_candidates_impl(&self, _slot: SlotIndex, values: &[Value]) -> Value {
+    pub fn combine_candidates_impl(&self, slot: SlotIndex, values: &[Value]) -> Value {
         if values.is_empty() {
             return Value::default();
         }
@@ -2069,9 +2069,27 @@ impl ScpDriver {
             .collect();
 
         if selectable_candidates.is_empty() {
-            panic!(
-                "BUG: no selectable candidate in combineCandidates after previousLedgerHash filter"
+            // Issue #3220: no candidate's previousLedgerHash matches the current
+            // LCL. This is a benign catchup-vs-nomination race: catchup (or the
+            // INV-H2 corrective tracking advance) moved LCL past the slot being
+            // nominated, so every candidate references the now-superseded
+            // pre-catchup LCL. Bail gracefully with an empty Value rather than
+            // crashing the validator with a process-fatal panic. The empty Value
+            // is mapped to `None` by the `SCPDriver::combine_candidates` wrapper
+            // (HerderScpCallback::combine_candidates), and the sole caller
+            // `NominationProtocol::update_composite` treats `None` as a no-op,
+            // abandoning the superseded slot. This is the behaviorally faithful
+            // equivalent of stellar-core's recoverable handling at
+            // HerderSCPDriver.cpp:800-804 (a `throw std::runtime_error`, not a
+            // process-fatal releaseAssert) — stellar-core's synchronous design
+            // makes that path effectively unreachable, but henyey's async
+            // catchup legitimately reaches it.
+            tracing::warn!(
+                slot,
+                "combineCandidates: no candidate matches current LCL \
+                 (catchup advanced past slot); returning no combined value"
             );
+            return Value::default();
         }
 
         // Phase 4: Sort and select best candidate.
@@ -6781,13 +6799,14 @@ mod tests {
         );
     }
 
-    /// Issue #2817: single stale candidate must panic (fail-loud), not return
-    /// values[0] as defensive fallback.
+    /// Issue #3220: a single stale candidate (its `previous_ledger_hash` no
+    /// longer matches the current LCL because catchup/INV-H2 advanced LCL past
+    /// the nominated slot) must NOT crash the validator. The
+    /// no-surviving-candidate path returns an empty `Value` (which the
+    /// `SCPDriver::combine_candidates` wrapper maps to `None`, a clean no-op for
+    /// the superseded slot). This replaces the former process-fatal panic.
     #[test]
-    #[should_panic(
-        expected = "BUG: no selectable candidate in combineCandidates after previousLedgerHash filter"
-    )]
-    fn test_combine_candidates_panics_when_single_candidate_is_stale() {
+    fn test_combine_candidates_returns_empty_when_single_candidate_stale() {
         use henyey_bucket::{BucketList, HotArchiveBucketList};
         use henyey_ledger::{compute_header_hash, LedgerManagerConfig};
         use stellar_xdr::curr::{
@@ -6851,17 +6870,22 @@ mod tests {
         };
         let v_stale = encode_sv(&sv_stale);
 
-        // Must panic — no longer returns defensive fallback
-        let _ = driver.combine_candidates_impl(1, &[v_stale]);
+        // Issue #3220: must return an empty Value (graceful bail), not panic.
+        let result = driver.combine_candidates_impl(1, &[v_stale]);
+        assert!(
+            result.0.is_empty(),
+            "no-surviving-candidate must return empty Value, got {} bytes",
+            result.0.len()
+        );
     }
 
-    /// Issue #2817: all candidates stale must panic (fail-loud), not return
-    /// values[0] as defensive fallback.
+    /// Issue #3220: when ALL candidates are stale (every
+    /// `previous_ledger_hash` references a pre-catchup LCL), the
+    /// no-surviving-candidate path must return an empty `Value` rather than
+    /// crashing the validator. This is the exact catchup-vs-nomination race
+    /// from the production crash. Replaces the former process-fatal panic.
     #[test]
-    #[should_panic(
-        expected = "BUG: no selectable candidate in combineCandidates after previousLedgerHash filter"
-    )]
-    fn test_combine_candidates_panics_when_all_candidates_are_stale() {
+    fn test_combine_candidates_returns_empty_when_all_candidates_stale() {
         use henyey_bucket::{BucketList, HotArchiveBucketList};
         use henyey_ledger::{compute_header_hash, LedgerManagerConfig};
         use stellar_xdr::curr::{
@@ -6939,8 +6963,94 @@ mod tests {
         let v1 = encode_sv(&sv_1);
         let v2 = encode_sv(&sv_2);
 
-        // Must panic — no longer returns defensive fallback
-        let _ = driver.combine_candidates_impl(1, &[v1, v2]);
+        // Issue #3220: all-stale must return an empty Value (graceful bail),
+        // not panic.
+        let result = driver.combine_candidates_impl(1, &[v1, v2]);
+        assert!(
+            result.0.is_empty(),
+            "all-stale candidates must return empty Value, got {} bytes",
+            result.0.len()
+        );
+    }
+
+    /// Issue #3220 (consensus-safety guarantee): the empty `Value` returned by
+    /// the no-surviving-candidate path must propagate through the
+    /// `SCPDriver::combine_candidates` trait wrapper as `None`, so the sole
+    /// caller (`NominationProtocol::update_composite`) sees a clean no-op for
+    /// the superseded slot instead of a malformed combined value.
+    #[test]
+    fn test_combine_candidates_empty_return_maps_to_none_via_wrapper() {
+        use henyey_bucket::{BucketList, HotArchiveBucketList};
+        use henyey_ledger::{compute_header_hash, LedgerManagerConfig};
+        use stellar_xdr::curr::{
+            Hash, LedgerHeader, LedgerHeaderExt, StellarValue, StellarValueExt, TimePoint, VecM,
+        };
+
+        let lm_config = LedgerManagerConfig {
+            validate_bucket_hash: false,
+            ..Default::default()
+        };
+        let lm = henyey_ledger::LedgerManager::new("Test Network".to_string(), lm_config);
+        let lcl_header = LedgerHeader {
+            ledger_version: 25,
+            previous_ledger_hash: Hash([0u8; 32]),
+            scp_value: StellarValue {
+                tx_set_hash: Hash([0u8; 32]),
+                close_time: TimePoint(0),
+                upgrades: VecM::default(),
+                ext: StellarValueExt::Basic,
+            },
+            tx_set_result_hash: Hash([0u8; 32]),
+            bucket_list_hash: Hash([0u8; 32]),
+            ledger_seq: 1,
+            total_coins: 1_000_000,
+            fee_pool: 0,
+            inflation_seq: 0,
+            id_pool: 0,
+            base_fee: 100,
+            base_reserve: 100,
+            max_tx_set_size: 100,
+            skip_list: [
+                Hash([0u8; 32]),
+                Hash([0u8; 32]),
+                Hash([0u8; 32]),
+                Hash([0u8; 32]),
+            ],
+            ext: LedgerHeaderExt::V0,
+        };
+        let lcl_hash = compute_header_hash(&lcl_header).expect("hash");
+        lm.initialize(
+            BucketList::new(),
+            HotArchiveBucketList::new(),
+            lcl_header,
+            lcl_hash,
+        )
+        .expect("init");
+
+        let driver = make_test_driver_with_lm(Arc::new(lm));
+
+        // One stale candidate (previous_ledger_hash != current LCL).
+        let stale_lcl = Hash256::from_bytes([0xCC; 32]);
+        let tx_set_stale = TransactionSet::new(stale_lcl, vec![]);
+        let hash_stale = *tx_set_stale.hash();
+        driver.cache_tx_set(tx_set_stale);
+
+        let sv_stale = StellarValue {
+            tx_set_hash: stellar_xdr::curr::Hash(hash_stale.0),
+            close_time: TimePoint(1_700_000_000),
+            upgrades: VecM::default(),
+            ext: StellarValueExt::Basic,
+        };
+        let v_stale = encode_sv(&sv_stale);
+
+        // Drive the SCPDriver trait wrapper (not the inherent _impl): all-stale
+        // candidates must surface to the caller as `None`.
+        let callback = HerderScpCallback::new(Arc::new(driver));
+        let combined = callback.combine_candidates(1, &[v_stale]);
+        assert!(
+            combined.is_none(),
+            "all-stale candidates must map to None at the SCPDriver wrapper"
+        );
     }
 
     // ========== Deferred-causes regression tests (issue #2096 / H-014) =========
