@@ -466,6 +466,86 @@ impl CatchupManager {
         Ok((data, knit_entries, last_archive_name))
     }
 
+    /// Download ONLY the ledger headers (plus knit-prefix entries) for the
+    /// full `[from_ledger+1, to_ledger]` range, used by the up-front
+    /// header-chain verification phase (#2901).
+    ///
+    /// Mirrors the header-extraction half of [`download_ledger_data`] but
+    /// discards the per-checkpoint transaction/result bodies as soon as the
+    /// headers have been copied out, so peak memory is bounded to ~one
+    /// checkpoint of body data rather than the whole gap. The headers
+    /// themselves (small, fixed-size records) are retained for the full
+    /// range so [`verify::verify_reverse_walk`] can thread trust top-down
+    /// across all checkpoints exactly as before.
+    ///
+    /// Returns `(headers, knit_entries, archive_name)`. `headers` covers the
+    /// apply range `[from_ledger+1, to_ledger]` in ascending order;
+    /// `knit_entries` covers `[knit_start, from_ledger]` (the §11.2 knit
+    /// prefix). This matches the apply/knit split produced by
+    /// [`download_ledger_data`] so the two phases stay in lockstep.
+    pub(super) async fn download_ledger_headers(
+        &mut self,
+        from_ledger: u32,
+        to_ledger: u32,
+        pinned: Option<&Arc<HistoryArchive>>,
+    ) -> Result<(Vec<LedgerHeader>, Vec<LedgerHeaderHistoryEntry>, String)> {
+        let mut headers: Vec<LedgerHeader> = Vec::new();
+        let mut knit_entries: Vec<LedgerHeaderHistoryEntry> = Vec::new();
+        let mut last_archive_name = "none".to_owned();
+
+        let apply_start = from_ledger.saturating_add(1);
+        let knit_start = if from_ledger == 0 {
+            apply_start
+        } else {
+            let apply_ckpt_start = crate::checkpoint::checkpoint_start(apply_start);
+            std::cmp::max(apply_ckpt_start, from_ledger.saturating_sub(1))
+        };
+
+        if apply_start > to_ledger {
+            return Ok((headers, knit_entries, last_archive_name));
+        }
+
+        // Walk checkpoint-by-checkpoint. Each checkpoint's full data (headers
+        // + tx/result bodies) is downloaded, the relevant headers are copied
+        // out, and the bodies are dropped at the end of the checkpoint block —
+        // bounding peak body memory to a single checkpoint.
+        let mut seq = knit_start;
+        while seq <= to_ledger {
+            let checkpoint = checkpoint::checkpoint_containing(seq);
+            let (cache, archive_name) = self
+                .download_checkpoint_ledger_data(checkpoint, pinned)
+                .await?;
+            last_archive_name = archive_name;
+
+            let checkpoint_end = std::cmp::min(checkpoint, to_ledger);
+            for s in seq..=checkpoint_end {
+                self.progress.current_ledger = s;
+                let header_entry_opt = cache.headers.iter().find(|h| h.header.ledger_seq == s);
+                if s < apply_start {
+                    // Knit-prefix entry: collected if present, silently skipped
+                    // otherwise (same policy as `download_ledger_data`).
+                    if let Some(entry) = header_entry_opt {
+                        knit_entries.push(entry.clone());
+                    }
+                    continue;
+                }
+                let header_entry = header_entry_opt.ok_or_else(|| {
+                    HistoryError::CatchupFailed(format!(
+                        "ledger {} not found in checkpoint headers",
+                        s
+                    ))
+                })?;
+                headers.push(header_entry.header.clone());
+            }
+
+            // Free this checkpoint's bodies before fetching the next checkpoint.
+            drop(cache);
+            seq = checkpoint_end.saturating_add(1);
+        }
+
+        Ok((headers, knit_entries, last_archive_name))
+    }
+
     /// Download ledger headers, transactions, and results for a checkpoint.
     ///
     /// Stage E instrumentation: emits
