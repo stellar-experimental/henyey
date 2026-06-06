@@ -19,6 +19,7 @@ Outputs:
     stdout: JSON (schema_version=1) with alarms array + aggregate lines
     stderr: per-alarm telemetry (# alarm=NAME metric=METRIC series_matched=N state=STATE)
     Side effects: writes updated snapshot files in --state-dir
+                  (suppressed by --no-snapshot-write for a read-only dry-run)
 
 Exit codes:
     0 = success
@@ -40,6 +41,17 @@ except ImportError:
     import tomli as tomllib  # type: ignore[no-redef]
 
 SCHEMA_VERSION = 1
+
+# When True (set by --no-snapshot-write in main()), write_snapshot() becomes a
+# no-op so the evaluator runs as a TRUE read-only dry-run: it evaluates against
+# the existing on-disk snapshots and emits identical JSON/telemetry, but
+# persists nothing. This is the single chokepoint for ALL stateful writes
+# (counter_streak_snapshot, ratio_snapshot, counter_dynamic_snapshot,
+# gauge_persistence, and the maybe_reset_counter_snapshot reset paths), so
+# gating it here suppresses every side effect at once — letting a diagnostic or
+# repeat invocation within a tick re-evaluate without consuming the delta.
+_NO_SNAPSHOT_WRITE = False
+
 VALID_KINDS = {
     "gauge", "gauge-ratio", "counter", "counter-dynamic",
     "counter-ratio", "histogram-p99", "counter-streak",
@@ -288,7 +300,16 @@ def read_snapshot(path: Path) -> dict[str, str]:
 
 
 def write_snapshot(path: Path, data: dict[str, str]) -> None:
-    """Write a key=value snapshot file atomically via rename."""
+    """Write a key=value snapshot file atomically via rename.
+
+    No-op when _NO_SNAPSHOT_WRITE is set (--no-snapshot-write): the in-memory
+    snapshot/persistence dicts the callers built are still updated locally —
+    harmless for this single-shot process since nothing reads them after exit —
+    but nothing is persisted, so the on-disk delta is not consumed. A future
+    in-process loop that re-reads state would need to revisit this.
+    """
+    if _NO_SNAPSHOT_WRITE:
+        return
     path.parent.mkdir(parents=True, exist_ok=True)
     lines = [f"{k}={v}" for k, v in data.items()]
     tmp = path.with_suffix(".tmp")
@@ -1356,7 +1377,17 @@ def main() -> int:
     parser.add_argument("--prev", default=None, help="Path to prev.prom")
     parser.add_argument("--state-dir", default=None, help="Directory for snapshot files")
     parser.add_argument("--validate-only", action="store_true", help="Only validate schema, don't evaluate")
+    parser.add_argument(
+        "--no-snapshot-write",
+        action="store_true",
+        help="Evaluate without persisting any snapshot/state files (read-only "
+             "dry-run for diagnostic/repeat invocations within a tick)",
+    )
     args = parser.parse_args()
+
+    # Gate the single write_snapshot() chokepoint for the whole process.
+    global _NO_SNAPSHOT_WRITE
+    _NO_SNAPSHOT_WRITE = args.no_snapshot_write
 
     # Validate-only mode only needs --catalog
     if not args.validate_only:

@@ -45,7 +45,7 @@ cleanup  # ensure fresh state
 mkdir -p "$TEST_ROOT"
 
 # ── TAP state ────────────────────────────────────────────────────────────────
-TAP_PLAN=321
+TAP_PLAN=325
 TAP_CURRENT=0
 TAP_FAILURES=0
 
@@ -3862,6 +3862,120 @@ except:
   fi
   rm -f "$tick_prom_148d"
   rm -rf "$state_dir_148d"
+
+  # Test 148e: --no-snapshot-write read-only dry-run (#3209).
+  # Regression for the double-run masking bug: the evaluator mutates its streak
+  # snapshot on EVERY run, so a second run within a tick compares the
+  # just-written snapshot against itself (delta consumed) and masks the
+  # recovery-stalled WARN that the first run fired (the #3206 alarm). The fix
+  # adds --no-snapshot-write so a diagnostic/repeat invocation re-evaluates
+  # against the existing on-disk snapshot without consuming the delta.
+  #
+  # Fixture mirrors 148c: pre-seed a PRE-restart snapshot (pid=1000), then feed
+  # a first post-restart observation (PID 2000, accrued stall 213) that fires
+  # recovery-stalled via the post_restart_absolute_threshold=50 path.
+  rs_state_of() {
+    # $1 = evaluator stdout JSON; prints the recovery-stalled alarm state.
+    echo "$1" | python3 -c "
+import json, sys
+try:
+    data = json.load(sys.stdin)
+    for r in data.get('alarms', []):
+        if r.get('name') == 'recovery-stalled':
+            print(r.get('state', 'missing'))
+            break
+    else:
+        print('not-found')
+except:
+    print('parse-error')
+" 2>/dev/null || echo "parse-error"
+  }
+  seed_148e_snapshot() {
+    # $1 = state-dir; (re)write the PRE-restart snapshot fixture.
+    mkdir -p "$1/metrics"
+    cat > "$1/metrics/counter_streak_snapshot" <<'SNAP_148E'
+version=1
+pid=1000
+start_ticks=1000
+counter_value=0
+breach_streak=0
+SNAP_148E
+  }
+  local state_dir_148e tick_prom_148e
+  state_dir_148e=$(mktemp -d)
+  tick_prom_148e=$(mktemp)
+  cat > "$tick_prom_148e" <<'TICK_PROM_148E'
+henyey_recovery_stalled_tick_total{reason="forcing_catchup_behind"} 213
+TICK_PROM_148E
+
+  # Run 1 (no flag): the canonical per-tick run — fires AND advances the
+  # snapshot (consumes the delta).
+  seed_148e_snapshot "$state_dir_148e"
+  local out1_148e rs1_148e
+  out1_148e=$(MONITOR_MODE=validator UPTIME_SECONDS=900 WARMUP_TICKS_REMAINING=0 \
+    PID=2000 START_TICKS=2000 \
+    python3 "$eval_script" \
+    --catalog "$catalog_file" \
+    --current "$tick_prom_148e" \
+    --state-dir "$state_dir_148e" 2>/dev/null) || true
+  rs1_148e=$(rs_state_of "$out1_148e")
+  if [[ "$rs1_148e" == "firing" ]]; then
+    tap_ok "eval-alarms: --no-snapshot-write run 1 (no flag) fires recovery-stalled (213 → firing)"
+  else
+    tap_not_ok "eval-alarms: --no-snapshot-write run 1 (no flag) fires recovery-stalled" \
+      "expected firing, got $rs1_148e"
+  fi
+
+  # Run 2 (no flag, SAME inputs, NO re-seed): documents the masking bug. The
+  # snapshot was advanced by run 1, so the delta is consumed and the alarm is
+  # masked (state != firing).
+  local out2_148e rs2_148e
+  out2_148e=$(MONITOR_MODE=validator UPTIME_SECONDS=900 WARMUP_TICKS_REMAINING=0 \
+    PID=2000 START_TICKS=2000 \
+    python3 "$eval_script" \
+    --catalog "$catalog_file" \
+    --current "$tick_prom_148e" \
+    --state-dir "$state_dir_148e" 2>/dev/null) || true
+  rs2_148e=$(rs_state_of "$out2_148e")
+  if [[ "$rs2_148e" != "firing" ]]; then
+    tap_ok "eval-alarms: --no-snapshot-write run 2 (no flag) masks recovery-stalled (delta consumed → $rs2_148e)"
+  else
+    tap_not_ok "eval-alarms: --no-snapshot-write run 2 (no flag) masks recovery-stalled" \
+      "expected masked (delta consumed by run 1), got firing"
+  fi
+
+  # Run 3 (--no-snapshot-write) against a FRESH re-seed of the PRE-restart
+  # snapshot: the alarm must STILL fire AND the snapshot file must be left
+  # BYTE-unchanged (delta not consumed). These two are the decisive fix
+  # assertions. Fails on origin/main: --no-snapshot-write is an unknown arg,
+  # so parse_args() exits non-zero, out3 is empty, and rs3 != firing.
+  seed_148e_snapshot "$state_dir_148e"
+  local snap_before_148e
+  snap_before_148e=$(cat "$state_dir_148e/metrics/counter_streak_snapshot")
+  local out3_148e rs3_148e snap_after_148e
+  out3_148e=$(MONITOR_MODE=validator UPTIME_SECONDS=900 WARMUP_TICKS_REMAINING=0 \
+    PID=2000 START_TICKS=2000 \
+    python3 "$eval_script" \
+    --catalog "$catalog_file" \
+    --current "$tick_prom_148e" \
+    --state-dir "$state_dir_148e" \
+    --no-snapshot-write 2>/dev/null) || true
+  rs3_148e=$(rs_state_of "$out3_148e")
+  if [[ "$rs3_148e" == "firing" ]]; then
+    tap_ok "eval-alarms: --no-snapshot-write run 3 (with flag) still fires recovery-stalled (213 → firing)"
+  else
+    tap_not_ok "eval-alarms: --no-snapshot-write run 3 (with flag) still fires recovery-stalled" \
+      "expected firing with --no-snapshot-write, got $rs3_148e (unknown flag on origin/main?)"
+  fi
+  snap_after_148e=$(cat "$state_dir_148e/metrics/counter_streak_snapshot")
+  if [[ "$snap_before_148e" == "$snap_after_148e" ]]; then
+    tap_ok "eval-alarms: --no-snapshot-write leaves counter_streak_snapshot byte-unchanged"
+  else
+    tap_not_ok "eval-alarms: --no-snapshot-write leaves counter_streak_snapshot byte-unchanged" \
+      "snapshot mutated despite --no-snapshot-write"
+  fi
+  rm -f "$tick_prom_148e"
+  rm -rf "$state_dir_148e"
 
   # Test 149: alarm-surfaces.toml file-local invariants + mirrored UIDs
   #           resolve to real Grafana alert UIDs in henyey-slo-alerts.yaml.
