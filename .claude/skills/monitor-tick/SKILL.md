@@ -1506,6 +1506,8 @@ Otherwise enter the deploy path:
    - `docs/`
    - `metrics/` (dashboards, alerts, observability docs — no runtime impact)
    - root-level `*.md` files, e.g. `README.md` or `CLAUDE.md`
+   - root-level git metadata dotfiles that never compile into the binary:
+     `.gitignore`, `.gitattributes`, `.gitmodules`
    - `stellar-specs` / `stellar-specs/` submodule pointer changes only
 
    Deny by default: if any path is outside this allowlist, continue to the CI,
