@@ -373,7 +373,7 @@ impl CatchupManager {
 
     /// Set an SCP-derived trusted anchor for reverse-walk verification (§9.1 + INV-C5).
     ///
-    /// When set, `verify_downloaded_data` builds `ReverseWalkConfig` with
+    /// When set, `verify_header_chain` builds `ReverseWalkConfig` with
     /// `TrustSource::Scp { seq, hash }` instead of the default `TrustSource::None`.
     /// This makes local-state disagreement during header-chain verification a
     /// fatal (non-retriable) error, matching stellar-core's online catchup behavior
