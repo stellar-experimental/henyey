@@ -686,6 +686,34 @@ mod tests {
         }
     }
 
+    /// Re-open an `App` against a just-dropped `App`'s db directory, tolerating the
+    /// sub-millisecond fd-close-vs-reopen window on the fs2 advisory db lockfile.
+    ///
+    /// `App::new` (→ `acquire_db_lock`) is intentionally single-shot in production so
+    /// real cross-process lock contention fails fast. This helper is TEST-ONLY: the
+    /// drop-then-reopen-same-db-dir-in-process pattern is unique to these tests, and
+    /// under CI scheduling pressure the first `App::new` can race the dropped app's
+    /// lockfile fd close (`mod.rs:1579` "database is locked"). We retry only on that
+    /// specific lock error with a short backoff and a bounded deadline; any OTHER
+    /// error is surfaced immediately so we never mask a real failure, and a lock that
+    /// genuinely never releases still panics with the original lockfile error rather
+    /// than hanging. Mirrors the bounded-poll idiom of `wait_for_publish_*` above.
+    async fn reopen_app_after_drop(config: crate::config::AppConfig) -> App {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            match App::new(config.clone()).await {
+                Ok(app) => return app,
+                Err(e) if e.to_string().contains("database is locked") => {
+                    if tokio::time::Instant::now() >= deadline {
+                        panic!("App::new never re-acquired the db lock within deadline: {e}");
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                Err(e) => panic!("App::new failed with non-lock error: {e}"),
+            }
+        }
+    }
+
     #[test]
     fn app_runtime_does_not_reconstruct_bucket_manager_from_config() {
         let app_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/app");
@@ -980,7 +1008,7 @@ mod tests {
         } = fixture;
         drop(app);
 
-        let second_app = App::new(config).await.unwrap();
+        let second_app = reopen_app_after_drop(config).await;
         assert_eq!(
             second_app.load_last_known_ledger().await.unwrap(),
             RestoreResult::Restored
