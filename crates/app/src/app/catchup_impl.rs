@@ -1282,21 +1282,27 @@ impl App {
     /// normal TriggerCatchup is preferred; when HardReset cooldown is active,
     /// falls back to AttemptRecovery — see #1843):
     ///
-    /// | catchup_in_progress | archive_behind | rec_exhausted | tx_set_ex | stuck≥120s | cooldown | schedule_due | Action |
-    /// |---|---|---|---|---|---|---|---|
-    /// | true  | *     | *    | *     | *     | *    | true (ab)  | AttemptRecovery |
-    /// | true  | *     | *    | *     | *     | *    | false      | Wait |
-    /// | false | true  | true | -     | -     | false| true       | HardReset(RecoveryExhausted) |
-    /// | false | true  | true | -     | -     | true | true       | AttemptRecovery |
-    /// | false | true  | -    | true  | -     | false| true       | HardReset(TxSetExhausted) |
-    /// | false | true  | -    | true  | -     | true | true       | AttemptRecovery |
-    /// | false | true  | -    | -     | true  | false| true       | HardReset(StallWallClock) |
-    /// | false | true  | -    | -     | true  | true | true       | AttemptRecovery |
-    /// | false | true  | false| false | false | *    | true       | AttemptRecovery |
-    /// | false | true  | *    | *     | *     | *    | false      | Wait |
-    /// | false | false | true | *     | *     | *    | -          | TriggerCatchup |
-    /// | false | false | false| *     | *     | *    | true       | AttemptRecovery |
-    /// | false | false | false| *     | *     | *    | false      | Wait |
+    /// `making_progress` (#3204) is `recovery_making_progress`: true while the
+    /// verified peer gap is strictly shrinking (peer-SCP back-fill is closing
+    /// the gap). It suppresses ONLY the count-based RecoveryExhausted reset; the
+    /// 120s wall-clock backstop (#2789) and tx_set exhaustion stay armed.
+    ///
+    /// | catchup_in_progress | archive_behind | rec_exhausted | making_progress | tx_set_ex | stuck≥120s | cooldown | schedule_due | Action |
+    /// |---|---|---|---|---|---|---|---|---|
+    /// | true  | *     | *    | *    | *     | *     | *    | true (ab)  | AttemptRecovery |
+    /// | true  | *     | *    | *    | *     | *     | *    | false      | Wait |
+    /// | false | true  | true | false| -     | -     | false| true       | HardReset(RecoveryExhausted) |
+    /// | false | true  | true | true | -     | -     | false| true       | AttemptRecovery (#3204) |
+    /// | false | true  | true | *    | -     | -     | true | true       | AttemptRecovery |
+    /// | false | true  | -    | *    | true  | -     | false| true       | HardReset(TxSetExhausted) |
+    /// | false | true  | -    | *    | true  | -     | true | true       | AttemptRecovery |
+    /// | false | true  | -    | *    | -     | true  | false| true       | HardReset(StallWallClock) |
+    /// | false | true  | -    | *    | -     | true  | true | true       | AttemptRecovery |
+    /// | false | true  | false| *    | false | false | *    | true       | AttemptRecovery |
+    /// | false | true  | *    | *    | *     | *     | *    | false      | Wait |
+    /// | false | false | true | *    | *     | *     | *    | -          | TriggerCatchup |
+    /// | false | false | false| *    | *     | *     | *    | true       | AttemptRecovery |
+    /// | false | false | false| *    | *     | *     | *    | false      | Wait |
     fn decide_consensus_stuck_action(s: StuckSignals) -> ConsensusStuckAction {
         let recovery_exhausted = s.recovery_attempts >= MAX_POST_CATCHUP_RECOVERY_ATTEMPTS;
 
@@ -1355,7 +1361,19 @@ impl App {
                     // HardReset already cleared stale state; repeating it
                     // before the cooldown expires is futile. Preserves #1843.
                     ConsensusStuckAction::AttemptRecovery
-                } else if recovery_exhausted {
+                } else if recovery_exhausted && !s.recovery_making_progress {
+                    // #3204: the count-based cap fires ONLY when peer-SCP
+                    // back-fill has stalled (peer_gap stopped strictly
+                    // shrinking for RECOVERY_ZERO_PROGRESS_ESCALATION_ATTEMPTS
+                    // ticks). While the verified peer gap is shrinking, #3199's
+                    // back-fill is demonstrably making progress, so we keep
+                    // driving peer-SCP recovery instead of discarding it with a
+                    // hard reset. This restores stellar-core's uncapped
+                    // out-of-sync recovery (HerderImpl::outOfSyncRecovery). The
+                    // suppression is count-cap-only: the 120s wall-clock
+                    // backstop below (#2789) and tx_set exhaustion stay armed,
+                    // and the progress signal (peer_gap-shrink) never touches
+                    // stuck_start, so the 120s ceiling cannot be wedged open.
                     ConsensusStuckAction::HardReset(HardResetReason::ArchiveBehindRecoveryExhausted)
                 } else if s.tx_set_exhausted {
                     ConsensusStuckAction::HardReset(HardResetReason::ArchiveBehindTxSetExhausted)
@@ -2033,6 +2051,14 @@ impl App {
                     let near_tip = peer_gap >= PEER_AHEAD_ESCALATION_THRESHOLD
                         && peer_gap < checkpoint_frequency() as u64;
 
+                    // #3204: progress-aware suppression of the count-based
+                    // recovery_exhausted HardReset. See
+                    // `update_recovery_gap_progress` for the full rationale —
+                    // the progress signal is peer_gap-shrink ONLY (never
+                    // current_ledger advance), so it cannot re-key stuck_start
+                    // and the 120s wall-clock backstop (#2789) stays armed.
+                    let recovery_making_progress = self.update_recovery_gap_progress(peer_gap);
+
                     let signals = StuckSignals {
                         catchup_in_progress: self.catchup_in_progress.load(Ordering::SeqCst),
                         archive_behind,
@@ -2042,6 +2068,7 @@ impl App {
                         recovery_attempts: effective_attempts,
                         hard_reset_cooldown_active,
                         near_tip,
+                        recovery_making_progress,
                     };
 
                     let decision = Self::decide_consensus_stuck_action(signals);
@@ -2947,15 +2974,40 @@ mod tests {
         since_recovery: u64,
         archive_behind: bool,
     ) -> ConsensusStuckAction {
+        decide_full(
+            catchup_triggered,
+            recovery_attempts,
+            since_recovery,
+            archive_behind,
+            // Existing callers model the steady-state-no-progress case
+            // (peer_gap not shrinking) and a non-stalled wall clock, which
+            // preserves every previously asserted outcome.
+            false,
+            0,
+        )
+    }
+
+    /// Extended helper exposing the two #3204 signals — `recovery_making_progress`
+    /// (peer_gap strictly shrinking → suppress the count cap) and `stuck_duration`
+    /// (the 120s wall-clock backstop arm).
+    fn decide_full(
+        catchup_triggered: bool,
+        recovery_attempts: u32,
+        since_recovery: u64,
+        archive_behind: bool,
+        recovery_making_progress: bool,
+        stuck_duration: u64,
+    ) -> ConsensusStuckAction {
         App::decide_consensus_stuck_action(StuckSignals {
             catchup_in_progress: catchup_triggered,
             archive_behind,
             tx_set_exhausted: false,
             schedule_due: since_recovery >= OUT_OF_SYNC_RECOVERY_TIMER_SECS,
-            stuck_duration: 0,
+            stuck_duration,
             recovery_attempts,
             hard_reset_cooldown_active: false,
             near_tip: false,
+            recovery_making_progress,
         })
     }
 
@@ -3017,6 +3069,133 @@ mod tests {
         ));
     }
 
+    // ================================================================
+    // #3204: progress-aware count cap. While peer_gap is strictly
+    // shrinking (peer-SCP back-fill making progress), the count-based
+    // RecoveryExhausted HardReset is SUPPRESSED; it re-arms only when
+    // peer_gap stops shrinking, and the 120s wall-clock backstop (#2789)
+    // remains independent.
+    // ================================================================
+
+    /// #3204 core fix: archive_behind + recovery_attempts past the cap, but
+    /// peer_gap is strictly shrinking (recovery_making_progress=true) and the
+    /// wall clock is well under 120s → keep driving peer-SCP recovery
+    /// (AttemptRecovery), NOT a hard reset.
+    ///
+    /// FAILS on origin/main (which returns HardReset(ArchiveBehindRecoveryExhausted)
+    /// at attempt 4 regardless of progress); PASSES post-fix. Reproduces the
+    /// #3204 progress-making episode.
+    #[test]
+    fn test_decide_archive_behind_gap_progress_does_not_hard_reset() {
+        let action = decide_full(
+            false,   // catchup not in flight
+            MAX + 1, // recovery_attempts past the cap (observed: 4 vs max 3)
+            TIMER,   // schedule due
+            true,    // archive_behind
+            true,    // recovery_making_progress (peer_gap strictly shrinking)
+            30,      // stuck_duration well under HARD_RESET_STALL_SECS
+        );
+        assert_eq!(
+            action,
+            ConsensusStuckAction::AttemptRecovery,
+            "peer_gap shrinking must suppress the count-based hard reset (#3204)"
+        );
+
+        // Far past the cap and near-tip: still keep driving recovery.
+        let action = decide_full(false, MAX + 50, TIMER, true, true, 0);
+        assert_eq!(action, ConsensusStuckAction::AttemptRecovery);
+    }
+
+    /// #3204 anti-wedge escape 1: when peer_gap STOPS shrinking
+    /// (recovery_making_progress=false) and recovery is exhausted, the genuine
+    /// stall still escalates to HardReset(ArchiveBehindRecoveryExhausted). This
+    /// is the real #3204 episode (gap grew 15→31→48 → never shrank → fires).
+    #[test]
+    fn test_decide_archive_behind_no_gap_progress_escalates() {
+        let action = decide_full(
+            false, MAX,   // exhausted
+            TIMER, // due
+            true,  // archive_behind
+            false, // NOT making progress (peer_gap flat/growing)
+            30,    // under the wall-clock backstop
+        );
+        assert!(
+            matches!(
+                action,
+                ConsensusStuckAction::HardReset(HardResetReason::ArchiveBehindRecoveryExhausted)
+            ),
+            "no peer_gap progress + exhausted must still hard-reset (anti-wedge)"
+        );
+    }
+
+    /// #3204 anti-wedge escape 2 (INDEPENDENCE): the 120s wall-clock backstop
+    /// (#2789) fires HardReset(ArchiveBehindStallWallClock) even when peer_gap
+    /// is still shrinking (recovery_making_progress=true). Proves escape-2 is
+    /// progress-independent — a peer-SCP back-fill that nibbles the gap forever
+    /// without resyncing cannot wedge the node past 120s. The production signal
+    /// is peer_gap-shrink-only and never touches stuck_start, so this ceiling
+    /// stays armed whenever current_ledger is pinned.
+    #[test]
+    fn test_decide_archive_behind_wall_clock_backstop_fires_despite_gap_progress() {
+        let action = decide_full(
+            false,
+            MAX + 100,             // recovery_attempts large
+            TIMER,                 // due
+            true,                  // archive_behind
+            true,                  // STILL making peer_gap progress
+            HARD_RESET_STALL_SECS, // wall clock hit the 120s backstop
+        );
+        assert!(
+            matches!(
+                action,
+                ConsensusStuckAction::HardReset(HardResetReason::ArchiveBehindStallWallClock)
+            ),
+            "120s wall-clock backstop must fire independent of peer_gap progress (#2789)"
+        );
+    }
+
+    /// Orthogonality: tx_set exhaustion HardReset is independent of the #3204
+    /// peer_gap progress suppression. With recovery_making_progress=true and
+    /// tx_set_exhausted=true (and recovery NOT exhausted, so the gap-progress
+    /// arm cannot mask it), the decision is HardReset(ArchiveBehindTxSetExhausted).
+    #[test]
+    fn test_decide_tx_set_exhausted_overrides_gap_progress() {
+        let action = App::decide_consensus_stuck_action(StuckSignals {
+            catchup_in_progress: false,
+            archive_behind: true,
+            tx_set_exhausted: true,
+            schedule_due: true,
+            stuck_duration: 30,
+            recovery_attempts: 0,
+            hard_reset_cooldown_active: false,
+            near_tip: false,
+            recovery_making_progress: true,
+        });
+        assert!(matches!(
+            action,
+            ConsensusStuckAction::HardReset(HardResetReason::ArchiveBehindTxSetExhausted)
+        ));
+    }
+
+    /// #1843 preserved under #3204: when the hard-reset cooldown is active,
+    /// every escalation (including the no-progress RecoveryExhausted path)
+    /// falls back to AttemptRecovery rather than a futile repeat hard reset.
+    #[test]
+    fn test_decide_archive_behind_cooldown_falls_back_even_without_progress() {
+        let action = App::decide_consensus_stuck_action(StuckSignals {
+            catchup_in_progress: false,
+            archive_behind: true,
+            tx_set_exhausted: false,
+            schedule_due: true,
+            stuck_duration: 30,
+            recovery_attempts: MAX,
+            hard_reset_cooldown_active: true,
+            near_tip: false,
+            recovery_making_progress: false,
+        });
+        assert_eq!(action, ConsensusStuckAction::AttemptRecovery);
+    }
+
     #[test]
     fn test_decide_archive_behind_waits_when_not_due() {
         let action = decide(false, MAX, TIMER - 1, true);
@@ -3052,6 +3231,7 @@ mod tests {
             recovery_attempts: 0,
             hard_reset_cooldown_active: false,
             near_tip: false,
+            recovery_making_progress: false,
         });
         assert!(matches!(
             action,
@@ -3071,6 +3251,7 @@ mod tests {
             recovery_attempts: 0,
             hard_reset_cooldown_active: false,
             near_tip: false,
+            recovery_making_progress: false,
         });
         assert!(matches!(
             action,
@@ -3090,6 +3271,7 @@ mod tests {
             recovery_attempts: 0,
             hard_reset_cooldown_active: false,
             near_tip: false,
+            recovery_making_progress: false,
         });
         assert_eq!(action, ConsensusStuckAction::AttemptRecovery);
     }
@@ -3106,6 +3288,7 @@ mod tests {
             recovery_attempts: MAX,
             hard_reset_cooldown_active: false,
             near_tip: false,
+            recovery_making_progress: false,
         });
         assert_eq!(action, ConsensusStuckAction::TriggerCatchup);
     }
@@ -3122,6 +3305,7 @@ mod tests {
             recovery_attempts: MAX,
             hard_reset_cooldown_active: false,
             near_tip: false,
+            recovery_making_progress: false,
         });
         assert!(matches!(
             action,
@@ -3161,6 +3345,7 @@ mod tests {
             recovery_attempts: 0,
             hard_reset_cooldown_active: false,
             near_tip: true,
+            recovery_making_progress: false,
         });
         assert_eq!(
             action,
@@ -3188,6 +3373,7 @@ mod tests {
             recovery_attempts: 0,
             hard_reset_cooldown_active: true,
             near_tip: true,
+            recovery_making_progress: false,
         });
         assert_eq!(
             action,
@@ -3213,6 +3399,7 @@ mod tests {
             recovery_attempts: 0,
             hard_reset_cooldown_active: false,
             near_tip: false,
+            recovery_making_progress: false,
         });
         assert_eq!(
             action,
@@ -3290,6 +3477,7 @@ mod tests {
             recovery_attempts: 0,
             hard_reset_cooldown_active: false,
             near_tip: true,
+            recovery_making_progress: false,
         });
         assert_eq!(
             action,
@@ -3316,6 +3504,7 @@ mod tests {
             recovery_attempts: 0,
             hard_reset_cooldown_active: false,
             near_tip: true,
+            recovery_making_progress: false,
         });
         assert!(
             matches!(
@@ -3340,6 +3529,7 @@ mod tests {
             recovery_attempts: MAX,
             hard_reset_cooldown_active: false,
             near_tip: true,
+            recovery_making_progress: false,
         });
         assert!(
             matches!(
@@ -3364,6 +3554,7 @@ mod tests {
             recovery_attempts: MAX,
             hard_reset_cooldown_active: false,
             near_tip: false,
+            recovery_making_progress: false,
         });
         assert!(
             matches!(
@@ -3389,6 +3580,7 @@ mod tests {
             recovery_attempts: 0,
             hard_reset_cooldown_active: true,
             near_tip: true,
+            recovery_making_progress: false,
         });
         assert_eq!(
             action,
@@ -3410,6 +3602,7 @@ mod tests {
             recovery_attempts: MAX,
             hard_reset_cooldown_active: false,
             near_tip: false,
+            recovery_making_progress: false,
         });
         assert_eq!(action, ConsensusStuckAction::Wait);
     }
@@ -3425,6 +3618,7 @@ mod tests {
             recovery_attempts: MAX,
             hard_reset_cooldown_active: false,
             near_tip: false,
+            recovery_making_progress: false,
         });
         assert_eq!(action, ConsensusStuckAction::AttemptRecovery);
     }
@@ -3447,6 +3641,7 @@ mod tests {
             recovery_attempts: 7, // from atomic counter (> MAX_POST_CATCHUP_RECOVERY_ATTEMPTS)
             hard_reset_cooldown_active: false,
             near_tip: false,
+            recovery_making_progress: false,
         });
         assert!(matches!(action, ConsensusStuckAction::HardReset(_)));
     }
@@ -3464,6 +3659,7 @@ mod tests {
             recovery_attempts: MAX,
             hard_reset_cooldown_active: false,
             near_tip: false,
+            recovery_making_progress: false,
         });
         // recovery_exhausted wins because it's checked first.
         assert!(matches!(
@@ -3481,6 +3677,7 @@ mod tests {
             recovery_attempts: 0,
             hard_reset_cooldown_active: false,
             near_tip: false,
+            recovery_making_progress: false,
         });
         // tx_set_exhausted wins over wall_clock.
         assert!(matches!(
@@ -3503,6 +3700,7 @@ mod tests {
                 recovery_attempts: re,
                 hard_reset_cooldown_active: false,
                 near_tip: false,
+                recovery_making_progress: false,
             })
         };
 
@@ -4418,6 +4616,7 @@ mod tests {
             catchup_in_progress: false,
             hard_reset_cooldown_active: false,
             near_tip: false,
+            recovery_making_progress: false,
         };
         let action = App::decide_consensus_stuck_action(signals_stuck_higher);
         // With recovery_attempts=8 (> MAX_RECOVERY_ATTEMPTS=6) and
@@ -4446,6 +4645,7 @@ mod tests {
             catchup_in_progress: false,
             hard_reset_cooldown_active: false,
             near_tip: false,
+            recovery_making_progress: false,
         };
         let action = App::decide_consensus_stuck_action(signals_atomic_higher);
         assert!(
@@ -4475,6 +4675,7 @@ mod tests {
             recovery_attempts: MAX,
             hard_reset_cooldown_active: true,
             near_tip: false,
+            recovery_making_progress: false,
         });
         assert_eq!(
             action,
@@ -4496,6 +4697,7 @@ mod tests {
             recovery_attempts: 0,
             hard_reset_cooldown_active: true,
             near_tip: false,
+            recovery_making_progress: false,
         });
         assert_eq!(
             action,
@@ -4517,6 +4719,7 @@ mod tests {
             recovery_attempts: 0,
             hard_reset_cooldown_active: true,
             near_tip: false,
+            recovery_making_progress: false,
         });
         assert_eq!(
             action,
@@ -4538,6 +4741,7 @@ mod tests {
             recovery_attempts: MAX,
             hard_reset_cooldown_active: false,
             near_tip: false,
+            recovery_making_progress: false,
         });
         assert!(
             matches!(
@@ -4561,6 +4765,7 @@ mod tests {
             recovery_attempts: MAX,
             hard_reset_cooldown_active: true,
             near_tip: false,
+            recovery_making_progress: false,
         });
         assert_eq!(
             action,
@@ -4582,6 +4787,7 @@ mod tests {
             recovery_attempts: 0,
             hard_reset_cooldown_active: true,
             near_tip: false,
+            recovery_making_progress: false,
         });
         assert_eq!(action, ConsensusStuckAction::AttemptRecovery);
     }
@@ -4893,24 +5099,68 @@ mod tests {
         );
     }
 
-    /// #1844 control: without a previous hard reset (no cooldown),
-    /// the same scenario routes to HardReset(RecoveryExhausted).
+    /// #1844 control (updated for #3204): without a previous hard reset (no
+    /// cooldown), the same scenario routes to HardReset(RecoveryExhausted) —
+    /// but only once the peer-gap-shrink progress suppression has lapsed.
+    ///
+    /// In this scenario there is NO peer-ahead evidence (max_verified_scp_slot
+    /// stays 0 → effective_peer_gap == 0, flat across ticks), so the verified
+    /// peer gap never strictly shrinks. Per #3204 the count-based cap is
+    /// suppressed while back-fill might be making progress and re-arms only
+    /// after RECOVERY_ZERO_PROGRESS_ESCALATION_ATTEMPTS consecutive non-shrink
+    /// ticks (escape-1, ~30s). So the HardReset now fires on the Nth tick, not
+    /// the 1st — proving the genuine-no-progress stall still escalates (the
+    /// anti-wedge guarantee), just bounded by the no-progress budget instead of
+    /// an instantaneous count cap.
     #[tokio::test]
     async fn test_no_previous_reset_routes_to_hard_reset() {
         use std::sync::atomic::Ordering;
+        use std::time::Duration;
 
         let (_dir, app) = mk_app_for_cooldown_livelock_scenario().await;
 
         // last_hard_reset_offset stays at 0 (default) → "no previous reset"
-        // → cooldown is inactive → HardReset fires.
+        // → cooldown is inactive → HardReset fires once progress lapses.
 
+        // Drive the no-progress counter to its escalation threshold. The peer
+        // gap is flat at 0 (no peer evidence), so each tick is a non-shrink.
+        // Re-arm the schedule timer between ticks so each one is schedule_due,
+        // and re-seed the stuck state because the prior tick's AttemptRecovery
+        // increments recovery_attempts (kept at/above the cap here).
+        for _ in 0..(RECOVERY_ZERO_PROGRESS_ESCALATION_ATTEMPTS - 1) {
+            {
+                let mut guard = app.consensus_stuck_state.write().await;
+                if let Some(state) = guard.as_mut() {
+                    state.last_recovery_attempt = app.clock.now() - Duration::from_secs(15);
+                    state.recovery_attempts = MAX_POST_CATCHUP_RECOVERY_ATTEMPTS;
+                }
+            }
+            let _ = app.maybe_start_buffered_catchup().await;
+            assert_eq!(
+                app.post_catchup_hard_reset_total.load(Ordering::Relaxed),
+                0,
+                "HardReset must be suppressed while the no-progress counter is below threshold"
+            );
+        }
+
+        // Final tick: the no-progress counter now reaches the escalation
+        // threshold → recovery_making_progress=false → HardReset fires.
+        // Re-arm the schedule timer + recovery_attempts so this tick is
+        // schedule_due and still exhausted.
+        {
+            let mut guard = app.consensus_stuck_state.write().await;
+            if let Some(state) = guard.as_mut() {
+                state.last_recovery_attempt = app.clock.now() - Duration::from_secs(15);
+                state.recovery_attempts = MAX_POST_CATCHUP_RECOVERY_ATTEMPTS;
+            }
+        }
         let _result = app.maybe_start_buffered_catchup().await;
 
         // HardReset should have fired:
         assert_eq!(
             app.post_catchup_hard_reset_total.load(Ordering::Relaxed),
             1,
-            "HardReset should fire when cooldown is inactive"
+            "HardReset should fire when cooldown is inactive and progress has lapsed"
         );
         // With the #1862 fix, the cold-cache path enters spawn_catchup
         // which clears consensus_stuck_state (sets it to None when entering
@@ -5350,6 +5600,7 @@ mod tests {
             recovery_attempts: MAX,
             hard_reset_cooldown_active: false,
             near_tip: false,
+            recovery_making_progress: false,
         };
 
         let action = App::decide_consensus_stuck_action(signals);
@@ -6394,6 +6645,7 @@ mod tests {
             recovery_attempts: MAX_POST_CATCHUP_RECOVERY_ATTEMPTS + 1,
             hard_reset_cooldown_active: true,
             near_tip: false,
+            recovery_making_progress: false,
         };
 
         let action = App::decide_consensus_stuck_action(signals);

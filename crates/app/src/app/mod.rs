@@ -225,6 +225,16 @@ const MAX_POST_CATCHUP_RECOVERY_ATTEMPTS: u32 = 3;
 /// OUT_OF_SYNC_RECOVERY_TIMER_SECS.
 const HARD_RESET_STALL_SECS: u64 = 120;
 
+/// Number of consecutive Path-A ticks with NO peer-gap shrink before the
+/// count-based `recovery_exhausted` HardReset is allowed to fire again (#3204).
+/// While the verified peer gap is strictly shrinking, #3199's peer-SCP
+/// back-fill is demonstrably making progress and must not be aborted by the
+/// 3-attempt count cap; we only escalate after this many ticks without a
+/// strict shrink (~30s at the 10s recovery interval). Tied to
+/// `MAX_POST_CATCHUP_RECOVERY_ATTEMPTS` so the no-progress budget matches the
+/// original count cap.
+const RECOVERY_ZERO_PROGRESS_ESCALATION_ATTEMPTS: u32 = MAX_POST_CATCHUP_RECOVERY_ATTEMPTS;
+
 /// Hard floor: never reset more than once per this interval.
 /// Prevents reset storms when the node is legitimately stabilizing.
 const HARD_RESET_MIN_COOLDOWN_SECS: u64 = 60;
@@ -945,6 +955,19 @@ pub struct App {
     /// `process_verified()` for `Verdict::Ok` envelopes only (verify-rejected
     /// envelopes return early). Reset on ledger progress.
     max_verified_scp_slot: AtomicU64,
+    /// Verified peer gap (`effective_peer_gap`) observed at the previous
+    /// Path-A consensus-stuck tick. Used to detect whether peer-SCP back-fill
+    /// is shrinking the gap (#3204). Sentinel `u64::MAX` means "no prior
+    /// observation this episode" (first tick → treated as non-progress).
+    /// Reset to the sentinel on `reset_recovery_attempts(Full)` and on
+    /// `force_post_catchup_hard_reset`.
+    last_recovery_peer_gap: AtomicU64,
+    /// Count of consecutive Path-A ticks in which the verified peer gap did
+    /// NOT strictly decrease (#3204). Reset to 0 on any strict shrink. When it
+    /// reaches `RECOVERY_ZERO_PROGRESS_ESCALATION_ATTEMPTS` the count-based
+    /// `recovery_exhausted` HardReset is re-enabled (peer-SCP back-fill has
+    /// stalled). Cleared alongside `last_recovery_peer_gap`.
+    recovery_consecutive_no_gap_progress: AtomicU32,
     /// Number of ledger closes that contained at least one transaction.
     /// Mirrors stellar-core's `ledger.transaction.count` histogram `.count`.
     ledger_tx_count: AtomicU64,
@@ -1499,6 +1522,8 @@ impl App {
             recovery_throttles: log_throttle::RecoveryLogThrottles::new(),
             max_observed_externalize_slot: AtomicU64::new(0),
             max_verified_scp_slot: AtomicU64::new(0),
+            last_recovery_peer_gap: AtomicU64::new(u64::MAX),
+            recovery_consecutive_no_gap_progress: AtomicU32::new(0),
             ledger_tx_count: AtomicU64::new(0),
             max_tx_size_bytes: Arc::new(AtomicU32::new(
                 henyey_herder::flow_control::MAX_CLASSIC_TX_SIZE_BYTES,
@@ -2218,6 +2243,52 @@ impl App {
             .saturating_sub(current_ledger as u64)
     }
 
+    /// Update the #3204 peer-gap-shrink progress tracker for one Path-A
+    /// consensus-stuck tick and return whether peer-SCP back-fill is still
+    /// "making progress" for the purpose of suppressing the count-based
+    /// `recovery_exhausted` HardReset.
+    ///
+    /// "Progress" = the verified peer gap (`peer_gap`) STRICTLY decreased vs
+    /// the previous tick of this stuck episode. This is the ONLY admitted
+    /// signal — we deliberately do NOT treat "current_ledger advanced" as
+    /// progress, because current_ledger is what re-keys `stuck_start`
+    /// (`maybe_start_buffered_catchup` filters the snapshot on current_ledger).
+    /// Admitting it would reset the episode clock and defeat the 120s
+    /// wall-clock backstop (#2789), creating a no-escape wedge. peer_gap-shrink
+    /// never touches `stuck_start`, so the 120s ceiling stays armed whenever
+    /// current_ledger is pinned — the two anti-wedge escapes remain
+    /// independent.
+    ///
+    /// Cumulative encoding so a single noisy flat tick mid-shrink does not
+    /// escalate: we count CONSECUTIVE ticks WITHOUT a strict shrink, reset that
+    /// counter to 0 on any strict shrink, and report progress while the counter
+    /// is below `RECOVERY_ZERO_PROGRESS_ESCALATION_ATTEMPTS`. The first tick of
+    /// an episode sees the `u64::MAX` sentinel as the prior gap, so it is NOT a
+    /// strict shrink (counter accrues from 0) — fail-safe toward escalation.
+    pub(super) fn update_recovery_gap_progress(&self, peer_gap: u64) -> bool {
+        let last_peer_gap = self.last_recovery_peer_gap.load(Ordering::Relaxed);
+        // The first tick of an episode has the u64::MAX sentinel as the prior
+        // gap → there is NO prior observation to compare against, so it is NOT
+        // a strict shrink (counter accrues from 0) — fail-safe toward
+        // escalation. Comparing against the sentinel directly would make the
+        // first tick spuriously look like a giant shrink and report progress.
+        let gap_shrank = last_peer_gap != u64::MAX && peer_gap < last_peer_gap;
+        self.last_recovery_peer_gap
+            .store(peer_gap, Ordering::Relaxed);
+
+        let no_gap_progress = if gap_shrank {
+            self.recovery_consecutive_no_gap_progress
+                .store(0, Ordering::Relaxed);
+            0
+        } else {
+            self.recovery_consecutive_no_gap_progress
+                .fetch_add(1, Ordering::Relaxed)
+                .saturating_add(1)
+        };
+
+        no_gap_progress < RECOVERY_ZERO_PROGRESS_ESCALATION_ATTEMPTS
+    }
+
     /// Reset (or re-arm) the recovery attempt counter and snapshot the current
     /// SCP message count. See [`RecoveryResetMode`] for the two reset policies.
     ///
@@ -2245,6 +2316,14 @@ impl App {
                 self.max_verified_scp_slot.store(0, Ordering::Relaxed);
                 self.recovery_attempts_without_progress
                     .store(0, Ordering::SeqCst);
+                // Clear the #3204 peer-gap-shrink progress tracker — the node
+                // is caught up, so the next stall episode must start with a
+                // fresh "no prior observation" sentinel and a zeroed
+                // no-progress counter.
+                self.last_recovery_peer_gap
+                    .store(u64::MAX, Ordering::Relaxed);
+                self.recovery_consecutive_no_gap_progress
+                    .store(0, Ordering::Relaxed);
                 // Re-arm the onset diagnostic for the next stall episode.
                 self.recovery_episode_latch.reset();
             }
@@ -11470,6 +11549,113 @@ mod tests {
                 .load(Ordering::SeqCst),
             high_attempts,
             "fetch_max must not lower attempts below existing value"
+        );
+    }
+
+    /// #3204: the peer-gap-shrink progress tracker.
+    ///
+    /// - A strictly shrinking gap (19→15→12) keeps the consecutive-no-progress
+    ///   counter at 0 and reports `recovery_making_progress = true`.
+    /// - A flat gap (12 repeated) increments the counter once per tick; after
+    ///   `RECOVERY_ZERO_PROGRESS_ESCALATION_ATTEMPTS` flat ticks it reaches the
+    ///   threshold and `recovery_making_progress` becomes false (escalation).
+    /// - Bounded oscillation (12→10→12→10) keeps the counter low because each
+    ///   strict shrink resets it, so progress is sustained.
+    #[tokio::test]
+    async fn test_recovery_gap_progress_counter() {
+        let (_dir, app) = make_app_for_peer_ahead_test().await;
+
+        // First tick: prior gap is the u64::MAX sentinel, so 19 is NOT a strict
+        // shrink — the counter accrues from 0 (value 1) but is still below the
+        // threshold (3), so progress is reported true while the gap then shrinks.
+        let first = app.update_recovery_gap_progress(19);
+        assert!(
+            first,
+            "first tick: counter=1 < {RECOVERY_ZERO_PROGRESS_ESCALATION_ATTEMPTS} → still progress"
+        );
+
+        // Strictly shrinking 19→15→12 resets the counter to 0 each tick.
+        assert!(app.update_recovery_gap_progress(15));
+        assert_eq!(
+            app.recovery_consecutive_no_gap_progress
+                .load(Ordering::Relaxed),
+            0,
+            "strict shrink resets the no-progress counter"
+        );
+        assert!(app.update_recovery_gap_progress(12));
+        assert_eq!(
+            app.recovery_consecutive_no_gap_progress
+                .load(Ordering::Relaxed),
+            0
+        );
+
+        // Now the gap goes flat at 12: each tick is non-shrink, counter climbs.
+        assert!(
+            app.update_recovery_gap_progress(12),
+            "1 flat tick: counter=1 < 3 → still progress"
+        );
+        assert!(
+            app.update_recovery_gap_progress(12),
+            "2 flat ticks: counter=2 < 3 → still progress"
+        );
+        let third_flat = app.update_recovery_gap_progress(12);
+        assert_eq!(
+            app.recovery_consecutive_no_gap_progress
+                .load(Ordering::Relaxed),
+            RECOVERY_ZERO_PROGRESS_ESCALATION_ATTEMPTS,
+            "3 flat ticks: counter reaches the escalation threshold"
+        );
+        assert!(
+            !third_flat,
+            "counter == threshold → recovery_making_progress is false (escalate)"
+        );
+
+        // A single strict shrink immediately re-enables progress (counter → 0).
+        assert!(app.update_recovery_gap_progress(11));
+        assert_eq!(
+            app.recovery_consecutive_no_gap_progress
+                .load(Ordering::Relaxed),
+            0
+        );
+
+        // Bounded oscillation 11→10→12→10: each strict shrink (10, then 10
+        // again from 12) resets the counter, the single up-tick (10→12) only
+        // bumps it to 1, so the counter never reaches the threshold and
+        // progress stays true throughout.
+        assert!(app.update_recovery_gap_progress(10)); // shrink → 0
+        assert!(app.update_recovery_gap_progress(12)); // grow  → 1 (< 3, progress)
+        assert!(app.update_recovery_gap_progress(10)); // shrink → 0
+        assert!(
+            app.recovery_consecutive_no_gap_progress
+                .load(Ordering::Relaxed)
+                < RECOVERY_ZERO_PROGRESS_ESCALATION_ATTEMPTS,
+            "bounded oscillation keeps the counter below the threshold"
+        );
+    }
+
+    /// #3204: a Full reset clears the peer-gap-shrink tracker so the next stall
+    /// episode starts from the "no prior observation" sentinel with a zeroed
+    /// no-progress counter (`force_post_catchup_hard_reset` delegates here).
+    #[tokio::test]
+    async fn test_reset_recovery_attempts_clears_gap_progress_tracker() {
+        let (_dir, app) = make_app_for_peer_ahead_test().await;
+        // Dirty the tracker.
+        app.last_recovery_peer_gap.store(7, Ordering::Relaxed);
+        app.recovery_consecutive_no_gap_progress
+            .store(2, Ordering::Relaxed);
+
+        app.reset_recovery_attempts(RecoveryResetMode::Full);
+
+        assert_eq!(
+            app.last_recovery_peer_gap.load(Ordering::Relaxed),
+            u64::MAX,
+            "Full reset must restore the no-prior-observation sentinel"
+        );
+        assert_eq!(
+            app.recovery_consecutive_no_gap_progress
+                .load(Ordering::Relaxed),
+            0,
+            "Full reset must zero the no-progress counter"
         );
     }
 
