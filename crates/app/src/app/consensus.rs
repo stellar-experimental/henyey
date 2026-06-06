@@ -1792,12 +1792,17 @@ impl App {
                     self.archive_recovery_snapshot().await.is_confirmed_behind();
                 let peer_gap = self.effective_peer_gap(current_ledger);
                 // Near-tip band (#3181/#3197): peers verified ahead by less
-                // than one checkpoint interval. Combined with the gate's
-                // existing `peer_gap >= PEER_AHEAD_ESCALATION_THRESHOLD`
-                // precondition this is the same predicate as the StuckSignals
-                // build site (PEER_AHEAD_ESCALATION_THRESHOLD <= peer_gap <
-                // checkpoint_frequency()). Read checkpoint_frequency() live (64
-                // default / 8 accelerated) for parity.
+                // than one checkpoint interval. The guard below
+                // (`near_tip && archive_is_confirmed_behind`) imposes NO lower
+                // bound on peer_gap — it also fires for tiny gaps (peer_gap of
+                // 0/1/2, below PEER_AHEAD_ESCALATION_THRESHOLD=3). That is
+                // intentional and harmless: re-broadcasting SCP + a bounded
+                // peer pull is a strict improvement over the request-only
+                // fallback even for tiny gaps, and mirrors stellar-core
+                // outOfSyncRecovery, which runs regardless of gap. The
+                // upper-bounded `peer_gap < checkpoint_frequency()` predicate
+                // is the only band constraint; read checkpoint_frequency()
+                // live (64 default / 8 accelerated) for parity.
                 let near_tip = peer_gap < checkpoint_frequency() as u64;
 
                 // Recovery-ROUTING fix (#3197, PRIMARY — this is the dominant
