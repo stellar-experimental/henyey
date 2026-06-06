@@ -90,6 +90,22 @@ crates/*/ledger/[0-9a-f][0-9a-f]/
 crates/*/results/[0-9a-f][0-9a-f]/
 crates/*/scp/[0-9a-f][0-9a-f]/
 crates/*/transactions/[0-9a-f][0-9a-f]/
+
+# Monitor/evaluator scratch state (#3201, defense in depth).
+# These leak into the tracked repo-root metrics/ dir when monitor-tick or
+# eval-alarms.py runs with a relative --state-dir from repo-root cwd, dirtying
+# the working tree and hard-blocking the deploy gate. Anchor with a leading '/'
+# so ONLY the repo-root metrics/ dir is matched — the tracked dashboards
+# (metrics/henyey-dashboard.json, ...) and any crates/*/metrics are unaffected.
+/metrics/current.prom
+/metrics/prev.prom
+/metrics/gauge_persistence
+/metrics/scrape_identity
+/metrics/counter_streak_snapshot
+/metrics/ratio_snapshot
+/metrics/counter_dynamic_snapshot
+/metrics/anomaly_cooldown.json
+/metrics/archive/
 scripts/lib/__pycache__/
 .alarm-regression-filing.lock
 .alarm-regression-filed.json
