@@ -1210,10 +1210,29 @@ a skip. Report `recovery_stalled: skipped (<reason>)`.
 - First tick after fresh start (no prior snapshot exists)
 
 On invalidation: write new snapshot with current counter value and
-`recovery_stalled_breach_streak=0`. Report `recovery_stalled: collecting baseline`.
-Do NOT evaluate burst or streak logic on invalidation ticks — this prevents
-false-firing the burst override on the first tick after a restart where the
-counter jumps from 0 to the current absolute value.
+`recovery_stalled_breach_streak=0`. Do NOT evaluate burst or streak (delta)
+logic on invalidation ticks — this prevents false-firing the burst override on
+the first tick after a restart where the counter jumps from 0 to the current
+absolute value.
+
+**Post-restart absolute-value fire (#3198):** After writing the fresh baseline,
+evaluate the *absolute* `recovery_stalled_behind` value that the reset would
+otherwise discard. If it meets `post_restart_absolute_threshold` (= `50`, from
+`metric-alarms.toml`), fire WARN once on this invalidation tick instead of
+reporting `collecting baseline`, and route through the Bug Filing Workflow.
+This closes the blind spot from #3197/#3198: a self-recovering
+`forcing_catchup_behind` stall that completes before the 15m clean-restart sync
+deadline (so check (2) never reports SYNC FAILURE) and accrues its entire burst
+across the single tick interval that straddles the baseline-reset tick (so the
+cross-tick streak/burst machine never observes an incrementing delta). The
+#3197 episode accrued 213 ticks; a clean restart reaching real-time sync
+promptly accrues only a handful (well under 50). The fresh baseline + 7200s
+cooldown prevent re-fire on subsequent ticks. The fire uses the absolute value,
+not a cross-tick delta — it is robust *across* the reset because it triggers
+*on* the reset. Both invalidation branches (PID/`start_ticks` change AND counter
+reset) are covered, so the absolute baseline is never silently discarded.
+Otherwise (absolute value below threshold, or threshold disabled): report
+`recovery_stalled: collecting baseline` as before.
 
 **Per-tick logic (not skipped AND not invalidated):**
 ```
@@ -1257,8 +1276,9 @@ to overall tick severity — the tick is considered unhealthy when any alert fir
 - `recovery_stalled: breach (delta=N, streak M/3)` — incrementing, below threshold
 - `recovery_stalled: WARNING delta=N (M ticks) — investigating` — streak ≥ 3
 - `recovery_stalled: WARNING delta=N (burst) — investigating` — immediate fire (delta ≥ 10)
+- `recovery_stalled: WARNING absolute=N (post-restart) — investigating` — post-restart absolute fire (absolute ≥ 50 on a baseline-reset tick, #3198)
 - `recovery_stalled: skipped (<reason>)` — metric missing or fetch failed
-- `recovery_stalled: collecting baseline` — first tick after restart/invalidation
+- `recovery_stalled: collecting baseline` — first tick after restart/invalidation (absolute value below the post-restart threshold)
 
 **Rendering precedence** (determines the `metrics_ratio:` line format):
 
@@ -1284,6 +1304,7 @@ Examples:
 - Building streak: `recovery_stalled: breach (delta=2, streak 1/3)`
 - Firing (streak): `recovery_stalled: WARNING delta=1 (3 ticks) — investigating`
 - Firing (burst): `recovery_stalled: WARNING delta=15 (burst) — investigating`
+- Firing (post-restart absolute, #3198): `recovery_stalled: WARNING absolute=213 (post-restart) — investigating`
 - Skipped: `recovery_stalled: skipped (metric missing)`
 - Baseline: `recovery_stalled: collecting baseline`
 
