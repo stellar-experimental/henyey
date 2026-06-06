@@ -526,6 +526,32 @@ mod tests {
         PeerId::from_bytes([v; 32])
     }
 
+    /// OVERLAY_SPEC.md §3.3: flood message deduplication MUST use BLAKE2b-256
+    /// over the XDR serialization of the entire `StellarMessage` (matching
+    /// stellar-core's `xdrBlake2()`), NOT SHA-256. This guards against a
+    /// regression to SHA-256 — the dedup hash is local-only, so a divergence
+    /// would silently waste CPU without a wire-visible failure.
+    #[test]
+    fn test_flood_dedup_hash_is_blake2b_not_sha256() {
+        use stellar_xdr::curr::{Limits, WriteXdr};
+
+        let message = StellarMessage::Peers(Default::default());
+        let bytes = message.to_xdr(Limits::none()).unwrap();
+
+        // The flood-dedup hash must equal BLAKE2b-256 of the XDR bytes.
+        let expected_blake2 = henyey_crypto::blake2(&bytes);
+        assert_eq!(compute_message_hash(&message), expected_blake2);
+
+        // ...and must NOT equal SHA-256 of the same bytes, which is the
+        // wrong primitive the spec audit (#3081) flagged.
+        let sha256 = henyey_common::Hash256::hash(&bytes);
+        assert_ne!(
+            compute_message_hash(&message),
+            sha256,
+            "flood dedup hash must be BLAKE2b-256, not SHA-256"
+        );
+    }
+
     #[test]
     fn test_flood_gate_basic() {
         let gate = FloodGate::new();
