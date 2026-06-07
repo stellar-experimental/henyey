@@ -45,7 +45,7 @@ cleanup  # ensure fresh state
 mkdir -p "$TEST_ROOT"
 
 # ── TAP state ────────────────────────────────────────────────────────────────
-TAP_PLAN=325
+TAP_PLAN=327
 TAP_CURRENT=0
 TAP_FAILURES=0
 
@@ -1646,6 +1646,37 @@ PYEOF
   else
     tap_not_ok "check-12b-semantics: metric label from TOML in both specs" \
       "Expected '$metric_label' in both Check 12b section and monitor-loop table"
+  fi
+
+  # Test 53b: recovery-stalled snapshot_file is a BARE filename (no '/'), matching
+  # sibling snapshots (ratio_snapshot / counter_dynamic_snapshot). The evaluator
+  # resolves snapshot_path = Path(state_dir) / snapshot_file and the SKILL invokes
+  # it with --state-dir .../metrics, so any 'metrics/' prefix here doubles the path
+  # (.../metrics/metrics/counter_streak_snapshot). See #3222. A directory prefix is
+  # invalid; the bare name resolves single-level under --state-dir. Substring greps
+  # (Tests 44/48) do NOT catch the doubling because the bare name is a substring of
+  # the doubled path — hence this dedicated structural assertion.
+  if [[ "$snapshot_file" != */* && "$snapshot_file" == "counter_streak_snapshot" ]]; then
+    tap_ok "metric-alarms: recovery-stalled snapshot_file is bare filename ($snapshot_file)"
+  else
+    tap_not_ok "metric-alarms: recovery-stalled snapshot_file is bare filename" \
+      "snapshot_file must be the bare name 'counter_streak_snapshot' (no '/' prefix), got '$snapshot_file' — a directory prefix doubles the resolved path under --state-dir .../metrics (#3222)"
+  fi
+
+  # Test 53c: check-12b Format block documents the evaluator's ACTUAL snapshot
+  # schema. eval-alarms.py writes version/pid/start_ticks/counter_value/breach_streak
+  # (no timestamp). The check-12b prose must use counter_value / breach_streak and
+  # must NOT contain the drifted field names recovery_stalled_behind /
+  # recovery_stalled_breach_streak / timestamp. See #3222.
+  if echo "$check_12b_section" | grep -Fq 'counter_value' \
+     && echo "$check_12b_section" | grep -Fq 'breach_streak' \
+     && ! echo "$check_12b_section" | grep -Fq 'recovery_stalled_behind' \
+     && ! echo "$check_12b_section" | grep -Fq 'recovery_stalled_breach_streak' \
+     && ! echo "$check_12b_section" | grep -Fq 'timestamp'; then
+    tap_ok "check-12b-semantics: doc snapshot schema matches evaluator (counter_value/breach_streak)"
+  else
+    tap_not_ok "check-12b-semantics: doc snapshot schema matches evaluator (counter_value/breach_streak)" \
+      "Check 12b prose must use 'counter_value'/'breach_streak' and must NOT contain 'recovery_stalled_behind', 'recovery_stalled_breach_streak', or 'timestamp' (drifted from eval-alarms.py schema, #3222)"
   fi
 
   # ════════════════════════════════════════════════════════════════════════════
