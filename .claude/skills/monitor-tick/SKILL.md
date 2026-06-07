@@ -1190,9 +1190,8 @@ Format:
 version=1
 pid=<PID>
 start_ticks=<field 22 from /proc/$PID/stat>
-timestamp=<ISO8601>
-recovery_stalled_behind=<value>
-recovery_stalled_breach_streak=<N>
+counter_value=<value>
+breach_streak=<N>
 ```
 
 **PID/start_ticks check (always, even on skip):** Before evaluating skip
@@ -1206,25 +1205,25 @@ counters to a pre-restart baseline.
 - `/metrics` returns "recorder not installed"
 - `forcing_catchup_behind` label missing from the scrape
 
-On skip: write snapshot preserving existing `recovery_stalled_behind` value (or
-0 if no prior snapshot) with `recovery_stalled_breach_streak=0`. Next healthy
+On skip: write snapshot preserving existing `counter_value` value (or
+0 if no prior snapshot) with `breach_streak=0`. Next healthy
 tick compares against preserved value — does NOT enter "collecting baseline" after
 a skip. Report `recovery_stalled: skipped (<reason>)`.
 
 **Invalidation (reset streak AND enter "collecting baseline"):**
 - PID or `start_ticks` changed (process restart) — checked before skip conditions
 - Snapshot malformed, missing fields, or `version` ≠ `1`
-- Current `recovery_stalled_behind` value < previous (counter reset)
+- Current `counter_value` value < previous (counter reset)
 - First tick after fresh start (no prior snapshot exists)
 
 On invalidation: write new snapshot with current counter value and
-`recovery_stalled_breach_streak=0`. Do NOT evaluate burst or streak (delta)
+`breach_streak=0`. Do NOT evaluate burst or streak (delta)
 logic on invalidation ticks — this prevents false-firing the burst override on
 the first tick after a restart where the counter jumps from 0 to the current
 absolute value.
 
 **Post-restart absolute-value fire (#3198):** After writing the fresh baseline,
-evaluate the *absolute* `recovery_stalled_behind` value that the reset would
+evaluate the *absolute* `counter_value` value that the reset would
 otherwise discard. If it meets `post_restart_absolute_threshold` (= `50`, from
 `metric-alarms.toml`), fire WARN once on this invalidation tick instead of
 reporting `collecting baseline`, and route through the Bug Filing Workflow.
@@ -1244,19 +1243,19 @@ Otherwise (absolute value below threshold, or threshold disabled): report
 
 **Per-tick logic (not skipped AND not invalidated):**
 ```
-delta = current(recovery_stalled_behind) - prev(recovery_stalled_behind)
+delta = current(counter_value) - prev(counter_value)
 
 if delta >= 10:
     # Immediate-fire override: large burst indicates sustained stalling.
     # Do NOT reset streak — keep incrementing; cooldown (7200s) handles dedup.
-    recovery_stalled_breach_streak += 1
+    breach_streak += 1
     → fire WARN, route through Bug Filing Workflow
 elif delta >= 1:
-    recovery_stalled_breach_streak += 1
-    if recovery_stalled_breach_streak >= 3:
+    breach_streak += 1
+    if breach_streak >= 3:
         → fire WARN, route through Bug Filing Workflow
 else:  # delta == 0
-    recovery_stalled_breach_streak = 0
+    breach_streak = 0
 ```
 
 Note: after skipped ticks where the counter value was preserved, the first
