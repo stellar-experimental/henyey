@@ -1800,6 +1800,15 @@ impl LedgerManager {
     /// * `header` - The ledger header to initialize with
     /// * `header_hash` - The authoritative hash of the header from the history archive
     /// * `cache_data` - Pre-computed cache data from `scan_level_pairs_for_caches`
+    /// * `skip_warm_cache` - When `true`, the per-entry account/bucket warm cache
+    ///   is NOT populated here. This is the cold catchup-apply path: the warm
+    ///   cache is a steady-state read-latency optimization that is pure dead
+    ///   weight during a one-pass restore, where it adds ~1.0–1.5 GB of transient
+    ///   anon RSS to the catchup peak (issue #3232). The caller MUST schedule a
+    ///   post-catchup warm-up via [`Self::warm_entry_caches`] so the cache is
+    ///   never left permanently cold (a silent steady-state perf regression).
+    ///   When `false`, the warm cache is populated inline as before (steady-state
+    ///   behavior is unchanged).
     pub fn initialize_with_precomputed_caches(
         &self,
         bucket_list: BucketList,
@@ -1807,6 +1816,7 @@ impl LedgerManager {
         header: LedgerHeader,
         header_hash: Hash256,
         cache_data: CacheInitResult,
+        skip_warm_cache: bool,
     ) -> Result<()> {
         self.verify_and_install_bucket_lists(
             bucket_list,
@@ -1817,7 +1827,14 @@ impl LedgerManager {
         crate::memory_report::log_startup_memory("after_verify_install_buckets");
 
         // Initialize per-bucket caches for all DiskIndex buckets.
-        {
+        //
+        // Skipped during cold catchup-apply (`skip_warm_cache == true`): the
+        // warm cache is a steady-state read-latency optimization that is wasted
+        // during a one-pass restore and inflates the catchup anon-RSS peak
+        // (#3232). The caller warms it once post-catchup via `warm_entry_caches`.
+        if skip_warm_cache {
+            info!("Skipping warm entry-cache init during catchup (will warm post-catchup)");
+        } else {
             let bucket_list = self.bucket_list.read();
             bucket_list.maybe_initialize_caches();
         }
@@ -1841,6 +1858,24 @@ impl LedgerManager {
         );
 
         Ok(())
+    }
+
+    /// Populate the per-entry account/bucket warm cache for all DiskIndex buckets.
+    ///
+    /// This is the post-catchup warm-up hook for [`Self::initialize_with_precomputed_caches`]
+    /// when it was called with `skip_warm_cache == true` (issue #3232). It uses the
+    /// node's configured `memory_for_caching_mb` budget, so steady-state cache
+    /// behavior is identical to the inline path — only the *timing* moves from
+    /// the catchup peak to off-peak steady state.
+    ///
+    /// Idempotent: `maybe_initialize_cache` early-returns for buckets whose cache
+    /// is already populated, so calling this when the cache is already warm (or
+    /// when no DiskIndex bucket exists) is a cheap no-op. Safe to call on every
+    /// transition to operational state.
+    pub fn warm_entry_caches(&self) {
+        let bucket_list = self.bucket_list.read();
+        bucket_list.maybe_initialize_caches();
+        crate::memory_report::log_startup_memory("after_post_catchup_cache_warm");
     }
 
     /// Verify bucket list hash against the header and install bucket lists + state.
@@ -7440,6 +7475,76 @@ mod tests {
         let streaming = scan_bucket_list_for_caches(&bl, TEST_PROTOCOL, 1).unwrap();
         let parallel = scan_bucket_list_for_caches(&bl, TEST_PROTOCOL, 2).unwrap();
         assert_cache_init_results_equivalent(&streaming, &parallel, "cross_level_overwrites");
+    }
+
+    /// Lever A (#3232): the cold catchup-apply path skips the warm per-entry
+    /// account cache, but still installs the precomputed consensus-relevant
+    /// caches (offer store, soroban state). A subsequent `warm_entry_caches()`
+    /// is the post-catchup warm-up hook. This test exercises the
+    /// `skip_warm_cache` plumbing and the warm-up method end-to-end.
+    #[test]
+    fn test_catchup_cache_init_skips_warm_cache_then_warm_up_runs() {
+        use henyey_common::protocol::CURRENT_LEDGER_PROTOCOL_VERSION;
+
+        let manager = LedgerManager::new(
+            "Test SDF Network ; September 2015".to_string(),
+            LedgerManagerConfig {
+                validate_bucket_hash: false,
+                ..Default::default()
+            },
+        );
+
+        // Build a bucket list with an offer so the precomputed offer cache is
+        // non-empty (proves consensus-relevant caches are installed regardless
+        // of the warm-cache skip).
+        let mut bl = new_bl_with_config();
+        let offer = make_offer_entry(42, [9u8; 32]);
+        bl.add_batch(
+            1,
+            CURRENT_LEDGER_PROTOCOL_VERSION,
+            BucketListType::Live,
+            vec![offer],
+            vec![],
+            vec![],
+        )
+        .unwrap();
+
+        let cache_data =
+            scan_bucket_list_for_caches(&bl, CURRENT_LEDGER_PROTOCOL_VERSION, 1).unwrap();
+        assert_eq!(cache_data.offers.len(), 1, "precomputed offer cache");
+
+        let mut header = create_genesis_header();
+        header.ledger_seq = 1;
+        header.ledger_version = CURRENT_LEDGER_PROTOCOL_VERSION;
+        let hot = henyey_bucket::HotArchiveBucketList::new();
+        let header_hash = crate::compute_header_hash(&header).expect("hash");
+
+        // Catchup path: skip_warm_cache == true.
+        manager
+            .initialize_with_precomputed_caches(bl, hot, header, header_hash, cache_data, true)
+            .expect("init with skipped warm cache");
+
+        // The warm per-entry cache must be inactive after a catchup-apply init.
+        assert!(
+            !manager.bucket_list().aggregate_cache_stats().active,
+            "warm entry cache must be inactive after catchup-apply (skip_warm_cache=true)"
+        );
+
+        // Consensus-relevant caches WERE installed despite the warm-cache skip.
+        assert_eq!(
+            manager.offer_store_lock().len(),
+            1,
+            "offer store installed during catchup-apply"
+        );
+
+        // Post-catchup warm-up hook runs without error and is idempotent. (Test
+        // bucket lists use InMemory indexes, which never get a per-bucket cache,
+        // so `active` remains false here; the budget→cache relationship for
+        // DiskIndex buckets is locked by the bucket-crate test
+        // `test_maybe_initialize_cache_skipped_when_budget_zero`.)
+        manager.warm_entry_caches();
+        manager.warm_entry_caches(); // idempotent — no panic, no double-init
+        assert!(!manager.bucket_list().aggregate_cache_stats().active);
     }
 
     #[test]

@@ -1382,6 +1382,102 @@ mod tests {
         bytes
     }
 
+    /// Build a `BucketEntry::Liveentry(account)` for the given key byte, matching
+    /// the on-disk record produced by `make_entry_bytes`.
+    fn make_account_bucket_entry(key_byte: u8) -> stellar_xdr::curr::BucketEntry {
+        let account = AccountEntry {
+            account_id: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([key_byte; 32]))),
+            balance: 100,
+            seq_num: SequenceNumber(1),
+            num_sub_entries: 0,
+            inflation_dest: None,
+            flags: 0,
+            home_domain: String32::default(),
+            thresholds: Thresholds([1, 0, 0, 0]),
+            signers: Vec::new().try_into().unwrap(),
+            ext: AccountEntryExt::V0,
+        };
+        let entry = LedgerEntry {
+            last_modified_ledger_seq: 1,
+            data: LedgerEntryData::Account(account),
+            ext: LedgerEntryExt::V0,
+        };
+        stellar_xdr::curr::BucketEntry::Liveentry(entry)
+    }
+
+    /// Build a DiskBucket backed by a forced `DiskIndex` (via a zero
+    /// `index_cutoff_mb` config) holding `n` sorted account entries. The
+    /// returned bucket has a `DiskIndex` so `maybe_initialize_cache` is exercised
+    /// (InMemory indexes never get a cache).
+    fn build_forced_disk_account_bucket(dir: &std::path::Path, n: u8) -> DiskBucket {
+        use henyey_common::BucketListDbConfig;
+
+        // Write sorted account records to disk and collect (entry, offset) pairs.
+        let mut file_bytes = Vec::new();
+        let mut entries: Vec<(stellar_xdr::curr::BucketEntry, u64)> = Vec::new();
+        for key_byte in 1..=n {
+            let offset = file_bytes.len() as u64;
+            file_bytes.extend(make_entry_bytes(key_byte));
+            entries.push((make_account_bucket_entry(key_byte), offset));
+        }
+        let path = dir.join("forced_disk.bucket");
+        std::fs::write(&path, &file_bytes).unwrap();
+
+        // Force a DiskIndex regardless of file size by setting the cutoff to 0.
+        let cfg = BucketListDbConfig {
+            index_cutoff_mb: 0,
+            ..BucketListDbConfig::default()
+        };
+        let index = LiveBucketIndex::from_entries(
+            entries.into_iter(),
+            DEFAULT_BLOOM_SEED,
+            file_bytes.len() as u64,
+            &cfg,
+        );
+        assert!(
+            !index.is_in_memory(),
+            "test setup expects a forced DiskIndex"
+        );
+
+        let hash = Hash256::hash(&file_bytes);
+        DiskBucket::from_prebuilt(&path, hash, n as usize, index).unwrap()
+    }
+
+    #[test]
+    fn test_maybe_initialize_cache_skipped_when_budget_zero() {
+        // Lever A (#3232): with `memory_for_caching_mb == 0`, the per-entry
+        // warm cache must NOT be allocated, even for a DiskIndex bucket with
+        // account entries. This is the effective budget used during cold
+        // catchup-apply, so the catchup peak pays nothing for the warm cache.
+        use henyey_common::BucketListDbConfig;
+        let dir = tempdir().unwrap();
+        let bucket = build_forced_disk_account_bucket(dir.path(), 8);
+
+        let cfg = BucketListDbConfig {
+            memory_for_caching_mb: 0,
+            ..BucketListDbConfig::default()
+        };
+        // total_bucket_list_account_size_bytes is irrelevant when budget is 0.
+        bucket.maybe_initialize_cache(10_000, &cfg);
+        assert!(
+            bucket.cache().is_none(),
+            "cache must stay None with a zero caching budget (catchup-apply path)"
+        );
+
+        // Sanity: a non-zero budget DOES populate the cache for the same bucket,
+        // proving the bucket is cacheable and the None above is due to the budget,
+        // not the bucket shape. This is the steady-state / post-catchup warm-up.
+        let warm_cfg = BucketListDbConfig {
+            memory_for_caching_mb: 64,
+            ..BucketListDbConfig::default()
+        };
+        bucket.maybe_initialize_cache(10_000, &warm_cfg);
+        assert!(
+            bucket.cache().is_some(),
+            "post-catchup warm-up with a non-zero budget must populate the cache"
+        );
+    }
+
     #[test]
     fn test_streaming_loader_rejects_unsorted_entries() {
         let dir = tempdir().unwrap();

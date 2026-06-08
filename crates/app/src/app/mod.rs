@@ -1854,6 +1854,15 @@ impl App {
         } else {
             self.set_state(AppState::Synced).await;
         }
+        // Post-catchup warm-up hook (#3232): the cold catchup-apply path skips
+        // the per-entry account/bucket warm cache to flatten the catchup anon-RSS
+        // peak. Now that the node has left CatchingUp and is operational, warm the
+        // cache off-peak so steady-state read latency is unaffected. Idempotent
+        // (`warm_entry_caches` early-returns for already-warm buckets), so the
+        // re-sync paths that also call this are a cheap no-op.
+        if self.ledger_manager.is_initialized() {
+            self.ledger_manager.warm_entry_caches();
+        }
         // Re-arm overlay flood acceptance now that the node is operational.
         if let Some(flag) = self.overlay_synced.lock().unwrap().as_ref() {
             flag.store(true, std::sync::atomic::Ordering::Relaxed);
