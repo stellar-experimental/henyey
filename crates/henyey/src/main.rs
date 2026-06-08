@@ -3605,6 +3605,42 @@ mod tests {
         assert!(matches!(cli.command, Commands::Info));
     }
 
+    /// Pins the compiled-in jemalloc `malloc_conf` so a future edit cannot
+    /// silently drop one of the memory-return knobs.
+    ///
+    /// The full RSS-peak effect is operator-verified on a real cold catchup
+    /// (via `henyey_startup_peak_anon_rss_mb`, #3228); this offline test only
+    /// asserts the config string carries the four intended knobs and is
+    /// NUL-terminated (jemalloc requires the trailing C-string NUL). Gated on
+    /// `feature = "jemalloc"` to match the static's own cfg — the symbol does
+    /// not exist without the feature. See #3235 / #3232.
+    #[cfg(feature = "jemalloc")]
+    #[test]
+    fn test_malloc_conf_carries_decay_and_retain_knobs() {
+        let conf = super::malloc_conf;
+
+        // Must be NUL-terminated: jemalloc parses it as a C string.
+        assert_eq!(
+            conf.last(),
+            Some(&0u8),
+            "malloc_conf must end with the NUL terminator"
+        );
+
+        let conf_str = std::str::from_utf8(conf).expect("malloc_conf must be valid UTF-8");
+
+        for knob in [
+            "background_thread:true",
+            "dirty_decay_ms:1000",
+            "muzzy_decay_ms:1000",
+            "retain:false",
+        ] {
+            assert!(
+                conf_str.contains(knob),
+                "malloc_conf is missing knob `{knob}`; got `{conf_str}`"
+            );
+        }
+    }
+
     #[test]
     fn test_cli_run_command() {
         let cli = Cli::parse_from(["rs-stellar-core", "run", "--validator"]);
