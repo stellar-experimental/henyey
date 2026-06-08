@@ -241,6 +241,8 @@ Corresponds to: `EventManager.h`, `LumenEventReconciler.h`
 | `newBurnEvent()` | `new_burn_event()` | Full |
 | `newClawbackEvent()` | `new_clawback_event()` | Full |
 | `newSetAuthorizedEvent()` | `new_set_authorized_event()` | Full |
+| `removePoolShareTrustLine()` revoke events (`TransactionUtils.cpp:1640-1790`) | `redeem_into_claimable_balance()` records `RevokeEvent`s, replayed by `emit_pool_share_revoke_events()` (`ledger/execution/meta.rs`) before `set_authorized` | Full — issue #3117 Gap A; per pool asset, `burn` (pool→issuer) if holder issues the asset else `transfer` (pool→CB, `allowMuxedIdOrMemo=false`), asset_a-then-asset_b, before `set_authorized`. Hash-relevant (TransactionMetaV4 op events) |
+| `getPossibleMuxedData()` memo gate (`EventManager.cpp:111`) | `make_possible_muxed_data()` (`events.rs`) | Full — issue #3117 Gap B; memo→`to_muxed_id` only when `to` is an ACCOUNT (was previously attached to any recipient with a memo). Hash-relevant |
 | `eventsForClaimAtoms()` | `events_for_claim_atoms()` | Full |
 | `setEvents()` | `set_events()` | Full |
 | `newFeeEvent()` | `new_fee_event()` | Full |
