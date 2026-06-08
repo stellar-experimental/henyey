@@ -829,9 +829,14 @@ fn make_possible_muxed_data(
     allow_muxed_id_or_memo: bool,
 ) -> ScVal {
     let is_to_muxed = matches!(to, ScAddress::MuxedAccount(_));
-    let has_memo = !matches!(memo, Memo::None);
+    // Mirror stellar-core `getPossibleMuxedData` (EventManager.cpp:111): the
+    // memo branch is gated on the recipient being an ACCOUNT. A non-account
+    // recipient (e.g. a claimable-balance address) never carries the tx memo
+    // as `to_muxed_id`, even when a memo is present.
+    let is_to_account_with_memo =
+        matches!(to, ScAddress::Account(_)) && !matches!(memo, Memo::None);
 
-    if !allow_muxed_id_or_memo || (!is_to_muxed && !has_memo) {
+    if !allow_muxed_id_or_memo || (!is_to_muxed && !is_to_account_with_memo) {
         return make_i128_scval(amount);
     }
 
@@ -2172,6 +2177,27 @@ mod tests {
         match data {
             ScVal::Map(Some(_)) => {}
             _ => panic!("Expected Map for memo case"),
+        }
+    }
+
+    #[test]
+    fn test_make_possible_muxed_data_non_account_with_memo_is_plain_i128() {
+        // Regression for #3117 Gap B: a non-ACCOUNT recipient (e.g. a
+        // claimable-balance address) must NOT carry the tx memo as
+        // `to_muxed_id`, even when a memo is present and muxed/memo data is
+        // allowed. Mirrors stellar-core `getPossibleMuxedData` (EventManager.cpp:111)
+        // which gates the memo branch on `to.type() == SC_ADDRESS_TYPE_ACCOUNT`.
+        let to = ScAddress::ClaimableBalance(ClaimableBalanceId::ClaimableBalanceIdTypeV0(Hash(
+            [7; 32],
+        )));
+        let memo = Memo::Id(999);
+        let data = make_possible_muxed_data(&to, 1000, &memo, true);
+
+        match data {
+            ScVal::I128(_) => {}
+            other => {
+                panic!("Expected plain I128 for non-account recipient with memo, got {other:?}")
+            }
         }
     }
 

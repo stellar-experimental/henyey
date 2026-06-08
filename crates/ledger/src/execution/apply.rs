@@ -833,6 +833,7 @@ impl TransactionExecutor {
                                     &self.state,
                                     pre_claimable_balance.as_ref(),
                                     pre_pool.as_ref(),
+                                    &op_exec.revoke_events,
                                 );
                             }
 

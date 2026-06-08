@@ -15,8 +15,8 @@ use stellar_xdr::curr::{
 
 use super::{
     add_pool_reserve, add_pool_shares, ensure_account_liabilities, ensure_trustline_liabilities,
-    is_authorized_to_maintain_liabilities, issuer_for_asset, TxIdentity, AUTHORIZED_FLAG,
-    AUTHORIZED_TO_MAINTAIN_LIABILITIES_FLAG, TRUSTLINE_CLAWBACK_ENABLED_FLAG,
+    is_authorized_to_maintain_liabilities, issuer_for_asset, RevokeEvent, TxIdentity,
+    AUTHORIZED_FLAG, AUTHORIZED_TO_MAINTAIN_LIABILITIES_FLAG, TRUSTLINE_CLAWBACK_ENABLED_FLAG,
 };
 use crate::state::LedgerStateManager;
 use crate::validation::LedgerContext;
@@ -34,6 +34,7 @@ pub(crate) fn execute_allow_trust(
     tx_id: &TxIdentity<'_>,
     state: &mut LedgerStateManager,
     _context: &LedgerContext,
+    revoke_events: &mut Vec<RevokeEvent>,
 ) -> Result<OperationResult> {
     // Validate authorize value (matches stellar-core doCheckValid ordering).
     // Valid values: 0, AUTHORIZED_FLAG (1), AUTHORIZED_TO_MAINTAIN_LIABILITIES_FLAG (2).
@@ -113,6 +114,7 @@ pub(crate) fn execute_allow_trust(
         tx_id,
         state,
         _context,
+        revoke_events,
     )? {
         Some(RemoveResult::LowReserve) => {
             return Ok(make_allow_trust_result(AllowTrustResultCode::LowReserve));
@@ -148,6 +150,7 @@ pub(crate) fn execute_set_trust_line_flags(
     tx_id: &TxIdentity<'_>,
     state: &mut LedgerStateManager,
     _context: &LedgerContext,
+    revoke_events: &mut Vec<RevokeEvent>,
 ) -> Result<OperationResult> {
     // --- doCheckValid checks (before any state access) ---
 
@@ -285,6 +288,7 @@ pub(crate) fn execute_set_trust_line_flags(
         tx_id,
         state,
         _context,
+        revoke_events,
     )? {
         Some(RemoveResult::LowReserve) => {
             return Ok(make_set_flags_result(
@@ -327,6 +331,7 @@ fn asset_from_code(code: &stellar_xdr::curr::AssetCode, issuer: &AccountId) -> A
 /// when revoking liabilities authorization. Returns `Some(RemoveResult::LowReserve)`
 /// or `Some(RemoveResult::TooManySponsoring)` if pool share redemption fails,
 /// `None` if no deauthorization occurred or it succeeded.
+#[allow(clippy::too_many_arguments)]
 fn handle_deauthorization(
     old_flags: u32,
     new_flags: u32,
@@ -335,13 +340,15 @@ fn handle_deauthorization(
     tx_id: &TxIdentity<'_>,
     state: &mut LedgerStateManager,
     context: &LedgerContext,
+    revoke_events: &mut Vec<RevokeEvent>,
 ) -> Result<Option<RemoveResult>> {
     let was_authorized_to_maintain = is_authorized_to_maintain_liabilities(old_flags);
     let will_be_authorized_to_maintain = is_authorized_to_maintain_liabilities(new_flags);
 
     if was_authorized_to_maintain && !will_be_authorized_to_maintain {
         remove_offers_with_cleanup(state, trustor, asset)?;
-        let result = redeem_pool_share_trustlines(state, context, trustor, asset, tx_id)?;
+        let result =
+            redeem_pool_share_trustlines(state, context, trustor, asset, tx_id, revoke_events)?;
         if result != RemoveResult::Success {
             return Ok(Some(result));
         }
@@ -514,6 +521,7 @@ fn redeem_pool_share_trustlines(
     account_id: &AccountId,
     asset: &Asset,
     tx_id: &super::TxIdentity<'_>,
+    revoke_events: &mut Vec<RevokeEvent>,
 ) -> Result<RemoveResult> {
     if protocol_version_is_before(context.protocol_version, ProtocolVersion::V18) {
         return Ok(RemoveResult::Success);
@@ -586,6 +594,7 @@ fn redeem_pool_share_trustlines(
                 &cb_sponsoring_acc_id,
                 tx_id,
                 &pool_id,
+                revoke_events,
             )?;
             if res != RemoveResult::Success {
                 return Ok(res);
@@ -601,6 +610,7 @@ fn redeem_pool_share_trustlines(
                 &cb_sponsoring_acc_id,
                 tx_id,
                 &pool_id,
+                revoke_events,
             )?;
             if res != RemoveResult::Success {
                 return Ok(res);
@@ -627,6 +637,7 @@ fn redeem_pool_share_trustlines(
 }
 
 /// Create a claimable balance for a pool share redemption.
+#[allow(clippy::too_many_arguments)]
 fn redeem_into_claimable_balance(
     state: &mut LedgerStateManager,
     asset: &Asset,
@@ -635,19 +646,39 @@ fn redeem_into_claimable_balance(
     cb_sponsoring_acc_id: &AccountId,
     tx_id: &super::TxIdentity<'_>,
     pool_id: &PoolId,
+    revoke_events: &mut Vec<RevokeEvent>,
 ) -> Result<RemoveResult> {
-    // If amount is 0, nothing to do
+    // If amount is 0, nothing to do (and, matching stellar-core, no event).
     if amount == 0 {
         return Ok(RemoveResult::Success);
     }
 
-    // If the account is the issuer, no claimable balance needed
+    // If the account is the issuer, no claimable balance needed. stellar-core
+    // (`removePoolShareTrustLine`, TransactionUtils.cpp:1654) emits a `burn`
+    // event (pool -> issuer) on this early-return path. Record it before
+    // returning so the central emitter replays it before `set_authorized`.
     if is_issuer(account_id, asset) {
+        revoke_events.push(RevokeEvent {
+            asset: asset.clone(),
+            pool_id: pool_id.clone(),
+            amount,
+            claimable_balance_id: None,
+        });
         return Ok(RemoveResult::Success);
     }
 
     // Create the claimable balance entry
     let balance_id = get_revoke_id(tx_id, pool_id, asset)?;
+
+    // stellar-core emits the `transfer` (pool -> claimable balance) event here,
+    // immediately after computing the balance ID and before sponsorship
+    // processing (TransactionUtils.cpp:1674). Record it for the central emitter.
+    revoke_events.push(RevokeEvent {
+        asset: asset.clone(),
+        pool_id: pool_id.clone(),
+        amount,
+        claimable_balance_id: Some(balance_id.clone()),
+    });
 
     let claimant = Claimant::ClaimantTypeV0(ClaimantV0 {
         destination: account_id.clone(),
@@ -950,6 +981,7 @@ mod tests {
             },
             &mut state,
             &context,
+            &mut Vec::new(),
         );
         assert!(result.is_ok());
 
@@ -1012,6 +1044,7 @@ mod tests {
             },
             &mut state,
             &context,
+            &mut Vec::new(),
         )
         .unwrap();
         match result {
@@ -1050,6 +1083,7 @@ mod tests {
             },
             &mut state,
             &context,
+            &mut Vec::new(),
         )
         .expect("allow trust");
         match result {
@@ -1105,6 +1139,7 @@ mod tests {
             },
             &mut state,
             &context,
+            &mut Vec::new(),
         )
         .unwrap();
         match result {
@@ -1162,6 +1197,7 @@ mod tests {
             },
             &mut state,
             &context,
+            &mut Vec::new(),
         );
         assert!(result.is_ok());
 
@@ -1242,6 +1278,7 @@ mod tests {
             },
             &mut state,
             &context,
+            &mut Vec::new(),
         );
         assert!(result.is_ok());
 
@@ -1327,6 +1364,7 @@ mod tests {
             },
             &mut state,
             &context,
+            &mut Vec::new(),
         );
         assert!(result.is_ok());
 
@@ -1404,6 +1442,7 @@ mod tests {
             },
             &mut state,
             &context,
+            &mut Vec::new(),
         )
         .unwrap();
         match result {
@@ -1454,6 +1493,7 @@ mod tests {
             },
             &mut state,
             &context,
+            &mut Vec::new(),
         )
         .unwrap();
         match result {
@@ -1500,6 +1540,7 @@ mod tests {
             },
             &mut state,
             &context,
+            &mut Vec::new(),
         )
         .unwrap();
         match result {
@@ -1552,6 +1593,7 @@ mod tests {
             },
             &mut state,
             &context,
+            &mut Vec::new(),
         )
         .unwrap();
         match result {
@@ -1618,6 +1660,7 @@ mod tests {
             },
             &mut state,
             &context,
+            &mut Vec::new(),
         )
         .unwrap();
         match result {
@@ -1663,6 +1706,7 @@ mod tests {
             },
             &mut state,
             &context,
+            &mut Vec::new(),
         )
         .unwrap();
         match result {
@@ -1710,6 +1754,7 @@ mod tests {
             },
             &mut state,
             &context,
+            &mut Vec::new(),
         )
         .unwrap();
         match result {
@@ -1757,6 +1802,7 @@ mod tests {
             },
             &mut state,
             &context,
+            &mut Vec::new(),
         )
         .unwrap();
         match result {
@@ -1804,6 +1850,7 @@ mod tests {
             },
             &mut state,
             &context,
+            &mut Vec::new(),
         )
         .unwrap();
         match result {
@@ -1978,6 +2025,7 @@ mod tests {
             },
             &mut state,
             &context,
+            &mut Vec::new(),
         )
         .unwrap();
 
@@ -2149,6 +2197,7 @@ mod tests {
             },
             &mut state,
             &context,
+            &mut Vec::new(),
         )
         .unwrap();
 
@@ -2298,6 +2347,7 @@ mod tests {
             },
             &mut state,
             &context,
+            &mut Vec::new(),
         )
         .unwrap();
 
@@ -2431,6 +2481,7 @@ mod tests {
             },
             &mut state,
             &context,
+            &mut Vec::new(),
         )
         .unwrap();
 
@@ -2602,6 +2653,7 @@ mod tests {
             },
             &mut state,
             &context,
+            &mut Vec::new(),
         )
         .unwrap();
 
@@ -2717,6 +2769,7 @@ mod tests {
             },
             &mut state,
             &context,
+            &mut Vec::new(),
         )
         .unwrap();
         match result {
@@ -2747,6 +2800,7 @@ mod tests {
             },
             &mut state,
             &context,
+            &mut Vec::new(),
         )
         .unwrap();
         match result {
@@ -2869,6 +2923,7 @@ mod tests {
             },
             &mut state,
             &context,
+            &mut Vec::new(),
         )
         .unwrap();
         match result {
@@ -2923,7 +2978,14 @@ mod tests {
             op_index: 0,
         };
 
-        let result = execute_allow_trust(&op, &source_id, &tx_id, &mut state, &context);
+        let result = execute_allow_trust(
+            &op,
+            &source_id,
+            &tx_id,
+            &mut state,
+            &context,
+            &mut Vec::new(),
+        );
         match result.unwrap() {
             OperationResult::OpInner(OperationResultTr::AllowTrust(r)) => {
                 assert!(
@@ -3039,6 +3101,7 @@ mod tests {
             },
             &mut state,
             &context,
+            &mut Vec::new(),
         )
         .unwrap();
 
@@ -3160,6 +3223,7 @@ mod tests {
             },
             &mut state,
             &context,
+            &mut Vec::new(),
         )
         .unwrap();
 
@@ -3206,7 +3270,15 @@ mod tests {
             op_index: 0,
         };
 
-        let result = execute_allow_trust(&op, &issuer_id, &tx_id, &mut state, &context).unwrap();
+        let result = execute_allow_trust(
+            &op,
+            &issuer_id,
+            &tx_id,
+            &mut state,
+            &context,
+            &mut Vec::new(),
+        )
+        .unwrap();
         match result {
             OperationResult::OpInner(OperationResultTr::AllowTrust(r)) => {
                 assert!(
@@ -3260,8 +3332,15 @@ mod tests {
             op_index: 0,
         };
 
-        let result =
-            execute_set_trust_line_flags(&op, &issuer_id, &tx_id, &mut state, &context).unwrap();
+        let result = execute_set_trust_line_flags(
+            &op,
+            &issuer_id,
+            &tx_id,
+            &mut state,
+            &context,
+            &mut Vec::new(),
+        )
+        .unwrap();
         match result {
             OperationResult::OpInner(OperationResultTr::SetTrustLineFlags(r)) => {
                 assert!(
@@ -3370,7 +3449,14 @@ mod tests {
             op_index: 0,
         };
 
-        let _result = execute_set_trust_line_flags(&op, &issuer_id, &tx_id, &mut state, &context);
+        let _result = execute_set_trust_line_flags(
+            &op,
+            &issuer_id,
+            &tx_id,
+            &mut state,
+            &context,
+            &mut Vec::new(),
+        );
 
         // The offer should have been deleted as part of deauthorization
         assert!(
@@ -3932,6 +4018,7 @@ mod tests {
             },
             &mut state,
             &context,
+            &mut Vec::new(),
         )
         .expect("execute should not error");
 

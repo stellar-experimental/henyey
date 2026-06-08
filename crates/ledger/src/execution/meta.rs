@@ -142,6 +142,7 @@ pub(super) fn extract_hot_archive_restored_keys(
     keys
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn emit_classic_events_for_operation(
     op_event_manager: &mut OpEventManager,
     op: &Operation,
@@ -150,6 +151,7 @@ pub(super) fn emit_classic_events_for_operation(
     state: &LedgerStateManager,
     pre_claimable_balance: Option<&ClaimableBalanceEntry>,
     pre_pool: Option<&LiquidityPoolEntry>,
+    revoke_events: &[henyey_tx::operations::execute::RevokeEvent],
 ) {
     if !op_event_manager.is_enabled() {
         return;
@@ -280,12 +282,20 @@ pub(super) fn emit_classic_events_for_operation(
         OperationBody::AllowTrust(op_data) => {
             let issuer = henyey_tx::muxed_to_account_id(op_source);
             let asset = allow_trust_asset(op_data, &issuer);
+            // Pool-share-trustline revocation events (#3117 Gap A) are emitted
+            // BEFORE set_authorized, mirroring stellar-core's
+            // removePoolShareTrustLine ordering.
+            emit_pool_share_revoke_events(op_event_manager, revoke_events);
             if let Some(trustline) = state.get_trustline(&op_data.trustor, &asset) {
                 let authorize = trustline.flags & AUTHORIZED_FLAG != 0;
                 op_event_manager.new_set_authorized_event(&asset, &op_data.trustor, authorize);
             }
         }
         OperationBody::SetTrustLineFlags(op_data) => {
+            // Pool-share-trustline revocation events (#3117 Gap A) are emitted
+            // BEFORE set_authorized, mirroring stellar-core's
+            // removePoolShareTrustLine ordering.
+            emit_pool_share_revoke_events(op_event_manager, revoke_events);
             if let Some(trustline) = state.get_trustline(&op_data.trustor, &op_data.asset) {
                 let authorize = trustline.flags & AUTHORIZED_FLAG != 0;
                 op_event_manager.new_set_authorized_event(
@@ -375,6 +385,39 @@ pub(super) fn emit_classic_events_for_operation(
             }
         }
         _ => {}
+    }
+}
+
+/// Emit the buffered pool-share-trustline revocation events (#3117 Gap A) in
+/// the order they were recorded during execution (asset_a then asset_b, per
+/// pool in canonical ledger-key order). Mirrors stellar-core
+/// `removePoolShareTrustLine` (TransactionUtils.cpp:1640-1790):
+/// - issuer holder → `burn` (pool -> issuer);
+/// - otherwise → `transfer` (pool -> claimable balance) with
+///   `allowMuxedIdOrMemo = false`.
+///
+/// The `transfer` is emitted directly (not via the issuer-check variant)
+/// because the issuer case is already disambiguated at record time.
+fn emit_pool_share_revoke_events(
+    op_event_manager: &mut OpEventManager,
+    revoke_events: &[henyey_tx::operations::execute::RevokeEvent],
+) {
+    for ev in revoke_events {
+        let pool_address = ScAddress::LiquidityPool(ev.pool_id.clone());
+        match &ev.claimable_balance_id {
+            Some(cb_id) => {
+                op_event_manager.new_transfer_event(
+                    &ev.asset,
+                    &pool_address,
+                    &make_claimable_balance_address(cb_id),
+                    ev.amount,
+                    false,
+                );
+            }
+            None => {
+                op_event_manager.new_burn_event(&ev.asset, &pool_address, ev.amount);
+            }
+        }
     }
 }
 

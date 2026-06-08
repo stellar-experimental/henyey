@@ -639,6 +639,33 @@ impl HotArchiveRestore {
 pub struct OperationExecutionResult {
     pub result: OperationResult,
     pub soroban_meta: Option<SorobanOperationMeta>,
+    /// Pool-share-trustline revocation events produced during AllowTrust /
+    /// SetTrustLineFlags deauthorization (#3117 Gap A). These are recorded
+    /// during execution (when the pool state is available) but emitted by the
+    /// central classic-event emitter BEFORE the `set_authorized` event, to
+    /// mirror stellar-core's `removePoolShareTrustLine` ordering
+    /// (TransactionUtils.cpp:1640-1790). Empty for every other operation.
+    pub revoke_events: Vec<RevokeEvent>,
+}
+
+/// A single pool-share-trustline revocation SAC event, captured during
+/// deauthorization and replayed by the central emitter before `set_authorized`.
+///
+/// Mirrors stellar-core `removePoolShareTrustLine`'s per-pool-asset emission:
+/// when the holder issues the asset, a `burn` (pool -> issuer); otherwise a
+/// `transfer` (pool -> newly-created claimable balance). `allowMuxedIdOrMemo`
+/// is always `false` for these events.
+#[derive(Debug, Clone)]
+pub struct RevokeEvent {
+    /// The asset moving out of the pool.
+    pub asset: Asset,
+    /// The liquidity pool the asset is leaving (the event `from`).
+    pub pool_id: stellar_xdr::curr::PoolId,
+    /// The amount withdrawn from the pool for this asset.
+    pub amount: i64,
+    /// Some(cb) for a `transfer` to the claimable balance; None for a `burn`
+    /// to the issuer (holder issues this asset).
+    pub claimable_balance_id: Option<stellar_xdr::curr::ClaimableBalanceId>,
 }
 
 impl OperationExecutionResult {
@@ -646,6 +673,7 @@ impl OperationExecutionResult {
         Self {
             result,
             soroban_meta: None,
+            revoke_events: Vec::new(),
         }
     }
 
@@ -653,6 +681,15 @@ impl OperationExecutionResult {
         Self {
             result,
             soroban_meta: Some(meta),
+            revoke_events: Vec::new(),
+        }
+    }
+
+    fn with_revoke_events(result: OperationResult, revoke_events: Vec<RevokeEvent>) -> Self {
+        Self {
+            result,
+            soroban_meta: None,
+            revoke_events,
         }
     }
 }
@@ -1342,9 +1379,21 @@ pub fn execute_operation_with_soroban(
                     op_data, &op_source, state, context,
                 )?,
             )),
-            OperationBody::AllowTrust(op_data) => Ok(OperationExecutionResult::new(
-                trust_flags::execute_allow_trust(op_data, &op_source, &tx_id, state, context)?,
-            )),
+            OperationBody::AllowTrust(op_data) => {
+                let mut revoke_events = Vec::new();
+                let result = trust_flags::execute_allow_trust(
+                    op_data,
+                    &op_source,
+                    &tx_id,
+                    state,
+                    context,
+                    &mut revoke_events,
+                )?;
+                Ok(OperationExecutionResult::with_revoke_events(
+                    result,
+                    revoke_events,
+                ))
+            }
             OperationBody::Inflation => Ok(OperationExecutionResult::new(
                 inflation::execute_inflation(&op_source, state, context)?,
             )),
@@ -1377,11 +1426,21 @@ pub fn execute_operation_with_soroban(
             OperationBody::ClawbackClaimableBalance(op_data) => Ok(OperationExecutionResult::new(
                 clawback::execute_clawback_claimable_balance(op_data, &op_source, state, context)?,
             )),
-            OperationBody::SetTrustLineFlags(op_data) => Ok(OperationExecutionResult::new(
-                trust_flags::execute_set_trust_line_flags(
-                    op_data, &op_source, &tx_id, state, context,
-                )?,
-            )),
+            OperationBody::SetTrustLineFlags(op_data) => {
+                let mut revoke_events = Vec::new();
+                let result = trust_flags::execute_set_trust_line_flags(
+                    op_data,
+                    &op_source,
+                    &tx_id,
+                    state,
+                    context,
+                    &mut revoke_events,
+                )?;
+                Ok(OperationExecutionResult::with_revoke_events(
+                    result,
+                    revoke_events,
+                ))
+            }
             OperationBody::LiquidityPoolDeposit(op_data) => Ok(OperationExecutionResult::new(
                 liquidity_pool::execute_liquidity_pool_deposit(
                     op_data, &op_source, state, context,
