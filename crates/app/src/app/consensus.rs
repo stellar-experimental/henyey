@@ -409,10 +409,10 @@ impl App {
     /// production sites so it stays a faithful mirror of what they do.
     #[cfg(test)]
     pub(super) async fn post_close_trigger_and_arm(&self) {
-        // Trigger consensus immediately after a successful close.
-        self.try_trigger_consensus().await;
-        // Arm the event-driven trigger for the *next* ledger (#2702), the henyey
-        // analog of `lastClosedLedgerIncreased` → `setupTriggerNextLedger`.
+        // Arm-only (#3014): no immediate `try_trigger_consensus()` — the armed
+        // `TriggerNextLedger` timer is the sole nomination scheduler, matching
+        // stellar-core's arm-only `lastClosedLedgerIncreased`
+        // (HerderImpl.cpp:1218-1233).
         self.setup_trigger_next_ledger().await;
     }
 

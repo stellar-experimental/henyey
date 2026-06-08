@@ -533,19 +533,24 @@ impl App {
                         self.set_phase_sub(super::phase::PHASE_6_9_MAYBE_PUBLISH_HISTORY);
                         self.maybe_publish_history().await;
 
-                        // Trigger consensus immediately after a successful close.
-                        // Both validators and watchers participate: validators
-                        // nominate; watchers build/cache the next-slot tx set
-                        // (parity: HERDER §5.2).
-                        self.set_phase_sub(super::phase::PHASE_6_10_TRY_TRIGGER_CONSENSUS);
-                        self.try_trigger_consensus().await;
-
                         // Arm the event-driven trigger for the *next* ledger
-                        // (#2702). This is the henyey analog of stellar-core's
-                        // `lastClosedLedgerIncreased` → `setupTriggerNextLedger`:
-                        // a close just advanced LCL, so schedule the next
-                        // nomination via a single-shot timer instead of relying
-                        // on the 1-second poll.
+                        // (#2702/#3014). A close just advanced LCL, so schedule
+                        // the next nomination via a single-shot
+                        // `TriggerNextLedger` timer. This is the henyey analog of
+                        // stellar-core's `lastClosedLedgerIncreased` →
+                        // `setupTriggerNextLedger` (HerderImpl.cpp:1218-1233),
+                        // which is **arm-only**: it does NOT call
+                        // `try_trigger_consensus()` synchronously here. The
+                        // immediate fire happens via the timer's
+                        // `triggerTime < now` clamp (in steady state the delay
+                        // clamps to ~0, so the timer fires on the next event-loop
+                        // iteration), and the timer-fire path carries the
+                        // close-pipeline pump signal the inline call lacked
+                        // (preserving the solo self-externalize cold-start). Both
+                        // validators and watchers participate via the fired timer
+                        // (parity: HERDER §5.2). The 1-second maintenance tick
+                        // remains as the safety-net backstop.
+                        self.set_phase_sub(super::phase::PHASE_6_10_TRY_TRIGGER_CONSENSUS);
                         self.setup_trigger_next_ledger().await;
 
                         // Drain SCP + fetch response channels.
