@@ -6462,6 +6462,61 @@ mod tests {
         );
     }
 
+    /// Parity-lock for #3050 (HERDER §15.4-5: numeric upgrade positivity), via
+    /// the ledger-state-aware `ScpDriver::is_valid_upgrade_for_apply` path.
+    ///
+    /// stellar-core `Upgrades::isValidForApply`
+    /// (`stellar-core/src/herder/Upgrades.cpp:591-631`) applies NO positivity
+    /// check: only `BaseFee != 0` / `BaseReserve != 0` are enforced; `MaxTxSetSize`
+    /// and `MaxSorobanTxSetSize` accept any size (incl. zero), with the Soroban
+    /// variant additionally gated on protocol ≥ 20. henyey already matches core.
+    /// This test passes today and would fail only if a spurious positivity check
+    /// were added (as the old spec wrongly demanded). Companion to
+    /// `upgrades::test_numeric_upgrade_zero_accepted_matches_core`, which locks
+    /// the no-ledger-state path.
+    #[test]
+    fn test_numeric_upgrade_zero_accepted_matches_core() {
+        let lm = make_default_lm();
+
+        // MaxTxSetSize: any size, incl. zero (core "any size is allowed").
+        assert!(
+            ScpDriver::is_valid_upgrade_for_apply(&LedgerUpgrade::MaxTxSetSize(0), 25, &lm),
+            "MaxTxSetSize(0) must be VALID per core — no positivity check"
+        );
+        assert!(
+            ScpDriver::is_valid_upgrade_for_apply(&LedgerUpgrade::MaxTxSetSize(1), 25, &lm),
+            "MaxTxSetSize(1) must be VALID"
+        );
+
+        // MaxSorobanTxSetSize: any size at protocol >= 20; gated below 20.
+        assert!(
+            ScpDriver::is_valid_upgrade_for_apply(&LedgerUpgrade::MaxSorobanTxSetSize(0), 20, &lm),
+            "MaxSorobanTxSetSize(0) must be VALID at protocol >= 20 per core"
+        );
+        assert!(
+            !ScpDriver::is_valid_upgrade_for_apply(&LedgerUpgrade::MaxSorobanTxSetSize(0), 19, &lm),
+            "MaxSorobanTxSetSize(0) must be INVALID below protocol 20 (protocol gate)"
+        );
+
+        // BaseFee / BaseReserve: the ONLY non-zero checks.
+        assert!(
+            !ScpDriver::is_valid_upgrade_for_apply(&LedgerUpgrade::BaseFee(0), 25, &lm),
+            "BaseFee(0) must be INVALID"
+        );
+        assert!(
+            !ScpDriver::is_valid_upgrade_for_apply(&LedgerUpgrade::BaseReserve(0), 25, &lm),
+            "BaseReserve(0) must be INVALID"
+        );
+        assert!(
+            ScpDriver::is_valid_upgrade_for_apply(&LedgerUpgrade::BaseFee(1), 25, &lm),
+            "BaseFee(1) must be VALID"
+        );
+        assert!(
+            ScpDriver::is_valid_upgrade_for_apply(&LedgerUpgrade::BaseReserve(1), 25, &lm),
+            "BaseReserve(1) must be VALID"
+        );
+    }
+
     /// Regression test for AUDIT-220 / issue #2157: validate_value_against_local_state
     /// must not allow a value to reach Valid without full tx-set content validation.
     ///

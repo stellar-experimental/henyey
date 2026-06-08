@@ -966,6 +966,84 @@ mod tests {
         assert_eq!(validity, UpgradeValidity::Invalid);
     }
 
+    /// Parity-lock for #3050 (HERDER §15.4-5: numeric upgrade positivity).
+    ///
+    /// stellar-core `Upgrades::isValidForApply`
+    /// (`stellar-core/src/herder/Upgrades.cpp:591-631`) applies NO positivity
+    /// check to the numeric upgrades: only `BaseFee != 0` and `BaseReserve != 0`
+    /// are enforced; `MaxTxSetSize` accepts any size (incl. zero) and
+    /// `MaxSorobanTxSetSize` accepts any size (incl. zero) once protocol ≥
+    /// `SOROBAN_PROTOCOL_VERSION` (20). henyey already matches core in both
+    /// validation paths. This test passes today and locks that parity — a future
+    /// spurious "must be a positive integer" check (as the old spec wrongly
+    /// demanded) would make it fail.
+    #[test]
+    fn test_numeric_upgrade_zero_accepted_matches_core() {
+        use stellar_xdr::curr::WriteXdr;
+
+        fn encode(upgrade: LedgerUpgrade) -> UpgradeType {
+            UpgradeType(
+                upgrade
+                    .to_xdr(stellar_xdr::curr::Limits::none())
+                    .unwrap()
+                    .try_into()
+                    .unwrap(),
+            )
+        }
+
+        // --- MaxTxSetSize: any size, incl. zero (core "any size is allowed") ---
+        let (validity, _) = is_valid_for_apply(&encode(LedgerUpgrade::MaxTxSetSize(0)), 25, 25);
+        assert_eq!(
+            validity,
+            UpgradeValidity::Valid,
+            "MaxTxSetSize(0) must be VALID per core — no positivity check"
+        );
+        let (validity, _) = is_valid_for_apply(&encode(LedgerUpgrade::MaxTxSetSize(1)), 25, 25);
+        assert_eq!(
+            validity,
+            UpgradeValidity::Valid,
+            "MaxTxSetSize(1) must be VALID"
+        );
+
+        // --- MaxSorobanTxSetSize: any size at protocol >= 20; gated below 20 ---
+        let (validity, _) =
+            is_valid_for_apply(&encode(LedgerUpgrade::MaxSorobanTxSetSize(0)), 20, 25);
+        assert_eq!(
+            validity,
+            UpgradeValidity::Valid,
+            "MaxSorobanTxSetSize(0) must be VALID at protocol >= 20 per core — no positivity check"
+        );
+        let (validity, _) =
+            is_valid_for_apply(&encode(LedgerUpgrade::MaxSorobanTxSetSize(0)), 19, 25);
+        assert_eq!(
+            validity,
+            UpgradeValidity::Invalid,
+            "MaxSorobanTxSetSize(0) must be INVALID below protocol 20 (protocol gate)"
+        );
+
+        // --- BaseFee / BaseReserve: the ONLY non-zero checks ---
+        let (validity, _) = is_valid_for_apply(&encode(LedgerUpgrade::BaseFee(0)), 25, 25);
+        assert_eq!(
+            validity,
+            UpgradeValidity::Invalid,
+            "BaseFee(0) must be INVALID"
+        );
+        let (validity, _) = is_valid_for_apply(&encode(LedgerUpgrade::BaseReserve(0)), 25, 25);
+        assert_eq!(
+            validity,
+            UpgradeValidity::Invalid,
+            "BaseReserve(0) must be INVALID"
+        );
+        let (validity, _) = is_valid_for_apply(&encode(LedgerUpgrade::BaseFee(1)), 25, 25);
+        assert_eq!(validity, UpgradeValidity::Valid, "BaseFee(1) must be VALID");
+        let (validity, _) = is_valid_for_apply(&encode(LedgerUpgrade::BaseReserve(1)), 25, 25);
+        assert_eq!(
+            validity,
+            UpgradeValidity::Valid,
+            "BaseReserve(1) must be VALID"
+        );
+    }
+
     #[test]
     fn test_upgrade_to_string() {
         assert_eq!(
