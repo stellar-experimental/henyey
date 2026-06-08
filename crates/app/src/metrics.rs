@@ -507,6 +507,12 @@ metric_catalog! {
             => "Current SCP ballot phase of the tracking slot (0=unknown, 1=prepare, 2=confirm, 3=externalize)";
         SCP_MEMORY_CUMULATIVE_STATEMENTS = "stellar_scp_memory_cumulative_statements"
             => "Total SCP statements currently held in memory (decreases after slot purging)";
+
+        // Startup/catchup peak RSS (issue #3226). Set once when the startup
+        // sampler stops, before the event loop's first ledger close. Covers the
+        // restore + catchup window that the `% 64` ledger-close report misses.
+        STARTUP_PEAK_ANON_RSS_MB = "henyey_startup_peak_anon_rss_mb"
+            => "Peak anonymous RSS (MB) observed during startup restore + catchup";
     }
 
     gauges_no_prereg {
@@ -2030,6 +2036,35 @@ mod tests {
         assert!(
             output.contains("stellar_protocol_version"),
             "stellar_protocol_version not found in rendered metrics"
+        );
+    }
+
+    /// Issue #3226: the startup peak-anon-RSS gauge is in the gauge catalog and
+    /// pre-registered at 0 (so dashboards render it before the sampler stops).
+    /// Mirrors the #3168 eviction-catalog test pattern.
+    #[test]
+    fn test_startup_peak_gauge_in_catalog() {
+        let gauge_names: HashSet<&str> = ALL_GAUGE_NAMES.iter().copied().collect();
+        assert!(
+            gauge_names.contains("henyey_startup_peak_anon_rss_mb"),
+            "henyey_startup_peak_anon_rss_mb missing from gauge catalog"
+        );
+        let prereg: HashSet<&str> = ALL_PREREGISTERED_GAUGE_NAMES.iter().copied().collect();
+        assert!(
+            prereg.contains("henyey_startup_peak_anon_rss_mb"),
+            "henyey_startup_peak_anon_rss_mb must be pre-registered at 0"
+        );
+    }
+
+    #[test]
+    fn test_startup_peak_gauge_preregistered_at_zero() {
+        let handle = ensure_test_recorder();
+        describe_metrics();
+        register_label_series();
+        let output = handle.render();
+        assert!(
+            output.contains("henyey_startup_peak_anon_rss_mb"),
+            "henyey_startup_peak_anon_rss_mb not found in rendered metrics"
         );
     }
 

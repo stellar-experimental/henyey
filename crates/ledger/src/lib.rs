@@ -82,6 +82,7 @@ pub mod offer;
 pub mod offer_store;
 pub mod p23_hot_archive_bug;
 mod p23_hot_archive_bug_data;
+pub mod peak_rss_sampler;
 mod prepare_liabilities;
 mod snapshot;
 mod soroban_state;
@@ -111,6 +112,7 @@ pub use manager::{
     LedgerManagerConfig,
 };
 pub use memory_report::log_startup_memory;
+pub use peak_rss_sampler::{Phase as StartupPhase, StartupPeakRssSampler};
 pub use snapshot::{
     EntriesLookupFn, EntryLookupFn, LedgerSnapshot, PoolShareTrustlinesByAccountFn,
     SnapshotBuilder, SnapshotHandle,

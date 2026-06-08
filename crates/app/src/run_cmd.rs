@@ -47,6 +47,7 @@ use crate::compat_http::CompatServer;
 use crate::config::AppConfig;
 use crate::http::{QueryServer, StatusServer};
 use henyey_history::CatchupRunMode;
+use henyey_ledger::peak_rss_sampler::{Phase as StartupPhase, StartupPeakRssSampler};
 
 /// Node running mode determining behavior and consensus participation.
 ///
@@ -370,6 +371,17 @@ fn print_startup_info(app: &App, options: &RunOptions) {
 
 /// Run the main application loop.
 async fn run_main_loop(app: Arc<App>, options: RunOptions) -> anyhow::Result<()> {
+    // Observability (#3226): sample peak anonymous RSS across the startup
+    // restore + catchup window — the region the `% 64` ledger-close memory
+    // report misses (that report only fires once replay is underway, after the
+    // restore peak has already been released). The sampler runs a single
+    // background std::thread (tokio-independent) that polls RssAnon ~1/s and
+    // tracks a running max; it shares no mutable state with the close/consensus
+    // path and has zero effect on hashes/timing. `mut` so we can tag the phase
+    // and stop it before the event loop is spawned (below), where the peak is
+    // published to the `henyey_startup_peak_anon_rss_mb` gauge.
+    let mut startup_rss_sampler = StartupPeakRssSampler::start();
+
     // Check for force-scp flag (standalone single-node bootstrap).
     // When set, skip all catchup and restore the node directly from DB state.
     let force_scp = app.check_force_scp().await;
@@ -419,6 +431,9 @@ async fn run_main_loop(app: Arc<App>, options: RunOptions) -> anyhow::Result<()>
             tracing::info!("Watcher mode: skipping catchup");
         } else {
             tracing::info!("Node is behind, starting catchup");
+
+            // Tag subsequent peak samples as the catchup phase (#3226).
+            startup_rss_sampler.set_phase(StartupPhase::Catchup);
 
             // Start overlay network BEFORE catchup to receive tx_sets during catchup.
             // This helps bridge the gap between catchup checkpoint and live consensus.
@@ -477,6 +492,17 @@ async fn run_main_loop(app: Arc<App>, options: RunOptions) -> anyhow::Result<()>
             app.refresh_max_tx_size_bytes().await;
         }
     }
+
+    // Stop the startup peak-RSS sampler (#3226) BEFORE the event loop is
+    // spawned, so the reported peak covers exactly the restore + catchup window
+    // and never overlaps with the `% 64` ledger-close report. stop() joins the
+    // sampler thread (no leak), emits the greppable
+    // `startup_peak_anon_rss_mb=<N> phase=<peak-phase>` one-liner, and returns
+    // the peak in bytes; publish it as a gauge. On non-Linux / read error this
+    // is 0 (no panic), inheriting ProcessMemory::capture()'s contract.
+    let startup_peak_bytes = startup_rss_sampler.stop();
+    let startup_peak_mb = startup_peak_bytes as f64 / (1024.0 * 1024.0);
+    crate::metrics::STARTUP_PEAK_ANON_RSS_MB.set(startup_peak_mb);
 
     // Start the sync recovery manager for consensus stuck detection
     app.start_sync_recovery();
