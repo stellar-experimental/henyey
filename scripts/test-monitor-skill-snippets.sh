@@ -45,7 +45,7 @@ cleanup  # ensure fresh state
 mkdir -p "$TEST_ROOT"
 
 # ── TAP state ────────────────────────────────────────────────────────────────
-TAP_PLAN=325
+TAP_PLAN=327
 TAP_CURRENT=0
 TAP_FAILURES=0
 
@@ -1646,6 +1646,37 @@ PYEOF
   else
     tap_not_ok "check-12b-semantics: metric label from TOML in both specs" \
       "Expected '$metric_label' in both Check 12b section and monitor-loop table"
+  fi
+
+  # Test 53b: recovery-stalled snapshot_file is a BARE filename (no '/'), matching
+  # sibling snapshots (ratio_snapshot / counter_dynamic_snapshot). The evaluator
+  # resolves snapshot_path = Path(state_dir) / snapshot_file and the SKILL invokes
+  # it with --state-dir .../metrics, so any 'metrics/' prefix here doubles the path
+  # (.../metrics/metrics/counter_streak_snapshot). See #3222. A directory prefix is
+  # invalid; the bare name resolves single-level under --state-dir. Substring greps
+  # (Tests 44/48) do NOT catch the doubling because the bare name is a substring of
+  # the doubled path — hence this dedicated structural assertion.
+  if [[ "$snapshot_file" != */* && "$snapshot_file" == "counter_streak_snapshot" ]]; then
+    tap_ok "metric-alarms: recovery-stalled snapshot_file is bare filename ($snapshot_file)"
+  else
+    tap_not_ok "metric-alarms: recovery-stalled snapshot_file is bare filename" \
+      "snapshot_file must be the bare name 'counter_streak_snapshot' (no '/' prefix), got '$snapshot_file' — a directory prefix doubles the resolved path under --state-dir .../metrics (#3222)"
+  fi
+
+  # Test 53c: check-12b Format block documents the evaluator's ACTUAL snapshot
+  # schema. eval-alarms.py writes version/pid/start_ticks/counter_value/breach_streak
+  # (no timestamp). The check-12b prose must use counter_value / breach_streak and
+  # must NOT contain the drifted field names recovery_stalled_behind /
+  # recovery_stalled_breach_streak / timestamp. See #3222.
+  if echo "$check_12b_section" | grep -Fq 'counter_value' \
+     && echo "$check_12b_section" | grep -Fq 'breach_streak' \
+     && ! echo "$check_12b_section" | grep -Fq 'recovery_stalled_behind' \
+     && ! echo "$check_12b_section" | grep -Fq 'recovery_stalled_breach_streak' \
+     && ! echo "$check_12b_section" | grep -Fq 'timestamp'; then
+    tap_ok "check-12b-semantics: doc snapshot schema matches evaluator (counter_value/breach_streak)"
+  else
+    tap_not_ok "check-12b-semantics: doc snapshot schema matches evaluator (counter_value/breach_streak)" \
+      "Check 12b prose must use 'counter_value'/'breach_streak' and must NOT contain 'recovery_stalled_behind', 'recovery_stalled_breach_streak', or 'timestamp' (drifted from eval-alarms.py schema, #3222)"
   fi
 
   # ════════════════════════════════════════════════════════════════════════════
@@ -3773,9 +3804,10 @@ except:
   # fire.
   local state_dir_148c
   state_dir_148c=$(mktemp -d)
-  # Pre-seed a snapshot from the PRE-restart incarnation (pid=1000).
-  mkdir -p "$state_dir_148c/metrics"
-  cat > "$state_dir_148c/metrics/counter_streak_snapshot" <<'SNAP_148C'
+  # Pre-seed a snapshot from the PRE-restart incarnation (pid=1000). The catalog
+  # snapshot_file is the BARE name (#3222), so the evaluator resolves it directly
+  # under --state-dir (no 'metrics/' subdir).
+  cat > "$state_dir_148c/counter_streak_snapshot" <<'SNAP_148C'
 version=1
 pid=1000
 start_ticks=1000
@@ -3821,8 +3853,7 @@ except:
   # Test 148d: recovery-stalled clean restart below threshold does NOT fire.
   local state_dir_148d
   state_dir_148d=$(mktemp -d)
-  mkdir -p "$state_dir_148d/metrics"
-  cat > "$state_dir_148d/metrics/counter_streak_snapshot" <<'SNAP_148D'
+  cat > "$state_dir_148d/counter_streak_snapshot" <<'SNAP_148D'
 version=1
 pid=1000
 start_ticks=1000
@@ -3891,9 +3922,10 @@ except:
 " 2>/dev/null || echo "parse-error"
   }
   seed_148e_snapshot() {
-    # $1 = state-dir; (re)write the PRE-restart snapshot fixture.
-    mkdir -p "$1/metrics"
-    cat > "$1/metrics/counter_streak_snapshot" <<'SNAP_148E'
+    # $1 = state-dir; (re)write the PRE-restart snapshot fixture. The catalog
+    # snapshot_file is the BARE name (#3222), so the evaluator resolves it
+    # directly under --state-dir (no 'metrics/' subdir).
+    cat > "$1/counter_streak_snapshot" <<'SNAP_148E'
 version=1
 pid=1000
 start_ticks=1000
@@ -3951,7 +3983,7 @@ TICK_PROM_148E
   # so parse_args() exits non-zero, out3 is empty, and rs3 != firing.
   seed_148e_snapshot "$state_dir_148e"
   local snap_before_148e
-  snap_before_148e=$(cat "$state_dir_148e/metrics/counter_streak_snapshot")
+  snap_before_148e=$(cat "$state_dir_148e/counter_streak_snapshot")
   local out3_148e rs3_148e snap_after_148e
   out3_148e=$(MONITOR_MODE=validator UPTIME_SECONDS=900 WARMUP_TICKS_REMAINING=0 \
     PID=2000 START_TICKS=2000 \
@@ -3967,7 +3999,7 @@ TICK_PROM_148E
     tap_not_ok "eval-alarms: --no-snapshot-write run 3 (with flag) still fires recovery-stalled" \
       "expected firing with --no-snapshot-write, got $rs3_148e (unknown flag on origin/main?)"
   fi
-  snap_after_148e=$(cat "$state_dir_148e/metrics/counter_streak_snapshot")
+  snap_after_148e=$(cat "$state_dir_148e/counter_streak_snapshot")
   if [[ "$snap_before_148e" == "$snap_after_148e" ]]; then
     tap_ok "eval-alarms: --no-snapshot-write leaves counter_streak_snapshot byte-unchanged"
   else

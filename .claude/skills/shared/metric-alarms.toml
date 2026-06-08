@@ -706,11 +706,11 @@ burst_threshold = 10
 # episode accrued 213; a clean restart reaching real-time sync promptly accrues
 # only a handful. 0/absent disables the check.
 post_restart_absolute_threshold = 50
-baseline_version = 2  # bumped in #3198: add post_restart_absolute_threshold post-restart absolute fire
-semantic_change_date = "2026-06-06T00:00:00Z"
+baseline_version = 3  # bumped in #3222: de-double snapshot_file (metrics/ prefix removed → bare filename)
+semantic_change_date = "2026-06-07T00:00:00Z"
 severity = "WARN"
 gates = ["validator-only"]
-snapshot_file = "metrics/counter_streak_snapshot"
+snapshot_file = "counter_streak_snapshot"
 cooldown_key = "henyey_recovery_stalled_tick_total{reason=\"forcing_catchup_behind\"}"
 cooldown_seconds = 7200
 filing_title = "metrics: henyey_recovery_stalled_tick_total{reason=\"forcing_catchup_behind\"} — sustained breach"
