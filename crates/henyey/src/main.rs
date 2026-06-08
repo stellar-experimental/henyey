@@ -73,10 +73,28 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 // - background_thread: purge dirty/muzzy pages asynchronously
 // - dirty_decay_ms=1000: return dirty pages to OS after 1s (default 10s)
 // - muzzy_decay_ms=1000: decommit muzzy pages after 1s (default 10s)
+// - retain=false: munmap freed virtual extents instead of retaining them.
+//   jemalloc's 5.0+ default is retain=true, which holds freed extents as
+//   retained virtual memory for fast reuse. During a multi-minute cold-catchup
+//   apply, the large transient working sets (HAS buffers, parallel bucket-apply
+//   scratch, cache-scan structures) are allocated and freed in churn; with
+//   retain=true the resident high-water stays inflated by the cumulative
+//   retained footprint. retain=false munmaps each freed extent, so — combined
+//   with the 1s decay + background_thread above — freed memory is returned to
+//   the OS continuously (~1s behind frees), bounding the *instantaneous* anon-RSS
+//   peak that is the binding constraint on a 32 GB / no-swap host.
+//   Tradeoff (honest): heap *growth* must re-mmap from the OS (syscall +
+//   first-touch fault) rather than recommitting a retained extent — a small
+//   steady-state alloc-path cost, assessed amortized for a validator whose
+//   steady-state RSS is dominated by stable, once-allocated caches/ledger state
+//   (infrequent growth events). Operator-authorized per #3233 / #3235.
+//   See #3235 / #3232. Catchup-scoped mallctl purge is the documented fallback
+//   if re-measurement shows steady-state regression.
 #[cfg(feature = "jemalloc")]
 #[allow(non_upper_case_globals)]
 #[export_name = "malloc_conf"]
-pub static malloc_conf: &[u8] = b"background_thread:true,dirty_decay_ms:1000,muzzy_decay_ms:1000\0";
+pub static malloc_conf: &[u8] =
+    b"background_thread:true,dirty_decay_ms:1000,muzzy_decay_ms:1000,retain:false\0";
 
 use std::path::{Path, PathBuf};
 
