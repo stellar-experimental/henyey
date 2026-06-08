@@ -6,7 +6,7 @@ use henyey_ledger::LedgerAdvanceParams;
 use henyey_ledger::{LedgerSnapshot, SnapshotBuilder, SnapshotHandle};
 use henyey_tx::{
     soroban::{PersistentModuleCache, SorobanConfig},
-    ClassicEventConfig, OpEventManager,
+    ClassicEventConfig, OpEventManager, TxEventManager,
 };
 use stellar_xdr::curr::{
     AccountEntry, AccountEntryExt, AccountEntryExtensionV1, AccountEntryExtensionV1Ext,
@@ -29,7 +29,8 @@ use stellar_xdr::curr::{
     LiquidityPoolEntryBody, LiquidityPoolEntryConstantProduct, LiquidityPoolWithdrawOp,
     ManageSellOfferOp, ManageSellOfferResult, Memo, MuxedAccount, MuxedAccountMed25519, OfferEntry,
     OfferEntryExt, Operation, OperationBody, OperationResult, OperationResultTr,
-    PathPaymentStrictReceiveOp, PathPaymentStrictSendOp, PathPaymentStrictSendResult,
+    PathPaymentStrictReceiveOp, PathPaymentStrictReceiveResult,
+    PathPaymentStrictReceiveResultSuccess, PathPaymentStrictSendOp, PathPaymentStrictSendResult,
     PathPaymentStrictSendResultSuccess, PoolId, Preconditions, PreconditionsV2, Price, PublicKey,
     ScAddress, ScString, ScSymbol, ScVal, SequenceNumber, SetOptionsOp, SetOptionsResult,
     SetTrustLineFlagsOp, Signature as XdrSignature, SignatureHint, Signer, SignerKey,
