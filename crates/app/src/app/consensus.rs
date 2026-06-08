@@ -401,6 +401,21 @@ impl App {
     /// Self-gates on `manual_close` (stellar-core skips `async_wait` under
     /// MANUAL_CLOSE, HerderImpl.cpp:1298-1303) and on `is_tracking`. Always
     /// cancels any prior trigger timer for the next slot before re-arming.
+    /// Test-only mirror of the post-close consensus-trigger subsequence run at
+    /// the two production post-close sites (`lifecycle.rs` select-loop close
+    /// completion and the `try_apply_buffered_ledgers` burst helper). The
+    /// regression test `test_post_close_arms_trigger_without_immediate_nomination`
+    /// asserts on this canonical sequence; it is edited in lockstep with the two
+    /// production sites so it stays a faithful mirror of what they do.
+    #[cfg(test)]
+    pub(super) async fn post_close_trigger_and_arm(&self) {
+        // Trigger consensus immediately after a successful close.
+        self.try_trigger_consensus().await;
+        // Arm the event-driven trigger for the *next* ledger (#2702), the henyey
+        // analog of `lastClosedLedgerIncreased` → `setupTriggerNextLedger`.
+        self.setup_trigger_next_ledger().await;
+    }
+
     pub(super) async fn setup_trigger_next_ledger(&self) {
         // Parity: MANUAL_CLOSE skips arming the trigger timer.
         if self.config.node.manual_close {
@@ -3050,6 +3065,96 @@ mod tests {
         assert!(
             !pump,
             "SCP nomination timeout must not signal a close-pipeline pump"
+        );
+    }
+
+    /// #3014: the post-close path must be **arm-only** — it arms the
+    /// `TriggerNextLedger` timer but must NOT call `try_trigger_consensus`
+    /// synchronously. This mirrors stellar-core's `lastClosedLedgerIncreased`
+    /// (HerderImpl.cpp:1218-1233), which calls only `setupTriggerNextLedger`;
+    /// the immediate fire happens via the timer's `triggerTime < now` clamp.
+    ///
+    /// Discrimination: the test bootstraps the steady-state regime where
+    /// `prepare_start(last_slot)` is `None` (cold start), so the trigger-time
+    /// gate inside `try_trigger_consensus` does NOT block. This is the only
+    /// regime that distinguishes pre/post: a fast/solo close already self-gates
+    /// on `origin/main` and would prove nothing.
+    ///
+    /// - Pre-fix (`origin/main`): the post-close sequence ran
+    ///   `try_trigger_consensus().await` immediately, so `consensus_trigger_attempts`
+    ///   incremented synchronously — this assertion FAILS.
+    /// - Post-fix: the post-close sequence is arm-only, so the counter does NOT
+    ///   move until the armed timer fires and is handled — this assertion PASSES.
+    #[tokio::test(start_paused = true)]
+    async fn test_post_close_arms_trigger_without_immediate_nomination() {
+        let (_dir, app) = mk_validator_app().await;
+
+        // Bootstrap at ledger 1 → tracking, LCL 1, next slot 2. prepare_start(1)
+        // is None on cold start, so the trigger-time gate in
+        // try_trigger_consensus does NOT block — the steady-state regime that
+        // discriminates pre/post.
+        app.herder.bootstrap(1);
+        assert!(app.herder.is_tracking());
+        assert!(
+            app.herder.prepare_start(1).is_none(),
+            "test precondition: prepare_start(LCL) must be None so the \
+             trigger-time gate does not block (the only regime that \
+             discriminates pre/post)"
+        );
+
+        let attempts_before = app.consensus_trigger_attempts.load(Ordering::Relaxed);
+
+        // Run the exact post-close subsequence the production sites run.
+        app.post_close_trigger_and_arm().await;
+
+        // (a) The post-close arm must NOT have triggered nomination
+        // synchronously. FAILS on origin/main (immediate try_trigger_consensus
+        // bumps the counter before any timer fires); PASSES post-fix.
+        assert_eq!(
+            app.consensus_trigger_attempts.load(Ordering::Relaxed),
+            attempts_before,
+            "post-close must be arm-only: try_trigger_consensus must NOT run \
+             synchronously (parity: lastClosedLedgerIncreased is arm-only)"
+        );
+
+        // (b) A TriggerNextLedger timer was armed for slot == current_ledger + 1.
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        let mut rx = app.scp_timer_rx.lock().await;
+        // prepare_start is None → delay is only ctValidityOffset (0) → fires
+        // effectively immediately under paused time.
+        tokio::time::advance(std::time::Duration::from_secs(2)).await;
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        let delivered = rx
+            .try_recv()
+            .expect("expected a TriggerNextLedger timer event to be delivered");
+        assert_eq!(
+            delivered.timer_type,
+            henyey_herder::TimerType::TriggerNextLedger
+        );
+        assert_eq!(
+            delivered.slot, 2,
+            "armed trigger timer must target current_ledger + 1"
+        );
+        drop(rx);
+
+        // (c) Handling the fired TriggerNextLedger event triggers nomination
+        // (attempts increments) and signals the close-pipeline pump — proving
+        // the trigger moved from immediate to timer-driven without losing
+        // close→nominate liveness.
+        let pump = app.handle_scp_timer_event(delivered).await;
+        assert!(
+            pump,
+            "a fired TriggerNextLedger event must signal the caller to pump the close pipeline"
+        );
+        assert_eq!(
+            app.consensus_trigger_attempts.load(Ordering::Relaxed),
+            attempts_before + 1,
+            "handling the armed TriggerNextLedger event must trigger nomination \
+             (timer-driven, not immediate)"
         );
     }
 }
