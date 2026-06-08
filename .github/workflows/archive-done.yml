@@ -43,19 +43,35 @@ jobs:
       # org-level ProjectV2 scope required by archive-stale-done.sh. That
       # requires a fine-grained PAT with Projects:Read+Write on
       # stellar-experimental, set as the PROJECT_BOARD_TOKEN secret.
+      # `secrets.*` cannot be used in step/job `if:` expressions, so this guard
+      # maps PROJECT_BOARD_TOKEN's presence into a step OUTPUT (`present`), which
+      # IS usable in a later `if:`. When the secret is absent we emit a `::notice::`
+      # (not `::warning::`) with the operator action — a clean skip should look
+      # clean in the run log, not alarming.
       - name: Check PROJECT_BOARD_TOKEN secret
+        id: check_token
         env:
           HAS_TOKEN: ${{ secrets.PROJECT_BOARD_TOKEN != '' }}
         run: |
+          echo "present=$HAS_TOKEN" >> "$GITHUB_OUTPUT"
           if [ "$HAS_TOKEN" != "true" ]; then
-            echo "::warning::PROJECT_BOARD_TOKEN secret is not configured; falling back to GITHUB_TOKEN, which lacks org-level ProjectV2 scope. The next step will fail with a diagnostic message. See issue #2777."
+            echo "::notice::PROJECT_BOARD_TOKEN secret is not configured; skipping the archive step (the job will conclude success). To enable archiving, create a fine-grained PAT with Projects:Read+Write on stellar-experimental and store it as the PROJECT_BOARD_TOKEN org secret. See issue #3224."
           else
-            echo "PROJECT_BOARD_TOKEN is configured."
+            echo "PROJECT_BOARD_TOKEN is configured; the archive step will run."
           fi
 
+      # Gated on the secret-presence OUTPUT only — NOT on the script's success.
+      # A step skipped via `if:` does NOT fail the job, so when the secret is
+      # absent the run concludes `success` (this is what ends the deploy-gate
+      # CI-signal pollution). When the secret IS present the step runs against
+      # PROJECT_BOARD_TOKEN directly; the doomed `|| secrets.GITHUB_TOKEN`
+      # fallback is dropped because GITHUB_TOKEN structurally lacks org-project
+      # scope. A present-but-unscoped/revoked token still runs here and fails
+      # loudly via the script's pre-flight exit 1 (don't mask real failures).
       - name: Run archive-stale-done.sh
+        if: steps.check_token.outputs.present == 'true'
         env:
-          GH_TOKEN: ${{ secrets.PROJECT_BOARD_TOKEN || secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.PROJECT_BOARD_TOKEN }}
         run: |
           DAYS="${{ inputs.days || '2' }}"
           DRY_RUN="${{ inputs.dry_run && '--dry-run' || '' }}"
