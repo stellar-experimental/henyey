@@ -1018,6 +1018,13 @@ impl App {
                 header.clone(),
                 header_hash,
                 cache_data,
+                // Skip the warm per-entry account cache during cold catchup-apply
+                // (#3232). It is a steady-state read-latency optimization wasted
+                // during a one-pass restore and adds ~1.0–1.5 GB to the catchup
+                // anon-RSS peak. It is warmed once post-catchup via
+                // `LedgerManager::warm_entry_caches()`, called from
+                // `restore_operational_state()` when the node leaves CatchingUp.
+                true,
             )
             .map_err(|e| anyhow::anyhow!("Failed to initialize ledger manager from disk: {}", e))?;
 

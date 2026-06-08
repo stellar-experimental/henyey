@@ -171,6 +171,100 @@ pub struct CacheInitResult {
     soroban_state: crate::soroban_state::InMemorySorobanState,
 }
 
+/// Per-type cross-level dedup set, replacing the single all-types
+/// `HashSet<LedgerKey>` previously used during the bucket-list cache scan.
+///
+/// # Why this is byte-identical to a single all-types `HashSet<LedgerKey>`
+///
+/// `LedgerKey` is a discriminated union (a type-tagged enum): two `LedgerKey`
+/// values compare equal **iff** they have the same variant tag AND equal inner
+/// data. Therefore the variants partition the key space into disjoint classes —
+/// a key of one variant can never equal a key of another variant, regardless of
+/// inner bytes.
+///
+/// A single set `S` and the union of per-variant sets `S_offer ∪ S_data ∪ …`
+/// (where each `S_v` holds only the inner keys of variant `v`) have **identical
+/// membership semantics**: `S.contains(k)` ⟺ `S_{variant(k)}.contains(inner(k))`,
+/// because no two distinct variants ever share a member. So `insert` returning
+/// "newly inserted" vs "already present" is identical across the two
+/// representations for every possible `LedgerKey`. The cross-level shadowing
+/// decision (a newer-level DEADENTRY shadows an older-level LIVEENTRY of the
+/// **same** type+key) is driven entirely by these `insert` return values, so the
+/// final merged state — and thus the bucket-list-derived soroban state, offer
+/// store, and bucketListHash — is byte-identical.
+///
+/// The memory win: the dominant types (offers, pool-share trustlines, contract
+/// data/code, TTL) are keyed by their compact inner structs instead of being
+/// wrapped in the larger `LedgerKey` enum, and a `LedgerKey` clone is no longer
+/// retained per key. A catch-all set keyed by the full `LedgerKey` handles any
+/// other variant so the abstraction is **total** (handles every `LedgerKey`
+/// variant exactly as the global set did) — though in practice only the
+/// scan-relevant variants below ever reach it.
+///
+/// Mirrors stellar-core's `InMemorySorobanState::initializeStateFromSnapshot`,
+/// which uses per-type `deletedKeys` rather than one all-types set.
+#[derive(Default)]
+struct PerTypeSeen {
+    offers: HashSet<stellar_xdr::curr::LedgerKeyOffer>,
+    trustlines: HashSet<stellar_xdr::curr::LedgerKeyTrustLine>,
+    contract_data: HashSet<stellar_xdr::curr::LedgerKeyContractData>,
+    contract_code: HashSet<stellar_xdr::curr::LedgerKeyContractCode>,
+    config_settings: HashSet<LedgerKeyConfigSetting>,
+    ttl: HashSet<stellar_xdr::curr::LedgerKeyTtl>,
+    /// Catch-all for any other `LedgerKey` variant, keeping the abstraction total
+    /// and provably equivalent to the prior all-types `HashSet<LedgerKey>`.
+    other: HashSet<LedgerKey>,
+}
+
+impl PerTypeSeen {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    /// Insert `key` into its per-type set. Returns `true` iff the key was not
+    /// already present — identical semantics to `HashSet::<LedgerKey>::insert`.
+    fn insert(&mut self, key: LedgerKey) -> bool {
+        match key {
+            LedgerKey::Offer(k) => self.offers.insert(k),
+            LedgerKey::Trustline(k) => self.trustlines.insert(k),
+            LedgerKey::ContractData(k) => self.contract_data.insert(k),
+            LedgerKey::ContractCode(k) => self.contract_code.insert(k),
+            LedgerKey::ConfigSetting(k) => self.config_settings.insert(k),
+            LedgerKey::Ttl(k) => self.ttl.insert(k),
+            other => self.other.insert(other),
+        }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only high-water mark of the `pending` buffer map in the multi-worker
+    /// `scan_and_merge`. Used by `test_scan_and_merge_pending_buffer_bounded` to
+    /// assert the buffer stays bounded under ascending claim order. Thread-local
+    /// so concurrent tests don't interfere; the merge loop runs on the calling
+    /// (test) thread, which is where the value is recorded and read.
+    static PENDING_HIGH_WATER: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn record_pending_high_water(len: usize) {
+    PENDING_HIGH_WATER.with(|hw| {
+        if len > hw.get() {
+            hw.set(len);
+        }
+    });
+}
+
+#[cfg(test)]
+fn reset_pending_high_water() {
+    PENDING_HIGH_WATER.with(|hw| hw.set(0));
+}
+
+#[cfg(test)]
+fn pending_high_water() -> usize {
+    PENDING_HIGH_WATER.with(|hw| hw.get())
+}
+
 /// Result of scanning a single bucket level's curr+snap buckets.
 ///
 /// Each level produces its own set of live entries and TTL entries, with
@@ -340,7 +434,7 @@ fn merge_level_results(
     let mut soroban_state = crate::soroban_state::InMemorySorobanState::new();
     let mut mem_offers: HashMap<i64, LedgerEntry> = HashMap::new();
     let mut pool_share_tl_account_index: HashMap<AccountId, HashSet<PoolId>> = HashMap::new();
-    let mut global_seen: HashSet<LedgerKey> = HashSet::new();
+    let mut global_seen = PerTypeSeen::new();
     let mut global_ttl_seen: HashSet<Hash> = HashSet::new();
 
     let mut offer_count = 0u64;
@@ -471,7 +565,7 @@ fn scan_and_merge_streaming(
     let mut soroban_state = crate::soroban_state::InMemorySorobanState::new();
     let mut mem_offers: HashMap<i64, LedgerEntry> = HashMap::new();
     let mut pool_share_tl_account_index: HashMap<AccountId, HashSet<PoolId>> = HashMap::new();
-    let mut global_seen: HashSet<LedgerKey> = HashSet::new();
+    let mut global_seen = PerTypeSeen::new();
     let mut global_ttl_seen: HashSet<Hash> = HashSet::new();
 
     let mut offer_count = 0u64;
@@ -687,7 +781,7 @@ fn scan_and_merge(
     let mut soroban_state = crate::soroban_state::InMemorySorobanState::new();
     let mut mem_offers: HashMap<i64, LedgerEntry> = HashMap::new();
     let mut pool_share_tl_account_index: HashMap<AccountId, HashSet<PoolId>> = HashMap::new();
-    let mut global_seen: HashSet<LedgerKey> = HashSet::new();
+    let mut global_seen = PerTypeSeen::new();
     let mut global_ttl_seen: HashSet<Hash> = HashSet::new();
 
     let mut offer_count = 0u64;
@@ -696,18 +790,28 @@ fn scan_and_merge(
     let mut ttl_count = 0u64;
     let mut config_count = 0u64;
 
-    // Choose scan order based on worker count:
-    // - Single worker: scan in level order (0 → 10) so the main thread can merge
-    //   and free each result immediately, avoiding buffering all results in memory.
-    // - Multiple workers: scan largest levels first for better load balancing,
-    //   since the main thread can absorb out-of-order completions.
-    let mut sorted_indices: Vec<usize> = (0..num_levels).collect();
-    if num_workers > 1 {
-        sorted_indices
-            .sort_by_key(|&i| std::cmp::Reverse(level_pairs[i].0.len() + level_pairs[i].1.len()));
-    }
+    // Claim levels in ascending level order (0 → N), matching the merge order
+    // (#3232 lever B, merge-ordering fix).
+    //
+    // The merge MUST proceed strictly in level order because a DEADENTRY at a
+    // newer (lower-numbered) level shadows a LIVEENTRY of the same key at an
+    // older (higher-numbered) level. So the main thread always merges level
+    // `next_merge_idx` next.
+    //
+    // Previously workers claimed levels LARGEST-FIRST for load balancing, but
+    // since merge order is fixed at 0→N, a large level (e.g. level 10 with ~12M
+    // entries) that completed early sat in the `pending` buffer map as a full
+    // `HashMap<LedgerKey, LedgerEntry>` until levels 0..9 were merged — worst
+    // case ALL levels' raw buffers co-resided, the dominant catchup-peak
+    // contributor. Claiming in ascending order makes the level the main thread
+    // is waiting on (`next_merge_idx`) complete among the earliest, so `pending`
+    // holds only a small reorder window (≈ num_workers buffers in flight), and
+    // the largest level (claimed last) is merged-and-freed almost immediately
+    // rather than pinned. This is correctness-neutral: claim order does not
+    // affect the merge result, only which raw buffers co-reside transiently.
+    let sorted_indices: Vec<usize> = (0..num_levels).collect();
 
-    // Workers atomically claim slots in the sorted array.
+    // Workers atomically claim slots in the (ascending) array.
     let next_claim = AtomicUsize::new(0);
     let next_claim_ref = &next_claim;
     let sorted_ref = &sorted_indices[..];
@@ -767,6 +871,13 @@ fn scan_and_merge(
                 }
             };
             pending.insert(idx, result);
+            // Record the high-water mark of buffered (un-merged) level results.
+            // With ascending claim order this stays a small reorder window
+            // (#3232 lever B merge-ordering fix); the test
+            // `test_scan_and_merge_pending_buffer_bounded` asserts it never
+            // reaches `num_levels`.
+            #[cfg(test)]
+            record_pending_high_water(pending.len());
             while let Some(result) = pending.remove(&next_merge_idx) {
                 // --- merge this level into accumulators, then drop raw result ---
                 for dead_key in result.dead_keys {
@@ -1800,6 +1911,15 @@ impl LedgerManager {
     /// * `header` - The ledger header to initialize with
     /// * `header_hash` - The authoritative hash of the header from the history archive
     /// * `cache_data` - Pre-computed cache data from `scan_level_pairs_for_caches`
+    /// * `skip_warm_cache` - When `true`, the per-entry account/bucket warm cache
+    ///   is NOT populated here. This is the cold catchup-apply path: the warm
+    ///   cache is a steady-state read-latency optimization that is pure dead
+    ///   weight during a one-pass restore, where it adds ~1.0–1.5 GB of transient
+    ///   anon RSS to the catchup peak (issue #3232). The caller MUST schedule a
+    ///   post-catchup warm-up via [`Self::warm_entry_caches`] so the cache is
+    ///   never left permanently cold (a silent steady-state perf regression).
+    ///   When `false`, the warm cache is populated inline as before (steady-state
+    ///   behavior is unchanged).
     pub fn initialize_with_precomputed_caches(
         &self,
         bucket_list: BucketList,
@@ -1807,6 +1927,7 @@ impl LedgerManager {
         header: LedgerHeader,
         header_hash: Hash256,
         cache_data: CacheInitResult,
+        skip_warm_cache: bool,
     ) -> Result<()> {
         self.verify_and_install_bucket_lists(
             bucket_list,
@@ -1817,7 +1938,14 @@ impl LedgerManager {
         crate::memory_report::log_startup_memory("after_verify_install_buckets");
 
         // Initialize per-bucket caches for all DiskIndex buckets.
-        {
+        //
+        // Skipped during cold catchup-apply (`skip_warm_cache == true`): the
+        // warm cache is a steady-state read-latency optimization that is wasted
+        // during a one-pass restore and inflates the catchup anon-RSS peak
+        // (#3232). The caller warms it once post-catchup via `warm_entry_caches`.
+        if skip_warm_cache {
+            info!("Skipping warm entry-cache init during catchup (will warm post-catchup)");
+        } else {
             let bucket_list = self.bucket_list.read();
             bucket_list.maybe_initialize_caches();
         }
@@ -1841,6 +1969,24 @@ impl LedgerManager {
         );
 
         Ok(())
+    }
+
+    /// Populate the per-entry account/bucket warm cache for all DiskIndex buckets.
+    ///
+    /// This is the post-catchup warm-up hook for [`Self::initialize_with_precomputed_caches`]
+    /// when it was called with `skip_warm_cache == true` (issue #3232). It uses the
+    /// node's configured `memory_for_caching_mb` budget, so steady-state cache
+    /// behavior is identical to the inline path — only the *timing* moves from
+    /// the catchup peak to off-peak steady state.
+    ///
+    /// Idempotent: `maybe_initialize_cache` early-returns for buckets whose cache
+    /// is already populated, so calling this when the cache is already warm (or
+    /// when no DiskIndex bucket exists) is a cheap no-op. Safe to call on every
+    /// transition to operational state.
+    pub fn warm_entry_caches(&self) {
+        let bucket_list = self.bucket_list.read();
+        bucket_list.maybe_initialize_caches();
+        crate::memory_report::log_startup_memory("after_post_catchup_cache_warm");
     }
 
     /// Verify bucket list hash against the header and install bucket lists + state.
@@ -1981,10 +2127,13 @@ impl LedgerManager {
     /// to the appropriate handler based on its type. This reads ~24 GB of
     /// bucket data once, instead of 5x (~120 GB) with per-type scanning.
     ///
-    /// A single `HashSet<LedgerKey>` is used for deduplication across all
-    /// entry types. Since `LedgerKey` is a discriminated union, keys of
-    /// different types never collide. Peak memory for the dedup set is
-    /// ~5.3M keys (~700 MB) on mainnet.
+    /// Cross-level deduplication uses [`PerTypeSeen`] — per-type sets keyed by
+    /// each `LedgerKey` variant's compact inner key. Because `LedgerKey` is a
+    /// discriminated union (variants partition the key space, so keys of
+    /// different types never collide), the union of per-type sets is
+    /// byte-identical in membership to a single all-types `HashSet<LedgerKey>`,
+    /// while avoiding the large enum-wrapped key clones the global set retained
+    /// for every offer/trustline/contract/TTL/config key (#3232 lever B).
     ///
     /// Entry types processed:
     /// - Offer -> in-memory offer store + secondary index
@@ -6766,6 +6915,279 @@ mod tests {
         );
     }
 
+    // ---- Lever B (#3232): per-type dead-key scoping (PerTypeSeen) ----
+
+    /// The crux of the byte-identical equivalence argument: `PerTypeSeen` has
+    /// IDENTICAL `insert` semantics to a single all-types `HashSet<LedgerKey>`,
+    /// because `LedgerKey` is type-tagged (variants partition the key space).
+    /// This test pins that for every scan-relevant variant AND proves cross-type
+    /// keys never collide (so the per-type narrowing is exact, not lossy).
+    #[test]
+    fn test_per_type_seen_matches_global_hashset_semantics() {
+        // A representative key per scan-relevant variant. Crucially, several use
+        // the SAME inner bytes across different variants — if the old global set
+        // had ever dedup'd across types, these would collide; per-type they must
+        // NOT (proving type-tagging makes the narrowing exact).
+        let shared = [3u8; 32];
+        let keys: Vec<LedgerKey> = vec![
+            LedgerKey::Offer(stellar_xdr::curr::LedgerKeyOffer {
+                seller_id: make_account_id(shared),
+                offer_id: 1,
+            }),
+            LedgerKey::Trustline(stellar_xdr::curr::LedgerKeyTrustLine {
+                account_id: make_account_id(shared),
+                asset: stellar_xdr::curr::TrustLineAsset::PoolShare(PoolId(Hash(shared))),
+            }),
+            LedgerKey::ContractData(stellar_xdr::curr::LedgerKeyContractData {
+                contract: ScAddress::Contract(ContractId(Hash(shared))),
+                key: ScVal::I32(7),
+                durability: ContractDataDurability::Persistent,
+            }),
+            LedgerKey::ContractCode(stellar_xdr::curr::LedgerKeyContractCode {
+                hash: Hash(shared),
+            }),
+            LedgerKey::ConfigSetting(LedgerKeyConfigSetting {
+                config_setting_id: stellar_xdr::curr::ConfigSettingId::ContractMaxSizeBytes,
+            }),
+            LedgerKey::Ttl(stellar_xdr::curr::LedgerKeyTtl {
+                key_hash: Hash(shared),
+            }),
+            // A non-scan-relevant variant lands in the catch-all set, proving the
+            // abstraction is total (handles EVERY LedgerKey variant).
+            LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
+                account_id: make_account_id(shared),
+            }),
+        ];
+
+        let mut global: HashSet<LedgerKey> = HashSet::new();
+        let mut per_type = PerTypeSeen::new();
+
+        // First insertion of each key: both report "newly inserted" (true).
+        // Despite identical inner bytes, the distinct variants never collide.
+        for k in &keys {
+            assert_eq!(
+                global.insert(k.clone()),
+                per_type.insert(k.clone()),
+                "first insert disagreement for {k:?}"
+            );
+        }
+        // Second insertion of each key: both report "already present" (false).
+        for k in &keys {
+            assert_eq!(
+                global.insert(k.clone()),
+                per_type.insert(k.clone()),
+                "second insert disagreement for {k:?}"
+            );
+        }
+    }
+
+    fn make_contract_code_entry(hash_bytes: [u8; 32]) -> LedgerEntry {
+        LedgerEntry {
+            last_modified_ledger_seq: 100,
+            data: LedgerEntryData::ContractCode(stellar_xdr::curr::ContractCodeEntry {
+                ext: stellar_xdr::curr::ContractCodeEntryExt::V0,
+                hash: Hash(hash_bytes),
+                code: vec![0u8; 4].try_into().unwrap(),
+            }),
+            ext: LedgerEntryExt::V0,
+        }
+    }
+
+    fn make_pool_share_trustline_entry(acct: [u8; 32], pool: [u8; 32]) -> LedgerEntry {
+        LedgerEntry {
+            last_modified_ledger_seq: 100,
+            data: LedgerEntryData::Trustline(stellar_xdr::curr::TrustLineEntry {
+                account_id: make_account_id(acct),
+                asset: stellar_xdr::curr::TrustLineAsset::PoolShare(PoolId(Hash(pool))),
+                balance: 0,
+                limit: i64::MAX,
+                flags: 0,
+                ext: stellar_xdr::curr::TrustLineEntryExt::V0,
+            }),
+            ext: LedgerEntryExt::V0,
+        }
+    }
+
+    /// For EACH scan-relevant type, a newer-level (level 0) DEADENTRY must shadow
+    /// an older-level (level 1) LIVEENTRY of the SAME type+key — the one
+    /// shadowing invariant that per-type scoping must preserve exactly. This is
+    /// the byte-identity guard: per-type sets reproduce the same shadowing as the
+    /// old all-types global set for every type.
+    #[test]
+    fn test_per_type_dedup_preserves_same_type_cross_level_shadowing() {
+        // (live entry, its LedgerKey, a closure asserting the final state is empty)
+        // Offer
+        {
+            let key = LedgerKey::Offer(stellar_xdr::curr::LedgerKeyOffer {
+                seller_id: make_account_id([5u8; 32]),
+                offer_id: 99,
+            });
+            let live = make_offer_entry(99, [5u8; 32]);
+            let l0 = LevelScanResult {
+                entries: HashMap::new(),
+                ttl_entries: HashMap::new(),
+                dead_keys: [key.clone()].into_iter().collect(),
+                dead_ttl_keys: HashSet::new(),
+            };
+            let l1 = LevelScanResult {
+                entries: [(key, live)].into_iter().collect(),
+                ttl_entries: HashMap::new(),
+                dead_keys: HashSet::new(),
+                dead_ttl_keys: HashSet::new(),
+            };
+            let r = merge_level_results(vec![l0, l1], None, TEST_PROTOCOL, &None);
+            assert!(r.offers.is_empty(), "offer DEADENTRY must shadow");
+        }
+        // Contract data
+        {
+            let live = make_contract_data_entry([6u8; 32]);
+            let key = henyey_common::entry_to_key(&live);
+            let l0 = LevelScanResult {
+                entries: HashMap::new(),
+                ttl_entries: HashMap::new(),
+                dead_keys: [key].into_iter().collect(),
+                dead_ttl_keys: HashSet::new(),
+            };
+            let live_key = henyey_common::entry_to_key(&live);
+            let l1 = LevelScanResult {
+                entries: [(live_key, live)].into_iter().collect(),
+                ttl_entries: HashMap::new(),
+                dead_keys: HashSet::new(),
+                dead_ttl_keys: HashSet::new(),
+            };
+            let r = merge_level_results(vec![l0, l1], None, TEST_PROTOCOL, &None);
+            assert_eq!(
+                r.soroban_state.contract_data_count(),
+                0,
+                "contract data DEADENTRY must shadow"
+            );
+        }
+        // Contract code
+        {
+            let live = make_contract_code_entry([7u8; 32]);
+            let key = henyey_common::entry_to_key(&live);
+            let l0 = LevelScanResult {
+                entries: HashMap::new(),
+                ttl_entries: HashMap::new(),
+                dead_keys: [key].into_iter().collect(),
+                dead_ttl_keys: HashSet::new(),
+            };
+            let live_key = henyey_common::entry_to_key(&live);
+            let l1 = LevelScanResult {
+                entries: [(live_key, live)].into_iter().collect(),
+                ttl_entries: HashMap::new(),
+                dead_keys: HashSet::new(),
+                dead_ttl_keys: HashSet::new(),
+            };
+            let r = merge_level_results(vec![l0, l1], None, TEST_PROTOCOL, &None);
+            assert_eq!(
+                r.soroban_state.contract_code_count(),
+                0,
+                "contract code DEADENTRY must shadow"
+            );
+        }
+        // Pool-share trustline (drives the pool_share_tl_account_index)
+        {
+            let live = make_pool_share_trustline_entry([8u8; 32], [1u8; 32]);
+            let key = henyey_common::entry_to_key(&live);
+            let l0 = LevelScanResult {
+                entries: HashMap::new(),
+                ttl_entries: HashMap::new(),
+                dead_keys: [key].into_iter().collect(),
+                dead_ttl_keys: HashSet::new(),
+            };
+            let live_key = henyey_common::entry_to_key(&live);
+            let l1 = LevelScanResult {
+                entries: [(live_key, live)].into_iter().collect(),
+                ttl_entries: HashMap::new(),
+                dead_keys: HashSet::new(),
+                dead_ttl_keys: HashSet::new(),
+            };
+            let r = merge_level_results(vec![l0, l1], None, TEST_PROTOCOL, &None);
+            assert!(
+                r.pool_share_tl_account_index.is_empty(),
+                "pool-share trustline DEADENTRY must shadow"
+            );
+        }
+        // TTL (uses the parallel dead_ttl_keys / global_ttl_seen path)
+        {
+            let live = make_ttl_entry([9u8; 32], 1000);
+            let l0 = LevelScanResult {
+                entries: HashMap::new(),
+                ttl_entries: HashMap::new(),
+                dead_keys: HashSet::new(),
+                dead_ttl_keys: [Hash([9u8; 32])].into_iter().collect(),
+            };
+            let ttl_key = stellar_xdr::curr::LedgerKeyTtl {
+                key_hash: Hash([9u8; 32]),
+            };
+            let ttl_data = crate::soroban_state::TtlData::new(1000, 1);
+            let l1 = LevelScanResult {
+                entries: HashMap::new(),
+                ttl_entries: [(Hash([9u8; 32]), (ttl_key, ttl_data))]
+                    .into_iter()
+                    .collect(),
+                dead_keys: HashSet::new(),
+                dead_ttl_keys: HashSet::new(),
+            };
+            let _ = live; // entry shape documented; merge uses ttl_entries map
+            let r = merge_level_results(vec![l0, l1], None, TEST_PROTOCOL, &None);
+            // No data/code entry adopts this TTL, and it was shadowed dead, so
+            // nothing is created. (Contract data/code counts remain zero.)
+            assert_eq!(r.soroban_state.contract_data_count(), 0);
+        }
+    }
+
+    /// Lever B merge-ordering fix (#3232): with ascending claim order the
+    /// `pending` buffer high-water never reaches `num_levels` (the old
+    /// largest-first claim order could pin all level buffers at once). Uses
+    /// enough levels and multiple workers to exercise out-of-order completion.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_scan_and_merge_pending_buffer_bounded() {
+        let mut bl = new_bl_with_config();
+        // Spread offers across many batches so the bucket list has several levels.
+        for i in 0..64u32 {
+            let offer = make_offer_entry(i as i64, {
+                let mut b = [0u8; 32];
+                b[0] = (i & 0xff) as u8;
+                b[1] = ((i >> 8) & 0xff) as u8;
+                b
+            });
+            bl.add_batch(
+                i + 1,
+                TEST_PROTOCOL,
+                BucketListType::Live,
+                vec![offer],
+                vec![],
+                vec![],
+            )
+            .unwrap();
+        }
+
+        let level_pairs: Vec<_> = bl
+            .levels()
+            .iter()
+            .map(|l| (l.curr.clone(), l.snap.clone()))
+            .collect();
+        let num_levels = level_pairs.len();
+        assert!(num_levels >= 2, "need multiple levels to test buffering");
+
+        reset_pending_high_water();
+        let result = scan_and_merge(&level_pairs, TEST_PROTOCOL, true, &None, None, 4).unwrap();
+
+        let hw = pending_high_water();
+        assert!(
+            hw < num_levels,
+            "pending buffer high-water {hw} must stay below num_levels {num_levels} \
+             (ascending claim order bounds the reorder window)"
+        );
+
+        // Correctness invariant: ascending-claim parallel result must equal the
+        // single-worker streaming result (byte-identical final state).
+        let streaming = scan_and_merge(&level_pairs, TEST_PROTOCOL, true, &None, None, 1).unwrap();
+        assert_cache_init_results_equivalent(&result, &streaming, "pending_bounded");
+    }
+
     #[test]
     fn test_scan_offer_secondary_index() {
         let mut bl = new_bl_with_config();
@@ -7440,6 +7862,76 @@ mod tests {
         let streaming = scan_bucket_list_for_caches(&bl, TEST_PROTOCOL, 1).unwrap();
         let parallel = scan_bucket_list_for_caches(&bl, TEST_PROTOCOL, 2).unwrap();
         assert_cache_init_results_equivalent(&streaming, &parallel, "cross_level_overwrites");
+    }
+
+    /// Lever A (#3232): the cold catchup-apply path skips the warm per-entry
+    /// account cache, but still installs the precomputed consensus-relevant
+    /// caches (offer store, soroban state). A subsequent `warm_entry_caches()`
+    /// is the post-catchup warm-up hook. This test exercises the
+    /// `skip_warm_cache` plumbing and the warm-up method end-to-end.
+    #[test]
+    fn test_catchup_cache_init_skips_warm_cache_then_warm_up_runs() {
+        use henyey_common::protocol::CURRENT_LEDGER_PROTOCOL_VERSION;
+
+        let manager = LedgerManager::new(
+            "Test SDF Network ; September 2015".to_string(),
+            LedgerManagerConfig {
+                validate_bucket_hash: false,
+                ..Default::default()
+            },
+        );
+
+        // Build a bucket list with an offer so the precomputed offer cache is
+        // non-empty (proves consensus-relevant caches are installed regardless
+        // of the warm-cache skip).
+        let mut bl = new_bl_with_config();
+        let offer = make_offer_entry(42, [9u8; 32]);
+        bl.add_batch(
+            1,
+            CURRENT_LEDGER_PROTOCOL_VERSION,
+            BucketListType::Live,
+            vec![offer],
+            vec![],
+            vec![],
+        )
+        .unwrap();
+
+        let cache_data =
+            scan_bucket_list_for_caches(&bl, CURRENT_LEDGER_PROTOCOL_VERSION, 1).unwrap();
+        assert_eq!(cache_data.offers.len(), 1, "precomputed offer cache");
+
+        let mut header = create_genesis_header();
+        header.ledger_seq = 1;
+        header.ledger_version = CURRENT_LEDGER_PROTOCOL_VERSION;
+        let hot = henyey_bucket::HotArchiveBucketList::new();
+        let header_hash = crate::compute_header_hash(&header).expect("hash");
+
+        // Catchup path: skip_warm_cache == true.
+        manager
+            .initialize_with_precomputed_caches(bl, hot, header, header_hash, cache_data, true)
+            .expect("init with skipped warm cache");
+
+        // The warm per-entry cache must be inactive after a catchup-apply init.
+        assert!(
+            !manager.bucket_list().aggregate_cache_stats().active,
+            "warm entry cache must be inactive after catchup-apply (skip_warm_cache=true)"
+        );
+
+        // Consensus-relevant caches WERE installed despite the warm-cache skip.
+        assert_eq!(
+            manager.offer_store_lock().len(),
+            1,
+            "offer store installed during catchup-apply"
+        );
+
+        // Post-catchup warm-up hook runs without error and is idempotent. (Test
+        // bucket lists use InMemory indexes, which never get a per-bucket cache,
+        // so `active` remains false here; the budget→cache relationship for
+        // DiskIndex buckets is locked by the bucket-crate test
+        // `test_maybe_initialize_cache_skipped_when_budget_zero`.)
+        manager.warm_entry_caches();
+        manager.warm_entry_caches(); // idempotent — no panic, no double-init
+        assert!(!manager.bucket_list().aggregate_cache_stats().active);
     }
 
     #[test]
