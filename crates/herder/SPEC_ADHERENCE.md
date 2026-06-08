@@ -663,6 +663,16 @@ excluded. SHOULD claims and operational defaults excluded.
     paths implement the per-type rules (Version monotonic + ≤
     `LEDGER_PROTOCOL_VERSION`; BaseFee/BaseReserve ≠ 0; Flags mask + V18;
     Config V20+ + ledger-resolves-and-valid; MaxSorobanTxSetSize V20+).
+  - **§15.4-5 (numeric upgrade positivity) — WAD/core-consistent:** matches
+    core, no positivity check per `stellar-core/src/herder/Upgrades.cpp:591-631`.
+    Only `BaseFee != 0` and `BaseReserve != 0` are enforced; `MaxTxSetSize`
+    accepts any size (incl. zero) and `MaxSorobanTxSetSize` accepts any size
+    (incl. zero) once protocol ≥ `SOROBAN_PROTOCOL_VERSION`. The earlier
+    spec-adherence finding (#3050) flagged an over-broad "MUST be a positive
+    integer" claim in `HERDER_SPEC.md` that was since corrected to match core;
+    henyey already matched core in both validation paths, so no validation-code
+    change was required. Parity is locked by
+    `test_numeric_upgrade_zero_accepted_matches_core` (`scp_driver.rs`).
   - **Status:** Full.
 
 - **§16.5 (MUST)** `removeUpgrades` + per-step expiration clear (default 15
