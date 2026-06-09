@@ -2107,11 +2107,29 @@ except Exception as e:
   fi
 
   # ── Test 77: check_quarantine_active — ancestor + content still applied ────
-  # New semantics: ancestor by itself is not enough; the bad commit's diff
-  # must still reverse-apply cleanly. Mock both git calls to return 0
-  # (ancestor: true, apply: clean).
+  # New semantics: ancestor by itself is not enough; at least one hunk of the
+  # bad commit's diff must still reverse-apply. Mock `diff` to emit a real
+  # single-hunk diff (so the per-hunk splitter parses one hunk) and `apply` to
+  # report it still reverse-applies (rc 0).
   printf '%s regression\n' "$sha1" > "$qdir/ancestor.txt"
-  git() { return 0; }
+  git() {
+    case "$1" in
+      merge-base) return 0 ;;
+      diff)
+        cat <<'CANNED'
+diff --git a/f.rs b/f.rs
+index 1111111..2222222 100644
+--- a/f.rs
++++ b/f.rs
+@@ -1,2 +1,3 @@ mod m {
++    still_present
+ }
+CANNED
+        return 0 ;;
+      apply) return 0 ;;  # hunk still reverse-applies → present
+      *) return 0 ;;
+    esac
+  }
   local rc77=0
   check_quarantine_ancestry "$qdir/ancestor.txt" || rc77=$?
   unset -f git
@@ -2136,13 +2154,23 @@ except Exception as e:
   fi
 
   # ── Test 78b: check_quarantine_active — ancestor but content reverted ──────
-  # Ancestor (rc=0) but apply --check --reverse fails (rc=1) → CLEAR.
-  # Mock dispatches on first arg: merge-base returns 0, apply returns 1.
+  # Ancestor (rc=0); `diff` emits a real single-hunk diff but the only hunk
+  # fails to reverse-apply (rc=1) → all hunks gone → CLEAR.
   printf '%s regression\n' "$sha1" > "$qdir/reverted.txt"
   git() {
     case "$1" in
       merge-base) return 0 ;;  # ancestor
-      diff)       return 0 ;;  # diff command emits output (pipe through)
+      diff)
+        cat <<'CANNED'
+diff --git a/f.rs b/f.rs
+index 1111111..2222222 100644
+--- a/f.rs
++++ b/f.rs
+@@ -1,2 +1,3 @@ mod m {
++    reverted_away
+ }
+CANNED
+        return 0 ;;
       apply)      return 1 ;;  # patch rejected → content gone
       *)          return 0 ;;
     esac
