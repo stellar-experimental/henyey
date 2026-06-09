@@ -887,6 +887,11 @@ impl App {
         // vs the old sequential path of ~297s.
         let reconstruct_start = std::time::Instant::now();
 
+        // Start-of-restore checkpoint (#3239) so live-bucket-restore is
+        // attributed to its own sampler sub-phase rather than orphaned to the
+        // coarse `Catchup` tag.
+        henyey_ledger::log_startup_memory("before_restore_bucket_list");
+
         let live_hash_pairs = has.bucket_hash_pairs();
         let live_next_states: Vec<Option<PendingMergeState>> = has.live_next_states()?;
         let bucket_dir = self.bucket_manager.bucket_dir().to_path_buf();
@@ -950,6 +955,7 @@ impl App {
         }
 
         // Step 6e: Restore hot archive (~1s, sequential).
+        henyey_ledger::log_startup_memory("hot_archive_restore");
         let hot_archive = if let Some(hot_hash_pairs) = has.hot_archive_bucket_hash_pairs() {
             let hot_next_states: Vec<Option<PendingMergeState>> =
                 has.hot_archive_next_states()?.unwrap_or_default();
@@ -1223,6 +1229,10 @@ impl App {
         header: &stellar_xdr::curr::LedgerHeader,
         lcl_seq: u32,
     ) -> anyhow::Result<(BucketList, HotArchiveBucketList)> {
+        // Start-of-restore checkpoint (#3239) — this cold-catchup path is
+        // sequential, so the sampler attributes each sub-phase cleanly.
+        henyey_ledger::log_startup_memory("before_restore_bucket_list");
+
         // Reconstruct live BucketList
         let live_hash_pairs = has.bucket_hash_pairs();
         let live_next_states: Vec<Option<PendingMergeState>> = has.live_next_states()?;
@@ -1246,6 +1256,9 @@ impl App {
         let bucket_dir = self.bucket_manager.bucket_dir().to_path_buf();
         bucket_list.set_bucket_dir(bucket_dir.clone());
         bucket_list.set_ledger_seq(lcl_seq);
+
+        // Live restore done — merge restart begins next (#3239).
+        henyey_ledger::log_startup_memory("after_restore_bucket_list");
 
         // Restart pending merges from HAS state.
         // This matches stellar-core loadLastKnownLedgerInternal() which calls
@@ -1274,6 +1287,7 @@ impl App {
         }
 
         // Reconstruct hot archive BucketList (or create empty)
+        henyey_ledger::log_startup_memory("hot_archive_restore");
         let hot_archive = if let Some(hot_hash_pairs) = has.hot_archive_bucket_hash_pairs() {
             let hot_next_states: Vec<Option<PendingMergeState>> =
                 has.hot_archive_next_states()?.unwrap_or_default();
