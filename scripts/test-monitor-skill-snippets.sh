@@ -45,7 +45,7 @@ cleanup  # ensure fresh state
 mkdir -p "$TEST_ROOT"
 
 # ── TAP state ────────────────────────────────────────────────────────────────
-TAP_PLAN=327
+TAP_PLAN=331
 TAP_CURRENT=0
 TAP_FAILURES=0
 
@@ -2107,11 +2107,29 @@ except Exception as e:
   fi
 
   # ── Test 77: check_quarantine_active — ancestor + content still applied ────
-  # New semantics: ancestor by itself is not enough; the bad commit's diff
-  # must still reverse-apply cleanly. Mock both git calls to return 0
-  # (ancestor: true, apply: clean).
+  # New semantics: ancestor by itself is not enough; at least one hunk of the
+  # bad commit's diff must still reverse-apply. Mock `diff` to emit a real
+  # single-hunk diff (so the per-hunk splitter parses one hunk) and `apply` to
+  # report it still reverse-applies (rc 0).
   printf '%s regression\n' "$sha1" > "$qdir/ancestor.txt"
-  git() { return 0; }
+  git() {
+    case "$1" in
+      merge-base) return 0 ;;
+      diff)
+        cat <<'CANNED'
+diff --git a/f.rs b/f.rs
+index 1111111..2222222 100644
+--- a/f.rs
++++ b/f.rs
+@@ -1,2 +1,3 @@ mod m {
++    still_present
+ }
+CANNED
+        return 0 ;;
+      apply) return 0 ;;  # hunk still reverse-applies → present
+      *) return 0 ;;
+    esac
+  }
   local rc77=0
   check_quarantine_ancestry "$qdir/ancestor.txt" || rc77=$?
   unset -f git
@@ -2136,13 +2154,23 @@ except Exception as e:
   fi
 
   # ── Test 78b: check_quarantine_active — ancestor but content reverted ──────
-  # Ancestor (rc=0) but apply --check --reverse fails (rc=1) → CLEAR.
-  # Mock dispatches on first arg: merge-base returns 0, apply returns 1.
+  # Ancestor (rc=0); `diff` emits a real single-hunk diff but the only hunk
+  # fails to reverse-apply (rc=1) → all hunks gone → CLEAR.
   printf '%s regression\n' "$sha1" > "$qdir/reverted.txt"
   git() {
     case "$1" in
       merge-base) return 0 ;;  # ancestor
-      diff)       return 0 ;;  # diff command emits output (pipe through)
+      diff)
+        cat <<'CANNED'
+diff --git a/f.rs b/f.rs
+index 1111111..2222222 100644
+--- a/f.rs
++++ b/f.rs
+@@ -1,2 +1,3 @@ mod m {
++    reverted_away
+ }
+CANNED
+        return 0 ;;
       apply)      return 1 ;;  # patch rejected → content gone
       *)          return 0 ;;
     esac
@@ -2155,6 +2183,226 @@ except Exception as e:
   else
     tap_not_ok "quarantine-active: ancestor + content-reverted returns 1 (auto-clear)" \
       "rc=$rc78b status=$QUARANTINE_STATUS match=$QUARANTINED_MATCH"
+  fi
+
+  # ── Tests 78c/78d/78e/78c-zsh: per-hunk reverse-apply (#3248) ──────────────
+  # Regression cluster for the false-clear bug fixed in #3248. The OLD code
+  # piped the whole-commit diff into a SINGLE `git apply --check --reverse`,
+  # which is all-or-nothing: a later unrelated commit drifting the context of
+  # ANY one hunk of a multi-file quarantined commit makes the entire
+  # reverse-apply fail → the gate reports CLEAR even though the harmful hunk
+  # (e.g. retain:false) is fully intact in HEAD. The fix splits the diff
+  # per-hunk and BLOCKS if ANY hunk still reverse-applies.
+  #
+  # Mock strategy (validated): mock `git diff sha^..sha` to emit a canned
+  # multi-hunk, multi-file diff; mock `git apply` to read the per-hunk patch
+  # off stdin and dispatch on the hunk's content marker — a "harmful" hunk
+  # still reverse-applies (rc 0), a "drifted/removed" hunk does not (rc 1).
+  # The mock therefore behaves identically whether it receives the whole-commit
+  # diff (old code: sees the drifted hunk → rejects all) or a single-hunk patch
+  # (new code: judges each hunk independently). This is what makes 78c FAIL on
+  # origin/main and PASS after the per-hunk rewrite.
+
+  # Canned 2-file, 2-hunk diff for a quarantined commit. Hunk 1 (main.rs) is
+  # the harmful retain:false line; hunk 2 (memory_report.rs) is the unrelated
+  # hunk a later commit drifted.
+  _q_canned_diff_drift() {
+    cat <<'CANNED'
+diff --git a/crates/henyey/src/main.rs b/crates/henyey/src/main.rs
+index 1111111..2222222 100644
+--- a/crates/henyey/src/main.rs
++++ b/crates/henyey/src/main.rs
+@@ -114,3 +114,4 @@ fn configure_allocator() {
+     let _ = unsafe { &_rjem_malloc_conf };
++    HARMFUL_RETAIN_FALSE_MARKER
+     let cfg = Config::load();
+     run(cfg)
+diff --git a/crates/ledger/src/memory_report.rs b/crates/ledger/src/memory_report.rs
+index 3333333..4444444 100644
+--- a/crates/ledger/src/memory_report.rs
++++ b/crates/ledger/src/memory_report.rs
+@@ -356,3 +356,4 @@ impl MemoryReport {
+     let total = self.heap + self.stack;
++    DRIFTED_UNRELATED_MARKER
+     report.emit(total);
+ }
+CANNED
+  }
+
+  # 3-hunk single-file diff for the partial-presence fail-safe case. Only the
+  # MIDDLE hunk still reverse-applies; the surrounding two are gone.
+  _q_canned_diff_partial() {
+    cat <<'CANNED'
+diff --git a/crates/henyey/src/cfg.rs b/crates/henyey/src/cfg.rs
+index aaaaaaa..bbbbbbb 100644
+--- a/crates/henyey/src/cfg.rs
++++ b/crates/henyey/src/cfg.rs
+@@ -10,2 +10,3 @@ mod top {
++    GONE_HUNK_ONE_MARKER
+ }
+@@ -40,2 +41,3 @@ mod mid {
++    HARMFUL_RETAIN_FALSE_MARKER
+ }
+@@ -90,2 +92,3 @@ mod bot {
++    GONE_HUNK_THREE_MARKER
+ }
+CANNED
+  }
+
+  # Per-hunk-aware `git` mock. `diff` emits the named canned diff; `apply`
+  # reads the patch off stdin and faithfully models `git apply --check`'s
+  # ALL-OR-NOTHING semantics: it succeeds (rc 0) only if EVERY hunk in the
+  # patch reverse-applies. A "harmful" hunk (HARMFUL_RETAIN_FALSE_MARKER)
+  # reverse-applies; a "drifted/removed" hunk (any *_MARKER that is NOT the
+  # harmful one) does NOT (a later commit moved its context). So the mock
+  # returns 0 iff the patch carries the harmful marker AND carries no
+  # drifted/gone marker. This is the crux of the #3248 repro:
+  #   - OLD code pipes the WHOLE 2-hunk diff into ONE apply → the patch
+  #     contains BOTH the harmful AND the drifted marker → rc 1 → false CLEAR.
+  #   - NEW code feeds each hunk separately → the harmful hunk alone → rc 0
+  #     → BLOCK.
+  # `merge-base` reports ancestor. `$_Q_MODE` selects the canned diff; if
+  # `$_Q_APPLY_ALL_FAIL` is set, every patch is rejected (genuine-revert).
+  _q_perhunk_git() {
+    case "$1" in
+      merge-base) return 0 ;;
+      diff)
+        case "${_Q_MODE:-drift}" in
+          partial) _q_canned_diff_partial ;;
+          *)       _q_canned_diff_drift ;;
+        esac
+        return 0
+        ;;
+      apply)
+        local patch
+        patch="$(cat)"
+        if [[ -n "${_Q_APPLY_ALL_FAIL:-}" ]]; then
+          return 1
+        fi
+        # All-or-nothing: any drifted/gone marker present → whole apply fails.
+        if printf '%s' "$patch" | grep -qE 'DRIFTED_UNRELATED_MARKER|GONE_HUNK_ONE_MARKER|GONE_HUNK_THREE_MARKER'; then
+          return 1
+        fi
+        if printf '%s' "$patch" | grep -q 'HARMFUL_RETAIN_FALSE_MARKER'; then
+          return 0   # only the harmful hunk → reverse-applies → present
+        fi
+        return 1     # no harmful content → rejected
+        ;;
+      *) return 0 ;;
+    esac
+  }
+
+  # ── Test 78c — drift → still-active (the #3248 bug; FAILS on origin/main) ───
+  printf '%s regression #3238\n' "$sha1" > "$qdir/drift.txt"
+  _Q_MODE=drift
+  unset _Q_APPLY_ALL_FAIL
+  git() { _q_perhunk_git "$@"; }
+  local rc78c=0
+  check_quarantine_active "$qdir/drift.txt" || rc78c=$?
+  unset -f git
+  unset _Q_MODE
+  if [[ $rc78c -eq 0 && "$QUARANTINE_STATUS" == "blocked_active" && "$QUARANTINED_MATCH" == "$sha1" ]]; then
+    tap_ok "quarantine-active: unrelated-hunk drift stays blocked (#3248 per-hunk)"
+  else
+    tap_not_ok "quarantine-active: unrelated-hunk drift stays blocked (#3248 per-hunk)" \
+      "rc=$rc78c status=$QUARANTINE_STATUS match=$QUARANTINED_MATCH"
+  fi
+
+  # ── Test 78d — genuine full revert → clear ─────────────────────────────────
+  # ALL hunks fail to reverse-apply (the bad commit was genuinely reverted).
+  printf '%s regression #3238\n' "$sha1" > "$qdir/revert.txt"
+  _Q_MODE=drift
+  _Q_APPLY_ALL_FAIL=1
+  git() { _q_perhunk_git "$@"; }
+  local rc78d=0
+  check_quarantine_active "$qdir/revert.txt" || rc78d=$?
+  unset -f git
+  unset _Q_MODE _Q_APPLY_ALL_FAIL
+  if [[ $rc78d -eq 1 && "$QUARANTINE_STATUS" == "clear" && -z "$QUARANTINED_MATCH" ]]; then
+    tap_ok "quarantine-active: all hunks gone → clear (per-hunk all-gone path)"
+  else
+    tap_not_ok "quarantine-active: all hunks gone → clear (per-hunk all-gone path)" \
+      "rc=$rc78d status=$QUARANTINE_STATUS match=$QUARANTINED_MATCH"
+  fi
+
+  # ── Test 78e — partial presence (fail-safe) → active ───────────────────────
+  # Same-file 3-hunk commit; only the middle (harmful) hunk survives. Per-file
+  # granularity would false-clear here (the whole file's patch fails); per-hunk
+  # correctly blocks. Encodes the fail-safe-toward-quarantined principle.
+  printf '%s regression #3238\n' "$sha1" > "$qdir/partial.txt"
+  _Q_MODE=partial
+  unset _Q_APPLY_ALL_FAIL
+  git() { _q_perhunk_git "$@"; }
+  local rc78e=0
+  check_quarantine_active "$qdir/partial.txt" || rc78e=$?
+  unset -f git
+  unset _Q_MODE
+  if [[ $rc78e -eq 0 && "$QUARANTINE_STATUS" == "blocked_active" && "$QUARANTINED_MATCH" == "$sha1" ]]; then
+    tap_ok "quarantine-active: partial same-file presence stays blocked (fail-safe)"
+  else
+    tap_not_ok "quarantine-active: partial same-file presence stays blocked (fail-safe)" \
+      "rc=$rc78e status=$QUARANTINE_STATUS match=$QUARANTINED_MATCH"
+  fi
+
+  # ── Test 78c-zsh — cross-shell recheck of the drift case ───────────────────
+  # The awk hunk-splitter + the `while read`/rc-capture loop must behave
+  # identically under zsh (the orchestrator runs under zsh). Re-run the 78c
+  # drift scenario inside a `zsh -c` subprocess. Gated on zsh availability.
+  if command -v zsh >/dev/null 2>&1; then
+    printf '%s regression #3238\n' "$sha1" > "$qdir/drift_zsh.txt"
+    local zsh_out
+    zsh_out=$(zsh -c '
+      emulate -L zsh
+      source "$1/scripts/lib/deploy-quarantine.sh"
+      git() {
+        case "$1" in
+          merge-base) return 0 ;;
+          diff)
+            cat <<CANNED
+diff --git a/crates/henyey/src/main.rs b/crates/henyey/src/main.rs
+index 1111111..2222222 100644
+--- a/crates/henyey/src/main.rs
++++ b/crates/henyey/src/main.rs
+@@ -114,3 +114,4 @@ fn configure_allocator() {
+     let _ = unsafe { \&_rjem_malloc_conf };
++    HARMFUL_RETAIN_FALSE_MARKER
+     let cfg = Config::load();
+     run(cfg)
+diff --git a/crates/ledger/src/memory_report.rs b/crates/ledger/src/memory_report.rs
+index 3333333..4444444 100644
+--- a/crates/ledger/src/memory_report.rs
++++ b/crates/ledger/src/memory_report.rs
+@@ -356,3 +356,4 @@ impl MemoryReport {
+     let total = self.heap + self.stack;
++    DRIFTED_UNRELATED_MARKER
+     report.emit(total);
+ }
+CANNED
+            return 0 ;;
+          apply)
+            local patch
+            patch="$(cat)"
+            if print -r -- "$patch" | grep -qE DRIFTED_UNRELATED_MARKER; then
+              return 1
+            fi
+            if print -r -- "$patch" | grep -q HARMFUL_RETAIN_FALSE_MARKER; then
+              return 0
+            fi
+            return 1 ;;
+          *) return 0 ;;
+        esac
+      }
+      rc=0
+      check_quarantine_active "$2" || rc=$?
+      print -r -- "rc=$rc status=$QUARANTINE_STATUS match=$QUARANTINED_MATCH"
+    ' -- "$REPO_ROOT" "$qdir/drift_zsh.txt")
+    if [[ "$zsh_out" == "rc=0 status=blocked_active match=$sha1" ]]; then
+      tap_ok "quarantine-active: drift stays blocked — zsh recheck"
+    else
+      tap_not_ok "quarantine-active: drift stays blocked — zsh recheck" "got: '$zsh_out'"
+    fi
+  else
+    tap_skip "quarantine-active: drift stays blocked — zsh recheck" "zsh not found"
   fi
 
   # ── Test 79: check_quarantine_active — git error on ancestry (fail-closed) ─

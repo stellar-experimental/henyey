@@ -100,6 +100,131 @@ parse_quarantine_file() {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
+# _quarantine_split_hunks
+#
+# Read-only filter. Reads a unified `git diff` on stdin and emits it split into
+# one self-contained patch per hunk on stdout, with each per-hunk patch
+# terminated by a NUL byte (so callers can iterate with `read -r -d ''` even
+# when a patch body contains blank lines). Each emitted patch carries the full
+# per-file header (`diff --git`/`old mode`/`new mode`/`index`/`---`/`+++`/etc.)
+# that preceded the `@@` hunk, so it is independently apply-checkable.
+#
+# We split per-HUNK (not per-file) deliberately: when a quarantined commit's
+# harmful hunk and an unrelated drifted hunk live in the SAME file, a per-file
+# patch is still all-or-nothing under `git apply --check` and would false-clear
+# (the drifted hunk fails → the whole file's patch fails). Per-hunk is the
+# minimal granularity that isolates "is THIS harmful hunk still present?".
+#
+# `filterdiff` is not installed, so this is a small awk program. It tracks the
+# current file header (everything from a `diff --git` line up to and including
+# the `+++` line) and, on each `@@` line, emits header + that single hunk's
+# body (up to the next `@@` or `diff --git`), NUL-terminated. Binary stanzas,
+# pure mode/rename changes, and other no-`@@` content produce zero hunks (no
+# false "applies"); the caller's fail-safe covers the zero-hunk case.
+# ─────────────────────────────────────────────────────────────────────────────
+_quarantine_split_hunks() {
+  awk '
+    function flush_hunk() {
+      if (in_hunk) {
+        printf "%s%s", header, hunk
+        printf "%c", 0
+        hunk = ""
+        in_hunk = 0
+      }
+    }
+    /^diff --git / {
+      flush_hunk()
+      header = $0 "\n"
+      in_header = 1
+      next
+    }
+    # File-header lines accumulate into header until the first @@.
+    in_header && /^@@/ {
+      in_header = 0
+    }
+    in_header {
+      header = header $0 "\n"
+      next
+    }
+    /^@@/ {
+      # New hunk for the current file: emit the previous one first.
+      flush_hunk()
+      in_hunk = 1
+      hunk = $0 "\n"
+      next
+    }
+    {
+      if (in_hunk) hunk = hunk $0 "\n"
+    }
+    END { flush_hunk() }
+  '
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# _quarantine_any_hunk_present SHA
+#
+# Read-only + git subprocess. Splits `git diff <sha>^..<sha>` into per-hunk
+# patches and reverse-apply-checks EACH hunk independently. Returns:
+#   0 — at least one hunk still reverse-applies (harmful content PRESENT → BLOCK)
+#   1 — every hunk fails to reverse-apply (content genuinely removed → CLEAR)
+#   2 — fail-safe: `git diff` errored, produced no output, or produced output
+#       from which no hunks could be parsed (treat as PRESENT → BLOCK)
+#
+# FAIL-SAFE direction: this gate guards deploys of a binary already proven to
+# crash the validator. A false BLOCK only delays a deploy (recoverable); a
+# false CLEAR re-crashes the node (catastrophic). So every uncertain case errs
+# toward BLOCK. The per-hunk loop captures each hunk's rc WITHOUT letting a
+# non-zero (expected: rejected hunk) abort under a caller's `set -e`.
+#
+# OVER-BLOCK is INTENTIONAL: "any hunk present → block" keeps a commit with
+# MIXED harmful+benign hunks blocked while a BENIGN hunk survives (e.g. #3238
+# added both `retain:false` (harmful) AND the `_rjem_malloc_conf` export
+# (benign — #3251 keeps it); after the harmful line is removed, the benign
+# export remains, so this stays blocked). This is fail-safe and by design: the
+# content-check is a BACKSTOP — the operator removes the quarantine ENTRY once
+# a fix is verified. We deliberately do NOT try to auto-distinguish
+# harmful-vs-benign hunks (that is the rejected content-signature approach,
+# which would require per-entry harmful-line identification + a schema change).
+# ─────────────────────────────────────────────────────────────────────────────
+_quarantine_any_hunk_present() {
+  local sha="$1"
+  local diff_out diff_rc=0
+
+  # Capture the full commit diff. A hard git error (missing parent, etc.) or
+  # empty output is fail-safe → PRESENT.
+  diff_out="$(git diff "${sha}^..${sha}" 2>/dev/null)" || diff_rc=$?
+  if [[ "$diff_rc" -ne 0 ]]; then
+    return 2
+  fi
+  if [[ -z "$diff_out" ]]; then
+    return 2
+  fi
+
+  local any_present=0 n_hunks=0 patch
+  # Iterate NUL-delimited per-hunk patches. `read -r -d ''` keeps blank lines
+  # inside a hunk intact and behaves identically under bash and zsh.
+  while IFS= read -r -d '' patch; do
+    [[ -z "$patch" ]] && continue
+    n_hunks=$((n_hunks + 1))
+    # rc=1 (hunk rejected) is NORMAL — must not abort the loop under set -e.
+    if printf '%s' "$patch" | git apply --check --reverse 2>/dev/null; then
+      any_present=1
+    fi
+  done < <(printf '%s\n' "$diff_out" | _quarantine_split_hunks)
+
+  # Non-empty diff but zero hunks parsed (pure rename/mode/binary, or a parser
+  # gap): fail-safe → PRESENT. Never silently treat "couldn't parse" as CLEAR.
+  if [[ "$n_hunks" -eq 0 ]]; then
+    return 2
+  fi
+
+  if [[ "$any_present" -eq 1 ]]; then
+    return 0
+  fi
+  return 1
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
 # check_quarantine_active QUARANTINE_FILE
 #
 # Read-only + git subprocess. Determines if any quarantined SHA's *content*
@@ -115,13 +240,23 @@ parse_quarantine_file() {
 #
 # Algorithm per entry:
 #   1. If SHA is NOT an ancestor of origin/main → not deployed, skip.
-#   2. If SHA IS an ancestor → emit its diff via `git diff sha^..sha` and
-#      test reverse-apply via `git apply --check --reverse`. Success means
-#      the bad lines are still in the tree (BLOCK). Failure (rejected hunks,
-#      missing files, context mismatch) means the bad code has been removed
-#      or moved (CLEAR for this entry).
-#   3. Hard git errors (rc>=128 from merge-base, rc>=128 from `git diff`
-#      itself, missing parent) fail-closed: BLOCK with a warning.
+#   2. If SHA IS an ancestor → split its diff (`git diff sha^..sha`) into
+#      per-hunk patches and reverse-apply-check EACH hunk independently
+#      (`_quarantine_any_hunk_present`). The entry is ACTIVE (BLOCK) if ANY
+#      hunk still reverse-applies — i.e. at least one harmful hunk's content
+#      is still in the tree. It CLEARs only when ALL hunks fail to
+#      reverse-apply (genuinely reverted/removed).
+#
+#      Why per-hunk and not whole-commit (the #3248 fix): `git apply --check`
+#      is all-or-nothing, so the old whole-commit reverse-apply false-CLEARED
+#      whenever a LATER unrelated commit drifted the context of ANY one hunk
+#      of a multi-file quarantined commit — even though the harmful hunk was
+#      fully intact. Per-hunk isolates each hunk's presence. Per-FILE is
+#      insufficient (same-file drift still false-clears all-or-nothing).
+#   3. Hard git errors (rc>=128 from merge-base, missing parent), an empty or
+#      unparseable diff, or a non-empty diff yielding zero hunks all FAIL-SAFE
+#      toward BLOCK (a false block delays a deploy; a false clear re-crashes
+#      the validator).
 #
 # Arguments:
 #   QUARANTINE_FILE - Path to deploy_quarantine.txt
@@ -157,7 +292,7 @@ check_quarantine_active() {
     return 1
   fi
 
-  local sha merge_base_rc apply_rc
+  local sha merge_base_rc present_rc
   while IFS= read -r sha; do
     [[ -z "$sha" ]] && continue
 
@@ -183,21 +318,32 @@ check_quarantine_active() {
       continue
     fi
 
-    # Step 2: content check. The SHA is an ancestor; ask whether its diff
-    # would still reverse-apply cleanly. If YES, the offending lines are
-    # in the current tree → BLOCK. If NO (rejected hunks, missing files,
-    # context drift) the bad code is no longer present → CLEAR for this
-    # entry.
-    apply_rc=0
-    git diff "${sha}^..${sha}" 2>/dev/null | git apply --check --reverse 2>/dev/null || apply_rc=$?
+    # Step 2: per-hunk content check. The SHA is an ancestor; ask whether ANY
+    # hunk of its diff still reverse-applies (harmful content present). rc 0 →
+    # at least one hunk present → BLOCK. rc 1 → all hunks gone → CLEAR for this
+    # entry. rc 2 → fail-safe (diff error / empty / zero hunks) → BLOCK.
+    present_rc=0
+    _quarantine_any_hunk_present "$sha" || present_rc=$?
 
-    if [[ "$apply_rc" -eq 0 ]]; then
-      # Reverse-apply works → content still present → BLOCK
+    if [[ "$present_rc" -eq 0 ]]; then
+      # At least one hunk's harmful content is still present → BLOCK.
       QUARANTINE_STATUS="blocked_active"
       QUARANTINED_MATCH="$sha"
       return 0
     fi
-    # rc != 0: bad code has been reverted or otherwise removed. Skip.
+    if [[ "$present_rc" -ge 2 ]]; then
+      # Fail-safe: could not confidently determine absence → BLOCK.
+      local warning="content-check-indeterminate: ${sha:0:8} (rc=$present_rc)"
+      if [[ -n "$QUARANTINE_WARNINGS" ]]; then
+        QUARANTINE_WARNINGS+=", $warning"
+      else
+        QUARANTINE_WARNINGS="$warning"
+      fi
+      QUARANTINE_STATUS="blocked_active"
+      QUARANTINED_MATCH="$sha"
+      return 0
+    fi
+    # present_rc == 1: every hunk failed to reverse-apply → content removed. Skip.
   done <<< "$QUARANTINE_ENTRIES"
 
   # No active match
