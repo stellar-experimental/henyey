@@ -90,9 +90,29 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 //   (infrequent growth events). Operator-authorized per #3233 / #3235.
 //   See #3235 / #3232. Catchup-scoped mallctl purge is the documented fallback
 //   if re-measurement shows steady-state regression.
+//
+// CRITICAL — the export name MUST be `_rjem_malloc_conf`, NOT plain
+// `malloc_conf`. `tikv-jemalloc-sys` builds jemalloc with
+// `--with-jemalloc-prefix=_rjem_`, so every public jemalloc symbol — including
+// the in-binary config symbol — is prefixed. jemalloc's `obtain_malloc_conf()`
+// reads its compiled-in config from the symbol `_rjem_malloc_conf` (and the
+// env source `_RJEM_MALLOC_CONF`); it NEVER reads plain `malloc_conf`. A strong
+// definition under `_rjem_malloc_conf` overrides libjemalloc's *weak* default
+// symbol of the same name, so this string is parsed at allocator init.
+//
+// Before this was fixed (issue #3237), the export was `#[export_name =
+// "malloc_conf"]`. That symbol matched NONE of jemalloc's config sources, so
+// the entire string was a silent no-op: jemalloc ran defaults (retain:true,
+// 10000ms decay, background_thread:false) and all the tuning above did nothing.
+// `nm` on the buggy release binary showed only the weak `_rjem_malloc_conf`
+// (jemalloc's default) and NO plain `malloc_conf` symbol at all.
+//
+// Do NOT "simplify" this back to `malloc_conf`. The runtime-assert test
+// `crates/henyey/tests/jemalloc_config.rs` reads the effective options via
+// `mallctl` and will fail if the config is not actually applied.
 #[cfg(feature = "jemalloc")]
 #[allow(non_upper_case_globals)]
-#[export_name = "malloc_conf"]
+#[export_name = "_rjem_malloc_conf"]
 pub static malloc_conf: &[u8] =
     b"background_thread:true,dirty_decay_ms:1000,muzzy_decay_ms:1000,retain:false\0";
 
