@@ -1284,10 +1284,17 @@ impl HotArchiveBucketList {
     /// * `hashes` - Vec of (curr_hash, snap_hash) pairs for each level
     /// * `next_states` - Pending merge state for each level
     /// * `load_bucket` - Thread-safe function to load a HotArchiveBucket by hash
+    /// * `fan_out` - Optional cap on concurrent bucket materialization, mirroring
+    ///   [`BucketList::restore_from_has_parallel`](crate::BucketList::restore_from_has_parallel).
+    ///   `None`/`Some(0)` = unbounded (current behavior). The restored
+    ///   `hash()` is identical for every `fan_out` value. (The hot archive is
+    ///   small/cheap relative to the live BL — this knob is threaded here for
+    ///   symmetry; the catchup memory win is on the live BucketList.)
     pub fn restore_from_has_parallel<F>(
         hashes: &[(Hash256, Hash256)],
         next_states: &[Option<PendingMergeState>],
         load_bucket: F,
+        fan_out: Option<usize>,
     ) -> Result<Self>
     where
         F: Fn(&Hash256) -> Result<HotArchiveBucket> + Send + Sync,
@@ -1308,6 +1315,11 @@ impl HotArchiveBucketList {
         }
 
         let load_bucket = &load_bucket;
+
+        // Bound concurrent materialization (#3245). Unbounded by default.
+        let limiter = crate::FanOutLimiter::from_cap(fan_out);
+        let limiter = &limiter;
+
         let levels = std::thread::scope(|s| -> Result<Vec<HotArchiveBucketLevel>> {
             let handles: Vec<_> = hashes
                 .iter()
@@ -1315,6 +1327,9 @@ impl HotArchiveBucketList {
                 .enumerate()
                 .map(|(i, ((curr_hash, snap_hash), state))| {
                     s.spawn(move || -> Result<HotArchiveBucketLevel> {
+                        // Permit held across this level's materialization
+                        // (curr + snap + optional output); released on drop.
+                        let _permit = limiter.acquire();
                         let curr = load_hot_or_sentinel_shared(curr_hash, load_bucket)?;
 
                         let snap = load_hot_or_sentinel_shared(snap_hash, load_bucket)?;
@@ -2395,7 +2410,8 @@ mod tests {
             }
         };
 
-        let result = HotArchiveBucketList::restore_from_has_parallel(&hashes, &next_states, loader);
+        let result =
+            HotArchiveBucketList::restore_from_has_parallel(&hashes, &next_states, loader, None);
         assert!(matches!(result, Err(BucketError::HashMismatch { .. })));
     }
 
@@ -2485,8 +2501,12 @@ mod tests {
             }
         };
 
-        let result =
-            HotArchiveBucketList::restore_from_has_parallel(&hashes, &next_states, combined_loader);
+        let result = HotArchiveBucketList::restore_from_has_parallel(
+            &hashes,
+            &next_states,
+            combined_loader,
+            None,
+        );
         assert!(matches!(result, Err(BucketError::HashMismatch { .. })));
     }
 
@@ -2500,9 +2520,12 @@ mod tests {
         });
         assert!(result.is_err());
 
-        let result = HotArchiveBucketList::restore_from_has_parallel(&hashes, &next_states, |_| {
-            unreachable!("should not call loader")
-        });
+        let result = HotArchiveBucketList::restore_from_has_parallel(
+            &hashes,
+            &next_states,
+            |_| unreachable!("should not call loader"),
+            None,
+        );
         assert!(result.is_err());
     }
 
@@ -2516,9 +2539,12 @@ mod tests {
         });
         assert!(result.is_err());
 
-        let result = HotArchiveBucketList::restore_from_has_parallel(&hashes, &next_states, |_| {
-            unreachable!("should not call loader")
-        });
+        let result = HotArchiveBucketList::restore_from_has_parallel(
+            &hashes,
+            &next_states,
+            |_| unreachable!("should not call loader"),
+            None,
+        );
         assert!(result.is_err());
     }
 
@@ -2686,7 +2712,8 @@ mod tests {
         };
 
         let bl =
-            HotArchiveBucketList::restore_from_has_parallel(&hashes, &next_states, loader).unwrap();
+            HotArchiveBucketList::restore_from_has_parallel(&hashes, &next_states, loader, None)
+                .unwrap();
 
         for level in bl.levels() {
             assert!(level.curr.hash().is_zero());
@@ -2739,7 +2766,8 @@ mod tests {
             )))
         };
 
-        let result = HotArchiveBucketList::restore_from_has_parallel(&hashes, &next_states, loader);
+        let result =
+            HotArchiveBucketList::restore_from_has_parallel(&hashes, &next_states, loader, None);
         assert!(
             result.is_err(),
             "hot archive parallel restore must fail when state-1 output bucket is missing"

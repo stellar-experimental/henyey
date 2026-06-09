@@ -902,9 +902,14 @@ impl App {
             let arc = bucket_manager.load_bucket(hash)?;
             Ok(Arc::try_unwrap(arc).unwrap_or_else(|arc| (*arc).clone()))
         };
-        let mut bucket_list =
-            BucketList::restore_from_has_parallel(&live_hash_pairs, &live_next_states, load_bucket)
-                .map_err(|e| anyhow::anyhow!("Failed to restore live bucket list: {}", e))?;
+        let restore_fan_out = self.config.buckets.restore_apply_fan_out_cap();
+        let mut bucket_list = BucketList::restore_from_has_parallel(
+            &live_hash_pairs,
+            &live_next_states,
+            load_bucket,
+            restore_fan_out,
+        )
+        .map_err(|e| anyhow::anyhow!("Failed to restore live bucket list: {}", e))?;
         bucket_list.set_bucket_dir(bucket_dir.clone());
         bucket_list.set_ledger_seq(lcl_seq);
         henyey_ledger::log_startup_memory("after_restore_bucket_list");
@@ -973,6 +978,7 @@ impl App {
                 &hot_hash_pairs,
                 &hot_next_states,
                 load_hot,
+                self.config.buckets.restore_apply_fan_out_cap(),
             )
             .map_err(|e| anyhow::anyhow!("Failed to restore hot archive: {}", e))?;
 
@@ -1249,9 +1255,13 @@ impl App {
             Ok(std::sync::Arc::try_unwrap(arc).unwrap_or_else(|arc| (*arc).clone()))
         };
 
-        let mut bucket_list =
-            BucketList::restore_from_has_parallel(&live_hash_pairs, &live_next_states, load_bucket)
-                .map_err(|e| anyhow::anyhow!("Failed to restore live bucket list: {}", e))?;
+        let mut bucket_list = BucketList::restore_from_has_parallel(
+            &live_hash_pairs,
+            &live_next_states,
+            load_bucket,
+            self.config.buckets.restore_apply_fan_out_cap(),
+        )
+        .map_err(|e| anyhow::anyhow!("Failed to restore live bucket list: {}", e))?;
 
         let bucket_dir = self.bucket_manager.bucket_dir().to_path_buf();
         bucket_list.set_bucket_dir(bucket_dir.clone());
@@ -1305,6 +1315,7 @@ impl App {
                 &hot_hash_pairs,
                 &hot_next_states,
                 load_hot,
+                self.config.buckets.restore_apply_fan_out_cap(),
             )
             .map_err(|e| anyhow::anyhow!("Failed to restore hot archive: {}", e))?;
 

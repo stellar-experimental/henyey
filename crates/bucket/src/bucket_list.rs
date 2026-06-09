@@ -2657,10 +2657,21 @@ impl BucketList {
     /// * `hashes` - Vec of (curr_hash, snap_hash) pairs for each level
     /// * `next_states` - Vec of pending merge states for each level
     /// * `load_bucket` - Thread-safe function to load a bucket from its hash
+    /// * `fan_out` - Optional cap on the number of workers that may *materialize*
+    ///   a bucket (`load_bucket`) concurrently. `None` (or `Some(0)`) is the
+    ///   default: unbounded, byte-for-byte the historical behavior — all
+    ///   workers materialize at once. `Some(k)` caps concurrent materialization
+    ///   to `k` via a counting semaphore ([`FanOutLimiter`]) acquired *around
+    ///   the `load_bucket` calls*. The permit bounds the transient
+    ///   per-load working set (the cold-catchup spike, #3235), NOT the resident
+    ///   base — assembled buckets stay live regardless of `k`. The restored
+    ///   `BucketList` and its `hash()` are identical for every `fan_out` value:
+    ///   assembly indexes results by level, independent of scheduling order.
     pub fn restore_from_has_parallel<F>(
         hashes: &[(Hash256, Hash256)],
         next_states: &[Option<PendingMergeState>],
         load_bucket: F,
+        fan_out: Option<usize>,
     ) -> Result<Self>
     where
         F: Fn(&Hash256) -> Result<Bucket> + Send + Sync,
@@ -2681,6 +2692,11 @@ impl BucketList {
         }
 
         let load_bucket = &load_bucket;
+
+        // Bound concurrent bucket materialization (the cold-catchup spike, #3245).
+        // Unbounded by default (`None`/`Some(0)`) → no-op, current behavior.
+        let limiter = crate::FanOutLimiter::from_cap(fan_out);
+        let limiter = &limiter;
 
         // Collect (level_index, output_hash) for levels with completed merge outputs.
         // Skip zero-hash outputs as a belt-and-suspenders defense; parse_next_states()
@@ -2704,6 +2720,12 @@ impl BucketList {
                     s.spawn(move || -> Result<(usize, Bucket, Bucket)> {
                         let level_start = std::time::Instant::now();
 
+                        // Acquire a permit around materialization so at most
+                        // `fan_out` workers build buckets at once (no-op when
+                        // unbounded). Held across both loads (the level
+                        // worker's transient working set); released on drop
+                        // after the buckets are built and returned.
+                        let _permit = limiter.acquire();
                         let curr = load_or_sentinel_shared(curr_hash, load_bucket)?;
                         let snap = load_or_sentinel_shared(snap_hash, load_bucket)?;
 
@@ -2733,6 +2755,10 @@ impl BucketList {
                         i,
                         s.spawn(move || -> Result<Bucket> {
                             let t = std::time::Instant::now();
+                            // Same permit gate as the level workers — the
+                            // output bucket (e.g. level 10's ~47M-entry merge
+                            // result) is a heavy materialization.
+                            let _permit = limiter.acquire();
                             let bucket = load_and_verify_shared(&hash, load_bucket)?;
                             tracing::info!(
                                 level = i,
@@ -4853,7 +4879,8 @@ mod tests {
         let next_states = vec![None; BUCKET_LIST_LEVELS];
 
         let loader = make_loader(vec![bucket0_curr, bucket1_curr]);
-        let bl = BucketList::restore_from_has_parallel(&hashes, &next_states, loader).unwrap();
+        let bl =
+            BucketList::restore_from_has_parallel(&hashes, &next_states, loader, None).unwrap();
 
         assert_eq!(bl.levels().len(), BUCKET_LIST_LEVELS);
 
@@ -4895,7 +4922,8 @@ mod tests {
         next_states[0] = Some(PendingMergeState::Output(ho));
 
         let loader = make_loader(vec![bucket_curr, bucket_out]);
-        let bl = BucketList::restore_from_has_parallel(&hashes, &next_states, loader).unwrap();
+        let bl =
+            BucketList::restore_from_has_parallel(&hashes, &next_states, loader, None).unwrap();
 
         assert!(
             bl.levels()[0].next.is_some(),
@@ -4924,7 +4952,8 @@ mod tests {
         let next_states = vec![None; BUCKET_LIST_LEVELS]; // all CLEAR
 
         let loader = make_loader(vec![bucket]);
-        let bl = BucketList::restore_from_has_parallel(&hashes, &next_states, loader).unwrap();
+        let bl =
+            BucketList::restore_from_has_parallel(&hashes, &next_states, loader, None).unwrap();
 
         for i in 0..BUCKET_LIST_LEVELS {
             assert!(
@@ -4971,31 +5000,123 @@ mod tests {
         let bl_seq =
             BucketList::restore_from_has(&hashes, &next_states, |h| loader_seq(h)).unwrap();
 
-        let loader_par = make_loader(all_buckets);
-        let bl_par =
-            BucketList::restore_from_has_parallel(&hashes, &next_states, loader_par).unwrap();
+        // Parametrize the parallel restore over the fan-out cap (#3245):
+        // unbounded (None / Some(0)), and capped to 1, 2, 4. EVERY value must
+        // produce a BYTE-IDENTICAL BucketList — same entries, same level.next
+        // presence, and crucially the same bl.hash() — because capping
+        // concurrency only changes HOW MANY workers materialize at once, not
+        // WHAT is assembled or the assembly order (results are indexed by
+        // level). This is the byte-identical-state proof.
+        let seq_hash = bl_seq.hash();
+        for fan_out in [None, Some(0), Some(1), Some(2), Some(4)] {
+            let loader_par = make_loader(all_buckets.clone());
+            let bl_par =
+                BucketList::restore_from_has_parallel(&hashes, &next_states, loader_par, fan_out)
+                    .unwrap();
 
-        // All entries should be reachable from both
-        for i in 1u8..=4 {
-            let key = make_account_key([i; 32]);
-            let seq_result = bl_seq.get(&key).unwrap();
-            let par_result = bl_par.get(&key).unwrap();
+            // Byte-identical restored state: bucketListHash must match the
+            // sequential restore regardless of fan-out.
             assert_eq!(
-                seq_result.is_some(),
-                par_result.is_some(),
-                "entry [{}; 32] presence mismatch between sequential and parallel restore",
-                i
+                bl_par.hash(),
+                seq_hash,
+                "bl.hash() differs for fan_out={:?} — capping concurrency must \
+                 not change the restored state",
+                fan_out
             );
+
+            // All entries should be reachable from both.
+            for i in 1u8..=4 {
+                let key = make_account_key([i; 32]);
+                let seq_result = bl_seq.get(&key).unwrap();
+                let par_result = bl_par.get(&key).unwrap();
+                assert_eq!(
+                    seq_result.is_some(),
+                    par_result.is_some(),
+                    "entry [{}; 32] presence mismatch (fan_out={:?})",
+                    i,
+                    fan_out
+                );
+            }
+
+            // level.next presence must match.
+            for i in 0..BUCKET_LIST_LEVELS {
+                assert_eq!(
+                    bl_seq.levels()[i].next.is_some(),
+                    bl_par.levels()[i].next.is_some(),
+                    "level {} next presence mismatch (fan_out={:?})",
+                    i,
+                    fan_out
+                );
+            }
         }
+    }
 
-        // level.next presence must match
-        for i in 0..BUCKET_LIST_LEVELS {
-            assert_eq!(
-                bl_seq.levels()[i].next.is_some(),
-                bl_par.levels()[i].next.is_some(),
-                "level {} next presence mismatch between sequential and parallel restore",
-                i
-            );
+    #[test]
+    fn test_restore_from_has_parallel_respects_fan_out_cap() {
+        // Verify the semaphore actually bounds concurrency: with fan_out =
+        // Some(2) over more than 2 non-empty levels, no more than 2 loader
+        // closures may execute simultaneously. We instrument the loader with an
+        // atomic concurrent-counter + max-seen, and sleep inside it so that an
+        // unbounded restore would reliably overlap >2 loads.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc as StdArc;
+
+        // Build distinct curr buckets for several levels so multiple loader
+        // calls run concurrently.
+        let n_levels = 6usize;
+        let buckets: Vec<Bucket> = (0..n_levels)
+            .map(|i| {
+                let entry = make_account_entry([(i as u8) + 1; 32], (i as i64 + 1) * 100);
+                Bucket::from_entries(vec![BucketListEntry::Liveentry(entry)]).unwrap()
+            })
+            .collect();
+
+        let mut hashes = vec![(Hash256::ZERO, Hash256::ZERO); BUCKET_LIST_LEVELS];
+        for (i, b) in buckets.iter().enumerate() {
+            hashes[i] = (b.hash(), Hash256::ZERO);
+        }
+        let next_states = vec![None; BUCKET_LIST_LEVELS];
+
+        // Map hash -> bucket for the instrumented loader.
+        let by_hash: std::collections::HashMap<Hash256, Bucket> =
+            buckets.iter().map(|b| (b.hash(), b.clone())).collect();
+
+        let current = StdArc::new(AtomicUsize::new(0));
+        let max_seen = StdArc::new(AtomicUsize::new(0));
+        let current_c = StdArc::clone(&current);
+        let max_seen_c = StdArc::clone(&max_seen);
+
+        let loader = move |h: &Hash256| -> Result<Bucket> {
+            if h.is_zero() {
+                // Sentinel path doesn't materialize a real bucket; don't count.
+                return Ok(Bucket::empty());
+            }
+            let now = current_c.fetch_add(1, Ordering::SeqCst) + 1;
+            max_seen_c.fetch_max(now, Ordering::SeqCst);
+            // Hold "inside the load" briefly so concurrent loads actually overlap.
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            let b = by_hash
+                .get(h)
+                .cloned()
+                .expect("instrumented loader: unknown hash");
+            current_c.fetch_sub(1, Ordering::SeqCst);
+            Ok(b)
+        };
+
+        let cap = 2usize;
+        let bl = BucketList::restore_from_has_parallel(&hashes, &next_states, loader, Some(cap))
+            .unwrap();
+
+        assert_eq!(current.load(Ordering::SeqCst), 0, "all loads completed");
+        assert!(
+            max_seen.load(Ordering::SeqCst) <= cap,
+            "max concurrent loads {} exceeded fan_out cap {}",
+            max_seen.load(Ordering::SeqCst),
+            cap
+        );
+        // Sanity: the buckets were actually materialized.
+        for (i, b) in buckets.iter().enumerate() {
+            assert_eq!(bl.levels()[i].curr.hash(), b.hash());
         }
     }
 
@@ -5005,9 +5126,12 @@ mod tests {
         let next_states = vec![None; BUCKET_LIST_LEVELS];
         let too_short = vec![(Hash256::ZERO, Hash256::ZERO); 5]; // < BUCKET_LIST_LEVELS
 
-        let result = BucketList::restore_from_has_parallel(&too_short, &next_states, |_| {
-            unreachable!("should not call loader")
-        });
+        let result = BucketList::restore_from_has_parallel(
+            &too_short,
+            &next_states,
+            |_| unreachable!("should not call loader"),
+            None,
+        );
         assert!(result.is_err(), "should return error for wrong level count");
     }
 
@@ -5023,8 +5147,9 @@ mod tests {
 
         let next_states = vec![None; BUCKET_LIST_LEVELS];
 
-        let bl = BucketList::restore_from_has_parallel(&hashes, &next_states, make_loader(vec![]))
-            .unwrap();
+        let bl =
+            BucketList::restore_from_has_parallel(&hashes, &next_states, make_loader(vec![]), None)
+                .unwrap();
 
         assert_eq!(bl.levels()[0].curr.hash(), *Hash256::empty_hash());
         assert_eq!(bl.levels()[0].curr.len(), 0);
@@ -5060,8 +5185,9 @@ mod tests {
 
         let next_states = vec![None; BUCKET_LIST_LEVELS];
 
-        let bl = BucketList::restore_from_has_parallel(&hashes, &next_states, make_loader(vec![]))
-            .unwrap();
+        let bl =
+            BucketList::restore_from_has_parallel(&hashes, &next_states, make_loader(vec![]), None)
+                .unwrap();
 
         assert_eq!(bl.levels()[0].curr.hash(), *Hash256::empty_hash());
         assert_eq!(bl.levels()[0].curr.len(), 0);
@@ -5534,7 +5660,7 @@ mod tests {
         let next_states = vec![None; BUCKET_LIST_LEVELS];
 
         let loader = make_wrong_hash_loader(correct_bucket, wrong_bucket);
-        let result = BucketList::restore_from_has_parallel(&hashes, &next_states, loader);
+        let result = BucketList::restore_from_has_parallel(&hashes, &next_states, loader, None);
         assert!(matches!(result, Err(BucketError::HashMismatch { .. })));
     }
 
@@ -5607,7 +5733,8 @@ mod tests {
             }
         };
 
-        let result = BucketList::restore_from_has_parallel(&hashes, &next_states, combined_loader);
+        let result =
+            BucketList::restore_from_has_parallel(&hashes, &next_states, combined_loader, None);
         assert!(matches!(result, Err(BucketError::HashMismatch { .. })));
     }
 
@@ -5621,9 +5748,12 @@ mod tests {
         });
         assert!(result.is_err());
 
-        let result = BucketList::restore_from_has_parallel(&hashes, &next_states, |_| {
-            unreachable!("should not call loader")
-        });
+        let result = BucketList::restore_from_has_parallel(
+            &hashes,
+            &next_states,
+            |_| unreachable!("should not call loader"),
+            None,
+        );
         assert!(result.is_err());
     }
 
@@ -5637,9 +5767,12 @@ mod tests {
         });
         assert!(result.is_err());
 
-        let result = BucketList::restore_from_has_parallel(&hashes, &next_states, |_| {
-            unreachable!("should not call loader")
-        });
+        let result = BucketList::restore_from_has_parallel(
+            &hashes,
+            &next_states,
+            |_| unreachable!("should not call loader"),
+            None,
+        );
         assert!(result.is_err());
     }
 
@@ -5761,7 +5894,7 @@ mod tests {
             )))
         };
 
-        let result = BucketList::restore_from_has_parallel(&hashes, &next_states, loader);
+        let result = BucketList::restore_from_has_parallel(&hashes, &next_states, loader, None);
         assert!(
             result.is_err(),
             "restore_from_has_parallel must fail when state-1 output bucket is missing"
@@ -5812,7 +5945,7 @@ mod tests {
         next_states[1] = Some(PendingMergeState::Output(output_hash));
 
         let loader = make_loader(vec![output_bucket]);
-        let result = BucketList::restore_from_has_parallel(&hashes, &next_states, loader);
+        let result = BucketList::restore_from_has_parallel(&hashes, &next_states, loader, None);
         assert!(
             result.is_ok(),
             "restore should succeed when all buckets are present: {:?}",
@@ -5947,7 +6080,8 @@ mod tests {
         next_states[0] = Some(PendingMergeState::Output(ho));
 
         let loader = make_loader(vec![bucket_curr, bucket_out]);
-        let bl = BucketList::restore_from_has_parallel(&hashes, &next_states, loader).unwrap();
+        let bl =
+            BucketList::restore_from_has_parallel(&hashes, &next_states, loader, None).unwrap();
 
         let referenced = bl.all_referenced_hashes();
 
@@ -6001,7 +6135,8 @@ mod tests {
         next_states[0] = Some(PendingMergeState::Output(Hash256::ZERO));
 
         let loader = make_loader(vec![bucket]);
-        let bl = BucketList::restore_from_has_parallel(&hashes, &next_states, loader).unwrap();
+        let bl =
+            BucketList::restore_from_has_parallel(&hashes, &next_states, loader, None).unwrap();
 
         assert!(
             bl.levels()[0].next.is_none(),
@@ -6287,6 +6422,7 @@ mod tests {
             &has_hashes,
             &has_next_states,
             move |h: &Hash256| loader_ref(h),
+            None,
         )
         .unwrap();
         bl_restored.set_ledger_seq(restore_ledger);
@@ -6510,9 +6646,13 @@ mod tests {
                 Bucket::from_xdr_file_disk_backed(&path)
             }
         };
-        let mut bl_restored =
-            BucketList::restore_from_has_parallel(&has_hashes, &has_next_states, disk_loader_clone)
-                .unwrap();
+        let mut bl_restored = BucketList::restore_from_has_parallel(
+            &has_hashes,
+            &has_next_states,
+            disk_loader_clone,
+            None,
+        )
+        .unwrap();
         bl_restored.set_ledger_seq(restore_ledger);
 
         // Set bucket_dir to enable disk-backed merges (the production condition)

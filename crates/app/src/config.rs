@@ -831,6 +831,31 @@ pub struct BucketConfig {
     #[serde(default = "default_scan_thread_count")]
     pub scan_thread_count: usize,
 
+    /// Maximum number of bucket-materialization workers that may run
+    /// concurrently during parallel restore (`restore_from_has_parallel`).
+    ///
+    /// Caps the cold-catchup live-allocation spike (#3245/#3235): on a fresh
+    /// catchup henyey spawns up to ~22 concurrent `load_bucket` workers, each
+    /// with a large transient working set (streaming index build, XDR parse
+    /// buffers, small buckets loaded fully into RAM). The peak ≈ the sum of all
+    /// concurrent workers' transient sets. Capping concurrency to `k` bounds
+    /// the spike (≈ `base + k × per-worker-live`) at the cost of restore
+    /// wall-clock.
+    ///
+    /// `0` (the default) means **unbounded** — the historical behavior, a true
+    /// no-op with zero regression. A non-zero `k` caps concurrent
+    /// materialization to `k` via a counting semaphore acquired around the
+    /// load. Bounding concurrency does NOT change the restored state: the
+    /// `bucketListHash` is byte-identical for every value of `k` (assembly is
+    /// indexed by level, independent of scheduling order).
+    ///
+    /// On a 32 GB host, `restore_apply_fan_out = 6` caps the peak at ~19 GB
+    /// (≤20 GB margin) for ~+30s of catchup time. Aligns with stellar-core,
+    /// which bounds apply/index concurrency via the configurable
+    /// `WORKER_THREADS`; henyey's unbounded fan-out was the outlier.
+    #[serde(default = "default_restore_apply_fan_out")]
+    pub restore_apply_fan_out: usize,
+
     /// Disable on-disk bucket garbage collection (forensic / debugging
     /// kill-switch).
     ///
@@ -848,6 +873,24 @@ fn default_scan_thread_count() -> usize {
     4
 }
 
+/// Default fan-out cap for parallel restore: `0` = unbounded (current
+/// behavior, zero regression). See [`BucketConfig::restore_apply_fan_out`].
+fn default_restore_apply_fan_out() -> usize {
+    0
+}
+
+impl BucketConfig {
+    /// The restore fan-out cap as an `Option<usize>` suitable for
+    /// `restore_from_has_parallel`: `0` maps to `None` (unbounded), any
+    /// non-zero `k` to `Some(k)`.
+    pub fn restore_apply_fan_out_cap(&self) -> Option<usize> {
+        match self.restore_apply_fan_out {
+            0 => None,
+            k => Some(k),
+        }
+    }
+}
+
 impl Default for BucketConfig {
     fn default() -> Self {
         Self {
@@ -855,6 +898,7 @@ impl Default for BucketConfig {
             cache_size: default_bucket_cache_size(),
             bucket_list_db: BucketListDbConfig::default(),
             scan_thread_count: default_scan_thread_count(),
+            restore_apply_fan_out: default_restore_apply_fan_out(),
             disable_bucket_gc: false,
         }
     }
@@ -2624,6 +2668,48 @@ disable_bucket_gc = true
             config.buckets.disable_bucket_gc,
             "disable_bucket_gc = true must parse to true"
         );
+    }
+
+    #[test]
+    fn test_restore_apply_fan_out_default_is_unbounded() {
+        // #3245: restore_apply_fan_out defaults to 0 == unbounded == current
+        // behavior (a true no-op, zero regression). The operator sets a
+        // non-zero cap (e.g. 6) at deploy on a memory-constrained host.
+        assert_eq!(
+            BucketConfig::default().restore_apply_fan_out,
+            0,
+            "restore_apply_fan_out must default to 0 (unbounded)"
+        );
+        assert_eq!(
+            BucketConfig::default().restore_apply_fan_out_cap(),
+            None,
+            "the default (0) must map to None (no cap engaged)"
+        );
+
+        // Absent from TOML => default unbounded.
+        let toml_str = r#"
+[network]
+passphrase = "Test SDF Network ; September 2015"
+
+[buckets]
+directory = "buckets"
+"#;
+        let config: AppConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.buckets.restore_apply_fan_out, 0);
+        assert_eq!(config.buckets.restore_apply_fan_out_cap(), None);
+
+        // A non-zero value round-trips and maps to Some(k).
+        let toml_str_capped = r#"
+[network]
+passphrase = "Test SDF Network ; September 2015"
+
+[buckets]
+directory = "buckets"
+restore_apply_fan_out = 6
+"#;
+        let config: AppConfig = toml::from_str(toml_str_capped).unwrap();
+        assert_eq!(config.buckets.restore_apply_fan_out, 6);
+        assert_eq!(config.buckets.restore_apply_fan_out_cap(), Some(6));
     }
 
     #[test]
