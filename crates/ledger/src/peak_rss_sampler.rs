@@ -29,7 +29,7 @@
 //! inheriting `ProcessMemory::capture()`'s degrade-to-zero contract.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -46,6 +46,12 @@ const POLL_INTERVAL: Duration = Duration::from_secs(1);
 /// the `run_main_loop` orchestrator alone). The finer `BucketApply`/`CacheScan`
 /// tags are nice-to-have refinements set at the existing `log_startup_memory`
 /// checkpoints.
+///
+/// The discriminants 0..=3 are stable (kept for the gauge/summary line so
+/// historical samples remain comparable). The cold-catchup restore sub-phase
+/// variants (#3239) are assigned 4+; they are set via [`note_checkpoint`]
+/// rather than `set_phase`, routed from the existing `log_startup_memory`
+/// checkpoints by [`phase_for_checkpoint`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum Phase {
@@ -57,6 +63,23 @@ pub enum Phase {
     CacheScan = 2,
     /// History catchup (HAS download + apply).
     Catchup = 3,
+    /// Live bucket-list restore (`restore_from_has_parallel`), from the start of
+    /// reconstruction until merges/scan begin (#3239).
+    LiveBucketRestore = 4,
+    /// Pending merge restart (`restart_merges_from_has`). On the warm-restart
+    /// path the in-memory cache scan runs concurrently with merges; a single
+    /// `current_phase` atomic cannot distinctly attribute the overlap, so the
+    /// merge-restart tag also covers the overlapped scan window there (#3239).
+    MergeRestart = 5,
+    /// Hot-archive bucket-list restore + merge restart (#3239).
+    HotArchiveRestore = 6,
+    /// Cache install: bucket-list verify/install, per-bucket cache init, and
+    /// pre-computed cache data install (cold-catchup
+    /// `initialize_with_precomputed_caches`). Module-cache warm is folded in
+    /// here (not separately checkpointed) (#3239).
+    CacheInstall = 7,
+    /// Post-catchup warm-up of per-entry caches (`warm_entry_caches`) (#3239).
+    PostCatchupWarm = 8,
 }
 
 impl Phase {
@@ -65,6 +88,11 @@ impl Phase {
             1 => Phase::BucketApply,
             2 => Phase::CacheScan,
             3 => Phase::Catchup,
+            4 => Phase::LiveBucketRestore,
+            5 => Phase::MergeRestart,
+            6 => Phase::HotArchiveRestore,
+            7 => Phase::CacheInstall,
+            8 => Phase::PostCatchupWarm,
             _ => Phase::Startup,
         }
     }
@@ -76,8 +104,46 @@ impl Phase {
             Phase::BucketApply => "bucket-apply",
             Phase::CacheScan => "cache-scan",
             Phase::Catchup => "catchup",
+            Phase::LiveBucketRestore => "live-bucket-restore",
+            Phase::MergeRestart => "merge-restart",
+            Phase::HotArchiveRestore => "hot-archive-restore",
+            Phase::CacheInstall => "cache-install",
+            Phase::PostCatchupWarm => "post-catchup-warm",
         }
     }
+}
+
+/// Map a `log_startup_memory` checkpoint string to the restore sub-phase that
+/// the sampler should attribute subsequent peak samples to (#3239).
+///
+/// An `after_X` checkpoint names the sub-phase that just *finished*, so the map
+/// advances `current_phase` to the sub-phase about to *start*. The first
+/// sub-phase is bootstrapped by an explicit `before_restore_bucket_list`
+/// checkpoint so live-bucket-restore is not orphaned to the coarse `Catchup`
+/// tag.
+///
+/// The same string always maps to the same `Phase` even when it appears in
+/// both the warm-restart (`load_last_known_ledger`) and cold-catchup
+/// (`initialize_with_precomputed_caches`) paths. Any string not in the table
+/// returns `None`, leaving `current_phase` unchanged (a no-op).
+pub fn phase_for_checkpoint(checkpoint: &str) -> Option<Phase> {
+    let phase = match checkpoint {
+        "before_restore_bucket_list" => Phase::LiveBucketRestore,
+        // Live restore done — merges (and the overlapped scan) begin next.
+        "after_restore_bucket_list" => Phase::MergeRestart,
+        "before_cache_scan" => Phase::CacheScan,
+        // Scan complete but still installing; the next boundary advances.
+        "after_cache_scan" => Phase::CacheScan,
+        "hot_archive_restore" => Phase::HotArchiveRestore,
+        // End of the warm-restart overlapped scan+merge window.
+        "after_cache_scan_and_merges" => Phase::MergeRestart,
+        "after_verify_install_buckets" => Phase::CacheInstall,
+        "after_bucket_cache_init" => Phase::CacheInstall,
+        "after_cache_install" => Phase::CacheInstall,
+        "after_post_catchup_cache_warm" => Phase::PostCatchupWarm,
+        _ => return None,
+    };
+    Some(phase)
 }
 
 /// Shared, lock-free state between the sampler thread and the controlling
@@ -269,11 +335,91 @@ fn sample_once_impl<F: Fn() -> u64>(state: &SamplerState, value_source: &F) {
     }
 }
 
+// --- Process-global sampler hook (#3239) ----------------------------------
+//
+// The cold-catchup restore sub-phases fire deep across app → ledger → bucket,
+// far from where the live sampler instance lives (a local in `run_cmd.rs`, not
+// on `App`). Rather than thread a sampler handle through
+// `catchup_with_run_mode` → `rebuild_bucket_lists_from_has` →
+// `reconstruct_bucket_lists` (a large, invasive cross-crate signature change),
+// `run_cmd.rs` registers the live sampler's `Arc<SamplerState>` into a
+// process-global slot at `start()` and clears it at `stop()`. The existing
+// `log_startup_memory` checkpoints call [`note_checkpoint`], which looks the
+// string up in [`phase_for_checkpoint`] and, when a sampler is registered,
+// stores the mapped sub-phase into the SAME `current_phase` the sampler thread
+// reads.
+//
+// Lifetime: the slot holds a `Weak`, so it never keeps the sampler alive past
+// `stop()`/`Drop`; a failed upgrade (no live sampler, e.g. steady-state `% 64`
+// reports or unit tests) makes `note_checkpoint` a cheap no-op — matching the
+// sampler's existing "degrade-to-zero, never panic" contract.
+//
+// Ordering: the `Mutex` provides the happens-before edge between the
+// `register`/`clear` writer and the `note_checkpoint` reader; the phase tag
+// itself is written into `current_phase` with `Release` and read by the
+// sampler thread with `Acquire` (the same atomic `set_phase` already uses), so
+// a tag written by `note_checkpoint` is observed by the sampler thread.
+
+/// Process-global slot holding a `Weak` reference to the live sampler's shared
+/// state, registered for exactly the single startup window.
+static GLOBAL_SAMPLER: OnceLock<Mutex<Weak<SamplerState>>> = OnceLock::new();
+
+fn global_sampler_slot() -> &'static Mutex<Weak<SamplerState>> {
+    GLOBAL_SAMPLER.get_or_init(|| Mutex::new(Weak::new()))
+}
+
+/// Register the given sampler as the process-global checkpoint target.
+///
+/// Call once, right after [`StartupPeakRssSampler::start`], so the
+/// `log_startup_memory` checkpoints fired during catchup/restore route their
+/// sub-phase tags into this sampler. Clear with [`clear_global_sampler`] at
+/// `stop()`. Registering stores a `Weak` (does not extend the sampler's
+/// lifetime) with `Release` semantics provided by the `Mutex`.
+pub fn register_global_sampler(sampler: &StartupPeakRssSampler) {
+    let mut slot = global_sampler_slot()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    *slot = Arc::downgrade(&sampler.state);
+}
+
+/// Clear the process-global checkpoint target so subsequent [`note_checkpoint`]
+/// calls become no-ops. Call at `stop()` (or whenever the startup window ends).
+pub fn clear_global_sampler() {
+    let mut slot = global_sampler_slot()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    *slot = Weak::new();
+}
+
+/// Route a `log_startup_memory` checkpoint string into the registered sampler's
+/// current sub-phase (#3239).
+///
+/// Looks the string up in [`phase_for_checkpoint`]; if it maps to a sub-phase
+/// AND a live sampler is registered, stores that sub-phase into the sampler's
+/// `current_phase` (so subsequent peak samples are attributed to it). Unknown
+/// strings, or the absence of a registered/live sampler, make this a no-op —
+/// it never panics and never allocates on the steady-state path.
+pub fn note_checkpoint(checkpoint: &str) {
+    let Some(phase) = phase_for_checkpoint(checkpoint) else {
+        return;
+    };
+    let slot = global_sampler_slot()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if let Some(state) = slot.upgrade() {
+        state.current_phase.store(phase as u8, Ordering::Release);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
-    use std::sync::Mutex;
+
+    /// Serializes the tests that touch the process-global sampler slot
+    /// (`register_global_sampler` / `clear_global_sampler` / `note_checkpoint`)
+    /// so concurrent test threads don't race on the shared static.
+    static GLOBAL_SAMPLER_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     /// A value-source driven by a fixed, in-order list of samples. Each call
     /// returns the next value (clamping at the last). Lets tests drive
@@ -377,6 +523,117 @@ mod tests {
         std::thread::sleep(Duration::from_millis(50));
         let peak = s.stop();
         assert!(peak >= mb(42), "thread should have sampled the source");
+    }
+
+    /// Drive `sample_once` across the cold-catchup restore sub-phase
+    /// transitions and assert the peak is attributed to the sub-phase current
+    /// when the running max was raised. Deterministic (no thread, no `/proc`).
+    #[test]
+    fn test_subphase_peak_attribution() {
+        let mut s = idle_sampler();
+        // live-restore @ 500MB, then merge-restart @ 700MB (the peak), then
+        // cache-scan @ 300MB (below peak).
+        s.set_phase(Phase::LiveBucketRestore);
+        s.sample_once(&scripted_source(vec![mb(500)]));
+        s.set_phase(Phase::MergeRestart);
+        s.sample_once(&scripted_source(vec![mb(700)]));
+        s.set_phase(Phase::CacheScan);
+        s.sample_once(&scripted_source(vec![mb(300)]));
+        assert_eq!(s.peak_bytes(), mb(700));
+        assert_eq!(
+            s.peak_phase(),
+            Phase::MergeRestart,
+            "peak must be attributed to the sub-phase current when the max was raised"
+        );
+        let _ = s.stop();
+    }
+
+    /// Every `log_startup_memory` checkpoint string must map to the intended
+    /// `Phase` (guards against typos / missed strings).
+    #[test]
+    fn test_checkpoint_string_maps_to_phase() {
+        let cases: &[(&str, Phase)] = &[
+            ("before_restore_bucket_list", Phase::LiveBucketRestore),
+            ("after_restore_bucket_list", Phase::MergeRestart),
+            ("before_cache_scan", Phase::CacheScan),
+            ("after_cache_scan", Phase::CacheScan),
+            ("hot_archive_restore", Phase::HotArchiveRestore),
+            ("after_cache_scan_and_merges", Phase::MergeRestart),
+            ("after_verify_install_buckets", Phase::CacheInstall),
+            ("after_bucket_cache_init", Phase::CacheInstall),
+            ("after_cache_install", Phase::CacheInstall),
+            ("after_post_catchup_cache_warm", Phase::PostCatchupWarm),
+        ];
+        for (s, expected) in cases {
+            assert_eq!(
+                phase_for_checkpoint(s),
+                Some(*expected),
+                "checkpoint string {s:?} must map to {expected:?}"
+            );
+        }
+        // Unknown strings map to None (no-op, leaves current_phase unchanged).
+        assert_eq!(phase_for_checkpoint("not_a_checkpoint"), None);
+    }
+
+    /// Every `Phase` variant must roundtrip through `from_u8(as u8)` and have a
+    /// unique, stable `as_str()`.
+    #[test]
+    fn test_phase_enum_roundtrip() {
+        let all = [
+            Phase::Startup,
+            Phase::BucketApply,
+            Phase::CacheScan,
+            Phase::Catchup,
+            Phase::LiveBucketRestore,
+            Phase::MergeRestart,
+            Phase::HotArchiveRestore,
+            Phase::CacheInstall,
+            Phase::PostCatchupWarm,
+        ];
+        let mut seen = std::collections::HashSet::new();
+        for p in all {
+            assert_eq!(
+                Phase::from_u8(p as u8),
+                p,
+                "{p:?} must roundtrip via from_u8"
+            );
+            assert!(
+                seen.insert(p.as_str()),
+                "as_str() for {p:?} ({}) collides with another variant",
+                p.as_str()
+            );
+        }
+    }
+
+    /// `note_checkpoint` with no registered sampler must be a no-op and never
+    /// panic.
+    #[test]
+    fn test_note_checkpoint_noop_without_registered_sampler() {
+        clear_global_sampler();
+        // Must not panic; nothing to observe (no registered sampler).
+        note_checkpoint("before_restore_bucket_list");
+        note_checkpoint("not_a_checkpoint");
+    }
+
+    /// Registering a sampler routes `note_checkpoint` into its `current_phase`;
+    /// clearing the registration restores the no-op behavior.
+    #[test]
+    fn test_note_checkpoint_sets_registered_sampler_phase() {
+        let _guard = GLOBAL_SAMPLER_TEST_LOCK.lock().unwrap();
+        let s = idle_sampler();
+        assert_eq!(s.current_phase(), Phase::Startup);
+        register_global_sampler(&s);
+        note_checkpoint("before_restore_bucket_list");
+        assert_eq!(s.current_phase(), Phase::LiveBucketRestore);
+        note_checkpoint("after_post_catchup_cache_warm");
+        assert_eq!(s.current_phase(), Phase::PostCatchupWarm);
+        // Unknown string leaves the phase unchanged.
+        note_checkpoint("not_a_checkpoint");
+        assert_eq!(s.current_phase(), Phase::PostCatchupWarm);
+        // After clearing, note_checkpoint is a no-op again.
+        clear_global_sampler();
+        note_checkpoint("before_restore_bucket_list");
+        assert_eq!(s.current_phase(), Phase::PostCatchupWarm);
     }
 
     /// Verify `stop()` emits the greppable `startup_peak_anon_rss_mb=` /

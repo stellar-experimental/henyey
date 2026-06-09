@@ -382,6 +382,14 @@ async fn run_main_loop(app: Arc<App>, options: RunOptions) -> anyhow::Result<()>
     // published to the `henyey_startup_peak_anon_rss_mb` gauge.
     let mut startup_rss_sampler = StartupPeakRssSampler::start();
 
+    // Register the sampler as the process-global checkpoint target (#3239) so
+    // the `log_startup_memory` checkpoints fired deep in the catchup/restore
+    // path (app → ledger → bucket) route their finer sub-phase tags into this
+    // sampler without threading a handle through `catchup_with_run_mode`. The
+    // slot holds a Weak (does not extend the sampler's lifetime); it is cleared
+    // right after `stop()` below. Observability-only.
+    henyey_ledger::peak_rss_sampler::register_global_sampler(&startup_rss_sampler);
+
     // Check for force-scp flag (standalone single-node bootstrap).
     // When set, skip all catchup and restore the node directly from DB state.
     let force_scp = app.check_force_scp().await;
@@ -501,6 +509,10 @@ async fn run_main_loop(app: Arc<App>, options: RunOptions) -> anyhow::Result<()>
     // the peak in bytes; publish it as a gauge. On non-Linux / read error this
     // is 0 (no panic), inheriting ProcessMemory::capture()'s contract.
     let startup_peak_bytes = startup_rss_sampler.stop();
+    // Clear the process-global checkpoint target (#3239): after the startup
+    // window, any later `log_startup_memory` call (e.g. a future steady-state
+    // checkpoint) must be a no-op rather than tagging a dropped sampler.
+    henyey_ledger::peak_rss_sampler::clear_global_sampler();
     let startup_peak_mb = startup_peak_bytes as f64 / (1024.0 * 1024.0);
     crate::metrics::STARTUP_PEAK_ANON_RSS_MB.set(startup_peak_mb);
 

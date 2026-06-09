@@ -366,6 +366,13 @@ pub fn log_startup_memory(phase: &str) {
         opt_background_thread = alloc.opt_background_thread,
         "Startup memory checkpoint"
     );
+
+    // Route this checkpoint into the startup peak-RSS sampler's finer
+    // sub-phase tag (#3239). No-op unless a sampler is registered (steady-state
+    // `% 64` reports and unit tests leave it unregistered) and the string maps
+    // to a known sub-phase. Observability-only: stores an AtomicU8 phase tag
+    // read by the sampler thread; no effect on hashes/timing/behavior.
+    crate::peak_rss_sampler::note_checkpoint(phase);
 }
 
 #[cfg(test)]
