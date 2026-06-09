@@ -1470,6 +1470,32 @@ impl Herder {
         tracker.has_quorum(slot, |node_id| self.scp_driver.get_quorum_set(node_id))
     }
 
+    /// Report `heard_from_quorum` from the SCP ballot protocol's per-slot flag.
+    ///
+    /// This is the parity-faithful source for the heartbeat / `/info`
+    /// telemetry, mirroring stellar-core's per-slot
+    /// `BallotProtocol::mHeardFromQuorum` (`stellar-core/src/scp/BallotProtocol.cpp:2192`).
+    /// Unlike [`Self::heard_from_quorum`] (the henyey-only `SlotQuorumTracker`),
+    /// the SCP flag (1) includes the local node — core's `LocalNode::isQuorum`
+    /// always counts the local node's own `mLatestEnvelopes` entry, while the
+    /// tracker never records self (self-messages are skipped in
+    /// `process_verified` before `record_envelope`); and (2) is set for every
+    /// slot the node has a ballot for, including a slot the node only *followed*
+    /// via a quorum of CONFIRM/EXTERNALIZE (`set_state_from_envelope` →
+    /// `advance_slot` → `check_heard_from_quorum`). The tracker, by contrast,
+    /// only reaches a v-blocking subset for an already-externalized slot the
+    /// node free-rode (#1862/#3199/#3205), so it gets stuck `false` after a
+    /// restart while `qset.agree` is healthy — the #3250 triad.
+    ///
+    /// `SlotQuorumTracker` is intentionally left untouched (it remains the
+    /// source for `is_v_blocking` / recovery accounting per #1874).
+    pub fn scp_heard_from_quorum(&self, slot: SlotIndex) -> bool {
+        self.scp
+            .get_slot_state(slot)
+            .map(|s| s.heard_from_quorum)
+            .unwrap_or(false)
+    }
+
     /// Check whether we have a v-blocking set for a slot.
     pub fn is_v_blocking(&self, slot: SlotIndex) -> bool {
         self.slot_quorum_tracker.read().is_v_blocking(slot)
@@ -7232,6 +7258,170 @@ mod tests {
         assert!(
             has_externalize,
             "SCP should emit its own EXTERNALIZE message"
+        );
+    }
+
+    /// Regression test for #3250: a node that *follows* a quorum of EXTERNALIZE
+    /// for slot N (without nominating, as after a restart) reports
+    /// `scp_heard_from_quorum(N) == true` (the parity-faithful SCP ballot flag,
+    /// which includes the local node), while the henyey-only `SlotQuorumTracker`
+    /// path `heard_from_quorum(N)` reproduces the issue's stuck-`false` triad.
+    ///
+    /// Fails on main: there is no `scp_heard_from_quorum` accessor, and the
+    /// tracker-based `heard_from_quorum` returns false for the followed
+    /// externalized slot (only a v-blocking remote subset accumulates; the
+    /// local node is never recorded). Passes after the fix.
+    #[test]
+    fn test_scp_heard_from_quorum_true_for_followed_externalized_slot() {
+        // 2-of-2 quorum (local + one remote). The node receives a single remote
+        // EXTERNALIZE for `slot` and *follows* it — the local node emits its own
+        // EXTERNALIZE on the same value, the slot externalizes, and the SCP
+        // per-slot ballot flag (which counts the local node, parity with core
+        // LocalNode::isQuorum) is set. The henyey-only tracker only ever records
+        // the single remote (the local node is skipped at herder.rs:1965), so it
+        // sees just 1 of the 2-of-2 quorum → the stuck-false side of the #3250
+        // triad (is_v_blocking=true, scp heard=true, tracker heard=false).
+        let local_secret = SecretKey::from_seed(&[7u8; 32]);
+        let local_public = local_secret.public_key();
+        let local_node_id = node_id_from_public_key(&local_public);
+
+        let remote_secret = SecretKey::from_seed(&[1u8; 32]);
+        let remote_public = remote_secret.public_key();
+        let remote_node_id = node_id_from_public_key(&remote_public);
+
+        let quorum_set = ScpQuorumSet {
+            threshold: 2,
+            validators: vec![local_node_id.clone(), remote_node_id.clone()]
+                .try_into()
+                .unwrap(),
+            inner_sets: vec![].try_into().unwrap(),
+        };
+
+        let config = HerderConfig {
+            is_validator: true,
+            node_public_key: local_public,
+            local_quorum_set: Some(quorum_set.clone()),
+            ..HerderConfig::default()
+        };
+
+        let herder = Herder::with_secret_key(
+            config,
+            SecretKey::from_seed(&[7u8; 32]),
+            make_default_lm(),
+            TimerManagerHandle::no_op(),
+        );
+        herder.start_syncing();
+        herder.bootstrap(0);
+
+        herder
+            .quorum_tracker
+            .write()
+            .expand(&remote_node_id, quorum_set.clone())
+            .unwrap();
+
+        let slot = herder.tracking_slot().get();
+
+        // Follow a remote EXTERNALIZE for `slot` (the node does not nominate —
+        // this mirrors the post-restart free-ride path).
+        let env = make_signed_externalize_from(slot, &herder, &remote_secret);
+        assert_eq!(herder.receive_scp_envelope(env), EnvelopeState::Valid);
+
+        // The slot externalized via SCP, so the per-slot ballot flag is set.
+        assert!(
+            herder.scp().is_slot_externalized(slot),
+            "slot should externalize after following a quorum EXTERNALIZE"
+        );
+
+        // The parity-faithful SCP flag is TRUE for the followed slot.
+        assert!(
+            herder.scp_heard_from_quorum(slot),
+            "scp_heard_from_quorum must be true for a followed externalized slot (#3250)"
+        );
+
+        // The old tracker path yields the stuck-false side of the triad: it never
+        // recorded the local node, so the single remote envelope does not satisfy
+        // the 2-of-2 quorum from the tracker's perspective.
+        assert!(
+            !herder.heard_from_quorum(slot),
+            "tracker-based heard_from_quorum reproduces the stuck-false #3250 triad"
+        );
+    }
+
+    /// Regression test for #3250: the SCP `heard_from_quorum` flag does not
+    /// require the local node to appear in `SlotQuorumTracker.slot_nodes` (it
+    /// never can — `process_verified` skips self-messages before
+    /// `record_envelope` at herder.rs:1965). A 2-of-2 (local + one remote)
+    /// quorum that externalizes via a single remote EXTERNALIZE is TRUE under
+    /// the SCP flag (the local node is counted by the ballot protocol) but
+    /// FALSE under the tracker (local node absent → only 1 of 2 recorded).
+    #[test]
+    fn test_scp_heard_from_quorum_independent_of_local_node_record() {
+        let local_secret = SecretKey::from_seed(&[7u8; 32]);
+        let local_public = local_secret.public_key();
+        let local_node_id = node_id_from_public_key(&local_public);
+
+        let remote_secret = SecretKey::from_seed(&[1u8; 32]);
+        let remote_public = remote_secret.public_key();
+        let remote_node_id = node_id_from_public_key(&remote_public);
+
+        let quorum_set = ScpQuorumSet {
+            threshold: 2,
+            validators: vec![local_node_id.clone(), remote_node_id.clone()]
+                .try_into()
+                .unwrap(),
+            inner_sets: vec![].try_into().unwrap(),
+        };
+
+        let config = HerderConfig {
+            is_validator: true,
+            node_public_key: local_public,
+            local_quorum_set: Some(quorum_set.clone()),
+            ..HerderConfig::default()
+        };
+
+        let herder = Herder::with_secret_key(
+            config,
+            SecretKey::from_seed(&[7u8; 32]),
+            make_default_lm(),
+            TimerManagerHandle::no_op(),
+        );
+        herder.start_syncing();
+        herder.bootstrap(0);
+
+        herder
+            .quorum_tracker
+            .write()
+            .expand(&remote_node_id, quorum_set.clone())
+            .unwrap();
+
+        let slot = herder.tracking_slot().get();
+
+        // Follow the single remote EXTERNALIZE. With a 2-of-2 qset that includes
+        // the local node, the ballot protocol counts the local node and the
+        // remote → quorum; the tracker only ever has the remote.
+        let env = make_signed_externalize_from(slot, &herder, &remote_secret);
+        assert_eq!(herder.receive_scp_envelope(env), EnvelopeState::Valid);
+
+        assert!(
+            herder.scp_heard_from_quorum(slot),
+            "scp_heard_from_quorum counts the local node (parity with core LocalNode::isQuorum)"
+        );
+
+        // The local node is never in the tracker's slot_nodes (self-message skip),
+        // so the tracker cannot reach a 2-of-2 quorum from the single remote.
+        assert!(
+            !herder.heard_from_quorum(slot),
+            "tracker excludes the local node (herder.rs:1965) → 2-of-2 qset stuck false"
+        );
+    }
+
+    /// `scp_heard_from_quorum` returns false for a slot with no SCP state.
+    #[test]
+    fn test_scp_heard_from_quorum_missing_slot_is_false() {
+        let herder = make_test_herder();
+        assert!(
+            !herder.scp_heard_from_quorum(999_999),
+            "scp_heard_from_quorum must be false for an unknown slot"
         );
     }
 
