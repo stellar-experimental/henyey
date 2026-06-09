@@ -95,6 +95,21 @@ pub struct AllocatorStats {
     pub mapped: u64,
     /// Bytes retained (returned to OS but still mapped).
     pub retained: u64,
+
+    /// Live small-class bytes across all arenas (`stats.arenas.<all>.small.allocated`).
+    pub small_allocated: u64,
+    /// Live large-class bytes across all arenas (`stats.arenas.<all>.large.allocated`).
+    /// jemalloc 5.x folds the former "huge" class into "large".
+    pub large_allocated: u64,
+
+    /// Effective `opt.retain` (false ⇒ freed extents are munmapped, not retained).
+    pub opt_retain: bool,
+    /// Effective `opt.dirty_decay_ms` (ms before dirty pages are purged; -1 = never).
+    pub opt_dirty_decay_ms: i64,
+    /// Effective `opt.muzzy_decay_ms` (ms before muzzy pages are decommitted; -1 = never).
+    pub opt_muzzy_decay_ms: i64,
+    /// Effective `opt.background_thread` (async purge thread enabled).
+    pub opt_background_thread: bool,
 }
 
 impl AllocatorStats {
@@ -112,12 +127,59 @@ impl AllocatorStats {
         }
     }
 
+    /// Allocator-side 3-way attribution of `allocated` into small / large / huge.
+    ///
+    /// `small` and `large` come directly from the merged-arena `stats.arenas`
+    /// MIBs; `huge` is the residual `allocated − small − large`, so the three
+    /// components sum *exactly* to `allocated`. The split is an allocator-level
+    /// view of which size class a steady live-bytes climb concentrates in — it
+    /// is **not** a per-subsystem ownership breakdown. A monotonic climb in one
+    /// class points at the leaking structure's allocation size, which an
+    /// operator soak + a targeted follow-up maps to the exact subsystem (#3237).
+    ///
+    /// When the per-arena MIBs are unavailable (`small`/`large` both zero, e.g.
+    /// jemalloc built without `--enable-stats`), `huge` collapses to the whole
+    /// of `allocated` — i.e. a single `arena_total`-style fallback — so the
+    /// invariant (sum == allocated) still holds and nothing panics.
+    pub fn arena_split(&self) -> (u64, u64, u64) {
+        let small = self.small_allocated;
+        let large = self.large_allocated;
+        // Residual; saturating so synthetic/over-counted inputs can't underflow.
+        let huge = self.allocated.saturating_sub(small).saturating_sub(large);
+        (small, large, huge)
+    }
+
     #[cfg(feature = "jemalloc")]
     fn read_jemalloc() -> Self {
-        use tikv_jemalloc_ctl::{epoch, stats};
+        use tikv_jemalloc_ctl::{epoch, opt, raw, stats};
 
         // Advance the epoch to get fresh stats
         let _ = epoch::advance();
+
+        // Merged-arena ("all arenas") small/large live-bytes. jemalloc's
+        // `MALLCTL_ARENAS_ALL` sentinel is 4096; reading
+        // `stats.arenas.4096.{small,large}.allocated` aggregates every arena.
+        // Best-effort: any failure (e.g. stats disabled) leaves the field 0,
+        // and `arena_split()` then attributes everything to the `huge`
+        // residual (the `arena_total` fallback).
+        let small_allocated = unsafe {
+            raw::read::<libc_size_t>(b"stats.arenas.4096.small.allocated\0")
+        }
+        .unwrap_or(0) as u64;
+        let large_allocated = unsafe {
+            raw::read::<libc_size_t>(b"stats.arenas.4096.large.allocated\0")
+        }
+        .unwrap_or(0) as u64;
+
+        // Effective allocator config — proves the malloc_conf string was
+        // actually parsed (see #3237). `opt.*` is read via the prefixed
+        // mallctl, so these reflect what jemalloc is really running.
+        let opt_retain = unsafe { raw::read::<bool>(b"opt.retain\0") }.unwrap_or(false);
+        let opt_dirty_decay_ms =
+            unsafe { raw::read::<isize>(b"opt.dirty_decay_ms\0") }.unwrap_or(0) as i64;
+        let opt_muzzy_decay_ms =
+            unsafe { raw::read::<isize>(b"opt.muzzy_decay_ms\0") }.unwrap_or(0) as i64;
+        let opt_background_thread = opt::background_thread::read().unwrap_or(false);
 
         Self {
             allocated: stats::allocated::read().unwrap_or(0) as u64,
@@ -125,9 +187,22 @@ impl AllocatorStats {
             resident: stats::resident::read().unwrap_or(0) as u64,
             mapped: stats::mapped::read().unwrap_or(0) as u64,
             retained: stats::retained::read().unwrap_or(0) as u64,
+            small_allocated,
+            large_allocated,
+            opt_retain,
+            opt_dirty_decay_ms,
+            opt_muzzy_decay_ms,
+            opt_background_thread,
         }
     }
 }
+
+/// `libc::size_t` without a `libc` dependency: `usize` is byte-identical to
+/// jemalloc's `size_t` on every platform we build for, and `raw::read::<T>` is
+/// a sized memcpy of `size_of::<T>()` bytes.
+#[cfg(feature = "jemalloc")]
+#[allow(non_camel_case_types)]
+type libc_size_t = usize;
 
 /// Complete memory snapshot for a single point in time.
 #[derive(Debug, Clone)]
@@ -198,6 +273,8 @@ impl MemoryReport {
     pub fn log(&self) {
         let to_mb = |b: u64| b as f64 / (1024.0 * 1024.0);
 
+        let (small, large, huge) = self.allocator.arena_split();
+
         info!(
             memory_report = true,
             ledger_seq = self.ledger_seq,
@@ -206,11 +283,24 @@ impl MemoryReport {
             file_rss_mb = format!("{:.0}", to_mb(self.process.file_rss_bytes)),
             jemalloc_allocated_mb = format!("{:.0}", to_mb(self.allocator.allocated)),
             jemalloc_resident_mb = format!("{:.0}", to_mb(self.allocator.resident)),
+            jemalloc_retained_mb = format!("{:.0}", to_mb(self.allocator.retained)),
             fragmentation_pct = format!("{:.1}", self.fragmentation_pct()),
             heap_components_mb = format!("{:.0}", to_mb(self.component_total())),
             mmap_mb = format!("{:.0}", to_mb(self.non_heap_total())),
             unaccounted_mb = format!("{:.0}", to_mb(self.unaccounted().unsigned_abs())),
             unaccounted_sign = if self.unaccounted() >= 0 { "+" } else { "-" },
+            // Allocator-side size-class split of jemalloc `allocated` — see
+            // `AllocatorStats::arena_split`. Localizes which class an
+            // unaccounted live-bytes climb concentrates in (#3237).
+            arena_small_mb = format!("{:.0}", to_mb(small)),
+            arena_large_mb = format!("{:.0}", to_mb(large)),
+            arena_huge_mb = format!("{:.0}", to_mb(huge)),
+            // Effective allocator config — observable proof malloc_conf was
+            // parsed (retain=false, 1000ms decay, background_thread=true).
+            opt_retain = self.allocator.opt_retain,
+            opt_dirty_decay_ms = self.allocator.opt_dirty_decay_ms,
+            opt_muzzy_decay_ms = self.allocator.opt_muzzy_decay_ms,
+            opt_background_thread = self.allocator.opt_background_thread,
             "Memory report summary"
         );
 
@@ -221,6 +311,25 @@ impl MemoryReport {
                 mb = format!("{:.1}", c.heap_mb()),
                 entry_count = c.entry_count,
                 kind = if c.is_heap { "heap" } else { "mmap" },
+                "Memory report component"
+            );
+        }
+
+        // Emit the allocator-side size-class split as synthetic components so
+        // it shows up alongside the per-subsystem heap components. These are an
+        // allocator-level view (NOT per-subsystem ownership) — labelled `arena`
+        // and `synthetic_class` so they are never mistaken for owned structures.
+        for (name, bytes) in [
+            ("arena_small", small),
+            ("arena_large", large),
+            ("arena_huge", huge),
+        ] {
+            info!(
+                ledger_seq = self.ledger_seq,
+                component = name,
+                mb = format!("{:.1}", bytes as f64 / (1024.0 * 1024.0)),
+                entry_count = 0u64,
+                kind = "synthetic_class",
                 "Memory report component"
             );
         }
@@ -249,6 +358,12 @@ pub fn log_startup_memory(phase: &str) {
         } else {
             "n/a".to_string()
         },
+        // Surface effective allocator config at startup so a no-op malloc_conf
+        // is visible from the first checkpoint (#3237).
+        opt_retain = alloc.opt_retain,
+        opt_dirty_decay_ms = alloc.opt_dirty_decay_ms,
+        opt_muzzy_decay_ms = alloc.opt_muzzy_decay_ms,
+        opt_background_thread = alloc.opt_background_thread,
         "Startup memory checkpoint"
     );
 }
@@ -279,6 +394,76 @@ mod tests {
     }
 
     #[test]
+    fn test_arena_split_sums_to_allocated() {
+        // small + large + huge must always equal `allocated`.
+        let stats = AllocatorStats {
+            allocated: 1000,
+            small_allocated: 600,
+            large_allocated: 250,
+            ..Default::default()
+        };
+        let (small, large, huge) = stats.arena_split();
+        assert_eq!(small, 600);
+        assert_eq!(large, 250);
+        assert_eq!(huge, 150, "huge is the residual allocated - small - large");
+        assert_eq!(small + large + huge, stats.allocated);
+    }
+
+    #[test]
+    fn test_arena_split_fallback_when_mibs_unavailable() {
+        // When the per-arena MIBs are unavailable, small/large are zero and the
+        // whole of `allocated` collapses into the `huge` (arena_total) bucket.
+        let stats = AllocatorStats {
+            allocated: 4096,
+            small_allocated: 0,
+            large_allocated: 0,
+            ..Default::default()
+        };
+        let (small, large, huge) = stats.arena_split();
+        assert_eq!((small, large), (0, 0));
+        assert_eq!(huge, 4096);
+        assert_eq!(small + large + huge, stats.allocated);
+    }
+
+    #[test]
+    fn test_arena_split_saturates_on_overcount() {
+        // If small + large somehow exceed `allocated` (e.g. synthetic inputs or
+        // a transient epoch skew), `huge` saturates to 0 — never underflows.
+        let stats = AllocatorStats {
+            allocated: 500,
+            small_allocated: 400,
+            large_allocated: 300,
+            ..Default::default()
+        };
+        let (small, large, huge) = stats.arena_split();
+        assert_eq!(huge, 0, "residual saturates rather than underflowing");
+        assert_eq!((small, large), (400, 300));
+    }
+
+    #[test]
+    fn test_opt_fields_plumb_into_report() {
+        // The opt.* config fields round-trip through AllocatorStats and are
+        // readable from the report's allocator snapshot.
+        let report = MemoryReport {
+            ledger_seq: 7,
+            process: ProcessMemory::default(),
+            allocator: AllocatorStats {
+                allocated: 2048,
+                opt_retain: false,
+                opt_dirty_decay_ms: 1000,
+                opt_muzzy_decay_ms: 1000,
+                opt_background_thread: true,
+                ..Default::default()
+            },
+            components: vec![],
+        };
+        assert!(!report.allocator.opt_retain);
+        assert_eq!(report.allocator.opt_dirty_decay_ms, 1000);
+        assert_eq!(report.allocator.opt_muzzy_decay_ms, 1000);
+        assert!(report.allocator.opt_background_thread);
+    }
+
+    #[test]
     fn test_memory_report_arithmetic() {
         let report = MemoryReport {
             ledger_seq: 100,
@@ -289,6 +474,7 @@ mod tests {
                 resident: 1200,
                 mapped: 1500,
                 retained: 300,
+                ..Default::default()
             },
             components: vec![
                 ComponentMemory::new("a", 400, 10),
