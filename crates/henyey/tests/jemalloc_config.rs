@@ -41,8 +41,7 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 #[cfg(feature = "jemalloc")]
 #[allow(non_upper_case_globals)]
 #[export_name = "_rjem_malloc_conf"]
-pub static malloc_conf: &[u8] =
-    b"background_thread:true,dirty_decay_ms:1000,muzzy_decay_ms:1000,retain:false\0";
+pub static malloc_conf: &[u8] = b"background_thread:true,dirty_decay_ms:1000,muzzy_decay_ms:1000\0";
 
 /// Reads jemalloc's effective options via `mallctl` and asserts they match the
 /// values in henyey's `malloc_conf`. This is the real proof the config is
@@ -59,13 +58,19 @@ fn test_jemalloc_config_is_applied_at_runtime() {
     // definitely initialized before we query its options.
     let _warm = vec![0u8; 4096];
 
-    // `opt.retain`: default `true`; henyey sets `retain:false`.
+    // `opt.retain`: jemalloc's 64-bit-Linux default is `true`. henyey
+    // intentionally leaves it at that default: `retain:false` was dropped in
+    // #3247 because it munmaps freed extents and exhausts `vm.max_map_count`
+    // during high-churn warm-restart bucket-list restore, crashing the
+    // validator. Under `retain:true` the decay knobs still return dirty pages
+    // via `madvise` (no VMA splits). This asserts `retain:false` is NOT live.
     let retain: bool = unsafe { raw::read(b"opt.retain\0") }.expect("read opt.retain via mallctl");
     assert!(
-        !retain,
-        "jemalloc opt.retain must be false (henyey sets retain:false). \
-         Got retain={retain}. If true, jemalloc is running DEFAULTS — the \
-         malloc_conf export is NOT being read (wrong symbol name?)."
+        retain,
+        "jemalloc opt.retain must be true (the default; henyey must NOT set \
+         retain:false — it caused munmap/VMA exhaustion, #3247). \
+         Got retain={retain}. If false, the harmful retain:false knob has been \
+         reintroduced into malloc_conf."
     );
 
     // `opt.dirty_decay_ms`: default 10000; henyey sets 1000.

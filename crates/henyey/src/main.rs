@@ -113,8 +113,11 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 #[cfg(feature = "jemalloc")]
 #[allow(non_upper_case_globals)]
 #[export_name = "_rjem_malloc_conf"]
-pub static malloc_conf: &[u8] =
-    b"background_thread:true,dirty_decay_ms:1000,muzzy_decay_ms:1000,retain:false\0";
+// NOTE: retain:false was REMOVED (#3247) — once live (via the #3238 symbol fix) it
+// made jemalloc munmap freed extents, exhausting vm.max_map_count during
+// warm-restart bucket-restore churn and crashing the validator. Decay knobs are
+// kept: under the default retain:true they return dirty pages via madvise (no VMA splits).
+pub static malloc_conf: &[u8] = b"background_thread:true,dirty_decay_ms:1000,muzzy_decay_ms:1000\0";
 
 use std::path::{Path, PathBuf};
 
@@ -3654,7 +3657,7 @@ mod tests {
     /// not exist without the feature. See #3235 / #3232.
     #[cfg(feature = "jemalloc")]
     #[test]
-    fn test_malloc_conf_carries_decay_and_retain_knobs() {
+    fn test_malloc_conf_carries_decay_knobs_and_omits_retain_false() {
         let conf = super::malloc_conf;
 
         // Must be NUL-terminated: jemalloc parses it as a C string.
@@ -3666,11 +3669,16 @@ mod tests {
 
         let conf_str = std::str::from_utf8(conf).expect("malloc_conf must be valid UTF-8");
 
+        // retain:false must NOT be present - it caused jemalloc munmap VMA exhaustion (#3247).
+        assert!(
+            !conf_str.contains("retain:false"),
+            "malloc_conf must NOT contain retain:false (it caused the VMA-exhaustion crash, #3247)"
+        );
+
         for knob in [
             "background_thread:true",
             "dirty_decay_ms:1000",
             "muzzy_decay_ms:1000",
-            "retain:false",
         ] {
             assert!(
                 conf_str.contains(knob),
