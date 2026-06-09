@@ -379,6 +379,117 @@ mod tests {
         assert!(peak >= mb(42), "thread should have sampled the source");
     }
 
+    /// Drive `sample_once` across the cold-catchup restore sub-phase
+    /// transitions and assert the peak is attributed to the sub-phase current
+    /// when the running max was raised. Deterministic (no thread, no `/proc`).
+    #[test]
+    fn test_subphase_peak_attribution() {
+        let mut s = idle_sampler();
+        // live-restore @ 500MB, then merge-restart @ 700MB (the peak), then
+        // cache-scan @ 300MB (below peak).
+        s.set_phase(Phase::LiveBucketRestore);
+        s.sample_once(&scripted_source(vec![mb(500)]));
+        s.set_phase(Phase::MergeRestart);
+        s.sample_once(&scripted_source(vec![mb(700)]));
+        s.set_phase(Phase::CacheScan);
+        s.sample_once(&scripted_source(vec![mb(300)]));
+        assert_eq!(s.peak_bytes(), mb(700));
+        assert_eq!(
+            s.peak_phase(),
+            Phase::MergeRestart,
+            "peak must be attributed to the sub-phase current when the max was raised"
+        );
+        let _ = s.stop();
+    }
+
+    /// Every `log_startup_memory` checkpoint string must map to the intended
+    /// `Phase` (guards against typos / missed strings).
+    #[test]
+    fn test_checkpoint_string_maps_to_phase() {
+        let cases: &[(&str, Phase)] = &[
+            ("before_restore_bucket_list", Phase::LiveBucketRestore),
+            ("after_restore_bucket_list", Phase::MergeRestart),
+            ("before_cache_scan", Phase::CacheScan),
+            ("after_cache_scan", Phase::CacheScan),
+            ("hot_archive_restore", Phase::HotArchiveRestore),
+            ("after_cache_scan_and_merges", Phase::MergeRestart),
+            ("after_verify_install_buckets", Phase::CacheInstall),
+            ("after_bucket_cache_init", Phase::CacheInstall),
+            ("after_cache_install", Phase::CacheInstall),
+            ("after_post_catchup_cache_warm", Phase::PostCatchupWarm),
+        ];
+        for (s, expected) in cases {
+            assert_eq!(
+                phase_for_checkpoint(s),
+                Some(*expected),
+                "checkpoint string {s:?} must map to {expected:?}"
+            );
+        }
+        // Unknown strings map to None (no-op, leaves current_phase unchanged).
+        assert_eq!(phase_for_checkpoint("not_a_checkpoint"), None);
+    }
+
+    /// Every `Phase` variant must roundtrip through `from_u8(as u8)` and have a
+    /// unique, stable `as_str()`.
+    #[test]
+    fn test_phase_enum_roundtrip() {
+        let all = [
+            Phase::Startup,
+            Phase::BucketApply,
+            Phase::CacheScan,
+            Phase::Catchup,
+            Phase::LiveBucketRestore,
+            Phase::MergeRestart,
+            Phase::HotArchiveRestore,
+            Phase::CacheInstall,
+            Phase::PostCatchupWarm,
+        ];
+        let mut seen = std::collections::HashSet::new();
+        for p in all {
+            assert_eq!(
+                Phase::from_u8(p as u8),
+                p,
+                "{p:?} must roundtrip via from_u8"
+            );
+            assert!(
+                seen.insert(p.as_str()),
+                "as_str() for {p:?} ({}) collides with another variant",
+                p.as_str()
+            );
+        }
+    }
+
+    /// `note_checkpoint` with no registered sampler must be a no-op and never
+    /// panic.
+    #[test]
+    fn test_note_checkpoint_noop_without_registered_sampler() {
+        clear_global_sampler();
+        // Must not panic; nothing to observe (no registered sampler).
+        note_checkpoint("before_restore_bucket_list");
+        note_checkpoint("not_a_checkpoint");
+    }
+
+    /// Registering a sampler routes `note_checkpoint` into its `current_phase`;
+    /// clearing the registration restores the no-op behavior.
+    #[test]
+    fn test_note_checkpoint_sets_registered_sampler_phase() {
+        let _guard = GLOBAL_SAMPLER_TEST_LOCK.lock().unwrap();
+        let s = idle_sampler();
+        assert_eq!(s.current_phase(), Phase::Startup);
+        register_global_sampler(&s);
+        note_checkpoint("before_restore_bucket_list");
+        assert_eq!(s.current_phase(), Phase::LiveBucketRestore);
+        note_checkpoint("after_post_catchup_cache_warm");
+        assert_eq!(s.current_phase(), Phase::PostCatchupWarm);
+        // Unknown string leaves the phase unchanged.
+        note_checkpoint("not_a_checkpoint");
+        assert_eq!(s.current_phase(), Phase::PostCatchupWarm);
+        // After clearing, note_checkpoint is a no-op again.
+        clear_global_sampler();
+        note_checkpoint("before_restore_bucket_list");
+        assert_eq!(s.current_phase(), Phase::PostCatchupWarm);
+    }
+
     /// Verify `stop()` emits the greppable `startup_peak_anon_rss_mb=` /
     /// `phase=` summary line, in both structured and Text-rendered form
     /// (mirrors the `memory_report` field tests).
