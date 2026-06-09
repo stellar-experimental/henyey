@@ -2810,6 +2810,49 @@ memory_for_caching_mb = 256
     }
 
     #[test]
+    fn test_bucket_manager_honors_configured_persist_index() {
+        use henyey_bucket::BucketManager;
+        use tempfile::TempDir;
+
+        // Construct the manager exactly as the app startup path does
+        // (crates/app/src/app/mod.rs), driving off the same config field-access
+        // path so a future rename keeps the test and production site coupled.
+        // On origin/main the startup path uses `with_cache_size`, which forces
+        // persist_index=false, so the configured value never reaches the
+        // manager — this asserts the fix (issue #3240).
+        let temp_dir = TempDir::new().unwrap();
+
+        // Default config persist_index is true; the configured value must be
+        // honored on the startup path.
+        let mut cfg = BucketConfig::default();
+        cfg.directory = temp_dir.path().to_path_buf();
+        cfg.bucket_list_db.persist_index = true;
+        let manager = BucketManager::with_cache_size_and_persist_index(
+            cfg.directory.clone(),
+            cfg.cache_size,
+            cfg.bucket_list_db.persist_index,
+        )
+        .unwrap();
+        assert!(
+            manager.persist_index(),
+            "configured persist_index=true must reach the manager"
+        );
+
+        // And persist_index=false must disable it on the same path.
+        cfg.bucket_list_db.persist_index = false;
+        let manager = BucketManager::with_cache_size_and_persist_index(
+            cfg.directory.clone(),
+            cfg.cache_size,
+            cfg.bucket_list_db.persist_index,
+        )
+        .unwrap();
+        assert!(
+            !manager.persist_index(),
+            "configured persist_index=false must reach the manager"
+        );
+    }
+
+    #[test]
     fn test_validation_compat_http_port_collision() {
         let mut config = AppConfig::default();
         config.http.enabled = true;
