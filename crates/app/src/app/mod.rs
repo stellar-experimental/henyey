@@ -1246,9 +1246,10 @@ impl App {
         let bucket_dir = config.buckets.directory.clone();
         std::fs::create_dir_all(&bucket_dir)?;
 
-        let bucket_manager = Arc::new(BucketManager::with_cache_size(
+        let bucket_manager = Arc::new(BucketManager::with_cache_size_and_persist_index(
             bucket_dir.clone(),
             config.buckets.cache_size,
+            config.buckets.bucket_list_db.persist_index,
         )?);
         tracing::info!("Bucket manager initialized");
 

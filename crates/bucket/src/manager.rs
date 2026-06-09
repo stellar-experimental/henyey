@@ -238,6 +238,24 @@ impl BucketManager {
         Self::build(bucket_dir, Self::DEFAULT_MAX_CACHE_SIZE, persist_index)
     }
 
+    /// Create a new BucketManager with both a custom cache size and index
+    /// persistence setting.
+    ///
+    /// This is the constructor used by the main application startup path so the
+    /// operator-configured `persist_index` lever
+    /// (`config.buckets.bucket_list_db.persist_index`, default `true`) is
+    /// honored instead of being silently forced to `false`. When `persist_index`
+    /// is true, eligible disk indexes are saved alongside bucket files and
+    /// loaded on startup, avoiding expensive index rebuilds. Mirrors
+    /// stellar-core's `Config::BUCKETLIST_DB_PERSIST_INDEX` gating.
+    pub fn with_cache_size_and_persist_index(
+        bucket_dir: PathBuf,
+        max_cache_size: usize,
+        persist_index: bool,
+    ) -> Result<Self> {
+        Self::build(bucket_dir, max_cache_size, persist_index)
+    }
+
     /// Returns whether index persistence is enabled.
     pub fn persist_index(&self) -> bool {
         self.persist_index
@@ -1894,6 +1912,30 @@ mod tests {
         manager.save_index_for_bucket(&hash, &index).unwrap();
         let loaded = manager.try_load_index_for_bucket(&hash, 10).unwrap();
         assert!(loaded.is_none());
+    }
+
+    #[test]
+    fn test_bucket_manager_with_cache_size_and_persist_index() {
+        // The new constructor must thread the configured `persist_index`
+        // value through to the manager (rather than hardcoding false like
+        // `with_cache_size`). Covers issue #3240.
+        let temp_dir = TempDir::new().unwrap();
+
+        let manager_on = BucketManager::with_cache_size_and_persist_index(
+            temp_dir.path().to_path_buf(),
+            5,
+            true,
+        )
+        .unwrap();
+        assert!(manager_on.persist_index());
+
+        let manager_off = BucketManager::with_cache_size_and_persist_index(
+            temp_dir.path().to_path_buf(),
+            5,
+            false,
+        )
+        .unwrap();
+        assert!(!manager_off.persist_index());
     }
 
     /// Regression test: Verify that cleanup_unreferenced_files only deletes
