@@ -99,6 +99,7 @@ mod disk_bucket;
 mod entry;
 mod error;
 mod eviction;
+mod fan_out_limiter;
 mod future_bucket;
 mod hot_archive;
 mod index;
@@ -130,6 +131,7 @@ pub use bucket::Bucket;
 pub use bucket_list::{
     BucketLevel, BucketList, BucketListStats, PendingMergeState, BUCKET_LIST_LEVELS,
 };
+pub use fan_out_limiter::{FanOutLimiter, FanOutPermit};
 
 // ============================================================================
 // Disk-backed storage
