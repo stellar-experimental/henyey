@@ -826,32 +826,49 @@ pub struct BucketConfig {
     /// Number of parallel threads used to scan the bucket list on startup
     /// (for populating the offer store, Soroban state, and TTL caches).
     ///
-    /// Default is 2. Set to 1 on memory-constrained machines where two
-    /// concurrent scans would exceed available RAM.
+    /// This scan dominates the startup peak anon RSS: each concurrent
+    /// level-scan worker holds a raw per-level result buffer, so the peak
+    /// scales near-linearly with the thread count (measured on mainnet,
+    /// 2026-06: ~9.5 GB base + ~6.3 GB per thread — 4 threads ≈ 28 GB,
+    /// 2 ≈ 21.6 GB, 1 ≈ 15.7 GB; see #3267/#3227).
+    ///
+    /// Default is 2: the scan's wall-clock is bounded by the largest level,
+    /// which a single thread handles while a second absorbs all smaller
+    /// levels, so 2 threads measured no slower than 4. Set to 1 on
+    /// memory-constrained machines (e.g. 32 GB hosts): it switches to a
+    /// streaming scan-and-merge with no intermediate buffers, trading
+    /// ~+35–40 s of startup for the lowest peak.
     #[serde(default = "default_scan_thread_count")]
     pub scan_thread_count: usize,
 
     /// Maximum number of bucket-materialization workers that may run
     /// concurrently during parallel restore (`restore_from_has_parallel`).
     ///
-    /// Caps the cold-catchup live-allocation spike (#3245/#3235): on a fresh
-    /// catchup henyey spawns up to ~22 concurrent `load_bucket` workers, each
-    /// with a large transient working set (streaming index build, XDR parse
-    /// buffers, small buckets loaded fully into RAM). The peak ≈ the sum of all
-    /// concurrent workers' transient sets. Capping concurrency to `k` bounds
-    /// the spike (≈ `base + k × per-worker-live`) at the cost of restore
-    /// wall-clock.
+    /// Caps the live-allocation spike of the **warm-restart** restore path
+    /// (#3245/#3235): when restoring persisted state from local db + buckets
+    /// at startup, henyey spawns up to ~22 concurrent `load_bucket` workers,
+    /// each with a large transient working set (streaming index build, XDR
+    /// parse buffers, small buckets loaded fully into RAM). Capping
+    /// concurrency to `k` bounds that spike via a counting semaphore.
+    ///
+    /// NOTE: this knob is wired only into the warm-restart path
+    /// (`restore_from_has_parallel`, called from ledger_close). The archive
+    /// cold-catchup path (`history::catchup::buckets`) uses the un-capped
+    /// `restore_from_has` and is unaffected by this setting.
+    ///
+    /// NOTE: as of 2026-06 (#3267/#3227), this knob is NOT the startup-peak
+    /// lever: measured peak anon RSS was flat (~28 GB) across k ∈ {0,4,6,8}
+    /// on both startup paths, because the peak sits in the bucket-list cache
+    /// scan, not the restore fan-out. To reduce the startup peak, lower
+    /// `scan_thread_count` instead.
     ///
     /// `0` (the default) means **unbounded** — the historical behavior, a true
     /// no-op with zero regression. A non-zero `k` caps concurrent
     /// materialization to `k` via a counting semaphore acquired around the
     /// load. Bounding concurrency does NOT change the restored state: the
     /// `bucketListHash` is byte-identical for every value of `k` (assembly is
-    /// indexed by level, independent of scheduling order).
-    ///
-    /// On a 32 GB host, `restore_apply_fan_out = 6` caps the peak at ~19 GB
-    /// (≤20 GB margin) for ~+30s of catchup time. Aligns with stellar-core,
-    /// which bounds apply/index concurrency via the configurable
+    /// indexed by level, independent of scheduling order). Aligns with
+    /// stellar-core, which bounds apply/index concurrency via the configurable
     /// `WORKER_THREADS`; henyey's unbounded fan-out was the outlier.
     #[serde(default = "default_restore_apply_fan_out")]
     pub restore_apply_fan_out: usize,
@@ -869,8 +886,11 @@ pub struct BucketConfig {
     pub disable_bucket_gc: bool,
 }
 
+/// Default scan parallelism: 2 measured the same wall-clock as 4 (the
+/// largest level is the critical path either way) at ~6.7 GB lower peak
+/// RSS (#3267).
 fn default_scan_thread_count() -> usize {
-    4
+    2
 }
 
 /// Default fan-out cap for parallel restore: `0` = unbounded (current
@@ -2668,6 +2688,42 @@ disable_bucket_gc = true
             config.buckets.disable_bucket_gc,
             "disable_bucket_gc = true must parse to true"
         );
+    }
+
+    #[test]
+    fn test_scan_thread_count_defaults_to_two() {
+        // #3267: 2 scan threads measured the same wall-clock as 4 (the
+        // largest level bounds the scan either way) at ~6.7 GB lower peak
+        // anon RSS, so 2 is the default. Operators may still raise it
+        // explicitly, or set 1 for the lowest-memory streaming path.
+        assert_eq!(
+            BucketConfig::default().scan_thread_count,
+            2,
+            "scan_thread_count must default to 2"
+        );
+
+        // Absent from TOML => default 2.
+        let toml_str = r#"
+[network]
+passphrase = "Test SDF Network ; September 2015"
+
+[buckets]
+directory = "buckets"
+"#;
+        let config: AppConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.buckets.scan_thread_count, 2);
+
+        // An explicit value round-trips.
+        let toml_str_explicit = r#"
+[network]
+passphrase = "Test SDF Network ; September 2015"
+
+[buckets]
+directory = "buckets"
+scan_thread_count = 4
+"#;
+        let config: AppConfig = toml::from_str(toml_str_explicit).unwrap();
+        assert_eq!(config.buckets.scan_thread_count, 4);
     }
 
     #[test]
