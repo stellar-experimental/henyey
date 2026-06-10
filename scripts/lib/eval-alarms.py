@@ -7,6 +7,14 @@ Usage:
 
 Inputs (env vars):
     PREV_PROM_INVALID   true/false (default: false)
+    PREV_SCRAPE_AGE_SECONDS  wall-clock age of the prev.prom/snapshot baseline,
+                        in seconds (default/absent/-1: unknown ⇒ not stale).
+                        When >= GAP_STALE_THRESHOLD_SECONDS the baseline is
+                        "gap-stale" (see #3246): the monitor LOOP stalled across
+                        a long wall-clock gap while the validator PROCESS
+                        survived, so the same-PID baseline is hours old and the
+                        counter-delta would false-fire as an acute burst.
+    GAP_STALE_THRESHOLD_SECONDS  gap-stale threshold (default: 3600 ≈ 3× tick).
     WARMUP_TICKS_REMAINING  0/1/2 (default: 0)
     FRESH_START         yes/no (default: no)
     CRASH_RECOVERY      yes/no (default: no)
@@ -554,16 +562,31 @@ def eval_gauge_ratio(
         return make_result(alarm, "ok", value=round(ratio, 4), threshold=threshold)
 
 
+def gap_stale_reason(age_hours: float) -> str:
+    """Skip reason for a gap-stale prev.prom baseline (#3246)."""
+    return f"gap-stale (prev age {age_hours}h)"
+
+
 def eval_counter(
     alarm: dict,
     current: dict,
     prev: dict,
     prev_prom_invalid: bool,
     warmup_remaining: int,
+    gap_stale: bool = False,
+    gap_stale_age_hours: float = 0,
 ) -> dict:
     """Evaluate a counter alarm."""
     if prev_prom_invalid:
         return make_result(alarm, "skipped", skip_reason="PREV_PROM_INVALID")
+    # Gap-stale (#3246): prev.prom is same-PID but hours old, so cur-prev spans
+    # the whole loop gap and would false-fire. prev.prom is recomputed from the
+    # file each tick, so a plain SKIP is sufficient — no persisted baseline to
+    # re-seed (contrast the snapshot families, which must re-baseline). Checked
+    # AFTER prev_prom_invalid so a PID change is never double-handled.
+    if gap_stale:
+        return make_result(alarm, "skipped",
+                           skip_reason=gap_stale_reason(gap_stale_age_hours))
 
     metric = alarm.get("metric")
     metric_sum_list = alarm.get("metric_sum")
@@ -608,12 +631,23 @@ def eval_counter_dynamic(
     state_dir: Path,
     prev_prom_invalid: bool,
     warmup_remaining: int,
+    gap_stale: bool = False,
+    gap_stale_age_hours: float = 0,
 ) -> dict:
     """Evaluate a counter-dynamic alarm (threshold = multiplier × prior delta)."""
     ev_default = default_extra_values(alarm, "counter-dynamic")
 
     if prev_prom_invalid:
         return make_result(alarm, "skipped", skip_reason="PREV_PROM_INVALID",
+                           extra_values=ev_default)
+    # Gap-stale (#3246): skip BEFORE the prior-delta snapshot write below — the
+    # gap-spanning delta must not be stored as next tick's prior_delta, which
+    # would poison the dynamic threshold. prev.prom is recomputed each tick, so
+    # SKIP (not re-baseline) suffices. Checked after prev_prom_invalid so a PID
+    # change is never double-handled.
+    if gap_stale:
+        return make_result(alarm, "skipped",
+                           skip_reason=gap_stale_reason(gap_stale_age_hours),
                            extra_values=ev_default)
 
     metric_sum_list = alarm["metric_sum"]
@@ -684,12 +718,21 @@ def eval_histogram_p99(
     current: dict,
     prev: dict,
     prev_prom_invalid: bool,
+    gap_stale: bool = False,
+    gap_stale_age_hours: float = 0,
 ) -> dict:
     """Evaluate a histogram-p99 alarm with mean fallback."""
     ev_default = default_extra_values(alarm, "histogram-p99")
 
     if prev_prom_invalid:
         return make_result(alarm, "skipped", skip_reason="PREV_PROM_INVALID",
+                           extra_values=ev_default)
+    # Gap-stale (#3246): the count/sum/bucket deltas all span the loop gap, so
+    # SKIP. prev.prom is recomputed each tick (no persisted baseline to reseed).
+    # Checked after prev_prom_invalid so a PID change is never double-handled.
+    if gap_stale:
+        return make_result(alarm, "skipped",
+                           skip_reason=gap_stale_reason(gap_stale_age_hours),
                            extra_values=ev_default)
 
     metric = alarm["metric"]
@@ -813,6 +856,7 @@ def eval_counter_ratio(
     fresh_start: bool,
     crash_recovery: bool,
     uptime: int,
+    gap_stale: bool = False,
 ) -> dict:
     """Evaluate a counter-ratio alarm with streak detection.
 
@@ -940,6 +984,23 @@ def eval_counter_ratio(
         write_snapshot(snapshot_path, snapshot)
         return make_result(alarm, "collecting_baseline", extra_values=ev_default)
 
+    # Gap-stale (#3246): the snapshot baseline is SAME-PID (the identity check
+    # above passed) but hours old — the monitor loop stalled across a long
+    # wall-clock gap while the process survived. Unlike the prev.prom families
+    # (which recompute their baseline from the file each tick and can simply
+    # SKIP), this snapshot PERSISTS across ticks, so a plain skip would leave
+    # the stale baseline and fire on the NEXT tick. RE-BASELINE instead: rewrite
+    # the snapshot to current values and reset the streak to "0" — the exact
+    # path used on a counter reset above. Sequenced after the identity check, so
+    # a PID change (#3206) is handled by the snapshot reset there and never
+    # double-handled here.
+    if gap_stale:
+        snapshot[prev_num_key] = str(int(cur_num))
+        snapshot[prev_den_key] = str(int(cur_den))
+        snapshot[streak_key] = "0"
+        write_snapshot(snapshot_path, snapshot)
+        return make_result(alarm, "collecting_baseline", extra_values=ev_default)
+
     num_delta = cur_num - prev_num
     den_delta = cur_den - prev_den
 
@@ -1031,6 +1092,7 @@ def eval_counter_streak(
     state_dir: Path,
     pid: str,
     start_ticks: str,
+    gap_stale: bool = False,
 ) -> dict:
     """Evaluate a counter-streak alarm.
 
@@ -1111,6 +1173,31 @@ def eval_counter_streak(
         post_restart = maybe_post_restart_fire(alarm, cur_val)
         if post_restart is not None:
             return post_restart
+        return make_result(alarm, "collecting_baseline",
+                           extra_values=ev_default)
+
+    # Gap-stale (#3246): the snapshot baseline is SAME-PID (the identity check
+    # above passed) but hours old — the monitor loop stalled across a long
+    # wall-clock gap while the process survived. The headline tick-184
+    # recovery-stalled false-fire lives here: counter jumped 0→703 over the gap,
+    # delta >= burst_threshold would fire WARN as an acute burst. RE-BASELINE
+    # instead: rewrite the snapshot to the current value and reset the streak to
+    # "0" (mirrors the counter-reset branch above) — this snapshot PERSISTS
+    # across ticks, so a plain skip would leave the stale baseline and fire on
+    # the NEXT tick. Unlike the PID-change / counter-reset branches, do NOT
+    # invoke maybe_post_restart_fire: gap-stale is not a restart — the counts
+    # accrued across normal operation, not a startup burst, so the absolute
+    # value must not acute-fire. Sequenced after the identity check, so a PID
+    # change (#3206) is handled there and never double-handled here.
+    if gap_stale:
+        new_snapshot = {
+            "version": "1",
+            "pid": pid,
+            "start_ticks": start_ticks,
+            "counter_value": str(int(cur_val)),
+            "breach_streak": "0",
+        }
+        write_snapshot(snapshot_path, new_snapshot)
         return make_result(alarm, "collecting_baseline",
                            extra_values=ev_default)
 
@@ -1416,6 +1503,24 @@ def main() -> int:
 
     # Read env vars
     prev_prom_invalid = os.environ.get("PREV_PROM_INVALID", "false").lower() == "true"
+    # Gap-staleness (#3246): the baseline (prev.prom for the file families,
+    # the persisted PID/start_ticks snapshot for the snapshot families) is
+    # SAME-PID-but-old when the monitor loop stalled across a long wall-clock
+    # gap while the process survived. PID-change (#3206) is handled FIRST via
+    # PREV_PROM_INVALID / the snapshot PID-mismatch reset; gap-stale is the
+    # distinct same-PID case, sequenced AFTER (never double-handled). Age -1 /
+    # absent ⇒ unknown ⇒ NOT stale (fail-safe; truly-missing identity is
+    # already covered by PREV_PROM_INVALID).
+    try:
+        prev_scrape_age = int(os.environ.get("PREV_SCRAPE_AGE_SECONDS", "-1"))
+    except ValueError:
+        prev_scrape_age = -1
+    try:
+        gap_stale_threshold = int(os.environ.get("GAP_STALE_THRESHOLD_SECONDS", "3600"))
+    except ValueError:
+        gap_stale_threshold = 3600
+    gap_stale = prev_scrape_age >= 0 and prev_scrape_age >= gap_stale_threshold
+    gap_stale_age_hours = round(prev_scrape_age / 3600.0, 1) if gap_stale else 0
     warmup_remaining = int(os.environ.get("WARMUP_TICKS_REMAINING", "0"))
     fresh_start = os.environ.get("FRESH_START", "no").lower() == "yes"
     crash_recovery = os.environ.get("CRASH_RECOVERY", "no").lower() == "yes"
@@ -1474,18 +1579,22 @@ def main() -> int:
             elif kind == "gauge-ratio":
                 result = eval_gauge_ratio(alarm, current, persistence_state, prev_prom_invalid)
             elif kind == "counter":
-                result = eval_counter(alarm, current, prev, prev_prom_invalid, warmup_remaining)
+                result = eval_counter(alarm, current, prev, prev_prom_invalid, warmup_remaining,
+                                      gap_stale, gap_stale_age_hours)
             elif kind == "counter-dynamic":
-                result = eval_counter_dynamic(alarm, current, prev, state_dir, prev_prom_invalid, warmup_remaining)
+                result = eval_counter_dynamic(alarm, current, prev, state_dir, prev_prom_invalid, warmup_remaining,
+                                              gap_stale, gap_stale_age_hours)
             elif kind == "histogram-p99":
-                result = eval_histogram_p99(alarm, current, prev, prev_prom_invalid)
+                result = eval_histogram_p99(alarm, current, prev, prev_prom_invalid,
+                                            gap_stale, gap_stale_age_hours)
             elif kind == "counter-ratio":
                 result = eval_counter_ratio(
                     alarm, current, prev, state_dir, pid, start_ticks_val,
-                    fresh_start, crash_recovery, uptime,
+                    fresh_start, crash_recovery, uptime, gap_stale,
                 )
             elif kind == "counter-streak":
-                result = eval_counter_streak(alarm, current, state_dir, pid, start_ticks_val)
+                result = eval_counter_streak(alarm, current, state_dir, pid, start_ticks_val,
+                                             gap_stale)
             else:
                 result = make_result(alarm, "skipped", skip_reason=f"unknown kind: {kind}")
 

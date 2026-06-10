@@ -45,7 +45,7 @@ cleanup  # ensure fresh state
 mkdir -p "$TEST_ROOT"
 
 # ── TAP state ────────────────────────────────────────────────────────────────
-TAP_PLAN=331
+TAP_PLAN=337
 TAP_CURRENT=0
 TAP_FAILURES=0
 
@@ -3257,6 +3257,26 @@ MOCK_BINARY
       "One or more of current.prom, prev.prom, scrape_identity missing from state table or not labeled check 12"
   fi
 
+  # Test 140: gap-staleness (#3246) documented in Check 12 — the identity section
+  # must compute prev_scrape_age from the timestamp field, export
+  # PREV_SCRAPE_AGE_SECONDS, name the gap-stale rule, and state the default
+  # threshold. The env var must also appear in the evaluator-invocation list.
+  if echo "$identity_section" | grep -Fq 'prev_scrape_age' \
+     && echo "$identity_section" | grep -Fq 'PREV_SCRAPE_AGE_SECONDS' \
+     && echo "$identity_section" | grep -Fq 'gap-stale' \
+     && echo "$identity_section" | grep -Fq '3600'; then
+    tap_ok "scrape-identity: gap-stale rule documented (prev_scrape_age, PREV_SCRAPE_AGE_SECONDS, gap-stale, 3600)"
+  else
+    tap_not_ok "scrape-identity: gap-stale rule documented" \
+      "identity section missing one of: prev_scrape_age, PREV_SCRAPE_AGE_SECONDS, gap-stale, 3600"
+  fi
+  if grep -Fq 'export PREV_SCRAPE_AGE_SECONDS' "$tick_file"; then
+    tap_ok "scrape-identity: PREV_SCRAPE_AGE_SECONDS in evaluator-invocation env list"
+  else
+    tap_not_ok "scrape-identity: PREV_SCRAPE_AGE_SECONDS in evaluator-invocation env list" \
+      "no 'export PREV_SCRAPE_AGE_SECONDS' in $tick_file"
+  fi
+
   fi  # end identity_section guard
 
   # Clean up all background processes from lifecycle tests
@@ -4256,6 +4276,200 @@ TICK_PROM_148E
   fi
   rm -f "$tick_prom_148e"
   rm -rf "$state_dir_148e"
+
+  # ── Tests 148f–148i: gap-staleness (#3246) ──────────────────────────────────
+  # When the monitor LOOP stalls for a long wall-clock gap but the validator
+  # PROCESS survives (same PID/start_ticks), the prev.prom / snapshot baseline
+  # stays valid by identity but becomes hours old. The counter-delta is then
+  # computed across the whole gap → false acute-burst alarms. The fix derives a
+  # gap_stale signal from PREV_SCRAPE_AGE_SECONDS >= GAP_STALE_THRESHOLD_SECONDS
+  # (default 3600) and applies it asymmetrically: prev.prom-family alarms SKIP
+  # (the file baseline is recomputed each tick); snapshot-family alarms
+  # RE-BASELINE (the snapshot persists across ticks).
+  local alarm_state_of
+  alarm_state_of() {
+    # $1 = evaluator stdout JSON, $2 = alarm name; prints the alarm state.
+    echo "$1" | python3 -c "
+import json, sys
+name = sys.argv[1]
+try:
+    data = json.load(sys.stdin)
+    for r in data.get('alarms', []):
+        if r.get('name') == name:
+            print(r.get('state', 'missing'))
+            break
+    else:
+        print('not-found')
+except:
+    print('parse-error')
+" "$2" 2>/dev/null || echo "parse-error"
+  }
+  local alarm_skipreason_of
+  alarm_skipreason_of() {
+    # $1 = evaluator stdout JSON, $2 = alarm name; prints the alarm skip_reason.
+    echo "$1" | python3 -c "
+import json, sys
+name = sys.argv[1]
+try:
+    data = json.load(sys.stdin)
+    for r in data.get('alarms', []):
+        if r.get('name') == name:
+            print(r.get('skip_reason', ''))
+            break
+    else:
+        print('not-found')
+except:
+    print('parse-error')
+" "$2" 2>/dev/null || echo "parse-error"
+  }
+
+  # Shared counter fixture: a valid prev.prom baseline (same incarnation, no
+  # PREV_PROM_INVALID) with a large delta on the `lost-sync` counter (op >= 1).
+  # The delta would normally fire — the only difference between 148f and 148g is
+  # the prev-scrape age.
+  local gap_prev_prom gap_cur_prom
+  gap_prev_prom=$(mktemp)
+  gap_cur_prom=$(mktemp)
+  cat > "$gap_prev_prom" <<'GAP_PREV'
+stellar_herder_lost_sync_total 100
+GAP_PREV
+  cat > "$gap_cur_prom" <<'GAP_CUR'
+stellar_herder_lost_sync_total 117
+GAP_CUR
+
+  # Test 148f: counter gap-stale skip. prev age 12h (43200s) >= threshold ⇒ the
+  # delta=17 lost-sync alarm must NOT acute-fire; it is skipped with a gap-stale
+  # reason. FAILS pre-fix (no gap_stale logic ⇒ fires).
+  local state_dir_148f out_148f
+  state_dir_148f=$(mktemp -d)
+  out_148f=$(MONITOR_MODE=validator UPTIME_SECONDS=99999 WARMUP_TICKS_REMAINING=0 \
+    PREV_PROM_INVALID=false PREV_SCRAPE_AGE_SECONDS=43200 \
+    PID=3366449 START_TICKS=5000 \
+    python3 "$eval_script" \
+    --catalog "$catalog_file" \
+    --current "$gap_cur_prom" \
+    --prev "$gap_prev_prom" \
+    --state-dir "$state_dir_148f" 2>/dev/null) || true
+  local ls_state_148f ls_reason_148f
+  ls_state_148f=$(alarm_state_of "$out_148f" "lost-sync")
+  ls_reason_148f=$(alarm_skipreason_of "$out_148f" "lost-sync")
+  if [[ "$ls_state_148f" == "skipped" && "$ls_reason_148f" == *"gap-stale"* ]]; then
+    tap_ok "eval-alarms: counter gap-stale skip (prev age 12h ⇒ lost-sync skipped, reason '$ls_reason_148f', not firing)"
+  else
+    tap_not_ok "eval-alarms: counter gap-stale skip" \
+      "expected skipped+gap-stale, got state=$ls_state_148f reason=$ls_reason_148f"
+  fi
+  rm -rf "$state_dir_148f"
+
+  # Test 148g: counter normal interval still fires. Same fixture, prev age 20min
+  # (1200s) < threshold ⇒ the delta=17 alarm STILL fires. Guards against
+  # over-skipping. Passes both pre- and post-fix (no gap_stale at 1200s).
+  local state_dir_148g out_148g ls_state_148g
+  state_dir_148g=$(mktemp -d)
+  out_148g=$(MONITOR_MODE=validator UPTIME_SECONDS=99999 WARMUP_TICKS_REMAINING=0 \
+    PREV_PROM_INVALID=false PREV_SCRAPE_AGE_SECONDS=1200 \
+    PID=3366449 START_TICKS=5000 \
+    python3 "$eval_script" \
+    --catalog "$catalog_file" \
+    --current "$gap_cur_prom" \
+    --prev "$gap_prev_prom" \
+    --state-dir "$state_dir_148g" 2>/dev/null) || true
+  ls_state_148g=$(alarm_state_of "$out_148g" "lost-sync")
+  if [[ "$ls_state_148g" == "firing" ]]; then
+    tap_ok "eval-alarms: counter normal interval still fires (prev age 20m ⇒ lost-sync firing)"
+  else
+    tap_not_ok "eval-alarms: counter normal interval still fires" \
+      "expected firing at 1200s prev age, got $ls_state_148g"
+  fi
+  rm -rf "$state_dir_148g"
+  rm -f "$gap_prev_prom" "$gap_cur_prom"
+
+  # Test 148h: recovery-stalled burst gap-stale RE-BASELINE (the headline
+  # tick-184 case). A valid SAME-PID snapshot baseline (pid=3366449) with a burst
+  # delta (counter jumped 0 → 703 across the gap). With prev age 12h >= threshold
+  # the alarm must RE-BASELINE — return collecting_baseline (NOT firing) AND
+  # rewrite the snapshot to the current counter value with breach_streak=0, so
+  # next tick's delta is small. A plain skip would leave the stale baseline and
+  # fire on the NEXT tick — that's why snapshot-family re-baselines. FAILS pre-fix
+  # (delta=703 >= burst_threshold ⇒ firing). NB: same PID, so this is the
+  # distinct-from-#3206 case — the identity check passes, #3206's PID-mismatch
+  # reset never triggers; gap-staleness is what re-baselines here.
+  local state_dir_148h tick_prom_148h
+  state_dir_148h=$(mktemp -d)
+  cat > "$state_dir_148h/counter_streak_snapshot" <<'SNAP_148H'
+version=1
+pid=3366449
+start_ticks=5000
+counter_value=0
+breach_streak=0
+SNAP_148H
+  tick_prom_148h=$(mktemp)
+  cat > "$tick_prom_148h" <<'TICK_PROM_148H'
+henyey_recovery_stalled_tick_total{reason="forcing_catchup_behind"} 703
+TICK_PROM_148H
+  local out_148h rs_state_148h
+  out_148h=$(MONITOR_MODE=validator UPTIME_SECONDS=99999 WARMUP_TICKS_REMAINING=0 \
+    PREV_PROM_INVALID=false PREV_SCRAPE_AGE_SECONDS=43200 \
+    PID=3366449 START_TICKS=5000 \
+    python3 "$eval_script" \
+    --catalog "$catalog_file" \
+    --current "$tick_prom_148h" \
+    --state-dir "$state_dir_148h" 2>/dev/null) || true
+  rs_state_148h=$(rs_state_of "$out_148h")
+  local snap_cv_148h snap_streak_148h
+  snap_cv_148h=$(grep '^counter_value=' "$state_dir_148h/counter_streak_snapshot" | cut -d= -f2)
+  snap_streak_148h=$(grep '^breach_streak=' "$state_dir_148h/counter_streak_snapshot" | cut -d= -f2)
+  if [[ "$rs_state_148h" == "collecting_baseline" \
+        && "$snap_cv_148h" == "703" && "$snap_streak_148h" == "0" ]]; then
+    tap_ok "eval-alarms: recovery-stalled burst gap-stale re-baseline (703 ⇒ collecting_baseline, snapshot reseeded to 703 streak 0, not firing)"
+  else
+    tap_not_ok "eval-alarms: recovery-stalled burst gap-stale re-baseline" \
+      "expected collecting_baseline + snapshot reseed (cv=703 streak=0), got state=$rs_state_148h cv=$snap_cv_148h streak=$snap_streak_148h"
+  fi
+  rm -f "$tick_prom_148h"
+  rm -rf "$state_dir_148h"
+
+  # Test 148i: counter-ratio gap-stale RE-BASELINE. A valid same-PID ratio
+  # snapshot baseline with a breaching ratio across the gap must re-baseline
+  # (collecting_baseline) and reset the streak to 0, rather than advancing the
+  # streak toward a fire. Uses `pending-too-old-ratio` (min_volume=100).
+  # FAILS pre-fix (the breaching ratio advances the streak → breach/firing).
+  local state_dir_148i tick_prom_148i
+  state_dir_148i=$(mktemp -d)
+  cat > "$state_dir_148i/ratio_snapshot" <<'SNAP_148I'
+version=1
+pid=3366449
+start_ticks=5000
+pending-too-old-ratio_numerator=0
+pending-too-old-ratio_denominator=0
+pending-too-old-ratio_streak=2
+SNAP_148I
+  tick_prom_148i=$(mktemp)
+  # num jumps 0→900, den 0→1000 across the gap → ratio 0.9 (breaching), den_delta
+  # 1000 >= min_volume 100.
+  cat > "$tick_prom_148i" <<'TICK_PROM_148I'
+stellar_herder_pending_too_old_total 900
+stellar_herder_pending_received_total 1000
+TICK_PROM_148I
+  local out_148i pt_state_148i
+  out_148i=$(MONITOR_MODE=validator UPTIME_SECONDS=99999 WARMUP_TICKS_REMAINING=0 \
+    PREV_PROM_INVALID=false PREV_SCRAPE_AGE_SECONDS=43200 \
+    PID=3366449 START_TICKS=5000 \
+    python3 "$eval_script" \
+    --catalog "$catalog_file" \
+    --current "$tick_prom_148i" \
+    --state-dir "$state_dir_148i" 2>/dev/null) || true
+  pt_state_148i=$(alarm_state_of "$out_148i" "pending-too-old-ratio")
+  local ratio_streak_148i
+  ratio_streak_148i=$(grep '^pending-too-old-ratio_streak=' "$state_dir_148i/ratio_snapshot" | cut -d= -f2)
+  if [[ "$pt_state_148i" == "collecting_baseline" && "$ratio_streak_148i" == "0" ]]; then
+    tap_ok "eval-alarms: counter-ratio gap-stale re-baseline (breaching ratio ⇒ collecting_baseline, streak reset 0)"
+  else
+    tap_not_ok "eval-alarms: counter-ratio gap-stale re-baseline" \
+      "expected collecting_baseline + streak 0, got state=$pt_state_148i streak=$ratio_streak_148i"
+  fi
+  rm -f "$tick_prom_148i"
+  rm -rf "$state_dir_148i"
 
   # Test 149: alarm-surfaces.toml file-local invariants + mirrored UIDs
   #           resolve to real Grafana alert UIDs in henyey-slo-alerts.yaml.

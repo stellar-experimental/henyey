@@ -929,6 +929,36 @@ against a node that is in real-time sync with age=2s).
      reason=`no scrape_identity` or `scrape_identity malformed`.
      This handles rollout (existing sessions have prev.prom but no
      scrape_identity), manual deletion, and corruption.
+   - **Gap-staleness check (`PREV_SCRAPE_AGE_SECONDS`, #3246):** the identity
+     check above only catches a *process* change (PID/`start_ticks`). It does
+     NOT catch the case where the monitor **loop** stalled across a long
+     wall-clock gap while the validator **process survived** — same PID, so
+     `PREV_PROM_INVALID=false`, but `prev.prom`/the snapshot baseline is now
+     hours old. The counter-delta would then be computed across the whole gap
+     and false-fire as an acute burst (the headline tick-184 `recovery-stalled`
+     case). Compute `prev_scrape_age = now − timestamp(scrape_identity)` from
+     the `timestamp=` field of `scrape_identity` (which describes the process
+     that produced `prev.prom`) and export it for the evaluator:
+     ```bash
+     # prev_ts = ISO8601 timestamp from the EXISTING scrape_identity (the one
+     # describing prev.prom), read BEFORE the fresh write below. If the file is
+     # absent/malformed/has no timestamp, leave the age unknown (-1) — that case
+     # is already covered by PREV_PROM_INVALID, and an unknown age is treated as
+     # NOT stale (fail-safe).
+     PREV_TS=$(awk -F= '/^timestamp=/{print $2}' \
+       /home/tomer/data/$MONITOR_SESSION_ID/metrics/scrape_identity 2>/dev/null)
+     if [ -n "$PREV_TS" ]; then
+       PREV_EPOCH=$(date -u -d "$PREV_TS" +%s 2>/dev/null || echo "")
+       NOW_EPOCH=$(date -u +%s)
+       if [ -n "$PREV_EPOCH" ]; then
+         export PREV_SCRAPE_AGE_SECONDS=$(( NOW_EPOCH - PREV_EPOCH ))
+       else
+         export PREV_SCRAPE_AGE_SECONDS=-1
+       fi
+     else
+       export PREV_SCRAPE_AGE_SECONDS=-1
+     fi
+     ```
    - Write fresh identity file:
      ```bash
      printf "version=1\npid=%s\nstart_ticks=%s\ntimestamp=%s\n" \
@@ -963,6 +993,23 @@ against a node that is in real-time sync with age=2s).
      Independence is safe: each check reads PID/start_ticks from `/proc` and
      compares against its own snapshot.
 
+   **Gap-stale baseline (`PREV_SCRAPE_AGE_SECONDS`, #3246):** derived in the
+   evaluator as `gap_stale = age >= 0 and age >= GAP_STALE_THRESHOLD_SECONDS`
+   (default `3600` ≈ 3× the nominal ~20-min tick). This is the **distinct**
+   same-PID-old-baseline case: PID-change (#3206) trips `PREV_PROM_INVALID`
+   FIRST; gap-stale is sequenced AFTER the identity check, so the two are never
+   double-handled. Applied **asymmetrically** by alarm family:
+   - **prev.prom families** (counter, counter-dynamic, histogram-p99): **SKIP**
+     the acute fire this tick with a `gap-stale (prev age Xh)` reason — `prev.prom`
+     is recomputed from the file each tick, so no persisted baseline to reseed.
+   - **snapshot families** (counter-ratio, counter-streak — incl. the headline
+     `recovery-stalled` burst): **RE-BASELINE** — rewrite the snapshot with
+     current values and reset the streak to `0` (reusing the counter-reset path),
+     because these snapshots PERSIST across ticks; a plain skip would leave the
+     stale baseline and fire on the NEXT tick.
+   - **Age-unknown (`-1`/absent)** is treated as NOT stale (fail-safe; a truly
+     missing identity is already covered by `PREV_PROM_INVALID`).
+
 6. **Counter reset handling**: for any counter, if `current < prev`, treat
    `delta = current` (defense-in-depth for within-incarnation counter resets).
 
@@ -988,6 +1035,7 @@ against a node that is in real-time sync with age=2s).
    ARCHIVE_VERSION=1
    TICK_SKIPPED=${TICK_SKIPPED:-false}
    PREV_PROM_INVALID=${PREV_PROM_INVALID:-false}
+   PREV_SCRAPE_AGE_SECONDS=${PREV_SCRAPE_AGE_SECONDS:--1}
    WARMUP_TICKS_REMAINING=${WARMUP_TICKS_REMAINING:-0}
    FRESH_START=${FRESH_START:-no}
    CRASH_RECOVERY=${CRASH_RECOVERY:-no}
@@ -1126,6 +1174,7 @@ catalog for per-alarm gates and the evaluator source for edge-case behavior.
 ```bash
 # Set env vars from checks 3/10 state:
 export PREV_PROM_INVALID=...     # true/false from scrape_identity check
+export PREV_SCRAPE_AGE_SECONDS=... # prev.prom/snapshot age in seconds (gap-stale, #3246); -1/unset = unknown
 export WARMUP_TICKS_REMAINING=... # 0/1/2 from restart detection
 export FRESH_START=...            # yes/no
 export CRASH_RECOVERY=...        # yes/no
