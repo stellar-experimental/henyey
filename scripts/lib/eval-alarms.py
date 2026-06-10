@@ -373,6 +373,12 @@ def make_result(
         "for_ticks_elapsed": for_ticks_elapsed,
         "skip_reason": skip_reason,
         "contributes_to": contributes_to,
+        # Surface the post-restart marker from extra_values so the renderer can
+        # distinguish a baseline-reset absolute fire (#3198/#3206) from a
+        # cross-tick burst. maybe_post_restart_fire is the sole setter; it lives
+        # only inside extra_values, so without this it never reaches the
+        # renderer and a post-restart fire is mislabeled (burst) (#3274).
+        "post_restart": bool(extra_values and extra_values.get("post_restart")),
     }
 
     # Safety net: warn about unresolved template placeholders.
@@ -1313,7 +1319,14 @@ def render_aggregate(results: list[dict], watcher_mode: bool) -> dict:
     else:
         r = stalled_alarms[0]
         if r["state"] == "firing":
-            if r.get("value", 0) >= 10:
+            if r.get("post_restart"):
+                # Baseline-reset absolute fire (#3198/#3206): the value is an
+                # absolute counter, not a cross-tick delta, so label it
+                # (post-restart) per the documented form (monitor-tick SKILL.md
+                # L1335). MUST precede the value>=10 burst check, since a
+                # post-restart absolute (>= threshold 50) is always >= 10 (#3274).
+                recovery_stalled_line = f"recovery_stalled: WARNING absolute={r['value']} (post-restart) — investigating"
+            elif r.get("value", 0) >= 10:
                 recovery_stalled_line = f"recovery_stalled: WARNING delta={r['value']} (burst) — investigating"
             else:
                 streak = r.get("for_ticks_elapsed", 0)
