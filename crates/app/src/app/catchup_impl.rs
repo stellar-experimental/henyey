@@ -1481,31 +1481,49 @@ impl App {
         // (suppressed resets must not arm the fatal timer), BEFORE step 1
         // (which clears the flag we read).
         //
-        // Fresh cache only: Stale means refresh in-flight (archive may have
-        // published). Cold means no data (must probe). Leave
-        // archive_recovery_status as ConfirmedBehind so decision function stays
-        // in the archive_behind branch where cooldown → AttemptRecovery.
+        // #3262 (widening): suppress on "not-known-ahead while peers confirm
+        // tip" rather than "Fresh-and-behind" only. At the live tip the
+        // published archive always lags the network, so is_confirmed_behind()
+        // is the normal steady state and the archive cache cycles through
+        // Fresh/Stale/Cold (urgent-mode TTL is 10s — between refreshes
+        // get_cached() returns Stale). The old Fresh-only predicate let the
+        // Stale/Cold windows fall through to a futile ProbeAhead archive probe
+        // that errors "not ahead of min_ledger" — spurious churn at tip. The
+        // widened predicate suppresses for:
+        //   - Fresh(v) if v <= current_ledger  (today's behavior)
+        //   - Stale(v) if v <= current_ledger  (NEW)
+        //   - Cold                              (NEW — no value to compare; a
+        //     refresh is in flight and peers confirm there is nothing ahead)
+        // A known-ahead cache (Fresh|Stale with v > current_ledger) still
+        // falls through to ProbeAhead: that is a legitimate catchup target
+        // (#1862). archive_recovery_status stays ConfirmedBehind so the
+        // decision function stays in the archive_behind branch where cooldown
+        // → AttemptRecovery.
         //
-        // #2789 (narrowing): only suppress when the validator is at-or-near
-        // the network tip. Peer-gap is read from verified SCP evidence
-        // (max_verified_scp_slot, via effective_peer_gap) rather than from
-        // the herder's latest_externalized — when the node is stuck waiting
-        // for tx_sets, latest_externalized stays at LCL while
+        // #2789 gate (preserved): only suppress when the validator is
+        // at-or-near the network tip. Peer-gap is read from verified SCP
+        // evidence (max_verified_scp_slot, via effective_peer_gap) rather than
+        // from the herder's latest_externalized — when the node is stuck
+        // waiting for tx_sets, latest_externalized stays at LCL while
         // max_verified_scp_slot reflects the network tip. When peers are
         // clearly ahead (peer_gap >= HARD_RESET_GAP_ESCALATION = 12), the
-        // suppression blocks the only state-changing recovery path and
-        // leaves the validator wedged for ~90s. Falling through to the
-        // hard-reset+ProbeAhead path is bounded by the 60s cooldown and the
-        // livelock circuit-breaker, and the spawn_catchup state transition
-        // to CatchingUp itself breaks the wedge.
+        // suppression never fires and the hard-reset+ProbeAhead path proceeds
+        // exactly as before — preserving the #1862 far-behind archive catchup
+        // and the #2789 anti-wedge contract (the peer_gap >= 12 gate is the
+        // henyey analogue of core's "LCL has fallen behind the network"
+        // condition; core has no archive-probe-at-tip path).
         let peer_gap = self.effective_peer_gap(current_ledger);
+        let cache_not_known_ahead = match self.get_cached_archive_checkpoint_nonblocking() {
+            CacheResult::Fresh(v) | CacheResult::Stale(v) => v <= current_ledger,
+            // Cold has no value — the v <= current_ledger comparison is
+            // vacuous; with peers confirming tip there is nothing to catch
+            // up to, so a Cold cache is treated as not-known-ahead.
+            CacheResult::Cold => true,
+        };
         let suppress_archive_behind_at_tip =
             self.archive_recovery_snapshot().await.is_confirmed_behind()
                 && peer_gap < HARD_RESET_GAP_ESCALATION
-                && matches!(
-                    self.get_cached_archive_checkpoint_nonblocking(),
-                    CacheResult::Fresh(v) if v <= current_ledger
-                );
+                && cache_not_known_ahead;
 
         if suppress_archive_behind_at_tip {
             // Record cooldown so decision function routes to AttemptRecovery.
@@ -1528,10 +1546,11 @@ impl App {
                     gap = current_gap,
                     peer_gap,
                     ?reason,
-                    "Hard reset suppressed: archive confirmed behind with fresh \
-                     cache at/below current_ledger AND peers within \
-                     HARD_RESET_GAP_ESCALATION — cooldown armed, requesting \
-                     SCP state from peers (#2713, narrowed by #2789)"
+                    "Hard reset suppressed: archive confirmed behind with a \
+                     not-known-ahead cache (Fresh/Stale at/below current_ledger, \
+                     or Cold) AND peers within HARD_RESET_GAP_ESCALATION — \
+                     cooldown armed, requesting SCP state from peers \
+                     (#2713, narrowed by #2789, widened by #3262)"
                 );
             } else {
                 tracing::debug!(
@@ -1540,7 +1559,7 @@ impl App {
                     gap = current_gap,
                     peer_gap,
                     ?reason,
-                    "Hard reset suppressed (#2713) (repeated)"
+                    "Hard reset suppressed (#2713/#3262) (repeated)"
                 );
             }
 
@@ -4282,6 +4301,13 @@ mod tests {
         // Set tx_set_all_peers_exhausted.
         app.tx_set_all_peers_exhausted.store(true, Ordering::SeqCst);
 
+        // Peers verifiably far ahead (peer_gap = 50 >= HARD_RESET_GAP_ESCALATION)
+        // so the #3262 at-tip suppression does NOT fire and the genuine
+        // hard-reset execution path (eviction, state-clearing, counters)
+        // runs — this test exercises that path, not the at-tip suppression.
+        app.max_verified_scp_slot
+            .store(u64::from(current_ledger) + 50, Ordering::Relaxed);
+
         // Arm archive_recovery_status with backoff.
         {
             let mut guard = app.archive_recovery_status.write().await;
@@ -5099,19 +5125,22 @@ mod tests {
         );
     }
 
-    /// #1844 control (updated for #3204): without a previous hard reset (no
-    /// cooldown), the same scenario routes to HardReset(RecoveryExhausted) —
-    /// but only once the peer-gap-shrink progress suppression has lapsed.
+    /// #1844 control (updated for #3204; re-pointed for #3262): without a
+    /// previous hard reset (no cooldown), the same scenario routes to
+    /// HardReset(RecoveryExhausted) — but only once the peer-gap-shrink
+    /// progress suppression has lapsed.
     ///
-    /// In this scenario there is NO peer-ahead evidence (max_verified_scp_slot
-    /// stays 0 → effective_peer_gap == 0, flat across ticks), so the verified
-    /// peer gap never strictly shrinks. Per #3204 the count-based cap is
-    /// suppressed while back-fill might be making progress and re-arms only
-    /// after RECOVERY_ZERO_PROGRESS_ESCALATION_ATTEMPTS consecutive non-shrink
-    /// ticks (escape-1, ~30s). So the HardReset now fires on the Nth tick, not
-    /// the 1st — proving the genuine-no-progress stall still escalates (the
-    /// anti-wedge guarantee), just bounded by the no-progress budget instead of
-    /// an instantaneous count cap.
+    /// Peers are verifiably far ahead (max_verified_scp_slot = 50 →
+    /// effective_peer_gap == 50 >= HARD_RESET_GAP_ESCALATION), so the #3262
+    /// at-tip suppression does NOT fire and this genuinely-behind stall must
+    /// still escalate (the anti-wedge guarantee). The peer gap is FLAT at 50
+    /// across ticks, so it never strictly shrinks. Per #3204 the count-based
+    /// cap is suppressed while back-fill might be making progress and re-arms
+    /// only after RECOVERY_ZERO_PROGRESS_ESCALATION_ATTEMPTS consecutive
+    /// non-shrink ticks (escape-1, ~30s). So the HardReset fires on the Nth
+    /// tick, not the 1st — proving the genuine-no-progress stall still
+    /// escalates, just bounded by the no-progress budget instead of an
+    /// instantaneous count cap.
     #[tokio::test]
     async fn test_no_previous_reset_routes_to_hard_reset() {
         use std::sync::atomic::Ordering;
@@ -5119,11 +5148,17 @@ mod tests {
 
         let (_dir, app) = mk_app_for_cooldown_livelock_scenario().await;
 
+        // Peers verifiably far ahead (peer_gap = 50 >= HARD_RESET_GAP_ESCALATION)
+        // so the #3262 at-tip suppression does not fire — the node is
+        // genuinely behind the network and must escalate.
+        app.max_verified_scp_slot.store(50, Ordering::Relaxed);
+
         // last_hard_reset_offset stays at 0 (default) → "no previous reset"
         // → cooldown is inactive → HardReset fires once progress lapses.
 
         // Drive the no-progress counter to its escalation threshold. The peer
-        // gap is flat at 0 (no peer evidence), so each tick is a non-shrink.
+        // gap is flat at 50 (peers ahead, no shrink), so each tick is a
+        // non-shrink.
         // Re-arm the schedule timer between ticks so each one is schedule_due,
         // and re-seed the stuck state because the prior tick's AttemptRecovery
         // increments recovery_attempts (kept at/above the cap here).
@@ -6305,6 +6340,12 @@ mod tests {
         let current_ledger: u32 = 0;
         // latest_externalized is None → unwrap_or(0), so latest_ext == 0.
 
+        // Peers verifiably ahead (peer_gap = 50 >= HARD_RESET_GAP_ESCALATION)
+        // so the #3262 at-tip suppression does NOT fire — this test verifies
+        // the latest_ext==0 startup exclusion of the at-tip exact-equality
+        // guard, so the reset must proceed past the suppression.
+        app.max_verified_scp_slot.store(50, Ordering::Relaxed);
+
         {
             let mut guard = app.archive_recovery_status.write().await;
             *guard = ArchiveRecoveryStatus::ConfirmedBehind {
@@ -6351,6 +6392,13 @@ mod tests {
             .scp_driver()
             .record_externalized(5_010, Default::default(), None);
         app.herder.scp_driver().publish_externalized(5_010);
+
+        // Peers verifiably far ahead (peer_gap = 50 >= HARD_RESET_GAP_ESCALATION)
+        // so the #3262 at-tip suppression does NOT fire and the Behind case
+        // proceeds to the genuine hard reset (this test exercises the
+        // proceed-when-behind path, not at-tip suppression).
+        app.max_verified_scp_slot
+            .store(u64::from(current_ledger) + 50, Ordering::Relaxed);
 
         {
             let mut guard = app.archive_recovery_status.write().await;
