@@ -2678,7 +2678,12 @@ impl App {
             peer_count: self.peer_count().await,
             pending_envelopes: herder_stats.pending_envelopes,
             cached_tx_sets: herder_stats.cached_tx_sets,
-            heard_from_quorum: self.herder.heard_from_quorum(quorum_slot),
+            // Source from the SCP ballot protocol's per-slot flag so this matches
+            // the /info qset `heard` view by construction (parity with
+            // stellar-core's getJsonQuorumInfo→ret["heard"]). The henyey-only
+            // SlotQuorumTracker excludes the local node and gets stuck false for a
+            // followed slot after a restart (#3250); is_v_blocking still uses it.
+            heard_from_quorum: self.herder.scp_heard_from_quorum(quorum_slot),
             is_v_blocking: self.herder.is_v_blocking(quorum_slot),
             slot: slot_state.map(Into::into),
             consensus_trigger_timer_fires: self
@@ -5078,7 +5083,41 @@ mod tests {
         // Verify quorum tracking methods are callable
         let slot = app.herder.tracking_slot().get();
         let _heard = app.herder.heard_from_quorum(slot);
+        let _scp_heard = app.herder.scp_heard_from_quorum(slot);
         let _blocking = app.herder.is_v_blocking(slot);
+    }
+
+    /// Regression test for #3250: the debug-stats / heartbeat `heard_from_quorum`
+    /// is sourced from the SCP ballot protocol's per-slot flag (which matches the
+    /// /info qset `heard` view), NOT the henyey-only SlotQuorumTracker. The two
+    /// must agree for the slot the stats query.
+    #[tokio::test]
+    async fn test_debug_stats_heard_from_quorum_matches_scp_ballot_flag() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-test.db");
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
+
+        let app = App::new(config).await.unwrap();
+
+        let stats = app.simulation_debug_stats().await;
+
+        // The stats slot is the same quorum_slot used to compute heard_from_quorum.
+        let quorum_slot = stats
+            .tracking_slot
+            .get()
+            .max(stats.current_ledger as u64 + 1)
+            .max(1);
+
+        // Source of truth: the SCP per-slot ballot flag (parity with core's
+        // BallotProtocol::mHeardFromQuorum). The debug-stats field must equal it
+        // exactly — by construction now that both read scp_heard_from_quorum.
+        let scp_flag = app.herder.scp_heard_from_quorum(quorum_slot);
+        assert_eq!(
+            stats.heard_from_quorum, scp_flag,
+            "debug-stats heard_from_quorum must mirror the SCP ballot flag (#3250)"
+        );
     }
 
     #[tokio::test]
