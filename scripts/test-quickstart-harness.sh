@@ -742,14 +742,19 @@ EOF
         --timeout "$budget" --diagnostics-dir "$diag_dir" \
         -- "$probe" >/dev/null 2>"$wrapper_log" || exit_code=$?
 
-    # The wrapper logs "Command: timeout <budget>s ..." for each attempt.
-    # Both attempts must use the same budget that was passed in.
+    # The wrapper logs "Command: timeout -k <grace> <budget>s ..." for each
+    # attempt (the `-k <grace>` is the #3273 kill-after force-kill). The
+    # per-attempt budget is the duration that immediately follows the `-k
+    # <grace>` token. Both attempts must use the same budget that was passed in.
+    # We extract the budget position (the SECOND duration on the timeout line,
+    # after the `-k <grace>` first duration) so the assertion tracks the budget,
+    # not the fixed grace.
     # `|| true` so a no-match (grep exit 1) doesn't abort under `set -e`.
     local attempt_budgets
-    attempt_budgets=$( (grep -oE "timeout ${budget}s" "$wrapper_log" || true) | wc -l | tr -d ' ')
+    attempt_budgets=$( (grep -oE "timeout -k [0-9]+s ${budget}s" "$wrapper_log" || true) | wc -l | tr -d ' ')
     local other_budgets
-    other_budgets=$( (grep -oE 'timeout [0-9]+s' "$wrapper_log" || true) \
-        | (grep -vE "timeout ${budget}s" || true) | wc -l | tr -d ' ')
+    other_budgets=$( (grep -oE 'timeout -k [0-9]+s [0-9]+s' "$wrapper_log" || true) \
+        | (grep -vE "timeout -k [0-9]+s ${budget}s" || true) | wc -l | tr -d ' ')
 
     if [[ $exit_code -eq 0 && "$attempt_budgets" == "2" && "$other_budgets" == "0" ]]; then
         tap_ok "retry_uses_same_budget_as_first_attempt"
@@ -1444,8 +1449,97 @@ test_workflow_testnet_shard_uses_soft_timeout_and_tight_budget() {
     fi
 }
 
+# ============================================================
+# Test 27: test_sigterm_ignoring_probe_is_force_killed_and_soft_skipped
+#
+# Root-cause regression for #3272. PR #3273's own testnet shard (run
+# 27298458353) HUNG: the per-probe `timeout 240` never fired because the
+# wrapper invoked GNU `timeout` WITHOUT a `--kill-after`/`-k` grace. The
+# upstream probe is `go run quickstart/tests/<probe>.go`, and `go run` does NOT
+# forward SIGTERM to the test binary it execs. So at the deadline `timeout`
+# sent SIGTERM, the probe ignored it, and `timeout` then blocked in wait()
+# FOREVER — never force-killing, never returning, hanging the whole step until
+# the job wall-clock cancelled it ~54 min later. The soft-skip never triggered
+# because the wrapper never returned at all.
+#
+# The fix: `timeout -k "${KILL_GRACE}" "$TIMEOUT" ...` so a SIGTERM-ignoring
+# probe is force-SIGKILLed after the grace and `timeout` is guaranteed to
+# return promptly. Empirically (GNU coreutils 8.32) a `-k` force-kill in a
+# pipeline (the wrapper runs `timeout ... | tee`) returns exit 137 (128+9,
+# SIGKILL) — NOT 124 — because `timeout` runs the child in its own process
+# group and reports the group SIGKILL as 128+9. (`--foreground` would make it
+# report 124, but in a PIPELINE `--foreground` re-introduces the hang, so it is
+# deliberately NOT used.) Therefore the soft-skip path must treat BOTH 124 (a
+# clean SIGTERM timeout) AND 137 (a timeout that required the `-k` SIGKILL
+# escalation) as the timeout disposition.
+#
+# This test wires a fake probe that IGNORES SIGTERM (trap '' TERM; sleep 60)
+# through the wrapper with a short --timeout (1s), a short KILL_GRACE (1s), and
+# --soft-on-timeout. It asserts:
+#   (a) the wrapper TERMINATES quickly — well under 30s — proving `-k` force-
+#       killed the probe (WITHOUT `-k`, on current pre-fix code, the wrapper
+#       hangs ~the full sleep 60 and this assertion FAILS), and
+#   (b) the timeout disposition is taken — under --soft-on-timeout the wrapper
+#       exits 0 with the grep-able SOFT-SKIP marker.
+# Without the `-k` fix AND the 137-as-timeout soft-skip extension, this test
+# FAILS (hang and/or non-zero exit with no SOFT-SKIP marker).
+# ============================================================
+test_sigterm_ignoring_probe_is_force_killed_and_soft_skipped() {
+    local diag_dir="$TMPDIR_BASE/diag-test27"
+    mkdir -p "$diag_dir"
+
+    # Fake probe that IGNORES SIGTERM and sleeps far longer than the timeout +
+    # grace. Without a `-k` force-kill, `timeout` sends SIGTERM (ignored) and
+    # blocks in wait() until this sleep finishes — i.e. the wrapper hangs.
+    local probe="$TMPDIR_BASE/probe-test27.sh"
+    cat > "$probe" <<'EOF'
+#!/bin/bash
+trap '' TERM
+sleep 60
+EOF
+    chmod +x "$probe"
+
+    local wrapper_log="$TMPDIR_BASE/wrapper-log-test27.txt"
+    local exit_code=0
+    local start end elapsed
+    start=$(date +%s)
+    # Cap the whole wrapper invocation at 30s with an OUTER timeout so a
+    # pre-fix HANG fails the assertion fast instead of stalling the harness for
+    # the full sleep 60. The outer timeout also uses -k so it can itself bound
+    # a wrapper that wedged. A correctly-fixed wrapper returns in ~2s, well
+    # under this 30s cap.
+    KILL_GRACE=1s timeout -k 5s 30 "$WRAPPER" \
+        --soft-on-timeout \
+        --network testnet --enable "core,horizon" --probe horizon-core-up \
+        --timeout 1 --diagnostics-dir "$diag_dir" \
+        -- "$probe" >/dev/null 2>"$wrapper_log" || exit_code=$?
+    end=$(date +%s)
+    elapsed=$((end - start))
+
+    # (a) The wrapper must have terminated quickly (the outer 30s timeout did
+    # NOT have to fire). If the inner wrapper hung, the OUTER timeout kills it
+    # at 30s and exit_code becomes 124/137 from the OUTER timeout — caught by
+    # both the elapsed assertion and the absence of a SOFT-SKIP marker.
+    if [[ $elapsed -lt 25 ]]; then
+        tap_ok "sigterm_ignoring_probe_terminates_quickly_via_kill_after"
+    else
+        tap_not_ok "sigterm_ignoring_probe_terminates_quickly_via_kill_after" \
+            "wrapper did not return promptly (elapsed=${elapsed}s) — -k force-kill missing, probe hung"
+    fi
+
+    # (b) The timeout disposition was taken: under --soft-on-timeout the wrapper
+    # exits 0 with the SOFT-SKIP marker. (A bounded-but-still-red wrapper would
+    # exit non-zero with no marker.)
+    if [[ $exit_code -eq 0 ]] && grep -q 'SOFT-SKIP' "$wrapper_log"; then
+        tap_ok "sigterm_ignoring_probe_timeout_is_soft_skipped"
+    else
+        tap_not_ok "sigterm_ignoring_probe_timeout_is_soft_skipped" \
+            "exit=$exit_code, SOFT-SKIP marker present=$(grep -q 'SOFT-SKIP' "$wrapper_log" && echo yes || echo no)"
+    fi
+}
+
 # --- Run all tests ---
-tap_plan 83
+tap_plan 85
 
 test_timeout_retry_on_targeted_shard
 test_non_timeout_failure_no_retry
@@ -1473,6 +1567,7 @@ test_soft_on_timeout_still_fails_real_assertion
 test_soft_on_timeout_preserves_diagnostics
 test_soft_on_timeout_off_by_default_preserves_red
 test_workflow_testnet_shard_uses_soft_timeout_and_tight_budget
+test_sigterm_ignoring_probe_is_force_killed_and_soft_skipped
 
 echo ""
 echo "# Results: $PASS_COUNT/$TEST_COUNT passed, $FAIL_COUNT failed"
