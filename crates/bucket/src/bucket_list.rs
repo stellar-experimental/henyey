@@ -274,6 +274,11 @@ pub(crate) struct MergeContext<'a> {
     pub bucket_dir: Option<&'a std::path::Path>,
     pub merge_map: Option<&'a std::sync::Arc<std::sync::RwLock<BucketMergeMap>>>,
     pub merge_counters: Option<Arc<MergeCounters>>,
+    /// BucketListDB config governing the index layout of disk-backed merge
+    /// outputs. Sourced from `BucketList::bucket_list_db_config` (default when
+    /// unset). Merge outputs are re-indexed on the next `load_bucket`, so this
+    /// only sizes the transient promotion-time index; threaded for load-path parity.
+    pub bucket_list_db: BucketListDbConfig,
 }
 
 struct AsyncMergeRequest {
@@ -286,6 +291,12 @@ struct AsyncMergeRequest {
     level: usize,
     bucket_dir: Option<std::path::PathBuf>,
     counters: Option<Arc<MergeCounters>>,
+    /// BucketListDB config governing the index layout of the merge output when
+    /// promoted to a disk-backed bucket. The merge output is re-indexed on the
+    /// next `BucketManager::load_bucket` regardless, so this only affects the
+    /// transient index built at promotion time; it is threaded for parity with
+    /// the load path. Defaults to `BucketListDbConfig::default()`.
+    bucket_list_db: BucketListDbConfig,
 }
 
 struct AddBatchArgs {
@@ -359,6 +370,7 @@ impl AsyncMergeHandle {
             level,
             bucket_dir,
             counters,
+            bucket_list_db,
         } = request;
         let (sender, receiver) = oneshot::channel();
 
@@ -421,7 +433,13 @@ impl AsyncMergeHandle {
                             let _ = std::fs::remove_file(&temp_path);
                             Ok(Bucket::empty())
                         } else {
-                            promote_temp_to_canonical(&temp_path, &dir, &hash, "start_merge")
+                            promote_temp_to_canonical(
+                                &temp_path,
+                                dir,
+                                &hash,
+                                "start_merge",
+                                &bucket_list_db,
+                            )
                         }
                     }
                     Err(e) => {
@@ -1124,6 +1142,7 @@ impl BucketLevel {
                             level: self.level,
                             bucket_dir: ctx.bucket_dir.map(|p| p.to_path_buf()),
                             counters: ctx.merge_counters,
+                            bucket_list_db: ctx.bucket_list_db,
                         });
                         // Store the guard alongside the handle so it signals on commit.
                         self.next = Some(PendingMerge::Async(handle));
@@ -1165,6 +1184,7 @@ impl BucketLevel {
                 level: self.level,
                 bucket_dir: ctx.bucket_dir.map(|p| p.to_path_buf()),
                 counters: ctx.merge_counters,
+                bucket_list_db: ctx.bucket_list_db,
             });
             self.next = Some(PendingMerge::Async(handle));
         } else {
@@ -1441,6 +1461,7 @@ fn perform_merge(
     bucket_dir: Option<&std::path::PathBuf>,
     keep_dead: DeadEntryPolicy,
     protocol_version: u32,
+    config: &BucketListDbConfig,
 ) -> Result<Bucket> {
     if let Some(dir) = bucket_dir {
         let temp_path = temp_merge_path(dir);
@@ -1459,7 +1480,7 @@ fn perform_merge(
             let _ = std::fs::remove_file(&temp_path);
             Ok(Bucket::empty())
         } else {
-            promote_temp_to_canonical(&temp_path, dir, &hash, "perform_merge")
+            promote_temp_to_canonical(&temp_path, dir, &hash, "perform_merge", config)
         }
     } else {
         merge_buckets(
@@ -2344,6 +2365,7 @@ impl BucketList {
                         bucket_dir: self.bucket_dir.as_deref(),
                         merge_map: self.merge_map.as_ref(),
                         merge_counters: Some(Arc::clone(&self.merge_counters)),
+                        bucket_list_db: self.bucket_list_db_config.clone().unwrap_or_default(),
                     },
                 )?;
 
@@ -3024,11 +3046,13 @@ impl BucketList {
         // Phase 2: Spawn all merges in parallel via spawn_blocking
         if !work_items.is_empty() {
             let bucket_dir = self.bucket_dir.clone();
+            let bucket_list_db = self.bucket_list_db_config.clone().unwrap_or_default();
 
             let handles_with_levels: Vec<_> = work_items
                 .into_iter()
                 .map(|work| {
                     let bucket_dir = bucket_dir.clone();
+                    let bucket_list_db = bucket_list_db.clone();
                     let level = work.level;
                     let handle = tokio::task::spawn_blocking(move || {
                         let start = std::time::Instant::now();
@@ -3040,6 +3064,7 @@ impl BucketList {
                             bucket_dir.as_ref(),
                             work.keep_dead,
                             protocol_version,
+                            &bucket_list_db,
                         );
 
                         let elapsed = start.elapsed();
@@ -3186,6 +3211,7 @@ impl BucketList {
                     bucket_dir: self.bucket_dir.as_deref(),
                     merge_map: self.merge_map.as_ref(),
                     merge_counters: Some(Arc::clone(&self.merge_counters)),
+                    bucket_list_db: self.bucket_list_db_config.clone().unwrap_or_default(),
                 },
             )?;
 
@@ -3855,6 +3881,7 @@ mod tests {
                     bucket_dir: None,
                     merge_map: None,
                     merge_counters: None,
+                    bucket_list_db: BucketListDbConfig::default(),
                 },
             )
             .unwrap();
@@ -4197,6 +4224,7 @@ mod tests {
             level: 1,
             bucket_dir: Some(temp_dir.path().to_path_buf()),
             counters: None,
+            bucket_list_db: BucketListDbConfig::default(),
         });
 
         // Set up bucket list with the pending merge
@@ -4268,6 +4296,7 @@ mod tests {
             level: 1,
             bucket_dir: Some(dir.clone()),
             counters: None,
+            bucket_list_db: BucketListDbConfig::default(),
         });
 
         let mut bl = BucketList::new();
@@ -4287,6 +4316,7 @@ mod tests {
                 level: 1,
                 bucket_dir: Some(dir.clone()),
                 counters: None,
+                bucket_list_db: BucketListDbConfig::default(),
             });
             probe.levels[1].next = Some(PendingMerge::Async(probe_handle));
             probe.resolve_all_pending_merges().unwrap();
@@ -4764,6 +4794,7 @@ mod tests {
                     bucket_dir: Some(&bucket_dir),
                     merge_map: None,
                     merge_counters: None,
+                    bucket_list_db: BucketListDbConfig::default(),
                 },
             )
             .unwrap();
@@ -4817,6 +4848,7 @@ mod tests {
                     bucket_dir: Some(&bucket_dir),
                     merge_map: None,
                     merge_counters: None,
+                    bucket_list_db: BucketListDbConfig::default(),
                 },
             )
             .unwrap();
@@ -5219,6 +5251,7 @@ mod tests {
             Some(&bucket_dir),
             DeadEntryPolicy::Keep,
             TEST_PROTOCOL,
+            &BucketListDbConfig::default(),
         )
         .unwrap();
         let expected_hash = first.hash();
@@ -5238,6 +5271,7 @@ mod tests {
             Some(&bucket_dir),
             DeadEntryPolicy::Keep,
             TEST_PROTOCOL,
+            &BucketListDbConfig::default(),
         )
         .unwrap();
         assert_eq!(second.hash(), expected_hash);
