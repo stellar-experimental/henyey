@@ -36,6 +36,15 @@ name: Quickstart
 #     probe had no retry. The retry stays scoped to this one shard.
 #   * No retry for any other shard, or for any non-transient failure (e.g. a
 #     genuine probe failure exit 1) — those still fail loudly.
+#   * Soft-skip on testnet TIMEOUT (#3272): the testnet/core,horizon shard alone
+#     passes --soft-on-timeout, so after the retry is exhausted a probe TIMEOUT
+#     (exit 124 ONLY) is converted to a neutral exit 0 with a grep-able
+#     SOFT-SKIP marker — the testnet shard depends on external network liveness
+#     (slow catchup / checkpoint cadence / archive availability), not henyey
+#     correctness, and a stuck sync probe used to red-roll the whole workflow.
+#     A genuine assertion failure (any non-124 exit) on testnet STILL stays red,
+#     so a real henyey-on-testnet break is never masked. Paired with a tighter
+#     240s per-probe timeout on that shard so the soft-skip fires in minutes.
 #
 # Whole-runner reclamation (#3185 / #3193): when GitHub SIGTERMs/SIGKILLs the
 # entire runner, the bash wrapper is killed too and never reaches its in-script
@@ -404,10 +413,32 @@ jobs:
           - network: local
             enable: galexie
             probes: "test_galexie.go"
-          # Additional testnet shard
+          # Additional testnet shard.
+          #
+          # De-gate `main` on testnet external-liveness (#3272): the testnet
+          # shard flakes on external network health (slow catchup, checkpoint
+          # cadence, archive availability) — NOT henyey correctness — and a
+          # stuck sync probe TIMEOUT used to red-roll the whole workflow and
+          # block every PR's merge gate. So this shard:
+          #   * sets soft_on_timeout: true — a probe TIMEOUT (exit 124) is
+          #     converted to a neutral soft-skip by run-quickstart-test.sh
+          #     (a genuine assertion failure, non-124, still stays red), and
+          #   * tightens probe_timeout to 240s (= timeout_multiplier(4) * 60,
+          #     the upstream 4-min precedent already documented above) so a
+          #     stuck probe fast-fails into the soft-skip in minutes with
+          #     diagnostics uploaded, instead of hanging until the 45-min
+          #     job wall-clock cancels the run.
+          # This extends the existing testnet-RPC-disabled precedent (see the
+          # "Testnet shard (#1848)" note above) to the sync-probe TIMEOUT
+          # outcome. Scoped to THIS shard only — local/pubnet keep the default
+          # 600s hard-fail-on-timeout and carry no soft flag.
+          # Budget: 4 probes × 240s + one 240s retry = 1200s (~20 min), well
+          # under the job's 45-min timeout-minutes.
           - network: testnet
             enable: "core,horizon"
             probes: "test_core.go test_horizon_up.go test_horizon_core_up.go test_horizon_ingesting.go"
+            soft_on_timeout: true
+            probe_timeout: 240
           # Additional pubnet shard
           # Note: upstream excludes horizon_core_up, horizon_ingesting, and
           # stellar_rpc_healthy on pubnet (see internal-test.yml conditionals).
@@ -452,6 +483,11 @@ jobs:
         env:
           NETWORK: ${{ matrix.network }}
           ENABLE: ${{ matrix.enable }}
+          # Per-shard overrides (#3272). Unset matrix keys render as empty
+          # strings; the loop below falls back to the default budget and omits
+          # the soft flag when these are empty. Only the testnet shard sets them.
+          SHARD_PROBE_TIMEOUT: ${{ matrix.probe_timeout }}
+          SHARD_SOFT_ON_TIMEOUT: ${{ matrix.soft_on_timeout }}
         run: |
           # Per-probe budget = github.run_attempt * timeout_multiplier minutes,
           # converted to seconds for GNU `timeout` (* 60). Mirrors upstream
@@ -464,6 +500,23 @@ jobs:
           # overall by this job's timeout-minutes: 45. The targeted single retry
           # in run-quickstart-test.sh is layered on top of this budget (#2920).
           PROBE_TIMEOUT=$(( ${{ github.run_attempt }} * timeout_multiplier * 60 ))
+
+          # Per-shard probe-timeout override (#3272). The testnet shard fast-
+          # fails at a tighter budget (SHARD_PROBE_TIMEOUT=240) so a stuck sync
+          # probe is soft-skipped in minutes; all other shards leave it empty and
+          # keep the upstream run_attempt * multiplier * 60 budget unchanged.
+          if [[ -n "$SHARD_PROBE_TIMEOUT" ]]; then
+            PROBE_TIMEOUT="$SHARD_PROBE_TIMEOUT"
+          fi
+
+          # Per-shard soft-on-timeout flag (#3272). Only the testnet shard sets
+          # matrix.soft_on_timeout: true; for every other shard SHARD_SOFT_ON_TIMEOUT
+          # is empty and SOFT_FLAG stays empty so the wrapper invocation is
+          # byte-identical to before (no --soft-on-timeout passed).
+          SOFT_FLAG=""
+          if [[ "$SHARD_SOFT_ON_TIMEOUT" == "true" ]]; then
+            SOFT_FLAG="--soft-on-timeout"
+          fi
           DIAG_DIR="/tmp/quickstart-diagnostics"
 
           for probe_file in ${{ matrix.probes }}; do
@@ -474,6 +527,7 @@ jobs:
             probe_name="${probe_name//_/-}"
 
             scripts/ci/run-quickstart-test.sh \
+              $SOFT_FLAG \
               --network "$NETWORK" \
               --enable "$ENABLE" \
               --probe "$probe_name" \

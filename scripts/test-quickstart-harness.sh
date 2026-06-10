@@ -742,14 +742,19 @@ EOF
         --timeout "$budget" --diagnostics-dir "$diag_dir" \
         -- "$probe" >/dev/null 2>"$wrapper_log" || exit_code=$?
 
-    # The wrapper logs "Command: timeout <budget>s ..." for each attempt.
-    # Both attempts must use the same budget that was passed in.
+    # The wrapper logs "Command: timeout -k <grace> <budget>s ..." for each
+    # attempt (the `-k <grace>` is the #3273 kill-after force-kill). The
+    # per-attempt budget is the duration that immediately follows the `-k
+    # <grace>` token. Both attempts must use the same budget that was passed in.
+    # We extract the budget position (the SECOND duration on the timeout line,
+    # after the `-k <grace>` first duration) so the assertion tracks the budget,
+    # not the fixed grace.
     # `|| true` so a no-match (grep exit 1) doesn't abort under `set -e`.
     local attempt_budgets
-    attempt_budgets=$( (grep -oE "timeout ${budget}s" "$wrapper_log" || true) | wc -l | tr -d ' ')
+    attempt_budgets=$( (grep -oE "timeout -k [0-9]+s ${budget}s" "$wrapper_log" || true) | wc -l | tr -d ' ')
     local other_budgets
-    other_budgets=$( (grep -oE 'timeout [0-9]+s' "$wrapper_log" || true) \
-        | (grep -vE "timeout ${budget}s" || true) | wc -l | tr -d ' ')
+    other_budgets=$( (grep -oE 'timeout -k [0-9]+s [0-9]+s' "$wrapper_log" || true) \
+        | (grep -vE "timeout -k [0-9]+s ${budget}s" || true) | wc -l | tr -d ' ')
 
     if [[ $exit_code -eq 0 && "$attempt_budgets" == "2" && "$other_budgets" == "0" ]]; then
         tap_ok "retry_uses_same_budget_as_first_attempt"
@@ -1218,8 +1223,323 @@ test_separate_workflow_run_retry_workflow() {
     fi
 }
 
+# ============================================================
+# Test 22: test_soft_on_timeout_testnet_timeout_is_neutral_skip
+#
+# Regression for #3272. The chronic external-testnet flake red-rolls main when a
+# stuck testnet sync probe times out (exit 124) on both the first attempt and
+# the single retry. With the opt-in --soft-on-timeout flag (used only by the
+# testnet shard), a double-timeout (exit 124) must be converted to a neutral
+# exit 0 with a grep-able SOFT-SKIP marker, so an environmental testnet hang no
+# longer blocks the merge gate — while diagnostics are still captured.
+# FAILS on origin/main: the --soft-on-timeout flag does not exist there, so a
+# double-timeout on the testnet shard exits non-zero (see
+# test_targeted_timeout_still_fails_after_second_attempt).
+# ============================================================
+test_soft_on_timeout_testnet_timeout_is_neutral_skip() {
+    local diag_dir="$TMPDIR_BASE/diag-test22"
+    mkdir -p "$diag_dir"
+
+    # Probe that always sleeps (always times out → exit 124 on both attempts).
+    local probe
+    probe=$(make_probe "test22" 0 999)
+
+    local wrapper_log="$TMPDIR_BASE/wrapper-log-test22.txt"
+    local exit_code=0
+    "$WRAPPER" \
+        --soft-on-timeout \
+        --network testnet --enable "core,horizon" --probe horizon-core-up \
+        --timeout 2 --diagnostics-dir "$diag_dir" \
+        -- "$probe" >/dev/null 2>"$wrapper_log" || exit_code=$?
+
+    # Under --soft-on-timeout, a double-timeout (124) is a neutral soft-skip.
+    if [[ $exit_code -eq 0 ]]; then
+        tap_ok "test_soft_on_timeout_testnet_timeout_is_neutral_skip"
+    else
+        tap_not_ok "test_soft_on_timeout_testnet_timeout_is_neutral_skip" \
+            "exit=$exit_code (expected 0 soft-skip on a testnet timeout)"
+    fi
+
+    # A grep-able SOFT-SKIP marker must be emitted so the soft-skip is observable.
+    if grep -q 'SOFT-SKIP' "$wrapper_log"; then
+        tap_ok "soft_on_timeout_emits_soft_skip_marker"
+    else
+        tap_not_ok "soft_on_timeout_emits_soft_skip_marker" "no SOFT-SKIP marker in wrapper output"
+    fi
+}
+
+# ============================================================
+# Test 23: test_soft_on_timeout_still_fails_real_assertion
+#
+# The soft-skip MUST NOT mask a genuine probe assertion failure. A probe that
+# exits 1 (a real henyey-on-testnet break, NOT a timeout) under
+# --soft-on-timeout must still exit non-zero, and GNU `timeout` propagates the
+# child's exit code unchanged for non-timeout exits, so the wrapper exit is
+# exactly 1 — not 0 and not soft-skipped.
+# ============================================================
+test_soft_on_timeout_still_fails_real_assertion() {
+    local diag_dir="$TMPDIR_BASE/diag-test23"
+    mkdir -p "$diag_dir"
+
+    # Probe that exits 1 immediately (assertion failure, non-124).
+    local probe
+    probe=$(make_probe "test23" 1 0)
+
+    local wrapper_log="$TMPDIR_BASE/wrapper-log-test23.txt"
+    local exit_code=0
+    "$WRAPPER" \
+        --soft-on-timeout \
+        --network testnet --enable "core,horizon" --probe horizon-core-up \
+        --timeout 10 --diagnostics-dir "$diag_dir" \
+        -- "$probe" >/dev/null 2>"$wrapper_log" || exit_code=$?
+
+    # A non-124 assertion failure stays RED even under --soft-on-timeout, and
+    # the child's exit code (1) propagates unchanged.
+    if [[ $exit_code -eq 1 ]]; then
+        tap_ok "test_soft_on_timeout_still_fails_real_assertion"
+    else
+        tap_not_ok "test_soft_on_timeout_still_fails_real_assertion" \
+            "exit=$exit_code (expected 1 — a real assertion failure must NOT be soft-skipped)"
+    fi
+
+    # The SOFT-SKIP marker must NOT be emitted for a genuine assertion failure.
+    if ! grep -q 'SOFT-SKIP' "$wrapper_log"; then
+        tap_ok "soft_on_timeout_does_not_soft_skip_real_assertion"
+    else
+        tap_not_ok "soft_on_timeout_does_not_soft_skip_real_assertion" \
+            "SOFT-SKIP marker emitted for a non-124 assertion failure (masks a real break)"
+    fi
+}
+
+# ============================================================
+# Test 24: test_soft_on_timeout_preserves_diagnostics
+#
+# A soft-skipped timeout must still produce attempt-* diagnostics dirs so a
+# degraded-testnet event remains observable in the uploaded CI artifacts.
+# ============================================================
+test_soft_on_timeout_preserves_diagnostics() {
+    local diag_dir="$TMPDIR_BASE/diag-test24"
+    mkdir -p "$diag_dir"
+
+    local probe
+    probe=$(make_probe "test24" 0 999)
+
+    local exit_code=0
+    "$WRAPPER" \
+        --soft-on-timeout \
+        --network testnet --enable "core,horizon" --probe horizon-core-up \
+        --timeout 2 --diagnostics-dir "$diag_dir" \
+        -- "$probe" >/dev/null 2>&1 || exit_code=$?
+
+    # Soft-skip exits 0 but both timed-out attempts must have left diagnostics.
+    if [[ -d "$diag_dir/attempt-1" && -d "$diag_dir/attempt-2" ]]; then
+        tap_ok "test_soft_on_timeout_preserves_diagnostics"
+    else
+        tap_not_ok "test_soft_on_timeout_preserves_diagnostics" \
+            "missing attempt diagnostics dirs on soft-skip (exit=$exit_code)"
+    fi
+}
+
+# ============================================================
+# Test 25: test_soft_on_timeout_off_by_default_preserves_red
+#
+# Scope guard: WITHOUT --soft-on-timeout, a double-timeout (124) on the testnet
+# shard must still return the original non-zero exit — proving the default
+# behavior is byte-identical for every existing caller / other shard and the
+# soft-skip is strictly opt-in.
+# ============================================================
+test_soft_on_timeout_off_by_default_preserves_red() {
+    local diag_dir="$TMPDIR_BASE/diag-test25"
+    mkdir -p "$diag_dir"
+
+    local probe
+    probe=$(make_probe "test25" 0 999)
+
+    local wrapper_log="$TMPDIR_BASE/wrapper-log-test25.txt"
+    local exit_code=0
+    "$WRAPPER" \
+        --network testnet --enable "core,horizon" --probe horizon-core-up \
+        --timeout 2 --diagnostics-dir "$diag_dir" \
+        -- "$probe" >/dev/null 2>"$wrapper_log" || exit_code=$?
+
+    # Default (no flag): a double-timeout stays RED, exactly as before.
+    if [[ $exit_code -ne 0 ]]; then
+        tap_ok "test_soft_on_timeout_off_by_default_preserves_red"
+    else
+        tap_not_ok "test_soft_on_timeout_off_by_default_preserves_red" \
+            "exit=$exit_code (without the flag a timeout must stay non-zero)"
+    fi
+
+    # No SOFT-SKIP marker without the flag.
+    if ! grep -q 'SOFT-SKIP' "$wrapper_log"; then
+        tap_ok "no_soft_skip_marker_without_flag"
+    else
+        tap_not_ok "no_soft_skip_marker_without_flag" "SOFT-SKIP emitted without --soft-on-timeout"
+    fi
+}
+
+# ============================================================
+# Test 26: test_workflow_testnet_shard_uses_soft_timeout_and_tight_budget
+#
+# New coverage (#3272). The workflow must pass --soft-on-timeout and a tighter
+# (sub-600s) per-probe --timeout to the testnet shard ONLY, and must NOT pass
+# the soft flag to the pubnet/local shards (scope guard). Implemented via the
+# matrix: the testnet entry carries a `soft_on_timeout` flag and a
+# `probe_timeout` override; the probe loop appends --soft-on-timeout only when
+# the matrix value is set, and uses the per-shard override when present.
+# ============================================================
+test_workflow_testnet_shard_uses_soft_timeout_and_tight_budget() {
+    if [[ ! -f "$WORKFLOW" ]]; then
+        tap_not_ok "workflow_testnet_shard_sets_soft_on_timeout" "workflow file not found"
+        tap_not_ok "workflow_testnet_shard_has_sub_600_timeout" "workflow file not found"
+        tap_not_ok "workflow_loop_passes_soft_flag_conditionally" "workflow file not found"
+        tap_not_ok "workflow_pubnet_local_shards_have_no_soft_flag" "workflow file not found"
+        return
+    fi
+
+    # The testnet matrix entry must set soft_on_timeout: true.
+    local testnet_block
+    testnet_block=$(awk '/network: testnet/{f=1} f{print} /network: pubnet/{if(f)exit}' "$WORKFLOW")
+    if echo "$testnet_block" | grep -qE 'soft_on_timeout:[[:space:]]*true'; then
+        tap_ok "workflow_testnet_shard_sets_soft_on_timeout"
+    else
+        tap_not_ok "workflow_testnet_shard_sets_soft_on_timeout" \
+            "testnet matrix entry must set 'soft_on_timeout: true'"
+    fi
+
+    # The testnet matrix entry must set a tighter per-probe timeout < 600s.
+    # `|| true` so a no-match doesn't abort under `set -e`.
+    local testnet_timeout
+    testnet_timeout=$( (echo "$testnet_block" | grep -oE 'probe_timeout:[[:space:]]*[0-9]+' || true) \
+        | head -1 | grep -oE '[0-9]+' || true)
+    if [[ -n "$testnet_timeout" && "$testnet_timeout" -lt 600 ]]; then
+        tap_ok "workflow_testnet_shard_has_sub_600_timeout"
+    else
+        tap_not_ok "workflow_testnet_shard_has_sub_600_timeout" \
+            "testnet matrix entry must set a sub-600s 'probe_timeout' override; got: '$testnet_timeout'"
+    fi
+
+    # The probe loop must append --soft-on-timeout conditionally (only when the
+    # matrix flag is set), not unconditionally.
+    if grep -q -- '--soft-on-timeout' "$WORKFLOW" && grep -qE 'soft_on_timeout' "$WORKFLOW"; then
+        tap_ok "workflow_loop_passes_soft_flag_conditionally"
+    else
+        tap_not_ok "workflow_loop_passes_soft_flag_conditionally" \
+            "probe loop must pass --soft-on-timeout gated on the matrix soft_on_timeout value"
+    fi
+
+    # Scope guard: pubnet/local shard blocks must NOT carry soft_on_timeout: true.
+    # Match only the real YAML matrix KEY (an actual `soft_on_timeout: true`
+    # line), not prose inside a `#` comment that happens to mention the flag —
+    # so strip comment lines before grepping. The testnet entry's documentation
+    # comment block precedes `- network: testnet`, so without this filter its
+    # prose would be miscounted against the local shards.
+    local pubnet_block local_blocks
+    pubnet_block=$(awk '/network: pubnet/{f=1} f{print}' "$WORKFLOW" \
+        | awk '/^    steps:/{exit} {print}' | grep -vE '^[[:space:]]*#')
+    # Local blocks: everything from the first matrix include up to the testnet entry.
+    local_blocks=$(awk '/include:/{f=1} f && /network: testnet/{exit} f{print}' "$WORKFLOW" \
+        | grep -vE '^[[:space:]]*#')
+    if ! echo "$pubnet_block" | grep -qE 'soft_on_timeout:[[:space:]]*true' \
+        && ! echo "$local_blocks" | grep -qE 'soft_on_timeout:[[:space:]]*true'; then
+        tap_ok "workflow_pubnet_local_shards_have_no_soft_flag"
+    else
+        tap_not_ok "workflow_pubnet_local_shards_have_no_soft_flag" \
+            "soft_on_timeout must be scoped to the testnet shard only (found on pubnet/local)"
+    fi
+}
+
+# ============================================================
+# Test 27: test_sigterm_ignoring_probe_is_force_killed_and_soft_skipped
+#
+# Root-cause regression for #3272. PR #3273's own testnet shard (run
+# 27298458353) HUNG: the per-probe `timeout 240` never fired because the
+# wrapper invoked GNU `timeout` WITHOUT a `--kill-after`/`-k` grace. The
+# upstream probe is `go run quickstart/tests/<probe>.go`, and `go run` does NOT
+# forward SIGTERM to the test binary it execs. So at the deadline `timeout`
+# sent SIGTERM, the probe ignored it, and `timeout` then blocked in wait()
+# FOREVER — never force-killing, never returning, hanging the whole step until
+# the job wall-clock cancelled it ~54 min later. The soft-skip never triggered
+# because the wrapper never returned at all.
+#
+# The fix: `timeout -k "${KILL_GRACE}" "$TIMEOUT" ...` so a SIGTERM-ignoring
+# probe is force-SIGKILLed after the grace and `timeout` is guaranteed to
+# return promptly. Empirically (GNU coreutils 8.32) a `-k` force-kill in a
+# pipeline (the wrapper runs `timeout ... | tee`) returns exit 137 (128+9,
+# SIGKILL) — NOT 124 — because `timeout` runs the child in its own process
+# group and reports the group SIGKILL as 128+9. (`--foreground` would make it
+# report 124, but in a PIPELINE `--foreground` re-introduces the hang, so it is
+# deliberately NOT used.) Therefore the soft-skip path must treat BOTH 124 (a
+# clean SIGTERM timeout) AND 137 (a timeout that required the `-k` SIGKILL
+# escalation) as the timeout disposition.
+#
+# This test wires a fake probe that IGNORES SIGTERM (trap '' TERM; sleep 60)
+# through the wrapper with a short --timeout (1s), a short KILL_GRACE (1s), and
+# --soft-on-timeout. It asserts:
+#   (a) the wrapper TERMINATES quickly — well under 30s — proving `-k` force-
+#       killed the probe (WITHOUT `-k`, on current pre-fix code, the wrapper
+#       hangs ~the full sleep 60 and this assertion FAILS), and
+#   (b) the timeout disposition is taken — under --soft-on-timeout the wrapper
+#       exits 0 with the grep-able SOFT-SKIP marker.
+# Without the `-k` fix AND the 137-as-timeout soft-skip extension, this test
+# FAILS (hang and/or non-zero exit with no SOFT-SKIP marker).
+# ============================================================
+test_sigterm_ignoring_probe_is_force_killed_and_soft_skipped() {
+    local diag_dir="$TMPDIR_BASE/diag-test27"
+    mkdir -p "$diag_dir"
+
+    # Fake probe that IGNORES SIGTERM and sleeps far longer than the timeout +
+    # grace. Without a `-k` force-kill, `timeout` sends SIGTERM (ignored) and
+    # blocks in wait() until this sleep finishes — i.e. the wrapper hangs.
+    local probe="$TMPDIR_BASE/probe-test27.sh"
+    cat > "$probe" <<'EOF'
+#!/bin/bash
+trap '' TERM
+sleep 60
+EOF
+    chmod +x "$probe"
+
+    local wrapper_log="$TMPDIR_BASE/wrapper-log-test27.txt"
+    local exit_code=0
+    local start end elapsed
+    start=$(date +%s)
+    # Cap the whole wrapper invocation at 30s with an OUTER timeout so a
+    # pre-fix HANG fails the assertion fast instead of stalling the harness for
+    # the full sleep 60. The outer timeout also uses -k so it can itself bound
+    # a wrapper that wedged. A correctly-fixed wrapper returns in ~2s, well
+    # under this 30s cap.
+    KILL_GRACE=1s timeout -k 5s 30 "$WRAPPER" \
+        --soft-on-timeout \
+        --network testnet --enable "core,horizon" --probe horizon-core-up \
+        --timeout 1 --diagnostics-dir "$diag_dir" \
+        -- "$probe" >/dev/null 2>"$wrapper_log" || exit_code=$?
+    end=$(date +%s)
+    elapsed=$((end - start))
+
+    # (a) The wrapper must have terminated quickly (the outer 30s timeout did
+    # NOT have to fire). If the inner wrapper hung, the OUTER timeout kills it
+    # at 30s and exit_code becomes 124/137 from the OUTER timeout — caught by
+    # both the elapsed assertion and the absence of a SOFT-SKIP marker.
+    if [[ $elapsed -lt 25 ]]; then
+        tap_ok "sigterm_ignoring_probe_terminates_quickly_via_kill_after"
+    else
+        tap_not_ok "sigterm_ignoring_probe_terminates_quickly_via_kill_after" \
+            "wrapper did not return promptly (elapsed=${elapsed}s) — -k force-kill missing, probe hung"
+    fi
+
+    # (b) The timeout disposition was taken: under --soft-on-timeout the wrapper
+    # exits 0 with the SOFT-SKIP marker. (A bounded-but-still-red wrapper would
+    # exit non-zero with no marker.)
+    if [[ $exit_code -eq 0 ]] && grep -q 'SOFT-SKIP' "$wrapper_log"; then
+        tap_ok "sigterm_ignoring_probe_timeout_is_soft_skipped"
+    else
+        tap_not_ok "sigterm_ignoring_probe_timeout_is_soft_skipped" \
+            "exit=$exit_code, SOFT-SKIP marker present=$(grep -q 'SOFT-SKIP' "$wrapper_log" && echo yes || echo no)"
+    fi
+}
+
 # --- Run all tests ---
-tap_plan 72
+tap_plan 85
 
 test_timeout_retry_on_targeted_shard
 test_non_timeout_failure_no_retry
@@ -1242,6 +1562,12 @@ test_exit137_no_retry_on_non_targeted_shard
 test_exit137_double_failure_fails
 test_in_run_rerun_job_removed
 test_separate_workflow_run_retry_workflow
+test_soft_on_timeout_testnet_timeout_is_neutral_skip
+test_soft_on_timeout_still_fails_real_assertion
+test_soft_on_timeout_preserves_diagnostics
+test_soft_on_timeout_off_by_default_preserves_red
+test_workflow_testnet_shard_uses_soft_timeout_and_tight_budget
+test_sigterm_ignoring_probe_is_force_killed_and_soft_skipped
 
 echo ""
 echo "# Results: $PASS_COUNT/$TEST_COUNT passed, $FAIL_COUNT failed"

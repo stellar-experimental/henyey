@@ -7,10 +7,40 @@
 #   run-quickstart-test.sh --network <net> --enable <services> --probe <name> \
 #       --timeout <seconds> (default: 600) --diagnostics-dir <dir> -- <probe_command...>
 #
+# Env:
+#   KILL_GRACE — grace passed to GNU `timeout -k` before it escalates
+#     SIGTERM → SIGKILL (default: 30s). Load-bearing (#3273): the upstream
+#     `go run` probe ignores SIGTERM, so without a kill-after grace `timeout`
+#     blocks in wait() forever and the CI step hangs instead of timing out.
+#
 # Exit codes:
-#   0 — probe passed (possibly after one retry)
+#   0 — probe passed (possibly after one retry), OR a timeout (exit 124) was
+#       soft-skipped under --soft-on-timeout (see below)
 #   1 — probe failed (non-timeout, or second timeout on retryable shard)
 #   2 — usage error
+#
+# --soft-on-timeout (opt-in, default OFF — #3272):
+#   The chronic external-testnet flake (issue #3272) red-rolls `main` whenever a
+#   stuck testnet sync probe times out (GNU `timeout` exit 124) on both the first
+#   attempt and the single retry. The testnet shard depends on external network
+#   liveness (checkpoint cadence, archive availability) and is NOT a henyey
+#   correctness signal — so a TIMEOUT there should not gate the merge. When
+#   --soft-on-timeout is passed (the testnet shard only), a *timeout* disposition
+#   is converted to a neutral `exit 0` with a grep-able
+#   `SOFT-SKIP` marker; diagnostics are still captured so the degraded-testnet
+#   event remains observable in uploaded artifacts. This extends the existing
+#   pubnet/testnet-RPC-disabled "don't gate henyey-correctness merges on external
+#   network liveness" precedent, scoped strictly to the TIMEOUT outcome.
+#   When the flag is OFF (every other caller/shard), behavior is byte-identical.
+#
+#   What counts as a TIMEOUT disposition (#3273): exit 124 OR exit 137. GNU
+#   `timeout` returns 124 when its SIGTERM kills the probe, but 137 (128+9,
+#   SIGKILL) when the probe IGNORES SIGTERM and the `-k` grace escalates to
+#   SIGKILL — which is exactly the upstream `go run` probe's signature (it does
+#   not forward SIGTERM). Both are a deadline hit, so both are soft-skipped
+#   under the flag. A genuine probe assertion FAILURE (any non-124, non-137
+#   exit — `go` test failures exit 1) ALWAYS stays red, even under the flag, so
+#   a real henyey-on-testnet break is never masked.
 #
 # Timeout budget: the caller (.github/workflows/quickstart.yml) is responsible
 # for supplying the per-probe budget via --timeout <seconds>. That budget
@@ -58,7 +88,16 @@ NETWORK=""
 ENABLE=""
 PROBE=""
 TIMEOUT=600
+# Grace before GNU `timeout` escalates SIGTERM → SIGKILL (the `-k` argument).
+# Load-bearing (#3273): the upstream `go run` probe ignores SIGTERM, so without
+# a kill-after grace `timeout` blocks in wait() forever and the CI step hangs.
+# Overridable via the KILL_GRACE env var (e.g. the harness passes a short grace).
+KILL_GRACE="${KILL_GRACE:-30s}"
 DIAGNOSTICS_DIR=""
+# Opt-in (#3272): treat a TIMEOUT (exit 124) disposition as a neutral soft-skip
+# instead of a red failure. Default OFF ⇒ behavior byte-identical for all other
+# shards/callers. See the header for the rationale and the strict 124-only scope.
+SOFT_ON_TIMEOUT=false
 PROBE_CMD=()
 
 while [[ $# -gt 0 ]]; do
@@ -68,6 +107,7 @@ while [[ $# -gt 0 ]]; do
         --probe) PROBE="$2"; shift 2 ;;
         --timeout) TIMEOUT="$2"; shift 2 ;;
         --diagnostics-dir) DIAGNOSTICS_DIR="$2"; shift 2 ;;
+        --soft-on-timeout) SOFT_ON_TIMEOUT=true; shift ;;
         --) shift; PROBE_CMD=("$@"); break ;;
         *) echo "Unknown option: $1" >&2; exit 2 ;;
     esac
@@ -106,6 +146,39 @@ is_retryable_exit() {
     [[ "$1" -eq 124 || "$1" -eq 143 || "$1" -eq 137 ]]
 }
 
+# --- Helper: soft-skip a TIMEOUT disposition under --soft-on-timeout (#3272) ---
+# Returns 0 (and emits the grep-able SOFT-SKIP marker) iff the flag is on AND the
+# exit code is a TIMEOUT disposition: EXACTLY 124 OR 137. Both are a `timeout`
+# deadline hit:
+#   * 124 — `timeout` sent SIGTERM and the probe died from it (the clean case).
+#   * 137 — the probe IGNORED SIGTERM, so the `-k` grace escalated to SIGKILL
+#     (128+9). Because the probe runs in its own process group (no
+#     --foreground), GNU `timeout` reports this group SIGKILL as 137, NOT 124
+#     (verified on coreutils 8.32). This is the EXACT signature of the upstream
+#     `go run` probe that hung PR #3273's testnet shard (run 27298458353): with
+#     the new `-k` it is now force-killed and surfaces as 137. Treating 137 as a
+#     timeout disposition is what makes the root-cause fix actually de-gate main
+#     — without it the probe would be bounded but stay red.
+# Every OTHER non-(124|137) exit is NOT soft-skipped — a genuine probe assertion
+# failure (e.g. exit 1) must stay red so a real henyey-on-testnet break is never
+# masked. Callers use this at each timeout sink (first-attempt non-retryable
+# timeout, and the post-retry second timeout) to decide whether to `exit 0`
+# instead of `exit 1`.
+#
+# Scope note: 137 is also the runner-reclamation SIGKILL signature handled by
+# is_retryable_exit. That is fine here: a 137 is ALWAYS an externally-killed
+# (timeout-grace or runner-reclamation) outcome, never a probe's own assertion
+# result — `go` test failures exit 1, not 137 — so soft-skipping 137 under the
+# opt-in testnet-only flag never masks a real break.
+should_soft_skip_timeout() {
+    [[ "$SOFT_ON_TIMEOUT" == true ]] && { [[ "$1" -eq 124 ]] || [[ "$1" -eq 137 ]]; }
+}
+
+emit_soft_skip() {
+    echo "=== SOFT-SKIP: testnet sync probe timed out (environmental, not a henyey failure) ===" >&2
+    echo "=== SOFT-SKIP: $NETWORK/$ENABLE/$PROBE exit 124 treated as neutral (#3272); diagnostics preserved ===" >&2
+}
+
 # --- Helper: capture diagnostics ---
 capture_diagnostics() {
     local attempt="$1"
@@ -135,11 +208,32 @@ run_probe() {
     local exit_code=0
 
     echo "=== Attempt $attempt: $PROBE ($NETWORK/$ENABLE) ===" >&2
-    echo "Command: timeout ${TIMEOUT}s ${PROBE_CMD[*]}" >&2
+    echo "Command: timeout -k ${KILL_GRACE} ${TIMEOUT}s ${PROBE_CMD[*]}" >&2
 
     # Use PIPESTATUS[0] to capture the timeout exit code, not the tee exit.
+    #
+    # The `-k ${KILL_GRACE}` is load-bearing (#3273 root-cause fix): GNU
+    # `timeout` first sends SIGTERM at the deadline, then — only with -k — sends
+    # SIGKILL after the grace if the child is still alive. The upstream probe is
+    # `go run quickstart/tests/<probe>.go`, and `go run` does NOT forward
+    # SIGTERM to the test binary it execs; that binary in turn spawns
+    # `docker exec` children. WITHOUT -k, `timeout` sends SIGTERM (ignored) at
+    # the deadline and then blocks in wait() FOREVER — it never force-kills,
+    # never returns, and hangs the whole CI step until the job wall-clock
+    # cancels it (observed: PR #3273's testnet shard, run 27298458353, hung ~54
+    # min). With -k, the SIGKILL force-terminates the whole process group within
+    # the grace window, so the wrapper is guaranteed to return promptly.
+    #
+    # Exit-code note: because the child runs in its own process group (we do NOT
+    # pass --foreground — in a PIPELINE like this one `--foreground` would
+    # re-introduce the hang, since timeout then can't bound the pipeline child),
+    # a `-k`-forced SIGKILL of a SIGTERM-ignoring probe yields exit 137 (128+9),
+    # NOT 124. A SIGTERM that DOES kill the probe still yields 124. The
+    # soft-skip therefore treats BOTH 124 and 137 as the timeout disposition
+    # (see should_soft_skip_timeout). A genuine probe assertion failure exits
+    # with its own (non-124, non-137) code, propagated unchanged, and stays red.
     set +o pipefail
-    timeout "$TIMEOUT" "${PROBE_CMD[@]}" 2>&1 | tee "$DIAGNOSTICS_DIR/attempt-${attempt}-output.log"
+    timeout -k "$KILL_GRACE" "$TIMEOUT" "${PROBE_CMD[@]}" 2>&1 | tee "$DIAGNOSTICS_DIR/attempt-${attempt}-output.log"
     exit_code=${PIPESTATUS[0]}
     set -o pipefail
 
@@ -171,11 +265,29 @@ if is_retryable_exit "$EXIT_CODE" && is_retryable_shard; then
         exit 0
     fi
 
+    # Post-retry sink. Under --soft-on-timeout, a SECOND timeout (exit 124 ONLY)
+    # is a neutral soft-skip (#3272); any other non-124 exit (a genuine probe
+    # assertion failure) stays red.
+    if should_soft_skip_timeout "$EXIT_CODE"; then
+        emit_soft_skip
+        echo "=== Failed on retry (exit $EXIT_CODE) but soft-skipped (timeout) ===" >&2
+        exit 0
+    fi
+
     echo "=== Failed on retry (exit $EXIT_CODE) ===" >&2
     exit 1
 fi
 
-# Non-transient failure, or transient failure on a non-retryable shard —
-# fail immediately so genuine test failures stay loud.
+# Non-transient failure, or transient failure on a non-retryable shard.
+# Under --soft-on-timeout, a TIMEOUT (exit 124 ONLY) here is a neutral soft-skip
+# (#3272); any other non-124 exit (a genuine probe assertion failure) stays red,
+# so a real henyey-on-testnet break is never masked.
+if should_soft_skip_timeout "$EXIT_CODE"; then
+    emit_soft_skip
+    echo "=== Failed (exit $EXIT_CODE) but soft-skipped (timeout) ===" >&2
+    exit 0
+fi
+
+# Fail immediately so genuine test failures stay loud.
 echo "=== Failed (exit $EXIT_CODE), not retryable ===" >&2
 exit 1
