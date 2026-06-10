@@ -1225,6 +1225,39 @@ mod tests {
         assert!(!index.is_in_memory());
     }
 
+    /// A Disk index built via the config-aware builder must use the configured
+    /// page size (`config.page_size_bytes()`), not the hardcoded
+    /// `DEFAULT_PAGE_SIZE`. Mirrors stellar-core `getPageSizeFromConfig`.
+    #[test]
+    fn test_from_entries_honors_nondefault_page_size() {
+        let entries: Vec<(BucketEntry, u64)> = (0..10u8)
+            .map(|i| {
+                (
+                    BucketEntry::Liveentry(make_account_entry(i)),
+                    i as u64 * 100,
+                )
+            })
+            .collect();
+
+        // Non-default exponent 12 → 4096-byte pages, with cutoff_mb=0 so the
+        // builder selects a DiskIndex regardless of file size.
+        let config = BucketListDbConfig {
+            index_page_size_exponent: 12,
+            index_cutoff_mb: 0,
+            ..BucketListDbConfig::default()
+        };
+        assert_ne!(config.page_size_bytes(), DEFAULT_PAGE_SIZE);
+
+        let index = LiveBucketIndex::from_entries(entries.into_iter(), [0u8; 16], 1000, &config);
+        match index {
+            LiveBucketIndex::Disk(disk) => {
+                assert_eq!(disk.page_size(), config.page_size_bytes());
+                assert_eq!(disk.page_size(), 1 << 12);
+            }
+            LiveBucketIndex::InMemory(_) => panic!("expected Disk index with cutoff_mb=0"),
+        }
+    }
+
     #[test]
     fn test_asset_pool_id_map() {
         let mut map = AssetPoolIdMap::new();

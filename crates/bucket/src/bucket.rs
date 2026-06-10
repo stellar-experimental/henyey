@@ -435,7 +435,22 @@ impl Bucket {
     /// This is the preferred method for loading large bucket files (multi-GB)
     /// that would exceed available memory if loaded entirely.
     pub fn from_xdr_file_disk_backed(path: impl AsRef<Path>) -> Result<Self> {
-        let disk_bucket = DiskBucket::from_file_streaming(path)?;
+        Self::from_xdr_file_disk_backed_with_config(path, &BucketListDbConfig::default())
+    }
+
+    /// Create a DiskBacked bucket from an uncompressed XDR file, honoring the
+    /// supplied `BucketListDbConfig` for index page size and the
+    /// InMemory-vs-Disk cutoff.
+    ///
+    /// Behaves identically to [`Self::from_xdr_file_disk_backed`] under the
+    /// default config; a non-default `index_page_size_exponent` / `index_cutoff_mb`
+    /// changes only the resulting index layout (an internal lookup cache), never
+    /// the bucket content hash. Mirrors stellar-core `getPageSizeFromConfig`.
+    pub fn from_xdr_file_disk_backed_with_config(
+        path: impl AsRef<Path>,
+        config: &BucketListDbConfig,
+    ) -> Result<Self> {
+        let disk_bucket = DiskBucket::from_file_streaming_with_config(path, config)?;
         let hash = disk_bucket.hash();
 
         Ok(Self {

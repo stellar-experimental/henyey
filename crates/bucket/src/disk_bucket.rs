@@ -324,8 +324,18 @@ impl DiskBucket {
         Self::from_file_streaming_with_seed(path, DEFAULT_BLOOM_SEED)
     }
 
+    /// Create a disk bucket from an uncompressed XDR file using streaming I/O,
+    /// honoring the supplied `BucketListDbConfig` for index page size and the
+    /// InMemory-vs-Disk cutoff. Uses the default bloom seed.
+    pub fn from_file_streaming_with_config(
+        path: impl AsRef<Path>,
+        config: &BucketListDbConfig,
+    ) -> Result<Self> {
+        Self::from_file_streaming_with_seed_and_config(path, DEFAULT_BLOOM_SEED, config)
+    }
+
     /// Create a disk bucket from an uncompressed XDR file using streaming I/O
-    /// with a custom bloom filter seed.
+    /// with a custom bloom filter seed, using the default `BucketListDbConfig`.
     ///
     /// Uses the advanced `LiveBucketIndex`:
     /// - Small buckets (< 10K entries): `InMemoryIndex` (per-key O(log n) lookup)
@@ -333,6 +343,24 @@ impl DiskBucket {
     pub fn from_file_streaming_with_seed(
         path: impl AsRef<Path>,
         bloom_seed: HashSeed,
+    ) -> Result<Self> {
+        Self::from_file_streaming_with_seed_and_config(
+            path,
+            bloom_seed,
+            &BucketListDbConfig::default(),
+        )
+    }
+
+    /// Create a disk bucket from an uncompressed XDR file using streaming I/O
+    /// with a custom bloom filter seed and an explicit `BucketListDbConfig`.
+    ///
+    /// The configured `index_page_size_exponent` sizes DiskIndex pages and the
+    /// configured `index_cutoff_mb` selects between InMemory and Disk indexes —
+    /// mirroring stellar-core `getPageSizeFromConfig` / `LiveBucketIndex::getPageSize`.
+    pub fn from_file_streaming_with_seed_and_config(
+        path: impl AsRef<Path>,
+        bloom_seed: HashSeed,
+        config: &BucketListDbConfig,
     ) -> Result<Self> {
         let path = path.as_ref();
         let file_len = std::fs::metadata(path)?.len();
@@ -342,7 +370,7 @@ impl DiskBucket {
         // parsing entries for the index, eliminating the previous two-pass approach.
         let iter = StreamingXdrEntryIterator::with_hasher(path, file_len, true)?;
         let (live_index, iter) =
-            LiveBucketIndex::try_from_entries_default_with_iter(iter, bloom_seed, file_len)?;
+            LiveBucketIndex::try_from_entries_with_iter(iter, bloom_seed, file_len, config)?;
         if iter.position() != file_len {
             return Err(BucketError::Io(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,

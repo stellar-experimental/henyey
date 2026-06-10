@@ -48,7 +48,7 @@ use std::sync::{Arc, RwLock};
 use stellar_xdr::curr::{LedgerEntry, LedgerKey, Limits, WriteXdr};
 
 use henyey_common::fs_utils::durable_rename;
-use henyey_common::Hash256;
+use henyey_common::{BucketListDbConfig, Hash256};
 use henyey_crypto::RandomEvictionCache;
 
 use crate::bucket::Bucket;
@@ -95,6 +95,7 @@ pub(crate) fn promote_temp_to_canonical(
     dir: &Path,
     hash: &Hash256,
     label: &str,
+    config: &BucketListDbConfig,
 ) -> crate::Result<Bucket> {
     let permanent_path = dir.join(canonical_bucket_filename(hash));
     if !permanent_path.exists() {
@@ -108,9 +109,9 @@ pub(crate) fn promote_temp_to_canonical(
                 ),
             ))
         })?;
-        Bucket::from_xdr_file_disk_backed(&permanent_path)
+        Bucket::from_xdr_file_disk_backed_with_config(&permanent_path, config)
     } else {
-        match Bucket::from_xdr_file_disk_backed(&permanent_path) {
+        match Bucket::from_xdr_file_disk_backed_with_config(&permanent_path, config) {
             Ok(existing) if existing.hash() == *hash => {
                 let _ = std::fs::remove_file(temp_path);
                 Ok(existing)
@@ -128,7 +129,7 @@ pub(crate) fn promote_temp_to_canonical(
                         format!("{label}: failed to replace corrupt permanent file: {e}"),
                     ))
                 })?;
-                Bucket::from_xdr_file_disk_backed(&permanent_path)
+                Bucket::from_xdr_file_disk_backed_with_config(&permanent_path, config)
             }
             Err(load_err) => {
                 tracing::warn!(
@@ -142,7 +143,7 @@ pub(crate) fn promote_temp_to_canonical(
                         format!("{label}: failed to replace unreadable permanent file: {e}"),
                     ))
                 })?;
-                Bucket::from_xdr_file_disk_backed(&permanent_path)
+                Bucket::from_xdr_file_disk_backed_with_config(&permanent_path, config)
             }
         }
     }
@@ -187,8 +188,15 @@ pub struct BucketManager {
     /// Cache of loaded buckets, keyed by content hash.
     /// Uses random-two-choice eviction matching stellar-core's caching philosophy.
     cache: RwLock<RandomEvictionCache<Hash256, Arc<Bucket>>>,
-    /// Whether to persist/load disk indexes alongside bucket files.
-    persist_index: bool,
+    /// BucketListDB configuration governing index build/load behavior.
+    ///
+    /// Owns `persist_index` (whether to persist/load disk indexes alongside
+    /// bucket files), `index_page_size_exponent` (DiskIndex page size), and
+    /// `index_cutoff_mb` (InMemory-vs-Disk selection threshold). Stored whole so
+    /// every manager-internal build/load site reads the configured page size and
+    /// cutoff — mirroring stellar-core where `BucketManager` owns `Config` and
+    /// both `createIndex` and `loadIndex` read `bm.getConfig()`.
+    bucket_list_db: BucketListDbConfig,
     /// Tracks completed merges for deduplication/reattachment.
     finished_merges: RwLock<BucketMergeMap>,
 }
@@ -205,15 +213,29 @@ impl BucketManager {
     /// into memory without significant memory pressure.
     pub const DISK_BACKED_THRESHOLD: u64 = 10 * 1024 * 1024;
 
-    fn build(bucket_dir: PathBuf, max_cache_size: usize, persist_index: bool) -> Result<Self> {
+    fn build(
+        bucket_dir: PathBuf,
+        max_cache_size: usize,
+        bucket_list_db: BucketListDbConfig,
+    ) -> Result<Self> {
         std::fs::create_dir_all(&bucket_dir)?;
 
         Ok(Self {
             bucket_dir,
             cache: RwLock::new(RandomEvictionCache::new(max_cache_size)),
-            persist_index,
+            bucket_list_db,
             finished_merges: RwLock::new(BucketMergeMap::new()),
         })
+    }
+
+    /// Builds a `BucketListDbConfig` carrying only the given `persist_index`,
+    /// with all other knobs (page size, cutoff) left at their defaults. Used by
+    /// the back-compat `persist_index`-only constructors.
+    fn config_with_persist_index(persist_index: bool) -> BucketListDbConfig {
+        BucketListDbConfig {
+            persist_index,
+            ..BucketListDbConfig::default()
+        }
     }
 
     fn cached_bucket(&self, hash: &Hash256) -> Option<Arc<Bucket>> {
@@ -222,12 +244,20 @@ impl BucketManager {
 
     /// Create a new BucketManager with the given directory.
     pub fn new(bucket_dir: PathBuf) -> Result<Self> {
-        Self::build(bucket_dir, Self::DEFAULT_MAX_CACHE_SIZE, false)
+        Self::build(
+            bucket_dir,
+            Self::DEFAULT_MAX_CACHE_SIZE,
+            Self::config_with_persist_index(false),
+        )
     }
 
     /// Create a new BucketManager with a custom cache size.
     pub fn with_cache_size(bucket_dir: PathBuf, max_cache_size: usize) -> Result<Self> {
-        Self::build(bucket_dir, max_cache_size, false)
+        Self::build(
+            bucket_dir,
+            max_cache_size,
+            Self::config_with_persist_index(false),
+        )
     }
 
     /// Create a new BucketManager with index persistence enabled.
@@ -235,30 +265,62 @@ impl BucketManager {
     /// When `persist_index` is true, disk indexes are saved alongside bucket files
     /// and loaded on startup, avoiding expensive index rebuilds.
     pub fn with_persist_index(bucket_dir: PathBuf, persist_index: bool) -> Result<Self> {
-        Self::build(bucket_dir, Self::DEFAULT_MAX_CACHE_SIZE, persist_index)
+        Self::build(
+            bucket_dir,
+            Self::DEFAULT_MAX_CACHE_SIZE,
+            Self::config_with_persist_index(persist_index),
+        )
     }
 
     /// Create a new BucketManager with both a custom cache size and index
     /// persistence setting.
     ///
-    /// This is the constructor used by the main application startup path so the
-    /// operator-configured `persist_index` lever
-    /// (`config.buckets.bucket_list_db.persist_index`, default `true`) is
-    /// honored instead of being silently forced to `false`. When `persist_index`
-    /// is true, eligible disk indexes are saved alongside bucket files and
-    /// loaded on startup, avoiding expensive index rebuilds. Mirrors
-    /// stellar-core's `Config::BUCKETLIST_DB_PERSIST_INDEX` gating.
+    /// Back-compat shim retained for #3243 callers/tests: builds a
+    /// `BucketListDbConfig` carrying the requested `persist_index` with all other
+    /// index knobs (page size, cutoff) at their defaults, then delegates to
+    /// [`Self::with_cache_size_and_config`]. New callers that have a full
+    /// `BucketListDbConfig` should use [`Self::with_cache_size_and_config`].
     pub fn with_cache_size_and_persist_index(
         bucket_dir: PathBuf,
         max_cache_size: usize,
         persist_index: bool,
     ) -> Result<Self> {
-        Self::build(bucket_dir, max_cache_size, persist_index)
+        Self::build(
+            bucket_dir,
+            max_cache_size,
+            Self::config_with_persist_index(persist_index),
+        )
+    }
+
+    /// Create a new BucketManager with a custom cache size and the full
+    /// operator-configured `BucketListDbConfig`.
+    ///
+    /// This is the constructor used by the main application startup path so the
+    /// operator-configured BucketListDB levers are honored throughout the index
+    /// build and load paths:
+    /// - `persist_index` (default `true`) — persist/load `.index` files;
+    /// - `index_page_size_exponent` (default 14 → 16 KB pages) — DiskIndex page
+    ///   size used when building and when validating a persisted index;
+    /// - `index_cutoff_mb` (default 20 MB) — InMemory-vs-Disk selection cutoff.
+    ///
+    /// Mirrors stellar-core where `BucketManager` owns `Config` and both
+    /// `createIndex` and `loadIndex` read `bm.getConfig()`.
+    pub fn with_cache_size_and_config(
+        bucket_dir: PathBuf,
+        max_cache_size: usize,
+        bucket_list_db: &BucketListDbConfig,
+    ) -> Result<Self> {
+        Self::build(bucket_dir, max_cache_size, bucket_list_db.clone())
     }
 
     /// Returns whether index persistence is enabled.
     pub fn persist_index(&self) -> bool {
-        self.persist_index
+        self.bucket_list_db.persist_index
+    }
+
+    /// Returns the configured BucketListDB settings governing index build/load.
+    pub fn bucket_list_db_config(&self) -> &BucketListDbConfig {
+        &self.bucket_list_db
     }
 
     /// Returns a reference to the finished merges map.
@@ -378,10 +440,21 @@ impl BucketManager {
                 "Loading bucket as DiskBacked (file exceeds threshold)"
             );
 
+            // Gate the persisted-Disk-index load on the configured index cutoff:
+            // a file at or below `index_cutoff_bytes()` is served an InMemory
+            // index (no persisted Disk index applies), mirroring stellar-core's
+            // `LiveBucketIndex::getPageSize` returning 0 below the cutoff. Above
+            // the cutoff we validate any persisted index against the configured
+            // page size (parity with core's `loadIndex` rebuild-on-mismatch).
+            let above_cutoff = file_size >= self.bucket_list_db.index_cutoff_bytes();
+            let persisted = if above_cutoff {
+                self.try_load_index_for_bucket(hash, self.bucket_list_db.page_size_bytes())?
+            } else {
+                None
+            };
+
             // Try loading a persisted index first (skips both file-scanning passes)
-            if let Some(disk_index) =
-                self.try_load_index_for_bucket(hash, crate::index::DEFAULT_PAGE_SIZE)?
-            {
+            if let Some(disk_index) = persisted {
                 let entry_count = disk_index.counters().total() as usize;
                 let live_index = crate::index::LiveBucketIndex::Disk(disk_index);
                 tracing::debug!(
@@ -396,8 +469,11 @@ impl BucketManager {
                     live_index,
                 )?
             } else {
-                // No persisted index: do full streaming build (2-pass)
-                let bucket = Bucket::from_xdr_file_disk_backed(&xdr_path)?;
+                // No persisted index (or below cutoff): do full streaming build
+                // using the configured page size / cutoff so the resulting index
+                // honors operator config.
+                let bucket =
+                    Bucket::from_xdr_file_disk_backed_with_config(&xdr_path, &self.bucket_list_db)?;
 
                 // Save index for next time (only for DiskIndex, not InMemoryIndex)
                 if let Some(crate::index::LiveBucketIndex::Disk(ref disk_idx)) = bucket.live_index()
@@ -493,7 +569,8 @@ impl BucketManager {
             return Err(BucketError::NotFound(hash.to_hex()));
         }
 
-        let bucket = Bucket::from_xdr_file_disk_backed(&xdr_path)?;
+        let bucket =
+            Bucket::from_xdr_file_disk_backed_with_config(&xdr_path, &self.bucket_list_db)?;
         if bucket.hash() != *hash {
             return Err(BucketError::HashMismatch {
                 expected: hash.to_hex(),
@@ -588,8 +665,13 @@ impl BucketManager {
         }
 
         // Promote temp file to canonical path and load as disk-backed bucket
-        let bucket =
-            promote_temp_to_canonical(&temp_path, &self.bucket_dir, &hash, "BucketManager::merge")?;
+        let bucket = promote_temp_to_canonical(
+            &temp_path,
+            &self.bucket_dir,
+            &hash,
+            "BucketManager::merge",
+            &self.bucket_list_db,
+        )?;
 
         // Persist the index for next time (only for DiskIndex, not InMemoryIndex)
         if let Some(crate::index::LiveBucketIndex::Disk(ref disk_idx)) = bucket.live_index() {
@@ -634,7 +716,7 @@ impl BucketManager {
         hash: &Hash256,
         index: &crate::index::DiskIndex,
     ) -> Result<()> {
-        if !self.persist_index {
+        if !self.bucket_list_db.persist_index {
             return Ok(());
         }
         let bucket_path = self.bucket_path(hash);
@@ -656,7 +738,7 @@ impl BucketManager {
         hash: &Hash256,
         expected_page_size: u64,
     ) -> Result<Option<crate::index::DiskIndex>> {
-        if !self.persist_index {
+        if !self.bucket_list_db.persist_index {
             return Ok(None);
         }
         let bucket_path = self.bucket_path(hash);
@@ -712,7 +794,7 @@ impl BucketManager {
         let xdr_path = self.bucket_path(hash);
         if xdr_path.exists() {
             // Delete associated index file
-            if self.persist_index {
+            if self.bucket_list_db.persist_index {
                 let _ = crate::index_persistence::delete_index(&xdr_path);
             }
             std::fs::remove_file(&xdr_path)?;
@@ -769,7 +851,7 @@ impl BucketManager {
         }
 
         // Clean up any orphaned index files
-        if self.persist_index {
+        if self.bucket_list_db.persist_index {
             let _ = crate::index_persistence::cleanup_orphaned_indexes(&self.bucket_dir);
         }
 
@@ -2681,5 +2763,205 @@ mod tests {
         manager.delete_bucket(&hash).unwrap();
         assert_eq!(manager.cache_size(), 0);
         assert!(!manager.bucket_exists(&hash));
+    }
+
+    // ===================================================================
+    // #3242: configured BucketListDB page size / index cutoff threading
+    // ===================================================================
+
+    /// Build a contract-data `BucketEntry` carrying a large `ScVal::Bytes`
+    /// payload so that a modest number of entries produces a multi-MB bucket
+    /// file. Each entry has a unique key so the index is well-formed.
+    fn make_large_contract_data_entry(key: u32, payload_len: usize) -> BucketEntry {
+        let payload = vec![(key & 0xff) as u8; payload_len];
+        BucketEntry::Liveentry(LedgerEntry {
+            last_modified_ledger_seq: 1,
+            data: LedgerEntryData::ContractData(ContractDataEntry {
+                ext: ExtensionPoint::V0,
+                contract: ScAddress::Contract(ContractId(Hash([7u8; 32]))),
+                key: ScVal::U32(key),
+                durability: ContractDataDurability::Persistent,
+                val: ScVal::Bytes(payload.try_into().unwrap()),
+            }),
+            ext: LedgerEntryExt::V0,
+        })
+    }
+
+    /// Create a bucket whose on-disk `.bucket.xdr` exceeds the given size in
+    /// bytes, via `manager.create_bucket`. Returns the bucket hash and the
+    /// final file size. ~64 KB payload per entry keeps the entry count low.
+    fn create_bucket_larger_than(manager: &BucketManager, min_bytes: u64) -> (Hash256, u64) {
+        let payload_len = 64 * 1024;
+        let per_entry = payload_len as u64 + 256; // payload + XDR overhead estimate
+        let count = (min_bytes / per_entry + 2) as u32;
+        let entries: Vec<BucketEntry> = (0..count)
+            .map(|i| make_large_contract_data_entry(i, payload_len))
+            .collect();
+        let bucket = manager.create_bucket(entries).unwrap();
+        let hash = bucket.hash();
+        // Drop the in-memory bucket from cache so subsequent loads re-read disk.
+        manager.clear_cache();
+        let file_size = std::fs::metadata(manager.bucket_path(&hash)).unwrap().len();
+        assert!(
+            file_size > min_bytes,
+            "bucket file {file_size} must exceed {min_bytes}"
+        );
+        (hash, file_size)
+    }
+
+    /// `with_cache_size_and_config` must thread the configured page size into
+    /// the streaming build path: loading a >10 MB bucket yields a Disk index
+    /// whose `page_size()` matches the configured value, not `DEFAULT_PAGE_SIZE`.
+    #[test]
+    fn test_with_cache_size_and_config_threads_page_size() {
+        let temp_dir = TempDir::new().unwrap();
+
+        // Non-default page-size exponent 13 → 8192-byte pages. Cutoff lowered to
+        // 1 MB so the >10 MB file selects a Disk index.
+        let config = BucketListDbConfig {
+            index_page_size_exponent: 13,
+            index_cutoff_mb: 1,
+            persist_index: false, // force the streaming build path
+            ..BucketListDbConfig::default()
+        };
+        assert_ne!(config.page_size_bytes(), crate::index::DEFAULT_PAGE_SIZE);
+
+        let manager =
+            BucketManager::with_cache_size_and_config(temp_dir.path().to_path_buf(), 10, &config)
+                .unwrap();
+
+        let (hash, _) =
+            create_bucket_larger_than(&manager, BucketManager::DISK_BACKED_THRESHOLD + 1);
+
+        let bucket = manager.load_bucket(&hash).unwrap();
+        match bucket.live_index() {
+            Some(crate::index::LiveBucketIndex::Disk(disk)) => {
+                assert_eq!(disk.page_size(), config.page_size_bytes());
+                assert_eq!(disk.page_size(), 1 << 13);
+            }
+            other => panic!(
+                "expected Disk index, got {:?}",
+                other.map(|i| i.is_in_memory())
+            ),
+        }
+    }
+
+    /// A persisted Disk index built under page-size A must be rejected and
+    /// rebuilt when a manager configured with page-size B loads the bucket.
+    /// Mirrors stellar-core `loadIndex` rebuild-on-config-change.
+    #[test]
+    fn test_load_bucket_rebuilds_index_on_page_size_change() {
+        let temp_dir = TempDir::new().unwrap();
+
+        // Manager A: exponent 13 (8192-byte pages), persistence on, low cutoff.
+        let config_a = BucketListDbConfig {
+            index_page_size_exponent: 13,
+            index_cutoff_mb: 1,
+            persist_index: true,
+            ..BucketListDbConfig::default()
+        };
+        let manager_a =
+            BucketManager::with_cache_size_and_config(temp_dir.path().to_path_buf(), 10, &config_a)
+                .unwrap();
+
+        let (hash, _) =
+            create_bucket_larger_than(&manager_a, BucketManager::DISK_BACKED_THRESHOLD + 1);
+
+        // First load under A builds + persists a Disk index with 8192-byte pages.
+        let bucket_a = manager_a.load_bucket(&hash).unwrap();
+        match bucket_a.live_index() {
+            Some(crate::index::LiveBucketIndex::Disk(disk)) => {
+                assert_eq!(disk.page_size(), 1 << 13);
+            }
+            _ => panic!("expected Disk index under config A"),
+        }
+        // Verify the index file was persisted.
+        let index_path =
+            crate::index_persistence::index_path_for_bucket(&manager_a.bucket_path(&hash));
+        assert!(index_path.exists(), "index should be persisted under A");
+
+        // Manager B: exponent 14 (16384-byte pages) over the same directory.
+        let config_b = BucketListDbConfig {
+            index_page_size_exponent: 14,
+            index_cutoff_mb: 1,
+            persist_index: true,
+            ..BucketListDbConfig::default()
+        };
+        let manager_b =
+            BucketManager::with_cache_size_and_config(temp_dir.path().to_path_buf(), 10, &config_b)
+                .unwrap();
+
+        // Load under B: the persisted A index (8192) must be rejected by the
+        // page-size validation and the index rebuilt at B's page size (16384).
+        let bucket_b = manager_b.load_bucket(&hash).unwrap();
+        match bucket_b.live_index() {
+            Some(crate::index::LiveBucketIndex::Disk(disk)) => {
+                assert_eq!(
+                    disk.page_size(),
+                    1 << 14,
+                    "persisted A index must be rebuilt at B's page size"
+                );
+            }
+            _ => panic!("expected Disk index under config B"),
+        }
+        assert_eq!(bucket_b.hash(), hash, "bucket content hash unchanged");
+    }
+
+    /// With `index_cutoff_mb` raised above the file size, a >10 MB bucket loads
+    /// as an InMemory index (not Disk) — exercising the cutoff gate in
+    /// `load_bucket`. Mirrors stellar-core `getPageSize` returning 0 below cutoff.
+    #[test]
+    fn test_load_bucket_respects_configured_cutoff() {
+        let temp_dir = TempDir::new().unwrap();
+
+        // Build the bucket first with a tiny-cutoff manager so we know its size.
+        let build_config = BucketListDbConfig {
+            index_cutoff_mb: 1,
+            persist_index: true,
+            ..BucketListDbConfig::default()
+        };
+        let manager_build = BucketManager::with_cache_size_and_config(
+            temp_dir.path().to_path_buf(),
+            10,
+            &build_config,
+        )
+        .unwrap();
+        let (hash, file_size) =
+            create_bucket_larger_than(&manager_build, BucketManager::DISK_BACKED_THRESHOLD + 1);
+
+        // Persist a Disk index for the bucket (so a stale Disk index exists).
+        let disk_loaded = manager_build.load_bucket(&hash).unwrap();
+        assert!(matches!(
+            disk_loaded.live_index(),
+            Some(crate::index::LiveBucketIndex::Disk(_))
+        ));
+        manager_build.clear_cache();
+
+        // Now load with a cutoff ABOVE the file size: the file is below cutoff,
+        // so the persisted Disk index must NOT be served — an InMemory index is
+        // built instead.
+        let cutoff_mb = (file_size / (1024 * 1024)) as usize + 5;
+        let above_config = BucketListDbConfig {
+            index_cutoff_mb: cutoff_mb,
+            persist_index: true,
+            ..BucketListDbConfig::default()
+        };
+        assert!(file_size < above_config.index_cutoff_bytes());
+        let manager_above = BucketManager::with_cache_size_and_config(
+            temp_dir.path().to_path_buf(),
+            10,
+            &above_config,
+        )
+        .unwrap();
+
+        let bucket = manager_above.load_bucket(&hash).unwrap();
+        assert!(
+            matches!(
+                bucket.live_index(),
+                Some(crate::index::LiveBucketIndex::InMemory(_))
+            ),
+            "below-cutoff file must load as InMemory, not a stale Disk index"
+        );
+        assert_eq!(bucket.hash(), hash, "bucket content hash unchanged");
     }
 }
