@@ -1199,7 +1199,16 @@ impl App {
                     // Check quorum status - use latest_ext if available since we have
                     // actual SCP messages for that slot, otherwise fall back to tracking_slot
                     let quorum_check_slot = if latest_ext > 0 { latest_ext } else { tracking_slot };
-                    let heard_from_quorum = self.herder.heard_from_quorum(quorum_check_slot);
+                    // heard_from_quorum reports the SCP ballot protocol's per-slot
+                    // flag (parity with stellar-core's BallotProtocol::mHeardFromQuorum:
+                    // includes the local node, and is set for slots the node only
+                    // *followed* via a quorum of EXTERNALIZE). The henyey-only
+                    // SlotQuorumTracker never records the local node and only reaches a
+                    // v-blocking subset for an already-externalized followed slot, so
+                    // it gets stuck false after a restart while the qset is healthy
+                    // (#3250). The tracker is still the source for is_v_blocking /
+                    // out-of-sync recovery accounting (#1874).
+                    let heard_from_quorum = self.herder.scp_heard_from_quorum(quorum_check_slot);
                     let is_v_blocking = self.herder.is_v_blocking(quorum_check_slot);
 
                     let scp_sent = self.scp_messages_sent.load(Ordering::Relaxed);
@@ -1231,12 +1240,18 @@ impl App {
                     );
                     scp_messages_last_heartbeat = scp_messages_received;
 
-                    // Warn if we haven't heard from quorum for a while
-                    if self.is_validator && !heard_from_quorum && peers > 0 {
+                    // Warn if we are not even hearing from a v-blocking set, which
+                    // is the real partition signal. stellar-core keys partition /
+                    // recovery off v-blocking, never off heardFromQuorum — a node
+                    // that is v-blocking is demonstrably hearing from its quorum at
+                    // the ballot level, so gating this WARN on !heard_from_quorum
+                    // produced a false "network partition" warning every heartbeat
+                    // after a restart (#3250). Gate on !is_v_blocking instead.
+                    if self.is_validator && !is_v_blocking && peers > 0 {
                         tracing::warn!(
                             tracking_slot,
-                            is_v_blocking,
-                            "Have not heard from quorum - may be experiencing network partition"
+                            heard_from_quorum,
+                            "Have not heard from a v-blocking set - may be experiencing network partition"
                         );
                     }
 
@@ -1284,10 +1299,14 @@ impl App {
                     }
 
                     // Out-of-sync recovery: purge old slots when we're too far behind.
-                    // This mirrors stellar-core's outOfSyncRecovery() behavior.
-                    // When we have v-blocking slots that are >100 ahead of older slots,
-                    // purge the old slots to free memory and allow recovery.
-                    if !self.herder.state().can_receive_scp() || !heard_from_quorum {
+                    // This mirrors stellar-core's outOfSyncRecovery() behavior, which
+                    // keys off gotVBlocking (HerderImpl.cpp:521) — never off
+                    // heardFromQuorum. out_of_sync_recovery() itself early-returns
+                    // when Tracking and otherwise scans v-blocking slots. Gating the
+                    // call on !heard_from_quorum (the previously-stuck tracker flag)
+                    // spuriously triggered recovery on a healthy node after a restart
+                    // (#3250); drop that disjunct to match core.
+                    if !self.herder.state().can_receive_scp() {
                         if let Some(purge_slot) = self.herder.out_of_sync_recovery() {
                             tracing::info!(
                                 purge_slot,
