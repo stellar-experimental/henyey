@@ -7261,6 +7261,157 @@ mod tests {
         );
     }
 
+    /// Guard test for #3252 (WAD verdict): a post-restart node that *follows* a
+    /// quorum EXTERNALIZE for slot N — without nominating it itself — resumes its
+    /// OWN nomination for slot N+1 the moment its LCL catches up to N.
+    ///
+    /// This locks the second half of the follow → resume-nomination path that
+    /// `test_externalize_transitions_syncing_to_tracking` leaves unproven (it
+    /// asserts only follow → Tracking, not the resume of nomination). The #3252
+    /// investigation established (verdict (a)) that there is NO follow-only mode:
+    /// following and own-balloting share one tracking state, and
+    /// `trigger_next_ledger` has no followed-vs-nominated gate (only
+    /// `is_tracking()`, the `is_nominating` idempotency skip, and
+    /// `lcl_matches_slot`). This is parity-exact with stellar-core
+    /// (`HerderImpl::triggerNextLedger` gate `isTracking() && isSynced() &&
+    /// !isApplying()`), so the test PASSES today; it would only FAIL if a future
+    /// change severed the resume path (e.g. added a spurious follow-only gate).
+    ///
+    /// Drives the LIVE follow path `receive_scp_envelope` → `Slot::process_envelope`
+    /// → `advance_slot` (NOT the restore-only `set_state_from_envelope`).
+    #[test]
+    fn test_following_externalize_resumes_own_nomination_for_next_slot() {
+        let local_secret = SecretKey::from_seed(&[7u8; 32]);
+        let local_public = local_secret.public_key();
+        let local_node_id = node_id_from_public_key(&local_public);
+
+        let remote_secret = SecretKey::from_seed(&[1u8; 32]);
+        let remote_public = remote_secret.public_key();
+        let remote_node_id = node_id_from_public_key(&remote_public);
+
+        // 2-of-2 quorum (local + one remote): a single remote EXTERNALIZE that the
+        // local node follows is enough to externalize the slot via SCP.
+        let quorum_set = ScpQuorumSet {
+            threshold: 2,
+            validators: vec![local_node_id.clone(), remote_node_id.clone()]
+                .try_into()
+                .unwrap(),
+            inner_sets: vec![].try_into().unwrap(),
+        };
+
+        let config = HerderConfig {
+            is_validator: true,
+            node_public_key: local_public,
+            local_quorum_set: Some(quorum_set.clone()),
+            ..HerderConfig::default()
+        };
+
+        // LM starts at seq 0 (LCL = 0): the same starting state as the proven
+        // #3250 follow tests, so the followed value validates against local state.
+        let lm = make_default_lm();
+        let herder = Herder::with_secret_key(
+            config,
+            SecretKey::from_seed(&[7u8; 32]),
+            lm.clone(),
+            TimerManagerHandle::no_op(),
+        );
+
+        // Come up out-of-sync after a restart, then restore tracking to slot N
+        // (bootstrap(0) sets tracking = 0+1 = 1, so the node tracks slot N = 1).
+        herder.start_syncing();
+        herder.bootstrap(0);
+
+        herder
+            .quorum_tracker
+            .write()
+            .expand(&remote_node_id, quorum_set)
+            .unwrap();
+
+        let follow_slot = herder.tracking_slot().get(); // N == 1
+        assert_eq!(
+            follow_slot, 1,
+            "node should be tracking slot N == 1 before following"
+        );
+
+        // --- FOLLOW: receive a remote EXTERNALIZE for slot N and follow it ---
+        // (live path: receive_scp_envelope → Slot::process_envelope → advance_slot,
+        // NOT set_state_from_envelope, which is restore-only). The node does not
+        // nominate this slot — it free-rides the quorum, mirroring the
+        // post-restart follower in #3250.
+        let env = make_signed_externalize_from(follow_slot, &herder, &remote_secret);
+        assert_eq!(herder.receive_scp_envelope(env), EnvelopeState::Valid);
+
+        // Sanity: the slot externalized via SCP and tracking advanced to N+1.
+        assert!(
+            herder.scp().is_slot_externalized(follow_slot),
+            "followed slot must externalize via SCP"
+        );
+        assert!(
+            herder.is_tracking(),
+            "node must be Tracking after following EXTERNALIZE"
+        );
+        assert_eq!(
+            herder.tracking_slot().get(),
+            follow_slot + 1,
+            "tracking must advance to N+1 after following the EXTERNALIZE"
+        );
+
+        // --- APPLY: advance LCL to N. In production the followed ledger N is
+        // applied by the ledger-close pipeline, bringing LCL to N; here we
+        // model that directly so `lcl_matches_slot(N+1)` (LCL+1 == slot) holds.
+        // Without this, trigger_next_ledger(N+1) would correctly SkippedStale
+        // because LCL is still N-1 (= 0) — the followed slot is not yet applied.
+        {
+            let mut header = lm.current_header();
+            header.ledger_seq = follow_slot as u32; // N
+            let header_hash = henyey_ledger::compute_header_hash(&header).expect("hash");
+            lm.set_header_for_test(header, header_hash);
+        }
+        assert_eq!(
+            lm.current_ledger_seq() as u64,
+            follow_slot,
+            "LCL must be at N after applying the followed ledger"
+        );
+
+        // The next slot N+1 has NOT yet been nominated by us — we only followed
+        // N. This is the precondition the resume path must clear.
+        assert!(
+            herder
+                .scp()
+                .get_slot_state(follow_slot + 1)
+                .map_or(true, |s| !s.is_nominating),
+            "slot N+1 must not be nominating before trigger_next_ledger"
+        );
+
+        // --- RESUME: with LCL == N, trigger the next ledger (N+1). The WAD
+        // verdict says this MUST nominate — there is no follow-only gate. ---
+        let next_slot = follow_slot + 1; // N+1
+        let outcome = herder
+            .trigger_next_ledger(next_slot as u32)
+            .expect("trigger_next_ledger must not error after following");
+
+        assert_eq!(
+            outcome,
+            TriggerOutcome::Triggered,
+            "a node that FOLLOWED slot N must resume its OWN nomination for N+1 \
+             (WAD verdict (a) for #3252) — got {:?}",
+            outcome
+        );
+
+        // And the SCP slot N+1 is now actively nominating: the node re-engaged
+        // consensus by itself, not merely by following.
+        let state = herder
+            .scp()
+            .get_slot_state(next_slot)
+            .expect("slot N+1 must have SCP state after trigger");
+        assert!(
+            state.is_nominating,
+            "slot N+1 must be in nominating state after the follower resumes \
+             (the resume half left unproven by \
+             test_externalize_transitions_syncing_to_tracking)"
+        );
+    }
+
     /// Regression test for #3250: a node that *follows* a quorum of EXTERNALIZE
     /// for slot N (without nominating, as after a restart) reports
     /// `scp_heard_from_quorum(N) == true` (the parity-faithful SCP ballot flag,
