@@ -46,6 +46,16 @@ _DEPLOY_QUARANTINE_LOADED=1
 #                         40-hex fix SHA when the entry carried a valid,
 #                         token-boundary-anchored `resolved:<sha>`, or "-" when
 #                         it did not. The two globals are index-aligned.
+#   QUARANTINE_REASONS  - Newline-separated reason text (everything after the
+#                         SHA on the entry's line), ONE PER ENTRY in the SAME
+#                         order as QUARANTINE_ENTRIES — index-aligned with both
+#                         QUARANTINE_ENTRIES and QUARANTINE_RESOLVED. A bare-SHA
+#                         entry (no reason) contributes an EMPTY line so the
+#                         lockstep three-FD read in quarantine_autostamp never
+#                         skews. Reasons are single-line by construction
+#                         (quarantine_append strips \n\t\r), so newline-joining
+#                         is lossless. Used by quarantine_autostamp to recover
+#                         the recorded crash issue # (`regression #N`, #3258).
 #   QUARANTINE_WARNINGS - Comma-space-separated warning messages
 #
 # Returns:
@@ -56,6 +66,7 @@ parse_quarantine_file() {
   local file="$1"
   QUARANTINE_ENTRIES=""
   QUARANTINE_RESOLVED=""
+  QUARANTINE_REASONS=""
   QUARANTINE_WARNINGS=""
 
   # Missing or empty file: clear, no warnings
@@ -111,9 +122,11 @@ parse_quarantine_file() {
       if [[ -n "$QUARANTINE_ENTRIES" ]]; then
         QUARANTINE_ENTRIES+=$'\n'"$sha"
         QUARANTINE_RESOLVED+=$'\n'"$resolved"
+        QUARANTINE_REASONS+=$'\n'"$_rest"
       else
         QUARANTINE_ENTRIES="$sha"
         QUARANTINE_RESOLVED="$resolved"
+        QUARANTINE_REASONS="$_rest"
       fi
     else
       local warning="malformed: ${sha:0:12}"
@@ -606,6 +619,152 @@ quarantine_resolve() {
     rm -f "$tmpfile" 2>/dev/null
     return 2
   fi
+
+  return 0
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# _quarantine_issue_in_reason REASON
+#
+# Read-only, pure (no subprocess). Echoes the FIRST GitHub issue number `#N`
+# found in REASON, or nothing if there is none. The crash issue # is recorded
+# by monitor-tick §3d as `regression #<issue>` in the entry's reason; #3260's
+# parser preserves arbitrary reason text. The parse EXCLUDES any `resolved:`
+# token span first (Critic A on #3258): a `resolved:<40-hex>` token contains no
+# `#`, so a hex digit-run can never be mis-read as an issue#, but we strip the
+# token span explicitly so the contract holds even if the token convention
+# changes. A single grep (no `=~` capture array, so the extraction is identical
+# under bash and zsh — zsh populates `$match`, not `$BASH_REMATCH`).
+# ─────────────────────────────────────────────────────────────────────────────
+_quarantine_issue_in_reason() {
+  local reason="$1"
+  # Excise any resolved:<40-hex> token span (boundary-anchored), so we never
+  # scan inside it for a `#N`. Replace with a space to keep word boundaries.
+  reason="$(printf '%s' " $reason " | sed -E 's/[[:space:]]resolved:[0-9a-f]{40}([[:space:]])/ \1/g')"
+  # First `#<digits>` occurrence. `grep -oE` + head emits just the matched
+  # token; strip the leading `#`. `|| true` keeps a no-match (grep rc=1) from
+  # tripping a caller's set -e/pipefail.
+  local tok
+  tok="$(printf '%s' "$reason" | grep -oE '#[0-9]+' | head -n1 || true)"
+  [[ -n "$tok" ]] && printf '%s' "${tok#\#}"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# _quarantine_fix_sha_for_issue ISSUE_NUMBER
+#
+# gh subprocess (best-effort, read-only). Resolves the merge-commit SHA of the
+# MERGED PR that closed ISSUE_NUMBER, via GitHub's STRUCTURED linkage — NOT
+# free-text commit-message scanning:
+#   1. `gh issue view N --json closedByPullRequestsReferences` → the PR numbers
+#      GitHub authoritatively records as closing issue N (issue-scoped: immune
+#      to any global PR-list recency window — Critic A on #3258).
+#   2. For each such PR, `gh pr view P --json state,mergeCommit` and take
+#      `.mergeCommit.oid` ONLY when `.state == "MERGED"` (an open/draft PR has
+#      a null mergeCommit and must never stamp — fail-safe).
+# Echoes the first valid 40-hex merge SHA found, or nothing. Any `gh`/network/
+# parse failure → echoes nothing (caller skips → no stamp → #3260's gate
+# governs). The `--jq` shapes here are EXACTLY what the production code consumes
+# and what the snippet-test `gh` mock must mirror (Critic A).
+# ─────────────────────────────────────────────────────────────────────────────
+_quarantine_fix_sha_for_issue() {
+  local issue="$1"
+  local repo="${QUARANTINE_GH_REPO:-stellar-experimental/henyey}"
+  local prs pr sha
+
+  # Issue-side linkage: the PR numbers that close this issue (one per line).
+  prs="$(gh issue view "$issue" --repo "$repo" \
+           --json closedByPullRequestsReferences \
+           --jq '.closedByPullRequestsReferences[]?.number' 2>/dev/null)" || return 0
+  [[ -z "$prs" ]] && return 0
+
+  while IFS= read -r pr; do
+    [[ -z "$pr" ]] && continue
+    # Merge SHA, ONLY when the PR is MERGED (else --jq emits nothing).
+    sha="$(gh pr view "$pr" --repo "$repo" \
+             --json state,mergeCommit \
+             --jq 'select(.state=="MERGED") | .mergeCommit.oid' 2>/dev/null)" || continue
+    if [[ "$sha" =~ ^[0-9a-f]{40}$ ]]; then
+      printf '%s' "$sha"
+      return 0
+    fi
+  done <<< "$prs"
+
+  return 0
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# quarantine_autostamp QUARANTINE_FILE
+#
+# Best-effort, full-autonomy auto-stamping (#3258). For each entry NOT already
+# carrying a `resolved:` token, follow GitHub's structured linkage to the
+# merge-commit SHA of the MERGED PR that closed the entry's recorded crash
+# issue (`regression #N`, written by monitor-tick §3d), and stamp it via the
+# existing #3260 `quarantine_resolve`.
+#
+# This function is WRITE-ONLY and STRICTLY MONOTONIC: it can only ADD a
+# `resolved:` token (delegating to quarantine_resolve, which is atomic tmp+mv,
+# idempotent, and self-resolution-guarded). It NEVER removes or weakens an
+# entry, and it contains NO clear logic. The SOLE clear authority remains
+# `check_quarantine_active` (#3260), which independently re-gates every stamp
+# with `git merge-base --is-ancestor <resolved> origin/main`. Therefore a
+# wrong / unmerged / premature stamp is still BLOCKED by that ancestor gate,
+# and a missing stamp leaves the per-hunk content-check in charge — a
+# catastrophic auto-clear of a still-harmful tree is unreachable by
+# construction. `check_quarantine_active` is intentionally NOT modified.
+#
+# FAIL-OPEN toward NOT-stamping: a missing/unparseable issue #, no closing PR,
+# an open (non-MERGED) PR, a self-resolution, or ANY gh/network/parse error
+# all skip that entry (leave it un-stamped). The function never aborts the tick.
+#
+# Call this ONCE PER TICK, BEFORE check_quarantine_active.
+#
+# Arguments:
+#   QUARANTINE_FILE - Path to deploy_quarantine.txt
+#
+# Env (optional):
+#   QUARANTINE_GH_REPO - owner/name for gh queries (default
+#                        stellar-experimental/henyey)
+#
+# Returns:
+#   0 — always (best-effort; per-entry failures are silently skipped). Never
+#       aborts; never propagates a gh/parse error.
+# ─────────────────────────────────────────────────────────────────────────────
+quarantine_autostamp() {
+  local file="$1"
+
+  # Missing/empty/unreadable file: nothing to stamp. (check_quarantine_active
+  # independently handles the unreadable case as fail-closed BLOCK.)
+  [[ -e "$file" && -s "$file" && -r "$file" ]] || return 0
+
+  parse_quarantine_file "$file" || return 0
+  [[ -z "$QUARANTINE_ENTRIES" ]] && return 0
+
+  # Iterate the three index-aligned globals in lockstep over three FDs. The
+  # `read <&3 && read <&4 && read <&5` pattern advances all streams one line
+  # per loop and behaves identically under bash and zsh (#3256).
+  local sha resolved reason issue fix_sha
+  while IFS= read -r sha <&3 && IFS= read -r resolved <&4 && IFS= read -r reason <&5; do
+    [[ -z "$sha" ]] && continue
+    # Already stamped → leave untouched, do NOT query gh (idempotent + cheap).
+    [[ "$resolved" != "-" ]] && continue
+
+    # Recover the crash issue # from the reason. No `#N` → skip (the gate's
+    # per-hunk content-check governs this entry).
+    issue="$(_quarantine_issue_in_reason "$reason")"
+    [[ -z "$issue" ]] && continue
+
+    # Resolve the merged fix SHA via structured GitHub linkage (best-effort).
+    fix_sha="$(_quarantine_fix_sha_for_issue "$issue")"
+    # No merged closing PR, open PR, or any gh error → skip (no stamp).
+    [[ "$fix_sha" =~ ^[0-9a-f]{40}$ ]] || continue
+    # Self-resolution guard (also enforced by quarantine_resolve): a commit
+    # cannot resolve itself. Skip rather than let quarantine_resolve reject.
+    [[ "$fix_sha" == "$sha" ]] && continue
+
+    # WRITE-ONLY stamp. Any rc from quarantine_resolve is non-fatal here —
+    # best-effort; the gate still governs. `|| true` keeps set -e happy.
+    quarantine_resolve "$file" "$sha" "$fix_sha" || true
+  done 3<<< "$QUARANTINE_ENTRIES" 4<<< "$QUARANTINE_RESOLVED" 5<<< "$QUARANTINE_REASONS"
 
   return 0
 }

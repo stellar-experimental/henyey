@@ -70,7 +70,7 @@ expected_funcs_for() {
     dedup-filing.sh)
       echo "dedup_load dedup_prune dedup_check dedup_record dedup_remove dedup_update_field dedup_write" ;;
     deploy-quarantine.sh)
-      echo "parse_quarantine_file check_quarantine_active check_quarantine_ancestry quarantine_append quarantine_remove quarantine_resolve" ;;
+      echo "parse_quarantine_file check_quarantine_active check_quarantine_ancestry quarantine_append quarantine_remove quarantine_resolve quarantine_autostamp" ;;
     monitor-decisions.sh)
       echo "check_session_wiped check_long_stale_session detect_crash_state cleanup_guard" ;;
     review-pr-merge.sh)
@@ -297,6 +297,54 @@ if [[ "$HAVE_ZSH" -eq 1 ]]; then
   assert_merge_flags_separated zsh zsh
 else
   skip "merge-flag-separation[zsh]: --squash and --admin arrive as distinct args" "zsh not installed"
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Assertion group 5.5: quarantine-autostamp-roundtrip-both-shells (#3258).
+#   quarantine_autostamp parses the crash issue # from an entry's reason,
+#   queries gh for the merged closing PR's merge SHA, and stamps resolved:<sha>
+#   via quarantine_resolve. Its inner loop reads THREE index-aligned globals in
+#   lockstep over FDs 3/4/5 — the highest cross-shell risk in the new code.
+#   This roundtrip mocks `gh` (so no network), runs autostamp under each shell
+#   from a foreign cwd, and asserts the resolved token was stamped onto the
+#   entry. The gh mock mirrors the real --jq shapes: issue-view emits the PR #,
+#   pr-view emits the 40-hex merge SHA only when state==MERGED.
+# ─────────────────────────────────────────────────────────────────────────────
+assert_autostamp_roundtrip() {
+  local shbin="$1" shname="$2"
+  local qfile="$SCRATCH/autostamp-$shname.txt"
+  local bad="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  local fix="bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+  printf '%s regression #4242\n' "$bad" > "$qfile"
+  # Mock gh: issue view → PR number; pr view → merge SHA (state==MERGED).
+  local code="
+    source '$LIB_DIR/deploy-quarantine.sh' || exit 3;
+    gh() {
+      case \"\$1\" in
+        issue) printf '%s\n' 707 ;;
+        pr) printf '%s\n' '$fix' ;;
+        *) return 0 ;;
+      esac
+    };
+    quarantine_autostamp '$qfile';
+    parse_quarantine_file '$qfile';
+    printf '%s' \"\$QUARANTINE_RESOLVED\"
+  "
+  run_in_shell "$shbin" "$code"
+  local label="quarantine-autostamp-roundtrip[$shname]: reason #N → stamps resolved:<merge-sha>"
+  if [[ "$_RC" -ne 0 ]]; then
+    notok "$label" "rc=$_RC" "stderr: $_STDERR"; return
+  fi
+  if [[ "$_STDOUT" != "$fix" ]]; then
+    notok "$label" "expected resolved: $fix" "got: '$_STDOUT'"; return
+  fi
+  ok "$label"
+}
+assert_autostamp_roundtrip bash bash
+if [[ "$HAVE_ZSH" -eq 1 ]]; then
+  assert_autostamp_roundtrip zsh zsh
+else
+  skip "quarantine-autostamp-roundtrip[zsh]: reason #N → stamps resolved:<merge-sha>" "zsh not installed"
 fi
 
 # ─────────────────────────────────────────────────────────────────────────────
