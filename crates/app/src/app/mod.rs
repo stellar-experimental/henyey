@@ -118,6 +118,13 @@ const TIME_SLICED_PEERS_MAX: usize = 25;
 const PEER_MAX_FAILURES_TO_SEND: u32 = 10;
 const TX_SET_REQUEST_WINDOW: u64 = 12;
 const MAX_TX_SET_REQUESTS_PER_TICK: usize = 32;
+/// Mirror of herder's `MAX_SLOTS_TO_REMEMBER` (12). Used only to compute the
+/// observability-only `peers_could_serve` signal in
+/// `request_scp_state_from_peers` (#3270). Kept here (rather than depending on
+/// a herder accessor) so the overlay crate's `peers_could_serve` stays free of
+/// a herder dependency — the app caller, which already knows the value, passes
+/// it in. Must stay in sync with `henyey_herder::herder::MAX_SLOTS_TO_REMEMBER`.
+const MAX_SLOTS_TO_REMEMBER: u32 = 12;
 /// Consensus stuck timeout matching stellar-core's CONSENSUS_STUCK_TIMEOUT_SECONDS.
 /// No longer used in the unified decision function (see #1831), but kept
 /// for the parity-checking test assertion.
@@ -2943,6 +2950,13 @@ impl App {
     /// Parity: mirrors stellar-core's `getMoreSCPState()` bounded-pull
     /// semantics (HerderImpl.cpp:2643-2658).
     pub async fn request_scp_state_from_peers(&self) {
+        // Count every re-request attempt — including the no-overlay and
+        // no-peers early-returns below — so a stall with no serviceable peers
+        // still registers as a request attempt in the scrape (#3270). The
+        // per-attempt fan-out is carried separately by the `peers_sent` log
+        // field, so this counter measures request *volume*, not peers reached.
+        crate::metrics::SCP_STATE_REQUESTS_SENT_TOTAL.increment(1);
+
         let Some(overlay) = self.overlay().await else {
             return;
         };
@@ -2954,11 +2968,22 @@ impl App {
         }
 
         let ledger_seq = self.scp_state_request_ledger_seq();
+        // Observability-only serviceability signal (#3270): how many connected
+        // peers could still hold `ledger_seq` in their SCP window. Pure read of
+        // state we already ingest; does not affect fan-out, peer selection, or
+        // the request watermark. `MAX_SLOTS_TO_REMEMBER` is sourced from the
+        // same herder constant (mirrored locally below) to keep the overlay
+        // crate free of a herder dependency.
+        let (peers_could_serve, peers_connected) =
+            overlay.peers_could_serve(ledger_seq, MAX_SLOTS_TO_REMEMBER);
         match overlay.request_scp_state(ledger_seq) {
             Ok(count) => {
                 tracing::info!(
                     ledger_seq,
                     peers_sent = count,
+                    peers_could_serve,
+                    peers_connected,
+                    requested_low = ledger_seq,
                     "Requested SCP state from peers (bounded pull)"
                 );
             }
@@ -2966,6 +2991,9 @@ impl App {
                 tracing::warn!(
                     ledger_seq,
                     error = %e,
+                    peers_could_serve,
+                    peers_connected,
+                    requested_low = ledger_seq,
                     "Failed to request SCP state from peers"
                 );
             }

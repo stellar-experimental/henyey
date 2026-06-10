@@ -571,6 +571,11 @@ pub(super) struct SharedPeerState {
     pub(super) dropped_authenticated_peers: Arc<std::sync::atomic::AtomicU64>,
     pub(super) banned_peers: Arc<RwLock<HashSet<PeerId>>>,
     pub(super) peer_info_cache: Arc<DashMap<PeerId, PeerInfo>>,
+    /// Per-peer highest observed externalized slot (observability-only). Shared
+    /// `Arc` with `OverlayManager::peer_latest_externalized`. Held here so the
+    /// peer-disconnect cleanup path (`cleanup_peer`) can drop the entry
+    /// alongside `peer_info_cache`. See issue #3270.
+    pub(super) peer_latest_externalized: Arc<DashMap<PeerId, AtomicU64>>,
     /// Last closed ledger sequence, used for flood record cleanup.
     pub(super) last_closed_ledger: Arc<AtomicU32>,
     /// Optional callback for intelligent SCP queue trimming.
@@ -658,6 +663,10 @@ impl SharedPeerState {
             .remove_if(peer_id, |_, handle| handle.generation == generation);
         if removed.is_some() {
             self.peer_info_cache.remove(peer_id);
+            // Drop the per-peer externalized observation so the map tracks only
+            // live peers and `peers_could_serve` cannot count departed peers
+            // (#3270).
+            self.peer_latest_externalized.remove(peer_id);
             self.admission_state.lock().clear_evicting(peer_id);
             self.dropped_authenticated_peers
                 .fetch_add(1, Ordering::Relaxed);
@@ -819,6 +828,17 @@ pub struct OverlayManager {
     pub(super) shutdown_tx: Mutex<Option<broadcast::Sender<()>>>,
     /// Cache of peer info for connected peers (lock-free access).
     pub(super) peer_info_cache: Arc<DashMap<PeerId, PeerInfo>>,
+    /// Highest externalized SCP slot observed *via live SCP gossip* from each
+    /// connected peer (lock-free, observability-only). Updated at the two
+    /// EXTERNALIZE-accept sites in the app event loop (see
+    /// `record_peer_externalized`). Read at `GetScpState` re-request time by
+    /// `peers_could_serve` to enrich the request log with how many connected
+    /// peers could still hold the requested slot in their SCP window. This is
+    /// pure telemetry — it never feeds back into envelope acceptance, relay,
+    /// peer selection, or the `GetScpState` watermark. Entries are removed on
+    /// disconnect (see `SharedPeerState::cleanup_peer`) so the map tracks only
+    /// live peers. See issue #3270.
+    pub(super) peer_latest_externalized: Arc<DashMap<PeerId, AtomicU64>>,
     /// Dedicated unbounded channel for SCP messages.
     /// SCP messages are consensus-critical and must never be dropped.
     /// Mainnet generates ~24 validators * multiple SCP rounds per slot,
@@ -974,6 +994,7 @@ impl OverlayManager {
             banned_peers: Arc::new(RwLock::new(HashSet::new())),
             shutdown_tx: Mutex::new(Some(shutdown_tx)),
             peer_info_cache: Arc::new(DashMap::new()),
+            peer_latest_externalized: Arc::new(DashMap::new()),
             scp_message_tx,
             scp_message_rx: Arc::new(TokioMutex::new(Some(scp_message_rx))),
             fetch_response_tx,
@@ -1014,6 +1035,7 @@ impl OverlayManager {
             dropped_authenticated_peers: Arc::clone(&self.dropped_authenticated_peers),
             banned_peers: Arc::clone(&self.banned_peers),
             peer_info_cache: Arc::clone(&self.peer_info_cache),
+            peer_latest_externalized: Arc::clone(&self.peer_latest_externalized),
             last_closed_ledger: Arc::clone(&self.last_closed_ledger),
             scp_callback: self.scp_callback.clone(),
             is_validator: self.config.is_validator,
@@ -1792,6 +1814,79 @@ impl OverlayManager {
         Ok(sent)
     }
 
+    /// Record the highest externalized SCP slot observed *via live SCP gossip*
+    /// from `peer` (observability-only). Called from the app event loop at the
+    /// two EXTERNALIZE-accept sites where the global externalize `fetch_max`
+    /// already fires and `from_peer`/`slot` are in scope.
+    ///
+    /// The stored value is monotonic per peer (`fetch_max`): a lower slot never
+    /// regresses a peer's recorded high-water mark. Absence of an entry means
+    /// "no externalized observation yet" — a distinct state from slot 0 (see
+    /// `peers_could_serve`, which excludes never-observed peers).
+    ///
+    /// This is a pure side-write: it never affects envelope acceptance, relay,
+    /// peer selection, or the `GetScpState` watermark. The scope is explicitly
+    /// "EXTERNALIZE observed via live SCP gossip" — slots learned via catchup
+    /// replay or `GetScpState` responses are not recorded here, which is the
+    /// correct signal for #3270 (the question is about peers' *live* SCP
+    /// windows). See issue #3270.
+    pub fn record_peer_externalized(&self, peer: &PeerId, slot: u64) {
+        // Only record for peers we currently consider connected, so we never
+        // resurrect an entry for a peer that just disconnected (the disconnect
+        // cleanup removes the entry; a racing late EXTERNALIZE must not re-add
+        // a stale peer).
+        if !self.peer_info_cache.contains_key(peer) {
+            return;
+        }
+        self.peer_latest_externalized
+            .entry(peer.clone())
+            .or_insert_with(|| AtomicU64::new(0))
+            .fetch_max(slot, Ordering::Relaxed);
+    }
+
+    /// Return `(could_serve, connected)` for a `GetScpState` re-request of
+    /// `requested_slot` (observability-only).
+    ///
+    /// - `connected` is the number of currently-connected peers.
+    /// - `could_serve` counts connected peers whose recorded latest observed
+    ///   externalized slot is recent enough that they could still hold
+    ///   `requested_slot` in their SCP window, i.e.
+    ///   `latest_ext - max_slots <= requested_slot` (the parity-faithful inverse
+    ///   of stellar-core's trim boundary `consensusIndex - MAX_SLOTS_TO_REMEMBER`,
+    ///   HerderImpl.cpp:1011-1012).
+    ///
+    /// A peer with **no recorded externalized observation** is counted in
+    /// `connected` but **excluded** from `could_serve`. This is deliberate: we
+    /// must NOT treat "never observed" as slot 0 and feed it through
+    /// `saturating_sub`, because `0.saturating_sub(max_slots) = 0 <=
+    /// requested_slot` would wrongly count freshly-connected churn peers as
+    /// serviceable — corrupting the signal exactly during the overlay churn
+    /// that motivates #3270.
+    ///
+    /// `max_slots` is passed in by the app caller (sourced from the same herder
+    /// `MAX_SLOTS_TO_REMEMBER` constant), keeping this crate free of a herder
+    /// dependency. See issue #3270.
+    pub fn peers_could_serve(&self, requested_slot: u32, max_slots: u32) -> (usize, usize) {
+        let connected = self.peer_info_cache.len();
+        let requested = requested_slot as u64;
+        let max_slots = max_slots as u64;
+        let could_serve = self
+            .peer_info_cache
+            .iter()
+            .filter(|entry| {
+                // Excluded unless we have an actual observation for this peer.
+                match self.peer_latest_externalized.get(entry.key()) {
+                    Some(latest) => {
+                        let latest_ext = latest.load(Ordering::Relaxed);
+                        latest_ext.saturating_sub(max_slots) <= requested
+                    }
+                    None => false,
+                }
+            })
+            .count();
+        (could_serve, connected)
+    }
+
     /// Request a transaction set by hash from all peers.
     pub async fn request_tx_set(&self, hash: &Uint256) -> Result<usize> {
         let message = StellarMessage::GetTxSet(hash.clone());
@@ -2492,6 +2587,7 @@ mod tests {
             dropped_authenticated_peers: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             banned_peers: Arc::new(RwLock::new(HashSet::new())),
             peer_info_cache: Arc::new(DashMap::new()),
+            peer_latest_externalized: Arc::new(DashMap::new()),
             last_closed_ledger: Arc::new(AtomicU32::new(0)),
             scp_callback: None,
             is_validator: false,
@@ -3018,6 +3114,7 @@ mod tests {
             dropped_authenticated_peers: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             banned_peers: Arc::new(RwLock::new(HashSet::new())),
             peer_info_cache: Arc::new(DashMap::new()),
+            peer_latest_externalized: Arc::new(DashMap::new()),
             last_closed_ledger: Arc::new(AtomicU32::new(0)),
             scp_callback: None,
             is_validator: false,
@@ -3114,6 +3211,7 @@ mod tests {
             dropped_authenticated_peers: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             banned_peers: Arc::new(RwLock::new(HashSet::new())),
             peer_info_cache: Arc::new(DashMap::new()),
+            peer_latest_externalized: Arc::new(DashMap::new()),
             last_closed_ledger: Arc::new(AtomicU32::new(0)),
             scp_callback: None,
             is_validator: false,
@@ -3817,6 +3915,7 @@ mod tests {
             dropped_authenticated_peers: Arc::new(AtomicU64::new(0)),
             banned_peers: Arc::new(RwLock::new(HashSet::new())),
             peer_info_cache: Arc::new(DashMap::new()),
+            peer_latest_externalized: Arc::new(DashMap::new()),
             last_closed_ledger: Arc::new(AtomicU32::new(0)),
             scp_callback: None,
             is_validator: true,
@@ -3891,6 +3990,7 @@ mod tests {
             dropped_authenticated_peers: Arc::new(AtomicU64::new(0)),
             banned_peers: Arc::new(RwLock::new(HashSet::new())),
             peer_info_cache: Arc::new(DashMap::new()),
+            peer_latest_externalized: Arc::new(DashMap::new()),
             last_closed_ledger: Arc::new(AtomicU32::new(0)),
             scp_callback: None,
             is_validator: true,
@@ -4532,6 +4632,198 @@ mod tests {
                 }
             }
         }
+    }
+
+    // ──────── peers_could_serve / record_peer_externalized (#3270) ────────
+
+    /// #3270: the serviceability threshold counts a connected peer iff its
+    /// recorded latest externalized slot satisfies
+    /// `latest_ext - max_slots <= requested_slot` (the inverse of stellar-core's
+    /// trim boundary). Covers: (a) all recent enough; (b) none recent enough;
+    /// (c) the exact `gap == max_slots` boundary (inclusive → serves) vs
+    /// `gap == max_slots + 1` (does not serve); (d) a peer with no recorded
+    /// observation is in `total` but excluded from `could_serve`.
+    #[test]
+    fn test_peers_could_serve_threshold() {
+        const MAX_SLOTS: u32 = 12;
+
+        let config = OverlayConfig::default();
+        let local_node = LocalNode::new_testnet(SecretKey::generate());
+        let manager = OverlayManager::new(config, local_node).unwrap();
+        manager.running.store(true, Ordering::Relaxed);
+
+        // Four connected peers.
+        let p_recent = PeerId::from_bytes([1u8; 32]);
+        let p_boundary = PeerId::from_bytes([2u8; 32]);
+        let p_over = PeerId::from_bytes([3u8; 32]);
+        let p_unobserved = PeerId::from_bytes([4u8; 32]);
+        let _r1 = insert_peer_with_capacity(&manager, p_recent.clone(), 16);
+        let _r2 = insert_peer_with_capacity(&manager, p_boundary.clone(), 16);
+        let _r3 = insert_peer_with_capacity(&manager, p_over.clone(), 16);
+        let _r4 = insert_peer_with_capacity(&manager, p_unobserved.clone(), 16);
+
+        let requested_slot: u32 = 100;
+
+        // p_recent: latest == requested → trivially serves.
+        manager.record_peer_externalized(&p_recent, requested_slot as u64);
+        // p_boundary: gap == max_slots exactly → inclusive, serves.
+        // latest - 12 == 100  ⟹  latest == 112.
+        manager.record_peer_externalized(&p_boundary, (requested_slot + MAX_SLOTS) as u64);
+        // p_over: gap == max_slots + 1 → does NOT serve.
+        // latest - 12 == 101 > 100  ⟹  latest == 113.
+        manager.record_peer_externalized(&p_over, (requested_slot + MAX_SLOTS + 1) as u64);
+        // p_unobserved: no record → excluded from could_serve, still in total.
+
+        let (could_serve, total) = manager.peers_could_serve(requested_slot, MAX_SLOTS);
+        assert_eq!(total, 4, "all four peers are connected → total == 4");
+        assert_eq!(
+            could_serve, 2,
+            "p_recent + p_boundary serve; p_over (gap 13) and p_unobserved (no record) do not"
+        );
+
+        // (a) all recent enough: ask about a higher slot that every peer's
+        //     window covers. p_over is at latest 113 (gap 13 for slot 100), but
+        //     for slot 101 its window floor 113 - 12 = 101 <= 101 serves; record
+        //     p_unobserved so it has an observation too. Recording is fetch_max,
+        //     so p_recent/p_boundary stay at 100/112 and still serve slot 101.
+        manager.record_peer_externalized(&p_unobserved, (requested_slot + 1) as u64);
+        let (all_serve, total_all) = manager.peers_could_serve(requested_slot + 1, MAX_SLOTS);
+        assert_eq!(total_all, 4);
+        assert_eq!(
+            all_serve, 4,
+            "at slot 101 every peer's window floor (<= 101) covers it → all serve"
+        );
+
+        // (b) none recent enough: ask for a slot far below every peer's window.
+        //     For requested_slot = 0 and latest ~ 100+, latest - 12 > 0 for all.
+        let (none_serve, total_none) = manager.peers_could_serve(0, MAX_SLOTS);
+        assert_eq!(total_none, 4);
+        assert_eq!(
+            none_serve, 0,
+            "no peer's window reaches slot 0 (latest - 12 > 0 for all)"
+        );
+    }
+
+    /// #3270: a peer with no recorded externalized observation must NOT be
+    /// counted as serviceable via `0.saturating_sub(max_slots) = 0`. Asserted
+    /// in isolation: a single unobserved peer yields could_serve == 0 even for
+    /// a low requested_slot where the slot-0 collision would otherwise fire.
+    #[test]
+    fn test_peers_could_serve_excludes_unobserved_peer() {
+        const MAX_SLOTS: u32 = 12;
+        let manager = OverlayManager::new(
+            OverlayConfig::default(),
+            LocalNode::new_testnet(SecretKey::generate()),
+        )
+        .unwrap();
+        manager.running.store(true, Ordering::Relaxed);
+
+        let peer = PeerId::from_bytes([5u8; 32]);
+        let _rx = insert_peer_with_capacity(&manager, peer, 16);
+
+        // requested_slot = 0 is exactly the case where treating "no observation"
+        // as slot 0 would wrongly count the peer (0.saturating_sub(12) = 0 <= 0).
+        let (could_serve, total) = manager.peers_could_serve(0, MAX_SLOTS);
+        assert_eq!(total, 1, "the peer is connected");
+        assert_eq!(
+            could_serve, 0,
+            "an unobserved peer must be excluded from could_serve (no slot-0 collision)"
+        );
+    }
+
+    /// #3270: `record_peer_externalized` is monotonic (`fetch_max`) — a lower
+    /// slot never regresses a peer's recorded high-water mark.
+    #[test]
+    fn test_record_peer_externalized_monotonic() {
+        const MAX_SLOTS: u32 = 12;
+        let manager = OverlayManager::new(
+            OverlayConfig::default(),
+            LocalNode::new_testnet(SecretKey::generate()),
+        )
+        .unwrap();
+        manager.running.store(true, Ordering::Relaxed);
+
+        let peer = PeerId::from_bytes([6u8; 32]);
+        let _rx = insert_peer_with_capacity(&manager, peer.clone(), 16);
+
+        manager.record_peer_externalized(&peer, 200);
+        // A stale, lower slot must not regress the recorded value.
+        manager.record_peer_externalized(&peer, 50);
+
+        // With latest == 200, the peer serves requested_slot >= 200 - 12 = 188.
+        let (serves_at_188, _) = manager.peers_could_serve(188, MAX_SLOTS);
+        assert_eq!(
+            serves_at_188, 1,
+            "latest stayed at 200; 200 - 12 = 188 <= 188"
+        );
+        // It does NOT serve requested_slot = 187 (latest - 12 = 188 > 187).
+        let (serves_at_187, _) = manager.peers_could_serve(187, MAX_SLOTS);
+        assert_eq!(
+            serves_at_187, 0,
+            "the regression (slot 50) was ignored; window floor is 188, not 38"
+        );
+    }
+
+    /// #3270: the per-peer externalized entry is dropped on disconnect, so
+    /// `peers_could_serve` reflects only live peers (no stale-peer inflation).
+    #[tokio::test]
+    async fn test_peer_externalized_removed_on_disconnect() {
+        const MAX_SLOTS: u32 = 12;
+        let manager = OverlayManager::new(
+            OverlayConfig::default(),
+            LocalNode::new_testnet(SecretKey::generate()),
+        )
+        .unwrap();
+        manager.running.store(true, Ordering::Relaxed);
+
+        // shared_state() shares the same Arcs as `manager`, so cleanup_peer on
+        // the shared state is observable through the manager's accessors.
+        let shared = manager.shared_state();
+        let peer = PeerId::from_bytes([7u8; 32]);
+        let _rx = insert_fake_peer(
+            &shared,
+            peer.clone(),
+            "10.0.0.7:11625".parse().unwrap(),
+            crate::connection::ConnectionDirection::Outbound,
+        );
+
+        manager.record_peer_externalized(&peer, 300);
+        let (before, total_before) = manager.peers_could_serve(290, MAX_SLOTS);
+        assert_eq!(total_before, 1, "peer connected before disconnect");
+        assert_eq!(before, 1, "peer serves slot 290 (300 - 12 = 288 <= 290)");
+
+        // Disconnect: cleanup_peer must drop both peer_info_cache and the
+        // per-peer externalized entry (generation 0 matches insert_fake_peer).
+        shared.cleanup_peer(&peer, 0);
+
+        let (after, total_after) = manager.peers_could_serve(290, MAX_SLOTS);
+        assert_eq!(total_after, 0, "no live peers after disconnect");
+        assert_eq!(after, 0, "departed peer must not be counted as serviceable");
+        assert!(
+            !manager.peer_latest_externalized.contains_key(&peer),
+            "per-peer externalized entry must be removed on disconnect"
+        );
+    }
+
+    /// #3270: `record_peer_externalized` ignores peers that are not currently
+    /// connected, so a racing late EXTERNALIZE cannot resurrect a stale entry
+    /// after the disconnect cleanup ran.
+    #[test]
+    fn test_record_peer_externalized_ignores_unconnected_peer() {
+        let manager = OverlayManager::new(
+            OverlayConfig::default(),
+            LocalNode::new_testnet(SecretKey::generate()),
+        )
+        .unwrap();
+        manager.running.store(true, Ordering::Relaxed);
+
+        let peer = PeerId::from_bytes([8u8; 32]);
+        // No insert into peer_info_cache → not connected.
+        manager.record_peer_externalized(&peer, 500);
+        assert!(
+            !manager.peer_latest_externalized.contains_key(&peer),
+            "must not record externalized slot for an unconnected peer"
+        );
     }
 
     #[tokio::test]

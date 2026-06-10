@@ -535,6 +535,10 @@ metric_catalog! {
             => "Recovery stall onset events (one per episode)";
         SCP_SCHEDULED_DEDUP_TOTAL = "henyey_scp_scheduled_dedup_total"
             => "SCP envelopes rejected by in-flight scheduled dedup";
+        SCP_STATE_REQUESTS_SENT_TOTAL = "henyey_scp_state_requests_sent_total"
+            => "Total GetScpState (SCP state) re-request attempts sent to peers \
+                (one per request attempt, including attempts where 0 peers were \
+                reachable); see issue #3270";
 
         // SCP/herder counters.
         SCP_ENVELOPE_EMIT_TOTAL = "stellar_scp_envelope_emit_total"
@@ -1678,6 +1682,61 @@ mod tests {
                 name
             );
         }
+    }
+
+    /// #3270: the GetScpState re-request counter is pre-registered, carries
+    /// HELP/TYPE, and increments (scrape-able from the first scrape).
+    #[test]
+    fn test_scp_state_requests_counter_in_catalog() {
+        const NAME: &str = "henyey_scp_state_requests_sent_total";
+        assert!(
+            ALL_COUNTER_NAMES.contains(&NAME),
+            "{} missing from catalog",
+            NAME
+        );
+        assert!(
+            ALL_PREREGISTERED_COUNTER_NAMES.contains(&NAME),
+            "{} should be pre-registered",
+            NAME
+        );
+        // The typed constant points at the expected Prometheus name.
+        assert_eq!(SCP_STATE_REQUESTS_SENT_TOTAL, NAME);
+    }
+
+    /// #3270: the counter is pre-registered at 0 with TYPE counter, and after
+    /// an increment renders the incremented value in the scrape.
+    #[test]
+    fn test_scp_state_requests_counter_increments() {
+        const NAME: &str = "henyey_scp_state_requests_sent_total";
+        let (recorder, handle) = fresh_local_recorder();
+        metrics::with_local_recorder(&recorder, || {
+            describe_metrics();
+            register_label_series();
+
+            // First scrape: pre-registered at 0 with TYPE counter.
+            let before = handle.render();
+            assert!(
+                before.contains(&format!("{} 0", NAME)),
+                "{} should be pre-registered at 0",
+                NAME
+            );
+            assert!(
+                before.contains(&format!("# TYPE {} counter", NAME)),
+                "{} should have TYPE counter",
+                NAME
+            );
+
+            // Increment via the typed metric API and confirm the scrape moves.
+            SCP_STATE_REQUESTS_SENT_TOTAL.increment(1);
+            SCP_STATE_REQUESTS_SENT_TOTAL.increment(1);
+            let after = handle.render();
+            assert!(
+                after.contains(&format!("{} 2", NAME)),
+                "{} should render 2 after two increments, got:\n{}",
+                NAME,
+                after
+            );
+        });
     }
 
     #[test]
