@@ -94,9 +94,10 @@ TIMEOUT=600
 # Overridable via the KILL_GRACE env var (e.g. the harness passes a short grace).
 KILL_GRACE="${KILL_GRACE:-30s}"
 DIAGNOSTICS_DIR=""
-# Opt-in (#3272): treat a TIMEOUT (exit 124) disposition as a neutral soft-skip
-# instead of a red failure. Default OFF ⇒ behavior byte-identical for all other
-# shards/callers. See the header for the rationale and the strict 124-only scope.
+# Opt-in (#3272): treat a TIMEOUT (exit 124 or 137 — TERM-timeout or -k SIGKILL)
+# disposition as a neutral soft-skip instead of a red failure. Default OFF ⇒
+# behavior byte-identical for all other shards/callers. See the header for the
+# rationale and the strict 124-or-137 timeout-only scope.
 SOFT_ON_TIMEOUT=false
 PROBE_CMD=()
 
@@ -174,9 +175,15 @@ should_soft_skip_timeout() {
     [[ "$SOFT_ON_TIMEOUT" == true ]] && { [[ "$1" -eq 124 ]] || [[ "$1" -eq 137 ]]; }
 }
 
+# Emit the grep-able SOFT-SKIP marker for a soft-skipped TIMEOUT disposition.
+# Takes the REAL exit code as $1 (124 = SIGTERM-killed, 137 = -k SIGKILL of a
+# SIGTERM-ignoring probe — the actual `go run` signature) so the log reflects
+# what actually happened, not a hardcoded 124. The harness greps only the
+# stable `SOFT-SKIP` prefix, so interpolating the code does not break it.
 emit_soft_skip() {
+    local soft_skip_exit="$1"
     echo "=== SOFT-SKIP: testnet sync probe timed out (environmental, not a henyey failure) ===" >&2
-    echo "=== SOFT-SKIP: $NETWORK/$ENABLE/$PROBE exit 124 treated as neutral (#3272); diagnostics preserved ===" >&2
+    echo "=== SOFT-SKIP: $NETWORK/$ENABLE/$PROBE exit $soft_skip_exit treated as neutral (#3272); diagnostics preserved ===" >&2
 }
 
 # --- Helper: capture diagnostics ---
@@ -265,11 +272,11 @@ if is_retryable_exit "$EXIT_CODE" && is_retryable_shard; then
         exit 0
     fi
 
-    # Post-retry sink. Under --soft-on-timeout, a SECOND timeout (exit 124 ONLY)
-    # is a neutral soft-skip (#3272); any other non-124 exit (a genuine probe
-    # assertion failure) stays red.
+    # Post-retry sink. Under --soft-on-timeout, a SECOND timeout (exit 124 or 137
+    # — TERM-timeout or -k SIGKILL) is a neutral soft-skip (#3272); any other
+    # exit (a genuine probe assertion failure) stays red.
     if should_soft_skip_timeout "$EXIT_CODE"; then
-        emit_soft_skip
+        emit_soft_skip "$EXIT_CODE"
         echo "=== Failed on retry (exit $EXIT_CODE) but soft-skipped (timeout) ===" >&2
         exit 0
     fi
@@ -279,11 +286,11 @@ if is_retryable_exit "$EXIT_CODE" && is_retryable_shard; then
 fi
 
 # Non-transient failure, or transient failure on a non-retryable shard.
-# Under --soft-on-timeout, a TIMEOUT (exit 124 ONLY) here is a neutral soft-skip
-# (#3272); any other non-124 exit (a genuine probe assertion failure) stays red,
-# so a real henyey-on-testnet break is never masked.
+# Under --soft-on-timeout, a TIMEOUT (exit 124 or 137 — TERM-timeout or -k
+# SIGKILL) here is a neutral soft-skip (#3272); any other exit (a genuine probe
+# assertion failure) stays red, so a real henyey-on-testnet break is never masked.
 if should_soft_skip_timeout "$EXIT_CODE"; then
-    emit_soft_skip
+    emit_soft_skip "$EXIT_CODE"
     echo "=== Failed (exit $EXIT_CODE) but soft-skipped (timeout) ===" >&2
     exit 0
 fi
