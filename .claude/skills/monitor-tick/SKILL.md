@@ -1574,6 +1574,14 @@ Otherwise enter the deploy path:
    ```bash
    # --- Quarantine gate ---
    source "$(git rev-parse --show-toplevel)/scripts/lib/deploy-quarantine.sh"
+   # Auto-stamp resolved:<fix-sha> on any bundled-commit quarantine whose
+   # recorded crash issue (`regression #N`) has a MERGED closing PR (#3258).
+   # WRITE-ONLY + best-effort: it only ADDS a `resolved:` token (never clears);
+   # any gh/network failure or open PR leaves the entry un-stamped. The clear
+   # decision stays SOLELY with check_quarantine_active below, which re-gates
+   # every stamp with `git merge-base --is-ancestor`. So a wrong/premature
+   # stamp is still BLOCKED, and `|| true` keeps a gh hiccup from aborting.
+   quarantine_autostamp "$HOME/data/deploy_quarantine.txt" || true
    check_quarantine_active "$HOME/data/deploy_quarantine.txt"
    if [ $? -eq 0 ]; then
      case "$QUARANTINE_STATUS" in
@@ -1846,8 +1854,28 @@ if **any** hunk of the quarantined SHA still reverse-applies. A commit that
 `retain:false` with the benign `_rjem_malloc_conf` export + instrumentation)
 can never auto-clear after a **partial** revert: the benign hunks are
 intentionally kept on `origin/main`, so the per-hunk check stays
-`blocked_active` forever (the tick-199 false-block, #3256). For that case,
-stamp the entry once with the fix commit that resolved it:
+`blocked_active` forever (the tick-199 false-block, #3256).
+
+**Automatic stamping (#3258).** For the common case — the auto-quarantine path
+records the crash issue # in the entry's reason (`regression #N`, written by
+§3d) — the deploy gate now stamps `resolved:<fix-sha>` **automatically every
+tick**, via `quarantine_autostamp` run immediately before
+`check_quarantine_active` (section 10's quarantine gate above). It follows
+GitHub's **structured** linkage — not free-text commit-message scanning: parse
+`#N` from the reason → ask GitHub which **MERGED** PR closed #N
+(`closedByPullRequestsReferences`) → take that PR's `mergeCommit.oid`. So once
+the fix PR merges, the entry auto-clears on the next tick with **no operator
+action**. `quarantine_autostamp` is **write-only and best-effort**: it only
+ADDS a `resolved:` token (never clears), and any gh/network/parse failure, an
+open (non-MERGED) PR, a missing issue #, or a self-resolution leaves the entry
+un-stamped — so the per-hunk content-check governs that entry. The clear
+decision stays **solely** with `check_quarantine_active`, which independently
+re-gates every stamp with `git merge-base --is-ancestor` — a wrong/premature
+stamp is still BLOCKED.
+
+**Manual stamping (fallback).** If the entry has no recorded issue # (e.g. a
+hand-added quarantine), or the fix landed without a closing PR, stamp it once
+yourself with the fix commit that resolved it:
 
 ```bash
 source "$(git rev-parse --show-toplevel)/scripts/lib/deploy-quarantine.sh"
@@ -1859,9 +1887,8 @@ This appends a `resolved:<fix-sha>` token to the entry. The gate **auto-clears**
 that entry once `<fix-sha>` is an ancestor of `origin/main` (i.e. the fix has
 merged) — no further per-tick action needed. It is **fail-safe**: a not-yet-
 merged fix, a malformed token, a self-resolution (`<fix-sha>` == `<bad_sha>`),
-or a git error all fall back to the per-hunk content-check (BLOCK). Stamping is
-a once-per-quarantine manual step today; automatic fix-SHA stamping is the
-follow-up #3258. `quarantine_remove` remains the override.
+or a git error all fall back to the per-hunk content-check (BLOCK).
+`quarantine_remove` remains the override.
 
 **Manual removal** (still supported, occasionally useful — e.g. an entry
 that the content check can't decide cleanly because of a malformed diff
