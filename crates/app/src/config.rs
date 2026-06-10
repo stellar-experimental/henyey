@@ -844,17 +844,20 @@ pub struct BucketConfig {
     /// Maximum number of bucket-materialization workers that may run
     /// concurrently during parallel restore (`restore_from_has_parallel`).
     ///
-    /// Caps the live-allocation spike of the **warm-restart** restore path
-    /// (#3245/#3235): when restoring persisted state from local db + buckets
-    /// at startup, henyey spawns up to ~22 concurrent `load_bucket` workers,
-    /// each with a large transient working set (streaming index build, XDR
-    /// parse buffers, small buckets loaded fully into RAM). Capping
-    /// concurrency to `k` bounds that spike via a counting semaphore.
+    /// Caps the live-allocation spike of the restore path (#3245/#3235): when
+    /// materializing the bucket list, henyey spawns up to ~22 concurrent
+    /// `load_bucket` workers, each with a large transient working set
+    /// (streaming index build, XDR parse buffers, small buckets loaded fully
+    /// into RAM). Capping concurrency to `k` bounds that spike via a counting
+    /// semaphore.
     ///
-    /// NOTE: this knob is wired only into the warm-restart path
-    /// (`restore_from_has_parallel`, called from ledger_close). The archive
-    /// cold-catchup path (`history::catchup::buckets`) uses the un-capped
-    /// `restore_from_has` and is unaffected by this setting.
+    /// As of #3268 this knob covers BOTH restore paths:
+    /// - the **warm-restart** path (`restore_from_has_parallel`, called from
+    ///   ledger_close), restoring persisted state from local db + buckets at
+    ///   startup; and
+    /// - the **archive cold-catchup** path (`history::catchup::buckets`'
+    ///   `apply_buckets`, threaded in via `CatchupManager::set_restore_apply_fan_out`),
+    ///   which was the original motivation (#3245/#3235) and is now also capped.
     ///
     /// NOTE: as of 2026-06 (#3267/#3227), this knob is NOT the startup-peak
     /// lever: measured peak anon RSS was flat (~28 GB) across k ∈ {0,4,6,8}
