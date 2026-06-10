@@ -432,14 +432,15 @@ impl CatchupManager {
         }
 
         // Restore the live bucket list with FutureBucket states
-        let mut bucket_list =
-            BucketList::restore_from_has(&live_hash_pairs, &live_next_states, load_bucket)
-                .map_err(|e| {
-                    HistoryError::CatchupFailed(format!(
-                        "Failed to restore live bucket list: {}",
-                        e
-                    ))
-                })?;
+        let mut bucket_list = BucketList::restore_from_has_parallel(
+            &live_hash_pairs,
+            &live_next_states,
+            load_bucket,
+            self.restore_apply_fan_out,
+        )
+        .map_err(|e| {
+            HistoryError::CatchupFailed(format!("Failed to restore live bucket list: {}", e))
+        })?;
         bucket_list.set_bucket_dir(bucket_dir.to_path_buf());
 
         // Validate live bucket-list structure post-restore.
@@ -632,10 +633,11 @@ impl CatchupManager {
                     Ok(bucket)
                 };
 
-            let hot_bucket_list = HotArchiveBucketList::restore_from_has(
+            let hot_bucket_list = HotArchiveBucketList::restore_from_has_parallel(
                 &hot_hash_pairs,
                 &hot_next_states,
                 load_hot_archive_bucket,
+                self.restore_apply_fan_out,
             )
             .map_err(|e| {
                 HistoryError::CatchupFailed(format!(
@@ -912,6 +914,250 @@ mod tests {
         match map_validation_error("hot archive", other) {
             HistoryError::CatchupFailed(msg) => assert_eq!(msg, "untouched"),
             other => panic!("unexpected error variant: {other:?}"),
+        }
+    }
+
+    // ----------------------------------------------------------------------
+    // #3268 — restore_apply_fan_out wired into the cold-catchup restore path.
+    //
+    // These tests exercise the seam that `apply_buckets` now uses:
+    // `BucketList::restore_from_has_parallel(.., self.restore_apply_fan_out)`
+    // (swapped from the un-capped, sequential `restore_from_has`).
+    // ----------------------------------------------------------------------
+
+    use crate::archive_state::HistoryArchiveState;
+    use henyey_bucket::BucketManager;
+    use henyey_db::Database;
+    use stellar_xdr::curr::{
+        AccountEntry, AccountEntryExt, AccountId, LedgerEntry, LedgerEntryData, LedgerEntryExt,
+        PublicKey, SequenceNumber, String32, Thresholds, Uint256,
+    };
+
+    fn account_liveentry(seed: u8) -> BucketEntry {
+        BucketEntry::Liveentry(LedgerEntry {
+            last_modified_ledger_seq: 1,
+            data: LedgerEntryData::Account(AccountEntry {
+                account_id: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([seed; 32]))),
+                balance: seed as i64 * 100,
+                seq_num: SequenceNumber(1),
+                num_sub_entries: 0,
+                inflation_dest: None,
+                flags: 0,
+                home_domain: String32::default(),
+                thresholds: Thresholds([1, 0, 0, 0]),
+                signers: Vec::new().try_into().unwrap(),
+                ext: AccountEntryExt::V0,
+            }),
+            ext: LedgerEntryExt::V0,
+        })
+    }
+
+    /// A distinct, well-versioned live bucket: a leading metaentry (protocol
+    /// `version`) followed by a single account liveentry keyed on `seed`, so
+    /// every bucket has a unique hash while sharing the same protocol version
+    /// (keeps the bucket-list structure validation happy).
+    fn versioned_bucket(version: u32, seed: u8) -> Bucket {
+        Bucket::from_entries(vec![meta_entry(version), account_liveentry(seed)])
+            .expect("metaentry + liveentry bucket valid")
+    }
+
+    /// Build a HAS whose live bucket list places distinct curr+snap buckets on
+    /// the shallowest `n` levels (all protocol v24, contiguous from level 0 with
+    /// every `next` clear, so the structure validator accepts it), no hot
+    /// archive. Returns the HAS plus the preloaded `(hash, xdr_bytes)` list that
+    /// `apply_buckets` consumes (mirroring the post-`download_buckets` state).
+    ///
+    /// Each level carries TWO distinct non-empty buckets (curr + snap) so that
+    /// `n` non-empty levels yield `n` concurrent restore worker threads (one per
+    /// level), exercising the fan-out cap.
+    fn build_live_has_fixture(n: usize) -> (HistoryArchiveState, Vec<(Hash256, Vec<u8>)>) {
+        assert!(n >= 1 && n <= BucketList::NUM_LEVELS);
+        let mut levels = cleared_levels(BucketList::NUM_LEVELS);
+        let mut preloaded: Vec<(Hash256, Vec<u8>)> = Vec::new();
+        let mut seed: u8 = 1;
+        for level in levels.iter_mut().take(n) {
+            let curr = versioned_bucket(24, seed);
+            seed += 1;
+            let snap = versioned_bucket(24, seed);
+            seed += 1;
+            let (hc, hs) = (curr.hash(), snap.hash());
+            level.curr = hc.to_hex();
+            level.snap = hs.to_hex();
+            preloaded.push((hc, curr.to_xdr_bytes().expect("serialize bucket xdr")));
+            preloaded.push((hs, snap.to_xdr_bytes().expect("serialize bucket xdr")));
+        }
+        let has = HistoryArchiveState::new_for_testing(64, levels);
+        (has, preloaded)
+    }
+
+    /// Construct a `CatchupManager` over a fresh temp bucket dir + in-memory DB
+    /// with no archives (the preloaded path never hits the network).
+    fn catchup_manager_for(dir: &std::path::Path) -> CatchupManager {
+        let bucket_manager =
+            BucketManager::new(dir.to_path_buf()).expect("bucket manager over temp dir");
+        let db = Database::open_in_memory().expect("in-memory db");
+        CatchupManager::new(Vec::new(), bucket_manager, db)
+    }
+
+    /// Byte-identical restored state across fan-out values on the cold-catchup
+    /// path: capping concurrency must NOT change the restored `bucketListHash`.
+    #[tokio::test]
+    async fn test_apply_buckets_byte_identical_across_fan_out() {
+        let (has, preloaded) = build_live_has_fixture(4);
+
+        let mut hashes = Vec::new();
+        for fan_out in [None, Some(1usize), Some(2), Some(8)] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let mut mgr = catchup_manager_for(dir.path());
+            mgr.set_restore_apply_fan_out(fan_out);
+            let (live_bl, hot_bl, _, _) = mgr
+                .apply_buckets(&has, &preloaded)
+                .await
+                .expect("apply_buckets succeeds");
+            hashes.push((fan_out, live_bl.hash(), hot_bl.hash()));
+        }
+
+        let (_, live0, hot0) = hashes[0];
+        for (fan_out, live, hot) in &hashes {
+            assert_eq!(
+                *live, live0,
+                "live bucketListHash differs for fan_out={fan_out:?} — capping \
+                 cold-catchup concurrency must not change the restored state"
+            );
+            assert_eq!(
+                *hot, hot0,
+                "hot-archive bucketListHash differs for fan_out={fan_out:?}"
+            );
+        }
+    }
+
+    /// Default cap (`None`) reproduces the un-capped restore exactly: the
+    /// restored `bucketListHash` equals a direct sequential `restore_from_has`
+    /// over the same HAS (the pre-#3268 behavior). No-op-at-default guarantee.
+    #[tokio::test]
+    async fn test_apply_buckets_default_unbounded_matches_current() {
+        let (has, preloaded) = build_live_has_fixture(3);
+
+        // Cold-catchup path with the DEFAULT cap (None — what a default config
+        // yields via restore_apply_fan_out_cap()).
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mgr = catchup_manager_for(dir.path());
+        assert_eq!(
+            mgr.restore_apply_fan_out, None,
+            "CatchupManager must default to unbounded fan-out"
+        );
+        let (live_bl, _, _, _) = mgr
+            .apply_buckets(&has, &preloaded)
+            .await
+            .expect("apply_buckets succeeds at default cap");
+
+        // Independent reference: sequential restore_from_has over the same HAS.
+        let by_hash: HashMap<Hash256, Bucket> = preloaded
+            .iter()
+            .map(|(h, bytes)| {
+                (
+                    *h,
+                    Bucket::from_xdr_bytes(bytes).expect("decode preloaded bucket"),
+                )
+            })
+            .collect();
+        let live_hash_pairs = has.bucket_hash_pairs();
+        let live_next_states = has.live_next_states().expect("live next states");
+        let ref_loader = |h: &Hash256| -> henyey_bucket::Result<Bucket> {
+            if let Some(b) = Bucket::for_sentinel_hash(h) {
+                return Ok(b);
+            }
+            by_hash
+                .get(h)
+                .cloned()
+                .ok_or_else(|| henyey_bucket::BucketError::NotFound(h.to_hex()))
+        };
+        let ref_bl =
+            BucketList::restore_from_has(&live_hash_pairs, &live_next_states, ref_loader).unwrap();
+
+        assert_eq!(
+            live_bl.hash(),
+            ref_bl.hash(),
+            "default (None) cold-catchup restore must equal the sequential \
+             restore_from_has result (no-op at default)"
+        );
+    }
+
+    /// The cold-catchup restore honors the fan-out cap.
+    ///
+    /// This drives the exact seam `apply_buckets` now uses — feeding the
+    /// `CatchupManager`'s stored `restore_apply_fan_out` into
+    /// `restore_from_has_parallel` — with a load-instrumented loader that
+    /// records the max number of concurrent in-flight loads.
+    ///
+    /// **Why this fails on `origin/main`:** there, `apply_buckets` calls the
+    /// sequential `restore_from_has`, which (a) has no `fan_out` parameter, so
+    /// `CatchupManager` has no field to store a cap and `set_restore_apply_fan_out`
+    /// does not exist (compile error), and (b) loads buckets strictly one at a
+    /// time, so concurrency can never reach 2. Using `Some(2)` (not `Some(1)`)
+    /// makes the failure unambiguous: main's max concurrency is always 1.
+    #[test]
+    fn test_apply_buckets_respects_fan_out_cap() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc as StdArc;
+
+        // Stored cap flows through the setter exactly as catchup_impl wires it.
+        let dir = tempfile::tempdir().unwrap();
+        let mut mgr = catchup_manager_for(dir.path());
+        mgr.set_restore_apply_fan_out(Some(2));
+        assert_eq!(mgr.restore_apply_fan_out, Some(2), "setter round-trips");
+
+        // Six distinct non-empty levels so unbounded would overlap >2 loads.
+        let (has, preloaded) = build_live_has_fixture(6);
+        let by_hash: HashMap<Hash256, Bucket> = preloaded
+            .iter()
+            .map(|(h, bytes)| (*h, Bucket::from_xdr_bytes(bytes).unwrap()))
+            .collect();
+        let live_hash_pairs = has.bucket_hash_pairs();
+        let live_next_states = has.live_next_states().unwrap();
+
+        let current = StdArc::new(AtomicUsize::new(0));
+        let max_seen = StdArc::new(AtomicUsize::new(0));
+        let current_c = StdArc::clone(&current);
+        let max_seen_c = StdArc::clone(&max_seen);
+
+        let loader = move |h: &Hash256| -> henyey_bucket::Result<Bucket> {
+            if let Some(b) = Bucket::for_sentinel_hash(h) {
+                return Ok(b);
+            }
+            let now = current_c.fetch_add(1, Ordering::SeqCst) + 1;
+            max_seen_c.fetch_max(now, Ordering::SeqCst);
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            let b = by_hash.get(h).cloned().expect("known hash");
+            current_c.fetch_sub(1, Ordering::SeqCst);
+            Ok(b)
+        };
+
+        // Exactly what apply_buckets does: feed the manager's stored cap.
+        let bl = BucketList::restore_from_has_parallel(
+            &live_hash_pairs,
+            &live_next_states,
+            loader,
+            mgr.restore_apply_fan_out,
+        )
+        .unwrap();
+
+        assert_eq!(current.load(Ordering::SeqCst), 0, "all loads completed");
+        let max = max_seen.load(Ordering::SeqCst);
+        assert!(
+            max <= 2,
+            "max concurrent cold-catchup loads {max} exceeded the fan_out cap 2"
+        );
+        assert_eq!(
+            max, 2,
+            "concurrency must actually reach 2 (proving the cap is threaded and \
+             parallelism active) — unreachable on main's sequential restore"
+        );
+        // Sanity: the curr buckets were materialized into the right levels
+        // (preloaded is [curr0, snap0, curr1, snap1, ...]).
+        for (i, pair) in preloaded.chunks(2).enumerate() {
+            assert_eq!(bl.levels()[i].curr.hash(), pair[0].0);
+            assert_eq!(bl.levels()[i].snap.hash(), pair[1].0);
         }
     }
 }

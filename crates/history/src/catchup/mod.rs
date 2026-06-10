@@ -291,6 +291,17 @@ pub struct CatchupManager {
     /// Derived from `Herder::check_ledger_close(target + 1)` during online catchup:
     /// `(target_ledger, tx_set.previous_ledger_hash())`.
     pub(super) trusted_scp_anchor: Option<(u32, Hash256)>,
+
+    /// Optional cap on concurrent bucket-materialization during the cold-catchup
+    /// `apply_buckets` restore (lever D, #3249/#3268).
+    ///
+    /// Threaded into `BucketList::restore_from_has_parallel` /
+    /// `HotArchiveBucketList::restore_from_has_parallel` via the `FanOutLimiter`
+    /// semaphore. `None` (the default) means unbounded — every level materializes
+    /// concurrently, identical to the historical behavior. The restored
+    /// `bucketListHash` is independent of this value (levels are assembled by
+    /// index, not completion order), so capping is byte-for-byte state-preserving.
+    pub(super) restore_apply_fan_out: Option<usize>,
 }
 
 impl CatchupManager {
@@ -312,6 +323,7 @@ impl CatchupManager {
             meta_callback: None,
             emit_meta_ext_v1: false,
             trusted_scp_anchor: None,
+            restore_apply_fan_out: None,
         }
     }
 
@@ -331,6 +343,7 @@ impl CatchupManager {
             meta_callback: None,
             emit_meta_ext_v1: false,
             trusted_scp_anchor: None,
+            restore_apply_fan_out: None,
         }
     }
 
@@ -369,6 +382,18 @@ impl CatchupManager {
     /// meta extension version.
     pub fn set_emit_meta_ext_v1(&mut self, enabled: bool) {
         self.emit_meta_ext_v1 = enabled;
+    }
+
+    /// Set the cap on concurrent bucket-materialization during cold-catchup restore.
+    ///
+    /// Mirrors the warm-restart wiring (lever D, #3249): the cap is threaded into
+    /// `BucketList::restore_from_has_parallel` / `HotArchiveBucketList::restore_from_has_parallel`
+    /// in `apply_buckets`, bounding how many bucket levels materialize at once via
+    /// the `FanOutLimiter` semaphore. `None` means unbounded (the default), which is
+    /// byte-for-byte identical to the historical behavior. The restored
+    /// `bucketListHash` is independent of this value.
+    pub fn set_restore_apply_fan_out(&mut self, cap: Option<usize>) {
+        self.restore_apply_fan_out = cap;
     }
 
     /// Set an SCP-derived trusted anchor for reverse-walk verification (§9.1 + INV-C5).

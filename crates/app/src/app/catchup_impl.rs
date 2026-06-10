@@ -781,6 +781,11 @@ impl App {
             Arc::new(self.db.clone()),
         );
         catchup_manager.set_network_passphrase(self.config.network.passphrase.clone());
+        // Cap concurrent bucket-materialization during the cold-catchup restore
+        // (lever D, #3249/#3268) so one knob bounds fan-out on both the
+        // warm-restart and archive cold-catchup paths. Default (`None`) is
+        // unbounded — byte-for-byte identical to the historical behavior.
+        catchup_manager.set_restore_apply_fan_out(self.config.buckets.restore_apply_fan_out_cap());
 
         // Wire up meta streaming for catchup replay.
         // When --metadata-output-stream is configured, replayed ledgers
