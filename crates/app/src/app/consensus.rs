@@ -798,10 +798,23 @@ impl App {
                 // time AND the archive is confirmed behind, escalate to
                 // hard reset. Uses a higher threshold than the fast-track
                 // path because absence of SCP traffic is weaker evidence.
+                //
+                // #3263: gate the escalation behind a peer_gap floor, matching
+                // the sibling peer-ahead site below (consensus.rs:1876). At the
+                // live tip the archive is normally behind, so without a verified
+                // peer ahead this site would otherwise escalate-at-tip. The
+                // `peer_gap >= PEER_AHEAD_ESCALATION_THRESHOLD` floor is the
+                // henyey proxy for "genuinely behind the network" and aligns
+                // with stellar-core's SCP-only `HerderImpl::outOfSyncRecovery`,
+                // which never archive-escalates at tip. #1862 far-behind
+                // (peer_gap >= 12 >= 3) is unaffected; a genuinely-stuck node at
+                // peer_gap < 3 is still caught by the independent #2789 120s
+                // wall-clock backstop, so the floor cannot create a new wedge.
                 let archive_is_confirmed_behind =
                     self.archive_recovery_snapshot().await.is_confirmed_behind();
                 let peer_gap = self.effective_peer_gap(current_ledger);
                 if archive_is_confirmed_behind
+                    && peer_gap >= PEER_AHEAD_ESCALATION_THRESHOLD
                     && attempts >= RECOVERY_HARD_RESET_ESCALATION_ATTEMPTS_NO_SCP
                     && !self.is_hard_reset_on_cooldown(peer_gap)
                 {
