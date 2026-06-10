@@ -12040,6 +12040,99 @@ mod tests {
         );
     }
 
+    /// #3263 floor: No-SCP escalation must NOT fire when peer_gap is below
+    /// PEER_AHEAD_ESCALATION_THRESHOLD (3) — no verified peer ahead means the
+    /// node is not "genuinely behind the network", matching the sibling
+    /// peer-ahead site and stellar-core's SCP-only outOfSyncRecovery.
+    ///
+    /// Clone of the fires-test but with `max_verified_scp_slot = 2` →
+    /// peer_gap = 2 (< floor). We assert on the per-app `last_hard_reset_offset`
+    /// side-effect, NOT on `is_confirmed_behind`: with current_ledger=0 the
+    /// harness's `ArchiveCheckpointCache` is never primed → Cold → the #3264
+    /// suppression (peer_gap < 12 && cache_not_known_ahead) catches the
+    /// escalation INSIDE `force_post_catchup_hard_reset` and leaves
+    /// confirmed-behind intact even on main, so `is_confirmed_behind` is not a
+    /// pre/post differentiator at peer_gap < 12. The clean differentiator is
+    /// whether `force_post_catchup_hard_reset` was REACHED, observed via its
+    /// cooldown side-effect: 0 = gated out (post-floor); > 0 = reached +
+    /// suppression armed the cooldown (pre-floor, fails on origin/main).
+    #[tokio::test]
+    async fn test_out_of_sync_at_tip_no_scp_low_peer_gap_no_escalation() {
+        let (_dir, app) = make_app_for_peer_ahead_test().await;
+        let current_ledger = 0u32;
+
+        {
+            *app.archive_recovery_status.write().await = ArchiveRecoveryStatus::ConfirmedBehind {
+                backoff_until: None,
+            };
+        }
+        // peer_gap = 2 (below PEER_AHEAD_ESCALATION_THRESHOLD = 3).
+        app.max_verified_scp_slot.store(2, Ordering::Relaxed);
+        app.recovery_attempts_without_progress.store(
+            RECOVERY_HARD_RESET_ESCALATION_ATTEMPTS_NO_SCP,
+            Ordering::SeqCst,
+        );
+        app.recovery_baseline_ledger
+            .store(current_ledger as u64, Ordering::SeqCst);
+        app.scp_messages_received.store(0, Ordering::Relaxed);
+        app.recovery_baseline_scp_received
+            .store(0, Ordering::SeqCst);
+
+        let result = app.out_of_sync_recovery(current_ledger).await;
+
+        // Escalation gated out by the floor: force_post_catchup_hard_reset is
+        // never reached, so the cooldown is never armed.
+        assert_eq!(
+            app.last_hard_reset_offset.load(Ordering::Relaxed),
+            0,
+            "peer_gap=2 < floor: No-SCP escalation must be gated out \
+             (last_hard_reset_offset stays 0)"
+        );
+        assert!(result.is_none());
+    }
+
+    /// #3263 floor boundary: at peer_gap == PEER_AHEAD_ESCALATION_THRESHOLD (3)
+    /// the No-SCP escalation STILL fires (guards `>=` vs `>` off-by-one).
+    ///
+    /// Same setup as the low-gap test with `max_verified_scp_slot = 3` →
+    /// peer_gap = 3 (exactly at the floor). peer_gap=3 < 12, so the #3264
+    /// Cold-cache suppression catches the escalation inside
+    /// `force_post_catchup_hard_reset` — we therefore assert via the same
+    /// `last_hard_reset_offset > 0` signal (escalation reached the chokepoint,
+    /// suppression armed the cooldown). Passes pre and post.
+    #[tokio::test]
+    async fn test_out_of_sync_at_tip_no_scp_peer_gap_at_floor_fires_hard_reset() {
+        let (_dir, app) = make_app_for_peer_ahead_test().await;
+        let current_ledger = 0u32;
+
+        {
+            *app.archive_recovery_status.write().await = ArchiveRecoveryStatus::ConfirmedBehind {
+                backoff_until: None,
+            };
+        }
+        // peer_gap = 3 (exactly at PEER_AHEAD_ESCALATION_THRESHOLD).
+        app.max_verified_scp_slot.store(3, Ordering::Relaxed);
+        app.recovery_attempts_without_progress.store(
+            RECOVERY_HARD_RESET_ESCALATION_ATTEMPTS_NO_SCP,
+            Ordering::SeqCst,
+        );
+        app.recovery_baseline_ledger
+            .store(current_ledger as u64, Ordering::SeqCst);
+        app.scp_messages_received.store(0, Ordering::Relaxed);
+        app.recovery_baseline_scp_received
+            .store(0, Ordering::SeqCst);
+
+        let _result = app.out_of_sync_recovery(current_ledger).await;
+
+        // Escalation reached force_post_catchup_hard_reset; Cold cache +
+        // peer_gap<12 → #3264 suppression armed the cooldown.
+        assert!(
+            app.last_hard_reset_offset.load(Ordering::Relaxed) > 0,
+            "peer_gap=3 == floor: No-SCP escalation must fire \
+             (reach force_post_catchup_hard_reset, arming cooldown)"
+        );
+    }
+
     /// Step 4 no-SCP path: attempts one below threshold should NOT fire.
     /// Uses current_ledger=0 for AtTip relation.
     #[tokio::test]
