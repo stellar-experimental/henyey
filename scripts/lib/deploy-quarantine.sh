@@ -12,6 +12,11 @@
 #   - Line-oriented, default-whitespace-separated fields
 #   - First field: 40 lowercase hex chars (commit SHA)
 #   - Remaining fields: optional free-text reason (single line)
+#   - An optional `resolved:<40-hex>` token MAY appear anywhere in the reason
+#     (token-boundary-anchored). It records the fix commit that resolves the
+#     quarantine: once that fix SHA is an ancestor of origin/main, the entry
+#     auto-clears (see check_quarantine_active). Additive — absent on legacy
+#     entries, which keep the per-hunk content-check as their backstop.
 #   - Lines starting with # (after optional whitespace) are comments
 #   - Blank/whitespace-only lines are skipped
 #   - CRLF is stripped during parsing
@@ -36,6 +41,11 @@ _DEPLOY_QUARANTINE_LOADED=1
 #
 # Sets globals:
 #   QUARANTINE_ENTRIES  - Newline-separated valid SHAs (order preserved)
+#   QUARANTINE_RESOLVED - Newline-separated resolved-fix SHAs, ONE PER ENTRY in
+#                         the SAME order as QUARANTINE_ENTRIES. A line is the
+#                         40-hex fix SHA when the entry carried a valid,
+#                         token-boundary-anchored `resolved:<sha>`, or "-" when
+#                         it did not. The two globals are index-aligned.
 #   QUARANTINE_WARNINGS - Comma-space-separated warning messages
 #
 # Returns:
@@ -45,6 +55,7 @@ _DEPLOY_QUARANTINE_LOADED=1
 parse_quarantine_file() {
   local file="$1"
   QUARANTINE_ENTRIES=""
+  QUARANTINE_RESOLVED=""
   QUARANTINE_WARNINGS=""
 
   # Missing or empty file: clear, no warnings
@@ -80,10 +91,29 @@ parse_quarantine_file() {
 
     # Validate: exactly 40 lowercase hex chars
     if [[ "$sha" =~ ^[0-9a-f]{40}$ ]]; then
+      # Extract an optional `resolved:<40-hex>` token from the reason field.
+      # Anchored on token boundaries (start-or-whitespace before, end-or-
+      # whitespace after) so a substring like `unresolved:...` or a >40-hex
+      # blob never false-matches. Default "-" (no resolved annotation).
+      # Done via grep (not the `=~` capture array) so the extraction is
+      # identical under bash and zsh — zsh populates `$match`, not
+      # `$BASH_REMATCH`, for `[[ =~ ]]` capture groups (#3256).
+      local resolved="-" _resolved_tok
+      # `|| true`: grep exits 1 on no-match; the `|| true` keeps this from
+      # tripping a caller's `set -e`/`pipefail` (the no-token case is normal).
+      _resolved_tok="$(printf '%s' " $_rest " | grep -oE '[[:space:]]resolved:[0-9a-f]{40}[[:space:]]' | head -n1 || true)"
+      if [[ -n "$_resolved_tok" ]]; then
+        # Strip the leading-space + `resolved:` prefix and the trailing space.
+        _resolved_tok="${_resolved_tok#"${_resolved_tok%%[![:space:]]*}"}"
+        _resolved_tok="${_resolved_tok%"${_resolved_tok##*[![:space:]]}"}"
+        resolved="${_resolved_tok#resolved:}"
+      fi
       if [[ -n "$QUARANTINE_ENTRIES" ]]; then
         QUARANTINE_ENTRIES+=$'\n'"$sha"
+        QUARANTINE_RESOLVED+=$'\n'"$resolved"
       else
         QUARANTINE_ENTRIES="$sha"
+        QUARANTINE_RESOLVED="$resolved"
       fi
     else
       local warning="malformed: ${sha:0:12}"
@@ -240,12 +270,28 @@ _quarantine_any_hunk_present() {
 #
 # Algorithm per entry:
 #   1. If SHA is NOT an ancestor of origin/main → not deployed, skip.
-#   2. If SHA IS an ancestor → split its diff (`git diff sha^..sha`) into
-#      per-hunk patches and reverse-apply-check EACH hunk independently
-#      (`_quarantine_any_hunk_present`). The entry is ACTIVE (BLOCK) if ANY
-#      hunk still reverse-applies — i.e. at least one harmful hunk's content
-#      is still in the tree. It CLEARs only when ALL hunks fail to
-#      reverse-apply (genuinely reverted/removed).
+#   2. resolved-SHA auto-clear (#3256): if the entry carries a valid
+#      `resolved:<fix-sha>` token, the fix SHA is NOT the entry's own SHA
+#      (self-resolution guard), and that fix SHA is an ancestor of origin/main
+#      (`git merge-base --is-ancestor` → 0), the fix has genuinely landed →
+#      CLEAR this entry (skip the content-check). This is the ONLY way an
+#      annotated bundled-commit quarantine auto-clears while benign hunks of
+#      the same commit are intentionally retained (the tick-199 false-block:
+#      #3238 bundled a harmful `retain:false` hunk removed by #3251 with benign
+#      hunks kept on main; the per-hunk check below stays BLOCKED forever
+#      because the benign hunks legitimately reverse-apply). An operator/
+#      automation stamps `resolved:` once; the gate auto-clears on merge.
+#      FAIL-SAFE: a missing token, self-resolution, a not-yet-merged fix
+#      (`--is-ancestor` → 1), OR a git error on the resolved-ancestry check
+#      (rc>=128) all FALL THROUGH to the per-hunk content-check below — the
+#      resolved path can only CLEAR, never relax the existing backstop.
+#   3. If the entry was not auto-cleared by step 2 → split its diff
+#      (`git diff sha^..sha`) into per-hunk patches and reverse-apply-check
+#      EACH hunk independently (`_quarantine_any_hunk_present`). The entry is
+#      ACTIVE (BLOCK) if ANY hunk still reverse-applies — i.e. at least one
+#      harmful hunk's content is still in the tree. It CLEARs only when ALL
+#      hunks fail to reverse-apply (genuinely reverted/removed). This is the
+#      byte-for-byte #3253 backstop for every un-annotated entry.
 #
 #      Why per-hunk and not whole-commit (the #3248 fix): `git apply --check`
 #      is all-or-nothing, so the old whole-commit reverse-apply false-CLEARED
@@ -253,7 +299,7 @@ _quarantine_any_hunk_present() {
 #      of a multi-file quarantined commit — even though the harmful hunk was
 #      fully intact. Per-hunk isolates each hunk's presence. Per-FILE is
 #      insufficient (same-file drift still false-clears all-or-nothing).
-#   3. Hard git errors (rc>=128 from merge-base, missing parent), an empty or
+#   4. Hard git errors (rc>=128 from merge-base, missing parent), an empty or
 #      unparseable diff, or a non-empty diff yielding zero hunks all FAIL-SAFE
 #      toward BLOCK (a false block delays a deploy; a false clear re-crashes
 #      the validator).
@@ -292,8 +338,11 @@ check_quarantine_active() {
     return 1
   fi
 
-  local sha merge_base_rc present_rc
-  while IFS= read -r sha; do
+  # Iterate QUARANTINE_ENTRIES and the index-aligned QUARANTINE_RESOLVED in
+  # lockstep over two FDs. `read -r ... <&3 && read -r ... <&4` advances both
+  # streams one line per loop and behaves identically under bash and zsh.
+  local sha resolved merge_base_rc present_rc resolved_rc
+  while IFS= read -r sha <&3 && IFS= read -r resolved <&4; do
     [[ -z "$sha" ]] && continue
 
     # Step 1: ancestry check. If SHA isn't reachable, its content can't
@@ -318,7 +367,24 @@ check_quarantine_active() {
       continue
     fi
 
-    # Step 2: per-hunk content check. The SHA is an ancestor; ask whether ANY
+    # Step 2: resolved-SHA auto-clear (#3256). If this entry carries a valid
+    # `resolved:<fix-sha>` that is NOT its own SHA (self-resolution guard) and
+    # the fix SHA is an ancestor of origin/main, the fix has genuinely landed
+    # → CLEAR this entry. Every uncertain case (no token, self-resolution,
+    # not-yet-merged, git error) FALLS THROUGH to the per-hunk content-check
+    # below — the resolved path can only clear, never weaken the backstop.
+    if [[ "$resolved" =~ ^[0-9a-f]{40}$ && "$resolved" != "$sha" ]]; then
+      resolved_rc=0
+      git merge-base --is-ancestor "$resolved" origin/main 2>/dev/null || resolved_rc=$?
+      if [[ "$resolved_rc" -eq 0 ]]; then
+        # Fix commit is on main → the quarantine is resolved → CLEAR.
+        continue
+      fi
+      # resolved_rc == 1 (fix not yet merged) OR rc>=128 (git error): do NOT
+      # clear — fall through to the per-hunk content-check (fail-closed).
+    fi
+
+    # Step 3: per-hunk content check. The SHA is an ancestor; ask whether ANY
     # hunk of its diff still reverse-applies (harmful content present). rc 0 →
     # at least one hunk present → BLOCK. rc 1 → all hunks gone → CLEAR for this
     # entry. rc 2 → fail-safe (diff error / empty / zero hunks) → BLOCK.
@@ -344,7 +410,7 @@ check_quarantine_active() {
       return 0
     fi
     # present_rc == 1: every hunk failed to reverse-apply → content removed. Skip.
-  done <<< "$QUARANTINE_ENTRIES"
+  done 3<<< "$QUARANTINE_ENTRIES" 4<<< "$QUARANTINE_RESOLVED"
 
   # No active match
   QUARANTINE_STATUS="clear"
@@ -455,6 +521,83 @@ quarantine_remove() {
   # Atomic removal via tmp+mv
   local tmpfile="${file}.tmp"
   if ! awk -v sha="$sha" '$1 != sha' "$file" > "$tmpfile" 2>/dev/null; then
+    rm -f "$tmpfile" 2>/dev/null
+    return 2
+  fi
+
+  if ! mv "$tmpfile" "$file" 2>/dev/null; then
+    rm -f "$tmpfile" 2>/dev/null
+    return 2
+  fi
+
+  return 0
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# quarantine_resolve QUARANTINE_FILE SHA RESOLVED_SHA
+#
+# I/O: atomically stamps a `resolved:<RESOLVED_SHA>` token onto EVERY entry
+# whose first field is SHA. This records the fix commit that resolves the
+# quarantine; check_quarantine_active auto-clears the entry once RESOLVED_SHA
+# is an ancestor of origin/main (#3256). Idempotent: any pre-existing
+# `resolved:<...>` token on a matching entry is replaced (canonicalized to a
+# single token), so repeated calls converge. Non-matching entries are left
+# byte-for-byte unchanged. Mirrors quarantine_remove's atomic tmp+mv posture.
+#
+# Arguments:
+#   QUARANTINE_FILE - Path to deploy_quarantine.txt
+#   SHA             - 40 lowercase hex chars (the quarantined commit)
+#   RESOLVED_SHA    - 40 lowercase hex chars (the fix commit)
+#
+# Returns:
+#   0 — stamped, already stamped (no-op), SHA not present, or missing file
+#   1 — invalid SHA format (either argument), or self-resolution
+#       (SHA == RESOLVED_SHA — rejected; would defeat the gate)
+#   2 — I/O error (read, awk, or mv failure)
+# ─────────────────────────────────────────────────────────────────────────────
+quarantine_resolve() {
+  local file="$1" sha="$2" resolved="$3"
+
+  # Validate both SHAs.
+  if [[ ! "$sha" =~ ^[0-9a-f]{40}$ ]]; then
+    return 1
+  fi
+  if [[ ! "$resolved" =~ ^[0-9a-f]{40}$ ]]; then
+    return 1
+  fi
+  # Self-resolution guard: a commit cannot resolve itself (it is always its own
+  # ancestor, which would permanently auto-clear the gate). Reject up front.
+  if [[ "$sha" == "$resolved" ]]; then
+    return 1
+  fi
+
+  # Missing file: nothing to stamp.
+  if [[ ! -e "$file" ]]; then
+    return 0
+  fi
+
+  # Unreadable file: cannot safely modify.
+  if [[ ! -r "$file" ]]; then
+    return 2
+  fi
+
+  # Atomic rewrite via tmp+mv. For every line whose first field == sha, strip
+  # any existing `resolved:<40hex>` token(s) and append the canonical one. The
+  # token boundary (leading space + trailing word-boundary) mirrors the parse
+  # regex so we never mangle a free-text reason.
+  local tmpfile="${file}.tmp"
+  if ! awk -v sha="$sha" -v resolved="$resolved" '
+    {
+      if ($1 == sha) {
+        # Remove any prior resolved:<40hex> token (boundary-anchored).
+        gsub(/[ \t]resolved:[0-9a-f]{40}([ \t]|$)/, " ", $0)
+        sub(/[ \t]+$/, "", $0)
+        print $0 " resolved:" resolved
+      } else {
+        print $0
+      }
+    }
+  ' "$file" > "$tmpfile" 2>/dev/null; then
     rm -f "$tmpfile" 2>/dev/null
     return 2
   fi
