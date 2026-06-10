@@ -897,10 +897,13 @@ impl App {
         let bucket_dir = self.bucket_manager.bucket_dir().to_path_buf();
 
         // Step 6a: Parallel restore of live BucketList (all levels loaded concurrently).
+        // No-cache restore loader (#3241): the restored BucketList owns these
+        // buckets; going through the caching `load_bucket` would pin a duplicate
+        // Arc per bucket in the manager cache through the startup peak and force
+        // a deep clone here.
         let bucket_manager = self.bucket_manager.clone();
         let load_bucket = |hash: &Hash256| -> henyey_bucket::Result<henyey_bucket::Bucket> {
-            let arc = bucket_manager.load_bucket(hash)?;
-            Ok(Arc::try_unwrap(arc).unwrap_or_else(|arc| (*arc).clone()))
+            bucket_manager.load_bucket_for_restore(hash)
         };
         let restore_fan_out = self.config.buckets.restore_apply_fan_out_cap();
         let mut bucket_list = BucketList::restore_from_has_parallel(
@@ -1249,10 +1252,11 @@ impl App {
         // responsible for ensuring this via preflight or download.
         // No silent downgrade of pending merge state.
 
+        // No-cache restore loader (#3241) — see reconstruct comment in the
+        // overlapped restore path above.
         let bucket_manager = self.bucket_manager.clone();
         let load_bucket = |hash: &Hash256| -> henyey_bucket::Result<henyey_bucket::Bucket> {
-            let arc = bucket_manager.load_bucket(hash)?;
-            Ok(std::sync::Arc::try_unwrap(arc).unwrap_or_else(|arc| (*arc).clone()))
+            bucket_manager.load_bucket_for_restore(hash)
         };
 
         let mut bucket_list = BucketList::restore_from_has_parallel(

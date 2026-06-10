@@ -424,6 +424,38 @@ impl BucketManager {
             return Ok(bucket);
         }
 
+        let bucket = self.load_bucket_from_disk(hash)?;
+
+        // Add to cache
+        let bucket = Arc::new(bucket);
+        self.add_to_cache(*hash, Arc::clone(&bucket));
+
+        Ok(bucket)
+    }
+
+    /// Load a bucket for cold-restore reconstruction (#3241).
+    ///
+    /// Identical to [`load_bucket`](Self::load_bucket) — sentinel handling,
+    /// canonical path, persisted-index support, hash verification — except it
+    /// neither consults nor populates the manager's bucket cache. The restored
+    /// `BucketList` takes ownership of the returned bucket; inserting a second
+    /// `Arc` into the cache would both pin a duplicate copy of every restored
+    /// bucket through the startup peak window and force the restore path to
+    /// deep-clone each bucket out of the shared `Arc`.
+    pub fn load_bucket_for_restore(&self, hash: &Hash256) -> Result<Bucket> {
+        if let Some(bucket) = Bucket::for_sentinel_hash(hash) {
+            return Ok(bucket);
+        }
+        self.load_bucket_from_disk(hash)
+    }
+
+    /// Shared disk-load path for [`load_bucket`](Self::load_bucket) and
+    /// [`load_bucket_for_restore`](Self::load_bucket_for_restore): loads the
+    /// canonical `.bucket.xdr` file (DiskBacked with persisted-index support
+    /// above [`DISK_BACKED_THRESHOLD`](Self::DISK_BACKED_THRESHOLD), fully
+    /// in-memory below it) and verifies the content hash. Does not touch the
+    /// cache; sentinel hashes must be handled by the caller.
+    fn load_bucket_from_disk(&self, hash: &Hash256) -> Result<Bucket> {
         // Load from canonical .bucket.xdr path
         let xdr_path = self.bucket_path(hash);
         if !xdr_path.exists() {
@@ -501,10 +533,6 @@ impl BucketManager {
                 actual: bucket.hash().to_hex(),
             });
         }
-
-        // Add to cache
-        let bucket = Arc::new(bucket);
-        self.add_to_cache(*hash, Arc::clone(&bucket));
 
         Ok(bucket)
     }
@@ -1611,6 +1639,67 @@ mod tests {
         let loaded = manager.load_bucket(&hash).unwrap();
         assert_eq!(loaded.hash(), hash);
         assert_eq!(loaded.len(), 1);
+    }
+
+    #[test]
+    fn test_load_bucket_for_restore_does_not_populate_cache() {
+        // #3241: the restore loader must neither consult nor populate the
+        // manager cache — the restored BucketList owns the bucket, and a
+        // cached duplicate Arc would pin a second copy through the startup
+        // peak window.
+        let (_temp_dir, manager) = create_manager();
+
+        let entries = vec![BucketEntry::Liveentry(make_account_entry([1u8; 32], 100))];
+        let bucket = manager.create_bucket(entries).unwrap();
+        let hash = bucket.hash();
+        drop(bucket);
+
+        manager.clear_cache();
+        assert_eq!(manager.cache_size(), 0);
+
+        let restored = manager.load_bucket_for_restore(&hash).unwrap();
+        assert_eq!(restored.hash(), hash, "restore load must verify the hash");
+        assert_eq!(restored.len(), 1);
+        assert_eq!(
+            manager.cache_size(),
+            0,
+            "restore load must not insert into the bucket cache"
+        );
+
+        // Content parity with the caching loader.
+        let via_cache = manager.load_bucket(&hash).unwrap();
+        assert_eq!(via_cache.hash(), restored.hash());
+        assert_eq!(via_cache.len(), restored.len());
+        assert_eq!(manager.cache_size(), 1, "load_bucket still caches");
+    }
+
+    #[test]
+    fn test_load_bucket_for_restore_sentinel_and_errors() {
+        let (_temp_dir, manager) = create_manager();
+
+        // Sentinel (zero hash) resolves to the empty bucket without touching
+        // disk or the cache.
+        let sentinel = manager.load_bucket_for_restore(&Hash256::ZERO).unwrap();
+        assert_eq!(sentinel.len(), 0);
+        assert_eq!(manager.cache_size(), 0);
+
+        // Missing bucket: NotFound, matching load_bucket.
+        let missing = Hash256::from_bytes([7u8; 32]);
+        match manager.load_bucket_for_restore(&missing) {
+            Err(BucketError::NotFound(_)) => {}
+            other => panic!("expected NotFound, got {other:?}"),
+        }
+
+        // Hash mismatch: write a real bucket's file under a wrong hash name.
+        let entries = vec![BucketEntry::Liveentry(make_account_entry([2u8; 32], 200))];
+        let bucket = manager.create_bucket(entries).unwrap();
+        let real_path = manager.bucket_path(&bucket.hash());
+        let wrong_hash = Hash256::from_bytes([9u8; 32]);
+        std::fs::copy(&real_path, manager.bucket_path(&wrong_hash)).unwrap();
+        match manager.load_bucket_for_restore(&wrong_hash) {
+            Err(BucketError::HashMismatch { .. }) => {}
+            other => panic!("expected HashMismatch, got {other:?}"),
+        }
     }
 
     #[test]
