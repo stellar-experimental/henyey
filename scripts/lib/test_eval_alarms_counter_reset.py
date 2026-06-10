@@ -26,6 +26,7 @@ write_snapshot = _mod.write_snapshot
 maybe_reset_counter_snapshot = _mod.maybe_reset_counter_snapshot
 eval_counter_dynamic = _mod.eval_counter_dynamic
 eval_counter_streak = _mod.eval_counter_streak
+render_aggregate = _mod.render_aggregate
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -382,6 +383,129 @@ def test_counter_streak_resume_after_skip_collects_baseline():
         # Should collect baseline, NOT fire or breach on the 400 delta
         assert result["state"] == "collecting_baseline", \
             f"Expected collecting_baseline after skip, got {result['state']}"
+
+
+# ── post-restart absolute fire tests (issue #3274) ───────────────────────────
+
+def test_post_restart_fire_sets_marker_on_result():
+    """A baseline-reset (PID-change) tick whose absolute counter value crosses
+    post_restart_absolute_threshold fires, and the firing result must carry the
+    `post_restart` marker so the renderer can label it `(post-restart)`.
+
+    Fails on origin/main: maybe_post_restart_fire sets `post_restart` only inside
+    extra_values, and make_result never surfaces it onto the result dict.
+    """
+    with tempfile.TemporaryDirectory() as d:
+        state_dir = Path(d)
+        snap_path = state_dir / "counter_streak_snapshot"
+        # Existing baseline under a DIFFERENT pid → next eval is a baseline reset.
+        write_snapshot(snap_path, {
+            "version": "1",
+            "pid": "111",
+            "start_ticks": "100",
+            "counter_value": "0",
+            "breach_streak": "0",
+        })
+
+        alarm = _make_alarm("recovery-stalled", kind="counter-streak",
+                            metric="recovery-stalled-metric",
+                            delta_threshold=1, streak_threshold=3,
+                            burst_threshold=10,
+                            post_restart_absolute_threshold=50,
+                            severity="WARN")
+        current = {"recovery-stalled-metric": [({}, 736.0)]}
+
+        # New pid "222" != snapshot pid "111" → baseline-reset branch.
+        result = eval_counter_streak(alarm, current, state_dir, "222", "200")
+
+        assert result["state"] == "firing", \
+            f"Expected firing on post-restart absolute fire, got {result['state']}"
+        assert result["value"] == 736, \
+            f"Expected absolute value 736, got {result['value']}"
+        assert result.get("post_restart") is True, \
+            f"Result must surface post_restart=True, got {result.get('post_restart')!r}"
+
+        # Contract: the fresh baseline (new pid, breach_streak=0) is written
+        # BEFORE the fire, so the next tick's streak machine stays consistent.
+        snap = read_snapshot(snap_path)
+        assert snap["pid"] == "222", "fresh baseline pid must be written before fire"
+        assert snap["breach_streak"] == "0", "fresh baseline streak must be 0"
+
+
+def test_render_post_restart_absolute_not_burst():
+    """render_aggregate labels a post_restart firing result with the documented
+    absolute=N (post-restart) form, NOT delta=N (burst).
+
+    Fails on origin/main: the renderer only sees value=736 >= 10 and emits
+    `(burst)` because it never inspects the post_restart marker.
+    """
+    r = {
+        "contributes_to": "recovery_stalled",
+        "state": "firing",
+        "value": 736,
+        "post_restart": True,
+    }
+    out = render_aggregate([r], watcher_mode=False)
+    line = out["recovery_stalled_line"]
+    assert line == "recovery_stalled: WARNING absolute=736 (post-restart) — investigating", \
+        f"Expected post-restart absolute form, got: {line!r}"
+    assert "(burst)" not in line, f"Must not render (burst) for post-restart fire, got: {line!r}"
+
+
+def test_render_same_pid_burst_still_burst():
+    """Over-relabel guard: a genuine same-PID burst (value >= 10, no post_restart
+    marker) must STILL render `(burst)`. The post-restart relabel must not swallow
+    real burst detection.
+
+    Passes before AND after the fix — proves the relabel is conditional on the
+    post_restart marker, not on value alone.
+    """
+    r = {
+        "contributes_to": "recovery_stalled",
+        "state": "firing",
+        "value": 15,
+    }
+    out = render_aggregate([r], watcher_mode=False)
+    line = out["recovery_stalled_line"]
+    assert line == "recovery_stalled: WARNING delta=15 (burst) — investigating", \
+        f"Expected burst form for same-PID burst, got: {line!r}"
+    assert "post-restart" not in line, \
+        f"Same-PID burst must not be relabeled post-restart, got: {line!r}"
+
+
+def test_post_restart_below_threshold_does_not_fire():
+    """Boundary: a baseline-reset tick whose absolute value is BELOW
+    post_restart_absolute_threshold (cur_val < 50) must NOT fire as post-restart;
+    it falls through to collecting_baseline.
+
+    Passes before and after — guards the lower boundary of the post-restart check.
+    """
+    with tempfile.TemporaryDirectory() as d:
+        state_dir = Path(d)
+        snap_path = state_dir / "counter_streak_snapshot"
+        write_snapshot(snap_path, {
+            "version": "1",
+            "pid": "111",
+            "start_ticks": "100",
+            "counter_value": "0",
+            "breach_streak": "0",
+        })
+
+        alarm = _make_alarm("recovery-stalled", kind="counter-streak",
+                            metric="recovery-stalled-metric",
+                            delta_threshold=1, streak_threshold=3,
+                            burst_threshold=10,
+                            post_restart_absolute_threshold=50,
+                            severity="WARN")
+        # Absolute value 49 < threshold 50 → no post-restart fire.
+        current = {"recovery-stalled-metric": [({}, 49.0)]}
+
+        result = eval_counter_streak(alarm, current, state_dir, "222", "200")
+
+        assert result["state"] == "collecting_baseline", \
+            f"Below-threshold reset must collect baseline, got {result['state']}"
+        assert not result.get("post_restart"), \
+            f"Below-threshold reset must not set post_restart, got {result.get('post_restart')!r}"
 
 
 # ── Run tests ─────────────────────────────────────────────────────────────────
