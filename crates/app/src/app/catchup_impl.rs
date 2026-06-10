@@ -6459,10 +6459,16 @@ mod tests {
         );
     }
 
-    /// When archive is ConfirmedBehind but cache is Stale, the guard
-    /// must NOT fire — ProbeAhead should proceed to discover truth.
+    /// #3262: When archive is ConfirmedBehind AND cache is Stale at/below
+    /// current_ledger AND peers confirm we are at-or-near tip (peer_gap <
+    /// HARD_RESET_GAP_ESCALATION), the hard reset must be SUPPRESSED and
+    /// routed to peer-SCP — NOT escalated to a spurious ProbeAhead archive
+    /// probe. This is the exact spurious-probe scenario from #3262: at the
+    /// live tip the published archive lags (10s urgent TTL → Stale between
+    /// refreshes), so the Fresh-only suppression on main bypassed and the
+    /// node spawned a futile ProbeAhead. Fails on main (counter increments).
     #[tokio::test]
-    async fn test_hard_reset_not_suppressed_stale_cache() {
+    async fn test_hard_reset_suppressed_stale_cache_at_tip() {
         let dir = tempfile::tempdir().expect("temp dir");
         let db_path = dir.path().join("rs-stellar-test.db");
         let config = crate::config::ConfigBuilder::new()
@@ -6476,6 +6482,161 @@ mod tests {
             .scp_driver()
             .record_externalized(5050, Default::default(), None);
         app.herder.scp_driver().publish_externalized(5050);
+
+        // peer_gap=5 (below HARD_RESET_GAP_ESCALATION=12) — peers confirm
+        // we are at/near tip, so this is the at-tip suppression window.
+        app.max_verified_scp_slot
+            .store(u64::from(current_ledger) + 5, Ordering::Relaxed);
+
+        {
+            let mut guard = app.archive_recovery_status.write().await;
+            *guard = ArchiveRecoveryStatus::ConfirmedBehind {
+                backoff_until: None,
+            };
+        }
+        // seed_stale makes the cache return Stale at/below current_ledger.
+        app.archive_checkpoint_cache.seed_stale(current_ledger);
+
+        app.start_instant = std::time::Instant::now() - std::time::Duration::from_secs(500);
+
+        let counter_before = app.post_catchup_hard_reset_total.load(Ordering::Relaxed);
+
+        let result = app
+            .force_post_catchup_hard_reset(
+                current_ledger,
+                HardResetReason::ArchiveBehindStallWallClock,
+            )
+            .await;
+
+        // Suppression must fire — returns None, no probe.
+        assert!(result.is_none(), "suppression guard should return None");
+
+        // Counter must NOT increment (no ProbeAhead spawned).
+        assert_eq!(
+            app.post_catchup_hard_reset_total.load(Ordering::Relaxed),
+            counter_before,
+            "counter must not increment when Stale-at-tip suppression fires (#3262)"
+        );
+
+        // Status stays ConfirmedBehind (not cleared).
+        assert!(
+            app.archive_recovery_snapshot().await.is_confirmed_behind(),
+            "archive_recovery_status must remain ConfirmedBehind after suppression"
+        );
+
+        // Cooldown armed; peer-SCP route taken instead of the probe.
+        assert!(
+            app.last_hard_reset_offset.load(Ordering::Relaxed) > 0,
+            "cooldown must be armed after suppression"
+        );
+
+        // Livelock timer must NOT be armed (guard is before livelock).
+        assert_eq!(
+            app.hard_reset_livelock_start.load(Ordering::Relaxed),
+            0,
+            "livelock timer must not be armed on suppression"
+        );
+    }
+
+    /// #3262: When archive is ConfirmedBehind AND cache is Cold AND peers
+    /// confirm we are at-or-near tip (peer_gap < HARD_RESET_GAP_ESCALATION),
+    /// the hard reset must be SUPPRESSED and routed to peer-SCP — NOT
+    /// escalated to a spurious ProbeAhead. A Cold cache with peers confirming
+    /// tip means a refresh is in flight and there is nothing to catch up to.
+    /// Fails on main (counter increments — Cold falls through to ProbeAhead).
+    #[tokio::test]
+    async fn test_hard_reset_suppressed_cold_cache_at_tip() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-test.db");
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
+        let mut app = App::new(config).await.unwrap();
+
+        let current_ledger: u32 = 5_000;
+
+        app.herder
+            .scp_driver()
+            .record_externalized(5050, Default::default(), None);
+        app.herder.scp_driver().publish_externalized(5050);
+
+        // peer_gap=5 (< HARD_RESET_GAP_ESCALATION=12) — peers confirm tip.
+        app.max_verified_scp_slot
+            .store(u64::from(current_ledger) + 5, Ordering::Relaxed);
+
+        {
+            let mut guard = app.archive_recovery_status.write().await;
+            *guard = ArchiveRecoveryStatus::ConfirmedBehind {
+                backoff_until: None,
+            };
+        }
+        // Do NOT seed cache — leaves it Cold.
+
+        app.start_instant = std::time::Instant::now() - std::time::Duration::from_secs(500);
+
+        let counter_before = app.post_catchup_hard_reset_total.load(Ordering::Relaxed);
+
+        let result = app
+            .force_post_catchup_hard_reset(
+                current_ledger,
+                HardResetReason::ArchiveBehindStallWallClock,
+            )
+            .await;
+
+        // Suppression must fire — returns None, no probe.
+        assert!(result.is_none(), "suppression guard should return None");
+
+        // Counter must NOT increment (no ProbeAhead spawned).
+        assert_eq!(
+            app.post_catchup_hard_reset_total.load(Ordering::Relaxed),
+            counter_before,
+            "counter must not increment when Cold-at-tip suppression fires (#3262)"
+        );
+
+        // Status stays ConfirmedBehind (not cleared).
+        assert!(
+            app.archive_recovery_snapshot().await.is_confirmed_behind(),
+            "archive_recovery_status must remain ConfirmedBehind after suppression"
+        );
+
+        // Cooldown armed; peer-SCP route taken instead of the probe.
+        assert!(
+            app.last_hard_reset_offset.load(Ordering::Relaxed) > 0,
+            "cooldown must be armed after suppression"
+        );
+
+        // Livelock timer must NOT be armed.
+        assert_eq!(
+            app.hard_reset_livelock_start.load(Ordering::Relaxed),
+            0,
+            "livelock timer must not be armed on suppression"
+        );
+    }
+
+    /// #1862 (re-pointed from `test_hard_reset_not_suppressed_stale_cache`):
+    /// When archive is ConfirmedBehind with a Stale cache AND peers are
+    /// verifiably far ahead (peer_gap >= HARD_RESET_GAP_ESCALATION), the
+    /// suppression must NOT fire — the Stale cache may have published a new
+    /// checkpoint and the node is genuinely behind the network, so it must
+    /// proceed to the ProbeAhead "discover truth" archive catchup (#1862).
+    #[tokio::test]
+    async fn test_hard_reset_not_suppressed_stale_cache_when_peers_ahead() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-test.db");
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
+        let mut app = App::new(config).await.unwrap();
+
+        let current_ledger: u32 = 5_000;
+
+        app.herder
+            .scp_driver()
+            .record_externalized(5050, Default::default(), None);
+        app.herder.scp_driver().publish_externalized(5050);
+
+        // Verified peers far ahead: peer_gap = 50 >= HARD_RESET_GAP_ESCALATION.
+        app.max_verified_scp_slot.store(5050, Ordering::Relaxed);
 
         {
             let mut guard = app.archive_recovery_status.write().await;
@@ -6496,18 +6657,23 @@ mod tests {
             .await;
 
         assert!(result.is_none()); // test app, spawn returns None anyway
-                                   // Key: counter DID increment (guard didn't fire, function proceeded).
+                                   // Key: counter DID increment (guard didn't fire — peers ahead, #1862
+                                   // ProbeAhead path proceeds).
         assert_eq!(
             app.post_catchup_hard_reset_total.load(Ordering::Relaxed),
             1,
-            "counter should increment (stale cache — guard must not fire)"
+            "counter should increment (stale cache + peers ahead — guard must not fire, #1862)"
         );
     }
 
-    /// When archive is ConfirmedBehind but cache is Cold, the guard
-    /// must NOT fire.
+    /// #1862 (re-pointed from `test_hard_reset_not_suppressed_cold_cache`):
+    /// When archive is ConfirmedBehind with a Cold cache AND peers are
+    /// verifiably far ahead (peer_gap >= HARD_RESET_GAP_ESCALATION), the
+    /// suppression must NOT fire — the node is genuinely behind the network
+    /// and must proceed to the ProbeAhead "discover truth" archive catchup
+    /// (#1862).
     #[tokio::test]
-    async fn test_hard_reset_not_suppressed_cold_cache() {
+    async fn test_hard_reset_not_suppressed_cold_cache_when_peers_ahead() {
         let dir = tempfile::tempdir().expect("temp dir");
         let db_path = dir.path().join("rs-stellar-test.db");
         let config = crate::config::ConfigBuilder::new()
@@ -6521,6 +6687,9 @@ mod tests {
             .scp_driver()
             .record_externalized(5050, Default::default(), None);
         app.herder.scp_driver().publish_externalized(5050);
+
+        // Verified peers far ahead: peer_gap = 50 >= HARD_RESET_GAP_ESCALATION.
+        app.max_verified_scp_slot.store(5050, Ordering::Relaxed);
 
         {
             let mut guard = app.archive_recovery_status.write().await;
@@ -6543,7 +6712,7 @@ mod tests {
         assert_eq!(
             app.post_catchup_hard_reset_total.load(Ordering::Relaxed),
             1,
-            "counter should increment (cold cache — guard must not fire)"
+            "counter should increment (cold cache + peers ahead — guard must not fire, #1862)"
         );
     }
 
