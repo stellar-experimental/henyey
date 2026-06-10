@@ -45,7 +45,7 @@ cleanup  # ensure fresh state
 mkdir -p "$TEST_ROOT"
 
 # ── TAP state ────────────────────────────────────────────────────────────────
-TAP_PLAN=349
+TAP_PLAN=355
 TAP_CURRENT=0
 TAP_FAILURES=0
 
@@ -2609,6 +2609,155 @@ CANNED
   else
     tap_not_ok "quarantine-resolve: missing file is a no-op (rc 0, no file created)" \
       "rc=$rc78q exists=$([ -e "$qdir/no_such_resolve.txt" ] && echo yes || echo no)"
+  fi
+
+  # ── Tests 78s-78x: quarantine_autostamp — issue→merged-PR→merge-SHA (#3258) ─
+  # quarantine_autostamp follows GitHub's STRUCTURED linkage: it parses the
+  # crash-issue number `#N` already recorded in the entry's reason (`regression
+  # #N`, written by monitor-tick §3d), asks GitHub which MERGED PR closed #N
+  # (`gh issue view N --json closedByPullRequestsReferences` → per-PR `gh pr
+  # view <pr> --json state,mergeCommit`), and stamps `resolved:<mergeCommit.oid>`
+  # via the existing #3260 quarantine_resolve. It is WRITE-ONLY and best-effort:
+  # any gh/network/parse failure, an open (non-MERGED) PR, or a missing/absent
+  # issue# → it skips that entry (no stamp), so #3260's gate governs unchanged.
+  #
+  # FAIL-SAFE: autostamp NEVER clears. The sole clear authority remains #3260's
+  # check_quarantine_active, which independently requires the stamped SHA be an
+  # ancestor of origin/main. A wrong/unmerged/premature stamp still BLOCKs.
+  #
+  # gh mock: matches the REAL --jq output shapes (Critic A) —
+  #   `gh issue view N --json closedByPullRequestsReferences --jq
+  #      '.closedByPullRequestsReferences[]?.number'`  → newline-separated PR #s
+  #   `gh pr view P --json state,mergeCommit --jq
+  #      'select(.state=="MERGED") | .mergeCommit.oid'` → merge SHA or empty.
+  # Driven by env: _GH_PR_FOR_ISSUE (PR# closing N or empty), _GH_PR_STATE
+  # (MERGED / OPEN), _GH_PR_MERGESHA (the merge oid), _GH_RC (non-zero → error).
+  _q_autostamp_gh() {
+    if [[ "${_GH_RC:-0}" -ne 0 ]]; then return "${_GH_RC}"; fi
+    case "$1" in
+      issue)
+        # gh issue view N --repo R --json closedByPullRequestsReferences --jq '...'
+        # Real --jq emits one PR number per line (empty when none).
+        [[ -n "${_GH_PR_FOR_ISSUE:-}" ]] && printf '%s\n' "$_GH_PR_FOR_ISSUE"
+        return 0
+        ;;
+      pr)
+        # gh pr view P --repo R --json state,mergeCommit --jq 'select(.state=="MERGED")|.mergeCommit.oid'
+        # Real --jq emits the oid only when state==MERGED, else nothing.
+        if [[ "${_GH_PR_STATE:-MERGED}" == "MERGED" ]]; then
+          printf '%s\n' "${_GH_PR_MERGESHA:-}"
+        fi
+        return 0
+        ;;
+      *) return 0 ;;
+    esac
+  }
+
+  # ── Test 78s — END-TO-END (#3258→#3260): reason #N + merged closing PR →
+  #   autostamp stamps resolved:<mergeSha>, then the gate AUTO-CLEARS.
+  # FAILS on origin/main today (no quarantine_autostamp → entry stays
+  # blocked_active, the tick-199 false-block); PASSES after this lands.
+  printf '%s regression #3238\n' "$sha1" > "$qdir/autostamp_e2e.txt"
+  _GH_PR_FOR_ISSUE=3251 _GH_PR_STATE=MERGED _GH_PR_MERGESHA="$sha2"
+  gh() { _q_autostamp_gh "$@"; }
+  local rc78s_stamp=0
+  quarantine_autostamp "$qdir/autostamp_e2e.txt" || rc78s_stamp=$?
+  unset -f gh
+  # Verify the stamp landed.
+  parse_quarantine_file "$qdir/autostamp_e2e.txt"
+  local stamped78s="$QUARANTINE_RESOLVED"
+  # Now the gate: sha1 ancestor + benign hunk present (partial), but resolved
+  # sha2 is on main → CLEAR. Reuse the resolved-aware git mock (sha2 merged).
+  _Q_RESOLVED_RC=0
+  git() { _q_resolved_git "$@"; }
+  local rc78s=0
+  check_quarantine_active "$qdir/autostamp_e2e.txt" || rc78s=$?
+  unset -f git
+  unset _Q_RESOLVED_RC
+  unset _GH_PR_FOR_ISSUE _GH_PR_STATE _GH_PR_MERGESHA
+  if [[ "$stamped78s" == "$sha2" && $rc78s -eq 1 && "$QUARANTINE_STATUS" == "clear" && -z "$QUARANTINED_MATCH" ]]; then
+    tap_ok "quarantine-autostamp: reason #N + merged PR → stamps resolved:<sha>, gate auto-clears (#3258→#3260)"
+  else
+    tap_not_ok "quarantine-autostamp: reason #N + merged PR → stamps resolved:<sha>, gate auto-clears (#3258→#3260)" \
+      "stamped='$stamped78s' rc=$rc78s status=$QUARANTINE_STATUS match=$QUARANTINED_MATCH"
+  fi
+
+  # ── Test 78t — no `#N` in reason → no stamp (gate's per-hunk check governs) ─
+  printf '%s regression no-issue-number\n' "$sha1" > "$qdir/autostamp_noissue.txt"
+  _GH_PR_FOR_ISSUE=3251 _GH_PR_STATE=MERGED _GH_PR_MERGESHA="$sha2"
+  gh() { _q_autostamp_gh "$@"; }
+  quarantine_autostamp "$qdir/autostamp_noissue.txt" || true
+  unset -f gh
+  unset _GH_PR_FOR_ISSUE _GH_PR_STATE _GH_PR_MERGESHA
+  parse_quarantine_file "$qdir/autostamp_noissue.txt"
+  if [[ "$QUARANTINE_RESOLVED" == "-" ]]; then
+    tap_ok "quarantine-autostamp: reason without #N is not stamped (per-hunk gate governs)"
+  else
+    tap_not_ok "quarantine-autostamp: reason without #N is not stamped (per-hunk gate governs)" \
+      "resolved='$QUARANTINE_RESOLVED' contents='$(cat "$qdir/autostamp_noissue.txt")'"
+  fi
+
+  # ── Test 78u — closing PR is OPEN (state != MERGED) → no stamp (fail-safe) ──
+  printf '%s regression #3238\n' "$sha1" > "$qdir/autostamp_open.txt"
+  _GH_PR_FOR_ISSUE=3251 _GH_PR_STATE=OPEN _GH_PR_MERGESHA="$sha2"
+  gh() { _q_autostamp_gh "$@"; }
+  quarantine_autostamp "$qdir/autostamp_open.txt" || true
+  unset -f gh
+  unset _GH_PR_FOR_ISSUE _GH_PR_STATE _GH_PR_MERGESHA
+  parse_quarantine_file "$qdir/autostamp_open.txt"
+  if [[ "$QUARANTINE_RESOLVED" == "-" ]]; then
+    tap_ok "quarantine-autostamp: open (non-MERGED) closing PR is not stamped (fail-safe)"
+  else
+    tap_not_ok "quarantine-autostamp: open (non-MERGED) closing PR is not stamped (fail-safe)" \
+      "resolved='$QUARANTINE_RESOLVED' contents='$(cat "$qdir/autostamp_open.txt")'"
+  fi
+
+  # ── Test 78v — gh error (rc!=0) → no stamp, function does not abort ────────
+  printf '%s regression #3238\n' "$sha1" > "$qdir/autostamp_gherr.txt"
+  _GH_RC=1 _GH_PR_FOR_ISSUE=3251 _GH_PR_STATE=MERGED _GH_PR_MERGESHA="$sha2"
+  gh() { _q_autostamp_gh "$@"; }
+  local rc78v=0
+  quarantine_autostamp "$qdir/autostamp_gherr.txt" || rc78v=$?
+  unset -f gh
+  unset _GH_RC _GH_PR_FOR_ISSUE _GH_PR_STATE _GH_PR_MERGESHA
+  parse_quarantine_file "$qdir/autostamp_gherr.txt"
+  if [[ "$QUARANTINE_RESOLVED" == "-" && $rc78v -eq 0 ]]; then
+    tap_ok "quarantine-autostamp: gh error skips entry, returns without abort (best-effort)"
+  else
+    tap_not_ok "quarantine-autostamp: gh error skips entry, returns without abort (best-effort)" \
+      "rc=$rc78v resolved='$QUARANTINE_RESOLVED' contents='$(cat "$qdir/autostamp_gherr.txt")'"
+  fi
+
+  # ── Test 78w — entry already stamped → unchanged, gh is NOT invoked ────────
+  printf '%s regression #3238 resolved:%s\n' "$sha1" "$sha2" > "$qdir/autostamp_idem.txt"
+  local _gh_called78w=0
+  gh() { _gh_called78w=1; _q_autostamp_gh "$@"; }
+  _GH_PR_FOR_ISSUE=3251 _GH_PR_STATE=MERGED _GH_PR_MERGESHA="cccccccccccccccccccccccccccccccccccccccc"
+  quarantine_autostamp "$qdir/autostamp_idem.txt" || true
+  unset -f gh
+  unset _GH_PR_FOR_ISSUE _GH_PR_STATE _GH_PR_MERGESHA
+  parse_quarantine_file "$qdir/autostamp_idem.txt"
+  if [[ "$QUARANTINE_RESOLVED" == "$sha2" && "$_gh_called78w" -eq 0 ]]; then
+    tap_ok "quarantine-autostamp: already-stamped entry is unchanged, no gh call (idempotent)"
+  else
+    tap_not_ok "quarantine-autostamp: already-stamped entry is unchanged, no gh call (idempotent)" \
+      "resolved='$QUARANTINE_RESOLVED' gh_called=$_gh_called78w contents='$(cat "$qdir/autostamp_idem.txt")'"
+  fi
+
+  # ── Test 78x — self-resolution (merge SHA == quarantined SHA) → not stamped ─
+  # quarantine_resolve rejects sha==resolved; autostamp delegates that guard.
+  printf '%s regression #3238\n' "$sha1" > "$qdir/autostamp_self.txt"
+  _GH_PR_FOR_ISSUE=3251 _GH_PR_STATE=MERGED _GH_PR_MERGESHA="$sha1"
+  gh() { _q_autostamp_gh "$@"; }
+  quarantine_autostamp "$qdir/autostamp_self.txt" || true
+  unset -f gh
+  unset _GH_PR_FOR_ISSUE _GH_PR_STATE _GH_PR_MERGESHA
+  parse_quarantine_file "$qdir/autostamp_self.txt"
+  if [[ "$QUARANTINE_RESOLVED" == "-" ]]; then
+    tap_ok "quarantine-autostamp: self-resolution (merge sha == quarantined sha) is not stamped"
+  else
+    tap_not_ok "quarantine-autostamp: self-resolution (merge sha == quarantined sha) is not stamped" \
+      "resolved='$QUARANTINE_RESOLVED' contents='$(cat "$qdir/autostamp_self.txt")'"
   fi
 
   # ── Test 79: check_quarantine_active — git error on ancestry (fail-closed) ─
