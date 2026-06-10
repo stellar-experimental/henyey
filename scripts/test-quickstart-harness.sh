@@ -1424,11 +1424,17 @@ test_workflow_testnet_shard_uses_soft_timeout_and_tight_budget() {
     fi
 
     # Scope guard: pubnet/local shard blocks must NOT carry soft_on_timeout: true.
-    # Extract the pubnet block (from 'network: pubnet' to end of matrix include).
+    # Match only the real YAML matrix KEY (an actual `soft_on_timeout: true`
+    # line), not prose inside a `#` comment that happens to mention the flag —
+    # so strip comment lines before grepping. The testnet entry's documentation
+    # comment block precedes `- network: testnet`, so without this filter its
+    # prose would be miscounted against the local shards.
     local pubnet_block local_blocks
-    pubnet_block=$(awk '/network: pubnet/{f=1} f{print}' "$WORKFLOW" | awk '/^    steps:/{exit} {print}')
+    pubnet_block=$(awk '/network: pubnet/{f=1} f{print}' "$WORKFLOW" \
+        | awk '/^    steps:/{exit} {print}' | grep -vE '^[[:space:]]*#')
     # Local blocks: everything from the first matrix include up to the testnet entry.
-    local_blocks=$(awk '/include:/{f=1} f && /network: testnet/{exit} f{print}' "$WORKFLOW")
+    local_blocks=$(awk '/include:/{f=1} f && /network: testnet/{exit} f{print}' "$WORKFLOW" \
+        | grep -vE '^[[:space:]]*#')
     if ! echo "$pubnet_block" | grep -qE 'soft_on_timeout:[[:space:]]*true' \
         && ! echo "$local_blocks" | grep -qE 'soft_on_timeout:[[:space:]]*true'; then
         tap_ok "workflow_pubnet_local_shards_have_no_soft_flag"

@@ -8,9 +8,27 @@
 #       --timeout <seconds> (default: 600) --diagnostics-dir <dir> -- <probe_command...>
 #
 # Exit codes:
-#   0 — probe passed (possibly after one retry)
+#   0 — probe passed (possibly after one retry), OR a timeout (exit 124) was
+#       soft-skipped under --soft-on-timeout (see below)
 #   1 — probe failed (non-timeout, or second timeout on retryable shard)
 #   2 — usage error
+#
+# --soft-on-timeout (opt-in, default OFF — #3272):
+#   The chronic external-testnet flake (issue #3272) red-rolls `main` whenever a
+#   stuck testnet sync probe times out (GNU `timeout` exit 124) on both the first
+#   attempt and the single retry. The testnet shard depends on external network
+#   liveness (checkpoint cadence, archive availability) and is NOT a henyey
+#   correctness signal — so a TIMEOUT there should not gate the merge. When
+#   --soft-on-timeout is passed (the testnet shard only), a *timeout* disposition
+#   (exit code 124 ONLY) is converted to a neutral `exit 0` with a grep-able
+#   `SOFT-SKIP` marker; diagnostics are still captured so the degraded-testnet
+#   event remains observable in uploaded artifacts. This extends the existing
+#   pubnet/testnet-RPC-disabled "don't gate henyey-correctness merges on external
+#   network liveness" precedent, scoped strictly to the TIMEOUT outcome.
+#   When the flag is OFF (every other caller/shard), behavior is byte-identical.
+#   A genuine probe assertion FAILURE (any non-124 exit) ALWAYS stays red, even
+#   under the flag, so a real henyey-on-testnet break is never masked. Only 124
+#   is soft-skipped; 125/126/127/137 (and any other non-124) stay red.
 #
 # Timeout budget: the caller (.github/workflows/quickstart.yml) is responsible
 # for supplying the per-probe budget via --timeout <seconds>. That budget
@@ -59,6 +77,10 @@ ENABLE=""
 PROBE=""
 TIMEOUT=600
 DIAGNOSTICS_DIR=""
+# Opt-in (#3272): treat a TIMEOUT (exit 124) disposition as a neutral soft-skip
+# instead of a red failure. Default OFF ⇒ behavior byte-identical for all other
+# shards/callers. See the header for the rationale and the strict 124-only scope.
+SOFT_ON_TIMEOUT=false
 PROBE_CMD=()
 
 while [[ $# -gt 0 ]]; do
@@ -68,6 +90,7 @@ while [[ $# -gt 0 ]]; do
         --probe) PROBE="$2"; shift 2 ;;
         --timeout) TIMEOUT="$2"; shift 2 ;;
         --diagnostics-dir) DIAGNOSTICS_DIR="$2"; shift 2 ;;
+        --soft-on-timeout) SOFT_ON_TIMEOUT=true; shift ;;
         --) shift; PROBE_CMD=("$@"); break ;;
         *) echo "Unknown option: $1" >&2; exit 2 ;;
     esac
@@ -104,6 +127,23 @@ is_retryable_shard() {
 # workflow recovers the fully-reclaimed case.)
 is_retryable_exit() {
     [[ "$1" -eq 124 || "$1" -eq 143 || "$1" -eq 137 ]]
+}
+
+# --- Helper: soft-skip a TIMEOUT disposition under --soft-on-timeout (#3272) ---
+# Returns 0 (and emits the grep-able SOFT-SKIP marker) iff the flag is on AND the
+# exit code is EXACTLY 124 (a GNU `timeout` TIMEOUT). Strictly 124 only:
+# 125/126/127/137 and any other non-124 exit are NOT soft-skipped — a genuine
+# probe assertion failure must stay red so a real henyey-on-testnet break is
+# never masked. Callers use this at each of the two 124 sinks (first-attempt
+# non-retryable timeout, and the post-retry second timeout) to decide whether to
+# `exit 0` instead of `exit 1`.
+should_soft_skip_timeout() {
+    [[ "$SOFT_ON_TIMEOUT" == true && "$1" -eq 124 ]]
+}
+
+emit_soft_skip() {
+    echo "=== SOFT-SKIP: testnet sync probe timed out (environmental, not a henyey failure) ===" >&2
+    echo "=== SOFT-SKIP: $NETWORK/$ENABLE/$PROBE exit 124 treated as neutral (#3272); diagnostics preserved ===" >&2
 }
 
 # --- Helper: capture diagnostics ---
@@ -171,11 +211,29 @@ if is_retryable_exit "$EXIT_CODE" && is_retryable_shard; then
         exit 0
     fi
 
+    # Post-retry sink. Under --soft-on-timeout, a SECOND timeout (exit 124 ONLY)
+    # is a neutral soft-skip (#3272); any other non-124 exit (a genuine probe
+    # assertion failure) stays red.
+    if should_soft_skip_timeout "$EXIT_CODE"; then
+        emit_soft_skip
+        echo "=== Failed on retry (exit $EXIT_CODE) but soft-skipped (timeout) ===" >&2
+        exit 0
+    fi
+
     echo "=== Failed on retry (exit $EXIT_CODE) ===" >&2
     exit 1
 fi
 
-# Non-transient failure, or transient failure on a non-retryable shard —
-# fail immediately so genuine test failures stay loud.
+# Non-transient failure, or transient failure on a non-retryable shard.
+# Under --soft-on-timeout, a TIMEOUT (exit 124 ONLY) here is a neutral soft-skip
+# (#3272); any other non-124 exit (a genuine probe assertion failure) stays red,
+# so a real henyey-on-testnet break is never masked.
+if should_soft_skip_timeout "$EXIT_CODE"; then
+    emit_soft_skip
+    echo "=== Failed (exit $EXIT_CODE) but soft-skipped (timeout) ===" >&2
+    exit 0
+fi
+
+# Fail immediately so genuine test failures stay loud.
 echo "=== Failed (exit $EXIT_CODE), not retryable ===" >&2
 exit 1
