@@ -2526,6 +2526,16 @@ impl App {
                     // the node is behind. Must NOT fire for Invalid/TooOld.  See #1812.
                     self.max_observed_externalize_slot
                         .fetch_max(slot, Ordering::SeqCst);
+                    // Observability-only (#3270): record this peer's highest
+                    // observed externalized slot via live SCP gossip, so the
+                    // GetScpState re-request log can report how many connected
+                    // peers could still serve the requested slot. Pure
+                    // side-write — does not alter envelope control flow.
+                    if let Some(peer) = from_peer_opt.as_ref() {
+                        if let Some(overlay) = self.overlay().await {
+                            overlay.record_peer_externalized(peer, slot);
+                        }
+                    }
                     tracing::debug!(slot, tracking, "EXTERNALIZE Valid — processing slot");
                     if let Some(tx_set_hash) = tx_set_hash {
                         self.herder.scp_driver().request_tx_set(tx_set_hash, slot);
@@ -2553,6 +2563,14 @@ impl App {
                 if is_externalize {
                     self.max_observed_externalize_slot
                         .fetch_max(slot, Ordering::SeqCst);
+                    // Observability-only (#3270): record this peer's highest
+                    // observed externalized slot via live SCP gossip. Pure
+                    // side-write — does not alter envelope control flow.
+                    if let Some(peer) = from_peer_opt.as_ref() {
+                        if let Some(overlay) = self.overlay().await {
+                            overlay.record_peer_externalized(peer, slot);
+                        }
+                    }
                     let current_ledger = self.current_ledger_seq() as u64;
                     if slot > current_ledger + 2 {
                         let next_slot = current_ledger as u32 + 1;

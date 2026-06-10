@@ -2549,6 +2549,7 @@ mod tests {
                 dropped_authenticated_peers: Arc::new(AtomicU64::new(0)),
                 banned_peers: Arc::new(RwLock::new(HashSet::new())),
                 peer_info_cache: Arc::new(DashMap::new()),
+                peer_latest_externalized: Arc::new(DashMap::new()),
                 last_closed_ledger: Arc::new(AtomicU32::new(0)),
                 scp_callback: None,
                 is_validator: false,
