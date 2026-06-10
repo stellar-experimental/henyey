@@ -45,7 +45,7 @@ cleanup  # ensure fresh state
 mkdir -p "$TEST_ROOT"
 
 # ── TAP state ────────────────────────────────────────────────────────────────
-TAP_PLAN=337
+TAP_PLAN=349
 TAP_CURRENT=0
 TAP_FAILURES=0
 
@@ -2403,6 +2403,212 @@ CANNED
     fi
   else
     tap_skip "quarantine-active: drift stays blocked — zsh recheck" "zsh not found"
+  fi
+
+  # ── Tests 78f-78j + 78r: resolved:<sha> auto-clear and its fail-safes (#3256) ─
+  # A bundled-commit quarantine (#3238) mixed a harmful hunk (removed by #3251)
+  # with benign hunks intentionally kept on main. The per-hunk content-check
+  # (78e) stays blocked_active FOREVER because the benign hunks legitimately
+  # reverse-apply — the tick-199 false-block. The fix: an additive
+  # `resolved:<fix-sha>` token auto-clears the entry once the fix SHA is an
+  # ancestor of origin/main. Every uncertain case (not-merged, malformed,
+  # self-resolution, git error) FALLS BACK to the per-hunk BLOCK (fail-safe).
+  #
+  # Mock strategy: reuse the `_Q_MODE=partial` canned diff (so the per-hunk
+  # content-check WOULD block — this is what makes 78f genuinely depend on the
+  # resolved short-circuit, not on the diff). A dedicated `git` mock dispatches
+  # `merge-base --is-ancestor <sha> origin/main` on the SHA being checked: the
+  # quarantined SHA ($sha1) is always an ancestor; the resolved/fix SHA is
+  # governed by `$_Q_RESOLVED_RC` (0 = merged, 1 = not yet, 128 = git error).
+  # `apply` is the partial-presence model: only the harmful hunk reverse-applies.
+  _q_resolved_git() {
+    case "$1" in
+      merge-base)
+        # Args: merge-base --is-ancestor <sha> origin/main → SHA is $3.
+        if [[ "$3" == "$sha1" ]]; then
+          return 0   # quarantined SHA is always deployed (ancestor)
+        fi
+        return "${_Q_RESOLVED_RC:-0}"  # fix SHA ancestry governed by the test
+        ;;
+      diff) _q_canned_diff_partial; return 0 ;;
+      apply)
+        local patch; patch="$(cat)"
+        if printf '%s' "$patch" | grep -qE 'GONE_HUNK_ONE_MARKER|GONE_HUNK_THREE_MARKER'; then
+          return 1
+        fi
+        if printf '%s' "$patch" | grep -q 'HARMFUL_RETAIN_FALSE_MARKER'; then
+          return 0
+        fi
+        return 1
+        ;;
+      *) return 0 ;;
+    esac
+  }
+
+  # ── Test 78f — bundled commit + surviving benign hunk + resolved-on-main → CLEAR
+  # FAILS on origin/main today (no `resolved` parsing → blocked_active, the
+  # tick-199 bug); PASSES after the resolved short-circuit lands.
+  printf '%s regression #3238 resolved:%s\n' "$sha1" "$sha2" > "$qdir/resolved_clear.txt"
+  _Q_RESOLVED_RC=0
+  git() { _q_resolved_git "$@"; }
+  local rc78f=0
+  check_quarantine_active "$qdir/resolved_clear.txt" || rc78f=$?
+  unset -f git
+  unset _Q_RESOLVED_RC
+  if [[ $rc78f -eq 1 && "$QUARANTINE_STATUS" == "clear" && -z "$QUARANTINED_MATCH" ]]; then
+    tap_ok "quarantine-active: bundled commit + resolved-on-main auto-clears (#3256)"
+  else
+    tap_not_ok "quarantine-active: bundled commit + resolved-on-main auto-clears (#3256)" \
+      "rc=$rc78f status=$QUARANTINE_STATUS match=$QUARANTINED_MATCH"
+  fi
+
+  # ── Test 78g — resolved-SHA NOT yet on main → stays blocked (fail-safe) ─────
+  printf '%s regression #3238 resolved:%s\n' "$sha1" "$sha2" > "$qdir/resolved_unmerged.txt"
+  _Q_RESOLVED_RC=1
+  git() { _q_resolved_git "$@"; }
+  local rc78g=0
+  check_quarantine_active "$qdir/resolved_unmerged.txt" || rc78g=$?
+  unset -f git
+  unset _Q_RESOLVED_RC
+  if [[ $rc78g -eq 0 && "$QUARANTINE_STATUS" == "blocked_active" && "$QUARANTINED_MATCH" == "$sha1" ]]; then
+    tap_ok "quarantine-active: resolved-SHA not yet merged stays blocked (fail-safe)"
+  else
+    tap_not_ok "quarantine-active: resolved-SHA not yet merged stays blocked (fail-safe)" \
+      "rc=$rc78g status=$QUARANTINE_STATUS match=$QUARANTINED_MATCH"
+  fi
+
+  # ── Test 78h — malformed resolved token → falls back to per-hunk BLOCK ──────
+  printf '%s regression #3238 resolved:notahex\n' "$sha1" > "$qdir/resolved_malformed.txt"
+  _Q_RESOLVED_RC=0
+  git() { _q_resolved_git "$@"; }
+  local rc78h=0
+  check_quarantine_active "$qdir/resolved_malformed.txt" || rc78h=$?
+  unset -f git
+  unset _Q_RESOLVED_RC
+  if [[ $rc78h -eq 0 && "$QUARANTINE_STATUS" == "blocked_active" && "$QUARANTINED_MATCH" == "$sha1" ]]; then
+    tap_ok "quarantine-active: malformed resolved token falls back to per-hunk block"
+  else
+    tap_not_ok "quarantine-active: malformed resolved token falls back to per-hunk block" \
+      "rc=$rc78h status=$QUARANTINE_STATUS match=$QUARANTINED_MATCH"
+  fi
+
+  # ── Test 78i — self-resolution (resolved == own SHA) → BLOCK ────────────────
+  # A commit is always its own ancestor, so resolved:<own-sha> would
+  # permanently auto-clear. The guard rejects it → per-hunk block governs.
+  printf '%s regression #3238 resolved:%s\n' "$sha1" "$sha1" > "$qdir/resolved_self.txt"
+  _Q_RESOLVED_RC=0
+  git() { _q_resolved_git "$@"; }
+  local rc78i=0
+  check_quarantine_active "$qdir/resolved_self.txt" || rc78i=$?
+  unset -f git
+  unset _Q_RESOLVED_RC
+  if [[ $rc78i -eq 0 && "$QUARANTINE_STATUS" == "blocked_active" && "$QUARANTINED_MATCH" == "$sha1" ]]; then
+    tap_ok "quarantine-active: self-resolution (resolved==own sha) is rejected, stays blocked"
+  else
+    tap_not_ok "quarantine-active: self-resolution (resolved==own sha) is rejected, stays blocked" \
+      "rc=$rc78i status=$QUARANTINE_STATUS match=$QUARANTINED_MATCH"
+  fi
+
+  # ── Test 78j — git error on resolved-ancestry check → BLOCK (fail-closed) ───
+  printf '%s regression #3238 resolved:%s\n' "$sha1" "$sha2" > "$qdir/resolved_giterr.txt"
+  _Q_RESOLVED_RC=128
+  git() { _q_resolved_git "$@"; }
+  local rc78j=0
+  check_quarantine_active "$qdir/resolved_giterr.txt" || rc78j=$?
+  unset -f git
+  unset _Q_RESOLVED_RC
+  if [[ $rc78j -eq 0 && "$QUARANTINE_STATUS" == "blocked_active" && "$QUARANTINED_MATCH" == "$sha1" ]]; then
+    tap_ok "quarantine-active: git error on resolved-ancestry falls back to block (fail-closed)"
+  else
+    tap_not_ok "quarantine-active: git error on resolved-ancestry falls back to block (fail-closed)" \
+      "rc=$rc78j status=$QUARANTINE_STATUS match=$QUARANTINED_MATCH"
+  fi
+
+  # ── Test 78k — parse extracts resolved token (token-boundary-anchored) ──────
+  # `unresolved:<40hex>` must NOT false-match; a real `resolved:<40hex>` must.
+  printf '%s reason unresolved:%s\n%s reason resolved:%s\n' \
+    "$sha1" "$sha2" "$sha2" "$sha1" > "$qdir/resolved_parse.txt"
+  parse_quarantine_file "$qdir/resolved_parse.txt"
+  local expected_resolved
+  expected_resolved=$(printf '%s\n%s' "-" "$sha1")
+  if [[ "$QUARANTINE_RESOLVED" == "$expected_resolved" ]]; then
+    tap_ok "quarantine-parse: resolved token extracted, unresolved: substring ignored"
+  else
+    tap_not_ok "quarantine-parse: resolved token extracted, unresolved: substring ignored" \
+      "resolved='$QUARANTINE_RESOLVED' expected='$expected_resolved'"
+  fi
+
+  # ── Test 78l — quarantine_resolve stamps token onto matching entry ──────────
+  local resolve_file="$qdir/resolve_stamp.txt"
+  printf '%s regression #3238\n%s other entry\n' "$sha1" "$sha2" > "$resolve_file"
+  quarantine_resolve "$resolve_file" "$sha1" "$sha2"
+  local rc78l=$?
+  parse_quarantine_file "$resolve_file"
+  local stamped_resolved
+  stamped_resolved=$(printf '%s\n%s' "$sha2" "-")
+  if [[ $rc78l -eq 0 && "$QUARANTINE_RESOLVED" == "$stamped_resolved" ]] \
+     && grep -q "^$sha1 regression #3238 resolved:$sha2$" "$resolve_file" \
+     && grep -q "^$sha2 other entry$" "$resolve_file"; then
+    tap_ok "quarantine-resolve: stamps resolved:<sha> onto matching entry, others untouched"
+  else
+    tap_not_ok "quarantine-resolve: stamps resolved:<sha> onto matching entry, others untouched" \
+      "rc=$rc78l resolved='$QUARANTINE_RESOLVED' contents='$(cat "$resolve_file")'"
+  fi
+
+  # ── Test 78m — quarantine_resolve is idempotent (no duplicate token) ────────
+  quarantine_resolve "$resolve_file" "$sha1" "$sha2"
+  local rc78m=$?
+  local token_count
+  token_count=$(grep -o "resolved:$sha2" "$resolve_file" | wc -l)
+  if [[ $rc78m -eq 0 && "$token_count" -eq 1 ]]; then
+    tap_ok "quarantine-resolve: second call is idempotent (single token)"
+  else
+    tap_not_ok "quarantine-resolve: second call is idempotent (single token)" \
+      "rc=$rc78m token_count=$token_count contents='$(cat "$resolve_file")'"
+  fi
+
+  # ── Test 78n — quarantine_resolve replaces a stale resolved token ───────────
+  local sha3="cccccccccccccccccccccccccccccccccccccccc"
+  quarantine_resolve "$resolve_file" "$sha1" "$sha3"
+  local rc78n=$?
+  if [[ $rc78n -eq 0 ]] \
+     && grep -q "^$sha1 regression #3238 resolved:$sha3$" "$resolve_file" \
+     && ! grep -q "resolved:$sha2" "$resolve_file"; then
+    tap_ok "quarantine-resolve: re-stamp canonicalizes to the new fix SHA"
+  else
+    tap_not_ok "quarantine-resolve: re-stamp canonicalizes to the new fix SHA" \
+      "rc=$rc78n contents='$(cat "$resolve_file")'"
+  fi
+
+  # ── Test 78o — quarantine_resolve rejects self-resolution (rc 1) ────────────
+  local rc78o=0
+  quarantine_resolve "$resolve_file" "$sha1" "$sha1" || rc78o=$?
+  if [[ $rc78o -eq 1 ]]; then
+    tap_ok "quarantine-resolve: self-resolution (sha==resolved) returns 1"
+  else
+    tap_not_ok "quarantine-resolve: self-resolution (sha==resolved) returns 1" "rc=$rc78o"
+  fi
+
+  # ── Test 78p — quarantine_resolve rejects invalid SHA (rc 1) ────────────────
+  local rc78p=0
+  quarantine_resolve "$resolve_file" "$sha1" "not-a-sha" || rc78p=$?
+  local rc78p2=0
+  quarantine_resolve "$resolve_file" "bad" "$sha2" || rc78p2=$?
+  if [[ $rc78p -eq 1 && $rc78p2 -eq 1 ]]; then
+    tap_ok "quarantine-resolve: invalid SHA (either arg) returns 1"
+  else
+    tap_not_ok "quarantine-resolve: invalid SHA (either arg) returns 1" \
+      "resolved-bad=$rc78p sha-bad=$rc78p2"
+  fi
+
+  # ── Test 78q — quarantine_resolve on missing file is a no-op (rc 0) ─────────
+  local rc78q=0
+  quarantine_resolve "$qdir/no_such_resolve.txt" "$sha1" "$sha2" || rc78q=$?
+  if [[ $rc78q -eq 0 && ! -e "$qdir/no_such_resolve.txt" ]]; then
+    tap_ok "quarantine-resolve: missing file is a no-op (rc 0, no file created)"
+  else
+    tap_not_ok "quarantine-resolve: missing file is a no-op (rc 0, no file created)" \
+      "rc=$rc78q exists=$([ -e "$qdir/no_such_resolve.txt" ] && echo yes || echo no)"
   fi
 
   # ── Test 79: check_quarantine_active — git error on ancestry (fail-closed) ─

@@ -1840,6 +1840,29 @@ Entries stay in the file as a historical log; they're harmless once their
 content is gone. The file can grow unboundedly over time if you want a
 deploy audit trail; trim it manually whenever convenient.
 
+**Bundled commits (`resolved:<fix-sha>`)** — the content-check above blocks
+if **any** hunk of the quarantined SHA still reverse-applies. A commit that
+**bundled** a harmful change with desirable ones (e.g. #3238 mixed a harmful
+`retain:false` with the benign `_rjem_malloc_conf` export + instrumentation)
+can never auto-clear after a **partial** revert: the benign hunks are
+intentionally kept on `origin/main`, so the per-hunk check stays
+`blocked_active` forever (the tick-199 false-block, #3256). For that case,
+stamp the entry once with the fix commit that resolved it:
+
+```bash
+source "$(git rev-parse --show-toplevel)/scripts/lib/deploy-quarantine.sh"
+# <fix-sha> is the commit that removed the harmful part (e.g. #3251).
+quarantine_resolve "$HOME/data/deploy_quarantine.txt" "$bad_sha" "$fix_sha"
+```
+
+This appends a `resolved:<fix-sha>` token to the entry. The gate **auto-clears**
+that entry once `<fix-sha>` is an ancestor of `origin/main` (i.e. the fix has
+merged) — no further per-tick action needed. It is **fail-safe**: a not-yet-
+merged fix, a malformed token, a self-resolution (`<fix-sha>` == `<bad_sha>`),
+or a git error all fall back to the per-hunk content-check (BLOCK). Stamping is
+a once-per-quarantine manual step today; automatic fix-SHA stamping is the
+follow-up #3258. `quarantine_remove` remains the override.
+
 **Manual removal** (still supported, occasionally useful — e.g. an entry
 that the content check can't decide cleanly because of a malformed diff
 or a binary file):

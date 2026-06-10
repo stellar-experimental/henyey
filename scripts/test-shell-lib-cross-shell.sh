@@ -70,7 +70,7 @@ expected_funcs_for() {
     dedup-filing.sh)
       echo "dedup_load dedup_prune dedup_check dedup_record dedup_remove dedup_update_field dedup_write" ;;
     deploy-quarantine.sh)
-      echo "parse_quarantine_file check_quarantine_active check_quarantine_ancestry quarantine_append quarantine_remove" ;;
+      echo "parse_quarantine_file check_quarantine_active check_quarantine_ancestry quarantine_append quarantine_remove quarantine_resolve" ;;
     monitor-decisions.sh)
       echo "check_session_wiped check_long_stale_session detect_crash_state cleanup_guard" ;;
     review-pr-merge.sh)
