@@ -41,6 +41,7 @@ henyey_scp_post_verify_total{reason="duplicate"} 280
 henyey_scp_post_verify_total{reason="too_far"} 18
 henyey_scp_post_verify_total{reason="buffer_full"} 4
 henyey_scp_post_verify_total{reason="per_slot_full"} 9
+henyey_scp_post_verify_total{reason="drift_manual_close"} 0
 stellar_herder_pending_too_old_total 45
 stellar_herder_pending_received_total 1900
 # Counter-streak

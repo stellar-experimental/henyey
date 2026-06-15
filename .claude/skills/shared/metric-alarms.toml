@@ -618,7 +618,7 @@ expected_labels = [
     "invalid_sig", "panic", "drift_range", "drift_close_time",
     "drift_cannot_receive", "self_message", "non_quorum", "buffered",
     "duplicate", "too_far", "buffer_full", "processed_directly",
-    "per_slot_full", "accepted",
+    "per_slot_full", "accepted", "drift_manual_close",
 ]
 ratio_op = "<"
 ratio_threshold = 0.05

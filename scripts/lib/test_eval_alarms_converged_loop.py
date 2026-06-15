@@ -444,6 +444,86 @@ def test_gate_skip_stderr_unified_format():
     assert "state=skipped" in line, f"Missing 'state=skipped' in telemetry: {line}"
 
 
+# ── Test: scp-accept-rate-low not skipped on the real 15-label fixtures (#3281) ─
+
+def test_scp_accept_rate_low_not_label_set_mismatch_on_real_fixtures():
+    """#3281/#3278: scp-accept-rate-low must NOT skip with "label set mismatch".
+
+    Runs the REAL alarm catalog (.claude/skills/shared/metric-alarms.toml) against
+    the REAL healthy eval-alarms fixtures. Before the label-set sync, the catalog
+    `expected_labels` was 14 while the live binary (and the fixtures) emit 15
+    post-verify series including `drift_manual_close`; the evaluator's exact
+    set-equality check then skipped the alarm every tick with skip_reason
+    "label set mismatch", silently disabling SCP accept-rate monitoring.
+
+    This is the observable-impact guard for #3281: once the catalog and both
+    fixtures carry all 15 labels, the alarm must EVALUATE — accepted states are
+    `collecting_baseline` (single-invocation baseline) or `ok`, and skip_reason
+    must not be a label-set mismatch. We deliberately accept `collecting_baseline`
+    in addition to `ok`: a single eval against the two fixtures resets the
+    counter-snapshot identity, so the evaluator legitimately reports
+    `collecting_baseline` rather than a converged ratio.
+    """
+    repo_root = Path(__file__).resolve().parents[2]
+    catalog_path = repo_root / ".claude" / "skills" / "shared" / "metric-alarms.toml"
+    fixture_dir = repo_root / "scripts" / "fixtures" / "eval-alarms"
+    current_path = fixture_dir / "healthy-current.prom"
+    prev_path = fixture_dir / "healthy-prev.prom"
+
+    assert catalog_path.is_file(), f"missing catalog: {catalog_path}"
+    assert current_path.is_file(), f"missing fixture: {current_path}"
+    assert prev_path.is_file(), f"missing fixture: {prev_path}"
+
+    with tempfile.TemporaryDirectory() as d:
+        state_dir = Path(d) / "state"
+        state_dir.mkdir(parents=True, exist_ok=True)
+
+        argv = [
+            "eval-alarms",
+            "--catalog", str(catalog_path),
+            "--current", str(current_path),
+            "--prev", str(prev_path),
+            "--state-dir", str(state_dir),
+        ]
+        env = {
+            "PREV_PROM_INVALID": "false",
+            "WARMUP_TICKS_REMAINING": "0",
+            "FRESH_START": "no",
+            "CRASH_RECOVERY": "no",
+            "UPTIME_SECONDS": "9999",
+            "MONITOR_MODE": "validator",
+            "PID": "123",
+            "START_TICKS": "456",
+        }
+
+        stdout_buf = io.StringIO()
+        stderr_buf = io.StringIO()
+        with patch.object(sys, "argv", argv), \
+             patch.object(sys, "stdout", stdout_buf), \
+             patch.object(sys, "stderr", stderr_buf), \
+             patch.dict(os.environ, env, clear=False):
+            rc = main()
+
+        assert rc == 0, f"main() returned {rc}, stderr: {stderr_buf.getvalue()}"
+        output = json.loads(stdout_buf.getvalue())
+
+    results = [a for a in output.get("alarms", []) if a.get("name") == "scp-accept-rate-low"]
+    assert len(results) == 1, f"expected exactly one scp-accept-rate-low result, got {results}"
+    result = results[0]
+
+    skip_reason = result.get("skip_reason")
+    assert skip_reason != "label set mismatch", (
+        f"scp-accept-rate-low skipped with label-set mismatch — the catalog "
+        f"expected_labels and the fixtures disagree on the post-verify label set: "
+        f"{result}"
+    )
+    assert result.get("state") in ("collecting_baseline", "ok"), (
+        f"scp-accept-rate-low did not evaluate (state should be collecting_baseline "
+        f"or ok, skip_reason should be falsy): state={result.get('state')!r} "
+        f"skip_reason={skip_reason!r}"
+    )
+
+
 # ── Run tests ─────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
