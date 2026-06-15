@@ -26,6 +26,7 @@ write_snapshot = _mod.write_snapshot
 maybe_reset_counter_snapshot = _mod.maybe_reset_counter_snapshot
 eval_counter_dynamic = _mod.eval_counter_dynamic
 eval_counter_streak = _mod.eval_counter_streak
+eval_counter_ratio = _mod.eval_counter_ratio
 render_aggregate = _mod.render_aggregate
 
 
@@ -506,6 +507,216 @@ def test_post_restart_below_threshold_does_not_fire():
             f"Below-threshold reset must collect baseline, got {result['state']}"
         assert not result.get("post_restart"), \
             f"Below-threshold reset must not set post_restart, got {result.get('post_restart')!r}"
+
+
+# ── missing-process-identity guard tests (issue #3279) ───────────────────────
+
+def test_missing_identity_does_not_poison_snapshot_or_fire():
+    """An identity-less tick (empty PID/START_TICKS) must NOT fire post-restart
+    and must NOT overwrite the prior valid baseline with an empty-identity one.
+
+    Fails on origin/main: the empty pid "" != snapshot pid "1731959" takes the
+    PID-change branch, writes a fresh baseline with pid="" (poison write), then
+    maybe_post_restart_fire fires because cur_val (64) >= threshold (50). After
+    the fix, the early identity guard returns skipped before any snapshot I/O.
+    """
+    with tempfile.TemporaryDirectory() as d:
+        state_dir = Path(d)
+        snap_path = state_dir / "counter_streak_snapshot"
+        # Prior snapshot has a VALID identity and counter.
+        write_snapshot(snap_path, {
+            "version": "1",
+            "pid": "1731959",
+            "start_ticks": "802654858",
+            "counter_value": "64",
+            "breach_streak": "0",
+        })
+
+        alarm = _make_alarm("recovery-stalled", kind="counter-streak",
+                            metric="recovery-stalled-metric",
+                            delta_threshold=1, streak_threshold=3,
+                            burst_threshold=10,
+                            post_restart_absolute_threshold=50,
+                            severity="WARN")
+        current = {"recovery-stalled-metric": [({}, 64.0)]}
+
+        # Identity-less tick: empty pid AND empty start_ticks.
+        result = eval_counter_streak(alarm, current, state_dir, "", "")
+
+        assert result["state"] == "skipped", \
+            f"Identity-less tick must be skipped, got {result['state']}"
+        assert result["skip_reason"] == "missing process identity", \
+            f"Expected 'missing process identity', got {result['skip_reason']!r}"
+        assert not result.get("post_restart"), \
+            f"Identity-less tick must NOT post-restart fire, got {result.get('post_restart')!r}"
+
+        # The prior valid baseline must be preserved verbatim (no poison write).
+        snap = read_snapshot(snap_path)
+        assert snap["pid"] == "1731959", \
+            f"prior baseline pid must be preserved, got {snap.get('pid')!r}"
+        assert snap["counter_value"] == "64", \
+            f"prior counter_value must be preserved, got {snap.get('counter_value')!r}"
+
+
+def test_empty_identity_snapshot_then_real_tick_no_fire():
+    """End-to-end two-tick sequence on a healthy node: an identity-less tick
+    (empty PID/START_TICKS) THEN a real-PID tick with a frozen counter (delta=0)
+    must report ok, NOT a post-restart fire.
+
+    Fails on origin/main: tick 1 poisons the snapshot to pid="" and itself fires
+    post_restart; tick 2's real pid "1731959" != poisoned "" re-enters the
+    PID-change branch and false-fires post_restart=True value=64. After the fix
+    tick 1 is a skipped no-op that preserves the prior VALID baseline, so tick 2
+    sees a stable PID and delta=0 → ok.
+    """
+    with tempfile.TemporaryDirectory() as d:
+        state_dir = Path(d)
+        snap_path = state_dir / "counter_streak_snapshot"
+        # Prior valid baseline established by an earlier healthy tick.
+        write_snapshot(snap_path, {
+            "version": "1",
+            "pid": "1731959",
+            "start_ticks": "802654858",
+            "counter_value": "64",
+            "breach_streak": "0",
+        })
+
+        alarm = _make_alarm("recovery-stalled", kind="counter-streak",
+                            metric="recovery-stalled-metric",
+                            delta_threshold=1, streak_threshold=3,
+                            burst_threshold=10,
+                            post_restart_absolute_threshold=50,
+                            severity="WARN")
+        # Frozen counter at the same value 64 across both ticks (delta=0).
+        current = {"recovery-stalled-metric": [({}, 64.0)]}
+
+        # Tick 1: identity-less (abbreviated tick) — must not poison or fire.
+        t1 = eval_counter_streak(alarm, current, state_dir, "", "")
+        assert t1["state"] == "skipped", \
+            f"Tick 1 (identity-less) must be skipped, got {t1['state']}"
+        assert not t1.get("post_restart"), \
+            f"Tick 1 must not post-restart fire, got {t1.get('post_restart')!r}"
+
+        # Tick 2: real PID, frozen counter — must report ok, not fire.
+        t2 = eval_counter_streak(alarm, current, state_dir, "1731959", "802654858")
+        assert t2["state"] == "ok", \
+            f"Tick 2 (real PID, frozen counter) must report ok, got {t2['state']}"
+        assert not t2.get("post_restart"), \
+            f"Tick 2 must not post-restart fire, got {t2.get('post_restart')!r}"
+
+
+def test_counter_ratio_missing_identity_skips_without_write():
+    """eval_counter_ratio with an empty process identity over a valid prior
+    ratio_snapshot returns skipped (missing process identity) and leaves the
+    snapshot untouched (no pid="" write).
+
+    Fails on origin/main: the empty identity differs from the snapshot pid,
+    so the snapshot is invalidated and baselines are rewritten under the empty
+    identity. After the fix the early guard returns before the snapshot read.
+    """
+    with tempfile.TemporaryDirectory() as d:
+        state_dir = Path(d)
+        snap_path = state_dir / "ratio_snapshot"
+        write_snapshot(snap_path, {
+            "version": "1",
+            "pid": "1731959",
+            "start_ticks": "802654858",
+            "myalarm_streak": "2",
+            "myalarm_numerator": "90",
+            "myalarm_denominator": "100",
+        })
+
+        alarm = _make_alarm("myalarm", kind="counter-ratio",
+                            numerator="num-metric", denominator="den-metric")
+        current = {"num-metric": [({}, 95.0)], "den-metric": [({}, 110.0)]}
+
+        # Identity-less tick: empty pid AND empty start_ticks; uptime large so
+        # the uptime<600 skip does not pre-empt the identity guard under test.
+        result = eval_counter_ratio(
+            alarm, current, {}, state_dir, "", "",
+            fresh_start=False, crash_recovery=False, uptime=3600,
+        )
+
+        assert result["state"] == "skipped", \
+            f"Identity-less ratio tick must be skipped, got {result['state']}"
+        assert result["skip_reason"] == "missing process identity", \
+            f"Expected 'missing process identity', got {result['skip_reason']!r}"
+
+        # Prior baseline must be preserved verbatim (no empty-identity write).
+        snap = read_snapshot(snap_path)
+        assert snap["pid"] == "1731959", \
+            f"prior ratio baseline pid must be preserved, got {snap.get('pid')!r}"
+        assert snap["myalarm_numerator"] == "90", \
+            f"prior numerator baseline must be preserved, got {snap.get('myalarm_numerator')!r}"
+
+
+def test_genuine_restart_still_fires_post_restart():
+    """Guard for #3198: a GENUINE restart (real, differing non-empty PID) with
+    cur_val >= post_restart_absolute_threshold STILL fires post_restart.
+
+    Passes before and after — the identity guard only short-circuits when the
+    identity is EMPTY, never on a real differing identity.
+    """
+    with tempfile.TemporaryDirectory() as d:
+        state_dir = Path(d)
+        snap_path = state_dir / "counter_streak_snapshot"
+        write_snapshot(snap_path, {
+            "version": "1",
+            "pid": "111",
+            "start_ticks": "100",
+            "counter_value": "0",
+            "breach_streak": "0",
+        })
+
+        alarm = _make_alarm("recovery-stalled", kind="counter-streak",
+                            metric="recovery-stalled-metric",
+                            delta_threshold=1, streak_threshold=3,
+                            burst_threshold=10,
+                            post_restart_absolute_threshold=50,
+                            severity="WARN")
+        current = {"recovery-stalled-metric": [({}, 736.0)]}
+
+        # Real differing identity "222"/"200" → genuine restart.
+        result = eval_counter_streak(alarm, current, state_dir, "222", "200")
+
+        assert result["state"] == "firing", \
+            f"Genuine restart must still fire, got {result['state']}"
+        assert result["value"] == 736, \
+            f"Expected absolute value 736, got {result['value']}"
+        assert result.get("post_restart") is True, \
+            f"Genuine restart must set post_restart=True, got {result.get('post_restart')!r}"
+
+
+def test_same_pid_frozen_counter_reports_ok():
+    """Guard: a same-PID tick with a frozen counter (delta=0) reports ok — a
+    frozen counter on a healthy node is the OPPOSITE of a stall and must not fire.
+    """
+    with tempfile.TemporaryDirectory() as d:
+        state_dir = Path(d)
+        snap_path = state_dir / "counter_streak_snapshot"
+        write_snapshot(snap_path, {
+            "version": "1",
+            "pid": "1731959",
+            "start_ticks": "802654858",
+            "counter_value": "64",
+            "breach_streak": "0",
+        })
+
+        alarm = _make_alarm("recovery-stalled", kind="counter-streak",
+                            metric="recovery-stalled-metric",
+                            delta_threshold=1, streak_threshold=3,
+                            burst_threshold=10,
+                            post_restart_absolute_threshold=50,
+                            severity="WARN")
+        current = {"recovery-stalled-metric": [({}, 64.0)]}
+
+        # Same real identity, delta=0.
+        result = eval_counter_streak(alarm, current, state_dir, "1731959", "802654858")
+
+        assert result["state"] == "ok", \
+            f"Same-PID frozen counter must report ok, got {result['state']}"
+        assert not result.get("post_restart"), \
+            f"Same-PID frozen counter must not post-restart fire, got {result.get('post_restart')!r}"
 
 
 # ── Run tests ─────────────────────────────────────────────────────────────────

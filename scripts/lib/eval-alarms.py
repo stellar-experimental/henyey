@@ -870,6 +870,19 @@ def eval_counter_ratio(
     """
     ev_default = default_extra_values(alarm, "counter-ratio")
 
+    # Missing process identity guard (#3279): mirror eval_counter_streak. An
+    # abbreviated tick that skips exporting PID/START_TICKS passes EMPTY strings.
+    # An empty identity is NOT a valid distinct incarnation — treating it as one
+    # invalidates the snapshot and rewrites the per-alarm baselines under the
+    # empty identity (poison write). eval_counter_ratio does not call
+    # maybe_post_restart_fire so it cannot post-restart-fire, but it must not
+    # persist an empty identity either. Establish nothing, decide nothing: skip
+    # BEFORE any snapshot/metric I/O so the prior valid baseline is preserved.
+    if not pid or not start_ticks:
+        return make_result(alarm, "skipped",
+                           skip_reason="missing process identity",
+                           extra_values=ev_default)
+
     # Global skip conditions for ratio checks
     ledger_age = extract_value(current, "stellar_ledger_age_current_seconds", "form1")
     if fresh_start:
@@ -1105,6 +1118,20 @@ def eval_counter_streak(
     Independent of PREV_PROM_INVALID — uses own PID/start_ticks in snapshot.
     """
     ev_default = default_extra_values(alarm, "counter-streak")
+
+    # Missing process identity guard (#3279): an abbreviated tick that skips
+    # exporting PID/START_TICKS passes EMPTY strings here. An empty identity is
+    # NOT a valid distinct incarnation — treating it as one makes the PID-change
+    # branch below write a fresh baseline under pid="" (poison write) and
+    # post-restart-fire on the discarded absolute value, then the NEXT real-PID
+    # tick reads the poisoned pid="" snapshot, re-enters the PID-change branch,
+    # and false-fires (post-restart) despite a stable PID and frozen counter.
+    # Establish nothing, decide nothing: skip BEFORE any snapshot/metric I/O so
+    # the prior valid baseline is preserved untouched.
+    if not pid or not start_ticks:
+        return make_result(alarm, "skipped",
+                           skip_reason="missing process identity",
+                           extra_values=ev_default)
 
     metric = alarm["metric"]
     extraction = alarm.get("extraction", "form2")
