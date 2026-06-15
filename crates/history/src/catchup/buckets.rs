@@ -1031,6 +1031,79 @@ mod tests {
         }
     }
 
+    /// #3282 fan-out rule-in/out DIAGNOSTIC: the FULL ledger-header hash
+    /// (not just the `bucketListHash`) must be identical across fan-out values
+    /// `{None, 1, 2, 6}`.
+    ///
+    /// **Why this is here:** build `384b4f6e` (the #3282 incident build) is the
+    /// #3269 fan-out-wiring commit, and `set_restore_apply_fan_out` is wired
+    /// into the catchup manager. #3269 only proved **bucketListHash** equality
+    /// across fan-out; the *full* ledger-header hash also folds in the
+    /// `bucket_list_hash` field (and, downstream, tx-result / upgrades / idpool
+    /// — all archive-sourced and therefore fan-out-independent). This test
+    /// rules fan-out IN or OUT as a contributor to the #3282 divergence by
+    /// hashing a representative `LedgerHeader` whose only fan-out-dependent
+    /// field — `bucket_list_hash` — is set from the restored live bucket list.
+    ///
+    /// **Diagnostic, not a blocker:** if this is GREEN, fan-out is exonerated
+    /// for #3282 (consistent with the timeline evidence that #2886/#2931
+    /// predate ALL fan-out work). If it ever goes RED, that is a SECOND,
+    /// separately-tracked parallel-restore-determinism bug (#3234 lineage) —
+    /// file a follow-up, do NOT widen the #3282 PR into a restore-determinism
+    /// fix.
+    #[tokio::test]
+    async fn test_apply_buckets_full_header_hash_identical_across_fan_out() {
+        use stellar_xdr::curr::{Hash, LedgerHeader};
+
+        // Six distinct non-empty live levels so unbounded fan-out overlaps
+        // multiple concurrent restore workers (maximizes any ordering
+        // sensitivity the diagnostic would surface).
+        let (has, preloaded) = build_live_has_fixture(6);
+
+        let mut header_hashes = Vec::new();
+        let mut hot_hashes = Vec::new();
+        for fan_out in [None, Some(1usize), Some(2), Some(6)] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let mut mgr = catchup_manager_for(dir.path());
+            mgr.set_restore_apply_fan_out(fan_out);
+            let (live_bl, hot_bl, _, _) = mgr
+                .apply_buckets(&has, &preloaded)
+                .await
+                .expect("apply_buckets succeeds");
+
+            // Build a representative ledger header whose only
+            // fan-out-dependent field is the restored live bucketListHash, and
+            // hash the WHOLE header (canonical XDR hash), not just the BL hash.
+            // The remaining header fields are archive-sourced constants, so any
+            // fan-out-induced divergence can ONLY enter via bucket_list_hash.
+            let header = LedgerHeader {
+                ledger_seq: has.current_ledger,
+                bucket_list_hash: Hash(live_bl.hash().0),
+                ..LedgerHeader::default()
+            };
+            header_hashes.push((fan_out, Hash256::hash_xdr(&header)));
+            hot_hashes.push((fan_out, hot_bl.hash()));
+        }
+
+        let (_, header0) = header_hashes[0];
+        for (fan_out, hh) in &header_hashes {
+            assert_eq!(
+                *hh, header0,
+                "FULL ledger-header hash differs for fan_out={fan_out:?} — \
+                 parallel restore concurrency must not change the derived \
+                 ledger header (if RED: file a separate #3234-lineage \
+                 follow-up; do NOT block #3282 on it)"
+            );
+        }
+        let (_, hot0) = hot_hashes[0];
+        for (fan_out, hot) in &hot_hashes {
+            assert_eq!(
+                *hot, hot0,
+                "hot-archive bucketListHash differs for fan_out={fan_out:?}"
+            );
+        }
+    }
+
     /// Default cap (`None`) reproduces the un-capped restore exactly: the
     /// restored `bucketListHash` equals a direct sequential `restore_from_has`
     /// over the same HAS (the pre-#3268 behavior). No-op-at-default guarantee.

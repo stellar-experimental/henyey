@@ -1669,6 +1669,79 @@ mod tests {
         );
     }
 
+    /// #3282 (offline reproduction of the production FATAL): a forced
+    /// near-tip `ReplayOnly` recovery catchup is seeded from CLONED LOCAL
+    /// state, so the §11.2 case-3 knit compares the *local* LCL hash against
+    /// the archive's canonical header at the same seq. When the covering
+    /// checkpoint IS published (so the #2937 `checkpoint_publication_gate`
+    /// passes) but the local LCL hash diverges from the canonical archive
+    /// header, the knit raises `KnitLclHashMismatch` — the exact error string
+    /// observed in the production FATAL (`knit-to-LCL failed at LCL: expected
+    /// <A>, got <B>`).
+    ///
+    /// This is the mandated CLAUDE.md "recreate the hash mismatch offline"
+    /// reproduction of the *condition*. It must demonstrate (1) the gate
+    /// passes (published checkpoint) AND (2) the knit still diverges fatally
+    /// — proving the publication gate cannot catch a wrong *local* LCL vs a
+    /// *canonical published* archive header (the divergence class that #2937
+    /// did not cover, hence the #2886/#2931/#3282 recurrence). The *response*
+    /// to this condition (archive-authoritative self-heal instead of wipe) is
+    /// asserted by the app-layer tests `test_near_tip_knit_mismatch_*`.
+    #[test]
+    fn test_offline_near_tip_replay_knit_to_lcl_repro() {
+        // Production incident shape: a forced near-tip catchup whose target's
+        // covering checkpoint is already published on the archive.
+        let target = 63041928; // #3282 forced-catchup target ledger
+        let target_ckpt = crate::checkpoint::checkpoint_containing(target);
+
+        // (1) The covering checkpoint IS published — the archive's frontier
+        // covers it — so the #2937 publication gate PASSES (it would only
+        // divert to a transient CheckpointNotYetPublished if the frontier were
+        // behind the covering checkpoint). This is exactly why #2937 did not
+        // prevent #3282: its gate is keyed on publication, not local-LCL
+        // correctness.
+        assert!(
+            checkpoint_publication_gate(target_ckpt, target).is_ok(),
+            "gate must pass: #3282's covering checkpoint was published"
+        );
+
+        // (2) The near-tip fast path cloned the LIVE local LCL header, making
+        // the *local* LCL the knit subject (catchup_impl.rs:193-225,
+        // override_lcl=Some(current)). Model a local LCL whose own hash
+        // (0x11) disagrees with the archive's canonical header at the same
+        // seq (0xAA). The case-3 (entry.seq == lcl.seq) knit compares
+        // entry.hash (archive, canonical) against lcl.hash (local, divergent).
+        let lcl_seq = target - 1; // LCL is just behind the target (near-tip)
+        let local_lcl = make_test_lcl(lcl_seq, h(0x11), h(0x09));
+        let archive_entry = make_test_entry(lcl_seq, h(0xAA), h(0x09));
+
+        let err = knit_to_lcl_decision(&archive_entry, &local_lcl)
+            .expect_err("divergent local LCL vs canonical archive header must fail the knit");
+
+        // The exact production observable: KnitLclHashMismatch, fatal at the
+        // error layer (detection unchanged — only the app-layer RESPONSE
+        // changes from wipe to archive-rebuild).
+        match &err {
+            HistoryError::KnitLclHashMismatch { expected, actual } => {
+                // `expected` is the LOCAL LCL hash; `actual` is the ARCHIVE's
+                // canonical header hash — matching the production message
+                // "expected <local>, got <archive>".
+                assert_eq!(*expected, h(0x11).to_hex());
+                assert_eq!(*actual, h(0xAA).to_hex());
+            }
+            other => panic!("expected KnitLclHashMismatch, got {other:?}"),
+        }
+        assert!(
+            err.is_fatal_catchup_failure(),
+            "the condition stays fatal at the error layer (§11.2 detection unchanged)"
+        );
+        assert!(
+            err.is_local_vs_archive_divergence(),
+            "KnitLclHashMismatch is a local-vs-archive divergence the node can \
+             self-heal from the archive (the new app-layer response)"
+        );
+    }
+
     // ================================================================
     // #2901: per-checkpoint streaming replay (bounded catchup memory).
     //

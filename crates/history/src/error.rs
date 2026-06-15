@@ -684,6 +684,53 @@ impl HistoryError {
         )
     }
 
+    /// Returns `true` if this error represents a **local-vs-archive state
+    /// divergence** — the local ledger state (LCL header, replayed header, or
+    /// applied bucket-list) disagrees with the canonical history archive.
+    ///
+    /// This is the divergence class that a forced near-tip recovery catchup
+    /// SEEDED FROM CLONED LOCAL STATE can hit when the local LCL is wrong
+    /// relative to a *published, canonical* archive header (#3282). Such a
+    /// divergence is **self-healable**: re-deriving canonical state from the
+    /// archive (a `force_full` bucket-apply that ignores the local clone)
+    /// rebuilds the correct state without any operator wipe — mirroring
+    /// stellar-core's near-tip recovery via `CatchupWork::downloadApplyBuckets`
+    /// (`stellar-core/src/catchup/CatchupWork.cpp:198`). It is distinct from a
+    /// genuine bucket/verification corruption: detection is unchanged (all of
+    /// these stay `is_fatal_catchup_failure()`); only the app-layer *response*
+    /// branches on this classifier to attempt an archive rebuild BEFORE any
+    /// terminal wipe.
+    ///
+    /// Recognized variants (the four knit/replay header-chain disagreements
+    /// plus the apply-path ledger hash mismatch):
+    /// - [`KnitLclHashMismatch`](HistoryError::KnitLclHashMismatch) — §11.2
+    ///   case 3 (the #3282 observable).
+    /// - [`KnitLclPredecessorHashMismatch`](HistoryError::KnitLclPredecessorHashMismatch)
+    ///   — §11.2 case 2.
+    /// - [`KnitCurrentLedgerPrevHashMismatch`](HistoryError::KnitCurrentLedgerPrevHashMismatch)
+    ///   — §11.2 case 4.
+    /// - [`ReplayHashMismatch`](HistoryError::ReplayHashMismatch) — replay
+    ///   produced a header hash that disagrees with the archive.
+    /// - [`Ledger(LedgerError::HashMismatch)`](HistoryError::Ledger) —
+    ///   apply-path ledger-header hash mismatch.
+    ///
+    /// Deliberately EXCLUDED: bucket/bucket-list verification failures
+    /// (`VerificationFailed`, `VerificationHashMismatch`) and chain-structure
+    /// failures (`InvalidPreviousHash`, `InvalidSequence`, `CorruptHeader`,
+    /// `KnitOvershot`, `FatalChainDisagreement`, `UnsupportedLedgerVersion`,
+    /// `InvalidTxSetHash`) — those indicate problems an archive re-derivation
+    /// would not (or could not) repair, so they remain terminal.
+    pub fn is_local_vs_archive_divergence(&self) -> bool {
+        matches!(
+            self,
+            HistoryError::KnitLclHashMismatch { .. }
+                | HistoryError::KnitLclPredecessorHashMismatch { .. }
+                | HistoryError::KnitCurrentLedgerPrevHashMismatch { .. }
+                | HistoryError::ReplayHashMismatch { .. }
+                | HistoryError::Ledger(henyey_ledger::LedgerError::HashMismatch { .. })
+        )
+    }
+
     /// Classify this error onto the ledger-chain verification taxonomy
     /// ([`LedgerVerifyStatus`], CATCHUP §3.9-1), or `None` if it is not a
     /// verification failure.
