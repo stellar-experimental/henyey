@@ -559,23 +559,24 @@ def test_missing_identity_does_not_poison_snapshot_or_fire():
 
 
 def test_empty_identity_snapshot_then_real_tick_no_fire():
-    """Two-tick sequence: an empty-identity snapshot (the poisoned state) followed
-    by a real-PID tick with a frozen counter (delta=0) must report ok, NOT a
-    post-restart fire.
+    """End-to-end two-tick sequence on a healthy node: an identity-less tick
+    (empty PID/START_TICKS) THEN a real-PID tick with a frozen counter (delta=0)
+    must report ok, NOT a post-restart fire.
 
-    Fails on origin/main: the real pid "1731959" != poisoned snapshot pid ""
-    re-enters the PID-change branch and false-fires post_restart=True value=64.
-    After the fix the guard never writes the empty-identity baseline in the first
-    place, so this test seeds it explicitly to prove the real tick does not fire.
+    Fails on origin/main: tick 1 poisons the snapshot to pid="" and itself fires
+    post_restart; tick 2's real pid "1731959" != poisoned "" re-enters the
+    PID-change branch and false-fires post_restart=True value=64. After the fix
+    tick 1 is a skipped no-op that preserves the prior VALID baseline, so tick 2
+    sees a stable PID and delta=0 → ok.
     """
     with tempfile.TemporaryDirectory() as d:
         state_dir = Path(d)
         snap_path = state_dir / "counter_streak_snapshot"
-        # Seed the poisoned empty-identity snapshot directly.
+        # Prior valid baseline established by an earlier healthy tick.
         write_snapshot(snap_path, {
             "version": "1",
-            "pid": "",
-            "start_ticks": "",
+            "pid": "1731959",
+            "start_ticks": "802654858",
             "counter_value": "64",
             "breach_streak": "0",
         })
@@ -586,15 +587,22 @@ def test_empty_identity_snapshot_then_real_tick_no_fire():
                             burst_threshold=10,
                             post_restart_absolute_threshold=50,
                             severity="WARN")
-        # Real PID, frozen counter at the same value 64 (delta=0).
+        # Frozen counter at the same value 64 across both ticks (delta=0).
         current = {"recovery-stalled-metric": [({}, 64.0)]}
 
-        result = eval_counter_streak(alarm, current, state_dir, "1731959", "802654858")
+        # Tick 1: identity-less (abbreviated tick) — must not poison or fire.
+        t1 = eval_counter_streak(alarm, current, state_dir, "", "")
+        assert t1["state"] == "skipped", \
+            f"Tick 1 (identity-less) must be skipped, got {t1['state']}"
+        assert not t1.get("post_restart"), \
+            f"Tick 1 must not post-restart fire, got {t1.get('post_restart')!r}"
 
-        assert result["state"] != "firing", \
-            f"Real-PID frozen-counter tick must not fire, got {result['state']}"
-        assert not result.get("post_restart"), \
-            f"Real-PID frozen-counter tick must not post-restart fire, got {result.get('post_restart')!r}"
+        # Tick 2: real PID, frozen counter — must report ok, not fire.
+        t2 = eval_counter_streak(alarm, current, state_dir, "1731959", "802654858")
+        assert t2["state"] == "ok", \
+            f"Tick 2 (real PID, frozen counter) must report ok, got {t2['state']}"
+        assert not t2.get("post_restart"), \
+            f"Tick 2 must not post-restart fire, got {t2.get('post_restart')!r}"
 
 
 def test_counter_ratio_missing_identity_skips_without_write():
