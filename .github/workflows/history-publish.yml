@@ -46,12 +46,34 @@ jobs:
         run: cargo build --release -p henyey
 
       - name: Run history publish integration test
+        # --soft-on-sync-timeout (#3280): the phase-1 wait can hit its deadline
+        # for two very different reasons. (1) The node SYNCED testnet but
+        # published no checkpoint — a REAL publish regression — stays a hard red
+        # (PUBLISH-REGRESSION). (2) The node NEVER reached sync in time — an
+        # environmental testnet-liveness timeout (the chronic flake this job
+        # hits: the same commit passes/fails on different days purely on testnet
+        # health) — is soft-skipped to a neutral exit 0 with a grep-able
+        # SOFT-SKIP marker. The phase-2 byte-compare against SDF's testnet
+        # archive is NEVER soft-skipped (a mismatch is always a hard red).
+        #
+        # De-gating the sync-timeout is safe because the publish CODE PATH is
+        # also covered deterministically on every PR by ci.yml's
+        # `cargo test --workspace` suite: enqueue-at-boundary trigger
+        # (crates/app/src/app/ledger_close.rs), publish-queue drain
+        # (crates/history/src/publish_queue.rs, crates/app/src/app/publish.rs),
+        # checkpoint build (crates/history/src/checkpoint_builder.rs), HAS
+        # (crates/history/src/archive_state.rs), upload
+        # (crates/history/src/upload.rs), and compare logic
+        # (crates/history/src/compare.rs). What this job uniquely adds — the
+        # live byte-match against SDF's testnet archive (phase 2) — is preserved.
+        # The flag is scoped to this testnet job only; the script defaults OFF.
         run: |
           TIMEOUT="${{ inputs.timeout }}"
           TIMEOUT="${TIMEOUT:-1500}"
 
           ./scripts/test-history-publish.sh \
             --no-build \
+            --soft-on-sync-timeout \
             --timeout "$TIMEOUT" \
             --data-dir "${{ runner.temp }}/publish-test"
 
@@ -74,11 +96,29 @@ jobs:
           echo "## History Publish (Testnet)" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
 
+          LOG_FILE="$DATA_DIR/validator.log"
+
           if [[ -f "$HAS_FILE" ]]; then
             CHECKPOINT=$(jq -r '.currentLedger' "$HAS_FILE" 2>/dev/null || echo "unknown")
             echo "- **Checkpoint:** $CHECKPOINT" >> "$GITHUB_STEP_SUMMARY"
           else
             echo "- **Checkpoint:** none published" >> "$GITHUB_STEP_SUMMARY"
           fi
+
+          # Surface the phase-1 deadline disposition (#3280) so a soft-skipped
+          # environmental SYNC-TIMEOUT stays visible on this daily job rather
+          # than silently passing. Derive it from the same on-disk signals the
+          # script's classifier uses: a published HAS, and the run-loop sync
+          # marker "Node is synced" in validator.log.
+          if [[ -f "$HAS_FILE" ]]; then
+            DISPOSITION="PUBLISHED"
+          elif [[ -f "$LOG_FILE" ]] && grep -qF "Node is synced" "$LOG_FILE"; then
+            DISPOSITION="PUBLISH-REGRESSION (synced but no checkpoint)"
+          elif [[ -f "$LOG_FILE" ]]; then
+            DISPOSITION="SYNC-TIMEOUT (environmental; soft-skipped)"
+          else
+            DISPOSITION="unknown (no validator log)"
+          fi
+          echo "- **Disposition:** $DISPOSITION" >> "$GITHUB_STEP_SUMMARY"
 
           echo "- **Status:** ${{ job.status }}" >> "$GITHUB_STEP_SUMMARY"
