@@ -261,7 +261,7 @@ traffic-proportional and self-calibrating.
 
 | Check | Numerator | Denominator | Threshold | Min denom delta | Severity | Rationale |
 |-------|-----------|-------------|-----------|-----------------|----------|-----------|
-| SCP post-verify acceptance rate | `delta(henyey_scp_post_verify_total{reason="accepted"})` + `delta(henyey_scp_post_verify_total{reason="processed_directly"})` | `sum delta(henyey_scp_post_verify_total{reason="..."})` across all 14 labels | < 0.05 (less than 5% accepted) for 3 ticks | 500 | WARN (→ Bug Filing) | Baseline acceptance ~10-20%; <5% sustained means almost nothing reaches SCP |
+| SCP post-verify acceptance rate | `delta(henyey_scp_post_verify_total{reason="accepted"})` + `delta(henyey_scp_post_verify_total{reason="processed_directly"})` | `sum delta(henyey_scp_post_verify_total{reason="..."})` across all 15 labels | < 0.05 (less than 5% accepted) for 3 ticks | 500 | WARN (→ Bug Filing) | Baseline acceptance ~10-20%; <5% sustained means almost nothing reaches SCP |
 | Transaction apply failure rate | `delta(stellar_ledger_apply_failure_total)` | `delta(stellar_ledger_apply_failure_total)` + `delta(stellar_ledger_apply_success_total)` | > 0.50 (over 50% fail) for 3 ticks | 200 | WARN (investigate) | Normal bad-tx traffic is <50%; sustained >50% suggests apply-engine bug |
 | Pending too-old rate | `delta(stellar_herder_pending_too_old_total)` | `delta(stellar_herder_pending_received_total)` | > 0.50 (over 50% too old) for 3 ticks | 100 | WARN | Overlay lag or stale-envelope flood; sustained >50% means most incoming envelopes reference already-closed slots |
 
@@ -273,7 +273,7 @@ traffic-proportional and self-calibrating.
 - `/metrics` fetch fails
 - `/metrics` returns "recorder not installed"
 - Any required counter missing or invalid
-- Post-verify label set ≠ expected 14 labels (`invalid_sig`, `panic`, `drift_range`, `drift_close_time`, `drift_cannot_receive`, `self_message`, `non_quorum`, `buffered`, `duplicate`, `too_far`, `buffer_full`, `processed_directly`, `per_slot_full`, `accepted`)
+- Post-verify label set ≠ expected 15 labels (`invalid_sig`, `panic`, `drift_range`, `drift_close_time`, `drift_cannot_receive`, `self_message`, `non_quorum`, `buffered`, `duplicate`, `too_far`, `buffer_full`, `processed_directly`, `per_slot_full`, `accepted`, `drift_manual_close`)
 
 On any skip: empty the ratio snapshot, reset all breach streak counters to 0.
 
@@ -302,7 +302,7 @@ path canonicalized in [`shared/metric-alarms.toml`](../shared/metric-alarms.toml
 Separate from ratio snapshot — runs independently of ratio skip conditions (see
 Check 12b in monitor-tick for full state machine). Validator mode only.
 
-**SCP denominator rationale:** Includes all 14 post-verify outcomes (not just errors). Normal
+**SCP denominator rationale:** Includes all 15 post-verify outcomes (not just errors). Normal
 outcomes (`duplicate`, `buffered`, `non_quorum`, `self_message`) appear at healthy-state
 proportions. The ratio measures "of everything that went through post-verify, what fraction
 reached SCP?" The 5% threshold is well below the healthy ~10-20% baseline. The older
