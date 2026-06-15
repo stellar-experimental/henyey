@@ -603,6 +603,18 @@ pub struct App {
     /// replay-only. This is triggered when a previous catchup fails with a
     /// hash mismatch (state divergence, e.g., protocol upgrade missed).
     catchup_needs_full_reset: AtomicBool,
+    /// Records whether the most-recently-started catchup was seeded from
+    /// CLONED LOCAL state (the near-tip replay-only fast path in
+    /// `catchup_with_run_mode`, where `override_lcl = Some(current)` makes the
+    /// *local* LCL the knit subject). Set on every catchup entry — `true` only
+    /// on the cloned-local fast path, `false` on `force_full` archive
+    /// bucket-apply, the HAS-rebuild slow path, or no-existing-state catchup.
+    ///
+    /// The single in-flight catchup is serialized by `catchup_in_progress`, so
+    /// the spawned catchup task reads this immediately after the catchup
+    /// returns to populate [`super::types::PendingCatchupResult`], which feeds
+    /// `handle_catchup_result`'s self-heal-vs-wipe decision (#3282).
+    last_catchup_seeded_from_local_clone: AtomicBool,
     /// Prevent concurrent history publish operations.
     /// When set, a background task is publishing a checkpoint.
     publish_in_progress: AtomicBool,
@@ -1429,6 +1441,7 @@ impl App {
             deferred_catchup: tokio::sync::Mutex::new(None),
             fatal_state_failure: AtomicBool::new(false),
             catchup_needs_full_reset: AtomicBool::new(force_full_catchup),
+            last_catchup_seeded_from_local_clone: AtomicBool::new(false),
             publish_in_progress: AtomicBool::new(false),
             publish_ready_since: std::sync::Mutex::new(None),
             #[cfg(test)]

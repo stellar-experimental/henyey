@@ -669,11 +669,13 @@ impl App {
                             // Take persist_ready before moving result.result
                             let persist_ready = result.take_persist_ready();
                             let made_progress = result.made_progress;
+                            let seeded_from_local_clone = result.seeded_from_local_clone;
 
                             let fatal = self.handle_catchup_result(
                                 result.result,
                                 pending.reset_stuck_state,
                                 &pending.label,
+                                seeded_from_local_clone,
                             )
                             .await;
 

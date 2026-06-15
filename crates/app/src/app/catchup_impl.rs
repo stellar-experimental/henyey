@@ -187,11 +187,26 @@ impl App {
         // replaying from the (possibly corrupt/diverged) local state.
         let force_full = self.catchup_needs_full_reset.load(Ordering::SeqCst);
         if force_full {
-            tracing::warn!("Previous catchup failed — forcing full bucket-apply catchup");
+            tracing::warn!(
+                "Previous catchup failed — forcing full bucket-apply catchup \
+                 (archive-authoritative, local state ignored)"
+            );
         }
+
+        // #3282: track whether this catchup is seeded from CLONED LOCAL state.
+        // Only the near-tip fast path below (initialized ledger manager, no
+        // force_full) clones the live LCL header and sets `override_lcl`,
+        // making the *local* LCL the knit subject. A local-vs-archive
+        // divergence on such a catchup is self-healable from the archive (a
+        // one-shot `force_full` rebuild) rather than a terminal wipe; the
+        // force_full / HAS-rebuild / no-existing-state paths are
+        // archive-authoritative and stay terminal on divergence. Default to
+        // `false`; set `true` only on the cloned-local fast path.
+        let mut seeded_from_local_clone = false;
 
         let (existing_state, override_lcl) = if current >= GENESIS_LEDGER_SEQ && !force_full {
             if self.ledger_manager.is_initialized() {
+                seeded_from_local_clone = true;
                 // Fast path: clone from live ledger manager.
                 // Must resolve async merges first — structure-based restart_merges
                 // creates PendingMerge::Async handles, and BucketLevel::clone()
@@ -245,6 +260,14 @@ impl App {
         } else {
             (None, None)
         };
+
+        // Publish the seeding mode so the spawned catchup task can forward it
+        // to `handle_catchup_result` (the single in-flight catchup is
+        // serialized by `catchup_in_progress`, so this read-after-return is
+        // race-free). See `last_catchup_seeded_from_local_clone` (#3282).
+        self.last_catchup_seeded_from_local_clone
+            .store(seeded_from_local_clone, Ordering::SeqCst);
+
         // Run catchup work
         let output = self
             .run_catchup_work(
@@ -2510,11 +2533,27 @@ impl App {
     /// Returns `true` if a fatal state failure was detected and shutdown
     /// has been triggered. The caller must skip all post-catchup work
     /// when this returns `true`.
+    /// Process the outcome of a catchup attempt.
+    ///
+    /// `seeded_from_local_clone` indicates the failed catchup replayed from
+    /// CLONED LOCAL state (the near-tip fast path, `catchup_with_run_mode`
+    /// :193-225, `override_lcl = Some(current)`). When `true`, a
+    /// local-vs-archive divergence error
+    /// ([`HistoryError::is_local_vs_archive_divergence`]) is **self-healable**:
+    /// instead of a terminal wipe, route to a one-shot archive-authoritative
+    /// full bucket-apply rebuild (`catchup_needs_full_reset = true`). When
+    /// `false` (the catchup was already an archive re-derivation, or never
+    /// touched local state), the same divergence stays terminal/fatal — the
+    /// archive disagrees with the consensus chain and the one-shot rebuild
+    /// must not loop (#3282).
+    ///
+    /// Returns `true` iff a fatal shutdown was triggered.
     pub(super) async fn handle_catchup_result(
         &self,
         catchup_result: anyhow::Result<CatchupResult>,
         reset_stuck_state: bool,
         label: &str,
+        seeded_from_local_clone: bool,
     ) -> bool {
         match catchup_result {
             Ok(result) => {
@@ -2665,6 +2704,66 @@ impl App {
                 *self.last_catchup_completed_at.write().await = Some(self.clock.now());
             }
             Err(err) => {
+                // #3282 self-heal: a local-vs-archive state divergence
+                // (KnitLclHashMismatch et al.) on a catchup SEEDED FROM CLONED
+                // LOCAL state is NOT terminal — the cloned local LCL is the
+                // knit subject, and the canonical state can be re-derived from
+                // the archive. Route to a one-shot archive-authoritative full
+                // bucket-apply (`catchup_needs_full_reset = true` ⇒ next
+                // catchup runs with `force_full`, which sets
+                // `existing_state=None`/`override_lcl=None` and ignores the
+                // cloned local state) INSTEAD of a destructive wipe.
+                //
+                // This mirrors stellar-core's near-tip recovery posture: a
+                // knit disagreement is a retryable Work failure surfaced via
+                // the `CatchupWork::fatalFailure()` *boolean*
+                // (stellar-core/src/catchup/CatchupWork.h:80, consumed at
+                // src/catchup/LedgerApplyManagerImpl.cpp:124) — NOT a state
+                // wipe — and recovery applies buckets from the archive HAS
+                // (`CatchupWork::downloadApplyBuckets`,
+                // src/catchup/CatchupWork.cpp:198). The disagreement itself is
+                // `ApplyCheckpointWork::getNextLedgerCloseData` throwing
+                // "replay of <h> at LCL <h> disagreed on hash"
+                // (src/catchup/ApplyCheckpointWork.cpp:236).
+                //
+                // The one-shot latch terminates the loop: the re-spawned
+                // catchup runs archive-authoritative (force_full ⇒
+                // seeded_from_local_clone == false), so if IT also diverges at
+                // knit, the `false` branch below treats it as fatal — the
+                // archive disagrees with the consensus chain and a wipe is
+                // correct. `catchup_needs_full_reset` is cleared on the next
+                // catchup entry (catchup_impl.rs:620), so it cannot re-latch.
+                let is_local_vs_archive_divergence = err
+                    .downcast_ref::<henyey_history::HistoryError>()
+                    .is_some_and(|e| e.is_local_vs_archive_divergence())
+                    || err
+                        .downcast_ref::<henyey_ledger::LedgerError>()
+                        .is_some_and(|e| {
+                            matches!(e, henyey_ledger::LedgerError::HashMismatch { .. })
+                        });
+                if seeded_from_local_clone && is_local_vs_archive_divergence {
+                    tracing::warn!(
+                        error = %err,
+                        "{label} catchup diverged from the archive while replaying \
+                         cloned local state — re-deriving canonical state via a \
+                         one-shot full bucket-apply from the archive (self-heal, \
+                         no wipe). A repeat divergence on the archive rebuild will \
+                         be terminal."
+                    );
+                    self.catchup_needs_full_reset.store(true, Ordering::SeqCst);
+                    // Continue to the shared restore/cooldown tail below (do NOT
+                    // wipe). The next catchup will be archive-authoritative.
+                    self.restore_operational_state().await;
+                    *self.last_catchup_completed_at.write().await = Some(self.clock.now());
+                    if reset_stuck_state {
+                        if let Some(state) = self.consensus_stuck_state.write().await.as_mut() {
+                            state.recovery_attempts = 0;
+                            state.last_recovery_attempt = self.clock.now();
+                        }
+                    }
+                    return false;
+                }
+
                 // Check if this is a fatal catchup failure (verification/integrity
                 // error indicating local state corruption).  Once detected, further
                 // catchup attempts are blocked and the node shuts down.
@@ -5897,7 +5996,9 @@ mod tests {
             henyey_history::HistoryError::VerificationFailed("bucket list hash mismatch".into())
                 .into();
 
-        let fatal = app.handle_catchup_result(Err(err), false, "test").await;
+        let fatal = app
+            .handle_catchup_result(Err(err), false, "test", false)
+            .await;
 
         assert!(
             fatal,
@@ -5933,7 +6034,9 @@ mod tests {
         let err: anyhow::Error =
             henyey_history::HistoryError::ArchiveUnreachable("timeout".into()).into();
 
-        let fatal = app.handle_catchup_result(Err(err), false, "test").await;
+        let fatal = app
+            .handle_catchup_result(Err(err), false, "test", false)
+            .await;
 
         assert!(
             !fatal,
@@ -5971,7 +6074,9 @@ mod tests {
             actual: "def".into(),
         });
 
-        let fatal = app.handle_catchup_result(Err(err), false, "test").await;
+        let fatal = app
+            .handle_catchup_result(Err(err), false, "test", false)
+            .await;
 
         assert!(
             !fatal,
@@ -6009,7 +6114,9 @@ mod tests {
             })
             .into();
 
-        let fatal = app.handle_catchup_result(Err(err), false, "test").await;
+        let fatal = app
+            .handle_catchup_result(Err(err), false, "test", false)
+            .await;
 
         assert!(
             fatal,
@@ -6022,6 +6129,98 @@ mod tests {
         assert!(
             !app.catchup_needs_full_reset.load(Ordering::SeqCst),
             "catchup_needs_full_reset must NOT be set — fatal path skips the else branch"
+        );
+    }
+
+    /// #3282 regression: a `KnitLclHashMismatch` (local-vs-archive divergence)
+    /// on a catchup SEEDED FROM CLONED LOCAL STATE must NOT wipe. Instead it
+    /// must route to a one-shot archive-authoritative full bucket-apply
+    /// rebuild (`catchup_needs_full_reset = true`), self-healing without an
+    /// operator wipe.
+    ///
+    /// FAILS on `origin/main`: today `KnitLclHashMismatch` is
+    /// `is_fatal_catchup_failure()`, so the Err branch unconditionally calls
+    /// `trigger_fatal_shutdown` and returns `true` BEFORE reaching the
+    /// `catchup_needs_full_reset` self-heal in the `else` block — the node
+    /// wipes instead of rebuilding from the archive.
+    #[tokio::test]
+    async fn test_near_tip_knit_mismatch_triggers_full_reset_not_wipe() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-test.db");
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
+        let app = App::new(config).await.unwrap();
+
+        // The exact #3282 observable: a §11.2 case-3 knit-to-LCL mismatch.
+        let err: anyhow::Error = henyey_history::HistoryError::KnitLclHashMismatch {
+            expected: "aa".into(),
+            actual: "bb".into(),
+        }
+        .into();
+
+        // seeded_from_local_clone = true → the failure is against the cloned
+        // local LCL, which the archive can re-derive. Must self-heal.
+        let fatal = app
+            .handle_catchup_result(Err(err), false, "test", true)
+            .await;
+
+        assert!(
+            !fatal,
+            "cloned-local near-tip knit mismatch must NOT be fatal — it self-heals"
+        );
+        assert!(
+            !app.fatal_state_failure.load(Ordering::SeqCst),
+            "fatal_state_failure must NOT be set — the node rebuilds from the archive"
+        );
+        assert!(
+            app.catchup_needs_full_reset.load(Ordering::SeqCst),
+            "catchup_needs_full_reset must be set so the next catchup is an \
+             archive-authoritative full bucket-apply (force_full)"
+        );
+    }
+
+    /// #3282 regression (safety backstop): a `KnitLclHashMismatch` on a
+    /// catchup that was ALREADY an archive re-derivation
+    /// (`seeded_from_local_clone = false`) must STILL go fatal/wipe. If the
+    /// archive rebuild itself diverges at knit, the archive disagrees with the
+    /// consensus chain and a terminal wipe is the correct action — the
+    /// self-heal is one-shot and must not loop. This pins that the fix does
+    /// NOT over-broaden into "never wipe".
+    #[tokio::test]
+    async fn test_full_bucket_apply_knit_mismatch_still_wipes() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-test.db");
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
+        let app = App::new(config).await.unwrap();
+
+        let mut shutdown_rx = app.subscribe_shutdown();
+
+        let err: anyhow::Error = henyey_history::HistoryError::KnitLclHashMismatch {
+            expected: "aa".into(),
+            actual: "bb".into(),
+        }
+        .into();
+
+        // seeded_from_local_clone = false → already an archive rebuild; a knit
+        // mismatch here is genuine unrecoverable corruption.
+        let fatal = app
+            .handle_catchup_result(Err(err), false, "test", false)
+            .await;
+
+        assert!(
+            fatal,
+            "non-cloned-local knit mismatch must be fatal (archive rebuild also diverged)"
+        );
+        assert!(
+            app.fatal_state_failure.load(Ordering::SeqCst),
+            "fatal_state_failure must be set — terminal archive-vs-chain divergence"
+        );
+        assert!(
+            shutdown_rx.try_recv().is_ok(),
+            "shutdown signal must be sent on the terminal divergence"
         );
     }
 

@@ -2116,7 +2116,20 @@ impl App {
                 Err(_) => None,
             };
 
-            let _ = result_tx.send(PendingCatchupResult::new(catchup_result, persist_ready));
+            // #3282: forward whether this catchup was seeded from cloned local
+            // state, so the event loop's `handle_catchup_result` can route a
+            // local-vs-archive divergence to an archive rebuild (self-heal)
+            // instead of a terminal wipe. Read after the catchup returns —
+            // race-free because `catchup_in_progress` serializes catchups.
+            let seeded_from_local_clone = app
+                .last_catchup_seeded_from_local_clone
+                .load(Ordering::SeqCst);
+
+            let _ = result_tx.send(PendingCatchupResult::new(
+                catchup_result,
+                persist_ready,
+                seeded_from_local_clone,
+            ));
         });
 
         tracing::info!(label, "Catchup task spawned");
