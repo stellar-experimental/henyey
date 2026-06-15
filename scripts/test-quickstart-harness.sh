@@ -1538,8 +1538,123 @@ EOF
     fi
 }
 
+# ============================================================
+# Test 28: test_timeout_with_orphaned_pipe_holder_still_terminates_and_soft_skips
+#
+# Root-cause regression for #3286 — the SECOND hang path that #3273's `-k` grace
+# did NOT cover. PR #3285's testnet shard HUNG ~54 min even with the `-k`
+# kill-after in place. Mechanism:
+#
+# `run_probe()` ran the probe as a PIPELINE — `timeout ... "${PROBE_CMD[@]}"
+# 2>&1 | tee <log>` — and read `exit_code=${PIPESTATUS[0]}`. That assignment
+# only executes AFTER the whole pipeline completes. `timeout`'s `-k` SIGKILLs
+# the probe's process GROUP, but any process the probe detached into its OWN
+# session (a `setsid`/double-forked grandchild, or in-container work reached
+# over keep-alive sockets) survives the group SIGKILL and keeps the inherited
+# stdout pipe WRITE-END open. `tee` therefore never sees EOF and blocks
+# forever; the pipeline never completes, `exit_code` is never assigned, and the
+# 124/137 soft-skip code AFTER run_probe is never reached → step 8 hangs the
+# whole job wall-clock. The `-k` bounded `timeout` itself, but NOT the wrapper:
+# the wrapper's fate was tied to the orphan closing the pipe fd, which never
+# happens.
+#
+# The fix (#3286): drop the blocking `| tee` pipeline; redirect straight to the
+# log file (`timeout ... > <log> 2>&1; exit_code=$?`). With no pipeline, the
+# wrapper no longer depends on the orphan ever closing an fd — `timeout`'s own
+# exit governs the wrapper and the soft-skip fires in seconds.
+#
+# This test wires a fake probe that (1) spawns a `setsid` grandchild holding the
+# stdout pipe open far longer than the timeout — the portable stand-in for the
+# docker-daemon / in-container survivor — and (2) itself IGNORES SIGTERM and
+# sleeps long, so `timeout`'s `-k` must SIGKILL it (proving the probe ITSELF is
+# bounded, isolating the orphaned-fd hang as the sole remaining failure). The
+# grandchild is marked with a UNIQUE sentinel so the test reaps EXACTLY it in
+# cleanup (Critic A REVISE-MINOR — never kill unrelated `sleep` processes on a
+# shared runner). The wrapper runs under an OUTER watchdog (`timeout -k 5s 30`)
+# so a regression FAILS the assertion fast (outer-watchdog 124) instead of
+# hanging the whole suite. It asserts:
+#   (a) the wrapper TERMINATES quickly — well under 30s — i.e. the outer
+#       watchdog did NOT have to fire (on pre-fix `| tee` code the orphan wedges
+#       tee, the wrapper never returns, the outer watchdog kills it at 30s and
+#       this assertion FAILS), and
+#   (b) the timeout disposition is taken — under --soft-on-timeout the wrapper
+#       exits 0 with the grep-able SOFT-SKIP marker.
+# FAILS on origin/main (orphan wedges the `| tee`, outer watchdog trips);
+# PASSES after the redirect-to-file fix.
+# ============================================================
+test_timeout_with_orphaned_pipe_holder_still_terminates_and_soft_skips() {
+    local diag_dir="$TMPDIR_BASE/diag-test28"
+    mkdir -p "$diag_dir"
+
+    # Unique sentinel so cleanup reaps EXACTLY this test's orphaned grandchild
+    # and never an unrelated `sleep` on a shared runner (Critic A REVISE-MINOR).
+    local marker="henyey-3286-orphan-$$-${RANDOM}"
+
+    # Fake probe: detach a grandchild into its OWN session via `setsid` that
+    # survives the process-group SIGKILL and keeps the inherited stdout pipe
+    # write-end open (the thing that wedges `tee`). Its stdout is deliberately
+    # NOT redirected, so it holds the inherited pipe fd open. `exec -a "$marker"`
+    # stamps the unique sentinel into the grandchild's argv[0] so cleanup reaps
+    # EXACTLY it via `pkill -f "$marker"` (never an unrelated `sleep`). The probe
+    # then ignores SIGTERM and sleeps long, so `timeout`'s `-k` must SIGKILL the
+    # probe's group — yet the detached grandchild lives on holding the fd, which
+    # is what wedges the pre-fix `| tee` pipeline.
+    local probe="$TMPDIR_BASE/probe-test28.sh"
+    cat > "$probe" <<EOF
+#!/bin/bash
+# Detached, own-session grandchild holding the inherited stdout pipe fd open.
+setsid bash -c 'exec -a "$marker" sleep 600' &
+trap '' TERM
+sleep 60
+EOF
+    chmod +x "$probe"
+
+    # Reap the orphaned grandchild by its unique marker no matter how the test
+    # exits, so it cannot leak across runs or delay the harness EXIT trap.
+    # shellcheck disable=SC2064
+    trap "pkill -f '$marker' 2>/dev/null || true" RETURN
+
+    local wrapper_log="$TMPDIR_BASE/wrapper-log-test28.txt"
+    local exit_code=0
+    local start end elapsed
+    start=$(date +%s)
+    # OUTER watchdog: cap the whole wrapper invocation at 30s so a pre-fix HANG
+    # (orphan wedges `| tee`) fails the assertion fast instead of stalling the
+    # harness. The watchdog uses -k so it can itself bound a wrapper that
+    # wedged. A correctly-fixed wrapper returns in ~2s, well under this cap.
+    KILL_GRACE=1s timeout -k 5s 30 "$WRAPPER" \
+        --soft-on-timeout \
+        --network testnet --enable "core,horizon" --probe horizon-core-up \
+        --timeout 1 --diagnostics-dir "$diag_dir" \
+        -- "$probe" >/dev/null 2>"$wrapper_log" || exit_code=$?
+    end=$(date +%s)
+    elapsed=$((end - start))
+
+    # (a) The wrapper terminated quickly — the OUTER watchdog did NOT fire. On
+    # pre-fix `| tee` code the orphan holds the pipe open, the wrapper never
+    # returns, the watchdog kills it at 30s and exit_code becomes 124/137 from
+    # the OUTER timeout — caught by both the elapsed assertion and the missing
+    # SOFT-SKIP marker.
+    if [[ $elapsed -lt 25 ]]; then
+        tap_ok "orphaned_pipe_holder_wrapper_terminates_quickly"
+    else
+        tap_not_ok "orphaned_pipe_holder_wrapper_terminates_quickly" \
+            "wrapper did not return promptly (elapsed=${elapsed}s) — orphaned pipe holder wedged the | tee pipeline"
+    fi
+
+    # (b) The timeout disposition was taken: under --soft-on-timeout the wrapper
+    # exits 0 with the SOFT-SKIP marker. (A wrapper killed by the outer watchdog
+    # exits non-zero with no marker.)
+    if [[ $exit_code -eq 0 ]] && grep -q 'SOFT-SKIP' "$wrapper_log"; then
+        tap_ok "orphaned_pipe_holder_timeout_is_soft_skipped"
+    else
+        tap_not_ok "orphaned_pipe_holder_timeout_is_soft_skipped" \
+            "exit=$exit_code, SOFT-SKIP marker present=$(grep -q 'SOFT-SKIP' "$wrapper_log" && echo yes || echo no)"
+    fi
+}
+
 # --- Run all tests ---
-tap_plan 85
+tap_plan 87
 
 test_timeout_retry_on_targeted_shard
 test_non_timeout_failure_no_retry
@@ -1568,6 +1683,7 @@ test_soft_on_timeout_preserves_diagnostics
 test_soft_on_timeout_off_by_default_preserves_red
 test_workflow_testnet_shard_uses_soft_timeout_and_tight_budget
 test_sigterm_ignoring_probe_is_force_killed_and_soft_skipped
+test_timeout_with_orphaned_pipe_holder_still_terminates_and_soft_skips
 
 echo ""
 echo "# Results: $PASS_COUNT/$TEST_COUNT passed, $FAIL_COUNT failed"
