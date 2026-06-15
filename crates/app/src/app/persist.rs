@@ -615,7 +615,8 @@ mod tests {
             buckets_applied: 1,
             ledgers_replayed: 0,
         });
-        let mut result = crate::app::types::PendingCatchupResult::new(result_ok, Some(ready));
+        let mut result =
+            crate::app::types::PendingCatchupResult::new(result_ok, Some(ready), false);
         assert!(result.made_progress, "buckets_applied > 0 → made_progress");
         assert!(
             result.take_persist_ready().is_some(),
@@ -631,8 +632,11 @@ mod tests {
     #[test]
     fn pending_catchup_result_derives_made_progress() {
         // Error → no progress
-        let err_result =
-            crate::app::types::PendingCatchupResult::new(Err(anyhow::anyhow!("test error")), None);
+        let err_result = crate::app::types::PendingCatchupResult::new(
+            Err(anyhow::anyhow!("test error")),
+            None,
+            false,
+        );
         assert!(!err_result.made_progress);
 
         // Success with no work → no progress
@@ -644,6 +648,7 @@ mod tests {
                 ledgers_replayed: 0,
             }),
             None,
+            false,
         );
         assert!(!no_work.made_progress);
 
@@ -656,6 +661,7 @@ mod tests {
                 ledgers_replayed: 5,
             }),
             None,
+            false,
         );
         assert!(with_progress.made_progress);
     }

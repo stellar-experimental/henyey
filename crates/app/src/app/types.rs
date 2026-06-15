@@ -587,6 +587,11 @@ pub(super) struct PendingCatchupResult {
     pub result: anyhow::Result<CatchupResult>,
     /// Whether catchup actually advanced the ledger.
     pub made_progress: bool,
+    /// Whether the catchup replayed from CLONED LOCAL state (the near-tip
+    /// fast path, `catchup_with_run_mode` :193-225). When `true`, a
+    /// local-vs-archive divergence failure is self-healable via an
+    /// archive-authoritative rebuild instead of a terminal wipe (#3282).
+    pub seeded_from_local_clone: bool,
     /// Ready-to-spawn persist job. Private to force callers through
     /// [`Self::take_persist_ready`], which returns a `#[must_use]` value.
     persist_ready: Option<super::persist::CatchupPersistReady>,
@@ -597,6 +602,7 @@ impl PendingCatchupResult {
     pub(super) fn new(
         result: anyhow::Result<CatchupResult>,
         persist_ready: Option<super::persist::CatchupPersistReady>,
+        seeded_from_local_clone: bool,
     ) -> Self {
         let made_progress = result
             .as_ref()
@@ -604,6 +610,7 @@ impl PendingCatchupResult {
         Self {
             result,
             made_progress,
+            seeded_from_local_clone,
             persist_ready,
         }
     }
