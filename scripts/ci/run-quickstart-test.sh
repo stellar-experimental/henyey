@@ -217,8 +217,6 @@ run_probe() {
     echo "=== Attempt $attempt: $PROBE ($NETWORK/$ENABLE) ===" >&2
     echo "Command: timeout -k ${KILL_GRACE} ${TIMEOUT}s ${PROBE_CMD[*]}" >&2
 
-    # Use PIPESTATUS[0] to capture the timeout exit code, not the tee exit.
-    #
     # The `-k ${KILL_GRACE}` is load-bearing (#3273 root-cause fix): GNU
     # `timeout` first sends SIGTERM at the deadline, then — only with -k — sends
     # SIGKILL after the grace if the child is still alive. The upstream probe is
@@ -229,20 +227,35 @@ run_probe() {
     # never returns, and hangs the whole CI step until the job wall-clock
     # cancels it (observed: PR #3273's testnet shard, run 27298458353, hung ~54
     # min). With -k, the SIGKILL force-terminates the whole process group within
-    # the grace window, so the wrapper is guaranteed to return promptly.
+    # the grace window, so `timeout` itself is guaranteed to return promptly.
+    #
+    # NO PIPELINE here — redirect straight to the log file, do NOT `| tee` it
+    # (#3286 root-cause fix, the SECOND hang path #3273's -k did NOT cover).
+    # `timeout`'s `-k` SIGKILLs the probe's process GROUP, but any process the
+    # probe detached into its OWN session — a `setsid`/double-forked grandchild,
+    # or in-container work reached over keep-alive sockets — survives the group
+    # SIGKILL and keeps the inherited stdout pipe WRITE-END open. With `… | tee`,
+    # `tee` then never sees EOF and blocks forever, so `exit_code=${PIPESTATUS[0]}`
+    # (which only runs AFTER the whole pipeline completes) is never assigned and
+    # the 124/137 soft-skip below never runs — step 8 hangs the full job
+    # wall-clock even WITH -k (observed: PR #3285's testnet shard, ~54 min). With
+    # `… > file`, `timeout`'s own exit governs the wrapper regardless of the
+    # orphan, and `exit_code=$?` is the SAME value `${PIPESTATUS[0]}` held for a
+    # non-pipeline command, so the 124/137 disposition is byte-identical. The
+    # orphan is reaped by the workflow's `docker stop/rm quickstart` Cleanup step
+    # (if: always()). The stdout `>` must precede `2>&1` to preserve the
+    # combined-stream capture the old `… 2>&1 | tee` produced.
     #
     # Exit-code note: because the child runs in its own process group (we do NOT
-    # pass --foreground — in a PIPELINE like this one `--foreground` would
-    # re-introduce the hang, since timeout then can't bound the pipeline child),
-    # a `-k`-forced SIGKILL of a SIGTERM-ignoring probe yields exit 137 (128+9),
-    # NOT 124. A SIGTERM that DOES kill the probe still yields 124. The
-    # soft-skip therefore treats BOTH 124 and 137 as the timeout disposition
-    # (see should_soft_skip_timeout). A genuine probe assertion failure exits
-    # with its own (non-124, non-137) code, propagated unchanged, and stays red.
-    set +o pipefail
-    timeout -k "$KILL_GRACE" "$TIMEOUT" "${PROBE_CMD[@]}" 2>&1 | tee "$DIAGNOSTICS_DIR/attempt-${attempt}-output.log"
-    exit_code=${PIPESTATUS[0]}
-    set -o pipefail
+    # pass --foreground — `--foreground` would let a re-parented child re-wedge
+    # the wrapper, and timeout could not bound the group), a `-k`-forced SIGKILL
+    # of a SIGTERM-ignoring probe yields exit 137 (128+9), NOT 124. A SIGTERM
+    # that DOES kill the probe still yields 124. The soft-skip therefore treats
+    # BOTH 124 and 137 as the timeout disposition (see should_soft_skip_timeout).
+    # A genuine probe assertion failure exits with its own (non-124, non-137)
+    # code, propagated unchanged, and stays red.
+    timeout -k "$KILL_GRACE" "$TIMEOUT" "${PROBE_CMD[@]}" > "$DIAGNOSTICS_DIR/attempt-${attempt}-output.log" 2>&1
+    exit_code=$?
 
     if [[ $exit_code -ne 0 ]]; then
         capture_diagnostics "$attempt"
