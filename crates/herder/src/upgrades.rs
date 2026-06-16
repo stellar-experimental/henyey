@@ -1624,4 +1624,244 @@ mod tests {
             err_msg
         );
     }
+
+    // ── #3300: per-variant scheduling → nomination validation ───────────
+    //
+    // Validates the real `create_upgrades_for` (nomination emitter) and
+    // `is_valid_for_nomination` (nomination acceptance gate) for EVERY
+    // `LedgerUpgrade` variant the SSC protocol-upgrade mission can drive via
+    // `/upgrades?mode=set`. For each variant we assert three things:
+    //   1. `create_upgrades_for` EMITS the matching `LedgerUpgrade` when the
+    //      current ledger value differs from the scheduled value.
+    //   2. `create_upgrades_for` SUPPRESSES the no-op when current == target.
+    //   3. `is_valid_for_nomination` ACCEPTS the produced upgrade at and after
+    //      `upgrade_time`, and REJECTS it before `upgrade_time`.
+    //
+    // Header/state application of the produced upgrades is covered offline by
+    // `crates/ledger/tests/upgrade_sequence_integration.rs`. Together the two
+    // suites cover schedule → nominate → apply for every variant without a
+    // live SCP network (externalize itself is the operator mission).
+
+    /// Current-ledger snapshot fixture with Soroban enabled, used as the
+    /// "before" state every variant upgrades away from.
+    fn baseline_state(close_time: u64) -> CurrentLedgerState {
+        CurrentLedgerState {
+            close_time,
+            protocol_version: 24,
+            base_fee: 100,
+            max_tx_set_size: 1000,
+            base_reserve: 5_000_000,
+            flags: 0,
+            max_soroban_tx_set_size: Some(100),
+        }
+    }
+
+    /// Assert the schedule → nominate behavior for one non-config variant:
+    /// emitted when current differs, suppressed when equal, and accepted by
+    /// `is_valid_for_nomination` at/after `upgrade_time` (rejected before).
+    fn assert_variant_emit_suppress_nominate(
+        params: UpgradeParameters,
+        differing_state: CurrentLedgerState,
+        matching_state: CurrentLedgerState,
+        expected: &LedgerUpgrade,
+    ) {
+        let upgrade_time = params.upgrade_time;
+        let upgrades = Upgrades::new(params);
+
+        // 1. Emitted when the current ledger value differs from the target.
+        let emitted = upgrades
+            .create_upgrades_for(&differing_state, None)
+            .unwrap();
+        assert!(
+            emitted.iter().any(|u| u == expected),
+            "expected {expected:?} to be emitted, got {emitted:?}"
+        );
+
+        // 2. Suppressed (no-op) when the current value already equals the target.
+        let suppressed = upgrades.create_upgrades_for(&matching_state, None).unwrap();
+        assert!(
+            !suppressed.iter().any(|u| u == expected),
+            "expected {expected:?} to be suppressed as a no-op, got {suppressed:?}"
+        );
+
+        // 3a. Accepted for nomination at the exact upgrade_time.
+        assert!(
+            upgrades.is_valid_for_nomination(expected, upgrade_time),
+            "{expected:?} should be valid for nomination at upgrade_time {upgrade_time}"
+        );
+        // 3b. Accepted strictly after upgrade_time.
+        assert!(
+            upgrades.is_valid_for_nomination(expected, upgrade_time + 1),
+            "{expected:?} should be valid for nomination after upgrade_time"
+        );
+        // 3c. Rejected before upgrade_time (timing gate).
+        if upgrade_time > 0 {
+            assert!(
+                !upgrades.is_valid_for_nomination(expected, upgrade_time - 1),
+                "{expected:?} should be rejected before upgrade_time"
+            );
+        }
+    }
+
+    #[test]
+    fn test_scheduled_params_nominate_each_variant() {
+        let t = 1000u64;
+
+        // ── Version ──────────────────────────────────────────────────────
+        let mut p = UpgradeParameters::new(t);
+        p.protocol_version = Some(25);
+        let mut matching = baseline_state(t);
+        matching.protocol_version = 25;
+        assert_variant_emit_suppress_nominate(
+            p,
+            baseline_state(t),
+            matching,
+            &LedgerUpgrade::Version(25),
+        );
+
+        // ── BaseFee ──────────────────────────────────────────────────────
+        let mut p = UpgradeParameters::new(t);
+        p.base_fee = Some(200);
+        let mut matching = baseline_state(t);
+        matching.base_fee = 200;
+        assert_variant_emit_suppress_nominate(
+            p,
+            baseline_state(t),
+            matching,
+            &LedgerUpgrade::BaseFee(200),
+        );
+
+        // ── BaseReserve ──────────────────────────────────────────────────
+        let mut p = UpgradeParameters::new(t);
+        p.base_reserve = Some(6_000_000);
+        let mut matching = baseline_state(t);
+        matching.base_reserve = 6_000_000;
+        assert_variant_emit_suppress_nominate(
+            p,
+            baseline_state(t),
+            matching,
+            &LedgerUpgrade::BaseReserve(6_000_000),
+        );
+
+        // ── MaxTxSetSize ─────────────────────────────────────────────────
+        let mut p = UpgradeParameters::new(t);
+        p.max_tx_set_size = Some(2000);
+        let mut matching = baseline_state(t);
+        matching.max_tx_set_size = 2000;
+        assert_variant_emit_suppress_nominate(
+            p,
+            baseline_state(t),
+            matching,
+            &LedgerUpgrade::MaxTxSetSize(2000),
+        );
+
+        // ── Flags ────────────────────────────────────────────────────────
+        let mut p = UpgradeParameters::new(t);
+        p.flags = Some(1);
+        let mut matching = baseline_state(t);
+        matching.flags = 1;
+        assert_variant_emit_suppress_nominate(
+            p,
+            baseline_state(t),
+            matching,
+            &LedgerUpgrade::Flags(1),
+        );
+
+        // ── MaxSorobanTxSetSize ──────────────────────────────────────────
+        let mut p = UpgradeParameters::new(t);
+        p.max_soroban_tx_set_size = Some(200);
+        let mut matching = baseline_state(t);
+        matching.max_soroban_tx_set_size = Some(200);
+        assert_variant_emit_suppress_nominate(
+            p,
+            baseline_state(t),
+            matching,
+            &LedgerUpgrade::MaxSorobanTxSetSize(200),
+        );
+    }
+
+    /// The Config variant requires a ledger-backed `ConfigUpgradeContext`, so
+    /// it is exercised separately from the scalar variants. Asserts emit (when
+    /// the proposed setting differs), suppress (when it matches), and
+    /// `is_valid_for_nomination` acceptance at/after `upgrade_time`.
+    #[test]
+    fn test_scheduled_config_variant_nominate() {
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        use stellar_xdr::curr::*;
+
+        let proposed = ConfigSettingEntry::ContractComputeV0(ConfigSettingContractComputeV0 {
+            ledger_max_instructions: 200_000_000, // differs from current
+            tx_max_instructions: 10_000_000,
+            fee_rate_per_instructions_increment: 100,
+            tx_memory_limit: 50_000_000,
+        });
+        let current = ConfigSettingEntry::ContractComputeV0(ConfigSettingContractComputeV0 {
+            ledger_max_instructions: 100_000_000,
+            tx_max_instructions: 10_000_000,
+            fee_rate_per_instructions_increment: 100,
+            tx_memory_limit: 50_000_000,
+        });
+        let upgrade_set = ConfigUpgradeSet {
+            updated_entry: vec![proposed].try_into().unwrap(),
+        };
+
+        // Context where the proposed setting DIFFERS from current → emit.
+        let (ctx_needed, key) =
+            build_config_upgrade_context(&upgrade_set, std::slice::from_ref(&current), 25, 100);
+        // Context where current already equals the proposed setting → suppress.
+        let proposed_for_match =
+            ConfigSettingEntry::ContractComputeV0(ConfigSettingContractComputeV0 {
+                ledger_max_instructions: 200_000_000,
+                tx_max_instructions: 10_000_000,
+                fee_rate_per_instructions_increment: 100,
+                tx_memory_limit: 50_000_000,
+            });
+        let (ctx_noop, _key2) =
+            build_config_upgrade_context(&upgrade_set, &[proposed_for_match], 25, 100);
+
+        let upgrade_time = 1000u64;
+        let mut params = UpgradeParameters::new(upgrade_time);
+        params.config_upgrade_set_key = Some(ConfigUpgradeSetKeyJson {
+            contract_id: STANDARD.encode(key.contract_id.0 .0),
+            content_hash: STANDARD.encode(key.content_hash.0),
+        });
+        let upgrades = Upgrades::new(params);
+
+        let state = CurrentLedgerState {
+            close_time: upgrade_time,
+            protocol_version: 25,
+            base_fee: 100,
+            max_tx_set_size: 1000,
+            base_reserve: 5_000_000,
+            flags: 0,
+            max_soroban_tx_set_size: None,
+        };
+
+        // Emit: proposed differs from current.
+        let emitted = upgrades
+            .create_upgrades_for(&state, Some(&ctx_needed))
+            .unwrap();
+        let config_upgrade = emitted
+            .iter()
+            .find(|u| matches!(u, LedgerUpgrade::Config(_)))
+            .cloned()
+            .expect("Config upgrade should be emitted when setting differs");
+        assert_eq!(config_upgrade, LedgerUpgrade::Config(key.clone()));
+
+        // Suppress: proposed already matches current.
+        let suppressed = upgrades
+            .create_upgrades_for(&state, Some(&ctx_noop))
+            .unwrap();
+        assert!(
+            !suppressed
+                .iter()
+                .any(|u| matches!(u, LedgerUpgrade::Config(_))),
+            "Config upgrade should be suppressed when setting already matches, got {suppressed:?}"
+        );
+
+        // Nomination acceptance at/after upgrade_time, rejection before.
+        assert!(upgrades.is_valid_for_nomination(&config_upgrade, upgrade_time));
+        assert!(upgrades.is_valid_for_nomination(&config_upgrade, upgrade_time + 1));
+        assert!(!upgrades.is_valid_for_nomination(&config_upgrade, upgrade_time - 1));
+    }
 }
