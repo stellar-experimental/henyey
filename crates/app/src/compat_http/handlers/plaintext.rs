@@ -459,6 +459,260 @@ fn is_leap_year(y: u32) -> bool {
 mod tests {
     use super::*;
 
+    // ── Live-App peer-admin handler tests (#3294) ───────────────────────
+    //
+    // These exercise the real wiring of the four compat peer-admin handlers
+    // (`/connect`, `/droppeer`, `/unban`, `/bans`) against a live `App`
+    // backed by a tempdir SQLite database, mirroring stellar-core
+    // `CommandHandler` response shapes.
+
+    use std::sync::Arc;
+
+    use http_body_util::BodyExt;
+
+    use crate::app::App;
+    use crate::compat_http::CompatServerState;
+    use crate::http::types::{ConnectParams, DropPeerParams, UnbanParams};
+
+    /// Build a `CompatServerState` backed by a real (minimal) `App` with a
+    /// tempdir database and no default peers. Returns `(TempDir, state)`; the
+    /// `TempDir` guard is returned first so it outlives the state (which holds
+    /// open DB handles).
+    async fn mk_compat_state() -> (tempfile::TempDir, Arc<CompatServerState>) {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("compat-peer-admin.db");
+        let mut config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
+        // Avoid pulling in default network peers in unit tests.
+        config.overlay.known_peers.clear();
+        config.is_compat_config = true;
+        let app = App::new(config).await.unwrap();
+        let state = Arc::new(CompatServerState {
+            app: Arc::new(app),
+            started_on: "2024-01-01T00:00:00Z".to_string(),
+            #[cfg(feature = "loadgen")]
+            loadgen_state: None,
+        });
+        (dir, state)
+    }
+
+    /// Collect a plain-text response body into a `String`.
+    async fn body_text(response: axum::response::Response) -> String {
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        String::from_utf8(bytes.to_vec()).unwrap()
+    }
+
+    /// Collect a JSON response body and parse it.
+    async fn body_json(response: axum::response::Response) -> serde_json::Value {
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    /// Generate a fresh peer (PeerId + its G... strkey).
+    fn mk_peer() -> (henyey_overlay::PeerId, String) {
+        let secret = henyey_crypto::SecretKey::generate();
+        let public = secret.public_key();
+        let strkey = public.to_strkey();
+        let peer_id = henyey_overlay::PeerId::from_bytes(*public.as_bytes());
+        (peer_id, strkey)
+    }
+
+    /// `/bans` reflects the real DB `load_bans` result — a banned peer's
+    /// strkey appears in the `bans` array. FAILS on `origin/main` (the stub
+    /// always returns `{"bans": []}` regardless of DB state).
+    #[tokio::test]
+    async fn test_compat_bans_reflects_db_load_bans() {
+        let (_dir, state) = mk_compat_state().await;
+        let (peer_id, strkey) = mk_peer();
+        // Start overlay so ban_peer's overlay side completes; the DB row is the
+        // part /bans reads back.
+        state.app.start_overlay().await.unwrap();
+        state.app.ban_peer(peer_id).await.unwrap();
+
+        let resp = compat_bans_handler(State(Arc::clone(&state)))
+            .await
+            .into_response();
+        let json = body_json(resp).await;
+        let bans = json["bans"].as_array().expect("bans array");
+        assert!(
+            bans.iter().any(|b| b.as_str() == Some(strkey.as_str())),
+            "banned strkey {strkey} not found in {json}"
+        );
+        state.app.shutdown();
+    }
+
+    /// `/bans` with no bans yields the documented `{"bans": []}` shape.
+    #[tokio::test]
+    async fn test_compat_bans_empty() {
+        let (_dir, state) = mk_compat_state().await;
+        let resp = compat_bans_handler(State(Arc::clone(&state)))
+            .await
+            .into_response();
+        let json = body_json(resp).await;
+        assert_eq!(json, serde_json::json!({"bans": []}));
+        state.app.shutdown();
+    }
+
+    /// `/unban?node=<strkey>` removes the DB ban row AND returns
+    /// `"Unban peer: <node>\n"`. FAILS on `origin/main` (the stub returns
+    /// `"done\n"` with no side effect, so the ban would persist).
+    #[tokio::test]
+    async fn test_compat_unban_removes_ban() {
+        let (_dir, state) = mk_compat_state().await;
+        let (peer_id, strkey) = mk_peer();
+        state.app.start_overlay().await.unwrap();
+        state.app.ban_peer(peer_id).await.unwrap();
+        // Precondition: the ban is present.
+        let before = state.app.banned_peers().await.unwrap();
+        assert!(
+            before
+                .iter()
+                .any(|p| peer_id_strkey(p) == Some(strkey.clone())),
+            "ban should be present before unban"
+        );
+
+        let params = UnbanParams {
+            peer_id: None,
+            node: Some(strkey.clone()),
+        };
+        let resp = compat_unban_handler(State(Arc::clone(&state)), Query(params))
+            .await
+            .into_response();
+        let text = body_text(resp).await;
+        assert_eq!(text, format!("Unban peer: {strkey}\n"));
+
+        // Real DB side effect: the ban is gone.
+        let after = state.app.banned_peers().await.unwrap();
+        assert!(
+            !after
+                .iter()
+                .any(|p| peer_id_strkey(p) == Some(strkey.clone())),
+            "ban should be removed after unban"
+        );
+        state.app.shutdown();
+    }
+
+    /// `/unban` with no `node` → the stellar-core "must specify" message.
+    #[tokio::test]
+    async fn test_compat_unban_missing_node() {
+        let (_dir, state) = mk_compat_state().await;
+        let params = UnbanParams {
+            peer_id: None,
+            node: None,
+        };
+        let resp = compat_unban_handler(State(Arc::clone(&state)), Query(params))
+            .await
+            .into_response();
+        let text = body_text(resp).await;
+        assert_eq!(text, "Must specify at least peer id: unban?node=NODE_ID\n");
+        state.app.shutdown();
+    }
+
+    /// `/unban?node=garbage` (unresolvable) → "Peer <node> not found".
+    #[tokio::test]
+    async fn test_compat_unban_unresolvable_node() {
+        let (_dir, state) = mk_compat_state().await;
+        let params = UnbanParams {
+            peer_id: None,
+            node: Some("garbage".to_string()),
+        };
+        let resp = compat_unban_handler(State(Arc::clone(&state)), Query(params))
+            .await
+            .into_response();
+        let text = body_text(resp).await;
+        assert_eq!(text, "Peer garbage not found\n");
+        state.app.shutdown();
+    }
+
+    /// `/droppeer` with no `node` → the stellar-core "must specify" message.
+    #[tokio::test]
+    async fn test_compat_droppeer_missing_node() {
+        let (_dir, state) = mk_compat_state().await;
+        let params = DropPeerParams {
+            peer_id: None,
+            node: None,
+            ban: None,
+        };
+        let resp = compat_droppeer_handler(State(Arc::clone(&state)), Query(params))
+            .await
+            .into_response();
+        let text = body_text(resp).await;
+        assert_eq!(
+            text,
+            "Must specify at least peer id: droppeer?node=NODE_ID\n"
+        );
+        state.app.shutdown();
+    }
+
+    /// `/droppeer?node=<strkey>` for a peer that is not connected →
+    /// "Peer <node> not found".
+    #[tokio::test]
+    async fn test_compat_droppeer_not_found() {
+        let (_dir, state) = mk_compat_state().await;
+        state.app.start_overlay().await.unwrap();
+        let (_peer_id, strkey) = mk_peer();
+        let params = DropPeerParams {
+            peer_id: None,
+            node: Some(strkey.clone()),
+            ban: None,
+        };
+        let resp = compat_droppeer_handler(State(Arc::clone(&state)), Query(params))
+            .await
+            .into_response();
+        let text = body_text(resp).await;
+        assert_eq!(text, format!("Peer {strkey} not found\n"));
+        state.app.shutdown();
+    }
+
+    /// `/connect` with no `peer`/`port` → the stellar-core "must specify"
+    /// message.
+    #[tokio::test]
+    async fn test_compat_connect_missing_param() {
+        let (_dir, state) = mk_compat_state().await;
+        let params = ConnectParams {
+            addr: None,
+            peer: None,
+            port: None,
+        };
+        let resp = compat_connect_handler(State(Arc::clone(&state)), Query(params))
+            .await
+            .into_response();
+        let text = body_text(resp).await;
+        assert_eq!(
+            text,
+            "Must specify a peer and port: connect&peer=PEER&port=PORT\n"
+        );
+        state.app.shutdown();
+    }
+
+    /// `/connect?peer=127.0.0.1&port=11625` → the fire-and-forget success
+    /// message (mirrors stellar-core's unconditional retStr). Proves the
+    /// wiring/side-effect path is invoked.
+    #[tokio::test]
+    async fn test_compat_connect_success_shape() {
+        let (_dir, state) = mk_compat_state().await;
+        state.app.start_overlay().await.unwrap();
+        let params = ConnectParams {
+            addr: None,
+            peer: Some("127.0.0.1".to_string()),
+            port: Some(11625),
+        };
+        let resp = compat_connect_handler(State(Arc::clone(&state)), Query(params))
+            .await
+            .into_response();
+        let text = body_text(resp).await;
+        assert_eq!(text, "Connect to: 127.0.0.1:11625\n");
+        state.app.shutdown();
+    }
+
+    /// Helper: PeerId → its G... strkey (used by ban-state assertions).
+    fn peer_id_strkey(peer_id: &henyey_overlay::PeerId) -> Option<String> {
+        henyey_crypto::PublicKey::from_bytes(peer_id.as_bytes())
+            .ok()
+            .map(|pk| pk.to_strkey())
+    }
+
     // ── /upgrades response shape tests ──────────────────────────────────
 
     /// Verify the default `/upgrades` response (no mode param) has `current` and `scheduled`.
