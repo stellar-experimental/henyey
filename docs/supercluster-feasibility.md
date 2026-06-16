@@ -4,6 +4,8 @@
 **Last updated**: 2026-03-24
 **Goal**: Determine whether Stellar Supercluster (SSC) can be used to run full-network simulations against Henyey, and define an execution plan that can actually be carried out from the current codebase.
 
+**See also**: [`docs/supercluster-nsc-workflow.md`](./supercluster-nsc-workflow.md) — the operator runbook for the Namespace (`nsc`) build/publish/launch surface that turns this feasibility plan into runnable commands (auth → build the Henyey image in a remote builder → publish to the workspace registry → provision the mission's k8s instance → capture artifacts → teardown).
+
 ## Executive Assessment
 
 Using SSC with Henyey is feasible, but the path is staged rather than immediate.
@@ -365,7 +367,7 @@ Candidate work:
 - [x] `loadgen.wasm` relocated for Docker build compatibility
 - [x] `.dockerignore` created
 - [ ] SSC-required commands verified in-container
-- [ ] build/run instructions documented
+- [x] build/run instructions documented — see [`docs/supercluster-nsc-workflow.md`](./supercluster-nsc-workflow.md) (#3293)
 - [ ] CI smoke test for image build and entrypoint validation passes
 
 ### Phase 1 handoff checklist

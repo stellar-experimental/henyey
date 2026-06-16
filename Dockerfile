@@ -18,7 +18,11 @@
 # since the ENTRYPOINT is the binary itself.
 
 # ── Build stage ──────────────────────────────────────────────────────────
-FROM rust:1.86-bookworm AS builder
+# Track the latest stable Rust on bookworm. CI builds with the stable toolchain
+# (`dtolnay/rust-toolchain@stable`), so the image must use a Rust new enough for
+# whatever the checked-in Cargo.lock resolves to (some deps require >= 1.88).
+# Pinning a specific minor (e.g. 1.86) goes stale as the lockfile advances.
+FROM rust:1-bookworm AS builder
 
 ARG FEATURES=""
 
@@ -33,7 +37,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Copy workspace manifests first for dependency caching
 COPY Cargo.toml Cargo.lock* ./
 COPY crates/ crates/
-COPY vendor/ vendor/
 
 # Build the release binary
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
