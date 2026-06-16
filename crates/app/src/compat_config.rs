@@ -2183,6 +2183,140 @@ mod tests {
         assert!(config.is_compat_config);
     }
 
+    /// AC#2 of the first mixed-image Supercluster (SSC) mission (#3292): the
+    /// mission-shaped, mixed-cluster `stellar-core.cfg` that SSC renders for a
+    /// **henyey validator** node in a 4-node (1 henyey + 3 stellar-core)
+    /// cluster must be accepted by henyey *without manual patching*.
+    ///
+    /// This is distinct from `test_ssc_generated_config_full_parse`, which
+    /// covers a testnet *watcher* shape (`NODE_IS_VALIDATOR=false`, real
+    /// testnet peers, history archives). Here the node is a VALIDATOR
+    /// participating as a minority in a stellar-core-majority quorum, with
+    /// in-cluster pod hostnames, accelerated close time, and NO history.
+    ///
+    /// The test drives the exact `is_stellar_core_format` +
+    /// `translate_stellar_core_config` entry the binary's `load_config` path
+    /// uses (main.rs), so it exercises real parsing, not a stub. It fails if
+    /// the mission fixture is not parseable (the durable, CI-enforced
+    /// regression artifact the triage report required).
+    #[test]
+    fn test_ssc_mission_mixed_config_parse() {
+        let fixture = include_str!("compat_http/test_fixtures/ssc_mission_mixed.cfg");
+        let raw: toml::Value = toml::from_str(fixture).unwrap();
+
+        // Detected as stellar-core format (the binary's branch in load_config).
+        assert!(
+            is_stellar_core_format(&raw),
+            "mission mixed-cluster config must be detected as stellar-core format"
+        );
+
+        // Translates without error — i.e. accepted WITHOUT manual patching (AC#2).
+        let config = translate_stellar_core_config(&raw).unwrap();
+
+        // --- Node is a VALIDATOR (the henyey node participates in consensus) ---
+        assert!(
+            config.node.is_validator,
+            "mission node must be a validator (NODE_IS_VALIDATOR=true)"
+        );
+        // NODE_SEED is the henyey node's own seed (the strkey before " self").
+        assert_eq!(
+            config.node.node_seed.as_deref(),
+            Some("SDQVDISRYN2JXBS7ICL7QJAEKB3HWBJFP2QECXG7GZICAHBK4UNJCWK2")
+        );
+
+        // --- Quorum: the listed [[VALIDATORS]] are exactly the 3 stellar-core
+        // peers; henyey's own key is added automatically (NOT listed in its own
+        // [[VALIDATORS]], mirroring stellar-core's addSelfToValidators which
+        // never dedups, Config.cpp:869-898). So the auto-generated quorum-set
+        // key list holds the 3 distinct core keys...
+        let henyey_self_key = henyey_crypto::SecretKey::from_strkey(
+            "SDQVDISRYN2JXBS7ICL7QJAEKB3HWBJFP2QECXG7GZICAHBK4UNJCWK2",
+        )
+        .unwrap()
+        .public_key()
+        .to_strkey();
+        let core_keys = [
+            "GDKXE2OZMJIPOSLNA6N6F2BVCI3O777I2OOC4BV7VOYUEHYX7RTRYA7Y",
+            "GCUCJTIYXSOXKBSNFGNFWW5MUQ54HKRPGJUTQFJ5RQXZXNOLNXYDHRAP",
+            "GC2V2EFSXN6SQTWVYA5EPJPBWWIMSD2XQNKUOHGEKB535AQE2I6IXV2Z",
+        ];
+        let validators = &config.node.quorum_set.validators;
+        assert_eq!(
+            validators.len(),
+            3,
+            "expected the 3 listed stellar-core validators, got {}: {:?}",
+            validators.len(),
+            validators
+        );
+        for core_key in core_keys {
+            assert!(
+                validators.contains(&core_key.to_string()),
+                "quorum must contain stellar-core key {core_key}"
+            );
+        }
+        // henyey does NOT list itself in [[VALIDATORS]] (no duplicate self).
+        assert!(
+            !validators.contains(&henyey_self_key),
+            "henyey must not list its own key in [[VALIDATORS]] (self is auto-added)"
+        );
+
+        // ...and the FULL 4-node quorum (3 core + auto-added self) materializes
+        // in the ValidatorWeightConfig, with exactly 4 DISTINCT node ids and no
+        // self double-counting (the inverse of
+        // `test_quorum_set_self_without_node_seed_fails`).
+        let vwc = config
+            .validator_weight_config
+            .as_ref()
+            .expect("mission validator config must build a ValidatorWeightConfig");
+        assert_eq!(
+            vwc.validator_entries.len(),
+            4,
+            "weight config must hold 4 distinct validators (3 core + self), got {}",
+            vwc.validator_entries.len()
+        );
+        let self_node_id = parse_node_id(&henyey_self_key).unwrap();
+        assert!(
+            vwc.validator_entries.contains_key(&self_node_id),
+            "weight config must contain henyey's auto-added self entry"
+        );
+        for core_key in core_keys {
+            let nid = parse_node_id(core_key).unwrap();
+            assert!(
+                vwc.validator_entries.contains_key(&nid),
+                "weight config must contain stellar-core key {core_key}"
+            );
+        }
+
+        // --- Accelerated close time on (SSC integration missions) ---
+        assert!(
+            config.testing.accelerate_time,
+            "ARTIFICIALLY_ACCELERATE_TIME_FOR_TESTING must be true"
+        );
+
+        // --- In-cluster known peers (pod hostnames, NOT real testnet peers) ---
+        // The henyey ADDRESS and the 3 core ADDRESSes are in-cluster pod DNS.
+        assert!(
+            !config.overlay.known_peers.is_empty(),
+            "mission config must yield in-cluster known peers"
+        );
+        for peer in &config.overlay.known_peers {
+            assert!(
+                peer.host.contains("ssc-mission-3292") || peer.host.ends_with(".svc.cluster.local"),
+                "known peer must be an in-cluster pod hostname, got {peer:?}"
+            );
+        }
+
+        // --- NO history archives (first mission excludes history) ---
+        assert!(
+            config.history.archives.is_empty(),
+            "first mission has no history archives, got {}",
+            config.history.archives.len()
+        );
+
+        // Compat flag set.
+        assert!(config.is_compat_config);
+    }
+
     /// Verify that the existing captive-core-testnet.cfg also parses correctly.
     #[test]
     fn test_captive_core_testnet_cfg_parse() {
