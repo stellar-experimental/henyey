@@ -1634,8 +1634,83 @@ EOF
     pkill -f "$marker" 2>/dev/null || true
 }
 
+# ============================================================
+# Test 29: test_testnet_shard_renders_step_timeout_25_others_360
+#
+# PRIMARY correct-by-construction guard for #3286 (does NOT depend on catching
+# a flaky CI hang). The whole diagnostic chain hinges on the testnet
+# core,horizon "Run probes through wrapper" step rendering a TIGHT step-level
+# `timeout-minutes` of 25: a step-timeout marks the STEP failed (so the
+# `if: failure()` "Upload diagnostics" step runs and the watchdog dump uploads),
+# whereas the 45-min JOB wall-clock is a *cancel* that does NOT reliably run
+# subsequent steps. A previous attempt could only be validated by a hung CI run.
+#
+# This test instead EVALUATES the per-shard `${{ matrix.step_timeout_minutes ||
+# 360 }}` expression exactly as GitHub Actions does (via
+# scripts/ci/render-quickstart-step-timeout.py, which applies GHA's `||` falsy
+# semantics: an unset matrix key is null/falsy -> 360; the testnet entry's
+# explicit 25 is truthy -> 25). It asserts:
+#   (a) the testnet/core,horizon shard renders timeout-minutes == 25, AND
+#   (b) every OTHER shard (local/pubnet) renders the generous 360 default,
+#       so the tight bound is scoped to exactly the hanging shard and no other.
+# If the key is ever moved to the wrong entry, dropped, or the expression form
+# changes so it stops resolving to 25, this assertion turns red — no hung run
+# required.
+# ============================================================
+test_testnet_shard_renders_step_timeout_25_others_360() {
+    local renderer="$REPO_ROOT/scripts/ci/render-quickstart-step-timeout.py"
+    if [[ ! -f "$WORKFLOW" || ! -f "$renderer" ]]; then
+        tap_not_ok "render_script_exists" "workflow or renderer not found"
+        tap_not_ok "testnet_core_horizon_shard_renders_step_timeout_25" "renderer missing"
+        tap_not_ok "non_testnet_shards_render_generous_default_360" "renderer missing"
+        tap_not_ok "exactly_one_shard_carries_tight_step_timeout" "renderer missing"
+        return
+    fi
+    tap_ok "render_script_exists"
+
+    # Render <network>|<enable>|<timeout-minutes> for every matrix shard.
+    # `|| true` so a renderer error (exit non-zero) doesn't abort under `set -e`;
+    # an empty/failed render is caught by the assertions below.
+    local rendered
+    rendered=$(python3 "$renderer" "$WORKFLOW" 2>"$TMPDIR_BASE/render-test29.err" || true)
+
+    # (a) The testnet core,horizon shard renders exactly 25.
+    local testnet_val
+    testnet_val=$( (echo "$rendered" | grep -E '^testnet\|core,horizon\|' || true) \
+        | head -1 | awk -F'|' '{print $3}')
+    if [[ "$testnet_val" == "25" ]]; then
+        tap_ok "testnet_core_horizon_shard_renders_step_timeout_25"
+    else
+        tap_not_ok "testnet_core_horizon_shard_renders_step_timeout_25" \
+            "expected 25, got '$testnet_val' (renderer err: $(tr '\n' ' ' < "$TMPDIR_BASE/render-test29.err"))"
+    fi
+
+    # (b) Every non-testnet shard renders the generous default (360). A shard
+    # that silently picked up a tight bound (or a default drift) turns this red.
+    local non_testnet_bad
+    non_testnet_bad=$( (echo "$rendered" | grep -vE '^testnet\|' || true) \
+        | awk -F'|' '$3 != "360" {print}' )
+    if [[ -z "$non_testnet_bad" && -n "$rendered" ]]; then
+        tap_ok "non_testnet_shards_render_generous_default_360"
+    else
+        tap_not_ok "non_testnet_shards_render_generous_default_360" \
+            "non-testnet shard(s) not at 360: ${non_testnet_bad:-<no shards rendered>}"
+    fi
+
+    # (c) Exactly one shard carries the tight (< 360) step timeout — the
+    # diagnostic bound must be surgically scoped, never broadcast.
+    local tight_count
+    tight_count=$( (echo "$rendered" || true) | awk -F'|' '$3 != "" && $3 + 0 < 360 {c++} END{print c+0}')
+    if [[ "$tight_count" == "1" ]]; then
+        tap_ok "exactly_one_shard_carries_tight_step_timeout"
+    else
+        tap_not_ok "exactly_one_shard_carries_tight_step_timeout" \
+            "expected exactly 1 shard with timeout-minutes < 360, got $tight_count"
+    fi
+}
+
 # --- Run all tests ---
-tap_plan 88
+tap_plan 92
 
 test_timeout_retry_on_targeted_shard
 test_non_timeout_failure_no_retry
@@ -1665,6 +1740,7 @@ test_soft_on_timeout_off_by_default_preserves_red
 test_workflow_testnet_shard_uses_soft_timeout_and_tight_budget
 test_sigterm_ignoring_probe_is_force_killed_and_soft_skipped
 test_testnet_hang_watchdog_emits_process_dump_before_step_kill
+test_testnet_shard_renders_step_timeout_25_others_360
 
 echo ""
 echo "# Results: $PASS_COUNT/$TEST_COUNT passed, $FAIL_COUNT failed"
