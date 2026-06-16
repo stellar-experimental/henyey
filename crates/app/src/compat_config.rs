@@ -1102,23 +1102,43 @@ fn warn_unrecognized_keys(table: &toml::map::Map<String, toml::Value>) -> Result
     Ok(())
 }
 
-/// Extract a base URL from a stellar-core curl command template.
+/// Extract a base URL from a stellar-core / SSC archive command template.
 ///
 /// Input:  `"curl -sf https://history.stellar.org/prd/core-testnet/core_testnet_001/{0} -o {1}"`
 /// Output: `Some("https://history.stellar.org/prd/core-testnet/core_testnet_001")`
 ///
-/// Also handles simpler forms like `"wget -q {0} -O {1}"` where no URL is present.
+/// Also handles simpler forms like `"wget -q {0} -O {1}"` and `"cp …"` where no
+/// URL is present, returning `None`.
+///
+/// The URL is taken from the first `http(s)://` token in the command. The
+/// `{0}`/`{1}` path-template placeholders mark where the remote/local path is
+/// substituted, so the URL is truncated at the first `{` and then any
+/// query-string and trailing slash is trimmed. This is more robust than
+/// stripping a fixed `/{0}` suffix, because SSC may render the template with a
+/// query string, shell quotes, or a trailing slash before the placeholder
+/// (history feasibility doc §6 flagged the fixed-suffix form as brittle).
 fn extract_url_from_curl_cmd(cmd: &str) -> Option<String> {
-    // Look for an http/https URL in the command string
-    for token in cmd.split_whitespace() {
+    for raw_token in cmd.split_whitespace() {
+        // Strip surrounding shell quotes SSC/stellar-core may wrap the URL in,
+        // e.g. `'https://host/{0}?auth=tok'`.
+        let token = raw_token.trim_matches(|c| c == '\'' || c == '"');
         if token.starts_with("http://") || token.starts_with("https://") {
-            // Strip the /{0} suffix that stellar-core appends for the remote path template
-            let url = token
-                .trim_end_matches("/{0}")
-                .trim_end_matches("/{1}")
-                .trim_end_matches("{0}")
-                .trim_end_matches("{1}");
-            return Some(url.to_string());
+            // The `{0}`/`{1}` placeholder marks where the path is substituted.
+            // Truncate the URL there so anything after (incl. a query string
+            // appended after the placeholder) is dropped.
+            let mut url = match token.find('{') {
+                Some(idx) => &token[..idx],
+                None => token,
+            };
+            // Drop a query string that precedes the placeholder, then a single
+            // trailing slash, so the base URL has no spurious suffix.
+            if let Some(q) = url.find('?') {
+                url = &url[..q];
+            }
+            let url = url.trim_end_matches('/');
+            if url.len() > "https://".len() {
+                return Some(url.to_string());
+            }
         }
     }
     None
@@ -1524,6 +1544,7 @@ mod tests {
 
     #[test]
     fn test_extract_url_from_curl_cmd() {
+        // --- Existing testnet shapes: behavior MUST stay identical ---
         assert_eq!(
             extract_url_from_curl_cmd(
                 "curl -sf https://history.stellar.org/prd/core-testnet/core_testnet_001/{0} -o {1}"
@@ -1538,6 +1559,54 @@ mod tests {
 
         // No URL in command
         assert_eq!(extract_url_from_curl_cmd("cp /local/{0} /dest/{1}"), None);
+
+        // --- AC#2 hardening (#3295): literal SSC `get` template shapes ---
+        // In-cluster localhost archive read-back (own publishing archive).
+        assert_eq!(
+            extract_url_from_curl_cmd("curl -sf http://localhost:1570/{0} -o {1}"),
+            Some("http://localhost:1570".to_string())
+        );
+        // In-cluster peer pod hostname with port.
+        assert_eq!(
+            extract_url_from_curl_cmd("curl -sf http://ssc-core-0.ssc.local:1570/{0} -o {1}"),
+            Some("http://ssc-core-0.ssc.local:1570".to_string())
+        );
+
+        // Trailing slash directly before the placeholder is normalized away.
+        assert_eq!(
+            extract_url_from_curl_cmd("curl -sf https://history.example.org/archive/{0} -o {1}"),
+            Some("https://history.example.org/archive".to_string())
+        );
+        // A double slash before the placeholder normalizes to a single base.
+        assert_eq!(
+            extract_url_from_curl_cmd("curl -sf https://history.example.org/archive//{0} -o {1}"),
+            Some("https://history.example.org/archive".to_string())
+        );
+
+        // Quoted URL with a query string appended after the placeholder — the
+        // fixed-suffix-strip form returned None here (silent empty URL); the
+        // hardened extractor recovers the base.
+        assert_eq!(
+            extract_url_from_curl_cmd("curl -sf 'https://history.example.org/{0}?auth=tok' -o {1}"),
+            Some("https://history.example.org".to_string())
+        );
+
+        // Put-style command where the URL is the last token and {1} is the file.
+        assert_eq!(
+            extract_url_from_curl_cmd("curl -T {1} https://history.example.org/{0}"),
+            Some("https://history.example.org".to_string())
+        );
+
+        // --- Forms with no extractable URL → None ---
+        // wget with the URL supplied via the {0} placeholder (no literal URL).
+        assert_eq!(extract_url_from_curl_cmd("wget -q {0} -O {1}"), None);
+        // A bare scheme with no host must not produce a phantom archive URL.
+        assert_eq!(extract_url_from_curl_cmd("curl -sf http:// -o {1}"), None);
+        // Plain cp upload command (no URL).
+        assert_eq!(
+            extract_url_from_curl_cmd("cp {1} /opt/stellar/history/ssc_local/{0}"),
+            None
+        );
     }
 
     #[test]
@@ -2314,6 +2383,101 @@ mod tests {
         );
 
         // Compat flag set.
+        assert!(config.is_compat_config);
+    }
+
+    /// AC#2 of the SSC history mission (#3295): the mission-shaped
+    /// `stellar-core.cfg` that SSC renders for a **publishing validator** —
+    /// one that both reads from peer archives (`get`) and writes its own
+    /// checkpoints (`put` + `mkdir`) into a cluster-local archive — must be
+    /// accepted by henyey *without manual patching*.
+    ///
+    /// This is distinct from `test_ssc_generated_config_full_parse` (a
+    /// read-only watcher with `get`-only archives) and
+    /// `test_ssc_mission_mixed_config_parse` (a validator with NO history).
+    /// Here we assert the full `[HISTORY.*]` triple round-trips: extracted
+    /// `url`, preserved `put`/`mkdir` strings, and `get_enabled`/`put_enabled`
+    /// flags, plus the inline `[[VALIDATORS]].HISTORY` `get`-only archives.
+    ///
+    /// The test drives the same `is_stellar_core_format` +
+    /// `translate_stellar_core_config` entry the binary's config-load path
+    /// uses, so it exercises real parsing, not a stub. It fails if a future
+    /// SSC template-rendering change breaks URL extraction or drops the
+    /// publish commands.
+    #[test]
+    fn test_ssc_mission_history_config_parse() {
+        let fixture = include_str!("compat_http/test_fixtures/ssc_mission_history.cfg");
+        let raw: toml::Value = toml::from_str(fixture).unwrap();
+
+        assert!(
+            is_stellar_core_format(&raw),
+            "SSC history config must be detected as stellar-core format"
+        );
+
+        let config = translate_stellar_core_config(&raw).unwrap();
+
+        // --- Node is a publishing validator ---
+        assert!(config.node.is_validator);
+
+        // --- History archives: 2 from [HISTORY.*] + 2 inline [[VALIDATORS]].HISTORY ---
+        // The publishing archive `ssc_local` carries the full get/put/mkdir triple.
+        let ssc_local = config
+            .history
+            .archives
+            .iter()
+            .find(|a| a.name == "ssc_local")
+            .expect("must have [HISTORY.ssc_local] archive");
+        assert_eq!(
+            ssc_local.url, "http://localhost:1570",
+            "url must be extracted from the localhost curl `get` template, with the /{{0}} suffix stripped"
+        );
+        assert!(ssc_local.get_enabled, "ssc_local has a `get`");
+        assert!(ssc_local.put_enabled, "ssc_local has a `put`");
+        assert_eq!(
+            ssc_local.put.as_deref(),
+            Some("cp {0} /opt/stellar/history/ssc_local/{1}"),
+            "the `put` command template must be preserved verbatim for the uploader"
+        );
+        assert_eq!(
+            ssc_local.mkdir.as_deref(),
+            Some("mkdir -p /opt/stellar/history/ssc_local/{0}"),
+            "the `mkdir` command template must be preserved verbatim"
+        );
+
+        // The read-only peer mirror `ssc_peer` is get-only (no put/mkdir).
+        let ssc_peer = config
+            .history
+            .archives
+            .iter()
+            .find(|a| a.name == "ssc_peer")
+            .expect("must have [HISTORY.ssc_peer] archive");
+        assert_eq!(ssc_peer.url, "http://ssc-core-1.ssc.local:1570");
+        assert!(ssc_peer.get_enabled);
+        assert!(!ssc_peer.put_enabled, "peer mirror is read-only");
+        assert!(ssc_peer.put.is_none());
+        assert!(ssc_peer.mkdir.is_none());
+
+        // Inline [[VALIDATORS]].HISTORY archives (get-only) are also present.
+        let ssc_core_0 = config
+            .history
+            .archives
+            .iter()
+            .find(|a| a.name == "ssc_core_0")
+            .expect("must have inline VALIDATORS HISTORY archive ssc_core_0");
+        assert_eq!(ssc_core_0.url, "http://ssc-core-0.ssc.local:1570");
+        assert!(ssc_core_0.get_enabled);
+        assert!(!ssc_core_0.put_enabled);
+
+        // Total: 2 from [HISTORY.*] + 2 from [[VALIDATORS]].HISTORY.
+        assert_eq!(
+            config.history.archives.len(),
+            4,
+            "expected 4 archives (2 [HISTORY.*] + 2 inline), got {}",
+            config.history.archives.len()
+        );
+
+        // Compat flag set — proves the binary's load path treats this as a
+        // stellar-core compat config (no manual patching).
         assert!(config.is_compat_config);
     }
 
