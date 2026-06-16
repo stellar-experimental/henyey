@@ -1538,8 +1538,179 @@ EOF
     fi
 }
 
+# ============================================================
+# Test 28: test_testnet_hang_watchdog_emits_process_dump_before_step_kill
+#
+# DIAGNOSTIC instrumentation coverage for #3286. The testnet "Run probes
+# through wrapper" step now (a) carries a tight step-level timeout-minutes (25)
+# so a hang FAILS FAST instead of running to the 45-min job cancel, and (b)
+# launches scripts/ci/quickstart-hang-watchdog.sh in the background BEFORE the
+# probe loop. After WATCHDOG_DELAY (< the step-timeout bound) the watchdog must
+# dump the process tree + open fds to the diagnostics dir, so the snapshot is
+# on disk BEFORE the step kill and is swept into the uploaded artifact.
+#
+# This test runs the SAME script the workflow runs (no inline-vs-test drift):
+# it simulates a hang by running a hung foreground "probe" under an OUTER
+# timeout that fires AFTER the watchdog delay (the simulated step kill), with
+# the watchdog backgrounded just as the step body does. It asserts the dump
+# file exists, is non-empty, and contains a process-table signature — i.e. the
+# diagnostic data is captured before the kill. The hung probe + watchdog are
+# reaped via a UNIQUE sentinel marker (pkill -f "$marker") so nothing leaks
+# across runs or wedges the harness EXIT trap (Critic A).
+# ============================================================
+test_testnet_hang_watchdog_emits_process_dump_before_step_kill() {
+    local watchdog="$REPO_ROOT/scripts/ci/quickstart-hang-watchdog.sh"
+    if [[ ! -f "$watchdog" ]]; then
+        tap_not_ok "watchdog_script_exists" "scripts/ci/quickstart-hang-watchdog.sh not found"
+        tap_not_ok "watchdog_dump_written_before_step_kill" "watchdog script missing"
+        tap_not_ok "watchdog_dump_has_process_signature" "watchdog script missing"
+        return
+    fi
+    tap_ok "watchdog_script_exists"
+
+    local diag_dir="$TMPDIR_BASE/diag-test28"
+    mkdir -p "$diag_dir"
+    local out_dir="$diag_dir/testnet-hang-watchdog"
+
+    # Unique sentinel so cleanup never kills unrelated processes on a shared
+    # CI runner (Critic A). The hung "probe" carries it in its argv.
+    local marker="qs-hang-wd-test28-$$-${RANDOM}"
+    local hang_sentinel="$TMPDIR_BASE/$marker.hung"
+
+    # Reap any leftovers from this test on function return, scoped to the
+    # unique marker (so it never kills unrelated processes).
+    # shellcheck disable=SC2064
+    trap "pkill -f '$marker' 2>/dev/null || true" RETURN
+
+    # Simulated step body: capture STEP_PID, launch the watchdog with a SHORT
+    # WATCHDOG_DELAY, then run a hung foreground 'probe' under an OUTER timeout
+    # that fires AFTER the watchdog has written its dump (the simulated 25-min
+    # step kill). The foreground probe carries the unique marker in its argv.
+    local step_body="$TMPDIR_BASE/stepbody-test28.sh"
+    cat > "$step_body" <<EOF
+#!/usr/bin/env bash
+set -u
+STEP_PID=\$\$
+# Watchdog fires at ~1s — well before the outer 3s simulated step kill.
+WATCHDOG_DELAY=1 bash "$watchdog" "$out_dir" "\$STEP_PID" &
+WATCHDOG_PID=\$!
+# Hung 'probe' that outlives the outer timeout; tagged with the unique marker
+# in its argv so cleanup's pkill -f matches only this process.
+touch "$hang_sentinel"
+exec sleep 30 "$marker"
+EOF
+    chmod +x "$step_body"
+
+    # Outer timeout = the simulated step-timeout-minutes kill. It fires at 3s,
+    # AFTER the 1s watchdog delay, so the dump must already be on disk.
+    timeout -k 2s 3 bash "$step_body" >/dev/null 2>&1 || true
+
+    # Give the backgrounded watchdog's file write a brief moment to settle.
+    local waited=0
+    while [[ ! -s "$out_dir/dump.txt" && $waited -lt 5 ]]; do
+        sleep 1
+        waited=$((waited + 1))
+    done
+
+    # (a) The dump file exists and is non-empty AFTER the simulated step kill.
+    if [[ -s "$out_dir/dump.txt" ]]; then
+        tap_ok "watchdog_dump_written_before_step_kill"
+    else
+        tap_not_ok "watchdog_dump_written_before_step_kill" \
+            "expected non-empty $out_dir/dump.txt after the simulated step kill"
+    fi
+
+    # (b) The dump contains a process-table signature (the PID column header
+    # from ps -ejH / ps faux), proving real process state was captured.
+    if grep -qE '\bPID\b' "$out_dir/dump.txt" 2>/dev/null; then
+        tap_ok "watchdog_dump_has_process_signature"
+    else
+        tap_not_ok "watchdog_dump_has_process_signature" \
+            "dump did not contain a process-table (PID column) signature"
+    fi
+
+    # Reap the hung probe + watchdog explicitly via the unique marker (the
+    # RETURN trap also covers this, belt-and-suspenders).
+    pkill -f "$marker" 2>/dev/null || true
+}
+
+# ============================================================
+# Test 29: test_testnet_shard_renders_step_timeout_25_others_360
+#
+# PRIMARY correct-by-construction guard for #3286 (does NOT depend on catching
+# a flaky CI hang). The whole diagnostic chain hinges on the testnet
+# core,horizon "Run probes through wrapper" step rendering a TIGHT step-level
+# `timeout-minutes` of 25: a step-timeout marks the STEP failed (so the
+# `if: failure()` "Upload diagnostics" step runs and the watchdog dump uploads),
+# whereas the 45-min JOB wall-clock is a *cancel* that does NOT reliably run
+# subsequent steps. A previous attempt could only be validated by a hung CI run.
+#
+# This test instead EVALUATES the per-shard `${{ matrix.step_timeout_minutes ||
+# 360 }}` expression exactly as GitHub Actions does (via
+# scripts/ci/render-quickstart-step-timeout.py, which applies GHA's `||` falsy
+# semantics: an unset matrix key is null/falsy -> 360; the testnet entry's
+# explicit 25 is truthy -> 25). It asserts:
+#   (a) the testnet/core,horizon shard renders timeout-minutes == 25, AND
+#   (b) every OTHER shard (local/pubnet) renders the generous 360 default,
+#       so the tight bound is scoped to exactly the hanging shard and no other.
+# If the key is ever moved to the wrong entry, dropped, or the expression form
+# changes so it stops resolving to 25, this assertion turns red — no hung run
+# required.
+# ============================================================
+test_testnet_shard_renders_step_timeout_25_others_360() {
+    local renderer="$REPO_ROOT/scripts/ci/render-quickstart-step-timeout.py"
+    if [[ ! -f "$WORKFLOW" || ! -f "$renderer" ]]; then
+        tap_not_ok "render_script_exists" "workflow or renderer not found"
+        tap_not_ok "testnet_core_horizon_shard_renders_step_timeout_25" "renderer missing"
+        tap_not_ok "non_testnet_shards_render_generous_default_360" "renderer missing"
+        tap_not_ok "exactly_one_shard_carries_tight_step_timeout" "renderer missing"
+        return
+    fi
+    tap_ok "render_script_exists"
+
+    # Render <network>|<enable>|<timeout-minutes> for every matrix shard.
+    # `|| true` so a renderer error (exit non-zero) doesn't abort under `set -e`;
+    # an empty/failed render is caught by the assertions below.
+    local rendered
+    rendered=$(python3 "$renderer" "$WORKFLOW" 2>"$TMPDIR_BASE/render-test29.err" || true)
+
+    # (a) The testnet core,horizon shard renders exactly 25.
+    local testnet_val
+    testnet_val=$( (echo "$rendered" | grep -E '^testnet\|core,horizon\|' || true) \
+        | head -1 | awk -F'|' '{print $3}')
+    if [[ "$testnet_val" == "25" ]]; then
+        tap_ok "testnet_core_horizon_shard_renders_step_timeout_25"
+    else
+        tap_not_ok "testnet_core_horizon_shard_renders_step_timeout_25" \
+            "expected 25, got '$testnet_val' (renderer err: $(tr '\n' ' ' < "$TMPDIR_BASE/render-test29.err"))"
+    fi
+
+    # (b) Every non-testnet shard renders the generous default (360). A shard
+    # that silently picked up a tight bound (or a default drift) turns this red.
+    local non_testnet_bad
+    non_testnet_bad=$( (echo "$rendered" | grep -vE '^testnet\|' || true) \
+        | awk -F'|' '$3 != "360" {print}' )
+    if [[ -z "$non_testnet_bad" && -n "$rendered" ]]; then
+        tap_ok "non_testnet_shards_render_generous_default_360"
+    else
+        tap_not_ok "non_testnet_shards_render_generous_default_360" \
+            "non-testnet shard(s) not at 360: ${non_testnet_bad:-<no shards rendered>}"
+    fi
+
+    # (c) Exactly one shard carries the tight (< 360) step timeout — the
+    # diagnostic bound must be surgically scoped, never broadcast.
+    local tight_count
+    tight_count=$( (echo "$rendered" || true) | awk -F'|' '$3 != "" && $3 + 0 < 360 {c++} END{print c+0}')
+    if [[ "$tight_count" == "1" ]]; then
+        tap_ok "exactly_one_shard_carries_tight_step_timeout"
+    else
+        tap_not_ok "exactly_one_shard_carries_tight_step_timeout" \
+            "expected exactly 1 shard with timeout-minutes < 360, got $tight_count"
+    fi
+}
+
 # --- Run all tests ---
-tap_plan 85
+tap_plan 92
 
 test_timeout_retry_on_targeted_shard
 test_non_timeout_failure_no_retry
@@ -1568,6 +1739,8 @@ test_soft_on_timeout_preserves_diagnostics
 test_soft_on_timeout_off_by_default_preserves_red
 test_workflow_testnet_shard_uses_soft_timeout_and_tight_budget
 test_sigterm_ignoring_probe_is_force_killed_and_soft_skipped
+test_testnet_hang_watchdog_emits_process_dump_before_step_kill
+test_testnet_shard_renders_step_timeout_25_others_360
 
 echo ""
 echo "# Results: $PASS_COUNT/$TEST_COUNT passed, $FAIL_COUNT failed"

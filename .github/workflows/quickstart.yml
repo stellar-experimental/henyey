@@ -434,11 +434,24 @@ jobs:
           # 600s hard-fail-on-timeout and carry no soft flag.
           # Budget: 4 probes × 240s + one 240s retry = 1200s (~20 min), well
           # under the job's 45-min timeout-minutes.
+          #
+          # DIAGNOSTIC instrumentation (#3286): this shard also sets a TIGHT,
+          # testnet-only step-level fail-fast bound via step_timeout_minutes: 25
+          # (applied as the "Run probes through wrapper" step's timeout-minutes
+          # below). Two wrapper-level fixes (#3273, #3287) both FAILED to bound
+          # the ~55-min step-8 hang, and a 45-min JOB-level wall-clock is a
+          # *cancel* — so `if: failure()` never fires and the diagnostics step
+          # never uploads. A step-level timeout-minutes kill instead marks the
+          # STEP failed (distinct from a job cancel), so the upload step runs.
+          # 25 min > the ~20-min healthy budget above, so a healthy run never
+          # trips it. Other shards inherit the generous 360-min default (a
+          # no-op under the job's own 45-min cap) and stay byte-identical.
           - network: testnet
             enable: "core,horizon"
             probes: "test_core.go test_horizon_up.go test_horizon_core_up.go test_horizon_ingesting.go"
             soft_on_timeout: true
             probe_timeout: 240
+            step_timeout_minutes: 25
           # Additional pubnet shard
           # Note: upstream excludes horizon_core_up, horizon_ingesting, and
           # stellar_rpc_healthy on pubnet (see internal-test.yml conditionals).
@@ -480,6 +493,15 @@ jobs:
             --enable ${{ matrix.enable }}
 
       - name: Run probes through wrapper
+        # DIAGNOSTIC fail-fast bound (#3286). Testnet sets
+        # matrix.step_timeout_minutes: 25 (tighter than its ~20-min healthy
+        # budget) so a hang here FAILS the STEP at ~25 min instead of running
+        # to the 45-min JOB cancel — a step-timeout marks the step *failed*, so
+        # the "Upload diagnostics" step (if: failure()) actually runs and the
+        # watchdog's process-tree dump is uploaded. All other shards have no
+        # step_timeout_minutes set and inherit the generous 360-min default
+        # (a no-op under the job's 45-min cap), so they stay byte-identical.
+        timeout-minutes: ${{ matrix.step_timeout_minutes || 360 }}
         env:
           NETWORK: ${{ matrix.network }}
           ENABLE: ${{ matrix.enable }}
@@ -519,6 +541,29 @@ jobs:
           fi
           DIAG_DIR="/tmp/quickstart-diagnostics"
 
+          # ---- DIAGNOSTIC hang watchdog (#3286), testnet shard only ----
+          # Capture the step shell's PID HERE, in the step body — NOT inside a
+          # subshell and NOT via $BASHPID — so the backgrounded watchdog can
+          # dump the fds THIS shell holds. The watchdog sleeps WATCHDOG_DELAY
+          # (default 1200s = 20 min, < the 25-min step_timeout_minutes bound)
+          # then writes a process-tree + open-fd snapshot to the diagnostics
+          # dir, so on the next hang the dump is on disk BEFORE the step kill
+          # and gets swept into the uploaded artifact. It is reaped on the
+          # healthy path (trap EXIT + explicit kill after the loop) so it never
+          # lingers or emits a spurious dump on a passing run. This does NOT fix
+          # the hang — its deliverable is DATA from the next hang.
+          STEP_PID=$$
+          WATCHDOG_PID=""
+          if [[ "$NETWORK" == "testnet" ]]; then
+            ( sleep "${WATCHDOG_DELAY:-1200}"; \
+              bash scripts/ci/quickstart-hang-watchdog.sh \
+                "$DIAG_DIR/testnet-hang-watchdog" "$STEP_PID" ) &
+            WATCHDOG_PID=$!
+            # Reap the watchdog on any step exit so a passing run never leaks
+            # the backgrounded sleep.
+            trap '[[ -n "$WATCHDOG_PID" ]] && kill "$WATCHDOG_PID" 2>/dev/null || true' EXIT
+          fi
+
           for probe_file in ${{ matrix.probes }}; do
             probe_name="${probe_file%.go}"
             probe_name="${probe_name#test_}"
@@ -536,8 +581,20 @@ jobs:
               -- go run "quickstart/tests/$probe_file"
           done
 
+          # Healthy path: probes finished, so reap the watchdog now (explicit
+          # kill, belt-and-suspenders with the EXIT trap) — no lingering sleep,
+          # no spurious dump on a passing run.
+          if [[ -n "$WATCHDOG_PID" ]]; then
+            kill "$WATCHDOG_PID" 2>/dev/null || true
+          fi
+
       - name: Upload diagnostics on failure
-        if: failure()
+        # DIAGNOSTIC instrumentation (#3286): upload on BOTH a step-timeout
+        # failure (the primary path — a testnet step_timeout_minutes kill marks
+        # the step failed, so failure() fires) AND a residual job-level cancel
+        # (belt-and-suspenders). The watchdog writes its dump before the step
+        # kill, so the artifact exists for either disposition.
+        if: ${{ failure() || cancelled() }}
         uses: actions/upload-artifact@v4
         with:
           name: quickstart-diagnostics-${{ matrix.network }}-${{ matrix.enable }}
