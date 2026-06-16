@@ -2224,45 +2224,66 @@ mod tests {
             Some("SDQVDISRYN2JXBS7ICL7QJAEKB3HWBJFP2QECXG7GZICAHBK4UNJCWK2")
         );
 
-        // --- Quorum set: exactly 4 DISTINCT keys (henyey + 3 stellar-core) ---
-        // henyey's own key is derived from NODE_SEED, and it is ALSO listed in
-        // [[VALIDATORS]] by PUBLIC_KEY. Assert no `$self`-resolution error and
-        // no double-counting: the set is exactly 4 distinct keys (the inverse
-        // of `test_quorum_set_self_without_node_seed_fails`).
+        // --- Quorum: the listed [[VALIDATORS]] are exactly the 3 stellar-core
+        // peers; henyey's own key is added automatically (NOT listed in its own
+        // [[VALIDATORS]], mirroring stellar-core's addSelfToValidators which
+        // never dedups, Config.cpp:869-898). So the auto-generated quorum-set
+        // key list holds the 3 distinct core keys...
         let henyey_self_key = henyey_crypto::SecretKey::from_strkey(
             "SDQVDISRYN2JXBS7ICL7QJAEKB3HWBJFP2QECXG7GZICAHBK4UNJCWK2",
         )
         .unwrap()
         .public_key()
         .to_strkey();
-        let validators = &config.node.quorum_set.validators;
-        assert_eq!(
-            validators.len(),
-            4,
-            "expected exactly 4 quorum validators (henyey + 3 core), got {}: {:?}",
-            validators.len(),
-            validators
-        );
-        let distinct: std::collections::HashSet<&String> = validators.iter().collect();
-        assert_eq!(
-            distinct.len(),
-            4,
-            "quorum validators must be 4 DISTINCT keys (no double-counting of self)"
-        );
-        // henyey's own derived key is present in the quorum.
-        assert!(
-            validators.contains(&henyey_self_key),
-            "quorum must contain henyey's own derived key {henyey_self_key}"
-        );
-        // The 3 stellar-core validator keys are present.
-        for core_key in [
+        let core_keys = [
             "GDKXE2OZMJIPOSLNA6N6F2BVCI3O777I2OOC4BV7VOYUEHYX7RTRYA7Y",
             "GCUCJTIYXSOXKBSNFGNFWW5MUQ54HKRPGJUTQFJ5RQXZXNOLNXYDHRAP",
             "GC2V2EFSXN6SQTWVYA5EPJPBWWIMSD2XQNKUOHGEKB535AQE2I6IXV2Z",
-        ] {
+        ];
+        let validators = &config.node.quorum_set.validators;
+        assert_eq!(
+            validators.len(),
+            3,
+            "expected the 3 listed stellar-core validators, got {}: {:?}",
+            validators.len(),
+            validators
+        );
+        for core_key in core_keys {
             assert!(
                 validators.contains(&core_key.to_string()),
                 "quorum must contain stellar-core key {core_key}"
+            );
+        }
+        // henyey does NOT list itself in [[VALIDATORS]] (no duplicate self).
+        assert!(
+            !validators.contains(&henyey_self_key),
+            "henyey must not list its own key in [[VALIDATORS]] (self is auto-added)"
+        );
+
+        // ...and the FULL 4-node quorum (3 core + auto-added self) materializes
+        // in the ValidatorWeightConfig, with exactly 4 DISTINCT node ids and no
+        // self double-counting (the inverse of
+        // `test_quorum_set_self_without_node_seed_fails`).
+        let vwc = config
+            .validator_weight_config
+            .as_ref()
+            .expect("mission validator config must build a ValidatorWeightConfig");
+        assert_eq!(
+            vwc.validator_entries.len(),
+            4,
+            "weight config must hold 4 distinct validators (3 core + self), got {}",
+            vwc.validator_entries.len()
+        );
+        let self_node_id = parse_node_id(&henyey_self_key).unwrap();
+        assert!(
+            vwc.validator_entries.contains_key(&self_node_id),
+            "weight config must contain henyey's auto-added self entry"
+        );
+        for core_key in core_keys {
+            let nid = parse_node_id(core_key).unwrap();
+            assert!(
+                vwc.validator_entries.contains_key(&nid),
+                "weight config must contain stellar-core key {core_key}"
             );
         }
 
