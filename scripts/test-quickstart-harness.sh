@@ -1538,8 +1538,104 @@ EOF
     fi
 }
 
+# ============================================================
+# Test 28: test_testnet_hang_watchdog_emits_process_dump_before_step_kill
+#
+# DIAGNOSTIC instrumentation coverage for #3286. The testnet "Run probes
+# through wrapper" step now (a) carries a tight step-level timeout-minutes (25)
+# so a hang FAILS FAST instead of running to the 45-min job cancel, and (b)
+# launches scripts/ci/quickstart-hang-watchdog.sh in the background BEFORE the
+# probe loop. After WATCHDOG_DELAY (< the step-timeout bound) the watchdog must
+# dump the process tree + open fds to the diagnostics dir, so the snapshot is
+# on disk BEFORE the step kill and is swept into the uploaded artifact.
+#
+# This test runs the SAME script the workflow runs (no inline-vs-test drift):
+# it simulates a hang by running a hung foreground "probe" under an OUTER
+# timeout that fires AFTER the watchdog delay (the simulated step kill), with
+# the watchdog backgrounded just as the step body does. It asserts the dump
+# file exists, is non-empty, and contains a process-table signature — i.e. the
+# diagnostic data is captured before the kill. The hung probe + watchdog are
+# reaped via a UNIQUE sentinel marker (pkill -f "$marker") so nothing leaks
+# across runs or wedges the harness EXIT trap (Critic A).
+# ============================================================
+test_testnet_hang_watchdog_emits_process_dump_before_step_kill() {
+    local watchdog="$REPO_ROOT/scripts/ci/quickstart-hang-watchdog.sh"
+    if [[ ! -f "$watchdog" ]]; then
+        tap_not_ok "watchdog_script_exists" "scripts/ci/quickstart-hang-watchdog.sh not found"
+        tap_not_ok "watchdog_dump_written_before_step_kill" "watchdog script missing"
+        tap_not_ok "watchdog_dump_has_process_signature" "watchdog script missing"
+        return
+    fi
+    tap_ok "watchdog_script_exists"
+
+    local diag_dir="$TMPDIR_BASE/diag-test28"
+    mkdir -p "$diag_dir"
+    local out_dir="$diag_dir/testnet-hang-watchdog"
+
+    # Unique sentinel so cleanup never kills unrelated processes on a shared
+    # CI runner (Critic A). The hung "probe" carries it in its argv.
+    local marker="qs-hang-wd-test28-$$-${RANDOM}"
+    local hang_sentinel="$TMPDIR_BASE/$marker.hung"
+
+    # Reap any leftovers from this test on function return, scoped to the
+    # unique marker (so it never kills unrelated processes).
+    # shellcheck disable=SC2064
+    trap "pkill -f '$marker' 2>/dev/null || true" RETURN
+
+    # Simulated step body: capture STEP_PID, launch the watchdog with a SHORT
+    # WATCHDOG_DELAY, then run a hung foreground 'probe' under an OUTER timeout
+    # that fires AFTER the watchdog has written its dump (the simulated 25-min
+    # step kill). The foreground probe carries the unique marker in its argv.
+    local step_body="$TMPDIR_BASE/stepbody-test28.sh"
+    cat > "$step_body" <<EOF
+#!/usr/bin/env bash
+set -u
+STEP_PID=\$\$
+# Watchdog fires at ~1s — well before the outer 3s simulated step kill.
+WATCHDOG_DELAY=1 bash "$watchdog" "$out_dir" "\$STEP_PID" &
+WATCHDOG_PID=\$!
+# Hung 'probe' that outlives the outer timeout; tagged with the unique marker
+# in its argv so cleanup's pkill -f matches only this process.
+touch "$hang_sentinel"
+exec sleep 30 "$marker"
+EOF
+    chmod +x "$step_body"
+
+    # Outer timeout = the simulated step-timeout-minutes kill. It fires at 3s,
+    # AFTER the 1s watchdog delay, so the dump must already be on disk.
+    timeout -k 2s 3 bash "$step_body" >/dev/null 2>&1 || true
+
+    # Give the backgrounded watchdog's file write a brief moment to settle.
+    local waited=0
+    while [[ ! -s "$out_dir/dump.txt" && $waited -lt 5 ]]; do
+        sleep 1
+        waited=$((waited + 1))
+    done
+
+    # (a) The dump file exists and is non-empty AFTER the simulated step kill.
+    if [[ -s "$out_dir/dump.txt" ]]; then
+        tap_ok "watchdog_dump_written_before_step_kill"
+    else
+        tap_not_ok "watchdog_dump_written_before_step_kill" \
+            "expected non-empty $out_dir/dump.txt after the simulated step kill"
+    fi
+
+    # (b) The dump contains a process-table signature (the PID column header
+    # from ps -ejH / ps faux), proving real process state was captured.
+    if grep -qE '\bPID\b' "$out_dir/dump.txt" 2>/dev/null; then
+        tap_ok "watchdog_dump_has_process_signature"
+    else
+        tap_not_ok "watchdog_dump_has_process_signature" \
+            "dump did not contain a process-table (PID column) signature"
+    fi
+
+    # Reap the hung probe + watchdog explicitly via the unique marker (the
+    # RETURN trap also covers this, belt-and-suspenders).
+    pkill -f "$marker" 2>/dev/null || true
+}
+
 # --- Run all tests ---
-tap_plan 85
+tap_plan 88
 
 test_timeout_retry_on_targeted_shard
 test_non_timeout_failure_no_retry
@@ -1568,6 +1664,7 @@ test_soft_on_timeout_preserves_diagnostics
 test_soft_on_timeout_off_by_default_preserves_red
 test_workflow_testnet_shard_uses_soft_timeout_and_tight_budget
 test_sigterm_ignoring_probe_is_force_killed_and_soft_skipped
+test_testnet_hang_watchdog_emits_process_dump_before_step_kill
 
 echo ""
 echo "# Results: $PASS_COUNT/$TEST_COUNT passed, $FAIL_COUNT failed"
