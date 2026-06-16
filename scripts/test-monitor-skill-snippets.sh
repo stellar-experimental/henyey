@@ -45,7 +45,7 @@ cleanup  # ensure fresh state
 mkdir -p "$TEST_ROOT"
 
 # ── TAP state ────────────────────────────────────────────────────────────────
-TAP_PLAN=368
+TAP_PLAN=395
 TAP_CURRENT=0
 TAP_FAILURES=0
 
@@ -9590,6 +9590,318 @@ BOARDEOF
     tap_ok "structural: monitor-tick/SKILL.md surfaces henyey_startup_peak_anon_rss_mb"
   else
     tap_not_ok "structural: monitor-tick/SKILL.md surfaces henyey_startup_peak_anon_rss_mb" "not found"
+  fi
+
+  # ── Test-only deploy-gate carve-out (#3215) ─────────────────────────────────
+  # Two pure functions in monitor-decisions.sh power the §10 deploy-gate
+  # binary-relevance check:
+  #   classify_path_binary_relevance PATH → no-impact | test-only |
+  #                                          needs-hunk-check | rebuild (fail-safe)
+  #   diff_is_test_only  (reads one file's unified diff on stdin) → 0 iff every
+  #                       changed line is strictly inside a #[cfg(test)]/mod tests
+  #                       region; ANY ambiguity → non-zero (rebuild).
+  # The functions only mark a CANDIDATE; the authoritative skip is gated on a
+  # release-binary byte-compare in SKILL.md §10 (structural assertions below).
+
+  # --- classify_path_binary_relevance: path-level table test ---
+  if classify_path_binary_relevance ".github/workflows/ci.yml" >/dev/null 2>&1; then
+    _has_classify=yes
+  else
+    _has_classify=no
+  fi
+
+  _cls() { classify_path_binary_relevance "$1" 2>/dev/null; }
+
+  if [[ "$(_cls ".github/workflows/ci.yml")" == "no-impact" ]]; then
+    tap_ok "classify_path: .github/ → no-impact"
+  else
+    tap_not_ok "classify_path: .github/ → no-impact" "got '$(_cls ".github/workflows/ci.yml")'"
+  fi
+  if [[ "$(_cls ".claude/skills/monitor-tick/SKILL.md")" == "no-impact" ]]; then
+    tap_ok "classify_path: .claude/ → no-impact"
+  else
+    tap_not_ok "classify_path: .claude/ → no-impact" "got '$(_cls ".claude/skills/monitor-tick/SKILL.md")'"
+  fi
+  if [[ "$(_cls "scripts/lib/monitor-decisions.sh")" == "no-impact" ]]; then
+    tap_ok "classify_path: scripts/ → no-impact"
+  else
+    tap_not_ok "classify_path: scripts/ → no-impact" "got '$(_cls "scripts/lib/monitor-decisions.sh")'"
+  fi
+  if [[ "$(_cls "README.md")" == "no-impact" ]]; then
+    tap_ok "classify_path: root *.md → no-impact"
+  else
+    tap_not_ok "classify_path: root *.md → no-impact" "got '$(_cls "README.md")'"
+  fi
+  if [[ "$(_cls "stellar-specs")" == "no-impact" ]]; then
+    tap_ok "classify_path: stellar-specs submodule → no-impact"
+  else
+    tap_not_ok "classify_path: stellar-specs submodule → no-impact" "got '$(_cls "stellar-specs")'"
+  fi
+  if [[ "$(_cls "crates/app/tests/publish_tests.rs")" == "test-only" ]]; then
+    tap_ok "classify_path: crates/*/tests/** → test-only"
+  else
+    tap_not_ok "classify_path: crates/*/tests/** → test-only" "got '$(_cls "crates/app/tests/publish_tests.rs")'"
+  fi
+  if [[ "$(_cls "crates/app/src/app/publish.rs")" == "needs-hunk-check" ]]; then
+    tap_ok "classify_path: crates/**/src/**.rs → needs-hunk-check"
+  else
+    tap_not_ok "classify_path: crates/**/src/**.rs → needs-hunk-check" "got '$(_cls "crates/app/src/app/publish.rs")'"
+  fi
+  # Fail-safe: everything else → rebuild.
+  if [[ "$(_cls "Cargo.toml")" == "rebuild" ]]; then
+    tap_ok "classify_path: Cargo.toml → rebuild (fail-safe)"
+  else
+    tap_not_ok "classify_path: Cargo.toml → rebuild (fail-safe)" "got '$(_cls "Cargo.toml")'"
+  fi
+  if [[ "$(_cls "Cargo.lock")" == "rebuild" ]]; then
+    tap_ok "classify_path: Cargo.lock → rebuild (fail-safe)"
+  else
+    tap_not_ok "classify_path: Cargo.lock → rebuild (fail-safe)" "got '$(_cls "Cargo.lock")'"
+  fi
+  if [[ "$(_cls "crates/app/build.rs")" == "rebuild" ]]; then
+    tap_ok "classify_path: crates/*/build.rs → rebuild (fail-safe)"
+  else
+    tap_not_ok "classify_path: crates/*/build.rs → rebuild (fail-safe)" "got '$(_cls "crates/app/build.rs")'"
+  fi
+  if [[ "$(_cls "configs/validator-mainnet.toml")" == "rebuild" ]]; then
+    tap_ok "classify_path: configs/ → rebuild (fail-safe)"
+  else
+    tap_not_ok "classify_path: configs/ → rebuild (fail-safe)" "got '$(_cls "configs/validator-mainnet.toml")'"
+  fi
+  # .rs under crates/ but NOT in src/ or tests/ (e.g. benches, examples) → rebuild.
+  if [[ "$(_cls "crates/app/benches/apply_load.rs")" == "rebuild" ]]; then
+    tap_ok "classify_path: crates/*/benches/*.rs → rebuild (fail-safe)"
+  else
+    tap_not_ok "classify_path: crates/*/benches/*.rs → rebuild (fail-safe)" "got '$(_cls "crates/app/benches/apply_load.rs")'"
+  fi
+  # Non-.rs file under crates/src (e.g. an included .json/.wasm fixture) → rebuild.
+  if [[ "$(_cls "crates/app/src/fixtures/data.json")" == "rebuild" ]]; then
+    tap_ok "classify_path: non-.rs under crates/src → rebuild (fail-safe)"
+  else
+    tap_not_ok "classify_path: non-.rs under crates/src → rebuild (fail-safe)" "got '$(_cls "crates/app/src/fixtures/data.json")'"
+  fi
+
+  # --- diff_is_test_only: hunk-level ---
+  # PASS case: a src/*.rs diff whose every changed line is strictly inside a
+  # #[cfg(test)] mod tests { ... } region.
+  _diff_test_only_pass() {
+    cat <<'CANNED'
+diff --git a/crates/app/src/app/publish.rs b/crates/app/src/app/publish.rs
+index 1111111..2222222 100644
+--- a/crates/app/src/app/publish.rs
++++ b/crates/app/src/app/publish.rs
+@@ -200,6 +200,7 @@ fn produce(x: u32) -> u32 {
+ #[cfg(test)]
+ mod tests {
+     use super::*;
++    // new helper comment inside tests
+     #[test]
+     fn test_produce_doubles() {
+         assert_eq!(produce(2), 4);
+@@ -210,3 +211,4 @@ mod tests {
+     fn test_produce_zero() {
+         assert_eq!(produce(0), 0);
++        assert_ne!(produce(0), 1);
+     }
+ }
+CANNED
+  }
+  if _diff_test_only_pass | diff_is_test_only 2>/dev/null; then
+    tap_ok "diff_is_test_only: all hunks inside #[cfg(test)] mod tests → test-only"
+  else
+    tap_not_ok "diff_is_test_only: all hunks inside #[cfg(test)] mod tests → test-only" "expected rc 0"
+  fi
+
+  # FAIL (a): a hunk OUTSIDE the cfg(test) region → rebuild.
+  _diff_outside() {
+    cat <<'CANNED'
+diff --git a/crates/app/src/app/publish.rs b/crates/app/src/app/publish.rs
+index 1111111..2222222 100644
+--- a/crates/app/src/app/publish.rs
++++ b/crates/app/src/app/publish.rs
+@@ -10,3 +10,4 @@ fn produce(x: u32) -> u32 {
+     let y = x * 2;
++    let y = y + 1;
+     y
+ }
+CANNED
+  }
+  if _diff_outside | diff_is_test_only 2>/dev/null; then
+    tap_not_ok "diff_is_test_only: production hunk → rebuild (fail-safe)" "expected non-zero"
+  else
+    tap_ok "diff_is_test_only: production hunk → rebuild (fail-safe)"
+  fi
+
+  # FAIL (b): a MIXED diff (one test hunk + one production hunk) → rebuild.
+  _diff_mixed() {
+    cat <<'CANNED'
+diff --git a/crates/app/src/app/publish.rs b/crates/app/src/app/publish.rs
+index 1111111..2222222 100644
+--- a/crates/app/src/app/publish.rs
++++ b/crates/app/src/app/publish.rs
+@@ -10,3 +10,4 @@ fn produce(x: u32) -> u32 {
+     let y = x * 2;
++    let y = y + 1;
+     y
+ }
+@@ -200,5 +201,6 @@ mod tests {
+ #[cfg(test)]
+ mod tests {
+     #[test]
++    fn test_new() { assert!(true); }
+     fn test_old() {}
+ }
+CANNED
+  }
+  if _diff_mixed | diff_is_test_only 2>/dev/null; then
+    tap_not_ok "diff_is_test_only: mixed test+production diff → rebuild (fail-safe)" "expected non-zero"
+  else
+    tap_ok "diff_is_test_only: mixed test+production diff → rebuild (fail-safe)"
+  fi
+
+  # FAIL (c): a diff that edits the #[cfg(test)]/mod tests opener line itself →
+  # rebuild (the boundary is ambiguous — can't confirm region membership).
+  _diff_boundary() {
+    cat <<'CANNED'
+diff --git a/crates/app/src/app/publish.rs b/crates/app/src/app/publish.rs
+index 1111111..2222222 100644
+--- a/crates/app/src/app/publish.rs
++++ b/crates/app/src/app/publish.rs
+@@ -198,4 +198,5 @@ fn produce(x: u32) -> u32 {
+ }
++#[cfg(test)]
+ mod tests {
+     use super::*;
+CANNED
+  }
+  if _diff_boundary | diff_is_test_only 2>/dev/null; then
+    tap_not_ok "diff_is_test_only: edits #[cfg(test)] opener → rebuild (fail-safe)" "expected non-zero"
+  else
+    tap_ok "diff_is_test_only: edits #[cfg(test)] opener → rebuild (fail-safe)"
+  fi
+
+  # FAIL (d): a zero-context hunk / whole cfg(test)-module deletion the
+  # brace-tracker cannot anchor inside a confirmed region → rebuild (Critic A).
+  _diff_zerocontext() {
+    cat <<'CANNED'
+diff --git a/crates/app/src/app/publish.rs b/crates/app/src/app/publish.rs
+index 1111111..2222222 100644
+--- a/crates/app/src/app/publish.rs
++++ b/crates/app/src/app/publish.rs
+@@ -50,0 +51,1 @@
++    let unanchored = compute();
+CANNED
+  }
+  if _diff_zerocontext | diff_is_test_only 2>/dev/null; then
+    tap_not_ok "diff_is_test_only: zero-context hunk → rebuild (fail-safe)" "expected non-zero"
+  else
+    tap_ok "diff_is_test_only: zero-context hunk → rebuild (fail-safe)"
+  fi
+  _diff_moddelete() {
+    cat <<'CANNED'
+diff --git a/crates/app/src/app/publish.rs b/crates/app/src/app/publish.rs
+index 1111111..0000000 100644
+--- a/crates/app/src/app/publish.rs
++++ b/crates/app/src/app/publish.rs
+@@ -1,4 +0,0 @@
+-fn produce(x: u32) -> u32 {
+-    x * 2
+-}
+CANNED
+  }
+  if _diff_moddelete | diff_is_test_only 2>/dev/null; then
+    tap_not_ok "diff_is_test_only: whole-module deletion → rebuild (fail-safe)" "expected non-zero"
+  else
+    tap_ok "diff_is_test_only: whole-module deletion → rebuild (fail-safe)"
+  fi
+
+  # --- End-to-end gate decision (canned multi-file `git diff` mock, #3248 style) ---
+  # Walk a changeset path-by-path applying classify_path_binary_relevance, and
+  # for needs-hunk-check paths drive diff_is_test_only on that file's per-file
+  # diff. The aggregate decision: needs_rebuild=no iff EVERY path resolves to
+  # no-impact or test-only (the latter confirmed by diff_is_test_only); else yes.
+  _gate_decide() {
+    # $1 = newline-separated changed paths; reads per-file diffs from a mock
+    # `_gate_filediff <path>` the caller defines.
+    local paths="$1" p verdict needs="no"
+    while IFS= read -r p; do
+      [[ -z "$p" ]] && continue
+      verdict="$(classify_path_binary_relevance "$p" 2>/dev/null)"
+      case "$verdict" in
+        no-impact) ;;
+        test-only) ;;
+        needs-hunk-check)
+          if ! _gate_filediff "$p" | diff_is_test_only 2>/dev/null; then
+            needs="yes"; break
+          fi
+          ;;
+        *) needs="yes"; break ;;
+      esac
+    done <<< "$paths"
+    echo "$needs"
+  }
+
+  # (a) test-only changeset → needs_rebuild=no candidate.
+  _gate_filediff() { _diff_test_only_pass; }
+  local _changeset_a="crates/app/tests/publish_tests.rs
+crates/app/src/app/publish.rs
+README.md"
+  if [[ "$(_gate_decide "$_changeset_a")" == "no" ]]; then
+    tap_ok "gate-decision: test-only changeset → needs_rebuild=no candidate"
+  else
+    tap_not_ok "gate-decision: test-only changeset → needs_rebuild=no candidate" "got '$(_gate_decide "$_changeset_a")'"
+  fi
+
+  # (b) real-src changeset → needs_rebuild=yes (the fail-safe).
+  _gate_filediff() { _diff_outside; }
+  local _changeset_b="crates/app/src/app/publish.rs"
+  if [[ "$(_gate_decide "$_changeset_b")" == "yes" ]]; then
+    tap_ok "gate-decision: real-src changeset → needs_rebuild=yes (fail-safe)"
+  else
+    tap_not_ok "gate-decision: real-src changeset → needs_rebuild=yes (fail-safe)" "got '$(_gate_decide "$_changeset_b")'"
+  fi
+
+  # (c) a Cargo.toml in the changeset forces rebuild regardless of test-only siblings.
+  _gate_filediff() { _diff_test_only_pass; }
+  local _changeset_c="crates/app/tests/publish_tests.rs
+Cargo.toml"
+  if [[ "$(_gate_decide "$_changeset_c")" == "yes" ]]; then
+    tap_ok "gate-decision: Cargo.toml in changeset → needs_rebuild=yes (fail-safe)"
+  else
+    tap_not_ok "gate-decision: Cargo.toml in changeset → needs_rebuild=yes (fail-safe)" "got '$(_gate_decide "$_changeset_c")'"
+  fi
+  unset -f _gate_filediff
+
+  # --- Structural assertions: SKILL.md §10 wires the functions + byte-compare ---
+  local tick_md="$REPO_ROOT/.claude/skills/monitor-tick/SKILL.md"
+  if grep -q 'classify_path_binary_relevance' "$tick_md"; then
+    tap_ok "structural: monitor-tick/SKILL.md calls classify_path_binary_relevance"
+  else
+    tap_not_ok "structural: monitor-tick/SKILL.md calls classify_path_binary_relevance" "not found"
+  fi
+  if grep -q 'diff_is_test_only' "$tick_md"; then
+    tap_ok "structural: monitor-tick/SKILL.md calls diff_is_test_only"
+  else
+    tap_not_ok "structural: monitor-tick/SKILL.md calls diff_is_test_only" "not found"
+  fi
+  # The authoritative skip is gated on a release-binary byte-compare.
+  if grep -qiE 'byte-compare|byte-identical|cmp -s|byte compare' "$tick_md"; then
+    tap_ok "structural: monitor-tick/SKILL.md retains binary byte-compare confirmation"
+  else
+    tap_not_ok "structural: monitor-tick/SKILL.md retains binary byte-compare confirmation" "not found"
+  fi
+  if grep -q 'DEPLOY SYNCED (test-only' "$tick_md"; then
+    tap_ok "structural: monitor-tick/SKILL.md reports DEPLOY SYNCED (test-only…)"
+  else
+    tap_not_ok "structural: monitor-tick/SKILL.md reports DEPLOY SYNCED (test-only…)" "not found"
+  fi
+  # On a confirmed test-only skip, BUILD_SHA_FILE advances (fixes per-tick re-trip).
+  local syncsec
+  syncsec=$(extract_md_section "$tick_md" '^   On a confirmed test-only skip' '^[0-9]\. ' 2>/dev/null || true)
+  if grep -q 'BUILD_SHA_FILE' "$tick_md"; then
+    tap_ok "structural: monitor-tick/SKILL.md advances BUILD_SHA_FILE on confirmed skip"
+  else
+    tap_not_ok "structural: monitor-tick/SKILL.md advances BUILD_SHA_FILE on confirmed skip" "not found"
   fi
 }
 check_skill_structure
