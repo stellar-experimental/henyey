@@ -909,7 +909,15 @@ enum Commands {
         #[arg(long)]
         force: bool,
 
-        /// Deprecated: accepted for stellar-core compatibility, ignored.
+        /// Accepted for stellar-core compatibility; intentional parity-correct
+        /// no-op. stellar-core v26 removed both this flag and the deprecated
+        /// in-memory run mode it served (`runNewDB` → `initializeDatabase(cfg)`
+        /// always builds a full persistent DB). henyey likewise always builds a
+        /// full persistent DB, so accepting and ignoring the flag is
+        /// behaviorally identical to upstream — not an unfinished feature.
+        /// Accepting (rather than erroring) keeps legacy SSC/captive-core
+        /// invocations that still pass the flag working. Do NOT wire this up to
+        /// resurrect an in-memory/minimal-schema mode.
         #[arg(long = "minimal-for-in-memory-mode", hide = true)]
         minimal_for_in_memory_mode: bool,
     },
@@ -1370,6 +1378,10 @@ async fn main() -> anyhow::Result<()> {
         Commands::NewDb {
             path,
             force,
+            // Intentionally dropped: parity-correct no-op (see the field doc on
+            // `NewDb.minimal_for_in_memory_mode`). stellar-core v26 removed this
+            // flag and `new-db` always builds a full persistent DB, exactly as
+            // `cmd_new_db` does. Do not wire this into `cmd_new_db`.
             minimal_for_in_memory_mode: _,
         } => cmd_new_db(config, path, force).await,
 
@@ -3644,6 +3656,54 @@ mod tests {
         // Test basic parsing
         let cli = Cli::parse_from(["rs-stellar-core", "info"]);
         assert!(matches!(cli.command, Commands::Info));
+    }
+
+    /// Pins the `new-db --minimal-for-in-memory-mode` flag as an accepted
+    /// parity-correct no-op. stellar-core v26 removed both the flag and the
+    /// in-memory run mode it served; henyey always builds a full persistent DB,
+    /// so the flag is accepted (legacy SSC/captive-core invocations keep
+    /// working) but carries no behavioral signal into `cmd_new_db`. This test
+    /// locks that contract so a future refactor cannot silently change it. See
+    /// #3299.
+    #[test]
+    fn test_cli_new_db_minimal_flag_accepted_noop() {
+        // The flag parses successfully (accepted, not rejected) and yields the
+        // default `path`/`force` while the flag itself reads `true`.
+        let cli = Cli::parse_from(["rs-stellar-core", "new-db", "--minimal-for-in-memory-mode"]);
+        match cli.command {
+            Commands::NewDb {
+                path,
+                force,
+                minimal_for_in_memory_mode,
+            } => {
+                assert!(
+                    minimal_for_in_memory_mode,
+                    "--minimal-for-in-memory-mode should parse to true"
+                );
+                assert_eq!(path, None, "flag must not affect `path`");
+                assert!(!force, "flag must not affect `force`");
+            }
+            _ => panic!("Expected NewDb command"),
+        }
+
+        // Omitting the flag defaults it to false and leaves `path`/`force`
+        // identical — the flag is purely additive and inert.
+        let cli = Cli::parse_from(["rs-stellar-core", "new-db"]);
+        match cli.command {
+            Commands::NewDb {
+                path,
+                force,
+                minimal_for_in_memory_mode,
+            } => {
+                assert!(
+                    !minimal_for_in_memory_mode,
+                    "flag must default to false when omitted"
+                );
+                assert_eq!(path, None, "default `path` should be None");
+                assert!(!force, "default `force` should be false");
+            }
+            _ => panic!("Expected NewDb command"),
+        }
     }
 
     /// Pins the compiled-in jemalloc `malloc_conf` so a future edit cannot

@@ -182,16 +182,19 @@ Impact:
 - history missions belong after mixed-image bring-up and basic HTTP parity work
 - the risk is lower than metrics/loadgen, but it is real
 
-### 7. `--minimal-for-in-memory-mode` is accepted but silently ignored
+### 7. `--minimal-for-in-memory-mode` is an intentional parity-correct no-op
 
-The `new-db` command accepts the `--minimal-for-in-memory-mode` flag for stellar-core compatibility (`crates/henyey/src/main.rs:422`), but the flag is a no-op. Henyey always creates a persistent SQLite database.
+The `new-db` command accepts the `--minimal-for-in-memory-mode` flag for stellar-core compatibility (`crates/henyey/src/main.rs:872`) and silently ignores it. This is **not** a gap: it is the parity-correct behavior.
 
-If SSC passes this flag expecting in-memory node behavior (faster startup, no disk state), the resulting node will behave differently than expected -- persistent state, slower teardown, possible stale-state issues across mission restarts.
+stellar-core v26 removed both this flag and the deprecated `--in-memory` run mode it served. Upstream `runNewDB` (`stellar-core/src/main/CommandLine.cpp:1191`) now calls only `initializeDatabase(cfg)` and always builds a full persistent database — there is no minimal/reduced-schema path anywhere in `CommandLine.cpp`. Henyey likewise always creates a full persistent SQLite database, so accepting and ignoring the flag produces a node that is behaviorally identical to upstream v26.
+
+Accepting (rather than erroring on) the legacy flag is a deliberate superset for invocation compatibility: SSC/captive-core invocations that still pass `--minimal-for-in-memory-mode` keep working, and the resulting full-DB node matches what upstream produces for the same command. No warning is emitted, matching upstream's silent behavior on this path (a warning would be henyey-only mission-log noise).
+
+The contract is pinned by `test_cli_new_db_minimal_flag_accepted_noop` in `crates/henyey/src/main.rs`, which asserts the flag is accepted and carries no behavioral signal into `cmd_new_db`.
 
 Impact:
 
-- may cause subtle mission failures that look like state corruption rather than a compatibility gap
-- should be an explicit known-limitation callout, not a silent no-op
+- none — resolved as a documented intentional no-op (see #3299)
 
 ### 8. SSC may expect additional CLI surface beyond the currently documented path
 
@@ -419,7 +422,7 @@ The project should not claim Henyey-only SSC readiness until all of the followin
 - [ ] at least one Henyey-only payment/topology mission passes end to end
 - [x] every SSC-facing compat endpoint has unit tests that validate its response shape against a stellar-core reference fixture
 - [x] the `create` mode behavioral deviation is fixed (returns deprecation message, not silent alias)
-- [ ] the `--minimal-for-in-memory-mode` behavioral deviation is either fixed or explicitly documented with its mission impact
+- [x] the `--minimal-for-in-memory-mode` flag is resolved as an intentional parity-correct no-op (stellar-core v26 removed the flag and in-memory mode; henyey always builds a full persistent DB — see section 7 and #3299)
 
 ## Implementation Commits
 
