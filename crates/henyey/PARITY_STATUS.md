@@ -54,7 +54,7 @@ Corresponds to: `CommandLine.cpp`, `ApplicationUtils.h`
 |--------------|------|--------|
 | `run()` / `setupApp()` / `runApp()` | `cmd_run()` | Full |
 | `runCatchup()` / `catchup()` | `cmd_catchup()` | Full |
-| `runNewDB()` / `initializeDatabase()` | `cmd_new_db()` | Full |
+| `runNewDB()` / `initializeDatabase()` | `cmd_new_db()` | Full — the legacy `--minimal-for-in-memory-mode` flag is accepted as an intentional parity-correct no-op (v26 upstream removed it; `new-db` always builds a full persistent DB). See #3299. |
 | `runUpgradeDB()` | `cmd_upgrade_db()` | Full |
 | `runPublish()` / `publish()` | `cmd_publish_history()` | Full |
 | `runWriteVerifiedCheckpointHashes()` | `cmd_verify_checkpoints()` | Full |
@@ -114,7 +114,7 @@ Features excluded by design. These are NOT counted against parity %.
 | `checkStellarCoreMajorVersionProtocolIdentity()` | Cargo versioning and protocol gating replace upstream release-tag validation |
 | `loadXdr()` / `rebuildLedgerFromBuckets()` | `BUILD_TESTS`-only utilities; workspace uses regular Rust tests instead |
 | `runFuzz()` / `runGenFuzz()` / `runTest()` | Fuzzing and test execution are handled by Cargo tooling, not the binary |
-| `minimalDBForInMemoryMode()` / `canRebuildInMemoryLedgerFromBuckets()` | In-memory mode is deprecated and intentionally unsupported |
+| `minimalDBForInMemoryMode()` / `canRebuildInMemoryLedgerFromBuckets()` | In-memory mode is deprecated and intentionally unsupported. The corresponding `new-db --minimal-for-in-memory-mode` CLI flag is accepted as an intentional no-op for invocation compatibility — parity-correct, since v26 stellar-core removed the flag and always builds a full persistent DB (#3299). |
 | `setAuthenticatedLedgerHashPair()` | `--start-at-ledger` and `--start-at-hash` are accepted only as no-op compat flags |
 | `applyBucketsForLCL()` | Ledger rebuild internals live in lower crates rather than the CLI binary |
 | `getStellarCoreMajorReleaseVersion()` | Helper is unnecessary because `cmd_version()` emits Rust-owned version strings directly |

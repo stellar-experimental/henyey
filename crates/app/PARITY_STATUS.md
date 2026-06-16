@@ -200,7 +200,7 @@ Features excluded by design. These are NOT counted against parity %.
 | `TmpDirManager`, `ProcessManager`, raw `LedgerTxnRoot` exposure | Different runtime architecture; not part of `henyey-app`'s public API |
 | Protocol-23 corruption verifier/reconciler | Repository targets protocol 24+ only |
 | `CommandLine.h`, `SettingsUpgradeUtils.h`, and `dumpxdr.h` utilities | Owned by the `henyey` binary crate, not `henyey-app` |
-| `minimalDBForInMemoryMode()` / `canRebuildInMemoryLedgerFromBuckets()` | Test-only upstream helpers not mirrored in this crate |
+| `minimalDBForInMemoryMode()` / `canRebuildInMemoryLedgerFromBuckets()` | Test-only upstream helpers not mirrored in this crate. The corresponding `new-db --minimal-for-in-memory-mode` CLI flag (in the `henyey` binary crate) is an intentional accepted-no-op — parity-correct, since v26 stellar-core removed the flag and always builds a full persistent DB (#3299). |
 | `BUILD_TESTS`-only overlay toggle (`getRunInOverlayOnlyMode` / `setRunInOverlayOnlyMode`) | Rust test strategy uses different hooks and feature gates |
 | `testTx()` | Test-only wire-format endpoint; no production use |
 
