@@ -345,6 +345,14 @@ fn prefetch_classic_keys(
 
 /// Compute max sequence number per source account for AccountMerge protection.
 fn compute_max_seq_num_to_apply(executor: &mut TransactionExecutor, transactions: &[TxWithFee]) {
+    // stellar-core gates the entire MAX_SEQ_NUM_TO_APPLY accumulation (the
+    // per-tx `accToMaxSeq` map and the `mergeSeen` flag) on protocol >= V19.
+    // See LedgerManagerImpl.cpp:2183. Henyey is protocol 24+ only, so V19 is
+    // always satisfied on supported ledgers and this guard is a provable no-op;
+    // it is retained for exact source-fidelity with stellar-core.
+    if !protocol_version_starts_from(executor.protocol_version, ProtocolVersion::V19) {
+        return;
+    }
     let mut merge_seen = false;
     let mut acc_to_max_seq: HashMap<AccountId, i64> = HashMap::new();
     for (tx, _) in transactions.iter() {

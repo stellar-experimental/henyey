@@ -1,5 +1,6 @@
 //! AccountMerge operation execution.
 
+use henyey_common::protocol::{protocol_version_starts_from, ProtocolVersion};
 use stellar_xdr::curr::{
     AccountEntry, AccountEntryExt, AccountEntryExtensionV1Ext, AccountFlags, AccountId,
     AccountMergeResult, AccountMergeResultCode, MuxedAccount, OperationResult, OperationResultTr,
@@ -17,7 +18,7 @@ pub(crate) fn execute_account_merge(
     dest: &MuxedAccount,
     source: &AccountId,
     state: &mut LedgerStateManager,
-    _context: &LedgerContext,
+    context: &LedgerContext,
 ) -> Result<OperationResult> {
     let dest_account_id = muxed_to_account_id(dest);
 
@@ -43,11 +44,19 @@ pub(crate) fn execute_account_merge(
     }
 
     let starting_seq = state.starting_sequence_number()?;
-    if let Some(&max_seq) = state.get_max_seq_num_to_apply(source) {
-        if max_seq >= starting_seq {
-            return Ok(make_result(AccountMergeResultCode::SeqnumTooFar));
+    // stellar-core only consults the MAX_SEQ_NUM_TO_APPLY map at protocol >= V19
+    // (MergeOpFrame.cpp:44). Henyey is protocol 24+ only, so V19 is always
+    // satisfied on supported ledgers and this guard is a provable no-op; it is
+    // retained for exact source-fidelity with stellar-core.
+    if protocol_version_starts_from(context.protocol_version, ProtocolVersion::V19) {
+        if let Some(&max_seq) = state.get_max_seq_num_to_apply(source) {
+            if max_seq >= starting_seq {
+                return Ok(make_result(AccountMergeResultCode::SeqnumTooFar));
+            }
         }
     }
+    // The raw `seqNum >= maxSeqToApply` check is UNCONDITIONAL in stellar-core
+    // (MergeOpFrame.cpp:55) — only the map lookup above is V19-gated.
     if source_account.seq_num.0 >= starting_seq {
         return Ok(make_result(AccountMergeResultCode::SeqnumTooFar));
     }

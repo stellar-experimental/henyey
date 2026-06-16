@@ -3878,6 +3878,115 @@ fn test_audit_577_max_seq_num_to_apply_with_pre_charged() {
     );
 }
 
+/// Parity test for #3109: the MAX_SEQ_NUM_TO_APPLY path is now gated on protocol
+/// >= V19, mirroring stellar-core (LedgerManagerImpl.cpp:2183 construction,
+/// MergeOpFrame.cpp:44 consumption). Henyey is protocol 24+ only, so the gate is
+/// always satisfied and is a provable no-op. This test exercises the full
+/// construction + consumption path on a protocol-24 ledger and asserts the
+/// always-true gate does NOT suppress the check — an AccountMerge whose source
+/// max seq would trigger SeqnumTooFar is still blocked.
+#[test]
+fn test_max_seq_num_to_apply_built_for_merge_protocol24() {
+    use henyey_ledger::execution::{run_transactions_on_executor, FeeStrategy};
+    use henyey_ledger::LedgerDelta;
+    use stellar_xdr::curr::AccountMergeResult;
+
+    let ledger_seq: u32 = 2;
+    let starting_seq: i64 = (ledger_seq as i64) << 32;
+    let protocol_version: u32 = 24; // minimum henyey-supported; gate (>= V19) always true
+
+    let secret = SecretKey::from_seed(&[123u8; 32]);
+    let source_id: AccountId = (&secret.public_key()).into();
+    // Source seq_num == starting_seq so the TX seq_num (starting_seq + 1) passes
+    // the per-tx sequence check; the built MAX_SEQ_NUM_TO_APPLY entry then blocks
+    // the merge with SeqnumTooFar.
+    let (source_key, source_entry) =
+        create_account_entry(source_id.clone(), starting_seq, 100_000_000);
+
+    let dest_id = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([124u8; 32])));
+    let (dest_key, dest_entry) = create_account_entry(dest_id.clone(), 1, 50_000_000);
+
+    let snapshot = SnapshotBuilder::new(1)
+        .add_entry(source_key, source_entry)
+        .add_entry(dest_key, dest_entry)
+        .build_with_default_header();
+    let snapshot = SnapshotHandle::new(snapshot);
+
+    let network_id = NetworkId::testnet();
+    let base_fee: u32 = 100;
+    let base_reserve: u32 = 5_000_000;
+
+    let op = Operation {
+        source_account: None,
+        body: OperationBody::AccountMerge(MuxedAccount::Ed25519(Uint256([124u8; 32]))),
+    };
+    let tx = Transaction {
+        source_account: MuxedAccount::Ed25519(Uint256(*secret.public_key().as_bytes())),
+        fee: base_fee,
+        seq_num: SequenceNumber(starting_seq + 1),
+        cond: Preconditions::None,
+        memo: Memo::None,
+        operations: vec![op].try_into().unwrap(),
+        ext: TransactionExt::V0,
+    };
+    let mut envelope = TransactionEnvelope::Tx(TransactionV1Envelope {
+        tx,
+        signatures: VecM::default(),
+    });
+    let sig = sign_envelope(&envelope, &secret, &network_id);
+    if let TransactionEnvelope::Tx(ref mut env) = envelope {
+        env.signatures = vec![sig].try_into().unwrap();
+    }
+
+    let context = henyey_tx::LedgerContext::new(
+        ledger_seq,
+        1_000,
+        base_fee,
+        base_reserve,
+        protocol_version,
+        network_id,
+    );
+    let mut executor = TransactionExecutor::new(
+        &context,
+        0,
+        SorobanConfig::default(),
+        ClassicEventConfig::default(),
+    );
+    executor
+        .load_orderbook_offers(&snapshot)
+        .expect("load offers");
+
+    let transactions = vec![(std::sync::Arc::new(envelope), None)];
+    let mut delta = LedgerDelta::new(ledger_seq);
+
+    let result = run_transactions_on_executor(henyey_ledger::execution::RunTransactionsParams {
+        executor: &mut executor,
+        snapshot: &snapshot,
+        transactions: &transactions,
+        base_fee,
+        soroban_base_prng_seed: [0u8; 32],
+        fee_strategy: FeeStrategy::PreChargeInternally,
+        delta: &mut delta,
+    })
+    .expect("run_transactions_on_executor");
+
+    assert!(
+        !result.results[0].success,
+        "AccountMerge must be blocked at protocol 24 (V19 gate always satisfied)"
+    );
+    let op_result = &result.results[0].operation_results[0];
+    match op_result {
+        OperationResult::OpInner(OperationResultTr::AccountMerge(
+            AccountMergeResult::SeqnumTooFar,
+        )) => {}
+        other => panic!("Expected AccountMerge::SeqnumTooFar, got {:?}", other),
+    }
+    assert!(
+        executor.state().get_account(&source_id).is_some(),
+        "source account must still exist when merge is blocked by MAX_SEQ_NUM_TO_APPLY"
+    );
+}
+
 /// Regression test for the single-op savepoint skip optimization.
 ///
 /// When a transaction has exactly one operation, the per-operation savepoint is
