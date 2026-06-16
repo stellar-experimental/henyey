@@ -2183,6 +2183,119 @@ mod tests {
         assert!(config.is_compat_config);
     }
 
+    /// AC#2 of the first mixed-image Supercluster (SSC) mission (#3292): the
+    /// mission-shaped, mixed-cluster `stellar-core.cfg` that SSC renders for a
+    /// **henyey validator** node in a 4-node (1 henyey + 3 stellar-core)
+    /// cluster must be accepted by henyey *without manual patching*.
+    ///
+    /// This is distinct from `test_ssc_generated_config_full_parse`, which
+    /// covers a testnet *watcher* shape (`NODE_IS_VALIDATOR=false`, real
+    /// testnet peers, history archives). Here the node is a VALIDATOR
+    /// participating as a minority in a stellar-core-majority quorum, with
+    /// in-cluster pod hostnames, accelerated close time, and NO history.
+    ///
+    /// The test drives the exact `is_stellar_core_format` +
+    /// `translate_stellar_core_config` entry the binary's `load_config` path
+    /// uses (main.rs), so it exercises real parsing, not a stub. It fails if
+    /// the mission fixture is not parseable (the durable, CI-enforced
+    /// regression artifact the triage report required).
+    #[test]
+    fn test_ssc_mission_mixed_config_parse() {
+        let fixture = include_str!("compat_http/test_fixtures/ssc_mission_mixed.cfg");
+        let raw: toml::Value = toml::from_str(fixture).unwrap();
+
+        // Detected as stellar-core format (the binary's branch in load_config).
+        assert!(
+            is_stellar_core_format(&raw),
+            "mission mixed-cluster config must be detected as stellar-core format"
+        );
+
+        // Translates without error — i.e. accepted WITHOUT manual patching (AC#2).
+        let config = translate_stellar_core_config(&raw).unwrap();
+
+        // --- Node is a VALIDATOR (the henyey node participates in consensus) ---
+        assert!(
+            config.node.is_validator,
+            "mission node must be a validator (NODE_IS_VALIDATOR=true)"
+        );
+        // NODE_SEED is the henyey node's own seed (the strkey before " self").
+        assert_eq!(
+            config.node.node_seed.as_deref(),
+            Some("SDQVDISRYN2JXBS7ICL7QJAEKB3HWBJFP2QECXG7GZICAHBK4UNJCWK2")
+        );
+
+        // --- Quorum set: exactly 4 DISTINCT keys (henyey + 3 stellar-core) ---
+        // henyey's own key is derived from NODE_SEED, and it is ALSO listed in
+        // [[VALIDATORS]] by PUBLIC_KEY. Assert no `$self`-resolution error and
+        // no double-counting: the set is exactly 4 distinct keys (the inverse
+        // of `test_quorum_set_self_without_node_seed_fails`).
+        let henyey_self_key = henyey_crypto::SecretKey::from_strkey(
+            "SDQVDISRYN2JXBS7ICL7QJAEKB3HWBJFP2QECXG7GZICAHBK4UNJCWK2",
+        )
+        .unwrap()
+        .public_key()
+        .to_strkey();
+        let validators = &config.node.quorum_set.validators;
+        assert_eq!(
+            validators.len(),
+            4,
+            "expected exactly 4 quorum validators (henyey + 3 core), got {}: {:?}",
+            validators.len(),
+            validators
+        );
+        let distinct: std::collections::HashSet<&String> = validators.iter().collect();
+        assert_eq!(
+            distinct.len(),
+            4,
+            "quorum validators must be 4 DISTINCT keys (no double-counting of self)"
+        );
+        // henyey's own derived key is present in the quorum.
+        assert!(
+            validators.contains(&henyey_self_key),
+            "quorum must contain henyey's own derived key {henyey_self_key}"
+        );
+        // The 3 stellar-core validator keys are present.
+        for core_key in [
+            "GDKXE2OZMJIPOSLNA6N6F2BVCI3O777I2OOC4BV7VOYUEHYX7RTRYA7Y",
+            "GCUCJTIYXSOXKBSNFGNFWW5MUQ54HKRPGJUTQFJ5RQXZXNOLNXYDHRAP",
+            "GC2V2EFSXN6SQTWVYA5EPJPBWWIMSD2XQNKUOHGEKB535AQE2I6IXV2Z",
+        ] {
+            assert!(
+                validators.contains(&core_key.to_string()),
+                "quorum must contain stellar-core key {core_key}"
+            );
+        }
+
+        // --- Accelerated close time on (SSC integration missions) ---
+        assert!(
+            config.testing.accelerate_time,
+            "ARTIFICIALLY_ACCELERATE_TIME_FOR_TESTING must be true"
+        );
+
+        // --- In-cluster known peers (pod hostnames, NOT real testnet peers) ---
+        // The henyey ADDRESS and the 3 core ADDRESSes are in-cluster pod DNS.
+        assert!(
+            !config.overlay.known_peers.is_empty(),
+            "mission config must yield in-cluster known peers"
+        );
+        for peer in &config.overlay.known_peers {
+            assert!(
+                peer.host.contains("ssc-mission-3292") || peer.host.ends_with(".svc.cluster.local"),
+                "known peer must be an in-cluster pod hostname, got {peer:?}"
+            );
+        }
+
+        // --- NO history archives (first mission excludes history) ---
+        assert!(
+            config.history.archives.is_empty(),
+            "first mission has no history archives, got {}",
+            config.history.archives.len()
+        );
+
+        // Compat flag set.
+        assert!(config.is_compat_config);
+    }
+
     /// Verify that the existing captive-core-testnet.cfg also parses correctly.
     #[test]
     fn test_captive_core_testnet_cfg_parse() {
