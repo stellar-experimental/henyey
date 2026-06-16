@@ -45,7 +45,7 @@ cleanup  # ensure fresh state
 mkdir -p "$TEST_ROOT"
 
 # ── TAP state ────────────────────────────────────────────────────────────────
-TAP_PLAN=355
+TAP_PLAN=368
 TAP_CURRENT=0
 TAP_FAILURES=0
 
@@ -9510,6 +9510,87 @@ BOARDEOF
   fi
 
   rm -rf "$dedup_test_root"
+
+  # ── eval_memory_guardrail (host-RAM-relative HIGH-MEMORY guardrail, #3227) ──
+  # Pure decision fn: eval_memory_guardrail rss_mb avail_mb host_ram_gb \
+  #   heap_prev_mb heap_curr_mb heap_prev2_mb → sets MEMORY_GUARDRAIL_VERDICT
+  # to none | report-high-mem | restart. Integer-MB math, no bc/floats.
+  # Thresholds: report > 0.65*ram; restart > 0.75*ram AND avail < 0.12*ram AND
+  # latest two heap_components_mb deltas both > 500 MB.
+
+  # 32 GB host, RSS=24500 (>0.75*32GB=24576? no — 24500<24576). Use 24600 to be
+  # unambiguously past the 0.75 floor while keeping >7 GB margin to the 32 GB wall.
+  eval_memory_guardrail 24600 3500 32 17000 17600 16400
+  if [[ "$MEMORY_GUARDRAIL_VERDICT" == "restart" ]]; then
+    tap_ok "eval_memory_guardrail: 32GB RSS>0.75 + avail<0.12 + heap +600/+600 → restart"
+  else
+    tap_not_ok "eval_memory_guardrail: 32GB restart case" "got $MEMORY_GUARDRAIL_VERDICT"
+  fi
+
+  # 32 GB host, RSS=22000 (>0.65*32GB=21299, <0.75=24576), avail healthy, heap flat.
+  eval_memory_guardrail 22000 10000 32 17000 17000 17000
+  if [[ "$MEMORY_GUARDRAIL_VERDICT" == "report-high-mem" ]]; then
+    tap_ok "eval_memory_guardrail: 32GB RSS>0.65 only → report-high-mem (no restart)"
+  else
+    tap_not_ok "eval_memory_guardrail: 32GB report-only case" "got $MEMORY_GUARDRAIL_VERDICT"
+  fi
+
+  # 32 GB host, RSS=20000 (steady ~18-20 GB anon, <0.65*32GB=21299), heap flat.
+  # Validates the 0.65 report bump: steady state must NOT chronically report-fire.
+  eval_memory_guardrail 20000 12000 32 17000 17000 17000
+  if [[ "$MEMORY_GUARDRAIL_VERDICT" == "none" ]]; then
+    tap_ok "eval_memory_guardrail: 32GB steady-state RSS<0.65 → none (no chronic report)"
+  else
+    tap_not_ok "eval_memory_guardrail: 32GB steady-state case" "got $MEMORY_GUARDRAIL_VERDICT"
+  fi
+
+  # 32 GB host, RSS=24600 (>0.75) during catchup but avail healthy AND heap NOT
+  # growing → transient catchup spike must not be killed (the ~27-29 GB cold-
+  # catchup peak that the operator-side scan lever, out of scope, addresses).
+  eval_memory_guardrail 24600 12000 32 17000 17000 17000
+  if [[ "$MEMORY_GUARDRAIL_VERDICT" == "report-high-mem" ]]; then
+    tap_ok "eval_memory_guardrail: 32GB catchup spike, avail healthy, heap flat → no restart"
+  else
+    tap_not_ok "eval_memory_guardrail: 32GB catchup-spike case" "got $MEMORY_GUARDRAIL_VERDICT"
+  fi
+
+  # 61 GB host (DEFAULT), RSS=24000, avail=7000, heap +600/+600. The OLD absolute
+  # rule (RSS>16GB AND avail<8GB AND heap growing) would have been at/near
+  # restart here; the host-relative rule does NOT false-fire because
+  # 24000 < 0.65*61GB=40601 ⇒ verdict none. This is the "no false-fire on 61 GB" case.
+  eval_memory_guardrail 24000 7000 61 17000 17600 16400
+  if [[ "$MEMORY_GUARDRAIL_VERDICT" == "none" ]]; then
+    tap_ok "eval_memory_guardrail: 61GB RSS=24G (old 16/8 rule near-restart) → none"
+  else
+    tap_not_ok "eval_memory_guardrail: 61GB no-false-fire case" "got $MEMORY_GUARDRAIL_VERDICT"
+  fi
+
+  # 61 GB host, RSS=46000 (>0.75*61GB=46848? no — 46000<46848). Use 47000 to clear
+  # the 0.75 floor: legit 61 GB restart still works when host genuinely under pressure.
+  eval_memory_guardrail 47000 7000 61 17000 17600 16400
+  if [[ "$MEMORY_GUARDRAIL_VERDICT" == "restart" ]]; then
+    tap_ok "eval_memory_guardrail: 61GB RSS>0.75 + avail<0.12 + heap growing → restart"
+  else
+    tap_not_ok "eval_memory_guardrail: 61GB legit-restart case" "got $MEMORY_GUARDRAIL_VERDICT"
+  fi
+
+  # ── Structural assertions (#3227): monitor-tick wires the guardrail + surfaces peak ──
+  local tick_md="$REPO_ROOT/.claude/skills/monitor-tick/SKILL.md"
+  if grep -q 'eval_memory_guardrail' "$tick_md"; then
+    tap_ok "structural: monitor-tick/SKILL.md calls eval_memory_guardrail"
+  else
+    tap_not_ok "structural: monitor-tick/SKILL.md calls eval_memory_guardrail" "not found"
+  fi
+  if grep -q 'MONITOR_HOST_RAM_GB' "$tick_md"; then
+    tap_ok "structural: monitor-tick/SKILL.md references MONITOR_HOST_RAM_GB"
+  else
+    tap_not_ok "structural: monitor-tick/SKILL.md references MONITOR_HOST_RAM_GB" "not found"
+  fi
+  if grep -q 'henyey_startup_peak_anon_rss_mb' "$tick_md"; then
+    tap_ok "structural: monitor-tick/SKILL.md surfaces henyey_startup_peak_anon_rss_mb"
+  else
+    tap_not_ok "structural: monitor-tick/SKILL.md surfaces henyey_startup_peak_anon_rss_mb" "not found"
+  fi
 }
 check_skill_structure
 run_tests

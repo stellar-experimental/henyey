@@ -579,6 +579,66 @@ detect_soft_fail_blocked() {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
+# eval_memory_guardrail RSS_MB AVAIL_MB HOST_RAM_GB HEAP_PREV_MB HEAP_CURR_MB HEAP_PREV2_MB
+#
+# Pure decision function for the monitor-tick HIGH-MEMORY guardrail (issue #3227).
+# Host-RAM-relative thresholds (replaces the old absolute 12/16/8 GB literals) so
+# the guardrail gives early warning on a 32 GB/no-swap box without false-firing
+# on a 61 GB box. All arithmetic is integer-MB (no `bc`/floats):
+#
+#   report_mb       = HOST_RAM_GB * 1024 * 65 / 100   (0.65 * host RAM)
+#   restart_rss_mb  = HOST_RAM_GB * 1024 * 75 / 100   (0.75 * host RAM)
+#   restart_avail_mb= HOST_RAM_GB * 1024 * 12 / 100   (0.12 * host RAM)
+#
+# Verdict ladder (sets global MEMORY_GUARDRAIL_VERDICT):
+#   restart          — RSS > restart_rss_mb AND AVAIL < restart_avail_mb AND
+#                      both latest heap deltas grew > 500 MB:
+#                        (HEAP_CURR - HEAP_PREV) > 500 AND (HEAP_PREV - HEAP_PREV2) > 500
+#   report-high-mem  — RSS > report_mb (early-warning, report-only; no restart)
+#   none             — otherwise
+#
+# The restart tier gates on system pressure AND evidence of a real heap leak, so
+# a transient cold-catchup RSS spike (heap NOT growing) is not killed. Callers map
+# the verdict to the restart ACTION / report line; this fn does NO I/O.
+#
+# Sets globals:
+#   MEMORY_GUARDRAIL_VERDICT   "none" | "report-high-mem" | "restart"
+# Returns: 0 always.
+# ─────────────────────────────────────────────────────────────────────────────
+eval_memory_guardrail() {
+  local rss_mb="$1"
+  local avail_mb="$2"
+  local host_ram_gb="$3"
+  local heap_prev_mb="$4"
+  local heap_curr_mb="$5"
+  local heap_prev2_mb="$6"
+
+  MEMORY_GUARDRAIL_VERDICT="none"
+
+  local report_mb=$(( host_ram_gb * 1024 * 65 / 100 ))
+  local restart_rss_mb=$(( host_ram_gb * 1024 * 75 / 100 ))
+  local restart_avail_mb=$(( host_ram_gb * 1024 * 12 / 100 ))
+
+  # Restart only when system is genuinely under pressure AND the heap is leaking
+  # (latest two heap_components_mb deltas both > 500 MB).
+  if [[ "$rss_mb" -gt "$restart_rss_mb" ]] \
+     && [[ "$avail_mb" -lt "$restart_avail_mb" ]] \
+     && [[ $(( heap_curr_mb - heap_prev_mb )) -gt 500 ]] \
+     && [[ $(( heap_prev_mb - heap_prev2_mb )) -gt 500 ]]; then
+    MEMORY_GUARDRAIL_VERDICT="restart"
+    return 0
+  fi
+
+  # Report-only early warning above 0.65 * host RAM.
+  if [[ "$rss_mb" -gt "$report_mb" ]]; then
+    MEMORY_GUARDRAIL_VERDICT="report-high-mem"
+    return 0
+  fi
+
+  return 0
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
 # grep_heartbeat_lines LOG_FILE [TAIL_COUNT]
 #
 # Prints heartbeat event lines from LOG_FILE.
