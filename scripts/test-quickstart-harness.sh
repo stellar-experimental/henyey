@@ -1709,8 +1709,121 @@ test_testnet_shard_renders_step_timeout_25_others_360() {
     fi
 }
 
+# ============================================================
+# Test 30: test_capture_diagnostics_docker_calls_are_time_bounded
+#
+# ROOT-CAUSE regression for #3286 (the actual fix, option A). The
+# instrumentation in #3289 captured the process tree on a real hung run and
+# pinned the mechanism: `capture_diagnostics()` runs INSIDE `run_probe()` —
+# AFTER the probe's `exit_code` is captured but BEFORE `run_probe` returns. On
+# an overloaded CI docker daemon a `docker ps -a` / `docker logs` /
+# `docker inspect` can wedge in uninterruptible D-state. The pre-fix code
+# guards those calls only with `|| true`, which does NOT bound a hang (a process
+# stuck in a syscall never reaches the `|| true`). So `capture_diagnostics`
+# never returns, `run_probe` never returns, and the 124/137 `--soft-on-timeout`
+# soft-skip — which lives in `main`, AFTER `run_probe` — is never reached. The
+# step then runs to its budget and the job is cancelled (the #3286 signature).
+#
+# The fix bounds each docker call with `timeout 30 docker ...` (keeping the
+# `|| true` so the timeout's own 124 is swallowed and the probe's already-
+# captured disposition stays byte-identical). With the docker calls bounded,
+# `run_probe` returns promptly and the EXISTING, already-correct soft-skip
+# fires — no soft-skip broadening is made (that would risk masking a genuine
+# assertion failure; test_soft_on_timeout_still_fails_real_assertion stays red).
+#
+# This test puts a FAKE `docker` first on PATH whose `docker ps -a` does
+# `sleep 999` (the D-state stand-in — `command -v docker` then finds the fake,
+# so the docker block in capture_diagnostics runs). It runs the wrapper on the
+# retryable testnet/core,horizon shard with --soft-on-timeout and an
+# always-timing-out probe, INSIDE an outer 30s watchdog. It asserts:
+#   (a) the wrapper RETURNS within the watchdog (outer rc != 124 — NOT killed),
+#       proving capture_diagnostics no longer wedges, AND
+#   (b) the probe disposition is preserved: wrapper exit 0 with the grep-able
+#       SOFT-SKIP marker for the timed-out testnet probe.
+# FAILS on origin/main: the unbounded `docker ps -a` wedges on the fake
+# `sleep 999`, run_probe never returns, the soft-skip is never reached, the
+# outer watchdog fires (rc 124) -> (a) fails. PASSES after the fix: the bounded
+# `timeout 30 docker ps -a` returns, run_probe returns, the soft-skip fires ->
+# exit 0 + SOFT-SKIP within seconds. The fake `docker`'s `sleep 999` is reaped
+# via a UNIQUE sentinel (pkill -f "$marker") in a RETURN trap so nothing leaks
+# across runs or wedges the harness EXIT trap (Critic A / Test 28 pattern).
+# ============================================================
+test_capture_diagnostics_docker_calls_are_time_bounded() {
+    local diag_dir="$TMPDIR_BASE/diag-test30"
+    mkdir -p "$diag_dir"
+
+    # Unique sentinel so cleanup only ever kills THIS test's fake-docker sleep,
+    # never an unrelated process on a shared CI runner (Critic A).
+    local marker="qs-fakedocker-test30-$$-${RANDOM}"
+
+    # Reap the fake-docker `sleep 999` on function return, scoped to the marker.
+    # shellcheck disable=SC2064
+    trap "pkill -f '$marker' 2>/dev/null || true" RETURN
+
+    # Fake `docker` whose `ps -a` wedges (sleep 999, tagged with the unique
+    # marker in its argv). Other subcommands return immediately. Placed first on
+    # PATH so capture_diagnostics' `command -v docker` resolves to THIS docker.
+    local fakebin="$TMPDIR_BASE/fakebin-test30"
+    mkdir -p "$fakebin"
+    cat > "$fakebin/docker" <<EOF
+#!/bin/bash
+# Fake docker for #3286 regression. \`docker ps -a\` wedges like a D-state
+# daemon on an overloaded runner. The wedge is a real \`sleep 999\` whose argv[0]
+# is set to the unique \$marker (via \`exec -a\`) so the test can reap it precisely
+# with \`pkill -f "\$marker"\` and never touch an unrelated process. (A bare
+# \`sleep 999 "\$marker"\` would treat the marker as a second time arg and exit
+# immediately — NOT a hang — so the marker must go in argv[0], not argv[1].)
+if [[ "\$1" == "ps" && "\$2" == "-a" ]]; then
+    exec -a "$marker" sleep 999
+fi
+# \`docker ps -aq --filter ...\` enumeration and any other subcommand: emit
+# nothing (no containers) and return immediately.
+exit 0
+EOF
+    chmod +x "$fakebin/docker"
+
+    # Probe that always sleeps -> always times out (124/137) on both attempts,
+    # so capture_diagnostics runs (it is only called on a non-zero exit).
+    local probe
+    probe=$(make_probe "test30" 0 999)
+
+    local wrapper_log="$TMPDIR_BASE/wrapper-log-test30.txt"
+    local outer_rc=0
+    # OUTER 30s watchdog: if capture_diagnostics wedges, run_probe never returns,
+    # the wrapper never reaches the soft-skip, and this outer timeout fires at
+    # 30s with rc 124. A correctly-fixed wrapper returns in ~a few seconds.
+    PATH="$fakebin:$PATH" timeout -k 5s 30 "$WRAPPER" \
+        --soft-on-timeout \
+        --network testnet --enable "core,horizon" --probe horizon-core-up \
+        --timeout 2 --diagnostics-dir "$diag_dir" \
+        -- "$probe" >/dev/null 2>"$wrapper_log" || outer_rc=$?
+
+    # (a) The wrapper RETURNED on its own — the outer watchdog did NOT have to
+    # fire (rc 124 would be the outer timeout killing a wedged wrapper).
+    if [[ $outer_rc -ne 124 ]]; then
+        tap_ok "capture_diagnostics_docker_calls_do_not_wedge_run_probe"
+    else
+        tap_not_ok "capture_diagnostics_docker_calls_do_not_wedge_run_probe" \
+            "outer watchdog fired (rc 124) — capture_diagnostics wedged on the D-state docker"
+    fi
+
+    # (b) The probe disposition is preserved: under --soft-on-timeout a testnet
+    # double-timeout is a neutral soft-skip (exit 0 + SOFT-SKIP marker). The fix
+    # must NOT alter pass/fail/soft-skip logic — only stop the diagnostics wedge.
+    if [[ $outer_rc -eq 0 ]] && grep -q 'SOFT-SKIP' "$wrapper_log"; then
+        tap_ok "capture_diagnostics_bound_preserves_soft_skip_disposition"
+    else
+        tap_not_ok "capture_diagnostics_bound_preserves_soft_skip_disposition" \
+            "rc=$outer_rc, SOFT-SKIP present=$(grep -q 'SOFT-SKIP' "$wrapper_log" && echo yes || echo no)"
+    fi
+
+    # Reap the fake-docker `sleep 999` explicitly via the unique marker (the
+    # RETURN trap also covers this, belt-and-suspenders).
+    pkill -f "$marker" 2>/dev/null || true
+}
+
 # --- Run all tests ---
-tap_plan 92
+tap_plan 94
 
 test_timeout_retry_on_targeted_shard
 test_non_timeout_failure_no_retry
@@ -1741,6 +1854,7 @@ test_workflow_testnet_shard_uses_soft_timeout_and_tight_budget
 test_sigterm_ignoring_probe_is_force_killed_and_soft_skipped
 test_testnet_hang_watchdog_emits_process_dump_before_step_kill
 test_testnet_shard_renders_step_timeout_25_others_360
+test_capture_diagnostics_docker_calls_are_time_bounded
 
 echo ""
 echo "# Results: $PASS_COUNT/$TEST_COUNT passed, $FAIL_COUNT failed"
