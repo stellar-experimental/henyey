@@ -1591,44 +1591,118 @@ Otherwise enter the deploy path:
    voluntary deploys. Urgent fixes can override by killing the node manually
    before the next tick — the normal startup path will pick up the latest
    origin/main.
-2. **Binary-relevance check**:
+2. **Binary-relevance check** (the path/hunk heuristic only marks a CANDIDATE;
+   the authoritative skip is gated by the binary byte-compare in step 2a):
    ```bash
+   source "$(git rev-parse --show-toplevel)/scripts/lib/monitor-decisions.sh"
+
    if [ "$gate_action" = "proceed-force-rebuild" ]; then
-     # invalid build_sha — skip allowlist, force rebuild
+     # invalid build_sha — skip heuristic, force rebuild
      needs_rebuild="yes"
+   elif changed_paths=$(git diff --name-only "$deployed_sha" origin/main 2>/dev/null); then
+     # ok or missing-fresh: classify every changed path. needs_rebuild stays
+     # "no" only if EVERY path is provably non-binary-affecting; ANY ambiguity
+     # flips to "yes" (fail-safe). skip_kind tracks the strongest skip reason
+     # for the report ("no-binary-impact" vs "test-only").
+     needs_rebuild="no"
+     skip_kind="no-binary-impact"
+     while IFS= read -r p; do
+       [ -z "$p" ] && continue
+       case "$(classify_path_binary_relevance "$p")" in
+         no-impact) ;;                          # allowlisted — never compiled in
+         test-only) skip_kind="test-only" ;;    # crates/*/tests/** integration test
+         needs-hunk-check)
+           # crates/**/src/**.rs: test-only ONLY if every changed line in THIS
+           # file's diff is inside a #[cfg(test)]/mod tests region. Any ambiguity
+           # (zero-context hunk, module deletion, boundary edit) → rebuild.
+           if git diff "$deployed_sha" origin/main -- "$p" | diff_is_test_only; then
+             skip_kind="test-only"
+           else
+             needs_rebuild="yes"; break
+           fi
+           ;;
+         *) needs_rebuild="yes"; break ;;       # rebuild (fail-safe default)
+       esac
+     done <<< "$changed_paths"
    else
-     # ok or missing-fresh: diff from deployed_sha
-     if changed_paths=$(git diff --name-only "$deployed_sha" origin/main 2>/dev/null); then
-       # Evaluate allowlist on $changed_paths (see below).
-       # If every path is allowlisted: needs_rebuild="no"
-       # Else: needs_rebuild="yes"
-       ...
-     else
-       # git diff failed — fail closed, force rebuild.
-       needs_rebuild="yes"
-     fi
+     # git diff failed — fail closed, force rebuild.
+     needs_rebuild="yes"
    fi
    ```
-   If `needs_rebuild="no"` (all paths allowlisted), skip the rebuild + restart:
-   run `git pull --rebase` only, then report
-   `DEPLOY SYNCED (no-binary-impact: allowlisted paths only — pulled <N> commits, no restart)`.
-   Do NOT update `BUILD_SHA_FILE` (the binary hasn't changed).
 
-   The non-binary-impact allowlist is:
-   - `.github/`
-   - `.claude/`
-   - `scripts/`
-   - `docs/`
-   - `metrics/` (dashboards, alerts, observability docs — no runtime impact)
-   - root-level `*.md` files, e.g. `README.md` or `CLAUDE.md`
-   - root-level git metadata dotfiles that never compile into the binary:
-     `.gitignore`, `.gitattributes`, `.gitmodules`
-   - `stellar-specs` / `stellar-specs/` submodule pointer changes only
+   `classify_path_binary_relevance PATH` returns one of `no-impact` |
+   `test-only` | `needs-hunk-check` | `rebuild`:
+   - **`no-impact`** (allowlisted — never compiles into the release binary):
+     `.github/`, `.claude/`, `scripts/`, `docs/`, `metrics/`, root-level `*.md`
+     (e.g. `README.md`, `CLAUDE.md`), root-level git metadata dotfiles
+     (`.gitignore`, `.gitattributes`, `.gitmodules`), and `stellar-specs` /
+     `stellar-specs/` submodule pointer changes.
+   - **`test-only`**: `crates/<crate>/tests/**` — integration tests, a separate
+     compilation target never linked into the `--release` lib/bin.
+   - **`needs-hunk-check`**: `crates/**/src/**.rs` — defer to `diff_is_test_only`
+     on that file's diff (returns 0 only if every changed line is strictly inside
+     a `#[cfg(test)]`/`mod tests` region; ANY ambiguity → rebuild).
+   - **`rebuild`** (FAIL-SAFE default): everything else — `Cargo.toml`,
+     `Cargo.lock`, any `build.rs`, `configs/`, `.rs` outside `src/`/`tests/`,
+     non-`.rs` files under `crates/`, or any unrecognized path. A false
+     "rebuild" costs only a wasted build; a false "skip" could miss a deploy.
 
-   Deny by default: if any path is outside this allowlist, continue to the CI,
-   build, and restart path. In particular, changes to `Cargo.toml`,
-   `Cargo.lock`, any `build.rs`, `crates/`, `configs/`, or mixed docs+code
-   commits require a rebuild + restart.
+2a. **Authoritative binary byte-compare** (only when `needs_rebuild="no"`): the
+    heuristic has marked the changeset a skip CANDIDATE, but shell-based Rust
+    region parsing is brittle, so it does NOT by itself authorize a skip. Build
+    `henyey` at BOTH `deployed_sha` and `origin/main` into the SAME scratch
+    target dir with identical flags, then byte-compare the two produced
+    binaries. Skip the rebuild+restart ONLY if the bytes are identical;
+    otherwise fall through to the normal rebuild+restart path (step 3+).
+    Build BOTH sides freshly in the same path — do NOT compare against the
+    long-running on-disk binary, which may have been built under a different
+    absolute path and so would never match (the carve-out would be inert).
+    ```bash
+    if [ "$needs_rebuild" = "no" ]; then
+      CMP_TARGET="/home/tomer/data/$MONITOR_SESSION_ID/binrel-cmp-target"
+      BIN_OLD="/home/tomer/data/$MONITOR_SESSION_ID/binrel-old"
+      BIN_NEW="/home/tomer/data/$MONITOR_SESSION_ID/binrel-new"
+      rm -rf "$CMP_TARGET"; mkdir -p "$CMP_TARGET"
+      # Build at deployed_sha, then at origin/main, into the SAME target dir.
+      git stash --include-untracked >/dev/null 2>&1 || true
+      git checkout --quiet "$deployed_sha" \
+        && CARGO_TARGET_DIR="$CMP_TARGET" cargo build --release -p henyey \
+        && cp "$CMP_TARGET/release/henyey" "$BIN_OLD"
+      git checkout --quiet origin/main \
+        && CARGO_TARGET_DIR="$CMP_TARGET" cargo build --release -p henyey \
+        && cp "$CMP_TARGET/release/henyey" "$BIN_NEW"
+      if [ -f "$BIN_OLD" ] && [ -f "$BIN_NEW" ] && cmp -s "$BIN_OLD" "$BIN_NEW"; then
+        binary_identical="yes"
+      else
+        binary_identical="no"   # heuristic miss OR non-reproducible build → rebuild
+      fi
+      rm -rf "$CMP_TARGET" "$BIN_OLD" "$BIN_NEW"
+    fi
+    ```
+    On a **confirmed skip** (`needs_rebuild="no"` AND `binary_identical="yes"`):
+    run `git pull --rebase` only, then advance `BUILD_SHA_FILE` to the new sha:
+    ```bash
+    new_sha=$(git rev-parse origin/main)
+    printf '%s\n' "$new_sha" > "${BUILD_SHA_FILE}.tmp"
+    mv "${BUILD_SHA_FILE}.tmp" "$BUILD_SHA_FILE"
+    ```
+    The bytes are confirmed byte-identical, so the running binary IS the
+    origin/main binary — advancing `BUILD_SHA_FILE` is correct and fixes the
+    per-tick re-trip (the gate no longer re-evaluates this same changeset every
+    tick). Report:
+    - `DEPLOY SYNCED (test-only: binary byte-identical — pulled <N> commits, no restart)` when `skip_kind="test-only"`;
+    - `DEPLOY SYNCED (no-binary-impact: allowlisted paths only — pulled <N> commits, no restart)` when `skip_kind="no-binary-impact"`.
+
+    If `binary_identical="no"` (a heuristic false-positive OR a
+    non-reproducible build): set `needs_rebuild="yes"` and fall through to the
+    normal build+restart path. A heuristic miss therefore costs at most one
+    wasted build, NEVER a missed deploy.
+
+    > NOTE on reproducibility: this depends on `cargo build --release` being
+    > bit-identical across two same-path builds. If that does not hold in
+    > practice, `binary_identical` will be `no` and the gate simply always
+    > rebuilds — strictly no worse than the legacy "always rebuild on `crates/`"
+    > behavior, just with a wasted build on test-only changes.
 3. **Quarantine gate** (only reached when `needs_rebuild=yes`):
    ```bash
    # --- Quarantine gate ---

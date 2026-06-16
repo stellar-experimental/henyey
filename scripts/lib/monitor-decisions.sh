@@ -664,3 +664,236 @@ grep_heartbeat_lines() {
     grep -E "$pattern" "$log_file" 2>/dev/null
   fi
 }
+
+# ─────────────────────────────────────────────────────────────────────────────
+# classify_path_binary_relevance PATH  (issue #3215)
+#
+# Path-level classifier for the monitor-tick §10 deploy-gate binary-relevance
+# check. Given a single repo-relative changed path, prints exactly ONE verdict:
+#
+#   no-impact         — allowlisted: documentation/CI/tooling/specs that never
+#                       compiles into the release binary.
+#   test-only         — crates/<crate>/tests/** integration tests (a separate
+#                       compilation target, never linked into --release lib/bin).
+#   needs-hunk-check  — crates/**/src/**.rs: MAY be test-only at the hunk level;
+#                       the caller must run diff_is_test_only on this file's diff.
+#   rebuild           — FAIL-SAFE default for EVERYTHING else (Cargo.toml,
+#                       Cargo.lock, any build.rs, configs/, .rs outside src/tests,
+#                       non-.rs under crates/, or any unrecognized path).
+#
+# The classifier is deliberately conservative: a false "rebuild" costs only a
+# wasted build, while a false "no-impact"/"test-only" could skip a real deploy —
+# so anything not provably non-binary-affecting falls through to rebuild.
+#
+# Prints the verdict to stdout. Returns 0 always.
+# ─────────────────────────────────────────────────────────────────────────────
+classify_path_binary_relevance() {
+  local path="$1"
+
+  # Empty path → fail-safe.
+  if [[ -z "$path" ]]; then
+    echo "rebuild"
+    return 0
+  fi
+
+  # --- Allowlist: paths that never compile into the release binary. ---
+  case "$path" in
+    .github/*|.claude/*|scripts/*|docs/*|metrics/*)
+      echo "no-impact"; return 0 ;;
+    .gitignore|.gitattributes|.gitmodules)
+      echo "no-impact"; return 0 ;;
+    stellar-specs|stellar-specs/*)
+      echo "no-impact"; return 0 ;;
+  esac
+  # Root-level *.md (e.g. README.md, CLAUDE.md) — no slash, .md suffix.
+  if [[ "$path" != */* && "$path" == *.md ]]; then
+    echo "no-impact"; return 0
+  fi
+
+  # --- crates/<crate>/tests/** : integration tests, never in --release lib/bin.
+  # Matches a `tests/` directory directly under a single crate dir.
+  if [[ "$path" == crates/*/tests/* ]]; then
+    echo "test-only"; return 0
+  fi
+
+  # --- crates/**/src/**.rs : source that MAY be hunk-level test-only.
+  # Must be a .rs file living under a `src/` directory inside crates/.
+  if [[ "$path" == crates/*/src/*.rs && "$path" == *.rs ]]; then
+    echo "needs-hunk-check"; return 0
+  fi
+
+  # --- Everything else: fail-safe rebuild. ---
+  echo "rebuild"
+  return 0
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# diff_is_test_only  (reads ONE file's unified diff on stdin)  (issue #3215)
+#
+# Hunk-level classifier: returns 0 ONLY if EVERY changed (`+`/`-`) line in the
+# diff lies strictly inside a `#[cfg(test)]` / `mod tests` region, tracked by
+# brace-depth from the region opener to its matching close brace. ANY of the
+# following → return 1 (rebuild), because the change may affect the binary:
+#
+#   - a changed line outside any confirmed cfg(test) region;
+#   - a changed line ON the `#[cfg(test)]` attribute or the `mod tests {` opener
+#     itself (the region boundary is being mutated — ambiguous);
+#   - a hunk that cannot be anchored (zero-context hunk, whole-module deletion,
+#     or any parse ambiguity);
+#   - an empty / unreadable diff.
+#
+# Deliberately dumb + fail-safe: its safety comes from defaulting to rebuild on
+# ANY ambiguity, NOT from parsing Rust accurately. It is NOT a Rust parser and
+# must not grow into one. The authoritative skip is gated downstream by a
+# release-binary byte-compare; this function only prunes the candidate set.
+#
+# The diff is re-walked using ONLY the new-file ('+'/' ') lines (the post-change
+# file content the hunk headers describe). We reconstruct the post-change line
+# stream, tag each reconstructed line as "changed" if it is an added line or sits
+# adjacent to a removed line, and verify every changed line is inside a region.
+#
+# Returns: 0 = test-only (safe-to-consider-skip candidate); 1 = rebuild.
+# ─────────────────────────────────────────────────────────────────────────────
+diff_is_test_only() {
+  awk '
+    BEGIN {
+      in_region = 0      # currently inside a confirmed #[cfg(test)] region
+      depth = 0          # brace depth within the region
+      pending_cfg = 0    # saw #[cfg(test)] attribute, awaiting its mod opener
+      saw_hunk = 0       # at least one @@ hunk header seen
+      saw_change = 0     # at least one +/- content line seen
+      bad = 0            # a changed line landed outside a region / on a boundary
+    }
+
+    # Skip diff metadata lines that arent hunk content.
+    /^diff --git / { next }
+    /^index /      { next }
+    /^--- /        { next }
+    /^\+\+\+ /     { next }
+    /^old mode /   { next }
+    /^new mode /   { next }
+    /^similarity / { next }
+    /^rename /     { next }
+    /^new file /   { next }
+    /^deleted file / { next }
+    /^Binary files / { bad = 1; next }
+
+    # Hunk header. Reject zero-context / zero-line headers we cannot anchor:
+    # a hunk whose new-file span is "+N,0" (pure deletion, no post lines) or
+    # "+N" with no count and no context cannot be situated inside a region.
+    /^@@ / {
+      saw_hunk = 1
+      # Parse the "+start,len" field. Forms: @@ -a,b +c,d @@  or  @@ -a +c @@
+      hdr = $0
+      # Extract the +c,d token.
+      if (match(hdr, /\+[0-9]+(,[0-9]+)?/)) {
+        plus = substr(hdr, RSTART, RLENGTH)
+        sub(/^\+/, "", plus)
+        if (index(plus, ",") > 0) {
+          split(plus, pp, ",")
+          newlen = pp[2] + 0
+        } else {
+          newlen = 1
+        }
+        # A hunk that adds no post-change lines (pure deletion) cannot be
+        # anchored as "inside a test region" — fail-safe.
+        if (newlen == 0) { bad = 1 }
+      } else {
+        bad = 1
+      }
+      next
+    }
+
+    # Content lines. Only meaningful after a hunk header.
+    {
+      if (saw_hunk == 0) { next }   # stray line before any hunk → ignore
+
+      sign = substr($0, 1, 1)
+      text = substr($0, 2)
+
+      if (sign == "-") {
+        # A removed line. If it is inside a region, fine; if it touches a region
+        # boundary, flag. We treat removed lines conservatively: a removed line
+        # that is NOT inside a confirmed region → bad. Removed lines do not
+        # advance the post-change brace tracker (they are gone), but they DO
+        # signal a change at the current region state.
+        saw_change = 1
+        # If the removed line is the region opener/attribute, the boundary is
+        # being mutated → ambiguous.
+        if (text ~ /#\[cfg\(test\)\]/ || text ~ /(^|[[:space:]])mod[[:space:]]+tests([[:space:]]|\{|$)/) {
+          bad = 1
+        } else if (in_region == 0) {
+          bad = 1
+        }
+        next
+      }
+
+      # Context (space) or added (plus) line — part of the post-change file.
+      changed = (sign == "+") ? 1 : 0
+      if (sign == "+") saw_change = 1
+
+      # --- Region tracking on the post-change line stream. ---
+      # Detect a #[cfg(test)] attribute: arms the next mod opener.
+      is_cfg_attr = (text ~ /#\[cfg\(test\)\]/)
+      # Detect a `mod tests` opener (allow `pub mod tests`, trailing brace/space).
+      is_mod_open = (text ~ /(^|[[:space:]])mod[[:space:]]+tests([[:space:]]*\{|[[:space:]]*$)/)
+
+      if (changed && (is_cfg_attr || is_mod_open)) {
+        # Editing the region boundary itself → ambiguous → fail-safe.
+        bad = 1
+      }
+
+      if (is_cfg_attr) {
+        pending_cfg = 1
+      }
+
+      # Count braces on this line to maintain depth when inside a region.
+      opens = gsub(/\{/, "{", text)   # gsub returns count of substitutions
+      closes = gsub(/\}/, "}", text)
+
+      if (in_region == 0) {
+        # Entering a region only when a #[cfg(test)]-armed `mod tests {` opens.
+        if (is_mod_open && pending_cfg) {
+          in_region = 1
+          pending_cfg = 0
+          # The opener line itself: a changed opener was already flagged above.
+          # Initialize depth from the braces on the opener line.
+          depth = opens - closes
+          if (depth <= 0) {
+            # `mod tests;` (no body) or one-liner — no region body to be inside.
+            in_region = 0
+            depth = 0
+          }
+        } else {
+          # Not in a region. A changed line here is outside → bad.
+          if (changed) bad = 1
+          # A `mod tests {` without a preceding #[cfg(test)] is not a test region
+          # we trust; pending_cfg only persists to the immediately-following mod.
+          if (is_mod_open) pending_cfg = 0
+        }
+      } else {
+        # Inside a region: this line is in-region BEFORE applying its own braces
+        # for the closing case. A changed in-region line is allowed.
+        depth += opens - closes
+        if (depth <= 0) {
+          # Region closed on/at this line. A changed line that closes the region
+          # is at the boundary → ambiguous → fail-safe.
+          if (changed) bad = 1
+          in_region = 0
+          depth = 0
+        }
+      }
+
+      next
+    }
+
+    END {
+      # Fail-safe on: any boundary/outside violation, an empty diff, a diff with
+      # no hunks, or a diff with no actual changes.
+      if (bad)         { exit 1 }
+      if (saw_hunk == 0) { exit 1 }
+      if (saw_change == 0) { exit 1 }
+      exit 0
+    }
+  '
+}
