@@ -75,6 +75,14 @@ Variables provided by the env file (all required):
 - `MONITOR_RPC_PORT` — `8000` (validator) or empty (watcher)
 - `MONITOR_RUN_FLAGS` — `--validator` (validator) or empty (watcher)
 
+Optional (not required in the env file; read with a default at the point of use):
+
+- `MONITOR_HOST_RAM_GB` — physical RAM of the host, in GB, used by the
+  host-RAM-relative memory guardrail (check 4). **Default `61`** when unset, so
+  existing 61 GB deployments are unaffected until an operator sets it (e.g. `32`
+  on a 32 GB/no-swap box). See `eval_memory_guardrail` in
+  `scripts/lib/monitor-decisions.sh`.
+
 Throughout this skill, substitute those values for the `$MONITOR_*` references below.
 
 ### Skill checkout drift detection
@@ -805,15 +813,40 @@ incidents: #1904, #1873, #1921, #1949.
 
 **(4) Memory** — `ps -o rss= -p $(_find_session_process "$HOME/data" "/proc" "$MONITOR_SESSION_ID")`, convert to MB.
 
-- If `RSS > 12 GB`, flag HIGH MEMORY (report-only; no restart).
-- **Restart condition** — restart only if ALL hold (this gates on system
-  pressure AND evidence of a real heap leak, so we don't kill a legit catchup):
-  1. `RSS > 16 GB`, AND
-  2. system `available` memory from `free -m` (NOT `free` — that excludes
-     reclaimable kernel cache) `< 8 GB`, AND
-  3. latest two `memory_report=true` (or `Memory report summary`) entries both show `heap_components_mb`
-     growing by > 500 MB vs the earlier snapshot.
-- Restart: Stop-PID, Rotate-log suffix `crashed`, Relaunch.
+The guardrail is **host-RAM-relative** (not absolute GB) so the same skill gives
+early warning on a 32 GB/no-swap box without false-firing on a 61 GB box. The
+thresholds live in the pure decision function `eval_memory_guardrail`
+(`scripts/lib/monitor-decisions.sh`, already sourced), called with integer-MB
+inputs. Pass:
+
+- `RSS_MB` — the RSS just measured, in MB.
+- `AVAIL_MB` — system `available` memory from `free -m` (NOT `free` — that
+  excludes reclaimable kernel cache), in MB.
+- `MONITOR_HOST_RAM_GB` — host physical RAM in GB, defaulting to `61`.
+- the latest three `heap_components_mb` snapshots (`heap_prev2`, `heap_prev`,
+  `heap_curr`) from the most recent `memory_report=true` / `Memory report
+  summary` log entries (see check 7), so the function can test whether the
+  latest two deltas both grew > 500 MB.
+
+```bash
+# AVAIL_MB from `free -m` (MemAvailable line); HEAP_* from the last three
+# memory_report snapshots (see check 7). HOST_RAM_GB defaults to 61.
+eval_memory_guardrail "$RSS_MB" "$AVAIL_MB" "${MONITOR_HOST_RAM_GB:-61}" \
+  "$HEAP_PREV2_MB" "$HEAP_PREV_MB" "$HEAP_CURR_MB"
+```
+
+`eval_memory_guardrail` sets `MEMORY_GUARDRAIL_VERDICT`:
+
+- `report-high-mem` — `RSS > 0.65 * host_ram` (21.3 GB @32, 40.6 GB @61). Flag
+  HIGH MEMORY (report-only; no restart).
+- `restart` — ALL of: `RSS > 0.75 * host_ram` (24 GB @32, 45.75 GB @61) AND
+  `avail < 0.12 * host_ram` (~3.84 GB @32, ~7.3 GB @61) AND the latest two
+  `heap_components_mb` deltas both grew > 500 MB. This gates on system pressure
+  AND evidence of a real heap leak, so we don't kill a legit catchup (a transient
+  cold-catchup RSS spike with heap NOT growing stays `report-high-mem`).
+- `none` — otherwise.
+
+When the verdict is `restart`: Stop-PID, Rotate-log suffix `crashed`, Relaunch.
 
 **(5) Disk** — `df -h /home/tomer/data | tail -1`. If usage > 85%, flag LOW DISK.
 Then keep the 3 most recent rotated archives per category (the ISO 8601
@@ -843,6 +876,32 @@ Otherwise extract `jemalloc_allocated_mb`, `jemalloc_resident_mb`,
 `unaccounted_sign`. If `fragmentation_pct > 50`, flag HIGH FRAGMENTATION.
 If `unaccounted_mb > 1000` with sign `+`, note it (known jemalloc overhead,
 not a bug — but verify `heap_components` is stable; if it is growing, investigate).
+
+**Startup/catchup peak RSS** — surface the `henyey_startup_peak_anon_rss_mb`
+gauge (issue #3226/#3227; sampler in `crates/ledger/src/peak_rss_sampler.rs`).
+This captures the startup-restore + catchup peak that the `% 64` ledger-close
+memory report misses (the ~27–29 GB cold-catchup transient). Read it from the
+check-12 `/metrics` scrape (`current.prom`) rather than re-scraping; read the
+attributed `phase` from the greppable log summary line:
+
+```bash
+PROM=/home/tomer/data/$MONITOR_SESSION_ID/metrics/current.prom
+STARTUP_PEAK_MB=$(awk '/^henyey_startup_peak_anon_rss_mb /{printf "%d", $2}' "$PROM" 2>/dev/null)
+# phase label lives in the log summary line, not the gauge:
+#   "...startup_peak_anon_rss_mb=<N> phase=<phase>..."
+STARTUP_PEAK_PHASE=$(grep -oE 'startup_peak_anon_rss_mb=[0-9]+ phase=[a-z_-]+' \
+  /home/tomer/data/$MONITOR_SESSION_ID/logs/monitor.log 2>/dev/null \
+  | tail -1 | grep -oE 'phase=[a-z_-]+' | cut -d= -f2)
+if [ -n "$STARTUP_PEAK_MB" ] && [ "$STARTUP_PEAK_MB" -gt 0 ]; then
+  WATCH_ITEMS+=("startup_peak_mb=$STARTUP_PEAK_MB${STARTUP_PEAK_PHASE:+ (phase=$STARTUP_PEAK_PHASE)}")
+fi
+```
+
+`STARTUP_PEAK_MB` is rendered on the `mem:` status line (see Output, `peak=`).
+The `startup_peak_mb=` watch entry lets the daily summary track peak creep across
+restarts. The gauge is set once at sampler stop (before the first ledger close),
+so it is absent on a node that has not finished startup — treat empty/absent as
+"no peak yet" and omit the watch entry, not a warning.
 
 **(8) RPC health** (validator mode only — skip in watcher mode) —
 `curl -s -X POST http://localhost:$MONITOR_RPC_PORT -H 'Content-Type: application/json' -d '{"jsonrpc":"2.0","id":1,"method":"getHealth"}'`.
@@ -1947,7 +2006,7 @@ MONITOR <OK|WARNING|ACTION|OFFLINE> — L<ledger> — <timestamp>
   wipe:    <per wipe-state composition table — omitted when no wipe>
   sync:    <synced | CATCHING UP (gap=N, uptime=Xm, deadline=<15m|20m|60m>) | SYNC FAILURE (gap=N, uptime=Xm — filed/commented #<N>)>
   mem:     <RSS_MB>MB rss | alloc=<alloc>MB resident=<resident>MB frag=<pct>%
-           heap=<heap>MB mmap=<mmap>MB unaccounted=<sign><unaccounted>MB
+           heap=<heap>MB mmap=<mmap>MB unaccounted=<sign><unaccounted>MB peak=<startup_peak|N/A>MB
   disk:    <used>/<total> (<pct>%) | session+data=<size>
   rpc:     <healthy|unhealthy|N/A> oldestL=<X> latestL=<Y> window=<Z>
   obsrvr:  <validating=<Y/N> val24h=<pct>% lag=<N> | N/A (watcher) | N/A (api-error)>

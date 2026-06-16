@@ -45,7 +45,7 @@ cleanup  # ensure fresh state
 mkdir -p "$TEST_ROOT"
 
 # ── TAP state ────────────────────────────────────────────────────────────────
-TAP_PLAN=364
+TAP_PLAN=368
 TAP_CURRENT=0
 TAP_FAILURES=0
 

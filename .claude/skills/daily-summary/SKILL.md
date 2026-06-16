@@ -101,6 +101,9 @@ Extract:
   gauges (current value), not histograms; just read the scalar
 - `henyey_jemalloc_fragmentation_pct` (current value)
 - `henyey_jemalloc_allocated_bytes` (heap-allocated, current)
+- `henyey_startup_peak_anon_rss_mb` (startup/catchup peak anon RSS, MB —
+  issue #3226/#3227; absent until startup completes). Read the attributed
+  `phase` from the `startup_peak_anon_rss_mb=<N> phase=<phase>` log summary line.
 - Last `memory_report=true` (or `Memory report summary`) line for `heap_components_mb` trajectory if available
 
 Build (uptime, deploys, RSS-GB, frag-pct) and emit:
@@ -113,6 +116,7 @@ Build (uptime, deploys, RSS-GB, frag-pct) and emit:
 - SCP propagation (`first_to_self_externalize_seconds`): <ms>ms avg
 - SCP slot-cycle (`externalized_seconds`): <s>s avg
 - Memory: RSS <G>G, frag <pct>% (<heap-components-trajectory>)
+- Startup peak: <G>G (phase=<phase>) — _(omit if `henyey_startup_peak_anon_rss_mb` absent / node still starting up)_
 - Disk: data <pct>% (<used>G of <total>G), session <size>G, mainnet <size>G
 ```
 
@@ -213,6 +217,10 @@ Still open (<N>):
 Multi-tick non-incident concerns. Source: the `watch` array of
 yesterday's tick-history.jsonl entries. Aggregate the same key across
 ticks; report current value + 24h delta + linked issue if any.
+
+Include `startup_peak_mb=` watch entries (emitted by monitor-tick check 7 from
+`henyey_startup_peak_anon_rss_mb`) so peak creep across restarts is visible — a
+peak that climbs run-over-run signals the cold-catchup transient is growing.
 
 ```bash
 HIST=/home/tomer/data/$MONITOR_SESSION_ID/tick-history.jsonl
