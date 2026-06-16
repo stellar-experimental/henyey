@@ -3,7 +3,7 @@
 **Crate**: `henyey-history`
 **Upstream**: `stellar-core/src/history/`
 **Overall Parity**: 79%
-**Last Updated**: 2026-05-20
+**Last Updated**: 2026-06-16
 
 ## Summary
 
@@ -12,7 +12,7 @@
 | Checkpoint math | Full | Matches 64-ledger checkpoint rules |
 | Archive path generation | Full | Standard shard and dirty paths covered |
 | HAS parsing and diffing | Full | Bucket-list hash, parsing, futures, and diffing all covered |
-| Archive HTTP and shell access | Full | Native HTTP reads plus shell-command writes |
+| Archive HTTP and shell access | Full | Native HTTP reads plus shell-command writes; offline publish→catchup round-trip over a `cp`/`mkdir` command-template archive and `file://` is CI-pinned (`tests/publish_catchup_roundtrip.rs`, #3295) |
 | Archive manager | Partial | No random selection or work wrappers |
 | Checkpoint builder | Full | Crash-safe dirty-file recovery implemented |
 | Publish queue persistence | Full | SQLite-backed queue replaces filesystem queue |

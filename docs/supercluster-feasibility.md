@@ -182,15 +182,30 @@ Impact:
 
 The publish/catchup plumbing exists, but the remaining issue is execution confidence.
 
-Two caveats should be called out explicitly:
+Two caveats were originally called out here; one is now closed offline (#3295):
 
-- mission-level reliability has not been demonstrated through SSC
-- HISTORY config parsing extracts archive URLs heuristically from `get` command strings in `crates/app/src/compat_config.rs:236`, which may be brittle depending on how SSC renders command templates
+- **Closed (offline):** HISTORY config parsing extracts archive URLs from the
+  `get` command template in `extract_url_from_curl_cmd`
+  (`crates/app/src/compat_config.rs`). This was previously a brittle fixed-suffix
+  strip; it is now hardened (quotes, query strings, trailing slashes, and the
+  `{0}`/`{1}` placeholder all handled) and pinned by unit tests plus a captured
+  SSC publishing-validator config fixture
+  (`crates/app/src/compat_http/test_fixtures/ssc_mission_history.cfg`) via
+  `test_ssc_mission_history_config_parse`. The fixture's exact `put`/`mkdir`
+  rendering still needs live confirmation against a real SSC history mission.
+- **Closed (offline):** an end-to-end publish→catchup round-trip — henyey
+  publishes a checkpoint, uploads it through a `cp`/`mkdir` command-template
+  archive, then catches up over `file://` and reaches the published ledger hash
+  — is now CI-pinned (`crates/history/tests/publish_catchup_roundtrip.rs`).
+- **Still open:** mission-level reliability has not been demonstrated through a
+  live SSC RUN (cross-tool archive readability + live catchup-to-hash). See the
+  operator runbook in `docs/supercluster-mission-3295.md` (AC#4/#5/#6 of #3295).
 
 Impact:
 
 - history missions belong after mixed-image bring-up and basic HTTP parity work
-- the risk is lower than metrics/loadgen, but it is real
+- the remaining risk is concentrated in the live RUN, not the henyey-side
+  publish/catchup/config-parse paths, which are now offline-pinned
 
 ### 7. `--minimal-for-in-memory-mode` is an intentional parity-correct no-op
 
