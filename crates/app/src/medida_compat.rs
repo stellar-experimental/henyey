@@ -475,11 +475,43 @@ impl MedidaCompat {
         }
     }
 
+    /// Construct a fresh, isolated registry for unit tests (the process-global
+    /// [`medida_compat`] singleton is shared and not suitable for assertions on
+    /// exact values).
+    #[cfg(test)]
+    pub(crate) fn new_for_test() -> Self {
+        Self::new()
+    }
+
+    /// Like [`new_for_test`], but anchors the meters' start/last-tick instants at
+    /// `now`. Marking at `now` and reading the snapshot at a wall clock ≥5s later
+    /// then exercises the lazy-tick rate path deterministically.
+    #[cfg(test)]
+    pub(crate) fn new_for_test_at(now: Instant) -> Self {
+        MedidaCompat {
+            close_timer: ReservoirSample::new(),
+            close_meter: EwmaMeter::new_at(now),
+            tx_count_histogram: ReservoirSample::new(),
+            scp_value_valid: EwmaMeter::new_at(now),
+            scp_value_invalid: EwmaMeter::new_at(now),
+            scp_last_seen: Mutex::new(ScpLastSeen::default()),
+        }
+    }
+
     /// Record a ledger close: `close_ms` into the close timer + meter, `tx_count`
     /// into the tx-count histogram. Called from the ledger-close path.
     pub fn record_ledger_close(&self, close_ms: f64, tx_count: u64) {
         self.close_timer.update(close_ms);
         self.close_meter.mark(1);
+        self.tx_count_histogram.update(tx_count as f64);
+    }
+
+    /// Like [`record_ledger_close`], but marks the close meter at an injected
+    /// instant so the EWMA lazy-tick behaviour is deterministically testable.
+    #[cfg(test)]
+    pub(crate) fn record_ledger_close_at(&self, close_ms: f64, tx_count: u64, now: Instant) {
+        self.close_timer.update(close_ms);
+        self.close_meter.mark_at(1, now);
         self.tx_count_histogram.update(tx_count as f64);
     }
 
@@ -499,6 +531,29 @@ impl MedidaCompat {
         }
         if invalid_delta > 0 {
             self.scp_value_invalid.mark(invalid_delta);
+        }
+    }
+
+    /// Like [`feed_scp`], but marks at an injected instant for deterministic
+    /// rate tests.
+    #[cfg(test)]
+    pub(crate) fn feed_scp_at(
+        &self,
+        value_valid_total: u64,
+        value_invalid_total: u64,
+        now: Instant,
+    ) {
+        let mut last = self.scp_last_seen.lock().unwrap();
+        let valid_delta = value_valid_total.saturating_sub(last.value_valid_total);
+        let invalid_delta = value_invalid_total.saturating_sub(last.value_invalid_total);
+        last.value_valid_total = value_valid_total;
+        last.value_invalid_total = value_invalid_total;
+        drop(last);
+        if valid_delta > 0 {
+            self.scp_value_valid.mark_at(valid_delta, now);
+        }
+        if invalid_delta > 0 {
+            self.scp_value_invalid.mark_at(invalid_delta, now);
         }
     }
 }

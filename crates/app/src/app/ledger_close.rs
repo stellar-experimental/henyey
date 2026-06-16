@@ -2342,6 +2342,14 @@ impl App {
                 .record(result.stats.close_time_ms as f64 / 1000.0);
         }
 
+        // Feed the medida-compat `ledger.ledger.close` timer (close duration in
+        // ms) + embedded meter, and the `ledger.transaction.count` histogram,
+        // for the stellar-core-compatible /metrics endpoint (#3296).
+        crate::medida_compat::medida_compat().record_ledger_close(
+            result.stats.close_time_ms as f64,
+            result.stats.tx_count as u64,
+        );
+
         // Phase 5: Per-phase close-duration histograms (LedgerClosePerf).
         if let Some(ref perf) = result.perf {
             let us_to_secs = |us: u64| us as f64 / 1_000_000.0;
