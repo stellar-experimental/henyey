@@ -192,13 +192,31 @@ capture_diagnostics() {
     local attempt_dir="$DIAGNOSTICS_DIR/attempt-$attempt"
     mkdir -p "$attempt_dir"
 
-    # Docker container state (best-effort)
+    # Docker container state (best-effort).
+    #
+    # Each docker call is bounded with `timeout 30` (#3286). capture_diagnostics
+    # runs INSIDE run_probe — after the probe's exit_code is captured but BEFORE
+    # run_probe returns. On a resource-starved CI runner the docker daemon can go
+    # into uninterruptible D-state, and an unbounded `docker ps -a` then wedges
+    # forever. The `|| true` below does NOT bound such a hang — a process stuck
+    # in a syscall never reaches `|| true` — so without `timeout` the call wedges,
+    # run_probe never returns, and the 124/137 --soft-on-timeout soft-skip (which
+    # lives in main, AFTER run_probe) is never reached: the step runs to its
+    # budget and the job is cancelled (the #3286 hang signature, confirmed by the
+    # #3289 instrumentation's captured process tree). `timeout 30` lets the
+    # diagnostics phase fail-open quickly so run_probe returns and the soft-skip
+    # fires. The `|| true` is KEPT so a timeout-induced 124 from a wedged docker
+    # call is swallowed and never contaminates the probe's own exit_code (already
+    # captured before capture_diagnostics runs) — the probe disposition stays
+    # byte-identical to before this fix. This bounds only the diagnostics-capture
+    # phase; it does NOT change any pass/fail/soft-skip logic.
     if command -v docker &>/dev/null; then
-        docker ps -a > "$attempt_dir/docker-ps.txt" 2>&1 || true
-        # Capture logs from any running quickstart containers
-        for cid in $(docker ps -aq --filter "name=quickstart" 2>/dev/null || true); do
-            docker logs "$cid" > "$attempt_dir/container-$cid.log" 2>&1 || true
-            docker inspect "$cid" > "$attempt_dir/container-$cid-inspect.json" 2>&1 || true
+        timeout 30 docker ps -a > "$attempt_dir/docker-ps.txt" 2>&1 || true
+        # Capture logs from any running quickstart containers. The enumeration is
+        # bounded too — the same D-state daemon wedges `docker ps -aq` identically.
+        for cid in $(timeout 30 docker ps -aq --filter "name=quickstart" 2>/dev/null || true); do
+            timeout 30 docker logs "$cid" > "$attempt_dir/container-$cid.log" 2>&1 || true
+            timeout 30 docker inspect "$cid" > "$attempt_dir/container-$cid-inspect.json" 2>&1 || true
         done
     fi
 
