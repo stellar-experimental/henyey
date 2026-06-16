@@ -116,38 +116,118 @@ pub(crate) async fn compat_ll_handler(
 
 // ── Peer management (plain text) ─────────────────────────────────────────
 
+/// GET /connect?peer=PEER&port=PORT
+///
+/// Mirrors stellar-core `CommandHandler::connect` (CommandHandler.cpp:478):
+/// the connect is fire-and-forget, so the success string is returned
+/// unconditionally once a peer+port are supplied (independent of whether the
+/// TCP connection ultimately succeeds). Wires into [`App::connect_peer`].
 pub(crate) async fn compat_connect_handler(
-    State(_state): State<Arc<CompatServerState>>,
+    State(state): State<Arc<CompatServerState>>,
     Query(params): Query<ConnectParams>,
 ) -> impl IntoResponse {
-    match params.peer {
-        Some(_peer) => "done\n".to_string(),
-        None => "Must specify a peer: connect?peer=<ip>&port=<port>\n".to_string(),
-    }
+    // stellar-core keys on both peer and port being present.
+    let (Some(peer), Some(port)) = (params.peer.clone(), params.port) else {
+        return "Must specify a peer and port: connect&peer=PEER&port=PORT\n".to_string();
+    };
+
+    let addr = match crate::http::helpers::parse_connect_params(&params) {
+        Ok(addr) => addr,
+        // A malformed peer/port still yields the "must specify" guidance, as
+        // there is no resolvable target to connect to.
+        Err(_) => {
+            return "Must specify a peer and port: connect&peer=PEER&port=PORT\n".to_string();
+        }
+    };
+
+    // Fire-and-forget: kick off the connect but do not reflect its outcome,
+    // matching stellar-core's unconditional retStr.
+    let _ = state.app.connect_peer(addr).await;
+    format!("Connect to: {}:{}\n", peer, port)
 }
 
+/// GET /droppeer?node=NODE_ID[&ban=1]
+///
+/// Mirrors stellar-core `CommandHandler::dropPeer` (CommandHandler.cpp:~543):
+/// keyed on `node`. Wires into [`App::disconnect_peer`] (+ [`App::ban_peer`]
+/// when `ban=1`). Any disconnect failure variant or an unresolvable node id
+/// collapses to the "not found" string so internal error prose never leaks.
 pub(crate) async fn compat_droppeer_handler(
-    State(_state): State<Arc<CompatServerState>>,
+    State(state): State<Arc<CompatServerState>>,
     Query(params): Query<DropPeerParams>,
 ) -> impl IntoResponse {
-    match params.node {
-        Some(_) => "done\n".to_string(),
-        None => "Must specify a peer: droppeer?node=<node_id>\n".to_string(),
+    let Some(node) = params.node.clone() else {
+        return "Must specify at least peer id: droppeer?node=NODE_ID\n".to_string();
+    };
+
+    let peer_id = match crate::http::helpers::parse_peer_id_params(&None, &params.node) {
+        Ok(peer_id) => peer_id,
+        // resolveNodeID-false in core → "Peer X not found".
+        Err(_) => return format!("Peer {} not found\n", node),
+    };
+
+    // Any DisconnectError (PeerNotFound or OverlayUnavailable) maps to the
+    // core not-found string.
+    if state.app.disconnect_peer(&peer_id).await.is_err() {
+        return format!("Peer {} not found\n", node);
+    }
+
+    let ban_requested = params.ban.unwrap_or(0) == 1;
+    if ban_requested {
+        // The disconnect already happened; a ban failure is non-fatal to the
+        // compat response (the peer is dropped regardless).
+        let _ = state.app.ban_peer(peer_id).await;
+        format!("Drop and ban peer: {}\n", node)
+    } else {
+        format!("Drop peer: {}\n", node)
     }
 }
 
+/// GET /unban?node=NODE_ID
+///
+/// Mirrors stellar-core `CommandHandler::unban` (CommandHandler.cpp:566):
+/// returns the success string whenever the node id resolves. Wires into
+/// [`App::unban_peer`], which removes the DB ban row first; an
+/// overlay-unavailable error after that point is collapsed to success because
+/// the meaningful (DB) side effect has already happened.
 pub(crate) async fn compat_unban_handler(
-    State(_state): State<Arc<CompatServerState>>,
-    Query(_params): Query<UnbanParams>,
+    State(state): State<Arc<CompatServerState>>,
+    Query(params): Query<UnbanParams>,
 ) -> impl IntoResponse {
-    "done\n"
+    let Some(node) = params.node.clone() else {
+        return "Must specify at least peer id: unban?node=NODE_ID\n".to_string();
+    };
+
+    let peer_id = match crate::http::helpers::parse_peer_id_params(&None, &params.node) {
+        Ok(peer_id) => peer_id,
+        Err(_) => return format!("Peer {} not found\n", node),
+    };
+
+    // unban_peer removes the DB row before its overlay check, so even an
+    // overlay-unavailable Err means the meaningful side effect succeeded.
+    // core returns "Unban peer:" whenever the id resolves, regardless.
+    let _ = state.app.unban_peer(&peer_id).await;
+    format!("Unban peer: {}\n", node)
 }
 
 /// GET /bans
+///
+/// Mirrors stellar-core `CommandHandler::bans` (CommandHandler.cpp:553):
+/// returns the banned node strkeys. Wires into [`App::banned_peers`] (pure DB
+/// `load_bans`). The empty case emits `{"bans": []}` (a documented divergence
+/// from core's jsoncpp `{"bans": null}`; see crates/app/PARITY_STATUS.md).
 pub(crate) async fn compat_bans_handler(
-    State(_state): State<Arc<CompatServerState>>,
+    State(state): State<Arc<CompatServerState>>,
 ) -> impl IntoResponse {
-    Json(serde_json::json!({"bans": []}))
+    let bans = state
+        .app
+        .banned_peers()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(crate::http::helpers::peer_id_to_strkey)
+        .collect::<Vec<_>>();
+    Json(serde_json::json!({ "bans": bans }))
 }
 
 // ── JSON endpoints (delegate to native logic) ───────────────────────────
