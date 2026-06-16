@@ -897,3 +897,170 @@ diff_is_test_only() {
     }
   '
 }
+
+# ─────────────────────────────────────────────────────────────────────────────
+# classify_stuck_alive_sync NODE_STATE CURRENT_LCL AGE_SEC RPC_STATUS RSS_MB \
+#                           PROC_RESPONSIVE STATE_FILE [NOW_EPOCH]
+#
+# Pure decision function for the monitor-tick remediation rung (3e):
+# "stuck-but-alive SYNC FAILURE" auto-restart (issue #3219).
+#
+# Detects a node that is ALIVE and RESPONSIVE (admin /info answers) but is NOT
+# making ledger progress: a frozen local `lcl`, climbing RPC `age`, RPC
+# `unhealthy`, and RSS UNDER the OOM floor. This is the residual failure mode
+# left over after (3c) soft-fail-wipe (owns the fatal-state-wipe case) and (3b)
+# wedge (owns the UNRESPONSIVE / frozen-event-loop case). (3e) is the MIRROR of
+# (3b): (3b) fires when the admin port is dead/timed-out; (3e) requires a live,
+# answering port (PROC_RESPONSIVE=yes). The two are mutually exclusive by
+# construction, so (3e) can never poach the wedge path.
+#
+# Band-aid for root cause #3218 (overlay SCP broadcast backpressure). The
+# max-restarts→escalate guard ensures a restart loop surfaces as `urgent`
+# rather than silently masking the unfixed defect.
+#
+# Mirrors detect_soft_fail_blocked's injectable-time design: NOW_EPOCH is the
+# optional last positional arg (defaults to wall clock) so all dwell/cooldown/
+# window arithmetic is deterministically testable.
+#
+# SOLE READER/WRITER of STATE_FILE — the caller supplies only the live
+# CURRENT_LCL value and the file path; this function owns all reads/writes of
+# `frozen_lcl`, `frozen_since_epoch`, `last_restart_epoch`, and `restart_epochs`.
+# On each call: if CURRENT_LCL != frozen_lcl, the lcl advanced (NOT stuck) → reset
+# frozen_lcl=CURRENT_LCL and frozen_since_epoch=NOW; else frozen_since_epoch
+# accumulates. frozen_lcl_seconds = NOW - frozen_since_epoch.
+#
+# Thresholds (named constants — operators may retune):
+#   STUCK_AGE_SEC=600       RPC wall-clock `age` floor (check (2)'s 30s is a
+#                           report-only flag; a restart must be far more
+#                           conservative). AGE + frozen-lcl are an intentionally
+#                           conservative AND (correlation only reduces false-fire).
+#   STUCK_DWELL_SEC=600     frozen-lcl wall-clock dwell (cadence-independent;
+#                           mirrors check (2)'s "<ledger>|<ts>" STUCK idiom).
+#   OOM_FLOOR_MB=16384      RSS ceiling; the OOM gate (check (4)) owns over-floor.
+#   STUCK_COOLDOWN_SEC=900  min seconds between stuck-restarts.
+#   STUCK_WINDOW_SEC=7200   rolling window (2h) for the max-restarts guard.
+#   MAX_STUCK_RESTARTS=3    max stuck-restarts within the window before escalate.
+#
+# State-set match: case-insensitive substring `valid` | `synced` | `track`.
+# Verified against the real /info `state` enum
+# (crates/app/src/compat_http/handlers/info.rs): healthy/validating →
+# "Synced!" (matches `synced`), catch-up → "Catching up" (no match → never
+# fires), boot → "Booting", stop → "Stopping". The extra `valid`/`track`
+# substrings are defensive against future enum drift.
+#
+# Sets global STUCK_ALIVE_SYNC ∈ "yes" | "no" | "cooldown" | "escalate":
+#   yes       — all six AND-gate conditions hold and neither guard tripped;
+#               appends NOW to restart_epochs and sets last_restart_epoch=NOW.
+#   cooldown  — conditions hold but NOW - last_restart_epoch < STUCK_COOLDOWN_SEC.
+#   escalate  — conditions hold but >= MAX_STUCK_RESTARTS within STUCK_WINDOW_SEC.
+#   no        — any AND-gate condition fails.
+# Returns: 0 always. Does NO process I/O (no kill/relaunch) — the (3e) rung does that.
+# ─────────────────────────────────────────────────────────────────────────────
+classify_stuck_alive_sync() {
+  local node_state="$1"
+  local current_lcl="$2"
+  local age_sec="$3"
+  local rpc_status="$4"
+  local rss_mb="$5"
+  local proc_responsive="$6"
+  local state_file="$7"
+  local now_epoch="${8:-$(date +%s)}"
+
+  # Named thresholds (operator-retunable).
+  local STUCK_AGE_SEC=600
+  local STUCK_DWELL_SEC=600
+  local OOM_FLOOR_MB=16384
+  local STUCK_COOLDOWN_SEC=900
+  local STUCK_WINDOW_SEC=7200
+  local MAX_STUCK_RESTARTS=3
+
+  STUCK_ALIVE_SYNC="no"
+
+  # ── Read prior state (this function is the sole reader/writer). ─────────────
+  local frozen_lcl="" frozen_since_epoch="" last_restart_epoch="0" restart_epochs=""
+  if [[ -f "$state_file" ]]; then
+    local line key val
+    while IFS='=' read -r key val; do
+      case "$key" in
+        frozen_lcl)          frozen_lcl="$val" ;;
+        frozen_since_epoch)  frozen_since_epoch="$val" ;;
+        last_restart_epoch)  last_restart_epoch="$val" ;;
+        restart_epochs)      restart_epochs="$val" ;;
+      esac
+    done < "$state_file"
+  fi
+  [[ -z "$last_restart_epoch" ]] && last_restart_epoch="0"
+
+  # ── Frozen-lcl bookkeeping: reset on advance, else accumulate. ──────────────
+  if [[ "$current_lcl" != "$frozen_lcl" ]]; then
+    frozen_lcl="$current_lcl"
+    frozen_since_epoch="$now_epoch"
+  fi
+  # Defensive: if the state file was missing/corrupt, anchor frozen_since to now.
+  [[ -z "$frozen_since_epoch" ]] && frozen_since_epoch="$now_epoch"
+
+  local frozen_lcl_seconds=$(( now_epoch - frozen_since_epoch ))
+  [[ "$frozen_lcl_seconds" -lt 0 ]] && frozen_lcl_seconds=0
+
+  # Prune restart_epochs to the rolling window (drop entries older than the window).
+  local pruned="" e
+  for e in $restart_epochs; do
+    [[ "$e" =~ ^[0-9]+$ ]] || continue
+    if [[ $(( now_epoch - e )) -lt "$STUCK_WINDOW_SEC" ]]; then
+      pruned="${pruned:+$pruned }$e"
+    fi
+  done
+  restart_epochs="$pruned"
+
+  # ── Persist the (possibly reset/pruned) state before any early return. ──────
+  _write_stuck_state() {
+    printf 'frozen_lcl=%s\nfrozen_since_epoch=%s\nlast_restart_epoch=%s\nrestart_epochs=%s\n' \
+      "$frozen_lcl" "$frozen_since_epoch" "$last_restart_epoch" "$restart_epochs" \
+      > "$state_file" 2>/dev/null || true
+  }
+
+  # ── Six-way AND-gate. Any miss → "no" (state persisted, no restart). ────────
+  # 1. Healthy/validating state (case-insensitive substring valid|synced|track).
+  local lc_state
+  lc_state=$(printf '%s' "$node_state" | tr '[:upper:]' '[:lower:]')
+  case "$lc_state" in
+    *valid*|*synced*|*track*) : ;;   # match — continue
+    *) _write_stuck_state; STUCK_ALIVE_SYNC="no"; return 0 ;;
+  esac
+  # 2. Process responsive (mirror of (3b) wedge).
+  [[ "$proc_responsive" == "yes" ]] || { _write_stuck_state; STUCK_ALIVE_SYNC="no"; return 0; }
+  # 3. RPC unhealthy.
+  [[ "$rpc_status" == "unhealthy" ]] || { _write_stuck_state; STUCK_ALIVE_SYNC="no"; return 0; }
+  # 4. age over threshold.
+  [[ "$age_sec" -gt "$STUCK_AGE_SEC" ]] || { _write_stuck_state; STUCK_ALIVE_SYNC="no"; return 0; }
+  # 5. frozen-lcl dwell met.
+  [[ "$frozen_lcl_seconds" -ge "$STUCK_DWELL_SEC" ]] || { _write_stuck_state; STUCK_ALIVE_SYNC="no"; return 0; }
+  # 6. RSS under OOM floor.
+  [[ "$rss_mb" -lt "$OOM_FLOOR_MB" ]] || { _write_stuck_state; STUCK_ALIVE_SYNC="no"; return 0; }
+
+  # ── Guards (conditions 1–6 hold). ───────────────────────────────────────────
+  # Cooldown: too soon after the last stuck-restart.
+  if [[ "$last_restart_epoch" -gt 0 ]] \
+     && [[ $(( now_epoch - last_restart_epoch )) -lt "$STUCK_COOLDOWN_SEC" ]]; then
+    _write_stuck_state
+    STUCK_ALIVE_SYNC="cooldown"
+    return 0
+  fi
+  # Max-restarts: a restart loop signals #3218 is unfixed → escalate, no restart.
+  local restart_count=0
+  for e in $restart_epochs; do
+    restart_count=$(( restart_count + 1 ))
+  done
+  if [[ "$restart_count" -ge "$MAX_STUCK_RESTARTS" ]]; then
+    _write_stuck_state
+    STUCK_ALIVE_SYNC="escalate"
+    return 0
+  fi
+
+  # ── Fire: record this restart and return yes. ──────────────────────────────
+  restart_epochs="${restart_epochs:+$restart_epochs }$now_epoch"
+  last_restart_epoch="$now_epoch"
+  _write_stuck_state
+  STUCK_ALIVE_SYNC="yes"
+  return 0
+}
