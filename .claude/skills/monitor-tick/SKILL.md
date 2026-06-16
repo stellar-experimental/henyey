@@ -811,6 +811,73 @@ Board-route to Backlog: `bash .github/skills/shared/scripts/move-issue-status.sh
 Recurrence-after-fix → NEW issue, not a comment on a closed one. Known prior
 incidents: #1904, #1873, #1921, #1949.
 
+**(3e) Stuck-but-alive SYNC FAILURE auto-restart** — a node can be alive AND
+responsive (admin `/info` answers) yet make no ledger progress: a frozen local
+`lcl`, climbing RPC `age`, RPC `unhealthy`, and RSS under the OOM floor. This is
+the residual mode left after (3c) (owns the fatal-state-wipe case) and (3b)
+(owns the UNRESPONSIVE / frozen-event-loop case). (3e) is the **mirror of (3b)**:
+(3b) fires when the admin port is dead/timed-out; (3e) requires a *live,
+answering* port — mutually exclusive by construction. It is a band-aid for root
+cause #3218 (overlay SCP broadcast backpressure); the escalate-on-streak guard
+surfaces a restart loop as `urgent` rather than silently masking the defect.
+
+Evaluate (3e) **strictly last** in the alive-process path — order is
+(3c) soft-fail-wipe → (3b) wedge → **(3e) stuck-alive-sync** — so it only catches
+the residual responsive-but-frozen state. The decision is made by the pure
+function `classify_stuck_alive_sync` (`scripts/lib/monitor-decisions.sh`, already
+sourced), which is the **sole reader/writer** of the per-session streak state
+file; the caller passes only the live `lcl` and the file path.
+
+```bash
+# Skip unless the process is alive AND this is NOT the wedge case (3b owns
+# unresponsive). PROC_RESPONSIVE: admin /info answered non-empty within timeout.
+[ -z "$PID" ] && : # skip — dead-process path (3a/3d) handles this
+INFO_BODY=$(curl -s -m 3 "http://localhost:$MONITOR_ADMIN_PORT/info" 2>/dev/null)
+PROC_RESPONSIVE=$([ -n "$INFO_BODY" ] && echo yes || echo no)
+# NODE_STATE: the /info `state` field — "Synced!" (healthy/validating),
+# "Catching up", "Booting", "Stopping" (crates/app/.../handlers/info.rs).
+NODE_STATE=$(printf '%s' "$INFO_BODY" | grep -oP '"state"\s*:\s*"\K[^"]+' | head -1)
+# CURRENT_LCL: local last-closed-ledger number (from /info `ledger.num`).
+CURRENT_LCL=$(printf '%s' "$INFO_BODY" | grep -oP '"num"\s*:\s*\K[0-9]+' | head -1)
+# AGE_SEC: RPC getHealth wall-clock `age` (the check-(2) staleness signal).
+# RPC_STATUS: "healthy" | "unhealthy" from validator-mode getHealth.
+# RSS_MB: the RSS measured in check (4) (reused; OOM gate owns RSS-over-floor).
+STUCK_STATE_FILE="/home/tomer/data/$MONITOR_SESSION_ID/metrics/stuck_restart_state"
+mkdir -p "$(dirname "$STUCK_STATE_FILE")"
+classify_stuck_alive_sync "$NODE_STATE" "$CURRENT_LCL" "$AGE_SEC" "$RPC_STATUS" \
+  "$RSS_MB" "$PROC_RESPONSIVE" "$STUCK_STATE_FILE"
+```
+
+`classify_stuck_alive_sync` sets `STUCK_ALIVE_SYNC`. It is `yes` only when ALL
+six hold: state matches `valid|synced|track` (case-insensitive substring; never
+`Catching up`/`Booting`); `PROC_RESPONSIVE=yes`; `RPC_STATUS=unhealthy`;
+`AGE_SEC > 600`; frozen-lcl wall-clock dwell `>= 600s` (cadence-independent,
+mirroring check (2)'s `<ledger>|<ts>` STUCK idiom — fires at ~10 min of freeze
+regardless of tick spacing); and `RSS_MB < 16384`. Thresholds are named
+constants at the top of the function for operator retuning. Guards: a **900s
+cooldown** (`NOW - last_restart < 900` → `cooldown`, no restart this tick) and a
+**max-3-restarts / 2h** guard (`>= 3` restarts in a 7200s rolling window →
+`escalate`, no restart).
+
+- On `STUCK_ALIVE_SYNC=yes`: **Stop-PID**, **Rotate-log** with suffix `stuck`,
+  then **Relaunch** (verbatim reuse of the Common-procedures machinery). The
+  `stuck` suffix is already a recognized rotation type (Crash-recovery signal 1
+  and check (5) retention), so the next tick sees `CRASH_RECOVERY=yes` and
+  extends the sync deadline to 60m — it will not false-fire SYNC FAILURE during
+  the legitimate replay that follows the restart.
+- On `STUCK_ALIVE_SYNC=escalate`: do **NOT** restart. File a single
+  `urgent`-labeled issue (reusing the (3b)-wedge filing idiom) noting the
+  restart streak and pointing at the unfixed root cause #3218 (overlay SCP
+  broadcast backpressure / near-tip-stall recovery); if #3218 is closed,
+  escalate to the operator. A restart loop is itself the signal that the root
+  cause is unaddressed.
+- On `STUCK_ALIVE_SYNC=cooldown` or `no`: report-only, no action this tick.
+
+This trigger fires ONLY on the genuine stuck-but-alive signature and never
+during legitimate transient sync/catch-up — a false restart on a consensus
+validator is harmful. The 600s frozen-lcl dwell + six-way AND-gate + 900s
+cooldown + max-3/2h guard enforce that conservatism.
+
 **(4) Memory** — `ps -o rss= -p $(_find_session_process "$HOME/data" "/proc" "$MONITOR_SESSION_ID")`, convert to MB.
 
 The guardrail is **host-RAM-relative** (not absolute GB) so the same skill gives

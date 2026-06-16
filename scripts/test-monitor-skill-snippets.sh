@@ -45,7 +45,7 @@ cleanup  # ensure fresh state
 mkdir -p "$TEST_ROOT"
 
 # ── TAP state ────────────────────────────────────────────────────────────────
-TAP_PLAN=395
+TAP_PLAN=406
 TAP_CURRENT=0
 TAP_FAILURES=0
 
@@ -1874,6 +1874,159 @@ PYEOF
   else
     tap_not_ok "consistency: SKILL.md references detect_soft_fail_blocked and has_fatal_wipe_evidence" \
       "One or both functions not referenced in monitor-tick/SKILL.md"
+  fi
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # classify_stuck_alive_sync tests (T63a–T63k)
+  # Source: scripts/lib/monitor-decisions.sh — (3e) stuck-but-alive SYNC FAILURE
+  # auto-restart trigger (issue #3219).
+  #
+  # Contract: classify_stuck_alive_sync NODE_STATE CURRENT_LCL AGE_SEC RPC_STATUS \
+  #             RSS_MB PROC_RESPONSIVE STATE_FILE [NOW_EPOCH]
+  # Sets STUCK_ALIVE_SYNC ∈ yes|no|cooldown|escalate. The function is the sole
+  # reader/writer of STATE_FILE. NOW_EPOCH is injectable for deterministic tests.
+  # ════════════════════════════════════════════════════════════════════════════
+
+  local NOW_SA=1700000000             # fixed reference for stuck-alive tests
+  local sa_dir="$TEST_ROOT/stuck-alive"
+  mkdir -p "$sa_dir"
+
+  # Helper: seed a state file with a frozen lcl that has been frozen for N seconds
+  # (so frozen_lcl_seconds = N at NOW_SA). Optional last_restart_epoch / restart_epochs.
+  _sa_seed() {
+    # $1=file $2=frozen_lcl $3=frozen_for_sec $4=last_restart_epoch $5=restart_epochs(space-sep)
+    local f="$1" lcl="$2" frozen_for="$3" last_restart="${4:-0}" epochs="${5:-}"
+    printf 'frozen_lcl=%s\nfrozen_since_epoch=%s\nlast_restart_epoch=%s\nrestart_epochs=%s\n' \
+      "$lcl" "$((NOW_SA - frozen_for))" "$last_restart" "$epochs" > "$f"
+  }
+
+  # ── Test 63a: full reproduced signature → yes ──────────────────────────────
+  # Synced! + lcl frozen 700s + age 700 + unhealthy + RSS 10240 + responsive.
+  local sa_a="$sa_dir/a.state"
+  _sa_seed "$sa_a" 55000000 700
+  classify_stuck_alive_sync "Synced!" 55000000 700 "unhealthy" 10240 "yes" "$sa_a" "$NOW_SA"
+  if [[ "$STUCK_ALIVE_SYNC" == "yes" ]]; then
+    tap_ok "stuck-alive: full signature (frozen 700s + age 700 + unhealthy + RSS 10240 + responsive) → yes"
+  else
+    tap_not_ok "stuck-alive: full signature → yes" "got STUCK_ALIVE_SYNC=$STUCK_ALIVE_SYNC"
+  fi
+
+  # ── Test 63b: transient sync (Catching up) → no ────────────────────────────
+  local sa_b="$sa_dir/b.state"
+  _sa_seed "$sa_b" 55000000 700
+  classify_stuck_alive_sync "Catching up" 55000000 700 "unhealthy" 10240 "yes" "$sa_b" "$NOW_SA"
+  if [[ "$STUCK_ALIVE_SYNC" == "no" ]]; then
+    tap_ok "stuck-alive: transient sync (Catching up) → no"
+  else
+    tap_not_ok "stuck-alive: transient sync (Catching up) → no" "got STUCK_ALIVE_SYNC=$STUCK_ALIVE_SYNC"
+  fi
+
+  # ── Test 63c: 3b wedge (PROC_RESPONSIVE=no) → no ───────────────────────────
+  # The wedge path (3b) owns the unresponsive case; (3e) must NOT poach it.
+  local sa_c="$sa_dir/c.state"
+  _sa_seed "$sa_c" 55000000 700
+  classify_stuck_alive_sync "Synced!" 55000000 700 "unhealthy" 10240 "no" "$sa_c" "$NOW_SA"
+  if [[ "$STUCK_ALIVE_SYNC" == "no" ]]; then
+    tap_ok "stuck-alive: 3b wedge (PROC_RESPONSIVE=no) → no (mirror of wedge path)"
+  else
+    tap_not_ok "stuck-alive: 3b wedge (PROC_RESPONSIVE=no) → no" "got STUCK_ALIVE_SYNC=$STUCK_ALIVE_SYNC"
+  fi
+
+  # ── Test 63d: healthy validating (RPC healthy, age 4s) → no ────────────────
+  local sa_d="$sa_dir/d.state"
+  _sa_seed "$sa_d" 55000000 4
+  classify_stuck_alive_sync "Synced!" 55000000 4 "healthy" 10240 "yes" "$sa_d" "$NOW_SA"
+  if [[ "$STUCK_ALIVE_SYNC" == "no" ]]; then
+    tap_ok "stuck-alive: healthy validating (RPC healthy, age 4s) → no"
+  else
+    tap_not_ok "stuck-alive: healthy validating → no" "got STUCK_ALIVE_SYNC=$STUCK_ALIVE_SYNC"
+  fi
+
+  # ── Test 63e: RSS over OOM floor (17000 > 16384) → no ──────────────────────
+  # The OOM gate (check 4) owns RSS-over-floor restarts.
+  local sa_e="$sa_dir/e.state"
+  _sa_seed "$sa_e" 55000000 700
+  classify_stuck_alive_sync "Synced!" 55000000 700 "unhealthy" 17000 "yes" "$sa_e" "$NOW_SA"
+  if [[ "$STUCK_ALIVE_SYNC" == "no" ]]; then
+    tap_ok "stuck-alive: RSS over OOM floor (17000) → no (OOM gate owns this)"
+  else
+    tap_not_ok "stuck-alive: RSS over OOM floor → no" "got STUCK_ALIVE_SYNC=$STUCK_ALIVE_SYNC"
+  fi
+
+  # ── Test 63f: dwell not met (frozen_lcl_seconds=300 < 600) → no ────────────
+  local sa_f="$sa_dir/f.state"
+  _sa_seed "$sa_f" 55000000 300
+  classify_stuck_alive_sync "Synced!" 55000000 700 "unhealthy" 10240 "yes" "$sa_f" "$NOW_SA"
+  if [[ "$STUCK_ALIVE_SYNC" == "no" ]]; then
+    tap_ok "stuck-alive: dwell not met (frozen_lcl_seconds=300 < 600) → no"
+  else
+    tap_not_ok "stuck-alive: dwell not met → no" "got STUCK_ALIVE_SYNC=$STUCK_ALIVE_SYNC"
+  fi
+
+  # ── Test 63g: frozen counter resets when lcl advances → no (state hygiene) ──
+  # State file says frozen at 55000000 for 700s, but CURRENT_LCL is 55000010
+  # (advanced) → the function must reset frozen_since to NOW and NOT fire.
+  local sa_g="$sa_dir/g.state"
+  _sa_seed "$sa_g" 55000000 700
+  classify_stuck_alive_sync "Synced!" 55000010 700 "unhealthy" 10240 "yes" "$sa_g" "$NOW_SA"
+  local g_result="$STUCK_ALIVE_SYNC"
+  # Verify the state file was rewritten with the new lcl and a fresh frozen_since.
+  local g_frozen_lcl g_frozen_since
+  g_frozen_lcl=$(grep '^frozen_lcl=' "$sa_g" | cut -d= -f2)
+  g_frozen_since=$(grep '^frozen_since_epoch=' "$sa_g" | cut -d= -f2)
+  if [[ "$g_result" == "no" && "$g_frozen_lcl" == "55000010" && "$g_frozen_since" == "$NOW_SA" ]]; then
+    tap_ok "stuck-alive: frozen counter resets when lcl advances → no (state hygiene)"
+  else
+    tap_not_ok "stuck-alive: frozen counter resets when lcl advances → no" \
+      "result=$g_result frozen_lcl=$g_frozen_lcl frozen_since=$g_frozen_since (want no/55000010/$NOW_SA)"
+  fi
+
+  # ── Test 63h: cooldown active (last_restart 300s ago < 900s) → cooldown ─────
+  local sa_h="$sa_dir/h.state"
+  _sa_seed "$sa_h" 55000000 700 "$((NOW_SA - 300))"
+  classify_stuck_alive_sync "Synced!" 55000000 700 "unhealthy" 10240 "yes" "$sa_h" "$NOW_SA"
+  if [[ "$STUCK_ALIVE_SYNC" == "cooldown" ]]; then
+    tap_ok "stuck-alive: cooldown active (last_restart 300s ago) → cooldown (no restart)"
+  else
+    tap_not_ok "stuck-alive: cooldown active → cooldown" "got STUCK_ALIVE_SYNC=$STUCK_ALIVE_SYNC"
+  fi
+
+  # ── Test 63i: max-restarts exceeded (3 in 2h window) → escalate ────────────
+  # 3 restart epochs within the 7200s window, last one > cooldown ago.
+  local sa_i="$sa_dir/i.state"
+  local r1=$((NOW_SA - 6000)) r2=$((NOW_SA - 4000)) r3=$((NOW_SA - 2000))
+  _sa_seed "$sa_i" 55000000 700 "$r3" "$r1 $r2 $r3"
+  classify_stuck_alive_sync "Synced!" 55000000 700 "unhealthy" 10240 "yes" "$sa_i" "$NOW_SA"
+  if [[ "$STUCK_ALIVE_SYNC" == "escalate" ]]; then
+    tap_ok "stuck-alive: max-restarts exceeded (3 in 2h window) → escalate (no restart, urgent)"
+  else
+    tap_not_ok "stuck-alive: max-restarts exceeded → escalate" "got STUCK_ALIVE_SYNC=$STUCK_ALIVE_SYNC"
+  fi
+
+  # ── Test 63j: case-insensitive state match (Validating!/Tracking) → yes ────
+  # Enum-drift robustness: if the /info enum ever emits these, the substring
+  # gate (valid|synced|track) still fires when all other signals hold.
+  local sa_j="$sa_dir/j.state"
+  _sa_seed "$sa_j" 55000000 700
+  classify_stuck_alive_sync "Validating!" 55000000 700 "unhealthy" 10240 "yes" "$sa_j" "$NOW_SA"
+  local j1="$STUCK_ALIVE_SYNC"
+  local sa_j2="$sa_dir/j2.state"
+  _sa_seed "$sa_j2" 55000000 700
+  classify_stuck_alive_sync "Tracking" 55000000 700 "unhealthy" 10240 "yes" "$sa_j2" "$NOW_SA"
+  local j2="$STUCK_ALIVE_SYNC"
+  if [[ "$j1" == "yes" && "$j2" == "yes" ]]; then
+    tap_ok "stuck-alive: case-insensitive state match (Validating!/Tracking) → yes (enum-drift robust)"
+  else
+    tap_not_ok "stuck-alive: case-insensitive state match → yes" "Validating!=$j1 Tracking=$j2"
+  fi
+
+  # ── Test 63k: consistency — SKILL.md references classify_stuck_alive_sync ───
+  local tick_file_sa="$REPO_ROOT/.claude/skills/monitor-tick/SKILL.md"
+  if grep -q 'classify_stuck_alive_sync' "$tick_file_sa"; then
+    tap_ok "consistency: monitor-tick/SKILL.md references classify_stuck_alive_sync"
+  else
+    tap_not_ok "consistency: monitor-tick/SKILL.md references classify_stuck_alive_sync" \
+      "(3e) rung not wired in monitor-tick/SKILL.md"
   fi
 
   # ── Test 64: Tick history capture uses quoted heredoc + datetime.now ────────
