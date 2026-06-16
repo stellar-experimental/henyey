@@ -1314,6 +1314,13 @@ pub(crate) async fn refresh_gauges(state: &ServerState) {
     SCP_VALUE_VALID_TOTAL.absolute(snap.scp.value_valid_total);
     SCP_VALUE_INVALID_TOTAL.absolute(snap.scp.value_invalid_total);
     SCP_NOMINATION_COMBINECANDIDATES_TOTAL.absolute(snap.scp.combine_candidates_total);
+
+    // Feed the medida-compat scp meters (`scp.value.valid`/`scp.value.invalid`)
+    // for the stellar-core-compatible /metrics endpoint by delta-marking the
+    // cumulative totals on this periodic refresh, so marks are spread over time
+    // for a truer EWMA shape than dumping the whole backlog at scrape (#3296).
+    crate::medida_compat::medida_compat()
+        .feed_scp(snap.scp.value_valid_total, snap.scp.value_invalid_total);
 }
 
 // ── Process health helpers ──────────────────────────────────────────────

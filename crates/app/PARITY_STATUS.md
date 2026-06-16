@@ -12,6 +12,7 @@
 | Application lifecycle and runtime wiring | Full | Init, run, catchup, shutdown, recovery loops; `lost_sync_count` metric matches stellar-core single-site `mLostSync.Mark()` (#2612) |
 | Configuration loading and compat translation | Partial | Core TOML and captive-core translation work; many stellar-core helpers omitted |
 | HTTP admin and query surfaces | Partial | Core endpoints exist including generateLoad; several compat admin routes are stubbed or absent |
+| Compat `/metrics` medida rates/percentiles | Partial | EWMA meter rates (`scp.value.valid`/`scp.value.invalid`, `ledger.ledger.close` rate fields) are an **exact** port of medida `ewma.cc`/`meter.cc`; timer/histogram percentiles (`ledger.ledger.close`, `ledger.transaction.count`) use an R7-over-256-sample-ring **documented approximation** of medida's CKMS-30s sample (#3296) — see [Compat `/metrics` medida accumulators](#compat-metrics-medida-accumulators-srcmedida_compatrs) |
 | Catchup and restart recovery | Full | Archive catchup, replay, restart restore, publish flow wired |
 | Persistent state integration | Partial | Critical state persisted through `henyey-db`; some SCP helper APIs absent |
 | Transaction flooding | Partial | Pull-mode advert/demand scheduling; classic flood budgets use stellar-core truncate-then-round integer arithmetic with distinct `FLOOD_TX_PERIOD_MS` for broadcast budget; Soroban advert/demand capacity remains a gap; advert flush cadence is consolidated with broadcast (200 ms) rather than separate (100 ms); removed non-parity `base_fee` overlay pre-filter on `GeneralizedTxSet` receive (stellar-core does zero validation at receive layer); overlay receive layer now matches stellar-core (zero structural validation — all validation deferred to herder via `prepare_for_apply`); buffered ledger close validates tx sets via `prepare_for_apply` before application (matching stellar-core `LedgerManagerImpl.cpp:1542`); flood advert stamping uses `tracking_consensus_ledger_index()` matching stellar-core `Peer::recvFloodAdvert()` (`Peer.cpp:2089`) |
@@ -36,6 +37,7 @@
 | `ApplicationImpl.cpp`, `TransactionQueue.cpp`, `TxAdverts.cpp`, `TxDemandsManager.cpp` | `src/app/tx_flooding.rs` | Tx advert/demand scheduling; classic flood budget rounding matches stellar-core integer arithmetic; broadcast period uses `flood_tx_period_ms` (200 ms, matching `FLOOD_TX_PERIOD_MS`) |
 | `Config.h` / `Config.cpp` | `src/config.rs`, `src/compat_config.rs` | Native TOML config plus stellar-core-format translation |
 | `CommandHandler.h` / `CommandHandler.cpp` | `src/http/mod.rs`, `src/http/handlers/`, `src/compat_http/` | Native Axum server plus compat wire-format server |
+| `lib/libmedida/.../stats/ewma.cc`, `meter.cc`, `stats/snapshot.cc` | `src/medida_compat.rs` | EWMA meter rates (exact); R7-reservoir timer/histogram percentiles (documented CKMS approximation) for the compat `/metrics` endpoint (#3296) |
 | `QueryServer.h` / `QueryServer.cpp` | `src/http/mod.rs`, `src/http/handlers/query.rs` | Separate query server with snapshot lookups |
 | `Maintainer.h` / `Maintainer.cpp` | `src/maintainer.rs` | Automatic background maintenance |
 | `PersistentState.h` / `PersistentState.cpp` | `src/app/mod.rs`, `henyey-db` | App owns usage; storage primitives live in `henyey-db` |
@@ -260,6 +262,44 @@ Features not yet implemented. These ARE counted against parity %.
 - Account-ban persistence has no Rust tests because the subsystem is not implemented. Upstream has 4 TEST_CASE / 21 SECTION.
 - HTTP threaded server behavior (3 TEST_CASE upstream in `HttpThreadedTests.cpp`) has no direct equivalent.
 
+### Compat `/metrics` medida accumulators (`src/medida_compat.rs`)
+
+Corresponds to: `lib/libmedida/src/medida/stats/ewma.cc`, `meter.cc`,
+`stats/snapshot.cc`; reported by `src/compat_http/handlers/metrics.rs`.
+
+stellar-core's `/metrics` endpoint emits medida JSON with in-process EWMA rates
+and timer/histogram percentiles. henyey's native metrics layer is Prometheus-based
+and does not maintain these, so the compat handler previously emitted hardcoded
+`0.0`s. `src/medida_compat.rs` adds in-process accumulators for exactly the four
+metrics SSC missions read (#3296):
+
+| medida metric | henyey accumulator | Parity |
+|---------------|--------------------|--------|
+| `ledger.ledger.close` rate fields (`mean_rate`, `1/5/15_min_rate`) | `EwmaMeter` (embedded, `event_type="calls"`) | **Full** — exact port of `ewma.cc`/`meter.cc`: alphas `1-exp(-5/(60·N))`, 5s lazy `TickIfNecessary`, first-sample seeding, `mean_rate = count·1e9/elapsed_ns` |
+| `scp.value.valid` / `scp.value.invalid` meters | `EwmaMeter` (`event_type="value"`, `HerderSCPDriver.cpp:55,57`) | **Full** — same EWMA port; fed app-side by delta-marking the already-exposed `ScpMetricsSnapshot` cumulative totals on the periodic metrics refresh (no herder→app coupling) |
+| `ledger.ledger.close` / `ledger.transaction.count` percentiles + `min/max/mean/stddev/sum` | `ReservoirSample` (256-entry ring + R7 interpolation) | **Partial** — see divergence below |
+
+**Documented percentile divergence (Partial).** stellar-core's default
+`Timer`/`Histogram` sample is a **CKMS** error-bounded streaming sketch over a
+30-second sliding window (`Timer::GetSnapshot()` → `Snapshot::CKMSImpl::getValue`).
+henyey instead keeps the last **256 observations** in a fixed-capacity ring and
+computes percentiles with the **R7 (Hyndman-Fan) interpolation over a sorted
+vector** copied verbatim from medida's `snapshot.cc Snapshot::VectorImpl::getValue`.
+Two precise differences:
+
+1. **Algorithm:** R7 exact-sorted interpolation vs CKMS error-bounded sketch — the
+   percentile *values* differ.
+2. **Window:** a **256-observation capacity window, NOT a time window** vs CKMS's
+   30-second time window. Under accelerated-time missions (e.g. 1s closes) 256
+   closes span ~256s of history, far wider than 30s, so percentiles are
+   smoother/laggier than stellar-core's.
+
+This is sufficient for SSC's presence/ordering/non-zero assertion class (SSC has
+no oracle for the exact CKMS values a henyey node would produce). `min`/`max`/
+`mean`/`sum` are stored/scaled in milliseconds to match stellar-core's timer
+`duration_unit`. If a mission proves sensitive to the window, the ring capacity
+can be tuned or a real CKMS port landed as a follow-up.
+
 ## Verification Results
 
 - **Testnet verification**: Node successfully syncs and tracks consensus on testnet, closing ledgers in parity with stellar-core validators.
@@ -275,7 +315,7 @@ Features not yet implemented. These ARE counted against parity %.
 
 | Category | Count |
 |----------|-------|
-| Implemented (Full) | 90 |
-| Gaps (None + Partial) | 39 |
+| Implemented (Full) | 92 |
+| Gaps (None + Partial) | 40 |
 | Intentional Omissions | 24 |
-| **Parity** | **90 / (90 + 39) = 70%** |
+| **Parity** | **92 / (92 + 40) = 70%** |

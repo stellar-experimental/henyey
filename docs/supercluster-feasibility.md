@@ -120,18 +120,28 @@ The handler now returns 8 metrics in proper medida JSON format with `type` field
 
 | Metric | Type | Value Source |
 |--------|------|-------------|
-| `ledger.ledger.close` | timer | ledger sequence (count), zero placeholders for rate/percentile |
+| `ledger.ledger.close` | timer | real observation count + EWMA rates (exact) + R7-reservoir percentiles/min/max/mean/stddev/sum (ms, documented approximation) (#3296) |
 | `peer.peer.count` | counter | real authenticated + pending count |
 | `peer.peer.authenticated-count` | counter | real authenticated count |
 | `peer.peer.pending-count` | counter | real pending count |
 | `herder.pending.transactions` | counter | real pending tx count |
 | `ledger.ledger.version` | counter | real protocol version |
-| `scp.value.valid` | meter | ledger sequence (count), zero rate placeholders |
-| `scp.value.invalid` | meter | zero (count + rate) |
+| `ledger.transaction.count` | histogram | real `ledger_tx_count` + R7-reservoir percentiles (#3296) |
+| `scp.value.valid` | meter | real cumulative count + EWMA rates, `event_type="value"` (#3296) |
+| `scp.value.invalid` | meter | real cumulative count + EWMA rates, `event_type="value"` (#3296) |
 
-3 unit tests validate the response shape, type fields, and rate fields.
+Unit tests validate the response shape, type fields, rate fields, and (post-#3296)
+non-zero real rate/percentile values after synthetic observations plus zero-at-startup.
 
-**Remaining gap**: Rate and percentile values are zero placeholders. This is fine for SSC missions that only check metric names and structure, but would need real tracking if SSC makes assertions about rate values.
+**Real metrics tracking (#3296)**: The four SSC-read metrics now emit REAL
+rate/percentile values from in-process accumulators in `crates/app/src/medida_compat.rs`:
+EWMA meter rates are an exact port of medida `ewma.cc`/`meter.cc`; timer/histogram
+percentiles use an R7-over-256-sample-ring **documented approximation** of medida's
+CKMS-30s sample (the algorithm differs — R7 exact-sorted vs CKMS sketch — and the
+window is capacity-based not time-based). Sufficient for SSC presence/ordering/
+non-zero assertions; SSC has no oracle for exact CKMS values. See
+`crates/app/PARITY_STATUS.md`. The other compat metrics' rate/percentile fields
+remain `0.0` placeholders (not SSC-read).
 
 Commit: `fc12e03`
 
@@ -322,7 +332,7 @@ Remaining work:
 
 | Item | Status | Priority |
 |------|--------|----------|
-| Real metrics tracking (rates/percentiles are zero placeholders) | NOT DONE | Low — only needed if SSC checks rate values |
+| Real metrics tracking for the 4 SSC-read metrics (EWMA rates + R7-reservoir percentiles) | DONE (#3296) | — percentiles are a documented CKMS approximation (`crates/app/src/medida_compat.rs`) |
 | Missing loadgen modes (`upgrade_setup`, `create_upgrade`, `pay_pregenerated`, `soroban_invoke_apply_load`) | NOT DONE | Low — deferred until SSC needs them |
 | End-to-end SSC mission validation | NOT DONE | Medium — requires SSC infrastructure |
 | `loadgen` feature verification in SSC deployment path | NOT DONE | Low — feature is enabled by default |
@@ -388,7 +398,7 @@ Candidate work:
 - [x] SSC config fixture parse test
 - [x] response-shape regression tests exist for every new or modified endpoint (36+ tests)
 - [ ] all-Henyey payment mission attempted and results recorded
-- [ ] real metrics tracking (rate/percentile values)
+- [x] real metrics tracking (rate/percentile values) for the 4 SSC-read metrics (#3296; percentiles are a documented CKMS approximation)
 
 ### Phase 3 handoff checklist
 

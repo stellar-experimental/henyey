@@ -61,6 +61,7 @@ pub mod config;
 pub mod http;
 pub mod logging;
 pub mod maintainer;
+pub mod medida_compat;
 pub mod meta_stream;
 pub mod meta_writer;
 pub mod metrics;
