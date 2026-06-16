@@ -7,7 +7,7 @@ use stellar_xdr::curr::LedgerUpgrade;
 use super::types::{ConnectParams, UpgradeItem};
 
 /// Parse connect endpoint parameters into a PeerAddress.
-pub(super) fn parse_connect_params(params: &ConnectParams) -> Result<PeerAddress, String> {
+pub(crate) fn parse_connect_params(params: &ConnectParams) -> Result<PeerAddress, String> {
     if let Some(addr) = params.addr.as_ref() {
         return crate::config::parse_peer_address(addr);
     }
@@ -23,7 +23,7 @@ pub(super) fn parse_connect_params(params: &ConnectParams) -> Result<PeerAddress
 }
 
 /// Parse a peer_id or node parameter into a PeerId.
-pub(super) fn parse_peer_id_params(
+pub(crate) fn parse_peer_id_params(
     peer_id: &Option<String>,
     node: &Option<String>,
 ) -> Result<PeerId, String> {
@@ -59,7 +59,7 @@ pub(super) fn node_id_to_strkey(node_id: &stellar_xdr::curr::NodeId) -> Option<S
 }
 
 /// Convert a PeerId to its strkey representation.
-pub(super) fn peer_id_to_strkey(peer_id: PeerId) -> Option<String> {
+pub(crate) fn peer_id_to_strkey(peer_id: PeerId) -> Option<String> {
     node_id_to_strkey(&stellar_xdr::curr::NodeId(peer_id.0))
 }
 

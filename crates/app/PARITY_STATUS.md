@@ -120,12 +120,26 @@ Corresponds to: `CommandHandler.h`
 | `generateLoad()` | native and compat handlers (feature-gated via `loadgen`) | Full |
 | `testAcc()` | compat handler with deterministic key derivation | Full |
 | `manualClose()` | works, but explicit seq/time params are rejected in compat/native handlers | Partial |
-| `connect()` / `dropPeer()` / `unban()` / `bans()` | native handlers work; compat handlers are placeholders or incomplete | Partial |
+| `connect()` / `dropPeer()` / `unban()` / `bans()` | native and compat handlers wired to overlay/DB side effects; two intentional compat divergences (see note below) | Full |
 | `ll()` | native dynamic log control works; compat handler is minimal | Partial |
 | `logRotate()` | placeholder response only | Partial |
 | `banaccounts()` / `unbanaccounts()` | — | None |
 | legacy survey commands (`surveyTopology()`, `stopSurvey()`, `getSurveyResult()`) | — | None |
 | time-sliced survey commands (`startSurveyCollecting()`, `stopSurveyCollecting()`, `surveyTopologyTimeSliced()`) | native handlers implemented; compat endpoints are stubs | Partial |
+
+**Intentional compat divergences for `connect` / `dropPeer` / `unban` / `bans`** (CommandHandler.cpp:478/~543/566/553), both documented and deliberate:
+
+1. **Trailing newline.** stellar-core's `retStr` carries no `\n`; henyey's compat
+   plain-text handlers append a trailing `\n` by the established compat convention
+   (e.g. `maintenance` → `"Done\n"`), so all compat plain-text endpoints are
+   internally consistent. Message text otherwise byte-matches core
+   (`"Connect to: PEER:PORT"`, `"Drop peer: NODE"`, `"Drop and ban peer: NODE"`,
+   `"Peer NODE not found"`, `"Unban peer: NODE"`, and the two "Must specify…"
+   guidance strings).
+2. **Empty `/bans` shape.** stellar-core's `bans()` emits jsoncpp `{"bans": null}`
+   when no bans exist; henyey emits `{"bans": []}` to match its own native
+   `/bans` (`BansResponse`) and because an empty array is unambiguous. SSC /
+   stellar-rpc consumers treat the two equivalently.
 
 ### Query server (`src/http/mod.rs`, `src/http/handlers/query.rs`)
 
@@ -195,7 +209,6 @@ Features not yet implemented. These ARE counted against parity %.
 | stellar-core Component | Priority | Notes |
 |------------------------|----------|-------|
 | `BannedAccountsPersistor` and `FILTERED_G_ADDRESSES` flow | High | No persisted banned-account subsystem or admin endpoints |
-| Compat `connect` / `droppeer` / `unban` / `bans` behavior | Medium | Compat handlers mostly return placeholders instead of mutating state |
 | Compat time-sliced survey admin routes | Medium | Native routes work; compat routes are still stubs |
 | `manualclose` explicit sequence/close-time parameters | Medium | Upstream standalone semantics are not exposed by handlers |
 | Scheduled online self-check parity | Medium | Manual self-check exists, but upstream periodic scheduling test is unmatched |
@@ -231,7 +244,7 @@ Features not yet implemented. These ARE counted against parity %.
 | Area | stellar-core Tests | Rust Tests | Notes |
 |------|-------------------|------------|-------|
 | Config and compat translation | 9 TEST_CASE / 21 SECTION | 64 `#[test]` | Strong coverage for loading, validation, and captive-core translation |
-| Command handler / compat HTTP | 5 TEST_CASE / 27 SECTION | 46 `#[test]` | Includes handler helpers, generateLoad, testacc; some compat behaviors are still stubs |
+| Command handler / compat HTTP | 5 TEST_CASE / 27 SECTION | 55 `#[test]` | Includes handler helpers, generateLoad, testacc, and live-App peer-admin tests (connect/droppeer/unban/bans); survey compat routes remain stubs |
 | Query server | 1 TEST_CASE / 9 SECTION | 7 `#[test]` | Good coverage of lookup ordering and validation |
 | Run/catchup utilities | 4 TEST_CASE / 5 SECTION | 19 `#[test]` | Target parsing and run-mode helpers are well covered |
 | Self-check scheduling | 1 TEST_CASE / 0 SECTION | 0 `#[test]` | No dedicated periodic self-check scheduling tests |
@@ -242,7 +255,7 @@ Features not yet implemented. These ARE counted against parity %.
 
 ### Test Gaps
 
-- Compat admin endpoints lack parity-style integration tests for real side effects (`connect`, `droppeer`, `unban`, survey control).
+- Compat peer-admin endpoints (`connect`, `droppeer`, `unban`, `bans`) now have live-App tests asserting real overlay/DB side effects; survey-control compat routes still lack parity-style side-effect tests.
 - There is no Rust equivalent of upstream's scheduled online self-check test in `SelfCheckTests.cpp`.
 - Account-ban persistence has no Rust tests because the subsystem is not implemented. Upstream has 4 TEST_CASE / 21 SECTION.
 - HTTP threaded server behavior (3 TEST_CASE upstream in `HttpThreadedTests.cpp`) has no direct equivalent.
