@@ -1735,7 +1735,9 @@ test_testnet_shard_renders_step_timeout_25_others_360() {
 # `sleep 999` (the D-state stand-in — `command -v docker` then finds the fake,
 # so the docker block in capture_diagnostics runs). It runs the wrapper on the
 # retryable testnet/core,horizon shard with --soft-on-timeout and an
-# always-timing-out probe, INSIDE an outer 30s watchdog. It asserts:
+# always-timing-out probe, INSIDE an outer watchdog (sized above the FIXED
+# wrapper's bounded diagnostics cost: two retried attempts each cap one
+# `timeout 30 docker ps -a` at ~30s, ~60s total). It asserts:
 #   (a) the wrapper RETURNS within the watchdog (outer rc != 124 — NOT killed),
 #       proving capture_diagnostics no longer wedges, AND
 #   (b) the probe disposition is preserved: wrapper exit 0 with the grep-able
@@ -1789,10 +1791,17 @@ EOF
 
     local wrapper_log="$TMPDIR_BASE/wrapper-log-test30.txt"
     local outer_rc=0
-    # OUTER 30s watchdog: if capture_diagnostics wedges, run_probe never returns,
-    # the wrapper never reaches the soft-skip, and this outer timeout fires at
-    # 30s with rc 124. A correctly-fixed wrapper returns in ~a few seconds.
-    PATH="$fakebin:$PATH" timeout -k 5s 30 "$WRAPPER" \
+    # OUTER watchdog. It must exceed the FIXED wrapper's bounded
+    # diagnostics cost: the probe times out on attempt 1 AND on the retry (the
+    # testnet/core,horizon shard is retryable), so capture_diagnostics runs
+    # twice, and each fixed `timeout 30 docker ps -a` consumes up to its full 30s
+    # against the fake `sleep 999` (~2 x 30s = ~60s). 90s leaves headroom so the
+    # FIXED wrapper returns inside the watchdog. On UNFIXED main the unbounded
+    # `docker ps -a` sleeps 999s (>> 90s) and never returns, so this outer
+    # timeout fires at 90s with rc 124 — exactly the assertion-(a) failure that
+    # proves the bug. (The bound is the plan's production `timeout 30`; a faster
+    # test bound is not available without weakening the fix under test.)
+    PATH="$fakebin:$PATH" timeout -k 5s 90 "$WRAPPER" \
         --soft-on-timeout \
         --network testnet --enable "core,horizon" --probe horizon-core-up \
         --timeout 2 --diagnostics-dir "$diag_dir" \
