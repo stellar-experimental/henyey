@@ -291,12 +291,12 @@ pub fn add_trustline_balance(tl: &mut TrustLineEntry, delta: i64) -> Result<(), 
 ///
 /// `amount` must be non-negative (use [`add_account_balance`] for credits).
 ///
-/// Returns `BalanceError::Overflow` if `amount` is negative,
+/// Returns `BalanceError::Underflow` if `amount` is negative,
 /// `BalanceError::Underflow` if the result would be negative.
 /// No liability checks — used for debits where the caller has already validated.
 pub fn sub_account_balance(account: &mut AccountEntry, amount: i64) -> Result<(), BalanceError> {
     if amount < 0 {
-        return Err(BalanceError::Overflow);
+        return Err(BalanceError::Underflow);
     }
     let new_balance = CheckedAmount::new(account.balance)
         .checked_sub(amount)
@@ -312,12 +312,12 @@ pub fn sub_account_balance(account: &mut AccountEntry, amount: i64) -> Result<()
 ///
 /// `amount` must be non-negative (use [`add_trustline_balance`] for credits).
 ///
-/// Returns `BalanceError::Overflow` if `amount` is negative,
+/// Returns `BalanceError::Underflow` if `amount` is negative,
 /// `BalanceError::Underflow` if the result would be negative.
 /// No liability or limit checks.
 pub fn sub_trustline_balance(tl: &mut TrustLineEntry, amount: i64) -> Result<(), BalanceError> {
     if amount < 0 {
-        return Err(BalanceError::Overflow);
+        return Err(BalanceError::Underflow);
     }
     let new_balance = CheckedAmount::new(tl.balance)
         .checked_sub(amount)
@@ -635,7 +635,7 @@ mod tests {
         let mut acc = make_account(100);
         assert_eq!(
             sub_account_balance(&mut acc, -1),
-            Err(BalanceError::Overflow)
+            Err(BalanceError::Underflow)
         );
         assert_eq!(acc.balance, 100); // unchanged
     }
@@ -662,7 +662,7 @@ mod tests {
         let mut tl = make_trustline(100, 1000);
         assert_eq!(
             sub_trustline_balance(&mut tl, -1),
-            Err(BalanceError::Overflow)
+            Err(BalanceError::Underflow)
         );
         assert_eq!(tl.balance, 100); // unchanged
     }
