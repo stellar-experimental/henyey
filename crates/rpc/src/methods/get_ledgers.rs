@@ -27,9 +27,7 @@ pub async fn handle(
     // Parse parameters
     let start_ledger = util::param_u32(&params, "startLedger")?;
 
-    let pagination = util::param_object(&params, "pagination")?;
-    let empty_obj = serde_json::Value::Null;
-    let pag = pagination.unwrap_or(&empty_obj);
+    let pag = util::param_object_or_null(&params, "pagination")?;
     let cursor_str = util::param_str(pag, "cursor")?;
     let limit = util::param_u32(pag, "limit")?;
 
@@ -94,12 +92,11 @@ pub async fn handle(
         ledgers.push(serde_json::Value::Object(obj));
     }
 
-    let mut result = json!({
-        "ledgers": ledgers,
-        "cursor": last_cursor
-    });
-    lctx.insert_json_fields(result.as_object_mut().unwrap());
-    Ok(result)
+    let mut result = serde_json::Map::new();
+    result.insert("ledgers".into(), json!(ledgers));
+    result.insert("cursor".into(), json!(last_cursor));
+    lctx.insert_json_fields(&mut result);
+    Ok(serde_json::Value::Object(result))
 }
 
 /// Validate getLedgers pagination. Cursor is a plain ledger sequence.

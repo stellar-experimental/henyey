@@ -37,9 +37,7 @@ pub async fn handle(
     let (event_type, contract_ids, topic_filters) = parse_event_filters(filters_array)?;
 
     // Parse pagination
-    let pagination = util::param_object(&params, "pagination")?;
-    let empty_obj = serde_json::Value::Null;
-    let pag = pagination.unwrap_or(&empty_obj);
+    let pag = util::param_object_or_null(&params, "pagination")?;
     let limit = util::param_u32(pag, "limit")?
         .map(|v| v as u64)
         .unwrap_or(DEFAULT_EVENTS_LIMIT)
@@ -159,14 +157,16 @@ pub async fn handle(
 
     let last_cursor = events.last().map(|e| e.id.as_str()).unwrap_or("");
 
-    let mut result = json!({
-        "events": event_json,
-        "cursor": last_cursor,
-    });
-    lctx.insert_json_fields(result.as_object_mut().unwrap());
+    let mut result = serde_json::Map::new();
+    result.insert("events".into(), json!(event_json));
+    result.insert("cursor".into(), json!(last_cursor));
+    lctx.insert_json_fields(&mut result);
     // get_events formats oldestLedgerCloseTime as ISO 8601 (unlike other handlers)
-    result["oldestLedgerCloseTime"] = json!(format_unix_timestamp_utc(lctx.oldest_close_time));
-    Ok(result)
+    result.insert(
+        "oldestLedgerCloseTime".into(),
+        json!(format_unix_timestamp_utc(lctx.oldest_close_time)),
+    );
+    Ok(serde_json::Value::Object(result))
 }
 
 /// Maximum number of filters allowed per request.

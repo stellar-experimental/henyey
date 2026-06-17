@@ -391,9 +391,7 @@ pub async fn handle(
     let auth_mode_str = util::param_str(&params, "authMode")?.unwrap_or("");
 
     // Parse resourceConfig parameter
-    let resource_config = util::param_object(&params, "resourceConfig")?;
-    let empty_obj = serde_json::Value::Null;
-    let rc = resource_config.unwrap_or(&empty_obj);
+    let rc = util::param_object_or_null(&params, "resourceConfig")?;
     let instruction_leeway: u32 = util::param_u32(rc, "instructionLeeway")?.unwrap_or(0);
 
     let sim = SimulationContext::from_app(&*ctx.app).await?;
