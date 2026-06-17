@@ -1432,7 +1432,7 @@ mod tests {
         let resolved = ResolvedPeer {
             original: addr.clone(),
             resolved: format!("{}:{}", addr.host, addr.port).parse().unwrap(),
-            key: addr_key.clone(),
+            key: addr_key,
         };
 
         let start = Instant::now();
@@ -1841,7 +1841,7 @@ mod tests {
         let addr_ip = PeerAddress::new("127.0.0.1", 11625);
         let (_, key1) = resolve_peer_address(&addr_ip).await.unwrap();
         assert!(
-            pending.try_reserve_address(key1.clone()),
+            pending.try_reserve_address(key1),
             "first reservation should succeed"
         );
 
@@ -2290,7 +2290,7 @@ mod tests {
         let resolved = ResolvedPeer {
             original: addr.clone(),
             resolved: format!("{}:{}", addr.host, addr.port).parse().unwrap(),
-            key: addr_key.clone(),
+            key: addr_key,
         };
 
         OverlayManager::connect_to_discovered_peer(
@@ -2369,7 +2369,7 @@ mod tests {
         let resolved = ResolvedPeer {
             original: addr.clone(),
             resolved: format!("{}:{}", addr.host, addr.port).parse().unwrap(),
-            key: addr_key.clone(),
+            key: addr_key,
         };
 
         OverlayManager::connect_to_discovered_peer(

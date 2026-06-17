@@ -2373,7 +2373,7 @@ mod tests {
 
         // Mix of IPv4 and IPv6
         let msg = OverlayManager::build_peers_message(
-            &[ipv4_peer.clone()],
+            std::slice::from_ref(&ipv4_peer),
             &[ipv6_peer, ipv6_full],
             None,
         );
@@ -2411,17 +2411,17 @@ mod tests {
         ));
 
         assert!(
-            pending.try_reserve_address(addr.clone()),
+            pending.try_reserve_address(addr),
             "first reservation should succeed"
         );
         assert!(
-            !pending.try_reserve_address(addr.clone()),
+            !pending.try_reserve_address(addr),
             "duplicate reservation should fail"
         );
 
         pending.release_address(&addr);
         assert!(
-            pending.try_reserve_address(addr.clone()),
+            pending.try_reserve_address(addr),
             "should succeed after release"
         );
 
@@ -2490,12 +2490,12 @@ mod tests {
 
         // Insert with a backdated timestamp
         pending.by_address.insert(
-            addr.clone(),
+            addr,
             std::time::Instant::now() - std::time::Duration::from_secs(60),
         );
 
         assert!(
-            !pending.try_reserve_address(addr.clone()),
+            !pending.try_reserve_address(addr),
             "stale entry still blocks before sweep"
         );
 
@@ -3461,9 +3461,8 @@ mod tests {
             for _ in 0..5 {
                 let cancelled = Arc::clone(&cancelled);
                 handles.push(tokio::spawn(async move {
-                    match tokio::time::sleep(Duration::from_secs(3600)).await {
-                        () => {} // Would only reach here if not aborted
-                    }
+                    // Would only complete here if not aborted.
+                    tokio::time::sleep(Duration::from_secs(3600)).await;
                     // If the task completes normally (not aborted), this
                     // wouldn't run because sleep(3600) in paused-time
                     // only resolves via time advance. Abort cancels it.
