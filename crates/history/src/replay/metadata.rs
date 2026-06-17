@@ -4,14 +4,22 @@
 //! entry changes. This produces identical results to the original execution
 //! and is used for testing and specialized replay scenarios.
 
+// `metadata.rs` provides metadata-based ledger replay, which is currently
+// exercised only by tests. All items below are therefore `#[cfg(test)]`-gated,
+// along with the imports that support them.
+#[cfg(test)]
 use crate::{verify, HistoryError, Result};
+#[cfg(test)]
 use henyey_ledger::TransactionSetVariant;
+#[cfg(test)]
 use stellar_xdr::curr::{
     LedgerEntry, LedgerHeader, LedgerKey, TransactionMeta, TransactionResultPair,
     TransactionResultSet, WriteXdr,
 };
 
+#[cfg(test)]
 use super::execution::soroban_entry_size;
+#[cfg(test)]
 use super::{LedgerReplayResult, ReplayConfig};
 
 /// Replays a single ledger from history data.
@@ -30,6 +38,7 @@ use super::{LedgerReplayResult, ReplayConfig};
 /// # Returns
 ///
 /// A `LedgerReplayResult` containing the changes to apply to ledger state.
+#[cfg(test)]
 pub(crate) fn replay_ledger(
     header: &LedgerHeader,
     tx_set: &TransactionSetVariant,
@@ -101,12 +110,14 @@ pub(crate) fn replay_ledger(
 /// - live_entries: Entries that were updated or restored
 /// - dead_entries: Keys of entries that were deleted
 /// Accumulated ledger entry changes from transaction meta.
+#[cfg(test)]
 struct LedgerChanges {
     init: Vec<LedgerEntry>,
     live: Vec<LedgerEntry>,
     dead: Vec<LedgerKey>,
 }
 
+#[cfg(test)]
 impl LedgerChanges {
     fn new() -> Self {
         Self {
@@ -132,6 +143,7 @@ impl LedgerChanges {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn extract_ledger_changes(
     tx_metas: &[TransactionMeta],
 ) -> Result<(Vec<LedgerEntry>, Vec<LedgerEntry>, Vec<LedgerKey>)> {
@@ -141,6 +153,7 @@ pub(crate) fn extract_ledger_changes(
 }
 
 /// Count the total number of operations in a transaction set.
+#[cfg(test)]
 fn count_operations(tx_set: &TransactionSetVariant) -> u32 {
     tx_set
         .transactions()
