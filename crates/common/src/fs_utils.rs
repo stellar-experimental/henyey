@@ -706,7 +706,7 @@ mod tests {
         let items: Vec<Result<Hash, TestError>> =
             vec![Ok(Hash([0u8; 32])), Ok(Hash([1u8; 32])), Err(TestError)];
 
-        let result = atomic_gzip_xdr_write_iter(&path, items.into_iter());
+        let result = atomic_gzip_xdr_write_iter(&path, items);
         assert!(result.is_err());
         assert!(!path.exists(), "final_path must not exist on error");
         assert_eq!(
