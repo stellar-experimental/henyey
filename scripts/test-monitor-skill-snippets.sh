@@ -9790,6 +9790,35 @@ BOARDEOF
   else
     tap_not_ok "classify_path: stellar-specs submodule → no-impact" "got '$(_cls "stellar-specs")'"
   fi
+  # Container-image files (#3307): Dockerfile / .dockerignore / *.dockerfile are
+  # never read by `cargo build --release -p henyey`, so they cannot change the
+  # compiled binary. Route them through no-impact so a Dockerfile-only delta hits
+  # the authoritative §10-step-2a binary byte-compare instead of a needless
+  # rebuild+restart. (Safe ONLY because the monitor runs the locally-compiled
+  # release/henyey, not the Docker image — see monitor-decisions.sh comment.)
+  if [[ "$(_cls "Dockerfile")" == "no-impact" ]]; then
+    tap_ok "classify_path: Dockerfile → no-impact"
+  else
+    tap_not_ok "classify_path: Dockerfile → no-impact" "got '$(_cls "Dockerfile")'"
+  fi
+  if [[ "$(_cls ".dockerignore")" == "no-impact" ]]; then
+    tap_ok "classify_path: .dockerignore → no-impact"
+  else
+    tap_not_ok "classify_path: .dockerignore → no-impact" "got '$(_cls ".dockerignore")'"
+  fi
+  if [[ "$(_cls "foo.dockerfile")" == "no-impact" ]]; then
+    tap_ok "classify_path: *.dockerfile → no-impact"
+  else
+    tap_not_ok "classify_path: *.dockerfile → no-impact" "got '$(_cls "foo.dockerfile")'"
+  fi
+  # CONTRAST / deliberate boundary (#3307): docker-compose*.yml is intentionally
+  # NOT allowlisted — it stays on the rebuild fail-safe. This assertion locks
+  # that scope boundary so a future allowlist edit can't silently absorb it.
+  if [[ "$(_cls "docker-compose.yml")" == "rebuild" ]]; then
+    tap_ok "classify_path: docker-compose.yml → rebuild (deliberate boundary)"
+  else
+    tap_not_ok "classify_path: docker-compose.yml → rebuild (deliberate boundary)" "got '$(_cls "docker-compose.yml")'"
+  fi
   if [[ "$(_cls "crates/app/tests/publish_tests.rs")" == "test-only" ]]; then
     tap_ok "classify_path: crates/*/tests/** → test-only"
   else
