@@ -50,7 +50,6 @@ graph TD
 | `XdrOutputStream` | Buffered writer for stellar-core-compatible size-prefixed XDR frames |
 | `DurableXdrOutputStream` | XDR frame writer that flushes and fsyncs each entry for crash safety |
 | `XdrInputStream` | Reader for the same framed XDR format used by stellar-core streams |
-| `MemoryEstimate` | Trait for O(1) approximate heap accounting of components |
 | `ComponentMemory` | Named memory measurement used for reporting heap or file-backed component usage |
 
 ## Usage

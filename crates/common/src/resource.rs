@@ -211,18 +211,6 @@ impl Resource {
         self.values[ty as usize]
     }
 
-    /// Sets the value for a specific resource type, returning `false` if out of bounds.
-    ///
-    /// This is the safe variant that does not panic.
-    pub fn try_set_val(&mut self, ty: ResourceType, val: i64) -> bool {
-        if let Some(slot) = self.values.get_mut(ty as usize) {
-            *slot = val;
-            true
-        } else {
-            false
-        }
-    }
-
     /// Sets the value for a specific resource type.
     ///
     /// # Panics
