@@ -595,7 +595,10 @@ pub fn translate_stellar_core_config(raw: &toml::Value) -> anyhow::Result<AppCon
                     })?;
                     keys.push(secret.public_key().to_strkey());
                 } else {
-                    keys.push(s.clone());
+                    // stellar-core format: "$PUBKEY $NAME" (key+name space-separated).
+                    // Split on whitespace and keep only the first token (the public key).
+                    let key = s.split_whitespace().next().unwrap_or(s);
+                    keys.push(key.to_string());
                 }
             }
             // [QUORUM_SET] always overrides [[VALIDATORS]]-generated quorum set.
@@ -783,7 +786,20 @@ fn translate_invariant_config(table: &toml::map::Map<String, toml::Value>, confi
         if let Some(arr) = value.as_array() {
             config.invariants.checks = arr
                 .iter()
-                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .filter_map(|v| {
+                    v.as_str().map(|s| {
+                        // stellar-core uses negative-lookahead regex syntax for
+                        // exclusion patterns (e.g. "(?!EventsAreConsistentWithEntryDiffs).*").
+                        // Rust's regex engine does not support lookahead. Since henyey
+                        // does not register the excluded invariant, these patterns are
+                        // equivalent to ".*" (match all registered invariants).
+                        if s.starts_with("(?!") && s.ends_with(").*") {
+                            ".*".to_string()
+                        } else {
+                            s.to_string()
+                        }
+                    })
+                })
                 .collect();
         }
     }
@@ -1824,6 +1840,51 @@ mod tests {
         let result = translate_stellar_core_config(&core_toml);
         assert!(result.is_err(), "Should fail when PUBLIC_KEY is missing");
         assert!(result.unwrap_err().to_string().contains("PUBLIC_KEY"));
+    }
+
+    #[test]
+    fn test_quorum_set_pubkey_name_format() {
+        // SSC writes explicit quorum set validators as "$PUBKEY $NAME" (e.g.
+        // "GB... core-new-0"). stellar-core splits on whitespace. Henyey must
+        // extract only the public key.
+        let core_toml: toml::Value = toml::from_str(
+            r#"
+            NETWORK_PASSPHRASE = "Standalone Network ; February 2017"
+            NODE_SEED = "SDQVDISRYN2JXBS7ICL7QJAEKB3HWBJFP2QECXG7GZICAHBK4UNJCWK2 self"
+            NODE_IS_VALIDATOR = true
+            UNSAFE_QUORUM = true
+            FAILURE_SAFETY = 0
+            [QUORUM_SET]
+            THRESHOLD_PERCENT = 100
+            VALIDATORS = [
+                "$self",
+                "GDKXE2OZMJIPOSLNA6N6F2BVCI3O777I2OOC4BV7VOYUEHYX7RTRYA7Y core-new-0",
+                "GCUCJTIYXSOXKBSNFGNFWW5MUQ54HKRPGJUTQFJ5RQXZXNOLNXYDHRAP core-old-0",
+            ]
+            "#,
+        )
+        .unwrap();
+
+        let config = translate_stellar_core_config(&core_toml).unwrap();
+        assert_eq!(config.node.quorum_set.validators.len(), 3);
+        // $self resolves to the node's own key
+        let self_pubkey = henyey_crypto::SecretKey::from_strkey(
+            "SDQVDISRYN2JXBS7ICL7QJAEKB3HWBJFP2QECXG7GZICAHBK4UNJCWK2",
+        )
+        .unwrap()
+        .public_key()
+        .to_strkey();
+        assert_eq!(config.node.quorum_set.validators[0], self_pubkey);
+        // pubkey+name entries are split on whitespace, extracting only the key
+        assert_eq!(
+            config.node.quorum_set.validators[1],
+            "GDKXE2OZMJIPOSLNA6N6F2BVCI3O777I2OOC4BV7VOYUEHYX7RTRYA7Y"
+        );
+        assert_eq!(
+            config.node.quorum_set.validators[2],
+            "GCUCJTIYXSOXKBSNFGNFWW5MUQ54HKRPGJUTQFJ5RQXZXNOLNXYDHRAP"
+        );
+        assert_eq!(config.node.quorum_set.threshold_percent, 100);
     }
 
     #[test]
@@ -3791,6 +3852,22 @@ NODE_SEED="SBXTJSLKQ2VZUEQNYU5EC6ZGQOONCX3JCFBK57R56YLYMUW76B2FMCJH self"
         let raw: toml::Value = toml::from_str(&toml_str).unwrap();
         let config = translate_stellar_core_config(&raw).unwrap();
         assert_eq!(config.invariants.checks, vec!["ConservationOfLumens"]);
+    }
+
+    #[test]
+    fn test_invariant_checks_negative_lookahead_translated() {
+        // stellar-core uses negative-lookahead regex syntax like
+        // "(?!EventsAreConsistentWithEntryDiffs).*" for INVARIANT_CHECKS.
+        // Rust regex does not support lookahead, so henyey translates
+        // these to ".*" (since henyey does not register the excluded
+        // invariant, the patterns are equivalent).
+        let toml_str = format!(
+            "{}\nINVARIANT_CHECKS = [\"(?!EventsAreConsistentWithEntryDiffs).*\"]\n",
+            minimal_compat_toml()
+        );
+        let raw: toml::Value = toml::from_str(&toml_str).unwrap();
+        let config = translate_stellar_core_config(&raw).unwrap();
+        assert_eq!(config.invariants.checks, vec![".*"]);
     }
 
     #[test]
