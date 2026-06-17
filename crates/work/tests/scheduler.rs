@@ -537,3 +537,136 @@ async fn test_retry_does_not_block_other_completions() {
     // A should be cancelled (it was waiting for its 10s retry timer)
     assert_eq!(scheduler.state(a), Some(WorkState::Cancelled));
 }
+
+// ============================================================================
+// Cancel-During-Run Guard Test (Finding 3 — merged select! invariant)
+// ============================================================================
+
+/// Guard test for the unified `tokio::select!` in `run_until_done_with_cancel`.
+///
+/// The scheduler loop polls cancellation, JoinSet completions, and retry timers
+/// in a single `biased;` select with a `_ = cancel.cancelled(), if !cancel_requested`
+/// arm and an `else => break` arm. This test pins the exact cancellation
+/// transition that the merged form must preserve. It must FAIL if a future
+/// refactor drops `biased;` (cancel-precedence ordering), the `if !cancel_requested`
+/// guard (would re-fire `cancel_all`/`retry_timers.clear()` and could deadlock or
+/// loop), or the `else => break` arm (reintroduces the all-branches-disabled
+/// `select!` panic on the post-cancel quiescence iteration).
+///
+/// Two sub-cases:
+///   1. Cancel mid-run: an in-flight item reaches `Cancelled`, while a sibling
+///      that finished *before* the cancel keeps `Success` (cancel-precedence +
+///      `cancel_all()` + no clobber of completed work).
+///   2. `max_concurrency = 1` with one running + one queued, cancel the token so
+///      that post-cancel both `running` and `retry_timers` drain — forcing the
+///      merged form's unique `else => break` arm.
+#[tokio::test]
+async fn test_cancel_during_run_preserves_transition() {
+    // -- Sub-case 1: cancel mid-run, sibling finished pre-cancel keeps Success --
+    {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut scheduler = WorkScheduler::new(WorkSchedulerConfig {
+            max_concurrency: 2,
+            retry_delay: Duration::from_millis(1),
+            event_tx: None,
+        });
+
+        // Sibling completes immediately (well before the cancel signal fires).
+        let sibling = scheduler.add_work(
+            Box::new(LogWork {
+                name: "sibling".to_string(),
+                log: Arc::clone(&log),
+            }),
+            vec![],
+            0,
+        );
+
+        // In-flight item polls is_cancelled() in a 5x5ms loop (~25ms total).
+        let in_flight = scheduler.add_work(
+            Box::new(CancellableWork {
+                name: "in-flight".to_string(),
+            }),
+            vec![],
+            0,
+        );
+
+        // Cancel after 8ms: the sibling has already completed (Success), the
+        // in-flight item is still parked polling is_cancelled().
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let cancel_clone = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(8)).await;
+            cancel_clone.cancel();
+        });
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            scheduler.run_until_done_with_cancel(cancel),
+        )
+        .await;
+        assert!(result.is_ok(), "scheduler hung on cancel-during-run");
+
+        // Cancel-precedence + cancel_all(): the in-flight item is Cancelled.
+        assert_eq!(
+            scheduler.state(in_flight),
+            Some(WorkState::Cancelled),
+            "in-flight item should be Cancelled, not Success/Failed"
+        );
+        // No clobber of already-completed work: the sibling keeps Success.
+        assert_eq!(
+            scheduler.state(sibling),
+            Some(WorkState::Success),
+            "sibling that finished before cancel must retain Success"
+        );
+        assert_eq!(log.lock().unwrap().as_slice(), ["sibling"]);
+    }
+
+    // -- Sub-case 2: post-cancel quiescence forces the `else => break` arm --
+    {
+        let mut scheduler = WorkScheduler::new(WorkSchedulerConfig {
+            max_concurrency: 1,
+            retry_delay: Duration::from_millis(1),
+            event_tx: None,
+        });
+
+        // One running + one queued (serialized by max_concurrency = 1).
+        let first = scheduler.add_work(
+            Box::new(CancellableWork {
+                name: "first".to_string(),
+            }),
+            vec![],
+            0,
+        );
+        let second = scheduler.add_work(
+            Box::new(CancellableWork {
+                name: "second".to_string(),
+            }),
+            vec![],
+            0,
+        );
+
+        // Cancel while `first` is in flight. After it is cancelled-and-joined,
+        // `second` is started-then-immediately-cancelled and drains; once both
+        // `running` and `retry_timers` are empty the post-cancel select has all
+        // non-`else` arms disabled, so it must take `else => break`.
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let cancel_clone = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(8)).await;
+            cancel_clone.cancel();
+        });
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            scheduler.run_until_done_with_cancel(cancel),
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "scheduler hung draining post-cancel (else => break arm)"
+        );
+
+        assert_eq!(scheduler.state(first), Some(WorkState::Cancelled));
+        assert_eq!(scheduler.state(second), Some(WorkState::Cancelled));
+    }
+}

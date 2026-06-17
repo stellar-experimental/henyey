@@ -10,8 +10,8 @@ use tracing::{debug, error, info, warn};
 
 use futures::StreamExt as _;
 
-use crate::types::EventSender;
-use crate::{Work, WorkContext, WorkEvent, WorkId, WorkOutcome, WorkState};
+use crate::types::{EventSender, WorkEvent};
+use crate::{Work, WorkContext, WorkId, WorkOutcome, WorkState};
 
 /// Configuration for the work scheduler.
 ///
@@ -463,47 +463,39 @@ impl WorkScheduler {
 
             // Poll JoinSet, retry timers, and cancellation concurrently.
             // This ensures retry delays never block completion handling.
-            if cancel_requested {
-                tokio::select! {
-                    result = join_set.join_next(), if !running.is_empty() => {
-                        let Some(join_result) = result else { break };
-                        self.handle_join_result(
-                            join_result, &mut running, &mut queue, &mut retry_timers,
-                        );
-                    }
-                    expired = retry_timers.next(), if !retry_timers.is_empty() => {
-                        if let Some(expired) = expired {
-                            let id = expired.into_inner();
-                            if self.state_or_pending(id) == WorkState::Pending {
-                                queue.push(id);
-                            }
-                        }
-                    }
-                    else => break,
+            //
+            // `biased;` polls the arms top-down, keeping cancellation
+            // highest-priority ("cancel takes precedence"). The cancel arm is
+            // guarded by `if !cancel_requested`, so once cancellation has been
+            // observed it is disabled. The `else => break` arm is therefore
+            // reachable only post-cancel — when the cancel arm is disabled and
+            // both remaining arms are also disabled (`running` and
+            // `retry_timers` both empty). Without it, `tokio::select!` panics
+            // when every branch is disabled. Do NOT drop it.
+            tokio::select! {
+                biased;
+
+                _ = cancel.cancelled(), if !cancel_requested => {
+                    cancel_requested = true;
+                    self.cancel_all();
+                    retry_timers.clear();
+                    continue;
                 }
-            } else {
-                tokio::select! {
-                    _ = cancel.cancelled() => {
-                        cancel_requested = true;
-                        self.cancel_all();
-                        retry_timers.clear();
-                        continue;
-                    }
-                    result = join_set.join_next(), if !running.is_empty() => {
-                        let Some(join_result) = result else { break };
-                        self.handle_join_result(
-                            join_result, &mut running, &mut queue, &mut retry_timers,
-                        );
-                    }
-                    expired = retry_timers.next(), if !retry_timers.is_empty() => {
-                        if let Some(expired) = expired {
-                            let id = expired.into_inner();
-                            if self.state_or_pending(id) == WorkState::Pending {
-                                queue.push(id);
-                            }
+                result = join_set.join_next(), if !running.is_empty() => {
+                    let Some(join_result) = result else { break };
+                    self.handle_join_result(
+                        join_result, &mut running, &mut queue, &mut retry_timers,
+                    );
+                }
+                expired = retry_timers.next(), if !retry_timers.is_empty() => {
+                    if let Some(expired) = expired {
+                        let id = expired.into_inner();
+                        if self.state_or_pending(id) == WorkState::Pending {
+                            queue.push(id);
                         }
                     }
                 }
+                else => break,
             }
         }
 

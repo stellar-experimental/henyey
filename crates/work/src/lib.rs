@@ -101,4 +101,4 @@ mod scheduler;
 mod types;
 
 pub use scheduler::{WorkScheduler, WorkSchedulerConfig, WorkSchedulerMetrics};
-pub use types::{Work, WorkContext, WorkEvent, WorkId, WorkOutcome, WorkState};
+pub use types::{Work, WorkContext, WorkId, WorkOutcome, WorkState};
