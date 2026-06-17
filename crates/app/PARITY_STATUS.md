@@ -118,6 +118,7 @@ Corresponds to: `CommandHandler.h`
 | stellar-core | Rust | Status |
 |--------------|------|--------|
 | `info()` / `metrics()` / `peers()` / `quorum()` / `scpInfo()` / `tx()` / `upgrades()` / `dumpProposedSettings()` / `sorobanInfo()` | native and compat handlers | Full |
+| `upgrades()` `mode=set` parameter set | compat handler parses the full SSC param set 1:1 with `CommandHandler.cpp:613-671`; validated offline (#3300) by `test_upgrades_set_parses_full_ssc_param_set`; two read/validation divergences documented below | Full (set path) |
 | `maintenance()` / `clearMetrics()` / `selfCheck()` | native and compat handlers | Full |
 | `generateLoad()` | native and compat handlers (feature-gated via `loadgen`) | Full |
 | `testAcc()` | compat handler with deterministic key derivation | Full |
@@ -142,6 +143,30 @@ Corresponds to: `CommandHandler.h`
    when no bans exist; henyey emits `{"bans": []}` to match its own native
    `/bans` (`BansResponse`) and because an empty array is unambiguous. SSC /
    stellar-rpc consumers treat the two equivalently.
+
+**Documented `/upgrades` read/validation divergences (#3300).** The
+parity-load-bearing path for an SSC protocol-upgrade mission is `mode=set`
+(the harness drives upgrades by setting them); that path parses the exact
+stellar-core parameter set (`upgradetime`, `protocolversion`, `basefee`,
+`basereserve`, `maxtxsetsize`, `flags`, base64 `configupgradesetkey`,
+`maxsorobantxsetsize`, `nominationtimeoutlimit`, `expirationminutes`) and is
+pinned 1:1 by `test_upgrades_set_parses_full_ssc_param_set`. Two divergences are
+on read/validation-feedback paths the mission's SET→observe-externalize flow
+does not require — recorded here as **candidate follow-ups**, not fixed in the
+validation PR:
+
+1. **Empty-mode read shape.** stellar-core returns `"mode required"` on empty
+   mode and serializes `getUpgradesJson()` (`{time,version,fee,maxtxsize,reserve}`,
+   `Upgrades.cpp:58-62`) only under `mode=get`. Henyey returns a bespoke
+   `{current,scheduled}` body on the empty/default mode. Follow-up only if the
+   live mission reads upgrade state via `/upgrades?mode=get`.
+2. **SET-time `configupgradesetkey` validation.** stellar-core validates the key
+   via `ConfigUpgradeSetFrame::makeFromKey` + `isValidForApply` at SET time and
+   rejects an invalid key with `"Error setting configUpgradeSet"`
+   (`CommandHandler.cpp:648-655`). Henyey decodes the key but **defers** validity
+   to nomination/apply (an invalid key simply never nominates). Likely benign,
+   but loud-vs-silent rejection differs. Follow-up only if the live mission
+   relies on SET-time rejection feedback.
 
 ### Query server (`src/http/mod.rs`, `src/http/handlers/query.rs`)
 
