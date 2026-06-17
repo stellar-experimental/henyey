@@ -50,7 +50,7 @@ use crate::BucketError;
 /// Version 3: Page size changed from entry-count to byte-offset semantics.
 /// Version 4: Added entry_type_sizes to counters.
 /// Version 5: Added bucket_hash, bucket_file_size, and data_checksum for integrity.
-pub const BUCKET_INDEX_VERSION: u32 = 5;
+pub(crate) const BUCKET_INDEX_VERSION: u32 = 5;
 
 // ============================================================================
 // Serializable Types

@@ -58,7 +58,7 @@ const BLOOM_FILTER_MIN_ENTRIES: usize = 2;
 
 /// Default hash seed for bloom filter construction.
 /// This is used when no custom seed is provided.
-pub const DEFAULT_BLOOM_SEED: HashSeed = [0u8; 16];
+pub(crate) const DEFAULT_BLOOM_SEED: HashSeed = [0u8; 16];
 
 /// A disk-backed bucket that stores entries on disk with an in-memory index.
 ///
