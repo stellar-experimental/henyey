@@ -19,7 +19,7 @@ const DEFAULT_EVENTS_LIMIT: u64 = 100;
 const MAX_EVENTS_LIMIT: u64 = 10_000;
 
 // SECURITY: request body bounded by HTTP framework body size limit; serde rejects invalid types
-pub async fn handle(
+pub(crate) async fn handle(
     ctx: &Arc<RpcContext>,
     params: serde_json::Value,
 ) -> Result<serde_json::Value, JsonRpcError> {

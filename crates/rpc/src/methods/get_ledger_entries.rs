@@ -16,7 +16,7 @@ use henyey_bucket::SearchableBucketListSnapshot;
 const MAX_KEYS: usize = 200;
 
 // SECURITY: request body bounded by HTTP framework body size limit; serde rejects invalid types
-pub async fn handle(
+pub(crate) async fn handle(
     ctx: &Arc<RpcContext>,
     params: serde_json::Value,
 ) -> Result<serde_json::Value, JsonRpcError> {

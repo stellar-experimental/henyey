@@ -11,7 +11,7 @@ use crate::context::RpcContext;
 use crate::error::JsonRpcError;
 use crate::fee_window::FeeDistribution;
 
-pub async fn handle(ctx: &Arc<RpcContext>) -> Result<serde_json::Value, JsonRpcError> {
+pub(crate) async fn handle(ctx: &Arc<RpcContext>) -> Result<serde_json::Value, JsonRpcError> {
     let ledger = ctx.app.ledger_summary();
 
     let classic = ctx.fee_windows.get_classic_distribution();

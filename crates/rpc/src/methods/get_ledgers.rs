@@ -16,7 +16,7 @@ const DEFAULT_LEDGER_LIMIT: u32 = 5;
 /// Maximum number of ledgers that can be requested in a single query.
 const MAX_LEDGER_LIMIT: u32 = 200;
 
-pub async fn handle(
+pub(crate) async fn handle(
     ctx: &Arc<RpcContext>,
     params: serde_json::Value,
 ) -> Result<serde_json::Value, JsonRpcError> {
