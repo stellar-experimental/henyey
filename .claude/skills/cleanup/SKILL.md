@@ -57,6 +57,13 @@ interpretation, no LLM calls yet** — just collect facts.
      the report and treat **all** files as not parity-mapped (no parity
      suppression applies). Surface "PARITY_STATUS.md missing" as a Lane C
      finding.
+   - If `PARITY_STATUS.md` exists and declares `Upstream: No direct stellar-core
+     source equivalent` (the "scoped contract" case — e.g. `henyey-clock`),
+     treat **all** files as not parity-mapped for Lane C structural suppression.
+     The crate's scoped API surface is still a contract (changes to the public
+     trait shape may be a Lane B/C finding, not protected), but there is no
+     upstream C++ structure to preserve. Do NOT surface this as a Lane C
+     finding — it's by design.
 
 2. **Project clippy baseline.** Run:
    ```
@@ -90,13 +97,42 @@ interpretation, no LLM calls yet** — just collect facts.
    ```
    For LARGE MODULE candidates in Lane C.
 
-State the facts collected up front in the response — clippy warning count,
-baseline pass/fail count, parity-mapped file count, largest module size. This
-is the operational summary, before any findings.
+State the facts collected up front in the response as an explicit table — it's
+the operational summary that drives the size-aware fast path in Stage 2 and
+the regression checks in Stage 5. Use this format:
+
+```
+| Fact                 | Value                                                |
+|----------------------|------------------------------------------------------|
+| Package              | <name>                                               |
+| Total LOC            | <sum> (across <N> source files)                      |
+| Non-test LOC         | <sum, excluding `#[cfg(test)]` modules>              |
+| Parity-mapped files  | <N> (of <total>); or "0 — scoped contract / missing" |
+| Clippy warnings      | <N>                                                  |
+| Tests                | <pass>/<fail>/<ignored>                              |
+| Largest module       | <file> (<lines> lines)                               |
+```
 
 ---
 
 ## Stage 2 — Fan out four finding lanes (parallel)
+
+### Size-aware fast path
+
+If the Stage 1 facts satisfy **all** of:
+
+- Non-test LOC **< 200**, AND
+- Clippy warnings **== 0**, AND
+- Tests **0 fail** (vs baseline)
+
+then **run all four lanes inline** in a single pass rather than fanning out
+four agents. Fanning out has fixed overhead per agent (each independently
+re-reads the same handful of files), which dominates the work when the crate
+is small and clean. The output format is unchanged — still emit the same Stage
+4 report shape. Note "inline lanes (small crate fast path)" in the report so
+the deviation is visible.
+
+Otherwise, fan out:
 
 Launch four `Agent` invocations in a single message so they run concurrently.
 Each agent gets: the crate path, the Stage 1 facts packet (parity map summary,
@@ -123,7 +159,9 @@ truncation happen in Stage 4, with full visibility.
 
 ### Lane A — Clippy backlog (deterministic)
 
-Read `/tmp/cleanup-clippy-before.txt`. For each warning:
+If the Stage 1 clippy warning count is **0**, short-circuit: emit Lane A as
+"skipped — clippy clean" in the Stage 4 report and do not spawn an agent.
+Otherwise, read `/tmp/cleanup-clippy-before.txt`. For each warning:
 
 - Classify into one of:
   - `auto-fixable` — `cargo clippy --fix` would resolve it (e.g.,
