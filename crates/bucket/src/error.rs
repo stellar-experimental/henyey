@@ -56,13 +56,6 @@ pub enum BucketError {
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 
-    /// Database operation failed.
-    ///
-    /// Occurs when bucket operations interact with the ledger database,
-    /// such as during eviction or state verification.
-    #[error("database error: {0}")]
-    Database(#[from] henyey_db::DbError),
-
     /// Bloom filter construction or lookup failed.
     ///
     /// This can occur when:
