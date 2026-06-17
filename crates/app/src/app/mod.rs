@@ -2201,6 +2201,31 @@ impl App {
         Ok(snapshot.get_entry(key)?.is_some())
     }
 
+    /// Load a `ConfigSettingEntry` by id from the current bucket-list snapshot.
+    ///
+    /// Returns `Ok(None)` if the setting is not present in the ledger (e.g. a
+    /// setting introduced by a protocol the network has not yet upgraded to).
+    /// Used by the simulation LoadGenerator's `create_upgrade` mode to build the
+    /// `ConfigUpgradeSet` from live network configuration.
+    pub fn load_config_setting(
+        &self,
+        id: stellar_xdr::curr::ConfigSettingId,
+    ) -> henyey_ledger::Result<Option<stellar_xdr::curr::ConfigSettingEntry>> {
+        let key = stellar_xdr::curr::LedgerKey::ConfigSetting(
+            stellar_xdr::curr::LedgerKeyConfigSetting {
+                config_setting_id: id,
+            },
+        );
+        let snapshot = self.ledger_manager.create_snapshot()?;
+        match snapshot.get_entry(&key)? {
+            Some(entry) => match entry.data {
+                stellar_xdr::curr::LedgerEntryData::ConfigSetting(cs) => Ok(Some(cs)),
+                _ => Ok(None),
+            },
+            None => Ok(None),
+        }
+    }
+
     /// Check whether the given account has any pending transactions in the
     /// herder's transaction queue.
     ///

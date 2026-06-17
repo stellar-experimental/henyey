@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 ///
 /// Matches stellar-core's `generateload` command parameters.
 /// All parameters are optional with sensible defaults.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct GenerateLoadParams {
     /// Load generation mode: "pay", "soroban_upload",
     /// "soroban_invoke_setup", "soroban_invoke", "mixed_classic_soroban".
@@ -57,6 +57,10 @@ pub struct GenerateLoadParams {
     /// Number of Wasm blobs to upload (for sorobaninvokesetup).
     #[serde(default)]
     pub wasms: u32,
+
+    /// Path to the pre-generated transactions file (for pay_pregenerated).
+    #[serde(default)]
+    pub preloadedtransactionsfile: Option<String>,
 }
 
 fn default_mode() -> String {

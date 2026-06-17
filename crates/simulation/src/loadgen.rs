@@ -116,10 +116,29 @@ pub enum LoadGenMode {
     SorobanInvoke,
     /// Blend of Pay, SorobanUpload, and SorobanInvoke at configurable weights.
     MixedClassicSoroban,
+    /// Two-phase setup for the config-upgrade contract: upload the loadgen
+    /// Wasm and deploy a single instance on the **root account**.
+    /// Prerequisite for `SorobanCreateUpgrade`.
+    ///
+    /// Matches stellar-core `SOROBAN_UPGRADE_SETUP`.
+    SorobanUpgradeSetup,
+    /// Submit a single `write` invocation that stages a `ConfigUpgradeSet` for a
+    /// network config upgrade. Requires a prior `SorobanUpgradeSetup` run.
+    ///
+    /// Matches stellar-core `SOROBAN_CREATE_UPGRADE`.
+    SorobanCreateUpgrade,
+    /// Replay pre-serialized transaction envelopes from an XDR record-marked
+    /// file. No account allocation; sequence numbers come from the file.
+    ///
+    /// Matches stellar-core `PAY_PREGENERATED`.
+    PayPregenerated,
 }
 
 impl LoadGenMode {
     /// Returns `true` for any Soroban mode.
+    ///
+    /// Matches stellar-core `GeneratedLoadConfig::isSoroban()`. Note this
+    /// includes the two soroban-upgrade modes but **not** `PayPregenerated`.
     pub fn is_soroban(self) -> bool {
         matches!(
             self,
@@ -127,19 +146,29 @@ impl LoadGenMode {
                 | Self::SorobanInvokeSetup
                 | Self::SorobanInvoke
                 | Self::MixedClassicSoroban
+                | Self::SorobanUpgradeSetup
+                | Self::SorobanCreateUpgrade
         )
     }
 
-    /// Returns `true` for setup-only modes (no ongoing tx submission).
+    /// Returns `true` for two-phase setup modes (upload Wasm then deploy).
+    ///
+    /// Matches stellar-core `GeneratedLoadConfig::isSorobanSetup()` —
+    /// `SorobanInvokeSetup` and `SorobanUpgradeSetup`.
     pub fn is_soroban_setup(self) -> bool {
-        matches!(self, Self::SorobanInvokeSetup)
+        matches!(self, Self::SorobanInvokeSetup | Self::SorobanUpgradeSetup)
     }
 
     /// Returns `true` for modes that submit transactions in a continuous loop.
     pub fn is_load(self) -> bool {
         matches!(
             self,
-            Self::Pay | Self::SorobanUpload | Self::SorobanInvoke | Self::MixedClassicSoroban
+            Self::Pay
+                | Self::SorobanUpload
+                | Self::SorobanInvoke
+                | Self::MixedClassicSoroban
+                | Self::SorobanCreateUpgrade
+                | Self::PayPregenerated
         )
     }
 
@@ -203,6 +232,13 @@ pub struct GeneratedLoadConfig {
     /// Weight for SorobanInvoke in `MixedClassicSoroban`.
     pub mix_invoke_weight: u32,
 
+    // --- Config-upgrade / pregenerated fields ---
+    /// Config-setting deltas applied when building the `ConfigUpgradeSet` for
+    /// `SorobanCreateUpgrade`. All-`None` (default) re-emits current settings.
+    pub soroban_upgrade_config: henyey_ledger::config_upgrade::SorobanUpgradeConfig,
+    /// Path to the pre-generated transactions file for `PayPregenerated`.
+    pub preloaded_transactions_file: Option<std::path::PathBuf>,
+
     // --- Legacy simple-mode fields (backward compat) ---
     /// Account names for simple step_plan mode.
     pub accounts: Vec<String>,
@@ -234,6 +270,8 @@ impl Default for GeneratedLoadConfig {
             mix_pay_weight: 1,
             mix_upload_weight: 1,
             mix_invoke_weight: 1,
+            soroban_upgrade_config: Default::default(),
+            preloaded_transactions_file: None,
             accounts: Vec::new(),
             txs_per_step: 0,
             steps: 0,
@@ -627,6 +665,44 @@ impl TxGenerator {
         Ok((account_id, envelope))
     }
 
+    /// Build a config-upgrade `write` invocation transaction.
+    ///
+    /// Builds the `ConfigUpgradeSet` bytes from the App's *live* config settings
+    /// (via `henyey_ledger::config_upgrade::build_config_upgrade_set`, a port of
+    /// stellar-core `getConfigUpgradeSetFromLoadConfig`) applying the supplied
+    /// `SorobanUpgradeConfig` deltas, then builds the create-upgrade tx
+    /// (TxGenerator.cpp:1251). `code_key` and `instance_key` come from a prior
+    /// `upgrade_setup` run.
+    pub fn invoke_soroban_create_upgrade_transaction(
+        &mut self,
+        ledger_num: u32,
+        account_id: u64,
+        upgrade_config: &henyey_ledger::config_upgrade::SorobanUpgradeConfig,
+        code_key: LedgerKey,
+        instance_key: LedgerKey,
+        max_fee_rate: Option<u32>,
+    ) -> anyhow::Result<(u64, TransactionEnvelope)> {
+        let app = Arc::clone(&self.app);
+        let upgrade_bytes =
+            henyey_ledger::config_upgrade::build_config_upgrade_set(upgrade_config, |id| {
+                app.load_config_setting(id).ok().flatten()
+            })
+            .map_err(|e| anyhow::anyhow!("failed to build config upgrade set: {e}"))?;
+
+        let fee = self.generate_fee(max_fee_rate, 1, account_id);
+        let (sk, seq) = self.next_source_sequence(account_id, ledger_num);
+        let builder = self.soroban_builder();
+        let envelope = builder.invoke_soroban_create_upgrade_tx(
+            &sk,
+            seq,
+            &upgrade_bytes,
+            code_key,
+            instance_key,
+            fee,
+        )?;
+        Ok((account_id, envelope))
+    }
+
     /// Build a contract invocation transaction for load testing.
     ///
     /// Calls `do_work(guest_cycles, host_cycles, n_entries, kb_per_entry)` on the
@@ -848,6 +924,14 @@ pub struct LoadGenerator {
     contract_instances: BTreeMap<u64, ContractInstance>,
     /// Number of WASM uploads completed in current setup run.
     wasms_uploaded: u32,
+
+    // --- PayPregenerated state ---
+    /// Open reader over the pre-generated transactions file (persists position
+    /// across steps). Set during `start()` for `PayPregenerated`.
+    preloaded_reader: Option<crate::loadgen_pregenerated::PregeneratedTxReader>,
+    /// Number of pre-generated transactions consumed so far. Drives the
+    /// round-robin account index `(curr_preloaded % n_accounts) + offset`.
+    curr_preloaded: u64,
 }
 
 impl LoadGenerator {
@@ -867,6 +951,8 @@ impl LoadGenerator {
             contract_overhead_bytes: 0,
             contract_instances: BTreeMap::new(),
             wasms_uploaded: 0,
+            preloaded_reader: None,
+            curr_preloaded: 0,
         }
     }
 
@@ -886,30 +972,76 @@ impl LoadGenerator {
         self.accounts_in_use.clear();
         self.contract_instances.clear();
 
-        // Soroban config setup
+        // Soroban config setup (mirrors stellar-core LoadGenerator::start()).
         if config.mode.is_soroban() && config.mode != LoadGenMode::SorobanUpload {
-            if config.n_wasms == 0 {
-                config.n_wasms = 1;
+            config.n_wasms = 1;
+
+            // Upgrade modes deploy exactly one instance.
+            if config.mode == LoadGenMode::SorobanUpgradeSetup {
+                config.n_instances = 1;
+            }
+            if config.mode == LoadGenMode::SorobanCreateUpgrade {
+                config.n_instances = 1;
+                config.n_txs = 1; // single upgrade TX
             }
 
             if config.mode.is_soroban_setup() {
                 self.reset_soroban_state();
+                // Phase 1 deploys the wasms; phase 2 (set in generate_load) deploys
+                // instances.
                 config.n_txs = config.n_wasms;
                 config.skip_low_fee_txs = false;
                 config.spike_interval = 0;
                 config.spike_size = 0;
             }
 
-            if config.mode.mode_sets_up_invoke() || config.mode.mode_invokes() {
-                if config.n_instances == 0 {
-                    config.n_instances = 1;
-                }
+            if (config.mode.mode_sets_up_invoke() || config.mode.mode_invokes())
+                && config.n_instances == 0
+            {
+                config.n_instances = 1;
             }
         }
 
-        // Populate accounts_available
-        for i in 0..config.n_accounts {
-            self.accounts_available.insert((i + config.offset) as u64);
+        // Populate accounts_available.
+        if config.mode != LoadGenMode::PayPregenerated {
+            // Upgrade modes use the root account (special ID) as the source and
+            // consume one numbered-account slot for it.
+            let mut accounts = config.n_accounts;
+            if config.mode == LoadGenMode::SorobanUpgradeSetup
+                || config.mode == LoadGenMode::SorobanCreateUpgrade
+            {
+                self.accounts_available.insert(ROOT_ACCOUNT_ID);
+                accounts = accounts.saturating_sub(1);
+            }
+            for i in 0..accounts {
+                self.accounts_available.insert((i + config.offset) as u64);
+            }
+        }
+
+        // PayPregenerated: open the transactions file, preload accounts. No
+        // account-pool allocation (the source accounts come from the file).
+        if config.mode == LoadGenMode::PayPregenerated {
+            self.curr_preloaded = 0;
+            if self.preloaded_reader.is_none() {
+                let path = config
+                    .preloaded_transactions_file
+                    .clone()
+                    .expect("PayPregenerated requires preloaded_transactions_file");
+                match crate::loadgen_pregenerated::PregeneratedTxReader::open(&path) {
+                    Ok(reader) => self.preloaded_reader = Some(reader),
+                    Err(e) => {
+                        warn!("Failed to open preloaded tx file: {e}");
+                        self.failed = true;
+                    }
+                }
+            }
+            // Preload account cache so seq numbers can be set on them.
+            let ledger_num = self.tx_generator.app.current_ledger_seq();
+            for i in 0..config.n_accounts {
+                let _ = self
+                    .tx_generator
+                    .find_account((i + config.offset) as u64, ledger_num);
+            }
         }
 
         // Build contract_instances for invoke modes (round-robin assignment)
@@ -1008,11 +1140,14 @@ impl LoadGenerator {
             // Compute how many txs we should have submitted by now
             let txs_this_step = self.get_tx_per_step(config);
 
-            // Cleanup accounts once per second
+            // Cleanup accounts once per second (skipped for PayPregenerated,
+            // which has no account pool — stellar-core LoadGenerator.cpp:681).
             let elapsed_secs = self.start_time.map(|t| t.elapsed().as_secs()).unwrap_or(0);
             if elapsed_secs != self.last_second {
                 self.last_second = elapsed_secs;
-                self.cleanup_accounts();
+                if config.mode != LoadGenMode::PayPregenerated {
+                    self.cleanup_accounts();
+                }
             }
 
             // Submit transactions for this step
@@ -1023,11 +1158,18 @@ impl LoadGenerator {
                     break;
                 }
 
-                let source_id = match self.get_next_available_account(ledger_num) {
-                    Some(id) => id,
-                    None => {
-                        debug!("No available accounts, waiting for cleanup");
-                        break;
+                // PayPregenerated draws its source account from the file, so it
+                // does not pick from the account pool (stellar-core
+                // LoadGenerator.cpp:701). A sentinel id is passed through.
+                let source_id = if config.mode == LoadGenMode::PayPregenerated {
+                    0
+                } else {
+                    match self.get_next_available_account(ledger_num) {
+                        Some(id) => id,
+                        None => {
+                            debug!("No available accounts, waiting for cleanup");
+                            break;
+                        }
                     }
                 };
 
@@ -1162,6 +1304,13 @@ impl LoadGenerator {
 
             let result = self.tx_generator.app.submit_transaction(envelope).await;
 
+            // PayPregenerated does not re-submit on failure: each tx is read
+            // once from the file, so a retry would consume the *next* tx
+            // (stellar-core LoadGenerator.cpp:874).
+            if config.mode == LoadGenMode::PayPregenerated {
+                return matches!(result, TxQueueResult::Added);
+            }
+
             match result {
                 TxQueueResult::Added => return true,
                 TxQueueResult::Invalid(Some(TxResultCode::TxBadSeq)) => {
@@ -1223,7 +1372,10 @@ impl LoadGenerator {
                 source_account_id,
                 DEFAULT_SOROBAN_INCLUSION_FEE,
             ),
-            LoadGenMode::SorobanInvokeSetup => {
+            // SorobanUpgradeSetup shares the two-phase upload→deploy path with
+            // SorobanInvokeSetup (it differs only in source account + single
+            // instance, both configured in start()).
+            LoadGenMode::SorobanInvokeSetup | LoadGenMode::SorobanUpgradeSetup => {
                 if config.n_wasms > 0 {
                     // Phase 1: Upload the loadgen WASM
                     let wasm = SorobanTxBuilder::loadgen_wasm();
@@ -1292,6 +1444,57 @@ impl LoadGenerator {
             }
             LoadGenMode::MixedClassicSoroban => {
                 self.create_mixed_classic_soroban_transaction(config, source_account_id, ledger_num)
+            }
+            LoadGenMode::SorobanCreateUpgrade => {
+                // Requires a prior SorobanUpgradeSetup: code key + exactly one
+                // instance key (stellar-core LoadGenerator.cpp:760).
+                let code_key = self.code_key.clone().ok_or_else(|| {
+                    anyhow::anyhow!("must run SOROBAN_UPGRADE_SETUP (no code key)")
+                })?;
+                if self.contract_instance_keys.len() != 1 {
+                    anyhow::bail!(
+                        "must run SOROBAN_UPGRADE_SETUP (expected exactly 1 instance, got {})",
+                        self.contract_instance_keys.len()
+                    );
+                }
+                let instance_key = self
+                    .contract_instance_keys
+                    .iter()
+                    .next()
+                    .expect("one instance key")
+                    .clone();
+                self.tx_generator.invoke_soroban_create_upgrade_transaction(
+                    ledger_num,
+                    source_account_id,
+                    &config.soroban_upgrade_config,
+                    code_key,
+                    instance_key,
+                    config.max_fee_rate,
+                )
+            }
+            LoadGenMode::PayPregenerated => {
+                let reader = self
+                    .preloaded_reader
+                    .as_mut()
+                    .ok_or_else(|| anyhow::anyhow!("PayPregenerated: file not open"))?;
+                let env = reader
+                    .read_one()?
+                    .ok_or_else(|| anyhow::anyhow!("end of pregenerated tx file reached"))?;
+
+                // Set (not increment) the seq on the round-robin account
+                // (currPreloaded % nAccounts) + offset (LoadGenerator.cpp:1769).
+                let seq = envelope_seq_num(&env);
+                let idx = if config.n_accounts > 0 {
+                    self.curr_preloaded % config.n_accounts as u64
+                } else {
+                    0
+                };
+                let account_id = idx + config.offset as u64;
+                if let Some(account) = self.tx_generator.accounts.get_mut(&account_id) {
+                    account.sequence_number = seq;
+                }
+                self.curr_preloaded += 1;
+                Ok((account_id, env))
             }
         }
     }
@@ -1558,6 +1761,21 @@ fn deterministic_rand(a: u64, b: u32) -> u64 {
     u64::from_le_bytes(hash.0[..8].try_into().unwrap())
 }
 
+/// Extract the sequence number from a `TransactionEnvelope`.
+///
+/// Used by `PayPregenerated` to mirror stellar-core's
+/// `acc->setSequenceNumber(txFrame->getSeqNum())`. Fee-bump envelopes carry the
+/// inner v1 tx's seq; v0 envelopes carry their own.
+fn envelope_seq_num(env: &TransactionEnvelope) -> i64 {
+    match env {
+        TransactionEnvelope::TxV0(e) => e.tx.seq_num.0,
+        TransactionEnvelope::Tx(e) => e.tx.seq_num.0,
+        TransactionEnvelope::TxFeeBump(e) => match &e.tx.inner_tx {
+            stellar_xdr::curr::FeeBumpTransactionInnerTx::Tx(inner) => inner.tx.seq_num.0,
+        },
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -1588,6 +1806,58 @@ mod tests {
         let report = LoadGenerator::summarize(&steps);
         assert_eq!(report.total_steps, 4);
         assert_eq!(report.total_transactions, 12);
+    }
+
+    #[test]
+    fn test_loadgen_mode_predicates_new_modes() {
+        // is_soroban: upgrade modes are soroban; pregenerated is NOT.
+        assert!(LoadGenMode::SorobanUpgradeSetup.is_soroban());
+        assert!(LoadGenMode::SorobanCreateUpgrade.is_soroban());
+        assert!(!LoadGenMode::PayPregenerated.is_soroban());
+
+        // is_soroban_setup: only the two setup modes.
+        assert!(LoadGenMode::SorobanUpgradeSetup.is_soroban_setup());
+        assert!(LoadGenMode::SorobanInvokeSetup.is_soroban_setup());
+        assert!(!LoadGenMode::SorobanCreateUpgrade.is_soroban_setup());
+        assert!(!LoadGenMode::PayPregenerated.is_soroban_setup());
+
+        // mode_sets_up_invoke stays SorobanInvokeSetup-only (upgrade_setup does
+        // not set up the invoke contract-instance map).
+        assert!(LoadGenMode::SorobanInvokeSetup.mode_sets_up_invoke());
+        assert!(!LoadGenMode::SorobanUpgradeSetup.mode_sets_up_invoke());
+        assert!(!LoadGenMode::SorobanCreateUpgrade.mode_sets_up_invoke());
+
+        // mode_invokes is unchanged by the new modes.
+        assert!(!LoadGenMode::SorobanUpgradeSetup.mode_invokes());
+        assert!(!LoadGenMode::SorobanCreateUpgrade.mode_invokes());
+        assert!(!LoadGenMode::PayPregenerated.mode_invokes());
+
+        // is_load: create_upgrade + pregenerated submit txs; upgrade_setup is a
+        // setup phase, not a continuous-load mode.
+        assert!(LoadGenMode::SorobanCreateUpgrade.is_load());
+        assert!(LoadGenMode::PayPregenerated.is_load());
+        assert!(!LoadGenMode::SorobanUpgradeSetup.is_load());
+    }
+
+    /// Guard: the five pre-existing modes keep their predicate classification
+    /// so adding the new modes did not perturb existing behavior.
+    #[test]
+    fn test_existing_mode_predicates_unchanged() {
+        assert!(!LoadGenMode::Pay.is_soroban());
+        assert!(LoadGenMode::SorobanUpload.is_soroban());
+        assert!(LoadGenMode::SorobanInvokeSetup.is_soroban());
+        assert!(LoadGenMode::SorobanInvoke.is_soroban());
+        assert!(LoadGenMode::MixedClassicSoroban.is_soroban());
+
+        assert!(LoadGenMode::Pay.is_load());
+        assert!(LoadGenMode::SorobanUpload.is_load());
+        assert!(!LoadGenMode::SorobanInvokeSetup.is_load());
+        assert!(LoadGenMode::SorobanInvoke.is_load());
+        assert!(LoadGenMode::MixedClassicSoroban.is_load());
+
+        assert!(LoadGenMode::SorobanInvoke.mode_invokes());
+        assert!(LoadGenMode::MixedClassicSoroban.mode_invokes());
+        assert!(!LoadGenMode::Pay.mode_invokes());
     }
 
     #[test]

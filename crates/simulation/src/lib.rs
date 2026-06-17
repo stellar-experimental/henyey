@@ -51,12 +51,14 @@ async fn join_or_abort(
     }
 }
 mod applyload;
+mod loadgen_pregenerated;
 mod loadgen_soroban;
 pub use applyload::{ApplyLoad, ApplyLoadConfig, ApplyLoadMode, Histogram};
 pub use loadgen::{
     GeneratedLoadConfig, GeneratedTransaction, LoadGenMode, LoadGenerator, LoadReport, LoadResult,
     LoadStep, TestAccount, TxGenerator,
 };
+pub use loadgen_pregenerated::PregeneratedTxReader;
 pub use loadgen_soroban::{BatchTransfer, ContractInvocation, SacTransfer, SorobanTxBuilder};
 
 mod poll;
