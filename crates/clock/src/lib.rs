@@ -1,4 +1,4 @@
-//! Clock abstractions for monotonic timing, async sleep, and periodic intervals.
+//! Clock abstractions for monotonic timing, wall-clock reads, and async sleep.
 
 use std::time::{Duration, Instant, SystemTime};
 
