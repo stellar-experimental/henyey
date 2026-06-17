@@ -925,6 +925,20 @@ impl Simulation {
             .collect()
     }
 
+    /// Returns `(expected, actual)` authenticated-peer sets for `id`:
+    /// topology-expected peers and currently-connected peers.
+    async fn peer_set_for(&self, id: &str) -> (HashSet<PeerId>, HashSet<PeerId>) {
+        let expected = self.expected_peer_ids(id);
+        let actual: HashSet<PeerId> = self.running_apps[id]
+            .app
+            .peer_snapshots()
+            .await
+            .into_iter()
+            .map(|s| s.info.peer_id)
+            .collect();
+        (expected, actual)
+    }
+
     /// Wait until every running node is connected to **exactly** the set of
     /// peers defined by the configured topology.
     ///
@@ -946,14 +960,7 @@ impl Simulation {
                 let mut ids: Vec<&String> = self.running_apps.keys().collect();
                 ids.sort();
                 for id in &ids {
-                    let expected = self.expected_peer_ids(id);
-                    let actual: HashSet<PeerId> = self.running_apps[*id]
-                        .app
-                        .peer_snapshots()
-                        .await
-                        .into_iter()
-                        .map(|s| s.info.peer_id)
-                        .collect();
+                    let (expected, actual) = self.peer_set_for(id).await;
                     if expected != actual {
                         return Ok(None);
                     }
@@ -976,14 +983,7 @@ impl Simulation {
                 let mut ids: Vec<&String> = self.running_apps.keys().collect();
                 ids.sort();
                 for id in &ids {
-                    let expected = self.expected_peer_ids(id);
-                    let actual: HashSet<PeerId> = self.running_apps[*id]
-                        .app
-                        .peer_snapshots()
-                        .await
-                        .into_iter()
-                        .map(|s| s.info.peer_id)
-                        .collect();
+                    let (expected, actual) = self.peer_set_for(id).await;
                     let mut missing: Vec<String> = expected
                         .difference(&actual)
                         .map(|p| p.to_strkey())

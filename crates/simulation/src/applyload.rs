@@ -1006,8 +1006,8 @@ impl ApplyLoad {
             }
             header.ledger_seq += 1;
 
-            let mut live_entries: Vec<LedgerEntry> = Vec::new();
-            let mut archived_entries: Vec<LedgerEntry> = Vec::new();
+            let live_entries: Vec<LedgerEntry>;
+            let archived_entries: Vec<LedgerEntry>;
 
             let is_last_batch = i
                 >= self
@@ -1022,12 +1022,11 @@ impl ApplyLoad {
                     self.config.bl_batch_size
                 };
 
-                generate_live_entries(
+                live_entries = generate_live_entries(
                     &base_live_entry,
                     header.ledger_seq,
                     entry_count,
                     &mut current_live_key,
-                    &mut live_entries,
                 );
 
                 let archived_entry_count = if is_last_batch {
@@ -1036,12 +1035,14 @@ impl ApplyLoad {
                     hot_archive_batch_size
                 };
 
-                generate_archived_entries(
+                archived_entries = generate_archived_entries(
                     header.ledger_seq,
                     archived_entry_count,
                     &mut current_hot_archive_key,
-                    &mut archived_entries,
                 );
+            } else {
+                live_entries = Vec::new();
+                archived_entries = Vec::new();
             }
 
             // Add to live bucket list.
@@ -1647,8 +1648,8 @@ fn generate_live_entries(
     ledger_seq: u32,
     count: u32,
     current_key: &mut u64,
-    entries: &mut Vec<LedgerEntry>,
-) {
+) -> Vec<LedgerEntry> {
+    let mut entries = Vec::new();
     for _ in 0..count {
         let mut le = base_entry.clone();
         le.last_modified_ledger_seq = ledger_seq;
@@ -1672,6 +1673,7 @@ fn generate_live_entries(
         entries.push(le);
         entries.push(ttl_entry);
     }
+    entries
 }
 
 /// Generate archived entries for a hot archive bucket list batch.
@@ -1679,8 +1681,8 @@ fn generate_archived_entries(
     ledger_seq: u32,
     count: u32,
     current_key: &mut u64,
-    entries: &mut Vec<LedgerEntry>,
-) {
+) -> Vec<LedgerEntry> {
+    let mut entries = Vec::new();
     for _ in 0..count {
         let lk = ApplyLoad::key_for_archived_entry(*current_key);
         let LedgerKey::ContractData(cd) = &lk else {
@@ -1700,6 +1702,7 @@ fn generate_archived_entries(
         entries.push(le);
         *current_key += 1;
     }
+    entries
 }
 
 /// Print a detailed performance breakdown for a benchmark run.
