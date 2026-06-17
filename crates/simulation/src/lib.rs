@@ -30,6 +30,7 @@ use loopback::LoopbackNetwork;
 
 const DEFAULT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 const ROLLBACK_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
+const STARTUP_READINESS_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Wait for a task handle to complete within `timeout`, aborting it if the
 /// deadline expires.
@@ -188,11 +189,6 @@ pub struct Simulation {
     app_account_sequences: HashMap<String, i64>,
     root_sequence: i64,
     overlay_connection_factory: Option<Arc<dyn ConnectionFactory>>,
-    /// Whether Soroban upgrade setup has completed (set by `SorobanUpgradeSetup`
-    /// loadgen mode).
-    ///
-    /// Matches stellar-core `Simulation::mSetupForSorobanUpgrade`.
-    setup_for_soroban_upgrade: bool,
     /// Test-only task handles for mock nodes. `find_exited_node`,
     /// `app_task_finished`, and `app_task_status` check this map
     /// before `running_apps`, enabling crash-detection tests without
@@ -243,7 +239,6 @@ impl Simulation {
             app_account_sequences: HashMap::new(),
             root_sequence: 1,
             overlay_connection_factory: None,
-            setup_for_soroban_upgrade: false,
             #[cfg(test)]
             test_nodes: HashMap::new(),
             #[cfg(test)]
@@ -441,7 +436,7 @@ impl Simulation {
         // construction.
         for plan in plans {
             let node_id = plan.id.clone();
-            self.insert_ready_node(plan, Duration::from_secs(30))
+            self.insert_ready_node(plan, STARTUP_READINESS_TIMEOUT)
                 .await
                 .with_context(|| format!("bootstrap app node {}", node_id))?;
         }
@@ -521,7 +516,7 @@ impl Simulation {
             )
             .await?;
 
-        self.insert_ready_node(plan, Duration::from_secs(30))
+        self.insert_ready_node(plan, STARTUP_READINESS_TIMEOUT)
             .await?;
 
         Ok(())
@@ -617,20 +612,6 @@ impl Simulation {
     pub fn expected_next_ledger_close_unix_secs(&self, node_id: &str) -> Option<u64> {
         let app = self.running_apps.get(node_id)?;
         Some(app.app.expected_next_ledger_close_unix_secs())
-    }
-
-    /// Check whether Soroban upgrade setup has completed.
-    ///
-    /// Matches stellar-core `Simulation::isSetUpForSorobanUpgrade()`.
-    pub fn is_setup_for_soroban_upgrade(&self) -> bool {
-        self.setup_for_soroban_upgrade
-    }
-
-    /// Mark Soroban upgrade setup as complete.
-    ///
-    /// Matches stellar-core `Simulation::markReadyForSorobanUpgrade()`.
-    pub fn mark_ready_for_soroban_upgrade(&mut self) {
-        self.setup_for_soroban_upgrade = true;
     }
 
     pub async fn app_peer_count(&self, node_id: &str) -> Option<usize> {
