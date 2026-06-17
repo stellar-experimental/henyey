@@ -1702,8 +1702,13 @@ Otherwise enter the deploy path:
    - **`no-impact`** (allowlisted — never compiles into the release binary):
      `.github/`, `.claude/`, `scripts/`, `docs/`, `metrics/`, root-level `*.md`
      (e.g. `README.md`, `CLAUDE.md`), root-level git metadata dotfiles
-     (`.gitignore`, `.gitattributes`, `.gitmodules`), and `stellar-specs` /
-     `stellar-specs/` submodule pointer changes.
+     (`.gitignore`, `.gitattributes`, `.gitmodules`), `stellar-specs` /
+     `stellar-specs/` submodule pointer changes, and container-image files
+     (`Dockerfile`, `.dockerignore`, `*.dockerfile`) — `cargo` never reads them,
+     so they cannot change the compiled binary; safe ONLY because the monitor
+     runs the locally-compiled `release/henyey`, not the Docker image (the
+     Dockerfile builds the separate SSC integration image). `docker-compose*.yml`
+     is deliberately NOT allowlisted — it stays on the `rebuild` fail-safe.
    - **`test-only`**: `crates/<crate>/tests/**` — integration tests, a separate
      compilation target never linked into the `--release` lib/bin.
    - **`needs-hunk-check`**: `crates/**/src/**.rs` — defer to `diff_is_test_only`

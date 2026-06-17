@@ -704,6 +704,25 @@ classify_path_binary_relevance() {
       echo "no-impact"; return 0 ;;
     stellar-specs|stellar-specs/*)
       echo "no-impact"; return 0 ;;
+    # Container-image files (#3307): never read by `cargo build --release -p
+    # henyey`, so they cannot change the compiled binary. Routing them through
+    # no-impact makes a Dockerfile-only delta a skip *candidate* that the
+    # §10-step-2a release-binary byte-compare then confirms, instead of forcing
+    # a needless rebuild + validator restart (or re-tripping every tick).
+    #
+    # SAFE ONLY because the monitor runs the validator as the locally-compiled
+    # binary (`release/henyey run ...`), NOT the Docker image — the Dockerfile
+    # builds the SEPARATE Stellar Supercluster (SSC) integration image, which is
+    # not the artifact this gate deploys. REVISIT this carve-out if the deploy
+    # model ever becomes image-based (validator run from the Docker image): then
+    # a Dockerfile change WOULD alter the deployed runtime and must rebuild.
+    #
+    # `*.dockerfile` matches slashed paths too (e.g. `ci/foo.dockerfile`); that
+    # is fine — no `.dockerfile`-suffixed file is in the cargo build graph.
+    # docker-compose*.yml is deliberately NOT allowlisted (stays on the rebuild
+    # fail-safe); see the contrast assertion in test-monitor-skill-snippets.sh.
+    Dockerfile|.dockerignore|*.dockerfile)
+      echo "no-impact"; return 0 ;;
   esac
   # Root-level *.md (e.g. README.md, CLAUDE.md) — no slash, .md suffix.
   if [[ "$path" != */* && "$path" == *.md ]]; then
