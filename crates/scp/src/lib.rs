@@ -114,18 +114,16 @@ pub(crate) fn process_envelopes_current_state<F>(
 where
     F: FnMut(&ScpEnvelope) -> bool,
 {
-    let mut nodes: Vec<_> = envelopes.keys().collect();
-    nodes.sort();
+    let mut entries: Vec<_> = envelopes.iter().collect();
+    entries.sort_by_key(|(id, _)| *id);
 
-    for node_id in nodes {
+    for (node_id, envelope) in entries {
         if !force_self && node_id == local_node_id && !fully_validated {
             continue;
         }
 
-        if let Some(envelope) = envelopes.get(node_id) {
-            if !f(envelope) {
-                return false;
-            }
+        if !f(envelope) {
+            return false;
         }
     }
 

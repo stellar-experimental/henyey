@@ -4,6 +4,19 @@
 //! nomination, and quorum state that can be serialized to JSON. These types
 //! match the stellar-core `getJsonInfo()` and `getJsonQuorumInfo()` output
 //! format, enabling compatible diagnostics and monitoring tooling.
+//!
+//! These structs — together with the `get_info` / `get_quorum_info` /
+//! `get_quorum_info_for_node` / `get_all_slot_info` accessors on `Slot`,
+//! `SCP`, `NominationProtocol`, and `BallotProtocol` — are an intentional
+//! parity-mirrored surface for stellar-core's `getJsonInfo()` /
+//! `getJsonQuorumInfo()` (see `crates/scp/PARITY_STATUS.md`), kept `pub` for
+//! the deferred fuller `/info`-endpoint parity work. They have no live external
+//! caller today (the live `/info` and compat handlers consume only
+//! `get_info_quorum_summary` / `get_reporting_summary`), so narrowing them to
+//! `pub(crate)` makes them dead code — a hard compile error under the
+//! repo-wide `-Dwarnings` — and deleting them would erase documented parity
+//! coverage. Do not narrow or delete (proved infeasible under `-Dwarnings` in
+//! #3365).
 
 /// JSON-serializable SCP slot information for debugging and monitoring.
 ///

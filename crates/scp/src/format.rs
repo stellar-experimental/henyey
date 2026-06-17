@@ -21,6 +21,14 @@ pub fn node_id_to_short_string(node_id: &NodeId) -> String {
 }
 
 /// Format a ballot for display.
+///
+/// Intentional parity-mapped debug-format surface mirroring stellar-core's
+/// `SCPDriver::ballotToStr` (`SCPDriver.h`). Kept `pub` despite having no
+/// current external caller: narrowing it (and `envelope_to_str`) to
+/// `pub(crate)` makes both — and the `VALUE_SHORT_BYTES` constant they
+/// transitively depend on — dead code, which is a hard compile error under the
+/// repo-wide `-Dwarnings`. Deleting it would erase a documented parity surface.
+/// Do not narrow or delete (proved infeasible under `-Dwarnings` in #3365).
 pub fn ballot_to_str(ballot: &ScpBallot) -> String {
     format!(
         "({},{})",
@@ -35,6 +43,13 @@ pub fn value_to_str(value: &Value) -> String {
 }
 
 /// Format an envelope for display.
+///
+/// Intentional parity-mapped debug-format surface mirroring stellar-core's
+/// `SCPDriver::envToStr` (`SCPDriver.h`). Kept `pub` for the same reason as
+/// [`ballot_to_str`]: narrowing to `pub(crate)` makes it dead code under the
+/// repo-wide `-Dwarnings`, and deleting it would erase a documented parity
+/// surface. Do not narrow or delete (proved infeasible under `-Dwarnings` in
+/// #3365).
 pub fn envelope_to_str(envelope: &ScpEnvelope) -> String {
     let node = node_id_to_short_string(&envelope.statement.node_id);
     let slot = envelope.statement.slot_index;
