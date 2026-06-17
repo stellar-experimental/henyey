@@ -1,37 +1,15 @@
-//! Memory estimation trait and helpers for per-component heap tracking.
+//! Heap-estimation helpers for per-component memory tracking.
 //!
-//! This module provides the [`MemoryEstimate`] trait for types that can report
-//! their approximate heap memory usage, plus helper functions for estimating
-//! the heap footprint of standard collections.
+//! This module provides [`ComponentMemory`] for reporting a component's
+//! memory usage, plus helper functions for estimating the heap footprint of
+//! standard collections.
 //!
 //! # Design
 //!
-//! Implementations should be O(1) — read capacities, lengths, and atomic
+//! Estimates should be O(1) — read capacities, lengths, and atomic
 //! counters, never iterate entries. Estimates should be conservative
 //! (slight over-count is acceptable) and exclude shared references (`Arc`)
 //! that may be counted by other components.
-//!
-//! # Usage
-//!
-//! ```ignore
-//! use henyey_common::memory::{MemoryEstimate, ComponentMemory, hashmap_heap_bytes};
-//!
-//! impl MemoryEstimate for MyCache {
-//!     fn estimate_heap_bytes(&self) -> usize {
-//!         hashmap_heap_bytes(self.map.capacity(), 32, 64)
-//!     }
-//! }
-//! ```
-
-/// Trait for types that can estimate their heap memory usage.
-///
-/// Implementations should return a conservative estimate of the heap
-/// bytes owned by this value, excluding shared references (Arc) that
-/// may be counted elsewhere. The estimate must be O(1) — read
-/// capacities, lengths, and atomic counters, never iterate entries.
-pub trait MemoryEstimate {
-    fn estimate_heap_bytes(&self) -> usize;
-}
 
 /// A named memory measurement from a single component.
 #[derive(Debug, Clone)]
