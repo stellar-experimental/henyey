@@ -62,7 +62,7 @@ use crate::CryptoError;
 use crate::{PublicKey as EdPublicKey, SecretKey as EdSecretKey};
 
 /// Overhead added to plaintext: 32-byte ephemeral public key + 16-byte Poly1305 tag.
-pub const SEALED_BOX_OVERHEAD: usize = 32 + 16;
+pub(crate) const SEALED_BOX_OVERHEAD: usize = 32 + 16;
 
 /// Performs X25519 DH, checks the result is contributory, and derives the
 /// XSalsa20 symmetric key via HSalsa20 (standard NaCl crypto_box key derivation).
@@ -163,10 +163,9 @@ pub fn seal_to_curve25519_public_key(
     recipient: &[u8; 32],
     plaintext: &[u8],
 ) -> Result<Vec<u8>, CryptoError> {
-    seal(recipient, plaintext).map_err(|e| match e {
-        CryptoError::SmallOrderPublicKey => CryptoError::SmallOrderPublicKey,
-        _ => CryptoError::EncryptionFailed,
-    })
+    // `seal` already returns the exact error variants this function documents
+    // (`SmallOrderPublicKey` or `EncryptionFailed`), so no remapping is needed.
+    seal(recipient, plaintext)
 }
 
 /// Decrypts a sealed payload using the recipient's Ed25519 secret key.
