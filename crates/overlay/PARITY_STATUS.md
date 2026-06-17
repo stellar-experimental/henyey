@@ -395,7 +395,7 @@ Corresponds to: `SurveyManager.h`, `SurveyDataManager.h`, `SurveyMessageLimiter.
 | `relayOrProcessResponse()` | `survey_impl::handle_survey_response()` | Full |
 | `relayOrProcessRequest()` | `survey_impl::handle_survey_request()` | Full |
 | `clearOldLedgers()` | `clear_old_ledgers()` | Full |
-| `getJsonResults()` | `get_node_data()` / peer data getters | Partial |
+| `getJsonResults()` | `get_node_data()` / peer data getters; the compat HTTP `/getsurveyresult` handler (`app::compat_http`) now projects the survey report to the stellar-core `getJsonResults()` JSON shape (`surveyInProgress`, strkey `backlog`/`badResponseNodes`, `topology` map) (#3298) | Partial |
 | `broadcastStartSurveyCollecting()` | `survey_impl::handle_survey_start_collecting()` | Full |
 | `relayStartSurveyCollecting()` | `survey_impl::handle_survey_start_collecting()` | Full |
 | `broadcastStopSurveyCollecting()` | `survey_impl::handle_survey_stop_collecting()` | Full |
