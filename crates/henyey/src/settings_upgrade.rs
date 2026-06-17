@@ -424,7 +424,7 @@ fn sign_tx(
 }
 
 /// Parameters for the `get-settings-upgrade-txs` CLI command.
-pub struct SettingsUpgradeParams<'a> {
+pub(crate) struct SettingsUpgradeParams<'a> {
     pub public_key_str: &'a str,
     pub seq_num: i64,
     pub network_passphrase: &'a str,
@@ -434,7 +434,7 @@ pub struct SettingsUpgradeParams<'a> {
 }
 
 /// Execute the `get-settings-upgrade-txs` command.
-pub fn run(params: &SettingsUpgradeParams<'_>) -> anyhow::Result<()> {
+pub(crate) fn run(params: &SettingsUpgradeParams<'_>) -> anyhow::Result<()> {
     // Decode the ConfigUpgradeSet from base64 XDR
     let xdr_bytes = BASE64
         .decode(params.xdr_base64)
