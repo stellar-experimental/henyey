@@ -841,7 +841,10 @@ impl Bucket {
     ///
     /// Each item is `(BucketEntry, record_size)` where `record_size` is the total
     /// bytes this entry occupies on disk.
-    pub fn iter_from_offset_with_sizes(&self, start_offset: u64) -> Result<BucketOffsetIter<'_>> {
+    pub(crate) fn iter_from_offset_with_sizes(
+        &self,
+        start_offset: u64,
+    ) -> Result<BucketOffsetIter<'_>> {
         match &self.storage {
             BucketStorage::InMemory { entries, .. } => {
                 Ok(BucketOffsetIter::InMemory(InMemoryOffsetIter {
@@ -1153,17 +1156,15 @@ impl Iterator for BucketIter<'_> {
 /// reads record sizes from the file format (no re-serialization needed).
 /// For in-memory buckets, it computes record sizes via XDR serialization
 /// (acceptable since in-memory buckets are small).
-pub enum BucketOffsetIter<'a> {
+pub(crate) enum BucketOffsetIter<'a> {
     /// In-memory variant that computes sizes on the fly.
     InMemory(InMemoryOffsetIter<'a>),
     /// Disk-backed variant that reads sizes from record marks.
     DiskBacked(crate::disk_bucket::DiskBucketOffsetIter),
-    /// Empty iterator (used for error recovery).
-    Empty,
 }
 
 /// In-memory offset iterator state.
-pub struct InMemoryOffsetIter<'a> {
+pub(crate) struct InMemoryOffsetIter<'a> {
     entries: &'a [BucketEntry],
     index: usize,
     current_offset: u64,
@@ -1203,7 +1204,6 @@ impl Iterator for BucketOffsetIter<'_> {
                 None
             }
             BucketOffsetIter::DiskBacked(iter) => iter.next(),
-            BucketOffsetIter::Empty => None,
         }
     }
 }
