@@ -1415,7 +1415,7 @@ mod tests {
             .unwrap();
 
         // Hand-computed expected guest_cycles.
-        let num_entries = rw_entries + 0 + instance.read_only_keys.len() as u32; // = 4
+        let num_entries = rw_entries + instance.read_only_keys.len() as u32; // = 4
         let instructions_for_entries =
             205 * num_entries * num_entries + 12_000 * num_entries + 65_485;
         let entries_write_size = 0u32; // data_entry_size = 0
