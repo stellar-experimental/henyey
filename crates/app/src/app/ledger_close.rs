@@ -3901,7 +3901,7 @@ mod publish_skip_marker_tests {
     }
 
     fn run_consumer(db: &Database, closing_seq: u32) -> bool {
-        db.transaction(|conn| Ok(consume_skip_marker_if_matches(conn, closing_seq)?))
+        db.transaction(|conn| consume_skip_marker_if_matches(conn, closing_seq))
             .unwrap()
     }
 
@@ -3926,7 +3926,7 @@ mod publish_skip_marker_tests {
             c.set_state(state_keys::PUBLISH_SKIP_FIRST_CHECKPOINT, "not-a-number")
         })
         .unwrap();
-        let res = db.transaction(|conn| Ok(consume_skip_marker_if_matches(conn, 127)?));
+        let res = db.transaction(|conn| consume_skip_marker_if_matches(conn, 127));
         match res {
             Err(henyey_db::DbError::Integrity(msg)) => {
                 assert!(
