@@ -237,59 +237,6 @@ pub fn parse_xdr_stream<T: ReadXdr>(data: &[u8]) -> Result<Vec<T>, HistoryError>
     Ok(entries)
 }
 
-/// Parse an XDR stream that uses length-prefixed framing.
-///
-/// Some XDR streams use explicit 4-byte length prefixes before each entry.
-/// This function handles that format.
-///
-/// # Type Parameters
-///
-/// * `T` - The XDR type to parse. Must implement `ReadXdr`.
-///
-/// # Arguments
-///
-/// * `data` - The raw XDR bytes with length prefixes
-///
-/// # Returns
-///
-/// A vector of parsed entries, or an error if parsing fails.
-pub fn parse_length_prefixed_xdr_stream<T: ReadXdr>(data: &[u8]) -> Result<Vec<T>, HistoryError> {
-    let mut entries = Vec::new();
-    let mut offset = 0;
-
-    while offset + 4 <= data.len() {
-        // Read 4-byte big-endian length
-        let len = u32::from_be_bytes([
-            data[offset],
-            data[offset + 1],
-            data[offset + 2],
-            data[offset + 3],
-        ]) as usize;
-        offset += 4;
-
-        if offset + len > data.len() {
-            return Err(HistoryError::XdrParsing(format!(
-                "Invalid XDR length: {} exceeds remaining data {}",
-                len,
-                data.len() - offset
-            )));
-        }
-
-        let entry_data = &data[offset..offset + len];
-        let entry = T::from_xdr(entry_data, stellar_xdr::curr::Limits::none())
-            .map_err(HistoryError::Xdr)?;
-        entries.push(entry);
-
-        offset += len;
-
-        // XDR padding to 4-byte boundary
-        let padding = (4 - (len % 4)) % 4;
-        offset += padding;
-    }
-
-    Ok(entries)
-}
-
 /// Parse an XDR stream that uses XDR Record Marking Standard (RFC 5531).
 ///
 /// The record marking format uses 4-byte record marks where:
@@ -378,56 +325,6 @@ pub fn parse_record_marked_xdr_stream_or_empty<T: ReadXdr>(
     // History/bucket files always use XDR record marks (RFC 5531).
     // No format detection needed — always parse with record marks.
     parse_record_marked_xdr_stream(data)
-}
-
-/// Download and decompress a gzipped file.
-///
-/// This is a convenience function that combines downloading with retries
-/// and gzip decompression.
-///
-/// # Arguments
-///
-/// * `client` - The HTTP client to use
-/// * `url` - The URL to download from
-/// * `config` - Download configuration
-///
-/// # Returns
-///
-/// The decompressed bytes, or an error.
-pub async fn download_and_decompress(
-    client: &Client,
-    url: &str,
-    config: &DownloadConfig,
-) -> Result<Vec<u8>, HistoryError> {
-    let compressed = download_with_retries(client, url, config).await?;
-    decompress_gzip(&compressed)
-}
-
-/// Download, decompress, and parse an XDR file.
-///
-/// This is a convenience function for the common case of downloading
-/// a gzipped XDR file and parsing it into a vector of entries.
-///
-/// # Type Parameters
-///
-/// * `T` - The XDR type to parse. Must implement `ReadXdr`.
-///
-/// # Arguments
-///
-/// * `client` - The HTTP client to use
-/// * `url` - The URL to download from
-/// * `config` - Download configuration
-///
-/// # Returns
-///
-/// A vector of parsed entries, or an error.
-pub async fn download_and_parse_xdr<T: ReadXdr>(
-    client: &Client,
-    url: &str,
-    config: &DownloadConfig,
-) -> Result<Vec<T>, HistoryError> {
-    let data = download_and_decompress(client, url, config).await?;
-    parse_xdr_stream(&data)
 }
 
 #[cfg(test)]

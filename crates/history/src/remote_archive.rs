@@ -214,29 +214,6 @@ impl RemoteArchive {
         self.execute_command(&command).await
     }
 
-    /// Download a remote file to a local path.
-    ///
-    /// # Arguments
-    ///
-    /// * `remote_url` - URL of the remote file
-    /// * `local_path` - Destination path for the downloaded file
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if:
-    /// - No get command is configured
-    /// - The command execution fails
-    pub async fn download_file(&self, remote_url: &str, local_path: &Path) -> Result<()> {
-        let get_cmd = self.config.get_cmd.as_ref().ok_or_else(|| {
-            HistoryError::RemoteNotConfigured("get command not configured".to_string())
-        })?;
-
-        let local_str = local_path.to_string_lossy();
-        let command = Self::format_command(get_cmd, &[remote_url, &local_str]);
-
-        self.execute_command(&command).await
-    }
-
     /// Ensure a remote directory exists, creating it if necessary.
     ///
     /// This is a no-op if no mkdir command is configured.

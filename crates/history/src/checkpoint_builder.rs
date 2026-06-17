@@ -725,7 +725,10 @@ mod tests {
     fn make_tx_entry(seq: u32) -> TransactionHistoryEntry {
         TransactionHistoryEntry {
             ledger_seq: seq,
-            tx_set: crate::make_empty_tx_set(),
+            tx_set: stellar_xdr::curr::TransactionSet {
+                previous_ledger_hash: Hash([0u8; 32]),
+                txs: VecM::default(),
+            },
             ext: TransactionHistoryEntryExt::default(),
         }
     }

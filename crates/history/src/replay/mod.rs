@@ -49,19 +49,16 @@ pub(crate) mod diff;
 pub(crate) mod execution;
 pub(crate) mod metadata;
 
-use crate::{verify, HistoryError, Result};
 use henyey_bucket::EvictionIterator;
 use henyey_common::{Hash256, NetworkId};
-use henyey_ledger::{EntryChange, TransactionSetVariant};
+use henyey_ledger::EntryChange;
 use henyey_tx::soroban::PersistentModuleCache;
 use stellar_xdr::curr::{
-    BucketListType, LedgerEntry, LedgerHeader, LedgerKey, StateArchivalSettings, TransactionMeta,
-    TransactionResultPair,
+    LedgerEntry, LedgerHeader, LedgerKey, StateArchivalSettings, TransactionResultPair,
 };
 
 // Re-export public items from submodules.
 pub use execution::replay_ledger_with_execution;
-pub(crate) use metadata::replay_ledger;
 
 /// The result of replaying a single ledger.
 ///
@@ -248,75 +245,6 @@ impl Default for ReplayConfig {
     }
 }
 
-/// Replay a batch of ledgers.
-///
-/// This is used during catchup to replay all ledgers from a checkpoint
-/// to the target ledger.
-///
-/// # Arguments
-///
-/// * `ledgers` - Slice of (header, tx_set, results, metas) tuples
-/// * `config` - Replay configuration
-/// * `progress_callback` - Optional callback for progress updates
-pub fn replay_ledgers<F>(
-    ledgers: &[(
-        LedgerHeader,
-        TransactionSetVariant,
-        Vec<TransactionResultPair>,
-        Vec<TransactionMeta>,
-    )],
-    config: &ReplayConfig,
-    mut progress_callback: Option<F>,
-) -> Result<Vec<LedgerReplayResult>>
-where
-    F: FnMut(u32, u32), // (current, total)
-{
-    let total = ledgers.len() as u32;
-    let mut results = Vec::with_capacity(ledgers.len());
-
-    for (i, (header, tx_set, tx_results, tx_metas)) in ledgers.iter().enumerate() {
-        let result = replay_ledger(header, tx_set, tx_results, tx_metas, config)?;
-        results.push(result);
-
-        if let Some(ref mut callback) = progress_callback {
-            callback(i as u32 + 1, total);
-        }
-    }
-
-    Ok(results)
-}
-
-/// Verify ledger consistency after replay.
-///
-/// Checks that the final bucket list hash matches the expected hash
-/// from the last replayed ledger header.
-pub fn verify_replay_consistency(
-    final_header: &LedgerHeader,
-    computed_bucket_list_hash: &Hash256,
-) -> Result<()> {
-    verify::verify_ledger_hash(final_header, computed_bucket_list_hash)
-}
-
-/// Apply replay results to the bucket list.
-///
-/// This takes the changes from ledger replay and applies them to the
-/// bucket list to update the ledger state.
-pub fn apply_replay_to_bucket_list(
-    bucket_list: &mut henyey_bucket::BucketList,
-    replay_result: &LedgerReplayResult,
-) -> Result<()> {
-    bucket_list
-        .add_batch(
-            replay_result.sequence,
-            replay_result.protocol_version,
-            BucketListType::Live,
-            replay_result.init_entries.clone(),
-            replay_result.live_entries.clone(),
-            replay_result.dead_entries.clone(),
-        )
-        .map_err(HistoryError::Bucket)
-}
-
 /// Prepare a ledger close based on replay data.
 ///
 /// This is used when we've replayed history and want to set up the
@@ -396,7 +324,10 @@ pub(crate) mod tests {
     }
 
     pub(crate) fn make_empty_tx_set() -> TransactionSet {
-        crate::make_empty_tx_set()
+        TransactionSet {
+            previous_ledger_hash: Hash([0u8; 32]),
+            txs: VecM::default(),
+        }
     }
 
     #[test]

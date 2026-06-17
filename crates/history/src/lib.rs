@@ -188,14 +188,6 @@ pub use verify::{
 /// Result type for history operations.
 pub type Result<T> = std::result::Result<T, HistoryError>;
 
-/// Construct an empty `TransactionSet` with a zeroed previous-ledger hash.
-pub fn make_empty_tx_set() -> stellar_xdr::curr::TransactionSet {
-    stellar_xdr::curr::TransactionSet {
-        previous_ledger_hash: stellar_xdr::curr::Hash([0u8; 32]),
-        txs: stellar_xdr::curr::VecM::default(),
-    }
-}
-
 // Re-export archive manager types (added at end of file)
 
 /// Configuration for a single history archive.

@@ -325,16 +325,6 @@ impl HistoryArchive {
         self.base_url.join(path).map_err(HistoryError::UrlParse)
     }
 
-    /// Check if the archive is accessible by fetching the root HAS.
-    ///
-    /// # Returns
-    ///
-    /// `Ok(())` if the archive is accessible, or an error otherwise.
-    pub async fn check_accessible(&self) -> Result<(), HistoryError> {
-        self.fetch_root_has().await?;
-        Ok(())
-    }
-
     /// Get the current ledger from this archive.
     ///
     /// This is a convenience method that fetches the root HAS and returns
@@ -342,26 +332,6 @@ impl HistoryArchive {
     pub async fn fetch_current_ledger(&self) -> Result<u32, HistoryError> {
         let has = self.fetch_root_has().await?;
         Ok(has.current_ledger())
-    }
-
-    /// Download a single ledger header by sequence.
-    ///
-    /// This downloads the checkpoint containing the ledger and extracts
-    /// the specific header. For bulk downloads, use `fetch_ledger_headers`.
-    ///
-    /// # Arguments
-    ///
-    /// * `seq` - The ledger sequence number
-    ///
-    /// # Returns
-    ///
-    /// The ledger header for the specified sequence.
-    pub async fn fetch_ledger_header(
-        &self,
-        seq: u32,
-    ) -> Result<stellar_xdr::curr::LedgerHeader, HistoryError> {
-        let (header, _hash) = self.fetch_ledger_header_with_hash(seq).await?;
-        Ok(header)
     }
 
     /// Download a single ledger header with its pre-computed hash by sequence.
@@ -393,35 +363,6 @@ impl HistoryArchive {
             "Ledger header {} not found in checkpoint",
             seq
         )))
-    }
-
-    /// Download a transaction set for a specific ledger.
-    ///
-    /// This downloads the checkpoint containing the ledger and extracts
-    /// the transactions for that specific ledger.
-    ///
-    /// # Arguments
-    ///
-    /// * `seq` - The ledger sequence number
-    ///
-    /// # Returns
-    ///
-    /// The transaction set for the specified ledger.
-    pub async fn fetch_transaction_set(
-        &self,
-        seq: u32,
-    ) -> Result<stellar_xdr::curr::TransactionSet, HistoryError> {
-        let transactions = self.fetch_transactions(seq).await?;
-
-        // Find the transaction set with the matching ledger sequence
-        for entry in transactions {
-            if entry.ledger_seq == seq {
-                return Ok(entry.tx_set);
-            }
-        }
-
-        // Return empty transaction set if no transactions for this ledger
-        Ok(crate::make_empty_tx_set())
     }
 }
 
