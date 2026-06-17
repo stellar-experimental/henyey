@@ -443,43 +443,43 @@ pub struct ScpVerifyMetrics {
 
 /// Overlay connection breakdown by direction and state.
 #[derive(Debug, Clone, Copy, Default)]
-pub struct ConnectionBreakdown {
-    pub inbound_authenticated: u64,
-    pub outbound_authenticated: u64,
-    pub inbound_pending: u64,
-    pub outbound_pending: u64,
+pub(crate) struct ConnectionBreakdown {
+    pub(crate) inbound_authenticated: u64,
+    pub(crate) outbound_authenticated: u64,
+    pub(crate) inbound_pending: u64,
+    pub(crate) outbound_pending: u64,
 }
 
 /// Quorum health summary for metrics.
 #[derive(Debug, Clone, Copy, Default)]
-pub struct QuorumHealthMetrics {
+pub(crate) struct QuorumHealthMetrics {
     /// Nodes in Confirming or Externalized state.
-    pub agree: u64,
+    pub(crate) agree: u64,
     /// Nodes in Missing state.
-    pub missing: u64,
+    pub(crate) missing: u64,
     /// Nodes disagreeing (placeholder — not yet detectable from QuorumInfo).
-    pub disagree: u64,
+    pub(crate) disagree: u64,
     /// Minimum nodes that can fail before quorum is lost, computed via
     /// `find_closest_v_blocking` (excludes self). More precise than
     /// `total - threshold` for nested quorum sets.
-    pub fail_at: u64,
+    pub(crate) fail_at: u64,
     /// Nodes that are participating but lagging behind the local node's
     /// latest ledger. A subset of `agree` (delayed peers count as agreeing).
-    pub delayed: u64,
+    pub(crate) delayed: u64,
 }
 
 /// SCP timing for the most recently externalized slot.
 #[derive(Debug, Clone, Copy, Default)]
-pub struct ScpTimingMetrics {
+pub(crate) struct ScpTimingMetrics {
     /// Duration from slot creation to externalize (seconds).
-    pub externalize_duration_secs: Option<f64>,
+    pub(crate) externalize_duration_secs: Option<f64>,
     /// Duration from first local nomination vote to ballot protocol start (seconds).
     /// Matches stellar-core's `mNominateToPrepare`.
     /// None if either nomination start or ballot start was not recorded for this slot.
-    pub nomination_duration_secs: Option<f64>,
+    pub(crate) nomination_duration_secs: Option<f64>,
     /// Duration from first EXTERNALIZE seen (any node) to self-externalize (seconds).
     /// None on catchup/fast-forward paths where no externalize events were recorded.
-    pub first_to_self_externalize_secs: Option<f64>,
+    pub(crate) first_to_self_externalize_secs: Option<f64>,
 }
 
 impl std::fmt::Display for AppInfo {
