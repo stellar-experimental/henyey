@@ -41,10 +41,45 @@ pub struct LoadGenRequest {
     pub wasms: u32,
     /// Path to the pre-generated transactions file for `pay_pregenerated`.
     pub preloaded_transactions_file: Option<String>,
+
+    // --- Apply-load (`soroban_invoke_apply_load`) params ---
+    /// Whether the node runs in overlay-only mode (gate stand-in).
+    pub overlay_only_mode: bool,
+    /// `APPLY_LOAD_BL_BATCH_SIZE`.
+    pub apply_load_bl_batch_size: u32,
+    /// `APPLY_LOAD_BL_SIMULATED_LEDGERS`.
+    pub apply_load_bl_simulated_ledgers: u32,
+    /// `APPLY_LOAD_DATA_ENTRY_SIZE` (rounded to a multiple of 4 downstream).
+    pub apply_load_data_entry_size: u32,
+    /// `APPLY_LOAD_NUM_RW_ENTRIES[_DISTRIBUTION]` as `(values, weights)`.
+    pub apply_load_num_rw_entries: (Vec<u32>, Vec<u32>),
+    /// `APPLY_LOAD_NUM_DISK_READ_ENTRIES[_DISTRIBUTION]`.
+    pub apply_load_num_disk_read_entries: (Vec<u32>, Vec<u32>),
+    /// `APPLY_LOAD_TX_SIZE_BYTES[_DISTRIBUTION]`.
+    pub apply_load_tx_size_bytes: (Vec<u32>, Vec<u32>),
+    /// `APPLY_LOAD_EVENT_COUNT[_DISTRIBUTION]`.
+    pub apply_load_event_count: (Vec<u32>, Vec<u32>),
+    /// `APPLY_LOAD_INSTRUCTIONS[_DISTRIBUTION]`.
+    pub apply_load_instructions: (Vec<u32>, Vec<u32>),
+}
+
+/// Parse a comma-separated list of `u32` (e.g. `"10,20,30"`), ignoring empty
+/// entries. Used for the `APPLY_LOAD_*` distribution value/weight params.
+fn parse_u32_csv(s: &Option<String>) -> Vec<u32> {
+    match s {
+        None => Vec::new(),
+        Some(s) => s
+            .split(',')
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .filter_map(|t| t.parse::<u32>().ok())
+            .collect(),
+    }
 }
 
 impl From<GenerateLoadParams> for LoadGenRequest {
     fn from(p: GenerateLoadParams) -> Self {
+        let dist = |v: &Option<String>, w: &Option<String>| (parse_u32_csv(v), parse_u32_csv(w));
         Self {
             mode: p.mode,
             accounts: p.accounts,
@@ -59,6 +94,30 @@ impl From<GenerateLoadParams> for LoadGenRequest {
             instances: p.instances,
             wasms: p.wasms,
             preloaded_transactions_file: p.preloadedtransactionsfile.filter(|s| !s.is_empty()),
+            overlay_only_mode: p.overlayonlymode,
+            apply_load_bl_batch_size: p.applyloadblbatchsize,
+            apply_load_bl_simulated_ledgers: p.applyloadblsimulatedledgers,
+            apply_load_data_entry_size: p.applyloaddataentrysize,
+            apply_load_num_rw_entries: dist(
+                &p.applyloadnumrwentries,
+                &p.applyloadnumrwentriesdistribution,
+            ),
+            apply_load_num_disk_read_entries: dist(
+                &p.applyloadnumdiskreadentries,
+                &p.applyloadnumdiskreadentriesdistribution,
+            ),
+            apply_load_tx_size_bytes: dist(
+                &p.applyloadtxsizebytes,
+                &p.applyloadtxsizebytesdistribution,
+            ),
+            apply_load_event_count: dist(
+                &p.applyloadeventcount,
+                &p.applyloadeventcountdistribution,
+            ),
+            apply_load_instructions: dist(
+                &p.applyloadinstructions,
+                &p.applyloadinstructionsdistribution,
+            ),
         }
     }
 }
@@ -168,6 +227,69 @@ pub(crate) async fn generateload_handler(
 mod tests {
     use super::*;
 
+    /// A `GenerateLoadParams` with zeroed apply-load fields, for `..` struct
+    /// update in test literals that only care about the classic params.
+    fn apply_load_params_defaults() -> GenerateLoadParams {
+        GenerateLoadParams {
+            mode: String::new(),
+            accounts: 0,
+            txs: 0,
+            txrate: 0,
+            offset: 0,
+            spikeinterval: 0,
+            spikesize: 0,
+            maxfeerate: 0,
+            skiplowfeetxs: false,
+            minpercentsuccess: 0,
+            instances: 0,
+            wasms: 0,
+            preloadedtransactionsfile: None,
+            overlayonlymode: false,
+            applyloadblbatchsize: 1000,
+            applyloadblsimulatedledgers: 1000,
+            applyloaddataentrysize: 0,
+            applyloadnumrwentries: None,
+            applyloadnumrwentriesdistribution: None,
+            applyloadnumdiskreadentries: None,
+            applyloadnumdiskreadentriesdistribution: None,
+            applyloadtxsizebytes: None,
+            applyloadtxsizebytesdistribution: None,
+            applyloadeventcount: None,
+            applyloadeventcountdistribution: None,
+            applyloadinstructions: None,
+            applyloadinstructionsdistribution: None,
+        }
+    }
+
+    /// A `LoadGenRequest` with zeroed apply-load fields, for `..` struct update
+    /// in test literals.
+    fn apply_load_request_defaults() -> LoadGenRequest {
+        LoadGenRequest {
+            mode: String::new(),
+            accounts: 0,
+            txs: 0,
+            tx_rate: 0,
+            offset: 0,
+            spike_interval: 0,
+            spike_size: 0,
+            max_fee_rate: 0,
+            skip_low_fee_txs: false,
+            min_percent_success: 0,
+            instances: 0,
+            wasms: 0,
+            preloaded_transactions_file: None,
+            overlay_only_mode: false,
+            apply_load_bl_batch_size: 1000,
+            apply_load_bl_simulated_ledgers: 1000,
+            apply_load_data_entry_size: 0,
+            apply_load_num_rw_entries: (Vec::new(), Vec::new()),
+            apply_load_num_disk_read_entries: (Vec::new(), Vec::new()),
+            apply_load_tx_size_bytes: (Vec::new(), Vec::new()),
+            apply_load_event_count: (Vec::new(), Vec::new()),
+            apply_load_instructions: (Vec::new(), Vec::new()),
+        }
+    }
+
     #[test]
     fn test_load_gen_request_from_params() {
         let params = GenerateLoadParams {
@@ -184,6 +306,7 @@ mod tests {
             instances: 3,
             wasms: 2,
             preloadedtransactionsfile: None,
+            ..apply_load_params_defaults()
         };
 
         let request: LoadGenRequest = params.into();
@@ -218,6 +341,7 @@ mod tests {
             instances: 0,
             wasms: 0,
             preloaded_transactions_file: None,
+            ..apply_load_request_defaults()
         };
         let debug = format!("{:?}", request);
         assert!(debug.contains("pay"));
@@ -240,6 +364,7 @@ mod tests {
             instances: 4,
             wasms: 1,
             preloaded_transactions_file: Some("/tmp/txs.xdr".to_string()),
+            ..apply_load_request_defaults()
         };
         let cloned = request.clone();
         assert_eq!(cloned.mode, request.mode);
@@ -270,6 +395,7 @@ mod tests {
             instances: 0,
             wasms: 0,
             preloadedtransactionsfile: Some("/data/pregenerated.xdr".to_string()),
+            ..apply_load_params_defaults()
         };
         let req: LoadGenRequest = params.clone().into();
         assert_eq!(
@@ -281,6 +407,42 @@ mod tests {
         params.preloadedtransactionsfile = Some(String::new());
         let req2: LoadGenRequest = params.into();
         assert_eq!(req2.preloaded_transactions_file, None);
+    }
+
+    /// #3309: the `APPLY_LOAD_*` params (scalars + comma-separated
+    /// distribution value/weight strings) flow through `GenerateLoadParams`
+    /// into `LoadGenRequest`, parsing CSV into `(values, weights)` pairs.
+    #[test]
+    fn test_apply_load_params_plumbing() {
+        let params = GenerateLoadParams {
+            mode: "soroban_invoke_apply_load".to_string(),
+            applyloadblbatchsize: 500,
+            applyloadblsimulatedledgers: 200,
+            applyloaddataentrysize: 7,
+            overlayonlymode: true,
+            applyloadnumrwentries: Some("1,2,3".to_string()),
+            applyloadnumrwentriesdistribution: Some("4,5,6".to_string()),
+            applyloadinstructions: Some("100, 200 ,".to_string()),
+            applyloadinstructionsdistribution: Some("1,1".to_string()),
+            ..apply_load_params_defaults()
+        };
+        let req: LoadGenRequest = params.into();
+        assert!(req.overlay_only_mode);
+        assert_eq!(req.apply_load_bl_batch_size, 500);
+        assert_eq!(req.apply_load_bl_simulated_ledgers, 200);
+        // data_entry_size is left raw here (rounding happens in main.rs).
+        assert_eq!(req.apply_load_data_entry_size, 7);
+        assert_eq!(
+            req.apply_load_num_rw_entries,
+            (vec![1, 2, 3], vec![4, 5, 6])
+        );
+        // Empty CSV entries are ignored.
+        assert_eq!(req.apply_load_instructions, (vec![100, 200], vec![1, 1]));
+        // Unspecified distributions default to empty.
+        assert_eq!(
+            req.apply_load_event_count,
+            (Vec::<u32>::new(), Vec::<u32>::new())
+        );
     }
 
     /// Verify that mode=stop is handled at the HTTP layer before is_running

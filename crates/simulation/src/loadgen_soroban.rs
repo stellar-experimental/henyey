@@ -11,12 +11,15 @@ use stellar_xdr::curr::{
     ContractIdPreimageFromAddress, CreateContractArgs, DecoratedSignature, Hash, HashIdPreimage,
     HashIdPreimageContractId, HostFunction, Int128Parts, InvokeContractArgs, InvokeHostFunctionOp,
     LedgerFootprint, LedgerKey, LedgerKeyContractCode, LedgerKeyContractData, Limits, Memo,
-    MuxedAccount, Operation, OperationBody, Preconditions, ScAddress, ScSymbol, ScVal, ScVec,
-    SequenceNumber, Signature, SignatureHint, SorobanAuthorizationEntry, SorobanAuthorizedFunction,
-    SorobanAuthorizedInvocation, SorobanCredentials, SorobanResources, SorobanTransactionData,
-    SorobanTransactionDataExt, Transaction, TransactionEnvelope, TransactionExt,
-    TransactionV1Envelope, Uint256, VecM, WriteXdr,
+    MuxedAccount, Operation, OperationBody, Preconditions, ScAddress, ScBytes, ScSymbol, ScVal,
+    ScVec, SequenceNumber, Signature, SignatureHint, SorobanAuthorizationEntry,
+    SorobanAuthorizedFunction, SorobanAuthorizedInvocation, SorobanCredentials, SorobanResources,
+    SorobanResourcesExtV0, SorobanTransactionData, SorobanTransactionDataExt, Transaction,
+    TransactionEnvelope, TransactionExt, TransactionV1Envelope, Uint256, VecM, WriteXdr,
 };
+
+use crate::loadgen::{sample_discrete, ContractInstance};
+use rand::Rng;
 
 /// Embedded loadgen test contract WASM (from stellar-core P21 test wasms).
 ///
@@ -101,6 +104,90 @@ const CREATE_UPGRADE_WRITE_BYTES: u32 = 3_100;
 /// fee-bound, not part of the upgrade-set content hash (the parity-critical
 /// quantity), so an over-estimate is acceptable for load generation.
 const CREATE_UPGRADE_RESOURCE_FEE: i64 = 50_000_000;
+
+// ---------------------------------------------------------------------------
+// Apply-load (V2) tuned instruction model.
+//
+// Faithful port of stellar-core `TxGenerator::invokeSorobanLoadTransactionV2`
+// (TxGenerator.cpp:551). These constants are the load-bearing parity
+// quantities — the random draws are non-consensus, but the instruction model
+// the draws feed into must match stellar-core exactly.
+// ---------------------------------------------------------------------------
+
+/// Base instruction count for the V2 apply-load invocation
+/// (`baseInstructionCount`, TxGenerator.cpp:558).
+const APPLY_LOAD_BASE_INSTRUCTIONS: u32 = 737_119;
+
+/// Baseline transaction size in bytes used to compute padding overhead
+/// (`baselineTxSizeBytes`, TxGenerator.cpp:559).
+const APPLY_LOAD_BASELINE_TX_SIZE_BYTES: u32 = 256;
+
+/// Per-event size in bytes (`SOROBAN_LOAD_V2_EVENT_SIZE_BYTES`, TxGenerator.h:103).
+const APPLY_LOAD_EVENT_SIZE_BYTES: u32 = 80;
+
+/// Instructions modeled per guest CPU cycle (`instructionsPerGuestCycle`).
+const APPLY_LOAD_INSTRUCTIONS_PER_GUEST_CYCLE: u32 = 40;
+
+/// Instructions modeled per host CPU cycle (`instructionsPerHostCycle`).
+/// Kept for parity documentation; the V2 path deliberately uses guest-only
+/// cycles (see TxGenerator.cpp:702), so host cycles are always 0.
+#[allow(dead_code)]
+const APPLY_LOAD_INSTRUCTIONS_PER_HOST_CYCLE: u32 = 4_875;
+
+/// Instructions modeled per byte of auth (padding) payload
+/// (`instructionsPerAuthByte`).
+const APPLY_LOAD_INSTRUCTIONS_PER_AUTH_BYTE: u32 = 35;
+
+/// Instructions modeled per emitted event (`instructionsPerEvent`).
+const APPLY_LOAD_INSTRUCTIONS_PER_EVENT: u32 = 8_500;
+
+/// Instructions modeled per byte written to entries (`instructionsPerEntryByte`).
+const APPLY_LOAD_INSTRUCTIONS_PER_ENTRY_BYTE: u32 = 44;
+
+// Storage-instruction quadratic coefficients (TxGenerator.cpp:677):
+// instructionsForEntries = 205*n^2 + 12000*n + 65485.
+const APPLY_LOAD_STORAGE_QUADRATIC_A: u32 = 205;
+const APPLY_LOAD_STORAGE_QUADRATIC_B: u32 = 12_000;
+const APPLY_LOAD_STORAGE_QUADRATIC_C: u32 = 65_485;
+
+// ---------------------------------------------------------------------------
+// Apply-load (V2) tx construction inputs/outputs
+// ---------------------------------------------------------------------------
+
+/// Sampling inputs for [`SorobanTxBuilder::invoke_soroban_apply_load_tx`].
+///
+/// Each `(values, weights)` pair is a discrete distribution sampled via
+/// [`crate::loadgen::sample_discrete`] (empty `values` ⇒ default `0`). The
+/// scalar fields come from the `APPLY_LOAD_BL_*` / `APPLY_LOAD_DATA_ENTRY_SIZE`
+/// config and the dispatch in `LoadGenerator` (LoadGenerator.cpp:785).
+pub struct ApplyLoadTxParams {
+    /// `APPLY_LOAD_BL_BATCH_SIZE * APPLY_LOAD_BL_SIMULATED_LEDGERS`.
+    pub data_entry_count: u64,
+    /// `APPLY_LOAD_DATA_ENTRY_SIZE` (already rounded to a multiple of 4).
+    pub data_entry_size: u32,
+    /// `APPLY_LOAD_NUM_RW_ENTRIES[_DISTRIBUTION]`.
+    pub num_rw_entries: (Vec<u32>, Vec<u32>),
+    /// `APPLY_LOAD_NUM_DISK_READ_ENTRIES[_DISTRIBUTION]`.
+    pub num_disk_read_entries: (Vec<u32>, Vec<u32>),
+    /// `APPLY_LOAD_TX_SIZE_BYTES[_DISTRIBUTION]`.
+    pub tx_size_bytes: (Vec<u32>, Vec<u32>),
+    /// `APPLY_LOAD_EVENT_COUNT[_DISTRIBUTION]`.
+    pub event_count: (Vec<u32>, Vec<u32>),
+    /// `APPLY_LOAD_INSTRUCTIONS[_DISTRIBUTION]`.
+    pub instructions: (Vec<u32>, Vec<u32>),
+    /// Number of pre-populated hot-archive entries (mirrors
+    /// `TxGenerator::mPrePopulatedArchivedEntries`). When 0, the autorestore
+    /// branch is dormant — exactly as stellar-core.
+    pub pre_populated_archived_entries: u32,
+}
+
+/// Result of building a V2 apply-load tx.
+pub struct ApplyLoadBuiltTx {
+    /// The signed transaction envelope.
+    pub envelope: TransactionEnvelope,
+    /// Number of archived entries simulated for autorestore (0 when dormant).
+    pub archived_entries_restored: u32,
+}
 
 // ---------------------------------------------------------------------------
 // SorobanTxBuilder
@@ -397,6 +484,230 @@ impl SorobanTxBuilder {
         self.build_soroban_envelope(source, sequence, op, resources, resource_fee, inclusion_fee)
     }
 
+    /// Build a V2 apply-load contract invocation transaction.
+    ///
+    /// Faithful port of stellar-core
+    /// `TxGenerator::invokeSorobanLoadTransactionV2` (TxGenerator.cpp:551).
+    /// Calls `do_cpu_only_work(u32 guest_cycles, u32 host_cycles, u32 event_count)`
+    /// with explicit `SorobanResources` (footprint + instructions + write/disk
+    /// bytes), op-size padding (`increaseOpSize`, TxGenerator.cpp:361), and the
+    /// archived-entry index list in `SorobanResourcesExtV0` when non-empty.
+    ///
+    /// The RNG is threaded through all samples in stellar-core's exact order
+    /// (disk-read → rw → entry-id loop → tx-size → event-count → instructions).
+    /// The draws are non-consensus (never hashed), so parity is on the
+    /// instruction *model*, with determinism guaranteed by the injected seeded
+    /// RNG.
+    ///
+    /// `next_key_to_restore` is the autorestore cursor (`mNextKeyToRestore`);
+    /// it is advanced by the number of restored entries. When
+    /// `params.pre_populated_archived_entries == 0` the autorestore branch is
+    /// dormant and the cursor is untouched.
+    #[allow(clippy::too_many_arguments)]
+    pub fn invoke_soroban_apply_load_tx<R: Rng + ?Sized>(
+        &self,
+        source: &SecretKey,
+        sequence: i64,
+        instance: &ContractInstance,
+        params: &ApplyLoadTxParams,
+        next_key_to_restore: &mut u32,
+        inclusion_fee: u32,
+        rng: &mut R,
+    ) -> anyhow::Result<ApplyLoadBuiltTx> {
+        let contract_address = make_contract_address(&instance.contract_id);
+
+        // Simulate disk reads via autorestore. Dormant when there are no
+        // pre-populated archived entries (TxGenerator.cpp:573).
+        let mut archive_entries_to_restore = 0u32;
+        if params.pre_populated_archived_entries != 0 {
+            archive_entries_to_restore = sample_discrete(
+                &params.num_disk_read_entries.0,
+                &params.num_disk_read_entries.1,
+                0,
+                rng,
+            );
+        }
+
+        // RW entries; restoration counts as a write, so subtract it (saturating).
+        let mut rw_entries =
+            sample_discrete(&params.num_rw_entries.0, &params.num_rw_entries.1, 0, rng);
+        rw_entries = rw_entries.saturating_sub(archive_entries_to_restore);
+
+        // Parity: stellar-core `releaseAssert(dataEntryCount > rwEntries)`
+        // (TxGenerator.cpp:596). Keep it a hard abort — do NOT soften to a clamp.
+        assert!(
+            params.data_entry_count > rw_entries as u64,
+            "APPLY_LOAD: data_entry_count ({}) must exceed rw_entries ({}); \
+             increase APPLY_LOAD_BL_BATCH_SIZE * APPLY_LOAD_BL_SIMULATED_LEDGERS",
+            params.data_entry_count,
+            rw_entries
+        );
+
+        let mut read_write: Vec<LedgerKey> = Vec::new();
+        let mut used_entries: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        // entryDist(0, dataEntryCount - 1); generate `entry_count` UNIQUE keys
+        // with the `--i` retry on collision (TxGenerator.cpp:600).
+        let mut generate_entries = |entry_count: u32, footprint: &mut Vec<LedgerKey>| {
+            let mut i = 0u32;
+            while i < entry_count {
+                let entry_id = rng.gen_range(0..params.data_entry_count);
+                if used_entries.insert(entry_id) {
+                    footprint.push(LedgerKey::ContractData(LedgerKeyContractData {
+                        contract: contract_address.clone(),
+                        key: ScVal::U64(entry_id),
+                        durability: ContractDataDurability::Persistent,
+                    }));
+                    i += 1;
+                }
+                // else: collision → retry (do not advance i).
+            }
+        };
+        generate_entries(rw_entries, &mut read_write);
+
+        // Archived autorestore entries appended to the RW footprint, recording
+        // their RW indexes (TxGenerator.cpp:621).
+        let mut archived_indexes: Vec<u32> = Vec::new();
+        if archive_entries_to_restore > 0 {
+            let end_index = *next_key_to_restore + archive_entries_to_restore;
+            if end_index > params.pre_populated_archived_entries {
+                anyhow::bail!(
+                    "Ran out of hot archive entries: {} > {}",
+                    end_index,
+                    params.pre_populated_archived_entries
+                );
+            }
+            while *next_key_to_restore < end_index {
+                let lk = get_key_for_archived_entry(*next_key_to_restore as u64);
+                read_write.push(lk);
+                archived_indexes.push((read_write.len() - 1) as u32);
+                *next_key_to_restore += 1;
+            }
+        }
+
+        let mut resources = SorobanResources {
+            footprint: LedgerFootprint {
+                read_only: instance
+                    .read_only_keys
+                    .clone()
+                    .try_into()
+                    .unwrap_or_default(),
+                read_write: read_write.try_into().unwrap_or_default(),
+            },
+            instructions: 0,
+            disk_read_bytes: 0,
+            write_bytes: 0,
+        };
+
+        // tx overhead = baseline + xdr_size(resources) (TxGenerator.cpp:643).
+        let tx_overhead_bytes =
+            APPLY_LOAD_BASELINE_TX_SIZE_BYTES.saturating_add(xdr_size(&resources) as u32);
+        let desired_tx_bytes =
+            sample_discrete(&params.tx_size_bytes.0, &params.tx_size_bytes.1, 0, rng);
+        let padding_bytes = desired_tx_bytes.saturating_sub(tx_overhead_bytes);
+        let entries_write_size = params
+            .data_entry_size
+            .saturating_mul(rw_entries + archive_entries_to_restore);
+
+        let event_count = sample_discrete(&params.event_count.0, &params.event_count.1, 0, rng);
+        let target_instructions =
+            sample_discrete(&params.instructions.0, &params.instructions.1, 0, rng);
+
+        resources.instructions = target_instructions;
+        resources.write_bytes = entries_write_size;
+        resources.disk_read_bytes = params
+            .data_entry_size
+            .saturating_mul(archive_entries_to_restore);
+
+        let num_entries =
+            rw_entries + archive_entries_to_restore + instance.read_only_keys.len() as u32;
+
+        // Storage-instruction quadratic (TxGenerator.cpp:677).
+        let instructions_for_entries = APPLY_LOAD_STORAGE_QUADRATIC_A
+            .saturating_mul(num_entries.saturating_mul(num_entries))
+            .saturating_add(APPLY_LOAD_STORAGE_QUADRATIC_B.saturating_mul(num_entries))
+            .saturating_add(APPLY_LOAD_STORAGE_QUADRATIC_C);
+
+        let instructions_without_cpu = APPLY_LOAD_BASE_INSTRUCTIONS
+            .saturating_add(APPLY_LOAD_INSTRUCTIONS_PER_AUTH_BYTE.saturating_mul(padding_bytes))
+            .saturating_add(
+                APPLY_LOAD_INSTRUCTIONS_PER_ENTRY_BYTE.saturating_mul(entries_write_size),
+            )
+            .saturating_add(instructions_for_entries)
+            .saturating_add(APPLY_LOAD_INSTRUCTIONS_PER_EVENT.saturating_mul(event_count));
+
+        let mut cpu_target = target_instructions.saturating_sub(instructions_without_cpu);
+
+        // Guest-only cycles (TxGenerator.cpp:702): host cycles deliberately 0.
+        let guest_cycles = cpu_target / APPLY_LOAD_INSTRUCTIONS_PER_GUEST_CYCLE;
+        cpu_target -= guest_cycles * APPLY_LOAD_INSTRUCTIONS_PER_GUEST_CYCLE;
+        let _ = cpu_target;
+        let host_cycles: u32 = 0;
+
+        // do_cpu_only_work(makeU32(guest), makeU32(host), makeU32(events)) —
+        // all 3 args U32, host_cycles still emitted (TxGenerator.cpp:710).
+        let host_fn = HostFunction::InvokeContract(InvokeContractArgs {
+            contract_address,
+            function_name: ScSymbol("do_cpu_only_work".try_into().unwrap()),
+            args: vec![
+                ScVal::U32(guest_cycles),
+                ScVal::U32(host_cycles),
+                ScVal::U32(event_count),
+            ]
+            .try_into()
+            .unwrap_or_default(),
+        });
+
+        let mut op = Operation {
+            source_account: None,
+            body: OperationBody::InvokeHostFunction(InvokeHostFunctionOp {
+                host_function: host_fn,
+                auth: VecM::default(),
+            }),
+        };
+
+        increase_op_size(&mut op, padding_bytes);
+
+        // Resource fee: henyey has no public `sorobanResourceFee` over raw
+        // `SorobanResources` (same gap #3314 documented for create_upgrade);
+        // the fee is a non-hashed bound, so a generous over-estimate is
+        // acceptable. stellar-core feeds `eventSize * eventCount` of event
+        // payload into the fee (TxGenerator.cpp:716); we fold that into the
+        // over-estimate, then apply the `+1_000_000 + restored * 100_000`
+        // buffer (TxGenerator.cpp:719) on top.
+        let event_payload_bytes = (APPLY_LOAD_EVENT_SIZE_BYTES as i64) * (event_count as i64);
+        let resource_fee = INVOKE_RESOURCE_FEE
+            + event_payload_bytes
+            + 1_000_000
+            + (archive_entries_to_restore as i64) * 100_000;
+
+        // Archived-index list lives in SorobanTransactionDataExt::V1 ↦
+        // SorobanResourcesExtV0.archived_soroban_entries — only when non-empty
+        // (else the default V0 ext), exactly stellar-core's
+        // `archivedIndexes.empty() ? nullopt : ...`.
+        let ext = if archived_indexes.is_empty() {
+            SorobanTransactionDataExt::V0
+        } else {
+            SorobanTransactionDataExt::V1(SorobanResourcesExtV0 {
+                archived_soroban_entries: archived_indexes.try_into().unwrap_or_default(),
+            })
+        };
+
+        let envelope = self.build_soroban_envelope_with_ext(
+            source,
+            sequence,
+            op,
+            resources,
+            ext,
+            resource_fee,
+            inclusion_fee,
+        )?;
+
+        Ok(ApplyLoadBuiltTx {
+            envelope,
+            archived_entries_restored: archive_entries_to_restore,
+        })
+    }
+
     /// Build a SAC (Stellar Asset Contract) creation transaction.
     ///
     /// Matches stellar-core `TxGenerator::createSACTransaction()`.
@@ -622,11 +933,33 @@ impl SorobanTxBuilder {
         resource_fee: i64,
         inclusion_fee: u32,
     ) -> anyhow::Result<TransactionEnvelope> {
+        self.build_soroban_envelope_with_ext(
+            source,
+            sequence,
+            op,
+            resources,
+            SorobanTransactionDataExt::V0,
+            resource_fee,
+            inclusion_fee,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build_soroban_envelope_with_ext(
+        &self,
+        source: &SecretKey,
+        sequence: i64,
+        op: Operation,
+        resources: SorobanResources,
+        ext: SorobanTransactionDataExt,
+        resource_fee: i64,
+        inclusion_fee: u32,
+    ) -> anyhow::Result<TransactionEnvelope> {
         let total_fee = inclusion_fee + resource_fee as u32;
         let source_muxed = MuxedAccount::Ed25519(Uint256(*source.public_key().as_bytes()));
 
         let soroban_data = SorobanTransactionData {
-            ext: SorobanTransactionDataExt::V0,
+            ext,
             resources,
             resource_fee,
         };
@@ -671,6 +1004,66 @@ pub fn compute_contract_id(
         .to_xdr(Limits::none())
         .map_err(|e| anyhow::anyhow!("failed to encode contract ID preimage: {}", e))?;
     Ok(Hash256::hash(&bytes))
+}
+
+/// Returns the `LedgerKey` for a pre-populated hot-archive entry at `index`.
+///
+/// Faithful port of stellar-core `ApplyLoad::getKeyForArchivedEntry`
+/// (ApplyLoad.cpp:409): a PERSISTENT `CONTRACT_DATA` key whose contract is
+/// `sha256("archived-entry")` and whose key is `SCV_U64(index)`.
+pub fn get_key_for_archived_entry(index: u64) -> LedgerKey {
+    let contract_id = Hash256::hash(b"archived-entry");
+    LedgerKey::ContractData(LedgerKeyContractData {
+        contract: ScAddress::Contract(ContractId(Hash(contract_id.0))),
+        key: ScVal::U64(index),
+        durability: ContractDataDurability::Persistent,
+    })
+}
+
+/// XDR-encoded size of a value, in bytes (parity helper for `xdr::xdr_size`).
+fn xdr_size<T: WriteXdr>(v: &T) -> usize {
+    v.to_xdr(Limits::none()).map(|b| b.len()).unwrap_or(0)
+}
+
+/// Pad an INVOKE_HOST_FUNCTION op up to `increase_up_to_bytes` by attaching a
+/// source-account auth entry carrying an `SCV_BYTES` payload.
+///
+/// Faithful port of stellar-core `increaseOpSize` (TxGenerator.cpp:361): the
+/// auth + empty-bytes overhead is subtracted first; if the overhead already
+/// exceeds the target, no padding is added.
+fn increase_op_size(op: &mut Operation, increase_up_to_bytes: u32) {
+    if increase_up_to_bytes == 0 {
+        return;
+    }
+
+    // SOROBAN_CREDENTIALS_SOURCE_ACCOUNT auth with an empty-bytes contract-fn arg.
+    let mut auth = SorobanAuthorizationEntry {
+        credentials: SorobanCredentials::SourceAccount,
+        root_invocation: SorobanAuthorizedInvocation {
+            function: SorobanAuthorizedFunction::ContractFn(InvokeContractArgs {
+                contract_address: ScAddress::Contract(ContractId(Hash([0u8; 32]))),
+                function_name: ScSymbol(Default::default()),
+                args: VecM::default(),
+            }),
+            sub_invocations: VecM::default(),
+        },
+    };
+
+    let empty_val = ScVal::Bytes(ScBytes(Default::default()));
+    let overhead_bytes = (xdr_size(&auth) + xdr_size(&empty_val)) as u32;
+    let payload_len = increase_up_to_bytes.saturating_sub(overhead_bytes);
+
+    let val = ScVal::Bytes(ScBytes(
+        vec![0u8; payload_len as usize]
+            .try_into()
+            .unwrap_or_default(),
+    ));
+    if let SorobanAuthorizedFunction::ContractFn(ref mut cf) = auth.root_invocation.function {
+        cf.args = vec![val].try_into().unwrap_or_default();
+    }
+    if let OperationBody::InvokeHostFunction(ref mut ihf) = op.body {
+        ihf.auth = vec![auth].try_into().unwrap_or_default();
+    }
 }
 
 /// Construct an `ScVal::I128` from a Rust `i128`.

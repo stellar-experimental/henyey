@@ -30,7 +30,8 @@ use tracing::{debug, info, warn};
 
 use crate::loadgen_soroban::{
     compute_contract_id, contract_code_key, contract_instance_key, make_account_address,
-    make_contract_address, BatchTransfer, ContractInvocation, SacTransfer, SorobanTxBuilder,
+    make_contract_address, ApplyLoadTxParams, BatchTransfer, ContractInvocation, SacTransfer,
+    SorobanTxBuilder,
 };
 
 // ---------------------------------------------------------------------------
@@ -132,6 +133,13 @@ pub enum LoadGenMode {
     ///
     /// Matches stellar-core `PAY_PREGENERATED`.
     PayPregenerated,
+    /// Heaviest apply-load throughput mode: builds V2 Soroban invoke
+    /// transactions (`do_cpu_only_work`) via distribution-sampled resources
+    /// and the tuned instruction model. Requires a prior `SorobanInvokeSetup`
+    /// (reads the per-account `contract_instances` map) and overlay-only mode.
+    ///
+    /// Matches stellar-core `SOROBAN_INVOKE_APPLY_LOAD`.
+    SorobanInvokeApplyLoad,
 }
 
 impl LoadGenMode {
@@ -148,6 +156,7 @@ impl LoadGenMode {
                 | Self::MixedClassicSoroban
                 | Self::SorobanUpgradeSetup
                 | Self::SorobanCreateUpgrade
+                | Self::SorobanInvokeApplyLoad
         )
     }
 
@@ -169,14 +178,20 @@ impl LoadGenMode {
                 | Self::MixedClassicSoroban
                 | Self::SorobanCreateUpgrade
                 | Self::PayPregenerated
+                | Self::SorobanInvokeApplyLoad
         )
     }
 
     /// Returns `true` for modes that invoke previously deployed contracts.
     ///
     /// Matches stellar-core `modeSetsUpInvoke()` | `modeInvokes()` invoke check.
+    /// `SorobanInvokeApplyLoad` reads the per-account `contract_instances` map
+    /// exactly like `SorobanInvoke`, so it must build that map in `start()`.
     pub fn mode_invokes(self) -> bool {
-        matches!(self, Self::SorobanInvoke | Self::MixedClassicSoroban)
+        matches!(
+            self,
+            Self::SorobanInvoke | Self::MixedClassicSoroban | Self::SorobanInvokeApplyLoad
+        )
     }
 
     /// Returns `true` for modes that set up contract instances (upload + deploy).
@@ -184,6 +199,112 @@ impl LoadGenMode {
     /// Matches stellar-core `modeSetsUpInvoke()`.
     pub fn mode_sets_up_invoke(self) -> bool {
         matches!(self, Self::SorobanInvokeSetup)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// sample_discrete (TxGenerator.cpp:34)
+// ---------------------------------------------------------------------------
+
+/// Sample from a discrete distribution of `values` with `weights`.
+///
+/// Faithful port of stellar-core `sampleDiscrete<T>` (TxGenerator.cpp:34):
+/// returns `default_value` when `values` is empty, else a weighted pick.
+///
+/// stellar-core uses `std::discrete_distribution` over a single global engine;
+/// henyey threads an injectable RNG so sampling is unit-testable and
+/// deterministic under a seed. The drawn *values* are non-consensus (never
+/// hashed), so bit-for-bit parity with C++ is not required — parity is on the
+/// formula the draws feed, and determinism on the seeded RNG.
+pub fn sample_discrete<R: rand::Rng + ?Sized>(
+    values: &[u32],
+    weights: &[u32],
+    default_value: u32,
+    rng: &mut R,
+) -> u32 {
+    if values.is_empty() {
+        return default_value;
+    }
+    // Mirror std::discrete_distribution: if weights are absent/degenerate,
+    // fall back to a uniform pick over the values.
+    let usable_weights = weights.len() == values.len() && weights.iter().any(|&w| w > 0);
+    if usable_weights {
+        match rand::distributions::WeightedIndex::new(weights.iter().copied()) {
+            Ok(dist) => {
+                use rand::distributions::Distribution;
+                return values[dist.sample(rng)];
+            }
+            Err(_) => {}
+        }
+    }
+    values[rng.gen_range(0..values.len())]
+}
+
+// ---------------------------------------------------------------------------
+// LoadGenApplyLoadConfig (APPLY_LOAD_* surface consumed by the V2 mode)
+// ---------------------------------------------------------------------------
+
+/// The `APPLY_LOAD_*` config subset the `SorobanInvokeApplyLoad` mode reads.
+///
+/// This is intentionally narrow — only the parameters the V2 tx path consumes
+/// (the bucket-list batch/ledger scalars, the data-entry size, and the 5
+/// sampling distributions). It is distinct from the broader
+/// [`crate::ApplyLoadConfig`] used by the direct-apply ledger-simulation
+/// harness, which carries ledger/tx resource-limit knobs out of scope here.
+///
+/// Defaults mirror stellar-core `Config.h` (batch=1000, simulated=1000,
+/// data_entry_size=0, empty distributions).
+#[derive(Debug, Clone)]
+pub struct LoadGenApplyLoadConfig {
+    /// `APPLY_LOAD_BL_BATCH_SIZE`.
+    pub bl_batch_size: u32,
+    /// `APPLY_LOAD_BL_SIMULATED_LEDGERS`.
+    pub bl_simulated_ledgers: u32,
+    /// `APPLY_LOAD_DATA_ENTRY_SIZE` (rounded up to a multiple of 4).
+    pub data_entry_size: u32,
+    /// `APPLY_LOAD_NUM_RW_ENTRIES[_DISTRIBUTION]` as `(values, weights)`.
+    pub num_rw_entries: (Vec<u32>, Vec<u32>),
+    /// `APPLY_LOAD_NUM_DISK_READ_ENTRIES[_DISTRIBUTION]`.
+    pub num_disk_read_entries: (Vec<u32>, Vec<u32>),
+    /// `APPLY_LOAD_TX_SIZE_BYTES[_DISTRIBUTION]`.
+    pub tx_size_bytes: (Vec<u32>, Vec<u32>),
+    /// `APPLY_LOAD_EVENT_COUNT[_DISTRIBUTION]`.
+    pub event_count: (Vec<u32>, Vec<u32>),
+    /// `APPLY_LOAD_INSTRUCTIONS[_DISTRIBUTION]`.
+    pub instructions: (Vec<u32>, Vec<u32>),
+}
+
+impl Default for LoadGenApplyLoadConfig {
+    fn default() -> Self {
+        Self {
+            bl_batch_size: 1000,
+            bl_simulated_ledgers: 1000,
+            data_entry_size: 0,
+            num_rw_entries: (Vec::new(), Vec::new()),
+            num_disk_read_entries: (Vec::new(), Vec::new()),
+            tx_size_bytes: (Vec::new(), Vec::new()),
+            event_count: (Vec::new(), Vec::new()),
+            instructions: (Vec::new(), Vec::new()),
+        }
+    }
+}
+
+impl LoadGenApplyLoadConfig {
+    /// `data_entry_count = APPLY_LOAD_BL_BATCH_SIZE * APPLY_LOAD_BL_SIMULATED_LEDGERS`
+    /// (LoadGenerator.cpp:792).
+    pub fn data_entry_count(&self) -> u64 {
+        self.bl_batch_size as u64 * self.bl_simulated_ledgers as u64
+    }
+
+    /// Round `APPLY_LOAD_DATA_ENTRY_SIZE` up to a multiple of 4
+    /// (Config.cpp:1608).
+    pub fn round_data_entry_size(size: u32) -> u32 {
+        let rem = size % 4;
+        if rem == 0 {
+            size
+        } else {
+            size + (4 - rem)
+        }
     }
 }
 
@@ -239,6 +360,15 @@ pub struct GeneratedLoadConfig {
     /// Path to the pre-generated transactions file for `PayPregenerated`.
     pub preloaded_transactions_file: Option<std::path::PathBuf>,
 
+    // --- Apply-load (V2) fields ---
+    /// `APPLY_LOAD_*` config subset consumed by `SorobanInvokeApplyLoad`.
+    pub apply_load: LoadGenApplyLoadConfig,
+    /// Whether the node is running in overlay-only mode. Gate stand-in for
+    /// stellar-core's `getRunInOverlayOnlyMode()` (henyey has no equivalent
+    /// yet). `SorobanInvokeApplyLoad` requires this to be `true`
+    /// (LoadGenerator.cpp:293).
+    pub overlay_only_mode: bool,
+
     // --- Legacy simple-mode fields (backward compat) ---
     /// Account names for simple step_plan mode.
     pub accounts: Vec<String>,
@@ -272,6 +402,8 @@ impl Default for GeneratedLoadConfig {
             mix_invoke_weight: 1,
             soroban_upgrade_config: Default::default(),
             preloaded_transactions_file: None,
+            apply_load: LoadGenApplyLoadConfig::default(),
+            overlay_only_mode: false,
             accounts: Vec::new(),
             txs_per_step: 0,
             steps: 0,
@@ -371,14 +503,28 @@ pub struct TxGenerator {
     pub(crate) app: Arc<App>,
     /// Network passphrase for transaction signing.
     pub(crate) network_passphrase: String,
+    /// Number of pre-populated hot-archive entries (mirrors stellar-core
+    /// `mPrePopulatedArchivedEntries`). Defaults to 0, so the apply-load V2
+    /// autorestore branch is dormant — henyey builds no bucket-prepopulation
+    /// harness here (out of scope, see #3309).
+    pre_populated_archived_entries: u32,
+    /// Autorestore cursor (mirrors stellar-core `mNextKeyToRestore`).
+    next_key_to_restore: u32,
+    /// Per-run RNG threaded through the non-consensus apply-load distribution
+    /// draws. Seeded deterministically so a run is reproducible.
+    apply_load_rng: rand_chacha::ChaCha8Rng,
 }
 
 impl TxGenerator {
     pub fn new(app: Arc<App>, network_passphrase: String) -> Self {
+        use rand::SeedableRng;
         Self {
             accounts: BTreeMap::new(),
             app,
             network_passphrase,
+            pre_populated_archived_entries: 0,
+            next_key_to_restore: 0,
+            apply_load_rng: rand_chacha::ChaCha8Rng::seed_from_u64(0),
         }
     }
 
@@ -770,6 +916,64 @@ impl TxGenerator {
         Ok((account_id, envelope))
     }
 
+    /// Build a V2 apply-load contract invocation transaction.
+    ///
+    /// Faithful port of stellar-core
+    /// `TxGenerator::invokeSorobanLoadTransactionV2` (TxGenerator.cpp:551).
+    /// The distribution-sampled tx construction lives in
+    /// [`SorobanTxBuilder::invoke_soroban_apply_load_tx`]; this wrapper threads
+    /// the generator's autorestore cursor + seeded RNG and refreshes the
+    /// account sequence number before building (to avoid `txBAD_SEQ` when the
+    /// tx is discarded during tx-set assembly).
+    pub fn invoke_soroban_load_transaction_v2(
+        &mut self,
+        ledger_num: u32,
+        account_id: u64,
+        instance: &ContractInstance,
+        apply_load: &crate::loadgen::LoadGenApplyLoadConfig,
+        max_fee_rate: Option<u32>,
+    ) -> anyhow::Result<(u64, TransactionEnvelope)> {
+        let fee = self.generate_fee(max_fee_rate, 1, account_id);
+
+        let params = ApplyLoadTxParams {
+            data_entry_count: apply_load.data_entry_count(),
+            data_entry_size: apply_load.data_entry_size,
+            num_rw_entries: apply_load.num_rw_entries.clone(),
+            num_disk_read_entries: apply_load.num_disk_read_entries.clone(),
+            tx_size_bytes: apply_load.tx_size_bytes.clone(),
+            event_count: apply_load.event_count.clone(),
+            instructions: apply_load.instructions.clone(),
+            pre_populated_archived_entries: self.pre_populated_archived_entries,
+        };
+
+        // Refresh the account's sequence number before building.
+        self.load_account(account_id);
+        let (sk, seq) = self.next_source_sequence(account_id, ledger_num);
+
+        // Build with the generator's autorestore cursor + RNG. We take the RNG
+        // out to satisfy the borrow checker, then put it back.
+        let builder = SorobanTxBuilder::new(self.network_passphrase.clone());
+        let mut next_key = self.next_key_to_restore;
+        let mut rng = std::mem::replace(
+            &mut self.apply_load_rng,
+            <rand_chacha::ChaCha8Rng as rand::SeedableRng>::seed_from_u64(0),
+        );
+        let result = builder.invoke_soroban_apply_load_tx(
+            &sk,
+            seq,
+            instance,
+            &params,
+            &mut next_key,
+            fee,
+            &mut rng,
+        );
+        self.apply_load_rng = rng;
+        let built = result?;
+        self.next_key_to_restore = next_key;
+
+        Ok((account_id, built.envelope))
+    }
+
     /// Build a SAC creation transaction.
     ///
     /// Matches stellar-core `TxGenerator::createSACTransaction()`.
@@ -971,6 +1175,16 @@ impl LoadGenerator {
         self.accounts_available.clear();
         self.accounts_in_use.clear();
         self.contract_instances.clear();
+
+        // Overlay-only gate (LoadGenerator.cpp:293): SOROBAN_INVOKE_APPLY_LOAD
+        // may only run in overlay-only mode. stellar-core resets + throws; we
+        // reset + mark failed (the run aborts before any tx is generated).
+        if Self::apply_load_overlay_gate_fails(config.mode, config.overlay_only_mode) {
+            warn!("Can only run SOROBAN_INVOKE_APPLY_LOAD in overlay only mode");
+            self.failed = true;
+            self.reset_soroban_state();
+            return;
+        }
 
         // Soroban config setup (mirrors stellar-core LoadGenerator::start()).
         if config.mode.is_soroban() && config.mode != LoadGenMode::SorobanUpload {
@@ -1442,6 +1656,22 @@ impl LoadGenerator {
                     config.max_fee_rate,
                 )
             }
+            LoadGenMode::SorobanInvokeApplyLoad => {
+                // Mirror LoadGenerator.cpp:785: read the per-account instance
+                // and build the V2 distribution-driven invoke.
+                let instance = self
+                    .contract_instances
+                    .get(&source_account_id)
+                    .expect("contract instance must be assigned for SorobanInvokeApplyLoad")
+                    .clone();
+                self.tx_generator.invoke_soroban_load_transaction_v2(
+                    ledger_num,
+                    source_account_id,
+                    &instance,
+                    &config.apply_load,
+                    config.max_fee_rate,
+                )
+            }
             LoadGenMode::MixedClassicSoroban => {
                 self.create_mixed_classic_soroban_transaction(config, source_account_id, ledger_num)
             }
@@ -1554,6 +1784,16 @@ impl LoadGenerator {
     /// Whether load generation has failed.
     pub fn has_failed(&self) -> bool {
         self.failed
+    }
+
+    /// Returns `true` when the overlay-only gate should reject the run.
+    ///
+    /// Mirrors stellar-core `LoadGenerator::start()` (LoadGenerator.cpp:293):
+    /// `SorobanInvokeApplyLoad` requires overlay-only mode; every other mode is
+    /// unaffected. Extracted as a pure function so the gate is unit-testable
+    /// without a full `App`.
+    pub fn apply_load_overlay_gate_fails(mode: LoadGenMode, overlay_only_mode: bool) -> bool {
+        mode == LoadGenMode::SorobanInvokeApplyLoad && !overlay_only_mode
     }
 
     /// Clear persistent Soroban state (contract keys, code key, overhead).

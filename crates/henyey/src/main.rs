@@ -141,7 +141,9 @@ mod loadgen_runner {
     use std::sync::Arc;
 
     use henyey_app::{App, LoadGenRequest, LoadGenRunner};
-    use henyey_simulation::{GeneratedLoadConfig, LoadGenMode, LoadGenerator};
+    use henyey_simulation::{
+        GeneratedLoadConfig, LoadGenApplyLoadConfig, LoadGenMode, LoadGenerator,
+    };
     use tokio::sync::Mutex;
 
     /// Centralized per-run lifecycle control with atomic state transitions.
@@ -341,18 +343,11 @@ mod loadgen_runner {
         /// Parallel to [`deprecated_mode`]: checked before `parse_mode` so the
         /// caller can return an explicit, actionable error (referencing the
         /// follow-up issue) instead of a generic unknown-mode error.
-        fn unsupported_mode(mode: &str) -> Option<&'static str> {
-            let normalized = mode.to_ascii_lowercase();
-            if normalized == "soroban_invoke_apply_load" || normalized == "sorobaninvokeapplyload" {
-                Some(
-                    "UNSUPPORTED: soroban_invoke_apply_load is not yet implemented in henyey. \
-                     It requires the APPLY_LOAD_* config surface and the V2 invoke distributions \
-                     and is tracked as a follow-up: \
-                     https://github.com/stellar-experimental/henyey/issues/3309",
-                )
-            } else {
-                None
-            }
+        ///
+        /// `soroban_invoke_apply_load` was the #3297 sentinel; #3309 implements
+        /// it, so there are currently no deferred-unsupported modes.
+        fn unsupported_mode(_mode: &str) -> Option<&'static str> {
+            None
         }
 
         /// Parse a mode string into a `LoadGenMode`.
@@ -360,10 +355,6 @@ mod loadgen_runner {
         /// Accepts both stellar-core underscore names (e.g. `soroban_upload`)
         /// and henyey's legacy no-separator names (e.g. `sorobanupload`).
         /// Case-insensitive.
-        ///
-        /// `soroban_invoke_apply_load` is intentionally **not** parsed here — it
-        /// returns `None` and is surfaced as an explicit unsupported error via
-        /// [`unsupported_mode`] (tracked under #3309).
         fn parse_mode(mode: &str) -> Option<LoadGenMode> {
             let normalized = mode.to_ascii_lowercase();
             match normalized.as_str() {
@@ -385,6 +376,9 @@ mod loadgen_runner {
                 | "soroban_create_upgrade"
                 | "sorobancreateupgrade" => Some(LoadGenMode::SorobanCreateUpgrade),
                 "pay_pregenerated" | "paypregenerated" => Some(LoadGenMode::PayPregenerated),
+                "soroban_invoke_apply_load" | "sorobaninvokeapplyload" => {
+                    Some(LoadGenMode::SorobanInvokeApplyLoad)
+                }
                 _ => None,
             }
         }
@@ -774,7 +768,8 @@ mod loadgen_runner {
                 format!(
                     "Unknown mode: '{}'. Use: pay, soroban_upload, \
                      soroban_invoke_setup, soroban_invoke, mixed_classic_soroban, \
-                     upgrade_setup, create_upgrade, pay_pregenerated.",
+                     upgrade_setup, create_upgrade, pay_pregenerated, \
+                     soroban_invoke_apply_load.",
                     request.mode
                 )
             })?;
@@ -810,6 +805,19 @@ mod loadgen_runner {
                     .preloaded_transactions_file
                     .as_ref()
                     .map(std::path::PathBuf::from),
+                apply_load: LoadGenApplyLoadConfig {
+                    bl_batch_size: request.apply_load_bl_batch_size,
+                    bl_simulated_ledgers: request.apply_load_bl_simulated_ledgers,
+                    data_entry_size: LoadGenApplyLoadConfig::round_data_entry_size(
+                        request.apply_load_data_entry_size,
+                    ),
+                    num_rw_entries: request.apply_load_num_rw_entries.clone(),
+                    num_disk_read_entries: request.apply_load_num_disk_read_entries.clone(),
+                    tx_size_bytes: request.apply_load_tx_size_bytes.clone(),
+                    event_count: request.apply_load_event_count.clone(),
+                    instructions: request.apply_load_instructions.clone(),
+                },
+                overlay_only_mode: request.overlay_only_mode,
                 ..Default::default()
             };
 

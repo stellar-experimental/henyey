@@ -61,6 +61,59 @@ pub struct GenerateLoadParams {
     /// Path to the pre-generated transactions file (for pay_pregenerated).
     #[serde(default)]
     pub preloadedtransactionsfile: Option<String>,
+
+    // --- Apply-load (`soroban_invoke_apply_load`) params ---
+    /// Whether the node is running in overlay-only mode (gate stand-in for
+    /// stellar-core's `getRunInOverlayOnlyMode`).
+    #[serde(default)]
+    pub overlayonlymode: bool,
+
+    /// `APPLY_LOAD_BL_BATCH_SIZE` (default 1000, matching Config.h).
+    #[serde(default = "default_apply_load_bl_batch_size")]
+    pub applyloadblbatchsize: u32,
+
+    /// `APPLY_LOAD_BL_SIMULATED_LEDGERS` (default 1000, matching Config.h).
+    #[serde(default = "default_apply_load_bl_simulated_ledgers")]
+    pub applyloadblsimulatedledgers: u32,
+
+    /// `APPLY_LOAD_DATA_ENTRY_SIZE` (default 0; rounded to a multiple of 4).
+    #[serde(default)]
+    pub applyloaddataentrysize: u32,
+
+    /// `APPLY_LOAD_NUM_RW_ENTRIES` values (comma-separated `u32`s).
+    #[serde(default)]
+    pub applyloadnumrwentries: Option<String>,
+    /// `APPLY_LOAD_NUM_RW_ENTRIES_DISTRIBUTION` weights (comma-separated).
+    #[serde(default)]
+    pub applyloadnumrwentriesdistribution: Option<String>,
+
+    /// `APPLY_LOAD_NUM_DISK_READ_ENTRIES` values.
+    #[serde(default)]
+    pub applyloadnumdiskreadentries: Option<String>,
+    /// `APPLY_LOAD_NUM_DISK_READ_ENTRIES_DISTRIBUTION` weights.
+    #[serde(default)]
+    pub applyloadnumdiskreadentriesdistribution: Option<String>,
+
+    /// `APPLY_LOAD_TX_SIZE_BYTES` values.
+    #[serde(default)]
+    pub applyloadtxsizebytes: Option<String>,
+    /// `APPLY_LOAD_TX_SIZE_BYTES_DISTRIBUTION` weights.
+    #[serde(default)]
+    pub applyloadtxsizebytesdistribution: Option<String>,
+
+    /// `APPLY_LOAD_EVENT_COUNT` values.
+    #[serde(default)]
+    pub applyloadeventcount: Option<String>,
+    /// `APPLY_LOAD_EVENT_COUNT_DISTRIBUTION` weights.
+    #[serde(default)]
+    pub applyloadeventcountdistribution: Option<String>,
+
+    /// `APPLY_LOAD_INSTRUCTIONS` values.
+    #[serde(default)]
+    pub applyloadinstructions: Option<String>,
+    /// `APPLY_LOAD_INSTRUCTIONS_DISTRIBUTION` weights.
+    #[serde(default)]
+    pub applyloadinstructionsdistribution: Option<String>,
 }
 
 fn default_mode() -> String {
@@ -81,6 +134,14 @@ fn default_txrate() -> u32 {
 
 fn default_instances() -> u32 {
     0
+}
+
+fn default_apply_load_bl_batch_size() -> u32 {
+    1000
+}
+
+fn default_apply_load_bl_simulated_ledgers() -> u32 {
+    1000
 }
 
 /// Response for the `/generateload` endpoint.
