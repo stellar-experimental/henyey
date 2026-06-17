@@ -131,12 +131,6 @@ impl Sha256Hasher {
     }
 }
 
-impl Default for Sha256Hasher {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 /// Type alias for BLAKE2b with 32-byte output (256 bits).
 pub(crate) type Blake2b256 = Blake2b<blake2::digest::consts::U32>;
 

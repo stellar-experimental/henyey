@@ -189,9 +189,7 @@ pub fn verify_ed25519_signed_payload(
     } else {
         // For shorter payloads, copy bytes left-aligned, remainder zero.
         let mut hint = [0u8; 4];
-        for (i, &byte) in signed_payload.payload.iter().enumerate() {
-            hint[i] = byte;
-        }
+        hint[..signed_payload.payload.len()].copy_from_slice(&signed_payload.payload);
         hint
     };
     let expected_hint = [
@@ -370,9 +368,7 @@ mod tests {
             ]
         } else {
             let mut hint = [0u8; 4];
-            for (i, &byte) in payload.iter().enumerate() {
-                hint[i] = byte;
-            }
+            hint[..payload.len()].copy_from_slice(&payload);
             hint
         };
         let xor_hint = [
