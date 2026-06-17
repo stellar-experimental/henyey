@@ -41,9 +41,7 @@ pub async fn handle(
     // Parse parameters
     let start_ledger = util::param_u32(&params, "startLedger")?;
 
-    let pagination = util::param_object(&params, "pagination")?;
-    let empty_obj = serde_json::Value::Null;
-    let pag = pagination.unwrap_or(&empty_obj);
+    let pag = util::param_object_or_null(&params, "pagination")?;
     let cursor = util::param_str(pag, "cursor")?;
     let limit = util::param_u32(pag, "limit")?;
 
@@ -153,10 +151,9 @@ pub async fn handle(
         })
         .unwrap_or_default();
 
-    let mut result = serde_json::json!({
-        "transactions": transactions,
-        "cursor": last_cursor
-    });
-    lctx.insert_json_fields(result.as_object_mut().unwrap());
-    Ok(result)
+    let mut result = serde_json::Map::new();
+    result.insert("transactions".into(), serde_json::json!(transactions));
+    result.insert("cursor".into(), serde_json::json!(last_cursor));
+    lctx.insert_json_fields(&mut result);
+    Ok(serde_json::Value::Object(result))
 }

@@ -301,6 +301,17 @@ pub(crate) fn param_object<'a>(
     }
 }
 
+/// Like [`param_object`], but returns a borrowable `&Value` even when the key
+/// is absent/null — falls back to a static `Null` so callers can read sub-keys
+/// uniformly. A present-but-non-object value still returns `invalid_params`.
+pub(crate) fn param_object_or_null<'a>(
+    params: &'a serde_json::Value,
+    key: &str,
+) -> Result<&'a serde_json::Value, JsonRpcError> {
+    const NULL: serde_json::Value = serde_json::Value::Null;
+    Ok(param_object(params, key)?.unwrap_or(&NULL))
+}
+
 /// Validate that the top-level params value is an object (or null, treated as empty object).
 /// Returns `Err(invalid_params)` if params is an array, string, number, or bool.
 pub(crate) fn require_params_object(params: &serde_json::Value) -> Result<(), JsonRpcError> {
@@ -895,6 +906,27 @@ mod tests {
         assert_eq!(toid_parse_cursor(&s).unwrap(), toid);
 
         assert!(toid_parse_cursor("not_a_number").is_err());
+    }
+
+    #[test]
+    fn test_param_object_or_null() {
+        // Absent key → static Null.
+        let params = serde_json::json!({});
+        assert_eq!(
+            param_object_or_null(&params, "pagination").unwrap(),
+            &serde_json::Value::Null
+        );
+
+        // Present object → that object.
+        let params = serde_json::json!({ "pagination": { "limit": 10 } });
+        assert_eq!(
+            param_object_or_null(&params, "pagination").unwrap(),
+            &serde_json::json!({ "limit": 10 })
+        );
+
+        // Present non-object → invalid_params.
+        let params = serde_json::json!({ "pagination": "oops" });
+        assert!(param_object_or_null(&params, "pagination").is_err());
     }
 
     #[test]

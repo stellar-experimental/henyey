@@ -74,9 +74,10 @@ pub async fn handle(
             Ok(serde_json::Value::Object(obj))
         }
         None => {
-            let mut result = json!({ "status": "NOT_FOUND" });
-            lctx.insert_json_fields(result.as_object_mut().unwrap());
-            Ok(result)
+            let mut result = serde_json::Map::new();
+            result.insert("status".into(), json!("NOT_FOUND"));
+            lctx.insert_json_fields(&mut result);
+            Ok(serde_json::Value::Object(result))
         }
     }
 }
