@@ -109,7 +109,7 @@ pub trait Invariant: Send + Sync {
 
 /// Information about the last failure of an invariant.
 #[derive(Debug, Clone)]
-pub struct FailureInfo {
+pub(crate) struct FailureInfo {
     pub last_failed_on_ledger: u32,
     pub last_failed_with_message: String,
 }
