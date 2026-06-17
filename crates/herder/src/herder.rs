@@ -4481,10 +4481,10 @@ impl Herder {
                             Ok(groups) => groups,
                             Err(_interrupted) => {
                                 debug!("Critical groups computation interrupted");
-                                // Do NOT call clear_checking() here: the state
-                                // was already replaced by the new start_checking()
-                                // that triggered the interrupt. Clearing here
-                                // would race with the new analysis.
+                                // Do NOT clear the in-progress analysis marker
+                                // here: the state was already replaced by the new
+                                // start_checking() that triggered the interrupt.
+                                // Clearing here would race with the new analysis.
                                 return;
                             }
                         };
@@ -4526,9 +4526,10 @@ impl Herder {
                 }
                 henyey_scp::quorum_intersection::IntersectionResult::Interrupted => {
                     debug!("Quorum intersection analysis interrupted (quorum map changed)");
-                    // Do NOT call clear_checking() here: the state was already
-                    // replaced by the new start_checking() that triggered the
-                    // interrupt. Clearing here would race with the new analysis.
+                    // Do NOT clear the in-progress analysis marker here: the state
+                    // was already replaced by the new start_checking() that
+                    // triggered the interrupt. Clearing here would race with the
+                    // new analysis.
                 }
             }
         };

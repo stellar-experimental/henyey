@@ -122,7 +122,6 @@ pub mod metrics;
 pub(crate) mod parallel_tx_set_builder;
 mod pending;
 mod persistence;
-#[allow(dead_code)] // All types used in herder.rs wiring below
 pub(crate) mod quorum_intersection_state;
 mod quorum_set_tracker;
 mod quorum_tracker;
