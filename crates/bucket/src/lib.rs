@@ -137,22 +137,19 @@ pub use fan_out_limiter::{FanOutLimiter, FanOutPermit};
 // Disk-backed storage
 // ============================================================================
 
-pub use disk_bucket::{DiskBucket, DiskBucketIter, DEFAULT_BLOOM_SEED};
+pub use disk_bucket::{DiskBucket, DiskBucketIter};
 
 // ============================================================================
 // Bloom filter for fast negative lookups
 // ============================================================================
 
-pub use bloom_filter::{BucketBloomFilter, HashSeed, HASH_KEY_BYTES};
+pub use bloom_filter::{BucketBloomFilter, HashSeed};
 
 // ============================================================================
 // Entry types and comparison
 // ============================================================================
 
-pub use entry::{
-    compare_entries, compare_keys, get_ttl_key, get_ttl_live_until, is_ttl_expired,
-    ledger_entry_data_type, ledger_key_type, BucketEntry, BucketEntryExt,
-};
+pub use entry::{get_ttl_key, get_ttl_live_until, BucketEntry, BucketEntryExt};
 // Re-export classification helpers from henyey-common for backward compatibility.
 pub use henyey_common::{
     is_persistent_entry, is_persistent_key, is_soroban_entry, is_soroban_key, is_temporary_entry,
@@ -171,8 +168,7 @@ pub use error::BucketError;
 pub use eviction::{
     bucket_update_period, default_state_archival_settings, level_half, level_should_spill,
     level_size, update_starting_eviction_iterator, EvictionCandidate, EvictionIterator,
-    EvictionIteratorExt, EvictionResult, ResolvedEviction, DEFAULT_EVICTION_SCAN_SIZE,
-    DEFAULT_MAX_ENTRIES_TO_ARCHIVE, DEFAULT_STARTING_EVICTION_SCAN_LEVEL,
+    EvictionIteratorExt, EvictionResult, ResolvedEviction,
 };
 
 // ============================================================================
@@ -229,8 +225,7 @@ pub use index::{
 // ============================================================================
 
 pub use index_persistence::{
-    cleanup_orphaned_indexes, delete_index, index_path_for_bucket, load_disk_index,
-    save_disk_index, BUCKET_INDEX_VERSION,
+    cleanup_orphaned_indexes, delete_index, index_path_for_bucket, load_disk_index, save_disk_index,
 };
 
 // ============================================================================
@@ -249,7 +244,7 @@ pub use merge_map::{BucketMergeMap, InFlightGuard, MergeResult, MergeSlot, Share
 // Bucket applicator (catchup)
 // ============================================================================
 
-pub use applicator::{ApplicatorCounters, BucketApplicator, EntryToApply, DEFAULT_CHUNK_SIZE};
+pub use applicator::{ApplicatorCounters, BucketApplicator, EntryToApply};
 
 // ============================================================================
 // Metrics and counters

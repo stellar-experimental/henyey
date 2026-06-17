@@ -52,7 +52,7 @@ use crate::Result;
 /// granularity and per-batch memory footprint during catchup. It does NOT
 /// affect the `bucketListHash` or any other consensus-deterministic output —
 /// the applicator yields identical entries regardless of batch size.
-pub const DEFAULT_CHUNK_SIZE: usize = 4095;
+pub(crate) const DEFAULT_CHUNK_SIZE: usize = 4095;
 
 // ============================================================================
 // Applicator Counters

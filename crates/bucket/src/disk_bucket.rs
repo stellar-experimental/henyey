@@ -58,7 +58,7 @@ const BLOOM_FILTER_MIN_ENTRIES: usize = 2;
 
 /// Default hash seed for bloom filter construction.
 /// This is used when no custom seed is provided.
-pub const DEFAULT_BLOOM_SEED: HashSeed = [0u8; 16];
+pub(crate) const DEFAULT_BLOOM_SEED: HashSeed = [0u8; 16];
 
 /// A disk-backed bucket that stores entries on disk with an in-memory index.
 ///
@@ -886,7 +886,10 @@ impl DiskBucket {
     ///
     /// Each item is `(BucketEntry, record_size)` where `record_size` includes
     /// the 4-byte record mark.
-    pub fn iter_from_offset_with_sizes(&self, start_offset: u64) -> Result<DiskBucketOffsetIter> {
+    pub(crate) fn iter_from_offset_with_sizes(
+        &self,
+        start_offset: u64,
+    ) -> Result<DiskBucketOffsetIter> {
         let file = File::open(&self.file_path)?;
         let file_len = file.metadata()?.len();
         let mut reader = BufReader::new(file);
@@ -980,7 +983,7 @@ impl Iterator for DiskBucketIter {
 /// just to compute entry byte sizes.
 ///
 /// All bucket files at this point use XDR record marks (RFC 5531 format).
-pub struct DiskBucketOffsetIter {
+pub(crate) struct DiskBucketOffsetIter {
     records: crate::record::RecordMarkedReader<BufReader<File>>,
     failed: bool,
 }

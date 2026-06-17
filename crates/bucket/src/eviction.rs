@@ -88,11 +88,11 @@ use crate::entry::{get_ttl_key, is_ttl_expired, BucketEntry};
 use henyey_common::{is_soroban_entry, is_temporary_entry};
 
 /// Default eviction scan size in bytes per ledger (100 KB).
-pub const DEFAULT_EVICTION_SCAN_SIZE: u32 = 100_000;
+pub(crate) const DEFAULT_EVICTION_SCAN_SIZE: u32 = 100_000;
 
 /// Default starting eviction scan level (level 6).
 /// Lower levels update too frequently, so we start from level 6.
-pub const DEFAULT_STARTING_EVICTION_SCAN_LEVEL: u32 = 6;
+pub(crate) const DEFAULT_STARTING_EVICTION_SCAN_LEVEL: u32 = 6;
 
 /// Re-export XDR EvictionIterator as the canonical type.
 ///
@@ -513,7 +513,7 @@ impl EvictionResult {
 }
 
 /// Default maximum entries to archive per ledger.
-pub const DEFAULT_MAX_ENTRIES_TO_ARCHIVE: u32 = 1000;
+pub(crate) const DEFAULT_MAX_ENTRIES_TO_ARCHIVE: u32 = 1000;
 
 /// Create default `StateArchivalSettings` for eviction scanning.
 ///
