@@ -1463,7 +1463,7 @@ mod tests {
         assert_eq!(config.buckets.directory, PathBuf::from("/tmp/buckets"));
         assert_eq!(
             config.node.node_seed.as_deref(),
-            Some("SBXTJSLKQ2VZUEQNYU5EC6ZGQOONCX3JCFBK57R56YLYMUW76B2FMCJH")
+            Some("SDQVDISRYN2JXBS7ICL7QJAEKB3HWBJFP2QECXG7GZICAHBK4UNJCWK2")
         );
         assert!(!config.node.is_validator);
         assert!(!config.node.force_scp);
