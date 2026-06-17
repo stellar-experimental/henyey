@@ -12,6 +12,7 @@ use futures::stream::{self, StreamExt};
 
 use henyey_bucket::canonical_bucket_filename;
 use henyey_common::fs_utils::atomic_write_bytes;
+use henyey_common::history_download::{MAX_CONCURRENT_DOWNLOADS, PROGRESS_REPORT_INTERVAL};
 use henyey_common::Hash256;
 use henyey_history::{archive::HistoryArchive, archive_state::HistoryArchiveState, verify};
 use henyey_ledger::TransactionSetVariant;
@@ -19,13 +20,6 @@ use henyey_work::{Work, WorkContext, WorkOutcome};
 use stellar_xdr::curr::{LedgerHeaderHistoryEntry, TransactionHistoryEntryExt, WriteXdr};
 
 use crate::{set_progress, HistoryWorkStage, SharedHistoryState};
-
-/// Maximum number of concurrent download requests, matching stellar-core's
-/// `MAX_CONCURRENT_SUBPROCESSES` limit.
-pub(crate) const MAX_CONCURRENT_DOWNLOADS: usize = 16;
-
-/// Log download progress every N items (and always on the last item).
-const PROGRESS_REPORT_INTERVAL: u32 = 5;
 
 // ============================================================================
 // Work Items

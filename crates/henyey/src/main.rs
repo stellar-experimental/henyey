@@ -2892,10 +2892,10 @@ async fn download_buckets_parallel(
     hashes: Vec<&henyey_common::Hash256>,
 ) -> anyhow::Result<(usize, usize)> {
     use futures::stream::{self, StreamExt};
+    use henyey_common::history_download::MAX_CONCURRENT_DOWNLOADS;
     use std::collections::HashSet;
     use std::sync::atomic::{AtomicU32, Ordering};
 
-    const MAX_CONCURRENT_DOWNLOADS: usize = 16;
     const MAX_CONCURRENT_LOADS: usize = 4;
 
     let total_count = hashes.len();
