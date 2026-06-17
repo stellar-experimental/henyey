@@ -608,7 +608,7 @@ mod tests {
     /// directly, complementing the behavioral test below.
     #[test]
     fn test_send_transaction_classified_as_write_method() {
-        // Mirror the classification logic from rpc_handler (line 377).
+        // Mirror the is_write_method classification logic in rpc_handler.
         let is_write = |method: &str| method == "sendTransaction";
 
         assert!(

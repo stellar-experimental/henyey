@@ -22,7 +22,7 @@ use crate::util;
 /// `LedgerCloseMeta` yet, so the field may be an empty string. When present,
 /// the blob is validated against the expected sequence number via
 /// [`parse_ledger_close_meta_checked`](util::parse_ledger_close_meta_checked).
-pub async fn handle(ctx: &Arc<RpcContext>) -> Result<serde_json::Value, JsonRpcError> {
+pub(crate) async fn handle(ctx: &Arc<RpcContext>) -> Result<serde_json::Value, JsonRpcError> {
     // Read all in-memory fields from a single atomic snapshot so they cannot
     // straddle a ledger close boundary.
     let snap = ctx.app.ledger_snapshot();

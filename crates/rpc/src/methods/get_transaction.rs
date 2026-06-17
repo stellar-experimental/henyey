@@ -8,7 +8,7 @@ use crate::context::RpcContext;
 use crate::error::JsonRpcError;
 use crate::util;
 
-pub async fn handle(
+pub(crate) async fn handle(
     ctx: &Arc<RpcContext>,
     params: serde_json::Value,
 ) -> Result<serde_json::Value, JsonRpcError> {

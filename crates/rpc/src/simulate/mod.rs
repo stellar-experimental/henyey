@@ -64,7 +64,7 @@ struct InvokeRequest {
 }
 
 /// Represents a single ledger entry state change from simulation.
-pub(self) struct LedgerEntryDiff {
+struct LedgerEntryDiff {
     key: LedgerKey,
     state_before: Option<stellar_xdr::curr::LedgerEntry>,
     state_after: Option<stellar_xdr::curr::LedgerEntry>,
@@ -336,7 +336,7 @@ where
 // SECURITY: simulation input bounded by HTTP body size limit and serde type validation.
 // SECURITY: concurrent simulations bounded by try_bounded_blocking with simulation_semaphore.
 // Pre-blocking work (XDR parsing, validation) is bounded by request_semaphore at the server level.
-pub async fn handle(
+pub(crate) async fn handle(
     ctx: &Arc<RpcContext>,
     params: serde_json::Value,
 ) -> Result<serde_json::Value, JsonRpcError> {

@@ -8,7 +8,7 @@ use crate::error::JsonRpcError;
 const TESTNET_PASSPHRASE: &str = "Test SDF Network ; September 2015";
 const TESTNET_FRIENDBOT_URL: &str = "https://friendbot.stellar.org/";
 
-pub async fn handle(ctx: &Arc<RpcContext>) -> Result<serde_json::Value, JsonRpcError> {
+pub(crate) async fn handle(ctx: &Arc<RpcContext>) -> Result<serde_json::Value, JsonRpcError> {
     let info = ctx.app.info();
 
     // Provide the friendbot URL for testnet
