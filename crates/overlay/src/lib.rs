@@ -83,7 +83,6 @@ mod flow_control;
 mod item_fetcher;
 mod loopback;
 mod manager;
-mod message_handlers;
 mod metrics;
 mod peer;
 mod peer_manager;
@@ -94,7 +93,7 @@ mod survey;
 pub use auth::{AuthCert, AuthCertExt, AuthContext, AuthState};
 pub use ban_manager::BanManager;
 pub use codec::{helpers as message_helpers, MessageCodec, MessageFrame};
-pub use connection::{Connection, ConnectionDirection, ConnectionPool, Listener};
+pub use connection::{Connection, ConnectionDirection, Listener};
 pub use connection_factory::{ConnectionFactory, TcpConnectionFactory};
 pub use error::OverlayError;
 pub use flood::{compute_message_hash, FloodGate, FloodGateStats, FloodRecord};
@@ -111,7 +110,6 @@ pub use loopback::LoopbackConnectionFactory;
 #[doc(hidden)]
 pub use manager::TestPeerReceiver;
 pub use manager::{AddPeerOutcome, OverlayManager, OverlayMessage, OverlayStats, PeerSnapshot};
-pub use message_handlers::{MessageDispatcher, MessageDispatcherStats, TxSetData};
 pub use metrics::{
     Counter, OverlayMessageKind, OverlayMetrics, OverlayMetricsSnapshot, Timer, TimerSnapshot,
 };

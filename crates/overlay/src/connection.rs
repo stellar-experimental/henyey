@@ -470,7 +470,7 @@ impl Listener {
 /// connections from preferred IP addresses can exceed `max_connections`
 /// by up to `possibly_preferred_extra` slots, matching upstream's
 /// `Config::POSSIBLY_PREFERRED_EXTRA`.
-pub struct ConnectionPool {
+pub(crate) struct ConnectionPool {
     /// Maximum number of authenticated connections allowed.
     max_connections: usize,
     /// Maximum additional pending (handshaking) connections allowed beyond
@@ -596,6 +596,7 @@ impl ConnectionPool {
     /// Call this when a connection is closed. If the connection was still
     /// pending (never promoted to authenticated), the pending count is
     /// also decremented.
+    #[cfg(test)]
     pub fn release(&self) {
         self.current_count.fetch_sub(1, Ordering::Relaxed);
     }
