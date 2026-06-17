@@ -4403,7 +4403,7 @@ url = "https://history.stellar.org/prd/core-testnet/core_testnet_001"
             .with_connection(|conn| {
                 use henyey_db::queries::StateQueries;
                 use henyey_db::schema::state_keys;
-                Ok(conn.get_state(state_keys::FORCE_SCP)?)
+                conn.get_state(state_keys::FORCE_SCP)
             })
             .unwrap();
         assert!(
@@ -4444,7 +4444,7 @@ url = "https://history.stellar.org/prd/core-testnet/core_testnet_001"
             .with_connection(|conn| {
                 use henyey_db::queries::StateQueries;
                 use henyey_db::schema::state_keys;
-                Ok(conn.get_state(state_keys::FORCE_SCP)?)
+                conn.get_state(state_keys::FORCE_SCP)
             })
             .unwrap();
         assert_eq!(
