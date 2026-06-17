@@ -452,9 +452,7 @@ impl WorkScheduler {
                 if running.contains(id) {
                     continue;
                 }
-                if self.start_work(id, &mut join_set, &mut running) {
-                    // started successfully
-                }
+                self.start_work(id, &mut join_set, &mut running);
             }
 
             if running.is_empty() && queue.is_empty() && retry_timers.is_empty() {
