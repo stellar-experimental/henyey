@@ -20,12 +20,6 @@ use crate::{Invariant, OperationDelta};
 
 pub struct AccountSubEntriesCountIsValid;
 
-impl AccountSubEntriesCountIsValid {
-    pub fn new() -> Self {
-        Self
-    }
-}
-
 /// Tracks the delta for a single account.
 #[derive(Default)]
 struct SubEntriesChange {
