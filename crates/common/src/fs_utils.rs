@@ -305,9 +305,13 @@ where
     let marked_len = len | 0x8000_0000;
     writer.write_all(&marked_len.to_be_bytes())?;
     writer.write_all(&bytes)?;
+    // `pad` is at most 3 (it is `(4 - len % 4) % 4`), so a fixed 3-byte stack
+    // array sliced to `..pad` avoids a per-write heap allocation and is
+    // byte-identical to `vec![0u8; pad]`: both yield exactly `pad` zero bytes,
+    // and the slice index `..pad` is always in-bounds for `pad in 0..=3`.
     let pad = (4 - (len % 4)) % 4;
     if pad > 0 {
-        writer.write_all(&vec![0u8; pad as usize])?;
+        writer.write_all(&[0u8; 3][..pad as usize])?;
     }
     Ok(())
 }
@@ -672,6 +676,46 @@ mod tests {
         let parsed: Vec<Hash> = parse_gz_record_marked_xdr_stream(&raw);
         assert_eq!(parsed, items);
         assert_eq!(count_temp_files(dir.path()), 0);
+    }
+
+    #[test]
+    fn test_write_record_marked_xdr_padding_bytes_pinned() {
+        use stellar_xdr::curr::Hash;
+
+        // (a) Pin the exact on-disk byte layout produced by the production
+        // path for a representative `WriteXdr` item. A `Hash` encodes to 32
+        // bytes (a 4-multiple), so `pad == 0` and the decoded record is
+        // exactly 4 (mark) + 32 (payload) bytes with no trailing pad. This is
+        // the only case real XDR types produce, and it is what the
+        // `&[0u8; 3][..pad]` change must keep byte-identical.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("out.xdr.gz");
+        let items = [Hash([7u8; 32])];
+        atomic_gzip_xdr_write_slice(&path, &items).unwrap();
+
+        let raw = fs::read(&path).unwrap();
+        use flate2::read::GzDecoder;
+        use std::io::Read;
+        let mut decoded = Vec::new();
+        GzDecoder::new(&raw[..]).read_to_end(&mut decoded).unwrap();
+
+        // Marked length: 32 | 0x8000_0000 == 0x8000_0020, big-endian.
+        assert_eq!(&decoded[0..4], &0x8000_0020u32.to_be_bytes());
+        // Payload: the 32 Hash bytes.
+        assert_eq!(&decoded[4..36], &[7u8; 32]);
+        // No trailing pad — the record is exactly 4 + 32 bytes.
+        assert_eq!(decoded.len(), 4 + 32);
+
+        // Also confirm the decoded item round-trips.
+        let parsed: Vec<Hash> = parse_gz_record_marked_xdr_stream(&raw);
+        assert_eq!(parsed, items);
+
+        // (b) Document the defensive-branch equivalence under test: for the
+        // unreachable `pad in 1..=3` cases, the stack slice `&[0u8; 3][..n]`
+        // emits the identical bytes as the previous `vec![0u8; n]`.
+        for n in 0..=3usize {
+            assert_eq!(&[0u8; 3][..n], &vec![0u8; n][..]);
+        }
     }
 
     #[test]

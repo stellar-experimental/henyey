@@ -217,16 +217,15 @@ mod tests {
 
     impl Visit for CapturedEvent {
         fn record_str(&mut self, field: &Field, value: &str) {
-            match field.name() {
-                "call" => self.call = Some(value.to_string()),
-                _ => {}
+            if field.name() == "call" {
+                self.call = Some(value.to_string());
             }
         }
         fn record_u64(&mut self, field: &Field, value: u64) {
-            match field.name() {
-                "elapsed_ms" => self.elapsed_ms = Some(value),
-                "total_ms" => self.total_ms = Some(value),
-                _ => {}
+            if field.name() == "elapsed_ms" {
+                self.elapsed_ms = Some(value);
+            } else if field.name() == "total_ms" {
+                self.total_ms = Some(value);
             }
         }
         fn record_i64(&mut self, field: &Field, value: i64) {
