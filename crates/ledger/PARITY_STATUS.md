@@ -159,6 +159,19 @@ Corresponds to: `LedgerCloseData` (in upstream `herder/` but used by `LedgerMana
 | `LedgerCloseStats` | `LedgerCloseStats` | Full |
 | `UpgradeContext` | `UpgradeContext` | Full |
 
+**Per-variant upgrade application validation (#3300).** Every `LedgerUpgrade`
+variant the SSC protocol-upgrade mission can schedule is exercised end-to-end
+through the REAL close-loop dispatcher (`close_ledger` → `apply_upgrades_to_delta`
+→ `apply_to_header` / `apply_config_upgrades` / `apply_max_soroban_tx_set_size`)
+by `crates/ledger/tests/upgrade_sequence_integration.rs`:
+`test_apply_each_ledger_upgrade_variant_mutates_header_and_state` (Version,
+BaseFee, BaseReserve, MaxTxSetSize, Flags → header fields / ext V1),
+`test_apply_max_soroban_tx_set_size_variant_mutates_state`
+(`ContractExecutionLanes.ledger_max_tx_count`), and
+`test_apply_config_upgrade_variant_mutates_state` (config-setting state). Driving
+through `close_ledger` (not the leaf functions) deliberately covers the
+dispatcher seam, not just the leaves.
+
 ### snapshot.rs (`snapshot.rs`)
 
 Corresponds to: `LedgerStateSnapshot.h`

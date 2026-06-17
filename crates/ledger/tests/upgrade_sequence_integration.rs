@@ -1490,3 +1490,205 @@ fn test_base_reserve_upgrade_prepare_liabilities_meta() {
         "Trustline should NOT appear in upgrade changes when all buying offers are erased"
     );
 }
+
+// ===========================================================================
+// #3300 — per-variant upgrade application through the REAL close-loop seam
+//
+// Validation mission (SSC protocol-upgrade): drive EACH `LedgerUpgrade`
+// variant the `/upgrades?mode=set` endpoint can schedule through the REAL
+// close-loop dispatcher (`LedgerManager::close_ledger` →
+// `apply_upgrades_to_delta` → `UpgradeContext::apply_to_header` /
+// `apply_config_upgrades` / `apply_max_soroban_tx_set_size`) over a genesis
+// snapshot, and assert the post-close header/state field mutates to the
+// scheduled value.
+//
+// Going through `close_ledger` (not the leaf functions directly) is
+// deliberate: it exercises the dispatcher SEAM that routes each variant to
+// the correct leaf — the gap Critic A flagged — not just the leaves in
+// isolation. The handler→`UpgradeParameters` parse is covered in
+// `crates/app/.../plaintext.rs`; the schedule→nominate emission is covered in
+// `crates/herder/src/upgrades.rs`. Together: schedule → nominate → apply for
+// every variant, offline.
+// ===========================================================================
+
+/// Version, BaseFee, BaseReserve, MaxTxSetSize, Flags — the header-field
+/// variants — each mutate the post-close header to the scheduled value via
+/// the real dispatcher → `apply_to_header` seam. Flags additionally promotes
+/// `LedgerHeaderExt` from V0 to V1.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_apply_each_ledger_upgrade_variant_mutates_header_and_state() {
+    let handle = tokio::runtime::Handle::current();
+
+    // ── Version: 24 → 25 mutates header.ledger_version ────────────────────
+    {
+        let ledger = init_ledger_manager(24);
+        let close = empty_close_data(&ledger, 1, 100).with_upgrade(LedgerUpgrade::Version(25));
+        let r = ledger
+            .close_ledger(close, Some(handle.clone()))
+            .expect("close Version");
+        assert_eq!(
+            r.header.ledger_version, 25,
+            "Version upgrade must set header.ledger_version"
+        );
+    }
+
+    // ── BaseFee: 100 → 250 mutates header.base_fee ────────────────────────
+    {
+        let ledger = init_ledger_manager(25);
+        let close = empty_close_data(&ledger, 1, 100).with_upgrade(LedgerUpgrade::BaseFee(250));
+        let r = ledger
+            .close_ledger(close, Some(handle.clone()))
+            .expect("close BaseFee");
+        assert_eq!(
+            r.header.base_fee, 250,
+            "BaseFee upgrade must set header.base_fee"
+        );
+    }
+
+    // ── BaseReserve: 100 → 7_000_000 mutates header.base_reserve ──────────
+    {
+        let ledger = init_ledger_manager(25);
+        let close =
+            empty_close_data(&ledger, 1, 100).with_upgrade(LedgerUpgrade::BaseReserve(7_000_000));
+        let r = ledger
+            .close_ledger(close, Some(handle.clone()))
+            .expect("close BaseReserve");
+        assert_eq!(
+            r.header.base_reserve, 7_000_000,
+            "BaseReserve upgrade must set header.base_reserve"
+        );
+    }
+
+    // ── MaxTxSetSize: 100 → 750 mutates header.max_tx_set_size ────────────
+    {
+        let ledger = init_ledger_manager(25);
+        let close =
+            empty_close_data(&ledger, 1, 100).with_upgrade(LedgerUpgrade::MaxTxSetSize(750));
+        let r = ledger
+            .close_ledger(close, Some(handle.clone()))
+            .expect("close MaxTxSetSize");
+        assert_eq!(
+            r.header.max_tx_set_size, 750,
+            "MaxTxSetSize upgrade must set header.max_tx_set_size"
+        );
+    }
+
+    // ── Flags: 0 → 1 promotes ext V0 → V1 and sets ext.flags ──────────────
+    {
+        let ledger = init_ledger_manager(25);
+        let close = empty_close_data(&ledger, 1, 100).with_upgrade(LedgerUpgrade::Flags(1));
+        let r = ledger
+            .close_ledger(close, Some(handle.clone()))
+            .expect("close Flags");
+        match &r.header.ext {
+            LedgerHeaderExt::V1(ext) => {
+                assert_eq!(ext.flags, 1, "Flags upgrade must set header ext V1 flags")
+            }
+            LedgerHeaderExt::V0 => panic!("Flags upgrade must promote ext V0 → V1"),
+        }
+    }
+}
+
+/// MaxSorobanTxSetSize is NOT a header field — it routes through the delta to
+/// the `CONFIG_SETTING_CONTRACT_EXECUTION_LANES` entry's `ledger_max_tx_count`
+/// (matching upstream `upgradeMaxSorobanTxSetSize`). Assert via the upgrade
+/// meta's `Updated` change that the new lane count lands in state.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_apply_max_soroban_tx_set_size_variant_mutates_state() {
+    let ledger = init_ledger_manager(25);
+
+    // Genesis seeds ledger_max_tx_count = 1; upgrade it to 50.
+    let close =
+        empty_close_data(&ledger, 1, 100).with_upgrade(LedgerUpgrade::MaxSorobanTxSetSize(50));
+    let handle = tokio::runtime::Handle::current();
+    let r = ledger
+        .close_ledger(close, Some(handle))
+        .expect("close MaxSorobanTxSetSize");
+
+    let meta = r.meta.expect("close meta");
+    let v2 = match meta {
+        LedgerCloseMeta::V2(v2) => v2,
+        other => panic!("expected V2 meta, got {other:?}"),
+    };
+    let soroban_meta = v2
+        .upgrades_processing
+        .iter()
+        .find(|m| matches!(m.upgrade, LedgerUpgrade::MaxSorobanTxSetSize(_)))
+        .expect("MaxSorobanTxSetSize upgrade must produce UpgradeEntryMeta");
+
+    let updated_lane_count = soroban_meta.changes.iter().find_map(|change| match change {
+        LedgerEntryChange::Updated(entry) => match &entry.data {
+            LedgerEntryData::ConfigSetting(ConfigSettingEntry::ContractExecutionLanes(lanes)) => {
+                Some(lanes.ledger_max_tx_count)
+            }
+            _ => None,
+        },
+        _ => None,
+    });
+    assert_eq!(
+        updated_lane_count,
+        Some(50),
+        "MaxSorobanTxSetSize upgrade must set ContractExecutionLanes.ledger_max_tx_count to 50"
+    );
+}
+
+/// The Config variant routes through the delta to `apply_config_upgrades`,
+/// which writes the proposed `ConfigSettingEntry` into state. Drive a valid
+/// config upgrade (whose key hash matches the stored set) through the real
+/// close loop and assert the targeted setting is updated in the upgrade meta.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_apply_config_upgrade_variant_mutates_state() {
+    let ledger = init_ledger_manager(25);
+
+    // Build a valid ConfigUpgradeSet that changes ContractComputeV0.
+    let proposed =
+        ConfigSettingEntry::ContractComputeV0(stellar_xdr::curr::ConfigSettingContractComputeV0 {
+            ledger_max_instructions: 222_000_000,
+            tx_max_instructions: 10_000_000,
+            fee_rate_per_instructions_increment: 100,
+            tx_memory_limit: 50_000_000,
+        });
+    let upgrade_set = ConfigUpgradeSet {
+        updated_entry: vec![proposed].try_into().expect("one entry"),
+    };
+    let key = make_config_upgrade_key_for_set(&[0xDE; 32], &upgrade_set);
+
+    // Store the upgrade set as CONTRACT_DATA + TTL in soroban state.
+    let data_entry = make_config_upgrade_entry(&key, &upgrade_set, 1);
+    ledger
+        .inject_synthetic_contract_data(data_entry, 1000)
+        .expect("inject config upgrade data");
+
+    let close = empty_close_data(&ledger, 1, 100).with_upgrade(LedgerUpgrade::Config(key.clone()));
+    let handle = tokio::runtime::Handle::current();
+    let r = ledger
+        .close_ledger(close, Some(handle))
+        .expect("close Config");
+
+    let meta = r.meta.expect("close meta");
+    let v2 = match meta {
+        LedgerCloseMeta::V2(v2) => v2,
+        other => panic!("expected V2 meta, got {other:?}"),
+    };
+    let config_meta = v2
+        .upgrades_processing
+        .iter()
+        .find(|m| matches!(m.upgrade, LedgerUpgrade::Config(_)))
+        .expect("Config upgrade must produce UpgradeEntryMeta");
+
+    // The ContractComputeV0 setting must be updated to the proposed value.
+    let updated_max_instructions = config_meta.changes.iter().find_map(|change| match change {
+        LedgerEntryChange::Updated(entry) => match &entry.data {
+            LedgerEntryData::ConfigSetting(ConfigSettingEntry::ContractComputeV0(c)) => {
+                Some(c.ledger_max_instructions)
+            }
+            _ => None,
+        },
+        _ => None,
+    });
+    assert_eq!(
+        updated_max_instructions,
+        Some(222_000_000),
+        "Config upgrade must write the proposed ContractComputeV0 setting into state"
+    );
+}

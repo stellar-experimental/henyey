@@ -241,7 +241,7 @@ The compat HTTP handler test suite was built from scratch during this work. Curr
 | `/metrics` | 3 | Response shape, type fields, rate fields |
 | `/testacc` | 10 | Response/error/not-found shapes, key derivation, seed padding |
 | `/generateload` | 4 | Request construction, debug, clone, stop mode |
-| Plaintext endpoints | 10 | Bans, quorum, scp, upgrades shapes, ISO8601 parsing |
+| Plaintext endpoints | 14 | Bans, quorum, scp, upgrades shapes, ISO8601 parsing, full `/upgrades?mode=set` SSC param-set pinning + `mode=clear` reset (#3300) |
 | Panic handler | 1 | `{"exception": "generic"}` shape |
 | **Total** | **36+** | |
 
@@ -272,7 +272,7 @@ The config parsing layer (`crates/app/src/compat_config.rs`) has 27 unit tests c
 | ComplexTopology with all Henyey nodes | **HIGH** | Same as SimplePayment |
 | Sustained load generation missions | MEDIUM | Rate/percentile metrics are zero placeholders; may need real tracking |
 | History catchup / publish missions | MEDIUM | Core machinery exists, but SSC mission validation and HISTORY-template compatibility remain open |
-| ProtocolUpgrade missions | MEDIUM | `/upgrades` exists, but mission-level execution is still unverified |
+| ProtocolUpgrade missions | LOW (pending live run) | `/upgrades` `mode=set` param set pinned 1:1 to stellar-core and the full schedule→nominate→apply path is covered by offline regression tests for every `LedgerUpgrade` variant (#3300); only the live multi-node SSC run remains (operator hand-off) |
 | VersionMix / mixed images | HIGH | Best near-term path to value |
 | EmitMeta-style missions | HIGH | Existing metadata support is already strong |
 | NetworkSurvey missions | LOW | Compat endpoints are stubs today |
@@ -365,13 +365,13 @@ Required work:
 
 1. Validate history publish from Henyey through SSC-generated archive config.
 2. Validate catchup from those archives.
-3. Exercise `/upgrades` end to end in mission form.
+3. Exercise `/upgrades` end to end in mission form. **Offline half done (#3300):** the `mode=set` param set is pinned 1:1 to stellar-core and the full schedule→nominate→apply path is covered by per-variant regression tests; the live multi-node SSC protocol-upgrade run is an operator hand-off — see [`docs/supercluster-mission-3300.md`](./supercluster-mission-3300.md).
 4. Verify cross-version or mixed-image history behavior if that is part of the target rollout.
 
 Exit criteria:
 
 - Henyey can publish history in SSC-managed runs and catch up from it reliably
-- upgrade missions complete without compatibility-specific failures
+- upgrade missions complete without compatibility-specific failures (offline regression complete #3300; live run pending)
 
 ### Phase 4 -- Optional parity work for lower-priority missions
 
@@ -423,8 +423,8 @@ Candidate work:
 - [ ] HISTORY parsing tested against SSC-style templates (fixtures from real SSC configs)
 - [ ] publish/catchup round-trip integration test passes outside SSC
 - [ ] publish/catchup scenario exercised under SSC
-- [ ] upgrade mission exercised under SSC
-- [ ] `/upgrades` response shape tested against stellar-core reference
+- [ ] upgrade mission exercised under SSC (operator hand-off — see [`docs/supercluster-mission-3300.md`](./supercluster-mission-3300.md))
+- [x] `/upgrades` `mode=set` parameter set tested 1:1 against stellar-core `CommandHandler.cpp:613-671`; per-variant schedule→nominate→apply regression covered offline (#3300)
 - [ ] remaining history/upgrade blockers documented precisely
 
 ### Phase 4 handoff checklist

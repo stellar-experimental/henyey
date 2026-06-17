@@ -853,6 +853,208 @@ mod tests {
         assert!(value.get("error").is_some());
     }
 
+    // ── #3300: /upgrades?mode=set exact SSC parameter-set pinning ───────
+    //
+    // Drives the REAL `compat_upgrades_handler` against a live `App` and reads
+    // back the parsed `UpgradeParameters` via `runtime_upgrade_parameters()`,
+    // pinning the parse 1:1 against stellar-core `CommandHandler::upgrades`
+    // (CommandHandler.cpp:613-671). stellar-core's `mode=set` branch accepts
+    // exactly these query params, which must each map to the matching
+    // `UpgradeParameters` field:
+    //   upgradetime, basefee, basereserve, maxtxsetsize, protocolversion,
+    //   flags, configupgradesetkey (base64 XDR), maxsorobantxsetsize,
+    //   nominationtimeoutlimit, expirationminutes.
+    // This is the parity-load-bearing path for an SSC protocol-upgrade
+    // mission (the harness drives upgrades via mode=set).
+
+    /// Build the base64-encoded `configupgradesetkey` XDR that SSC sends, and
+    /// return both the wire string and the decoded key for round-trip checks.
+    fn ssc_config_upgrade_set_key() -> (String, stellar_xdr::curr::ConfigUpgradeSetKey) {
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        use stellar_xdr::curr::{ConfigUpgradeSetKey, ContractId, Hash, Limits, WriteXdr};
+        let key = ConfigUpgradeSetKey {
+            contract_id: ContractId(Hash([0xAB; 32])),
+            content_hash: Hash([0xCD; 32]),
+        };
+        let bytes = key.to_xdr(Limits::none()).expect("encode key");
+        (STANDARD.encode(bytes), key)
+    }
+
+    /// Build the `mode=set` query param map with the full SSC parameter set.
+    fn full_ssc_set_params(config_key_b64: &str) -> std::collections::HashMap<String, String> {
+        let mut m = std::collections::HashMap::new();
+        m.insert("mode".into(), "set".into());
+        // Unix-timestamp form (stellar-core also accepts ISO 8601; both paths
+        // are parsed by the handler — see `parse_iso8601_to_unix`).
+        m.insert("upgradetime".into(), "1700000000".into());
+        m.insert("basefee".into(), "250".into());
+        m.insert("basereserve".into(), "6000000".into());
+        m.insert("maxtxsetsize".into(), "2000".into());
+        m.insert("protocolversion".into(), "25".into());
+        m.insert("flags".into(), "1".into());
+        m.insert("configupgradesetkey".into(), config_key_b64.into());
+        m.insert("maxsorobantxsetsize".into(), "50".into());
+        m.insert("nominationtimeoutlimit".into(), "3".into());
+        m.insert("expirationminutes".into(), "120".into());
+        m
+    }
+
+    /// `/upgrades?mode=set` with the full SSC parameter set parses every
+    /// param into the correct `UpgradeParameters` field. Drives the real
+    /// handler + `App::set_upgrade_parameters`, reads back via
+    /// `runtime_upgrade_parameters()`.
+    #[tokio::test]
+    async fn test_upgrades_set_parses_full_ssc_param_set() {
+        let (_dir, state) = mk_compat_state().await;
+        let (config_key_b64, expected_key) = ssc_config_upgrade_set_key();
+
+        let resp = compat_upgrades_handler(
+            State(Arc::clone(&state)),
+            Query(full_ssc_set_params(&config_key_b64)),
+        )
+        .await
+        .into_response();
+        let json = body_json(resp).await;
+        assert_eq!(json["status"], "ok", "mode=set should succeed: {json}");
+
+        let params = state.app.runtime_upgrade_parameters();
+        assert_eq!(params.upgrade_time, 1_700_000_000, "upgradetime");
+        assert_eq!(params.base_fee, Some(250), "basefee");
+        assert_eq!(params.base_reserve, Some(6_000_000), "basereserve");
+        assert_eq!(params.max_tx_set_size, Some(2000), "maxtxsetsize");
+        assert_eq!(params.protocol_version, Some(25), "protocolversion");
+        assert_eq!(params.flags, Some(1), "flags");
+        assert_eq!(
+            params.max_soroban_tx_set_size,
+            Some(50),
+            "maxsorobantxsetsize"
+        );
+        assert_eq!(
+            params.nomination_timeout_limit,
+            Some(3),
+            "nominationtimeoutlimit"
+        );
+        assert_eq!(params.expiration_minutes, Some(120), "expirationminutes");
+
+        // configupgradesetkey: base64 XDR decoded back to the exact key.
+        let parsed_key = params
+            .config_upgrade_set_key
+            .as_ref()
+            .expect("configupgradesetkey must be parsed")
+            .to_xdr()
+            .expect("key round-trips to XDR");
+        assert_eq!(
+            parsed_key, expected_key,
+            "configupgradesetkey must decode to the exact ConfigUpgradeSetKey"
+        );
+
+        state.app.shutdown();
+    }
+
+    /// `/upgrades?mode=set&upgradetime=1970-01-01T00:00:00Z` — the ISO 8601
+    /// "apply immediately" form stellar-core's `isoStringToTm` accepts — parses
+    /// to epoch 0.
+    #[tokio::test]
+    async fn test_upgrades_set_parses_iso8601_upgradetime() {
+        let (_dir, state) = mk_compat_state().await;
+        let mut m = std::collections::HashMap::new();
+        m.insert("mode".into(), "set".into());
+        m.insert("upgradetime".into(), "1970-01-01T00:00:00Z".into());
+        m.insert("protocolversion".into(), "25".into());
+
+        let resp = compat_upgrades_handler(State(Arc::clone(&state)), Query(m))
+            .await
+            .into_response();
+        let json = body_json(resp).await;
+        assert_eq!(json["status"], "ok");
+
+        let params = state.app.runtime_upgrade_parameters();
+        assert_eq!(params.upgrade_time, 0, "epoch ISO 8601 → 0");
+        assert_eq!(params.protocol_version, Some(25));
+        state.app.shutdown();
+    }
+
+    /// `/upgrades?mode=clear` resets the scheduled parameters back to the
+    /// default (no upgrades scheduled), mirroring stellar-core's `clear`
+    /// branch (CommandHandler.cpp:672 — sets an empty `UpgradeParameters`).
+    #[tokio::test]
+    async fn test_upgrades_clear_resets_to_default() {
+        let (_dir, state) = mk_compat_state().await;
+        let (config_key_b64, _key) = ssc_config_upgrade_set_key();
+
+        // First set a full param set.
+        let resp = compat_upgrades_handler(
+            State(Arc::clone(&state)),
+            Query(full_ssc_set_params(&config_key_b64)),
+        )
+        .await
+        .into_response();
+        assert_eq!(body_json(resp).await["status"], "ok");
+        assert!(state
+            .app
+            .runtime_upgrade_parameters()
+            .protocol_version
+            .is_some());
+
+        // Now clear.
+        let mut clear = std::collections::HashMap::new();
+        clear.insert("mode".into(), "clear".into());
+        let resp = compat_upgrades_handler(State(Arc::clone(&state)), Query(clear))
+            .await
+            .into_response();
+        assert_eq!(body_json(resp).await["status"], "ok");
+
+        let params = state.app.runtime_upgrade_parameters();
+        let default = henyey_herder::upgrades::UpgradeParameters::default();
+        assert_eq!(params.protocol_version, default.protocol_version);
+        assert_eq!(params.base_fee, default.base_fee);
+        assert_eq!(params.base_reserve, default.base_reserve);
+        assert_eq!(params.max_tx_set_size, default.max_tx_set_size);
+        assert_eq!(params.flags, default.flags);
+        assert_eq!(
+            params.max_soroban_tx_set_size,
+            default.max_soroban_tx_set_size
+        );
+        assert!(params.config_upgrade_set_key.is_none());
+        assert!(
+            !params.has_any_upgrade(),
+            "clear must remove all scheduled upgrades"
+        );
+        state.app.shutdown();
+    }
+
+    /// Default GET (`/upgrades` with no/empty mode) returns the bespoke
+    /// `{current, scheduled}` shape. NOTE: this is a DOCUMENTED divergence
+    /// from stellar-core, which returns `"mode required"` for empty mode and
+    /// only emits `getUpgradesJson()` under `mode=get` (see PARITY_STATUS).
+    #[tokio::test]
+    async fn test_upgrades_default_get_shape() {
+        let (_dir, state) = mk_compat_state().await;
+        let resp = compat_upgrades_handler(
+            State(Arc::clone(&state)),
+            Query(std::collections::HashMap::new()),
+        )
+        .await
+        .into_response();
+        let json = body_json(resp).await;
+        let obj = json.as_object().expect("object body");
+        assert!(obj.contains_key("current"), "default GET has 'current'");
+        assert!(obj.contains_key("scheduled"), "default GET has 'scheduled'");
+        for key in ["ledgerVersion", "baseFee", "baseReserve", "maxTxSetSize"] {
+            assert!(json["current"].get(key).is_some(), "current.{key}");
+        }
+        for key in [
+            "upgradetime",
+            "protocolversion",
+            "basefee",
+            "basereserve",
+            "maxtxsetsize",
+        ] {
+            assert!(json["scheduled"].get(key).is_some(), "scheduled.{key}");
+        }
+        state.app.shutdown();
+    }
+
     // ── /quorum response shape test ─────────────────────────────────────
 
     /// Verify `/quorum` response has `{"quorum": "<hash>"}` shape.

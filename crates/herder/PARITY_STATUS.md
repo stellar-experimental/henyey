@@ -458,6 +458,17 @@ Corresponds to: `Upgrades.h`
 | `ConfigUpgradeSetFrame::encodeAsString()` | _(not implemented)_ | None |
 | `ConfigUpgradeSetFrame::toJson()` | _(not implemented)_ | None |
 
+**Schedule→nomination validation (#3300).** The schedule→nominate half of the
+SSC protocol-upgrade path is covered offline for every `LedgerUpgrade` variant
+(Version, BaseFee, BaseReserve, MaxTxSetSize, Flags, MaxSorobanTxSetSize, Config)
+by `test_scheduled_params_nominate_each_variant` and
+`test_scheduled_config_variant_nominate`: `create_upgrades_for` emits the
+matching upgrade when the current ledger value differs, suppresses the no-op when
+equal, and `is_valid_for_nomination` accepts at/after `upgrade_time` (rejects
+before). Header/state application is covered in `henyey-ledger`
+(`upgrade_sequence_integration.rs`); the live multi-node externalize run is an
+operator hand-off (`docs/supercluster-mission-3300.md`).
+
 ### ParallelTxSetBuilder (`parallel_tx_set_builder.rs`)
 
 Corresponds to: `ParallelTxSetBuilder.h`
