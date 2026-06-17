@@ -161,9 +161,8 @@ mod tests {
 
     impl Visit for CapturedEvent {
         fn record_str(&mut self, field: &Field, value: &str) {
-            match field.name() {
-                "task" => self.task = Some(value.to_string()),
-                _ => {}
+            if field.name() == "task" {
+                self.task = Some(value.to_string());
             }
         }
         fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
