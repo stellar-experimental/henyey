@@ -580,12 +580,6 @@ impl Simulation {
             .map(|n| n.app.ledger_info().ledger_seq)
     }
 
-    pub fn app_latest_externalized_slot(&self, node_id: &str) -> Option<u64> {
-        self.running_apps
-            .get(node_id)
-            .and_then(|n| n.app.latest_externalized_slot())
-    }
-
     pub fn app(&self, node_id: &str) -> Option<Arc<App>> {
         self.running_apps.get(node_id).map(|n| Arc::clone(&n.app))
     }
