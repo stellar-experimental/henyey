@@ -323,4 +323,72 @@ mod tests {
         assert!(!QuorumInfoNodeState::Preparing.is_externalized());
         assert!(QuorumInfoNodeState::Externalized.is_externalized());
     }
+
+    /// Guard test pinning the sorted-`NodeId`-iteration contract of
+    /// `process_envelopes_current_state`.
+    ///
+    /// `process_*` mirrors stellar-core's `processCurrentState`, which iterates
+    /// `mLatestEnvelopes` — a `std::map<NodeID, ...>` whose iteration is
+    /// NodeID-sorted. Henyey stores a `HashMap` and must reconstruct that exact
+    /// order. This test inserts envelopes in deliberately non-sorted insertion
+    /// order and asserts the visited node order equals the nodes sorted by
+    /// `NodeId` `Ord` (bytewise-lexicographic), so any future refactor that
+    /// breaks the sorted-order contract fails here. (Guard test — passes both
+    /// before and after the F1 double-lookup cleanup.)
+    #[test]
+    fn test_process_envelopes_current_state_sorted_node_order() {
+        use std::collections::HashMap;
+
+        let quorum_set = make_quorum_set(vec![make_node_id(1)], 1);
+
+        // Build a minimal nomination envelope for the given node.
+        let make_env = |node: NodeId| -> ScpEnvelope {
+            let nomination = ScpNomination {
+                quorum_set_hash: hash_quorum_set(&quorum_set).into(),
+                votes: vec![make_value(&[1])].try_into().unwrap(),
+                accepted: vec![].try_into().unwrap(),
+            };
+            ScpEnvelope {
+                statement: ScpStatement {
+                    node_id: node,
+                    slot_index: 1,
+                    pledges: ScpStatementPledges::Nominate(nomination),
+                },
+                signature: stellar_xdr::curr::Signature(Vec::new().try_into().unwrap()),
+            }
+        };
+
+        // Insert in deliberately non-sorted insertion order. HashMap insertion
+        // order is unspecified, so the sort in `process_envelopes_current_state`
+        // is what establishes the deterministic visited order.
+        let seeds: [u8; 5] = [3, 1, 5, 2, 4];
+        let mut envelopes: HashMap<NodeId, ScpEnvelope> = HashMap::new();
+        for &s in &seeds {
+            let node = make_node_id(s);
+            envelopes.insert(node.clone(), make_env(node));
+        }
+
+        // A non-member local node so the self-skip branch never fires.
+        let local = make_node_id(200);
+
+        let mut visited: Vec<NodeId> = Vec::new();
+        let completed = process_envelopes_current_state(
+            &envelopes,
+            |env| {
+                visited.push(env.statement.node_id.clone());
+                true
+            },
+            &local,
+            true,  // fully_validated
+            false, // force_self
+        );
+        assert!(completed, "iteration should run to completion");
+
+        let mut expected: Vec<NodeId> = seeds.iter().map(|&s| make_node_id(s)).collect();
+        expected.sort();
+        assert_eq!(
+            visited, expected,
+            "envelopes must be visited in sorted NodeId order"
+        );
+    }
 }
