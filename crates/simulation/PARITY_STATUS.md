@@ -79,6 +79,9 @@ Corresponds to: scoped deterministic load-generation API.
 | Load configuration and modes | `GeneratedLoadConfig`, `LoadGenMode` | Full |
 | Classic payment load | `LoadGenerator`, `TxGenerator::payment_transaction()` | Full |
 | Soroban upload/setup/invoke load | `LoadGenerator`, `SorobanTxBuilder` | Full |
+| Upgrade-setup / create-upgrade load (#3297) | `SorobanUpgradeSetup`/`SorobanCreateUpgrade`, `invoke_soroban_create_upgrade_tx`, `config_upgrade::build_config_upgrade_set` | Full |
+| Pregenerated payment load (#3297) | `PayPregenerated`, `PregeneratedTxReader` | Full |
+| `soroban_invoke_apply_load` (V2 invoke + APPLY_LOAD config) | deferred — explicit unsupported error (#3309) | Missing (tracked #3309) |
 | Account pool, retries, and reports | `TestAccount`, `LoadReport`, `LoadResult` | Full |
 | End-to-end load scenario breadth | selected tests and helpers | Partial |
 

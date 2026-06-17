@@ -75,6 +75,33 @@ const BATCH_TRANSFER_READ_BYTES_PER_ITEM: u32 = 800;
 /// Per-transfer write bytes for batch transfers.
 const BATCH_TRANSFER_WRITE_BYTES_PER_ITEM: u32 = 800;
 
+/// CPU instructions budget for the config-upgrade `write` invocation.
+///
+/// Matches stellar-core `TxGenerator::invokeSorobanCreateUpgradeTransaction`'s
+/// default `resources->instructions` (TxGenerator.cpp:1251).
+const CREATE_UPGRADE_INSTRUCTIONS: u32 = 2_500_000;
+
+/// Disk-read bytes for the config-upgrade `write` invocation
+/// (stellar-core default `diskReadBytes`).
+const CREATE_UPGRADE_READ_BYTES: u32 = 3_100;
+
+/// Write bytes for the config-upgrade `write` invocation
+/// (stellar-core default `writeBytes`).
+const CREATE_UPGRADE_WRITE_BYTES: u32 = 3_100;
+
+/// Fixed resource fee (stroops) for the config-upgrade `write` invocation.
+///
+/// stellar-core computes `sorobanResourceFee(app, resources, 1000, 40) +
+/// 20'000'000` (TxGenerator.cpp:1251). henyey does not expose a public
+/// `sorobanResourceFee`-equivalent over raw `SorobanResources` from the
+/// simulation crate, so — consistent with the other generous fixed fee
+/// constants in this module (`INVOKE_RESOURCE_FEE`, `UPLOAD_WASM_RESOURCE_FEE`)
+/// — we use a generous fixed value that comfortably covers the resources above
+/// plus the `+20'000'000` upgrade-tx headroom. The resource fee is a
+/// fee-bound, not part of the upgrade-set content hash (the parity-critical
+/// quantity), so an over-estimate is acceptable for load generation.
+const CREATE_UPGRADE_RESOURCE_FEE: i64 = 50_000_000;
+
 // ---------------------------------------------------------------------------
 // SorobanTxBuilder
 // ---------------------------------------------------------------------------
@@ -285,6 +312,89 @@ impl SorobanTxBuilder {
             resource_fee,
             invocation.inclusion_fee,
         )
+    }
+
+    /// Build a config-upgrade `write` invocation transaction.
+    ///
+    /// Faithful port of stellar-core
+    /// `TxGenerator::invokeSorobanCreateUpgradeTransaction` (TxGenerator.cpp:1251):
+    ///
+    /// - op = `INVOKE_CONTRACT` on the upgrade contract, function `"write"`,
+    ///   single arg `SCV_BYTES(upgradeBytes)`;
+    /// - footprint readOnly = `[instanceKey, codeKey]` (order matters);
+    /// - footprint readWrite = `[temp CONTRACT_DATA]` whose contract is the
+    ///   upgrade contract and whose key is
+    ///   `SCV_BYTES(xdr_to_opaque(sha256(upgradeBytes)))` — i.e. the raw 32-byte
+    ///   content hash (XDR fixed-opaque encoding of a `Hash` is the 32 bytes
+    ///   verbatim);
+    /// - resources insns=2_500_000 / diskRead=3_100 / write=3_100.
+    ///
+    /// `code_key` and `instance_key` come from a prior `upgrade_setup` run.
+    pub fn invoke_soroban_create_upgrade_tx(
+        &self,
+        source: &SecretKey,
+        sequence: i64,
+        upgrade_bytes: &[u8],
+        code_key: LedgerKey,
+        instance_key: LedgerKey,
+        inclusion_fee: u32,
+    ) -> anyhow::Result<TransactionEnvelope> {
+        // The upgrade contract address is taken from the instance key.
+        let contract_address = match &instance_key {
+            LedgerKey::ContractData(cd) => cd.contract.clone(),
+            _ => anyhow::bail!("instance_key must be a CONTRACT_DATA key"),
+        };
+
+        // Temp CONTRACT_DATA entry keyed by SCV_BYTES(xdr_to_opaque(sha256)).
+        // XDR fixed-opaque encoding of a 32-byte `Hash` is the 32 bytes
+        // verbatim, so the key bytes are the raw content hash.
+        let upgrade_hash = Hash256::hash(upgrade_bytes);
+        let key_bytes =
+            ScVal::Bytes(
+                upgrade_hash.0.to_vec().try_into().map_err(|_| {
+                    anyhow::anyhow!("upgrade content hash exceeds SCV_BYTES capacity")
+                })?,
+            );
+        let upgrade_lk = LedgerKey::ContractData(LedgerKeyContractData {
+            contract: contract_address.clone(),
+            key: key_bytes,
+            durability: ContractDataDurability::Temporary,
+        });
+
+        let arg = ScVal::Bytes(
+            upgrade_bytes
+                .to_vec()
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("upgrade bytes exceed SCV_BYTES capacity"))?,
+        );
+
+        let host_fn = HostFunction::InvokeContract(InvokeContractArgs {
+            contract_address,
+            function_name: ScSymbol("write".try_into().unwrap()),
+            args: vec![arg].try_into().unwrap_or_default(),
+        });
+
+        let op = Operation {
+            source_account: None,
+            body: OperationBody::InvokeHostFunction(InvokeHostFunctionOp {
+                host_function: host_fn,
+                auth: VecM::default(),
+            }),
+        };
+
+        let resources = SorobanResources {
+            footprint: LedgerFootprint {
+                // Order matters: [instance, code].
+                read_only: vec![instance_key, code_key].try_into().unwrap_or_default(),
+                read_write: vec![upgrade_lk].try_into().unwrap_or_default(),
+            },
+            instructions: CREATE_UPGRADE_INSTRUCTIONS,
+            disk_read_bytes: CREATE_UPGRADE_READ_BYTES,
+            write_bytes: CREATE_UPGRADE_WRITE_BYTES,
+        };
+
+        let resource_fee = CREATE_UPGRADE_RESOURCE_FEE;
+        self.build_soroban_envelope(source, sequence, op, resources, resource_fee, inclusion_fee)
     }
 
     /// Build a SAC (Stellar Asset Contract) creation transaction.
@@ -731,5 +841,93 @@ mod tests {
         let id = Hash256::hash(b"test");
         let key = contract_instance_key(&id);
         assert!(matches!(key, LedgerKey::ContractData(_)));
+    }
+
+    /// The create-upgrade tx must match stellar-core
+    /// `invokeSorobanCreateUpgradeTransaction` (TxGenerator.cpp:1251):
+    /// INVOKE_CONTRACT `write`(SCV_BYTES(upgradeBytes)), footprint
+    /// readOnly=[instance, code], readWrite=[temp CONTRACT_DATA keyed by
+    /// SCV_BYTES(sha256(upgradeBytes))], fixed resources.
+    #[test]
+    fn test_invoke_soroban_create_upgrade_tx_op_shape() {
+        let passphrase = "Test SDF Network ; September 2015".to_string();
+        let builder = SorobanTxBuilder::new(passphrase);
+        let source = SecretKey::from_seed(&[3u8; 32]);
+
+        let wasm_hash = Hash256::hash(b"loadgen-wasm");
+        let contract_id = Hash256::hash(b"upgrade-contract");
+        let code_key = contract_code_key(&wasm_hash);
+        let instance_key = contract_instance_key(&contract_id);
+
+        let upgrade_bytes = vec![0xAB, 0xCD, 0xEF, 0x01, 0x02];
+        let expected_hash = Hash256::hash(&upgrade_bytes);
+
+        let env = builder
+            .invoke_soroban_create_upgrade_tx(
+                &source,
+                42,
+                &upgrade_bytes,
+                code_key.clone(),
+                instance_key.clone(),
+                100,
+            )
+            .unwrap();
+
+        let TransactionEnvelope::Tx(v1) = &env else {
+            panic!("expected v1 envelope");
+        };
+        let tx = &v1.tx;
+        assert_eq!(tx.seq_num.0, 42);
+
+        // Operation: INVOKE_CONTRACT "write"(SCV_BYTES(upgradeBytes)).
+        let op = &tx.operations[0];
+        let OperationBody::InvokeHostFunction(ihf) = &op.body else {
+            panic!("expected InvokeHostFunction");
+        };
+        let HostFunction::InvokeContract(args) = &ihf.host_function else {
+            panic!("expected InvokeContract");
+        };
+        assert_eq!(args.function_name.0.as_slice(), b"write");
+        assert_eq!(args.args.len(), 1);
+        match &args.args[0] {
+            ScVal::Bytes(b) => assert_eq!(b.0.as_slice(), upgrade_bytes.as_slice()),
+            other => panic!("expected SCV_BYTES arg, got {other:?}"),
+        }
+        // Contract address is the upgrade contract instance's contract.
+        match (&args.contract_address, &instance_key) {
+            (ScAddress::Contract(a), LedgerKey::ContractData(cd)) => {
+                assert_eq!(ScAddress::Contract(a.clone()), cd.contract);
+            }
+            _ => panic!("unexpected address shapes"),
+        }
+
+        // Footprint + resources live in the V1 ext SorobanTransactionData.
+        let TransactionExt::V1(data) = &tx.ext else {
+            panic!("expected V1 soroban ext");
+        };
+        let res = &data.resources;
+        assert_eq!(res.instructions, CREATE_UPGRADE_INSTRUCTIONS);
+        assert_eq!(res.disk_read_bytes, CREATE_UPGRADE_READ_BYTES);
+        assert_eq!(res.write_bytes, CREATE_UPGRADE_WRITE_BYTES);
+
+        // readOnly = [instance, code] (order matters).
+        let ro: Vec<LedgerKey> = res.footprint.read_only.to_vec();
+        assert_eq!(ro, vec![instance_key.clone(), code_key]);
+
+        // readWrite = single temp CONTRACT_DATA keyed by sha256(upgradeBytes).
+        let rw: Vec<LedgerKey> = res.footprint.read_write.to_vec();
+        assert_eq!(rw.len(), 1);
+        let LedgerKey::ContractData(rw_cd) = &rw[0] else {
+            panic!("expected CONTRACT_DATA rw key");
+        };
+        assert_eq!(rw_cd.durability, ContractDataDurability::Temporary);
+        match &rw_cd.key {
+            ScVal::Bytes(b) => assert_eq!(b.0.as_slice(), &expected_hash.0),
+            other => panic!("expected SCV_BYTES key, got {other:?}"),
+        }
+        // The rw entry's contract is the upgrade contract.
+        if let LedgerKey::ContractData(inst_cd) = &instance_key {
+            assert_eq!(rw_cd.contract, inst_cd.contract);
+        }
     }
 }

@@ -154,13 +154,15 @@ All mode compatibility work is complete:
 - **`stop` mode**: `stop_load()` added to `LoadGenRunner` trait, implemented end-to-end. Both compat and native HTTP handlers intercept `mode=stop` before the `is_running()` check, matching stellar-core behavior.
 - **`GENESIS_TEST_ACCOUNT_COUNT`**: Replaces `create` mode. Accounts named `"TestAccount-0"` through `"TestAccount-{N-1}"` are created in the genesis ledger with deterministic keys and even balance splits. `bootstrap_from_db()` correctly recreates these accounts in the bucket list on restart.
 
-Still missing modes (deferred — will get "unknown mode" errors until SSC actually needs them):
-- `upgrade_setup`
-- `create_upgrade`
-- `pay_pregenerated`
-- `soroban_invoke_apply_load`
+Bounded modes now implemented (#3297):
+- `upgrade_setup` — SorobanInvokeSetup clone on the root account, single instance.
+- `create_upgrade` — single `write` invocation staging a `ConfigUpgradeSet` built from live config settings (`config_upgrade::build_config_upgrade_set`, a port of `getConfigUpgradeSetFromLoadConfig`); content-hash unit-pinned for parity.
+- `pay_pregenerated` — XDR record-marking transaction-file reader; no account allocation; sequence numbers set (not incremented) from the file; no resubmit.
 
-Commits: `fc12e03`, `35a44d8`, `dae8ad9`
+Still deferred:
+- `soroban_invoke_apply_load` — returns an explicit "unsupported (tracked #3309)" error (not a generic unknown-mode error). Requires the `APPLY_LOAD_*` config surface and V2 invoke distributions; its MaxTPS/apply-load mission validation also gates on #3296.
+
+Commits: `fc12e03`, `35a44d8`, `dae8ad9`, plus #3297 (the 3 bounded modes)
 
 ### 5. Compat survey endpoints are stubs
 

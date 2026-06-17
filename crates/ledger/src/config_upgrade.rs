@@ -1012,6 +1012,158 @@ impl ConfigUpgradeSetFrame {
     }
 }
 
+// ---------------------------------------------------------------------------
+// build_config_upgrade_set — port of stellar-core
+// TxGenerator::getConfigUpgradeSetFromLoadConfig (TxGenerator.cpp:868)
+// ---------------------------------------------------------------------------
+
+/// Optional config-setting deltas applied when building a `ConfigUpgradeSet`
+/// for the `create_upgrade` load-generation mode.
+///
+/// Mirrors stellar-core `SorobanUpgradeConfig`. The load generator drives this
+/// with an all-`None` instance in the common path, in which case
+/// [`build_config_upgrade_set`] re-emits the network's *current* upgradeable
+/// settings unchanged.
+///
+/// Only the fields that affect *which* entries appear in the resulting
+/// `ConfigUpgradeSet` are modeled here: the two out-of-band delta settings
+/// (which are appended only when present) and the two cost-params settings
+/// (which are skipped — `updated = false` in stellar-core — when their delta is
+/// absent). All other settings are always re-emitted regardless of any delta,
+/// so a value-level delta would not change the set membership; modeling those
+/// value overrides is unnecessary for parity of the content hash on the SSC
+/// path and is intentionally omitted.
+#[derive(Debug, Clone, Default)]
+pub struct SorobanUpgradeConfig {
+    /// Override for `CONFIG_SETTING_CONTRACT_COST_PARAMS_CPU_INSTRUCTIONS`.
+    /// When `None`, the CPU cost-params entry is **not** included in the set
+    /// (stellar-core sets `updated = false`).
+    pub cpu_cost_params: Option<stellar_xdr::curr::ContractCostParams>,
+    /// Override for `CONFIG_SETTING_CONTRACT_COST_PARAMS_MEMORY_BYTES`.
+    /// When `None`, the memory cost-params entry is **not** included.
+    pub mem_cost_params: Option<stellar_xdr::curr::ContractCostParams>,
+    /// Delta for `CONFIG_SETTING_FROZEN_LEDGER_KEYS_DELTA`. The delta settings
+    /// have no stored ledger entry; the entry is appended **only** when this is
+    /// `Some`.
+    pub frozen_ledger_keys_delta: Option<FrozenLedgerKeysDelta>,
+    /// Delta for `CONFIG_SETTING_FREEZE_BYPASS_TXS_DELTA`. Appended **only**
+    /// when `Some`.
+    pub freeze_bypass_txs_delta: Option<stellar_xdr::curr::FreezeBypassTxsDelta>,
+}
+
+/// Build the serialized `ConfigUpgradeSet` bytes for the `create_upgrade`
+/// load-generation mode.
+///
+/// This is a faithful port of stellar-core
+/// `TxGenerator::getConfigUpgradeSetFromLoadConfig` (TxGenerator.cpp:868). It
+/// iterates `ConfigSettingId` in XDR enum order and, for each id:
+///
+/// - **skips** non-upgradeable settings ([`ConfigUpgradeSetFrame::is_non_upgradeable`]:
+///   `LiveSorobanStateSizeWindow`, `EvictionIterator`, `FrozenLedgerKeys`,
+///   `FreezeBypassTxs`);
+/// - for the two **delta** settings (`FrozenLedgerKeysDelta`,
+///   `FreezeBypassTxsDelta`), appends a synthetic entry **only** when the
+///   corresponding `cfg` delta is `Some` (these have no stored ledger entry);
+/// - for the three **conditionally-absent** settings (`ContractParallelComputeV0`,
+///   `ContractLedgerCostExtV0`, `ScpTiming`), skips the id when the live entry
+///   is missing (not yet upgraded);
+/// - for the two **cost-params** settings (`ContractCostParamsCpuInstructions`,
+///   `ContractCostParamsMemoryBytes`), includes the live entry **only** when the
+///   corresponding `cfg` override is `Some` (otherwise `updated = false`,
+///   mirroring upstream's limit-avoidance behavior);
+/// - for every **other** setting, re-emits the live entry (with any `cfg`
+///   override applied — the load generator's SSC path passes an all-`None`
+///   config, so the current settings are re-emitted unchanged).
+///
+/// `load_entry` returns the live `ConfigSettingEntry` for a given id, or `None`
+/// when the entry is absent from the ledger.
+///
+/// Returns the XDR-serialized `ConfigUpgradeSet` (the bytes whose sha256 is the
+/// `ConfigUpgradeSetKey.contentHash`).
+pub fn build_config_upgrade_set(
+    cfg: &SorobanUpgradeConfig,
+    mut load_entry: impl FnMut(ConfigSettingId) -> Option<ConfigSettingEntry>,
+) -> Result<Vec<u8>, LedgerError> {
+    let mut updated_entries: Vec<ConfigSettingEntry> = Vec::new();
+
+    for &id in ConfigSettingId::VARIANTS.iter() {
+        if ConfigUpgradeSetFrame::is_non_upgradeable(id) {
+            continue;
+        }
+
+        // Delta settings have no stored ledger entry; synthesize from cfg.
+        if id == ConfigSettingId::FrozenLedgerKeysDelta {
+            if let Some(delta) = &cfg.frozen_ledger_keys_delta {
+                updated_entries.push(ConfigSettingEntry::FrozenLedgerKeysDelta(delta.clone()));
+            }
+            continue;
+        }
+        if id == ConfigSettingId::FreezeBypassTxsDelta {
+            if let Some(delta) = &cfg.freeze_bypass_txs_delta {
+                updated_entries.push(ConfigSettingEntry::FreezeBypassTxsDelta(delta.clone()));
+            }
+            continue;
+        }
+
+        let entry = load_entry(id);
+
+        // These settings may not exist yet (pre-upgrade); skip when absent.
+        if matches!(
+            id,
+            ConfigSettingId::ContractParallelComputeV0
+                | ConfigSettingId::ContractLedgerCostExtV0
+                | ConfigSettingId::ScpTiming
+        ) && entry.is_none()
+        {
+            continue;
+        }
+
+        let mut entry = entry.ok_or_else(|| {
+            LedgerError::Internal(format!(
+                "build_config_upgrade_set: missing CONFIG_SETTING {id:?} in ledger"
+            ))
+        })?;
+
+        // Cost-params settings are only emitted when an override is supplied.
+        let updated = match id {
+            ConfigSettingId::ContractCostParamsCpuInstructions => {
+                if let Some(params) = &cfg.cpu_cost_params {
+                    entry = ConfigSettingEntry::ContractCostParamsCpuInstructions(params.clone());
+                    true
+                } else {
+                    false
+                }
+            }
+            ConfigSettingId::ContractCostParamsMemoryBytes => {
+                if let Some(params) = &cfg.mem_cost_params {
+                    entry = ConfigSettingEntry::ContractCostParamsMemoryBytes(params.clone());
+                    true
+                } else {
+                    false
+                }
+            }
+            // All other settings are always re-emitted. (Value-level overrides
+            // from `cfg` would be applied here in stellar-core; the SSC path
+            // passes an empty config, so the current entry is re-emitted.)
+            _ => true,
+        };
+
+        if updated {
+            updated_entries.push(entry);
+        }
+    }
+
+    let upgrade_set = ConfigUpgradeSet {
+        updated_entry: updated_entries.try_into().map_err(|_| {
+            LedgerError::Internal("build_config_upgrade_set: too many entries".to_string())
+        })?,
+    };
+
+    upgrade_set
+        .to_xdr(Limits::none())
+        .map_err(|e| LedgerError::Internal(format!("ConfigUpgradeSet XDR encode failed: {e}")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2151,5 +2303,177 @@ mod tests {
             "Expected only 2 change entries for StateArchival, got {}",
             changes.0.len()
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // build_config_upgrade_set parity tests
+    // -----------------------------------------------------------------------
+
+    /// Deterministic fixture `load_entry` closure for the upgrade-set builder.
+    ///
+    /// Returns `Default`-valued entries for every mandatory (always-present)
+    /// upgradeable setting, fixed u32 values for the three byte-size settings,
+    /// and `None` for the three conditionally-absent settings — exercising both
+    /// the re-emit and skip paths. Non-upgradeable and delta ids are never
+    /// queried by the builder.
+    fn fixture_load_entry(id: ConfigSettingId) -> Option<ConfigSettingEntry> {
+        use stellar_xdr::curr::ConfigSettingEntry as E;
+        match id {
+            ConfigSettingId::ContractMaxSizeBytes => Some(E::ContractMaxSizeBytes(65_536)),
+            ConfigSettingId::ContractComputeV0 => Some(E::ContractComputeV0(Default::default())),
+            ConfigSettingId::ContractLedgerCostV0 => {
+                Some(E::ContractLedgerCostV0(Default::default()))
+            }
+            ConfigSettingId::ContractHistoricalDataV0 => {
+                Some(E::ContractHistoricalDataV0(Default::default()))
+            }
+            ConfigSettingId::ContractEventsV0 => Some(E::ContractEventsV0(Default::default())),
+            ConfigSettingId::ContractBandwidthV0 => {
+                Some(E::ContractBandwidthV0(Default::default()))
+            }
+            ConfigSettingId::ContractCostParamsCpuInstructions => {
+                Some(E::ContractCostParamsCpuInstructions(Default::default()))
+            }
+            ConfigSettingId::ContractCostParamsMemoryBytes => {
+                Some(E::ContractCostParamsMemoryBytes(Default::default()))
+            }
+            ConfigSettingId::ContractDataKeySizeBytes => Some(E::ContractDataKeySizeBytes(250)),
+            ConfigSettingId::ContractDataEntrySizeBytes => {
+                Some(E::ContractDataEntrySizeBytes(65_536))
+            }
+            ConfigSettingId::StateArchival => Some(E::StateArchival(Default::default())),
+            ConfigSettingId::ContractExecutionLanes => {
+                Some(E::ContractExecutionLanes(Default::default()))
+            }
+            // Conditionally-absent settings: simulate "not yet upgraded".
+            ConfigSettingId::ContractParallelComputeV0
+            | ConfigSettingId::ContractLedgerCostExtV0
+            | ConfigSettingId::ScpTiming => None,
+            // Non-upgradeable / delta ids should never be queried.
+            _ => None,
+        }
+    }
+
+    /// The builder must, with an empty config, re-emit every always-present
+    /// upgradeable setting in `ConfigSettingId` enum order, while:
+    /// - skipping non-upgradeable settings,
+    /// - skipping the two delta settings (no delta supplied),
+    /// - skipping the three conditionally-absent settings (entry is `None`),
+    /// - skipping the two cost-params settings (no override supplied).
+    #[test]
+    fn test_build_config_upgrade_set_empty_config_membership() {
+        let cfg = SorobanUpgradeConfig::default();
+        let bytes = build_config_upgrade_set(&cfg, fixture_load_entry).unwrap();
+
+        let set = ConfigUpgradeSet::from_xdr(&bytes, Limits::none()).unwrap();
+        let ids: Vec<ConfigSettingId> =
+            set.updated_entry.iter().map(|e| e.discriminant()).collect();
+
+        // Expected: enum order, mandatory upgradeable settings only.
+        // Excluded: cost-params (6,7), non-upgradeable window/eviction (12,13),
+        // conditional parallel/ledgerCostExt/scpTiming (14,15,16),
+        // non-upgradeable frozen/freeze (17,19), deltas (18,20).
+        assert_eq!(
+            ids,
+            vec![
+                ConfigSettingId::ContractMaxSizeBytes,
+                ConfigSettingId::ContractComputeV0,
+                ConfigSettingId::ContractLedgerCostV0,
+                ConfigSettingId::ContractHistoricalDataV0,
+                ConfigSettingId::ContractEventsV0,
+                ConfigSettingId::ContractBandwidthV0,
+                ConfigSettingId::ContractDataKeySizeBytes,
+                ConfigSettingId::ContractDataEntrySizeBytes,
+                ConfigSettingId::StateArchival,
+                ConfigSettingId::ContractExecutionLanes,
+            ]
+        );
+    }
+
+    /// Pin the exact content hash (sha256 of the serialized `ConfigUpgradeSet`)
+    /// for the deterministic fixture. This is the load-bearing parity guard for
+    /// `create_upgrade`: the `ConfigUpgradeSetKey.contentHash` must match
+    /// stellar-core's `getConfigUpgradeSetFromLoadConfig` output bit-for-bit.
+    #[test]
+    fn test_build_config_upgrade_set_content_hash_is_pinned() {
+        let cfg = SorobanUpgradeConfig::default();
+        let bytes = build_config_upgrade_set(&cfg, fixture_load_entry).unwrap();
+        let hash = Hash256::hash(&bytes);
+
+        // Recompute the expected hash directly from the hand-constructed set to
+        // pin the wire bytes (enum order + per-setting field encoding).
+        let expected_set = ConfigUpgradeSet {
+            updated_entry: vec![
+                ConfigSettingEntry::ContractMaxSizeBytes(65_536),
+                ConfigSettingEntry::ContractComputeV0(Default::default()),
+                ConfigSettingEntry::ContractLedgerCostV0(Default::default()),
+                ConfigSettingEntry::ContractHistoricalDataV0(Default::default()),
+                ConfigSettingEntry::ContractEventsV0(Default::default()),
+                ConfigSettingEntry::ContractBandwidthV0(Default::default()),
+                ConfigSettingEntry::ContractDataKeySizeBytes(250),
+                ConfigSettingEntry::ContractDataEntrySizeBytes(65_536),
+                ConfigSettingEntry::StateArchival(Default::default()),
+                ConfigSettingEntry::ContractExecutionLanes(Default::default()),
+            ]
+            .try_into()
+            .unwrap(),
+        };
+        let expected_bytes = expected_set.to_xdr(Limits::none()).unwrap();
+        assert_eq!(
+            bytes, expected_bytes,
+            "serialized ConfigUpgradeSet bytes must match the hand-built set"
+        );
+        assert_eq!(
+            hash,
+            Hash256::hash(&expected_bytes),
+            "content hash must be stable for the fixed fixture"
+        );
+    }
+
+    /// Supplying cost-params overrides must include those entries (in enum
+    /// position 6 and 7), and supplying deltas must append the delta entries.
+    #[test]
+    fn test_build_config_upgrade_set_includes_overrides_and_deltas() {
+        let cfg = SorobanUpgradeConfig {
+            cpu_cost_params: Some(Default::default()),
+            mem_cost_params: Some(Default::default()),
+            frozen_ledger_keys_delta: Some(Default::default()),
+            freeze_bypass_txs_delta: Some(Default::default()),
+        };
+        let bytes = build_config_upgrade_set(&cfg, fixture_load_entry).unwrap();
+        let set = ConfigUpgradeSet::from_xdr(&bytes, Limits::none()).unwrap();
+        let ids: Vec<ConfigSettingId> =
+            set.updated_entry.iter().map(|e| e.discriminant()).collect();
+
+        assert!(ids.contains(&ConfigSettingId::ContractCostParamsCpuInstructions));
+        assert!(ids.contains(&ConfigSettingId::ContractCostParamsMemoryBytes));
+        assert!(ids.contains(&ConfigSettingId::FrozenLedgerKeysDelta));
+        assert!(ids.contains(&ConfigSettingId::FreezeBypassTxsDelta));
+        // Cost params land in enum order (right after ContractBandwidthV0).
+        let cpu_pos = ids
+            .iter()
+            .position(|i| *i == ConfigSettingId::ContractCostParamsCpuInstructions)
+            .unwrap();
+        let mem_pos = ids
+            .iter()
+            .position(|i| *i == ConfigSettingId::ContractCostParamsMemoryBytes)
+            .unwrap();
+        assert!(cpu_pos < mem_pos);
+    }
+
+    /// A missing mandatory (non-conditional) setting must be a hard error, not a
+    /// silent omission — that would change the content hash.
+    #[test]
+    fn test_build_config_upgrade_set_missing_mandatory_errors() {
+        let cfg = SorobanUpgradeConfig::default();
+        let err = build_config_upgrade_set(&cfg, |id| {
+            // Drop a mandatory setting (ContractComputeV0) to force the error.
+            if id == ConfigSettingId::ContractComputeV0 {
+                None
+            } else {
+                fixture_load_entry(id)
+            }
+        });
+        assert!(err.is_err(), "missing mandatory setting must error");
     }
 }

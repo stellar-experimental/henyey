@@ -335,11 +335,35 @@ mod loadgen_runner {
             }
         }
 
+        /// Returns `Some("unsupported message")` for modes that stellar-core
+        /// supports but henyey has deferred to a tracked follow-up issue.
+        ///
+        /// Parallel to [`deprecated_mode`]: checked before `parse_mode` so the
+        /// caller can return an explicit, actionable error (referencing the
+        /// follow-up issue) instead of a generic unknown-mode error.
+        fn unsupported_mode(mode: &str) -> Option<&'static str> {
+            let normalized = mode.to_ascii_lowercase();
+            if normalized == "soroban_invoke_apply_load" || normalized == "sorobaninvokeapplyload" {
+                Some(
+                    "UNSUPPORTED: soroban_invoke_apply_load is not yet implemented in henyey. \
+                     It requires the APPLY_LOAD_* config surface and the V2 invoke distributions \
+                     and is tracked as a follow-up: \
+                     https://github.com/stellar-experimental/henyey/issues/3309",
+                )
+            } else {
+                None
+            }
+        }
+
         /// Parse a mode string into a `LoadGenMode`.
         ///
         /// Accepts both stellar-core underscore names (e.g. `soroban_upload`)
         /// and henyey's legacy no-separator names (e.g. `sorobanupload`).
         /// Case-insensitive.
+        ///
+        /// `soroban_invoke_apply_load` is intentionally **not** parsed here — it
+        /// returns `None` and is surfaced as an explicit unsupported error via
+        /// [`unsupported_mode`] (tracked under #3309).
         fn parse_mode(mode: &str) -> Option<LoadGenMode> {
             let normalized = mode.to_ascii_lowercase();
             match normalized.as_str() {
@@ -352,6 +376,15 @@ mod loadgen_runner {
                 "mixed_classic_soroban" | "mixedclassicsoroban" | "mixed" => {
                     Some(LoadGenMode::MixedClassicSoroban)
                 }
+                "upgrade_setup"
+                | "upgradesetup"
+                | "soroban_upgrade_setup"
+                | "sorobanupgradesetup" => Some(LoadGenMode::SorobanUpgradeSetup),
+                "create_upgrade"
+                | "createupgrade"
+                | "soroban_create_upgrade"
+                | "sorobancreateupgrade" => Some(LoadGenMode::SorobanCreateUpgrade),
+                "pay_pregenerated" | "paypregenerated" => Some(LoadGenMode::PayPregenerated),
                 _ => None,
             }
         }
@@ -409,6 +442,73 @@ mod loadgen_runner {
                 SimulationLoadGenRunner::parse_mode("mixed_classic_soroban"),
                 Some(LoadGenMode::MixedClassicSoroban)
             );
+        }
+
+        #[test]
+        fn test_parse_mode_new_bounded_modes() {
+            // upgrade_setup
+            assert_eq!(
+                SimulationLoadGenRunner::parse_mode("upgrade_setup"),
+                Some(LoadGenMode::SorobanUpgradeSetup)
+            );
+            assert_eq!(
+                SimulationLoadGenRunner::parse_mode("soroban_upgrade_setup"),
+                Some(LoadGenMode::SorobanUpgradeSetup)
+            );
+            assert_eq!(
+                SimulationLoadGenRunner::parse_mode("UpgradeSetup"),
+                Some(LoadGenMode::SorobanUpgradeSetup)
+            );
+            // create_upgrade
+            assert_eq!(
+                SimulationLoadGenRunner::parse_mode("create_upgrade"),
+                Some(LoadGenMode::SorobanCreateUpgrade)
+            );
+            assert_eq!(
+                SimulationLoadGenRunner::parse_mode("soroban_create_upgrade"),
+                Some(LoadGenMode::SorobanCreateUpgrade)
+            );
+            assert_eq!(
+                SimulationLoadGenRunner::parse_mode("CreateUpgrade"),
+                Some(LoadGenMode::SorobanCreateUpgrade)
+            );
+            // pay_pregenerated
+            assert_eq!(
+                SimulationLoadGenRunner::parse_mode("pay_pregenerated"),
+                Some(LoadGenMode::PayPregenerated)
+            );
+            assert_eq!(
+                SimulationLoadGenRunner::parse_mode("PayPregenerated"),
+                Some(LoadGenMode::PayPregenerated)
+            );
+        }
+
+        #[test]
+        fn test_soroban_invoke_apply_load_is_unsupported_referencing_3309() {
+            // parse_mode must NOT accept it (distinct from a recognized mode)…
+            assert_eq!(
+                SimulationLoadGenRunner::parse_mode("soroban_invoke_apply_load"),
+                None
+            );
+            // …and the explicit unsupported sentinel must reference #3309.
+            let msg = SimulationLoadGenRunner::unsupported_mode("soroban_invoke_apply_load")
+                .expect("apply-load must return an explicit unsupported message");
+            assert!(
+                msg.contains("3309"),
+                "unsupported message must reference follow-up issue #3309, got: {msg}"
+            );
+            assert!(
+                msg.to_ascii_lowercase().contains("unsupported"),
+                "message should say it is unsupported"
+            );
+            // Case-insensitive + camelCase alias.
+            assert!(
+                SimulationLoadGenRunner::unsupported_mode("SOROBAN_INVOKE_APPLY_LOAD").is_some()
+            );
+            assert!(SimulationLoadGenRunner::unsupported_mode("sorobaninvokeapplyload").is_some());
+            // Other modes are not flagged unsupported.
+            assert!(SimulationLoadGenRunner::unsupported_mode("pay").is_none());
+            assert!(SimulationLoadGenRunner::unsupported_mode("create_upgrade").is_none());
         }
 
         #[test]
@@ -666,13 +766,27 @@ mod loadgen_runner {
                 return Err(msg.to_string());
             }
 
+            // Modes stellar-core supports but henyey has deferred (e.g.
+            // soroban_invoke_apply_load → #3309) get an explicit, actionable
+            // error rather than a generic unknown-mode error.
+            if let Some(msg) = Self::unsupported_mode(&request.mode) {
+                return Err(msg.to_string());
+            }
+
             let mode = Self::parse_mode(&request.mode).ok_or_else(|| {
                 format!(
                     "Unknown mode: '{}'. Use: pay, soroban_upload, \
-                     soroban_invoke_setup, soroban_invoke, mixed_classic_soroban.",
+                     soroban_invoke_setup, soroban_invoke, mixed_classic_soroban, \
+                     upgrade_setup, create_upgrade, pay_pregenerated.",
                     request.mode
                 )
             })?;
+
+            // PayPregenerated requires a transactions file (LoadGenerator.cpp:526).
+            if mode == LoadGenMode::PayPregenerated && request.preloaded_transactions_file.is_none()
+            {
+                return Err("PAY_PREGENERATED mode requires preloadedTransactionsFile".to_string());
+            }
 
             // Atomic exclusivity gate with coupled stop-token creation.
             let (permit, stop_token) = LoadGenPermit::try_acquire(&self.state)
@@ -695,6 +809,10 @@ mod loadgen_runner {
                 n_instances: request.instances,
                 n_wasms: request.wasms,
                 min_soroban_percent_success: request.min_percent_success,
+                preloaded_transactions_file: request
+                    .preloaded_transactions_file
+                    .as_ref()
+                    .map(std::path::PathBuf::from),
                 ..Default::default()
             };
 

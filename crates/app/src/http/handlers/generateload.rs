@@ -39,6 +39,8 @@ pub struct LoadGenRequest {
     pub min_percent_success: u32,
     pub instances: u32,
     pub wasms: u32,
+    /// Path to the pre-generated transactions file for `pay_pregenerated`.
+    pub preloaded_transactions_file: Option<String>,
 }
 
 impl From<GenerateLoadParams> for LoadGenRequest {
@@ -56,6 +58,7 @@ impl From<GenerateLoadParams> for LoadGenRequest {
             min_percent_success: p.minpercentsuccess,
             instances: p.instances,
             wasms: p.wasms,
+            preloaded_transactions_file: p.preloadedtransactionsfile.filter(|s| !s.is_empty()),
         }
     }
 }
@@ -180,22 +183,10 @@ mod tests {
             minpercentsuccess: 90,
             instances: 3,
             wasms: 2,
+            preloadedtransactionsfile: None,
         };
 
-        let request = LoadGenRequest {
-            mode: params.mode.clone(),
-            accounts: params.accounts,
-            txs: params.txs,
-            tx_rate: params.txrate,
-            offset: params.offset,
-            spike_interval: params.spikeinterval,
-            spike_size: params.spikesize,
-            max_fee_rate: params.maxfeerate,
-            skip_low_fee_txs: params.skiplowfeetxs,
-            min_percent_success: params.minpercentsuccess,
-            instances: params.instances,
-            wasms: params.wasms,
-        };
+        let request: LoadGenRequest = params.into();
 
         assert_eq!(request.mode, "pay");
         assert_eq!(request.accounts, 200);
@@ -226,6 +217,7 @@ mod tests {
             min_percent_success: 0,
             instances: 0,
             wasms: 0,
+            preloaded_transactions_file: None,
         };
         let debug = format!("{:?}", request);
         assert!(debug.contains("pay"));
@@ -247,12 +239,48 @@ mod tests {
             min_percent_success: 95,
             instances: 4,
             wasms: 1,
+            preloaded_transactions_file: Some("/tmp/txs.xdr".to_string()),
         };
         let cloned = request.clone();
         assert_eq!(cloned.mode, request.mode);
         assert_eq!(cloned.accounts, request.accounts);
         assert_eq!(cloned.tx_rate, request.tx_rate);
         assert_eq!(cloned.instances, request.instances);
+        assert_eq!(
+            cloned.preloaded_transactions_file,
+            request.preloaded_transactions_file
+        );
+    }
+
+    /// The pregenerated-file query param flows into `LoadGenRequest`, and an
+    /// empty string is normalized to `None` (matches "no file supplied").
+    #[test]
+    fn test_preloaded_transactions_file_from_params() {
+        let mut params = GenerateLoadParams {
+            mode: "pay_pregenerated".to_string(),
+            accounts: 100,
+            txs: 100,
+            txrate: 10,
+            offset: 0,
+            spikeinterval: 0,
+            spikesize: 0,
+            maxfeerate: 0,
+            skiplowfeetxs: false,
+            minpercentsuccess: 0,
+            instances: 0,
+            wasms: 0,
+            preloadedtransactionsfile: Some("/data/pregenerated.xdr".to_string()),
+        };
+        let req: LoadGenRequest = params.clone().into();
+        assert_eq!(
+            req.preloaded_transactions_file.as_deref(),
+            Some("/data/pregenerated.xdr")
+        );
+
+        // Empty string → None.
+        params.preloadedtransactionsfile = Some(String::new());
+        let req2: LoadGenRequest = params.into();
+        assert_eq!(req2.preloaded_transactions_file, None);
     }
 
     /// Verify that mode=stop is handled at the HTTP layer before is_running
