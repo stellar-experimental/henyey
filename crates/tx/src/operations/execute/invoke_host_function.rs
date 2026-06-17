@@ -4227,7 +4227,7 @@ mod tests {
         // When limit is 0 and combined size is 0, it must be allowed.
         let combined_size_zero: u32 = 0;
         assert!(
-            !(combined_size_zero > limit),
+            combined_size_zero <= limit,
             "Zero limit with zero size must be allowed"
         );
     }
@@ -4238,7 +4238,7 @@ mod tests {
         let limit: u32 = 1000;
         let combined_size: u32 = 1000; // exactly at limit
         assert!(
-            !(combined_size > limit),
+            combined_size <= limit,
             "Combined size equal to limit must be allowed (strict > comparison)"
         );
     }
