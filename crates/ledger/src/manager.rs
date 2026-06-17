@@ -25,7 +25,6 @@
 //! for state archival. This stores archived/evicted entries separately from
 //! the live bucket list, and both contribute to the header's bucket list hash.
 
-use crate::offer_store::OfferStore;
 use crate::{
     close::{
         LedgerCloseData, LedgerCloseResult, LedgerCloseStats, SortState, TransactionSetVariant,
@@ -52,6 +51,7 @@ use henyey_common::protocol::{
 use henyey_common::{BucketListDbConfig, Hash256, NetworkId};
 use henyey_tx::envelope_utils::envelope_operation_count;
 use henyey_tx::soroban::PersistentModuleCache;
+use henyey_tx::state::offer_store::OfferStore;
 use henyey_tx::{ClassicEventConfig, LedgerContext, TxEventManager};
 use parking_lot::{Mutex, RwLock};
 use std::collections::{HashMap, HashSet};
@@ -1545,7 +1545,7 @@ pub struct LedgerManager {
     ///
     /// Used to compute `stellar_ledger_age_closed_seconds` — the time elapsed
     /// between consecutive close_ledger calls, matching stellar-core's mLastClose.
-    last_close_wall_time: std::sync::Mutex<std::time::Instant>,
+    last_close_wall_time: Mutex<std::time::Instant>,
 }
 
 // Compile-time assertion: LedgerManager must be Send + Sync for spawn_blocking.
@@ -1584,7 +1584,7 @@ impl LedgerManager {
             #[cfg(any(test, feature = "test-utils"))]
             snapshot_count: std::sync::atomic::AtomicU64::new(0),
             invariant_manager: None,
-            last_close_wall_time: std::sync::Mutex::new(std::time::Instant::now()),
+            last_close_wall_time: Mutex::new(std::time::Instant::now()),
         }
     }
 
@@ -2191,14 +2191,9 @@ impl LedgerManager {
         runtime_handle: Option<tokio::runtime::Handle>,
     ) -> Result<LedgerCloseResult> {
         // Emit ledger age metric: time since last close_ledger entry.
-        let age_secs = self
-            .last_close_wall_time
-            .lock()
-            .unwrap()
-            .elapsed()
-            .as_secs_f64();
+        let age_secs = self.last_close_wall_time.lock().elapsed().as_secs_f64();
         metrics::histogram!("stellar_ledger_age_closed_seconds").record(age_secs);
-        *self.last_close_wall_time.lock().unwrap() = std::time::Instant::now();
+        *self.last_close_wall_time.lock() = std::time::Instant::now();
 
         let rss_before = get_rss_bytes();
         let begin_start = std::time::Instant::now();
