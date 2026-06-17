@@ -530,11 +530,18 @@ pub fn singleton_quorum_set(node_id: NodeId) -> ScpQuorumSet {
 ///
 /// This struct provides efficient caching of singleton quorum sets,
 /// matching the stellar-core `getSingletonQSet()` optimization.
+// Retained as an intentional internal/test utility: it has no non-test
+// in-crate caller, and #3329 removed it from the crate's public API
+// (crate-root `pub use`), so without this allow the lib build would flag
+// it (and its inherent methods) as dead code. It remains exercised by the
+// `quorum` test module and mirrors stellar-core's `getSingletonQSet()`.
+#[allow(dead_code)]
 #[derive(Debug, Default)]
 pub struct SingletonQuorumSetCache {
     cache: std::sync::RwLock<std::collections::HashMap<NodeId, ScpQuorumSet>>,
 }
 
+#[allow(dead_code)]
 impl SingletonQuorumSetCache {
     /// Create a new empty cache.
     pub fn new() -> Self {
