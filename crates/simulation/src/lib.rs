@@ -55,11 +55,14 @@ mod loadgen_pregenerated;
 mod loadgen_soroban;
 pub use applyload::{ApplyLoad, ApplyLoadConfig, ApplyLoadMode, Histogram};
 pub use loadgen::{
-    GeneratedLoadConfig, GeneratedTransaction, LoadGenMode, LoadGenerator, LoadReport, LoadResult,
-    LoadStep, TestAccount, TxGenerator,
+    sample_discrete, GeneratedLoadConfig, GeneratedTransaction, LoadGenApplyLoadConfig,
+    LoadGenMode, LoadGenerator, LoadReport, LoadResult, LoadStep, TestAccount, TxGenerator,
 };
 pub use loadgen_pregenerated::PregeneratedTxReader;
-pub use loadgen_soroban::{BatchTransfer, ContractInvocation, SacTransfer, SorobanTxBuilder};
+pub use loadgen_soroban::{
+    get_key_for_archived_entry, ApplyLoadBuiltTx, ApplyLoadTxParams, BatchTransfer,
+    ContractInvocation, SacTransfer, SorobanTxBuilder,
+};
 
 mod poll;
 pub use poll::{poll_until, CrashScope, PollOutcome};

@@ -172,7 +172,7 @@ Features not yet implemented. These ARE counted against parity %.
 | Area | stellar-core Tests | Rust Tests | Notes |
 |------|-------------------|------------|-------|
 | CLI parsing and dispatch | 0 TEST_CASE / 0 SECTION | 5 `#[test]` | Basic `clap` command parsing is covered |
-| Load-generation mode parsing | 0 TEST_CASE / 0 SECTION | 15 `#[test]` | Covers compatibility spellings, deprecated `create` mode, case-insensitive parsing, the 3 bounded SSC modes (`upgrade_setup`/`create_upgrade`/`pay_pregenerated`, #3297), and the explicit `soroban_invoke_apply_load` unsupported sentinel (#3309) |
+| Load-generation mode parsing | 0 TEST_CASE / 0 SECTION | 15 `#[test]` | Covers compatibility spellings, deprecated `create` mode, case-insensitive parsing, the 3 bounded SSC modes (`upgrade_setup`/`create_upgrade`/`pay_pregenerated`, #3297), and `soroban_invoke_apply_load` resolving to the real `SorobanInvokeApplyLoad` mode (#3309) |
 | Application-utils style helpers | 4 TEST_CASE / 5 SECTION | 6 `#[test]` | Rust focuses on genesis/database helper behavior |
 | Config and command-handler compat | 14 TEST_CASE / 48 SECTION | 0 `#[test]` | Most equivalent coverage lives in `henyey-app`, not this crate |
 | Self-check | 1 TEST_CASE / 0 SECTION | 0 `#[test]` | No direct regression tests for the CLI command |
