@@ -110,7 +110,7 @@ mod manager;
 mod merge;
 mod merge_map;
 mod metrics;
-pub mod record;
+mod record;
 pub mod snapshot;
 
 // ============================================================================
