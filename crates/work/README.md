@@ -43,7 +43,6 @@ budget, cancellation tokens, optional events, and dependency blocking.
 | `WorkContext` | Execution context containing the work ID, attempt number, and cancellation token. |
 | `WorkOutcome` | Result of one execution attempt: success, retry, failure, or cancellation. |
 | `WorkState` | Scheduler-visible lifecycle state for a registered work item. |
-| `WorkEvent` | Optional state transition notification sent over a Tokio channel. |
 | `WorkId` | Scheduler-local `u64` identifier used for dependencies and inspection. |
 
 ## Usage

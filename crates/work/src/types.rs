@@ -128,14 +128,6 @@ impl WorkContext {
     pub fn is_cancelled(&self) -> bool {
         self.cancel_token.is_cancelled()
     }
-
-    /// Returns a reference to the cancellation token.
-    ///
-    /// This can be used for more advanced cancellation patterns, such as
-    /// passing the token to async operations that support it directly.
-    pub fn cancel_token(&self) -> &CancellationToken {
-        &self.cancel_token
-    }
 }
 
 /// Event emitted by the scheduler when work state changes.
