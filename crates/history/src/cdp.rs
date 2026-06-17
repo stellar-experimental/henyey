@@ -857,7 +857,7 @@ pub fn extract_transaction_processing(
 
 /// Build a map from transaction hash to envelope for matching.
 /// This version uses the network-aware hash (network_id || ENVELOPE_TYPE || tx).
-pub fn build_tx_hash_map_with_network(
+fn build_tx_hash_map_with_network(
     txs: &[stellar_xdr::curr::TransactionEnvelope],
     network_id: &Hash,
 ) -> std::collections::HashMap<Hash, stellar_xdr::curr::TransactionEnvelope> {
@@ -910,7 +910,7 @@ pub fn extract_transaction_results(
 ///
 /// Returns either a Classic TransactionSet (V0) or Generalized set (V1/V2).
 /// This is useful for passing to `close_ledger` when replaying from CDP.
-pub fn extract_transaction_set(meta: &LedgerCloseMeta) -> henyey_ledger::TransactionSetVariant {
+fn extract_transaction_set(meta: &LedgerCloseMeta) -> henyey_ledger::TransactionSetVariant {
     use henyey_ledger::TransactionSetVariant;
     match meta {
         LedgerCloseMeta::V0(v0) => TransactionSetVariant::Classic(v0.tx_set.clone()),

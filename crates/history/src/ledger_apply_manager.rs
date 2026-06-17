@@ -25,8 +25,7 @@
 use std::collections::BTreeMap;
 
 use crate::checkpoint::{
-    checkpoint_frequency, checkpoint_start, first_ledger_after_checkpoint_containing,
-    is_checkpoint_start,
+    checkpoint_start, first_ledger_after_checkpoint_containing, is_checkpoint_start,
 };
 
 /// Maximum allowed drift, in ledgers, between the next ledger queued for
@@ -188,13 +187,6 @@ pub fn trim_boundary_for_last_buffered(last_buffered: u32) -> Option<u32> {
     }
 }
 
-/// The §7.1(c) buffer-size invariant bound: at most one full checkpoint plus the
-/// following checkpoint's first ledger.
-#[inline]
-pub fn max_buffer_invariant_entries() -> usize {
-    (checkpoint_frequency() + 1) as usize
-}
-
 /// The §7.2 buffered-catchup *trigger* decision over the syncing buffer's span.
 ///
 /// This is distinct from [`ProcessLedgerDecision`] (the §7.2 step-3/5/6
@@ -313,7 +305,9 @@ mod tests {
     fn trim_buffer_respects_invariant() {
         let mut buf: BTreeMap<u32, ()> = (10u32..=192).map(|s| (s, ())).collect();
         trim_syncing_buffer(&mut buf, 9);
-        assert!(buf.len() <= max_buffer_invariant_entries());
+        // §7.1(c) buffer-size invariant bound: at most one full checkpoint plus
+        // the following checkpoint's first ledger.
+        assert!(buf.len() <= (crate::checkpoint::checkpoint_frequency() + 1) as usize);
         assert_eq!(*buf.keys().next().unwrap(), 128);
     }
 
