@@ -1,239 +1,446 @@
 ---
 name: cleanup
-description: Review or apply code simplifications to a crate
-argument-hint: <crate-path> [--apply]
+description: Crate-scoped Rust cleanup audit and optionally apply, with parity-aware filtering and adversarial verification
+argument-hint: <crate-path> [--mode=review|plan|apply]
 ---
 
 Parse `$ARGUMENTS`:
-- The first argument is the crate path. Replace `$TARGET` with it.
-- If `--apply` is present, set `$MODE = apply`. Otherwise set `$MODE = review`.
+- The first argument is the crate path (e.g. `crates/bucket`). Replace `$TARGET` with it.
+- `--mode=review` (default), `--mode=plan`, `--mode=apply`. `--apply` is a back-compat alias for `--mode=apply`.
 
-# Code Simplification
+# Cleanup
 
-Review the Rust crate at `$TARGET` and identify concrete simplifications.
+A crate-scoped Rust audit for the henyey codebase. For diff-scoped cleanup
+(typically as part of a PR review), use `/simplify` instead — this skill is for
+whole-crate audits, intended for maintenance passes, not PR work.
 
-## Mode
+## Modes
 
-- **`$MODE = review`** (default): Produce a ranked list of findings with
-  file:line references. Do NOT make any changes. Cap findings at
-  **min(15, 1 per 200 non-test lines)** — if you find more, keep only the
-  highest-impact ones.
-- **`$MODE = apply`**: Perform the simplifications directly. For each change,
-  briefly state what you changed and why. Run `cargo clippy -p <crate>` and
-  `cargo test -p <crate>` after each logical group of changes to verify
-  correctness. Stop after **10 changes** or when remaining findings are
-  low-impact.
+- **`review`** — read-only ranked list. Skips adversarial verify (cheap pass).
+- **`plan`** — read-only, full pipeline including adversarial verify. Output is
+  a ready-to-execute action list with per-finding verdicts. Use when a human
+  will apply the fixes.
+- **`apply`** — full pipeline + apply confirmed findings + commit per lane.
 
-## Parity Filter
-
-This codebase mirrors stellar-core for determinism. Before reporting any
-finding, check whether the code structurally mirrors a stellar-core counterpart
-by looking in `stellar-core/src/`. **Suppress the finding** if refactoring
-would make it harder to verify parity. Signs of parity-driven structure:
-
-- The file/function name matches a stellar-core `.cpp`/`.h` file or function.
-- The control flow (match arms, if-else chains) follows stellar-core's ordering.
-- Constants, parameter lists, or duplicated logic mirrors stellar-core's own
-  structure (including stellar-core's own duplication).
-
-This filter applies most often to: LARGE MODULE, GOD FUNCTION, DEEP NESTING,
-LONG PARAMETER LIST, DUPLICATION, and MAGIC NUMBERS.
-
-### Strengthened parity rules
-
-These specific patterns should **always be suppressed**:
-
-- **1:1 module mapping**: If a `.rs` file maps directly to a stellar-core `.cpp`
-  file (e.g., `bucket_list.rs` ↔ `BucketList.cpp`), do NOT flag it as LARGE
-  MODULE. The module's size reflects the upstream structure.
-- **Orchestration methods**: Methods on structs that mirror stellar-core classes
-  (e.g., `App`, `LedgerManager`, `Herder`) that coordinate multiple subsystems
-  are exempt from GOD FUNCTION. These methods require broad field access; extraction
-  would introduce parameter bloat or artificial state structs.
-- **Protocol-version functions**: Functions with version suffixes (`_p24`, `_p25`,
-  `_p26`) are exempt from GOD FUNCTION and DUPLICATION. Each version has
-  intentional subtle differences that are safer to keep explicit than to abstract.
-
-**Exception**: The Idiom categories (C-STYLE MUTATION, C-STYLE OUTPUT PARAMETER,
-C-STYLE OPTION HANDLING, VERBOSE ERROR PROPAGATION) are exempt — always report
-them regardless of parity.
-
-**Parity-positive findings**: If a simplification would make parity *easier* to
-verify (e.g., renaming to match stellar-core, extracting a function that maps
-1:1 to an upstream function), report it with a `[PARITY+]` tag. These findings
-are allowed even when they touch parity-driven code, because they improve — not
-degrade — the ability to verify alignment.
-
-## Categories
-
-For each finding, classify it into exactly one category:
-
-### Structure
- 1. **LARGE MODULE** — any single .rs file over 1500 non-test lines.
-    Suggest reduction via extraction, deduplication, or dead-code removal.
-    Only recommend a directory module (`foo/mod.rs`) when 3+ separable concerns
-    each exceed ~200 lines. Never split solely to extract tests.
-    **Suppress if**: the module is a cohesive unit — well-named functions with
-    clear internal structure but no obvious separation boundary. Being large
-    alone is not a finding; the module must have identifiable separable concerns.
- 2. **GOD FUNCTION** — any function over 200 lines or with cyclomatic complexity
-    that makes it hard to follow. Suggest extraction points and names.
-    **Suppress if**: the function is a sequential pipeline (≤2 nesting levels)
-    with clearly labeled phases (setup → process → cleanup), or a flat mapping
-    function (e.g., config translation). High line count with low nesting and
-    linear flow is not complexity.
- 3. **DEEP NESTING** — blocks indented 4+ levels. Suggest early returns, guard
-    clauses, or extraction to flatten.
- 4. **LONG PARAMETER LIST** — functions taking 7+ parameters. Suggest grouping
-    into a context/config struct. **Reinforce parity check**: if the parameter
-    list mirrors the corresponding stellar-core function, suppress.
-
-### Redundancy
- 5. **DEAD CODE** — functions, fields, methods, or branches that are never used
-    or always return a fixed value. Include evidence (e.g., "no callers found").
- 6. **DUPLICATION** — identical or near-identical logic repeated in 2+ places.
-    Show the locations and what a shared implementation would look like.
-    When checking for duplicates, also scan `crates/common/` and direct
-    dependency crates for existing equivalents that could be reused.
- 7. **DUPLICATE STATE** — the same truth tracked in 2+ places that must be kept
-    in sync manually. Suggest which copy to remove.
- 8. **SCATTERED CONCERN** — a single logical operation performed in multiple call
-    sites instead of one function. **Only report** when consolidation would be a
-    net improvement (fewer total lines, clearer intent). Do not report when the
-    duplication is incidental or the call sites have meaningful differences.
- 9. **UNNECESSARY CLONING** — values cloned where a borrow or move would suffice.
-    **Skip** when the cloned type implements or could implement `Copy`, or the
-    clone is in a cold path — the performance cost is negligible and removing
-    it adds no clarity.
-10. **TRIVIAL WRAPPER** — one-liner functions that only delegate with no added
-    logic. Inline and remove, unless the wrapper provides meaningful abstraction
-    (e.g., a public API shielding an internal signature, semantic naming that
-    improves call-site readability, or API stability for a frequently-changing
-    internal function).
-
-### Naming & Constants
-11. **MISLEADING NAMES** — identifiers whose name does not match their actual
-    semantics. Suggest a better name.
-12. **MAGIC NUMBERS** — hardcoded numeric or string literals that should be
-    named constants. Skip constants that mirror stellar-core values or are
-    defined by the XDR specification.
-
-### Visibility
-13. **OVERLY BROAD VISIBILITY** — items with broader visibility than needed.
-    Includes `pub` items only used within the current crate (narrow to
-    `pub(crate)`, `pub(super)`, or private) and `pub(crate)` items only used
-    within a single module (narrow to `pub(super)` or private).
-
-### Clippy
-14. **CLIPPY SUPPRESSIONS** — `#[allow(clippy::...)]` or `#[allow(dead_code)]`
-    where the underlying issue can be fixed. Do not report suppressions that
-    are genuinely necessary (false positive, upstream requirement, or parity
-    with stellar-core). In particular, `#[allow(clippy::too_many_arguments)]`
-    on parity functions is expected — skip these.
-
-### Documentation
-15. **STALE COMMENTS** — comments that no longer match the code. Fix or remove.
-16. **COMMENTED-OUT CODE** — dead code left as comments. Remove (git preserves
-    history).
-
-### Idiom (exempt from Parity Filter)
-
-These categories target C/C++ idioms carried over from stellar-core. They are
-**exempt from the Parity Filter** — always report them, even when the code
-structurally mirrors stellar-core. The goal is to make the Rust codebase
-idiomatically Rust, not a transliteration of C++.
-
-17. **C-STYLE MUTATION** — functions that take `&mut T` and return `bool` for
-    success/failure. The Rust idiom is `Result<(), E>` (or `Option<T>` when
-    there is no meaningful error context). Callers benefit from `?` propagation
-    instead of `if !func(...) { return error; }` chains.
-    *Example 1*: `add_account_balance(account: &mut AccountEntry, delta: i64) -> bool`
-    → `fn add_account_balance(account: &mut AccountEntry, delta: i64) -> Result<(), BalanceError>`.
-    *Example 2*: `process_op(entry: &mut LedgerEntry) -> Result<bool, Error>` where
-    `bool` encodes sub-operation success → `fn process_op(entry: &mut LedgerEntry) -> Result<(), Error>`.
-    **Skip**: In-place slice sorting (`sort_by`, `sort_unstable_by`) and mutable
-    slice operations are idiomatic Rust, not C-isms.
-18. **C-STYLE OUTPUT PARAMETER** — functions that take `&mut Vec<T>` (or similar
-    containers) as output parameters instead of returning a collection. The Rust
-    idiom is to return the collected value, letting the caller decide how to
-    combine it.
-    *Example*: `collect_bucket_hashes(out: &mut Vec<Hash256>)`
-    → `fn collect_bucket_hashes() -> Vec<Hash256>`.
-19. **C-STYLE OPTION HANDLING** — manual `is_none()` / `is_some()` checks
-    followed by `.unwrap()` instead of pattern matching (`let Some(x) = … else`),
-    `match`, or combinators (`.map()`, `.and_then()`, `.ok_or()`). The
-    check-then-unwrap pattern risks panic if a future edit separates the check
-    from the unwrap.
-20. **VERBOSE ERROR PROPAGATION** — manual `match result { Ok(x) => ...,
-    Err(e) => return Err(e) }` or `if let Err(e) = ... { return Err(e); }`
-    chains that should use `?`, `.map_err()`, or combinators. Also includes
-    no-op `.map_err(|e| e)` and `match x { Ok(v) => Ok(v), Err(e) => Err(e.into()) }`
-    instead of `x?` or `x.map_err(Into::into)?`.
-    *Example*: `match foo() { Ok(v) => v, Err(e) => return Err(e.into()) }`
-    → `foo()?`.
-
-## Analysis Process
-
-Before classifying findings, perform these setup steps:
-
-1. **Run clippy**: Execute `cargo clippy -p <crate> 2>&1` and note any existing
-   warnings. This informs CLIPPY SUPPRESSIONS evaluation — a suppression hiding
-   a real warning is a finding; one hiding a false positive is not.
-2. **Count lines**: Run `wc -l` on each `.rs` file in `$TARGET/src/` (excluding
-   test modules) to identify LARGE MODULE candidates.
-3. **Check parity mapping**: For each source file, check whether a corresponding
-   stellar-core file exists in `stellar-core/src/` using the crate-to-upstream
-   mapping. Record which files have 1:1 counterparts (these get stronger parity
-   protection).
-
-## Ranking
-
-Rank findings by impact: how much each fix would reduce complexity, improve
-readability, or prevent bugs. High-impact first.
-
-## Conventions
-
-- **Inline tests**: Unit tests belong in `#[cfg(test)] mod tests { }` at the
-  bottom of the source file. Do not extract tests into separate files.
-
-## Scope
-
-- Do not flag issues **within** test code (`#[cfg(test)]`) or in `stellar-core/`.
-- Do not flag issues in auto-generated code (files produced by build scripts,
-  proc macros, or XDR code generators).
-- Test code **may** be referenced as evidence (e.g., to show a function is only
-  called from tests when evaluating dead code or visibility).
-
-## Output Format (review mode only)
-
-Per finding:
+## Pipeline overview
 
 ```
-### [RANK]. [CATEGORY] — one-line summary
-- **Location**: file:line (and file:line if duplicated)
-- **Evidence**: why this qualifies
-- **Suggestion**: concrete fix (keep it brief)
+Stage 1 (deterministic facts)
+  → Stage 2 (4 finding lanes in parallel)
+    → Stage 3 (adversarial verify, plan + apply only)
+      → Stage 4 (rank + report)
+        → Stage 5 (apply, apply mode only)
+          → Stage 6 (commit, apply mode only)
+            → Stage 7 (final report)
 ```
 
-End the review with a summary table:
+Lanes:
+
+- **Lane A — Clippy backlog** (deterministic input, parity-aware)
+- **Lane B — Idiom** (parity-exempt, Rust-idiomatic fixes)
+- **Lane C — Structure & dead code** (parity-filtered, LLM-judged)
+- **Lane D — Cross-crate** (advisory only, never auto-applied)
+
+---
+
+## Stage 1 — Establish ground truth
+
+Run these *before* any LLM judgment. The outputs feed every later stage. **No
+interpretation, no LLM calls yet** — just collect facts.
+
+1. **Read the parity map.** `Read crates/$TARGET/PARITY_STATUS.md`. Extract the
+   **File Mapping** table (`stellar-core File | Rust Module | Notes`). This is
+   the authoritative `<rs file> ↔ <cpp file>` list — used throughout the
+   pipeline as the source of truth for which code is parity-protected. Do NOT
+   substitute filename heuristics; use this table.
+   - If `PARITY_STATUS.md` doesn't exist for the crate, note that explicitly in
+     the report and treat **all** files as not parity-mapped (no parity
+     suppression applies). Surface "PARITY_STATUS.md missing" as a Lane C
+     finding.
+
+2. **Project clippy baseline.** Run:
+   ```
+   cargo clippy -p <package-name> --all-targets 2>&1 | tee /tmp/cleanup-clippy-before.txt
+   ```
+   `<package-name>` is the Cargo package name (e.g. `henyey-bucket` for
+   `crates/bucket`), not the directory. Look it up in `crates/$TARGET/Cargo.toml`.
+   This honors `.cargo/config.toml` — which sets `-Dwarnings -Aclippy::style`.
+   **Do NOT add `-W clippy::pedantic` or `-W clippy::nursery`.** The project has
+   deliberately opted out of style lints; respecting that is the whole point.
+   Pedantic generates hundreds of low-value warnings (e.g., dominated by
+   `cast_possible_truncation`).
+
+3. **Test baseline.** Run:
+   ```
+   cargo test -p <package-name> --no-fail-fast 2>&1 | tee /tmp/cleanup-test-baseline.txt
+   ```
+   Record which tests pass/fail BEFORE any change. Used in Stage 5 to attribute
+   later failures correctly. A test that was already failing is not your
+   regression.
+
+4. **Workspace structure.** Run once (cached for Lane D):
+   ```
+   cargo metadata --format-version 1 --no-deps | jq -r '.packages[].name' | sort
+   ```
+   This is the universe of crates Lane D may suggest moving code into.
+
+5. **Line counts.** Run:
+   ```
+   wc -l crates/$TARGET/src/**/*.rs 2>/dev/null | sort -n | tail
+   ```
+   For LARGE MODULE candidates in Lane C.
+
+State the facts collected up front in the response — clippy warning count,
+baseline pass/fail count, parity-mapped file count, largest module size. This
+is the operational summary, before any findings.
+
+---
+
+## Stage 2 — Fan out four finding lanes (parallel)
+
+Launch four `Agent` invocations in a single message so they run concurrently.
+Each agent gets: the crate path, the Stage 1 facts packet (parity map summary,
+clippy log path, baseline log path, workspace crate list), and its lane's
+specific brief below.
+
+Each lane returns findings as structured items with these fields:
 
 ```
-## Summary
-
-| Category | Count | Highest Impact |
-|----------|-------|----------------|
-| LARGE MODULE | ... | ... |
-| ... | ... | ... |
+{ lane: "A" | "B" | "C" | "D",
+  finding_id: "<lane>-<n>",
+  file: "crates/<crate>/src/<path>:<line>",
+  category: "<lane-specific>",
+  summary: "<one-line>",
+  evidence: "<concrete observation — quoted code, grep result, clippy line>",
+  suggested_fix: "<brief fix description>",
+  confidence: "high" | "medium" | "low",
+  parity_relevant: true | false,
+  parity_mapped_file: "<cpp filename from PARITY_STATUS.md>" | null }
 ```
 
-## Apply Mode Guidelines
+**No silent cap per lane.** Lanes return everything they find. Ranking and
+truncation happen in Stage 4, with full visibility.
 
-When `$MODE = apply`:
-- Work through findings in rank order (highest impact first).
-- Make one logical change at a time — do not batch unrelated refactors.
-- After each change, verify with `cargo clippy -p <crate>` and `cargo test -p <crate>`.
-- If a change breaks tests or introduces warnings, revert it and move on.
-- Stop and report if a change would alter observable behavior.
-- **Commit strategy**: Commit after each logical group of related changes.
-  Use message format: `"Clean up <crate>: <what changed>"`. Include
-  `Co-authored-by` trailers per AGENTS.md. Push after all changes are complete.
+### Lane A — Clippy backlog (deterministic)
+
+Read `/tmp/cleanup-clippy-before.txt`. For each warning:
+
+- Classify into one of:
+  - `auto-fixable` — `cargo clippy --fix` would resolve it (e.g.,
+    `needless_clone`, `redundant_pattern_matching`, `manual_let_else`,
+    `question_mark`, `needless_return`).
+  - `manual-fixable` — requires human judgment but the fix is local
+    (e.g., `cast_possible_truncation` where a narrower type clearly works).
+  - `parity-protected` — the warning is on a file listed in the PARITY_STATUS.md
+    File Mapping table, AND the fix would alter structure (e.g.,
+    `too_many_arguments` on a parity-mapped function). Suppress with a noted
+    `#[allow(...)]` reason if not already suppressed.
+  - `false-positive` — the lint is wrong for this code (rare; require evidence).
+- Set `parity_relevant: true` if the warning's file appears in the File Mapping
+  table.
+- Confidence is `high` for clippy-backed findings — the LLM is categorizing, not
+  rediscovering.
+
+### Lane B — Idiom (parity-exempt)
+
+The goal is Rust-idiomatic code, not a C++ transliteration. Parity filter does
+**not** apply to this lane — even parity-mapped files get idiom fixes, because
+the C++ structure of the function is preserved while the *expression* of it
+becomes Rust-native.
+
+Categories:
+
+- **C-STYLE MUTATION** — `&mut T -> bool` for success/failure. Rust idiom:
+  `Result<(), E>` or `Option<T>`. *Skip* idiomatic in-place slice operations
+  (`sort_by`, `sort_unstable_by`, `swap`).
+- **C-STYLE OUTPUT PARAMETER** — `&mut Vec<T>` as output param. Rust idiom: return
+  the value.
+- **C-STYLE OPTION HANDLING** — `is_none()`/`is_some()` check followed by
+  `.unwrap()`. Rust idiom: pattern matching, `let-else`, combinators.
+- **VERBOSE ERROR PROPAGATION** — manual `match Ok/Err` chains, no-op
+  `.map_err(|e| e)`. Rust idiom: `?`, `.map_err(Into::into)?`.
+- **RUST API ANTI-PATTERNS** — `&Vec<T>` (use `&[T]`), `&String` (use `&str`),
+  `Box<T>` for `Copy`-able T, missing `#[derive(Default)]` / `#[derive(Clone)]`
+  where it would be uncontroversial.
+- **CONCURRENCY ANTI-PATTERNS** — `Arc<Mutex<T>>` where `RwLock`, `&T`, or
+  `Arc<T>` suffices; `MutexGuard` held across `.await`; `tokio::spawn` capturing
+  more than the closure body needs.
+
+Set `parity_relevant: false` on all Lane B findings.
+
+### Lane C — Structure & dead code (parity-filtered)
+
+Apply the parity filter from the PARITY_STATUS.md File Mapping table (Stage 1):
+
+- If the file appears in the File Mapping table → set `parity_mapped_file` to
+  the cpp counterpart and `parity_relevant: true`.
+- **Suppress** findings on parity-mapped files for these categories: LARGE
+  MODULE, GOD FUNCTION, DEEP NESTING, LONG PARAMETER LIST, DUPLICATION, MAGIC
+  NUMBERS — these are structural choices that mirror upstream. Suppression
+  reason in evidence field: "mirrors `<cpp file>` from PARITY_STATUS.md File
+  Mapping".
+- **Always report** regardless of parity: DEAD CODE, STALE COMMENTS,
+  COMMENTED-OUT CODE, MISLEADING NAMES, OVERLY BROAD VISIBILITY.
+
+Categories:
+
+- **LARGE MODULE** — `.rs` over 1500 non-test lines. Require 3+ separable
+  concerns, each ≥200 lines, to recommend a split. Never split solely to extract
+  tests.
+- **GOD FUNCTION** — function over 200 lines with non-trivial branching. *Skip*
+  flat pipelines and config-translation functions (high line count but linear).
+- **DEEP NESTING** — 4+ levels of indentation. Suggest early returns / guard
+  clauses / extraction.
+- **LONG PARAMETER LIST** — 7+ parameters.
+- **DEAD CODE** — claims require workspace-wide evidence. Use:
+  ```
+  rg --type rust '\b<symbol>\b' /Users/tomer/dev/henyey/crates/
+  ```
+  to verify zero non-definition hits. Without workspace-wide evidence, demote
+  to `confidence: low` and route to "Unverified candidates" in Stage 4 —
+  do NOT emit as a confirmed finding.
+- **DUPLICATION** — identical/near-identical logic in 2+ places. Show
+  locations; if a shared form exists in `henyey-common` or sibling crates,
+  cross-reference (and prefer emitting it as Lane D).
+- **DUPLICATE STATE** — same truth tracked in 2+ places.
+- **SCATTERED CONCERN** — logical operation done in N call sites instead of one.
+  *Only emit* when consolidation is a net improvement (fewer lines, clearer
+  intent).
+- **OVERLY BROAD VISIBILITY** — `pub` items only used within crate (narrow to
+  `pub(crate)`), `pub(crate)` items only used in one module. *Verify* downstream
+  use with workspace-wide grep before flagging public re-exports; the crate's
+  public API is not a finding.
+- **MAGIC NUMBERS** — hardcoded literals that should be named. Skip values that
+  match XDR-spec constants or stellar-core named constants.
+- **MISLEADING NAMES** — identifier name does not match semantics. Suggest a
+  rename.
+- **STALE COMMENTS** — comment no longer matches code.
+- **COMMENTED-OUT CODE** — dead code left as comments.
+- **TRIVIAL WRAPPER** — one-line delegate with no added abstraction. Skip
+  wrappers that shield an internal signature or provide semantic naming for
+  call sites.
+- **[PARITY+]** — a cleanup that would make parity *easier* to verify (e.g.,
+  renaming a function to match stellar-core's name, extracting a function that
+  maps 1:1 to an upstream function). Allowed even when touching parity-mapped
+  code. Tag the finding's category with the `[PARITY+]` prefix.
+
+### Lane D — Cross-crate (advisory only)
+
+Findings in this lane are **never auto-applied**, regardless of mode. They are
+emitted as follow-ups for human review.
+
+Categories:
+
+- Helpers in this crate that duplicate or could move to `henyey-common`,
+  `henyey-crypto`, `henyey-db`, or other shared crates.
+- `pub use` reorganization across the crate boundary (e.g., expose at workspace
+  root, or stop re-exporting).
+- Types defined in this crate that would fit better in a sibling crate.
+
+Output as a `## Cross-crate follow-ups` section. In `apply` mode, additionally
+note "to be filed as separate issue / PR" — do not edit other crates.
+
+### Scope (all lanes)
+
+- Do NOT flag issues within `#[cfg(test)]` modules or under `stellar-core/`.
+- Do NOT flag issues in code emitted by `build.rs`. Empirically only
+  `crates/henyey/build.rs` exists and it doesn't produce in-tree files; if
+  generated files exist in a crate, they typically live under `target/` and
+  are excluded by `wc -l` already.
+- Test code MAY be referenced as evidence (e.g., to show a function is only
+  called from tests when evaluating DEAD CODE or OVERLY BROAD VISIBILITY).
+
+---
+
+## Stage 3 — Adversarial verify (plan + apply modes only)
+
+In `review` mode, skip this stage and go straight to Stage 4.
+
+For every Lane B, C, or D finding with `confidence != low`, spawn a verify
+agent. Lane A findings skip verify — clippy has already verified them
+mechanically.
+
+Each verify agent receives: the finding, the surrounding code, the relevant
+PARITY_STATUS.md row (if any), and instructions to **argue against** the
+finding. Each returns exactly one verdict:
+
+- **`confirmed`** — finding is real, the proposed fix is feasible, no
+  parity or behavior risk.
+- **`parity-risk`** — touches a parity-mapped section in a way that would
+  diverge from stellar-core. Reject.
+- **`behavior-change`** — the fix is correctness-significant, not pure
+  cleanup. Route to `/code-review` instead.
+- **`infeasible`** — borrow checker, lifetimes, Send/Sync, or other
+  type-level constraint blocks the proposed fix.
+- **`false-positive`** — duplicates another finding, misreads the code, or
+  the "issue" is intentional.
+
+Verdict is recorded on the finding. `confirmed` findings move forward;
+others are reported in the rejected section with the verdict reason.
+
+The verify pass is the single biggest correctness defense in this skill. Do
+not skip it in `plan` or `apply` mode.
+
+---
+
+## Stage 4 — Rank and report
+
+Sort confirmed findings within each lane by impact (lines reduced, allocations
+avoided, [PARITY+] bonus, then category severity). Output structure:
+
+```
+## Facts (from Stage 1)
+- Package: <name>
+- Parity-mapped files: <count> (of <total> in src/)
+- Clippy warnings: <count>
+- Tests: <pass>/<fail>/<ignored>
+- Largest module: <file> (<lines> lines)
+
+## Confirmed findings (will apply / safe to apply)
+### Lane A — Clippy backlog (<N> findings)
+<per-finding block, ranked>
+### Lane B — Idiom (<N> findings)
+<per-finding block, ranked>
+### Lane C — Structure & dead code (<N> findings)
+<per-finding block, ranked>
+
+## Cross-crate follow-ups (Lane D, advisory only)
+<per-finding block>
+
+## Rejected by verify
+### parity-risk (<N>)
+### behavior-change (<N>)
+### infeasible (<N>)
+### false-positive (<N>)
+
+## Unverified candidates
+<low-confidence findings, e.g., DEAD CODE without workspace evidence>
+```
+
+Per-finding block format:
+
+```
+#### [LANE-N] CATEGORY — one-line summary
+- **Location**: `file:line`
+- **Parity**: <mapped cpp file> | not mapped | parity-exempt (Lane B)
+- **Evidence**: <concrete observation>
+- **Fix**: <brief>
+```
+
+In `review` and `plan` modes, stop here. The plan mode output is exactly the
+"Confirmed findings" section above; the user/operator runs the fixes.
+
+---
+
+## Stage 5 — Apply (apply mode only)
+
+Apply confirmed Lane A → Lane B → Lane C, in that order (least → most risky).
+Each lane becomes one commit at the end.
+
+**Per-change loop:**
+
+1. Make the edit.
+2. Run `cargo check -p <package-name>` (seconds).
+3. If it fails: do NOT auto-revert. Read the error. Decide: fix-forward (the
+   error is a minor follow-on, fix and continue) or revert this finding (the
+   fix isn't viable as-is — record the verdict reason and move on).
+
+**Per-lane verify (after all confirmed findings in the lane are applied):**
+
+1. `cargo clippy -p <package-name> --all-targets 2>&1 | tee /tmp/cleanup-clippy-after-<lane>.txt`
+2. `cargo test -p <package-name> --no-fail-fast 2>&1 | tee /tmp/cleanup-test-after-<lane>.txt`
+3. **Compare against the Stage 1 baseline.** A test that was failing before is
+   not your regression. Only new failures block the lane. New clippy warnings
+   on lines you touched block; pre-existing warnings on unrelated lines do not.
+4. If a real regression is found: bisect within the lane's changes to find the
+   culprit; revert just that one and continue.
+
+**End-of-run verify:**
+
+```
+cargo test --all 2>&1 | tail -50
+```
+
+This catches downstream crate breakage that `cargo test -p <crate>` misses
+entirely. Per `CLAUDE.md`, this is required before submitting. Do not skip.
+
+**Termination conditions:**
+
+- All confirmed findings applied, OR
+- Clippy warning count stops decreasing across two lanes (the remaining warnings
+  are intentional/parity-protected), OR
+- Wall-clock budget exhausted (default: stop after 20 changes total). The
+  current skill's "10 changes" cap was arbitrary; 20 is generous enough that
+  the natural conditions usually fire first.
+
+---
+
+## Stage 6 — Commit (apply mode only)
+
+One commit per lane (skip lanes with zero applied changes). Per `CLAUDE.md`:
+
+- Imperative, sentence case. Examples:
+  - `Clean up henyey-bucket: fix clippy backlog`
+  - `Clean up henyey-bucket: idiomatic Rust pass`
+  - `Clean up henyey-bucket: structural simplification`
+- Trailer: `Co-authored-by: Claude Code <claude-code@anthropic.com>`
+- If Lane C removed code that was listed in `crates/$TARGET/PARITY_STATUS.md`'s
+  File Mapping or Component Mapping tables, update those tables in the same
+  commit (per `CLAUDE.md`'s parity-status maintenance rule).
+- Before each commit: verify the `stellar-specs` submodule pointer didn't drift
+  (per project convention — rebases have silently reverted it in the past).
+  Check with `git diff --staged stellar-specs` and `git submodule status` —
+  unstage any unintended submodule pointer change.
+- Push after the run completes (not after each commit), once `cargo test --all`
+  has passed. If push is rejected, pull with rebase and retry (per `CLAUDE.md`).
+
+---
+
+## Stage 7 — Final report
+
+```
+## Cleanup summary for <package-name>
+
+### Metrics
+- Clippy warnings: <before> → <after>
+- Tests (vs baseline): <new failures: 0 | N>, <newly passing: M>
+- LOC delta: <±N>
+
+### Applied
+- Lane A: <count> findings → commit <sha> "<message>"
+- Lane B: <count> findings → commit <sha> "<message>"
+- Lane C: <count> findings → commit <sha> "<message>"
+- PARITY_STATUS.md updates: <N rows touched> | none
+
+### Deferred
+- Cross-crate follow-ups: <count> (Lane D)
+- Rejected by verify: <count> (see report above for breakdown)
+- Unverified candidates: <count> (DEAD CODE without evidence, low-confidence)
+
+### Final tests
+- cargo test --all: <PASS | FAIL: tail of output>
+- Push status: <pushed: sha | not pushed: reason>
+```
+
+---
+
+## Notes on tools and dependencies
+
+- `cargo-machete` and `cargo-udeps` are **not** required and are not installed
+  in the project as of this writing. If either is available locally,
+  the Lane C DEAD CODE detection may use them as additional evidence sources,
+  but absence is not a blocker.
+- `rg` (ripgrep) is required for workspace-wide grep evidence in Lane C. If not
+  available, fall back to `grep -rn` from the workspace root.
+- All commands run from the workspace root (`/Users/tomer/dev/henyey`).
+- Artifacts (clippy logs, baselines) go in `/tmp/cleanup-*` so multiple runs are
+  isolated. Per `CLAUDE.md`, large/persistent artifacts should go in
+  `~/data/<session-id>/` — these are small and short-lived, so `/tmp` is fine.
+
+## Reproducibility note
+
+Lane A output is fully deterministic (clippy → categorize). Lanes B/C/D are
+LLM-judged and will vary slightly run-to-run. The adversarial verify in Stage 3
+is the stabilizing layer — a finding that survives verify in one run is very
+likely to survive in another. For audit / before-and-after comparisons, prefer
+the Stage 4 "Confirmed findings" section over raw lane output.
