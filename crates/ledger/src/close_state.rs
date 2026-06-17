@@ -881,7 +881,7 @@ mod tests {
             CloseLedgerState::begin(snapshot, header, henyey_common::Hash256::ZERO, 101);
 
         let result = state.capture_entry_changes(|_s| -> Result<()> {
-            Err(crate::error::LedgerError::Internal("test error".into()).into())
+            Err(crate::error::LedgerError::Internal("test error".into()))
         });
 
         assert!(result.is_err());
@@ -930,7 +930,9 @@ mod tests {
         let result = state.capture_entry_changes(|s| -> Result<()> {
             let entry = make_test_account_entry(1, 1000, 101);
             s.record_create(entry)?;
-            Err(crate::error::LedgerError::Internal("deliberate error".into()).into())
+            Err(crate::error::LedgerError::Internal(
+                "deliberate error".into(),
+            ))
         });
         assert!(result.is_err());
 
@@ -968,8 +970,9 @@ mod tests {
         state.record_create(entry).unwrap();
 
         // Step 3: Simulate a failing operation (log and continue)
-        let result: Result<()> =
-            Err(crate::error::LedgerError::Internal("simulated recompute failure".into()).into());
+        let result: Result<()> = Err(crate::error::LedgerError::Internal(
+            "simulated recompute failure".into(),
+        ));
         if let Err(e) = result {
             // In production this would be tracing::error!(...)
             let _ = e;
