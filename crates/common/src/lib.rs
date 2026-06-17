@@ -55,6 +55,7 @@ pub mod config;
 pub mod error;
 pub mod fs_utils;
 pub mod header_validation;
+pub mod history_download;
 pub mod ledger_type_utils;
 pub mod math;
 pub mod memory;
