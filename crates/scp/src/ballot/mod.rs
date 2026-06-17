@@ -59,8 +59,6 @@ use crate::quorum::{
 use crate::EnvelopeState;
 use crate::SlotContext;
 
-/// Phase of the ballot protocol.
-///
 mod envelope;
 mod state_machine;
 mod statements;
