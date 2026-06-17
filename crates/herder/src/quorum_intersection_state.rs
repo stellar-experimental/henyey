@@ -120,11 +120,6 @@ impl QuorumIntersectionState {
         }
     }
 
-    /// Whether analysis is currently in progress.
-    pub fn is_analyzing(&self) -> bool {
-        matches!(self.analysis, AnalysisState::Analyzing { .. })
-    }
-
     /// Get the hash from the last completed result.
     pub fn last_result_hash(&self) -> Option<&Hash256> {
         match &self.last_result {
@@ -162,23 +157,6 @@ impl QuorumIntersectionState {
             interrupt_flag: flag,
         };
         flag_clone
-    }
-
-    /// Set the interrupt flag on any in-flight analysis.
-    ///
-    /// Used when the quorum map changes during analysis to signal
-    /// the running checker to abort.
-    pub fn interrupt_stale(&mut self) {
-        if let AnalysisState::Analyzing { interrupt_flag, .. } = &self.analysis {
-            interrupt_flag.store(true, Ordering::Relaxed);
-        }
-    }
-
-    /// Clear the in-progress analysis marker without publishing a result.
-    ///
-    /// Used when the analysis is interrupted or cannot complete.
-    pub fn clear_checking(&mut self) {
-        self.analysis = AnalysisState::Idle;
     }
 
     /// Record a completed analysis result.
@@ -379,51 +357,6 @@ mod tests {
     }
 
     #[test]
-    fn test_clear_checking_unblocks_future_checks() {
-        let mut state = QuorumIntersectionState::new();
-        let hash1 = make_hash(1);
-
-        // Publish an intersecting result.
-        state.start_checking(hash1);
-        state.complete_check(
-            &hash1,
-            QuorumIntersectionResult::Intersecting {
-                check_ledger: 50,
-                num_nodes: 3,
-                quorum_map_hash: hash1,
-                critical_groups: vec![],
-            },
-        );
-
-        // Start a new check, then clear it (simulates TooLarge).
-        let hash2 = make_hash(2);
-        state.start_checking(hash2);
-        assert!(state.checking_hash().is_some());
-
-        state.clear_checking();
-        assert!(state.checking_hash().is_none());
-
-        // Previous result should still be available.
-        assert!(state.has_any_results());
-        assert!(state.enjoys_quorum_intersection());
-        assert_eq!(state.last_good_ledger(), 50);
-    }
-
-    #[test]
-    fn test_interrupt_stale_analysis() {
-        let mut state = QuorumIntersectionState::new();
-        let hash1 = make_hash(1);
-
-        // Start analysis.
-        let flag = state.start_checking(hash1);
-        assert!(!flag.load(Ordering::Relaxed));
-
-        // Interrupt it.
-        state.interrupt_stale();
-        assert!(flag.load(Ordering::Relaxed));
-    }
-
-    #[test]
     fn test_start_checking_interrupts_old_analysis() {
         let mut state = QuorumIntersectionState::new();
         let hash1 = make_hash(1);
@@ -439,17 +372,5 @@ mod tests {
             flag1.load(Ordering::Relaxed),
             "old analysis should be interrupted"
         );
-    }
-
-    #[test]
-    fn test_is_analyzing() {
-        let mut state = QuorumIntersectionState::new();
-        assert!(!state.is_analyzing());
-
-        state.start_checking(make_hash(1));
-        assert!(state.is_analyzing());
-
-        state.clear_checking();
-        assert!(!state.is_analyzing());
     }
 }
