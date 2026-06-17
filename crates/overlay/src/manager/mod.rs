@@ -3461,12 +3461,12 @@ mod tests {
             for _ in 0..5 {
                 let cancelled = Arc::clone(&cancelled);
                 handles.push(tokio::spawn(async move {
-                    // Would only complete here if not aborted.
+                    // Hold the Arc clone for the task's lifetime so the
+                    // post-abort strong_count assertion is meaningful. The
+                    // sleep never resolves (paused time, no advance), so the
+                    // task only ends via abort.
+                    let _cancelled = cancelled;
                     tokio::time::sleep(Duration::from_secs(3600)).await;
-                    // If the task completes normally (not aborted), this
-                    // wouldn't run because sleep(3600) in paused-time
-                    // only resolves via time advance. Abort cancels it.
-                    drop(cancelled); // prevent "unused" warning
                 }));
             }
         }
