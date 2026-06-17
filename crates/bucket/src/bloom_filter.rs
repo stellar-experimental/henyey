@@ -52,7 +52,7 @@ use xorf::{BinaryFuse16, Filter};
 use crate::{BucketError, Result};
 
 /// Size of the SipHash key in bytes (128 bits).
-pub const HASH_KEY_BYTES: usize = 16;
+pub(crate) const HASH_KEY_BYTES: usize = 16;
 
 /// Type alias for the hash seed used in bloom filter construction.
 pub type HashSeed = [u8; HASH_KEY_BYTES];

@@ -147,21 +147,21 @@ impl BucketEntryExt for BucketEntry {
 /// The rs-stellar-xdr crate declares enum variants in discriminant order and
 /// struct fields in XDR order, so Rust's `derive(Ord)` produces identical
 /// ordering to xdrpp's recursive field-by-field `operator<`.
-pub fn compare_keys(a: &LedgerKey, b: &LedgerKey) -> Ordering {
+pub(crate) fn compare_keys(a: &LedgerKey, b: &LedgerKey) -> Ordering {
     a.cmp(b)
 }
 
 /// Returns the ledger entry type for a given ledger key.
 ///
 /// Delegates to the XDR crate's inherent `LedgerKey::discriminant()` method.
-pub fn ledger_key_type(key: &LedgerKey) -> stellar_xdr::curr::LedgerEntryType {
+pub(crate) fn ledger_key_type(key: &LedgerKey) -> stellar_xdr::curr::LedgerEntryType {
     key.discriminant()
 }
 
 /// Returns the ledger entry type for a given entry data variant.
 ///
 /// Delegates to the XDR crate's inherent `LedgerEntryData::discriminant()` method.
-pub fn ledger_entry_data_type(
+pub(crate) fn ledger_entry_data_type(
     data: &stellar_xdr::curr::LedgerEntryData,
 ) -> stellar_xdr::curr::LedgerEntryType {
     data.discriminant()
@@ -171,7 +171,7 @@ pub fn ledger_entry_data_type(
 ///
 /// Metadata entries are always sorted first.
 /// Returns None if either entry is metadata and the other is not.
-pub fn compare_entries(a: &BucketEntry, b: &BucketEntry) -> Ordering {
+pub(crate) fn compare_entries(a: &BucketEntry, b: &BucketEntry) -> Ordering {
     match (a.key(), b.key()) {
         (Some(key_a), Some(key_b)) => compare_keys(&key_a, &key_b),
         (None, Some(_)) => Ordering::Less, // Metadata comes first
@@ -320,7 +320,7 @@ pub fn get_ttl_key(key: &LedgerKey) -> Option<LedgerKey> {
 ///
 /// An entry is expired when its `live_until_ledger_seq` is less than the current ledger.
 /// Returns None if the entry is not a TTL entry.
-pub fn is_ttl_expired(ttl_entry: &LedgerEntry, current_ledger: u32) -> Option<bool> {
+pub(crate) fn is_ttl_expired(ttl_entry: &LedgerEntry, current_ledger: u32) -> Option<bool> {
     get_ttl_live_until(ttl_entry).map(|live_until| live_until < current_ledger)
 }
 
