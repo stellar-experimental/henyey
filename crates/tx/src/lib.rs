@@ -167,9 +167,7 @@ pub use frame::{
 };
 
 // Re-export apply types and functions
-pub use apply::{
-    apply_fee_only, apply_from_history, apply_transaction_set_from_history, ChangeRef, TxChangeLog,
-};
+pub use apply::{apply_from_history, ChangeRef, TxChangeLog};
 
 // Re-export result types
 pub use result::{
@@ -223,229 +221,6 @@ pub use live_execution::{
 /// as the error type.
 pub type Result<T> = std::result::Result<T, TxError>;
 
-/// Summary result of transaction validation.
-///
-/// This enum provides a simplified view of validation outcomes, suitable for
-/// quick checks and logging. For detailed error information, use the
-/// [`ValidationError`] type returned by validation functions.
-///
-/// # Mapping from ValidationError
-///
-/// Each `ValidationResult` variant corresponds to one or more [`ValidationError`]
-/// variants. The [`From<ValidationError>`] implementation provides this mapping.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ValidationResult {
-    /// Transaction passed all validation checks.
-    Valid,
-    /// Transaction has invalid or missing signature(s).
-    InvalidSignature,
-    /// Transaction fee is below the minimum required.
-    InsufficientFee,
-    /// Source account sequence number does not match expected.
-    BadSequence,
-    /// Source account does not exist in the ledger.
-    NoAccount,
-    /// Source account has insufficient balance for the fee.
-    InsufficientBalance,
-    /// Transaction's max time bound has passed.
-    TooLate,
-    /// Transaction's min time bound has not yet been reached.
-    TooEarly,
-    /// Minimum sequence age or ledger gap precondition not met.
-    BadMinSeqAgeOrGap,
-    /// Extra signer requirements specified in preconditions not met.
-    BadAuthExtra,
-    /// Other validation failure (structure, fee bump inner tx, etc.).
-    Invalid,
-}
-
-impl From<ValidationError> for ValidationResult {
-    fn from(err: ValidationError) -> Self {
-        match err {
-            ValidationError::InvalidStructure(_) => ValidationResult::Invalid,
-            ValidationError::InvalidSignature => ValidationResult::InvalidSignature,
-            ValidationError::MissingSignatures => ValidationResult::InvalidSignature,
-            ValidationError::BadSequence { .. } => ValidationResult::BadSequence,
-            ValidationError::InsufficientFee { .. } => ValidationResult::InsufficientFee,
-            ValidationError::SourceAccountNotFound => ValidationResult::NoAccount,
-            ValidationError::InsufficientBalance => ValidationResult::InsufficientBalance,
-            ValidationError::TooLate { .. } => ValidationResult::TooLate,
-            ValidationError::TooEarly { .. } => ValidationResult::TooEarly,
-            ValidationError::LedgerBoundsTooEarly { .. } => ValidationResult::TooEarly,
-            ValidationError::LedgerBoundsTooLate { .. } => ValidationResult::TooLate,
-            ValidationError::BadMinAccountSequence => ValidationResult::BadSequence,
-            ValidationError::BadMinAccountSequenceAge => ValidationResult::BadMinSeqAgeOrGap,
-            ValidationError::BadMinAccountSequenceLedgerGap => ValidationResult::BadMinSeqAgeOrGap,
-            ValidationError::ExtraSignersNotMet => ValidationResult::BadAuthExtra,
-            ValidationError::FeeBumpInsufficientFee { .. } => ValidationResult::InsufficientFee,
-            ValidationError::FeeBumpInvalidInner(_) => ValidationResult::Invalid,
-        }
-    }
-}
-
-/// High-level transaction validator.
-///
-/// Provides a convenient interface for validating transaction envelopes
-/// against ledger context and optionally source account data.
-///
-/// # Example
-///
-/// ```ignore
-/// use henyey_tx::TransactionValidator;
-/// use stellar_xdr::curr::TransactionEnvelope;
-///
-/// let validator = TransactionValidator::testnet(1000, 1625000000);
-/// let envelope: TransactionEnvelope = /* ... */;
-///
-/// match validator.validate(&envelope) {
-///     ValidationResult::Valid => println!("Transaction is valid"),
-///     ValidationResult::InsufficientFee => println!("Fee too low"),
-///     other => println!("Validation failed: {:?}", other),
-/// }
-/// ```
-pub struct TransactionValidator {
-    /// Ledger context used for validation.
-    context: LedgerContext,
-}
-
-impl TransactionValidator {
-    /// Create a new validator with the given ledger context.
-    pub fn new(context: LedgerContext) -> Self {
-        Self { context }
-    }
-
-    /// Create a validator for testnet.
-    pub fn testnet(sequence: u32, close_time: u64) -> Self {
-        Self {
-            context: LedgerContext::testnet(sequence, close_time),
-        }
-    }
-
-    /// Create a validator for mainnet.
-    pub fn mainnet(sequence: u32, close_time: u64) -> Self {
-        Self {
-            context: LedgerContext::mainnet(sequence, close_time),
-        }
-    }
-
-    /// Validate a transaction envelope (basic checks only).
-    pub fn validate(&self, tx: &stellar_xdr::curr::TransactionEnvelope) -> ValidationResult {
-        let frame = TransactionFrame::from_owned(tx.clone());
-
-        match validate_basic(&frame, &self.context) {
-            Ok(()) => ValidationResult::Valid,
-            Err(errors) => {
-                // Return the first error
-                if let Some(err) = errors.into_iter().next() {
-                    err.into()
-                } else {
-                    ValidationResult::Invalid
-                }
-            }
-        }
-    }
-
-    /// Full validation with account data.
-    pub fn validate_with_account(
-        &self,
-        tx: &stellar_xdr::curr::TransactionEnvelope,
-        source_account: &stellar_xdr::curr::AccountEntry,
-    ) -> ValidationResult {
-        let frame = TransactionFrame::from_owned(tx.clone());
-
-        match validate_full(&frame, &self.context, source_account) {
-            Ok(()) => ValidationResult::Valid,
-            Err(errors) => {
-                if let Some(err) = errors.into_iter().next() {
-                    err.into()
-                } else {
-                    ValidationResult::Invalid
-                }
-            }
-        }
-    }
-
-    /// Check if all required signatures are present.
-    pub fn check_signatures(&self, tx: &stellar_xdr::curr::TransactionEnvelope) -> bool {
-        let frame = TransactionFrame::from_owned(tx.clone());
-        validate_signatures(&frame, &self.context).is_ok()
-    }
-}
-
-/// Simplified transaction execution result.
-///
-/// This is a convenience wrapper that provides easy access to the most
-/// commonly needed information from a transaction execution. For full
-/// details, use [`TxApplyResult`] and its [`TxResultWrapper`].
-///
-/// This type can be constructed from [`TxApplyResult`] via the [`From`] trait.
-#[derive(Debug, Clone)]
-pub struct TransactionResult {
-    /// The fee charged in stroops.
-    pub fee_charged: i64,
-    /// Result of each operation in the transaction.
-    pub operation_results: Vec<OperationResult>,
-    /// Whether the transaction as a whole succeeded.
-    pub success: bool,
-}
-
-impl From<TxApplyResult> for TransactionResult {
-    fn from(result: TxApplyResult) -> Self {
-        Self {
-            fee_charged: result.fee_charged,
-            operation_results: result
-                .result
-                .operation_results()
-                .map(|ops| {
-                    ops.into_iter()
-                        .map(|op| {
-                            if op.is_success() {
-                                OperationResult::Success
-                            } else {
-                                OperationResult::Failed(OperationError::OpFailed)
-                            }
-                        })
-                        .collect()
-                })
-                .unwrap_or_default(),
-            success: result.success,
-        }
-    }
-}
-
-/// Simplified operation execution result.
-///
-/// Indicates whether an individual operation within a transaction succeeded
-/// or failed. For detailed operation-specific results, use the XDR
-/// `OperationResult` type from `stellar_xdr`.
-#[derive(Debug, Clone)]
-pub enum OperationResult {
-    /// Operation completed successfully.
-    Success,
-    /// Operation failed with an error.
-    Failed(OperationError),
-}
-
-/// Simplified operation error categories.
-///
-/// These are high-level error categories that cover the most common failure
-/// modes. For detailed error codes, use the XDR `OperationResult` variants.
-#[derive(Debug, Clone)]
-pub enum OperationError {
-    /// Generic operation failure (no specific category).
-    OpFailed,
-    /// Required account does not exist.
-    NoAccount,
-    /// Insufficient balance or reserve for the operation.
-    Underfunded,
-    /// Trustline or offer capacity exceeded.
-    LineFull,
-    /// Asset authorization check failed.
-    NotAuthorized,
-    /// Other operation-specific error with description.
-    Other(String),
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -478,16 +253,6 @@ mod tests {
             tx,
             signatures: vec![].try_into().unwrap(),
         })
-    }
-
-    #[test]
-    fn test_validator_creation() {
-        let validator = TransactionValidator::testnet(1, 1000);
-        let envelope = create_test_envelope();
-
-        // Basic validation should pass
-        let result = validator.validate(&envelope);
-        assert_eq!(result, ValidationResult::Valid);
     }
 
     #[test]
@@ -567,28 +332,6 @@ mod tests {
         }
     }
 
-    /// Test ValidationResult enum.
-    #[test]
-    fn test_validation_result() {
-        let valid = ValidationResult::Valid;
-        assert!(matches!(valid, ValidationResult::Valid));
-
-        let invalid = ValidationResult::Invalid;
-        assert!(matches!(invalid, ValidationResult::Invalid));
-
-        let no_account = ValidationResult::NoAccount;
-        assert!(matches!(no_account, ValidationResult::NoAccount));
-
-        let bad_seq = ValidationResult::BadSequence;
-        assert!(matches!(bad_seq, ValidationResult::BadSequence));
-
-        let insuff_fee = ValidationResult::InsufficientFee;
-        assert!(matches!(insuff_fee, ValidationResult::InsufficientFee));
-
-        let invalid_sig = ValidationResult::InvalidSignature;
-        assert!(matches!(invalid_sig, ValidationResult::InvalidSignature));
-    }
-
     /// Test TxError variants.
     #[test]
     fn test_tx_error_display() {
@@ -605,28 +348,6 @@ mod tests {
         assert!(display.contains("account"));
     }
 
-    /// Test OperationError variants.
-    #[test]
-    fn test_operation_error() {
-        let err = OperationError::Underfunded;
-        assert!(matches!(err, OperationError::Underfunded));
-
-        let err = OperationError::LineFull;
-        assert!(matches!(err, OperationError::LineFull));
-
-        let err = OperationError::NotAuthorized;
-        assert!(matches!(err, OperationError::NotAuthorized));
-
-        let err = OperationError::NoAccount;
-        assert!(matches!(err, OperationError::NoAccount));
-
-        let err = OperationError::OpFailed;
-        assert!(matches!(err, OperationError::OpFailed));
-
-        let err = OperationError::Other("custom error".to_string());
-        assert!(matches!(err, OperationError::Other(_)));
-    }
-
     /// Test TransactionFrame with fee bump detection.
     #[test]
     fn test_frame_fee_bump_detection() {
@@ -634,46 +355,5 @@ mod tests {
         let envelope = create_test_envelope();
         let frame = TransactionFrame::from_owned(envelope);
         assert!(!frame.is_fee_bump());
-    }
-
-    /// Test TransactionValidator with different network contexts.
-    #[test]
-    fn test_validator_networks() {
-        let testnet_validator = TransactionValidator::testnet(1, 1000);
-        let mainnet_validator = TransactionValidator::mainnet(1, 1000);
-
-        let envelope = create_test_envelope();
-        // Both should validate basic transaction structure
-        assert_eq!(
-            testnet_validator.validate(&envelope),
-            ValidationResult::Valid
-        );
-        assert_eq!(
-            mainnet_validator.validate(&envelope),
-            ValidationResult::Valid
-        );
-    }
-
-    /// Regression test: LedgerBoundsTooLate maps to ValidationResult::TooLate
-    /// (not Invalid). Covers the equality case current == max_ledger.
-    #[test]
-    fn test_ledger_bounds_too_late_maps_to_too_late() {
-        let result: ValidationResult = ValidationError::LedgerBoundsTooLate {
-            max_ledger: 100,
-            current: 100,
-        }
-        .into();
-        assert_eq!(result, ValidationResult::TooLate);
-    }
-
-    /// Regression test: LedgerBoundsTooEarly maps to ValidationResult::TooEarly.
-    #[test]
-    fn test_ledger_bounds_too_early_maps_to_too_early() {
-        let result: ValidationResult = ValidationError::LedgerBoundsTooEarly {
-            min_ledger: 200,
-            current: 50,
-        }
-        .into();
-        assert_eq!(result, ValidationResult::TooEarly);
     }
 }
