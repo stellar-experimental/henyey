@@ -147,8 +147,8 @@ impl SorobanStorage {
     }
 
     /// Get contract code.
-    pub fn get_code(&self, hash: &Hash) -> Option<&Vec<u8>> {
-        self.code_entries.get(hash).and_then(|c| c.as_ref())
+    pub fn get_code(&self, hash: &Hash) -> Option<&[u8]> {
+        self.code_entries.get(hash).and_then(|c| c.as_deref())
     }
 
     // SECURITY: HashMap iteration in test helpers only; production path uses Vec with deterministic ordering
