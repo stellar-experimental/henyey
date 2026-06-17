@@ -37,8 +37,7 @@ pub(crate) fn execute_manage_data(
     if data_name.is_empty() || data_name.len() > MAX_DATA_NAME_LENGTH {
         return Ok(make_result(ManageDataResultCode::InvalidName));
     }
-    let data_name_bytes: &Vec<u8> =
-        <stellar_xdr::curr::String64 as AsRef<Vec<u8>>>::as_ref(&op.data_name);
+    let data_name_bytes: &[u8] = op.data_name.as_ref();
     if !is_string_valid(data_name_bytes) {
         return Ok(make_result(ManageDataResultCode::InvalidName));
     }
