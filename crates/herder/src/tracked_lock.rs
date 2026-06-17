@@ -63,14 +63,13 @@ use std::time::Instant;
 
 use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
-// Re-export the shared timing primitives so in-crate call sites keep
-// using the familiar `tracked_lock::time_call(...)` path without
+// Re-export the shared timing primitives so in-crate call sites can use
+// `tracked_lock::PhaseTimer` / `tracked_lock::LOCK_SLOW_THRESHOLD` without
 // reaching into `henyey_common::tracking` directly. `LOCK_SLOW_THRESHOLD`
 // is defined once in `henyey-common` and consumed by both this crate
 // and the app-crate tokio companion, so both instrumentation families
 // speak the same language in the validator log.
-#[allow(unused_imports)]
-pub(crate) use henyey_common::tracking::{time_call, PhaseTimer, LOCK_SLOW_THRESHOLD};
+pub(crate) use henyey_common::tracking::{PhaseTimer, LOCK_SLOW_THRESHOLD};
 
 /// RAII wrapper around a `parking_lot` RwLock guard that emits
 /// a single `WARN lock=<label> kind="hold"` on drop iff the

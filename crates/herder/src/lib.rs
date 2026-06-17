@@ -101,7 +101,6 @@
 //! - `herder_utils`: Utility functions (value extraction, node ID formatting)
 //! - `timer_manager`: SCP nomination/ballot timeout scheduling (tokio)
 //! - `sync_recovery`: Out-of-sync detection and recovery
-//! - `tx_broadcast`: Periodic transaction flooding to peers
 //! - `drift_tracker`: Close time drift monitoring
 //! - `dead_node_tracker`: Missing/dead validator detection
 //! - `flow_control`: Flow control constants (transaction size limits)
@@ -127,7 +126,6 @@ mod quorum_set_tracker;
 mod quorum_tracker;
 mod scp_driver;
 pub mod scp_verify;
-mod spawn;
 mod state;
 mod surge_pricing;
 pub mod sync_recovery;
@@ -215,9 +213,6 @@ pub use sync_recovery::{
 
 // Dead node detection
 pub use dead_node_tracker::{DeadNodeTracker, CHECK_FOR_DEAD_NODES_MINUTES};
-
-// Spawn-blocking helpers
-pub use spawn::{await_blocking_logged, spawn_blocking_logged};
 
 /// Result type for Herder operations.
 pub type Result<T> = std::result::Result<T, HerderError>;

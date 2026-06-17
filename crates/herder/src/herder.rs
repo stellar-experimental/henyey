@@ -4130,7 +4130,7 @@ impl Herder {
         // near-free re-schedule that improves fairness when the drain returns
         // instantly (e.g., empty ready queue). (#2716)
         tokio::task::yield_now().await;
-        crate::spawn::await_blocking_logged(&ctx, handle)
+        henyey_common::spawn::await_blocking_logged(&ctx, handle)
             .await
             .ok()
             .unwrap_or(0)
@@ -4146,7 +4146,7 @@ impl Herder {
         slot: SlotIndex,
     ) -> TimeoutOutcome {
         let herder = Arc::clone(self);
-        match crate::spawn::spawn_blocking_logged("handle_nomination_timeout", move || {
+        match henyey_common::spawn::spawn_blocking_logged("handle_nomination_timeout", move || {
             herder.handle_nomination_timeout(slot)
         })
         .await
