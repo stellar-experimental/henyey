@@ -14,7 +14,7 @@
 use stellar_xdr::curr::{
     AccountEntry, AccountEntryExt, AccountEntryExtensionV1Ext, ContractEvent, DataEntry,
     LedgerEntry, LedgerEntryData, OfferEntry, Operation, OperationResult, TrustLineAsset,
-    TrustLineEntry, TrustLineEntryExt, TrustLineEntryV1Ext,
+    TrustLineEntry, TrustLineEntryExt, TrustLineEntryV1Ext, TrustLineFlags,
 };
 
 use crate::{Invariant, OperationDelta};
@@ -199,8 +199,10 @@ fn check_trustline(tl: &TrustLineEntry, previous: Option<&LedgerEntry>) -> Resul
     // Clawback flag must not be enabled if it wasn't enabled before.
     if let Some(prev) = previous {
         if let LedgerEntryData::Trustline(prev_tl) = &prev.data {
-            let prev_clawback = (prev_tl.flags & 0x4) != 0; // AUTHORIZED_TO_MAINTAIN_LIABILITIES clawback bit
-            let cur_clawback = (tl.flags & 0x4) != 0;
+            // 0x4 is the trustline clawback bit (TRUSTLINE_CLAWBACK_ENABLED_FLAG).
+            const CLAWBACK_FLAG: u32 = TrustLineFlags::TrustlineClawbackEnabledFlag as u32;
+            let prev_clawback = (prev_tl.flags & CLAWBACK_FLAG) != 0;
+            let cur_clawback = (tl.flags & CLAWBACK_FLAG) != 0;
             if !prev_clawback && cur_clawback {
                 return Err("TrustLine clawback flag was enabled".to_string());
             }
