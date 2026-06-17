@@ -59,25 +59,44 @@ fn has_account_ext_v2(acc: &AccountEntry) -> bool {
     )
 }
 
-/// Update sponsorship counters for a single entry.
-fn update_counters(
-    entry: &LedgerEntry,
-    num_sponsoring: &mut HashMap<AccountId, i64>,
-    num_sponsored: &mut HashMap<AccountId, i64>,
-    claimable_balance_reserve: &mut i64,
-    sign: i64,
-) {
+/// Per-entry sponsorship contributions, as unsigned magnitudes.
+///
+/// The sign (+1 for entries that come into existence / post-states, -1 for
+/// entries that go away / pre-states) is applied by the caller via [`merge`],
+/// which keeps this a pure query over the entry and moves the reverse-direction
+/// arithmetic to the call site (mirroring stellar-core's `updateCounters` with
+/// the `sign` factor lifted out).
+///
+/// `sponsoring` is keyed by the **sponsor** account; `sponsored` is keyed by the
+/// **owner/sponsored** account. These are distinct keys, and a single entry can
+/// contribute to multiple sponsor keys (its own `sponsoringID` plus one per
+/// signer-sponsoring-ID), so a flat scalar pair cannot represent them — hence the
+/// per-key contribution lists.
+#[derive(Default)]
+struct SponsorshipContributions {
+    /// (sponsor account, unsigned magnitude) pairs to add to `num_sponsoring`.
+    sponsoring: Vec<(AccountId, i64)>,
+    /// (owner account, unsigned magnitude) pairs to add to `num_sponsored`.
+    sponsored: Vec<(AccountId, i64)>,
+    /// Unsigned magnitude to add to the claimable-balance reserve accumulator.
+    claimable_balance_reserve: i64,
+}
+
+/// Compute the sponsorship contributions for a single entry (sign-free).
+fn sponsorship_contributions(entry: &LedgerEntry) -> SponsorshipContributions {
+    let mut contribs = SponsorshipContributions::default();
+
     // Check for sponsoring extension on the entry itself.
     if let LedgerEntryExt::V1(v1) = &entry.ext {
         if let Some(ref sponsor) = v1.sponsoring_id.0 {
-            let mult = sign * get_mult(entry);
-            *num_sponsoring.entry(sponsor.clone()).or_default() += mult;
+            let mult = get_mult(entry);
+            contribs.sponsoring.push((sponsor.clone(), mult));
             if !matches!(&entry.data, LedgerEntryData::ClaimableBalance(_)) {
                 if let Some(account_id) = get_account_id(entry) {
-                    *num_sponsored.entry(account_id.clone()).or_default() += mult;
+                    contribs.sponsored.push((account_id.clone(), mult));
                 }
             } else {
-                *claimable_balance_reserve += mult;
+                contribs.claimable_balance_reserve += mult;
             }
         }
     }
@@ -89,35 +108,54 @@ fn update_counters(
                 if let AccountEntryExtensionV1Ext::V2(v2) = &v1.ext {
                     for sponsor_opt in v2.signer_sponsoring_i_ds.iter() {
                         if let Some(ref sponsor) = sponsor_opt.0 {
-                            *num_sponsoring.entry(sponsor.clone()).or_default() += sign;
-                            *num_sponsored.entry(acc.account_id.clone()).or_default() += sign;
+                            contribs.sponsoring.push((sponsor.clone(), 1));
+                            contribs.sponsored.push((acc.account_id.clone(), 1));
                         }
                     }
                 }
             }
         }
     }
+
+    contribs
 }
 
-/// Get the delta in num_sponsoring and num_sponsored from an account entry.
-fn get_delta_sponsoring_and_sponsored(
-    entry: Option<&LedgerEntry>,
-    num_sponsoring: &mut i64,
-    num_sponsored: &mut i64,
-    sign: i64,
-) {
+/// Apply signed contributions into a counter map.
+///
+/// `*dst.entry(k).or_default() += sign * v` for each contribution. HashMap `+=`
+/// accumulation is order-independent and `sign ∈ {+1, -1}` is pure multiplication,
+/// so this is bit-for-bit identical to the old in-place `update_counters` math.
+fn merge(dst: &mut HashMap<AccountId, i64>, contribs: &[(AccountId, i64)], sign: i64) {
+    for (k, v) in contribs {
+        *dst.entry(k.clone()).or_default() += sign * v;
+    }
+}
+
+/// The change in an account's own `numSponsoring` / `numSponsored` counters,
+/// read from its V2 extension. Both are zero when the entry is absent, is not an
+/// account, or has no V2 extension.
+#[derive(Default)]
+struct AccountSponsorshipDelta {
+    sponsoring: i64,
+    sponsored: i64,
+}
+
+/// Read the `numSponsoring` / `numSponsored` counters from an account entry.
+fn get_delta_sponsoring_and_sponsored(entry: Option<&LedgerEntry>) -> AccountSponsorshipDelta {
+    let mut delta = AccountSponsorshipDelta::default();
     if let Some(entry) = entry {
         if let LedgerEntryData::Account(acc) = &entry.data {
             if has_account_ext_v2(acc) {
                 if let AccountEntryExt::V1(v1) = &acc.ext {
                     if let AccountEntryExtensionV1Ext::V2(v2) = &v1.ext {
-                        *num_sponsoring += sign * v2.num_sponsoring as i64;
-                        *num_sponsored += sign * v2.num_sponsored as i64;
+                        delta.sponsoring = v2.num_sponsoring as i64;
+                        delta.sponsored = v2.num_sponsored as i64;
                     }
                 }
             }
         }
     }
+    delta
 }
 
 impl Invariant for SponsorshipCountIsValid {
@@ -129,6 +167,10 @@ impl Invariant for SponsorshipCountIsValid {
         false
     }
 
+    // `_claimable_balance_reserve` is a write-only accumulator (see below); the
+    // `#[allow]` covers the dead-store lint on its per-iteration assignments,
+    // which the previous `&mut` out-param form incidentally hid.
+    #[allow(unused_assignments)]
     fn check_on_operation_apply(
         &self,
         _operation: &Operation,
@@ -144,46 +186,40 @@ impl Invariant for SponsorshipCountIsValid {
 
         let mut num_sponsoring: HashMap<AccountId, i64> = HashMap::new();
         let mut num_sponsored: HashMap<AccountId, i64> = HashMap::new();
-        let mut claimable_balance_reserve: i64 = 0;
+        // Write-only accumulator, mirroring stellar-core's `claimableBalanceReserve`
+        // in `SponsorshipCountIsValid::checkOnOperationApply`: it is accumulated but
+        // never read back (the invariant never checks it). Kept for parity so the
+        // claimable-balance branch of `sponsorship_contributions` has a faithful sink
+        // and does NOT leak into `num_sponsored`.
+        let mut _claimable_balance_reserve: i64 = 0;
 
         // Process created entries.
         for entry in delta.created {
-            update_counters(
-                entry,
-                &mut num_sponsoring,
-                &mut num_sponsored,
-                &mut claimable_balance_reserve,
-                1,
-            );
+            let c = sponsorship_contributions(entry);
+            merge(&mut num_sponsoring, &c.sponsoring, 1);
+            merge(&mut num_sponsored, &c.sponsored, 1);
+            _claimable_balance_reserve += c.claimable_balance_reserve;
         }
 
         // Process updated entries (current - previous).
         for (current, previous) in delta.updated.iter().zip(delta.update_states.iter()) {
-            update_counters(
-                current,
-                &mut num_sponsoring,
-                &mut num_sponsored,
-                &mut claimable_balance_reserve,
-                1,
-            );
-            update_counters(
-                previous,
-                &mut num_sponsoring,
-                &mut num_sponsored,
-                &mut claimable_balance_reserve,
-                -1,
-            );
+            let c = sponsorship_contributions(current);
+            merge(&mut num_sponsoring, &c.sponsoring, 1);
+            merge(&mut num_sponsored, &c.sponsored, 1);
+            _claimable_balance_reserve += c.claimable_balance_reserve;
+
+            let p = sponsorship_contributions(previous);
+            merge(&mut num_sponsoring, &p.sponsoring, -1);
+            merge(&mut num_sponsored, &p.sponsored, -1);
+            _claimable_balance_reserve -= p.claimable_balance_reserve;
         }
 
         // Process deleted entries.
         for entry in delta.delete_states {
-            update_counters(
-                entry,
-                &mut num_sponsoring,
-                &mut num_sponsored,
-                &mut claimable_balance_reserve,
-                -1,
-            );
+            let c = sponsorship_contributions(entry);
+            merge(&mut num_sponsoring, &c.sponsoring, -1);
+            merge(&mut num_sponsored, &c.sponsored, -1);
+            _claimable_balance_reserve -= c.claimable_balance_reserve;
         }
 
         // Check accounts that appear in the delta.
@@ -195,20 +231,10 @@ impl Invariant for SponsorshipCountIsValid {
             if let LedgerEntryData::Account(acc) = &current.data {
                 let account_id = &acc.account_id;
 
-                let mut delta_sponsoring: i64 = 0;
-                let mut delta_sponsored: i64 = 0;
-                get_delta_sponsoring_and_sponsored(
-                    Some(current),
-                    &mut delta_sponsoring,
-                    &mut delta_sponsored,
-                    1,
-                );
-                get_delta_sponsoring_and_sponsored(
-                    Some(previous),
-                    &mut delta_sponsoring,
-                    &mut delta_sponsored,
-                    -1,
-                );
+                let current_delta = get_delta_sponsoring_and_sponsored(Some(current));
+                let previous_delta = get_delta_sponsoring_and_sponsored(Some(previous));
+                let delta_sponsoring = current_delta.sponsoring - previous_delta.sponsoring;
+                let delta_sponsored = current_delta.sponsored - previous_delta.sponsored;
 
                 let expected_sponsoring = num_sponsoring.get(account_id).copied().unwrap_or(0);
                 if expected_sponsoring != delta_sponsoring {
@@ -239,14 +265,9 @@ impl Invariant for SponsorshipCountIsValid {
             if let LedgerEntryData::Account(acc) = &entry.data {
                 let account_id = &acc.account_id;
 
-                let mut delta_sponsoring: i64 = 0;
-                let mut delta_sponsored: i64 = 0;
-                get_delta_sponsoring_and_sponsored(
-                    Some(entry),
-                    &mut delta_sponsoring,
-                    &mut delta_sponsored,
-                    1,
-                );
+                let delta = get_delta_sponsoring_and_sponsored(Some(entry));
+                let delta_sponsoring = delta.sponsoring;
+                let delta_sponsored = delta.sponsored;
 
                 let expected_sponsoring = num_sponsoring.get(account_id).copied().unwrap_or(0);
                 if expected_sponsoring != delta_sponsoring {
@@ -276,14 +297,9 @@ impl Invariant for SponsorshipCountIsValid {
             if let LedgerEntryData::Account(acc) = &entry.data {
                 let account_id = &acc.account_id;
 
-                let mut delta_sponsoring: i64 = 0;
-                let mut delta_sponsored: i64 = 0;
-                get_delta_sponsoring_and_sponsored(
-                    Some(entry),
-                    &mut delta_sponsoring,
-                    &mut delta_sponsored,
-                    -1,
-                );
+                let delta = get_delta_sponsoring_and_sponsored(Some(entry));
+                let delta_sponsoring = -delta.sponsoring;
+                let delta_sponsored = -delta.sponsored;
 
                 let expected_sponsoring = num_sponsoring.get(account_id).copied().unwrap_or(0);
                 if expected_sponsoring != delta_sponsoring {
@@ -330,5 +346,263 @@ impl Invariant for SponsorshipCountIsValid {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Characterization guard test for the sponsorship-count invariant.
+    //!
+    //! These tests pin the *current* (and post-refactor identical) behavior of
+    //! `SponsorshipCountIsValid` so a future subtle sign/merge regression in
+    //! `sponsorship_contributions` / `merge` / `get_delta_sponsoring_and_sponsored`
+    //! is caught. They are NOT regression tests for a bug — they pass on the
+    //! pre-refactor code too. They cover, per the converged plan for #3361:
+    //!   - created entry (sign +1) routing into num_sponsoring / num_sponsored,
+    //!   - the reverse-direction updated path (current +1 / previous -1),
+    //!   - signer-sponsoring-ID contributions (magnitude 1),
+    //!   - claimable-balance reserve routing (magnitude must NOT leak into
+    //!     num_sponsored),
+    //!   - consistent delta -> Ok, inconsistent (V2 counter off by 1) -> Err with
+    //!     the numSponsoring / numSponsored mismatch message,
+    //!   - the trailing unmatched-residual `count != 0` error branch.
+
+    use super::*;
+    use stellar_xdr::curr::{
+        AccountEntryExtensionV1, AccountEntryExtensionV2, AccountEntryExtensionV2Ext, AlphaNum4,
+        Asset, AssetCode4, ClaimPredicate, ClaimableBalanceEntry, ClaimableBalanceEntryExt,
+        ClaimableBalanceId, Claimant, ClaimantV0, Hash, InflationResult, LedgerEntryExtensionV1,
+        LedgerEntryExtensionV1Ext, Liabilities, OperationBody, OperationResultTr, PublicKey,
+        SequenceNumber, SponsorshipDescriptor, String32, Thresholds, TrustLineEntry,
+        TrustLineEntryExt, Uint256,
+    };
+
+    fn account_id(seed: u8) -> AccountId {
+        AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([seed; 32])))
+    }
+
+    fn dummy_operation() -> Operation {
+        Operation {
+            source_account: None,
+            body: OperationBody::Inflation,
+        }
+    }
+
+    fn dummy_op_result() -> OperationResult {
+        OperationResult::OpInner(OperationResultTr::Inflation(InflationResult::NotTime))
+    }
+
+    fn network_id() -> [u8; 32] {
+        [0u8; 32]
+    }
+
+    /// Build an account entry with an optional V2 ext (numSponsoring/numSponsored
+    /// counters plus signer-sponsoring-ID descriptors).
+    fn account_entry(
+        id: u8,
+        num_sub_entries: u32,
+        v2: Option<(u32, u32, Vec<Option<AccountId>>)>,
+    ) -> LedgerEntry {
+        let ext = match v2 {
+            None => AccountEntryExt::V0,
+            Some((num_sponsoring, num_sponsored, signers)) => {
+                let signer_sponsoring_i_ds: VecMOrVec = signers
+                    .into_iter()
+                    .map(SponsorshipDescriptor)
+                    .collect::<Vec<_>>()
+                    .try_into()
+                    .unwrap();
+                AccountEntryExt::V1(AccountEntryExtensionV1 {
+                    liabilities: Liabilities {
+                        buying: 0,
+                        selling: 0,
+                    },
+                    ext: AccountEntryExtensionV1Ext::V2(AccountEntryExtensionV2 {
+                        num_sponsored,
+                        num_sponsoring,
+                        signer_sponsoring_i_ds,
+                        ext: AccountEntryExtensionV2Ext::V0,
+                    }),
+                })
+            }
+        };
+        LedgerEntry {
+            last_modified_ledger_seq: 1,
+            data: LedgerEntryData::Account(AccountEntry {
+                account_id: account_id(id),
+                balance: 0,
+                seq_num: SequenceNumber(0),
+                num_sub_entries,
+                inflation_dest: None,
+                flags: 0,
+                home_domain: String32::default(),
+                thresholds: Thresholds([0; 4]),
+                signers: vec![].try_into().unwrap(),
+                ext,
+            }),
+            ext: LedgerEntryExt::V0,
+        }
+    }
+
+    /// Build a (non-pool-share) trustline entry, optionally sponsored by `sponsor`.
+    fn trustline_entry(owner: u8, sponsor: Option<AccountId>) -> LedgerEntry {
+        let ext = match sponsor {
+            None => LedgerEntryExt::V0,
+            Some(s) => LedgerEntryExt::V1(LedgerEntryExtensionV1 {
+                sponsoring_id: SponsorshipDescriptor(Some(s)),
+                ext: LedgerEntryExtensionV1Ext::V0,
+            }),
+        };
+        LedgerEntry {
+            last_modified_ledger_seq: 1,
+            data: LedgerEntryData::Trustline(TrustLineEntry {
+                account_id: account_id(owner),
+                asset: TrustLineAsset::CreditAlphanum4(AlphaNum4 {
+                    asset_code: AssetCode4([b'A', b'B', b'C', 0]),
+                    issuer: account_id(99),
+                }),
+                balance: 0,
+                limit: 0,
+                flags: 0,
+                ext: TrustLineEntryExt::V0,
+            }),
+            ext,
+        }
+    }
+
+    /// Build a claimable-balance entry with `n` claimants, sponsored by `sponsor`.
+    fn claimable_balance_entry(n: usize, sponsor: AccountId) -> LedgerEntry {
+        let claimants: Vec<Claimant> = (0..n)
+            .map(|i| {
+                Claimant::ClaimantTypeV0(ClaimantV0 {
+                    destination: account_id(50 + i as u8),
+                    predicate: ClaimPredicate::Unconditional,
+                })
+            })
+            .collect();
+        LedgerEntry {
+            last_modified_ledger_seq: 1,
+            data: LedgerEntryData::ClaimableBalance(ClaimableBalanceEntry {
+                balance_id: ClaimableBalanceId::ClaimableBalanceIdTypeV0(Hash([7; 32])),
+                claimants: claimants.try_into().unwrap(),
+                asset: Asset::Native,
+                amount: 0,
+                ext: ClaimableBalanceEntryExt::V0,
+            }),
+            ext: LedgerEntryExt::V1(LedgerEntryExtensionV1 {
+                sponsoring_id: SponsorshipDescriptor(Some(sponsor)),
+                ext: LedgerEntryExtensionV1Ext::V0,
+            }),
+        }
+    }
+
+    type VecMOrVec = stellar_xdr::curr::VecM<SponsorshipDescriptor, 20>;
+
+    fn run(
+        created: &[LedgerEntry],
+        updated: &[LedgerEntry],
+        update_states: &[LedgerEntry],
+        delete_states: &[LedgerEntry],
+    ) -> Result<(), String> {
+        let nid = network_id();
+        let delta = OperationDelta {
+            created,
+            updated,
+            update_states,
+            deleted: &[],
+            delete_states,
+            ledger_seq: 100,
+            ledger_version: 24,
+            header_current: None,
+            header_previous: None,
+            network_id: &nid,
+        };
+        SponsorshipCountIsValid.check_on_operation_apply(
+            &dummy_operation(),
+            &dummy_op_result(),
+            &delta,
+            &[],
+        )
+    }
+
+    /// Account B sponsors a newly-created trustline owned by A; A's V2 ext gains
+    /// numSponsored=1, B's V2 ext gains numSponsoring=1. Consistent => Ok.
+    /// Then flip B's numSponsoring to 0 (off by 1) => Err with the numSponsoring
+    /// mismatch message.
+    #[test]
+    fn test_sponsorship_delta_signs() {
+        let sponsor = account_id(2); // B
+        let owner_a = 1u8; // A
+
+        // --- Consistent: created sponsored trustline + both accounts created ---
+        // A created with numSponsored = 1; B created with numSponsoring = 1.
+        let tl = trustline_entry(owner_a, Some(sponsor.clone()));
+        let acct_a = account_entry(owner_a, 1, Some((0, 1, vec![]))); // numSponsored=1
+        let acct_b = account_entry(2, 0, Some((1, 0, vec![]))); // numSponsoring=1
+        let created = vec![tl.clone(), acct_a.clone(), acct_b.clone()];
+        assert!(
+            run(&created, &[], &[], &[]).is_ok(),
+            "consistent created sponsored trustline should pass"
+        );
+
+        // --- Inconsistent: B's numSponsoring off by 1 (0 instead of 1) ---
+        let acct_b_bad = account_entry(2, 0, Some((0, 0, vec![])));
+        let created_bad = vec![tl.clone(), acct_a.clone(), acct_b_bad];
+        let err = run(&created_bad, &[], &[], &[]).unwrap_err();
+        assert!(
+            err.contains("numSponsoring"),
+            "expected numSponsoring mismatch, got: {err}"
+        );
+
+        // --- Reverse-direction (updated): trustline sponsorship REMOVED ---
+        // previous state had A sponsored (numSponsored=1) by B (numSponsoring=1);
+        // current state drops the sponsorship. The current-minus-previous delta is
+        // -1 for both. Build updated current = unsponsored A/B/TL, previous =
+        // sponsored. Consistent => Ok.
+        let tl_prev = trustline_entry(owner_a, Some(sponsor.clone()));
+        let tl_cur = trustline_entry(owner_a, None);
+        let a_prev = account_entry(owner_a, 1, Some((0, 1, vec![])));
+        let a_cur = account_entry(owner_a, 1, Some((0, 0, vec![])));
+        let b_prev = account_entry(2, 0, Some((1, 0, vec![])));
+        let b_cur = account_entry(2, 0, Some((0, 0, vec![])));
+        let updated = vec![tl_cur, a_cur, b_cur];
+        let update_states = vec![tl_prev, a_prev, b_prev];
+        assert!(
+            run(&[], &updated, &update_states, &[]).is_ok(),
+            "consistent reverse-direction sponsorship removal should pass"
+        );
+
+        // --- Signer-sponsoring-ID contribution (magnitude 1) ---
+        // A created with one signer sponsored by B: A.numSponsored=1, B.numSponsoring=1.
+        let a_signer = account_entry(owner_a, 0, Some((0, 1, vec![Some(sponsor.clone())])));
+        let b_signer = account_entry(2, 0, Some((1, 0, vec![])));
+        assert!(
+            run(&[a_signer, b_signer], &[], &[], &[]).is_ok(),
+            "consistent signer-sponsoring contribution should pass"
+        );
+
+        // --- Claimable-balance reserve routing: must NOT leak into num_sponsored ---
+        // A CB with 3 claimants sponsored by B contributes mult=3 to B's
+        // numSponsoring and routes 3 to the (unchecked) claimable_balance_reserve,
+        // NOT to num_sponsored. So if B (created with numSponsoring=3) is the only
+        // account in the delta, the check passes — proving the CB magnitude did not
+        // create a num_sponsored entry for any account.
+        let cb = claimable_balance_entry(3, sponsor.clone());
+        let b_cb = account_entry(2, 0, Some((3, 0, vec![])));
+        assert!(
+            run(&[cb.clone(), b_cb], &[], &[], &[]).is_ok(),
+            "claimable-balance reserve must route to numSponsoring only, not numSponsored"
+        );
+
+        // --- Unmatched residual branch ---
+        // Sponsored trustline owned by A, sponsor B, but neither A nor B appears as
+        // its own account entry in the delta. The accumulated numSponsoring[B]=1 and
+        // numSponsored[A]=1 are never erased => trailing `count != 0` error fires.
+        let lone_tl = trustline_entry(owner_a, Some(sponsor.clone()));
+        let err = run(&[lone_tl], &[], &[], &[]).unwrap_err();
+        assert!(
+            err.contains("numSponsoring") || err.contains("numSponsored"),
+            "expected unmatched-residual mismatch, got: {err}"
+        );
     }
 }

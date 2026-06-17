@@ -21,7 +21,7 @@ use crate::{Invariant, OperationDelta};
 pub struct AccountSubEntriesCountIsValid;
 
 /// Tracks the delta for a single account.
-#[derive(Default)]
+#[derive(Clone, Copy, Default)]
 struct SubEntriesChange {
     /// Change in the account's `num_sub_entries` field.
     num_sub_entries: i32,
@@ -183,7 +183,7 @@ impl Invariant for AccountSubEntriesCountIsValid {
             if let LedgerEntryData::Account(account) = &previous.data {
                 let change = changes
                     .get(&account.account_id)
-                    .map(|c| c.clone_counts())
+                    .copied()
                     .unwrap_or_default();
                 let num_signers =
                     account.num_sub_entries as i32 + change.num_sub_entries - change.signers;
@@ -199,15 +199,5 @@ impl Invariant for AccountSubEntriesCountIsValid {
         }
 
         Ok(())
-    }
-}
-
-impl SubEntriesChange {
-    fn clone_counts(&self) -> SubEntriesChange {
-        SubEntriesChange {
-            num_sub_entries: self.num_sub_entries,
-            signers: self.signers,
-            calculated_sub_entries: self.calculated_sub_entries,
-        }
     }
 }
