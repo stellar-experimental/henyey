@@ -2862,7 +2862,7 @@ impl App {
         });
 
         self.set_phase_sub(phase::PHASE_6_6_TX_QUEUE_JOIN);
-        match henyey_herder::await_blocking_logged("tx-queue close-update", join).await {
+        match henyey_common::await_blocking_logged("tx-queue close-update", join).await {
             Ok((shift_result, invalid_banned)) => {
                 if shift_result.unbanned_count > 0 || shift_result.evicted_due_to_age > 0 {
                     tracing::debug!(
