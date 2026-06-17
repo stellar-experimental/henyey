@@ -157,26 +157,11 @@ pub mod state_keys {
     /// state of the bucket list at that point.
     pub const HISTORY_ARCHIVE_STATE: &str = "historyarchivestate";
 
-    /// Current database schema version.
-    ///
-    /// Used by the migration system to track schema upgrades.
-    pub const DATABASE_SCHEMA: &str = "databaseschema";
-
     /// Network passphrase for transaction signing.
     ///
     /// Identifies which Stellar network this node is connected to
     /// (e.g., "Public Global Stellar Network ; September 2015" for mainnet).
     pub const NETWORK_PASSPHRASE: &str = "networkpassphrase";
-
-    /// Target ledger version for protocol upgrades.
-    ///
-    /// Set when a protocol upgrade is pending.
-    pub const LEDGER_UPGRADE_VERSION: &str = "ledgerupgradeversion";
-
-    /// Serialized SCP state for crash recovery.
-    ///
-    /// Contains the last known SCP state to resume consensus after restart.
-    pub const LAST_SCP_DATA: &str = "lastscpdata";
 
     /// Current SCP nomination/ballot state.
     ///
