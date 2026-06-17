@@ -127,8 +127,8 @@ Corresponds to: `CommandHandler.h`
 | `ll()` | native dynamic log control works; compat handler is minimal | Partial |
 | `logRotate()` | placeholder response only | Partial |
 | `banaccounts()` / `unbanaccounts()` | — | None |
-| legacy survey commands (`surveyTopology()`, `stopSurvey()`, `getSurveyResult()`) | — | None |
-| time-sliced survey commands (`startSurveyCollecting()`, `stopSurveyCollecting()`, `surveyTopologyTimeSliced()`) | native handlers implemented; compat endpoints are stubs | Partial |
+| legacy survey commands (`surveyTopology()`) | — (removed upstream in favor of time-sliced) | None |
+| time-sliced survey commands (`startSurveyCollecting()`, `stopSurveyCollecting()`, `surveyTopologyTimeSliced()`, `stopSurvey()`, `getSurveyResult()`) | native handlers implemented; compat endpoints wired to native `App` survey methods with stellar-core param names (`nonce`/`node`/`inboundpeerindex`/`outboundpeerindex`), plain-text `retStr` (JSON for `getsurveyresult` with **strkey**-encoded `backlog`/`badResponseNodes`), and the `Synced`/`Validating` booted gate (#3298). One bounded, documented divergence on `surveytopologytimesliced`'s duplicate/self-peer edge (native fused bool) | Full |
 
 **Intentional compat divergences for `connect` / `dropPeer` / `unban` / `bans`** (CommandHandler.cpp:478/~543/566/553), both documented and deliberate:
 
@@ -236,7 +236,6 @@ Features not yet implemented. These ARE counted against parity %.
 | stellar-core Component | Priority | Notes |
 |------------------------|----------|-------|
 | `BannedAccountsPersistor` and `FILTERED_G_ADDRESSES` flow | High | No persisted banned-account subsystem or admin endpoints |
-| Compat time-sliced survey admin routes | Medium | Native routes work; compat routes are still stubs |
 | `manualclose` explicit sequence/close-time parameters | Medium | Upstream standalone semantics are not exposed by handlers |
 | Scheduled online self-check parity | Medium | Manual self-check exists, but upstream periodic scheduling test is unmatched |
 | `PersistentState` tx-set hash helpers | Medium | Several SCP persistence helpers remain absent |
@@ -271,7 +270,7 @@ Features not yet implemented. These ARE counted against parity %.
 | Area | stellar-core Tests | Rust Tests | Notes |
 |------|-------------------|------------|-------|
 | Config and compat translation | 9 TEST_CASE / 21 SECTION | 64 `#[test]` | Strong coverage for loading, validation, and captive-core translation |
-| Command handler / compat HTTP | 5 TEST_CASE / 27 SECTION | 55 `#[test]` | Includes handler helpers, generateLoad, testacc, and live-App peer-admin tests (connect/droppeer/unban/bans); survey compat routes remain stubs |
+| Command handler / compat HTTP | 5 TEST_CASE / 27 SECTION | 63 `#[test]` | Includes handler helpers, generateLoad, testacc, live-App peer-admin tests (connect/droppeer/unban/bans), and live-App survey tests (start/stop-collecting, surveytopologytimesliced, stopsurvey, getsurveyresult — booted gate, param validation, strkey projection) (#3298) |
 | Query server | 1 TEST_CASE / 9 SECTION | 7 `#[test]` | Good coverage of lookup ordering and validation |
 | Run/catchup utilities | 4 TEST_CASE / 5 SECTION | 19 `#[test]` | Target parsing and run-mode helpers are well covered |
 | Self-check scheduling | 1 TEST_CASE / 0 SECTION | 0 `#[test]` | No dedicated periodic self-check scheduling tests |
@@ -282,7 +281,7 @@ Features not yet implemented. These ARE counted against parity %.
 
 ### Test Gaps
 
-- Compat peer-admin endpoints (`connect`, `droppeer`, `unban`, `bans`) now have live-App tests asserting real overlay/DB side effects; survey-control compat routes still lack parity-style side-effect tests.
+- Compat peer-admin endpoints (`connect`, `droppeer`, `unban`, `bans`) and survey-control endpoints (`startsurveycollecting`, `stopsurveycollecting`, `surveytopologytimesliced`, `stopsurvey`, `getsurveyresult`) now have live-App tests asserting the booted gate, required-param/strkey validation, plain-text-vs-JSON medium, and strkey-encoded peer lists (#3298). The `surveytopologytimesliced` success-token branch (Survey started vs already running) needs a fully-booted App and is covered only by the documented bounded-divergence note.
 - There is no Rust equivalent of upstream's scheduled online self-check test in `SelfCheckTests.cpp`.
 - Account-ban persistence has no Rust tests because the subsystem is not implemented. Upstream has 4 TEST_CASE / 21 SECTION.
 - HTTP threaded server behavior (3 TEST_CASE upstream in `HttpThreadedTests.cpp`) has no direct equivalent.

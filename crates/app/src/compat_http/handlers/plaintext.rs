@@ -9,10 +9,12 @@
 use std::sync::Arc;
 
 use axum::extract::{Query, State};
+use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::Json;
 use serde::Deserialize;
 
+use crate::app::AppState;
 use crate::compat_http::CompatServerState;
 use crate::http::types::{
     CompatSorobanInfoResponse, ConnectParams, DropPeerParams, SorobanInfoResponse, UnbanParams,
@@ -442,40 +444,214 @@ pub(crate) async fn compat_sorobaninfo_handler(
 }
 
 // ── Survey endpoints (stellar-core URL paths) ───────────────────────────
+//
+// These mirror stellar-core `CommandHandler` (v26.0.1) exactly — NOT henyey's
+// native `/survey/*` JSON handlers. stellar-core returns **plain text**
+// `retStr` for start/stop-collecting, surveytopologytimesliced, and stopsurvey,
+// and **JSON** for getsurveyresult. Param names follow stellar-core
+// (`nonce`, `node`, `inboundpeerindex`, `outboundpeerindex`) — these differ
+// from the native handlers' `inbound_index`/`outbound_index`. All survey logic
+// (signing, nonce, reporting state) lives in the native `App` methods; these
+// handlers are pure wiring (#3298, analogous to #3294).
 
-/// GET /getsurveyresult  (stellar-core path for henyey's /survey)
-pub(crate) async fn compat_getsurveyresult_handler(
-    State(_state): State<Arc<CompatServerState>>,
-) -> impl IntoResponse {
-    Json(serde_json::json!({"survey": "not implemented"}))
+/// Query params for `/startsurveycollecting` — `nonce` is required, matching
+/// stellar-core `parseRequiredParam<uint32_t>(map, "nonce")`.
+#[derive(Deserialize)]
+pub(crate) struct CompatStartSurveyParams {
+    nonce: u32,
 }
 
-/// GET /startsurveycollecting
-pub(crate) async fn compat_startsurveycollecting_handler(
-    State(_state): State<Arc<CompatServerState>>,
+/// Query params for `/surveytopologytimesliced`. All three are required,
+/// matching stellar-core `parseRequiredParam` for `node` / `inboundpeerindex`
+/// / `outboundpeerindex`.
+#[derive(Deserialize)]
+pub(crate) struct CompatSurveyTopologyParams {
+    node: String,
+    inboundpeerindex: u32,
+    outboundpeerindex: u32,
+}
+
+/// Booted gate mirroring native `survey_booted`: survey commands run only when
+/// the node is `Synced` or `Validating`.
+async fn compat_survey_booted(state: &CompatServerState) -> bool {
+    matches!(
+        state.app.state().await,
+        AppState::Synced | AppState::Validating
+    )
+}
+
+/// stellar-core does not gate these via a booted check; the native handlers do.
+/// We return HTTP 503 + the verbatim native message when not booted.
+fn compat_survey_not_booted() -> (StatusCode, String) {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Application is not fully booted, try again later.".to_string(),
+    )
+}
+
+/// GET /getsurveyresult  (stellar-core path for henyey's /survey)
+///
+/// Returns JSON in stellar-core `SurveyManager::getJsonResults()` shape
+/// (`CommandHandler::getSurveyResult` → `toStyledString`): `surveyInProgress`
+/// (bool), `backlog` / `badResponseNodes` (arrays of **strkey** peer ids,
+/// matching `KeyUtils::toStrKey`, `SurveyManager.cpp:682,690`), and a
+/// `topology` map keyed by surveyed-peer strkey (matching
+/// `mResults["topology"][toStrKey(peer)]`).
+///
+/// The native `survey_report()` carries `backlog`/`bad_response_nodes` and the
+/// per-peer `peer_id`s as 64-char **hex** (`PeerId::to_hex`); we re-derive the
+/// strkey form here so the compat wire output matches stellar-core (and does
+/// NOT leak henyey's internal hex encoding).
+pub(crate) async fn compat_getsurveyresult_handler(
+    State(state): State<Arc<CompatServerState>>,
 ) -> impl IntoResponse {
-    "done\n"
+    let report = state.app.survey_report().await;
+
+    let backlog: Vec<String> = report.backlog.iter().map(|h| hex_to_strkey(h)).collect();
+    let bad_response_nodes: Vec<String> = report
+        .bad_response_nodes
+        .iter()
+        .map(|h| hex_to_strkey(h))
+        .collect();
+
+    // stellar-core keys per-peer topology results under
+    // mResults["topology"][toStrKey(surveyedPeerID)]. The native report keys
+    // its per-peer results by nonce then peer (hex); flatten to a strkey-keyed
+    // map mirroring stellar-core.
+    let mut topology = serde_json::Map::new();
+    for reports in report.peer_reports.values() {
+        for peer in reports {
+            topology.insert(
+                hex_to_strkey(&peer.peer_id),
+                serde_json::to_value(&peer.response).unwrap_or(serde_json::Value::Null),
+            );
+        }
+    }
+
+    Json(serde_json::json!({
+        "surveyInProgress": report.survey_in_progress,
+        "backlog": backlog,
+        "badResponseNodes": bad_response_nodes,
+        "topology": topology,
+    }))
+}
+
+/// GET /startsurveycollecting?nonce=<u32>
+///
+/// stellar-core `CommandHandler::startSurveyCollecting`: required `nonce`, then
+/// `broadcastStartSurveyCollecting(nonce)` → verbatim success/failure strings.
+pub(crate) async fn compat_startsurveycollecting_handler(
+    State(state): State<Arc<CompatServerState>>,
+    Query(params): Query<CompatStartSurveyParams>,
+) -> impl IntoResponse {
+    if !compat_survey_booted(&state).await {
+        return compat_survey_not_booted();
+    }
+    let ok = state
+        .app
+        .start_survey_collecting(params.nonce)
+        .await
+        .is_ok();
+    let msg = if ok {
+        "Requested network to start survey collecting."
+    } else {
+        "Failed to start survey collecting. Another survey is active on the network."
+    };
+    (StatusCode::OK, msg.to_string())
 }
 
 /// GET /stopsurveycollecting
+///
+/// stellar-core `CommandHandler::stopSurveyCollecting`:
+/// `broadcastStopSurveyCollecting()` → verbatim success/failure strings.
 pub(crate) async fn compat_stopsurveycollecting_handler(
-    State(_state): State<Arc<CompatServerState>>,
+    State(state): State<Arc<CompatServerState>>,
 ) -> impl IntoResponse {
-    "done\n"
+    if !compat_survey_booted(&state).await {
+        return compat_survey_not_booted();
+    }
+    let ok = state.app.stop_survey_collecting().await.is_ok();
+    let msg = if ok {
+        "Requested network to stop survey collecting."
+    } else {
+        "Failed to stop survey collecting. No survey is active on the network."
+    };
+    (StatusCode::OK, msg.to_string())
 }
 
-/// GET /surveytopologytimesliced
+/// GET /surveytopologytimesliced?node=<strkey>&inboundpeerindex=<u32>&outboundpeerindex=<u32>
+///
+/// stellar-core `CommandHandler::surveyTopologyTimeSliced`: parses `node`
+/// (strkey), `inboundpeerindex`, `outboundpeerindex`, then sets
+/// `retStr = "Adding node."` and appends `"Survey started "` when a fresh
+/// reporting session started, else `"Survey already running!"`.
+///
+/// stellar-core performs two independent steps — `startSurveyReporting()`
+/// (bool drives the trailing token) and an UNCONDITIONAL
+/// `addNodeToRunningSurveyBacklog(...)`. Henyey's `survey_topology_timesliced`
+/// fuses both into one bool: it returns `true` only on a fresh `Started`
+/// (≈ stellar-core's `startSurveyReporting()` success), so we use it to select
+/// the trailing token. **Accepted bounded divergence (#3298):** for the
+/// duplicate-peer / self-peer / not-ready edge the native method returns
+/// `false` and SKIPS the insert, whereas stellar-core always adds the node and
+/// only varies the token. This multi-node already-running edge is a documented
+/// reuse limitation of the native fused bool — not reimplemented here.
 pub(crate) async fn compat_surveytopology_handler(
-    State(_state): State<Arc<CompatServerState>>,
+    State(state): State<Arc<CompatServerState>>,
+    Query(params): Query<CompatSurveyTopologyParams>,
 ) -> impl IntoResponse {
-    "done\n"
+    // Validate the `node` strkey before the booted gate: stellar-core parses
+    // required params first (`parseRequiredParam` throws on a bad value), so a
+    // malformed `node` is a 400 regardless of node state.
+    let pubkey = match henyey_crypto::PublicKey::from_strkey(&params.node) {
+        Ok(key) => key,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                "Invalid node public key".to_string(),
+            );
+        }
+    };
+    if !compat_survey_booted(&state).await {
+        return compat_survey_not_booted();
+    }
+    let peer_id = henyey_overlay::PeerId::from_bytes(*pubkey.as_bytes());
+    let started = state
+        .app
+        .survey_topology_timesliced(peer_id, params.inboundpeerindex, params.outboundpeerindex)
+        .await;
+    let msg = if started {
+        "Adding node.Survey started "
+    } else {
+        "Adding node.Survey already running!"
+    };
+    (StatusCode::OK, msg.to_string())
 }
 
 /// GET /stopsurvey (stellar-core path for henyey's /survey/reporting/stop)
+///
+/// stellar-core `CommandHandler::stopSurvey`: `stopSurveyReporting()` then the
+/// verbatim, ungated `retStr = "survey stopped"`.
 pub(crate) async fn compat_stopreporting_handler(
-    State(_state): State<Arc<CompatServerState>>,
+    State(state): State<Arc<CompatServerState>>,
 ) -> impl IntoResponse {
-    "done\n"
+    state.app.stop_survey_reporting().await;
+    (StatusCode::OK, "survey stopped".to_string())
+}
+
+/// Convert a 64-char hex-encoded ed25519 public key (as carried by the native
+/// `SurveyReport`) into its Stellar strkey (`G...`) form, matching
+/// stellar-core `KeyUtils::toStrKey`. Falls back to the original string if it
+/// is not parseable hex (defensive — `SurveyReport` always emits valid hex).
+fn hex_to_strkey(hex_pubkey: &str) -> String {
+    match hex::decode(hex_pubkey) {
+        Ok(bytes) if bytes.len() == 32 => {
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&bytes);
+            henyey_overlay::PeerId::from_bytes(arr).to_strkey()
+        }
+        _ => hex_pubkey.to_string(),
+    }
 }
 
 /// Parse a simple ISO 8601 datetime string to Unix timestamp.
@@ -1314,6 +1490,204 @@ mod tests {
         assert!(is_leap_year(2024));
         assert!(!is_leap_year(1900));
         assert!(!is_leap_year(2023));
+    }
+
+    // ── Compat survey-endpoint wiring tests (#3298) ─────────────────────
+    //
+    // These exercise the five compat survey handlers (`/getsurveyresult`,
+    // `/startsurveycollecting`, `/stopsurveycollecting`,
+    // `/surveytopologytimesliced`, `/stopsurvey`) against a live `App`,
+    // mirroring stellar-core `CommandHandler` (v26.0.1) param names, the
+    // booted-state gate, plain-text vs JSON response medium, and the
+    // strkey-encoded peer lists in `getsurveyresult`.
+    //
+    // Each FAILS on `origin/main`: the stub handlers ignore `State` and return
+    // `"done\n"` / `{"survey":"not implemented"}` regardless of app state.
+
+    use axum::body::Body;
+    use http::Request;
+    use tower::ServiceExt;
+
+    use crate::compat_http::build_compat_router;
+
+    /// Send a `GET <uri>` through the full compat router (so axum `Query`
+    /// extraction runs, mirroring stellar-core's `parseRequiredParam`).
+    async fn compat_get(state: Arc<CompatServerState>, uri: &str) -> axum::response::Response {
+        let router = build_compat_router(state);
+        router
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(uri)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    /// `/startsurveycollecting?nonce=1` on a fresh (pre-Synced) App returns 503
+    /// + the not-booted message. FAILS on main (stub returns 200 `"done\n"`).
+    #[tokio::test]
+    async fn test_compat_startsurveycollecting_gated_when_not_booted() {
+        let (_dir, state) = mk_compat_state().await;
+        let resp = compat_get(Arc::clone(&state), "/startsurveycollecting?nonce=1").await;
+        assert_eq!(resp.status(), http::StatusCode::SERVICE_UNAVAILABLE);
+        let text = body_text(resp).await;
+        assert!(
+            text.contains("not fully booted"),
+            "expected not-booted message, got {text:?}"
+        );
+        state.app.shutdown();
+    }
+
+    /// `/startsurveycollecting` with no `nonce` is a missing required param →
+    /// 400 (axum Query rejection ≈ stellar-core parseRequiredParam throw).
+    /// FAILS on main (stub returns 200 `"done\n"`).
+    #[tokio::test]
+    async fn test_compat_startsurveycollecting_missing_nonce_400() {
+        let (_dir, state) = mk_compat_state().await;
+        let resp = compat_get(Arc::clone(&state), "/startsurveycollecting").await;
+        assert_eq!(resp.status(), http::StatusCode::BAD_REQUEST);
+        state.app.shutdown();
+    }
+
+    /// `/stopsurveycollecting` on a fresh App returns 503. FAILS on main.
+    #[tokio::test]
+    async fn test_compat_stopsurveycollecting_gated_when_not_booted() {
+        let (_dir, state) = mk_compat_state().await;
+        let resp = compat_get(Arc::clone(&state), "/stopsurveycollecting").await;
+        assert_eq!(resp.status(), http::StatusCode::SERVICE_UNAVAILABLE);
+        state.app.shutdown();
+    }
+
+    /// `/surveytopologytimesliced` with a malformed `node` strkey → 400, while
+    /// exercising the stellar-core param names `inboundpeerindex` /
+    /// `outboundpeerindex`. FAILS on main (stub returns 200 `"done\n"`).
+    #[tokio::test]
+    async fn test_compat_surveytopologytimesliced_invalid_node_param() {
+        let (_dir, state) = mk_compat_state().await;
+        let resp = compat_get(
+            Arc::clone(&state),
+            "/surveytopologytimesliced?node=not-a-strkey&inboundpeerindex=0&outboundpeerindex=0",
+        )
+        .await;
+        assert_eq!(resp.status(), http::StatusCode::BAD_REQUEST);
+        state.app.shutdown();
+    }
+
+    /// `/surveytopologytimesliced` with valid params on a fresh App returns 503
+    /// (booted gate). FAILS on main (stub returns 200 `"done\n"`).
+    #[tokio::test]
+    async fn test_compat_surveytopologytimesliced_gated_when_not_booted() {
+        let (_dir, state) = mk_compat_state().await;
+        let (_peer_id, strkey) = mk_peer();
+        let uri = format!(
+            "/surveytopologytimesliced?node={strkey}&inboundpeerindex=0&outboundpeerindex=0"
+        );
+        let resp = compat_get(Arc::clone(&state), &uri).await;
+        assert_eq!(resp.status(), http::StatusCode::SERVICE_UNAVAILABLE);
+        state.app.shutdown();
+    }
+
+    /// `/stopsurvey` returns the verbatim plain-text `"survey stopped"` (NOT
+    /// JSON), invoking `stop_survey_reporting()` (ungated, idempotent). FAILS
+    /// on main (stub returns `"done\n"`).
+    #[tokio::test]
+    async fn test_compat_stopsurvey_returns_plaintext() {
+        let (_dir, state) = mk_compat_state().await;
+        let resp = compat_get(Arc::clone(&state), "/stopsurvey").await;
+        assert_eq!(resp.status(), http::StatusCode::OK);
+        let text = body_text(resp).await;
+        assert_eq!(text, "survey stopped");
+        state.app.shutdown();
+    }
+
+    /// `/getsurveyresult` returns JSON shaped like stellar-core
+    /// `SurveyManager::getJsonResults()`: `surveyInProgress` (bool) plus
+    /// `backlog` / `badResponseNodes` as **strkey** arrays (NOT hex). FAILS on
+    /// main (stub returns `{"survey":"not implemented"}`).
+    #[tokio::test]
+    async fn test_compat_getsurveyresult_returns_json_shape() {
+        let (_dir, state) = mk_compat_state().await;
+        let resp = compat_get(Arc::clone(&state), "/getsurveyresult").await;
+        assert_eq!(resp.status(), http::StatusCode::OK);
+        let json = body_json(resp).await;
+        assert!(
+            json.get("surveyInProgress").is_some(),
+            "missing surveyInProgress in {json}"
+        );
+        assert!(json["surveyInProgress"].is_boolean());
+        assert!(
+            json.get("backlog").and_then(|v| v.as_array()).is_some(),
+            "backlog must be an array in {json}"
+        );
+        assert!(
+            json.get("badResponseNodes")
+                .and_then(|v| v.as_array())
+                .is_some(),
+            "badResponseNodes must be an array in {json}"
+        );
+        // The stub key must be gone.
+        assert!(
+            json.get("survey").is_none(),
+            "stub key `survey` should not be present in {json}"
+        );
+        state.app.shutdown();
+    }
+
+    /// strkey (not hex) parity for `getsurveyresult`'s `backlog` /
+    /// `badResponseNodes`. We populate the running-survey reporting backlog
+    /// with a known peer via `survey_topology_timesliced`, then assert the
+    /// emitted entries are that peer's G... STRKEY (matching
+    /// `SurveyManager.cpp:682,690` `KeyUtils::toStrKey`), NOT the 64-hex form
+    /// `survey_report()` carries internally. FAILS on main (stub).
+    #[tokio::test]
+    async fn test_compat_getsurveyresult_backlog_is_strkey_not_hex() {
+        let (_dir, state) = mk_compat_state().await;
+        let (peer_id, strkey) = mk_peer();
+        // Seed a running reporting session with a known peer in the backlog so
+        // the projection has a non-empty list to encode (test-only seam — does
+        // not exercise survey logic).
+        state
+            .app
+            .seed_survey_reporting_backlog_for_test(peer_id.clone())
+            .await;
+
+        // Internally the native SurveyReport carries this peer as 64-char hex.
+        let report = state.app.survey_report().await;
+        assert_eq!(report.backlog, vec![peer_id.to_hex()]);
+        assert_ne!(
+            peer_id.to_hex(),
+            strkey,
+            "hex and strkey forms must differ for the test to be meaningful"
+        );
+
+        // The compat handler MUST re-derive strkey, matching stellar-core
+        // SurveyManager.cpp:682,690 (KeyUtils::toStrKey), NOT emit the hex.
+        let resp = compat_get(Arc::clone(&state), "/getsurveyresult").await;
+        let json = body_json(resp).await;
+        let backlog = json["backlog"].as_array().expect("backlog array");
+        assert_eq!(
+            backlog.len(),
+            1,
+            "expected exactly the seeded peer in backlog {json}"
+        );
+        let entry = backlog[0].as_str().unwrap();
+        assert_eq!(
+            entry, strkey,
+            "backlog entry must be the peer's strkey, not hex"
+        );
+        assert!(
+            entry.starts_with('G'),
+            "backlog entry {entry:?} is not a G... strkey"
+        );
+        assert_ne!(
+            entry,
+            peer_id.to_hex(),
+            "backlog entry must NOT be the hex form"
+        );
+        state.app.shutdown();
     }
 }
 

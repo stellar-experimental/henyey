@@ -256,6 +256,22 @@ impl App {
         true
     }
 
+    /// Test-only seam: seed the reporting backlog with a single peer and mark
+    /// the reporting phase running, without driving the full collecting →
+    /// reporting handshake (which requires an injected overlay and finalized
+    /// node data). Used by the compat `/getsurveyresult` strkey-projection test
+    /// (#3298) to get a deterministic non-empty `backlog`.
+    #[cfg(test)]
+    pub(crate) async fn seed_survey_reporting_backlog_for_test(
+        &self,
+        peer_id: henyey_overlay::PeerId,
+    ) {
+        let mut reporting = self.survey_reporting.write().await;
+        reporting.running = true;
+        reporting.peers.insert(peer_id.clone());
+        reporting.queue.push_back(peer_id);
+    }
+
     async fn start_survey_reporting(&self) -> SurveyReportingStart {
         let nonce = { self.survey_state.read().await.data().nonce() };
         let Some(nonce) = nonce else {

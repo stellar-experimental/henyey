@@ -164,21 +164,33 @@ Still deferred:
 
 Commits: `fc12e03`, `35a44d8`, `dae8ad9`, plus #3297 (the 3 bounded modes)
 
-### 5. Compat survey endpoints are stubs
+### ~~5. Compat survey endpoints are stubs~~ — CLOSED
 
-The compat survey routes exist, but they are not wired to the native survey implementation.
+The five compat survey routes are now wired to the native survey implementation
+(`crates/app/src/compat_http/handlers/plaintext.rs`), mirroring stellar-core
+`CommandHandler` (v26.0.1) param names and response medium (#3298):
 
-Stub behavior in `crates/app/src/compat_http/handlers/plaintext.rs:328`:
+- `/getsurveyresult` returns JSON in `SurveyManager::getJsonResults()` shape —
+  `surveyInProgress` (bool), `backlog`/`badResponseNodes` as **strkey** arrays
+  (`KeyUtils::toStrKey`, not henyey's internal hex), and a `topology` map keyed
+  by surveyed-peer strkey.
+- `/startsurveycollecting?nonce=<u32>` → `start_survey_collecting(nonce)`;
+  verbatim success/failure `retStr`.
+- `/stopsurveycollecting` → `stop_survey_collecting()`; verbatim success/failure.
+- `/surveytopologytimesliced?node=<strkey>&inboundpeerindex=<u32>&outboundpeerindex=<u32>`
+  → `survey_topology_timesliced(...)`; `retStr = "Adding node." + ("Survey
+  started "|"Survey already running!")`.
+- `/stopsurvey` → `stop_survey_reporting()`; verbatim `"survey stopped"`.
 
-- `/getsurveyresult` returns `{"survey": "not implemented"}`
-- `/startsurveycollecting`, `/stopsurveycollecting`, and `/surveytopologytimesliced` return `done\n`
+start/stop-collecting and surveytopologytimesliced gate on `Synced`/`Validating`
+(503 when not booted). One bounded, documented divergence: the native fused
+`survey_topology_timesliced` bool skips the insert for the duplicate/self-peer
+edge, whereas stellar-core always adds the node — an accepted reuse limitation.
+The native survey handlers remain in `crates/app/src/http/handlers/survey.rs`,
+backed by `crates/app/src/app/survey_impl.rs`.
 
-Meanwhile, real native survey handlers exist in `crates/app/src/http/handlers/survey.rs:1`, backed by application logic in `crates/app/src/app/survey_impl.rs:1`.
-
-Impact:
-
-- survey-related SSC missions should be classified as unsupported today
-- this is not urgent unless network survey missions are in scope
+This was the last SSC compat survey item; survey-related SSC missions are now
+supported through the compat surface.
 
 ### 6. History mission reliability is plausible, but not yet proven
 
@@ -277,7 +289,7 @@ The config parsing layer (`crates/app/src/compat_config.rs`) has 27 unit tests c
 | ProtocolUpgrade missions | LOW (pending live run) | `/upgrades` `mode=set` param set pinned 1:1 to stellar-core and the full schedule→nominate→apply path is covered by offline regression tests for every `LedgerUpgrade` variant (#3300); only the live multi-node SSC run remains (operator hand-off) |
 | VersionMix / mixed images | HIGH | Best near-term path to value |
 | EmitMeta-style missions | HIGH | Existing metadata support is already strong |
-| NetworkSurvey missions | LOW | Compat endpoints are stubs today |
+| NetworkSurvey missions | LOW | Compat survey endpoints wired to the native survey subsystem (#3298) |
 | MaxTPS benchmarking | LOW | Requires deeper loadgen and metrics parity, and possibly other SSC assumptions |
 | DatabaseInplaceUpgrade | N/A | Not relevant to Henyey's SQLite architecture |
 
@@ -383,7 +395,7 @@ Exit criteria:
 
 Candidate work:
 
-- wire compat survey endpoints to the native survey subsystem
+- ~~wire compat survey endpoints to the native survey subsystem~~ — done (#3298)
 - broaden `/generateload` mode coverage further
 - improve metrics parity beyond the minimum SSC-required set
 - pursue MaxTPS/performance-specific missions once correctness missions are stable
@@ -431,7 +443,7 @@ Candidate work:
 
 ### Phase 4 handoff checklist
 
-- [ ] survey scope explicitly decided
+- [x] survey scope explicitly decided — compat survey endpoints wired to native subsystem (#3298)
 - [ ] long-tail mission matrix updated
 - [ ] deferred work separated from active blockers
 - [ ] any new compat endpoints have response-shape parity tests
