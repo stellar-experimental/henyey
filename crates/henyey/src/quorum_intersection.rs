@@ -99,7 +99,7 @@ fn load_quorum_map(path: &Path) -> anyhow::Result<HashMap<NodeId, Option<ScpQuor
 /// * `Ok(true)` - Network enjoys quorum intersection (safe)
 /// * `Ok(false)` - Network does NOT enjoy quorum intersection (unsafe!)
 /// * `Err(_)` - Configuration error or unsatisfiable quorum slice
-pub fn check_quorum_intersection_from_json(path: &Path) -> anyhow::Result<bool> {
+pub(crate) fn check_quorum_intersection_from_json(path: &Path) -> anyhow::Result<bool> {
     let qmap = load_quorum_map(path)?;
 
     if let Some(node) = find_unsatisfiable_node(&qmap) {
