@@ -11,9 +11,9 @@
 //!
 //! # Length Field Format
 //!
-//! The length field has special semantics:
-//! - **Bit 31 (MSB)**: Authentication flag. When set, the message has a valid MAC.
-//!   When clear (e.g., Hello/Auth during handshake), the MAC field is all zeros.
+//! The length field uses XDR record marking semantics:
+//! - **Bit 31 (MSB)**: Final-fragment flag. Henyey emits and accepts only
+//!   single-fragment overlay messages, so this bit must be set.
 //! - **Bits 0-30**: Actual message body length in bytes.
 //!
 //! # Message Size Limits
@@ -49,19 +49,16 @@ pub struct MessageFrame {
     pub raw_len: usize,
 
     /// Whether bit 31 was set in the length prefix.
-    ///
-    /// When true, the message has a valid MAC that should be verified.
-    /// When false (Hello/Auth during handshake), the MAC field is zeros.
-    pub is_authenticated: bool,
+    pub is_last_fragment: bool,
 }
 
 impl MessageFrame {
     /// Creates a new message frame with the given parameters.
-    pub fn new(message: AuthenticatedMessage, raw_len: usize, is_authenticated: bool) -> Self {
+    pub fn new(message: AuthenticatedMessage, raw_len: usize, is_last_fragment: bool) -> Self {
         Self {
             message,
             raw_len,
-            is_authenticated,
+            is_last_fragment,
         }
     }
 }
@@ -98,8 +95,8 @@ enum DecodeState {
     ReadingBody {
         /// Expected message body length.
         len: usize,
-        /// Whether bit 31 was set (message has valid MAC).
-        is_authenticated: bool,
+        /// Whether bit 31 was set (final XDR record fragment).
+        is_last_fragment: bool,
     },
 }
 
@@ -122,23 +119,15 @@ impl MessageCodec {
 
     /// Encodes a message to bytes with length prefix.
     ///
-    /// Returns a `Vec<u8>` containing the 4-byte length prefix followed by
-    /// the XDR-encoded message body. The length prefix has bit 31 set for
-    /// authenticated messages (all except Hello).
+    /// Returns a `Vec<u8>` containing the 4-byte record-marking prefix followed
+    /// by the XDR-encoded message body. Bit 31 is always set because Henyey
+    /// writes each overlay message as a single XDR record fragment.
     pub fn encode_message(message: &AuthenticatedMessage) -> Result<Vec<u8>> {
-        // Determine if this message should have the authentication bit set.
-        // G14: Bit 31 (0x80000000) is the AUTH_MSG_FLAG from stellar-core
-        // (Peer.h:AUTH_MSG_FLAG_PULL_MODE_REQUESTED). HELLO messages don't
-        // have the auth bit; all others do.
-        let AuthenticatedMessage::V0(v0) = message;
-        let is_authenticated = !matches!(v0.message, stellar_xdr::curr::StellarMessage::Hello(_));
-
         let xdr_bytes = message.to_xdr(Limits::none())?;
         let len = xdr_bytes.len() as u32;
-        let auth_bit = if is_authenticated { 0x80000000u32 } else { 0 };
 
         let mut buf = Vec::with_capacity(4 + xdr_bytes.len());
-        buf.extend_from_slice(&(len | auth_bit).to_be_bytes());
+        buf.extend_from_slice(&(len | 0x80000000u32).to_be_bytes());
         buf.extend_from_slice(&xdr_bytes);
 
         Ok(buf)
@@ -168,13 +157,17 @@ impl Decoder for MessageCodec {
                         return Ok(None);
                     }
 
-                    // Read length prefix
-                    // In Stellar's protocol, bit 31 indicates authentication status
-                    // Bit 31 set = message has valid MAC
-                    // Bit 31 clear = message has zero MAC (Hello/Auth during handshake)
+                    // Read XDR record-marking prefix. Bit 31 is the final
+                    // fragment flag, not an authentication marker.
                     let raw_len = u32::from_be_bytes([src[0], src[1], src[2], src[3]]);
-                    let is_authenticated = (raw_len & 0x80000000) != 0;
+                    let is_last_fragment = (raw_len & 0x80000000) != 0;
                     let len = (raw_len & 0x7FFFFFFF) as usize;
+
+                    if !is_last_fragment {
+                        return Err(OverlayError::Message(
+                            "fragmented XDR records are not supported".into(),
+                        ));
+                    }
 
                     // Validate length
                     // OVERLAY_SPEC §3.3: len==0 is handled distinctly as
@@ -213,12 +206,12 @@ impl Decoder for MessageCodec {
 
                     self.decode_state = DecodeState::ReadingBody {
                         len,
-                        is_authenticated,
+                        is_last_fragment,
                     };
                 }
                 DecodeState::ReadingBody {
                     len,
-                    is_authenticated,
+                    is_last_fragment,
                 } => {
                     if src.len() < len {
                         // Need more data for message body
@@ -234,7 +227,7 @@ impl Decoder for MessageCodec {
                     // Reset state
                     self.decode_state = DecodeState::ReadingLength;
 
-                    return Ok(Some(MessageFrame::new(message, len, is_authenticated)));
+                    return Ok(Some(MessageFrame::new(message, len, is_last_fragment)));
                 }
             }
         }
@@ -245,17 +238,6 @@ impl Encoder<AuthenticatedMessage> for MessageCodec {
     type Error = OverlayError;
 
     fn encode(&mut self, message: AuthenticatedMessage, dst: &mut BytesMut) -> Result<()> {
-        // Determine if this message should have the authentication bit set.
-        // HELLO messages are sent before keys are established, so they use
-        // sequence 0 and an all-zero MAC field - no auth bit.
-        // All other messages (AUTH and post-auth) have valid MACs and need
-        // the auth bit set so the receiver knows to verify the MAC.
-        let is_authenticated = match &message {
-            AuthenticatedMessage::V0(v0) => {
-                !matches!(v0.message, stellar_xdr::curr::StellarMessage::Hello(_))
-            }
-        };
-
         // Encode to XDR
         let xdr_bytes = message.to_xdr(Limits::none())?;
 
@@ -267,13 +249,11 @@ impl Encoder<AuthenticatedMessage> for MessageCodec {
             )));
         }
 
-        // Write length prefix with authentication bit
-        // Bit 31 set = message has valid MAC that should be verified
-        // Bit 31 clear = message has zero MAC (Hello during handshake)
+        // Write XDR record-marking prefix. Bit 31 is the final-fragment bit,
+        // not an authentication marker.
         let len = xdr_bytes.len() as u32;
-        let auth_bit = if is_authenticated { 0x80000000 } else { 0 };
         dst.reserve(4 + xdr_bytes.len());
-        dst.put_u32(len | auth_bit);
+        dst.put_u32(len | 0x80000000);
 
         // Write message body
         dst.extend_from_slice(&xdr_bytes);
@@ -391,15 +371,15 @@ mod tests {
         // Should have 4-byte length prefix
         assert!(encoded.len() > 4);
 
-        // Length should match (mask off auth bit)
+        // Length should match (mask off final-fragment bit)
         let raw_len = u32::from_be_bytes([encoded[0], encoded[1], encoded[2], encoded[3]]);
         let len = (raw_len & 0x7FFFFFFF) as usize;
         assert_eq!(len, encoded.len() - 4);
 
-        // Non-Hello messages should have auth bit set
+        // Single-fragment messages should have final-fragment bit set
         assert!(
             raw_len & 0x80000000 != 0,
-            "auth bit should be set for non-Hello messages"
+            "final-fragment bit should be set"
         );
 
         // Should decode
@@ -413,8 +393,8 @@ mod tests {
     }
 
     #[test]
-    fn test_auth_bit_set_for_authenticated_messages() {
-        // Non-Hello messages should have auth bit set
+    fn test_record_marking_bit_set_for_authenticated_messages() {
+        // All single-fragment messages should have the XDR final-fragment bit set.
         let msg = AuthenticatedMessage::V0(AuthenticatedMessageV0 {
             sequence: 1,
             message: StellarMessage::Peers(VecM::default()),
@@ -423,13 +403,16 @@ mod tests {
         let encoded = MessageCodec::encode_message(&msg).unwrap();
         let raw_len = u32::from_be_bytes([encoded[0], encoded[1], encoded[2], encoded[3]]);
 
-        assert!(raw_len & 0x80000000 != 0, "auth bit should be set");
+        assert!(
+            raw_len & 0x80000000 != 0,
+            "final-fragment bit should be set"
+        );
         assert_eq!((raw_len & 0x7FFFFFFF) as usize, encoded.len() - 4);
     }
 
     #[test]
-    fn test_auth_bit_not_set_for_hello() {
-        // Hello messages should NOT have auth bit set
+    fn test_record_marking_bit_set_for_hello() {
+        // HELLO is also a complete single-fragment XDR record.
         let msg = AuthenticatedMessage::V0(AuthenticatedMessageV0 {
             sequence: 0,
             message: StellarMessage::Hello(Default::default()),
@@ -439,15 +422,15 @@ mod tests {
         let raw_len = u32::from_be_bytes([encoded[0], encoded[1], encoded[2], encoded[3]]);
 
         assert!(
-            raw_len & 0x80000000 == 0,
-            "auth bit should NOT be set for Hello"
+            raw_len & 0x80000000 != 0,
+            "final-fragment bit should be set for Hello"
         );
-        assert_eq!(raw_len as usize, encoded.len() - 4);
+        assert_eq!((raw_len & 0x7FFFFFFF) as usize, encoded.len() - 4);
     }
 
     #[test]
-    fn test_codec_roundtrip_with_auth_bit() {
-        // Test that encode/decode roundtrip preserves the auth bit correctly
+    fn test_codec_roundtrip_with_record_marking_bit() {
+        // Test that encode/decode roundtrip preserves the final-fragment bit.
         let mut codec = MessageCodec::new();
         let mut buf = BytesMut::new();
 
@@ -460,8 +443,8 @@ mod tests {
         codec.encode(auth_msg, &mut buf).unwrap();
         let frame = codec.decode(&mut buf).unwrap().unwrap();
         assert!(
-            frame.is_authenticated,
-            "decoded frame should be marked as authenticated"
+            frame.is_last_fragment,
+            "decoded frame should be marked as final fragment"
         );
 
         // Hello message (unauthenticated)
@@ -473,8 +456,8 @@ mod tests {
         codec.encode(hello_msg, &mut buf).unwrap();
         let frame = codec.decode(&mut buf).unwrap().unwrap();
         assert!(
-            !frame.is_authenticated,
-            "Hello message should NOT be marked as authenticated"
+            frame.is_last_fragment,
+            "Hello message should be marked as final fragment"
         );
     }
 
@@ -540,7 +523,7 @@ mod tests {
     fn test_decoder_rejects_too_small_message() {
         let mut codec = MessageCodec::new();
         // 4 bytes = too small (MIN_MESSAGE_SIZE is 12)
-        let len: u32 = 4;
+        let len: u32 = 4 | 0x80000000;
         let mut buf = BytesMut::new();
         buf.extend_from_slice(&len.to_be_bytes());
         // Add enough dummy bytes so the decoder doesn't stall waiting for body
@@ -563,7 +546,7 @@ mod tests {
         // OVERLAY_SPEC §3.3: zero-length messages produce a distinct
         // "error during read" error, matching stellar-core TCPPeer.cpp:690-700.
         let mut codec = MessageCodec::new();
-        let len: u32 = 0;
+        let len: u32 = 0 | 0x80000000;
         let mut buf = BytesMut::new();
         buf.extend_from_slice(&len.to_be_bytes());
         buf.extend_from_slice(&[0u8; 16]);
@@ -581,7 +564,7 @@ mod tests {
     fn test_decoder_rejects_oversized_unauthenticated_message() {
         let mut codec = MessageCodec::new();
         // Before set_authenticated(), limit is 4096 bytes
-        let len: u32 = 4097;
+        let len: u32 = 4097 | 0x80000000;
         let mut buf = BytesMut::new();
         buf.extend_from_slice(&len.to_be_bytes());
         buf.extend_from_slice(&vec![0u8; 4097]);
@@ -606,7 +589,7 @@ mod tests {
         // After set_authenticated(), a 4097-byte message is allowed (length is valid).
         // We can't fully decode it since the body isn't valid XDR, but the length
         // check should pass and move to ReadingBody state.
-        let len: u32 = 4097;
+        let len: u32 = 4097 | 0x80000000;
         let mut buf = BytesMut::new();
         buf.extend_from_slice(&len.to_be_bytes());
         // Only provide partial body so decoder returns Ok(None) waiting for more data

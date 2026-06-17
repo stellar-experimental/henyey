@@ -390,9 +390,11 @@ async fn run_main_loop(app: Arc<App>, options: RunOptions) -> anyhow::Result<()>
     // right after `stop()` below. Observability-only.
     henyey_ledger::peak_rss_sampler::register_global_sampler(&startup_rss_sampler);
 
-    // Check for force-scp flag (standalone single-node bootstrap).
-    // When set, skip all catchup and restore the node directly from DB state.
-    let force_scp = app.check_force_scp().await;
+    // Check for FORCE_SCP (from compat/native config) or the persisted
+    // force-scp flag (set by the CLI helper). When set, skip catchup and
+    // bootstrap SCP directly from the DB state, matching stellar-core startup.
+    let persisted_force_scp = app.check_force_scp().await;
+    let force_scp = app.config().node.force_scp || persisted_force_scp;
     if force_scp {
         // Parity: stellar-core ApplicationImpl.cpp:658–661 rejects startup
         // when FORCE_SCP=true and NODE_IS_VALIDATOR=false.
@@ -401,7 +403,9 @@ async fn run_main_loop(app: Arc<App>, options: RunOptions) -> anyhow::Result<()>
         }
         tracing::info!("force-scp flag detected, bootstrapping from DB state");
         app.bootstrap_from_db().await?;
-        app.clear_force_scp().await;
+        if persisted_force_scp {
+            app.clear_force_scp().await;
+        }
     }
 
     // Attempt to restore node state from persisted DB + on-disk bucket files.

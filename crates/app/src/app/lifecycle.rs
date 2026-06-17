@@ -1392,13 +1392,11 @@ impl App {
 
         self.store_config_peers().await;
 
-        // Create local node info
-        let mut local_node =
-            if self.config.network.passphrase == "Test SDF Network ; September 2015" {
-                LocalNode::new_testnet(self.keypair.clone())
-            } else {
-                LocalNode::new_mainnet(self.keypair.clone())
-            };
+        // Create local node info with the actual configured passphrase,
+        // not a hardcoded testnet/mainnet default. SSC-generated configs
+        // use a unique passphrase (e.g. "Private test network 'ssc-xxx'")
+        // so the network ID must be derived from it.
+        let mut local_node = LocalNode::new(self.keypair.clone(), &self.config.network.passphrase);
         local_node.listening_port = self.config.overlay.peer_port;
         if let Some(hash) = self.config.build.commit_hash() {
             local_node.set_commit_hash(hash);

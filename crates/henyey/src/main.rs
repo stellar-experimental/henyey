@@ -1737,6 +1737,7 @@ fn local_config() -> AppConfig {
             },
             manual_close: false,
             force_old_style_leader_election: false,
+            force_scp: false,
         },
         network: NetworkConfig {
             passphrase: "Standalone Network ; February 2017".to_string(),

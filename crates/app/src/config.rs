@@ -280,6 +280,13 @@ pub struct NodeConfig {
     /// Matches stellar-core's `FORCE_OLD_STYLE_LEADER_ELECTION`.
     #[serde(default)]
     pub force_old_style_leader_election: bool,
+
+    /// Bootstrap SCP from the local database state at startup.
+    ///
+    /// Matches stellar-core's `FORCE_SCP` runtime flag. In stellar-core-format
+    /// configs this defaults to `NODE_IS_VALIDATOR` unless explicitly set.
+    #[serde(default)]
+    pub force_scp: bool,
 }
 
 impl Default for NodeConfig {
@@ -292,6 +299,7 @@ impl Default for NodeConfig {
             quorum_set: QuorumSetConfig::default(),
             manual_close: false,
             force_old_style_leader_election: false,
+            force_scp: false,
         }
     }
 }

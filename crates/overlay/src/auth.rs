@@ -52,6 +52,8 @@ use stellar_xdr::curr::{
 pub type AuthCert = xdr::AuthCert;
 use x25519_dalek::{EphemeralSecret, PublicKey as X25519PublicKey, SharedSecret};
 
+use tracing::debug;
+
 /// Builds and signs an `AuthCert` over the given ephemeral pubkey with the given
 /// expiration, using the node's Ed25519 identity.
 ///
@@ -197,6 +199,12 @@ fn sign_cert_with(
 
     // stellar-core signs the SHA-256 hash of the data, not the raw data
     let hash = Hash256::hash(&data);
+    debug!(
+        "sign_cert_with: net={}, exp={}, hash={}",
+        hex::encode(network_id.as_bytes()),
+        expiration,
+        hex::encode(hash.as_bytes()),
+    );
     let signature = secret_key.sign(hash.as_bytes());
     *signature.as_bytes()
 }
@@ -2021,4 +2029,47 @@ mod tests {
             assert!(ctx_peer.is_authenticated());
         }
     }
+}
+
+#[test]
+fn test_auth_cert_signing_parity() {
+    use henyey_common::{Hash256, NetworkId};
+    use stellar_xdr::curr::{EnvelopeType, Limits, WriteXdr};
+    // 1. EnvelopeType::Auth must have XDR value 3, matching stellar-core.
+    assert_eq!(EnvelopeType::Auth as i32, 3);
+    let xdr = EnvelopeType::Auth.to_xdr(Limits::none()).unwrap();
+    assert_eq!(xdr, vec![0, 0, 0, 3]);
+    // 2. to_xdr() and as i32 produce identical byte output.
+    assert_eq!((EnvelopeType::Auth as i32).to_be_bytes().to_vec(), xdr,);
+    // 3. Signing and verification roundtrip with raw byte concatenation.
+    let seed = [0xabu8; 32];
+    let secret = henyey_crypto::SecretKey::from_seed(&seed);
+    let passphrase = "Private test network 'ssc-test'";
+    let network_id = NetworkId::from_passphrase(passphrase);
+    let pubkey = secret.public_key();
+    // Construct data the way sign_cert_with does it.
+    let expiration = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        + 3600;
+    let x25519_pub = [0x42u8; 32];
+    let mut data = Vec::with_capacity(32 + 4 + 8 + 32);
+    data.extend_from_slice(network_id.as_bytes());
+    data.extend_from_slice(&(EnvelopeType::Auth as i32).to_be_bytes());
+    data.extend_from_slice(&expiration.to_be_bytes());
+    data.extend_from_slice(&x25519_pub);
+    let hash = Hash256::hash(&data);
+    let sig = secret.sign(hash.as_bytes());
+    pubkey
+        .verify(hash.as_bytes(), &sig)
+        .expect("signature must verify");
+    // 4. Verify using the same path that AuthCertExt::verify uses.
+    let cert = stellar_xdr::curr::AuthCert {
+        pubkey: stellar_xdr::curr::Curve25519Public { key: x25519_pub },
+        expiration,
+        sig: stellar_xdr::curr::Signature(sig.as_bytes().to_vec().try_into().unwrap()),
+    };
+    cert.verify(&network_id, &pubkey)
+        .expect("cert verify must succeed");
 }
