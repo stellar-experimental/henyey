@@ -1353,7 +1353,9 @@ mod tests {
             v_short.clone()
         ]));
         // Single element and empty are sorted-unique.
-        assert!(NominationProtocol::is_sorted_unique(&[v_short.clone()]));
+        assert!(NominationProtocol::is_sorted_unique(std::slice::from_ref(
+            &v_short
+        )));
         assert!(NominationProtocol::is_sorted_unique(&[]));
     }
 
@@ -3199,7 +3201,7 @@ mod tests {
         );
         // No record into latest_nominations (gate returns before record).
         assert!(
-            nom.latest_nominations.get(&node).is_none(),
+            !nom.latest_nominations.contains_key(&node),
             "non-sane self-statement must not be recorded"
         );
         // No promotion / state growth.
