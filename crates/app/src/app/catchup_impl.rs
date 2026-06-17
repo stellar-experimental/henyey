@@ -7362,7 +7362,7 @@ mod tests {
             .await;
 
         // Assert that set_trusted_scp_anchor was actually called with expected values.
-        let installed = app.last_installed_scp_anchor.lock().unwrap().clone();
+        let installed = *app.last_installed_scp_anchor.lock().unwrap();
         assert_eq!(
             installed,
             Some((target_ledger, expected_prev_hash)),
@@ -7426,7 +7426,7 @@ mod tests {
             .await;
 
         // The anchor must NOT have been installed for OfflineBasic.
-        let installed = app.last_installed_scp_anchor.lock().unwrap().clone();
+        let installed = *app.last_installed_scp_anchor.lock().unwrap();
         assert_eq!(
             installed, None,
             "Offline catchup must NOT call set_trusted_scp_anchor() even when \

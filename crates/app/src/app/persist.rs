@@ -741,16 +741,15 @@ mod tests {
             // Clone db for the write_fn closure (it receives &Database from
             // run_blocking, but we need our handle for assertions later).
             let db_for_write = db.clone();
-            let write_fn: Box<dyn FnOnce(&Database) -> anyhow::Result<()> + Send> =
-                Box::new(move |db| {
-                    use henyey_db::queries::*;
-                    db.with_connection(|conn| {
-                        conn.store_ledger_header(&header, &header_xdr)?;
-                        conn.set_last_closed_ledger(test_seq)?;
-                        Ok(())
-                    })
-                    .map_err(|e| anyhow::anyhow!(e))
-                });
+            let write_fn: PersistWriteFn = Box::new(move |db| {
+                use henyey_db::queries::*;
+                db.with_connection(|conn| {
+                    conn.store_ledger_header(&header, &header_xdr)?;
+                    conn.set_last_closed_ledger(test_seq)?;
+                    Ok(())
+                })
+                .map_err(|e| anyhow::anyhow!(e))
+            });
 
             let job = PersistJob::LedgerClose {
                 write_fn,

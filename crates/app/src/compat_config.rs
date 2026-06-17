@@ -3627,8 +3627,7 @@ NODE_SEED="SBXTJSLKQ2VZUEQNYU5EC6ZGQOONCX3JCFBK57R56YLYMUW76B2FMCJH self"
 
     #[test]
     fn test_translate_surveyor_keys() {
-        let cfg = format!(
-            r#"
+        let cfg = r#"
             NETWORK_PASSPHRASE = "Test SDF Network ; September 2015"
             DATABASE = "sqlite3:///tmp/stellar-core.db"
             UNSAFE_QUORUM = true
@@ -3637,7 +3636,7 @@ NODE_SEED="SBXTJSLKQ2VZUEQNYU5EC6ZGQOONCX3JCFBK57R56YLYMUW76B2FMCJH self"
                 "GCGB2S2KBER5MNQNJTNF5N3Y4PEPFMHONPIGXNOYIREMYCMJZ3GAVDXQ"
             ]
             "#
-        );
+        .to_string();
         let app_config = translate(&cfg).unwrap();
         assert_eq!(app_config.overlay.surveyor_keys.len(), 2);
         assert_eq!(
@@ -3652,28 +3651,26 @@ NODE_SEED="SBXTJSLKQ2VZUEQNYU5EC6ZGQOONCX3JCFBK57R56YLYMUW76B2FMCJH self"
 
     #[test]
     fn test_translate_surveyor_keys_empty() {
-        let cfg = format!(
-            r#"
+        let cfg = r#"
             NETWORK_PASSPHRASE = "Test SDF Network ; September 2015"
             DATABASE = "sqlite3:///tmp/stellar-core.db"
             UNSAFE_QUORUM = true
             SURVEYOR_KEYS = []
             "#
-        );
+        .to_string();
         let app_config = translate(&cfg).unwrap();
         assert!(app_config.overlay.surveyor_keys.is_empty());
     }
 
     #[test]
     fn test_translate_surveyor_keys_rejects_non_string() {
-        let cfg = format!(
-            r#"
+        let cfg = r#"
             NETWORK_PASSPHRASE = "Test SDF Network ; September 2015"
             DATABASE = "sqlite3:///tmp/stellar-core.db"
             UNSAFE_QUORUM = true
             SURVEYOR_KEYS = ["GDEX3JU2AUGVPQFGFKMEOGHEUQ4YGRIYDJIKQSC7QLHAJ4RV63MJKGAS", 42]
             "#
-        );
+        .to_string();
         let err = translate(&cfg).unwrap_err();
         assert!(
             err.to_string().contains("SURVEYOR_KEYS[1]"),
@@ -3684,14 +3681,13 @@ NODE_SEED="SBXTJSLKQ2VZUEQNYU5EC6ZGQOONCX3JCFBK57R56YLYMUW76B2FMCJH self"
 
     #[test]
     fn test_translate_surveyor_keys_rejects_non_array() {
-        let cfg = format!(
-            r#"
+        let cfg = r#"
             NETWORK_PASSPHRASE = "Test SDF Network ; September 2015"
             DATABASE = "sqlite3:///tmp/stellar-core.db"
             UNSAFE_QUORUM = true
             SURVEYOR_KEYS = "GDEX3JU2AUGVPQFGFKMEOGHEUQ4YGRIYDJIKQSC7QLHAJ4RV63MJKGAS"
             "#
-        );
+        .to_string();
         let err = translate(&cfg).unwrap_err();
         assert!(
             err.to_string().contains("SURVEYOR_KEYS: expected array"),
@@ -3702,8 +3698,7 @@ NODE_SEED="SBXTJSLKQ2VZUEQNYU5EC6ZGQOONCX3JCFBK57R56YLYMUW76B2FMCJH self"
 
     #[test]
     fn test_translate_preferred_peer_keys() {
-        let cfg = format!(
-            r#"
+        let cfg = r#"
             NETWORK_PASSPHRASE = "Test SDF Network ; September 2015"
             DATABASE = "sqlite3:///tmp/core.db"
             HTTP_PORT = 11626
@@ -3714,7 +3709,7 @@ NODE_SEED="SBXTJSLKQ2VZUEQNYU5EC6ZGQOONCX3JCFBK57R56YLYMUW76B2FMCJH self"
             ]
             PREFERRED_PEERS_ONLY = true
             "#
-        );
+        .to_string();
         let config = translate(&cfg).unwrap();
         assert_eq!(config.overlay.preferred_peer_keys.len(), 2);
         assert!(config
@@ -3730,15 +3725,14 @@ NODE_SEED="SBXTJSLKQ2VZUEQNYU5EC6ZGQOONCX3JCFBK57R56YLYMUW76B2FMCJH self"
 
     #[test]
     fn test_translate_preferred_peer_keys_invalid_element() {
-        let cfg = format!(
-            r#"
+        let cfg = r#"
             NETWORK_PASSPHRASE = "Test SDF Network ; September 2015"
             DATABASE = "sqlite3:///tmp/core.db"
             HTTP_PORT = 11626
             UNSAFE_QUORUM = true
             PREFERRED_PEER_KEYS = ["valid-string", 42]
             "#
-        );
+        .to_string();
         let err = translate(&cfg).unwrap_err();
         assert!(
             err.to_string().contains("PREFERRED_PEER_KEYS[1]"),
@@ -3749,15 +3743,14 @@ NODE_SEED="SBXTJSLKQ2VZUEQNYU5EC6ZGQOONCX3JCFBK57R56YLYMUW76B2FMCJH self"
 
     #[test]
     fn test_translate_preferred_peers_only_wrong_type() {
-        let cfg = format!(
-            r#"
+        let cfg = r#"
             NETWORK_PASSPHRASE = "Test SDF Network ; September 2015"
             DATABASE = "sqlite3:///tmp/core.db"
             HTTP_PORT = 11626
             UNSAFE_QUORUM = true
             PREFERRED_PEERS_ONLY = "yes"
             "#
-        );
+        .to_string();
         let err = translate(&cfg).unwrap_err();
         assert!(
             err.to_string().contains("PREFERRED_PEERS_ONLY"),
@@ -3768,14 +3761,13 @@ NODE_SEED="SBXTJSLKQ2VZUEQNYU5EC6ZGQOONCX3JCFBK57R56YLYMUW76B2FMCJH self"
 
     #[test]
     fn test_translate_preferred_peers_only_default_false() {
-        let cfg = format!(
-            r#"
+        let cfg = r#"
             NETWORK_PASSPHRASE = "Test SDF Network ; September 2015"
             DATABASE = "sqlite3:///tmp/core.db"
             HTTP_PORT = 11626
             UNSAFE_QUORUM = true
             "#
-        );
+        .to_string();
         let config = translate(&cfg).unwrap();
         assert!(!config.overlay.preferred_peers_only);
         assert!(config.overlay.preferred_peer_keys.is_empty());
