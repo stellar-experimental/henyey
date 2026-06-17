@@ -85,8 +85,8 @@
 //! ```
 
 use stellar_xdr::curr::{
-    AccountEntry, AccountId, LedgerEntry, LedgerEntryChange, LedgerEntryChanges, LedgerKey,
-    TransactionMeta, TransactionResult,
+    AccountId, LedgerEntry, LedgerEntryChange, LedgerEntryChanges, LedgerKey, TransactionMeta,
+    TransactionResult,
 };
 
 use crate::error::TxError;
@@ -535,32 +535,6 @@ fn apply_before_ops_after(
     }
     delta.extend_from_changes(after)?;
     Ok(())
-}
-
-/// Apply fee-only for a failed transaction.
-pub fn apply_fee_only(
-    frame: &TransactionFrame,
-    delta: &mut TxChangeLog,
-    _source_account: &AccountEntry,
-) -> Result<()> {
-    let fee = frame.total_fee().as_i64();
-    delta.add_fee(fee);
-    Ok(())
-}
-
-/// Batch apply multiple transactions from history.
-pub fn apply_transaction_set_from_history(
-    transactions: Vec<(TransactionFrame, TransactionResult, TransactionMeta)>,
-    delta: &mut TxChangeLog,
-) -> Result<Vec<TxApplyResult>> {
-    let mut results = Vec::with_capacity(transactions.len());
-
-    for (frame, result, meta) in transactions {
-        let apply_result = apply_from_history(&frame, &result, meta, delta)?;
-        results.push(apply_result);
-    }
-
-    Ok(results)
 }
 
 #[cfg(test)]

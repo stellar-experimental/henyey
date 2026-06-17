@@ -36,7 +36,6 @@ flowchart TD
 | Type | Description |
 |------|-------------|
 | `TransactionFrame` | Unified wrapper for V0, V1, and fee-bump envelopes, with hash, fee, precondition, and resource helpers. |
-| `TransactionValidator` | High-level convenience API for basic or account-aware validation. |
 | `LedgerContext` | Ledger-level inputs used during validation and execution, including network ID and protocol version. |
 | `LiveExecutionContext` | Mutable live-apply context containing ledger state and fee-pool accounting. |
 | `LedgerStateManager` | In-memory execution state with per-operation savepoints and delta tracking. |
@@ -52,22 +51,6 @@ flowchart TD
 | `SorobanExecutionResult` | Return value, storage changes, events, and resource usage from host execution. |
 
 ## Usage
-
-Validate an envelope against ledger context:
-
-```rust
-use henyey_tx::{TransactionValidator, ValidationResult};
-use stellar_xdr::curr::TransactionEnvelope;
-
-let envelope: TransactionEnvelope = todo!();
-let validator = TransactionValidator::testnet(10_000, 1_700_000_000);
-
-match validator.validate(&envelope) {
-    ValidationResult::Valid => {}
-    ValidationResult::InsufficientFee => {}
-    other => panic!("unexpected validation result: {other:?}"),
-}
-```
 
 Set up live execution state for transaction application phases:
 

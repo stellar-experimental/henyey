@@ -254,9 +254,6 @@ impl LedgerContext {
 /// Each variant provides specific information about why validation failed,
 /// including the expected vs actual values where applicable. This enables
 /// detailed error reporting and debugging.
-///
-/// These errors can be converted to [`ValidationResult`](crate::ValidationResult)
-/// for simplified handling via the `From` trait implementation.
 #[derive(Debug, Clone)]
 pub enum ValidationError {
     /// Transaction envelope has invalid structure or missing required fields.
