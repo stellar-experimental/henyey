@@ -19,12 +19,6 @@ use crate::{Invariant, OperationDelta};
 
 pub struct SponsorshipCountIsValid;
 
-impl SponsorshipCountIsValid {
-    pub fn new() -> Self {
-        Self
-    }
-}
-
 /// Get the multiplier for sponsorship counting.
 /// Accounts count as 2 (account + base reserve), pool share trustlines as 2,
 /// claimable balances as claimant count, others as 1.

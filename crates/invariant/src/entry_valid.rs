@@ -21,12 +21,6 @@ use crate::{Invariant, OperationDelta};
 
 pub struct LedgerEntryIsValid;
 
-impl LedgerEntryIsValid {
-    pub fn new() -> Self {
-        Self
-    }
-}
-
 impl Invariant for LedgerEntryIsValid {
     fn name(&self) -> &str {
         "LedgerEntryIsValid"
