@@ -484,31 +484,28 @@ mod loadgen_runner {
         }
 
         #[test]
-        fn test_soroban_invoke_apply_load_is_unsupported_referencing_3309() {
-            // parse_mode must NOT accept it (distinct from a recognized mode)…
+        fn test_parse_mode_soroban_invoke_apply_load_now_supported() {
+            // #3309: the mode is now implemented — parse_mode resolves it to the
+            // real `SorobanInvokeApplyLoad` variant (the #3297 sentinel that
+            // returned `None` + an "unsupported" message is gone).
             assert_eq!(
                 SimulationLoadGenRunner::parse_mode("soroban_invoke_apply_load"),
-                None
+                Some(LoadGenMode::SorobanInvokeApplyLoad)
             );
-            // …and the explicit unsupported sentinel must reference #3309.
-            let msg = SimulationLoadGenRunner::unsupported_mode("soroban_invoke_apply_load")
-                .expect("apply-load must return an explicit unsupported message");
+            assert_eq!(
+                SimulationLoadGenRunner::parse_mode("sorobaninvokeapplyload"),
+                Some(LoadGenMode::SorobanInvokeApplyLoad)
+            );
+            // Case-insensitive.
+            assert_eq!(
+                SimulationLoadGenRunner::parse_mode("SOROBAN_INVOKE_APPLY_LOAD"),
+                Some(LoadGenMode::SorobanInvokeApplyLoad)
+            );
+            // The #3309 unsupported sentinel must no longer flag it.
             assert!(
-                msg.contains("3309"),
-                "unsupported message must reference follow-up issue #3309, got: {msg}"
+                SimulationLoadGenRunner::unsupported_mode("soroban_invoke_apply_load").is_none()
             );
-            assert!(
-                msg.to_ascii_lowercase().contains("unsupported"),
-                "message should say it is unsupported"
-            );
-            // Case-insensitive + camelCase alias.
-            assert!(
-                SimulationLoadGenRunner::unsupported_mode("SOROBAN_INVOKE_APPLY_LOAD").is_some()
-            );
-            assert!(SimulationLoadGenRunner::unsupported_mode("sorobaninvokeapplyload").is_some());
-            // Other modes are not flagged unsupported.
-            assert!(SimulationLoadGenRunner::unsupported_mode("pay").is_none());
-            assert!(SimulationLoadGenRunner::unsupported_mode("create_upgrade").is_none());
+            assert!(SimulationLoadGenRunner::unsupported_mode("sorobaninvokeapplyload").is_none());
         }
 
         #[test]

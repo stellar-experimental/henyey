@@ -1903,6 +1903,74 @@ mod tests {
         assert_eq!(config.mode, LoadGenMode::Pay);
     }
 
+    /// #3309: the new apply-load mode classifies as soroban + load + invoke
+    /// (it reads `contract_instances` exactly like `SorobanInvoke`).
+    #[test]
+    fn test_apply_load_mode_predicates() {
+        let m = LoadGenMode::SorobanInvokeApplyLoad;
+        assert!(m.is_soroban());
+        assert!(m.is_load());
+        assert!(m.mode_invokes());
+        assert!(!m.is_soroban_setup());
+        assert!(!m.mode_sets_up_invoke());
+    }
+
+    /// #3309 config surface: defaults mirror stellar-core Config.h
+    /// (batch=1000, simulated=1000, entry_size=0, empty distributions) and
+    /// `data_entry_size` rounds up to a multiple of 4 (Config.cpp:1608).
+    #[test]
+    fn test_apply_load_config_defaults_and_parse() {
+        let c = LoadGenApplyLoadConfig::default();
+        assert_eq!(c.bl_batch_size, 1000);
+        assert_eq!(c.bl_simulated_ledgers, 1000);
+        assert_eq!(c.data_entry_size, 0);
+        assert!(c.num_rw_entries.0.is_empty());
+        assert!(c.num_disk_read_entries.0.is_empty());
+        assert!(c.tx_size_bytes.0.is_empty());
+        assert!(c.event_count.0.is_empty());
+        assert!(c.instructions.0.is_empty());
+
+        // data_entry_count = batch * simulated.
+        assert_eq!(c.data_entry_count(), 1_000_000);
+
+        // round_data_entry_size rounds up to a multiple of 4.
+        assert_eq!(LoadGenApplyLoadConfig::round_data_entry_size(0), 0);
+        assert_eq!(LoadGenApplyLoadConfig::round_data_entry_size(1), 4);
+        assert_eq!(LoadGenApplyLoadConfig::round_data_entry_size(4), 4);
+        assert_eq!(LoadGenApplyLoadConfig::round_data_entry_size(5), 8);
+        assert_eq!(LoadGenApplyLoadConfig::round_data_entry_size(7), 8);
+
+        // GeneratedLoadConfig embeds it and defaults overlay_only_mode = false.
+        let g = GeneratedLoadConfig::default();
+        assert!(!g.overlay_only_mode);
+        assert_eq!(g.apply_load.bl_batch_size, 1000);
+    }
+
+    /// Overlay-only gate (LoadGenerator.cpp:293): `SorobanInvokeApplyLoad`
+    /// requires overlay-only mode; all other modes are unaffected.
+    #[test]
+    fn test_loadgen_apply_load_requires_overlay_only() {
+        // gate fails (must reset+error) when apply-load mode + flag false.
+        assert!(LoadGenerator::apply_load_overlay_gate_fails(
+            LoadGenMode::SorobanInvokeApplyLoad,
+            false
+        ));
+        // passes when overlay-only mode is on.
+        assert!(!LoadGenerator::apply_load_overlay_gate_fails(
+            LoadGenMode::SorobanInvokeApplyLoad,
+            true
+        ));
+        // other modes never gated.
+        assert!(!LoadGenerator::apply_load_overlay_gate_fails(
+            LoadGenMode::Pay,
+            false
+        ));
+        assert!(!LoadGenerator::apply_load_overlay_gate_fails(
+            LoadGenMode::SorobanInvoke,
+            false
+        ));
+    }
+
     #[test]
     fn test_stop_signal_contract() {
         // Validates that generate_load accepts &AtomicBool and the type is
