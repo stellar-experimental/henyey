@@ -250,9 +250,9 @@ mod tests {
     #[test]
     fn test_bounded_range_excludes_oversized_second_row() {
         let conn = setup_db();
-        conn.store_ledger_close_meta(100, &vec![0u8; 100]).unwrap();
+        conn.store_ledger_close_meta(100, &[0u8; 100]).unwrap();
         conn.store_ledger_close_meta(101, &vec![1u8; 5000]).unwrap();
-        conn.store_ledger_close_meta(102, &vec![2u8; 100]).unwrap();
+        conn.store_ledger_close_meta(102, &[2u8; 100]).unwrap();
 
         // Budget of 200 → first row (100 B) included, second (5000 B) excluded.
         let results = conn
