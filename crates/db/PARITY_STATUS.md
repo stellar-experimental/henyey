@@ -10,7 +10,7 @@
 | Area | Status | Notes |
 |------|--------|-------|
 | Connection pool and initialization | Full | r2d2/rusqlite covers open, pool, schema bootstrap |
-| Schema migrations | Full | Independent SQLite schema versioning through v8 |
+| Schema migrations | Full | Independent SQLite schema versioning through v10 (post-v8 index migrations: 8→9 `events_topic1_id`, 9→10 `txhistory_status_ledger`) |
 | Persistent state (`storestate`) | Full | Key-value reads, writes, deletes, and LCL helpers |
 | Ledger header storage | Full | Store/load/hash/stream/delete + field validation matching `LedgerHeaderUtils::isValid()` |
 | Transaction history storage | Full | Tx rows, txsets, txresults, range queries, cleanup |
@@ -134,7 +134,7 @@ Corresponds to: `PeerManager.h` SQL subset
 | `PeerManager::ensureExists()` | `PeerQueries::store_peer()` | Full |
 | `PeerManager::load()` | `PeerQueries::load_peer()` | Full |
 | `PeerManager::store()` | `PeerQueries::store_peer()` | Full |
-| `PeerManager::loadRandomPeers()` | `load_random_peers()` and specialized variants | Full |
+| `PeerManager::loadRandomPeers()` | `query_random_peers()` | Full |
 | `PeerManager::removePeersWithManyFailures()` | `remove_peers_with_failures()` | Full |
 | `PeerManager::getPeersToSend()` | Random-peer query helpers | Full |
 | `PeerManager::loadAllPeers()` | `load_peers(None)` | Full |
@@ -177,7 +177,6 @@ Features excluded by design. These are NOT counted against parity %.
 | `PersistentState::createMisc()`, `PersistentState::setMiscState()` | No separate misc database |
 | `shouldRebuildForOfferTable()`, `clearRebuildForOfferTable()`, `setRebuildForOfferTable()` | Offer-table rebuild flow is not modeled in Rust DB state |
 | `dropTxMetaIfExists()` | No separate legacy txmeta table exists in the Rust schema |
-| `LedgerHeaderUtils::getFlags()`, `LedgerHeaderUtils::isValid()` | Validation belongs in ledger logic, not the DB crate |
 | `PeerManager::update()` (type/backoff logic) | Higher-level peer heuristics live in the overlay crate, not in DB |
 | `PeerManager::countPeers()` | Not needed; peer loading handles limits directly |
 
@@ -210,7 +209,7 @@ Features not yet implemented. These ARE counted against parity %.
 
 4. **Schema versioning**
    - **stellar-core**: Main schema version 28 plus misc schema version 2.
-   - **Rust**: Independent schema version 8 with fresh-schema assumptions.
+   - **Rust**: Independent schema version 10 with fresh-schema assumptions.
    - **Rationale**: The Rust node does not preserve legacy upgrade history from older stellar-core releases.
 
 5. **SCP recovery tables**
