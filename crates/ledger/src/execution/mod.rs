@@ -4397,7 +4397,7 @@ mod tests {
         assert!(executor.hot_archive_restored_keys().contains(&key2));
 
         // Duplicate record is idempotent.
-        executor.record_hot_archive_restores(&[key1.clone()]);
+        executor.record_hot_archive_restores(std::slice::from_ref(&key1));
         assert_eq!(executor.hot_archive_restored_keys().len(), 2);
 
         // advance_to_ledger clears the set.
@@ -4437,7 +4437,7 @@ mod tests {
         });
 
         // Record one key from "this cluster's" work.
-        executor.record_hot_archive_restores(&[key1.clone()]);
+        executor.record_hot_archive_restores(std::slice::from_ref(&key1));
 
         // Seed from prior stage with a different key.
         let mut prior_keys = std::collections::HashSet::new();
