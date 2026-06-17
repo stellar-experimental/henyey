@@ -242,7 +242,6 @@ Features not yet implemented. These ARE counted against parity %.
 - No Rust test covers the upstream SQLite MVCC scenario from `DatabaseTests.cpp`.
 - No direct unit test covers the missing `getNodeQuorumSet()` parity gap.
 - `ban.rs` has no dedicated unit tests (functionality exercised through integration tests).
-- `delete_old_tx_set_data()` remains effectively untested because it is currently a no-op.
 
 ## Parity Calculation
 

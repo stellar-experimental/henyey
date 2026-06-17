@@ -19,7 +19,8 @@ use crate::error::DbError;
 pub trait PublishQueueQueries {
     /// Adds a checkpoint ledger to the publish queue.
     ///
-    /// This is a no-op if the ledger is already in the queue.
+    /// First-write-wins: this is a no-op if the ledger is already in the
+    /// queue, leaving the existing row (and its stored HAS JSON) untouched.
     /// The `has_json` parameter stores the History Archive State JSON
     /// captured at checkpoint time, ensuring the publish path uses the
     /// exact HAS (including hot archive bucket hashes) from the
@@ -74,10 +75,13 @@ pub trait PublishQueueQueries {
 
 impl PublishQueueQueries for Connection {
     fn enqueue_publish(&self, ledger_seq: u32, has_json: &str) -> Result<(), DbError> {
+        // `INSERT OR IGNORE` makes the first-write-wins contract explicit: on a
+        // `ledgerseq` primary-key conflict the new row is ignored, leaving the
+        // existing entry intact. This intentionally swallows the PK conflict for
+        // idempotency. All callers always pass a non-null `has_json`, so the
+        // `state NOT NULL` constraint is never at risk.
         self.execute(
-            "INSERT INTO publishqueue (ledgerseq, state) VALUES (?1, ?2) \
-             ON CONFLICT(ledgerseq) DO UPDATE SET state = excluded.state \
-             WHERE publishqueue.state = 'pending'",
+            "INSERT OR IGNORE INTO publishqueue (ledgerseq, state) VALUES (?1, ?2)",
             params![ledger_seq as i64, has_json],
         )?;
         Ok(())
@@ -128,9 +132,7 @@ impl PublishQueueQueries for Connection {
     }
 
     fn load_all_publish_has(&self) -> Result<Vec<String>, DbError> {
-        let mut stmt = self.prepare(
-            "SELECT state FROM publishqueue WHERE state != 'pending' ORDER BY ledgerseq ASC",
-        )?;
+        let mut stmt = self.prepare("SELECT state FROM publishqueue ORDER BY ledgerseq ASC")?;
         let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(DbError::from)
@@ -159,7 +161,14 @@ mod tests {
     }
 
     #[test]
-    fn test_enqueue_publish_overwrites_existing_legacy_state() {
+    fn test_enqueue_publish_does_not_overwrite_existing_row() {
+        // First-write-wins: an existing row for a `ledgerseq` is never
+        // overwritten by a subsequent enqueue, even if the pre-existing row
+        // holds a legacy value (e.g. the old `'pending'` sentinel that this
+        // crate no longer writes). The `INSERT OR IGNORE` ignores the PK
+        // conflict and leaves the existing row intact. This pins the removal
+        // of the old `WHERE state = 'pending'` UPDATE branch — under that
+        // branch this row WOULD have been overwritten.
         let conn = setup_db();
 
         conn.execute(
@@ -172,7 +181,7 @@ mod tests {
         conn.enqueue_publish(63, has_json).unwrap();
 
         let stored = conn.load_publish_has(63).unwrap().unwrap();
-        assert_eq!(stored, has_json);
+        assert_eq!(stored, "pending");
     }
 
     #[test]
@@ -187,6 +196,23 @@ mod tests {
 
         let stored = conn.load_publish_has(63).unwrap().unwrap();
         assert_eq!(stored, first_has);
+    }
+
+    #[test]
+    fn test_load_all_publish_has_returns_all_rows() {
+        // Pins the removal of the dead `WHERE state != 'pending'` filter:
+        // every enqueued HAS row is returned, in ascending ledgerseq order.
+        let conn = setup_db();
+
+        let has_63 = r#"{"version":2,"currentLedger":63}"#;
+        let has_127 = r#"{"version":2,"currentLedger":127}"#;
+
+        // Insert out of order to confirm the ORDER BY is honored.
+        conn.enqueue_publish(127, has_127).unwrap();
+        conn.enqueue_publish(63, has_63).unwrap();
+
+        let all = conn.load_all_publish_has().unwrap();
+        assert_eq!(all, vec![has_63.to_string(), has_127.to_string()]);
     }
 
     #[test]
