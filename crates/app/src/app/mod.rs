@@ -3230,7 +3230,7 @@ impl App {
     }
 
     /// Overlay connection breakdown by direction and state.
-    pub async fn overlay_connection_breakdown(
+    pub(crate) async fn overlay_connection_breakdown(
         &self,
     ) -> Option<crate::app::types::ConnectionBreakdown> {
         let overlay = self.overlay.read().await;
@@ -3246,7 +3246,7 @@ impl App {
     }
 
     /// Quorum health summary (None when not tracking).
-    pub fn quorum_health(&self) -> Option<crate::app::types::QuorumHealthMetrics> {
+    pub(crate) fn quorum_health(&self) -> Option<crate::app::types::QuorumHealthMetrics> {
         let (agree, missing, disagree, fail_at, delayed) = self.herder.quorum_health()?;
         Some(crate::app::types::QuorumHealthMetrics {
             agree,
@@ -3271,7 +3271,7 @@ impl App {
     }
 
     /// SCP timing for the most recently externalized slot.
-    pub fn scp_timing(&self) -> Option<crate::app::types::ScpTimingMetrics> {
+    pub(crate) fn scp_timing(&self) -> Option<crate::app::types::ScpTimingMetrics> {
         let snapshot = self.herder.scp_timing()?;
         Some(crate::app::types::ScpTimingMetrics {
             externalize_duration_secs: Some(snapshot.externalize_duration.as_secs_f64()),
