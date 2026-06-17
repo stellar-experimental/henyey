@@ -11,7 +11,7 @@ use crate::{BucketError, Result};
 
 #[derive(Debug)]
 #[allow(dead_code)]
-pub struct Record<'a> {
+pub(crate) struct Record<'a> {
     pub(crate) offset: u64,
     pub(crate) mark_bytes: [u8; 4],
     pub(crate) declared_len: usize,
@@ -21,7 +21,7 @@ pub struct Record<'a> {
 
 #[derive(Debug)]
 #[allow(dead_code)]
-pub struct SliceRecord<'a> {
+pub(crate) struct SliceRecord<'a> {
     pub(crate) offset: usize,
     pub(crate) mark_bytes: [u8; 4],
     pub(crate) declared_len: usize,
