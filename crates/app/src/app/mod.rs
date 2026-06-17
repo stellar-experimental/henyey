@@ -13215,11 +13215,13 @@ mod tests {
 
         // Arm the tracking timer.
         {
-            let guard = app.sync_recovery_handle.read();
-            let handle = guard
-                .as_ref()
-                .expect("handle should be set after start_sync_recovery");
-            handle.start_tracking().await;
+            // Clone the handle out of a temporary guard so no parking_lot
+            // guard is held across the `.await` (clippy::await_holding_lock).
+            let handle = app.sync_recovery_handle.read().clone();
+            handle
+                .expect("handle should be set after start_sync_recovery")
+                .start_tracking()
+                .await;
         }
         // Drain: let the manager process StartTracking and arm the deadline.
         tokio::task::yield_now().await;
@@ -13246,16 +13248,18 @@ mod tests {
             "on_out_of_sync_recovery() should set sync_recovery_pending"
         );
 
-        // Cleanup: shutdown the manager and await its task.
+        // Cleanup: shutdown the manager and await its task. Clone/take out of
+        // temporary guards so no parking_lot guard is held across the `.await`
+        // (clippy::await_holding_lock).
         {
-            let guard = app.sync_recovery_handle.read();
-            if let Some(handle) = guard.as_ref() {
+            let handle = app.sync_recovery_handle.read().clone();
+            if let Some(handle) = handle {
                 handle.shutdown().await;
             }
         }
         {
-            let mut guard = app.sync_recovery_task.write();
-            if let Some(task) = guard.take() {
+            let task = app.sync_recovery_task.write().take();
+            if let Some(task) = task {
                 let _ = task.await;
             }
         }
