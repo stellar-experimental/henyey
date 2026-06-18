@@ -1126,8 +1126,6 @@ pub struct LoadGenerator {
     contract_overhead_bytes: u64,
     /// Per-account contract instance assignments (rebuilt each `SorobanInvoke` run).
     contract_instances: BTreeMap<u64, ContractInstance>,
-    /// Number of WASM uploads completed in current setup run.
-    wasms_uploaded: u32,
 
     // --- PayPregenerated state ---
     /// Open reader over the pre-generated transactions file (persists position
@@ -1154,7 +1152,6 @@ impl LoadGenerator {
             contract_instance_keys: HashSet::new(),
             contract_overhead_bytes: 0,
             contract_instances: BTreeMap::new(),
-            wasms_uploaded: 0,
             preloaded_reader: None,
             curr_preloaded: 0,
         }
@@ -1603,7 +1600,6 @@ impl LoadGenerator {
                         let wasm_hash = SorobanTxBuilder::loadgen_wasm_hash();
                         self.code_key = Some(contract_code_key(&wasm_hash));
                         self.contract_overhead_bytes = wasm.len() as u64 + 160;
-                        self.wasms_uploaded += 1;
                         config.n_wasms = config.n_wasms.saturating_sub(1);
                     }
                     result
