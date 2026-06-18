@@ -147,64 +147,10 @@ impl fmt::Display for CheckedAmount {
     }
 }
 
-/// Checked wrapper for `u32` counter fields in consensus-critical code.
-///
-/// Covers: `num_sub_entries` and similar counters that must never underflow.
-///
-/// Like [`CheckedAmount`], this type does NOT implement arithmetic operator
-/// traits. Use `checked_add()` / `checked_sub()` explicitly.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct CheckedCounter(u32);
-
-impl CheckedCounter {
-    /// Create a new `CheckedCounter` from a raw `u32`.
-    pub fn new(value: u32) -> Self {
-        Self(value)
-    }
-
-    /// Extract the inner `u32` value.
-    pub fn value(self) -> u32 {
-        self.0
-    }
-
-    /// Checked addition. Returns `None` on overflow.
-    pub fn checked_add(self, rhs: u32) -> Option<Self> {
-        self.0.checked_add(rhs).map(Self)
-    }
-
-    /// Checked subtraction. Returns `None` on underflow.
-    pub fn checked_sub(self, rhs: u32) -> Option<Self> {
-        self.0.checked_sub(rhs).map(Self)
-    }
-
-    /// Returns true if the value is zero.
-    pub fn is_zero(self) -> bool {
-        self.0 == 0
-    }
-}
-
-impl From<u32> for CheckedCounter {
-    fn from(value: u32) -> Self {
-        Self(value)
-    }
-}
-
-impl From<CheckedCounter> for u32 {
-    fn from(counter: CheckedCounter) -> Self {
-        counter.0
-    }
-}
-
-impl fmt::Display for CheckedCounter {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
 // ── Consensus-critical arithmetic helpers ────────────────────────────────
 //
 // These operate on XDR types (AccountEntry, TrustLineEntry) using
-// CheckedAmount/CheckedCounter internally. Available to all crates that
+// CheckedAmount internally. Available to all crates that
 // depend on henyey-common.
 
 /// Extract liabilities from an account entry.
@@ -501,46 +447,6 @@ mod tests {
                 CheckedAmount::new(3),
             ]
         );
-    }
-
-    // ── CheckedCounter ──
-
-    #[test]
-    fn test_checked_counter_new_and_value() {
-        let c = CheckedCounter::new(5);
-        assert_eq!(c.value(), 5);
-        assert_eq!(u32::from(c), 5);
-    }
-
-    #[test]
-    fn test_checked_counter_checked_add() {
-        let c = CheckedCounter::new(10);
-        assert_eq!(c.checked_add(5), Some(CheckedCounter::new(15)));
-    }
-
-    #[test]
-    fn test_checked_counter_checked_add_overflow() {
-        let c = CheckedCounter::new(u32::MAX);
-        assert_eq!(c.checked_add(1), None);
-    }
-
-    #[test]
-    fn test_checked_counter_checked_sub() {
-        let c = CheckedCounter::new(10);
-        assert_eq!(c.checked_sub(5), Some(CheckedCounter::new(5)));
-        assert_eq!(c.checked_sub(10), Some(CheckedCounter::new(0)));
-    }
-
-    #[test]
-    fn test_checked_counter_checked_sub_underflow() {
-        let c = CheckedCounter::new(0);
-        assert_eq!(c.checked_sub(1), None);
-    }
-
-    #[test]
-    fn test_checked_counter_is_zero() {
-        assert!(CheckedCounter::new(0).is_zero());
-        assert!(!CheckedCounter::new(1).is_zero());
     }
 
     // ── BalanceError ──
