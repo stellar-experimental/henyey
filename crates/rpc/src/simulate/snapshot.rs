@@ -31,11 +31,6 @@ pub(crate) struct BucketListSnapshotSource {
     current_ledger: u32,
 }
 
-// Safety: BucketListSnapshotSource contains only owned, immutable data.
-// SearchableBucketListSnapshot holds cloned data from the bucket list.
-// It is safe to send across threads.
-unsafe impl Send for BucketListSnapshotSource {}
-
 impl BucketListSnapshotSource {
     pub(crate) fn new(snapshot: SearchableBucketListSnapshot, current_ledger: u32) -> Self {
         Self {
