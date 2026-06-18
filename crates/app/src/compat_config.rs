@@ -2360,7 +2360,7 @@ mod tests {
         assert!(config.is_compat_config);
     }
 
-    /// AC#2 of the first mixed-image Supercluster (SSC) mission (#3292): the
+    /// Config acceptance for the Henyey mixed-image Supercluster (SSC) mission: the
     /// mission-shaped, mixed-cluster `stellar-core.cfg` that SSC renders for a
     /// **henyey validator** node in a 4-node (1 henyey + 3 stellar-core)
     /// cluster must be accepted by henyey *without manual patching*.
@@ -2478,7 +2478,7 @@ mod tests {
         );
         for peer in &config.overlay.known_peers {
             assert!(
-                peer.host.contains("ssc-mission-3292") || peer.host.ends_with(".svc.cluster.local"),
+                peer.host.contains("ssc-henyey-mixed") || peer.host.ends_with(".svc.cluster.local"),
                 "known peer must be an in-cluster pod hostname, got {peer:?}"
             );
         }

@@ -257,12 +257,16 @@ mod tests {
                 "herder.pending.transactions": { "type": "counter", "count": 0 },
                 "ledger.ledger.version": { "type": "counter", "count": 0 },
                 "scp.value.valid": { "type": "meter", "count": 0 },
-                "scp.value.invalid": { "type": "meter", "count": 0 }
+                "scp.value.invalid": { "type": "meter", "count": 0 },
+                "scp.envelope.invalidsig": { "type": "counter", "count": 0 },
+                "history.publish.failure": { "type": "counter", "count": 0 },
+                "ledger.invariant.failure": { "type": "counter", "count": 0 },
+                "ledger.transaction.internal-error": { "type": "counter", "count": 0 }
             }
         });
 
         let metrics = value["metrics"].as_object().unwrap();
-        assert_eq!(metrics.len(), 9, "should have 9 metrics");
+        assert_eq!(metrics.len(), 13, "should have 13 metrics");
         for (name, metric) in metrics {
             assert!(
                 metric.get("type").is_some(),
@@ -388,8 +392,8 @@ mod tests {
         assert_eq!(invalid["event_type"], "value");
         assert_eq!(invalid["count"], 7, "scp.value.invalid count is real total");
 
-        // --- Shape preserved: all 9 metrics with type+count ---
-        assert_eq!(m.len(), 9, "should still emit 9 metrics");
+        // --- Shape preserved: all 13 metrics with type+count ---
+        assert_eq!(m.len(), 13, "should still emit 13 metrics");
         for (name, metric) in m {
             assert!(metric.get("type").is_some(), "{name} has type");
             assert!(metric.get("count").is_some(), "{name} has count");
@@ -443,8 +447,8 @@ mod tests {
             );
         }
 
-        // Shape contract: 9 metrics, all with type+count.
-        assert_eq!(m.len(), 9);
+        // Shape contract: 13 metrics, all with type+count.
+        assert_eq!(m.len(), 13);
         for (name, metric) in m {
             assert!(metric.get("type").is_some(), "{name} has type");
             assert!(metric.get("count").is_some(), "{name} has count");

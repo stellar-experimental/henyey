@@ -22,6 +22,24 @@ const BUSY_TIMEOUT_MS: u32 = 30_000;
 /// SQLite cache size in kibibytes (negative value = KiB for PRAGMA cache_size).
 const CACHE_SIZE_KIB: i32 = -64_000;
 
+/// Applies the per-connection SQLite PRAGMAs shared by the file-backed and
+/// in-memory open paths.
+///
+/// These are set via the pool's `with_init` callback so every pooled
+/// connection gets the same configuration. Note that `journal_mode` is
+/// database-level (persistent) and is therefore set once in [`Database::initialize`]
+/// rather than here.
+fn init_connection_pragmas(conn: &mut rusqlite::Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(&format!(
+        "PRAGMA busy_timeout = {};\
+         PRAGMA synchronous = FULL;\
+         PRAGMA foreign_keys = ON;\
+         PRAGMA cache_size = {};\
+         PRAGMA temp_store = MEMORY;",
+        BUSY_TIMEOUT_MS, CACHE_SIZE_KIB
+    ))
+}
+
 impl Database {
     /// Opens a database at the given path, creating it if necessary.
     ///
@@ -46,17 +64,8 @@ impl Database {
             }
         }
 
-        let manager = r2d2_sqlite::SqliteConnectionManager::file(path).with_init(|conn| {
-            conn.execute_batch(&format!(
-                "PRAGMA busy_timeout = {};\
-                 PRAGMA synchronous = FULL;\
-                 PRAGMA foreign_keys = ON;\
-                 PRAGMA cache_size = {};\
-                 PRAGMA temp_store = MEMORY;",
-                BUSY_TIMEOUT_MS, CACHE_SIZE_KIB
-            ))?;
-            Ok(())
-        });
+        let manager =
+            r2d2_sqlite::SqliteConnectionManager::file(path).with_init(init_connection_pragmas);
         let pool = r2d2::Pool::builder()
             .max_size(POOL_MAX_SIZE)
             .connection_timeout(std::time::Duration::from_secs(CONNECTION_TIMEOUT_SECS))
@@ -74,17 +83,8 @@ impl Database {
     /// persisted across restarts. The connection pool size is limited to 1
     /// since in-memory databases are connection-specific.
     pub fn open_in_memory() -> Result<Self> {
-        let manager = r2d2_sqlite::SqliteConnectionManager::memory().with_init(|conn| {
-            conn.execute_batch(&format!(
-                "PRAGMA busy_timeout = {};\
-                 PRAGMA synchronous = FULL;\
-                 PRAGMA foreign_keys = ON;\
-                 PRAGMA cache_size = {};\
-                 PRAGMA temp_store = MEMORY;",
-                BUSY_TIMEOUT_MS, CACHE_SIZE_KIB
-            ))?;
-            Ok(())
-        });
+        let manager =
+            r2d2_sqlite::SqliteConnectionManager::memory().with_init(init_connection_pragmas);
         let pool = r2d2::Pool::builder().max_size(1).build(manager)?;
 
         let db = Self { pool };
