@@ -136,7 +136,6 @@ pub mod fees;
 mod frame;
 pub mod frozen_keys;
 pub(crate) mod live_execution;
-pub(crate) mod lumen_reconciler;
 pub(crate) mod meta_builder;
 pub mod operations;
 mod result;
@@ -156,9 +155,6 @@ pub use events::{
     ClassicEventConfig, EventManagerHierarchy, OpEventManager, P23SacReconciler,
     SacReconciliationInfo, TxEventManager,
 };
-
-// Re-export lumen reconciler types
-pub use lumen_reconciler::{reconcile_events, LumenEventReconciler, ReconcilerConfig};
 
 // Re-export frame types
 pub use frame::{

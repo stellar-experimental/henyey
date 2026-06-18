@@ -16,7 +16,7 @@
 | Transaction Application | Full | Live execution + catchup modes |
 | Classic Operations (24) | Full | All operations implemented |
 | Soroban Operations (3) | Full | Via e2e_invoke API |
-| Event Emission | Full | SAC events, lumen reconciliation |
+| Event Emission | Full | SAC events |
 | Metadata Building | Full | V2/V3/V4 TransactionMeta; op meta gated on success |
 | Offer Exchange | Full | exchangeV10, pool exchange, price bounds |
 | Sponsorship Utils | Full | Inline in state.rs |
@@ -37,7 +37,7 @@
 | `MutableTransactionResult.h` / `.cpp` | `result.rs` | Full |
 | `TransactionMeta.h` / `.cpp` | `meta_builder.rs` | Full |
 | `EventManager.h` / `.cpp` | `events.rs` | Full |
-| `LumenEventReconciler.h` / `.cpp` | `lumen_reconciler.rs` | Full |
+| `LumenEventReconciler.h` / `.cpp` | N/A | Not implemented by design: pre-protocol-8 only (stellar-core gates on `protocolVersionIsBefore(V_8)`); henyey is protocol 24+ — not mirrored |
 | `OfferExchange.h` / `.cpp` | `operations/execute/offer_exchange.rs` | Full |
 | `OperationFrame.h` / `.cpp` | `operations/mod.rs`, `operations/execute/mod.rs` | Full |
 | `SignatureUtils.h` / `.cpp` | `signature_checker.rs`, `validation.rs` | Verify functions inline |
@@ -224,9 +224,9 @@ Corresponds to: `TransactionMeta.h`
 | V2/V3/V4 meta formats | `finalize()` | Full |
 | Change recording | `record_create/update/delete/restore()` | Full |
 
-### Event Emission (`events.rs`, `lumen_reconciler.rs`)
+### Event Emission (`events.rs`)
 
-Corresponds to: `EventManager.h`, `LumenEventReconciler.h`
+Corresponds to: `EventManager.h`
 
 | stellar-core | Rust | Status |
 |--------------|------|--------|
@@ -246,7 +246,7 @@ Corresponds to: `EventManager.h`, `LumenEventReconciler.h`
 | `eventsForClaimAtoms()` | `events_for_claim_atoms()` | Full |
 | `setEvents()` | `set_events()` | Full |
 | `newFeeEvent()` | `new_fee_event()` | Full |
-| `reconcileEvents()` | `reconcile_events()` | Full |
+| `reconcileEvents()` | N/A | Not mirrored — pre-protocol-8 only (intentional omission); henyey is protocol 24+ |
 | `Protocol23CorruptionEventReconciler` (`P23HotArchiveBug.cpp:456-615`) | `P23SacReconciler` (`events.rs`) | Full — issue #3126; observability-only SAC mint/burn backfill on p23 hot-archive auto-restore, gated on `BACKFILL_STELLAR_ASSET_EVENTS` (off by default), zero consensus-hash effect (events prepended to op-meta after the success preimage is hashed). Omits `hasReconciliationAmount`/`mReconciliationAmounts` (only feeds the unimplemented `EventsAreConsistentWithEntryDiffs` invariant) |
 | `getAssetFromEvent()` | Not needed (reconciliation uses different approach) | Full |
 | Muxed account handling | `make_muxed_account_address()` | Full |
@@ -576,7 +576,6 @@ Features not yet implemented. These ARE counted against parity %.
 | State management | - | 61 #[test] | Rust-only: savepoint, rollback, offer index |
 | Entry store | - | 45 #[test] | Rust-only: generic entry store |
 | Meta building | - | 20 #[test] | Rust-only: TransactionMeta construction |
-| Lumen reconciler | - | 17 #[test] | Rust-only: SAC event reconciliation |
 | Result tracking | - | 31 #[test] | Rust-only: MutableTransactionResult |
 | Live execution | - | 28 #[test] | Rust-only: fee/seq/refund flow |
 | History apply | - | 22 #[test] | Rust-only: catchup mode |
@@ -704,12 +703,12 @@ Both approaches ensure WASM compilation costs are NOT charged against transactio
 
 | Category | Count |
 |----------|-------|
-| Implemented (Full) | 202 |
+| Implemented (Full) | 201 |
 | Gaps (None + Partial) | 6 |
-| Intentional Omissions | 31 |
-| **Parity** | **202 / (202 + 6) = 97%** |
+| Intentional Omissions | 32 |
+| **Parity** | **201 / (201 + 6) = 97%** |
 
-Breakdown of the 202 implemented items:
+Breakdown of the 201 implemented items:
 - TransactionFrame accessors/methods: 29
 - Validation functions: 14
 - SignatureChecker functions: 10
@@ -727,7 +726,6 @@ Breakdown of the 202 implemented items:
 - Soroban integration components: 12
 - Order book index: 7
 - Savepoint/rollback: 7
-- LumenEventReconciler: 1
 - SignatureUtils (verify functions): 7
 - Frozen ledger keys (CAP-77): 5
 
