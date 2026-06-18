@@ -161,14 +161,29 @@ mod tests {
     }
 
     #[test]
-    fn test_enqueue_publish_does_not_overwrite_existing_row() {
-        // First-write-wins: an existing row for a `ledgerseq` is never
-        // overwritten by a subsequent enqueue, even if the pre-existing row
-        // holds a legacy value (e.g. the old `'pending'` sentinel that this
-        // crate no longer writes). The `INSERT OR IGNORE` ignores the PK
-        // conflict and leaves the existing row intact. This pins the removal
-        // of the old `WHERE state = 'pending'` UPDATE branch — under that
-        // branch this row WOULD have been overwritten.
+    fn test_enqueue_publish_last_write_wins() {
+        // Last-write-wins: re-enqueuing the same `ledgerseq` with a differing
+        // HAS overwrites the stored row. This mirrors stellar-core v26.0.1's
+        // `writeCheckpointFile` durable-rename onto a fixed per-seq path (an
+        // unconditional overwrite) and henyey-history's `INSERT OR REPLACE`.
+        let conn = setup_db();
+
+        let has_a = r#"{"version":2,"currentLedger":63,"marker":"A"}"#;
+        let has_b = r#"{"version":2,"currentLedger":63,"marker":"B"}"#;
+
+        conn.enqueue_publish(63, has_a).unwrap();
+        conn.enqueue_publish(63, has_b).unwrap();
+
+        let stored = conn.load_publish_has(63).unwrap().unwrap();
+        assert_eq!(stored, has_b);
+    }
+
+    #[test]
+    fn test_enqueue_publish_overwrites_legacy_pending_row() {
+        // Last-write-wins repairs legacy rows: a pre-existing `'pending'`
+        // sentinel row (which this crate no longer writes) is overwritten by a
+        // real HAS on re-enqueue. This matches the pre-#3390 `WHERE state =
+        // 'pending'` UPDATE branch and stellar-core's unconditional rename.
         let conn = setup_db();
 
         conn.execute(
@@ -181,21 +196,7 @@ mod tests {
         conn.enqueue_publish(63, has_json).unwrap();
 
         let stored = conn.load_publish_has(63).unwrap().unwrap();
-        assert_eq!(stored, "pending");
-    }
-
-    #[test]
-    fn test_enqueue_publish_keeps_existing_has_json() {
-        let conn = setup_db();
-
-        let first_has = r#"{"version":2,"currentLedger":63,"marker":"first"}"#;
-        let second_has = r#"{"version":2,"currentLedger":63,"marker":"second"}"#;
-
-        conn.enqueue_publish(63, first_has).unwrap();
-        conn.enqueue_publish(63, second_has).unwrap();
-
-        let stored = conn.load_publish_has(63).unwrap().unwrap();
-        assert_eq!(stored, first_has);
+        assert_eq!(stored, has_json);
     }
 
     #[test]
