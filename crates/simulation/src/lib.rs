@@ -604,16 +604,6 @@ impl Simulation {
         Ok(())
     }
 
-    /// Get the expected Unix timestamp (seconds) of the next ledger close for a node.
-    ///
-    /// Returns `tracking_consensus_close_time + ledger_close_duration.as_secs()`.
-    /// Matches stellar-core's expected close time calculation used in
-    /// various `crankUntil` calls.
-    pub fn expected_next_ledger_close_unix_secs(&self, node_id: &str) -> Option<u64> {
-        let app = self.running_apps.get(node_id)?;
-        Some(app.app.expected_next_ledger_close_unix_secs())
-    }
-
     pub async fn app_peer_count(&self, node_id: &str) -> Option<usize> {
         let app = self.running_apps.get(node_id)?;
         Some(app.app.peer_count().await)
