@@ -1022,7 +1022,7 @@ impl App {
                     _ = interval.tick() => {
                         let progress = get_progress(&state_monitor).await;
                         if progress.stage != last_stage || progress.message != last_message {
-                            last_stage = progress.stage.clone();
+                            last_stage = progress.stage;
                             last_message = progress.message.clone();
                             if let Some(stage) = progress.stage {
                                 tracing::info!(stage = ?stage, message = %progress.message, "Historywork progress");
