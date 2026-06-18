@@ -176,30 +176,6 @@ impl ValidationLevel {
     }
 }
 
-/// Callback interface for the SCP consensus protocol.
-///
-/// This trait is implemented by the application layer (typically the Herder)
-/// to connect SCP to the rest of the system. SCP is designed to be completely
-/// isolated from application logic, and all interactions happen through
-/// this trait.
-///
-/// # Thread Safety
-///
-/// Implementors must be `Send + Sync` as SCP may invoke callbacks from
-/// multiple contexts. Internal state should be protected appropriately.
-///
-/// # Callback Categories
-///
-/// The trait methods fall into several categories:
-///
-/// - **Validation**: [`validate_value`](Self::validate_value), [`extract_valid_value`](Self::extract_valid_value)
-/// - **Value Composition**: [`combine_candidates`](Self::combine_candidates)
-/// - **Quorum Set Lookup**: [`get_quorum_set`](Self::get_quorum_set), [`get_quorum_set_by_hash`](Self::get_quorum_set_by_hash)
-/// - **Cryptography**: [`sign_envelope`](Self::sign_envelope), [`verify_envelope`](Self::verify_envelope), [`hash_quorum_set`](Self::hash_quorum_set)
-/// - **Hash Computation**: [`compute_hash_node`](Self::compute_hash_node), [`compute_value_hash`](Self::compute_value_hash)
-/// - **Network**: [`emit_envelope`](Self::emit_envelope)
-/// - **Notifications**: [`nominating_value`](Self::nominating_value), [`value_externalized`](Self::value_externalized), etc.
-/// - **Timing**: [`compute_timeout`](Self::compute_timeout)
 /// Encode a value to its canonical XDR wire bytes.
 ///
 /// Module-private helper shared by the default [`SCPDriver::compute_hash_node`]
@@ -243,6 +219,30 @@ where
     result
 }
 
+/// Callback interface for the SCP consensus protocol.
+///
+/// This trait is implemented by the application layer (typically the Herder)
+/// to connect SCP to the rest of the system. SCP is designed to be completely
+/// isolated from application logic, and all interactions happen through
+/// this trait.
+///
+/// # Thread Safety
+///
+/// Implementors must be `Send + Sync` as SCP may invoke callbacks from
+/// multiple contexts. Internal state should be protected appropriately.
+///
+/// # Callback Categories
+///
+/// The trait methods fall into several categories:
+///
+/// - **Validation**: [`validate_value`](Self::validate_value), [`extract_valid_value`](Self::extract_valid_value)
+/// - **Value Composition**: [`combine_candidates`](Self::combine_candidates)
+/// - **Quorum Set Lookup**: [`get_quorum_set`](Self::get_quorum_set), [`get_quorum_set_by_hash`](Self::get_quorum_set_by_hash)
+/// - **Cryptography**: [`sign_envelope`](Self::sign_envelope), [`verify_envelope`](Self::verify_envelope), [`hash_quorum_set`](Self::hash_quorum_set)
+/// - **Hash Computation**: [`compute_hash_node`](Self::compute_hash_node), [`compute_value_hash`](Self::compute_value_hash)
+/// - **Network**: [`emit_envelope`](Self::emit_envelope)
+/// - **Notifications**: [`nominating_value`](Self::nominating_value), [`value_externalized`](Self::value_externalized), etc.
+/// - **Timing**: [`compute_timeout`](Self::compute_timeout)
 pub trait SCPDriver: Send + Sync {
     /// Validate a value.
     ///
