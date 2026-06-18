@@ -370,7 +370,7 @@ impl WorkScheduler {
     ///
     /// Each work item that is pending or running will be cancelled, and their
     /// dependents will be blocked.
-    pub fn cancel_all(&mut self) {
+    pub(crate) fn cancel_all(&mut self) {
         let ids: Vec<WorkId> = self.entries.keys().copied().collect();
         for id in ids {
             let _ = self.cancel(id);
