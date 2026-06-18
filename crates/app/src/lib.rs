@@ -69,17 +69,10 @@ pub mod run_cmd;
 pub mod survey;
 
 pub use app::bootstrap::initialize_genesis;
-pub use app::{
-    App, AppState, CatchupResult, CatchupTarget, FallbackCatchup, LedgerInfo, LedgerSummary,
-    RestoreResult, ScpSlotDebugStats, SimulationDebugStats, SurveyReport,
-};
+pub use app::{App, AppState, FallbackCatchup, LedgerSummary, RestoreResult, SimulationDebugStats};
 pub use catchup_cmd::{run_catchup, CatchupMode, CatchupOptions};
 pub use config::{AppConfig, BuildMetadata, MaintenanceAppConfig};
-pub use henyey_history::{CatchupConfiguration, CatchupRunMode};
-pub use logging::{init_with_handle, LogConfig, LogFormat, LogLevelHandle, LOG_PARTITIONS};
-pub use maintainer::{
-    Maintainer, MaintenanceConfig, DEFAULT_MAINTENANCE_COUNT, DEFAULT_MAINTENANCE_PERIOD,
-};
+pub use logging::{LogConfig, LogFormat};
 pub use run_cmd::{run_node, ExtraServerSpawner, RunMode, RunOptions};
 
 // Load generation support (feature-gated).
