@@ -189,7 +189,7 @@ type EventFilters = (EventTypeFilter, ContractIdFilters, TopicFilters);
 /// or an error if the value is present but not an array.
 fn validate_filters_field(
     val: Option<&serde_json::Value>,
-) -> Result<Option<&Vec<serde_json::Value>>, JsonRpcError> {
+) -> Result<Option<&[serde_json::Value]>, JsonRpcError> {
     match val {
         None => Ok(None),
         Some(v) if v.is_null() => Ok(None),
@@ -203,7 +203,7 @@ fn validate_filters_field(
 ///
 /// Returns `(event_type, contract_ids, topic_filters)`.
 fn parse_event_filters(
-    filters: Option<&Vec<serde_json::Value>>,
+    filters: Option<&[serde_json::Value]>,
 ) -> Result<EventFilters, JsonRpcError> {
     let mut event_type: Option<&'static str> = None;
     let mut contract_ids = Vec::new();
