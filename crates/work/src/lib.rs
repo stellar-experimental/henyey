@@ -88,7 +88,8 @@
 //! The scheduler supports cooperative cancellation. Work items should periodically
 //! check [`WorkContext::is_cancelled()`] and return [`WorkOutcome::Cancelled`] if
 //! cancellation is requested. The scheduler propagates cancellation to all
-//! registered work items when [`WorkScheduler::cancel_all()`] is called.
+//! registered work items when the `CancellationToken` passed to
+//! `run_until_done_with_cancel` fires.
 //!
 //! # Thread Safety
 //!
