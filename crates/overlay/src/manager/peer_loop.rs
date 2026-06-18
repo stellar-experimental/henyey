@@ -221,7 +221,10 @@ impl PeerRateLimiter {
                 TrafficClass::TxAndDemand => self.dropped_tx_demand += 1,
                 TrafficClass::Advert => self.dropped_advert += 1,
                 TrafficClass::ControlFetch => self.dropped_control_fetch += 1,
-                TrafficClass::Survey => self.dropped_aggregate += 1,
+                // Survey has no per-class drop counter (aggregate-only by
+                // design); the unconditional increment below records the
+                // single aggregate-cap drop, matching the other classes.
+                TrafficClass::Survey => {}
             }
             self.dropped_aggregate += 1;
             return false;
