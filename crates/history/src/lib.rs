@@ -75,7 +75,6 @@
 //! # Key Types
 //!
 //! - [`HistoryArchive`]: Client for accessing a single history archive
-//! - [`HistoryManager`]: Manages multiple archives with failover support
 //! - [`HistoryArchiveState`]: Parsed checkpoint metadata (HAS file)
 //! - [`CatchupManager`]: Orchestrates the full catchup process
 //! - [`ReplayConfig`]: Configuration for ledger replay and verification
@@ -204,160 +203,6 @@ pub struct ArchiveConfig {
     pub get_enabled: bool,
     /// Whether this archive can be used for publishing history data.
     pub put_enabled: bool,
-}
-
-/// Manager for multiple history archives with failover support.
-///
-/// The `HistoryManager` wraps multiple [`HistoryArchive`] instances and provides
-/// automatic failover: if one archive fails to respond, the manager tries the next
-/// archive in the list until one succeeds or all archives have been exhausted.
-///
-/// This is essential for reliable catchup since individual archives may be temporarily
-/// unavailable or have incomplete data.
-///
-/// # Example
-///
-/// ```no_run
-/// use henyey_history::{HistoryManager, archive::testnet};
-///
-/// # async fn example() -> Result<(), henyey_history::HistoryError> {
-/// let manager = HistoryManager::from_urls(testnet::ARCHIVE_URLS)?;
-///
-/// // Automatically tries each archive until one succeeds
-/// let has = manager.fetch_root_has().await?;
-/// println!("Network at ledger {}", has.current_ledger());
-/// # Ok(())
-/// # }
-/// ```
-pub struct HistoryManager {
-    archives: Vec<HistoryArchive>,
-}
-
-impl HistoryManager {
-    /// Create a new history manager with the given archives.
-    pub fn new(archives: Vec<HistoryArchive>) -> Self {
-        Self { archives }
-    }
-
-    /// Create a history manager from a list of URLs.
-    pub fn from_urls(urls: &[&str]) -> Result<Self> {
-        let archives: Result<Vec<_>> = urls.iter().map(|url| HistoryArchive::new(url)).collect();
-        Ok(Self::new(archives?))
-    }
-
-    /// Add an archive to the manager.
-    pub fn add_archive(&mut self, archive: HistoryArchive) {
-        self.archives.push(archive);
-    }
-
-    /// Get the number of archives.
-    pub fn archive_count(&self) -> usize {
-        self.archives.len()
-    }
-
-    /// Try an operation against each archive until one succeeds.
-    ///
-    /// On failure, logs a warning with the archive URL and the error,
-    /// then moves on to the next archive. Returns `fallback_err` if all
-    /// archives fail.
-    async fn try_archives<'a, F, T>(
-        &'a self,
-        op: F,
-        context: &str,
-        fallback_err: HistoryError,
-    ) -> Result<T>
-    where
-        F: Fn(
-            &'a HistoryArchive,
-        )
-            -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<T>> + Send + 'a>>,
-    {
-        for archive in &self.archives {
-            match op(archive).await {
-                Ok(value) => return Ok(value),
-                Err(e) => {
-                    tracing::warn!(
-                        url = %archive.base_url(),
-                        error = %e,
-                        "Failed to {} from archive", context,
-                    );
-                }
-            }
-        }
-        Err(fallback_err)
-    }
-
-    /// Get the root HAS from any available archive.
-    ///
-    /// Tries each archive in sequence until one succeeds.
-    pub async fn fetch_root_has(&self) -> Result<HistoryArchiveState> {
-        self.try_archives(
-            |a| Box::pin(a.fetch_root_has()),
-            "get HAS",
-            HistoryError::NoArchiveAvailable,
-        )
-        .await
-    }
-
-    /// Get the checkpoint HAS from any available archive.
-    pub async fn fetch_checkpoint_has(&self, ledger: u32) -> Result<HistoryArchiveState> {
-        self.try_archives(
-            |a| Box::pin(a.fetch_checkpoint_has(ledger)),
-            "get checkpoint HAS",
-            HistoryError::CheckpointNotFound(ledger),
-        )
-        .await
-    }
-
-    /// Download a bucket from any available archive.
-    pub async fn fetch_bucket(&self, hash: &henyey_common::Hash256) -> Result<Vec<u8>> {
-        let hash = *hash;
-        self.try_archives(
-            |a| Box::pin(a.fetch_bucket(&hash)),
-            "get bucket",
-            HistoryError::BucketNotFound(hash),
-        )
-        .await
-    }
-
-    /// Get ledger headers for a checkpoint from any available archive.
-    pub async fn fetch_ledger_headers(
-        &self,
-        checkpoint: u32,
-    ) -> Result<Vec<stellar_xdr::curr::LedgerHeaderHistoryEntry>> {
-        self.try_archives(
-            |a| Box::pin(a.fetch_ledger_headers(checkpoint)),
-            "get ledger headers",
-            HistoryError::CheckpointNotFound(checkpoint),
-        )
-        .await
-    }
-
-    /// Get transactions for a checkpoint from any available archive.
-    pub async fn fetch_transactions(
-        &self,
-        checkpoint: u32,
-    ) -> Result<Vec<stellar_xdr::curr::TransactionHistoryEntry>> {
-        self.try_archives(
-            |a| Box::pin(a.fetch_transactions(checkpoint)),
-            "get transactions",
-            HistoryError::CheckpointNotFound(checkpoint),
-        )
-        .await
-    }
-
-    /// Get transaction results for a checkpoint from any available archive.
-    pub async fn fetch_results(
-        &self,
-        checkpoint: u32,
-    ) -> Result<Vec<stellar_xdr::curr::TransactionHistoryResultEntry>> {
-        self.try_archives(
-            |a| Box::pin(a.fetch_results(checkpoint)),
-            "get transaction results",
-            HistoryError::CheckpointNotFound(checkpoint),
-        )
-        .await
-    }
 }
 
 /// Summary result of a successful catchup operation.
@@ -543,14 +388,6 @@ impl HistoryArchiveManager {
     pub fn get_archive(&self, name: &str) -> Result<&ArchiveEntry> {
         self.archives
             .iter()
-            .find(|a| a.name == name)
-            .ok_or_else(|| HistoryError::ArchiveNotFound(name.to_string()))
-    }
-
-    /// Get a mutable reference to an archive entry by name.
-    pub fn get_archive_mut(&mut self, name: &str) -> Result<&mut ArchiveEntry> {
-        self.archives
-            .iter_mut()
             .find(|a| a.name == name)
             .ok_or_else(|| HistoryError::ArchiveNotFound(name.to_string()))
     }

@@ -330,10 +330,8 @@ pub enum HistoryError {
     ///
     /// Replaces string-based [`VerificationFailed`](HistoryError::VerificationFailed)
     /// for hash comparison errors in [`crate::verify::verify_bucket_hash`],
-    /// [`crate::verify::verify_ledger_hash`],
     /// [`crate::verify::verify_ledger_header_history_entry`],
     /// [`crate::verify::verify_tx_result_set`],
-    /// [`crate::verify::verify_header_matches_trusted`],
     /// [`crate::verify::verify_chain_anchors`], and
     /// [`crate::replay::execution::verify_bucket_list_hash`].
     #[error("verification hash mismatch: {0}")]

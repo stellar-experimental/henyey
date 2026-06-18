@@ -476,35 +476,6 @@ pub fn verify_bucket_hash(data: &[u8], expected_hash: &Hash256) -> Result<()> {
     Ok(())
 }
 
-/// Verify that a ledger header's bucket list hash matches the expected value.
-///
-/// This verifies that the ledger state (represented by the BucketList) matches
-/// what the header claims.
-///
-/// # Arguments
-///
-/// * `header` - The ledger header to verify
-/// * `bucket_list_hash` - The computed hash of the BucketList
-///
-/// # Returns
-///
-/// Ok(()) if the hashes match, or an error if they don't.
-pub fn verify_ledger_hash(header: &LedgerHeader, bucket_list_hash: &Hash256) -> Result<()> {
-    let header_bucket_hash = Hash256::from(header.bucket_list_hash.clone());
-
-    if header_bucket_hash != *bucket_list_hash {
-        return Err(crate::error::VerifyHashMismatchInfo::log_and_new(
-            crate::error::VerifyHashKind::BucketList,
-            Some(header.ledger_seq),
-            header_bucket_hash,
-            *bucket_list_hash,
-        )
-        .into());
-    }
-
-    Ok(())
-}
-
 /// Compute the SHA-256 hash of a ledger header.
 ///
 /// This is the hash that gets stored in the next ledger's `previous_ledger_hash`.
@@ -640,55 +611,6 @@ pub fn verify_tx_set(header: &LedgerHeader, tx_set: &TransactionSetVariant) -> R
     }
 
     Ok(())
-}
-
-/// Verify that a header links correctly to a known trusted header.
-///
-/// This is used to verify headers downloaded from history against
-/// a header we received via SCP (which we trust).
-///
-/// # Arguments
-///
-/// * `downloaded_header` - Header downloaded from history archive
-/// * `trusted_header` - Header received via SCP consensus
-pub fn verify_header_matches_trusted(
-    downloaded_header: &LedgerHeader,
-    trusted_header: &LedgerHeader,
-) -> Result<()> {
-    if downloaded_header.ledger_seq != trusted_header.ledger_seq {
-        return Err(HistoryError::InvalidSequence {
-            expected: trusted_header.ledger_seq,
-            got: downloaded_header.ledger_seq,
-        });
-    }
-
-    let downloaded_hash = compute_header_hash(downloaded_header)?;
-    let trusted_hash = compute_header_hash(trusted_header)?;
-
-    if downloaded_hash != trusted_hash {
-        return Err(crate::error::VerifyHashMismatchInfo::log_and_new(
-            crate::error::VerifyHashKind::TrustedHeader,
-            Some(downloaded_header.ledger_seq),
-            trusted_hash,
-            downloaded_hash,
-        )
-        .into());
-    }
-
-    Ok(())
-}
-
-/// Result of verifying a complete catchup dataset.
-#[derive(Debug, Clone)]
-pub struct VerificationResult {
-    /// Number of headers verified.
-    pub headers_verified: u32,
-    /// Number of buckets verified.
-    pub buckets_verified: u32,
-    /// Number of ledgers verified.
-    pub ledgers_verified: u32,
-    /// The final ledger hash.
-    pub final_ledger_hash: Hash256,
 }
 
 /// Verify the HAS network passphrase matches the expected passphrase.
@@ -1559,26 +1481,6 @@ mod tests {
     }
 
     #[test]
-    fn test_verify_ledger_hash_mismatch_typed() {
-        let mut header = make_test_header(42, Hash256::ZERO);
-        // Set a bucket_list_hash that won't match the computed one.
-        header.bucket_list_hash = Hash([0xAA; 32]);
-        let computed_bucket_list_hash = Hash256::ZERO;
-
-        let err = verify_ledger_hash(&header, &computed_bucket_list_hash).unwrap_err();
-
-        match err {
-            HistoryError::VerificationHashMismatch(info) => {
-                assert_eq!(info.kind(), crate::error::VerifyHashKind::BucketList);
-                assert_eq!(info.ledger(), Some(42));
-                assert_eq!(info.expected(), Hash256::from(header.bucket_list_hash));
-                assert_eq!(info.actual(), computed_bucket_list_hash);
-            }
-            other => panic!("expected VerificationHashMismatch, got: {other}"),
-        }
-    }
-
-    #[test]
     fn test_verify_ledger_header_history_entry_mismatch_typed() {
         let header = make_test_header(100, Hash256::ZERO);
         let entry = LedgerHeaderHistoryEntry {
@@ -1626,34 +1528,6 @@ mod tests {
         let header = make_test_header(GENESIS_LEDGER_SEQ, Hash256::ZERO);
         // Empty result set at genesis should succeed regardless of hash.
         assert!(verify_tx_result_set(&header, &[]).is_ok());
-    }
-
-    #[test]
-    fn test_verify_header_matches_trusted_mismatch_typed() {
-        let downloaded = make_test_header(77, Hash256::ZERO);
-        // Trusted header with same seq but different content.
-        let mut trusted = make_test_header(77, Hash256::ZERO);
-        trusted.total_coins = 999; // Different content → different hash
-
-        let err = verify_header_matches_trusted(&downloaded, &trusted).unwrap_err();
-
-        match err {
-            HistoryError::VerificationHashMismatch(info) => {
-                assert_eq!(info.kind(), crate::error::VerifyHashKind::TrustedHeader);
-                assert_eq!(info.ledger(), Some(77));
-                let trusted_hash = compute_header_hash(&trusted).unwrap();
-                let downloaded_hash = compute_header_hash(&downloaded).unwrap();
-                assert_eq!(info.expected(), trusted_hash);
-                assert_eq!(info.actual(), downloaded_hash);
-            }
-            other => panic!("expected VerificationHashMismatch, got: {other}"),
-        }
-    }
-
-    #[test]
-    fn test_verify_header_matches_trusted_ok() {
-        let header = make_test_header(77, Hash256::ZERO);
-        assert!(verify_header_matches_trusted(&header, &header).is_ok());
     }
 
     // --- Precedence regression tests for verify_tx_result_ordering ---
