@@ -294,9 +294,9 @@ impl OpEventManager {
 
     /// Emit a mint event at the beginning of the event list.
     ///
-    /// This is used by the [`LumenEventReconciler`](crate::lumen_reconciler::LumenEventReconciler)
-    /// to insert synthetic mint events for pre-protocol 8 XLM reconciliation.
-    /// Inserting at the beginning ensures correct event ordering for historical replay.
+    /// Inserts a synthetic mint event at the front of the event list so it
+    /// precedes the operation's own events. Inserting at the beginning ensures
+    /// correct event ordering for historical replay.
     ///
     /// # Parameters
     ///
