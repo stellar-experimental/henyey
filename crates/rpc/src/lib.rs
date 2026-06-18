@@ -13,6 +13,5 @@ mod simulate;
 mod types;
 mod util;
 
-pub use context::{RpcAppHandle, RpcContext};
-pub use fee_window::FeeWindows;
+pub use context::RpcAppHandle;
 pub use server::{RpcServer, RpcServerRunning};
