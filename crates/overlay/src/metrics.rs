@@ -448,6 +448,13 @@ pub struct OverlayMetrics {
     /// Inbound connections rejected at any point after accept but before establish
     /// (handshake failure, banned, duplicate, slots full, register race).
     pub inbound_reject: Counter,
+    /// Monotonic count of inbound peers that transitioned to authenticated
+    /// (handshake completed + registered). Diagnostic for #3419: lets an
+    /// operator distinguish "never authenticated" (stays 0) from "authenticated
+    /// then churned" (climbs while the instantaneous
+    /// `stellar_overlay_inbound_authenticated` gauge stays near 0). Mirrors the
+    /// increment point of `inbound_establish`; observability-only.
+    pub inbound_authenticated_total: Counter,
     /// Outbound connection attempts: a dial was actually initiated (after the
     /// address reservation succeeded inside `connect_to_discovered_peer` /
     /// `connect_to_explicit_peer`). Does NOT include caller-side skips (e.g.,
@@ -572,6 +579,7 @@ impl OverlayMetrics {
             inbound_establish: self.inbound_establish.get(),
             inbound_drop: self.inbound_drop.get(),
             inbound_reject: self.inbound_reject.get(),
+            inbound_authenticated_total: self.inbound_authenticated_total.get(),
             outbound_attempt: self.outbound_attempt.get(),
             outbound_establish: self.outbound_establish.get(),
             outbound_drop: self.outbound_drop.get(),
@@ -647,6 +655,7 @@ impl OverlayMetrics {
             &self.inbound_establish,
             &self.inbound_drop,
             &self.inbound_reject,
+            &self.inbound_authenticated_total,
             &self.outbound_attempt,
             &self.outbound_establish,
             &self.outbound_drop,
@@ -711,6 +720,8 @@ pub struct OverlayMetricsSnapshot {
     pub inbound_establish: u64,
     pub inbound_drop: u64,
     pub inbound_reject: u64,
+    /// Monotonic count of inbound peers that reached authenticated state (#3419).
+    pub inbound_authenticated_total: u64,
     pub outbound_attempt: u64,
     pub outbound_establish: u64,
     pub outbound_drop: u64,

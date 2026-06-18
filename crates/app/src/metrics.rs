@@ -627,6 +627,11 @@ metric_catalog! {
             => "Total inbound peer disconnections (run_peer_loop returned)";
         OVERLAY_INBOUND_REJECT_TOTAL = "stellar_overlay_inbound_reject_total"
             => "Total inbound connections rejected before establishment";
+        // #3419 diagnostic: monotonic count of inbound peers that reached
+        // authenticated state. Climbing while the `inbound_authenticated` gauge
+        // stays near 0 means "authenticated then churned", not "never authenticated".
+        OVERLAY_INBOUND_AUTHENTICATED_TOTAL = "stellar_overlay_inbound_authenticated_total"
+            => "Total inbound peers that transitioned to authenticated (monotonic)";
         OVERLAY_OUTBOUND_ATTEMPT_TOTAL = "stellar_overlay_outbound_attempt_total"
             => "Total outbound connection attempts (dial initiated)";
         OVERLAY_OUTBOUND_ESTABLISH_TOTAL = "stellar_overlay_outbound_establish_total"
@@ -1067,6 +1072,7 @@ pub(crate) async fn refresh_gauges(state: &ServerState) {
         OVERLAY_INBOUND_ESTABLISH_TOTAL.absolute(ov.inbound_establish);
         OVERLAY_INBOUND_DROP_TOTAL.absolute(ov.inbound_drop);
         OVERLAY_INBOUND_REJECT_TOTAL.absolute(ov.inbound_reject);
+        OVERLAY_INBOUND_AUTHENTICATED_TOTAL.absolute(ov.inbound_authenticated_total);
         OVERLAY_OUTBOUND_ATTEMPT_TOTAL.absolute(ov.outbound_attempt);
         OVERLAY_OUTBOUND_ESTABLISH_TOTAL.absolute(ov.outbound_establish);
         OVERLAY_OUTBOUND_DROP_TOTAL.absolute(ov.outbound_drop);
