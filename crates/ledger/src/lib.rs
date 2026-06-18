@@ -102,8 +102,8 @@ pub use execution::{
 };
 pub use header::{
     calculate_skip_values, close_time, compute_header_hash, create_next_header,
-    is_before_protocol_version, protocol_version, skip_list_target_seq, verify_header_chain,
-    verify_skip_list, SKIP_1, SKIP_2, SKIP_3, SKIP_4, SKIP_LIST_SIZE,
+    is_before_protocol_version, protocol_version, verify_header_chain, SKIP_1, SKIP_2, SKIP_3,
+    SKIP_4, SKIP_LIST_SIZE,
 };
 pub use manager::new_bucket_list_with_soroban_config;
 pub use manager::{

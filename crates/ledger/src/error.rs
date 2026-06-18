@@ -14,20 +14,12 @@ use thiserror::Error;
 ///
 /// # Error Categories
 ///
-/// - **State errors**: `NotInitialized`, `AlreadyInitialized`, `EntryNotFound`
+/// - **State errors**: `NotInitialized`, `AlreadyInitialized`
 /// - **Validation errors**: `InvalidSequence`, `HashMismatch`, `InvalidHeaderChain`
-/// - **Close errors**: `InvalidLedgerClose`, `DuplicateEntry`, `MissingEntry`
-/// - **External errors**: `Database`, `Bucket`, `Xdr`
+/// - **External errors**: `Bucket`, `Xdr`
 /// - **Internal errors**: `Serialization`, `Snapshot`, `Internal`
 #[derive(Debug, Error)]
 pub enum LedgerError {
-    /// A requested ledger entry was not found.
-    ///
-    /// This can occur when loading entries that don't exist in the
-    /// bucket list or snapshot cache.
-    #[error("entry not found")]
-    EntryNotFound,
-
     /// Ledger sequence number doesn't match expected value.
     ///
     /// This typically indicates an attempt to close a ledger out of order,
@@ -85,25 +77,9 @@ pub enum LedgerError {
     #[error("ledger already initialized")]
     AlreadyInitialized,
 
-    /// Invalid ledger close operation.
-    #[error("invalid ledger close: {0}")]
-    InvalidLedgerClose(String),
-
-    /// Attempted to create an entry that already exists.
-    #[error("duplicate entry: {0}")]
-    DuplicateEntry(String),
-
-    /// Attempted to update or delete an entry that doesn't exist.
-    #[error("missing entry for update/delete: {0}")]
-    MissingEntry(String),
-
     /// Snapshot-related error.
     #[error("snapshot error: {0}")]
     Snapshot(String),
-
-    /// Checked arithmetic error (balance overflow, underflow, etc.).
-    #[error("balance error: {0}")]
-    Balance(#[from] henyey_common::checked_types::BalanceError),
 
     /// Internal error (indicates a bug).
     ///
