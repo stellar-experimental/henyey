@@ -157,6 +157,24 @@ fn build_metrics_json(
                 "1_min_rate": scp_invalid.one_minute_rate,
                 "5_min_rate": scp_invalid.five_minute_rate,
                 "15_min_rate": scp_invalid.fifteen_minute_rate
+            },
+            // Zero-value metrics required by SSC's CheckNoErrorMetrics.
+            // Henyey doesn't track these, but SSC asserts they exist.
+            "scp.envelope.invalidsig": {
+                "type": "counter",
+                "count": 0
+            },
+            "history.publish.failure": {
+                "type": "counter",
+                "count": 0
+            },
+            "ledger.invariant.failure": {
+                "type": "counter",
+                "count": 0
+            },
+            "ledger.transaction.internal-error": {
+                "type": "counter",
+                "count": 0
             }
         }
     })
