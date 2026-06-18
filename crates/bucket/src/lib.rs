@@ -166,9 +166,8 @@ pub use error::BucketError;
 // ============================================================================
 
 pub use eviction::{
-    bucket_update_period, default_state_archival_settings, level_half, level_should_spill,
-    level_size, update_starting_eviction_iterator, EvictionCandidate, EvictionIterator,
-    EvictionIteratorExt, EvictionResult, ResolvedEviction,
+    default_state_archival_settings, level_half, update_starting_eviction_iterator,
+    EvictionCandidate, EvictionIterator, EvictionIteratorExt, EvictionResult, ResolvedEviction,
 };
 
 // ============================================================================
