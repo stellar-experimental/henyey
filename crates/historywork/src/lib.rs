@@ -185,7 +185,7 @@ pub type SharedHistoryState = Arc<Mutex<HistoryWorkState>>;
 ///
 /// This enum is used for progress reporting and monitoring. Each variant
 /// corresponds to a specific work item in the download or publish pipeline.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HistoryWorkStage {
     /// Fetching the History Archive State (HAS) JSON file.
     FetchHas,
