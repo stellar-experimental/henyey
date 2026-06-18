@@ -11,13 +11,6 @@ use thiserror::Error;
 /// capacity limits, SCP consensus problems, or internal state errors.
 #[derive(Debug, Error)]
 pub enum HerderError {
-    /// Transaction queue is at capacity.
-    ///
-    /// The queue has reached its maximum size and cannot accept additional
-    /// transactions without evicting lower-fee transactions.
-    #[error("transaction queue full")]
-    QueueFull,
-
     /// An error occurred in the SCP consensus layer.
     ///
     /// This wraps errors from the underlying SCP implementation, such as
