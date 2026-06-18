@@ -2040,6 +2040,33 @@ mod tests {
         assert!(limiter.allow(TrafficClass::ControlFetch));
     }
 
+    /// Regression test for #3428: a Survey message dropped at the aggregate
+    /// cap must increment `dropped_aggregate` by exactly 1, matching the other
+    /// traffic classes. Previously the aggregate-exhausted match arm did
+    /// `Survey => self.dropped_aggregate += 1` AND then the unconditional
+    /// `self.dropped_aggregate += 1` ran, so each dropped Survey added +2.
+    #[test]
+    fn test_peer_rate_limiter_survey_drop_single_aggregate_count() {
+        let mut limiter = PeerRateLimiter::new();
+
+        // Fill the aggregate window with Survey messages (all allowed).
+        for _ in 0..DEFAULT_PEER_RATE_LIMIT {
+            assert!(limiter.allow(TrafficClass::Survey));
+        }
+
+        // Drop N more Survey messages past the aggregate cap (all rejected).
+        const N: u64 = 5;
+        for _ in 0..N {
+            assert!(!limiter.allow(TrafficClass::Survey));
+        }
+
+        // Each aggregate-cap drop must count exactly once, not twice.
+        assert_eq!(
+            limiter.dropped_aggregate, N,
+            "each dropped Survey must add +1 to dropped_aggregate (not +2)"
+        );
+    }
+
     #[test]
     fn test_peer_rate_limiter_telemetry_counters() {
         let mut limiter = PeerRateLimiter::new();
