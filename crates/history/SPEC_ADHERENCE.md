@@ -178,7 +178,7 @@ All constants present with correct values:
 | INV-C1 (Chain monotonic) | Full | `verify.rs:312-332` (forward link within group), `verify.rs:515-530` (`verify_ledger_header_history_entry` hashes header). |
 | INV-C2 (Checkpoint alignment) | Full | `verify.rs:282-292` (group partition by checkpoint); checkpoint ledger range enforced via `verify_tx_result_ordering` (`verify.rs:808-842`). |
 | INV-C3 (HAS integrity) | Full | `verify.rs:709-761` + `archive_state.rs:404-473`. |
-| INV-C4 (BucketList hash agreement) | Full | `verify.rs:480-494` (`verify_ledger_hash`) + `archive_state.rs:600-654` (`compute_bucket_list_hash`). |
+| INV-C4 (BucketList hash agreement) | Full | `replay/execution.rs:140-200` (`verify_bucket_list_hash`, called under `config.verify_bucket_list`) + `archive_state.rs:600-654` (`compute_bucket_list_hash`). Verified at checkpoint ledgers (and ≥V23 only when eviction ran), matching stellar-core's checkpoint-boundary assertion in `CatchupWork.cpp:259-260`. |
 | INV-C5 (Trust anchor authentication) | Full | Verification function supports `TrustSource::Scp` (`verify.rs:355-384`) and online catchup now plumbs the SCP-derived anchor from `App::resolve_scp_trust_anchor()` → `CatchupManager::set_trusted_scp_anchor()` → `catchup/replay.rs`. LCL disagreement is fatal when trusted hash exists. |
 | INV-C6 (Tx result hash check) | Partial | `verify_tx_result_set` correct (`verify.rs:542-563`) but no `OFFLINE_COMPLETE`-mode caller that loops over every replay-range ledger. See §12. |
 | INV-C7 (Knit-to-LCL exclusivity) | Full | `catchup/replay.rs:58-117` — five mutually-exclusive cases; case 5 returns `KnitOvershot` error (fatal). |

@@ -634,44 +634,6 @@ impl PublishManager {
         let has_path = self.has_path(checkpoint_ledger);
         has_path.exists()
     }
-
-    /// Get the latest published checkpoint.
-    pub fn latest_published_checkpoint(&self) -> Option<u32> {
-        // Scan the history directory for published checkpoints
-        let base = &self.config.local_path;
-        let has_dir = base.join("history");
-
-        if !has_dir.exists() {
-            return None;
-        }
-
-        fn scan_dir(path: &Path, latest: &mut Option<u32>) {
-            let Ok(entries) = std::fs::read_dir(path) else {
-                return;
-            };
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.is_dir() {
-                    scan_dir(&path, latest);
-                } else if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                    if let Some(hex) = name
-                        .strip_prefix("history-")
-                        .and_then(|n| n.strip_suffix(".json"))
-                    {
-                        if let Ok(seq) = u32::from_str_radix(hex, 16) {
-                            if is_checkpoint_ledger(seq) {
-                                *latest = Some(latest.map_or(seq, |l| l.max(seq)));
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        let mut latest: Option<u32> = None;
-        scan_dir(&has_dir, &mut latest);
-        latest
-    }
 }
 
 #[cfg(test)]

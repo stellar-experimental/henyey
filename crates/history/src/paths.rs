@@ -98,16 +98,6 @@ pub fn root_has_path() -> &'static str {
     ".well-known/stellar-history.json"
 }
 
-/// Generate the directory path for ledger-related files at a checkpoint.
-///
-/// Returns: `ledger/{xx}/{yy}/{zz}`
-pub fn ledger_dir(ledger: u32) -> String {
-    let checkpoint = checkpoint_ledger(ledger);
-    let hex = format!("{:08x}", checkpoint);
-
-    format!("ledger/{}/{}/{}", &hex[0..2], &hex[2..4], &hex[4..6])
-}
-
 /// Generate the path for a checkpoint file without extension.
 ///
 /// Returns: `{category}/{xx}/{yy}/{zz}/{category}-{hex}`

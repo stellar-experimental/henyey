@@ -11,7 +11,6 @@ History archive access, catchup, replay, and checkpoint publishing for Henyey.
 ```mermaid
 flowchart LR
     A[HistoryArchive]
-    B[HistoryManager]
     C[HistoryArchiveState]
     D[CatchupRange]
     E[CatchupManager]
@@ -24,7 +23,6 @@ flowchart LR
     L[RemoteArchive]
     M[CdpDataLake]
 
-    B --> A
     A --> C
     E --> D
     E --> A
@@ -43,7 +41,6 @@ flowchart LR
 | Type | Description |
 |------|-------------|
 | `HistoryArchive` | Reqwest-based client for one readable history archive. |
-| `HistoryManager` | Read-side failover wrapper across multiple `HistoryArchive`s. |
 | `HistoryArchiveManager` | Mixed read/write archive manager mirroring stellar-core archive configuration logic. |
 | `HistoryArchiveState` | Parsed HAS document with bucket hash helpers and FutureBucket state. |
 | `CatchupManager` | End-to-end catchup orchestrator: download, verify, apply buckets, replay. |
@@ -148,7 +145,6 @@ See `publish_queue.rs` module docs for the full semantic mapping to stellar-core
 
 | Rust | stellar-core |
 |------|--------------|
-| `lib.rs` (`HistoryManager`) | `src/history/HistoryManagerImpl.cpp` |
 | `lib.rs` (`HistoryArchiveManager`, `ArchiveEntry`) | `src/history/HistoryArchiveManager.cpp` |
 | `archive.rs` | `src/history/HistoryArchive.cpp` |
 | `archive_state.rs` | `src/history/HistoryArchive.cpp` (HAS serialization and bucket-state logic) |
