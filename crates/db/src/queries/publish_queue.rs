@@ -19,8 +19,11 @@ use crate::error::DbError;
 pub trait PublishQueueQueries {
     /// Adds a checkpoint ledger to the publish queue.
     ///
-    /// First-write-wins: this is a no-op if the ledger is already in the
-    /// queue, leaving the existing row (and its stored HAS JSON) untouched.
+    /// Last-write-wins: re-enqueuing an existing `ledgerseq` overwrites the
+    /// stored row with the new HAS JSON. This matches stellar-core v26.0.1's
+    /// `writeCheckpointFile`, which `durableRename`s the HAS onto a fixed
+    /// per-seq path (an unconditional overwrite), and henyey-history's
+    /// `PublishQueue::enqueue`, which already uses `INSERT OR REPLACE`.
     /// The `has_json` parameter stores the History Archive State JSON
     /// captured at checkpoint time, ensuring the publish path uses the
     /// exact HAS (including hot archive bucket hashes) from the
@@ -75,13 +78,16 @@ pub trait PublishQueueQueries {
 
 impl PublishQueueQueries for Connection {
     fn enqueue_publish(&self, ledger_seq: u32, has_json: &str) -> Result<(), DbError> {
-        // `INSERT OR IGNORE` makes the first-write-wins contract explicit: on a
-        // `ledgerseq` primary-key conflict the new row is ignored, leaving the
-        // existing entry intact. This intentionally swallows the PK conflict for
-        // idempotency. All callers always pass a non-null `has_json`, so the
-        // `state NOT NULL` constraint is never at risk.
+        // `INSERT OR REPLACE` makes the last-write-wins contract explicit: on a
+        // `ledgerseq` primary-key conflict the existing row is deleted and the
+        // new row inserted, overwriting `state` with the new `has_json`. This
+        // matches stellar-core's durable-rename overwrite and henyey-history's
+        // `INSERT OR REPLACE`. The table has only `(ledgerseq PK, state)` with
+        // no other columns, FKs, or triggers, so the replace cannot drop a
+        // column or orphan data. All callers always pass a non-null `has_json`,
+        // so the `state NOT NULL` constraint is never at risk.
         self.execute(
-            "INSERT OR IGNORE INTO publishqueue (ledgerseq, state) VALUES (?1, ?2)",
+            "INSERT OR REPLACE INTO publishqueue (ledgerseq, state) VALUES (?1, ?2)",
             params![ledger_seq as i64, has_json],
         )?;
         Ok(())
