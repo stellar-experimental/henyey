@@ -543,7 +543,7 @@ pub fn default_state_archival_settings() -> StateArchivalSettings {
 /// - Level 2: 64
 /// - Level 3: 256
 /// - ...
-pub fn level_size(level: u32) -> u64 {
+pub(crate) fn level_size(level: u32) -> u64 {
     1u64 << (2 * (level + 1))
 }
 
@@ -563,7 +563,7 @@ fn round_down(value: u64, modulo: u64) -> u64 {
 ///
 /// A level spills when the ledger number is at a levelHalf or levelSize boundary.
 /// The top level (level 10) never spills.
-pub fn level_should_spill(ledger: u32, level: u32) -> bool {
+pub(crate) fn level_should_spill(ledger: u32, level: u32) -> bool {
     if level >= BUCKET_LIST_LEVELS as u32 - 1 {
         return false; // Top level never spills
     }
@@ -582,7 +582,7 @@ pub fn level_should_spill(ledger: u32, level: u32) -> bool {
 /// - Level 1 curr: 2 ledgers
 /// - Level 1 snap: 8 ledgers
 /// - Level N curr: 2^(2*N - 1) ledgers
-pub fn bucket_update_period(level: u32, is_curr: bool) -> u32 {
+pub(crate) fn bucket_update_period(level: u32, is_curr: bool) -> u32 {
     if !is_curr {
         // Snap bucket updates when the level below spills
         return bucket_update_period(level + 1, true);

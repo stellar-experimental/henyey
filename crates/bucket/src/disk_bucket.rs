@@ -47,7 +47,7 @@ use stellar_xdr::curr::{
 use henyey_common::{BucketListDbConfig, Hash256};
 
 use crate::bloom_filter::HashSeed;
-use crate::cache::RandomEvictionCache;
+use crate::cache::BucketEntryCache;
 use crate::entry::{BucketEntry, BucketEntryExt};
 use crate::index::LiveBucketIndex;
 use crate::{BucketError, Result};
@@ -108,7 +108,7 @@ pub struct DiskBucket {
     /// Per-bucket entry cache for DiskIndex buckets.
     /// Initialized lazily via `maybe_initialize_cache()`.
     /// Only caches ACCOUNT entries (matching stellar-core).
-    cache: OnceLock<Arc<RandomEvictionCache>>,
+    cache: OnceLock<Arc<BucketEntryCache>>,
     /// Cached protocol version read from the leading metaentry.
     ///
     /// `Some(Some(v))` — bucket has a metaentry with `ledger_version = v`.
@@ -605,7 +605,7 @@ impl DiskBucket {
     }
 
     /// Returns the per-bucket cache, if initialized.
-    pub fn cache(&self) -> Option<&Arc<RandomEvictionCache>> {
+    pub fn cache(&self) -> Option<&Arc<BucketEntryCache>> {
         self.cache.get()
     }
 
@@ -665,7 +665,7 @@ impl DiskBucket {
             return;
         }
 
-        let cache = RandomEvictionCache::with_limits(usize::MAX, cache_entries);
+        let cache = BucketEntryCache::with_limits(usize::MAX, cache_entries);
         cache.activate();
         let _ = self.cache.set(Arc::new(cache));
     }
