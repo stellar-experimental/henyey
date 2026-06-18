@@ -118,7 +118,7 @@ impl CacheEntry {
 ///
 /// The cache tracks both entry count and estimated memory usage. Eviction
 /// is triggered when either limit is exceeded.
-pub struct RandomEvictionCache {
+pub struct BucketEntryCache {
     /// The cache storage, protected by a mutex.
     inner: Mutex<CacheInner>,
     /// Maximum cache size in bytes.
@@ -161,7 +161,7 @@ impl CacheInner {
     }
 }
 
-impl RandomEvictionCache {
+impl BucketEntryCache {
     /// Creates a new cache with the given limits.
     pub fn with_limits(max_bytes: usize, max_entries: usize) -> Self {
         Self {
@@ -395,10 +395,10 @@ impl RandomEvictionCache {
     }
 }
 
-impl std::fmt::Debug for RandomEvictionCache {
+impl std::fmt::Debug for BucketEntryCache {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let stats = self.stats();
-        f.debug_struct("RandomEvictionCache")
+        f.debug_struct("BucketEntryCache")
             .field("entry_count", &stats.entry_count)
             .field("size_bytes", &stats.size_bytes)
             .field("max_bytes", &stats.max_bytes)
@@ -498,7 +498,7 @@ mod tests {
 
     #[test]
     fn test_cache_basic_operations() {
-        let cache = RandomEvictionCache::with_limits(1_000_000, 1_000);
+        let cache = BucketEntryCache::with_limits(1_000_000, 1_000);
         cache.activate();
 
         let key = make_account_key(1);
@@ -518,7 +518,7 @@ mod tests {
 
     #[test]
     fn test_cache_not_active() {
-        let cache = RandomEvictionCache::with_limits(1_000_000, 1_000);
+        let cache = BucketEntryCache::with_limits(1_000_000, 1_000);
         // Don't activate the cache
 
         let key = make_account_key(1);
@@ -532,44 +532,44 @@ mod tests {
     #[test]
     fn test_is_cached_type_account_only() {
         // Account key should be cached
-        assert!(RandomEvictionCache::is_cached_type(&make_account_key(1)));
+        assert!(BucketEntryCache::is_cached_type(&make_account_key(1)));
 
         // Trustline key should NOT be cached (matching stellar-core)
         let trustline_key = make_trustline_key(1, b"USD\0");
-        assert!(!RandomEvictionCache::is_cached_type(&trustline_key));
+        assert!(!BucketEntryCache::is_cached_type(&trustline_key));
 
         // ClaimableBalance key should NOT be cached
         let cb_key = LedgerKey::ClaimableBalance(LedgerKeyClaimableBalance {
             balance_id: ClaimableBalanceId::ClaimableBalanceIdTypeV0(Hash([0; 32])),
         });
-        assert!(!RandomEvictionCache::is_cached_type(&cb_key));
+        assert!(!BucketEntryCache::is_cached_type(&cb_key));
 
         // LiquidityPool key should NOT be cached
         let lp_key = LedgerKey::LiquidityPool(LedgerKeyLiquidityPool {
             liquidity_pool_id: PoolId(Hash([0; 32])),
         });
-        assert!(!RandomEvictionCache::is_cached_type(&lp_key));
+        assert!(!BucketEntryCache::is_cached_type(&lp_key));
 
         // Offer key should NOT be cached
         let offer_key = LedgerKey::Offer(LedgerKeyOffer {
             seller_id: make_account_id(1),
             offer_id: 1,
         });
-        assert!(!RandomEvictionCache::is_cached_type(&offer_key));
+        assert!(!BucketEntryCache::is_cached_type(&offer_key));
 
         // Data key should NOT be cached
         let data_key = LedgerKey::Data(LedgerKeyData {
             account_id: make_account_id(1),
             data_name: String64::from(stellar_xdr::curr::StringM::default()),
         });
-        assert!(!RandomEvictionCache::is_cached_type(&data_key));
+        assert!(!BucketEntryCache::is_cached_type(&data_key));
     }
 
     #[test]
     fn test_cache_eviction() {
         // Create cache with small entry limit — power-of-2 evicts one per insert
         // when at capacity, so after 10 inserts with max=5 we should have exactly 5.
-        let cache = RandomEvictionCache::with_limits(1_000_000, 5);
+        let cache = BucketEntryCache::with_limits(1_000_000, 5);
         cache.activate();
 
         for i in 0..10u8 {
@@ -584,7 +584,7 @@ mod tests {
         // Power-of-2-choices should preferentially evict less-recently-used entries.
         // Use a large enough cache that self-eviction (both random picks landing on
         // the same index) is negligible.
-        let cache = RandomEvictionCache::with_limits(1_000_000, 100);
+        let cache = BucketEntryCache::with_limits(1_000_000, 100);
         cache.activate();
 
         let hot_key = make_account_key(0);
@@ -604,7 +604,7 @@ mod tests {
     #[test]
     fn test_eviction_by_byte_limit() {
         // Each account entry is ~200+ bytes. A 500-byte cache should only hold 1-2.
-        let cache = RandomEvictionCache::with_limits(500, 1_000_000);
+        let cache = BucketEntryCache::with_limits(500, 1_000_000);
         cache.activate();
 
         for i in 0..10u8 {
@@ -619,7 +619,7 @@ mod tests {
     #[test]
     fn test_keys_vec_consistency_after_removes() {
         // Verify the keys vec stays consistent after interleaved inserts and removes.
-        let cache = RandomEvictionCache::with_limits(1_000_000, 100);
+        let cache = BucketEntryCache::with_limits(1_000_000, 100);
         cache.activate();
 
         // Insert 20 entries
@@ -657,7 +657,7 @@ mod tests {
 
     #[test]
     fn test_cache_stats() {
-        let cache = RandomEvictionCache::with_limits(1_000_000, 1_000);
+        let cache = BucketEntryCache::with_limits(1_000_000, 1_000);
         cache.activate();
 
         let key = make_account_key(1);
@@ -681,7 +681,7 @@ mod tests {
 
     #[test]
     fn test_cache_clear() {
-        let cache = RandomEvictionCache::with_limits(1_000_000, 1_000);
+        let cache = BucketEntryCache::with_limits(1_000_000, 1_000);
         cache.activate();
 
         for i in 0..5u8 {
@@ -697,7 +697,7 @@ mod tests {
 
     #[test]
     fn test_cache_update_existing() {
-        let cache = RandomEvictionCache::with_limits(1_000_000, 1_000);
+        let cache = BucketEntryCache::with_limits(1_000_000, 1_000);
         cache.activate();
 
         let key = make_account_key(1);
@@ -717,7 +717,7 @@ mod tests {
 
     #[test]
     fn test_cache_rejects_non_account_types() {
-        let cache = RandomEvictionCache::with_limits(1_000_000, 1_000);
+        let cache = BucketEntryCache::with_limits(1_000_000, 1_000);
         cache.activate();
 
         // Trustline should not be cached

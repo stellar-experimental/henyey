@@ -59,7 +59,7 @@
 | §9.3 | DiskIndex | Full | index.rs:523-740; bloom_filter.rs:68-130 |
 | §9.4 | Type range map | Full | index.rs (TypeRange) |
 | §9.5 | AssetPoolIDMap | Full | index.rs:207-280, 469, 698 |
-| §9.6 | Entry cache | Full | cache.rs (RandomEvictionCache); bucket_list.rs:1716-1733 |
+| §9.6 | Entry cache | Full | cache.rs (BucketEntryCache); bucket_list.rs:1716-1733 |
 | §9.7 | Persistence + version invalidation | Full | index_persistence.rs:53, 427-456 (`BUCKET_INDEX_VERSION = 5`) |
 | §10.1 | BucketSnapshotManager | Full | snapshot.rs:1152-1276 |
 | §10.2 | Point lookup | Full | snapshot.rs:372-406 |
