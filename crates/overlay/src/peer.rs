@@ -213,6 +213,12 @@ pub struct Peer {
     /// Used to conditionally release the reservation on cleanup; inbound
     /// peers that bypassed reservation (mutual-dial) must not release it.
     holds_pending_peer_id: bool,
+    /// Diagnostic (#3419, observability-only): the wire name of the most-recent
+    /// `StellarMessage` we sent on this connection (handshake or post-auth).
+    /// Updated on every send path; read by the peer loop on drop to surface the
+    /// "last message henyey sent before the connection reset" pattern. `"none"`
+    /// until the first send. Purely additive state — does NOT gate any logic.
+    last_sent_msg_type: &'static str,
 }
 
 impl Peer {
@@ -253,6 +259,7 @@ impl Peer {
             stats: Arc::new(PeerStats::default()),
             metrics,
             holds_pending_peer_id: false,
+            last_sent_msg_type: "none",
         };
 
         peer.handshake(
@@ -305,6 +312,7 @@ impl Peer {
             stats: Arc::new(PeerStats::default()),
             metrics,
             holds_pending_peer_id: false,
+            last_sent_msg_type: "none",
         };
 
         // Perform handshake (with ban + pending-dedup checks after HELLO for inbound)
@@ -763,6 +771,8 @@ impl Peer {
     /// Send a raw message (before authentication, e.g., Hello).
     async fn send_raw(&mut self, message: StellarMessage) -> Result<()> {
         let kind = OverlayMessageKind::from_stellar_message(&message);
+        // #3419 diagnostic: record the last-sent wire type (observability-only).
+        self.last_sent_msg_type = helpers::message_type_name(&message);
         let body_size = msg_body_size(&message);
         let auth_msg = self.auth.wrap_unauthenticated(message);
         // `Connection::send` returns the on-the-wire frame size, so we don't
@@ -783,6 +793,8 @@ impl Peer {
     /// Send an Auth message (with MAC but sequence 0).
     async fn send_auth(&mut self, message: StellarMessage) -> Result<()> {
         let kind = OverlayMessageKind::from_stellar_message(&message);
+        // #3419 diagnostic: record the last-sent wire type (observability-only).
+        self.last_sent_msg_type = helpers::message_type_name(&message);
         let body_size = msg_body_size(&message);
         let auth_msg = self.auth.wrap_auth_message(message)?;
         let wire_size = self.connection.send(auth_msg).await?;
@@ -806,6 +818,8 @@ impl Peer {
 
         let kind = OverlayMessageKind::from_stellar_message(&message);
         let msg_type = helpers::message_type_name(&message);
+        // #3419 diagnostic: record the last-sent wire type (observability-only).
+        self.last_sent_msg_type = msg_type;
         trace!("SEND {} to {}", msg_type, self.info.peer_id);
 
         let body_size = msg_body_size(&message);
@@ -959,6 +973,14 @@ impl Peer {
         self.info.direction
     }
 
+    /// Diagnostic (#3419, observability-only): the wire name of the most-recent
+    /// `StellarMessage` sent on this connection, or `"none"` if nothing has been
+    /// sent yet. Read by the peer loop on drop to surface the last message
+    /// henyey sent before a remote reset.
+    pub fn last_sent_msg_type(&self) -> &'static str {
+        self.last_sent_msg_type
+    }
+
     /// Whether this peer owns a pending_peer_id reservation.
     /// Used by the manager to decide whether to call `release_peer_id`
     /// during cleanup — peers that bypassed the reservation in a
@@ -1032,6 +1054,7 @@ impl Peer {
             stats: Arc::new(PeerStats::default()),
             metrics,
             holds_pending_peer_id,
+            last_sent_msg_type: "none",
         }
     }
 }
@@ -1107,6 +1130,7 @@ mod tests {
             stats: Arc::new(PeerStats::default()),
             metrics: metrics_a,
             holds_pending_peer_id: false,
+            last_sent_msg_type: "none",
         };
         let peer_b = Peer {
             info: PeerInfo {
@@ -1125,6 +1149,7 @@ mod tests {
             stats: Arc::new(PeerStats::default()),
             metrics: metrics_b,
             holds_pending_peer_id: false,
+            last_sent_msg_type: "none",
         };
         (peer_a, peer_b)
     }
@@ -1183,6 +1208,7 @@ mod tests {
             stats: Arc::new(PeerStats::default()),
             metrics: Arc::new(OverlayMetrics::new()),
             holds_pending_peer_id: false,
+            last_sent_msg_type: "none",
         };
         (peer, hello)
     }
@@ -1431,6 +1457,7 @@ mod tests {
             stats: Arc::new(PeerStats::default()),
             metrics: Arc::new(OverlayMetrics::new()),
             holds_pending_peer_id: false,
+            last_sent_msg_type: "none",
         };
 
         (responder, client_conn, client_auth)
@@ -1630,6 +1657,7 @@ mod tests {
             stats: Arc::new(PeerStats::default()),
             metrics: Arc::new(OverlayMetrics::new()),
             holds_pending_peer_id: false,
+            last_sent_msg_type: "none",
         };
 
         // The remote side: a raw responder AuthContext that replies to the

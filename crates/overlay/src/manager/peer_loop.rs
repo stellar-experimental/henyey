@@ -909,6 +909,40 @@ impl OverlayManager {
         }
     }
 
+    /// #3419 diagnostic (observability-only): emit a `warn!` describing how an
+    /// inbound peer connection dropped/reset, capturing the last message henyey
+    /// sent on that connection before the drop. This does NOT alter any control
+    /// flow, handshake, auth, codec, or dispatch behavior — it only reads
+    /// already-tracked per-peer state and logs it.
+    ///
+    /// Gated to inbound connections only: the mainnet symptom in #3419 is
+    /// `stellar_overlay_inbound_authenticated` sustained near 0 while inbound
+    /// peers establish then get reset by the remote post-auth. Outbound drops
+    /// are not the subject of this investigation, so we don't spam them here.
+    ///
+    /// `reason` is a short, low-cardinality classification of the drop site
+    /// (e.g. "recv_error", "remote_closed", "send_error"); `detail` carries the
+    /// errno / error string when available (empty otherwise).
+    fn log_inbound_drop_diag(peer: &Peer, peer_id: &PeerId, reason: &str, detail: &str) {
+        if peer.direction() != ConnectionDirection::Inbound {
+            return;
+        }
+        let stats = peer.stats();
+        warn!(
+            target: "overlay_inbound_diag",
+            peer_id = %peer_id,
+            addr = %peer.remote_addr(),
+            direction = "inbound",
+            authenticated = peer.is_ready(),
+            last_sent_msg_type = peer.last_sent_msg_type(),
+            messages_sent = stats.messages_sent.load(Ordering::Relaxed),
+            messages_received = stats.messages_received.load(Ordering::Relaxed),
+            drop_reason = reason,
+            drop_detail = detail,
+            "inbound peer connection dropped; last message henyey sent before reset recorded"
+        );
+    }
+
     pub(super) async fn run_peer_loop(
         peer_id: PeerId,
         mut peer: Peer,
@@ -965,6 +999,7 @@ impl OverlayManager {
                             if let Err(e) = peer.send(m).await {
                                 debug!("Failed to send to {}: {}", peer_id, e);
                                 state.metrics.errors_write.inc();
+                                Self::log_inbound_drop_diag(&peer, &peer_id, "send_error", &e.to_string());
                                 break;
                             }
                             state.metrics.messages_written.inc();
@@ -982,6 +1017,7 @@ impl OverlayManager {
                                 }
                                 Err(e) => {
                                     debug!("Failed to send batch to {}: {}", peer_id, e);
+                                    Self::log_inbound_drop_diag(&peer, &peer_id, "flood_send_error", &e.to_string());
                                     break;
                                 }
                             }
@@ -1065,11 +1101,13 @@ impl OverlayManager {
                         }
                         Ok(None) => {
                             info!("Peer {} loop exiting: connection closed by remote (total_msgs={}, scp_msgs={})", peer_id, total_messages, scp_messages);
+                            Self::log_inbound_drop_diag(&peer, &peer_id, "remote_closed", "");
                             break;
                         }
                         Err(e) => {
                             state.metrics.errors_read.inc();
                             info!("Peer {} loop exiting: recv error: {} (total_msgs={}, scp_msgs={})", peer_id, e, total_messages, scp_messages);
+                            Self::log_inbound_drop_diag(&peer, &peer_id, "recv_error", &e.to_string());
                             break;
                         }
                     }

@@ -481,6 +481,19 @@ impl OverlayManager {
             shared.pending_connections.release_peer_id(&peer_id);
         }
         shared.metrics.inbound_establish.inc();
+        // #3419 diagnostic (observability-only): an inbound peer transitioned to
+        // authenticated. The monotonic counter lets an operator distinguish
+        // "never authenticated" (stays 0) from "authenticated then churned"
+        // (climbs while the instantaneous gauge stays near 0). The warn event
+        // gives a timestamped, per-direction authenticated-transition signal.
+        shared.metrics.inbound_authenticated_total.inc();
+        warn!(
+            target: "overlay_inbound_diag",
+            peer_id = %peer_id,
+            direction = "inbound",
+            event = "authenticated",
+            "inbound peer transitioned to authenticated"
+        );
 
         let generation = register_result.generation;
         Self::run_peer_loop(
