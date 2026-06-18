@@ -1,7 +1,7 @@
 # Supercluster Mission #3295 — History Publish/Catchup Mission
 
 **Issue:** [#3295](https://github.com/stellar-experimental/henyey/issues/3295)
-**Companion docs:** [`supercluster-mission-3292.md`](./supercluster-mission-3292.md) (the first mixed-image mission — pattern + harness source), [`supercluster-nsc-workflow.md`](./supercluster-nsc-workflow.md) (#3304 — the verified `nsc` build/publish/launch surface), [`supercluster-feasibility.md`](./supercluster-feasibility.md) (§6 history reliability).
+**Companion docs:** [`supercluster-henyey-mixed-mission.md`](./supercluster-henyey-mixed-mission.md) (the first mixed-image mission — pattern + harness source), [`supercluster-nsc-workflow.md`](./supercluster-nsc-workflow.md) (#3304 — the verified `nsc` build/publish/launch surface), [`supercluster-feasibility.md`](./supercluster-feasibility.md) (§6 history reliability).
 
 This runbook drives an **SSC history mission**: a henyey node **publishes** its
 own checkpoints to a history archive and **catches up** from an SSC-managed
@@ -86,7 +86,7 @@ cross-tool / AC#6) — see the checklist below.
    [`supercluster-nsc-workflow.md`](./supercluster-nsc-workflow.md) (#3304).
 2. **Build + push + provision (nsc side):** build and push the henyey image,
    capture the **`sha256` digest**, and `nsc create` an ephemeral k8s instance.
-   (Reuse the `scripts/ssc/launch-mission-3292.sh` wrapper if launching a mixed
+   (Reuse the `scripts/ssc/launch-henyey-mixed-mission.sh` wrapper if launching a mixed
    topology; a history mission additionally needs a **publishing** node, i.e.
    `NODE_IS_VALIDATOR=true` with a writable `[HISTORY.<name>]` archive — see the
    fixture shape.)

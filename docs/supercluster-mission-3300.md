@@ -1,7 +1,7 @@
 # Supercluster Mission #3300 — Protocol-Upgrade Mission
 
 **Issue:** [#3300](https://github.com/stellar-experimental/henyey/issues/3300)
-**Companion docs:** [`supercluster-nsc-workflow.md`](./supercluster-nsc-workflow.md) (the verified `nsc` build/publish/launch surface), [`supercluster-mission-3292.md`](./supercluster-mission-3292.md) (first mixed-image mission this builds on), [`supercluster-feasibility.md`](./supercluster-feasibility.md).
+**Companion docs:** [`supercluster-nsc-workflow.md`](./supercluster-nsc-workflow.md) (the verified `nsc` build/publish/launch surface), [`supercluster-henyey-mixed-mission.md`](./supercluster-henyey-mixed-mission.md) (Henyey mixed-image mission this builds on), [`supercluster-feasibility.md`](./supercluster-feasibility.md).
 
 This runbook drives a **live multi-node SSC protocol-upgrade mission**: a mixed
 network (stellar-core validators + at least one henyey node) where an operator
@@ -9,8 +9,7 @@ drives the stellar-core-compatible `/upgrades?mode=set` admin endpoint and
 observes the full **schedule → nominate → externalize → apply** path land an
 upgrade at the upgrade ledger, in agreement across the mixed cluster.
 
-It is the protocol-upgrade counterpart to the history mission and the next-to-last
-issue in the SSC epic drain order (#3292–#3300). Like #3292, the upgrade
+It is the protocol-upgrade counterpart to the history mission. Like the Henyey mixed-image mission, the upgrade
 machinery is already **Full** parity end-to-end; the deliverable is
 *mission-definition + offline regression artifacts + parity-doc updates + an
 operator runbook*, not new production code.
@@ -27,7 +26,7 @@ operator runbook*, not new production code.
 | AC#6 | logs / config / image digest / exact `/upgrades?mode=set` invocation + before/after headers **captured** | run-dir layout + this runbook's artifact checklist |
 | AC#7 | any param/parity gap the live run surfaces becomes a **concrete follow-up issue** | operator files a follow-up per the checklist; never a silent patch |
 
-**Scope:** a protocol-upgrade mission over the mixed network from #3292. It does
+**Scope:** a protocol-upgrade mission over the Henyey mixed-image network. It does
 NOT add new upgrade machinery — all three layers (admin endpoint parse, herder
 nominate, ledger apply) are already implemented for every `LedgerUpgrade`
 variant.
@@ -39,7 +38,7 @@ variant.
 | Admin endpoint parse (`/upgrades?mode=set`) | `crates/app/src/compat_http/handlers/plaintext.rs` (`compat_upgrades_handler`) | Full — param set matches `CommandHandler.cpp:613-671` |
 | Herder schedule → nominate | `crates/herder/src/upgrades.rs` (`create_upgrades_for`, `is_valid_for_nomination`) | Full |
 | Ledger apply | `crates/ledger/src/close.rs` (`apply_to_header`, `apply_config_upgrades`, `apply_max_soroban_tx_set_size`) dispatched from `crates/ledger/src/manager.rs` (`apply_upgrades_to_delta`) | Full |
-| Externalize (SCP) | `crates/herder` EXTERNALIZE receipt path | Full (#3292) |
+| Externalize (SCP) | `crates/herder` EXTERNALIZE receipt path | Full |
 
 The `mode=set` parameters the SSC harness can drive, each mapped to a
 `LedgerUpgrade` variant at apply time:
@@ -110,9 +109,9 @@ checklist below.
 > run any of it and does NOT fabricate a mission transcript.
 
 1. **Auth + bring up the mixed network** (one-time per session): `nsc login`
-   (interactive browser OAuth). Reuse the #3292 mixed-image topology (stellar-core
+   (interactive browser OAuth). Reuse the Henyey mixed-image topology (stellar-core
    validators + ≥1 henyey node, core-majority quorum). Confirm baseline:
-   `/info.state == "Synced!"` and seq+hash agreement (run `assert-mission-3292.sh`).
+   `/info.state == "Synced!"` and seq+hash agreement (run `assert-henyey-mixed-mission.sh`).
 2. **Capture the pre-upgrade baseline.** Record henyey + stellar-core `/info`
    (ledger num/hash, `protocol_version`, `base_fee`, `base_reserve`,
    `max_tx_set_size`, flags) so the post-upgrade diff is unambiguous.

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
-# assert-mission-3292.sh — operator-run acceptance checks for the first
-# mixed-image Supercluster (SSC) mission (#3292). Run this against a LIVE
+# assert-henyey-mixed-mission.sh — operator-run acceptance checks for the
+# Henyey mixed-image Supercluster (SSC) mission. Run this against a LIVE
 # mission (the nsc-side instance is up and the SSC dotnet harness has the
 # mixed network running). It encodes mission acceptance criteria AC#3–AC#6 as
 # a runnable, exit-coded check.
@@ -18,7 +18,7 @@
 #   /metrics -> .metrics["peer.peer.authenticated-count"].count
 #
 # Usage:
-#   scripts/ssc/assert-mission-3292.sh \
+#   scripts/ssc/assert-henyey-mixed-mission.sh \
 #       --henyey-info    http://<henyey-pod>:11626/info \
 #       --core-info      http://<core-pod>:11626/info \
 #       --henyey-metrics http://<henyey-pod>:11626/metrics \
@@ -63,7 +63,7 @@ metric_auth() { jq -r '.metrics["peer.peer.authenticated-count"].count' <<<"$1";
 
 # --- Self-check: exercise the logic offline against fixtures -----------------
 if [ "$SELF_CHECK" -eq 1 ]; then
-  echo "=== assert-mission-3292 self-check (offline) ==="
+  echo "=== assert-henyey-mixed-mission self-check (offline) ==="
   HENYEY_FIX='{"info":{"state":"Synced!","ledger":{"num":12345,"hash":"deadbeef"}}}'
   CORE_FIX='{"info":{"state":"Synced!","ledger":{"num":12345,"hash":"deadbeef"}}}'
   METRICS_FIX='{"metrics":{"peer.peer.authenticated-count":{"type":"counter","count":3}}}'

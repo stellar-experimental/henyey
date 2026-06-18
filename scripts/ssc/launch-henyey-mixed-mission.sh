@@ -1,20 +1,18 @@
 #!/usr/bin/env bash
 #
-# launch-mission-3292.sh — stand up the nsc-side launch surface for the first
-# mixed-image Supercluster (SSC) mission (#3292): 3 stellar-core validators +
-# 1 henyey validator, stellar-core-majority quorum.
+# launch-henyey-mixed-mission.sh — stand up the nsc-side launch surface for
+# the Henyey mixed-image Supercluster (SSC) mission.
 #
 # This is a THIN WRAPPER over the verified `nsc` commands documented in
-# docs/supercluster-nsc-workflow.md (#3304): auth smoke check -> build+push
+# docs/supercluster-nsc-workflow.md: auth smoke check -> build+push
 # the henyey image -> capture the image digest -> `nsc create` an ephemeral
 # k8s instance -> write the run-dir layout -> print the exact SSC dotnet
 # invocation to hand off.
 #
 # IMPORTANT — this script does NOT run the mission. The actual mission RUN is
 # performed by the external `stellar/supercluster` dotnet harness (NOT vendored
-# here) against the published image + the instance kubeconfig, and is tracked
-# in #3292 as operator-executed work. This script gets you up to the hand-off
-# point and prints the exact SSC invocation.
+# here) against the published image + the instance kubeconfig. This script gets you up
+# to the hand-off point and prints the exact SSC invocation.
 #
 # Modes:
 #   --dry-run   Assemble and print every command + the run-dir layout WITHOUT
@@ -23,7 +21,7 @@
 #   (default)   Execute the nsc-side steps for real (requires `nsc login`).
 #
 # Usage:
-#   scripts/ssc/launch-mission-3292.sh [--dry-run] [--registry REG]
+#   scripts/ssc/launch-henyey-mixed-mission.sh [--dry-run] [--registry REG]
 #                                      [--image-tag TAG] [--duration DUR]
 #                                      [--runs-dir DIR]
 #
@@ -57,7 +55,7 @@ done
 
 IMAGE_REF="${REGISTRY}/${IMAGE_NAME}:${IMAGE_TAG}"
 DATE_TAG="$(date +%Y%m%d)"
-[ -n "$RUNS_DIR" ] || RUNS_DIR="runs/${DATE_TAG}-mission-3292"
+[ -n "$RUNS_DIR" ] || RUNS_DIR="runs/${DATE_TAG}-henyey-mixed-mission"
 
 # `run` echoes the command; in --dry-run it does NOT execute it.
 run() {
@@ -67,7 +65,7 @@ run() {
   fi
 }
 
-echo "=== SSC mission #3292 launch (nsc side) ==="
+echo "=== Henyey mixed-image SSC launch (nsc side) ==="
 echo "registry:   $REGISTRY"
 echo "image ref:  $IMAGE_REF"
 echo "duration:   $DURATION"
@@ -116,36 +114,45 @@ run nsc create --ephemeral \
   --enable="kubernetes:${K8S_VERSION}" \
   --duration="$DURATION" \
   --output_json_to="$INSTANCE_JSON" \
-  --purpose="SSC mission #3292 (henyey mixed validator)"
+  --purpose="SSC Henyey mixed-image mission"
 echo
 
-# --- 4. Hand off to the SSC dotnet harness (owned by #3292, NOT run here) -----
+# --- 4. Hand off to the SSC dotnet harness (NOT run here) ---------------
 echo "--- 4. Hand off to SSC dotnet harness (operator-executed, NOT run here) ---"
 cat <<HANDOFF
 The mission RUN is performed by the external stellar/supercluster dotnet
 harness (not vendored in this repo). Point it at the published image (pin by
 DIGEST for reproducibility) and the instance kubeconfig:
 
-  nsc kubeconfig write            # write a kubeconfig for the instance
-  # then, from the stellar/supercluster checkout:
-  dotnet run --project src/App -- \\
+  nsc kubeconfig write <instance-id>   # write a kubeconfig for the instance
+  # then, from the stellar/supercluster checkout with PR #400 or equivalent:
+  dotnet run --project src/App/App.fsproj --configuration Release -- mission \\
+      MixedImageLoadGenerationWithOldImageMajority \\
+      --kubeconfig <path-from-nsc-kubeconfig-write> \\
+      --namespace default \\
+      --destination ${RUNS_DIR}/ssc \\
+      --keep-data \\
+      --core-http-via-pod-exec \\
       --image=${IMAGE_PINNED} \\
-      --kubeconfig=<path-from-nsc-kubeconfig-write> \\
-      MissionMixedImageNetworkSurvey   # or the agreed first mixed-image mission name
+      --old-image=stellar/stellar-core:latest \\
+      --probe-timeout 240 \\
+      --tx-rate 5 \\
+      --num-txs 100 \\
+      --num-accounts 100 \\
+      --genesis-test-account-count 100
 
-Topology for the first mission (see docs/supercluster-mission-3292.md):
-  - 3 stellar-core validators + 1 henyey validator
-  - stellar-core-majority quorum (henyey is a minority validator)
-  - accelerated close time, no history / loadgen / survey
+In this mission, --image is Henyey and --old-image is stellar-core.
+The mission creates a 2-node stellar-core old-image majority and a 1-node
+Henyey new-image minority.
 
 Once the network is up, validate it with:
-  scripts/ssc/assert-mission-3292.sh \\
+  scripts/ssc/assert-henyey-mixed-mission.sh \\
       --henyey-info http://<henyey-pod>:11626/info \\
       --core-info   http://<core-pod>:11626/info \\
       --henyey-metrics http://<henyey-pod>:11626/metrics
 
-Then capture artifacts into ${RUNS_DIR}/ and onto #3292 (see the runbook §"Artifacts").
+Then capture artifacts into ${RUNS_DIR}/ (see the runbook §"Artifacts").
 HANDOFF
 echo
 
-echo "=== nsc-side launch surface ready (mission RUN handed to operator/#3292) ==="
+echo "=== nsc-side launch surface ready (mission RUN handed to operator/SSC) ==="

@@ -17,9 +17,9 @@ This is an operator runbook for the [Namespace](https://namespace.so) CLI (`nsc`
 > 2. **publishes** it to the SDF workspace registry (`nscr.io/k4jkul01t5rr0`), and
 > 3. **provisions** the Kubernetes instance the mission runs on (and lets you inspect it).
 >
-> The **actual mission RUN** — defining and driving a stellar-core-majority mixed mission — is performed by the **Stellar Supercluster dotnet harness** (`stellar/supercluster`), which consumes the published image via `--image=nscr.io/k4jkul01t5rr0/henyey:ssc`. That run is tracked in **#3292**, NOT executed by this runbook. This doc gives you everything up to the point where SSC takes over, plus the commands to inspect and tear down what nsc created.
+> The **actual mission RUN** is performed by the **Stellar Supercluster dotnet harness** (`stellar/supercluster`), which consumes the published image via `--image=nscr.io/k4jkul01t5rr0/henyey:ssc`. This runbook covers the `nsc` build/publish/provisioning surface plus the command shape to inject Henyey into SSC.
 >
-> Anything in this doc marked **"produced by SSC (#3292)"** is emitted by the SSC harness, not by `nsc` — do not expect `nsc` to generate it.
+> Anything in this doc marked **"produced by SSC"** is emitted by the SSC harness, not by `nsc` — do not expect `nsc` to generate it.
 
 ---
 
@@ -172,9 +172,9 @@ $ nsc registry describe nscr.io/k4jkul01t5rr0/henyey:ssc -o json
 
 ---
 
-## 3. Launch the #3292 mixed mission (acceptance: launch first stellar-core-majority mixed mission)
+## 3. Launch the Henyey mixed-image mission
 
-> **CALLOUT — boundary (repeat of §0):** the steps in this section stand up the **nsc-side launch surface**: a Kubernetes instance + the published image reference. The mission itself — the stellar-core-majority mixed topology, the loadgen, the assertions — is defined and RUN by the SSC dotnet harness and is tracked in **#3292**. This runbook does **not** contain a fabricated full-mission transcript; it documents and verifies only what `nsc` provides.
+> **CALLOUT — boundary (repeat of §0):** the steps in this section stand up the **nsc-side launch surface**: a Kubernetes instance + the published image reference. The mission itself — the stellar-core-majority mixed topology, the loadgen, the assertions — is defined and RUN by the SSC dotnet harness and is tracked in **the Henyey mixed-image mission**. This runbook does **not** contain a fabricated full-mission transcript; it documents and verifies only what `nsc` provides.
 
 ### 3a. Provision the Kubernetes instance (nsc side)
 
@@ -185,7 +185,7 @@ nsc create --ephemeral \
   --enable=kubernetes:1.33 \
   --duration=2h \
   --output_json_to=instance.json \
-  --purpose="SSC mission #3292 (Henyey mixed)"
+  --purpose="SSC Henyey mixed-image mission (Henyey mixed)"
 ```
 
 - `--ephemeral` + `--duration` bound the cost; the instance is reaped automatically after the duration even if you forget to destroy it.
@@ -231,17 +231,29 @@ NAME            STATUS   ROLES                  AGE   VERSION
 34s7a782adi1q   Ready    control-plane,master   7s    v1.33.1+k3s1
 ```
 
-### 3b. Hand off to SSC (#3292)
+### 3b. Hand off to SSC (the Henyey mixed-image mission)
 
 The SSC harness consumes the image and the instance. Conceptually:
 
 ```bash
-# RUN BY THE SSC HARNESS (stellar/supercluster) — tracked in #3292, NOT here.
-#   dotnet run ... --image=nscr.io/k4jkul01t5rr0/henyey:ssc@sha256:<digest> \
-#       --kubeconfig=<from nsc kubeconfig> <MissionMixed...>
+# RUN BY THE SSC HARNESS (stellar/supercluster) — not by nsc.
+dotnet run --project src/App/App.fsproj --configuration Release -- mission \
+  MixedImageLoadGenerationWithOldImageMajority \
+  --kubeconfig <path-from-nsc-kubeconfig-write> \
+  --namespace default \
+  --destination <artifact-dir>/ssc \
+  --keep-data \
+  --core-http-via-pod-exec \
+  --image nscr.io/k4jkul01t5rr0/henyey:ssc@sha256:<digest> \
+  --old-image stellar/stellar-core:latest \
+  --probe-timeout 240 \
+  --tx-rate 5 \
+  --num-txs 100 \
+  --num-accounts 100 \
+  --genesis-test-account-count 100
 ```
 
-Point SSC at the instance's kubeconfig and the published image. **This invocation is owned by #3292** — see that issue for the mission class, quorum layout, and loadgen parameters.
+Point SSC at the instance's kubeconfig and the published Henyey image. In this mission, `--image` is Henyey and `--old-image` is stellar-core.
 
 ### 3c. Inspect the running mission (nsc side)
 
@@ -267,19 +279,19 @@ nsc kubectl logs <pod>     # per-pod (Henyey/stellar-core) logs
 | **Kubernetes resources** | `nsc kubectl get all -A` | nsc (k8s) |
 | **Pod / system logs** | `nsc logs --all`, `nsc kubectl logs <pod>` | nsc (k8s) |
 | **kubeconfig** | `nsc kubeconfig write` | nsc |
-| **Generated `stellar-core.cfg`** | written into the SSC mission output dir | **produced by SSC (#3292)** — nsc does not emit this |
-| **Mission result / assertions / pass-fail** | SSC harness output / mission logs | **produced by SSC (#3292)** — nsc does not emit this |
-| **Loadgen / metrics assertions** | SSC harness | **produced by SSC (#3292)** |
+| **Generated `stellar-core.cfg`** | written into the SSC mission output dir | **produced by SSC** — nsc does not emit this |
+| **Mission result / assertions / pass-fail** | SSC harness output / mission logs | **produced by SSC** — nsc does not emit this |
+| **Loadgen / metrics assertions** | SSC harness | **produced by SSC** |
 
 Suggested run directory layout (operator convention):
 
 ```
-runs/<date>-mission-3292/
+runs/<date>-henyey-mixed-mission/
   instance.json           # nsc create --output_json_to
   image-digest.txt        # nsc registry describe ... -o json
   k8s-resources.txt       # nsc kubectl get all -A
   logs/                   # nsc logs --all, per-pod logs
-  ssc/                    # produced by SSC (#3292): stellar-core.cfg, mission output
+  ssc/                    # produced by SSC: stellar-core.cfg, mission output
 ```
 
 ---
@@ -338,9 +350,9 @@ nsc build -f Dockerfile --platform linux/amd64 \
   --push -n nscr.io/k4jkul01t5rr0/henyey:ssc .
 nsc registry describe nscr.io/k4jkul01t5rr0/henyey:ssc -o json   # capture sha256
 
-# 3. provision (nsc side); mission RUN handed to SSC / #3292
+# 3. provision (nsc side); mission RUN handed to SSC
 nsc create --ephemeral --enable=kubernetes:1.33 --duration=2h \
-  --output_json_to=instance.json --purpose="SSC mission #3292"
+  --output_json_to=instance.json --purpose="SSC Henyey mixed-image mission"
 nsc kubeconfig write && nsc kubectl get all -A
 
 # 4. teardown
@@ -358,9 +370,9 @@ nsc list -o json   # confirm your ephemeral cluster is gone (use -o json, not ba
 | §2 build + `-n`/`--push` to workspace registry | YES | real build via remote builder |
 | §2 `nsc registry describe` digest capture | YES | real `sha256:` digest captured |
 | §3a ephemeral `nsc create` + `--output_json_to` | YES | instance `34s7a782adi1q` created; real metadata JSON captured |
-| §3b SSC mission RUN | NO — by design | owned by #3292 (long-lived k8s + dotnet harness) |
+| §3b SSC mission RUN | NO — by design | owned by the external SSC harness (long-lived k8s + dotnet harness) |
 | §3c `nsc kubectl get nodes` inspection | YES | real node `Ready` (`v1.33.1+k3s1`) against the ephemeral instance |
 | §5 `nsc destroy --force` teardown | YES | `34s7a782adi1q` destroyed (exit 0); confirmed gone via `nsc list -o json` |
 | TTY gotcha (`nsc list --all` → `/dev/tty`) | YES | reproduced live; `nsc list -o json` is the verified non-interactive workaround |
 
-The only acceptance step not live-runnable within a single task is the full #3292 mission RUN (long-lived k8s instance + SSC dotnet harness); it is documented here and handed to #3292.
+The only acceptance step not live-runnable within this `nsc` runbook is the full Henyey mixed-image mission RUN (long-lived k8s instance + SSC dotnet harness).

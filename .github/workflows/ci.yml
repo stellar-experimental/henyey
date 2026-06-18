@@ -172,11 +172,11 @@ jobs:
       - name: Run project-loop skill snippet harness
         run: bash scripts/test-project-loop-skill-snippets.sh
 
-  ssc-mission-3292-scripts:
-    name: SSC Mission 3292 Scripts
+  ssc-henyey-mixed-mission-scripts:
+    name: Henyey Mixed-Image SSC Scripts
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
-      - name: Run SSC mission #3292 script harness (dry-run + self-check)
-        run: bash scripts/ssc/test-mission-3292-scripts.sh
+      - name: Run Henyey mixed-image SSC script harness (dry-run + self-check)
+        run: bash scripts/ssc/test-henyey-mixed-mission-scripts.sh

@@ -1,21 +1,21 @@
 #!/usr/bin/env bash
 #
-# test-mission-3292-scripts.sh — CI smoke test for the SSC mission #3292 helper
+# test-henyey-mixed-mission-scripts.sh — CI smoke test for the Henyey mixed-image SSC helper
 # scripts. Exercises their command-assembly and assertion logic WITHOUT any live
 # infra (`nsc`, k8s, curl), so the launch/assert paths are covered in CI.
 #
 # Covers:
 #   - bash -n syntax of both helper scripts
-#   - launch-mission-3292.sh --dry-run assembles the verified nsc commands and
+#   - launch-henyey-mixed-mission.sh --dry-run assembles the verified nsc commands and
 #     the run-dir layout without invoking nsc
-#   - assert-mission-3292.sh --self-check validates its JSON-extraction and
+#   - assert-henyey-mixed-mission.sh --self-check validates its JSON-extraction and
 #     seq+hash agreement / mismatch logic against built-in fixtures
 #
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-LAUNCH="$SCRIPT_DIR/launch-mission-3292.sh"
-ASSERT="$SCRIPT_DIR/assert-mission-3292.sh"
+LAUNCH="$SCRIPT_DIR/launch-henyey-mixed-mission.sh"
+ASSERT="$SCRIPT_DIR/assert-henyey-mixed-mission.sh"
 
 fail=0
 check() {
@@ -27,7 +27,7 @@ check() {
   fi
 }
 
-echo "=== SSC mission #3292 script harness ==="
+echo "=== Henyey mixed-image SSC script harness ==="
 
 # 1. Syntax.
 check "launch script bash -n" bash -n "$LAUNCH"
@@ -57,9 +57,9 @@ check "assert self-check (offline logic)" bash "$ASSERT" --self-check
 
 echo
 if [ "$fail" -eq 0 ]; then
-  echo "=== ALL SSC mission #3292 script checks PASSED ==="
+  echo "=== ALL Henyey mixed-image SSC script checks PASSED ==="
   exit 0
 else
-  echo "=== SSC mission #3292 script checks FAILED ==="
+  echo "=== Henyey mixed-image SSC script checks FAILED ==="
   exit 1
 fi
