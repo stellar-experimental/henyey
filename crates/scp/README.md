@@ -46,13 +46,12 @@ stateDiagram-v2
 | `BallotPhase` | Public enum describing ballot progression through `Prepare`, `Confirm`, and `Externalize`. |
 | `ValidationLevel` | Driver-reported validation result used to gate nomination and ballot progress. |
 | `SCPTimerType` | Identifies nomination versus ballot timers. |
-| `ScpError` | Error enum for malformed messages, invalid quorum sets, and internal SCP failures. |
+| `ScpError` | Error enum for SCP envelope signature-verification failures. |
 | `QuorumConfigError` | Error enum for parsing and validating Rust-side quorum-set configuration. |
 | `SlotInfo` | Serializable slot summary combining nomination and ballot diagnostics. |
 | `NominationInfo` | Serializable nomination-state snapshot. |
 | `BallotInfo` | Serializable ballot-state snapshot, including prepared and commit ranges. |
 | `QuorumInfo` / `NodeInfo` | Serializable quorum participation view for a slot and its peers. |
-| `SingletonQuorumSetCache` | Cache for repeatedly constructing one-node quorum sets during quorum operations. |
 
 ## Usage
 
