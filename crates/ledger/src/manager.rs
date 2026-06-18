@@ -2525,15 +2525,6 @@ impl LedgerManager {
             Ok(store.all_ledger_entries())
         });
 
-        // Create index-based lookup for offers by (account, asset).
-        let offer_store_idx = self.offer_store.clone();
-        let offers_by_account_asset_fn: crate::snapshot::OffersByAccountAssetFn = Arc::new(
-            move |account_id: &AccountId, asset: &stellar_xdr::curr::Asset| {
-                let store = offer_store_idx.lock();
-                Ok(store.offers_by_account_and_asset_as_entries(account_id, asset))
-            },
-        );
-
         // Create index-based lookup for pool share trustlines by account.
         // This mirrors stellar-core's `getPoolShareTrustLine(accountID, asset)` which
         // queries SQL for all pool share trustlines owned by an account.  Without this
@@ -2551,7 +2542,6 @@ impl LedgerManager {
 
         let mut handle = SnapshotHandle::with_lookups_and_entries(snapshot, lookup_fn, entries_fn);
         handle.set_batch_lookup(batch_lookup_fn);
-        handle.set_offers_by_account_asset(offers_by_account_asset_fn);
         handle.set_pool_share_tls_by_account(pool_share_tls_by_account_fn);
         let closure_build_elapsed = t3.elapsed();
 
@@ -5973,7 +5963,7 @@ impl LedgerCloseContext<'_> {
             }
         }
 
-        // Record stats (counts were already computed during categorize_for_bucket_update)
+        // Record stats (counts were already computed during drain_categorization_for_bucket_update)
         self.stats.record_entry_changes(
             bucket_created_count,
             bucket_updated_count,

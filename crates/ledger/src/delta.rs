@@ -708,11 +708,6 @@ impl LedgerDelta {
             .collect()
     }
 
-    /// Result of categorizing delta entries for bucket list update.
-    pub fn categorize_for_bucket_update(&self) -> DeltaCategorization {
-        categorize_changes(self.changes().cloned(), false, self.ledger_seq)
-    }
-
     /// Drains entries from the delta, categorizing them for bucket list update.
     /// Moves entries instead of cloning, saving ~50K clone operations.
     /// Metadata (fee_pool_delta, total_coins_delta) is preserved.

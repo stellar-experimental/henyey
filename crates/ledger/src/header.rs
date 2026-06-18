@@ -124,46 +124,6 @@ pub fn calculate_skip_values(header: &LedgerHeader) -> [stellar_xdr::curr::Hash;
     skip_list
 }
 
-/// Calculate the target ledger sequence for a skip list entry.
-///
-/// Given a ledger sequence and skip list index, computes which historical
-/// ledger that skip list entry points to.
-///
-/// # Arguments
-///
-/// * `current_seq` - The ledger sequence containing the skip list
-/// * `skip_index` - Which skip list entry (0-3)
-///
-/// # Returns
-///
-/// The target ledger sequence, or `None` if:
-/// - The index is out of range (>= 4)
-/// - The target would be before genesis (sequence 0)
-pub fn skip_list_target_seq(current_seq: u32, skip_index: usize) -> Option<u32> {
-    if skip_index >= SKIP_LIST_SIZE {
-        return None;
-    }
-
-    fn round_back(current_seq: u32, interval: u32) -> u32 {
-        let rem = current_seq % interval;
-        if rem == 0 {
-            interval
-        } else {
-            rem
-        }
-    }
-
-    let delta = match skip_index {
-        0 => 1,
-        1 => round_back(current_seq, 4),
-        2 => round_back(current_seq, 16),
-        3 => round_back(current_seq, 64),
-        _ => return None,
-    };
-
-    current_seq.checked_sub(delta)
-}
-
 /// Verify that a ledger header correctly chains to its predecessor.
 ///
 /// This validates the cryptographic chain integrity by checking:
@@ -202,50 +162,6 @@ pub fn verify_header_chain(
             expected: prev_header_hash.to_hex(),
             actual: current_prev_hash.to_hex(),
         });
-    }
-
-    Ok(())
-}
-
-/// Verify the skip list entries against historical headers.
-///
-/// This validates that each non-zero skip list entry correctly points
-/// to the expected historical header hash.
-///
-/// # Arguments
-///
-/// * `header` - The header whose skip list to verify
-/// * `get_header_at_seq` - Function to look up historical header hashes
-///
-/// # Verification
-///
-/// For each skip list entry, if the target sequence exists and can be
-/// looked up, the stored hash must match the actual header hash at that
-/// sequence. Zero hashes are skipped (valid for genesis/early ledgers).
-pub fn verify_skip_list(
-    header: &LedgerHeader,
-    get_header_at_seq: impl Fn(u32) -> Option<Hash256>,
-) -> Result<()> {
-    for (i, skip_hash) in header.skip_list.iter().enumerate() {
-        let skip_hash256 = Hash256::from(skip_hash.0);
-
-        if skip_hash256.is_zero() {
-            continue;
-        }
-
-        if let Some(target_seq) = skip_list_target_seq(header.ledger_seq, i) {
-            if let Some(expected_hash) = get_header_at_seq(target_seq) {
-                if skip_hash256 != expected_hash {
-                    return Err(LedgerError::InvalidHeaderChain(format!(
-                        "skip list entry {} mismatch at seq {}: expected {}, got {}",
-                        i,
-                        target_seq,
-                        expected_hash.to_hex(),
-                        skip_hash256.to_hex()
-                    )));
-                }
-            }
-        }
     }
 
     Ok(())
@@ -413,15 +329,6 @@ mod tests {
         header.skip_list = calculate_skip_values(&header);
         assert_eq!(header.skip_list[0], Hash([4u8; 32]));
         assert_eq!(header.skip_list[1], Hash([3u8; 32]));
-    }
-
-    #[test]
-    fn test_skip_list_target_seq() {
-        assert_eq!(skip_list_target_seq(10, 0), Some(9));
-        assert_eq!(skip_list_target_seq(1, 0), Some(0));
-        assert_eq!(skip_list_target_seq(8, 1), Some(4));
-        assert_eq!(skip_list_target_seq(10, 1), Some(8));
-        assert_eq!(skip_list_target_seq(0, 0), None);
     }
 
     #[test]
