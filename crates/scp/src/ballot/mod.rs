@@ -63,8 +63,8 @@ mod envelope;
 mod state_machine;
 mod statements;
 
-pub use statements::get_companion_quorum_set_hash;
-pub use statements::get_working_ballot;
+pub(crate) use statements::get_companion_quorum_set_hash;
+pub(crate) use statements::get_working_ballot;
 use statements::{are_ballots_less_and_compatible, are_ballots_less_and_incompatible};
 pub(crate) use statements::{ballot_compare, ballot_compatible, cmp_opt_ballot};
 
@@ -374,11 +374,6 @@ impl BallotProtocol {
     /// Get the high ballot (highest confirmable).
     pub fn high_ballot(&self) -> Option<&ScpBallot> {
         self.high_ballot.as_ref()
-    }
-
-    /// Get the current consensus value.
-    pub fn value(&self) -> Option<&Value> {
-        self.current_ballot.as_ref().map(|b| &b.value)
     }
 
     /// Check protocol invariants for debugging.

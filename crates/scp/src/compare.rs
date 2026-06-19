@@ -32,7 +32,7 @@ pub(crate) fn ballot_summary_of(pledges: &ScpStatementPledges) -> Option<(Ballot
 /// check in stellar-core:
 /// 1. Identity: node_id + slot_index must match (SCP.cpp:420-423)
 /// 2. Phase: nomination ↔ ballot never replaces (Slot.cpp:118-121)
-/// 3. Ballot ordering: delegates to [`is_newer_ballot_st`] (BallotProtocol.cpp:55-90)
+/// 3. Ballot ordering: delegates to `is_newer_ballot_st` (BallotProtocol.cpp:55-90)
 ///
 /// Note: stellar-core's slot-existence check (`getSlot`) depends on runtime
 /// state and is not replicated in this free function.
