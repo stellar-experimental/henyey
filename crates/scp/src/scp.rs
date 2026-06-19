@@ -43,7 +43,6 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::Duration;
 
 use parking_lot::RwLock;
 use stellar_xdr::curr::{
@@ -355,24 +354,6 @@ impl<D: SCPDriver> SCP<D> {
         self.slots.read().contains_key(&slot_index)
     }
 
-    /// Get the current value for a slot.
-    ///
-    /// For externalized slots, returns the externalized value.
-    /// For non-externalized slots, returns the ballot's committed value,
-    /// or the nomination composite value if the ballot hasn't committed yet.
-    /// Returns `None` if the slot has no value at all.
-    pub fn get_slot_current_value(&self, slot_index: u64) -> Option<Value> {
-        let slots = self.slots.read();
-        let slot = slots.get(&slot_index)?;
-        if let Some(value) = slot.get_externalized_value() {
-            return Some(value.clone());
-        }
-        if let Some(commit_ballot) = slot.ballot().commit() {
-            return Some(commit_ballot.value.clone());
-        }
-        slot.nomination().latest_composite().cloned()
-    }
-
     /// Restore `fully_validated` for a slot and emit any deferred
     /// ballot/nomination envelopes that were suppressed while the
     /// value was pending full validation.
@@ -471,16 +452,6 @@ impl<D: SCPDriver> SCP<D> {
             .filter(|(_, slot)| slot.is_externalized())
             .map(|(&index, _)| index)
             .max()
-    }
-
-    /// Get the timeout duration for a nomination round.
-    pub fn get_nomination_timeout(&self, round: u32) -> Duration {
-        self.driver.compute_timeout(round, true)
-    }
-
-    /// Get the timeout duration for a ballot round.
-    pub fn get_ballot_timeout(&self, round: u32) -> Duration {
-        self.driver.compute_timeout(round, false)
     }
 
     /// Check if we've heard from a v-blocking set for a slot.
