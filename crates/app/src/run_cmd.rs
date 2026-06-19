@@ -1,4 +1,4 @@
-//! Run command implementation for rs-stellar-core.
+//! Run command implementation for henyey.
 //!
 //! The run command starts the node and keeps it synchronized with the network.
 //! This is the primary operational mode for a Stellar Core node.
@@ -15,9 +15,9 @@
 //! # Command Line Usage
 //!
 //! ```text
-//! rs-stellar-core run                    # Run as a full node
-//! rs-stellar-core run --validator        # Run as a validator
-//! rs-stellar-core run --watcher          # Run as a watcher (no catchup)
+//! henyey run                    # Run as a full node
+//! henyey run --validator        # Run as a validator
+//! henyey run --watcher          # Run as a watcher (no catchup)
 //! ```
 //!
 //! # Running Modes

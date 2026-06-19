@@ -1,4 +1,4 @@
-//! Configuration loading and validation for rs-stellar-core.
+//! Configuration loading and validation for henyey.
 //!
 //! This module provides a comprehensive configuration system that supports:
 //!

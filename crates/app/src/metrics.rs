@@ -14,8 +14,6 @@
 //! invocation below. The macro generates the public constant, description,
 //! pre-registration, and test inventory from that one declaration.
 
-use std::sync::OnceLock;
-
 use metrics::{counter, describe_counter, describe_gauge, describe_histogram, gauge};
 use metrics_exporter_prometheus::{Matcher, PrometheusBuilder, PrometheusHandle};
 
@@ -1506,7 +1504,9 @@ fn configure_histogram_buckets(builder: PrometheusBuilder) -> PrometheusBuilder 
 /// The `metrics` global recorder is one-shot per process. Since Rust tests
 /// run in parallel within the same process, this helper ensures the recorder
 /// is installed exactly once. Subsequent calls return the same handle.
-pub fn ensure_test_recorder() -> &'static PrometheusHandle {
+#[cfg(test)]
+pub(crate) fn ensure_test_recorder() -> &'static PrometheusHandle {
+    use std::sync::OnceLock;
     static HANDLE: OnceLock<PrometheusHandle> = OnceLock::new();
     HANDLE.get_or_init(|| {
         configure_histogram_buckets(PrometheusBuilder::new())

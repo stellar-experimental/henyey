@@ -1,4 +1,4 @@
-//! Logging setup and progress tracking for rs-stellar-core.
+//! Logging setup and progress tracking for henyey.
 //!
 //! This module provides:
 //!

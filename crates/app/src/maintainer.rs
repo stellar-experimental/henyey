@@ -1,4 +1,4 @@
-//! Database maintenance scheduler for rs-stellar-core.
+//! Database maintenance scheduler for henyey.
 //!
 //! The Maintainer is responsible for periodically cleaning up old data from the
 //! database to prevent unbounded growth. It runs in the background and performs

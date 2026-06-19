@@ -1,4 +1,4 @@
-//! Catchup command implementation for rs-stellar-core.
+//! Catchup command implementation for henyey.
 //!
 //! The catchup command synchronizes a node with the Stellar network by downloading
 //! ledger history from archives and applying it to rebuild local state. This is
@@ -11,9 +11,9 @@
 //! # Command Line Usage
 //!
 //! ```text
-//! rs-stellar-core catchup current        # Catch up to the latest ledger
-//! rs-stellar-core catchup 1000000        # Catch up to ledger 1000000
-//! rs-stellar-core catchup 1000000/100    # Catch up to ledger 1000000 with 100 ledgers history
+//! henyey catchup current        # Catch up to the latest ledger
+//! henyey catchup 1000000        # Catch up to ledger 1000000
+//! henyey catchup 1000000/100    # Catch up to ledger 1000000 with 100 ledgers history
 //! ```
 //!
 //! # Catchup Modes
