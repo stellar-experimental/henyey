@@ -463,19 +463,6 @@ pub struct FloodGateStats {
     pub evictions_total: u64,
 }
 
-impl FloodGateStats {
-    /// Calculates the duplicate rate as a percentage.
-    ///
-    /// Returns 0.0 if no messages have been processed.
-    pub fn duplicate_rate(&self) -> f64 {
-        if self.total_messages == 0 {
-            0.0
-        } else {
-            (self.duplicate_messages as f64 / self.total_messages as f64) * 100.0
-        }
-    }
-}
-
 /// Computes the BLAKE2b-256 hash of a message for flood tracking.
 ///
 /// This matches stellar-core's `xdrBlake2()` used in `Floodgate::broadcast()`.

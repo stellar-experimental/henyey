@@ -48,7 +48,13 @@ pub struct MessageFrame {
     /// Size of the message body in bytes (not including length prefix).
     pub raw_len: usize,
 
-    /// Whether bit 31 was set in the length prefix.
+    /// Whether bit 31 of the 4-byte length prefix was set.
+    ///
+    /// Invariant: bit 31 is the XDR record-marking "last fragment"
+    /// (continuation) bit, NOT an authentication flag. stellar-core treats
+    /// it identically (`TCPPeer.cpp:679`: `length &= 0x7f` clears the XDR
+    /// continuation bit). MAC/auth gating is on the receiver's own auth
+    /// state (see `AuthContext::unwrap_message`), never on this wire bit.
     pub is_last_fragment: bool,
 }
 

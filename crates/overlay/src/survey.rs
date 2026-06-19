@@ -53,6 +53,7 @@ const NUM_LEDGERS_BEFORE_IGNORE: u32 = 6;
 const MAX_REQUEST_LIMIT_PER_LEDGER: u32 = 10;
 
 /// Throttle timeout multiplier for survey requests.
+#[cfg(test)]
 pub const SURVEY_THROTTLE_TIMEOUT_MULT: u32 = 3;
 
 /// Survey throttle timeout in milliseconds.

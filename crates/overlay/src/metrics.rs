@@ -23,7 +23,6 @@
 //! All metrics use atomic operations and are safe to access from multiple threads.
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
 
 use stellar_xdr::curr::StellarMessage;
 
@@ -67,167 +66,10 @@ impl Counter {
     }
 }
 
-/// Simple timer for tracking operation latencies.
-#[derive(Debug)]
-pub struct Timer {
-    /// Total duration of all recorded operations.
-    total_duration_us: AtomicU64,
-    /// Number of operations recorded.
-    count: AtomicU64,
-    /// Minimum duration in microseconds.
-    min_us: AtomicU64,
-    /// Maximum duration in microseconds.
-    max_us: AtomicU64,
-}
-
-impl Default for Timer {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Timer {
-    /// Create a new timer.
-    pub fn new() -> Self {
-        Self {
-            total_duration_us: AtomicU64::new(0),
-            count: AtomicU64::new(0),
-            min_us: AtomicU64::new(u64::MAX),
-            max_us: AtomicU64::new(0),
-        }
-    }
-
-    /// Record a duration.
-    pub fn record(&self, duration: Duration) {
-        let us = duration.as_micros() as u64;
-        self.total_duration_us.fetch_add(us, Ordering::Relaxed);
-        self.count.fetch_add(1, Ordering::Relaxed);
-
-        // Update min (compare-and-swap loop)
-        loop {
-            let current_min = self.min_us.load(Ordering::Relaxed);
-            if us >= current_min {
-                break;
-            }
-            if self
-                .min_us
-                .compare_exchange_weak(current_min, us, Ordering::Relaxed, Ordering::Relaxed)
-                .is_ok()
-            {
-                break;
-            }
-        }
-
-        // Update max
-        loop {
-            let current_max = self.max_us.load(Ordering::Relaxed);
-            if us <= current_max {
-                break;
-            }
-            if self
-                .max_us
-                .compare_exchange_weak(current_max, us, Ordering::Relaxed, Ordering::Relaxed)
-                .is_ok()
-            {
-                break;
-            }
-        }
-    }
-
-    /// Start timing an operation. Returns a guard that records the duration when dropped.
-    pub fn start(&self) -> TimerGuard<'_> {
-        TimerGuard {
-            timer: self,
-            start: Instant::now(),
-        }
-    }
-
-    /// Get the number of recorded operations.
-    pub fn count(&self) -> u64 {
-        self.count.load(Ordering::Relaxed)
-    }
-
-    /// Get the total duration of all recorded operations.
-    pub fn total_duration(&self) -> Duration {
-        Duration::from_micros(self.total_duration_us.load(Ordering::Relaxed))
-    }
-
-    /// Get the average duration (returns 0 if no operations recorded).
-    pub fn avg_duration(&self) -> Duration {
-        let count = self.count();
-        if count == 0 {
-            return Duration::ZERO;
-        }
-        let total = self.total_duration_us.load(Ordering::Relaxed);
-        Duration::from_micros(total / count)
-    }
-
-    /// Get the minimum duration (returns MAX if no operations recorded).
-    pub fn min_duration(&self) -> Duration {
-        let min = self.min_us.load(Ordering::Relaxed);
-        if min == u64::MAX {
-            Duration::ZERO
-        } else {
-            Duration::from_micros(min)
-        }
-    }
-
-    /// Get the maximum duration.
-    pub fn max_duration(&self) -> Duration {
-        Duration::from_micros(self.max_us.load(Ordering::Relaxed))
-    }
-
-    /// Get a snapshot of timer statistics.
-    pub fn snapshot(&self) -> TimerSnapshot {
-        TimerSnapshot {
-            count: self.count(),
-            total: self.total_duration(),
-            avg: self.avg_duration(),
-            min: self.min_duration(),
-            max: self.max_duration(),
-        }
-    }
-
-    /// Reset all values.
-    pub fn reset(&self) {
-        self.total_duration_us.store(0, Ordering::Relaxed);
-        self.count.store(0, Ordering::Relaxed);
-        self.min_us.store(u64::MAX, Ordering::Relaxed);
-        self.max_us.store(0, Ordering::Relaxed);
-    }
-}
-
-/// Guard that records timer duration when dropped.
-pub struct TimerGuard<'a> {
-    timer: &'a Timer,
-    start: Instant,
-}
-
-impl Drop for TimerGuard<'_> {
-    fn drop(&mut self) {
-        self.timer.record(self.start.elapsed());
-    }
-}
-
 fn reset_counters(counters: &[&Counter]) {
     for counter in counters {
         counter.reset();
     }
-}
-
-/// Snapshot of timer statistics.
-#[derive(Debug, Clone)]
-pub struct TimerSnapshot {
-    /// Number of operations.
-    pub count: u64,
-    /// Total duration.
-    pub total: Duration,
-    /// Average duration.
-    pub avg: Duration,
-    /// Minimum duration.
-    pub min: Duration,
-    /// Maximum duration.
-    pub max: Duration,
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -820,61 +662,6 @@ mod tests {
     }
 
     #[test]
-    fn test_timer_basic() {
-        let timer = Timer::new();
-        assert_eq!(timer.count(), 0);
-
-        timer.record(Duration::from_millis(10));
-        timer.record(Duration::from_millis(20));
-        timer.record(Duration::from_millis(30));
-
-        assert_eq!(timer.count(), 3);
-
-        let snapshot = timer.snapshot();
-        assert_eq!(snapshot.count, 3);
-        // Total should be around 60ms (60000 us)
-        assert!(snapshot.total.as_micros() >= 59000);
-        assert!(snapshot.total.as_micros() <= 61000);
-        // Min should be around 10ms
-        assert!(snapshot.min.as_millis() >= 9);
-        assert!(snapshot.min.as_millis() <= 11);
-        // Max should be around 30ms
-        assert!(snapshot.max.as_millis() >= 29);
-        assert!(snapshot.max.as_millis() <= 31);
-    }
-
-    #[test]
-    fn test_timer_guard() {
-        let timer = Timer::new();
-
-        {
-            let _guard = timer.start();
-            thread::sleep(Duration::from_millis(5));
-        }
-
-        assert_eq!(timer.count(), 1);
-        assert!(timer.total_duration().as_millis() >= 4);
-    }
-
-    #[test]
-    fn test_timer_concurrent() {
-        let timer = Timer::new();
-        let timer_ref = &timer;
-
-        thread::scope(|s| {
-            for _ in 0..10 {
-                s.spawn(|| {
-                    for _ in 0..10 {
-                        timer_ref.record(Duration::from_micros(100));
-                    }
-                });
-            }
-        });
-
-        assert_eq!(timer.count(), 100);
-    }
-
-    #[test]
     fn test_overlay_metrics_creation() {
         let metrics = OverlayMetrics::new();
 
@@ -927,14 +714,6 @@ mod tests {
 
         assert_eq!(metrics.messages_read.get(), 0);
         assert_eq!(metrics.bytes_read.get(), 0);
-    }
-
-    #[test]
-    fn test_timer_empty_avg() {
-        let timer = Timer::new();
-        assert_eq!(timer.avg_duration(), Duration::ZERO);
-        assert_eq!(timer.min_duration(), Duration::ZERO);
-        assert_eq!(timer.max_duration(), Duration::ZERO);
     }
 
     #[test]
