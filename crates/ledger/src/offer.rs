@@ -4,11 +4,10 @@
 //!
 //! - [`OfferDescriptor`]: A lightweight reference to an offer's price and ID
 //! - [`AssetPair`]: A trading pair of buying and selling assets
-//! - [`is_better_offer`]: Determine which offer has a better price
 //!
 //! # Offer Ordering
 //!
-//! Offers are ordered by:
+//! Offers are ordered by `OfferDescriptor`'s [`Ord`] impl:
 //! 1. **Price** (ascending) - Lower price is better (seller wants less of buying asset per selling asset)
 //! 2. **Offer ID** (ascending) - For equal prices, older offers (lower ID) have priority
 //!
@@ -18,7 +17,7 @@
 //! # Example
 //!
 //! ```
-//! use henyey_ledger::offer::{OfferDescriptor, is_better_offer};
+//! use henyey_ledger::offer::OfferDescriptor;
 //! use stellar_xdr::curr::Price;
 //!
 //! let offer1 = OfferDescriptor {
@@ -32,7 +31,7 @@
 //! };
 //!
 //! // offer1 is better because it has a lower price
-//! assert!(is_better_offer(&offer1, &offer2));
+//! assert!(offer1 < offer2);
 //! ```
 
 use std::hash::{Hash, Hasher};
@@ -127,37 +126,6 @@ impl Hash for OfferDescriptor {
     }
 }
 
-/// Check if the left offer is better than the right offer.
-///
-/// An offer is considered "better" if:
-/// 1. It has a lower price (n/d ratio), or
-/// 2. For equal prices, it has a lower offer ID (older offers have priority)
-///
-/// # Arguments
-///
-/// * `lhs` - The left-hand offer descriptor
-/// * `rhs` - The right-hand offer descriptor
-///
-/// # Returns
-///
-/// `true` if `lhs` is a better offer than `rhs`.
-///
-/// # Example
-///
-/// ```
-/// use henyey_ledger::offer::{OfferDescriptor, is_better_offer};
-/// use stellar_xdr::curr::Price;
-///
-/// let cheaper = OfferDescriptor::new(Price { n: 1, d: 2 }, 100);
-/// let expensive = OfferDescriptor::new(Price { n: 2, d: 3 }, 50);
-///
-/// assert!(is_better_offer(&cheaper, &expensive));
-/// assert!(!is_better_offer(&expensive, &cheaper));
-/// ```
-pub fn is_better_offer(lhs: &OfferDescriptor, rhs: &OfferDescriptor) -> bool {
-    lhs < rhs
-}
-
 /// A trading pair of assets.
 ///
 /// This struct represents a pair of assets being traded in the DEX:
@@ -197,27 +165,6 @@ impl Hash for AssetPair {
     }
 }
 
-/// A comparator for sorting offers by price then ID.
-///
-/// This can be used with sorted collections to maintain offers
-/// in their proper order.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct IsBetterOfferComparator;
-
-impl IsBetterOfferComparator {
-    /// Compare two offer descriptors.
-    ///
-    /// Returns `true` if `lhs` should come before `rhs` in sorted order.
-    pub fn compare(&self, lhs: &OfferDescriptor, rhs: &OfferDescriptor) -> bool {
-        is_better_offer(lhs, rhs)
-    }
-}
-
-/// Sort offer descriptors by price and ID.
-pub fn sort_offer_descriptors(offers: &mut [OfferDescriptor]) {
-    offers.sort();
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -243,35 +190,6 @@ mod tests {
     }
 
     #[test]
-    fn test_is_better_offer_by_price() {
-        let cheaper = make_descriptor(1, 2, 100); // price = 0.5
-        let expensive = make_descriptor(2, 3, 50); // price = 0.67
-
-        assert!(is_better_offer(&cheaper, &expensive));
-        assert!(!is_better_offer(&expensive, &cheaper));
-    }
-
-    #[test]
-    fn test_is_better_offer_by_id() {
-        let older = make_descriptor(1, 2, 100);
-        let newer = make_descriptor(1, 2, 200);
-
-        // Same price, older (lower ID) is better
-        assert!(is_better_offer(&older, &newer));
-        assert!(!is_better_offer(&newer, &older));
-    }
-
-    #[test]
-    fn test_is_better_offer_equal() {
-        let d1 = make_descriptor(1, 2, 100);
-        let d2 = make_descriptor(1, 2, 100);
-
-        // Neither is better than equal
-        assert!(!is_better_offer(&d1, &d2));
-        assert!(!is_better_offer(&d2, &d1));
-    }
-
-    #[test]
     fn test_offer_descriptor_ordering() {
         let mut offers = vec![
             make_descriptor(3, 4, 300), // price = 0.75
@@ -280,7 +198,8 @@ mod tests {
             make_descriptor(2, 3, 50),  // price = 0.67
         ];
 
-        sort_offer_descriptors(&mut offers);
+        // Production ordering is OfferDescriptor's `Ord` impl.
+        offers.sort();
 
         // Expected order: 0.5 (ID 100), 0.5 (ID 200), 0.67, 0.75
         assert_eq!(offers[0], make_descriptor(1, 2, 100));
@@ -333,17 +252,6 @@ mod tests {
         // Different pair should not match
         let different = AssetPair::new(credit.clone(), native.clone());
         assert_eq!(map.get(&different), None);
-    }
-
-    #[test]
-    fn test_is_better_offer_comparator() {
-        let comparator = IsBetterOfferComparator;
-
-        let better = make_descriptor(1, 2, 100);
-        let worse = make_descriptor(2, 3, 50);
-
-        assert!(comparator.compare(&better, &worse));
-        assert!(!comparator.compare(&worse, &better));
     }
 
     #[test]

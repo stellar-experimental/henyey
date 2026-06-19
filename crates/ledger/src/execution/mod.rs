@@ -116,7 +116,7 @@ use signatures::*;
 /// `VmInstantiation` (uncached) cost model, matching stellar-core behavior.
 ///
 /// No-op when `cache` is `None` (pre-Soroban protocol or cache init failure).
-pub fn warm_module_cache_from_entries(
+pub(crate) fn warm_module_cache_from_entries(
     cache: Option<&PersistentModuleCache>,
     entries: &[LedgerEntry],
     protocol_version: u32,
@@ -138,7 +138,7 @@ pub fn warm_module_cache_from_entries(
 ///
 /// This allows the ledger execution layer to look up archived entries without
 /// requiring the tx layer to depend on the bucket crate.
-pub struct HotArchiveLookupImpl {
+pub(crate) struct HotArchiveLookupImpl {
     hot_archive: std::sync::Arc<parking_lot::RwLock<Option<HotArchiveBucketList>>>,
 }
 
@@ -2632,7 +2632,7 @@ pub use henyey_common::ThresholdLevel;
 /// transaction and reused across TX-level checks, per-operation checks, and
 /// extra signer checks. After all checks, `check_all_signatures_used()` verifies
 /// that every signature in the envelope was consumed by at least one check.
-pub struct SignatureTracker<'a> {
+pub(crate) struct SignatureTracker<'a> {
     tx_hash: &'a Hash256,
     signatures: &'a [stellar_xdr::curr::DecoratedSignature],
     used: Vec<bool>,
@@ -2861,7 +2861,7 @@ pub struct SorobanContext<'a> {
 /// Bundles live entries and deleted keys together so they always travel as a
 /// pair.  Constructed once per stage from the current `LedgerDelta` and shared
 /// by all clusters in that stage.
-pub struct PriorStageState {
+pub(crate) struct PriorStageState {
     pub entries: Vec<LedgerEntry>,
     pub deleted_keys: Vec<LedgerKey>,
     /// Keys restored from hot archive by prior stages.
@@ -2898,7 +2898,7 @@ impl PriorStageState {
 }
 
 /// Parameters specific to a single cluster or stage within the parallel phase.
-pub struct ClusterParams<'a> {
+pub(crate) struct ClusterParams<'a> {
     pub id_pool: u64,
     pub prior_stage: &'a PriorStageState,
     pub pre_charged_fees: &'a [PreChargedFee],

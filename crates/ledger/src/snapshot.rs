@@ -37,7 +37,7 @@ use crate::execution::SorobanNetworkInfo;
 /// Tracks hits at each cache layer and fallback lookups. Shared across
 /// clones of the same SnapshotHandle via `Arc`.
 #[derive(Debug, Default)]
-pub struct SnapshotLookupStats {
+pub(crate) struct SnapshotLookupStats {
     /// Lookups served by the built-in snapshot cache (`inner.get_entry()`).
     pub snapshot_cache_hits: AtomicU64,
     /// Lookups served by the prefetch/read-through cache.
@@ -59,7 +59,7 @@ impl SnapshotLookupStats {
 
 /// Statistics from a prefetch operation.
 #[derive(Debug, Default)]
-pub struct PrefetchStats {
+pub(crate) struct PrefetchStats {
     /// Number of keys that needed loading (not already cached).
     pub requested: usize,
     /// Number of entries actually loaded from the bucket list.
@@ -209,11 +209,6 @@ impl LedgerSnapshot {
         self.soroban_network_info.as_ref()
     }
 
-    /// Get the bucket list hash.
-    pub fn bucket_list_hash(&self) -> Hash256 {
-        Hash256::from(self.header.bucket_list_hash.0)
-    }
-
     /// Look up an entry by key.
     pub fn get_entry(&self, key: &LedgerKey) -> Option<&LedgerEntry> {
         self.entries.get(key)
@@ -244,11 +239,6 @@ impl LedgerSnapshot {
     /// from the previous ledger, so that new offers get the correct IDs.
     pub fn set_id_pool(&mut self, id_pool: u64) {
         self.header.id_pool = id_pool;
-    }
-
-    /// Get the number of cached entries.
-    pub fn num_entries(&self) -> usize {
-        self.entries.len()
     }
 
     /// Iterate over all cached entries.
@@ -574,7 +564,7 @@ impl SnapshotHandle {
     ///
     /// Uses batch_lookup_fn for a single bucket list traversal.
     /// Keys already in the snapshot cache or prefetch cache are skipped.
-    pub fn prefetch(&self, keys: &[LedgerKey]) -> Result<PrefetchStats> {
+    pub(crate) fn prefetch(&self, keys: &[LedgerKey]) -> Result<PrefetchStats> {
         let mut needed = Vec::new();
         let cache = self.prefetch_cache.read();
 
@@ -626,7 +616,7 @@ impl SnapshotHandle {
     }
 
     /// Return the shared lookup statistics.
-    pub fn lookup_stats(&self) -> &SnapshotLookupStats {
+    pub(crate) fn lookup_stats(&self) -> &SnapshotLookupStats {
         &self.stats
     }
 

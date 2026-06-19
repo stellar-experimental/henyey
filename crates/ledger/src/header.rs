@@ -29,9 +29,6 @@ use crate::{LedgerError, Result};
 use henyey_common::Hash256;
 use stellar_xdr::curr::{LedgerHeader, Limits, WriteXdr};
 
-/// Number of entries in the skip list (fixed at 4 by protocol).
-pub const SKIP_LIST_SIZE: usize = 4;
-
 /// Skip list update intervals (from stellar-core).
 /// The skip list stores bucket_list_hash values at these intervals.
 pub const SKIP_1: u32 = 50;
@@ -250,21 +247,6 @@ pub fn close_time(header: &LedgerHeader) -> u64 {
 /// for transactions processed in this ledger.
 pub fn protocol_version(header: &LedgerHeader) -> u32 {
     header.ledger_version
-}
-
-/// Check if a header predates a given protocol version.
-///
-/// Useful for conditional logic based on protocol capabilities.
-///
-/// # Example
-///
-/// ```ignore
-/// if is_before_protocol_version(header, 20) {
-///     // Soroban not available
-/// }
-/// ```
-pub fn is_before_protocol_version(header: &LedgerHeader, version: u32) -> bool {
-    header.ledger_version < version
 }
 
 #[cfg(test)]
