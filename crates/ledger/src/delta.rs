@@ -84,7 +84,7 @@ fn merge_ttl_current(
 /// - `Deleted` entries go to the "dead" batch
 #[derive(Debug, Clone)]
 /// Result of categorizing delta entries for bucket list update in a single pass.
-pub struct DeltaCategorization {
+pub(crate) struct DeltaCategorization {
     pub init_entries: Vec<LedgerEntry>,
     pub live_entries: Vec<LedgerEntry>,
     pub dead_keys: Vec<LedgerKey>,
@@ -712,7 +712,7 @@ impl LedgerDelta {
     /// Moves entries instead of cloning, saving ~50K clone operations.
     /// Metadata (fee_pool_delta, total_coins_delta) is preserved.
     /// Offer and pool share trustline changes are collected separately for commit_close.
-    pub fn drain_categorization_for_bucket_update(&mut self) -> DeltaCategorization {
+    pub(crate) fn drain_categorization_for_bucket_update(&mut self) -> DeltaCategorization {
         // Iterate using change_order for deterministic ordering.
         // drain() on a HashMap iterates in arbitrary order, which would
         // produce non-deterministic bucket list updates across nodes.

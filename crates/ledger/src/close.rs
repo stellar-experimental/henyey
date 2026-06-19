@@ -748,13 +748,13 @@ pub struct SorobanPhaseStructure {
 }
 
 /// Pre-extracted per-transaction metadata.
-pub struct TxMeta {
+pub(crate) struct TxMeta {
     pub fee_source: AccountId,
     pub is_soroban: bool,
 }
 
 /// Pre-parsed transaction set with all views computed once.
-pub struct PreparedTxSet {
+pub(crate) struct PreparedTxSet {
     /// Cached hash (XDR serialize + SHA-256, computed once).
     pub hash: Hash256,
     /// Classic phase transactions, sorted for sequential apply.
@@ -788,14 +788,9 @@ fn envelope_is_soroban(env: &TransactionEnvelope) -> bool {
 }
 
 impl TransactionSetVariant {
-    /// Parse the transaction set once, producing all views needed by `apply_transactions()`.
-    pub fn prepare(&self) -> PreparedTxSet {
-        self.prepare_with_hash(self.hash())
-    }
-
     /// Consuming variant that moves TX envelopes instead of cloning.
     /// Skips per-TX hashing and sorting — stages must already be in final order.
-    pub fn prepare_presorted(self, hash: Hash256) -> PreparedTxSet {
+    pub(crate) fn prepare_presorted(self, hash: Hash256) -> PreparedTxSet {
         let (classic_txs, soroban_phase, all_txs) = match self {
             TransactionSetVariant::Classic(set) => {
                 let txs: Vec<TxWithFee> = Vec::from(set.txs)
@@ -873,7 +868,7 @@ impl TransactionSetVariant {
         }
     }
 
-    pub fn prepare_with_hash(&self, hash: Hash256) -> PreparedTxSet {
+    pub(crate) fn prepare_with_hash(&self, hash: Hash256) -> PreparedTxSet {
         let (classic_txs, soroban_phase, all_txs) = match self {
             TransactionSetVariant::Classic(set) => {
                 let txs: Vec<TxWithFee> = set

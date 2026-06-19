@@ -57,7 +57,7 @@ pub(super) enum RestoreSource {
 /// Uses a single map to enforce that a key cannot appear in both hot-archive
 /// and live-BL sources simultaneously (type-enforced mutual exclusion).
 #[derive(Debug)]
-pub struct RestoredEntries {
+pub(crate) struct RestoredEntries {
     entries: HashMap<LedgerKey, RestoreSource>,
 }
 

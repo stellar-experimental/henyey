@@ -144,7 +144,7 @@ impl CloseLedgerState {
     ///
     /// Returns all live offer entries visible through the full read path:
     /// current delta + snapshot.
-    pub fn all_offers(&self) -> Result<Vec<LedgerEntry>> {
+    pub(crate) fn all_offers(&self) -> Result<Vec<LedgerEntry>> {
         // Start with all offers from the base snapshot
         let snapshot_entries = self.snapshot.all_entries()?;
 
@@ -293,7 +293,7 @@ impl CloseLedgerState {
     /// This is the proper terminal operation — consumes the delta's entry
     /// changes for the bucket list, leaving the `CloseLedgerState` in a
     /// drained state.
-    pub fn drain_for_bucket_update(&mut self) -> DeltaCategorization {
+    pub(crate) fn drain_for_bucket_update(&mut self) -> DeltaCategorization {
         self.current.drain_categorization_for_bucket_update()
     }
 
@@ -304,7 +304,7 @@ impl CloseLedgerState {
     /// soroban state snapshot held by the lookup closures, allowing
     /// `Arc::make_mut` on the live soroban state to mutate in-place instead
     /// of deep-cloning the entire HashMap.
-    pub fn release_snapshot_lookups(&mut self) {
+    pub(crate) fn release_snapshot_lookups(&mut self) {
         self.snapshot.release_lookups();
     }
 
