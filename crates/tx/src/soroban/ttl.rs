@@ -34,7 +34,7 @@ pub fn restore_ttl_target(ledger_seq: u32, min_persistent_ttl: u32) -> u32 {
 /// The hot archive does not store TTL entries; they are synthesized from the
 /// data/code key hash and the restore target TTL at the time of restoration.
 #[must_use]
-pub fn synthesize_ttl_entry(
+pub(crate) fn synthesize_ttl_entry(
     key_hash: stellar_xdr::curr::Hash,
     live_until_ledger_seq: u32,
 ) -> stellar_xdr::curr::LedgerEntry {

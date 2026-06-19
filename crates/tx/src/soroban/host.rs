@@ -679,7 +679,7 @@ define_wasm_compilation_context!(
 ///
 /// The invocation request bundles the host function, authorization, ledger context,
 /// Soroban config, and optional shared caches required for execution.
-pub fn execute_host_function_with_cache(
+pub(crate) fn execute_host_function_with_cache(
     request: HostFunctionInvocation<'_>,
 ) -> Result<SorobanExecutionResult, SorobanExecutionError> {
     let protocol_version = request.context.protocol_version;

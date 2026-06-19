@@ -76,7 +76,7 @@ pub struct SorobanState {
 
 /// Re-export `StorageKey` from the soroban module as the canonical key type
 /// for contract data entries.
-pub use crate::soroban::StorageKey;
+pub(crate) use crate::soroban::StorageKey;
 
 // ==================== Offer Index ====================
 //

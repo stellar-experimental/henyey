@@ -167,9 +167,8 @@ pub use apply::{apply_from_history, ChangeRef, TxChangeLog};
 
 // Re-export result types
 pub use result::{
-    MutableTransactionResult, OpResultCode, OpResultWrapper, RefundableFeeError,
-    RefundableFeeTracker, TransactionResultCodeExt, TxApplyResult, TxResultCode, TxResultWrapper,
-    TxSetResultSummary,
+    MutableTransactionResult, OpResultCode, RefundableFeeError, RefundableFeeTracker,
+    TransactionResultCodeExt, TxApplyResult, TxResultCode, TxResultWrapper,
 };
 
 // Re-export signature checker types
