@@ -77,6 +77,11 @@ const SUPPORTED_KEYS: &[&str] = &[
     "PUBLISH_TO_ARCHIVE_DELAY",
     "ARTIFICIALLY_GENERATE_LOAD_FOR_TESTING",
     "GENESIS_TEST_ACCOUNT_COUNT",
+    "USE_CONFIG_FOR_GENESIS",
+    "TESTING_UPGRADE_LEDGER_PROTOCOL_VERSION",
+    "TESTING_UPGRADE_DESIRED_FEE",
+    "TESTING_UPGRADE_RESERVE",
+    "TESTING_UPGRADE_MAX_TX_SET_SIZE",
     "RUN_STANDALONE",
     // Sub-tables (handled structurally)
     "HISTORY",
@@ -634,6 +639,25 @@ pub fn translate_stellar_core_config(raw: &toml::Value) -> anyhow::Result<AppCon
     }
     if let Some(v) = get_u32(table, "GENESIS_TEST_ACCOUNT_COUNT") {
         config.testing.genesis_test_account_count = v;
+    }
+    // Genesis-construction overrides. Mirrors stellar-core's
+    // USE_CONFIG_FOR_GENESIS / TESTING_UPGRADE_* keys (Config.cpp:198/231-234).
+    // Absent keys leave the stellar-core-matching defaults in place, so a
+    // config without these is byte-identical to the legacy genesis.
+    if let Some(v) = get_bool(table, "USE_CONFIG_FOR_GENESIS") {
+        config.testing.use_config_for_genesis = v;
+    }
+    if let Some(v) = get_u32(table, "TESTING_UPGRADE_LEDGER_PROTOCOL_VERSION") {
+        config.testing.testing_upgrade_ledger_protocol_version = v;
+    }
+    if let Some(v) = get_u32(table, "TESTING_UPGRADE_DESIRED_FEE") {
+        config.testing.testing_upgrade_desired_fee = v;
+    }
+    if let Some(v) = get_u32(table, "TESTING_UPGRADE_RESERVE") {
+        config.testing.testing_upgrade_reserve = v;
+    }
+    if let Some(v) = get_u32(table, "TESTING_UPGRADE_MAX_TX_SET_SIZE") {
+        config.testing.testing_upgrade_max_tx_set_size = v;
     }
     if let Some(v) = get_bool(table, "RUN_STANDALONE") {
         config.testing.run_standalone = v;
@@ -2131,6 +2155,51 @@ mod tests {
         .unwrap();
         let config = translate_stellar_core_config(&core_toml).unwrap();
         assert_eq!(config.testing.genesis_test_account_count, 0);
+    }
+
+    #[test]
+    fn test_use_config_for_genesis_parsed() {
+        let core_toml: toml::Value = toml::from_str(
+            r#"
+            NETWORK_PASSPHRASE = "Test SDF Network ; September 2015"
+            USE_CONFIG_FOR_GENESIS = true
+            TESTING_UPGRADE_LEDGER_PROTOCOL_VERSION = 25
+            TESTING_UPGRADE_DESIRED_FEE = 200
+            TESTING_UPGRADE_RESERVE = 5000000
+            TESTING_UPGRADE_MAX_TX_SET_SIZE = 500
+            "#,
+        )
+        .unwrap();
+        let config = translate_stellar_core_config(&core_toml).unwrap();
+        assert!(config.testing.use_config_for_genesis);
+        assert_eq!(config.testing.testing_upgrade_ledger_protocol_version, 25);
+        assert_eq!(config.testing.testing_upgrade_desired_fee, 200);
+        assert_eq!(config.testing.testing_upgrade_reserve, 5_000_000);
+        assert_eq!(config.testing.testing_upgrade_max_tx_set_size, 500);
+
+        let gc = config.testing.genesis_config();
+        assert!(gc.use_config_for_genesis);
+        assert_eq!(gc.protocol_version, 25);
+        assert_eq!(gc.base_fee, 200);
+        assert_eq!(gc.base_reserve, 5_000_000);
+        assert_eq!(gc.max_tx_set_size, 500);
+    }
+
+    #[test]
+    fn test_use_config_for_genesis_defaults() {
+        // Absent keys ⇒ stellar-core defaults (false / 26 / 100 / 100_000_000 / 50).
+        let core_toml: toml::Value = toml::from_str(
+            r#"
+            NETWORK_PASSPHRASE = "Test SDF Network ; September 2015"
+            "#,
+        )
+        .unwrap();
+        let config = translate_stellar_core_config(&core_toml).unwrap();
+        assert!(!config.testing.use_config_for_genesis);
+        assert_eq!(config.testing.testing_upgrade_ledger_protocol_version, 26);
+        assert_eq!(config.testing.testing_upgrade_desired_fee, 100);
+        assert_eq!(config.testing.testing_upgrade_reserve, 100_000_000);
+        assert_eq!(config.testing.testing_upgrade_max_tx_set_size, 50);
     }
 
     #[test]

@@ -1220,6 +1220,7 @@ impl App {
                 Some(&config.buckets.directory),
                 &config.network.passphrase,
                 config.testing.genesis_test_account_count,
+                &config.testing.genesis_config(),
             )?;
         }
 

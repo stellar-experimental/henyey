@@ -3953,6 +3953,169 @@ fn create_ledger_entries_for_v26(ltx: &mut CloseLedgerState, ledger_seq: u32) ->
     Ok(())
 }
 
+/// Re-calibrate the V20 CPU/memory cost-param entries to the post-release
+/// corrected values.
+///
+/// Parity: `SorobanNetworkConfig::updateRecalibratedCostTypesForV20`
+/// (NetworkConfig.cpp:2606-2720), which stellar-core runs under `#ifdef
+/// BUILD_TESTS` inside `initializeGenesisLedgerForTesting` immediately after
+/// `createLedgerEntriesForV20` (NetworkConfig.cpp:1724). Protocol 20 shipped
+/// with somewhat incorrect costs that were re-calibrated shortly after
+/// release; the genesis path catches up to the corrected values.
+///
+/// This is GENESIS-ONLY and MUST NOT be wired into the live
+/// `apply_version_upgrade_side_effects` upgrade path — a node upgrading a
+/// running network from <20 to >=20 follows the on-network sequence, which
+/// reaches the recalibrated values via the normal per-protocol config
+/// upgrades, not this BUILD_TESTS shortcut.
+///
+/// Indices match the `ContractCostType` enum (see `initial_cpu_cost_params_for_v20`):
+/// DispatchHostFunction=4, VisitObject=5, ValSer=6, ValDeser=7,
+/// ComputeSha256Hash=8, ComputeEd25519PubKey=9, VerifyEd25519Sig=10,
+/// VmInstantiation=11, VmCachedInstantiation=12, InvokeVmFunction=13,
+/// ComputeKeccak256Hash=14, DecodeEcdsaCurve256Sig=15,
+/// RecoverEcdsaSecp256k1Key=16, Int256AddSub=17, Int256Mul=18, Int256Div=19,
+/// Int256Pow=20, Int256Shift=21, ChaCha20DrawBytes=22.
+fn update_recalibrated_cost_types_for_v20(
+    ltx: &mut CloseLedgerState,
+    ledger_seq: u32,
+) -> Result<()> {
+    // CPU param recalibration (NetworkConfig.cpp:2620-2693). `resize` keeps the
+    // existing V20 size (23 entries); we pass the current count via the helper,
+    // which resizes to NEW_SIZE then overwrites the listed indices.
+    const V20_COST_PARAM_SIZE: usize = 23;
+
+    // (index, const_term, linear_term)
+    let cpu_updates: &[(usize, i64, i64)] = &[
+        (4, 295, 0),         // DispatchHostFunction
+        (5, 60, 0),          // VisitObject
+        (6, 221, 26),        // ValSer
+        (7, 331, 4369),      // ValDeser
+        (8, 3636, 7013),     // ComputeSha256Hash
+        (9, 40256, 0),       // ComputeEd25519PubKey
+        (10, 377551, 4059),  // VerifyEd25519Sig
+        (11, 417482, 45712), // VmInstantiation
+        (12, 417482, 45712), // VmCachedInstantiation
+        (13, 1945, 0),       // InvokeVmFunction
+        (14, 6481, 5943),    // ComputeKeccak256Hash
+        (15, 711, 0),        // DecodeEcdsaCurve256Sig
+        (16, 2314804, 0),    // RecoverEcdsaSecp256k1Key
+        (17, 4176, 0),       // Int256AddSub
+        (18, 4716, 0),       // Int256Mul
+        (19, 4680, 0),       // Int256Div
+        (20, 4256, 0),       // Int256Pow
+        (21, 884, 0),        // Int256Shift
+        (22, 1059, 502),     // ChaCha20DrawBytes
+    ];
+
+    // Memory param recalibration (NetworkConfig.cpp:2702-2717): only
+    // VmInstantiation and VmCachedInstantiation are rewritten.
+    let mem_updates: &[(usize, i64, i64)] = &[
+        (11, 132773, 4903), // VmInstantiation
+        (12, 132773, 4903), // VmCachedInstantiation
+    ];
+
+    resize_and_update_cost_params(
+        ltx,
+        ledger_seq,
+        V20_COST_PARAM_SIZE,
+        cpu_updates,
+        mem_updates,
+    )?;
+
+    tracing::info!(
+        ledger_seq = ledger_seq,
+        "Applied updateRecalibratedCostTypesForV20 (genesis-only BUILD_TESTS recalibration)"
+    );
+
+    Ok(())
+}
+
+/// Build the full Soroban `ConfigSetting` ledger-entry set for a genesis ledger
+/// at `protocol`, for `USE_CONFIG_FOR_GENESIS` networks.
+///
+/// Parity: `SorobanNetworkConfig::initializeGenesisLedgerForTesting`
+/// (NetworkConfig.cpp:1708-1751). Reuses the SAME per-protocol cascade that
+/// the live upgrade path drives in `apply_version_upgrade_side_effects`
+/// (manager.rs:3081), gated by the identical `protocolVersionStartsFrom`
+/// thresholds (here `prev_version = 0`). The genesis-only BUILD_TESTS V20 cost
+/// recalibration (`update_recalibrated_cost_types_for_v20`) is layered between
+/// V20 and V21, matching NetworkConfig.cpp:1724.
+///
+/// The returned entries carry their FINAL post-cascade values: create-then-
+/// update collapses to "created (final value)" in the delta, and the V23
+/// rent-param update read-modify-writes the V20-created `ContractLedgerCostV0`
+/// / `StateArchival` entries in the same delta. Entries are harvested via the
+/// delta's current entries so any in-delta update is reflected.
+///
+/// Entry ORDER is irrelevant to the bucket-list hash: `BucketList::add_batch`
+/// sorts the batch by `LedgerKey` (bucket_list.rs) and the bucket re-sorts.
+///
+/// Henyey supports protocol 24+ only; `protocol` is expected to be >= 24. The
+/// cascade is correct for any `protocol >= 20`, but values < 24 are not a
+/// supported genesis target.
+pub fn build_genesis_soroban_config_entries(
+    protocol: u32,
+    _network_id: &NetworkId,
+) -> Result<Vec<LedgerEntry>> {
+    use crate::snapshot::{LedgerSnapshot, SnapshotHandle};
+
+    // Genesis ledger sequence is 1; the live bucket list is empty at the point
+    // stellar-core runs initializeGenesisLedgerForTesting (LedgerManagerImpl.cpp
+    // :421, before root-account creation and bucket sealing), so the V20
+    // LiveSorobanStateSizeWindow is seeded with size 0.
+    const GENESIS_LEDGER_SEQ: u32 = 1;
+    const GENESIS_INITIAL_BUCKET_LIST_SIZE: u64 = 0;
+
+    if protocol < 20 {
+        // Pre-Soroban: no config entries (matches core's
+        // protocolVersionStartsFrom(SOROBAN_PROTOCOL_VERSION) guard).
+        return Ok(Vec::new());
+    }
+
+    // Build an empty-snapshot close state at genesis. The cascade functions
+    // read-modify-write entries they themselves created in this same delta, so
+    // an empty base snapshot is sufficient.
+    let snapshot = SnapshotHandle::new(LedgerSnapshot::empty(GENESIS_LEDGER_SEQ));
+    let header = create_genesis_header();
+    let mut ltx = CloseLedgerState::begin(snapshot, header, Hash256::ZERO, GENESIS_LEDGER_SEQ);
+
+    // V20: create the 14 base config entries.
+    create_ledger_entries_for_v20(
+        &mut ltx,
+        GENESIS_LEDGER_SEQ,
+        GENESIS_INITIAL_BUCKET_LIST_SIZE,
+    )?;
+    // V20 BUILD_TESTS recalibration (genesis-only) — NetworkConfig.cpp:1724.
+    update_recalibrated_cost_types_for_v20(&mut ltx, GENESIS_LEDGER_SEQ)?;
+
+    if protocol >= 21 {
+        create_cost_types_for_v21(&mut ltx, GENESIS_LEDGER_SEQ)?;
+    }
+    if protocol >= 22 {
+        create_cost_types_for_v22(&mut ltx, GENESIS_LEDGER_SEQ)?;
+    }
+    if protocol >= 23 {
+        create_and_update_ledger_entries_for_v23(&mut ltx, GENESIS_LEDGER_SEQ)?;
+    }
+    if protocol >= 25 {
+        create_cost_types_for_v25(&mut ltx, GENESIS_LEDGER_SEQ)?;
+    }
+    if protocol >= 26 {
+        update_cost_types_for_v26(&mut ltx, GENESIS_LEDGER_SEQ)?;
+        create_ledger_entries_for_v26(&mut ltx, GENESIS_LEDGER_SEQ)?;
+    }
+
+    // Harvest the final entry values. `current_entries()` returns the current
+    // value of every create AND update in the delta — so cost params that V20
+    // created and V21/V22/V25/V26 updated, and the V23 rent-param updates to
+    // the V20-created ledger-cost / state-archival entries, all carry their
+    // final values. Because every entry the cascade touches originates from a
+    // `record_create` earlier in the same delta, create-then-update collapses
+    // to a single "created (final value)" change and no entry is duplicated.
+    Ok(ltx.current_delta().current_entries())
+}
+
 impl LedgerCloseContext<'_> {
     /// Load StateArchivalSettings through the CloseLedgerState read path.
     ///
@@ -10350,6 +10513,230 @@ mod tests {
             manager.hot_archive_bucket_list().as_ref().unwrap().hash(),
             henyey_bucket::HotArchiveBucketList::new().hash(),
             "hot archive bucket list must not be installed"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Genesis Soroban config-entry builder (#3492)
+    // -----------------------------------------------------------------------
+
+    fn genesis_config_entry(protocol: u32, id: ConfigSettingId) -> ConfigSettingEntry {
+        let network_id = NetworkId::from_passphrase("Test SDF Network ; September 2015");
+        let entries = build_genesis_soroban_config_entries(protocol, &network_id).unwrap();
+        entries
+            .into_iter()
+            .find_map(|e| match e.data {
+                LedgerEntryData::ConfigSetting(cs) if cs.discriminant() == id => Some(cs),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("config setting {id:?} not present at protocol {protocol}"))
+    }
+
+    fn genesis_cpu_params(protocol: u32) -> Vec<stellar_xdr::curr::ContractCostParamEntry> {
+        match genesis_config_entry(protocol, ConfigSettingId::ContractCostParamsCpuInstructions) {
+            ConfigSettingEntry::ContractCostParamsCpuInstructions(p) => p.0.to_vec(),
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    fn genesis_mem_params(protocol: u32) -> Vec<stellar_xdr::curr::ContractCostParamEntry> {
+        match genesis_config_entry(protocol, ConfigSettingId::ContractCostParamsMemoryBytes) {
+            ConfigSettingEntry::ContractCostParamsMemoryBytes(p) => p.0.to_vec(),
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_build_genesis_soroban_config_entries_counts() {
+        let network_id = NetworkId::from_passphrase("Test SDF Network ; September 2015");
+        // p24: V20's 14 entries + V23's 3 entries (protocol 24 includes the
+        // full upgrade cascade through 24, which includes V23). V21/V22 only
+        // resize the cost-param entries — they add no new config-setting keys.
+        let p24 = build_genesis_soroban_config_entries(24, &network_id).unwrap();
+        assert_eq!(p24.len(), 17, "p24 genesis config-setting count");
+        // p25: same set as p24 (V25 only resizes cost params, adds no keys).
+        let p25 = build_genesis_soroban_config_entries(25, &network_id).unwrap();
+        assert_eq!(p25.len(), 17, "p25 genesis config-setting count");
+        // p26: + 2 V26 frozen-key entries.
+        let p26 = build_genesis_soroban_config_entries(26, &network_id).unwrap();
+        assert_eq!(p26.len(), 19, "p26 genesis config-setting count");
+        // Pre-Soroban: empty.
+        let p19 = build_genesis_soroban_config_entries(19, &network_id).unwrap();
+        assert!(p19.is_empty(), "pre-Soroban genesis has no config entries");
+    }
+
+    #[test]
+    fn test_build_genesis_soroban_config_entries_no_duplicate_keys() {
+        let network_id = NetworkId::from_passphrase("Test SDF Network ; September 2015");
+        for protocol in [24u32, 25, 26] {
+            let entries = build_genesis_soroban_config_entries(protocol, &network_id).unwrap();
+            let mut ids: Vec<i32> = entries
+                .iter()
+                .filter_map(|e| match &e.data {
+                    LedgerEntryData::ConfigSetting(cs) => Some(cs.discriminant() as i32),
+                    _ => None,
+                })
+                .collect();
+            let total = ids.len();
+            ids.sort_unstable();
+            ids.dedup();
+            assert_eq!(
+                ids.len(),
+                total,
+                "no duplicate config-setting keys at protocol {protocol}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_genesis_recalibrated_cpu_params_match_core() {
+        // Spot-check the recalibrated V20 CPU params (NetworkConfig.cpp:2620).
+        // Index comments per the ContractCostType enum.
+        let cpu = genesis_cpu_params(24);
+        assert_eq!(cpu[4].const_term, 295, "DispatchHostFunction const");
+        assert_eq!(cpu[4].linear_term, 0, "DispatchHostFunction linear");
+        assert_eq!(cpu[7].const_term, 331, "ValDeser const");
+        assert_eq!(cpu[7].linear_term, 4369, "ValDeser linear");
+        assert_eq!(cpu[11].const_term, 417482, "VmInstantiation const");
+        assert_eq!(cpu[11].linear_term, 45712, "VmInstantiation linear");
+        assert_eq!(
+            cpu[16].const_term, 2314804,
+            "RecoverEcdsaSecp256k1Key const"
+        );
+        assert_eq!(cpu[22].const_term, 1059, "ChaCha20DrawBytes const");
+        assert_eq!(cpu[22].linear_term, 502, "ChaCha20DrawBytes linear");
+    }
+
+    /// Run V20 + recalibration in isolation and return the (cpu, mem) cost
+    /// param tables, BEFORE the V21+ cascade overwrites any indices.
+    fn recalibrated_v20_params_isolated() -> (
+        Vec<stellar_xdr::curr::ContractCostParamEntry>,
+        Vec<stellar_xdr::curr::ContractCostParamEntry>,
+    ) {
+        use crate::snapshot::{LedgerSnapshot, SnapshotHandle};
+        let snapshot = SnapshotHandle::new(LedgerSnapshot::empty(1));
+        let header = create_genesis_header();
+        let mut ltx = CloseLedgerState::begin(snapshot, header, Hash256::ZERO, 1);
+        create_ledger_entries_for_v20(&mut ltx, 1, 0).unwrap();
+        update_recalibrated_cost_types_for_v20(&mut ltx, 1).unwrap();
+        let entries = ltx.current_delta().current_entries();
+        let mut cpu = None;
+        let mut mem = None;
+        for e in entries {
+            if let LedgerEntryData::ConfigSetting(cs) = e.data {
+                match cs {
+                    ConfigSettingEntry::ContractCostParamsCpuInstructions(p) => {
+                        cpu = Some(p.0.to_vec())
+                    }
+                    ConfigSettingEntry::ContractCostParamsMemoryBytes(p) => {
+                        mem = Some(p.0.to_vec())
+                    }
+                    _ => {}
+                }
+            }
+        }
+        (cpu.unwrap(), mem.unwrap())
+    }
+
+    #[test]
+    fn test_genesis_recalibrated_mem_params_match_core() {
+        // The recalibration rewrites mem indices 11 and 12 to 132773/4903
+        // (NetworkConfig.cpp:2706). Index 12 (VmCachedInstantiation) is later
+        // overwritten by createCostTypesForV21 (69472/1217), matching core's
+        // ordering, so we verify the recalibrated values in ISOLATION here and
+        // verify the V21 overwrite of index 12 separately below.
+        let (_cpu, mem) = recalibrated_v20_params_isolated();
+        assert_eq!(mem[11].const_term, 132773, "VmInstantiation mem const");
+        assert_eq!(mem[11].linear_term, 4903, "VmInstantiation mem linear");
+        assert_eq!(
+            mem[12].const_term, 132773,
+            "VmCachedInstantiation mem const"
+        );
+        assert_eq!(
+            mem[12].linear_term, 4903,
+            "VmCachedInstantiation mem linear"
+        );
+    }
+
+    #[test]
+    fn test_genesis_v21_overwrites_recalibrated_mem_index_12() {
+        // After the full p24 cascade, index 12 mem carries the V21 value
+        // (69472/1217), and index 11 retains the recalibrated value
+        // (132773/4903) since V21 mem does not touch index 11.
+        let mem = genesis_mem_params(24);
+        assert_eq!(
+            mem[12].const_term, 69472,
+            "V21 overwrites VmCachedInstantiation mem"
+        );
+        assert_eq!(mem[12].linear_term, 1217);
+        assert_eq!(
+            mem[11].const_term, 132773,
+            "VmInstantiation mem retained from recalibration"
+        );
+        assert_eq!(mem[11].linear_term, 4903);
+    }
+
+    #[test]
+    fn test_update_recalibrated_cost_types_for_v20_overwrites_v20_values() {
+        // The recalibration must REPLACE the initial V20 values. Verify a few
+        // indices changed from the initial table to the recalibrated table.
+        let initial_cpu = initial_cpu_cost_params_for_v20();
+        // Initial DispatchHostFunction const is 310; recalibrated is 295.
+        assert_eq!(initial_cpu[4].const_term, 310);
+        let cpu = genesis_cpu_params(24);
+        assert_eq!(cpu[4].const_term, 295);
+        // Initial VmInstantiation is (451626, 45405); recalibrated (417482, 45712).
+        assert_eq!(initial_cpu[11].const_term, 451626);
+        assert_eq!(cpu[11].const_term, 417482);
+    }
+
+    #[test]
+    fn test_genesis_v23_rent_params_override_v20_ledger_cost() {
+        // V23's updateRentCostParamsForV23 read-modify-writes the V20-created
+        // ContractLedgerCostV0 entry; harvesting via current_entries() must
+        // carry the V23 value (3 GB), not the V20 value (30 GB).
+        match genesis_config_entry(25, ConfigSettingId::ContractLedgerCostV0) {
+            ConfigSettingEntry::ContractLedgerCostV0(s) => {
+                assert_eq!(
+                    s.soroban_state_target_size_bytes, 3_000_000_000,
+                    "V23 rent override must be reflected in genesis"
+                );
+                assert_eq!(s.rent_fee1_kb_soroban_state_size_low, -17_000);
+                assert_eq!(s.rent_fee1_kb_soroban_state_size_high, 10_000);
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+        // The V20 initial value (30 GB) is checked in isolation below
+        // (test_genesis_v20_ledger_cost_initial_value_before_v23), since every
+        // supported genesis protocol (24+) runs the V23 override.
+    }
+
+    #[test]
+    fn test_genesis_v20_ledger_cost_initial_value_before_v23() {
+        // Confirm the V20-created ContractLedgerCostV0 carries 30 GB BEFORE the
+        // V23 override, by running only V20 + recalibration in isolation. This
+        // guards that the V23 override (3 GB) is a genuine read-modify-write of
+        // the V20 value rather than a coincidence.
+        use crate::snapshot::{LedgerSnapshot, SnapshotHandle};
+        let snapshot = SnapshotHandle::new(LedgerSnapshot::empty(1));
+        let header = create_genesis_header();
+        let mut ltx = CloseLedgerState::begin(snapshot, header, Hash256::ZERO, 1);
+        create_ledger_entries_for_v20(&mut ltx, 1, 0).unwrap();
+        update_recalibrated_cost_types_for_v20(&mut ltx, 1).unwrap();
+        let entries = ltx.current_delta().current_entries();
+        let cost = entries
+            .into_iter()
+            .find_map(|e| match e.data {
+                LedgerEntryData::ConfigSetting(ConfigSettingEntry::ContractLedgerCostV0(s)) => {
+                    Some(s)
+                }
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(
+            cost.soroban_state_target_size_bytes,
+            30 * 1024 * 1024 * 1024_i64,
+            "V20 initial ledger-cost target size is 30 GB before V23"
         );
     }
 }

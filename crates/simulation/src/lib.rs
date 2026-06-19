@@ -1933,6 +1933,7 @@ pub fn initialize_genesis_ledger(
         None,
         network_passphrase,
         config.testing.genesis_test_account_count,
+        &config.testing.genesis_config(),
     )
 }
 
