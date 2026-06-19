@@ -154,6 +154,7 @@ fn parse_next_states(
 }
 
 /// Parse bucket hashes at a specific level, returning (curr, snap) as Options.
+#[cfg(test)]
 fn parse_level_hashes(level: &HASBucketLevel) -> (Option<Hash256>, Option<Hash256>) {
     (
         parse_nonzero_hash(&level.curr),
@@ -543,6 +544,7 @@ impl HistoryArchiveState {
     ///
     /// Returns `Some` for version >= 2 HAS with populated hot archive,
     /// `None` for version < 2 or missing hot archive data.
+    #[cfg(test)]
     pub fn hot_archive_levels_mut(&mut self) -> Option<&mut Vec<HASBucketLevel>> {
         self.hot_archive_buckets.as_mut()
     }
@@ -659,6 +661,7 @@ impl HistoryArchiveState {
     }
 
     /// Get the number of bucket levels.
+    #[cfg(test)]
     pub fn bucket_level_count(&self) -> usize {
         self.current_buckets.len()
     }
@@ -672,6 +675,7 @@ impl HistoryArchiveState {
     /// # Returns
     ///
     /// A tuple of (current_hash, snapshot_hash) if the level exists.
+    #[cfg(test)]
     pub fn bucket_hashes_at_level(
         &self,
         level: usize,
@@ -679,33 +683,11 @@ impl HistoryArchiveState {
         self.current_buckets.get(level).map(parse_level_hashes)
     }
 
-    /// Get hot archive bucket hashes for a specific level.
-    ///
-    /// # Arguments
-    ///
-    /// * `level` - The bucket level index (0 = most frequently updated)
-    ///
-    /// # Returns
-    ///
-    /// A tuple of (current_hash, snapshot_hash) if the level exists.
-    pub fn hot_archive_bucket_hashes_at_level(
-        &self,
-        level: usize,
-    ) -> Option<(Option<Hash256>, Option<Hash256>)> {
-        let hot_buckets = self.hot_archive_buckets.as_ref()?;
-        hot_buckets.get(level).map(parse_level_hashes)
-    }
-
     /// Check if this HAS contains hot archive buckets.
     pub fn has_hot_archive_buckets(&self) -> bool {
         self.hot_archive_buckets
             .as_ref()
             .is_some_and(|v| !v.is_empty())
-    }
-
-    /// Get the number of hot archive bucket levels.
-    pub fn hot_archive_bucket_level_count(&self) -> usize {
-        self.hot_archive_buckets.as_ref().map_or(0, |v| v.len())
     }
 
     /// Get bucket hashes as (curr, snap) tuples for all levels.
@@ -859,6 +841,7 @@ impl HistoryArchiveState {
     }
 
     /// Clear all futures, resetting every level's next to default (state 0).
+    #[cfg(test)]
     pub fn clear_all_futures(&mut self) {
         for level in &mut self.current_buckets {
             level.next = HASBucketNext::default();

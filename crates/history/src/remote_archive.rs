@@ -217,7 +217,7 @@ impl RemoteArchive {
     /// Ensure a remote directory exists, creating it if necessary.
     ///
     /// This is a no-op if no mkdir command is configured.
-    pub async fn ensure_dir(&self, remote_dir: &str) -> Result<()> {
+    async fn ensure_dir(&self, remote_dir: &str) -> Result<()> {
         if self.config.mkdir_cmd.is_some() {
             // Ignore errors from mkdir as the directory may already exist
             let _ = self.mkdir(remote_dir).await;

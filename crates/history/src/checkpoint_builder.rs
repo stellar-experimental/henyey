@@ -331,11 +331,13 @@ impl CheckpointBuilder {
     }
 
     /// Get the current checkpoint being built, if any.
+    #[cfg(test)]
     pub fn current_checkpoint(&self) -> Option<u32> {
         self.current_checkpoint
     }
 
     /// Check if a checkpoint is currently being built.
+    #[cfg(test)]
     pub fn is_open(&self) -> bool {
         self.current_checkpoint.is_some()
     }
@@ -634,6 +636,7 @@ impl CheckpointBuilder {
     }
 
     /// Check if startup validation has been performed.
+    #[cfg(test)]
     pub fn is_validated(&self) -> bool {
         self.startup_validated
     }

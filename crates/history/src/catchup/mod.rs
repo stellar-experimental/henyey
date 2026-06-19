@@ -169,7 +169,7 @@ impl Default for CatchupProgress {
 ///
 /// This struct holds all the data needed for catchup when it has been
 /// pre-fetched (e.g., for testing or when using an alternative data source).
-/// Pass this to [`CatchupManager::catchup_to_ledger_with_checkpoint_data`]
+/// Pass this to [`CatchupManager::catchup_to_ledger_with_checkpoint_data_config`]
 /// to skip the download phase.
 #[derive(Debug, Clone)]
 pub struct CheckpointData {
@@ -976,27 +976,6 @@ impl CatchupManager {
             &header,
             hash,
             self.progress.buckets_total,
-            ledger_manager,
-        )
-        .await
-    }
-
-    /// Catch up to a target ledger using pre-downloaded checkpoint data.
-    ///
-    /// This is the backwards-compatible 3-argument entry point that defaults to
-    /// `CatchupRunMode::OfflineBasic`. Use
-    /// [`catchup_to_ledger_with_checkpoint_data_config`] when you need to
-    /// specify a different run mode.
-    pub async fn catchup_to_ledger_with_checkpoint_data(
-        &mut self,
-        target: u32,
-        data: CheckpointData,
-        ledger_manager: &LedgerManager,
-    ) -> Result<CatchupResult> {
-        self.catchup_to_ledger_with_checkpoint_data_config(
-            target,
-            data,
-            CatchupConfiguration::offline_basic(CatchupMode::Minimal),
             ledger_manager,
         )
         .await
