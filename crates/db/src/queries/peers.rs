@@ -9,6 +9,33 @@ use rusqlite::{params, Connection, OptionalExtension, Row};
 
 use crate::error::DbError;
 
+/// Decodes the three `PeerRecord` fields from a row at the given column indices.
+///
+/// The `next_attempt`, `num_failures`, and `type` columns live at different
+/// positions depending on the SELECT (`load_peers` puts them at 2/3/4, `load_peer`
+/// at 0/1/2), so the caller supplies the indices. `col_type` is also the column
+/// index reported in the `FromSqlConversionFailure` on a bad `type` value, so each
+/// caller's error payload stays tied to its own column.
+fn peer_record_from_row(
+    row: &Row<'_>,
+    col_next_attempt: usize,
+    col_num_failures: usize,
+    col_type: usize,
+) -> rusqlite::Result<PeerRecord> {
+    let raw_type: i32 = row.get(col_type)?;
+    Ok(PeerRecord {
+        next_attempt: row.get(col_next_attempt)?,
+        num_failures: row.get::<_, i64>(col_num_failures)? as u32,
+        peer_type: StoredPeerType::try_from(raw_type).map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(
+                col_type,
+                rusqlite::types::Type::Integer,
+                e.into(),
+            )
+        })?,
+    })
+}
+
 /// Extracts a `(host, port, PeerRecord)` tuple from a row.
 ///
 /// Column order matches the SELECT in `load_peers()`:
@@ -22,18 +49,7 @@ fn peer_row(row: &Row<'_>) -> rusqlite::Result<(String, u16, PeerRecord)> {
 
     let host: String = row.get(COL_HOST)?;
     let port: i64 = row.get(COL_PORT)?;
-    let raw_type: i32 = row.get(COL_TYPE)?;
-    let record = PeerRecord {
-        next_attempt: row.get(COL_NEXT_ATTEMPT)?,
-        num_failures: row.get::<_, i64>(COL_NUM_FAILURES)? as u32,
-        peer_type: StoredPeerType::try_from(raw_type).map_err(|e| {
-            rusqlite::Error::FromSqlConversionFailure(
-                COL_TYPE,
-                rusqlite::types::Type::Integer,
-                e.into(),
-            )
-        })?,
-    };
+    let record = peer_record_from_row(row, COL_NEXT_ATTEMPT, COL_NUM_FAILURES, COL_TYPE)?;
     Ok((host, port as u16, record))
 }
 
@@ -128,20 +144,7 @@ impl PeerQueries for Connection {
             .query_row(
                 "SELECT nextattempt, numfailures, type FROM peers WHERE ip = ?1 AND port = ?2",
                 params![host, port as i64],
-                |row| {
-                    let raw_type: i32 = row.get(2)?;
-                    Ok(PeerRecord {
-                        next_attempt: row.get(0)?,
-                        num_failures: row.get::<_, i64>(1)? as u32,
-                        peer_type: StoredPeerType::try_from(raw_type).map_err(|e| {
-                            rusqlite::Error::FromSqlConversionFailure(
-                                2,
-                                rusqlite::types::Type::Integer,
-                                e.into(),
-                            )
-                        })?,
-                    })
-                },
+                |row| peer_record_from_row(row, 0, 1, 2),
             )
             .optional()?;
         Ok(result)

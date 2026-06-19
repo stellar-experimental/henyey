@@ -65,6 +65,13 @@ use std::sync::Arc;
 
 use rusqlite::Connection;
 
+/// Number of SQLite VM opcodes between progress-handler callbacks.
+///
+/// Shared by [`install_query_budget`] at both the callback-count computation
+/// (`ceil(max_ops / N)`) and the `progress_handler` registration (`N` opcodes
+/// per callback), so the two stay coupled.
+const QUERY_BUDGET_OPCODE_INTERVAL: u32 = 1000;
+
 /// RAII guard that clears the connection-wide SQLite progress handler on drop.
 ///
 /// # Safety invariant
@@ -86,9 +93,10 @@ impl Drop for QueryBudgetGuard<'_> {
 /// Installs a SQLite progress handler that interrupts the query after
 /// approximately `max_ops` VM opcodes.
 ///
-/// The handler fires every 1000 opcodes and checks a counter against
-/// `ceil(max_ops / 1000)`. When the counter reaches the threshold the
-/// handler returns `true`, causing SQLite to raise `SQLITE_INTERRUPT`.
+/// The handler fires every [`QUERY_BUDGET_OPCODE_INTERVAL`] opcodes and checks
+/// a counter against `ceil(max_ops / QUERY_BUDGET_OPCODE_INTERVAL)`. When the
+/// counter reaches the threshold the handler returns `true`, causing SQLite to
+/// raise `SQLITE_INTERRUPT`.
 ///
 /// Returns `None` (no-op) when `max_ops == 0`, meaning "unlimited".
 ///
@@ -102,11 +110,11 @@ pub(crate) fn install_query_budget(
     if max_ops == 0 {
         return None;
     }
-    let max_callbacks = (max_ops as u64).div_ceil(1000) as u32;
+    let max_callbacks = (max_ops as u64).div_ceil(QUERY_BUDGET_OPCODE_INTERVAL as u64) as u32;
     let counter = Arc::new(AtomicU32::new(0));
     let counter_clone = counter.clone();
     conn.progress_handler(
-        1000,
+        QUERY_BUDGET_OPCODE_INTERVAL as i32,
         Some(move || {
             let count = counter_clone.fetch_add(1, Ordering::Relaxed);
             count + 1 >= max_callbacks
