@@ -481,27 +481,11 @@ impl PeerAddress {
         }
     }
 
-    /// Returns a canonical dedup key for this peer address.
-    ///
-    /// For IP-address hosts, normalizes the string representation via a parse
-    /// round-trip (e.g. stripping leading zeros). For hostname hosts (config
-    /// entries before DNS resolution), falls back to the raw `host:port`.
-    ///
-    /// This is a synchronous, allocation-only operation — no DNS lookup.
-    #[deprecated(note = "Use dial_key() or ResolvedPeerAddr::try_from_peer_address() instead")]
-    pub fn canonical_key(&self) -> String {
-        if let Ok(ip) = self.host.parse::<std::net::IpAddr>() {
-            format!("{}:{}", ip, self.port)
-        } else {
-            format!("{}:{}", self.host, self.port)
-        }
-    }
-
     /// Compute the dial key for this address.
     ///
     /// IPs produce a normalized `DialKey::Resolved`; hostnames and IPv6 literals
-    /// produce `DialKey::Hostname`. This replaces `canonical_key()` with a
-    /// type-safe equivalent that makes hostname/IP aliasing impossible.
+    /// produce `DialKey::Hostname`. This is a type-safe dedup key that makes
+    /// hostname/IP aliasing impossible.
     pub fn dial_key(&self) -> DialKey {
         match ResolvedPeerAddr::try_from_peer_address(self) {
             Some(resolved) => DialKey::Resolved(resolved),
@@ -931,13 +915,6 @@ impl LocalNode {
     /// Uses the testnet network passphrase and current protocol versions.
     pub fn new_testnet(secret_key: henyey_crypto::SecretKey) -> Self {
         Self::with_network(secret_key, henyey_common::NetworkId::testnet())
-    }
-
-    /// Creates a new local node configured for the Stellar mainnet.
-    ///
-    /// Uses the mainnet network passphrase and current protocol versions.
-    pub fn new_mainnet(secret_key: henyey_crypto::SecretKey) -> Self {
-        Self::with_network(secret_key, henyey_common::NetworkId::mainnet())
     }
 
     /// Creates a new local node with a custom network passphrase.

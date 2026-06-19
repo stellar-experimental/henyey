@@ -400,11 +400,6 @@ impl ItemFetcher {
         *self.available_peers.lock().unwrap() = peers;
     }
 
-    /// Get the current list of available peers.
-    pub fn get_available_peers(&self) -> Vec<PeerId> {
-        self.available_peers.lock().unwrap().clone()
-    }
-
     /// Wrapper around `Tracker::try_next_peer` that increments the
     /// `item_fetcher_next_peer` counter on `AskPeer` results. All call sites
     /// should use this instead of calling `tracker.try_next_peer()` directly

@@ -3716,7 +3716,7 @@ mod tests {
     }
 
     #[test]
-    fn test_add_known_peer_canonical_key_dedup() {
+    fn test_add_known_peer_dial_key_dedup() {
         let local_node = {
             let secret = henyey_crypto::SecretKey::generate();
             crate::LocalNode::new_testnet(secret)
@@ -3726,7 +3726,7 @@ mod tests {
             ..Default::default()
         };
         let manager = OverlayManager::new(config, local_node).unwrap();
-        // Same IP, should be rejected as duplicate via canonical key
+        // Same IP, should be rejected as duplicate via dial key
         assert!(!manager.add_known_peer(PeerAddress::new("10.0.0.1", 11625)));
         // Different port, should be accepted
         assert!(manager.add_known_peer(PeerAddress::new("10.0.0.1", 11626)));
