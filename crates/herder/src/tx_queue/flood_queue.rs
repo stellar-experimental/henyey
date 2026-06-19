@@ -265,7 +265,7 @@ mod tests {
         fq.visit_top_txs(|_| VisitTxResult::Processed, &mut remaining, 25, &limits);
 
         // Reset and repopulate
-        let txs = vec![tx1.clone(), tx2.clone()];
+        let txs = [tx1.clone(), tx2.clone()];
         fq.reset_and_repopulate(txs.iter(), 25);
 
         // Should be able to drain again

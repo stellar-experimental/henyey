@@ -421,7 +421,7 @@ pub struct PendingTxSet {
 
 /// Pending quorum set request.
 #[derive(Debug, Clone)]
-pub struct PendingQuorumSet {
+pub(crate) struct PendingQuorumSet {
     /// Number of times we've requested this.
     pub request_count: u32,
     /// Node IDs that use this quorum set (envelope senders).
@@ -8949,13 +8949,13 @@ mod compare_tx_sets_tests {
 
         // Two StellarValues with the same tx_set_hash but different close_times
         let sv_a = StellarValue {
-            tx_set_hash: Hash(tx_set_hash.as_bytes().clone()),
+            tx_set_hash: Hash(*tx_set_hash.as_bytes()),
             close_time: TimePoint(1000),
             upgrades: vec![].try_into().unwrap(),
             ext: StellarValueExt::Basic,
         };
         let sv_b = StellarValue {
-            tx_set_hash: Hash(tx_set_hash.as_bytes().clone()),
+            tx_set_hash: Hash(*tx_set_hash.as_bytes()),
             close_time: TimePoint(1001),
             upgrades: vec![].try_into().unwrap(),
             ext: StellarValueExt::Basic,

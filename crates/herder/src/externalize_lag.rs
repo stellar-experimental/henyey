@@ -225,7 +225,7 @@ mod tests {
 
         tracker.record_event(100, &self_node, true, t0);
 
-        let qset = make_qset(&[self_node.clone()]);
+        let qset = make_qset(std::slice::from_ref(&self_node));
         assert_eq!(tracker.get_lag_info_summary(&qset), None);
     }
 
