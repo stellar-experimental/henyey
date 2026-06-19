@@ -47,6 +47,10 @@
 
 pub(crate) mod diff;
 pub(crate) mod execution;
+// `metadata` provides metadata-based ledger replay, exercised only by tests.
+// The whole module is `#[cfg(test)]`-gated here (single source of truth), so
+// its items don't need individual `#[cfg(test)]` attributes.
+#[cfg(test)]
 pub(crate) mod metadata;
 
 use henyey_bucket::EvictionIterator;
