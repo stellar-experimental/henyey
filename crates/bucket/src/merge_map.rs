@@ -41,15 +41,82 @@ use henyey_common::Hash256;
 use tokio::sync::watch;
 
 use crate::bucket::Bucket;
+use crate::error::{BucketError, BucketErrorClass};
 use crate::future_bucket::MergeKey;
 
 // ============================================================================
 // In-Flight Merge Types
 // ============================================================================
 
+/// A `Clone`able merge failure that preserves the structured error
+/// classification (and raw `errno` for transient IO) across the merge error
+/// chain (#3478).
+///
+/// `BucketError` is not `Clone` (it wraps `std::io::Error`), so historically
+/// the merge channel carried a bare `Arc<str>` and the `errno` was lost — a
+/// transient ENOSPC was indistinguishable from genuine corruption by the time
+/// it reached the resolve sites. This thin wrapper carries the coarse
+/// [`BucketErrorClass`] (cheap, `Copy`) alongside the rendered message so
+/// recovery decisions key on the class, not on string-matching.
+#[derive(Debug, Clone)]
+pub struct MergeError {
+    /// Coarse classification, carrying the raw `errno` for transient IO.
+    pub class: BucketErrorClass,
+    /// Rendered message (for logging / re-materialized non-IO errors).
+    pub message: Arc<str>,
+}
+
+impl MergeError {
+    /// Build a `MergeError` from a `BucketError`, capturing its class.
+    pub fn from_bucket_error(err: &BucketError) -> Self {
+        Self {
+            class: err.error_class(),
+            message: Arc::from(err.to_string()),
+        }
+    }
+
+    /// Build a `MergeError` from a plain message with an explicit class.
+    /// Used for channel/cancellation errors that have no originating
+    /// `BucketError` (classified `Other` — fatal/conservative).
+    pub fn from_message(message: impl Into<Arc<str>>) -> Self {
+        Self {
+            class: BucketErrorClass::Other,
+            message: message.into(),
+        }
+    }
+
+    /// True only for the transient free-space IO class (ENOSPC/EDQUOT).
+    pub fn is_transient_io(&self) -> bool {
+        self.class.is_transient_io()
+    }
+
+    /// Re-materialize a classified [`BucketError`] from this wrapper.
+    ///
+    /// `TransientIo(errno)` round-trips to `BucketError::Io` carrying the same
+    /// raw `errno` (so `is_transient_io()` stays true); `Corruption` to
+    /// `BucketError::Corruption`; `Other` to `BucketError::Merge`.
+    pub fn to_bucket_error(&self) -> BucketError {
+        match self.class {
+            BucketErrorClass::TransientIo(errno) => {
+                BucketError::Io(std::io::Error::from_raw_os_error(errno))
+            }
+            BucketErrorClass::Corruption => BucketError::Corruption(self.message.to_string()),
+            BucketErrorClass::Other => BucketError::Merge(self.message.to_string()),
+        }
+    }
+}
+
+impl std::fmt::Display for MergeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
 /// Result of an in-flight merge — either success or error.
-/// Must be cloneable so multiple receivers can access it.
-pub type MergeResult = std::result::Result<Arc<Bucket>, Arc<str>>;
+/// Must be cloneable so multiple receivers can access it. The error payload is
+/// a structured [`MergeError`] (not a bare string) so the `errno` survives for
+/// recovery classification (#3478).
+pub type MergeResult = std::result::Result<Arc<Bucket>, Arc<MergeError>>;
 
 /// Outcome of requesting a merge slot via [`BucketMergeMap::get_or_start`].
 pub enum MergeSlot {
@@ -114,10 +181,12 @@ impl InFlightGuard {
         // Drop will remove from in_flight
     }
 
-    /// Signal failure. Sends error to all reattached receivers.
-    pub fn fail(mut self, error: &str) {
+    /// Signal failure. Sends a structured error to all reattached receivers,
+    /// preserving the error classification (so a transient ENOSPC stays
+    /// distinguishable from corruption — #3478).
+    pub fn fail(mut self, error: MergeError) {
         self.signaled = true;
-        let _ = self.sender.send(Some(Err(Arc::from(error))));
+        let _ = self.sender.send(Some(Err(Arc::new(error))));
         // Drop will remove from in_flight
     }
 }
@@ -125,10 +194,12 @@ impl InFlightGuard {
 impl Drop for InFlightGuard {
     fn drop(&mut self) {
         if !self.signaled {
-            // Panic/early-return path: signal stable terminal error
-            let _ = self
-                .sender
-                .send(Some(Err(Arc::from("merge abandoned (guard dropped)"))));
+            // Panic/early-return path: signal stable terminal error. Classified
+            // `Other` (fatal/conservative) — an abandoned guard is not a known
+            // transient condition.
+            let _ = self.sender.send(Some(Err(Arc::new(MergeError::from_message(
+                "merge abandoned (guard dropped)",
+            )))));
         }
         // Always remove from in_flight (exactly once)
         if let Ok(mut map) = self.map.write() {

@@ -20,12 +20,47 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use henyey_bucket::HotArchiveBucket;
+use henyey_bucket::{BucketError, HotArchiveBucket};
 use henyey_db::Database;
 use henyey_history::{checkpoint_ledger, is_checkpoint_ledger, GENESIS_LEDGER_SEQ};
 use henyey_ledger::LedgerManager;
 
 use super::types::PendingPersist;
+
+/// Handle that lets a detached persist task request a **clean, recoverable**
+/// process shutdown on a transient environmental IO failure (ENOSPC/EDQUOT),
+/// instead of `std::process::abort()` (#3478).
+///
+/// Persist work runs on a detached blocking thread with no `App` reference, so
+/// the shutdown signal is threaded in via this thin `Clone` handle (wrapping
+/// the app's broadcast shutdown sender). The semantics mirror
+/// [`App::trigger_recoverable_shutdown`](crate::App::trigger_recoverable_shutdown):
+/// a clean shutdown WITHOUT `fatal_wipe_required` and WITHOUT setting
+/// `fatal_state_failure` — the on-disk state is intact and the operator just
+/// frees space and restarts.
+#[derive(Clone)]
+pub(crate) struct RecoverableShutdownHandle {
+    shutdown_tx: tokio::sync::broadcast::Sender<()>,
+}
+
+impl RecoverableShutdownHandle {
+    pub(crate) fn new(shutdown_tx: tokio::sync::broadcast::Sender<()>) -> Self {
+        Self { shutdown_tx }
+    }
+
+    /// Emit the recoverable-shutdown log (no `fatal_wipe_required`) and signal
+    /// the main loop to exit cleanly.
+    fn trigger(&self, context: &str, error: &dyn std::fmt::Display) {
+        tracing::error!(
+            context,
+            error = %error,
+            "RECOVERABLE: transient local IO failure during persist. \
+             Node will shut down cleanly. Free disk space and restart; \
+             no state wipe required (on-disk state is intact)."
+        );
+        let _ = self.shutdown_tx.send(());
+    }
+}
 
 /// Data needed to persist catchup state to SQLite after catchup completes.
 ///
@@ -169,8 +204,9 @@ impl CatchupPersistReady {
         data: CatchupPersistData,
         db: Database,
         ledger_manager: Arc<LedgerManager>,
+        shutdown: RecoverableShutdownHandle,
     ) -> Self {
-        let (job, ledger_seq) = PersistJob::catchup(data, db, ledger_manager);
+        let (job, ledger_seq) = PersistJob::catchup(data, db, ledger_manager, shutdown);
         Self { job, ledger_seq }
     }
 
@@ -236,6 +272,8 @@ pub(super) enum PersistJob {
         data: Box<CatchupPersistData>,
         db: Database,
         ledger_manager: Arc<LedgerManager>,
+        /// Clean recoverable shutdown on transient-IO persist failure (#3478).
+        shutdown: RecoverableShutdownHandle,
     },
     /// Post-close: flush hot archive + buckets + write full ledger data to DB,
     /// then optionally store LedgerCloseMeta for RPC.
@@ -247,6 +285,8 @@ pub(super) enum PersistJob {
         db: Database,
         ledger_manager: Arc<LedgerManager>,
         bucket_dir: std::path::PathBuf,
+        /// Clean recoverable shutdown on transient-IO persist failure (#3478).
+        shutdown: RecoverableShutdownHandle,
     },
 }
 
@@ -259,6 +299,7 @@ impl PersistJob {
         data: CatchupPersistData,
         db: Database,
         ledger_manager: Arc<LedgerManager>,
+        shutdown: RecoverableShutdownHandle,
     ) -> (Self, u32) {
         let seq = data.header.ledger_seq;
         (
@@ -266,6 +307,7 @@ impl PersistJob {
                 data: Box::new(data),
                 db,
                 ledger_manager,
+                shutdown,
             },
             seq,
         )
@@ -284,8 +326,9 @@ impl PersistJob {
                 data,
                 db,
                 ledger_manager,
+                shutdown,
             } => {
-                flush_bucket_persist_sync(&ledger_manager);
+                flush_bucket_persist_sync(&ledger_manager, &shutdown);
 
                 if let Err(e) = data.write_to_db(&db) {
                     fatal_persist_error("catchup DB write", &e);
@@ -299,6 +342,7 @@ impl PersistJob {
                 db,
                 ledger_manager,
                 bucket_dir,
+                shutdown,
             } => {
                 let persist_start = std::time::Instant::now();
 
@@ -309,7 +353,7 @@ impl PersistJob {
                 // durable on disk first. (The publish-queue enqueue itself, the
                 // §4.11 Step 1 "queue checkpoint", is co-transactional inside
                 // `write_fn` — see `LedgerPersistInputs::serialize_and_write_to_db`.)
-                flush_hot_archive_and_buckets_sync(&ledger_manager, &bucket_dir);
+                flush_hot_archive_and_buckets_sync(&ledger_manager, &bucket_dir, &shutdown);
 
                 // LEDGER_SPEC §4.11 Step 2 (#3066): "commit LedgerTxn". This is
                 // the single atomic SQLite transaction that co-writes header,
@@ -366,15 +410,15 @@ pub(super) fn spawn_persist_task(job: PersistJob, ledger_seq: u32) -> PendingPer
 /// Takes the pending persist handle from the bucket list (brief write lock),
 /// then joins the background thread WITHOUT holding the lock. This prevents
 /// blocking concurrent `bucket_list()` reads on the event loop.
-fn flush_bucket_persist_sync(ledger_manager: &LedgerManager) {
+fn flush_bucket_persist_sync(ledger_manager: &LedgerManager, shutdown: &RecoverableShutdownHandle) {
     let pending_handle = ledger_manager.bucket_list_mut().take_pending_persist();
     if let Some(handle) = pending_handle {
-        if let Err(e) = handle
-            .join()
-            .expect("bucket persist thread panicked")
-            .map_err(|e| format!("flush_pending_persist: {e}"))
-        {
-            fatal_persist_error("bucket flush", &e);
+        if let Err(e) = handle.join().expect("bucket persist thread panicked") {
+            // `e` is a classified `MergeError` (errno preserved through the
+            // persist thread), re-materialized to a classified `BucketError`
+            // so a transient ENOSPC routes to a clean recoverable shutdown
+            // rather than `abort()` (#3478).
+            handle_persist_error("bucket flush", &e.to_bucket_error(), shutdown);
         }
     }
 }
@@ -383,18 +427,22 @@ fn flush_bucket_persist_sync(ledger_manager: &LedgerManager) {
 ///
 /// Used by the post-close path where hot archive persist and bucket flush
 /// both run on the calling blocking thread.
-fn flush_hot_archive_and_buckets_sync(ledger_manager: &LedgerManager, bucket_dir: &Path) {
+fn flush_hot_archive_and_buckets_sync(
+    ledger_manager: &LedgerManager,
+    bucket_dir: &Path,
+    shutdown: &RecoverableShutdownHandle,
+) {
     // Persist hot archive buckets to disk.
     let habl_guard = ledger_manager.hot_archive_bucket_list();
     if let Some(habl) = habl_guard.as_ref() {
         if let Err(e) = persist_hot_archive_to_dir(habl.levels(), bucket_dir) {
-            fatal_persist_error("hot archive persist", &e);
+            handle_persist_error("hot archive persist", &e, shutdown);
         }
     }
     drop(habl_guard);
 
     // Flush pending bucket persist (take-then-join without holding the lock).
-    flush_bucket_persist_sync(ledger_manager);
+    flush_bucket_persist_sync(ledger_manager, shutdown);
 }
 
 /// Write hot archive bucket files to the bucket directory.
@@ -403,10 +451,13 @@ fn flush_hot_archive_and_buckets_sync(ledger_manager: &LedgerManager, bucket_dir
 /// already have a backing file on disk. Returns an error if any bucket
 /// file fails to write — the caller must not proceed to write HAS or
 /// publish state that references missing bucket files.
+///
+/// Returns the structured [`BucketError`] (preserving the `errno`) so the
+/// caller can distinguish a transient ENOSPC from genuine corruption (#3478).
 fn persist_hot_archive_to_dir(
     levels: &[henyey_bucket::HotArchiveBucketLevel],
     bucket_dir: &Path,
-) -> Result<(), String> {
+) -> Result<(), BucketError> {
     for level in levels {
         let mut buckets: Vec<&HotArchiveBucket> = vec![level.curr(), level.snap_bucket()];
         if let Some(next) = level.next() {
@@ -417,13 +468,7 @@ fn persist_hot_archive_to_dir(
                 let path =
                     bucket_dir.join(henyey_bucket::canonical_bucket_filename(&bucket.hash()));
                 if !path.exists() {
-                    bucket.save_to_xdr_file(&path).map_err(|e| {
-                        format!(
-                            "Failed to persist hot archive bucket {} to disk: {}",
-                            bucket.hash().to_hex(),
-                            e
-                        )
-                    })?;
+                    bucket.save_to_xdr_file(&path)?;
                 }
             }
         }
@@ -431,10 +476,31 @@ fn persist_hot_archive_to_dir(
     Ok(())
 }
 
+/// Route a persist failure to the correct shutdown path based on its
+/// classification (#3478).
+///
+/// - **Transient IO** (ENOSPC/EDQUOT): environmental, no partial state
+///   committed → a clean recoverable shutdown WITHOUT a state wipe. Matches
+///   stellar-core, which throws `POSSIBLY_CORRUPTED_LOCAL_FS` ("ensure enough
+///   space") → clean exit; operator frees space + restarts; no wipe.
+/// - **Anything else** (corruption / non-free-space IO): keeps the existing
+///   `abort()` behavior — the node's on-disk state may diverge from in-memory
+///   state, violating determinism guarantees.
+fn handle_persist_error(context: &str, error: &BucketError, shutdown: &RecoverableShutdownHandle) {
+    if error.is_transient_io() {
+        shutdown.trigger(context, error);
+    } else {
+        fatal_persist_error(context, error);
+    }
+}
+
 /// Log a fatal persist error and abort the process.
 ///
-/// All persist failures are unrecoverable — the node's on-disk state would
-/// diverge from in-memory state, violating determinism guarantees.
+/// Used for persist failures that are NOT a recoverable transient-IO condition
+/// (corruption, non-free-space IO): the node's on-disk state would diverge
+/// from in-memory state, violating determinism guarantees. (A transient
+/// ENOSPC/EDQUOT routes to a clean recoverable shutdown instead — see
+/// [`handle_persist_error`].)
 pub(super) fn fatal_persist_error(context: &str, error: &dyn std::fmt::Display) -> ! {
     tracing::error!(context, error = %error, "Fatal persist failure, aborting");
     std::process::abort();
@@ -445,6 +511,69 @@ mod tests {
     use super::*;
     use henyey_db::queries::StateQueries;
     use stellar_xdr::curr::{Hash, LedgerHeader, LedgerHeaderExt, StellarValue, StellarValueExt};
+
+    /// A detached `RecoverableShutdownHandle` for tests (no live App).
+    fn test_recoverable_shutdown() -> RecoverableShutdownHandle {
+        let (tx, _rx) = tokio::sync::broadcast::channel(1);
+        RecoverableShutdownHandle::new(tx)
+    }
+
+    /// #3478: the persist-error classifier must route a transient ENOSPC
+    /// (errno 28) to a clean recoverable shutdown (broadcast a shutdown
+    /// signal), NOT to `std::process::abort()` — the on-disk state is intact.
+    #[test]
+    fn transient_io_persist_error_routes_to_recoverable_shutdown_3478() {
+        let (tx, mut rx) = tokio::sync::broadcast::channel(1);
+        let shutdown = RecoverableShutdownHandle::new(tx);
+
+        let enospc = BucketError::Io(std::io::Error::from_raw_os_error(28));
+        assert!(enospc.is_transient_io(), "errno 28 must be transient IO");
+
+        // handle_persist_error must NOT abort for a transient-IO error; it must
+        // signal a clean shutdown. (If it aborted, the test process would die.)
+        handle_persist_error("test transient flush", &enospc, &shutdown);
+
+        // The recoverable shutdown signal was sent (no wipe, no abort).
+        assert!(
+            rx.try_recv().is_ok(),
+            "transient-IO persist error must trigger a clean recoverable shutdown signal"
+        );
+    }
+
+    /// #3478: EDQUOT (errno 122) is also a transient free-space class and must
+    /// route to recoverable shutdown.
+    #[test]
+    fn edquot_persist_error_is_transient_3478() {
+        let edquot = BucketError::Io(std::io::Error::from_raw_os_error(122));
+        assert!(
+            edquot.is_transient_io(),
+            "errno 122 (EDQUOT) must be transient IO"
+        );
+    }
+
+    /// #3478: a corruption (or non-free-space IO) persist error must NOT be
+    /// classified transient — it stays on the fatal `abort()` path. We assert
+    /// the classifier branch (the `abort()` itself is not unit-testable).
+    #[test]
+    fn corruption_persist_error_stays_fatal_3478() {
+        let corruption = BucketError::Corruption("bucket entries unsorted".to_string());
+        assert!(
+            !corruption.is_transient_io(),
+            "corruption must NOT be classified transient (stays fatal/abort)"
+        );
+
+        // EIO (errno 5) is conservatively fatal (could be hardware corruption).
+        let eio = BucketError::Io(std::io::Error::from_raw_os_error(5));
+        assert!(
+            !eio.is_transient_io(),
+            "EIO must NOT be classified transient (stays fatal/abort)"
+        );
+
+        // A transient handle that is never triggered for these classes: assert
+        // no shutdown signal is produced by the classifier when we DON'T call
+        // handle_persist_error (the fatal path would abort, which we can't run
+        // here — so we only verify classification above).
+    }
 
     fn make_header(seq: u32) -> (LedgerHeader, Vec<u8>) {
         use stellar_xdr::curr::{LedgerHeaderExtensionV1, Limits, WriteXdr};
@@ -564,7 +693,7 @@ mod tests {
             has_json: "{}".to_string(),
             publish_enabled: false,
         };
-        let ready = CatchupPersistReady::new(data, db, lm);
+        let ready = CatchupPersistReady::new(data, db, lm, test_recoverable_shutdown());
         assert_eq!(ready.ledger_seq(), 99);
         let pending = ready.spawn();
         assert_eq!(pending.ledger_seq, 99);
@@ -608,7 +737,7 @@ mod tests {
             has_json: "{}".to_string(),
             publish_enabled: false,
         };
-        let ready = CatchupPersistReady::new(data, db, lm);
+        let ready = CatchupPersistReady::new(data, db, lm, test_recoverable_shutdown());
         let result_ok = Ok(crate::app::types::CatchupResult {
             ledger_seq: 50,
             ledger_hash: henyey_common::Hash256::default(),
@@ -757,6 +886,7 @@ mod tests {
                 db: db_for_write,
                 ledger_manager: lm,
                 bucket_dir: bucket_dir.path().to_path_buf(),
+                shutdown: test_recoverable_shutdown(),
             };
 
             let pending = spawn_persist_task(job, test_seq);

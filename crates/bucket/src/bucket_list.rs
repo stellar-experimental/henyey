@@ -317,8 +317,13 @@ enum MergeRecvState {
     /// Merge in progress; receiver delivers the result.
     Pending(oneshot::Receiver<Result<Bucket>>),
     /// Terminal state — merge completed or failed; result is cached.
-    /// Errors stored as strings since BucketError is not Clone.
-    Ready(std::result::Result<Arc<Bucket>, String>),
+    ///
+    /// Errors are stored as a structured [`MergeError`] (not a bare string)
+    /// since `BucketError` is not `Clone`. The `MergeError` carries the coarse
+    /// class / raw `errno`, so `resolve()` can re-materialize a *classified*
+    /// `BucketError` and a transient ENOSPC stays distinguishable from
+    /// corruption (#3478).
+    Ready(std::result::Result<Arc<Bucket>, crate::merge_map::MergeError>),
 }
 
 /// Handle to an asynchronous bucket merge running in a background thread.
@@ -518,16 +523,20 @@ impl AsyncMergeHandle {
     /// - No runtime: `blocking_recv` directly
     pub fn resolve(&mut self) -> Result<Arc<Bucket>> {
         if let MergeRecvState::Ready(ref result) = self.state {
-            return result.clone().map_err(|msg| BucketError::Merge(msg));
+            // Re-materialize a *classified* BucketError from the cached
+            // structured MergeError so the errno survives repeated resolves.
+            return result.clone().map_err(|e| e.to_bucket_error());
         }
 
         let start = std::time::Instant::now();
 
         // Take the Pending receiver, replacing with a temporary Ready(Err) in case
-        // the recv panics (belt-and-suspenders).
+        // the recv panics (belt-and-suspenders). Classified `Other` (fatal).
         let MergeRecvState::Pending(rx) = std::mem::replace(
             &mut self.state,
-            MergeRecvState::Ready(Err("merge resolve interrupted".to_string())),
+            MergeRecvState::Ready(Err(crate::merge_map::MergeError::from_message(
+                "merge resolve interrupted",
+            ))),
         ) else {
             unreachable!("already checked for Ready above");
         };
@@ -550,16 +559,42 @@ impl AsyncMergeHandle {
                     Ok(bucket)
                 }
                 Err(e) => {
-                    let msg = e.to_string();
-                    self.state = MergeRecvState::Ready(Err(msg.clone()));
-                    Err(BucketError::Merge(msg))
+                    // Preserve the structured class/errno from the original
+                    // BucketError (#3478) instead of stringifying it away.
+                    let merge_err = crate::merge_map::MergeError::from_bucket_error(&e);
+                    self.state = MergeRecvState::Ready(Err(merge_err.clone()));
+                    Err(merge_err.to_bucket_error())
                 }
             },
             Err(e) => {
-                let msg = e.to_string();
-                self.state = MergeRecvState::Ready(Err(msg.clone()));
-                Err(BucketError::Merge(msg))
+                // Channel/cancellation error — no originating BucketError class.
+                let merge_err = crate::merge_map::MergeError::from_bucket_error(&e);
+                self.state = MergeRecvState::Ready(Err(merge_err.clone()));
+                Err(merge_err.to_bucket_error())
             }
+        }
+    }
+
+    /// Test-only constructor: build a handle already resolved to a failure
+    /// carrying a structured [`MergeError`] (with its real `errno`).
+    ///
+    /// Used by the #3478 regression tests to inject the exact production
+    /// ENOSPC failure so the classification path (`is_transient_io`) is
+    /// exercised on a real structured errno, not a hard-coded boolean.
+    #[cfg(test)]
+    pub(crate) fn new_failed_for_test(level: usize, error: crate::merge_map::MergeError) -> Self {
+        let merge_key = MergeKey::new(
+            DeadEntryPolicy::Keep,
+            Hash256::default(),
+            Hash256::default(),
+        );
+        Self {
+            state: MergeRecvState::Ready(Err(error)),
+            level,
+            input_file_paths: Vec::new(),
+            input_curr_hash: Hash256::default(),
+            input_snap_hash: Hash256::default(),
+            merge_key,
         }
     }
 }
@@ -642,14 +677,14 @@ impl SharedMergeHandle {
     /// Uses the same runtime-aware blocking strategy as AsyncMergeHandle::resolve().
     pub fn resolve(&mut self) -> Result<Arc<Bucket>> {
         if let Some(ref result) = self.cached_result {
-            return result
-                .clone()
-                .map_err(|e| BucketError::Merge(e.to_string()));
+            // Re-materialize a classified BucketError from the structured
+            // MergeError so the errno survives (#3478).
+            return result.clone().map_err(|e| e.to_bucket_error());
         }
 
         let result = blocking_recv_watch(&mut self.receiver)?;
         self.cached_result = Some(result.clone());
-        result.map_err(|e| BucketError::Merge(e.to_string()))
+        result.map_err(|e| e.to_bucket_error())
     }
 }
 
@@ -928,23 +963,45 @@ impl BucketLevel {
     /// before cloning the bucket list, as unresolved merges would be
     /// lost during cloning.
     ///
-    /// Merge failures are propagated as errors (matching stellar-core's
-    /// fatal behavior for merge failures).
+    /// Merge failures are propagated as errors. A transient-IO (ENOSPC/EDQUOT)
+    /// failure is recoverable and re-classified by the caller; genuine
+    /// corruption stays fatal (#3478). The error is re-materialized as a
+    /// *classified* `BucketError` (via the cached structured `MergeError`), so
+    /// repeated calls keep surfacing the same classified error rather than
+    /// silently returning `Ok` once cached.
     pub fn resolve_pending_merge(&mut self) -> Result<()> {
         match &mut self.next {
             Some(PendingMerge::Async(ref mut handle)) => {
-                if matches!(handle.state, MergeRecvState::Pending(_)) {
-                    handle.resolve()?;
-                }
+                // Always call resolve(): if Pending it blocks and caches; if
+                // already Ready(Err) it re-surfaces the cached classified
+                // error (so a poisoned level is never silently treated as Ok).
+                handle.resolve()?;
             }
             Some(PendingMerge::Shared(ref mut handle)) => {
-                if handle.cached_result.is_none() {
-                    handle.resolve()?;
-                }
+                handle.resolve()?;
             }
             _ => {}
         }
         Ok(())
+    }
+
+    /// The `MergeKey` of this level's pending merge, if any. Used to clear the
+    /// shared merge map when resetting a transient-IO-failed level (#3478).
+    fn pending_merge_key(&self) -> Option<MergeKey> {
+        match &self.next {
+            Some(PendingMerge::Async(handle)) => Some(handle.merge_key.clone()),
+            Some(PendingMerge::Shared(handle)) => Some(handle.metadata.merge_key.clone()),
+            _ => None,
+        }
+    }
+
+    /// Reset a level whose pending merge failed transiently, so the next close
+    /// re-issues a fresh merge instead of being served a poisoned `Ready(Err)`
+    /// (#3478, §3). Clears the pending merge and drops the in-flight guard
+    /// (signalling any reattached consumers via the guard's `Drop`).
+    fn reset_failed_merge(&mut self) {
+        self.next = None;
+        self.in_flight_guard = None;
     }
 
     /// Get a reference to the next bucket if any (pending merge result).
@@ -1400,7 +1457,12 @@ pub struct BucketList {
     eviction_counters: Arc<EvictionCounters>,
     /// Background thread handle for async bucket persistence.
     /// Bounded to one concurrent write; the next add_batch waits for completion.
-    pending_persist: Option<std::thread::JoinHandle<std::result::Result<(), String>>>,
+    ///
+    /// The error payload is a structured [`MergeError`] (not a bare `String`)
+    /// so a transient ENOSPC during persist stays distinguishable from genuine
+    /// corruption at the flush site (#3478).
+    pending_persist:
+        Option<std::thread::JoinHandle<std::result::Result<(), crate::merge_map::MergeError>>>,
 }
 
 /// Deduplicate ledger entries by key, keeping only the last occurrence.
@@ -1555,6 +1617,55 @@ where
     load_and_verify_shared(hash, load_bucket)
 }
 
+/// Persist a batch of buckets to disk, returning a structured [`MergeError`]
+/// that preserves the IO error classification (#3478).
+///
+/// Runs on the background persist thread. If multiple buckets fail, the
+/// returned error preserves the most-severe class so corruption is never
+/// masked by a co-occurring transient failure: `Corruption` wins over
+/// `TransientIo`, which wins over `Other`. The message aggregates all failures.
+fn persist_buckets_collecting_error(
+    buckets_to_persist: Vec<(Arc<Bucket>, std::path::PathBuf)>,
+) -> std::result::Result<(), crate::merge_map::MergeError> {
+    let mut messages = Vec::new();
+    // Track the most-severe class seen across failures.
+    let mut worst: Option<crate::error::BucketErrorClass> = None;
+    for (bucket, path) in buckets_to_persist {
+        if let Err(e) = bucket.save_to_xdr_file(&path) {
+            messages.push(format!("bucket {}: {}", bucket.hash().to_hex(), e));
+            let class = e.error_class();
+            worst = Some(match worst {
+                None => class,
+                Some(prev) => more_severe_class(prev, class),
+            });
+        }
+    }
+    if messages.is_empty() {
+        Ok(())
+    } else {
+        Err(crate::merge_map::MergeError {
+            class: worst.unwrap_or(crate::error::BucketErrorClass::Other),
+            message: std::sync::Arc::from(messages.join("; ")),
+        })
+    }
+}
+
+/// Pick the more-severe of two error classes so corruption is never masked by
+/// a co-occurring transient failure (#3478): `Corruption` > `TransientIo` >
+/// `Other`. (`Other` is fatal too, but a transient class is the more specific
+/// recoverable signal, so it ranks above `Other` for the recovery decision.)
+fn more_severe_class(
+    a: crate::error::BucketErrorClass,
+    b: crate::error::BucketErrorClass,
+) -> crate::error::BucketErrorClass {
+    use crate::error::BucketErrorClass::*;
+    match (a, b) {
+        (Corruption, _) | (_, Corruption) => Corruption,
+        (TransientIo(e), _) | (_, TransientIo(e)) => TransientIo(e),
+        _ => Other,
+    }
+}
+
 impl BucketList {
     /// Number of levels in the BucketList.
     pub const NUM_LEVELS: usize = BUCKET_LIST_LEVELS;
@@ -1590,15 +1701,14 @@ impl BucketList {
     /// Call before writing state that references bucket files (HAS, LCL, publish).
     pub fn flush_pending_persist(&mut self) -> Result<()> {
         if let Some(handle) = self.pending_persist.take() {
-            let result: std::result::Result<(), String> = handle
+            let result: std::result::Result<(), crate::merge_map::MergeError> = handle
                 .join()
                 .expect("background bucket persist thread panicked");
-            result.map_err(|e| {
-                BucketError::Io(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("background bucket persist failed: {}", e),
-                ))
-            })?;
+            // Re-materialize a classified BucketError (preserving the original
+            // ErrorKind/errno) instead of flattening to ErrorKind::Other, so
+            // the persist flush site can distinguish a transient ENOSPC from
+            // corruption (#3478).
+            result.map_err(|e| e.to_bucket_error())?;
         }
         Ok(())
     }
@@ -1610,7 +1720,8 @@ impl BucketList {
     /// thread join, preventing lock contention with concurrent readers.
     pub fn take_pending_persist(
         &mut self,
-    ) -> Option<std::thread::JoinHandle<std::result::Result<(), String>>> {
+    ) -> Option<std::thread::JoinHandle<std::result::Result<(), crate::merge_map::MergeError>>>
+    {
         self.pending_persist.take()
     }
 
@@ -1659,9 +1770,44 @@ impl BucketList {
     /// This should be called before cloning a bucket list to ensure that all
     /// async merges are resolved and their results are cached, preventing data
     /// loss during cloning.
+    ///
+    /// # Recovery semantics (#3478)
+    ///
+    /// On a **transient-IO** (ENOSPC/EDQUOT) merge failure — environmental,
+    /// no partial state committed — the failed level is RESET (its pending
+    /// merge and shared-merge-map entry are cleared) so the next close
+    /// re-issues a fresh merge once disk recovers, rather than being served a
+    /// poisoned cached `Ready(Err)`. The error is still propagated so callers
+    /// can back off (skip GC / abort a catchup attempt) without panicking.
+    ///
+    /// Genuine **corruption** (and any other class) is left terminal and
+    /// propagated unchanged — we must NOT silently retry corruption.
     pub fn resolve_all_pending_merges(&mut self) -> Result<()> {
-        for level in &mut self.levels {
-            level.resolve_pending_merge()?;
+        for idx in 0..self.levels.len() {
+            let result = self.levels[idx].resolve_pending_merge();
+            if let Err(ref err) = result {
+                if err.is_transient_io() {
+                    // Recoverable: reset this level so the next close re-issues
+                    // the merge, and clear the shared merge-map entry for its
+                    // key so the re-issue starts fresh (not a stale in-flight /
+                    // completed lookup).
+                    let key = self.levels[idx].pending_merge_key();
+                    self.levels[idx].reset_failed_merge();
+                    if let (Some(key), Some(merge_map)) = (key, self.merge_map.as_ref()) {
+                        if let Ok(mut map) = merge_map.write() {
+                            map.in_flight.remove(&key);
+                            map.remove_merge(&key);
+                        }
+                    }
+                    tracing::warn!(
+                        level = idx,
+                        error = %err,
+                        "Transient IO failure resolving bucket merge; level reset to re-merge \
+                         on next close (recoverable — not corruption)"
+                    );
+                }
+                return result;
+            }
         }
         Ok(())
     }
@@ -2406,15 +2552,11 @@ impl BucketList {
         if let Some(ref dir) = self.bucket_dir {
             // Wait for any previous background persist to complete
             if let Some(handle) = self.pending_persist.take() {
-                let result: std::result::Result<(), String> = handle
+                let result: std::result::Result<(), crate::merge_map::MergeError> = handle
                     .join()
                     .expect("background bucket persist thread panicked");
-                result.map_err(|e| {
-                    BucketError::Io(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        format!("background bucket persist failed: {}", e),
-                    ))
-                })?;
+                // Preserve the structured class/errno (#3478).
+                result.map_err(|e| e.to_bucket_error())?;
             }
 
             let mut buckets_to_persist: Vec<(Arc<Bucket>, std::path::PathBuf)> = Vec::new();
@@ -2430,17 +2572,7 @@ impl BucketList {
             }
             if !buckets_to_persist.is_empty() {
                 self.pending_persist = Some(std::thread::spawn(move || {
-                    let mut errors = Vec::new();
-                    for (bucket, path) in buckets_to_persist {
-                        if let Err(e) = bucket.save_to_xdr_file(&path) {
-                            errors.push(format!("bucket {}: {}", bucket.hash().to_hex(), e));
-                        }
-                    }
-                    if errors.is_empty() {
-                        Ok(())
-                    } else {
-                        Err(errors.join("; "))
-                    }
+                    persist_buckets_collecting_error(buckets_to_persist)
                 }));
             }
         }
@@ -3553,7 +3685,8 @@ impl Drop for BucketList {
     fn drop(&mut self) {
         // Wait for any pending background persist to complete
         if let Some(handle) = self.pending_persist.take() {
-            let result: std::result::Result<(), String> = match handle.join() {
+            let result: std::result::Result<(), crate::merge_map::MergeError> = match handle.join()
+            {
                 Ok(r) => r,
                 Err(_) => return,
             };

@@ -3003,6 +3003,7 @@ impl App {
                 db: self.db.clone(),
                 ledger_manager: self.ledger_manager.clone(),
                 bucket_dir: self.bucket_manager.bucket_dir().to_path_buf(),
+                shutdown: self.recoverable_shutdown_handle(),
             },
             pending.ledger_seq,
         );

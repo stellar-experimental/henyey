@@ -42,8 +42,8 @@ use crate::{
     LedgerError, Result,
 };
 use henyey_bucket::{
-    BucketEntry, BucketEntryExt, BucketList, BucketListSnapshot, BucketMergeMap, EvictionIterator,
-    EvictionResult, HotArchiveBucketList, PendingMergeState,
+    BucketEntry, BucketEntryExt, BucketError, BucketList, BucketListSnapshot, BucketMergeMap,
+    EvictionIterator, EvictionResult, HotArchiveBucketList, PendingMergeState,
 };
 use henyey_common::protocol::{
     hot_archive_supported, needs_upgrade_to_version, protocol_version_starts_from, ProtocolVersion,
@@ -1729,11 +1729,19 @@ impl LedgerManager {
     /// This must be called before cloning the bucket list, because
     /// `BucketLevel::clone()` drops unresolved async merges. After calling
     /// this, all pending merges are `PendingMerge::InMemory` and safe to clone.
-    pub fn resolve_pending_bucket_merges(&self) {
-        self.bucket_list
-            .write()
-            .resolve_all_pending_merges()
-            .expect("bucket merge failure is fatal — cannot continue with corrupt bucket list");
+    ///
+    /// Returns `Err` on a merge failure. The error is classified (#3478): a
+    /// transient-IO (ENOSPC/EDQUOT) failure is environmental and recoverable —
+    /// callers should back off (skip the best-effort GC tick, or abort that
+    /// catchup attempt) rather than terminate the process; the failed level is
+    /// reset internally so the next close re-issues the merge. Genuine
+    /// corruption stays fatal and callers should treat it as such.
+    ///
+    /// Mirrors stellar-core: a bucket merge IO failure throws (recoverable
+    /// clean exit on ENOSPC; node corruption is the distinct fatal path) — it
+    /// never `std::abort`s on the bucket path.
+    pub fn try_resolve_pending_bucket_merges(&self) -> std::result::Result<(), BucketError> {
+        self.bucket_list.write().resolve_all_pending_merges()
     }
 
     /// Get a lock on the unified offer store for direct access.
