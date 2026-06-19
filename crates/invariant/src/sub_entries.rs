@@ -12,8 +12,8 @@
 use std::collections::HashMap;
 
 use stellar_xdr::curr::{
-    AccountId, ContractEvent, LedgerEntry, LedgerEntryData, Operation, OperationResult,
-    TrustLineAsset,
+    AccountEntry, AccountId, ContractEvent, LedgerEntry, LedgerEntryData, Operation,
+    OperationResult, TrustLineAsset,
 };
 
 use crate::{Invariant, OperationDelta};
@@ -69,6 +69,24 @@ fn get_sub_entry_account(entry: &LedgerEntry) -> Option<&AccountId> {
     }
 }
 
+/// Extract the `AccountEntry` from an optional ledger entry.
+///
+/// Returns `None` for an absent entry and — defensively — for any non-account
+/// variant. In `update_changed_sub_entries` the outer `match` already proves the
+/// present side is an `Account` (same calling convention as stellar-core's
+/// `current->data.account()` direct access), so the non-account case is dead;
+/// returning `None` keeps that path contributing 0 (matching the prior
+/// `else { 0 }`) rather than panicking.
+fn account_of(entry: Option<&LedgerEntry>) -> Option<&AccountEntry> {
+    match entry {
+        Some(LedgerEntry {
+            data: LedgerEntryData::Account(a),
+            ..
+        }) => Some(a),
+        _ => None,
+    }
+}
+
 /// Update the sub-entries change map for a single entry delta.
 fn update_changed_sub_entries(
     changes: &mut HashMap<AccountId, SubEntriesChange>,
@@ -81,43 +99,13 @@ fn update_changed_sub_entries(
         LedgerEntryData::Account(acc) => {
             let account_id = acc.account_id.clone();
             let change = changes.entry(account_id).or_default();
-            change.num_sub_entries += current
-                .map(|e| {
-                    if let LedgerEntryData::Account(a) = &e.data {
-                        a.num_sub_entries as i32
-                    } else {
-                        0
-                    }
-                })
-                .unwrap_or(0)
-                - previous
-                    .map(|e| {
-                        if let LedgerEntryData::Account(a) = &e.data {
-                            a.num_sub_entries as i32
-                        } else {
-                            0
-                        }
-                    })
-                    .unwrap_or(0);
+            let cur = account_of(current);
+            let prev = account_of(previous);
+            change.num_sub_entries += cur.map_or(0, |a| a.num_sub_entries as i32)
+                - prev.map_or(0, |a| a.num_sub_entries as i32);
 
-            let cur_signers = current
-                .map(|e| {
-                    if let LedgerEntryData::Account(a) = &e.data {
-                        a.signers.len() as i32
-                    } else {
-                        0
-                    }
-                })
-                .unwrap_or(0);
-            let prev_signers = previous
-                .map(|e| {
-                    if let LedgerEntryData::Account(a) = &e.data {
-                        a.signers.len() as i32
-                    } else {
-                        0
-                    }
-                })
-                .unwrap_or(0);
+            let cur_signers = cur.map_or(0, |a| a.signers.len() as i32);
+            let prev_signers = prev.map_or(0, |a| a.signers.len() as i32);
             change.signers += cur_signers - prev_signers;
             change.calculated_sub_entries += cur_signers - prev_signers;
         }
