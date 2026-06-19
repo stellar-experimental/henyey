@@ -98,8 +98,8 @@ pub(crate) async fn cmd_publish_history(config: AppConfig, force: bool) -> anyho
 
     println!("Latest publishable checkpoint: {}", latest_checkpoint);
 
-    let queued_checkpoints = db.load_publish_queue(None)?;
-    let mut queued_checkpoints = queued_checkpoints
+    let mut queued_checkpoints = db
+        .load_publish_queue(None)?
         .into_iter()
         .filter(|checkpoint| *checkpoint <= latest_checkpoint)
         .collect::<Vec<_>>();
@@ -314,9 +314,9 @@ pub(crate) async fn cmd_publish_history(config: AppConfig, force: bool) -> anyho
             published_any = true;
         }
 
-        if let Some((ref publish_dir, _)) = command_publish_dir {
-            write_scp_history_file(publish_dir, checkpoint, &scp_entries)?;
-            let plan = henyey_history::upload::UploadPlan::from_staging_dir(publish_dir)?;
+        if let Some((publish_dir, publish_tmp)) = command_publish_dir {
+            write_scp_history_file(&publish_dir, checkpoint, &scp_entries)?;
+            let plan = henyey_history::upload::UploadPlan::from_staging_dir(&publish_dir)?;
             for archive in &command_targets {
                 let remote_archive =
                     henyey_history::RemoteArchive::new(henyey_history::RemoteArchiveConfig {
@@ -329,9 +329,7 @@ pub(crate) async fn cmd_publish_history(config: AppConfig, force: bool) -> anyho
                 println!("OK (command: {})", archive.name);
                 published_any = true;
             }
-        }
 
-        if let Some((_publish_dir, publish_tmp)) = command_publish_dir {
             if let Err(err) = publish_tmp.close() {
                 tracing::warn!(
                     error = %err,
@@ -368,7 +366,6 @@ fn build_scp_history_entries(
     start_ledger: u32,
     checkpoint: u32,
 ) -> anyhow::Result<Vec<stellar_xdr::curr::ScpHistoryEntry>> {
-    use henyey_common::Hash256;
     use std::collections::HashSet;
     use stellar_xdr::curr::{LedgerScpMessages, ScpHistoryEntry, ScpHistoryEntryV0};
 
