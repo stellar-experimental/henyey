@@ -1908,7 +1908,7 @@ async fn cmd_run(
     }
 
     // In local mode, auto-initialize database and history if needed.
-    let config = if local {
+    let mut config = if local {
         let db_path = &config.database.path;
 
         // Ensure data directory exists.
@@ -1967,7 +1967,6 @@ async fn cmd_run(
     };
 
     // Set in-memory mode on the config so it flows through to App::new.
-    let mut config = config;
     config.database.in_memory = in_memory;
     if in_memory {
         tracing::info!("In-memory mode requested via --in-memory flag");
@@ -3242,14 +3241,10 @@ fn bucket_info(path: &std::path::Path) -> anyhow::Result<()> {
         println!();
         println!("Total: {} files, {} bytes", count, total_size);
     } else {
-        // Single bucket file
-        println!("Bucket file: {}", path.display());
-
-        let metadata = std::fs::metadata(path)?;
-        println!("Size: {} bytes", metadata.len());
-
-        // Would parse and display bucket contents
-        println!("(Bucket content parsing not yet implemented)");
+        anyhow::bail!(
+            "bucket-info expects a directory; got file {}",
+            path.display()
+        );
     }
 
     Ok(())
@@ -3414,12 +3409,6 @@ async fn cmd_dump_ledger(
     Ok(())
 }
 
-/// Perform offline self-checks (equivalent to stellar-core self-check command).
-///
-/// This command performs comprehensive diagnostic checks:
-/// 1. Header chain verification - ensures ledger headers form a valid chain
-/// 2. Bucket hash verification - verifies all bucket files have correct hashes
-/// 3. Crypto benchmarking - measures Ed25519 sign/verify performance
 /// Verify ledger header chain integrity going backwards.
 /// Returns false if any break in the chain is detected.
 fn self_check_header_chain(db: &henyey_db::Database, latest_seq: u32) -> anyhow::Result<bool> {
@@ -3563,6 +3552,12 @@ fn self_check_crypto_benchmark() {
     println!("  Benchmarked {} verifications / sec", verify_per_sec);
 }
 
+/// Perform offline self-checks (equivalent to stellar-core self-check command).
+///
+/// This command performs comprehensive diagnostic checks:
+/// 1. Header chain verification - ensures ledger headers form a valid chain
+/// 2. Bucket hash verification - verifies all bucket files have correct hashes
+/// 3. Crypto benchmarking - measures Ed25519 sign/verify performance
 async fn cmd_self_check(config: AppConfig) -> anyhow::Result<()> {
     let db = henyey_db::Database::open(&config.database.path)?;
 

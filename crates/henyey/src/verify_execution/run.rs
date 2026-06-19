@@ -594,12 +594,12 @@ fn print_eviction_and_entry_diagnostics(
     lcm: &stellar_xdr::curr::LedgerCloseMeta,
     result_header: &stellar_xdr::curr::LedgerHeader,
 ) {
-    let cdp_evicted_keys = henyey_history::cdp::extract_evicted_keys(&lcm);
-    let tx_metas = henyey_history::cdp::extract_transaction_metas(&lcm);
+    let cdp_evicted_keys = henyey_history::cdp::extract_evicted_keys(lcm);
+    let tx_metas = henyey_history::cdp::extract_transaction_metas(lcm);
     let cdp_restored_keys = henyey_history::cdp::extract_restored_keys(&tx_metas);
 
     // Count CDP entry changes (including upgrade-meta create/update counts).
-    let cdp_upgrade_metas = henyey_history::cdp::extract_upgrade_metas(&lcm);
+    let cdp_upgrade_metas = henyey_history::cdp::extract_upgrade_metas(lcm);
     let (cdp_creates, cdp_updates, cdp_deletes, upgrade_creates, upgrade_updates) =
         cdp_change_counts(&tx_metas, &cdp_upgrade_metas);
 
