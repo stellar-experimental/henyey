@@ -44,16 +44,19 @@ impl LedgerRange {
     }
 
     /// Check if the range is empty.
+    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.count == 0
     }
 
     /// Get the limit (one past the last ledger).
+    #[cfg(test)]
     pub fn limit(&self) -> u32 {
         self.first + self.count
     }
 
     /// Get the last ledger in the range (panics if empty).
+    #[cfg(test)]
     pub fn last(&self) -> u32 {
         assert!(self.count > 0, "cannot get last of empty range");
         self.first + self.count - 1

@@ -177,12 +177,6 @@ pub use publish_queue::{
 };
 pub use remote_archive::{RemoteArchive, RemoteArchiveConfig};
 pub use replay::{ReplayConfig, ReplayedLedgerState};
-pub use verify::{
-    compute_header_hash, verify_bucket_hash, verify_chain_anchors, verify_has_passphrase,
-    verify_header_chain, verify_header_chain_from_entries, verify_ledger_header_history_entry,
-    verify_reverse_walk, verify_tx_result_ordering, ChainTrustAnchors, ReverseWalkConfig,
-    ReverseWalkResult, TrustSource,
-};
 
 /// Result type for history operations.
 pub type Result<T> = std::result::Result<T, HistoryError>;
