@@ -25,9 +25,12 @@ use henyey_tx::envelope_utils::envelope_soroban_data;
 use stellar_xdr::curr::{
     ConfigSettingEntry, ContractDataDurability, ContractId, ContractIdPreimage,
     ContractIdPreimageFromAddress, ExtensionPoint, Hash, LedgerEntry, LedgerEntryData,
-    LedgerEntryExt, LedgerKey, LedgerKeyContractData, LedgerUpgrade, Limits, OperationBody,
-    ScAddress, ScVal, TransactionEnvelope, Uint256, WriteXdr,
+    LedgerEntryExt, LedgerKey, LedgerUpgrade, Limits, OperationBody, ScAddress, ScVal,
+    TransactionEnvelope, Uint256, WriteXdr,
 };
+// `LedgerKeyContractData` is only constructed in test fixtures below.
+#[cfg(test)]
+use stellar_xdr::curr::LedgerKeyContractData;
 use tracing::{debug, info, warn};
 
 use crate::loadgen::{ContractInstance, TxGenerator};
@@ -622,21 +625,6 @@ impl ApplyLoad {
         &self.write_entry_utilization
     }
 
-    /// Returns a `LedgerKey` for a pre-populated archived state entry at the
-    /// given index.
-    ///
-    /// Matches stellar-core `ApplyLoad::getKeyForArchivedEntry()`.
-    pub fn key_for_archived_entry(index: u64) -> LedgerKey {
-        let contract_id_bytes = Hash256::hash(b"archived-entry");
-        let contract_addr = ScAddress::Contract(ContractId(Hash(contract_id_bytes.0)));
-
-        LedgerKey::ContractData(LedgerKeyContractData {
-            contract: contract_addr,
-            key: ScVal::U64(index),
-            durability: ContractDataDurability::Persistent,
-        })
-    }
-
     /// Calculate the required number of hot archive entries based on config.
     ///
     /// Matches stellar-core `ApplyLoad::calculateRequiredHotArchiveEntries()`.
@@ -897,14 +885,8 @@ impl ApplyLoad {
 
         // For each cluster, deploy a batch_transfer contract and fund it.
         for i in 0..num_clusters {
-            let success_before = self.apply_soroban_success;
-            let salt = Hash256::hash(i.to_string().as_bytes());
-
-            // In a full implementation, we would:
-            // 1. Upload batch_transfer wasm (once)
-            // 2. Deploy contract instance
-            // 3. Fund contract with XLM via SAC payment
-            // For now, create a placeholder instance.
+            // TODO: deploy real batch_transfer instance (upload wasm, deploy,
+            // fund via SAC). For now, create a placeholder instance.
             let contract_id = Hash256::hash(format!("batch-transfer-{}", i).as_bytes());
             let instance_key = crate::loadgen_soroban::contract_instance_key(&contract_id);
 
@@ -915,8 +897,6 @@ impl ApplyLoad {
             };
 
             self.batch_transfer_instances.push(instance);
-            let _ = salt; // suppress unused warning
-            let _ = success_before;
         }
 
         ensure!(
@@ -1684,7 +1664,7 @@ fn generate_archived_entries(
 ) -> Vec<LedgerEntry> {
     let mut entries = Vec::new();
     for _ in 0..count {
-        let lk = ApplyLoad::key_for_archived_entry(*current_key);
+        let lk = crate::loadgen_soroban::get_key_for_archived_entry(*current_key);
         let LedgerKey::ContractData(cd) = &lk else {
             unreachable!()
         };
@@ -1823,29 +1803,6 @@ mod tests {
         assert_eq!(h.count(), 3);
         assert_eq!(h.mean(), 200.0);
         assert_eq!(h.values(), &[100, 200, 300]);
-    }
-
-    #[test]
-    fn test_key_for_archived_entry() {
-        let key0 = ApplyLoad::key_for_archived_entry(0);
-        let key1 = ApplyLoad::key_for_archived_entry(1);
-        let key0_again = ApplyLoad::key_for_archived_entry(0);
-
-        // Same index produces same key.
-        assert_eq!(
-            key0.to_xdr(Limits::none()).unwrap(),
-            key0_again.to_xdr(Limits::none()).unwrap()
-        );
-
-        // Different indices produce different keys.
-        assert_ne!(
-            key0.to_xdr(Limits::none()).unwrap(),
-            key1.to_xdr(Limits::none()).unwrap()
-        );
-
-        // Both are ContractData keys.
-        assert!(matches!(key0, LedgerKey::ContractData(_)));
-        assert!(matches!(key1, LedgerKey::ContractData(_)));
     }
 
     #[test]
