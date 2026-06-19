@@ -79,7 +79,7 @@ pub use quorum::{
 pub(crate) use quorum::is_valid_quorum_set;
 pub use quorum_config::{
     config_to_quorum_set, node_id_to_strkey, parse_node_id, testnet_quorum_config,
-    validate_quorum_config, QuorumConfigError,
+    QuorumConfigError,
 };
 pub use scp::{SlotState, SCP};
 pub use slot::Slot;

@@ -372,6 +372,7 @@ impl BallotProtocol {
     }
 
     /// Get the high ballot (highest confirmable).
+    #[cfg(test)]
     pub fn high_ballot(&self) -> Option<&ScpBallot> {
         self.high_ballot.as_ref()
     }
