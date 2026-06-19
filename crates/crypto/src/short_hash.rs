@@ -26,14 +26,13 @@
 //!
 //! # Example
 //!
-//! ```ignore
-//! use henyey_crypto::{compute_hash, initialize};
+//! ```
+//! use henyey_crypto::xdr_compute_hash;
+//! use stellar_xdr::curr::LedgerEntry;
 //!
-//! // Initialize with a random key (optional, happens automatically)
-//! initialize();
-//!
-//! // Compute a short hash
-//! let hash = compute_hash(b"some data");
+//! // Hash an XDR-encoded value using the process-global key.
+//! let entry = LedgerEntry::default();
+//! let hash = xdr_compute_hash(&entry).unwrap();
 //! ```
 
 use crate::random;

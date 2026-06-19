@@ -19,25 +19,11 @@
 //! let hash = blake2(b"hello world");
 //! ```
 //!
-//! # HMAC-SHA256
+//! # HMAC-SHA256 and HKDF
 //!
-//! ```ignore
-//! use henyey_crypto::{hmac_sha256, hmac_sha256_verify};
-//!
-//! let key = [0u8; 32];
-//! let mac = hmac_sha256(&key, b"message");
-//! assert!(hmac_sha256_verify(&mac, &key, b"message"));
-//! ```
-//!
-//! # HKDF Key Derivation
-//!
-//! ```ignore
-//! use henyey_crypto::{hkdf_extract, hkdf_expand};
-//!
-//! let ikm = b"input keying material";
-//! let prk = hkdf_extract(ikm);
-//! let derived = hkdf_expand(&prk, b"context info");
-//! ```
+//! This module also provides crate-internal HMAC-SHA256 and HKDF
+//! (RFC 5869) key-derivation primitives used by the Curve25519 shared-key
+//! derivation path. These are not part of the public API.
 
 use blake2::Blake2b;
 use henyey_common::Hash256;
@@ -182,15 +168,6 @@ fn hmac_sha256_chunks(key: &[u8], chunks: &[&[u8]]) -> [u8; 32] {
 /// # Returns
 ///
 /// A 32-byte message authentication code.
-///
-/// # Example
-///
-/// ```ignore
-/// use henyey_crypto::hmac_sha256;
-///
-/// let key = [0u8; 32];
-/// let mac = hmac_sha256(&key, b"message");
-/// ```
 pub(crate) fn hmac_sha256(key: &[u8; 32], data: &[u8]) -> [u8; 32] {
     hmac_sha256_chunks(key, &[data])
 }
@@ -209,17 +186,6 @@ pub(crate) fn hmac_sha256(key: &[u8; 32], data: &[u8]) -> [u8; 32] {
 /// # Returns
 ///
 /// `true` if the MAC is valid, `false` otherwise.
-///
-/// # Example
-///
-/// ```ignore
-/// use henyey_crypto::{hmac_sha256, hmac_sha256_verify};
-///
-/// let key = [0u8; 32];
-/// let mac = hmac_sha256(&key, b"message");
-/// assert!(hmac_sha256_verify(&mac, &key, b"message"));
-/// assert!(!hmac_sha256_verify(&mac, &key, b"tampered"));
-/// ```
 #[cfg(test)]
 fn hmac_sha256_verify(mac: &[u8; 32], key: &[u8; 32], data: &[u8]) -> bool {
     let mut verifier = new_hmac(key);
@@ -239,15 +205,6 @@ fn hmac_sha256_verify(mac: &[u8; 32], key: &[u8; 32], data: &[u8]) -> bool {
 /// # Returns
 ///
 /// A 32-byte Pseudo-Random Key (PRK).
-///
-/// # Example
-///
-/// ```ignore
-/// use henyey_crypto::hkdf_extract;
-///
-/// let ikm = b"some input keying material";
-/// let prk = hkdf_extract(ikm);
-/// ```
 pub(crate) fn hkdf_extract(ikm: &[u8]) -> [u8; 32] {
     let zero_salt = [0u8; 32];
     hmac_sha256(&zero_salt, ikm)
@@ -268,15 +225,6 @@ pub(crate) fn hkdf_extract(ikm: &[u8]) -> [u8; 32] {
 /// # Returns
 ///
 /// A 32-byte derived key.
-///
-/// # Example
-///
-/// ```ignore
-/// use henyey_crypto::{hkdf_extract, hkdf_expand};
-///
-/// let prk = hkdf_extract(b"ikm");
-/// let key = hkdf_expand(&prk, b"context");
-/// ```
 #[cfg(test)]
 fn hkdf_expand(prk: &[u8; 32], info: &[u8]) -> [u8; 32] {
     let counter = [0x01];
@@ -295,14 +243,6 @@ fn hkdf_expand(prk: &[u8; 32], info: &[u8]) -> [u8; 32] {
 /// # Returns
 ///
 /// A 32-byte derived key.
-///
-/// # Example
-///
-/// ```ignore
-/// use henyey_crypto::hkdf;
-///
-/// let derived = hkdf(b"input keying material", b"context");
-/// ```
 #[cfg(test)]
 fn hkdf(ikm: &[u8], info: &[u8]) -> [u8; 32] {
     let prk = hkdf_extract(ikm);
@@ -321,16 +261,6 @@ fn hkdf(ikm: &[u8], info: &[u8]) -> [u8; 32] {
 /// # Returns
 ///
 /// The SHA-256 hash of the XDR-encoded value, or an error if encoding fails.
-///
-/// # Example
-///
-/// ```ignore
-/// use henyey_crypto::xdr_sha256;
-/// use stellar_xdr::curr::LedgerHeader;
-///
-/// let header: LedgerHeader = /* ... */;
-/// let hash = xdr_sha256(&header)?;
-/// ```
 #[cfg(test)]
 fn xdr_sha256<T: WriteXdr>(value: &T) -> Result<Hash256, stellar_xdr::curr::Error> {
     let bytes = value.to_xdr(stellar_xdr::curr::Limits::none())?;

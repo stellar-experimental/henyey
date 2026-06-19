@@ -55,6 +55,9 @@
 //! ```
 
 use crate::{hkdf_extract, random_bytes, CryptoError};
+use std::hash::{Hash, Hasher};
+use x25519_dalek::{PublicKey, StaticSecret};
+use zeroize::ZeroizeOnDrop;
 
 /// Ordering of public keys when deriving a shared key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,9 +67,6 @@ pub enum KeyOrdering {
     /// Remote public key comes first in concatenation.
     RemoteFirst,
 }
-use std::hash::{Hash, Hasher};
-use x25519_dalek::{PublicKey, StaticSecret};
-use zeroize::ZeroizeOnDrop;
 
 /// A secret Curve25519 scalar for ECDH key exchange.
 ///

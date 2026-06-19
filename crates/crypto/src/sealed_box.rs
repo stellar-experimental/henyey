@@ -32,18 +32,22 @@
 //!
 //! # Example
 //!
-//! ```ignore
-//! use henyey_crypto::{SecretKey, seal_to_public_key, open_from_secret_key};
+//! ```
+//! use henyey_crypto::{
+//!     Curve25519Secret, seal_to_curve25519_public_key, open_from_curve25519_secret_key,
+//! };
 //!
-//! let recipient_secret = SecretKey::generate();
-//! let recipient_public = recipient_secret.public_key();
+//! let recipient_secret = Curve25519Secret::random();
+//! let recipient_public = recipient_secret.derive_public();
 //!
-//! // Encrypt a message
+//! // Encrypt a message to the recipient's Curve25519 public key.
 //! let plaintext = b"secret survey response";
-//! let ciphertext = seal_to_public_key(&recipient_public, plaintext).unwrap();
+//! let ciphertext =
+//!     seal_to_curve25519_public_key(&recipient_public.to_bytes(), plaintext).unwrap();
 //!
-//! // Decrypt the message
-//! let decrypted = open_from_secret_key(&recipient_secret, &ciphertext).unwrap();
+//! // Decrypt with the recipient's Curve25519 secret key.
+//! let decrypted =
+//!     open_from_curve25519_secret_key(&recipient_secret.to_bytes(), &ciphertext).unwrap();
 //! assert_eq!(decrypted, plaintext);
 //! ```
 
