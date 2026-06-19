@@ -105,7 +105,11 @@ impl Default for WorkSchedulerConfig {
 /// [`WorkSlot::InFlight`]). On successful completion, ownership is returned and
 /// the work item can be retried. On panic or task abort, the work item is
 /// permanently lost ([`WorkSlot::Lost`]) — this is safe because panics and aborts
-/// transition work to terminal states that are never re-run.
+/// transition work to terminal states that are never re-run. `Lost` is a
+/// write-only diagnostic marker: it is set once on the panic/abort path and is
+/// never re-read to drive behavior (the sole reader treats any non-`Idle` slot
+/// identically), so it is kept purely to distinguish "moved into a panicked or
+/// aborted task" from `InFlight` = "moved into a still-running task".
 ///
 /// # Example
 ///
@@ -235,6 +239,12 @@ enum WorkSlot {
     /// Work has been moved into a spawned task.
     InFlight,
     /// Work was irrecoverably lost due to panic or task abort (terminal).
+    ///
+    /// Write-only diagnostic marker: set once on the panic/abort path (from a
+    /// prior `InFlight` state) and never re-read to drive behavior — the sole
+    /// reader treats any non-`Idle` slot identically. Kept to distinguish a
+    /// panicked/aborted task from one that is still running (`InFlight`);
+    /// collapsing it into `InFlight` is a deliberately deferred design decision.
     Lost,
 }
 
@@ -373,7 +383,7 @@ impl WorkScheduler {
     pub(crate) fn cancel_all(&mut self) {
         let ids: Vec<WorkId> = self.entries.keys().copied().collect();
         for id in ids {
-            let _ = self.cancel(id);
+            self.cancel(id);
         }
     }
 
@@ -559,14 +569,18 @@ impl WorkScheduler {
             return false;
         }
 
-        let Some(attempts) = self.entries.get_mut(&id).map(|entry| entry.attempts) else {
-            return false;
-        };
-        if self
+        // Read both `attempts` and the cancel-token state out of a single
+        // immutable lookup into `Copy` locals, dropping the borrow before the
+        // `finish_terminal_state` call below (which needs `&mut self`). The
+        // mutate-and-spawn phase reacquires a `&mut` borrow via `get_mut`.
+        let Some((attempts, is_cancelled)) = self
             .entries
             .get(&id)
-            .is_some_and(|entry| entry.cancel_token.is_cancelled())
-        {
+            .map(|entry| (entry.attempts, entry.cancel_token.is_cancelled()))
+        else {
+            return false;
+        };
+        if is_cancelled {
             self.finish_terminal_state(id, WorkState::Cancelled, attempts);
             return false;
         }
@@ -702,33 +716,31 @@ impl WorkScheduler {
 
         self.finalize_entry(id, completion.work);
 
+        // Any cancellation — whether signalled via the cancel token/state
+        // (`cancelled`) or returned directly by the work item
+        // (`WorkOutcome::Cancelled`, which the unconditional arm below used to
+        // handle even when `cancelled` was false) — terminates as Cancelled
+        // with no further action. The `|| matches!(...)` clause is load-bearing:
+        // it preserves the old unconditional `Cancelled` arm so a genuine
+        // `Cancelled` outcome does not fall through to the match below.
+        if cancelled || matches!(completion.outcome, WorkOutcome::Cancelled) {
+            self.finish_terminal_state(id, WorkState::Cancelled, attempt);
+            return CompletionAction::None;
+        }
+
         match completion.outcome {
-            WorkOutcome::Cancelled => {
-                self.finish_terminal_state(id, WorkState::Cancelled, attempt);
-                CompletionAction::None
-            }
-            WorkOutcome::Success if cancelled => {
-                self.finish_terminal_state(id, WorkState::Cancelled, attempt);
-                CompletionAction::None
-            }
             WorkOutcome::Success => {
                 self.transition_state(id, WorkState::Success, attempt);
                 CompletionAction::Done { completed_id: id }
             }
-            WorkOutcome::Retry { delay: _ } if cancelled => {
-                self.finish_terminal_state(id, WorkState::Cancelled, attempt);
-                CompletionAction::None
-            }
             WorkOutcome::Retry { delay } => self.schedule_retry(id, attempt, delay),
-            WorkOutcome::Failed(_) if cancelled => {
-                self.finish_terminal_state(id, WorkState::Cancelled, attempt);
-                CompletionAction::None
-            }
             WorkOutcome::Failed(err) => {
                 warn!(work_id = id, error = %err, "work failed");
                 self.finish_terminal_state(id, WorkState::Failed, attempt);
                 CompletionAction::None
             }
+            // Cancelled is handled by the early guard above.
+            WorkOutcome::Cancelled => CompletionAction::None,
         }
     }
 
@@ -814,6 +826,10 @@ impl WorkScheduler {
 
         // Work item is permanently lost — it was moved into the panicked/aborted task.
         if let Some(entry) = self.entries.get_mut(&id) {
+            debug_assert!(
+                matches!(entry.work, WorkSlot::InFlight),
+                "Lost is only reachable from InFlight"
+            );
             entry.work = WorkSlot::Lost;
         }
     }
