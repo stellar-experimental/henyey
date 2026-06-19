@@ -60,12 +60,6 @@
 //! - [`SorobanConfig`]: Network configuration for Soroban execution including
 //!   cost parameters, TTL limits, and fee configuration.
 //!
-//! - [`SorobanBudget`]: Tracks resource consumption (CPU, memory, I/O) against
-//!   declared limits to enforce execution bounds.
-//!
-//! - [`SorobanStorage`]: Provides the storage interface for contract state,
-//!   tracking reads and writes during execution.
-//!
 //! - [`execute_host_function_with_cache`]: Main entry point for executing Soroban
 //!   operations, handling protocol version dispatch.
 //!
@@ -90,15 +84,15 @@ pub mod protocol;
 mod storage;
 pub mod ttl;
 
-pub use budget::{
-    FeeConfiguration, RentFeeConfiguration, ResourceLimits, SorobanBudget, SorobanConfig,
-};
+pub use budget::{FeeConfiguration, RentFeeConfiguration, SorobanConfig};
+pub(crate) use host::execute_host_function_with_cache;
 pub use host::{
-    execute_host_function_with_cache, PersistentModuleCache, SorobanExecutionError,
-    SorobanExecutionResult, StorageChange, StorageChangeKind,
+    PersistentModuleCache, SorobanExecutionError, SorobanExecutionResult, StorageChange,
+    StorageChangeKind,
 };
-pub use storage::{SorobanStorage, StorageEntry, StorageKey};
-pub use ttl::{extend_ttl_target, restore_ttl_target, synthesize_ttl_entry};
+pub(crate) use storage::StorageKey;
+pub(crate) use ttl::synthesize_ttl_entry;
+pub use ttl::{extend_ttl_target, restore_ttl_target};
 
 use stellar_xdr::curr::{
     AccountId, Hash, HostFunction, LedgerEntry, LedgerKey, SorobanAuthorizationEntry,
@@ -109,7 +103,7 @@ use crate::{state::LedgerStateManager, validation::LedgerContext};
 
 /// Bundles the inputs needed to execute a Soroban host function.
 #[derive(Clone, Copy)]
-pub struct HostFunctionInvocation<'a> {
+pub(crate) struct HostFunctionInvocation<'a> {
     pub host_function: &'a HostFunction,
     pub auth_entries: &'a [SorobanAuthorizationEntry],
     pub source: &'a AccountId,
@@ -163,7 +157,7 @@ pub type TtlKeyCache = std::collections::HashMap<LedgerKey, Hash>;
 
 /// Get or compute the TTL key hash for a ContractData/ContractCode key.
 /// Uses the cache if available, falls back to computing on the spot.
-pub fn get_or_compute_key_hash(cache: Option<&TtlKeyCache>, key: &LedgerKey) -> Hash {
+pub(crate) fn get_or_compute_key_hash(cache: Option<&TtlKeyCache>, key: &LedgerKey) -> Hash {
     if let Some(cache) = cache {
         if let Some(hash) = cache.get(key) {
             return hash.clone();
@@ -173,7 +167,7 @@ pub fn get_or_compute_key_hash(cache: Option<&TtlKeyCache>, key: &LedgerKey) -> 
 }
 
 /// Compute the hash of a ledger key for TTL lookup.
-pub fn compute_key_hash(key: &LedgerKey) -> Hash {
+pub(crate) fn compute_key_hash(key: &LedgerKey) -> Hash {
     henyey_common::Hash256::hash_xdr(key).into()
 }
 
@@ -216,8 +210,10 @@ pub trait HotArchiveLookup: Send + Sync {
 /// This is used when:
 /// - Hot archive is not available (e.g., pre-Protocol 23)
 /// - Running in a context where hot archive lookups are not needed
+#[cfg(test)]
 pub struct NoHotArchive;
 
+#[cfg(test)]
 impl HotArchiveLookup for NoHotArchive {
     fn get(
         &self,

@@ -1217,27 +1217,6 @@ pub fn malformed_operation_result(
 }
 
 #[cfg(test)]
-/// Get the needed weight for an operation from the source account.
-///
-/// Looks up the threshold value from the account's `thresholds` array
-/// based on the threshold level required for the operation.
-///
-/// # Arguments
-///
-/// * `account` - The account entry containing threshold configuration
-/// * `level` - The threshold level required
-///
-/// # Returns
-///
-/// The threshold value (0-255) as an i32.
-pub fn get_needed_threshold(
-    account: &stellar_xdr::curr::AccountEntry,
-    level: ThresholdLevel,
-) -> i32 {
-    account.thresholds.0[level as usize] as i32
-}
-
-#[cfg(test)]
 mod tests {
     use super::*;
     use stellar_xdr::curr::*;
@@ -1617,30 +1596,6 @@ mod tests {
             get_threshold_level(&set_options_domain_op),
             ThresholdLevel::Med
         );
-    }
-
-    #[test]
-    fn test_get_needed_threshold() {
-        use stellar_xdr::curr::{
-            AccountEntry, AccountEntryExt, SequenceNumber, String32, Thresholds, VecM,
-        };
-
-        let account = AccountEntry {
-            account_id: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([0u8; 32]))),
-            balance: 1000,
-            seq_num: SequenceNumber(1),
-            num_sub_entries: 0,
-            inflation_dest: None,
-            flags: 0,
-            home_domain: String32::default(),
-            thresholds: Thresholds([10, 1, 5, 10]), // master=10, low=1, med=5, high=10
-            signers: VecM::default(),
-            ext: AccountEntryExt::V0,
-        };
-
-        assert_eq!(get_needed_threshold(&account, ThresholdLevel::Low), 1);
-        assert_eq!(get_needed_threshold(&account, ThresholdLevel::Med), 5);
-        assert_eq!(get_needed_threshold(&account, ThresholdLevel::High), 10);
     }
 
     /// Test validate_path_payment_strict_receive.

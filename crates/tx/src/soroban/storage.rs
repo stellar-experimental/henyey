@@ -3,9 +3,10 @@
 //! Provides a storage interface for contract state that integrates with
 //! our LedgerStateManager.
 
+#[cfg(test)]
+use stellar_xdr::curr::ContractDataEntry;
 use stellar_xdr::curr::{
-    ContractDataDurability, ContractDataEntry, Hash, LedgerKey, LedgerKeyContractData, ScAddress,
-    ScVal,
+    ContractDataDurability, Hash, LedgerKey, LedgerKeyContractData, ScAddress, ScVal,
 };
 
 /// A storage key for contract data.
@@ -45,6 +46,7 @@ impl StorageKey {
 }
 
 /// A storage entry (key-value pair).
+#[cfg(test)]
 #[derive(Debug, Clone)]
 pub struct StorageEntry {
     /// The storage key.
@@ -55,6 +57,7 @@ pub struct StorageEntry {
     pub live_until: u32,
 }
 
+#[cfg(test)]
 impl StorageEntry {
     /// Create a new storage entry.
     pub fn new(key: StorageKey, value: ScVal, live_until: u32) -> Self {
@@ -86,6 +89,7 @@ impl StorageEntry {
 ///
 /// This captures the initial state of all entries in the footprint
 /// before execution begins.
+#[cfg(test)]
 #[derive(Debug, Clone, Default)]
 pub struct SorobanStorage {
     /// Entries that were read during execution.
@@ -96,6 +100,7 @@ pub struct SorobanStorage {
     code_entries: std::collections::HashMap<Hash, Option<Vec<u8>>>,
 }
 
+#[cfg(test)]
 impl SorobanStorage {
     /// Create a new empty storage.
     pub fn new() -> Self {
@@ -152,11 +157,6 @@ impl SorobanStorage {
     }
 
     // SECURITY: HashMap iteration in test helpers only; production path uses Vec with deterministic ordering
-    /// Get all written entries.
-    pub fn written_entries(&self) -> impl Iterator<Item = (&StorageKey, &Option<StorageEntry>)> {
-        self.write_entries.iter()
-    }
-
     /// Get all created entries (new writes that weren't in reads).
     pub fn created_entries(&self) -> impl Iterator<Item = &StorageEntry> {
         self.write_entries.iter().filter_map(|(key, entry)| {

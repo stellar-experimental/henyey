@@ -10,13 +10,7 @@
 //!   status, fee charged, and detailed result.
 //!
 //! - [`TxResultWrapper`]: Wrapper around XDR `TransactionResult` with helper methods
-//!   for checking success, extracting operation results, and result codes.
-//!
-//! - [`OpResultWrapper`]: Wrapper around XDR `OperationResult` for checking operation
-//!   success and extracting result codes.
-//!
-//! - [`TxSetResultSummary`]: Aggregates statistics across multiple transactions for
-//!   reporting on transaction set application.
+//!   for checking success and result codes.
 //!
 //! # Result Codes
 //!
@@ -24,8 +18,8 @@
 //! XDR result codes with human-readable names.
 
 use stellar_xdr::curr::{
-    InnerTransactionResultResult, OperationResult, OperationResultTr, TransactionResult,
-    TransactionResultCode, TransactionResultResult,
+    OperationResult, OperationResultTr, TransactionResult, TransactionResultCode,
+    TransactionResultResult,
 };
 
 /// Result of applying a transaction.
@@ -82,72 +76,6 @@ impl TxResultWrapper {
         }
     }
 
-    /// Create a fee error result.
-    pub fn fee_error() -> Self {
-        Self {
-            inner: TransactionResult {
-                fee_charged: 0,
-                result: TransactionResultResult::TxInsufficientFee,
-                ext: stellar_xdr::curr::TransactionResultExt::V0,
-            },
-        }
-    }
-
-    /// Create a time bounds error result.
-    pub fn time_bounds_error() -> Self {
-        Self {
-            inner: TransactionResult {
-                fee_charged: 0,
-                result: TransactionResultResult::TxTooLate,
-                ext: stellar_xdr::curr::TransactionResultExt::V0,
-            },
-        }
-    }
-
-    /// Create a no account error result.
-    pub fn no_account_error() -> Self {
-        Self {
-            inner: TransactionResult {
-                fee_charged: 0,
-                result: TransactionResultResult::TxNoAccount,
-                ext: stellar_xdr::curr::TransactionResultExt::V0,
-            },
-        }
-    }
-
-    /// Create a bad sequence error result.
-    pub fn bad_seq_error() -> Self {
-        Self {
-            inner: TransactionResult {
-                fee_charged: 0,
-                result: TransactionResultResult::TxBadSeq,
-                ext: stellar_xdr::curr::TransactionResultExt::V0,
-            },
-        }
-    }
-
-    /// Create an insufficient balance error result.
-    pub fn insufficient_balance_error() -> Self {
-        Self {
-            inner: TransactionResult {
-                fee_charged: 0,
-                result: TransactionResultResult::TxInsufficientBalance,
-                ext: stellar_xdr::curr::TransactionResultExt::V0,
-            },
-        }
-    }
-
-    /// Create an operation failed result.
-    pub fn operation_failed() -> Self {
-        Self {
-            inner: TransactionResult {
-                fee_charged: 0,
-                result: TransactionResultResult::TxFailed(vec![].try_into().unwrap()),
-                ext: stellar_xdr::curr::TransactionResultExt::V0,
-            },
-        }
-    }
-
     /// Get the underlying XDR result.
     pub fn into_xdr(self) -> TransactionResult {
         self.inner
@@ -180,45 +108,6 @@ impl TxResultWrapper {
     /// Get the result code.
     pub fn result_code(&self) -> TxResultCode {
         self.inner.result.discriminant()
-    }
-
-    /// Get the operation results if the transaction was executed.
-    pub fn operation_results(&self) -> Option<Vec<OpResultWrapper>> {
-        match &self.inner.result {
-            TransactionResultResult::TxSuccess(results)
-            | TransactionResultResult::TxFailed(results) => Some(
-                results
-                    .iter()
-                    .map(|r| OpResultWrapper::from_xdr(r.clone()))
-                    .collect(),
-            ),
-            TransactionResultResult::TxFeeBumpInnerSuccess(inner)
-            | TransactionResultResult::TxFeeBumpInnerFailed(inner) => match &inner.result.result {
-                InnerTransactionResultResult::TxSuccess(results)
-                | InnerTransactionResultResult::TxFailed(results) => Some(
-                    results
-                        .iter()
-                        .map(|r| OpResultWrapper::from_xdr(r.clone()))
-                        .collect(),
-                ),
-                _ => None,
-            },
-            _ => None,
-        }
-    }
-
-    /// Get the number of operations that succeeded.
-    pub fn successful_operation_count(&self) -> usize {
-        self.operation_results()
-            .map(|results| results.iter().filter(|r| r.is_success()).count())
-            .unwrap_or(0)
-    }
-
-    /// Get the number of operations that failed.
-    pub fn failed_operation_count(&self) -> usize {
-        self.operation_results()
-            .map(|results| results.iter().filter(|r| !r.is_success()).count())
-            .unwrap_or(0)
     }
 }
 
@@ -279,147 +168,6 @@ impl TransactionResultCodeExt for TransactionResultCode {
             TxSorobanInvalid => TransactionResultResult::TxSorobanInvalid,
             TxFrozenKeyAccessed => TransactionResultResult::TxFrozenKeyAccessed,
         }
-    }
-}
-
-/// Wrapper around OperationResult for easier inspection.
-#[derive(Debug, Clone)]
-pub struct OpResultWrapper {
-    inner: OperationResult,
-}
-
-impl OpResultWrapper {
-    /// Create from XDR OperationResult.
-    pub fn from_xdr(result: OperationResult) -> Self {
-        Self { inner: result }
-    }
-
-    /// Get the underlying XDR result.
-    pub fn into_xdr(self) -> OperationResult {
-        self.inner
-    }
-
-    /// Get a reference to the underlying XDR result.
-    pub fn as_xdr(&self) -> &OperationResult {
-        &self.inner
-    }
-
-    /// Check if the operation succeeded.
-    pub fn is_success(&self) -> bool {
-        match &self.inner {
-            OperationResult::OpInner(tr) => self.is_tr_success(tr),
-            _ => false,
-        }
-    }
-
-    /// Check if the inner result is a success.
-    fn is_tr_success(&self, tr: &OperationResultTr) -> bool {
-        match tr {
-            OperationResultTr::CreateAccount(r) => {
-                matches!(r, stellar_xdr::curr::CreateAccountResult::Success)
-            }
-            OperationResultTr::Payment(r) => {
-                matches!(r, stellar_xdr::curr::PaymentResult::Success)
-            }
-            OperationResultTr::PathPaymentStrictReceive(r) => {
-                matches!(
-                    r,
-                    stellar_xdr::curr::PathPaymentStrictReceiveResult::Success(_)
-                )
-            }
-            OperationResultTr::ManageSellOffer(r) => {
-                matches!(r, stellar_xdr::curr::ManageSellOfferResult::Success(_))
-            }
-            OperationResultTr::CreatePassiveSellOffer(r) => {
-                matches!(r, stellar_xdr::curr::ManageSellOfferResult::Success(_))
-            }
-            OperationResultTr::SetOptions(r) => {
-                matches!(r, stellar_xdr::curr::SetOptionsResult::Success)
-            }
-            OperationResultTr::ChangeTrust(r) => {
-                matches!(r, stellar_xdr::curr::ChangeTrustResult::Success)
-            }
-            OperationResultTr::AllowTrust(r) => {
-                matches!(r, stellar_xdr::curr::AllowTrustResult::Success)
-            }
-            OperationResultTr::AccountMerge(r) => {
-                matches!(r, stellar_xdr::curr::AccountMergeResult::Success(_))
-            }
-            OperationResultTr::Inflation(r) => {
-                matches!(r, stellar_xdr::curr::InflationResult::Success(_))
-            }
-            OperationResultTr::ManageData(r) => {
-                matches!(r, stellar_xdr::curr::ManageDataResult::Success)
-            }
-            OperationResultTr::BumpSequence(r) => {
-                matches!(r, stellar_xdr::curr::BumpSequenceResult::Success)
-            }
-            OperationResultTr::ManageBuyOffer(r) => {
-                matches!(r, stellar_xdr::curr::ManageBuyOfferResult::Success(_))
-            }
-            OperationResultTr::PathPaymentStrictSend(r) => {
-                matches!(
-                    r,
-                    stellar_xdr::curr::PathPaymentStrictSendResult::Success(_)
-                )
-            }
-            OperationResultTr::CreateClaimableBalance(r) => {
-                matches!(
-                    r,
-                    stellar_xdr::curr::CreateClaimableBalanceResult::Success(_)
-                )
-            }
-            OperationResultTr::ClaimClaimableBalance(r) => {
-                matches!(r, stellar_xdr::curr::ClaimClaimableBalanceResult::Success)
-            }
-            OperationResultTr::BeginSponsoringFutureReserves(r) => {
-                matches!(
-                    r,
-                    stellar_xdr::curr::BeginSponsoringFutureReservesResult::Success
-                )
-            }
-            OperationResultTr::EndSponsoringFutureReserves(r) => {
-                matches!(
-                    r,
-                    stellar_xdr::curr::EndSponsoringFutureReservesResult::Success
-                )
-            }
-            OperationResultTr::RevokeSponsorship(r) => {
-                matches!(r, stellar_xdr::curr::RevokeSponsorshipResult::Success)
-            }
-            OperationResultTr::Clawback(r) => {
-                matches!(r, stellar_xdr::curr::ClawbackResult::Success)
-            }
-            OperationResultTr::ClawbackClaimableBalance(r) => {
-                matches!(
-                    r,
-                    stellar_xdr::curr::ClawbackClaimableBalanceResult::Success
-                )
-            }
-            OperationResultTr::SetTrustLineFlags(r) => {
-                matches!(r, stellar_xdr::curr::SetTrustLineFlagsResult::Success)
-            }
-            OperationResultTr::LiquidityPoolDeposit(r) => {
-                matches!(r, stellar_xdr::curr::LiquidityPoolDepositResult::Success)
-            }
-            OperationResultTr::LiquidityPoolWithdraw(r) => {
-                matches!(r, stellar_xdr::curr::LiquidityPoolWithdrawResult::Success)
-            }
-            OperationResultTr::InvokeHostFunction(r) => {
-                matches!(r, stellar_xdr::curr::InvokeHostFunctionResult::Success(_))
-            }
-            OperationResultTr::ExtendFootprintTtl(r) => {
-                matches!(r, stellar_xdr::curr::ExtendFootprintTtlResult::Success)
-            }
-            OperationResultTr::RestoreFootprint(r) => {
-                matches!(r, stellar_xdr::curr::RestoreFootprintResult::Success)
-            }
-        }
-    }
-
-    /// Get the result code.
-    pub fn result_code(&self) -> OpResultCode {
-        self.inner.discriminant()
     }
 }
 
@@ -797,53 +545,6 @@ impl MutableTransactionResult {
     }
 }
 
-/// Summary of transaction results for a transaction set.
-#[derive(Debug, Clone, Default)]
-pub struct TxSetResultSummary {
-    /// Total transactions.
-    pub total: usize,
-    /// Successful transactions.
-    pub successful: usize,
-    /// Failed transactions.
-    pub failed: usize,
-    /// Total fee charged.
-    pub total_fee: i64,
-    /// Total operations.
-    pub total_operations: usize,
-    /// Successful operations.
-    pub successful_operations: usize,
-}
-
-impl TxSetResultSummary {
-    /// Create a new empty summary.
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Add a transaction result to the summary.
-    pub fn add(&mut self, result: &TxApplyResult, op_count: usize) {
-        self.total += 1;
-        self.total_fee += result.fee_charged;
-        self.total_operations += op_count;
-
-        if result.success {
-            self.successful += 1;
-            self.successful_operations += result.result.successful_operation_count();
-        } else {
-            self.failed += 1;
-        }
-    }
-
-    /// Get the success rate as a percentage.
-    pub fn success_rate(&self) -> f64 {
-        if self.total == 0 {
-            0.0
-        } else {
-            (self.successful as f64 / self.total as f64) * 100.0
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -894,33 +595,6 @@ mod tests {
         let apply_result = TxApplyResult::success(100, wrapper);
         assert!(apply_result.success);
         assert_eq!(apply_result.fee_charged, 100);
-    }
-
-    #[test]
-    fn test_tx_set_result_summary() {
-        let mut summary = TxSetResultSummary::new();
-
-        let success_result = TxApplyResult {
-            success: true,
-            fee_charged: 100,
-            result: TxResultWrapper::from_xdr(create_success_result()),
-        };
-
-        let failed_result = TxApplyResult {
-            success: false,
-            fee_charged: 100,
-            result: TxResultWrapper::from_xdr(create_failed_result()),
-        };
-
-        summary.add(&success_result, 1);
-        summary.add(&failed_result, 2);
-
-        assert_eq!(summary.total, 2);
-        assert_eq!(summary.successful, 1);
-        assert_eq!(summary.failed, 1);
-        assert_eq!(summary.total_fee, 200);
-        assert_eq!(summary.total_operations, 3);
-        assert_eq!(summary.success_rate(), 50.0);
     }
 
     #[test]
@@ -1136,62 +810,6 @@ mod tests {
         assert!(wrapper.is_success());
         assert_eq!(wrapper.result_code(), TxResultCode::TxSuccess);
     }
-
-    /// Test TxSetResultSummary with empty set.
-    #[test]
-    fn test_tx_set_result_summary_empty() {
-        let summary = TxSetResultSummary::new();
-        assert_eq!(summary.total, 0);
-        assert_eq!(summary.successful, 0);
-        assert_eq!(summary.failed, 0);
-        assert_eq!(summary.total_fee, 0);
-        assert_eq!(summary.total_operations, 0);
-        // Empty set has 0% success rate (or could be NaN, but we'll check for 0)
-        assert!(summary.success_rate().is_nan() || summary.success_rate() == 0.0);
-    }
-
-    /// Test TxSetResultSummary with all successful transactions.
-    #[test]
-    fn test_tx_set_result_summary_all_success() {
-        let mut summary = TxSetResultSummary::new();
-
-        for _ in 0..5 {
-            let success_result = TxApplyResult {
-                success: true,
-                fee_charged: 100,
-                result: TxResultWrapper::from_xdr(create_success_result()),
-            };
-            summary.add(&success_result, 1);
-        }
-
-        assert_eq!(summary.total, 5);
-        assert_eq!(summary.successful, 5);
-        assert_eq!(summary.failed, 0);
-        assert_eq!(summary.success_rate(), 100.0);
-    }
-
-    /// Test TxSetResultSummary with all failed transactions.
-    #[test]
-    fn test_tx_set_result_summary_all_failed() {
-        let mut summary = TxSetResultSummary::new();
-
-        for _ in 0..3 {
-            let failed_result = TxApplyResult {
-                success: false,
-                fee_charged: 50,
-                result: TxResultWrapper::from_xdr(create_failed_result()),
-            };
-            summary.add(&failed_result, 2);
-        }
-
-        assert_eq!(summary.total, 3);
-        assert_eq!(summary.successful, 0);
-        assert_eq!(summary.failed, 3);
-        assert_eq!(summary.total_fee, 150);
-        assert_eq!(summary.total_operations, 6);
-        assert_eq!(summary.success_rate(), 0.0);
-    }
-
     /// Test all TxResultCode variants have names.
     #[test]
     fn test_all_tx_result_code_names() {
