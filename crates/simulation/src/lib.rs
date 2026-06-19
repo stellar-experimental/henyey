@@ -1953,13 +1953,13 @@ impl Drop for Simulation {
                 node.app.shutdown();
                 tracing::debug!(node = %id, "Simulation::drop: shutdown requested");
             }
-            for (_id, node) in self.running_apps.drain() {
+            for node in self.running_apps.values() {
                 node.task.handle.abort();
             }
         }
 
         #[cfg(test)]
-        for (_id, node) in self.test_nodes.drain() {
+        for node in self.test_nodes.values() {
             node.handle.abort();
         }
     }
