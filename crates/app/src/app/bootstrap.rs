@@ -103,19 +103,46 @@ pub fn initialize_genesis(
         TransactionSet, VecM, WriteXdr,
     };
 
-    // SKELETON (commit 1, failing test): genesis is still built at the
-    // hardcoded defaults regardless of `genesis_config` — the regression test
-    // must FAIL here. The real config handling lands in commit 2.
-    let _ = genesis_config;
+    // Header field values. When USE_CONFIG_FOR_GENESIS is set, stellar-core
+    // overrides ledger_version/baseFee/baseReserve/maxTxSetSize from the
+    // TESTING_UPGRADE_* config (LedgerManagerImpl.cpp:489-503). Otherwise the
+    // genesis defaults (0 / 100 / 100_000_000 / 100) are used, byte-identical
+    // to the pre-change behavior.
     let (ledger_version, base_fee, base_reserve, max_tx_set_size) =
-        (0u32, 100u32, 100_000_000u32, 100u32);
+        if genesis_config.use_config_for_genesis {
+            (
+                genesis_config.protocol_version,
+                genesis_config.base_fee,
+                genesis_config.base_reserve,
+                genesis_config.max_tx_set_size,
+            )
+        } else {
+            (0u32, 100u32, 100_000_000u32, 100u32)
+        };
 
     // Build genesis account entries (root + optional test accounts).
-    let genesis_entries = build_genesis_entries(
+    let mut genesis_entries = build_genesis_entries(
         network_passphrase,
         genesis_test_account_count,
         GENESIS_TOTAL_COINS,
     );
+
+    // When USE_CONFIG_FOR_GENESIS is set and the genesis protocol is >= 20,
+    // inject the full Soroban ConfigSetting entry set. Mirrors
+    // SorobanNetworkConfig::initializeGenesisLedgerForTesting
+    // (NetworkConfig.cpp:1708), which stellar-core's startNewLedger(genesis)
+    // invokes (LedgerManagerImpl.cpp:421). Entry ordering is irrelevant —
+    // add_batch sorts the batch by LedgerKey, matching core's canonical bucket
+    // assembly.
+    if genesis_config.use_config_for_genesis && ledger_version >= 20 {
+        let network_id = NetworkId::from_passphrase(network_passphrase);
+        let config_entries =
+            henyey_ledger::build_genesis_soroban_config_entries(ledger_version, &network_id)
+                .map_err(|e| {
+                    anyhow::anyhow!("Failed to build genesis Soroban config entries: {}", e)
+                })?;
+        genesis_entries.extend(config_entries);
+    }
 
     // Create bucket list and add all genesis entries.
     let mut bucket_list = BucketList::new();
