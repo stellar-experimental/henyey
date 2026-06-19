@@ -119,6 +119,18 @@ struct RepairReport {
     errors: usize,
 }
 
+impl RepairReport {
+    /// Folds the counters from `other` into `self` field-wise. Used to
+    /// accumulate per-iteration repair stats across stabilize-loop rounds.
+    fn accumulate(&mut self, other: &RepairReport) {
+        self.initiated += other.initiated;
+        self.already_connected += other.already_connected;
+        self.pool_full += other.pool_full;
+        self.overlay_not_ready += other.overlay_not_ready;
+        self.errors += other.errors;
+    }
+}
+
 impl std::fmt::Display for RepairReport {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
@@ -835,11 +847,7 @@ impl Simulation {
             self.bail_if_any_node_exited().await?;
 
             let report = self.repair_app_connectivity().await;
-            cumulative_report.initiated += report.initiated;
-            cumulative_report.already_connected += report.already_connected;
-            cumulative_report.pool_full += report.pool_full;
-            cumulative_report.overlay_not_ready += report.overlay_not_ready;
-            cumulative_report.errors += report.errors;
+            cumulative_report.accumulate(&report);
 
             let remaining = deadline
                 .checked_duration_since(tokio::time::Instant::now())
@@ -1013,11 +1021,7 @@ impl Simulation {
             self.bail_if_any_node_exited().await?;
 
             let report = self.repair_app_connectivity().await;
-            cumulative_report.initiated += report.initiated;
-            cumulative_report.already_connected += report.already_connected;
-            cumulative_report.pool_full += report.pool_full;
-            cumulative_report.overlay_not_ready += report.overlay_not_ready;
-            cumulative_report.errors += report.errors;
+            cumulative_report.accumulate(&report);
 
             let remaining = deadline
                 .checked_duration_since(tokio::time::Instant::now())
@@ -2024,6 +2028,34 @@ mod crank_tests {
         sim.add_node("B", SecretKey::from_seed(&[2u8; 32]));
         sim.add_pending_connection("A", "B");
         sim
+    }
+
+    #[test]
+    fn test_repair_report_accumulate() {
+        // Distinct per-field values so a copy-paste field mismatch in
+        // `accumulate` is caught by the assertions below.
+        let mut acc = RepairReport {
+            initiated: 1,
+            already_connected: 2,
+            pool_full: 4,
+            overlay_not_ready: 8,
+            errors: 16,
+        };
+        let other = RepairReport {
+            initiated: 32,
+            already_connected: 64,
+            pool_full: 128,
+            overlay_not_ready: 256,
+            errors: 512,
+        };
+
+        acc.accumulate(&other);
+
+        assert_eq!(acc.initiated, 1 + 32);
+        assert_eq!(acc.already_connected, 2 + 64);
+        assert_eq!(acc.pool_full, 4 + 128);
+        assert_eq!(acc.overlay_not_ready, 8 + 256);
+        assert_eq!(acc.errors, 16 + 512);
     }
 
     // ==================================================================
