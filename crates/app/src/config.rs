@@ -622,7 +622,27 @@ impl Default for DiagnosticsConfig {
 /// [testing]
 /// accelerate_time = true  # 1s ledger close, checkpoint frequency 8
 /// ```
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+fn default_testing_upgrade_protocol_version() -> u32 {
+    // stellar-core CURRENT_LEDGER_PROTOCOL_VERSION (Config.cpp:36).
+    26
+}
+
+fn default_testing_upgrade_desired_fee() -> u32 {
+    // stellar-core GENESIS_LEDGER_BASE_FEE (LedgerManagerImpl.cpp:111).
+    100
+}
+
+fn default_testing_upgrade_reserve() -> u32 {
+    // stellar-core GENESIS_LEDGER_BASE_RESERVE (LedgerManagerImpl.cpp:112).
+    100_000_000
+}
+
+fn default_testing_upgrade_max_tx_set_size() -> u32 {
+    // stellar-core Config.cpp:234 (note: 50, not the genesis-header 100).
+    50
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TestingConfig {
     /// When true, accelerate time for testing: 1-second ledger close and
@@ -653,6 +673,45 @@ pub struct TestingConfig {
     #[serde(default)]
     pub genesis_test_account_count: u32,
 
+    /// When true, build the genesis ledger from the `TESTING_UPGRADE_*`
+    /// settings (configured protocol version, base fee/reserve/maxTxSetSize)
+    /// and inject the full Soroban `ConfigSetting` entry set, instead of the
+    /// default `ledger_version = 0` empty-config genesis.
+    ///
+    /// Maps to stellar-core's `USE_CONFIG_FOR_GENESIS`. All SSC mixed-image
+    /// missions set this true so the genesis bucket-list hash matches
+    /// stellar-core. Default `false` preserves the legacy genesis exactly.
+    #[serde(default)]
+    pub use_config_for_genesis: bool,
+
+    /// Protocol version of the genesis ledger when `use_config_for_genesis`.
+    ///
+    /// Maps to stellar-core's `TESTING_UPGRADE_LEDGER_PROTOCOL_VERSION`
+    /// (default `CURRENT_LEDGER_PROTOCOL_VERSION` = 26).
+    #[serde(default = "default_testing_upgrade_protocol_version")]
+    pub testing_upgrade_ledger_protocol_version: u32,
+
+    /// `base_fee` of the genesis ledger when `use_config_for_genesis`.
+    ///
+    /// Maps to stellar-core's `TESTING_UPGRADE_DESIRED_FEE`
+    /// (default `GENESIS_LEDGER_BASE_FEE` = 100).
+    #[serde(default = "default_testing_upgrade_desired_fee")]
+    pub testing_upgrade_desired_fee: u32,
+
+    /// `base_reserve` of the genesis ledger when `use_config_for_genesis`.
+    ///
+    /// Maps to stellar-core's `TESTING_UPGRADE_RESERVE`
+    /// (default `GENESIS_LEDGER_BASE_RESERVE` = 100_000_000).
+    #[serde(default = "default_testing_upgrade_reserve")]
+    pub testing_upgrade_reserve: u32,
+
+    /// `max_tx_set_size` of the genesis ledger when `use_config_for_genesis`.
+    ///
+    /// Maps to stellar-core's `TESTING_UPGRADE_MAX_TX_SET_SIZE` (default 50 —
+    /// note this differs from the genesis-header default of 100).
+    #[serde(default = "default_testing_upgrade_max_tx_set_size")]
+    pub testing_upgrade_max_tx_set_size: u32,
+
     /// When true, the node operates as a standalone validator not connected
     /// to a real network. Standalone validators are exempt from certain
     /// config restrictions that protect networked validators (diagnostic
@@ -661,6 +720,37 @@ pub struct TestingConfig {
     /// Maps to stellar-core's `RUN_STANDALONE`.
     #[serde(default)]
     pub run_standalone: bool,
+}
+
+impl TestingConfig {
+    /// Build the [`GenesisConfig`](crate::app::bootstrap::GenesisConfig) used
+    /// by genesis initialization from these testing settings.
+    pub fn genesis_config(&self) -> crate::app::bootstrap::GenesisConfig {
+        crate::app::bootstrap::GenesisConfig {
+            use_config_for_genesis: self.use_config_for_genesis,
+            protocol_version: self.testing_upgrade_ledger_protocol_version,
+            base_fee: self.testing_upgrade_desired_fee,
+            base_reserve: self.testing_upgrade_reserve,
+            max_tx_set_size: self.testing_upgrade_max_tx_set_size,
+        }
+    }
+}
+
+impl Default for TestingConfig {
+    fn default() -> Self {
+        Self {
+            accelerate_time: false,
+            ledger_close_time: None,
+            generate_load_for_testing: false,
+            genesis_test_account_count: 0,
+            use_config_for_genesis: false,
+            testing_upgrade_ledger_protocol_version: default_testing_upgrade_protocol_version(),
+            testing_upgrade_desired_fee: default_testing_upgrade_desired_fee(),
+            testing_upgrade_reserve: default_testing_upgrade_reserve(),
+            testing_upgrade_max_tx_set_size: default_testing_upgrade_max_tx_set_size(),
+            run_standalone: false,
+        }
+    }
 }
 
 /// Catchup behavior configuration.

@@ -3953,6 +3953,169 @@ fn create_ledger_entries_for_v26(ltx: &mut CloseLedgerState, ledger_seq: u32) ->
     Ok(())
 }
 
+/// Re-calibrate the V20 CPU/memory cost-param entries to the post-release
+/// corrected values.
+///
+/// Parity: `SorobanNetworkConfig::updateRecalibratedCostTypesForV20`
+/// (NetworkConfig.cpp:2606-2720), which stellar-core runs under `#ifdef
+/// BUILD_TESTS` inside `initializeGenesisLedgerForTesting` immediately after
+/// `createLedgerEntriesForV20` (NetworkConfig.cpp:1724). Protocol 20 shipped
+/// with somewhat incorrect costs that were re-calibrated shortly after
+/// release; the genesis path catches up to the corrected values.
+///
+/// This is GENESIS-ONLY and MUST NOT be wired into the live
+/// `apply_version_upgrade_side_effects` upgrade path — a node upgrading a
+/// running network from <20 to >=20 follows the on-network sequence, which
+/// reaches the recalibrated values via the normal per-protocol config
+/// upgrades, not this BUILD_TESTS shortcut.
+///
+/// Indices match the `ContractCostType` enum (see `initial_cpu_cost_params_for_v20`):
+/// DispatchHostFunction=4, VisitObject=5, ValSer=6, ValDeser=7,
+/// ComputeSha256Hash=8, ComputeEd25519PubKey=9, VerifyEd25519Sig=10,
+/// VmInstantiation=11, VmCachedInstantiation=12, InvokeVmFunction=13,
+/// ComputeKeccak256Hash=14, DecodeEcdsaCurve256Sig=15,
+/// RecoverEcdsaSecp256k1Key=16, Int256AddSub=17, Int256Mul=18, Int256Div=19,
+/// Int256Pow=20, Int256Shift=21, ChaCha20DrawBytes=22.
+fn update_recalibrated_cost_types_for_v20(
+    ltx: &mut CloseLedgerState,
+    ledger_seq: u32,
+) -> Result<()> {
+    // CPU param recalibration (NetworkConfig.cpp:2620-2693). `resize` keeps the
+    // existing V20 size (23 entries); we pass the current count via the helper,
+    // which resizes to NEW_SIZE then overwrites the listed indices.
+    const V20_COST_PARAM_SIZE: usize = 23;
+
+    // (index, const_term, linear_term)
+    let cpu_updates: &[(usize, i64, i64)] = &[
+        (4, 295, 0),         // DispatchHostFunction
+        (5, 60, 0),          // VisitObject
+        (6, 221, 26),        // ValSer
+        (7, 331, 4369),      // ValDeser
+        (8, 3636, 7013),     // ComputeSha256Hash
+        (9, 40256, 0),       // ComputeEd25519PubKey
+        (10, 377551, 4059),  // VerifyEd25519Sig
+        (11, 417482, 45712), // VmInstantiation
+        (12, 417482, 45712), // VmCachedInstantiation
+        (13, 1945, 0),       // InvokeVmFunction
+        (14, 6481, 5943),    // ComputeKeccak256Hash
+        (15, 711, 0),        // DecodeEcdsaCurve256Sig
+        (16, 2314804, 0),    // RecoverEcdsaSecp256k1Key
+        (17, 4176, 0),       // Int256AddSub
+        (18, 4716, 0),       // Int256Mul
+        (19, 4680, 0),       // Int256Div
+        (20, 4256, 0),       // Int256Pow
+        (21, 884, 0),        // Int256Shift
+        (22, 1059, 502),     // ChaCha20DrawBytes
+    ];
+
+    // Memory param recalibration (NetworkConfig.cpp:2702-2717): only
+    // VmInstantiation and VmCachedInstantiation are rewritten.
+    let mem_updates: &[(usize, i64, i64)] = &[
+        (11, 132773, 4903), // VmInstantiation
+        (12, 132773, 4903), // VmCachedInstantiation
+    ];
+
+    resize_and_update_cost_params(
+        ltx,
+        ledger_seq,
+        V20_COST_PARAM_SIZE,
+        cpu_updates,
+        mem_updates,
+    )?;
+
+    tracing::info!(
+        ledger_seq = ledger_seq,
+        "Applied updateRecalibratedCostTypesForV20 (genesis-only BUILD_TESTS recalibration)"
+    );
+
+    Ok(())
+}
+
+/// Build the full Soroban `ConfigSetting` ledger-entry set for a genesis ledger
+/// at `protocol`, for `USE_CONFIG_FOR_GENESIS` networks.
+///
+/// Parity: `SorobanNetworkConfig::initializeGenesisLedgerForTesting`
+/// (NetworkConfig.cpp:1708-1751). Reuses the SAME per-protocol cascade that
+/// the live upgrade path drives in `apply_version_upgrade_side_effects`
+/// (manager.rs:3081), gated by the identical `protocolVersionStartsFrom`
+/// thresholds (here `prev_version = 0`). The genesis-only BUILD_TESTS V20 cost
+/// recalibration (`update_recalibrated_cost_types_for_v20`) is layered between
+/// V20 and V21, matching NetworkConfig.cpp:1724.
+///
+/// The returned entries carry their FINAL post-cascade values: create-then-
+/// update collapses to "created (final value)" in the delta, and the V23
+/// rent-param update read-modify-writes the V20-created `ContractLedgerCostV0`
+/// / `StateArchival` entries in the same delta. Entries are harvested via the
+/// delta's current entries so any in-delta update is reflected.
+///
+/// Entry ORDER is irrelevant to the bucket-list hash: `BucketList::add_batch`
+/// sorts the batch by `LedgerKey` (bucket_list.rs) and the bucket re-sorts.
+///
+/// Henyey supports protocol 24+ only; `protocol` is expected to be >= 24. The
+/// cascade is correct for any `protocol >= 20`, but values < 24 are not a
+/// supported genesis target.
+pub fn build_genesis_soroban_config_entries(
+    protocol: u32,
+    _network_id: &NetworkId,
+) -> Result<Vec<LedgerEntry>> {
+    use crate::snapshot::{LedgerSnapshot, SnapshotHandle};
+
+    // Genesis ledger sequence is 1; the live bucket list is empty at the point
+    // stellar-core runs initializeGenesisLedgerForTesting (LedgerManagerImpl.cpp
+    // :421, before root-account creation and bucket sealing), so the V20
+    // LiveSorobanStateSizeWindow is seeded with size 0.
+    const GENESIS_LEDGER_SEQ: u32 = 1;
+    const GENESIS_INITIAL_BUCKET_LIST_SIZE: u64 = 0;
+
+    if protocol < 20 {
+        // Pre-Soroban: no config entries (matches core's
+        // protocolVersionStartsFrom(SOROBAN_PROTOCOL_VERSION) guard).
+        return Ok(Vec::new());
+    }
+
+    // Build an empty-snapshot close state at genesis. The cascade functions
+    // read-modify-write entries they themselves created in this same delta, so
+    // an empty base snapshot is sufficient.
+    let snapshot = SnapshotHandle::new(LedgerSnapshot::empty(GENESIS_LEDGER_SEQ));
+    let header = create_genesis_header();
+    let mut ltx = CloseLedgerState::begin(snapshot, header, Hash256::ZERO, GENESIS_LEDGER_SEQ);
+
+    // V20: create the 14 base config entries.
+    create_ledger_entries_for_v20(
+        &mut ltx,
+        GENESIS_LEDGER_SEQ,
+        GENESIS_INITIAL_BUCKET_LIST_SIZE,
+    )?;
+    // V20 BUILD_TESTS recalibration (genesis-only) — NetworkConfig.cpp:1724.
+    update_recalibrated_cost_types_for_v20(&mut ltx, GENESIS_LEDGER_SEQ)?;
+
+    if protocol >= 21 {
+        create_cost_types_for_v21(&mut ltx, GENESIS_LEDGER_SEQ)?;
+    }
+    if protocol >= 22 {
+        create_cost_types_for_v22(&mut ltx, GENESIS_LEDGER_SEQ)?;
+    }
+    if protocol >= 23 {
+        create_and_update_ledger_entries_for_v23(&mut ltx, GENESIS_LEDGER_SEQ)?;
+    }
+    if protocol >= 25 {
+        create_cost_types_for_v25(&mut ltx, GENESIS_LEDGER_SEQ)?;
+    }
+    if protocol >= 26 {
+        update_cost_types_for_v26(&mut ltx, GENESIS_LEDGER_SEQ)?;
+        create_ledger_entries_for_v26(&mut ltx, GENESIS_LEDGER_SEQ)?;
+    }
+
+    // Harvest the final entry values. `current_entries()` returns the current
+    // value of every create AND update in the delta — so cost params that V20
+    // created and V21/V22/V25/V26 updated, and the V23 rent-param updates to
+    // the V20-created ledger-cost / state-archival entries, all carry their
+    // final values. Because every entry the cascade touches originates from a
+    // `record_create` earlier in the same delta, create-then-update collapses
+    // to a single "created (final value)" change and no entry is duplicated.
+    Ok(ltx.current_delta().current_entries())
+}
+
 impl LedgerCloseContext<'_> {
     /// Load StateArchivalSettings through the CloseLedgerState read path.
     ///

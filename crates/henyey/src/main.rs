@@ -1788,6 +1788,7 @@ fn local_config() -> AppConfig {
             generate_load_for_testing: true,
             genesis_test_account_count: 0,
             run_standalone: true,
+            ..Default::default()
         },
         compat_http: CompatHttpConfig {
             enabled: true,
@@ -1925,6 +1926,7 @@ async fn cmd_run(
                 Some(&config.buckets.directory),
                 &config.network.passphrase,
                 config.testing.genesis_test_account_count,
+                &config.testing.genesis_config(),
             )?;
             tracing::info!("Local mode: genesis ledger initialized");
 
@@ -2049,6 +2051,7 @@ async fn cmd_new_db(
         Some(bucket_dir),
         passphrase,
         config.testing.genesis_test_account_count,
+        &config.testing.genesis_config(),
     )?;
 
     println!("Database created successfully at: {}", db_path.display());
@@ -2063,12 +2066,14 @@ fn initialize_genesis_ledger(
     bucket_dir: Option<&std::path::Path>,
     network_passphrase: &str,
     genesis_test_account_count: u32,
+    genesis_config: &henyey_app::GenesisConfig,
 ) -> anyhow::Result<()> {
     henyey_app::initialize_genesis(
         db,
         bucket_dir,
         network_passphrase,
         genesis_test_account_count,
+        genesis_config,
     )
 }
 
@@ -3928,7 +3933,14 @@ mod tests {
         let db = henyey_db::Database::open_in_memory().unwrap();
         let passphrase = "Standalone Network ; February 2017";
 
-        initialize_genesis_ledger(&db, None, passphrase, 0).unwrap();
+        initialize_genesis_ledger(
+            &db,
+            None,
+            passphrase,
+            0,
+            &henyey_app::GenesisConfig::default(),
+        )
+        .unwrap();
 
         // Verify LCL is set to 1
         db.with_connection(|conn| {
@@ -3998,7 +4010,14 @@ mod tests {
         let passphrase = "Standalone Network ; February 2017";
         let count = 10;
 
-        initialize_genesis_ledger(&db, None, passphrase, count).unwrap();
+        initialize_genesis_ledger(
+            &db,
+            None,
+            passphrase,
+            count,
+            &henyey_app::GenesisConfig::default(),
+        )
+        .unwrap();
 
         // Verify LCL is set and header is stored
         db.with_connection(|conn| {
@@ -4012,7 +4031,14 @@ mod tests {
             // Verify bucket_list_hash differs from the 0-account case
             // (it should include 11 accounts instead of 1)
             let db2 = henyey_db::Database::open_in_memory().unwrap();
-            initialize_genesis_ledger(&db2, None, passphrase, 0).unwrap();
+            initialize_genesis_ledger(
+                &db2,
+                None,
+                passphrase,
+                0,
+                &henyey_app::GenesisConfig::default(),
+            )
+            .unwrap();
             let header0 = db2
                 .with_connection(|c| c.load_ledger_header(1))
                 .unwrap()
@@ -4090,7 +4116,14 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let bucket_dir = tmp.path().join("buckets");
 
-        initialize_genesis_ledger(&db, Some(&bucket_dir), passphrase, 0).unwrap();
+        initialize_genesis_ledger(
+            &db,
+            Some(&bucket_dir),
+            passphrase,
+            0,
+            &henyey_app::GenesisConfig::default(),
+        )
+        .unwrap();
 
         // The bucket directory should have been created
         assert!(bucket_dir.exists(), "bucket directory should be created");
@@ -4145,7 +4178,14 @@ mod tests {
         let passphrase = "Standalone Network ; February 2017";
 
         // Should succeed without error even with no bucket_dir
-        initialize_genesis_ledger(&db, None, passphrase, 0).unwrap();
+        initialize_genesis_ledger(
+            &db,
+            None,
+            passphrase,
+            0,
+            &henyey_app::GenesisConfig::default(),
+        )
+        .unwrap();
 
         // Verify genesis ledger was still created correctly
         db.with_connection(|conn| {

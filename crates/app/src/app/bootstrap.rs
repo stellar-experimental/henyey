@@ -12,6 +12,52 @@ use super::App;
 /// Total coins in the genesis ledger (100 billion XLM in stroops).
 const GENESIS_TOTAL_COINS: i64 = 1_000_000_000_000_000_000;
 
+/// Genesis-ledger construction parameters derived from `[testing]` config.
+///
+/// Mirrors stellar-core's `USE_CONFIG_FOR_GENESIS` + `TESTING_UPGRADE_*`
+/// handling in `LedgerManagerImpl::startNewLedger()`
+/// (LedgerManagerImpl.cpp:489-503). When `use_config_for_genesis` is false
+/// (the default), genesis is built exactly as before: `ledger_version = 0`,
+/// `base_fee = 100`, `base_reserve = 100_000_000`, `max_tx_set_size = 100`,
+/// and NO Soroban `ConfigSetting` entries.
+///
+/// When `use_config_for_genesis` is true, the genesis header is built at
+/// `protocol_version` with the `base_fee`/`base_reserve`/`max_tx_set_size`
+/// overrides, and (for protocol >= 20) the full Soroban config-settings set
+/// is injected into the genesis bucket list — matching SSC mixed-image
+/// missions running BUILD_TESTS-enabled stellar-core.
+#[derive(Debug, Clone, Copy)]
+pub struct GenesisConfig {
+    /// Whether to honor the `TESTING_UPGRADE_*` overrides and inject the
+    /// Soroban config-settings set into genesis.
+    pub use_config_for_genesis: bool,
+    /// Protocol version for the genesis header when `use_config_for_genesis`.
+    pub protocol_version: u32,
+    /// `base_fee` override for the genesis header.
+    pub base_fee: u32,
+    /// `base_reserve` override for the genesis header.
+    pub base_reserve: u32,
+    /// `max_tx_set_size` override for the genesis header.
+    pub max_tx_set_size: u32,
+}
+
+impl Default for GenesisConfig {
+    fn default() -> Self {
+        // Matches stellar-core Config.cpp defaults (false / 26 / 100 /
+        // 100_000_000 / 50). With `use_config_for_genesis = false` these
+        // overrides are inert and genesis is byte-identical to the pre-change
+        // behavior (the genesis header still uses the hardcoded 0 / 100 /
+        // 100_000_000 / 100 values below).
+        Self {
+            use_config_for_genesis: false,
+            protocol_version: 26,
+            base_fee: 100,
+            base_reserve: 100_000_000,
+            max_tx_set_size: 50,
+        }
+    }
+}
+
 /// Initialize a fresh genesis ledger in an empty database.
 ///
 /// This is the shared genesis initialization used by all code paths that need
@@ -45,6 +91,7 @@ pub fn initialize_genesis(
     bucket_dir: Option<&std::path::Path>,
     network_passphrase: &str,
     genesis_test_account_count: u32,
+    genesis_config: &GenesisConfig,
 ) -> anyhow::Result<()> {
     use henyey_db::schema::state_keys;
     use henyey_history::build_history_archive_state;
@@ -55,6 +102,13 @@ pub fn initialize_genesis(
         TransactionHistoryResultEntry, TransactionHistoryResultEntryExt, TransactionResultSet,
         TransactionSet, VecM, WriteXdr,
     };
+
+    // SKELETON (commit 1, failing test): genesis is still built at the
+    // hardcoded defaults regardless of `genesis_config` — the regression test
+    // must FAIL here. The real config handling lands in commit 2.
+    let _ = genesis_config;
+    let (ledger_version, base_fee, base_reserve, max_tx_set_size) =
+        (0u32, 100u32, 100_000_000u32, 100u32);
 
     // Build genesis account entries (root + optional test accounts).
     let genesis_entries = build_genesis_entries(
@@ -77,7 +131,7 @@ pub fn initialize_genesis(
     // Build genesis header.
     let bucket_list_hash = bucket_list.hash();
     let mut header = LedgerHeader {
-        ledger_version: 0,
+        ledger_version,
         previous_ledger_hash: Hash([0u8; 32]),
         scp_value: StellarValue {
             tx_set_hash: Hash([0u8; 32]),
@@ -92,9 +146,9 @@ pub fn initialize_genesis(
         fee_pool: 0,
         inflation_seq: 0,
         id_pool: 0,
-        base_fee: 100,
-        base_reserve: 100_000_000, // 10 XLM
-        max_tx_set_size: 100,
+        base_fee,
+        base_reserve,
+        max_tx_set_size,
         skip_list: std::array::from_fn(|_| Hash([0u8; 32])),
         ext: LedgerHeaderExt::V0,
     };
@@ -355,7 +409,7 @@ mod tests {
     #[test]
     fn test_initialize_genesis_writes_complete_state() {
         let db = henyey_db::Database::open_in_memory().unwrap();
-        initialize_genesis(&db, None, PASSPHRASE, 0).unwrap();
+        initialize_genesis(&db, None, PASSPHRASE, 0, &GenesisConfig::default()).unwrap();
 
         db.with_connection(|conn| {
             // LCL = 1
@@ -387,9 +441,9 @@ mod tests {
     fn test_initialize_genesis_rejects_nonempty_db_with_lcl() {
         let db = henyey_db::Database::open_in_memory().unwrap();
         // First init succeeds
-        initialize_genesis(&db, None, PASSPHRASE, 0).unwrap();
+        initialize_genesis(&db, None, PASSPHRASE, 0, &GenesisConfig::default()).unwrap();
         // Second init should fail (DB has LCL)
-        let result = initialize_genesis(&db, None, PASSPHRASE, 0);
+        let result = initialize_genesis(&db, None, PASSPHRASE, 0, &GenesisConfig::default());
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(
@@ -433,7 +487,7 @@ mod tests {
         db.with_connection(|conn| conn.store_ledger_header(&header, &header_xdr))
             .unwrap();
 
-        let result = initialize_genesis(&db, None, PASSPHRASE, 0);
+        let result = initialize_genesis(&db, None, PASSPHRASE, 0, &GenesisConfig::default());
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(
@@ -445,7 +499,7 @@ mod tests {
     #[test]
     fn test_initialize_genesis_with_test_accounts() {
         let db = henyey_db::Database::open_in_memory().unwrap();
-        initialize_genesis(&db, None, PASSPHRASE, 3).unwrap();
+        initialize_genesis(&db, None, PASSPHRASE, 3, &GenesisConfig::default()).unwrap();
 
         db.with_connection(|conn| {
             let lcl = conn.get_last_closed_ledger()?;
@@ -461,7 +515,14 @@ mod tests {
         let bucket_dir = dir.path().join("buckets");
         let db = henyey_db::Database::open_in_memory().unwrap();
 
-        initialize_genesis(&db, Some(&bucket_dir), PASSPHRASE, 0).unwrap();
+        initialize_genesis(
+            &db,
+            Some(&bucket_dir),
+            PASSPHRASE,
+            0,
+            &GenesisConfig::default(),
+        )
+        .unwrap();
 
         // At least one bucket file should exist.
         let entries: Vec<_> = std::fs::read_dir(&bucket_dir)
@@ -472,5 +533,144 @@ mod tests {
             !entries.is_empty(),
             "bucket files should be persisted to disk"
         );
+    }
+
+    /// Helper: build a `GenesisConfig` with `use_config_for_genesis = true` at a
+    /// fixed protocol, using stellar-core's TESTING_UPGRADE_* defaults.
+    fn config_for_genesis(protocol: u32) -> GenesisConfig {
+        GenesisConfig {
+            use_config_for_genesis: true,
+            protocol_version: protocol,
+            base_fee: 100,
+            base_reserve: 100_000_000,
+            max_tx_set_size: 50,
+        }
+    }
+
+    /// Collect the `ConfigSettingId`s present in the genesis Soroban config set
+    /// for the given protocol.
+    fn genesis_config_setting_ids(protocol: u32) -> Vec<stellar_xdr::curr::ConfigSettingId> {
+        use stellar_xdr::curr::LedgerEntryData;
+        let network_id = NetworkId::from_passphrase(PASSPHRASE);
+        let entries =
+            henyey_ledger::build_genesis_soroban_config_entries(protocol, &network_id).unwrap();
+        let mut ids: Vec<_> = entries
+            .iter()
+            .filter_map(|e| match &e.data {
+                LedgerEntryData::ConfigSetting(cs) => Some(cs.discriminant()),
+                _ => None,
+            })
+            .collect();
+        ids.sort_by_key(|id| *id as i32);
+        ids
+    }
+
+    /// Regression test for #3492: with USE_CONFIG_FOR_GENESIS=true the genesis
+    /// header carries the configured protocol + fee overrides, and the genesis
+    /// bucket list contains the FULL Soroban ConfigSetting entry set.
+    ///
+    /// Fails on `origin/main` (genesis hardcodes ledger_version=0 and emits
+    /// zero ConfigSetting entries — bootstrap.rs:80).
+    #[test]
+    fn test_genesis_config_for_genesis_matches_core_3492() {
+        use stellar_xdr::curr::ConfigSettingId;
+
+        let db = henyey_db::Database::open_in_memory().unwrap();
+        let protocol = 25;
+        initialize_genesis(&db, None, PASSPHRASE, 0, &config_for_genesis(protocol)).unwrap();
+
+        // (a) Header carries the configured protocol + TESTING_UPGRADE_* fees.
+        db.with_connection(|conn| {
+            let header = conn.load_ledger_header(1)?.unwrap();
+            assert_eq!(
+                header.ledger_version, protocol,
+                "genesis header must use the configured protocol version"
+            );
+            assert_eq!(
+                header.base_fee, 100,
+                "base_fee from TESTING_UPGRADE_DESIRED_FEE"
+            );
+            assert_eq!(
+                header.base_reserve, 100_000_000,
+                "base_reserve from TESTING_UPGRADE_RESERVE"
+            );
+            assert_eq!(
+                header.max_tx_set_size, 50,
+                "max_tx_set_size from TESTING_UPGRADE_MAX_TX_SET_SIZE (50, not 100)"
+            );
+            Ok(())
+        })
+        .unwrap();
+
+        // (b) The genesis Soroban config set is present, with the EXACT expected
+        // per-ID membership at protocol 25 (V20's 14 + V23's 3 = 17 entries; no
+        // V26 frozen-key entries yet). Per-ID presence, not just "non-empty".
+        let ids = genesis_config_setting_ids(protocol);
+        let expected: Vec<ConfigSettingId> = {
+            let mut v = vec![
+                ConfigSettingId::ContractMaxSizeBytes,
+                ConfigSettingId::ContractComputeV0,
+                ConfigSettingId::ContractLedgerCostV0,
+                ConfigSettingId::ContractHistoricalDataV0,
+                ConfigSettingId::ContractEventsV0,
+                ConfigSettingId::ContractBandwidthV0,
+                ConfigSettingId::ContractCostParamsCpuInstructions,
+                ConfigSettingId::ContractCostParamsMemoryBytes,
+                ConfigSettingId::ContractDataKeySizeBytes,
+                ConfigSettingId::ContractDataEntrySizeBytes,
+                ConfigSettingId::StateArchival,
+                ConfigSettingId::ContractExecutionLanes,
+                ConfigSettingId::LiveSorobanStateSizeWindow,
+                ConfigSettingId::EvictionIterator,
+                // V23 additions:
+                ConfigSettingId::ContractParallelComputeV0,
+                ConfigSettingId::ContractLedgerCostExtV0,
+                ConfigSettingId::ScpTiming,
+            ];
+            v.sort_by_key(|id| *id as i32);
+            v
+        };
+        assert_eq!(
+            ids, expected,
+            "genesis config-setting ID set at p25 must match core exactly"
+        );
+        assert_eq!(ids.len(), 17, "p25 genesis config-setting count");
+    }
+
+    /// Backward-compat guard: with USE_CONFIG_FOR_GENESIS absent/false the
+    /// genesis is BYTE-IDENTICAL to the legacy behavior — ledger_version 0, no
+    /// config entries, and a pinned header/bucket-list hash. Would FAIL if the
+    /// fix regressed the default path.
+    #[test]
+    fn test_genesis_no_config_for_genesis_unchanged() {
+        use henyey_ledger::compute_header_hash;
+
+        let db = henyey_db::Database::open_in_memory().unwrap();
+        initialize_genesis(&db, None, PASSPHRASE, 0, &GenesisConfig::default()).unwrap();
+
+        db.with_connection(|conn| {
+            let header = conn.load_ledger_header(1)?.unwrap();
+            // Legacy genesis header constants.
+            assert_eq!(header.ledger_version, 0);
+            assert_eq!(header.base_fee, 100);
+            assert_eq!(header.base_reserve, 100_000_000);
+            assert_eq!(header.max_tx_set_size, 100);
+
+            // Pin the genesis hashes for the testnet passphrase. These are the
+            // pre-change values; any drift means the default path regressed.
+            let header_hash = compute_header_hash(&header).unwrap();
+            assert_eq!(
+                header_hash.to_hex(),
+                "63d98f536ee68d1b27b5b89f23af5311b7569a24faf1403ad0b52b633b07be99",
+                "genesis header hash regressed for the no-config path"
+            );
+            assert_eq!(
+                hex::encode(header.bucket_list_hash.0),
+                "572a2e32ff248a07b0e70fd1f6d318c1facd20b6cc08c33d5775259868125a16",
+                "genesis bucket-list hash regressed for the no-config path"
+            );
+            Ok(())
+        })
+        .unwrap();
     }
 }
