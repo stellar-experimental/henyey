@@ -182,11 +182,13 @@ impl NominationProtocol {
     }
 
     /// Get the voted values.
+    #[cfg(test)]
     pub fn votes(&self) -> &[Value] {
         &self.votes
     }
 
     /// Get the accepted values.
+    #[cfg(test)]
     pub fn accepted(&self) -> &[Value] {
         &self.accepted
     }
@@ -277,6 +279,7 @@ impl NominationProtocol {
     }
 
     /// Get the timer expiration count.
+    #[cfg(test)]
     pub fn timer_exp_count(&self) -> u32 {
         self.timer_exp_count
     }

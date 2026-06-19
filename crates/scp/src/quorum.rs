@@ -171,19 +171,13 @@ where
     is_quorum_slice(quorum_set, &remaining_set, &get_quorum_set)
 }
 
-/// Check if a set of nodes is a blocking set.
+/// Check if a set of nodes is a v-blocking set for a given quorum set.
 ///
-/// A set B is a blocking set if it intersects every quorum slice.
-/// This means that no quorum can be formed without at least one
-/// node from B participating.
+/// A set B is v-blocking for node v if B intersects all of v's quorum slices.
 ///
 /// # Arguments
 /// * `quorum_set` - The quorum set to check against
 /// * `nodes` - The set of nodes to check
-///
-/// Check if a set of nodes is a v-blocking set for a given quorum set.
-///
-/// A set B is v-blocking for node v if B intersects all of v's quorum slices.
 ///
 /// # Returns
 /// True if the nodes form a v-blocking set.

@@ -33,9 +33,8 @@
 
 use henyey_common::config::QuorumSetConfig;
 use stellar_xdr::curr::{NodeId, PublicKey, ScpQuorumSet, Uint256};
-use tracing::warn;
 
-use crate::{get_all_nodes, is_quorum_set_sane, is_valid_quorum_set};
+use crate::is_valid_quorum_set;
 
 /// Errors that can occur when parsing or validating quorum set configuration.
 ///
@@ -190,53 +189,6 @@ fn parse_hex_node_id(key_str: &str) -> Result<NodeId, QuorumConfigError> {
     Ok(NodeId(PublicKey::PublicKeyTypeEd25519(Uint256(arr))))
 }
 
-/// Validate that a quorum set configuration will produce valid consensus.
-///
-/// This checks:
-/// 1. The quorum set is structurally valid
-/// 2. Threshold is reasonable (not 0, not > 100%)
-/// 3. There are enough validators for safety
-pub fn validate_quorum_config(config: &QuorumSetConfig) -> Result<(), QuorumConfigError> {
-    // Check threshold is in range (ThresholdPercent already validated during deserialization)
-    let threshold_value: u32 = config.threshold_percent.into();
-    if threshold_value > 100 {
-        return Err(QuorumConfigError::InvalidThreshold {
-            threshold: threshold_value,
-            validator_count: 100,
-        });
-    }
-
-    // Convert to XDR to validate structure
-    let qs = config_to_quorum_set(config)?;
-
-    if let Err(err) = is_quorum_set_sane(&qs, false) {
-        return Err(QuorumConfigError::InvalidStructure(err));
-    }
-
-    // Check we have validators
-    let all_nodes = get_all_nodes(&qs);
-    if all_nodes.is_empty() && config.validators.is_empty() && config.inner_sets.is_empty() {
-        warn!("Quorum set has no validators - node will not be able to reach consensus");
-    }
-
-    // Warn if threshold is too low
-    if threshold_value < 51 {
-        warn!(
-            "Quorum threshold {}% is below 51% - this may compromise safety",
-            threshold_value
-        );
-    }
-
-    // Warn if threshold is 100% (no fault tolerance)
-    if threshold_value == 100 && !config.validators.is_empty() {
-        warn!(
-            "Quorum threshold is 100% - no fault tolerance, any validator failure blocks consensus"
-        );
-    }
-
-    Ok(())
-}
-
 /// Well-known validators for Stellar networks.
 ///
 /// This module provides public keys for SDF-operated validators on testnet
@@ -275,12 +227,6 @@ pub mod known_validators {
     ///
     /// With 67% threshold, the network can tolerate up to 1/3 faulty validators.
     pub const RECOMMENDED_THRESHOLD_PERCENT: u32 = 67;
-
-    /// Minimum safe threshold percentage (51%).
-    ///
-    /// Below 51%, the network may not have proper quorum intersection,
-    /// compromising safety guarantees.
-    pub const MINIMUM_SAFE_THRESHOLD_PERCENT: u32 = 51;
 }
 
 fn recommended_quorum_config(validators: &[&str]) -> QuorumSetConfig {
@@ -297,14 +243,6 @@ fn recommended_quorum_config(validators: &[&str]) -> QuorumSetConfig {
 /// Create a testnet quorum set configuration.
 pub fn testnet_quorum_config() -> QuorumSetConfig {
     recommended_quorum_config(known_validators::TESTNET_VALIDATORS)
-}
-
-/// Create a mainnet quorum set configuration using SDF validators.
-///
-/// Note: For production, you should configure your own quorum set
-/// based on validators you trust. This is just a starting point.
-pub fn mainnet_sdf_quorum_config() -> QuorumSetConfig {
-    recommended_quorum_config(known_validators::MAINNET_SDF_VALIDATORS)
 }
 
 /// Convert a NodeId to a strkey string (G... format).
@@ -347,20 +285,6 @@ mod tests {
         let qs = config_to_quorum_set(&config).unwrap();
         assert_eq!(qs.validators.len(), 3);
         assert_eq!(qs.threshold, 3); // 67% of 3 = 2.01 -> ceil -> 3
-    }
-
-    #[test]
-    fn test_validate_quorum_config() {
-        let config = QuorumSetConfig {
-            threshold_percent: 67.into(),
-            validators: vec![
-                "0000000000000000000000000000000000000000000000000000000000000001".to_string(),
-                "0000000000000000000000000000000000000000000000000000000000000002".to_string(),
-            ],
-            inner_sets: Vec::new(),
-        };
-
-        assert!(validate_quorum_config(&config).is_ok());
     }
 
     #[test]
