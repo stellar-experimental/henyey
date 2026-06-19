@@ -2095,18 +2095,37 @@ struct ApplyLoadOptions {
     iterations: u32,
 }
 
+/// The three CLI-selectable apply-load modes.
+///
+/// Henyey-local benchmark surface (no stellar-core analog for `single-shot`).
+/// Collapses the former `mode`-string + `is_single_shot`-bool duplicate state
+/// into a single source of truth; the upstream `henyey_simulation::ApplyLoadMode`
+/// is derived from it for the harness constructor.
+enum CliApplyLoadMode {
+    LedgerLimits,
+    MaxSacTps,
+    SingleShot,
+}
+
 async fn cmd_apply_load(mut config: AppConfig, opts: ApplyLoadOptions) -> anyhow::Result<()> {
     use henyey_simulation::{ApplyLoad, ApplyLoadConfig, ApplyLoadMode};
 
-    let mode = match opts.mode.as_str() {
-        "ledger-limits" => ApplyLoadMode::LimitBased,
-        "max-sac-tps" | "single-shot" => ApplyLoadMode::MaxSacTps,
+    let cli_mode = match opts.mode.as_str() {
+        "ledger-limits" => CliApplyLoadMode::LedgerLimits,
+        "max-sac-tps" => CliApplyLoadMode::MaxSacTps,
+        "single-shot" => CliApplyLoadMode::SingleShot,
         other => anyhow::bail!(
             "Unknown apply-load mode '{}'. Valid modes: ledger-limits, max-sac-tps, single-shot",
             other
         ),
     };
-    let is_single_shot = opts.mode == "single-shot";
+    // Derive the upstream harness mode (`single-shot` and `max-sac-tps` both map
+    // to `MaxSacTps`; the single-shot vs search distinction is resolved by the
+    // dispatch `match` below, not by the harness enum).
+    let mode = match cli_mode {
+        CliApplyLoadMode::LedgerLimits => ApplyLoadMode::LimitBased,
+        CliApplyLoadMode::MaxSacTps | CliApplyLoadMode::SingleShot => ApplyLoadMode::MaxSacTps,
+    };
 
     // Configure for standalone benchmark operation.
     // The node never connects to peers or runs consensus — ApplyLoad
@@ -2141,7 +2160,7 @@ async fn cmd_apply_load(mut config: AppConfig, opts: ApplyLoadOptions) -> anyhow
 
     // Build the ApplyLoad configuration.
     let al_config = ApplyLoadConfig {
-        num_ledgers: if is_single_shot {
+        num_ledgers: if matches!(cli_mode, CliApplyLoadMode::SingleShot) {
             opts.iterations
         } else {
             opts.num_ledgers
@@ -2163,8 +2182,8 @@ async fn cmd_apply_load(mut config: AppConfig, opts: ApplyLoadOptions) -> anyhow
     println!("Setup complete.");
     println!();
 
-    match mode {
-        ApplyLoadMode::LimitBased => {
+    match cli_mode {
+        CliApplyLoadMode::LedgerLimits => {
             println!(
                 "Running limit-based benchmark ({} ledgers)...",
                 opts.num_ledgers
@@ -2218,7 +2237,7 @@ async fn cmd_apply_load(mut config: AppConfig, opts: ApplyLoadOptions) -> anyhow
             );
         }
 
-        ApplyLoadMode::MaxSacTps if is_single_shot => {
+        CliApplyLoadMode::SingleShot => {
             // Round tx_count down to nearest multiple of clusters.
             let txs = (opts.tx_count / opts.clusters) * opts.clusters;
             println!(
@@ -2242,7 +2261,7 @@ async fn cmd_apply_load(mut config: AppConfig, opts: ApplyLoadOptions) -> anyhow
             println!("Success rate: {:.1}%", harness.success_rate() * 100.0);
         }
 
-        ApplyLoadMode::MaxSacTps => {
+        CliApplyLoadMode::MaxSacTps => {
             println!("Searching for maximum sustainable SAC TPS...");
             println!();
 
