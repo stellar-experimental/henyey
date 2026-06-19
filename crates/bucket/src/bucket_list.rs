@@ -6768,4 +6768,143 @@ mod tests {
         // Cleanup test bucket directory
         let _ = std::fs::remove_dir_all(&bucket_dir);
     }
+
+    // ========================================================================
+    // Regression tests for #3478 — ENOSPC during bucket merge is recoverable,
+    // not corruption. The validator must NOT panic/abort on a transient disk-
+    // full (no partial state committed), but MUST stay fatal on genuine
+    // corruption (HashMismatch / Corruption). Classification keys on the raw
+    // errno (ENOSPC=28, EDQUOT=122), NOT on string-matching.
+    // ========================================================================
+
+    /// The exact production ENOSPC error observed on mainnet (session
+    /// 74535976): `IO error: No space left on device (os error 28)`.
+    /// ENOSPC is errno 28 on Linux.
+    fn make_enospc_bucket_error() -> BucketError {
+        BucketError::Io(std::io::Error::from_raw_os_error(28))
+    }
+
+    /// A transient-IO merge whose result is the production ENOSPC error must
+    /// surface `Err` AND classify as `is_transient_io() == true` — proving the
+    /// errno survives the merge error chain (it was stringified away on main).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_enospc_merge_failure_is_recoverable_not_corruption_3478() {
+        let mut level = BucketLevel::new(1);
+
+        // Inject a level-1 async merge whose result is the exact production
+        // ENOSPC error, via the test-only structured-errno ctor.
+        let merge_err =
+            crate::merge_map::MergeError::from_bucket_error(&make_enospc_bucket_error());
+        let handle = AsyncMergeHandle::new_failed_for_test(1, merge_err);
+        level.next = Some(PendingMerge::Async(handle));
+
+        let mut bl = BucketList::new();
+        bl.levels[1] = level;
+
+        let err = bl
+            .resolve_all_pending_merges()
+            .expect_err("ENOSPC merge failure must surface an error");
+
+        assert!(
+            err.is_transient_io(),
+            "ENOSPC (errno 28) must classify as transient IO (recoverable), got: {err:?}"
+        );
+    }
+
+    /// Genuine corruption (HashMismatch / Corruption) must STAY fatal — it must
+    /// NOT be classified as transient IO, so it is never masked/recovered.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_corruption_merge_failure_stays_fatal_3478() {
+        // HashMismatch
+        let hash_mismatch = BucketError::HashMismatch {
+            expected: "aa".to_string(),
+            actual: "bb".to_string(),
+        };
+        assert!(
+            !hash_mismatch.is_transient_io(),
+            "HashMismatch must NOT be transient IO (stays fatal)"
+        );
+
+        // Corruption
+        let corruption = BucketError::Corruption("entries not sorted".to_string());
+        assert!(
+            !corruption.is_transient_io(),
+            "Corruption must NOT be transient IO (stays fatal)"
+        );
+
+        // EIO (errno 5) is conservatively NOT transient (could be hardware
+        // corruption).
+        let eio = BucketError::Io(std::io::Error::from_raw_os_error(5));
+        assert!(
+            !eio.is_transient_io(),
+            "EIO must NOT be transient IO (conservative — could be corruption)"
+        );
+
+        // And the round-trip through MergeError preserves corruption class.
+        let merge_err = crate::merge_map::MergeError::from_bucket_error(&corruption);
+        let mut level = BucketLevel::new(1);
+        let handle = AsyncMergeHandle::new_failed_for_test(1, merge_err);
+        level.next = Some(PendingMerge::Async(handle));
+        let mut bl = BucketList::new();
+        bl.levels[1] = level;
+        let err = bl
+            .resolve_all_pending_merges()
+            .expect_err("corruption merge failure must surface an error");
+        assert!(
+            !err.is_transient_io(),
+            "corruption round-tripped through MergeError must stay fatal, got: {err:?}"
+        );
+    }
+
+    /// A transient-IO-failed level must NOT poison its cache: once "disk
+    /// recovers", a subsequent real re-prepare at a later ledger must re-issue
+    /// the merge and complete cleanly. On main the failed merge caches
+    /// `Ready(Err)` permanently and the level would wedge forever.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_failed_level_remerges_after_recovery_3478() {
+        let mut bl = BucketList::new();
+
+        // Inject a transient-IO (ENOSPC) failed async merge into level 1.
+        let merge_err =
+            crate::merge_map::MergeError::from_bucket_error(&make_enospc_bucket_error());
+        let handle = AsyncMergeHandle::new_failed_for_test(1, merge_err);
+        bl.levels[1].next = Some(PendingMerge::Async(handle));
+
+        // Resolving surfaces the transient-IO error.
+        let err = bl
+            .resolve_all_pending_merges()
+            .expect_err("ENOSPC merge failure must surface an error");
+        assert!(err.is_transient_io(), "expected transient IO, got {err:?}");
+
+        // After a transient-IO failure the level must be reset so the NEXT
+        // close can re-issue a fresh merge — NOT left holding a poisoned
+        // `Ready(Err)`. Drive a REAL re-prepare and assert it succeeds.
+        assert!(
+            bl.levels[1].next.is_none(),
+            "transient-IO-failed level must reset its pending merge so the next close re-issues it"
+        );
+
+        // "Disk recovers": drive a real re-prepare on level 1 (in-memory merge,
+        // no bucket_dir) and assert it completes cleanly.
+        let incoming = Arc::new(Bucket::empty());
+        bl.levels[1]
+            .prepare_with_normalization(
+                TEST_PROTOCOL,
+                incoming,
+                &[],
+                MergeContext {
+                    keep_dead_entries: DeadEntryPolicy::Keep,
+                    normalize_init: InitEntryPolicy::Preserve,
+                    use_empty_curr: false,
+                    bucket_dir: None,
+                    merge_map: None,
+                    merge_counters: None,
+                    bucket_list_db: BucketListDbConfig::default(),
+                },
+            )
+            .expect("re-prepare after recovery must start a fresh merge");
+
+        bl.resolve_all_pending_merges()
+            .expect("re-issued merge must resolve cleanly after disk recovery");
+    }
 }
