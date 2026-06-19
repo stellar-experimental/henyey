@@ -26,9 +26,8 @@ pub async fn dispatch(
         | "getEvents"
         | "sendTransaction"
         | "simulateTransaction" => {
-            if let Err(e) = util::require_params_object(&params) {
-                Err(e)
-            } else {
+            async {
+                util::require_params_object(&params)?;
                 match method {
                     "getLedgerEntries" => methods::get_ledger_entries::handle(ctx, params).await,
                     "getTransaction" => methods::get_transaction::handle(ctx, params).await,
@@ -40,6 +39,7 @@ pub async fn dispatch(
                     _ => unreachable!(),
                 }
             }
+            .await
         }
         _ => Err(JsonRpcError::method_not_found(method)),
     };
