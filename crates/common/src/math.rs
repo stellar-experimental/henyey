@@ -38,7 +38,7 @@ pub enum Rounding {
 }
 
 /// Error type for math operations.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MathError {
     /// The result overflows the target type.
     Overflow,
@@ -219,21 +219,6 @@ pub(crate) fn big_multiply_unsigned(a: u64, b: u64) -> u128 {
     (a as u128) * (b as u128)
 }
 
-/// Multiplies two non-negative i64 values, returning a u128 result.
-///
-/// # Panics
-///
-/// Panics if either input is negative.
-#[inline]
-#[allow(dead_code)] // Parity with stellar-core; not yet called in production
-pub(crate) fn big_multiply(a: i64, b: i64) -> u128 {
-    assert!(
-        a >= 0 && b >= 0,
-        "big_multiply requires non-negative inputs"
-    );
-    big_multiply_unsigned(a as u64, b as u64)
-}
-
 /// Saturating multiplication: returns `a * b`, capped at `i64::MAX` on overflow.
 ///
 /// Both inputs must be non-negative.
@@ -294,70 +279,6 @@ pub(crate) fn double_to_clamped_u32(d: f64) -> u32 {
         return u32::MAX;
     }
     d.clamp(0.0, u32::MAX as f64) as u32
-}
-
-/// Computes the integer square root of `a * b`.
-///
-/// Returns x such that `x * x <= a * b < (x + 1) * (x + 1)`.
-///
-/// Uses the modified Babylonian method with 128-bit precision.
-#[allow(dead_code)] // Parity with stellar-core; not yet called in production
-pub(crate) fn big_square_root(a: u64, b: u64) -> u64 {
-    if a == 0 || b == 0 {
-        return 0;
-    }
-
-    let sqrt_ceil = big_square_root_ceil(a, b);
-
-    // Check if sqrt_ceil is exact
-    if big_multiply_unsigned(sqrt_ceil, sqrt_ceil) <= big_multiply_unsigned(a, b) {
-        return sqrt_ceil;
-    }
-
-    // sqrt_ceil > 0 because 0*0 <= a*b for all a, b
-    sqrt_ceil - 1
-}
-
-/// Computes ceil(sqrt(a * b)) using the modified Babylonian method.
-#[allow(dead_code)] // Called only by big_square_root (which is parity-only)
-fn big_square_root_ceil(a: u64, b: u64) -> u64 {
-    if a == 0 || b == 0 {
-        return 0;
-    }
-
-    // R = a * b - 1
-    let r = big_multiply_unsigned(a, b) - 1;
-
-    // Seed with a reasonable estimate: 2^(ceil(bits/2))
-    let num_bits = 128 - r.leading_zeros();
-    let seed_bits = num_bits.div_ceil(2);
-    let mut x = if seed_bits >= 64 {
-        u64::MAX
-    } else {
-        1u64 << seed_bits
-    };
-
-    let mut prev = 0u64;
-    while x != prev {
-        prev = x;
-
-        // y = ceil(R / x)
-        let y = match big_divide_unsigned_128(r, x, Rounding::Up) {
-            Ok(v) => v,
-            Err(_) => return x, // Overflow means we're done
-        };
-
-        // x = ceil((x + y) / 2)
-        if u64::MAX - x <= y {
-            // Handle potential overflow
-            let temp = (x as u128) + (y as u128);
-            x = temp.div_ceil(2) as u64;
-        } else {
-            x = (x + y).div_ceil(2);
-        }
-    }
-
-    x
 }
 
 #[cfg(test)]
@@ -474,40 +395,6 @@ mod tests {
             big_multiply_unsigned(u64::MAX, u64::MAX),
             (u64::MAX as u128) * (u64::MAX as u128)
         );
-    }
-
-    #[test]
-    fn test_big_square_root() {
-        // sqrt(100) = 10
-        assert_eq!(big_square_root(100, 1), 10);
-        assert_eq!(big_square_root(10, 10), 10);
-
-        // sqrt(99) = 9 (floor)
-        assert_eq!(big_square_root(99, 1), 9);
-
-        // sqrt(0) = 0
-        assert_eq!(big_square_root(0, 100), 0);
-        assert_eq!(big_square_root(100, 0), 0);
-
-        // sqrt(1) = 1
-        assert_eq!(big_square_root(1, 1), 1);
-
-        // sqrt(4) = 2
-        assert_eq!(big_square_root(4, 1), 2);
-        assert_eq!(big_square_root(2, 2), 2);
-    }
-
-    #[test]
-    fn test_big_square_root_large() {
-        // sqrt(10^18) = 10^9
-        let result = big_square_root(1_000_000_000, 1_000_000_000);
-        assert_eq!(result, 1_000_000_000);
-
-        // sqrt(10^18 - 1) should be 10^9 - 1 or close
-        let result = big_square_root(999_999_999, 1_000_000_001);
-        // 999999999 * 1000000001 = 10^18 - 1
-        // sqrt should be very close to 10^9
-        assert!(result >= 999_999_999 && result <= 1_000_000_000);
     }
 
     #[test]

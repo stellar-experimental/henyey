@@ -41,7 +41,7 @@ use std::ops::{Add, AddAssign, Sub, SubAssign};
 use crate::math::is_representable_as_i64;
 
 /// Error type for checked Resource arithmetic operations.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResourceError {
     /// The two Resources have different numbers of dimensions.
     SizeMismatch { lhs: usize, rhs: usize },

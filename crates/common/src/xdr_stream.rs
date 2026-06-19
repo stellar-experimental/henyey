@@ -77,20 +77,23 @@ pub fn xdr_encoded_len_u32(val: &impl WriteXdr) -> u32 {
 
 #[inline]
 fn encode_frame_header(size: u32) -> [u8; 4] {
-    [
-        ((size >> 24) & 0xFF) as u8 | FRAME_CONTINUATION_BIT,
-        ((size >> 16) & 0xFF) as u8,
-        ((size >> 8) & 0xFF) as u8,
-        (size & 0xFF) as u8,
-    ]
+    // Big-endian layout (MSB first), with the continuation bit OR'd into byte 0.
+    // Matches stellar-core `XDROutputFileStream::writeOne` record marking.
+    let mut header = size.to_be_bytes();
+    header[0] |= FRAME_CONTINUATION_BIT;
+    header
 }
 
 #[inline]
 fn decode_frame_size(header: [u8; 4]) -> u32 {
-    (((header[0] & !FRAME_CONTINUATION_BIT) as u32) << 24)
-        | ((header[1] as u32) << 16)
-        | ((header[2] as u32) << 8)
-        | (header[3] as u32)
+    // Strip the continuation bit from the MSB, then reassemble big-endian.
+    // Matches stellar-core `XDRInputFileStream::getXDRSize`.
+    u32::from_be_bytes([
+        header[0] & !FRAME_CONTINUATION_BIT,
+        header[1],
+        header[2],
+        header[3],
+    ])
 }
 
 /// Serialize a value to XDR and write it as a size-prefixed frame.
