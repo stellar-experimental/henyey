@@ -1923,6 +1923,43 @@ impl App {
         self.shutdown();
     }
 
+    /// Trigger a clean, recoverable shutdown due to a transient environmental
+    /// failure (e.g. ENOSPC/EDQUOT during bucket persist — #3478).
+    ///
+    /// Unlike [`trigger_fatal_shutdown`](Self::trigger_fatal_shutdown), this:
+    /// - does **NOT** emit `fatal_wipe_required = true` (see [`FATAL_WIPE_FIELD`]) —
+    ///   the on-disk state is intact (no partial state was committed), so a
+    ///   wipe would be both wasteful and wrong; the operator just needs to free
+    ///   space and restart; and
+    /// - does **NOT** set `fatal_state_failure` — the condition is recoverable,
+    ///   so a restart after disk recovery may proceed normally.
+    ///
+    /// # Parity (stellar-core v26.0.1)
+    ///
+    /// A bucket merge/flush IO failure in core throws a plain `runtime_error`
+    /// tagged `POSSIBLY_CORRUPTED_LOCAL_FS` ("ensure enough space") that
+    /// propagates uncaught out of `closeLedger` → **clean process exit**. Core
+    /// auto-wipes on NEITHER ENOSPC nor corruption (wipe is operator-driven),
+    /// and there is no `std::abort`/`terminate` on the bucket path. This method
+    /// is the parity-faithful henyey equivalent: a clean shutdown with the
+    /// free-space operator guidance and no wipe — distinct from corruption,
+    /// which retains the abort + wipe path.
+    pub fn trigger_recoverable_shutdown(&self, reason: &str) {
+        tracing::error!(
+            "RECOVERABLE: transient local IO failure — {}. \
+             Node will shut down cleanly. Free disk space and restart; \
+             no state wipe required (on-disk state is intact).",
+            reason
+        );
+        self.shutdown();
+    }
+
+    /// A handle that lets a detached persist task request a clean recoverable
+    /// shutdown (no state wipe) on a transient-IO persist failure (#3478).
+    pub(crate) fn recoverable_shutdown_handle(&self) -> super::persist::RecoverableShutdownHandle {
+        super::persist::RecoverableShutdownHandle::new(self.shutdown_tx.clone())
+    }
+
     /// Subscribe to shutdown notifications.
     pub fn subscribe_shutdown(&self) -> tokio::sync::broadcast::Receiver<()> {
         self.shutdown_tx.subscribe()
@@ -3297,6 +3334,81 @@ mod fatal_wipe_field_tests {
         assert!(
             app.fatal_state_failure.load(Ordering::SeqCst),
             "fatal_state_failure must be set"
+        );
+    }
+
+    /// #3478: `trigger_recoverable_shutdown()` must NOT emit
+    /// `fatal_wipe_required` and must NOT set `fatal_state_failure` — a
+    /// transient ENOSPC is environmental, the on-disk state is intact, and a
+    /// wipe would be wrong. The inverse of the fatal-shutdown contract above.
+    #[tokio::test]
+    async fn test_recoverable_shutdown_does_not_emit_wipe_field_3478() {
+        use std::sync::atomic::Ordering;
+        use tracing::{
+            field::{Field, Visit},
+            subscriber::with_default,
+            Event, Metadata, Subscriber,
+        };
+
+        #[derive(Default)]
+        struct CapturedBool {
+            value: Option<bool>,
+        }
+        impl Visit for CapturedBool {
+            fn record_bool(&mut self, field: &Field, value: bool) {
+                if field.name() == FATAL_WIPE_FIELD {
+                    self.value = Some(value);
+                }
+            }
+            fn record_debug(&mut self, _: &Field, _: &dyn std::fmt::Debug) {}
+        }
+
+        #[derive(Default, Clone)]
+        struct WipeFieldSubscriber {
+            captured: Arc<Mutex<Option<bool>>>,
+        }
+        impl Subscriber for WipeFieldSubscriber {
+            fn enabled(&self, _: &Metadata<'_>) -> bool {
+                true
+            }
+            fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+                tracing::span::Id::from_u64(1)
+            }
+            fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+            fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+            fn event(&self, event: &Event<'_>) {
+                let mut cap = CapturedBool::default();
+                event.record(&mut cap);
+                if let Some(v) = cap.value {
+                    *self.captured.lock().unwrap() = Some(v);
+                }
+            }
+            fn enter(&self, _: &tracing::span::Id) {}
+            fn exit(&self, _: &tracing::span::Id) {}
+        }
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-test.db");
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
+        let app = super::super::App::new(config).await.unwrap();
+
+        let sub = WipeFieldSubscriber::default();
+        let captured = sub.captured.clone();
+
+        with_default(sub, || {
+            app.trigger_recoverable_shutdown("disk full (test)");
+        });
+
+        assert_eq!(
+            *captured.lock().unwrap(),
+            None,
+            "trigger_recoverable_shutdown must NOT emit {FATAL_WIPE_FIELD}"
+        );
+        assert!(
+            !app.fatal_state_failure.load(Ordering::SeqCst),
+            "trigger_recoverable_shutdown must NOT set fatal_state_failure (recoverable)"
         );
     }
 

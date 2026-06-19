@@ -881,7 +881,7 @@ pub struct App {
     ///
     /// Stale-bucket GC now runs on every ledger close (matching stellar-core's
     /// unconditional `forgetUnreferencedBuckets`), rather than every 100 ledgers.
-    /// At ~5s cadence a GC run that blocks in `resolve_pending_bucket_merges()`
+    /// At ~5s cadence a GC run that blocks in `try_resolve_pending_bucket_merges()`
     /// during a merge backlog could still be running when the next close fires.
     /// This flag makes per-ledger GC self-coalescing: at most one background GC
     /// at a time. If a run falls behind, subsequent ledgers skip GC (deferring
@@ -1085,12 +1085,56 @@ fn collect_db_referenced_bucket_hashes(db: &henyey_db::Database) -> anyhow::Resu
 /// See `retain_buckets()` doc comment for the full GC safety contract and
 /// `PARITY_STATUS.md` §6 for the divergence rationale vs stellar-core's
 /// refcount-based approach.
+/// What the best-effort GC path should do when resolving pending bucket merges
+/// fails (#3478).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GcMergeOutcome {
+    /// Transient-IO (ENOSPC/EDQUOT): skip GC this tick (recoverable, retries
+    /// next ledger). Mirrors the existing best-effort DB-error skip.
+    SkipThisTick,
+    /// Corruption / other: the bucket list cannot be trusted — stay fatal.
+    Fatal,
+}
+
+/// Decide the GC path's response to a merge-resolution error. Extracted so the
+/// transient-vs-fatal decision is unit-testable without a live `LedgerManager`.
+fn gc_merge_resolution_outcome(err: &henyey_bucket::BucketError) -> GcMergeOutcome {
+    if err.is_transient_io() {
+        GcMergeOutcome::SkipThisTick
+    } else {
+        GcMergeOutcome::Fatal
+    }
+}
+
 fn collect_gc_roots(
     lm: &henyey_ledger::LedgerManager,
     sm: &BucketSnapshotManager,
     db: &henyey_db::Database,
 ) -> Option<Vec<Hash256>> {
-    lm.resolve_pending_bucket_merges();
+    // GC is best-effort and self-coalescing (re-runs every ledger). On a
+    // transient-IO (ENOSPC/EDQUOT) merge-resolution failure (#3478) we skip GC
+    // this tick — exactly like the DB-error case below — instead of crashing;
+    // the failed level is reset internally so the merge re-issues next close.
+    // Genuine corruption stays fatal (the bucket list cannot be trusted).
+    if let Err(e) = lm.try_resolve_pending_bucket_merges() {
+        match gc_merge_resolution_outcome(&e) {
+            GcMergeOutcome::SkipThisTick => {
+                tracing::warn!(
+                    error = %e,
+                    "Skipping bucket cleanup: transient IO resolving pending merges \
+                     (recoverable — will retry next ledger)"
+                );
+                return None;
+            }
+            GcMergeOutcome::Fatal => {
+                // Corruption / other: the bucket list cannot be trusted to
+                // continue. Preserve the pre-#3478 fatal behavior.
+                panic!(
+                    "bucket merge failure is fatal — cannot continue with corrupt bucket list: {e}"
+                );
+            }
+        }
+    }
 
     let mut hashes = lm.all_referenced_bucket_hashes();
     hashes.extend(sm.all_referenced_hashes());
@@ -2846,7 +2890,7 @@ impl App {
     ///
     /// # Safety
     ///
-    /// `resolve_pending_bucket_merges()` must run first: background merge threads
+    /// `try_resolve_pending_bucket_merges()` must run first: background merge threads
     /// may have written output files to disk whose hashes haven't been polled yet.
     /// Without resolution, those outputs would not appear in `all_referenced_hashes()`
     /// and could be prematurely deleted while a `DiskBucket` still references the path.
@@ -2857,7 +2901,7 @@ impl App {
     /// # Re-entrancy guard (#3028)
     ///
     /// Because this now runs on every ledger close (~5s) rather than every 100th,
-    /// a slow run (blocked in `resolve_pending_bucket_merges()` during a merge
+    /// a slow run (blocked in `try_resolve_pending_bucket_merges()` during a merge
     /// backlog) could still be in flight when the next close fires. The
     /// `bucket_gc_in_flight` flag coalesces overlapping invocations: at most one
     /// background GC runs at a time, and a ledger whose GC would overlap an
@@ -3945,6 +3989,43 @@ mod tests {
     use super::*;
     use stellar_xdr::curr::StellarValueExt;
     use tempfile;
+
+    /// #3478: the best-effort GC path must SKIP (not crash) on a transient-IO
+    /// (ENOSPC/EDQUOT) merge-resolution failure, and stay FATAL on corruption
+    /// or non-free-space IO. This guards the transient-vs-fatal decision the
+    /// `collect_gc_roots` caller makes.
+    #[test]
+    fn test_gc_skips_on_transient_io_stays_fatal_on_corruption_3478() {
+        use henyey_bucket::BucketError;
+
+        // ENOSPC (28) and EDQUOT (122): skip this tick (recoverable).
+        let enospc = BucketError::Io(std::io::Error::from_raw_os_error(28));
+        assert_eq!(
+            gc_merge_resolution_outcome(&enospc),
+            GcMergeOutcome::SkipThisTick,
+            "ENOSPC must cause GC to skip this tick, not crash"
+        );
+        let edquot = BucketError::Io(std::io::Error::from_raw_os_error(122));
+        assert_eq!(
+            gc_merge_resolution_outcome(&edquot),
+            GcMergeOutcome::SkipThisTick,
+            "EDQUOT must cause GC to skip this tick"
+        );
+
+        // Corruption and EIO: stay fatal (bucket list cannot be trusted).
+        let corruption = BucketError::Corruption("unsorted".to_string());
+        assert_eq!(
+            gc_merge_resolution_outcome(&corruption),
+            GcMergeOutcome::Fatal,
+            "corruption must stay fatal"
+        );
+        let eio = BucketError::Io(std::io::Error::from_raw_os_error(5));
+        assert_eq!(
+            gc_merge_resolution_outcome(&eio),
+            GcMergeOutcome::Fatal,
+            "EIO must stay fatal (could be hardware corruption)"
+        );
+    }
 
     /// Panic-safety of the bucket-GC re-entrancy guard (#3028): `ResetGuard`
     /// MUST clear the in-flight flag on drop even when the surrounding scope

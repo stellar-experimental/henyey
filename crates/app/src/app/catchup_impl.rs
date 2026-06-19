@@ -211,7 +211,13 @@ impl App {
                 // Must resolve async merges first — structure-based restart_merges
                 // creates PendingMerge::Async handles, and BucketLevel::clone()
                 // drops unresolved async merges.
-                self.ledger_manager.resolve_pending_bucket_merges();
+                //
+                // Propagate a resolution failure via `?` so only THIS catchup
+                // attempt aborts (self-healable on retry) rather than the
+                // process. A transient-IO (ENOSPC) failure is recoverable and
+                // the level is reset internally to re-merge; corruption stays
+                // fatal upstream. (#3478)
+                self.ledger_manager.try_resolve_pending_bucket_merges()?;
                 let bucket_list = self.ledger_manager.bucket_list().clone();
                 let hot_archive = self
                     .ledger_manager
@@ -591,11 +597,16 @@ impl App {
         if let Some(persist_data) = catchup_persist_data {
             match finalize.0 {
                 super::persist::CatchupFinalizerInner::Inline { db, ledger_manager } => {
-                    super::persist::CatchupPersistReady::new(persist_data, db, ledger_manager)
-                        .spawn()
-                        .handle
-                        .await
-                        .expect("inline catchup persist panicked");
+                    super::persist::CatchupPersistReady::new(
+                        persist_data,
+                        db,
+                        ledger_manager,
+                        self.recoverable_shutdown_handle(),
+                    )
+                    .spawn()
+                    .handle
+                    .await
+                    .expect("inline catchup persist panicked");
                     tracing::info!(
                         ledger_seq = catchup_result.ledger_seq,
                         "Catchup persist completed (inline)"
@@ -623,8 +634,12 @@ impl App {
                             "Failed to set catchup persist sentinel"
                         );
                     }
-                    let ready =
-                        super::persist::CatchupPersistReady::new(persist_data, db, ledger_manager);
+                    let ready = super::persist::CatchupPersistReady::new(
+                        persist_data,
+                        db,
+                        ledger_manager,
+                        self.recoverable_shutdown_handle(),
+                    );
                     // Send-failure tolerance: if the receiver was dropped
                     // (caller cancellation), `ready` drops here — no persist
                     // task spawned, no untracked work.

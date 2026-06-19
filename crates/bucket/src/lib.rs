@@ -159,7 +159,7 @@ pub use henyey_common::{
 // Error handling
 // ============================================================================
 
-pub use error::BucketError;
+pub use error::{BucketError, BucketErrorClass};
 
 // ============================================================================
 // Eviction (Soroban state archival)
@@ -237,7 +237,9 @@ pub use cache::{BucketEntryCache, CacheStats};
 // Merge deduplication
 // ============================================================================
 
-pub use merge_map::{BucketMergeMap, InFlightGuard, MergeResult, MergeSlot, SharedMergeMetadata};
+pub use merge_map::{
+    BucketMergeMap, InFlightGuard, MergeError, MergeResult, MergeSlot, SharedMergeMetadata,
+};
 
 // ============================================================================
 // Bucket applicator (catchup)
