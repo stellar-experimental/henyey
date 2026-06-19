@@ -9054,6 +9054,7 @@ mod resource_limit_parity_tests {
 
     /// Run a resource-limit scenario: create 32 TXs, add to queue, build tx set,
     /// validate shape and base fee.
+    #[allow(clippy::too_many_arguments)]
     fn run_resource_limit_scenario(
         soroban_limit: Resource,
         min_stage: u32,
@@ -9967,7 +9968,6 @@ mod eviction_queue_tests {
     }
 }
 
-#[cfg(test)]
 #[cfg(test)]
 mod fee_rate_tests {
     use super::*;

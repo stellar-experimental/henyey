@@ -472,7 +472,7 @@ impl TxSetTracker {
     /// Return all hashes currently in the cache. Test-only.
     #[cfg(test)]
     pub fn cached_hashes(&self) -> Vec<Hash256> {
-        self.cache.iter().map(|entry| entry.key().clone()).collect()
+        self.cache.iter().map(|entry| *entry.key()).collect()
     }
 
     pub fn pending_count(&self) -> usize {

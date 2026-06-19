@@ -2985,9 +2985,12 @@ mod stellar_core_parity_tests {
     fn assert_no_intra_stage_conflicts(stages: &[Vec<Vec<HashedTx>>], context: &str) {
         use std::collections::HashSet;
 
+        // (RO key set, RW key set) for a single cluster.
+        type ClusterKeySets = (HashSet<Vec<u8>>, HashSet<Vec<u8>>);
+
         for (si, stage) in stages.iter().enumerate() {
             // Collect per-cluster RW and RO key sets.
-            let cluster_keys: Vec<(HashSet<Vec<u8>>, HashSet<Vec<u8>>)> = stage
+            let cluster_keys: Vec<ClusterKeySets> = stage
                 .iter()
                 .map(|cluster| {
                     let mut ro_set = HashSet::new();
@@ -3199,12 +3202,12 @@ mod stellar_core_parity_tests {
                 let phase = stages_to_xdr_phase(stages, Some(base_fee));
                 let xdr_bytes = phase
                     .to_xdr(Limits::none())
-                    .expect(&format!("{ctx}: XDR serialization failed"));
+                    .unwrap_or_else(|_| panic!("{ctx}: XDR serialization failed"));
                 let decoded = TransactionPhase::from_xdr(&xdr_bytes, Limits::none())
-                    .expect(&format!("{ctx}: XDR deserialization failed"));
+                    .unwrap_or_else(|_| panic!("{ctx}: XDR deserialization failed"));
                 let re_encoded = decoded
                     .to_xdr(Limits::none())
-                    .expect(&format!("{ctx}: XDR re-serialization failed"));
+                    .unwrap_or_else(|_| panic!("{ctx}: XDR re-serialization failed"));
                 assert_eq!(
                     xdr_bytes, re_encoded,
                     "{ctx}: XDR roundtrip produced different bytes"
