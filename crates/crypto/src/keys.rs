@@ -104,6 +104,7 @@ impl PublicKey {
     ///
     /// This is used for sealed box encryption, which uses X25519 key exchange.
     /// The Ed25519 key is converted to its Curve25519 equivalent.
+    #[cfg(test)]
     pub fn to_curve25519_bytes(&self) -> [u8; 32] {
         self.0.to_montgomery().to_bytes()
     }
@@ -239,6 +240,7 @@ impl SecretKey {
     ///
     /// This is used for sealed box operations, which use X25519 key exchange.
     /// The Ed25519 secret key is converted to its Curve25519 equivalent.
+    #[cfg(test)]
     pub fn to_curve25519_bytes(&self) -> [u8; 32] {
         self.inner.to_scalar_bytes()
     }
