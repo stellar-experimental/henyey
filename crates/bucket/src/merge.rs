@@ -605,7 +605,6 @@ pub fn merge_in_memory(
     let old_entries = old_bucket.get_in_memory_entries().unwrap();
     let new_entries = new_bucket.get_in_memory_entries().unwrap();
 
-    // DEBUG: Print merge inputs
     tracing::debug!(
         old_entries_count = old_entries.len(),
         new_entries_count = new_entries.len(),
@@ -659,7 +658,7 @@ pub fn merge_in_memory(
         // Serialize entry for hash using reusable buffer
         entry_buf.clear();
         {
-            let mut limited = Limited::new(&mut entry_buf as &mut Vec<u8>, Limits::none());
+            let mut limited = Limited::new(&mut entry_buf, Limits::none());
             entry.write_xdr(&mut limited).map_err(|e| {
                 BucketError::Serialization(format!("Failed to serialize entry: {}", e))
             })?;
@@ -713,7 +712,6 @@ pub fn merge_in_memory(
     // Compute final hash
     let hash = Hash256::from_sha256(hasher);
 
-    // DEBUG: Print merge output
     tracing::debug!(
         merged_count = all_entries.len(),
         has_meta = all_entries.first().map(|e| e.is_metadata()).unwrap_or(false),

@@ -296,10 +296,17 @@ enum FutureBucketInner {
         output_hash: Hash256,
     },
 
-    /// Async merge in progress with live input references.
+    /// Async merge in progress.
+    ///
+    /// Only the input *hashes* are retained, not the input buckets themselves:
+    /// the merge task consumes its own clones of the inputs, and snapshot
+    /// serialization persists only the hex hashes. This diverges from
+    /// stellar-core's `FutureBucket`, which keeps `mInputCurrBucket`/
+    /// `mInputSnapBucket` solely so `checkState()` can `releaseAssert` the live
+    /// bucket hashes match the stored hashes. Here the enum makes those invalid
+    /// state combinations unrepresentable, so the input-bucket mirrors (and the
+    /// runtime check that read them) are unnecessary.
     LiveMerging {
-        curr: Arc<Bucket>,
-        snap: Arc<Bucket>,
         curr_hash: Hash256,
         snap_hash: Hash256,
         merge_handle: MergeHandle,
@@ -367,8 +374,6 @@ impl FutureBucket {
 
         Self {
             inner: FutureBucketInner::LiveMerging {
-                curr,
-                snap,
                 curr_hash,
                 snap_hash,
                 merge_handle: MergeHandle::new(receiver),
@@ -439,37 +444,6 @@ impl FutureBucket {
             FutureBucketInner::LiveOutput { .. } => FutureBucketState::LiveOutput,
             FutureBucketInner::LiveMerging { .. } => FutureBucketState::LiveInputs,
         }
-    }
-
-    /// Validate internal field invariants for the current state.
-    ///
-    /// With the enum-based design, invalid states are unrepresentable at compile
-    /// time. This method is retained for API compatibility but always returns Ok.
-    ///
-    /// Spec: BUCKETLISTDB_SPEC §7.1 — FutureBucket state validation.
-    #[deprecated(note = "Invariants are now enforced at compile time by the enum design")]
-    pub fn check_state(&self) -> Result<()> {
-        // Hash consistency assertions in debug builds
-        debug_assert!(
-            {
-                match &self.inner {
-                    FutureBucketInner::LiveOutput {
-                        output,
-                        output_hash,
-                    } => output.hash() == *output_hash,
-                    FutureBucketInner::LiveMerging {
-                        curr,
-                        snap,
-                        curr_hash,
-                        snap_hash,
-                        ..
-                    } => curr.hash() == *curr_hash && snap.hash() == *snap_hash,
-                    _ => true,
-                }
-            },
-            "hash/bucket consistency violated"
-        );
-        Ok(())
     }
 
     /// Check if this FutureBucket is in a live state (has bucket references).
@@ -744,8 +718,6 @@ impl FutureBucket {
                 });
 
                 self.inner = FutureBucketInner::LiveMerging {
-                    curr,
-                    snap,
                     curr_hash: ch,
                     snap_hash: sh,
                     merge_handle: MergeHandle::new(receiver),
@@ -840,8 +812,6 @@ impl FutureBucket {
             inner: FutureBucketInner::LiveMerging {
                 curr_hash: curr.hash(),
                 snap_hash: snap.hash(),
-                curr,
-                snap,
                 merge_handle,
                 keep_tombstones: DeadEntryPolicy::Keep,
             },
@@ -1592,18 +1562,6 @@ mod tests {
         assert_eq!(fb.state(), FutureBucketState::LiveInputs);
         assert!(fb.is_merging());
         assert!(fb.is_live());
-    }
-
-    #[test]
-    #[allow(deprecated)]
-    fn test_check_state_always_ok() {
-        let fb = FutureBucket::clear();
-        assert!(fb.check_state().is_ok());
-
-        let entry = make_account_entry([1u8; 32], 100);
-        let bucket = Arc::new(Bucket::from_entries(vec![BucketEntry::Liveentry(entry)]).unwrap());
-        let fb = FutureBucket::from_output(bucket);
-        assert!(fb.check_state().is_ok());
     }
 
     #[test]

@@ -79,9 +79,6 @@ use henyey_common::{is_persistent_entry, is_soroban_entry, is_temporary_entry};
 /// Number of levels in the BucketList (matches stellar-core's `kNumLevels`).
 pub const BUCKET_LIST_LEVELS: usize = 11;
 
-// HAS_NEXT_STATE constants moved to crates/history/src/archive_state.rs
-// (they are HAS-JSON-format concerns, not bucket-domain concepts)
-
 // ============================================================================
 // Bucket list arithmetic helpers (shared by BucketList and HotArchiveBucketList)
 // ============================================================================
@@ -2190,17 +2187,13 @@ impl BucketList {
 
     /// Return all live entries as of the current bucket list state.
     ///
-    /// # Deprecation
-    ///
-    /// This method materializes all entries into memory, which is problematic
-    /// for mainnet scale (~60M entries = ~52 GB RAM). Prefer using
-    /// [`live_entries_iter()`](Self::live_entries_iter) for memory-efficient
-    /// streaming iteration.
-    #[deprecated(
-        since = "0.2.0",
-        note = "Use live_entries_iter() for memory-efficient streaming iteration"
-    )]
-    pub fn live_entries(&self) -> Result<Vec<LedgerEntry>> {
+    /// Test-only materializing oracle: it collects every live entry into memory
+    /// (~52 GB at mainnet scale), so production code uses the streaming
+    /// [`live_entries_iter()`](Self::live_entries_iter) instead. This helper is
+    /// retained solely as an independent cross-check for the iterator in
+    /// `live_iterator::tests::test_matches_live_entries`.
+    #[cfg(test)]
+    pub(crate) fn live_entries(&self) -> Result<Vec<LedgerEntry>> {
         let mut seen: HashSet<Vec<u8>> = HashSet::new();
         let mut entries = Vec::new();
 
