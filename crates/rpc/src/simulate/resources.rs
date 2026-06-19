@@ -203,17 +203,13 @@ pub(super) fn compute_invoke_resource_fee(
     // only non-Soroban entries (accounts, trustlines etc.) count, since Soroban
     // entries (ContractData/ContractCode) are cached in memory and don't require
     // disk reads. Auto-restored entries also count.
-    let mut disk_read_entries = 0u32;
-    for k in resources.footprint.read_only.iter() {
-        if !henyey_common::is_soroban_key(k) {
-            disk_read_entries += 1;
-        }
-    }
-    for k in resources.footprint.read_write.iter() {
-        if !henyey_common::is_soroban_key(k) {
-            disk_read_entries += 1;
-        }
-    }
+    let mut disk_read_entries = resources
+        .footprint
+        .read_only
+        .iter()
+        .chain(resources.footprint.read_write.iter())
+        .filter(|k| !henyey_common::is_soroban_key(k))
+        .count() as u32;
     disk_read_entries += restored_entry_count;
 
     compute_resource_fee_core(&ResourceFeeParams {
