@@ -99,7 +99,7 @@ where
 /// In release builds with `panic = "abort"`, task panics abort the process
 /// before this function can observe them. This helper is most useful in
 /// dev/test builds and as documentation of intent.
-pub async fn await_join_logged<T>(
+pub(crate) async fn await_join_logged<T>(
     context: &str,
     handle: JoinHandle<T>,
 ) -> Result<T, tokio::task::JoinError> {
