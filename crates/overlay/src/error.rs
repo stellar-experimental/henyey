@@ -146,31 +146,6 @@ pub enum OverlayError {
     Internal(String),
 }
 
-impl OverlayError {
-    /// Returns true if this error is transient and the operation could succeed on retry.
-    ///
-    /// Connection failures, timeouts, and I/O errors are typically retriable.
-    pub fn is_retriable(&self) -> bool {
-        matches!(
-            self,
-            OverlayError::ConnectionFailed(_)
-                | OverlayError::ConnectionTimeout(_)
-                | OverlayError::Io(_)
-        )
-    }
-
-    /// Returns true if this error indicates a fundamental incompatibility.
-    ///
-    /// Network mismatches and version incompatibilities are fatal - retrying
-    /// will not help and the peer should not be contacted again.
-    pub fn is_fatal(&self) -> bool {
-        matches!(
-            self,
-            OverlayError::NetworkMismatch | OverlayError::VersionMismatch(_)
-        )
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

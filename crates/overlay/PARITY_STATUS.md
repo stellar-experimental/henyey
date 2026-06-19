@@ -2,8 +2,8 @@
 
 **Crate**: `henyey-overlay`
 **Upstream**: `stellar-core/src/overlay/`
-**Overall Parity**: 91%
-**Last Updated**: 2026-05-28
+**Overall Parity**: 90%
+**Last Updated**: 2026-06-19
 
 ## Summary
 
@@ -402,7 +402,7 @@ Corresponds to: `SurveyManager.h`, `SurveyDataManager.h`, `SurveyMessageLimiter.
 | `relayStopSurveyCollecting()` | `survey_impl::handle_survey_stop_collecting()` | Full |
 | `modifyNodeData()` | `modify_node_data()` | Full |
 | `modifyPeerData()` | `modify_peer_data()` | Full |
-| `recordDroppedPeer()` | `record_dropped_peer()` | Full |
+| `recordDroppedPeer()` | `record_dropped_peer()` | None |
 | `updateSurveyPhase()` | `update_phase()` | Full |
 | `sendTopologyRequest()` | `survey_impl::handle_survey_request()` | Full |
 | `processTimeSlicedTopologyResponse()` | `survey_impl::handle_survey_response()` | Full |
@@ -416,7 +416,7 @@ Corresponds to: `SurveyManager.h`, `SurveyDataManager.h`, `SurveyMessageLimiter.
 | `SurveyDataManager::stopSurveyCollecting()` | `stop_collecting()` | Full |
 | `SurveyDataManager::modifyNodeData()` | `modify_node_data()` | Full |
 | `SurveyDataManager::modifyPeerData()` | `modify_peer_data()` | Full |
-| `SurveyDataManager::recordDroppedPeer()` | `record_dropped_peer()` | Full |
+| `SurveyDataManager::recordDroppedPeer()` | `record_dropped_peer()` | None |
 | `SurveyDataManager::getNonce()` | `nonce()` | Full |
 | `SurveyDataManager::nonceIsReporting()` | (via phase check) | Full |
 | `SurveyDataManager::fillSurveyData()` | `survey_impl::handle_survey_request()` | Full |
@@ -488,6 +488,7 @@ Features not yet implemented. These ARE counted against parity %.
 | `OverlayManagerImpl::updateSizeCounters()` | Low | Metrics for pending/auth sizes |
 | `OverlayManagerImpl::availableOutboundAuthenticatedSlots()` | Low | Slot availability check |
 | `SurveyManager::getMsgSummary()` | Low | Survey message logging |
+| `SurveyDataManager::recordDroppedPeer()` | Medium | `record_dropped_peer()` exists with correct internal semantics but has **zero production callers** — it is never invoked from the peer-drop path, so henyey survey responses always report `dropped_peers: 0`. The symmetric add/node-data counters (`record_added_peer` / `modify_node_data`) are likewise production-unwired. Wiring these into the peer lifecycle is a behavior-changing parity task tracked in #3500. |
 
 ## Architectural Differences
 
@@ -548,7 +549,7 @@ Features not yet implemented. These ARE counted against parity %.
 
 | Category | Count |
 |----------|-------|
-| Implemented (Full) | 257 |
-| Gaps (None + Partial) | 26 |
+| Implemented (Full) | 255 |
+| Gaps (None + Partial) | 28 |
 | Intentional Omissions | 10 |
-| **Parity** | **257 / (257 + 26) = 91%** |
+| **Parity** | **255 / (255 + 28) = 90%** |

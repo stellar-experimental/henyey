@@ -206,20 +206,6 @@ impl PeerManager {
         })
     }
 
-    /// Create a peer manager using an existing database connection.
-    pub fn from_connection(conn: Connection) -> Result<Self> {
-        Self::init_db(&conn)?;
-
-        let cache = Self::load_all_from_db(&conn)?;
-
-        let db = Arc::new(Mutex::new(conn));
-
-        Ok(Self {
-            cache: RwLock::new(cache),
-            db: Some(db),
-        })
-    }
-
     /// Initialize the database schema.
     fn init_db(conn: &Connection) -> Result<()> {
         conn.execute(
@@ -948,9 +934,9 @@ mod tests {
     }
 
     #[test]
-    fn test_get_peers_to_send_canonical_key_exclusion() {
-        // Exclusion must compare via canonical_key, not raw field equality.
-        // PeerManager records store IP strings; canonical_key normalizes
+    fn test_get_peers_to_send_dial_key_exclusion() {
+        // Exclusion must compare via dial_key, not raw field equality.
+        // PeerManager records store IP strings; dial_key normalizes
         // them (e.g. IPv6 shortening, future IPv4-mapped IPv6 handling).
         let manager = PeerManager::new_in_memory();
 
@@ -964,7 +950,7 @@ mod tests {
         assert_eq!(peers.len(), 1);
         assert_eq!(peers[0].host, "5.6.7.8");
 
-        // Verify canonical_key is used by constructing a fresh PeerAddress
+        // Verify dial_key is used by constructing a fresh PeerAddress
         // with the same IP — it should still be excluded
         let exclude_fresh = PeerAddress::new("1.2.3.4".to_string(), 11625);
         let peers = manager.get_peers_to_send(10, &exclude_fresh);
