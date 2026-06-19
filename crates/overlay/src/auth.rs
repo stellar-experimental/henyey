@@ -932,7 +932,7 @@ mod tests {
         assert_eq!(hello.ledger_version, 26);
     }
 
-    // ---- G14: Auth flag (bit 31) gates MAC verification in unwrap_message ----
+    // ---- G14: receiver auth state (not the wire bit-31 flag) gates MAC verification in unwrap_message ----
 
     /// Helper: Complete a full handshake between two AuthContexts.
     /// Returns (initiator, acceptor) both in Authenticated state.
@@ -994,7 +994,7 @@ mod tests {
         let msg = StellarMessage::Peers(xdr::VecM::default());
         let wrapped = ctx_a.wrap_message(msg.clone()).unwrap();
 
-        // message_is_authenticated=true → MAC should be verified
+        // Receiver is authenticated → MAC is verified (and passes for a valid MAC).
         let unwrapped = ctx_b.unwrap_message(wrapped).unwrap();
         assert!(matches!(unwrapped, StellarMessage::Peers(_)));
     }
@@ -1002,7 +1002,7 @@ mod tests {
     #[test]
     fn test_unwrap_bad_mac_rejected_when_authenticated_g14() {
         // After handshake, a message with a wrong MAC should be rejected
-        // when bit 31 is set (message_is_authenticated=true).
+        // because the receiver's own auth state is authenticated.
         let (mut ctx_a, mut ctx_b) = complete_handshake();
 
         let msg = StellarMessage::Peers(xdr::VecM::default());

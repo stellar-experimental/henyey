@@ -345,12 +345,6 @@ impl KnownPeerSet {
         entries.extend(self.discovered.iter().cloned());
         entries
     }
-
-    /// Total known peer count.
-    #[allow(dead_code)]
-    pub(super) fn len(&self) -> usize {
-        self.config_entries.len() + self.discovered.len()
-    }
 }
 
 /// An overlay message received from a peer, ready for dispatch to subscribers.

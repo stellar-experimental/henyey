@@ -110,16 +110,14 @@ pub use loopback::LoopbackConnectionFactory;
 #[doc(hidden)]
 pub use manager::TestPeerReceiver;
 pub use manager::{AddPeerOutcome, OverlayManager, OverlayMessage, OverlayStats, PeerSnapshot};
-pub use metrics::{
-    Counter, OverlayMessageKind, OverlayMetrics, OverlayMetricsSnapshot, Timer, TimerSnapshot,
-};
+pub use metrics::{Counter, OverlayMessageKind, OverlayMetrics, OverlayMetricsSnapshot};
 pub use peer::{Peer, PeerInfo, PeerState, PeerStats, PeerStatsSnapshot};
 pub use peer_manager::{
     BackOffUpdate, PeerManager, PeerQuery, PeerRecord, PeerTypeFilter, StoredPeerType, TypeUpdate,
 };
 pub use survey::{
     CollectingNodeData, CollectingPeerData, SurveyConfig, SurveyManager, SurveyManagerStats,
-    SurveyPhase, TimeSlicedNodeData, TimeSlicedPeerData, SURVEY_THROTTLE_TIMEOUT_MULT,
+    SurveyPhase, TimeSlicedNodeData, TimeSlicedPeerData,
 };
 
 use std::collections::HashSet;
