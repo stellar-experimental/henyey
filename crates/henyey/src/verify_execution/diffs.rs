@@ -724,6 +724,27 @@ pub(super) fn print_tx_result_diffs(
 /// printing. Mapping preserved exactly: `Created→creates`; `Updated` and
 /// `Restored→updates`; `Removed→deletes`; `State` ignored. Upgrade metas count
 /// only `Created`/`Updated`.
+/// Classifies a single change-group, returning `(creates, updates, deletes)`.
+///
+/// Mapping preserved exactly: `Created→creates`; `Updated` and `Restored→updates`;
+/// `Removed→deletes`; `State` ignored. Callers accumulate (`+=`) the returned
+/// tuple — the counts fold across all change-groups and tx_metas.
+fn count_changes(changes: &[stellar_xdr::curr::LedgerEntryChange]) -> (u32, u32, u32) {
+    let mut creates = 0u32;
+    let mut updates = 0u32;
+    let mut deletes = 0u32;
+    for change in changes {
+        match change {
+            stellar_xdr::curr::LedgerEntryChange::Created(_) => creates += 1,
+            stellar_xdr::curr::LedgerEntryChange::Updated(_) => updates += 1,
+            stellar_xdr::curr::LedgerEntryChange::Removed(_) => deletes += 1,
+            stellar_xdr::curr::LedgerEntryChange::Restored(_) => updates += 1,
+            stellar_xdr::curr::LedgerEntryChange::State(_) => {}
+        }
+    }
+    (creates, updates, deletes)
+}
+
 pub(super) fn cdp_change_counts(
     tx_metas: &[stellar_xdr::curr::TransactionMeta],
     upgrade_metas: &[stellar_xdr::curr::UpgradeEntryMeta],
@@ -732,29 +753,13 @@ pub(super) fn cdp_change_counts(
     let mut cdp_updates = 0u32;
     let mut cdp_deletes = 0u32;
     for tx_meta in tx_metas {
-        fn count_changes(
-            changes: &[stellar_xdr::curr::LedgerEntryChange],
-            creates: &mut u32,
-            updates: &mut u32,
-            deletes: &mut u32,
-        ) {
-            for change in changes {
-                match change {
-                    stellar_xdr::curr::LedgerEntryChange::Created(_) => *creates += 1,
-                    stellar_xdr::curr::LedgerEntryChange::Updated(_) => *updates += 1,
-                    stellar_xdr::curr::LedgerEntryChange::Removed(_) => *deletes += 1,
-                    stellar_xdr::curr::LedgerEntryChange::Restored(_) => *updates += 1,
-                    stellar_xdr::curr::LedgerEntryChange::State(_) => {}
-                }
-            }
-        }
         henyey_common::meta_walk::for_each_change_group(tx_meta, |changes| {
-            count_changes(
-                changes,
-                &mut cdp_creates,
-                &mut cdp_updates,
-                &mut cdp_deletes,
-            );
+            // Accumulate (`+=`, not reassign): counters fold across every
+            // change-group callback within this tx_meta AND across all tx_metas.
+            let (c, u, d) = count_changes(changes);
+            cdp_creates += c;
+            cdp_updates += u;
+            cdp_deletes += d;
         });
     }
 

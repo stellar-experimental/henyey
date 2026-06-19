@@ -248,62 +248,7 @@ async fn verify_single_ledger(
         Ok(r) => r,
         Err(e) => {
             println!("  Ledger {}: close_ledger failed: {}", seq, e);
-            // Print the CDP/mainnet expected header fields so the WARN
-            // log emitted by manager.rs::commit (which prints OUR
-            // computed fields) can be diffed against mainnet's directly
-            // from CI output.
-            tracing::warn!(
-                target: "hash_mismatch_debug",
-                ledger_seq = seq,
-                expected_header_hash = %verified_header_hash.to_hex(),
-                expected_bucket_list_hash = %Hash256::from(cdp_header.bucket_list_hash.0).to_hex(),
-                expected_tx_result_hash = %Hash256::from(cdp_header.tx_set_result_hash.0).to_hex(),
-                expected_total_coins = cdp_header.total_coins,
-                expected_fee_pool = cdp_header.fee_pool,
-                expected_inflation_seq = cdp_header.inflation_seq,
-                expected_id_pool = cdp_header.id_pool,
-                expected_base_fee = cdp_header.base_fee,
-                expected_base_reserve = cdp_header.base_reserve,
-                expected_max_tx_set_size = cdp_header.max_tx_set_size,
-                expected_ledger_version = cdp_header.ledger_version,
-                "Pre-commit hash mismatch (replay mode) - mainnet/CDP expected fields"
-            );
-            // Per-tx CDP result diagnostic: log each tx hash + fee_charged
-            // from mainnet's recorded results so they can be diffed against
-            // our per-tx WARN log emitted from manager.rs::commit.
-            //
-            // CRITICAL: cdp envelopes (from tx_set, canonical order) and
-            // tx_processing (apply order) are NOT aligned by index. We MUST
-            // align by tx hash via extract_transaction_processing.
-            let network_id = stellar_xdr::curr::Hash(*ctx.ledger_manager.network_id().0.as_bytes());
-            let cdp_processing =
-                henyey_history::cdp::extract_transaction_processing(&lcm, &network_id);
-            for (i, info) in cdp_processing.iter().enumerate() {
-                let (op_types, declared_fee, soroban_resource_fee, soroban_resources) =
-                    describe_envelope(Some(&info.envelope));
-                let op_results = describe_op_results(&info.result.result.result);
-                let (changes_count, changes_total_bytes) = summarize_cdp_meta(Some(&info.meta));
-                let diag_events = extract_diagnostic_event_summary(Some(&info.meta));
-                let changes_summary = summarize_cdp_meta_changes(Some(&info.meta));
-                tracing::warn!(
-                    target: "hash_mismatch_debug",
-                    ledger_seq = seq,
-                    tx_index = i,
-                    tx_hash = %Hash256::from_bytes(info.result.transaction_hash.0).to_hex(),
-                    fee_charged = info.result.result.fee_charged,
-                    result_code = ?info.result.result.result.discriminant(),
-                    op_results = %op_results,
-                    declared_fee = declared_fee,
-                    op_types = %op_types,
-                    soroban_resource_fee = soroban_resource_fee,
-                    soroban_resources = %soroban_resources,
-                    cdp_meta_changes_count = changes_count,
-                    cdp_meta_changes_total_bytes = changes_total_bytes,
-                    diag_events = %diag_events,
-                    changes = %changes_summary,
-                    "Per-tx result (mainnet/CDP, hash-aligned)"
-                );
-            }
+            log_close_ledger_failure_diag(ctx, seq, verified_header_hash, &cdp_header, &lcm);
             if ctx.stop_on_error {
                 anyhow::bail!("close_ledger failed at ledger {}: {}", seq, e);
             }
@@ -347,33 +292,21 @@ async fn verify_single_ledger(
                 std::io::Write::flush(&mut std::io::stdout()).ok();
             }
         } else {
-            println!();
-            println!("  Ledger {}: MISMATCH", seq);
-            if !header_matches {
-                println!(
-                    "    Header hash: ours={} expected={}",
-                    result.header_hash.to_hex(),
-                    expected_header_hash.to_hex()
-                );
-                let bucket_levels = ctx.ledger_manager.bucket_list_levels();
-                print_header_field_diffs(&result.header, &cdp_header, &bucket_levels);
-            }
-            if !tx_result_matches {
-                println!(
-                    "    TX result hash: ours={} expected={}",
-                    our_tx_result_hash.to_hex(),
-                    expected_tx_result_hash.to_hex()
-                );
-            }
-
-            if ctx.show_diff && !tx_result_matches {
-                print_tx_result_diffs(&result.tx_results, &cdp_tx_results);
-            }
-
-            // Compare eviction data when header mismatches but TX results match
-            if !header_matches && tx_result_matches {
-                print_eviction_and_entry_diagnostics(ctx, &lcm, &result.header);
-            }
+            print_mismatch_details(
+                ctx,
+                seq,
+                &result.header,
+                result.header_hash,
+                expected_header_hash,
+                our_tx_result_hash,
+                expected_tx_result_hash,
+                header_matches,
+                tx_result_matches,
+                &result.tx_results,
+                &cdp_tx_results,
+                &cdp_header,
+                &lcm,
+            );
 
             if ctx.stop_on_error {
                 anyhow::bail!("Mismatch at ledger {}", seq);
@@ -383,49 +316,178 @@ async fn verify_single_ledger(
         // Collect and display performance metrics
         if let Some(ref perf) = result.perf {
             record_perf(stats, perf, seq);
-
-            // Print per-ledger summary every 64 ledgers or if slow
-            if !ctx.quiet && (stats.ledgers_verified % 64 == 0 || perf.total_us > 500_000) {
-                let cache_rate = if perf.cache.hits + perf.cache.misses > 0 {
-                    perf.cache.hits as f64 / (perf.cache.hits + perf.cache.misses) as f64 * 100.0
-                } else {
-                    0.0
-                };
-                println!(
-                    "\n  [PERF L{}] total={:.1}ms tx_exec={:.1}ms commit={:.1}ms \
-                 add_batch={:.1}ms eviction={:.1}ms txs={} cache={:.0}% \
-                 rss={:.0}MB",
-                    seq,
-                    perf.total_us as f64 / 1000.0,
-                    perf.tx_exec_us as f64 / 1000.0,
-                    commit_us(perf) as f64 / 1000.0,
-                    perf.add_batch_us as f64 / 1000.0,
-                    perf.eviction_us as f64 / 1000.0,
-                    perf.tx_count,
-                    cache_rate,
-                    perf.rss_after_bytes as f64 / (1024.0 * 1024.0),
-                );
-                // Show top 3 slowest txs for this ledger
-                for tx in perf.tx_timings.iter().take(3) {
-                    if tx.exec_us > 1000 {
-                        println!(
-                            "    tx[{}] {}..  {:.1}ms  ops={}  {}  {}",
-                            tx.index,
-                            &tx.hash_hex[..tx.hash_hex.len().min(12)],
-                            tx.exec_us as f64 / 1000.0,
-                            tx.op_count,
-                            if tx.is_soroban { "soroban" } else { "classic" },
-                            if tx.success { "ok" } else { "FAILED" },
-                        );
-                    }
-                }
-            }
+            print_perf_line(seq, perf, ctx.quiet, stats.ledgers_verified);
         }
     }
 
     // Update prev hash for next ledger
     *prev_ledger_hash = result.header_hash;
     Ok(())
+}
+
+/// Logs the CDP/mainnet expected header fields and per-tx CDP results after a
+/// `close_ledger` failure, so they can be diffed against the WARN log emitted by
+/// `manager.rs::commit` (which prints OUR computed fields) directly from CI output.
+///
+/// Print-only: extracted verbatim from `verify_single_ledger`'s close-failure arm.
+/// All control flow (the `stop_on_error` bail) stays in the caller.
+fn log_close_ledger_failure_diag(
+    ctx: &VerifyContext,
+    seq: u32,
+    verified_header_hash: Hash256,
+    cdp_header: &stellar_xdr::curr::LedgerHeader,
+    lcm: &stellar_xdr::curr::LedgerCloseMeta,
+) {
+    tracing::warn!(
+        target: "hash_mismatch_debug",
+        ledger_seq = seq,
+        expected_header_hash = %verified_header_hash.to_hex(),
+        expected_bucket_list_hash = %Hash256::from(cdp_header.bucket_list_hash.0).to_hex(),
+        expected_tx_result_hash = %Hash256::from(cdp_header.tx_set_result_hash.0).to_hex(),
+        expected_total_coins = cdp_header.total_coins,
+        expected_fee_pool = cdp_header.fee_pool,
+        expected_inflation_seq = cdp_header.inflation_seq,
+        expected_id_pool = cdp_header.id_pool,
+        expected_base_fee = cdp_header.base_fee,
+        expected_base_reserve = cdp_header.base_reserve,
+        expected_max_tx_set_size = cdp_header.max_tx_set_size,
+        expected_ledger_version = cdp_header.ledger_version,
+        "Pre-commit hash mismatch (replay mode) - mainnet/CDP expected fields"
+    );
+    // Per-tx CDP result diagnostic: log each tx hash + fee_charged
+    // from mainnet's recorded results so they can be diffed against
+    // our per-tx WARN log emitted from manager.rs::commit.
+    //
+    // CRITICAL: cdp envelopes (from tx_set, canonical order) and
+    // tx_processing (apply order) are NOT aligned by index. We MUST
+    // align by tx hash via extract_transaction_processing.
+    let network_id = stellar_xdr::curr::Hash(*ctx.ledger_manager.network_id().0.as_bytes());
+    let cdp_processing = henyey_history::cdp::extract_transaction_processing(lcm, &network_id);
+    for (i, info) in cdp_processing.iter().enumerate() {
+        let (op_types, declared_fee, soroban_resource_fee, soroban_resources) =
+            describe_envelope(Some(&info.envelope));
+        let op_results = describe_op_results(&info.result.result.result);
+        let (changes_count, changes_total_bytes) = summarize_cdp_meta(Some(&info.meta));
+        let diag_events = extract_diagnostic_event_summary(Some(&info.meta));
+        let changes_summary = summarize_cdp_meta_changes(Some(&info.meta));
+        tracing::warn!(
+            target: "hash_mismatch_debug",
+            ledger_seq = seq,
+            tx_index = i,
+            tx_hash = %Hash256::from_bytes(info.result.transaction_hash.0).to_hex(),
+            fee_charged = info.result.result.fee_charged,
+            result_code = ?info.result.result.result.discriminant(),
+            op_results = %op_results,
+            declared_fee = declared_fee,
+            op_types = %op_types,
+            soroban_resource_fee = soroban_resource_fee,
+            soroban_resources = %soroban_resources,
+            cdp_meta_changes_count = changes_count,
+            cdp_meta_changes_total_bytes = changes_total_bytes,
+            diag_events = %diag_events,
+            changes = %changes_summary,
+            "Per-tx result (mainnet/CDP, hash-aligned)"
+        );
+    }
+}
+
+/// Prints the per-ledger MISMATCH diagnostics (header-field diffs, tx-result
+/// hash diffs, and eviction/entry diagnostics).
+///
+/// Print-only: extracted verbatim from `verify_single_ledger`'s mismatch arm.
+/// The `stop_on_error` bail stays in the caller.
+#[allow(clippy::too_many_arguments)]
+fn print_mismatch_details(
+    ctx: &VerifyContext,
+    seq: u32,
+    our_header: &stellar_xdr::curr::LedgerHeader,
+    our_header_hash: Hash256,
+    expected_header_hash: Hash256,
+    our_tx_result_hash: Hash256,
+    expected_tx_result_hash: Hash256,
+    header_matches: bool,
+    tx_result_matches: bool,
+    our_tx_results: &[stellar_xdr::curr::TransactionResultPair],
+    cdp_tx_results: &[stellar_xdr::curr::TransactionResultPair],
+    cdp_header: &stellar_xdr::curr::LedgerHeader,
+    lcm: &stellar_xdr::curr::LedgerCloseMeta,
+) {
+    println!();
+    println!("  Ledger {}: MISMATCH", seq);
+    if !header_matches {
+        println!(
+            "    Header hash: ours={} expected={}",
+            our_header_hash.to_hex(),
+            expected_header_hash.to_hex()
+        );
+        let bucket_levels = ctx.ledger_manager.bucket_list_levels();
+        print_header_field_diffs(our_header, cdp_header, &bucket_levels);
+    }
+    if !tx_result_matches {
+        println!(
+            "    TX result hash: ours={} expected={}",
+            our_tx_result_hash.to_hex(),
+            expected_tx_result_hash.to_hex()
+        );
+    }
+
+    if ctx.show_diff && !tx_result_matches {
+        print_tx_result_diffs(our_tx_results, cdp_tx_results);
+    }
+
+    // Compare eviction data when header mismatches but TX results match
+    if !header_matches && tx_result_matches {
+        print_eviction_and_entry_diagnostics(ctx, lcm, our_header);
+    }
+}
+
+/// Prints the per-ledger performance summary line (every 64 ledgers or when slow),
+/// including cache-rate math and the top-3-slowest-tx tail.
+///
+/// Print-only: extracted verbatim from `verify_single_ledger`'s perf block. The
+/// `record_perf` stats mutation stays in the caller.
+fn print_perf_line(
+    seq: u32,
+    perf: &henyey_ledger::LedgerClosePerf,
+    quiet: bool,
+    ledgers_verified: u32,
+) {
+    // Print per-ledger summary every 64 ledgers or if slow
+    if !quiet && (ledgers_verified % 64 == 0 || perf.total_us > 500_000) {
+        let cache_rate = if perf.cache.hits + perf.cache.misses > 0 {
+            perf.cache.hits as f64 / (perf.cache.hits + perf.cache.misses) as f64 * 100.0
+        } else {
+            0.0
+        };
+        println!(
+            "\n  [PERF L{}] total={:.1}ms tx_exec={:.1}ms commit={:.1}ms \
+                 add_batch={:.1}ms eviction={:.1}ms txs={} cache={:.0}% \
+                 rss={:.0}MB",
+            seq,
+            perf.total_us as f64 / 1000.0,
+            perf.tx_exec_us as f64 / 1000.0,
+            commit_us(perf) as f64 / 1000.0,
+            perf.add_batch_us as f64 / 1000.0,
+            perf.eviction_us as f64 / 1000.0,
+            perf.tx_count,
+            cache_rate,
+            perf.rss_after_bytes as f64 / (1024.0 * 1024.0),
+        );
+        // Show top 3 slowest txs for this ledger
+        for tx in perf.tx_timings.iter().take(3) {
+            if tx.exec_us > 1000 {
+                println!(
+                    "    tx[{}] {}..  {:.1}ms  ops={}  {}  {}",
+                    tx.index,
+                    &tx.hash_hex[..tx.hash_hex.len().min(12)],
+                    tx.exec_us as f64 / 1000.0,
+                    tx.op_count,
+                    if tx.is_soroban { "soroban" } else { "classic" },
+                    if tx.success { "ok" } else { "FAILED" },
+                );
+            }
+        }
+    }
 }
 
 /// Phase 6: Print verification and performance summaries.
