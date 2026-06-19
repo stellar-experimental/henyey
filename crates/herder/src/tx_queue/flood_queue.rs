@@ -3,7 +3,7 @@
 //! The [`FloodQueue`] tracks which transactions need to be advertised to peers.
 //! It is populated on admission (via [`QueueStore::insert`]) and destructively
 //! drained by [`TransactionQueue::broadcast_with_visitor`]. This matches
-
+//!
 //! stellar-core's persistent `mTxsToFlood` inside `TxQueueLimiter`.
 //!
 //! # Design Rationale
