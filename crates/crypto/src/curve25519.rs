@@ -16,6 +16,23 @@
 //! During P2P handshake, peers generate random Curve25519 keys and sign them
 //! with their long-lived Ed25519 keys.
 //!
+//! # Retained parity surface (do not narrow or delete)
+//!
+//! The `pub` wrapper API in this module — [`Curve25519Secret`],
+//! [`Curve25519Public`], [`KeyOrdering`], their methods, and the `From` impls —
+//! is a deliberately-retained, parity-mapped surface that mirrors stellar-core's
+//! `src/crypto/Curve25519.h` (`curve25519RandomSecret` / `curve25519DerivePublic`
+//! / `curve25519DeriveSharedKey`, all tracked as Full parity in
+//! `PARITY_STATUS.md`). It is kept `pub` despite having only test-internal
+//! callers today (the overlay currently reimplements ECDH inline on raw
+//! `x25519_dalek` rather than going through these wrappers), so that a future
+//! dead-code audit does not re-flag it. It must **not** be narrowed to
+//! `pub(crate)` (that fails `-D warnings` with dead-code errors) and must
+//! **not** be deleted: [`Curve25519Secret::derive_shared_key`] is the sole live
+//! caller of the HMAC/HKDF helper chain in `hash.rs` (`hkdf_extract` →
+//! `hmac_sha256` → ...), so deleting this module would orphan and cascade-delete
+//! that Full-parity surface.
+//!
 //! # Example
 //!
 //! ```

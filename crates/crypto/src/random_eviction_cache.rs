@@ -61,13 +61,11 @@ impl<K: Eq + Hash + Clone, V> RandomEvictionCache<K, V> {
     /// Matches stellar-core's `maybeGet()` which increments the generation
     /// counter and records it on the accessed entry.
     pub fn get(&mut self, key: &K) -> Option<&V> {
-        // We need to do a two-step lookup to satisfy the borrow checker:
-        // first check existence, then mutate.
-        if !self.map.contains_key(key) {
-            return None;
-        }
+        // `map` and `generation` are disjoint fields, so a single `get_mut`
+        // split-borrow suffices: `?` returns `None` on a miss before any
+        // generation bump, and on a hit we bump once and stamp the entry.
+        let entry = self.map.get_mut(key)?;
         self.generation += 1;
-        let entry = self.map.get_mut(key).unwrap();
         entry.last_access = self.generation;
         Some(&entry.value)
     }
