@@ -66,12 +66,13 @@ pub struct HistoryWorkIds {
 /// # Example
 ///
 /// ```rust,ignore
-/// use henyey_historywork::{HistoryWorkBuilder, SharedHistoryState};
+/// use henyey_historywork::{HistoryWorkBuilder, HistoryWorkState};
 /// use henyey_work::WorkScheduler;
 /// use std::sync::Arc;
+/// use tokio::sync::Mutex;
 ///
 /// // Create shared state and builder
-/// let state: SharedHistoryState = Default::default();
+/// let state = Arc::new(Mutex::new(HistoryWorkState::default()));
 /// let builder = HistoryWorkBuilder::new(archive.clone(), checkpoint, state.clone());
 ///
 /// // Register download work items

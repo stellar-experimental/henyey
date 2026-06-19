@@ -52,7 +52,7 @@ Corresponds to: `GetHistoryArchiveStateWork.h`
 | stellar-core | Rust | Status |
 |--------------|------|--------|
 | `GetHistoryArchiveStateWork(app, seq, archive, report, maxRetries)` | `GetHistoryArchiveStateWork { archive, checkpoint, state }` | Full |
-| `getHistoryArchiveState()` | `SharedHistoryState.has` | Full |
+| `getHistoryArchiveState()` | `HistoryWorkState.has` | Full |
 | `getArchive()` | `GetHistoryArchiveStateWork.archive` | Full |
 | `getStatus()` | `get_progress()` / `HistoryWorkProgress` | Full |
 | `doWork()` | `Work::run()` | Full |

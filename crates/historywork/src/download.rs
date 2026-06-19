@@ -208,7 +208,7 @@ impl Work for DownloadBucketsWork {
         let to_download: Vec<_> = hashes
             .iter()
             .filter(|hash| {
-                let path = bucket_dir.join(canonical_bucket_filename(&hash));
+                let path = bucket_dir.join(canonical_bucket_filename(hash));
                 !path.exists()
             })
             .cloned()
