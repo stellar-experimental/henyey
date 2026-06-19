@@ -22,7 +22,7 @@ graph TD
     TX[DownloadTransactionsWork]
     RES[DownloadTxResultsWork]
     SCP[DownloadScpHistoryWork]
-    STATE[SharedHistoryState]
+    STATE[HistoryWorkState]
     DATA[build_checkpoint_data]
 
     HAS --> BKT
@@ -44,8 +44,7 @@ graph TD
 
 | Type | Description |
 |------|-------------|
-| `HistoryWorkState` | Shared single-checkpoint state holding HAS, bucket directory, downloaded XDR payloads, and progress. |
-| `SharedHistoryState` | `Arc<Mutex<HistoryWorkState>>` handle shared across work items. |
+| `HistoryWorkState` | Shared single-checkpoint state holding HAS, bucket directory, downloaded XDR payloads, and progress. Wrapped in an `Arc<Mutex<HistoryWorkState>>` handle shared across work items (internally aliased as the crate-private `SharedHistoryState`). |
 | `HistoryWorkStage` | Progress enum covering HAS, bucket, header, transaction, result, and SCP download stages. |
 | `HistoryWorkProgress` | Human-readable progress snapshot returned by `get_progress()`. |
 | `HistoryWorkBuilder` | Registers the checkpoint download DAG with a `WorkScheduler`. |
@@ -61,14 +60,15 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use henyey_history::archive::HistoryArchive;
-use henyey_historywork::{build_checkpoint_data, HistoryWorkBuilder, SharedHistoryState};
+use henyey_historywork::{build_checkpoint_data, HistoryWorkBuilder, HistoryWorkState};
 use henyey_work::{WorkScheduler, WorkSchedulerConfig};
+use tokio::sync::Mutex;
 
 # async fn example() -> anyhow::Result<()> {
 let archive = Arc::new(HistoryArchive::new(
     "https://history.stellar.org/prd/core-testnet/core_testnet_001",
 )?);
-let state: SharedHistoryState = Default::default();
+let state = Arc::new(Mutex::new(HistoryWorkState::default()));
 let builder = HistoryWorkBuilder::new(
     archive,
     63,
@@ -89,9 +89,12 @@ assert_eq!(checkpoint.has.current_ledger, 63);
 ### Monitor progress
 
 ```rust
-use henyey_historywork::{get_progress, HistoryWorkStage, SharedHistoryState};
+use std::sync::Arc;
 
-# async fn example(state: SharedHistoryState) {
+use henyey_historywork::{get_progress, HistoryWorkStage, HistoryWorkState};
+use tokio::sync::Mutex;
+
+# async fn example(state: Arc<Mutex<HistoryWorkState>>) {
 let progress = get_progress(&state).await;
 if let Some(HistoryWorkStage::DownloadBuckets) = progress.stage {
     tracing::info!(message = %progress.message, "history download progress");
@@ -102,9 +105,12 @@ if let Some(HistoryWorkStage::DownloadBuckets) = progress.stage {
 ### Consume assembled checkpoint data
 
 ```rust
-use henyey_historywork::{build_checkpoint_data, SharedHistoryState};
+use std::sync::Arc;
 
-# async fn example(state: SharedHistoryState) -> anyhow::Result<()> {
+use henyey_historywork::{build_checkpoint_data, HistoryWorkState};
+use tokio::sync::Mutex;
+
+# async fn example(state: Arc<Mutex<HistoryWorkState>>) -> anyhow::Result<()> {
 let checkpoint_data = build_checkpoint_data(&state).await?;
 
 // Pass the verified checkpoint data to catchup code without cloning the XDR.
@@ -125,7 +131,7 @@ assert!(!checkpoint_data.headers.is_empty());
 
 - Buckets are verified and written to disk during download so catchup does not
   keep multi-GB bucket payloads resident in memory.
-- `build_checkpoint_data()` moves data out of `SharedHistoryState`; callers
+- `build_checkpoint_data()` moves data out of the shared `HistoryWorkState`; callers
   should invoke it once after all scheduled work has completed.
 - Retry budgets come from `henyey_history::download` constants so the work DAG
   follows the same `RETRY_A_FEW` and `RETRY_A_LOT` policy as catchup.

@@ -40,8 +40,8 @@
 //!             └─────────────┘ └─────────────┘
 //! ```
 //!
-//! All work items share state through [`SharedHistoryState`], a thread-safe container
-//! that accumulates downloaded data as work progresses.
+//! All work items share state through a thread-safe `Arc<Mutex<`[`HistoryWorkState`]`>>`
+//! handle that accumulates downloaded data as work progresses.
 //!
 //! # Usage
 //!
@@ -50,12 +50,14 @@
 //! Use [`HistoryWorkBuilder`] to register download work items with a scheduler:
 //!
 //! ```rust,ignore
-//! use henyey_historywork::{HistoryWorkBuilder, SharedHistoryState};
+//! use henyey_historywork::{HistoryWorkBuilder, HistoryWorkState};
 //! use henyey_work::{WorkScheduler, WorkSchedulerConfig};
+//! use std::sync::Arc;
 //! use std::path::PathBuf;
+//! use tokio::sync::Mutex;
 //!
 //! // Create shared state for work items
-//! let state: SharedHistoryState = Default::default();
+//! let state = Arc::new(Mutex::new(HistoryWorkState::default()));
 //!
 //! // Build and register work items
 //! let builder = HistoryWorkBuilder::new(
@@ -109,9 +111,9 @@ pub use builder::{HistoryWorkBuilder, HistoryWorkIds};
 ///
 /// # Thread Safety
 ///
-/// This type is wrapped in [`SharedHistoryState`] (an `Arc<Mutex<...>>`) for
-/// safe sharing between concurrent work items. Work items acquire the lock
-/// briefly to read dependencies or write their output.
+/// This type is wrapped in an `Arc<Mutex<...>>` for safe sharing between
+/// concurrent work items. Work items acquire the lock briefly to read
+/// dependencies or write their output.
 ///
 /// # Fields
 ///
@@ -166,20 +168,27 @@ pub struct HistoryWorkState {
 
 /// Thread-safe handle to shared history work state.
 ///
-/// This type alias wraps [`HistoryWorkState`] in an `Arc<Mutex<...>>` for
-/// safe sharing between work items. Use `state.lock().await` to access
-/// the underlying state.
+/// Internal crate-private alias wrapping [`HistoryWorkState`] in an
+/// `Arc<Mutex<...>>` for safe sharing between work items. The public functions
+/// and [`HistoryWorkBuilder`] accept this handle as a plain
+/// `Arc<Mutex<HistoryWorkState>>`; external callers construct it directly rather
+/// than importing this alias name. Use `state.lock().await` to access the
+/// underlying state.
 ///
 /// # Example
 ///
 /// ```rust,ignore
-/// let state: SharedHistoryState = Default::default();
+/// use henyey_historywork::HistoryWorkState;
+/// use std::sync::Arc;
+/// use tokio::sync::Mutex;
+///
+/// let state = Arc::new(Mutex::new(HistoryWorkState::default()));
 ///
 /// // In a work item:
 /// let mut guard = state.lock().await;
 /// guard.has = Some(downloaded_has);
 /// ```
-pub type SharedHistoryState = Arc<Mutex<HistoryWorkState>>;
+pub(crate) type SharedHistoryState = Arc<Mutex<HistoryWorkState>>;
 
 /// Identifies the current stage of history work execution.
 ///
