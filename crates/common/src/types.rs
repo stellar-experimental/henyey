@@ -121,7 +121,7 @@ impl Hash256 {
     /// Prefer [`hash_xdr`] in production code where encoding failure is an
     /// invariant violation. Use this only when the caller genuinely needs to
     /// handle the error (e.g. encoding untrusted or partially-constructed data).
-    pub fn try_hash_xdr<T: stellar_xdr::curr::WriteXdr>(
+    pub(crate) fn try_hash_xdr<T: stellar_xdr::curr::WriteXdr>(
         value: &T,
     ) -> Result<Self, stellar_xdr::curr::Error> {
         use stellar_xdr::curr::Limited;

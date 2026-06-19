@@ -96,12 +96,19 @@ Corresponds to: `numeric.h`, `numeric128.h`
 | `doubleToClampedUint32()` | `double_to_clamped_u32()` | Full |
 | `bigDivide()` | `big_divide()` | Full |
 | `bigDivideUnsigned()` | `big_divide_unsigned()` | Full |
-| `bigSquareRoot()` | `big_square_root()` | Full |
+| `bigSquareRoot()` | — | N/A |
 | `saturatingMultiply()` | `saturating_multiply()` | Full |
 | `bigDivide128()` | `big_divide_128()` | Full |
 | `bigDivideUnsigned128()` | `big_divide_unsigned_128()` | Full |
 | `bigMultiplyUnsigned()` | `big_multiply_unsigned()` | Full |
-| `bigMultiply()` | `big_multiply()` | Full |
+| `bigMultiply()` | — | N/A |
+
+> **N/A — `bigSquareRoot()` / `bigMultiply()`:** the `henyey-common` placeholders
+> were never wired to production and have been removed. The live numeric paths use
+> distinct `henyey-tx`-local helpers with different signatures
+> (`offer_exchange.rs::big_multiply` → `i128` saturating; `liquidity_pool.rs::big_square_root`
+> on `i64`), so a shared `henyey-common` implementation is not currently consumed.
+> Reintroduce a unified helper if a shared consumer appears.
 
 ### resource (`resource.rs`)
 
