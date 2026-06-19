@@ -482,7 +482,7 @@ impl ApplyLoad {
             let result = self.tx_gen.invoke_soroban_load_transaction(
                 ledger_num,
                 account_id,
-                &load_instance,
+                load_instance,
                 Some(1_000_000),
             );
 
@@ -1227,7 +1227,7 @@ impl ApplyLoad {
                         ledger_num,
                         account_idx,
                         &self.batch_transfer_instances[cluster_id as usize],
-                        &sac_instance,
+                        sac_instance,
                         destinations,
                         None,
                     )?;
@@ -1246,7 +1246,7 @@ impl ApplyLoad {
                     ledger_num,
                     account_idx,
                     to_address,
-                    &sac_instance,
+                    sac_instance,
                     100,
                     None,
                 )?;
@@ -1399,7 +1399,7 @@ impl ApplyLoad {
             }),
             // 11: CONFIG_SETTING_CONTRACT_EXECUTION_LANES
             ConfigSettingEntry::ContractExecutionLanes(ConfigSettingContractExecutionLanesV0 {
-                ledger_max_tx_count: ledger_max_tx_count,
+                ledger_max_tx_count,
             }),
             // 14: CONFIG_SETTING_CONTRACT_PARALLEL_COMPUTE_V0
             ConfigSettingEntry::ContractParallelComputeV0(ConfigSettingContractParallelComputeV0 {

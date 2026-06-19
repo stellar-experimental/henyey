@@ -564,7 +564,7 @@ impl TxGenerator {
                 }
             } else {
                 let name = format!("TestAccount-{}", account_id);
-                let initial_seq = (ledger_num as i64) << 32;
+                let initial_seq = (ledger_num as i64) << INITIAL_SEQ_LEDGER_SHIFT;
                 let mut account = TestAccount::from_name(&name, initial_seq);
                 // Try to load real sequence from DB
                 match self.app.load_account_sequence(&account.account_id) {
@@ -613,7 +613,7 @@ impl TxGenerator {
         balance: i64,
     ) -> Vec<Operation> {
         let mut ops = Vec::with_capacity(count as usize);
-        let initial_seq = (ledger_num as i64) << 32;
+        let initial_seq = (ledger_num as i64) << INITIAL_SEQ_LEDGER_SHIFT;
         for i in start..start + count {
             let name = format!("TestAccount-{}", i);
             let account = TestAccount::from_name(&name, initial_seq);
@@ -1038,10 +1038,7 @@ impl TxGenerator {
     ) -> anyhow::Result<(u64, TransactionEnvelope)> {
         let fee = self.generate_fee(max_fee_rate, 1, source_account_id);
         let sac_address = make_contract_address(&sac_instance.contract_id);
-        let dest_vals: Vec<ScVal> = destinations
-            .into_iter()
-            .map(|a| ScVal::Address(a))
-            .collect();
+        let dest_vals: Vec<ScVal> = destinations.into_iter().map(ScVal::Address).collect();
         let (sk, seq) = self.next_source_sequence(source_account_id, ledger_num);
         let builder = self.soroban_builder();
         let envelope = builder.invoke_batch_transfer_tx(

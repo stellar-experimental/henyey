@@ -34,6 +34,7 @@ impl PregeneratedTxReader {
     }
 
     /// Construct a reader over an in-memory record-marked buffer (testing).
+    #[cfg(test)]
     pub fn from_bytes(data: Vec<u8>) -> Self {
         Self { data, offset: 0 }
     }
