@@ -96,20 +96,17 @@ assert!(maybe_entry.is_none());
 # Ok::<(), henyey_ledger::LedgerError>(())
 ```
 
-### Use ledger helpers for fees and reserves
+### Use ledger helpers for reserves
 
 ```rust
-use henyey_ledger::{fees, reserves};
-use stellar_xdr::curr::{AccountEntry, Transaction};
+use henyey_ledger::reserves;
+use stellar_xdr::curr::AccountEntry;
 
-let tx: Transaction = todo!();
 let account: AccountEntry = todo!();
 
-let charged_fee = fees::calculate_fee(&tx, 100);
 let min_balance = reserves::minimum_balance(&account, 5_000_000);
 let available = reserves::available_to_send(&account, 5_000_000);
 
-assert!(charged_fee as i64 <= account.balance);
 assert!(available <= account.balance - min_balance);
 ```
 
@@ -117,7 +114,7 @@ assert!(available <= account.balance - min_balance);
 
 | Module | Description |
 |--------|-------------|
-| `lib.rs` | Public exports plus lightweight fee, reserve, and trustline helpers. |
+| `lib.rs` | Public exports plus lightweight reserve and trustline helpers. |
 | `manager.rs` | `LedgerManager`, startup cache scans, bucket-list installation, and close/commit orchestration. |
 | `close.rs` | Ledger-close inputs and outputs, transaction-set preparation, upgrade context, and perf/stat structs. |
 | `delta.rs` | Change coalescing, fee deduction helpers, and bucket-update categorization. |

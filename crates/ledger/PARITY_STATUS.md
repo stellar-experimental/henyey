@@ -113,7 +113,7 @@ Corresponds to: `LedgerHeaderUtils.h`
 | Header hash computation | `compute_header_hash()` | Full |
 | Skip list computation | `calculate_skip_values()` | Full |
 | Next header creation | `create_next_header()` | Full |
-| Protocol version utilities | `protocol_version()`, `is_before_protocol_version()` | Full |
+| Protocol version utilities | `protocol_version()` | Full |
 | Close time extraction | `close_time()` | Full |
 | `LedgerHeaderUtils::storeInDatabase()` | Not applicable (no SQL) | None |
 | `LedgerHeaderUtils::loadByHash()` | Not applicable (no SQL) | None |
@@ -254,7 +254,7 @@ Corresponds to: `LedgerTxn.h` (offer comparison subset)
 
 | stellar-core | Rust | Status |
 |--------------|------|--------|
-| `isBetterOffer()` | `is_better_offer()` | Full |
+| `isBetterOffer()` | `Ord` impl on `OfferDescriptor` | Full |
 | `OfferDescriptor` | `OfferDescriptor` | Full |
 | `IsBetterOfferComparator` | `Ord` impl on `OfferDescriptor` | Full |
 | `AssetPair` | `AssetPair` | Full |
@@ -297,13 +297,9 @@ Corresponds to: Fee/reserve logic in `LedgerManager.h`
 | stellar-core | Rust | Status |
 |--------------|------|--------|
 | `getLastMinBalance()` | `reserves::minimum_balance()` | Full |
-| Fee calculation | `fees::calculate_fee()` | Full |
-| Available balance for fees | `fees::available_balance()` | Full |
 | Selling liabilities | `reserves::selling_liabilities()` | Full |
 | Buying liabilities | `reserves::buying_liabilities()` | Full |
 | Available to send | `reserves::available_to_send()` | Full |
-| Available to receive | `reserves::available_to_receive()` | Full |
-| Sub-entry affordability | `reserves::can_add_sub_entry()` | Full |
 
 ### lib.rs -- trustlines module (`lib.rs`)
 
@@ -316,7 +312,6 @@ Corresponds to: `TrustLineWrapper.h` (balance constraint subset)
 | `TrustLineWrapper::getBuyingLiabilities()` | `trustlines::buying_liabilities()` | Full |
 | `TrustLineWrapper::getSellingLiabilities()` | `trustlines::selling_liabilities()` | Full |
 | `TrustLineWrapper::getAvailableBalance()` | `trustlines::available_to_send()` | Full |
-| `TrustLineWrapper::getMaxAmountReceive()` | `trustlines::available_to_receive()` | Full |
 | `TrustLineWrapper::isAuthorized()` | Via flag checks in tx crate | Full |
 
 ## Intentional Omissions
@@ -442,12 +437,12 @@ The ledger crate has been verified against testnet for ledger close correctness.
 
 | Category | Count |
 |----------|-------|
-| Implemented (Full) | 139 |
+| Implemented (Full) | 134 |
 | Gaps (None + Partial) | 9 |
 | Intentional Omissions | 30 |
-| **Parity** | **139 / (139 + 9) = 94%** |
+| **Parity** | **134 / (134 + 9) = 94%** |
 
-The 139 implemented items cover: LedgerManager core operations (31, including `applySorobanStages`, `applySorobanStageClustersInParallel`, `applyThread`, `getModuleCache`), header utilities (8), delta/change tracking (13), close data (8), snapshots (8), execution pipeline (28, including `commonPreApply`/`preParallelApply`/`parallelApply` and all v20-v26 network-config synthesis paths), config upgrade (6), offer utilities (5), in-memory Soroban state (15), fee/reserve calculations (8), trustline utilities (7), CloseLedgerState merged reads with `EntryReader` (1), module cache rebuild (1 — partial, not counted here).
+The 134 implemented items cover: LedgerManager core operations (31, including `applySorobanStages`, `applySorobanStageClustersInParallel`, `applyThread`, `getModuleCache`), header utilities (8), delta/change tracking (13), close data (8), snapshots (8), execution pipeline (28, including `commonPreApply`/`preParallelApply`/`parallelApply` and all v20-v26 network-config synthesis paths), config upgrade (6), offer utilities (5), in-memory Soroban state (15), fee/reserve calculations (4), trustline utilities (6), CloseLedgerState merged reads with `EntryReader` (1), module cache rebuild (1 — partial, not counted here).
 
 The 8 gap items include: timing utilities (2), metrics methods (2), multi-threaded module cache compilation (1 Partial), CompleteConstLedgerState (1 Partial), prefetch (1), and meta streaming (1).
 

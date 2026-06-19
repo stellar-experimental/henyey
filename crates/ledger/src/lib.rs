@@ -36,11 +36,10 @@
 //! - **Contract data**: Soroban smart contract storage (Protocol 20+)
 //! - **Contract code**: Soroban WASM bytecode (Protocol 20+)
 //!
-//! # Fee and Reserve Calculations
+//! # Reserve Calculations
 //!
-//! The [`fees`] and [`reserves`] modules provide utilities for calculating:
+//! The [`reserves`] module provides utilities for calculating:
 //!
-//! - Transaction fees based on operation count and base fee
 //! - Account minimum balances based on sub-entries and sponsorship
 //! - Available balance for spending (accounting for reserves and liabilities)
 //!
@@ -89,7 +88,7 @@ mod soroban_state;
 // Re-export main types
 pub use close::{
     CachePerfStats, LedgerCloseData, LedgerClosePerf, LedgerCloseResult, LedgerCloseStats,
-    SorobanPhaseStructure, SortState, TransactionSetVariant, TxPerf, TxWithFee, UpgradeContext,
+    SorobanPhaseStructure, TransactionSetVariant, TxPerf, UpgradeContext,
 };
 pub use close_state::CloseLedgerState;
 pub use config_upgrade::{ConfigUpgradeSetFrame, ConfigUpgradeValidity};
@@ -101,14 +100,13 @@ pub use execution::{
     SorobanNetworkInfo,
 };
 pub use header::{
-    calculate_skip_values, close_time, compute_header_hash, create_next_header,
-    is_before_protocol_version, protocol_version, verify_header_chain, SKIP_1, SKIP_2, SKIP_3,
-    SKIP_4, SKIP_LIST_SIZE,
+    calculate_skip_values, close_time, compute_header_hash, create_next_header, protocol_version,
+    verify_header_chain,
 };
 pub use manager::build_genesis_soroban_config_entries;
 pub use manager::new_bucket_list_with_soroban_config;
 pub use manager::{
-    prepend_fee_event, scan_level_pairs_for_caches, CacheInitResult, HeaderSnapshot, LedgerManager,
+    prepend_fee_event, scan_level_pairs_for_caches, HeaderSnapshot, LedgerManager,
     LedgerManagerConfig,
 };
 pub use memory_report::log_startup_memory;
@@ -117,10 +115,7 @@ pub use snapshot::{
     EntriesLookupFn, EntryLookupFn, LedgerSnapshot, PoolShareTrustlinesByAccountFn,
     SnapshotBuilder, SnapshotHandle,
 };
-pub use soroban_state::{
-    ContractCodeMapEntry, ContractDataMapEntry, InMemorySorobanState, SharedSorobanState,
-    SorobanRentConfig, SorobanStateStats, TtlData,
-};
+pub use soroban_state::{InMemorySorobanState, SharedSorobanState};
 
 /// Result type for ledger operations.
 ///
@@ -182,92 +177,6 @@ impl From<&stellar_xdr::curr::LedgerHeader> for LedgerInfo {
             base_reserve: header.base_reserve,
             protocol_version: header.ledger_version,
         }
-    }
-}
-
-/// Fee calculation utilities for transaction processing.
-///
-/// This module provides functions for computing transaction fees and checking
-/// whether accounts have sufficient balance to pay fees. All fees are
-/// denominated in stroops (1 XLM = 10,000,000 stroops).
-///
-/// # Fee Model
-///
-/// Stellar uses a simple fee model where fees are charged per operation:
-///
-/// - **Base fee**: Network-wide minimum fee per operation (typically 100 stroops)
-/// - **Transaction fee**: `num_operations * base_fee` (minimum)
-/// - **Surge pricing**: During high load, fees may exceed the base fee
-///
-/// The transaction's `fee` field represents the maximum the sender is willing
-/// to pay. The actual charged fee is the minimum of this and the required fee.
-pub mod fees {
-    use stellar_xdr::curr::{AccountEntry, Transaction};
-
-    /// Calculate the fee for a transaction.
-    ///
-    /// Computes the minimum required fee based on operation count and base fee.
-    /// The actual charged fee is capped by the transaction's declared maximum.
-    ///
-    /// # Arguments
-    ///
-    /// * `tx` - The transaction to calculate fees for
-    /// * `base_fee` - The network base fee per operation in stroops
-    ///
-    /// # Returns
-    ///
-    /// The fee amount in stroops that would be charged for this transaction.
-    ///
-    /// # Limitations
-    ///
-    /// This is a simplified utility for classic transactions only. For fee-bump
-    /// transactions, use the outer fee. For Soroban transactions, the actual fee
-    /// includes the resource fee from `SorobanTransactionData`. The authoritative
-    /// fee charging happens in `processFeeSeqNum` during ledger close, not here.
-    pub fn calculate_fee(tx: &Transaction, base_fee: u32) -> u64 {
-        let num_ops = tx.operations.len() as u64;
-        let min_fee = num_ops * base_fee as u64;
-
-        // The transaction's fee field is the maximum the user is willing to pay.
-        // The actual charge is min(declared_fee, num_ops * base_fee).
-        std::cmp::min(tx.fee as u64, min_fee)
-    }
-
-    /// Check if an account can afford the fee.
-    ///
-    /// This checks the available balance (after accounting for selling liabilities)
-    /// against the required fee amount.
-    ///
-    /// # Note
-    ///
-    /// This is a simplified check that doesn't account for minimum balance
-    /// requirements. Use `reserves::available_to_send` for a complete check.
-    pub fn can_afford_fee(account: &AccountEntry, fee: u64) -> bool {
-        // Account must have enough XLM to pay the fee
-        // considering selling liabilities
-        let available = available_balance(account);
-        available >= fee as i64
-    }
-
-    /// Calculate the available balance for fee payment.
-    ///
-    /// Returns the account balance minus selling liabilities. This represents
-    /// the maximum amount that could be used for fees without affecting
-    /// outstanding offers.
-    ///
-    /// # Note
-    ///
-    /// This does not subtract the minimum balance requirement. The returned
-    /// value may exceed what's actually spendable.
-    pub fn available_balance(account: &AccountEntry) -> i64 {
-        let selling_liabilities = match &account.ext {
-            stellar_xdr::curr::AccountEntryExt::V0 => 0,
-            stellar_xdr::curr::AccountEntryExt::V1(v1) => v1.liabilities.selling,
-        };
-
-        // Available = balance - selling_liabilities
-        // (reserves are checked separately)
-        account.balance - selling_liabilities
     }
 }
 
@@ -392,47 +301,6 @@ pub mod reserves {
             .saturating_sub(min_bal)
             .saturating_sub(sell_liab)
     }
-
-    /// Calculate the available capacity to receive XLM.
-    ///
-    /// This is the maximum amount of XLM that can be received by the account
-    /// before hitting the maximum balance limit (i64::MAX stroops).
-    ///
-    /// # Formula
-    ///
-    /// `i64::MAX - balance - buying_liabilities`
-    ///
-    /// # Returns
-    ///
-    /// The available receiving capacity in stroops.
-    pub fn available_to_receive(account: &AccountEntry) -> i64 {
-        let buy_liab = buying_liabilities(account);
-        i64::MAX
-            .saturating_sub(account.balance)
-            .saturating_sub(buy_liab)
-    }
-
-    /// Check if an account can afford to add a new sub-entry.
-    ///
-    /// Adding a sub-entry (trustline, offer, signer, or data entry) increases
-    /// the minimum balance requirement by one base reserve. This function
-    /// checks whether the account has sufficient balance to support the new entry.
-    ///
-    /// # Arguments
-    ///
-    /// * `account` - The account to check
-    /// * `base_reserve` - The network base reserve in stroops
-    ///
-    /// # Returns
-    ///
-    /// `true` if the account can afford the additional reserve requirement.
-    pub fn can_add_sub_entry(account: &AccountEntry, base_reserve: u32) -> bool {
-        let current_min = minimum_balance(account, base_reserve);
-        let new_min = current_min + base_reserve as i64;
-        let sell_liab = selling_liabilities(account);
-
-        account.balance >= new_min + sell_liab
-    }
 }
 
 /// Trustline liability and balance constraint utilities.
@@ -489,21 +357,6 @@ pub mod trustlines {
         trustline
             .balance
             .saturating_sub(selling_liabilities(trustline))
-    }
-
-    /// Calculate the available capacity to receive on a trustline.
-    ///
-    /// This is the maximum amount of the asset that can be received before
-    /// hitting the trustline limit, accounting for buying liabilities.
-    ///
-    /// # Formula
-    ///
-    /// `limit - balance - buying_liabilities`
-    pub fn available_to_receive(trustline: &TrustLineEntry) -> i64 {
-        trustline
-            .limit
-            .saturating_sub(trustline.balance)
-            .saturating_sub(buying_liabilities(trustline))
     }
 
     /// Check if adding `delta` to selling liabilities would be valid.
@@ -799,43 +652,6 @@ mod tests {
         assert_eq!(reserves::buying_liabilities(&v1), 500);
     }
 
-    /// Buying liabilities constrain available_to_receive.
-    /// Parity: LiabilitiesTests.cpp:451 "cannot increase liabilities above INT64_MAX minus balance"
-    #[test]
-    fn test_buying_liabilities_constrain_available_to_receive() {
-        // No liabilities: can receive up to i64::MAX - balance
-        let a = create_account_with_liabilities(100_000_000, 0, 0, 0);
-        assert_eq!(reserves::available_to_receive(&a), i64::MAX - 100_000_000);
-
-        // With buying liabilities: capacity reduced
-        let b = create_account_with_liabilities(100_000_000, 0, 0, 50_000_000);
-        assert_eq!(
-            reserves::available_to_receive(&b),
-            i64::MAX - 100_000_000 - 50_000_000
-        );
-
-        // Maximum buying liabilities: no room left
-        let c = create_account_with_liabilities(100_000_000, 0, 0, i64::MAX - 100_000_000);
-        assert_eq!(reserves::available_to_receive(&c), 0);
-    }
-
-    /// Limiting values for buying liabilities.
-    /// Parity: LiabilitiesTests.cpp:520 "limiting values"
-    #[test]
-    fn test_buying_liabilities_limiting_values() {
-        // INT64_MAX balance: cannot receive anything more
-        let max_bal = create_account_with_liabilities(i64::MAX, 0, 0, 0);
-        assert_eq!(reserves::available_to_receive(&max_bal), 0);
-
-        // INT64_MAX - 1 balance: can receive 1
-        let near_max = create_account_with_liabilities(i64::MAX - 1, 0, 0, 0);
-        assert_eq!(reserves::available_to_receive(&near_max), 1);
-
-        // Half balance, half buying liabilities: can receive 1
-        let half = create_account_with_liabilities(i64::MAX / 2, 0, 0, i64::MAX / 2);
-        assert_eq!(reserves::available_to_receive(&half), 1);
-    }
-
     /// Buying liabilities do not affect available_to_send.
     #[test]
     fn test_buying_liabilities_do_not_affect_sending() {
@@ -853,16 +669,6 @@ mod tests {
     // and new_balance + buying_liab <= INT64_MAX (for increases).
     // We test these constraints via available_to_send / available_to_receive.
     // =========================================================================
-
-    /// Balance can increase from below minimum.
-    /// Parity: LiabilitiesTests.cpp:920 "can increase balance from below minimum"
-    #[test]
-    fn test_balance_increase_from_below_minimum() {
-        // Account below reserve can receive funds (balance stays or increases)
-        let below = create_account_with_liabilities(min_balance(0) - 1, 0, 0, 0);
-        // Available to receive is still very large
-        assert!(reserves::available_to_receive(&below) > 0);
-    }
 
     /// Balance cannot decrease below reserve plus selling liabilities.
     /// Parity: LiabilitiesTests.cpp:939 "cannot decrease balance below reserve plus selling liabilities"
@@ -889,60 +695,10 @@ mod tests {
         assert_eq!(reserves::available_to_send(&maxed, BASE_RESERVE), 0);
     }
 
-    /// Balance cannot increase above INT64_MAX minus buying liabilities.
-    /// Parity: LiabilitiesTests.cpp:967 "cannot increase balance above INT64_MAX minus buying liabilities"
-    #[test]
-    fn test_balance_cannot_exceed_max_minus_buying() {
-        // Maximum balance, no liabilities: can't receive
-        let at_max = create_account_with_liabilities(i64::MAX, 0, 0, 0);
-        assert_eq!(reserves::available_to_receive(&at_max), 0);
-
-        // Below max, no liabilities: can receive 1
-        let near_max = create_account_with_liabilities(i64::MAX - 1, 0, 0, 0);
-        assert_eq!(reserves::available_to_receive(&near_max), 1);
-
-        // Below max, with buying liabilities: reduced capacity
-        let with_buy = create_account_with_liabilities(i64::MAX - 2, 0, 0, 1);
-        assert_eq!(reserves::available_to_receive(&with_buy), 1);
-
-        // Buying liabilities consume all capacity
-        let full = create_account_with_liabilities(i64::MAX - 1, 0, 0, 1);
-        assert_eq!(reserves::available_to_receive(&full), 0);
-    }
-
     // =========================================================================
     // P1-6: Account add sub-entries
     // Parity: LiabilitiesTests.cpp:989 "account add subentries"
     // =========================================================================
-
-    #[test]
-    fn test_can_add_sub_entry_basic() {
-        // Account with enough balance: can add
-        let account = create_test_account(min_balance(0) + BASE_RESERVE as i64, 0);
-        assert!(reserves::can_add_sub_entry(&account, BASE_RESERVE));
-
-        // Account at min balance: cannot add (needs one more base_reserve)
-        let at_min = create_test_account(min_balance(0), 0);
-        assert!(!reserves::can_add_sub_entry(&at_min, BASE_RESERVE));
-
-        // Account below min balance: cannot add
-        let below_min = create_test_account(min_balance(0) - 1, 0);
-        assert!(!reserves::can_add_sub_entry(&below_min, BASE_RESERVE));
-    }
-
-    /// Sub-entry addition with selling liabilities.
-    /// Parity: LiabilitiesTests.cpp:1119 "cannot increase sub entries when balance is insufficient"
-    #[test]
-    fn test_can_add_sub_entry_with_selling_liabilities() {
-        // Balance = min(0) + reserve + 100, selling = 100: can add
-        let a =
-            create_account_with_liabilities(min_balance(0) + BASE_RESERVE as i64 + 100, 0, 100, 0);
-        assert!(reserves::can_add_sub_entry(&a, BASE_RESERVE));
-
-        // Balance = min(0) + reserve, selling = 1: cannot add (selling eats into reserve)
-        let b = create_account_with_liabilities(min_balance(0) + BASE_RESERVE as i64, 0, 1, 0);
-        assert!(!reserves::can_add_sub_entry(&b, BASE_RESERVE));
-    }
 
     /// Can always decrease sub-entries (removing returns reserve).
     /// Parity: LiabilitiesTests.cpp:1104 "can decrease sub entries when below min balance"
@@ -975,8 +731,6 @@ mod tests {
         );
         // min_balance = (2+0+0-2)*5M = 0
         assert_eq!(reserves::minimum_balance(&sponsored, BASE_RESERVE), 0);
-        // can_add_sub_entry: new_min = 0 + 5M = 5M, balance = 5M, sell=0 → 5M >= 5M+0
-        assert!(reserves::can_add_sub_entry(&sponsored, BASE_RESERVE));
     }
 
     // =========================================================================
@@ -1042,42 +796,6 @@ mod tests {
         );
     }
 
-    /// Account available limit: considers buying liabilities.
-    /// Parity: LiabilitiesTests.cpp:1336 "account available limit"
-    #[test]
-    fn test_account_available_limit_comprehensive() {
-        // No liabilities: can receive up to MAX - balance
-        assert_eq!(
-            reserves::available_to_receive(&create_account_with_liabilities(1000, 0, 0, 0)),
-            i64::MAX - 1000
-        );
-
-        // Buying liabilities reduce receive capacity
-        assert_eq!(
-            reserves::available_to_receive(&create_account_with_liabilities(1000, 0, 0, 500)),
-            i64::MAX - 1500
-        );
-
-        // At max: nothing receivable
-        assert_eq!(
-            reserves::available_to_receive(&create_account_with_liabilities(i64::MAX, 0, 0, 0)),
-            0
-        );
-
-        // Selling liabilities don't affect receive capacity
-        assert_eq!(
-            reserves::available_to_receive(&create_account_with_liabilities(1000, 0, 500, 0)),
-            i64::MAX - 1000
-        );
-
-        // With sub-entries: available to receive is not affected by min_balance
-        // (buying capacity is just MAX - balance - buying_liab)
-        assert_eq!(
-            reserves::available_to_receive(&create_account_with_liabilities(1000, 5, 0, 0)),
-            i64::MAX - 1000
-        );
-    }
-
     /// Sponsorship interactions with available balance.
     /// Parity: LiabilitiesTests.cpp sponsoring/sponsored loops in addSellingLiabilities
     #[test]
@@ -1110,41 +828,6 @@ mod tests {
     }
 
     // =========================================================================
-    // Fee calculation tests (expanded)
-    // =========================================================================
-
-    #[test]
-    fn test_can_afford_fee() {
-        let account = create_test_account(10_000, 0);
-        assert!(fees::can_afford_fee(&account, 1000));
-        assert!(fees::can_afford_fee(&account, 10_000));
-        assert!(!fees::can_afford_fee(&account, 10_001));
-    }
-
-    /// Fee affordability with selling liabilities.
-    #[test]
-    fn test_can_afford_fee_with_selling_liabilities() {
-        // balance=10000, selling=5000 → available for fee = 5000
-        let a = create_account_with_liabilities(10_000, 0, 5_000, 0);
-        assert!(fees::can_afford_fee(&a, 5000));
-        assert!(!fees::can_afford_fee(&a, 5001));
-    }
-
-    /// Fee available_balance is balance minus selling liabilities.
-    #[test]
-    fn test_fees_available_balance() {
-        let v0 = create_test_account(100, 0);
-        assert_eq!(fees::available_balance(&v0), 100);
-
-        let v1 = create_account_with_liabilities(100, 0, 30, 0);
-        assert_eq!(fees::available_balance(&v1), 70);
-
-        // buying liabilities don't affect fee balance
-        let v1b = create_account_with_liabilities(100, 0, 0, 999);
-        assert_eq!(fees::available_balance(&v1b), 100);
-    }
-
-    // =========================================================================
     // P1 Available to send/receive edge cases
     // =========================================================================
 
@@ -1165,31 +848,13 @@ mod tests {
         assert_eq!(reserves::available_to_send(&b, BASE_RESERVE), 1 - min_100);
     }
 
-    /// available_to_receive: at MAX balance, capacity is 0; beyond that saturates.
-    #[test]
-    fn test_available_to_receive_at_max() {
-        let a = create_account_with_liabilities(i64::MAX, 0, 0, 0);
-        assert_eq!(reserves::available_to_receive(&a), 0);
-
-        // With buying liabilities at MAX balance, capacity goes negative
-        // (saturating_sub saturates at i64::MIN not 0)
-        let b = create_account_with_liabilities(i64::MAX, 0, 0, 1);
-        assert!(reserves::available_to_receive(&b) <= 0);
-    }
-
-    /// Test interaction between selling and buying liabilities.
+    /// Test that selling liabilities reduce available_to_send.
     #[test]
     fn test_selling_and_buying_liabilities_independent() {
         let a = create_account_with_liabilities(min_balance(0) + 1000, 0, 300, 500);
 
-        // Selling affects available_to_send
+        // Selling affects available_to_send (buying does not)
         assert_eq!(reserves::available_to_send(&a, BASE_RESERVE), 700);
-
-        // Buying affects available_to_receive
-        assert_eq!(
-            reserves::available_to_receive(&a),
-            i64::MAX - (min_balance(0) + 1000) - 500
-        );
     }
 
     // =========================================================================
@@ -1476,78 +1141,16 @@ mod tests {
         ));
     }
 
-    /// Trustline available_to_receive is limit - balance - buying_liabilities.
-    #[test]
-    fn test_trustline_available_to_receive() {
-        // No liabilities
-        let a = create_trustline_with_liabilities(1000, 5000, 0, 0);
-        assert_eq!(trustlines::available_to_receive(&a), 4000);
-
-        // With buying liabilities
-        let b = create_trustline_with_liabilities(1000, 5000, 0, 500);
-        assert_eq!(trustlines::available_to_receive(&b), 3500);
-
-        // Buying liabilities fill remaining capacity
-        let c = create_trustline_with_liabilities(1000, 5000, 0, 4000);
-        assert_eq!(trustlines::available_to_receive(&c), 0);
-
-        // At limit: no room
-        let d = create_trustline_with_liabilities(5000, 5000, 0, 0);
-        assert_eq!(trustlines::available_to_receive(&d), 0);
-
-        // V0 trustline: buying = 0
-        let e = create_trustline_v0(1000, 5000);
-        assert_eq!(trustlines::available_to_receive(&e), 4000);
-    }
-
-    /// Parity: LiabilitiesTests.cpp:1488 "trustline available limit"
-    #[test]
-    fn test_trustline_available_to_receive_comprehensive() {
-        // Zero balance, large limit: can receive up to limit
-        assert_eq!(
-            trustlines::available_to_receive(&create_trustline_with_liabilities(0, 1000, 0, 0)),
-            1000
-        );
-
-        // Buying liabilities don't affect selling side
-        let tl = create_trustline_with_liabilities(100, 200, 999, 50);
-        assert_eq!(trustlines::available_to_receive(&tl), 50);
-    }
-
-    /// Selling and buying liabilities are independent on trustlines.
+    /// Selling liabilities reduce trustline available_to_send.
     #[test]
     fn test_trustline_selling_and_buying_independent() {
         let tl = create_trustline_with_liabilities(500, 1000, 200, 300);
 
-        // Selling affects available_to_send
+        // Selling affects available_to_send (buying does not)
         assert_eq!(trustlines::available_to_send(&tl), 300);
-
-        // Buying affects available_to_receive
-        assert_eq!(trustlines::available_to_receive(&tl), 200);
-
-        // Changing selling doesn't affect receive
-        let tl2 = create_trustline_with_liabilities(500, 1000, 0, 300);
-        assert_eq!(trustlines::available_to_receive(&tl2), 200); // same
 
         // Changing buying doesn't affect send
         let tl3 = create_trustline_with_liabilities(500, 1000, 200, 0);
         assert_eq!(trustlines::available_to_send(&tl3), 300); // same
-    }
-
-    /// Parity: LiabilitiesTests.cpp:1512 "trustline minimum limit"
-    /// Tests that trustline limit must be at least balance + buying_liabilities.
-    #[test]
-    fn test_trustline_minimum_limit() {
-        // Trustline at exactly limit: available_to_receive = 0
-        let at_limit = create_trustline_with_liabilities(1000, 1000, 0, 0);
-        assert_eq!(trustlines::available_to_receive(&at_limit), 0);
-
-        // With buying liabilities at limit: no room at all
-        let over = create_trustline_with_liabilities(900, 1000, 0, 100);
-        assert_eq!(trustlines::available_to_receive(&over), 0);
-
-        // Just barely under: 1 unit of room
-        let barely = create_trustline_with_liabilities(900, 1000, 0, 99);
-        assert_eq!(trustlines::available_to_receive(&barely), 1);
     }
 }
