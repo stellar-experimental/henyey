@@ -95,6 +95,11 @@
 //! - `pending`: Pending SCP envelope management (future slots)
 //! - `fetching_envelopes`: Envelopes waiting for TxSet/QuorumSet from peers
 //! - `quorum_tracker`: Quorum participation and security tracking
+//! - `quorum_set_tracker`: Quorum-set fetching and reference tracking
+//! - `quorum_intersection_state`: Quorum intersection monitoring (diagnostic)
+//! - `tx_set_tracker`: Transaction-set fetching and reference tracking
+//! - `externalize_lag`: Externalize timing/lag measurement (diagnostic)
+//! - `tracked_lock`: Lock-acquisition instrumentation (diagnostic)
 //! - `persistence`: SCP state persistence for crash recovery (SQLite)
 //! - `upgrades`: Ledger upgrade scheduling and validation
 //! - `ledger_close_data`: Ledger close data for consensus output
@@ -131,8 +136,6 @@ mod surge_pricing;
 pub mod sync_recovery;
 pub(crate) mod timer_manager;
 mod tracked_lock;
-// tx_broadcast module removed — flood scheduling is now handled by
-// TransactionQueue::broadcast_with_visitor() + the app-layer flood timer.
 mod tx_queue;
 mod tx_queue_limiter;
 mod tx_set_tracker;
@@ -148,25 +151,24 @@ pub use herder::{
     EnvelopeState, Herder, HerderConfig, HerderStats, LastExternalizedLedger, LedgerCloseInfo,
     NextConsensusSlot, TimeoutOutcome, TriggerOutcome, TX_SET_GC_DELAY_SECS,
 };
-pub use metrics::{ScpMetrics, ScpMetricsSnapshot};
+pub use metrics::ScpMetricsSnapshot;
 pub use pending::{PendingConfig, PendingEnvelopes, PendingResult, PendingStats};
 pub use quorum_tracker::{ExpandError, QuorumTracker, SlotQuorumTracker};
 pub use scp_driver::{
-    CachedTxSet, ExternalizeTimingSnapshot, ExternalizedSlot, HerderScpCallback, PendingTxSet,
-    ScpDriver, ScpDriverCacheSizes, ScpDriverConfig, ValidatorEntryInfo, ValidatorQuality,
+    HerderScpCallback, PendingTxSet, ScpDriver, ValidatorEntryInfo, ValidatorQuality,
     ValidatorWeightConfig, ValueValidation,
 };
 pub use state::HerderState;
 pub use tx_queue::{
-    BroadcastBudget, BroadcastCandidate, BroadcastVisitResult, QueuedTransaction, SorobanTxLimits,
-    TransactionQueue, TransactionSet, TxQueueConfig, TxQueueResult, TxQueueStats, TxSetBody,
-    SOROBAN_TRANSACTION_QUEUE_SIZE_MULTIPLIER, TRANSACTION_QUEUE_SIZE_MULTIPLIER,
+    BroadcastBudget, BroadcastVisitResult, SorobanTxLimits, TransactionQueue, TransactionSet,
+    TxQueueConfig, TxQueueResult, SOROBAN_TRANSACTION_QUEUE_SIZE_MULTIPLIER,
+    TRANSACTION_QUEUE_SIZE_MULTIPLIER,
 };
 
 // Persistence
 pub use persistence::{
-    get_quorum_set_hash, get_tx_set_hashes, Database, InMemoryScpPersistence, PersistedSlotState,
-    RestoredScpState, ScpPersistenceManager, ScpStatePersistence, SqliteScpPersistence,
+    get_tx_set_hashes, Database, PersistedSlotState, RestoredScpState, ScpPersistenceManager,
+    ScpStatePersistence, SqliteScpPersistence,
 };
 
 // HerderUtils
@@ -193,23 +195,18 @@ pub use tx_queue::SnapshotProviders;
 pub use parallel_tx_set_builder::build_two_phase_tx_set;
 
 // TxQueueLimiter and surge pricing
-pub use surge_pricing::VisitTxResult;
 pub use tx_queue_limiter::{FloodQueueNotInitialized, TxQueueLimiter};
 
 // Timer management
 pub use timer_manager::{
-    TimerCallback, TimerCommand, TimerManager, TimerManagerHandle, TimerManagerWithStats,
-    TimerStats, TimerType,
+    TimerCallback, TimerManager, TimerManagerHandle, TimerManagerWithStats, TimerStats, TimerType,
 };
 
 // Sync recovery
 pub use sync_recovery::{
-    SyncRecoveryCallback, SyncRecoveryCommand, SyncRecoveryHandle, SyncRecoveryManager,
-    SyncRecoveryStats, SyncRecoveryStatsTracker, CONSENSUS_STUCK_TIMEOUT, LEDGER_VALIDITY_BRACKET,
-    OUT_OF_SYNC_RECOVERY_INTERVAL,
+    SyncRecoveryCallback, SyncRecoveryHandle, SyncRecoveryManager, CONSENSUS_STUCK_TIMEOUT,
+    LEDGER_VALIDITY_BRACKET, OUT_OF_SYNC_RECOVERY_INTERVAL,
 };
-
-// (TxBroadcastManager removed — see TransactionQueue::broadcast_with_visitor)
 
 // Dead node detection
 pub use dead_node_tracker::{DeadNodeTracker, CHECK_FOR_DEAD_NODES_MINUTES};
