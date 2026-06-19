@@ -17,9 +17,6 @@ soroban-env-host-p24.workspace = true
 soroban-env-host-p25.workspace = true
 soroban-env-host-p26.workspace = true
 
-# Serialization
-serde.workspace = true
-
 # Error handling
 thiserror.workspace = true
 tracing.workspace = true
@@ -31,6 +28,3 @@ hex.workspace = true
 
 # WASM parsing for cost input extraction
 wasmparser = "0.116.1"
-
-[dev-dependencies]
-tempfile.workspace = true

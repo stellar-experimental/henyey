@@ -307,6 +307,7 @@ impl TxChangeLog {
     }
 
     /// Get the total number of changes.
+    #[cfg(test)]
     pub fn change_count(&self) -> usize {
         self.created.len() + self.updated.len() + self.deleted.len()
     }
