@@ -189,12 +189,14 @@ that mirrors stellar-core's `BucketOutputIterator::maybePut`.
 
 ### §7.1 FutureBucket State Machine
 The state diagram (Clear, HashOutput, HashInputs, LiveOutput, LiveInputs)
-is implemented at `future_bucket.rs:279-308` as a Rust enum
-(`FutureBucketInner`) where each variant carries exactly the fields it
-needs — making the spec's "invalid" combinations unrepresentable. The
-`check_state()` method at line 444-473 is retained for API compatibility
-but is now a no-op (deprecated, asserts only hash/bucket consistency
-in debug builds).
+is implemented as a Rust enum (`FutureBucketInner`) where each variant
+carries exactly the fields it needs — making the spec's "invalid"
+combinations unrepresentable at compile time. Consequently there is no
+runtime invariant-checker: stellar-core's `FutureBucket::checkState()`
+(and the `mInputCurrBucket`/`mInputSnapBucket` it `releaseAssert`s over)
+have no henyey counterpart because the enum design renders the invalid
+states it guards against unconstructable. The `LiveMerging` variant
+therefore retains only the input *hashes*, not the input buckets.
 
 ### §7.3 MergeKey
 `MergeKey` at `future_bucket.rs:81-99` is `(keep_tombstones, curr_hash, snap_hash)`.

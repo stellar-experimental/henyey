@@ -604,7 +604,7 @@ pub(crate) fn bucket_update_period(level: u32, is_curr: bool) -> u32 {
 /// scanSize < bucket.getSize()`, the bucket is too large to fully scan within
 /// its update period, so the scan can never complete a pass over it. Returns
 /// `true` in that "stuck" case so the caller can record an incomplete-scan.
-pub fn eviction_scan_is_stuck(
+pub(crate) fn eviction_scan_is_stuck(
     iter: &EvictionIterator,
     scan_size: u32,
     bucket_byte_size: u64,
