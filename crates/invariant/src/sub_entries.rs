@@ -173,11 +173,11 @@ impl Invariant for AccountSubEntriesCountIsValid {
                     .get(&account.account_id)
                     .copied()
                     .unwrap_or_default();
-                let num_signers =
-                    account.num_sub_entries as i32 + change.num_sub_entries - change.signers;
-                if num_signers != account.signers.len() as i32 {
-                    let other_sub_entries =
-                        account.num_sub_entries as i32 - account.signers.len() as i32;
+                let num_sub_entries = account.num_sub_entries as i32;
+                let num_account_signers = account.signers.len() as i32;
+                let num_signers = num_sub_entries + change.num_sub_entries - change.signers;
+                if num_signers != num_account_signers {
+                    let other_sub_entries = num_sub_entries - num_account_signers;
                     return Err(format!(
                         "Deleted Account {:?} has {} subentries other than signers",
                         account.account_id, other_sub_entries

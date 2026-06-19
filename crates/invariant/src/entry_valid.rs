@@ -13,8 +13,8 @@
 
 use stellar_xdr::curr::{
     AccountEntry, AccountEntryExt, AccountEntryExtensionV1Ext, ContractEvent, DataEntry,
-    LedgerEntry, LedgerEntryData, OfferEntry, Operation, OperationResult, TrustLineAsset,
-    TrustLineEntry, TrustLineEntryExt, TrustLineEntryV1Ext, TrustLineFlags,
+    LedgerEntry, LedgerEntryData, LedgerEntryExt, OfferEntry, Operation, OperationResult,
+    TrustLineAsset, TrustLineEntry, TrustLineEntryExt, TrustLineEntryV1Ext, TrustLineFlags,
 };
 
 use crate::{Invariant, OperationDelta};
@@ -81,21 +81,18 @@ fn check_entry(
         LedgerEntryData::Data(data) => check_data(data),
         LedgerEntryData::ClaimableBalance(_) => {
             // ClaimableBalance must be sponsored.
-            match &entry.ext {
-                stellar_xdr::curr::LedgerEntryExt::V1(v1) => {
-                    if v1.sponsoring_id.0.is_none() {
-                        return Err("ClaimableBalance is not sponsored".to_string());
-                    }
-                }
-                _ => {
-                    return Err("ClaimableBalance is not sponsored".to_string());
-                }
+            let sponsored = matches!(
+                &entry.ext,
+                LedgerEntryExt::V1(v1) if v1.sponsoring_id.0.is_some()
+            );
+            if !sponsored {
+                return Err("ClaimableBalance is not sponsored".to_string());
             }
             Ok(())
         }
         LedgerEntryData::LiquidityPool(_) => {
             // LiquidityPool must not be sponsored.
-            if !matches!(&entry.ext, stellar_xdr::curr::LedgerEntryExt::V0) {
+            if !matches!(&entry.ext, LedgerEntryExt::V0) {
                 return Err("LiquidityPool is sponsored".to_string());
             }
             Ok(())
