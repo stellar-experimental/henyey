@@ -34,7 +34,7 @@ use tracing::info;
 /// This should be incremented whenever a new migration is added.
 /// The database initialization and migration system uses this to
 /// determine if upgrades are needed.
-pub(crate) const CURRENT_VERSION: i32 = 10;
+const CURRENT_VERSION: i32 = 10;
 
 /// Represents a single database migration.
 ///
@@ -187,7 +187,7 @@ const MIGRATIONS: &[Migration] = &[
 /// # Errors
 ///
 /// Returns an error if the stored version string cannot be parsed as an integer.
-pub(crate) fn get_schema_version(conn: &Connection) -> Result<i32> {
+fn get_schema_version(conn: &Connection) -> Result<i32> {
     let result: std::result::Result<String, _> = conn.query_row(
         "SELECT state FROM storestate WHERE statename = 'databaseschema'",
         [],
@@ -209,7 +209,7 @@ pub(crate) fn get_schema_version(conn: &Connection) -> Result<i32> {
 /// Records the schema version in the database.
 ///
 /// This is called after each successful migration to update the version tracker.
-pub(crate) fn set_schema_version(conn: &Connection, version: i32) -> Result<()> {
+fn set_schema_version(conn: &Connection, version: i32) -> Result<()> {
     conn.execute(
         "INSERT OR REPLACE INTO storestate (statename, state) VALUES ('databaseschema', ?)",
         [version.to_string()],

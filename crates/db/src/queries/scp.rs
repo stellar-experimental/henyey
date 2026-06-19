@@ -23,6 +23,8 @@ use stellar_xdr::curr::{
 use crate::error::DbError;
 use crate::schema::state_keys;
 
+use super::state::StateQueries;
+
 const TX_SET_KEY_PREFIX: &str = "txset:";
 
 /// Query trait for SCP consensus state operations.
@@ -300,9 +302,6 @@ fn tx_set_key(hash: &Hash) -> String {
     format!("{TX_SET_KEY_PREFIX}{}", hex::encode(hash.0))
 }
 
-/// Delegates to [`StateQueries`] methods to avoid duplicating storestate SQL.
-use super::state::StateQueries;
-
 fn parse_slot_key(key: &str) -> Option<u64> {
     key.strip_prefix(&format!("{}:", state_keys::SCP_STATE))?
         .parse()
@@ -317,6 +316,7 @@ fn decode_tx_set_data(encoded: &str) -> Result<Vec<u8>, DbError> {
 /// Extended query trait for SCP state persistence (crash recovery).
 ///
 /// These methods support the herder's SCP state persistence for crash recovery.
+/// They delegate to [`StateQueries`] methods to avoid duplicating storestate SQL.
 pub trait ScpStatePersistenceQueries {
     /// Save SCP state for a slot as JSON.
     fn save_scp_slot_state(&self, slot: u64, state_json: &str) -> Result<(), DbError>;
