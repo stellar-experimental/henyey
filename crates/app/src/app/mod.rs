@@ -1,4 +1,4 @@
-//! Core application struct and component initialization for rs-stellar-core.
+//! Core application struct and component initialization for henyey.
 //!
 //! This module contains the [`App`] struct, which is the central coordinator for all
 //! Stellar Core subsystems. It manages the lifecycle of:

@@ -1,4 +1,4 @@
-//! Application orchestration for rs-stellar-core.
+//! Application orchestration for henyey.
 //!
 //! This crate provides the top-level application layer that wires together all
 //! subsystems of a Stellar Core node. It is responsible for:
@@ -71,7 +71,7 @@ pub mod survey;
 pub use app::bootstrap::{initialize_genesis, GenesisConfig};
 pub use app::{App, AppState, FallbackCatchup, LedgerSummary, RestoreResult, SimulationDebugStats};
 pub use catchup_cmd::{run_catchup, CatchupMode, CatchupOptions};
-pub use config::{AppConfig, BuildMetadata, MaintenanceAppConfig};
+pub use config::{AppConfig, BuildMetadata};
 pub use logging::{LogConfig, LogFormat};
 pub use run_cmd::{run_node, ExtraServerSpawner, RunMode, RunOptions};
 
