@@ -724,17 +724,11 @@ struct RentChange {
     new_live_until_ledger: u32,
 }
 
-pub fn entry_size_for_rent_by_protocol(
-    protocol_version: u32,
-    entry: &stellar_xdr::curr::LedgerEntry,
-    entry_xdr_size: u32,
-) -> u32 {
-    entry_size_for_rent_by_protocol_with_cost_params(protocol_version, entry, entry_xdr_size, None)
-}
-
-/// Like `entry_size_for_rent_by_protocol`, but accepts optional on-chain cost
-/// parameters (cpu_cost_params, mem_cost_params) so that the budget used for
-/// computing WASM module memory cost matches the network configuration.
+/// Compute the entry size used for rent accounting, by protocol version.
+///
+/// Accepts optional on-chain cost parameters (cpu_cost_params, mem_cost_params)
+/// so that the budget used for computing WASM module memory cost matches the
+/// network configuration.
 ///
 /// When `cost_params` is `None`, falls back to `Budget::default()` which uses
 /// hard-coded cost model parameters. For deterministic parity with stellar-core
