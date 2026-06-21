@@ -1,6 +1,7 @@
 # Henyey Herder Crate — Specification Adherence Evaluation
 
 **Evaluated against:** stellar-core v26.0.1 herder implementation (C++ reference)
+**stellar-core pin:** v27.0.0 — evaluation body reflects the v26.0.1 baseline; Protocol 27 delta re-eval pending.
 **Crate:** `crates/herder/` (henyey-herder)
 **SCP core library:** `crates/scp/` (henyey-scp) — 95% parity (see `crates/scp/PARITY_STATUS.md`)
 **Parity:** see `crates/herder/PARITY_STATUS.md` for current function-level status

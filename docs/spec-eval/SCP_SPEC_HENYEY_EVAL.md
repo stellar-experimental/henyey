@@ -2,6 +2,7 @@
 
 **Evaluated against:** `stellar-specs/SCP_SPEC.md` (Stellar Consensus Protocol Specification)
 **Reference implementation:** stellar-core v26.0.1
+**stellar-core pin:** v27.0.0 — evaluation body reflects the v26.0.1 baseline; Protocol 27 delta re-eval pending.
 **Crate:** `crates/scp/` (henyey-scp)
 **Function-level parity:** 95% (see `crates/scp/PARITY_STATUS.md` for current counts)
 **Date:** 2026-05-10

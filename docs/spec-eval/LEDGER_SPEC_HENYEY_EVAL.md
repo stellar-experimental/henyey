@@ -6,6 +6,7 @@
 **Evaluator**: AI-assisted review
 **Henyey target**: Protocol 24+ only
 **stellar-core baseline**: v26.0.1
+**stellar-core pin**: v27.0.0 — evaluation body reflects the v26.0.1 baseline; Protocol 27 delta re-eval pending.
 
 ---
 
