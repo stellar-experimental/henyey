@@ -70,4 +70,4 @@
 
 - SQLite is the only supported database backend.
 - Protocol support is 24+ only; do not add legacy protocol behavior.
-- The stellar-core upstream is available as a git submodule at `stellar-core/` (pinned to v26.0.1) for parity checks.
+- The stellar-core upstream is available as a git submodule at `stellar-core/` (pinned to v27.0.0) for parity checks.
