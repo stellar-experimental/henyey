@@ -1,6 +1,7 @@
 # Henyey Bucket Crate — Specification Adherence Evaluation
 
 **Evaluated against:** `stellar-specs/BUCKETLISTDB_SPEC.md` (stellar-core v26.0.1 BucketListDB reference)
+**stellar-core pin:** v27.0.0 — evaluation body reflects the v26.0.1 baseline; Protocol 27 delta re-eval pending.
 **Crate:** `crates/bucket/` (henyey-bucket)
 **Date:** 2026-05-10
 

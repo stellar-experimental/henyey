@@ -1,6 +1,7 @@
 # Henyey TX Crate — Specification Adherence Evaluation
 
 **Evaluated against:** `stellar-specs/TX_SPEC.md` (stellar-core v26.0.1 / Protocol 26)
+**stellar-core pin:** v27.0.0 — evaluation body reflects the v26.0.1 baseline; Protocol 27 delta re-eval pending.
 **Crate:** `crates/tx/` (henyey-tx)
 **Self-reported parity:** See `crates/tx/PARITY_STATUS.md` for current function-level counts
 **Date:** 2026-05-10

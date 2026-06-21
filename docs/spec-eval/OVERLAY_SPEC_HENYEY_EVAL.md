@@ -2,6 +2,7 @@
 
 **Evaluated against:** `stellar-specs/OVERLAY_SPEC.md` (Stellar Overlay Protocol Specification v26)
 **Upstream reference:** stellar-core v26.0.1
+**stellar-core pin:** v27.0.0 — evaluation body reflects the v26.0.1 baseline; Protocol 27 delta re-eval pending.
 **Crate:** `crates/overlay/` (henyey-overlay)
 **Date:** 2026-05-10
 
