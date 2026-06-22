@@ -2185,7 +2185,8 @@ mod tests {
 
     #[test]
     fn test_use_config_for_genesis_defaults() {
-        // Absent keys ⇒ stellar-core defaults (false / 26 / 100 / 100_000_000 / 50).
+        // Absent keys ⇒ stellar-core defaults (false / CURRENT_PROTOCOL / 100 / 100_000_000 / 50).
+        // stellar-core sets TESTING_UPGRADE_LEDGER_PROTOCOL_VERSION = CURRENT_LEDGER_PROTOCOL_VERSION.
         let core_toml: toml::Value = toml::from_str(
             r#"
             NETWORK_PASSPHRASE = "Test SDF Network ; September 2015"
@@ -2194,7 +2195,10 @@ mod tests {
         .unwrap();
         let config = translate_stellar_core_config(&core_toml).unwrap();
         assert!(!config.testing.use_config_for_genesis);
-        assert_eq!(config.testing.testing_upgrade_ledger_protocol_version, 26);
+        assert_eq!(
+            config.testing.testing_upgrade_ledger_protocol_version,
+            henyey_common::protocol::CURRENT_LEDGER_PROTOCOL_VERSION
+        );
         assert_eq!(config.testing.testing_upgrade_desired_fee, 100);
         assert_eq!(config.testing.testing_upgrade_reserve, 100_000_000);
         assert_eq!(config.testing.testing_upgrade_max_tx_set_size, 50);

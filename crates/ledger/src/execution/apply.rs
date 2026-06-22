@@ -1854,6 +1854,39 @@ mod tests {
         }
     }
 
+    /// P27 module cache: warming a V1-ext entry derives V1 cost inputs from the
+    /// wasm (mirrors the P26 behavior) and the rebuild caller (`new_for_protocol(27)`)
+    /// routes to a P27 cache.
+    #[test]
+    fn test_warm_module_cache_v1_entry_uses_derived_v1_cost_inputs_p27() {
+        let cache = PersistentModuleCache::new_for_protocol(27)
+            .expect("P27 module cache should be available");
+        let (entry, hash_bytes) = make_v1_contract_code_ledger_entry(WASM_A);
+        super::super::warm_module_cache_from_entries(Some(&cache), &[entry], 27);
+
+        let host_hash = soroban_env_host_p27::xdr::Hash(hash_bytes);
+        let module = cache
+            .as_p27()
+            .expect("protocol 27 must produce a P27 cache")
+            .get_module(&host_hash)
+            .expect("get_module should not error")
+            .expect("V1-ext entry should be in cache");
+
+        match &module.cost_inputs {
+            soroban_env_host_p27::vm::VersionedContractCodeCostInputs::V1(inputs) => {
+                assert_ne!(
+                    inputs.n_instructions, 10,
+                    "cost inputs should be derived from wasm, not copied from entry ext"
+                );
+            }
+            soroban_env_host_p27::vm::VersionedContractCodeCostInputs::V0 { .. } => {
+                panic!(
+                    "P27 should derive V1 cost inputs from wasm via parse_and_cache_module_simple"
+                );
+            }
+        }
+    }
+
     #[test]
     fn test_warm_module_cache_v0_cost_inputs_p24() {
         let cache = PersistentModuleCache::new_for_protocol(24)

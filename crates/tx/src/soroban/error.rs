@@ -3,6 +3,7 @@
 use soroban_env_host_p24 as soroban_env_host24;
 use soroban_env_host_p25 as soroban_env_host25;
 use soroban_env_host_p26 as soroban_env_host26;
+use soroban_env_host_p27 as soroban_env_host27;
 
 /// Convert a P24 HostError to P25 HostError.
 ///
@@ -91,6 +92,51 @@ fn convert_sc_error_p26_to_p25(
         ScError26::Budget(code) => ScError25::Budget(convert_sc_error_code_p26_to_p25(code)),
         ScError26::Value(code) => ScError25::Value(convert_sc_error_code_p26_to_p25(code)),
         ScError26::Auth(code) => ScError25::Auth(convert_sc_error_code_p26_to_p25(code)),
+    }
+}
+
+/// Convert a P27 HostError to P25 HostError.
+///
+/// P25 is our canonical internal error type for `SorobanExecutionError`. Even
+/// though soroban-env-host-p27 shares stellar-xdr 27.0.0 with the workspace, the
+/// P25 host type is a distinct crate, so a real (integer-preserving) conversion
+/// is still required. The ScError variants and codes are stable across versions.
+pub(crate) fn convert_host_error_p27_to_p25(
+    err: soroban_env_host27::HostError,
+) -> soroban_env_host25::HostError {
+    let sc_error = soroban_env_host27::xdr::ScError::try_from(&err).unwrap_or(
+        soroban_env_host27::xdr::ScError::Context(
+            soroban_env_host27::xdr::ScErrorCode::InternalError,
+        ),
+    );
+    let sc_error = convert_sc_error_p27_to_p25(sc_error);
+    soroban_env_host25::HostError::from(sc_error)
+}
+
+fn convert_sc_error_code_p27_to_p25(
+    code: soroban_env_host27::xdr::ScErrorCode,
+) -> soroban_env_host25::xdr::ScErrorCode {
+    soroban_env_host25::xdr::ScErrorCode::try_from(code as i32)
+        .unwrap_or(soroban_env_host25::xdr::ScErrorCode::InternalError)
+}
+
+fn convert_sc_error_p27_to_p25(
+    sc_error: soroban_env_host27::xdr::ScError,
+) -> soroban_env_host25::xdr::ScError {
+    use soroban_env_host25::xdr::ScError as ScError25;
+    use soroban_env_host27::xdr::ScError as ScError27;
+
+    match sc_error {
+        ScError27::Contract(code) => ScError25::Contract(code),
+        ScError27::WasmVm(code) => ScError25::WasmVm(convert_sc_error_code_p27_to_p25(code)),
+        ScError27::Context(code) => ScError25::Context(convert_sc_error_code_p27_to_p25(code)),
+        ScError27::Storage(code) => ScError25::Storage(convert_sc_error_code_p27_to_p25(code)),
+        ScError27::Object(code) => ScError25::Object(convert_sc_error_code_p27_to_p25(code)),
+        ScError27::Crypto(code) => ScError25::Crypto(convert_sc_error_code_p27_to_p25(code)),
+        ScError27::Events(code) => ScError25::Events(convert_sc_error_code_p27_to_p25(code)),
+        ScError27::Budget(code) => ScError25::Budget(convert_sc_error_code_p27_to_p25(code)),
+        ScError27::Value(code) => ScError25::Value(convert_sc_error_code_p27_to_p25(code)),
+        ScError27::Auth(code) => ScError25::Auth(convert_sc_error_code_p27_to_p25(code)),
     }
 }
 
@@ -247,6 +293,24 @@ mod tests {
         match p25_sc_error {
             ScError25::Context(code) => assert_eq!(code, ScErrorCode25::InternalError),
             _ => panic!("Expected Context error"),
+        }
+    }
+
+    #[test]
+    fn test_convert_host_error_p27_to_p25() {
+        use soroban_env_host_p27 as soroban_env_host27;
+        let p27_sc_error = soroban_env_host27::xdr::ScError::Storage(
+            soroban_env_host27::xdr::ScErrorCode::ExceededLimit,
+        );
+        let p27_host_error = soroban_env_host27::HostError::from(p27_sc_error);
+        let p25_host_error = convert_host_error_p27_to_p25(p27_host_error);
+
+        let p25_sc_error: ScError25 = (&p25_host_error)
+            .try_into()
+            .unwrap_or(ScError25::Context(ScErrorCode25::InternalError));
+        match p25_sc_error {
+            ScError25::Storage(code) => assert_eq!(code, ScErrorCode25::ExceededLimit),
+            other => panic!("Expected Storage error, got {other:?}"),
         }
     }
 }

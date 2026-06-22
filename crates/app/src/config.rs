@@ -623,8 +623,9 @@ impl Default for DiagnosticsConfig {
 /// accelerate_time = true  # 1s ledger close, checkpoint frequency 8
 /// ```
 fn default_testing_upgrade_protocol_version() -> u32 {
-    // stellar-core CURRENT_LEDGER_PROTOCOL_VERSION (Config.cpp:36).
-    26
+    // stellar-core sets TESTING_UPGRADE_LEDGER_PROTOCOL_VERSION = CURRENT_LEDGER_PROTOCOL_VERSION
+    // (Config.cpp:34/232). Mirror our CURRENT_LEDGER_PROTOCOL_VERSION (= 27).
+    henyey_common::protocol::CURRENT_LEDGER_PROTOCOL_VERSION
 }
 
 fn default_testing_upgrade_desired_fee() -> u32 {

@@ -39,7 +39,7 @@
 
 /// Protocol version enumeration for type-safe version comparisons.
 ///
-/// This enum represents all known Stellar protocol versions from V0 to V26.
+/// This enum represents all known Stellar protocol versions from V0 to V27.
 /// It is used with the version-checking functions to enable compile-time
 /// verification of version comparisons.
 ///
@@ -77,6 +77,7 @@ pub enum ProtocolVersion {
     V24 = 24,
     V25 = 25,
     V26 = 26,
+    V27 = 27,
 }
 
 impl ProtocolVersion {
@@ -133,7 +134,7 @@ pub const MIN_LEDGER_PROTOCOL_VERSION: u32 = 24;
 ///
 /// This represents the highest protocol version that this implementation
 /// can process. Ledgers with higher versions will be rejected.
-pub const CURRENT_LEDGER_PROTOCOL_VERSION: u32 = 26;
+pub const CURRENT_LEDGER_PROTOCOL_VERSION: u32 = 27;
 
 /// The minimum supported ledger protocol version for Soroban execution.
 ///
@@ -375,6 +376,73 @@ mod tests {
         assert!(protocol_version_is_before(19, ProtocolVersion::V20));
         assert!(!protocol_version_is_before(20, ProtocolVersion::V20));
         assert!(!protocol_version_is_before(21, ProtocolVersion::V20));
+    }
+
+    #[test]
+    fn test_protocol_version_v27_value() {
+        assert_eq!(ProtocolVersion::V27 as u32, 27);
+        assert_eq!(ProtocolVersion::V27.as_u32(), 27);
+    }
+
+    #[test]
+    fn test_current_ledger_protocol_version_is_27() {
+        assert_eq!(CURRENT_LEDGER_PROTOCOL_VERSION, 27);
+    }
+
+    #[test]
+    fn test_ledger_header_version_27_xdr_roundtrip() {
+        // A protocol-27 LedgerHeader must round-trip through the workspace XDR
+        // (stellar-xdr 27.0.0), confirming the toolchain recognizes ledger_version 27.
+        use stellar_xdr::{Limits, ReadXdr, WriteXdr};
+        let header = stellar_xdr::LedgerHeader {
+            ledger_version: 27,
+            previous_ledger_hash: stellar_xdr::Hash([0u8; 32]),
+            scp_value: stellar_xdr::StellarValue {
+                tx_set_hash: stellar_xdr::Hash([0u8; 32]),
+                close_time: stellar_xdr::TimePoint(0),
+                upgrades: vec![].try_into().unwrap(),
+                ext: stellar_xdr::StellarValueExt::Basic,
+            },
+            tx_set_result_hash: stellar_xdr::Hash([0u8; 32]),
+            bucket_list_hash: stellar_xdr::Hash([0u8; 32]),
+            ledger_seq: 1,
+            total_coins: 0,
+            fee_pool: 0,
+            inflation_seq: 0,
+            id_pool: 0,
+            base_fee: 100,
+            base_reserve: 5_000_000,
+            max_tx_set_size: 1000,
+            skip_list: [
+                stellar_xdr::Hash([0u8; 32]),
+                stellar_xdr::Hash([0u8; 32]),
+                stellar_xdr::Hash([0u8; 32]),
+                stellar_xdr::Hash([0u8; 32]),
+            ],
+            ext: stellar_xdr::LedgerHeaderExt::V0,
+        };
+        let bytes = header.to_xdr(Limits::none()).expect("encode v27 header");
+        let decoded =
+            stellar_xdr::LedgerHeader::from_xdr(&bytes, Limits::none()).expect("decode v27 header");
+        assert_eq!(decoded.ledger_version, 27);
+
+        // ScVal round-trip (smoke).
+        let sv = stellar_xdr::ScVal::U32(27);
+        let sv_bytes = sv.to_xdr(Limits::none()).expect("encode scval");
+        let sv_decoded =
+            stellar_xdr::ScVal::from_xdr(&sv_bytes, Limits::none()).expect("decode scval");
+        assert_eq!(sv_decoded, stellar_xdr::ScVal::U32(27));
+    }
+
+    #[test]
+    fn test_protocol_version_starts_from_v27() {
+        // A v27 ledger is at or after V27; a v26 ledger is before V27.
+        assert!(protocol_version_starts_from(27, ProtocolVersion::V27));
+        assert!(!protocol_version_starts_from(26, ProtocolVersion::V27));
+        assert!(protocol_version_is_before(26, ProtocolVersion::V27));
+        assert!(!protocol_version_is_before(27, ProtocolVersion::V27));
+        // V27 is strictly after V26.
+        assert!(ProtocolVersion::V27 > ProtocolVersion::V26);
     }
 
     #[test]

@@ -19,6 +19,7 @@ use soroban_env_host25::HostError as HostErrorP25;
 use soroban_env_host_p24 as soroban_env_host24;
 use soroban_env_host_p25 as soroban_env_host25;
 use soroban_env_host_p26 as soroban_env_host26;
+use soroban_env_host_p27 as soroban_env_host27;
 
 // P25 module cache types
 use soroban_env_host25::{
@@ -26,24 +27,33 @@ use soroban_env_host25::{
     ErrorHandler as ErrorHandlerP25, ModuleCache as ModuleCacheP25,
 };
 
-// P26 module cache types
-// soroban-env-host-p26 uses stellar-xdr 26.0.0 — the same version as our workspace.
-// This means P26 XDR types ARE the workspace types — no XDR byte roundtrip needed.
+// P26 module cache types.
+// soroban-env-host-p26 pins stellar-xdr 26.0.0, distinct from the workspace XDR
+// (now 27.0.0), so P26 XDR types are byte-converted to the workspace types (#3533).
 use soroban_env_host26::HostError as HostErrorP26;
 use soroban_env_host26::{
     budget::AsBudget as AsBudgetP26, CompilationContext as CompilationContextP26,
     ErrorHandler as ErrorHandlerP26, ModuleCache as ModuleCacheP26,
 };
 
-// The P26 host is pinned to the stellar-core v26.0.1 submodule revision (b351f88)
-// which uses stellar-xdr 26.0.0 — the same as our workspace. Types are unified
-// by Cargo, so no XDR byte roundtrip is needed for P26 (unlike P24/P25).
+// P27 module cache types.
+// soroban-env-host-p27 is pinned to the stellar-core v27.0.0 gitlink (b03d2563)
+// which uses stellar-xdr 27.0.0 — the SAME version as our workspace. This means
+// P27 XDR types ARE the workspace types; Cargo unifies them, so the P27 path is
+// NATIVE — no XDR byte roundtrip (unlike P24/P25/P26).
+use soroban_env_host27::HostError as HostErrorP27;
+use soroban_env_host27::{
+    budget::AsBudget as AsBudgetP27, CompilationContext as CompilationContextP27,
+    ErrorHandler as ErrorHandlerP27, ModuleCache as ModuleCacheP27,
+};
 use stellar_xdr::{
     DiagnosticEvent, LedgerEntry, LedgerKey, Limits, ReadXdr, ScVal, SorobanTransactionData,
     SorobanTransactionDataExt, WriteXdr,
 };
 
-use super::error::{convert_host_error_p24_to_p25, convert_host_error_p26_to_p25};
+use super::error::{
+    convert_host_error_p24_to_p25, convert_host_error_p26_to_p25, convert_host_error_p27_to_p25,
+};
 use super::HostFunctionInvocation;
 use crate::state::LedgerStateManager;
 use crate::validation::LedgerContext;
@@ -187,8 +197,10 @@ pub enum PersistentModuleCache {
     P24(ModuleCache),
     /// Protocol 25 module cache
     P25(ModuleCacheP25),
-    /// Protocol 26+ module cache
+    /// Protocol 26 module cache
     P26(ModuleCacheP26),
+    /// Protocol 27+ module cache
+    P27(ModuleCacheP27),
 }
 
 impl PersistentModuleCache {
@@ -214,9 +226,21 @@ impl PersistentModuleCache {
             .map(PersistentModuleCache::P26)
     }
 
+    /// Create a new empty P27 cache.
+    pub fn new_p27() -> Option<Self> {
+        let ctx = WasmCompilationContextP27::new();
+        ModuleCacheP27::new(&ctx)
+            .ok()
+            .map(PersistentModuleCache::P27)
+    }
+
     /// Create a new cache for the given protocol version.
     pub fn new_for_protocol(protocol_version: u32) -> Option<Self> {
-        if protocol_version_starts_from(protocol_version, ProtocolVersion::V26) {
+        // V27-first: protocol_version_starts_from(_, V26) is also true at v27, so
+        // the V27 branch MUST precede the V26 branch to route v27 ledgers correctly.
+        if protocol_version_starts_from(protocol_version, ProtocolVersion::V27) {
+            Self::new_p27()
+        } else if protocol_version_starts_from(protocol_version, ProtocolVersion::V26) {
             Self::new_p26()
         } else if protocol_version_starts_from(protocol_version, ProtocolVersion::V25) {
             Self::new_p25()
@@ -258,6 +282,12 @@ impl PersistentModuleCache {
                     .parse_and_cache_module_simple(&ctx, protocol_version, wasm)
                     .is_ok()
             }
+            PersistentModuleCache::P27(cache) => {
+                let ctx = WasmCompilationContextP27::new();
+                cache
+                    .parse_and_cache_module_simple(&ctx, protocol_version, wasm)
+                    .is_ok()
+            }
         }
     }
 
@@ -279,6 +309,10 @@ impl PersistentModuleCache {
             }
             PersistentModuleCache::P26(cache) => {
                 let contract_id = soroban_env_host26::xdr::Hash(hash.0);
+                cache.remove_module(&contract_id).ok().flatten().is_some()
+            }
+            PersistentModuleCache::P27(cache) => {
+                let contract_id = soroban_env_host27::xdr::Hash(hash.0);
                 cache.remove_module(&contract_id).ok().flatten().is_some()
             }
         }
@@ -304,6 +338,14 @@ impl PersistentModuleCache {
     pub fn as_p26(&self) -> Option<&ModuleCacheP26> {
         match self {
             PersistentModuleCache::P26(cache) => Some(cache),
+            _ => None,
+        }
+    }
+
+    /// Get the P27 cache if this is a P27 cache.
+    pub fn as_p27(&self) -> Option<&ModuleCacheP27> {
+        match self {
+            PersistentModuleCache::P27(cache) => Some(cache),
             _ => None,
         }
     }
@@ -671,6 +713,16 @@ define_wasm_compilation_context!(
     HostErrorP26
 );
 
+// P27 version of the compilation context.
+define_wasm_compilation_context!(
+    WasmCompilationContextP27,
+    soroban_env_host27,
+    ErrorHandlerP27,
+    AsBudgetP27,
+    CompilationContextP27,
+    HostErrorP27
+);
+
 /// Execute a Soroban host function with an optional pre-populated module cache.
 ///
 /// This is the same as `execute_host_function` but accepts an optional persistent
@@ -683,6 +735,21 @@ pub(crate) fn execute_host_function_with_cache(
     request: HostFunctionInvocation<'_>,
 ) -> Result<SorobanExecutionResult, SorobanExecutionError> {
     let protocol_version = request.context.protocol_version;
+    // V27-first: starts_from(_, V26) is also true at v27, so the V27 branch MUST
+    // precede the V26 branch — otherwise a v27 ledger mis-routes to the P26 host.
+    if protocol_version_starts_from(protocol_version, ProtocolVersion::V27) {
+        // INVARIANT: module cache always present and correct protocol type during Soroban execution
+        let cache = request
+            .module_cache
+            .unwrap_or_else(|| panic!("Module cache must be provided for Soroban TX execution"));
+        let p27_cache = cache.as_p27().unwrap_or_else(|| {
+            panic!(
+                "Module cache is not P27 but protocol version is {}",
+                protocol_version
+            )
+        });
+        return execute_host_function_p27(request, Some(p27_cache));
+    }
     if protocol_version_starts_from(protocol_version, ProtocolVersion::V26) {
         // INVARIANT: module cache always present and correct protocol type during Soroban execution
         let cache = request
@@ -1660,6 +1727,33 @@ fn rent_fee_config_p25_to_p26(
     }
 }
 
+fn convert_diagnostic_events_p27(
+    events: Vec<soroban_env_host27::xdr::DiagnosticEvent>,
+) -> Vec<DiagnosticEvent> {
+    convert_diagnostic_events_cross_version(events, "P27", |event| {
+        use soroban_env_host27::xdr::WriteXdr as WriteXdrP27;
+        event
+            .to_xdr(soroban_env_host27::xdr::Limits::none())
+            .map_err(|e| e.to_string())
+    })
+}
+
+/// Convert the SorobanConfig's (P25-typed) RentFeeConfiguration to the P27 type.
+///
+/// The SorobanConfig stores RentFeeConfiguration as P25 types. The P27 host has an
+/// independent struct with the same fields, so we copy field by field.
+fn rent_fee_config_p25_to_p27(
+    config: &soroban_env_host25::fees::RentFeeConfiguration,
+) -> soroban_env_host27::fees::RentFeeConfiguration {
+    soroban_env_host27::fees::RentFeeConfiguration {
+        fee_per_write_1kb: config.fee_per_write_1kb,
+        fee_per_rent_1kb: config.fee_per_rent_1kb,
+        fee_per_write_entry: config.fee_per_write_entry,
+        persistent_rent_rate_denominator: config.persistent_rent_rate_denominator,
+        temporary_rent_rate_denominator: config.temporary_rent_rate_denominator,
+    }
+}
+
 fn execute_host_function_p26(
     request: HostFunctionInvocation<'_>,
     existing_cache: Option<&ModuleCacheP26>,
@@ -1917,6 +2011,256 @@ fn execute_host_function_p26(
     })
 }
 
+/// Execute a Soroban host function on the P27 host (protocol 27+).
+///
+/// This is a NATIVE clone of `execute_host_function_p26`: soroban-env-host-p27
+/// pins stellar-xdr 27.0.0 — the SAME version as our workspace — so the P27 XDR
+/// types ARE the workspace types. There is NO byte roundtrip: the on-chain cost
+/// params and ledger entries are passed straight through. Only the canonical
+/// internal error type (P25, for `SorobanExecutionError`) requires a conversion,
+/// done via `convert_host_error_p27_to_p25`.
+fn execute_host_function_p27(
+    request: HostFunctionInvocation<'_>,
+    existing_cache: Option<&ModuleCacheP27>,
+) -> Result<SorobanExecutionResult, SorobanExecutionError> {
+    use soroban_env_host27::{budget::Budget, e2e_invoke, fees::compute_rent_fee};
+
+    let HostFunctionInvocation {
+        host_function,
+        auth_entries,
+        source,
+        state,
+        context,
+        soroban_data,
+        soroban_config,
+        guarded_hot_archive,
+        ttl_key_cache,
+        ..
+    } = request;
+
+    let make_setup_error = |e: HostErrorP27| SorobanExecutionError {
+        host_error: convert_host_error_p27_to_p25(e),
+        cpu_insns_consumed: 0,
+        mem_bytes_consumed: 0,
+        diagnostic_events: Vec::new(),
+    };
+
+    let instruction_limit = soroban_data.resources.instructions as u64;
+    let memory_limit = soroban_config.tx_max_memory_bytes;
+
+    let budget = if soroban_config.has_valid_cost_params() {
+        // NATIVE: workspace ContractCostParams == soroban_env_host27::xdr::ContractCostParams.
+        // Pass them straight through — no ws_to_pNN conversion.
+        Budget::try_from_configs(
+            instruction_limit,
+            memory_limit,
+            soroban_config.cpu_cost_params.clone(),
+            soroban_config.mem_cost_params.clone(),
+        )
+        .map_err(make_setup_error)?
+    } else {
+        tracing::warn!("Using default Soroban budget - cost parameters not loaded from network.");
+        Budget::default()
+    };
+
+    let ledger_info = soroban_env_host27::LedgerInfo {
+        protocol_version: context.protocol_version,
+        sequence_number: context.sequence,
+        timestamp: context.close_time,
+        network_id: context.network_id.0 .0,
+        base_reserve: context.base_reserve,
+        min_temp_entry_ttl: soroban_config.min_temp_entry_ttl,
+        min_persistent_entry_ttl: soroban_config.min_persistent_entry_ttl,
+        max_entry_ttl: soroban_config.max_entry_ttl,
+    };
+
+    tracing::debug!(
+        protocol_version = context.protocol_version,
+        sequence_number = context.sequence,
+        timestamp = context.close_time,
+        instruction_limit,
+        memory_limit,
+        has_cost_params = soroban_config.has_valid_cost_params(),
+        "P27: Soroban host ledger info configured"
+    );
+
+    // SECURITY: PRNG seed always Some in production Soroban execution path
+    let base_prng_seed: [u8; 32] = if let Some(prng_seed) = context.soroban_prng_seed {
+        prng_seed
+    } else {
+        tracing::warn!("P27: Using fallback PRNG seed - results may differ from stellar-core");
+        derive_fallback_prng_seed(context)
+    };
+
+    let snapshot = LedgerSnapshotAdapterP25::with_hot_archive(
+        state,
+        context.sequence,
+        guarded_hot_archive,
+        ttl_key_cache,
+    );
+
+    // ── Gather footprint entries ──
+    let footprint = prepare_footprint_entries(
+        &snapshot,
+        soroban_data,
+        context,
+        soroban_config,
+        ttl_key_cache,
+        "P27",
+    )?;
+
+    // Use existing module cache — it must always be provided.
+    let module_cache = existing_cache
+        .unwrap_or_else(|| {
+            panic!(
+                "P27: Module cache is not available — this is a bug. \
+                The persistent module cache should always be initialized before TX execution."
+            )
+        })
+        .clone();
+    let module_cache = Some(module_cache);
+
+    // ── Encode inputs and call non-typed invoke_host_function() ──
+    let inputs = encode_invocation_inputs(host_function, soroban_data, source, auth_entries)?;
+
+    let mut diagnostic_events: Vec<soroban_env_host27::xdr::DiagnosticEvent> = Vec::new();
+
+    let result = match e2e_invoke::invoke_host_function(
+        &budget,
+        true, // enable_diagnostics
+        inputs.encoded_host_fn,
+        inputs.encoded_resources,
+        &footprint.actual_restored_indices,
+        inputs.encoded_source,
+        inputs.encoded_auth.into_iter(),
+        ledger_info,
+        footprint.encoded_ledger_entries.into_iter(),
+        footprint.encoded_ttl_entries.into_iter(),
+        base_prng_seed.to_vec(),
+        &mut diagnostic_events,
+        None, // trace_hook
+        module_cache,
+    ) {
+        Ok(r) => {
+            tracing::debug!(
+                cpu_consumed = budget.get_cpu_insns_consumed().unwrap_or(0),
+                mem_consumed = budget.get_mem_bytes_consumed().unwrap_or(0),
+                "P27: e2e_invoke completed successfully"
+            );
+            r
+        }
+        Err(e) => {
+            let cpu_insns_consumed = budget.get_cpu_insns_consumed().unwrap_or(0);
+            let mem_bytes_consumed = budget.get_mem_bytes_consumed().unwrap_or(0);
+            tracing::debug!(
+                cpu_consumed = cpu_insns_consumed,
+                mem_consumed = mem_bytes_consumed,
+                error = %e,
+                "P27: e2e_invoke failed"
+            );
+            for (i, event) in diagnostic_events.iter().enumerate() {
+                use soroban_env_host27::xdr::WriteXdr as _;
+                if let Ok(encoded) = event.to_xdr(soroban_env_host27::xdr::Limits::none()) {
+                    tracing::warn!(
+                        event_idx = i,
+                        event_hex = hex::encode(&encoded),
+                        "P27: Diagnostic event"
+                    );
+                }
+            }
+            return Err(SorobanExecutionError {
+                host_error: convert_host_error_p27_to_p25(e),
+                cpu_insns_consumed,
+                mem_bytes_consumed,
+                diagnostic_events: convert_diagnostic_events_p27(diagnostic_events),
+            });
+        }
+    };
+
+    // ── Decode result ──
+    // Convert diagnostic events before defining closures that borrow budget.
+    let final_diagnostic_events = convert_diagnostic_events_p27(diagnostic_events);
+
+    let make_budget_error = |desc: &str| -> SorobanExecutionError {
+        tracing::debug!(desc, "P27: XDR decode error in result processing");
+        SorobanExecutionError {
+            host_error: HostErrorP25::from(soroban_env_host25::Error::from_type_and_code(
+                soroban_env_host25::xdr::ScErrorType::Context,
+                soroban_env_host25::xdr::ScErrorCode::InternalError,
+            )),
+            cpu_insns_consumed: budget.get_cpu_insns_consumed().unwrap_or(0),
+            mem_bytes_consumed: budget.get_mem_bytes_consumed().unwrap_or(0),
+            diagnostic_events: final_diagnostic_events.clone(),
+        }
+    };
+
+    let (return_value, return_value_size) = match result.encoded_invoke_result {
+        Ok(ref bytes) => {
+            let val = ScVal::from_xdr(bytes, Limits::none())
+                .map_err(|_| make_budget_error("failed to decode ScVal"))?;
+            (val, bytes.len() as u32)
+        }
+        Err(ref e) => {
+            let cpu_insns_consumed = budget.get_cpu_insns_consumed().unwrap_or(0);
+            let mem_bytes_consumed = budget.get_mem_bytes_consumed().unwrap_or(0);
+            tracing::debug!(
+                cpu_consumed = cpu_insns_consumed,
+                mem_consumed = mem_bytes_consumed,
+                error = %e,
+                "P27: e2e_invoke result contained error"
+            );
+            return Err(SorobanExecutionError {
+                host_error: convert_host_error_p27_to_p25(e.clone()),
+                cpu_insns_consumed,
+                mem_bytes_consumed,
+                diagnostic_events: final_diagnostic_events.clone(),
+            });
+        }
+    };
+
+    // ── Contract events ──
+    let (contract_events, contract_events_size) =
+        decode_contract_events(&result.encoded_contract_events, &make_budget_error)?;
+
+    // ── Rent: use P27 host's compute_rent_fee ──
+    let rent_changes = e2e_invoke::extract_rent_changes(&result.ledger_changes);
+    let p27_rent_config = rent_fee_config_p25_to_p27(&soroban_config.rent_fee_config);
+    let rent_fee = compute_rent_fee(&rent_changes, &p27_rent_config, context.sequence);
+
+    // ── Storage changes ──
+    let normalized_changes: Vec<NormalizedLedgerChange> = result
+        .ledger_changes
+        .into_iter()
+        .map(|c| NormalizedLedgerChange {
+            encoded_key: c.encoded_key,
+            read_only: c.read_only,
+            encoded_new_value: c.encoded_new_value,
+            old_entry_size_bytes_for_rent: c.old_entry_size_bytes_for_rent,
+            ttl_new_live_until_ledger: c.ttl_change.map(|t| t.new_live_until_ledger),
+        })
+        .collect();
+    let storage_changes =
+        map_storage_changes(normalized_changes, state, ttl_key_cache, &make_budget_error)?;
+
+    let cpu_insns = budget.get_cpu_insns_consumed().unwrap_or(0);
+    let mem_bytes = budget.get_mem_bytes_consumed().unwrap_or(0);
+    let contract_events_and_return_value_size =
+        contract_events_size.saturating_add(return_value_size);
+
+    Ok(SorobanExecutionResult {
+        return_value,
+        storage_changes,
+        contract_events,
+        diagnostic_events: final_diagnostic_events,
+        cpu_insns,
+        mem_bytes,
+        contract_events_and_return_value_size,
+        rent_fee,
+        live_bucket_list_restores: footprint.live_bl_restores,
+        actual_restored_indices: footprint.actual_restored_indices,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1930,6 +2274,32 @@ mod tests {
         });
         let hash = compute_key_hash(&key);
         assert_ne!(hash.0, [0u8; 32]);
+    }
+
+    /// V27 protocol routes to a P27 module cache; V26 still routes to P26.
+    #[test]
+    fn test_new_for_protocol_v27_routes_to_p27() {
+        let cache27 = PersistentModuleCache::new_for_protocol(27)
+            .expect("P27 module cache should be available");
+        assert!(
+            cache27.as_p27().is_some(),
+            "protocol 27 must produce a P27 cache"
+        );
+        assert!(
+            cache27.as_p26().is_none(),
+            "protocol 27 must NOT produce a P26 cache"
+        );
+
+        let cache26 = PersistentModuleCache::new_for_protocol(26)
+            .expect("P26 module cache should be available");
+        assert!(
+            cache26.as_p26().is_some(),
+            "protocol 26 must still produce a P26 cache"
+        );
+        assert!(
+            cache26.as_p27().is_none(),
+            "protocol 26 must NOT produce a P27 cache"
+        );
     }
 
     /// Test compute_key_hash produces different hashes for different keys.

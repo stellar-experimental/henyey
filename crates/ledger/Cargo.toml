@@ -15,6 +15,7 @@ henyey-tx.workspace = true
 henyey-invariant.workspace = true
 soroban-env-host-p25.workspace = true
 soroban-env-host-p26.workspace = true
+soroban-env-host-p27.workspace = true
 
 # Serialization
 serde.workspace = true

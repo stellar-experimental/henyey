@@ -43,14 +43,15 @@ pub struct GenesisConfig {
 
 impl Default for GenesisConfig {
     fn default() -> Self {
-        // Matches stellar-core Config.cpp defaults (false / 26 / 100 /
-        // 100_000_000 / 50). With `use_config_for_genesis = false` these
-        // overrides are inert and genesis is byte-identical to the pre-change
+        // Matches stellar-core Config.cpp defaults (false / CURRENT_PROTOCOL / 100 /
+        // 100_000_000 / 50; stellar-core ties TESTING_UPGRADE_LEDGER_PROTOCOL_VERSION
+        // to CURRENT_LEDGER_PROTOCOL_VERSION). With `use_config_for_genesis = false`
+        // these overrides are inert and genesis is byte-identical to the pre-change
         // behavior (the genesis header still uses the hardcoded 0 / 100 /
         // 100_000_000 / 100 values below).
         Self {
             use_config_for_genesis: false,
-            protocol_version: 26,
+            protocol_version: henyey_common::protocol::CURRENT_LEDGER_PROTOCOL_VERSION,
             base_fee: 100,
             base_reserve: 100_000_000,
             max_tx_set_size: 50,

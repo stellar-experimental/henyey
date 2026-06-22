@@ -13,7 +13,7 @@ if [ ! -d "stellar-core/.git" ] && [ ! -f "stellar-core/.git" ]; then
 fi
 
 errors=0
-for proto in p24 p25 p26; do
+for proto in p24 p25 p26 p27; do
     # Extract recorded gitlink SHA from stellar-core's tree
     submodule_sha=$(git -C stellar-core ls-tree HEAD "src/rust/soroban/$proto" | awk '{print $3}')
     if [ -z "$submodule_sha" ]; then
@@ -46,7 +46,7 @@ if [ $errors -gt 0 ]; then
     echo ""
     echo "FAIL: $errors soroban pin(s) out of sync with stellar-core submodule."
     echo "Update Cargo.toml revs to match:"
-    echo "  git -C stellar-core ls-tree HEAD src/rust/soroban/p24 src/rust/soroban/p25 src/rust/soroban/p26"
+    echo "  git -C stellar-core ls-tree HEAD src/rust/soroban/p24 src/rust/soroban/p25 src/rust/soroban/p26 src/rust/soroban/p27"
     exit 1
 fi
 echo ""
