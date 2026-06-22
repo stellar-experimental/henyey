@@ -452,7 +452,7 @@ metric_catalog! {
 
         // Phase 4: Overlay connection breakdown.
         OVERLAY_INBOUND_AUTHENTICATED = "stellar_overlay_inbound_authenticated"
-            => "Authenticated inbound peer connections";
+            => "Authenticated inbound peer connections (instantaneous net, currently-authenticated count; trend stellar_overlay_inbound_authenticated_total instead)";
         OVERLAY_OUTBOUND_AUTHENTICATED = "stellar_overlay_outbound_authenticated"
             => "Authenticated outbound peer connections";
         OVERLAY_INBOUND_PENDING = "stellar_overlay_inbound_pending"
@@ -622,7 +622,14 @@ metric_catalog! {
         OVERLAY_INBOUND_ESTABLISH_TOTAL = "stellar_overlay_inbound_establish_total"
             => "Total inbound peers fully established (registered after handshake)";
         OVERLAY_INBOUND_DROP_TOTAL = "stellar_overlay_inbound_drop_total"
-            => "Total inbound peer disconnections (run_peer_loop returned)";
+            => "Total inbound peer disconnections (run_peer_loop returned); equals remote + local";
+        // #3422 diagnostic: segment inbound drops by initiator so "peers churn
+        // out" (remote RST/FIN) is visibly distinct from "henyey drops peers".
+        // remote + local == the inbound_drop total by construction.
+        OVERLAY_INBOUND_DROP_REMOTE_TOTAL = "stellar_overlay_inbound_drop_remote_total"
+            => "Inbound drops initiated by the remote peer (FIN / RST / recv-error)";
+        OVERLAY_INBOUND_DROP_LOCAL_TOTAL = "stellar_overlay_inbound_drop_local_total"
+            => "Inbound drops initiated by henyey (timeout / send-error / protocol / shutdown)";
         OVERLAY_INBOUND_REJECT_TOTAL = "stellar_overlay_inbound_reject_total"
             => "Total inbound connections rejected before establishment";
         // #3419 diagnostic: monotonic count of inbound peers that reached
@@ -1069,6 +1076,8 @@ pub(crate) async fn refresh_gauges(state: &ServerState) {
         OVERLAY_INBOUND_ATTEMPT_TOTAL.absolute(ov.inbound_attempt);
         OVERLAY_INBOUND_ESTABLISH_TOTAL.absolute(ov.inbound_establish);
         OVERLAY_INBOUND_DROP_TOTAL.absolute(ov.inbound_drop);
+        OVERLAY_INBOUND_DROP_REMOTE_TOTAL.absolute(ov.inbound_drop_remote);
+        OVERLAY_INBOUND_DROP_LOCAL_TOTAL.absolute(ov.inbound_drop_local);
         OVERLAY_INBOUND_REJECT_TOTAL.absolute(ov.inbound_reject);
         OVERLAY_INBOUND_AUTHENTICATED_TOTAL.absolute(ov.inbound_authenticated_total);
         OVERLAY_OUTBOUND_ATTEMPT_TOTAL.absolute(ov.outbound_attempt);

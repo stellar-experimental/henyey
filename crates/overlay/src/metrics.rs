@@ -285,8 +285,22 @@ pub struct OverlayMetrics {
     /// Incremented exactly once per inbound peer that reaches `register_peer` Ok.
     pub inbound_establish: Counter,
     /// Inbound peer disconnections: incremented after `run_peer_loop` returns for an
-    /// inbound peer (mirrors `inbound_establish`).
+    /// inbound peer (mirrors `inbound_establish`). This is the unconditional total;
+    /// it always equals `inbound_drop_remote + inbound_drop_local` by construction
+    /// (both siblings are incremented at the same single drop site in
+    /// `manager/connection.rs`).
     pub inbound_drop: Counter,
+    /// Inbound drops where the *remote peer* closed/reset the socket: `recv`
+    /// returning `Ok(None)` (peer FIN) or a recv error (RST / errno 104). #3419
+    /// diagnostic: distinguishes "peers churn out" (high remote ratio, normal for
+    /// transient leaf peers) from "henyey drops peers". Observability-only.
+    pub inbound_drop_remote: Counter,
+    /// Inbound drops where *henyey* broke the peer loop: idle/straggler timeout,
+    /// send / flood-send error, protocol-violation or received-ERROR_MSG teardown,
+    /// shutdown, or channel close. The `send_error` case is attributed local by the
+    /// "who broke the loop" convention even though the underlying cause may be a
+    /// remote RST surfaced on the next write. #3419 diagnostic; observability-only.
+    pub inbound_drop_local: Counter,
     /// Inbound connections rejected at any point after accept but before establish
     /// (handshake failure, banned, duplicate, slots full, register race).
     pub inbound_reject: Counter,
@@ -294,8 +308,12 @@ pub struct OverlayMetrics {
     /// (handshake completed + registered). Diagnostic for #3419: lets an
     /// operator distinguish "never authenticated" (stays 0) from "authenticated
     /// then churned" (climbs while the instantaneous
-    /// `stellar_overlay_inbound_authenticated` gauge stays near 0). Mirrors the
-    /// increment point of `inbound_establish`; observability-only.
+    /// `stellar_overlay_inbound_authenticated` gauge stays near 0). This `_total`
+    /// is the cumulative *trend* line; the `stellar_overlay_inbound_authenticated`
+    /// gauge is the instantaneous net (currently-authenticated) count — a single
+    /// snapshot of the gauge reading `== drop total` is not a regression, which
+    /// misled three #3419 investigations. Mirrors the increment point of
+    /// `inbound_establish`; observability-only.
     pub inbound_authenticated_total: Counter,
     /// Outbound connection attempts: a dial was actually initiated (after the
     /// address reservation succeeded inside `connect_to_discovered_peer` /
@@ -420,6 +438,8 @@ impl OverlayMetrics {
             inbound_attempt: self.inbound_attempt.get(),
             inbound_establish: self.inbound_establish.get(),
             inbound_drop: self.inbound_drop.get(),
+            inbound_drop_remote: self.inbound_drop_remote.get(),
+            inbound_drop_local: self.inbound_drop_local.get(),
             inbound_reject: self.inbound_reject.get(),
             inbound_authenticated_total: self.inbound_authenticated_total.get(),
             outbound_attempt: self.outbound_attempt.get(),
@@ -496,6 +516,8 @@ impl OverlayMetrics {
             &self.inbound_attempt,
             &self.inbound_establish,
             &self.inbound_drop,
+            &self.inbound_drop_remote,
+            &self.inbound_drop_local,
             &self.inbound_reject,
             &self.inbound_authenticated_total,
             &self.outbound_attempt,
@@ -561,6 +583,10 @@ pub struct OverlayMetricsSnapshot {
     pub inbound_attempt: u64,
     pub inbound_establish: u64,
     pub inbound_drop: u64,
+    /// Inbound drops initiated by the remote peer (FIN / RST / recv-error) (#3422).
+    pub inbound_drop_remote: u64,
+    /// Inbound drops initiated by henyey (timeout / send-error / protocol / shutdown) (#3422).
+    pub inbound_drop_local: u64,
     pub inbound_reject: u64,
     /// Monotonic count of inbound peers that reached authenticated state (#3419).
     pub inbound_authenticated_total: u64,

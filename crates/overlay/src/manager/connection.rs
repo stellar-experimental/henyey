@@ -4,7 +4,7 @@
 //! `connect_outbound_inner`, `run_discovered_peer_connection`, `add_peer`,
 //! and related helpers.
 
-use super::peer_loop::make_error_msg;
+use super::peer_loop::{make_error_msg, DropInitiator};
 use super::{OutboundMessage, OverlayManager, SharedPeerState};
 use crate::{
     connection::{ConnectionDirection, ConnectionPool, Listener},
@@ -496,7 +496,7 @@ impl OverlayManager {
         );
 
         let generation = register_result.generation;
-        Self::run_peer_loop(
+        let drop_initiator = Self::run_peer_loop(
             peer_id.clone(),
             peer,
             register_result.outbound_rx,
@@ -505,7 +505,14 @@ impl OverlayManager {
         )
         .await;
 
+        // #3422: the total is unconditional; the initiator-segmented siblings sum
+        // to it by construction (every inbound drop increments exactly one of
+        // remote/local here).
         shared.metrics.inbound_drop.inc();
+        match drop_initiator {
+            DropInitiator::Remote => shared.metrics.inbound_drop_remote.inc(),
+            DropInitiator::Local => shared.metrics.inbound_drop_local.inc(),
+        }
         shared.cleanup_peer(&peer_id, generation);
         pool.release_authenticated();
     }
@@ -778,7 +785,8 @@ impl OverlayManager {
         // NOTE: Do NOT send PEERS to outbound peers — see Peer.cpp:1225-1230.
 
         let generation = register_result.generation;
-        Self::run_peer_loop(
+        // Outbound out of scope for #3422 — discard the DropInitiator.
+        let _ = Self::run_peer_loop(
             peer_id.clone(),
             peer,
             register_result.outbound_rx,
@@ -1134,7 +1142,8 @@ pub(super) async fn connect_to_explicit_peer(
     let generation = register_result.generation;
     let handle = tokio::spawn(async move {
         // Clone again for run_peer_loop (takes ownership); originals used for cleanup.
-        OverlayManager::run_peer_loop(
+        // Outbound out of scope for #3422 — discard the DropInitiator.
+        let _ = OverlayManager::run_peer_loop(
             peer_id_clone.clone(),
             peer,
             register_result.outbound_rx,
@@ -1606,6 +1615,21 @@ mod tests {
         }
         assert_eq!(metrics_a.outbound_drop.get(), 1);
         assert_eq!(metrics_b.inbound_drop.get(), 1);
+
+        // #3422: the initiator-segmented siblings must sum to the inbound_drop
+        // total by construction. Exactly one of remote/local is incremented per
+        // inbound drop, so remote + local == total == 1. (Which side fires is
+        // non-deterministic here — both managers shut down concurrently — so we
+        // assert the invariant, not a specific attribution.)
+        assert_eq!(
+            metrics_b.inbound_drop_remote.get() + metrics_b.inbound_drop_local.get(),
+            metrics_b.inbound_drop.get(),
+            "inbound_drop_remote + inbound_drop_local must equal inbound_drop total"
+        );
+        assert_eq!(
+            metrics_b.inbound_drop_remote.get() + metrics_b.inbound_drop_local.get(),
+            1
+        );
     }
 
     // ---- add_peer dedup tests ----
