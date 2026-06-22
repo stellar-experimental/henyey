@@ -1636,7 +1636,7 @@ impl App {
     /// Used by both the normal escalation path (after RECOVERY_ESCALATION_CATCHUP
     /// attempts) and the fast-track path (when SCP messages arrive but tx_sets
     /// are evicted from peers' caches).
-    async fn trigger_recovery_catchup(
+    pub(super) async fn trigger_recovery_catchup(
         &self,
         current_ledger: u32,
         latest_externalized: u64,
