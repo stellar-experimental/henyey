@@ -1714,7 +1714,12 @@ fn default_base_reserve() -> u32 {
 }
 
 fn default_protocol_version() -> u32 {
-    25
+    // Track the compiled current protocol so a non-pinned node advertises (and
+    // caps operator upgrade proposals at) its real max, mirroring stellar-core's
+    // `LEDGER_PROTOCOL_VERSION = CURRENT_LEDGER_PROTOCOL_VERSION` default
+    // (Config.cpp:160). Shipped mainnet *.toml pin this explicitly and override
+    // the default. See #3550.
+    henyey_common::protocol::CURRENT_LEDGER_PROTOCOL_VERSION
 }
 
 fn default_db_path() -> PathBuf {
