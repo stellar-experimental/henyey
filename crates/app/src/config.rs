@@ -1714,7 +1714,12 @@ fn default_base_reserve() -> u32 {
 }
 
 fn default_protocol_version() -> u32 {
-    25
+    // Track the compiled current protocol so a non-pinned node advertises (and
+    // caps operator upgrade proposals at) its real max, mirroring stellar-core's
+    // `LEDGER_PROTOCOL_VERSION = CURRENT_LEDGER_PROTOCOL_VERSION` default
+    // (Config.cpp:160). Shipped mainnet *.toml pin this explicitly and override
+    // the default. See #3550.
+    henyey_common::protocol::CURRENT_LEDGER_PROTOCOL_VERSION
 }
 
 fn default_db_path() -> PathBuf {
@@ -4935,5 +4940,65 @@ name = "test"
         let meta = BuildMetadata::new("a".repeat(40), "2024-01-01T00:00:00Z");
         assert_eq!(meta.commit_hash(), Some("a".repeat(40).as_str()));
         assert_eq!(meta.build_timestamp(), Some("2024-01-01T00:00:00Z"));
+    }
+
+    // #3550: `default_protocol_version()` must track the compiled
+    // `CURRENT_LEDGER_PROTOCOL_VERSION` constant, not a stale literal. A
+    // non-pinned node otherwise under-advertises its max protocol in compat
+    // `/info` and caps operator upgrade proposals below what it can actually
+    // apply, mirroring stellar-core's
+    // `LEDGER_PROTOCOL_VERSION = CURRENT_LEDGER_PROTOCOL_VERSION` default
+    // (Config.cpp:160).
+    #[test]
+    fn test_default_protocol_version_tracks_current_constant() {
+        assert_eq!(
+            default_protocol_version(),
+            henyey_common::protocol::CURRENT_LEDGER_PROTOCOL_VERSION,
+            "default_protocol_version() must track CURRENT_LEDGER_PROTOCOL_VERSION, not a literal"
+        );
+        // Anti-drift: pin the current expected value so a stale literal is caught.
+        assert_eq!(default_protocol_version(), 27);
+    }
+
+    #[test]
+    fn test_network_config_default_max_protocol_is_current() {
+        // The non-pinned default (used by compat `/info` advertisement, a
+        // verbatim passthrough at compat_http/handlers/info.rs:39) must equal
+        // the compiled current protocol.
+        let config = AppConfig::default();
+        assert_eq!(
+            config.network.max_protocol_version,
+            henyey_common::protocol::CURRENT_LEDGER_PROTOCOL_VERSION
+        );
+
+        // A TOML that names `[network]` but omits `max_protocol_version` must
+        // deserialize to the current constant via `#[serde(default = ...)]`.
+        let toml_str = r#"
+[network]
+passphrase = "Test SDF Network ; September 2015"
+"#;
+        let parsed: AppConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(
+            parsed.network.max_protocol_version,
+            henyey_common::protocol::CURRENT_LEDGER_PROTOCOL_VERSION,
+            "absent max_protocol_version must default to CURRENT_LEDGER_PROTOCOL_VERSION"
+        );
+    }
+
+    #[test]
+    fn test_explicit_max_protocol_version_overrides_default() {
+        // Override guardrail: an explicit pin (as in all shipped mainnet *.toml)
+        // must win over the now-current default. This is what keeps mainnet
+        // advertising the pinned 25 while the default auto-tracks the constant.
+        let toml_str = r#"
+[network]
+passphrase = "Public Global Stellar Network ; September 2015"
+max_protocol_version = 25
+"#;
+        let config: AppConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(
+            config.network.max_protocol_version, 25,
+            "an explicit TOML max_protocol_version must override the default"
+        );
     }
 }
