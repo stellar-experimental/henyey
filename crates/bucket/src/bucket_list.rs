@@ -3873,7 +3873,7 @@ mod tests {
     /// touches bucket state.
     #[tokio::test(flavor = "multi_thread")]
     async fn test_per_level_hash_trace_is_non_perturbing() {
-        use crate::tracing_test_support::capture_events;
+        use henyey_common::test_support::tracing_capture::capture_events;
 
         // Hook disabled (no subscriber enables the target).
         let chain_off = run_sixteen_ledger_chain();

@@ -1261,7 +1261,7 @@ mod tests {
 
     #[test]
     fn test_log_and_new_emits_structured_tracing() {
-        use crate::tracing_test_support::capture_events;
+        use henyey_common::test_support::tracing_capture::capture_events;
 
         let expected = Hash256::ZERO;
         let actual = Hash256::from([0xAB; 32]);

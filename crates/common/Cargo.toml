@@ -19,6 +19,21 @@ toml.workspace = true
 tokio = { workspace = true, features = ["rt"] }
 tracing.workspace = true
 
+# Optional, dev-only: pulled in ONLY when the `test-support` feature is enabled
+# (see [features] below). A normal `cargo build --all` with no features must not
+# compile this into the production `henyey-common` artifact.
+tracing-subscriber = { workspace = true, optional = true }
+
+[features]
+# Exposes the deterministic tracing-capture test helper under
+# `henyey_common::test_support`. Consumer crates opt in via
+# `[dev-dependencies] henyey-common = { workspace = true, features =
+# ["test-support"] }`. Mirrors the self-referential `test-utils` feature in
+# `henyey-history`.
+test-support = ["dep:tracing-subscriber"]
+
 [dev-dependencies]
 tempfile.workspace = true
 tokio = { workspace = true, features = ["rt", "macros", "time"] }
+# Enable the helper for this crate's own tests (the helper self-test).
+henyey-common = { path = ".", features = ["test-support"] }
