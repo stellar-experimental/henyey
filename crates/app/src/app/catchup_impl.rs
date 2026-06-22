@@ -3,6 +3,48 @@
 use super::archive_cache::CacheResult;
 use super::*;
 
+/// Decide how a forced **recovery catchup** should run given the node's
+/// current LCL and the operator's configured catchup mode.
+///
+/// This is the single safety hinge for the stateless fresh-genesis carveout
+/// (#3410). A node whose LCL is exactly genesis (ledger 1) has, by
+/// definition, no externalized/committed ledger state of its own. Under the
+/// SSC mixed-image mission its force-bootstrapped genesis hash legitimately
+/// differs from the (earlier-started) peers' archive history chain, so a
+/// replay-from-genesis catchup would compare the archive's genesis-chain
+/// header against the local genesis snapshot and fail `verify_knit_to_lcl`
+/// with a `KnitLcl*` error — the structurally-doomed first attempt described
+/// in #3410.
+///
+/// The fix: when `current == GENESIS_LEDGER_SEQ`, force the effective catchup
+/// depth to [`CatchupMode::Minimal`] (count = 0). At genesis,
+/// `CatchupRange::calculate` then yields `BucketsOnly` (checkpoint target) or
+/// `BucketApplyAndReplay` (non-checkpoint target) — i.e. it adopts the
+/// archive's state via bucket-apply, exactly as stellar-core's fresh-node
+/// `CatchupWork::downloadApplyBuckets` does. The knit-to-LCL check then runs
+/// only in the post-checkpoint replay phase (LCL > genesis at that point),
+/// never against the genesis snapshot. `seed_local_state == false` so the
+/// genesis branch does NOT clone the local genesis bucket state for replay.
+///
+/// For `LCL > genesis` the operator's configured mode is returned unchanged
+/// and local state is seeded as before — `CatchupRange` selection and the
+/// knit-fatal classification are byte-for-byte unchanged (preserving the
+/// #3282/#3288 semantics).
+///
+/// Returns `(effective_mode, seed_local_state)`.
+pub(crate) fn genesis_recovery_catchup_plan(
+    current: u32,
+    configured_mode: CatchupMode,
+) -> (CatchupMode, bool) {
+    if current == GENESIS_LEDGER_SEQ {
+        // Stateless fresh node: route to archive-authoritative bucket-apply.
+        (CatchupMode::Minimal, false)
+    } else {
+        // Has committed local state: unchanged behavior.
+        (configured_mode, true)
+    }
+}
+
 impl App {
     pub(crate) fn should_skip_externalized_catchup_cooldown(
         target_checkpoint: u32,
@@ -193,6 +235,34 @@ impl App {
             );
         }
 
+        // #3410 change 1 (load-bearing): a stateless fresh-genesis node
+        // (LCL == ledger 1) forced into recovery catchup must NOT replay from
+        // genesis. Under the SSC mixed-image mission its force-bootstrapped
+        // genesis hash differs from the (earlier-started) peers' archive
+        // history chain, so a replay-from-genesis would compare the archive's
+        // genesis-chain header against the local genesis snapshot and fail
+        // `verify_knit_to_lcl` with a `KnitLcl*` error — the structurally
+        // doomed first attempt. Force the effective depth to `Minimal` (count
+        // = 0) so `CatchupRange::calculate` yields `BucketsOnly` /
+        // `BucketApplyAndReplay` — archive-authoritative bucket-apply,
+        // mirroring core's fresh-node `CatchupWork::downloadApplyBuckets`. The
+        // knit-to-LCL check then runs only in the post-checkpoint replay phase
+        // (LCL > genesis at that point), never against genesis.
+        //
+        // For LCL > genesis the configured mode and local-state seeding are
+        // returned unchanged — `CatchupRange` selection is byte-for-byte
+        // identical (preserves #3282/#3288). `force_full` already ignores
+        // local state, so the seeding decision below also short-circuits on it.
+        let (mode, seed_local_state) = genesis_recovery_catchup_plan(current, mode);
+        if current == GENESIS_LEDGER_SEQ {
+            tracing::info!(
+                target_ledger,
+                "Fresh-genesis recovery catchup — routing to archive-authoritative \
+                 bucket-apply (effective Minimal depth), skipping replay-from-genesis \
+                 knit (#3410)"
+            );
+        }
+
         // #3282: track whether this catchup is seeded from CLONED LOCAL state.
         // Only the near-tip fast path below (initialized ledger manager, no
         // force_full) clones the live LCL header and sets `override_lcl`,
@@ -204,7 +274,7 @@ impl App {
         // `false`; set `true` only on the cloned-local fast path.
         let mut seeded_from_local_clone = false;
 
-        let (existing_state, override_lcl) = if current >= GENESIS_LEDGER_SEQ && !force_full {
+        let (existing_state, override_lcl) = if seed_local_state && !force_full {
             if self.ledger_manager.is_initialized() {
                 seeded_from_local_clone = true;
                 // Fast path: clone from live ledger manager.
@@ -1830,13 +1900,27 @@ impl App {
         // 10 seconds gives enough time for SCP messages to arrive and fill
         // small gaps after catchup + buffered ledger drain.
         const EVALUATION_COOLDOWN_SECS: u64 = 10;
+        // #3410: shorten the inter-catchup-retry backoff for a stateless
+        // fresh-genesis node (LCL == ledger 1). After change 1 routes its
+        // recovery catchup to a bucket-apply, the doomed slow replay-from-
+        // genesis attempt is gone; a fresh node racing the SSC consensus-stall
+        // timeout should re-attempt the bucket-apply quickly rather than wait
+        // the full 10s steady-state cooldown. Gated strictly on genesis so the
+        // steady-state cooldown (which prevents post-catchup log spam / rapid
+        // re-trigger on a node WITH state) is unchanged for LCL > genesis.
+        const GENESIS_EVALUATION_COOLDOWN_SECS: u64 = 3;
+        let cooldown_secs = if self.current_ledger_seq() == GENESIS_LEDGER_SEQ {
+            GENESIS_EVALUATION_COOLDOWN_SECS
+        } else {
+            EVALUATION_COOLDOWN_SECS
+        };
         self.set_phase_sub(PHASE_13_4_BUFFERED_LAST_CATCHUP_COMPLETED_READ);
         let cooldown_elapsed = self
             .last_catchup_completed_at
             .read()
             .await
             .map(|t| t.elapsed().as_secs());
-        let recently_skipped = cooldown_elapsed.is_some_and(|s| s < EVALUATION_COOLDOWN_SECS);
+        let recently_skipped = cooldown_elapsed.is_some_and(|s| s < cooldown_secs);
         if recently_skipped {
             tracing::debug!(
                 cooldown_elapsed = ?cooldown_elapsed,
@@ -2719,6 +2803,16 @@ impl App {
                 *self.last_catchup_completed_at.write().await = Some(self.clock.now());
             }
             Err(err) => {
+                // #3410: read `at_genesis` at the TOP of the Err arm, before
+                // any state mutation / cooldown writes below. The failed-catchup
+                // knit error fires before any ledger close advances LCL, so the
+                // LCL is still genesis (ledger 1) here for a stateless fresh
+                // node. A node at LCL == genesis has, by definition, no
+                // externalized/committed ledger state of its own — adopting the
+                // archive's state via a bucket-apply retry carries no divergence
+                // risk. This is the single safety hinge for the carveout below.
+                let at_genesis = self.current_ledger_seq() == GENESIS_LEDGER_SEQ;
+
                 // #3282 self-heal: a local-vs-archive state divergence
                 // (KnitLclHashMismatch et al.) on a catchup SEEDED FROM CLONED
                 // LOCAL state is NOT terminal — the cloned local LCL is the
@@ -2768,6 +2862,48 @@ impl App {
                     self.catchup_needs_full_reset.store(true, Ordering::SeqCst);
                     // Continue to the shared restore/cooldown tail below (do NOT
                     // wipe). The next catchup will be archive-authoritative.
+                    self.restore_operational_state().await;
+                    *self.last_catchup_completed_at.write().await = Some(self.clock.now());
+                    if reset_stuck_state {
+                        if let Some(state) = self.consensus_stuck_state.write().await.as_mut() {
+                            state.recovery_attempts = 0;
+                            state.last_recovery_attempt = self.clock.now();
+                        }
+                    }
+                    return false;
+                }
+
+                // #3410 change 2 (defense-in-depth): a knit-to-LCL header-chain
+                // disagreement while the node is at GENESIS must NOT escalate to
+                // `FATAL: unrecoverable local state failure`. A stateless
+                // fresh-genesis node has no committed state to protect — the
+                // knit disagreement against the archive's (earlier-started)
+                // history chain is expected, not local corruption. Route it to
+                // an archive-authoritative bucket-apply retry
+                // (`catchup_needs_full_reset = true`) and fall through to the
+                // normal failed-catchup cooldown/retry tail instead of
+                // `trigger_fatal_shutdown`.
+                //
+                // This is a same-file safety net for any residual route that
+                // still reaches the knit at genesis (change 1 routes the catchup
+                // *range* to bucket-apply, so the knit normally never runs
+                // against genesis at all). It is gated STRICTLY on `at_genesis`:
+                // for LCL > genesis the knit-fatal classification below is
+                // byte-for-byte unchanged, preserving the #3282/#3288 terminal
+                // semantics for a node that has real state.
+                let is_knit_to_lcl = err
+                    .downcast_ref::<henyey_history::HistoryError>()
+                    .is_some_and(|e| e.is_knit_to_lcl_failure());
+                if at_genesis && is_knit_to_lcl {
+                    tracing::warn!(
+                        error = %err,
+                        "{label} catchup hit a knit-to-LCL mismatch at genesis \
+                         (stateless fresh node) — adopting the archive's state via \
+                         an archive-authoritative bucket-apply retry instead of a \
+                         FATAL wipe (#3410). A node with committed state (LCL > \
+                         genesis) would still wipe here."
+                    );
+                    self.catchup_needs_full_reset.store(true, Ordering::SeqCst);
                     self.restore_operational_state().await;
                     *self.last_catchup_completed_at.write().await = Some(self.clock.now());
                     if reset_stuck_state {
@@ -6209,6 +6345,15 @@ mod tests {
             .build();
         let app = App::new(config).await.unwrap();
 
+        // The scenario this test pins is "the archive rebuild ALREADY ran and
+        // advanced the node past genesis, then diverged at knit again". Advance
+        // the LCL past genesis so the #3410 stateless-genesis carveout does NOT
+        // apply — a node with committed state must still wipe (#3288).
+        let mut header = app.ledger_manager.current_header();
+        header.ledger_seq = 100;
+        app.ledger_manager
+            .set_header_for_test(header, henyey_common::Hash256::ZERO);
+
         let mut shutdown_rx = app.subscribe_shutdown();
 
         let err: anyhow::Error = henyey_history::HistoryError::KnitLclHashMismatch {
@@ -6218,7 +6363,7 @@ mod tests {
         .into();
 
         // seeded_from_local_clone = false → already an archive rebuild; a knit
-        // mismatch here is genuine unrecoverable corruption.
+        // mismatch here (above genesis) is genuine unrecoverable corruption.
         let fatal = app
             .handle_catchup_result(Err(err), false, "test", false)
             .await;
@@ -6234,6 +6379,185 @@ mod tests {
         assert!(
             shutdown_rx.try_recv().is_ok(),
             "shutdown signal must be sent on the terminal divergence"
+        );
+    }
+
+    /// #3410 regression (change 1, load-bearing): a stateless fresh-genesis
+    /// node (LCL == ledger 1) forced into recovery catchup under the
+    /// operator's `Complete` / large-`Recent` policy must be routed to an
+    /// archive-authoritative **bucket-apply** (effective `Minimal` depth), NOT
+    /// a replay-from-genesis that runs `verify_knit_to_lcl` against the local
+    /// genesis snapshot. The plan returns `(Minimal, seed_local_state=false)`
+    /// at genesis so `CatchupRange::calculate` yields `BucketsOnly` /
+    /// `BucketApplyAndReplay` (mirroring core's fresh-node
+    /// `downloadApplyBuckets`).
+    ///
+    /// FAILS on `origin/main`: the helper does not exist, and the genesis
+    /// branch (catchup_impl.rs) clones local genesis state + keeps `Complete`,
+    /// driving the doomed `ReplayOnly`-from-genesis range.
+    #[test]
+    fn test_genesis_recovery_forces_bucket_apply_mode() {
+        use henyey_history::CatchupMode;
+
+        // At genesis: the operator's configured depth is overridden to Minimal
+        // and local state is NOT seeded — regardless of the configured mode.
+        for configured in [
+            CatchupMode::Complete,
+            CatchupMode::Recent(100_000),
+            CatchupMode::Recent(5),
+            CatchupMode::Minimal,
+        ] {
+            let (mode, seed) = genesis_recovery_catchup_plan(GENESIS_LEDGER_SEQ, configured);
+            assert_eq!(
+                mode,
+                CatchupMode::Minimal,
+                "at genesis, effective depth must be Minimal (→ bucket-apply), \
+                 not {configured:?}"
+            );
+            assert!(
+                !seed,
+                "at genesis there is no committed local state to seed for replay"
+            );
+        }
+
+        // Above genesis: the configured mode and local-state seeding are
+        // unchanged (preserves #3282/#3288 and existing CatchupRange selection).
+        for current in [2u32, 64, 100, 61_000_000] {
+            for configured in [
+                CatchupMode::Complete,
+                CatchupMode::Recent(128),
+                CatchupMode::Minimal,
+            ] {
+                let (mode, seed) = genesis_recovery_catchup_plan(current, configured);
+                assert_eq!(
+                    mode, configured,
+                    "above genesis (seq {current}) the configured mode must be unchanged"
+                );
+                assert!(
+                    seed,
+                    "above genesis (seq {current}) local state must still be seeded"
+                );
+            }
+        }
+    }
+
+    /// #3410 regression (change 2, defense-in-depth): a knit-to-LCL mismatch
+    /// while the node is at genesis (LCL == ledger 1) must NOT escalate to
+    /// `FATAL: unrecoverable local state failure`. A stateless fresh node has
+    /// no committed state to protect, so the response is an
+    /// archive-authoritative bucket-apply retry (`catchup_needs_full_reset =
+    /// true`), not a wipe.
+    ///
+    /// A fresh `App::new` is exactly at genesis (ledger manager header seq ==
+    /// 1), modeling the SSC cold-start node. `seeded_from_local_clone = false`
+    /// pins that this is the residual route (not the #3282 cloned-local path).
+    ///
+    /// FAILS on `origin/main`: `KnitLclHashMismatch` is
+    /// `is_fatal_catchup_failure()`, so the Err arm calls
+    /// `trigger_fatal_shutdown` and returns `true` — the #3288 latch is
+    /// bypassed at genesis and the node FATALs.
+    #[tokio::test]
+    async fn test_genesis_knit_mismatch_does_not_trigger_fatal_shutdown() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-test.db");
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
+        let app = App::new(config).await.unwrap();
+
+        // Sanity: a fresh app is at genesis.
+        assert_eq!(
+            app.current_ledger_seq(),
+            GENESIS_LEDGER_SEQ,
+            "precondition: fresh app must be at genesis (ledger 1)"
+        );
+
+        let mut shutdown_rx = app.subscribe_shutdown();
+
+        let err: anyhow::Error = henyey_history::HistoryError::KnitLclHashMismatch {
+            expected: "aa".into(),
+            actual: "bb".into(),
+        }
+        .into();
+
+        // seeded_from_local_clone = false: this is the residual archive-path
+        // route, NOT the #3282 cloned-local self-heal. At genesis it must still
+        // NOT be fatal.
+        let fatal = app
+            .handle_catchup_result(Err(err), false, "test", false)
+            .await;
+
+        assert!(
+            !fatal,
+            "a knit-to-LCL mismatch at genesis must NOT be fatal — a stateless \
+             fresh node has no local state to protect"
+        );
+        assert!(
+            !app.fatal_state_failure.load(Ordering::SeqCst),
+            "fatal_state_failure must NOT be set at genesis"
+        );
+        assert!(
+            app.catchup_needs_full_reset.load(Ordering::SeqCst),
+            "catchup_needs_full_reset must be set so the next catchup is an \
+             archive-authoritative bucket-apply"
+        );
+        assert!(
+            shutdown_rx.try_recv().is_err(),
+            "no shutdown signal may be sent at genesis"
+        );
+    }
+
+    /// #3410 / #3288 guard: a knit-to-LCL mismatch on a node with committed
+    /// state (LCL > genesis) on an archive-authoritative catchup
+    /// (`seeded_from_local_clone = false`) must STILL go FATAL/wipe. The
+    /// genesis carveout is narrowly gated on `LCL == genesis`; for any node
+    /// with real state the #3282/#3288 terminal semantics are preserved
+    /// byte-for-byte.
+    ///
+    /// PASSES on `origin/main` (the pre-existing behavior) and after the fix.
+    #[tokio::test]
+    async fn test_nongenesis_knit_mismatch_still_fatal() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-test.db");
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
+        let app = App::new(config).await.unwrap();
+
+        // Advance the LCL past genesis: this node HAS committed state worth
+        // protecting, so a knit divergence is terminal corruption.
+        let mut header = app.ledger_manager.current_header();
+        header.ledger_seq = 100;
+        app.ledger_manager
+            .set_header_for_test(header, henyey_common::Hash256::ZERO);
+        assert!(
+            app.current_ledger_seq() > GENESIS_LEDGER_SEQ,
+            "precondition: node must be past genesis"
+        );
+
+        let mut shutdown_rx = app.subscribe_shutdown();
+
+        let err: anyhow::Error = henyey_history::HistoryError::KnitLclHashMismatch {
+            expected: "aa".into(),
+            actual: "bb".into(),
+        }
+        .into();
+
+        let fatal = app
+            .handle_catchup_result(Err(err), false, "test", false)
+            .await;
+
+        assert!(
+            fatal,
+            "a knit-to-LCL mismatch ABOVE genesis must be fatal (preserves #3288)"
+        );
+        assert!(
+            app.fatal_state_failure.load(Ordering::SeqCst),
+            "fatal_state_failure must be set above genesis"
+        );
+        assert!(
+            shutdown_rx.try_recv().is_ok(),
+            "shutdown signal must be sent above genesis"
         );
     }
 
