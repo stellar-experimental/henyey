@@ -82,6 +82,47 @@ pub(crate) fn query_rate_limit_window(close_duration: Duration) -> Duration {
     henyey_overlay::query_policy::query_rate_limit_window(close_duration)
 }
 
+/// Offload one periodic tx-set GC purge onto the blocking thread pool, keeping
+/// purges strictly serial via a loop-local in-flight handle (#3532).
+///
+/// The purge (`Herder::purge_persisted_tx_sets` → `BEGIN IMMEDIATE` read-then-
+/// delete over the persisted-tx-set table) is a synchronous SQLite write
+/// transaction. Running it inline in the tokio `select!` event loop froze the
+/// loop for tens of seconds (observed 39s, `watchdog_freeze`) when the table
+/// was large or the WAL write lock was contended, stalling SCP processing,
+/// broadcast, and fetch-response draining (the climbing `fetch_channel_depth`
+/// symptom). This moves the blocking work to `spawn_blocking` so the loop arm
+/// returns immediately.
+///
+/// Parity: stellar-core's `HerderImpl::purgeOldPersistedTxSets()`
+/// (HerderImpl.cpp:2448-2487) runs in an `async_wait` callback and reschedules
+/// `startTxSetGCTimer()` (HerderImpl.cpp:2440-2444) only AFTER the purge
+/// returns — i.e. purges never overlap. The `is_finished()` guard reproduces
+/// that serial, non-overlapping cadence across the async boundary (the timer's
+/// `MissedTickBehavior::Skip` only coalesces ticks, not in-flight tasks). The
+/// purge *contents* are unchanged (same atomic SQL, #2770), and GC only deletes
+/// orphaned/unreferenced persisted tx-sets — never ledger/consensus/bucket
+/// state — so the thread it runs on is not observable and parity is preserved.
+///
+/// `slot` is the loop-local in-flight handle. If a prior purge is still
+/// running, the tick is skipped (coalesced); otherwise a fresh blocking task is
+/// spawned and its handle stored. The handle is fire-and-not-awaited: GC is
+/// idempotent and periodic, so a skipped tick simply re-runs next interval, and
+/// on shutdown the loop `abort()`s any in-flight handle (harmless — the purge
+/// is a single atomic transaction).
+fn dispatch_tx_set_gc<F>(work: F, slot: &mut Option<tokio::task::JoinHandle<()>>)
+where
+    F: FnOnce() + Send + 'static,
+{
+    // Serial cadence: skip if a prior purge is still running (mirrors
+    // stellar-core rescheduling startTxSetGCTimer() only after the purge
+    // returns — purges never overlap).
+    if slot.as_ref().is_some_and(|h| !h.is_finished()) {
+        return;
+    }
+    *slot = Some(tokio::task::spawn_blocking(work));
+}
+
 /// Whether a transaction queue result requires removal of the FloodGate record,
 /// allowing re-delivery to be treated as new.
 ///
@@ -370,6 +411,11 @@ impl App {
             tx_set_gc_period,
         );
         tx_set_gc_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // Loop-local in-flight handle for the offloaded tx-set GC purge (#3532).
+        // The purge runs on the blocking pool via `spawn_blocking`; this handle
+        // keeps purges strictly serial (skip a tick if the prior purge is still
+        // running) and is aborted on shutdown. See `dispatch_tx_set_gc`.
+        let mut tx_set_gc_task: Option<tokio::task::JoinHandle<()>> = None;
 
         // Get mutable access to SCP envelope receiver
         let mut scp_rx = self.scp_envelope_rx.lock().await;
@@ -1175,18 +1221,36 @@ impl App {
 
                 // Periodic GC of unreferenced persisted SCP tx sets.
                 // Parity: stellar-core HerderImpl::startTxSetGCTimer() at
-                // HerderImpl.cpp:2440-2444. Called inline (no spawn_blocking)
-                // to match stellar-core's strictly serial reschedule cadence
-                // and to avoid a fire-and-forget task surviving select! exit
-                // on shutdown.
+                // HerderImpl.cpp:2440-2444. The purge is a synchronous
+                // BEGIN IMMEDIATE SQLite write transaction; running it inline
+                // froze the event loop for tens of seconds (39s watchdog_freeze,
+                // #3532). It is offloaded to the blocking pool via
+                // `dispatch_tx_set_gc`, which keeps purges strictly serial
+                // (mirroring stellar-core's serial reschedule cadence) through
+                // the loop-local in-flight handle. `set_phase(33)` stays on the
+                // loop thread so the watchdog phase label is preserved.
                 _ = tx_set_gc_interval.tick() => {
                     self.set_phase(33); // 33 = tx_set_gc
-                    self.herder.purge_persisted_tx_sets();
+                    let herder = Arc::clone(&self.herder);
+                    dispatch_tx_set_gc(
+                        move || herder.purge_persisted_tx_sets(),
+                        &mut tx_set_gc_task,
+                    );
                 }
 
                 // Shutdown signal (lowest priority)
                 _ = shutdown_rx.recv() => {
                     tracing::info!("Shutdown signal received");
+                    // Abort any in-flight tx-set GC purge so the offloaded
+                    // blocking task does not survive loop exit (#3532). The
+                    // purge is a single atomic, idempotent transaction (#2770),
+                    // so an abort mid-flight is harmless — it either completes
+                    // (spawn_blocking closures are not force-cancelled) or the
+                    // process is exiting; a skipped purge simply re-runs next
+                    // interval on the next startup.
+                    if let Some(h) = tx_set_gc_task.take() {
+                        h.abort();
+                    }
                     break;
                 }
 
