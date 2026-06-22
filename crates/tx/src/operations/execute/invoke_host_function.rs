@@ -507,7 +507,27 @@ fn execute_contract_invocation(
         p23_sac_reconciler,
     } = request;
 
-    // Convert auth entries to a slice
+    // Convert auth entries to a slice.
+    //
+    // Auth entries are passed OPAQUELY to the protocol-routed Soroban host
+    // (`encode_invocation_inputs` in soroban/host.rs serializes them with the
+    // workspace XDR; the host decodes and verifies them with its own bundled
+    // XDR). ALL credential verification — including the CAP-0071 / V_27
+    // variants `SorobanCredentials::{AddressV2, AddressWithDelegates}`, the
+    // recursive `SorobanDelegateSignature` trees, and the new
+    // `ENVELOPE_TYPE_SOROBAN_AUTHORIZATION_WITH_ADDRESS` preimage hashing — is
+    // owned by the host (soroban-env-host-p27), NEVER reimplemented here.
+    // Reimplementing it in henyey-tx would diverge from the host's metered
+    // hashing and fork consensus auth.
+    //
+    // Version gating is host-routing, not a validation-time gate: V_27+ ledgers
+    // run the p27 host (native CAP-0071 verification); pre-V27 ledgers run the
+    // p26 host, whose stellar-xdr 26.0.0 cannot decode credential discriminants
+    // 2/3, yielding a host error → `INVOKE_HOST_FUNCTION_TRAPPED` (a failed
+    // invocation), NOT a synthesized txMALFORMED. This matches stellar-core v27
+    // exactly: `InvokeHostFunctionOpFrame::doCheckValidForSoroban` performs no
+    // credential-type validation. See `crates/tx/tests/cap0071_auth_credentials.rs`
+    // and the `cap0071` unit tests in soroban/host.rs (#3527).
     let auth_entries: Vec<_> = op.auth.to_vec();
 
     // Run all pre-execution footprint checks in a single per-entry pass, mirroring
