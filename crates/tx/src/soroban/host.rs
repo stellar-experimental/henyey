@@ -2302,6 +2302,210 @@ mod tests {
         );
     }
 
+    // ====================================================================
+    // CAP-0071 Soroban authorization delegation (#3527)
+    //
+    // henyey-tx passes Soroban auth entries to the protocol-routed host as
+    // opaque XDR bytes via `encode_invocation_inputs` (host.rs:982). The
+    // host then decodes those bytes with ITS OWN bundled stellar-xdr and
+    // performs ALL credential verification. henyey-tx reimplements none of
+    // it (that would fork consensus auth). These tests pin the protocol
+    // boundary that gates the new credential variants:
+    //
+    //   * The P27 host pins stellar-xdr 27.0.0 (== workspace XDR), so it
+    //     decodes `SorobanCredentials::AddressV2` / `AddressWithDelegates`
+    //     (discriminants 2 / 3) and verifies them natively at V_27+.
+    //   * The pre-V27 P26 host pins stellar-xdr 26.0.0, which has no
+    //     knowledge of discriminants 2 / 3, so decoding an entry carrying
+    //     them FAILS. In the live apply path that decode failure surfaces
+    //     as a non-internal host error → `INVOKE_HOST_FUNCTION_TRAPPED`
+    //     (an op-level failed invocation), NOT a synthesized txMALFORMED.
+    //
+    // This mirrors stellar-core v27.0.0 exactly: `doCheckValidForSoroban`
+    // (InvokeHostFunctionOpFrame.cpp:1282) performs NO credential-type
+    // validation, and `get_host_module_for_protocol`
+    // (soroban_proto_all.rs) routes by ledger protocol version to the same
+    // p26 / p27 hosts. Pre-V27 rejection is therefore host-routing, not a
+    // validation-time gate — so henyey-tx adds no explicit version gate.
+    // ====================================================================
+
+    /// Build an `AddressV2` credential auth entry (discriminant 2) using the
+    /// workspace XDR (== P27 XDR), exactly as henyey-tx would hand it to the
+    /// host boundary.
+    fn cap0071_address_v2_entry() -> stellar_xdr::SorobanAuthorizationEntry {
+        use stellar_xdr::*;
+        SorobanAuthorizationEntry {
+            credentials: SorobanCredentials::AddressV2(SorobanAddressCredentials {
+                address: ScAddress::Contract(ContractId(Hash([7u8; 32]))),
+                nonce: 42,
+                signature_expiration_ledger: 1000,
+                signature: ScVal::Void,
+            }),
+            root_invocation: SorobanAuthorizedInvocation {
+                function: SorobanAuthorizedFunction::ContractFn(InvokeContractArgs {
+                    contract_address: ScAddress::Contract(ContractId(Hash([8u8; 32]))),
+                    function_name: ScSymbol("f".try_into().unwrap()),
+                    args: VecM::default(),
+                }),
+                sub_invocations: VecM::default(),
+            },
+        }
+    }
+
+    /// Build an `AddressWithDelegates` credential auth entry (discriminant 3)
+    /// carrying a recursive `SorobanDelegateSignature` tree (a nested delegate
+    /// under a top-level delegate), exercising the full CAP-0071 surface.
+    fn cap0071_address_with_delegates_entry() -> stellar_xdr::SorobanAuthorizationEntry {
+        use stellar_xdr::*;
+        let nested = SorobanDelegateSignature {
+            address: ScAddress::Account(AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(
+                [3u8; 32],
+            )))),
+            signature: ScVal::Void,
+            nested_delegates: VecM::default(),
+        };
+        let top = SorobanDelegateSignature {
+            address: ScAddress::Account(AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(
+                [4u8; 32],
+            )))),
+            signature: ScVal::Void,
+            nested_delegates: vec![nested].try_into().unwrap(),
+        };
+        SorobanAuthorizationEntry {
+            credentials: SorobanCredentials::AddressWithDelegates(
+                SorobanAddressCredentialsWithDelegates {
+                    address_credentials: SorobanAddressCredentials {
+                        address: ScAddress::Contract(ContractId(Hash([7u8; 32]))),
+                        nonce: 42,
+                        signature_expiration_ledger: 1000,
+                        signature: ScVal::Void,
+                    },
+                    delegates: vec![top].try_into().unwrap(),
+                },
+            ),
+            root_invocation: SorobanAuthorizedInvocation {
+                function: SorobanAuthorizedFunction::ContractFn(InvokeContractArgs {
+                    contract_address: ScAddress::Contract(ContractId(Hash([8u8; 32]))),
+                    function_name: ScSymbol("f".try_into().unwrap()),
+                    args: VecM::default(),
+                }),
+                sub_invocations: VecM::default(),
+            },
+        }
+    }
+
+    /// V_27+: the P27 host (stellar-xdr 27.0.0) decodes an `AddressV2` auth
+    /// entry — the discriminant the workspace serializes flows straight into
+    /// the host for native verification.
+    #[test]
+    fn test_address_v2_credentials_at_v27_routes_to_host() {
+        use soroban_env_host27::xdr::ReadXdr as ReadXdrP27;
+        let bytes = encode_one_auth_entry(&cap0071_address_v2_entry());
+        let decoded = soroban_env_host27::xdr::SorobanAuthorizationEntry::from_xdr(
+            &bytes,
+            soroban_env_host27::xdr::Limits::none(),
+        );
+        assert!(
+            decoded.is_ok(),
+            "P27 host (stellar-xdr 27.0.0) must decode AddressV2 credentials so it can verify them natively at V_27+: {decoded:?}"
+        );
+    }
+
+    /// V_27+: the P27 host decodes an `AddressWithDelegates` entry carrying a
+    /// recursive `SorobanDelegateSignature` tree — the full CAP-0071 surface
+    /// flows through opaquely for the host to verify.
+    #[test]
+    fn test_address_with_delegates_at_v27_routes_to_host() {
+        use soroban_env_host27::xdr::ReadXdr as ReadXdrP27;
+        let bytes = encode_one_auth_entry(&cap0071_address_with_delegates_entry());
+        let decoded = soroban_env_host27::xdr::SorobanAuthorizationEntry::from_xdr(
+            &bytes,
+            soroban_env_host27::xdr::Limits::none(),
+        );
+        assert!(
+            decoded.is_ok(),
+            "P27 host must decode AddressWithDelegates (recursive delegates) for native verification at V_27+: {decoded:?}"
+        );
+    }
+
+    /// Pre-V27: the P26 host (stellar-xdr 26.0.0) CANNOT decode an `AddressV2`
+    /// entry — discriminant 2 is unknown to it. This is the exact reject
+    /// mechanism: a host decode failure → non-internal host error →
+    /// `INVOKE_HOST_FUNCTION_TRAPPED` in the live path. NOT a txMALFORMED.
+    #[test]
+    fn test_address_v2_credentials_rejected_before_v27() {
+        use soroban_env_host26::xdr::ReadXdr as ReadXdrP26;
+        let bytes = encode_one_auth_entry(&cap0071_address_v2_entry());
+        let decoded = soroban_env_host26::xdr::SorobanAuthorizationEntry::from_xdr(
+            &bytes,
+            soroban_env_host26::xdr::Limits::none(),
+        );
+        assert!(
+            decoded.is_err(),
+            "P26 host (stellar-xdr 26.0.0) must REJECT AddressV2 credentials (unknown discriminant 2) — this is the pre-V27 host-routing reject path"
+        );
+    }
+
+    /// Pre-V27: the P26 host CANNOT decode an `AddressWithDelegates` entry —
+    /// discriminant 3 is unknown to it (host-routing rejection).
+    #[test]
+    fn test_address_with_delegates_rejected_before_v27() {
+        use soroban_env_host26::xdr::ReadXdr as ReadXdrP26;
+        let bytes = encode_one_auth_entry(&cap0071_address_with_delegates_entry());
+        let decoded = soroban_env_host26::xdr::SorobanAuthorizationEntry::from_xdr(
+            &bytes,
+            soroban_env_host26::xdr::Limits::none(),
+        );
+        assert!(
+            decoded.is_err(),
+            "P26 host must REJECT AddressWithDelegates (unknown discriminant 3) — pre-V27 host-routing reject path"
+        );
+    }
+
+    /// Regression guard: the legacy `Address` credential (discriminant 1) is
+    /// UNAFFECTED before V27 — the P26 host still decodes it. Confirms the
+    /// pre-V27 reject path is specific to the new variants and introduces no
+    /// regression for existing Soroban auth.
+    #[test]
+    fn test_legacy_address_credentials_unaffected_before_v27() {
+        use soroban_env_host26::xdr::ReadXdr as ReadXdrP26;
+        use stellar_xdr::*;
+        let entry = SorobanAuthorizationEntry {
+            credentials: SorobanCredentials::Address(SorobanAddressCredentials {
+                address: ScAddress::Contract(ContractId(Hash([7u8; 32]))),
+                nonce: 42,
+                signature_expiration_ledger: 1000,
+                signature: ScVal::Void,
+            }),
+            root_invocation: SorobanAuthorizedInvocation {
+                function: SorobanAuthorizedFunction::ContractFn(InvokeContractArgs {
+                    contract_address: ScAddress::Contract(ContractId(Hash([8u8; 32]))),
+                    function_name: ScSymbol("f".try_into().unwrap()),
+                    args: VecM::default(),
+                }),
+                sub_invocations: VecM::default(),
+            },
+        };
+        let bytes = encode_one_auth_entry(&entry);
+        let decoded = soroban_env_host26::xdr::SorobanAuthorizationEntry::from_xdr(
+            &bytes,
+            soroban_env_host26::xdr::Limits::none(),
+        );
+        assert!(
+            decoded.is_ok(),
+            "P26 host must STILL decode legacy Address credentials (discriminant 1) — no regression: {decoded:?}"
+        );
+    }
+
+    /// Encode a single auth entry to XDR via the workspace serializer — the
+    /// exact `to_xdr` path `encode_invocation_inputs` (host.rs:998) uses to
+    /// hand auth entries to the host boundary.
+    fn encode_one_auth_entry(entry: &stellar_xdr::SorobanAuthorizationEntry) -> Vec<u8> {
+        entry
+            .to_xdr(Limits::none())
+            .expect("workspace XDR (27.0.0) must serialize CAP-0071 auth entries")
+    }
+
     /// Test compute_key_hash produces different hashes for different keys.
     #[test]
     fn test_compute_key_hash_different_keys() {
