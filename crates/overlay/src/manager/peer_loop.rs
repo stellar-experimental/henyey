@@ -28,6 +28,44 @@ const MAX_ERROR_MESSAGE_LEN: usize = 100;
 
 use crate::query_policy::QueryKind;
 
+/// Who initiated an inbound peer drop, used to segment the
+/// `stellar_overlay_inbound_drop_total` counter into remote- vs
+/// henyey-initiated siblings (#3422). This is a passive classification read out
+/// of `run_peer_loop`'s exit path — it adds NO drop/`break` decision and changes
+/// no protocol, handshake, auth, codec, or peer-lifecycle behavior.
+///
+/// Classification convention (matches the #3419 operator question "did peers
+/// churn out, or did henyey stop talking?"):
+/// - `Remote`: the peer closed/reset the socket — `recv` returned `Ok(None)`
+///   (peer FIN) or a recv error (RST / errno 104).
+/// - `Local`: henyey broke the loop — idle/straggler timeout, send / flood-send
+///   error, protocol-violation or received-ERROR_MSG teardown, shutdown, or
+///   channel close. `send_error` is attributed `Local` by the "who broke the
+///   loop" convention even though the underlying cause may be a remote RST
+///   surfaced on the next write: the operator signal is "henyey's send path
+///   gave up."
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(super) enum DropInitiator {
+    /// The remote peer closed or reset the connection.
+    Remote,
+    /// Henyey broke the peer loop. Default: any unattributed exit is henyey-side.
+    #[default]
+    Local,
+}
+
+impl DropInitiator {
+    /// Map a `log_inbound_drop_diag` `reason` string to its initiator. Only the
+    /// two remote-origin reasons (`remote_closed`, `recv_error`) are `Remote`;
+    /// every other reason — and any unknown string — is `Local`. Kept as a pure
+    /// function so the attribution is unit-testable without a live socket.
+    pub(super) fn from_reason(reason: &str) -> Self {
+        match reason {
+            "remote_closed" | "recv_error" => DropInitiator::Remote,
+            _ => DropInitiator::Local,
+        }
+    }
+}
+
 /// Per-query-type sliding-window rate limiter.
 ///
 /// Parity: stellar-core (Peer.cpp:1423-1438) limits GetTxSet, GetScpQuorumSet,
@@ -949,8 +987,14 @@ impl OverlayManager {
         mut outbound_rx: mpsc::Receiver<OutboundMessage>,
         flow_control: Arc<FlowControl>,
         state: SharedPeerState,
-    ) {
+    ) -> DropInitiator {
         let running = &state.running;
+
+        // #3422: who initiated the drop. Default Local (henyey-side); set Remote
+        // only at the two remote-origin exits below. The caller in
+        // connection.rs uses this to increment the matching sibling counter
+        // alongside the unconditional inbound_drop total.
+        let mut drop_initiator = DropInitiator::Local;
         let is_validator = state.is_validator;
 
         // NOTE: The initial SEND_MORE_EXTENDED grant is sent in Peer::handshake()
@@ -1102,12 +1146,14 @@ impl OverlayManager {
                         Ok(None) => {
                             info!("Peer {} loop exiting: connection closed by remote (total_msgs={}, scp_msgs={})", peer_id, total_messages, scp_messages);
                             Self::log_inbound_drop_diag(&peer, &peer_id, "remote_closed", "");
+                            drop_initiator = DropInitiator::from_reason("remote_closed");
                             break;
                         }
                         Err(e) => {
                             state.metrics.errors_read.inc();
                             info!("Peer {} loop exiting: recv error: {} (total_msgs={}, scp_msgs={})", peer_id, e, total_messages, scp_messages);
                             Self::log_inbound_drop_diag(&peer, &peer_id, "recv_error", &e.to_string());
+                            drop_initiator = DropInitiator::from_reason("recv_error");
                             break;
                         }
                     }
@@ -1139,6 +1185,8 @@ impl OverlayManager {
         // Close peer (owned, no mutex needed)
         peer.close().await;
         debug!("Peer {} loop exited and disconnected", peer_id);
+
+        drop_initiator
     }
 
     /// Process a single received message from a peer.
@@ -1312,6 +1360,41 @@ mod tests {
     use super::*;
     use crate::flow_control::FlowControlConfig;
     use stellar_xdr::ErrorCode;
+
+    #[test]
+    fn test_drop_initiator_classification() {
+        // #3422: classify each inbound-drop `reason` (the low-cardinality
+        // taxonomy fed to log_inbound_drop_diag) by who broke the loop.
+        // Remote = peer closed/reset the socket; Local = henyey broke the loop.
+        assert_eq!(
+            DropInitiator::from_reason("remote_closed"),
+            DropInitiator::Remote
+        );
+        assert_eq!(
+            DropInitiator::from_reason("recv_error"),
+            DropInitiator::Remote
+        );
+        assert_eq!(
+            DropInitiator::from_reason("send_error"),
+            DropInitiator::Local
+        );
+        assert_eq!(
+            DropInitiator::from_reason("flood_send_error"),
+            DropInitiator::Local
+        );
+        assert_eq!(DropInitiator::from_reason("timeout"), DropInitiator::Local);
+        assert_eq!(
+            DropInitiator::from_reason("protocol_break"),
+            DropInitiator::Local
+        );
+        assert_eq!(DropInitiator::from_reason("shutdown"), DropInitiator::Local);
+        // Default for any unknown / unattributed exit is Local (henyey-side).
+        assert_eq!(
+            DropInitiator::from_reason("anything_else"),
+            DropInitiator::Local
+        );
+        assert_eq!(DropInitiator::default(), DropInitiator::Local);
+    }
 
     #[test]
     fn test_idle_timeout_constants_match_upstream() {
