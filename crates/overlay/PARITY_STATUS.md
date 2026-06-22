@@ -18,7 +18,7 @@
 | BanManager | Full | In-memory + SQLite persistence, auto-ban escalation, time-limited bans |
 | PeerManager | Full | SQLite persistence, backoff, type tracking, direction-filtered queries |
 | TxAdverts / TxDemandsManager | N/A | Advert/demand scheduling owned by app crate (`tx_flooding.rs`); overlay handles transport only |
-| SurveyManager | Partial | Survey flow complete; JSON summary and limiter behavior simplified |
+| SurveyManager | Partial | Owned by the app layer (`crates/app/src/survey.rs` `SurveyDataManager`/`SurveyState`/`SurveyMessageLimiter` + `crates/app/src/app/survey_impl.rs`); overlay handles transport only. Survey flow complete; JSON summary and limiter behavior simplified |
 | OverlayMetrics | Full | Counters and timers for all message types |
 | PeerBareAddress | Full | Mapped to PeerAddress in lib.rs |
 | MessageCodec (framing) | Full | Length-prefix with auth bit (bit 31) |
@@ -43,9 +43,9 @@
 | `PeerDoor.h` / `PeerDoor.cpp` | `connection.rs` (Listener) | Full match |
 | `PeerManager.h` / `PeerManager.cpp` | `peer_manager.rs` | Full match |
 | `RandomPeerSource.h` / `RandomPeerSource.cpp` | `peer_manager.rs` | Merged into PeerManager |
-| `SurveyManager.h` / `SurveyManager.cpp` | `survey.rs` + `app/survey_impl.rs` | Full match (relay/crypto in app layer) |
-| `SurveyDataManager.h` / `SurveyDataManager.cpp` | `survey.rs` | Merged into SurveyManager |
-| `SurveyMessageLimiter.h` / `SurveyMessageLimiter.cpp` | `survey.rs` | Simplified implementation |
+| `SurveyManager.h` / `SurveyManager.cpp` | `app/src/survey.rs` + `app/src/app/survey_impl.rs` | Full match (owned by app layer; relay/crypto in `survey_impl.rs`) |
+| `SurveyDataManager.h` / `SurveyDataManager.cpp` | `app/src/survey.rs` (`SurveyDataManager`) | Full match |
+| `SurveyMessageLimiter.h` / `SurveyMessageLimiter.cpp` | `app/src/survey.rs` (`SurveyMessageLimiter`) | Simplified implementation |
 | `TCPPeer.h` / `TCPPeer.cpp` | `peer.rs`, `connection.rs`, `codec.rs` | Split across modules |
 | `Tracker.h` / `Tracker.cpp` | `item_fetcher.rs` | Merged into ItemFetcher |
 | `TxAdverts.h` / `TxAdverts.cpp` | App crate `tx_flooding.rs` | Moved to app layer |
@@ -382,13 +382,15 @@ Corresponds to: `OverlayMetrics.h`
 | `OverlayMetrics()` | `OverlayMetrics::new()` | Full |
 | All meter/timer/counter fields | Matching Counter/Timer fields | Full |
 
-### SurveyManager (`survey.rs`)
+### SurveyManager (`app/src/survey.rs` + `app/src/app/survey_impl.rs`)
 
 Corresponds to: `SurveyManager.h`, `SurveyDataManager.h`, `SurveyMessageLimiter.h`
 
+Survey is owned by the **app layer** — the data model lives in `crates/app/src/survey.rs` (`SurveyDataManager` / `SurveyState` / `SurveyMessageLimiter`) and the relay/crypto/wire handling in `crates/app/src/app/survey_impl.rs`. (The former overlay `survey.rs` `SurveyManager` shell was a dead, never-constructed duplicate and was removed in #3543.) Rust method names below refer to the app-layer symbols.
+
 | stellar-core | Rust | Status |
 |--------------|------|--------|
-| `SurveyManager()` | `SurveyManager::new()` | Full |
+| `SurveyManager()` | `SurveyDataManager::new()` / `SurveyState::new()` | Full |
 | `startSurveyReporting()` | `start_collecting()` | Full |
 | `stopSurveyReporting()` | `stop_collecting()` | Full |
 | `addNodeToRunningSurveyBacklog()` | `add_peer_to_backlog()` | Full |
@@ -529,8 +531,8 @@ Features not yet implemented. These ARE counted against parity %.
 | PeerManager | 8 TEST_CASE / 38 SECTION | 9 #[test] | Moderate gap remains in persistence edge cases |
 | BanManager | No dedicated upstream test file | 15 #[test] | Rust coverage is stronger than upstream organization suggests |
 | TCPPeer / framing | 4 TEST_CASE / 5 SECTION | 18 #[test] (codec.rs) + 5 (connection.rs) | Good framing coverage; fewer end-to-end socket scenarios |
-| SurveyManager | 5 TEST_CASE / 7 SECTION | 20 #[test] | Good unit coverage |
-| SurveyMessageLimiter | 1 TEST_CASE / 10 SECTION | Included in 20 `survey.rs` tests | Core limiter paths covered |
+| SurveyManager | 5 TEST_CASE / 7 SECTION | `#[test]` in app layer (`crates/app/src/survey.rs`) | Good unit coverage; survey is owned by the app layer |
+| SurveyMessageLimiter | 1 TEST_CASE / 10 SECTION | Included in the app-layer survey tests (`crates/app/src/survey.rs`) | Core limiter paths covered |
 | OverlayManager | 4 TEST_CASE / 0 SECTION | 36 #[test] | Strong unit coverage for startup, peer rotation, and bookkeeping |
 | OverlayTopology | 2 TEST_CASE / 7 SECTION | 0 | Not covered |
 | MessageDispatcher | N/A | 10 #[test] | Rust-specific; includes audit-002 cache bound tests |
