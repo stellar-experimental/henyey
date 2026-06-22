@@ -113,6 +113,9 @@ mod metrics;
 mod record;
 pub mod snapshot;
 
+#[cfg(test)]
+pub(crate) mod tracing_test_support;
+
 // ============================================================================
 // XDR record mark constants
 // ============================================================================
