@@ -82,6 +82,47 @@ pub(crate) fn query_rate_limit_window(close_duration: Duration) -> Duration {
     henyey_overlay::query_policy::query_rate_limit_window(close_duration)
 }
 
+/// Offload one periodic tx-set GC purge onto the blocking thread pool, keeping
+/// purges strictly serial via a loop-local in-flight handle (#3532).
+///
+/// The purge (`Herder::purge_persisted_tx_sets` → `BEGIN IMMEDIATE` read-then-
+/// delete over the persisted-tx-set table) is a synchronous SQLite write
+/// transaction. Running it inline in the tokio `select!` event loop froze the
+/// loop for tens of seconds (observed 39s, `watchdog_freeze`) when the table
+/// was large or the WAL write lock was contended, stalling SCP processing,
+/// broadcast, and fetch-response draining (the climbing `fetch_channel_depth`
+/// symptom). This moves the blocking work to `spawn_blocking` so the loop arm
+/// returns immediately.
+///
+/// Parity: stellar-core's `HerderImpl::purgeOldPersistedTxSets()`
+/// (HerderImpl.cpp:2448-2487) runs in an `async_wait` callback and reschedules
+/// `startTxSetGCTimer()` (HerderImpl.cpp:2440-2444) only AFTER the purge
+/// returns — i.e. purges never overlap. The `is_finished()` guard reproduces
+/// that serial, non-overlapping cadence across the async boundary (the timer's
+/// `MissedTickBehavior::Skip` only coalesces ticks, not in-flight tasks). The
+/// purge *contents* are unchanged (same atomic SQL, #2770), and GC only deletes
+/// orphaned/unreferenced persisted tx-sets — never ledger/consensus/bucket
+/// state — so the thread it runs on is not observable and parity is preserved.
+///
+/// `slot` is the loop-local in-flight handle. If a prior purge is still
+/// running, the tick is skipped (coalesced); otherwise a fresh blocking task is
+/// spawned and its handle stored. The handle is fire-and-not-awaited: GC is
+/// idempotent and periodic, so a skipped tick simply re-runs next interval, and
+/// on shutdown the loop `abort()`s any in-flight handle (harmless — the purge
+/// is a single atomic transaction).
+fn dispatch_tx_set_gc<F>(work: F, slot: &mut Option<tokio::task::JoinHandle<()>>)
+where
+    F: FnOnce() + Send + 'static,
+{
+    // Serial cadence: skip if a prior purge is still running (mirrors
+    // stellar-core rescheduling startTxSetGCTimer() only after the purge
+    // returns — purges never overlap).
+    if slot.as_ref().is_some_and(|h| !h.is_finished()) {
+        return;
+    }
+    *slot = Some(tokio::task::spawn_blocking(work));
+}
+
 /// Whether a transaction queue result requires removal of the FloodGate record,
 /// allowing re-delivery to be treated as new.
 ///
@@ -370,6 +411,11 @@ impl App {
             tx_set_gc_period,
         );
         tx_set_gc_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // Loop-local in-flight handle for the offloaded tx-set GC purge (#3532).
+        // The purge runs on the blocking pool via `spawn_blocking`; this handle
+        // keeps purges strictly serial (skip a tick if the prior purge is still
+        // running) and is aborted on shutdown. See `dispatch_tx_set_gc`.
+        let mut tx_set_gc_task: Option<tokio::task::JoinHandle<()>> = None;
 
         // Get mutable access to SCP envelope receiver
         let mut scp_rx = self.scp_envelope_rx.lock().await;
@@ -1175,18 +1221,36 @@ impl App {
 
                 // Periodic GC of unreferenced persisted SCP tx sets.
                 // Parity: stellar-core HerderImpl::startTxSetGCTimer() at
-                // HerderImpl.cpp:2440-2444. Called inline (no spawn_blocking)
-                // to match stellar-core's strictly serial reschedule cadence
-                // and to avoid a fire-and-forget task surviving select! exit
-                // on shutdown.
+                // HerderImpl.cpp:2440-2444. The purge is a synchronous
+                // BEGIN IMMEDIATE SQLite write transaction; running it inline
+                // froze the event loop for tens of seconds (39s watchdog_freeze,
+                // #3532). It is offloaded to the blocking pool via
+                // `dispatch_tx_set_gc`, which keeps purges strictly serial
+                // (mirroring stellar-core's serial reschedule cadence) through
+                // the loop-local in-flight handle. `set_phase(33)` stays on the
+                // loop thread so the watchdog phase label is preserved.
                 _ = tx_set_gc_interval.tick() => {
                     self.set_phase(33); // 33 = tx_set_gc
-                    self.herder.purge_persisted_tx_sets();
+                    let herder = Arc::clone(&self.herder);
+                    dispatch_tx_set_gc(
+                        move || herder.purge_persisted_tx_sets(),
+                        &mut tx_set_gc_task,
+                    );
                 }
 
                 // Shutdown signal (lowest priority)
                 _ = shutdown_rx.recv() => {
                     tracing::info!("Shutdown signal received");
+                    // Abort any in-flight tx-set GC purge so the offloaded
+                    // blocking task does not survive loop exit (#3532). The
+                    // purge is a single atomic, idempotent transaction (#2770),
+                    // so an abort mid-flight is harmless — it either completes
+                    // (spawn_blocking closures are not force-cancelled) or the
+                    // process is exiting; a skipped purge simply re-runs next
+                    // interval on the next startup.
+                    if let Some(h) = tx_set_gc_task.take() {
+                        h.abort();
+                    }
                     break;
                 }
 
@@ -3707,5 +3771,145 @@ mod tx_flood_forget_tests {
     #[test]
     fn test_try_again_later_forgets() {
         assert!(should_forget_tx_flood_record(&TxQueueResult::TryAgainLater));
+    }
+}
+
+#[cfg(test)]
+mod tx_set_gc_offload_tests {
+    //! Regression tests for #3532 — the tx_set_gc event-loop freeze.
+    //!
+    //! On `origin/main` the `tx_set_gc_interval.tick()` arm called
+    //! `self.herder.purge_persisted_tx_sets()` inline on the tokio event-loop
+    //! thread. A large persisted-tx-set table (or write contention) made that
+    //! synchronous `BEGIN IMMEDIATE` purge block the loop for tens of seconds
+    //! (observed 39s, watchdog_freeze). The fix offloads the purge via
+    //! `spawn_blocking` behind a loop-local in-flight guard so the loop arm
+    //! returns promptly and purges stay strictly serial (mirroring
+    //! stellar-core's serial reschedule cadence).
+    use super::dispatch_tx_set_gc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Barrier};
+    use std::thread::ThreadId;
+    use std::time::{Duration, Instant};
+    use tokio::task::JoinHandle;
+
+    /// The dispatch must return promptly (loop not blocked) and the work must
+    /// run on a DIFFERENT thread than the dispatcher (the event-loop thread).
+    ///
+    /// Fails on `origin/main`: the arm runs the purge inline, so the dispatch
+    /// would block for the full ~1s barrier and the work thread id would equal
+    /// the dispatcher's thread id.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_tx_set_gc_purge_runs_off_event_loop_thread() {
+        let dispatcher_tid = std::thread::current().id();
+        let work_tid: Arc<std::sync::Mutex<Option<ThreadId>>> =
+            Arc::new(std::sync::Mutex::new(None));
+        // Barrier of 2: the work closure waits until the test releases it, so
+        // the work is guaranteed still-running while we assert prompt return.
+        let barrier = Arc::new(Barrier::new(2));
+
+        let mut slot: Option<JoinHandle<()>> = None;
+        let work_tid_c = Arc::clone(&work_tid);
+        let barrier_c = Arc::clone(&barrier);
+
+        let start = Instant::now();
+        dispatch_tx_set_gc(
+            move || {
+                *work_tid_c.lock().unwrap() = Some(std::thread::current().id());
+                // Block to simulate a slow purge. If this ran inline on the
+                // dispatcher thread, the dispatch call below would not return.
+                barrier_c.wait();
+            },
+            &mut slot,
+        );
+        let dispatch_elapsed = start.elapsed();
+
+        // (1) Dispatch returned promptly — the event loop was not blocked.
+        assert!(
+            dispatch_elapsed < Duration::from_millis(100),
+            "dispatch_tx_set_gc blocked the caller for {:?} (expected <100ms); \
+             purge was not offloaded off the event-loop thread",
+            dispatch_elapsed
+        );
+
+        // Release the work closure and let the spawned task complete.
+        barrier.wait();
+        let handle = slot.take().expect("dispatch should have stored a handle");
+        handle.await.expect("spawned purge task should complete");
+
+        // (2) The work ran on a different thread than the dispatcher.
+        let observed = work_tid
+            .lock()
+            .unwrap()
+            .expect("work should have recorded a thread id");
+        assert_ne!(
+            observed, dispatcher_tid,
+            "purge ran on the dispatcher (event-loop) thread; expected a spawn_blocking thread"
+        );
+    }
+
+    /// A second dispatch while the first purge is still in-flight must NOT
+    /// spawn a second concurrent purge (serial in-flight guard), mirroring
+    /// stellar-core rescheduling the GC timer only after the purge returns.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_tx_set_gc_serial_no_overlap() {
+        // Counts how many purge closures are running concurrently and the peak.
+        let running = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let total = Arc::new(AtomicUsize::new(0));
+        // Barrier of 2: test + first purge. The first purge holds here so it is
+        // unambiguously still-running when the second dispatch is attempted.
+        let barrier = Arc::new(Barrier::new(2));
+
+        let mut slot: Option<JoinHandle<()>> = None;
+
+        let make_work = || {
+            let running = Arc::clone(&running);
+            let peak = Arc::clone(&peak);
+            let total = Arc::clone(&total);
+            let barrier = Arc::clone(&barrier);
+            move || {
+                total.fetch_add(1, Ordering::SeqCst);
+                let cur = running.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(cur, Ordering::SeqCst);
+                barrier.wait();
+                running.fetch_sub(1, Ordering::SeqCst);
+            }
+        };
+
+        // First dispatch: spawns and starts running (blocks on the barrier).
+        dispatch_tx_set_gc(make_work(), &mut slot);
+        // Wait until the first purge is observably running before the 2nd tick.
+        let spin_start = Instant::now();
+        while running.load(Ordering::SeqCst) == 0 {
+            assert!(
+                spin_start.elapsed() < Duration::from_secs(5),
+                "first purge never started"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        // Second dispatch while the first is still in-flight: must be skipped.
+        dispatch_tx_set_gc(make_work(), &mut slot);
+
+        // Give a skipped-or-spawned second task a moment to (not) start.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            peak.load(Ordering::SeqCst),
+            1,
+            "a second purge ran concurrently with the first; in-flight guard failed"
+        );
+
+        // Release the first purge and let it finish.
+        barrier.wait();
+        let handle = slot.take().expect("a handle should be stored");
+        handle.await.expect("first purge should complete");
+
+        // Exactly one purge ran in total — the second tick was coalesced.
+        assert_eq!(
+            total.load(Ordering::SeqCst),
+            1,
+            "expected exactly one purge to run (second tick coalesced by guard)"
+        );
     }
 }
