@@ -9500,6 +9500,301 @@ mod tests {
             "orphan tx set must be purged by GC"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // restore_persisted_scp_state (#2769) — startup SCP-state restore.
+    //
+    // Mirrors stellar-core HerderImpl::restoreSCPState() (HerderImpl.cpp:2239-2311)
+    // called from HerderImpl::start() (HerderImpl.cpp:2455-2471). The henyey
+    // split lifecycle runs `bootstrap(lcl)` first (the setTrackingSCPState +
+    // trackingHeartBeat equivalent), so restore must filter to `slot > lcl`.
+    // That filter is the regression guard for the consensus stall that closed
+    // PR #2797 (replaying already-finalized `slot <= lcl` ballots stalls
+    // henyey's SCP ballot machine).
+    // -----------------------------------------------------------------------
+
+    /// Build a validator herder whose local quorum set is a 1-of-1 over itself,
+    /// returning the herder plus the signing secret. Distinct seed from the
+    /// shared `[7u8;32]` helpers so its persisted envelopes are local-node-owned.
+    fn make_restore_validator_herder() -> (Herder, SecretKey) {
+        let seed = [3u8; 32];
+        let secret = SecretKey::from_seed(&seed);
+        let public = secret.public_key();
+        let node_id = node_id_from_public_key(&public);
+
+        let quorum_set = ScpQuorumSet {
+            threshold: 1,
+            validators: vec![node_id].try_into().unwrap(),
+            inner_sets: vec![].try_into().unwrap(),
+        };
+
+        let config = HerderConfig {
+            is_validator: true,
+            node_public_key: public,
+            local_quorum_set: Some(quorum_set),
+            ..HerderConfig::default()
+        };
+
+        let herder = Herder::with_secret_key(
+            config,
+            SecretKey::from_seed(&seed),
+            make_default_lm(),
+            TimerManagerHandle::no_op(),
+        );
+        (herder, SecretKey::from_seed(&seed))
+    }
+
+    /// Construct a signed NOMINATE envelope from `secret` for `slot` whose
+    /// single vote references a freshly built tx set. Returns
+    /// `(envelope, tx_set_hash, stored_tx_set_bytes, quorum_set_hash, quorum_set)`
+    /// so the caller can persist the envelope alongside its referenced deps,
+    /// exactly as the production persist callback does.
+    fn make_local_nominate_with_deps(
+        herder: &Herder,
+        secret: &SecretKey,
+        slot: u64,
+    ) -> (
+        ScpEnvelope,
+        stellar_xdr::Hash,
+        Vec<u8>,
+        stellar_xdr::Hash,
+        ScpQuorumSet,
+    ) {
+        use stellar_xdr::WriteXdr;
+
+        // Build a tx set on top of LCL and capture both its hash and the
+        // StoredTransactionSet XDR bytes (what gets persisted).
+        let lcl_hash = herder.scp_driver.current_header_hash();
+        let tx_set = TransactionSet::new(lcl_hash, Vec::new());
+        let tx_set_hash = stellar_xdr::Hash(tx_set.hash().0);
+        let stored_bytes = tx_set
+            .to_xdr_stored_set()
+            .to_xdr(Limits::none())
+            .expect("encode StoredTransactionSet");
+
+        // Build a signed StellarValue referencing the tx set.
+        let close_time = TimePoint(1);
+        let network_id = herder.scp_driver.network_id();
+        let mut sign_data = network_id.0.to_vec();
+        sign_data.extend_from_slice(&EnvelopeType::Scpvalue.to_xdr(Limits::none()).expect("xdr"));
+        sign_data.extend_from_slice(&tx_set_hash.to_xdr(Limits::none()).expect("xdr"));
+        sign_data.extend_from_slice(&close_time.to_xdr(Limits::none()).expect("xdr"));
+        let value_sig = secret.sign(&sign_data);
+
+        let value_node_id = XdrNodeId(stellar_xdr::PublicKey::PublicKeyTypeEd25519(
+            stellar_xdr::Uint256(*secret.public_key().as_bytes()),
+        ));
+        let stellar_value = StellarValue {
+            tx_set_hash: tx_set_hash.clone(),
+            close_time,
+            upgrades: vec![].try_into().unwrap(),
+            ext: StellarValueExt::Signed(LedgerCloseValueSignature {
+                node_id: value_node_id,
+                signature: stellar_xdr::Signature(
+                    value_sig.0.to_vec().try_into().unwrap_or_default(),
+                ),
+            }),
+        };
+        let value = Value(
+            stellar_value
+                .to_xdr(Limits::none())
+                .unwrap()
+                .try_into()
+                .unwrap(),
+        );
+
+        // The companion quorum set: the herder's local qset.
+        let quorum_set = herder
+            .scp_driver
+            .get_local_quorum_set()
+            .expect("validator herder must have a local quorum set");
+        let quorum_set_hash = stellar_xdr::Hash(henyey_scp::hash_quorum_set(&quorum_set).0);
+
+        let node_id = XdrNodeId(stellar_xdr::PublicKey::PublicKeyTypeEd25519(
+            stellar_xdr::Uint256(*secret.public_key().as_bytes()),
+        ));
+        let statement = ScpStatement {
+            node_id,
+            slot_index: slot,
+            pledges: ScpStatementPledges::Nominate(ScpNomination {
+                quorum_set_hash: quorum_set_hash.clone(),
+                votes: vec![value].try_into().unwrap(),
+                accepted: vec![].try_into().unwrap(),
+            }),
+        };
+
+        let envelope = sign_statement(&statement, herder, secret);
+        (
+            envelope,
+            tx_set_hash,
+            stored_bytes,
+            quorum_set_hash,
+            quorum_set,
+        )
+    }
+
+    #[test]
+    fn test_restore_persisted_scp_state_no_manager_is_noop() {
+        // No persistence manager installed → guarded no-op, no panic, no slots.
+        let herder = make_test_herder();
+        herder.bootstrap(100);
+        herder.restore_persisted_scp_state(100);
+        assert!(
+            herder.get_current_state_for_slot(101).is_empty(),
+            "no manager → nothing replayed"
+        );
+    }
+
+    #[test]
+    fn test_restore_persisted_scp_state_lcl_at_or_below_genesis_is_noop() {
+        // lcl == GENESIS_LEDGER_SEQ (1): even with persisted state present,
+        // nothing must be replayed (matches upstream's genesis skip).
+        let (herder, secret) = make_restore_validator_herder();
+        let manager = Arc::new(crate::persistence::ScpPersistenceManager::in_memory());
+        assert!(herder.set_scp_persistence(Arc::clone(&manager)).is_ok());
+
+        // Persist a slot-2 envelope (> genesis), to prove the genesis guard
+        // (not the slot filter) is what blocks replay here.
+        let (env, tx_hash, tx_bytes, qs_hash, qs) =
+            make_local_nominate_with_deps(&herder, &secret, 2);
+        manager
+            .persist_scp_state(2, &[env], &[(tx_hash, tx_bytes)], &[(qs_hash, qs)])
+            .expect("persist");
+
+        herder.bootstrap(1);
+        herder.restore_persisted_scp_state(1);
+
+        assert!(
+            herder.get_current_state_for_slot(2).is_empty(),
+            "lcl <= GENESIS must be a no-op even with persisted state"
+        );
+    }
+
+    #[test]
+    fn test_restore_persisted_scp_state_replays_future_slot_and_deps() {
+        // Persist an lcl+1 local envelope plus its referenced tx set + quorum
+        // set; after restore the future slot must be present in SCP state and
+        // both deps cached.
+        let lcl = 100u64;
+        let (herder, secret) = make_restore_validator_herder();
+        let manager = Arc::new(crate::persistence::ScpPersistenceManager::in_memory());
+        assert!(herder.set_scp_persistence(Arc::clone(&manager)).is_ok());
+
+        let (env, tx_hash, tx_bytes, qs_hash, qs) =
+            make_local_nominate_with_deps(&herder, &secret, lcl + 1);
+        manager
+            .persist_scp_state(
+                lcl + 1,
+                &[env],
+                &[(tx_hash.clone(), tx_bytes)],
+                &[(qs_hash.clone(), qs)],
+            )
+            .expect("persist");
+
+        herder.bootstrap(lcl as u32);
+        herder.restore_persisted_scp_state(lcl);
+
+        // Future slot replayed into SCP.
+        assert!(
+            !herder.get_current_state_for_slot(lcl + 1).is_empty(),
+            "future-slot (lcl+1) envelope must be replayed into SCP state"
+        );
+        // Quorum set cached (queryable by hash via scp_driver).
+        let qs_hash256 = henyey_common::Hash256(qs_hash.0);
+        assert!(
+            herder.get_quorum_set_by_hash(&qs_hash256).is_some(),
+            "referenced quorum set must be cached after restore"
+        );
+        // Tx set cached.
+        let tx_hash256 = henyey_common::Hash256(tx_hash.0);
+        assert!(
+            herder.has_tx_set(&tx_hash256),
+            "referenced tx set must be cached after restore"
+        );
+    }
+
+    #[test]
+    fn test_restore_persisted_scp_state_filters_slots_at_or_below_lcl() {
+        // The #2797 stall guard: persist envelopes for BOTH slot==lcl and
+        // slot==lcl+1; restore must replay only lcl+1 and DROP lcl.
+        let lcl = 100u64;
+        let (herder, secret) = make_restore_validator_herder();
+        let manager = Arc::new(crate::persistence::ScpPersistenceManager::in_memory());
+        assert!(herder.set_scp_persistence(Arc::clone(&manager)).is_ok());
+
+        let (env_at, tx_at, tx_at_bytes, qs_at, qs_at_set) =
+            make_local_nominate_with_deps(&herder, &secret, lcl);
+        manager
+            .persist_scp_state(
+                lcl,
+                &[env_at],
+                &[(tx_at, tx_at_bytes)],
+                &[(qs_at, qs_at_set)],
+            )
+            .expect("persist at-lcl");
+
+        let (env_fut, tx_fut, tx_fut_bytes, qs_fut, qs_fut_set) =
+            make_local_nominate_with_deps(&herder, &secret, lcl + 1);
+        manager
+            .persist_scp_state(
+                lcl + 1,
+                &[env_fut],
+                &[(tx_fut, tx_fut_bytes)],
+                &[(qs_fut, qs_fut_set)],
+            )
+            .expect("persist future");
+
+        herder.bootstrap(lcl as u32);
+        herder.restore_persisted_scp_state(lcl);
+
+        assert!(
+            herder.get_current_state_for_slot(lcl).is_empty(),
+            "slot <= lcl must NOT be replayed (the #2797 stall guard)"
+        );
+        assert!(
+            !herder.get_current_state_for_slot(lcl + 1).is_empty(),
+            "slot > lcl must be replayed"
+        );
+    }
+
+    #[test]
+    fn test_restore_persisted_scp_state_skips_corrupt_tx_set() {
+        // A corrupt tx-set blob persisted alongside a valid one must not panic
+        // and must not block the valid tx set from being cached. The valid
+        // envelope references only the valid tx set.
+        let lcl = 100u64;
+        let (herder, secret) = make_restore_validator_herder();
+        let manager = Arc::new(crate::persistence::ScpPersistenceManager::in_memory());
+        assert!(herder.set_scp_persistence(Arc::clone(&manager)).is_ok());
+
+        let (env, tx_hash, tx_bytes, qs_hash, qs) =
+            make_local_nominate_with_deps(&herder, &secret, lcl + 1);
+        let corrupt_hash = stellar_xdr::Hash([0xEEu8; 32]);
+        manager
+            .persist_scp_state(
+                lcl + 1,
+                &[env],
+                &[
+                    (tx_hash.clone(), tx_bytes),
+                    (corrupt_hash.clone(), vec![0xDE, 0xAD, 0xBE, 0xEF]),
+                ],
+                &[(qs_hash, qs)],
+            )
+            .expect("persist");
+
+        herder.bootstrap(lcl as u32);
+        herder.restore_persisted_scp_state(lcl);
+
+        // Valid tx set cached; corrupt one isolated (not cached), no panic.
+        assert!(
+            herder.has_tx_set(&henyey_common::Hash256(tx_hash.0)),
+            "valid tx set must be cached"
+        );
+        assert!(
+            !herder.has_tx_set(&henyey_common::Hash256(corrupt_hash.0)),
+            "corrupt tx set must NOT be cached"
+        );
+    }
 }
 
 #[cfg(test)]
