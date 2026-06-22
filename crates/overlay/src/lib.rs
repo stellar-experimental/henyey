@@ -87,7 +87,6 @@ mod metrics;
 mod peer;
 mod peer_manager;
 pub mod query_policy;
-mod survey;
 
 // Re-export public types
 pub use auth::{AuthCert, AuthCertExt, AuthContext, AuthState};
@@ -114,10 +113,6 @@ pub use metrics::{Counter, OverlayMessageKind, OverlayMetrics, OverlayMetricsSna
 pub use peer::{Peer, PeerInfo, PeerState, PeerStats, PeerStatsSnapshot};
 pub use peer_manager::{
     BackOffUpdate, PeerManager, PeerQuery, PeerRecord, PeerTypeFilter, StoredPeerType, TypeUpdate,
-};
-pub use survey::{
-    CollectingNodeData, CollectingPeerData, SurveyConfig, SurveyManager, SurveyManagerStats,
-    SurveyPhase, TimeSlicedNodeData, TimeSlicedPeerData,
 };
 
 use std::collections::HashSet;
