@@ -115,14 +115,15 @@ pub trait AuthCertExt {
 /// Returns `true` if `a` and `b` are equal, without leaking information about
 /// which bytes differ through timing.
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    use subtle::ConstantTimeEq;
+    // Length differs only on non-secret, fixed-size MAC operands ([u8; 32]); the
+    // early return never leaks information about attacker-influenced lengths.
     if a.len() != b.len() {
         return false;
     }
-    let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
-    }
-    diff == 0
+    // Delegate the byte comparison to `subtle`, whose audited optimization
+    // barriers prevent a compiler from short-circuiting the constant-time loop.
+    a.ct_eq(b).into()
 }
 
 impl AuthCertExt for AuthCert {
@@ -1282,6 +1283,17 @@ mod tests {
         let mut b = [0u8; 32];
         b[31] = 1; // differ in only the last byte's lowest bit
         assert!(!constant_time_eq(&a, &b));
+
+        // Pin the real MAC operand shape: a 32-byte (`HmacSha256Mac.mac: [u8; 32]`)
+        // buffer with a single-bit flip in the last byte. This is exactly the
+        // operand size used at the MAC-verify call site in `unwrap_message`, so the
+        // boolean contract (equal -> true, single-bit-different -> false) is pinned
+        // for the security-critical shape.
+        let mac_a: [u8; 32] = [0xA5; 32];
+        let mut mac_b = mac_a;
+        assert!(constant_time_eq(&mac_a, &mac_b)); // identical MACs -> true
+        mac_b[31] ^= 0x01; // flip the lowest bit of the last byte
+        assert!(!constant_time_eq(&mac_a, &mac_b)); // single-bit-different -> false
     }
 
     #[test]
