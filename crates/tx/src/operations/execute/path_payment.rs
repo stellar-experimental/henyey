@@ -19,6 +19,8 @@ use super::{
     is_asset_valid, is_trustline_authorized, issuer_for_asset, sub_account_balance,
     sub_trustline_balance, trustline_liabilities,
 };
+use henyey_common::protocol::{protocol_version_starts_from, ProtocolVersion};
+
 use crate::frame::muxed_to_account_id;
 use crate::frozen_keys::offer_accesses_frozen_key;
 use crate::state::LedgerStateManager;
@@ -66,6 +68,10 @@ pub(crate) fn execute_path_payment_strict_receive(
     }
 
     let mut offers_claimed: Vec<ClaimAtom> = Vec::new();
+    // Running total of offers crossed only in discarded speculative book passes
+    // (pool-wins at V_27). Persists ACROSS hops; charged into the per-hop budget
+    // alongside committed offers. Stays 0 pre-V27. See `convert_with_offers_and_pools`.
+    let mut non_committed_consumed: i64 = 0;
 
     if let Err(err) = update_dest_balance(
         &dest,
@@ -114,7 +120,9 @@ pub(crate) fn execute_path_payment_strict_receive(
         let mut amount_send = 0;
         let mut amount_recv = 0;
         let mut offer_trail = Vec::new();
-        let max_offers_to_cross = MAX_OFFERS_TO_CROSS - offers_claimed.len() as i64;
+        let mut non_committed_crossed = 0i64;
+        let max_offers_to_cross =
+            MAX_OFFERS_TO_CROSS - offers_claimed.len() as i64 - non_committed_consumed;
         let convert_res = convert_with_offers_and_pools(
             &mut ConversionParams {
                 source,
@@ -131,6 +139,7 @@ pub(crate) fn execute_path_payment_strict_receive(
             &mut amount_send,
             &mut amount_recv,
             max_offers_to_cross,
+            &mut non_committed_crossed,
         )?;
 
         if convert_res == ConvertResult::FilterStopCrossSelf {
@@ -149,6 +158,7 @@ pub(crate) fn execute_path_payment_strict_receive(
             ));
         }
 
+        non_committed_consumed += non_committed_crossed;
         max_amount_recv = amount_send;
         recv_asset = send_asset;
 
@@ -240,6 +250,10 @@ pub(crate) fn execute_path_payment_strict_send(
     }
 
     let mut offers_claimed: Vec<ClaimAtom> = Vec::new();
+    // Running total of offers crossed only in discarded speculative book passes
+    // (pool-wins at V_27). Persists ACROSS hops; charged into the per-hop budget
+    // alongside committed offers. Stays 0 pre-V27. See `convert_with_offers_and_pools`.
+    let mut non_committed_consumed: i64 = 0;
     let mut full_path: Vec<Asset> = op.path.to_vec();
     full_path.push(op.dest_asset.clone());
 
@@ -263,7 +277,9 @@ pub(crate) fn execute_path_payment_strict_send(
         let mut amount_send = 0;
         let mut amount_recv = 0;
         let mut offer_trail = Vec::new();
-        let max_offers_to_cross = MAX_OFFERS_TO_CROSS - offers_claimed.len() as i64;
+        let mut non_committed_crossed = 0i64;
+        let max_offers_to_cross =
+            MAX_OFFERS_TO_CROSS - offers_claimed.len() as i64 - non_committed_consumed;
         let convert_res = convert_with_offers_and_pools(
             &mut ConversionParams {
                 source,
@@ -280,6 +296,7 @@ pub(crate) fn execute_path_payment_strict_send(
             &mut amount_send,
             &mut amount_recv,
             max_offers_to_cross,
+            &mut non_committed_crossed,
         )?;
 
         if convert_res == ConvertResult::FilterStopCrossSelf {
@@ -298,6 +315,7 @@ pub(crate) fn execute_path_payment_strict_send(
             ));
         }
 
+        non_committed_consumed += non_committed_crossed;
         max_amount_send = amount_recv;
         send_asset = recv_asset;
 
@@ -518,7 +536,15 @@ fn convert_with_offers_and_pools(
     amount_send: &mut i64,
     amount_recv: &mut i64,
     max_offers_to_cross: i64,
+    // Out-param: the number of order-book offers crossed only in the speculative
+    // pass and then discarded because the liquidity pool won. At protocol >= V_27
+    // these crossings are charged against the cross-budget (stellar-core
+    // OfferExchange.cpp `nonCommittedOffersCrossed`); the caller must subtract
+    // this from its running budget. Set to 0 on every other path, so pre-V27
+    // behavior is unchanged.
+    non_committed_crossed: &mut i64,
 ) -> Result<ConvertResult> {
+    *non_committed_crossed = 0;
     // Parity: stellar-core checks isPoolTradingDisabled before pool exchange
     // (OfferExchange.cpp:1396). When the flag is set or rounding is Normal,
     // fall back to order-book only.
@@ -603,6 +629,21 @@ fn convert_with_offers_and_pools(
     let rollback_us = t_rb.elapsed().as_micros() as u64;
     if savepoint_us > 100 || rollback_us > 100 {
         tracing::debug!(savepoint_us, rollback_us, "savepoint profiling (pool wins)");
+    }
+
+    // Parity (stellar-core OfferExchange.cpp convertWithOffersAndPools, V_27):
+    // the offers crossed only in the discarded speculative book pass
+    // (`nonCommittedOffersCrossed = tempOfferTrail.size()`) are charged against
+    // the cross-budget. The `>=` (not `>`) reserves one budget unit for the pool
+    // ClaimAtom appended below (which stellar-core charges via `maxOffersToCross
+    // -= 1`). Pre-V27 these crossings cost nothing and this branch is skipped,
+    // so behavior is unchanged.
+    if protocol_version_starts_from(params.context.protocol_version, ProtocolVersion::V27) {
+        let non_committed = book_offer_trail.len() as i64;
+        if non_committed >= max_offers_to_cross {
+            return Ok(ConvertResult::CrossedTooMany);
+        }
+        *non_committed_crossed = non_committed;
     }
 
     params.offer_trail.clear();
@@ -3220,5 +3261,293 @@ mod tests {
             }
             other => panic!("Expected PathPaymentStrictReceive success, got {:?}", other),
         }
+    }
+
+    /// Build a state where a liquidity pool wins on price against `num_offers`
+    /// order-book offers (selling B for A) that the speculative book pass would
+    /// nonetheless cross. Returns the assets so the caller can drive a direct
+    /// `convert_with_offers_and_pools` (send A, receive B).
+    ///
+    /// Each book offer sells a small amount of B at a price strictly worse than
+    /// the pool (2 A per B vs. the pool's ~1:1), so the pool always wins on
+    /// price. The speculative book pass still crosses all of them while filling
+    /// the requested receive amount, which is exactly the
+    /// `nonCommittedOffersCrossed` situation from stellar-core OfferExchange.cpp.
+    fn setup_pool_wins_with_book_crossings(
+        state: &mut LedgerStateManager,
+        num_offers: i64,
+    ) -> (Asset, Asset) {
+        let issuer_a = create_test_account_id(110);
+        let issuer_b = create_test_account_id(120);
+        state.create_account(create_test_account(issuer_a.clone(), 1_000_000_000));
+        state.create_account(create_test_account(issuer_b.clone(), 1_000_000_000));
+
+        let asset_a = create_test_asset(b"AAA\0", issuer_a.clone());
+        let asset_b = create_test_asset(b"BBB\0", issuer_b.clone());
+
+        // Pool with 1:1 reserves — wins on price against the worse book offers.
+        let pool_params = LiquidityPoolConstantProductParameters {
+            asset_a: asset_a.clone(),
+            asset_b: asset_b.clone(),
+            fee: 30,
+        };
+        let pool_id = PoolId(
+            henyey_common::Hash256::hash_xdr(
+                &LiquidityPoolParameters::LiquidityPoolConstantProduct(pool_params.clone()),
+            )
+            .into(),
+        );
+        state.create_liquidity_pool(LiquidityPoolEntry {
+            liquidity_pool_id: pool_id,
+            body: LiquidityPoolEntryBody::LiquidityPoolConstantProduct(
+                LiquidityPoolEntryConstantProduct {
+                    params: pool_params,
+                    reserve_a: 10_000_000,
+                    reserve_b: 10_000_000,
+                    total_pool_shares: 10_000_000,
+                    pool_shares_trust_line_count: 1,
+                },
+            ),
+        });
+
+        // `num_offers` tiny book offers, each selling 10 of B for A at price 2:1
+        // (2 A per B) — strictly worse than the pool, so the pool wins, but the
+        // speculative book pass crosses each one while filling the receive side.
+        for i in 0..num_offers {
+            // Distinct seller account per offer. The single-byte `create_test_account_id`
+            // seed only yields 256 unique ids, so derive the key from the full index
+            // to support up to MAX_OFFERS_TO_CROSS offers without collisions.
+            let mut seed = [0u8; 32];
+            seed[0..8].copy_from_slice(&(0x5000_0000_0000_0000u64 + i as u64).to_be_bytes());
+            let seller_id = AccountId(stellar_xdr::PublicKey::PublicKeyTypeEd25519(
+                stellar_xdr::Uint256(seed),
+            ));
+            let mut seller = create_test_account(seller_id.clone(), 1_000_000_000);
+            // Cover the two trustlines + one offer so that consuming the offer in
+            // the speculative book pass doesn't underflow num_sub_entries.
+            seller.num_sub_entries = 3;
+            state.create_account(seller);
+            state.create_trustline(crate::test_utils::create_trustline_with_liabilities(
+                seller_id.clone(),
+                create_test_trustline_asset(b"AAA\0", issuer_a.clone()),
+                0,
+                i64::MAX,
+                AUTHORIZED_FLAG,
+                20, // buying liabilities (2 A per 10 B offered)
+                0,
+            ));
+            state.create_trustline(crate::test_utils::create_trustline_with_liabilities(
+                seller_id.clone(),
+                create_test_trustline_asset(b"BBB\0", issuer_b.clone()),
+                100_000,
+                i64::MAX,
+                AUTHORIZED_FLAG,
+                0,
+                10, // selling liabilities (matches offer amount)
+            ));
+            state.create_offer(OfferEntry {
+                seller_id,
+                offer_id: 100 + i,
+                selling: asset_b.clone(),
+                buying: asset_a.clone(),
+                amount: 10,
+                price: Price { n: 2, d: 1 },
+                flags: 0,
+                ext: OfferEntryExt::V0,
+            });
+        }
+
+        (asset_a, asset_b)
+    }
+
+    /// Drive a strict-receive `convert_with_offers_and_pools` (send A, receive B)
+    /// asking for `recv` of B with the given per-hop `max_offers_to_cross` budget
+    /// at `protocol_version`.
+    fn run_convert_pool_vs_book(
+        state: &mut LedgerStateManager,
+        source: &AccountId,
+        send_asset: &Asset,
+        recv_asset: &Asset,
+        recv: i64,
+        max_offers_to_cross: i64,
+        protocol_version: u32,
+    ) -> (ConvertResult, i64) {
+        let mut context = create_test_context();
+        context.protocol_version = protocol_version;
+        let mut amount_send = 0;
+        let mut amount_recv = 0;
+        let mut offer_trail = Vec::new();
+        let mut non_committed_crossed = 0i64;
+        let res = convert_with_offers_and_pools(
+            &mut ConversionParams {
+                source,
+                selling: send_asset,
+                buying: recv_asset,
+                max_send: i64::MAX,
+                max_receive: recv,
+                round: RoundingType::PathPaymentStrictReceive,
+                offer_trail: &mut offer_trail,
+                state,
+                context: &context,
+                frozen_key_config: &context.frozen_key_config,
+            },
+            &mut amount_send,
+            &mut amount_recv,
+            max_offers_to_cross,
+            &mut non_committed_crossed,
+        )
+        .unwrap();
+        (res, non_committed_crossed)
+    }
+
+    /// Primary regression test for #3528. A path-payment hop where the pool wins
+    /// on price but the speculative book pass crossed enough offers to exceed the
+    /// budget: at V_26 it returns `Ok` (the discarded crossings are free), at
+    /// V_27 it returns `CrossedTooMany` (the discarded crossings are charged).
+    ///
+    /// FAILS on origin/main (henyey always discards the speculative crossings and
+    /// returns `Ok` regardless of protocol version).
+    #[test]
+    fn test_convert_with_offers_and_pools_non_committed_crossings_v27_vs_v26() {
+        let source_id = create_test_account_id(0);
+
+        // 5 book offers crossed speculatively; budget of 5 leaves no room once the
+        // 5 non-committed crossings plus the pool atom are accounted for.
+        let recv = 50; // 5 offers * 10 B each
+        let budget = 5;
+
+        // V_26: discarded book crossings cost nothing → pool applied, Ok.
+        let mut state_v26 = LedgerStateManager::new(5_000_000, 100);
+        let (a26, b26) = setup_pool_wins_with_book_crossings(&mut state_v26, 5);
+        let (res26, nc26) =
+            run_convert_pool_vs_book(&mut state_v26, &source_id, &a26, &b26, recv, budget, 26);
+        assert_eq!(
+            res26,
+            ConvertResult::Ok,
+            "pre-V27: discarded speculative crossings must be free (pool wins, Ok)"
+        );
+        assert_eq!(nc26, 0, "pre-V27 out-param must stay 0 (bit-identical)");
+
+        // V_27: 5 non-committed crossings >= budget of 5 → CrossedTooMany.
+        let mut state_v27 = LedgerStateManager::new(5_000_000, 100);
+        let (a27, b27) = setup_pool_wins_with_book_crossings(&mut state_v27, 5);
+        let (res27, _) =
+            run_convert_pool_vs_book(&mut state_v27, &source_id, &a27, &b27, recv, budget, 27);
+        assert_eq!(
+            res27,
+            ConvertResult::CrossedTooMany,
+            "V27: non-committed book crossings (5) >= budget (5) must fail CrossedTooMany"
+        );
+    }
+
+    /// Boundary test for #3528 pinning `>=` (not `>`): with exactly one free slot
+    /// above the non-committed count the pool wins (`Ok`); reducing the budget so
+    /// `count >= budget` flips it to `CrossedTooMany`. The reserved slot is for
+    /// the pool ClaimAtom.
+    #[test]
+    fn test_non_committed_crossings_v27_boundary() {
+        let source_id = create_test_account_id(0);
+        let recv = 50; // 5 book offers * 10 B
+
+        // budget = 6 → 5 non-committed crossings < 6 (one slot free for the pool
+        // atom) → pool wins, Ok, and the caller is told 5 were consumed.
+        let mut state_ok = LedgerStateManager::new(5_000_000, 100);
+        let (a, b) = setup_pool_wins_with_book_crossings(&mut state_ok, 5);
+        let (res_ok, nc_ok) =
+            run_convert_pool_vs_book(&mut state_ok, &source_id, &a, &b, recv, 6, 27);
+        assert_eq!(
+            res_ok,
+            ConvertResult::Ok,
+            "V27 boundary: 5 crossings < budget 6 → pool wins (Ok)"
+        );
+        assert_eq!(
+            nc_ok, 5,
+            "out-param must report the 5 non-committed crossings"
+        );
+
+        // budget = 5 → 5 >= 5 → CrossedTooMany (the `>=` reserves the pool slot).
+        let mut state_fail = LedgerStateManager::new(5_000_000, 100);
+        let (a, b) = setup_pool_wins_with_book_crossings(&mut state_fail, 5);
+        let (res_fail, _) =
+            run_convert_pool_vs_book(&mut state_fail, &source_id, &a, &b, recv, 5, 27);
+        assert_eq!(
+            res_fail,
+            ConvertResult::CrossedTooMany,
+            "V27 boundary: 5 crossings >= budget 5 → CrossedTooMany"
+        );
+    }
+
+    /// End-to-end regression for #3528: a full strict-receive op whose single hop
+    /// crosses many speculative book offers before the pool wins exhausts the
+    /// work limit at V_27 (`opEXCEEDED_WORK_LIMIT`) but succeeds at V_26.
+    #[test]
+    fn test_path_payment_strict_receive_exceeds_work_limit_v27() {
+        let source_id = create_test_account_id(0);
+        let dest_id = create_test_account_id(1);
+
+        // Enough book offers that the speculative crossings exceed the 1000-offer
+        // budget on their own: 1000 offers * 10 B = 10_000 B requested.
+        let num_offers = MAX_OFFERS_TO_CROSS;
+        let recv = num_offers * 10;
+
+        let build = |proto: u32| {
+            let mut state = LedgerStateManager::new(5_000_000, 100);
+            state.create_account(create_test_account(source_id.clone(), 1_000_000_000));
+            state.create_account(create_test_account(dest_id.clone(), 1_000_000_000));
+            let (asset_a, asset_b) = setup_pool_wins_with_book_crossings(&mut state, num_offers);
+
+            // Source can pay A; dest can receive B.
+            state.create_trustline(create_test_trustline(
+                source_id.clone(),
+                create_test_trustline_asset(b"AAA\0", create_test_account_id(110)),
+                100_000_000,
+                i64::MAX,
+                AUTHORIZED_FLAG,
+            ));
+            state.create_trustline(create_test_trustline(
+                dest_id.clone(),
+                create_test_trustline_asset(b"BBB\0", create_test_account_id(120)),
+                0,
+                i64::MAX,
+                AUTHORIZED_FLAG,
+            ));
+
+            let op = PathPaymentStrictReceiveOp {
+                send_asset: asset_a,
+                send_max: 100_000_000,
+                destination: create_test_muxed_account(1),
+                dest_asset: asset_b,
+                dest_amount: recv,
+                path: vec![].try_into().unwrap(),
+            };
+            let mut context = LedgerContext::testnet(100, 1000);
+            context.protocol_version = proto;
+            (state, op, context)
+        };
+
+        // V_27: the ~1000 speculative book crossings exceed the work limit.
+        let (mut state, op, context) = build(27);
+        let res =
+            execute_path_payment_strict_receive(&op, &source_id, &mut state, &context).unwrap();
+        assert!(
+            matches!(res, OperationResult::OpExceededWorkLimit),
+            "V27: speculative book crossings must exhaust the work limit, got {:?}",
+            res
+        );
+
+        // V_26: the discarded crossings are free, so the op succeeds via the pool.
+        let (mut state, op, context) = build(26);
+        let res =
+            execute_path_payment_strict_receive(&op, &source_id, &mut state, &context).unwrap();
+        assert!(
+            matches!(
+                res,
+                OperationResult::OpInner(OperationResultTr::PathPaymentStrictReceive(
+                    PathPaymentStrictReceiveResult::Success(_)
+                ))
+            ),
+            "V26: discarded speculative crossings are free, op must succeed, got {:?}",
+            res
+        );
     }
 }

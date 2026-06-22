@@ -265,7 +265,7 @@ Corresponds to: `OfferExchange.h`
 | `adjustOffer()` | `adjust_offer_amount()` | Full |
 | `checkPriceErrorBound()` | `check_price_error_bound()` | Full |
 | `exchangeWithPool()` | `exchange_with_pool()` (in `path_payment.rs`) | Full |
-| `convertWithOffersAndPools()` | `convert_with_offers_and_pools()` (in `path_payment.rs`) | Full |
+| `convertWithOffersAndPools()` | `convert_with_offers_and_pools()` (in `path_payment.rs`) | Full (incl. V_27 `nonCommittedOffersCrossed` accounting) |
 | `canSellAtMost()` | Inline in manage_offer/path_payment | Full |
 | `canBuyAtMost()` | Inline in manage_offer/path_payment | Full |
 | `getPoolID()` | Inline pool ID computation | Full |
