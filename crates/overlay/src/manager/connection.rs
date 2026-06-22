@@ -2849,5 +2849,130 @@ mod tests {
             shared.cleanup_peer(&remote, new_gen);
             assert!(!shared.peers.contains_key(&remote));
         }
+
+        #[tokio::test]
+        async fn test_mutual_dial_replacement_does_not_double_count_added_peers() {
+            // Regression for #3500: the mutual-dial "new wins" replacement branch
+            // reuses an already-counted authenticated slot, so it must NOT bump the
+            // `added_authenticated_peers` atomic again. stellar-core v27.0.0 resolves
+            // the same collision pre-auth at HELLO (Peer::recvHello ERR_CONF
+            // "already-connected") so the loser is dropped while still pending —
+            // never counted as added, never recordDroppedPeer'd. Net core: +1/0.
+            // henyey must match: a winning replacement adds 0 (the slot was counted
+            // at the displaced peer's original registration) and the stale-generation
+            // cleanup drops 0.
+            let local = low_id();
+            let remote = high_id();
+            let shared = make_shared(local);
+            // Seed an existing authenticated outbound peer at generation 0. NOTE:
+            // insert_fake does NOT bump the add atomic, so we sample the baseline
+            // immediately before the replacing call and assert the *delta* across it.
+            insert_fake(&shared, &remote, ConnectionDirection::Outbound);
+
+            let added_before = shared.added_authenticated_peers.load(Ordering::Relaxed);
+            let dropped_before = shared.dropped_authenticated_peers.load(Ordering::Relaxed);
+
+            // Winning cross-direction inbound registration (local < remote ⇒ accept
+            // inbound ⇒ new wins ⇒ replaced.is_some()).
+            let peer = crate::peer::Peer::new_test_inbound(
+                remote.clone(),
+                false,
+                Arc::clone(&shared.metrics),
+            );
+            let reg = OverlayManager::try_register_peer(
+                &peer,
+                &remote,
+                peer.info().clone(),
+                &shared,
+                1024,
+            )
+            .expect("replacement should succeed");
+            assert!(
+                reg.replaced.is_some(),
+                "this case must be a replacement to exercise the double-count path"
+            );
+
+            // The replacement reused an already-counted slot: the add atomic must
+            // not have moved. On origin/main this is +1 (the bug) — the test fails.
+            assert_eq!(
+                shared.added_authenticated_peers.load(Ordering::Relaxed),
+                added_before,
+                "mutual-dial replacement must not bump added_authenticated_peers (double count)"
+            );
+
+            // Stale-generation cleanup of the displaced peer (the caller drops the
+            // old handle; its peer_loop calls cleanup_peer with the old generation):
+            // the new generation is installed, so this is a no-op and must not bump
+            // the drop atomic.
+            shared.cleanup_peer(&remote, 0);
+            assert_eq!(
+                shared.dropped_authenticated_peers.load(Ordering::Relaxed),
+                dropped_before,
+                "stale-generation cleanup must not bump dropped_authenticated_peers"
+            );
+            assert!(shared.peers.contains_key(&remote));
+        }
+
+        #[tokio::test]
+        async fn test_normal_registration_still_counts_added_peer() {
+            // Guard against over-correcting the fix: a non-replacing registration
+            // (vacant entry ⇒ replaced.is_none()) must still bump the add atomic by
+            // exactly 1.
+            let local = low_id();
+            let remote = high_id();
+            let shared = make_shared(local);
+
+            let added_before = shared.added_authenticated_peers.load(Ordering::Relaxed);
+            let peer = crate::peer::Peer::new_test_inbound(
+                remote.clone(),
+                false,
+                Arc::clone(&shared.metrics),
+            );
+            let reg = OverlayManager::try_register_peer(
+                &peer,
+                &remote,
+                peer.info().clone(),
+                &shared,
+                1024,
+            )
+            .expect("vacant entry should succeed");
+            assert!(reg.replaced.is_none());
+            assert_eq!(
+                shared.added_authenticated_peers.load(Ordering::Relaxed),
+                added_before + 1,
+                "a normal (non-replacement) registration must still count the added peer"
+            );
+        }
+
+        #[tokio::test]
+        async fn test_mutual_dial_loser_does_not_count() {
+            // The mutual-dial "existing wins" branch returns Err(AlreadyConnected)
+            // BEFORE the add bump, so a rejected duplicate must leave the add atomic
+            // unchanged. local > remote ⇒ keep existing outbound ⇒ reject new inbound.
+            let local = high_id();
+            let remote = low_id();
+            let shared = make_shared(local);
+            insert_fake(&shared, &remote, ConnectionDirection::Outbound);
+
+            let added_before = shared.added_authenticated_peers.load(Ordering::Relaxed);
+            let peer = crate::peer::Peer::new_test_inbound(
+                remote.clone(),
+                false,
+                Arc::clone(&shared.metrics),
+            );
+            let result = OverlayManager::try_register_peer(
+                &peer,
+                &remote,
+                peer.info().clone(),
+                &shared,
+                1024,
+            );
+            assert!(result.is_err());
+            assert_eq!(
+                shared.added_authenticated_peers.load(Ordering::Relaxed),
+                added_before,
+                "a rejected mutual-dial loser must not bump added_authenticated_peers"
+            );
+        }
     }
 }
