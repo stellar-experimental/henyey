@@ -22,6 +22,7 @@ async-trait.workspace = true
 x25519-dalek.workspace = true
 hmac.workspace = true
 sha2.workspace = true
+subtle.workspace = true
 blake2.workspace = true
 
 # Serialization
