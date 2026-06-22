@@ -23,6 +23,7 @@ It reuses `/project-tick`'s board query (Step 1), actionability filter (Step 2 +
 ## Configuration
 
 - **`N` = max parallel sub-agents = 3** (override with `--max-parallel=N`). Never dispatch more than `N` specialists concurrently.
+- **`KEEP_RECENT_DONE` = 10** — the loop keeps at most this many closed items in the `done` section, archiving the rest each pass (Step F2). Override with `--keep-recent-done=N`; set `--no-archive` to disable the trim entirely.
 - **`--no-reflect`** — skip the self-reflection / self-improvement pass entirely (operator off-switch).
 - Repo / project / field IDs: see `/project-tick` "Project board" section.
 
@@ -159,7 +160,22 @@ Then handle these special cases before the next pass:
 
 - **Force-converge:** you do **not** implement force-converge — `/review-pr` owns the lifetime bounce-cap force-converge behavior (at the cap, green CI auto-merges and residual reviewer concerns become follow-up issues; only red/pending CI still blocks). Just let `/review-pr` handle it and record an anomaly when an issue hits the cap.
 
-If actionable work remains and slots are free → go back to **Step C** immediately (same pass continues picking). Otherwise → **Step G**.
+If actionable work remains and slots are free → go back to **Step C** immediately (same pass continues picking). Otherwise → **Step F2**.
+
+### Step F2 — Trim the `done` section (keep ≤ `KEEP_RECENT_DONE` most recent)
+
+Once per pass (after dispatch handling, before idle), keep the `done` column from growing without bound: archive every closed item except the **`KEEP_RECENT_DONE` (=10)** most-recently-closed. Best-effort — never block a pass; skip on error and record an anomaly:
+
+```bash
+[ "${NO_ARCHIVE:-0}" = "1" ] || \
+  bash .github/skills/shared/scripts/archive-stale-done.sh --keep-recent "${KEEP_RECENT_DONE:-10}" \
+  || anomaly_log_append "done-trim archive-stale-done.sh failed (non-fatal)"
+```
+
+Notes:
+- Selection is by `closedAt` recency over CLOSED project items (which is what populates `done`); it uses GitHub's `archiveProjectV2Item` mutation, which is **reversible** (items can be unarchived). Idempotent — a no-op once ≤ `KEEP_RECENT_DONE` closed items remain, so the steady-state cost is one paginated query per pass.
+- The same script's age-based mode (`[days]`, default 2) remains available for cron use; `/project-loop` uses the count-based `--keep-recent` mode so the visible `done` section stays bounded regardless of churn.
+- Requires a token with org Projects scope (the script pre-flights and fails loudly otherwise — see its header); on a token-less run the step just logs the anomaly and the pass continues.
 
 ### Step G — Idle / backoff
 

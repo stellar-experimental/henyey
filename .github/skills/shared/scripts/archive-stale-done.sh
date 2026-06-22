@@ -1,15 +1,20 @@
 #!/usr/bin/env bash
-# archive-stale-done.sh — archive closed project items older than N days.
+# archive-stale-done.sh — archive closed project items, by age or by count.
 #
 # Usage:
-#   archive-stale-done.sh [--dry-run] [days]
+#   archive-stale-done.sh [--dry-run] [days]            # age-based  (default)
+#   archive-stale-done.sh [--dry-run] --keep-recent N   # count-based
 #
-# Default days = 2.
+# Two selection policies (mutually exclusive):
+#   * age-based (default, default days = 2): archive every project #2 item
+#     whose underlying Issue/PR is CLOSED and was closed at least N days ago.
+#   * count-based (--keep-recent N): keep only the N most-recently-closed
+#     items; archive every other CLOSED item regardless of age. This is what
+#     /project-loop uses to keep the `done` column trimmed to ~10 items.
 #
-# Archives every project #2 item whose underlying Issue/PR is in state
-# CLOSED and was closed at least N days ago, unless already archived.
-# Idempotent and safe to run from cron / a scheduled GitHub Action /
-# the plan-do-review-loop tick.
+# In both cases only un-archived items with Issue/PR content (not drafts) are
+# touched. Idempotent and safe to run from cron / a scheduled GitHub Action /
+# the project-loop tick. Archiving is reversible (items can be unarchived).
 #
 # Why not use the built-in "Auto-archive items" project workflow?
 #   GitHub does not expose the workflow's filter/action via the public
@@ -19,11 +24,25 @@
 set -euo pipefail
 
 DRY_RUN=false
-if [[ "${1:-}" == "--dry-run" ]]; then
-  DRY_RUN=true
-  shift
+KEEP_RECENT=""
+DAYS=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --dry-run)        DRY_RUN=true; shift ;;
+    --keep-recent)    KEEP_RECENT="${2:?--keep-recent requires a count N}"; shift 2 ;;
+    --keep-recent=*)  KEEP_RECENT="${1#*=}"; shift ;;
+    --*)              echo "ERROR: unknown flag: $1" >&2; exit 2 ;;
+    *)                DAYS="$1"; shift ;;
+  esac
+done
+DAYS="${DAYS:-2}"
+
+if [ -n "$KEEP_RECENT" ]; then
+  if ! [[ "$KEEP_RECENT" =~ ^[0-9]+$ ]]; then
+    echo "ERROR: --keep-recent requires a non-negative integer, got: $KEEP_RECENT" >&2
+    exit 2
+  fi
 fi
-DAYS="${1:-2}"
 
 OWNER="stellar-experimental"
 PROJECT_NUM=2
@@ -81,20 +100,39 @@ items_json=$(gh api graphql --paginate -f query='
     }
   }' -f org="$OWNER" -F proj="$PROJECT_NUM")
 
-# Eligible: not yet archived, has issue/PR content (skip drafts), state CLOSED,
-# closedAt older than the cutoff.
-to_archive=$(jq -rs --argjson days "$DAYS" '
-  .[].data.organization.projectV2.items.nodes[]
-  | select(.isArchived == false)
-  | select(.content != null)
-  | select(.content.state == "CLOSED")
-  | select(.content.closedAt != null)
-  | select((.content.closedAt | fromdateiso8601) < (now - ($days * 86400)))
-  | "\(.id) \(.content.number) \(.content.closedAt)"
-' <<<"$items_json")
+# Eligible base set: not yet archived, has issue/PR content (skip drafts),
+# state CLOSED, with a closedAt. The two policies differ only in which of the
+# eligible items they then select for archiving.
+if [ -n "$KEEP_RECENT" ]; then
+  # Count-based: sort eligible items most-recent-first by closedAt, keep the
+  # first $KEEP_RECENT, archive the rest.
+  to_archive=$(jq -rs --argjson keep "$KEEP_RECENT" '
+    [ .[].data.organization.projectV2.items.nodes[]
+      | select(.isArchived == false)
+      | select(.content != null)
+      | select(.content.state == "CLOSED")
+      | select(.content.closedAt != null) ]
+    | sort_by(.content.closedAt) | reverse
+    | .[$keep:]
+    | .[] | "\(.id) \(.content.number) \(.content.closedAt)"
+  ' <<<"$items_json")
+  empty_msg="No surplus items to archive (≤${KEEP_RECENT} closed item(s) present)."
+else
+  # Age-based: archive eligible items whose closedAt is older than the cutoff.
+  to_archive=$(jq -rs --argjson days "$DAYS" '
+    .[].data.organization.projectV2.items.nodes[]
+    | select(.isArchived == false)
+    | select(.content != null)
+    | select(.content.state == "CLOSED")
+    | select(.content.closedAt != null)
+    | select((.content.closedAt | fromdateiso8601) < (now - ($days * 86400)))
+    | "\(.id) \(.content.number) \(.content.closedAt)"
+  ' <<<"$items_json")
+  empty_msg="No items to archive (closed > ${DAYS} day(s) ago)."
+fi
 
 if [ -z "$to_archive" ]; then
-  echo "No items to archive (closed > ${DAYS} day(s) ago)."
+  echo "$empty_msg"
   exit 0
 fi
 
