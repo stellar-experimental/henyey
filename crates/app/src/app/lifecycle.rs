@@ -3709,3 +3709,143 @@ mod tx_flood_forget_tests {
         assert!(should_forget_tx_flood_record(&TxQueueResult::TryAgainLater));
     }
 }
+
+#[cfg(test)]
+mod tx_set_gc_offload_tests {
+    //! Regression tests for #3532 — the tx_set_gc event-loop freeze.
+    //!
+    //! On `origin/main` the `tx_set_gc_interval.tick()` arm called
+    //! `self.herder.purge_persisted_tx_sets()` inline on the tokio event-loop
+    //! thread. A large persisted-tx-set table (or write contention) made that
+    //! synchronous `BEGIN IMMEDIATE` purge block the loop for tens of seconds
+    //! (observed 39s, watchdog_freeze). The fix offloads the purge via
+    //! `spawn_blocking` behind a loop-local in-flight guard so the loop arm
+    //! returns promptly and purges stay strictly serial (mirroring
+    //! stellar-core's serial reschedule cadence).
+    use super::dispatch_tx_set_gc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Barrier};
+    use std::thread::ThreadId;
+    use std::time::{Duration, Instant};
+    use tokio::task::JoinHandle;
+
+    /// The dispatch must return promptly (loop not blocked) and the work must
+    /// run on a DIFFERENT thread than the dispatcher (the event-loop thread).
+    ///
+    /// Fails on `origin/main`: the arm runs the purge inline, so the dispatch
+    /// would block for the full ~1s barrier and the work thread id would equal
+    /// the dispatcher's thread id.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_tx_set_gc_purge_runs_off_event_loop_thread() {
+        let dispatcher_tid = std::thread::current().id();
+        let work_tid: Arc<std::sync::Mutex<Option<ThreadId>>> =
+            Arc::new(std::sync::Mutex::new(None));
+        // Barrier of 2: the work closure waits until the test releases it, so
+        // the work is guaranteed still-running while we assert prompt return.
+        let barrier = Arc::new(Barrier::new(2));
+
+        let mut slot: Option<JoinHandle<()>> = None;
+        let work_tid_c = Arc::clone(&work_tid);
+        let barrier_c = Arc::clone(&barrier);
+
+        let start = Instant::now();
+        dispatch_tx_set_gc(
+            move || {
+                *work_tid_c.lock().unwrap() = Some(std::thread::current().id());
+                // Block to simulate a slow purge. If this ran inline on the
+                // dispatcher thread, the dispatch call below would not return.
+                barrier_c.wait();
+            },
+            &mut slot,
+        );
+        let dispatch_elapsed = start.elapsed();
+
+        // (1) Dispatch returned promptly — the event loop was not blocked.
+        assert!(
+            dispatch_elapsed < Duration::from_millis(100),
+            "dispatch_tx_set_gc blocked the caller for {:?} (expected <100ms); \
+             purge was not offloaded off the event-loop thread",
+            dispatch_elapsed
+        );
+
+        // Release the work closure and let the spawned task complete.
+        barrier.wait();
+        let handle = slot.take().expect("dispatch should have stored a handle");
+        handle.await.expect("spawned purge task should complete");
+
+        // (2) The work ran on a different thread than the dispatcher.
+        let observed = work_tid
+            .lock()
+            .unwrap()
+            .expect("work should have recorded a thread id");
+        assert_ne!(
+            observed, dispatcher_tid,
+            "purge ran on the dispatcher (event-loop) thread; expected a spawn_blocking thread"
+        );
+    }
+
+    /// A second dispatch while the first purge is still in-flight must NOT
+    /// spawn a second concurrent purge (serial in-flight guard), mirroring
+    /// stellar-core rescheduling the GC timer only after the purge returns.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_tx_set_gc_serial_no_overlap() {
+        // Counts how many purge closures are running concurrently and the peak.
+        let running = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let total = Arc::new(AtomicUsize::new(0));
+        // Barrier of 2: test + first purge. The first purge holds here so it is
+        // unambiguously still-running when the second dispatch is attempted.
+        let barrier = Arc::new(Barrier::new(2));
+
+        let mut slot: Option<JoinHandle<()>> = None;
+
+        let make_work = || {
+            let running = Arc::clone(&running);
+            let peak = Arc::clone(&peak);
+            let total = Arc::clone(&total);
+            let barrier = Arc::clone(&barrier);
+            move || {
+                total.fetch_add(1, Ordering::SeqCst);
+                let cur = running.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(cur, Ordering::SeqCst);
+                barrier.wait();
+                running.fetch_sub(1, Ordering::SeqCst);
+            }
+        };
+
+        // First dispatch: spawns and starts running (blocks on the barrier).
+        dispatch_tx_set_gc(make_work(), &mut slot);
+        // Wait until the first purge is observably running before the 2nd tick.
+        let spin_start = Instant::now();
+        while running.load(Ordering::SeqCst) == 0 {
+            assert!(
+                spin_start.elapsed() < Duration::from_secs(5),
+                "first purge never started"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        // Second dispatch while the first is still in-flight: must be skipped.
+        dispatch_tx_set_gc(make_work(), &mut slot);
+
+        // Give a skipped-or-spawned second task a moment to (not) start.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            peak.load(Ordering::SeqCst),
+            1,
+            "a second purge ran concurrently with the first; in-flight guard failed"
+        );
+
+        // Release the first purge and let it finish.
+        barrier.wait();
+        let handle = slot.take().expect("a handle should be stored");
+        handle.await.expect("first purge should complete");
+
+        // Exactly one purge ran in total — the second tick was coalesced.
+        assert_eq!(
+            total.load(Ordering::SeqCst),
+            1,
+            "expected exactly one purge to run (second tick coalesced by guard)"
+        );
+    }
+}
