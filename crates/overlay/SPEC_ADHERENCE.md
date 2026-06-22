@@ -1,8 +1,8 @@
 # OVERLAY_SPEC Adherence — henyey-overlay
 
-**Spec version:** 26 (Overlay Protocol v38–v39)
+**Spec version:** 26 (Overlay Protocol v38–v41)
 **Crate:** crates/overlay
-**Last updated:** 2026-06-03
+**Last updated:** 2026-06-22
 **Overall adherence:** 83%
 
 Counts (excluding Drift and N/A from denominator):

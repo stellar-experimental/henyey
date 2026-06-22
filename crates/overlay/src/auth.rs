@@ -928,7 +928,7 @@ mod tests {
         let ctx = AuthContext::new(local_node, true);
 
         let hello = ctx.create_hello();
-        assert_eq!(hello.overlay_version, 40);
+        assert_eq!(hello.overlay_version, 41);
         assert_eq!(hello.overlay_min_version, 38);
         assert_eq!(
             hello.ledger_version,
@@ -1478,13 +1478,13 @@ mod tests {
 
     #[test]
     fn test_process_hello_rejects_peer_too_new() {
-        // Peer's min version is above our max (40)
+        // Peer's min version is above our max (41)
         let secret = SecretKey::generate();
         let local_node = LocalNode::new_testnet(secret);
         let mut ctx = AuthContext::new(local_node.clone(), true);
         ctx.hello_sent();
 
-        let hello = make_hello_with_versions(43, 41, &local_node);
+        let hello = make_hello_with_versions(45, 42, &local_node);
         let result = ctx.process_hello(&hello);
         assert!(result.is_err());
         assert!(
@@ -1903,10 +1903,10 @@ mod tests {
             r
         );
 
-        // Peer too new.
+        // Peer too new (min 42 is above our max of 41).
         let mut ctx = AuthContext::new(local_node.clone(), false);
         ctx.hello_sent();
-        let hello = make_hello_with_versions(43, 41, &local_node);
+        let hello = make_hello_with_versions(45, 42, &local_node);
         ctx.process_hello_phase1(&hello).unwrap();
         let r = ctx.validate_hello_post_send(&hello);
         assert!(
