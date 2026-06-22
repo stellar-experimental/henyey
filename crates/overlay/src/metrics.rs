@@ -915,4 +915,39 @@ mod tests {
         metrics.reset();
         assert_eq!(metrics.flood_shed_unsynced.get(), 0);
     }
+
+    #[test]
+    fn test_inbound_drop_remote_local_split_sums_to_total() {
+        // #3422: the two initiator-segmented counters must round-trip through
+        // snapshot and (by the connection.rs increment convention) sum to the
+        // unconditional `inbound_drop` total. Here we model that convention by
+        // incrementing the total alongside each split increment.
+        let metrics = OverlayMetrics::new();
+
+        // 3 remote-initiated drops, 2 local-initiated drops.
+        for _ in 0..3 {
+            metrics.inbound_drop_remote.inc();
+            metrics.inbound_drop.inc();
+        }
+        for _ in 0..2 {
+            metrics.inbound_drop_local.inc();
+            metrics.inbound_drop.inc();
+        }
+
+        let snap = metrics.snapshot();
+        assert_eq!(snap.inbound_drop_remote, 3);
+        assert_eq!(snap.inbound_drop_local, 2);
+        assert_eq!(snap.inbound_drop, 5);
+        assert_eq!(
+            snap.inbound_drop_remote + snap.inbound_drop_local,
+            snap.inbound_drop,
+            "remote + local must equal the inbound_drop total"
+        );
+
+        metrics.reset();
+        let snap = metrics.snapshot();
+        assert_eq!(snap.inbound_drop_remote, 0);
+        assert_eq!(snap.inbound_drop_local, 0);
+        assert_eq!(snap.inbound_drop, 0);
+    }
 }

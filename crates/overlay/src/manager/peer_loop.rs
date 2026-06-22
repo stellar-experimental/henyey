@@ -1314,6 +1314,41 @@ mod tests {
     use stellar_xdr::ErrorCode;
 
     #[test]
+    fn test_drop_initiator_classification() {
+        // #3422: classify each inbound-drop `reason` (the low-cardinality
+        // taxonomy fed to log_inbound_drop_diag) by who broke the loop.
+        // Remote = peer closed/reset the socket; Local = henyey broke the loop.
+        assert_eq!(
+            DropInitiator::from_reason("remote_closed"),
+            DropInitiator::Remote
+        );
+        assert_eq!(
+            DropInitiator::from_reason("recv_error"),
+            DropInitiator::Remote
+        );
+        assert_eq!(
+            DropInitiator::from_reason("send_error"),
+            DropInitiator::Local
+        );
+        assert_eq!(
+            DropInitiator::from_reason("flood_send_error"),
+            DropInitiator::Local
+        );
+        assert_eq!(DropInitiator::from_reason("timeout"), DropInitiator::Local);
+        assert_eq!(
+            DropInitiator::from_reason("protocol_break"),
+            DropInitiator::Local
+        );
+        assert_eq!(DropInitiator::from_reason("shutdown"), DropInitiator::Local);
+        // Default for any unknown / unattributed exit is Local (henyey-side).
+        assert_eq!(
+            DropInitiator::from_reason("anything_else"),
+            DropInitiator::Local
+        );
+        assert_eq!(DropInitiator::default(), DropInitiator::Local);
+    }
+
+    #[test]
     fn test_idle_timeout_constants_match_upstream() {
         // Verify our timeout constants match stellar-core defaults:
         // - PEER_TIMEOUT = 30 (Config.cpp:258)
