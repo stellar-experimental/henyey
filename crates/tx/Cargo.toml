@@ -16,6 +16,7 @@ henyey-db.workspace = true
 soroban-env-host-p24.workspace = true
 soroban-env-host-p25.workspace = true
 soroban-env-host-p26.workspace = true
+soroban-env-host-p27.workspace = true
 
 # Error handling
 thiserror.workspace = true

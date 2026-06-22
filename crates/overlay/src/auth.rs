@@ -929,7 +929,10 @@ mod tests {
         let hello = ctx.create_hello();
         assert_eq!(hello.overlay_version, 40);
         assert_eq!(hello.overlay_min_version, 38);
-        assert_eq!(hello.ledger_version, 26);
+        assert_eq!(
+            hello.ledger_version,
+            henyey_common::protocol::CURRENT_LEDGER_PROTOCOL_VERSION
+        );
     }
 
     // ---- G14: receiver auth state (not the wire bit-31 flag) gates MAC verification in unwrap_message ----

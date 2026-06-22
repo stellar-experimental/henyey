@@ -37,6 +37,7 @@ pub(super) use henyey_common::checked_types::{account_liabilities, trustline_lia
 use soroban_env_host_p24 as soroban_env_host24;
 use soroban_env_host_p25 as soroban_env_host25;
 use soroban_env_host_p26 as soroban_env_host26;
+use soroban_env_host_p27 as soroban_env_host27;
 use stellar_xdr::{
     AccountEntry, AccountEntryExt, AccountEntryExtensionV1, AccountEntryExtensionV1Ext, AccountId,
     Asset, ContractEvent, DiagnosticEvent, ExtendFootprintTtlResult, InvokeHostFunctionResult,
@@ -778,8 +779,8 @@ pub fn entry_size_for_rent_by_protocol_with_cost_params(
                 entry_xdr_size
             }
         }
-    } else {
-        // Protocol >= 26: p26 host pins stellar-xdr 26.0.0, distinct from the
+    } else if protocol_version_is_before(protocol_version, ProtocolVersion::V27) {
+        // Protocol 26: p26 host pins stellar-xdr 26.0.0, distinct from the
         // workspace XDR, so the entry is byte-converted to the P26 type.
         let budget = match cost_params {
             Some((cpu, mem)) => build_budget_p26(cpu, mem),
@@ -797,6 +798,15 @@ pub fn entry_size_for_rent_by_protocol_with_cost_params(
                 entry_xdr_size
             }
         }
+    } else {
+        // Protocol >= 27: p27 host pins stellar-xdr 27.0.0 — the SAME as the
+        // workspace XDR — so the entry is passed NATIVELY (no byte conversion).
+        let budget = match cost_params {
+            Some((cpu, mem)) => build_budget_p27(cpu, mem),
+            None => soroban_env_host27::budget::Budget::default(),
+        };
+        soroban_env_host27::e2e_invoke::entry_size_for_rent(&budget, entry, entry_xdr_size)
+            .unwrap_or(entry_xdr_size)
     }
 }
 
@@ -858,6 +868,24 @@ fn build_budget_p26(
             soroban_env_host26::budget::Budget::default()
         }
     }
+}
+
+/// Build a P27 Budget from on-chain cost parameters.
+///
+/// NATIVE: the P27 host shares stellar-xdr 27.0.0 with the workspace, so the
+/// workspace `ContractCostParams` are passed straight through (no conversion).
+fn build_budget_p27(
+    cpu_cost_params: &stellar_xdr::ContractCostParams,
+    mem_cost_params: &stellar_xdr::ContractCostParams,
+) -> soroban_env_host27::budget::Budget {
+    // Use limits of 0 — we only need the cost model, not actual metering.
+    soroban_env_host27::budget::Budget::try_from_configs(
+        0,
+        0,
+        cpu_cost_params.clone(),
+        mem_cost_params.clone(),
+    )
+    .unwrap_or_else(|_| soroban_env_host27::budget::Budget::default())
 }
 
 // Local conversion functions removed — use crate::soroban::convert::try_convert_* instead.

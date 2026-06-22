@@ -24,7 +24,7 @@ members = [
 # They are referenced as workspace dependencies with version pins below.
 
 [workspace.package]
-version = "26.0.0-alpha.1"
+version = "27.0.0-alpha.1"
 edition = "2021"
 authors = ["Stellar Contributors"]
 license = "Apache-2.0"
@@ -42,10 +42,11 @@ stellar-strkey = "0.0.11"
 # submodule's recorded gitlinks for rs-soroban-env.
 # Verify alignment: bash scripts/check-soroban-pins.sh
 # When bumping the stellar-core submodule, update these revs to match:
-#   git -C stellar-core ls-tree HEAD src/rust/soroban/p24 src/rust/soroban/p25 src/rust/soroban/p26
+#   git -C stellar-core ls-tree HEAD src/rust/soroban/p24 src/rust/soroban/p25 src/rust/soroban/p26 src/rust/soroban/p27
 soroban-env-host-p24 = { package = "soroban-env-host", git = "https://github.com/stellar/rs-soroban-env", rev = "a37eeda815e626f416eff13f2eacb32a8b0c3729" }
 soroban-env-host-p25 = { package = "soroban-env-host", git = "https://github.com/stellar/rs-soroban-env", rev = "6323c1fc03ecb9f53b7c1e42fd62c1bbd3aebc2c" }
 soroban-env-host-p26 = { package = "soroban-env-host", git = "https://github.com/stellar/rs-soroban-env", rev = "b351f88a468d3b9e1d6de53d5b0ca585f6b7dadb" }
+soroban-env-host-p27 = { package = "soroban-env-host", git = "https://github.com/stellar/rs-soroban-env", rev = "b03d2563f3a08d51095a19bdbb6d90364b8ce04a" }
 
 # Workspace crates
 henyey-common = { path = "crates/common" }
