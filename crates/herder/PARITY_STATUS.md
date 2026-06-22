@@ -115,7 +115,7 @@ Corresponds to: `Herder.h`, `HerderImpl.h`
 | `herderOutOfSync()` | `SyncRecoveryManager` | Full |
 | `getMoreSCPState()` | `request_scp_state_from_peers()` → `OverlayManager::request_scp_state()` with clamped low-watermark and 2-peer fanout | Full |
 | `persistSCPState()` | `ScpPersistenceManager.persist_scp_state()` wired via `ScpDriver::emit` persist callback | Full[^persist-scp] |
-| `restoreSCPState()` | `ScpPersistenceManager.restore()` | Full |
+| `restoreSCPState()` | `Herder::restore_persisted_scp_state()` wired from `App::run()` after `bootstrap(lcl)` | Partial[^restore-scp] |
 | `persistUpgrades()` | `UpgradeParameters` with Serde persistence | Full |
 | `restoreUpgrades()` | `UpgradeParameters` with Serde persistence | Full |
 | `trackingHeartBeat()` | `SyncRecoveryManager` | Full |
@@ -132,8 +132,43 @@ Corresponds to: `Herder.h`, `HerderImpl.h`
 [^txset-gc]: GC timer + purge wired in #2698 (driven by app event-loop phase
 33 every `TX_SET_GC_DELAY_SECS` = 60s). The `persist_scp_state` wiring was
 completed in #2768 (`ScpDriver::emit` invokes the persist callback installed
-by `Herder::set_scp_persistence`). The `restore_scp_state` wiring remains
-tracked in #2769.
+by `Herder::set_scp_persistence`). The `restore_scp_state` wiring was completed
+in #2769 (see [^restore-scp]).
+
+[^restore-scp]: Startup restore was wired in #2769. `App::run()` calls
+`Herder::restore_persisted_scp_state(lcl)` immediately after
+`Herder::bootstrap(lcl)` and before requesting SCP state from peers — the
+henyey split-lifecycle equivalent of stellar-core's `HerderImpl::start()`
+calling `restoreSCPState()` after `setTrackingSCPState(lcl,...,true)` +
+`trackingHeartBeat()` (`HerderImpl.cpp:2455-2471`). Marked **Partial** because
+of two intentional, architecture-forced adaptations (NOT upstream parity):
+
+1. **`slot > lcl` envelope filter** (no upstream analog). `bootstrap(lcl)` has
+   already recreated the finalized-LCL baseline, so persisted `slot <= lcl`
+   envelopes are already-closed history; re-injecting them adds nothing and
+   stalls henyey's SCP ballot machine (it pins `current_ballot`/`phase` and
+   rejects superseding live envelopes — `ballot/mod.rs:854`). This is the
+   regression guard for the consensus stall that closed PR #2797.
+
+2. **Live-envelope replay is currently gated OFF**
+   (`Herder::RESTORE_LIVE_ENVELOPE_REPLAY == false`). #2769 ships the
+   dependency hydration (decode + cache the referenced tx-sets and quorum-sets
+   for retained `slot > lcl` envelopes) and the transitive-quorum rebuild, but
+   does NOT replay the future-slot envelopes via `set_state_from_envelope`,
+   because doing so reproduces the PR #2797 stall (the simulation restart suite
+   `test_core3_restart_rejoin_over_loopback` stalls ~4/5 runs with replay on,
+   and is deterministically green with it off). Re-enabling live replay is
+   tracked by #3555 (allow a restored ballot slot to be superseded by a later
+   network EXTERNALIZE); once that lands the flag flips to `true`.
+
+   The restore-time quorum-tracker rebuild follows upstream's
+   local-node-preserving closure shape (`PendingEnvelopes.cpp:924-955`): the
+   local node always resolves via its pinned local quorum set (never weakened),
+   and remote nodes resolve via their latest message's companion quorum-set
+   hash. henyey has no `HerderPersistence::getNodeQuorumSet` DB table, so
+   upstream's third (DB) fallback branch is omitted; remote-node transitive
+   quorum that is not resolvable from restored quorum-sets is reconstructed
+   lazily from live messages, not at restore.
 
 [^persist-scp]: Wired in #2768 via a deferred persist callback on `ScpDriver`.
 Each call to `ScpDriver::emit` (which mirrors stellar-core's

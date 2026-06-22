@@ -2870,6 +2870,17 @@ impl ScpDriver {
         self.qset_tracker.store(node_id, quorum_set);
     }
 
+    /// Store a quorum set by its content hash only, without associating it
+    /// with a node.
+    ///
+    /// Used by the startup SCP-state restore path (#2769) to rehydrate
+    /// persisted quorum sets so envelope replay and the transitive-quorum
+    /// rebuild can resolve them by hash. Parity: stellar-core
+    /// `PendingEnvelopes::addSCPQuorumSet` → `putQSet`.
+    pub fn store_quorum_set_by_hash(&self, hash: Hash256, quorum_set: ScpQuorumSet) {
+        self.qset_tracker.store_by_hash(hash, quorum_set);
+    }
+
     /// Get a quorum set for a node.
     pub fn get_quorum_set(&self, node_id: &stellar_xdr::NodeId) -> Option<ScpQuorumSet> {
         self.qset_tracker.get_by_node(node_id)

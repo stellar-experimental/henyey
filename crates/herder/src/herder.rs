@@ -893,6 +893,235 @@ impl Herder {
         Ok(())
     }
 
+    /// When `true`, the persisted **future-slot** (`slot > lcl`) local
+    /// envelopes are replayed into SCP via `set_state_from_envelope`. When
+    /// `false`, restore performs dependency hydration (tx-sets + quorum-sets)
+    /// and the transitive-quorum rebuild ONLY, and the live-envelope replay is
+    /// deferred.
+    ///
+    /// **Currently GATED OFF.** Re-injecting even a future-slot local envelope
+    /// pins henyey's SCP ballot machine in its restored phase (e.g.
+    /// `Externalize`) so the restored node emits nothing and cannot follow a
+    /// later network ballot for that slot — reproducing the consensus stall
+    /// that closed PR #2797. With replay enabled the simulation restart test
+    /// `test_core3_restart_rejoin_over_loopback` stalls in ~4 of 5 runs (node0
+    /// stuck `ballot_phase=Externalize, scp_sent=0` while peers stay in
+    /// `Prepare`); with replay gated off the same suite is deterministically
+    /// green. The plan's mechanical gate (≥5 green sim runs to ship live
+    /// replay) therefore selects the gated-off variant. Re-enabling is tracked
+    /// by the SCP ballot-supersession follow-up referenced in
+    /// `crates/herder/PARITY_STATUS.md`'s `[^restore-scp]` footnote; once SCP
+    /// can supersede a restored ballot from a later network EXTERNALIZE, flip
+    /// this to `true` and the existing replay path + tests re-activate.
+    const RESTORE_LIVE_ENVELOPE_REPLAY: bool = false;
+
+    /// Restore persisted SCP state at startup. Hydrates the tx-sets and
+    /// quorum-sets referenced by retained **future-slot** (`slot > lcl`) local
+    /// envelopes and rebuilds the transitive quorum graph. The future-slot
+    /// envelopes themselves are replayed into SCP only when
+    /// [`Self::RESTORE_LIVE_ENVELOPE_REPLAY`] is `true` (currently `false`; see
+    /// that constant for the #2797-stall rationale).
+    ///
+    /// Parity: mirrors stellar-core `HerderImpl::restoreSCPState()`
+    /// (`HerderImpl.cpp:2239-2311`), invoked from `HerderImpl::start()` after
+    /// `setTrackingSCPState(lcl, ..., true)` + `trackingHeartBeat()`
+    /// (`HerderImpl.cpp:2455-2471`). In henyey's split lifecycle, the
+    /// `setTrackingSCPState`/`trackingHeartBeat` equivalent is
+    /// `App::run()` → `Herder::bootstrap(lcl)`, so this hook must run **after**
+    /// `bootstrap(lcl)` and before requesting SCP state from peers.
+    ///
+    /// Two intentional, architecture-forced divergences from upstream (see the
+    /// `[^restore-scp]` footnote in `crates/herder/PARITY_STATUS.md`):
+    ///
+    /// 1. **`slot > lcl` envelope filter** (no upstream analog). `bootstrap(lcl)`
+    ///    has already recreated the finalized-LCL baseline, so any persisted
+    ///    envelope for a `slot <= lcl` is already-closed history. Re-injecting
+    ///    it via `set_state_from_envelope` adds nothing and, worse, stalls
+    ///    henyey's SCP ballot machine (it pins `current_ballot`/`phase` and
+    ///    rejects superseding live envelopes — `ballot/mod.rs:854`). This is
+    ///    the regression guard for the consensus stall that closed PR #2797.
+    ///    The deeper ballot-supersession gap is the follow-up that gates
+    ///    re-enabling live-envelope replay.
+    /// 2. **Restore-time quorum-tracker rebuild** uses upstream's
+    ///    local-node-preserving closure shape (`PendingEnvelopes.cpp:924-955`):
+    ///    local node → always-available local qset; remote node → latest
+    ///    message → companion qset hash → by-hash lookup. henyey has no
+    ///    `HerderPersistence::getNodeQuorumSet` DB table, so upstream's third
+    ///    (DB) fallback branch is omitted; remote-node transitive quorum is
+    ///    reconstructed lazily from live messages, not at restore. The local
+    ///    node is never weakened by the rebuild.
+    ///
+    /// Genesis gate: a no-op when `lcl <= GENESIS_LEDGER_SEQ` (nothing useful
+    /// can be persisted before genesis) and when no persistence manager is
+    /// installed. The `slot > lcl` filter also makes a fresh-genesis replay a
+    /// no-op, so dropping upstream's explicit `!FORCE_SCP` branch is
+    /// behaviorally equivalent for a fresh node.
+    ///
+    /// Per-entry decode errors are tolerated (logged + skipped), matching
+    /// upstream's per-entry try/catch; a hard storage/load failure logs an
+    /// error and lets startup proceed via the fresh-envelope sync fallback.
+    pub fn restore_persisted_scp_state(&self, lcl: u64) {
+        let Some(manager) = self.scp_persistence.get() else {
+            // No persistence manager installed — nothing to restore.
+            return;
+        };
+
+        if lcl <= GENESIS_LEDGER_SEQ {
+            // Genesis (or pre-genesis): nothing useful was ever persisted.
+            return;
+        }
+
+        let restored = match manager.restore_scp_state() {
+            Ok(restored) => restored,
+            Err(e) => {
+                // Hard load failure: proceed without restored state, exactly
+                // like stellar-core "proceeding without them".
+                error!(error = %e, "Failed to restore persisted SCP state — proceeding without it");
+                return;
+            }
+        };
+
+        // Retain only future-slot envelopes. `slot <= lcl` is already-closed
+        // history that bootstrap(lcl) has reconstructed; replaying it stalls
+        // SCP (the #2797 regression). Filter first so dependency hydration is
+        // driven strictly by the envelopes we will actually replay.
+        let future_envelopes: Vec<&ScpEnvelope> = restored
+            .envelopes
+            .iter()
+            .filter(|(slot, _env)| *slot > lcl)
+            .map(|(_slot, env)| env)
+            .collect();
+
+        if future_envelopes.is_empty() {
+            debug!(
+                lcl,
+                total = restored.envelopes.len(),
+                "restore_persisted_scp_state: no future-slot envelopes to replay"
+            );
+            return;
+        }
+
+        // Collect the tx-set and quorum-set hashes referenced by the retained
+        // future-slot envelopes only.
+        let mut referenced_tx_sets: std::collections::HashSet<Hash256> =
+            std::collections::HashSet::new();
+        let mut referenced_qsets: std::collections::HashSet<Hash256> =
+            std::collections::HashSet::new();
+        for env in &future_envelopes {
+            for hash in crate::persistence::get_tx_set_hashes(env) {
+                referenced_tx_sets.insert(Hash256(hash.0));
+            }
+            if let Some(qhash) = crate::persistence::get_quorum_set_hash(env) {
+                referenced_qsets.insert(Hash256(qhash.0));
+            }
+        }
+
+        // --- Tx-set replay (parity: HerderImpl.cpp:2247-2272). ---
+        // Decode StoredTransactionSet → TransactionSet → cache. Per-entry
+        // decode errors are logged and skipped.
+        for (hash, bytes) in &restored.tx_sets {
+            let hash256 = Hash256(hash.0);
+            if !referenced_tx_sets.contains(&hash256) {
+                // Not referenced by any retained future-slot envelope.
+                continue;
+            }
+            let stored = match stellar_xdr::StoredTransactionSet::from_xdr(
+                bytes.as_slice(),
+                stellar_xdr::Limits::none(),
+            ) {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!(error = %e, "restore: failed to decode StoredTransactionSet — skipping");
+                    continue;
+                }
+            };
+            match TransactionSet::from_xdr_stored_set(&stored) {
+                Ok(tx_set) => self.scp_driver.cache_tx_set(tx_set),
+                Err(e) => {
+                    warn!(error = %e, "restore: failed to build TransactionSet — skipping");
+                }
+            }
+        }
+
+        // --- Quorum-set replay (parity: addSCPQuorumSet → putQSet,
+        // PendingEnvelopes.cpp:99-121). Store by hash in the qset tracker so
+        // both set_state_from_envelope and the rebuild can resolve it, and
+        // mirror into FetchingEnvelopes (the putQSet equivalent that releases
+        // any waiters). ---
+        for (hash, qs) in &restored.quorum_sets {
+            let hash256 = Hash256(hash.0);
+            if !referenced_qsets.contains(&hash256) {
+                continue;
+            }
+            self.scp_driver
+                .store_quorum_set_by_hash(hash256, qs.clone());
+            self.fetching_envelopes
+                .cache_quorum_set(hash256, qs.clone());
+        }
+
+        // --- SCP envelope replay (parity: Slot::setStateFromEnvelope,
+        // Slot.cpp:61-88). Only future slots reach here. GATED: see
+        // `RESTORE_LIVE_ENVELOPE_REPLAY` — replaying a restored ballot stalls
+        // SCP (the PR #2797 regression), so this is deferred to the
+        // ballot-supersession follow-up. Dependency hydration above still runs
+        // so the node can immediately validate the future slot once it hears
+        // the corresponding live envelopes from peers. ---
+        let mut replayed = 0usize;
+        if Self::RESTORE_LIVE_ENVELOPE_REPLAY {
+            for env in &future_envelopes {
+                if self.scp.set_state_from_envelope(env) {
+                    replayed += 1;
+                } else {
+                    warn!(
+                        slot = env.statement.slot_index,
+                        "restore: set_state_from_envelope rejected a persisted envelope — skipping"
+                    );
+                }
+            }
+        } else {
+            debug!(
+                lcl,
+                deferred = future_envelopes.len(),
+                "restore: live-envelope replay gated off (PR #2797 stall guard); \
+                 hydrated dependencies only"
+            );
+        }
+
+        // --- Rebuild the transitive quorum graph once, after all envelopes
+        // are loaded. Idempotent, so a single end-of-restore rebuild is
+        // equivalent to upstream's per-slot rebuild. The closure preserves the
+        // local node (its qset is pinned/always-available) and resolves remote
+        // nodes via their latest restored message's companion qset hash. ---
+        let mut tracker = self.quorum_tracker.write();
+        let local_node_id = self.scp.local_node_id().clone();
+        if let Err(err) = tracker.rebuild(|id| {
+            if *id == local_node_id {
+                // Local node: pinned local qset, never weakened.
+                return self.scp_driver.get_quorum_set(id);
+            }
+            // Remote node: latest restored message → companion qset hash →
+            // by-hash lookup. None if we never restored that node's qset
+            // (reconstructed lazily from live messages later).
+            if let Some(qs) = self.scp_driver.get_quorum_set(id) {
+                return Some(qs);
+            }
+            let env = self.scp.get_latest_message(id)?;
+            let qhash = crate::persistence::get_quorum_set_hash(&env)?;
+            self.scp_driver.get_quorum_set_by_hash(&Hash256(qhash.0))
+        }) {
+            warn!(error = %err, "restore: failed to rebuild quorum tracker");
+        }
+        drop(tracker);
+
+        info!(
+            lcl,
+            replayed,
+            tx_sets = referenced_tx_sets.len(),
+            quorum_sets = referenced_qsets.len(),
+            "Restored persisted SCP state for future slots"
+        );
+    }
+
     /// Install the shared `is_applying` flag so `trigger_next_ledger` can
     /// check whether ledger application is in progress.
     ///
@@ -9498,6 +9727,330 @@ mod tests {
         assert!(
             !manager.has_tx_set(&orphan_hash).unwrap(),
             "orphan tx set must be purged by GC"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // restore_persisted_scp_state (#2769) — startup SCP-state restore.
+    //
+    // Mirrors stellar-core HerderImpl::restoreSCPState() (HerderImpl.cpp:2239-2311)
+    // called from HerderImpl::start() (HerderImpl.cpp:2455-2471). The henyey
+    // split lifecycle runs `bootstrap(lcl)` first (the setTrackingSCPState +
+    // trackingHeartBeat equivalent), so restore must filter to `slot > lcl`.
+    // That filter is the regression guard for the consensus stall that closed
+    // PR #2797 (replaying already-finalized `slot <= lcl` ballots stalls
+    // henyey's SCP ballot machine).
+    // -----------------------------------------------------------------------
+
+    /// Build a validator herder whose local quorum set is a 1-of-1 over itself,
+    /// returning the herder plus the signing secret. Distinct seed from the
+    /// shared `[7u8;32]` helpers so its persisted envelopes are local-node-owned.
+    fn make_restore_validator_herder() -> (Herder, SecretKey) {
+        let seed = [3u8; 32];
+        let secret = SecretKey::from_seed(&seed);
+        let public = secret.public_key();
+        let node_id = node_id_from_public_key(&public);
+
+        let quorum_set = ScpQuorumSet {
+            threshold: 1,
+            validators: vec![node_id].try_into().unwrap(),
+            inner_sets: vec![].try_into().unwrap(),
+        };
+
+        let config = HerderConfig {
+            is_validator: true,
+            node_public_key: public,
+            local_quorum_set: Some(quorum_set),
+            ..HerderConfig::default()
+        };
+
+        let herder = Herder::with_secret_key(
+            config,
+            SecretKey::from_seed(&seed),
+            make_default_lm(),
+            TimerManagerHandle::no_op(),
+        );
+        (herder, SecretKey::from_seed(&seed))
+    }
+
+    /// Construct a signed NOMINATE envelope from `secret` for `slot` whose
+    /// single vote references a freshly built tx set. Returns
+    /// `(envelope, tx_set_hash, stored_tx_set_bytes, quorum_set_hash, quorum_set)`
+    /// so the caller can persist the envelope alongside its referenced deps,
+    /// exactly as the production persist callback does.
+    fn make_local_nominate_with_deps(
+        herder: &Herder,
+        secret: &SecretKey,
+        slot: u64,
+    ) -> (
+        ScpEnvelope,
+        stellar_xdr::Hash,
+        Vec<u8>,
+        stellar_xdr::Hash,
+        ScpQuorumSet,
+    ) {
+        use stellar_xdr::WriteXdr;
+
+        // Build a tx set on top of LCL and capture both its hash and the
+        // StoredTransactionSet XDR bytes (what gets persisted).
+        let lcl_hash = herder.scp_driver.current_header_hash();
+        let tx_set = TransactionSet::new(lcl_hash, Vec::new());
+        let tx_set_hash = stellar_xdr::Hash(tx_set.hash().0);
+        let stored_bytes = tx_set
+            .to_xdr_stored_set()
+            .to_xdr(Limits::none())
+            .expect("encode StoredTransactionSet");
+
+        // Build a signed StellarValue referencing the tx set.
+        let close_time = TimePoint(1);
+        let network_id = herder.scp_driver.network_id();
+        let mut sign_data = network_id.0.to_vec();
+        sign_data.extend_from_slice(&EnvelopeType::Scpvalue.to_xdr(Limits::none()).expect("xdr"));
+        sign_data.extend_from_slice(&tx_set_hash.to_xdr(Limits::none()).expect("xdr"));
+        sign_data.extend_from_slice(&close_time.to_xdr(Limits::none()).expect("xdr"));
+        let value_sig = secret.sign(&sign_data);
+
+        let value_node_id = XdrNodeId(stellar_xdr::PublicKey::PublicKeyTypeEd25519(
+            stellar_xdr::Uint256(*secret.public_key().as_bytes()),
+        ));
+        let stellar_value = StellarValue {
+            tx_set_hash: tx_set_hash.clone(),
+            close_time,
+            upgrades: vec![].try_into().unwrap(),
+            ext: StellarValueExt::Signed(LedgerCloseValueSignature {
+                node_id: value_node_id,
+                signature: stellar_xdr::Signature(
+                    value_sig.0.to_vec().try_into().unwrap_or_default(),
+                ),
+            }),
+        };
+        let value = Value(
+            stellar_value
+                .to_xdr(Limits::none())
+                .unwrap()
+                .try_into()
+                .unwrap(),
+        );
+
+        // The companion quorum set: the herder's local qset.
+        let quorum_set = herder
+            .scp_driver
+            .get_local_quorum_set()
+            .expect("validator herder must have a local quorum set");
+        let quorum_set_hash = stellar_xdr::Hash(henyey_scp::hash_quorum_set(&quorum_set).0);
+
+        let node_id = XdrNodeId(stellar_xdr::PublicKey::PublicKeyTypeEd25519(
+            stellar_xdr::Uint256(*secret.public_key().as_bytes()),
+        ));
+        let statement = ScpStatement {
+            node_id,
+            slot_index: slot,
+            pledges: ScpStatementPledges::Nominate(ScpNomination {
+                quorum_set_hash: quorum_set_hash.clone(),
+                votes: vec![value].try_into().unwrap(),
+                accepted: vec![].try_into().unwrap(),
+            }),
+        };
+
+        let envelope = sign_statement(&statement, herder, secret);
+        (
+            envelope,
+            tx_set_hash,
+            stored_bytes,
+            quorum_set_hash,
+            quorum_set,
+        )
+    }
+
+    #[test]
+    fn test_restore_persisted_scp_state_no_manager_is_noop() {
+        // No persistence manager installed → guarded no-op, no panic, no slots.
+        let herder = make_test_herder();
+        herder.bootstrap(100);
+        herder.restore_persisted_scp_state(100);
+        assert!(
+            herder.get_current_state_for_slot(101).is_empty(),
+            "no manager → nothing replayed"
+        );
+    }
+
+    #[test]
+    fn test_restore_persisted_scp_state_lcl_at_or_below_genesis_is_noop() {
+        // lcl == GENESIS_LEDGER_SEQ (1): even with persisted state present,
+        // nothing must be replayed (matches upstream's genesis skip).
+        let (herder, secret) = make_restore_validator_herder();
+        let manager = Arc::new(crate::persistence::ScpPersistenceManager::in_memory());
+        assert!(herder.set_scp_persistence(Arc::clone(&manager)).is_ok());
+
+        // Persist a slot-2 envelope (> genesis), to prove the genesis guard
+        // (not the slot filter) is what blocks replay here.
+        let (env, tx_hash, tx_bytes, qs_hash, qs) =
+            make_local_nominate_with_deps(&herder, &secret, 2);
+        manager
+            .persist_scp_state(2, &[env], &[(tx_hash, tx_bytes)], &[(qs_hash, qs)])
+            .expect("persist");
+
+        herder.bootstrap(1);
+        herder.restore_persisted_scp_state(1);
+
+        assert!(
+            herder.get_current_state_for_slot(2).is_empty(),
+            "lcl <= GENESIS must be a no-op even with persisted state"
+        );
+    }
+
+    #[test]
+    fn test_restore_persisted_scp_state_replays_future_slot_and_deps() {
+        // Persist an lcl+1 local envelope plus its referenced tx set + quorum
+        // set; after restore BOTH deps must be hydrated, driven by the retained
+        // future-slot envelope.
+        //
+        // NOTE: live-envelope replay is GATED OFF in this PR
+        // (`RESTORE_LIVE_ENVELOPE_REPLAY == false`) because replaying a
+        // restored ballot stalls SCP (the PR #2797 regression). So the future
+        // slot is NOT installed into SCP state here; we assert dependency
+        // hydration instead. When the SCP ballot-supersession follow-up lands
+        // and the flag flips, the slot-installation assertion below (currently
+        // an `is_empty` check) becomes the `!is_empty` check.
+        let lcl = 100u64;
+        let (herder, secret) = make_restore_validator_herder();
+        let manager = Arc::new(crate::persistence::ScpPersistenceManager::in_memory());
+        assert!(herder.set_scp_persistence(Arc::clone(&manager)).is_ok());
+
+        let (env, tx_hash, tx_bytes, qs_hash, qs) =
+            make_local_nominate_with_deps(&herder, &secret, lcl + 1);
+        manager
+            .persist_scp_state(
+                lcl + 1,
+                &[env],
+                &[(tx_hash.clone(), tx_bytes)],
+                &[(qs_hash.clone(), qs)],
+            )
+            .expect("persist");
+
+        herder.bootstrap(lcl as u32);
+        herder.restore_persisted_scp_state(lcl);
+
+        // Quorum set cached (queryable by hash via scp_driver).
+        let qs_hash256 = henyey_common::Hash256(qs_hash.0);
+        assert!(
+            herder.get_quorum_set_by_hash(&qs_hash256).is_some(),
+            "referenced quorum set must be cached after restore"
+        );
+        // Tx set cached.
+        let tx_hash256 = henyey_common::Hash256(tx_hash.0);
+        assert!(
+            herder.has_tx_set(&tx_hash256),
+            "referenced tx set must be cached after restore"
+        );
+        // Live-replay is gated off: the future slot is NOT installed into SCP.
+        assert!(
+            Herder::RESTORE_LIVE_ENVELOPE_REPLAY
+                == !herder.get_current_state_for_slot(lcl + 1).is_empty(),
+            "future-slot installation must track the RESTORE_LIVE_ENVELOPE_REPLAY gate"
+        );
+    }
+
+    #[test]
+    fn test_restore_persisted_scp_state_filters_slots_at_or_below_lcl() {
+        // The #2797 stall guard: dependency hydration is driven ONLY by
+        // retained `slot > lcl` envelopes. Persist a slot==lcl envelope with
+        // its own distinct deps and a slot==lcl+1 envelope with different
+        // deps; after restore, only the future-slot deps are hydrated, and the
+        // already-finalized slot's deps are dropped. (Distinct tx sets are
+        // produced by giving the at-lcl envelope a non-empty tx set.)
+        let lcl = 100u64;
+        let (herder, secret) = make_restore_validator_herder();
+        let manager = Arc::new(crate::persistence::ScpPersistenceManager::in_memory());
+        assert!(herder.set_scp_persistence(Arc::clone(&manager)).is_ok());
+
+        // Future-slot (lcl+1) envelope + deps — these MUST be hydrated.
+        let (env_fut, tx_fut, tx_fut_bytes, qs_fut, qs_fut_set) =
+            make_local_nominate_with_deps(&herder, &secret, lcl + 1);
+
+        // At-lcl envelope referencing a DISTINCT tx-set hash that no future
+        // envelope references — this MUST be dropped by the slot filter.
+        let stale_tx_hash = stellar_xdr::Hash([0x5Au8; 32]);
+        let stale_env = make_persist_envelope_with_tx_set_hash(lcl, stale_tx_hash.clone());
+        manager
+            .persist_scp_state(
+                lcl,
+                &[stale_env],
+                &[(stale_tx_hash.clone(), vec![1, 2, 3, 4])],
+                &[],
+            )
+            .expect("persist at-lcl");
+        manager
+            .persist_scp_state(
+                lcl + 1,
+                &[env_fut],
+                &[(tx_fut.clone(), tx_fut_bytes)],
+                &[(qs_fut.clone(), qs_fut_set)],
+            )
+            .expect("persist future");
+
+        herder.bootstrap(lcl as u32);
+        herder.restore_persisted_scp_state(lcl);
+
+        // Future-slot deps hydrated.
+        assert!(
+            herder.has_tx_set(&henyey_common::Hash256(tx_fut.0)),
+            "slot > lcl tx set must be hydrated"
+        );
+        assert!(
+            herder
+                .get_quorum_set_by_hash(&henyey_common::Hash256(qs_fut.0))
+                .is_some(),
+            "slot > lcl quorum set must be hydrated"
+        );
+        // Stale slot's dep NOT hydrated (filtered out before hydration).
+        assert!(
+            !herder.has_tx_set(&henyey_common::Hash256(stale_tx_hash.0)),
+            "slot <= lcl tx set must NOT be hydrated (the #2797 stall guard)"
+        );
+        // Neither slot is installed while live-replay is gated off.
+        assert!(
+            herder.get_current_state_for_slot(lcl).is_empty(),
+            "slot <= lcl must never be installed"
+        );
+    }
+
+    #[test]
+    fn test_restore_persisted_scp_state_skips_corrupt_tx_set() {
+        // A corrupt tx-set blob persisted alongside a valid one must not panic
+        // and must not block the valid tx set from being cached. The valid
+        // envelope references only the valid tx set.
+        let lcl = 100u64;
+        let (herder, secret) = make_restore_validator_herder();
+        let manager = Arc::new(crate::persistence::ScpPersistenceManager::in_memory());
+        assert!(herder.set_scp_persistence(Arc::clone(&manager)).is_ok());
+
+        let (env, tx_hash, tx_bytes, qs_hash, qs) =
+            make_local_nominate_with_deps(&herder, &secret, lcl + 1);
+        let corrupt_hash = stellar_xdr::Hash([0xEEu8; 32]);
+        manager
+            .persist_scp_state(
+                lcl + 1,
+                &[env],
+                &[
+                    (tx_hash.clone(), tx_bytes),
+                    (corrupt_hash.clone(), vec![0xDE, 0xAD, 0xBE, 0xEF]),
+                ],
+                &[(qs_hash, qs)],
+            )
+            .expect("persist");
+
+        herder.bootstrap(lcl as u32);
+        herder.restore_persisted_scp_state(lcl);
+
+        // Valid tx set cached; corrupt one isolated (not cached), no panic.
+        assert!(
+            herder.has_tx_set(&henyey_common::Hash256(tx_hash.0)),
+            "valid tx set must be cached"
+        );
+        assert!(
+            !herder.has_tx_set(&henyey_common::Hash256(corrupt_hash.0)),
+            "corrupt tx set must NOT be cached"
         );
     }
 }
