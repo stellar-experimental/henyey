@@ -249,4 +249,22 @@ mod tests {
             _ => panic!("Expected Context error"),
         }
     }
+
+    #[test]
+    fn test_convert_host_error_p27_to_p25() {
+        use soroban_env_host_p27 as soroban_env_host27;
+        let p27_sc_error = soroban_env_host27::xdr::ScError::Storage(
+            soroban_env_host27::xdr::ScErrorCode::ExceededLimit,
+        );
+        let p27_host_error = soroban_env_host27::HostError::from(p27_sc_error);
+        let p25_host_error = convert_host_error_p27_to_p25(p27_host_error);
+
+        let p25_sc_error: ScError25 = (&p25_host_error)
+            .try_into()
+            .unwrap_or(ScError25::Context(ScErrorCode25::InternalError));
+        match p25_sc_error {
+            ScError25::Storage(code) => assert_eq!(code, ScErrorCode25::ExceededLimit),
+            other => panic!("Expected Storage error, got {other:?}"),
+        }
+    }
 }

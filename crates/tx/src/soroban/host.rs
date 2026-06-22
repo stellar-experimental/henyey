@@ -1932,6 +1932,32 @@ mod tests {
         assert_ne!(hash.0, [0u8; 32]);
     }
 
+    /// V27 protocol routes to a P27 module cache; V26 still routes to P26.
+    #[test]
+    fn test_new_for_protocol_v27_routes_to_p27() {
+        let cache27 = PersistentModuleCache::new_for_protocol(27)
+            .expect("P27 module cache should be available");
+        assert!(
+            cache27.as_p27().is_some(),
+            "protocol 27 must produce a P27 cache"
+        );
+        assert!(
+            cache27.as_p26().is_none(),
+            "protocol 27 must NOT produce a P26 cache"
+        );
+
+        let cache26 = PersistentModuleCache::new_for_protocol(26)
+            .expect("P26 module cache should be available");
+        assert!(
+            cache26.as_p26().is_some(),
+            "protocol 26 must still produce a P26 cache"
+        );
+        assert!(
+            cache26.as_p27().is_none(),
+            "protocol 26 must NOT produce a P27 cache"
+        );
+    }
+
     /// Test compute_key_hash produces different hashes for different keys.
     #[test]
     fn test_compute_key_hash_different_keys() {

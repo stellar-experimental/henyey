@@ -378,6 +378,28 @@ mod tests {
     }
 
     #[test]
+    fn test_protocol_version_v27_value() {
+        assert_eq!(ProtocolVersion::V27 as u32, 27);
+        assert_eq!(ProtocolVersion::V27.as_u32(), 27);
+    }
+
+    #[test]
+    fn test_current_ledger_protocol_version_is_27() {
+        assert_eq!(CURRENT_LEDGER_PROTOCOL_VERSION, 27);
+    }
+
+    #[test]
+    fn test_protocol_version_starts_from_v27() {
+        // A v27 ledger is at or after V27; a v26 ledger is before V27.
+        assert!(protocol_version_starts_from(27, ProtocolVersion::V27));
+        assert!(!protocol_version_starts_from(26, ProtocolVersion::V27));
+        assert!(protocol_version_is_before(26, ProtocolVersion::V27));
+        assert!(!protocol_version_is_before(27, ProtocolVersion::V27));
+        // V27 is strictly after V26.
+        assert!(ProtocolVersion::V27 > ProtocolVersion::V26);
+    }
+
+    #[test]
     fn test_protocol_version_starts_from() {
         assert!(!protocol_version_starts_from(19, ProtocolVersion::V20));
         assert!(protocol_version_starts_from(20, ProtocolVersion::V20));
