@@ -323,9 +323,20 @@ impl OverlayManager {
             }
         };
         shared.peer_info_cache.insert(peer_id.clone(), peer_info);
-        shared
-            .added_authenticated_peers
-            .fetch_add(1, Ordering::Relaxed);
+        // Only count a NEWLY-occupied authenticated slot. When this registration
+        // REPLACED an existing authenticated handle (the mutual-dial "new wins"
+        // tiebreaker above), the slot was already counted at the displaced peer's
+        // original registration, so re-counting would double-bump (+2 add / 0 drop
+        // for a single surviving peer). stellar-core v27.0.0 resolves the same
+        // collision pre-auth at HELLO (Peer::recvHello ERR_CONF "already-connected"),
+        // dropping the loser while still pending — never ++mAddedAuthenticatedPeers,
+        // never recordDroppedPeer. Suppressing the duplicate add (NOT bumping a drop)
+        // matches core's absolute counters: +1 add / 0 drop. (#3500)
+        if replaced.is_none() {
+            shared
+                .added_authenticated_peers
+                .fetch_add(1, Ordering::Relaxed);
+        }
         Ok(RegisterResult {
             outbound_rx,
             flow_control,
