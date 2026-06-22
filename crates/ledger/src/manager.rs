@@ -5202,7 +5202,16 @@ impl LedgerCloseContext<'_> {
         // provides this automatically.
         // Gate on prev_version (initialLedgerVers) to match stellar-core: on the upgrade
         // ledger (e.g. protocol 0→25), eviction does NOT run.
-        let eviction_settings = if protocol_version_starts_from(prev_version, ProtocolVersion::V23)
+        //
+        // Parity (#3553): stellar-core loads the Soroban network config INLINE for every
+        // `initialLedgerVers >= SOROBAN_PROTOCOL_VERSION` (V20) ledger
+        // (`SorobanNetworkConfig::loadFromLedger` in
+        // `LedgerManagerImpl::sealLedgerTxnAndStoreInBucketsAndDB`,
+        // `LedgerManagerImpl.cpp:2984-2993`), NOT only at V23. The eviction-iterator
+        // update (below) runs for every V20+ ledger; the V23
+        // (FIRST_PROTOCOL_SUPPORTING_PERSISTENT_EVICTION) gate covers ONLY the
+        // hot-archive restore sub-step.
+        let eviction_settings = if protocol_version_starts_from(prev_version, ProtocolVersion::V20)
         {
             tracing::debug!(
                 ledger_seq = self.close_data.ledger_seq,
@@ -5358,12 +5367,24 @@ impl LedgerCloseContext<'_> {
             let mut eviction_us: u64 = 0;
             let mut evicted_meta_keys: Vec<LedgerKey> = Vec::new();
 
-            if protocol_version_starts_from(prev_version, ProtocolVersion::V23) {
-                let has_hot_archive = self.manager.hot_archive_bucket_list.read().is_some();
-                if has_hot_archive && eviction_settings.is_some() {
-                    // Use pre-loaded eviction settings (loaded before bucket list lock)
-                    let eviction_settings = eviction_settings.clone().unwrap();
-
+            // Parity (#3553): stellar-core runs the eviction scan and writes the
+            // CONFIG_SETTING_EVICTION_ITERATOR config setting for EVERY
+            // `initialLedgerVers >= SOROBAN_PROTOCOL_VERSION` (V20) ledger,
+            // UNCONDITIONALLY (LedgerManagerImpl.cpp:2984-3009 →
+            // BucketManager::resolveBackgroundEvictionScan, BucketManager.cpp:1290:
+            // `networkConfig.updateEvictionIterator(ltx, newEvictionIterator)` is
+            // called even when zero entries are evicted). The write is conditioned on
+            // NEITHER a hot-archive bucket list NOR a pre-loaded settings value — the
+            // settings are loaded inline above. Previously henyey gated this on the
+            // non-core conjuncts `prev_version >= V23 && has_hot_archive &&
+            // eviction_settings.is_some()`; when any conjunct was false the per-ledger
+            // EvictionIterator live entry was dropped, flipping the live bucket hash
+            // (the L16 bucketListHash divergence in #3552). The hot-archive
+            // restore / addHotArchiveBatch sub-step stays gated on V23 + hot-archive
+            // presence below (mirroring core's inner
+            // FIRST_PROTOCOL_SUPPORTING_PERSISTENT_EVICTION check).
+            if protocol_version_starts_from(prev_version, ProtocolVersion::V20) {
+                if let Some(eviction_settings) = eviction_settings.clone() {
                     // Try to use background eviction scan from previous ledger
                     let eviction_start = std::time::Instant::now();
                     let eviction_result = {
@@ -5519,6 +5540,32 @@ impl LedgerCloseContext<'_> {
                     };
 
                     live_entries.push(eviction_iter_entry);
+                } else {
+                    // Settings could not be loaded (degenerate / partially
+                    // initialized state — on a real V20+ ledger the StateArchival
+                    // settings are always present). stellar-core still writes the
+                    // EvictionIterator config setting unconditionally
+                    // (BucketManager.cpp:1290). With no scan region we cannot
+                    // advance the cursor, so re-stamp the current iterator
+                    // unchanged — this keeps the per-ledger EvictionIterator update
+                    // in the live bucket batch (the #3552 parity fix) instead of
+                    // silently dropping it.
+                    if let Ok(iter) = load_eviction_iterator_from_bucket_list(&bucket_list) {
+                        tracing::debug!(
+                            ledger_seq = self.close_data.ledger_seq,
+                            level = iter.bucket_list_level,
+                            is_curr = iter.is_curr_bucket,
+                            offset = iter.bucket_file_offset,
+                            "Re-stamping unchanged EvictionIterator (no settings loaded)"
+                        );
+                        live_entries.push(LedgerEntry {
+                            last_modified_ledger_seq: self.close_data.ledger_seq,
+                            data: LedgerEntryData::ConfigSetting(
+                                ConfigSettingEntry::EvictionIterator(iter),
+                            ),
+                            ext: LedgerEntryExt::V0,
+                        });
+                    }
                 }
             }
 

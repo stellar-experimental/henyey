@@ -243,3 +243,107 @@ fn oracle_genesis_bucket_roundtrip_matches_core() {
         );
     }
 }
+
+/// Cross-impl oracle for the #3553 fix: core's L16 level-2 spill bucket
+/// `0ebd5750` (the byte-for-byte counterpart to henyey's empty, divergent
+/// `d15ebeb4` captured during the SSC v27 mixed-image mission, cluster
+/// `rfh1c2qdatp96`).
+///
+/// Decoding both oracle buckets pins the divergence exactly:
+///
+/// - henyey `d15ebeb4` (16 B): `Metaentry(BucketMetadata { ledger_version: 0,
+///   ext: V0 })` — EMPTY (metadata only).
+/// - core  `0ebd5750` (60 B): `Metaentry({ ledger_version: 27, ext:
+///   V1(BucketListType::Live) })` **+ one** `Liveentry` carrying
+///   `ConfigSetting(EvictionIterator { bucket_list_level: 6, is_curr_bucket:
+///   true, bucket_file_offset: 0 })` with `last_modified_ledger_seq: 17` — the
+///   per-ledger eviction-iterator update henyey dropped.
+///
+/// henyey's `{0,void}` empty bucket is the `InputDerived`-of-two-empty-inputs
+/// merge artifact that results once the EvictionIterator live entry is missing
+/// from the level-1 inputs; the dropped entry (fixed in the ledger crate) is the
+/// root cause, and the metadata is a downstream symptom. This guard locks in the
+/// cross-impl bucket bytes: it PASSES on `main` (the bucket/merge machinery is
+/// verified-correct — feeding it the entry reproduces core's bucket byte-for-byte;
+/// the ledger crate is where the entry was dropped) and guards the bucket hash
+/// against future regression.
+///
+/// Fixture `bucket-0ebd5750.xdr` is the uncompressed `BucketEntry` XDR stream
+/// captured from the mission
+/// (`~/data/9eb89c28/ssc-v27-diag/core-bucket-snaps/CORE_COUNTERPART_0ebd5750.xdr`).
+#[test]
+fn oracle_l16_eviction_iterator_bucket_matches_core() {
+    use stellar_xdr::{BucketEntry, BucketMetadataExt, ConfigSettingEntry, LedgerEntryData};
+
+    const PATH: &str = "tests/fixtures/issue3552/bucket-0ebd5750.xdr";
+    const EXPECTED_HEX: &str = "0ebd575078e13e426e4bd19a1788389cc460fbfa667bad8b93122c44420d01ae";
+
+    let raw = std::fs::read(PATH).unwrap_or_else(|e| panic!("read fixture {PATH}: {e}"));
+    let expected = Hash256::from_hex(EXPECTED_HEX).expect("parse expected hash");
+
+    // (1) Raw decode + hash of the record-marked on-disk stream == core's
+    // content-addressed (filename) hash.
+    let bucket =
+        Bucket::from_xdr_bytes(&raw).unwrap_or_else(|e| panic!("from_xdr_bytes({PATH}): {e:?}"));
+    assert_eq!(
+        bucket.hash(),
+        expected,
+        "from_xdr_bytes hash must match core's published L16 level-2 bucket hash",
+    );
+
+    // (2) Re-sort through henyey's comparator + re-serialize — proves comparator
+    // + sort + serialize + record-mark + hash parity for this content.
+    let parsed = bucket.entries().to_vec();
+    let resorted = Bucket::from_entries(parsed.clone())
+        .unwrap_or_else(|e| panic!("from_entries({PATH}): {e:?}"));
+    assert_eq!(
+        resorted.hash(),
+        expected,
+        "from_entries (comparator re-sort) hash must match core's published hash",
+    );
+
+    // (3) Structural assertions: METAENTRY {27, V1(Live)} + exactly one
+    // EvictionIterator LIVEENTRY {level: 6, is_curr: true, offset: 0} at
+    // last_modified 17.
+    let entries = bucket.entries();
+    assert_eq!(entries.len(), 2, "core's L16 level-2 bucket has 2 entries");
+
+    match &entries[0] {
+        BucketEntry::Metaentry(meta) => {
+            assert_eq!(meta.ledger_version, 27, "METAENTRY ledger_version");
+            assert!(
+                matches!(
+                    meta.ext,
+                    BucketMetadataExt::V1(stellar_xdr::BucketListType::Live)
+                ),
+                "METAENTRY ext must be V1(Live), got {:?}",
+                meta.ext
+            );
+        }
+        other => panic!("entry 0 must be a METAENTRY, got {other:?}"),
+    }
+
+    match &entries[1] {
+        BucketEntry::Liveentry(entry) => {
+            assert_eq!(
+                entry.last_modified_ledger_seq, 17,
+                "EvictionIterator last_modified_ledger_seq"
+            );
+            match &entry.data {
+                LedgerEntryData::ConfigSetting(ConfigSettingEntry::EvictionIterator(it)) => {
+                    assert_eq!(
+                        it.bucket_list_level, 6,
+                        "EvictionIterator bucket_list_level"
+                    );
+                    assert!(it.is_curr_bucket, "EvictionIterator is_curr_bucket");
+                    assert_eq!(
+                        it.bucket_file_offset, 0,
+                        "EvictionIterator bucket_file_offset"
+                    );
+                }
+                other => panic!("entry 1 must be an EvictionIterator ConfigSetting, got {other:?}"),
+            }
+        }
+        other => panic!("entry 1 must be a LIVEENTRY, got {other:?}"),
+    }
+}
