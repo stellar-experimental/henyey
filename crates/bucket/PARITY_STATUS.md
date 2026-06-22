@@ -267,6 +267,12 @@ Features not yet implemented. These ARE counted against parity %.
 | `BucketManager::reportBucketEntryCountMetrics()` | Low | Entry counters are collected but not fully published |
 | `EvictionStatistics::submitMetricsAndRestartCycle()` | Low | Current stats are simplified and less structured |
 
+## Known Divergences (open)
+
+| Divergence | Status | Notes |
+|------------|--------|-------|
+| L16 `bucketListHash` (first populated level-1 → level-2 spill) | **Open — tracked in #3553** | Surfaced by the P27 Supercluster mixed-image mission (#3552): henyey's L16 empty-ledger close diverged from stellar-core v27 (`167a7373…` vs `c9f9560d…`) at the first *populated* level-1 → level-2 spill, with identical header inputs. The bucket comparator, entry sort, XDR serialization, record-marking, and bucket hashing are **verified byte-identical to core v27** for the suspect genesis ConfigSetting / Soroban / INIT content — proven against two real core merge-output buckets (see Test Coverage). The root cause therefore lies in the L16 entry SET/CONTENT (INIT-vs-LIVE classification), whose live oracle is not present in the single-checkpoint archive; capturing it + landing the fix and a fail-on-main regression is tracked in **#3553**. A read-only, gated per-level `bucket_list_hash` instrumentation hook (`BucketList::add_batch_internal`) was added to pinpoint the divergent level on a mission re-run. |
+
 ## Architectural Differences
 
 1. **Unified live bucket representation**
@@ -310,6 +316,7 @@ Features not yet implemented. These ARE counted against parity %.
 | `BucketIndexTests.cpp` | 13 TEST_CASE / 10 SECTION | ~56 `#[test]` | In-memory index, disk index, cache, persistence |
 | `BucketMergeMapTests.cpp` | 1 TEST_CASE / 0 SECTION | 13 `#[test]` | Completed-merge bookkeeping |
 | Other (applicator, entry, future, metrics, iterator) | — | ~41 `#[test]` | Applicator, entry comparison, iterator tests |
+| Real-core-bucket parity guard (`level1_to_level2_spill_parity.rs`) | — | 1 `#[test]` (+2 diagnostics) | `oracle_genesis_bucket_roundtrip_matches_core`: feeds henyey two **real** core v27 merge-output buckets (genesis ConfigSetting / Soroban / INIT content) and asserts `from_xdr_bytes` AND `from_entries` (comparator re-sort) reproduce core's published hashes byte-for-byte. Locks in the verified-correct comparator / sort / serialize / record-mark / hash machinery (#3552). |
 | **Total** | **50 TEST_CASE / 46 SECTION** | **~248 `#[test]`** | Rust coverage is broader but still misses a few upstream scenarios |
 
 ### Test Gaps
