@@ -1806,6 +1806,59 @@ impl OverlayManager {
         Ok(sent)
     }
 
+    /// Request SCP state from a *bounded-wider* set of authenticated peers.
+    ///
+    /// This is a henyey-specific recovery escape (issue #3318) — it has NO
+    /// direct upstream analog. stellar-core's `getMoreSCPState` is hard-bounded
+    /// to 2 peers and never widens. The app-layer caller fires this exactly once
+    /// per stuck episode, only after the bounded 2-peer `request_scp_state` has
+    /// repeatedly landed on peers that cannot serve the missing slot
+    /// (`peers_could_serve == 0`) AND that condition has persisted past a
+    /// wall-clock deadline. It does NOT replace `request_scp_state`, which stays
+    /// the steady-state upstream mirror.
+    ///
+    /// Selection draws from the FULL authenticated peer set (inbound + outbound),
+    /// matching `getRandomAuthenticatedPeers`, shuffles it, and sends
+    /// `GetScpState` to up to `cap` peers via the non-blocking `try_send_to`
+    /// (event-loop rule: never a blocking send). The caller is responsible for
+    /// computing `cap` (e.g. `min(serviceable, 8)`, falling back to all
+    /// authenticated peers when serviceable is 0); this method just honors the
+    /// bound over the connected set.
+    pub fn request_scp_state_widened(&self, ledger_seq: u32, cap: usize) -> Result<usize> {
+        use rand::seq::SliceRandom;
+
+        if !self.running.load(Ordering::Relaxed) {
+            return Err(OverlayError::NotStarted);
+        }
+
+        let message = StellarMessage::GetScpState(ledger_seq);
+        let mut peers = self.connected_peers();
+        if peers.is_empty() || cap == 0 {
+            return Ok(0);
+        }
+
+        // Shuffle the full authenticated set and take up to `cap`.
+        let mut rng = rand::thread_rng();
+        peers.shuffle(&mut rng);
+        let target = cap.min(peers.len());
+
+        let mut sent = 0usize;
+        for peer_id in peers.iter().take(target) {
+            match self.try_send_to(peer_id, message.clone()) {
+                Ok(()) => sent += 1,
+                Err(e) => {
+                    debug!(peer = %peer_id, error = %e, "Failed to send widened GetScpState to peer");
+                }
+            }
+        }
+
+        debug!(
+            ledger_seq,
+            sent, cap, "Sent widened GetScpState to authenticated peers (#3318 recovery escape)"
+        );
+        Ok(sent)
+    }
+
     /// Record the highest externalized SCP slot observed *via live SCP gossip*
     /// from `peer` (observability-only). Called from the app event loop at the
     /// two EXTERNALIZE-accept sites where the global externalize `fetch_max`
@@ -4621,6 +4674,73 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Regression test for #3318: the additive `request_scp_state_widened`
+    /// variant sends `GetScpState` to up to its bounded cap of authenticated
+    /// peers (drawn from the FULL inbound+outbound set), while the original
+    /// `request_scp_state` still targets exactly 2. This is the henyey-specific
+    /// wider recovery pull that fires only when the bounded 2-peer pull keeps
+    /// landing on peers that cannot serve the missing slot.
+    #[test]
+    fn test_request_scp_state_widened_targets_serviceable_peers() {
+        let config = OverlayConfig::default();
+        let local_node = LocalNode::new_testnet(SecretKey::generate());
+        let manager = OverlayManager::new(config, local_node).unwrap();
+        manager.running.store(true, Ordering::Relaxed);
+
+        // Six connected authenticated peers, a mix of inbound + outbound so we
+        // also confirm the widened pull draws from the full authenticated set.
+        let mut rxs = Vec::new();
+        for i in 1u8..=6 {
+            let peer = PeerId::from_bytes([i; 32]);
+            rxs.push(insert_peer_with_capacity(&manager, peer, 16));
+        }
+
+        let ledger_seq = 100u32;
+
+        // Cap of 4 → exactly 4 of the 6 peers receive GetScpState.
+        let sent = manager.request_scp_state_widened(ledger_seq, 4).unwrap();
+        assert_eq!(
+            sent, 4,
+            "widened pull with cap 4 over 6 peers should send to exactly 4, got {sent}"
+        );
+
+        let received: usize = rxs
+            .iter_mut()
+            .map(|rx| {
+                let mut n = 0;
+                while let Ok(msg) = rx.try_recv() {
+                    match msg {
+                        OutboundMessage::Send(StellarMessage::GetScpState(seq)) => {
+                            assert_eq!(seq, ledger_seq, "GetScpState ledger_seq mismatch");
+                            n += 1;
+                        }
+                        other => panic!("expected Send(GetScpState), got {other:?}"),
+                    }
+                }
+                n
+            })
+            .sum();
+        assert_eq!(
+            received, 4,
+            "exactly 4 of 6 peers should have received GetScpState, got {received}"
+        );
+
+        // A cap exceeding the connected set sends to all connected peers (the
+        // serviceable==0 fallback widens to ALL authenticated peers).
+        let sent_all = manager.request_scp_state_widened(ledger_seq, 100).unwrap();
+        assert_eq!(
+            sent_all, 6,
+            "widened pull with cap > peer count should send to all 6 peers, got {sent_all}"
+        );
+
+        // The original bounded pull is UNTOUCHED: still exactly 2 peers.
+        let sent_two = manager.request_scp_state(ledger_seq).unwrap();
+        assert_eq!(
+            sent_two, 2,
+            "original request_scp_state must still target exactly 2 peers, got {sent_two}"
+        );
     }
 
     // ──────── peers_could_serve / record_peer_externalized (#3270) ────────

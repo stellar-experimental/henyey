@@ -1636,7 +1636,7 @@ impl App {
     /// Used by both the normal escalation path (after RECOVERY_ESCALATION_CATCHUP
     /// attempts) and the fast-track path (when SCP messages arrive but tx_sets
     /// are evicted from peers' caches).
-    async fn trigger_recovery_catchup(
+    pub(super) async fn trigger_recovery_catchup(
         &self,
         current_ledger: u32,
         latest_externalized: u64,
@@ -1878,6 +1878,24 @@ impl App {
                     // contiguous gap can be back-filled from peers that
                     // re-acquired the tx_sets.
                     self.retry_exhausted_tx_sets().await;
+
+                    // ── #3318 wider peer-SCP pull (operator-approved henyey
+                    // deviation from upstream's fixed 2-peer getMoreSCPState) ──
+                    // The steady-state bounded re-broadcast + 2-peer pull above
+                    // is an EXACT upstream mirror and is always performed. But
+                    // when the connected set collectively cannot serve the
+                    // missing slot — `peers_could_serve(watermark) == 0` — the
+                    // 2-peer pull re-lands on unserviceable peers every 10s and
+                    // the node wedges (lcl frozen, attempts climbing). Once that
+                    // unserviceable condition has persisted past the wall-clock
+                    // deadline (the SAME #2789 stuck-onset clock, NOT the
+                    // per-tick `last_scp_state_request_at` which advances every
+                    // pull), issue ONE bounded wider GetScpState so the node can
+                    // obtain the back-fill instead of restarting. Strictly
+                    // additive and provably gated: it cannot fire while any peer
+                    // can serve, and cannot fire before the deadline.
+                    self.maybe_widen_near_tip_scp_pull().await;
+
                     // Do NOT re-arm sync_recovery_pending; the recovery timer
                     // drives the next tick (avoids a 1s spin loop).
                     return None;
@@ -2015,6 +2033,88 @@ impl App {
         }
 
         result
+    }
+
+    /// #3318 — issue ONE bounded *wider* peer-SCP pull when the near-tip /
+    /// archive-confirmed-behind recovery loop has been unable to find ANY peer
+    /// that can serve the missing slot for longer than the wall-clock deadline.
+    ///
+    /// This is the henyey-specific deviation from upstream's fixed 2-peer
+    /// `getMoreSCPState` (operator-approved). It is strictly additive on top of
+    /// the steady-state bounded re-broadcast + 2-peer pull, and provably gated:
+    ///
+    /// - **Serviceability gate:** fires only when
+    ///   `peers_could_serve(watermark) == 0` — i.e. NO connected peer has been
+    ///   observed externalizing recently enough to still hold the missing slot.
+    ///   While any peer can serve, the 2-peer pull is sufficient and this is a
+    ///   no-op (exact upstream behavior).
+    /// - **Deadline gate:** fires only after the stuck condition has persisted
+    ///   past `NEAR_TIP_WIDEN_STALL_SECS`, measured from the #2789 stuck-ONSET
+    ///   clock (`consensus_stuck_state.stuck_start`). It deliberately does NOT
+    ///   use `last_scp_state_request_at`, which advances on every pull and would
+    ///   never show a sustained stall. When no stuck state is recorded (the
+    ///   episode hasn't been classified as stuck), the deadline is treated as
+    ///   not-yet-reached and this is a no-op.
+    ///
+    /// Fan-out is bounded: `min(serviceable, NEAR_TIP_WIDEN_MAX_PEERS)`, falling
+    /// back to ALL authenticated peers when serviceable == 0 (a peer not
+    /// recently *observed* externalizing may still hold the slot). The send is
+    /// non-blocking (`try_send_to` inside `request_scp_state_widened`), so it
+    /// can never freeze the event loop.
+    async fn maybe_widen_near_tip_scp_pull(&self) {
+        let Some(overlay) = self.overlay().await else {
+            return;
+        };
+
+        let ledger_seq = self.scp_state_request_ledger_seq();
+        let (serviceable, _connected) =
+            overlay.peers_could_serve(ledger_seq, MAX_SLOTS_TO_REMEMBER);
+
+        // Serviceability gate: while any peer can serve, the steady-state
+        // 2-peer pull is sufficient — widening here would be a pure upstream
+        // deviation for no benefit.
+        if serviceable > 0 {
+            return;
+        }
+
+        // Deadline gate: the unserviceable condition must have persisted past
+        // the wall-clock deadline, measured from the stuck ONSET (#2789), not
+        // the per-tick request timestamp.
+        let stuck_secs = self
+            .consensus_stuck_state
+            .read()
+            .await
+            .as_ref()
+            .map(|s| s.stuck_start.elapsed().as_secs())
+            .unwrap_or(0);
+        if stuck_secs < NEAR_TIP_WIDEN_STALL_SECS {
+            return;
+        }
+
+        // serviceable == 0 → fall back to all authenticated peers (a peer not
+        // recently observed externalizing may still hold the slot). Otherwise
+        // bound at NEAR_TIP_WIDEN_MAX_PEERS.
+        let cap = NEAR_TIP_WIDEN_MAX_PEERS;
+
+        match overlay.request_scp_state_widened(ledger_seq, cap) {
+            Ok(sent) => {
+                crate::metrics::RECOVERY_STALLED_TICK_TOTAL.increment("near_tip_peer_scp_widen", 1);
+                tracing::warn!(
+                    ledger_seq,
+                    peers_widened = sent,
+                    stuck_secs,
+                    "Near-tip recovery: no peer could serve the missing slot past the \
+                     deadline — issuing ONE bounded wider GetScpState (#3318 recovery escape)"
+                );
+            }
+            Err(e) => {
+                tracing::debug!(
+                    ledger_seq,
+                    error = %e,
+                    "Failed to issue wider GetScpState during near-tip recovery"
+                );
+            }
+        }
     }
 
     /// Spawn catchup as a background tokio task.

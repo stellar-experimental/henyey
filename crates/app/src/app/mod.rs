@@ -232,6 +232,22 @@ const MAX_POST_CATCHUP_RECOVERY_ATTEMPTS: u32 = 3;
 /// OUT_OF_SYNC_RECOVERY_TIMER_SECS.
 const HARD_RESET_STALL_SECS: u64 = 120;
 
+/// Wall-clock deadline (seconds) the near-tip / archive-confirmed-behind
+/// recovery condition must persist with ZERO serviceable peers before the
+/// henyey-specific bounded *wider* peer-SCP pull is allowed to fire once
+/// (#3318). Aligned with `HARD_RESET_STALL_SECS` and the #2789 wall-clock
+/// backstop: by the time the node has been stuck this long with no peer able
+/// to serve the missing slot, the steady-state 2-peer pull has demonstrably
+/// failed to converge, so one wider pull is a strict improvement over wedging.
+const NEAR_TIP_WIDEN_STALL_SECS: u64 = HARD_RESET_STALL_SECS;
+
+/// Upper bound on the fan-out of the #3318 near-tip wider peer-SCP pull. The
+/// pull targets `min(serviceable, NEAR_TIP_WIDEN_MAX_PEERS)` peers, falling
+/// back to ALL authenticated peers only when serviceable == 0 (a peer not
+/// recently *observed* externalizing may still hold the slot). Keeps the
+/// deviation from upstream's fixed 2-peer cap strictly bounded.
+const NEAR_TIP_WIDEN_MAX_PEERS: usize = 8;
+
 /// Number of consecutive Path-A ticks with NO peer-gap shrink before the
 /// count-based `recovery_exhausted` HardReset is allowed to fire again (#3204).
 /// While the verified peer gap is strictly shrinking, #3199's peer-SCP
@@ -13727,6 +13743,200 @@ mod tests {
             get_scp_state_count, 2,
             "Bounded pull must send GetScpState to exactly 2 of 3 peers, got {}",
             get_scp_state_count
+        );
+    }
+
+    // ──────── #3318: near-tip recovery wider-pull on sustained unserviceability ────────
+
+    /// Shared harness for the three near-tip wider-pull tests. Builds an App
+    /// with `n_peers` injected overlay peers, seeds the archive cache below the
+    /// next checkpoint (archive confirmed behind), and pins the verified peer
+    /// gap inside the near-tip band so `trigger_recovery_catchup` routes into
+    /// the near-tip peer-SCP branch (consensus.rs ~1860).
+    ///
+    /// Returns `(app, receivers, current_ledger)`.
+    async fn setup_near_tip_recovery(
+        n_peers: u8,
+    ) -> (App, Vec<henyey_overlay::TestPeerReceiver>, u32) {
+        let dir = Box::leak(Box::new(tempfile::tempdir().expect("temp dir")));
+        let db_path = dir.path().join("rs-stellar-test.db");
+        let config = crate::config::ConfigBuilder::simulation()
+            .database_path(db_path)
+            .build();
+        let app = App::new(config).await.unwrap();
+
+        let overlay_config = OverlayManagerConfig::default();
+        let local_node = LocalNode::new_testnet(henyey_crypto::SecretKey::generate());
+        let overlay = OverlayManager::new(overlay_config, local_node).unwrap();
+        let mut receivers = Vec::new();
+        for i in 1..=n_peers {
+            let peer = PeerId::from_bytes([0xD0 | i; 32]);
+            receivers.push(overlay.inject_test_peer(peer, 64));
+        }
+        overlay.set_running_for_test();
+        *app.overlay.write().await = Some(Arc::new(overlay));
+
+        let current_ledger: u32 = 100;
+        let next_cp = henyey_history::checkpoint::checkpoint_containing(current_ledger + 1);
+        let archive_seed =
+            henyey_history::checkpoint::latest_checkpoint_before_or_at(current_ledger)
+                .expect("a published checkpoint at or before current_ledger");
+        assert!(archive_seed < next_cp);
+        app.archive_checkpoint_cache.seed(archive_seed);
+
+        // Pin the verified peer gap inside the near-tip band
+        // (peer_gap < checkpoint_frequency()). max_verified just above tip.
+        app.max_verified_scp_slot
+            .store(current_ledger as u64 + 1, Ordering::Relaxed);
+
+        (app, receivers, current_ledger)
+    }
+
+    /// Count the DISTINCT peers that received at least one GetScpState message.
+    async fn distinct_peers_got_get_scp_state(
+        receivers: &mut [henyey_overlay::TestPeerReceiver],
+    ) -> usize {
+        // Allow the synchronous bounded pull + any widened pull to deliver.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let mut count = 0;
+        for rx in receivers.iter_mut() {
+            let mut got = false;
+            while let Some(msg) = rx.try_recv() {
+                if matches!(msg, stellar_xdr::StellarMessage::GetScpState(_)) {
+                    got = true;
+                }
+            }
+            if got {
+                count += 1;
+            }
+        }
+        count
+    }
+
+    /// #3318: when the bounded 2-peer pull keeps landing on peers that cannot
+    /// serve the missing slot (`peers_could_serve == 0`) AND that condition has
+    /// persisted past the wall-clock deadline, the near-tip recovery tick fires
+    /// ONE wider GetScpState reaching more than 2 peers. FAILS on origin/main:
+    /// no widening path exists, so at most 2 peers ever receive GetScpState.
+    #[tokio::test]
+    async fn test_near_tip_recovery_widens_pull_when_peers_cannot_serve_after_deadline() {
+        let (app, mut receivers, current_ledger) = setup_near_tip_recovery(5).await;
+
+        // peers_could_serve == 0: no peer has a recorded externalized
+        // observation, so none is counted serviceable.
+        // Stuck-onset past the 120s deadline.
+        {
+            let mut guard = app.consensus_stuck_state.write().await;
+            *guard = Some(ConsensusStuckState {
+                current_ledger,
+                first_buffered: current_ledger + 1,
+                stuck_start: app.clock.now() - std::time::Duration::from_secs(130),
+                last_recovery_attempt: app.clock.now(),
+                recovery_attempts: 8,
+            });
+        }
+
+        let result = app
+            .trigger_recovery_catchup(
+                current_ledger,
+                current_ledger as u64,
+                consensus::LedgerRelation::AtTip,
+                8,
+            )
+            .await;
+        assert!(result.is_none(), "near-tip recovery must return None");
+
+        let reached = distinct_peers_got_get_scp_state(&mut receivers).await;
+        assert!(
+            reached > 2,
+            "wider pull must reach more than 2 peers when peers cannot serve past \
+             the deadline, but only {reached} received GetScpState"
+        );
+    }
+
+    /// #3318: when peers CAN serve the missing slot, the wider pull must NOT
+    /// fire — the steady-state bounded 2-peer pull is preserved exactly.
+    #[tokio::test]
+    async fn test_near_tip_recovery_does_not_widen_when_peers_can_serve() {
+        let (app, mut receivers, current_ledger) = setup_near_tip_recovery(5).await;
+
+        // Make every peer serviceable: record an externalized observation AT
+        // the request watermark so `latest_ext - max_slots <= watermark` holds
+        // (latest_ext == watermark → trivially serves). Recording at
+        // current_ledger would be too HIGH relative to a low watermark and
+        // would (wrongly, for this test's intent) read as unserviceable.
+        let watermark = app.scp_state_request_ledger_seq();
+        if let Some(overlay) = app.overlay().await {
+            for peer in overlay.connected_peers() {
+                overlay.record_peer_externalized(&peer, watermark as u64);
+            }
+        }
+
+        // Stuck-onset past the deadline (isolating the serviceability gate).
+        {
+            let mut guard = app.consensus_stuck_state.write().await;
+            *guard = Some(ConsensusStuckState {
+                current_ledger,
+                first_buffered: current_ledger + 1,
+                stuck_start: app.clock.now() - std::time::Duration::from_secs(130),
+                last_recovery_attempt: app.clock.now(),
+                recovery_attempts: 8,
+            });
+        }
+
+        let result = app
+            .trigger_recovery_catchup(
+                current_ledger,
+                current_ledger as u64,
+                consensus::LedgerRelation::AtTip,
+                8,
+            )
+            .await;
+        assert!(result.is_none(), "near-tip recovery must return None");
+
+        let reached = distinct_peers_got_get_scp_state(&mut receivers).await;
+        assert!(
+            reached <= 2,
+            "no wider pull when peers can serve: at most 2 peers should receive \
+             GetScpState, but {reached} did"
+        );
+    }
+
+    /// #3318: when peers cannot serve but the unserviceable condition has NOT
+    /// yet persisted past the deadline, the wider pull must NOT fire — guards
+    /// against premature widening on transient overlay churn.
+    #[tokio::test]
+    async fn test_near_tip_recovery_does_not_widen_before_deadline() {
+        let (app, mut receivers, current_ledger) = setup_near_tip_recovery(5).await;
+
+        // peers_could_serve == 0 (no recorded observations) but stuck-onset is
+        // RECENT — well within the 120s deadline.
+        {
+            let mut guard = app.consensus_stuck_state.write().await;
+            *guard = Some(ConsensusStuckState {
+                current_ledger,
+                first_buffered: current_ledger + 1,
+                stuck_start: app.clock.now() - std::time::Duration::from_secs(10),
+                last_recovery_attempt: app.clock.now(),
+                recovery_attempts: 1,
+            });
+        }
+
+        let result = app
+            .trigger_recovery_catchup(
+                current_ledger,
+                current_ledger as u64,
+                consensus::LedgerRelation::AtTip,
+                1,
+            )
+            .await;
+        assert!(result.is_none(), "near-tip recovery must return None");
+
+        let reached = distinct_peers_got_get_scp_state(&mut receivers).await;
+        assert!(
+            reached <= 2,
+            "no wider pull before the deadline: at most 2 peers should receive \
+             GetScpState, but {reached} did"
         );
     }
 }
