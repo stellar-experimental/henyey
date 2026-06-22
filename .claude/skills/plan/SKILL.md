@@ -150,6 +150,28 @@ Run three lens passes in sequence (correctness / parity / scope), each as its ow
 >   preserved" list must name the integration tests in that crate that exercise
 >   the touched behavior.
 >
+> **Visibility-narrowing / dead-code build-verify gate (REVISE-MAJOR):**
+>
+> For ANY plan that narrows visibility (`pub`→`pub(crate)`/`pub(super)`/private)
+> or removes "dead" code: the plan MUST specify applying the narrowing/removal in
+> a scratch worktree and verifying it with `cargo build -p <crate> --all-targets`
+> (plus the workspace build) under `-Dwarnings`. A grep for callers is
+> INSUFFICIENT — only a build determines reachability (this repo sets `-Dwarnings`
+> globally in `.cargo/config.toml`, so an unused item is a hard error, and a
+> `#[cfg(test)]`-only caller does NOT keep an item alive in a normal `cargo build`).
+> The plan must classify each affected symbol:
+>
+> - **(a) in-crate non-test caller exists** → narrowing to `pub(crate)` is safe.
+> - **(b) only `#[cfg(test)]` callers, or no callers** → the item is DEAD: delete
+>   it, or keep it `pub` / `#[cfg(test)]` — never blind `pub(crate)` (that trips
+>   `dead_code`). A crate-root `pub use` re-export can be the sole keep-alive. An
+>   external integration-test-crate caller (`crates/<c>/tests/*.rs` is a SEPARATE
+>   crate) blocks `pub(crate)` with E0624.
+>
+> Return **REVISE-MAJOR** if a plan asserts a symbol is "safe to narrow" / "dead"
+> from a caller grep alone with no scratch build-verify step specified for `/do`,
+> or if it blind-narrows a (b)-class symbol to `pub(crate)`.
+>
 > You may read the issue body, the plan, and any source files the plan references.
 > Post your verdict as a PR-style comment with this exact structure:
 >
@@ -443,3 +465,7 @@ gh issue edit $ISSUE --repo stellar-experimental/henyey --remove-assignee @me
 - Round 1: C: REVISE-MAJOR ("too broad — splits across 3 crates") → refute pass: `STANDS` (genuinely 3 crates).
 - → File sub-issues, narrow plan. Round 2: A: REVISE-MAJOR ("narrowed plan no longer addresses original problem"), B: APPROVE, C: APPROVE → refute pass on A's concern: `STANDS`.
 - → Force-converge (Step 5-bis): file follow-up issue capturing A's surviving "narrowed plan misses original problem" concern, post `## ⚠️ Plan: Force-Converged (Round 2 Cap)` with the round-2 plan body and a reference to the follow-up, advance to `ready-for-doing`. The operator triages the follow-up — close as won't-fix if the original problem is genuinely covered by the narrowed plan + sub-issues, or schedule a follow-up PR if A was right.
+
+**Visibility-narrowing dead-code trap (Critic A REVISE-MAJOR):**
+- Plan: "narrow `ScpDriver::foo`/`bar` from `pub` to `pub(crate)`; grep shows zero callers outside the crate."
+- → Critic A: grep is insufficient under `-Dwarnings`. The symbols' only callers are `#[cfg(test)]` → they are DEAD, not "internal." `pub(crate)` would trip `dead_code` (this is exactly #3365 scp: 15 dead-code errors across 6 files). REVISE-MAJOR: the plan must specify a scratch build (`cargo build -p henyey-scp --all-targets` under `-Dwarnings`) and choose delete-or-keep-`pub`, not blind narrow.

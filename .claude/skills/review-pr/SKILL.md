@@ -393,6 +393,25 @@ Post via `gh pr comment $PR_NUM --repo stellar-experimental/henyey --body-file <
 >    pass (CI will catch this) and the plan's "Existing tests preserved" list
 >    must all be green in CI.
 >
+> **Visibility-narrowing / dead-code build-verify gate (CHANGES_REQUESTED):**
+>
+> For ANY PR diff that narrows visibility (`pub`→`pub(crate)`/`pub(super)`/private)
+> or removes "dead" code: green CI proves the change COMPILES under this repo's
+> global `-Dwarnings`, but a green build alone is NOT enough — you MUST verify the
+> diff's per-symbol classification rationale, not rubber-stamp a grep-only
+> justification. For each affected symbol, confirm the diff's choice matches:
+> **(a)** in-crate non-test caller exists → `pub(crate)` is correct; **(b)** only
+> `#[cfg(test)]` callers or none → the symbol is DEAD and the diff must delete it
+> or keep it `pub` / `#[cfg(test)]` (a crate-root `pub use` re-export can be the
+> sole keep-alive; an integration-test-crate caller blocks `pub(crate)` with
+> E0624) — a blind `pub(crate)` on a (b)-class symbol would not have compiled, so
+> if CI is green the live question is whether the (a)/(b) classification the diff
+> assumed is actually the reason it compiles. Return **CHANGES_REQUESTED** if the
+> PR's narrowing/deletion justification rests on a caller grep with no evidence the
+> (a)/(b) classification was reasoned through. (Full worked trap: the `/plan`
+> SKILL "Examples (verdict patterns)" → "Visibility-narrowing dead-code trap",
+> the #3365 scp cfg(test) case.)
+>
 > Then evaluate logic, error handling, readability per usual.
 >
 > Post your verdict as a single PR-level comment using \`gh pr comment\`,
