@@ -1598,7 +1598,7 @@ mod tests {
     }
 
     // Use the shared tracing capture helper (serialized via process-wide mutex).
-    use crate::tracing_test_support::capture_events;
+    use henyey_common::test_support::tracing_capture::capture_events;
 
     #[test]
     fn test_verify_tx_result_set_mismatch_emits_tracing() {

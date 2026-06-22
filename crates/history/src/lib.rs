@@ -130,9 +130,6 @@ pub mod error;
 #[cfg(any(test, feature = "test-utils"))]
 pub mod test_utils;
 
-#[cfg(test)]
-pub(crate) mod tracing_test_support;
-
 // Re-export main types at crate root
 pub use archive::HistoryArchive;
 pub use archive_state::HistoryArchiveState;

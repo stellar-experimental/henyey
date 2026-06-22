@@ -41,4 +41,6 @@ parking_lot.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
-tracing-subscriber.workspace = true
+# Shared deterministic tracing-capture test helper (replaces the deleted local
+# `tracing_test_support` module). See #3559.
+henyey-common = { workspace = true, features = ["test-support"] }

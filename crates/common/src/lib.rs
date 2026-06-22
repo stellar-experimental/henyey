@@ -65,6 +65,10 @@ pub mod network;
 pub mod protocol;
 pub mod resource;
 pub mod spawn;
+/// Shared, dev-only test-support utilities. Gated behind the `test-support`
+/// feature so it never enters a normal (no-feature) build.
+#[cfg(feature = "test-support")]
+pub mod test_support;
 pub mod time;
 pub mod tracking;
 pub mod types;
