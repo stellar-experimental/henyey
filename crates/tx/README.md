@@ -106,7 +106,6 @@ assert!(delta.fee_charged() >= 0);
 | `fee_bump.rs` | Fee-bump helpers, validation, and result wrapping. |
 | `signature_checker.rs` | Multi-signer verification and signer collection. |
 | `events.rs` | Classic and SAC event construction helpers. |
-| `lumen_reconciler.rs` | XLM event reconciliation for mint/burn/transfer edge cases. |
 | `meta_builder.rs` | Transaction metadata builders and diagnostic event plumbing; current finalize path emits V4 metadata. |
 | `scval_utils.rs` | `ScVal` conversion helpers used by event code. |
 | `operations/mod.rs` | Operation-level validation helpers, thresholds, and prefetch key collection. |
@@ -171,7 +170,6 @@ Soroban execution is protocol-versioned. `soroban-env-host-p24` is used for prot
 | `result.rs` | `src/transactions/MutableTransactionResult.cpp` |
 | `meta_builder.rs` | `src/transactions/TransactionMeta.cpp`, `src/transactions/TransactionMeta.h` |
 | `events.rs` | `src/transactions/EventManager.cpp` |
-| `lumen_reconciler.rs` | `src/transactions/LumenEventReconciler.cpp` |
 | `operations/mod.rs` | `src/transactions/OperationFrame.cpp` |
 | `operations/execute/*.rs` | `src/transactions/*OpFrame.cpp`, `src/transactions/OfferExchange.cpp` |
 | `state/mod.rs` | `src/ledger/LedgerTxn.cpp`, `src/ledger/LedgerTxn.h` |
