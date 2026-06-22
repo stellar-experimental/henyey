@@ -68,7 +68,7 @@ impl RecoverableShutdownHandle {
 /// [`PendingPersist`] task to avoid blocking inside `tokio::spawn`.
 #[derive(Clone)]
 pub(super) struct CatchupPersistData {
-    pub header: stellar_xdr::curr::LedgerHeader,
+    pub header: stellar_xdr::LedgerHeader,
     pub header_xdr: Vec<u8>,
     pub has_json: String,
     /// Whether checkpoint publishing is enabled for this run. Drives the
@@ -510,7 +510,7 @@ pub(super) fn fatal_persist_error(context: &str, error: &dyn std::fmt::Display) 
 mod tests {
     use super::*;
     use henyey_db::queries::StateQueries;
-    use stellar_xdr::curr::{Hash, LedgerHeader, LedgerHeaderExt, StellarValue, StellarValueExt};
+    use stellar_xdr::{Hash, LedgerHeader, LedgerHeaderExt, StellarValue, StellarValueExt};
 
     /// A detached `RecoverableShutdownHandle` for tests (no live App).
     fn test_recoverable_shutdown() -> RecoverableShutdownHandle {
@@ -576,13 +576,13 @@ mod tests {
     }
 
     fn make_header(seq: u32) -> (LedgerHeader, Vec<u8>) {
-        use stellar_xdr::curr::{LedgerHeaderExtensionV1, Limits, WriteXdr};
+        use stellar_xdr::{LedgerHeaderExtensionV1, Limits, WriteXdr};
         let header = LedgerHeader {
             ledger_version: 24,
             previous_ledger_hash: Hash([0; 32]),
             scp_value: StellarValue {
                 tx_set_hash: Hash([0; 32]),
-                close_time: stellar_xdr::curr::TimePoint(0),
+                close_time: stellar_xdr::TimePoint(0),
                 upgrades: vec![].try_into().unwrap(),
                 ext: StellarValueExt::Basic,
             },
@@ -599,7 +599,7 @@ mod tests {
             skip_list: [Hash([0; 32]), Hash([0; 32]), Hash([0; 32]), Hash([0; 32])],
             ext: LedgerHeaderExt::V1(LedgerHeaderExtensionV1 {
                 flags: 0,
-                ext: stellar_xdr::curr::LedgerHeaderExtensionV1Ext::V0,
+                ext: stellar_xdr::LedgerHeaderExtensionV1Ext::V0,
             }),
         };
         let xdr = header.to_xdr(Limits::none()).unwrap();

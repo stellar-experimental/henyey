@@ -988,7 +988,7 @@ fn build_validator_weight_config(
     validator_entries: &[(String, String, Option<String>, Option<String>)], // (pubkey, name, home_domain, quality)
     domain_quality_map: &HashMap<String, ValidatorQuality>,
 ) -> anyhow::Result<Option<ValidatorWeightConfig>> {
-    use stellar_xdr::curr::NodeId;
+    use stellar_xdr::NodeId;
 
     let mut entries: Vec<(NodeId, ValidatorEntryInfo)> = Vec::new();
 
@@ -1092,13 +1092,11 @@ fn build_validator_weight_config(
 }
 
 /// Parse a public key string into a NodeId.
-fn parse_node_id(pubkey: &str) -> anyhow::Result<stellar_xdr::curr::NodeId> {
+fn parse_node_id(pubkey: &str) -> anyhow::Result<stellar_xdr::NodeId> {
     let pk = henyey_crypto::PublicKey::from_strkey(pubkey)
         .map_err(|e| anyhow::anyhow!("Invalid public key '{}': {}", pubkey, e))?;
-    Ok(stellar_xdr::curr::NodeId(
-        stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(stellar_xdr::curr::Uint256(
-            *pk.as_bytes(),
-        )),
+    Ok(stellar_xdr::NodeId(
+        stellar_xdr::PublicKey::PublicKeyTypeEd25519(stellar_xdr::Uint256(*pk.as_bytes())),
     ))
 }
 

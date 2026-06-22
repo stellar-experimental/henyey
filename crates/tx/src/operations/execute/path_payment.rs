@@ -3,7 +3,7 @@
 //! This module implements the execution logic for PathPaymentStrictReceive
 //! and PathPaymentStrictSend operations, which transfer assets through a path.
 
-use stellar_xdr::curr::{
+use stellar_xdr::{
     AccountId, Asset, ClaimAtom, ClaimLiquidityAtom, LiquidityPoolEntryBody,
     LiquidityPoolParameters, OperationResult, OperationResultTr, PathPaymentStrictReceiveOp,
     PathPaymentStrictReceiveResult, PathPaymentStrictReceiveResultCode,
@@ -833,7 +833,7 @@ fn apply_pool_exchange(
 
 fn pool_id_for_assets(send_asset: &Asset, recv_asset: &Asset) -> PoolId {
     let params = LiquidityPoolParameters::LiquidityPoolConstantProduct(
-        stellar_xdr::curr::LiquidityPoolConstantProductParameters {
+        stellar_xdr::LiquidityPoolConstantProductParameters {
             asset_a: std::cmp::min(send_asset.clone(), recv_asset.clone()),
             asset_b: std::cmp::max(send_asset.clone(), recv_asset.clone()),
             fee: LIQUIDITY_POOL_FEE_V18 as i32,
@@ -1097,7 +1097,7 @@ mod tests {
     use crate::test_utils::{
         create_test_account_id, create_test_asset, create_test_trustline_asset,
     };
-    use stellar_xdr::curr::*;
+    use stellar_xdr::*;
 
     fn create_test_muxed_account(seed: u8) -> MuxedAccount {
         MuxedAccount::Ed25519(Uint256([seed; 32]))
@@ -3081,7 +3081,7 @@ mod tests {
     /// path payments must skip pool exchange and use order-book only.
     #[test]
     fn test_audit_011_pool_trading_disabled_flag_skips_pool_exchange() {
-        use stellar_xdr::curr::LedgerHeaderFlags;
+        use stellar_xdr::LedgerHeaderFlags;
 
         let mut state = LedgerStateManager::new(5_000_000, 100);
 

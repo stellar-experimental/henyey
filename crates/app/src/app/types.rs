@@ -14,7 +14,7 @@ use henyey_common::Hash256;
 use henyey_herder::{AccountProvider, FeeBalanceProvider, Herder, NextConsensusSlot};
 use henyey_ledger::{HeaderSnapshot, LedgerManager};
 use henyey_overlay::{PeerId, ScpQueueCallback};
-use stellar_xdr::curr::{Hash, LedgerUpgrade, ReadXdr, TopologyResponseBodyV2, UpgradeType};
+use stellar_xdr::{Hash, LedgerUpgrade, ReadXdr, TopologyResponseBodyV2, UpgradeType};
 
 use crate::survey::SurveyPhase;
 
@@ -122,9 +122,9 @@ pub struct SurveyPeerReport {
 pub struct SurveyReport {
     pub phase: SurveyPhase,
     pub nonce: Option<u32>,
-    pub local_node: Option<stellar_xdr::curr::TimeSlicedNodeData>,
-    pub inbound_peers: Vec<stellar_xdr::curr::TimeSlicedPeerData>,
-    pub outbound_peers: Vec<stellar_xdr::curr::TimeSlicedPeerData>,
+    pub local_node: Option<stellar_xdr::TimeSlicedNodeData>,
+    pub inbound_peers: Vec<stellar_xdr::TimeSlicedPeerData>,
+    pub outbound_peers: Vec<stellar_xdr::TimeSlicedPeerData>,
     pub peer_reports: std::collections::BTreeMap<u32, Vec<SurveyPeerReport>>,
     pub survey_in_progress: bool,
     pub backlog: Vec<String>,
@@ -292,8 +292,8 @@ impl LedgerSummary {
     /// because it depends on the system clock (which only the caller has).
     pub fn from_snapshot(snap: &HeaderSnapshot, age: u64) -> Self {
         let flags = match &snap.header.ext {
-            stellar_xdr::curr::LedgerHeaderExt::V0 => 0,
-            stellar_xdr::curr::LedgerHeaderExt::V1(ext) => ext.flags,
+            stellar_xdr::LedgerHeaderExt::V0 => 0,
+            stellar_xdr::LedgerHeaderExt::V1(ext) => ext.flags,
         };
         LedgerSummary {
             num: snap.header.ledger_seq,
@@ -1136,16 +1136,16 @@ pub(super) struct LedgerFeeBalanceProvider {
 impl FeeBalanceProvider for LedgerFeeBalanceProvider {
     fn get_available_balance(
         &self,
-        account_id: &stellar_xdr::curr::AccountId,
+        account_id: &stellar_xdr::AccountId,
     ) -> henyey_ledger::Result<Option<i64>> {
         let snapshot = self.ledger_manager.create_snapshot()?;
-        let key = stellar_xdr::curr::LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
+        let key = stellar_xdr::LedgerKey::Account(stellar_xdr::LedgerKeyAccount {
             account_id: account_id.clone(),
         });
         let Some(entry) = snapshot.get_entry(&key)? else {
             return Ok(None);
         };
-        if let stellar_xdr::curr::LedgerEntryData::Account(acc) = &entry.data {
+        if let stellar_xdr::LedgerEntryData::Account(acc) = &entry.data {
             let base_reserve = snapshot.header().base_reserve;
             Ok(Some(henyey_ledger::reserves::available_to_send(
                 acc,
@@ -1170,8 +1170,8 @@ pub(super) struct LedgerAccountProvider {
 impl AccountProvider for LedgerAccountProvider {
     fn load_account(
         &self,
-        account_id: &stellar_xdr::curr::AccountId,
-    ) -> henyey_ledger::Result<Option<stellar_xdr::curr::AccountEntry>> {
+        account_id: &stellar_xdr::AccountId,
+    ) -> henyey_ledger::Result<Option<stellar_xdr::AccountEntry>> {
         // Create a snapshot per call for the queue-admission path.
         // The SCP validation path uses SnapshotValidationProviders
         // which holds a single snapshot for the entire validation run.
@@ -1225,8 +1225,8 @@ impl SnapshotValidationProviders {
 impl AccountProvider for SnapshotValidationProviders {
     fn load_account(
         &self,
-        account_id: &stellar_xdr::curr::AccountId,
-    ) -> henyey_ledger::Result<Option<stellar_xdr::curr::AccountEntry>> {
+        account_id: &stellar_xdr::AccountId,
+    ) -> henyey_ledger::Result<Option<stellar_xdr::AccountEntry>> {
         self.inner.load_account(account_id)
     }
 }
@@ -1234,7 +1234,7 @@ impl AccountProvider for SnapshotValidationProviders {
 impl FeeBalanceProvider for SnapshotValidationProviders {
     fn get_available_balance(
         &self,
-        account_id: &stellar_xdr::curr::AccountId,
+        account_id: &stellar_xdr::AccountId,
     ) -> henyey_ledger::Result<Option<i64>> {
         self.inner.get_available_balance(account_id)
     }
@@ -1247,7 +1247,7 @@ pub(super) fn decode_upgrades(upgrades: Vec<UpgradeType>) -> Vec<LedgerUpgrade> 
         .into_iter()
         .filter_map(|upgrade| {
             let bytes = upgrade.0.as_slice();
-            match LedgerUpgrade::from_xdr(bytes, stellar_xdr::curr::Limits::none()) {
+            match LedgerUpgrade::from_xdr(bytes, stellar_xdr::Limits::none()) {
                 Ok(decoded) => Some(decoded),
                 Err(err) => {
                     tracing::warn!(error = %err, "Failed to decode ledger upgrade");
@@ -1610,7 +1610,7 @@ mod tests {
     #[test]
     fn test_ledger_summary_from_snapshot_v0() {
         use henyey_ledger::HeaderSnapshot;
-        use stellar_xdr::curr::*;
+        use stellar_xdr::*;
 
         let header = LedgerHeader {
             ledger_version: 25,
@@ -1655,7 +1655,7 @@ mod tests {
     #[test]
     fn test_ledger_summary_from_snapshot_v1_flags() {
         use henyey_ledger::HeaderSnapshot;
-        use stellar_xdr::curr::*;
+        use stellar_xdr::*;
 
         let header = LedgerHeader {
             ledger_version: 25,
@@ -1793,7 +1793,7 @@ mod tests {
     fn test_peer_tx_adverts_queue_incoming_stamps_history() {
         let mut adverts = PeerTxAdverts::new();
         let hash_bytes = [7u8; 32];
-        let hashes = vec![stellar_xdr::curr::Hash(hash_bytes)];
+        let hashes = vec![stellar_xdr::Hash(hash_bytes)];
 
         adverts.queue_incoming(&hashes, 15, 100);
 

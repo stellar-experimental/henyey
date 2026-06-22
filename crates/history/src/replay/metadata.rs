@@ -9,7 +9,7 @@
 // items below don't need individual `#[cfg(test)]` attributes.
 use crate::{verify, HistoryError, Result};
 use henyey_ledger::TransactionSetVariant;
-use stellar_xdr::curr::{
+use stellar_xdr::{
     LedgerEntry, LedgerHeader, LedgerKey, TransactionMeta, TransactionResultPair,
     TransactionResultSet, WriteXdr,
 };
@@ -54,7 +54,7 @@ pub(crate) fn replay_ledger(
                 .map_err(|_| HistoryError::CatchupFailed("tx result set too large".to_string()))?,
         };
         let xdr = result_set
-            .to_xdr(stellar_xdr::curr::Limits::none())
+            .to_xdr(stellar_xdr::Limits::none())
             .map_err(|e| {
                 HistoryError::CatchupFailed(format!("failed to encode tx result set: {}", e))
             })?;
@@ -119,8 +119,8 @@ impl LedgerChanges {
         }
     }
 
-    fn push(&mut self, change: &stellar_xdr::curr::LedgerEntryChange) {
-        use stellar_xdr::curr::LedgerEntryChange;
+    fn push(&mut self, change: &stellar_xdr::LedgerEntryChange) {
+        use stellar_xdr::LedgerEntryChange;
         match change {
             LedgerEntryChange::Created(entry) => self.init.push(entry.clone()),
             LedgerEntryChange::Updated(entry) => self.live.push(entry.clone()),
@@ -149,14 +149,14 @@ fn count_operations(tx_set: &TransactionSetVariant) -> u32 {
         .transactions()
         .into_iter()
         .map(|tx_env| {
-            use stellar_xdr::curr::TransactionEnvelope;
+            use stellar_xdr::TransactionEnvelope;
             match tx_env {
                 TransactionEnvelope::TxV0(tx) => tx.tx.operations.len() as u32,
                 TransactionEnvelope::Tx(tx) => tx.tx.operations.len() as u32,
                 TransactionEnvelope::TxFeeBump(tx) => {
                     // Fee bump wraps an inner transaction; +1 for the wrapper itself
                     match &tx.tx.inner_tx {
-                        stellar_xdr::curr::FeeBumpTransactionInnerTx::Tx(inner) => {
+                        stellar_xdr::FeeBumpTransactionInnerTx::Tx(inner) => {
                             inner.tx.operations.len() as u32 + 1
                         }
                     }
@@ -170,7 +170,7 @@ fn count_operations(tx_set: &TransactionSetVariant) -> u32 {
 mod tests {
     use super::*;
     use henyey_common::Hash256;
-    use stellar_xdr::curr::{
+    use stellar_xdr::{
         AccountEntry, AccountEntryExt, AccountId, ExtensionPoint, GeneralizedTransactionSet, Hash,
         LedgerEntryChange, LedgerEntryChanges, LedgerEntryData, LedgerEntryExt, OperationMeta,
         OperationMetaV2, PublicKey, SequenceNumber, StateArchivalSettings, String32, Thresholds,
@@ -276,7 +276,7 @@ mod tests {
             results: VecM::default(),
         };
         let result_xdr = result_set
-            .to_xdr(stellar_xdr::curr::Limits::none())
+            .to_xdr(stellar_xdr::Limits::none())
             .expect("tx result set xdr");
         let result_hash = Hash256::hash(&result_xdr);
 

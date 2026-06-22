@@ -4,7 +4,7 @@
 //! and TestUtils patterns. It consolidates test utilities that were previously
 //! duplicated across individual operation test modules.
 
-use stellar_xdr::curr::{
+use stellar_xdr::{
     AccountEntry, AccountEntryExt, AccountEntryExtensionV1, AccountEntryExtensionV1Ext,
     AccountEntryExtensionV2, AccountEntryExtensionV2Ext, AccountFlags, AccountId, AlphaNum4, Asset,
     AssetCode4, Liabilities, PublicKey, SequenceNumber, String32, Thresholds, TrustLineAsset,
@@ -291,18 +291,18 @@ pub fn create_test_context_with_protocol(protocol_version: u32) -> LedgerContext
 
 /// Assert that an operation result is OpTooManySubentries.
 #[track_caller]
-pub fn assert_too_many_subentries(result: &stellar_xdr::curr::OperationResult) {
+pub fn assert_too_many_subentries(result: &stellar_xdr::OperationResult) {
     match result {
-        stellar_xdr::curr::OperationResult::OpTooManySubentries => {}
+        stellar_xdr::OperationResult::OpTooManySubentries => {}
         other => panic!("expected OpTooManySubentries, got {:?}", other),
     }
 }
 
 /// Assert that an operation result is OpTooManySponsoring.
 #[track_caller]
-pub fn assert_too_many_sponsoring(result: &stellar_xdr::curr::OperationResult) {
+pub fn assert_too_many_sponsoring(result: &stellar_xdr::OperationResult) {
     match result {
-        stellar_xdr::curr::OperationResult::OpTooManySponsoring => {}
+        stellar_xdr::OperationResult::OpTooManySponsoring => {}
         other => panic!("expected OpTooManySponsoring, got {:?}", other),
     }
 }

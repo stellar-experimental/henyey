@@ -25,7 +25,7 @@
 
 use std::sync::RwLock;
 
-use stellar_xdr::curr::{
+use stellar_xdr::{
     InnerTransactionResultResult, LedgerCloseMeta, SorobanTransactionMetaExt, TransactionMeta,
     TransactionResultPair, TransactionResultResult,
 };
@@ -605,7 +605,7 @@ mod tests {
 
     #[test]
     fn test_count_ops_from_result_success() {
-        use stellar_xdr::curr::{OperationResult, TransactionResultResult, VecM};
+        use stellar_xdr::{OperationResult, TransactionResultResult, VecM};
         let ops: VecM<OperationResult> = vec![
             OperationResult::OpNotSupported,
             OperationResult::OpNotSupported,
@@ -618,7 +618,7 @@ mod tests {
 
     #[test]
     fn test_count_ops_from_result_error_codes() {
-        use stellar_xdr::curr::TransactionResultResult;
+        use stellar_xdr::TransactionResultResult;
         // Error codes that carry no operation results should return 0
         assert_eq!(
             count_ops_from_result(&TransactionResultResult::TxTooEarly),

@@ -188,10 +188,10 @@ pub(crate) async fn cmd_publish_history(config: AppConfig, force: bool) -> anyho
                 .get_ledger_header(seq)?
                 .ok_or_else(|| anyhow::anyhow!("Missing ledger header {}", seq))?;
             let hash = compute_header_hash(&header)?;
-            headers.push(stellar_xdr::curr::LedgerHeaderHistoryEntry {
+            headers.push(stellar_xdr::LedgerHeaderHistoryEntry {
                 header,
-                hash: stellar_xdr::curr::Hash(hash.0),
-                ext: stellar_xdr::curr::LedgerHeaderHistoryEntryExt::V0,
+                hash: stellar_xdr::Hash(hash.0),
+                ext: stellar_xdr::LedgerHeaderHistoryEntryExt::V0,
             });
 
             let tx_entry = db.get_tx_history_entry(seq)?;
@@ -365,9 +365,9 @@ fn build_scp_history_entries(
     db: &henyey_db::Database,
     start_ledger: u32,
     checkpoint: u32,
-) -> anyhow::Result<Vec<stellar_xdr::curr::ScpHistoryEntry>> {
+) -> anyhow::Result<Vec<stellar_xdr::ScpHistoryEntry>> {
     use std::collections::HashSet;
-    use stellar_xdr::curr::{LedgerScpMessages, ScpHistoryEntry, ScpHistoryEntryV0};
+    use stellar_xdr::{LedgerScpMessages, ScpHistoryEntry, ScpHistoryEntryV0};
 
     let mut entries = Vec::new();
     for seq in start_ledger..=checkpoint {
@@ -430,7 +430,7 @@ fn write_root_has(
 fn write_scp_history_file(
     base_dir: &std::path::Path,
     checkpoint: u32,
-    entries: &[stellar_xdr::curr::ScpHistoryEntry],
+    entries: &[stellar_xdr::ScpHistoryEntry],
 ) -> anyhow::Result<()> {
     use henyey_history::paths::checkpoint_path;
 
@@ -455,7 +455,7 @@ struct CommandArchiveTarget {
 mod tests {
     use super::*;
     use std::io::Read;
-    use stellar_xdr::curr::ReadXdr;
+    use stellar_xdr::ReadXdr;
 
     /// Regression test for #2097: CLI publish staging must use `<bucket_dir>/tmp/`,
     /// not the system temp directory.
@@ -465,7 +465,7 @@ mod tests {
             BucketListQueries, HistoryQueries, LedgerQueries, PublishQueueQueries, StateQueries,
         };
         use henyey_db::schema::state_keys;
-        use stellar_xdr::curr::{
+        use stellar_xdr::{
             Hash, LedgerHeader, LedgerHeaderExt, Limits, StellarValue, StellarValueExt,
             TransactionHistoryEntry, TransactionHistoryEntryExt, TransactionHistoryResultEntry,
             TransactionHistoryResultEntryExt, TransactionResultSet, TransactionSet, VecM, WriteXdr,
@@ -524,7 +524,7 @@ mod tests {
                     previous_ledger_hash: Hash(previous_header_hash.0),
                     scp_value: StellarValue {
                         tx_set_hash: Hash(tx_hash.0),
-                        close_time: stellar_xdr::curr::TimePoint(seq as u64),
+                        close_time: stellar_xdr::TimePoint(seq as u64),
                         upgrades: VecM::default(),
                         ext: StellarValueExt::Basic,
                     },
@@ -635,11 +635,11 @@ mod tests {
         use tempfile::TempDir;
 
         let tmp = TempDir::new().unwrap();
-        let entry = stellar_xdr::curr::ScpHistoryEntry::V0(stellar_xdr::curr::ScpHistoryEntryV0 {
-            quorum_sets: stellar_xdr::curr::VecM::default(),
-            ledger_messages: stellar_xdr::curr::LedgerScpMessages {
+        let entry = stellar_xdr::ScpHistoryEntry::V0(stellar_xdr::ScpHistoryEntryV0 {
+            quorum_sets: stellar_xdr::VecM::default(),
+            ledger_messages: stellar_xdr::LedgerScpMessages {
                 ledger_seq: 63,
-                messages: stellar_xdr::curr::VecM::default(),
+                messages: stellar_xdr::VecM::default(),
             },
         });
 
@@ -658,11 +658,9 @@ mod tests {
         let payload_len = (mark & 0x7fff_ffff) as usize;
         assert_eq!(payload_len, bytes.len() - 4);
 
-        let parsed = stellar_xdr::curr::ScpHistoryEntry::from_xdr(
-            &bytes[4..],
-            stellar_xdr::curr::Limits::none(),
-        )
-        .unwrap();
+        let parsed =
+            stellar_xdr::ScpHistoryEntry::from_xdr(&bytes[4..], stellar_xdr::Limits::none())
+                .unwrap();
         assert_eq!(parsed, entry);
     }
 
@@ -671,11 +669,11 @@ mod tests {
         use tempfile::TempDir;
 
         let tmp = TempDir::new().unwrap();
-        let entry = stellar_xdr::curr::ScpHistoryEntry::V0(stellar_xdr::curr::ScpHistoryEntryV0 {
-            quorum_sets: stellar_xdr::curr::VecM::default(),
-            ledger_messages: stellar_xdr::curr::LedgerScpMessages {
+        let entry = stellar_xdr::ScpHistoryEntry::V0(stellar_xdr::ScpHistoryEntryV0 {
+            quorum_sets: stellar_xdr::VecM::default(),
+            ledger_messages: stellar_xdr::LedgerScpMessages {
                 ledger_seq: 63,
-                messages: stellar_xdr::curr::VecM::default(),
+                messages: stellar_xdr::VecM::default(),
             },
         });
 

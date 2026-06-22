@@ -8,7 +8,7 @@ use henyey_tx::{
     soroban::{PersistentModuleCache, SorobanConfig},
     ClassicEventConfig, OpEventManager, TxEventManager,
 };
-use stellar_xdr::curr::{
+use stellar_xdr::{
     AccountEntry, AccountEntryExt, AccountEntryExtensionV1, AccountEntryExtensionV1Ext,
     AccountEntryExtensionV2, AccountEntryExtensionV2Ext, AccountEntryExtensionV3, AccountId,
     AllowTrustOp, AlphaNum4, Asset, AssetCode, AssetCode4, BytesM, ChangeTrustAsset, ChangeTrustOp,
@@ -47,7 +47,7 @@ fn create_account_entry_with_last_modified(
     balance: i64,
     last_modified_ledger_seq: u32,
 ) -> (LedgerKey, LedgerEntry) {
-    let key = LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
+    let key = LedgerKey::Account(stellar_xdr::LedgerKeyAccount {
         account_id: account_id.clone(),
     });
 
@@ -79,7 +79,7 @@ fn create_account_entry_with_seq_info(
     seq_ledger: u32,
     seq_time: u64,
 ) -> (LedgerKey, LedgerEntry) {
-    let key = LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
+    let key = LedgerKey::Account(stellar_xdr::LedgerKeyAccount {
         account_id: account_id.clone(),
     });
 
@@ -132,7 +132,7 @@ fn create_account_entry_with_flags(
     balance: i64,
     flags: u32,
 ) -> (LedgerKey, LedgerEntry) {
-    let key = LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
+    let key = LedgerKey::Account(stellar_xdr::LedgerKeyAccount {
         account_id: account_id.clone(),
     });
 
@@ -188,9 +188,9 @@ fn set_account_liabilities(entry: &mut LedgerEntry, selling: i64, buying: i64) {
     let LedgerEntryData::Account(account) = &mut entry.data else {
         return;
     };
-    account.ext = AccountEntryExt::V1(stellar_xdr::curr::AccountEntryExtensionV1 {
-        liabilities: stellar_xdr::curr::Liabilities { selling, buying },
-        ext: stellar_xdr::curr::AccountEntryExtensionV1Ext::V0,
+    account.ext = AccountEntryExt::V1(stellar_xdr::AccountEntryExtensionV1 {
+        liabilities: stellar_xdr::Liabilities { selling, buying },
+        ext: stellar_xdr::AccountEntryExtensionV1Ext::V0,
     });
 }
 
@@ -198,9 +198,9 @@ fn set_trustline_liabilities(entry: &mut LedgerEntry, selling: i64, buying: i64)
     let LedgerEntryData::Trustline(trustline) = &mut entry.data else {
         return;
     };
-    trustline.ext = TrustLineEntryExt::V1(stellar_xdr::curr::TrustLineEntryV1 {
-        liabilities: stellar_xdr::curr::Liabilities { selling, buying },
-        ext: stellar_xdr::curr::TrustLineEntryV1Ext::V0,
+    trustline.ext = TrustLineEntryExt::V1(stellar_xdr::TrustLineEntryV1 {
+        liabilities: stellar_xdr::Liabilities { selling, buying },
+        ext: stellar_xdr::TrustLineEntryV1Ext::V0,
     });
 }
 
@@ -327,7 +327,7 @@ fn asset_string_scval(asset: &Asset) -> ScVal {
 }
 
 fn assert_transfer_event(
-    event: &stellar_xdr::curr::ContractEvent,
+    event: &stellar_xdr::ContractEvent,
     from: &ScAddress,
     to: &ScAddress,
     asset: &Asset,
@@ -344,7 +344,7 @@ fn assert_transfer_event(
 }
 
 fn assert_claim_atom_events(
-    events: &[stellar_xdr::curr::ContractEvent],
+    events: &[stellar_xdr::ContractEvent],
     claim: &ClaimAtom,
     source_id: &AccountId,
     start: usize,
@@ -427,7 +427,7 @@ fn assert_claim_atom_events(
 fn native_asset_contract_id(network_id: &NetworkId) -> ContractId {
     let preimage = HashIdPreimage::ContractId(HashIdPreimageContractId {
         network_id: Hash::from(network_id.0),
-        contract_id_preimage: ContractIdPreimage::Asset(stellar_xdr::curr::Asset::Native),
+        contract_id_preimage: ContractIdPreimage::Asset(stellar_xdr::Asset::Native),
     });
     let hash = henyey_common::Hash256::hash_xdr(&preimage);
     ContractId(Hash::from(hash))

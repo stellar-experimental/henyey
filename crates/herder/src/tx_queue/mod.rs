@@ -53,8 +53,8 @@ use henyey_common::{
     any_greater, xdr_to_bytes, Hash256, NetworkId, Resource, ResourceType, NUM_SOROBAN_TX_RESOURCES,
 };
 use henyey_crypto::Sha256Hasher;
-use stellar_xdr::curr::WriteXdr;
-use stellar_xdr::curr::{
+use stellar_xdr::WriteXdr;
+use stellar_xdr::{
     AccountEntry, AccountId, DecoratedSignature, FeeBumpTransactionInnerTx,
     GeneralizedTransactionSet, Limits, OperationType, Preconditions, SignerKey,
     TransactionEnvelope, TransactionPhase, TxSetComponent,
@@ -1155,16 +1155,14 @@ fn build_eviction_exclusion(
 }
 
 /// Get the source account (inner for fee-bump) as a MuxedAccount.
-fn source_account_from_envelope(envelope: &TransactionEnvelope) -> stellar_xdr::curr::MuxedAccount {
+fn source_account_from_envelope(envelope: &TransactionEnvelope) -> stellar_xdr::MuxedAccount {
     match envelope {
         TransactionEnvelope::TxV0(env) => {
-            stellar_xdr::curr::MuxedAccount::Ed25519(env.tx.source_account_ed25519.clone())
+            stellar_xdr::MuxedAccount::Ed25519(env.tx.source_account_ed25519.clone())
         }
         TransactionEnvelope::Tx(env) => env.tx.source_account.clone(),
         TransactionEnvelope::TxFeeBump(env) => match &env.tx.inner_tx {
-            stellar_xdr::curr::FeeBumpTransactionInnerTx::Tx(inner) => {
-                inner.tx.source_account.clone()
-            }
+            stellar_xdr::FeeBumpTransactionInnerTx::Tx(inner) => inner.tx.source_account.clone(),
         },
     }
 }
@@ -1186,7 +1184,7 @@ fn account_id_from_envelope(envelope: &TransactionEnvelope) -> AccountId {
 fn fee_source_key(envelope: &TransactionEnvelope) -> Vec<u8> {
     let fee_source = match envelope {
         TransactionEnvelope::TxV0(env) => {
-            stellar_xdr::curr::MuxedAccount::Ed25519(env.tx.source_account_ed25519.clone())
+            stellar_xdr::MuxedAccount::Ed25519(env.tx.source_account_ed25519.clone())
         }
         TransactionEnvelope::Tx(env) => env.tx.source_account.clone(),
         TransactionEnvelope::TxFeeBump(env) => env.tx.fee_source.clone(),
@@ -1200,11 +1198,11 @@ use henyey_tx::envelope_utils::is_fee_bump_envelope;
 
 /// Convert an XDR-encoded account key back to AccountId.
 fn account_id_from_fee_source_key(key: &[u8]) -> AccountId {
-    use stellar_xdr::curr::ReadXdr;
+    use stellar_xdr::ReadXdr;
     AccountId::from_xdr(key, Limits::none()).unwrap_or({
         // Fallback to a zero account ID if decoding fails
-        AccountId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
-            stellar_xdr::curr::Uint256([0; 32]),
+        AccountId(stellar_xdr::PublicKey::PublicKeyTypeEd25519(
+            stellar_xdr::Uint256([0; 32]),
         ))
     })
 }
@@ -1654,7 +1652,7 @@ impl TransactionQueue {
         // Queue admission only: validate host function pairing.
         // stellar-core enforces this at queue admission but not tx-set checkValid.
         if frame.is_soroban() && !frame.validate_host_fn() {
-            return Err(stellar_xdr::curr::TransactionResultCode::TxSorobanInvalid);
+            return Err(stellar_xdr::TransactionResultCode::TxSorobanInvalid);
         }
 
         // Build ledger context once for bounds and signature validation.
@@ -1734,7 +1732,7 @@ impl TransactionQueue {
                 if henyey_tx::is_op_supported(&op_type, ctx.protocol_version, ctx.ledger_flags)
                     .is_err()
                 {
-                    return Err(stellar_xdr::curr::TransactionResultCode::TxFailed);
+                    return Err(stellar_xdr::TransactionResultCode::TxFailed);
                 }
                 let effective_source = match &op.source_account {
                     Some(muxed) => henyey_tx::muxed_to_account_id(muxed),
@@ -1747,7 +1745,7 @@ impl TransactionQueue {
                 )
                 .is_err()
                 {
-                    return Err(stellar_xdr::curr::TransactionResultCode::TxFailed);
+                    return Err(stellar_xdr::TransactionResultCode::TxFailed);
                 }
             }
         }
@@ -1761,7 +1759,7 @@ impl TransactionQueue {
     /// Parity: stellar-core `TransactionFrame::checkSorobanResources()`.
     fn check_soroban_resources(
         &self,
-        env: &stellar_xdr::curr::TransactionEnvelope,
+        env: &stellar_xdr::TransactionEnvelope,
     ) -> std::result::Result<(), String> {
         let ctx = self.validation_context.read();
         let Some(ref limits) = ctx.soroban_limits else {
@@ -1958,7 +1956,7 @@ impl TransactionQueue {
         &self,
         lane_config: &dyn SurgePricingLaneConfig,
         lane_fees: &mut Vec<Option<FeeRate>>,
-        envelope: &stellar_xdr::curr::TransactionEnvelope,
+        envelope: &stellar_xdr::TransactionEnvelope,
         queued: &QueuedTransaction,
     ) -> bool {
         let lane = lane_config.get_lane(envelope);
@@ -3417,10 +3415,7 @@ fn has_ed25519_signature(
         .any(|sig| henyey_tx::verify_signature_with_raw_key(tx_hash, sig, key_bytes))
 }
 
-fn has_hashx_signature(
-    signatures: &[DecoratedSignature],
-    key: &stellar_xdr::curr::Uint256,
-) -> bool {
+fn has_hashx_signature(signatures: &[DecoratedSignature], key: &stellar_xdr::Uint256) -> bool {
     signatures.iter().any(|sig| {
         if sig.signature.0.len() != 32 {
             return false;
@@ -3437,7 +3432,7 @@ fn has_hashx_signature(
 fn has_signed_payload_signature(
     _tx_hash: &Hash256,
     signatures: &[DecoratedSignature],
-    payload: &stellar_xdr::curr::SignerKeyEd25519SignedPayload,
+    payload: &stellar_xdr::SignerKeyEd25519SignedPayload,
 ) -> bool {
     signatures
         .iter()
@@ -3456,7 +3451,7 @@ mod tests {
     use henyey_common::NetworkId;
     use henyey_common::{Resource, ResourceType, NUM_SOROBAN_TX_RESOURCES};
     use henyey_crypto::{sign_hash, SecretKey};
-    use stellar_xdr::curr::{
+    use stellar_xdr::{
         AccountId, AlphaNum4, Asset, AssetCode4, ContractExecutable, ContractIdPreimage,
         ContractIdPreimageFromAddress, CreateAccountOp, CreateContractArgs, DecoratedSignature,
         Duration, FeeBumpTransaction, FeeBumpTransactionEnvelope, FeeBumpTransactionExt,
@@ -3649,14 +3644,14 @@ mod tests {
             TransactionEnvelope::TxV0(tx) => tx.tx.seq_num.0,
             TransactionEnvelope::Tx(tx) => tx.tx.seq_num.0,
             TransactionEnvelope::TxFeeBump(tx) => match &tx.tx.inner_tx {
-                stellar_xdr::curr::FeeBumpTransactionInnerTx::Tx(inner) => inner.tx.seq_num.0,
+                stellar_xdr::FeeBumpTransactionInnerTx::Tx(inner) => inner.tx.seq_num.0,
             },
         }
     }
 
     fn envelope_size(envelope: &TransactionEnvelope) -> usize {
         envelope
-            .to_xdr(stellar_xdr::curr::Limits::none())
+            .to_xdr(stellar_xdr::Limits::none())
             .map(|bytes| bytes.len())
             .unwrap_or(0)
     }
@@ -3675,7 +3670,7 @@ mod tests {
                 env.tx.source_account = source;
             }
             TransactionEnvelope::TxFeeBump(env) => match &mut env.tx.inner_tx {
-                stellar_xdr::curr::FeeBumpTransactionInnerTx::Tx(inner) => {
+                stellar_xdr::FeeBumpTransactionInnerTx::Tx(inner) => {
                     inner.tx.source_account = source;
                 }
             },
@@ -4062,15 +4057,15 @@ mod tests {
 
         let _set = queue.build_generalized_tx_set(Hash256::ZERO, 100);
         let gen = _set.generalized_tx_set().unwrap().clone();
-        let stellar_xdr::curr::GeneralizedTransactionSet::V1(v1) = gen;
+        let stellar_xdr::GeneralizedTransactionSet::V1(v1) = gen;
         assert_eq!(v1.phases.len(), 2);
 
         match &v1.phases[0] {
-            stellar_xdr::curr::TransactionPhase::V0(components) => {
+            stellar_xdr::TransactionPhase::V0(components) => {
                 let txs: Vec<_> = components
                     .iter()
                     .flat_map(|component| match component {
-                        stellar_xdr::curr::TxSetComponent::TxsetCompTxsMaybeDiscountedFee(comp) => {
+                        stellar_xdr::TxSetComponent::TxsetCompTxsMaybeDiscountedFee(comp) => {
                             comp.txs.to_vec()
                         }
                     })
@@ -4086,7 +4081,7 @@ mod tests {
         }
 
         match &v1.phases[1] {
-            stellar_xdr::curr::TransactionPhase::V1(parallel) => {
+            stellar_xdr::TransactionPhase::V1(parallel) => {
                 let mut txs = Vec::new();
                 for stage in parallel.execution_stages.iter() {
                     for cluster in stage.iter() {
@@ -4132,10 +4127,10 @@ mod tests {
 
         let _set = queue.build_generalized_tx_set(Hash256::ZERO, 10);
         let gen = _set.generalized_tx_set().unwrap().clone();
-        let stellar_xdr::curr::GeneralizedTransactionSet::V1(v1) = gen;
+        let stellar_xdr::GeneralizedTransactionSet::V1(v1) = gen;
         let base_fee = match &v1.phases[0] {
-            stellar_xdr::curr::TransactionPhase::V0(components) => {
-                let stellar_xdr::curr::TxSetComponent::TxsetCompTxsMaybeDiscountedFee(comp) =
+            stellar_xdr::TransactionPhase::V0(components) => {
+                let stellar_xdr::TxSetComponent::TxsetCompTxsMaybeDiscountedFee(comp) =
                     &components[0];
                 comp.base_fee
             }
@@ -4155,9 +4150,9 @@ mod tests {
 
         let _set = queue.build_generalized_tx_set(Hash256::ZERO, 10);
         let gen = _set.generalized_tx_set().unwrap().clone();
-        let stellar_xdr::curr::GeneralizedTransactionSet::V1(v1) = gen;
+        let stellar_xdr::GeneralizedTransactionSet::V1(v1) = gen;
         let base_fee = match &v1.phases[1] {
-            stellar_xdr::curr::TransactionPhase::V1(parallel) => parallel.base_fee,
+            stellar_xdr::TransactionPhase::V1(parallel) => parallel.base_fee,
             _ => None,
         };
 
@@ -4178,11 +4173,11 @@ mod tests {
 
         let _set = queue.build_generalized_tx_set(Hash256::ZERO, 10);
         let gen = _set.generalized_tx_set().unwrap().clone();
-        let stellar_xdr::curr::GeneralizedTransactionSet::V1(v1) = gen;
+        let stellar_xdr::GeneralizedTransactionSet::V1(v1) = gen;
 
         let txs = match &v1.phases[0] {
-            stellar_xdr::curr::TransactionPhase::V0(components) => {
-                let stellar_xdr::curr::TxSetComponent::TxsetCompTxsMaybeDiscountedFee(comp) =
+            stellar_xdr::TransactionPhase::V0(components) => {
+                let stellar_xdr::TxSetComponent::TxsetCompTxsMaybeDiscountedFee(comp) =
                     &components[0];
                 comp.txs.to_vec()
             }
@@ -4208,11 +4203,11 @@ mod tests {
 
         let _set = queue.build_generalized_tx_set(Hash256::ZERO, 10);
         let gen = _set.generalized_tx_set().unwrap().clone();
-        let stellar_xdr::curr::GeneralizedTransactionSet::V1(v1) = gen;
+        let stellar_xdr::GeneralizedTransactionSet::V1(v1) = gen;
 
         let mut txs = Vec::new();
         match &v1.phases[1] {
-            stellar_xdr::curr::TransactionPhase::V1(parallel) => {
+            stellar_xdr::TransactionPhase::V1(parallel) => {
                 for stage in parallel.execution_stages.iter() {
                     for cluster in stage.iter() {
                         txs.extend(cluster.0.iter().cloned());
@@ -4270,12 +4265,10 @@ mod tests {
 
         let _set = queue.build_generalized_tx_set(Hash256::ZERO, 100);
         let gen = _set.generalized_tx_set().unwrap().clone();
-        let stellar_xdr::curr::GeneralizedTransactionSet::V1(v1) = gen;
+        let stellar_xdr::GeneralizedTransactionSet::V1(v1) = gen;
         let base_fee = match &v1.phases[0] {
-            stellar_xdr::curr::TransactionPhase::V0(components) => match &components[0] {
-                stellar_xdr::curr::TxSetComponent::TxsetCompTxsMaybeDiscountedFee(comp) => {
-                    comp.base_fee
-                }
+            stellar_xdr::TransactionPhase::V0(components) => match &components[0] {
+                stellar_xdr::TxSetComponent::TxsetCompTxsMaybeDiscountedFee(comp) => comp.base_fee,
             },
             _ => None,
         };
@@ -4663,10 +4656,10 @@ mod tests {
 
         let _set = queue.build_generalized_tx_set(Hash256::ZERO, 10);
         let gen = _set.generalized_tx_set().unwrap().clone();
-        let stellar_xdr::curr::GeneralizedTransactionSet::V1(tx_set) = gen;
+        let stellar_xdr::GeneralizedTransactionSet::V1(tx_set) = gen;
         let phases = &tx_set.phases;
         let components = match &phases[0] {
-            stellar_xdr::curr::TransactionPhase::V0(components) => components,
+            stellar_xdr::TransactionPhase::V0(components) => components,
             _ => panic!("expected classic phase"),
         };
         assert_eq!(components.len(), 2);
@@ -4674,7 +4667,7 @@ mod tests {
         let mut base_fees = Vec::new();
         let mut tx_counts = Vec::new();
         for comp in components.iter() {
-            let stellar_xdr::curr::TxSetComponent::TxsetCompTxsMaybeDiscountedFee(comp) = comp;
+            let stellar_xdr::TxSetComponent::TxsetCompTxsMaybeDiscountedFee(comp) = comp;
             base_fees.push(comp.base_fee);
             tx_counts.push(comp.txs.len());
         }
@@ -4975,16 +4968,16 @@ mod tests {
 
         let _set = queue.build_generalized_tx_set(Hash256::ZERO, 200);
         let gen = _set.generalized_tx_set().unwrap().clone();
-        let stellar_xdr::curr::GeneralizedTransactionSet::V1(v1) = gen;
+        let stellar_xdr::GeneralizedTransactionSet::V1(v1) = gen;
         let components = match &v1.phases[0] {
-            stellar_xdr::curr::TransactionPhase::V0(comps) => comps,
+            stellar_xdr::TransactionPhase::V0(comps) => comps,
             _ => panic!("expected classic phase"),
         };
 
         let mut has_dex_fee = false;
         let mut has_classic_fee = false;
         for comp in components.iter() {
-            let stellar_xdr::curr::TxSetComponent::TxsetCompTxsMaybeDiscountedFee(comp) = comp;
+            let stellar_xdr::TxSetComponent::TxsetCompTxsMaybeDiscountedFee(comp) = comp;
             match comp.base_fee {
                 Some(500) => has_dex_fee = true,
                 Some(fee) if fee == base_fee => has_classic_fee = true,
@@ -5085,9 +5078,9 @@ mod tests {
 
         let _set = queue.build_generalized_tx_set(Hash256::ZERO, 10);
         let gen = _set.generalized_tx_set().unwrap().clone();
-        let stellar_xdr::curr::GeneralizedTransactionSet::V1(v1) = gen;
+        let stellar_xdr::GeneralizedTransactionSet::V1(v1) = gen;
         let base_fee = match &v1.phases[1] {
-            stellar_xdr::curr::TransactionPhase::V1(parallel) => parallel.base_fee,
+            stellar_xdr::TransactionPhase::V1(parallel) => parallel.base_fee,
             _ => None,
         };
         assert_eq!(base_fee, Some(8000));
@@ -5116,9 +5109,9 @@ mod tests {
 
         let _set = queue.build_generalized_tx_set(Hash256::ZERO, 10);
         let gen = _set.generalized_tx_set().unwrap().clone();
-        let stellar_xdr::curr::GeneralizedTransactionSet::V1(v1) = gen;
+        let stellar_xdr::GeneralizedTransactionSet::V1(v1) = gen;
         let parallel = match &v1.phases[1] {
-            stellar_xdr::curr::TransactionPhase::V1(parallel) => parallel,
+            stellar_xdr::TransactionPhase::V1(parallel) => parallel,
             _ => panic!("expected Soroban V1 phase"),
         };
 
@@ -5890,7 +5883,7 @@ mod tests {
 
     #[test]
     fn test_extra_signer_signed_payload_satisfied() {
-        use stellar_xdr::curr::SignerKeyEd25519SignedPayload;
+        use stellar_xdr::SignerKeyEd25519SignedPayload;
 
         let queue = TransactionQueue::with_defaults();
 
@@ -5972,7 +5965,7 @@ mod tests {
     #[test]
     fn test_extra_signer_signed_payload_wrong_key_rejected() {
         use henyey_tx::TxResultCode;
-        use stellar_xdr::curr::SignerKeyEd25519SignedPayload;
+        use stellar_xdr::SignerKeyEd25519SignedPayload;
 
         let queue = TransactionQueue::with_defaults();
 
@@ -6058,7 +6051,7 @@ mod tests {
     #[test]
     fn test_extra_signer_signed_payload_bad_signature_rejected() {
         use henyey_tx::TxResultCode;
-        use stellar_xdr::curr::SignerKeyEd25519SignedPayload;
+        use stellar_xdr::SignerKeyEd25519SignedPayload;
 
         let queue = TransactionQueue::with_defaults();
 
@@ -6144,7 +6137,7 @@ mod tests {
     #[test]
     fn test_extra_signer_signed_payload_empty_payload_rejected() {
         use henyey_tx::TxResultCode;
-        use stellar_xdr::curr::SignerKeyEd25519SignedPayload;
+        use stellar_xdr::SignerKeyEd25519SignedPayload;
 
         let queue = TransactionQueue::with_defaults();
 
@@ -6251,7 +6244,7 @@ mod tests {
     #[test]
     fn test_audit_093_queue_rejects_expiring_tx() {
         use henyey_tx::TxResultCode;
-        use stellar_xdr::curr::TimeBounds;
+        use stellar_xdr::TimeBounds;
 
         let lcl_close_time: u64 = 1_700_000_000;
         let expected_close_secs: u64 = 5;
@@ -6292,8 +6285,8 @@ mod tests {
             fee: 200,
             seq_num: SequenceNumber(1),
             cond: Preconditions::Time(TimeBounds {
-                min_time: stellar_xdr::curr::TimePoint(0),
-                max_time: stellar_xdr::curr::TimePoint(max_time),
+                min_time: stellar_xdr::TimePoint(0),
+                max_time: stellar_xdr::TimePoint(max_time),
             }),
             memo: Memo::None,
             operations: operations.try_into().unwrap(),
@@ -6325,7 +6318,7 @@ mod tests {
     #[test]
     fn test_queue_already_expired_tx_returns_too_late() {
         use henyey_tx::TxResultCode;
-        use stellar_xdr::curr::TimeBounds;
+        use stellar_xdr::TimeBounds;
 
         let lcl_close_time: u64 = 1_700_000_000;
         let config = TxQueueConfig {
@@ -6362,8 +6355,8 @@ mod tests {
             fee: 200,
             seq_num: SequenceNumber(1),
             cond: Preconditions::Time(TimeBounds {
-                min_time: stellar_xdr::curr::TimePoint(0),
-                max_time: stellar_xdr::curr::TimePoint(max_time),
+                min_time: stellar_xdr::TimePoint(0),
+                max_time: stellar_xdr::TimePoint(max_time),
             }),
             memo: Memo::None,
             operations: operations.try_into().unwrap(),
@@ -6394,7 +6387,7 @@ mod tests {
     #[test]
     fn test_queue_uses_dynamic_expected_close_time() {
         use henyey_tx::TxResultCode;
-        use stellar_xdr::curr::TimeBounds;
+        use stellar_xdr::TimeBounds;
 
         // Use current wall-clock time so drift ≈ 0.
         let lcl_close_time: u64 = std::time::SystemTime::now()
@@ -6439,8 +6432,8 @@ mod tests {
             fee: 200,
             seq_num: SequenceNumber(1),
             cond: Preconditions::Time(TimeBounds {
-                min_time: stellar_xdr::curr::TimePoint(0),
-                max_time: stellar_xdr::curr::TimePoint(max_time),
+                min_time: stellar_xdr::TimePoint(0),
+                max_time: stellar_xdr::TimePoint(max_time),
             }),
             memo: Memo::None,
             operations: operations.try_into().unwrap(),
@@ -7306,7 +7299,7 @@ mod tests {
 
     /// Helper for AUDIT-214 (#2103) tests: count txs in a phase.
     fn audit_214_phase_tx_count(phase: &TransactionPhase) -> usize {
-        use stellar_xdr::curr::TxSetComponent;
+        use stellar_xdr::TxSetComponent;
         match phase {
             TransactionPhase::V0(components) => components
                 .iter()
@@ -7335,7 +7328,7 @@ mod tests {
         read_only_entries: usize,
         read_write_entries: usize,
     ) -> TransactionEnvelope {
-        use stellar_xdr::curr::LedgerKey;
+        use stellar_xdr::LedgerKey;
         let source = MuxedAccount::Ed25519(Uint256([50u8; 32]));
         let host_function = HostFunction::InvokeContract(InvokeContractArgs {
             contract_address: ScAddress::default(),
@@ -7353,14 +7346,14 @@ mod tests {
         // Build footprint with specified entry counts
         let read_only: Vec<LedgerKey> = (0..read_only_entries)
             .map(|i| {
-                LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
+                LedgerKey::Account(stellar_xdr::LedgerKeyAccount {
                     account_id: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([i as u8; 32]))),
                 })
             })
             .collect();
         let read_write: Vec<LedgerKey> = (0..read_write_entries)
             .map(|i| {
-                LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
+                LedgerKey::Account(stellar_xdr::LedgerKeyAccount {
                     account_id: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(
                         [(i + 100) as u8; 32],
                     ))),
@@ -7983,9 +7976,9 @@ mod tests {
 
         let _set = queue.build_generalized_tx_set(Hash256::ZERO, 10);
         let gen = _set.generalized_tx_set().unwrap().clone();
-        let stellar_xdr::curr::GeneralizedTransactionSet::V1(v1) = gen;
+        let stellar_xdr::GeneralizedTransactionSet::V1(v1) = gen;
         let parallel = match &v1.phases[1] {
-            stellar_xdr::curr::TransactionPhase::V1(parallel) => parallel,
+            stellar_xdr::TransactionPhase::V1(parallel) => parallel,
             _ => panic!("expected Soroban V1 phase"),
         };
 
@@ -8411,7 +8404,7 @@ mod tests {
 #[cfg(test)]
 mod pending_depth_tests {
     use super::*;
-    use stellar_xdr::curr::{
+    use stellar_xdr::{
         CreateAccountOp, DecoratedSignature, Memo, MuxedAccount, Operation, OperationBody,
         Preconditions, SequenceNumber, SignatureHint, Transaction, TransactionEnvelope,
         TransactionExt, TransactionV1Envelope, Uint256,
@@ -8424,8 +8417,8 @@ mod pending_depth_tests {
                 source_account: None,
                 body: OperationBody::CreateAccount(CreateAccountOp {
                     // Use destination [255; 32] so it differs from any test source
-                    destination: stellar_xdr::curr::AccountId(
-                        stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(Uint256([255u8; 32])),
+                    destination: stellar_xdr::AccountId(
+                        stellar_xdr::PublicKey::PublicKeyTypeEd25519(Uint256([255u8; 32])),
                     ),
                     starting_balance: 1_000_000_000,
                 }),
@@ -8444,7 +8437,7 @@ mod pending_depth_tests {
             tx,
             signatures: vec![DecoratedSignature {
                 hint: SignatureHint([0u8; 4]),
-                signature: stellar_xdr::curr::Signature(vec![0u8; 64].try_into().unwrap()),
+                signature: stellar_xdr::Signature(vec![0u8; 64].try_into().unwrap()),
             }]
             .try_into()
             .unwrap(),
@@ -8706,7 +8699,7 @@ mod snapshot_providers_tests {
         let source = MuxedAccount::Ed25519(Uint256([source_seed; 32]));
         let operations: Vec<Operation> = vec![Operation {
             source_account: None,
-            body: OperationBody::CreateAccount(stellar_xdr::curr::CreateAccountOp {
+            body: OperationBody::CreateAccount(stellar_xdr::CreateAccountOp {
                 destination: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([255u8; 32]))),
                 starting_balance: 1_000_000_000,
             }),
@@ -8724,14 +8717,14 @@ mod snapshot_providers_tests {
             tx,
             signatures: vec![DecoratedSignature {
                 hint: SignatureHint([0u8; 4]),
-                signature: stellar_xdr::curr::Signature(vec![0u8; 64].try_into().unwrap()),
+                signature: stellar_xdr::Signature(vec![0u8; 64].try_into().unwrap()),
             }]
             .try_into()
             .unwrap(),
         })
     }
 
-    use stellar_xdr::curr::{
+    use stellar_xdr::{
         AccountId, DecoratedSignature, Memo, MuxedAccount, Operation, OperationBody, Preconditions,
         PublicKey, SequenceNumber, SignatureHint, Transaction, TransactionEnvelope, TransactionExt,
         TransactionV1Envelope, Uint256,
@@ -8819,7 +8812,7 @@ mod snapshot_providers_tests {
 mod resource_limit_parity_tests {
     use super::*;
     use henyey_common::{Resource, ResourceType};
-    use stellar_xdr::curr::{
+    use stellar_xdr::{
         ContractDataDurability, GeneralizedTransactionSet, HostFunction, InvokeContractArgs,
         InvokeHostFunctionOp, LedgerFootprint, LedgerKey, LedgerKeyContractData, Memo,
         MuxedAccount, Operation, OperationBody, Preconditions, ScAddress, ScVal, SorobanResources,
@@ -8843,9 +8836,7 @@ mod resource_limit_parity_tests {
             ContractDataDurability::Temporary
         };
         LedgerKey::ContractData(LedgerKeyContractData {
-            contract: ScAddress::Contract(stellar_xdr::curr::ContractId(stellar_xdr::curr::Hash(
-                [0u8; 32],
-            ))),
+            contract: ScAddress::Contract(stellar_xdr::ContractId(stellar_xdr::Hash([0u8; 32]))),
             key: ScVal::I32(id),
             durability,
         })
@@ -8896,10 +8887,10 @@ mod resource_limit_parity_tests {
             source_account: None,
             body: OperationBody::InvokeHostFunction(InvokeHostFunctionOp {
                 host_function: HostFunction::InvokeContract(InvokeContractArgs {
-                    contract_address: ScAddress::Contract(stellar_xdr::curr::ContractId(
-                        stellar_xdr::curr::Hash(source_bytes),
+                    contract_address: ScAddress::Contract(stellar_xdr::ContractId(
+                        stellar_xdr::Hash(source_bytes),
                     )),
-                    function_name: stellar_xdr::curr::ScSymbol("test".try_into().unwrap()),
+                    function_name: stellar_xdr::ScSymbol("test".try_into().unwrap()),
                     args: Default::default(),
                 }),
                 auth: Default::default(),
@@ -8910,7 +8901,7 @@ mod resource_limit_parity_tests {
         let tx = Transaction {
             source_account: source,
             fee: inclusion_fee as u32,
-            seq_num: stellar_xdr::curr::SequenceNumber(1),
+            seq_num: stellar_xdr::SequenceNumber(1),
             cond: Preconditions::None,
             memo: Memo::None,
             operations: vec![invoke_op].try_into().unwrap(),
@@ -8983,13 +8974,13 @@ mod resource_limit_parity_tests {
     /// Returns (num_stages, clusters_per_stage, txs_per_cluster) for uniform shapes.
     fn extract_soroban_phase(
         gen_tx_set: &GeneralizedTransactionSet,
-    ) -> &stellar_xdr::curr::ParallelTxsComponent {
+    ) -> &stellar_xdr::ParallelTxsComponent {
         match gen_tx_set {
             GeneralizedTransactionSet::V1(v1) => {
                 // Phase 1 is the Soroban phase
                 let phase = &v1.phases[1];
                 match phase {
-                    stellar_xdr::curr::TransactionPhase::V1(component) => component,
+                    stellar_xdr::TransactionPhase::V1(component) => component,
                     _ => panic!("expected V1 soroban phase"),
                 }
             }
@@ -9257,10 +9248,7 @@ mod resource_limit_parity_tests {
             let mut id = 0u32;
             let sample_tx =
                 make_resource_limit_tx(&mut id, 1_000_000, &[0, 1], &[2, 3], 100, 1_000, 100);
-            let tx_size = sample_tx
-                .to_xdr(stellar_xdr::curr::Limits::none())
-                .unwrap()
-                .len() as i64;
+            let tx_size = sample_tx.to_xdr(stellar_xdr::Limits::none()).unwrap().len() as i64;
 
             let mut limits = default_soroban_limits();
             limits.set_val(ResourceType::TxByteSize, 11 * tx_size - 1);
@@ -9324,7 +9312,7 @@ mod resource_limit_parity_tests {
 mod eviction_queue_tests {
     use super::*;
     use henyey_common::types::Hash256;
-    use stellar_xdr::curr::*;
+    use stellar_xdr::*;
 
     fn make_test_envelope(fee: u32, ops: usize) -> TransactionEnvelope {
         let source = MuxedAccount::Ed25519(Uint256([0u8; 32]));
@@ -9367,7 +9355,7 @@ mod eviction_queue_tests {
                 env.tx.source_account = source;
             }
             TransactionEnvelope::TxFeeBump(env) => match &mut env.tx.inner_tx {
-                stellar_xdr::curr::FeeBumpTransactionInnerTx::Tx(inner) => {
+                stellar_xdr::FeeBumpTransactionInnerTx::Tx(inner) => {
                     inner.tx.source_account = source;
                 }
             },
@@ -10048,7 +10036,7 @@ mod fee_rate_tests {
     }
 
     fn make_dummy_envelope(fee: u32, ops: u32) -> TransactionEnvelope {
-        use stellar_xdr::curr::*;
+        use stellar_xdr::*;
         let mut operations = Vec::new();
         for _ in 0..ops {
             operations.push(Operation {
@@ -10079,7 +10067,7 @@ mod fee_rate_tests {
 #[cfg(test)]
 mod broadcast_visitor_tests {
     use super::*;
-    use stellar_xdr::curr::*;
+    use stellar_xdr::*;
 
     fn make_test_envelope(fee: u32, ops: usize) -> TransactionEnvelope {
         let source = MuxedAccount::Ed25519(Uint256([0u8; 32]));

@@ -39,7 +39,7 @@ use henyey_bucket::{BUCKET_LIST_LEVELS, HOT_ARCHIVE_BUCKET_LIST_LEVELS};
 use henyey_common::Hash256;
 use henyey_crypto::Sha256Hasher;
 use henyey_ledger::TransactionSetVariant;
-use stellar_xdr::curr::{
+use stellar_xdr::{
     LedgerHeader, LedgerHeaderHistoryEntry, Limits, ScpHistoryEntry, TransactionHistoryResultEntry,
     WriteXdr,
 };
@@ -480,12 +480,13 @@ pub fn verify_bucket_hash(data: &[u8], expected_hash: &Hash256) -> Result<()> {
 ///
 /// This is the hash that gets stored in the next ledger's `previous_ledger_hash`.
 pub fn compute_header_hash(header: &LedgerHeader) -> Result<Hash256> {
-    let xdr_bytes = header
-        .to_xdr(stellar_xdr::curr::Limits::none())
-        .map_err(|e| HistoryError::CorruptHeader {
-            ledger: header.ledger_seq,
-            detail: format!("failed to encode header: {}", e),
-        })?;
+    let xdr_bytes =
+        header
+            .to_xdr(stellar_xdr::Limits::none())
+            .map_err(|e| HistoryError::CorruptHeader {
+                ledger: header.ledger_seq,
+                detail: format!("failed to encode header: {}", e),
+            })?;
 
     Ok(Hash256::hash(&xdr_bytes))
 }
@@ -778,7 +779,7 @@ pub fn verify_tx_result_ordering(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use stellar_xdr::curr::{Hash, LedgerHeaderHistoryEntryExt, StellarValue, TimePoint, VecM};
+    use stellar_xdr::{Hash, LedgerHeaderHistoryEntryExt, StellarValue, TimePoint, VecM};
 
     fn make_test_header(seq: u32, prev_hash: Hash256) -> LedgerHeader {
         LedgerHeader {
@@ -788,7 +789,7 @@ mod tests {
                 tx_set_hash: Hash([0u8; 32]),
                 close_time: TimePoint(0),
                 upgrades: VecM::default(),
-                ext: stellar_xdr::curr::StellarValueExt::Basic,
+                ext: stellar_xdr::StellarValueExt::Basic,
             },
             tx_set_result_hash: Hash([0u8; 32]),
             bucket_list_hash: Hash([0u8; 32]),
@@ -801,7 +802,7 @@ mod tests {
             base_reserve: 5000000,
             max_tx_set_size: 100,
             skip_list: std::array::from_fn(|_| Hash([0u8; 32])),
-            ext: stellar_xdr::curr::LedgerHeaderExt::V0,
+            ext: stellar_xdr::LedgerHeaderExt::V0,
         }
     }
 
@@ -939,7 +940,7 @@ mod tests {
     // Item 4: Transaction result ordering tests
     #[test]
     fn test_verify_tx_result_ordering_valid() {
-        use stellar_xdr::curr::{
+        use stellar_xdr::{
             TransactionHistoryResultEntry, TransactionHistoryResultEntryExt, TransactionResultSet,
             VecM,
         };
@@ -972,7 +973,7 @@ mod tests {
 
     #[test]
     fn test_verify_tx_result_ordering_out_of_range() {
-        use stellar_xdr::curr::{
+        use stellar_xdr::{
             TransactionHistoryResultEntry, TransactionHistoryResultEntryExt, TransactionResultSet,
             VecM,
         };
@@ -989,7 +990,7 @@ mod tests {
 
     #[test]
     fn test_verify_tx_result_ordering_not_increasing() {
-        use stellar_xdr::curr::{
+        use stellar_xdr::{
             TransactionHistoryResultEntry, TransactionHistoryResultEntryExt, TransactionResultSet,
             VecM,
         };
@@ -1021,7 +1022,7 @@ mod tests {
 
     #[test]
     fn test_verify_tx_result_ordering_descending() {
-        use stellar_xdr::curr::{
+        use stellar_xdr::{
             TransactionHistoryResultEntry, TransactionHistoryResultEntryExt, TransactionResultSet,
             VecM,
         };
@@ -1047,7 +1048,7 @@ mod tests {
 
     #[test]
     fn test_verify_tx_result_ordering_single_entry() {
-        use stellar_xdr::curr::{
+        use stellar_xdr::{
             TransactionHistoryResultEntry, TransactionHistoryResultEntryExt, TransactionResultSet,
             VecM,
         };
@@ -1193,7 +1194,7 @@ mod tests {
 
     #[test]
     fn test_verify_tx_result_ordering_first_checkpoint() {
-        use stellar_xdr::curr::{
+        use stellar_xdr::{
             TransactionHistoryResultEntry, TransactionHistoryResultEntryExt, TransactionResultSet,
             VecM,
         };
@@ -1533,7 +1534,7 @@ mod tests {
     // --- Precedence regression tests for verify_tx_result_ordering ---
 
     fn make_tx_result_entry(ledger_seq: u32) -> TransactionHistoryResultEntry {
-        use stellar_xdr::curr::{TransactionHistoryResultEntryExt, TransactionResultSet};
+        use stellar_xdr::{TransactionHistoryResultEntryExt, TransactionResultSet};
         TransactionHistoryResultEntry {
             ledger_seq,
             tx_result_set: TransactionResultSet {
@@ -2165,14 +2166,14 @@ mod tests {
         let mut upper = make_chain(128, 191, 25);
         // Tamper: set first header's previous_ledger_hash to garbage so it
         // doesn't match hash(lower[126]).
-        upper[0].previous_ledger_hash = stellar_xdr::curr::Hash([0xDD; 32]);
+        upper[0].previous_ledger_hash = stellar_xdr::Hash([0xDD; 32]);
 
         let mut headers: Vec<_> = lower.into_iter().chain(upper).collect();
         // Re-compute internal chain for upper group: header 129's prev must
         // match hash of (tampered) header 128, etc. Use make_chain's approach.
         for i in 128..headers.len() {
             let prev_hash = compute_header_hash(&headers[i - 1]).unwrap();
-            headers[i].previous_ledger_hash = stellar_xdr::curr::Hash(prev_hash.0);
+            headers[i].previous_ledger_hash = stellar_xdr::Hash(prev_hash.0);
         }
 
         let hash_at_50 = compute_header_hash(&headers[49]).unwrap();

@@ -8,7 +8,7 @@
 use std::collections::HashSet;
 
 use henyey_common::Hash256;
-use stellar_xdr::curr::{
+use stellar_xdr::{
     AccountId, Asset, ChangeTrustAsset, Hash, LedgerFootprint, LedgerKey, Limits, MuxedAccount,
     Operation, OperationBody, RevokeSponsorshipOp, WriteXdr,
 };
@@ -76,36 +76,33 @@ impl Default for FrozenKeyConfig {
 }
 
 /// Helper to construct an account LedgerKey for frozen key checks.
-pub fn account_key(account_id: &stellar_xdr::curr::AccountId) -> LedgerKey {
-    LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
+pub fn account_key(account_id: &stellar_xdr::AccountId) -> LedgerKey {
+    LedgerKey::Account(stellar_xdr::LedgerKeyAccount {
         account_id: account_id.clone(),
     })
 }
 
 /// Helper to construct a trustline LedgerKey for frozen key checks.
-pub fn trustline_key(
-    account_id: &stellar_xdr::curr::AccountId,
-    asset: &stellar_xdr::curr::Asset,
-) -> LedgerKey {
-    LedgerKey::Trustline(stellar_xdr::curr::LedgerKeyTrustLine {
+pub fn trustline_key(account_id: &stellar_xdr::AccountId, asset: &stellar_xdr::Asset) -> LedgerKey {
+    LedgerKey::Trustline(stellar_xdr::LedgerKeyTrustLine {
         account_id: account_id.clone(),
         asset: asset_to_trustline_asset(asset),
     })
 }
 
 /// Convert an Asset to a TrustLineAsset (for trustline key construction).
-fn asset_to_trustline_asset(asset: &stellar_xdr::curr::Asset) -> stellar_xdr::curr::TrustLineAsset {
+fn asset_to_trustline_asset(asset: &stellar_xdr::Asset) -> stellar_xdr::TrustLineAsset {
     match asset {
-        stellar_xdr::curr::Asset::Native => {
+        stellar_xdr::Asset::Native => {
             // Native assets don't have trustlines — this shouldn't be called for native.
             // Return a dummy value; caller should guard against native.
-            stellar_xdr::curr::TrustLineAsset::Native
+            stellar_xdr::TrustLineAsset::Native
         }
-        stellar_xdr::curr::Asset::CreditAlphanum4(a4) => {
-            stellar_xdr::curr::TrustLineAsset::CreditAlphanum4(a4.clone())
+        stellar_xdr::Asset::CreditAlphanum4(a4) => {
+            stellar_xdr::TrustLineAsset::CreditAlphanum4(a4.clone())
         }
-        stellar_xdr::curr::Asset::CreditAlphanum12(a12) => {
-            stellar_xdr::curr::TrustLineAsset::CreditAlphanum12(a12.clone())
+        stellar_xdr::Asset::CreditAlphanum12(a12) => {
+            stellar_xdr::TrustLineAsset::CreditAlphanum12(a12.clone())
         }
     }
 }
@@ -321,16 +318,16 @@ fn manage_offer_accesses_frozen_key(
 }
 
 /// Construct an Asset from AllowTrust asset code + issuer.
-fn allow_trust_asset(issuer: &AccountId, asset_code: &stellar_xdr::curr::AssetCode) -> Asset {
+fn allow_trust_asset(issuer: &AccountId, asset_code: &stellar_xdr::AssetCode) -> Asset {
     match asset_code {
-        stellar_xdr::curr::AssetCode::CreditAlphanum4(code) => {
-            Asset::CreditAlphanum4(stellar_xdr::curr::AlphaNum4 {
+        stellar_xdr::AssetCode::CreditAlphanum4(code) => {
+            Asset::CreditAlphanum4(stellar_xdr::AlphaNum4 {
                 asset_code: code.clone(),
                 issuer: issuer.clone(),
             })
         }
-        stellar_xdr::curr::AssetCode::CreditAlphanum12(code) => {
-            Asset::CreditAlphanum12(stellar_xdr::curr::AlphaNum12 {
+        stellar_xdr::AssetCode::CreditAlphanum12(code) => {
+            Asset::CreditAlphanum12(stellar_xdr::AlphaNum12 {
                 asset_code: code.clone(),
                 issuer: issuer.clone(),
             })
@@ -341,12 +338,12 @@ fn allow_trust_asset(issuer: &AccountId, asset_code: &stellar_xdr::curr::AssetCo
 /// Convert a MuxedAccount to AccountId.
 fn muxed_to_account_id(muxed: &MuxedAccount) -> AccountId {
     match muxed {
-        MuxedAccount::Ed25519(key) => AccountId(
-            stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(key.clone()),
-        ),
-        MuxedAccount::MuxedEd25519(m) => AccountId(
-            stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(m.ed25519.clone()),
-        ),
+        MuxedAccount::Ed25519(key) => {
+            AccountId(stellar_xdr::PublicKey::PublicKeyTypeEd25519(key.clone()))
+        }
+        MuxedAccount::MuxedEd25519(m) => AccountId(stellar_xdr::PublicKey::PublicKeyTypeEd25519(
+            m.ed25519.clone(),
+        )),
     }
 }
 
@@ -358,27 +355,27 @@ fn muxed_to_account_id(muxed: &MuxedAccount) -> AccountId {
 /// - The selling asset's trustline is frozen (non-native only)
 /// - The buying asset's trustline is frozen (non-native only)
 pub fn offer_accesses_frozen_key(
-    offer: &stellar_xdr::curr::OfferEntry,
+    offer: &stellar_xdr::OfferEntry,
     config: &FrozenKeyConfig,
 ) -> bool {
     if !config.has_frozen_keys() {
         return false;
     }
     // Frozen seller account only matters when at least one side is native
-    if (matches!(offer.selling, stellar_xdr::curr::Asset::Native)
-        || matches!(offer.buying, stellar_xdr::curr::Asset::Native))
+    if (matches!(offer.selling, stellar_xdr::Asset::Native)
+        || matches!(offer.buying, stellar_xdr::Asset::Native))
         && config.is_key_frozen(&account_key(&offer.seller_id))
     {
         return true;
     }
     // Check selling asset trustline (if non-native)
-    if !matches!(offer.selling, stellar_xdr::curr::Asset::Native)
+    if !matches!(offer.selling, stellar_xdr::Asset::Native)
         && config.is_key_frozen(&trustline_key(&offer.seller_id, &offer.selling))
     {
         return true;
     }
     // Check buying asset trustline (if non-native)
-    if !matches!(offer.buying, stellar_xdr::curr::Asset::Native)
+    if !matches!(offer.buying, stellar_xdr::Asset::Native)
         && config.is_key_frozen(&trustline_key(&offer.seller_id, &offer.buying))
     {
         return true;
@@ -389,7 +386,7 @@ pub fn offer_accesses_frozen_key(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use stellar_xdr::curr::*;
+    use stellar_xdr::*;
 
     fn make_account_id(seed: u8) -> AccountId {
         AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([seed; 32])))
@@ -589,12 +586,10 @@ mod tests {
     #[test]
     fn test_accesses_frozen_key_soroban_footprint() {
         let source = make_account_id(1);
-        let frozen_key = LedgerKey::ContractData(stellar_xdr::curr::LedgerKeyContractData {
-            contract: stellar_xdr::curr::ScAddress::Contract(stellar_xdr::curr::ContractId(Hash(
-                [42u8; 32],
-            ))),
-            key: stellar_xdr::curr::ScVal::Void,
-            durability: stellar_xdr::curr::ContractDataDurability::Persistent,
+        let frozen_key = LedgerKey::ContractData(stellar_xdr::LedgerKeyContractData {
+            contract: stellar_xdr::ScAddress::Contract(stellar_xdr::ContractId(Hash([42u8; 32]))),
+            key: stellar_xdr::ScVal::Void,
+            durability: stellar_xdr::ContractDataDurability::Persistent,
         });
         let key_bytes = frozen_key.to_xdr(Limits::none()).unwrap();
         let config = FrozenKeyConfig::new(vec![key_bytes], vec![]);
@@ -616,12 +611,10 @@ mod tests {
     fn test_op_create_account_frozen_dest() {
         let tx_source = make_account_id(1);
         let config = freeze_account(2);
-        let op = make_op(OperationBody::CreateAccount(
-            stellar_xdr::curr::CreateAccountOp {
-                destination: make_account_id(2),
-                starting_balance: 1000,
-            },
-        ));
+        let op = make_op(OperationBody::CreateAccount(stellar_xdr::CreateAccountOp {
+            destination: make_account_id(2),
+            starting_balance: 1000,
+        }));
         assert!(operation_accesses_frozen_key(&op, &tx_source, &config));
     }
 
@@ -629,7 +622,7 @@ mod tests {
     fn test_op_payment_native_frozen_dest() {
         let tx_source = make_account_id(1);
         let config = freeze_account(2);
-        let op = make_op(OperationBody::Payment(stellar_xdr::curr::PaymentOp {
+        let op = make_op(OperationBody::Payment(stellar_xdr::PaymentOp {
             destination: MuxedAccount::Ed25519(Uint256([2u8; 32])),
             asset: Asset::Native,
             amount: 100,
@@ -642,7 +635,7 @@ mod tests {
         let tx_source = make_account_id(1);
         let asset = make_credit_asset(b"USD\0", 3);
         let config = freeze_trustline(1, &asset);
-        let op = make_op(OperationBody::Payment(stellar_xdr::curr::PaymentOp {
+        let op = make_op(OperationBody::Payment(stellar_xdr::PaymentOp {
             destination: MuxedAccount::Ed25519(Uint256([2u8; 32])),
             asset: asset.clone(),
             amount: 100,
@@ -655,7 +648,7 @@ mod tests {
         let tx_source = make_account_id(1);
         let asset = make_credit_asset(b"USD\0", 3);
         let config = freeze_trustline(2, &asset);
-        let op = make_op(OperationBody::Payment(stellar_xdr::curr::PaymentOp {
+        let op = make_op(OperationBody::Payment(stellar_xdr::PaymentOp {
             destination: MuxedAccount::Ed25519(Uint256([2u8; 32])),
             asset: asset.clone(),
             amount: 100,
@@ -669,7 +662,7 @@ mod tests {
         let selling = make_credit_asset(b"USD\0", 3);
         let config = freeze_trustline(1, &selling);
         let op = make_op(OperationBody::ManageSellOffer(
-            stellar_xdr::curr::ManageSellOfferOp {
+            stellar_xdr::ManageSellOfferOp {
                 selling: selling.clone(),
                 buying: Asset::Native,
                 amount: 100,
@@ -685,7 +678,7 @@ mod tests {
         let tx_source = make_account_id(1);
         let config = freeze_account(99); // freeze unrelated account
         let op = make_op(OperationBody::ManageSellOffer(
-            stellar_xdr::curr::ManageSellOfferOp {
+            stellar_xdr::ManageSellOfferOp {
                 selling: Asset::Native,
                 buying: make_credit_asset(b"USD\0", 3),
                 amount: 100,
@@ -701,15 +694,13 @@ mod tests {
         let tx_source = make_account_id(1);
         let asset = make_credit_asset(b"USD\0", 3);
         let config = freeze_trustline(1, &asset);
-        let op = make_op(OperationBody::ChangeTrust(
-            stellar_xdr::curr::ChangeTrustOp {
-                line: ChangeTrustAsset::CreditAlphanum4(stellar_xdr::curr::AlphaNum4 {
-                    asset_code: AssetCode4(*b"USD\0"),
-                    issuer: make_account_id(3),
-                }),
-                limit: 1000,
-            },
-        ));
+        let op = make_op(OperationBody::ChangeTrust(stellar_xdr::ChangeTrustOp {
+            line: ChangeTrustAsset::CreditAlphanum4(stellar_xdr::AlphaNum4 {
+                asset_code: AssetCode4(*b"USD\0"),
+                issuer: make_account_id(3),
+            }),
+            limit: 1000,
+        }));
         assert!(operation_accesses_frozen_key(&op, &tx_source, &config));
     }
 
@@ -728,7 +719,7 @@ mod tests {
         let tx_source = make_account_id(1);
         let asset = make_credit_asset(b"USD\0", 1);
         let config = freeze_trustline(2, &asset);
-        let op = make_op(OperationBody::Clawback(stellar_xdr::curr::ClawbackOp {
+        let op = make_op(OperationBody::Clawback(stellar_xdr::ClawbackOp {
             asset: asset.clone(),
             from: MuxedAccount::Ed25519(Uint256([2u8; 32])),
             amount: 50,
@@ -742,7 +733,7 @@ mod tests {
         let asset = make_credit_asset(b"USD\0", 3);
         let config = freeze_trustline(1, &asset);
         let op = make_op(OperationBody::CreateClaimableBalance(
-            stellar_xdr::curr::CreateClaimableBalanceOp {
+            stellar_xdr::CreateClaimableBalanceOp {
                 asset: asset.clone(),
                 amount: 100,
                 claimants: vec![].try_into().unwrap(),
@@ -756,7 +747,7 @@ mod tests {
         let tx_source = make_account_id(1);
         let config = freeze_account(99);
         let op = make_op(OperationBody::CreateClaimableBalance(
-            stellar_xdr::curr::CreateClaimableBalanceOp {
+            stellar_xdr::CreateClaimableBalanceOp {
                 asset: Asset::Native,
                 amount: 100,
                 claimants: vec![].try_into().unwrap(),
@@ -771,7 +762,7 @@ mod tests {
         let asset = make_credit_asset(b"USD\0", 1);
         let config = freeze_trustline(2, &asset);
         let op = make_op(OperationBody::SetTrustLineFlags(
-            stellar_xdr::curr::SetTrustLineFlagsOp {
+            stellar_xdr::SetTrustLineFlagsOp {
                 trustor: make_account_id(2),
                 asset: asset.clone(),
                 clear_flags: 0,
@@ -799,9 +790,9 @@ mod tests {
         let config = freeze_account(5);
         let tx_source = make_account_id(1);
         let op = make_op(OperationBody::RevokeSponsorship(
-            RevokeSponsorshipOp::Signer(stellar_xdr::curr::RevokeSponsorshipOpSigner {
+            RevokeSponsorshipOp::Signer(stellar_xdr::RevokeSponsorshipOpSigner {
                 account_id: make_account_id(5),
-                signer_key: stellar_xdr::curr::SignerKey::Ed25519(Uint256([0u8; 32])),
+                signer_key: stellar_xdr::SignerKey::Ed25519(Uint256([0u8; 32])),
             }),
         ));
         assert!(operation_accesses_frozen_key(&op, &tx_source, &config));
@@ -824,8 +815,8 @@ mod tests {
         // These ops return false from doesAccessFrozenKey
         for body in [
             OperationBody::Inflation,
-            OperationBody::BumpSequence(stellar_xdr::curr::BumpSequenceOp {
-                bump_to: stellar_xdr::curr::SequenceNumber(100),
+            OperationBody::BumpSequence(stellar_xdr::BumpSequenceOp {
+                bump_to: stellar_xdr::SequenceNumber(100),
             }),
         ] {
             assert!(
@@ -842,7 +833,7 @@ mod tests {
         let send_asset = make_credit_asset(b"USD\0", 3);
         let config = freeze_trustline(1, &send_asset);
         let op = make_op(OperationBody::PathPaymentStrictReceive(
-            stellar_xdr::curr::PathPaymentStrictReceiveOp {
+            stellar_xdr::PathPaymentStrictReceiveOp {
                 send_asset: send_asset.clone(),
                 send_max: 100,
                 destination: MuxedAccount::Ed25519(Uint256([2u8; 32])),
@@ -859,7 +850,7 @@ mod tests {
         let tx_source = make_account_id(1);
         let config = freeze_account(2);
         let op = make_op(OperationBody::PathPaymentStrictReceive(
-            stellar_xdr::curr::PathPaymentStrictReceiveOp {
+            stellar_xdr::PathPaymentStrictReceiveOp {
                 send_asset: make_credit_asset(b"USD\0", 3),
                 send_max: 100,
                 destination: MuxedAccount::Ed25519(Uint256([2u8; 32])),
@@ -877,7 +868,7 @@ mod tests {
         let dest_asset = make_credit_asset(b"EUR\0", 4);
         let config = freeze_trustline(2, &dest_asset);
         let op = make_op(OperationBody::PathPaymentStrictSend(
-            stellar_xdr::curr::PathPaymentStrictSendOp {
+            stellar_xdr::PathPaymentStrictSendOp {
                 send_asset: Asset::Native,
                 send_amount: 100,
                 destination: MuxedAccount::Ed25519(Uint256([2u8; 32])),

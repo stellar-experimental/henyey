@@ -340,7 +340,7 @@ impl App {
                     .to_json()
                     .map_err(|e| anyhow::anyhow!("Failed to serialize HAS after catchup: {}", e))?;
                 let header_xdr = final_header
-                    .to_xdr(stellar_xdr::curr::Limits::none())
+                    .to_xdr(stellar_xdr::Limits::none())
                     .map_err(|e| {
                         anyhow::anyhow!("Failed to serialize header XDR after catchup: {}", e)
                     })?;
@@ -1146,7 +1146,7 @@ impl App {
         mut message_rx: tokio::sync::mpsc::UnboundedReceiver<OverlayMessage>,
     ) {
         use std::collections::HashSet;
-        use stellar_xdr::curr::{Limits, ScpStatementPledges};
+        use stellar_xdr::{Limits, ScpStatementPledges};
 
         let mut cached_tx_sets = 0u32;
         let mut requested_tx_sets = 0u32;
@@ -1254,7 +1254,7 @@ impl App {
                             let overlay = self.overlay().await;
                             if let Some(overlay) = overlay {
                                 match overlay
-                                    .request_tx_set(&stellar_xdr::curr::Uint256(tx_set_hash.0))
+                                    .request_tx_set(&stellar_xdr::Uint256(tx_set_hash.0))
                                     .await
                                 {
                                     Ok(peer_count) => {
@@ -4403,7 +4403,7 @@ mod tests {
                     None
                 },
                 upgrades: vec![],
-                stellar_value_ext: stellar_xdr::curr::StellarValueExt::Basic,
+                stellar_value_ext: stellar_xdr::StellarValueExt::Basic,
             }
         };
 
@@ -5056,9 +5056,7 @@ mod tests {
 
     /// Helper: create a valid StellarValue XDR blob for seeding externalized slots.
     fn mk_stellar_value_xdr_for_slot(tx_set_hash: [u8; 32]) -> Vec<u8> {
-        use stellar_xdr::curr::{
-            Hash, Limits, StellarValue, StellarValueExt, TimePoint, VecM, WriteXdr,
-        };
+        use stellar_xdr::{Hash, Limits, StellarValue, StellarValueExt, TimePoint, VecM, WriteXdr};
         let sv = StellarValue {
             tx_set_hash: Hash(tx_set_hash),
             close_time: TimePoint(12345),
@@ -5069,8 +5067,8 @@ mod tests {
     }
 
     /// Helper: wrap XDR bytes into a Value for record_externalized.
-    fn mk_value_for_slot(xdr_bytes: Vec<u8>) -> stellar_xdr::curr::Value {
-        stellar_xdr::curr::Value(
+    fn mk_value_for_slot(xdr_bytes: Vec<u8>) -> stellar_xdr::Value {
+        stellar_xdr::Value(
             xdr_bytes
                 .try_into()
                 .expect("StellarValue XDR fits in Value"),
@@ -5121,7 +5119,7 @@ mod tests {
                     tx_set_hash: henyey_common::Hash256::from_bytes([0x50; 32]),
                     tx_set: None,
                     upgrades: Vec::new(),
-                    stellar_value_ext: stellar_xdr::curr::StellarValueExt::Basic,
+                    stellar_value_ext: stellar_xdr::StellarValueExt::Basic,
                 },
             );
         }
@@ -7222,7 +7220,7 @@ mod tests {
         slot: u64,
         previous_ledger_hash: henyey_common::types::Hash256,
     ) {
-        use stellar_xdr::curr::{Limits, StellarValue, StellarValueExt, TimePoint, WriteXdr};
+        use stellar_xdr::{Limits, StellarValue, StellarValueExt, TimePoint, WriteXdr};
 
         let tx_set = henyey_herder::TransactionSet::new(previous_ledger_hash, vec![]);
         let tx_set_hash = *tx_set.hash();
@@ -7232,13 +7230,12 @@ mod tests {
 
         // Build a StellarValue with the matching tx_set_hash.
         let sv = StellarValue {
-            tx_set_hash: stellar_xdr::curr::Hash(tx_set_hash.0),
+            tx_set_hash: stellar_xdr::Hash(tx_set_hash.0),
             close_time: TimePoint(1000),
             upgrades: vec![].try_into().unwrap(),
             ext: StellarValueExt::Basic,
         };
-        let value =
-            stellar_xdr::curr::Value(sv.to_xdr(Limits::none()).unwrap().try_into().unwrap());
+        let value = stellar_xdr::Value(sv.to_xdr(Limits::none()).unwrap().try_into().unwrap());
 
         // Record the slot as externalized.
         app.herder
@@ -7284,17 +7281,16 @@ mod tests {
         // Case 2: slot target+1 is externalized but WITHOUT a cached tx-set.
         // Build a StellarValue with a tx_set_hash that has no cached tx-set.
         {
-            use stellar_xdr::curr::{Limits, StellarValue, StellarValueExt, TimePoint, WriteXdr};
+            use stellar_xdr::{Limits, StellarValue, StellarValueExt, TimePoint, WriteXdr};
 
             let fake_hash = henyey_common::types::Hash256([99u8; 32]);
             let sv = StellarValue {
-                tx_set_hash: stellar_xdr::curr::Hash(fake_hash.0),
+                tx_set_hash: stellar_xdr::Hash(fake_hash.0),
                 close_time: TimePoint(2000),
                 upgrades: vec![].try_into().unwrap(),
                 ext: StellarValueExt::Basic,
             };
-            let value =
-                stellar_xdr::curr::Value(sv.to_xdr(Limits::none()).unwrap().try_into().unwrap());
+            let value = stellar_xdr::Value(sv.to_xdr(Limits::none()).unwrap().try_into().unwrap());
 
             app.herder
                 .scp_driver()

@@ -19,7 +19,7 @@ use henyey_common::{Hash256, NetworkId};
 use henyey_crypto::SecretKey;
 use henyey_herder::TxQueueResult;
 use henyey_tx::TxResultCode;
-use stellar_xdr::curr::{
+use stellar_xdr::{
     AccountId, Asset, ContractDataDurability, ContractId, ContractIdPreimage,
     ContractIdPreimageFromAddress, CreateAccountOp, Hash, LedgerKey, LedgerKeyContractData, Memo,
     MuxedAccount, Operation, OperationBody, PaymentOp, Preconditions, PublicKey, ScAddress, ScVal,
@@ -2004,7 +2004,7 @@ fn envelope_seq_num(env: &TransactionEnvelope) -> i64 {
         TransactionEnvelope::TxV0(e) => e.tx.seq_num.0,
         TransactionEnvelope::Tx(e) => e.tx.seq_num.0,
         TransactionEnvelope::TxFeeBump(e) => match &e.tx.inner_tx {
-            stellar_xdr::curr::FeeBumpTransactionInnerTx::Tx(inner) => inner.tx.seq_num.0,
+            stellar_xdr::FeeBumpTransactionInnerTx::Tx(inner) => inner.tx.seq_num.0,
         },
     }
 }

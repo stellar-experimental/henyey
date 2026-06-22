@@ -17,7 +17,7 @@
 
 use std::path::Path;
 
-use stellar_xdr::curr::{Limits, ReadXdr, TransactionEnvelope};
+use stellar_xdr::{Limits, ReadXdr, TransactionEnvelope};
 
 /// Stateful reader over a record-marked file of `TransactionEnvelope`s.
 pub struct PregeneratedTxReader {
@@ -96,7 +96,7 @@ impl PregeneratedTxReader {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use stellar_xdr::curr::{
+    use stellar_xdr::{
         Memo, MuxedAccount, Operation, OperationBody, PaymentOp, Preconditions, SequenceNumber,
         Transaction, TransactionExt, TransactionV1Envelope, Uint256, VecM, WriteXdr,
     };
@@ -109,7 +109,7 @@ mod tests {
             source_account: None,
             body: OperationBody::Payment(PaymentOp {
                 destination: MuxedAccount::Ed25519(Uint256([9u8; 32])),
-                asset: stellar_xdr::curr::Asset::Native,
+                asset: stellar_xdr::Asset::Native,
                 amount: 1,
             }),
         };

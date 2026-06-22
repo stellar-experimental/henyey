@@ -115,7 +115,7 @@ fn build_fee_bump_extend_ttl_tx(
         fee_source: MuxedAccount::Ed25519(Uint256(*outer_secret.public_key().as_bytes())),
         fee: outer_fee as i64,
         inner_tx: FeeBumpTransactionInnerTx::Tx(inner_v1),
-        ext: stellar_xdr::curr::FeeBumpTransactionExt::V0,
+        ext: stellar_xdr::FeeBumpTransactionExt::V0,
     };
 
     let mut envelope = TransactionEnvelope::TxFeeBump(FeeBumpTransactionEnvelope {

@@ -4,7 +4,7 @@
 use std::rc::Rc;
 
 use soroban_env_host_p25 as soroban_host;
-use stellar_xdr::curr::{
+use stellar_xdr::{
     ExtendFootprintTtlOp, ExtensionPoint, LedgerEntryType, LedgerFootprint, LedgerKey, Limits,
     OperationBody, ReadXdr, RestoreFootprintOp, SorobanResources, SorobanTransactionData,
     SorobanTransactionDataExt, WriteXdr,
@@ -21,8 +21,8 @@ pub(super) struct InvokeSimulationOutput {
 }
 
 pub(super) fn run_invoke_simulation(
-    host_fn: stellar_xdr::curr::HostFunction,
-    source_account: stellar_xdr::curr::AccountId,
+    host_fn: stellar_xdr::HostFunction,
+    source_account: stellar_xdr::AccountId,
     ledger_info: soroban_host::LedgerInfo,
     snapshot_source: BucketListSnapshotSource,
     auth_mode: soroban_host::e2e_invoke::RecordingInvocationAuthMode,
@@ -126,7 +126,7 @@ fn extract_modified_entries(
         // Get state after: decode from encoded_new_value
         let state_after = match change.encoded_new_value.as_ref() {
             Some(v) => Some(
-                stellar_xdr::curr::LedgerEntry::from_xdr(v, Limits::none())
+                stellar_xdr::LedgerEntry::from_xdr(v, Limits::none())
                     .map_err(|e| format!("failed to decode new LedgerEntry from change: {e}"))?,
             ),
             None => None,

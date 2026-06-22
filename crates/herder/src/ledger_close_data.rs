@@ -9,10 +9,10 @@
 //! validation for replay and verification.
 
 use henyey_common::Hash256;
-use stellar_xdr::curr::{Limits, ReadXdr, StellarValue, StoredDebugTransactionSet};
+use stellar_xdr::{Limits, ReadXdr, StellarValue, StoredDebugTransactionSet};
 
 #[cfg(feature = "test-utils")]
-use stellar_xdr::curr::TransactionResultSet;
+use stellar_xdr::TransactionResultSet;
 
 use crate::tx_queue::TransactionSet;
 
@@ -36,7 +36,7 @@ use crate::tx_queue::TransactionSet;
 ///
 /// ```ignore
 /// use henyey_herder::{LedgerCloseData, TransactionSet};
-/// use stellar_xdr::curr::StellarValue;
+/// use stellar_xdr::StellarValue;
 ///
 /// let tx_set = TransactionSet::new(prev_hash, transactions);
 /// let stellar_value = /* ... */;
@@ -159,7 +159,7 @@ impl LedgerCloseData {
     }
 
     /// Get the upgrades from the StellarValue.
-    pub fn upgrades(&self) -> &[stellar_xdr::curr::UpgradeType] {
+    pub fn upgrades(&self) -> &[stellar_xdr::UpgradeType] {
         &self.value.upgrades
     }
 
@@ -235,8 +235,8 @@ pub enum LedgerCloseDataError {
     XdrError(String),
 }
 
-impl From<stellar_xdr::curr::Error> for LedgerCloseDataError {
-    fn from(e: stellar_xdr::curr::Error) -> Self {
+impl From<stellar_xdr::Error> for LedgerCloseDataError {
+    fn from(e: stellar_xdr::Error) -> Self {
         LedgerCloseDataError::XdrError(e.to_string())
     }
 }
@@ -255,9 +255,9 @@ impl From<stellar_xdr::curr::Error> for LedgerCloseDataError {
 /// A string representation of the StellarValue.
 pub fn stellar_value_to_string<F>(sv: &StellarValue, short_node_id: Option<F>) -> String
 where
-    F: Fn(&stellar_xdr::curr::NodeId) -> String,
+    F: Fn(&stellar_xdr::NodeId) -> String,
 {
-    use stellar_xdr::curr::{LedgerUpgrade, StellarValueExt};
+    use stellar_xdr::{LedgerUpgrade, StellarValueExt};
 
     let mut res = String::from("[");
 
@@ -303,8 +303,8 @@ where
 }
 
 /// Convert a LedgerUpgrade to a human-readable string.
-fn upgrade_to_string(upgrade: &stellar_xdr::curr::LedgerUpgrade) -> String {
-    use stellar_xdr::curr::LedgerUpgrade;
+fn upgrade_to_string(upgrade: &stellar_xdr::LedgerUpgrade) -> String {
+    use stellar_xdr::LedgerUpgrade;
 
     match upgrade {
         LedgerUpgrade::Version(v) => format!("version={}", v),
@@ -325,7 +325,7 @@ fn upgrade_to_string(upgrade: &stellar_xdr::curr::LedgerUpgrade) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use stellar_xdr::curr::{Hash, Limits, StellarValueExt, TimePoint, UpgradeType, WriteXdr};
+    use stellar_xdr::{Hash, Limits, StellarValueExt, TimePoint, UpgradeType, WriteXdr};
 
     fn make_test_value(tx_set_hash: [u8; 32], close_time: u64) -> StellarValue {
         StellarValue {
@@ -368,7 +368,7 @@ mod tests {
     #[test]
     fn test_stellar_value_to_string_basic() {
         let value = make_test_value([0xABu8; 32], 12345);
-        let s = stellar_value_to_string::<fn(&stellar_xdr::curr::NodeId) -> String>(&value, None);
+        let s = stellar_value_to_string::<fn(&stellar_xdr::NodeId) -> String>(&value, None);
 
         assert!(s.contains("txH: "));
         assert!(s.contains("ct: 12345"));
@@ -377,7 +377,7 @@ mod tests {
 
     #[test]
     fn test_stellar_value_to_string_with_upgrades() {
-        use stellar_xdr::curr::LedgerUpgrade;
+        use stellar_xdr::LedgerUpgrade;
 
         let upgrade = LedgerUpgrade::Version(25);
         let upgrade_bytes = upgrade.to_xdr(Limits::none()).unwrap();
@@ -391,13 +391,13 @@ mod tests {
             ext: StellarValueExt::Basic,
         };
 
-        let s = stellar_value_to_string::<fn(&stellar_xdr::curr::NodeId) -> String>(&value, None);
+        let s = stellar_value_to_string::<fn(&stellar_xdr::NodeId) -> String>(&value, None);
         assert!(s.contains("version=25"));
     }
 
     #[test]
     fn test_upgrade_to_string() {
-        use stellar_xdr::curr::LedgerUpgrade;
+        use stellar_xdr::LedgerUpgrade;
 
         assert_eq!(upgrade_to_string(&LedgerUpgrade::Version(25)), "version=25");
         assert_eq!(

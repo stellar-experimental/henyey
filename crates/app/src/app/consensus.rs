@@ -1336,7 +1336,7 @@ impl App {
     pub(super) async fn send_quorum_set(
         &self,
         peer_id: &henyey_overlay::PeerId,
-        requested_hash: stellar_xdr::curr::Uint256,
+        requested_hash: stellar_xdr::Uint256,
     ) {
         let Some(overlay) = self.overlay().await else {
             return;
@@ -1348,8 +1348,8 @@ impl App {
                 tracing::debug!(peer = %peer_id, error = %e, "Failed to send quorum set");
             }
         } else {
-            let msg = StellarMessage::DontHave(stellar_xdr::curr::DontHave {
-                type_: stellar_xdr::curr::MessageType::ScpQuorumset,
+            let msg = StellarMessage::DontHave(stellar_xdr::DontHave {
+                type_: stellar_xdr::MessageType::ScpQuorumset,
                 req_hash: requested_hash,
             });
             if let Err(e) = overlay.try_send_to(peer_id, msg) {
@@ -1362,7 +1362,7 @@ impl App {
     pub(super) async fn handle_quorum_set(
         &self,
         _peer_id: &henyey_overlay::PeerId,
-        quorum_set: stellar_xdr::curr::ScpQuorumSet,
+        quorum_set: stellar_xdr::ScpQuorumSet,
     ) {
         let hash = henyey_scp::hash_quorum_set(&quorum_set);
 

@@ -731,7 +731,7 @@ mod tests {
     /// non-ConfigSetting LedgerEntryData variant (data corruption).
     #[test]
     fn test_load_config_setting_wrong_data_variant() {
-        use stellar_xdr::curr::{
+        use stellar_xdr::{
             AccountEntry, AccountId, LedgerEntryExt, PublicKey, SequenceNumber, Thresholds, Uint256,
         };
 
@@ -774,7 +774,7 @@ mod tests {
 
     /// Helper: create a LedgerEntry wrapping a ConfigSettingEntry.
     fn make_config_entry(setting: ConfigSettingEntry) -> LedgerEntry {
-        use stellar_xdr::curr::LedgerEntryExt;
+        use stellar_xdr::LedgerEntryExt;
         LedgerEntry {
             last_modified_ledger_seq: 1,
             data: LedgerEntryData::ConfigSetting(setting),
@@ -803,7 +803,7 @@ mod tests {
     /// V26+ with both settings present and populated returns correct config.
     #[test]
     fn test_load_frozen_key_config_v26_happy_path() {
-        use stellar_xdr::curr::{EncodedLedgerKey, FreezeBypassTxs, FrozenLedgerKeys, Hash};
+        use stellar_xdr::{EncodedLedgerKey, FreezeBypassTxs, FrozenLedgerKeys, Hash};
 
         let lookup: crate::EntryLookupFn = std::sync::Arc::new(move |key: &LedgerKey| {
             if let LedgerKey::ConfigSetting(cs) = key {
@@ -837,7 +837,7 @@ mod tests {
     /// V26+ with both settings present but empty (VecM::default) succeeds with empty config.
     #[test]
     fn test_load_frozen_key_config_v26_empty_settings() {
-        use stellar_xdr::curr::{FreezeBypassTxs, FrozenLedgerKeys};
+        use stellar_xdr::{FreezeBypassTxs, FrozenLedgerKeys};
 
         let lookup: crate::EntryLookupFn = std::sync::Arc::new(|key: &LedgerKey| {
             if let LedgerKey::ConfigSetting(cs) = key {
@@ -891,7 +891,7 @@ mod tests {
     /// V26+ with missing FreezeBypassTxs setting must error.
     #[test]
     fn test_load_frozen_key_config_missing_bypass_txs() {
-        use stellar_xdr::curr::FrozenLedgerKeys;
+        use stellar_xdr::FrozenLedgerKeys;
 
         let lookup: crate::EntryLookupFn = std::sync::Arc::new(|key: &LedgerKey| {
             if let LedgerKey::ConfigSetting(cs) = key {
@@ -953,7 +953,7 @@ mod tests {
     /// V26+ with wrong ConfigSettingEntry subtype for FreezeBypassTxs must error.
     #[test]
     fn test_load_frozen_key_config_wrong_subtype_bypass_txs() {
-        use stellar_xdr::curr::FrozenLedgerKeys;
+        use stellar_xdr::FrozenLedgerKeys;
 
         // Return correct FrozenLedgerKeys, but wrong subtype for FreezeBypassTxs
         let lookup: crate::EntryLookupFn = std::sync::Arc::new(|key: &LedgerKey| {
@@ -998,7 +998,7 @@ mod tests {
     fn soroban_info_lookup(
         overrides: std::collections::HashMap<ConfigSettingId, Option<ConfigSettingEntry>>,
     ) -> crate::EntryLookupFn {
-        use stellar_xdr::curr::LedgerEntryExt;
+        use stellar_xdr::LedgerEntryExt;
         std::sync::Arc::new(move |key: &LedgerKey| {
             if let LedgerKey::ConfigSetting(cs) = key {
                 let id = cs.config_setting_id;
@@ -1190,7 +1190,7 @@ mod tests {
     /// V23 settings present and correct are loaded properly.
     #[test]
     fn test_load_soroban_network_info_v23_settings_present() {
-        use stellar_xdr::curr::{
+        use stellar_xdr::{
             ConfigSettingContractLedgerCostExtV0, ConfigSettingContractParallelComputeV0,
             ConfigSettingScpTiming,
         };
@@ -1271,7 +1271,7 @@ mod tests {
     /// require_config succeeds when the entry exists and the extract closure matches.
     #[test]
     fn test_require_config_happy_path() {
-        use stellar_xdr::curr::ConfigSettingContractComputeV0;
+        use stellar_xdr::ConfigSettingContractComputeV0;
 
         let lookup: crate::EntryLookupFn = std::sync::Arc::new(|key: &LedgerKey| {
             if let LedgerKey::ConfigSetting(cs) = key {
@@ -1339,7 +1339,7 @@ mod tests {
     /// require_config errors when the ConfigSettingEntry variant doesn't match the extractor.
     #[test]
     fn test_require_config_wrong_variant() {
-        use stellar_xdr::curr::ConfigSettingContractComputeV0;
+        use stellar_xdr::ConfigSettingContractComputeV0;
 
         // Store a ContractComputeV0 but try to extract StateArchivalSettings
         let lookup: crate::EntryLookupFn = std::sync::Arc::new(|key: &LedgerKey| {

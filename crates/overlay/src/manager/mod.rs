@@ -59,9 +59,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use stellar_xdr::curr::{
-    PeerAddress as XdrPeerAddress, PeerAddressIp, StellarMessage, Uint256, VecM,
-};
+use stellar_xdr::{PeerAddress as XdrPeerAddress, PeerAddressIp, StellarMessage, Uint256, VecM};
 use tokio::sync::{broadcast, mpsc, Mutex as TokioMutex};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, trace, warn};
@@ -1260,7 +1258,7 @@ impl OverlayManager {
     pub fn send_error_and_drop(
         &self,
         peer_id: &PeerId,
-        code: stellar_xdr::curr::ErrorCode,
+        code: stellar_xdr::ErrorCode,
         message: &str,
     ) -> bool {
         let Some(entry) = self.peers.get(peer_id) else {
@@ -1683,7 +1681,7 @@ impl OverlayManager {
 
         // Send SEND_MORE_EXTENDED with 0 additional messages but
         // `increase` additional bytes, matching upstream behavior.
-        let send_more = StellarMessage::SendMoreExtended(stellar_xdr::curr::SendMoreExtended {
+        let send_more = StellarMessage::SendMoreExtended(stellar_xdr::SendMoreExtended {
             num_messages: 0,
             num_bytes: increase,
         });
@@ -3029,7 +3027,7 @@ mod tests {
     async fn test_audit_086_targeted_flood_uses_flow_control() {
         use crate::flow_control::{FlowControl, FlowControlConfig};
         use crate::peer::PeerStats;
-        use stellar_xdr::curr::*;
+        use stellar_xdr::*;
 
         let config = OverlayConfig::default();
         let secret = SecretKey::generate();
@@ -3142,8 +3140,8 @@ mod tests {
 
         let request_msgs = vec![
             StellarMessage::GetScpState(100),
-            StellarMessage::GetScpQuorumset(stellar_xdr::curr::Uint256([1u8; 32])),
-            StellarMessage::GetTxSet(stellar_xdr::curr::Uint256([2u8; 32])),
+            StellarMessage::GetScpQuorumset(stellar_xdr::Uint256([1u8; 32])),
+            StellarMessage::GetTxSet(stellar_xdr::Uint256([2u8; 32])),
         ];
 
         for msg in &request_msgs {
@@ -3241,26 +3239,26 @@ mod tests {
     fn all_fetch_variant_messages(peer: &PeerId) -> Vec<OverlayMessage> {
         let variants = vec![
             StellarMessage::GetScpState(0),
-            StellarMessage::GetScpQuorumset(stellar_xdr::curr::Uint256([1u8; 32])),
-            StellarMessage::GetTxSet(stellar_xdr::curr::Uint256([2u8; 32])),
-            StellarMessage::GeneralizedTxSet(stellar_xdr::curr::GeneralizedTransactionSet::V1(
-                stellar_xdr::curr::TransactionSetV1 {
-                    previous_ledger_hash: stellar_xdr::curr::Hash([0u8; 32]),
+            StellarMessage::GetScpQuorumset(stellar_xdr::Uint256([1u8; 32])),
+            StellarMessage::GetTxSet(stellar_xdr::Uint256([2u8; 32])),
+            StellarMessage::GeneralizedTxSet(stellar_xdr::GeneralizedTransactionSet::V1(
+                stellar_xdr::TransactionSetV1 {
+                    previous_ledger_hash: stellar_xdr::Hash([0u8; 32]),
                     phases: vec![].try_into().unwrap(),
                 },
             )),
-            StellarMessage::TxSet(stellar_xdr::curr::TransactionSet {
-                previous_ledger_hash: stellar_xdr::curr::Hash([0u8; 32]),
-                txs: stellar_xdr::curr::VecM::default(),
+            StellarMessage::TxSet(stellar_xdr::TransactionSet {
+                previous_ledger_hash: stellar_xdr::Hash([0u8; 32]),
+                txs: stellar_xdr::VecM::default(),
             }),
-            StellarMessage::DontHave(stellar_xdr::curr::DontHave {
-                type_: stellar_xdr::curr::MessageType::TxSet,
-                req_hash: stellar_xdr::curr::Uint256([3u8; 32]),
+            StellarMessage::DontHave(stellar_xdr::DontHave {
+                type_: stellar_xdr::MessageType::TxSet,
+                req_hash: stellar_xdr::Uint256([3u8; 32]),
             }),
-            StellarMessage::ScpQuorumset(stellar_xdr::curr::ScpQuorumSet {
+            StellarMessage::ScpQuorumset(stellar_xdr::ScpQuorumSet {
                 threshold: 1,
-                validators: stellar_xdr::curr::VecM::default(),
-                inner_sets: stellar_xdr::curr::VecM::default(),
+                validators: stellar_xdr::VecM::default(),
+                inner_sets: stellar_xdr::VecM::default(),
             }),
         ];
         variants
@@ -4066,22 +4064,22 @@ mod tests {
     }
 
     fn make_hello_msg() -> StellarMessage {
-        StellarMessage::Hello(stellar_xdr::curr::Hello {
+        StellarMessage::Hello(stellar_xdr::Hello {
             ledger_version: 0,
             overlay_version: 0,
             overlay_min_version: 0,
-            network_id: stellar_xdr::curr::Hash([0u8; 32]),
+            network_id: stellar_xdr::Hash([0u8; 32]),
             version_str: "test".try_into().unwrap(),
             listening_port: 0,
-            peer_id: stellar_xdr::curr::NodeId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
-                stellar_xdr::curr::Uint256([0u8; 32]),
+            peer_id: stellar_xdr::NodeId(stellar_xdr::PublicKey::PublicKeyTypeEd25519(
+                stellar_xdr::Uint256([0u8; 32]),
             )),
-            cert: stellar_xdr::curr::AuthCert {
-                pubkey: stellar_xdr::curr::Curve25519Public { key: [0u8; 32] },
+            cert: stellar_xdr::AuthCert {
+                pubkey: stellar_xdr::Curve25519Public { key: [0u8; 32] },
                 expiration: 0,
-                sig: stellar_xdr::curr::Signature::default(),
+                sig: stellar_xdr::Signature::default(),
             },
-            nonce: stellar_xdr::curr::Uint256([0u8; 32]),
+            nonce: stellar_xdr::Uint256([0u8; 32]),
         })
     }
 
@@ -4179,21 +4177,21 @@ mod tests {
     }
 
     fn make_flood_tx_msg() -> StellarMessage {
-        use stellar_xdr::curr::TransactionEnvelope;
+        use stellar_xdr::TransactionEnvelope;
         StellarMessage::Transaction(TransactionEnvelope::Tx(
-            stellar_xdr::curr::TransactionV1Envelope {
-                tx: stellar_xdr::curr::Transaction {
-                    source_account: stellar_xdr::curr::MuxedAccount::Ed25519(
-                        stellar_xdr::curr::Uint256([0; 32]),
-                    ),
+            stellar_xdr::TransactionV1Envelope {
+                tx: stellar_xdr::Transaction {
+                    source_account: stellar_xdr::MuxedAccount::Ed25519(stellar_xdr::Uint256(
+                        [0; 32],
+                    )),
                     fee: 100,
-                    seq_num: stellar_xdr::curr::SequenceNumber(1),
-                    cond: stellar_xdr::curr::Preconditions::None,
-                    memo: stellar_xdr::curr::Memo::None,
-                    operations: stellar_xdr::curr::VecM::default(),
-                    ext: stellar_xdr::curr::TransactionExt::V0,
+                    seq_num: stellar_xdr::SequenceNumber(1),
+                    cond: stellar_xdr::Preconditions::None,
+                    memo: stellar_xdr::Memo::None,
+                    operations: stellar_xdr::VecM::default(),
+                    ext: stellar_xdr::TransactionExt::V0,
                 },
-                signatures: stellar_xdr::curr::VecM::default(),
+                signatures: stellar_xdr::VecM::default(),
             },
         ))
     }
@@ -4608,9 +4606,7 @@ mod tests {
         // Verify each received message is the correct GetScpState(ledger_seq).
         for msg in &received {
             match msg {
-                super::OutboundMessage::Send(stellar_xdr::curr::StellarMessage::GetScpState(
-                    seq,
-                )) => {
+                super::OutboundMessage::Send(stellar_xdr::StellarMessage::GetScpState(seq)) => {
                     assert_eq!(
                         *seq, ledger_seq,
                         "GetScpState should contain ledger_seq {}, got {}",
@@ -4832,7 +4828,7 @@ mod tests {
         assert!(
             manager.send_error_and_drop(
                 &peer_id,
-                stellar_xdr::curr::ErrorCode::Misc,
+                stellar_xdr::ErrorCode::Misc,
                 "Survey has invalid signature",
             ),
             "send_error_and_drop should queue the shutdown for a connected peer"
@@ -4841,7 +4837,7 @@ mod tests {
         // First the ERROR_MSG with the exact survey code/string.
         match rx.recv().await.unwrap() {
             OutboundMessage::Send(StellarMessage::ErrorMsg(err)) => {
-                assert_eq!(err.code, stellar_xdr::curr::ErrorCode::Misc);
+                assert_eq!(err.code, stellar_xdr::ErrorCode::Misc);
                 assert_eq!(err.msg.to_string(), "Survey has invalid signature");
             }
             other => panic!(
@@ -4871,7 +4867,7 @@ mod tests {
         assert!(
             !manager.send_error_and_drop(
                 &peer_id,
-                stellar_xdr::curr::ErrorCode::Misc,
+                stellar_xdr::ErrorCode::Misc,
                 "Survey has invalid signature",
             ),
             "send_error_and_drop should report false for an unknown peer"

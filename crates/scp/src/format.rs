@@ -1,6 +1,6 @@
 //! Display formatting helpers for SCP types (nodes, ballots, envelopes, values).
 
-use stellar_xdr::curr::{NodeId, ScpBallot, ScpEnvelope, ScpStatementPledges, Value};
+use stellar_xdr::{NodeId, ScpBallot, ScpEnvelope, ScpStatementPledges, Value};
 
 /// Number of bytes to display for node IDs (8 hex chars).
 const NODE_ID_PREFIX_BYTES: usize = 4;
@@ -14,7 +14,7 @@ const VALUE_PREFIX_BYTES: usize = 8;
 /// Returns the first 8 hex characters of the public key.
 pub fn node_id_to_short_string(node_id: &NodeId) -> String {
     match &node_id.0 {
-        stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(stellar_xdr::curr::Uint256(bytes)) => {
+        stellar_xdr::PublicKey::PublicKeyTypeEd25519(stellar_xdr::Uint256(bytes)) => {
             hex::encode(&bytes[..NODE_ID_PREFIX_BYTES])
         }
     }
@@ -102,7 +102,7 @@ pub fn envelope_to_str(envelope: &ScpEnvelope) -> String {
 mod tests {
     use super::*;
     use crate::test_utils::{make_node_id, make_value};
-    use stellar_xdr::curr::{ScpNomination, ScpQuorumSet, ScpStatement};
+    use stellar_xdr::{ScpNomination, ScpQuorumSet, ScpStatement};
 
     #[test]
     fn test_node_id_to_short_string() {
@@ -152,7 +152,7 @@ mod tests {
         };
         let envelope = ScpEnvelope {
             statement,
-            signature: stellar_xdr::curr::Signature(Vec::new().try_into().unwrap_or_default()),
+            signature: stellar_xdr::Signature(Vec::new().try_into().unwrap_or_default()),
         };
 
         let s = envelope_to_str(&envelope);

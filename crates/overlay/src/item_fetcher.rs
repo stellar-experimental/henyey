@@ -54,7 +54,7 @@ use crate::PeerId;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use stellar_xdr::curr::{Hash, ScpEnvelope};
+use stellar_xdr::{Hash, ScpEnvelope};
 use tracing::{debug, trace};
 
 /// Type of item being fetched.
@@ -735,7 +735,7 @@ pub struct ItemFetcherStats {
 /// Uses the same approach as stellar-core: BLAKE2b-256 of the StellarMessage wrapping the envelope.
 fn compute_envelope_hash(env: &ScpEnvelope) -> Hash {
     // Create a StellarMessage::ScpMessage wrapping the envelope
-    let msg = stellar_xdr::curr::StellarMessage::ScpMessage(env.clone());
+    let msg = stellar_xdr::StellarMessage::ScpMessage(env.clone());
 
     // Serialize to XDR
     let xdr_bytes = henyey_common::xdr_to_bytes(&msg);
@@ -748,7 +748,7 @@ fn compute_envelope_hash(env: &ScpEnvelope) -> Hash {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use stellar_xdr::curr::{
+    use stellar_xdr::{
         NodeId, PublicKey, ScpNomination, ScpStatement, ScpStatementPledges, Signature, Uint256,
     };
 

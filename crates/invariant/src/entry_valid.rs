@@ -11,7 +11,7 @@
 //! (all Soroban entry forms, asset contract validation, etc.) is tracked
 //! as follow-up work.
 
-use stellar_xdr::curr::{
+use stellar_xdr::{
     AccountEntry, AccountEntryExt, AccountEntryExtensionV1Ext, ContractEvent, DataEntry,
     LedgerEntry, LedgerEntryData, LedgerEntryExt, OfferEntry, Operation, OperationResult,
     TrustLineAsset, TrustLineEntry, TrustLineEntryExt, TrustLineEntryV1Ext, TrustLineFlags,

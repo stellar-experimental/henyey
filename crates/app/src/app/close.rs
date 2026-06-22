@@ -6,7 +6,7 @@
 use std::sync::atomic::Ordering;
 
 use henyey_herder::{sync_recovery::SyncRecoveryCallback, HerderCallback};
-use stellar_xdr::curr::{ScpEnvelope, StellarValueExt, UpgradeType};
+use stellar_xdr::{ScpEnvelope, StellarValueExt, UpgradeType};
 
 use super::types::{decode_upgrades, PendingLedgerClose};
 use super::App;

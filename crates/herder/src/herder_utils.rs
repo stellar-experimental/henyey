@@ -9,7 +9,7 @@
 
 use henyey_common::Hash256;
 use henyey_scp::Slot;
-use stellar_xdr::curr::{
+use stellar_xdr::{
     Limits, NodeId, ReadXdr, ScpEnvelope, ScpStatement, StellarValue, StellarValueExt,
 };
 
@@ -30,7 +30,7 @@ use stellar_xdr::curr::{
 /// # Example
 ///
 /// ```ignore
-/// use stellar_xdr::curr::ScpStatement;
+/// use stellar_xdr::ScpStatement;
 /// use henyey_herder::get_stellar_values;
 ///
 /// let values = get_stellar_values(&statement);
@@ -62,7 +62,7 @@ pub fn get_stellar_values(statement: &ScpStatement) -> Vec<StellarValue> {
 /// # Example
 ///
 /// ```ignore
-/// use stellar_xdr::curr::ScpEnvelope;
+/// use stellar_xdr::ScpEnvelope;
 /// use henyey_herder::get_tx_set_hashes_from_envelope;
 ///
 /// let hashes = get_tx_set_hashes_from_envelope(&envelope);
@@ -131,7 +131,7 @@ pub fn get_validated_tx_set_hashes(envelope: &ScpEnvelope) -> Result<Vec<Hash256
 /// # Example
 ///
 /// ```ignore
-/// use stellar_xdr::curr::NodeId;
+/// use stellar_xdr::NodeId;
 /// use henyey_herder::to_short_string;
 ///
 /// let short = to_short_string(&node_id);
@@ -139,7 +139,7 @@ pub fn get_validated_tx_set_hashes(envelope: &ScpEnvelope) -> Result<Vec<Hash256
 /// ```
 pub fn to_short_string(node_id: &NodeId) -> String {
     match &node_id.0 {
-        stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(key) => {
+        stellar_xdr::PublicKey::PublicKeyTypeEd25519(key) => {
             // Convert to hex and take first 5 characters
             let hex = hex::encode(key.0);
             hex.chars().take(5).collect()
@@ -163,7 +163,7 @@ pub fn to_short_strkey(node_id: &NodeId) -> String {
     use stellar_strkey::ed25519::PublicKey as StrPublicKey;
 
     match &node_id.0 {
-        stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(key) => {
+        stellar_xdr::PublicKey::PublicKeyTypeEd25519(key) => {
             let strkey = StrPublicKey(key.0).to_string();
             strkey.chars().take(5).collect()
         }
@@ -193,7 +193,7 @@ pub(crate) async fn sleep_until_or_forever(instant: Option<tokio::time::Instant>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use stellar_xdr::curr::{
+    use stellar_xdr::{
         LedgerCloseValueSignature, Limits, ScpBallot, ScpNomination, ScpStatement,
         ScpStatementExternalize, ScpStatementPledges, Signature as XdrSignature, StellarValue,
         StellarValueExt, TimePoint, Uint256, Value, WriteXdr,
@@ -201,7 +201,7 @@ mod tests {
 
     fn make_test_stellar_value(tx_set_hash: [u8; 32], close_time: u64) -> StellarValue {
         StellarValue {
-            tx_set_hash: stellar_xdr::curr::Hash(tx_set_hash),
+            tx_set_hash: stellar_xdr::Hash(tx_set_hash),
             close_time: TimePoint(close_time),
             upgrades: vec![].try_into().unwrap(),
             ext: StellarValueExt::Basic,
@@ -211,9 +211,7 @@ mod tests {
     fn make_test_node_id(seed: u8) -> NodeId {
         let mut key = [0u8; 32];
         key[0] = seed;
-        NodeId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(Uint256(
-            key,
-        )))
+        NodeId(stellar_xdr::PublicKey::PublicKeyTypeEd25519(Uint256(key)))
     }
 
     fn encode_value(sv: &StellarValue) -> Value {
@@ -230,7 +228,7 @@ mod tests {
             node_id: make_test_node_id(1),
             slot_index: 1,
             pledges: ScpStatementPledges::Nominate(ScpNomination {
-                quorum_set_hash: stellar_xdr::curr::Hash([0u8; 32]),
+                quorum_set_hash: stellar_xdr::Hash([0u8; 32]),
                 votes: vec![encode_value(&sv1)].try_into().unwrap(),
                 accepted: vec![encode_value(&sv2)].try_into().unwrap(),
             }),
@@ -257,7 +255,7 @@ mod tests {
                     value: encode_value(&sv),
                 },
                 n_h: 1,
-                commit_quorum_set_hash: stellar_xdr::curr::Hash([0u8; 32]),
+                commit_quorum_set_hash: stellar_xdr::Hash([0u8; 32]),
             }),
         };
 
@@ -281,10 +279,10 @@ mod tests {
                         value: encode_value(&sv),
                     },
                     n_h: 1,
-                    commit_quorum_set_hash: stellar_xdr::curr::Hash([0u8; 32]),
+                    commit_quorum_set_hash: stellar_xdr::Hash([0u8; 32]),
                 }),
             },
-            signature: stellar_xdr::curr::Signature(vec![0u8; 64].try_into().unwrap()),
+            signature: stellar_xdr::Signature(vec![0u8; 64].try_into().unwrap()),
         };
 
         let hashes = get_tx_set_hashes_from_envelope(&envelope);
@@ -317,7 +315,7 @@ mod tests {
             node_id: make_test_node_id(1),
             slot_index: 1,
             pledges: ScpStatementPledges::Nominate(ScpNomination {
-                quorum_set_hash: stellar_xdr::curr::Hash([0u8; 32]),
+                quorum_set_hash: stellar_xdr::Hash([0u8; 32]),
                 votes: vec![Value(vec![1, 2, 3].try_into().unwrap())]
                     .try_into()
                     .unwrap(),
@@ -336,11 +334,11 @@ mod tests {
 
     fn make_signed_stellar_value(tx_set_hash: [u8; 32], close_time: u64) -> StellarValue {
         StellarValue {
-            tx_set_hash: stellar_xdr::curr::Hash(tx_set_hash),
+            tx_set_hash: stellar_xdr::Hash(tx_set_hash),
             close_time: TimePoint(close_time),
             upgrades: vec![].try_into().unwrap(),
             ext: StellarValueExt::Signed(LedgerCloseValueSignature {
-                node_id: NodeId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(Uint256(
+                node_id: NodeId(stellar_xdr::PublicKey::PublicKeyTypeEd25519(Uint256(
                     [0u8; 32],
                 ))),
                 signature: XdrSignature(vec![0u8; 64].try_into().unwrap()),
@@ -362,10 +360,10 @@ mod tests {
                         value: encode_value(&sv),
                     },
                     n_h: 1,
-                    commit_quorum_set_hash: stellar_xdr::curr::Hash([0u8; 32]),
+                    commit_quorum_set_hash: stellar_xdr::Hash([0u8; 32]),
                 }),
             },
-            signature: stellar_xdr::curr::Signature(vec![0u8; 64].try_into().unwrap()),
+            signature: stellar_xdr::Signature(vec![0u8; 64].try_into().unwrap()),
         };
 
         let result = get_validated_tx_set_hashes(&envelope);
@@ -390,10 +388,10 @@ mod tests {
                         value: encode_value(&sv),
                     },
                     n_h: 1,
-                    commit_quorum_set_hash: stellar_xdr::curr::Hash([0u8; 32]),
+                    commit_quorum_set_hash: stellar_xdr::Hash([0u8; 32]),
                 }),
             },
-            signature: stellar_xdr::curr::Signature(vec![0u8; 64].try_into().unwrap()),
+            signature: stellar_xdr::Signature(vec![0u8; 64].try_into().unwrap()),
         };
 
         let result = get_validated_tx_set_hashes(&envelope);
@@ -408,14 +406,14 @@ mod tests {
                 node_id: make_test_node_id(1),
                 slot_index: 1,
                 pledges: ScpStatementPledges::Nominate(ScpNomination {
-                    quorum_set_hash: stellar_xdr::curr::Hash([0u8; 32]),
+                    quorum_set_hash: stellar_xdr::Hash([0u8; 32]),
                     votes: vec![Value(vec![1, 2, 3].try_into().unwrap())]
                         .try_into()
                         .unwrap(),
                     accepted: vec![].try_into().unwrap(),
                 }),
             },
-            signature: stellar_xdr::curr::Signature(vec![0u8; 64].try_into().unwrap()),
+            signature: stellar_xdr::Signature(vec![0u8; 64].try_into().unwrap()),
         };
 
         let result = get_validated_tx_set_hashes(&envelope);
@@ -433,7 +431,7 @@ mod tests {
             node_id: make_test_node_id(1),
             slot_index: 1,
             pledges: ScpStatementPledges::Nominate(ScpNomination {
-                quorum_set_hash: stellar_xdr::curr::Hash([0u8; 32]),
+                quorum_set_hash: stellar_xdr::Hash([0u8; 32]),
                 votes: vec![encode_value(&signed_sv), encode_value(&basic_sv)]
                     .try_into()
                     .unwrap(),

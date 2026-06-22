@@ -1,6 +1,6 @@
 //! High-level database methods for SCP and bucket-list persistence.
 
-use stellar_xdr::curr::{ScpEnvelope, ScpQuorumSet};
+use stellar_xdr::{ScpEnvelope, ScpQuorumSet};
 
 use crate::{pool::Database, queries, Result};
 

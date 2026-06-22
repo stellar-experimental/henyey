@@ -16,7 +16,7 @@ impl App {
         )
     }
 
-    pub fn proposed_upgrades(&self) -> Vec<stellar_xdr::curr::LedgerUpgrade> {
+    pub fn proposed_upgrades(&self) -> Vec<stellar_xdr::LedgerUpgrade> {
         self.config.upgrades.to_ledger_upgrades()
     }
 
@@ -46,7 +46,7 @@ impl App {
     /// * `Err` - I/O error or invariant violation reading from ledger
     pub fn get_config_upgrade_set(
         &self,
-        key: &stellar_xdr::curr::ConfigUpgradeSetKey,
+        key: &stellar_xdr::ConfigUpgradeSetKey,
     ) -> Result<Option<serde_json::Value>, henyey_ledger::LedgerError> {
         let frame = match self.ledger_manager.get_config_upgrade_set(key)? {
             Some(f) => f,

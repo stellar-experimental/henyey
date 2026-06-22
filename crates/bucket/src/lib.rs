@@ -63,7 +63,7 @@
 //!
 //! ```ignore
 //! use henyey_bucket::{BucketList, BucketManager};
-//! use stellar_xdr::curr::BucketListType;
+//! use stellar_xdr::BucketListType;
 //!
 //! // Create a bucket manager for disk storage
 //! let manager = BucketManager::new("/tmp/buckets".into())?;
@@ -287,7 +287,7 @@ pub type Result<T> = std::result::Result<T, BucketError>;
 mod tests {
     use super::*;
     use crate::BucketEntry;
-    use stellar_xdr::curr::*; // Re-import to shadow XDR's BucketEntry
+    use stellar_xdr::*; // Re-import to shadow XDR's BucketEntry
 
     const TEST_PROTOCOL: u32 = 25;
 

@@ -14,7 +14,7 @@ use std::sync::{Mutex, RwLock};
 use henyey_common::Hash256;
 use henyey_crypto::RandomEvictionCache;
 use henyey_scp::hash_quorum_set;
-use stellar_xdr::curr::{NodeId, PublicKey, ScpQuorumSet};
+use stellar_xdr::{NodeId, PublicKey, ScpQuorumSet};
 use tracing::{debug, info, trace};
 
 use super::scp_driver::PendingQuorumSet;
@@ -305,7 +305,7 @@ impl QuorumSetTracker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use stellar_xdr::curr::{ScpQuorumSet, Uint256, VecM};
+    use stellar_xdr::{ScpQuorumSet, Uint256, VecM};
 
     fn make_node_id(seed: u8) -> NodeId {
         NodeId(PublicKey::PublicKeyTypeEd25519(Uint256([seed; 32])))

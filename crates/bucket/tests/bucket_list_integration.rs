@@ -8,7 +8,7 @@ use henyey_bucket::{
     HotArchiveBucketList,
 };
 use henyey_common::Hash256;
-use stellar_xdr::curr::*;
+use stellar_xdr::*;
 
 const TEST_PROTOCOL: u32 = 25;
 
@@ -920,7 +920,7 @@ async fn test_eviction_scan_shadowed_entries_not_evicted() {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_eviction_scan_incremental() {
     use henyey_bucket::EvictionIterator;
-    use stellar_xdr::curr::StateArchivalSettings;
+    use stellar_xdr::StateArchivalSettings;
 
     let mut bl = BucketList::new();
 
@@ -2003,7 +2003,7 @@ async fn test_scan_for_entries_of_types_soroban_combined() {
 #[tokio::test]
 async fn test_eviction_scan_zero_budget_does_not_advance_iterator() {
     use henyey_bucket::EvictionIterator;
-    use stellar_xdr::curr::StateArchivalSettings;
+    use stellar_xdr::StateArchivalSettings;
 
     let mut bl = BucketList::new();
 

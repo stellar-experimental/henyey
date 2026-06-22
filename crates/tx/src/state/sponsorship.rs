@@ -617,8 +617,7 @@ impl LedgerStateManager {
         }
 
         // Create the pre-auth TX signer key from the transaction hash
-        let signer_key =
-            stellar_xdr::curr::SignerKey::PreAuthTx(stellar_xdr::curr::Uint256(tx_hash.0));
+        let signer_key = stellar_xdr::SignerKey::PreAuthTx(stellar_xdr::Uint256(tx_hash.0));
 
         // Remove from each source account
         for account_id in source_accounts {
@@ -644,7 +643,7 @@ impl LedgerStateManager {
     pub fn remove_account_signer(
         &mut self,
         account_id: &AccountId,
-        signer_key: &stellar_xdr::curr::SignerKey,
+        signer_key: &stellar_xdr::SignerKey,
     ) -> Result<bool> {
         // ── Phase 1: Validate (fallible, no observable mutations) ────────
 
@@ -785,7 +784,7 @@ fn check_num_sponsoring_overflow(account: &AccountEntry, delta: i64) -> Result<(
 mod tests {
     use super::*;
     use crate::test_utils::{create_test_account_id, create_test_account_with_sponsorship};
-    use stellar_xdr::curr::{
+    use stellar_xdr::{
         AccountEntryExt, AccountEntryExtensionV1Ext, Signer, SignerKey, SponsorshipDescriptor,
         Uint256,
     };
@@ -1298,9 +1297,9 @@ mod tests {
         let mut state = LedgerStateManager::new(5_000_000, 100);
         let mut hash = [0u8; 32];
         hash[0] = 99;
-        let key = LedgerKey::ClaimableBalance(stellar_xdr::curr::LedgerKeyClaimableBalance {
-            balance_id: stellar_xdr::curr::ClaimableBalanceId::ClaimableBalanceIdTypeV0(
-                stellar_xdr::curr::Hash(hash),
+        let key = LedgerKey::ClaimableBalance(stellar_xdr::LedgerKeyClaimableBalance {
+            balance_id: stellar_xdr::ClaimableBalanceId::ClaimableBalanceIdTypeV0(
+                stellar_xdr::Hash(hash),
             ),
         });
         // No sponsor set for this key
@@ -1336,9 +1335,9 @@ mod tests {
         ));
 
         // Use a trustline key (a subentry type that requires num_sub_entries check)
-        let key = LedgerKey::Trustline(stellar_xdr::curr::LedgerKeyTrustLine {
+        let key = LedgerKey::Trustline(stellar_xdr::LedgerKeyTrustLine {
             account_id: owner_id.clone(),
-            asset: stellar_xdr::curr::TrustLineAsset::Native,
+            asset: stellar_xdr::TrustLineAsset::Native,
         });
         state.set_entry_sponsor(key.clone(), sponsor_id.clone());
 
@@ -1359,22 +1358,20 @@ mod tests {
 
     /// Helper: build a trustline ledger key for tests.
     fn trustline_key(owner: &AccountId, asset_seed: u8) -> LedgerKey {
-        LedgerKey::Trustline(stellar_xdr::curr::LedgerKeyTrustLine {
+        LedgerKey::Trustline(stellar_xdr::LedgerKeyTrustLine {
             account_id: owner.clone(),
-            asset: stellar_xdr::curr::TrustLineAsset::CreditAlphanum4(
-                stellar_xdr::curr::AlphaNum4 {
-                    asset_code: stellar_xdr::curr::AssetCode4([asset_seed, 0, 0, 0]),
-                    issuer: create_test_account_id(200),
-                },
-            ),
+            asset: stellar_xdr::TrustLineAsset::CreditAlphanum4(stellar_xdr::AlphaNum4 {
+                asset_code: stellar_xdr::AssetCode4([asset_seed, 0, 0, 0]),
+                issuer: create_test_account_id(200),
+            }),
         })
     }
 
     /// Helper: build a claimable balance ledger key for tests.
     fn cb_key(seed: u8) -> LedgerKey {
-        LedgerKey::ClaimableBalance(stellar_xdr::curr::LedgerKeyClaimableBalance {
-            balance_id: stellar_xdr::curr::ClaimableBalanceId::ClaimableBalanceIdTypeV0(
-                stellar_xdr::curr::Hash([seed; 32]),
+        LedgerKey::ClaimableBalance(stellar_xdr::LedgerKeyClaimableBalance {
+            balance_id: stellar_xdr::ClaimableBalanceId::ClaimableBalanceIdTypeV0(
+                stellar_xdr::Hash([seed; 32]),
             ),
         })
     }
@@ -1946,7 +1943,7 @@ mod tests {
     /// Post-fix: completes successfully, clears metadata, decrements all counts.
     #[test]
     fn test_l62759194_replay_subentry_removal_uses_phase1_sponsor_snapshot() {
-        use stellar_xdr::curr::{LedgerKeyOffer, OfferEntry, OfferEntryExt, Price};
+        use stellar_xdr::{LedgerKeyOffer, OfferEntry, OfferEntryExt, Price};
 
         let mut state = LedgerStateManager::new(5_000_000, 100);
 
@@ -2094,7 +2091,7 @@ mod tests {
     /// the Phase-1 captured sponsor snapshot.
     #[test]
     fn test_remove_sponsored_claimable_balance_uses_phase1_sponsor_snapshot() {
-        use stellar_xdr::curr::{ClaimableBalanceId, Hash, LedgerKeyClaimableBalance};
+        use stellar_xdr::{ClaimableBalanceId, Hash, LedgerKeyClaimableBalance};
 
         let mut state = LedgerStateManager::new(5_000_000, 100);
         let sponsor_id = create_test_account_id(240);
@@ -2131,7 +2128,7 @@ mod tests {
     /// must use the Phase-1 captured sponsor snapshot.
     #[test]
     fn test_remove_entry_sponsorship_and_update_counts_uses_phase1_sponsor_snapshot() {
-        use stellar_xdr::curr::{LedgerKeyOffer, OfferEntry, OfferEntryExt, Price};
+        use stellar_xdr::{LedgerKeyOffer, OfferEntry, OfferEntryExt, Price};
 
         let mut state = LedgerStateManager::new(5_000_000, 100);
 

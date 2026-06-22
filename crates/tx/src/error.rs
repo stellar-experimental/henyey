@@ -79,7 +79,7 @@ pub enum TxError {
 
     /// XDR error.
     #[error("XDR error: {0}")]
-    Xdr(#[from] stellar_xdr::curr::Error),
+    Xdr(#[from] stellar_xdr::Error),
 
     /// Checked arithmetic error (balance overflow, underflow, etc.).
     #[error("balance error: {0}")]

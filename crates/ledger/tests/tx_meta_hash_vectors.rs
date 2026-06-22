@@ -1,7 +1,7 @@
 use henyey_common::entry_to_key;
 use henyey_common::normalize_transaction_meta;
 use henyey_crypto::{seed, xdr_compute_hash};
-use stellar_xdr::curr::{
+use stellar_xdr::{
     AccountEntry, AccountEntryExt, ExtensionPoint, LedgerEntry, LedgerEntryChange,
     LedgerEntryChanges, LedgerEntryData, LedgerEntryExt, OperationMetaV2, PublicKey, String32,
     Thresholds, TransactionMeta, TransactionMetaV4, Uint256, VecM,
@@ -10,9 +10,9 @@ use stellar_xdr::curr::{
 fn account_entry(id_byte: u8, balance: i64) -> LedgerEntry {
     let account_id = PublicKey::PublicKeyTypeEd25519(Uint256([id_byte; 32]));
     let account = AccountEntry {
-        account_id: stellar_xdr::curr::AccountId(account_id),
+        account_id: stellar_xdr::AccountId(account_id),
         balance,
-        seq_num: stellar_xdr::curr::SequenceNumber(1),
+        seq_num: stellar_xdr::SequenceNumber(1),
         num_sub_entries: 0,
         inflation_dest: None,
         flags: 0,

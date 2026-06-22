@@ -259,10 +259,10 @@ impl App {
                 .get_ledger_header(seq)?
                 .ok_or_else(|| anyhow::anyhow!("Missing ledger header {}", seq))?;
             let hash = henyey_ledger::compute_header_hash(&header)?;
-            headers.push(stellar_xdr::curr::LedgerHeaderHistoryEntry {
+            headers.push(stellar_xdr::LedgerHeaderHistoryEntry {
                 header,
-                hash: stellar_xdr::curr::Hash(hash.0),
-                ext: stellar_xdr::curr::LedgerHeaderHistoryEntryExt::V0,
+                hash: stellar_xdr::Hash(hash.0),
+                ext: stellar_xdr::LedgerHeaderHistoryEntryExt::V0,
             });
 
             let tx_entry = self.db.get_tx_history_entry(seq)?;
@@ -464,10 +464,10 @@ impl App {
         &self,
         start_ledger: u32,
         checkpoint: u32,
-    ) -> anyhow::Result<Vec<stellar_xdr::curr::ScpHistoryEntry>> {
+    ) -> anyhow::Result<Vec<stellar_xdr::ScpHistoryEntry>> {
         use henyey_common::Hash256;
         use std::collections::HashSet;
-        use stellar_xdr::curr::{LedgerScpMessages, ScpHistoryEntry, ScpHistoryEntryV0};
+        use stellar_xdr::{LedgerScpMessages, ScpHistoryEntry, ScpHistoryEntryV0};
 
         let mut entries = Vec::new();
         for seq in start_ledger..=checkpoint {
@@ -523,7 +523,7 @@ impl App {
 fn write_scp_history_file(
     base_dir: &std::path::Path,
     checkpoint: u32,
-    entries: &[stellar_xdr::curr::ScpHistoryEntry],
+    entries: &[stellar_xdr::ScpHistoryEntry],
 ) -> anyhow::Result<()> {
     use henyey_history::paths::checkpoint_path;
 
@@ -550,7 +550,7 @@ mod tests {
     use henyey_db::schema::state_keys;
     use henyey_history::publish::build_history_archive_state;
     use henyey_ledger::TransactionSetVariant;
-    use stellar_xdr::curr::{
+    use stellar_xdr::{
         Hash, LedgerHeader, LedgerHeaderExt, Limits, StellarValue, StellarValueExt,
         TransactionHistoryEntry, TransactionHistoryEntryExt, TransactionHistoryResultEntry,
         TransactionHistoryResultEntryExt, TransactionResultSet, TransactionSet, VecM, WriteXdr,
@@ -599,7 +599,7 @@ mod tests {
             previous_ledger_hash: Hash(previous_ledger_hash.0),
             scp_value: StellarValue {
                 tx_set_hash: Hash(tx_set_hash.0),
-                close_time: stellar_xdr::curr::TimePoint(seq as u64),
+                close_time: stellar_xdr::TimePoint(seq as u64),
                 upgrades: VecM::default(),
                 ext: StellarValueExt::Basic,
             },
@@ -842,7 +842,7 @@ mod tests {
             .add_batch(
                 1,
                 0,
-                stellar_xdr::curr::BucketListType::Live,
+                stellar_xdr::BucketListType::Live,
                 genesis_entries.clone(),
                 vec![],
                 vec![],
@@ -862,7 +862,7 @@ mod tests {
             bl.add_batch(
                 1,
                 0,
-                stellar_xdr::curr::BucketListType::Live,
+                stellar_xdr::BucketListType::Live,
                 genesis_entries,
                 vec![],
                 vec![],
@@ -1094,11 +1094,11 @@ mod tests {
         use tempfile::TempDir;
 
         let tmp = TempDir::new().unwrap();
-        let entry = stellar_xdr::curr::ScpHistoryEntry::V0(stellar_xdr::curr::ScpHistoryEntryV0 {
-            quorum_sets: stellar_xdr::curr::VecM::default(),
-            ledger_messages: stellar_xdr::curr::LedgerScpMessages {
+        let entry = stellar_xdr::ScpHistoryEntry::V0(stellar_xdr::ScpHistoryEntryV0 {
+            quorum_sets: stellar_xdr::VecM::default(),
+            ledger_messages: stellar_xdr::LedgerScpMessages {
                 ledger_seq: 63,
-                messages: stellar_xdr::curr::VecM::default(),
+                messages: stellar_xdr::VecM::default(),
             },
         });
 

@@ -33,7 +33,7 @@ use henyey_ledger::{
     compute_header_hash, CloseLedgerState, ConfigUpgradeSetFrame, LedgerCloseData, LedgerManager,
     LedgerManagerConfig, SnapshotBuilder, SnapshotHandle, TransactionSetVariant, UpgradeContext,
 };
-use stellar_xdr::curr::{
+use stellar_xdr::{
     ConfigSettingEntry, ConfigSettingId, ConfigUpgradeSet, ConfigUpgradeSetKey,
     ContractDataDurability, ContractId, Hash, LedgerEntry, LedgerEntryData, LedgerEntryExt,
     LedgerHeader, LedgerHeaderExt, LedgerKey, LedgerKeyConfigSetting, LedgerKeyContractData,
@@ -145,8 +145,8 @@ fn make_config_upgrade_entry(
     let xdr_bytes = upgrade_set.to_xdr(Limits::none()).expect("encode");
     LedgerEntry {
         last_modified_ledger_seq: ledger_seq,
-        data: LedgerEntryData::ContractData(stellar_xdr::curr::ContractDataEntry {
-            ext: stellar_xdr::curr::ExtensionPoint::V0,
+        data: LedgerEntryData::ContractData(stellar_xdr::ContractDataEntry {
+            ext: stellar_xdr::ExtensionPoint::V0,
             contract: ScAddress::Contract(upgrade_key.contract_id.clone()),
             key: ScVal::Bytes(
                 upgrade_key
@@ -859,7 +859,7 @@ async fn test_failed_config_upgrade_does_not_abort_ledger_close() {
     }
 }
 
-use stellar_xdr::curr::{
+use stellar_xdr::{
     ContractCostParamEntry, ContractCostParams, ExtensionPoint, LedgerCloseMeta, LedgerEntryChange,
 };
 
@@ -1085,7 +1085,7 @@ async fn test_config_upgrade_memory_cost_state_size_recompute_in_meta() {
 
 use henyey_common::NetworkId;
 use henyey_crypto::{sign_hash, SecretKey};
-use stellar_xdr::curr::{
+use stellar_xdr::{
     AccountEntry, AccountEntryExt, AccountEntryExtensionV1, AccountEntryExtensionV1Ext, AccountId,
     Asset, BucketListType, BumpSequenceOp, DecoratedSignature, LedgerKeyOffer, LedgerKeyTrustLine,
     Liabilities, Memo, MuxedAccount, OfferEntry, Operation, OperationBody, Preconditions, Price,
@@ -1143,7 +1143,7 @@ fn make_native_sell_offer(
             amount,
             price: Price { n: 1, d: 1 },
             flags: 0,
-            ext: stellar_xdr::curr::OfferEntryExt::V0,
+            ext: stellar_xdr::OfferEntryExt::V0,
         }),
         ext: LedgerEntryExt::V0,
     }
@@ -1230,12 +1230,12 @@ fn test_base_reserve_upgrade_prepare_liabilities_meta() {
     )));
 
     // The non-native asset for the offer's buying side.
-    let buying_asset = Asset::CreditAlphanum4(stellar_xdr::curr::AlphaNum4 {
-        asset_code: stellar_xdr::curr::AssetCode4(*b"TEST"),
+    let buying_asset = Asset::CreditAlphanum4(stellar_xdr::AlphaNum4 {
+        asset_code: stellar_xdr::AssetCode4(*b"TEST"),
         issuer: account_id_b.clone(),
     });
-    let tl_asset = TrustLineAsset::CreditAlphanum4(stellar_xdr::curr::AlphaNum4 {
-        asset_code: stellar_xdr::curr::AssetCode4(*b"TEST"),
+    let tl_asset = TrustLineAsset::CreditAlphanum4(stellar_xdr::AlphaNum4 {
+        asset_code: stellar_xdr::AssetCode4(*b"TEST"),
         issuer: account_id_b.clone(),
     });
 
@@ -1642,7 +1642,7 @@ async fn test_apply_config_upgrade_variant_mutates_state() {
 
     // Build a valid ConfigUpgradeSet that changes ContractComputeV0.
     let proposed =
-        ConfigSettingEntry::ContractComputeV0(stellar_xdr::curr::ConfigSettingContractComputeV0 {
+        ConfigSettingEntry::ContractComputeV0(stellar_xdr::ConfigSettingContractComputeV0 {
             ledger_max_instructions: 222_000_000,
             tx_max_instructions: 10_000_000,
             fee_rate_per_instructions_increment: 100,

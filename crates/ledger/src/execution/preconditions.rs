@@ -11,7 +11,7 @@ use henyey_tx::{
     validation::{self, LedgerContext as ValidationContext},
     TransactionFrame,
 };
-use stellar_xdr::curr::{Preconditions, TransactionEnvelope, TransactionResultCode};
+use stellar_xdr::{Preconditions, TransactionEnvelope, TransactionResultCode};
 
 use crate::snapshot::SnapshotHandle;
 use crate::{LedgerError, Result};
@@ -180,7 +180,7 @@ impl TransactionExecutor {
                 .envelope()
             {
                 TransactionEnvelope::TxFeeBump(env) => match &env.tx.inner_tx {
-                    stellar_xdr::curr::FeeBumpTransactionInnerTx::Tx(inner) => {
+                    stellar_xdr::FeeBumpTransactionInnerTx::Tx(inner) => {
                         let inner_env = TransactionEnvelope::Tx(inner.clone());
                         let inner_frame =
                             TransactionFrame::from_owned_with_network(inner_env, self.network_id);

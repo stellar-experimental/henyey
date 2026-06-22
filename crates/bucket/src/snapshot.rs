@@ -55,7 +55,7 @@ use crate::{
 use parking_lot::RwLock;
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
-use stellar_xdr::curr::{
+use stellar_xdr::{
     AccountId, Asset, HotArchiveBucketEntry, LedgerEntry, LedgerEntryData, LedgerEntryType,
     LedgerHeader, LedgerKey, LedgerKeyTrustLine, PoolId, StateArchivalSettings, TrustLineAsset,
 };
@@ -402,7 +402,7 @@ impl BucketListSnapshot {
             return Ok(None);
         }
 
-        use stellar_xdr::curr::{Limits, WriteXdr};
+        use stellar_xdr::{Limits, WriteXdr};
         let key_bytes = key.to_xdr(Limits::none()).map_err(|e| {
             crate::BucketError::Serialization(format!("Failed to serialize key: {}", e))
         })?;
@@ -431,7 +431,7 @@ impl BucketListSnapshot {
     ///
     /// OFFER keys are skipped (matching stellar-core's `typeNotSupported`).
     pub fn load_keys_result(&self, keys: &[LedgerKey]) -> crate::Result<Vec<LedgerEntry>> {
-        use stellar_xdr::curr::{Limits, WriteXdr};
+        use stellar_xdr::{Limits, WriteXdr};
 
         let mut result = Vec::with_capacity(keys.len());
 
@@ -1051,7 +1051,7 @@ impl SearchableBucketListSnapshot {
                                 }
 
                                 // Check if pool contains the asset
-                                let stellar_xdr::curr::LiquidityPoolEntryBody::LiquidityPoolConstantProduct(
+                                let stellar_xdr::LiquidityPoolEntryBody::LiquidityPoolConstantProduct(
                                     cp,
                                 ) = &pool.body;
                                 if &cp.params.asset_a == asset || &cp.params.asset_b == asset {
@@ -1444,7 +1444,7 @@ impl BucketSnapshotManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use stellar_xdr::curr::*;
+    use stellar_xdr::*;
 
     fn make_test_header(ledger_seq: u32) -> LedgerHeader {
         LedgerHeader {

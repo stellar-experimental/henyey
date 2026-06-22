@@ -36,7 +36,7 @@
 
 use henyey_common::NetworkId;
 use henyey_crypto::PublicKey as StrKeyPublicKey;
-use stellar_xdr::curr::{
+use stellar_xdr::{
     AccountId, Asset, ClaimableBalanceId, ContractDataDurability, ContractEvent, ContractEventBody,
     ContractEventType, ContractEventV0, ContractId, ContractIdPreimage, Hash, HashIdPreimage,
     HashIdPreimageContractId, Int128Parts, LedgerEntry, LedgerEntryData, LedgerKey, Limits, Memo,
@@ -161,7 +161,7 @@ impl OpEventManager {
     pub fn events_for_claim_atoms(
         &mut self,
         source: &MuxedAccount,
-        claim_atoms: &[stellar_xdr::curr::ClaimAtom],
+        claim_atoms: &[stellar_xdr::ClaimAtom],
     ) {
         if !self.enabled || self.finalized {
             return;
@@ -169,7 +169,7 @@ impl OpEventManager {
         let source_addr = make_muxed_account_address(source);
         for atom in claim_atoms {
             match atom {
-                stellar_xdr::curr::ClaimAtom::OrderBook(claim) => {
+                stellar_xdr::ClaimAtom::OrderBook(claim) => {
                     let seller = make_account_address(&claim.seller_id);
                     self.event_for_transfer_with_issuer_check(
                         &claim.asset_bought,
@@ -186,7 +186,7 @@ impl OpEventManager {
                         false,
                     );
                 }
-                stellar_xdr::curr::ClaimAtom::LiquidityPool(claim) => {
+                stellar_xdr::ClaimAtom::LiquidityPool(claim) => {
                     let pool = ScAddress::LiquidityPool(claim.liquidity_pool_id.clone());
                     self.event_for_transfer_with_issuer_check(
                         &claim.asset_bought,
@@ -203,7 +203,7 @@ impl OpEventManager {
                         false,
                     );
                 }
-                stellar_xdr::curr::ClaimAtom::V0(claim) => {
+                stellar_xdr::ClaimAtom::V0(claim) => {
                     let seller = ScAddress::Account(AccountId::from(
                         XdrPublicKey::PublicKeyTypeEd25519(claim.seller_ed25519.clone()),
                     ));
@@ -743,7 +743,7 @@ pub fn make_claimable_balance_address(balance_id: &ClaimableBalanceId) -> ScAddr
 fn make_event(contract_id: ContractId, topics: Vec<ScVal>, data: ScVal) -> ContractEvent {
     let topics: Vec<ScVal> = topics;
     ContractEvent {
-        ext: stellar_xdr::curr::ExtensionPoint::V0,
+        ext: stellar_xdr::ExtensionPoint::V0,
         contract_id: Some(contract_id),
         type_: ContractEventType::Contract,
         body: ContractEventBody::V0(ContractEventV0 {
@@ -1201,22 +1201,22 @@ fn get_asset_from_event(event: &ContractEvent, network_id: &NetworkId) -> Option
         Asset::Native
     } else if let Some((code, issuer_str)) = asset_str.split_once(':') {
         let issuer_pk = StrKeyPublicKey::from_strkey(issuer_str).ok()?;
-        let issuer = AccountId::from(XdrPublicKey::PublicKeyTypeEd25519(
-            stellar_xdr::curr::Uint256(*issuer_pk.as_bytes()),
-        ));
+        let issuer = AccountId::from(XdrPublicKey::PublicKeyTypeEd25519(stellar_xdr::Uint256(
+            *issuer_pk.as_bytes(),
+        )));
         let code_bytes = code.as_bytes();
         if code_bytes.len() <= 4 {
             let mut buf = [0u8; 4];
             buf[..code_bytes.len()].copy_from_slice(code_bytes);
-            Asset::CreditAlphanum4(stellar_xdr::curr::AlphaNum4 {
-                asset_code: stellar_xdr::curr::AssetCode4(buf),
+            Asset::CreditAlphanum4(stellar_xdr::AlphaNum4 {
+                asset_code: stellar_xdr::AssetCode4(buf),
                 issuer,
             })
         } else if code_bytes.len() <= 12 {
             let mut buf = [0u8; 12];
             buf[..code_bytes.len()].copy_from_slice(code_bytes);
-            Asset::CreditAlphanum12(stellar_xdr::curr::AlphaNum12 {
-                asset_code: stellar_xdr::curr::AssetCode12(buf),
+            Asset::CreditAlphanum12(stellar_xdr::AlphaNum12 {
+                asset_code: stellar_xdr::AssetCode12(buf),
                 issuer,
             })
         } else {
@@ -1293,22 +1293,22 @@ fn backfill_event(event: &mut ContractEvent, network_id: &NetworkId) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use stellar_xdr::curr::{MuxedAccountMed25519, PublicKey, Uint256};
+    use stellar_xdr::{MuxedAccountMed25519, PublicKey, Uint256};
 
     fn test_account_id(seed: u8) -> AccountId {
         AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([seed; 32])))
     }
 
     fn test_asset_alphanum4(seed: u8) -> Asset {
-        Asset::CreditAlphanum4(stellar_xdr::curr::AlphaNum4 {
-            asset_code: stellar_xdr::curr::AssetCode4([b'U', b'S', b'D', 0]),
+        Asset::CreditAlphanum4(stellar_xdr::AlphaNum4 {
+            asset_code: stellar_xdr::AssetCode4([b'U', b'S', b'D', 0]),
             issuer: test_account_id(seed),
         })
     }
 
     fn test_asset_alphanum12(seed: u8) -> Asset {
-        Asset::CreditAlphanum12(stellar_xdr::curr::AlphaNum12 {
-            asset_code: stellar_xdr::curr::AssetCode12([
+        Asset::CreditAlphanum12(stellar_xdr::AlphaNum12 {
+            asset_code: stellar_xdr::AssetCode12([
                 b'L', b'O', b'N', b'G', b'A', b'S', b'S', b'E', b'T', 0, 0, 0,
             ]),
             issuer: test_account_id(seed),
@@ -1668,7 +1668,7 @@ mod tests {
         );
 
         let event = ContractEvent {
-            ext: stellar_xdr::curr::ExtensionPoint::V0,
+            ext: stellar_xdr::ExtensionPoint::V0,
             contract_id: None,
             type_: ContractEventType::Contract,
             body: ContractEventBody::V0(ContractEventV0 {
@@ -2260,7 +2260,7 @@ mod tests {
     // Protocol 23 SAC mint/burn event reconciler tests (issue #3126).
     // ====================================================================
 
-    use stellar_xdr::curr::{
+    use stellar_xdr::{
         ContractDataEntry, ExtensionPoint, LedgerEntryExt, ScSymbol as XdrScSymbol, ScVec, WriteXdr,
     };
 
@@ -2415,17 +2415,17 @@ mod tests {
         // An account entry is not CONTRACT_DATA → None even if the key matched.
         let account_entry = LedgerEntry {
             last_modified_ledger_seq: 0,
-            data: LedgerEntryData::Account(stellar_xdr::curr::AccountEntry {
+            data: LedgerEntryData::Account(stellar_xdr::AccountEntry {
                 account_id: test_account_id(1),
                 balance: 0,
-                seq_num: stellar_xdr::curr::SequenceNumber(0),
+                seq_num: stellar_xdr::SequenceNumber(0),
                 num_sub_entries: 0,
                 inflation_dest: None,
                 flags: 0,
                 home_domain: Default::default(),
-                thresholds: stellar_xdr::curr::Thresholds([0; 4]),
+                thresholds: stellar_xdr::Thresholds([0; 4]),
                 signers: Default::default(),
-                ext: stellar_xdr::curr::AccountEntryExt::V0,
+                ext: stellar_xdr::AccountEntryExt::V0,
             }),
             ext: LedgerEntryExt::V0,
         };

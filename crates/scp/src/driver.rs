@@ -40,7 +40,7 @@
 use std::time::Duration;
 
 use henyey_common::Hash256;
-use stellar_xdr::curr::{NodeId, ScpBallot, ScpEnvelope, ScpQuorumSet, Value};
+use stellar_xdr::{NodeId, ScpBallot, ScpEnvelope, ScpQuorumSet, Value};
 
 /// Type of SCP timer.
 ///
@@ -184,7 +184,7 @@ impl ValidationLevel {
 /// which produces the exact wire bytes stellar-core's `xdr::xdr_to_opaque`
 /// produces for these types. Kept as a free function (not a trait method) so it
 /// does not widen the public trait surface.
-fn scp_xdr_bytes<T: stellar_xdr::curr::WriteXdr>(value: &T) -> Vec<u8> {
+fn scp_xdr_bytes<T: stellar_xdr::WriteXdr>(value: &T) -> Vec<u8> {
     henyey_common::xdr_stream::xdr_to_bytes(value)
 }
 
@@ -790,7 +790,7 @@ mod tests {
 #[cfg(test)]
 mod default_hash_tests {
     use super::*;
-    use stellar_xdr::curr::{BytesM, Limits, PublicKey, Uint256, WriteXdr};
+    use stellar_xdr::{BytesM, Limits, PublicKey, Uint256, WriteXdr};
 
     /// A minimal `SCPDriver` impl that does NOT override `compute_hash_node`
     /// or `compute_value_hash`, so it exercises the trait DEFAULTS.

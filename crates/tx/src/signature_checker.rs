@@ -38,7 +38,7 @@
 use henyey_common::Hash256;
 use henyey_crypto::Signature;
 use std::collections::HashMap;
-use stellar_xdr::curr::{DecoratedSignature, Signer, SignerKey, SignerKeyType};
+use stellar_xdr::{DecoratedSignature, Signer, SignerKey, SignerKeyType};
 
 /// Signature checker that tracks which signatures have been used and
 /// accumulates weights when checking against account signers.
@@ -300,7 +300,7 @@ fn verify_ed25519_signed_payload(sig: &DecoratedSignature, signer: &Signer) -> b
 ///
 /// Creates a signer list from the account's explicit signers plus the master
 /// key (using the account's master weight from `thresholds[0]`).
-pub fn collect_signers_for_account(account: &stellar_xdr::curr::AccountEntry) -> Vec<Signer> {
+pub fn collect_signers_for_account(account: &stellar_xdr::AccountEntry) -> Vec<Signer> {
     let mut signers: Vec<Signer> = account.signers.to_vec();
 
     // Add the master key as a signer with weight from thresholds[0]
@@ -308,7 +308,7 @@ pub fn collect_signers_for_account(account: &stellar_xdr::curr::AccountEntry) ->
     if master_weight > 0 {
         // Extract the Ed25519 key bytes from the PublicKey
         let key_bytes = match &account.account_id.0 {
-            stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(key) => key.clone(),
+            stellar_xdr::PublicKey::PublicKeyTypeEd25519(key) => key.clone(),
         };
         signers.push(Signer {
             key: SignerKey::Ed25519(key_bytes),
@@ -323,7 +323,7 @@ pub fn collect_signers_for_account(account: &stellar_xdr::curr::AccountEntry) ->
 mod tests {
     use super::*;
     use henyey_crypto::{sign_hash, SecretKey};
-    use stellar_xdr::curr::{
+    use stellar_xdr::{
         AccountEntry, AccountEntryExt, AccountId, PublicKey as XdrPublicKey,
         Signature as XdrSignature, SignatureHint, Thresholds, Uint256,
     };
@@ -503,11 +503,11 @@ mod tests {
         let account = AccountEntry {
             account_id: AccountId(XdrPublicKey::PublicKeyTypeEd25519(master_key_bytes.clone())),
             balance: 1000,
-            seq_num: stellar_xdr::curr::SequenceNumber(1),
+            seq_num: stellar_xdr::SequenceNumber(1),
             num_sub_entries: 0,
             inflation_dest: None,
             flags: 0,
-            home_domain: stellar_xdr::curr::String32::default(),
+            home_domain: stellar_xdr::String32::default(),
             thresholds: Thresholds([10, 1, 2, 3]), // Master weight = 10
             signers: vec![extra_signer.clone()].try_into().unwrap(),
             ext: AccountEntryExt::V0,
@@ -554,11 +554,11 @@ mod tests {
         let account = AccountEntry {
             account_id: AccountId(XdrPublicKey::PublicKeyTypeEd25519(master_key_bytes.clone())),
             balance: 1000,
-            seq_num: stellar_xdr::curr::SequenceNumber(1),
+            seq_num: stellar_xdr::SequenceNumber(1),
             num_sub_entries: 0,
             inflation_dest: None,
             flags: 0,
-            home_domain: stellar_xdr::curr::String32::default(),
+            home_domain: stellar_xdr::String32::default(),
             thresholds: Thresholds([0, 1, 2, 3]), // Master weight = 0
             signers: vec![].try_into().unwrap(),
             ext: AccountEntryExt::V0,

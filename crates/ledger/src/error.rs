@@ -58,7 +58,7 @@ pub enum LedgerError {
 
     /// XDR encoding or decoding error.
     #[error("XDR error: {0}")]
-    Xdr(#[from] stellar_xdr::curr::Error),
+    Xdr(#[from] stellar_xdr::Error),
 
     /// Generic serialization error.
     #[error("serialization error: {0}")]

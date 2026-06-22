@@ -1,6 +1,6 @@
 //! Shared ScVal construction helpers for events and transaction meta.
 
-use stellar_xdr::curr::{ScString, ScSymbol, ScVal, StringM};
+use stellar_xdr::{ScString, ScSymbol, ScVal, StringM};
 
 /// Create a ScVal::Symbol from a string.
 pub(crate) fn make_symbol_scval(value: &str) -> ScVal {

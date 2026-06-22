@@ -129,10 +129,7 @@ pub type Result<T> = std::result::Result<T, LedgerError>;
 /// view with delta overlay) implement this trait, allowing config-loading and
 /// other read-path code to be generic over the entry source.
 pub trait EntryReader {
-    fn get_entry(
-        &self,
-        key: &stellar_xdr::curr::LedgerKey,
-    ) -> Result<Option<stellar_xdr::curr::LedgerEntry>>;
+    fn get_entry(&self, key: &stellar_xdr::LedgerKey) -> Result<Option<stellar_xdr::LedgerEntry>>;
 }
 
 /// Simplified view of the current ledger header.
@@ -166,8 +163,8 @@ pub struct LedgerInfo {
     pub protocol_version: u32,
 }
 
-impl From<&stellar_xdr::curr::LedgerHeader> for LedgerInfo {
-    fn from(header: &stellar_xdr::curr::LedgerHeader) -> Self {
+impl From<&stellar_xdr::LedgerHeader> for LedgerInfo {
+    fn from(header: &stellar_xdr::LedgerHeader) -> Self {
         Self {
             sequence: header.ledger_seq,
             previous_ledger_hash: henyey_common::Hash256::from(header.previous_ledger_hash.0),
@@ -205,7 +202,7 @@ impl From<&stellar_xdr::curr::LedgerHeader> for LedgerInfo {
 ///
 /// These affect the available balance for sending and receiving.
 pub mod reserves {
-    use stellar_xdr::curr::AccountEntry;
+    use stellar_xdr::AccountEntry;
 
     /// Number of stroops per XLM (1 XLM = 10,000,000 stroops).
     pub const STROOPS_PER_XLM: i64 = 10_000_000;
@@ -233,10 +230,10 @@ pub mod reserves {
 
         // Get sponsorship info if available
         let (num_sponsoring, num_sponsored) = match &account.ext {
-            stellar_xdr::curr::AccountEntryExt::V0 => (0, 0),
-            stellar_xdr::curr::AccountEntryExt::V1(v1) => match &v1.ext {
-                stellar_xdr::curr::AccountEntryExtensionV1Ext::V0 => (0, 0),
-                stellar_xdr::curr::AccountEntryExtensionV1Ext::V2(v2) => {
+            stellar_xdr::AccountEntryExt::V0 => (0, 0),
+            stellar_xdr::AccountEntryExt::V1(v1) => match &v1.ext {
+                stellar_xdr::AccountEntryExtensionV1Ext::V0 => (0, 0),
+                stellar_xdr::AccountEntryExtensionV1Ext::V2(v2) => {
                     (v2.num_sponsoring as i64, v2.num_sponsored as i64)
                 }
             },
@@ -258,8 +255,8 @@ pub mod reserves {
     /// The selling liabilities in stroops, or 0 for V0 accounts.
     pub fn selling_liabilities(account: &AccountEntry) -> i64 {
         match &account.ext {
-            stellar_xdr::curr::AccountEntryExt::V0 => 0,
-            stellar_xdr::curr::AccountEntryExt::V1(v1) => v1.liabilities.selling,
+            stellar_xdr::AccountEntryExt::V0 => 0,
+            stellar_xdr::AccountEntryExt::V1(v1) => v1.liabilities.selling,
         }
     }
 
@@ -274,8 +271,8 @@ pub mod reserves {
     /// The buying liabilities in stroops, or 0 for V0 accounts.
     pub fn buying_liabilities(account: &AccountEntry) -> i64 {
         match &account.ext {
-            stellar_xdr::curr::AccountEntryExt::V0 => 0,
-            stellar_xdr::curr::AccountEntryExt::V1(v1) => v1.liabilities.buying,
+            stellar_xdr::AccountEntryExt::V0 => 0,
+            stellar_xdr::AccountEntryExt::V1(v1) => v1.liabilities.buying,
         }
     }
 
@@ -323,15 +320,15 @@ pub mod reserves {
 /// - Selling liabilities cannot exceed balance
 /// - Buying liabilities cannot exceed `limit - balance`
 pub mod trustlines {
-    use stellar_xdr::curr::TrustLineEntry;
+    use stellar_xdr::TrustLineEntry;
 
     /// Get the selling liabilities for a trustline.
     ///
     /// Returns 0 for V0 trustlines (no liability tracking).
     pub fn selling_liabilities(trustline: &TrustLineEntry) -> i64 {
         match &trustline.ext {
-            stellar_xdr::curr::TrustLineEntryExt::V0 => 0,
-            stellar_xdr::curr::TrustLineEntryExt::V1(v1) => v1.liabilities.selling,
+            stellar_xdr::TrustLineEntryExt::V0 => 0,
+            stellar_xdr::TrustLineEntryExt::V1(v1) => v1.liabilities.selling,
         }
     }
 
@@ -340,8 +337,8 @@ pub mod trustlines {
     /// Returns 0 for V0 trustlines (no liability tracking).
     pub fn buying_liabilities(trustline: &TrustLineEntry) -> i64 {
         match &trustline.ext {
-            stellar_xdr::curr::TrustLineEntryExt::V0 => 0,
-            stellar_xdr::curr::TrustLineEntryExt::V1(v1) => v1.liabilities.buying,
+            stellar_xdr::TrustLineEntryExt::V0 => 0,
+            stellar_xdr::TrustLineEntryExt::V1(v1) => v1.liabilities.buying,
         }
     }
 
@@ -391,7 +388,7 @@ pub mod trustlines {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use stellar_xdr::curr::{
+    use stellar_xdr::{
         AccountEntry, AccountEntryExt, AccountEntryExtensionV1, AccountEntryExtensionV1Ext,
         AccountEntryExtensionV2, AccountEntryExtensionV2Ext, AccountId, Liabilities, PublicKey,
         SequenceNumber, Thresholds, Uint256,
@@ -408,9 +405,9 @@ mod tests {
             num_sub_entries,
             inflation_dest: None,
             flags: 0,
-            home_domain: stellar_xdr::curr::String32::default(),
+            home_domain: stellar_xdr::String32::default(),
             thresholds: Thresholds([1, 0, 0, 0]),
-            signers: stellar_xdr::curr::VecM::default(),
+            signers: stellar_xdr::VecM::default(),
             ext: AccountEntryExt::V0,
         }
     }
@@ -429,9 +426,9 @@ mod tests {
             num_sub_entries,
             inflation_dest: None,
             flags: 0,
-            home_domain: stellar_xdr::curr::String32::default(),
+            home_domain: stellar_xdr::String32::default(),
             thresholds: Thresholds([1, 0, 0, 0]),
-            signers: stellar_xdr::curr::VecM::default(),
+            signers: stellar_xdr::VecM::default(),
             ext: AccountEntryExt::V1(AccountEntryExtensionV1 {
                 liabilities: Liabilities { buying, selling },
                 ext: AccountEntryExtensionV1Ext::V0,
@@ -455,15 +452,15 @@ mod tests {
             num_sub_entries,
             inflation_dest: None,
             flags: 0,
-            home_domain: stellar_xdr::curr::String32::default(),
+            home_domain: stellar_xdr::String32::default(),
             thresholds: Thresholds([1, 0, 0, 0]),
-            signers: stellar_xdr::curr::VecM::default(),
+            signers: stellar_xdr::VecM::default(),
             ext: AccountEntryExt::V1(AccountEntryExtensionV1 {
                 liabilities: Liabilities { buying, selling },
                 ext: AccountEntryExtensionV1Ext::V2(AccountEntryExtensionV2 {
                     num_sponsoring,
                     num_sponsored,
-                    signer_sponsoring_i_ds: stellar_xdr::curr::VecM::default(),
+                    signer_sponsoring_i_ds: stellar_xdr::VecM::default(),
                     ext: AccountEntryExtensionV2Ext::V0,
                 }),
             }),
@@ -862,7 +859,7 @@ mod tests {
     // Parity: LiabilitiesTests.cpp:542 "add trustline selling liabilities"
     // =========================================================================
 
-    use stellar_xdr::curr::{
+    use stellar_xdr::{
         AlphaNum4, AssetCode4, TrustLineAsset, TrustLineEntry, TrustLineEntryExt, TrustLineEntryV1,
         TrustLineEntryV1Ext,
     };

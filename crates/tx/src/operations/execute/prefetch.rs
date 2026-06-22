@@ -7,7 +7,7 @@
 
 use std::collections::HashSet;
 
-use stellar_xdr::curr::{
+use stellar_xdr::{
     AccountId, AllowTrustOp, Asset, AssetCode, BeginSponsoringFutureReservesOp, ChangeTrustAsset,
     ChangeTrustOp, ClaimClaimableBalanceOp, ClawbackClaimableBalanceOp, ClawbackOp,
     CreateAccountOp, CreateClaimableBalanceOp, CreatePassiveSellOfferOp, LedgerKey,
@@ -43,13 +43,13 @@ fn offer_key(seller: &AccountId, id: i64) -> LedgerKey {
     })
 }
 
-fn claimable_balance_key(id: &stellar_xdr::curr::ClaimableBalanceId) -> LedgerKey {
+fn claimable_balance_key(id: &stellar_xdr::ClaimableBalanceId) -> LedgerKey {
     LedgerKey::ClaimableBalance(LedgerKeyClaimableBalance {
         balance_id: id.clone(),
     })
 }
 
-fn data_key(account: &AccountId, name: &stellar_xdr::curr::String64) -> LedgerKey {
+fn data_key(account: &AccountId, name: &stellar_xdr::String64) -> LedgerKey {
     LedgerKey::Data(LedgerKeyData {
         account_id: account.clone(),
         data_name: name.clone(),
@@ -172,13 +172,13 @@ fn prefetch_keys_allow_trust(op: &AllowTrustOp, source: &AccountId, keys: &mut H
     // Build the trustline asset from the AllowTrust asset code + source (issuer)
     let tl_asset = match &op.asset {
         AssetCode::CreditAlphanum4(code) => {
-            TrustLineAsset::CreditAlphanum4(stellar_xdr::curr::AlphaNum4 {
+            TrustLineAsset::CreditAlphanum4(stellar_xdr::AlphaNum4 {
                 asset_code: code.clone(),
                 issuer: source.clone(),
             })
         }
         AssetCode::CreditAlphanum12(code) => {
-            TrustLineAsset::CreditAlphanum12(stellar_xdr::curr::AlphaNum12 {
+            TrustLineAsset::CreditAlphanum12(stellar_xdr::AlphaNum12 {
                 asset_code: code.clone(),
                 issuer: source.clone(),
             })
@@ -244,7 +244,7 @@ fn prefetch_keys_liquidity_pool_deposit(
     keys: &mut HashSet<LedgerKey>,
 ) {
     keys.insert(LedgerKey::LiquidityPool(
-        stellar_xdr::curr::LedgerKeyLiquidityPool {
+        stellar_xdr::LedgerKeyLiquidityPool {
             liquidity_pool_id: op.liquidity_pool_id.clone(),
         },
     ));
@@ -256,7 +256,7 @@ fn prefetch_keys_liquidity_pool_withdraw(
     keys: &mut HashSet<LedgerKey>,
 ) {
     keys.insert(LedgerKey::LiquidityPool(
-        stellar_xdr::curr::LedgerKeyLiquidityPool {
+        stellar_xdr::LedgerKeyLiquidityPool {
             liquidity_pool_id: op.liquidity_pool_id.clone(),
         },
     ));
@@ -363,7 +363,7 @@ pub fn collect_prefetch_keys(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use stellar_xdr::curr::*;
+    use stellar_xdr::*;
 
     fn test_account_id(seed: u8) -> AccountId {
         AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([seed; 32])))

@@ -47,7 +47,7 @@
 use std::collections::HashSet;
 
 use henyey_common::Hash256;
-use stellar_xdr::curr::{NodeId, ScpQuorumSet};
+use stellar_xdr::{NodeId, ScpQuorumSet};
 
 /// Maximum allowed nesting level for quorum sets.
 ///
@@ -428,9 +428,7 @@ fn normalize_quorum_set_simplify(quorum_set: &mut ScpQuorumSet, id_to_remove: Op
 
 fn node_id_bytes(node_id: &NodeId) -> [u8; 32] {
     match &node_id.0 {
-        stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(stellar_xdr::curr::Uint256(bytes)) => {
-            *bytes
-        }
+        stellar_xdr::PublicKey::PublicKeyTypeEd25519(stellar_xdr::Uint256(bytes)) => *bytes,
     }
 }
 
@@ -576,7 +574,7 @@ impl SingletonQuorumSetCache {
 mod tests {
     use super::*;
     use crate::test_utils::make_node_id;
-    use stellar_xdr::curr::{PublicKey, Uint256};
+    use stellar_xdr::{PublicKey, Uint256};
 
     fn make_simple_quorum_set(threshold: u32, node_ids: &[NodeId]) -> ScpQuorumSet {
         simple_quorum_set(threshold, node_ids.to_vec())

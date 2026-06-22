@@ -4,7 +4,7 @@
 //! - AllowTrust (deprecated, but still supported)
 //! - SetTrustLineFlags
 
-use stellar_xdr::curr::{
+use stellar_xdr::{
     AccountFlags, AccountId, AllowTrustOp, AllowTrustResult, AllowTrustResultCode, Asset,
     ClaimPredicate, ClaimableBalanceEntry, ClaimableBalanceId, Claimant, ClaimantV0, Hash,
     HashIdPreimage, HashIdPreimageRevokeId, LedgerKey, LedgerKeyClaimableBalance,
@@ -44,12 +44,12 @@ pub(crate) fn execute_allow_trust(
 
     // Validate asset code content (defense-in-depth; also checked in validation layer).
     match &op.asset {
-        stellar_xdr::curr::AssetCode::CreditAlphanum4(code) => {
+        stellar_xdr::AssetCode::CreditAlphanum4(code) => {
             if !henyey_common::asset::is_asset_code4_valid(code) {
                 return Ok(make_allow_trust_result(AllowTrustResultCode::Malformed));
             }
         }
-        stellar_xdr::curr::AssetCode::CreditAlphanum12(code) => {
+        stellar_xdr::AssetCode::CreditAlphanum12(code) => {
             if !henyey_common::asset::is_asset_code12_valid(code) {
                 return Ok(make_allow_trust_result(AllowTrustResultCode::Malformed));
             }
@@ -310,16 +310,16 @@ pub(crate) fn execute_set_trust_line_flags(
 }
 
 /// Convert an AllowTrust asset code + issuer into a full Asset.
-fn asset_from_code(code: &stellar_xdr::curr::AssetCode, issuer: &AccountId) -> Asset {
+fn asset_from_code(code: &stellar_xdr::AssetCode, issuer: &AccountId) -> Asset {
     match code {
-        stellar_xdr::curr::AssetCode::CreditAlphanum4(c) => {
-            Asset::CreditAlphanum4(stellar_xdr::curr::AlphaNum4 {
+        stellar_xdr::AssetCode::CreditAlphanum4(c) => {
+            Asset::CreditAlphanum4(stellar_xdr::AlphaNum4 {
                 asset_code: c.clone(),
                 issuer: issuer.clone(),
             })
         }
-        stellar_xdr::curr::AssetCode::CreditAlphanum12(c) => {
-            Asset::CreditAlphanum12(stellar_xdr::curr::AlphaNum12 {
+        stellar_xdr::AssetCode::CreditAlphanum12(c) => {
+            Asset::CreditAlphanum12(stellar_xdr::AlphaNum12 {
                 asset_code: c.clone(),
                 issuer: issuer.clone(),
             })
@@ -690,17 +690,19 @@ fn redeem_into_claimable_balance(
         claimants: vec![claimant].try_into().unwrap(),
         asset: asset.clone(),
         amount,
-        ext: stellar_xdr::curr::ClaimableBalanceEntryExt::V0,
+        ext: stellar_xdr::ClaimableBalanceEntryExt::V0,
     };
 
     // If asset is not native, check clawback flag
     if !matches!(asset, Asset::Native) {
         if let Some(asset_tl) = state.get_trustline(account_id, asset) {
             if asset_tl.flags & TRUSTLINE_CLAWBACK_ENABLED_FLAG != 0 {
-                cb_entry.ext = stellar_xdr::curr::ClaimableBalanceEntryExt::V1(
-                    stellar_xdr::curr::ClaimableBalanceEntryExtensionV1 {
-                        ext: stellar_xdr::curr::ClaimableBalanceEntryExtensionV1Ext::V0,
-                        flags: stellar_xdr::curr::ClaimableBalanceFlags::ClaimableBalanceClawbackEnabledFlag as u32,
+                cb_entry.ext = stellar_xdr::ClaimableBalanceEntryExt::V1(
+                    stellar_xdr::ClaimableBalanceEntryExtensionV1 {
+                        ext: stellar_xdr::ClaimableBalanceEntryExtensionV1Ext::V0,
+                        flags:
+                            stellar_xdr::ClaimableBalanceFlags::ClaimableBalanceClawbackEnabledFlag
+                                as u32,
                     },
                 );
             }
@@ -870,7 +872,7 @@ mod tests {
     use super::*;
     use crate::test_utils::create_test_account_id;
     use henyey_common::LIQUIDITY_POOL_FEE_V18;
-    use stellar_xdr::curr::*;
+    use stellar_xdr::*;
 
     fn create_test_account(account_id: AccountId, balance: i64, flags: u32) -> AccountEntry {
         AccountEntry {
@@ -1028,9 +1030,7 @@ mod tests {
 
         let op = AllowTrustOp {
             trustor: trustor_id.clone(),
-            asset: stellar_xdr::curr::AssetCode::CreditAlphanum4(AssetCode4([
-                b'U', b'S', b'D', b'C',
-            ])),
+            asset: stellar_xdr::AssetCode::CreditAlphanum4(AssetCode4([b'U', b'S', b'D', b'C'])),
             authorize: 0,
         };
 
@@ -1292,7 +1292,7 @@ mod tests {
         // The issuer account should NOT be in the updated entries
         // Only the trustline should be recorded as updated
         for entry in updated_entries {
-            if let stellar_xdr::curr::LedgerEntryData::Account(acc) = &entry.data {
+            if let stellar_xdr::LedgerEntryData::Account(acc) = &entry.data {
                 // Check this isn't the issuer account
                 assert_ne!(
                     acc.account_id, issuer_id,
@@ -1303,7 +1303,7 @@ mod tests {
 
         // The trustline SHOULD be in the updated entries (it was updated)
         let has_trustline = updated_entries.iter().any(|e| {
-            matches!(&e.data, stellar_xdr::curr::LedgerEntryData::Trustline(tl)
+            matches!(&e.data, stellar_xdr::LedgerEntryData::Trustline(tl)
                 if tl.account_id == trustor_id)
         });
         assert!(
@@ -1377,7 +1377,7 @@ mod tests {
 
         // The issuer account should NOT be in the updated entries
         for entry in updated_entries {
-            if let stellar_xdr::curr::LedgerEntryData::Account(acc) = &entry.data {
+            if let stellar_xdr::LedgerEntryData::Account(acc) = &entry.data {
                 assert_ne!(
                     acc.account_id, issuer_id,
                     "Issuer account should NOT be in updated_entries for AllowTrust"
@@ -1387,7 +1387,7 @@ mod tests {
 
         // The trustline SHOULD be in the updated entries
         let has_trustline = updated_entries.iter().any(|e| {
-            matches!(&e.data, stellar_xdr::curr::LedgerEntryData::Trustline(tl)
+            matches!(&e.data, stellar_xdr::LedgerEntryData::Trustline(tl)
                 if tl.account_id == trustor_id)
         });
         assert!(
@@ -3250,7 +3250,7 @@ mod tests {
             num_sub_entries: 0,
             inflation_dest: None,
             flags: AccountFlags::RevocableFlag as u32,
-            home_domain: stellar_xdr::curr::String32::default(),
+            home_domain: stellar_xdr::String32::default(),
             thresholds: Thresholds([1, 0, 0, 0]),
             signers: Vec::new().try_into().unwrap(),
             ext: AccountEntryExt::V0,
@@ -3260,7 +3260,7 @@ mod tests {
         let invalid_code = AssetCode4([b'U', 0, b'S', b'D']);
         let op = AllowTrustOp {
             trustor: trustor_id.clone(),
-            asset: stellar_xdr::curr::AssetCode::CreditAlphanum4(invalid_code),
+            asset: stellar_xdr::AssetCode::CreditAlphanum4(invalid_code),
             authorize: 1,
         };
 
@@ -3307,7 +3307,7 @@ mod tests {
             num_sub_entries: 0,
             inflation_dest: None,
             flags: AccountFlags::RevocableFlag as u32,
-            home_domain: stellar_xdr::curr::String32::default(),
+            home_domain: stellar_xdr::String32::default(),
             thresholds: Thresholds([1, 0, 0, 0]),
             signers: Vec::new().try_into().unwrap(),
             ext: AccountEntryExt::V0,

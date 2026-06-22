@@ -132,7 +132,7 @@ mod tests {
     use henyey_common::Hash256;
     use std::sync::Arc;
     use std::time::Instant;
-    use stellar_xdr::curr::{
+    use stellar_xdr::{
         CreateAccountOp, DecoratedSignature, Memo, MuxedAccount, Operation, OperationBody,
         Preconditions, SequenceNumber, Signature as XdrSignature, SignatureHint, Transaction,
         TransactionEnvelope, TransactionExt, TransactionV1Envelope, Uint256,
@@ -143,9 +143,9 @@ mod tests {
         let operations = vec![Operation {
             source_account: None,
             body: OperationBody::CreateAccount(CreateAccountOp {
-                destination: stellar_xdr::curr::AccountId(
-                    stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(Uint256([255u8; 32])),
-                ),
+                destination: stellar_xdr::AccountId(stellar_xdr::PublicKey::PublicKeyTypeEd25519(
+                    Uint256([255u8; 32]),
+                )),
                 starting_balance: 1_000_000_000,
             }),
         }];

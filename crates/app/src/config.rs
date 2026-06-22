@@ -349,8 +349,8 @@ impl QuorumSetConfig {
     /// invalid inner sets, or an invalid threshold_percent. Errors from
     /// nested inner sets are propagated with path context rather than
     /// silently dropped.
-    pub fn to_xdr(&self) -> anyhow::Result<stellar_xdr::curr::ScpQuorumSet> {
-        use stellar_xdr::curr::{NodeId, PublicKey, ScpQuorumSet, Uint256};
+    pub fn to_xdr(&self) -> anyhow::Result<stellar_xdr::ScpQuorumSet> {
+        use stellar_xdr::{NodeId, PublicKey, ScpQuorumSet, Uint256};
 
         if self.is_empty() {
             anyhow::bail!("Quorum set has no validators or inner sets");
@@ -826,21 +826,19 @@ pub struct UpgradeConfig {
 }
 
 impl UpgradeConfig {
-    pub fn to_ledger_upgrades(&self) -> Vec<stellar_xdr::curr::LedgerUpgrade> {
+    pub fn to_ledger_upgrades(&self) -> Vec<stellar_xdr::LedgerUpgrade> {
         let mut upgrades = Vec::new();
         if let Some(version) = self.protocol_version {
-            upgrades.push(stellar_xdr::curr::LedgerUpgrade::Version(version));
+            upgrades.push(stellar_xdr::LedgerUpgrade::Version(version));
         }
         if let Some(fee) = self.base_fee {
-            upgrades.push(stellar_xdr::curr::LedgerUpgrade::BaseFee(fee));
+            upgrades.push(stellar_xdr::LedgerUpgrade::BaseFee(fee));
         }
         if let Some(reserve) = self.base_reserve {
-            upgrades.push(stellar_xdr::curr::LedgerUpgrade::BaseReserve(reserve));
+            upgrades.push(stellar_xdr::LedgerUpgrade::BaseReserve(reserve));
         }
         if let Some(max_tx_set_size) = self.max_tx_set_size {
-            upgrades.push(stellar_xdr::curr::LedgerUpgrade::MaxTxSetSize(
-                max_tx_set_size,
-            ));
+            upgrades.push(stellar_xdr::LedgerUpgrade::MaxTxSetSize(max_tx_set_size));
         }
         upgrades
     }
@@ -2373,7 +2371,7 @@ fn validate_port_collisions(config: &AppConfig) -> anyhow::Result<()> {
 /// validation level. Ports stellar-core's `computeDefaultThreshold`
 /// (Config.cpp:91-123).
 fn compute_default_threshold(
-    qset: &stellar_xdr::curr::ScpQuorumSet,
+    qset: &stellar_xdr::ScpQuorumSet,
     level: ValidationThresholdLevel,
 ) -> u32 {
     let top_size = (qset.validators.len() + qset.inner_sets.len()) as u32;
@@ -2393,7 +2391,7 @@ fn compute_default_threshold(
 /// Validate quorum safety for a compat config, mirroring stellar-core's
 /// `Config::validateConfig` (Config.cpp:2306-2357).
 fn validate_quorum_safety(
-    quorum_set: &stellar_xdr::curr::ScpQuorumSet,
+    quorum_set: &stellar_xdr::ScpQuorumSet,
     safety: &CompatQuorumSafety,
 ) -> anyhow::Result<()> {
     use std::collections::HashSet;
@@ -2455,8 +2453,8 @@ fn validate_quorum_safety(
 
 /// Recursively collect all node IDs from a quorum set.
 fn collect_nodes(
-    qset: &stellar_xdr::curr::ScpQuorumSet,
-    nodes: &mut std::collections::HashSet<stellar_xdr::curr::NodeId>,
+    qset: &stellar_xdr::ScpQuorumSet,
+    nodes: &mut std::collections::HashSet<stellar_xdr::NodeId>,
 ) {
     for v in qset.validators.iter() {
         nodes.insert(v.clone());
@@ -2715,9 +2713,7 @@ mod tests {
         let bytes: Vec<[u8; 32]> = validators
             .iter()
             .map(|node_id| match &node_id.0 {
-                stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(stellar_xdr::curr::Uint256(
-                    bytes,
-                )) => *bytes,
+                stellar_xdr::PublicKey::PublicKeyTypeEd25519(stellar_xdr::Uint256(bytes)) => *bytes,
             })
             .collect();
         assert!(bytes[0] <= bytes[1]);

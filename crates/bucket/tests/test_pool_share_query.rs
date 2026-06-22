@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 
 use henyey_bucket::{BucketList, BucketListSnapshot, SearchableBucketListSnapshot};
 use henyey_common::LIQUIDITY_POOL_FEE_V18;
-use stellar_xdr::curr::{
+use stellar_xdr::{
     AccountId, AlphaNum4, Asset, AssetCode4, Hash, LedgerEntry, LedgerEntryData, LedgerEntryExt,
     LedgerHeader, LedgerHeaderExt, LiquidityPoolConstantProductParameters, LiquidityPoolEntry,
     LiquidityPoolEntryBody, LiquidityPoolEntryConstantProduct, PoolId, PublicKey, StellarValue,
@@ -85,7 +85,7 @@ fn make_ledger_header(ledger_seq: u32) -> LedgerHeader {
         previous_ledger_hash: Hash([0u8; 32]),
         scp_value: StellarValue {
             tx_set_hash: Hash([0u8; 32]),
-            close_time: stellar_xdr::curr::TimePoint(0),
+            close_time: stellar_xdr::TimePoint(0),
             upgrades: Vec::new().try_into().unwrap(),
             ext: StellarValueExt::Basic,
         },
@@ -157,7 +157,7 @@ async fn test_load_pool_share_trustlines_by_account_and_asset() {
         .add_batch(
             1,
             TEST_PROTOCOL,
-            stellar_xdr::curr::BucketListType::Live,
+            stellar_xdr::BucketListType::Live,
             vec![
                 pool1.clone(),
                 pool2.clone(),
@@ -224,7 +224,7 @@ async fn test_load_pool_share_trustlines_no_match() {
         .add_batch(
             1,
             TEST_PROTOCOL,
-            stellar_xdr::curr::BucketListType::Live,
+            stellar_xdr::BucketListType::Live,
             vec![pool, tl],
             vec![],
             vec![],
@@ -262,7 +262,7 @@ async fn test_load_pool_share_trustlines_deleted_pool() {
         .add_batch(
             1,
             TEST_PROTOCOL,
-            stellar_xdr::curr::BucketListType::Live,
+            stellar_xdr::BucketListType::Live,
             vec![pool, tl],
             vec![],
             vec![],
@@ -277,15 +277,14 @@ async fn test_load_pool_share_trustlines_deleted_pool() {
     assert_eq!(result.len(), 1);
 
     // Delete the pool
-    let pool_key =
-        stellar_xdr::curr::LedgerKey::LiquidityPool(stellar_xdr::curr::LedgerKeyLiquidityPool {
-            liquidity_pool_id: pool_id,
-        });
+    let pool_key = stellar_xdr::LedgerKey::LiquidityPool(stellar_xdr::LedgerKeyLiquidityPool {
+        liquidity_pool_id: pool_id,
+    });
     bucket_list
         .add_batch(
             2,
             TEST_PROTOCOL,
-            stellar_xdr::curr::BucketListType::Live,
+            stellar_xdr::BucketListType::Live,
             vec![],
             vec![],
             vec![pool_key],
@@ -322,7 +321,7 @@ async fn test_load_pool_share_trustlines_multi_version() {
         .add_batch(
             1,
             TEST_PROTOCOL,
-            stellar_xdr::curr::BucketListType::Live,
+            stellar_xdr::BucketListType::Live,
             vec![pool, tl.clone()],
             vec![],
             vec![],
@@ -339,7 +338,7 @@ async fn test_load_pool_share_trustlines_multi_version() {
         .add_batch(
             2,
             TEST_PROTOCOL,
-            stellar_xdr::curr::BucketListType::Live,
+            stellar_xdr::BucketListType::Live,
             vec![],
             vec![tl.clone()],
             vec![],
@@ -424,7 +423,7 @@ async fn test_load_trustlines_for_account() {
         .add_batch(
             1,
             TEST_PROTOCOL,
-            stellar_xdr::curr::BucketListType::Live,
+            stellar_xdr::BucketListType::Live,
             vec![tl1, tl2, tl3],
             vec![],
             vec![],
@@ -463,7 +462,7 @@ async fn test_load_pool_share_trustlines_asset_in_b_position() {
         .add_batch(
             1,
             TEST_PROTOCOL,
-            stellar_xdr::curr::BucketListType::Live,
+            stellar_xdr::BucketListType::Live,
             vec![pool, tl],
             vec![],
             vec![],

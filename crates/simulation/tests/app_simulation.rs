@@ -703,10 +703,9 @@ async fn test_load_account_sequence_finds_root_account() {
     let network_id = henyey_common::NetworkId::from_passphrase("Test SDF Network ; September 2015");
     let root_sk = henyey_crypto::SecretKey::from_seed(network_id.as_bytes());
     let root_pk = root_sk.public_key();
-    let root_account_id =
-        stellar_xdr::curr::AccountId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
-            stellar_xdr::curr::Uint256(*root_pk.as_bytes()),
-        ));
+    let root_account_id = stellar_xdr::AccountId(stellar_xdr::PublicKey::PublicKeyTypeEd25519(
+        stellar_xdr::Uint256(*root_pk.as_bytes()),
+    ));
 
     // This is the bug: load_account_sequence returns Ok(None) instead of
     // Ok(Some(0)) for the genesis root account.
@@ -792,10 +791,9 @@ async fn test_load_account_sequence_pair_topology() {
     let network_id = henyey_common::NetworkId::from_passphrase("Test SDF Network ; September 2015");
     let root_sk = henyey_crypto::SecretKey::from_seed(network_id.as_bytes());
     let root_pk = root_sk.public_key();
-    let root_account_id =
-        stellar_xdr::curr::AccountId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
-            stellar_xdr::curr::Uint256(*root_pk.as_bytes()),
-        ));
+    let root_account_id = stellar_xdr::AccountId(stellar_xdr::PublicKey::PublicKeyTypeEd25519(
+        stellar_xdr::Uint256(*root_pk.as_bytes()),
+    ));
 
     // Check on both nodes.
     for node_id in ["node0", "node1"] {
@@ -1987,7 +1985,7 @@ async fn test_pair_tcp_scp_messages_exercise_pump_scp_intake() {
 /// Regression context: #2317, #2364, #2374.
 #[tokio::test]
 async fn test_self_echo_scp_reaches_pump_scp_intake() {
-    use stellar_xdr::curr::{NodeId, StellarMessage};
+    use stellar_xdr::{NodeId, StellarMessage};
 
     let mut sim = build_app_backed_topology(Topologies::pair(SimulationMode::OverTcp), 100).await;
 
@@ -1999,7 +1997,7 @@ async fn test_self_echo_scp_reaches_pump_scp_intake() {
 
     // Derive node0's NodeId (matches herder's node_id_from_public_key).
     let pk_0 = app_0.public_key();
-    let node0_id = NodeId(stellar_xdr::curr::PublicKey::from(&pk_0));
+    let node0_id = NodeId(stellar_xdr::PublicKey::from(&pk_0));
 
     // Find an envelope authored by node0 from node1's SCP state.
     // Node0's own SCP slot doesn't store self-authored envelopes (they're

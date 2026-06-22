@@ -54,7 +54,7 @@ use henyey_tx::{
     validation, ClassicEventConfig, LedgerContext, LedgerStateManager, OpEventManager,
     TransactionFrame, TxError, TxEventManager,
 };
-use stellar_xdr::curr::{
+use stellar_xdr::{
     AccountEntry, AccountId, AccountMergeResult, AllowTrustOp, AlphaNum12, AlphaNum4, Asset,
     AssetCode, ClaimableBalanceEntry, ClaimableBalanceId, ConfigSettingEntry, ConfigSettingId,
     ContractEvent, CreateClaimableBalanceResult, DiagnosticEvent, ExtensionPoint, InflationResult,
@@ -175,13 +175,13 @@ impl TransactionExecutionRequest {
 }
 
 pub(super) struct OperationExecutionRequest<'a> {
-    pub(super) op: &'a stellar_xdr::curr::Operation,
+    pub(super) op: &'a stellar_xdr::Operation,
     pub(super) source: &'a AccountId,
     pub(super) tx_source: &'a AccountId,
     pub(super) tx_seq: i64,
     pub(super) op_index: u32,
     pub(super) context: &'a LedgerContext,
-    pub(super) soroban_data: Option<&'a stellar_xdr::curr::SorobanTransactionData>,
+    pub(super) soroban_data: Option<&'a stellar_xdr::SorobanTransactionData>,
 }
 
 impl HotArchiveLookupImpl {
@@ -1041,14 +1041,14 @@ impl TransactionExecutor {
         self.loaded_accounts.insert(account_id.clone(), true);
 
         // Try to load from snapshot
-        let key = stellar_xdr::curr::LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
+        let key = stellar_xdr::LedgerKey::Account(stellar_xdr::LedgerKeyAccount {
             account_id: account_id.clone(),
         });
 
         if let Some(entry) = self.get_entry_from_snapshot(snapshot, &key)? {
             if record {
                 // Log signer info for debugging (only in record mode)
-                if let stellar_xdr::curr::LedgerEntryData::Account(ref acct) = entry.data {
+                if let stellar_xdr::LedgerEntryData::Account(ref acct) = entry.data {
                     tracing::trace!(
                         account = ?account_id,
                         num_signers = acct.signers.len(),
@@ -1076,7 +1076,7 @@ impl TransactionExecutor {
         &mut self,
         snapshot: &SnapshotHandle,
         account_id: &AccountId,
-        asset: &stellar_xdr::curr::TrustLineAsset,
+        asset: &stellar_xdr::TrustLineAsset,
     ) -> Result<bool> {
         if self
             .state
@@ -1091,13 +1091,13 @@ impl TransactionExecutor {
             return Ok(false);
         }
 
-        let key = stellar_xdr::curr::LedgerKey::Trustline(stellar_xdr::curr::LedgerKeyTrustLine {
+        let key = stellar_xdr::LedgerKey::Trustline(stellar_xdr::LedgerKeyTrustLine {
             account_id: account_id.clone(),
             asset: asset.clone(),
         });
 
         if let Some(entry) = self.get_entry_from_snapshot(snapshot, &key)? {
-            if let stellar_xdr::curr::LedgerEntryData::Trustline(ref tl) = entry.data {
+            if let stellar_xdr::LedgerEntryData::Trustline(ref tl) = entry.data {
                 tracing::debug!(
                     account = %account_id_to_strkey(account_id),
                     asset = ?asset,
@@ -1135,7 +1135,7 @@ impl TransactionExecutor {
             return Ok(false);
         }
 
-        let key = stellar_xdr::curr::LedgerKey::ClaimableBalance(LedgerKeyClaimableBalance {
+        let key = stellar_xdr::LedgerKey::ClaimableBalance(LedgerKeyClaimableBalance {
             balance_id: balance_id.clone(),
         });
 
@@ -1152,7 +1152,7 @@ impl TransactionExecutor {
         &mut self,
         snapshot: &SnapshotHandle,
         account_id: &AccountId,
-        data_name: &stellar_xdr::curr::String64,
+        data_name: &stellar_xdr::String64,
     ) -> Result<bool> {
         // Convert to string for state lookup (matches how data_entries are keyed)
         let name_str = String::from_utf8_lossy(data_name.as_slice()).to_string();
@@ -1167,7 +1167,7 @@ impl TransactionExecutor {
             return Ok(false);
         }
 
-        let key = stellar_xdr::curr::LedgerKey::Data(stellar_xdr::curr::LedgerKeyData {
+        let key = stellar_xdr::LedgerKey::Data(stellar_xdr::LedgerKeyData {
             account_id: account_id.clone(),
             data_name: data_name.clone(),
         });
@@ -1188,7 +1188,7 @@ impl TransactionExecutor {
         seller_id: &AccountId,
         offer_id: i64,
     ) -> Result<()> {
-        let key = stellar_xdr::curr::LedgerKey::Offer(stellar_xdr::curr::LedgerKeyOffer {
+        let key = stellar_xdr::LedgerKey::Offer(stellar_xdr::LedgerKeyOffer {
             seller_id: seller_id.clone(),
             offer_id,
         });
@@ -1231,7 +1231,7 @@ impl TransactionExecutor {
             return Ok(None);
         }
 
-        let key = stellar_xdr::curr::LedgerKey::LiquidityPool(LedgerKeyLiquidityPool {
+        let key = stellar_xdr::LedgerKey::LiquidityPool(LedgerKeyLiquidityPool {
             liquidity_pool_id: pool_id.clone(),
         });
 
@@ -1281,14 +1281,14 @@ impl TransactionExecutor {
     fn load_path_payment_pools(
         &mut self,
         snapshot: &SnapshotHandle,
-        send_asset: &stellar_xdr::curr::Asset,
-        dest_asset: &stellar_xdr::curr::Asset,
-        path: &[stellar_xdr::curr::Asset],
+        send_asset: &stellar_xdr::Asset,
+        dest_asset: &stellar_xdr::Asset,
+        path: &[stellar_xdr::Asset],
     ) -> Result<()> {
-        use stellar_xdr::curr::{LiquidityPoolConstantProductParameters, LiquidityPoolParameters};
+        use stellar_xdr::{LiquidityPoolConstantProductParameters, LiquidityPoolParameters};
 
         // Build the full conversion path: send_asset -> path[0] -> ... -> dest_asset
-        let mut assets: Vec<&stellar_xdr::curr::Asset> = vec![send_asset];
+        let mut assets: Vec<&stellar_xdr::Asset> = vec![send_asset];
         assets.extend(path.iter());
         assets.push(dest_asset);
 
@@ -1355,7 +1355,7 @@ impl TransactionExecutor {
         for (buying, selling) in pairs {
             for offer_key in self.state.top_n_offer_keys(buying, selling, n) {
                 if let Some(offer) = self.state.get_offer_by_key(&offer_key) {
-                    keys.insert(LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
+                    keys.insert(LedgerKey::Account(stellar_xdr::LedgerKeyAccount {
                         account_id: offer.seller_id.clone(),
                     }));
                     if let Some(tl_asset) = asset_to_trustline_asset(&offer.selling) {
@@ -1416,7 +1416,7 @@ impl TransactionExecutor {
             .state
             .get_offers_by_account_and_asset(account_id, asset);
         for offer in &offers {
-            let offer_key = LedgerKey::Offer(stellar_xdr::curr::LedgerKeyOffer {
+            let offer_key = LedgerKey::Offer(stellar_xdr::LedgerKeyOffer {
                 seller_id: offer.seller_id.clone(),
                 offer_id: offer.offer_id,
             });
@@ -1534,7 +1534,7 @@ impl TransactionExecutor {
     pub fn load_soroban_footprint(
         &mut self,
         snapshot: &SnapshotHandle,
-        footprint: &stellar_xdr::curr::LedgerFootprint,
+        footprint: &stellar_xdr::LedgerFootprint,
     ) -> Result<()> {
         use sha2::{Digest, Sha256};
 
@@ -1577,9 +1577,9 @@ impl TransactionExecutor {
                 let key_bytes = key
                     .to_xdr(Limits::none())
                     .map_err(|e| LedgerError::Serialization(e.to_string()))?;
-                let key_hash = stellar_xdr::curr::Hash(Sha256::digest(&key_bytes).into());
+                let key_hash = stellar_xdr::Hash(Sha256::digest(&key_bytes).into());
                 ttl_key_cache.insert(key.clone(), key_hash.clone());
-                let ttl_key = LedgerKey::Ttl(stellar_xdr::curr::LedgerKeyTtl { key_hash });
+                let ttl_key = LedgerKey::Ttl(stellar_xdr::LedgerKeyTtl { key_hash });
 
                 let entry_in_state = self.state.get_entry(key).is_some();
                 let ttl_in_state = self.state.get_entry(&ttl_key).is_some()
@@ -1765,14 +1765,14 @@ impl TransactionExecutor {
         // This is needed because flush_modified_entries updates snapshots to current values
         let mut state_overrides: HashMap<LedgerKey, LedgerEntry> = HashMap::new();
         if let Some(acc) = self.state.get_account(&fee_source_id) {
-            let key = LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
+            let key = LedgerKey::Account(stellar_xdr::LedgerKeyAccount {
                 account_id: fee_source_id.clone(),
             });
             state_overrides.insert(key, self.state.ledger_entry_for_account(acc));
         }
         if fee_source_id != inner_source_id {
             if let Some(acc) = self.state.get_account(&inner_source_id) {
-                let key = LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
+                let key = LedgerKey::Account(stellar_xdr::LedgerKeyAccount {
                     account_id: inner_source_id.clone(),
                 });
                 state_overrides.insert(key, self.state.ledger_entry_for_account(acc));
@@ -1791,7 +1791,7 @@ impl TransactionExecutor {
         if protocol_version_is_before(self.protocol_version, ProtocolVersion::V10) {
             if let Some(acc) = self.state.get_account_mut(&inner_source_id) {
                 // Set the account's seq_num to the transaction's seq_num
-                acc.seq_num = stellar_xdr::curr::SequenceNumber(frame.sequence_number());
+                acc.seq_num = stellar_xdr::SequenceNumber(frame.sequence_number());
                 henyey_tx::state::update_account_seq_info(acc, self.ledger_seq, self.close_time);
             }
         }
@@ -2051,15 +2051,14 @@ impl TransactionExecutor {
         // for metadata. In single-phase mode, the signer removal still happens but the
         // metadata changes are captured by the normal flush mechanism.
         let fee_bump_wrapper_changes = if frame.is_fee_bump() {
-            let fee_source_key = LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
+            let fee_source_key = LedgerKey::Account(stellar_xdr::LedgerKeyAccount {
                 account_id: fee_source_id.clone(),
             });
             if let Some(fee_source_before) = self.state.get_entry(&fee_source_key) {
                 // Remove the PreAuthTx signer matching the fee bump outer hash from
                 // the fee source, matching stellar-core's removeOneTimeSignerKeyFromFeeSource().
-                let signer_key = stellar_xdr::curr::SignerKey::PreAuthTx(
-                    stellar_xdr::curr::Uint256(outer_hash.0),
-                );
+                let signer_key =
+                    stellar_xdr::SignerKey::PreAuthTx(stellar_xdr::Uint256(outer_hash.0));
                 self.state
                     .remove_account_signer(&fee_source_id, &signer_key)
                     .map_err(|e| LedgerError::Internal(format!("signer removal error: {}", e)))?;
@@ -2416,7 +2415,7 @@ impl TransactionExecutor {
         // Capture pre-mutation state for all source accounts BEFORE any modifications.
         let mut state_overrides = HashMap::new();
         for account_id in &source_accounts {
-            let key = LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
+            let key = LedgerKey::Account(stellar_xdr::LedgerKeyAccount {
                 account_id: account_id.clone(),
             });
             if let Some(entry) = self.state.get_entry(&key) {
@@ -2427,7 +2426,7 @@ impl TransactionExecutor {
         // Step 1: Sequence bump (processSeqNum equivalent).
         let seq_bump_start = std::time::Instant::now();
         if let Some(acc) = self.state.get_account_mut(inner_source_id) {
-            acc.seq_num = stellar_xdr::curr::SequenceNumber(frame.sequence_number());
+            acc.seq_num = stellar_xdr::SequenceNumber(frame.sequence_number());
             henyey_tx::state::update_account_seq_info(acc, self.ledger_seq, self.close_time);
         }
         let seq_bump_us = seq_bump_start.elapsed().as_micros() as u64;
@@ -2507,13 +2506,12 @@ impl TransactionExecutor {
         // Mirrors FeeBumpTransactionFrame::apply() lines 162-165.
         if frame.is_fee_bump() {
             let fee_source_id = henyey_tx::muxed_to_account_id(&frame.fee_source_account());
-            let fee_source_key = LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
+            let fee_source_key = LedgerKey::Account(stellar_xdr::LedgerKeyAccount {
                 account_id: fee_source_id.clone(),
             });
             if let Some(fee_source_before) = self.state.get_entry(&fee_source_key) {
-                let signer_key = stellar_xdr::curr::SignerKey::PreAuthTx(
-                    stellar_xdr::curr::Uint256(outer_hash.0),
-                );
+                let signer_key =
+                    stellar_xdr::SignerKey::PreAuthTx(stellar_xdr::Uint256(outer_hash.0));
                 self.state
                     .remove_account_signer(&fee_source_id, &signer_key)
                     .map_err(|e| LedgerError::Internal(format!("signer removal error: {}", e)))?;
@@ -2634,12 +2632,12 @@ pub use henyey_common::ThresholdLevel;
 /// that every signature in the envelope was consumed by at least one check.
 pub(crate) struct SignatureTracker<'a> {
     tx_hash: &'a Hash256,
-    signatures: &'a [stellar_xdr::curr::DecoratedSignature],
+    signatures: &'a [stellar_xdr::DecoratedSignature],
     used: Vec<bool>,
 }
 
 impl<'a> SignatureTracker<'a> {
-    fn new(tx_hash: &'a Hash256, signatures: &'a [stellar_xdr::curr::DecoratedSignature]) -> Self {
+    fn new(tx_hash: &'a Hash256, signatures: &'a [stellar_xdr::DecoratedSignature]) -> Self {
         let used = vec![false; signatures.len()];
         Self {
             tx_hash,
@@ -2657,7 +2655,7 @@ impl<'a> SignatureTracker<'a> {
         let mut signers: Vec<(SignerKey, u32)> = Vec::new();
         let master_weight = account.thresholds.0[0] as u32;
         if master_weight > 0 {
-            let stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(ref key) = account.account_id.0;
+            let stellar_xdr::PublicKey::PublicKeyTypeEd25519(ref key) = account.account_id.0;
             let signer_key = SignerKey::Ed25519(key.clone());
             signers.push((signer_key, master_weight));
         }
@@ -2673,7 +2671,7 @@ impl<'a> SignatureTracker<'a> {
     /// source. Creates a synthetic signer with just the account's public key at
     /// weight 1, needed threshold 0.
     fn check_signature_no_account(&mut self, account_id: &AccountId) -> bool {
-        let stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(ref key) = account_id.0;
+        let stellar_xdr::PublicKey::PublicKeyTypeEd25519(ref key) = account_id.0;
         let signer_key = SignerKey::Ed25519(key.clone());
         let signers = vec![(signer_key, 1u32)];
         self.check_signature_from_signers(&signers, 0)
@@ -2914,12 +2912,10 @@ pub(crate) fn fee_source_account_id(env: &TransactionEnvelope) -> AccountId {
         TransactionEnvelope::TxFeeBump(e) => e.tx.fee_source.clone(),
     };
     match muxed {
-        MuxedAccount::Ed25519(key) => {
-            AccountId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(key))
+        MuxedAccount::Ed25519(key) => AccountId(stellar_xdr::PublicKey::PublicKeyTypeEd25519(key)),
+        MuxedAccount::MuxedEd25519(m) => {
+            AccountId(stellar_xdr::PublicKey::PublicKeyTypeEd25519(m.ed25519))
         }
-        MuxedAccount::MuxedEd25519(m) => AccountId(
-            stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(m.ed25519),
-        ),
     }
 }
 
@@ -3142,7 +3138,7 @@ mod tests {
     /// for indices in `actual_restored_indices`, not all `archived_soroban_entries`.
     #[test]
     fn test_extract_hot_archive_restored_keys_uses_actual_indices() {
-        use stellar_xdr::curr::{
+        use stellar_xdr::{
             ContractDataDurability, ContractId, LedgerFootprint, LedgerKey, LedgerKeyContractData,
             ScAddress, ScVal, SorobanResources, SorobanResourcesExtV0, SorobanTransactionData,
             SorobanTransactionDataExt,
@@ -3150,17 +3146,17 @@ mod tests {
 
         // Create a footprint with 3 keys in read_write
         let key0 = LedgerKey::ContractData(LedgerKeyContractData {
-            contract: ScAddress::Contract(ContractId(stellar_xdr::curr::Hash([0u8; 32]))),
+            contract: ScAddress::Contract(ContractId(stellar_xdr::Hash([0u8; 32]))),
             key: ScVal::U32(0),
             durability: ContractDataDurability::Persistent,
         });
         let key1 = LedgerKey::ContractData(LedgerKeyContractData {
-            contract: ScAddress::Contract(ContractId(stellar_xdr::curr::Hash([1u8; 32]))),
+            contract: ScAddress::Contract(ContractId(stellar_xdr::Hash([1u8; 32]))),
             key: ScVal::U32(1),
             durability: ContractDataDurability::Persistent,
         });
         let key2 = LedgerKey::ContractData(LedgerKeyContractData {
-            contract: ScAddress::Contract(ContractId(stellar_xdr::curr::Hash([2u8; 32]))),
+            contract: ScAddress::Contract(ContractId(stellar_xdr::Hash([2u8; 32]))),
             key: ScVal::U32(2),
             durability: ContractDataDurability::Persistent,
         });
@@ -3271,14 +3267,14 @@ mod tests {
     /// the result is empty regardless of what the envelope declares.
     #[test]
     fn test_extract_hot_archive_restored_keys_empty_indices() {
-        use stellar_xdr::curr::{
+        use stellar_xdr::{
             ContractDataDurability, ContractId, LedgerFootprint, LedgerKey, LedgerKeyContractData,
             ScAddress, ScVal, SorobanResources, SorobanResourcesExtV0, SorobanTransactionData,
             SorobanTransactionDataExt,
         };
 
         let key0 = LedgerKey::ContractData(LedgerKeyContractData {
-            contract: ScAddress::Contract(ContractId(stellar_xdr::curr::Hash([0u8; 32]))),
+            contract: ScAddress::Contract(ContractId(stellar_xdr::Hash([0u8; 32]))),
             key: ScVal::U32(0),
             durability: ContractDataDurability::Persistent,
         });
@@ -3330,13 +3326,13 @@ mod tests {
     #[test]
     fn test_ve06_failed_op_hot_archive_keys_not_collected() {
         use std::collections::HashSet;
-        use stellar_xdr::curr::{
+        use stellar_xdr::{
             ContractDataDurability, ContractId, LedgerKey, LedgerKeyContractData, OperationResult,
             ScAddress, ScVal,
         };
 
         let archived_key = LedgerKey::ContractData(LedgerKeyContractData {
-            contract: ScAddress::Contract(ContractId(stellar_xdr::curr::Hash([0xCCu8; 32]))),
+            contract: ScAddress::Contract(ContractId(stellar_xdr::Hash([0xCCu8; 32]))),
             key: ScVal::U32(42),
             durability: ContractDataDurability::Persistent,
         });
@@ -3348,8 +3344,8 @@ mod tests {
 
         // Case 1: operation succeeded → keys ARE collected.
         let success_result =
-            OperationResult::OpInner(stellar_xdr::curr::OperationResultTr::RestoreFootprint(
-                stellar_xdr::curr::RestoreFootprintResult::Success,
+            OperationResult::OpInner(stellar_xdr::OperationResultTr::RestoreFootprint(
+                stellar_xdr::RestoreFootprintResult::Success,
             ));
         assert!(is_operation_success(&success_result));
 
@@ -3365,8 +3361,8 @@ mod tests {
 
         // Case 2: operation failed → keys are NOT collected (VE-06 fix).
         let failed_result =
-            OperationResult::OpInner(stellar_xdr::curr::OperationResultTr::InvokeHostFunction(
-                stellar_xdr::curr::InvokeHostFunctionResult::EntryArchived,
+            OperationResult::OpInner(stellar_xdr::OperationResultTr::InvokeHostFunction(
+                stellar_xdr::InvokeHostFunctionResult::EntryArchived,
             ));
         assert!(!is_operation_success(&failed_result));
 
@@ -3388,7 +3384,7 @@ mod tests {
     /// structured as a Vec that can accumulate keys across transactions.
     #[test]
     fn test_restored_keys_accumulation_pattern() {
-        use stellar_xdr::curr::{
+        use stellar_xdr::{
             ContractDataDurability, ContractId, LedgerKey, LedgerKeyContractData, ScAddress, ScVal,
         };
 
@@ -3397,7 +3393,7 @@ mod tests {
 
         // TX1 restores key0
         let key0 = LedgerKey::ContractData(LedgerKeyContractData {
-            contract: ScAddress::Contract(ContractId(stellar_xdr::curr::Hash([0u8; 32]))),
+            contract: ScAddress::Contract(ContractId(stellar_xdr::Hash([0u8; 32]))),
             key: ScVal::U32(0),
             durability: ContractDataDurability::Persistent,
         });
@@ -3405,7 +3401,7 @@ mod tests {
 
         // TX2 restores key1
         let key1 = LedgerKey::ContractData(LedgerKeyContractData {
-            contract: ScAddress::Contract(ContractId(stellar_xdr::curr::Hash([1u8; 32]))),
+            contract: ScAddress::Contract(ContractId(stellar_xdr::Hash([1u8; 32]))),
             key: ScVal::U32(1),
             durability: ContractDataDurability::Persistent,
         });
@@ -3436,7 +3432,7 @@ mod tests {
         use crate::snapshot::{LedgerSnapshot, SnapshotHandle};
         use crate::LedgerDelta;
         use std::sync::Arc;
-        use stellar_xdr::curr::*;
+        use stellar_xdr::*;
 
         // --- Build a ContractCode entry and its TTL in the snapshot ---
         let code_hash = Hash([0xCC; 32]);
@@ -3567,7 +3563,7 @@ mod tests {
     fn test_deleted_account_not_reloaded_from_snapshot() {
         use crate::snapshot::{LedgerSnapshot, SnapshotHandle};
         use std::sync::Arc;
-        use stellar_xdr::curr::*;
+        use stellar_xdr::*;
 
         let account_id = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([0xAA; 32])));
         let account_entry = LedgerEntry {
@@ -3645,7 +3641,7 @@ mod tests {
     fn test_load_entry_respects_delta_deleted_keys() {
         use crate::snapshot::{LedgerSnapshot, SnapshotHandle};
         use std::sync::Arc;
-        use stellar_xdr::curr::*;
+        use stellar_xdr::*;
 
         // Create an account that exists in the "bucket list" snapshot.
         let account_id = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([0xBB; 32])));
@@ -3711,7 +3707,7 @@ mod tests {
     fn test_record_entry_access_stamps_loaded_data_entry() {
         use crate::snapshot::{LedgerSnapshot, SnapshotHandle};
         use std::sync::Arc;
-        use stellar_xdr::curr::*;
+        use stellar_xdr::*;
 
         let owner = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([0x11; 32])));
         let sponsor = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([0x22; 32])));
@@ -3782,7 +3778,7 @@ mod tests {
         use crate::soroban_state::SharedSorobanState;
         use sha2::{Digest, Sha256};
         use std::sync::Arc;
-        use stellar_xdr::curr::*;
+        use stellar_xdr::*;
 
         // --- Build a ContractData entry ---
         let contract_address = ScAddress::Contract(ContractId(Hash([0xAB; 32])));
@@ -3882,7 +3878,7 @@ mod tests {
             atomic::{AtomicBool, Ordering},
             Arc,
         };
-        use stellar_xdr::curr::*;
+        use stellar_xdr::*;
 
         let contract_address = ScAddress::Contract(ContractId(Hash([0xCD; 32])));
         let data_key = LedgerKey::ContractData(LedgerKeyContractData {
@@ -3955,7 +3951,7 @@ mod tests {
         use crate::snapshot::{LedgerSnapshot, SnapshotHandle};
         use sha2::{Digest, Sha256};
         use std::sync::Arc;
-        use stellar_xdr::curr::*;
+        use stellar_xdr::*;
 
         let contract_address = ScAddress::Contract(ContractId(Hash([0xEF; 32])));
         let data_key = LedgerKey::ContractData(LedgerKeyContractData {
@@ -4048,7 +4044,7 @@ mod tests {
         use crate::soroban_state::SharedSorobanState;
         use sha2::{Digest, Sha256};
         use std::sync::Arc;
-        use stellar_xdr::curr::*;
+        use stellar_xdr::*;
 
         // --- Build a ContractData entry ---
         let contract_address = ScAddress::Contract(ContractId(Hash([0x77; 32])));
@@ -4144,7 +4140,7 @@ mod tests {
         use crate::snapshot::{EntriesLookupFn, LedgerSnapshot, SnapshotHandle};
         use std::collections::HashSet;
         use std::sync::Arc;
-        use stellar_xdr::curr::*;
+        use stellar_xdr::*;
 
         let make_account_id = |seed: u8| -> AccountId {
             let mut bytes = [0u8; 32];
@@ -4302,7 +4298,7 @@ mod tests {
     #[test]
     fn test_prior_stage_state_filters_non_soroban_deletions() {
         use crate::LedgerDelta;
-        use stellar_xdr::curr::*;
+        use stellar_xdr::*;
 
         let mut delta = LedgerDelta::new(101);
 
@@ -4385,11 +4381,11 @@ mod tests {
         assert!(executor.hot_archive_restored_keys().is_empty());
 
         // Record some keys.
-        let key1 = LedgerKey::ContractCode(stellar_xdr::curr::LedgerKeyContractCode {
-            hash: stellar_xdr::curr::Hash([1u8; 32]),
+        let key1 = LedgerKey::ContractCode(stellar_xdr::LedgerKeyContractCode {
+            hash: stellar_xdr::Hash([1u8; 32]),
         });
-        let key2 = LedgerKey::ContractCode(stellar_xdr::curr::LedgerKeyContractCode {
-            hash: stellar_xdr::curr::Hash([2u8; 32]),
+        let key2 = LedgerKey::ContractCode(stellar_xdr::LedgerKeyContractCode {
+            hash: stellar_xdr::Hash([2u8; 32]),
         });
         executor.record_hot_archive_restores(&[key1.clone(), key2.clone()]);
         assert_eq!(executor.hot_archive_restored_keys().len(), 2);
@@ -4429,11 +4425,11 @@ mod tests {
             ClassicEventConfig::default(),
         );
 
-        let key1 = LedgerKey::ContractCode(stellar_xdr::curr::LedgerKeyContractCode {
-            hash: stellar_xdr::curr::Hash([10u8; 32]),
+        let key1 = LedgerKey::ContractCode(stellar_xdr::LedgerKeyContractCode {
+            hash: stellar_xdr::Hash([10u8; 32]),
         });
-        let key2 = LedgerKey::ContractCode(stellar_xdr::curr::LedgerKeyContractCode {
-            hash: stellar_xdr::curr::Hash([20u8; 32]),
+        let key2 = LedgerKey::ContractCode(stellar_xdr::LedgerKeyContractCode {
+            hash: stellar_xdr::Hash([20u8; 32]),
         });
 
         // Record one key from "this cluster's" work.
@@ -4456,8 +4452,8 @@ mod tests {
     fn test_prior_stage_state_carries_restored_keys() {
         let delta = crate::LedgerDelta::new(100);
         let mut restored = std::collections::HashSet::new();
-        let key = LedgerKey::ContractCode(stellar_xdr::curr::LedgerKeyContractCode {
-            hash: stellar_xdr::curr::Hash([77u8; 32]),
+        let key = LedgerKey::ContractCode(stellar_xdr::LedgerKeyContractCode {
+            hash: stellar_xdr::Hash([77u8; 32]),
         });
         restored.insert(key.clone());
 
@@ -4472,7 +4468,7 @@ mod tests {
     /// fields.
     #[test]
     fn test_hot_archive_restored_keys_sort_uses_native_ord() {
-        use stellar_xdr::curr::{
+        use stellar_xdr::{
             ContractDataDurability, ContractId, Hash, LedgerKey, LedgerKeyContractData, ScAddress,
             ScVal,
         };
@@ -4557,7 +4553,7 @@ mod tests {
     #[test]
     fn test_execute_with_pre_apply_result_partial_fee_failing_body() {
         use henyey_crypto::{sign_hash, SecretKey};
-        use stellar_xdr::curr::{
+        use stellar_xdr::{
             AccountEntry, AccountEntryExt, AccountId, DecoratedSignature, LedgerEntry,
             LedgerEntryData, LedgerEntryExt, LedgerKey, MuxedAccount, Operation, OperationBody,
             PaymentOp, Preconditions, PublicKey, SequenceNumber, SignatureHint, Thresholds,
@@ -4579,7 +4575,7 @@ mod tests {
             *secret.public_key().as_bytes(),
         )));
 
-        let account_key = LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
+        let account_key = LedgerKey::Account(stellar_xdr::LedgerKeyAccount {
             account_id: source_id.clone(),
         });
         let account_entry = LedgerEntry {
@@ -4610,7 +4606,7 @@ mod tests {
             source_account: None,
             body: OperationBody::Payment(PaymentOp {
                 destination: dest,
-                asset: stellar_xdr::curr::Asset::Native,
+                asset: stellar_xdr::Asset::Native,
                 amount: 1,
             }),
         };
@@ -4619,7 +4615,7 @@ mod tests {
             fee: 200,
             seq_num: SequenceNumber(2),
             cond: Preconditions::None,
-            memo: stellar_xdr::curr::Memo::None,
+            memo: stellar_xdr::Memo::None,
             operations: vec![op].try_into().unwrap(),
             ext: TransactionExt::V0,
         };
@@ -4638,7 +4634,7 @@ mod tests {
         let hint = SignatureHint([pk_bytes[28], pk_bytes[29], pk_bytes[30], pk_bytes[31]]);
         let decorated = DecoratedSignature {
             hint,
-            signature: stellar_xdr::curr::Signature(signature.0.to_vec().try_into().unwrap()),
+            signature: stellar_xdr::Signature(signature.0.to_vec().try_into().unwrap()),
         };
         if let TransactionEnvelope::Tx(ref mut env) = envelope {
             env.signatures = vec![decorated].try_into().unwrap();

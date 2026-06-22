@@ -15,7 +15,7 @@
 use henyey_common::xdr_stream::XdrOutputStream;
 use henyey_common::Hash256;
 use rusqlite::{params, Connection, OptionalExtension};
-use stellar_xdr::curr::{
+use stellar_xdr::{
     Hash, LedgerScpMessages, Limits, NodeId, PublicKey, ReadXdr, ScpEnvelope, ScpHistoryEntry,
     ScpHistoryEntryV0, ScpQuorumSet, Uint256, WriteXdr,
 };
@@ -279,10 +279,10 @@ impl ScpQueries for Connection {
 /// Extract the quorum set hash from an SCP envelope's statement.
 fn scp_envelope_quorum_set_hash(envelope: &ScpEnvelope) -> Hash256 {
     let hash = match &envelope.statement.pledges {
-        stellar_xdr::curr::ScpStatementPledges::Nominate(nom) => &nom.quorum_set_hash,
-        stellar_xdr::curr::ScpStatementPledges::Prepare(prep) => &prep.quorum_set_hash,
-        stellar_xdr::curr::ScpStatementPledges::Confirm(conf) => &conf.quorum_set_hash,
-        stellar_xdr::curr::ScpStatementPledges::Externalize(ext) => &ext.commit_quorum_set_hash,
+        stellar_xdr::ScpStatementPledges::Nominate(nom) => &nom.quorum_set_hash,
+        stellar_xdr::ScpStatementPledges::Prepare(prep) => &prep.quorum_set_hash,
+        stellar_xdr::ScpStatementPledges::Confirm(conf) => &conf.quorum_set_hash,
+        stellar_xdr::ScpStatementPledges::Externalize(ext) => &ext.commit_quorum_set_hash,
     };
     Hash256::from_bytes(hash.0)
 }
@@ -606,7 +606,7 @@ fn referenced_tx_set_hashes_from_state_json(state_json: &str) -> Result<Vec<Hash
 /// `Vec<Value>` (in Nominate); each `Value` decodes into a `StellarValue`
 /// whose `tx_set_hash` is the referenced hash.
 fn extract_tx_set_hashes_from_envelope(envelope: &ScpEnvelope) -> Vec<Hash> {
-    use stellar_xdr::curr::{ScpStatementPledges, StellarValue, Value as XdrValue};
+    use stellar_xdr::{ScpStatementPledges, StellarValue, Value as XdrValue};
 
     fn from_value(value: &XdrValue) -> Option<Hash> {
         let sv = StellarValue::from_xdr(value.as_slice(), Limits::none()).ok()?;
@@ -807,28 +807,26 @@ mod tests {
     fn persisted_state_json_referencing(tx_set_hash: &Hash) -> String {
         // Construct a NOMINATE envelope referencing `tx_set_hash` via a
         // StellarValue.
-        let stellar_value = stellar_xdr::curr::StellarValue {
+        let stellar_value = stellar_xdr::StellarValue {
             tx_set_hash: tx_set_hash.clone(),
-            close_time: stellar_xdr::curr::TimePoint(0),
+            close_time: stellar_xdr::TimePoint(0),
             upgrades: vec![].try_into().unwrap(),
-            ext: stellar_xdr::curr::StellarValueExt::Basic,
+            ext: stellar_xdr::StellarValueExt::Basic,
         };
         let value_xdr = stellar_value.to_xdr(Limits::none()).unwrap();
         let envelope = ScpEnvelope {
-            statement: stellar_xdr::curr::ScpStatement {
+            statement: stellar_xdr::ScpStatement {
                 node_id: NodeId(PublicKey::PublicKeyTypeEd25519(Uint256([0u8; 32]))),
                 slot_index: 100,
-                pledges: stellar_xdr::curr::ScpStatementPledges::Nominate(
-                    stellar_xdr::curr::ScpNomination {
-                        quorum_set_hash: Hash([0u8; 32]),
-                        votes: vec![stellar_xdr::curr::Value(value_xdr.try_into().unwrap())]
-                            .try_into()
-                            .unwrap(),
-                        accepted: vec![].try_into().unwrap(),
-                    },
-                ),
+                pledges: stellar_xdr::ScpStatementPledges::Nominate(stellar_xdr::ScpNomination {
+                    quorum_set_hash: Hash([0u8; 32]),
+                    votes: vec![stellar_xdr::Value(value_xdr.try_into().unwrap())]
+                        .try_into()
+                        .unwrap(),
+                    accepted: vec![].try_into().unwrap(),
+                }),
             },
-            signature: stellar_xdr::curr::Signature::default(),
+            signature: stellar_xdr::Signature::default(),
         };
         let env_xdr: Vec<u8> = envelope.to_xdr(Limits::none()).unwrap();
         // Match the herder's PersistedSlotState JSON shape: serde_json renders
@@ -919,13 +917,13 @@ mod tests {
         let node_id = NodeId(PublicKey::PublicKeyTypeEd25519(Uint256([1u8; 32])));
         let qset_hash = Hash([0u8; 32]);
         let envelope = ScpEnvelope {
-            statement: stellar_xdr::curr::ScpStatement {
+            statement: stellar_xdr::ScpStatement {
                 node_id: node_id.clone(),
                 slot_index: 100,
-                pledges: stellar_xdr::curr::ScpStatementPledges::Prepare(
-                    stellar_xdr::curr::ScpStatementPrepare {
+                pledges: stellar_xdr::ScpStatementPledges::Prepare(
+                    stellar_xdr::ScpStatementPrepare {
                         quorum_set_hash: qset_hash.clone(),
-                        ballot: stellar_xdr::curr::ScpBallot {
+                        ballot: stellar_xdr::ScpBallot {
                             counter: 1,
                             value: vec![].try_into().unwrap(),
                         },
@@ -936,7 +934,7 @@ mod tests {
                     },
                 ),
             },
-            signature: stellar_xdr::curr::Signature::default(),
+            signature: stellar_xdr::Signature::default(),
         };
         conn.store_scp_history(100, &[envelope]).unwrap();
 
@@ -983,13 +981,13 @@ mod tests {
             let node_id = NodeId(PublicKey::PublicKeyTypeEd25519(Uint256([seq as u8; 32])));
             let qset_hash = Hash([seq as u8; 32]);
             let envelope = ScpEnvelope {
-                statement: stellar_xdr::curr::ScpStatement {
+                statement: stellar_xdr::ScpStatement {
                     node_id: node_id.clone(),
                     slot_index: seq as u64,
-                    pledges: stellar_xdr::curr::ScpStatementPledges::Prepare(
-                        stellar_xdr::curr::ScpStatementPrepare {
+                    pledges: stellar_xdr::ScpStatementPledges::Prepare(
+                        stellar_xdr::ScpStatementPrepare {
                             quorum_set_hash: qset_hash.clone(),
-                            ballot: stellar_xdr::curr::ScpBallot {
+                            ballot: stellar_xdr::ScpBallot {
                                 counter: 1,
                                 value: vec![].try_into().unwrap(),
                             },
@@ -1000,7 +998,7 @@ mod tests {
                         },
                     ),
                 },
-                signature: stellar_xdr::curr::Signature::default(),
+                signature: stellar_xdr::Signature::default(),
             };
             conn.store_scp_history(seq, &[envelope]).unwrap();
 
@@ -1081,13 +1079,13 @@ mod tests {
             for validator in 0..3u8 {
                 let node_id = NodeId(PublicKey::PublicKeyTypeEd25519(Uint256([validator; 32])));
                 envelopes.push(ScpEnvelope {
-                    statement: stellar_xdr::curr::ScpStatement {
+                    statement: stellar_xdr::ScpStatement {
                         node_id,
                         slot_index: seq as u64,
-                        pledges: stellar_xdr::curr::ScpStatementPledges::Prepare(
-                            stellar_xdr::curr::ScpStatementPrepare {
+                        pledges: stellar_xdr::ScpStatementPledges::Prepare(
+                            stellar_xdr::ScpStatementPrepare {
                                 quorum_set_hash: Hash([0u8; 32]),
-                                ballot: stellar_xdr::curr::ScpBallot {
+                                ballot: stellar_xdr::ScpBallot {
                                     counter: 1,
                                     value: vec![].try_into().unwrap(),
                                 },
@@ -1098,7 +1096,7 @@ mod tests {
                             },
                         ),
                     },
-                    signature: stellar_xdr::curr::Signature::default(),
+                    signature: stellar_xdr::Signature::default(),
                 });
             }
             conn.store_scp_history(seq, &envelopes).unwrap();
@@ -1126,13 +1124,13 @@ mod tests {
             // Create a simple test envelope
             let node_id = NodeId(PublicKey::PublicKeyTypeEd25519(Uint256([seq as u8; 32])));
             let envelope = ScpEnvelope {
-                statement: stellar_xdr::curr::ScpStatement {
+                statement: stellar_xdr::ScpStatement {
                     node_id: node_id.clone(),
                     slot_index: seq as u64,
-                    pledges: stellar_xdr::curr::ScpStatementPledges::Prepare(
-                        stellar_xdr::curr::ScpStatementPrepare {
+                    pledges: stellar_xdr::ScpStatementPledges::Prepare(
+                        stellar_xdr::ScpStatementPrepare {
                             quorum_set_hash: Hash([0u8; 32]),
-                            ballot: stellar_xdr::curr::ScpBallot {
+                            ballot: stellar_xdr::ScpBallot {
                                 counter: 1,
                                 value: vec![].try_into().unwrap(),
                             },
@@ -1143,7 +1141,7 @@ mod tests {
                         },
                     ),
                 },
-                signature: stellar_xdr::curr::Signature::default(),
+                signature: stellar_xdr::Signature::default(),
             };
             conn.store_scp_history(seq, &[envelope]).unwrap();
 

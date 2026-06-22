@@ -9,7 +9,7 @@
 use std::sync::Arc;
 
 use henyey_invariant::{ConservationOfLumens, Invariant, InvariantManager, OperationDelta};
-use stellar_xdr::curr::{
+use stellar_xdr::{
     AccountEntry, AccountEntryExt, AccountId, AlphaNum4, Asset, AssetCode4, ClaimPredicate,
     ClaimableBalanceEntry, ClaimableBalanceEntryExt, ClaimableBalanceId, Claimant, ClaimantV0,
     ContractDataDurability, ContractDataEntry, ContractId, ContractIdPreimage, ExtensionPoint,
@@ -195,12 +195,12 @@ fn dummy_op() -> Operation {
 
 /// A non-inflation op result (Payment success) so the no-inflation branch runs.
 fn payment_result() -> OperationResult {
-    use stellar_xdr::curr::PaymentResult;
+    use stellar_xdr::PaymentResult;
     OperationResult::OpInner(OperationResultTr::Payment(PaymentResult::Success))
 }
 
 fn inflation_result(payouts: Vec<(u8, i64)>) -> OperationResult {
-    use stellar_xdr::curr::InflationPayout;
+    use stellar_xdr::InflationPayout;
     let payouts: VecM<InflationPayout> = payouts
         .into_iter()
         .map(|(seed, amount)| InflationPayout {
@@ -253,7 +253,7 @@ impl DeltaBuilder {
         header_previous: Option<&LedgerHeader>,
     ) -> Result<(), String> {
         let network_id = [0u8; 32];
-        let deleted_keys: Vec<stellar_xdr::curr::LedgerKey> = vec![]; // not read by invariant
+        let deleted_keys: Vec<stellar_xdr::LedgerKey> = vec![]; // not read by invariant
         let delta = OperationDelta {
             created: &self.created,
             updated: &self.updated,
@@ -611,7 +611,7 @@ fn test_conservation_mismatched_update_lengths_fail_fast() {
     let inv = ConservationOfLumens::new();
     let h = header(1_000_000, 0);
     let network_id = [0u8; 32];
-    let deleted_keys: Vec<stellar_xdr::curr::LedgerKey> = vec![];
+    let deleted_keys: Vec<stellar_xdr::LedgerKey> = vec![];
 
     // Two post-states but only one pre-state → length divergence.
     let updated = vec![account_entry(2, 500), account_entry(3, 2500)];

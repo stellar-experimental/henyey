@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use henyey_common::Hash256;
 use henyey_scp::{EnvelopeState, SCPDriver, SCPTimerType, ValidationLevel, SCP};
-use stellar_xdr::curr::{
+use stellar_xdr::{
     Hash, NodeId, PublicKey, ScpBallot, ScpEnvelope, ScpNomination, ScpQuorumSet, ScpStatement,
     ScpStatementConfirm, ScpStatementExternalize, ScpStatementPledges, ScpStatementPrepare,
     Signature, Uint256, Value,

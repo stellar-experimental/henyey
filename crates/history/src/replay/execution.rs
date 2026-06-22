@@ -20,7 +20,7 @@ use henyey_ledger::{
 };
 use henyey_tx::{muxed_to_account_id, soroban::SorobanConfig, LedgerContext, TransactionFrame};
 use sha2::{Digest, Sha256};
-use stellar_xdr::curr::{
+use stellar_xdr::{
     BucketListType, ConfigSettingEntry, ConfigSettingId, LedgerEntry, LedgerEntryData,
     LedgerEntryExt, LedgerHeader, LedgerKey, LedgerKeyConfigSetting, StateArchivalSettings,
     TransactionResultSet, WriteXdr,
@@ -34,7 +34,7 @@ use super::{LedgerReplayResult, ReplayConfig, ReplayExecutionContext};
 fn debug_xdr_hash<T: WriteXdr>(items: &[T]) -> String {
     let mut hasher = Sha256::new();
     for item in items {
-        if let Ok(xdr) = item.to_xdr(stellar_xdr::curr::Limits::none()) {
+        if let Ok(xdr) = item.to_xdr(stellar_xdr::Limits::none()) {
             hasher.update(&xdr);
         }
     }
@@ -293,25 +293,25 @@ pub(super) fn soroban_entry_size(
     entry: &LedgerEntry,
     protocol_version: u32,
     cost_params: Option<(
-        &stellar_xdr::curr::ContractCostParams,
-        &stellar_xdr::curr::ContractCostParams,
+        &stellar_xdr::ContractCostParams,
+        &stellar_xdr::ContractCostParams,
     )>,
 ) -> i64 {
     use henyey_tx::operations::execute::entry_size_for_rent_by_protocol_with_cost_params;
-    use stellar_xdr::curr::WriteXdr;
+    use stellar_xdr::WriteXdr;
 
     match &entry.data {
         LedgerEntryData::ContractData(_) => {
             // Contract data uses XDR size
             entry
-                .to_xdr(stellar_xdr::curr::Limits::none())
+                .to_xdr(stellar_xdr::Limits::none())
                 .map(|xdr_bytes| xdr_bytes.len() as i64)
                 .unwrap_or(0)
         }
         LedgerEntryData::ContractCode(_) => {
             // Contract code uses rent-adjusted size (includes compiled module memory)
             entry
-                .to_xdr(stellar_xdr::curr::Limits::none())
+                .to_xdr(stellar_xdr::Limits::none())
                 .map(|xdr_bytes| {
                     let xdr_size = xdr_bytes.len() as u32;
                     entry_size_for_rent_by_protocol_with_cost_params(
@@ -337,8 +337,8 @@ pub(super) fn compute_soroban_state_size_delta(
     changes: &[EntryChange],
     protocol_version: u32,
     cost_params: Option<(
-        &stellar_xdr::curr::ContractCostParams,
-        &stellar_xdr::curr::ContractCostParams,
+        &stellar_xdr::ContractCostParams,
+        &stellar_xdr::ContractCostParams,
     )>,
 ) -> i64 {
     let mut delta: i64 = 0;
@@ -372,9 +372,9 @@ pub(super) fn compute_soroban_state_size_window_entry(
     seq: u32,
     bucket_list: &henyey_bucket::BucketList,
     soroban_state_size: u64,
-    archival_override: Option<&stellar_xdr::curr::StateArchivalSettings>,
+    archival_override: Option<&stellar_xdr::StateArchivalSettings>,
 ) -> Result<Option<LedgerEntry>> {
-    use stellar_xdr::curr::VecM;
+    use stellar_xdr::VecM;
 
     // Load StateArchival settings
     let archival = if let Some(override_settings) = archival_override {
@@ -681,7 +681,7 @@ pub fn replay_ledger_with_execution(
                 })?,
             };
         let xdr = result_set
-            .to_xdr(stellar_xdr::curr::Limits::none())
+            .to_xdr(stellar_xdr::Limits::none())
             .map_err(|e| {
                 HistoryError::CatchupFailed(format!("failed to encode tx result set: {}", e))
             })?;
@@ -898,12 +898,12 @@ mod tests {
     use super::*;
     use henyey_bucket::{BucketList, HotArchiveBucketList};
     use henyey_common::NetworkId;
-    use stellar_xdr::curr::{Hash, LedgerEntry, LedgerEntryData, LedgerEntryExt};
+    use stellar_xdr::{Hash, LedgerEntry, LedgerEntryData, LedgerEntryExt};
 
     use super::super::tests::{make_empty_tx_set, make_test_header};
 
     fn make_contract_data_entry(seq: u32, key_bytes: &[u8], val_bytes: &[u8]) -> LedgerEntry {
-        use stellar_xdr::curr::{
+        use stellar_xdr::{
             ContractDataDurability, ContractDataEntry, ContractId, ExtensionPoint, ScAddress, ScVal,
         };
         LedgerEntry {
@@ -913,13 +913,9 @@ mod tests {
                 contract: ScAddress::Contract(ContractId(Hash(std::array::from_fn(|i| {
                     key_bytes.get(i).copied().unwrap_or(0)
                 })))),
-                key: ScVal::Bytes(
-                    stellar_xdr::curr::ScBytes::try_from(key_bytes.to_vec()).unwrap(),
-                ),
+                key: ScVal::Bytes(stellar_xdr::ScBytes::try_from(key_bytes.to_vec()).unwrap()),
                 durability: ContractDataDurability::Persistent,
-                val: ScVal::Bytes(
-                    stellar_xdr::curr::ScBytes::try_from(val_bytes.to_vec()).unwrap(),
-                ),
+                val: ScVal::Bytes(stellar_xdr::ScBytes::try_from(val_bytes.to_vec()).unwrap()),
             }),
             ext: LedgerEntryExt::V0,
         }
@@ -933,7 +929,7 @@ mod tests {
     /// `account_id_byte`. Used to construct multiple distinct `LedgerKey`s in
     /// tests that need more than one Account in the bucket list.
     fn make_account_entry_with_id(seq: u32, account_id_byte: u8) -> LedgerEntry {
-        use stellar_xdr::curr::{
+        use stellar_xdr::{
             AccountEntry, AccountEntryExt, AccountId, PublicKey, SequenceNumber, Thresholds,
             Uint256,
         };
@@ -948,9 +944,9 @@ mod tests {
                 num_sub_entries: 0,
                 inflation_dest: None,
                 flags: 0,
-                home_domain: stellar_xdr::curr::String32::default(),
+                home_domain: stellar_xdr::String32::default(),
                 thresholds: Thresholds([1, 0, 0, 0]),
-                signers: stellar_xdr::curr::VecM::default(),
+                signers: stellar_xdr::VecM::default(),
                 ext: AccountEntryExt::V0,
             }),
             ext: LedgerEntryExt::V0,
@@ -961,7 +957,7 @@ mod tests {
     /// from `hash_byte` and a fixed 100-byte WASM payload. Mirrors the helper
     /// in `crates/tx/src/operations/execute/restore_footprint.rs`.
     fn make_contract_code_entry(seq: u32, hash_byte: u8) -> LedgerEntry {
-        use stellar_xdr::curr::{ContractCodeEntry, ContractCodeEntryExt};
+        use stellar_xdr::{ContractCodeEntry, ContractCodeEntryExt};
         LedgerEntry {
             last_modified_ledger_seq: seq,
             data: LedgerEntryData::ContractCode(ContractCodeEntry {
@@ -983,7 +979,7 @@ mod tests {
         ledger_seq: u32,
         live: Vec<LedgerEntry>,
     ) {
-        use stellar_xdr::curr::BucketListType;
+        use stellar_xdr::BucketListType;
         bucket_list
             .add_batch(
                 ledger_seq,
@@ -1390,7 +1386,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_compute_soroban_state_size_window_entry_at_sample_boundary() {
-        use stellar_xdr::curr::{BucketListType, ConfigSettingEntry, StateArchivalSettings};
+        use stellar_xdr::{BucketListType, ConfigSettingEntry, StateArchivalSettings};
 
         // Create archival settings with sample_period=100, sample_size=5
         let archival = StateArchivalSettings {
@@ -1400,7 +1396,7 @@ mod tests {
         };
 
         // Create initial window with 5 samples
-        let initial_window: stellar_xdr::curr::VecM<u64> =
+        let initial_window: stellar_xdr::VecM<u64> =
             vec![1000, 2000, 3000, 4000, 5000].try_into().unwrap();
 
         // Set up bucket list with required config entries
@@ -1469,7 +1465,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_compute_soroban_state_size_window_entry_not_at_boundary() {
-        use stellar_xdr::curr::{BucketListType, ConfigSettingEntry, StateArchivalSettings};
+        use stellar_xdr::{BucketListType, ConfigSettingEntry, StateArchivalSettings};
 
         // Create archival settings with sample_period=100
         let archival = StateArchivalSettings {
@@ -1478,7 +1474,7 @@ mod tests {
             ..StateArchivalSettings::default()
         };
 
-        let initial_window: stellar_xdr::curr::VecM<u64> =
+        let initial_window: stellar_xdr::VecM<u64> =
             vec![1000, 2000, 3000, 4000, 5000].try_into().unwrap();
 
         let mut bucket_list = BucketList::new();
@@ -1531,7 +1527,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_compute_soroban_state_size_window_entry_resize_smaller() {
-        use stellar_xdr::curr::{BucketListType, ConfigSettingEntry, StateArchivalSettings};
+        use stellar_xdr::{BucketListType, ConfigSettingEntry, StateArchivalSettings};
 
         // New settings want size 3 instead of 5
         let archival = StateArchivalSettings {
@@ -1541,7 +1537,7 @@ mod tests {
         };
 
         // Current window has 5 entries
-        let initial_window: stellar_xdr::curr::VecM<u64> =
+        let initial_window: stellar_xdr::VecM<u64> =
             vec![1000, 2000, 3000, 4000, 5000].try_into().unwrap();
 
         let mut bucket_list = BucketList::new();
@@ -1744,7 +1740,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_compute_soroban_state_size_window_entry_zero_sample_period_errors() {
-        use stellar_xdr::curr::StateArchivalSettings;
+        use stellar_xdr::StateArchivalSettings;
 
         let archival = StateArchivalSettings {
             live_soroban_state_size_window_sample_period: 0,
@@ -1765,7 +1761,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_compute_soroban_state_size_window_entry_missing_window_errors() {
-        use stellar_xdr::curr::StateArchivalSettings;
+        use stellar_xdr::StateArchivalSettings;
 
         let archival = StateArchivalSettings {
             live_soroban_state_size_window_sample_period: 100,
@@ -1784,7 +1780,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_compute_soroban_state_size_window_entry_empty_window_errors() {
-        use stellar_xdr::curr::{BucketListType, ConfigSettingEntry, StateArchivalSettings};
+        use stellar_xdr::{BucketListType, ConfigSettingEntry, StateArchivalSettings};
 
         let archival = StateArchivalSettings {
             live_soroban_state_size_window_sample_period: 100,
@@ -1794,7 +1790,7 @@ mod tests {
 
         // Add an empty window to the bucket list
         let mut bucket_list = BucketList::new();
-        let empty_window: stellar_xdr::curr::VecM<u64> = vec![].try_into().unwrap();
+        let empty_window: stellar_xdr::VecM<u64> = vec![].try_into().unwrap();
         let window_entry = LedgerEntry {
             last_modified_ledger_seq: 1,
             data: LedgerEntryData::ConfigSetting(ConfigSettingEntry::LiveSorobanStateSizeWindow(
@@ -1826,7 +1822,7 @@ mod tests {
     #[test]
     fn test_load_state_archival_wrong_variant_errors() {
         use henyey_ledger::execution::load_config_setting;
-        use stellar_xdr::curr::{
+        use stellar_xdr::{
             ConfigSettingContractComputeV0, ConfigSettingEntry, ConfigSettingId, LedgerEntry,
             LedgerEntryData, LedgerEntryExt, LedgerKey, LedgerKeyConfigSetting,
         };
@@ -1891,7 +1887,7 @@ mod tests {
     fn test_load_state_archival_io_error_propagates() {
         use henyey_ledger::execution::load_config_setting;
         use std::sync::Arc;
-        use stellar_xdr::curr::{ConfigSettingEntry, ConfigSettingId};
+        use stellar_xdr::{ConfigSettingEntry, ConfigSettingId};
 
         let snapshot = henyey_ledger::LedgerSnapshot::empty(1);
         let lookup_fn: henyey_ledger::EntryLookupFn = Arc::new(|_key| {
@@ -1937,7 +1933,7 @@ mod tests {
     async fn test_replay_fee_event_code_path_executes() {
         use henyey_common::NetworkId;
         use henyey_crypto::{sign_hash, SecretKey};
-        use stellar_xdr::curr::{
+        use stellar_xdr::{
             AccountEntry, AccountEntryExt, AccountId, BucketListType, ContractCodeEntry,
             ContractCodeEntryExt, DecoratedSignature, ExtendFootprintTtlOp, ExtensionPoint,
             LedgerFootprint, LedgerKeyContractCode, Memo, MuxedAccount, Operation, OperationBody,
@@ -1949,7 +1945,7 @@ mod tests {
 
         let network_id = NetworkId::testnet();
         let secret = SecretKey::from_seed(&[1u8; 32]);
-        let source_id = AccountId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(Uint256(
+        let source_id = AccountId(stellar_xdr::PublicKey::PublicKeyTypeEd25519(Uint256(
             *secret.public_key().as_bytes(),
         )));
 
@@ -1978,7 +1974,7 @@ mod tests {
             data: LedgerEntryData::ContractCode(ContractCodeEntry {
                 ext: ContractCodeEntryExt::V0,
                 hash: code_hash.clone(),
-                code: stellar_xdr::curr::BytesM::try_from(vec![1u8, 2u8, 3u8]).unwrap(),
+                code: stellar_xdr::BytesM::try_from(vec![1u8, 2u8, 3u8]).unwrap(),
             }),
             ext: LedgerEntryExt::V0,
         };
@@ -2133,7 +2129,7 @@ mod tests {
         use henyey_bucket::EvictionIterator;
         use henyey_common::xdr_to_bytes;
         use sha2::{Digest, Sha256};
-        use stellar_xdr::curr::{
+        use stellar_xdr::{
             ConfigSettingEntry, ContractCostParamEntry, ContractCostParams, ContractDataDurability,
             ContractDataEntry, ContractId, ExtensionPoint, LedgerKeyConfigSetting,
             LedgerKeyContractData, LedgerKeyTtl, ScAddress, ScBytes, ScVal, StateArchivalSettings,
@@ -2261,7 +2257,7 @@ mod tests {
             .add_batch(
                 1,
                 25,
-                stellar_xdr::curr::BucketListType::Live,
+                stellar_xdr::BucketListType::Live,
                 all_entries,
                 vec![],
                 vec![],

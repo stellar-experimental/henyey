@@ -14,7 +14,7 @@
 //! - `PendingEnvelopes::getJsonInfo()`
 
 use serde::{Deserialize, Serialize};
-use stellar_xdr::curr::NodeId;
+use stellar_xdr::NodeId;
 
 /// Complete Herder JSON info response.
 ///
@@ -249,7 +249,7 @@ pub fn format_node_id(node_id: &NodeId, full_keys: bool) -> String {
     use stellar_strkey::ed25519::PublicKey as StrPublicKey;
 
     match &node_id.0 {
-        stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(key) => {
+        stellar_xdr::PublicKey::PublicKeyTypeEd25519(key) => {
             let strkey = StrPublicKey(key.0).to_string();
             if full_keys {
                 strkey
@@ -461,14 +461,12 @@ impl QuorumJsonInfoBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use stellar_xdr::curr::Uint256;
+    use stellar_xdr::Uint256;
 
     fn make_test_node_id(seed: u8) -> NodeId {
         let mut key = [0u8; 32];
         key[0] = seed;
-        NodeId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(Uint256(
-            key,
-        )))
+        NodeId(stellar_xdr::PublicKey::PublicKeyTypeEd25519(Uint256(key)))
     }
 
     #[test]

@@ -1,6 +1,6 @@
 //! Offer exchange math helpers (v10+).
 
-use stellar_xdr::curr::{AccountId, Asset, ClaimAtom, Price};
+use stellar_xdr::{AccountId, Asset, ClaimAtom, Price};
 
 use crate::frozen_keys::FrozenKeyConfig;
 use crate::state::LedgerStateManager;

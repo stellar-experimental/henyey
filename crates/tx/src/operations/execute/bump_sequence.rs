@@ -1,6 +1,6 @@
 //! BumpSequence operation execution.
 
-use stellar_xdr::curr::{
+use stellar_xdr::{
     AccountId, BumpSequenceOp, BumpSequenceResult, BumpSequenceResultCode, OperationResult,
     OperationResultTr,
 };
@@ -54,7 +54,7 @@ fn make_result(code: BumpSequenceResultCode) -> OperationResult {
 mod tests {
     use super::*;
     use crate::test_utils::create_test_account_id;
-    use stellar_xdr::curr::*;
+    use stellar_xdr::*;
 
     fn create_test_account(account_id: AccountId, balance: i64, seq_num: i64) -> AccountEntry {
         AccountEntry {

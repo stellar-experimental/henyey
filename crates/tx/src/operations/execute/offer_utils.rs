@@ -6,7 +6,7 @@
 //! - Crossing an offer (the v10 exchange path)
 //! - Deleting an offer with sponsorship/sub-entry cleanup
 
-use stellar_xdr::curr::{
+use stellar_xdr::{
     AccountId, Asset, ClaimAtom, ClaimOfferAtom, LedgerKey, LedgerKeyOffer, OfferEntry, Price,
 };
 

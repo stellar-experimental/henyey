@@ -18,7 +18,7 @@
 //!
 //! ```
 //! use henyey_ledger::offer::OfferDescriptor;
-//! use stellar_xdr::curr::Price;
+//! use stellar_xdr::Price;
 //!
 //! let offer1 = OfferDescriptor {
 //!     price: Price { n: 1, d: 2 },  // 0.5
@@ -36,7 +36,7 @@
 
 use std::hash::{Hash, Hasher};
 
-use stellar_xdr::curr::{Asset, LedgerEntry, OfferEntry, Price, WriteXdr};
+use stellar_xdr::{Asset, LedgerEntry, OfferEntry, Price, WriteXdr};
 
 /// A lightweight descriptor for an offer used in sorting and comparison.
 ///
@@ -71,7 +71,7 @@ impl OfferDescriptor {
     /// Panics if the ledger entry does not contain an offer.
     pub fn from_ledger_entry(entry: &LedgerEntry) -> Self {
         match &entry.data {
-            stellar_xdr::curr::LedgerEntryData::Offer(offer) => Self::from_offer_entry(offer),
+            stellar_xdr::LedgerEntryData::Offer(offer) => Self::from_offer_entry(offer),
             _ => panic!("Expected offer entry"),
         }
     }
@@ -156,10 +156,10 @@ impl AssetPair {
 impl Hash for AssetPair {
     fn hash<H: Hasher>(&self, state: &mut H) {
         // Hash the XDR bytes of both assets
-        if let Ok(bytes) = self.buying.to_xdr(stellar_xdr::curr::Limits::none()) {
+        if let Ok(bytes) = self.buying.to_xdr(stellar_xdr::Limits::none()) {
             bytes.hash(state);
         }
-        if let Ok(bytes) = self.selling.to_xdr(stellar_xdr::curr::Limits::none()) {
+        if let Ok(bytes) = self.selling.to_xdr(stellar_xdr::Limits::none()) {
             bytes.hash(state);
         }
     }
@@ -211,13 +211,11 @@ mod tests {
     #[test]
     fn test_asset_pair() {
         let native = Asset::Native;
-        let credit = Asset::CreditAlphanum4(stellar_xdr::curr::AlphaNum4 {
-            asset_code: stellar_xdr::curr::AssetCode4([b'U', b'S', b'D', 0]),
-            issuer: stellar_xdr::curr::AccountId(
-                stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(stellar_xdr::curr::Uint256(
-                    [0; 32],
-                )),
-            ),
+        let credit = Asset::CreditAlphanum4(stellar_xdr::AlphaNum4 {
+            asset_code: stellar_xdr::AssetCode4([b'U', b'S', b'D', 0]),
+            issuer: stellar_xdr::AccountId(stellar_xdr::PublicKey::PublicKeyTypeEd25519(
+                stellar_xdr::Uint256([0; 32]),
+            )),
         });
 
         let pair1 = AssetPair::new(native.clone(), credit.clone());
@@ -233,13 +231,11 @@ mod tests {
         use std::collections::HashMap;
 
         let native = Asset::Native;
-        let credit = Asset::CreditAlphanum4(stellar_xdr::curr::AlphaNum4 {
-            asset_code: stellar_xdr::curr::AssetCode4([b'U', b'S', b'D', 0]),
-            issuer: stellar_xdr::curr::AccountId(
-                stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(stellar_xdr::curr::Uint256(
-                    [0; 32],
-                )),
-            ),
+        let credit = Asset::CreditAlphanum4(stellar_xdr::AlphaNum4 {
+            asset_code: stellar_xdr::AssetCode4([b'U', b'S', b'D', 0]),
+            issuer: stellar_xdr::AccountId(stellar_xdr::PublicKey::PublicKeyTypeEd25519(
+                stellar_xdr::Uint256([0; 32]),
+            )),
         });
 
         let pair = AssetPair::new(native.clone(), credit.clone());

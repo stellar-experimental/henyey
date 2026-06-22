@@ -80,7 +80,7 @@
 use std::collections::HashSet;
 
 use henyey_common::protocol::MIN_SOROBAN_PROTOCOL_VERSION;
-use stellar_xdr::curr::{LedgerEntry, LedgerKey, StateArchivalSettings};
+use stellar_xdr::{LedgerEntry, LedgerKey, StateArchivalSettings};
 
 use crate::bucket::Bucket;
 use crate::bucket_list::BUCKET_LIST_LEVELS;
@@ -103,7 +103,7 @@ pub(crate) const DEFAULT_STARTING_EVICTION_SCAN_LEVEL: u32 = 6;
 ///
 /// 1. Level N curr bucket → Level N snap bucket → Level N+1 curr bucket → ...
 /// 2. Wraps back to starting level when reaching the top.
-pub type EvictionIterator = stellar_xdr::curr::EvictionIterator;
+pub type EvictionIterator = stellar_xdr::EvictionIterator;
 
 /// Extension trait adding eviction-specific methods to the XDR `EvictionIterator`.
 pub trait EvictionIteratorExt {
@@ -1140,7 +1140,7 @@ mod tests {
 
     // --- EvictionResult::resolve() tests ---
 
-    use stellar_xdr::curr::{
+    use stellar_xdr::{
         ContractDataDurability, ContractDataEntry, ContractId, ExtensionPoint, Hash, LedgerEntry,
         LedgerEntryData, LedgerEntryExt, ScAddress, ScVal,
     };
@@ -1495,20 +1495,20 @@ mod tests {
     #[test]
     #[should_panic(expected = "Soroban entry")]
     fn test_eviction_candidate_rejects_non_soroban_entry() {
-        use stellar_xdr::curr::{AccountEntry, AccountId, PublicKey, Thresholds, Uint256};
+        use stellar_xdr::{AccountEntry, AccountId, PublicKey, Thresholds, Uint256};
         let non_soroban_entry = LedgerEntry {
             last_modified_ledger_seq: 1,
             data: LedgerEntryData::Account(AccountEntry {
                 account_id: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([0; 32]))),
                 balance: 100,
-                seq_num: stellar_xdr::curr::SequenceNumber(1),
+                seq_num: stellar_xdr::SequenceNumber(1),
                 num_sub_entries: 0,
                 inflation_dest: None,
                 flags: 0,
-                home_domain: stellar_xdr::curr::String32::default(),
+                home_domain: stellar_xdr::String32::default(),
                 thresholds: Thresholds([1, 0, 0, 0]),
-                signers: stellar_xdr::curr::VecM::default(),
-                ext: stellar_xdr::curr::AccountEntryExt::V0,
+                signers: stellar_xdr::VecM::default(),
+                ext: stellar_xdr::AccountEntryExt::V0,
             }),
             ext: LedgerEntryExt::V0,
         };

@@ -28,7 +28,7 @@ use henyey_herder::{
     get_tx_set_hashes, PersistedSlotState, ScpPersistenceManager, ScpStatePersistence,
     SqliteScpPersistence,
 };
-use stellar_xdr::curr::{
+use stellar_xdr::{
     Hash, Limits, NodeId, PublicKey, ScpEnvelope, ScpNomination, ScpStatement, ScpStatementPledges,
     Signature, StellarValue, StellarValueExt, TimePoint, Uint256, Value, WriteXdr,
 };

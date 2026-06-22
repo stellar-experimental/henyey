@@ -17,7 +17,7 @@ use henyey_common::Hash256;
 use henyey_history::{archive::HistoryArchive, archive_state::HistoryArchiveState, verify};
 use henyey_ledger::TransactionSetVariant;
 use henyey_work::{Work, WorkContext, WorkOutcome};
-use stellar_xdr::curr::{LedgerHeaderHistoryEntry, TransactionHistoryEntryExt, WriteXdr};
+use stellar_xdr::{LedgerHeaderHistoryEntry, TransactionHistoryEntryExt, WriteXdr};
 
 use crate::{set_progress, HistoryWorkStage, SharedHistoryState};
 
@@ -552,10 +552,7 @@ impl Work for DownloadTxResultsWork {
                     return WorkOutcome::Failed(err);
                 }
             };
-            let xdr = match entry
-                .tx_result_set
-                .to_xdr(stellar_xdr::curr::Limits::none())
-            {
+            let xdr = match entry.tx_result_set.to_xdr(stellar_xdr::Limits::none()) {
                 Ok(xdr) => xdr,
                 Err(err) => {
                     emit_archive_counter(

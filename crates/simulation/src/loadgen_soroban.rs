@@ -6,7 +6,7 @@
 
 use henyey_common::{Hash256, NetworkId};
 use henyey_crypto::{sign_hash, SecretKey};
-use stellar_xdr::curr::{
+use stellar_xdr::{
     ContractDataDurability, ContractExecutable, ContractId, ContractIdPreimage,
     ContractIdPreimageFromAddress, CreateContractArgs, DecoratedSignature, Hash, HashIdPreimage,
     HashIdPreimageContractId, HostFunction, Int128Parts, InvokeContractArgs, InvokeHostFunctionOp,
@@ -291,10 +291,8 @@ impl SorobanTxBuilder {
         salt: &Uint256,
         inclusion_fee: u32,
     ) -> anyhow::Result<TransactionEnvelope> {
-        let deployer_address = ScAddress::Account(stellar_xdr::curr::AccountId(
-            stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(Uint256(
-                *source.public_key().as_bytes(),
-            )),
+        let deployer_address = ScAddress::Account(stellar_xdr::AccountId(
+            stellar_xdr::PublicKey::PublicKeyTypeEd25519(Uint256(*source.public_key().as_bytes())),
         ));
 
         let preimage = ContractIdPreimage::Address(ContractIdPreimageFromAddress {
@@ -715,7 +713,7 @@ impl SorobanTxBuilder {
         &self,
         source: &SecretKey,
         sequence: i64,
-        asset: stellar_xdr::curr::Asset,
+        asset: stellar_xdr::Asset,
         inclusion_fee: u32,
     ) -> anyhow::Result<TransactionEnvelope> {
         let preimage = ContractIdPreimage::Asset(asset);
@@ -1076,8 +1074,8 @@ pub fn make_i128(value: i128) -> ScVal {
 
 /// Construct an `ScAddress::Account` from a public key.
 pub fn make_account_address(public_key: &henyey_crypto::PublicKey) -> ScAddress {
-    ScAddress::Account(stellar_xdr::curr::AccountId(
-        stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(Uint256(*public_key.as_bytes())),
+    ScAddress::Account(stellar_xdr::AccountId(
+        stellar_xdr::PublicKey::PublicKeyTypeEd25519(Uint256(*public_key.as_bytes())),
     ))
 }
 
@@ -1116,7 +1114,7 @@ fn build_sac_transfer_rw_keys(
 
     // Source account key
     if let ScAddress::Account(ref aid) = from_address {
-        keys.push(LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
+        keys.push(LedgerKey::Account(stellar_xdr::LedgerKeyAccount {
             account_id: aid.clone(),
         }));
     }
@@ -1124,7 +1122,7 @@ fn build_sac_transfer_rw_keys(
     // Destination balance key
     match &to_address {
         ScAddress::Contract(_) => {
-            let balance_key = ScVal::Vec(Some(stellar_xdr::curr::ScVec(
+            let balance_key = ScVal::Vec(Some(stellar_xdr::ScVec(
                 vec![
                     ScVal::Symbol(ScSymbol("Balance".try_into().unwrap())),
                     ScVal::Address(to_address),
@@ -1133,15 +1131,15 @@ fn build_sac_transfer_rw_keys(
                 .unwrap_or_default(),
             )));
             keys.push(LedgerKey::ContractData(
-                stellar_xdr::curr::LedgerKeyContractData {
+                stellar_xdr::LedgerKeyContractData {
                     contract: make_contract_address(contract_id),
                     key: balance_key,
-                    durability: stellar_xdr::curr::ContractDataDurability::Persistent,
+                    durability: stellar_xdr::ContractDataDurability::Persistent,
                 },
             ));
         }
         ScAddress::Account(ref aid) => {
-            keys.push(LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
+            keys.push(LedgerKey::Account(stellar_xdr::LedgerKeyAccount {
                 account_id: aid.clone(),
             }));
         }
@@ -1719,7 +1717,7 @@ mod tests {
 
     #[test]
     fn test_compute_contract_id_deterministic() {
-        let preimage = ContractIdPreimage::Asset(stellar_xdr::curr::Asset::Native);
+        let preimage = ContractIdPreimage::Asset(stellar_xdr::Asset::Native);
         let id1 = compute_contract_id(&preimage, "Test SDF Network ; September 2015").unwrap();
         let id2 = compute_contract_id(&preimage, "Test SDF Network ; September 2015").unwrap();
         assert_eq!(id1, id2);

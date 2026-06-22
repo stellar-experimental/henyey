@@ -58,7 +58,7 @@ use henyey_tx::envelope_utils::{
     envelope_operation_count, has_dex_operations_envelope, is_soroban_envelope,
     resources_from_envelope,
 };
-use stellar_xdr::curr::TransactionEnvelope;
+use stellar_xdr::TransactionEnvelope;
 
 use crate::tx_queue::QueuedTransaction;
 use henyey_tx::FeeRate;
@@ -866,7 +866,7 @@ mod tests {
     #[should_panic(expected = "erase: resources exceed lane current count")]
     fn test_erase_panics_when_resources_exceed_lane_count() {
         use crate::tx_queue::QueuedTransaction;
-        use stellar_xdr::curr::{
+        use stellar_xdr::{
             DecoratedSignature, Memo, MuxedAccount, Operation, OperationBody, Preconditions,
             SequenceNumber, Signature, SignatureHint, Transaction, TransactionEnvelope,
             TransactionV1Envelope, Uint256,
@@ -888,7 +888,7 @@ mod tests {
             }]
             .try_into()
             .unwrap(),
-            ext: stellar_xdr::curr::TransactionExt::V0,
+            ext: stellar_xdr::TransactionExt::V0,
         };
         let envelope = TransactionEnvelope::Tx(TransactionV1Envelope {
             tx,

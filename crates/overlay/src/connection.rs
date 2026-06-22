@@ -25,7 +25,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
-use stellar_xdr::curr::AuthenticatedMessage;
+use stellar_xdr::AuthenticatedMessage;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::timeout;
@@ -71,7 +71,7 @@ impl ConnectionDirection {
 /// 3. Call [`close`](Connection::close) when done (or drop the connection)
 ///
 /// [`MessageCodec`]: crate::MessageCodec
-/// [`AuthenticatedMessage`]: stellar_xdr::curr::AuthenticatedMessage
+/// [`AuthenticatedMessage`]: stellar_xdr::AuthenticatedMessage
 pub struct Connection {
     /// Framed stream for message encoding/decoding.
     framed: Framed<BoxedIo, MessageCodec>,

@@ -23,7 +23,7 @@
 
 use crate::{OverlayError, Result};
 use bytes::{Buf, BufMut, BytesMut};
-use stellar_xdr::curr::{AuthenticatedMessage, Limits, ReadXdr, WriteXdr};
+use stellar_xdr::{AuthenticatedMessage, Limits, ReadXdr, WriteXdr};
 use tokio_util::codec::{Decoder, Encoder};
 
 /// Maximum message size (16 MB) - prevents memory exhaustion.
@@ -281,7 +281,7 @@ impl Encoder<AuthenticatedMessage> for MessageCodec {
 /// SHA-256. The authoritative implementation is
 /// [`crate::flood::compute_message_hash`]; all flood-gate call sites use it.
 pub mod helpers {
-    use stellar_xdr::curr::StellarMessage;
+    use stellar_xdr::StellarMessage;
 
     /// Returns true if this message type is flow-controlled (uses flood/flow
     /// capacity). This includes both globally-deduplicated flood payloads
@@ -359,7 +359,7 @@ pub mod helpers {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use stellar_xdr::curr::{AuthenticatedMessageV0, HmacSha256Mac, StellarMessage, VecM};
+    use stellar_xdr::{AuthenticatedMessageV0, HmacSha256Mac, StellarMessage, VecM};
 
     fn make_test_message() -> AuthenticatedMessage {
         AuthenticatedMessage::V0(AuthenticatedMessageV0 {
@@ -634,7 +634,7 @@ mod tests {
     fn test_is_flood_message_classification() {
         // Flood messages
         assert!(helpers::is_flood_message(&StellarMessage::Transaction(
-            stellar_xdr::curr::TransactionEnvelope::TxV0(Default::default())
+            stellar_xdr::TransactionEnvelope::TxV0(Default::default())
         )));
         assert!(helpers::is_flood_message(&StellarMessage::FloodAdvert(
             Default::default()
@@ -668,9 +668,9 @@ mod tests {
     #[test]
     fn test_watcher_droppable_keeps_tx_flooding_messages() {
         assert!(!helpers::is_watcher_droppable(
-            &StellarMessage::Transaction(stellar_xdr::curr::TransactionEnvelope::TxV0(
-                Default::default()
-            ))
+            &StellarMessage::Transaction(
+                stellar_xdr::TransactionEnvelope::TxV0(Default::default())
+            )
         ));
         assert!(!helpers::is_watcher_droppable(
             &StellarMessage::FloodAdvert(Default::default())
@@ -708,9 +708,9 @@ mod tests {
 
         // Transaction and SCP messages ARE FloodGate-tracked
         assert!(helpers::is_flood_gate_tracked(
-            &StellarMessage::Transaction(stellar_xdr::curr::TransactionEnvelope::TxV0(
-                Default::default()
-            ))
+            &StellarMessage::Transaction(
+                stellar_xdr::TransactionEnvelope::TxV0(Default::default())
+            )
         ));
         assert!(helpers::is_flood_gate_tracked(&StellarMessage::ScpMessage(
             Default::default()

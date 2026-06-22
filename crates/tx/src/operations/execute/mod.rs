@@ -37,7 +37,7 @@ pub(super) use henyey_common::checked_types::{account_liabilities, trustline_lia
 use soroban_env_host_p24 as soroban_env_host24;
 use soroban_env_host_p25 as soroban_env_host25;
 use soroban_env_host_p26 as soroban_env_host26;
-use stellar_xdr::curr::{
+use stellar_xdr::{
     AccountEntry, AccountEntryExt, AccountEntryExtensionV1, AccountEntryExtensionV1Ext, AccountId,
     Asset, ContractEvent, DiagnosticEvent, ExtendFootprintTtlResult, InvokeHostFunctionResult,
     LedgerKey, Liabilities, Operation, OperationBody, OperationResult, OperationResultTr,
@@ -316,11 +316,11 @@ fn apply_balance_delta(
 }
 
 /// Classify a ledger key for rent purposes: (is_persistent, is_code_entry).
-fn rent_classification(key: &stellar_xdr::curr::LedgerKey) -> (bool, bool) {
+fn rent_classification(key: &stellar_xdr::LedgerKey) -> (bool, bool) {
     match key {
-        stellar_xdr::curr::LedgerKey::ContractCode(_) => (true, true),
-        stellar_xdr::curr::LedgerKey::ContractData(cd) => (
-            cd.durability == stellar_xdr::curr::ContractDataDurability::Persistent,
+        stellar_xdr::LedgerKey::ContractCode(_) => (true, true),
+        stellar_xdr::LedgerKey::ContractData(cd) => (
+            cd.durability == stellar_xdr::ContractDataDurability::Persistent,
             false,
         ),
         _ => (false, false),
@@ -509,7 +509,7 @@ pub struct SorobanOperationMeta {
     /// Diagnostic events emitted during execution.
     pub diagnostic_events: Vec<DiagnosticEvent>,
     /// Return value for invoke host function (if any).
-    pub return_value: Option<stellar_xdr::curr::ScVal>,
+    pub return_value: Option<stellar_xdr::ScVal>,
     /// Contract events + return value size in bytes.
     pub event_size_bytes: u32,
     /// Rent fee charged for storage changes.
@@ -558,10 +558,10 @@ impl SorobanOperationMeta {
 /// in `processOpLedgerEntryChanges` to determine RESTORED vs RESTORED+UPDATED emission.
 #[derive(Debug, Clone)]
 pub struct HotArchiveRestore {
-    key: stellar_xdr::curr::LedgerKey,
-    entry: stellar_xdr::curr::LedgerEntry,
+    key: stellar_xdr::LedgerKey,
+    entry: stellar_xdr::LedgerEntry,
     /// Synthesized TTL entry at the time of restore. Used for meta comparison.
-    ttl_entry: stellar_xdr::curr::LedgerEntry,
+    ttl_entry: stellar_xdr::LedgerEntry,
 }
 
 impl HotArchiveRestore {
@@ -577,8 +577,8 @@ impl HotArchiveRestore {
     /// - `key` is not a persistent Soroban key (ContractCode or persistent ContractData)
     /// - `entry` does not correspond to `key`
     pub fn new(
-        key: stellar_xdr::curr::LedgerKey,
-        entry: stellar_xdr::curr::LedgerEntry,
+        key: stellar_xdr::LedgerKey,
+        entry: stellar_xdr::LedgerEntry,
         restored_live_until_ledger: u32,
     ) -> Self {
         assert!(
@@ -604,34 +604,31 @@ impl HotArchiveRestore {
     }
 
     /// The ledger key of the restored entry (ContractCode or persistent ContractData).
-    pub fn key(&self) -> &stellar_xdr::curr::LedgerKey {
+    pub fn key(&self) -> &stellar_xdr::LedgerKey {
         &self.key
     }
 
     /// The restored entry value.
-    pub fn entry(&self) -> &stellar_xdr::curr::LedgerEntry {
+    pub fn entry(&self) -> &stellar_xdr::LedgerEntry {
         &self.entry
     }
 
     /// The synthesized TTL entry at the time of restore.
-    pub fn ttl_entry(&self) -> &stellar_xdr::curr::LedgerEntry {
+    pub fn ttl_entry(&self) -> &stellar_xdr::LedgerEntry {
         &self.ttl_entry
     }
 
     /// Derive the TTL key from the data/code key.
-    pub fn ttl_key(&self) -> stellar_xdr::curr::LedgerKey {
+    pub fn ttl_key(&self) -> stellar_xdr::LedgerKey {
         let key_hash = crate::soroban::compute_key_hash(&self.key);
-        stellar_xdr::curr::LedgerKey::Ttl(stellar_xdr::curr::LedgerKeyTtl { key_hash })
+        stellar_xdr::LedgerKey::Ttl(stellar_xdr::LedgerKeyTtl { key_hash })
     }
 }
 
 #[cfg(test)]
 impl HotArchiveRestore {
     /// Test helper: create with a default TTL target of 1000.
-    pub fn new_for_test(
-        key: stellar_xdr::curr::LedgerKey,
-        entry: stellar_xdr::curr::LedgerEntry,
-    ) -> Self {
+    pub fn new_for_test(key: stellar_xdr::LedgerKey, entry: stellar_xdr::LedgerEntry) -> Self {
         Self::new(key, entry, 1000)
     }
 }
@@ -660,12 +657,12 @@ pub struct RevokeEvent {
     /// The asset moving out of the pool.
     pub asset: Asset,
     /// The liquidity pool the asset is leaving (the event `from`).
-    pub pool_id: stellar_xdr::curr::PoolId,
+    pub pool_id: stellar_xdr::PoolId,
     /// The amount withdrawn from the pool for this asset.
     pub amount: i64,
     /// Some(cb) for a `transfer` to the claimable balance; None for a `burn`
     /// to the issuer (holder issues this asset).
-    pub claimable_balance_id: Option<stellar_xdr::curr::ClaimableBalanceId>,
+    pub claimable_balance_id: Option<stellar_xdr::ClaimableBalanceId>,
 }
 
 impl OperationExecutionResult {
@@ -709,7 +706,7 @@ enum OldRentState {
 }
 
 struct RentSnapshot {
-    key: stellar_xdr::curr::LedgerKey,
+    key: stellar_xdr::LedgerKey,
     is_persistent: bool,
     is_code_entry: bool,
     old_state: OldRentState,
@@ -736,15 +733,16 @@ struct RentChange {
 /// available.
 pub fn entry_size_for_rent_by_protocol_with_cost_params(
     protocol_version: u32,
-    entry: &stellar_xdr::curr::LedgerEntry,
+    entry: &stellar_xdr::LedgerEntry,
     entry_xdr_size: u32,
     cost_params: Option<(
-        &stellar_xdr::curr::ContractCostParams,
-        &stellar_xdr::curr::ContractCostParams,
+        &stellar_xdr::ContractCostParams,
+        &stellar_xdr::ContractCostParams,
     )>,
 ) -> u32 {
     use crate::soroban::convert::{
         try_convert_ledger_entry_to_p24, try_convert_ledger_entry_ws_to_p25,
+        try_convert_ledger_entry_ws_to_p26,
     };
     if protocol_version_is_before(protocol_version, ProtocolVersion::V25) {
         let budget = match cost_params {
@@ -781,20 +779,31 @@ pub fn entry_size_for_rent_by_protocol_with_cost_params(
             }
         }
     } else {
-        // Protocol >= 26: p26 host uses stellar-xdr 26.0.0 (same as workspace).
+        // Protocol >= 26: p26 host pins stellar-xdr 26.0.0, distinct from the
+        // workspace XDR, so the entry is byte-converted to the P26 type.
         let budget = match cost_params {
             Some((cpu, mem)) => build_budget_p26(cpu, mem),
             None => soroban_env_host26::budget::Budget::default(),
         };
-        soroban_env_host26::e2e_invoke::entry_size_for_rent(&budget, entry, entry_xdr_size)
-            .unwrap_or(entry_xdr_size)
+        match try_convert_ledger_entry_ws_to_p26(entry) {
+            Ok(p26_entry) => soroban_env_host26::e2e_invoke::entry_size_for_rent(
+                &budget,
+                &p26_entry,
+                entry_xdr_size,
+            )
+            .unwrap_or(entry_xdr_size),
+            Err(e) => {
+                tracing::warn!("entry_size_for_rent: {e}, falling back to XDR size");
+                entry_xdr_size
+            }
+        }
     }
 }
 
 /// Build a P24 Budget from on-chain cost parameters.
 fn build_budget_p24(
-    cpu_cost_params: &stellar_xdr::curr::ContractCostParams,
-    mem_cost_params: &stellar_xdr::curr::ContractCostParams,
+    cpu_cost_params: &stellar_xdr::ContractCostParams,
+    mem_cost_params: &stellar_xdr::ContractCostParams,
 ) -> soroban_env_host24::budget::Budget {
     use crate::soroban::convert::try_convert_cost_params_to_p24;
     match (
@@ -815,8 +824,8 @@ fn build_budget_p24(
 
 /// Build a P25 Budget from on-chain cost parameters.
 fn build_budget_p25(
-    cpu_cost_params: &stellar_xdr::curr::ContractCostParams,
-    mem_cost_params: &stellar_xdr::curr::ContractCostParams,
+    cpu_cost_params: &stellar_xdr::ContractCostParams,
+    mem_cost_params: &stellar_xdr::ContractCostParams,
 ) -> soroban_env_host25::budget::Budget {
     use crate::soroban::convert::try_convert_cost_params_ws_to_p25;
     match (
@@ -833,30 +842,33 @@ fn build_budget_p25(
 }
 
 /// Build a P26 Budget from on-chain cost parameters.
-///
-/// P26 host uses stellar-xdr 26.0.0 (same as workspace) — no conversion needed.
 fn build_budget_p26(
-    cpu_cost_params: &stellar_xdr::curr::ContractCostParams,
-    mem_cost_params: &stellar_xdr::curr::ContractCostParams,
+    cpu_cost_params: &stellar_xdr::ContractCostParams,
+    mem_cost_params: &stellar_xdr::ContractCostParams,
 ) -> soroban_env_host26::budget::Budget {
-    soroban_env_host26::budget::Budget::try_from_configs(
-        0,
-        0,
-        cpu_cost_params.clone(),
-        mem_cost_params.clone(),
-    )
-    .unwrap_or_else(|_| soroban_env_host26::budget::Budget::default())
+    use crate::soroban::convert::try_convert_cost_params_ws_to_p26;
+    match (
+        try_convert_cost_params_ws_to_p26(cpu_cost_params),
+        try_convert_cost_params_ws_to_p26(mem_cost_params),
+    ) {
+        (Ok(cpu), Ok(mem)) => soroban_env_host26::budget::Budget::try_from_configs(0, 0, cpu, mem)
+            .unwrap_or_else(|_| soroban_env_host26::budget::Budget::default()),
+        (Err(e), _) | (_, Err(e)) => {
+            tracing::warn!("build_budget_p26: {e}, using default budget");
+            soroban_env_host26::budget::Budget::default()
+        }
+    }
 }
 
 // Local conversion functions removed — use crate::soroban::convert::try_convert_* instead.
 
 fn rent_snapshot_for_keys(
-    keys: &[stellar_xdr::curr::LedgerKey],
+    keys: &[stellar_xdr::LedgerKey],
     state: &LedgerStateManager,
     protocol_version: u32,
     cost_params: Option<(
-        &stellar_xdr::curr::ContractCostParams,
-        &stellar_xdr::curr::ContractCostParams,
+        &stellar_xdr::ContractCostParams,
+        &stellar_xdr::ContractCostParams,
     )>,
     ttl_key_cache: Option<&crate::soroban::TtlKeyCache>,
 ) -> Vec<RentSnapshot> {
@@ -895,8 +907,8 @@ fn rent_changes_from_snapshots(
     state: &LedgerStateManager,
     protocol_version: u32,
     cost_params: Option<(
-        &stellar_xdr::curr::ContractCostParams,
-        &stellar_xdr::curr::ContractCostParams,
+        &stellar_xdr::ContractCostParams,
+        &stellar_xdr::ContractCostParams,
     )>,
     ttl_key_cache: Option<&crate::soroban::TtlKeyCache>,
 ) -> Vec<RentChange> {
@@ -1463,7 +1475,7 @@ pub fn execute_operation_with_soroban(
 mod tests {
     use super::*;
     use crate::test_utils::create_test_account_id;
-    use stellar_xdr::curr::*;
+    use stellar_xdr::*;
 
     fn create_test_account(account_id: AccountId, balance: i64) -> AccountEntry {
         AccountEntry {

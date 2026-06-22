@@ -33,7 +33,7 @@
 
 use crate::types::entry_to_key;
 use crate::Hash256;
-use stellar_xdr::curr::{LedgerEntryChange, LedgerEntryChanges, LedgerKey, TransactionMeta};
+use stellar_xdr::{LedgerEntryChange, LedgerEntryChanges, LedgerKey, TransactionMeta};
 
 /// Extracts the ledger key from a ledger entry change.
 fn change_key(change: &LedgerEntryChange) -> LedgerKey {
@@ -65,7 +65,7 @@ fn change_type_order(change: &LedgerEntryChange) -> u8 {
 /// deterministic ordering regardless of the original order. Uses
 /// `LedgerKey::cmp` (derived `Ord`) which matches stellar-core's xdrpp
 /// `operator<` ordering — see `crates/bucket/src/entry.rs:143-151`.
-fn sort_changes(changes: &mut LedgerEntryChanges) -> Result<(), stellar_xdr::curr::Error> {
+fn sort_changes(changes: &mut LedgerEntryChanges) -> Result<(), stellar_xdr::Error> {
     let mut entries: Vec<(LedgerKey, u8, [u8; 32], LedgerEntryChange)> =
         Vec::with_capacity(changes.0.len());
 
@@ -83,16 +83,14 @@ fn sort_changes(changes: &mut LedgerEntryChanges) -> Result<(), stellar_xdr::cur
     });
 
     let sorted: Vec<LedgerEntryChange> = entries.into_iter().map(|(_, _, _, c)| c).collect();
-    changes.0 = sorted
-        .try_into()
-        .map_err(|_| stellar_xdr::curr::Error::Invalid)?;
+    changes.0 = sorted.try_into().map_err(|_| stellar_xdr::Error::Invalid)?;
     Ok(())
 }
 
 fn normalize_ops<T>(
-    ops: &mut stellar_xdr::curr::VecM<T>,
+    ops: &mut stellar_xdr::VecM<T>,
     mut changes: impl FnMut(&mut T) -> &mut LedgerEntryChanges,
-) -> Result<(), stellar_xdr::curr::Error> {
+) -> Result<(), stellar_xdr::Error> {
     for op in ops.iter_mut() {
         sort_changes(changes(op))?;
     }
@@ -104,9 +102,9 @@ fn normalize_ops<T>(
 fn normalize_v2_style<T>(
     tx_changes_before: &mut LedgerEntryChanges,
     tx_changes_after: &mut LedgerEntryChanges,
-    operations: &mut stellar_xdr::curr::VecM<T>,
+    operations: &mut stellar_xdr::VecM<T>,
     changes: impl FnMut(&mut T) -> &mut LedgerEntryChanges,
-) -> Result<(), stellar_xdr::curr::Error> {
+) -> Result<(), stellar_xdr::Error> {
     sort_changes(tx_changes_before)?;
     sort_changes(tx_changes_after)?;
     normalize_ops(operations, changes)?;
@@ -122,9 +120,7 @@ fn normalize_v2_style<T>(
 /// # Errors
 ///
 /// Returns an error if XDR serialization fails during sorting.
-pub fn normalize_transaction_meta(
-    meta: &mut TransactionMeta,
-) -> Result<(), stellar_xdr::curr::Error> {
+pub fn normalize_transaction_meta(meta: &mut TransactionMeta) -> Result<(), stellar_xdr::Error> {
     match meta {
         TransactionMeta::V0(ops) => {
             normalize_ops(ops, |op| &mut op.changes)?;
@@ -158,7 +154,7 @@ pub fn normalize_transaction_meta(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use stellar_xdr::curr::*;
+    use stellar_xdr::*;
 
     /// Verify that sort_changes uses LedgerKey::cmp (struct ordering), not XDR
     /// byte ordering. For ContractData keys with variable-length ScVal fields,

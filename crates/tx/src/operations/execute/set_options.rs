@@ -3,7 +3,7 @@
 //! This module implements the execution logic for the SetOptions operation,
 //! which modifies various account settings.
 
-use stellar_xdr::curr::{
+use stellar_xdr::{
     AccountEntry, AccountEntryExt, AccountEntryExtensionV1Ext, AccountEntryExtensionV2,
     AccountFlags, AccountId, OperationResult, OperationResultTr, PublicKey, SetOptionsOp,
     SetOptionsResult, SetOptionsResultCode, Signer, SignerKey, SignerKeyEd25519SignedPayload,
@@ -287,7 +287,7 @@ struct AccountSnapshot {
 /// Apply a signer update (add, remove, or change weight) to the source account.
 /// Returns the sponsor delta to apply, or an error.
 fn apply_signer_update(
-    signer: &stellar_xdr::curr::Signer,
+    signer: &stellar_xdr::Signer,
     source: &AccountId,
     source_account: &mut AccountEntry,
     sponsor_info: Option<&SponsorInfo>,
@@ -328,7 +328,7 @@ fn apply_signer_update(
     let sponsor = sponsor_info.map(|info| info.sponsor_id.clone());
     let has_v2 = matches!(
         source_account.ext,
-        AccountEntryExt::V1(stellar_xdr::curr::AccountEntryExtensionV1 {
+        AccountEntryExt::V1(stellar_xdr::AccountEntryExtensionV1 {
             ext: AccountEntryExtensionV1Ext::V2(_),
             ..
         })
@@ -485,7 +485,7 @@ fn make_result(code: SetOptionsResultCode) -> OperationResult {
 mod tests {
     use super::*;
     use crate::test_utils::create_test_account_id;
-    use stellar_xdr::curr::*;
+    use stellar_xdr::*;
 
     fn make_string32(s: &str) -> String32 {
         String32::try_from(s.as_bytes().to_vec()).unwrap()

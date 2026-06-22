@@ -16,9 +16,9 @@ fn test_classic_events_emitted_for_payment() {
 
     let operation = Operation {
         source_account: None,
-        body: OperationBody::Payment(stellar_xdr::curr::PaymentOp {
+        body: OperationBody::Payment(stellar_xdr::PaymentOp {
             destination: MuxedAccount::Ed25519(Uint256([4u8; 32])),
-            asset: stellar_xdr::curr::Asset::Native,
+            asset: stellar_xdr::Asset::Native,
             amount: 100,
         }),
     };
@@ -65,13 +65,13 @@ fn test_classic_events_emitted_for_payment() {
         panic!("unexpected tx meta");
     };
 
-    let tx_events: &[stellar_xdr::curr::TransactionEvent] = meta.events.as_ref();
+    let tx_events: &[stellar_xdr::TransactionEvent] = meta.events.as_ref();
     assert_eq!(tx_events.len(), 0);
 
     let contract_id = native_asset_contract_id(&network_id);
-    let op_events: &[stellar_xdr::curr::OperationMetaV2] = meta.operations.as_ref();
+    let op_events: &[stellar_xdr::OperationMetaV2] = meta.operations.as_ref();
     assert_eq!(op_events.len(), 1);
-    let op_event_list: &[stellar_xdr::curr::ContractEvent] = op_events[0].events.as_ref();
+    let op_event_list: &[stellar_xdr::ContractEvent] = op_events[0].events.as_ref();
     assert_eq!(op_event_list.len(), 1);
     let op_event = &op_event_list[0];
     assert_eq!(op_event.contract_id, Some(contract_id));
@@ -117,9 +117,9 @@ fn test_classic_events_payment_with_muxed_destination() {
     });
     let operation = Operation {
         source_account: None,
-        body: OperationBody::Payment(stellar_xdr::curr::PaymentOp {
+        body: OperationBody::Payment(stellar_xdr::PaymentOp {
             destination: muxed_dest,
-            asset: stellar_xdr::curr::Asset::Native,
+            asset: stellar_xdr::Asset::Native,
             amount: 200,
         }),
     };
@@ -166,16 +166,16 @@ fn test_classic_events_payment_with_muxed_destination() {
         panic!("unexpected tx meta");
     };
 
-    let op_events: &[stellar_xdr::curr::OperationMetaV2] = meta.operations.as_ref();
+    let op_events: &[stellar_xdr::OperationMetaV2] = meta.operations.as_ref();
     assert_eq!(op_events.len(), 1);
-    let op_event_list: &[stellar_xdr::curr::ContractEvent] = op_events[0].events.as_ref();
+    let op_event_list: &[stellar_xdr::ContractEvent] = op_events[0].events.as_ref();
     assert_eq!(op_event_list.len(), 1);
     let op_event = &op_event_list[0];
     let ContractEventBody::V0(op_body) = &op_event.body;
     let ScVal::Map(Some(map)) = &op_body.data else {
         panic!("expected map data for muxed destination");
     };
-    let entries: &[stellar_xdr::curr::ScMapEntry] = map.0.as_ref();
+    let entries: &[stellar_xdr::ScMapEntry] = map.0.as_ref();
     assert_eq!(entries.len(), 2);
     let amount_entry = entries
         .iter()
@@ -205,9 +205,9 @@ fn test_classic_events_payment_with_memo_data() {
 
     let operation = Operation {
         source_account: None,
-        body: OperationBody::Payment(stellar_xdr::curr::PaymentOp {
+        body: OperationBody::Payment(stellar_xdr::PaymentOp {
             destination: MuxedAccount::Ed25519(Uint256([8u8; 32])),
-            asset: stellar_xdr::curr::Asset::Native,
+            asset: stellar_xdr::Asset::Native,
             amount: 150,
         }),
     };
@@ -255,16 +255,16 @@ fn test_classic_events_payment_with_memo_data() {
         panic!("unexpected tx meta");
     };
 
-    let op_events: &[stellar_xdr::curr::OperationMetaV2] = meta.operations.as_ref();
+    let op_events: &[stellar_xdr::OperationMetaV2] = meta.operations.as_ref();
     assert_eq!(op_events.len(), 1);
-    let op_event_list: &[stellar_xdr::curr::ContractEvent] = op_events[0].events.as_ref();
+    let op_event_list: &[stellar_xdr::ContractEvent] = op_events[0].events.as_ref();
     assert_eq!(op_event_list.len(), 1);
     let op_event = &op_event_list[0];
     let ContractEventBody::V0(op_body) = &op_event.body;
     let ScVal::Map(Some(map)) = &op_body.data else {
         panic!("expected map data for memo");
     };
-    let entries: &[stellar_xdr::curr::ScMapEntry] = map.0.as_ref();
+    let entries: &[stellar_xdr::ScMapEntry] = map.0.as_ref();
     assert_eq!(entries.len(), 2);
     let amount_entry = entries
         .iter()
@@ -299,9 +299,9 @@ fn test_classic_events_payment_memo_precedence() {
     });
     let operation = Operation {
         source_account: None,
-        body: OperationBody::Payment(stellar_xdr::curr::PaymentOp {
+        body: OperationBody::Payment(stellar_xdr::PaymentOp {
             destination: muxed_dest,
-            asset: stellar_xdr::curr::Asset::Native,
+            asset: stellar_xdr::Asset::Native,
             amount: 250,
         }),
     };
@@ -349,16 +349,16 @@ fn test_classic_events_payment_memo_precedence() {
         panic!("unexpected tx meta");
     };
 
-    let op_events: &[stellar_xdr::curr::OperationMetaV2] = meta.operations.as_ref();
+    let op_events: &[stellar_xdr::OperationMetaV2] = meta.operations.as_ref();
     assert_eq!(op_events.len(), 1);
-    let op_event_list: &[stellar_xdr::curr::ContractEvent] = op_events[0].events.as_ref();
+    let op_event_list: &[stellar_xdr::ContractEvent] = op_events[0].events.as_ref();
     assert_eq!(op_event_list.len(), 1);
     let op_event = &op_event_list[0];
     let ContractEventBody::V0(op_body) = &op_event.body;
     let ScVal::Map(Some(map)) = &op_body.data else {
         panic!("expected map data for muxed destination");
     };
-    let entries: &[stellar_xdr::curr::ScMapEntry] = map.0.as_ref();
+    let entries: &[stellar_xdr::ScMapEntry] = map.0.as_ref();
     assert_eq!(entries.len(), 2);
     let muxed_entry = entries
         .iter()
@@ -429,9 +429,9 @@ fn test_classic_events_emitted_for_account_merge() {
         panic!("unexpected tx meta");
     };
 
-    let op_events: &[stellar_xdr::curr::OperationMetaV2] = meta.operations.as_ref();
+    let op_events: &[stellar_xdr::OperationMetaV2] = meta.operations.as_ref();
     assert_eq!(op_events.len(), 1);
-    let op_event_list: &[stellar_xdr::curr::ContractEvent] = op_events[0].events.as_ref();
+    let op_event_list: &[stellar_xdr::ContractEvent] = op_events[0].events.as_ref();
     assert_eq!(op_event_list.len(), 1);
     let op_event = &op_event_list[0];
     let ContractEventBody::V0(op_body) = &op_event.body;
@@ -518,9 +518,9 @@ fn test_classic_events_emitted_for_create_account() {
         panic!("unexpected tx meta");
     };
 
-    let op_events: &[stellar_xdr::curr::OperationMetaV2] = meta.operations.as_ref();
+    let op_events: &[stellar_xdr::OperationMetaV2] = meta.operations.as_ref();
     assert_eq!(op_events.len(), 1);
-    let op_event_list: &[stellar_xdr::curr::ContractEvent] = op_events[0].events.as_ref();
+    let op_event_list: &[stellar_xdr::ContractEvent] = op_events[0].events.as_ref();
     assert_eq!(op_event_list.len(), 1);
     let op_event = &op_event_list[0];
     let ContractEventBody::V0(op_body) = &op_event.body;
@@ -616,9 +616,9 @@ fn test_classic_events_emitted_for_create_claimable_balance() {
         panic!("unexpected tx meta");
     };
 
-    let op_events: &[stellar_xdr::curr::OperationMetaV2] = meta.operations.as_ref();
+    let op_events: &[stellar_xdr::OperationMetaV2] = meta.operations.as_ref();
     assert_eq!(op_events.len(), 1);
-    let op_event_list: &[stellar_xdr::curr::ContractEvent] = op_events[0].events.as_ref();
+    let op_event_list: &[stellar_xdr::ContractEvent] = op_events[0].events.as_ref();
     assert_eq!(op_event_list.len(), 1);
     let op_event = &op_event_list[0];
     let ContractEventBody::V0(op_body) = &op_event.body;
@@ -723,9 +723,9 @@ fn test_classic_events_emitted_for_claim_claimable_balance() {
         panic!("unexpected tx meta");
     };
 
-    let op_events: &[stellar_xdr::curr::OperationMetaV2] = meta.operations.as_ref();
+    let op_events: &[stellar_xdr::OperationMetaV2] = meta.operations.as_ref();
     assert_eq!(op_events.len(), 1);
-    let op_event_list: &[stellar_xdr::curr::ContractEvent] = op_events[0].events.as_ref();
+    let op_event_list: &[stellar_xdr::ContractEvent] = op_events[0].events.as_ref();
     assert_eq!(op_event_list.len(), 1);
     let op_event = &op_event_list[0];
     let ContractEventBody::V0(op_body) = &op_event.body;
@@ -827,9 +827,9 @@ fn test_classic_events_emitted_for_allow_trust() {
         panic!("unexpected tx meta");
     };
 
-    let op_events: &[stellar_xdr::curr::OperationMetaV2] = meta.operations.as_ref();
+    let op_events: &[stellar_xdr::OperationMetaV2] = meta.operations.as_ref();
     assert_eq!(op_events.len(), 1);
-    let op_event_list: &[stellar_xdr::curr::ContractEvent] = op_events[0].events.as_ref();
+    let op_event_list: &[stellar_xdr::ContractEvent] = op_events[0].events.as_ref();
     assert_eq!(op_event_list.len(), 1);
     let op_event = &op_event_list[0];
     let ContractEventBody::V0(op_body) = &op_event.body;
@@ -924,9 +924,9 @@ fn test_classic_events_emitted_for_set_trustline_flags() {
         panic!("unexpected tx meta");
     };
 
-    let op_events: &[stellar_xdr::curr::OperationMetaV2] = meta.operations.as_ref();
+    let op_events: &[stellar_xdr::OperationMetaV2] = meta.operations.as_ref();
     assert_eq!(op_events.len(), 1);
-    let op_event_list: &[stellar_xdr::curr::ContractEvent] = op_events[0].events.as_ref();
+    let op_event_list: &[stellar_xdr::ContractEvent] = op_events[0].events.as_ref();
     assert_eq!(op_event_list.len(), 1);
     let op_event = &op_event_list[0];
     let ContractEventBody::V0(op_body) = &op_event.body;
@@ -1023,9 +1023,9 @@ fn test_classic_events_emitted_for_clawback() {
         panic!("unexpected tx meta");
     };
 
-    let op_events: &[stellar_xdr::curr::OperationMetaV2] = meta.operations.as_ref();
+    let op_events: &[stellar_xdr::OperationMetaV2] = meta.operations.as_ref();
     assert_eq!(op_events.len(), 1);
-    let op_event_list: &[stellar_xdr::curr::ContractEvent] = op_events[0].events.as_ref();
+    let op_event_list: &[stellar_xdr::ContractEvent] = op_events[0].events.as_ref();
     assert_eq!(op_event_list.len(), 1);
     let op_event = &op_event_list[0];
     let ContractEventBody::V0(op_body) = &op_event.body;
@@ -1131,9 +1131,9 @@ fn test_classic_events_emitted_for_clawback_claimable_balance() {
         panic!("unexpected tx meta");
     };
 
-    let op_events: &[stellar_xdr::curr::OperationMetaV2] = meta.operations.as_ref();
+    let op_events: &[stellar_xdr::OperationMetaV2] = meta.operations.as_ref();
     assert_eq!(op_events.len(), 1);
-    let op_event_list: &[stellar_xdr::curr::ContractEvent] = op_events[0].events.as_ref();
+    let op_event_list: &[stellar_xdr::ContractEvent] = op_events[0].events.as_ref();
     assert_eq!(op_event_list.len(), 1);
     let op_event = &op_event_list[0];
     let ContractEventBody::V0(op_body) = &op_event.body;
@@ -1249,9 +1249,9 @@ fn test_classic_events_emitted_for_liquidity_pool_deposit() {
         panic!("unexpected tx meta");
     };
 
-    let op_events: &[stellar_xdr::curr::OperationMetaV2] = meta.operations.as_ref();
+    let op_events: &[stellar_xdr::OperationMetaV2] = meta.operations.as_ref();
     assert_eq!(op_events.len(), 1);
-    let op_event_list: &[stellar_xdr::curr::ContractEvent] = op_events[0].events.as_ref();
+    let op_event_list: &[stellar_xdr::ContractEvent] = op_events[0].events.as_ref();
     assert_eq!(op_event_list.len(), 2);
 
     let pool_address = ScAddress::LiquidityPool(pool_id.clone());
@@ -1383,9 +1383,9 @@ fn test_classic_events_emitted_for_liquidity_pool_withdraw() {
         panic!("unexpected tx meta");
     };
 
-    let op_events: &[stellar_xdr::curr::OperationMetaV2] = meta.operations.as_ref();
+    let op_events: &[stellar_xdr::OperationMetaV2] = meta.operations.as_ref();
     assert_eq!(op_events.len(), 1);
-    let op_event_list: &[stellar_xdr::curr::ContractEvent] = op_events[0].events.as_ref();
+    let op_event_list: &[stellar_xdr::ContractEvent] = op_events[0].events.as_ref();
     assert_eq!(op_event_list.len(), 2);
 
     let pool_address = ScAddress::LiquidityPool(pool_id.clone());
@@ -1585,9 +1585,9 @@ fn test_classic_events_emitted_for_manage_sell_offer() {
         panic!("unexpected tx meta");
     };
 
-    let op_events: &[stellar_xdr::curr::OperationMetaV2] = meta.operations.as_ref();
+    let op_events: &[stellar_xdr::OperationMetaV2] = meta.operations.as_ref();
     assert_eq!(op_events.len(), 1);
-    let op_event_list: &[stellar_xdr::curr::ContractEvent] = op_events[0].events.as_ref();
+    let op_event_list: &[stellar_xdr::ContractEvent] = op_events[0].events.as_ref();
     assert_eq!(op_event_list.len(), claim_atoms.len() * 2);
 
     let mut index = 0;
@@ -1711,7 +1711,7 @@ fn test_classic_events_emitted_for_path_payment_strict_send() {
         "unexpected result: {:?}",
         result.operation_results
     );
-    let (claim_atoms, last): (&[ClaimAtom], &stellar_xdr::curr::SimplePaymentResult) =
+    let (claim_atoms, last): (&[ClaimAtom], &stellar_xdr::SimplePaymentResult) =
         match result.operation_results.get(0).expect("op result") {
             OperationResult::OpInner(OperationResultTr::PathPaymentStrictSend(
                 PathPaymentStrictSendResult::Success(PathPaymentStrictSendResultSuccess {
@@ -1729,9 +1729,9 @@ fn test_classic_events_emitted_for_path_payment_strict_send() {
         panic!("unexpected tx meta");
     };
 
-    let op_events: &[stellar_xdr::curr::OperationMetaV2] = meta.operations.as_ref();
+    let op_events: &[stellar_xdr::OperationMetaV2] = meta.operations.as_ref();
     assert_eq!(op_events.len(), 1);
-    let op_event_list: &[stellar_xdr::curr::ContractEvent] = op_events[0].events.as_ref();
+    let op_event_list: &[stellar_xdr::ContractEvent] = op_events[0].events.as_ref();
     assert_eq!(op_event_list.len(), claim_atoms.len() * 2 + 1);
 
     let mut index = 0;
@@ -1776,7 +1776,7 @@ fn build_pool_share_revoke_snapshot(
     use henyey_ledger::{EntryLookupFn, PoolShareTrustlinesByAccountFn};
     use std::collections::HashMap;
     use std::sync::Arc;
-    use stellar_xdr::curr::{
+    use stellar_xdr::{
         Liabilities, Limits, TrustLineEntryExt, TrustLineEntryExtensionV2,
         TrustLineEntryExtensionV2Ext, TrustLineEntryV1, TrustLineEntryV1Ext, WriteXdr,
     };
@@ -1838,7 +1838,7 @@ fn build_pool_share_revoke_snapshot(
     let (issuer_key, issuer_entry) =
         create_account_entry_with_flags(issuer_id.clone(), 1, 100_000_000, 0x1 | 0x2);
 
-    let trustor_key = LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
+    let trustor_key = LedgerKey::Account(stellar_xdr::LedgerKeyAccount {
         account_id: trustor_id.clone(),
     });
     let trustor_entry = LedgerEntry {
@@ -1923,7 +1923,7 @@ fn execute_single_op_tx_v4(
     issuer_secret: &SecretKey,
     op: Operation,
     network_id: &NetworkId,
-) -> stellar_xdr::curr::TransactionMetaV4 {
+) -> stellar_xdr::TransactionMetaV4 {
     let tx = Transaction {
         source_account: MuxedAccount::Ed25519(Uint256(*issuer_secret.public_key().as_bytes())),
         fee: 1000,
@@ -2010,9 +2010,9 @@ fn test_classic_events_pool_share_revoke_transfer() {
     };
 
     let meta = execute_single_op_tx_v4(&handle, &issuer_secret, op, &network_id);
-    let op_events: &[stellar_xdr::curr::OperationMetaV2] = meta.operations.as_ref();
+    let op_events: &[stellar_xdr::OperationMetaV2] = meta.operations.as_ref();
     assert_eq!(op_events.len(), 1);
-    let events: &[stellar_xdr::curr::ContractEvent] = op_events[0].events.as_ref();
+    let events: &[stellar_xdr::ContractEvent] = op_events[0].events.as_ref();
 
     // Expect exactly 3 events: transfer(asset_a) [0], transfer(asset_b) [1],
     // set_authorized [2]. amount_a = floor(100*1000/500)=200, amount_b=400.
@@ -2093,9 +2093,9 @@ fn test_classic_events_pool_share_revoke_burn_when_issuer() {
     };
 
     let meta = execute_single_op_tx_v4(&handle, &issuer_secret, op, &network_id);
-    let op_events: &[stellar_xdr::curr::OperationMetaV2] = meta.operations.as_ref();
+    let op_events: &[stellar_xdr::OperationMetaV2] = meta.operations.as_ref();
     assert_eq!(op_events.len(), 1);
-    let events: &[stellar_xdr::curr::ContractEvent] = op_events[0].events.as_ref();
+    let events: &[stellar_xdr::ContractEvent] = op_events[0].events.as_ref();
 
     // transfer(asset_a) [0], burn(asset_b) [1], set_authorized [2].
     assert_eq!(events.len(), 3, "expected transfer + burn + set_authorized");
@@ -2130,7 +2130,7 @@ fn revoke_cb_address(
     pool_id: &PoolId,
     asset: &Asset,
 ) -> ScAddress {
-    use stellar_xdr::curr::{ClaimableBalanceId, HashIdPreimage, HashIdPreimageRevokeId};
+    use stellar_xdr::{ClaimableBalanceId, HashIdPreimage, HashIdPreimageRevokeId};
     let preimage = HashIdPreimage::PoolRevokeOpId(HashIdPreimageRevokeId {
         source_account: source_id.clone(),
         seq_num: SequenceNumber(seq),
@@ -2208,8 +2208,8 @@ fn test_classic_events_create_claimable_balance_with_memo_no_muxed_id() {
     let TransactionMeta::V4(meta) = result.tx_meta.expect("tx meta") else {
         panic!("unexpected tx meta");
     };
-    let op_events: &[stellar_xdr::curr::OperationMetaV2] = meta.operations.as_ref();
-    let event_list: &[stellar_xdr::curr::ContractEvent] = op_events[0].events.as_ref();
+    let op_events: &[stellar_xdr::OperationMetaV2] = meta.operations.as_ref();
+    let event_list: &[stellar_xdr::ContractEvent] = op_events[0].events.as_ref();
     assert_eq!(event_list.len(), 1);
     let ContractEventBody::V0(body) = &event_list[0].body;
     assert_eq!(
@@ -2349,8 +2349,8 @@ fn test_classic_events_emitted_for_path_payment_strict_receive() {
     let TransactionMeta::V4(meta) = result.tx_meta.expect("tx meta") else {
         panic!("unexpected tx meta");
     };
-    let op_events: &[stellar_xdr::curr::OperationMetaV2] = meta.operations.as_ref();
-    let event_list: &[stellar_xdr::curr::ContractEvent] = op_events[0].events.as_ref();
+    let op_events: &[stellar_xdr::OperationMetaV2] = meta.operations.as_ref();
+    let event_list: &[stellar_xdr::ContractEvent] = op_events[0].events.as_ref();
     assert_eq!(event_list.len(), claim_atoms.len() * 2 + 1);
 
     let mut index = 0;
@@ -2437,7 +2437,7 @@ fn test_classic_events_payment_to_issuer_emits_burn() {
 
     let operation = Operation {
         source_account: None,
-        body: OperationBody::Payment(stellar_xdr::curr::PaymentOp {
+        body: OperationBody::Payment(stellar_xdr::PaymentOp {
             destination: issuer_id.clone().into(),
             asset: asset.clone(),
             amount: 10_000_000,
@@ -2479,8 +2479,8 @@ fn test_classic_events_payment_to_issuer_emits_burn() {
     let TransactionMeta::V4(meta) = result.tx_meta.expect("tx meta") else {
         panic!("unexpected tx meta");
     };
-    let op_events: &[stellar_xdr::curr::OperationMetaV2] = meta.operations.as_ref();
-    let event_list: &[stellar_xdr::curr::ContractEvent] = op_events[0].events.as_ref();
+    let op_events: &[stellar_xdr::OperationMetaV2] = meta.operations.as_ref();
+    let event_list: &[stellar_xdr::ContractEvent] = op_events[0].events.as_ref();
     assert_eq!(event_list.len(), 1);
     let ContractEventBody::V0(body) = &event_list[0].body;
     let topics: &[ScVal] = body.topics.as_ref();
@@ -2526,7 +2526,7 @@ fn test_classic_events_payment_from_issuer_emits_mint() {
 
     let operation = Operation {
         source_account: None,
-        body: OperationBody::Payment(stellar_xdr::curr::PaymentOp {
+        body: OperationBody::Payment(stellar_xdr::PaymentOp {
             destination: holder_id.clone().into(),
             asset: asset.clone(),
             amount: 10_000_000,
@@ -2568,8 +2568,8 @@ fn test_classic_events_payment_from_issuer_emits_mint() {
     let TransactionMeta::V4(meta) = result.tx_meta.expect("tx meta") else {
         panic!("unexpected tx meta");
     };
-    let op_events: &[stellar_xdr::curr::OperationMetaV2] = meta.operations.as_ref();
-    let event_list: &[stellar_xdr::curr::ContractEvent] = op_events[0].events.as_ref();
+    let op_events: &[stellar_xdr::OperationMetaV2] = meta.operations.as_ref();
+    let event_list: &[stellar_xdr::ContractEvent] = op_events[0].events.as_ref();
     assert_eq!(event_list.len(), 1);
     let ContractEventBody::V0(body) = &event_list[0].body;
     let topics: &[ScVal] = body.topics.as_ref();
@@ -2599,14 +2599,14 @@ fn test_classic_events_fee_charge_and_refund() {
     tx_mgr.charge_fee(
         &source_id,
         100,
-        stellar_xdr::curr::TransactionEventStage::BeforeAllTxs,
+        stellar_xdr::TransactionEventStage::BeforeAllTxs,
     );
     // Soroban refund: data = -refund, AfterAllTxs — mirrors apply.rs which calls
     // `new_fee_event(&fee_source, -refund, AfterAllTxs)`.
     tx_mgr.new_fee_event(
         &source_id,
         -30,
-        stellar_xdr::curr::TransactionEventStage::AfterAllTxs,
+        stellar_xdr::TransactionEventStage::AfterAllTxs,
     );
 
     let events = tx_mgr.finalize();
@@ -2618,9 +2618,9 @@ fn test_classic_events_fee_charge_and_refund() {
     let charge = &events[0];
     assert_eq!(
         charge.stage,
-        stellar_xdr::curr::TransactionEventStage::BeforeAllTxs
+        stellar_xdr::TransactionEventStage::BeforeAllTxs
     );
-    let stellar_xdr::curr::ContractEventBody::V0(charge_body) = &charge.event.body;
+    let stellar_xdr::ContractEventBody::V0(charge_body) = &charge.event.body;
     let charge_topics: &[ScVal] = charge_body.topics.as_ref();
     assert_eq!(charge_topics[0], scval_symbol("fee"));
     assert_eq!(charge_topics[1], ScVal::Address(from.clone()));
@@ -2630,9 +2630,9 @@ fn test_classic_events_fee_charge_and_refund() {
     let refund = &events[1];
     assert_eq!(
         refund.stage,
-        stellar_xdr::curr::TransactionEventStage::AfterAllTxs
+        stellar_xdr::TransactionEventStage::AfterAllTxs
     );
-    let stellar_xdr::curr::ContractEventBody::V0(refund_body) = &refund.event.body;
+    let stellar_xdr::ContractEventBody::V0(refund_body) = &refund.event.body;
     let refund_topics: &[ScVal] = refund_body.topics.as_ref();
     assert_eq!(refund_topics[0], scval_symbol("fee"));
     assert_eq!(refund_topics[1], ScVal::Address(from));
@@ -2651,7 +2651,7 @@ fn test_classic_events_emitted_for_claim_atoms_v0() {
         issuer: issuer_id.clone(),
     });
 
-    let claim = ClaimAtom::V0(stellar_xdr::curr::ClaimOfferAtomV0 {
+    let claim = ClaimAtom::V0(stellar_xdr::ClaimOfferAtomV0 {
         seller_ed25519: Uint256([182u8; 32]),
         offer_id: 9,
         asset_sold: Asset::Native,

@@ -18,7 +18,7 @@ pub(crate) async fn submit_tx_handler(
     Json(request): Json<SubmitTxRequest>,
 ) -> impl IntoResponse {
     use base64::{engine::general_purpose::STANDARD, Engine};
-    use stellar_xdr::curr::{Limits, ReadXdr, TransactionEnvelope};
+    use stellar_xdr::{Limits, ReadXdr, TransactionEnvelope};
 
     // Decode and validate the transaction
     let tx_bytes = match STANDARD.decode(&request.tx) {

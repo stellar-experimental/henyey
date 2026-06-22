@@ -221,7 +221,7 @@ pub type Result<T> = std::result::Result<T, HerderError>;
 #[derive(Debug)]
 pub struct PendingTransaction {
     /// The transaction envelope containing the transaction and signatures.
-    pub envelope: stellar_xdr::curr::TransactionEnvelope,
+    pub envelope: stellar_xdr::TransactionEnvelope,
     /// When this transaction was first received from the network.
     pub received_at: std::time::Instant,
     /// Number of times this transaction has been seen/broadcast.
@@ -267,14 +267,14 @@ pub trait HerderCallback: Send + Sync {
         ledger_seq: u32,
         tx_set: TransactionSet,
         close_time: u64,
-        upgrades: Vec<stellar_xdr::curr::UpgradeType>,
-        stellar_value_ext: stellar_xdr::curr::StellarValueExt,
+        upgrades: Vec<stellar_xdr::UpgradeType>,
+        stellar_value_ext: stellar_xdr::StellarValueExt,
     ) -> Result<henyey_common::Hash256>;
 
     /// Called when an SCP message should be broadcast to the network.
     ///
     /// The implementer should relay this envelope to connected peers.
-    async fn broadcast_scp_message(&self, envelope: stellar_xdr::curr::ScpEnvelope);
+    async fn broadcast_scp_message(&self, envelope: stellar_xdr::ScpEnvelope);
 }
 
 #[cfg(test)]
@@ -291,7 +291,7 @@ mod tests {
 
     fn make_default_lm() -> std::sync::Arc<henyey_ledger::LedgerManager> {
         use henyey_ledger::{LedgerManager, LedgerManagerConfig};
-        use stellar_xdr::curr::{
+        use stellar_xdr::{
             Hash, LedgerHeader, LedgerHeaderExt, StellarValue, StellarValueExt, TimePoint, VecM,
         };
         let config = LedgerManagerConfig {

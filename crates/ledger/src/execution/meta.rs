@@ -15,7 +15,7 @@ pub(super) use henyey_common::asset::non_native_asset_to_trustline_asset as asse
 /// Sorting by (key_hash, type_order) places each TTL immediately before its
 /// associated contract entry.
 fn soroban_create_sort_key(entry: &LedgerEntry) -> Option<(Vec<u8>, u8)> {
-    if let stellar_xdr::curr::LedgerEntryData::Ttl(ttl) = &entry.data {
+    if let stellar_xdr::LedgerEntryData::Ttl(ttl) = &entry.data {
         Some((ttl.key_hash.0.to_vec(), 0))
     } else if henyey_common::is_soroban_entry(entry) {
         let key = henyey_common::entry_to_key(entry);
@@ -26,19 +26,19 @@ fn soroban_create_sort_key(entry: &LedgerEntry) -> Option<(Vec<u8>, u8)> {
     }
 }
 
-pub(super) fn asset_issuer_id(asset: &stellar_xdr::curr::Asset) -> Option<AccountId> {
+pub(super) fn asset_issuer_id(asset: &stellar_xdr::Asset) -> Option<AccountId> {
     henyey_common::asset::get_issuer(asset).ok().cloned()
 }
 
 pub(super) fn make_account_key(account_id: &AccountId) -> LedgerKey {
-    LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
+    LedgerKey::Account(stellar_xdr::LedgerKeyAccount {
         account_id: account_id.clone(),
     })
 }
 
 pub(super) fn make_trustline_key(
     account_id: &AccountId,
-    asset: &stellar_xdr::curr::TrustLineAsset,
+    asset: &stellar_xdr::TrustLineAsset,
 ) -> LedgerKey {
     LedgerKey::Trustline(LedgerKeyTrustLine {
         account_id: account_id.clone(),
@@ -1048,7 +1048,7 @@ pub(super) struct TransactionMetaParts {
     pub op_changes: Vec<LedgerEntryChanges>,
     pub op_events: Vec<Vec<ContractEvent>>,
     pub tx_events: Vec<TransactionEvent>,
-    pub soroban_return_value: Option<stellar_xdr::curr::ScVal>,
+    pub soroban_return_value: Option<stellar_xdr::ScVal>,
     pub diagnostic_events: Vec<DiagnosticEvent>,
     pub soroban_fee_info: Option<(i64, i64, i64)>,
     pub emit_soroban_tx_meta_ext_v1: bool,
@@ -1152,7 +1152,7 @@ pub(super) fn empty_transaction_meta() -> TransactionMeta {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use stellar_xdr::curr::*;
+    use stellar_xdr::*;
 
     fn make_ttl_entry(key_hash: [u8; 32], live_until: u32) -> LedgerEntry {
         LedgerEntry {

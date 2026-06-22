@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use henyey_crypto::SecretKey;
 use henyey_overlay::{LocalNode, OverlayConfig, OverlayError, OverlayManager, PeerAddress};
-use stellar_xdr::curr::{
+use stellar_xdr::{
     Memo, MuxedAccount, Preconditions, SequenceNumber, StellarMessage, Transaction,
     TransactionEnvelope, TransactionV1Envelope, Uint256,
 };
@@ -32,7 +32,7 @@ fn make_test_transaction() -> TransactionEnvelope {
             cond: Preconditions::None,
             memo: Memo::None,
             operations: vec![].try_into().unwrap(),
-            ext: stellar_xdr::curr::TransactionExt::V0,
+            ext: stellar_xdr::TransactionExt::V0,
         },
         signatures: vec![].try_into().unwrap(),
     })

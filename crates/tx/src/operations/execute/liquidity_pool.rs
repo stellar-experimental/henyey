@@ -4,7 +4,7 @@
 //! - LiquidityPoolDeposit
 //! - LiquidityPoolWithdraw
 
-use stellar_xdr::curr::{
+use stellar_xdr::{
     AccountId, Asset, LiquidityPoolDepositOp, LiquidityPoolDepositResult,
     LiquidityPoolDepositResultCode, LiquidityPoolWithdrawOp, LiquidityPoolWithdrawResult,
     LiquidityPoolWithdrawResultCode, OperationResult, OperationResultTr, Price, TrustLineAsset,
@@ -63,7 +63,7 @@ pub(crate) fn execute_liquidity_pool_deposit(
 
     // Get pool parameters
     let (asset_a, asset_b, reserve_a, reserve_b, total_shares, _fee) = match &pool.body {
-        stellar_xdr::curr::LiquidityPoolEntryBody::LiquidityPoolConstantProduct(cp) => {
+        stellar_xdr::LiquidityPoolEntryBody::LiquidityPoolConstantProduct(cp) => {
             let params = &cp.params;
             (
                 params.asset_a.clone(),
@@ -222,7 +222,7 @@ pub(crate) fn execute_liquidity_pool_deposit(
     // Update pool reserves
     if let Some(pool_mut) = state.get_liquidity_pool_mut(&op.liquidity_pool_id) {
         match &mut pool_mut.body {
-            stellar_xdr::curr::LiquidityPoolEntryBody::LiquidityPoolConstantProduct(cp) => {
+            stellar_xdr::LiquidityPoolEntryBody::LiquidityPoolConstantProduct(cp) => {
                 add_pool_reserve(&mut cp.reserve_a, deposit_a)?;
                 add_pool_reserve(&mut cp.reserve_b, deposit_b)?;
                 add_pool_shares(&mut cp.total_pool_shares, shares_received)?;
@@ -268,7 +268,7 @@ pub(crate) fn execute_liquidity_pool_withdraw(
 
     // Get pool parameters
     let (asset_a, asset_b, reserve_a, reserve_b, total_shares) = match &pool.body {
-        stellar_xdr::curr::LiquidityPoolEntryBody::LiquidityPoolConstantProduct(cp) => {
+        stellar_xdr::LiquidityPoolEntryBody::LiquidityPoolConstantProduct(cp) => {
             let params = &cp.params;
             (
                 params.asset_a.clone(),
@@ -367,7 +367,7 @@ pub(crate) fn execute_liquidity_pool_withdraw(
     // Update pool reserves
     if let Some(pool_mut) = state.get_liquidity_pool_mut(&op.liquidity_pool_id) {
         match &mut pool_mut.body {
-            stellar_xdr::curr::LiquidityPoolEntryBody::LiquidityPoolConstantProduct(cp) => {
+            stellar_xdr::LiquidityPoolEntryBody::LiquidityPoolConstantProduct(cp) => {
                 add_pool_reserve(&mut cp.reserve_a, -withdraw_a)?;
                 add_pool_reserve(&mut cp.reserve_b, -withdraw_b)?;
                 add_pool_shares(&mut cp.total_pool_shares, -op.amount)?;
@@ -390,7 +390,7 @@ fn resolve_deposit_asset(
     state: &LedgerStateManager,
     context: &LedgerContext,
 ) -> std::result::Result<i64, LiquidityPoolDepositResultCode> {
-    use stellar_xdr::curr::TrustLineEntry;
+    use stellar_xdr::TrustLineEntry;
 
     let trustline: Option<&TrustLineEntry> =
         if matches!(asset, Asset::Native) || is_issuer(source, asset) {
@@ -839,7 +839,7 @@ mod tests {
     use super::*;
     use crate::test_utils::create_test_account_id;
     use henyey_common::LIQUIDITY_POOL_FEE_V18;
-    use stellar_xdr::curr::*;
+    use stellar_xdr::*;
 
     fn create_test_account(account_id: AccountId, balance: i64, flags: u32) -> AccountEntry {
         AccountEntry {
@@ -2547,8 +2547,7 @@ mod tests {
 
         // Freeze source's trustline for asset_a via CAP-77
         let frozen_key = crate::frozen_keys::trustline_key(&source_id, &asset_a);
-        let frozen_bytes =
-            stellar_xdr::curr::WriteXdr::to_xdr(&frozen_key, Limits::none()).unwrap();
+        let frozen_bytes = stellar_xdr::WriteXdr::to_xdr(&frozen_key, Limits::none()).unwrap();
 
         let mut context = create_test_context();
         context.frozen_key_config =
@@ -2647,8 +2646,7 @@ mod tests {
 
         // Freeze source's trustline for asset_b via CAP-77
         let frozen_key = crate::frozen_keys::trustline_key(&source_id, &asset_b);
-        let frozen_bytes =
-            stellar_xdr::curr::WriteXdr::to_xdr(&frozen_key, Limits::none()).unwrap();
+        let frozen_bytes = stellar_xdr::WriteXdr::to_xdr(&frozen_key, Limits::none()).unwrap();
 
         let mut context = create_test_context();
         context.frozen_key_config =

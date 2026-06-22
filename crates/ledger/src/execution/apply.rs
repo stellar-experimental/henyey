@@ -8,7 +8,7 @@
 use std::collections::{HashMap, HashSet};
 
 use henyey_crypto::account_id_to_strkey;
-use stellar_xdr::curr::{
+use stellar_xdr::{
     AccountId, ContractEvent, DiagnosticEvent, LedgerKey, OperationBody, OperationResult,
     OperationType, SorobanTransactionData, TransactionResultCode, TrustLineFlags,
 };
@@ -43,13 +43,13 @@ pub(super) const AUTHORIZED_FLAG: u32 = TrustLineFlags::AuthorizedFlag as u32;
 #[derive(Debug, Clone)]
 pub(super) enum RestoreSource {
     /// Data/code key restored from hot archive with its original entry.
-    HotArchive(Box<stellar_xdr::curr::LedgerEntry>),
+    HotArchive(Box<stellar_xdr::LedgerEntry>),
     /// TTL key for a hot-archive-restored entry with its synthesized TTL entry.
     /// The stored entry represents the TTL value at restoration time (before any
     /// host-side extensions), enabling RESTORED vs RESTORED+UPDATED comparison.
-    HotArchiveTtl(Box<stellar_xdr::curr::LedgerEntry>),
+    HotArchiveTtl(Box<stellar_xdr::LedgerEntry>),
     /// Key restored from live bucket list with its original entry.
-    LiveBucketList(Box<stellar_xdr::curr::LedgerEntry>),
+    LiveBucketList(Box<stellar_xdr::LedgerEntry>),
 }
 
 /// Tracks entries restored from different sources per CAP-0066 (Soroban only).
@@ -150,7 +150,7 @@ impl RestoredEntries {
     /// Iterate hot-archive entries that have original values (data/code keys only).
     pub(super) fn hot_archive_entries_with_originals(
         &self,
-    ) -> impl Iterator<Item = (&LedgerKey, &stellar_xdr::curr::LedgerEntry)> {
+    ) -> impl Iterator<Item = (&LedgerKey, &stellar_xdr::LedgerEntry)> {
         self.entries.iter().filter_map(|(k, v)| match v {
             RestoreSource::HotArchive(entry) => Some((k, entry.as_ref())),
             _ => None,
@@ -160,7 +160,7 @@ impl RestoredEntries {
     // --- Live BL insertion ---
 
     /// Internal: insert a single live-BL key with hot-archive conflict check.
-    fn insert_live_bl_inner(&mut self, key: LedgerKey, original: stellar_xdr::curr::LedgerEntry) {
+    fn insert_live_bl_inner(&mut self, key: LedgerKey, original: stellar_xdr::LedgerEntry) {
         assert!(
             !matches!(
                 self.entries.get(&key),
@@ -230,18 +230,14 @@ impl RestoredEntries {
     /// `build_entry_changes_with_hot_archive`). Production code must use
     /// [`Self::insert_live_bl_pair`] which enforces the atomic pairing invariant.
     #[cfg(test)]
-    pub(super) fn insert_live_bl(
-        &mut self,
-        key: LedgerKey,
-        original: stellar_xdr::curr::LedgerEntry,
-    ) {
+    pub(super) fn insert_live_bl(&mut self, key: LedgerKey, original: stellar_xdr::LedgerEntry) {
         self.insert_live_bl_inner(key, original);
     }
 
     /// Iterate all live-BL entries (key + original entry).
     pub(super) fn live_bl_entries(
         &self,
-    ) -> impl Iterator<Item = (&LedgerKey, &stellar_xdr::curr::LedgerEntry)> {
+    ) -> impl Iterator<Item = (&LedgerKey, &stellar_xdr::LedgerEntry)> {
         self.entries.iter().filter_map(|(k, v)| match v {
             RestoreSource::LiveBucketList(entry) => Some((k, entry.as_ref())),
             _ => None,
@@ -269,7 +265,7 @@ impl RestoredEntries {
     pub(super) fn insert_hot_archive_entry_for_test(
         &mut self,
         key: LedgerKey,
-        original: stellar_xdr::curr::LedgerEntry,
+        original: stellar_xdr::LedgerEntry,
     ) {
         assert!(
             !matches!(key, LedgerKey::Ttl(_)),
@@ -283,7 +279,7 @@ impl RestoredEntries {
     pub(super) fn insert_hot_archive_ttl_for_test(
         &mut self,
         key: LedgerKey,
-        original: stellar_xdr::curr::LedgerEntry,
+        original: stellar_xdr::LedgerEntry,
     ) {
         assert!(
             matches!(key, LedgerKey::Ttl(_)),
@@ -444,7 +440,7 @@ pub(super) fn collect_soroban_restored_entries(
 }
 
 impl TransactionExecutor {
-    /// Build an op-scoped [`stellar_xdr::curr::LedgerHeader`] used as both the
+    /// Build an op-scoped [`stellar_xdr::LedgerHeader`] used as both the
     /// `current` and `previous` header for `ConservationOfLumens`.
     ///
     /// Only `total_coins`/`fee_pool` are read by the invariant, and it reads
@@ -455,8 +451,8 @@ impl TransactionExecutor {
     /// payouts; fee-pool changes are applied at tx-set level via
     /// `record_fee_pool_delta`, outside the per-op delta). The concrete field
     /// values are therefore irrelevant; we emit a minimal header.
-    fn op_scoped_header(&self) -> stellar_xdr::curr::LedgerHeader {
-        use stellar_xdr::curr::{
+    fn op_scoped_header(&self) -> stellar_xdr::LedgerHeader {
+        use stellar_xdr::{
             Hash, LedgerHeader, LedgerHeaderExt, StellarValue, StellarValueExt, TimePoint,
         };
         LedgerHeader {
@@ -961,7 +957,7 @@ impl TransactionExecutor {
                 tracker.consumed_rent_fee,
             ));
             let refund = tracker.refund_amount();
-            let stage = stellar_xdr::curr::TransactionEventStage::AfterAllTxs;
+            let stage = stellar_xdr::TransactionEventStage::AfterAllTxs;
             tx_event_manager.new_fee_event(&fee_source_id, -refund, stage);
             fee_refund = refund;
         }
@@ -1191,7 +1187,7 @@ impl TransactionExecutor {
 mod tests {
     use super::*;
     use henyey_tx::operations::execute::HotArchiveRestore;
-    use stellar_xdr::curr::{
+    use stellar_xdr::{
         ContractDataDurability, ContractDataEntry, ContractId, ExtensionPoint, Hash,
         LedgerEntryData, LedgerEntryExt, LedgerKeyContractData, ScAddress, ScVal, TtlEntry,
     };
@@ -1204,8 +1200,8 @@ mod tests {
         })
     }
 
-    fn make_entry(seq: u32) -> stellar_xdr::curr::LedgerEntry {
-        stellar_xdr::curr::LedgerEntry {
+    fn make_entry(seq: u32) -> stellar_xdr::LedgerEntry {
+        stellar_xdr::LedgerEntry {
             last_modified_ledger_seq: seq,
             data: LedgerEntryData::ContractData(ContractDataEntry {
                 ext: ExtensionPoint::V0,
@@ -1252,7 +1248,7 @@ mod tests {
             key: ScVal::Void,
             durability: ContractDataDurability::Persistent,
         });
-        let live_entry = stellar_xdr::curr::LedgerEntry {
+        let live_entry = stellar_xdr::LedgerEntry {
             last_modified_ledger_seq: 1,
             data: LedgerEntryData::ContractData(ContractDataEntry {
                 ext: ExtensionPoint::V0,
@@ -1327,7 +1323,7 @@ mod tests {
             key: ScVal::Void,
             durability: ContractDataDurability::Persistent,
         });
-        let live_entry = stellar_xdr::curr::LedgerEntry {
+        let live_entry = stellar_xdr::LedgerEntry {
             last_modified_ledger_seq: 1,
             data: LedgerEntryData::ContractData(ContractDataEntry {
                 ext: ExtensionPoint::V0,
@@ -1364,7 +1360,7 @@ mod tests {
             key: ScVal::Void,
             durability: ContractDataDurability::Persistent,
         });
-        let live_entry = stellar_xdr::curr::LedgerEntry {
+        let live_entry = stellar_xdr::LedgerEntry {
             last_modified_ledger_seq: 1,
             data: LedgerEntryData::ContractData(ContractDataEntry {
                 ext: ExtensionPoint::V0,
@@ -1406,7 +1402,7 @@ mod tests {
             key: ScVal::Void,
             durability: ContractDataDurability::Persistent,
         });
-        let live_entry1 = stellar_xdr::curr::LedgerEntry {
+        let live_entry1 = stellar_xdr::LedgerEntry {
             last_modified_ledger_seq: 1,
             data: LedgerEntryData::ContractData(ContractDataEntry {
                 ext: ExtensionPoint::V0,
@@ -1422,7 +1418,7 @@ mod tests {
             key: ScVal::Void,
             durability: ContractDataDurability::Persistent,
         });
-        let live_entry2 = stellar_xdr::curr::LedgerEntry {
+        let live_entry2 = stellar_xdr::LedgerEntry {
             last_modified_ledger_seq: 1,
             data: LedgerEntryData::ContractData(ContractDataEntry {
                 ext: ExtensionPoint::V0,
@@ -1450,7 +1446,7 @@ mod tests {
             _ => unreachable!(),
         };
         let entry = make_entry(1);
-        let ttl_entry = stellar_xdr::curr::LedgerEntry {
+        let ttl_entry = stellar_xdr::LedgerEntry {
             last_modified_ledger_seq: 1,
             data: LedgerEntryData::Ttl(TtlEntry {
                 key_hash: ttl_key_hash,
@@ -1540,7 +1536,7 @@ mod tests {
     use henyey_common::NetworkId;
     use henyey_tx::soroban::PersistentModuleCache;
     use sha2::{Digest, Sha256};
-    use stellar_xdr::curr::{ContractCodeEntry, ContractCodeEntryExt};
+    use stellar_xdr::{ContractCodeEntry, ContractCodeEntryExt};
 
     /// Valid Soroban WASM fixture A (small contract).
     const WASM_A: &[u8] =
@@ -1567,9 +1563,9 @@ mod tests {
     }
 
     /// Build a `LedgerEntry` wrapping a `ContractCodeEntry` for the given WASM.
-    fn make_contract_code_ledger_entry(wasm: &[u8]) -> stellar_xdr::curr::LedgerEntry {
+    fn make_contract_code_ledger_entry(wasm: &[u8]) -> stellar_xdr::LedgerEntry {
         let hash_bytes: [u8; 32] = Sha256::digest(wasm).into();
-        stellar_xdr::curr::LedgerEntry {
+        stellar_xdr::LedgerEntry {
             last_modified_ledger_seq: 100,
             data: LedgerEntryData::ContractCode(ContractCodeEntry {
                 ext: ContractCodeEntryExt::V0,
@@ -1729,14 +1725,12 @@ mod tests {
 
     /// Helper: build a V1 `LedgerEntry` with known cost inputs for the
     /// given WASM blob.
-    fn make_v1_contract_code_ledger_entry(
-        wasm: &[u8],
-    ) -> (stellar_xdr::curr::LedgerEntry, [u8; 32]) {
-        use stellar_xdr::curr::{
+    fn make_v1_contract_code_ledger_entry(wasm: &[u8]) -> (stellar_xdr::LedgerEntry, [u8; 32]) {
+        use stellar_xdr::{
             ContractCodeCostInputs, ContractCodeEntryV1, ExtensionPoint as XdrExtensionPoint,
         };
         let hash_bytes: [u8; 32] = Sha256::digest(wasm).into();
-        let entry = stellar_xdr::curr::LedgerEntry {
+        let entry = stellar_xdr::LedgerEntry {
             last_modified_ledger_seq: 100,
             data: LedgerEntryData::ContractCode(ContractCodeEntry {
                 ext: ContractCodeEntryExt::V1(ContractCodeEntryV1 {

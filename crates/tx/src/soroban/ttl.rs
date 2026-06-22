@@ -35,16 +35,16 @@ pub fn restore_ttl_target(ledger_seq: u32, min_persistent_ttl: u32) -> u32 {
 /// data/code key hash and the restore target TTL at the time of restoration.
 #[must_use]
 pub(crate) fn synthesize_ttl_entry(
-    key_hash: stellar_xdr::curr::Hash,
+    key_hash: stellar_xdr::Hash,
     live_until_ledger_seq: u32,
-) -> stellar_xdr::curr::LedgerEntry {
-    stellar_xdr::curr::LedgerEntry {
+) -> stellar_xdr::LedgerEntry {
+    stellar_xdr::LedgerEntry {
         last_modified_ledger_seq: 0,
-        data: stellar_xdr::curr::LedgerEntryData::Ttl(stellar_xdr::curr::TtlEntry {
+        data: stellar_xdr::LedgerEntryData::Ttl(stellar_xdr::TtlEntry {
             key_hash,
             live_until_ledger_seq,
         }),
-        ext: stellar_xdr::curr::LedgerEntryExt::V0,
+        ext: stellar_xdr::LedgerEntryExt::V0,
     }
 }
 

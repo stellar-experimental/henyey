@@ -100,9 +100,9 @@ impl NetworkId {
     }
 }
 
-impl From<NetworkId> for stellar_xdr::curr::Hash {
+impl From<NetworkId> for stellar_xdr::Hash {
     fn from(id: NetworkId) -> Self {
-        stellar_xdr::curr::Hash(id.0 .0)
+        stellar_xdr::Hash(id.0 .0)
     }
 }
 

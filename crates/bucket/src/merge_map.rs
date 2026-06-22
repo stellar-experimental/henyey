@@ -621,14 +621,14 @@ mod tests {
 
         // Create a non-empty bucket (use a known non-zero hash)
         let bucket = Arc::new(
-            Bucket::from_entries(vec![stellar_xdr::curr::BucketEntry::Liveentry(
-                stellar_xdr::curr::LedgerEntry {
+            Bucket::from_entries(vec![stellar_xdr::BucketEntry::Liveentry(
+                stellar_xdr::LedgerEntry {
                     last_modified_ledger_seq: 1,
-                    data: stellar_xdr::curr::LedgerEntryData::Ttl(stellar_xdr::curr::TtlEntry {
-                        key_hash: stellar_xdr::curr::Hash([1; 32]),
+                    data: stellar_xdr::LedgerEntryData::Ttl(stellar_xdr::TtlEntry {
+                        key_hash: stellar_xdr::Hash([1; 32]),
                         live_until_ledger_seq: 100,
                     }),
-                    ext: stellar_xdr::curr::LedgerEntryExt::V0,
+                    ext: stellar_xdr::LedgerEntryExt::V0,
                 },
             )])
             .unwrap(),

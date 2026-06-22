@@ -7,7 +7,7 @@
 use std::collections::HashSet;
 
 use henyey_common::{Hash256, NetworkId};
-use stellar_xdr::curr::{
+use stellar_xdr::{
     AccountId, AlphaNum4, Asset, AssetCode4, CreateAccountOp, GeneralizedTransactionSet,
     InvokeContractArgs, InvokeHostFunctionOp, ManageSellOfferOp, MuxedAccount, Operation,
     OperationBody, Price, PublicKey, ScAddress, ScSymbol, ScVal, SequenceNumber, SorobanResources,
@@ -35,8 +35,8 @@ fn make_classic_payment(fee: u32) -> TransactionEnvelope {
         source_account: source,
         fee,
         seq_num: SequenceNumber(1),
-        cond: stellar_xdr::curr::Preconditions::None,
-        memo: stellar_xdr::curr::Memo::None,
+        cond: stellar_xdr::Preconditions::None,
+        memo: stellar_xdr::Memo::None,
         operations: vec![op].try_into().unwrap(),
         ext: TransactionExt::V0,
     };
@@ -67,8 +67,8 @@ fn make_dex_tx(fee: u32) -> TransactionEnvelope {
         source_account: source,
         fee,
         seq_num: SequenceNumber(1),
-        cond: stellar_xdr::curr::Preconditions::None,
-        memo: stellar_xdr::curr::Memo::None,
+        cond: stellar_xdr::Preconditions::None,
+        memo: stellar_xdr::Memo::None,
         operations: vec![op].try_into().unwrap(),
         ext: TransactionExt::V0,
     };
@@ -95,8 +95,8 @@ fn make_multi_op_classic(fee: u32, ops: usize) -> TransactionEnvelope {
         source_account: source,
         fee,
         seq_num: SequenceNumber(1),
-        cond: stellar_xdr::curr::Preconditions::None,
-        memo: stellar_xdr::curr::Memo::None,
+        cond: stellar_xdr::Preconditions::None,
+        memo: stellar_xdr::Memo::None,
         operations: operations.try_into().unwrap(),
         ext: TransactionExt::V0,
     };
@@ -111,7 +111,7 @@ fn make_soroban_tx(fee: u32, instructions: u32) -> TransactionEnvelope {
     let op = Operation {
         source_account: None,
         body: OperationBody::InvokeHostFunction(InvokeHostFunctionOp {
-            host_function: stellar_xdr::curr::HostFunction::InvokeContract(InvokeContractArgs {
+            host_function: stellar_xdr::HostFunction::InvokeContract(InvokeContractArgs {
                 contract_address: ScAddress::default(),
                 function_name: ScSymbol(
                     StringM::<32>::try_from("test".to_string()).expect("symbol"),
@@ -122,7 +122,7 @@ fn make_soroban_tx(fee: u32, instructions: u32) -> TransactionEnvelope {
         }),
     };
     let resources = SorobanResources {
-        footprint: stellar_xdr::curr::LedgerFootprint {
+        footprint: stellar_xdr::LedgerFootprint {
             read_only: VecM::default(),
             read_write: VecM::default(),
         },
@@ -134,8 +134,8 @@ fn make_soroban_tx(fee: u32, instructions: u32) -> TransactionEnvelope {
         source_account: source,
         fee,
         seq_num: SequenceNumber(1),
-        cond: stellar_xdr::curr::Preconditions::None,
-        memo: stellar_xdr::curr::Memo::None,
+        cond: stellar_xdr::Preconditions::None,
+        memo: stellar_xdr::Memo::None,
         operations: vec![op].try_into().unwrap(),
         ext: TransactionExt::V1(SorobanTransactionData {
             ext: SorobanTransactionDataExt::V0,
@@ -159,7 +159,7 @@ fn set_source(envelope: &mut TransactionEnvelope, seed: u8) {
             env.tx.source_account = source;
         }
         TransactionEnvelope::TxFeeBump(env) => match &mut env.tx.inner_tx {
-            stellar_xdr::curr::FeeBumpTransactionInnerTx::Tx(inner) => {
+            stellar_xdr::FeeBumpTransactionInnerTx::Tx(inner) => {
                 inner.tx.source_account = source;
             }
         },
@@ -195,8 +195,7 @@ fn flatten_gen_tx_set(gen: &GeneralizedTransactionSet) -> Vec<TransactionEnvelop
 }
 
 fn xdr_bytes(gen: &GeneralizedTransactionSet) -> Vec<u8> {
-    gen.to_xdr(stellar_xdr::curr::Limits::none())
-        .expect("XDR encode")
+    gen.to_xdr(stellar_xdr::Limits::none()).expect("XDR encode")
 }
 
 // ---------------------------------------------------------------------------

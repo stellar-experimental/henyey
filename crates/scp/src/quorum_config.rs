@@ -32,7 +32,7 @@
 //! ```
 
 use henyey_common::config::QuorumSetConfig;
-use stellar_xdr::curr::{NodeId, PublicKey, ScpQuorumSet, Uint256};
+use stellar_xdr::{NodeId, PublicKey, ScpQuorumSet, Uint256};
 
 use crate::is_valid_quorum_set;
 

@@ -2,7 +2,7 @@
 
 use std::cmp::Ordering;
 
-use stellar_xdr::curr::{
+use stellar_xdr::{
     ScpNomination, ScpStatement, ScpStatementConfirm, ScpStatementPledges, ScpStatementPrepare,
 };
 
@@ -147,7 +147,7 @@ pub(crate) fn is_newer_confirm(old: &ScpStatementConfirm, new: &ScpStatementConf
 mod tests {
     use super::*;
     use crate::test_utils::{make_node_id, make_quorum_set, make_value};
-    use stellar_xdr::curr::{ScpBallot, ScpNomination};
+    use stellar_xdr::{ScpBallot, ScpNomination};
 
     #[test]
     fn test_is_newer_nomination() {
@@ -282,7 +282,7 @@ mod tests {
         let externalize_st = ScpStatement {
             node_id: node.clone(),
             slot_index: 1,
-            pledges: ScpStatementPledges::Externalize(stellar_xdr::curr::ScpStatementExternalize {
+            pledges: ScpStatementPledges::Externalize(stellar_xdr::ScpStatementExternalize {
                 commit: make_ballot(1, &[1]),
                 n_h: 1,
                 commit_quorum_set_hash: crate::quorum::hash_quorum_set(&quorum_set).into(),
@@ -340,7 +340,7 @@ mod tests {
         let confirm_st = ScpStatement {
             node_id: node.clone(),
             slot_index: 1,
-            pledges: ScpStatementPledges::Confirm(stellar_xdr::curr::ScpStatementConfirm {
+            pledges: ScpStatementPledges::Confirm(stellar_xdr::ScpStatementConfirm {
                 ballot: make_ballot(1, &[1]),
                 n_prepared: 1,
                 n_commit: 1,
@@ -352,7 +352,7 @@ mod tests {
         let externalize_st = ScpStatement {
             node_id: node.clone(),
             slot_index: 1,
-            pledges: ScpStatementPledges::Externalize(stellar_xdr::curr::ScpStatementExternalize {
+            pledges: ScpStatementPledges::Externalize(stellar_xdr::ScpStatementExternalize {
                 commit: make_ballot(1, &[1]),
                 n_h: 1,
                 commit_quorum_set_hash: qs_hash.into(),
@@ -412,7 +412,7 @@ mod tests {
         let confirm_st = ScpStatement {
             node_id: node.clone(),
             slot_index: 1,
-            pledges: ScpStatementPledges::Confirm(stellar_xdr::curr::ScpStatementConfirm {
+            pledges: ScpStatementPledges::Confirm(stellar_xdr::ScpStatementConfirm {
                 ballot: make_ballot(1, &[1]),
                 n_prepared: 1,
                 n_commit: 1,
@@ -527,7 +527,7 @@ mod tests {
         let advancing_confirm = ScpStatement {
             node_id: node,
             slot_index: 100,
-            pledges: ScpStatementPledges::Confirm(stellar_xdr::curr::ScpStatementConfirm {
+            pledges: ScpStatementPledges::Confirm(stellar_xdr::ScpStatementConfirm {
                 ballot: make_ballot(5, &[1]),
                 n_prepared: 3,
                 n_commit: 2,

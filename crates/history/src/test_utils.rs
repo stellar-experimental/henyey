@@ -21,7 +21,7 @@ use flate2::{write::GzEncoder, Compression};
 use henyey_bucket::{Bucket, BucketList, HotArchiveBucketList, HOT_ARCHIVE_BUCKET_LIST_LEVELS};
 use henyey_common::Hash256;
 use sha2::{Digest, Sha256};
-use stellar_xdr::curr::{
+use stellar_xdr::{
     Hash, LedgerHeader, LedgerHeaderExt, LedgerHeaderHistoryEntry, LedgerHeaderHistoryEntryExt,
     StellarValue, StellarValueExt, TimePoint, VecM, WriteXdr,
 };
@@ -219,7 +219,7 @@ pub async fn build_single_checkpoint_archive(
         ext: LedgerHeaderHistoryEntryExt::default(),
     };
     let header_xdr = header_entry
-        .to_xdr(stellar_xdr::curr::Limits::none())
+        .to_xdr(stellar_xdr::Limits::none())
         .expect("header xdr");
 
     let zero_hash = "0".repeat(64);

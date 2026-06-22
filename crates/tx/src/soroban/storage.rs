@@ -4,8 +4,8 @@
 //! our LedgerStateManager.
 
 #[cfg(test)]
-use stellar_xdr::curr::ContractDataEntry;
-use stellar_xdr::curr::{
+use stellar_xdr::ContractDataEntry;
+use stellar_xdr::{
     ContractDataDurability, Hash, LedgerKey, LedgerKeyContractData, ScAddress, ScVal,
 };
 
@@ -76,7 +76,7 @@ impl StorageEntry {
     /// Convert to a ContractDataEntry.
     pub fn to_contract_data_entry(&self) -> ContractDataEntry {
         ContractDataEntry {
-            ext: stellar_xdr::curr::ExtensionPoint::V0,
+            ext: stellar_xdr::ExtensionPoint::V0,
             contract: self.key.contract.clone(),
             key: self.key.key.clone(),
             durability: self.key.durability,
@@ -255,7 +255,7 @@ impl Footprint {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use stellar_xdr::curr::{ContractId, LedgerKeyContractCode};
+    use stellar_xdr::{ContractId, LedgerKeyContractCode};
 
     fn make_contract_address(seed: u8) -> ScAddress {
         ScAddress::Contract(ContractId(Hash([seed; 32])))
@@ -494,7 +494,7 @@ mod tests {
             ContractDataDurability::Persistent,
         );
         // Use a simple ScVal type
-        let value = ScVal::I128(stellar_xdr::curr::Int128Parts { hi: 0, lo: 42 });
+        let value = ScVal::I128(stellar_xdr::Int128Parts { hi: 0, lo: 42 });
         let entry = StorageEntry::new(key, value.clone(), 5000);
 
         let contract_data = entry.to_contract_data_entry();

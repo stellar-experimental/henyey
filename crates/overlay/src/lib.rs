@@ -667,27 +667,25 @@ impl<'de> serde::Deserialize<'de> for PeerAddress {
 ///
 /// When displayed, the full strkey format (G...) is shown for easy identification.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct PeerId(pub stellar_xdr::curr::PublicKey);
+pub struct PeerId(pub stellar_xdr::PublicKey);
 
 impl PeerId {
     /// Creates a `PeerId` from an XDR public key.
-    pub fn from_xdr(key: stellar_xdr::curr::PublicKey) -> Self {
+    pub fn from_xdr(key: stellar_xdr::PublicKey) -> Self {
         Self(key)
     }
 
     /// Creates a `PeerId` from raw Ed25519 public key bytes.
     pub fn from_bytes(bytes: [u8; 32]) -> Self {
-        Self(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
-            stellar_xdr::curr::Uint256(bytes),
+        Self(stellar_xdr::PublicKey::PublicKeyTypeEd25519(
+            stellar_xdr::Uint256(bytes),
         ))
     }
 
     /// Returns a reference to the raw 32-byte public key.
     pub fn as_bytes(&self) -> &[u8; 32] {
         match &self.0 {
-            stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(stellar_xdr::curr::Uint256(
-                bytes,
-            )) => bytes,
+            stellar_xdr::PublicKey::PublicKeyTypeEd25519(stellar_xdr::Uint256(bytes)) => bytes,
         }
     }
 
@@ -744,7 +742,7 @@ pub trait MessageHandler: Send + Sync {
     async fn handle_message(
         &self,
         peer_id: &PeerId,
-        message: stellar_xdr::curr::StellarMessage,
+        message: stellar_xdr::StellarMessage,
     ) -> Result<()>;
 }
 
@@ -931,7 +929,7 @@ impl LocalNode {
     }
 
     /// Returns this node's public key in XDR format.
-    pub fn xdr_public_key(&self) -> stellar_xdr::curr::PublicKey {
+    pub fn xdr_public_key(&self) -> stellar_xdr::PublicKey {
         (&self.public_key()).into()
     }
 

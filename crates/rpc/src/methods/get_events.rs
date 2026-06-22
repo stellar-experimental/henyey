@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use serde_json::json;
-use stellar_xdr::curr::{
+use stellar_xdr::{
     ContractEvent, ContractEventBody, ContractEventType, Limits, ReadXdr, ScVal, WriteXdr,
 };
 
@@ -563,9 +563,9 @@ mod tests {
 
     #[test]
     fn test_extract_event_value_valid() {
-        use stellar_xdr::curr::{ContractEvent, ContractEventBody, ContractEventV0, WriteXdr};
+        use stellar_xdr::{ContractEvent, ContractEventBody, ContractEventV0, WriteXdr};
         let event = ContractEvent {
-            ext: stellar_xdr::curr::ExtensionPoint::V0,
+            ext: stellar_xdr::ExtensionPoint::V0,
             contract_id: None,
             type_: ContractEventType::Contract,
             body: ContractEventBody::V0(ContractEventV0 {
@@ -581,9 +581,9 @@ mod tests {
 
     #[test]
     fn test_insert_event_fields_base64_valid() {
-        use stellar_xdr::curr::{ContractEvent, ContractEventBody, ContractEventV0, WriteXdr};
+        use stellar_xdr::{ContractEvent, ContractEventBody, ContractEventV0, WriteXdr};
         let event = ContractEvent {
-            ext: stellar_xdr::curr::ExtensionPoint::V0,
+            ext: stellar_xdr::ExtensionPoint::V0,
             contract_id: None,
             type_: ContractEventType::Contract,
             body: ContractEventBody::V0(ContractEventV0 {
@@ -610,9 +610,9 @@ mod tests {
 
     #[test]
     fn test_insert_event_fields_json_corrupt_topic_errors() {
-        use stellar_xdr::curr::{ContractEvent, ContractEventBody, ContractEventV0, WriteXdr};
+        use stellar_xdr::{ContractEvent, ContractEventBody, ContractEventV0, WriteXdr};
         let event = ContractEvent {
-            ext: stellar_xdr::curr::ExtensionPoint::V0,
+            ext: stellar_xdr::ExtensionPoint::V0,
             contract_id: None,
             type_: ContractEventType::Contract,
             body: ContractEventBody::V0(ContractEventV0 {

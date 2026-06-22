@@ -96,7 +96,7 @@ pub fn initialize_genesis(
     use henyey_db::schema::state_keys;
     use henyey_history::build_history_archive_state;
     use henyey_ledger::{calculate_skip_values, compute_header_hash};
-    use stellar_xdr::curr::{
+    use stellar_xdr::{
         BucketListType, Hash, LedgerHeader, LedgerHeaderExt, Limits, StellarValue, StellarValueExt,
         TimePoint, TransactionHistoryEntry, TransactionHistoryEntryExt,
         TransactionHistoryResultEntry, TransactionHistoryResultEntryExt, TransactionResultSet,
@@ -266,8 +266,8 @@ pub(crate) fn build_genesis_entries(
     passphrase: &str,
     test_account_count: u32,
     total_coins: i64,
-) -> Vec<stellar_xdr::curr::LedgerEntry> {
-    use stellar_xdr::curr::{
+) -> Vec<stellar_xdr::LedgerEntry> {
+    use stellar_xdr::{
         AccountEntry, AccountEntryExt, AccountId, LedgerEntry, LedgerEntryData, LedgerEntryExt,
         PublicKey, SequenceNumber, Thresholds, Uint256, VecM,
     };
@@ -298,7 +298,7 @@ pub(crate) fn build_genesis_entries(
                 num_sub_entries: 0,
                 inflation_dest: None,
                 flags: 0,
-                home_domain: stellar_xdr::curr::String32::default(),
+                home_domain: stellar_xdr::String32::default(),
                 thresholds: Thresholds([1, 0, 0, 0]),
                 signers: VecM::default(),
                 ext: AccountEntryExt::V0,
@@ -386,7 +386,7 @@ impl App {
         let mut bucket_list = BucketList::new();
         bucket_list.set_bucket_dir(bucket_dir.clone());
         {
-            use stellar_xdr::curr::BucketListType;
+            use stellar_xdr::BucketListType;
             bucket_list
                 .add_batch(1, 0, BucketListType::Live, genesis_entries, vec![], vec![])
                 .map_err(|e| anyhow::anyhow!("Failed to create genesis bucket list: {}", e))?;
@@ -484,7 +484,7 @@ mod tests {
         let db = henyey_db::Database::open_in_memory().unwrap();
 
         // Write a stale header without setting LCL.
-        use stellar_xdr::curr::{
+        use stellar_xdr::{
             Hash, LedgerHeader, LedgerHeaderExt, Limits, StellarValue, StellarValueExt, TimePoint,
             VecM, WriteXdr,
         };
@@ -576,8 +576,8 @@ mod tests {
 
     /// Collect the `ConfigSettingId`s present in the genesis Soroban config set
     /// for the given protocol.
-    fn genesis_config_setting_ids(protocol: u32) -> Vec<stellar_xdr::curr::ConfigSettingId> {
-        use stellar_xdr::curr::LedgerEntryData;
+    fn genesis_config_setting_ids(protocol: u32) -> Vec<stellar_xdr::ConfigSettingId> {
+        use stellar_xdr::LedgerEntryData;
         let network_id = NetworkId::from_passphrase(PASSPHRASE);
         let entries =
             henyey_ledger::build_genesis_soroban_config_entries(protocol, &network_id).unwrap();
@@ -600,7 +600,7 @@ mod tests {
     /// zero ConfigSetting entries — bootstrap.rs:80).
     #[test]
     fn test_genesis_config_for_genesis_matches_core_3492() {
-        use stellar_xdr::curr::ConfigSettingId;
+        use stellar_xdr::ConfigSettingId;
 
         let db = henyey_db::Database::open_in_memory().unwrap();
         let protocol = 25;

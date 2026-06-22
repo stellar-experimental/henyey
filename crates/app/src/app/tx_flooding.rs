@@ -741,7 +741,7 @@ impl App {
     }
 
     /// Handle a TxSet message from the network.
-    pub(super) async fn handle_tx_set(&self, tx_set: stellar_xdr::curr::TransactionSet) {
+    pub(super) async fn handle_tx_set(&self, tx_set: stellar_xdr::TransactionSet) {
         use henyey_herder::TransactionSet;
 
         // Build internal TransactionSet from wire data — hash computed internally
@@ -791,7 +791,7 @@ impl App {
     /// Handle a GeneralizedTxSet message from the network.
     pub(super) async fn handle_generalized_tx_set(
         &self,
-        gen_tx_set: stellar_xdr::curr::GeneralizedTransactionSet,
+        gen_tx_set: stellar_xdr::GeneralizedTransactionSet,
     ) {
         // Time the full body (#1759 diagnostics): this runs inline on
         // the event loop for every GeneralizedTxSet, including the
@@ -805,7 +805,7 @@ impl App {
 
     async fn handle_generalized_tx_set_inner(
         &self,
-        gen_tx_set: stellar_xdr::curr::GeneralizedTransactionSet,
+        gen_tx_set: stellar_xdr::GeneralizedTransactionSet,
     ) {
         use henyey_herder::TransactionSet;
 
@@ -883,13 +883,13 @@ impl App {
                     let ledger_version = self.ledger_manager.current_header().ledger_version;
                     let message_type =
                         if protocol_version_starts_from(ledger_version, ProtocolVersion::V20) {
-                            stellar_xdr::curr::MessageType::GeneralizedTxSet
+                            stellar_xdr::MessageType::GeneralizedTxSet
                         } else {
-                            stellar_xdr::curr::MessageType::TxSet
+                            stellar_xdr::MessageType::TxSet
                         };
-                    let msg = StellarMessage::DontHave(stellar_xdr::curr::DontHave {
+                    let msg = StellarMessage::DontHave(stellar_xdr::DontHave {
                         type_: message_type,
-                        req_hash: stellar_xdr::curr::Uint256(hash.0),
+                        req_hash: stellar_xdr::Uint256(hash.0),
                     });
                     if let Err(e) = overlay.try_send_to(peer_id, msg) {
                         tracing::debug!(hash = hex::encode(hash.0), peer = %peer_id, error = %e, "Failed to send DontHave for TxSet");
@@ -927,7 +927,7 @@ impl App {
 
         // Convert to legacy XDR TransactionSet
         let prev_hash = tx_set.previous_ledger_hash();
-        let xdr_tx_set = stellar_xdr::curr::TransactionSet {
+        let xdr_tx_set = stellar_xdr::TransactionSet {
             previous_ledger_hash: Hash::from(prev_hash),
             txs: tx_set.transactions_owned().try_into().unwrap_or_default(),
         };
@@ -1127,7 +1127,7 @@ impl App {
 
         for (hash, peer_id) in requests {
             tracing::debug!(hash = %hash, peer = %peer_id, "Requesting tx set");
-            let request = StellarMessage::GetTxSet(stellar_xdr::curr::Uint256(hash.0));
+            let request = StellarMessage::GetTxSet(stellar_xdr::Uint256(hash.0));
             if let Err(e) = overlay.try_send_to(&peer_id, request) {
                 tracing::warn!(hash = %hash, peer = %peer_id, error = %e, "Failed to request TxSet");
             }
@@ -1304,7 +1304,7 @@ impl App {
                 peer_count = peers.len(),
                 "Retrying exhausted tx_set fetch — broadcasting to all eligible peers"
             );
-            let msg = StellarMessage::GetTxSet(stellar_xdr::curr::Uint256(hash.0));
+            let msg = StellarMessage::GetTxSet(stellar_xdr::Uint256(hash.0));
             for peer in &peers {
                 let _ = overlay.try_send_to(peer, msg.clone());
             }
@@ -1576,7 +1576,7 @@ mod tests {
     // ── Test helpers for collect_adverts_for_peers ────────────────────────
 
     use henyey_herder::{TransactionQueue, TxQueueConfig, TxQueueResult};
-    use stellar_xdr::curr::{
+    use stellar_xdr::{
         AccountId, AlphaNum4, Asset, AssetCode4, DecoratedSignature, ManageSellOfferOp, Memo,
         MuxedAccount, Operation, OperationBody, Preconditions, Price, PublicKey, SequenceNumber,
         Signature, SignatureHint, Transaction, TransactionEnvelope, TransactionExt,
@@ -1597,7 +1597,7 @@ mod tests {
         let operations: Vec<Operation> = (0..ops)
             .map(|_| Operation {
                 source_account: None,
-                body: OperationBody::BumpSequence(stellar_xdr::curr::BumpSequenceOp {
+                body: OperationBody::BumpSequence(stellar_xdr::BumpSequenceOp {
                     bump_to: SequenceNumber(0),
                 }),
             })
@@ -2008,7 +2008,7 @@ mod tests {
     /// content validation at the receive layer (Peer::recvGeneralizedTxSet).
     #[tokio::test]
     async fn test_handle_generalized_tx_set_accepts_low_base_fee() {
-        use stellar_xdr::curr::{
+        use stellar_xdr::{
             GeneralizedTransactionSet, Hash, ParallelTxsComponent, TransactionPhase,
             TransactionSetV1, TxSetComponent, TxSetComponentTxsMaybeDiscountedFee,
         };
@@ -2085,7 +2085,7 @@ mod tests {
     /// tx set has a generalized form whose hash matches the requested hash.
     #[tokio::test]
     async fn test_send_tx_set_sends_generalized_for_matching_hash() {
-        use stellar_xdr::curr::{
+        use stellar_xdr::{
             GeneralizedTransactionSet, Hash, ParallelTxsComponent, TransactionPhase,
             TransactionSetV1, TxSetComponent, TxSetComponentTxsMaybeDiscountedFee,
         };
@@ -2192,11 +2192,7 @@ mod tests {
         let peer_id = make_peer_id(99);
         let hash_bytes = [0x42u8; 32];
         let advert = FloodAdvert {
-            tx_hashes: TxAdvertVector(
-                vec![stellar_xdr::curr::Hash(hash_bytes)]
-                    .try_into()
-                    .unwrap(),
-            ),
+            tx_hashes: TxAdvertVector(vec![stellar_xdr::Hash(hash_bytes)].try_into().unwrap()),
         };
         let hash256 = Hash256(hash_bytes);
 

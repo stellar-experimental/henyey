@@ -42,7 +42,7 @@
 
 use henyey_common::protocol::{protocol_version_starts_from, ProtocolVersion};
 use henyey_common::{Hash256, NetworkId};
-use stellar_xdr::curr::{
+use stellar_xdr::{
     AccountId, DecoratedSignature, FeeBumpTransaction, FeeBumpTransactionEnvelope,
     FeeBumpTransactionInnerTx, Hash, InnerTransactionResult, InnerTransactionResultExt,
     InnerTransactionResultPair, InnerTransactionResultResult, MuxedAccount, OperationResult,
@@ -538,9 +538,7 @@ impl FeeBumpMutableTransactionResult {
             inner_success: true,
             inner_op_results: vec![
                 OperationResult::OpInner(
-                    stellar_xdr::curr::OperationResultTr::Payment(
-                        stellar_xdr::curr::PaymentResult::Success,
-                    )
+                    stellar_xdr::OperationResultTr::Payment(stellar_xdr::PaymentResult::Success,)
                 );
                 op_count
             ],
@@ -827,7 +825,7 @@ pub fn extract_inner_hash_from_result(result: &TransactionResult) -> Option<Hash
 mod tests {
     use super::*;
     use henyey_common::NetworkId;
-    use stellar_xdr::curr::{
+    use stellar_xdr::{
         Asset, FeeBumpTransactionExt, Memo, Operation, OperationBody, PaymentOp, Preconditions,
         SequenceNumber, Signature, SignatureHint, Transaction, TransactionExt, Uint256, VecM,
     };

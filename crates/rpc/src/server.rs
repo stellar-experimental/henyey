@@ -638,7 +638,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_send_transaction_exempt_from_timeout() {
         use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
-        use stellar_xdr::curr::{
+        use stellar_xdr::{
             Limits, Memo, MuxedAccount, Operation, OperationBody, Preconditions, SequenceNumber,
             Transaction, TransactionEnvelope, TransactionExt, TransactionV1Envelope, Uint256,
             WriteXdr,
@@ -859,7 +859,7 @@ mod tests {
     // Category H: Fee window ingestion recovery (AUDIT-175 regression tests)
     // -----------------------------------------------------------------------
 
-    use stellar_xdr::curr::{
+    use stellar_xdr::{
         Hash, LedgerCloseMetaV0, LedgerHeader, LedgerHeaderExt, LedgerHeaderHistoryEntry,
         LedgerHeaderHistoryEntryExt, Limits, StellarValue, StellarValueExt, TimePoint,
         TransactionSet, WriteXdr,
@@ -867,7 +867,7 @@ mod tests {
 
     /// Build minimal valid LedgerCloseMeta XDR bytes for a given ledger sequence.
     fn make_lcm_bytes(seq: u32) -> Vec<u8> {
-        let lcm = stellar_xdr::curr::LedgerCloseMeta::V0(LedgerCloseMetaV0 {
+        let lcm = stellar_xdr::LedgerCloseMeta::V0(LedgerCloseMetaV0 {
             ledger_header: LedgerHeaderHistoryEntry {
                 hash: Hash([0; 32]),
                 header: LedgerHeader {

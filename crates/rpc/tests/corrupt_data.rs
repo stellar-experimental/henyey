@@ -17,7 +17,7 @@ use henyey_db::{
     StoreTxParams, TxStatus,
 };
 use serde_json::json;
-use stellar_xdr::curr::{
+use stellar_xdr::{
     ContractEvent, ContractEventBody, ContractEventType, ContractEventV0, ExtensionPoint, Hash,
     LedgerHeader, LedgerHeaderExt, Limits, Memo, MuxedAccount, Preconditions, ScVal,
     SequenceNumber, StellarValue, StellarValueExt, TimePoint, Transaction, TransactionEnvelope,
@@ -637,7 +637,7 @@ async fn get_ledgers_corrupt_metadata() {
 
 /// Build a minimal, valid `LedgerCloseMeta` with the given ledger sequence.
 fn valid_lcm_bytes(seq: u32) -> Vec<u8> {
-    use stellar_xdr::curr::{
+    use stellar_xdr::{
         Hash, LedgerCloseMeta, LedgerCloseMetaV0, LedgerHeader, LedgerHeaderExt,
         LedgerHeaderHistoryEntry, LedgerHeaderHistoryEntryExt, StellarValue, StellarValueExt,
         TimePoint, TransactionSet, WriteXdr,
@@ -744,7 +744,7 @@ async fn get_latest_ledger_sequence_mismatch() {
 #[tokio::test]
 async fn get_latest_ledger_fields_consistent_with_header_xdr() {
     use sha2::{Digest, Sha256};
-    use stellar_xdr::curr::{LedgerHeader as XdrLedgerHeader, ReadXdr};
+    use stellar_xdr::{LedgerHeader as XdrLedgerHeader, ReadXdr};
 
     let h = setup_fake_rpc_with_header(2, 1_700_000_000).await;
 

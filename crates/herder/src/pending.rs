@@ -38,7 +38,7 @@ use parking_lot::RwLock;
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
-use stellar_xdr::curr::ScpEnvelope;
+use stellar_xdr::ScpEnvelope;
 
 /// Per-slot envelope safety cap. Henyey-specific defense-in-depth.
 ///
@@ -606,7 +606,7 @@ impl Default for PendingEnvelopes {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use stellar_xdr::curr::{
+    use stellar_xdr::{
         Hash, NodeId as XdrNodeId, PublicKey, ScpEnvelope, ScpNomination, ScpStatement,
         ScpStatementPledges, Uint256,
     };
@@ -625,7 +625,7 @@ mod tests {
                     accepted: vec![].try_into().unwrap(),
                 }),
             },
-            signature: stellar_xdr::curr::Signature(vec![0u8; 64].try_into().unwrap()),
+            signature: stellar_xdr::Signature(vec![0u8; 64].try_into().unwrap()),
         }
     }
 
@@ -725,7 +725,7 @@ mod tests {
                     accepted: vec![].try_into().unwrap(),
                 }),
             },
-            signature: stellar_xdr::curr::Signature(vec![0u8; 64].try_into().unwrap()),
+            signature: stellar_xdr::Signature(vec![0u8; 64].try_into().unwrap()),
         }
     }
 

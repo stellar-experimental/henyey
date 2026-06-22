@@ -1,6 +1,6 @@
 //! Shared types for protocol-versioned host implementations.
 
-use stellar_xdr::curr::{LedgerEntry, LedgerEntryData, LedgerKey, LedgerKeyTtl};
+use stellar_xdr::{LedgerEntry, LedgerEntryData, LedgerKey, LedgerKeyTtl};
 
 /// An entry restored from the live BucketList (had expired TTL but wasn't yet evicted).
 ///
@@ -101,7 +101,7 @@ impl LiveBucketListRestore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use stellar_xdr::curr::{
+    use stellar_xdr::{
         ContractCodeEntry, ContractDataDurability, ContractDataEntry, ContractId, ExtensionPoint,
         Hash, LedgerEntryExt, LedgerKeyContractCode, LedgerKeyContractData, ScAddress, ScVal,
         TtlEntry,
@@ -139,7 +139,7 @@ mod tests {
         LedgerEntry {
             last_modified_ledger_seq: 100,
             data: LedgerEntryData::ContractCode(ContractCodeEntry {
-                ext: stellar_xdr::curr::ContractCodeEntryExt::V0,
+                ext: stellar_xdr::ContractCodeEntryExt::V0,
                 hash: Hash([2u8; 32]),
                 code: vec![0u8; 10].try_into().unwrap(),
             }),
@@ -216,12 +216,10 @@ mod tests {
     #[test]
     #[should_panic(expected = "key must be a persistent Soroban key")]
     fn test_new_panics_on_account_key() {
-        let account_key = LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
-            account_id: stellar_xdr::curr::AccountId(
-                stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(stellar_xdr::curr::Uint256(
-                    [0u8; 32],
-                )),
-            ),
+        let account_key = LedgerKey::Account(stellar_xdr::LedgerKeyAccount {
+            account_id: stellar_xdr::AccountId(stellar_xdr::PublicKey::PublicKeyTypeEd25519(
+                stellar_xdr::Uint256([0u8; 32]),
+            )),
         });
         let entry = persistent_data_entry();
         let data_key = persistent_data_key();

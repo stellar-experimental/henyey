@@ -46,7 +46,7 @@ use henyey_common::{BucketListDbConfig, Hash256};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use stellar_xdr::curr::{
+use stellar_xdr::{
     BucketListType, BucketMetadata, BucketMetadataExt, LedgerEntry, LedgerKey, Limits,
     StateArchivalSettings, WriteXdr,
 };
@@ -1907,8 +1907,7 @@ impl BucketList {
             return;
         }
         let counters = self.sum_bucket_entry_counters();
-        let total_account_bytes =
-            counters.size_for_type(stellar_xdr::curr::LedgerEntryType::Account);
+        let total_account_bytes = counters.size_for_type(stellar_xdr::LedgerEntryType::Account);
         for level in &self.levels {
             for bucket in [&level.curr, &level.snap] {
                 if !bucket.is_empty() {
@@ -2111,7 +2110,7 @@ impl BucketList {
     /// `true` if iteration completed, `false` if stopped early by callback.
     pub fn scan_for_entries_of_type<F>(
         &self,
-        entry_type: stellar_xdr::curr::LedgerEntryType,
+        entry_type: stellar_xdr::LedgerEntryType,
         callback: F,
     ) -> Result<bool>
     where
@@ -2142,16 +2141,15 @@ impl BucketList {
     /// `true` if iteration completed, `false` if stopped early by callback.
     pub fn scan_for_entries_of_types<F>(
         &self,
-        entry_types: &[stellar_xdr::curr::LedgerEntryType],
+        entry_types: &[stellar_xdr::LedgerEntryType],
         mut callback: F,
     ) -> Result<bool>
     where
         F: FnMut(&BucketEntry) -> bool,
     {
-        use stellar_xdr::curr::LedgerKey;
+        use stellar_xdr::LedgerKey;
 
-        let type_set: HashSet<stellar_xdr::curr::LedgerEntryType> =
-            entry_types.iter().copied().collect();
+        let type_set: HashSet<stellar_xdr::LedgerEntryType> = entry_types.iter().copied().collect();
         let mut seen_keys: HashSet<LedgerKey> = HashSet::new();
 
         for level in &self.levels {
@@ -3735,7 +3733,7 @@ mod tests {
     use super::*;
     use crate::entry::BucketEntry as BucketListEntry;
     use crate::merge::{merge_buckets, MergeOptions};
-    use stellar_xdr::curr::*;
+    use stellar_xdr::*;
 
     const TEST_PROTOCOL: u32 = 25;
 

@@ -4,7 +4,7 @@
 //! logging detailed mismatch information for debugging.
 
 use henyey_common::Hash256;
-use stellar_xdr::curr::{LedgerHeader, TransactionEnvelope, TransactionResultPair};
+use stellar_xdr::{LedgerHeader, TransactionEnvelope, TransactionResultPair};
 
 /// Log detailed information about transaction result mismatches.
 ///
@@ -72,9 +72,7 @@ fn summarize_operations(tx: &TransactionEnvelope) -> Vec<String> {
         TransactionEnvelope::TxV0(env) => env.tx.operations.as_slice(),
         TransactionEnvelope::Tx(env) => env.tx.operations.as_slice(),
         TransactionEnvelope::TxFeeBump(env) => match &env.tx.inner_tx {
-            stellar_xdr::curr::FeeBumpTransactionInnerTx::Tx(inner) => {
-                inner.tx.operations.as_slice()
-            }
+            stellar_xdr::FeeBumpTransactionInnerTx::Tx(inner) => inner.tx.operations.as_slice(),
         },
     };
 

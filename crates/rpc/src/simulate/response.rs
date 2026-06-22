@@ -3,7 +3,7 @@
 
 use serde_json::json;
 use soroban_env_host_p25 as soroban_host;
-use stellar_xdr::curr::{
+use stellar_xdr::{
     HostFunction, InvokeHostFunctionOp, OperationBody, SorobanTransactionData,
     SorobanTransactionDataExt, WriteXdr,
 };
@@ -31,7 +31,7 @@ pub(super) fn build_invoke_response(
     use super::convert::p25_to_ws;
 
     // Convert P25 resources to workspace types
-    let resources: stellar_xdr::curr::SorobanResources = p25_to_ws(&sim_result.resources)
+    let resources: stellar_xdr::SorobanResources = p25_to_ws(&sim_result.resources)
         .map_err(|e| JsonRpcError::internal_logged("xdr_conversion", &e))?;
 
     // Apply resource adjustments (mirrors soroban-simulation default_adjustment)
@@ -42,7 +42,7 @@ pub(super) fn build_invoke_response(
     let rent_changes = soroban_host::e2e_invoke::extract_rent_changes(&sim_result.ledger_changes);
 
     // Convert P25 auth to workspace for the InvokeHostFunctionOp
-    let ws_auth: Vec<stellar_xdr::curr::SorobanAuthorizationEntry> = sim_result
+    let ws_auth: Vec<stellar_xdr::SorobanAuthorizationEntry> = sim_result
         .auth
         .iter()
         .map(|a| p25_to_ws(a).map_err(|e| JsonRpcError::internal_logged("xdr_conversion", &e)))
@@ -63,7 +63,7 @@ pub(super) fn build_invoke_response(
     let ext = if sim_result.restored_rw_entry_indices.is_empty() {
         SorobanTransactionDataExt::V0
     } else {
-        SorobanTransactionDataExt::V1(stellar_xdr::curr::SorobanResourcesExtV0 {
+        SorobanTransactionDataExt::V1(stellar_xdr::SorobanResourcesExtV0 {
             archived_soroban_entries: sim_result
                 .restored_rw_entry_indices
                 .clone()
@@ -109,7 +109,7 @@ pub(super) fn build_invoke_response(
     // Conversion failures are logged but don't fail the response: diagnostic
     // events are informational and stellar-core treats them as non-fatal.
     if !diagnostic_events.is_empty() {
-        let mut ws_events: Vec<stellar_xdr::curr::DiagnosticEvent> =
+        let mut ws_events: Vec<stellar_xdr::DiagnosticEvent> =
             Vec::with_capacity(diagnostic_events.len());
         for e in &diagnostic_events {
             match p25_to_ws(e) {
@@ -125,7 +125,7 @@ pub(super) fn build_invoke_response(
     }
 
     // Encode auth entries and return value
-    let return_value: Option<stellar_xdr::curr::ScVal> = match &sim_result.invoke_result {
+    let return_value: Option<stellar_xdr::ScVal> = match &sim_result.invoke_result {
         Ok(val) => {
             Some(p25_to_ws(val).map_err(|e| JsonRpcError::internal_logged("xdr_conversion", &e))?)
         }
@@ -302,7 +302,7 @@ fn insert_sim_xdr_array_field<T: WriteXdr + serde::Serialize>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use stellar_xdr::curr::*;
+    use stellar_xdr::*;
 
     fn test_account_key(key_byte: u8) -> LedgerKey {
         LedgerKey::Account(LedgerKeyAccount {

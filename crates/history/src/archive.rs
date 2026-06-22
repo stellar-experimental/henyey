@@ -6,7 +6,7 @@
 
 use henyey_common::Hash256;
 use reqwest::Client;
-use stellar_xdr::curr::{
+use stellar_xdr::{
     LedgerHeaderHistoryEntry, ScpHistoryEntry, TransactionHistoryEntry,
     TransactionHistoryResultEntry,
 };
@@ -349,7 +349,7 @@ impl HistoryArchive {
     pub async fn fetch_ledger_header_with_hash(
         &self,
         seq: u32,
-    ) -> Result<(stellar_xdr::curr::LedgerHeader, Hash256), HistoryError> {
+    ) -> Result<(stellar_xdr::LedgerHeader, Hash256), HistoryError> {
         let headers = self.fetch_ledger_headers(seq).await?;
 
         for entry in headers {

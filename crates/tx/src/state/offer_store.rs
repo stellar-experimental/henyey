@@ -11,7 +11,7 @@ use std::collections::{HashMap, HashSet};
 
 use super::offer_index::{OfferIndex, OfferKey};
 use super::{asset_to_trustline_asset, TrustlineKey};
-use stellar_xdr::curr::{
+use stellar_xdr::{
     AccountId, Asset, LedgerEntry, LedgerEntryData, LedgerEntryExt, LedgerEntryExtensionV1,
     LedgerEntryExtensionV1Ext, OfferEntry, SponsorshipDescriptor,
 };

@@ -44,7 +44,7 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use stellar_xdr::curr::{ConfigUpgradeSetKey, LedgerUpgrade, ReadXdr, UpgradeType};
+use stellar_xdr::{ConfigUpgradeSetKey, LedgerUpgrade, ReadXdr, UpgradeType};
 
 /// Default expiration time for pending upgrades (15 minutes, matching stellar-core
 /// Upgrades::DEFAULT_UPGRADE_EXPIRATION_MINUTES).
@@ -216,8 +216,8 @@ impl ConfigUpgradeSetKeyJson {
         ch.copy_from_slice(&content_hash);
 
         Ok(ConfigUpgradeSetKey {
-            contract_id: stellar_xdr::curr::ContractId(stellar_xdr::curr::Hash(cid)),
-            content_hash: stellar_xdr::curr::Hash(ch),
+            contract_id: stellar_xdr::ContractId(stellar_xdr::Hash(cid)),
+            content_hash: stellar_xdr::Hash(ch),
         })
     }
 }
@@ -559,7 +559,7 @@ impl Upgrades {
         // Remove individual applied upgrades
         for upgrade_bytes in applied_upgrades {
             let Ok(upgrade) =
-                LedgerUpgrade::from_xdr(&upgrade_bytes.0, stellar_xdr::curr::Limits::none())
+                LedgerUpgrade::from_xdr(&upgrade_bytes.0, stellar_xdr::Limits::none())
             else {
                 continue;
             };
@@ -650,8 +650,7 @@ pub fn is_valid_for_apply(
     current_version: u32,
     max_protocol_version: u32,
 ) -> (UpgradeValidity, Option<LedgerUpgrade>) {
-    let upgrade = match LedgerUpgrade::from_xdr(&upgrade_bytes.0, stellar_xdr::curr::Limits::none())
-    {
+    let upgrade = match LedgerUpgrade::from_xdr(&upgrade_bytes.0, stellar_xdr::Limits::none()) {
         Ok(u) => u,
         Err(_) => return (UpgradeValidity::XdrInvalid, None),
     };
@@ -704,7 +703,7 @@ pub fn upgrade_to_string(upgrade: &LedgerUpgrade) -> String {
 ///
 /// Returns None if the XDR cannot be deserialized.
 pub fn parse_upgrade(upgrade_bytes: &UpgradeType) -> Option<LedgerUpgrade> {
-    LedgerUpgrade::from_xdr(&upgrade_bytes.0, stellar_xdr::curr::Limits::none()).ok()
+    LedgerUpgrade::from_xdr(&upgrade_bytes.0, stellar_xdr::Limits::none()).ok()
 }
 
 #[cfg(test)]
@@ -858,12 +857,12 @@ mod tests {
 
     #[test]
     fn test_is_valid_for_apply_version() {
-        use stellar_xdr::curr::WriteXdr;
+        use stellar_xdr::WriteXdr;
 
         let upgrade = LedgerUpgrade::Version(24);
         let bytes = UpgradeType(
             upgrade
-                .to_xdr(stellar_xdr::curr::Limits::none())
+                .to_xdr(stellar_xdr::Limits::none())
                 .unwrap()
                 .try_into()
                 .unwrap(),
@@ -884,13 +883,13 @@ mod tests {
 
     #[test]
     fn test_is_valid_for_apply_base_fee() {
-        use stellar_xdr::curr::WriteXdr;
+        use stellar_xdr::WriteXdr;
 
         // Valid fee
         let upgrade = LedgerUpgrade::BaseFee(100);
         let bytes = UpgradeType(
             upgrade
-                .to_xdr(stellar_xdr::curr::Limits::none())
+                .to_xdr(stellar_xdr::Limits::none())
                 .unwrap()
                 .try_into()
                 .unwrap(),
@@ -902,7 +901,7 @@ mod tests {
         let upgrade = LedgerUpgrade::BaseFee(0);
         let bytes = UpgradeType(
             upgrade
-                .to_xdr(stellar_xdr::curr::Limits::none())
+                .to_xdr(stellar_xdr::Limits::none())
                 .unwrap()
                 .try_into()
                 .unwrap(),
@@ -913,13 +912,13 @@ mod tests {
 
     #[test]
     fn test_is_valid_for_apply_flags() {
-        use stellar_xdr::curr::WriteXdr;
+        use stellar_xdr::WriteXdr;
 
         // Valid flags on protocol 18+
         let upgrade = LedgerUpgrade::Flags(0x3);
         let bytes = UpgradeType(
             upgrade
-                .to_xdr(stellar_xdr::curr::Limits::none())
+                .to_xdr(stellar_xdr::Limits::none())
                 .unwrap()
                 .try_into()
                 .unwrap(),
@@ -935,7 +934,7 @@ mod tests {
         let upgrade = LedgerUpgrade::Flags(0x100);
         let bytes = UpgradeType(
             upgrade
-                .to_xdr(stellar_xdr::curr::Limits::none())
+                .to_xdr(stellar_xdr::Limits::none())
                 .unwrap()
                 .try_into()
                 .unwrap(),
@@ -946,12 +945,12 @@ mod tests {
 
     #[test]
     fn test_is_valid_for_apply_soroban() {
-        use stellar_xdr::curr::WriteXdr;
+        use stellar_xdr::WriteXdr;
 
         let upgrade = LedgerUpgrade::MaxSorobanTxSetSize(100);
         let bytes = UpgradeType(
             upgrade
-                .to_xdr(stellar_xdr::curr::Limits::none())
+                .to_xdr(stellar_xdr::Limits::none())
                 .unwrap()
                 .try_into()
                 .unwrap(),
@@ -979,12 +978,12 @@ mod tests {
     /// demanded) would make it fail.
     #[test]
     fn test_numeric_upgrade_zero_accepted_matches_core() {
-        use stellar_xdr::curr::WriteXdr;
+        use stellar_xdr::WriteXdr;
 
         fn encode(upgrade: LedgerUpgrade) -> UpgradeType {
             UpgradeType(
                 upgrade
-                    .to_xdr(stellar_xdr::curr::Limits::none())
+                    .to_xdr(stellar_xdr::Limits::none())
                     .unwrap()
                     .try_into()
                     .unwrap(),
@@ -1076,7 +1075,7 @@ mod tests {
 
     #[test]
     fn test_remove_upgrades_applied() {
-        use stellar_xdr::curr::WriteXdr;
+        use stellar_xdr::WriteXdr;
 
         let mut params = UpgradeParameters::new(1000);
         params.protocol_version = Some(24);
@@ -1088,7 +1087,7 @@ mod tests {
         let applied_upgrade = LedgerUpgrade::Version(24);
         let applied_bytes = UpgradeType(
             applied_upgrade
-                .to_xdr(stellar_xdr::curr::Limits::none())
+                .to_xdr(stellar_xdr::Limits::none())
                 .unwrap()
                 .try_into()
                 .unwrap(),
@@ -1102,12 +1101,12 @@ mod tests {
 
     #[test]
     fn test_parse_upgrade() {
-        use stellar_xdr::curr::WriteXdr;
+        use stellar_xdr::WriteXdr;
 
         let upgrade = LedgerUpgrade::Version(24);
         let bytes = UpgradeType(
             upgrade
-                .to_xdr(stellar_xdr::curr::Limits::none())
+                .to_xdr(stellar_xdr::Limits::none())
                 .unwrap()
                 .try_into()
                 .unwrap(),
@@ -1120,8 +1119,8 @@ mod tests {
     #[test]
     fn test_config_upgrade_set_key_json() {
         let key = ConfigUpgradeSetKey {
-            contract_id: stellar_xdr::curr::ContractId(stellar_xdr::curr::Hash([1u8; 32])),
-            content_hash: stellar_xdr::curr::Hash([2u8; 32]),
+            contract_id: stellar_xdr::ContractId(stellar_xdr::Hash([1u8; 32])),
+            content_hash: stellar_xdr::Hash([2u8; 32]),
         };
 
         let json = ConfigUpgradeSetKeyJson::from_xdr(&key);
@@ -1368,8 +1367,8 @@ mod tests {
 
         // Propose upgrade with a DIFFERENT key K2
         let different_key = ConfigUpgradeSetKey {
-            contract_id: stellar_xdr::curr::ContractId(stellar_xdr::curr::Hash([3u8; 32])),
-            content_hash: stellar_xdr::curr::Hash([4u8; 32]),
+            contract_id: stellar_xdr::ContractId(stellar_xdr::Hash([3u8; 32])),
+            content_hash: stellar_xdr::Hash([4u8; 32]),
         };
         let upgrade = LedgerUpgrade::Config(different_key);
 
@@ -1389,15 +1388,15 @@ mod tests {
     /// matching current CONFIG_SETTING entries. Returns `(ctx, key)` where
     /// `key` is the `ConfigUpgradeSetKey` suitable for `UpgradeParameters`.
     fn build_config_upgrade_context(
-        upgrade_set: &stellar_xdr::curr::ConfigUpgradeSet,
-        current_settings: &[stellar_xdr::curr::ConfigSettingEntry],
+        upgrade_set: &stellar_xdr::ConfigUpgradeSet,
+        current_settings: &[stellar_xdr::ConfigSettingEntry],
         protocol_version: u32,
         ledger_seq: u32,
     ) -> (ConfigUpgradeContext, ConfigUpgradeSetKey) {
         use henyey_common::Hash256;
         use henyey_ledger::{SnapshotBuilder, SnapshotHandle};
         use sha2::{Digest, Sha256};
-        use stellar_xdr::curr::*;
+        use stellar_xdr::*;
 
         // Compute the content hash from the XDR-encoded upgrade set.
         let upgrade_xdr = upgrade_set.to_xdr(Limits::none()).unwrap();
@@ -1421,7 +1420,7 @@ mod tests {
         let data_entry = LedgerEntry {
             last_modified_ledger_seq: ledger_seq,
             data: LedgerEntryData::ContractData(ContractDataEntry {
-                ext: stellar_xdr::curr::ExtensionPoint::V0,
+                ext: stellar_xdr::ExtensionPoint::V0,
                 contract: ScAddress::Contract(ContractId(contract_id.clone())),
                 key: ScVal::Bytes(content_hash_bytes.to_vec().try_into().unwrap()),
                 durability: ContractDataDurability::Temporary,
@@ -1481,7 +1480,7 @@ mod tests {
     #[test]
     fn test_create_upgrades_for_config_with_context_needed() {
         use base64::{engine::general_purpose::STANDARD, Engine};
-        use stellar_xdr::curr::*;
+        use stellar_xdr::*;
 
         let proposed = ConfigSettingEntry::ContractComputeV0(ConfigSettingContractComputeV0 {
             ledger_max_instructions: 200_000_000, // differs
@@ -1545,7 +1544,7 @@ mod tests {
     #[test]
     fn test_create_upgrades_for_config_with_context_not_needed() {
         use base64::{engine::general_purpose::STANDARD, Engine};
-        use stellar_xdr::curr::*;
+        use stellar_xdr::*;
 
         // Proposed and current are identical — upgrade not needed.
         let setting = ConfigSettingEntry::ContractComputeV0(ConfigSettingContractComputeV0 {
@@ -1599,10 +1598,10 @@ mod tests {
     #[test]
     fn test_from_snapshot_propagates_get_entry_error() {
         use henyey_ledger::{EntryLookupFn, LedgerSnapshot, SnapshotHandle};
-        use stellar_xdr::curr::*;
+        use stellar_xdr::*;
 
         let key = ConfigUpgradeSetKey {
-            contract_id: stellar_xdr::curr::ContractId(Hash([1u8; 32])),
+            contract_id: stellar_xdr::ContractId(Hash([1u8; 32])),
             content_hash: Hash([2u8; 32]),
         };
 
@@ -1787,7 +1786,7 @@ mod tests {
     #[test]
     fn test_scheduled_config_variant_nominate() {
         use base64::{engine::general_purpose::STANDARD, Engine};
-        use stellar_xdr::curr::*;
+        use stellar_xdr::*;
 
         let proposed = ConfigSettingEntry::ContractComputeV0(ConfigSettingContractComputeV0 {
             ledger_max_instructions: 200_000_000, // differs from current

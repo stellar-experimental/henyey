@@ -1,7 +1,7 @@
 //! AccountMerge operation execution.
 
 use henyey_common::protocol::{protocol_version_starts_from, ProtocolVersion};
-use stellar_xdr::curr::{
+use stellar_xdr::{
     AccountEntry, AccountEntryExt, AccountEntryExtensionV1Ext, AccountFlags, AccountId,
     AccountMergeResult, AccountMergeResultCode, MuxedAccount, OperationResult, OperationResultTr,
 };
@@ -136,7 +136,7 @@ fn num_sponsoring(account: &AccountEntry) -> i64 {
 mod tests {
     use super::*;
     use crate::test_utils::create_test_account_id;
-    use stellar_xdr::curr::*;
+    use stellar_xdr::*;
 
     fn create_test_muxed_account(seed: u8) -> MuxedAccount {
         MuxedAccount::Ed25519(Uint256([seed; 32]))

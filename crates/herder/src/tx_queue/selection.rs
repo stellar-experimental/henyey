@@ -139,7 +139,7 @@ impl TransactionQueue {
         override_fee_provider: Option<&dyn FeeBalanceProvider>,
         override_account_provider: Option<&dyn AccountProvider>,
     ) -> TransactionSet {
-        use stellar_xdr::curr::GeneralizedTransactionSet;
+        use stellar_xdr::GeneralizedTransactionSet;
 
         // Derive base_fee, protocol_version, and validation context from the
         // build context. For Nomination, these come from the snapshot header.
@@ -254,8 +254,8 @@ impl TransactionQueue {
         let (soroban_phase, _soroban_base_fee) =
             build_soroban_phase_with_base_fee(soroban_txs, soroban_limited, base_fee, &self.config);
 
-        let gen_tx_set = GeneralizedTransactionSet::V1(stellar_xdr::curr::TransactionSetV1 {
-            previous_ledger_hash: stellar_xdr::curr::Hash(previous_ledger_hash.0),
+        let gen_tx_set = GeneralizedTransactionSet::V1(stellar_xdr::TransactionSetV1 {
+            previous_ledger_hash: stellar_xdr::Hash(previous_ledger_hash.0),
             phases: vec![classic_phase, soroban_phase]
                 .try_into()
                 .unwrap_or_default(),
@@ -568,7 +568,7 @@ impl TransactionQueue {
 /// selection, `base_fee` must be `None` regardless of surge-pricing state.
 /// In stellar-core (`TxSetFrame.cpp:286-290`), `baseFee` is set only when
 /// `inclusionFeeMap` is non-empty (i.e., at least one tx survived).
-fn empty_soroban_phase_pair() -> (stellar_xdr::curr::TransactionPhase, Option<i64>) {
+fn empty_soroban_phase_pair() -> (stellar_xdr::TransactionPhase, Option<i64>) {
     (henyey_tx::tx_set_xdr::empty_soroban_phase(), None)
 }
 
@@ -584,8 +584,8 @@ fn build_soroban_phase_with_base_fee(
     soroban_limited: bool,
     ledger_base_fee: i64,
     config: &super::TxQueueConfig,
-) -> (stellar_xdr::curr::TransactionPhase, Option<i64>) {
-    use stellar_xdr::curr::{DependentTxCluster, ParallelTxExecutionStage, TransactionEnvelope};
+) -> (stellar_xdr::TransactionPhase, Option<i64>) {
+    use stellar_xdr::{DependentTxCluster, ParallelTxExecutionStage, TransactionEnvelope};
 
     if soroban_txs.is_empty() {
         return empty_soroban_phase_pair();
@@ -681,10 +681,8 @@ fn build_classic_phase(
     dex_limited: bool,
     base_fee: i64,
     has_dex_lane: bool,
-) -> stellar_xdr::curr::TransactionPhase {
-    use stellar_xdr::curr::{
-        TransactionPhase, TxSetComponent, TxSetComponentTxsMaybeDiscountedFee,
-    };
+) -> stellar_xdr::TransactionPhase {
+    use stellar_xdr::{TransactionPhase, TxSetComponent, TxSetComponentTxsMaybeDiscountedFee};
 
     let mut classic_components: Vec<TxSetComponent> = Vec::new();
     if !classic_txs.is_empty() {

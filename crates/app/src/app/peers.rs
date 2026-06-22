@@ -104,7 +104,7 @@ impl App {
     pub async fn try_send_to_peer(
         &self,
         peer_id: &PeerId,
-        message: stellar_xdr::curr::StellarMessage,
+        message: stellar_xdr::StellarMessage,
     ) -> anyhow::Result<()> {
         let overlay = self
             .overlay()
@@ -256,7 +256,7 @@ impl App {
         };
 
         for (peer, hash) in to_ping {
-            let msg = StellarMessage::GetScpQuorumset(stellar_xdr::curr::Uint256(hash.0));
+            let msg = StellarMessage::GetScpQuorumset(stellar_xdr::Uint256(hash.0));
             if overlay.try_send_to(&peer, msg).is_err() {
                 tracing::debug!(peer = %peer, "Failed to send ping");
                 self.ping_state
@@ -293,7 +293,7 @@ impl App {
     /// Process a peer list received from the network.
     pub(super) async fn process_peer_list(
         &self,
-        peer_list: stellar_xdr::curr::VecM<stellar_xdr::curr::PeerAddress, 100>,
+        peer_list: stellar_xdr::VecM<stellar_xdr::PeerAddress, 100>,
     ) {
         let Some(overlay) = self.overlay().await else {
             return;
@@ -305,10 +305,10 @@ impl App {
             .filter_map(|xdr_addr| {
                 // Extract IP address from the XDR type
                 let ip = match &xdr_addr.ip {
-                    stellar_xdr::curr::PeerAddressIp::IPv4(bytes) => {
+                    stellar_xdr::PeerAddressIp::IPv4(bytes) => {
                         format!("{}.{}.{}.{}", bytes[0], bytes[1], bytes[2], bytes[3])
                     }
-                    stellar_xdr::curr::PeerAddressIp::IPv6(_) => {
+                    stellar_xdr::PeerAddressIp::IPv6(_) => {
                         return None;
                     }
                 };

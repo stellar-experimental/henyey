@@ -30,7 +30,7 @@
 //! latest SCP state is durable. This enables recovery to the last externalized slot.
 
 use serde::{Deserialize, Serialize};
-use stellar_xdr::curr::{
+use stellar_xdr::{
     Hash, Limits, ReadXdr, ScpEnvelope, ScpQuorumSet, ScpStatementPledges, StellarValue, Value,
     WriteXdr,
 };
@@ -658,7 +658,7 @@ pub struct RestoredScpState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use stellar_xdr::curr::*;
+    use stellar_xdr::*;
 
     pub(crate) fn make_test_envelope(slot: u64) -> ScpEnvelope {
         ScpEnvelope {

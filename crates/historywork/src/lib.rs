@@ -92,7 +92,7 @@ use anyhow::{anyhow, Result};
 use tokio::sync::Mutex;
 
 use henyey_history::CheckpointData;
-use stellar_xdr::curr::{
+use stellar_xdr::{
     LedgerHeaderHistoryEntry, ScpHistoryEntry, TransactionHistoryEntry,
     TransactionHistoryResultEntry,
 };

@@ -5,7 +5,7 @@
 
 use std::cmp::Ordering;
 
-use stellar_xdr::curr::{
+use stellar_xdr::{
     AccountId, Asset, CreatePassiveSellOfferOp, LedgerKey, LedgerKeyOffer, ManageBuyOfferOp,
     ManageOfferSuccessResult, ManageOfferSuccessResultOffer, ManageSellOfferOp,
     ManageSellOfferResult, ManageSellOfferResultCode, OfferEntry, OfferEntryExt, OfferEntryFlags,
@@ -951,10 +951,8 @@ fn create_offer_entry(
 }
 
 /// Convert ManageSellOfferResult to ManageBuyOfferResult.
-fn convert_sell_to_buy_result(
-    result: ManageSellOfferResult,
-) -> stellar_xdr::curr::ManageBuyOfferResult {
-    use stellar_xdr::curr::ManageBuyOfferResult;
+fn convert_sell_to_buy_result(result: ManageSellOfferResult) -> stellar_xdr::ManageBuyOfferResult {
+    use stellar_xdr::ManageBuyOfferResult;
 
     match result {
         ManageSellOfferResult::Success(s) => ManageBuyOfferResult::Success(s),
@@ -1002,7 +1000,7 @@ mod tests {
     use super::super::{AUTHORIZED_FLAG, AUTHORIZED_TO_MAINTAIN_LIABILITIES_FLAG};
     use super::*;
     use crate::test_utils::create_test_account_id;
-    use stellar_xdr::curr::*;
+    use stellar_xdr::*;
 
     fn create_test_account(account_id: AccountId, balance: i64) -> AccountEntry {
         AccountEntry {
@@ -2723,7 +2721,7 @@ mod tests {
         let result = execute_manage_buy_offer(&op, &source_id, &mut state, &context);
         match result.unwrap() {
             OperationResult::OpInner(OperationResultTr::ManageBuyOffer(
-                stellar_xdr::curr::ManageBuyOfferResult::Success(_),
+                stellar_xdr::ManageBuyOfferResult::Success(_),
             )) => {
                 // Success
             }
@@ -2893,7 +2891,7 @@ mod tests {
         // meaning it was recorded as accessed. This matches stellar-core behavior where
         // loadAccount is called before the exchange for new offers (V14+).
         let op_snapshots = state.end_op_snapshot();
-        let source_account_key = LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
+        let source_account_key = LedgerKey::Account(stellar_xdr::LedgerKeyAccount {
             account_id: source_id.clone(),
         });
         assert!(
@@ -3059,7 +3057,7 @@ mod tests {
         // In stellar-core, createEntryWithPossibleSponsorship loads the sponsor (numSponsoring++),
         // and removeEntryWithPossibleSponsorship loads it again (numSponsoring--).
         // Net effect is zero but the sponsor gets lm stamped.
-        let sponsor_account_key = LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
+        let sponsor_account_key = LedgerKey::Account(stellar_xdr::LedgerKeyAccount {
             account_id: sponsor_id.clone(),
         });
         assert!(
@@ -3068,7 +3066,7 @@ mod tests {
         );
 
         // Source account should also be in op snapshot
-        let source_account_key = LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
+        let source_account_key = LedgerKey::Account(stellar_xdr::LedgerKeyAccount {
             account_id: source_id.clone(),
         });
         assert!(

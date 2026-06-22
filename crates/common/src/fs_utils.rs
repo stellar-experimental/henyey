@@ -198,7 +198,7 @@ pub fn atomic_gzip_copy(from: &Path, to: &Path) -> io::Result<()> {
 /// Atomically write a slice of XDR items to `final_path` as RFC 5531
 /// record-marked entries, gzip-compressed, then durably rename.
 ///
-/// Each item is serialized via [`stellar_xdr::curr::WriteXdr`] and prefixed
+/// Each item is serialized via [`stellar_xdr::WriteXdr`] and prefixed
 /// with a 4-byte big-endian length whose high bit is set (the RFC 5531
 /// "last fragment" flag). The output is gzip-compressed and written via
 /// [`atomic_write_with`], inheriting its durability and error contract.
@@ -218,7 +218,7 @@ pub fn atomic_gzip_copy(from: &Path, to: &Path) -> io::Result<()> {
 /// the temp file and leave `final_path` untouched.
 pub fn atomic_gzip_xdr_write_slice<T>(final_path: &Path, items: &[T]) -> io::Result<()>
 where
-    T: stellar_xdr::curr::WriteXdr,
+    T: stellar_xdr::WriteXdr,
 {
     atomic_gzip_xdr_write_inner(final_path, |encoder| {
         for item in items {
@@ -251,7 +251,7 @@ where
 pub fn atomic_gzip_xdr_write_iter<T, I, E>(final_path: &Path, items: I) -> io::Result<()>
 where
     I: IntoIterator<Item = Result<T, E>>,
-    T: stellar_xdr::curr::WriteXdr,
+    T: stellar_xdr::WriteXdr,
     E: std::error::Error + Send + Sync + 'static,
 {
     atomic_gzip_xdr_write_inner(final_path, |encoder| {
@@ -296,10 +296,10 @@ where
 fn write_record_marked_xdr_to<W, T>(writer: &mut W, item: &T) -> io::Result<()>
 where
     W: io::Write,
-    T: stellar_xdr::curr::WriteXdr,
+    T: stellar_xdr::WriteXdr,
 {
     let bytes = item
-        .to_xdr(stellar_xdr::curr::Limits::none())
+        .to_xdr(stellar_xdr::Limits::none())
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     let len = bytes.len() as u32;
     let marked_len = len | 0x8000_0000;
@@ -626,7 +626,7 @@ mod tests {
     /// Used only by tests — `henyey-common` cannot reuse the equivalent
     /// helper in `henyey-history` due to the dep cycle.
     #[cfg(test)]
-    fn parse_gz_record_marked_xdr_stream<T: stellar_xdr::curr::ReadXdr>(bytes: &[u8]) -> Vec<T> {
+    fn parse_gz_record_marked_xdr_stream<T: stellar_xdr::ReadXdr>(bytes: &[u8]) -> Vec<T> {
         use flate2::read::GzDecoder;
         use std::io::Read;
         let mut decoded = Vec::new();
@@ -644,7 +644,7 @@ mod tests {
             let len = (mark & 0x7FFF_FFFF) as usize;
             pos += 4;
             let payload = &decoded[pos..pos + len];
-            let item = T::from_xdr(payload, stellar_xdr::curr::Limits::none()).expect("decode XDR");
+            let item = T::from_xdr(payload, stellar_xdr::Limits::none()).expect("decode XDR");
             out.push(item);
             pos += len;
             // XDR pad to 4-byte boundary.
@@ -665,7 +665,7 @@ mod tests {
 
     #[test]
     fn test_atomic_gzip_xdr_write_slice_roundtrip() {
-        use stellar_xdr::curr::Hash;
+        use stellar_xdr::Hash;
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("out.xdr.gz");
 
@@ -680,7 +680,7 @@ mod tests {
 
     #[test]
     fn test_write_record_marked_xdr_padding_bytes_pinned() {
-        use stellar_xdr::curr::Hash;
+        use stellar_xdr::Hash;
 
         // (a) Pin the exact on-disk byte layout produced by the production
         // path for a representative `WriteXdr` item. A `Hash` encodes to 32
@@ -720,7 +720,7 @@ mod tests {
 
     #[test]
     fn test_atomic_gzip_xdr_write_iter_roundtrip() {
-        use stellar_xdr::curr::Hash;
+        use stellar_xdr::Hash;
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("out.xdr.gz");
 
@@ -739,7 +739,7 @@ mod tests {
 
     #[test]
     fn test_atomic_gzip_xdr_write_iter_propagates_error_no_temp() {
-        use stellar_xdr::curr::Hash;
+        use stellar_xdr::Hash;
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("out.xdr.gz");
 
@@ -762,7 +762,7 @@ mod tests {
 
     #[test]
     fn test_atomic_gzip_xdr_write_empty_slice_produces_valid_empty_gzip() {
-        use stellar_xdr::curr::Hash;
+        use stellar_xdr::Hash;
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("out.xdr.gz");
 
@@ -784,7 +784,7 @@ mod tests {
     fn test_atomic_gzip_xdr_write_pinned_payload() {
         use flate2::read::GzDecoder;
         use std::io::Read;
-        use stellar_xdr::curr::Hash;
+        use stellar_xdr::Hash;
 
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("pinned.xdr.gz");

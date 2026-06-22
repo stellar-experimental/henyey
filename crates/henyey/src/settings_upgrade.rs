@@ -14,7 +14,7 @@
 //! hex tx hash. The final line is always the base64 `ConfigUpgradeSetKey`.
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
-use stellar_xdr::curr::{
+use stellar_xdr::{
     ConfigUpgradeSet, ConfigUpgradeSetKey, ContractDataDurability, ContractExecutable, ContractId,
     ContractIdPreimage, ContractIdPreimageFromAddress, CreateContractArgs, DecoratedSignature,
     Hash, HashIdPreimage, HashIdPreimageContractId, HostFunction, InvokeContractArgs,
@@ -124,8 +124,8 @@ fn get_wasm_restore_tx(
         fee,
         resource_fee,
         single_operation(OperationBody::RestoreFootprint(
-            stellar_xdr::curr::RestoreFootprintOp {
-                ext: stellar_xdr::curr::ExtensionPoint::V0,
+            stellar_xdr::RestoreFootprintOp {
+                ext: stellar_xdr::ExtensionPoint::V0,
             },
         )),
         resources,
@@ -160,7 +160,7 @@ fn get_upload_tx(public_key: &Uint256, seq_num: i64) -> (TransactionEnvelope, Le
         fee,
         resource_fee,
         single_operation(OperationBody::InvokeHostFunction(
-            stellar_xdr::curr::InvokeHostFunctionOp {
+            stellar_xdr::InvokeHostFunctionOp {
                 host_function: HostFunction::UploadContractWasm(wasm.try_into().unwrap()),
                 auth: VecM::default(),
             },
@@ -212,8 +212,8 @@ fn get_create_tx_with_salt(
 
     // Build contract ID preimage
     let id_preimage = ContractIdPreimage::Address(ContractIdPreimageFromAddress {
-        address: ScAddress::Account(stellar_xdr::curr::AccountId(
-            stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(public_key.clone()),
+        address: ScAddress::Account(stellar_xdr::AccountId(
+            stellar_xdr::PublicKey::PublicKeyTypeEd25519(public_key.clone()),
         )),
         salt,
     });
@@ -225,9 +225,7 @@ fn get_create_tx_with_salt(
         contract_id_preimage: id_preimage.clone(),
     });
 
-    let full_preimage_bytes = full_preimage
-        .to_xdr(stellar_xdr::curr::Limits::none())
-        .unwrap();
+    let full_preimage_bytes = full_preimage.to_xdr(stellar_xdr::Limits::none()).unwrap();
     let contract_id = Hash(sha256(&full_preimage_bytes).0);
 
     // Build create contract operation and auth entry (both need id_preimage + executable)
@@ -271,7 +269,7 @@ fn get_create_tx_with_salt(
         fee,
         resource_fee,
         single_operation(OperationBody::InvokeHostFunction(
-            stellar_xdr::curr::InvokeHostFunctionOp {
+            stellar_xdr::InvokeHostFunctionOp {
                 host_function: HostFunction::CreateContract(create_args),
                 auth: vec![auth].try_into().unwrap(),
             },
@@ -297,16 +295,14 @@ fn get_invoke_tx(
     seq_num: i64,
     add_resource_fee: i64,
 ) -> (TransactionEnvelope, ConfigUpgradeSetKey) {
-    let upgrade_set_bytes = upgrade_set
-        .to_xdr(stellar_xdr::curr::Limits::none())
-        .unwrap();
+    let upgrade_set_bytes = upgrade_set.to_xdr(stellar_xdr::Limits::none()).unwrap();
 
     // Build invoke contract args
     let addr = ScAddress::Contract(ContractId(deployment.contract_id.clone()));
 
     let function_name = ScSymbol("write".try_into().unwrap());
 
-    let args_val = ScVal::Bytes(stellar_xdr::curr::ScBytes(
+    let args_val = ScVal::Bytes(stellar_xdr::ScBytes(
         upgrade_set_bytes.clone().try_into().unwrap(),
     ));
 
@@ -318,9 +314,9 @@ fn get_invoke_tx(
 
     // Build the upgrade data ledger key
     let upgrade_hash = sha256(&upgrade_set_bytes);
-    let upgrade_hash_val = ScVal::Bytes(stellar_xdr::curr::ScBytes(
+    let upgrade_hash_val = ScVal::Bytes(stellar_xdr::ScBytes(
         Hash(upgrade_hash.0)
-            .to_xdr(stellar_xdr::curr::Limits::none())
+            .to_xdr(stellar_xdr::Limits::none())
             .unwrap()
             .try_into()
             .unwrap(),
@@ -356,7 +352,7 @@ fn get_invoke_tx(
         fee,
         resource_fee,
         single_operation(OperationBody::InvokeHostFunction(
-            stellar_xdr::curr::InvokeHostFunctionOp {
+            stellar_xdr::InvokeHostFunctionOp {
                 host_function: HostFunction::InvokeContract(invoke_args),
                 auth: VecM::default(),
             },
@@ -387,7 +383,7 @@ fn compute_tx_hash(
         _ => panic!("Expected ENVELOPE_TYPE_TX"),
     };
 
-    let payload_bytes = payload.to_xdr(stellar_xdr::curr::Limits::none()).unwrap();
+    let payload_bytes = payload.to_xdr(stellar_xdr::Limits::none()).unwrap();
     sha256(&payload_bytes)
 }
 
@@ -408,7 +404,7 @@ fn sign_tx(
 
     let decorated = DecoratedSignature {
         hint,
-        signature: stellar_xdr::curr::Signature(signature.as_bytes().to_vec().try_into().unwrap()),
+        signature: stellar_xdr::Signature(signature.as_bytes().to_vec().try_into().unwrap()),
     };
 
     match envelope {
@@ -439,7 +435,7 @@ pub(crate) fn run(params: &SettingsUpgradeParams<'_>) -> anyhow::Result<()> {
     let xdr_bytes = BASE64
         .decode(params.xdr_base64)
         .map_err(|e| anyhow::anyhow!("Failed to decode base64 XDR: {}", e))?;
-    let upgrade_set = ConfigUpgradeSet::from_xdr(&xdr_bytes, stellar_xdr::curr::Limits::none())
+    let upgrade_set = ConfigUpgradeSet::from_xdr(&xdr_bytes, stellar_xdr::Limits::none())
         .map_err(|e| anyhow::anyhow!("Failed to decode ConfigUpgradeSet XDR: {}", e))?;
 
     // Parse public key from StrKey
@@ -486,7 +482,7 @@ pub(crate) fn run(params: &SettingsUpgradeParams<'_>) -> anyhow::Result<()> {
 
         for tx in txs {
             let tx_hash = sign_tx(tx, &secret_key, params.network_passphrase);
-            let tx_bytes = tx.to_xdr(stellar_xdr::curr::Limits::none())?;
+            let tx_bytes = tx.to_xdr(stellar_xdr::Limits::none())?;
             println!("{}", BASE64.encode(&tx_bytes));
             println!("{}", hex::encode(tx_hash.0));
         }
@@ -504,7 +500,7 @@ pub(crate) fn run(params: &SettingsUpgradeParams<'_>) -> anyhow::Result<()> {
 
         for (i, label) in labels.iter().enumerate() {
             eprintln!("{}", label);
-            let tx_bytes = txs[i].to_xdr(stellar_xdr::curr::Limits::none())?;
+            let tx_bytes = txs[i].to_xdr(stellar_xdr::Limits::none())?;
             println!("{}", BASE64.encode(&tx_bytes));
             let tx_hash = compute_tx_hash(txs[i], params.network_passphrase);
             println!("{}", hex::encode(tx_hash.0));
@@ -512,7 +508,7 @@ pub(crate) fn run(params: &SettingsUpgradeParams<'_>) -> anyhow::Result<()> {
     }
 
     // Always output the ConfigUpgradeSetKey as the last line
-    let key_bytes = upgrade_set_key.to_xdr(stellar_xdr::curr::Limits::none())?;
+    let key_bytes = upgrade_set_key.to_xdr(stellar_xdr::Limits::none())?;
     println!("{}", BASE64.encode(&key_bytes));
 
     Ok(())

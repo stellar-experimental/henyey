@@ -2,7 +2,7 @@
 //! computation, fee estimation, resource bumping.
 
 use soroban_env_host_p25 as soroban_host;
-use stellar_xdr::curr::{OperationBody, SorobanResources};
+use stellar_xdr::{OperationBody, SorobanResources};
 
 /// Multiplicative adjustment factor for refundable fees (soroban-simulation default).
 const REFUNDABLE_FEE_ADJUSTMENT_FACTOR: f64 = 1.15;
@@ -69,7 +69,7 @@ pub(super) fn estimate_tx_size_for_op(
     operation: &OperationBody,
     resources: &SorobanResources,
 ) -> u32 {
-    use stellar_xdr::curr::*;
+    use stellar_xdr::*;
 
     let soroban_data = SorobanTransactionData {
         ext: SorobanTransactionDataExt::V0,
@@ -301,7 +301,7 @@ fn compute_resource_fee_core(params: &ResourceFeeParams<'_>) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use stellar_xdr::curr::*;
+    use stellar_xdr::*;
 
     fn test_soroban_network_info() -> henyey_ledger::SorobanNetworkInfo {
         henyey_ledger::SorobanNetworkInfo {

@@ -59,7 +59,7 @@
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 
 use henyey_scp::{is_quorum, is_v_blocking, SlotIndex};
-use stellar_xdr::curr::{NodeId, ScpQuorumSet};
+use stellar_xdr::{NodeId, ScpQuorumSet};
 
 /// Tracks quorum participation over recent slots.
 ///
@@ -399,7 +399,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use stellar_xdr::curr::{PublicKey, Uint256};
+    use stellar_xdr::{PublicKey, Uint256};
 
     fn make_node_id(seed: u8) -> NodeId {
         let mut bytes = [0u8; 32];

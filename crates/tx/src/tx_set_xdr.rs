@@ -9,7 +9,7 @@
 //! construction should carry an `// Intentionally invalid` comment and exist
 //! only in tests verifying validation of malformed inputs.
 
-use stellar_xdr::curr::{ParallelTxExecutionStage, ParallelTxsComponent, TransactionPhase, VecM};
+use stellar_xdr::{ParallelTxExecutionStage, ParallelTxsComponent, TransactionPhase, VecM};
 
 /// Construct a `ParallelTxsComponent` enforcing the base-fee/empty-stages
 /// invariant (stellar-core `parallelPhaseToXdr()`, TxSetFrame.cpp:286-300).
@@ -78,7 +78,7 @@ pub fn soroban_phase_with_stages(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use stellar_xdr::curr::{DependentTxCluster, ParallelTxExecutionStage, TransactionEnvelope};
+    use stellar_xdr::{DependentTxCluster, ParallelTxExecutionStage, TransactionEnvelope};
 
     fn make_dummy_stages() -> VecM<ParallelTxExecutionStage> {
         // A minimal non-empty execution_stages: one stage with one cluster

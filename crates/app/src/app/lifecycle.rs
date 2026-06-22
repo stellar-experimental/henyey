@@ -1654,13 +1654,9 @@ impl App {
             StellarMessage::DontHave(dont_have) => {
                 let is_tx_set = matches!(
                     dont_have.type_,
-                    stellar_xdr::curr::MessageType::TxSet
-                        | stellar_xdr::curr::MessageType::GeneralizedTxSet
+                    stellar_xdr::MessageType::TxSet | stellar_xdr::MessageType::GeneralizedTxSet
                 );
-                let is_ping = matches!(
-                    dont_have.type_,
-                    stellar_xdr::curr::MessageType::ScpQuorumset
-                );
+                let is_ping = matches!(dont_have.type_, stellar_xdr::MessageType::ScpQuorumset);
                 if is_tx_set {
                     tracing::debug!(
                         peer = %msg.from_peer,
@@ -1760,13 +1756,11 @@ impl App {
 
             StellarMessage::TxSet(tx_set) => {
                 // Compute hash for logging
-                let computed_hash = match stellar_xdr::curr::WriteXdr::to_xdr(
-                    &tx_set,
-                    stellar_xdr::curr::Limits::none(),
-                ) {
-                    Ok(xdr_bytes) => format!("{}", henyey_common::Hash256::hash(&xdr_bytes)),
-                    Err(e) => format!("<encoding failed: {e}>"),
-                };
+                let computed_hash =
+                    match stellar_xdr::WriteXdr::to_xdr(&tx_set, stellar_xdr::Limits::none()) {
+                        Ok(xdr_bytes) => format!("{}", henyey_common::Hash256::hash(&xdr_bytes)),
+                        Err(e) => format!("<encoding failed: {e}>"),
+                    };
                 tracing::info!(
                     peer = %msg.from_peer,
                     computed_hash = %computed_hash,
@@ -1779,13 +1773,11 @@ impl App {
 
             StellarMessage::GeneralizedTxSet(gen_tx_set) => {
                 // Compute hash for logging
-                let computed_hash = match stellar_xdr::curr::WriteXdr::to_xdr(
-                    &gen_tx_set,
-                    stellar_xdr::curr::Limits::none(),
-                ) {
-                    Ok(xdr_bytes) => format!("{}", henyey_common::Hash256::hash(&xdr_bytes)),
-                    Err(e) => format!("<encoding failed: {e}>"),
-                };
+                let computed_hash =
+                    match stellar_xdr::WriteXdr::to_xdr(&gen_tx_set, stellar_xdr::Limits::none()) {
+                        Ok(xdr_bytes) => format!("{}", henyey_common::Hash256::hash(&xdr_bytes)),
+                        Err(e) => format!("<encoding failed: {e}>"),
+                    };
                 tracing::debug!(
                     peer = %msg.from_peer,
                     computed_hash = %computed_hash,
@@ -1853,7 +1845,7 @@ impl App {
         let Some(overlay) = self.overlay().await else {
             return;
         };
-        let request = StellarMessage::GetTxSet(stellar_xdr::curr::Uint256(tx_set_hash.0));
+        let request = StellarMessage::GetTxSet(stellar_xdr::Uint256(tx_set_hash.0));
         if let Err(e) = overlay.try_send_to(peer, request) {
             tracing::debug!(
                 peer = %peer,
@@ -2441,11 +2433,8 @@ impl App {
 
         let tx_set_hash = if is_externalize {
             match &envelope.statement.pledges {
-                stellar_xdr::curr::ScpStatementPledges::Externalize(ext) => {
-                    match StellarValue::from_xdr(
-                        &ext.commit.value.0,
-                        stellar_xdr::curr::Limits::none(),
-                    ) {
+                stellar_xdr::ScpStatementPledges::Externalize(ext) => {
+                    match StellarValue::from_xdr(&ext.commit.value.0, stellar_xdr::Limits::none()) {
                         Ok(stellar_value) => Some(Hash256::from_bytes(stellar_value.tx_set_hash.0)),
                         Err(err) => {
                             tracing::warn!(
@@ -2531,8 +2520,7 @@ impl App {
             if self.herder.request_quorum_set(hash256, sender_node_id) {
                 if let Some(peer) = from_peer_opt.as_ref() {
                     if let Some(overlay) = self.overlay().await {
-                        let request =
-                            StellarMessage::GetScpQuorumset(stellar_xdr::curr::Uint256(hash.0));
+                        let request = StellarMessage::GetScpQuorumset(stellar_xdr::Uint256(hash.0));
                         if let Err(e) = overlay.try_send_to(peer, request) {
                             tracing::debug!(peer = %peer, error = %e, "Failed to request quorum set");
                         }
@@ -2687,7 +2675,7 @@ impl App {
                     if let Some(peer) = from_peer_opt.as_ref() {
                         if let Some(overlay) = self.overlay().await {
                             let request =
-                                StellarMessage::GetTxSet(stellar_xdr::curr::Uint256(tx_set_hash.0));
+                                StellarMessage::GetTxSet(stellar_xdr::Uint256(tx_set_hash.0));
                             if let Err(e) = overlay.try_send_to(peer, request) {
                                 tracing::debug!(
                                     peer = %peer,
@@ -2722,7 +2710,7 @@ mod pump_tests {
     use henyey_herder::scp_verify::{PipelinedIntake, Verdict, VerifiedEnvelope};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
-    use stellar_xdr::curr::{
+    use stellar_xdr::{
         NodeId, PublicKey as XdrPublicKey, ScpBallot, ScpEnvelope, ScpStatement,
         ScpStatementPledges, ScpStatementPrepare, Signature, Uint256, Value,
     };
@@ -2731,7 +2719,7 @@ mod pump_tests {
         let node_id = NodeId(XdrPublicKey::PublicKeyTypeEd25519(Uint256([1u8; 32])));
         let value = Value(vec![].try_into().unwrap());
         let pledges = ScpStatementPledges::Prepare(ScpStatementPrepare {
-            quorum_set_hash: stellar_xdr::curr::Hash([0u8; 32]),
+            quorum_set_hash: stellar_xdr::Hash([0u8; 32]),
             ballot: ScpBallot {
                 counter: 1,
                 value: value.clone(),
@@ -2801,7 +2789,7 @@ mod pump_tests {
 mod scp_dedup_pipeline_tests {
     use super::App;
     use henyey_overlay::OverlayMessage;
-    use stellar_xdr::curr::{
+    use stellar_xdr::{
         Hash as XdrHash, Limits, NodeId as XdrNodeId, PublicKey as XdrPublicKey, ScpBallot,
         ScpEnvelope, ScpStatement, ScpStatementPledges, ScpStatementPrepare,
         Signature as XdrSignature, StellarMessage, StellarValue, StellarValueExt, TimePoint,

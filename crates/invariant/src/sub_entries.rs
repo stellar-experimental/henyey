@@ -11,7 +11,7 @@
 
 use std::collections::HashMap;
 
-use stellar_xdr::curr::{
+use stellar_xdr::{
     AccountEntry, AccountId, ContractEvent, LedgerEntry, LedgerEntryData, Operation,
     OperationResult, TrustLineAsset,
 };

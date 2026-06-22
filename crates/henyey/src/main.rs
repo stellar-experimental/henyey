@@ -123,7 +123,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 use clap::{Parser, Subcommand};
-use stellar_xdr::curr::WriteXdr;
+use stellar_xdr::WriteXdr;
 
 use henyey_app::{
     logging, run_catchup, run_node, App, AppConfig, CatchupMode as CatchupModeInternal,
@@ -2512,7 +2512,7 @@ fn cmd_offline_info(config: AppConfig) -> anyhow::Result<()> {
     use henyey_common::protocol::CURRENT_LEDGER_PROTOCOL_VERSION;
     use henyey_db::queries::StateQueries;
     use std::time::{SystemTime, UNIX_EPOCH};
-    use stellar_xdr::curr::LedgerHeaderExt;
+    use stellar_xdr::LedgerHeaderExt;
 
     let db_path = &config.database.path;
 
@@ -2845,7 +2845,7 @@ async fn verify_single_checkpoint(
 
                 match result_entry
                     .tx_result_set
-                    .to_xdr(stellar_xdr::curr::Limits::none())
+                    .to_xdr(stellar_xdr::Limits::none())
                 {
                     Ok(bytes) => {
                         if let Err(e) = verify::verify_tx_result_set(header, &bytes) {
@@ -3035,7 +3035,7 @@ async fn cmd_debug_bucket_entry(
     use henyey_common::Hash256;
     use henyey_history::is_checkpoint_ledger;
     use std::sync::Arc;
-    use stellar_xdr::curr::{
+    use stellar_xdr::{
         AccountId, LedgerEntryData, LedgerKey, LedgerKeyAccount, PublicKey, Uint256,
     };
 
@@ -3282,7 +3282,7 @@ async fn cmd_dump_ledger(
 ) -> anyhow::Result<()> {
     use henyey_bucket::BucketManager;
     use std::io::Write;
-    use stellar_xdr::curr::LedgerEntryType;
+    use stellar_xdr::LedgerEntryType;
 
     // Parse entry type filter if provided
     let type_filter: Option<LedgerEntryType> = if let Some(ref type_str) = filter.entry_type {
@@ -3630,7 +3630,7 @@ async fn cmd_verify_checkpoints(
 
     // Collect verified checkpoint hashes
     let mut verified_checkpoints: Vec<serde_json::Value> = Vec::new();
-    let mut prev_header: Option<stellar_xdr::curr::LedgerHeader> = None;
+    let mut prev_header: Option<stellar_xdr::LedgerHeader> = None;
     let mut verified_count = 0;
     let mut error_count = 0;
 
@@ -3657,7 +3657,7 @@ async fn cmd_verify_checkpoints(
                     continue;
                 }
 
-                let headers: Vec<stellar_xdr::curr::LedgerHeader> = history_entries
+                let headers: Vec<stellar_xdr::LedgerHeader> = history_entries
                     .iter()
                     .map(|entry| entry.header.clone())
                     .collect();

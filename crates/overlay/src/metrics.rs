@@ -24,7 +24,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use stellar_xdr::curr::StellarMessage;
+use stellar_xdr::StellarMessage;
 
 /// Atomic counter for simple metrics.
 #[derive(Debug, Default)]
@@ -794,7 +794,7 @@ mod tests {
 
     #[test]
     fn test_overlay_message_kind_from_stellar_message() {
-        use stellar_xdr::curr::*;
+        use stellar_xdr::*;
 
         // Test representative variants
         let hello = StellarMessage::Hello(Hello::default());

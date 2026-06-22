@@ -4,7 +4,7 @@
 //! used by the `getEvents` RPC endpoint.
 
 use rusqlite::{params, Connection};
-use stellar_xdr::curr::ContractEventType;
+use stellar_xdr::ContractEventType;
 
 use super::{install_query_budget, is_query_interrupted};
 use crate::error::DbError;

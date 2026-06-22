@@ -47,7 +47,7 @@ impl BallotProtocol {
 
         let mut envelope = ScpEnvelope {
             statement: statement.clone(),
-            signature: stellar_xdr::curr::Signature(Vec::new().try_into().unwrap_or_default()),
+            signature: stellar_xdr::Signature(Vec::new().try_into().unwrap_or_default()),
         };
 
         ctx.driver.sign_envelope(&mut envelope);

@@ -15,7 +15,7 @@
 //! let manager = ScpPersistenceManager::new(Box::new(persistence));
 //! ```
 
-use stellar_xdr::curr::Hash;
+use stellar_xdr::Hash;
 use tracing::debug;
 
 use crate::error::DbError;

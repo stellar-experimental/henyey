@@ -45,7 +45,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use parking_lot::RwLock;
-use stellar_xdr::curr::{
+use stellar_xdr::{
     NodeId, ScpBallot, ScpEnvelope, ScpQuorumSet, ScpStatement, ScpStatementPledges, Value,
 };
 
@@ -1139,11 +1139,9 @@ impl<D: SCPDriver> SCP<D> {
                 .latest_envelopes()
                 .get(node_id)
                 .and_then(|env| match &env.statement.pledges {
-                    stellar_xdr::curr::ScpStatementPledges::Prepare(p) => Some(p.ballot.counter),
-                    stellar_xdr::curr::ScpStatementPledges::Confirm(c) => Some(c.ballot.counter),
-                    stellar_xdr::curr::ScpStatementPledges::Externalize(e) => {
-                        Some(e.commit.counter)
-                    }
+                    stellar_xdr::ScpStatementPledges::Prepare(p) => Some(p.ballot.counter),
+                    stellar_xdr::ScpStatementPledges::Confirm(c) => Some(c.ballot.counter),
+                    stellar_xdr::ScpStatementPledges::Externalize(e) => Some(e.commit.counter),
                     _ => None,
                 });
 
@@ -1224,7 +1222,7 @@ mod tests {
     };
     use std::sync::atomic::Ordering;
     use std::time::Duration;
-    use stellar_xdr::curr::{
+    use stellar_xdr::{
         ScpBallot, ScpNomination, ScpStatement, ScpStatementPledges, ScpStatementPrepare,
     };
 
@@ -1259,7 +1257,7 @@ mod tests {
         };
         ScpEnvelope {
             statement,
-            signature: stellar_xdr::curr::Signature(Vec::new().try_into().unwrap_or_default()),
+            signature: stellar_xdr::Signature(Vec::new().try_into().unwrap_or_default()),
         }
     }
 
@@ -1281,7 +1279,7 @@ mod tests {
         };
         ScpEnvelope {
             statement,
-            signature: stellar_xdr::curr::Signature(Vec::new().try_into().unwrap_or_default()),
+            signature: stellar_xdr::Signature(Vec::new().try_into().unwrap_or_default()),
         }
     }
 

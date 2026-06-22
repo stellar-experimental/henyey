@@ -16,7 +16,7 @@
 
 use std::fmt;
 
-use stellar_xdr::curr::{
+use stellar_xdr::{
     LedgerHeaderHistoryEntry, TransactionHistoryEntry, TransactionHistoryResultEntry, WriteXdr,
 };
 
@@ -291,8 +291,8 @@ fn compare_ledger_headers(
         }
 
         // Compare the full header by XDR serialization.
-        let l_xdr = l.header.to_xdr(stellar_xdr::curr::Limits::none());
-        let r_xdr = r.header.to_xdr(stellar_xdr::curr::Limits::none());
+        let l_xdr = l.header.to_xdr(stellar_xdr::Limits::none());
+        let r_xdr = r.header.to_xdr(stellar_xdr::Limits::none());
         if let Some((l_bytes, r_bytes)) = report_xdr_errors(
             l_xdr,
             r_xdr,
@@ -421,8 +421,8 @@ fn compare_ledger_headers(
 /// Ordering guarantee for `(Err, Err)`: local mismatch is pushed first,
 /// reference second.
 fn report_xdr_errors(
-    l_xdr: Result<Vec<u8>, stellar_xdr::curr::Error>,
-    r_xdr: Result<Vec<u8>, stellar_xdr::curr::Error>,
+    l_xdr: Result<Vec<u8>, stellar_xdr::Error>,
+    r_xdr: Result<Vec<u8>, stellar_xdr::Error>,
     ledger_seq: u32,
     category: Category,
     payload_name: &str,
@@ -477,7 +477,7 @@ fn report_xdr_errors(
 /// Trait for history entry types that can be compared by XDR serialization.
 trait ComparableEntry {
     fn ledger_seq(&self) -> u32;
-    fn payload_xdr(&self) -> std::result::Result<Vec<u8>, stellar_xdr::curr::Error>;
+    fn payload_xdr(&self) -> std::result::Result<Vec<u8>, stellar_xdr::Error>;
     fn category() -> Category;
     fn payload_name() -> &'static str;
 }
@@ -486,8 +486,8 @@ impl ComparableEntry for TransactionHistoryEntry {
     fn ledger_seq(&self) -> u32 {
         self.ledger_seq
     }
-    fn payload_xdr(&self) -> std::result::Result<Vec<u8>, stellar_xdr::curr::Error> {
-        self.tx_set.to_xdr(stellar_xdr::curr::Limits::none())
+    fn payload_xdr(&self) -> std::result::Result<Vec<u8>, stellar_xdr::Error> {
+        self.tx_set.to_xdr(stellar_xdr::Limits::none())
     }
     fn category() -> Category {
         Category::Transactions
@@ -501,8 +501,8 @@ impl ComparableEntry for TransactionHistoryResultEntry {
     fn ledger_seq(&self) -> u32 {
         self.ledger_seq
     }
-    fn payload_xdr(&self) -> std::result::Result<Vec<u8>, stellar_xdr::curr::Error> {
-        self.tx_result_set.to_xdr(stellar_xdr::curr::Limits::none())
+    fn payload_xdr(&self) -> std::result::Result<Vec<u8>, stellar_xdr::Error> {
+        self.tx_result_set.to_xdr(stellar_xdr::Limits::none())
     }
     fn category() -> Category {
         Category::Results
@@ -634,7 +634,7 @@ mod tests {
     use super::*;
     use crate::archive_state::{HASBucketLevel, HASBucketNext};
     use henyey_bucket::BUCKET_LIST_LEVELS;
-    use stellar_xdr::curr::{
+    use stellar_xdr::{
         Hash, TransactionHistoryEntryExt, TransactionHistoryResultEntryExt, TransactionResultSet,
         TransactionSet,
     };
@@ -648,7 +648,7 @@ mod tests {
             ledger_seq,
             tx_set: TransactionSet {
                 previous_ledger_hash: Hash([0u8; 32]),
-                txs: stellar_xdr::curr::VecM::default(),
+                txs: stellar_xdr::VecM::default(),
             },
             ext: TransactionHistoryEntryExt::V0,
         }
@@ -659,7 +659,7 @@ mod tests {
             ledger_seq,
             tx_set: TransactionSet {
                 previous_ledger_hash: Hash([hash_byte; 32]),
-                txs: stellar_xdr::curr::VecM::default(),
+                txs: stellar_xdr::VecM::default(),
             },
             ext: TransactionHistoryEntryExt::V0,
         }
@@ -669,7 +669,7 @@ mod tests {
         TransactionHistoryResultEntry {
             ledger_seq,
             tx_result_set: TransactionResultSet {
-                results: stellar_xdr::curr::VecM::default(),
+                results: stellar_xdr::VecM::default(),
             },
             ext: TransactionHistoryResultEntryExt::default(),
         }
@@ -681,15 +681,15 @@ mod tests {
     ) -> TransactionHistoryResultEntry {
         // Create entries with different content by varying the number of
         // (empty) result pairs.
-        let results: Vec<stellar_xdr::curr::TransactionResultPair> = (0..num_results)
-            .map(|_| stellar_xdr::curr::TransactionResultPair {
-                transaction_hash: stellar_xdr::curr::Hash([0u8; 32]),
-                result: stellar_xdr::curr::TransactionResult {
+        let results: Vec<stellar_xdr::TransactionResultPair> = (0..num_results)
+            .map(|_| stellar_xdr::TransactionResultPair {
+                transaction_hash: stellar_xdr::Hash([0u8; 32]),
+                result: stellar_xdr::TransactionResult {
                     fee_charged: 100,
-                    result: stellar_xdr::curr::TransactionResultResult::TxSuccess(
-                        stellar_xdr::curr::VecM::default(),
+                    result: stellar_xdr::TransactionResultResult::TxSuccess(
+                        stellar_xdr::VecM::default(),
                     ),
-                    ext: stellar_xdr::curr::TransactionResultExt::V0,
+                    ext: stellar_xdr::TransactionResultExt::V0,
                 },
             })
             .collect();
@@ -1093,7 +1093,7 @@ mod tests {
     fn test_report_xdr_errors_local_err() {
         let mut out = Vec::new();
         let result = report_xdr_errors(
-            Err(stellar_xdr::curr::Error::Invalid),
+            Err(stellar_xdr::Error::Invalid),
             Ok(vec![4, 5, 6]),
             42,
             Category::Transactions,
@@ -1113,7 +1113,7 @@ mod tests {
         let mut out = Vec::new();
         let result = report_xdr_errors(
             Ok(vec![1, 2, 3]),
-            Err(stellar_xdr::curr::Error::Invalid),
+            Err(stellar_xdr::Error::Invalid),
             99,
             Category::Results,
             "tx_result_set",
@@ -1131,8 +1131,8 @@ mod tests {
     fn test_report_xdr_errors_both_err() {
         let mut out = Vec::new();
         let result = report_xdr_errors(
-            Err(stellar_xdr::curr::Error::Invalid),
-            Err(stellar_xdr::curr::Error::Invalid),
+            Err(stellar_xdr::Error::Invalid),
+            Err(stellar_xdr::Error::Invalid),
             7,
             Category::LedgerHeaders,
             "header",
@@ -1152,7 +1152,7 @@ mod tests {
     // ========================================================================
 
     fn make_ledger_header_entry(ledger_seq: u32, base_fee: u32) -> LedgerHeaderHistoryEntry {
-        use stellar_xdr::curr::{
+        use stellar_xdr::{
             Hash, LedgerHeader, LedgerHeaderExt, LedgerHeaderHistoryEntryExt, StellarValue,
             StellarValueExt, TimePoint, VecM,
         };
@@ -1237,8 +1237,8 @@ mod tests {
         fn ledger_seq(&self) -> u32 {
             self.seq
         }
-        fn payload_xdr(&self) -> std::result::Result<Vec<u8>, stellar_xdr::curr::Error> {
-            Err(stellar_xdr::curr::Error::Invalid)
+        fn payload_xdr(&self) -> std::result::Result<Vec<u8>, stellar_xdr::Error> {
+            Err(stellar_xdr::Error::Invalid)
         }
         fn category() -> Category {
             Category::Transactions

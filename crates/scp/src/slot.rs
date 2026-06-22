@@ -31,7 +31,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use stellar_xdr::curr::{NodeId, ScpEnvelope, ScpQuorumSet, ScpStatementPledges, Value};
+use stellar_xdr::{NodeId, ScpEnvelope, ScpQuorumSet, ScpStatementPledges, Value};
 
 use crate::ballot::{BallotPhase, BallotProtocol};
 use crate::driver::SCPDriver;
@@ -237,14 +237,14 @@ impl Slot {
     /// Externalize phase so `get_externalizing_state()` returns it.
     #[cfg(any(test, feature = "test-helpers"))]
     pub fn test_inject_externalizing_envelope(&mut self, envelope: ScpEnvelope) {
-        use stellar_xdr::curr::ScpStatementPledges;
+        use stellar_xdr::ScpStatementPledges;
 
         // Ensure the ballot is in Externalize phase with a commit value.
         if self.ballot.phase() != crate::ballot::BallotPhase::Externalize {
             // Extract value from the envelope for force_externalize.
             let value = match &envelope.statement.pledges {
                 ScpStatementPledges::Externalize(ext) => ext.commit.value.clone(),
-                _ => stellar_xdr::curr::Value(vec![0u8].try_into().unwrap()),
+                _ => stellar_xdr::Value(vec![0u8].try_into().unwrap()),
             };
             self.ballot.force_externalize(value);
         }
@@ -777,7 +777,7 @@ impl Slot {
     /// Get values from a statement.
     ///
     /// Extracts all values referenced by a statement.
-    pub fn get_statement_values(statement: &stellar_xdr::curr::ScpStatement) -> Vec<Value> {
+    pub fn get_statement_values(statement: &stellar_xdr::ScpStatement) -> Vec<Value> {
         use ScpStatementPledges::*;
         let mut values = Vec::new();
 
@@ -1124,19 +1124,19 @@ mod tests {
         let mut slot = Slot::new(1, node.clone(), quorum_set.clone(), true);
 
         let value: Value = vec![1, 2, 3].try_into().unwrap();
-        let nomination = stellar_xdr::curr::ScpNomination {
+        let nomination = stellar_xdr::ScpNomination {
             quorum_set_hash: crate::quorum::hash_quorum_set(&quorum_set).into(),
             votes: vec![value.clone()].try_into().unwrap(),
             accepted: vec![].try_into().unwrap(),
         };
-        let statement = stellar_xdr::curr::ScpStatement {
+        let statement = stellar_xdr::ScpStatement {
             node_id: node.clone(),
             slot_index: 1,
             pledges: ScpStatementPledges::Nominate(nomination),
         };
         let envelope = ScpEnvelope {
             statement,
-            signature: stellar_xdr::curr::Signature(Vec::new().try_into().unwrap_or_default()),
+            signature: stellar_xdr::Signature(Vec::new().try_into().unwrap_or_default()),
         };
 
         assert!(slot.set_state_from_envelope(&envelope, &Arc::new(MockDriver::bare())));
@@ -1151,13 +1151,13 @@ mod tests {
         let mut slot = Slot::new(1, node.clone(), quorum_set.clone(), true);
 
         let value: Value = vec![4, 5, 6].try_into().unwrap();
-        let prep = stellar_xdr::curr::ScpStatementPrepare {
+        let prep = stellar_xdr::ScpStatementPrepare {
             quorum_set_hash: crate::quorum::hash_quorum_set(&quorum_set).into(),
-            ballot: stellar_xdr::curr::ScpBallot {
+            ballot: stellar_xdr::ScpBallot {
                 counter: 3,
                 value: value.clone(),
             },
-            prepared: Some(stellar_xdr::curr::ScpBallot {
+            prepared: Some(stellar_xdr::ScpBallot {
                 counter: 2,
                 value: value.clone(),
             }),
@@ -1165,14 +1165,14 @@ mod tests {
             n_c: 0,
             n_h: 0,
         };
-        let statement = stellar_xdr::curr::ScpStatement {
+        let statement = stellar_xdr::ScpStatement {
             node_id: node.clone(),
             slot_index: 1,
             pledges: ScpStatementPledges::Prepare(prep),
         };
         let envelope = ScpEnvelope {
             statement,
-            signature: stellar_xdr::curr::Signature(Vec::new().try_into().unwrap_or_default()),
+            signature: stellar_xdr::Signature(Vec::new().try_into().unwrap_or_default()),
         };
 
         assert!(slot.set_state_from_envelope(&envelope, &Arc::new(MockDriver::bare())));
@@ -1187,22 +1187,22 @@ mod tests {
         let mut slot = Slot::new(1, node.clone(), quorum_set.clone(), true);
 
         let value: Value = vec![7, 8, 9].try_into().unwrap();
-        let ext = stellar_xdr::curr::ScpStatementExternalize {
-            commit: stellar_xdr::curr::ScpBallot {
+        let ext = stellar_xdr::ScpStatementExternalize {
+            commit: stellar_xdr::ScpBallot {
                 counter: 5,
                 value: value.clone(),
             },
             n_h: 7,
             commit_quorum_set_hash: crate::quorum::hash_quorum_set(&quorum_set).into(),
         };
-        let statement = stellar_xdr::curr::ScpStatement {
+        let statement = stellar_xdr::ScpStatement {
             node_id: node.clone(),
             slot_index: 1,
             pledges: ScpStatementPledges::Externalize(ext),
         };
         let envelope = ScpEnvelope {
             statement,
-            signature: stellar_xdr::curr::Signature(Vec::new().try_into().unwrap_or_default()),
+            signature: stellar_xdr::Signature(Vec::new().try_into().unwrap_or_default()),
         };
 
         assert!(slot.set_state_from_envelope(&envelope, &Arc::new(MockDriver::bare())));
@@ -1222,9 +1222,9 @@ mod tests {
 
         // Set up initial ballot state
         let value: Value = vec![1, 2, 3].try_into().unwrap();
-        let prep = stellar_xdr::curr::ScpStatementPrepare {
+        let prep = stellar_xdr::ScpStatementPrepare {
             quorum_set_hash: crate::quorum::hash_quorum_set(&quorum_set).into(),
-            ballot: stellar_xdr::curr::ScpBallot {
+            ballot: stellar_xdr::ScpBallot {
                 counter: 1,
                 value: value.clone(),
             },
@@ -1233,14 +1233,14 @@ mod tests {
             n_c: 0,
             n_h: 0,
         };
-        let statement = stellar_xdr::curr::ScpStatement {
+        let statement = stellar_xdr::ScpStatement {
             node_id: node.clone(),
             slot_index: 1,
             pledges: ScpStatementPledges::Prepare(prep),
         };
         let envelope = ScpEnvelope {
             statement,
-            signature: stellar_xdr::curr::Signature(Vec::new().try_into().unwrap_or_default()),
+            signature: stellar_xdr::Signature(Vec::new().try_into().unwrap_or_default()),
         };
         slot.set_state_from_envelope(&envelope, &Arc::new(MockDriver::bare()));
 
@@ -1392,19 +1392,19 @@ mod tests {
 
         // Set up some state via set_state_from_envelope so there are messages
         let value: Value = vec![1, 2, 3].try_into().unwrap();
-        let nomination = stellar_xdr::curr::ScpNomination {
+        let nomination = stellar_xdr::ScpNomination {
             quorum_set_hash: crate::quorum::hash_quorum_set(&quorum_set).into(),
             votes: vec![value.clone()].try_into().unwrap(),
             accepted: vec![].try_into().unwrap(),
         };
-        let statement = stellar_xdr::curr::ScpStatement {
+        let statement = stellar_xdr::ScpStatement {
             node_id: node.clone(),
             slot_index: 1,
             pledges: ScpStatementPledges::Nominate(nomination),
         };
         let envelope = ScpEnvelope {
             statement,
-            signature: stellar_xdr::curr::Signature(Vec::new().try_into().unwrap_or_default()),
+            signature: stellar_xdr::Signature(Vec::new().try_into().unwrap_or_default()),
         };
         slot.set_state_from_envelope(&envelope, &Arc::new(MockDriver::bare()));
 
@@ -1454,18 +1454,18 @@ mod tests {
         // Since set_state_from_envelope validates node_id == local_node_id,
         // we can only add our own envelope.
         let value: Value = vec![1, 2, 3].try_into().unwrap();
-        let nomination = stellar_xdr::curr::ScpNomination {
+        let nomination = stellar_xdr::ScpNomination {
             quorum_set_hash: crate::quorum::hash_quorum_set(&quorum_set).into(),
             votes: vec![value.clone()].try_into().unwrap(),
             accepted: vec![].try_into().unwrap(),
         };
         let own_envelope = ScpEnvelope {
-            statement: stellar_xdr::curr::ScpStatement {
+            statement: stellar_xdr::ScpStatement {
                 node_id: node1.clone(),
                 slot_index: 1,
                 pledges: ScpStatementPledges::Nominate(nomination.clone()),
             },
-            signature: stellar_xdr::curr::Signature(Vec::new().try_into().unwrap_or_default()),
+            signature: stellar_xdr::Signature(Vec::new().try_into().unwrap_or_default()),
         };
         slot.set_state_from_envelope(&own_envelope, &Arc::new(MockDriver::bare()));
 
@@ -1502,22 +1502,22 @@ mod tests {
         let mut slot = Slot::new(1, node.clone(), quorum_set.clone(), true);
 
         let value: Value = vec![7, 8, 9].try_into().unwrap();
-        let ext = stellar_xdr::curr::ScpStatementExternalize {
-            commit: stellar_xdr::curr::ScpBallot {
+        let ext = stellar_xdr::ScpStatementExternalize {
+            commit: stellar_xdr::ScpBallot {
                 counter: 5,
                 value: value.clone(),
             },
             n_h: 7,
             commit_quorum_set_hash: crate::quorum::hash_quorum_set(&quorum_set).into(),
         };
-        let statement = stellar_xdr::curr::ScpStatement {
+        let statement = stellar_xdr::ScpStatement {
             node_id: node.clone(),
             slot_index: 1,
             pledges: ScpStatementPledges::Externalize(ext),
         };
         let envelope = ScpEnvelope {
             statement,
-            signature: stellar_xdr::curr::Signature(Vec::new().try_into().unwrap_or_default()),
+            signature: stellar_xdr::Signature(Vec::new().try_into().unwrap_or_default()),
         };
         slot.set_state_from_envelope(&envelope, &Arc::new(MockDriver::bare()));
 
@@ -1538,22 +1538,22 @@ mod tests {
         let mut slot = Slot::new(1, node.clone(), quorum_set.clone(), false);
 
         let value: Value = vec![7, 8, 9].try_into().unwrap();
-        let ext = stellar_xdr::curr::ScpStatementExternalize {
-            commit: stellar_xdr::curr::ScpBallot {
+        let ext = stellar_xdr::ScpStatementExternalize {
+            commit: stellar_xdr::ScpBallot {
                 counter: 5,
                 value: value.clone(),
             },
             n_h: 7,
             commit_quorum_set_hash: crate::quorum::hash_quorum_set(&quorum_set).into(),
         };
-        let statement = stellar_xdr::curr::ScpStatement {
+        let statement = stellar_xdr::ScpStatement {
             node_id: node.clone(),
             slot_index: 1,
             pledges: ScpStatementPledges::Externalize(ext),
         };
         let envelope = ScpEnvelope {
             statement,
-            signature: stellar_xdr::curr::Signature(Vec::new().try_into().unwrap_or_default()),
+            signature: stellar_xdr::Signature(Vec::new().try_into().unwrap_or_default()),
         };
 
         // Note: set_state_from_envelope for EXTERNALIZE sets fully_validated=true
@@ -1580,19 +1580,19 @@ mod tests {
 
         // Create envelope from wrong node
         let value: Value = vec![1, 2, 3].try_into().unwrap();
-        let nomination = stellar_xdr::curr::ScpNomination {
+        let nomination = stellar_xdr::ScpNomination {
             quorum_set_hash: crate::quorum::hash_quorum_set(&quorum_set).into(),
             votes: vec![value.clone()].try_into().unwrap(),
             accepted: vec![].try_into().unwrap(),
         };
-        let statement = stellar_xdr::curr::ScpStatement {
+        let statement = stellar_xdr::ScpStatement {
             node_id: node2.clone(), // Wrong node!
             slot_index: 1,
             pledges: ScpStatementPledges::Nominate(nomination),
         };
         let envelope = ScpEnvelope {
             statement,
-            signature: stellar_xdr::curr::Signature(Vec::new().try_into().unwrap_or_default()),
+            signature: stellar_xdr::Signature(Vec::new().try_into().unwrap_or_default()),
         };
 
         assert!(
@@ -1609,19 +1609,19 @@ mod tests {
 
         // Create envelope for wrong slot
         let value: Value = vec![1, 2, 3].try_into().unwrap();
-        let nomination = stellar_xdr::curr::ScpNomination {
+        let nomination = stellar_xdr::ScpNomination {
             quorum_set_hash: crate::quorum::hash_quorum_set(&quorum_set).into(),
             votes: vec![value.clone()].try_into().unwrap(),
             accepted: vec![].try_into().unwrap(),
         };
-        let statement = stellar_xdr::curr::ScpStatement {
+        let statement = stellar_xdr::ScpStatement {
             node_id: node.clone(),
             slot_index: 999, // Wrong slot!
             pledges: ScpStatementPledges::Nominate(nomination),
         };
         let envelope = ScpEnvelope {
             statement,
-            signature: stellar_xdr::curr::Signature(Vec::new().try_into().unwrap_or_default()),
+            signature: stellar_xdr::Signature(Vec::new().try_into().unwrap_or_default()),
         };
 
         assert!(
@@ -1638,22 +1638,22 @@ mod tests {
         let mut slot = Slot::new(1, node.clone(), quorum_set.clone(), true);
 
         let value: Value = vec![7, 8, 9].try_into().unwrap();
-        let ext = stellar_xdr::curr::ScpStatementExternalize {
-            commit: stellar_xdr::curr::ScpBallot {
+        let ext = stellar_xdr::ScpStatementExternalize {
+            commit: stellar_xdr::ScpBallot {
                 counter: 5,
                 value: value.clone(),
             },
             n_h: 7,
             commit_quorum_set_hash: crate::quorum::hash_quorum_set(&quorum_set).into(),
         };
-        let statement = stellar_xdr::curr::ScpStatement {
+        let statement = stellar_xdr::ScpStatement {
             node_id: node.clone(),
             slot_index: 1,
             pledges: ScpStatementPledges::Externalize(ext),
         };
         let envelope = ScpEnvelope {
             statement,
-            signature: stellar_xdr::curr::Signature(Vec::new().try_into().unwrap_or_default()),
+            signature: stellar_xdr::Signature(Vec::new().try_into().unwrap_or_default()),
         };
 
         assert!(slot.set_state_from_envelope(&envelope, &Arc::new(MockDriver::bare())));
@@ -1757,9 +1757,9 @@ mod tests {
 
         // Create a dummy hint statement
         let value: Value = vec![1, 2, 3].try_into().unwrap();
-        let prep = stellar_xdr::curr::ScpStatementPrepare {
+        let prep = stellar_xdr::ScpStatementPrepare {
             quorum_set_hash: crate::quorum::hash_quorum_set(&quorum_set).into(),
-            ballot: stellar_xdr::curr::ScpBallot {
+            ballot: stellar_xdr::ScpBallot {
                 counter: 1,
                 value: value.clone(),
             },
@@ -1768,7 +1768,7 @@ mod tests {
             n_c: 0,
             n_h: 0,
         };
-        let statement = stellar_xdr::curr::ScpStatement {
+        let statement = stellar_xdr::ScpStatement {
             node_id: node.clone(),
             slot_index: 1,
             pledges: ScpStatementPledges::Prepare(prep),
@@ -1796,18 +1796,18 @@ mod tests {
 
         // Add nomination envelope
         let value: Value = vec![1, 2, 3].try_into().unwrap();
-        let nomination = stellar_xdr::curr::ScpNomination {
+        let nomination = stellar_xdr::ScpNomination {
             quorum_set_hash: crate::quorum::hash_quorum_set(&quorum_set).into(),
             votes: vec![value.clone()].try_into().unwrap(),
             accepted: vec![].try_into().unwrap(),
         };
         let nom_envelope = ScpEnvelope {
-            statement: stellar_xdr::curr::ScpStatement {
+            statement: stellar_xdr::ScpStatement {
                 node_id: node.clone(),
                 slot_index: 1,
                 pledges: ScpStatementPledges::Nominate(nomination),
             },
-            signature: stellar_xdr::curr::Signature(Vec::new().try_into().unwrap_or_default()),
+            signature: stellar_xdr::Signature(Vec::new().try_into().unwrap_or_default()),
         };
         slot.set_state_from_envelope(&nom_envelope, &Arc::new(MockDriver::bare()));
 
@@ -1823,9 +1823,9 @@ mod tests {
         );
 
         // Add ballot envelope - should prefer ballot over nomination
-        let prep = stellar_xdr::curr::ScpStatementPrepare {
+        let prep = stellar_xdr::ScpStatementPrepare {
             quorum_set_hash: crate::quorum::hash_quorum_set(&quorum_set).into(),
-            ballot: stellar_xdr::curr::ScpBallot {
+            ballot: stellar_xdr::ScpBallot {
                 counter: 1,
                 value: value.clone(),
             },
@@ -1835,12 +1835,12 @@ mod tests {
             n_h: 0,
         };
         let ballot_envelope = ScpEnvelope {
-            statement: stellar_xdr::curr::ScpStatement {
+            statement: stellar_xdr::ScpStatement {
                 node_id: node.clone(),
                 slot_index: 1,
                 pledges: ScpStatementPledges::Prepare(prep),
             },
-            signature: stellar_xdr::curr::Signature(Vec::new().try_into().unwrap_or_default()),
+            signature: stellar_xdr::Signature(Vec::new().try_into().unwrap_or_default()),
         };
         slot.set_state_from_envelope(&ballot_envelope, &Arc::new(MockDriver::bare()));
 
@@ -1877,22 +1877,22 @@ mod tests {
         // Simulate externalization happening while not fully validated:
         // set_state_from_envelope with an EXTERNALIZE populates ballot state
         let value: Value = vec![42].try_into().unwrap();
-        let externalize = stellar_xdr::curr::ScpStatementExternalize {
-            commit: stellar_xdr::curr::ScpBallot {
+        let externalize = stellar_xdr::ScpStatementExternalize {
+            commit: stellar_xdr::ScpBallot {
                 counter: 1,
                 value: value.clone(),
             },
             n_h: 1,
             commit_quorum_set_hash: crate::quorum::hash_quorum_set(&quorum_set).into(),
         };
-        let statement = stellar_xdr::curr::ScpStatement {
+        let statement = stellar_xdr::ScpStatement {
             node_id: node.clone(),
             slot_index: 1,
             pledges: ScpStatementPledges::Externalize(externalize),
         };
         let envelope = ScpEnvelope {
             statement,
-            signature: stellar_xdr::curr::Signature(Vec::new().try_into().unwrap_or_default()),
+            signature: stellar_xdr::Signature(Vec::new().try_into().unwrap_or_default()),
         };
         slot.set_state_from_envelope(&envelope, &Arc::new(MockDriver::bare()));
 
@@ -1959,8 +1959,8 @@ mod tests {
         let qs = Arc::new(make_qs(vec![peer_node.clone()], 1));
         let value: Value = vec![42, 43, 44].try_into().unwrap();
 
-        let ext = stellar_xdr::curr::ScpStatementExternalize {
-            commit: stellar_xdr::curr::ScpBallot {
+        let ext = stellar_xdr::ScpStatementExternalize {
+            commit: stellar_xdr::ScpBallot {
                 counter: 1,
                 value: value.clone(),
             },
@@ -1968,12 +1968,12 @@ mod tests {
             commit_quorum_set_hash: crate::quorum::hash_quorum_set(&qs).into(),
         };
         let envelope = ScpEnvelope {
-            statement: stellar_xdr::curr::ScpStatement {
+            statement: stellar_xdr::ScpStatement {
                 node_id: peer_node.clone(),
                 slot_index: 10,
                 pledges: ScpStatementPledges::Externalize(ext),
             },
-            signature: stellar_xdr::curr::Signature(Vec::new().try_into().unwrap_or_default()),
+            signature: stellar_xdr::Signature(Vec::new().try_into().unwrap_or_default()),
         };
 
         // --- Slot A: MaybeValidDeferred (simulates missing tx_set fast-path) ---
@@ -2102,7 +2102,7 @@ mod tests {
         let mut slot = Slot::new(1, node.clone(), quorum_set.clone(), true);
 
         // Process a peer nomination envelope
-        let peer_nomination = stellar_xdr::curr::ScpNomination {
+        let peer_nomination = stellar_xdr::ScpNomination {
             quorum_set_hash: crate::quorum::hash_quorum_set(&quorum_set).into(),
             votes: vec![vec![1u8, 2, 3].try_into().unwrap()]
                 .try_into()
@@ -2110,12 +2110,12 @@ mod tests {
             accepted: vec![].try_into().unwrap(),
         };
         let peer_envelope = ScpEnvelope {
-            statement: stellar_xdr::curr::ScpStatement {
+            statement: stellar_xdr::ScpStatement {
                 node_id: peer1.clone(),
                 slot_index: 1,
                 pledges: ScpStatementPledges::Nominate(peer_nomination),
             },
-            signature: stellar_xdr::curr::Signature(Vec::new().try_into().unwrap_or_default()),
+            signature: stellar_xdr::Signature(Vec::new().try_into().unwrap_or_default()),
         };
         slot.process_envelope(peer_envelope, &driver);
 
@@ -2180,9 +2180,9 @@ mod tests {
         let mut slot = Slot::new(1, node.clone(), qs.clone(), true);
 
         let value: Value = vec![1, 2, 3].try_into().unwrap();
-        let prep = stellar_xdr::curr::ScpStatementPrepare {
+        let prep = stellar_xdr::ScpStatementPrepare {
             quorum_set_hash: crate::quorum::hash_quorum_set(&qs).into(),
-            ballot: stellar_xdr::curr::ScpBallot {
+            ballot: stellar_xdr::ScpBallot {
                 counter: 1,
                 value: value.clone(),
             },
@@ -2191,14 +2191,14 @@ mod tests {
             n_c: 0,
             n_h: 0,
         };
-        let statement = stellar_xdr::curr::ScpStatement {
+        let statement = stellar_xdr::ScpStatement {
             node_id: node.clone(),
             slot_index: 1,
             pledges: ScpStatementPledges::Prepare(prep),
         };
         let envelope = ScpEnvelope {
             statement,
-            signature: stellar_xdr::curr::Signature(Vec::new().try_into().unwrap_or_default()),
+            signature: stellar_xdr::Signature(Vec::new().try_into().unwrap_or_default()),
         };
         slot.set_state_from_envelope(&envelope, &Arc::new(MockDriver::bare()));
         assert!(
@@ -2353,9 +2353,9 @@ mod tests {
         let mut slot = Slot::new(1, node1.clone(), qs.clone(), true);
 
         let value: Value = vec![1, 2, 3].try_into().unwrap();
-        let prep = stellar_xdr::curr::ScpStatementPrepare {
+        let prep = stellar_xdr::ScpStatementPrepare {
             quorum_set_hash: crate::quorum::hash_quorum_set(&qs).into(),
-            ballot: stellar_xdr::curr::ScpBallot {
+            ballot: stellar_xdr::ScpBallot {
                 counter: 1,
                 value: value.clone(),
             },
@@ -2364,14 +2364,14 @@ mod tests {
             n_c: 0,
             n_h: 0,
         };
-        let statement = stellar_xdr::curr::ScpStatement {
+        let statement = stellar_xdr::ScpStatement {
             node_id: node1,
             slot_index: 1,
             pledges: ScpStatementPledges::Prepare(prep),
         };
         let envelope = ScpEnvelope {
             statement,
-            signature: stellar_xdr::curr::Signature(Vec::new().try_into().unwrap_or_default()),
+            signature: stellar_xdr::Signature(Vec::new().try_into().unwrap_or_default()),
         };
         slot.set_state_from_envelope(&envelope, &Arc::new(MockDriver::bare()));
         assert!(slot.is_fully_validated());

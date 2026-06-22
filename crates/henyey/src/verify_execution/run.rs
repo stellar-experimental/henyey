@@ -194,7 +194,7 @@ async fn verify_single_ledger(
     ctx: &mut VerifyContext,
     stats: &mut VerifyStats,
     prev_ledger_hash: &mut Hash256,
-    header_entry: &stellar_xdr::curr::LedgerHeaderHistoryEntry,
+    header_entry: &stellar_xdr::LedgerHeaderHistoryEntry,
 ) -> anyhow::Result<()> {
     let header = &header_entry.header;
     let seq = header.ledger_seq;
@@ -335,8 +335,8 @@ fn log_close_ledger_failure_diag(
     ctx: &VerifyContext,
     seq: u32,
     verified_header_hash: Hash256,
-    cdp_header: &stellar_xdr::curr::LedgerHeader,
-    lcm: &stellar_xdr::curr::LedgerCloseMeta,
+    cdp_header: &stellar_xdr::LedgerHeader,
+    lcm: &stellar_xdr::LedgerCloseMeta,
 ) {
     tracing::warn!(
         target: "hash_mismatch_debug",
@@ -361,7 +361,7 @@ fn log_close_ledger_failure_diag(
     // CRITICAL: cdp envelopes (from tx_set, canonical order) and
     // tx_processing (apply order) are NOT aligned by index. We MUST
     // align by tx hash via extract_transaction_processing.
-    let network_id = stellar_xdr::curr::Hash(*ctx.ledger_manager.network_id().0.as_bytes());
+    let network_id = stellar_xdr::Hash(*ctx.ledger_manager.network_id().0.as_bytes());
     let cdp_processing = henyey_history::cdp::extract_transaction_processing(lcm, &network_id);
     for (i, info) in cdp_processing.iter().enumerate() {
         let (op_types, declared_fee, soroban_resource_fee, soroban_resources) =
@@ -400,17 +400,17 @@ fn log_close_ledger_failure_diag(
 fn print_mismatch_details(
     ctx: &VerifyContext,
     seq: u32,
-    our_header: &stellar_xdr::curr::LedgerHeader,
+    our_header: &stellar_xdr::LedgerHeader,
     our_header_hash: Hash256,
     expected_header_hash: Hash256,
     our_tx_result_hash: Hash256,
     expected_tx_result_hash: Hash256,
     header_matches: bool,
     tx_result_matches: bool,
-    our_tx_results: &[stellar_xdr::curr::TransactionResultPair],
-    cdp_tx_results: &[stellar_xdr::curr::TransactionResultPair],
-    cdp_header: &stellar_xdr::curr::LedgerHeader,
-    lcm: &stellar_xdr::curr::LedgerCloseMeta,
+    our_tx_results: &[stellar_xdr::TransactionResultPair],
+    cdp_tx_results: &[stellar_xdr::TransactionResultPair],
+    cdp_header: &stellar_xdr::LedgerHeader,
+    lcm: &stellar_xdr::LedgerCloseMeta,
 ) {
     println!();
     println!("  Ledger {}: MISMATCH", seq);
@@ -591,8 +591,8 @@ pub(super) fn print_summary(stats: &mut VerifyStats, elapsed: Duration) {
 /// the divergence is likely in bucket list state (eviction, upgrades, etc.).
 fn print_eviction_and_entry_diagnostics(
     ctx: &VerifyContext,
-    lcm: &stellar_xdr::curr::LedgerCloseMeta,
-    result_header: &stellar_xdr::curr::LedgerHeader,
+    lcm: &stellar_xdr::LedgerCloseMeta,
+    result_header: &stellar_xdr::LedgerHeader,
 ) {
     let cdp_evicted_keys = henyey_history::cdp::extract_evicted_keys(lcm);
     let tx_metas = henyey_history::cdp::extract_transaction_metas(lcm);

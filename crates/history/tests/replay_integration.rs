@@ -21,7 +21,7 @@ use henyey_history::{
     verify, CatchupConfiguration, HistoryError,
 };
 use henyey_ledger::TransactionSetVariant;
-use stellar_xdr::curr::{
+use stellar_xdr::{
     Hash, LedgerHeader, LedgerHeaderExt, LedgerHeaderHistoryEntry, LedgerHeaderHistoryEntryExt,
     StellarValue, StellarValueExt, TimePoint, TransactionHistoryEntry, TransactionHistoryEntryExt,
     TransactionHistoryResultEntry, TransactionHistoryResultEntryExt, TransactionResultSet,
@@ -173,7 +173,7 @@ async fn test_catchup_replay_bucket_hash_verification() {
         .add_batch(
             target,
             25,
-            stellar_xdr::curr::BucketListType::Live,
+            stellar_xdr::BucketListType::Live,
             Vec::new(),
             Vec::new(),
             Vec::new(),
@@ -201,7 +201,7 @@ async fn test_catchup_replay_bucket_hash_verification() {
         results: VecM::default(),
     };
     let result_xdr = result_set
-        .to_xdr(stellar_xdr::curr::Limits::none())
+        .to_xdr(stellar_xdr::Limits::none())
         .expect("tx result xdr");
     let tx_result_hash = Hash256::hash(&result_xdr);
 
@@ -226,10 +226,10 @@ async fn test_catchup_replay_bucket_hash_verification() {
             ext: LedgerHeaderHistoryEntryExt::default(),
         };
         let entry63_xdr = entry63
-            .to_xdr(stellar_xdr::curr::Limits::none())
+            .to_xdr(stellar_xdr::Limits::none())
             .expect("header63 xdr");
         let entry64_xdr = entry64
-            .to_xdr(stellar_xdr::curr::Limits::none())
+            .to_xdr(stellar_xdr::Limits::none())
             .expect("header64 xdr");
         record_marked(&[entry63_xdr, entry64_xdr])
     };
@@ -241,7 +241,7 @@ async fn test_catchup_replay_bucket_hash_verification() {
             ext: LedgerHeaderHistoryEntryExt::default(),
         };
         let entry64_xdr = entry64
-            .to_xdr(stellar_xdr::curr::Limits::none())
+            .to_xdr(stellar_xdr::Limits::none())
             .expect("header64 xdr");
         record_marked(&[entry64_xdr])
     };
@@ -251,7 +251,7 @@ async fn test_catchup_replay_bucket_hash_verification() {
         ext: TransactionHistoryEntryExt::V0,
     };
     let tx_history_xdr = record_marked(&[tx_history_entry
-        .to_xdr(stellar_xdr::curr::Limits::none())
+        .to_xdr(stellar_xdr::Limits::none())
         .expect("tx history xdr")]);
     let tx_result_entry = TransactionHistoryResultEntry {
         ledger_seq: target,
@@ -259,7 +259,7 @@ async fn test_catchup_replay_bucket_hash_verification() {
         ext: TransactionHistoryResultEntryExt::default(),
     };
     let tx_result_xdr = record_marked(&[tx_result_entry
-        .to_xdr(stellar_xdr::curr::Limits::none())
+        .to_xdr(stellar_xdr::Limits::none())
         .expect("tx result history xdr")]);
 
     let mut levels = Vec::with_capacity(BUCKET_LIST_LEVELS);
@@ -418,7 +418,7 @@ async fn test_catchup_replay_bucket_hash_verification() {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_catchup_recent_large_gap_replays_with_parity() {
     use henyey_history::CatchupMode;
-    use stellar_xdr::curr::{GeneralizedTransactionSet, TransactionPhase, TransactionSetV1};
+    use stellar_xdr::{GeneralizedTransactionSet, TransactionPhase, TransactionSetV1};
 
     let target = 200u32;
     let lcl = 100u32;
@@ -428,7 +428,7 @@ async fn test_catchup_recent_large_gap_replays_with_parity() {
         results: VecM::default(),
     };
     let empty_result_xdr = empty_result_set
-        .to_xdr(stellar_xdr::curr::Limits::none())
+        .to_xdr(stellar_xdr::Limits::none())
         .expect("tx result xdr");
     let empty_tx_result_hash = Hash256::hash(&empty_result_xdr);
 
@@ -496,7 +496,7 @@ async fn test_catchup_recent_large_gap_replays_with_parity() {
                     ext: LedgerHeaderHistoryEntryExt::default(),
                 };
                 entry
-                    .to_xdr(stellar_xdr::curr::Limits::none())
+                    .to_xdr(stellar_xdr::Limits::none())
                     .expect("header xdr")
             })
             .collect();
@@ -633,7 +633,7 @@ async fn test_catchup_recent_large_gap_replays_with_parity() {
 /// - The tx set hash in ledger 64 uses Generalized v23+ format
 #[tokio::test]
 async fn test_catchup_self_corrects_lcl_protocol_from_archive() {
-    use stellar_xdr::curr::{GeneralizedTransactionSet, TransactionPhase, TransactionSetV1};
+    use stellar_xdr::{GeneralizedTransactionSet, TransactionPhase, TransactionSetV1};
 
     let checkpoint = 63u32;
     let target = 64u32;
@@ -665,7 +665,7 @@ async fn test_catchup_self_corrects_lcl_protocol_from_archive() {
         results: VecM::default(),
     };
     let empty_result_xdr = empty_result_set
-        .to_xdr(stellar_xdr::curr::Limits::none())
+        .to_xdr(stellar_xdr::Limits::none())
         .expect("tx result xdr");
     let empty_tx_result_hash = Hash256::hash(&empty_result_xdr);
 
@@ -788,7 +788,7 @@ async fn test_catchup_self_corrects_lcl_protocol_from_archive() {
                 ext: LedgerHeaderHistoryEntryExt::default(),
             };
             entry
-                .to_xdr(stellar_xdr::curr::Limits::none())
+                .to_xdr(stellar_xdr::Limits::none())
                 .expect("header xdr")
         })
         .collect();
@@ -811,7 +811,7 @@ async fn test_catchup_self_corrects_lcl_protocol_from_archive() {
                 ext: LedgerHeaderHistoryEntryExt::default(),
             };
             entry
-                .to_xdr(stellar_xdr::curr::Limits::none())
+                .to_xdr(stellar_xdr::Limits::none())
                 .expect("header xdr")
         })
         .collect();
@@ -993,7 +993,7 @@ async fn test_replay_hash_mismatch_produces_replay_hash_mismatch_error() {
         results: VecM::default(),
     };
     let result_xdr = result_set
-        .to_xdr(stellar_xdr::curr::Limits::none())
+        .to_xdr(stellar_xdr::Limits::none())
         .expect("tx result xdr");
     let tx_result_hash = Hash256::hash(&result_xdr);
 
@@ -1025,10 +1025,10 @@ async fn test_replay_hash_mismatch_produces_replay_hash_mismatch_error() {
             ext: LedgerHeaderHistoryEntryExt::default(),
         };
         let entry63_xdr = entry63
-            .to_xdr(stellar_xdr::curr::Limits::none())
+            .to_xdr(stellar_xdr::Limits::none())
             .expect("header63 xdr");
         let entry64_xdr = entry64
-            .to_xdr(stellar_xdr::curr::Limits::none())
+            .to_xdr(stellar_xdr::Limits::none())
             .expect("header64 xdr");
         record_marked(&[entry63_xdr, entry64_xdr])
     };
@@ -1039,7 +1039,7 @@ async fn test_replay_hash_mismatch_produces_replay_hash_mismatch_error() {
             ext: LedgerHeaderHistoryEntryExt::default(),
         };
         let entry64_xdr = entry64
-            .to_xdr(stellar_xdr::curr::Limits::none())
+            .to_xdr(stellar_xdr::Limits::none())
             .expect("header64 xdr");
         record_marked(&[entry64_xdr])
     };
@@ -1049,7 +1049,7 @@ async fn test_replay_hash_mismatch_produces_replay_hash_mismatch_error() {
         ext: TransactionHistoryEntryExt::V0,
     };
     let tx_history_xdr = record_marked(&[tx_history_entry
-        .to_xdr(stellar_xdr::curr::Limits::none())
+        .to_xdr(stellar_xdr::Limits::none())
         .expect("tx history xdr")]);
     let tx_result_entry = TransactionHistoryResultEntry {
         ledger_seq: target,
@@ -1057,7 +1057,7 @@ async fn test_replay_hash_mismatch_produces_replay_hash_mismatch_error() {
         ext: TransactionHistoryResultEntryExt::default(),
     };
     let tx_result_xdr = record_marked(&[tx_result_entry
-        .to_xdr(stellar_xdr::curr::Limits::none())
+        .to_xdr(stellar_xdr::Limits::none())
         .expect("tx result history xdr")]);
 
     let mut levels = Vec::with_capacity(BUCKET_LIST_LEVELS);
@@ -1261,7 +1261,7 @@ async fn test_replay_with_validate_bucket_hash_enabled() {
         .add_batch(
             target,
             25,
-            stellar_xdr::curr::BucketListType::Live,
+            stellar_xdr::BucketListType::Live,
             Vec::new(),
             Vec::new(),
             Vec::new(),
@@ -1289,7 +1289,7 @@ async fn test_replay_with_validate_bucket_hash_enabled() {
         results: VecM::default(),
     };
     let result_xdr = result_set
-        .to_xdr(stellar_xdr::curr::Limits::none())
+        .to_xdr(stellar_xdr::Limits::none())
         .expect("tx result xdr");
     let tx_result_hash = Hash256::hash(&result_xdr);
 
@@ -1314,10 +1314,10 @@ async fn test_replay_with_validate_bucket_hash_enabled() {
             ext: LedgerHeaderHistoryEntryExt::default(),
         };
         let entry63_xdr = entry63
-            .to_xdr(stellar_xdr::curr::Limits::none())
+            .to_xdr(stellar_xdr::Limits::none())
             .expect("header63 xdr");
         let entry64_xdr = entry64
-            .to_xdr(stellar_xdr::curr::Limits::none())
+            .to_xdr(stellar_xdr::Limits::none())
             .expect("header64 xdr");
         record_marked(&[entry63_xdr, entry64_xdr])
     };
@@ -1329,7 +1329,7 @@ async fn test_replay_with_validate_bucket_hash_enabled() {
             ext: LedgerHeaderHistoryEntryExt::default(),
         };
         let entry64_xdr = entry64
-            .to_xdr(stellar_xdr::curr::Limits::none())
+            .to_xdr(stellar_xdr::Limits::none())
             .expect("header64 xdr");
         record_marked(&[entry64_xdr])
     };
@@ -1339,7 +1339,7 @@ async fn test_replay_with_validate_bucket_hash_enabled() {
         ext: TransactionHistoryEntryExt::V0,
     };
     let tx_history_xdr = record_marked(&[tx_history_entry
-        .to_xdr(stellar_xdr::curr::Limits::none())
+        .to_xdr(stellar_xdr::Limits::none())
         .expect("tx history xdr")]);
     let tx_result_entry = TransactionHistoryResultEntry {
         ledger_seq: target,
@@ -1347,7 +1347,7 @@ async fn test_replay_with_validate_bucket_hash_enabled() {
         ext: TransactionHistoryResultEntryExt::default(),
     };
     let tx_result_xdr = record_marked(&[tx_result_entry
-        .to_xdr(stellar_xdr::curr::Limits::none())
+        .to_xdr(stellar_xdr::Limits::none())
         .expect("tx result history xdr")]);
 
     let mut levels = Vec::with_capacity(BUCKET_LIST_LEVELS);
@@ -1495,7 +1495,7 @@ async fn test_replay_with_validate_bucket_hash_enabled() {
 async fn test_inv_c15_rejects_bucket_apply_older_than_lcl() {
     use henyey_bucket::HotArchiveBucketList;
     use henyey_history::catchup::CheckpointData;
-    use stellar_xdr::curr::ScpHistoryEntry;
+    use stellar_xdr::ScpHistoryEntry;
 
     let checkpoint = 127u32;
     let target = 128u32;
@@ -1616,7 +1616,7 @@ async fn test_inv_c15_rejects_bucket_apply_older_than_lcl() {
 async fn test_inv_c15_allows_bucket_apply_at_lcl() {
     use henyey_bucket::HotArchiveBucketList;
     use henyey_history::catchup::CheckpointData;
-    use stellar_xdr::curr::ScpHistoryEntry;
+    use stellar_xdr::ScpHistoryEntry;
 
     let checkpoint = 127u32;
     let target = 128u32;
@@ -1664,19 +1664,18 @@ async fn test_inv_c15_allows_bucket_apply_at_lcl() {
     };
 
     // Build a header for target (128) to replay.
-    let tx_result_set = stellar_xdr::curr::TransactionResultSet {
+    let tx_result_set = stellar_xdr::TransactionResultSet {
         results: VecM::default(),
     };
     let result_xdr = tx_result_set
-        .to_xdr(stellar_xdr::curr::Limits::none())
+        .to_xdr(stellar_xdr::Limits::none())
         .expect("result xdr");
     let tx_result_hash = Hash256::hash(&result_xdr);
 
-    let tx_set =
-        stellar_xdr::curr::GeneralizedTransactionSet::V1(stellar_xdr::curr::TransactionSetV1 {
-            previous_ledger_hash: Hash(*checkpoint_hash.as_bytes()),
-            phases: VecM::default(),
-        });
+    let tx_set = stellar_xdr::GeneralizedTransactionSet::V1(stellar_xdr::TransactionSetV1 {
+        previous_ledger_hash: Hash(*checkpoint_hash.as_bytes()),
+        phases: VecM::default(),
+    });
     let tx_set_hash = henyey_history::verify::compute_tx_set_hash(
         &TransactionSetVariant::Generalized(tx_set.clone()),
     )
@@ -1788,7 +1787,7 @@ async fn test_inv_c15_allows_bucket_apply_at_lcl() {
 async fn test_checkpoint_data_path_preserves_online_run_mode() {
     use henyey_history::catchup::CheckpointData;
     use henyey_history::CatchupRunMode;
-    use stellar_xdr::curr::ScpHistoryEntry;
+    use stellar_xdr::ScpHistoryEntry;
 
     let checkpoint = 127u32;
     let target = 128u32;
@@ -1948,7 +1947,7 @@ async fn test_offline_complete_rejected_at_checkpoint_data_entry_point() {
     use henyey_history::catchup::CheckpointData;
     use henyey_history::CatchupConfiguration;
     use henyey_history::CatchupRunMode;
-    use stellar_xdr::curr::ScpHistoryEntry;
+    use stellar_xdr::ScpHistoryEntry;
 
     let ledger_manager = henyey_ledger::LedgerManager::new(
         "Test SDF Network ; September 2015".to_string(),
@@ -2032,7 +2031,7 @@ async fn test_checkpoint_data_config_rejects_non_minimal_depth() {
     use henyey_history::catchup::CheckpointData;
     use henyey_history::CatchupConfiguration;
     use henyey_history::CatchupRunMode;
-    use stellar_xdr::curr::ScpHistoryEntry;
+    use stellar_xdr::ScpHistoryEntry;
 
     let ledger_manager = henyey_ledger::LedgerManager::new(
         "Test SDF Network ; September 2015".to_string(),
@@ -2182,7 +2181,7 @@ async fn test_catchup_pins_downloads_to_gate_archive() {
         .add_batch(
             target,
             25,
-            stellar_xdr::curr::BucketListType::Live,
+            stellar_xdr::BucketListType::Live,
             Vec::new(),
             Vec::new(),
             Vec::new(),
@@ -2210,7 +2209,7 @@ async fn test_catchup_pins_downloads_to_gate_archive() {
         results: VecM::default(),
     };
     let result_xdr = result_set
-        .to_xdr(stellar_xdr::curr::Limits::none())
+        .to_xdr(stellar_xdr::Limits::none())
         .expect("tx result xdr");
     let tx_result_hash = Hash256::hash(&result_xdr);
 
@@ -2254,7 +2253,7 @@ async fn test_catchup_pins_downloads_to_gate_archive() {
             ext: LedgerHeaderHistoryEntryExt::default(),
         };
         record_marked(&[entry63
-            .to_xdr(stellar_xdr::curr::Limits::none())
+            .to_xdr(stellar_xdr::Limits::none())
             .expect("header63 xdr")])
     };
 
@@ -2265,7 +2264,7 @@ async fn test_catchup_pins_downloads_to_gate_archive() {
             ext: LedgerHeaderHistoryEntryExt::default(),
         };
         record_marked(&[entry64
-            .to_xdr(stellar_xdr::curr::Limits::none())
+            .to_xdr(stellar_xdr::Limits::none())
             .expect("header64 xdr")])
     };
     let headers_xdr_good = make_data_checkpoint_headers(header64_hash, header64.clone());
@@ -2278,7 +2277,7 @@ async fn test_catchup_pins_downloads_to_gate_archive() {
         ext: TransactionHistoryEntryExt::V0,
     };
     let tx_history_xdr = record_marked(&[tx_history_entry
-        .to_xdr(stellar_xdr::curr::Limits::none())
+        .to_xdr(stellar_xdr::Limits::none())
         .expect("tx history xdr")]);
     let tx_result_entry = TransactionHistoryResultEntry {
         ledger_seq: target,
@@ -2286,7 +2285,7 @@ async fn test_catchup_pins_downloads_to_gate_archive() {
         ext: TransactionHistoryResultEntryExt::default(),
     };
     let tx_result_xdr = record_marked(&[tx_result_entry
-        .to_xdr(stellar_xdr::curr::Limits::none())
+        .to_xdr(stellar_xdr::Limits::none())
         .expect("tx result history xdr")]);
 
     let mut levels = Vec::with_capacity(BUCKET_LIST_LEVELS);

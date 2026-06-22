@@ -2,7 +2,7 @@
 
 use std::cmp::Ordering;
 
-use stellar_xdr::curr::{
+use stellar_xdr::{
     AccountEntry, AccountEntryExt, AccountEntryExtensionV1Ext, AccountId, Signer, SignerKey,
     SponsorshipDescriptor, VecM,
 };
@@ -322,7 +322,7 @@ fn index_out_of_bounds(index: usize, len: usize) -> TxError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use stellar_xdr::curr::{
+    use stellar_xdr::{
         AccountEntryExtensionV1, AccountEntryExtensionV2, AccountEntryExtensionV2Ext, Liabilities,
         PublicKey, SignerKeyEd25519SignedPayload, String32, Thresholds, Uint256,
     };
@@ -331,7 +331,7 @@ mod tests {
         AccountEntry {
             account_id: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([1; 32]))),
             balance: 100,
-            seq_num: stellar_xdr::curr::SequenceNumber(1),
+            seq_num: stellar_xdr::SequenceNumber(1),
             num_sub_entries: signers.len() as u32,
             inflation_dest: None,
             flags: 0,

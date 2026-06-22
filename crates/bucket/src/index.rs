@@ -20,7 +20,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use stellar_xdr::curr::{
+use stellar_xdr::{
     Asset, LedgerEntry, LedgerEntryData, LedgerEntryType, LedgerKey, Limits, PoolId,
     TrustLineAsset, WriteXdr,
 };
@@ -377,9 +377,8 @@ impl InMemoryIndex {
                 // Extract pool mappings from liquidity pool entries
                 if let BucketEntry::Liveentry(e) | BucketEntry::Initentry(e) = &entry {
                     if let LedgerEntryData::LiquidityPool(pool) = &e.data {
-                        let stellar_xdr::curr::LiquidityPoolEntryBody::LiquidityPoolConstantProduct(
-                            cp,
-                        ) = &pool.body;
+                        let stellar_xdr::LiquidityPoolEntryBody::LiquidityPoolConstantProduct(cp) =
+                            &pool.body;
                         asset_to_pool_id.add_pool(
                             pool.liquidity_pool_id.clone(),
                             &cp.params.asset_a,
@@ -601,9 +600,8 @@ impl DiskIndex {
                 // Extract pool mappings
                 if let BucketEntry::Liveentry(e) | BucketEntry::Initentry(e) = &entry {
                     if let LedgerEntryData::LiquidityPool(pool) = &e.data {
-                        let stellar_xdr::curr::LiquidityPoolEntryBody::LiquidityPoolConstantProduct(
-                            cp,
-                        ) = &pool.body;
+                        let stellar_xdr::LiquidityPoolEntryBody::LiquidityPoolConstantProduct(cp) =
+                            &pool.body;
                         asset_to_pool_id.add_pool(
                             pool.liquidity_pool_id.clone(),
                             &cp.params.asset_a,
@@ -1020,7 +1018,7 @@ impl LiveBucketIndex {
     /// the asset.
     pub fn get_pool_share_trustline_keys(
         &self,
-        account_id: &stellar_xdr::curr::AccountId,
+        account_id: &stellar_xdr::AccountId,
         asset: &Asset,
     ) -> Vec<LedgerKey> {
         let pools = self.get_pools_for_asset(asset);
@@ -1028,7 +1026,7 @@ impl LiveBucketIndex {
         pools
             .into_iter()
             .map(|pool_id| {
-                LedgerKey::Trustline(stellar_xdr::curr::LedgerKeyTrustLine {
+                LedgerKey::Trustline(stellar_xdr::LedgerKeyTrustLine {
                     account_id: account_id.clone(),
                     asset: TrustLineAsset::PoolShare(pool_id),
                 })
@@ -1065,7 +1063,7 @@ impl LiveBucketIndex {
 mod tests {
     use super::*;
     use crate::entry::BucketEntry;
-    use stellar_xdr::curr::*;
+    use stellar_xdr::*;
 
     fn make_account_id(byte: u8) -> AccountId {
         AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([byte; 32])))
@@ -1405,7 +1403,7 @@ mod tests {
         key_val: i32,
         durability: ContractDataDurability,
     ) -> LedgerEntry {
-        use stellar_xdr::curr::*;
+        use stellar_xdr::*;
         LedgerEntry {
             last_modified_ledger_seq: 1,
             data: LedgerEntryData::ContractData(ContractDataEntry {
@@ -1574,7 +1572,7 @@ mod tests {
     // the index entry counters.
 
     fn make_contract_code_entry(seed: u8) -> LedgerEntry {
-        use stellar_xdr::curr::*;
+        use stellar_xdr::*;
         LedgerEntry {
             last_modified_ledger_seq: 1,
             data: LedgerEntryData::ContractCode(ContractCodeEntry {

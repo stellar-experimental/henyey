@@ -14,7 +14,7 @@
 //! assert!(!is_string_valid("Hello\x00World")); // Contains control character
 //! ```
 
-use stellar_xdr::curr::{
+use stellar_xdr::{
     AccountId, Asset, AssetCode12, AssetCode4, BucketEntry, ChangeTrustAsset,
     HotArchiveBucketEntry, LedgerKey, TrustLineAsset,
 };
@@ -108,7 +108,7 @@ pub fn str_to_asset_code<const N: usize>(s: &str) -> [u8; N] {
 ///
 /// ```rust
 /// use henyey_common::asset::asset_to_string;
-/// use stellar_xdr::curr::{Asset, AssetCode4, AlphaNum4, PublicKey, Uint256};
+/// use stellar_xdr::{Asset, AssetCode4, AlphaNum4, PublicKey, Uint256};
 ///
 /// // Native asset
 /// let native = Asset::Native;
@@ -165,7 +165,7 @@ pub fn is_asset_code12_valid(code: &AssetCode12) -> bool {
 ///
 /// ```rust
 /// use henyey_common::asset::is_asset_valid;
-/// use stellar_xdr::curr::Asset;
+/// use stellar_xdr::Asset;
 ///
 /// // Native assets are always valid
 /// assert!(is_asset_valid(&Asset::Native, 25));
@@ -201,7 +201,7 @@ pub fn is_change_trust_asset_valid(asset: &ChangeTrustAsset, ledger_version: u32
                 return false;
             }
 
-            let stellar_xdr::curr::LiquidityPoolParameters::LiquidityPoolConstantProduct(cp) = lp;
+            let stellar_xdr::LiquidityPoolParameters::LiquidityPoolConstantProduct(cp) = lp;
 
             is_asset_valid(&cp.asset_a, ledger_version)
                 && is_asset_valid(&cp.asset_b, ledger_version)
@@ -237,7 +237,7 @@ impl std::error::Error for NoIssuerError {}
 ///
 /// ```rust
 /// use henyey_common::asset::get_issuer;
-/// use stellar_xdr::curr::Asset;
+/// use stellar_xdr::Asset;
 ///
 /// // Native assets have no issuer
 /// assert!(get_issuer(&Asset::Native).is_err());
@@ -367,8 +367,8 @@ pub fn add_balance(balance: i64, delta: i64, max_balance: i64) -> Option<i64> {
 /// Checks:
 /// 1. `balance + delta` must not overflow `i64::MAX` or go negative.
 /// 2. `new_balance` must not exceed `i64::MAX - buying_liabilities`.
-pub fn try_add_account_balance(acc: &mut stellar_xdr::curr::AccountEntry, delta: i64) -> bool {
-    use stellar_xdr::curr::AccountEntryExt;
+pub fn try_add_account_balance(acc: &mut stellar_xdr::AccountEntry, delta: i64) -> bool {
+    use stellar_xdr::AccountEntryExt;
 
     // 1. Overflow / underflow check via add_balance
     let new_balance = match add_balance(acc.balance, delta, i64::MAX) {
@@ -428,7 +428,7 @@ pub(crate) fn get_bucket_ledger_key(be: &BucketEntry) -> LedgerKey {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use stellar_xdr::curr::{AlphaNum12, AlphaNum4, PublicKey, Uint256};
+    use stellar_xdr::{AlphaNum12, AlphaNum4, PublicKey, Uint256};
 
     fn make_account_id(n: u8) -> AccountId {
         let mut bytes = [0u8; 32];

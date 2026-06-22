@@ -40,7 +40,7 @@
 
 use henyey_common::{asset::is_asset_valid, Hash256, NetworkId};
 use henyey_crypto::{PublicKey, Signature};
-use stellar_xdr::curr::{
+use stellar_xdr::{
     AccountEntry, DecoratedSignature, Limits, OperationBody, Preconditions, SignerKey,
     TransactionEnvelope, WriteXdr,
 };
@@ -83,9 +83,9 @@ fn check_xdr_depth(frame: &TransactionFrame) -> std::result::Result<(), PreSeqNu
 ///
 /// - `DepthLimitExceeded` → includes the configured limit value.
 /// - Any other XDR error → preserves the underlying error text.
-fn format_xdr_depth_error(err: stellar_xdr::curr::Error) -> PreSeqNumError {
+fn format_xdr_depth_error(err: stellar_xdr::Error) -> PreSeqNumError {
     match err {
-        stellar_xdr::curr::Error::DepthLimitExceeded => PreSeqNumError::Malformed(format!(
+        stellar_xdr::Error::DepthLimitExceeded => PreSeqNumError::Malformed(format!(
             "XDR depth limit exceeded (limit: {XDR_DEPTH_LIMIT})"
         )),
         other => PreSeqNumError::Malformed(format!("XDR depth check failed: {other}")),
@@ -244,7 +244,7 @@ impl LedgerContext {
     /// Whether liquidity pool trading is disabled by the ledger header flags.
     /// Mirrors stellar-core's `isPoolTradingDisabled()`.
     pub fn is_pool_trading_disabled(&self) -> bool {
-        use stellar_xdr::curr::LedgerHeaderFlags;
+        use stellar_xdr::LedgerHeaderFlags;
         self.ledger_flags & (LedgerHeaderFlags::TradingFlag as u32) != 0
     }
 }
@@ -654,7 +654,7 @@ fn validate_soroban_resources(
     }
 
     let footprint = &data.resources.footprint;
-    if let stellar_xdr::curr::SorobanTransactionDataExt::V1(resource_ext) = &data.ext {
+    if let stellar_xdr::SorobanTransactionDataExt::V1(resource_ext) = &data.ext {
         let mut prev: Option<u32> = None;
         for index in resource_ext.archived_soroban_entries.iter() {
             if let Some(prev_index) = prev {
@@ -697,10 +697,10 @@ fn validate_soroban_resources(
             // Valid: Account, Trustline, ContractData, ContractCode.
             // Invalid: Offer, Data, ClaimableBalance, LiquidityPool, ConfigSetting, Ttl.
             match key {
-                stellar_xdr::curr::LedgerKey::Account(_)
-                | stellar_xdr::curr::LedgerKey::Trustline(_)
-                | stellar_xdr::curr::LedgerKey::ContractData(_)
-                | stellar_xdr::curr::LedgerKey::ContractCode(_) => {}
+                stellar_xdr::LedgerKey::Account(_)
+                | stellar_xdr::LedgerKey::Trustline(_)
+                | stellar_xdr::LedgerKey::ContractData(_)
+                | stellar_xdr::LedgerKey::ContractCode(_) => {}
                 _ => {
                     return Err(ValidationError::InvalidStructure(
                         "unsupported ledger key type in Soroban footprint".to_string(),
@@ -829,7 +829,7 @@ fn available_balance_for_fee(
     base_reserve: u32,
     protocol_version: u32,
 ) -> i64 {
-    use stellar_xdr::curr::{AccountEntryExt, AccountEntryExtensionV1Ext};
+    use stellar_xdr::{AccountEntryExt, AccountEntryExtensionV1Ext};
 
     // minBalance = (2 + numSubEntries + numSponsoring − numSponsored) * base_reserve,
     // matching stellar-core `getMinBalance` / `henyey_ledger::fees::minimum_balance`.
@@ -946,7 +946,7 @@ fn fee_bump_inner_hash(
 ) -> std::result::Result<Hash256, String> {
     match frame.envelope() {
         TransactionEnvelope::TxFeeBump(env) => match &env.tx.inner_tx {
-            stellar_xdr::curr::FeeBumpTransactionInnerTx::Tx(inner) => {
+            stellar_xdr::FeeBumpTransactionInnerTx::Tx(inner) => {
                 let inner_env = TransactionEnvelope::Tx(inner.clone());
                 let inner_frame = TransactionFrame::from_owned_with_network(inner_env, *network_id);
                 inner_frame
@@ -991,10 +991,7 @@ fn has_ed25519_signature(
         .any(|sig| verify_signature_with_key(tx_hash, sig, pk))
 }
 
-fn has_hashx_signature(
-    signatures: &[DecoratedSignature],
-    key: &stellar_xdr::curr::Uint256,
-) -> bool {
+fn has_hashx_signature(signatures: &[DecoratedSignature], key: &stellar_xdr::Uint256) -> bool {
     signatures.iter().any(|sig| {
         // No length restriction on HashX preimages — stellar-core accepts any
         // length allowed by XDR and checks only sha256(preimage) == key.
@@ -1010,7 +1007,7 @@ fn has_hashx_signature(
 fn has_signed_payload_signature(
     _tx_hash: &Hash256,
     signatures: &[DecoratedSignature],
-    signed_payload: &stellar_xdr::curr::SignerKeyEd25519SignedPayload,
+    signed_payload: &stellar_xdr::SignerKeyEd25519SignedPayload,
 ) -> bool {
     signatures
         .iter()
@@ -1072,8 +1069,8 @@ pub enum PreSeqNumError {
 
 impl PreSeqNumError {
     /// Map to the corresponding `TransactionResultCode`.
-    pub fn to_tx_result_code(&self) -> stellar_xdr::curr::TransactionResultCode {
-        use stellar_xdr::curr::TransactionResultCode;
+    pub fn to_tx_result_code(&self) -> stellar_xdr::TransactionResultCode {
+        use stellar_xdr::TransactionResultCode;
         match self {
             Self::MissingOperation => TransactionResultCode::TxMissingOperation,
             Self::Malformed(_) => TransactionResultCode::TxMalformed,
@@ -1136,10 +1133,7 @@ pub fn check_valid_pre_seq_num_with_config(
     // (stellar-core: TransactionFrame.cpp commonValidPreSeqNum rejects
     // ENVELOPE_TYPE_TX_V0 with txNOT_SUPPORTED for protocol >= 13)
     if protocol_version >= 13 {
-        if matches!(
-            frame.envelope(),
-            stellar_xdr::curr::TransactionEnvelope::TxV0(_)
-        ) {
+        if matches!(frame.envelope(), stellar_xdr::TransactionEnvelope::TxV0(_)) {
             return Err(PreSeqNumError::OpNotSupported);
         }
     }
@@ -1268,7 +1262,7 @@ pub fn check_valid_pre_seq_num_with_config(
                         // 4e-i. WASM size gate
                         // stellar-core: InvokeHostFunctionOpFrame.cpp:1290-1299
                         if let Some(max_size) = soroban_limits.map(|l| l.max_contract_size_bytes) {
-                            if let stellar_xdr::curr::HostFunction::UploadContractWasm(wasm) =
+                            if let stellar_xdr::HostFunction::UploadContractWasm(wasm) =
                                 &invoke.host_function
                             {
                                 if wasm.len() > max_size as usize {
@@ -1282,10 +1276,10 @@ pub fn check_valid_pre_seq_num_with_config(
                         }
                         // 4e-ii. CreateContract fromAsset: validate asset code
                         // stellar-core: InvokeHostFunctionOpFrame.cpp:1301-1309
-                        if let stellar_xdr::curr::HostFunction::CreateContract(args) =
+                        if let stellar_xdr::HostFunction::CreateContract(args) =
                             &invoke.host_function
                         {
-                            if let stellar_xdr::curr::ContractIdPreimage::Asset(asset) =
+                            if let stellar_xdr::ContractIdPreimage::Asset(asset) =
                                 &args.contract_id_preimage
                             {
                                 if !is_asset_valid(asset, protocol_version) {
@@ -1312,7 +1306,7 @@ pub fn check_valid_pre_seq_num_with_config(
         // so fee-bump-wrapped classic txs with V1 extensions are correctly rejected.
         if protocol_version >= 21 {
             if let Some(tx) = frame.inner_tx() {
-                if tx.ext != stellar_xdr::curr::TransactionExt::V0 {
+                if tx.ext != stellar_xdr::TransactionExt::V0 {
                     return Err(PreSeqNumError::Malformed(
                         "classic transaction must not carry extension data".to_string(),
                     ));
@@ -1422,7 +1416,7 @@ fn check_soroban_resource_limits(
 
     // 8. Archived entry extension validation (protocol version check)
     // Parity: stellar-core TransactionFrame.cpp:990-1041
-    if let stellar_xdr::curr::SorobanTransactionDataExt::V1(_) = &data.ext {
+    if let stellar_xdr::SorobanTransactionDataExt::V1(_) = &data.ext {
         if protocol_version < 23 {
             return Err(PreSeqNumError::SorobanInvalid(
                 "SorobanResourcesExtV0 not supported before protocol 23".to_string(),
@@ -1440,8 +1434,8 @@ fn check_soroban_resource_limits(
 /// For other ops, only classic (non-Soroban) entries plus archived Soroban
 /// entries require disk reads.
 fn get_num_disk_read_entries(
-    resources: &stellar_xdr::curr::SorobanResources,
-    ext: &stellar_xdr::curr::SorobanTransactionDataExt,
+    resources: &stellar_xdr::SorobanResources,
+    ext: &stellar_xdr::SorobanTransactionDataExt,
     frame: &TransactionFrame,
 ) -> u64 {
     let is_restore = frame
@@ -1467,7 +1461,7 @@ fn get_num_disk_read_entries(
     }
 
     // Add archived Soroban entries (on-disk by definition)
-    if let stellar_xdr::curr::SorobanTransactionDataExt::V1(resource_ext) = ext {
+    if let stellar_xdr::SorobanTransactionDataExt::V1(resource_ext) = ext {
         count += resource_ext.archived_soroban_entries.len() as u64;
     }
 
@@ -1478,18 +1472,18 @@ fn get_num_disk_read_entries(
 ///
 /// Parity: stellar-core `footprintKeyIsValid` lambda (TransactionFrame.cpp:916-962).
 fn validate_footprint_key(
-    key: &stellar_xdr::curr::LedgerKey,
+    key: &stellar_xdr::LedgerKey,
     protocol_version: u32,
     limits: &SorobanResourceLimits,
 ) -> std::result::Result<(), PreSeqNumError> {
     match key {
-        stellar_xdr::curr::LedgerKey::Account(_)
-        | stellar_xdr::curr::LedgerKey::ContractData(_)
-        | stellar_xdr::curr::LedgerKey::ContractCode(_) => {}
-        stellar_xdr::curr::LedgerKey::Trustline(tl) => {
+        stellar_xdr::LedgerKey::Account(_)
+        | stellar_xdr::LedgerKey::ContractData(_)
+        | stellar_xdr::LedgerKey::ContractCode(_) => {}
+        stellar_xdr::LedgerKey::Trustline(tl) => {
             // stellar-core: reject native, self-issued, and invalid trustline assets
             if !henyey_common::asset::is_trustline_asset_valid(&tl.asset, protocol_version)
-                || matches!(tl.asset, stellar_xdr::curr::TrustLineAsset::Native)
+                || matches!(tl.asset, stellar_xdr::TrustLineAsset::Native)
                 || henyey_common::asset::is_trustline_asset_issuer(&tl.account_id, &tl.asset)
             {
                 return Err(PreSeqNumError::SorobanInvalid(
@@ -1520,7 +1514,7 @@ fn validate_footprint_key(
 mod tests {
     use super::*;
     use henyey_crypto::{sign_hash, SecretKey};
-    use stellar_xdr::curr::{
+    use stellar_xdr::{
         AccountEntry, AccountEntryExt, AccountId, Asset, ContractDataDurability, ContractId,
         DecoratedSignature, Duration, Hash, HostFunction, InvokeContractArgs, InvokeHostFunctionOp,
         LedgerBounds, LedgerFootprint, LedgerKey, LedgerKeyContractData, ManageDataOp, Memo,
@@ -1741,7 +1735,7 @@ mod tests {
 
     #[test]
     fn test_validate_soroban_archived_index_out_of_bounds() {
-        let key = LedgerKey::ContractCode(stellar_xdr::curr::LedgerKeyContractCode {
+        let key = LedgerKey::ContractCode(stellar_xdr::LedgerKeyContractCode {
             hash: Hash([3u8; 32]),
         });
         let envelope = create_soroban_envelope(vec![key], Some(vec![1]), true);
@@ -2004,7 +1998,7 @@ mod tests {
     /// After the fix it PASSES because available balance < fee.
     #[test]
     fn test_validate_full_rejects_insufficient_available_balance() {
-        use stellar_xdr::curr::{AccountEntryExtensionV1, AccountEntryExtensionV1Ext, Liabilities};
+        use stellar_xdr::{AccountEntryExtensionV1, AccountEntryExtensionV1Ext, Liabilities};
 
         let secret = SecretKey::from_seed(&[42u8; 32]);
         let account_id: AccountId = (&secret.public_key()).into();
@@ -2067,7 +2061,7 @@ mod tests {
     /// fee, `validate_full` must NOT push `InsufficientBalance`.
     #[test]
     fn test_validate_full_accepts_sufficient_available_balance() {
-        use stellar_xdr::curr::{AccountEntryExtensionV1, AccountEntryExtensionV1Ext, Liabilities};
+        use stellar_xdr::{AccountEntryExtensionV1, AccountEntryExtensionV1Ext, Liabilities};
 
         let secret = SecretKey::from_seed(&[43u8; 32]);
         let account_id: AccountId = (&secret.public_key()).into();
@@ -2124,9 +2118,7 @@ mod tests {
         // Build a deeply nested ScVal to exceed the 500-depth XDR limit.
         let mut val = ScVal::U32(42);
         for _ in 0..501 {
-            val = ScVal::Vec(Some(stellar_xdr::curr::ScVec(
-                vec![val].try_into().unwrap(),
-            )));
+            val = ScVal::Vec(Some(stellar_xdr::ScVec(vec![val].try_into().unwrap())));
         }
 
         let source = MuxedAccount::Ed25519(Uint256([1u8; 32]));
@@ -3091,11 +3083,10 @@ mod tests {
     fn test_check_valid_pre_seq_num_empty_signed_payload_extra_signer() {
         let source = MuxedAccount::Ed25519(Uint256([0u8; 32]));
         let dest = MuxedAccount::Ed25519(Uint256([1u8; 32]));
-        let signer =
-            SignerKey::Ed25519SignedPayload(stellar_xdr::curr::SignerKeyEd25519SignedPayload {
-                ed25519: Uint256([42u8; 32]),
-                payload: vec![].try_into().unwrap(),
-            });
+        let signer = SignerKey::Ed25519SignedPayload(stellar_xdr::SignerKeyEd25519SignedPayload {
+            ed25519: Uint256([42u8; 32]),
+            payload: vec![].try_into().unwrap(),
+        });
         let tx = Transaction {
             source_account: source,
             fee: 100,
@@ -3216,7 +3207,7 @@ mod tests {
         // Regression for #2059: a fee-bump envelope wrapping a classic inner tx
         // with TransactionExt::V1 must also be rejected on p21+, matching
         // stellar-core's inner-tx revalidation in FeeBumpTransactionFrame.cpp:307-309.
-        use stellar_xdr::curr::{
+        use stellar_xdr::{
             FeeBumpTransaction, FeeBumpTransactionEnvelope, FeeBumpTransactionExt,
             FeeBumpTransactionInnerTx,
         };
@@ -3285,7 +3276,7 @@ mod tests {
     fn test_check_valid_pre_seq_num_soroban_duplicate_footprint_key() {
         let source = MuxedAccount::Ed25519(Uint256([0u8; 32]));
         let dup_key = LedgerKey::ContractData(LedgerKeyContractData {
-            contract: ScAddress::Contract(stellar_xdr::curr::ContractId(Hash([99u8; 32]))),
+            contract: ScAddress::Contract(stellar_xdr::ContractId(Hash([99u8; 32]))),
             key: ScVal::Symbol(ScSymbol("test".try_into().unwrap())),
             durability: ContractDataDurability::Persistent,
         });
@@ -3312,7 +3303,7 @@ mod tests {
                 source_account: None,
                 body: OperationBody::InvokeHostFunction(InvokeHostFunctionOp {
                     host_function: HostFunction::InvokeContract(InvokeContractArgs {
-                        contract_address: ScAddress::Contract(stellar_xdr::curr::ContractId(Hash(
+                        contract_address: ScAddress::Contract(stellar_xdr::ContractId(Hash(
                             [1u8; 32],
                         ))),
                         function_name: ScSymbol("test".try_into().unwrap()),
@@ -3341,7 +3332,7 @@ mod tests {
     #[test]
     fn test_audit_074_hashx_extra_signer_non_32_byte_preimage() {
         use henyey_common::Hash256;
-        use stellar_xdr::curr::{DecoratedSignature, Signature, SignatureHint, Uint256};
+        use stellar_xdr::{DecoratedSignature, Signature, SignatureHint, Uint256};
 
         // 5-byte preimage "hello"
         let preimage = b"hello";
@@ -3390,7 +3381,7 @@ mod tests {
         // Regression: check_valid_pre_seq_num must validate ops against the inner
         // tx source, not the outer fee source. A payment from inner→dest is valid
         // when the inner source differs from the outer fee source.
-        use stellar_xdr::curr::{
+        use stellar_xdr::{
             FeeBumpTransaction, FeeBumpTransactionEnvelope, FeeBumpTransactionExt,
             FeeBumpTransactionInnerTx,
         };
@@ -3463,7 +3454,7 @@ mod tests {
     /// in the apply path and produce txFAILED with per-op results.
     #[test]
     fn test_pre_seq_num_does_not_reject_malformed_classic_ops() {
-        use stellar_xdr::curr::*;
+        use stellar_xdr::*;
 
         let source_key = Uint256([1u8; 32]);
         // ManageBuyOffer with same selling/buying asset: structurally invalid
@@ -3603,7 +3594,7 @@ mod tests {
     /// Fee-bump wrapping a Soroban inner tx with zero outer inclusion fee → rejected.
     #[test]
     fn test_validate_fee_fee_bump_soroban_zero_inclusion_fee() {
-        use stellar_xdr::curr::{
+        use stellar_xdr::{
             FeeBumpTransaction, FeeBumpTransactionEnvelope, FeeBumpTransactionExt,
             FeeBumpTransactionInnerTx,
         };
@@ -3946,7 +3937,7 @@ mod tests {
 
     #[test]
     fn test_validate_footprint_key_unsupported_type() {
-        use stellar_xdr::curr::LedgerKeyOffer;
+        use stellar_xdr::LedgerKeyOffer;
         let key = LedgerKey::Offer(LedgerKeyOffer {
             seller_id: AccountId(XdrPublicKey::PublicKeyTypeEd25519(Uint256([0u8; 32]))),
             offer_id: 1,
@@ -3961,7 +3952,7 @@ mod tests {
         let limits = permissive_limits();
 
         // Account key
-        let acct = LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
+        let acct = LedgerKey::Account(stellar_xdr::LedgerKeyAccount {
             account_id: AccountId(XdrPublicKey::PublicKeyTypeEd25519(Uint256([1u8; 32]))),
         });
         assert!(validate_footprint_key(&acct, 23, &limits).is_ok());
@@ -3986,7 +3977,7 @@ mod tests {
 
     #[test]
     fn test_validate_footprint_key_trustline_native_rejected() {
-        use stellar_xdr::curr::{LedgerKeyTrustLine, TrustLineAsset};
+        use stellar_xdr::{LedgerKeyTrustLine, TrustLineAsset};
         let key = LedgerKey::Trustline(LedgerKeyTrustLine {
             account_id: AccountId(XdrPublicKey::PublicKeyTypeEd25519(Uint256([1u8; 32]))),
             asset: TrustLineAsset::Native,
@@ -3997,7 +3988,7 @@ mod tests {
 
     #[test]
     fn test_validate_footprint_key_trustline_self_issued_rejected() {
-        use stellar_xdr::curr::{AlphaNum4, AssetCode4, LedgerKeyTrustLine, TrustLineAsset};
+        use stellar_xdr::{AlphaNum4, AssetCode4, LedgerKeyTrustLine, TrustLineAsset};
         let issuer_bytes = [7u8; 32];
         let key = LedgerKey::Trustline(LedgerKeyTrustLine {
             account_id: AccountId(XdrPublicKey::PublicKeyTypeEd25519(Uint256(issuer_bytes))),
@@ -4012,7 +4003,7 @@ mod tests {
 
     #[test]
     fn test_validate_footprint_key_trustline_valid() {
-        use stellar_xdr::curr::{AlphaNum4, AssetCode4, LedgerKeyTrustLine, TrustLineAsset};
+        use stellar_xdr::{AlphaNum4, AssetCode4, LedgerKeyTrustLine, TrustLineAsset};
         let key = LedgerKey::Trustline(LedgerKeyTrustLine {
             account_id: AccountId(XdrPublicKey::PublicKeyTypeEd25519(Uint256([1u8; 32]))),
             asset: TrustLineAsset::CreditAlphanum4(AlphaNum4 {
@@ -4026,7 +4017,7 @@ mod tests {
 
     #[test]
     fn test_get_num_disk_read_entries_restore_footprint() {
-        use stellar_xdr::curr::RestoreFootprintOp;
+        use stellar_xdr::RestoreFootprintOp;
         let rw = vec![
             contract_data_key(1),
             contract_data_key(2),
@@ -4040,7 +4031,7 @@ mod tests {
             rw,
             SorobanTransactionDataExt::V0,
             OperationBody::RestoreFootprint(RestoreFootprintOp {
-                ext: stellar_xdr::curr::ExtensionPoint::V0,
+                ext: stellar_xdr::ExtensionPoint::V0,
             }),
         );
         let data = frame.soroban_data().unwrap();
@@ -4073,7 +4064,7 @@ mod tests {
 
     #[test]
     fn test_get_num_disk_read_entries_classic_keys_counted() {
-        use stellar_xdr::curr::LedgerKeyAccount;
+        use stellar_xdr::LedgerKeyAccount;
         // Account keys are classic (non-Soroban) → counted as disk reads at v23+
         let acct_key = LedgerKey::Account(LedgerKeyAccount {
             account_id: AccountId(XdrPublicKey::PublicKeyTypeEd25519(Uint256([5u8; 32]))),
@@ -4100,7 +4091,7 @@ mod tests {
 
     #[test]
     fn test_xdr_depth_error_message_includes_limit() {
-        let err = stellar_xdr::curr::Error::DepthLimitExceeded;
+        let err = stellar_xdr::Error::DepthLimitExceeded;
         let result = format_xdr_depth_error(err);
         assert_eq!(
             result,
@@ -4122,7 +4113,7 @@ mod tests {
 
     #[test]
     fn test_xdr_depth_error_message_preserves_non_depth_xdr_error() {
-        let err = stellar_xdr::curr::Error::LengthLimitExceeded;
+        let err = stellar_xdr::Error::LengthLimitExceeded;
         let expected_inner = format!("{err}");
         let result = format_xdr_depth_error(err);
         let msg = match &result {

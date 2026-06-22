@@ -3,7 +3,7 @@
 //! This module implements the execution logic for the ManageData operation,
 //! which allows accounts to attach arbitrary key-value data.
 
-use stellar_xdr::curr::{
+use stellar_xdr::{
     AccountId, DataEntry, DataEntryExt, LedgerKey, LedgerKeyData, ManageDataOp, ManageDataResult,
     ManageDataResultCode, OperationResult, OperationResultTr,
 };
@@ -190,7 +190,7 @@ fn is_string_valid(bytes: &[u8]) -> bool {
 mod tests {
     use super::*;
     use crate::test_utils::create_test_account_id;
-    use stellar_xdr::curr::*;
+    use stellar_xdr::*;
 
     fn create_test_account(account_id: AccountId, balance: i64) -> AccountEntry {
         AccountEntry {

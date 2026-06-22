@@ -6,7 +6,7 @@ use std::sync::Arc;
 use henyey_common::protocol::LclContext;
 use henyey_common::Hash256;
 use henyey_ledger::{HeaderSnapshot, LedgerCloseData, LedgerManager};
-use stellar_xdr::curr::{
+use stellar_xdr::{
     LedgerHeader, LedgerHeaderHistoryEntry, LedgerUpgrade, Limits, ReadXdr, WriteXdr,
 };
 use tracing::{debug, info, warn};
@@ -351,7 +351,7 @@ impl CatchupManager {
             // unused. Use a zero placeholder rather than recomputing the header
             // hash for a synthetic entry that we discard immediately.
             let virtual_entry = LedgerHeaderHistoryEntry {
-                hash: stellar_xdr::curr::Hash([0; 32]),
+                hash: stellar_xdr::Hash([0; 32]),
                 header,
                 ext: Default::default(),
             };
@@ -442,7 +442,7 @@ impl CatchupManager {
             if let Some(result_entry) = data.tx_result_entry() {
                 let xdr = result_entry
                     .tx_result_set
-                    .to_xdr(stellar_xdr::curr::Limits::none())
+                    .to_xdr(stellar_xdr::Limits::none())
                     .map_err(|e| {
                         HistoryError::CatchupFailed(format!(
                             "Failed to serialize tx result set for ledger {}: {}",
@@ -876,10 +876,10 @@ mod tests {
     /// hash, and `lcl_prev_hash` is what the LCL header's
     /// `previous_ledger_hash` field carries (i.e. the hash of LCL-1).
     fn make_test_lcl(lcl_seq: u32, lcl_hash: Hash256, lcl_prev_hash: Hash256) -> HeaderSnapshot {
-        use stellar_xdr::curr::LedgerHeader;
+        use stellar_xdr::LedgerHeader;
         let mut header = LedgerHeader::default();
         header.ledger_seq = lcl_seq;
-        header.previous_ledger_hash = stellar_xdr::curr::Hash(lcl_prev_hash.0);
+        header.previous_ledger_hash = stellar_xdr::Hash(lcl_prev_hash.0);
         HeaderSnapshot {
             header,
             hash: lcl_hash,
@@ -894,13 +894,13 @@ mod tests {
         seq: u32,
         entry_hash: Hash256,
         entry_prev: Hash256,
-    ) -> stellar_xdr::curr::LedgerHeaderHistoryEntry {
-        use stellar_xdr::curr::{LedgerHeader, LedgerHeaderHistoryEntry};
+    ) -> stellar_xdr::LedgerHeaderHistoryEntry {
+        use stellar_xdr::{LedgerHeader, LedgerHeaderHistoryEntry};
         let mut header = LedgerHeader::default();
         header.ledger_seq = seq;
-        header.previous_ledger_hash = stellar_xdr::curr::Hash(entry_prev.0);
+        header.previous_ledger_hash = stellar_xdr::Hash(entry_prev.0);
         LedgerHeaderHistoryEntry {
-            hash: stellar_xdr::curr::Hash(entry_hash.0),
+            hash: stellar_xdr::Hash(entry_hash.0),
             header,
             ext: Default::default(),
         }
@@ -1133,11 +1133,11 @@ mod tests {
     /// out of `verify_knit_to_lcl` later.
     fn make_apply_ledger_data(seq: u32, prev_hash: Hash256) -> LedgerData {
         use henyey_common::protocol::LclContext;
-        use stellar_xdr::curr::LedgerHeader;
+        use stellar_xdr::LedgerHeader;
 
         let mut header = LedgerHeader::default();
         header.ledger_seq = seq;
-        header.previous_ledger_hash = stellar_xdr::curr::Hash(prev_hash.0);
+        header.previous_ledger_hash = stellar_xdr::Hash(prev_hash.0);
 
         let lcl = LclContext::new(0, prev_hash);
         LedgerData::new(header, None, None, &lcl).expect("valid LedgerData")
@@ -1331,7 +1331,7 @@ mod tests {
     /// After fix: the error propagates, halting replay.
     #[test]
     fn test_audit_yh2_tx_set_mismatch_is_error() {
-        use stellar_xdr::curr::{Hash, LedgerHeader, StellarValue, TransactionSet};
+        use stellar_xdr::{Hash, LedgerHeader, StellarValue, TransactionSet};
 
         // Create a header with a specific tx_set_hash
         let mut header = LedgerHeader::default();
@@ -1360,7 +1360,7 @@ mod tests {
     /// [AUDIT-YH2] verify_tx_result_set must return a fatal error for mismatched result hashes.
     #[test]
     fn test_audit_yh2_tx_result_set_mismatch_is_error() {
-        use stellar_xdr::curr::{Hash, LedgerHeader};
+        use stellar_xdr::{Hash, LedgerHeader};
 
         let mut header = LedgerHeader::default();
         header.ledger_seq = 100;
@@ -1451,7 +1451,7 @@ mod tests {
     ) -> (Vec<super::LedgerData>, Hash256) {
         use crate::verify::compute_header_hash;
         use henyey_common::protocol::LclContext;
-        use stellar_xdr::curr::{Hash, StellarValue, TimePoint, VecM};
+        use stellar_xdr::{Hash, StellarValue, TimePoint, VecM};
 
         let mut entries = Vec::with_capacity(count as usize);
         let mut prev_hash = Hash256::ZERO;
@@ -1466,7 +1466,7 @@ mod tests {
                     tx_set_hash: Hash([0u8; 32]),
                     close_time: TimePoint(0),
                     upgrades: VecM::default(),
-                    ext: stellar_xdr::curr::StellarValueExt::Basic,
+                    ext: stellar_xdr::StellarValueExt::Basic,
                 },
                 tx_set_result_hash: Hash([0u8; 32]),
                 bucket_list_hash: Hash([0u8; 32]),
@@ -1479,7 +1479,7 @@ mod tests {
                 base_reserve: 5000000,
                 max_tx_set_size: 100,
                 skip_list: std::array::from_fn(|_| Hash([0u8; 32])),
-                ext: stellar_xdr::curr::LedgerHeaderExt::V0,
+                ext: stellar_xdr::LedgerHeaderExt::V0,
             };
 
             let lcl_context = LclContext::new(25, prev_hash);
@@ -1919,7 +1919,7 @@ mod tests {
     /// helper — valid case, mismatched tx-set hash, and absent-result skip.
     #[test]
     fn test_verify_txsets_valid_mismatch_and_absent_skip() {
-        use stellar_xdr::curr::{Hash, StellarValue, TransactionSet};
+        use stellar_xdr::{Hash, StellarValue, TransactionSet};
 
         let (_tmp_dir, manager) = make_test_catchup_manager();
 
@@ -1980,7 +1980,7 @@ mod tests {
     #[test]
     fn test_header_chain_verified_over_full_range_before_replay() {
         use crate::verify::compute_header_hash;
-        use stellar_xdr::curr::Hash;
+        use stellar_xdr::Hash;
 
         let tmpdir = tempfile::tempdir().unwrap();
         let bucket_manager =

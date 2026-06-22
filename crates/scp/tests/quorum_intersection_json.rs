@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use henyey_scp::quorum_config::parse_node_id;
 use henyey_scp::{is_quorum, is_quorum_slice};
 use serde::Deserialize;
-use stellar_xdr::curr::{NodeId, ScpQuorumSet};
+use stellar_xdr::{NodeId, ScpQuorumSet};
 
 #[derive(Debug, Deserialize)]
 struct QuorumIntersectionJson {

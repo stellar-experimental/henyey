@@ -122,29 +122,27 @@ impl fmt::Display for PublicKey {
     }
 }
 
-impl TryFrom<&stellar_xdr::curr::PublicKey> for PublicKey {
+impl TryFrom<&stellar_xdr::PublicKey> for PublicKey {
     type Error = CryptoError;
 
-    fn try_from(xdr: &stellar_xdr::curr::PublicKey) -> Result<Self, Self::Error> {
+    fn try_from(xdr: &stellar_xdr::PublicKey) -> Result<Self, Self::Error> {
         match xdr {
-            stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(stellar_xdr::curr::Uint256(
-                bytes,
-            )) => Self::from_bytes(bytes),
+            stellar_xdr::PublicKey::PublicKeyTypeEd25519(stellar_xdr::Uint256(bytes)) => {
+                Self::from_bytes(bytes)
+            }
         }
     }
 }
 
-impl From<&PublicKey> for stellar_xdr::curr::PublicKey {
+impl From<&PublicKey> for stellar_xdr::PublicKey {
     fn from(pk: &PublicKey) -> Self {
-        stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(stellar_xdr::curr::Uint256(
-            *pk.as_bytes(),
-        ))
+        stellar_xdr::PublicKey::PublicKeyTypeEd25519(stellar_xdr::Uint256(*pk.as_bytes()))
     }
 }
 
-impl From<&PublicKey> for stellar_xdr::curr::AccountId {
+impl From<&PublicKey> for stellar_xdr::AccountId {
     fn from(pk: &PublicKey) -> Self {
-        stellar_xdr::curr::AccountId(pk.into())
+        stellar_xdr::AccountId(pk.into())
     }
 }
 
@@ -273,9 +271,9 @@ impl Clone for SecretKey {
 ///
 /// This is a convenience function for converting the XDR AccountId type
 /// directly to a human-readable strkey format, suitable for logging.
-pub fn account_id_to_strkey(account_id: &stellar_xdr::curr::AccountId) -> String {
+pub fn account_id_to_strkey(account_id: &stellar_xdr::AccountId) -> String {
     match &account_id.0 {
-        stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(stellar_xdr::curr::Uint256(bytes)) => {
+        stellar_xdr::PublicKey::PublicKeyTypeEd25519(stellar_xdr::Uint256(bytes)) => {
             stellar_strkey::ed25519::PublicKey(*bytes).to_string()
         }
     }
@@ -309,11 +307,11 @@ impl fmt::Debug for Signature {
     }
 }
 
-impl From<Signature> for stellar_xdr::curr::Signature {
+impl From<Signature> for stellar_xdr::Signature {
     fn from(sig: Signature) -> Self {
         // Safety: Signature is always exactly 64 bytes, which is within
         // the XDR Signature's BytesM::<64> limit.
-        stellar_xdr::curr::Signature(
+        stellar_xdr::Signature(
             sig.0
                 .try_into()
                 .expect("64-byte signature always fits in BytesM::<64>"),
@@ -321,10 +319,10 @@ impl From<Signature> for stellar_xdr::curr::Signature {
     }
 }
 
-impl TryFrom<&stellar_xdr::curr::Signature> for Signature {
+impl TryFrom<&stellar_xdr::Signature> for Signature {
     type Error = CryptoError;
 
-    fn try_from(xdr: &stellar_xdr::curr::Signature) -> Result<Self, Self::Error> {
+    fn try_from(xdr: &stellar_xdr::Signature) -> Result<Self, Self::Error> {
         let bytes: [u8; 64] =
             xdr.0
                 .as_slice()

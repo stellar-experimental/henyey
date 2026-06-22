@@ -4,7 +4,7 @@ use std::rc::Rc;
 
 use henyey_bucket::SearchableBucketListSnapshot;
 use soroban_env_host_p25 as soroban_host;
-use stellar_xdr::curr::{
+use stellar_xdr::{
     AccountEntryExt, AccountEntryExtensionV1, AccountEntryExtensionV1Ext, AccountEntryExtensionV2,
     AccountEntryExtensionV2Ext, AccountEntryExtensionV3, ExtensionPoint, LedgerEntry,
     LedgerEntryData, LedgerKey, Liabilities, SponsorshipDescriptor, TimePoint,
@@ -125,9 +125,7 @@ fn get_entry_ttl(
 
     match snapshot.load_result(&ttl_key)? {
         Some(entry) => match entry.data {
-            stellar_xdr::curr::LedgerEntryData::Ttl(ttl_data) => {
-                Ok(Some(ttl_data.live_until_ledger_seq))
-            }
+            stellar_xdr::LedgerEntryData::Ttl(ttl_data) => Ok(Some(ttl_data.live_until_ledger_seq)),
             _ => Ok(None),
         },
         None => Ok(None),
@@ -156,7 +154,7 @@ fn normalize_entry(entry: &mut LedgerEntry) {
 /// Upgrade an `AccountEntry`'s extension chain to V3.
 ///
 /// Mirrors `update_account_entry` from `soroban-simulation/src/snapshot_source.rs`.
-fn update_account_entry(account_entry: &mut stellar_xdr::curr::AccountEntry) {
+fn update_account_entry(account_entry: &mut stellar_xdr::AccountEntry) {
     match &mut account_entry.ext {
         AccountEntryExt::V0 => {
             let mut ext = AccountEntryExtensionV1 {
@@ -209,7 +207,7 @@ fn fill_account_ext_v3(account_ext_v2: &mut AccountEntryExtensionV2) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use stellar_xdr::curr::{
+    use stellar_xdr::{
         AccountEntry, AccountEntryExt, AccountEntryExtensionV1, AccountEntryExtensionV1Ext,
         AccountEntryExtensionV2, AccountEntryExtensionV2Ext, AccountEntryExtensionV3, AccountId,
         ContractDataDurability, ContractDataEntry, ContractId, ExtensionPoint, Hash, Int128Parts,

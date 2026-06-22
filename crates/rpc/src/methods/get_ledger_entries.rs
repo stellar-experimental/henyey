@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use serde_json::json;
-use stellar_xdr::curr::{LedgerEntry, LedgerKey, Limits, ReadXdr, WriteXdr};
+use stellar_xdr::{LedgerEntry, LedgerKey, Limits, ReadXdr, WriteXdr};
 
 use crate::context::RpcContext;
 use crate::error::JsonRpcError;
@@ -162,15 +162,15 @@ pub(crate) async fn handle(
 /// For contract data and contract code entries, build the corresponding TTL key.
 fn ttl_key_for_entry(entry: &LedgerEntry) -> Option<LedgerKey> {
     let entry_key = match &entry.data {
-        stellar_xdr::curr::LedgerEntryData::ContractData(data) => {
-            LedgerKey::ContractData(stellar_xdr::curr::LedgerKeyContractData {
+        stellar_xdr::LedgerEntryData::ContractData(data) => {
+            LedgerKey::ContractData(stellar_xdr::LedgerKeyContractData {
                 contract: data.contract.clone(),
                 key: data.key.clone(),
                 durability: data.durability,
             })
         }
-        stellar_xdr::curr::LedgerEntryData::ContractCode(code) => {
-            LedgerKey::ContractCode(stellar_xdr::curr::LedgerKeyContractCode {
+        stellar_xdr::LedgerEntryData::ContractCode(code) => {
+            LedgerKey::ContractCode(stellar_xdr::LedgerKeyContractCode {
                 hash: code.hash.clone(),
             })
         }
@@ -190,7 +190,7 @@ fn lookup_ttl(
     let Some(ttl_entry) = snapshot.load_result(&ttl_key)? else {
         return Ok(None);
     };
-    if let stellar_xdr::curr::LedgerEntryData::Ttl(ttl_data) = &ttl_entry.data {
+    if let stellar_xdr::LedgerEntryData::Ttl(ttl_data) = &ttl_entry.data {
         Ok(Some(ttl_data.live_until_ledger_seq))
     } else {
         Ok(None)
@@ -200,7 +200,7 @@ fn lookup_ttl(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use stellar_xdr::curr::{
+    use stellar_xdr::{
         AccountId, LedgerKeyAccount, LedgerKeyContractCode, PublicKey, Uint256, WriteXdr,
     };
 
@@ -217,7 +217,7 @@ mod tests {
 
     fn contract_code_key(byte: u8) -> LedgerKey {
         LedgerKey::ContractCode(LedgerKeyContractCode {
-            hash: stellar_xdr::curr::Hash([byte; 32]),
+            hash: stellar_xdr::Hash([byte; 32]),
         })
     }
 

@@ -26,7 +26,7 @@ use henyey_tx::operations::execute::{
     adjust_offer_amount, exchange_v10_without_price_error_thresholds, ExchangeResult, RoundingType,
 };
 use std::collections::{BTreeMap, HashMap, HashSet};
-use stellar_xdr::curr::{
+use stellar_xdr::{
     AccountEntry, AccountEntryExt, AccountEntryExtensionV1, AccountEntryExtensionV1Ext,
     AccountEntryExtensionV2, AccountEntryExtensionV2Ext, AccountId, Asset, LedgerEntry,
     LedgerEntryData, LedgerEntryExt, LedgerKey, LedgerKeyAccount, LedgerKeyTrustLine, Liabilities,
@@ -466,9 +466,9 @@ fn ensure_trustline_liabilities(trustline: &mut TrustLineEntry) -> &mut Liabilit
 }
 
 /// Build a default signer_sponsoring_ids vector of None values.
-fn build_signer_sponsoring_ids(count: usize) -> VecM<stellar_xdr::curr::SponsorshipDescriptor, 20> {
-    let ids: Vec<stellar_xdr::curr::SponsorshipDescriptor> = (0..count)
-        .map(|_| stellar_xdr::curr::SponsorshipDescriptor(None))
+fn build_signer_sponsoring_ids(count: usize) -> VecM<stellar_xdr::SponsorshipDescriptor, 20> {
+    let ids: Vec<stellar_xdr::SponsorshipDescriptor> = (0..count)
+        .map(|_| stellar_xdr::SponsorshipDescriptor(None))
         .collect();
     ids.try_into().unwrap_or_default()
 }
@@ -485,9 +485,9 @@ fn make_trustline_key(account_id: &AccountId, asset: &Asset) -> LedgerKey {
 ///
 /// Matches stellar-core's `isAuthorizedToMaintainLiabilities` check.
 fn is_authorized_to_maintain_liabilities_tl(tl: &TrustLineEntry) -> bool {
-    const AUTHORIZED_FLAG: u32 = stellar_xdr::curr::TrustLineFlags::AuthorizedFlag as u32;
+    const AUTHORIZED_FLAG: u32 = stellar_xdr::TrustLineFlags::AuthorizedFlag as u32;
     const AUTH_LIAB_FLAG: u32 =
-        stellar_xdr::curr::TrustLineFlags::AuthorizedToMaintainLiabilitiesFlag as u32;
+        stellar_xdr::TrustLineFlags::AuthorizedToMaintainLiabilitiesFlag as u32;
     tl.flags & (AUTHORIZED_FLAG | AUTH_LIAB_FLAG) != 0
 }
 

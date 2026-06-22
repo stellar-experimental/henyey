@@ -323,7 +323,7 @@ pub(crate) async fn compat_upgrades_handler(
         if let Some(key_str) = params.get("configupgradesetkey") {
             // configupgradesetkey is a base64-encoded ConfigUpgradeSetKey XDR
             use base64::{engine::general_purpose::STANDARD, Engine};
-            use stellar_xdr::curr::{ConfigUpgradeSetKey, Limits, ReadXdr};
+            use stellar_xdr::{ConfigUpgradeSetKey, Limits, ReadXdr};
             if let Ok(bytes) = STANDARD.decode(key_str) {
                 if let Ok(key) = ConfigUpgradeSetKey::from_xdr(&bytes, Limits::none()) {
                     upgrade_params.config_upgrade_set_key = Some(
@@ -1045,9 +1045,9 @@ mod tests {
 
     /// Build the base64-encoded `configupgradesetkey` XDR that SSC sends, and
     /// return both the wire string and the decoded key for round-trip checks.
-    fn ssc_config_upgrade_set_key() -> (String, stellar_xdr::curr::ConfigUpgradeSetKey) {
+    fn ssc_config_upgrade_set_key() -> (String, stellar_xdr::ConfigUpgradeSetKey) {
         use base64::{engine::general_purpose::STANDARD, Engine};
-        use stellar_xdr::curr::{ConfigUpgradeSetKey, ContractId, Hash, Limits, WriteXdr};
+        use stellar_xdr::{ConfigUpgradeSetKey, ContractId, Hash, Limits, WriteXdr};
         let key = ConfigUpgradeSetKey {
             contract_id: ContractId(Hash([0xAB; 32])),
             content_hash: Hash([0xCD; 32]),

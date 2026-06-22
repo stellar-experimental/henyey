@@ -2,7 +2,7 @@ use flate2::{write::GzEncoder, Compression};
 use henyey_history::download::{
     decompress_gzip, parse_record_marked_xdr_stream_or_empty, parse_xdr_stream,
 };
-use stellar_xdr::curr::{
+use stellar_xdr::{
     Hash, LedgerHeader, LedgerHeaderExt, LedgerHeaderHistoryEntry, LedgerHeaderHistoryEntryExt,
     StellarValue, StellarValueExt, TimePoint, VecM, WriteXdr,
 };
@@ -72,16 +72,8 @@ fn test_parse_xdr_stream_raw() {
     let entry_a = make_header(63);
     let entry_b = make_header(64);
     let mut stream = Vec::new();
-    stream.extend_from_slice(
-        &entry_a
-            .to_xdr(stellar_xdr::curr::Limits::none())
-            .expect("xdr a"),
-    );
-    stream.extend_from_slice(
-        &entry_b
-            .to_xdr(stellar_xdr::curr::Limits::none())
-            .expect("xdr b"),
-    );
+    stream.extend_from_slice(&entry_a.to_xdr(stellar_xdr::Limits::none()).expect("xdr a"));
+    stream.extend_from_slice(&entry_b.to_xdr(stellar_xdr::Limits::none()).expect("xdr b"));
 
     let parsed = parse_xdr_stream::<LedgerHeaderHistoryEntry>(&stream).expect("parse");
     assert_eq!(parsed.len(), 2);
@@ -93,12 +85,8 @@ fn test_parse_xdr_stream_raw() {
 fn test_parse_xdr_stream_record_marked() {
     let entry_a = make_header(127);
     let entry_b = make_header(128);
-    let entry_a_xdr = entry_a
-        .to_xdr(stellar_xdr::curr::Limits::none())
-        .expect("xdr a");
-    let entry_b_xdr = entry_b
-        .to_xdr(stellar_xdr::curr::Limits::none())
-        .expect("xdr b");
+    let entry_a_xdr = entry_a.to_xdr(stellar_xdr::Limits::none()).expect("xdr a");
+    let entry_b_xdr = entry_b.to_xdr(stellar_xdr::Limits::none()).expect("xdr b");
 
     let mut stream = Vec::new();
     stream.extend_from_slice(&record_marked(&entry_a_xdr));

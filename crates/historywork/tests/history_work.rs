@@ -18,7 +18,7 @@ use henyey_history::{
 use henyey_historywork::{HistoryWorkBuilder, HistoryWorkState};
 use henyey_ledger::TransactionSetVariant;
 use henyey_work::{WorkScheduler, WorkSchedulerConfig};
-use stellar_xdr::curr::{
+use stellar_xdr::{
     Hash, LedgerHeader, LedgerHeaderExt, LedgerHeaderHistoryEntry, LedgerHeaderHistoryEntryExt,
     LedgerScpMessages, ScpHistoryEntry, ScpHistoryEntryV0, StellarValue, StellarValueExt,
     TimePoint, TransactionHistoryEntry, TransactionHistoryEntryExt, TransactionHistoryResultEntry,
@@ -96,7 +96,7 @@ async fn test_history_work_chain() {
         results: VecM::default(),
     };
     let tx_result_xdr = tx_result_set
-        .to_xdr(stellar_xdr::curr::Limits::none())
+        .to_xdr(stellar_xdr::Limits::none())
         .expect("tx result xdr");
     let tx_result_hash = Hash256::hash(&tx_result_xdr);
 
@@ -108,7 +108,7 @@ async fn test_history_work_chain() {
         ext: LedgerHeaderHistoryEntryExt::default(),
     };
     let header_xdr_raw = header_entry
-        .to_xdr(stellar_xdr::curr::Limits::none())
+        .to_xdr(stellar_xdr::Limits::none())
         .expect("xdr");
     let header_xdr = record_marked(&[header_xdr_raw]);
 
@@ -163,7 +163,7 @@ async fn test_history_work_chain() {
         ext: TransactionHistoryEntryExt::default(),
     };
     let tx_entry_xdr_raw = tx_entry
-        .to_xdr(stellar_xdr::curr::Limits::none())
+        .to_xdr(stellar_xdr::Limits::none())
         .expect("tx entry xdr");
     let tx_entry_xdr = record_marked(&[tx_entry_xdr_raw]);
     fixtures.insert(
@@ -177,7 +177,7 @@ async fn test_history_work_chain() {
         ext: TransactionHistoryResultEntryExt::default(),
     };
     let tx_result_entry_xdr_raw = tx_result_entry
-        .to_xdr(stellar_xdr::curr::Limits::none())
+        .to_xdr(stellar_xdr::Limits::none())
         .expect("tx result entry xdr");
     let tx_result_entry_xdr = record_marked(&[tx_result_entry_xdr_raw]);
     fixtures.insert(
@@ -193,7 +193,7 @@ async fn test_history_work_chain() {
         },
     });
     let scp_entry_xdr_raw = scp_entry
-        .to_xdr(stellar_xdr::curr::Limits::none())
+        .to_xdr(stellar_xdr::Limits::none())
         .expect("scp entry xdr");
     let scp_entry_xdr = record_marked(&[scp_entry_xdr_raw]);
     fixtures.insert(

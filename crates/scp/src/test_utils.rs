@@ -7,7 +7,7 @@
 use crate::driver::{SCPDriver, ValidationLevel};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
-use stellar_xdr::curr::{NodeId, PublicKey, ScpBallot, ScpEnvelope, ScpQuorumSet, Uint256, Value};
+use stellar_xdr::{NodeId, PublicKey, ScpBallot, ScpEnvelope, ScpQuorumSet, Uint256, Value};
 
 // ---------------------------------------------------------------------------
 // MockDriver — configurable mock for SCPDriver

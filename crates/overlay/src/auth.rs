@@ -41,7 +41,7 @@ use henyey_common::Hash256;
 use henyey_crypto::PublicKey;
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
-use stellar_xdr::curr::{
+use stellar_xdr::{
     self as xdr, AuthenticatedMessage, AuthenticatedMessageV0, Curve25519Public, EnvelopeType,
     Hello, HmacSha256Key, HmacSha256Mac, StellarMessage, Uint256, WriteXdr,
 };
@@ -1362,7 +1362,7 @@ mod tests {
 
     #[test]
     fn test_auth_cert_xdr_roundtrip() {
-        use stellar_xdr::curr::ReadXdr;
+        use stellar_xdr::ReadXdr;
 
         let secret = SecretKey::generate();
         let local_node = LocalNode::new_testnet(secret);
@@ -2034,7 +2034,7 @@ mod tests {
 #[test]
 fn test_auth_cert_signing_parity() {
     use henyey_common::{Hash256, NetworkId};
-    use stellar_xdr::curr::{EnvelopeType, Limits, WriteXdr};
+    use stellar_xdr::{EnvelopeType, Limits, WriteXdr};
     // 1. EnvelopeType::Auth must have XDR value 3, matching stellar-core.
     assert_eq!(EnvelopeType::Auth as i32, 3);
     let xdr = EnvelopeType::Auth.to_xdr(Limits::none()).unwrap();
@@ -2065,10 +2065,10 @@ fn test_auth_cert_signing_parity() {
         .verify(hash.as_bytes(), &sig)
         .expect("signature must verify");
     // 4. Verify using the same path that AuthCertExt::verify uses.
-    let cert = stellar_xdr::curr::AuthCert {
-        pubkey: stellar_xdr::curr::Curve25519Public { key: x25519_pub },
+    let cert = stellar_xdr::AuthCert {
+        pubkey: stellar_xdr::Curve25519Public { key: x25519_pub },
         expiration,
-        sig: stellar_xdr::curr::Signature(sig.as_bytes().to_vec().try_into().unwrap()),
+        sig: stellar_xdr::Signature(sig.as_bytes().to_vec().try_into().unwrap()),
     };
     cert.verify(&network_id, &pubkey)
         .expect("cert verify must succeed");
