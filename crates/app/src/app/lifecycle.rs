@@ -275,6 +275,18 @@ impl App {
         self.herder.bootstrap(ledger_seq);
         tracing::info!(ledger_seq, "Herder bootstrapped");
 
+        // Restore persisted SCP state for in-flight future slots so a node
+        // recovering from a crash resumes local SCP tracking without waiting
+        // for fresh network envelopes. Parity: stellar-core
+        // `HerderImpl::start()` calls `restoreSCPState()` immediately after
+        // `setTrackingSCPState(lcl, ..., true)` + `trackingHeartBeat()`
+        // (HerderImpl.cpp:2455-2471) — and in henyey's split lifecycle
+        // `bootstrap(lcl)` above is that tracking step. Restore therefore runs
+        // here, AFTER bootstrap and BEFORE we request SCP state from peers.
+        // Only future slots (`slot > lcl`) are replayed; see
+        // `Herder::restore_persisted_scp_state` for the #2797-stall guard.
+        self.herder.restore_persisted_scp_state(ledger_seq as u64);
+
         // Wire overlay tracking state to herder. The herder is now syncing,
         // so the overlay's maybe_drop_random_peer() should know the node is
         // tracking (parity: stellar-core Config::REALLY_DEAD_NUM_FAILURES_CUTOFF

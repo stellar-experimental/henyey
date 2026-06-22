@@ -223,6 +223,23 @@ impl QuorumSetTracker {
         inner.associate_known_qset(key, hash, quorum_set);
     }
 
+    /// Store a validated qset by its hash only, WITHOUT associating it with
+    /// any node.
+    ///
+    /// Used by the startup SCP-state restore path (#2769): persisted quorum
+    /// sets are rehydrated by hash so that `set_state_from_envelope` and the
+    /// transitive-quorum rebuild can resolve companion-qset-hash lookups,
+    /// mirroring stellar-core's `PendingEnvelopes::addSCPQuorumSet` →
+    /// `putQSet` which stores by hash in `mQsetCache` without a NodeID
+    /// association. Inserting only into `by_hash` (and clearing any pending
+    /// entry for the hash) preserves the invariant that a hash present in
+    /// `by_hash` is not also pending.
+    pub fn store_by_hash(&self, hash: Hash256, quorum_set: ScpQuorumSet) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.by_hash.put(hash, quorum_set);
+        inner.pending.remove(&hash);
+    }
+
     /// Look up by node ID.
     ///
     /// Checks the pinned local qset first, then the bounded caches.

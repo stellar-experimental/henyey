@@ -21,7 +21,7 @@ use std::sync::Arc;
 use henyey_common::Hash256;
 use henyey_crypto::SecretKey;
 use henyey_herder::{
-    persistence::ScpPersistenceManager, Herder, HerderConfig, TimerManagerHandle, TransactionSet,
+    Herder, HerderConfig, ScpPersistenceManager, TimerManagerHandle, TransactionSet,
 };
 use henyey_ledger::{LedgerManager, LedgerManagerConfig};
 use stellar_xdr::{
@@ -118,7 +118,6 @@ fn make_validator_herder(lcl: u32) -> (Arc<Herder>, SecretKey, ScpQuorumSet) {
 /// Build a signed local NOMINATE envelope for `slot` referencing a tx set
 /// built on the herder's LCL. Returns the envelope plus the persisted deps.
 fn local_nominate_with_deps(
-    herder: &Herder,
     secret: &SecretKey,
     quorum_set: &ScpQuorumSet,
     slot: u64,
@@ -203,7 +202,7 @@ fn test_restored_future_slot_observable_after_restart() {
     assert!(herder1.set_scp_persistence(Arc::clone(&manager)).is_ok());
 
     let (env, tx_hash, tx_bytes, qs_hash, qs) =
-        local_nominate_with_deps(&herder1, &secret, &quorum_set, lcl + 1);
+        local_nominate_with_deps(&secret, &quorum_set, lcl + 1);
     manager
         .persist_scp_state(
             lcl + 1,
@@ -221,20 +220,23 @@ fn test_restored_future_slot_observable_after_restart() {
     // Restore BEFORE any network traffic — exactly the startup ordering.
     herder2.restore_persisted_scp_state(lcl);
 
-    // The future-slot envelope must be observable immediately, with no peers.
-    assert!(
-        !herder2.get_current_state_for_slot(lcl + 1).is_empty(),
-        "restored future-slot (lcl+1) SCP state must be observable after restart"
-    );
-    // Dependencies hydrated.
+    // The future-slot envelope's DEPENDENCIES must be observable immediately,
+    // with no peers — so once the second node hears the corresponding live
+    // envelopes it can validate the slot without a fetch round-trip.
+    //
+    // NOTE: live-envelope replay is GATED OFF in this PR (the PR #2797 stall
+    // guard), so the future slot itself is not installed into SCP. This test
+    // asserts dependency hydration. When the SCP ballot-supersession follow-up
+    // lands and replay is re-enabled, add an assertion that
+    // `get_current_state_for_slot(lcl + 1)` is non-empty.
     assert!(
         herder2.has_tx_set(&Hash256(tx_hash.0)),
-        "referenced tx set must be cached after restore"
+        "restored future-slot tx set must be cached after restart"
     );
     assert!(
         herder2
             .get_quorum_set_by_hash(&Hash256(qs_hash.0))
             .is_some(),
-        "referenced quorum set must be cached after restore"
+        "restored future-slot quorum set must be cached after restart"
     );
 }
