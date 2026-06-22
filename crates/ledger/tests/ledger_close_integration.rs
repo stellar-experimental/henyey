@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use henyey_bucket::HotArchiveBucketList;
+use henyey_bucket::{BucketList, HotArchiveBucketList};
 use henyey_common::Hash256;
 use henyey_ledger::{
     compute_header_hash, LedgerCloseData, LedgerManager, LedgerManagerConfig, TransactionSetVariant,
@@ -1791,4 +1791,127 @@ async fn test_close_stamps_last_modified_on_all_entries() {
             "{label} account last_modified_ledger_seq must equal the close ledger seq"
         );
     }
+}
+
+/// Regression test for #3553 (the #3552 L16 `bucketListHash` divergence).
+///
+/// stellar-core (`LedgerManagerImpl::sealLedgerTxnAndStoreInBucketsAndDB`,
+/// `LedgerManagerImpl.cpp:2984-3060`) runs the eviction scan and writes the
+/// `CONFIG_SETTING_EVICTION_ITERATOR` config setting on **every**
+/// `initialLedgerVers >= SOROBAN_PROTOCOL_VERSION` (V20) ledger,
+/// **unconditionally** — `BucketManager::resolveBackgroundEvictionScan`
+/// (`BucketManager.cpp:1290`) always calls `networkConfig.updateEvictionIterator`
+/// even on a zero-eviction scan. The V23
+/// (`FIRST_PROTOCOL_SUPPORTING_PERSISTENT_EVICTION`) gate covers ONLY the
+/// hot-archive `addHotArchiveBatch`/restore sub-step, NOT the iterator update,
+/// and core conditions the iterator write on neither a hot-archive bucket list
+/// nor pre-loaded settings.
+///
+/// Henyey previously gated the entire eviction step — including the per-ledger
+/// `live_entries.push(eviction_iter_entry)` — behind the non-core conjuncts
+/// `prev_version >= V23 && has_hot_archive && eviction_settings.is_some()`. When
+/// the hot-archive bucket list is momentarily absent (`has_hot_archive == false`)
+/// the iterator update is dropped, the live bucket batch loses the EvictionIterator
+/// live entry, and the resulting bucket diverges from core (the lone L16
+/// `bucketListHash` flip captured as oracle `0ebd5750` vs henyey's empty
+/// `d15ebeb4`).
+///
+/// This test closes a V25 ledger (>= V20 and >= V23, no evictable entries) over a
+/// live bucket list that carries the EvictionIterator config setting but NOT the
+/// StateArchival settings, so `load_state_archival_settings()` returns `None` and
+/// the non-core `eviction_settings.is_some()` conjunct is false. On `main` the
+/// EvictionIterator config setting is NOT re-stamped to the close ledger (the push
+/// is skipped); after the fix it is, matching core's unconditional per-ledger
+/// `updateEvictionIterator` (which writes the iterator even when no scan region is
+/// available / nothing is evicted).
+#[test]
+fn test_eviction_iterator_emitted_every_v20_ledger() {
+    use stellar_xdr::{
+        BucketListType, ConfigSettingEntry, ConfigSettingId, EvictionIterator,
+        LedgerKeyConfigSetting,
+    };
+
+    let config = LedgerManagerConfig {
+        validate_bucket_hash: false,
+        ..Default::default()
+    };
+    let ledger = LedgerManager::new("Test Network".to_string(), config);
+
+    // Live bucket list seeded with ONLY the EvictionIterator config setting (no
+    // StateArchival), at protocol >= V20. This makes `eviction_settings` load as
+    // `None` on the close below — the non-core conjunct under test. The
+    // EvictionIterator entry exists so it can be re-stamped by the per-ledger
+    // update.
+    let mut bucket_list = BucketList::new();
+    // Seed the EvictionIterator with last_modified 0 (stale) so that closing
+    // ledger 1 must re-stamp it to 1 — closing ledger 1 from genesis does NOT
+    // trigger a level spill, so no Tokio runtime is needed.
+    let eviction_iter_entry = LedgerEntry {
+        last_modified_ledger_seq: 0,
+        data: LedgerEntryData::ConfigSetting(ConfigSettingEntry::EvictionIterator(
+            EvictionIterator {
+                bucket_list_level: 6,
+                is_curr_bucket: true,
+                bucket_file_offset: 0,
+            },
+        )),
+        ext: LedgerEntryExt::V0,
+    };
+    bucket_list
+        .add_batch(
+            1,
+            25,
+            BucketListType::Live,
+            vec![eviction_iter_entry],
+            vec![],
+            vec![],
+        )
+        .expect("seed bucket list");
+    let hot_archive = HotArchiveBucketList::new();
+    // Genesis header at protocol 25 (>= V23 >= V20): the version gate is
+    // satisfied; the failing conjunct under test is `eviction_settings.is_some()`.
+    let header = make_genesis_header();
+    let header_hash = compute_header_hash(&header).expect("hash");
+    ledger
+        .initialize(bucket_list, hot_archive, header, header_hash)
+        .expect("init");
+
+    let close_ledger_seq = 1u32;
+    let close_data = LedgerCloseData::new(
+        close_ledger_seq,
+        TransactionSetVariant::Classic(TransactionSet {
+            previous_ledger_hash: Hash([0u8; 32]),
+            txs: VecM::default(),
+        }),
+        1,
+        ledger.current_header_hash(),
+    );
+
+    ledger.close_ledger(close_data, None).expect("close ledger");
+
+    // The EvictionIterator config setting must be present and re-stamped to the
+    // close ledger seq — proving the per-ledger update entered the live bucket
+    // batch (mirroring core's unconditional `updateEvictionIterator`).
+    let key = LedgerKey::ConfigSetting(LedgerKeyConfigSetting {
+        config_setting_id: ConfigSettingId::EvictionIterator,
+    });
+    let entry = ledger
+        .bucket_list()
+        .get(&key)
+        .expect("bucket list get")
+        .expect("EvictionIterator config setting must exist after close");
+    assert!(
+        matches!(
+            entry.data,
+            LedgerEntryData::ConfigSetting(ConfigSettingEntry::EvictionIterator(_))
+        ),
+        "entry must be an EvictionIterator config setting"
+    );
+    assert_eq!(
+        entry.last_modified_ledger_seq, close_ledger_seq,
+        "EvictionIterator must be re-stamped to the close ledger seq on every V20+ \
+         ledger (core writes it unconditionally via updateEvictionIterator); a stale \
+         last_modified means henyey dropped the per-ledger eviction-iterator update \
+         (the #3552 L16 bucketListHash divergence)"
+    );
 }
