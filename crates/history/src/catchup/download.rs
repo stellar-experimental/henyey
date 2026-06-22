@@ -12,7 +12,7 @@ use henyey_common::Hash256;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use stellar_xdr::curr::{
+use stellar_xdr::{
     LedgerHeader, LedgerHeaderHistoryEntry, ScpHistoryEntry, TransactionHistoryEntry,
     TransactionHistoryResultEntry,
 };

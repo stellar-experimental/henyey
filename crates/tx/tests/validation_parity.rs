@@ -11,7 +11,7 @@ use henyey_tx::validation::{
     check_valid_pre_seq_num, check_valid_pre_seq_num_with_config, PreSeqNumError,
 };
 use henyey_tx::{validate_operation, TransactionFrame};
-use stellar_xdr::curr::{
+use stellar_xdr::{
     AccountId, AlphaNum4, Asset, AssetCode4, ClawbackOp, ContractDataDurability, ContractId,
     ContractIdPreimage, CreateContractArgs, ExtendFootprintTtlOp, FeeBumpTransaction,
     FeeBumpTransactionEnvelope, FeeBumpTransactionExt, FeeBumpTransactionInnerTx, Hash,
@@ -71,10 +71,10 @@ fn make_soroban_frame(
 /// Build a minimal InvokeHostFunction operation body (invoke contract no-op).
 fn invoke_host_noop() -> OperationBody {
     OperationBody::InvokeHostFunction(InvokeHostFunctionOp {
-        host_function: HostFunction::InvokeContract(stellar_xdr::curr::InvokeContractArgs {
+        host_function: HostFunction::InvokeContract(stellar_xdr::InvokeContractArgs {
             contract_address: ScAddress::Contract(ContractId(Hash([9u8; 32]))),
-            function_name: stellar_xdr::curr::ScSymbol(
-                stellar_xdr::curr::StringM::<32>::try_from("noop".to_string()).unwrap(),
+            function_name: stellar_xdr::ScSymbol(
+                stellar_xdr::StringM::<32>::try_from("noop".to_string()).unwrap(),
             ),
             args: VecM::default(),
         }),
@@ -128,7 +128,7 @@ fn test_reject_restore_footprint_nonempty_readonly() {
 
     let frame = make_soroban_frame(
         OperationBody::RestoreFootprint(RestoreFootprintOp {
-            ext: stellar_xdr::curr::ExtensionPoint::V0,
+            ext: stellar_xdr::ExtensionPoint::V0,
         }),
         footprint,
         50,
@@ -155,7 +155,7 @@ fn test_reject_restore_footprint_non_persistent_readwrite() {
 
     let frame = make_soroban_frame(
         OperationBody::RestoreFootprint(RestoreFootprintOp {
-            ext: stellar_xdr::curr::ExtensionPoint::V0,
+            ext: stellar_xdr::ExtensionPoint::V0,
         }),
         footprint,
         50,
@@ -187,7 +187,7 @@ fn test_reject_extend_footprint_ttl_nonempty_readwrite() {
 
     let frame = make_soroban_frame(
         OperationBody::ExtendFootprintTtl(ExtendFootprintTtlOp {
-            ext: stellar_xdr::curr::ExtensionPoint::V0,
+            ext: stellar_xdr::ExtensionPoint::V0,
             extend_to: 1000,
         }),
         footprint,
@@ -213,7 +213,7 @@ fn test_reject_extend_footprint_ttl_non_soroban_key() {
 
     let frame = make_soroban_frame(
         OperationBody::ExtendFootprintTtl(ExtendFootprintTtlOp {
-            ext: stellar_xdr::curr::ExtensionPoint::V0,
+            ext: stellar_xdr::ExtensionPoint::V0,
             extend_to: 1000,
         }),
         footprint,
@@ -336,7 +336,7 @@ fn test_reject_clawback_muxed_from_not_self_clawback() {
 /// Regression test for #1486 — CreateContract fromAsset with invalid asset code.
 #[test]
 fn test_reject_create_contract_from_invalid_asset() {
-    use stellar_xdr::curr::ContractExecutable;
+    use stellar_xdr::ContractExecutable;
 
     // All-zero asset code is invalid per isAssetValid
     let invalid_asset = Asset::CreditAlphanum4(AlphaNum4 {
@@ -494,19 +494,17 @@ fn make_over_depth_soroban_envelope() -> TransactionEnvelope {
     // Each ScVal::Vec layer adds XDR depth. We need >500 layers.
     let mut val = ScVal::U32(42);
     for _ in 0..501 {
-        val = ScVal::Vec(Some(stellar_xdr::curr::ScVec(
-            vec![val].try_into().unwrap(),
-        )));
+        val = ScVal::Vec(Some(stellar_xdr::ScVec(vec![val].try_into().unwrap())));
     }
 
     let source = MuxedAccount::Ed25519(Uint256([1u8; 32]));
     let op = Operation {
         source_account: None,
         body: OperationBody::InvokeHostFunction(InvokeHostFunctionOp {
-            host_function: HostFunction::InvokeContract(stellar_xdr::curr::InvokeContractArgs {
+            host_function: HostFunction::InvokeContract(stellar_xdr::InvokeContractArgs {
                 contract_address: ScAddress::Contract(ContractId(Hash([9u8; 32]))),
-                function_name: stellar_xdr::curr::ScSymbol(
-                    stellar_xdr::curr::StringM::<32>::try_from("deep".to_string()).unwrap(),
+                function_name: stellar_xdr::ScSymbol(
+                    stellar_xdr::StringM::<32>::try_from("deep".to_string()).unwrap(),
                 ),
                 args: vec![val].try_into().unwrap(),
             }),
@@ -589,7 +587,7 @@ fn test_validate_basic_rejects_transaction_exceeding_xdr_depth_limit() {
 /// the XDR depth limit. Parity: stellar-core FeeBumpTransactionFrame.cpp:278.
 #[test]
 fn test_reject_fee_bump_transaction_exceeding_xdr_depth_limit() {
-    use stellar_xdr::curr::{
+    use stellar_xdr::{
         DecoratedSignature, FeeBumpTransaction, FeeBumpTransactionEnvelope, FeeBumpTransactionExt,
         FeeBumpTransactionInnerTx, Signature, SignatureHint,
     };

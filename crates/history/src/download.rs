@@ -25,7 +25,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use flate2::read::GzDecoder;
 use reqwest::Client;
-use stellar_xdr::curr::ReadXdr;
+use stellar_xdr::ReadXdr;
 use tracing::{debug, warn};
 
 use crate::error::HistoryError;
@@ -214,7 +214,7 @@ pub fn decompress_gzip(compressed: &[u8]) -> Result<Vec<u8>, HistoryError> {
 ///
 /// A vector of parsed entries, or an error if parsing fails.
 pub fn parse_xdr_stream<T: ReadXdr>(data: &[u8]) -> Result<Vec<T>, HistoryError> {
-    use stellar_xdr::curr::{Limited, Limits};
+    use stellar_xdr::{Limited, Limits};
 
     let mut entries = Vec::new();
     let cursor = std::io::Cursor::new(data);
@@ -224,9 +224,7 @@ pub fn parse_xdr_stream<T: ReadXdr>(data: &[u8]) -> Result<Vec<T>, HistoryError>
     loop {
         match T::read_xdr(&mut limited) {
             Ok(entry) => entries.push(entry),
-            Err(stellar_xdr::curr::Error::Io(ref e))
-                if e.kind() == std::io::ErrorKind::UnexpectedEof =>
-            {
+            Err(stellar_xdr::Error::Io(ref e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
                 // Normal end of stream
                 break;
             }
@@ -288,8 +286,8 @@ pub fn parse_record_marked_xdr_stream<T: ReadXdr>(data: &[u8]) -> Result<Vec<T>,
         }
 
         let record_data = &data[offset..offset + record_len];
-        let entry = T::from_xdr(record_data, stellar_xdr::curr::Limits::none())
-            .map_err(HistoryError::Xdr)?;
+        let entry =
+            T::from_xdr(record_data, stellar_xdr::Limits::none()).map_err(HistoryError::Xdr)?;
         entries.push(entry);
 
         offset += record_len;

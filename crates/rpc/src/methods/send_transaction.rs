@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use serde_json::json;
-use stellar_xdr::curr::{Limits, ReadXdr, TransactionEnvelope, TransactionResultCode};
+use stellar_xdr::{Limits, ReadXdr, TransactionEnvelope, TransactionResultCode};
 
 use crate::context::RpcContext;
 use crate::error::JsonRpcError;
@@ -103,9 +103,9 @@ fn insert_empty_diagnostic_events(
 }
 
 /// Build an error TransactionResult for the response using the actual error code.
-fn build_error_result(code: Option<TransactionResultCode>) -> stellar_xdr::curr::TransactionResult {
+fn build_error_result(code: Option<TransactionResultCode>) -> stellar_xdr::TransactionResult {
     use henyey_tx::TransactionResultCodeExt;
-    use stellar_xdr::curr::{TransactionResult, TransactionResultExt, TransactionResultResult};
+    use stellar_xdr::{TransactionResult, TransactionResultExt, TransactionResultResult};
 
     let result = code
         .map(|c| c.to_xdr_result())
@@ -121,7 +121,7 @@ fn build_error_result(code: Option<TransactionResultCode>) -> stellar_xdr::curr:
 #[cfg(test)]
 mod tests {
     use super::*;
-    use stellar_xdr::curr::{TransactionResultResult, WriteXdr};
+    use stellar_xdr::{TransactionResultResult, WriteXdr};
 
     #[test]
     fn test_build_error_result_structure() {

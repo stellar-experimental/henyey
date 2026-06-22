@@ -24,7 +24,7 @@ use std::sync::Arc;
 
 use henyey_common::{xdr_to_bytes, Hash256};
 use henyey_crypto::Sha256Hasher;
-use stellar_xdr::curr::{
+use stellar_xdr::{
     AccountId, ConfigUpgradeSetKey, GeneralizedTransactionSet, LedgerCloseMeta, LedgerHeader,
     LedgerHeaderExt, LedgerHeaderExtensionV1, LedgerHeaderExtensionV1Ext, LedgerUpgrade,
     OperationBody, ScpHistoryEntry, StellarValueExt, TransactionEnvelope, TransactionResultPair,
@@ -84,7 +84,7 @@ pub struct ConfigUpgradeResult {
     /// Whether Soroban memory cost parameters changed (requires cost model reload).
     pub memory_cost_params_changed: bool,
     /// Per-upgrade entry changes, keyed by serialized `ConfigUpgradeSetKey`.
-    pub per_upgrade_changes: HashMap<Vec<u8>, stellar_xdr::curr::LedgerEntryChanges>,
+    pub per_upgrade_changes: HashMap<Vec<u8>, stellar_xdr::LedgerEntryChanges>,
 }
 
 /// Complete input data for closing a ledger.
@@ -279,17 +279,17 @@ pub enum TransactionSetVariant {
     Generalized(GeneralizedTransactionSet),
 }
 
-impl From<&stellar_xdr::curr::TransactionHistoryEntry> for TransactionSetVariant {
+impl From<&stellar_xdr::TransactionHistoryEntry> for TransactionSetVariant {
     /// Extract the transaction set from a history entry.
     ///
     /// For V1 entries, extracts the generalized transaction set from the ext field.
     /// For V0 entries, uses the classic transaction set.
-    fn from(entry: &stellar_xdr::curr::TransactionHistoryEntry) -> Self {
+    fn from(entry: &stellar_xdr::TransactionHistoryEntry) -> Self {
         match &entry.ext {
-            stellar_xdr::curr::TransactionHistoryEntryExt::V1(generalized) => {
+            stellar_xdr::TransactionHistoryEntryExt::V1(generalized) => {
                 TransactionSetVariant::Generalized(generalized.clone())
             }
-            stellar_xdr::curr::TransactionHistoryEntryExt::V0 => {
+            stellar_xdr::TransactionHistoryEntryExt::V0 => {
                 TransactionSetVariant::Classic(entry.tx_set.clone())
             }
         }
@@ -302,20 +302,22 @@ impl TransactionSetVariant {
         match self {
             TransactionSetVariant::Classic(set) => set.txs.len(),
             TransactionSetVariant::Generalized(set) => {
-                let stellar_xdr::curr::GeneralizedTransactionSet::V1(set_v1) = set;
+                let stellar_xdr::GeneralizedTransactionSet::V1(set_v1) = set;
                 let mut count = 0;
                 for phase in set_v1.phases.iter() {
                     match phase {
-                        stellar_xdr::curr::TransactionPhase::V0(components) => {
+                        stellar_xdr::TransactionPhase::V0(components) => {
                             for comp in components.iter() {
                                 match comp {
-                                    stellar_xdr::curr::TxSetComponent::TxsetCompTxsMaybeDiscountedFee(c) => {
+                                    stellar_xdr::TxSetComponent::TxsetCompTxsMaybeDiscountedFee(
+                                        c,
+                                    ) => {
                                         count += c.txs.len();
                                     }
                                 }
                             }
                         }
-                        stellar_xdr::curr::TransactionPhase::V1(parallel) => {
+                        stellar_xdr::TransactionPhase::V1(parallel) => {
                             for stage in parallel.execution_stages.iter() {
                                 for cluster in stage.iter() {
                                     count += cluster.0.len();
@@ -349,7 +351,7 @@ impl TransactionSetVariant {
         match self {
             TransactionSetVariant::Classic(set) => Hash256::from(set.previous_ledger_hash.0),
             TransactionSetVariant::Generalized(set) => {
-                let stellar_xdr::curr::GeneralizedTransactionSet::V1(set_v1) = set;
+                let stellar_xdr::GeneralizedTransactionSet::V1(set_v1) = set;
                 Hash256::from(set_v1.previous_ledger_hash.0)
             }
         }
@@ -358,9 +360,9 @@ impl TransactionSetVariant {
     /// Create an empty generalized transaction set for a given ledger header.
     pub fn empty_generalized(header: &LedgerHeader) -> Self {
         TransactionSetVariant::Generalized(GeneralizedTransactionSet::V1(
-            stellar_xdr::curr::TransactionSetV1 {
+            stellar_xdr::TransactionSetV1 {
                 previous_ledger_hash: header.previous_ledger_hash.clone(),
-                phases: stellar_xdr::curr::VecM::default(),
+                phases: stellar_xdr::VecM::default(),
             },
         ))
     }
@@ -370,20 +372,22 @@ impl TransactionSetVariant {
         match self {
             TransactionSetVariant::Classic(set) => set.txs.iter().collect(),
             TransactionSetVariant::Generalized(set) => {
-                let stellar_xdr::curr::GeneralizedTransactionSet::V1(set_v1) = set;
+                let stellar_xdr::GeneralizedTransactionSet::V1(set_v1) = set;
                 let mut txs = Vec::new();
                 for phase in set_v1.phases.iter() {
                     match phase {
-                        stellar_xdr::curr::TransactionPhase::V0(components) => {
+                        stellar_xdr::TransactionPhase::V0(components) => {
                             for comp in components.iter() {
                                 match comp {
-                                    stellar_xdr::curr::TxSetComponent::TxsetCompTxsMaybeDiscountedFee(c) => {
+                                    stellar_xdr::TxSetComponent::TxsetCompTxsMaybeDiscountedFee(
+                                        c,
+                                    ) => {
                                         txs.extend(c.txs.iter());
                                     }
                                 }
                             }
                         }
-                        stellar_xdr::curr::TransactionPhase::V1(parallel) => {
+                        stellar_xdr::TransactionPhase::V1(parallel) => {
                             for stage in parallel.execution_stages.iter() {
                                 for cluster in stage.iter() {
                                     txs.extend(cluster.0.iter());
@@ -416,14 +420,14 @@ impl TransactionSetVariant {
                 sorted_for_apply_sequential(txs, set_hash)
             }
             TransactionSetVariant::Generalized(set) => {
-                let stellar_xdr::curr::GeneralizedTransactionSet::V1(set_v1) = set;
+                let stellar_xdr::GeneralizedTransactionSet::V1(set_v1) = set;
                 let mut txs = Vec::new();
                 for phase in set_v1.phases.iter() {
                     match phase {
-                        stellar_xdr::curr::TransactionPhase::V0(components) => {
+                        stellar_xdr::TransactionPhase::V0(components) => {
                             txs.extend(sorted_component_txs(components.iter(), set_hash));
                         }
-                        stellar_xdr::curr::TransactionPhase::V1(parallel) => {
+                        stellar_xdr::TransactionPhase::V1(parallel) => {
                             let base_fee = base_fee_to_u32(parallel.base_fee);
                             txs.extend(sorted_for_apply_parallel(
                                 parallel.execution_stages.as_slice(),
@@ -455,10 +459,10 @@ impl TransactionSetVariant {
                 sorted_for_apply_sequential(txs, set_hash)
             }
             TransactionSetVariant::Generalized(set) => {
-                let stellar_xdr::curr::GeneralizedTransactionSet::V1(set_v1) = set;
+                let stellar_xdr::GeneralizedTransactionSet::V1(set_v1) = set;
                 let mut txs = Vec::new();
                 for phase in set_v1.phases.iter() {
-                    if let stellar_xdr::curr::TransactionPhase::V0(components) = phase {
+                    if let stellar_xdr::TransactionPhase::V0(components) = phase {
                         txs.extend(sorted_component_txs(components.iter(), set_hash));
                     }
                 }
@@ -478,9 +482,9 @@ impl TransactionSetVariant {
         match self {
             TransactionSetVariant::Classic(_) => None,
             TransactionSetVariant::Generalized(set) => {
-                let stellar_xdr::curr::GeneralizedTransactionSet::V1(set_v1) = set;
+                let stellar_xdr::GeneralizedTransactionSet::V1(set_v1) = set;
                 for phase in set_v1.phases.iter() {
-                    if let stellar_xdr::curr::TransactionPhase::V1(parallel) = phase {
+                    if let stellar_xdr::TransactionPhase::V1(parallel) = phase {
                         let base_fee = base_fee_to_u32(parallel.base_fee);
 
                         let stages = sorted_stages_for_parallel(
@@ -533,14 +537,14 @@ fn cmp_hashes(left: &Hash256, right: &Hash256, set_hash: &Hash256) -> Ordering {
     }
 }
 
-fn tx_source_id(tx: &TransactionEnvelope) -> stellar_xdr::curr::AccountId {
+fn tx_source_id(tx: &TransactionEnvelope) -> stellar_xdr::AccountId {
     match tx {
         TransactionEnvelope::TxV0(env) => henyey_tx::muxed_to_account_id(
-            &stellar_xdr::curr::MuxedAccount::Ed25519(env.tx.source_account_ed25519.clone()),
+            &stellar_xdr::MuxedAccount::Ed25519(env.tx.source_account_ed25519.clone()),
         ),
         TransactionEnvelope::Tx(env) => henyey_tx::muxed_to_account_id(&env.tx.source_account),
         TransactionEnvelope::TxFeeBump(env) => match &env.tx.inner_tx {
-            stellar_xdr::curr::FeeBumpTransactionInnerTx::Tx(inner) => {
+            stellar_xdr::FeeBumpTransactionInnerTx::Tx(inner) => {
                 henyey_tx::muxed_to_account_id(&inner.tx.source_account)
             }
         },
@@ -552,18 +556,17 @@ fn tx_sequence_number(tx: &TransactionEnvelope) -> i64 {
         TransactionEnvelope::TxV0(env) => env.tx.seq_num.0,
         TransactionEnvelope::Tx(env) => env.tx.seq_num.0,
         TransactionEnvelope::TxFeeBump(env) => match &env.tx.inner_tx {
-            stellar_xdr::curr::FeeBumpTransactionInnerTx::Tx(inner) => inner.tx.seq_num.0,
+            stellar_xdr::FeeBumpTransactionInnerTx::Tx(inner) => inner.tx.seq_num.0,
         },
     }
 }
 
 fn collect_component_txs<'a>(
-    components: impl IntoIterator<Item = &'a stellar_xdr::curr::TxSetComponent>,
+    components: impl IntoIterator<Item = &'a stellar_xdr::TxSetComponent>,
 ) -> Vec<TxWithFee> {
     let mut txs = Vec::new();
     for component in components {
-        let stellar_xdr::curr::TxSetComponent::TxsetCompTxsMaybeDiscountedFee(component) =
-            component;
+        let stellar_xdr::TxSetComponent::TxsetCompTxsMaybeDiscountedFee(component) = component;
         let base_fee = base_fee_to_u32(component.base_fee);
         txs.extend(
             component
@@ -577,7 +580,7 @@ fn collect_component_txs<'a>(
 }
 
 fn sorted_component_txs<'a>(
-    components: impl IntoIterator<Item = &'a stellar_xdr::curr::TxSetComponent>,
+    components: impl IntoIterator<Item = &'a stellar_xdr::TxSetComponent>,
     set_hash: Hash256,
 ) -> Vec<TxWithFee> {
     sorted_for_apply_sequential(collect_component_txs(components), set_hash)
@@ -649,7 +652,7 @@ fn sorted_for_apply_sequential(txs: Vec<TxWithFee>, set_hash: Hash256) -> Vec<Tx
 /// Clusters within a stage are NOT sorted -- they are independent, so stellar-core
 /// preserves XDR order to keep deterministic result ordering.
 fn sort_parallel_stages(
-    stages: &[stellar_xdr::curr::ParallelTxExecutionStage],
+    stages: &[stellar_xdr::ParallelTxExecutionStage],
     set_hash: &Hash256,
 ) -> Vec<Vec<Vec<Arc<TransactionEnvelope>>>> {
     // Pre-compute TX hashes alongside each TX to avoid redundant XDR+SHA256 during sort.
@@ -706,7 +709,7 @@ fn sort_parallel_stages(
 /// Returns stages > clusters > sorted (tx, base_fee) triples using the same
 /// canonical ordering as `sorted_for_apply_parallel`.
 fn sorted_stages_for_parallel(
-    stages: &[stellar_xdr::curr::ParallelTxExecutionStage],
+    stages: &[stellar_xdr::ParallelTxExecutionStage],
     set_hash: Hash256,
     base_fee: Option<u32>,
 ) -> ParallelStages {
@@ -722,7 +725,7 @@ fn sorted_stages_for_parallel(
 }
 
 fn sorted_for_apply_parallel(
-    stages: &[stellar_xdr::curr::ParallelTxExecutionStage],
+    stages: &[stellar_xdr::ParallelTxExecutionStage],
     set_hash: Hash256,
     base_fee: Option<u32>,
 ) -> Vec<TxWithFee> {
@@ -774,7 +777,7 @@ fn envelope_is_soroban(env: &TransactionEnvelope) -> bool {
         TransactionEnvelope::TxV0(e) => &e.tx.operations,
         TransactionEnvelope::Tx(e) => &e.tx.operations,
         TransactionEnvelope::TxFeeBump(e) => match &e.tx.inner_tx {
-            stellar_xdr::curr::FeeBumpTransactionInnerTx::Tx(inner) => &inner.tx.operations,
+            stellar_xdr::FeeBumpTransactionInnerTx::Tx(inner) => &inner.tx.operations,
         },
     };
     ops.iter().any(|op| {
@@ -801,19 +804,19 @@ impl TransactionSetVariant {
                 (sorted.clone(), None, sorted)
             }
             TransactionSetVariant::Generalized(set) => {
-                let stellar_xdr::curr::GeneralizedTransactionSet::V1(set_v1) = set;
+                let stellar_xdr::GeneralizedTransactionSet::V1(set_v1) = set;
                 let mut classic_txs = Vec::new();
                 let mut soroban_phase = None;
                 let mut all_txs = Vec::new();
 
                 for phase in Vec::from(set_v1.phases) {
                     match phase {
-                        stellar_xdr::curr::TransactionPhase::V0(components) => {
+                        stellar_xdr::TransactionPhase::V0(components) => {
                             let sorted = sorted_for_apply_sequential(
                                 Vec::from(components)
                                     .into_iter()
                                     .flat_map(|component| {
-                                        let stellar_xdr::curr::TxSetComponent::TxsetCompTxsMaybeDiscountedFee(
+                                        let stellar_xdr::TxSetComponent::TxsetCompTxsMaybeDiscountedFee(
                                             component,
                                         ) = component;
                                         let base_fee = base_fee_to_u32(component.base_fee);
@@ -827,7 +830,7 @@ impl TransactionSetVariant {
                             classic_txs = sorted.clone();
                             all_txs.extend(sorted);
                         }
-                        stellar_xdr::curr::TransactionPhase::V1(parallel) => {
+                        stellar_xdr::TransactionPhase::V1(parallel) => {
                             let base_fee = base_fee_to_u32(parallel.base_fee);
                             let stages: ParallelStages = Vec::from(parallel.execution_stages)
                                 .into_iter()
@@ -881,19 +884,19 @@ impl TransactionSetVariant {
                 (sorted.clone(), None, sorted)
             }
             TransactionSetVariant::Generalized(set) => {
-                let stellar_xdr::curr::GeneralizedTransactionSet::V1(set_v1) = set;
+                let stellar_xdr::GeneralizedTransactionSet::V1(set_v1) = set;
                 let mut classic_txs = Vec::new();
                 let mut soroban_phase = None;
                 let mut all_txs = Vec::new();
 
                 for phase in set_v1.phases.iter() {
                     match phase {
-                        stellar_xdr::curr::TransactionPhase::V0(components) => {
+                        stellar_xdr::TransactionPhase::V0(components) => {
                             let sorted = sorted_component_txs(components.iter(), hash);
                             classic_txs = sorted.clone();
                             all_txs.extend(sorted);
                         }
-                        stellar_xdr::curr::TransactionPhase::V1(parallel) => {
+                        stellar_xdr::TransactionPhase::V1(parallel) => {
                             let base_fee = base_fee_to_u32(parallel.base_fee);
                             let stages = sorted_stages_for_parallel(
                                 parallel.execution_stages.as_slice(),
@@ -1329,7 +1332,7 @@ impl UpgradeContext {
         protocol_version: u32,
         soroban_state: &crate::soroban_state::SharedSorobanState,
     ) -> Result<ConfigUpgradeResult, LedgerError> {
-        use stellar_xdr::curr::{Limits, WriteXdr};
+        use stellar_xdr::{Limits, WriteXdr};
 
         let mut state_archival_changed = false;
         let mut memory_cost_params_changed = false;
@@ -1481,8 +1484,8 @@ impl UpgradeContext {
         &self,
         ltx: &mut CloseLedgerState,
         ledger_seq: u32,
-    ) -> Result<stellar_xdr::curr::LedgerEntryChanges, LedgerError> {
-        use stellar_xdr::curr::{
+    ) -> Result<stellar_xdr::LedgerEntryChanges, LedgerError> {
+        use stellar_xdr::{
             ConfigSettingEntry, ConfigSettingId, LedgerEntryChange, LedgerEntryChanges,
             LedgerEntryData, LedgerKey, LedgerKeyConfigSetting, VecM,
         };
@@ -1630,7 +1633,7 @@ mod tests {
     use super::*;
     use henyey_crypto::Sha256Hasher;
     use std::collections::HashMap;
-    use stellar_xdr::curr::{
+    use stellar_xdr::{
         DependentTxCluster, FeeBumpTransaction, FeeBumpTransactionEnvelope,
         FeeBumpTransactionInnerTx, GeneralizedTransactionSet, Hash, Limits, Memo, MuxedAccount,
         ParallelTxExecutionStage, Preconditions, Transaction, TransactionEnvelope, TransactionExt,
@@ -1643,7 +1646,7 @@ mod tests {
         let tx = Transaction {
             source_account: source,
             fee: 100,
-            seq_num: stellar_xdr::curr::SequenceNumber(seq),
+            seq_num: stellar_xdr::SequenceNumber(seq),
             cond: Preconditions::None,
             memo: Memo::None,
             operations: VecM::default(),
@@ -1665,7 +1668,7 @@ mod tests {
             fee_source,
             fee: 200,
             inner_tx: FeeBumpTransactionInnerTx::Tx(inner),
-            ext: stellar_xdr::curr::FeeBumpTransactionExt::V0,
+            ext: stellar_xdr::FeeBumpTransactionExt::V0,
         };
         TransactionEnvelope::TxFeeBump(FeeBumpTransactionEnvelope {
             tx: fee_bump,
@@ -1725,7 +1728,7 @@ mod tests {
         }
     }
 
-    fn fee_source_id(tx: &TransactionEnvelope) -> stellar_xdr::curr::AccountId {
+    fn fee_source_id(tx: &TransactionEnvelope) -> stellar_xdr::AccountId {
         match tx {
             TransactionEnvelope::TxV0(env) => henyey_tx::muxed_to_account_id(
                 &MuxedAccount::Ed25519(env.tx.source_account_ed25519.clone()),
@@ -1737,7 +1740,7 @@ mod tests {
         }
     }
 
-    fn inner_source_id(tx: &TransactionEnvelope) -> stellar_xdr::curr::AccountId {
+    fn inner_source_id(tx: &TransactionEnvelope) -> stellar_xdr::AccountId {
         match tx {
             TransactionEnvelope::TxV0(env) => henyey_tx::muxed_to_account_id(
                 &MuxedAccount::Ed25519(env.tx.source_account_ed25519.clone()),
@@ -1885,7 +1888,7 @@ mod tests {
                     let fee_bump_b = make_fee_bump(9, inner_b, 1);
                     let classic = make_tx(classic_seed, 1);
                     let txs = vec![fee_bump_a.clone(), classic.clone(), fee_bump_b.clone()];
-                    let set = stellar_xdr::curr::TransactionSet {
+                    let set = stellar_xdr::TransactionSet {
                         previous_ledger_hash: Hash::from(Hash256::ZERO),
                         txs: txs.clone().try_into().unwrap(),
                     };

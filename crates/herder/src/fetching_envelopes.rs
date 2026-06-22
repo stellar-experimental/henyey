@@ -16,7 +16,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
-use stellar_xdr::curr::{Hash, Limits, ReadXdr, ScpEnvelope, ScpQuorumSet};
+use stellar_xdr::{Hash, Limits, ReadXdr, ScpEnvelope, ScpQuorumSet};
 use tracing::{debug, trace};
 
 /// Callback type for requesting items from peers.
@@ -1088,7 +1088,7 @@ impl FetchingEnvelopes {
     /// Parity: stellar-core rejects envelopes containing non-signed StellarValues
     /// in both nomination (votes/accepted) and ballot statements.
     fn check_stellar_value_signed(envelope: &ScpEnvelope) -> bool {
-        use stellar_xdr::curr::{ScpStatementPledges, StellarValue, StellarValueExt};
+        use stellar_xdr::{ScpStatementPledges, StellarValue, StellarValueExt};
 
         let values: Vec<&[u8]> = match &envelope.statement.pledges {
             ScpStatementPledges::Nominate(nom) => {
@@ -1136,7 +1136,7 @@ impl FetchingEnvelopes {
     /// from ALL statement types including NOMINATE (votes + accepted). Previously
     /// NOMINATE returned None, bypassing tx_set fetch gating (#1117).
     fn extract_tx_set_hashes(envelope: &ScpEnvelope) -> Vec<Hash256> {
-        use stellar_xdr::curr::StellarValue;
+        use stellar_xdr::StellarValue;
 
         henyey_scp::Slot::get_statement_values(&envelope.statement)
             .into_iter()
@@ -1147,7 +1147,7 @@ impl FetchingEnvelopes {
 
     /// Extract QuorumSet hash from an envelope.
     fn extract_quorum_set_hash(envelope: &ScpEnvelope) -> Option<Hash256> {
-        use stellar_xdr::curr::ScpStatementPledges;
+        use stellar_xdr::ScpStatementPledges;
 
         let hash = match &envelope.statement.pledges {
             ScpStatementPledges::Nominate(nom) => Some(&nom.quorum_set_hash),
@@ -1168,7 +1168,7 @@ impl FetchingEnvelopes {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use stellar_xdr::curr::{
+    use stellar_xdr::{
         NodeId as XdrNodeId, PublicKey, ScpNomination, ScpStatement, ScpStatementPledges,
         Signature, Uint256, Value, WriteXdr,
     };
@@ -1480,7 +1480,7 @@ mod tests {
     // =========================================================================
 
     fn make_basic_stellar_value() -> Vec<u8> {
-        use stellar_xdr::curr::{StellarValue, StellarValueExt, TimePoint, VecM, WriteXdr};
+        use stellar_xdr::{StellarValue, StellarValueExt, TimePoint, VecM, WriteXdr};
         let sv = StellarValue {
             tx_set_hash: Hash([0u8; 32]),
             close_time: TimePoint(12345),
@@ -1491,7 +1491,7 @@ mod tests {
     }
 
     fn make_signed_stellar_value_bytes() -> Vec<u8> {
-        use stellar_xdr::curr::{
+        use stellar_xdr::{
             LedgerCloseValueSignature, StellarValue, StellarValueExt, TimePoint, VecM, WriteXdr,
         };
         let sv = StellarValue {
@@ -1500,14 +1500,14 @@ mod tests {
             upgrades: VecM::default(),
             ext: StellarValueExt::Signed(LedgerCloseValueSignature {
                 node_id: XdrNodeId(PublicKey::PublicKeyTypeEd25519(Uint256([1u8; 32]))),
-                signature: stellar_xdr::curr::Signature(vec![0u8; 64].try_into().unwrap()),
+                signature: stellar_xdr::Signature(vec![0u8; 64].try_into().unwrap()),
             }),
         };
         sv.to_xdr(Limits::none()).unwrap()
     }
 
     fn make_envelope_with_nomination_values(slot: SlotIndex, values: Vec<Vec<u8>>) -> ScpEnvelope {
-        use stellar_xdr::curr::Value;
+        use stellar_xdr::Value;
         let node_id = XdrNodeId(PublicKey::PublicKeyTypeEd25519(Uint256([1u8; 32])));
         let votes: Vec<Value> = values
             .into_iter()
@@ -1720,32 +1720,28 @@ mod tests {
     /// different StellarValues that also need the STELLAR_VALUE_SIGNED check.
     #[test]
     fn test_audit_xh3_prepare_validates_prepared_and_prepared_prime() {
-        use stellar_xdr::curr::{
-            ScpBallot, ScpStatementPrepare, StellarValue, StellarValueExt, Value,
-        };
+        use stellar_xdr::{ScpBallot, ScpStatementPrepare, StellarValue, StellarValueExt, Value};
 
         // Create a signed StellarValue for the main ballot
         let signed_sv = StellarValue {
             tx_set_hash: Hash([1u8; 32]),
-            close_time: stellar_xdr::curr::TimePoint(1000),
+            close_time: stellar_xdr::TimePoint(1000),
             upgrades: vec![].try_into().unwrap(),
-            ext: StellarValueExt::Signed(stellar_xdr::curr::LedgerCloseValueSignature {
+            ext: StellarValueExt::Signed(stellar_xdr::LedgerCloseValueSignature {
                 node_id: XdrNodeId(PublicKey::PublicKeyTypeEd25519(Uint256([1u8; 32]))),
                 signature: Signature(vec![0u8; 64].try_into().unwrap()),
             }),
         };
-        let signed_bytes = signed_sv.to_xdr(stellar_xdr::curr::Limits::none()).unwrap();
+        let signed_bytes = signed_sv.to_xdr(stellar_xdr::Limits::none()).unwrap();
 
         // Create an unsigned (Basic) StellarValue for the prepared ballot
         let unsigned_sv = StellarValue {
             tx_set_hash: Hash([2u8; 32]),
-            close_time: stellar_xdr::curr::TimePoint(999),
+            close_time: stellar_xdr::TimePoint(999),
             upgrades: vec![].try_into().unwrap(),
             ext: StellarValueExt::Basic,
         };
-        let unsigned_bytes = unsigned_sv
-            .to_xdr(stellar_xdr::curr::Limits::none())
-            .unwrap();
+        let unsigned_bytes = unsigned_sv.to_xdr(stellar_xdr::Limits::none()).unwrap();
 
         let node_id = XdrNodeId(PublicKey::PublicKeyTypeEd25519(Uint256([1u8; 32])));
 
@@ -1781,7 +1777,7 @@ mod tests {
 
     /// Helper to create a signed StellarValue for test envelopes.
     fn make_test_stellar_value(tx_set_hash: [u8; 32]) -> Value {
-        use stellar_xdr::curr::{
+        use stellar_xdr::{
             LedgerCloseValueSignature, StellarValue, StellarValueExt, TimePoint, WriteXdr,
         };
 
@@ -1874,7 +1870,7 @@ mod tests {
 
     /// Build a signed StellarValue referencing a specific tx_set_hash.
     fn make_signed_stellar_value_with_hash(tx_set_hash: Hash256) -> Vec<u8> {
-        use stellar_xdr::curr::{
+        use stellar_xdr::{
             LedgerCloseValueSignature, StellarValue, StellarValueExt, TimePoint, VecM, WriteXdr,
         };
         let sv = StellarValue {
@@ -1883,7 +1879,7 @@ mod tests {
             upgrades: VecM::default(),
             ext: StellarValueExt::Signed(LedgerCloseValueSignature {
                 node_id: XdrNodeId(PublicKey::PublicKeyTypeEd25519(Uint256([1u8; 32]))),
-                signature: stellar_xdr::curr::Signature(vec![0u8; 64].try_into().unwrap()),
+                signature: stellar_xdr::Signature(vec![0u8; 64].try_into().unwrap()),
             }),
         };
         sv.to_xdr(Limits::none()).unwrap()

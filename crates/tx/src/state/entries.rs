@@ -216,9 +216,9 @@ impl LedgerStateManager {
                     last_modified_ledger_seq: last_modified,
                     data: other,
                     ext: if has_sponsorship_ext {
-                        LedgerEntryExt::V1(stellar_xdr::curr::LedgerEntryExtensionV1 {
+                        LedgerEntryExt::V1(stellar_xdr::LedgerEntryExtensionV1 {
                             sponsoring_id: SponsorshipDescriptor(sponsor),
-                            ext: stellar_xdr::curr::LedgerEntryExtensionV1Ext::V0,
+                            ext: stellar_xdr::LedgerEntryExtensionV1Ext::V0,
                         })
                     } else {
                         LedgerEntryExt::V0

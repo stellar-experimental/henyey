@@ -51,7 +51,7 @@
 
 use std::collections::HashSet;
 
-use stellar_xdr::curr::{LedgerEntry, LedgerKey};
+use stellar_xdr::{LedgerEntry, LedgerKey};
 
 use crate::bucket::{Bucket, BucketIter};
 use crate::entry::BucketEntry;
@@ -277,7 +277,7 @@ impl LiveEntriesStats {
 mod tests {
     use super::*;
     use crate::BucketList;
-    use stellar_xdr::curr::*;
+    use stellar_xdr::*;
 
     fn make_account_id(bytes: [u8; 32]) -> AccountId {
         AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(bytes)))

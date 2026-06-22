@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use henyey_tx::TransactionResultCodeExt;
-use stellar_xdr::curr::{
+use stellar_xdr::{
     Limits, ReadXdr, TransactionEnvelope, TransactionResult, TransactionResultExt,
     TransactionResultResult, WriteXdr,
 };
@@ -147,7 +147,7 @@ pub(crate) async fn compat_tx_handler(
 fn encode_tx_result(
     result: TransactionResultResult,
     fee_charged: i64,
-) -> Result<String, stellar_xdr::curr::Error> {
+) -> Result<String, stellar_xdr::Error> {
     let tx_result = TransactionResult {
         fee_charged,
         result,
@@ -304,7 +304,7 @@ mod tests {
     #[test]
     fn test_encode_tx_result_round_trip_all_variants() {
         use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
-        use stellar_xdr::curr::TransactionResultCode;
+        use stellar_xdr::TransactionResultCode;
 
         let cases: &[(TransactionResultResult, i64, TransactionResultCode)] = &[
             (

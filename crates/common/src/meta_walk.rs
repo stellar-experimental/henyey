@@ -4,7 +4,7 @@
 //! pattern, avoiding duplication across crates that need to walk ledger
 //! entry changes from transaction metadata.
 
-use stellar_xdr::curr::{LedgerEntryChange, TransactionMeta};
+use stellar_xdr::{LedgerEntryChange, TransactionMeta};
 
 /// Walk change groups in a single `TransactionMeta`, invoking `f` once per
 /// contiguous slice of changes in field traversal order.
@@ -81,7 +81,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use stellar_xdr::curr::{
+    use stellar_xdr::{
         AccountEntry, AccountEntryExt, AccountId, ExtensionPoint, LedgerEntry, LedgerEntryChanges,
         LedgerEntryData, LedgerEntryExt, OperationMeta, OperationMetaV2, PublicKey, SequenceNumber,
         String32, Thresholds, TransactionMetaV1, TransactionMetaV2, TransactionMetaV3,

@@ -51,7 +51,7 @@ use henyey_common::fs_utils::durable_rename;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
-use stellar_xdr::curr::{
+use stellar_xdr::{
     LedgerHeaderHistoryEntry, Limits, ReadXdr, TransactionHistoryEntry,
     TransactionHistoryResultEntry, WriteXdr,
 };
@@ -689,7 +689,7 @@ impl CheckpointBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use stellar_xdr::curr::{
+    use stellar_xdr::{
         Hash, LedgerHeader, LedgerHeaderExt, LedgerHeaderHistoryEntryExt, StellarValue,
         StellarValueExt, TimePoint, TransactionHistoryEntry, TransactionHistoryEntryExt,
         TransactionHistoryResultEntry, TransactionHistoryResultEntryExt, TransactionResultSet,
@@ -728,7 +728,7 @@ mod tests {
     fn make_tx_entry(seq: u32) -> TransactionHistoryEntry {
         TransactionHistoryEntry {
             ledger_seq: seq,
-            tx_set: stellar_xdr::curr::TransactionSet {
+            tx_set: stellar_xdr::TransactionSet {
                 previous_ledger_hash: Hash([0u8; 32]),
                 txs: VecM::default(),
             },

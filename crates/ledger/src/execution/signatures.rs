@@ -11,8 +11,8 @@ use henyey_tx::OperationTypeExt;
 pub(super) fn is_operation_success(result: &OperationResult) -> bool {
     match result {
         OperationResult::OpInner(inner) => {
-            use stellar_xdr::curr::OperationResultTr;
-            use stellar_xdr::curr::*;
+            use stellar_xdr::OperationResultTr;
+            use stellar_xdr::*;
             match inner {
                 OperationResultTr::CreateAccount(r) => {
                     matches!(r, CreateAccountResult::Success)
@@ -104,7 +104,7 @@ pub(super) fn is_operation_success(result: &OperationResult) -> bool {
 
 pub(super) fn has_sufficient_signer_weight(
     tx_hash: &Hash256,
-    signatures: &[stellar_xdr::curr::DecoratedSignature],
+    signatures: &[stellar_xdr::DecoratedSignature],
     account: &AccountEntry,
     required_weight: u32,
 ) -> bool {
@@ -112,7 +112,7 @@ pub(super) fn has_sufficient_signer_weight(
     let mut counted: HashSet<Hash256> = HashSet::new();
 
     // Master key signer.
-    let stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(ref master_key) = account.account_id.0;
+    let stellar_xdr::PublicKey::PublicKeyTypeEd25519(ref master_key) = account.account_id.0;
     let master_key_bytes = &master_key.0;
     let master_weight = account.thresholds.0[0] as u32;
     tracing::trace!(
@@ -179,7 +179,7 @@ pub(super) fn has_sufficient_signer_weight(
 
 pub(super) fn has_required_extra_signers(
     tx_hash: &Hash256,
-    signatures: &[stellar_xdr::curr::DecoratedSignature],
+    signatures: &[stellar_xdr::DecoratedSignature],
     extra_signers: &[SignerKey],
 ) -> bool {
     extra_signers.iter().all(|signer| match signer {
@@ -203,7 +203,7 @@ pub(super) fn has_required_extra_signers(
 /// and tx-set validation (`validate_fee_bump_for_tx_set`).
 pub(super) fn fee_bump_outer_auth_check(
     tx_hash: &Hash256,
-    signatures: &[stellar_xdr::curr::DecoratedSignature],
+    signatures: &[stellar_xdr::DecoratedSignature],
     fee_source_account: &AccountEntry,
 ) -> bool {
     let required_weight = threshold_low(fee_source_account);
@@ -216,7 +216,7 @@ pub(super) fn fee_bump_inner_hash(
 ) -> Result<Hash256> {
     match frame.envelope() {
         TransactionEnvelope::TxFeeBump(env) => match &env.tx.inner_tx {
-            stellar_xdr::curr::FeeBumpTransactionInnerTx::Tx(inner) => {
+            stellar_xdr::FeeBumpTransactionInnerTx::Tx(inner) => {
                 let inner_env = TransactionEnvelope::Tx(inner.clone());
                 let inner_frame = TransactionFrame::from_owned_with_network(inner_env, *network_id);
                 inner_frame
@@ -289,8 +289,8 @@ pub(super) fn get_needed_threshold(account: &AccountEntry, level: ThresholdLevel
 
 /// Check if a decorated signature matches an Ed25519SignedPayload signer key.
 pub(super) fn has_signed_payload_match(
-    sig: &stellar_xdr::curr::DecoratedSignature,
-    signed_payload: &stellar_xdr::curr::SignerKeyEd25519SignedPayload,
+    sig: &stellar_xdr::DecoratedSignature,
+    signed_payload: &stellar_xdr::SignerKeyEd25519SignedPayload,
 ) -> bool {
     henyey_crypto::verify_ed25519_signed_payload(sig, signed_payload)
 }
@@ -333,7 +333,7 @@ pub(super) fn check_operation_signatures(
     frame: &TransactionFrame,
     state: &LedgerStateManager,
     tx_hash: &Hash256,
-    signatures: &[stellar_xdr::curr::DecoratedSignature],
+    signatures: &[stellar_xdr::DecoratedSignature],
     inner_source_id: &AccountId,
 ) -> Option<(Vec<OperationResult>, ExecutionFailure)> {
     // Create a signature tracker for used-signature tracking
@@ -450,7 +450,7 @@ pub(super) fn check_operation_signatures(
 /// OperationResult defaults to opINNER with a default inner result for the
 /// operation type (typically the "Success" variant).
 pub(super) fn default_success_op_result(op: &Operation) -> OperationResult {
-    use stellar_xdr::curr::*;
+    use stellar_xdr::*;
 
     let inner = match &op.body {
         OperationBody::CreateAccount(_) => {
@@ -543,20 +543,20 @@ pub(super) fn default_success_op_result(op: &Operation) -> OperationResult {
 /// Default empty offer success result used for manage offer operations.
 /// stellar-core default-constructs ManageOfferSuccessResult with MANAGE_OFFER_CREATED (0)
 /// discriminant and a zero-initialized OfferEntry payload.
-fn empty_offer_success_result() -> stellar_xdr::curr::ManageOfferSuccessResult {
-    stellar_xdr::curr::ManageOfferSuccessResult {
+fn empty_offer_success_result() -> stellar_xdr::ManageOfferSuccessResult {
+    stellar_xdr::ManageOfferSuccessResult {
         offers_claimed: VecM::default(),
-        offer: stellar_xdr::curr::ManageOfferSuccessResultOffer::Created(
-            stellar_xdr::curr::OfferEntry::default(),
+        offer: stellar_xdr::ManageOfferSuccessResultOffer::Created(
+            stellar_xdr::OfferEntry::default(),
         ),
     }
 }
 
 /// Default zero-value simple payment result used for path payment operations.
-fn zero_simple_payment_result() -> stellar_xdr::curr::SimplePaymentResult {
-    stellar_xdr::curr::SimplePaymentResult {
-        destination: AccountId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
-            stellar_xdr::curr::Uint256([0; 32]),
+fn zero_simple_payment_result() -> stellar_xdr::SimplePaymentResult {
+    stellar_xdr::SimplePaymentResult {
+        destination: AccountId(stellar_xdr::PublicKey::PublicKeyTypeEd25519(
+            stellar_xdr::Uint256([0; 32]),
         )),
         asset: Asset::Native,
         amount: 0,
@@ -564,15 +564,13 @@ fn zero_simple_payment_result() -> stellar_xdr::curr::SimplePaymentResult {
 }
 
 pub(super) fn signer_key_id(key: &SignerKey) -> Hash256 {
-    let bytes = key
-        .to_xdr(stellar_xdr::curr::Limits::none())
-        .unwrap_or_default();
+    let bytes = key.to_xdr(stellar_xdr::Limits::none()).unwrap_or_default();
     Hash256::hash(&bytes)
 }
 
 pub(super) fn has_ed25519_signature_raw(
     tx_hash: &Hash256,
-    signatures: &[stellar_xdr::curr::DecoratedSignature],
+    signatures: &[stellar_xdr::DecoratedSignature],
     key_bytes: &[u8; 32],
 ) -> bool {
     signatures
@@ -581,8 +579,8 @@ pub(super) fn has_ed25519_signature_raw(
 }
 
 pub(super) fn has_hashx_signature(
-    signatures: &[stellar_xdr::curr::DecoratedSignature],
-    key: &stellar_xdr::curr::Uint256,
+    signatures: &[stellar_xdr::DecoratedSignature],
+    key: &stellar_xdr::Uint256,
 ) -> bool {
     signatures.iter().any(|sig| {
         // HashX signatures can be any length - the signature is the preimage
@@ -600,8 +598,8 @@ pub(super) fn has_hashx_signature(
 
 pub(super) fn has_signed_payload_signature(
     _tx_hash: &Hash256,
-    signatures: &[stellar_xdr::curr::DecoratedSignature],
-    signed_payload: &stellar_xdr::curr::SignerKeyEd25519SignedPayload,
+    signatures: &[stellar_xdr::DecoratedSignature],
+    signed_payload: &stellar_xdr::SignerKeyEd25519SignedPayload,
 ) -> bool {
     signatures
         .iter()
@@ -676,7 +674,7 @@ pub(super) fn check_operations_valid(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use stellar_xdr::curr::*;
+    use stellar_xdr::*;
 
     #[test]
     fn test_default_success_op_result_create_passive_sell_offer() {

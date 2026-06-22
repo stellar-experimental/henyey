@@ -3,7 +3,7 @@
 //! Pre-loads accounts, trustlines, and other entries needed by each operation
 //! type before execution. Extracted from the main executor module for readability.
 
-use stellar_xdr::curr::{
+use stellar_xdr::{
     AccountId, LedgerKey, LedgerKeyClaimableBalance, LedgerKeyLiquidityPool, LedgerKeyTrustLine,
     Limits, OperationBody, PoolId, TrustLineAsset, WriteXdr,
 };
@@ -22,7 +22,7 @@ impl TransactionExecutor {
     pub(super) fn load_operation_accounts(
         &mut self,
         snapshot: &SnapshotHandle,
-        op: &stellar_xdr::curr::Operation,
+        op: &stellar_xdr::Operation,
         source_id: &AccountId,
     ) -> Result<()> {
         let op_source = op
@@ -153,7 +153,7 @@ impl TransactionExecutor {
                     }
                 }
                 if op_data.offer_id != 0 {
-                    keys.push(LedgerKey::Offer(stellar_xdr::curr::LedgerKeyOffer {
+                    keys.push(LedgerKey::Offer(stellar_xdr::LedgerKeyOffer {
                         seller_id: op_source.clone(),
                         offer_id: op_data.offer_id,
                     }));
@@ -186,7 +186,7 @@ impl TransactionExecutor {
                     }
                 }
                 if op_data.offer_id != 0 {
-                    keys.push(LedgerKey::Offer(stellar_xdr::curr::LedgerKeyOffer {
+                    keys.push(LedgerKey::Offer(stellar_xdr::LedgerKeyOffer {
                         seller_id: op_source.clone(),
                         offer_id: op_data.offer_id,
                     }));
@@ -259,20 +259,20 @@ impl TransactionExecutor {
             OperationBody::ChangeTrust(op_data) => {
                 // Load existing trustline if any
                 let tl_asset = match &op_data.line {
-                    stellar_xdr::curr::ChangeTrustAsset::Native => None,
-                    stellar_xdr::curr::ChangeTrustAsset::CreditAlphanum4(a) => {
+                    stellar_xdr::ChangeTrustAsset::Native => None,
+                    stellar_xdr::ChangeTrustAsset::CreditAlphanum4(a) => {
                         Some(TrustLineAsset::CreditAlphanum4(a.clone()))
                     }
-                    stellar_xdr::curr::ChangeTrustAsset::CreditAlphanum12(a) => {
+                    stellar_xdr::ChangeTrustAsset::CreditAlphanum12(a) => {
                         Some(TrustLineAsset::CreditAlphanum12(a.clone()))
                     }
-                    stellar_xdr::curr::ChangeTrustAsset::PoolShare(params) => {
+                    stellar_xdr::ChangeTrustAsset::PoolShare(params) => {
                         // Compute pool ID from params
                         use sha2::{Digest, Sha256};
                         let xdr = params
                             .to_xdr(Limits::none())
                             .map_err(|e| LedgerError::Serialization(e.to_string()))?;
-                        let pool_id = PoolId(stellar_xdr::curr::Hash(Sha256::digest(&xdr).into()));
+                        let pool_id = PoolId(stellar_xdr::Hash(Sha256::digest(&xdr).into()));
                         Some(TrustLineAsset::PoolShare(pool_id))
                     }
                 };
@@ -295,7 +295,7 @@ impl TransactionExecutor {
                 // which doesn't record the access in transaction changes.
                 // We still need to load the account into state so the existence check works.
                 match &op_data.line {
-                    stellar_xdr::curr::ChangeTrustAsset::CreditAlphanum4(a) => {
+                    stellar_xdr::ChangeTrustAsset::CreditAlphanum4(a) => {
                         let asset_code = String::from_utf8_lossy(a.asset_code.as_slice());
                         tracing::debug!(
                             asset_code = %asset_code,
@@ -304,7 +304,7 @@ impl TransactionExecutor {
                         );
                         self.load_account_without_record(snapshot, &a.issuer)?;
                     }
-                    stellar_xdr::curr::ChangeTrustAsset::CreditAlphanum12(a) => {
+                    stellar_xdr::ChangeTrustAsset::CreditAlphanum12(a) => {
                         let asset_code = String::from_utf8_lossy(a.asset_code.as_slice());
                         tracing::debug!(
                             asset_code = %asset_code,
@@ -313,13 +313,14 @@ impl TransactionExecutor {
                         );
                         self.load_account_without_record(snapshot, &a.issuer)?;
                     }
-                    stellar_xdr::curr::ChangeTrustAsset::PoolShare(params) => {
+                    stellar_xdr::ChangeTrustAsset::PoolShare(params) => {
                         use sha2::{Digest, Sha256};
                         let xdr = params
                             .to_xdr(Limits::none())
                             .map_err(|e| LedgerError::Serialization(e.to_string()))?;
-                        let pool_id = PoolId(stellar_xdr::curr::Hash(Sha256::digest(&xdr).into()));
-                        let stellar_xdr::curr::LiquidityPoolParameters::LiquidityPoolConstantProduct(cp) = params;
+                        let pool_id = PoolId(stellar_xdr::Hash(Sha256::digest(&xdr).into()));
+                        let stellar_xdr::LiquidityPoolParameters::LiquidityPoolConstantProduct(cp) =
+                            params;
                         let mut keys = vec![LedgerKey::LiquidityPool(LedgerKeyLiquidityPool {
                             liquidity_pool_id: pool_id,
                         })];
@@ -340,7 +341,7 @@ impl TransactionExecutor {
             }
             OperationBody::RevokeSponsorship(op_data) => {
                 // Load the target entry that sponsorship is being revoked from
-                use stellar_xdr::curr::RevokeSponsorshipOp;
+                use stellar_xdr::RevokeSponsorshipOp;
                 match op_data {
                     RevokeSponsorshipOp::LedgerEntry(ledger_key) => {
                         // Load the entry directly by its key

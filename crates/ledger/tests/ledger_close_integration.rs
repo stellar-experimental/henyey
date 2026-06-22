@@ -5,7 +5,7 @@ use henyey_common::Hash256;
 use henyey_ledger::{
     compute_header_hash, LedgerCloseData, LedgerManager, LedgerManagerConfig, TransactionSetVariant,
 };
-use stellar_xdr::curr::{
+use stellar_xdr::{
     AccountEntry, AccountEntryExt, AccountId, Asset, BucketListType, BytesM, ContractCodeEntry,
     ContractCodeEntryExt, ContractEventBody, CreateAccountOp, DecoratedSignature,
     ExtendFootprintTtlOp, ExtensionPoint, FeeBumpTransaction, FeeBumpTransactionEnvelope,
@@ -158,7 +158,7 @@ fn test_ledger_close_meta_structural_validation() {
 /// Parity: LedgerCloseMetaStreamTests.cpp - meta with SCP history entries
 #[test]
 fn test_ledger_close_meta_with_scp_history() {
-    use stellar_xdr::curr::{LedgerScpMessages, ScpHistoryEntry, ScpHistoryEntryV0};
+    use stellar_xdr::{LedgerScpMessages, ScpHistoryEntry, ScpHistoryEntryV0};
 
     let config = LedgerManagerConfig {
         validate_bucket_hash: false,
@@ -848,7 +848,7 @@ fn test_close_ledger_fee_event_fee_bump_soroban() {
         fee_source: MuxedAccount::Ed25519(Uint256(*outer_secret.public_key().as_bytes())),
         fee: 200_000,
         inner_tx: FeeBumpTransactionInnerTx::Tx(inner_v1),
-        ext: stellar_xdr::curr::FeeBumpTransactionExt::V0,
+        ext: stellar_xdr::FeeBumpTransactionExt::V0,
     };
 
     let mut fee_bump_envelope = TransactionEnvelope::TxFeeBump(FeeBumpTransactionEnvelope {
@@ -931,7 +931,7 @@ fn test_close_ledger_fee_event_fee_bump_soroban() {
             from_str.contains(&outer_strkey) || {
                 // Compare the raw bytes: the Address should correspond to the outer source
                 match addr {
-                    stellar_xdr::curr::ScAddress::Account(aid) => aid == &outer_source_id,
+                    stellar_xdr::ScAddress::Account(aid) => aid == &outer_source_id,
                     _ => false,
                 }
             },
@@ -990,7 +990,7 @@ fn test_ledger_close_eviction_meta_key_ordering_impl() {
     use henyey_bucket::{BucketList, EvictionIterator};
     use henyey_common::xdr_to_bytes;
     use sha2::{Digest, Sha256};
-    use stellar_xdr::curr::{
+    use stellar_xdr::{
         ConfigSettingContractBandwidthV0, ConfigSettingContractComputeV0,
         ConfigSettingContractEventsV0, ConfigSettingContractExecutionLanesV0,
         ConfigSettingContractHistoricalDataV0, ConfigSettingContractLedgerCostV0,
@@ -1001,7 +1001,7 @@ fn test_ledger_close_eviction_meta_key_ordering_impl() {
 
     // --- Helper: compute the TTL key for a given data key ---
     let ttl_key_for = |data_key: &LedgerKey| -> LedgerKey {
-        let key_bytes = data_key.to_xdr(stellar_xdr::curr::Limits::none()).unwrap();
+        let key_bytes = data_key.to_xdr(stellar_xdr::Limits::none()).unwrap();
         let hash_bytes: [u8; 32] = Sha256::digest(&key_bytes).into();
         LedgerKey::Ttl(LedgerKeyTtl {
             key_hash: Hash(hash_bytes),
@@ -1287,7 +1287,7 @@ fn test_ledger_close_eviction_meta_key_ordering_impl() {
 /// Bug behavior: op_count == 1 (only the successful tx's operation_results counted).
 #[test]
 fn test_ledger_close_counts_ops_for_pre_execution_rejected_transactions() {
-    use stellar_xdr::curr::BumpSequenceOp;
+    use stellar_xdr::BumpSequenceOp;
 
     let network_id = NetworkId::testnet();
 
@@ -1406,7 +1406,7 @@ fn test_ledger_close_counts_ops_for_pre_execution_rejected_transactions() {
 
     // Find the TxBadSeq result (order-independent)
     let has_bad_seq = result.tx_results.iter().any(|pair| {
-        use stellar_xdr::curr::TransactionResultResult;
+        use stellar_xdr::TransactionResultResult;
         matches!(&pair.result.result, TransactionResultResult::TxBadSeq)
     });
     assert!(has_bad_seq, "expected one TxBadSeq result");
@@ -1441,7 +1441,7 @@ fn test_ledger_close_counts_ops_for_pre_execution_rejected_transactions() {
 async fn test_close_ledger_with_held_snapshot_preserves_results() {
     use henyey_common::NetworkId;
     use henyey_crypto::{sign_hash, SecretKey};
-    use stellar_xdr::curr::{
+    use stellar_xdr::{
         AccountEntry, AccountEntryExt, AccountId, BucketListType, BytesM, ContractCodeEntry,
         ContractCodeEntryExt, ExtendFootprintTtlOp, LedgerFootprint, LedgerKey,
         LedgerKeyContractCode, MuxedAccount, Operation, OperationBody, Preconditions, PublicKey,
@@ -1468,7 +1468,7 @@ async fn test_close_ledger_with_held_snapshot_preserves_results() {
             inflation_dest: None,
             flags: 0,
             home_domain: Default::default(),
-            thresholds: stellar_xdr::curr::Thresholds([1, 0, 0, 0]),
+            thresholds: stellar_xdr::Thresholds([1, 0, 0, 0]),
             signers: VecM::default(),
             ext: AccountEntryExt::V0,
         }),
@@ -1768,7 +1768,7 @@ async fn test_close_stamps_last_modified_on_all_entries() {
     assert!(
         matches!(
             result.tx_results[0].result.result,
-            stellar_xdr::curr::TransactionResultResult::TxSuccess(_)
+            stellar_xdr::TransactionResultResult::TxSuccess(_)
         ),
         "tx should succeed, got {:?}",
         result.tx_results[0].result.result

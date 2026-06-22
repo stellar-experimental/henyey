@@ -21,7 +21,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use parking_lot::Mutex;
-use stellar_xdr::curr::{LedgerEntry, LedgerEntryData, LedgerKey};
+use stellar_xdr::{LedgerEntry, LedgerEntryData, LedgerKey};
 
 use crate::entry::BucketEntry;
 
@@ -437,7 +437,7 @@ pub struct CacheStats {
 mod tests {
     use super::*;
     use crate::entry::BucketEntry; // Use our BucketEntry, not the XDR one
-    use stellar_xdr::curr::*;
+    use stellar_xdr::*;
 
     fn make_account_id(byte: u8) -> AccountId {
         AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([byte; 32])))
@@ -560,7 +560,7 @@ mod tests {
         // Data key should NOT be cached
         let data_key = LedgerKey::Data(LedgerKeyData {
             account_id: make_account_id(1),
-            data_name: String64::from(stellar_xdr::curr::StringM::default()),
+            data_name: String64::from(stellar_xdr::StringM::default()),
         });
         assert!(!BucketEntryCache::is_cached_type(&data_key));
     }

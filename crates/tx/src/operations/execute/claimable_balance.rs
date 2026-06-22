@@ -5,7 +5,7 @@
 
 use std::collections::HashSet;
 
-use stellar_xdr::curr::{
+use stellar_xdr::{
     AccountFlags, AccountId, Asset, ClaimClaimableBalanceOp, ClaimClaimableBalanceResult,
     ClaimClaimableBalanceResultCode, ClaimPredicate, ClaimableBalanceEntry,
     ClaimableBalanceEntryExt, ClaimableBalanceEntryExtensionV1,
@@ -262,7 +262,7 @@ pub(crate) fn execute_claim_claimable_balance(
 
     // Check if source is a valid claimant
     let is_valid_claimant = entry.claimants.iter().any(|c| match c {
-        stellar_xdr::curr::Claimant::ClaimantTypeV0(cv0) => {
+        stellar_xdr::Claimant::ClaimantTypeV0(cv0) => {
             &cv0.destination == source && check_predicate(&cv0.predicate, context)
         }
     });
@@ -377,7 +377,7 @@ fn asset_issuer(asset: &Asset) -> Option<AccountId> {
 }
 
 /// Check if a claim predicate is satisfied.
-fn check_predicate(predicate: &stellar_xdr::curr::ClaimPredicate, context: &LedgerContext) -> bool {
+fn check_predicate(predicate: &stellar_xdr::ClaimPredicate, context: &LedgerContext) -> bool {
     match predicate {
         ClaimPredicate::Unconditional => true,
         ClaimPredicate::And(predicates) => {
@@ -539,7 +539,7 @@ mod tests {
     use super::super::AUTHORIZED_FLAG;
     use super::*;
     use crate::test_utils::create_test_account_id;
-    use stellar_xdr::curr::*;
+    use stellar_xdr::*;
 
     fn create_test_account(account_id: AccountId, balance: i64) -> AccountEntry {
         AccountEntry {
@@ -1352,7 +1352,7 @@ mod tests {
 
         // Find the op_source account in updated entries
         let op_source_in_delta = updated_entries.iter().any(|entry| {
-            if let stellar_xdr::curr::LedgerEntryData::Account(acc) = &entry.data {
+            if let stellar_xdr::LedgerEntryData::Account(acc) = &entry.data {
                 acc.account_id == op_source_id
             } else {
                 false
@@ -2322,8 +2322,7 @@ mod tests {
 
         // Freeze the claimant's USD trustline via CAP-77
         let frozen_key = crate::frozen_keys::trustline_key(&claimant_id, &asset);
-        let frozen_bytes =
-            stellar_xdr::curr::WriteXdr::to_xdr(&frozen_key, Limits::none()).unwrap();
+        let frozen_bytes = stellar_xdr::WriteXdr::to_xdr(&frozen_key, Limits::none()).unwrap();
 
         let mut context = create_test_context();
         context.frozen_key_config =

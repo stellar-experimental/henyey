@@ -64,7 +64,7 @@
 //!
 //! ```ignore
 //! use henyey_tx::{TransactionFrame, apply_from_history, TxChangeLog};
-//! use stellar_xdr::curr::{TransactionEnvelope, TransactionResult, TransactionMeta};
+//! use stellar_xdr::{TransactionEnvelope, TransactionResult, TransactionMeta};
 //!
 //! // Parse transaction from archive
 //! let envelope: TransactionEnvelope = /* from archive */;
@@ -188,7 +188,7 @@ pub use operations::{
     validate_classic_op_structure, validate_operation, OperationTypeExt, OperationValidationError,
     ThresholdLevel,
 };
-pub use stellar_xdr::curr::OperationType;
+pub use stellar_xdr::OperationType;
 
 // Re-export state types
 pub use state::{AssetPair, LedgerStateManager, OfferDescriptor, OfferIndex, OfferKey};
@@ -219,7 +219,7 @@ pub type Result<T> = std::result::Result<T, TxError>;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use stellar_xdr::curr::*;
+    use stellar_xdr::*;
 
     fn create_test_envelope() -> TransactionEnvelope {
         let source = MuxedAccount::Ed25519(Uint256([0u8; 32]));

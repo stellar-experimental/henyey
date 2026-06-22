@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use henyey_crypto::SecretKey;
 use henyey_overlay::{LocalNode, OverlayConfig, OverlayError, OverlayManager, PeerAddress};
-use stellar_xdr::curr::{
+use stellar_xdr::{
     Hash, ScpEnvelope, ScpNomination, ScpStatement, ScpStatementPledges, StellarMessage, Uint256,
 };
 use tokio::time::timeout;
@@ -25,9 +25,9 @@ async fn try_start(manager: &mut OverlayManager) -> bool {
 fn make_test_envelope(slot: u64) -> ScpEnvelope {
     ScpEnvelope {
         statement: ScpStatement {
-            node_id: stellar_xdr::curr::NodeId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
-                Uint256([0u8; 32]),
-            )),
+            node_id: stellar_xdr::NodeId(stellar_xdr::PublicKey::PublicKeyTypeEd25519(Uint256(
+                [0u8; 32],
+            ))),
             slot_index: slot,
             pledges: ScpStatementPledges::Nominate(ScpNomination {
                 quorum_set_hash: Hash([0u8; 32]),
@@ -35,7 +35,7 @@ fn make_test_envelope(slot: u64) -> ScpEnvelope {
                 accepted: vec![].try_into().unwrap(),
             }),
         },
-        signature: stellar_xdr::curr::Signature(vec![0u8; 64].try_into().unwrap()),
+        signature: stellar_xdr::Signature(vec![0u8; 64].try_into().unwrap()),
     }
 }
 

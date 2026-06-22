@@ -39,7 +39,7 @@ use flate2::write::GzEncoder;
 use flate2::Compression;
 use henyey_common::Hash256;
 use sha2::{Digest, Sha256};
-use stellar_xdr::curr::BucketMetadata;
+use stellar_xdr::BucketMetadata;
 
 use crate::entry::{compare_entries, BucketEntry, BucketEntryExt};
 use crate::{BucketError, Result};
@@ -400,7 +400,7 @@ impl BucketOutputIterator {
         ) {
             let metadata = BucketMetadata {
                 ledger_version: self.protocol_version,
-                ext: stellar_xdr::curr::BucketMetadataExt::V0,
+                ext: stellar_xdr::BucketMetadataExt::V0,
             };
             let entry = BucketEntry::Metaentry(metadata);
             self.write_entry_raw(&entry)?;
@@ -715,7 +715,7 @@ impl MergeInput for FileMergeInput {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use stellar_xdr::curr::{
+    use stellar_xdr::{
         AccountEntry, AccountEntryExt, AccountId, LedgerEntry, LedgerEntryData, LedgerEntryExt,
         LedgerKey, LedgerKeyAccount, PublicKey, SequenceNumber, String32, Thresholds, Uint256,
     };

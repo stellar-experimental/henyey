@@ -5,7 +5,7 @@
 //! - EndSponsoringFutureReserves
 //! - RevokeSponsorship
 
-use stellar_xdr::curr::{
+use stellar_xdr::{
     AccountId, BeginSponsoringFutureReservesOp, BeginSponsoringFutureReservesResult,
     BeginSponsoringFutureReservesResultCode, EndSponsoringFutureReservesResult,
     EndSponsoringFutureReservesResultCode, LedgerEntryData, LedgerKey, LedgerKeyAccount,
@@ -109,7 +109,7 @@ pub(crate) fn execute_revoke_sponsorship(
     state: &mut LedgerStateManager,
     context: &LedgerContext,
 ) -> Result<OperationResult> {
-    use stellar_xdr::curr::RevokeSponsorshipOp as RSO;
+    use stellar_xdr::RevokeSponsorshipOp as RSO;
 
     // Check source account exists
     if state.get_account(source).is_none() {
@@ -494,7 +494,7 @@ mod tests {
         create_test_account_id, create_test_account_with_sponsorship, create_test_trustline,
         create_test_trustline_asset,
     };
-    use stellar_xdr::curr::*;
+    use stellar_xdr::*;
 
     fn create_test_account(account_id: AccountId, balance: i64) -> AccountEntry {
         AccountEntry {

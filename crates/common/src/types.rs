@@ -112,7 +112,7 @@ impl Hash256 {
     /// Panics if XDR serialization fails. For in-memory, already-validated
     /// values encoded with `Limits::none()`, this is an internal invariant
     /// violation and should never happen in practice.
-    pub fn hash_xdr<T: stellar_xdr::curr::WriteXdr>(value: &T) -> Self {
+    pub fn hash_xdr<T: stellar_xdr::WriteXdr>(value: &T) -> Self {
         Self::try_hash_xdr(value).expect("XDR encoding of in-memory value must not fail")
     }
 
@@ -121,10 +121,10 @@ impl Hash256 {
     /// Prefer [`hash_xdr`] in production code where encoding failure is an
     /// invariant violation. Use this only when the caller genuinely needs to
     /// handle the error (e.g. encoding untrusted or partially-constructed data).
-    pub(crate) fn try_hash_xdr<T: stellar_xdr::curr::WriteXdr>(
+    pub(crate) fn try_hash_xdr<T: stellar_xdr::WriteXdr>(
         value: &T,
-    ) -> Result<Self, stellar_xdr::curr::Error> {
-        use stellar_xdr::curr::Limited;
+    ) -> Result<Self, stellar_xdr::Error> {
+        use stellar_xdr::Limited;
 
         struct Sha256Writer(Sha256);
         impl std::io::Write for Sha256Writer {
@@ -138,7 +138,7 @@ impl Hash256 {
         }
 
         let mut writer = Sha256Writer(Sha256::new());
-        let mut limited = Limited::new(&mut writer, stellar_xdr::curr::Limits::none());
+        let mut limited = Limited::new(&mut writer, stellar_xdr::Limits::none());
         value.write_xdr(&mut limited)?;
         let result = writer.0.finalize();
         Ok(Self(result.into()))
@@ -214,15 +214,15 @@ impl fmt::Display for Hash256 {
     }
 }
 
-impl From<stellar_xdr::curr::Hash> for Hash256 {
-    fn from(hash: stellar_xdr::curr::Hash) -> Self {
+impl From<stellar_xdr::Hash> for Hash256 {
+    fn from(hash: stellar_xdr::Hash) -> Self {
         Self(hash.0)
     }
 }
 
-impl From<Hash256> for stellar_xdr::curr::Hash {
+impl From<Hash256> for stellar_xdr::Hash {
     fn from(hash: Hash256) -> Self {
-        stellar_xdr::curr::Hash(hash.0)
+        stellar_xdr::Hash(hash.0)
     }
 }
 
@@ -265,8 +265,8 @@ impl std::ops::BitXor for Hash256 {
 /// This is the canonical, infallible conversion from a ledger entry to its
 /// corresponding key. The match is exhaustive over all `LedgerEntryData`
 /// variants, so it always succeeds.
-pub fn entry_to_key(entry: &stellar_xdr::curr::LedgerEntry) -> stellar_xdr::curr::LedgerKey {
-    use stellar_xdr::curr::*;
+pub fn entry_to_key(entry: &stellar_xdr::LedgerEntry) -> stellar_xdr::LedgerKey {
+    use stellar_xdr::*;
 
     match &entry.data {
         LedgerEntryData::Account(a) => LedgerKey::Account(LedgerKeyAccount {
@@ -311,7 +311,7 @@ pub fn entry_to_key(entry: &stellar_xdr::curr::LedgerEntry) -> stellar_xdr::curr
 
 /// Type alias: `ThresholdLevel` is now `ThresholdIndexes` from the XDR crate.
 /// Variants: `MasterWeight = 0`, `Low = 1`, `Med = 2`, `High = 3`.
-pub type ThresholdLevel = stellar_xdr::curr::ThresholdIndexes;
+pub type ThresholdLevel = stellar_xdr::ThresholdIndexes;
 
 /// Deterministic seed derivation matching stellar-core `txtest::getAccount()`.
 ///
@@ -332,8 +332,8 @@ pub fn deterministic_seed(name: &str) -> [u8; 32] {
 /// Different SCP pledge types store the quorum set hash in different fields:
 /// `Nominate`, `Prepare`, and `Confirm` use `quorum_set_hash`, while
 /// `Externalize` uses `commit_quorum_set_hash`.
-pub fn scp_quorum_set_hash(statement: &stellar_xdr::curr::ScpStatement) -> stellar_xdr::curr::Hash {
-    use stellar_xdr::curr::ScpStatementPledges;
+pub fn scp_quorum_set_hash(statement: &stellar_xdr::ScpStatement) -> stellar_xdr::Hash {
+    use stellar_xdr::ScpStatementPledges;
     match &statement.pledges {
         ScpStatementPledges::Nominate(nom) => nom.quorum_set_hash.clone(),
         ScpStatementPledges::Prepare(prep) => prep.quorum_set_hash.clone(),
@@ -416,7 +416,7 @@ mod tests {
 
     #[test]
     fn test_hash_xdr_and_try_hash_xdr_agree() {
-        use stellar_xdr::curr::Hash;
+        use stellar_xdr::Hash;
         let value = Hash([99u8; 32]);
         let infallible = Hash256::hash_xdr(&value);
         let fallible = Hash256::try_hash_xdr(&value).unwrap();
@@ -425,7 +425,7 @@ mod tests {
 
     #[test]
     fn test_hash_xdr_deterministic() {
-        use stellar_xdr::curr::Hash;
+        use stellar_xdr::Hash;
         let value = Hash([1u8; 32]);
         assert_eq!(Hash256::hash_xdr(&value), Hash256::hash_xdr(&value));
     }

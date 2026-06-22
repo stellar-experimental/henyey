@@ -38,7 +38,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use stellar_xdr::curr::{LedgerEntry, LedgerEntryType, LedgerKey};
+use stellar_xdr::{LedgerEntry, LedgerEntryType, LedgerKey};
 
 use crate::bucket::Bucket;
 use crate::entry::{ledger_entry_data_type, ledger_key_type, BucketEntry};
@@ -423,7 +423,7 @@ impl std::fmt::Debug for BucketApplicator {
 mod tests {
     use super::*;
     use crate::entry::BucketEntry; // Use our BucketEntry, not the XDR one
-    use stellar_xdr::curr::*;
+    use stellar_xdr::*;
 
     fn make_account_id(byte: u8) -> AccountId {
         AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([byte; 32])))

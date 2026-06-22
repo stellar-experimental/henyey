@@ -7,7 +7,7 @@ use henyey_app::{App, AppState, LedgerSummary};
 use henyey_bucket::BucketSnapshotManager;
 use henyey_herder::TxQueueResult;
 use henyey_ledger::HeaderSnapshot;
-use stellar_xdr::curr::TransactionEnvelope;
+use stellar_xdr::TransactionEnvelope;
 use tokio::sync::Semaphore;
 
 use crate::fee_window::FeeWindows;

@@ -7,9 +7,9 @@
 /// Returns a short description of a TransactionEnvelope for diagnostics:
 /// (op_types_csv, declared_fee, soroban_resource_fee, soroban_resources_summary).
 pub(super) fn describe_envelope(
-    env: Option<&stellar_xdr::curr::TransactionEnvelope>,
+    env: Option<&stellar_xdr::TransactionEnvelope>,
 ) -> (String, i64, i64, String) {
-    use stellar_xdr::curr::{
+    use stellar_xdr::{
         Operation, OperationBody, SorobanTransactionData, TransactionEnvelope, TransactionExt,
     };
     fn describe_op(op: &Operation) -> &'static str {
@@ -44,7 +44,7 @@ pub(super) fn describe_envelope(
         }
     }
     fn summarize_resources(data: &SorobanTransactionData) -> String {
-        use stellar_xdr::curr::SorobanTransactionDataExt;
+        use stellar_xdr::SorobanTransactionDataExt;
         let r = &data.resources;
         let archived = match &data.ext {
             SorobanTransactionDataExt::V1(ext) => ext.archived_soroban_entries.len(),
@@ -81,7 +81,7 @@ pub(super) fn describe_envelope(
         }
         TransactionEnvelope::TxFeeBump(fb) => {
             let (inner_ops_str, inner_sb_fee, inner_sb_summary) = match &fb.tx.inner_tx {
-                stellar_xdr::curr::FeeBumpTransactionInnerTx::Tx(inner) => {
+                stellar_xdr::FeeBumpTransactionInnerTx::Tx(inner) => {
                     let ops_str = inner
                         .tx
                         .operations
@@ -112,13 +112,13 @@ pub(super) fn describe_envelope(
 /// "operation byte-write resources exceeds amount specified") — critical
 /// for #2503 hash-mismatch divergence diagnosis.
 pub(super) fn extract_diagnostic_event_summary(
-    meta: Option<&stellar_xdr::curr::TransactionMeta>,
+    meta: Option<&stellar_xdr::TransactionMeta>,
 ) -> String {
-    use stellar_xdr::curr::{ScVal, TransactionMeta};
+    use stellar_xdr::{ScVal, TransactionMeta};
     let Some(meta) = meta else {
         return String::new();
     };
-    let events: &[stellar_xdr::curr::DiagnosticEvent] = match meta {
+    let events: &[stellar_xdr::DiagnosticEvent] = match meta {
         TransactionMeta::V3(m) => m
             .soroban_meta
             .as_ref()
@@ -130,7 +130,7 @@ pub(super) fn extract_diagnostic_event_summary(
     let mut summaries = Vec::new();
     for event in events {
         let body = match &event.event.body {
-            stellar_xdr::curr::ContractEventBody::V0(b) => b,
+            stellar_xdr::ContractEventBody::V0(b) => b,
         };
         let mut parts: Vec<String> = Vec::new();
         for topic in body.topics.as_slice() {
@@ -176,41 +176,38 @@ pub(super) fn extract_diagnostic_event_summary(
 
 /// Build a per-tx state-changes summary string mirroring what henyey logs from
 /// manager.rs::commit on hash mismatch. Format: "phase:type:size:hash16 | …"
-pub(super) fn summarize_cdp_meta_changes(
-    meta: Option<&stellar_xdr::curr::TransactionMeta>,
-) -> String {
+pub(super) fn summarize_cdp_meta_changes(meta: Option<&stellar_xdr::TransactionMeta>) -> String {
     use sha2::{Digest, Sha256};
-    use stellar_xdr::curr::{LedgerEntryChange, LedgerEntryData, TransactionMeta, WriteXdr};
+    use stellar_xdr::{LedgerEntryChange, LedgerEntryData, TransactionMeta, WriteXdr};
     let Some(meta) = meta else {
         return String::new();
     };
     let mut parts: Vec<String> = Vec::new();
-    let walk =
-        |changes: &stellar_xdr::curr::LedgerEntryChanges, parts: &mut Vec<String>, phase: &str| {
-            for change in changes.iter() {
-                let entry = match change {
-                    LedgerEntryChange::Created(e) => e,
-                    LedgerEntryChange::Updated(e) => e,
-                    LedgerEntryChange::Restored(e) => e,
-                    _ => continue,
-                };
-                if matches!(entry.data, LedgerEntryData::Ttl(_)) {
-                    continue;
-                }
-                let data_bytes = entry
-                    .data
-                    .to_xdr(stellar_xdr::curr::Limits::none())
-                    .unwrap_or_default();
-                let data_hash = format!("{:x}", Sha256::digest(&data_bytes));
-                parts.push(format!(
-                    "{}:t{:?}:{}:{}",
-                    phase,
-                    std::mem::discriminant(&entry.data),
-                    data_bytes.len(),
-                    &data_hash[..16],
-                ));
+    let walk = |changes: &stellar_xdr::LedgerEntryChanges, parts: &mut Vec<String>, phase: &str| {
+        for change in changes.iter() {
+            let entry = match change {
+                LedgerEntryChange::Created(e) => e,
+                LedgerEntryChange::Updated(e) => e,
+                LedgerEntryChange::Restored(e) => e,
+                _ => continue,
+            };
+            if matches!(entry.data, LedgerEntryData::Ttl(_)) {
+                continue;
             }
-        };
+            let data_bytes = entry
+                .data
+                .to_xdr(stellar_xdr::Limits::none())
+                .unwrap_or_default();
+            let data_hash = format!("{:x}", Sha256::digest(&data_bytes));
+            parts.push(format!(
+                "{}:t{:?}:{}:{}",
+                phase,
+                std::mem::discriminant(&entry.data),
+                data_bytes.len(),
+                &data_hash[..16],
+            ));
+        }
+    };
     match meta {
         TransactionMeta::V3(m) => {
             walk(&m.tx_changes_before, &mut parts, "before");
@@ -250,8 +247,8 @@ pub(super) fn summarize_cdp_meta_changes(
 /// across a transaction's tx_apply_processing change groups. Mirrors the
 /// stellar-core write_bytes accounting (which excludes TTL entries) for
 /// side-by-side comparison with henyey's `total_write_bytes`.
-pub(super) fn summarize_cdp_meta(meta: Option<&stellar_xdr::curr::TransactionMeta>) -> (u32, u64) {
-    use stellar_xdr::curr::{LedgerEntryChange, LedgerEntryData, WriteXdr};
+pub(super) fn summarize_cdp_meta(meta: Option<&stellar_xdr::TransactionMeta>) -> (u32, u64) {
+    use stellar_xdr::{LedgerEntryChange, LedgerEntryData, WriteXdr};
     let Some(meta) = meta else {
         return (0, 0);
     };
@@ -268,7 +265,7 @@ pub(super) fn summarize_cdp_meta(meta: Option<&stellar_xdr::curr::TransactionMet
                 continue;
             }
             count += 1;
-            if let Ok(bytes) = entry.to_xdr(stellar_xdr::curr::Limits::none()) {
+            if let Ok(bytes) = entry.to_xdr(stellar_xdr::Limits::none()) {
                 total_bytes += bytes.len() as u64;
             }
         }
@@ -279,10 +276,8 @@ pub(super) fn summarize_cdp_meta(meta: Option<&stellar_xdr::curr::TransactionMet
 /// Returns a CSV summary of operation result discriminants for a transaction
 /// result, e.g. "InvokeHostFunction:Trapped". Used to diagnose tx-level
 /// success/fail divergence by exposing per-op outcomes.
-pub(super) fn describe_op_results(r: &stellar_xdr::curr::TransactionResultResult) -> String {
-    use stellar_xdr::curr::{
-        InnerTransactionResultResult, OperationResult, TransactionResultResult,
-    };
+pub(super) fn describe_op_results(r: &stellar_xdr::TransactionResultResult) -> String {
+    use stellar_xdr::{InnerTransactionResultResult, OperationResult, TransactionResultResult};
     fn one_op(op: &OperationResult) -> String {
         // Print the full Debug repr (without payload values) so that
         // success/failure variants of inner result types like
@@ -322,8 +317,8 @@ pub(super) fn describe_op_results(r: &stellar_xdr::curr::TransactionResultResult
 }
 
 /// Returns a human-readable name for a `TransactionResultResult` variant.
-pub(super) fn tx_result_code_name(r: &stellar_xdr::curr::TransactionResultResult) -> String {
-    use stellar_xdr::curr::TransactionResultResult;
+pub(super) fn tx_result_code_name(r: &stellar_xdr::TransactionResultResult) -> String {
+    use stellar_xdr::TransactionResultResult;
     match r {
         TransactionResultResult::TxSuccess(_) => "txSuccess".to_string(),
         TransactionResultResult::TxFailed(_) => "txFailed".to_string(),
@@ -335,16 +330,16 @@ pub(super) fn tx_result_code_name(r: &stellar_xdr::curr::TransactionResultResult
 
 /// Prints pairwise differences between two operation result slices.
 pub(super) fn print_op_diffs(
-    our_ops: &[stellar_xdr::curr::OperationResult],
-    cdp_ops: &[stellar_xdr::curr::OperationResult],
+    our_ops: &[stellar_xdr::OperationResult],
+    cdp_ops: &[stellar_xdr::OperationResult],
 ) {
-    use stellar_xdr::curr::WriteXdr;
+    use stellar_xdr::WriteXdr;
     for (j, (our_op, cdp_op)) in our_ops.iter().zip(cdp_ops.iter()).enumerate() {
         let our_op_xdr = our_op
-            .to_xdr(stellar_xdr::curr::Limits::none())
+            .to_xdr(stellar_xdr::Limits::none())
             .unwrap_or_default();
         let cdp_op_xdr = cdp_op
-            .to_xdr(stellar_xdr::curr::Limits::none())
+            .to_xdr(stellar_xdr::Limits::none())
             .unwrap_or_default();
         if our_op_xdr != cdp_op_xdr {
             println!("          Op {} differs:", j);
@@ -355,7 +350,7 @@ pub(super) fn print_op_diffs(
 }
 
 /// Prints all operations from a result slice with a label.
-pub(super) fn print_all_ops(label: &str, ops: &[stellar_xdr::curr::OperationResult]) {
+pub(super) fn print_all_ops(label: &str, ops: &[stellar_xdr::OperationResult]) {
     println!("        {} ops ({}):", label, ops.len());
     for (j, op) in ops.iter().enumerate() {
         println!("          Op {}: {:?}", j, op);
@@ -364,8 +359,8 @@ pub(super) fn print_all_ops(label: &str, ops: &[stellar_xdr::curr::OperationResu
 
 /// Prints an exhaustive field-by-field comparison of two ledger headers.
 pub(super) fn print_header_field_diffs(
-    h: &stellar_xdr::curr::LedgerHeader,
-    c: &stellar_xdr::curr::LedgerHeader,
+    h: &stellar_xdr::LedgerHeader,
+    c: &stellar_xdr::LedgerHeader,
     bucket_levels: &[(henyey_common::Hash256, henyey_common::Hash256)],
 ) {
     use henyey_common::Hash256;
@@ -499,10 +494,10 @@ pub(super) fn print_header_field_diffs(
 
 /// Compare fee bump inner results from both sides and print differences.
 pub(super) fn print_fee_bump_inner_diffs(
-    our_result: &stellar_xdr::curr::TransactionResultResult,
-    cdp_result: &stellar_xdr::curr::TransactionResultResult,
+    our_result: &stellar_xdr::TransactionResultResult,
+    cdp_result: &stellar_xdr::TransactionResultResult,
 ) {
-    use stellar_xdr::curr::{InnerTransactionResultResult, TransactionResultResult};
+    use stellar_xdr::{InnerTransactionResultResult, TransactionResultResult};
 
     match (our_result, cdp_result) {
         (
@@ -592,10 +587,10 @@ pub(super) fn print_fee_bump_inner_diffs(
 /// Shows ordering differences, then does a TX-by-TX XDR comparison with
 /// detailed operation-level diffs for all result variant combinations.
 pub(super) fn print_tx_result_diffs(
-    our_results: &[stellar_xdr::curr::TransactionResultPair],
-    cdp_results: &[stellar_xdr::curr::TransactionResultPair],
+    our_results: &[stellar_xdr::TransactionResultPair],
+    cdp_results: &[stellar_xdr::TransactionResultPair],
 ) {
-    use stellar_xdr::curr::{TransactionResultResult, WriteXdr};
+    use stellar_xdr::{TransactionResultResult, WriteXdr};
     println!(
         "    TX count: ours={} CDP={}",
         our_results.len(),
@@ -628,11 +623,11 @@ pub(super) fn print_tx_result_diffs(
     for (i, (our_tx, cdp_tx)) in our_results.iter().zip(cdp_results.iter()).enumerate() {
         let our_xdr = our_tx
             .result
-            .to_xdr(stellar_xdr::curr::Limits::none())
+            .to_xdr(stellar_xdr::Limits::none())
             .unwrap_or_default();
         let cdp_xdr = cdp_tx
             .result
-            .to_xdr(stellar_xdr::curr::Limits::none())
+            .to_xdr(stellar_xdr::Limits::none())
             .unwrap_or_default();
 
         if our_xdr != cdp_xdr {
@@ -729,25 +724,25 @@ pub(super) fn print_tx_result_diffs(
 /// Mapping preserved exactly: `Created→creates`; `Updated` and `Restored→updates`;
 /// `Removed→deletes`; `State` ignored. Callers accumulate (`+=`) the returned
 /// tuple — the counts fold across all change-groups and tx_metas.
-fn count_changes(changes: &[stellar_xdr::curr::LedgerEntryChange]) -> (u32, u32, u32) {
+fn count_changes(changes: &[stellar_xdr::LedgerEntryChange]) -> (u32, u32, u32) {
     let mut creates = 0u32;
     let mut updates = 0u32;
     let mut deletes = 0u32;
     for change in changes {
         match change {
-            stellar_xdr::curr::LedgerEntryChange::Created(_) => creates += 1,
-            stellar_xdr::curr::LedgerEntryChange::Updated(_) => updates += 1,
-            stellar_xdr::curr::LedgerEntryChange::Removed(_) => deletes += 1,
-            stellar_xdr::curr::LedgerEntryChange::Restored(_) => updates += 1,
-            stellar_xdr::curr::LedgerEntryChange::State(_) => {}
+            stellar_xdr::LedgerEntryChange::Created(_) => creates += 1,
+            stellar_xdr::LedgerEntryChange::Updated(_) => updates += 1,
+            stellar_xdr::LedgerEntryChange::Removed(_) => deletes += 1,
+            stellar_xdr::LedgerEntryChange::Restored(_) => updates += 1,
+            stellar_xdr::LedgerEntryChange::State(_) => {}
         }
     }
     (creates, updates, deletes)
 }
 
 pub(super) fn cdp_change_counts(
-    tx_metas: &[stellar_xdr::curr::TransactionMeta],
-    upgrade_metas: &[stellar_xdr::curr::UpgradeEntryMeta],
+    tx_metas: &[stellar_xdr::TransactionMeta],
+    upgrade_metas: &[stellar_xdr::UpgradeEntryMeta],
 ) -> (u32, u32, u32, u32, u32) {
     let mut cdp_creates = 0u32;
     let mut cdp_updates = 0u32;
@@ -768,8 +763,8 @@ pub(super) fn cdp_change_counts(
     for um in upgrade_metas {
         for change in um.changes.iter() {
             match change {
-                stellar_xdr::curr::LedgerEntryChange::Created(_) => upgrade_creates += 1,
-                stellar_xdr::curr::LedgerEntryChange::Updated(_) => upgrade_updates += 1,
+                stellar_xdr::LedgerEntryChange::Created(_) => upgrade_creates += 1,
+                stellar_xdr::LedgerEntryChange::Updated(_) => upgrade_updates += 1,
                 _ => {}
             }
         }
@@ -788,23 +783,23 @@ pub(super) fn cdp_change_counts(
 ///
 /// Verbatim move of the `if !cdp_upgrade_metas.is_empty()` block from
 /// `run::print_eviction_and_entry_diagnostics`.
-pub(super) fn print_cdp_upgrade_entries(upgrade_metas: &[stellar_xdr::curr::UpgradeEntryMeta]) {
+pub(super) fn print_cdp_upgrade_entries(upgrade_metas: &[stellar_xdr::UpgradeEntryMeta]) {
     if !upgrade_metas.is_empty() {
         use sha2::{Digest, Sha256};
-        use stellar_xdr::curr::WriteXdr;
+        use stellar_xdr::WriteXdr;
         println!("    CDP upgrade entries (expected):");
         for (ui, um) in upgrade_metas.iter().enumerate() {
             for change in um.changes.iter() {
                 match change {
-                    stellar_xdr::curr::LedgerEntryChange::Updated(entry) => {
+                    stellar_xdr::LedgerEntryChange::Updated(entry) => {
                         let key_str = match &entry.data {
-                            stellar_xdr::curr::LedgerEntryData::ConfigSetting(cs) => {
+                            stellar_xdr::LedgerEntryData::ConfigSetting(cs) => {
                                 format!("ConfigSetting({:?})", cs.discriminant())
                             }
                             other => format!("{:?}", std::mem::discriminant(other)),
                         };
                         let xdr_bytes = entry
-                            .to_xdr(stellar_xdr::curr::Limits::none())
+                            .to_xdr(stellar_xdr::Limits::none())
                             .unwrap_or_default();
                         let xdr_size = xdr_bytes.len();
                         let hash = {
@@ -816,15 +811,15 @@ pub(super) fn print_cdp_upgrade_entries(upgrade_metas: &[stellar_xdr::curr::Upgr
                         println!("      upgrade[{}] Updated: key={}, last_modified={}, xdr_size={}, xdr_hash={}",
                         ui, key_str, entry.last_modified_ledger_seq, xdr_size, hash);
                     }
-                    stellar_xdr::curr::LedgerEntryChange::Created(entry) => {
+                    stellar_xdr::LedgerEntryChange::Created(entry) => {
                         let key_str = match &entry.data {
-                            stellar_xdr::curr::LedgerEntryData::ConfigSetting(cs) => {
+                            stellar_xdr::LedgerEntryData::ConfigSetting(cs) => {
                                 format!("ConfigSetting({:?})", cs.discriminant())
                             }
                             other => format!("{:?}", std::mem::discriminant(other)),
                         };
                         let xdr_bytes = entry
-                            .to_xdr(stellar_xdr::curr::Limits::none())
+                            .to_xdr(stellar_xdr::Limits::none())
                             .unwrap_or_default();
                         let xdr_size = xdr_bytes.len();
                         let hash = {
@@ -836,9 +831,9 @@ pub(super) fn print_cdp_upgrade_entries(upgrade_metas: &[stellar_xdr::curr::Upgr
                         println!("      upgrade[{}] Created: key={}, last_modified={}, xdr_size={}, xdr_hash={}",
                         ui, key_str, entry.last_modified_ledger_seq, xdr_size, hash);
                     }
-                    stellar_xdr::curr::LedgerEntryChange::State(entry) => {
+                    stellar_xdr::LedgerEntryChange::State(entry) => {
                         let key_str = match &entry.data {
-                            stellar_xdr::curr::LedgerEntryData::ConfigSetting(cs) => {
+                            stellar_xdr::LedgerEntryData::ConfigSetting(cs) => {
                                 format!("ConfigSetting({:?})", cs.discriminant())
                             }
                             other => format!("{:?}", std::mem::discriminant(other)),
@@ -859,29 +854,29 @@ pub(super) fn print_cdp_upgrade_entries(upgrade_metas: &[stellar_xdr::curr::Upgr
 /// printing. Includes ALL change sources: `fee_processing`,
 /// `tx_apply_processing`, and `post_tx_apply_fee_processing` (V2 only).
 pub(super) fn coalesce_cdp_final_entries(
-    lcm: &stellar_xdr::curr::LedgerCloseMeta,
-) -> std::collections::HashMap<Vec<u8>, stellar_xdr::curr::LedgerEntry> {
-    use stellar_xdr::curr::WriteXdr;
+    lcm: &stellar_xdr::LedgerCloseMeta,
+) -> std::collections::HashMap<Vec<u8>, stellar_xdr::LedgerEntry> {
+    use stellar_xdr::WriteXdr;
     // Coalesce: keep last Updated entry per key
     // Include ALL change sources: fee_processing, tx_apply_processing, and post_tx_apply_fee_processing
-    let mut final_entries: std::collections::HashMap<Vec<u8>, stellar_xdr::curr::LedgerEntry> =
+    let mut final_entries: std::collections::HashMap<Vec<u8>, stellar_xdr::LedgerEntry> =
         std::collections::HashMap::new();
     // Helper to process a slice of changes into the coalesced map
     let coalesce_changes =
-        |changes: &[stellar_xdr::curr::LedgerEntryChange],
-         map: &mut std::collections::HashMap<Vec<u8>, stellar_xdr::curr::LedgerEntry>| {
+        |changes: &[stellar_xdr::LedgerEntryChange],
+         map: &mut std::collections::HashMap<Vec<u8>, stellar_xdr::LedgerEntry>| {
             for change in changes {
                 match change {
-                    stellar_xdr::curr::LedgerEntryChange::Updated(entry)
-                    | stellar_xdr::curr::LedgerEntryChange::Created(entry)
-                    | stellar_xdr::curr::LedgerEntryChange::Restored(entry) => {
+                    stellar_xdr::LedgerEntryChange::Updated(entry)
+                    | stellar_xdr::LedgerEntryChange::Created(entry)
+                    | stellar_xdr::LedgerEntryChange::Restored(entry) => {
                         let key = henyey_common::entry_to_key(entry);
-                        if let Ok(kb) = key.to_xdr(stellar_xdr::curr::Limits::none()) {
+                        if let Ok(kb) = key.to_xdr(stellar_xdr::Limits::none()) {
                             map.insert(kb, entry.clone());
                         }
                     }
-                    stellar_xdr::curr::LedgerEntryChange::Removed(key) => {
-                        if let Ok(kb) = key.to_xdr(stellar_xdr::curr::Limits::none()) {
+                    stellar_xdr::LedgerEntryChange::Removed(key) => {
+                        if let Ok(kb) = key.to_xdr(stellar_xdr::Limits::none()) {
                             map.remove(&kb);
                         }
                     }
@@ -890,29 +885,29 @@ pub(super) fn coalesce_cdp_final_entries(
             }
         };
     let coalesce_tx_meta =
-        |meta: &stellar_xdr::curr::TransactionMeta,
-         map: &mut std::collections::HashMap<Vec<u8>, stellar_xdr::curr::LedgerEntry>| {
+        |meta: &stellar_xdr::TransactionMeta,
+         map: &mut std::collections::HashMap<Vec<u8>, stellar_xdr::LedgerEntry>| {
             henyey_common::meta_walk::for_each_change_group(meta, |changes| {
                 coalesce_changes(changes, map);
             });
         };
     // Process ALL change sources from LCM tx_processing
     match &lcm {
-        stellar_xdr::curr::LedgerCloseMeta::V0(v0) => {
+        stellar_xdr::LedgerCloseMeta::V0(v0) => {
             for tp in v0.tx_processing.iter() {
                 coalesce_changes(&tp.fee_processing, &mut final_entries);
                 coalesce_tx_meta(&tp.tx_apply_processing, &mut final_entries);
                 // V0 TransactionResultMeta has no post_tx_apply_fee_processing
             }
         }
-        stellar_xdr::curr::LedgerCloseMeta::V1(v1) => {
+        stellar_xdr::LedgerCloseMeta::V1(v1) => {
             for tp in v1.tx_processing.iter() {
                 coalesce_changes(&tp.fee_processing, &mut final_entries);
                 coalesce_tx_meta(&tp.tx_apply_processing, &mut final_entries);
                 // V1 TransactionResultMeta has no post_tx_apply_fee_processing
             }
         }
-        stellar_xdr::curr::LedgerCloseMeta::V2(v2) => {
+        stellar_xdr::LedgerCloseMeta::V2(v2) => {
             for tp in v2.tx_processing.iter() {
                 coalesce_changes(&tp.fee_processing, &mut final_entries);
                 coalesce_tx_meta(&tp.tx_apply_processing, &mut final_entries);
@@ -924,15 +919,12 @@ pub(super) fn coalesce_cdp_final_entries(
 }
 
 /// Prints readable offer-entry diff details for a CDP/ours offer mismatch.
-fn print_offer_diff_detail(
-    cdp_o: &stellar_xdr::curr::OfferEntry,
-    our_o: &stellar_xdr::curr::OfferEntry,
-) {
+fn print_offer_diff_detail(cdp_o: &stellar_xdr::OfferEntry, our_o: &stellar_xdr::OfferEntry) {
     println!(
         "      CDP  offer: seller={:?} amount={} price={}/{}",
         hex::encode(
             &{
-                let stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(ref pk) = cdp_o.seller_id.0;
+                let stellar_xdr::PublicKey::PublicKeyTypeEd25519(ref pk) = cdp_o.seller_id.0;
                 pk.0
             }[..8]
         ),
@@ -944,7 +936,7 @@ fn print_offer_diff_detail(
         "      Ours offer: seller={:?} amount={} price={}/{}",
         hex::encode(
             &{
-                let stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(ref pk) = our_o.seller_id.0;
+                let stellar_xdr::PublicKey::PublicKeyTypeEd25519(ref pk) = our_o.seller_id.0;
                 pk.0
             }[..8]
         ),
@@ -955,21 +947,18 @@ fn print_offer_diff_detail(
 }
 
 /// Prints readable account-entry diff details for a CDP/ours account mismatch.
-fn print_account_diff_detail(
-    cdp_a: &stellar_xdr::curr::AccountEntry,
-    our_a: &stellar_xdr::curr::AccountEntry,
-) {
+fn print_account_diff_detail(cdp_a: &stellar_xdr::AccountEntry, our_a: &stellar_xdr::AccountEntry) {
     let cdp_pk = {
-        let stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(ref pk) = cdp_a.account_id.0;
+        let stellar_xdr::PublicKey::PublicKeyTypeEd25519(ref pk) = cdp_a.account_id.0;
         hex::encode(&pk.0[..16])
     };
     // Extract sponsorship counts from extensions
-    let get_ext = |a: &stellar_xdr::curr::AccountEntry| -> (u32, u32, u32) {
+    let get_ext = |a: &stellar_xdr::AccountEntry| -> (u32, u32, u32) {
         match &a.ext {
-            stellar_xdr::curr::AccountEntryExt::V0 => (0, 0, 0),
-            stellar_xdr::curr::AccountEntryExt::V1(v1) => match &v1.ext {
-                stellar_xdr::curr::AccountEntryExtensionV1Ext::V0 => (0, 0, 0),
-                stellar_xdr::curr::AccountEntryExtensionV1Ext::V2(v2) => (
+            stellar_xdr::AccountEntryExt::V0 => (0, 0, 0),
+            stellar_xdr::AccountEntryExt::V1(v1) => match &v1.ext {
+                stellar_xdr::AccountEntryExtensionV1Ext::V0 => (0, 0, 0),
+                stellar_xdr::AccountEntryExtensionV1Ext::V2(v2) => (
                     v2.num_sponsoring,
                     v2.num_sponsored,
                     v2.signer_sponsoring_i_ds.len() as u32,
@@ -1011,8 +1000,8 @@ fn print_account_diff_detail(
 
 /// Prints readable trustline-entry diff details for a CDP/ours trustline mismatch.
 fn print_trustline_diff_detail(
-    cdp_t: &stellar_xdr::curr::TrustLineEntry,
-    our_t: &stellar_xdr::curr::TrustLineEntry,
+    cdp_t: &stellar_xdr::TrustLineEntry,
+    our_t: &stellar_xdr::TrustLineEntry,
 ) {
     println!(
         "      CDP  trustline: balance={} asset={:?}",
@@ -1026,13 +1015,11 @@ fn print_trustline_diff_detail(
 
 /// Prints readable liquidity-pool-entry diff details for a CDP/ours pool mismatch.
 fn print_pool_diff_detail(
-    cdp_p: &stellar_xdr::curr::LiquidityPoolEntry,
-    our_p: &stellar_xdr::curr::LiquidityPoolEntry,
+    cdp_p: &stellar_xdr::LiquidityPoolEntry,
+    our_p: &stellar_xdr::LiquidityPoolEntry,
 ) {
-    let stellar_xdr::curr::LiquidityPoolEntryBody::LiquidityPoolConstantProduct(ref cdp_cp) =
-        cdp_p.body;
-    let stellar_xdr::curr::LiquidityPoolEntryBody::LiquidityPoolConstantProduct(ref our_cp) =
-        our_p.body;
+    let stellar_xdr::LiquidityPoolEntryBody::LiquidityPoolConstantProduct(ref cdp_cp) = cdp_p.body;
+    let stellar_xdr::LiquidityPoolEntryBody::LiquidityPoolConstantProduct(ref our_cp) = our_p.body;
     println!(
         "      CDP  pool: reserve_a={} reserve_b={}",
         cdp_cp.reserve_a, cdp_cp.reserve_b
@@ -1045,14 +1032,14 @@ fn print_pool_diff_detail(
 
 /// Formats a short key description for a CDP entry that is truly missing from
 /// our state. Returns the string; the caller emits the `println!`.
-fn format_missing_entry_key(data: &stellar_xdr::curr::LedgerEntryData) -> String {
+fn format_missing_entry_key(data: &stellar_xdr::LedgerEntryData) -> String {
     match data {
-        stellar_xdr::curr::LedgerEntryData::Account(a) => {
-            let stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(ref pk) = a.account_id.0;
+        stellar_xdr::LedgerEntryData::Account(a) => {
+            let stellar_xdr::PublicKey::PublicKeyTypeEd25519(ref pk) = a.account_id.0;
             format!("Account({})", hex::encode(&pk.0[..8]))
         }
-        stellar_xdr::curr::LedgerEntryData::Trustline(t) => {
-            let stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(ref pk) = t.account_id.0;
+        stellar_xdr::LedgerEntryData::Trustline(t) => {
+            let stellar_xdr::PublicKey::PublicKeyTypeEd25519(ref pk) = t.account_id.0;
             format!(
                 "Trustline(acct={}, asset={:?}, balance={})",
                 hex::encode(&pk.0[..8]),
@@ -1060,9 +1047,8 @@ fn format_missing_entry_key(data: &stellar_xdr::curr::LedgerEntryData) -> String
                 t.balance
             )
         }
-        stellar_xdr::curr::LedgerEntryData::LiquidityPool(p) => {
-            let stellar_xdr::curr::LiquidityPoolEntryBody::LiquidityPoolConstantProduct(ref cp) =
-                p.body;
+        stellar_xdr::LedgerEntryData::LiquidityPool(p) => {
+            let stellar_xdr::LiquidityPoolEntryBody::LiquidityPoolConstantProduct(ref cp) = p.body;
             format!("Pool(ra={}, rb={})", cp.reserve_a, cp.reserve_b)
         }
         other => format!("{:?}", std::mem::discriminant(other)),
@@ -1078,11 +1064,11 @@ fn format_missing_entry_key(data: &stellar_xdr::curr::LedgerEntryData) -> String
 /// and the `offer_store_lock()` `MutexGuard` scopes stay inside this helper.
 pub(super) fn print_cdp_entry_comparison(
     ctx: &super::VerifyContext,
-    result_header: &stellar_xdr::curr::LedgerHeader,
-    final_entries: &std::collections::HashMap<Vec<u8>, stellar_xdr::curr::LedgerEntry>,
+    result_header: &stellar_xdr::LedgerHeader,
+    final_entries: &std::collections::HashMap<Vec<u8>, stellar_xdr::LedgerEntry>,
 ) {
     use sha2::{Digest, Sha256};
-    use stellar_xdr::curr::WriteXdr;
+    use stellar_xdr::WriteXdr;
     // Compare CDP entries with our bucket list state
     let bl = ctx.ledger_manager.bucket_list();
     let bl_snapshot = henyey_bucket::BucketListSnapshot::new(&bl, result_header.clone());
@@ -1090,13 +1076,12 @@ pub(super) fn print_cdp_entry_comparison(
     let mut diffs = 0;
     let mut missing = 0;
     for (key_bytes, cdp_entry) in final_entries.iter() {
-        use stellar_xdr::curr::ReadXdr;
-        if let Ok(key) = stellar_xdr::curr::LedgerKey::from_xdr(
-            key_bytes.as_slice(),
-            stellar_xdr::curr::Limits::none(),
-        ) {
+        use stellar_xdr::ReadXdr;
+        if let Ok(key) =
+            stellar_xdr::LedgerKey::from_xdr(key_bytes.as_slice(), stellar_xdr::Limits::none())
+        {
             let cdp_xdr = cdp_entry
-                .to_xdr(stellar_xdr::curr::Limits::none())
+                .to_xdr(stellar_xdr::Limits::none())
                 .unwrap_or_default();
             let cdp_hash = {
                 let mut h = Sha256::new();
@@ -1106,7 +1091,7 @@ pub(super) fn print_cdp_entry_comparison(
             match bl_snapshot.get(&key) {
                 Some(our_entry) => {
                     let our_xdr = our_entry
-                        .to_xdr(stellar_xdr::curr::Limits::none())
+                        .to_xdr(stellar_xdr::Limits::none())
                         .unwrap_or_default();
                     let our_hash = {
                         let mut h = Sha256::new();
@@ -1135,29 +1120,29 @@ pub(super) fn print_cdp_entry_comparison(
                         );
                         // For offers, show readable details
                         if let (
-                            stellar_xdr::curr::LedgerEntryData::Offer(cdp_o),
-                            stellar_xdr::curr::LedgerEntryData::Offer(our_o),
+                            stellar_xdr::LedgerEntryData::Offer(cdp_o),
+                            stellar_xdr::LedgerEntryData::Offer(our_o),
                         ) = (&cdp_entry.data, &our_entry.data)
                         {
                             print_offer_diff_detail(cdp_o, our_o);
                         }
                         if let (
-                            stellar_xdr::curr::LedgerEntryData::Account(cdp_a),
-                            stellar_xdr::curr::LedgerEntryData::Account(our_a),
+                            stellar_xdr::LedgerEntryData::Account(cdp_a),
+                            stellar_xdr::LedgerEntryData::Account(our_a),
                         ) = (&cdp_entry.data, &our_entry.data)
                         {
                             print_account_diff_detail(cdp_a, our_a);
                         }
                         if let (
-                            stellar_xdr::curr::LedgerEntryData::Trustline(cdp_t),
-                            stellar_xdr::curr::LedgerEntryData::Trustline(our_t),
+                            stellar_xdr::LedgerEntryData::Trustline(cdp_t),
+                            stellar_xdr::LedgerEntryData::Trustline(our_t),
                         ) = (&cdp_entry.data, &our_entry.data)
                         {
                             print_trustline_diff_detail(cdp_t, our_t);
                         }
                         if let (
-                            stellar_xdr::curr::LedgerEntryData::LiquidityPool(cdp_p),
-                            stellar_xdr::curr::LedgerEntryData::LiquidityPool(our_p),
+                            stellar_xdr::LedgerEntryData::LiquidityPool(cdp_p),
+                            stellar_xdr::LedgerEntryData::LiquidityPool(our_p),
                         ) = (&cdp_entry.data, &our_entry.data)
                         {
                             print_pool_diff_detail(cdp_p, our_p);
@@ -1170,15 +1155,14 @@ pub(super) fn print_cdp_entry_comparison(
                 None => {
                     // For offers, try the offer_store instead of bucket list snapshot
                     // (offers are not indexed in bucket list snapshot)
-                    if let stellar_xdr::curr::LedgerEntryData::Offer(ref cdp_offer) = cdp_entry.data
-                    {
+                    if let stellar_xdr::LedgerEntryData::Offer(ref cdp_offer) = cdp_entry.data {
                         let offer_store = ctx.ledger_manager.offer_store_lock();
                         if let Some(our_entry) = offer_store
                             .get_ledger_entry_by_id(cdp_offer.offer_id)
                             .as_ref()
                         {
                             let our_xdr = our_entry
-                                .to_xdr(stellar_xdr::curr::Limits::none())
+                                .to_xdr(stellar_xdr::Limits::none())
                                 .unwrap_or_default();
                             let our_hash = {
                                 let mut h = Sha256::new();
@@ -1187,13 +1171,12 @@ pub(super) fn print_cdp_entry_comparison(
                             };
                             if our_hash != cdp_hash {
                                 diffs += 1;
-                                if let stellar_xdr::curr::LedgerEntryData::Offer(ref our_offer) =
+                                if let stellar_xdr::LedgerEntryData::Offer(ref our_offer) =
                                     our_entry.data
                                 {
                                     let cdp_seller = {
-                                        let stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
-                                            ref pk,
-                                        ) = cdp_offer.seller_id.0;
+                                        let stellar_xdr::PublicKey::PublicKeyTypeEd25519(ref pk) =
+                                            cdp_offer.seller_id.0;
                                         hex::encode(&pk.0[..8])
                                     };
                                     println!(
@@ -1221,7 +1204,7 @@ pub(super) fn print_cdp_entry_comparison(
                             // Offer is truly missing from our state
                             missing += 1;
                             let cdp_seller = {
-                                let stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(ref pk) =
+                                let stellar_xdr::PublicKey::PublicKeyTypeEd25519(ref pk) =
                                     cdp_offer.seller_id.0;
                                 hex::encode(&pk.0)
                             };
@@ -1257,7 +1240,7 @@ pub(super) fn print_cdp_entry_comparison(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use stellar_xdr::curr::{
+    use stellar_xdr::{
         AccountEntry, AccountEntryExt, AccountId, ExtensionPoint, GeneralizedTransactionSet, Hash,
         LedgerCloseMeta, LedgerCloseMetaExt, LedgerCloseMetaV2, LedgerEntry, LedgerEntryChange,
         LedgerEntryData, LedgerEntryExt, LedgerHeader, LedgerHeaderExt, LedgerHeaderHistoryEntry,
@@ -1411,7 +1394,7 @@ mod tests {
 
     fn entry_key_bytes(entry: &LedgerEntry) -> Vec<u8> {
         henyey_common::entry_to_key(entry)
-            .to_xdr(stellar_xdr::curr::Limits::none())
+            .to_xdr(stellar_xdr::Limits::none())
             .unwrap()
     }
 

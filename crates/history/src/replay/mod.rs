@@ -57,7 +57,7 @@ use henyey_bucket::EvictionIterator;
 use henyey_common::{Hash256, NetworkId};
 use henyey_ledger::EntryChange;
 use henyey_tx::soroban::PersistentModuleCache;
-use stellar_xdr::curr::{
+use stellar_xdr::{
     LedgerEntry, LedgerHeader, LedgerKey, StateArchivalSettings, TransactionResultPair,
 };
 
@@ -289,7 +289,7 @@ impl ReplayedLedgerState {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use stellar_xdr::curr::{Hash, StellarValue, TimePoint, TransactionSet, VecM};
+    use stellar_xdr::{Hash, StellarValue, TimePoint, TransactionSet, VecM};
 
     pub(crate) fn make_test_header(seq: u32) -> LedgerHeader {
         LedgerHeader {
@@ -299,7 +299,7 @@ pub(crate) mod tests {
                 tx_set_hash: Hash([0u8; 32]),
                 close_time: TimePoint(1234567890),
                 upgrades: VecM::default(),
-                ext: stellar_xdr::curr::StellarValueExt::Basic,
+                ext: stellar_xdr::StellarValueExt::Basic,
             },
             tx_set_result_hash: Hash([0u8; 32]),
             bucket_list_hash: Hash([0u8; 32]),
@@ -312,7 +312,7 @@ pub(crate) mod tests {
             base_reserve: 5000000,
             max_tx_set_size: 100,
             skip_list: std::array::from_fn(|_| Hash([0u8; 32])),
-            ext: stellar_xdr::curr::LedgerHeaderExt::V0,
+            ext: stellar_xdr::LedgerHeaderExt::V0,
         }
     }
 

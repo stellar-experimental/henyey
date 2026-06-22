@@ -28,7 +28,7 @@
 //!
 //! ```
 //! use henyey_crypto::xdr_compute_hash;
-//! use stellar_xdr::curr::LedgerEntry;
+//! use stellar_xdr::LedgerEntry;
 //!
 //! // Hash an XDR-encoded value using the process-global key.
 //! let entry = LedgerEntry::default();
@@ -40,7 +40,7 @@ use crate::CryptoError;
 use siphasher::sip::SipHasher24;
 use std::hash::Hasher;
 use std::sync::{Mutex, OnceLock};
-use stellar_xdr::curr::{Limits, WriteXdr};
+use stellar_xdr::{Limits, WriteXdr};
 
 /// Size of the SipHash key in bytes (128 bits).
 const KEY_BYTES: usize = 16;
@@ -166,7 +166,7 @@ pub fn xdr_compute_hash<T: WriteXdr>(value: &T) -> Result<u64, CryptoError> {
 mod tests {
     use super::*;
     use std::sync::{Mutex, MutexGuard, OnceLock};
-    use stellar_xdr::curr::LedgerEntry;
+    use stellar_xdr::LedgerEntry;
 
     fn test_guard() -> MutexGuard<'static, ()> {
         static GUARD: OnceLock<Mutex<()>> = OnceLock::new();

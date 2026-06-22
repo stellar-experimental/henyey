@@ -47,7 +47,7 @@ use std::sync::Arc;
 /// Exceeding this limit indicates a bug in the protocol state machine.
 const MAX_PROTOCOL_TRANSITIONS: u32 = 50;
 
-use stellar_xdr::curr::{
+use stellar_xdr::{
     NodeId, ScpBallot, ScpEnvelope, ScpQuorumSet, ScpStatement, ScpStatementConfirm,
     ScpStatementExternalize, ScpStatementPledges, ScpStatementPrepare, Value,
 };
@@ -1069,7 +1069,7 @@ mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
-    use stellar_xdr::curr::{ScpNomination, VecM};
+    use stellar_xdr::{ScpNomination, VecM};
 
     /// Helper to construct a `SlotContext` from the old four-parameter pattern.
     macro_rules! ctx {
@@ -1158,7 +1158,7 @@ mod tests {
         };
         ScpEnvelope {
             statement,
-            signature: stellar_xdr::curr::Signature(Vec::new().try_into().unwrap_or_default()),
+            signature: stellar_xdr::Signature(Vec::new().try_into().unwrap_or_default()),
         }
     }
 
@@ -1191,7 +1191,7 @@ mod tests {
         };
         ScpEnvelope {
             statement,
-            signature: stellar_xdr::curr::Signature(Vec::new().try_into().unwrap_or_default()),
+            signature: stellar_xdr::Signature(Vec::new().try_into().unwrap_or_default()),
         }
     }
 
@@ -1215,7 +1215,7 @@ mod tests {
         };
         ScpEnvelope {
             statement,
-            signature: stellar_xdr::curr::Signature(Vec::new().try_into().unwrap_or_default()),
+            signature: stellar_xdr::Signature(Vec::new().try_into().unwrap_or_default()),
         }
     }
 
@@ -1242,7 +1242,7 @@ mod tests {
         };
         ScpEnvelope {
             statement,
-            signature: stellar_xdr::curr::Signature(Vec::new().try_into().unwrap_or_default()),
+            signature: stellar_xdr::Signature(Vec::new().try_into().unwrap_or_default()),
         }
     }
 
@@ -1263,7 +1263,7 @@ mod tests {
         };
         ScpEnvelope {
             statement,
-            signature: stellar_xdr::curr::Signature(Vec::new().try_into().unwrap_or_default()),
+            signature: stellar_xdr::Signature(Vec::new().try_into().unwrap_or_default()),
         }
     }
 
@@ -1286,7 +1286,7 @@ mod tests {
         };
         ScpEnvelope {
             statement,
-            signature: stellar_xdr::curr::Signature(Vec::new().try_into().unwrap_or_default()),
+            signature: stellar_xdr::Signature(Vec::new().try_into().unwrap_or_default()),
         }
     }
 
@@ -1303,7 +1303,7 @@ mod tests {
             n_prepared,
             n_commit,
             n_h,
-            quorum_set_hash: stellar_xdr::curr::Hash([0u8; 32]),
+            quorum_set_hash: stellar_xdr::Hash([0u8; 32]),
         };
         let statement = ScpStatement {
             node_id,
@@ -1312,7 +1312,7 @@ mod tests {
         };
         ScpEnvelope {
             statement,
-            signature: stellar_xdr::curr::Signature(Vec::new().try_into().unwrap_or_default()),
+            signature: stellar_xdr::Signature(Vec::new().try_into().unwrap_or_default()),
         }
     }
 
@@ -2763,7 +2763,7 @@ mod tests {
         };
         let envelope = ScpEnvelope {
             statement,
-            signature: stellar_xdr::curr::Signature(Vec::new().try_into().unwrap_or_default()),
+            signature: stellar_xdr::Signature(Vec::new().try_into().unwrap_or_default()),
         };
 
         ssfe!(ballot, &envelope, &node, &quorum_set).unwrap();
@@ -2800,7 +2800,7 @@ mod tests {
         };
         let envelope = ScpEnvelope {
             statement,
-            signature: stellar_xdr::curr::Signature(Vec::new().try_into().unwrap_or_default()),
+            signature: stellar_xdr::Signature(Vec::new().try_into().unwrap_or_default()),
         };
 
         ssfe!(ballot, &envelope, &node, &quorum_set).unwrap();
@@ -2835,7 +2835,7 @@ mod tests {
         };
         let envelope = ScpEnvelope {
             statement,
-            signature: stellar_xdr::curr::Signature(Vec::new().try_into().unwrap_or_default()),
+            signature: stellar_xdr::Signature(Vec::new().try_into().unwrap_or_default()),
         };
 
         ssfe!(ballot, &envelope, &node, &quorum_set).unwrap();
@@ -2865,7 +2865,7 @@ mod tests {
         };
         let envelope = ScpEnvelope {
             statement,
-            signature: stellar_xdr::curr::Signature(Vec::new().try_into().unwrap_or_default()),
+            signature: stellar_xdr::Signature(Vec::new().try_into().unwrap_or_default()),
         };
 
         let _ = ssfe!(ballot, &envelope, &node, &quorum_set);
@@ -2923,7 +2923,7 @@ mod tests {
         };
         let envelope = ScpEnvelope {
             statement,
-            signature: stellar_xdr::curr::Signature(Vec::new().try_into().unwrap_or_default()),
+            signature: stellar_xdr::Signature(Vec::new().try_into().unwrap_or_default()),
         };
         ssfe!(ballot, &envelope, &node, &quorum_set).unwrap();
 
@@ -3274,7 +3274,7 @@ mod tests {
         };
         let envelope = ScpEnvelope {
             statement,
-            signature: stellar_xdr::curr::Signature(Vec::new().try_into().unwrap_or_default()),
+            signature: stellar_xdr::Signature(Vec::new().try_into().unwrap_or_default()),
         };
         ssfe!(bp, &envelope, &node, &quorum_set).unwrap();
         assert!(
@@ -3299,7 +3299,7 @@ mod tests {
         };
         let envelope = ScpEnvelope {
             statement,
-            signature: stellar_xdr::curr::Signature(Vec::new().try_into().unwrap_or_default()),
+            signature: stellar_xdr::Signature(Vec::new().try_into().unwrap_or_default()),
         };
         ssfe!(bp, &envelope, &node, &quorum_set).unwrap();
         assert!(
@@ -4623,7 +4623,7 @@ mod tests {
     // tests do not depend on a tracing subscriber.
 
     use crate::compare::ballot_summary_of;
-    use stellar_xdr::curr::{Hash, ScpStatementConfirm, ScpStatementExternalize, Signature};
+    use stellar_xdr::{Hash, ScpStatementConfirm, ScpStatementExternalize, Signature};
 
     fn zero_hash() -> Hash {
         Hash::from([0u8; 32])
@@ -5225,7 +5225,7 @@ mod tests {
         let mut bp = BallotProtocol::new();
 
         let value = make_value(&[42]);
-        let qs_hash: stellar_xdr::curr::Hash = hash_quorum_set(&quorum_set).into();
+        let qs_hash: stellar_xdr::Hash = hash_quorum_set(&quorum_set).into();
 
         // Manually put bp into Confirm phase with valid commit and high_ballot
         bp.phase = BallotPhase::Confirm;
@@ -5260,7 +5260,7 @@ mod tests {
                     quorum_set_hash: qs_hash.clone(),
                 }),
             },
-            signature: stellar_xdr::curr::Signature(Vec::new().try_into().unwrap_or_default()),
+            signature: stellar_xdr::Signature(Vec::new().try_into().unwrap_or_default()),
         };
         let env_c = ScpEnvelope {
             statement: ScpStatement {
@@ -5277,7 +5277,7 @@ mod tests {
                     quorum_set_hash: qs_hash.clone(),
                 }),
             },
-            signature: stellar_xdr::curr::Signature(Vec::new().try_into().unwrap_or_default()),
+            signature: stellar_xdr::Signature(Vec::new().try_into().unwrap_or_default()),
         };
         bp.latest_envelopes.insert(node_b.clone(), env_b);
         bp.latest_envelopes.insert(node_c.clone(), env_c);
@@ -5332,7 +5332,7 @@ mod tests {
         let mut bp = BallotProtocol::new();
 
         let value = make_value(&[42]);
-        let qs_hash: stellar_xdr::curr::Hash = hash_quorum_set(&quorum_set).into();
+        let qs_hash: stellar_xdr::Hash = hash_quorum_set(&quorum_set).into();
 
         bp.phase = BallotPhase::Confirm;
         bp.commit = Some(ScpBallot {
@@ -5369,7 +5369,7 @@ mod tests {
                     quorum_set_hash: qs_hash.clone(),
                 }),
             },
-            signature: stellar_xdr::curr::Signature(Vec::new().try_into().unwrap_or_default()),
+            signature: stellar_xdr::Signature(Vec::new().try_into().unwrap_or_default()),
         };
         let env_c = ScpEnvelope {
             statement: ScpStatement {
@@ -5386,7 +5386,7 @@ mod tests {
                     quorum_set_hash: qs_hash.clone(),
                 }),
             },
-            signature: stellar_xdr::curr::Signature(Vec::new().try_into().unwrap_or_default()),
+            signature: stellar_xdr::Signature(Vec::new().try_into().unwrap_or_default()),
         };
         bp.latest_envelopes.insert(node_b.clone(), env_b);
         bp.latest_envelopes.insert(node_c.clone(), env_c);

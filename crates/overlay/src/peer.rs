@@ -37,7 +37,7 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
-use stellar_xdr::curr::{Auth, Hello, StellarMessage};
+use stellar_xdr::{Auth, Hello, StellarMessage};
 use tracing::{debug, info, trace, warn};
 
 /// Auth flag value indicating flow control with byte-level capacity is enabled.
@@ -499,7 +499,7 @@ impl Peer {
         // Matches stellar-core Peer::recvAuth() → sendSendMore().
         // Both grants are derived from configuration at overlay startup —
         // OVERLAY_SPEC §7.2 (initial SEND_MORE_EXTENDED capacity grant) / §5.4.4.
-        let send_more = StellarMessage::SendMoreExtended(stellar_xdr::curr::SendMoreExtended {
+        let send_more = StellarMessage::SendMoreExtended(stellar_xdr::SendMoreExtended {
             num_messages: initial_message_grant,
             num_bytes: initial_byte_grant,
         });
@@ -602,9 +602,9 @@ impl Peer {
         } else {
             &reason
         };
-        let msg = StellarMessage::ErrorMsg(stellar_xdr::curr::SError {
-            code: stellar_xdr::curr::ErrorCode::Conf,
-            msg: stellar_xdr::curr::StringM::try_from(truncated.to_string()).unwrap_or_default(),
+        let msg = StellarMessage::ErrorMsg(stellar_xdr::SError {
+            code: stellar_xdr::ErrorCode::Conf,
+            msg: stellar_xdr::StringM::try_from(truncated.to_string()).unwrap_or_default(),
         });
         if let Err(e) = self.send_raw(msg).await {
             debug!("Failed to send ERR_CONF: {}", e);
@@ -999,7 +999,7 @@ impl Peer {
     /// Note: GetPeers was removed in Protocol 24. This is a no-op.
     /// Send extended flow control message with byte limit.
     pub async fn send_more_extended(&mut self, num_messages: u32, num_bytes: u32) -> Result<()> {
-        let message = StellarMessage::SendMoreExtended(stellar_xdr::curr::SendMoreExtended {
+        let message = StellarMessage::SendMoreExtended(stellar_xdr::SendMoreExtended {
             num_messages,
             num_bytes,
         });
@@ -1162,7 +1162,7 @@ mod tests {
         use crate::auth::{AuthCert, AuthCertExt, AuthContext};
         use crate::connection::Connection;
         use henyey_crypto::SecretKey;
-        use stellar_xdr::curr as xdr;
+        use stellar_xdr as xdr;
         use x25519_dalek::EphemeralSecret;
 
         let (_client, server) = tokio::io::duplex(1024 * 1024);
@@ -1420,7 +1420,7 @@ mod tests {
     use crate::auth::AuthContext;
     use crate::connection::Connection;
     use henyey_crypto::SecretKey;
-    use stellar_xdr::curr::Hello;
+    use stellar_xdr::Hello;
 
     /// Build a responder `Peer` (inbound, `Handshaking`) wired over an in-memory
     /// duplex to a raw client-side `(Connection, AuthContext)` initiator pair.
@@ -1551,7 +1551,7 @@ mod tests {
             StellarMessage::ErrorMsg(e) => {
                 assert_eq!(
                     e.code,
-                    stellar_xdr::curr::ErrorCode::Conf,
+                    stellar_xdr::ErrorCode::Conf,
                     "second frame must be ERR_CONF"
                 );
             }
@@ -1569,7 +1569,7 @@ mod tests {
         let client_local = LocalNode::new_testnet(SecretKey::generate());
         let frames = responder_reply_frames(client_local, |hello| {
             // Wrong network id (compatible overlay version preserved).
-            hello.network_id = stellar_xdr::curr::Hash([0xAB; 32]);
+            hello.network_id = stellar_xdr::Hash([0xAB; 32]);
         })
         .await;
 

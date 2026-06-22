@@ -4,7 +4,7 @@
 //! Note: Inflation has been deprecated since Protocol 12 and always returns
 //! NOT_TIME on the public network, but we implement it for completeness.
 
-use stellar_xdr::curr::{
+use stellar_xdr::{
     AccountId, InflationPayout, InflationResult, InflationResultCode, OperationResult,
     OperationResultTr,
 };
@@ -65,7 +65,7 @@ fn make_inflation_result(
 mod tests {
     use super::*;
     use crate::test_utils::create_test_account_id;
-    use stellar_xdr::curr::*;
+    use stellar_xdr::*;
 
     fn create_test_account(account_id: AccountId, balance: i64) -> AccountEntry {
         AccountEntry {

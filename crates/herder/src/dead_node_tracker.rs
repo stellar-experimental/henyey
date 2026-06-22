@@ -41,7 +41,7 @@
 use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
-use stellar_xdr::curr::NodeId;
+use stellar_xdr::NodeId;
 
 /// Interval for checking dead nodes (15 minutes, matching stellar-core).
 pub const CHECK_FOR_DEAD_NODES_MINUTES: u64 = 15;
@@ -201,14 +201,12 @@ impl DeadNodeTracker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use stellar_xdr::curr::PublicKey;
+    use stellar_xdr::PublicKey;
 
     fn make_node_id(n: u8) -> NodeId {
         let mut bytes = [0u8; 32];
         bytes[0] = n;
-        NodeId(PublicKey::PublicKeyTypeEd25519(stellar_xdr::curr::Uint256(
-            bytes,
-        )))
+        NodeId(PublicKey::PublicKeyTypeEd25519(stellar_xdr::Uint256(bytes)))
     }
 
     #[test]

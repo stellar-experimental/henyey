@@ -7,7 +7,7 @@
 use henyey_common::xdr_stream::XdrOutputStream;
 use henyey_common::Hash256;
 use rusqlite::{params, Connection, OptionalExtension};
-use stellar_xdr::curr::{LedgerHeader, LedgerHeaderHistoryEntry, Limits, ReadXdr};
+use stellar_xdr::{LedgerHeader, LedgerHeaderHistoryEntry, Limits, ReadXdr};
 
 use crate::error::DbError;
 
@@ -222,9 +222,9 @@ impl LedgerQueries for Connection {
             let hash_bytes = Hash256::from_hex(&hash_hex)
                 .map_err(|e| DbError::Integrity(format!("Invalid ledger hash: {}", e)))?;
             let entry = LedgerHeaderHistoryEntry {
-                hash: stellar_xdr::curr::Hash(hash_bytes.0),
+                hash: stellar_xdr::Hash(hash_bytes.0),
                 header,
-                ext: stellar_xdr::curr::LedgerHeaderHistoryEntryExt::V0,
+                ext: stellar_xdr::LedgerHeaderHistoryEntryExt::V0,
             };
             stream
                 .write_one(&entry)
@@ -321,7 +321,7 @@ impl LedgerQueries for Connection {
 mod tests {
     use super::*;
     use rusqlite::Connection;
-    use stellar_xdr::curr::{
+    use stellar_xdr::{
         Hash, LedgerHeader, LedgerHeaderExt, StellarValue, StellarValueExt, TimePoint, WriteXdr,
     };
 

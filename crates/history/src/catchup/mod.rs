@@ -68,8 +68,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use henyey_ledger::{LedgerManager, TransactionSetVariant};
-use stellar_xdr::curr::LedgerCloseMeta;
-use stellar_xdr::curr::{
+use stellar_xdr::LedgerCloseMeta;
+use stellar_xdr::{
     ExtensionPoint, GeneralizedTransactionSet, Hash, LedgerCloseMetaExt, LedgerCloseMetaExtV1,
     LedgerCloseMetaV2, LedgerHeader, LedgerHeaderHistoryEntry, LedgerHeaderHistoryEntryExt,
     ScpHistoryEntry, TransactionHistoryEntry, TransactionHistoryResultEntry, TransactionResultPair,
@@ -79,7 +79,7 @@ use tracing::{debug, info};
 
 /// Extract a `TransactionSetVariant` from a `TransactionHistoryEntry`.
 pub(crate) fn tx_set_from_history_entry(entry: &TransactionHistoryEntry) -> TransactionSetVariant {
-    use stellar_xdr::curr::TransactionHistoryEntryExt;
+    use stellar_xdr::TransactionHistoryEntryExt;
     match &entry.ext {
         TransactionHistoryEntryExt::V0 => TransactionSetVariant::Classic(entry.tx_set.clone()),
         TransactionHistoryEntryExt::V1(set) => TransactionSetVariant::Generalized(set.clone()),
@@ -1143,7 +1143,7 @@ impl CatchupManager {
             if let Some(header) = header_map.get(&entry.ledger_seq) {
                 let xdr = entry
                     .tx_result_set
-                    .to_xdr(stellar_xdr::curr::Limits::none())
+                    .to_xdr(stellar_xdr::Limits::none())
                     .map_err(|e| {
                         HistoryError::CatchupFailed(format!(
                             "failed to encode tx result set: {}",
@@ -1383,7 +1383,7 @@ pub(crate) fn make_empty_tx_set(lcl: &LclContext) -> TransactionSetVariant {
     use henyey_common::protocol::{
         protocol_version_starts_from, ProtocolVersion, PARALLEL_SOROBAN_PHASE_PROTOCOL_VERSION,
     };
-    use stellar_xdr::curr::{TransactionPhase, TransactionSet, VecM};
+    use stellar_xdr::{TransactionPhase, TransactionSet, VecM};
 
     let previous_ledger_hash = lcl.lcl_hash().clone();
     let lcl_protocol_version = lcl.protocol_version();
@@ -1515,7 +1515,7 @@ impl CatchupManagerBuilder {
             emit_classic_events: false,
             backfill_stellar_asset_events: false,
             run_eviction: true,
-            eviction_settings: stellar_xdr::curr::StateArchivalSettings::default(),
+            eviction_settings: stellar_xdr::StateArchivalSettings::default(),
             wait_for_publish: false,
         };
 
@@ -1677,11 +1677,11 @@ mod tests {
         let header = LedgerHeader {
             ledger_version: 20,
             previous_ledger_hash: Hash([0u8; 32]),
-            scp_value: stellar_xdr::curr::StellarValue {
+            scp_value: stellar_xdr::StellarValue {
                 tx_set_hash: Hash([0u8; 32]),
-                close_time: stellar_xdr::curr::TimePoint(0),
-                upgrades: stellar_xdr::curr::VecM::default(),
-                ext: stellar_xdr::curr::StellarValueExt::Basic,
+                close_time: stellar_xdr::TimePoint(0),
+                upgrades: stellar_xdr::VecM::default(),
+                ext: stellar_xdr::StellarValueExt::Basic,
             },
             tx_set_result_hash: Hash([0u8; 32]),
             bucket_list_hash: Hash([0u8; 32]),
@@ -1694,7 +1694,7 @@ mod tests {
             base_reserve: 5000000,
             max_tx_set_size: 100,
             skip_list: std::array::from_fn(|_| Hash([0u8; 32])),
-            ext: stellar_xdr::curr::LedgerHeaderExt::V0,
+            ext: stellar_xdr::LedgerHeaderExt::V0,
         };
         let entry = LedgerHeaderHistoryEntry {
             hash: Hash([1u8; 32]),

@@ -15,7 +15,7 @@ mod tests {
     use soroban_env_host_p25::xdr::{ReadXdr as ReadXdrP25, WriteXdr as WriteXdrP25};
     use soroban_env_host_p25::{storage::SnapshotSource, HostError};
 
-    use stellar_xdr::curr::{
+    use stellar_xdr::{
         AccountId, Hash, LedgerEntry, LedgerEntryData, LedgerEntryExt, LedgerKey, Limits, ReadXdr,
         WriteXdr,
     };
@@ -268,7 +268,7 @@ mod tests {
         }
     }
 
-    use stellar_xdr::curr::{
+    use stellar_xdr::{
         ContractDataDurability, ContractDataEntry, ContractId, LedgerKeyContractData, ScAddress,
         ScVal, TtlEntry,
     };
@@ -289,7 +289,7 @@ mod tests {
         val: i32,
     ) -> ContractDataEntry {
         ContractDataEntry {
-            ext: stellar_xdr::curr::ExtensionPoint::V0,
+            ext: stellar_xdr::ExtensionPoint::V0,
             contract: ScAddress::Contract(ContractId(Hash(contract_hash))),
             key: ScVal::I32(key_val),
             durability: ContractDataDurability::Persistent,
@@ -452,24 +452,24 @@ mod tests {
         let current_ledger = 1000u32;
 
         // Create an account
-        let account_id = AccountId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
-            stellar_xdr::curr::Uint256([5u8; 32]),
+        let account_id = AccountId(stellar_xdr::PublicKey::PublicKeyTypeEd25519(
+            stellar_xdr::Uint256([5u8; 32]),
         ));
-        let account = stellar_xdr::curr::AccountEntry {
+        let account = stellar_xdr::AccountEntry {
             account_id: account_id.clone(),
             balance: 1_000_000_000,
-            seq_num: stellar_xdr::curr::SequenceNumber(1),
+            seq_num: stellar_xdr::SequenceNumber(1),
             num_sub_entries: 0,
             inflation_dest: None,
             flags: 0,
-            home_domain: stellar_xdr::curr::String32::default(),
-            thresholds: stellar_xdr::curr::Thresholds([1, 0, 0, 0]),
-            signers: stellar_xdr::curr::VecM::default(),
-            ext: stellar_xdr::curr::AccountEntryExt::V0,
+            home_domain: stellar_xdr::String32::default(),
+            thresholds: stellar_xdr::Thresholds([1, 0, 0, 0]),
+            signers: stellar_xdr::VecM::default(),
+            ext: stellar_xdr::AccountEntryExt::V0,
         };
         state.create_account(account);
 
-        let key = LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
+        let key = LedgerKey::Account(stellar_xdr::LedgerKeyAccount {
             account_id: account_id.clone(),
         });
 

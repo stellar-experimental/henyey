@@ -38,7 +38,7 @@ use soroban_env_host26::{
 // The P26 host is pinned to the stellar-core v26.0.1 submodule revision (b351f88)
 // which uses stellar-xdr 26.0.0 — the same as our workspace. Types are unified
 // by Cargo, so no XDR byte roundtrip is needed for P26 (unlike P24/P25).
-use stellar_xdr::curr::{
+use stellar_xdr::{
     DiagnosticEvent, LedgerEntry, LedgerKey, Limits, ReadXdr, ScVal, SorobanTransactionData,
     SorobanTransactionDataExt, WriteXdr,
 };
@@ -89,7 +89,7 @@ pub struct SorobanExecutionResult {
     /// Storage changes made during execution.
     pub storage_changes: Vec<StorageChange>,
     /// Contract and system events emitted during execution.
-    pub contract_events: Vec<stellar_xdr::curr::ContractEvent>,
+    pub contract_events: Vec<stellar_xdr::ContractEvent>,
     /// Diagnostic events emitted during execution.
     pub diagnostic_events: Vec<DiagnosticEvent>,
     /// CPU instructions consumed.
@@ -267,7 +267,7 @@ impl PersistentModuleCache {
     /// prevent unbounded growth of the module cache.
     ///
     /// Returns true if the module was found and removed, false otherwise.
-    pub fn remove_contract(&self, hash: &stellar_xdr::curr::Hash) -> bool {
+    pub fn remove_contract(&self, hash: &stellar_xdr::Hash) -> bool {
         match self {
             PersistentModuleCache::P24(cache) => {
                 let contract_id = soroban_env_host24::xdr::Hash(hash.0);
@@ -436,7 +436,7 @@ impl<'a> LedgerSnapshotAdapterP25<'a> {
                         // Get the TTL entry for the restore info
                         let key_hash =
                             super::get_or_compute_key_hash(self.ttl_key_cache, key.as_ref());
-                        let ttl_key = LedgerKey::Ttl(stellar_xdr::curr::LedgerKeyTtl { key_hash });
+                        let ttl_key = LedgerKey::Ttl(stellar_xdr::LedgerKeyTtl { key_hash });
                         let ttl_entry = self.state.get_entry(&ttl_key);
 
                         ttl_entry.map(|te| {
@@ -767,7 +767,7 @@ struct NormalizedLedgerChange {
 /// suitable for e2e_invoke::invoke_host_function().
 ///
 /// This is the shared logic between P24 and P25 execution paths. Both paths use
-/// workspace XDR types (`stellar_xdr::curr`) and the same `LedgerSnapshotAdapterP25`.
+/// workspace XDR types (`stellar_xdr`) and the same `LedgerSnapshotAdapterP25`.
 fn prepare_footprint_entries(
     snapshot: &LedgerSnapshotAdapterP25<'_>,
     soroban_data: &SorobanTransactionData,
@@ -787,13 +787,13 @@ fn prepare_footprint_entries(
         let needs_ttl = henyey_common::is_soroban_key(key);
         if let Some(lu) = live_until {
             let key_hash = super::get_or_compute_key_hash(ttl_key_cache, key);
-            henyey_common::xdr_to_bytes(&stellar_xdr::curr::TtlEntry {
+            henyey_common::xdr_to_bytes(&stellar_xdr::TtlEntry {
                 key_hash,
                 live_until_ledger_seq: lu,
             })
         } else if needs_ttl {
             let key_hash = super::get_or_compute_key_hash(ttl_key_cache, key);
-            henyey_common::xdr_to_bytes(&stellar_xdr::curr::TtlEntry {
+            henyey_common::xdr_to_bytes(&stellar_xdr::TtlEntry {
                 key_hash,
                 live_until_ledger_seq: context.sequence,
             })
@@ -913,10 +913,10 @@ fn prepare_footprint_entries(
 
 /// Encode the host function invocation inputs into XDR bytes.
 fn encode_invocation_inputs(
-    host_function: &stellar_xdr::curr::HostFunction,
+    host_function: &stellar_xdr::HostFunction,
     soroban_data: &SorobanTransactionData,
-    source: &stellar_xdr::curr::AccountId,
-    auth_entries: &[stellar_xdr::curr::SorobanAuthorizationEntry],
+    source: &stellar_xdr::AccountId,
+    auth_entries: &[stellar_xdr::SorobanAuthorizationEntry],
 ) -> Result<EncodedInvocationInputs, SorobanExecutionError> {
     let encoded_host_fn = host_function
         .to_xdr(Limits::none())
@@ -946,11 +946,11 @@ fn encode_invocation_inputs(
 fn decode_contract_events(
     encoded_events: &[Vec<u8>],
     make_error: &dyn Fn(&str) -> SorobanExecutionError,
-) -> Result<(Vec<stellar_xdr::curr::ContractEvent>, u32), SorobanExecutionError> {
+) -> Result<(Vec<stellar_xdr::ContractEvent>, u32), SorobanExecutionError> {
     let mut contract_events = Vec::new();
     let mut contract_events_size = 0u32;
     for encoded_event in encoded_events {
-        let event = stellar_xdr::curr::ContractEvent::from_xdr(encoded_event, Limits::none())
+        let event = stellar_xdr::ContractEvent::from_xdr(encoded_event, Limits::none())
             .map_err(|_| make_error("failed to decode ContractEvent"))?;
         contract_events_size = contract_events_size.saturating_add(encoded_event.len() as u32);
         contract_events.push(event);
@@ -1619,6 +1619,17 @@ fn convert_diagnostic_events_p24(
     })
 }
 
+fn convert_diagnostic_events_p26(
+    events: Vec<soroban_env_host26::xdr::DiagnosticEvent>,
+) -> Vec<DiagnosticEvent> {
+    convert_diagnostic_events_cross_version(events, "P26", |event| {
+        use soroban_env_host26::xdr::WriteXdr as WriteXdrP26;
+        event
+            .to_xdr(soroban_env_host26::xdr::Limits::none())
+            .map_err(|e| e.to_string())
+    })
+}
+
 fn rent_fee_config_p25_to_p24(
     config: &soroban_env_host25::fees::RentFeeConfiguration,
 ) -> soroban_env_host24::fees::RentFeeConfiguration {
@@ -1679,13 +1690,28 @@ fn execute_host_function_p26(
     let memory_limit = soroban_config.tx_max_memory_bytes;
 
     let budget = if soroban_config.has_valid_cost_params() {
-        Budget::try_from_configs(
-            instruction_limit,
-            memory_limit,
-            soroban_config.cpu_cost_params.clone(),
-            soroban_config.mem_cost_params.clone(),
-        )
-        .map_err(make_setup_error)?
+        let cost_params_error = || {
+            make_setup_error(HostErrorP26::from(
+                soroban_env_host26::Error::from_type_and_code(
+                    soroban_env_host26::xdr::ScErrorType::Context,
+                    soroban_env_host26::xdr::ScErrorCode::InternalError,
+                ),
+            ))
+        };
+        let p26_cpu =
+            super::convert::try_convert_cost_params_ws_to_p26(&soroban_config.cpu_cost_params)
+                .map_err(|e| {
+                    tracing::warn!("P26 cost params conversion failed: {e}");
+                    cost_params_error()
+                })?;
+        let p26_mem =
+            super::convert::try_convert_cost_params_ws_to_p26(&soroban_config.mem_cost_params)
+                .map_err(|e| {
+                    tracing::warn!("P26 cost params conversion failed: {e}");
+                    cost_params_error()
+                })?;
+        Budget::try_from_configs(instruction_limit, memory_limit, p26_cpu, p26_mem)
+            .map_err(make_setup_error)?
     } else {
         tracing::warn!("Using default Soroban budget - cost parameters not loaded from network.");
         Budget::default()
@@ -1787,7 +1813,8 @@ fn execute_host_function_p26(
                 "P26: e2e_invoke failed"
             );
             for (i, event) in diagnostic_events.iter().enumerate() {
-                if let Ok(encoded) = event.to_xdr(Limits::none()) {
+                use soroban_env_host26::xdr::WriteXdr as _;
+                if let Ok(encoded) = event.to_xdr(soroban_env_host26::xdr::Limits::none()) {
                     tracing::warn!(
                         event_idx = i,
                         event_hex = hex::encode(&encoded),
@@ -1799,13 +1826,14 @@ fn execute_host_function_p26(
                 host_error: convert_host_error_p26_to_p25(e),
                 cpu_insns_consumed,
                 mem_bytes_consumed,
-                diagnostic_events,
+                diagnostic_events: convert_diagnostic_events_p26(diagnostic_events),
             });
         }
     };
 
     // ── Decode result ──
-    let final_diagnostic_events = diagnostic_events;
+    // Convert diagnostic events before defining closures that borrow budget.
+    let final_diagnostic_events = convert_diagnostic_events_p26(diagnostic_events);
 
     let make_budget_error = |desc: &str| -> SorobanExecutionError {
         tracing::debug!(desc, "P26: XDR decode error in result processing");
@@ -1893,11 +1921,11 @@ fn execute_host_function_p26(
 mod tests {
     use super::*;
     use crate::soroban::compute_key_hash;
-    use stellar_xdr::curr::{Hash, LedgerEntryData};
+    use stellar_xdr::{Hash, LedgerEntryData};
 
     #[test]
     fn test_compute_key_hash() {
-        let key = LedgerKey::ContractCode(stellar_xdr::curr::LedgerKeyContractCode {
+        let key = LedgerKey::ContractCode(stellar_xdr::LedgerKeyContractCode {
             hash: Hash([1u8; 32]),
         });
         let hash = compute_key_hash(&key);
@@ -1907,10 +1935,10 @@ mod tests {
     /// Test compute_key_hash produces different hashes for different keys.
     #[test]
     fn test_compute_key_hash_different_keys() {
-        let key1 = LedgerKey::ContractCode(stellar_xdr::curr::LedgerKeyContractCode {
+        let key1 = LedgerKey::ContractCode(stellar_xdr::LedgerKeyContractCode {
             hash: Hash([1u8; 32]),
         });
-        let key2 = LedgerKey::ContractCode(stellar_xdr::curr::LedgerKeyContractCode {
+        let key2 = LedgerKey::ContractCode(stellar_xdr::LedgerKeyContractCode {
             hash: Hash([2u8; 32]),
         });
 
@@ -1923,7 +1951,7 @@ mod tests {
     /// Test compute_key_hash is deterministic.
     #[test]
     fn test_compute_key_hash_deterministic() {
-        let key = LedgerKey::ContractCode(stellar_xdr::curr::LedgerKeyContractCode {
+        let key = LedgerKey::ContractCode(stellar_xdr::LedgerKeyContractCode {
             hash: Hash([42u8; 32]),
         });
 
@@ -1936,10 +1964,10 @@ mod tests {
     /// Test compute_key_hash with ContractData key.
     #[test]
     fn test_compute_key_hash_contract_data() {
-        use stellar_xdr::curr::{ContractDataDurability, LedgerKeyContractData, ScAddress};
+        use stellar_xdr::{ContractDataDurability, LedgerKeyContractData, ScAddress};
 
         let key = LedgerKey::ContractData(LedgerKeyContractData {
-            contract: ScAddress::Contract(stellar_xdr::curr::ContractId(Hash([3u8; 32]))),
+            contract: ScAddress::Contract(stellar_xdr::ContractId(Hash([3u8; 32]))),
             key: ScVal::U32(100),
             durability: ContractDataDurability::Persistent,
         });
@@ -1952,18 +1980,18 @@ mod tests {
     #[test]
     fn test_storage_change_with_new_entry() {
         let change = StorageChange {
-            key: LedgerKey::ContractCode(stellar_xdr::curr::LedgerKeyContractCode {
+            key: LedgerKey::ContractCode(stellar_xdr::LedgerKeyContractCode {
                 hash: Hash([4u8; 32]),
             }),
             kind: StorageChangeKind::Modified {
                 entry: Box::new(LedgerEntry {
                     last_modified_ledger_seq: 100,
-                    data: LedgerEntryData::ContractCode(stellar_xdr::curr::ContractCodeEntry {
-                        ext: stellar_xdr::curr::ContractCodeEntryExt::V0,
+                    data: LedgerEntryData::ContractCode(stellar_xdr::ContractCodeEntry {
+                        ext: stellar_xdr::ContractCodeEntryExt::V0,
                         hash: Hash([4u8; 32]),
                         code: vec![0xDE, 0xAD].try_into().unwrap(),
                     }),
-                    ext: stellar_xdr::curr::LedgerEntryExt::V0,
+                    ext: stellar_xdr::LedgerEntryExt::V0,
                 }),
                 live_until: Some(1000),
                 ttl_extended: false,
@@ -1981,7 +2009,7 @@ mod tests {
     #[test]
     fn test_storage_change_ttl_extended() {
         let change = StorageChange {
-            key: LedgerKey::ContractCode(stellar_xdr::curr::LedgerKeyContractCode {
+            key: LedgerKey::ContractCode(stellar_xdr::LedgerKeyContractCode {
                 hash: Hash([5u8; 32]),
             }),
             kind: StorageChangeKind::TtlOnly {
@@ -2081,7 +2109,7 @@ mod tests {
     #[test]
     fn test_storage_change_delete() {
         let change = StorageChange {
-            key: LedgerKey::ContractCode(stellar_xdr::curr::LedgerKeyContractCode {
+            key: LedgerKey::ContractCode(stellar_xdr::LedgerKeyContractCode {
                 hash: Hash([6u8; 32]),
             }),
             kind: StorageChangeKind::Deleted,
@@ -2123,7 +2151,7 @@ mod tests {
     #[test]
     fn test_map_storage_changes_invalid_new_value_errors() {
         use crate::soroban::LedgerStateManager;
-        use stellar_xdr::curr::WriteXdr;
+        use stellar_xdr::WriteXdr;
         let state = LedgerStateManager::new(5_000_000, 100);
         let make_error = |_desc: &str| -> SorobanExecutionError {
             SorobanExecutionError {
@@ -2137,7 +2165,7 @@ mod tests {
             }
         };
         // Valid key, invalid new_value
-        let key = LedgerKey::ContractCode(stellar_xdr::curr::LedgerKeyContractCode {
+        let key = LedgerKey::ContractCode(stellar_xdr::LedgerKeyContractCode {
             hash: Hash([1u8; 32]),
         });
         let encoded_key = key.to_xdr(Limits::none()).unwrap();
@@ -2156,7 +2184,7 @@ mod tests {
     #[test]
     fn test_map_storage_changes_valid_data() {
         use crate::soroban::LedgerStateManager;
-        use stellar_xdr::curr::WriteXdr;
+        use stellar_xdr::WriteXdr;
         let state = LedgerStateManager::new(5_000_000, 100);
         let make_error = |_desc: &str| -> SorobanExecutionError {
             SorobanExecutionError {
@@ -2169,17 +2197,17 @@ mod tests {
                 diagnostic_events: vec![],
             }
         };
-        let key = LedgerKey::ContractCode(stellar_xdr::curr::LedgerKeyContractCode {
+        let key = LedgerKey::ContractCode(stellar_xdr::LedgerKeyContractCode {
             hash: Hash([1u8; 32]),
         });
         let entry = LedgerEntry {
             last_modified_ledger_seq: 100,
-            data: LedgerEntryData::ContractCode(stellar_xdr::curr::ContractCodeEntry {
-                ext: stellar_xdr::curr::ContractCodeEntryExt::V0,
+            data: LedgerEntryData::ContractCode(stellar_xdr::ContractCodeEntry {
+                ext: stellar_xdr::ContractCodeEntryExt::V0,
                 hash: Hash([1u8; 32]),
                 code: vec![0xDE, 0xAD].try_into().unwrap(),
             }),
-            ext: stellar_xdr::curr::LedgerEntryExt::V0,
+            ext: stellar_xdr::LedgerEntryExt::V0,
         };
         let encoded_key = key.to_xdr(Limits::none()).unwrap();
         let encoded_value = entry.to_xdr(Limits::none()).unwrap();
@@ -2211,7 +2239,7 @@ mod tests {
         // TtlOnly: read-only entry with TTL extended
         // We need a TTL that is greater than ledger-start to trigger ttl_extended=true.
         // LedgerStateManager starts with no TTLs, so any live_until > 0 means extended.
-        let key2 = LedgerKey::ContractCode(stellar_xdr::curr::LedgerKeyContractCode {
+        let key2 = LedgerKey::ContractCode(stellar_xdr::LedgerKeyContractCode {
             hash: Hash([2u8; 32]),
         });
         let encoded_key2 = key2.to_xdr(Limits::none()).unwrap();
@@ -2258,7 +2286,7 @@ mod tests {
         // Set ledger-start TTL to 6_000_000 so that live_until <= ledger_start_ttl.
         let key_hash = crate::soroban::compute_key_hash(&key2);
         let mut state_with_ttl = LedgerStateManager::new(5_000_000, 100);
-        state_with_ttl.create_ttl(stellar_xdr::curr::TtlEntry {
+        state_with_ttl.create_ttl(stellar_xdr::TtlEntry {
             key_hash: key_hash.clone(),
             live_until_ledger_seq: 6_000_000,
         });
@@ -2283,7 +2311,7 @@ mod tests {
     /// events.
     #[test]
     fn test_convert_diagnostic_events_cross_version_skip_corrupt() {
-        use stellar_xdr::curr::{
+        use stellar_xdr::{
             ContractEvent, ContractEventBody, ContractEventType, ContractEventV0, DiagnosticEvent,
             ExtensionPoint, WriteXdr,
         };
@@ -2356,27 +2384,25 @@ mod tests {
                 key: &LedgerKey,
             ) -> std::result::Result<Option<LedgerEntry>, Box<dyn std::error::Error + Send + Sync>>
             {
-                let key_bytes =
-                    stellar_xdr::curr::WriteXdr::to_xdr(key, stellar_xdr::curr::Limits::none())?;
+                let key_bytes = stellar_xdr::WriteXdr::to_xdr(key, stellar_xdr::Limits::none())?;
                 Ok(self.entries.get(&key_bytes).cloned())
             }
         }
 
-        let key = LedgerKey::ContractCode(stellar_xdr::curr::LedgerKeyContractCode {
+        let key = LedgerKey::ContractCode(stellar_xdr::LedgerKeyContractCode {
             hash: Hash([99u8; 32]),
         });
         let entry = LedgerEntry {
             last_modified_ledger_seq: 42,
-            data: LedgerEntryData::ContractCode(stellar_xdr::curr::ContractCodeEntry {
-                ext: stellar_xdr::curr::ContractCodeEntryExt::V0,
+            data: LedgerEntryData::ContractCode(stellar_xdr::ContractCodeEntry {
+                ext: stellar_xdr::ContractCodeEntryExt::V0,
                 hash: Hash([99u8; 32]),
                 code: vec![0xCA, 0xFE].try_into().unwrap(),
             }),
-            ext: stellar_xdr::curr::LedgerEntryExt::V0,
+            ext: stellar_xdr::LedgerEntryExt::V0,
         };
 
-        let key_bytes =
-            stellar_xdr::curr::WriteXdr::to_xdr(&key, stellar_xdr::curr::Limits::none()).unwrap();
+        let key_bytes = stellar_xdr::WriteXdr::to_xdr(&key, stellar_xdr::Limits::none()).unwrap();
         let mut ha_entries = HashMap::new();
         ha_entries.insert(key_bytes, entry);
         let hot_archive = TestHotArchive {

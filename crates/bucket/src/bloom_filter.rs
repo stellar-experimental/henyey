@@ -46,7 +46,7 @@
 
 use siphasher::sip::SipHasher24;
 use std::hash::Hasher;
-use stellar_xdr::curr::{LedgerKey, Limits, WriteXdr};
+use stellar_xdr::{LedgerKey, Limits, WriteXdr};
 use xorf::{BinaryFuse16, Filter};
 
 use crate::{BucketError, Result};
@@ -239,7 +239,7 @@ impl std::fmt::Debug for BucketBloomFilter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use stellar_xdr::curr::*;
+    use stellar_xdr::*;
 
     fn make_test_seed() -> HashSeed {
         [

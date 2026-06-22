@@ -47,7 +47,7 @@ use std::sync::Arc;
 
 use henyey_common::Hash256;
 use sha2::{Digest, Sha256};
-use stellar_xdr::curr::{BucketMetadata, BucketMetadataExt, LedgerKey, Limits, WriteXdr};
+use stellar_xdr::{BucketMetadata, BucketMetadataExt, LedgerKey, Limits, WriteXdr};
 
 use crate::bucket::{Bucket, BucketIter};
 use crate::entry::{compare_keys, BucketEntry, BucketEntryExt};
@@ -621,7 +621,7 @@ pub fn merge_in_memory(
             ext: BucketMetadataExt::V0,
         };
         if protocol_version_starts_from(max_protocol_version, ProtocolVersion::V23) {
-            meta.ext = BucketMetadataExt::V1(stellar_xdr::curr::BucketListType::Live);
+            meta.ext = BucketMetadataExt::V1(stellar_xdr::BucketListType::Live);
         }
         Some(BucketEntry::Metaentry(meta))
     } else {
@@ -653,7 +653,7 @@ pub fn merge_in_memory(
     // Helper to add entry to output with incremental hashing
     // Uses reusable buffers to minimize allocations
     let mut add_entry = |entry: BucketEntry| -> Result<()> {
-        use stellar_xdr::curr::Limited;
+        use stellar_xdr::Limited;
 
         // Serialize entry for hash using reusable buffer
         entry_buf.clear();
@@ -1125,7 +1125,7 @@ fn build_output_metadata(
     // For Protocol 23+, Live buckets must use V1 extension with BucketListType::LIVE.
     // merge_buckets is specifically for the Live bucket list.
     if protocol_version_starts_from(protocol_version, ProtocolVersion::V23) {
-        output.ext = BucketMetadataExt::V1(stellar_xdr::curr::BucketListType::Live);
+        output.ext = BucketMetadataExt::V1(stellar_xdr::BucketListType::Live);
     }
 
     Ok((protocol_version, Some(BucketEntry::Metaentry(output))))
@@ -1135,7 +1135,7 @@ fn build_output_metadata(
 mod tests {
     use super::*;
     use crate::BucketEntry;
-    use stellar_xdr::curr::*; // Re-import to shadow XDR's BucketEntry
+    use stellar_xdr::*; // Re-import to shadow XDR's BucketEntry
 
     const TEST_PROTOCOL: u32 = 25;
 

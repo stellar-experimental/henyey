@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use henyey_common::{Hash256, NetworkId};
 use henyey_tx::TransactionFrame;
-use stellar_xdr::curr::{
+use stellar_xdr::{
     AccountId, AlphaNum4, Asset, AssetCode4, CreateAccountOp, InvokeContractArgs,
     InvokeHostFunctionOp, LedgerFootprint, ManageSellOfferOp, MuxedAccount, Operation,
     OperationBody, Price, PublicKey, ScAddress, ScSymbol, ScVal, SequenceNumber, SorobanResources,
@@ -47,8 +47,8 @@ fn make_classic_payment(fee: u32) -> TransactionEnvelope {
         source_account: source,
         fee,
         seq_num: SequenceNumber(1),
-        cond: stellar_xdr::curr::Preconditions::None,
-        memo: stellar_xdr::curr::Memo::None,
+        cond: stellar_xdr::Preconditions::None,
+        memo: stellar_xdr::Memo::None,
         operations: vec![op].try_into().unwrap(),
         ext: TransactionExt::V0,
     };
@@ -79,8 +79,8 @@ fn make_classic_dex(fee: u32) -> TransactionEnvelope {
         source_account: source,
         fee,
         seq_num: SequenceNumber(1),
-        cond: stellar_xdr::curr::Preconditions::None,
-        memo: stellar_xdr::curr::Memo::None,
+        cond: stellar_xdr::Preconditions::None,
+        memo: stellar_xdr::Memo::None,
         operations: vec![op].try_into().unwrap(),
         ext: TransactionExt::V0,
     };
@@ -95,7 +95,7 @@ fn make_soroban_tx(total_fee: u32, resource_fee: i64) -> TransactionEnvelope {
     let op = Operation {
         source_account: None,
         body: OperationBody::InvokeHostFunction(InvokeHostFunctionOp {
-            host_function: stellar_xdr::curr::HostFunction::InvokeContract(InvokeContractArgs {
+            host_function: stellar_xdr::HostFunction::InvokeContract(InvokeContractArgs {
                 contract_address: ScAddress::default(),
                 function_name: ScSymbol(
                     StringM::<32>::try_from("test".to_string()).expect("symbol"),
@@ -107,17 +107,17 @@ fn make_soroban_tx(total_fee: u32, resource_fee: i64) -> TransactionEnvelope {
     };
     let footprint = LedgerFootprint {
         read_only: vec![
-            stellar_xdr::curr::LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
+            stellar_xdr::LedgerKey::Account(stellar_xdr::LedgerKeyAccount {
                 account_id: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([6u8; 32]))),
             }),
-            stellar_xdr::curr::LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
+            stellar_xdr::LedgerKey::Account(stellar_xdr::LedgerKeyAccount {
                 account_id: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([7u8; 32]))),
             }),
         ]
         .try_into()
         .unwrap(),
-        read_write: vec![stellar_xdr::curr::LedgerKey::Account(
-            stellar_xdr::curr::LedgerKeyAccount {
+        read_write: vec![stellar_xdr::LedgerKey::Account(
+            stellar_xdr::LedgerKeyAccount {
                 account_id: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([8u8; 32]))),
             },
         )]
@@ -134,8 +134,8 @@ fn make_soroban_tx(total_fee: u32, resource_fee: i64) -> TransactionEnvelope {
         source_account: source,
         fee: total_fee,
         seq_num: SequenceNumber(1),
-        cond: stellar_xdr::curr::Preconditions::None,
-        memo: stellar_xdr::curr::Memo::None,
+        cond: stellar_xdr::Preconditions::None,
+        memo: stellar_xdr::Memo::None,
         operations: vec![op].try_into().unwrap(),
         ext: TransactionExt::V1(SorobanTransactionData {
             ext: SorobanTransactionDataExt::V0,
@@ -151,13 +151,13 @@ fn make_soroban_tx(total_fee: u32, resource_fee: i64) -> TransactionEnvelope {
 
 fn summary_for_set(
     txs: &[TransactionEnvelope],
-    gen: &stellar_xdr::curr::GeneralizedTransactionSet,
+    gen: &stellar_xdr::GeneralizedTransactionSet,
 ) -> TxSetSummary {
     let mut base_fee_map: HashMap<Hash256, Option<i64>> = HashMap::new();
     let mut soroban_base_fee = None;
 
-    let stellar_xdr::curr::GeneralizedTransactionSet::V1(tx_set) = gen;
-    if let stellar_xdr::curr::TransactionPhase::V0(components) = &tx_set.phases[0] {
+    let stellar_xdr::GeneralizedTransactionSet::V1(tx_set) = gen;
+    if let stellar_xdr::TransactionPhase::V0(components) = &tx_set.phases[0] {
         for component in components.iter() {
             let TxSetComponent::TxsetCompTxsMaybeDiscountedFee(comp) = component;
             for tx in comp.txs.iter() {
@@ -166,7 +166,7 @@ fn summary_for_set(
         }
     }
     match &tx_set.phases[1] {
-        stellar_xdr::curr::TransactionPhase::V1(parallel) => {
+        stellar_xdr::TransactionPhase::V1(parallel) => {
             soroban_base_fee = parallel.base_fee;
             for stage in parallel.execution_stages.iter() {
                 for cluster in stage.iter() {
@@ -176,7 +176,7 @@ fn summary_for_set(
                 }
             }
         }
-        stellar_xdr::curr::TransactionPhase::V0(components) => {
+        stellar_xdr::TransactionPhase::V0(components) => {
             if let Some(component) = components.first() {
                 let TxSetComponent::TxsetCompTxsMaybeDiscountedFee(comp) = component;
                 soroban_base_fee = comp.base_fee;
@@ -234,7 +234,7 @@ fn summary_for_set(
             disk_read_entries += resources.get_val(henyey_common::ResourceType::ReadLedgerEntries);
             write_entries += resources.get_val(henyey_common::ResourceType::WriteLedgerEntries);
             tx_size_bytes += tx
-                .to_xdr(stellar_xdr::curr::Limits::none())
+                .to_xdr(stellar_xdr::Limits::none())
                 .map(|b| b.len() as i64)
                 .unwrap_or(0);
         } else {

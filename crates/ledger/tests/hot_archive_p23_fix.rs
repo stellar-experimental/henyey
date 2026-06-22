@@ -19,7 +19,7 @@ use henyey_ledger::p23_hot_archive_bug::{
 };
 
 use henyey_common::entry_to_key;
-use stellar_xdr::curr::{LedgerEntry, LedgerKey};
+use stellar_xdr::{LedgerEntry, LedgerKey};
 
 /// A live-state loader that always reports "absent" — matching the real
 /// scenario where the 478 corrupted keys were evicted long before the upgrade
@@ -237,7 +237,7 @@ fn test_is_mainnet_gate() {
 /// the 478 hardcoded keys (an Account entry — the hardcoded entries are all
 /// ContractData).
 fn make_unrelated_entry() -> LedgerEntry {
-    use stellar_xdr::curr::{
+    use stellar_xdr::{
         AccountEntry, AccountEntryExt, AccountId, LedgerEntryData, LedgerEntryExt, PublicKey,
         SequenceNumber, String32, Thresholds, Uint256, VecM,
     };

@@ -30,7 +30,7 @@ use std::collections::BTreeMap;
 use std::io::{BufReader, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
-use stellar_xdr::curr::{
+use stellar_xdr::{
     BucketListType, BucketMetadata, BucketMetadataExt, HotArchiveBucketEntry, LedgerEntry,
     LedgerKey, Limits, ReadXdr, WriteXdr,
 };
@@ -1927,7 +1927,7 @@ pub fn merge_hot_archive_buckets(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use stellar_xdr::curr::*;
+    use stellar_xdr::*;
 
     fn make_contract_data_key(contract_id: [u8; 32], key_bytes: &[u8]) -> LedgerKey {
         LedgerKey::ContractData(LedgerKeyContractData {

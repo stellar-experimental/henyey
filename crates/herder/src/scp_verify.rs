@@ -41,7 +41,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use henyey_common::Hash256;
-use stellar_xdr::curr::ScpEnvelope;
+use stellar_xdr::ScpEnvelope;
 
 use crate::error::HerderError;
 use crate::scp_driver::ScpDriver;
@@ -658,7 +658,7 @@ mod tests {
     }
 
     fn dummy_envelope() -> ScpEnvelope {
-        use stellar_xdr::curr::{
+        use stellar_xdr::{
             NodeId, PublicKey as XdrPublicKey, ScpBallot, ScpStatement, ScpStatementPledges,
             ScpStatementPrepare, Signature, Uint256, Value,
         };
@@ -666,7 +666,7 @@ mod tests {
         let node_id = NodeId(XdrPublicKey::PublicKeyTypeEd25519(Uint256([1u8; 32])));
         let value = Value(vec![].try_into().unwrap());
         let pledges = ScpStatementPledges::Prepare(ScpStatementPrepare {
-            quorum_set_hash: stellar_xdr::curr::Hash([0u8; 32]),
+            quorum_set_hash: stellar_xdr::Hash([0u8; 32]),
             ballot: ScpBallot {
                 counter: 1,
                 value: value.clone(),

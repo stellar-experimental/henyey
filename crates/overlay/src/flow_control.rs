@@ -28,7 +28,7 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
-use stellar_xdr::curr::{StellarMessage, WriteXdr};
+use stellar_xdr::{StellarMessage, WriteXdr};
 use tracing::{debug, trace, warn};
 
 /// Callback trait for SCP queue trimming decisions.
@@ -1260,8 +1260,8 @@ fn messages_equal(a: &StellarMessage, b: &StellarMessage) -> bool {
         return false;
     }
     // For full equality, compare XDR
-    let a_xdr = a.to_xdr(stellar_xdr::curr::Limits::none());
-    let b_xdr = b.to_xdr(stellar_xdr::curr::Limits::none());
+    let a_xdr = a.to_xdr(stellar_xdr::Limits::none());
+    let b_xdr = b.to_xdr(stellar_xdr::Limits::none());
     match (a_xdr, b_xdr) {
         (Ok(a), Ok(b)) => a == b,
         _ => false,
@@ -1271,20 +1271,20 @@ fn messages_equal(a: &StellarMessage, b: &StellarMessage) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use stellar_xdr::curr::{Hash, ScpEnvelope, SendMoreExtended, TransactionEnvelope};
+    use stellar_xdr::{Hash, ScpEnvelope, SendMoreExtended, TransactionEnvelope};
 
     fn make_tx_message() -> StellarMessage {
         // Create a minimal transaction message for testing
         StellarMessage::Transaction(TransactionEnvelope::TxV0(
-            stellar_xdr::curr::TransactionV0Envelope {
-                tx: stellar_xdr::curr::TransactionV0 {
-                    source_account_ed25519: stellar_xdr::curr::Uint256([0u8; 32]),
+            stellar_xdr::TransactionV0Envelope {
+                tx: stellar_xdr::TransactionV0 {
+                    source_account_ed25519: stellar_xdr::Uint256([0u8; 32]),
                     fee: 100,
-                    seq_num: stellar_xdr::curr::SequenceNumber(1),
+                    seq_num: stellar_xdr::SequenceNumber(1),
                     time_bounds: None,
-                    memo: stellar_xdr::curr::Memo::None,
+                    memo: stellar_xdr::Memo::None,
                     operations: vec![].try_into().unwrap(),
-                    ext: stellar_xdr::curr::TransactionV0Ext::V0,
+                    ext: stellar_xdr::TransactionV0Ext::V0,
                 },
                 signatures: vec![].try_into().unwrap(),
             },
@@ -1293,22 +1293,18 @@ mod tests {
 
     fn make_scp_message() -> StellarMessage {
         StellarMessage::ScpMessage(ScpEnvelope {
-            statement: stellar_xdr::curr::ScpStatement {
-                node_id: stellar_xdr::curr::NodeId(
-                    stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(stellar_xdr::curr::Uint256(
-                        [0u8; 32],
-                    )),
-                ),
+            statement: stellar_xdr::ScpStatement {
+                node_id: stellar_xdr::NodeId(stellar_xdr::PublicKey::PublicKeyTypeEd25519(
+                    stellar_xdr::Uint256([0u8; 32]),
+                )),
                 slot_index: 1,
-                pledges: stellar_xdr::curr::ScpStatementPledges::Nominate(
-                    stellar_xdr::curr::ScpNomination {
-                        quorum_set_hash: Hash([0u8; 32]),
-                        votes: vec![].try_into().unwrap(),
-                        accepted: vec![].try_into().unwrap(),
-                    },
-                ),
+                pledges: stellar_xdr::ScpStatementPledges::Nominate(stellar_xdr::ScpNomination {
+                    quorum_set_hash: Hash([0u8; 32]),
+                    votes: vec![].try_into().unwrap(),
+                    accepted: vec![].try_into().unwrap(),
+                }),
             },
-            signature: stellar_xdr::curr::Signature::default(),
+            signature: stellar_xdr::Signature::default(),
         })
     }
 
@@ -1528,22 +1524,22 @@ mod tests {
     fn test_is_flow_controlled_message() {
         let tx = make_tx_message();
         let scp = make_scp_message();
-        let hello = StellarMessage::Hello(stellar_xdr::curr::Hello {
+        let hello = StellarMessage::Hello(stellar_xdr::Hello {
             ledger_version: 1,
             overlay_version: 1,
             overlay_min_version: 1,
             network_id: Hash([0u8; 32]),
             version_str: "test".try_into().unwrap(),
             listening_port: 0,
-            peer_id: stellar_xdr::curr::NodeId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
-                stellar_xdr::curr::Uint256([0u8; 32]),
+            peer_id: stellar_xdr::NodeId(stellar_xdr::PublicKey::PublicKeyTypeEd25519(
+                stellar_xdr::Uint256([0u8; 32]),
             )),
-            cert: stellar_xdr::curr::AuthCert {
-                pubkey: stellar_xdr::curr::Curve25519Public { key: [0u8; 32] },
+            cert: stellar_xdr::AuthCert {
+                pubkey: stellar_xdr::Curve25519Public { key: [0u8; 32] },
                 expiration: 0,
-                sig: stellar_xdr::curr::Signature::default(),
+                sig: stellar_xdr::Signature::default(),
             },
-            nonce: stellar_xdr::curr::Uint256([0u8; 32]),
+            nonce: stellar_xdr::Uint256([0u8; 32]),
         });
 
         assert!(is_flow_controlled_message(&tx));
@@ -1710,22 +1706,18 @@ mod tests {
 
     fn make_scp_message_at_slot(slot: u64) -> StellarMessage {
         StellarMessage::ScpMessage(ScpEnvelope {
-            statement: stellar_xdr::curr::ScpStatement {
-                node_id: stellar_xdr::curr::NodeId(
-                    stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(stellar_xdr::curr::Uint256(
-                        [0u8; 32],
-                    )),
-                ),
+            statement: stellar_xdr::ScpStatement {
+                node_id: stellar_xdr::NodeId(stellar_xdr::PublicKey::PublicKeyTypeEd25519(
+                    stellar_xdr::Uint256([0u8; 32]),
+                )),
                 slot_index: slot,
-                pledges: stellar_xdr::curr::ScpStatementPledges::Nominate(
-                    stellar_xdr::curr::ScpNomination {
-                        quorum_set_hash: Hash([0u8; 32]),
-                        votes: vec![].try_into().unwrap(),
-                        accepted: vec![].try_into().unwrap(),
-                    },
-                ),
+                pledges: stellar_xdr::ScpStatementPledges::Nominate(stellar_xdr::ScpNomination {
+                    quorum_set_hash: Hash([0u8; 32]),
+                    votes: vec![].try_into().unwrap(),
+                    accepted: vec![].try_into().unwrap(),
+                }),
             },
-            signature: stellar_xdr::curr::Signature::default(),
+            signature: stellar_xdr::Signature::default(),
         })
     }
 
@@ -1831,8 +1823,8 @@ mod tests {
         let scp_size = msg_body_size(&scp);
 
         // Vec-based size (the old approach)
-        let tx_xdr = tx.to_xdr(stellar_xdr::curr::Limits::none()).unwrap();
-        let scp_xdr = scp.to_xdr(stellar_xdr::curr::Limits::none()).unwrap();
+        let tx_xdr = tx.to_xdr(stellar_xdr::Limits::none()).unwrap();
+        let scp_xdr = scp.to_xdr(stellar_xdr::Limits::none()).unwrap();
 
         assert_eq!(tx_size, tx_xdr.len() as u64);
         assert_eq!(scp_size, scp_xdr.len() as u64);

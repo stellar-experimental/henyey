@@ -70,7 +70,7 @@ use henyey_common::protocol::{
     protocol_version_is_before, protocol_version_starts_from, ProtocolVersion,
 };
 use henyey_common::{Hash256, NetworkId};
-use stellar_xdr::curr::{AccountId, TransactionEventStage, TransactionResultCode};
+use stellar_xdr::{AccountId, TransactionEventStage, TransactionResultCode};
 
 use crate::events::TxEventManager;
 use crate::frame::{muxed_to_account_id, TransactionFrame};
@@ -329,7 +329,7 @@ fn update_sequence_number(
         .get_account_mut(account_id)
         .ok_or_else(|| TxError::AccountNotFound(format!("{:?}", account_id)))?;
 
-    account.seq_num = stellar_xdr::curr::SequenceNumber(tx_seq_num);
+    account.seq_num = stellar_xdr::SequenceNumber(tx_seq_num);
     Ok(())
 }
 
@@ -693,7 +693,7 @@ pub fn apply_transaction(
 mod tests {
     use super::*;
     use crate::test_utils::create_test_account_id;
-    use stellar_xdr::curr::{
+    use stellar_xdr::{
         AccountEntry, AccountEntryExt, AccountId, MuxedAccount, Operation, OperationBody,
         PaymentOp, Preconditions, PublicKey, SequenceNumber, Transaction, TransactionEnvelope,
         TransactionExt, TransactionV1Envelope, Uint256,
@@ -708,7 +708,7 @@ mod tests {
             inflation_dest: None,
             flags: 0,
             home_domain: Default::default(),
-            thresholds: stellar_xdr::curr::Thresholds([1, 0, 0, 0]),
+            thresholds: stellar_xdr::Thresholds([1, 0, 0, 0]),
             signers: vec![].try_into().unwrap(),
             ext: AccountEntryExt::V0,
         }
@@ -721,7 +721,7 @@ mod tests {
             source_account: None,
             body: OperationBody::Payment(PaymentOp {
                 destination: dest,
-                asset: stellar_xdr::curr::Asset::Native,
+                asset: stellar_xdr::Asset::Native,
                 amount: 1000,
             }),
         };
@@ -733,7 +733,7 @@ mod tests {
             fee,
             seq_num: SequenceNumber(seq_num),
             cond: Preconditions::None,
-            memo: stellar_xdr::curr::Memo::None,
+            memo: stellar_xdr::Memo::None,
             operations: vec![payment_op].try_into().unwrap(),
             ext: TransactionExt::V0,
         };
@@ -947,14 +947,13 @@ mod tests {
         // liability check: (i64::MAX-100+50) > i64::MAX - 200 -> (i64::MAX-50) > (i64::MAX-200) -> true -> skip
         let mut account = make_account_entry(account_id.clone(), i64::MAX - 100, 1);
         // Add buying liabilities via V1 extension
-        account.ext =
-            stellar_xdr::curr::AccountEntryExt::V1(stellar_xdr::curr::AccountEntryExtensionV1 {
-                liabilities: stellar_xdr::curr::Liabilities {
-                    buying: 200,
-                    selling: 0,
-                },
-                ext: stellar_xdr::curr::AccountEntryExtensionV1Ext::V0,
-            });
+        account.ext = stellar_xdr::AccountEntryExt::V1(stellar_xdr::AccountEntryExtensionV1 {
+            liabilities: stellar_xdr::Liabilities {
+                buying: 200,
+                selling: 0,
+            },
+            ext: stellar_xdr::AccountEntryExtensionV1Ext::V0,
+        });
 
         if let Some(state) = ctx.state_mut() {
             state.put_account(account);
@@ -1290,7 +1289,7 @@ mod tests {
     /// (inner ops + 1) for fee calculation, not plain operation_count().
     #[test]
     fn test_fee_to_charge_fee_bump() {
-        use stellar_xdr::curr::{
+        use stellar_xdr::{
             DecoratedSignature, FeeBumpTransaction, FeeBumpTransactionEnvelope,
             FeeBumpTransactionExt, FeeBumpTransactionInnerTx,
         };
@@ -1304,12 +1303,12 @@ mod tests {
             fee: 100,
             seq_num: SequenceNumber(1),
             cond: Preconditions::None,
-            memo: stellar_xdr::curr::Memo::None,
+            memo: stellar_xdr::Memo::None,
             operations: vec![Operation {
                 source_account: None,
                 body: OperationBody::Payment(PaymentOp {
                     destination: MuxedAccount::Ed25519(Uint256([2u8; 32])),
-                    asset: stellar_xdr::curr::Asset::Native,
+                    asset: stellar_xdr::Asset::Native,
                     amount: 1000,
                 }),
             }]
@@ -1334,7 +1333,7 @@ mod tests {
 
         let envelope = TransactionEnvelope::TxFeeBump(FeeBumpTransactionEnvelope {
             tx: fee_bump_tx,
-            signatures: stellar_xdr::curr::VecM::<DecoratedSignature, 20>::default(),
+            signatures: stellar_xdr::VecM::<DecoratedSignature, 20>::default(),
         });
 
         let frame = TransactionFrame::from_owned(envelope);
@@ -1355,7 +1354,7 @@ mod tests {
     /// not the outer fee source.
     #[test]
     fn test_audit_051_fee_bump_seq_num_on_inner_source() {
-        use stellar_xdr::curr::{
+        use stellar_xdr::{
             DecoratedSignature, FeeBumpTransaction, FeeBumpTransactionEnvelope,
             FeeBumpTransactionExt, FeeBumpTransactionInnerTx,
         };
@@ -1383,12 +1382,12 @@ mod tests {
             fee: 100,
             seq_num: SequenceNumber(6),
             cond: Preconditions::None,
-            memo: stellar_xdr::curr::Memo::None,
+            memo: stellar_xdr::Memo::None,
             operations: vec![Operation {
                 source_account: None,
                 body: OperationBody::Payment(PaymentOp {
                     destination: MuxedAccount::Ed25519(Uint256([99u8; 32])),
-                    asset: stellar_xdr::curr::Asset::Native,
+                    asset: stellar_xdr::Asset::Native,
                     amount: 1000,
                 }),
             }]
@@ -1413,7 +1412,7 @@ mod tests {
 
         let fee_bump_envelope = TransactionEnvelope::TxFeeBump(FeeBumpTransactionEnvelope {
             tx: fee_bump_tx,
-            signatures: stellar_xdr::curr::VecM::<DecoratedSignature, 20>::default(),
+            signatures: stellar_xdr::VecM::<DecoratedSignature, 20>::default(),
         });
 
         let frame = TransactionFrame::from_owned(fee_bump_envelope);
@@ -1447,7 +1446,7 @@ mod tests {
         inner_fee: u32,
         outer_fee: i64,
     ) -> TransactionFrame {
-        use stellar_xdr::curr::{
+        use stellar_xdr::{
             ContractDataDurability, DecoratedSignature, FeeBumpTransaction,
             FeeBumpTransactionEnvelope, FeeBumpTransactionExt, FeeBumpTransactionInnerTx, Hash,
             HostFunction, InvokeContractArgs, InvokeHostFunctionOp, LedgerFootprint, LedgerKey,
@@ -1513,7 +1512,7 @@ mod tests {
             fee: inner_fee,
             seq_num: SequenceNumber(1),
             cond: Preconditions::None,
-            memo: stellar_xdr::curr::Memo::None,
+            memo: stellar_xdr::Memo::None,
             operations: vec![op].try_into().unwrap(),
             ext: TransactionExt::V1(soroban_data),
         };
@@ -1546,7 +1545,7 @@ mod tests {
     /// and charges the fee source, not the inner source.
     #[test]
     fn test_process_fee_seq_num_fee_bump() {
-        use stellar_xdr::curr::{
+        use stellar_xdr::{
             DecoratedSignature, FeeBumpTransaction, FeeBumpTransactionEnvelope,
             FeeBumpTransactionExt, FeeBumpTransactionInnerTx,
         };
@@ -1574,12 +1573,12 @@ mod tests {
             fee: 100,
             seq_num: SequenceNumber(6),
             cond: Preconditions::None,
-            memo: stellar_xdr::curr::Memo::None,
+            memo: stellar_xdr::Memo::None,
             operations: vec![Operation {
                 source_account: None,
                 body: OperationBody::Payment(PaymentOp {
                     destination: MuxedAccount::Ed25519(Uint256([50u8; 32])),
-                    asset: stellar_xdr::curr::Asset::Native,
+                    asset: stellar_xdr::Asset::Native,
                     amount: 1000,
                 }),
             }]
@@ -1604,7 +1603,7 @@ mod tests {
 
         let envelope = TransactionEnvelope::TxFeeBump(FeeBumpTransactionEnvelope {
             tx: fee_bump_tx,
-            signatures: stellar_xdr::curr::VecM::<DecoratedSignature, 20>::default(),
+            signatures: stellar_xdr::VecM::<DecoratedSignature, 20>::default(),
         });
 
         let frame = TransactionFrame::from_owned(envelope);
@@ -1770,7 +1769,7 @@ mod tests {
         // stays at TxSuccess (the initial state from process_fee_seq_num).
         assert_eq!(
             result.result_code(),
-            stellar_xdr::curr::TransactionResultCode::TxSuccess,
+            stellar_xdr::TransactionResultCode::TxSuccess,
             "partial fee must not produce an error — body application is not blocked"
         );
 

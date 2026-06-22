@@ -27,7 +27,7 @@
 
 use crate::{LedgerError, Result};
 use henyey_common::Hash256;
-use stellar_xdr::curr::{LedgerHeader, Limits, WriteXdr};
+use stellar_xdr::{LedgerHeader, Limits, WriteXdr};
 
 /// Skip list update intervals (from stellar-core).
 /// The skip list stores bucket_list_hash values at these intervals.
@@ -45,7 +45,7 @@ pub struct NextHeaderFields {
     pub total_coins: i64,
     pub fee_pool: i64,
     pub inflation_seq: u32,
-    pub stellar_value_ext: stellar_xdr::curr::StellarValueExt,
+    pub stellar_value_ext: stellar_xdr::StellarValueExt,
 }
 
 /// Compute the canonical hash of a ledger header.
@@ -96,7 +96,7 @@ pub fn compute_header_hash(header: &LedgerHeader) -> Result<Hash256> {
 ///
 /// This must be called after setting the bucket_list_hash but before computing
 /// the header hash.
-pub fn calculate_skip_values(header: &LedgerHeader) -> [stellar_xdr::curr::Hash; 4] {
+pub fn calculate_skip_values(header: &LedgerHeader) -> [stellar_xdr::Hash; 4] {
     let seq = header.ledger_seq;
     let mut skip_list = header.skip_list.clone();
 
@@ -205,10 +205,10 @@ pub fn create_next_header(
     let mut header = LedgerHeader {
         ledger_version: prev_header.ledger_version,
         previous_ledger_hash: prev_header_hash.into(),
-        scp_value: stellar_xdr::curr::StellarValue {
+        scp_value: stellar_xdr::StellarValue {
             tx_set_hash: fields.tx_set_hash.into(),
-            close_time: stellar_xdr::curr::TimePoint(fields.close_time),
-            upgrades: stellar_xdr::curr::VecM::default(),
+            close_time: stellar_xdr::TimePoint(fields.close_time),
+            upgrades: stellar_xdr::VecM::default(),
             ext: fields.stellar_value_ext,
         },
         tx_set_result_hash: fields.tx_set_result_hash.into(),
@@ -252,17 +252,17 @@ pub fn protocol_version(header: &LedgerHeader) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use stellar_xdr::curr::Hash;
+    use stellar_xdr::Hash;
 
     fn create_test_header(seq: u32) -> LedgerHeader {
         LedgerHeader {
             ledger_version: 20,
             previous_ledger_hash: Hash([0u8; 32]),
-            scp_value: stellar_xdr::curr::StellarValue {
+            scp_value: stellar_xdr::StellarValue {
                 tx_set_hash: Hash([0u8; 32]),
-                close_time: stellar_xdr::curr::TimePoint(1000 + seq as u64),
-                upgrades: stellar_xdr::curr::VecM::default(),
-                ext: stellar_xdr::curr::StellarValueExt::Basic,
+                close_time: stellar_xdr::TimePoint(1000 + seq as u64),
+                upgrades: stellar_xdr::VecM::default(),
+                ext: stellar_xdr::StellarValueExt::Basic,
             },
             tx_set_result_hash: Hash([0u8; 32]),
             bucket_list_hash: Hash([0u8; 32]),
@@ -275,7 +275,7 @@ mod tests {
             base_reserve: 5_000_000,
             max_tx_set_size: 1000,
             skip_list: std::array::from_fn(|_| Hash([0u8; 32])),
-            ext: stellar_xdr::curr::LedgerHeaderExt::V0,
+            ext: stellar_xdr::LedgerHeaderExt::V0,
         }
     }
 
@@ -328,7 +328,7 @@ mod tests {
                 total_coins: 100_000_000_000_000_000,
                 fee_pool: 0,
                 inflation_seq: 0,
-                stellar_value_ext: stellar_xdr::curr::StellarValueExt::Basic,
+                stellar_value_ext: stellar_xdr::StellarValueExt::Basic,
             },
         );
         assert!(result.is_err(), "Should fail on ledger_seq overflow");
@@ -349,7 +349,7 @@ mod tests {
                 total_coins: 100_000_000_000_000_000,
                 fee_pool: 0,
                 inflation_seq: 0,
-                stellar_value_ext: stellar_xdr::curr::StellarValueExt::Basic,
+                stellar_value_ext: stellar_xdr::StellarValueExt::Basic,
             },
         );
         assert!(result.is_ok());
@@ -371,7 +371,7 @@ mod tests {
                 total_coins: 100_000_000_000_000_000,
                 fee_pool: -1,
                 inflation_seq: 0,
-                stellar_value_ext: stellar_xdr::curr::StellarValueExt::Basic,
+                stellar_value_ext: stellar_xdr::StellarValueExt::Basic,
             },
         );
         assert!(result.is_err(), "Should fail on negative fee_pool");

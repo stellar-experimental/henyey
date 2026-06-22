@@ -232,29 +232,29 @@ impl Hash for Curve25519Public {
     }
 }
 
-impl From<stellar_xdr::curr::Curve25519Public> for Curve25519Public {
-    fn from(xdr: stellar_xdr::curr::Curve25519Public) -> Self {
+impl From<stellar_xdr::Curve25519Public> for Curve25519Public {
+    fn from(xdr: stellar_xdr::Curve25519Public) -> Self {
         Self::from_bytes(xdr.key)
     }
 }
 
-impl From<Curve25519Public> for stellar_xdr::curr::Curve25519Public {
+impl From<Curve25519Public> for stellar_xdr::Curve25519Public {
     fn from(key: Curve25519Public) -> Self {
-        stellar_xdr::curr::Curve25519Public {
+        stellar_xdr::Curve25519Public {
             key: key.to_bytes(),
         }
     }
 }
 
-impl From<stellar_xdr::curr::Curve25519Secret> for Curve25519Secret {
-    fn from(xdr: stellar_xdr::curr::Curve25519Secret) -> Self {
+impl From<stellar_xdr::Curve25519Secret> for Curve25519Secret {
+    fn from(xdr: stellar_xdr::Curve25519Secret) -> Self {
         Self::from_bytes(xdr.key)
     }
 }
 
-impl From<Curve25519Secret> for stellar_xdr::curr::Curve25519Secret {
+impl From<Curve25519Secret> for stellar_xdr::Curve25519Secret {
     fn from(key: Curve25519Secret) -> Self {
-        stellar_xdr::curr::Curve25519Secret {
+        stellar_xdr::Curve25519Secret {
             key: key.to_bytes(),
         }
     }
@@ -379,7 +379,7 @@ mod tests {
         let public = secret.derive_public();
 
         // Convert to XDR and back
-        let xdr_public: stellar_xdr::curr::Curve25519Public = public.into();
+        let xdr_public: stellar_xdr::Curve25519Public = public.into();
         let restored_public: Curve25519Public = xdr_public.into();
 
         assert_eq!(public.to_bytes(), restored_public.to_bytes());

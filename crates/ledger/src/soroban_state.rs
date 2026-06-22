@@ -176,13 +176,14 @@ impl<V: Clone> ShardedCowMap<V> {
 }
 use henyey_tx::operations::execute::entry_size_for_rent_by_protocol_with_cost_params;
 use henyey_tx::soroban::convert::{
-    try_convert_cost_params_ws_to_p25, try_convert_ledger_entry_ws_to_p25,
+    try_convert_cost_params_ws_to_p25, try_convert_cost_params_ws_to_p26,
+    try_convert_ledger_entry_ws_to_p25, try_convert_ledger_entry_ws_to_p26,
 };
 use soroban_env_host25::budget::Budget as BudgetP25;
 use soroban_env_host25::e2e_invoke::entry_size_for_rent as entry_size_for_rent_p25;
 use soroban_env_host_p25 as soroban_env_host25;
 use soroban_env_host_p26 as soroban_env_host26;
-use stellar_xdr::curr::{
+use stellar_xdr::{
     ConfigSettingId, ContractCostParams, Hash, LedgerEntry, LedgerEntryData, LedgerKey,
     LedgerKeyConfigSetting, LedgerKeyContractCode, LedgerKeyContractData, LedgerKeyTtl, TtlEntry,
 };
@@ -286,7 +287,8 @@ fn build_rent_budget_p25(rent_config: Option<&SorobanRentConfig>) -> BudgetP25 {
 
 /// Build a p26 Budget from on-chain cost parameters (for protocol 26+).
 ///
-/// P26 host uses stellar-xdr 26.0.0 (same as workspace) — no conversion needed.
+/// P26 host pins stellar-xdr 26.0.0, distinct from the workspace XDR, so the
+/// cost params are byte-converted to the P26 type.
 fn build_rent_budget_p26(
     rent_config: Option<&SorobanRentConfig>,
 ) -> soroban_env_host26::budget::Budget {
@@ -299,11 +301,25 @@ fn build_rent_budget_p26(
 
     let instruction_limit = config.tx_max_instructions.saturating_mul(2);
     let memory_limit = config.tx_max_memory_bytes.saturating_mul(2);
+    let cpu_params = match try_convert_cost_params_ws_to_p26(&config.cpu_cost_params) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!("build_rent_budget_p26: {e}, using default budget");
+            return soroban_env_host26::budget::Budget::default();
+        }
+    };
+    let mem_params = match try_convert_cost_params_ws_to_p26(&config.mem_cost_params) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!("build_rent_budget_p26: {e}, using default budget");
+            return soroban_env_host26::budget::Budget::default();
+        }
+    };
     soroban_env_host26::budget::Budget::try_from_configs(
         instruction_limit,
         memory_limit,
-        config.cpu_cost_params.clone(),
-        config.mem_cost_params.clone(),
+        cpu_params,
+        mem_params,
     )
     .unwrap_or_else(|_| soroban_env_host26::budget::Budget::default())
 }
@@ -672,7 +688,7 @@ impl InMemorySorobanState {
                 key_hash: key.key_hash.clone(),
                 live_until_ledger_seq: ttl_data.live_until_ledger_seq,
             }),
-            ext: stellar_xdr::curr::LedgerEntryExt::V0,
+            ext: stellar_xdr::LedgerEntryExt::V0,
         };
 
         Some(Arc::new(entry))
@@ -1045,10 +1061,19 @@ impl InMemorySorobanState {
             };
         }
         // Protocol >= 26: use p26 host (86 cost types).
-        // P26 host uses stellar-xdr 26.0.0 (same as workspace) — no conversion needed.
+        // P26 host pins stellar-xdr 26.0.0, distinct from the workspace XDR, so
+        // the entry is byte-converted to the P26 type.
         let budget = build_rent_budget_p26(rent_config);
-        soroban_env_host26::e2e_invoke::entry_size_for_rent(&budget, entry, xdr_size)
-            .unwrap_or(xdr_size)
+        match try_convert_ledger_entry_ws_to_p26(entry) {
+            Ok(p26_entry) => {
+                soroban_env_host26::e2e_invoke::entry_size_for_rent(&budget, &p26_entry, xdr_size)
+                    .unwrap_or(xdr_size)
+            }
+            Err(e) => {
+                tracing::warn!("calculate_code_size: {e}, falling back to XDR size");
+                xdr_size
+            }
+        }
     }
 
     /// Update state with new entries from a ledger close.
@@ -1355,7 +1380,7 @@ impl SharedSorobanState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use stellar_xdr::curr::{
+    use stellar_xdr::{
         ContractCodeEntry, ContractCodeEntryExt, ContractDataDurability, ContractDataEntry,
         ContractId, ExtensionPoint, Hash, LedgerEntryExt, LedgerKeyContractCode,
         LedgerKeyContractData, ScAddress, ScVal,
@@ -1370,9 +1395,7 @@ mod tests {
     fn contract_data_shard_index(key_bytes: [u8; 32]) -> usize {
         let ledger_key = LedgerKey::ContractData(LedgerKeyContractData {
             contract: make_contract_address(),
-            key: ScVal::Bytes(stellar_xdr::curr::ScBytes(
-                key_bytes.to_vec().try_into().unwrap(),
-            )),
+            key: ScVal::Bytes(stellar_xdr::ScBytes(key_bytes.to_vec().try_into().unwrap())),
             durability: ContractDataDurability::Persistent,
         });
         let key_hash = Hash256::hash_xdr(&ledger_key);
@@ -1423,13 +1446,11 @@ mod tests {
             data: LedgerEntryData::ContractData(ContractDataEntry {
                 ext: ExtensionPoint::V0,
                 contract: make_contract_address(),
-                key: ScVal::Bytes(stellar_xdr::curr::ScBytes(
-                    key_bytes.to_vec().try_into().unwrap(),
-                )),
+                key: ScVal::Bytes(stellar_xdr::ScBytes(key_bytes.to_vec().try_into().unwrap())),
                 durability: ContractDataDurability::Persistent,
                 val: ScVal::I32(42),
             }),
-            ext: stellar_xdr::curr::LedgerEntryExt::V0,
+            ext: stellar_xdr::LedgerEntryExt::V0,
         }
     }
 
@@ -1441,7 +1462,7 @@ mod tests {
                 hash: Hash(hash),
                 code: vec![0u8; 100].try_into().unwrap(),
             }),
-            ext: stellar_xdr::curr::LedgerEntryExt::V0,
+            ext: stellar_xdr::LedgerEntryExt::V0,
         }
     }
 
@@ -1495,9 +1516,7 @@ mod tests {
 
         let key = LedgerKeyContractData {
             contract: make_contract_address(),
-            key: ScVal::Bytes(stellar_xdr::curr::ScBytes(
-                [1u8; 32].to_vec().try_into().unwrap(),
-            )),
+            key: ScVal::Bytes(stellar_xdr::ScBytes([1u8; 32].to_vec().try_into().unwrap())),
             durability: ContractDataDurability::Persistent,
         };
 
@@ -1553,9 +1572,7 @@ mod tests {
         // Get the key hash
         let key = LedgerKeyContractData {
             contract: make_contract_address(),
-            key: ScVal::Bytes(stellar_xdr::curr::ScBytes(
-                [1u8; 32].to_vec().try_into().unwrap(),
-            )),
+            key: ScVal::Bytes(stellar_xdr::ScBytes([1u8; 32].to_vec().try_into().unwrap())),
             durability: ContractDataDurability::Persistent,
         };
         let key_hash = InMemorySorobanState::contract_data_key_hash(&key);
@@ -1577,9 +1594,7 @@ mod tests {
         // Create TTL before the entry exists
         let key = LedgerKeyContractData {
             contract: make_contract_address(),
-            key: ScVal::Bytes(stellar_xdr::curr::ScBytes(
-                [1u8; 32].to_vec().try_into().unwrap(),
-            )),
+            key: ScVal::Bytes(stellar_xdr::ScBytes([1u8; 32].to_vec().try_into().unwrap())),
             durability: ContractDataDurability::Persistent,
         };
         let key_hash = InMemorySorobanState::contract_data_key_hash(&key);
@@ -1610,9 +1625,7 @@ mod tests {
         // Set TTL
         let key = LedgerKeyContractData {
             contract: make_contract_address(),
-            key: ScVal::Bytes(stellar_xdr::curr::ScBytes(
-                [1u8; 32].to_vec().try_into().unwrap(),
-            )),
+            key: ScVal::Bytes(stellar_xdr::ScBytes([1u8; 32].to_vec().try_into().unwrap())),
             durability: ContractDataDurability::Persistent,
         };
         let key_hash = InMemorySorobanState::contract_data_key_hash(&key);
@@ -1683,7 +1696,7 @@ mod tests {
         // Create a TTL entry for the data that will be "restored" from hot archive
         let restored_key = LedgerKeyContractData {
             contract: make_contract_address(),
-            key: ScVal::Bytes(stellar_xdr::curr::ScBytes(
+            key: ScVal::Bytes(stellar_xdr::ScBytes(
                 [42u8; 32].to_vec().try_into().unwrap(),
             )),
             durability: ContractDataDurability::Persistent,
@@ -1706,7 +1719,7 @@ mod tests {
             data: LedgerEntryData::ContractData(ContractDataEntry {
                 ext: ExtensionPoint::V0,
                 contract: make_contract_address(),
-                key: ScVal::Bytes(stellar_xdr::curr::ScBytes(
+                key: ScVal::Bytes(stellar_xdr::ScBytes(
                     [42u8; 32].to_vec().try_into().unwrap(),
                 )),
                 durability: ContractDataDurability::Persistent,
@@ -1762,7 +1775,7 @@ mod tests {
     /// the in-memory Soroban state cache — they should always go to the database.
     #[test]
     fn test_config_setting_not_in_memory_type() {
-        use stellar_xdr::curr::{ConfigSettingId, LedgerKeyConfigSetting};
+        use stellar_xdr::{ConfigSettingId, LedgerKeyConfigSetting};
 
         // ConfigSetting should NOT be an in-memory type
         let config_key = LedgerKey::ConfigSetting(LedgerKeyConfigSetting {
@@ -1792,12 +1805,10 @@ mod tests {
         assert!(InMemorySorobanState::is_in_memory_type(&ttl_key));
 
         // Account should also not be an in-memory type
-        let account_key = LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
-            account_id: stellar_xdr::curr::AccountId(
-                stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(stellar_xdr::curr::Uint256(
-                    [0u8; 32],
-                )),
-            ),
+        let account_key = LedgerKey::Account(stellar_xdr::LedgerKeyAccount {
+            account_id: stellar_xdr::AccountId(stellar_xdr::PublicKey::PublicKeyTypeEd25519(
+                stellar_xdr::Uint256([0u8; 32]),
+            )),
         });
         assert!(!InMemorySorobanState::is_in_memory_type(&account_key));
     }
@@ -2010,7 +2021,7 @@ mod tests {
 
     #[test]
     fn test_xdr_size_matches_serialization() {
-        use stellar_xdr::curr::{Limits, WriteXdr};
+        use stellar_xdr::{Limits, WriteXdr};
 
         // Contract data entry
         let entry = make_contract_data_entry([1u8; 32]);
@@ -2030,7 +2041,7 @@ mod tests {
 
     #[test]
     fn test_contract_data_size_tracking_exact_deltas() {
-        use stellar_xdr::curr::{Limits, WriteXdr};
+        use stellar_xdr::{Limits, WriteXdr};
 
         let mut state = InMemorySorobanState::new();
 
@@ -2044,9 +2055,7 @@ mod tests {
         let mut updated_entry = make_contract_data_entry([1u8; 32]);
         if let LedgerEntryData::ContractData(cd) = &mut updated_entry.data {
             // Use a much larger value to ensure different XDR size
-            cd.val = ScVal::Bytes(stellar_xdr::curr::ScBytes(
-                vec![0u8; 200].try_into().unwrap(),
-            ));
+            cd.val = ScVal::Bytes(stellar_xdr::ScBytes(vec![0u8; 200].try_into().unwrap()));
         }
         let updated_xdr_size = updated_entry.to_xdr(Limits::none()).unwrap().len() as i64;
         state.update_contract_data(updated_entry).unwrap();
@@ -2059,9 +2068,7 @@ mod tests {
         // Delete and verify size returns to 0
         let key = LedgerKeyContractData {
             contract: make_contract_address(),
-            key: ScVal::Bytes(stellar_xdr::curr::ScBytes(
-                [1u8; 32].to_vec().try_into().unwrap(),
-            )),
+            key: ScVal::Bytes(stellar_xdr::ScBytes([1u8; 32].to_vec().try_into().unwrap())),
             durability: ContractDataDurability::Persistent,
         };
         state.delete_contract_data(&key).unwrap();
@@ -2124,7 +2131,7 @@ mod tests {
 
     #[test]
     fn test_snapshot_preserves_sizes() {
-        use stellar_xdr::curr::{Limits, WriteXdr};
+        use stellar_xdr::{Limits, WriteXdr};
 
         let mut state = InMemorySorobanState::new();
 
@@ -2154,9 +2161,7 @@ mod tests {
         // Delete from live
         let key = LedgerKeyContractData {
             contract: make_contract_address(),
-            key: ScVal::Bytes(stellar_xdr::curr::ScBytes(
-                [1u8; 32].to_vec().try_into().unwrap(),
-            )),
+            key: ScVal::Bytes(stellar_xdr::ScBytes([1u8; 32].to_vec().try_into().unwrap())),
             durability: ContractDataDurability::Persistent,
         };
         state.delete_contract_data(&key).unwrap();
@@ -2262,7 +2267,7 @@ mod tests {
         // Verify snapshot isolation: snapshot still sees original values.
         let snap_key_a = LedgerKey::ContractData(LedgerKeyContractData {
             contract: make_contract_address(),
-            key: ScVal::Bytes(stellar_xdr::curr::ScBytes(
+            key: ScVal::Bytes(stellar_xdr::ScBytes(
                 key_a_bytes.to_vec().try_into().unwrap(),
             )),
             durability: ContractDataDurability::Persistent,

@@ -12,7 +12,7 @@ use crate::frame::muxed_to_account_id;
 use henyey_common::asset::{
     is_asset_valid, is_change_trust_asset_valid, is_string_valid, is_trustline_asset_valid,
 };
-use stellar_xdr::curr::{
+use stellar_xdr::{
     AccountId, AllowTrustOp, Asset, BeginSponsoringFutureReservesOp, BumpSequenceOp,
     ChangeTrustAsset, ChangeTrustOp, ClaimClaimableBalanceOp, ClaimPredicate, Claimant,
     ClawbackClaimableBalanceOp, ClawbackOp, CreateAccountOp, CreateClaimableBalanceOp,
@@ -24,7 +24,7 @@ use stellar_xdr::curr::{
     MASK_ACCOUNT_FLAGS_V17,
 };
 
-/// Extension trait for `stellar_xdr::curr::OperationType` providing Soroban classification
+/// Extension trait for `stellar_xdr::OperationType` providing Soroban classification
 /// and body-to-type conversion.
 pub trait OperationTypeExt {
     /// Check if this is a Soroban operation.
@@ -481,9 +481,8 @@ fn validate_set_options(
         // signer key must not be self
         if let Some(src) = source_account {
             if let SignerKey::Ed25519(key) = &signer.key {
-                let signer_acct = AccountId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
-                    key.clone(),
-                ));
+                let signer_acct =
+                    AccountId(stellar_xdr::PublicKey::PublicKeyTypeEd25519(key.clone()));
                 if &signer_acct == src {
                     return Err(OperationValidationError::InvalidSigner);
                 }
@@ -564,14 +563,14 @@ fn validate_allow_trust(
     // Asset must be a valid credit code. Mirrors stellar-core
     // AllowTrustOpFrame::doCheckValid() which calls isAssetValid().
     match &op.asset {
-        stellar_xdr::curr::AssetCode::CreditAlphanum4(code) => {
+        stellar_xdr::AssetCode::CreditAlphanum4(code) => {
             if !henyey_common::asset::is_asset_code4_valid(code) {
                 return Err(OperationValidationError::InvalidAsset(
                     "invalid asset code".into(),
                 ));
             }
         }
-        stellar_xdr::curr::AssetCode::CreditAlphanum12(code) => {
+        stellar_xdr::AssetCode::CreditAlphanum12(code) => {
             if !henyey_common::asset::is_asset_code12_valid(code) {
                 return Err(OperationValidationError::InvalidAsset(
                     "invalid asset code".into(),
@@ -752,7 +751,7 @@ fn validate_revoke_sponsorship(
                         "invalid trustline asset".into(),
                     ));
                 }
-                if matches!(tl.asset, stellar_xdr::curr::TrustLineAsset::Native) {
+                if matches!(tl.asset, stellar_xdr::TrustLineAsset::Native) {
                     return Err(OperationValidationError::InvalidAsset(
                         "trustline asset cannot be native".into(),
                     ));
@@ -805,7 +804,7 @@ fn validate_clawback(
     // with the same underlying key is considered different (clawback is allowed).
     if let Some(src) = source_account {
         let key = match &src.0 {
-            stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(k) => k.clone(),
+            stellar_xdr::PublicKey::PublicKeyTypeEd25519(k) => k.clone(),
         };
         let src_muxed = MuxedAccount::Ed25519(key);
         if op.from == src_muxed {
@@ -1110,8 +1109,8 @@ pub fn validate_classic_op_structure(
 pub fn malformed_operation_result(
     body: &OperationBody,
     err: &OperationValidationError,
-) -> stellar_xdr::curr::OperationResult {
-    use stellar_xdr::curr::*;
+) -> stellar_xdr::OperationResult {
+    use stellar_xdr::*;
     let tr = match body {
         OperationBody::CreateAccount(_) => {
             OperationResultTr::CreateAccount(CreateAccountResult::Malformed)
@@ -1219,7 +1218,7 @@ pub fn malformed_operation_result(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use stellar_xdr::curr::*;
+    use stellar_xdr::*;
 
     #[test]
     fn test_operation_type_from_body() {
@@ -1398,9 +1397,9 @@ mod tests {
             source_account: None,
             body: OperationBody::AllowTrust(AllowTrustOp {
                 trustor: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([0u8; 32]))),
-                asset: stellar_xdr::curr::AssetCode::CreditAlphanum4(
-                    stellar_xdr::curr::AssetCode4([b'U', b'S', b'D', 0]),
-                ),
+                asset: stellar_xdr::AssetCode::CreditAlphanum4(stellar_xdr::AssetCode4([
+                    b'U', b'S', b'D', 0,
+                ])),
                 authorize: 1,
             }),
         };
@@ -1410,7 +1409,7 @@ mod tests {
         let bump_seq_op = Operation {
             source_account: None,
             body: OperationBody::BumpSequence(BumpSequenceOp {
-                bump_to: stellar_xdr::curr::SequenceNumber(100),
+                bump_to: stellar_xdr::SequenceNumber(100),
             }),
         };
         assert_eq!(get_threshold_level(&bump_seq_op), ThresholdLevel::Low);
@@ -1419,8 +1418,8 @@ mod tests {
         let claim_op = Operation {
             source_account: None,
             body: OperationBody::ClaimClaimableBalance(ClaimClaimableBalanceOp {
-                balance_id: stellar_xdr::curr::ClaimableBalanceId::ClaimableBalanceIdTypeV0(
-                    stellar_xdr::curr::Hash([0u8; 32]),
+                balance_id: stellar_xdr::ClaimableBalanceId::ClaimableBalanceIdTypeV0(
+                    stellar_xdr::Hash([0u8; 32]),
                 ),
             }),
         };
@@ -1461,7 +1460,7 @@ mod tests {
         let change_trust_op = Operation {
             source_account: None,
             body: OperationBody::ChangeTrust(ChangeTrustOp {
-                line: stellar_xdr::curr::ChangeTrustAsset::Native,
+                line: stellar_xdr::ChangeTrustAsset::Native,
                 limit: 1000,
             }),
         };
@@ -1471,7 +1470,7 @@ mod tests {
         let manage_data_op = Operation {
             source_account: None,
             body: OperationBody::ManageData(ManageDataOp {
-                data_name: stellar_xdr::curr::String64::try_from(b"test".to_vec()).unwrap(),
+                data_name: stellar_xdr::String64::try_from(b"test".to_vec()).unwrap(),
                 data_value: Some(b"value".to_vec().try_into().unwrap()),
             }),
         };
@@ -1519,8 +1518,8 @@ mod tests {
                 med_threshold: None,
                 high_threshold: None,
                 home_domain: None,
-                signer: Some(stellar_xdr::curr::Signer {
-                    key: stellar_xdr::curr::SignerKey::Ed25519(Uint256([0u8; 32])),
+                signer: Some(stellar_xdr::Signer {
+                    key: stellar_xdr::SignerKey::Ed25519(Uint256([0u8; 32])),
                     weight: 10,
                 }),
             }),
@@ -1587,7 +1586,7 @@ mod tests {
                 med_threshold: None,
                 high_threshold: None,
                 home_domain: Some(
-                    stellar_xdr::curr::String32::try_from(b"example.com".to_vec()).unwrap(),
+                    stellar_xdr::String32::try_from(b"example.com".to_vec()).unwrap(),
                 ),
                 signer: None,
             }),
@@ -1673,8 +1672,8 @@ mod tests {
     fn test_validate_manage_sell_offer() {
         let valid = ManageSellOfferOp {
             selling: Asset::Native,
-            buying: Asset::CreditAlphanum4(stellar_xdr::curr::AlphaNum4 {
-                asset_code: stellar_xdr::curr::AssetCode4([b'U', b'S', b'D', 0]),
+            buying: Asset::CreditAlphanum4(stellar_xdr::AlphaNum4 {
+                asset_code: stellar_xdr::AssetCode4([b'U', b'S', b'D', 0]),
                 issuer: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([0u8; 32]))),
             }),
             amount: 1000,
@@ -1733,8 +1732,8 @@ mod tests {
     fn test_validate_manage_buy_offer() {
         let valid = ManageBuyOfferOp {
             selling: Asset::Native,
-            buying: Asset::CreditAlphanum4(stellar_xdr::curr::AlphaNum4 {
-                asset_code: stellar_xdr::curr::AssetCode4([b'U', b'S', b'D', 0]),
+            buying: Asset::CreditAlphanum4(stellar_xdr::AlphaNum4 {
+                asset_code: stellar_xdr::AssetCode4([b'U', b'S', b'D', 0]),
                 issuer: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([0u8; 32]))),
             }),
             buy_amount: 1000,
@@ -1806,11 +1805,11 @@ mod tests {
     /// Test validate_change_trust.
     #[test]
     fn test_validate_change_trust() {
-        use stellar_xdr::curr::ChangeTrustAsset;
+        use stellar_xdr::ChangeTrustAsset;
 
         let valid = ChangeTrustOp {
-            line: ChangeTrustAsset::CreditAlphanum4(stellar_xdr::curr::AlphaNum4 {
-                asset_code: stellar_xdr::curr::AssetCode4([b'U', b'S', b'D', 0]),
+            line: ChangeTrustAsset::CreditAlphanum4(stellar_xdr::AlphaNum4 {
+                asset_code: stellar_xdr::AssetCode4([b'U', b'S', b'D', 0]),
                 issuer: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([0u8; 32]))),
             }),
             limit: 1000,
@@ -1829,13 +1828,13 @@ mod tests {
     #[test]
     fn test_validate_bump_sequence() {
         let valid = BumpSequenceOp {
-            bump_to: stellar_xdr::curr::SequenceNumber(100),
+            bump_to: stellar_xdr::SequenceNumber(100),
         };
         assert!(validate_bump_sequence(&valid).is_ok());
 
         // Negative bump_to
         let negative = BumpSequenceOp {
-            bump_to: stellar_xdr::curr::SequenceNumber(-1),
+            bump_to: stellar_xdr::SequenceNumber(-1),
         };
         assert!(validate_bump_sequence(&negative).is_err());
     }
@@ -1844,21 +1843,21 @@ mod tests {
     #[test]
     fn test_validate_manage_data() {
         let valid = ManageDataOp {
-            data_name: stellar_xdr::curr::String64::try_from(b"test".to_vec()).unwrap(),
+            data_name: stellar_xdr::String64::try_from(b"test".to_vec()).unwrap(),
             data_value: Some(b"value".to_vec().try_into().unwrap()),
         };
         assert!(validate_manage_data(&valid, 21).is_ok());
 
         // Delete operation (None value) is also valid
         let delete = ManageDataOp {
-            data_name: stellar_xdr::curr::String64::try_from(b"test".to_vec()).unwrap(),
+            data_name: stellar_xdr::String64::try_from(b"test".to_vec()).unwrap(),
             data_value: None,
         };
         assert!(validate_manage_data(&delete, 21).is_ok());
 
         // Invalid string (contains null byte)
         let invalid_name = ManageDataOp {
-            data_name: stellar_xdr::curr::String64::try_from(b"te\x00st".to_vec()).unwrap(),
+            data_name: stellar_xdr::String64::try_from(b"te\x00st".to_vec()).unwrap(),
             data_value: None,
         };
         assert!(validate_manage_data(&invalid_name, 21).is_err());

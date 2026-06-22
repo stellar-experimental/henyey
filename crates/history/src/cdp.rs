@@ -55,7 +55,7 @@
 
 use crate::{HistoryError, Result};
 use std::io::Read;
-use stellar_xdr::curr::{Hash, LedgerCloseMeta, Limits, ReadXdr, WriteXdr};
+use stellar_xdr::{Hash, LedgerCloseMeta, Limits, ReadXdr, WriteXdr};
 
 /// CDP data lake client for fetching `LedgerCloseMeta` from cloud object storage.
 ///
@@ -545,9 +545,7 @@ macro_rules! map_tx_processing {
 /// The returned metadata is in transaction **apply order**, which may differ
 /// from the order in the transaction set for protocol versions with parallel
 /// execution phases.
-pub fn extract_transaction_metas(
-    meta: &LedgerCloseMeta,
-) -> Vec<stellar_xdr::curr::TransactionMeta> {
+pub fn extract_transaction_metas(meta: &LedgerCloseMeta) -> Vec<stellar_xdr::TransactionMeta> {
     map_tx_processing!(meta, |tp| tp.tx_apply_processing.clone())
 }
 
@@ -562,27 +560,27 @@ pub fn extract_transaction_metas(
 #[derive(Debug, Clone)]
 pub struct TransactionProcessingInfo {
     /// The transaction envelope containing the transaction body and signatures.
-    pub envelope: stellar_xdr::curr::TransactionEnvelope,
+    pub envelope: stellar_xdr::TransactionEnvelope,
 
     /// The transaction result pair containing the hash and result code.
-    pub result: stellar_xdr::curr::TransactionResultPair,
+    pub result: stellar_xdr::TransactionResultPair,
 
     /// The transaction metadata containing all ledger entry changes.
     ///
     /// This includes changes from both the transaction body and any
     /// Soroban contract invocations.
-    pub meta: stellar_xdr::curr::TransactionMeta,
+    pub meta: stellar_xdr::TransactionMeta,
 
     /// Fee-related ledger entry changes.
     ///
     /// These changes are applied before the transaction body and include
     /// fee deduction from the source account.
-    pub fee_meta: stellar_xdr::curr::LedgerEntryChanges,
+    pub fee_meta: stellar_xdr::LedgerEntryChanges,
 
     /// Post-transaction fee processing changes.
     ///
     /// These changes are applied after the transaction body, such as Soroban refunds.
-    pub post_fee_meta: stellar_xdr::curr::LedgerEntryChanges,
+    pub post_fee_meta: stellar_xdr::LedgerEntryChanges,
 
     /// Per-transaction base fee from the transaction set.
     ///
@@ -596,7 +594,7 @@ pub struct TransactionProcessingInfo {
 /// The base fee may differ from `ledger_header.base_fee` during surge pricing.
 /// `None` means "use the ledger header's base_fee".
 struct TxWithBaseFee<'a> {
-    env: &'a stellar_xdr::curr::TransactionEnvelope,
+    env: &'a stellar_xdr::TransactionEnvelope,
     base_fee: Option<u32>,
 }
 
@@ -607,23 +605,23 @@ struct TxWithBaseFee<'a> {
 /// structure (phases -> V0 components / V1 parallel stages -> clusters -> txs)
 /// so that consumers can operate on a flat iterator.
 fn visit_generalized_tx_set(
-    tx_set: &stellar_xdr::curr::GeneralizedTransactionSet,
+    tx_set: &stellar_xdr::GeneralizedTransactionSet,
 ) -> Vec<TxWithBaseFee<'_>> {
-    let stellar_xdr::curr::GeneralizedTransactionSet::V1(v1) = tx_set;
+    let stellar_xdr::GeneralizedTransactionSet::V1(v1) = tx_set;
     let mut result = Vec::new();
 
     for phase in v1.phases.iter() {
         match phase {
-            stellar_xdr::curr::TransactionPhase::V0(components) => {
+            stellar_xdr::TransactionPhase::V0(components) => {
                 for comp in components.iter() {
-                    let stellar_xdr::curr::TxSetComponent::TxsetCompTxsMaybeDiscountedFee(c) = comp;
+                    let stellar_xdr::TxSetComponent::TxsetCompTxsMaybeDiscountedFee(c) = comp;
                     let base_fee = c.base_fee.and_then(|fee| u32::try_from(fee).ok());
                     for env in c.txs.iter() {
                         result.push(TxWithBaseFee { env, base_fee });
                     }
                 }
             }
-            stellar_xdr::curr::TransactionPhase::V1(parallel) => {
+            stellar_xdr::TransactionPhase::V1(parallel) => {
                 let base_fee = parallel.base_fee.and_then(|fee| u32::try_from(fee).ok());
                 for stage in parallel.execution_stages.iter() {
                     for cluster in stage.iter() {
@@ -644,7 +642,7 @@ fn visit_generalized_tx_set(
 /// The `GeneralizedTransactionSet` can contain per-phase/per-component base fees
 /// that differ from `header.base_fee` during surge pricing.
 fn build_tx_hash_to_base_fee_map(
-    tx_set: &stellar_xdr::curr::GeneralizedTransactionSet,
+    tx_set: &stellar_xdr::GeneralizedTransactionSet,
     network_id: &Hash,
 ) -> std::collections::HashMap<Hash, Option<u32>> {
     visit_generalized_tx_set(tx_set)
@@ -657,33 +655,30 @@ fn build_tx_hash_to_base_fee_map(
 }
 
 /// Compute the network-aware transaction hash.
-fn compute_tx_hash(
-    env: &stellar_xdr::curr::TransactionEnvelope,
-    network_id: &Hash,
-) -> Option<Hash> {
+fn compute_tx_hash(env: &stellar_xdr::TransactionEnvelope, network_id: &Hash) -> Option<Hash> {
     use sha2::{Digest, Sha256};
-    use stellar_xdr::curr::EnvelopeType;
+    use stellar_xdr::EnvelopeType;
 
     let mut hasher = Sha256::new();
     hasher.update(network_id);
 
     let envelope_type = match env {
-        stellar_xdr::curr::TransactionEnvelope::TxV0(_) => EnvelopeType::TxV0,
-        stellar_xdr::curr::TransactionEnvelope::Tx(_) => EnvelopeType::Tx,
-        stellar_xdr::curr::TransactionEnvelope::TxFeeBump(_) => EnvelopeType::TxFeeBump,
+        stellar_xdr::TransactionEnvelope::TxV0(_) => EnvelopeType::TxV0,
+        stellar_xdr::TransactionEnvelope::Tx(_) => EnvelopeType::Tx,
+        stellar_xdr::TransactionEnvelope::TxFeeBump(_) => EnvelopeType::TxFeeBump,
     };
     hasher.update((envelope_type as i32).to_be_bytes());
 
     match env {
-        stellar_xdr::curr::TransactionEnvelope::TxV0(tx_v0) => {
+        stellar_xdr::TransactionEnvelope::TxV0(tx_v0) => {
             let tx_xdr = henyey_common::xdr_to_bytes(&tx_v0.tx);
             hasher.update(&tx_xdr);
         }
-        stellar_xdr::curr::TransactionEnvelope::Tx(tx_v1) => {
+        stellar_xdr::TransactionEnvelope::Tx(tx_v1) => {
             let tx_xdr = henyey_common::xdr_to_bytes(&tx_v1.tx);
             hasher.update(&tx_xdr);
         }
-        stellar_xdr::curr::TransactionEnvelope::TxFeeBump(tx_bump) => {
+        stellar_xdr::TransactionEnvelope::TxFeeBump(tx_bump) => {
             let tx_xdr = henyey_common::xdr_to_bytes(&tx_bump.tx);
             hasher.update(&tx_xdr);
         }
@@ -696,15 +691,15 @@ fn compute_tx_hash(
 /// Common fields extracted from V1/V2 `TransactionResultMeta` variants.
 struct TxProcessingFields {
     tx_hash: Hash,
-    result: stellar_xdr::curr::TransactionResultPair,
-    meta: stellar_xdr::curr::TransactionMeta,
-    fee_meta: stellar_xdr::curr::LedgerEntryChanges,
-    post_fee_meta: stellar_xdr::curr::LedgerEntryChanges,
+    result: stellar_xdr::TransactionResultPair,
+    meta: stellar_xdr::TransactionMeta,
+    fee_meta: stellar_xdr::LedgerEntryChanges,
+    post_fee_meta: stellar_xdr::LedgerEntryChanges,
 }
 
 /// Shared extraction logic for V1/V2 `LedgerCloseMeta` (generalized tx set).
 fn extract_generalized_tx_processing(
-    tx_set: &stellar_xdr::curr::GeneralizedTransactionSet,
+    tx_set: &stellar_xdr::GeneralizedTransactionSet,
     processing: impl Iterator<Item = TxProcessingFields>,
     network_id: &Hash,
     version_label: &str,
@@ -780,7 +775,7 @@ pub fn extract_transaction_processing(
                         result: tp.result.clone(),
                         meta: tp.tx_apply_processing.clone(),
                         fee_meta: tp.fee_processing.clone(),
-                        post_fee_meta: stellar_xdr::curr::LedgerEntryChanges::default(),
+                        post_fee_meta: stellar_xdr::LedgerEntryChanges::default(),
                         base_fee: None, // V0 doesn't have per-tx base fees
                     })
                 })
@@ -801,7 +796,7 @@ pub fn extract_transaction_processing(
                 result: tp.result.clone(),
                 meta: tp.tx_apply_processing.clone(),
                 fee_meta: tp.fee_processing.clone(),
-                post_fee_meta: stellar_xdr::curr::LedgerEntryChanges::default(),
+                post_fee_meta: stellar_xdr::LedgerEntryChanges::default(),
             }),
             network_id,
             "V1",
@@ -824,9 +819,9 @@ pub fn extract_transaction_processing(
 /// Build a map from transaction hash to envelope for matching.
 /// This version uses the network-aware hash (network_id || ENVELOPE_TYPE || tx).
 fn build_tx_hash_map_with_network(
-    txs: &[stellar_xdr::curr::TransactionEnvelope],
+    txs: &[stellar_xdr::TransactionEnvelope],
     network_id: &Hash,
-) -> std::collections::HashMap<Hash, stellar_xdr::curr::TransactionEnvelope> {
+) -> std::collections::HashMap<Hash, stellar_xdr::TransactionEnvelope> {
     txs.iter()
         .filter_map(|env| {
             let hash = compute_tx_hash(env, network_id)?;
@@ -836,7 +831,7 @@ fn build_tx_hash_map_with_network(
 }
 
 /// Extract ledger header from LedgerCloseMeta.
-pub fn extract_ledger_header(meta: &LedgerCloseMeta) -> stellar_xdr::curr::LedgerHeader {
+pub fn extract_ledger_header(meta: &LedgerCloseMeta) -> stellar_xdr::LedgerHeader {
     match meta {
         LedgerCloseMeta::V0(v0) => v0.ledger_header.header.clone(),
         LedgerCloseMeta::V1(v1) => v1.ledger_header.header.clone(),
@@ -847,7 +842,7 @@ pub fn extract_ledger_header(meta: &LedgerCloseMeta) -> stellar_xdr::curr::Ledge
 /// Extract transaction envelopes from LedgerCloseMeta.
 pub fn extract_transaction_envelopes(
     meta: &LedgerCloseMeta,
-) -> Vec<stellar_xdr::curr::TransactionEnvelope> {
+) -> Vec<stellar_xdr::TransactionEnvelope> {
     match meta {
         LedgerCloseMeta::V0(v0) => v0.tx_set.txs.to_vec(),
         LedgerCloseMeta::V1(v1) => extract_txs_from_generalized_set(&v1.tx_set),
@@ -857,8 +852,8 @@ pub fn extract_transaction_envelopes(
 
 /// Helper to extract transactions from a GeneralizedTransactionSet.
 fn extract_txs_from_generalized_set(
-    tx_set: &stellar_xdr::curr::GeneralizedTransactionSet,
-) -> Vec<stellar_xdr::curr::TransactionEnvelope> {
+    tx_set: &stellar_xdr::GeneralizedTransactionSet,
+) -> Vec<stellar_xdr::TransactionEnvelope> {
     visit_generalized_tx_set(tx_set)
         .into_iter()
         .map(|t| t.env.clone())
@@ -868,7 +863,7 @@ fn extract_txs_from_generalized_set(
 /// Extract transaction result pairs from LedgerCloseMeta.
 pub fn extract_transaction_results(
     meta: &LedgerCloseMeta,
-) -> Vec<stellar_xdr::curr::TransactionResultPair> {
+) -> Vec<stellar_xdr::TransactionResultPair> {
     map_tx_processing!(meta, |tp| tp.result.clone())
 }
 
@@ -909,7 +904,7 @@ pub fn extract_ledger_close_data(
     expected_header_hash: Option<henyey_common::Hash256>,
 ) -> henyey_ledger::LedgerCloseData {
     use henyey_ledger::LedgerCloseData;
-    use stellar_xdr::curr::{LedgerUpgrade, Limits, ReadXdr};
+    use stellar_xdr::{LedgerUpgrade, Limits, ReadXdr};
 
     let header = extract_ledger_header(meta);
     let tx_set = extract_transaction_set(meta);
@@ -942,7 +937,7 @@ pub fn extract_ledger_close_data(
 
 /// Extract evicted ledger keys from LedgerCloseMeta (V2 only).
 /// These are entries that were evicted from the live bucket list.
-pub fn extract_evicted_keys(meta: &LedgerCloseMeta) -> Vec<stellar_xdr::curr::LedgerKey> {
+pub fn extract_evicted_keys(meta: &LedgerCloseMeta) -> Vec<stellar_xdr::LedgerKey> {
     match meta {
         LedgerCloseMeta::V0(_) | LedgerCloseMeta::V1(_) => Vec::new(),
         LedgerCloseMeta::V2(v2) => v2.evicted_keys.to_vec(),
@@ -963,9 +958,9 @@ pub fn extract_evicted_keys(meta: &LedgerCloseMeta) -> Vec<stellar_xdr::curr::Le
 /// }
 /// ```
 pub fn extract_restored_keys(
-    tx_metas: &[stellar_xdr::curr::TransactionMeta],
-) -> Vec<stellar_xdr::curr::LedgerKey> {
-    use stellar_xdr::curr::LedgerEntryChange;
+    tx_metas: &[stellar_xdr::TransactionMeta],
+) -> Vec<stellar_xdr::LedgerKey> {
+    use stellar_xdr::LedgerEntryChange;
 
     let mut restored_keys = Vec::new();
 
@@ -986,7 +981,7 @@ pub fn extract_restored_keys(
 
 /// Extract upgrade changes from LedgerCloseMeta.
 /// These are ledger entry changes from protocol upgrades (not from transactions).
-pub fn extract_upgrade_metas(meta: &LedgerCloseMeta) -> Vec<stellar_xdr::curr::UpgradeEntryMeta> {
+pub fn extract_upgrade_metas(meta: &LedgerCloseMeta) -> Vec<stellar_xdr::UpgradeEntryMeta> {
     match meta {
         LedgerCloseMeta::V0(v0) => v0.upgrades_processing.to_vec(),
         LedgerCloseMeta::V1(v1) => v1.upgrades_processing.to_vec(),
@@ -997,7 +992,7 @@ pub fn extract_upgrade_metas(meta: &LedgerCloseMeta) -> Vec<stellar_xdr::curr::U
 #[cfg(test)]
 mod tests {
     use super::*;
-    use stellar_xdr::curr::{
+    use stellar_xdr::{
         AccountEntry, AccountEntryExt, AccountId, ContractCodeEntry, ContractCodeEntryExt,
         ContractDataDurability, ContractDataEntry, ContractId, ExtensionPoint, Hash, LedgerEntry,
         LedgerEntryChange, LedgerEntryChanges, LedgerEntryData, LedgerEntryExt, LedgerKey,

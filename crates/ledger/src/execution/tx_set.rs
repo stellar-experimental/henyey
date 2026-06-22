@@ -425,8 +425,8 @@ fn apply_soroban_fee_refunds(
     tx_result_metas: &mut [TransactionResultMetaV1],
     ledger_seq: u32,
     protocol_version: u32,
-) -> Vec<(usize, stellar_xdr::curr::LedgerEntryChanges)> {
-    use stellar_xdr::curr::{LedgerEntryChange, LedgerEntryChanges, LedgerKeyAccount};
+) -> Vec<(usize, stellar_xdr::LedgerEntryChanges)> {
+    use stellar_xdr::{LedgerEntryChange, LedgerEntryChanges, LedgerKeyAccount};
 
     let mut total_refunds = 0i64;
     let mut per_tx_changes = Vec::new();
@@ -885,13 +885,13 @@ pub fn execute_soroban_parallel_phase(
     // Only adjust fee pool if the refund was actually credited.
     // On failure, correct fee_charged back to full pre-charged fee (AUDIT-233).
     // Also capture STATE/UPDATED changes for post_tx_apply_fee_processing meta.
-    use stellar_xdr::curr::{LedgerEntryChange, LedgerEntryChanges};
+    use stellar_xdr::{LedgerEntryChange, LedgerEntryChanges};
     let mut total_refunds = 0i64;
     for idx in 0..all_results.len() {
         let refund = all_results[idx].fee_refund;
         if refund > 0 && idx < flat_txs.len() {
             let source = fee_source_account_id(flat_txs[idx]);
-            let account_key = LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
+            let account_key = LedgerKey::Account(stellar_xdr::LedgerKeyAccount {
                 account_id: source.clone(),
             });
             let pre_entry = delta.get_current_entry(&account_key);
@@ -987,14 +987,14 @@ pub(crate) fn pre_deduct_all_fees_on_delta(
                     .sum::<usize>(),
         );
         for (tx, _) in classic_txs {
-            fee_keys.push(LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
+            fee_keys.push(LedgerKey::Account(stellar_xdr::LedgerKeyAccount {
                 account_id: fee_source_account_id(tx),
             }));
         }
         for stage in &soroban_phase.stages {
             for cluster in stage {
                 for (tx, _) in cluster {
-                    fee_keys.push(LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
+                    fee_keys.push(LedgerKey::Account(stellar_xdr::LedgerKeyAccount {
                         account_id: fee_source_account_id(tx),
                     }));
                 }
@@ -1060,12 +1060,12 @@ pub(crate) fn pre_deduct_all_fees_on_delta(
 fn soroban_write_footprint(tx: &TransactionEnvelope) -> Option<Vec<LedgerKey>> {
     let data = match tx {
         TransactionEnvelope::Tx(env) => match &env.tx.ext {
-            stellar_xdr::curr::TransactionExt::V1(data) => Some(data),
+            stellar_xdr::TransactionExt::V1(data) => Some(data),
             _ => None,
         },
         TransactionEnvelope::TxFeeBump(env) => match &env.tx.inner_tx {
-            stellar_xdr::curr::FeeBumpTransactionInnerTx::Tx(inner) => match &inner.tx.ext {
-                stellar_xdr::curr::TransactionExt::V1(data) => Some(data),
+            stellar_xdr::FeeBumpTransactionInnerTx::Tx(inner) => match &inner.tx.ext {
+                stellar_xdr::TransactionExt::V1(data) => Some(data),
                 _ => None,
             },
         },
@@ -1617,7 +1617,7 @@ pub fn compute_state_size_window_entry(
     sample_size: u32,
 ) -> Result<Option<LedgerEntry>> {
     use henyey_common::protocol::MIN_SOROBAN_PROTOCOL_VERSION;
-    use stellar_xdr::curr::{
+    use stellar_xdr::{
         ConfigSettingEntry, ConfigSettingId, LedgerEntryData, LedgerEntryExt, LedgerKey,
         LedgerKeyConfigSetting, VecM,
     };
@@ -1746,7 +1746,7 @@ fn collect_dex_asset_pairs(transactions: &[TxWithFee]) -> HashSet<(Asset, Asset)
 #[cfg(test)]
 mod tests {
     use super::*;
-    use stellar_xdr::curr::{
+    use stellar_xdr::{
         AccountId, AlphaNum4, Asset, AssetCode4, ManageSellOfferOp, Memo, MuxedAccount,
         PathPaymentStrictReceiveOp, Preconditions, PublicKey, SequenceNumber, Transaction,
         TransactionExt, TransactionV1Envelope, Uint256, VecM,
@@ -1803,7 +1803,7 @@ mod tests {
                 selling: Asset::Native,
                 buying: usd.clone(),
                 amount: 100,
-                price: stellar_xdr::curr::Price { n: 1, d: 1 },
+                price: stellar_xdr::Price { n: 1, d: 1 },
                 offer_id: 0,
             },
         ))]);
@@ -1814,11 +1814,11 @@ mod tests {
 
         // ManageBuyOffer also captured
         let tx2 = make_tx_with_ops(vec![op(OperationBody::ManageBuyOffer(
-            stellar_xdr::curr::ManageBuyOfferOp {
+            stellar_xdr::ManageBuyOfferOp {
                 selling: eur.clone(),
                 buying: usd.clone(),
                 buy_amount: 100,
-                price: stellar_xdr::curr::Price { n: 2, d: 1 },
+                price: stellar_xdr::Price { n: 2, d: 1 },
                 offer_id: 0,
             },
         ))]);
@@ -1857,13 +1857,11 @@ mod tests {
     mod compute_state_size_window {
         use super::*;
         use henyey_bucket::BucketList;
-        use stellar_xdr::curr::{
-            BucketListType, ConfigSettingEntry, LedgerEntryData, LedgerEntryExt,
-        };
+        use stellar_xdr::{BucketListType, ConfigSettingEntry, LedgerEntryData, LedgerEntryExt};
 
         fn make_bucket_list_with_window(window: Vec<u64>) -> BucketList {
             let mut bl = BucketList::new();
-            let window_vecm: stellar_xdr::curr::VecM<u64> = window.try_into().unwrap();
+            let window_vecm: stellar_xdr::VecM<u64> = window.try_into().unwrap();
             let entry = LedgerEntry {
                 last_modified_ledger_seq: 1,
                 data: LedgerEntryData::ConfigSetting(
@@ -1961,7 +1959,7 @@ mod tests {
 
     fn make_simple_tx_result_pair(fee_charged: i64) -> TransactionResultPair {
         TransactionResultPair {
-            transaction_hash: stellar_xdr::curr::Hash([0u8; 32]),
+            transaction_hash: stellar_xdr::Hash([0u8; 32]),
             result: TransactionResult {
                 fee_charged,
                 result: TransactionResultResult::TxSuccess(Vec::new().try_into().unwrap()),
@@ -1975,7 +1973,7 @@ mod tests {
         inner_fee_charged: i64,
     ) -> TransactionResultPair {
         let inner_pair = InnerTransactionResultPair {
-            transaction_hash: stellar_xdr::curr::Hash([1u8; 32]),
+            transaction_hash: stellar_xdr::Hash([1u8; 32]),
             result: InnerTransactionResult {
                 fee_charged: inner_fee_charged,
                 result: InnerTransactionResultResult::TxSuccess(Vec::new().try_into().unwrap()),
@@ -1983,7 +1981,7 @@ mod tests {
             },
         };
         TransactionResultPair {
-            transaction_hash: stellar_xdr::curr::Hash([0u8; 32]),
+            transaction_hash: stellar_xdr::Hash([0u8; 32]),
             result: TransactionResult {
                 fee_charged: outer_fee_charged,
                 result: TransactionResultResult::TxFeeBumpInnerSuccess(inner_pair),
@@ -2030,7 +2028,7 @@ mod tests {
     fn test_correct_fee_charged_fee_bump_inner_failed_protocol_24() {
         // Fee-bump inner failed on p24: both outer and inner should be corrected
         let inner_pair = InnerTransactionResultPair {
-            transaction_hash: stellar_xdr::curr::Hash([1u8; 32]),
+            transaction_hash: stellar_xdr::Hash([1u8; 32]),
             result: InnerTransactionResult {
                 fee_charged: 4000,
                 result: InnerTransactionResultResult::TxFailed(Vec::new().try_into().unwrap()),
@@ -2038,7 +2036,7 @@ mod tests {
             },
         };
         let mut pair = TransactionResultPair {
-            transaction_hash: stellar_xdr::curr::Hash([0u8; 32]),
+            transaction_hash: stellar_xdr::Hash([0u8; 32]),
             result: TransactionResult {
                 fee_charged: 7000,
                 result: TransactionResultResult::TxFeeBumpInnerFailed(inner_pair),

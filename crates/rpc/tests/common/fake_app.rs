@@ -15,7 +15,7 @@ use henyey_bucket::BucketSnapshotManager;
 use henyey_herder::TxQueueResult;
 use henyey_ledger::{compute_header_hash, HeaderSnapshot, LedgerManager, LedgerManagerConfig};
 use henyey_rpc::{RpcAppHandle, RpcServer};
-use stellar_xdr::curr::{LedgerHeader, TransactionEnvelope};
+use stellar_xdr::{LedgerHeader, TransactionEnvelope};
 use tokio::sync::broadcast;
 
 // ---------------------------------------------------------------------------

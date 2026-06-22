@@ -20,7 +20,7 @@ use std::sync::Arc;
 
 use henyey_common::xdr_to_bytes;
 use henyey_crypto::Sha256Hasher;
-use stellar_xdr::curr::{NodeId, ScpQuorumSet};
+use stellar_xdr::{NodeId, ScpQuorumSet};
 
 use crate::quorum::is_quorum_slice;
 use crate::Hash256;

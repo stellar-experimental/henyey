@@ -12,7 +12,7 @@
 use crate::meta_stream::{MetaStreamError, MetaStreamManager};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use stellar_xdr::curr::LedgerCloseMeta;
+use stellar_xdr::LedgerCloseMeta;
 use tokio::sync::mpsc;
 
 /// Capacity of the bounded write channel.
@@ -247,20 +247,20 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         // Channel should be closed now
-        let meta = LedgerCloseMeta::V0(stellar_xdr::curr::LedgerCloseMetaV0 {
-            ledger_header: stellar_xdr::curr::LedgerHeaderHistoryEntry {
-                hash: stellar_xdr::curr::Hash([0; 32]),
-                header: stellar_xdr::curr::LedgerHeader {
+        let meta = LedgerCloseMeta::V0(stellar_xdr::LedgerCloseMetaV0 {
+            ledger_header: stellar_xdr::LedgerHeaderHistoryEntry {
+                hash: stellar_xdr::Hash([0; 32]),
+                header: stellar_xdr::LedgerHeader {
                     ledger_version: 21,
-                    previous_ledger_hash: stellar_xdr::curr::Hash([0; 32]),
-                    scp_value: stellar_xdr::curr::StellarValue {
-                        tx_set_hash: stellar_xdr::curr::Hash([0; 32]),
-                        close_time: stellar_xdr::curr::TimePoint(0),
+                    previous_ledger_hash: stellar_xdr::Hash([0; 32]),
+                    scp_value: stellar_xdr::StellarValue {
+                        tx_set_hash: stellar_xdr::Hash([0; 32]),
+                        close_time: stellar_xdr::TimePoint(0),
                         upgrades: vec![].try_into().unwrap(),
-                        ext: stellar_xdr::curr::StellarValueExt::Basic,
+                        ext: stellar_xdr::StellarValueExt::Basic,
                     },
-                    tx_set_result_hash: stellar_xdr::curr::Hash([0; 32]),
-                    bucket_list_hash: stellar_xdr::curr::Hash([0; 32]),
+                    tx_set_result_hash: stellar_xdr::Hash([0; 32]),
+                    bucket_list_hash: stellar_xdr::Hash([0; 32]),
                     ledger_seq: 1,
                     total_coins: 0,
                     fee_pool: 0,
@@ -270,17 +270,17 @@ mod tests {
                     base_reserve: 5000000,
                     max_tx_set_size: 100,
                     skip_list: [
-                        stellar_xdr::curr::Hash([0; 32]),
-                        stellar_xdr::curr::Hash([0; 32]),
-                        stellar_xdr::curr::Hash([0; 32]),
-                        stellar_xdr::curr::Hash([0; 32]),
+                        stellar_xdr::Hash([0; 32]),
+                        stellar_xdr::Hash([0; 32]),
+                        stellar_xdr::Hash([0; 32]),
+                        stellar_xdr::Hash([0; 32]),
                     ],
-                    ext: stellar_xdr::curr::LedgerHeaderExt::V0,
+                    ext: stellar_xdr::LedgerHeaderExt::V0,
                 },
-                ext: stellar_xdr::curr::LedgerHeaderHistoryEntryExt::V0,
+                ext: stellar_xdr::LedgerHeaderHistoryEntryExt::V0,
             },
-            tx_set: stellar_xdr::curr::TransactionSet {
-                previous_ledger_hash: stellar_xdr::curr::Hash([0; 32]),
+            tx_set: stellar_xdr::TransactionSet {
+                previous_ledger_hash: stellar_xdr::Hash([0; 32]),
                 txs: vec![].try_into().unwrap(),
             },
             tx_processing: vec![].try_into().unwrap(),

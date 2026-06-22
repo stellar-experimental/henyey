@@ -43,7 +43,7 @@ fn test_soroban_refund_event_after_all_txs() {
     let operation = Operation {
         source_account: None,
         body: OperationBody::ExtendFootprintTtl(ExtendFootprintTtlOp {
-            ext: stellar_xdr::curr::ExtensionPoint::V0,
+            ext: stellar_xdr::ExtensionPoint::V0,
             extend_to: 100,
         }),
     };
@@ -102,7 +102,7 @@ fn test_soroban_refund_event_after_all_txs() {
         panic!("unexpected tx meta");
     };
 
-    let tx_events: &[stellar_xdr::curr::TransactionEvent] = meta.events.as_ref();
+    let tx_events: &[stellar_xdr::TransactionEvent] = meta.events.as_ref();
     assert_eq!(tx_events.len(), 1);
 
     let contract_id = native_asset_contract_id(&network_id);
@@ -123,7 +123,7 @@ fn create_account_entry_with_sponsored_signers(
     signer_sponsors: Vec<SponsorshipDescriptor>,
     num_sponsored: u32,
 ) -> (LedgerKey, LedgerEntry) {
-    let key = LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
+    let key = LedgerKey::Account(stellar_xdr::LedgerKeyAccount {
         account_id: account_id.clone(),
     });
 
@@ -165,7 +165,7 @@ fn create_sponsor_account_entry(
     balance: i64,
     num_sponsoring: u32,
 ) -> (LedgerKey, LedgerEntry) {
-    let key = LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
+    let key = LedgerKey::Account(stellar_xdr::LedgerKeyAccount {
         account_id: account_id.clone(),
     });
 
@@ -1320,7 +1320,7 @@ fn test_cross_tx_deleted_trustline_not_reloaded() {
     });
 
     // Source account has a trustline (num_sub_entries=1)
-    let source_key = LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
+    let source_key = LedgerKey::Account(stellar_xdr::LedgerKeyAccount {
         account_id: source_id.clone(),
     });
     let source_entry = LedgerEntry {
@@ -2198,7 +2198,7 @@ fn test_create_account_sponsor_low_reserve_before_underfunded() {
                 PublicKey::PublicKeyTypeEd25519(k) => k.clone(),
             })),
             body: OperationBody::BeginSponsoringFutureReserves(
-                stellar_xdr::curr::BeginSponsoringFutureReservesOp {
+                stellar_xdr::BeginSponsoringFutureReservesOp {
                     sponsored_id: dest_id.clone(),
                 },
             ),
@@ -2287,7 +2287,7 @@ fn test_create_account_sponsor_low_reserve_before_underfunded() {
 /// claimable balance entry's own CLAIMABLE_BALANCE_CLAWBACK_ENABLED_FLAG.
 #[test]
 fn test_clawback_claimable_balance_not_issuer_error_code() {
-    use stellar_xdr::curr::{
+    use stellar_xdr::{
         ClaimableBalanceEntryExtensionV1, ClaimableBalanceEntryExtensionV1Ext,
         ClaimableBalanceFlags, ClawbackClaimableBalanceResult,
     };
@@ -2448,9 +2448,9 @@ fn test_classic_fees_deducted_upfront_before_tx_execution() {
     for i in 0..3u32 {
         let operation = Operation {
             source_account: None,
-            body: OperationBody::Payment(stellar_xdr::curr::PaymentOp {
+            body: OperationBody::Payment(stellar_xdr::PaymentOp {
                 destination: MuxedAccount::Ed25519(Uint256([88u8; 32])),
-                asset: stellar_xdr::curr::Asset::Native,
+                asset: stellar_xdr::Asset::Native,
                 amount: 200,
             }),
         };
@@ -2539,7 +2539,7 @@ fn test_set_trust_line_flags_redeems_pool_shares_loaded_from_snapshot() {
     use henyey_ledger::{EntryLookupFn, PoolShareTrustlinesByAccountFn};
     use std::collections::HashMap;
     use std::sync::Arc;
-    use stellar_xdr::curr::{
+    use stellar_xdr::{
         Liabilities, Limits, TrustLineEntryExt, TrustLineEntryExtensionV2,
         TrustLineEntryExtensionV2Ext, TrustLineEntryV1, TrustLineEntryV1Ext, TrustLineFlags,
         WriteXdr,
@@ -2658,7 +2658,7 @@ fn test_set_trust_line_flags_redeems_pool_shares_loaded_from_snapshot() {
         create_account_entry_with_flags(issuer_id.clone(), 1, 100_000_000, 0x1 | 0x2);
 
     // Trustor account — num_sub_entries=4 (2 asset TLs × 1 each + pool share TL counts as 2)
-    let trustor_key = LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
+    let trustor_key = LedgerKey::Account(stellar_xdr::LedgerKeyAccount {
         account_id: trustor_id.clone(),
     });
     let trustor_entry = LedgerEntry {
@@ -2867,7 +2867,7 @@ fn test_fee_bump_charges_outer_fee_when_inner_auth_fails_at_apply() {
         key: SignerKey::Ed25519(Uint256(*signer_pubkey.as_bytes())),
         weight: 1,
     };
-    let inner_key = LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
+    let inner_key = LedgerKey::Account(stellar_xdr::LedgerKeyAccount {
         account_id: inner_account_id.clone(),
     });
     let inner_entry = LedgerEntry {
@@ -2954,7 +2954,7 @@ fn test_fee_bump_charges_outer_fee_when_inner_auth_fails_at_apply() {
     // TX2: fee-bump wrapping an inner tx signed by signer_secret (now removed by TX1).
     let payment_op = Operation {
         source_account: None,
-        body: OperationBody::Payment(stellar_xdr::curr::PaymentOp {
+        body: OperationBody::Payment(stellar_xdr::PaymentOp {
             destination: MuxedAccount::Ed25519(Uint256([9u8; 32])),
             asset: Asset::Native,
             amount: 1,
@@ -2987,7 +2987,7 @@ fn test_fee_bump_charges_outer_fee_when_inner_auth_fails_at_apply() {
         fee_source: MuxedAccount::Ed25519(Uint256(*fee_secret.public_key().as_bytes())),
         fee: 200,
         inner_tx: FeeBumpTransactionInnerTx::Tx(inner_v1),
-        ext: stellar_xdr::curr::FeeBumpTransactionExt::V0,
+        ext: stellar_xdr::FeeBumpTransactionExt::V0,
     };
 
     let mut env2 = TransactionEnvelope::TxFeeBump(FeeBumpTransactionEnvelope {
@@ -3123,7 +3123,7 @@ fn test_op_source_merged_in_prior_tx_returns_bad_auth() {
     // Before fix: Henyey returned true (0 >= 0 bug) → op executed → opNO_ACCOUNT.
     let payment_op = Operation {
         source_account: Some(op_source_muxed),
-        body: OperationBody::Payment(stellar_xdr::curr::PaymentOp {
+        body: OperationBody::Payment(stellar_xdr::PaymentOp {
             destination: MuxedAccount::Ed25519(match &dest_id.0 {
                 PublicKey::PublicKeyTypeEd25519(k) => k.clone(),
             }),
@@ -3217,9 +3217,9 @@ fn test_pre_auth_tx_signer_checked_before_removal() {
     // PreAuthTx signer in TX 1.
     let payment_op = Operation {
         source_account: None,
-        body: OperationBody::Payment(stellar_xdr::curr::PaymentOp {
+        body: OperationBody::Payment(stellar_xdr::PaymentOp {
             destination: MuxedAccount::Ed25519(Uint256([99u8; 32])),
-            asset: stellar_xdr::curr::Asset::Native,
+            asset: stellar_xdr::Asset::Native,
             amount: 1000,
         }),
     };
@@ -3520,7 +3520,7 @@ fn test_fee_bump_soroban_checks_inner_signatures() {
         fee_source: MuxedAccount::Ed25519(Uint256(*fee_secret.public_key().as_bytes())),
         fee: 200,
         inner_tx: FeeBumpTransactionInnerTx::Tx(inner_v1),
-        ext: stellar_xdr::curr::FeeBumpTransactionExt::V0,
+        ext: stellar_xdr::FeeBumpTransactionExt::V0,
     };
 
     let mut env2 = TransactionEnvelope::TxFeeBump(FeeBumpTransactionEnvelope {
@@ -3590,7 +3590,7 @@ fn test_pre_charged_fee_override_on_validation_failure() {
     // Build TX from the missing account — this will trigger TxNoAccount.
     let payment_op = Operation {
         source_account: None,
-        body: OperationBody::Payment(stellar_xdr::curr::PaymentOp {
+        body: OperationBody::Payment(stellar_xdr::PaymentOp {
             destination: MuxedAccount::Ed25519(Uint256(*secret.public_key().as_bytes())),
             asset: Asset::Native,
             amount: 1,
@@ -3774,7 +3774,7 @@ fn test_partial_fee_precharge_still_applies_body() {
 fn test_audit_577_max_seq_num_to_apply_with_pre_charged() {
     use henyey_ledger::execution::{run_transactions_on_executor, FeeStrategy, PreChargedFee};
     use henyey_ledger::LedgerDelta;
-    use stellar_xdr::curr::AccountMergeResult;
+    use stellar_xdr::AccountMergeResult;
 
     let ledger_seq: u32 = 2;
     let starting_seq: i64 = (ledger_seq as i64) << 32; // 8589934592
@@ -3889,7 +3889,7 @@ fn test_audit_577_max_seq_num_to_apply_with_pre_charged() {
 fn test_max_seq_num_to_apply_built_for_merge_protocol24() {
     use henyey_ledger::execution::{run_transactions_on_executor, FeeStrategy};
     use henyey_ledger::LedgerDelta;
-    use stellar_xdr::curr::AccountMergeResult;
+    use stellar_xdr::AccountMergeResult;
 
     let ledger_seq: u32 = 2;
     let starting_seq: i64 = (ledger_seq as i64) << 32;
@@ -4014,7 +4014,7 @@ fn test_single_op_tx_failure_rolls_back_without_per_op_savepoint() {
     let nonexistent_dest = MuxedAccount::Ed25519(Uint256([99u8; 32]));
     let op_payment = Operation {
         source_account: None,
-        body: OperationBody::Payment(stellar_xdr::curr::PaymentOp {
+        body: OperationBody::Payment(stellar_xdr::PaymentOp {
             destination: nonexistent_dest,
             asset: Asset::Native,
             amount: 1_000_000,
@@ -4103,7 +4103,7 @@ fn test_audit_005_fee_bump_pre_auth_signer_removed_from_fee_source() {
     // Build the fee bump transaction first to compute the outer hash.
     let payment_op = Operation {
         source_account: None,
-        body: OperationBody::Payment(stellar_xdr::curr::PaymentOp {
+        body: OperationBody::Payment(stellar_xdr::PaymentOp {
             destination: MuxedAccount::Ed25519(Uint256(*inner_secret.public_key().as_bytes())),
             asset: Asset::Native,
             amount: 1,
@@ -4139,7 +4139,7 @@ fn test_audit_005_fee_bump_pre_auth_signer_removed_from_fee_source() {
         fee_source: MuxedAccount::Ed25519(Uint256(*fee_secret.public_key().as_bytes())),
         fee: 200,
         inner_tx: FeeBumpTransactionInnerTx::Tx(signed_inner_v1.clone()),
-        ext: stellar_xdr::curr::FeeBumpTransactionExt::V0,
+        ext: stellar_xdr::FeeBumpTransactionExt::V0,
     };
 
     let fee_bump_env = TransactionEnvelope::TxFeeBump(FeeBumpTransactionEnvelope {
@@ -4200,7 +4200,7 @@ fn test_audit_005_fee_bump_pre_auth_signer_removed_from_fee_source() {
         fee_source: MuxedAccount::Ed25519(Uint256(*fee_secret.public_key().as_bytes())),
         fee: 200,
         inner_tx: FeeBumpTransactionInnerTx::Tx(signed_inner_v1),
-        ext: stellar_xdr::curr::FeeBumpTransactionExt::V0,
+        ext: stellar_xdr::FeeBumpTransactionExt::V0,
     };
 
     let mut envelope = TransactionEnvelope::TxFeeBump(FeeBumpTransactionEnvelope {
@@ -4256,7 +4256,7 @@ fn test_audit_005_fee_bump_inner_hash_for_signer_removal() {
     // Build the inner TX to compute the inner TX contents hash.
     let payment_op = Operation {
         source_account: None,
-        body: OperationBody::Payment(stellar_xdr::curr::PaymentOp {
+        body: OperationBody::Payment(stellar_xdr::PaymentOp {
             destination: MuxedAccount::Ed25519(Uint256(*fee_secret.public_key().as_bytes())),
             asset: Asset::Native,
             amount: 1,
@@ -4332,7 +4332,7 @@ fn test_audit_005_fee_bump_inner_hash_for_signer_removal() {
         fee_source: MuxedAccount::Ed25519(Uint256(*fee_secret.public_key().as_bytes())),
         fee: 200,
         inner_tx: FeeBumpTransactionInnerTx::Tx(inner_v1),
-        ext: stellar_xdr::curr::FeeBumpTransactionExt::V0,
+        ext: stellar_xdr::FeeBumpTransactionExt::V0,
     };
 
     let mut envelope = TransactionEnvelope::TxFeeBump(FeeBumpTransactionEnvelope {
@@ -4432,7 +4432,7 @@ fn test_audit_007_sequential_soroban_fee_charged_subtracts_refund() {
     let operation = Operation {
         source_account: None,
         body: OperationBody::ExtendFootprintTtl(ExtendFootprintTtlOp {
-            ext: stellar_xdr::curr::ExtensionPoint::V0,
+            ext: stellar_xdr::ExtensionPoint::V0,
             extend_to: 100,
         }),
     };
@@ -4625,10 +4625,10 @@ async fn test_audit_095_pre_parallel_apply_globalizes_seq_bumps() {
     // sequences on the shared executor and transfers to the main delta
     // BEFORE clusters start, so peer clusters see bumped sequences.
     let current = delta.current_entries();
-    let _acct1_key = LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
+    let _acct1_key = LedgerKey::Account(stellar_xdr::LedgerKeyAccount {
         account_id: acct1_id.clone(),
     });
-    let _acct2_key = LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
+    let _acct2_key = LedgerKey::Account(stellar_xdr::LedgerKeyAccount {
         account_id: acct2_id.clone(),
     });
 
@@ -4741,7 +4741,7 @@ fn test_post_seq_failure_removes_preauth_signer() {
     // Create account with seq_num=1, with both ed25519 key weight and PreAuthTx signer.
     // The account has seq_time/seq_ledger set for min_seq_ledger_gap checking.
     let (key, entry) = {
-        let key = LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
+        let key = LedgerKey::Account(stellar_xdr::LedgerKeyAccount {
             account_id: account_id.clone(),
         });
         let entry = LedgerEntry {
@@ -4928,7 +4928,7 @@ fn test_post_seq_failure_removes_fee_bump_outer_signer() {
             TransactionEnvelope::Tx(ref env) => env.clone(),
             _ => panic!("expected Tx"),
         }),
-        ext: stellar_xdr::curr::FeeBumpTransactionExt::V0,
+        ext: stellar_xdr::FeeBumpTransactionExt::V0,
     };
 
     let mut fee_bump_envelope = TransactionEnvelope::TxFeeBump(FeeBumpTransactionEnvelope {
@@ -4957,7 +4957,7 @@ fn test_post_seq_failure_removes_fee_bump_outer_signer() {
         weight: 1,
     };
     let (fee_key, fee_entry) = {
-        let key = LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
+        let key = LedgerKey::Account(stellar_xdr::LedgerKeyAccount {
             account_id: fee_account_id.clone(),
         });
         let entry = LedgerEntry {
@@ -4985,7 +4985,7 @@ fn test_post_seq_failure_removes_fee_bump_outer_signer() {
         weight: 1,
     };
     let (inner_key, inner_entry) = {
-        let key = LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
+        let key = LedgerKey::Account(stellar_xdr::LedgerKeyAccount {
             account_id: inner_account_id.clone(),
         });
         let entry = LedgerEntry {
@@ -5094,7 +5094,7 @@ fn test_fee_strategy_externally_precharged_too_short() {
 
     let payment_op = Operation {
         source_account: None,
-        body: OperationBody::Payment(stellar_xdr::curr::PaymentOp {
+        body: OperationBody::Payment(stellar_xdr::PaymentOp {
             destination: MuxedAccount::Ed25519(Uint256(*secret.public_key().as_bytes())),
             asset: Asset::Native,
             amount: 1,
@@ -5175,7 +5175,7 @@ fn test_fee_strategy_externally_precharged_too_long() {
 
     let payment_op = Operation {
         source_account: None,
-        body: OperationBody::Payment(stellar_xdr::curr::PaymentOp {
+        body: OperationBody::Payment(stellar_xdr::PaymentOp {
             destination: MuxedAccount::Ed25519(Uint256(*secret.public_key().as_bytes())),
             asset: Asset::Native,
             amount: 1,
@@ -5213,11 +5213,11 @@ fn test_fee_strategy_externally_precharged_too_long() {
     let pre_charged = vec![
         PreChargedFee {
             charged_fee: 100,
-            fee_changes: stellar_xdr::curr::LedgerEntryChanges(vec![].try_into().unwrap()),
+            fee_changes: stellar_xdr::LedgerEntryChanges(vec![].try_into().unwrap()),
         },
         PreChargedFee {
             charged_fee: 100,
-            fee_changes: stellar_xdr::curr::LedgerEntryChanges(vec![].try_into().unwrap()),
+            fee_changes: stellar_xdr::LedgerEntryChanges(vec![].try_into().unwrap()),
         },
     ];
 
@@ -5283,7 +5283,7 @@ async fn test_soroban_fee_source_externally_precharged_too_short() {
     // Only 1 fee for 2 transactions — should trigger length mismatch.
     let fee_source = SorobanFeeSource::ExternallyPrecharged(vec![PreChargedFee {
         charged_fee: 100,
-        fee_changes: stellar_xdr::curr::LedgerEntryChanges(vec![].try_into().unwrap()),
+        fee_changes: stellar_xdr::LedgerEntryChanges(vec![].try_into().unwrap()),
     }]);
 
     let result = execute_soroban_parallel_phase(
@@ -5352,11 +5352,11 @@ async fn test_soroban_fee_source_externally_precharged_too_long() {
     let fee_source = SorobanFeeSource::ExternallyPrecharged(vec![
         PreChargedFee {
             charged_fee: 100,
-            fee_changes: stellar_xdr::curr::LedgerEntryChanges(vec![].try_into().unwrap()),
+            fee_changes: stellar_xdr::LedgerEntryChanges(vec![].try_into().unwrap()),
         },
         PreChargedFee {
             charged_fee: 100,
-            fee_changes: stellar_xdr::curr::LedgerEntryChanges(vec![].try_into().unwrap()),
+            fee_changes: stellar_xdr::LedgerEntryChanges(vec![].try_into().unwrap()),
         },
     ]);
 
@@ -5414,7 +5414,7 @@ fn test_fee_strategy_no_fees_skips_fee_processing() {
     // Simple self-payment so TX passes validation.
     let payment_op = Operation {
         source_account: None,
-        body: OperationBody::Payment(stellar_xdr::curr::PaymentOp {
+        body: OperationBody::Payment(stellar_xdr::PaymentOp {
             destination: MuxedAccount::Ed25519(Uint256(*secret.public_key().as_bytes())),
             asset: Asset::Native,
             amount: 1,
@@ -5598,7 +5598,7 @@ fn test_audit_245_fee_bump_outer_signer_removed_in_same_ledger_succeeds() {
     // inner tx from Y (payment to dest).
     let payment_op = Operation {
         source_account: None,
-        body: OperationBody::Payment(stellar_xdr::curr::PaymentOp {
+        body: OperationBody::Payment(stellar_xdr::PaymentOp {
             destination: MuxedAccount::Ed25519(Uint256([83u8; 32])),
             asset: Asset::Native,
             amount: 1_000_000,
@@ -5631,7 +5631,7 @@ fn test_audit_245_fee_bump_outer_signer_removed_in_same_ledger_succeeds() {
         fee_source: MuxedAccount::Ed25519(Uint256(*fee_secret.public_key().as_bytes())),
         fee: 200,
         inner_tx: FeeBumpTransactionInnerTx::Tx(inner_v1),
-        ext: stellar_xdr::curr::FeeBumpTransactionExt::V0,
+        ext: stellar_xdr::FeeBumpTransactionExt::V0,
     };
 
     // Sign the fee-bump outer with signer B (removed by TX1, but valid at tx-set time)
@@ -5763,7 +5763,7 @@ fn test_failed_soroban_tx_no_soroban_meta() {
     );
 
     // Fee refund events should still be present (fee accounting is independent).
-    let tx_events: &[stellar_xdr::curr::TransactionEvent] = v4.events.as_ref();
+    let tx_events: &[stellar_xdr::TransactionEvent] = v4.events.as_ref();
     assert!(
         !tx_events.is_empty(),
         "fee refund events must still be emitted for failed Soroban txs"
@@ -5787,7 +5787,7 @@ fn test_preauth_signer_and_seq_bump_produce_single_meta_entry() {
 
     let operation = Operation {
         source_account: None,
-        body: OperationBody::Payment(stellar_xdr::curr::PaymentOp {
+        body: OperationBody::Payment(stellar_xdr::PaymentOp {
             destination: MuxedAccount::Ed25519(Uint256([4u8; 32])),
             asset: Asset::Native,
             amount: 1_000_000,
@@ -5824,7 +5824,7 @@ fn test_preauth_signer_and_seq_bump_produce_single_meta_entry() {
 
     // Source account: seq_num=1, ed25519 weight + PreAuthTx signer.
     let (source_key, source_entry) = {
-        let key = LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
+        let key = LedgerKey::Account(stellar_xdr::LedgerKeyAccount {
             account_id: account_id.clone(),
         });
         let entry = LedgerEntry {
@@ -5865,7 +5865,7 @@ fn test_preauth_signer_and_seq_bump_produce_single_meta_entry() {
 
     // Destination account for the payment operation to succeed.
     let (dest_key, dest_entry) = {
-        let key = LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
+        let key = LedgerKey::Account(stellar_xdr::LedgerKeyAccount {
             account_id: destination_id.clone(),
         });
         let entry = LedgerEntry {

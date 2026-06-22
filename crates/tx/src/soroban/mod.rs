@@ -94,7 +94,7 @@ pub(crate) use storage::StorageKey;
 pub(crate) use ttl::synthesize_ttl_entry;
 pub use ttl::{extend_ttl_target, restore_ttl_target};
 
-use stellar_xdr::curr::{
+use stellar_xdr::{
     AccountId, Hash, HostFunction, LedgerEntry, LedgerKey, SorobanAuthorizationEntry,
     SorobanTransactionData,
 };
@@ -267,7 +267,7 @@ impl<'a> GuardedHotArchive<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use stellar_xdr::curr::{
+    use stellar_xdr::{
         AccountId, ContractDataDurability, ContractDataEntry, ContractId, ExtensionPoint, Hash,
         LedgerEntryData, LedgerEntryExt, LedgerKeyContractData, PublicKey, ScAddress, ScVal,
         Uint256,
@@ -313,7 +313,7 @@ mod tests {
         assert!(archive.get(&contract_key).unwrap().is_none());
 
         // Account key
-        let account_key = LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
+        let account_key = LedgerKey::Account(stellar_xdr::LedgerKeyAccount {
             account_id: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([0u8; 32]))),
         });
         assert!(archive.get(&account_key).unwrap().is_none());
@@ -334,8 +334,7 @@ mod tests {
                 key: &LedgerKey,
             ) -> std::result::Result<Option<LedgerEntry>, Box<dyn std::error::Error + Send + Sync>>
             {
-                let key_bytes =
-                    stellar_xdr::curr::WriteXdr::to_xdr(key, stellar_xdr::curr::Limits::none())?;
+                let key_bytes = stellar_xdr::WriteXdr::to_xdr(key, stellar_xdr::Limits::none())?;
                 Ok(self.entries.get(&key_bytes).cloned())
             }
         }
@@ -343,8 +342,7 @@ mod tests {
         let mut entries = HashMap::new();
         let key = test_contract_data_key();
         let entry = test_contract_data_entry();
-        let key_bytes =
-            stellar_xdr::curr::WriteXdr::to_xdr(&key, stellar_xdr::curr::Limits::none()).unwrap();
+        let key_bytes = stellar_xdr::WriteXdr::to_xdr(&key, stellar_xdr::Limits::none()).unwrap();
         entries.insert(key_bytes, entry.clone());
 
         let archive = TestHotArchive { entries };

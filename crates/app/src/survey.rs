@@ -45,7 +45,7 @@ use henyey_herder::Herder;
 use henyey_ledger::LedgerManager;
 use henyey_overlay::{PeerId, PeerSnapshot};
 use serde::Serialize;
-use stellar_xdr::curr::{
+use stellar_xdr::{
     NodeId, PeerStats, SurveyMessageCommandType, SurveyRequestMessage, SurveyResponseMessage,
     TimeSlicedNodeData, TimeSlicedPeerData, TimeSlicedPeerDataList, TimeSlicedSurveyRequestMessage,
     TimeSlicedSurveyStartCollectingMessage, TimeSlicedSurveyStopCollectingMessage,
@@ -553,7 +553,7 @@ impl SurveyDataManager {
     pub fn stop_collecting_by_identity(
         &mut self,
         nonce: u32,
-        surveyor_id: &stellar_xdr::curr::NodeId,
+        surveyor_id: &stellar_xdr::NodeId,
         inbound_peers: &[PeerSnapshot],
         outbound_peers: &[PeerSnapshot],
         added_peers_total: u64,
@@ -991,7 +991,7 @@ impl SurveyState {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU32, Ordering};
-    use stellar_xdr::curr::{NodeId, PublicKey, Uint256};
+    use stellar_xdr::{NodeId, PublicKey, Uint256};
 
     /// Mock ledger source for tests — returns a controllable ledger number.
     #[derive(Debug)]
@@ -1112,7 +1112,7 @@ mod tests {
             surveyor_peer_id: test_node_id(),
             surveyed_peer_id: NodeId(PublicKey::PublicKeyTypeEd25519(Uint256([2u8; 32]))),
             ledger_num: 100,
-            encryption_key: stellar_xdr::curr::Curve25519Public { key: [0u8; 32] },
+            encryption_key: stellar_xdr::Curve25519Public { key: [0u8; 32] },
             command_type: SurveyMessageCommandType::TimeSlicedSurveyTopology,
         }
     }
@@ -1227,7 +1227,7 @@ mod tests {
             surveyed_peer_id: NodeId(PublicKey::PublicKeyTypeEd25519(Uint256([2u8; 32]))),
             ledger_num: 100,
             command_type: SurveyMessageCommandType::TimeSlicedSurveyTopology,
-            encrypted_body: stellar_xdr::curr::EncryptedBody(vec![].try_into().unwrap()),
+            encrypted_body: stellar_xdr::EncryptedBody(vec![].try_into().unwrap()),
         };
         let is_valid = state.record_and_validate_response(&response, 42, || true);
         assert!(is_valid);
@@ -1288,7 +1288,7 @@ mod tests {
             surveyor_peer_id: test_node_id(),
             surveyed_peer_id: NodeId(PublicKey::PublicKeyTypeEd25519(Uint256([2u8; 32]))),
             ledger_num: 94,
-            encryption_key: stellar_xdr::curr::Curve25519Public { key: [0u8; 32] },
+            encryption_key: stellar_xdr::Curve25519Public { key: [0u8; 32] },
             command_type: SurveyMessageCommandType::TimeSlicedSurveyTopology,
         };
         assert!(limiter.add_and_validate_request(&request_at_94, &local_node, || true));
@@ -1328,7 +1328,7 @@ mod tests {
             surveyor_peer_id: test_node_id(),
             surveyed_peer_id: NodeId(PublicKey::PublicKeyTypeEd25519(Uint256([id; 32]))),
             ledger_num,
-            encryption_key: stellar_xdr::curr::Curve25519Public { key: [0u8; 32] },
+            encryption_key: stellar_xdr::Curve25519Public { key: [0u8; 32] },
             command_type: SurveyMessageCommandType::TimeSlicedSurveyTopology,
         };
 
@@ -1353,7 +1353,7 @@ mod tests {
             surveyor_peer_id: test_node_id(),
             surveyed_peer_id: NodeId(PublicKey::PublicKeyTypeEd25519(Uint256([id; 32]))),
             ledger_num,
-            encryption_key: stellar_xdr::curr::Curve25519Public { key: [0u8; 32] },
+            encryption_key: stellar_xdr::Curve25519Public { key: [0u8; 32] },
             command_type: SurveyMessageCommandType::TimeSlicedSurveyTopology,
         };
 
@@ -1377,7 +1377,7 @@ mod tests {
             surveyor_peer_id: test_node_id(),
             surveyed_peer_id: NodeId(PublicKey::PublicKeyTypeEd25519(Uint256([2u8; 32]))),
             ledger_num: 94,
-            encryption_key: stellar_xdr::curr::Curve25519Public { key: [0u8; 32] },
+            encryption_key: stellar_xdr::Curve25519Public { key: [0u8; 32] },
             command_type: SurveyMessageCommandType::TimeSlicedSurveyTopology,
         };
         assert!(limiter.add_and_validate_request(&request_94, &local_node, || true));
@@ -1409,7 +1409,7 @@ mod tests {
             surveyor_peer_id: test_node_id(),
             surveyed_peer_id: NodeId(PublicKey::PublicKeyTypeEd25519(Uint256([2u8; 32]))),
             ledger_num: 100,
-            encryption_key: stellar_xdr::curr::Curve25519Public { key: [0u8; 32] },
+            encryption_key: stellar_xdr::Curve25519Public { key: [0u8; 32] },
             command_type: SurveyMessageCommandType::TimeSlicedSurveyTopology,
         };
 
@@ -1429,7 +1429,7 @@ mod tests {
             surveyor_peer_id: test_node_id(),
             surveyed_peer_id: NodeId(PublicKey::PublicKeyTypeEd25519(Uint256([id; 32]))),
             ledger_num: 100,
-            encryption_key: stellar_xdr::curr::Curve25519Public { key: [0u8; 32] },
+            encryption_key: stellar_xdr::Curve25519Public { key: [0u8; 32] },
             command_type: SurveyMessageCommandType::TimeSlicedSurveyTopology,
         };
 
@@ -1450,7 +1450,7 @@ mod tests {
             surveyor_peer_id: test_node_id(),
             surveyed_peer_id: NodeId(PublicKey::PublicKeyTypeEd25519(Uint256([id; 32]))),
             ledger_num: 100,
-            encryption_key: stellar_xdr::curr::Curve25519Public { key: [0u8; 32] },
+            encryption_key: stellar_xdr::Curve25519Public { key: [0u8; 32] },
             command_type: SurveyMessageCommandType::TimeSlicedSurveyTopology,
         };
 
@@ -1469,7 +1469,7 @@ mod tests {
             surveyed_peer_id: NodeId(PublicKey::PublicKeyTypeEd25519(Uint256([2u8; 32]))),
             ledger_num: 100,
             command_type: SurveyMessageCommandType::TimeSlicedSurveyTopology,
-            encrypted_body: stellar_xdr::curr::EncryptedBody(vec![].try_into().unwrap()),
+            encrypted_body: stellar_xdr::EncryptedBody(vec![].try_into().unwrap()),
         };
 
         // No request was registered, so response is rejected.

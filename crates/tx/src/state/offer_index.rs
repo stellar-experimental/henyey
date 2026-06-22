@@ -296,7 +296,7 @@ impl OfferIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use stellar_xdr::curr::{
+    use stellar_xdr::{
         AccountId, AlphaNum4, Asset, AssetCode4, OfferEntry, OfferEntryExt, Price, PublicKey,
         Uint256,
     };

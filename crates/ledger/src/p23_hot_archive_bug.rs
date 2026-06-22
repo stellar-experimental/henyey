@@ -42,7 +42,7 @@
 //!    (events are op-meta-only, hashed after the success preimage) and is
 //!    off by default.
 
-use stellar_xdr::curr::{LedgerEntry, LedgerKey, Limits, ReadXdr};
+use stellar_xdr::{LedgerEntry, LedgerKey, Limits, ReadXdr};
 
 use henyey_common::entry_to_key;
 
@@ -223,7 +223,7 @@ mod tests {
     /// `P23_CORRUPTED_AFFECTED_ASSETS_COUNT = 12`).
     #[test]
     fn affected_assets_array_is_12_and_decodes() {
-        use stellar_xdr::curr::{Asset, ReadXdr};
+        use stellar_xdr::{Asset, ReadXdr};
         assert_eq!(P23_CORRUPTED_AFFECTED_ASSETS_COUNT, 12);
         assert_eq!(P23_CORRUPTED_AFFECTED_ASSETS.len(), 12);
         for (i, s) in P23_CORRUPTED_AFFECTED_ASSETS.iter().enumerate() {

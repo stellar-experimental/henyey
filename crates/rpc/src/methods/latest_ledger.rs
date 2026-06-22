@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use serde_json::json;
-use stellar_xdr::curr::{Limits, WriteXdr};
+use stellar_xdr::{Limits, WriteXdr};
 
 use crate::context::RpcContext;
 use crate::error::JsonRpcError;

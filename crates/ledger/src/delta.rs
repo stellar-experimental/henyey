@@ -36,7 +36,7 @@
 
 use crate::{LedgerError, Result};
 use std::collections::HashMap;
-use stellar_xdr::curr::{
+use stellar_xdr::{
     AccountId, LedgerEntry, LedgerEntryChange, LedgerEntryChanges, LedgerEntryData, LedgerKey,
     LedgerKeyAccount, VecM,
 };
@@ -369,10 +369,7 @@ impl LedgerDelta {
     /// Parity: LedgerTxnTests.cpp:853 "fails for configuration"
     pub fn record_delete(&mut self, entry: LedgerEntry) -> Result<()> {
         // ConfigSetting entries cannot be erased (parity: stellar-core LedgerTxn::erase)
-        if matches!(
-            entry.data,
-            stellar_xdr::curr::LedgerEntryData::ConfigSetting(_)
-        ) {
+        if matches!(entry.data, stellar_xdr::LedgerEntryData::ConfigSetting(_)) {
             return Err(LedgerError::InvalidEntry(
                 "cannot delete ConfigSetting entries".to_string(),
             ));
@@ -932,12 +929,12 @@ fn categorize_changes(
             EntryChange::Updated { current, .. } => current,
         };
         let is_offer_or_pool = match &entry_ref.data {
-            stellar_xdr::curr::LedgerEntryData::Offer(_) => {
+            stellar_xdr::LedgerEntryData::Offer(_) => {
                 has_offers = true;
                 true
             }
-            stellar_xdr::curr::LedgerEntryData::Trustline(tl)
-                if matches!(tl.asset, stellar_xdr::curr::TrustLineAsset::PoolShare(_)) =>
+            stellar_xdr::LedgerEntryData::Trustline(tl)
+                if matches!(tl.asset, stellar_xdr::TrustLineAsset::PoolShare(_)) =>
             {
                 has_pool_share_trustlines = true;
                 true
@@ -1041,7 +1038,7 @@ fn emit_new_entry(changes: &mut Vec<LedgerEntryChange>, change: &EntryChange) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use stellar_xdr::curr::{
+    use stellar_xdr::{
         AccountEntry, AccountEntryExt, AccountId, LedgerEntryChange, LedgerEntryData,
         LedgerEntryExt, PublicKey, SequenceNumber, Thresholds, Uint256,
     };
@@ -1059,9 +1056,9 @@ mod tests {
                 num_sub_entries: 0,
                 inflation_dest: None,
                 flags: 0,
-                home_domain: stellar_xdr::curr::String32::default(),
+                home_domain: stellar_xdr::String32::default(),
                 thresholds: Thresholds([1, 0, 0, 0]),
-                signers: stellar_xdr::curr::VecM::default(),
+                signers: stellar_xdr::VecM::default(),
                 ext: AccountEntryExt::V0,
             }),
             ext: LedgerEntryExt::V0,
@@ -1666,7 +1663,7 @@ mod tests {
     // =========================================================================
 
     fn create_config_setting_entry() -> LedgerEntry {
-        use stellar_xdr::curr::ConfigSettingEntry;
+        use stellar_xdr::ConfigSettingEntry;
 
         LedgerEntry {
             last_modified_ledger_seq: 1,
@@ -1708,7 +1705,7 @@ mod tests {
         // Update is allowed
         let mut updated = config.clone();
         if let LedgerEntryData::ConfigSetting(ref mut setting) = updated.data {
-            *setting = stellar_xdr::curr::ConfigSettingEntry::ContractMaxSizeBytes(32768);
+            *setting = stellar_xdr::ConfigSettingEntry::ContractMaxSizeBytes(32768);
         }
         delta.record_update(config, updated).unwrap();
         assert_eq!(delta.num_changes(), 1);
@@ -1941,7 +1938,7 @@ mod tests {
     /// Regression test for AUDIT-H18.
     #[test]
     fn test_apply_refund_buying_liabilities() {
-        use stellar_xdr::curr::{AccountEntryExtensionV1, AccountEntryExtensionV1Ext, Liabilities};
+        use stellar_xdr::{AccountEntryExtensionV1, AccountEntryExtensionV1Ext, Liabilities};
 
         let mut delta = LedgerDelta::new(1);
 
@@ -1958,9 +1955,9 @@ mod tests {
                 num_sub_entries: 0,
                 inflation_dest: None,
                 flags: 0,
-                home_domain: stellar_xdr::curr::String32::default(),
+                home_domain: stellar_xdr::String32::default(),
                 thresholds: Thresholds([1, 0, 0, 0]),
-                signers: stellar_xdr::curr::VecM::default(),
+                signers: stellar_xdr::VecM::default(),
                 ext: AccountEntryExt::V1(AccountEntryExtensionV1 {
                     liabilities: Liabilities {
                         buying: 500,
@@ -2204,8 +2201,8 @@ mod tests {
         key_hash[0] = seed;
         LedgerEntry {
             last_modified_ledger_seq: 1,
-            data: LedgerEntryData::Ttl(stellar_xdr::curr::TtlEntry {
-                key_hash: stellar_xdr::curr::Hash(key_hash),
+            data: LedgerEntryData::Ttl(stellar_xdr::TtlEntry {
+                key_hash: stellar_xdr::Hash(key_hash),
                 live_until_ledger_seq: live_until,
             }),
             ext: LedgerEntryExt::V0,
@@ -2548,8 +2545,8 @@ mod tests {
     fn test_merge_ttl_key_with_non_ttl_data_errors() {
         // TTL key but Account data is an invariant violation — must error.
         let ttl_key_hash = [42u8; 32];
-        let ttl_key = LedgerKey::Ttl(stellar_xdr::curr::LedgerKeyTtl {
-            key_hash: stellar_xdr::curr::Hash(ttl_key_hash),
+        let ttl_key = LedgerKey::Ttl(stellar_xdr::LedgerKeyTtl {
+            key_hash: stellar_xdr::Hash(ttl_key_hash),
         });
 
         // Build a bogus entry: TTL key but Account data

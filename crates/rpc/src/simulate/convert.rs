@@ -52,7 +52,7 @@ impl std::error::Error for ConversionError {}
 /// Convert a workspace (v26) type to a P25 (v25) type via XDR bytes.
 pub(super) fn ws_to_p25<WS, P25>(ws_val: &WS) -> Result<P25, ConversionError>
 where
-    WS: stellar_xdr::curr::WriteXdr,
+    WS: stellar_xdr::WriteXdr,
     P25: soroban_host::xdr::ReadXdr,
 {
     let err = |phase, cause: String| ConversionError {
@@ -63,7 +63,7 @@ where
         cause,
     };
     let bytes = ws_val
-        .to_xdr(stellar_xdr::curr::Limits::none())
+        .to_xdr(stellar_xdr::Limits::none())
         .map_err(|e| err(ConversionPhase::Serialize, e.to_string()))?;
     P25::from_xdr(&bytes, soroban_host::xdr::Limits::none())
         .map_err(|e| err(ConversionPhase::Deserialize, e.to_string()))
@@ -73,7 +73,7 @@ where
 pub(super) fn p25_to_ws<P25, WS>(p25_val: &P25) -> Result<WS, ConversionError>
 where
     P25: soroban_host::xdr::WriteXdr,
-    WS: stellar_xdr::curr::ReadXdr,
+    WS: stellar_xdr::ReadXdr,
 {
     let err = |phase, cause: String| ConversionError {
         direction: ConversionDirection::P25ToWs,
@@ -85,7 +85,7 @@ where
     let bytes = p25_val
         .to_xdr(soroban_host::xdr::Limits::none())
         .map_err(|e| err(ConversionPhase::Serialize, e.to_string()))?;
-    WS::from_xdr(&bytes, stellar_xdr::curr::Limits::none())
+    WS::from_xdr(&bytes, stellar_xdr::Limits::none())
         .map_err(|e| err(ConversionPhase::Deserialize, e.to_string()))
 }
 
@@ -127,7 +127,7 @@ mod tests {
     #[test]
     fn test_ws_to_p25_success() {
         // Round-trip a simple XDR type that exists in both versions.
-        let ws_val = stellar_xdr::curr::Uint256([42u8; 32]);
+        let ws_val = stellar_xdr::Uint256([42u8; 32]);
         let result: Result<soroban_host::xdr::Uint256, _> = ws_to_p25(&ws_val);
         assert_eq!(result.unwrap().0, [42u8; 32]);
     }
@@ -135,7 +135,7 @@ mod tests {
     #[test]
     fn test_p25_to_ws_success() {
         let p25_val = soroban_host::xdr::Uint256([99u8; 32]);
-        let result: Result<stellar_xdr::curr::Uint256, _> = p25_to_ws(&p25_val);
+        let result: Result<stellar_xdr::Uint256, _> = p25_to_ws(&p25_val);
         assert_eq!(result.unwrap().0, [99u8; 32]);
     }
 
@@ -147,7 +147,7 @@ mod tests {
         // deserialize as Uint256 (32 bytes).
         let p25_val = soroban_host::xdr::Uint256([0u8; 32]);
         // Serialize Uint256 (32 bytes) and try to read as a LedgerHeader — will fail.
-        let result: Result<stellar_xdr::curr::LedgerHeader, _> = p25_to_ws(&p25_val);
+        let result: Result<stellar_xdr::LedgerHeader, _> = p25_to_ws(&p25_val);
         let err = result.unwrap_err();
         assert!(matches!(err.phase, ConversionPhase::Deserialize));
         assert!(matches!(err.direction, ConversionDirection::P25ToWs));

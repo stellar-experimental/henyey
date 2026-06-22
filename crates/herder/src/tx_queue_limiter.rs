@@ -504,7 +504,7 @@ mod tests {
     use super::*;
     use henyey_common::Hash256;
     use std::sync::Arc;
-    use stellar_xdr::curr::{
+    use stellar_xdr::{
         DecoratedSignature, Memo, MuxedAccount, Operation, OperationBody, Preconditions,
         SequenceNumber, Signature, SignatureHint, Transaction, TransactionEnvelope,
         TransactionV1Envelope, Uint256,
@@ -526,7 +526,7 @@ mod tests {
             cond: Preconditions::None,
             memo: Memo::None,
             operations: operations.try_into().unwrap(),
-            ext: stellar_xdr::curr::TransactionExt::V0,
+            ext: stellar_xdr::TransactionExt::V0,
         };
 
         let envelope = TransactionEnvelope::Tx(TransactionV1Envelope {

@@ -65,7 +65,7 @@ pub enum CryptoError {
 
     /// XDR serialization or deserialization failed.
     #[error("XDR error: {0}")]
-    Xdr(#[from] stellar_xdr::curr::Error),
+    Xdr(#[from] stellar_xdr::Error),
 
     /// Attempted to reseed the short hash with a different value after hashing.
     ///

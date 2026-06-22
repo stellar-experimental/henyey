@@ -35,7 +35,7 @@
 use crate::delta::{ChangeCheckpoint, DeltaCategorization, LedgerDelta};
 use crate::snapshot::SnapshotHandle;
 use crate::Result;
-use stellar_xdr::curr::{
+use stellar_xdr::{
     AccountEntry, AccountId, LedgerEntry, LedgerEntryChanges, LedgerEntryData, LedgerHeader,
     LedgerKey,
 };
@@ -100,7 +100,7 @@ impl CloseLedgerState {
 
     /// Load an account by ID.
     pub fn get_account(&self, account_id: &AccountId) -> Result<Option<AccountEntry>> {
-        let key = LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
+        let key = LedgerKey::Account(stellar_xdr::LedgerKeyAccount {
             account_id: account_id.clone(),
         });
         match self.get_entry(&key)? {
@@ -345,7 +345,7 @@ fn is_offer_key(key: &LedgerKey) -> bool {
 mod tests {
     use super::*;
     use crate::snapshot::{LedgerSnapshot, SnapshotHandle};
-    use stellar_xdr::curr::{
+    use stellar_xdr::{
         AccountEntry, AccountId, LedgerEntry, LedgerEntryChange, LedgerEntryData, LedgerEntryExt,
         LedgerHeader, LedgerKey, LedgerKeyAccount, PublicKey, Thresholds, Uint256,
     };
@@ -363,14 +363,14 @@ mod tests {
             data: LedgerEntryData::Account(AccountEntry {
                 account_id,
                 balance,
-                seq_num: stellar_xdr::curr::SequenceNumber(0),
+                seq_num: stellar_xdr::SequenceNumber(0),
                 num_sub_entries: 0,
                 inflation_dest: None,
                 flags: 0,
-                home_domain: stellar_xdr::curr::String32::default(),
+                home_domain: stellar_xdr::String32::default(),
                 thresholds: Thresholds([1, 0, 0, 0]),
-                signers: stellar_xdr::curr::VecM::default(),
-                ext: stellar_xdr::curr::AccountEntryExt::V0,
+                signers: stellar_xdr::VecM::default(),
+                ext: stellar_xdr::AccountEntryExt::V0,
             }),
             ext: LedgerEntryExt::V0,
         }

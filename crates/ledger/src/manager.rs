@@ -57,7 +57,7 @@ use parking_lot::{Mutex, RwLock};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
-use stellar_xdr::curr::{
+use stellar_xdr::{
     AccountId, BucketListType, ConfigSettingEntry, ConfigSettingId, ExtensionPoint,
     GeneralizedTransactionSet, Hash, LedgerCloseMeta, LedgerCloseMetaExt, LedgerCloseMetaExtV1,
     LedgerCloseMetaV2, LedgerEntry, LedgerEntryData, LedgerEntryExt, LedgerHeader,
@@ -134,7 +134,7 @@ pub fn prepend_fee_event(
     }
 
     if let TransactionMeta::V4(ref mut v4) = meta {
-        let existing_events: Vec<stellar_xdr::curr::TransactionEvent> =
+        let existing_events: Vec<stellar_xdr::TransactionEvent> =
             v4.events.iter().cloned().collect();
         let mut combined = Vec::with_capacity(fee_events.len() + existing_events.len());
         combined.extend(fee_events);
@@ -205,12 +205,12 @@ pub struct CacheInitResult {
 /// which uses per-type `deletedKeys` rather than one all-types set.
 #[derive(Default)]
 struct PerTypeSeen {
-    offers: HashSet<stellar_xdr::curr::LedgerKeyOffer>,
-    trustlines: HashSet<stellar_xdr::curr::LedgerKeyTrustLine>,
-    contract_data: HashSet<stellar_xdr::curr::LedgerKeyContractData>,
-    contract_code: HashSet<stellar_xdr::curr::LedgerKeyContractCode>,
+    offers: HashSet<stellar_xdr::LedgerKeyOffer>,
+    trustlines: HashSet<stellar_xdr::LedgerKeyTrustLine>,
+    contract_data: HashSet<stellar_xdr::LedgerKeyContractData>,
+    contract_code: HashSet<stellar_xdr::LedgerKeyContractCode>,
     config_settings: HashSet<LedgerKeyConfigSetting>,
-    ttl: HashSet<stellar_xdr::curr::LedgerKeyTtl>,
+    ttl: HashSet<stellar_xdr::LedgerKeyTtl>,
     /// Catch-all for any other `LedgerKey` variant, keeping the abstraction total
     /// and provably equivalent to the prior all-types `HashSet<LedgerKey>`.
     other: HashSet<LedgerKey>,
@@ -273,13 +273,7 @@ struct LevelScanResult {
     /// Live entries of interest, deduped within this level (curr shadows snap).
     entries: HashMap<LedgerKey, LedgerEntry>,
     /// TTL entries keyed by TTL key hash (separate because TTLs need special handling).
-    ttl_entries: HashMap<
-        Hash,
-        (
-            stellar_xdr::curr::LedgerKeyTtl,
-            crate::soroban_state::TtlData,
-        ),
-    >,
+    ttl_entries: HashMap<Hash, (stellar_xdr::LedgerKeyTtl, crate::soroban_state::TtlData)>,
     /// Keys that were DEAD at this level — used for cross-level shadowing.
     /// A dead entry at a lower level must prevent live entries at higher levels
     /// from being included in the final result.
@@ -295,13 +289,7 @@ struct LevelScanResult {
 /// (pre-collected entries) and the fallback path (full bucket iteration).
 struct LevelScanner {
     entries: HashMap<LedgerKey, LedgerEntry>,
-    ttl_entries: HashMap<
-        Hash,
-        (
-            stellar_xdr::curr::LedgerKeyTtl,
-            crate::soroban_state::TtlData,
-        ),
-    >,
+    ttl_entries: HashMap<Hash, (stellar_xdr::LedgerKeyTtl, crate::soroban_state::TtlData)>,
     seen_keys: HashSet<LedgerKey>,
     dead_keys: HashSet<LedgerKey>,
     dead_ttl_keys: HashSet<Hash>,
@@ -358,7 +346,7 @@ impl LevelScanner {
 
             // TTL entries go into a separate map keyed by hash
             if let LedgerEntryData::Ttl(ref ttl) = le.data {
-                let ttl_key = stellar_xdr::curr::LedgerKeyTtl {
+                let ttl_key = stellar_xdr::LedgerKeyTtl {
                     key_hash: ttl.key_hash.clone(),
                 };
                 let ttl_data = crate::soroban_state::TtlData::new(
@@ -408,7 +396,7 @@ fn scan_single_level(
                     | LedgerKey::Ttl(_)
                     | LedgerKey::ConfigSetting(_)
             ) || matches!(&key, LedgerKey::Trustline(tl_key)
-                if matches!(tl_key.asset, stellar_xdr::curr::TrustLineAsset::PoolShare(_)));
+                if matches!(tl_key.asset, stellar_xdr::TrustLineAsset::PoolShare(_)));
             if !is_scan_relevant {
                 continue;
             }
@@ -466,7 +454,7 @@ fn merge_level_results(
                     offer_count += 1;
                 }
                 LedgerEntryData::Trustline(ref tl) => {
-                    if let stellar_xdr::curr::TrustLineAsset::PoolShare(ref pool_id) = tl.asset {
+                    if let stellar_xdr::TrustLineAsset::PoolShare(ref pool_id) = tl.asset {
                         pool_share_tl_account_index
                             .entry(tl.account_id.clone())
                             .or_default()
@@ -598,7 +586,7 @@ fn scan_and_merge_streaming(
                         | LedgerKey::Ttl(_)
                         | LedgerKey::ConfigSetting(_)
                 ) || matches!(&key, LedgerKey::Trustline(tl_key)
-                    if matches!(tl_key.asset, stellar_xdr::curr::TrustLineAsset::PoolShare(_)));
+                    if matches!(tl_key.asset, stellar_xdr::TrustLineAsset::PoolShare(_)));
                 if !is_scan_relevant {
                     continue;
                 }
@@ -628,7 +616,7 @@ fn scan_and_merge_streaming(
                     if let LedgerEntryData::Ttl(ref ttl) = le.data {
                         let key_hash = ttl.key_hash.clone();
                         if global_ttl_seen.insert(key_hash.clone()) {
-                            let ttl_key = stellar_xdr::curr::LedgerKeyTtl {
+                            let ttl_key = stellar_xdr::LedgerKeyTtl {
                                 key_hash: key_hash.clone(),
                             };
                             let ttl_data = crate::soroban_state::TtlData::new(
@@ -655,7 +643,7 @@ fn scan_and_merge_streaming(
                                 level_entry_count += 1;
                             }
                             LedgerEntryData::Trustline(ref tl) => {
-                                if let stellar_xdr::curr::TrustLineAsset::PoolShare(ref pool_id) =
+                                if let stellar_xdr::TrustLineAsset::PoolShare(ref pool_id) =
                                     tl.asset
                                 {
                                     pool_share_tl_account_index
@@ -897,9 +885,7 @@ fn scan_and_merge(
                             offer_count += 1;
                         }
                         LedgerEntryData::Trustline(ref tl) => {
-                            if let stellar_xdr::curr::TrustLineAsset::PoolShare(ref pool_id) =
-                                tl.asset
-                            {
+                            if let stellar_xdr::TrustLineAsset::PoolShare(ref pool_id) = tl.asset {
                                 pool_share_tl_account_index
                                     .entry(tl.account_id.clone())
                                     .or_default()
@@ -1135,7 +1121,7 @@ pub(crate) fn handle_upgrade_affecting_soroban_state_size(
     ledger_seq: u32,
     soroban_state: &crate::soroban_state::SharedSorobanState,
 ) -> Result<()> {
-    use stellar_xdr::curr::{
+    use stellar_xdr::{
         ConfigSettingEntry, ConfigSettingId, LedgerEntry, LedgerEntryData, LedgerEntryExt,
         LedgerKey, LedgerKeyConfigSetting,
     };
@@ -1190,7 +1176,7 @@ pub(crate) fn handle_upgrade_affecting_soroban_state_size(
             for size in &mut window_vec {
                 *size = new_size;
             }
-            let new_window: stellar_xdr::curr::VecM<u64> = window_vec
+            let new_window: stellar_xdr::VecM<u64> = window_vec
                 .try_into()
                 .map_err(|_| LedgerError::Internal("Failed to convert window vec".to_string()))?;
             let new_window_entry = LedgerEntry {
@@ -2266,10 +2252,10 @@ impl LedgerManager {
         if close_data.prev_ledger_hash != state.header_hash {
             // Describe the StellarValueExt for logging with details
             let stellar_value_ext_desc = match &state.header.scp_value.ext {
-                stellar_xdr::curr::StellarValueExt::Basic => "Basic".to_string(),
-                stellar_xdr::curr::StellarValueExt::Signed(sig) => {
+                stellar_xdr::StellarValueExt::Basic => "Basic".to_string(),
+                stellar_xdr::StellarValueExt::Signed(sig) => {
                     let node_id_bytes = match &sig.node_id.0 {
-                        stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(key) => key.0,
+                        stellar_xdr::PublicKey::PublicKeyTypeEd25519(key) => key.0,
                     };
                     format!(
                         "Signed(node_id={}, sig_len={})",
@@ -2280,7 +2266,7 @@ impl LedgerManager {
             };
 
             // Compute recomputed hash to verify
-            use stellar_xdr::curr::{Limits, WriteXdr};
+            use stellar_xdr::{Limits, WriteXdr};
             match state.header.to_xdr(Limits::none()) {
                 Ok(header_xdr) => {
                     let header_xdr_hex = Hash256::from_bytes({
@@ -2646,14 +2632,13 @@ impl LedgerManager {
                         }
                     }
                     LedgerEntryData::Trustline(tl)
-                        if matches!(tl.asset, stellar_xdr::curr::TrustLineAsset::PoolShare(_)) =>
+                        if matches!(tl.asset, stellar_xdr::TrustLineAsset::PoolShare(_)) =>
                     {
                         match change {
                             EntryChange::Created(entry) => {
                                 if let LedgerEntryData::Trustline(ref tl) = entry.data {
-                                    if let stellar_xdr::curr::TrustLineAsset::PoolShare(
-                                        ref pool_id,
-                                    ) = tl.asset
+                                    if let stellar_xdr::TrustLineAsset::PoolShare(ref pool_id) =
+                                        tl.asset
                                     {
                                         self.pool_share_tl_account_index
                                             .write()
@@ -2665,9 +2650,8 @@ impl LedgerManager {
                             }
                             EntryChange::Deleted { previous } => {
                                 if let LedgerEntryData::Trustline(ref tl) = previous.data {
-                                    if let stellar_xdr::curr::TrustLineAsset::PoolShare(
-                                        ref pool_id,
-                                    ) = tl.asset
+                                    if let stellar_xdr::TrustLineAsset::PoolShare(ref pool_id) =
+                                        tl.asset
                                     {
                                         let mut idx = self.pool_share_tl_account_index.write();
                                         if let Some(pools) = idx.get_mut(&tl.account_id) {
@@ -2828,7 +2812,7 @@ impl LedgerManager {
         entry: LedgerEntry,
         live_until_ledger: u32,
     ) -> Result<()> {
-        use stellar_xdr::curr::LedgerEntryData;
+        use stellar_xdr::LedgerEntryData;
 
         // Verify it's a CONTRACT_DATA entry
         let _cd = match &entry.data {
@@ -2844,14 +2828,14 @@ impl LedgerManager {
         let ttl_data = crate::soroban_state::TtlData::new(live_until_ledger, last_modified);
 
         // Build the LedgerKey for TTL
-        let data_key = LedgerKey::ContractData(stellar_xdr::curr::LedgerKeyContractData {
+        let data_key = LedgerKey::ContractData(stellar_xdr::LedgerKeyContractData {
             contract: _cd.contract.clone(),
             key: _cd.key.clone(),
             durability: _cd.durability,
         });
         let key_hash = Hash256::hash_xdr(&data_key);
-        let ttl_key = stellar_xdr::curr::LedgerKeyTtl {
-            key_hash: stellar_xdr::curr::Hash(key_hash.0),
+        let ttl_key = stellar_xdr::LedgerKeyTtl {
+            key_hash: stellar_xdr::Hash(key_hash.0),
         };
 
         let mut state = self.soroban_state.write();
@@ -2931,7 +2915,7 @@ impl LedgerManager {
         };
 
         let mut compiled = 0u32;
-        let mut seen_hashes = std::collections::HashSet::<stellar_xdr::curr::Hash>::new();
+        let mut seen_hashes = std::collections::HashSet::<stellar_xdr::Hash>::new();
 
         // Scan levels from 0 (newest) to 10 (oldest). Within each level,
         // curr shadows snap. Dead entries shadow live entries at higher levels.
@@ -2958,7 +2942,7 @@ impl LedgerManager {
                             henyey_bucket::BucketEntry::Liveentry(le)
                             | henyey_bucket::BucketEntry::Initentry(le) => {
                                 if let LedgerEntryData::ContractCode(ref cc) = le.data {
-                                    let hash = stellar_xdr::curr::Hash(
+                                    let hash = stellar_xdr::Hash(
                                         <sha2::Sha256 as sha2::Digest>::digest(cc.code.as_slice())
                                             .into(),
                                     );
@@ -2999,7 +2983,7 @@ impl LedgerManager {
     /// invariant violations (e.g. missing TTL entry).
     pub fn get_config_upgrade_set(
         &self,
-        key: &stellar_xdr::curr::ConfigUpgradeSetKey,
+        key: &stellar_xdr::ConfigUpgradeSetKey,
     ) -> crate::Result<Option<std::sync::Arc<crate::config_upgrade::ConfigUpgradeSetFrame>>> {
         if !self.is_initialized() {
             return Ok(None);
@@ -3041,8 +3025,8 @@ struct LedgerCloseContext<'a> {
     stats: LedgerCloseStats,
     upgrade_ctx: UpgradeContext,
     id_pool: u64,
-    tx_results: Vec<stellar_xdr::curr::TransactionResultPair>,
-    tx_result_metas: Vec<stellar_xdr::curr::TransactionResultMetaV1>,
+    tx_results: Vec<stellar_xdr::TransactionResultPair>,
+    tx_result_metas: Vec<stellar_xdr::TransactionResultMetaV1>,
     /// Keys of entries restored from hot archive during transaction execution.
     /// Passed to HotArchiveBucketList::add_batch to remove restored entries from archive.
     hot_archive_restored_keys: Vec<LedgerKey>,
@@ -3166,7 +3150,7 @@ fn create_ledger_entries_for_v20(
     ledger_seq: u32,
     initial_bucket_list_size: u64,
 ) -> Result<()> {
-    use stellar_xdr::curr::{
+    use stellar_xdr::{
         ConfigSettingContractBandwidthV0, ConfigSettingContractComputeV0,
         ConfigSettingContractEventsV0, ConfigSettingContractExecutionLanesV0,
         ConfigSettingContractHistoricalDataV0, ConfigSettingContractLedgerCostV0,
@@ -3340,8 +3324,8 @@ fn create_ledger_entries_for_v20(
 /// Build the initial V20 CPU cost parameter table (23 entries: indices 0..=22).
 ///
 /// Parity: NetworkConfig.cpp:246-338 `initialCpuCostParamsEntryForV20`
-fn initial_cpu_cost_params_for_v20() -> Vec<stellar_xdr::curr::ContractCostParamEntry> {
-    use stellar_xdr::curr::{ContractCostParamEntry, ExtensionPoint};
+fn initial_cpu_cost_params_for_v20() -> Vec<stellar_xdr::ContractCostParamEntry> {
+    use stellar_xdr::{ContractCostParamEntry, ExtensionPoint};
     let e = |const_term: i64, linear_term: i64| ContractCostParamEntry {
         ext: ExtensionPoint::V0,
         const_term,
@@ -3378,8 +3362,8 @@ fn initial_cpu_cost_params_for_v20() -> Vec<stellar_xdr::curr::ContractCostParam
 /// Build the initial V20 memory cost parameter table (23 entries: indices 0..=22).
 ///
 /// Parity: NetworkConfig.cpp:688-776 `initialMemCostParamsEntryForV20`
-fn initial_mem_cost_params_for_v20() -> Vec<stellar_xdr::curr::ContractCostParamEntry> {
-    use stellar_xdr::curr::{ContractCostParamEntry, ExtensionPoint};
+fn initial_mem_cost_params_for_v20() -> Vec<stellar_xdr::ContractCostParamEntry> {
+    use stellar_xdr::{ContractCostParamEntry, ExtensionPoint};
     let e = |const_term: i64, linear_term: i64| ContractCostParamEntry {
         ext: ExtensionPoint::V0,
         const_term,
@@ -3425,7 +3409,7 @@ fn resize_and_update_cost_params(
     cpu_updates: &[(usize, i64, i64)],
     mem_updates: &[(usize, i64, i64)],
 ) -> Result<()> {
-    use stellar_xdr::curr::{ContractCostParamEntry, ContractCostParams};
+    use stellar_xdr::{ContractCostParamEntry, ContractCostParams};
 
     let make_entry = |const_term: i64, linear_term: i64| ContractCostParamEntry {
         ext: ExtensionPoint::V0,
@@ -3655,7 +3639,7 @@ fn create_and_update_ledger_entries_for_v23(
     ltx: &mut CloseLedgerState,
     ledger_seq: u32,
 ) -> Result<()> {
-    use stellar_xdr::curr::{
+    use stellar_xdr::{
         ConfigSettingContractLedgerCostExtV0, ConfigSettingContractParallelComputeV0,
         ConfigSettingScpTiming,
     };
@@ -3929,7 +3913,7 @@ fn update_cost_types_for_v26(ltx: &mut CloseLedgerState, ledger_seq: u32) -> Res
 /// Parity: NetworkConfig.cpp createLedgerEntriesForV26
 /// Creates 2 CONFIG_SETTING entries with empty frozen key and bypass tx sets.
 fn create_ledger_entries_for_v26(ltx: &mut CloseLedgerState, ledger_seq: u32) -> Result<()> {
-    use stellar_xdr::curr::{FreezeBypassTxs, FrozenLedgerKeys, VecM};
+    use stellar_xdr::{FreezeBypassTxs, FrozenLedgerKeys, VecM};
 
     let make_entry = |config: ConfigSettingEntry| -> LedgerEntry {
         LedgerEntry {
@@ -4212,7 +4196,7 @@ impl LedgerCloseContext<'_> {
             // (which is skipped in simulation mode).
             let tx_set = std::mem::replace(
                 &mut self.close_data.tx_set,
-                TransactionSetVariant::Classic(stellar_xdr::curr::TransactionSet {
+                TransactionSetVariant::Classic(stellar_xdr::TransactionSet {
                     previous_ledger_hash: Hash([0; 32]),
                     txs: Default::default(),
                 }),
@@ -4317,8 +4301,8 @@ impl LedgerCloseContext<'_> {
                 soroban_config: soroban_config.clone(),
                 frozen_key_config: frozen_key_config.clone(),
                 ledger_flags: match &self.prev_header.ext {
-                    stellar_xdr::curr::LedgerHeaderExt::V0 => 0,
-                    stellar_xdr::curr::LedgerHeaderExt::V1(ext) => ext.flags,
+                    stellar_xdr::LedgerHeaderExt::V0 => 0,
+                    stellar_xdr::LedgerHeaderExt::V1(ext) => ext.flags,
                 },
                 soroban_resource_limits: self
                     .manager
@@ -4375,7 +4359,7 @@ impl LedgerCloseContext<'_> {
             // classic executor so classic TXs see ALL fee deductions (including
             // Soroban fees on shared accounts).
             for entry in self.ltx.current_delta().current_entries() {
-                if matches!(entry.data, stellar_xdr::curr::LedgerEntryData::Account(_)) {
+                if matches!(entry.data, stellar_xdr::LedgerEntryData::Account(_)) {
                     executor_ref.state_mut().load_entry(entry);
                 }
             }
@@ -4680,7 +4664,7 @@ impl LedgerCloseContext<'_> {
         prev_version: u32,
         protocol_version: u32,
     ) -> Result<(bool, bool, Vec<UpgradeEntryMeta>)> {
-        use stellar_xdr::curr::{LedgerEntryChanges, LedgerUpgrade, Limits, WriteXdr};
+        use stellar_xdr::{LedgerEntryChanges, LedgerUpgrade, Limits, WriteXdr};
 
         // LEDGER_SPEC §7.3.4 step 2 (LEDGER §7.3.4-2): re-validate each upgrade
         // via isValidForApply at apply time and SKIP invalid ones with a
@@ -5044,16 +5028,16 @@ impl LedgerCloseContext<'_> {
         // Note: we use upgrade_ctx.upgrades (not close_data.upgrades) because
         // close_data.upgrades is drained by std::mem::take in apply_upgrades_to_delta
         // to build UpgradeEntryMeta.
-        let raw_upgrades: Vec<stellar_xdr::curr::UpgradeType> = self
+        let raw_upgrades: Vec<stellar_xdr::UpgradeType> = self
             .upgrade_ctx
             .upgrades
             .iter()
             .filter_map(|upgrade| {
-                use stellar_xdr::curr::WriteXdr;
+                use stellar_xdr::WriteXdr;
                 upgrade
-                    .to_xdr(stellar_xdr::curr::Limits::none())
+                    .to_xdr(stellar_xdr::Limits::none())
                     .ok()
-                    .and_then(|bytes| stellar_xdr::curr::UpgradeType::try_from(bytes).ok())
+                    .and_then(|bytes| stellar_xdr::UpgradeType::try_from(bytes).ok())
             })
             .collect();
         if let Ok(upgrades_vec) = raw_upgrades.try_into() {
@@ -5063,7 +5047,7 @@ impl LedgerCloseContext<'_> {
         new_header.id_pool = self.id_pool;
 
         // Compute header hash - add detailed XDR logging for debugging
-        use stellar_xdr::curr::{Limits, WriteXdr};
+        use stellar_xdr::{Limits, WriteXdr};
         let header_xdr_bytes = new_header.to_xdr(Limits::none())?;
         let header_xdr_hex = header_xdr_bytes.iter().fold(
             String::with_capacity(header_xdr_bytes.len() * 2),
@@ -5140,7 +5124,7 @@ impl LedgerCloseContext<'_> {
         // TransactionResultSet wrapper.
         let tx_result_hash = {
             use sha2::{Digest, Sha256};
-            use stellar_xdr::curr::{Limited, Limits, WriteXdr};
+            use stellar_xdr::{Limited, Limits, WriteXdr};
 
             struct Sha256Writer(Sha256);
             impl std::io::Write for Sha256Writer {
@@ -5601,7 +5585,9 @@ impl LedgerCloseContext<'_> {
                                 !matches!(
                                     &e.data,
                                     LedgerEntryData::ConfigSetting(
-                                        stellar_xdr::curr::ConfigSettingEntry::LiveSorobanStateSizeWindow(_)
+                                        stellar_xdr::ConfigSettingEntry::LiveSorobanStateSizeWindow(
+                                            _
+                                        )
                                     )
                                 )
                             });
@@ -6009,12 +5995,12 @@ impl LedgerCloseContext<'_> {
                 // purpose; mirror its field set here so analysts comparing
                 // live vs replay diagnostics see directly comparable output.
                 let stellar_value_ext_desc = match &new_header.scp_value.ext {
-                    stellar_xdr::curr::StellarValueExt::Basic => "Basic",
-                    stellar_xdr::curr::StellarValueExt::Signed(_) => "Signed",
+                    stellar_xdr::StellarValueExt::Basic => "Basic",
+                    stellar_xdr::StellarValueExt::Signed(_) => "Signed",
                 };
                 let header_ext_desc = match &new_header.ext {
-                    stellar_xdr::curr::LedgerHeaderExt::V0 => "V0".to_string(),
-                    stellar_xdr::curr::LedgerHeaderExt::V1(v1) => {
+                    stellar_xdr::LedgerHeaderExt::V0 => "V0".to_string(),
+                    stellar_xdr::LedgerHeaderExt::V1(v1) => {
                         format!("V1(flags={})", v1.flags)
                     }
                 };
@@ -6055,12 +6041,10 @@ impl LedgerCloseContext<'_> {
                 // side can diff against CDP's tx_apply_processing changes and
                 // localize the first divergent prior tx.
                 use sha2::{Digest, Sha256};
-                use stellar_xdr::curr::{
-                    LedgerEntryChange, LedgerEntryData, TransactionMeta, WriteXdr,
-                };
+                use stellar_xdr::{LedgerEntryChange, LedgerEntryData, TransactionMeta, WriteXdr};
                 for (i, meta_v1) in self.tx_result_metas.iter().enumerate() {
                     let mut changes_summary: Vec<String> = Vec::new();
-                    let walk = |changes: &stellar_xdr::curr::LedgerEntryChanges,
+                    let walk = |changes: &stellar_xdr::LedgerEntryChanges,
                                 summary: &mut Vec<String>,
                                 phase: &str| {
                         for change in changes.iter() {
@@ -6076,7 +6060,7 @@ impl LedgerCloseContext<'_> {
                             }
                             let data_bytes = entry
                                 .data
-                                .to_xdr(stellar_xdr::curr::Limits::none())
+                                .to_xdr(stellar_xdr::Limits::none())
                                 .unwrap_or_default();
                             let data_hash = format!("{:x}", Sha256::digest(&data_bytes));
                             summary.push(format!(
@@ -6167,8 +6151,8 @@ impl LedgerCloseContext<'_> {
 
         // Describe the StellarValueExt for logging
         let stellar_value_ext_desc = match &new_header.scp_value.ext {
-            stellar_xdr::curr::StellarValueExt::Basic => "Basic".to_string(),
-            stellar_xdr::curr::StellarValueExt::Signed(_) => "Signed".to_string(),
+            stellar_xdr::StellarValueExt::Basic => "Basic".to_string(),
+            stellar_xdr::StellarValueExt::Signed(_) => "Signed".to_string(),
         };
 
         info!(
@@ -6473,11 +6457,11 @@ fn create_genesis_header() -> LedgerHeader {
     LedgerHeader {
         ledger_version: 0,
         previous_ledger_hash: Hash([0u8; 32]),
-        scp_value: stellar_xdr::curr::StellarValue {
+        scp_value: stellar_xdr::StellarValue {
             tx_set_hash: Hash([0u8; 32]),
-            close_time: stellar_xdr::curr::TimePoint(0),
-            upgrades: stellar_xdr::curr::VecM::default(),
-            ext: stellar_xdr::curr::StellarValueExt::Basic,
+            close_time: stellar_xdr::TimePoint(0),
+            upgrades: stellar_xdr::VecM::default(),
+            ext: stellar_xdr::StellarValueExt::Basic,
         },
         tx_set_result_hash: Hash([0u8; 32]),
         bucket_list_hash: Hash([0u8; 32]),
@@ -6491,7 +6475,7 @@ fn create_genesis_header() -> LedgerHeader {
         base_reserve: 100_000_000, // 10 XLM in stroops
         max_tx_set_size: 100,
         skip_list: std::array::from_fn(|_| Hash([0u8; 32])),
-        ext: stellar_xdr::curr::LedgerHeaderExt::V0,
+        ext: stellar_xdr::LedgerHeaderExt::V0,
     }
 }
 
@@ -6503,7 +6487,7 @@ fn create_genesis_header() -> LedgerHeader {
 /// `MinimumSorobanNetworkConfig`).
 #[doc(hidden)]
 pub fn new_bucket_list_with_soroban_config() -> BucketList {
-    use stellar_xdr::curr::{
+    use stellar_xdr::{
         BucketListType, ConfigSettingContractBandwidthV0, ConfigSettingContractComputeV0,
         ConfigSettingContractEventsV0, ConfigSettingContractExecutionLanesV0,
         ConfigSettingContractHistoricalDataV0, ConfigSettingContractLedgerCostV0,
@@ -6619,7 +6603,7 @@ mod tests {
     use super::*;
     use crate::delta::LedgerDelta;
     use henyey_bucket::EvictionIteratorExt;
-    use stellar_xdr::curr::{
+    use stellar_xdr::{
         Asset, ContractDataDurability, ContractDataEntry, ContractId, ExtensionPoint,
         LedgerScpMessages, OfferEntry, OfferEntryExt, Price, ScAddress, ScVal, ScpHistoryEntry,
         ScpHistoryEntryV0, TransactionSet, TtlEntry, WriteXdr,
@@ -6631,8 +6615,8 @@ mod tests {
     const TEST_PROTOCOL: u32 = 25;
 
     fn make_account_id(bytes: [u8; 32]) -> AccountId {
-        AccountId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
-            stellar_xdr::curr::Uint256(bytes),
+        AccountId(stellar_xdr::PublicKey::PublicKeyTypeEd25519(
+            stellar_xdr::Uint256(bytes),
         ))
     }
 
@@ -6659,9 +6643,7 @@ mod tests {
             data: LedgerEntryData::ContractData(ContractDataEntry {
                 ext: ExtensionPoint::V0,
                 contract: ScAddress::Contract(ContractId(Hash([1u8; 32]))),
-                key: ScVal::Bytes(stellar_xdr::curr::ScBytes(
-                    key_bytes.to_vec().try_into().unwrap(),
-                )),
+                key: ScVal::Bytes(stellar_xdr::ScBytes(key_bytes.to_vec().try_into().unwrap())),
                 durability: ContractDataDurability::Persistent,
                 val: ScVal::I32(42),
             }),
@@ -6796,7 +6778,7 @@ mod tests {
         )
         .unwrap();
 
-        let dead_key = LedgerKey::Offer(stellar_xdr::curr::LedgerKeyOffer {
+        let dead_key = LedgerKey::Offer(stellar_xdr::LedgerKeyOffer {
             seller_id: make_account_id([5u8; 32]),
             offer_id: 99,
         });
@@ -6951,7 +6933,7 @@ mod tests {
         use henyey_bucket::Bucket;
 
         let entry = make_offer_entry(1, [1u8; 32]);
-        let dead_key = LedgerKey::Offer(stellar_xdr::curr::LedgerKeyOffer {
+        let dead_key = LedgerKey::Offer(stellar_xdr::LedgerKeyOffer {
             seller_id: make_account_id([1u8; 32]),
             offer_id: 1,
         });
@@ -6978,7 +6960,7 @@ mod tests {
         if let LedgerEntryData::Offer(ref mut o) = entry_v2.data {
             o.amount = 7777;
         }
-        let key = LedgerKey::Offer(stellar_xdr::curr::LedgerKeyOffer {
+        let key = LedgerKey::Offer(stellar_xdr::LedgerKeyOffer {
             seller_id: make_account_id([1u8; 32]),
             offer_id: 1,
         });
@@ -7012,11 +6994,11 @@ mod tests {
         // Entries with different keys across levels should all be included.
         let offer1 = make_offer_entry(1, [1u8; 32]);
         let offer2 = make_offer_entry(2, [2u8; 32]);
-        let key1 = LedgerKey::Offer(stellar_xdr::curr::LedgerKeyOffer {
+        let key1 = LedgerKey::Offer(stellar_xdr::LedgerKeyOffer {
             seller_id: make_account_id([1u8; 32]),
             offer_id: 1,
         });
-        let key2 = LedgerKey::Offer(stellar_xdr::curr::LedgerKeyOffer {
+        let key2 = LedgerKey::Offer(stellar_xdr::LedgerKeyOffer {
             seller_id: make_account_id([2u8; 32]),
             offer_id: 2,
         });
@@ -7044,7 +7026,7 @@ mod tests {
         // a live entry at a higher (older) level from appearing in the result.
         // This was the root cause of the soroban_state_size inflation bug.
         let offer = make_offer_entry(1, [1u8; 32]);
-        let key = LedgerKey::Offer(stellar_xdr::curr::LedgerKeyOffer {
+        let key = LedgerKey::Offer(stellar_xdr::LedgerKeyOffer {
             seller_id: make_account_id([1u8; 32]),
             offer_id: 1,
         });
@@ -7086,31 +7068,29 @@ mod tests {
         // NOT (proving type-tagging makes the narrowing exact).
         let shared = [3u8; 32];
         let keys: Vec<LedgerKey> = vec![
-            LedgerKey::Offer(stellar_xdr::curr::LedgerKeyOffer {
+            LedgerKey::Offer(stellar_xdr::LedgerKeyOffer {
                 seller_id: make_account_id(shared),
                 offer_id: 1,
             }),
-            LedgerKey::Trustline(stellar_xdr::curr::LedgerKeyTrustLine {
+            LedgerKey::Trustline(stellar_xdr::LedgerKeyTrustLine {
                 account_id: make_account_id(shared),
-                asset: stellar_xdr::curr::TrustLineAsset::PoolShare(PoolId(Hash(shared))),
+                asset: stellar_xdr::TrustLineAsset::PoolShare(PoolId(Hash(shared))),
             }),
-            LedgerKey::ContractData(stellar_xdr::curr::LedgerKeyContractData {
+            LedgerKey::ContractData(stellar_xdr::LedgerKeyContractData {
                 contract: ScAddress::Contract(ContractId(Hash(shared))),
                 key: ScVal::I32(7),
                 durability: ContractDataDurability::Persistent,
             }),
-            LedgerKey::ContractCode(stellar_xdr::curr::LedgerKeyContractCode {
-                hash: Hash(shared),
-            }),
+            LedgerKey::ContractCode(stellar_xdr::LedgerKeyContractCode { hash: Hash(shared) }),
             LedgerKey::ConfigSetting(LedgerKeyConfigSetting {
-                config_setting_id: stellar_xdr::curr::ConfigSettingId::ContractMaxSizeBytes,
+                config_setting_id: stellar_xdr::ConfigSettingId::ContractMaxSizeBytes,
             }),
-            LedgerKey::Ttl(stellar_xdr::curr::LedgerKeyTtl {
+            LedgerKey::Ttl(stellar_xdr::LedgerKeyTtl {
                 key_hash: Hash(shared),
             }),
             // A non-scan-relevant variant lands in the catch-all set, proving the
             // abstraction is total (handles EVERY LedgerKey variant).
-            LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
+            LedgerKey::Account(stellar_xdr::LedgerKeyAccount {
                 account_id: make_account_id(shared),
             }),
         ];
@@ -7140,8 +7120,8 @@ mod tests {
     fn make_contract_code_entry(hash_bytes: [u8; 32]) -> LedgerEntry {
         LedgerEntry {
             last_modified_ledger_seq: 100,
-            data: LedgerEntryData::ContractCode(stellar_xdr::curr::ContractCodeEntry {
-                ext: stellar_xdr::curr::ContractCodeEntryExt::V0,
+            data: LedgerEntryData::ContractCode(stellar_xdr::ContractCodeEntry {
+                ext: stellar_xdr::ContractCodeEntryExt::V0,
                 hash: Hash(hash_bytes),
                 code: vec![0u8; 4].try_into().unwrap(),
             }),
@@ -7152,13 +7132,13 @@ mod tests {
     fn make_pool_share_trustline_entry(acct: [u8; 32], pool: [u8; 32]) -> LedgerEntry {
         LedgerEntry {
             last_modified_ledger_seq: 100,
-            data: LedgerEntryData::Trustline(stellar_xdr::curr::TrustLineEntry {
+            data: LedgerEntryData::Trustline(stellar_xdr::TrustLineEntry {
                 account_id: make_account_id(acct),
-                asset: stellar_xdr::curr::TrustLineAsset::PoolShare(PoolId(Hash(pool))),
+                asset: stellar_xdr::TrustLineAsset::PoolShare(PoolId(Hash(pool))),
                 balance: 0,
                 limit: i64::MAX,
                 flags: 0,
-                ext: stellar_xdr::curr::TrustLineEntryExt::V0,
+                ext: stellar_xdr::TrustLineEntryExt::V0,
             }),
             ext: LedgerEntryExt::V0,
         }
@@ -7174,7 +7154,7 @@ mod tests {
         // (live entry, its LedgerKey, a closure asserting the final state is empty)
         // Offer
         {
-            let key = LedgerKey::Offer(stellar_xdr::curr::LedgerKeyOffer {
+            let key = LedgerKey::Offer(stellar_xdr::LedgerKeyOffer {
                 seller_id: make_account_id([5u8; 32]),
                 offer_id: 99,
             });
@@ -7274,7 +7254,7 @@ mod tests {
                 dead_keys: HashSet::new(),
                 dead_ttl_keys: [Hash([9u8; 32])].into_iter().collect(),
             };
-            let ttl_key = stellar_xdr::curr::LedgerKeyTtl {
+            let ttl_key = stellar_xdr::LedgerKeyTtl {
                 key_hash: Hash([9u8; 32]),
             };
             let ttl_data = crate::soroban_state::TtlData::new(1000, 1);
@@ -7419,7 +7399,7 @@ mod tests {
         )
         .unwrap();
 
-        let dead_key = LedgerKey::Offer(stellar_xdr::curr::LedgerKeyOffer {
+        let dead_key = LedgerKey::Offer(stellar_xdr::LedgerKeyOffer {
             seller_id: make_account_id([7u8; 32]),
             offer_id: 77,
         });
@@ -7609,7 +7589,7 @@ mod tests {
         )
         .unwrap();
         // Kill it at ledger 2
-        let dead_key = LedgerKey::Offer(stellar_xdr::curr::LedgerKeyOffer {
+        let dead_key = LedgerKey::Offer(stellar_xdr::LedgerKeyOffer {
             seller_id: make_account_id([1u8; 32]),
             offer_id: 1,
         });
@@ -7805,17 +7785,17 @@ mod tests {
     #[test]
     fn test_streaming_pool_share_trustline_indexing() {
         let mut bl = new_bl_with_config();
-        let pool_hash = stellar_xdr::curr::PoolId(Hash([99u8; 32]));
+        let pool_hash = stellar_xdr::PoolId(Hash([99u8; 32]));
         let account = make_account_id([1u8; 32]);
         let tl_entry = LedgerEntry {
             last_modified_ledger_seq: 1,
-            data: LedgerEntryData::Trustline(stellar_xdr::curr::TrustLineEntry {
+            data: LedgerEntryData::Trustline(stellar_xdr::TrustLineEntry {
                 account_id: account.clone(),
-                asset: stellar_xdr::curr::TrustLineAsset::PoolShare(pool_hash.clone()),
+                asset: stellar_xdr::TrustLineAsset::PoolShare(pool_hash.clone()),
                 balance: 100,
                 limit: 1000,
                 flags: 0,
-                ext: stellar_xdr::curr::TrustLineEntryExt::V0,
+                ext: stellar_xdr::TrustLineEntryExt::V0,
             }),
             ext: LedgerEntryExt::V0,
         };
@@ -7961,11 +7941,11 @@ mod tests {
             .unwrap();
         }
         // Kill offers 2 and 4
-        let dead2 = LedgerKey::Offer(stellar_xdr::curr::LedgerKeyOffer {
+        let dead2 = LedgerKey::Offer(stellar_xdr::LedgerKeyOffer {
             seller_id: make_account_id([2u8; 32]),
             offer_id: 2,
         });
-        let dead4 = LedgerKey::Offer(stellar_xdr::curr::LedgerKeyOffer {
+        let dead4 = LedgerKey::Offer(stellar_xdr::LedgerKeyOffer {
             seller_id: make_account_id([4u8; 32]),
             offer_id: 4,
         });
@@ -8451,20 +8431,20 @@ mod tests {
             hash_bytes[0] = i;
             let code_entry = LedgerEntry {
                 last_modified_ledger_seq: 1,
-                data: LedgerEntryData::ContractCode(stellar_xdr::curr::ContractCodeEntry {
-                    ext: stellar_xdr::curr::ContractCodeEntryExt::V0,
+                data: LedgerEntryData::ContractCode(stellar_xdr::ContractCodeEntry {
+                    ext: stellar_xdr::ContractCodeEntryExt::V0,
                     hash: Hash(hash_bytes),
                     code: vec![0u8; 50].try_into().unwrap(),
                 }),
                 ext: LedgerEntryExt::V0,
             };
-            let code_key = LedgerKey::ContractCode(stellar_xdr::curr::LedgerKeyContractCode {
+            let code_key = LedgerKey::ContractCode(stellar_xdr::LedgerKeyContractCode {
                 hash: Hash(hash_bytes),
             });
 
             // Create TTL entry with SHA256 hash of the key
             use sha2::{Digest, Sha256};
-            let key_bytes = code_key.to_xdr(stellar_xdr::curr::Limits::none()).unwrap();
+            let key_bytes = code_key.to_xdr(stellar_xdr::Limits::none()).unwrap();
             let mut hasher = Sha256::new();
             hasher.update(&key_bytes);
             let hash_result = hasher.finalize();
@@ -9160,7 +9140,7 @@ mod tests {
     /// apply_upgrades_to_delta before build_and_hash_header runs).
     #[test]
     fn test_header_scp_value_upgrades_populated_after_drain() {
-        use stellar_xdr::curr::{LedgerUpgrade, Limits, ReadXdr};
+        use stellar_xdr::{LedgerUpgrade, Limits, ReadXdr};
 
         let manager = LedgerManager::new(
             "Test SDF Network ; September 2015".to_string(),
@@ -9227,7 +9207,7 @@ mod tests {
     /// Mirrors stellar-core `LedgerManagerImpl.cpp:1660-1711`.
     #[test]
     fn test_apply_time_revalidation_skips_version_regression() {
-        use stellar_xdr::curr::{LedgerUpgrade, Limits, ReadXdr};
+        use stellar_xdr::{LedgerUpgrade, Limits, ReadXdr};
 
         let manager = LedgerManager::new(
             "Test SDF Network ; September 2015".to_string(),
@@ -9287,7 +9267,7 @@ mod tests {
     /// set in `scp_value.upgrades`.
     #[test]
     fn test_apply_time_revalidation_skips_invalid_base_fee() {
-        use stellar_xdr::curr::{LedgerUpgrade, Limits, ReadXdr};
+        use stellar_xdr::{LedgerUpgrade, Limits, ReadXdr};
 
         let manager = LedgerManager::new(
             "Test SDF Network ; September 2015".to_string(),
@@ -9353,7 +9333,7 @@ mod tests {
     /// upgrade in the same set.
     #[test]
     fn test_apply_time_revalidation_effective_version_ordering() {
-        use stellar_xdr::curr::LedgerUpgrade;
+        use stellar_xdr::LedgerUpgrade;
 
         let manager = LedgerManager::new(
             "Test SDF Network ; September 2015".to_string(),
@@ -9810,14 +9790,12 @@ mod tests {
     // --- Tests for build_soroban_rent_config ---
 
     /// A simple EntryReader backed by a HashMap for testing.
-    struct MapReader(
-        std::collections::HashMap<stellar_xdr::curr::LedgerKey, stellar_xdr::curr::LedgerEntry>,
-    );
+    struct MapReader(std::collections::HashMap<stellar_xdr::LedgerKey, stellar_xdr::LedgerEntry>);
     impl crate::EntryReader for MapReader {
         fn get_entry(
             &self,
-            key: &stellar_xdr::curr::LedgerKey,
-        ) -> Result<Option<stellar_xdr::curr::LedgerEntry>> {
+            key: &stellar_xdr::LedgerKey,
+        ) -> Result<Option<stellar_xdr::LedgerEntry>> {
             Ok(self.0.get(key).cloned())
         }
     }
@@ -9825,13 +9803,13 @@ mod tests {
     fn make_config_ledger_entry(setting: ConfigSettingEntry) -> LedgerEntry {
         LedgerEntry {
             last_modified_ledger_seq: 1,
-            data: stellar_xdr::curr::LedgerEntryData::ConfigSetting(setting),
-            ext: stellar_xdr::curr::LedgerEntryExt::V0,
+            data: stellar_xdr::LedgerEntryData::ConfigSetting(setting),
+            ext: stellar_xdr::LedgerEntryExt::V0,
         }
     }
 
-    fn config_key(id: ConfigSettingId) -> stellar_xdr::curr::LedgerKey {
-        stellar_xdr::curr::LedgerKey::ConfigSetting(stellar_xdr::curr::LedgerKeyConfigSetting {
+    fn config_key(id: ConfigSettingId) -> stellar_xdr::LedgerKey {
+        stellar_xdr::LedgerKey::ConfigSetting(stellar_xdr::LedgerKeyConfigSetting {
             config_setting_id: id,
         })
     }
@@ -9846,19 +9824,19 @@ mod tests {
 
     #[test]
     fn test_build_soroban_rent_config_complete_reader_returns_some() {
-        use stellar_xdr::curr::{ConfigSettingContractComputeV0, ContractCostParams};
+        use stellar_xdr::{ConfigSettingContractComputeV0, ContractCostParams};
 
         let mut map = std::collections::HashMap::new();
         map.insert(
             config_key(ConfigSettingId::ContractCostParamsCpuInstructions),
             make_config_ledger_entry(ConfigSettingEntry::ContractCostParamsCpuInstructions(
-                ContractCostParams(stellar_xdr::curr::VecM::default()),
+                ContractCostParams(stellar_xdr::VecM::default()),
             )),
         );
         map.insert(
             config_key(ConfigSettingId::ContractCostParamsMemoryBytes),
             make_config_ledger_entry(ConfigSettingEntry::ContractCostParamsMemoryBytes(
-                ContractCostParams(stellar_xdr::curr::VecM::default()),
+                ContractCostParams(stellar_xdr::VecM::default()),
             )),
         );
         map.insert(
@@ -9883,14 +9861,14 @@ mod tests {
 
     #[test]
     fn test_build_soroban_rent_config_partial_state_cpu_only_errors() {
-        use stellar_xdr::curr::ContractCostParams;
+        use stellar_xdr::ContractCostParams;
 
         // Only CPU key present, others missing — inconsistent state.
         let mut map = std::collections::HashMap::new();
         map.insert(
             config_key(ConfigSettingId::ContractCostParamsCpuInstructions),
             make_config_ledger_entry(ConfigSettingEntry::ContractCostParamsCpuInstructions(
-                ContractCostParams(stellar_xdr::curr::VecM::default()),
+                ContractCostParams(stellar_xdr::VecM::default()),
             )),
         );
 
@@ -9907,14 +9885,14 @@ mod tests {
 
     #[test]
     fn test_build_soroban_rent_config_partial_state_cpu_absent_errors() {
-        use stellar_xdr::curr::{ConfigSettingContractComputeV0, ContractCostParams};
+        use stellar_xdr::{ConfigSettingContractComputeV0, ContractCostParams};
 
         // CPU absent but Memory + Compute present — inconsistent state (reverse case).
         let mut map = std::collections::HashMap::new();
         map.insert(
             config_key(ConfigSettingId::ContractCostParamsMemoryBytes),
             make_config_ledger_entry(ConfigSettingEntry::ContractCostParamsMemoryBytes(
-                ContractCostParams(stellar_xdr::curr::VecM::default()),
+                ContractCostParams(stellar_xdr::VecM::default()),
             )),
         );
         map.insert(
@@ -9942,21 +9920,21 @@ mod tests {
 
     #[test]
     fn test_build_soroban_rent_config_wrong_variant_errors() {
-        use stellar_xdr::curr::{ConfigSettingContractComputeV0, ContractCostParams};
+        use stellar_xdr::{ConfigSettingContractComputeV0, ContractCostParams};
 
         // All three keys present, but MemoryBytes has the wrong variant.
         let mut map = std::collections::HashMap::new();
         map.insert(
             config_key(ConfigSettingId::ContractCostParamsCpuInstructions),
             make_config_ledger_entry(ConfigSettingEntry::ContractCostParamsCpuInstructions(
-                ContractCostParams(stellar_xdr::curr::VecM::default()),
+                ContractCostParams(stellar_xdr::VecM::default()),
             )),
         );
         // Wrong variant for MemoryBytes — put CPU params where Memory should be.
         map.insert(
             config_key(ConfigSettingId::ContractCostParamsMemoryBytes),
             make_config_ledger_entry(ConfigSettingEntry::ContractCostParamsCpuInstructions(
-                ContractCostParams(stellar_xdr::curr::VecM::default()),
+                ContractCostParams(stellar_xdr::VecM::default()),
             )),
         );
         map.insert(
@@ -9996,13 +9974,11 @@ mod tests {
         };
 
         // Create an empty V4 transaction meta
-        let mut meta = TransactionMeta::V4(stellar_xdr::curr::TransactionMetaV4 {
+        let mut meta = TransactionMeta::V4(stellar_xdr::TransactionMetaV4 {
             ext: ExtensionPoint::V0,
-            tx_changes_before: stellar_xdr::curr::LedgerEntryChanges(
-                Vec::new().try_into().unwrap(),
-            ),
+            tx_changes_before: stellar_xdr::LedgerEntryChanges(Vec::new().try_into().unwrap()),
             operations: Vec::new().try_into().unwrap(),
-            tx_changes_after: stellar_xdr::curr::LedgerEntryChanges(Vec::new().try_into().unwrap()),
+            tx_changes_after: stellar_xdr::LedgerEntryChanges(Vec::new().try_into().unwrap()),
             soroban_meta: None,
             events: Vec::new().try_into().unwrap(),
             diagnostic_events: Vec::new().try_into().unwrap(),
@@ -10055,13 +10031,11 @@ mod tests {
         };
 
         // Create meta and prepend with pre-refund fee (the correct behavior)
-        let mut meta_pre = TransactionMeta::V4(stellar_xdr::curr::TransactionMetaV4 {
+        let mut meta_pre = TransactionMeta::V4(stellar_xdr::TransactionMetaV4 {
             ext: ExtensionPoint::V0,
-            tx_changes_before: stellar_xdr::curr::LedgerEntryChanges(
-                Vec::new().try_into().unwrap(),
-            ),
+            tx_changes_before: stellar_xdr::LedgerEntryChanges(Vec::new().try_into().unwrap()),
             operations: Vec::new().try_into().unwrap(),
-            tx_changes_after: stellar_xdr::curr::LedgerEntryChanges(Vec::new().try_into().unwrap()),
+            tx_changes_after: stellar_xdr::LedgerEntryChanges(Vec::new().try_into().unwrap()),
             soroban_meta: None,
             events: Vec::new().try_into().unwrap(),
             diagnostic_events: Vec::new().try_into().unwrap(),
@@ -10076,13 +10050,11 @@ mod tests {
         );
 
         // Create meta and prepend with post-refund fee (the old buggy behavior)
-        let mut meta_post = TransactionMeta::V4(stellar_xdr::curr::TransactionMetaV4 {
+        let mut meta_post = TransactionMeta::V4(stellar_xdr::TransactionMetaV4 {
             ext: ExtensionPoint::V0,
-            tx_changes_before: stellar_xdr::curr::LedgerEntryChanges(
-                Vec::new().try_into().unwrap(),
-            ),
+            tx_changes_before: stellar_xdr::LedgerEntryChanges(Vec::new().try_into().unwrap()),
             operations: Vec::new().try_into().unwrap(),
-            tx_changes_after: stellar_xdr::curr::LedgerEntryChanges(Vec::new().try_into().unwrap()),
+            tx_changes_after: stellar_xdr::LedgerEntryChanges(Vec::new().try_into().unwrap()),
             soroban_meta: None,
             events: Vec::new().try_into().unwrap(),
             diagnostic_events: Vec::new().try_into().unwrap(),
@@ -10136,13 +10108,11 @@ mod tests {
             backfill_stellar_asset_events: false,
         };
 
-        let mut meta1 = TransactionMeta::V4(stellar_xdr::curr::TransactionMetaV4 {
+        let mut meta1 = TransactionMeta::V4(stellar_xdr::TransactionMetaV4 {
             ext: ExtensionPoint::V0,
-            tx_changes_before: stellar_xdr::curr::LedgerEntryChanges(
-                Vec::new().try_into().unwrap(),
-            ),
+            tx_changes_before: stellar_xdr::LedgerEntryChanges(Vec::new().try_into().unwrap()),
             operations: Vec::new().try_into().unwrap(),
-            tx_changes_after: stellar_xdr::curr::LedgerEntryChanges(Vec::new().try_into().unwrap()),
+            tx_changes_after: stellar_xdr::LedgerEntryChanges(Vec::new().try_into().unwrap()),
             soroban_meta: None,
             events: Vec::new().try_into().unwrap(),
             diagnostic_events: Vec::new().try_into().unwrap(),
@@ -10156,13 +10126,11 @@ mod tests {
             classic_events,
         );
 
-        let mut meta2 = TransactionMeta::V4(stellar_xdr::curr::TransactionMetaV4 {
+        let mut meta2 = TransactionMeta::V4(stellar_xdr::TransactionMetaV4 {
             ext: ExtensionPoint::V0,
-            tx_changes_before: stellar_xdr::curr::LedgerEntryChanges(
-                Vec::new().try_into().unwrap(),
-            ),
+            tx_changes_before: stellar_xdr::LedgerEntryChanges(Vec::new().try_into().unwrap()),
             operations: Vec::new().try_into().unwrap(),
-            tx_changes_after: stellar_xdr::curr::LedgerEntryChanges(Vec::new().try_into().unwrap()),
+            tx_changes_after: stellar_xdr::LedgerEntryChanges(Vec::new().try_into().unwrap()),
             soroban_meta: None,
             events: Vec::new().try_into().unwrap(),
             diagnostic_events: Vec::new().try_into().unwrap(),
@@ -10198,7 +10166,7 @@ mod tests {
     /// accounts that were added to the bucket list during genesis bootstrap.
     #[test]
     fn test_create_snapshot_finds_genesis_account() {
-        use stellar_xdr::curr::{
+        use stellar_xdr::{
             AccountEntry, AccountEntryExt, LedgerHeader, SequenceNumber, String32, Thresholds,
         };
 
@@ -10270,7 +10238,7 @@ mod tests {
     /// catchup). This validates the defensive check added in create_snapshot.
     #[test]
     fn test_create_snapshot_returns_error_after_reset() {
-        use stellar_xdr::curr::{
+        use stellar_xdr::{
             AccountEntry, AccountEntryExt, LedgerHeader, SequenceNumber, String32, Thresholds,
         };
 
@@ -10540,14 +10508,14 @@ mod tests {
             .unwrap_or_else(|| panic!("config setting {id:?} not present at protocol {protocol}"))
     }
 
-    fn genesis_cpu_params(protocol: u32) -> Vec<stellar_xdr::curr::ContractCostParamEntry> {
+    fn genesis_cpu_params(protocol: u32) -> Vec<stellar_xdr::ContractCostParamEntry> {
         match genesis_config_entry(protocol, ConfigSettingId::ContractCostParamsCpuInstructions) {
             ConfigSettingEntry::ContractCostParamsCpuInstructions(p) => p.0.to_vec(),
             other => panic!("unexpected variant: {other:?}"),
         }
     }
 
-    fn genesis_mem_params(protocol: u32) -> Vec<stellar_xdr::curr::ContractCostParamEntry> {
+    fn genesis_mem_params(protocol: u32) -> Vec<stellar_xdr::ContractCostParamEntry> {
         match genesis_config_entry(protocol, ConfigSettingId::ContractCostParamsMemoryBytes) {
             ConfigSettingEntry::ContractCostParamsMemoryBytes(p) => p.0.to_vec(),
             other => panic!("unexpected variant: {other:?}"),
@@ -10618,8 +10586,8 @@ mod tests {
     /// Run V20 + recalibration in isolation and return the (cpu, mem) cost
     /// param tables, BEFORE the V21+ cascade overwrites any indices.
     fn recalibrated_v20_params_isolated() -> (
-        Vec<stellar_xdr::curr::ContractCostParamEntry>,
-        Vec<stellar_xdr::curr::ContractCostParamEntry>,
+        Vec<stellar_xdr::ContractCostParamEntry>,
+        Vec<stellar_xdr::ContractCostParamEntry>,
     ) {
         use crate::snapshot::{LedgerSnapshot, SnapshotHandle};
         let snapshot = SnapshotHandle::new(LedgerSnapshot::empty(1));

@@ -18,7 +18,7 @@ use std::fs::File;
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::Path;
 
-use stellar_xdr::curr::{Limits, ReadXdr, WriteXdr};
+use stellar_xdr::{Limits, ReadXdr, WriteXdr};
 
 const FRAME_CONTINUATION_BIT: u8 = 0x80;
 const MAX_FRAME_SIZE: u32 = 0x8000_0000;
@@ -61,7 +61,7 @@ pub fn xdr_encoded_len(val: &impl WriteXdr) -> usize {
             Ok(())
         }
     }
-    let mut w = stellar_xdr::curr::Limited::new(CountingWriter(0), Limits::none());
+    let mut w = stellar_xdr::Limited::new(CountingWriter(0), Limits::none());
     val.write_xdr(&mut w)
         .expect("XDR encoding of in-memory value must not fail");
     w.inner.0
@@ -315,7 +315,7 @@ impl XdrInputStream {
 mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
-    use stellar_xdr::curr::{LedgerCloseMeta, LedgerCloseMetaV2, ReadXdr};
+    use stellar_xdr::{LedgerCloseMeta, LedgerCloseMetaV2, ReadXdr};
 
     /// A thread-safe in-memory writer that allows reading the buffer after writing.
     #[derive(Clone)]
@@ -375,11 +375,10 @@ mod tests {
         assert_eq!(bytes_written, data.len());
 
         // Verify the payload decodes back to the same value
-        let decoded =
-            LedgerCloseMeta::from_xdr(&data[4..], stellar_xdr::curr::Limits::none()).unwrap();
+        let decoded = LedgerCloseMeta::from_xdr(&data[4..], stellar_xdr::Limits::none()).unwrap();
         assert_eq!(
-            decoded.to_xdr(stellar_xdr::curr::Limits::none()).unwrap(),
-            meta.to_xdr(stellar_xdr::curr::Limits::none()).unwrap()
+            decoded.to_xdr(stellar_xdr::Limits::none()).unwrap(),
+            meta.to_xdr(stellar_xdr::Limits::none()).unwrap()
         );
     }
 
@@ -401,15 +400,14 @@ mod tests {
         let sz1 = read_frame_size(&data, 0);
         let frame1_end = 4 + sz1 as usize;
         let _decoded1 =
-            LedgerCloseMeta::from_xdr(&data[4..frame1_end], stellar_xdr::curr::Limits::none())
-                .unwrap();
+            LedgerCloseMeta::from_xdr(&data[4..frame1_end], stellar_xdr::Limits::none()).unwrap();
 
         // Decode second frame
         let sz2 = read_frame_size(&data, frame1_end);
         let frame2_end = frame1_end + 4 + sz2 as usize;
         let _decoded2 = LedgerCloseMeta::from_xdr(
             &data[frame1_end + 4..frame2_end],
-            stellar_xdr::curr::Limits::none(),
+            stellar_xdr::Limits::none(),
         )
         .unwrap();
     }
@@ -554,7 +552,7 @@ mod tests {
         assert!(data[0] & FRAME_CONTINUATION_BIT != 0);
         let sz = read_frame_size(&data, 0);
         let _decoded =
-            LedgerCloseMeta::from_xdr(&data[4..4 + sz as usize], stellar_xdr::curr::Limits::none())
+            LedgerCloseMeta::from_xdr(&data[4..4 + sz as usize], stellar_xdr::Limits::none())
                 .unwrap();
     }
 
@@ -635,7 +633,7 @@ mod tests {
 
     #[test]
     fn test_xdr_to_bytes_roundtrips() {
-        use stellar_xdr::curr::Hash;
+        use stellar_xdr::Hash;
         let hash = Hash([42u8; 32]);
         let bytes = xdr_to_bytes(&hash);
         let decoded = Hash::from_xdr(&bytes, Limits::none()).unwrap();
@@ -644,14 +642,14 @@ mod tests {
 
     #[test]
     fn test_xdr_encoded_len_matches_xdr_to_bytes() {
-        use stellar_xdr::curr::Hash;
+        use stellar_xdr::Hash;
         let hash = Hash([0xABu8; 32]);
         assert_eq!(xdr_encoded_len(&hash), xdr_to_bytes(&hash).len());
     }
 
     #[test]
     fn test_xdr_encoded_len_u32_matches_xdr_to_bytes() {
-        use stellar_xdr::curr::{Hash, TtlEntry};
+        use stellar_xdr::{Hash, TtlEntry};
         // Simple type
         let hash = Hash([0xCDu8; 32]);
         assert_eq!(xdr_encoded_len_u32(&hash), xdr_to_bytes(&hash).len() as u32);

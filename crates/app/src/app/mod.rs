@@ -92,7 +92,7 @@ use henyey_overlay::{
 use henyey_scp::hash_quorum_set;
 use henyey_tx::{envelope_sequence_number, TransactionFrame};
 use henyey_work::{WorkScheduler, WorkSchedulerConfig, WorkState};
-use stellar_xdr::curr::{
+use stellar_xdr::{
     Curve25519Public, EncryptedBody, FloodAdvert, FloodDemand, Hash, LedgerCloseMeta,
     LedgerScpMessages, ReadXdr, ScpEnvelope, ScpHistoryEntry, ScpHistoryEntryV0,
     ScpStatementPledges, SignedTimeSlicedSurveyResponseMessage, StellarMessage, StellarValue,
@@ -112,7 +112,7 @@ use crate::meta_stream::{MetaStreamError, MetaStreamManager};
 use crate::meta_writer::MetaWriter;
 use crate::survey::{HerderLedgerSource, SurveyDataManager, SurveyMessageLimiter, SurveyState};
 use henyey_ledger::{close_time as ledger_close_time, compute_header_hash, verify_header_chain};
-use stellar_xdr::curr::TransactionEnvelope;
+use stellar_xdr::TransactionEnvelope;
 
 const TIME_SLICED_PEERS_MAX: usize = 25;
 const PEER_MAX_FAILURES_TO_SEND: u32 = 10;
@@ -1765,7 +1765,7 @@ impl App {
     fn build_herder_config(
         config: &AppConfig,
         keypair: &henyey_crypto::SecretKey,
-        local_quorum_set: Option<stellar_xdr::curr::ScpQuorumSet>,
+        local_quorum_set: Option<stellar_xdr::ScpQuorumSet>,
     ) -> HerderConfig {
         let freq = checkpoint_frequency();
         HerderConfig {
@@ -2209,7 +2209,7 @@ impl App {
     /// Used by the simulation LoadGenerator to refresh cached sequence numbers.
     pub fn load_account_sequence(
         &self,
-        account_id: &stellar_xdr::curr::AccountId,
+        account_id: &stellar_xdr::AccountId,
     ) -> henyey_ledger::Result<Option<i64>> {
         let snapshot = self.ledger_manager.create_snapshot()?;
         let Some(account) = snapshot.get_account(account_id)? else {
@@ -2229,8 +2229,8 @@ impl App {
     /// Used by the compat HTTP `/testacc` endpoint.
     pub fn load_account(
         &self,
-        account_id: &stellar_xdr::curr::AccountId,
-    ) -> henyey_ledger::Result<Option<stellar_xdr::curr::AccountEntry>> {
+        account_id: &stellar_xdr::AccountId,
+    ) -> henyey_ledger::Result<Option<stellar_xdr::AccountEntry>> {
         let snapshot = self.ledger_manager.create_snapshot()?;
         snapshot.get_account(account_id)
     }
@@ -2238,10 +2238,7 @@ impl App {
     /// Check whether a ledger entry exists in the current bucket list.
     ///
     /// Used by the simulation LoadGenerator to verify Soroban state is synced.
-    pub fn has_ledger_entry(
-        &self,
-        key: &stellar_xdr::curr::LedgerKey,
-    ) -> henyey_ledger::Result<bool> {
+    pub fn has_ledger_entry(&self, key: &stellar_xdr::LedgerKey) -> henyey_ledger::Result<bool> {
         let snapshot = self.ledger_manager.create_snapshot()?;
         Ok(snapshot.get_entry(key)?.is_some())
     }
@@ -2254,17 +2251,15 @@ impl App {
     /// `ConfigUpgradeSet` from live network configuration.
     pub fn load_config_setting(
         &self,
-        id: stellar_xdr::curr::ConfigSettingId,
-    ) -> henyey_ledger::Result<Option<stellar_xdr::curr::ConfigSettingEntry>> {
-        let key = stellar_xdr::curr::LedgerKey::ConfigSetting(
-            stellar_xdr::curr::LedgerKeyConfigSetting {
-                config_setting_id: id,
-            },
-        );
+        id: stellar_xdr::ConfigSettingId,
+    ) -> henyey_ledger::Result<Option<stellar_xdr::ConfigSettingEntry>> {
+        let key = stellar_xdr::LedgerKey::ConfigSetting(stellar_xdr::LedgerKeyConfigSetting {
+            config_setting_id: id,
+        });
         let snapshot = self.ledger_manager.create_snapshot()?;
         match snapshot.get_entry(&key)? {
             Some(entry) => match entry.data {
-                stellar_xdr::curr::LedgerEntryData::ConfigSetting(cs) => Ok(Some(cs)),
+                stellar_xdr::LedgerEntryData::ConfigSetting(cs) => Ok(Some(cs)),
                 _ => Ok(None),
             },
             None => Ok(None),
@@ -2275,7 +2270,7 @@ impl App {
     /// herder's transaction queue.
     ///
     /// Matches stellar-core `Herder::sourceAccountPending()`.
-    pub fn source_account_pending(&self, account_id: &stellar_xdr::curr::AccountId) -> bool {
+    pub fn source_account_pending(&self, account_id: &stellar_xdr::AccountId) -> bool {
         self.herder.source_account_pending(account_id)
     }
 
@@ -2724,7 +2719,7 @@ impl App {
     /// SCP envelopes (e.g., self-echo tests). Delegates to
     /// `Herder::get_scp_envelopes`.
     #[cfg(feature = "test-utils")]
-    pub fn get_scp_envelopes(&self, slot: u64) -> Vec<stellar_xdr::curr::ScpEnvelope> {
+    pub fn get_scp_envelopes(&self, slot: u64) -> Vec<stellar_xdr::ScpEnvelope> {
         self.herder.get_scp_envelopes(slot)
     }
 
@@ -3229,7 +3224,7 @@ impl App {
     }
 
     /// Return the local quorum set if configured.
-    pub fn local_quorum_set(&self) -> Option<stellar_xdr::curr::ScpQuorumSet> {
+    pub fn local_quorum_set(&self) -> Option<stellar_xdr::ScpQuorumSet> {
         self.herder.local_quorum_set()
     }
 
@@ -3987,7 +3982,7 @@ pub(crate) struct PesIterationGate {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use stellar_xdr::curr::StellarValueExt;
+    use stellar_xdr::StellarValueExt;
     use tempfile;
 
     /// #3478: the best-effort GC path must SKIP (not crash) on a transient-IO
@@ -4092,17 +4087,17 @@ mod tests {
     /// Minimal successful `LedgerCloseResult` for the given sequence.
     fn make_successful_close_result(seq: u32) -> henyey_ledger::LedgerCloseResult {
         henyey_ledger::LedgerCloseResult {
-            header: stellar_xdr::curr::LedgerHeader {
+            header: stellar_xdr::LedgerHeader {
                 ledger_version: 24,
-                previous_ledger_hash: stellar_xdr::curr::Hash([0u8; 32]),
-                scp_value: stellar_xdr::curr::StellarValue {
-                    tx_set_hash: stellar_xdr::curr::Hash([0u8; 32]),
-                    close_time: stellar_xdr::curr::TimePoint(seq as u64),
-                    upgrades: stellar_xdr::curr::VecM::default(),
-                    ext: stellar_xdr::curr::StellarValueExt::Basic,
+                previous_ledger_hash: stellar_xdr::Hash([0u8; 32]),
+                scp_value: stellar_xdr::StellarValue {
+                    tx_set_hash: stellar_xdr::Hash([0u8; 32]),
+                    close_time: stellar_xdr::TimePoint(seq as u64),
+                    upgrades: stellar_xdr::VecM::default(),
+                    ext: stellar_xdr::StellarValueExt::Basic,
                 },
-                tx_set_result_hash: stellar_xdr::curr::Hash([0u8; 32]),
-                bucket_list_hash: stellar_xdr::curr::Hash([0u8; 32]),
+                tx_set_result_hash: stellar_xdr::Hash([0u8; 32]),
+                bucket_list_hash: stellar_xdr::Hash([0u8; 32]),
                 ledger_seq: seq,
                 total_coins: 0,
                 fee_pool: 0,
@@ -4112,12 +4107,12 @@ mod tests {
                 base_reserve: 5_000_000,
                 max_tx_set_size: 100,
                 skip_list: [
-                    stellar_xdr::curr::Hash([0u8; 32]),
-                    stellar_xdr::curr::Hash([0u8; 32]),
-                    stellar_xdr::curr::Hash([0u8; 32]),
-                    stellar_xdr::curr::Hash([0u8; 32]),
+                    stellar_xdr::Hash([0u8; 32]),
+                    stellar_xdr::Hash([0u8; 32]),
+                    stellar_xdr::Hash([0u8; 32]),
+                    stellar_xdr::Hash([0u8; 32]),
                 ],
-                ext: stellar_xdr::curr::LedgerHeaderExt::V0,
+                ext: stellar_xdr::LedgerHeaderExt::V0,
             },
             header_hash: henyey_common::Hash256::ZERO,
             tx_results: Vec::new(),
@@ -4892,7 +4887,7 @@ mod tests {
         let far_ahead_close_time = now_secs + 61;
         let mut header = app.ledger_manager().current_header();
         header.ledger_seq = 10;
-        header.scp_value.close_time = stellar_xdr::curr::TimePoint(far_ahead_close_time);
+        header.scp_value.close_time = stellar_xdr::TimePoint(far_ahead_close_time);
         app.ledger_manager()
             .set_header_for_test(header, henyey_common::Hash256::ZERO);
 
@@ -5032,7 +5027,7 @@ mod tests {
         let now_secs: u64 = 1_700_000_000;
         app.herder.set_test_clock_seconds(now_secs);
         let mut header = app.ledger_manager().current_header();
-        header.scp_value.close_time = stellar_xdr::curr::TimePoint(now_secs + 61);
+        header.scp_value.close_time = stellar_xdr::TimePoint(now_secs + 61);
         let lcl_seq = header.ledger_seq;
         app.ledger_manager()
             .set_header_for_test(header, henyey_common::Hash256::ZERO);
@@ -5107,7 +5102,7 @@ mod tests {
         let now_secs: u64 = 1_700_000_000;
         app.herder.set_test_clock_seconds(now_secs);
         let mut header = app.ledger_manager().current_header();
-        header.scp_value.close_time = stellar_xdr::curr::TimePoint(now_secs + 61);
+        header.scp_value.close_time = stellar_xdr::TimePoint(now_secs + 61);
         app.ledger_manager()
             .set_header_for_test(header, henyey_common::Hash256::ZERO);
 
@@ -5349,7 +5344,7 @@ mod tests {
     /// in the syncing_ledgers entry is cleared.
     #[tokio::test]
     async fn test_try_start_ledger_close_rejects_malformed_tx_set() {
-        use stellar_xdr::curr::{
+        use stellar_xdr::{
             GeneralizedTransactionSet, Hash, TransactionPhase, TransactionSetV1, TxSetComponent,
             TxSetComponentTxsMaybeDiscountedFee,
         };
@@ -5982,13 +5977,13 @@ mod tests {
         // Verify the message type matching pattern used in the broadcast
         // handler to skip fetch response messages (they go through the
         // dedicated channel instead).
-        use stellar_xdr::curr::StellarMessage;
+        use stellar_xdr::StellarMessage;
 
         let test_messages = vec![
             (
-                StellarMessage::GeneralizedTxSet(stellar_xdr::curr::GeneralizedTransactionSet::V1(
-                    stellar_xdr::curr::TransactionSetV1 {
-                        previous_ledger_hash: stellar_xdr::curr::Hash([0u8; 32]),
+                StellarMessage::GeneralizedTxSet(stellar_xdr::GeneralizedTransactionSet::V1(
+                    stellar_xdr::TransactionSetV1 {
+                        previous_ledger_hash: stellar_xdr::Hash([0u8; 32]),
                         phases: vec![].try_into().unwrap(),
                     },
                 )),
@@ -5996,9 +5991,9 @@ mod tests {
                 "GeneralizedTxSet",
             ),
             (
-                StellarMessage::DontHave(stellar_xdr::curr::DontHave {
-                    type_: stellar_xdr::curr::MessageType::TxSet,
-                    req_hash: stellar_xdr::curr::Uint256([0u8; 32]),
+                StellarMessage::DontHave(stellar_xdr::DontHave {
+                    type_: stellar_xdr::MessageType::TxSet,
+                    req_hash: stellar_xdr::Uint256([0u8; 32]),
                 }),
                 true,
                 "DontHave",
@@ -7926,17 +7921,17 @@ mod tests {
         let pending = PendingLedgerClose {
             handle: tokio::task::spawn_blocking(|| {
                 Ok(henyey_ledger::LedgerCloseResult {
-                    header: stellar_xdr::curr::LedgerHeader {
+                    header: stellar_xdr::LedgerHeader {
                         ledger_version: 24,
-                        previous_ledger_hash: stellar_xdr::curr::Hash([0u8; 32]),
-                        scp_value: stellar_xdr::curr::StellarValue {
-                            tx_set_hash: stellar_xdr::curr::Hash([0u8; 32]),
-                            close_time: stellar_xdr::curr::TimePoint(1),
-                            upgrades: stellar_xdr::curr::VecM::default(),
-                            ext: stellar_xdr::curr::StellarValueExt::Basic,
+                        previous_ledger_hash: stellar_xdr::Hash([0u8; 32]),
+                        scp_value: stellar_xdr::StellarValue {
+                            tx_set_hash: stellar_xdr::Hash([0u8; 32]),
+                            close_time: stellar_xdr::TimePoint(1),
+                            upgrades: stellar_xdr::VecM::default(),
+                            ext: stellar_xdr::StellarValueExt::Basic,
                         },
-                        tx_set_result_hash: stellar_xdr::curr::Hash([0u8; 32]),
-                        bucket_list_hash: stellar_xdr::curr::Hash([0u8; 32]),
+                        tx_set_result_hash: stellar_xdr::Hash([0u8; 32]),
+                        bucket_list_hash: stellar_xdr::Hash([0u8; 32]),
                         ledger_seq: 1,
                         total_coins: 0,
                         fee_pool: 0,
@@ -7946,12 +7941,12 @@ mod tests {
                         base_reserve: 5_000_000,
                         max_tx_set_size: 100,
                         skip_list: [
-                            stellar_xdr::curr::Hash([0u8; 32]),
-                            stellar_xdr::curr::Hash([0u8; 32]),
-                            stellar_xdr::curr::Hash([0u8; 32]),
-                            stellar_xdr::curr::Hash([0u8; 32]),
+                            stellar_xdr::Hash([0u8; 32]),
+                            stellar_xdr::Hash([0u8; 32]),
+                            stellar_xdr::Hash([0u8; 32]),
+                            stellar_xdr::Hash([0u8; 32]),
                         ],
-                        ext: stellar_xdr::curr::LedgerHeaderExt::V0,
+                        ext: stellar_xdr::LedgerHeaderExt::V0,
                     },
                     header_hash: henyey_common::Hash256::ZERO,
                     tx_results: Vec::new(),
@@ -8136,17 +8131,17 @@ mod tests {
         let pending = PendingLedgerClose {
             handle: tokio::task::spawn_blocking(|| {
                 Ok(henyey_ledger::LedgerCloseResult {
-                    header: stellar_xdr::curr::LedgerHeader {
+                    header: stellar_xdr::LedgerHeader {
                         ledger_version: 24,
-                        previous_ledger_hash: stellar_xdr::curr::Hash([0u8; 32]),
-                        scp_value: stellar_xdr::curr::StellarValue {
-                            tx_set_hash: stellar_xdr::curr::Hash([0u8; 32]),
-                            close_time: stellar_xdr::curr::TimePoint(1),
-                            upgrades: stellar_xdr::curr::VecM::default(),
-                            ext: stellar_xdr::curr::StellarValueExt::Basic,
+                        previous_ledger_hash: stellar_xdr::Hash([0u8; 32]),
+                        scp_value: stellar_xdr::StellarValue {
+                            tx_set_hash: stellar_xdr::Hash([0u8; 32]),
+                            close_time: stellar_xdr::TimePoint(1),
+                            upgrades: stellar_xdr::VecM::default(),
+                            ext: stellar_xdr::StellarValueExt::Basic,
                         },
-                        tx_set_result_hash: stellar_xdr::curr::Hash([0u8; 32]),
-                        bucket_list_hash: stellar_xdr::curr::Hash([0u8; 32]),
+                        tx_set_result_hash: stellar_xdr::Hash([0u8; 32]),
+                        bucket_list_hash: stellar_xdr::Hash([0u8; 32]),
                         ledger_seq: 1,
                         total_coins: 0,
                         fee_pool: 0,
@@ -8156,12 +8151,12 @@ mod tests {
                         base_reserve: 5_000_000,
                         max_tx_set_size: 100,
                         skip_list: [
-                            stellar_xdr::curr::Hash([0u8; 32]),
-                            stellar_xdr::curr::Hash([0u8; 32]),
-                            stellar_xdr::curr::Hash([0u8; 32]),
-                            stellar_xdr::curr::Hash([0u8; 32]),
+                            stellar_xdr::Hash([0u8; 32]),
+                            stellar_xdr::Hash([0u8; 32]),
+                            stellar_xdr::Hash([0u8; 32]),
+                            stellar_xdr::Hash([0u8; 32]),
                         ],
-                        ext: stellar_xdr::curr::LedgerHeaderExt::V0,
+                        ext: stellar_xdr::LedgerHeaderExt::V0,
                     },
                     header_hash: henyey_common::Hash256::ZERO,
                     tx_results: Vec::new(),
@@ -8267,7 +8262,7 @@ mod tests {
     /// empty tx_queue and subtract.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_post_close_revalidation_is_single_snapshot() {
-        use stellar_xdr::curr::{
+        use stellar_xdr::{
             CreateAccountOp, DecoratedSignature, Memo, MuxedAccount, Operation, OperationBody,
             Preconditions, SequenceNumber, SignatureHint, Transaction, TransactionExt,
             TransactionV1Envelope, Uint256,
@@ -8278,12 +8273,11 @@ mod tests {
         /// every `load_account` call returns `None` — exercising the full
         /// re-validation path (source lookup, ops-auth lookup) without
         /// needing a populated bucket list.
-        fn make_synthetic_envelope(seed: u8) -> stellar_xdr::curr::TransactionEnvelope {
+        fn make_synthetic_envelope(seed: u8) -> stellar_xdr::TransactionEnvelope {
             let source = MuxedAccount::Ed25519(Uint256([seed; 32]));
-            let dest =
-                stellar_xdr::curr::AccountId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
-                    Uint256([seed.wrapping_add(1); 32]),
-                ));
+            let dest = stellar_xdr::AccountId(stellar_xdr::PublicKey::PublicKeyTypeEd25519(
+                Uint256([seed.wrapping_add(1); 32]),
+            ));
             let tx = Transaction {
                 source_account: source,
                 fee: 100,
@@ -8301,11 +8295,11 @@ mod tests {
                 .unwrap(),
                 ext: TransactionExt::V0,
             };
-            stellar_xdr::curr::TransactionEnvelope::Tx(TransactionV1Envelope {
+            stellar_xdr::TransactionEnvelope::Tx(TransactionV1Envelope {
                 tx,
                 signatures: vec![DecoratedSignature {
                     hint: SignatureHint([0u8; 4]),
-                    signature: stellar_xdr::curr::Signature(vec![0u8; 64].try_into().unwrap()),
+                    signature: stellar_xdr::Signature(vec![0u8; 64].try_into().unwrap()),
                 }]
                 .try_into()
                 .unwrap(),
@@ -8317,17 +8311,17 @@ mod tests {
             let pending = PendingLedgerClose {
                 handle: tokio::task::spawn_blocking(|| {
                     Ok(henyey_ledger::LedgerCloseResult {
-                        header: stellar_xdr::curr::LedgerHeader {
+                        header: stellar_xdr::LedgerHeader {
                             ledger_version: 24,
-                            previous_ledger_hash: stellar_xdr::curr::Hash([0u8; 32]),
-                            scp_value: stellar_xdr::curr::StellarValue {
-                                tx_set_hash: stellar_xdr::curr::Hash([0u8; 32]),
-                                close_time: stellar_xdr::curr::TimePoint(1),
-                                upgrades: stellar_xdr::curr::VecM::default(),
-                                ext: stellar_xdr::curr::StellarValueExt::Basic,
+                            previous_ledger_hash: stellar_xdr::Hash([0u8; 32]),
+                            scp_value: stellar_xdr::StellarValue {
+                                tx_set_hash: stellar_xdr::Hash([0u8; 32]),
+                                close_time: stellar_xdr::TimePoint(1),
+                                upgrades: stellar_xdr::VecM::default(),
+                                ext: stellar_xdr::StellarValueExt::Basic,
                             },
-                            tx_set_result_hash: stellar_xdr::curr::Hash([0u8; 32]),
-                            bucket_list_hash: stellar_xdr::curr::Hash([0u8; 32]),
+                            tx_set_result_hash: stellar_xdr::Hash([0u8; 32]),
+                            bucket_list_hash: stellar_xdr::Hash([0u8; 32]),
                             ledger_seq: 1,
                             total_coins: 0,
                             fee_pool: 0,
@@ -8337,12 +8331,12 @@ mod tests {
                             base_reserve: 5_000_000,
                             max_tx_set_size: 100,
                             skip_list: [
-                                stellar_xdr::curr::Hash([0u8; 32]),
-                                stellar_xdr::curr::Hash([0u8; 32]),
-                                stellar_xdr::curr::Hash([0u8; 32]),
-                                stellar_xdr::curr::Hash([0u8; 32]),
+                                stellar_xdr::Hash([0u8; 32]),
+                                stellar_xdr::Hash([0u8; 32]),
+                                stellar_xdr::Hash([0u8; 32]),
+                                stellar_xdr::Hash([0u8; 32]),
                             ],
-                            ext: stellar_xdr::curr::LedgerHeaderExt::V0,
+                            ext: stellar_xdr::LedgerHeaderExt::V0,
                         },
                         header_hash: henyey_common::Hash256::ZERO,
                         tx_results: Vec::new(),
@@ -8473,9 +8467,7 @@ mod tests {
     /// Helper: construct a valid signed XDR blob for StellarValue with the
     /// given tx_set_hash so check_ledger_close parses it successfully.
     fn mk_stellar_value_xdr(tx_set_hash: [u8; 32]) -> Vec<u8> {
-        use stellar_xdr::curr::{
-            Hash, Limits, StellarValue, StellarValueExt, TimePoint, VecM, WriteXdr,
-        };
+        use stellar_xdr::{Hash, Limits, StellarValue, StellarValueExt, TimePoint, VecM, WriteXdr};
         let sv = StellarValue {
             tx_set_hash: Hash(tx_set_hash),
             close_time: TimePoint(12345),
@@ -8487,8 +8479,8 @@ mod tests {
 
     /// Helper: wrap the XDR bytes into a `Value` (BytesM<64>-ish type for
     /// ScpDriver::record_externalized).
-    fn mk_value(xdr_bytes: Vec<u8>) -> stellar_xdr::curr::Value {
-        stellar_xdr::curr::Value(
+    fn mk_value(xdr_bytes: Vec<u8>) -> stellar_xdr::Value {
+        stellar_xdr::Value(
             xdr_bytes
                 .try_into()
                 .expect("StellarValue XDR fits in Value"),
@@ -8544,7 +8536,7 @@ mod tests {
                     tx_set_hash: henyey_common::Hash256::from_bytes([0x11; 32]),
                     tx_set: None,
                     upgrades: Vec::new(),
-                    stellar_value_ext: stellar_xdr::curr::StellarValueExt::Basic,
+                    stellar_value_ext: stellar_xdr::StellarValueExt::Basic,
                 },
             );
             buf.insert(
@@ -8555,7 +8547,7 @@ mod tests {
                     tx_set_hash: henyey_common::Hash256::from_bytes([0x77; 32]),
                     tx_set: None,
                     upgrades: Vec::new(),
-                    stellar_value_ext: stellar_xdr::curr::StellarValueExt::Basic,
+                    stellar_value_ext: stellar_xdr::StellarValueExt::Basic,
                 },
             );
         }
@@ -8700,7 +8692,7 @@ mod tests {
                     tx_set_hash: missing_hash,
                     tx_set: None,
                     upgrades: Vec::new(),
-                    stellar_value_ext: stellar_xdr::curr::StellarValueExt::Basic,
+                    stellar_value_ext: stellar_xdr::StellarValueExt::Basic,
                 },
             );
         }
@@ -8770,7 +8762,7 @@ mod tests {
                     tx_set_hash: hash_a,
                     tx_set: None,
                     upgrades: Vec::new(),
-                    stellar_value_ext: stellar_xdr::curr::StellarValueExt::Basic,
+                    stellar_value_ext: stellar_xdr::StellarValueExt::Basic,
                 },
             );
         }
@@ -9199,7 +9191,7 @@ mod tests {
     /// The tx will fail validation (no real account), but the freshness
     /// gate fires before validation, so the tx content doesn't matter.
     fn make_dummy_tx_envelope() -> TransactionEnvelope {
-        use stellar_xdr::curr::{
+        use stellar_xdr::{
             CreateAccountOp, DecoratedSignature, Memo, MuxedAccount, Operation, OperationBody,
             Preconditions, SequenceNumber, SignatureHint, Transaction, TransactionExt,
             TransactionV1Envelope, Uint256,
@@ -9213,8 +9205,8 @@ mod tests {
             operations: vec![Operation {
                 source_account: None,
                 body: OperationBody::CreateAccount(CreateAccountOp {
-                    destination: stellar_xdr::curr::AccountId(
-                        stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(Uint256([2u8; 32])),
+                    destination: stellar_xdr::AccountId(
+                        stellar_xdr::PublicKey::PublicKeyTypeEd25519(Uint256([2u8; 32])),
                     ),
                     starting_balance: 1_000_000_000,
                 }),
@@ -9227,7 +9219,7 @@ mod tests {
             tx,
             signatures: vec![DecoratedSignature {
                 hint: SignatureHint([0u8; 4]),
-                signature: stellar_xdr::curr::Signature(vec![0u8; 64].try_into().unwrap()),
+                signature: stellar_xdr::Signature(vec![0u8; 64].try_into().unwrap()),
             }]
             .try_into()
             .unwrap(),
@@ -10894,12 +10886,10 @@ mod tests {
         // Activate survey_data so the Idle path sees survey_is_active() == true.
         {
             let mut state = app.survey_state.write().await;
-            let msg = stellar_xdr::curr::TimeSlicedSurveyStartCollectingMessage {
-                surveyor_id: stellar_xdr::curr::NodeId(
-                    stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(stellar_xdr::curr::Uint256(
-                        [0u8; 32],
-                    )),
-                ),
+            let msg = stellar_xdr::TimeSlicedSurveyStartCollectingMessage {
+                surveyor_id: stellar_xdr::NodeId(stellar_xdr::PublicKey::PublicKeyTypeEd25519(
+                    stellar_xdr::Uint256([0u8; 32]),
+                )),
                 nonce: 99,
                 ledger_num: 1,
             };
@@ -11219,7 +11209,7 @@ mod tests {
             tx_set_hash,
             tx_set,
             upgrades: Vec::new(),
-            stellar_value_ext: stellar_xdr::curr::StellarValueExt::Basic,
+            stellar_value_ext: stellar_xdr::StellarValueExt::Basic,
         }
     }
 
@@ -11392,7 +11382,7 @@ mod tests {
                     tx_set_hash: henyey_common::Hash256::from_bytes([0xAA; 32]),
                     tx_set: None,
                     upgrades: Vec::new(),
-                    stellar_value_ext: stellar_xdr::curr::StellarValueExt::Basic,
+                    stellar_value_ext: stellar_xdr::StellarValueExt::Basic,
                 },
             );
         }
@@ -11429,7 +11419,7 @@ mod tests {
                     tx_set_hash: henyey_common::Hash256::from_bytes([0xBB; 32]),
                     tx_set: None,
                     upgrades: Vec::new(),
-                    stellar_value_ext: stellar_xdr::curr::StellarValueExt::Basic,
+                    stellar_value_ext: stellar_xdr::StellarValueExt::Basic,
                 },
             );
         }
@@ -12638,9 +12628,9 @@ mod tests {
     // ---- SurveyMessageSigner / SurveyRequestSigner tests ----
 
     /// Helper: construct the expected local node ID from an App's keypair.
-    fn expected_node_id(app: &App) -> stellar_xdr::curr::NodeId {
-        stellar_xdr::curr::NodeId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
-            stellar_xdr::curr::Uint256(*app.keypair.public_key().as_bytes()),
+    fn expected_node_id(app: &App) -> stellar_xdr::NodeId {
+        stellar_xdr::NodeId(stellar_xdr::PublicKey::PublicKeyTypeEd25519(
+            stellar_xdr::Uint256(*app.keypair.public_key().as_bytes()),
         ))
     }
 
@@ -12689,8 +12679,8 @@ mod tests {
     async fn test_survey_request_signer_build_request() {
         let app = survey_test_app().await;
         let nonce = 123u32;
-        let peer_id = henyey_overlay::PeerId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
-            stellar_xdr::curr::Uint256([1u8; 32]),
+        let peer_id = henyey_overlay::PeerId(stellar_xdr::PublicKey::PublicKeyTypeEd25519(
+            stellar_xdr::Uint256([1u8; 32]),
         ));
 
         app.herder.set_tracking_for_testing(31, 300);
@@ -12704,7 +12694,7 @@ mod tests {
         assert_eq!(signed.request.outbound_peers_index, 10);
         assert_eq!(
             signed.request.request.surveyed_peer_id,
-            stellar_xdr::curr::NodeId(peer_id.0.clone())
+            stellar_xdr::NodeId(peer_id.0.clone())
         );
         assert_eq!(
             signed.request.request.surveyor_peer_id,
@@ -12723,11 +12713,11 @@ mod tests {
     async fn test_survey_request_signer_reads_fresh_ledger_per_call() {
         let app = survey_test_app().await;
         let nonce = 200u32;
-        let peer_a = henyey_overlay::PeerId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
-            stellar_xdr::curr::Uint256([2u8; 32]),
+        let peer_a = henyey_overlay::PeerId(stellar_xdr::PublicKey::PublicKeyTypeEd25519(
+            stellar_xdr::Uint256([2u8; 32]),
         ));
-        let peer_b = henyey_overlay::PeerId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
-            stellar_xdr::curr::Uint256([3u8; 32]),
+        let peer_b = henyey_overlay::PeerId(stellar_xdr::PublicKey::PublicKeyTypeEd25519(
+            stellar_xdr::Uint256([3u8; 32]),
         ));
 
         // Set tracking to slot 11 (ledger_index = 10)
@@ -12781,7 +12771,7 @@ mod tests {
         let surveyor_id = expected_node_id(&app);
         {
             let mut state = app.survey_state.write().await;
-            let start_msg = stellar_xdr::curr::TimeSlicedSurveyStartCollectingMessage {
+            let start_msg = stellar_xdr::TimeSlicedSurveyStartCollectingMessage {
                 surveyor_id: surveyor_id.clone(),
                 nonce,
                 ledger_num: 10,
@@ -12857,7 +12847,7 @@ mod tests {
                 assert_eq!(signed.request.nonce, nonce, "nonce must match");
                 assert_eq!(
                     signed.request.request.surveyed_peer_id,
-                    stellar_xdr::curr::NodeId(peer_id.0.clone()),
+                    stellar_xdr::NodeId(peer_id.0.clone()),
                     "surveyed_peer_id must match injected peer"
                 );
                 assert_eq!(
@@ -13403,7 +13393,7 @@ mod tests {
         );
         for msg in &received {
             match msg {
-                stellar_xdr::curr::StellarMessage::GetScpState(seq) => {
+                stellar_xdr::StellarMessage::GetScpState(seq) => {
                     assert_eq!(
                         *seq, expected_seq,
                         "GetScpState should use low-watermark seq {}, got {}",
@@ -13427,7 +13417,7 @@ mod tests {
     /// which would have broadcast the older envelopes too.
     #[tokio::test]
     async fn test_out_of_sync_recovery_uses_latest_slot_rebroadcast_then_bounded_scp_pull() {
-        use stellar_xdr::curr::{
+        use stellar_xdr::{
             NodeId, PublicKey, ScpNomination, ScpStatement, ScpStatementPledges, Signature, Uint256,
         };
 
@@ -13460,7 +13450,7 @@ mod tests {
         let make_nom_envelope = |slot_index: u64, node_bytes: u8| -> ScpEnvelope {
             let node_id = NodeId(PublicKey::PublicKeyTypeEd25519(Uint256([node_bytes; 32])));
             let nomination = ScpNomination {
-                quorum_set_hash: stellar_xdr::curr::Hash([0xAA; 32]),
+                quorum_set_hash: stellar_xdr::Hash([0xAA; 32]),
                 votes: vec![vec![slot_index as u8].try_into().unwrap()]
                     .try_into()
                     .unwrap(),
@@ -13531,7 +13521,7 @@ mod tests {
 
         // Drain all messages from peers.
         let drain =
-            |rx: &mut henyey_overlay::TestPeerReceiver| -> Vec<stellar_xdr::curr::StellarMessage> {
+            |rx: &mut henyey_overlay::TestPeerReceiver| -> Vec<stellar_xdr::StellarMessage> {
                 let mut msgs = Vec::new();
                 while let Some(msg) = rx.try_recv() {
                     msgs.push(msg);
@@ -13547,7 +13537,7 @@ mod tests {
             .iter()
             .flat_map(|msgs| {
                 msgs.iter().filter_map(|m| match m {
-                    stellar_xdr::curr::StellarMessage::ScpMessage(env) => Some(env),
+                    stellar_xdr::StellarMessage::ScpMessage(env) => Some(env),
                     _ => None,
                 })
             })
@@ -13592,7 +13582,7 @@ mod tests {
             .iter()
             .map(|msgs| {
                 msgs.iter()
-                    .filter(|m| matches!(m, stellar_xdr::curr::StellarMessage::GetScpState(s) if *s == expected_seq))
+                    .filter(|m| matches!(m, stellar_xdr::StellarMessage::GetScpState(s) if *s == expected_seq))
                     .count()
             })
             .sum();
@@ -13708,7 +13698,7 @@ mod tests {
 
         // Drain all messages from the three peer receivers.
         let drain =
-            |rx: &mut henyey_overlay::TestPeerReceiver| -> Vec<stellar_xdr::curr::StellarMessage> {
+            |rx: &mut henyey_overlay::TestPeerReceiver| -> Vec<stellar_xdr::StellarMessage> {
                 let mut msgs = Vec::new();
                 while let Some(msg) = rx.try_recv() {
                     msgs.push(msg);
@@ -13727,7 +13717,7 @@ mod tests {
             .map(|msgs| {
                 msgs.iter()
                     .filter(|m| {
-                        matches!(m, stellar_xdr::curr::StellarMessage::GetScpState(s) if *s == expected_seq)
+                        matches!(m, stellar_xdr::StellarMessage::GetScpState(s) if *s == expected_seq)
                     })
                     .count()
             })

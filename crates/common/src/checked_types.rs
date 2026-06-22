@@ -12,9 +12,7 @@
 
 use std::fmt;
 
-use stellar_xdr::curr::{
-    AccountEntry, AccountEntryExt, Liabilities, TrustLineEntry, TrustLineEntryExt,
-};
+use stellar_xdr::{AccountEntry, AccountEntryExt, Liabilities, TrustLineEntry, TrustLineEntryExt};
 
 /// Error type for checked arithmetic operations on consensus-critical values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -465,7 +463,7 @@ mod tests {
     // ── Balance direction guard tests ──
 
     fn make_account(balance: i64) -> AccountEntry {
-        use stellar_xdr::curr::*;
+        use stellar_xdr::*;
         AccountEntry {
             account_id: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([0; 32]))),
             balance,
@@ -481,7 +479,7 @@ mod tests {
     }
 
     fn make_trustline(balance: i64, limit: i64) -> TrustLineEntry {
-        use stellar_xdr::curr::*;
+        use stellar_xdr::*;
         TrustLineEntry {
             account_id: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([0; 32]))),
             asset: TrustLineAsset::CreditAlphanum4(AlphaNum4 {

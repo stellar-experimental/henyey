@@ -33,7 +33,7 @@ use parking_lot::{Mutex, RwLock};
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
-use stellar_xdr::curr::StellarMessage;
+use stellar_xdr::StellarMessage;
 use tracing::{debug, trace, warn};
 
 use crate::PeerId;
@@ -467,7 +467,7 @@ pub struct FloodGateStats {
 ///
 /// This matches stellar-core's `xdrBlake2()` used in `Floodgate::broadcast()`.
 pub fn compute_message_hash(message: &StellarMessage) -> Hash256 {
-    use stellar_xdr::curr::{Limits, WriteXdr};
+    use stellar_xdr::{Limits, WriteXdr};
     let bytes = message
         .to_xdr(Limits::none())
         .expect("XDR serialization of StellarMessage must not fail");
@@ -520,7 +520,7 @@ mod tests {
     /// would silently waste CPU without a wire-visible failure.
     #[test]
     fn test_flood_dedup_hash_is_blake2b_not_sha256() {
-        use stellar_xdr::curr::{Limits, WriteXdr};
+        use stellar_xdr::{Limits, WriteXdr};
 
         let message = StellarMessage::Peers(Default::default());
         let bytes = message.to_xdr(Limits::none()).unwrap();
@@ -619,7 +619,7 @@ mod tests {
 
     #[test]
     fn test_flood_record() {
-        let message = StellarMessage::Peers(stellar_xdr::curr::VecM::default());
+        let message = StellarMessage::Peers(stellar_xdr::VecM::default());
         let record = FloodRecord::new(message, None);
 
         assert!(!record.hash.is_zero());
@@ -733,9 +733,8 @@ mod tests {
         // Pull-control messages are flood messages but NOT gate-tracked
         let advert = StellarMessage::FloodAdvert(Default::default());
         let demand = StellarMessage::FloodDemand(Default::default());
-        let tx = StellarMessage::Transaction(stellar_xdr::curr::TransactionEnvelope::TxV0(
-            Default::default(),
-        ));
+        let tx =
+            StellarMessage::Transaction(stellar_xdr::TransactionEnvelope::TxV0(Default::default()));
 
         // Pull-control messages are flood messages but NOT gate-tracked
         assert!(helpers::is_flood_message(&advert));

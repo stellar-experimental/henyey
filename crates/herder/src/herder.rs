@@ -56,7 +56,7 @@ use henyey_common::{Hash256, NetworkId};
 use henyey_crypto::{PublicKey, SecretKey};
 use henyey_ledger::LedgerManager;
 use henyey_scp::{SlotIndex, SCP};
-use stellar_xdr::curr::{
+use stellar_xdr::{
     EnvelopeType, LedgerCloseValueSignature, LedgerHeader, LedgerUpgrade, Limits, NodeId, ReadXdr,
     ScpEnvelope, ScpQuorumSet, ScpStatementPledges, Signature as XdrSignature, StellarValue,
     StellarValueExt, TimePoint, TransactionEnvelope, Uint256, UpgradeType, Value, WriteXdr,
@@ -354,7 +354,7 @@ pub struct HerderConfig {
     pub max_tx_set_size: usize,
 
     /// Protocol upgrades this validator proposes to include in nominations.
-    pub proposed_upgrades: Vec<stellar_xdr::curr::LedgerUpgrade>,
+    pub proposed_upgrades: Vec<stellar_xdr::LedgerUpgrade>,
 
     /// Maximum supported protocol version for upgrade validation.
     pub max_protocol_version: u32,
@@ -701,9 +701,9 @@ impl Herder {
             );
             for v in quorum_set.validators.iter() {
                 let key_hex = match &v.0 {
-                    stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
-                        stellar_xdr::curr::Uint256(bytes),
-                    ) => hex::encode(bytes),
+                    stellar_xdr::PublicKey::PublicKeyTypeEd25519(stellar_xdr::Uint256(bytes)) => {
+                        hex::encode(bytes)
+                    }
                 };
                 info!(validator = %key_hex, "Quorum set validator");
             }
@@ -839,15 +839,13 @@ impl Herder {
                     }
                     let _guard = Guard(&manager_for_thread);
 
-                    use stellar_xdr::curr::{Limits, WriteXdr};
+                    use stellar_xdr::{Limits, WriteXdr};
 
                     let envelopes = scp.get_latest_messages_send(slot);
 
-                    let mut tx_sets: Vec<(stellar_xdr::curr::Hash, Vec<u8>)> = Vec::new();
-                    let mut quorum_sets: Vec<(
-                        stellar_xdr::curr::Hash,
-                        stellar_xdr::curr::ScpQuorumSet,
-                    )> = Vec::new();
+                    let mut tx_sets: Vec<(stellar_xdr::Hash, Vec<u8>)> = Vec::new();
+                    let mut quorum_sets: Vec<(stellar_xdr::Hash, stellar_xdr::ScpQuorumSet)> =
+                        Vec::new();
 
                     for envelope in &envelopes {
                         for hash in crate::persistence::get_tx_set_hashes(envelope) {
@@ -1022,7 +1020,7 @@ impl Herder {
     pub fn test_inject_externalizing_envelope(
         &self,
         slot: u64,
-        envelope: stellar_xdr::curr::ScpEnvelope,
+        envelope: stellar_xdr::ScpEnvelope,
     ) {
         self.scp.test_inject_externalizing_envelope(slot, envelope);
     }
@@ -1034,8 +1032,8 @@ impl Herder {
     #[doc(hidden)]
     pub fn test_store_quorum_set(
         &self,
-        node_id: &stellar_xdr::curr::NodeId,
-        qset: stellar_xdr::curr::ScpQuorumSet,
+        node_id: &stellar_xdr::NodeId,
+        qset: stellar_xdr::ScpQuorumSet,
     ) {
         self.scp_driver.test_store_quorum_set(node_id, qset);
     }
@@ -1363,10 +1361,10 @@ impl Herder {
     }
 
     /// Return the set of node IDs from the local quorum set (if configured).
-    pub fn local_quorum_nodes(&self) -> std::collections::HashSet<stellar_xdr::curr::NodeId> {
+    pub fn local_quorum_nodes(&self) -> std::collections::HashSet<stellar_xdr::NodeId> {
         fn collect_nodes(
-            quorum_set: &stellar_xdr::curr::ScpQuorumSet,
-            acc: &mut std::collections::HashSet<stellar_xdr::curr::NodeId>,
+            quorum_set: &stellar_xdr::ScpQuorumSet,
+            acc: &mut std::collections::HashSet<stellar_xdr::NodeId>,
         ) {
             for validator in quorum_set.validators.iter() {
                 acc.insert(validator.clone());
@@ -1767,7 +1765,7 @@ impl Herder {
 
         // Check all values in the envelope based on statement type
         // Returns true if ANY value passes (conservative / permissive)
-        use stellar_xdr::curr::ScpStatementPledges;
+        use stellar_xdr::ScpStatementPledges;
         match &envelope.statement.pledges {
             ScpStatementPledges::Nominate(nom) => {
                 nom.accepted.iter().any(|v| check_value(v))
@@ -2111,8 +2109,7 @@ impl Herder {
         // validated helper so malformed EXTERNALIZE values cannot trigger
         // fetch side effects.
         let lcl = self.ledger_manager.current_ledger_seq() as u64;
-        if let stellar_xdr::curr::ScpStatementPledges::Externalize(_) = &envelope.statement.pledges
-        {
+        if let stellar_xdr::ScpStatementPledges::Externalize(_) = &envelope.statement.pledges {
             if let Ok(hashes) = crate::herder_utils::get_validated_tx_set_hashes(&envelope) {
                 for tx_set_hash in hashes {
                     if slot > lcl {
@@ -2194,7 +2191,7 @@ impl Herder {
         let slot = envelope.statement.slot_index;
         let is_externalize = matches!(
             envelope.statement.pledges,
-            stellar_xdr::curr::ScpStatementPledges::Externalize(_)
+            stellar_xdr::ScpStatementPledges::Externalize(_)
         );
 
         debug!(
@@ -3169,8 +3166,8 @@ impl Herder {
             max_tx_set_size: parts.header.max_tx_set_size,
             base_reserve: parts.header.base_reserve,
             flags: match &parts.header.ext {
-                stellar_xdr::curr::LedgerHeaderExt::V0 => 0,
-                stellar_xdr::curr::LedgerHeaderExt::V1(ext) => ext.flags,
+                stellar_xdr::LedgerHeaderExt::V0 => 0,
+                stellar_xdr::LedgerHeaderExt::V1(ext) => ext.flags,
             },
             max_soroban_tx_set_size: parts.max_soroban_tx_set_size,
         };
@@ -3458,8 +3455,8 @@ impl Herder {
             // build path uses the same ledger state as self-validation (#2319).
             let network_id = NetworkId(self.scp_driver.network_id());
             let ledger_flags = match &header.ext {
-                stellar_xdr::curr::LedgerHeaderExt::V0 => 0u32,
-                stellar_xdr::curr::LedgerHeaderExt::V1(v1) => v1.flags,
+                stellar_xdr::LedgerHeaderExt::V0 => 0u32,
+                stellar_xdr::LedgerHeaderExt::V1(v1) => v1.flags,
             };
             let mut validation_ctx = crate::tx_set_utils::TxSetValidationContext::new(
                 header.ledger_seq,
@@ -3686,7 +3683,7 @@ impl Herder {
         close_time: u64,
         upgrades: Vec<UpgradeType>,
     ) -> std::result::Result<StellarValue, HerderError> {
-        let xdr_tx_set_hash = stellar_xdr::curr::Hash(tx_set_hash.0);
+        let xdr_tx_set_hash = stellar_xdr::Hash(tx_set_hash.0);
         let xdr_close_time = TimePoint(close_time);
         let secret_key = self
             .secret_key
@@ -3705,7 +3702,7 @@ impl Herder {
         sign_data.extend_from_slice(&encode_xdr(&xdr_tx_set_hash, "tx set hash")?);
         sign_data.extend_from_slice(&encode_xdr(&xdr_close_time, "close time")?);
         let sig = secret_key.sign(&sign_data);
-        let node_id = NodeId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(Uint256(
+        let node_id = NodeId(stellar_xdr::PublicKey::PublicKeyTypeEd25519(Uint256(
             *secret_key.public_key().as_bytes(),
         )));
 
@@ -3762,7 +3759,7 @@ impl Herder {
     /// queue.
     ///
     /// Matches stellar-core `Herder::sourceAccountPending(AccountID const&)`.
-    pub fn source_account_pending(&self, account_id: &stellar_xdr::curr::AccountId) -> bool {
+    pub fn source_account_pending(&self, account_id: &stellar_xdr::AccountId) -> bool {
         let key = account_key_from_account_id(account_id);
         self.tx_queue
             .pending_accounts()
@@ -4701,7 +4698,7 @@ mod tests {
     use crate::tx_queue::TransactionSet;
     use henyey_crypto::SecretKey;
     use henyey_scp::hash_quorum_set;
-    use stellar_xdr::curr::{
+    use stellar_xdr::{
         EnvelopeType, LedgerCloseValueSignature, LedgerUpgrade, Limits, NodeId as XdrNodeId,
         ReadXdr, ScpBallot, ScpNomination, ScpStatement, ScpStatementExternalize,
         ScpStatementPledges, ScpStatementPrepare, Signature as XdrSignature, StellarValue,
@@ -4753,7 +4750,7 @@ mod tests {
         let tx_set_hash = *tx_set.hash();
         herder.scp_driver.cache_tx_set(tx_set);
 
-        let xdr_tx_set_hash = stellar_xdr::curr::Hash(tx_set_hash.0);
+        let xdr_tx_set_hash = stellar_xdr::Hash(tx_set_hash.0);
         let close_time = TimePoint(1);
 
         // Sign: (networkID, ENVELOPE_TYPE_SCPVALUE, txSetHash, closeTime)
@@ -4764,8 +4761,8 @@ mod tests {
         sign_data.extend_from_slice(&close_time.to_xdr(Limits::none()).expect("xdr"));
         let sig = secret_key.sign(&sign_data);
 
-        let node_id = XdrNodeId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
-            stellar_xdr::curr::Uint256(*secret_key.public_key().as_bytes()),
+        let node_id = XdrNodeId(stellar_xdr::PublicKey::PublicKeyTypeEd25519(
+            stellar_xdr::Uint256(*secret_key.public_key().as_bytes()),
         ));
 
         let stellar_value = StellarValue {
@@ -4774,9 +4771,7 @@ mod tests {
             upgrades: vec![].try_into().unwrap(),
             ext: StellarValueExt::Signed(LedgerCloseValueSignature {
                 node_id,
-                signature: stellar_xdr::curr::Signature(
-                    sig.0.to_vec().try_into().unwrap_or_default(),
-                ),
+                signature: stellar_xdr::Signature(sig.0.to_vec().try_into().unwrap_or_default()),
             }),
         };
         let value_bytes = stellar_value.to_xdr(Limits::none()).unwrap();
@@ -4808,8 +4803,8 @@ mod tests {
         let secret = SecretKey::from_seed(&[1u8; 32]);
         let public = secret.public_key();
 
-        let node_id = XdrNodeId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
-            stellar_xdr::curr::Uint256(*public.as_bytes()),
+        let node_id = XdrNodeId(stellar_xdr::PublicKey::PublicKeyTypeEd25519(
+            stellar_xdr::Uint256(*public.as_bytes()),
         ));
 
         // Include a vote with a valid close time so the envelope passes
@@ -4824,7 +4819,7 @@ mod tests {
             node_id: node_id.clone(),
             slot_index: slot,
             pledges: ScpStatementPledges::Nominate(ScpNomination {
-                quorum_set_hash: stellar_xdr::curr::Hash([0u8; 32]),
+                quorum_set_hash: stellar_xdr::Hash([0u8; 32]),
                 votes: vec![vote].try_into().unwrap(),
                 accepted: vec![].try_into().unwrap(),
             }),
@@ -4847,8 +4842,8 @@ mod tests {
     }
 
     fn make_test_envelope(slot: u64) -> ScpEnvelope {
-        let node_id = XdrNodeId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
-            stellar_xdr::curr::Uint256([0u8; 32]),
+        let node_id = XdrNodeId(stellar_xdr::PublicKey::PublicKeyTypeEd25519(
+            stellar_xdr::Uint256([0u8; 32]),
         ));
 
         ScpEnvelope {
@@ -4856,7 +4851,7 @@ mod tests {
                 node_id,
                 slot_index: slot,
                 pledges: ScpStatementPledges::Nominate(ScpNomination {
-                    quorum_set_hash: stellar_xdr::curr::Hash([0u8; 32]),
+                    quorum_set_hash: stellar_xdr::Hash([0u8; 32]),
                     votes: vec![].try_into().unwrap(),
                     accepted: vec![].try_into().unwrap(),
                 }),
@@ -5279,12 +5274,12 @@ mod tests {
     }
 
     fn make_minimal_tx_envelope() -> TransactionEnvelope {
-        use stellar_xdr::curr::{Memo, TransactionV0, TransactionV0Envelope, TransactionV0Ext};
+        use stellar_xdr::{Memo, TransactionV0, TransactionV0Envelope, TransactionV0Ext};
         TransactionEnvelope::TxV0(TransactionV0Envelope {
             tx: TransactionV0 {
-                source_account_ed25519: stellar_xdr::curr::Uint256([0u8; 32]),
+                source_account_ed25519: stellar_xdr::Uint256([0u8; 32]),
                 fee: 100,
-                seq_num: stellar_xdr::curr::SequenceNumber(1),
+                seq_num: stellar_xdr::SequenceNumber(1),
                 time_bounds: None,
                 memo: Memo::None,
                 operations: vec![].try_into().unwrap(),
@@ -5318,7 +5313,7 @@ mod tests {
     /// must return TryAgainLater (stellar-core HerderImpl.cpp:627-645).
     #[test]
     fn test_receive_transaction_cross_type_conflict_returns_try_again_later() {
-        use stellar_xdr::curr::{
+        use stellar_xdr::{
             CreateAccountOp, DecoratedSignature, HostFunction, InvokeContractArgs,
             InvokeHostFunctionOp, Memo, MuxedAccount, Operation, OperationBody, Preconditions,
             PublicKey, ScAddress, ScSymbol, SequenceNumber, SignatureHint, StringM, Transaction,
@@ -5339,9 +5334,9 @@ mod tests {
             operations: vec![Operation {
                 source_account: None,
                 body: OperationBody::CreateAccount(CreateAccountOp {
-                    destination: stellar_xdr::curr::AccountId(PublicKey::PublicKeyTypeEd25519(
-                        Uint256([255u8; 32]),
-                    )),
+                    destination: stellar_xdr::AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(
+                        [255u8; 32],
+                    ))),
                     starting_balance: 1000000000,
                 }),
             }]
@@ -5368,7 +5363,7 @@ mod tests {
         let host_function = HostFunction::InvokeContract(InvokeContractArgs {
             contract_address: ScAddress::default(),
             function_name,
-            args: VecM::<stellar_xdr::curr::ScVal>::default(),
+            args: VecM::<stellar_xdr::ScVal>::default(),
         });
         let soroban_tx = Transaction {
             source_account: MuxedAccount::Ed25519(Uint256([42u8; 32])),
@@ -5530,12 +5525,12 @@ mod tests {
     /// Create a StellarValue with a given close time and encode to Value.
     fn make_value_with_close_time(close_time: u64) -> Value {
         let sv = StellarValue {
-            tx_set_hash: stellar_xdr::curr::Hash([0u8; 32]),
+            tx_set_hash: stellar_xdr::Hash([0u8; 32]),
             close_time: TimePoint(close_time),
             upgrades: vec![].try_into().unwrap(),
             ext: StellarValueExt::Signed(LedgerCloseValueSignature {
-                node_id: XdrNodeId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
-                    stellar_xdr::curr::Uint256([0u8; 32]),
+                node_id: XdrNodeId(stellar_xdr::PublicKey::PublicKeyTypeEd25519(
+                    stellar_xdr::Uint256([0u8; 32]),
                 )),
                 signature: XdrSignature(vec![0u8; 64].try_into().unwrap()),
             }),
@@ -5545,8 +5540,8 @@ mod tests {
 
     /// Create a nomination envelope with a specific close time in its voted values.
     fn make_nomination_envelope_with_close_time(slot: u64, close_time: u64) -> ScpEnvelope {
-        let node_id = XdrNodeId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
-            stellar_xdr::curr::Uint256([1u8; 32]),
+        let node_id = XdrNodeId(stellar_xdr::PublicKey::PublicKeyTypeEd25519(
+            stellar_xdr::Uint256([1u8; 32]),
         ));
         let value = make_value_with_close_time(close_time);
 
@@ -5555,7 +5550,7 @@ mod tests {
                 node_id,
                 slot_index: slot,
                 pledges: ScpStatementPledges::Nominate(ScpNomination {
-                    quorum_set_hash: stellar_xdr::curr::Hash([0u8; 32]),
+                    quorum_set_hash: stellar_xdr::Hash([0u8; 32]),
                     votes: vec![value].try_into().unwrap(),
                     accepted: vec![].try_into().unwrap(),
                 }),
@@ -6002,10 +5997,10 @@ mod tests {
         let config = HerderConfig {
             is_validator: true,
             node_public_key: public,
-            local_quorum_set: Some(stellar_xdr::curr::ScpQuorumSet {
+            local_quorum_set: Some(stellar_xdr::ScpQuorumSet {
                 threshold: 1,
-                validators: vec![stellar_xdr::curr::NodeId(
-                    stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(stellar_xdr::curr::Uint256(
+                validators: vec![stellar_xdr::NodeId(
+                    stellar_xdr::PublicKey::PublicKeyTypeEd25519(stellar_xdr::Uint256(
                         *public.as_bytes(),
                     )),
                 )]
@@ -6106,18 +6101,15 @@ mod tests {
         let seed = [7u8; 32];
         let secret = SecretKey::from_seed(&seed);
         let public = secret.public_key();
-        let local_node_id =
-            stellar_xdr::curr::NodeId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
-                stellar_xdr::curr::Uint256(*public.as_bytes()),
-            ));
-        let fake_peer1 =
-            stellar_xdr::curr::NodeId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
-                stellar_xdr::curr::Uint256([1u8; 32]),
-            ));
-        let fake_peer2 =
-            stellar_xdr::curr::NodeId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
-                stellar_xdr::curr::Uint256([2u8; 32]),
-            ));
+        let local_node_id = stellar_xdr::NodeId(stellar_xdr::PublicKey::PublicKeyTypeEd25519(
+            stellar_xdr::Uint256(*public.as_bytes()),
+        ));
+        let fake_peer1 = stellar_xdr::NodeId(stellar_xdr::PublicKey::PublicKeyTypeEd25519(
+            stellar_xdr::Uint256([1u8; 32]),
+        ));
+        let fake_peer2 = stellar_xdr::NodeId(stellar_xdr::PublicKey::PublicKeyTypeEd25519(
+            stellar_xdr::Uint256([2u8; 32]),
+        ));
 
         let quorum_set = ScpQuorumSet {
             threshold: 2,
@@ -6194,7 +6186,7 @@ mod tests {
     /// without a cross-module visibility change.
     fn make_lm_at_seq_for_stale_test(ledger_seq: u32) -> Arc<henyey_ledger::LedgerManager> {
         use henyey_ledger::{LedgerManager, LedgerManagerConfig};
-        use stellar_xdr::curr::{
+        use stellar_xdr::{
             Hash, LedgerHeader, LedgerHeaderExt, StellarValue, StellarValueExt, TimePoint, VecM,
         };
         let config = LedgerManagerConfig {
@@ -6257,10 +6249,9 @@ mod tests {
         let seed = [42u8; 32];
         let secret = SecretKey::from_seed(&seed);
         let public = secret.public_key();
-        let local_node_id =
-            stellar_xdr::curr::NodeId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
-                stellar_xdr::curr::Uint256(*public.as_bytes()),
-            ));
+        let local_node_id = stellar_xdr::NodeId(stellar_xdr::PublicKey::PublicKeyTypeEd25519(
+            stellar_xdr::Uint256(*public.as_bytes()),
+        ));
         let quorum_set = ScpQuorumSet {
             threshold: 1,
             validators: vec![local_node_id].try_into().unwrap(),
@@ -6498,7 +6489,7 @@ mod tests {
         // With lcl_close_time = u64::MAX - 100, close_time = u64::MAX - 99,
         // which is always > now + MAX_TIME_SLIP_SECONDS → gate rejects.
         use henyey_ledger::{LedgerManager, LedgerManagerConfig};
-        use stellar_xdr::curr::{
+        use stellar_xdr::{
             Hash, LedgerHeader, LedgerHeaderExt, StellarValue, StellarValueExt, TimePoint, VecM,
         };
         let lm_config = LedgerManagerConfig {
@@ -6593,10 +6584,9 @@ mod tests {
         let seed = [43u8; 32];
         let secret = SecretKey::from_seed(&seed);
         let public = secret.public_key();
-        let local_node_id =
-            stellar_xdr::curr::NodeId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
-                stellar_xdr::curr::Uint256(*public.as_bytes()),
-            ));
+        let local_node_id = stellar_xdr::NodeId(stellar_xdr::PublicKey::PublicKeyTypeEd25519(
+            stellar_xdr::Uint256(*public.as_bytes()),
+        ));
         let quorum_set = ScpQuorumSet {
             threshold: 1,
             validators: vec![local_node_id].try_into().unwrap(),
@@ -6638,7 +6628,7 @@ mod tests {
         close_time: u64,
     ) -> Arc<henyey_ledger::LedgerManager> {
         use henyey_ledger::{LedgerManager, LedgerManagerConfig};
-        use stellar_xdr::curr::{
+        use stellar_xdr::{
             Hash, LedgerHeader, LedgerHeaderExt, StellarValue, StellarValueExt, TimePoint, VecM,
         };
         let config = LedgerManagerConfig {
@@ -6692,10 +6682,9 @@ mod tests {
         let seed = [50u8; 32];
         let secret = SecretKey::from_seed(&seed);
         let public = secret.public_key();
-        let local_node_id =
-            stellar_xdr::curr::NodeId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
-                stellar_xdr::curr::Uint256(*public.as_bytes()),
-            ));
+        let local_node_id = stellar_xdr::NodeId(stellar_xdr::PublicKey::PublicKeyTypeEd25519(
+            stellar_xdr::Uint256(*public.as_bytes()),
+        ));
         let quorum_set = ScpQuorumSet {
             threshold: 1,
             validators: vec![local_node_id].try_into().unwrap(),
@@ -6747,10 +6736,9 @@ mod tests {
         let seed = [51u8; 32];
         let secret = SecretKey::from_seed(&seed);
         let public = secret.public_key();
-        let local_node_id =
-            stellar_xdr::curr::NodeId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
-                stellar_xdr::curr::Uint256(*public.as_bytes()),
-            ));
+        let local_node_id = stellar_xdr::NodeId(stellar_xdr::PublicKey::PublicKeyTypeEd25519(
+            stellar_xdr::Uint256(*public.as_bytes()),
+        ));
         let quorum_set = ScpQuorumSet {
             threshold: 1,
             validators: vec![local_node_id].try_into().unwrap(),
@@ -6937,10 +6925,9 @@ mod tests {
         let seed = [70u8; 32];
         let secret = SecretKey::from_seed(&seed);
         let public = secret.public_key();
-        let local_node_id =
-            stellar_xdr::curr::NodeId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
-                stellar_xdr::curr::Uint256(*public.as_bytes()),
-            ));
+        let local_node_id = stellar_xdr::NodeId(stellar_xdr::PublicKey::PublicKeyTypeEd25519(
+            stellar_xdr::Uint256(*public.as_bytes()),
+        ));
         let quorum_set = ScpQuorumSet {
             threshold: 1,
             validators: vec![local_node_id].try_into().unwrap(),
@@ -7040,10 +7027,9 @@ mod tests {
         let seed = [44u8; 32];
         let secret = SecretKey::from_seed(&seed);
         let public = secret.public_key();
-        let local_node_id =
-            stellar_xdr::curr::NodeId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
-                stellar_xdr::curr::Uint256(*public.as_bytes()),
-            ));
+        let local_node_id = stellar_xdr::NodeId(stellar_xdr::PublicKey::PublicKeyTypeEd25519(
+            stellar_xdr::Uint256(*public.as_bytes()),
+        ));
         let quorum_set = ScpQuorumSet {
             threshold: 1,
             validators: vec![local_node_id].try_into().unwrap(),
@@ -7148,8 +7134,8 @@ mod tests {
     /// with a properly signed StellarValue (STELLAR_VALUE_SIGNED).
     fn make_signed_externalize_from(slot: u64, herder: &Herder, secret: &SecretKey) -> ScpEnvelope {
         let public = secret.public_key();
-        let node_id = XdrNodeId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
-            stellar_xdr::curr::Uint256(*public.as_bytes()),
+        let node_id = XdrNodeId(stellar_xdr::PublicKey::PublicKeyTypeEd25519(
+            stellar_xdr::Uint256(*public.as_bytes()),
         ));
 
         // Use the value helper that caches the tx set and signs properly
@@ -7161,7 +7147,7 @@ mod tests {
             pledges: ScpStatementPledges::Externalize(ScpStatementExternalize {
                 commit: ScpBallot { counter: 1, value },
                 n_h: 1,
-                commit_quorum_set_hash: stellar_xdr::curr::Hash([0u8; 32]),
+                commit_quorum_set_hash: stellar_xdr::Hash([0u8; 32]),
             }),
         };
 
@@ -7777,13 +7763,13 @@ mod tests {
     /// for that quorum set get unblocked.
     #[test]
     fn test_audit_004_store_quorum_set_unblocks_fetching_envelopes() {
-        use stellar_xdr::curr::Hash as XdrHash;
+        use stellar_xdr::Hash as XdrHash;
 
         let herder = make_test_herder();
 
         // Build a sane quorum set with one validator.
-        let node_id = XdrNodeId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
-            stellar_xdr::curr::Uint256([1u8; 32]),
+        let node_id = XdrNodeId(stellar_xdr::PublicKey::PublicKeyTypeEd25519(
+            stellar_xdr::Uint256([1u8; 32]),
         ));
         let quorum_set = ScpQuorumSet {
             threshold: 1,
@@ -7847,7 +7833,7 @@ mod tests {
     /// and permanently strand the envelope).
     #[test]
     fn test_audit_104_qset_missing_routes_through_fetching() {
-        use stellar_xdr::curr::Hash as XdrHash;
+        use stellar_xdr::Hash as XdrHash;
 
         let local_secret = SecretKey::from_seed(&[7u8; 32]);
         let local_public = local_secret.public_key();
@@ -7945,7 +7931,7 @@ mod tests {
     /// drains them via spawn_blocking.
     #[test]
     fn test_issue_1907_process_scp_envelope_does_not_drain_ready_inline() {
-        use stellar_xdr::curr::Hash as XdrHash;
+        use stellar_xdr::Hash as XdrHash;
 
         let local_secret = SecretKey::from_seed(&[7u8; 32]);
         let local_public = local_secret.public_key();
@@ -8222,13 +8208,13 @@ mod tests {
     /// store_quorum_set().
     #[test]
     fn test_audit_104_store_quorum_set_drains_ready() {
-        use stellar_xdr::curr::Hash as XdrHash;
+        use stellar_xdr::Hash as XdrHash;
 
         let herder = make_test_herder();
 
         // Build a sane quorum set
-        let node_id = XdrNodeId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
-            stellar_xdr::curr::Uint256([1u8; 32]),
+        let node_id = XdrNodeId(stellar_xdr::PublicKey::PublicKeyTypeEd25519(
+            stellar_xdr::Uint256([1u8; 32]),
         ));
         let quorum_set = ScpQuorumSet {
             threshold: 1,
@@ -8302,7 +8288,7 @@ mod tests {
     async fn test_issue_1773_receive_tx_set_frees_event_loop_during_drain() {
         use std::sync::atomic::{AtomicU64, Ordering};
         use std::sync::Arc;
-        use stellar_xdr::curr::Hash as XdrHash;
+        use stellar_xdr::Hash as XdrHash;
 
         let herder = Arc::new(make_test_herder());
 
@@ -8314,8 +8300,8 @@ mod tests {
         // processed-set dedup does not short-circuit the drain loop;
         // the `counter` field in ScpBallot provides that uniqueness.
         const BACKLOG: usize = 400;
-        let node_id = XdrNodeId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
-            stellar_xdr::curr::Uint256([42u8; 32]),
+        let node_id = XdrNodeId(stellar_xdr::PublicKey::PublicKeyTypeEd25519(
+            stellar_xdr::Uint256([42u8; 32]),
         ));
         let mut envelopes = Vec::with_capacity(BACKLOG);
         for i in 0..BACKLOG {
@@ -8414,13 +8400,13 @@ mod tests {
     async fn test_issue_1907_quorum_set_drain_frees_event_loop() {
         use std::sync::atomic::{AtomicU64, Ordering};
         use std::sync::Arc;
-        use stellar_xdr::curr::Hash as XdrHash;
+        use stellar_xdr::Hash as XdrHash;
 
         let herder = Arc::new(make_test_herder());
 
         // Build a sane quorum set
-        let node_id = XdrNodeId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
-            stellar_xdr::curr::Uint256([42u8; 32]),
+        let node_id = XdrNodeId(stellar_xdr::PublicKey::PublicKeyTypeEd25519(
+            stellar_xdr::Uint256([42u8; 32]),
         ));
         let quorum_set = ScpQuorumSet {
             threshold: 1,
@@ -8513,15 +8499,15 @@ mod tests {
     /// `process_ready_fetching_envelopes()` call should drain them.
     #[test]
     fn test_issue_1922_cache_tx_set_does_not_drain_inline() {
-        use stellar_xdr::curr::Hash as XdrHash;
+        use stellar_xdr::Hash as XdrHash;
 
         let herder = make_test_herder();
 
         let tx_set = TransactionSet::new(Hash256::ZERO, Vec::new());
 
         // Synthesise 10 ready envelopes for slot 1.
-        let node_id = XdrNodeId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
-            stellar_xdr::curr::Uint256([42u8; 32]),
+        let node_id = XdrNodeId(stellar_xdr::PublicKey::PublicKeyTypeEd25519(
+            stellar_xdr::Uint256([42u8; 32]),
         ));
         let mut envelopes = Vec::with_capacity(10);
         for i in 0..10 {
@@ -8581,7 +8567,7 @@ mod tests {
     async fn test_issue_1922_cache_tx_set_and_drain_frees_event_loop() {
         use std::sync::atomic::{AtomicU64, Ordering};
         use std::sync::Arc;
-        use stellar_xdr::curr::Hash as XdrHash;
+        use stellar_xdr::Hash as XdrHash;
 
         let herder = Arc::new(make_test_herder());
 
@@ -8589,8 +8575,8 @@ mod tests {
 
         // Synthesise 400 ready envelopes for slot 1.
         const BACKLOG: usize = 400;
-        let node_id = XdrNodeId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
-            stellar_xdr::curr::Uint256([42u8; 32]),
+        let node_id = XdrNodeId(stellar_xdr::PublicKey::PublicKeyTypeEd25519(
+            stellar_xdr::Uint256([42u8; 32]),
         ));
         let mut envelopes = Vec::with_capacity(BACKLOG);
         for i in 0..BACKLOG {
@@ -8852,7 +8838,7 @@ mod tests {
         herder: &Herder,
         secret_key: &SecretKey,
     ) -> Value {
-        let xdr_tx_set_hash = stellar_xdr::curr::Hash(tx_set_hash.0);
+        let xdr_tx_set_hash = stellar_xdr::Hash(tx_set_hash.0);
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -8867,8 +8853,8 @@ mod tests {
         sign_data.extend_from_slice(&close_time.to_xdr(Limits::none()).unwrap());
         let sig = secret_key.sign(&sign_data);
 
-        let node_id = XdrNodeId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
-            stellar_xdr::curr::Uint256(*secret_key.public_key().as_bytes()),
+        let node_id = XdrNodeId(stellar_xdr::PublicKey::PublicKeyTypeEd25519(
+            stellar_xdr::Uint256(*secret_key.public_key().as_bytes()),
         ));
 
         let stellar_value = StellarValue {
@@ -8877,9 +8863,7 @@ mod tests {
             upgrades: vec![].try_into().unwrap(),
             ext: StellarValueExt::Signed(LedgerCloseValueSignature {
                 node_id,
-                signature: stellar_xdr::curr::Signature(
-                    sig.0.to_vec().try_into().unwrap_or_default(),
-                ),
+                signature: stellar_xdr::Signature(sig.0.to_vec().try_into().unwrap_or_default()),
             }),
         };
         Value(
@@ -9064,8 +9048,8 @@ mod tests {
         // Peer that will send the EXTERNALIZE.
         let peer_secret = SecretKey::from_seed(&[2u8; 32]);
         let peer_public = peer_secret.public_key();
-        let peer_node_id = XdrNodeId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
-            stellar_xdr::curr::Uint256(*peer_public.as_bytes()),
+        let peer_node_id = XdrNodeId(stellar_xdr::PublicKey::PublicKeyTypeEd25519(
+            stellar_xdr::Uint256(*peer_public.as_bytes()),
         ));
 
         // Set tracking: consensus_index = 1 (next slot to close).
@@ -9089,7 +9073,7 @@ mod tests {
                 pledges: ScpStatementPledges::Externalize(ScpStatementExternalize {
                     commit: ScpBallot { counter: 1, value },
                     n_h: 1,
-                    commit_quorum_set_hash: stellar_xdr::curr::Hash([0u8; 32]),
+                    commit_quorum_set_hash: stellar_xdr::Hash([0u8; 32]),
                 }),
             },
             // Envelope signature not verified by SCP (bypassed in this test).
@@ -9175,8 +9159,8 @@ mod tests {
         // Peer that will send the EXTERNALIZE.
         let peer_secret = SecretKey::from_seed(&[2u8; 32]);
         let peer_public = peer_secret.public_key();
-        let peer_node_id = XdrNodeId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
-            stellar_xdr::curr::Uint256(*peer_public.as_bytes()),
+        let peer_node_id = XdrNodeId(stellar_xdr::PublicKey::PublicKeyTypeEd25519(
+            stellar_xdr::Uint256(*peer_public.as_bytes()),
         ));
 
         // Set tracking: consensus_index = 1 (next slot to close).
@@ -9207,7 +9191,7 @@ mod tests {
                 pledges: ScpStatementPledges::Externalize(ScpStatementExternalize {
                     commit: ScpBallot { counter: 1, value },
                     n_h: 1,
-                    commit_quorum_set_hash: stellar_xdr::curr::Hash([0u8; 32]),
+                    commit_quorum_set_hash: stellar_xdr::Hash([0u8; 32]),
                 }),
             },
             // Envelope signature not verified by SCP (bypassed in this test).
@@ -9283,8 +9267,8 @@ mod tests {
 
     fn make_persist_envelope_with_tx_set_hash(
         slot: u64,
-        tx_set_hash: stellar_xdr::curr::Hash,
-    ) -> stellar_xdr::curr::ScpEnvelope {
+        tx_set_hash: stellar_xdr::Hash,
+    ) -> stellar_xdr::ScpEnvelope {
         let stellar_value = StellarValue {
             tx_set_hash,
             close_time: TimePoint(0),
@@ -9292,14 +9276,14 @@ mod tests {
             ext: StellarValueExt::Basic,
         };
         let value = stellar_value.to_xdr(Limits::none()).unwrap();
-        stellar_xdr::curr::ScpEnvelope {
+        stellar_xdr::ScpEnvelope {
             statement: ScpStatement {
-                node_id: XdrNodeId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
-                    stellar_xdr::curr::Uint256([0u8; 32]),
+                node_id: XdrNodeId(stellar_xdr::PublicKey::PublicKeyTypeEd25519(
+                    stellar_xdr::Uint256([0u8; 32]),
                 )),
                 slot_index: slot,
                 pledges: ScpStatementPledges::Nominate(ScpNomination {
-                    quorum_set_hash: stellar_xdr::curr::Hash([0u8; 32]),
+                    quorum_set_hash: stellar_xdr::Hash([0u8; 32]),
                     votes: vec![Value(value.try_into().unwrap())].try_into().unwrap(),
                     accepted: vec![].try_into().unwrap(),
                 }),
@@ -9324,8 +9308,8 @@ mod tests {
             "first install should succeed"
         );
 
-        let referenced_hash = stellar_xdr::curr::Hash([1u8; 32]);
-        let orphan_hash = stellar_xdr::curr::Hash([2u8; 32]);
+        let referenced_hash = stellar_xdr::Hash([1u8; 32]);
+        let orphan_hash = stellar_xdr::Hash([2u8; 32]);
 
         // Drive setup through the public manager API: persist an envelope
         // referencing `referenced_hash`, but pass BOTH tx sets through so the
@@ -9488,10 +9472,10 @@ mod tests {
 
         // Inject an orphan tx set directly via the manager (not referenced
         // by any persisted envelope).
-        let orphan_hash = stellar_xdr::curr::Hash([0xAAu8; 32]);
+        let orphan_hash = stellar_xdr::Hash([0xAAu8; 32]);
         let orphan_env = make_persist_envelope_with_tx_set_hash(
             999_999,
-            stellar_xdr::curr::Hash([0xBBu8; 32]), // some unrelated hash
+            stellar_xdr::Hash([0xBBu8; 32]), // some unrelated hash
         );
         manager
             .persist_scp_state(
@@ -9525,7 +9509,7 @@ mod inv_h2_lcl_guard_tests {
 
     fn make_lm_at_seq(ledger_seq: u32) -> Arc<henyey_ledger::LedgerManager> {
         use henyey_ledger::{LedgerManager, LedgerManagerConfig};
-        use stellar_xdr::curr::{
+        use stellar_xdr::{
             Hash, LedgerHeader, LedgerHeaderExt, StellarValue, StellarValueExt, TimePoint, VecM,
         };
         let config = LedgerManagerConfig {
@@ -9967,13 +9951,13 @@ mod inv_h2_lcl_guard_tests {
 #[cfg(test)]
 mod closing_gate_tests {
     use super::*;
-    use stellar_xdr::curr::{
+    use stellar_xdr::{
         ScpNomination, ScpStatement, ScpStatementPledges, Signature as XdrSignature,
     };
 
     fn make_default_lm() -> Arc<henyey_ledger::LedgerManager> {
         use henyey_ledger::{LedgerManager, LedgerManagerConfig};
-        use stellar_xdr::curr::{
+        use stellar_xdr::{
             Hash, LedgerHeader, LedgerHeaderExt, StellarValue, StellarValueExt, TimePoint, VecM,
         };
         let config = LedgerManagerConfig {
@@ -10028,16 +10012,15 @@ mod closing_gate_tests {
     }
 
     fn make_test_envelope(slot: u64) -> ScpEnvelope {
-        let node_id =
-            stellar_xdr::curr::NodeId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
-                stellar_xdr::curr::Uint256([0u8; 32]),
-            ));
+        let node_id = stellar_xdr::NodeId(stellar_xdr::PublicKey::PublicKeyTypeEd25519(
+            stellar_xdr::Uint256([0u8; 32]),
+        ));
         ScpEnvelope {
             statement: ScpStatement {
                 node_id,
                 slot_index: slot,
                 pledges: ScpStatementPledges::Nominate(ScpNomination {
-                    quorum_set_hash: stellar_xdr::curr::Hash([0u8; 32]),
+                    quorum_set_hash: stellar_xdr::Hash([0u8; 32]),
                     votes: vec![].try_into().unwrap(),
                     accepted: vec![].try_into().unwrap(),
                 }),
@@ -10241,7 +10224,7 @@ mod set_state_tests {
 
     fn make_default_lm() -> Arc<henyey_ledger::LedgerManager> {
         use henyey_ledger::{LedgerManager, LedgerManagerConfig};
-        use stellar_xdr::curr::{
+        use stellar_xdr::{
             Hash, LedgerHeader, LedgerHeaderExt, StellarValue, StellarValueExt, TimePoint, VecM,
         };
         let config = LedgerManagerConfig {
@@ -10478,7 +10461,7 @@ mod scp_pipeline_tests {
         Verdict, VerifiedEnvelope, VerifierState,
     };
     use henyey_crypto::SecretKey;
-    use stellar_xdr::curr::{
+    use stellar_xdr::{
         NodeId as XdrNodeId, ScpNomination, ScpStatement, ScpStatementPledges,
         Signature as XdrSignature,
     };
@@ -10496,15 +10479,15 @@ mod scp_pipeline_tests {
     }
 
     fn make_unsigned_envelope(slot: u64, node_seed: u8) -> ScpEnvelope {
-        let node_id = XdrNodeId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
-            stellar_xdr::curr::Uint256([node_seed; 32]),
+        let node_id = XdrNodeId(stellar_xdr::PublicKey::PublicKeyTypeEd25519(
+            stellar_xdr::Uint256([node_seed; 32]),
         ));
         ScpEnvelope {
             statement: ScpStatement {
                 node_id,
                 slot_index: slot,
                 pledges: ScpStatementPledges::Nominate(ScpNomination {
-                    quorum_set_hash: stellar_xdr::curr::Hash([0u8; 32]),
+                    quorum_set_hash: stellar_xdr::Hash([0u8; 32]),
                     votes: vec![].try_into().unwrap(),
                     accepted: vec![].try_into().unwrap(),
                 }),
@@ -10552,14 +10535,14 @@ mod scp_pipeline_tests {
         herder: &Herder,
         secret: &SecretKey,
     ) -> ScpEnvelope {
-        use stellar_xdr::curr::{
+        use stellar_xdr::{
             LedgerCloseValueSignature, Limits, NodeId as XdrNodeId, ScpNomination, ScpStatement,
             ScpStatementPledges, Signature as XdrSignature, StellarValue, StellarValueExt,
             TimePoint, Value, WriteXdr,
         };
         let public = secret.public_key();
-        let node_id = XdrNodeId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
-            stellar_xdr::curr::Uint256(*public.as_bytes()),
+        let node_id = XdrNodeId(stellar_xdr::PublicKey::PublicKeyTypeEd25519(
+            stellar_xdr::Uint256(*public.as_bytes()),
         ));
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -10567,11 +10550,11 @@ mod scp_pipeline_tests {
             .as_secs();
 
         // Build a signed StellarValue so check_envelope_close_time accepts it.
-        let tx_set_hash = stellar_xdr::curr::Hash([0u8; 32]);
+        let tx_set_hash = stellar_xdr::Hash([0u8; 32]);
         let close_time = TimePoint(now);
         let mut sign_data = herder.scp_driver.network_id().0.to_vec();
         sign_data.extend_from_slice(
-            &stellar_xdr::curr::EnvelopeType::Scpvalue
+            &stellar_xdr::EnvelopeType::Scpvalue
                 .to_xdr(Limits::none())
                 .unwrap(),
         );
@@ -10584,7 +10567,7 @@ mod scp_pipeline_tests {
             upgrades: vec![].try_into().unwrap(),
             ext: StellarValueExt::Signed(LedgerCloseValueSignature {
                 node_id: node_id.clone(),
-                signature: stellar_xdr::curr::Signature(
+                signature: stellar_xdr::Signature(
                     value_sig.0.to_vec().try_into().unwrap_or_default(),
                 ),
             }),
@@ -10595,7 +10578,7 @@ mod scp_pipeline_tests {
             node_id,
             slot_index: slot,
             pledges: ScpStatementPledges::Nominate(ScpNomination {
-                quorum_set_hash: stellar_xdr::curr::Hash([0u8; 32]),
+                quorum_set_hash: stellar_xdr::Hash([0u8; 32]),
                 votes: vec![vote].try_into().unwrap(),
                 accepted: vec![].try_into().unwrap(),
             }),
@@ -10960,7 +10943,7 @@ mod scp_pipeline_tests {
 
     fn make_ledger_manager_at_seq(ledger_seq: u32) -> Arc<henyey_ledger::LedgerManager> {
         use henyey_ledger::{LedgerManager, LedgerManagerConfig};
-        use stellar_xdr::curr::{
+        use stellar_xdr::{
             Hash, LedgerHeader, LedgerHeaderExt, StellarValue, StellarValueExt, TimePoint, VecM,
         };
         let config = LedgerManagerConfig {
@@ -11130,14 +11113,14 @@ mod scp_pipeline_tests {
 #[cfg(test)]
 mod advance_tracking_slot_tests {
     use super::*;
-    use stellar_xdr::curr::{
+    use stellar_xdr::{
         Hash, NodeId as XdrNodeId, PublicKey, ScpEnvelope, ScpNomination, ScpStatement,
         ScpStatementPledges, Uint256,
     };
 
     fn make_default_lm() -> Arc<henyey_ledger::LedgerManager> {
         use henyey_ledger::{LedgerManager, LedgerManagerConfig};
-        use stellar_xdr::curr::{
+        use stellar_xdr::{
             LedgerHeader, LedgerHeaderExt, StellarValue, StellarValueExt, TimePoint, VecM,
         };
         let config = LedgerManagerConfig {
@@ -11204,7 +11187,7 @@ mod advance_tracking_slot_tests {
                     accepted: vec![].try_into().unwrap(),
                 }),
             },
-            signature: stellar_xdr::curr::Signature(vec![0u8; 64].try_into().unwrap()),
+            signature: stellar_xdr::Signature(vec![0u8; 64].try_into().unwrap()),
         }
     }
 
@@ -11403,7 +11386,7 @@ mod advance_tracking_slot_tests {
     async fn test_nomination_value_uses_single_snapshot() {
         use henyey_bucket::{BucketList, HotArchiveBucketList};
         use henyey_ledger::LedgerManagerConfig;
-        use stellar_xdr::curr::{
+        use stellar_xdr::{
             CreateAccountOp, DecoratedSignature, Hash, LedgerHeader, LedgerHeaderExt, Memo,
             MuxedAccount, Operation, OperationBody, Preconditions, SequenceNumber, SignatureHint,
             StellarValue, StellarValueExt, TimePoint, Transaction, TransactionEnvelope,
@@ -11412,10 +11395,9 @@ mod advance_tracking_slot_tests {
 
         fn make_synthetic_envelope(seed: u8) -> TransactionEnvelope {
             let source = MuxedAccount::Ed25519(Uint256([seed; 32]));
-            let dest =
-                stellar_xdr::curr::AccountId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
-                    Uint256([seed.wrapping_add(128); 32]),
-                ));
+            let dest = stellar_xdr::AccountId(stellar_xdr::PublicKey::PublicKeyTypeEd25519(
+                Uint256([seed.wrapping_add(128); 32]),
+            ));
             let tx = Transaction {
                 source_account: source,
                 fee: 200,
@@ -11437,7 +11419,7 @@ mod advance_tracking_slot_tests {
                 tx,
                 signatures: vec![DecoratedSignature {
                     hint: SignatureHint([0u8; 4]),
-                    signature: stellar_xdr::curr::Signature(vec![0u8; 64].try_into().unwrap()),
+                    signature: stellar_xdr::Signature(vec![0u8; 64].try_into().unwrap()),
                 }]
                 .try_into()
                 .unwrap(),
@@ -11449,7 +11431,7 @@ mod advance_tracking_slot_tests {
         let secret_for_herder = henyey_crypto::SecretKey::from_seed(&seed);
         let public = secret_for_herder.public_key();
         let node_id = super::node_id_from_public_key(&public);
-        let quorum_set = stellar_xdr::curr::ScpQuorumSet {
+        let quorum_set = stellar_xdr::ScpQuorumSet {
             threshold: 1,
             validators: vec![node_id].try_into().unwrap(),
             inner_sets: vec![].try_into().unwrap(),
@@ -11574,9 +11556,7 @@ mod advance_tracking_slot_tests {
     /// Build a v24 `LedgerHeader` with a non-zero `max_tx_set_size`. Mirrors
     /// the header shape used by `test_nomination_value_uses_single_snapshot`.
     fn v24_header() -> LedgerHeader {
-        use stellar_xdr::curr::{
-            Hash, LedgerHeaderExt, StellarValue, StellarValueExt, TimePoint, VecM,
-        };
+        use stellar_xdr::{Hash, LedgerHeaderExt, StellarValue, StellarValueExt, TimePoint, VecM};
         LedgerHeader {
             ledger_version: 24,
             previous_ledger_hash: Hash([0u8; 32]),
@@ -11610,7 +11590,7 @@ mod advance_tracking_slot_tests {
     /// is an empty `TransactionPhase::V0`. The hash is computed from the XDR
     /// encoding so that `prepare_for_apply` accepts the recomputed hash.
     fn empty_n_phase_generalized_tx_set(n_phases: usize) -> TransactionSet {
-        use stellar_xdr::curr::{
+        use stellar_xdr::{
             GeneralizedTransactionSet, Hash, TransactionPhase, TransactionSetV1, VecM,
         };
         let phases: VecM<TransactionPhase> = (0..n_phases)
@@ -11796,16 +11776,16 @@ mod advance_tracking_slot_tests {
     // ── Cross-phase duplicate-source test helpers ────────────────────────
 
     /// Classic `CreateAccount` envelope (same shape as `tx_set.rs` tests).
-    fn make_classic_envelope(seed: u8, fee: u32) -> stellar_xdr::curr::TransactionEnvelope {
-        use stellar_xdr::curr::{
+    fn make_classic_envelope(seed: u8, fee: u32) -> stellar_xdr::TransactionEnvelope {
+        use stellar_xdr::{
             CreateAccountOp, DecoratedSignature, Memo, MuxedAccount, Operation, OperationBody,
             Preconditions, SequenceNumber, SignatureHint, Transaction, TransactionEnvelope,
             TransactionExt, TransactionV1Envelope, Uint256,
         };
         let source = MuxedAccount::Ed25519(Uint256([seed; 32]));
-        let dest = stellar_xdr::curr::AccountId(
-            stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(Uint256([seed.wrapping_add(1); 32])),
-        );
+        let dest = stellar_xdr::AccountId(stellar_xdr::PublicKey::PublicKeyTypeEd25519(Uint256(
+            [seed.wrapping_add(1); 32],
+        )));
         TransactionEnvelope::Tx(TransactionV1Envelope {
             tx: Transaction {
                 source_account: source,
@@ -11826,7 +11806,7 @@ mod advance_tracking_slot_tests {
             },
             signatures: vec![DecoratedSignature {
                 hint: SignatureHint([0u8; 4]),
-                signature: stellar_xdr::curr::Signature(vec![0u8; 64].try_into().unwrap()),
+                signature: stellar_xdr::Signature(vec![0u8; 64].try_into().unwrap()),
             }]
             .try_into()
             .unwrap(),
@@ -11834,11 +11814,8 @@ mod advance_tracking_slot_tests {
     }
 
     /// Soroban `InvokeHostFunction` envelope (same shape as `tx_set.rs` tests).
-    fn make_soroban_envelope_for_phase(
-        seed: u8,
-        fee: u32,
-    ) -> stellar_xdr::curr::TransactionEnvelope {
-        use stellar_xdr::curr::{
+    fn make_soroban_envelope_for_phase(seed: u8, fee: u32) -> stellar_xdr::TransactionEnvelope {
+        use stellar_xdr::{
             ContractDataDurability, ContractId, DecoratedSignature, Hash, HostFunction,
             InvokeContractArgs, InvokeHostFunctionOp, LedgerFootprint, LedgerKey,
             LedgerKeyContractData, Memo, MuxedAccount, Operation, OperationBody, Preconditions,
@@ -11888,7 +11865,7 @@ mod advance_tracking_slot_tests {
             },
             signatures: vec![DecoratedSignature {
                 hint: SignatureHint([0u8; 4]),
-                signature: stellar_xdr::curr::Signature(vec![0u8; 64].try_into().unwrap()),
+                signature: stellar_xdr::Signature(vec![0u8; 64].try_into().unwrap()),
             }]
             .try_into()
             .unwrap(),
@@ -11898,7 +11875,7 @@ mod advance_tracking_slot_tests {
     /// Build a 2-phase generalized tx set: V0 classic + V1 parallel Soroban.
     /// `classic_seed` and `soroban_seed` control the source-account ED25519 key.
     fn make_two_phase_tx_set(classic_seed: u8, soroban_seed: u8) -> TransactionSet {
-        use stellar_xdr::curr::{
+        use stellar_xdr::{
             DependentTxCluster, GeneralizedTransactionSet, Hash, ParallelTxExecutionStage,
             TransactionPhase, TransactionSetV1, TxSetComponent,
             TxSetComponentTxsMaybeDiscountedFee,
@@ -12036,7 +12013,7 @@ mod advance_tracking_slot_tests {
         use crate::tx_set_utils::TxSetValidationContext;
         use henyey_common::NetworkId;
         use std::time::Duration;
-        use stellar_xdr::curr::{
+        use stellar_xdr::{
             AccountId, DecoratedSignature, Hash, LedgerHeader, LedgerHeaderExt, Memo, MuxedAccount,
             Operation, OperationBody, Preconditions, PublicKey, SequenceNumber, SignatureHint,
             StellarValue, StellarValueExt, TimePoint, Transaction, TransactionEnvelope,
@@ -12065,7 +12042,7 @@ mod advance_tracking_slot_tests {
             memo: Memo::None,
             operations: vec![Operation {
                 source_account: None,
-                body: OperationBody::CreateAccount(stellar_xdr::curr::CreateAccountOp {
+                body: OperationBody::CreateAccount(stellar_xdr::CreateAccountOp {
                     destination: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([255u8; 32]))),
                     starting_balance: 1_000_000_000,
                 }),
@@ -12078,7 +12055,7 @@ mod advance_tracking_slot_tests {
             tx,
             signatures: vec![DecoratedSignature {
                 hint: SignatureHint([0u8; 4]),
-                signature: stellar_xdr::curr::Signature(vec![0u8; 64].try_into().unwrap()),
+                signature: stellar_xdr::Signature(vec![0u8; 64].try_into().unwrap()),
             }]
             .try_into()
             .unwrap(),
@@ -12213,7 +12190,7 @@ mod advance_tracking_slot_tests {
     async fn test_build_nomination_value_self_check_passes_on_v24() {
         use henyey_bucket::{BucketList, HotArchiveBucketList};
         use henyey_ledger::LedgerManagerConfig;
-        use stellar_xdr::curr::{
+        use stellar_xdr::{
             Hash, LedgerHeader, LedgerHeaderExt, StellarValue, StellarValueExt, TimePoint, VecM,
         };
 
@@ -12222,7 +12199,7 @@ mod advance_tracking_slot_tests {
         let secret_for_herder = henyey_crypto::SecretKey::from_seed(&seed);
         let public = secret_for_herder.public_key();
         let node_id = super::node_id_from_public_key(&public);
-        let quorum_set = stellar_xdr::curr::ScpQuorumSet {
+        let quorum_set = stellar_xdr::ScpQuorumSet {
             threshold: 1,
             validators: vec![node_id].try_into().unwrap(),
             inner_sets: vec![].try_into().unwrap(),
@@ -12299,11 +12276,9 @@ mod advance_tracking_slot_tests {
         // Decode the StellarValue to extract the tx_set_hash and verify the
         // tx set was actually cached (caching only happens after the
         // self-validation gate accepts it).
-        let stellar_value = stellar_xdr::curr::StellarValue::from_xdr(
-            &value.0[..],
-            stellar_xdr::curr::Limits::none(),
-        )
-        .expect("decode StellarValue");
+        let stellar_value =
+            stellar_xdr::StellarValue::from_xdr(&value.0[..], stellar_xdr::Limits::none())
+                .expect("decode StellarValue");
         let tx_set_hash = Hash256::from_bytes(stellar_value.tx_set_hash.0);
         assert!(
             herder.scp_driver().has_tx_set(&tx_set_hash),
@@ -12432,7 +12407,7 @@ mod quorum_health_tests {
     use crate::tx_queue::TransactionSet;
     use henyey_crypto::SecretKey;
     use henyey_scp::hash_quorum_set;
-    use stellar_xdr::curr::{
+    use stellar_xdr::{
         EnvelopeType, LedgerCloseValueSignature, Limits, NodeId as XdrNodeId, ScpBallot,
         ScpStatement, ScpStatementExternalize, ScpStatementPledges, ScpStatementPrepare,
         Signature as XdrSignature, StellarValue, StellarValueExt, TimePoint, Value, WriteXdr,
@@ -12440,7 +12415,7 @@ mod quorum_health_tests {
 
     fn make_default_lm() -> Arc<henyey_ledger::LedgerManager> {
         use henyey_ledger::{LedgerManager, LedgerManagerConfig};
-        use stellar_xdr::curr::{Hash, LedgerHeader, LedgerHeaderExt, VecM};
+        use stellar_xdr::{Hash, LedgerHeader, LedgerHeaderExt, VecM};
         let config = LedgerManagerConfig {
             validate_bucket_hash: false,
             ..Default::default()
@@ -12527,7 +12502,7 @@ mod quorum_health_tests {
         // Register each peer's quorum set so that is_statement_sane can
         // resolve the quorum_set_hash in PREPARE/CONFIRM envelopes.
         for key in &keys[1..] {
-            let peer_node_id = NodeId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(Uint256(
+            let peer_node_id = NodeId(stellar_xdr::PublicKey::PublicKeyTypeEd25519(Uint256(
                 *key.public_key().as_bytes(),
             )));
             herder.store_quorum_set(&peer_node_id, quorum_set.clone());
@@ -12544,7 +12519,7 @@ mod quorum_health_tests {
         let tx_set_hash = *tx_set.hash();
         herder.scp_driver.cache_tx_set(tx_set);
 
-        let xdr_tx_set_hash = stellar_xdr::curr::Hash(tx_set_hash.0);
+        let xdr_tx_set_hash = stellar_xdr::Hash(tx_set_hash.0);
         let close_time = TimePoint(1);
 
         let network_id = herder.scp_driver.network_id();
@@ -12554,8 +12529,8 @@ mod quorum_health_tests {
         sign_data.extend_from_slice(&close_time.to_xdr(Limits::none()).unwrap());
         let sig = signer.sign(&sign_data);
 
-        let node_id = XdrNodeId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
-            stellar_xdr::curr::Uint256(*signer.public_key().as_bytes()),
+        let node_id = XdrNodeId(stellar_xdr::PublicKey::PublicKeyTypeEd25519(
+            stellar_xdr::Uint256(*signer.public_key().as_bytes()),
         ));
 
         let stellar_value = StellarValue {
@@ -12578,7 +12553,7 @@ mod quorum_health_tests {
         slot: u64,
         pledges: ScpStatementPledges,
     ) -> ScpEnvelope {
-        let node_id = NodeId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(Uint256(
+        let node_id = NodeId(stellar_xdr::PublicKey::PublicKeyTypeEd25519(Uint256(
             *secret_key.public_key().as_bytes(),
         )));
         ScpEnvelope {
@@ -12598,14 +12573,14 @@ mod quorum_health_tests {
                 value: value.clone(),
             },
             n_h: u32::MAX,
-            commit_quorum_set_hash: stellar_xdr::curr::Hash([0u8; 32]),
+            commit_quorum_set_hash: stellar_xdr::Hash([0u8; 32]),
         })
     }
 
     fn prepare_pledges(value: &Value, quorum_set: &ScpQuorumSet) -> ScpStatementPledges {
         let qs_hash = hash_quorum_set(quorum_set);
         ScpStatementPledges::Prepare(ScpStatementPrepare {
-            quorum_set_hash: stellar_xdr::curr::Hash(qs_hash.0),
+            quorum_set_hash: stellar_xdr::Hash(qs_hash.0),
             ballot: ScpBallot {
                 counter: 1,
                 value: value.clone(),
@@ -12830,7 +12805,7 @@ mod quorum_health_tests {
         );
 
         for key in &keys[1..] {
-            let peer_node_id = NodeId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(Uint256(
+            let peer_node_id = NodeId(stellar_xdr::PublicKey::PublicKeyTypeEd25519(Uint256(
                 *key.public_key().as_bytes(),
             )));
             herder.store_quorum_set(&peer_node_id, quorum_set.clone());
@@ -12943,7 +12918,7 @@ mod quorum_health_tests {
         let node_ids: Vec<NodeId> = keys
             .iter()
             .map(|k| {
-                NodeId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(Uint256(
+                NodeId(stellar_xdr::PublicKey::PublicKeyTypeEd25519(Uint256(
                     *k.public_key().as_bytes(),
                 )))
             })
@@ -12999,9 +12974,9 @@ mod quorum_health_tests {
                 key[..4].copy_from_slice(&idx.to_le_bytes());
                 key
             };
-            let churn_node_id = NodeId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
-                Uint256(churn_key),
-            ));
+            let churn_node_id = NodeId(stellar_xdr::PublicKey::PublicKeyTypeEd25519(Uint256(
+                churn_key,
+            )));
 
             // Each churn node gets a sane single-node qset (threshold=1,
             // validators=[self]). Unique validator field → unique hash.
@@ -13106,7 +13081,7 @@ mod quorum_intersection_deadlock_tests {
 
     fn make_default_lm() -> Arc<henyey_ledger::LedgerManager> {
         use henyey_ledger::{LedgerManager, LedgerManagerConfig};
-        use stellar_xdr::curr::{
+        use stellar_xdr::{
             Hash, LedgerHeader, LedgerHeaderExt, StellarValue, StellarValueExt, TimePoint, VecM,
         };
         let config = LedgerManagerConfig {
@@ -13190,7 +13165,7 @@ mod quorum_intersection_deadlock_tests {
 
         // Expand the transitive quorum tracker with all peers.
         for key in keys.iter().skip(1) {
-            let peer_node_id = NodeId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(Uint256(
+            let peer_node_id = NodeId(stellar_xdr::PublicKey::PublicKeyTypeEd25519(Uint256(
                 *key.public_key().as_bytes(),
             )));
             herder.store_quorum_set(&peer_node_id, quorum_set.clone());
@@ -13326,7 +13301,7 @@ mod quorum_intersection_deadlock_tests {
 mod dynamic_close_time_tests {
     use super::*;
     use henyey_ledger::{LedgerManager, LedgerManagerConfig, SorobanNetworkInfo};
-    use stellar_xdr::curr::{
+    use stellar_xdr::{
         Hash, LedgerHeader, LedgerHeaderExt, StellarValue, StellarValueExt, TimePoint, VecM,
     };
 
@@ -13564,7 +13539,7 @@ mod previous_value_tests {
     use crate::tx_queue::TransactionSet;
     use henyey_crypto::SecretKey;
     use henyey_ledger::{LedgerManager, LedgerManagerConfig};
-    use stellar_xdr::curr::{
+    use stellar_xdr::{
         EnvelopeType, Hash, LedgerCloseValueSignature, LedgerHeader, LedgerHeaderExt, Limits,
         NodeId as XdrNodeId, ScpBallot, ScpStatement, ScpStatementExternalize, ScpStatementPledges,
         Signature as XdrSignature, StellarValue, StellarValueExt, TimePoint, Value, VecM, WriteXdr,
@@ -13715,8 +13690,8 @@ mod previous_value_tests {
         sign_data.extend_from_slice(&ct.to_xdr(Limits::none()).unwrap());
         let sig = secret.sign(&sign_data);
 
-        let node_id = XdrNodeId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
-            stellar_xdr::curr::Uint256(*secret.public_key().as_bytes()),
+        let node_id = XdrNodeId(stellar_xdr::PublicKey::PublicKeyTypeEd25519(
+            stellar_xdr::Uint256(*secret.public_key().as_bytes()),
         ));
 
         let stellar_value = StellarValue {
@@ -13725,9 +13700,7 @@ mod previous_value_tests {
             upgrades: VecM::default(),
             ext: StellarValueExt::Signed(LedgerCloseValueSignature {
                 node_id,
-                signature: stellar_xdr::curr::Signature(
-                    sig.0.to_vec().try_into().unwrap_or_default(),
-                ),
+                signature: stellar_xdr::Signature(sig.0.to_vec().try_into().unwrap_or_default()),
             }),
         };
         Value(
@@ -13749,8 +13722,8 @@ mod previous_value_tests {
         secret: &SecretKey,
         value: Value,
     ) -> ScpEnvelope {
-        let node_id = XdrNodeId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
-            stellar_xdr::curr::Uint256(*secret.public_key().as_bytes()),
+        let node_id = XdrNodeId(stellar_xdr::PublicKey::PublicKeyTypeEd25519(
+            stellar_xdr::Uint256(*secret.public_key().as_bytes()),
         ));
 
         let statement = ScpStatement {
@@ -13909,7 +13882,7 @@ mod previous_value_tests {
 mod required_lm_behavioral_tests {
     use super::*;
     use henyey_ledger::{LedgerManager, LedgerManagerConfig};
-    use stellar_xdr::curr::{
+    use stellar_xdr::{
         Hash, LedgerHeader, LedgerHeaderExt, StellarValue, StellarValueExt, TimePoint, VecM,
     };
 
@@ -14098,7 +14071,7 @@ mod required_lm_behavioral_tests {
 mod fetching_envelopes_routing_tests {
     use super::*;
     use henyey_ledger::{LedgerManager, LedgerManagerConfig};
-    use stellar_xdr::curr::{
+    use stellar_xdr::{
         Hash as XdrHash, LedgerHeader, LedgerHeaderExt, NodeId as XdrNodeId, ScpBallot,
         ScpEnvelope, ScpStatement, ScpStatementPledges, ScpStatementPrepare,
         Signature as XdrSignature, StellarValue, StellarValueExt, TimePoint, Value, VecM,
@@ -14155,8 +14128,8 @@ mod fetching_envelopes_routing_tests {
     /// Helper: make a simple test envelope for FetchingEnvelopes tests.
     /// Uses a Prepare statement with a unique counter for hash uniqueness.
     fn make_fetching_test_envelope(slot: u64, counter: u32) -> ScpEnvelope {
-        let node_id = XdrNodeId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
-            stellar_xdr::curr::Uint256([42u8; 32]),
+        let node_id = XdrNodeId(stellar_xdr::PublicKey::PublicKeyTypeEd25519(
+            stellar_xdr::Uint256([42u8; 32]),
         ));
         let ballot = ScpBallot {
             counter,
@@ -14167,7 +14140,7 @@ mod fetching_envelopes_routing_tests {
                 node_id,
                 slot_index: slot,
                 pledges: ScpStatementPledges::Prepare(ScpStatementPrepare {
-                    quorum_set_hash: stellar_xdr::curr::Hash([0u8; 32]),
+                    quorum_set_hash: stellar_xdr::Hash([0u8; 32]),
                     ballot,
                     prepared: None,
                     prepared_prime: None,

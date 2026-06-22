@@ -1,7 +1,7 @@
 use henyey_common::{Hash256, Resource, ResourceType, NUM_SOROBAN_TX_RESOURCES};
 use henyey_herder::{TransactionQueue, TxQueueConfig};
 use henyey_tx::muxed_to_account_id;
-use stellar_xdr::curr::{
+use stellar_xdr::{
     AccountId, AlphaNum4, Asset, AssetCode4, CreateAccountOp, DecoratedSignature, HostFunction,
     InvokeContractArgs, InvokeHostFunctionOp, LedgerFootprint, ManageSellOfferOp, Memo,
     MuxedAccount, Operation, OperationBody, Preconditions, Price, PublicKey, ScAddress, ScSymbol,
@@ -147,7 +147,7 @@ fn set_source(envelope: &mut TransactionEnvelope, seed: u8) {
             env.tx.source_account = source;
         }
         TransactionEnvelope::TxFeeBump(env) => match &mut env.tx.inner_tx {
-            stellar_xdr::curr::FeeBumpTransactionInnerTx::Tx(inner) => {
+            stellar_xdr::FeeBumpTransactionInnerTx::Tx(inner) => {
                 inner.tx.source_account = source;
             }
         },
@@ -163,7 +163,7 @@ fn set_seq(envelope: &mut TransactionEnvelope, seq: i64) {
             env.tx.seq_num = SequenceNumber(seq);
         }
         TransactionEnvelope::TxFeeBump(env) => match &mut env.tx.inner_tx {
-            stellar_xdr::curr::FeeBumpTransactionInnerTx::Tx(inner) => {
+            stellar_xdr::FeeBumpTransactionInnerTx::Tx(inner) => {
                 inner.tx.seq_num = SequenceNumber(seq);
             }
         },
@@ -173,13 +173,11 @@ fn set_seq(envelope: &mut TransactionEnvelope, seq: i64) {
 fn account_key_from_envelope(envelope: &TransactionEnvelope) -> Vec<u8> {
     let source = match envelope {
         TransactionEnvelope::TxV0(env) => {
-            stellar_xdr::curr::MuxedAccount::Ed25519(env.tx.source_account_ed25519.clone())
+            stellar_xdr::MuxedAccount::Ed25519(env.tx.source_account_ed25519.clone())
         }
         TransactionEnvelope::Tx(env) => env.tx.source_account.clone(),
         TransactionEnvelope::TxFeeBump(env) => match &env.tx.inner_tx {
-            stellar_xdr::curr::FeeBumpTransactionInnerTx::Tx(inner) => {
-                inner.tx.source_account.clone()
-            }
+            stellar_xdr::FeeBumpTransactionInnerTx::Tx(inner) => inner.tx.source_account.clone(),
         },
     };
     let account_id = muxed_to_account_id(&source);
@@ -313,7 +311,7 @@ fn test_sequence_gap_blocks_following() {
             TransactionEnvelope::Tx(env) => env.tx.seq_num.0,
             TransactionEnvelope::TxV0(env) => env.tx.seq_num.0,
             TransactionEnvelope::TxFeeBump(env) => match &env.tx.inner_tx {
-                stellar_xdr::curr::FeeBumpTransactionInnerTx::Tx(inner) => inner.tx.seq_num.0,
+                stellar_xdr::FeeBumpTransactionInnerTx::Tx(inner) => inner.tx.seq_num.0,
             },
         })
         .collect();
@@ -371,7 +369,7 @@ fn test_starting_sequence_excludes_prior() {
             TransactionEnvelope::Tx(env) => env.tx.seq_num.0,
             TransactionEnvelope::TxV0(env) => env.tx.seq_num.0,
             TransactionEnvelope::TxFeeBump(env) => match &env.tx.inner_tx {
-                stellar_xdr::curr::FeeBumpTransactionInnerTx::Tx(inner) => inner.tx.seq_num.0,
+                stellar_xdr::FeeBumpTransactionInnerTx::Tx(inner) => inner.tx.seq_num.0,
             },
         })
         .collect();

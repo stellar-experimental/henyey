@@ -31,7 +31,7 @@ use henyey_common::Hash256;
 use henyey_history::HistoryArchive;
 use henyey_ledger::compute_header_hash;
 use std::path::PathBuf;
-use stellar_xdr::curr::{LedgerHeader, TransactionHistoryResultEntry, WriteXdr};
+use stellar_xdr::{LedgerHeader, TransactionHistoryResultEntry, WriteXdr};
 
 /// CLI arguments for the header comparison tool.
 #[derive(Parser)]
@@ -260,8 +260,8 @@ fn compare_present_entries(
 
     let count = local_results.len().min(archive_results.len());
     for i in 0..count {
-        let local_bytes = local_results[i].to_xdr(stellar_xdr::curr::Limits::none())?;
-        let archive_bytes = archive_results[i].to_xdr(stellar_xdr::curr::Limits::none())?;
+        let local_bytes = local_results[i].to_xdr(stellar_xdr::Limits::none())?;
+        let archive_bytes = archive_results[i].to_xdr(stellar_xdr::Limits::none())?;
         if local_bytes != archive_bytes {
             diffs.push(format!(
                 "tx[{}] mismatch: local fee={} result={:?} | archive fee={} result={:?}",
@@ -281,7 +281,7 @@ fn compare_present_entries(
 fn print_tx_result_hash(label: &str, entry: &TransactionHistoryResultEntry) {
     let bytes = entry
         .tx_result_set
-        .to_xdr(stellar_xdr::curr::Limits::none())
+        .to_xdr(stellar_xdr::Limits::none())
         .unwrap_or_default();
     let hash = Hash256::hash(&bytes);
     println!("  {} hash: {}", label, hash.to_hex());
@@ -290,7 +290,7 @@ fn print_tx_result_hash(label: &str, entry: &TransactionHistoryResultEntry) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use stellar_xdr::curr::{
+    use stellar_xdr::{
         Hash, TransactionResult, TransactionResultExt, TransactionResultPair,
         TransactionResultResult, TransactionResultSet, VecM,
     };
@@ -302,7 +302,7 @@ mod tests {
             tx_result_set: TransactionResultSet {
                 results: VecM::default(),
             },
-            ext: stellar_xdr::curr::TransactionHistoryResultEntryExt::V0,
+            ext: stellar_xdr::TransactionHistoryResultEntryExt::V0,
         }
     }
 
@@ -321,7 +321,7 @@ mod tests {
             tx_result_set: TransactionResultSet {
                 results: vec![pair].try_into().unwrap(),
             },
-            ext: stellar_xdr::curr::TransactionHistoryResultEntryExt::V0,
+            ext: stellar_xdr::TransactionHistoryResultEntryExt::V0,
         }
     }
 

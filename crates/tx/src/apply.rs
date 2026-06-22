@@ -84,7 +84,7 @@
 //! }
 //! ```
 
-use stellar_xdr::curr::{
+use stellar_xdr::{
     AccountId, LedgerEntry, LedgerEntryChange, LedgerEntryChanges, LedgerKey, TransactionMeta,
     TransactionResult,
 };
@@ -193,7 +193,7 @@ impl TxChangeLog {
 
     /// Record a created entry.
     pub fn record_create(&mut self, entry: LedgerEntry) {
-        if let stellar_xdr::curr::LedgerEntryData::Ttl(ttl) = &entry.data {
+        if let stellar_xdr::LedgerEntryData::Ttl(ttl) = &entry.data {
             tracing::debug!(
                 key_hash = ?ttl.key_hash,
                 "TxChangeLog::record_create for Ttl"
@@ -209,7 +209,7 @@ impl TxChangeLog {
     /// `pre_state` is the entry value BEFORE the modification.
     /// `post_state` is the entry value AFTER the modification.
     pub fn record_update(&mut self, pre_state: LedgerEntry, post_state: LedgerEntry) {
-        if let stellar_xdr::curr::LedgerEntryData::Ttl(ttl) = &post_state.data {
+        if let stellar_xdr::LedgerEntryData::Ttl(ttl) = &post_state.data {
             tracing::debug!(
                 key_hash = ?ttl.key_hash,
                 "TxChangeLog::record_update for Ttl"
@@ -228,17 +228,17 @@ impl TxChangeLog {
     /// a separate STATE+UPDATED pair.
     pub fn update_created_ttl(
         &mut self,
-        key_hash: &stellar_xdr::curr::Hash,
-        ttl_entry: &stellar_xdr::curr::TtlEntry,
+        key_hash: &stellar_xdr::Hash,
+        ttl_entry: &stellar_xdr::TtlEntry,
     ) {
-        use stellar_xdr::curr::LedgerEntryData;
+        use stellar_xdr::LedgerEntryData;
 
         // Find the TTL entry in created with matching key_hash
         for entry in &mut self.created {
             if let LedgerEntryData::Ttl(ttl) = &entry.data {
                 if ttl.key_hash == *key_hash {
                     // Update the TTL value in the created entry
-                    entry.data = LedgerEntryData::Ttl(stellar_xdr::curr::TtlEntry {
+                    entry.data = LedgerEntryData::Ttl(stellar_xdr::TtlEntry {
                         key_hash: key_hash.clone(),
                         live_until_ledger_seq: ttl_entry.live_until_ledger_seq,
                     });
@@ -325,7 +325,7 @@ impl TxChangeLog {
     /// or buying-liabilities violation (TransactionUtils.cpp:561-592).
     pub fn apply_refund_to_account(&mut self, account_id: &AccountId, refund: i64) -> bool {
         use henyey_common::asset::try_add_account_balance;
-        use stellar_xdr::curr::LedgerEntryData;
+        use stellar_xdr::LedgerEntryData;
 
         // Find the last update for this account and modify its balance
         for entry in self.updated.iter_mut().rev() {
@@ -542,7 +542,7 @@ fn apply_before_ops_after(
 mod tests {
     use super::*;
     use crate::state::asset_to_trustline_asset;
-    use stellar_xdr::curr::*;
+    use stellar_xdr::*;
 
     #[test]
     fn test_ledger_delta_creation() {
@@ -798,7 +798,7 @@ mod tests {
     /// Regression test for AUDIT-H18: stellar-core checks newBalance > INT64_MAX - buyingLiabilities.
     #[test]
     fn test_ledger_delta_apply_refund_buying_liabilities() {
-        use stellar_xdr::curr::{AccountEntryExtensionV1, Liabilities};
+        use stellar_xdr::{AccountEntryExtensionV1, Liabilities};
 
         let mut delta = TxChangeLog::new(100);
 
@@ -820,7 +820,7 @@ mod tests {
                         buying: 500,
                         selling: 0,
                     },
-                    ext: stellar_xdr::curr::AccountEntryExtensionV1Ext::V0,
+                    ext: stellar_xdr::AccountEntryExtensionV1Ext::V0,
                 }),
             }),
             ext: LedgerEntryExt::V0,
@@ -893,13 +893,13 @@ mod tests {
     #[test]
     fn test_asset_to_trustline_asset_variants() {
         // Native
-        let native = stellar_xdr::curr::Asset::Native;
+        let native = stellar_xdr::Asset::Native;
         let key = asset_to_trustline_asset(&native);
         assert!(matches!(key, TrustLineAsset::Native));
 
         // CreditAlphanum4
         let issuer = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([5u8; 32])));
-        let alpha4 = stellar_xdr::curr::Asset::CreditAlphanum4(AlphaNum4 {
+        let alpha4 = stellar_xdr::Asset::CreditAlphanum4(AlphaNum4 {
             asset_code: AssetCode4(*b"USD\0"),
             issuer: issuer.clone(),
         });
@@ -912,7 +912,7 @@ mod tests {
         }
 
         // CreditAlphanum12
-        let alpha12 = stellar_xdr::curr::Asset::CreditAlphanum12(AlphaNum12 {
+        let alpha12 = stellar_xdr::Asset::CreditAlphanum12(AlphaNum12 {
             asset_code: AssetCode12(*b"LONGASSET123"),
             issuer: issuer.clone(),
         });

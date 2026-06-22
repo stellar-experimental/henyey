@@ -83,8 +83,8 @@ fn consume_skip_marker_if_matches(
 /// DB write preserves the same ordering as `processExternalized()`.
 struct ScpHistoryBatch {
     ledger_seq: u32,
-    envelopes: Vec<stellar_xdr::curr::ScpEnvelope>,
-    quorum_sets: Vec<(Hash256, stellar_xdr::curr::ScpQuorumSet)>,
+    envelopes: Vec<stellar_xdr::ScpEnvelope>,
+    quorum_sets: Vec<(Hash256, stellar_xdr::ScpQuorumSet)>,
 }
 
 /// Raw inputs for a ledger-close persist job, captured on the event loop.
@@ -93,7 +93,7 @@ struct ScpHistoryBatch {
 /// serialization). The persist task performs all serialization on a
 /// blocking thread via [`LedgerPersistInputs::serialize_and_write_to_db`].
 struct LedgerPersistInputs {
-    header: stellar_xdr::curr::LedgerHeader,
+    header: stellar_xdr::LedgerHeader,
     tx_history_entry: TransactionHistoryEntry,
     tx_result_entry: TransactionHistoryResultEntry,
     ordered_txs: Vec<std::sync::Arc<TransactionEnvelope>>,
@@ -156,7 +156,7 @@ impl LedgerPersistInputs {
 
         let header_xdr = self
             .header
-            .to_xdr(stellar_xdr::curr::Limits::none())
+            .to_xdr(stellar_xdr::Limits::none())
             .map_err(|e| anyhow::anyhow!("Failed to serialize header XDR: {}", e))?;
 
         // Diagnostic: compare HAS-derived bucket_list_hash against header.
@@ -216,15 +216,15 @@ impl LedgerPersistInputs {
                     .map_err(|e| henyey_db::DbError::Integrity(e.to_string()))?;
                 let tx_id = tx_hash.to_hex();
 
-                let tx_body = tx.to_xdr(stellar_xdr::curr::Limits::none())?;
-                let tx_result_xdr = tx_result.to_xdr(stellar_xdr::curr::Limits::none())?;
+                let tx_body = tx.to_xdr(stellar_xdr::Limits::none())?;
+                let tx_result_xdr = tx_result.to_xdr(stellar_xdr::Limits::none())?;
                 let tx_meta_xdr = match tx_meta {
-                    Some(meta) => Some(meta.to_xdr(stellar_xdr::curr::Limits::none())?),
+                    Some(meta) => Some(meta.to_xdr(stellar_xdr::Limits::none())?),
                     None => None,
                 };
 
                 let status = {
-                    use stellar_xdr::curr::TransactionResultCode;
+                    use stellar_xdr::TransactionResultCode;
                     let code = tx_result.result.result.discriminant();
                     if code == TransactionResultCode::TxSuccess
                         || code == TransactionResultCode::TxFeeBumpInnerSuccess
@@ -464,7 +464,7 @@ impl App {
     /// on a blocking thread — not on the event loop.
     fn build_persist_inputs(
         &self,
-        header: &stellar_xdr::curr::LedgerHeader,
+        header: &stellar_xdr::LedgerHeader,
         tx_set_variant: &TransactionSetVariant,
         tx_results: &[TransactionResultPair],
         tx_metas: Option<&[TransactionMeta]>,
@@ -564,13 +564,13 @@ impl App {
     /// Extract contract events from transaction metadata for indexing.
     fn extract_contract_events(
         ledger_seq: u32,
-        ordered_txs: &[std::sync::Arc<stellar_xdr::curr::TransactionEnvelope>],
+        ordered_txs: &[std::sync::Arc<stellar_xdr::TransactionEnvelope>],
         tx_results: &[TransactionResultPair],
         tx_metas: &[TransactionMeta],
         network_id: NetworkId,
     ) -> anyhow::Result<Vec<henyey_db::EventRecord>> {
         use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
-        use stellar_xdr::curr::{ContractEvent, Limits, TransactionResultCode};
+        use stellar_xdr::{ContractEvent, Limits, TransactionResultCode};
 
         let mut all_events = Vec::new();
 
@@ -640,7 +640,7 @@ impl App {
 
                 // Serialize topics — propagate errors instead of silently dropping
                 let topics: Vec<String> = match &event.body {
-                    stellar_xdr::curr::ContractEventBody::V0(body) => body
+                    stellar_xdr::ContractEventBody::V0(body) => body
                         .topics
                         .iter()
                         .map(|t| {
@@ -1072,8 +1072,8 @@ impl App {
         }
 
         let ledger_flags = match &header.ext {
-            stellar_xdr::curr::LedgerHeaderExt::V0 => 0,
-            stellar_xdr::curr::LedgerHeaderExt::V1(ext) => ext.flags,
+            stellar_xdr::LedgerHeaderExt::V0 => 0,
+            stellar_xdr::LedgerHeaderExt::V1(ext) => ext.flags,
         };
 
         self.herder.tx_queue().update_validation_context(
@@ -1232,7 +1232,7 @@ impl App {
     async fn reconstruct_bucket_lists(
         &self,
         has: &HistoryArchiveState,
-        header: &stellar_xdr::curr::LedgerHeader,
+        header: &stellar_xdr::LedgerHeader,
         lcl_seq: u32,
     ) -> anyhow::Result<(BucketList, HotArchiveBucketList)> {
         // Start-of-restore checkpoint (#3239) — this cold-catchup path is
@@ -2047,7 +2047,7 @@ impl App {
         let our_header_hash = snapshot.hash;
         if our_header_hash != tx_set.previous_ledger_hash() {
             // Log header XDR bytes for hash debugging (mirrors manager.rs:2122-2140)
-            use stellar_xdr::curr::{Limits, WriteXdr};
+            use stellar_xdr::{Limits, WriteXdr};
             let header = &snapshot.header;
             match header.to_xdr(Limits::none()) {
                 Ok(header_xdr) => {
@@ -2473,7 +2473,7 @@ impl App {
         let meta_xdr = result
             .meta
             .as_ref()
-            .and_then(|meta| meta.to_xdr(stellar_xdr::curr::Limits::none()).ok());
+            .and_then(|meta| meta.to_xdr(stellar_xdr::Limits::none()).ok());
 
         // Build (envelope, seq_num) pairs for all txs (applied + failed) so
         // sequence-based removal drops superseded queued txs for the same account.
@@ -2488,7 +2488,7 @@ impl App {
             let seq_num = envelope_sequence_number(tx);
             all_txs.push((tx.clone(), seq_num));
 
-            use stellar_xdr::curr::TransactionResultResult;
+            use stellar_xdr::TransactionResultResult;
             let is_success = matches!(
                 tx_result.result.result,
                 TransactionResultResult::TxSuccess(_)
@@ -2673,8 +2673,8 @@ impl App {
             let prep_start = std::time::Instant::now();
 
             let ledger_flags = match &result_header.ext {
-                stellar_xdr::curr::LedgerHeaderExt::V0 => 0,
-                stellar_xdr::curr::LedgerHeaderExt::V1(ext) => ext.flags,
+                stellar_xdr::LedgerHeaderExt::V0 => 0,
+                stellar_xdr::LedgerHeaderExt::V1(ext) => ext.flags,
             };
             let close_time_ctx = result_header.scp_value.close_time.0;
             let base_fee = result_header.base_fee;
@@ -3050,7 +3050,7 @@ mod extract_contract_events_tests {
     use super::*;
     use std::sync::Arc;
 
-    use stellar_xdr::curr::{
+    use stellar_xdr::{
         ContractEvent, ContractEventBody, ContractEventType, ContractEventV0, ExtensionPoint, Hash,
         Memo, MuxedAccount, Preconditions, ScVal, SequenceNumber, SorobanTransactionMeta,
         SorobanTransactionMetaExt, Transaction, TransactionEnvelope, TransactionExt,
@@ -3179,7 +3179,7 @@ mod extract_contract_events_tests {
 
     #[test]
     fn test_extract_v4_per_op_events() {
-        use stellar_xdr::curr::{OperationMetaV2, TransactionMetaV4};
+        use stellar_xdr::{OperationMetaV2, TransactionMetaV4};
 
         let env = test_envelope();
         let result = test_result_pair(true);
@@ -3605,17 +3605,17 @@ mod restore_result_tests {
                     &has_json,
                 )?;
                 // Store a minimal ledger header at seq 100.
-                let header = stellar_xdr::curr::LedgerHeader {
+                let header = stellar_xdr::LedgerHeader {
                     ledger_version: 20,
-                    previous_ledger_hash: stellar_xdr::curr::Hash([0u8; 32]),
-                    scp_value: stellar_xdr::curr::StellarValue {
-                        tx_set_hash: stellar_xdr::curr::Hash([0u8; 32]),
-                        close_time: stellar_xdr::curr::TimePoint(1234567890),
+                    previous_ledger_hash: stellar_xdr::Hash([0u8; 32]),
+                    scp_value: stellar_xdr::StellarValue {
+                        tx_set_hash: stellar_xdr::Hash([0u8; 32]),
+                        close_time: stellar_xdr::TimePoint(1234567890),
                         upgrades: vec![].try_into().unwrap(),
-                        ext: stellar_xdr::curr::StellarValueExt::Basic,
+                        ext: stellar_xdr::StellarValueExt::Basic,
                     },
-                    tx_set_result_hash: stellar_xdr::curr::Hash([0u8; 32]),
-                    bucket_list_hash: stellar_xdr::curr::Hash([1u8; 32]),
+                    tx_set_result_hash: stellar_xdr::Hash([0u8; 32]),
+                    bucket_list_hash: stellar_xdr::Hash([1u8; 32]),
                     ledger_seq: 100,
                     total_coins: 100_000_000_000_000_000,
                     fee_pool: 0,
@@ -3624,11 +3624,11 @@ mod restore_result_tests {
                     base_fee: 100,
                     base_reserve: 5_000_000,
                     max_tx_set_size: 100,
-                    skip_list: std::array::from_fn(|_| stellar_xdr::curr::Hash([0u8; 32])),
-                    ext: stellar_xdr::curr::LedgerHeaderExt::V0,
+                    skip_list: std::array::from_fn(|_| stellar_xdr::Hash([0u8; 32])),
+                    ext: stellar_xdr::LedgerHeaderExt::V0,
                 };
-                use stellar_xdr::curr::WriteXdr;
-                let data = header.to_xdr(stellar_xdr::curr::Limits::none()).unwrap();
+                use stellar_xdr::WriteXdr;
+                let data = header.to_xdr(stellar_xdr::Limits::none()).unwrap();
                 conn.store_ledger_header(&header, &data)?;
                 Ok::<_, henyey_db::DbError>(())
             })
@@ -3727,7 +3727,7 @@ mod fatal_shutdown_tests {
 mod refresh_stale_buffer_tests {
     use super::*;
     use henyey_common::Hash256;
-    use stellar_xdr::curr::{Limits, StellarValue, StellarValueExt, TimePoint, WriteXdr};
+    use stellar_xdr::{Limits, StellarValue, StellarValueExt, TimePoint, WriteXdr};
 
     /// Helper: create a minimal App for testing.
     ///
@@ -3767,13 +3767,13 @@ mod refresh_stale_buffer_tests {
 
         // Build a valid StellarValue XDR for the externalized slot.
         let stellar_value = StellarValue {
-            tx_set_hash: stellar_xdr::curr::Hash(tx_set_hash.0),
+            tx_set_hash: stellar_xdr::Hash(tx_set_hash.0),
             close_time: TimePoint(1_700_000_000),
             upgrades: Default::default(),
             ext: StellarValueExt::Basic,
         };
         let value_bytes = stellar_value.to_xdr(Limits::none()).unwrap();
-        let value = stellar_xdr::curr::Value(value_bytes.try_into().unwrap());
+        let value = stellar_xdr::Value(value_bytes.try_into().unwrap());
 
         // Seed the herder: record the slot as externalized (with valid XDR).
         app.herder
@@ -3830,13 +3830,13 @@ mod refresh_stale_buffer_tests {
         let tx_set_hash = *tx_set.hash();
 
         let stellar_value = StellarValue {
-            tx_set_hash: stellar_xdr::curr::Hash(tx_set_hash.0),
+            tx_set_hash: stellar_xdr::Hash(tx_set_hash.0),
             close_time: TimePoint(1_700_000_000),
             upgrades: Default::default(),
             ext: StellarValueExt::Basic,
         };
         let value_bytes = stellar_value.to_xdr(Limits::none()).unwrap();
-        let value = stellar_xdr::curr::Value(value_bytes.try_into().unwrap());
+        let value = stellar_xdr::Value(value_bytes.try_into().unwrap());
 
         app.herder
             .scp_driver()
@@ -4034,8 +4034,8 @@ mod publish_skip_marker_tests {
 
     /// Convenience: minimal LedgerHeader fixture for the persist path.
     /// Mirrors `persist::tests::make_header` but is private to this module.
-    fn persist_test_header(seq: u32) -> (stellar_xdr::curr::LedgerHeader, Vec<u8>) {
-        use stellar_xdr::curr::{
+    fn persist_test_header(seq: u32) -> (stellar_xdr::LedgerHeader, Vec<u8>) {
+        use stellar_xdr::{
             Hash, LedgerHeader, LedgerHeaderExt, LedgerHeaderExtensionV1,
             LedgerHeaderExtensionV1Ext, Limits, StellarValue, StellarValueExt, WriteXdr,
         };
@@ -4044,7 +4044,7 @@ mod publish_skip_marker_tests {
             previous_ledger_hash: Hash([0; 32]),
             scp_value: StellarValue {
                 tx_set_hash: Hash([0; 32]),
-                close_time: stellar_xdr::curr::TimePoint(0),
+                close_time: stellar_xdr::TimePoint(0),
                 upgrades: vec![].try_into().unwrap(),
                 ext: StellarValueExt::Basic,
             },
@@ -4086,7 +4086,7 @@ mod scp_history_persistence_ordering_tests {
     use henyey_history::HistoryArchiveState;
     use henyey_scp::hash_quorum_set;
     use std::sync::Arc;
-    use stellar_xdr::curr::{
+    use stellar_xdr::{
         Hash, LedgerHeader, LedgerHeaderExt, NodeId, PublicKey, ScpBallot, ScpEnvelope,
         ScpQuorumSet, ScpStatement, ScpStatementExternalize, ScpStatementPledges, Signature,
         StellarValue, StellarValueExt, TimePoint, TransactionHistoryEntry,

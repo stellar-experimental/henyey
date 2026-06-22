@@ -9,7 +9,7 @@
 //! `GET_SCP_STATE_MAX_RATE` (61), `QUERY_RESPONSE_MULTIPLIER` (136).
 
 use std::time::Duration;
-use stellar_xdr::curr::StellarMessage;
+use stellar_xdr::StellarMessage;
 
 /// Maximum number of ledger slots used for per-peer rate-limit windows.
 /// Matches stellar-core's `Config::MAX_SLOTS_TO_REMEMBER` (default 12).
@@ -76,7 +76,7 @@ pub fn query_rate_limit_window(close_duration: Duration) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use stellar_xdr::curr::{Hello, Uint256};
+    use stellar_xdr::{Hello, Uint256};
 
     #[test]
     fn classify_returns_correct_variants() {
@@ -100,16 +100,16 @@ mod tests {
             ledger_version: 0,
             overlay_version: 0,
             overlay_min_version: 0,
-            network_id: stellar_xdr::curr::Hash([0; 32]),
-            version_str: stellar_xdr::curr::StringM::default(),
+            network_id: stellar_xdr::Hash([0; 32]),
+            version_str: stellar_xdr::StringM::default(),
             listening_port: 0,
-            peer_id: stellar_xdr::curr::NodeId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
-                Uint256([0; 32]),
-            )),
-            cert: stellar_xdr::curr::AuthCert {
-                pubkey: stellar_xdr::curr::Curve25519Public { key: [0; 32] },
+            peer_id: stellar_xdr::NodeId(stellar_xdr::PublicKey::PublicKeyTypeEd25519(Uint256(
+                [0; 32],
+            ))),
+            cert: stellar_xdr::AuthCert {
+                pubkey: stellar_xdr::Curve25519Public { key: [0; 32] },
                 expiration: 0,
-                sig: stellar_xdr::curr::Signature::default(),
+                sig: stellar_xdr::Signature::default(),
             },
             nonce: Uint256([0; 32]),
         });

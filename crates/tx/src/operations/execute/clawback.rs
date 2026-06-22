@@ -4,7 +4,7 @@
 //! - Clawback (clawback from a trustline)
 //! - ClawbackClaimableBalance (clawback from a claimable balance)
 
-use stellar_xdr::curr::{
+use stellar_xdr::{
     AccountId, Asset, ClaimableBalanceFlags, ClawbackClaimableBalanceOp,
     ClawbackClaimableBalanceResult, ClawbackClaimableBalanceResultCode, ClawbackOp, ClawbackResult,
     ClawbackResultCode, LedgerKey, LedgerKeyClaimableBalance, MuxedAccount, OperationResult,
@@ -35,7 +35,7 @@ pub(crate) fn execute_clawback(
     // stellar-core compares the full MuxedAccount XDR values, so a MuxedEd25519
     // with the same base key as the source Ed25519 is NOT considered "self".
     let source_as_muxed = MuxedAccount::Ed25519(match source.0 {
-        stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(ref k) => k.clone(),
+        stellar_xdr::PublicKey::PublicKeyTypeEd25519(ref k) => k.clone(),
     });
     if op.from == source_as_muxed {
         return Ok(make_clawback_result(ClawbackResultCode::Malformed));
@@ -145,7 +145,7 @@ pub(crate) fn execute_clawback_claimable_balance(
     // Check the claimable balance entry itself has CLAWBACK_ENABLED flag
     // (stellar-core checks isClawbackEnabledOnClaimableBalance, NOT the issuer account)
     let cb_clawback_enabled = match &entry.ext {
-        stellar_xdr::curr::ClaimableBalanceEntryExt::V1(v1) => {
+        stellar_xdr::ClaimableBalanceEntryExt::V1(v1) => {
             v1.flags & ClaimableBalanceFlags::ClaimableBalanceClawbackEnabledFlag as u32 != 0
         }
         _ => false,
@@ -216,7 +216,7 @@ mod tests {
     use super::*;
     use crate::test_utils::create_test_account_id;
     use crate::TxError;
-    use stellar_xdr::curr::*;
+    use stellar_xdr::*;
 
     const AUTHORIZED_FLAG: u32 = TrustLineFlags::AuthorizedFlag as u32;
 

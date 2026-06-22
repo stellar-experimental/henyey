@@ -18,7 +18,7 @@ use std::net::SocketAddr;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
-use stellar_xdr::curr::ErrorCode;
+use stellar_xdr::ErrorCode;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 

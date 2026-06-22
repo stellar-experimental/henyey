@@ -8,7 +8,7 @@
 //! XDR discriminant lives inside the `.data` field (whereas stellar-core's
 //! C++ templates operate on the discriminant directly via `.type()`).
 
-use stellar_xdr::curr::*;
+use stellar_xdr::*;
 
 /// Returns `true` if the entry is a Soroban entry (`ContractData` or `ContractCode`).
 ///

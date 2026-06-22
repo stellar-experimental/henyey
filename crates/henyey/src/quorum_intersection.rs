@@ -29,7 +29,7 @@ use henyey_scp::quorum_intersection::{
     check_intersection, find_unsatisfiable_node, IntersectionResult,
 };
 use serde::Deserialize;
-use stellar_xdr::curr::{NodeId, ScpQuorumSet};
+use stellar_xdr::{NodeId, ScpQuorumSet};
 
 /// JSON representation of the network configuration for quorum intersection analysis.
 #[derive(Debug, Deserialize)]
@@ -120,7 +120,7 @@ pub(crate) fn check_quorum_intersection_from_json(path: &Path) -> anyhow::Result
 
 /// Converts a node ID to its hexadecimal representation for display.
 fn node_id_to_hex(node: &NodeId) -> String {
-    use stellar_xdr::curr::PublicKey;
+    use stellar_xdr::PublicKey;
     match node.0 {
         PublicKey::PublicKeyTypeEd25519(ref key) => hex::encode(key.0),
     }

@@ -6,7 +6,7 @@
 //! Placed in `henyey-common` so both `henyey-ledger` and `henyey-db` can
 //! call it without introducing a circular crate dependency.
 
-use stellar_xdr::curr::LedgerHeader;
+use stellar_xdr::LedgerHeader;
 
 /// Validate ledger header field invariants.
 ///
@@ -60,7 +60,7 @@ pub fn validate_header_fields(header: &LedgerHeader) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use stellar_xdr::curr::{Hash, StellarValue, StellarValueExt};
+    use stellar_xdr::{Hash, StellarValue, StellarValueExt};
 
     fn make_valid_header() -> LedgerHeader {
         LedgerHeader {
@@ -68,8 +68,8 @@ mod tests {
             previous_ledger_hash: Hash([0u8; 32]),
             scp_value: StellarValue {
                 tx_set_hash: Hash([0u8; 32]),
-                close_time: stellar_xdr::curr::TimePoint(1_000_000),
-                upgrades: stellar_xdr::curr::VecM::default(),
+                close_time: stellar_xdr::TimePoint(1_000_000),
+                upgrades: stellar_xdr::VecM::default(),
                 ext: StellarValueExt::Basic,
             },
             tx_set_result_hash: Hash([0u8; 32]),
@@ -83,7 +83,7 @@ mod tests {
             base_reserve: 100_000_000,
             max_tx_set_size: 100,
             skip_list: std::array::from_fn(|_| Hash([0u8; 32])),
-            ext: stellar_xdr::curr::LedgerHeaderExt::V0,
+            ext: stellar_xdr::LedgerHeaderExt::V0,
         }
     }
 
@@ -141,14 +141,14 @@ mod tests {
     #[test]
     fn test_close_time_at_i64_max_passes() {
         let mut header = make_valid_header();
-        header.scp_value.close_time = stellar_xdr::curr::TimePoint(i64::MAX as u64);
+        header.scp_value.close_time = stellar_xdr::TimePoint(i64::MAX as u64);
         assert!(validate_header_fields(&header).is_ok());
     }
 
     #[test]
     fn test_close_time_exceeds_i64_max_fails() {
         let mut header = make_valid_header();
-        header.scp_value.close_time = stellar_xdr::curr::TimePoint(i64::MAX as u64 + 1);
+        header.scp_value.close_time = stellar_xdr::TimePoint(i64::MAX as u64 + 1);
         let err = validate_header_fields(&header).unwrap_err();
         assert!(err.contains("close_time exceeds i64::MAX"), "{}", err);
     }

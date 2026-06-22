@@ -45,7 +45,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
-use stellar_xdr::curr::{LedgerEntry, LedgerKey, Limits, WriteXdr};
+use stellar_xdr::{LedgerEntry, LedgerKey, Limits, WriteXdr};
 
 use henyey_common::fs_utils::durable_rename;
 use henyey_common::{BucketListDbConfig, Hash256};
@@ -1006,7 +1006,7 @@ impl BucketManager {
     pub fn visit_ledger_entries_of_type<A>(
         &self,
         bucket_hashes: &[Hash256],
-        entry_type: stellar_xdr::curr::LedgerEntryType,
+        entry_type: stellar_xdr::LedgerEntryType,
         accept_entry: A,
         min_ledger: Option<u32>,
     ) -> Result<bool>
@@ -1129,7 +1129,7 @@ impl BucketManager {
 
             for entry in bucket.try_iter()? {
                 match entry? {
-                    stellar_xdr::curr::HotArchiveBucketEntry::Archived(ref ledger_entry) => {
+                    stellar_xdr::HotArchiveBucketEntry::Archived(ref ledger_entry) => {
                         let key = henyey_common::entry_to_key(ledger_entry);
                         let key_bytes = key.to_xdr(Limits::none()).map_err(|e| {
                             BucketError::Serialization(format!(
@@ -1139,7 +1139,7 @@ impl BucketManager {
                         })?;
                         state.insert(key_bytes, ledger_entry.clone());
                     }
-                    stellar_xdr::curr::HotArchiveBucketEntry::Live(ref key) => {
+                    stellar_xdr::HotArchiveBucketEntry::Live(ref key) => {
                         // Live = restore marker (tombstone) — remove from archive
                         let key_bytes = key.to_xdr(Limits::none()).map_err(|e| {
                             BucketError::Serialization(format!(
@@ -1149,7 +1149,7 @@ impl BucketManager {
                         })?;
                         state.remove(&key_bytes);
                     }
-                    stellar_xdr::curr::HotArchiveBucketEntry::Metaentry(_) => {
+                    stellar_xdr::HotArchiveBucketEntry::Metaentry(_) => {
                         // Skip metadata entries
                     }
                 }
@@ -1180,7 +1180,7 @@ impl BucketManager {
         bucket_hashes: &[Hash256],
         protocol_version: u32,
     ) -> Result<Arc<Bucket>> {
-        use stellar_xdr::curr::BucketMetadata;
+        use stellar_xdr::BucketMetadata;
 
         // Load complete state
         let entries = self.load_complete_ledger_state(bucket_hashes)?;
@@ -1195,7 +1195,7 @@ impl BucketManager {
         // Add metadata
         bucket_entries.push(crate::BucketEntry::Metaentry(BucketMetadata {
             ledger_version: protocol_version,
-            ext: stellar_xdr::curr::BucketMetadataExt::V0,
+            ext: stellar_xdr::BucketMetadataExt::V0,
         }));
 
         // Add all entries as LIVE (not INIT since these are resolved entries)
@@ -1544,7 +1544,7 @@ mod tests {
     use crate::future_bucket::MergeKey;
     use crate::merge::DeadEntryPolicy;
     use crate::BucketEntry; // Re-import to shadow XDR's BucketEntry
-    use stellar_xdr::curr::*;
+    use stellar_xdr::*;
     use tempfile::TempDir;
 
     fn make_account_id(bytes: [u8; 32]) -> AccountId {

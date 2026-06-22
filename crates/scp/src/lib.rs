@@ -230,7 +230,7 @@ impl EnvelopeState {
 }
 
 // Re-export XDR types commonly used with SCP
-pub use stellar_xdr::curr::{
+pub use stellar_xdr::{
     NodeId, ScpBallot, ScpEnvelope, ScpNomination, ScpQuorumSet, ScpStatement, ScpStatementConfirm,
     ScpStatementExternalize, ScpStatementPledges, ScpStatementPrepare, Value,
 };
@@ -352,7 +352,7 @@ mod tests {
                     slot_index: 1,
                     pledges: ScpStatementPledges::Nominate(nomination),
                 },
-                signature: stellar_xdr::curr::Signature(Vec::new().try_into().unwrap()),
+                signature: stellar_xdr::Signature(Vec::new().try_into().unwrap()),
             }
         };
 

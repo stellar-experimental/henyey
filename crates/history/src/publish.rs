@@ -57,7 +57,7 @@ use henyey_common::fs_utils::{
 };
 use henyey_common::Hash256;
 use std::path::{Path, PathBuf};
-use stellar_xdr::curr::{
+use stellar_xdr::{
     LedgerHeaderHistoryEntry, TransactionHistoryEntry, TransactionHistoryResultEntry, WriteXdr,
 };
 use tracing::{debug, info, warn};
@@ -407,7 +407,7 @@ impl PublishManager {
 
                     let xdr = result_entry
                         .tx_result_set
-                        .to_xdr(stellar_xdr::curr::Limits::none())
+                        .to_xdr(stellar_xdr::Limits::none())
                         .map_err(|e| HistoryError::VerificationFailed(e.to_string()))?;
                     verify::verify_tx_result_set(header, &xdr)?;
                 }
@@ -683,7 +683,7 @@ mod tests {
 
     #[test]
     fn test_publish_checkpoint_rejects_bad_header_entry_hash() {
-        use stellar_xdr::curr::{
+        use stellar_xdr::{
             Hash, LedgerHeader, LedgerHeaderExt, LedgerHeaderHistoryEntryExt, StellarValue,
             StellarValueExt, TimePoint, VecM,
         };
@@ -738,7 +738,7 @@ mod tests {
     async fn test_build_has_hash_matches_bucket_list_hash() {
         use henyey_bucket::BucketList;
         use sha2::{Digest, Sha256};
-        use stellar_xdr::curr::*;
+        use stellar_xdr::*;
 
         let mut bl = BucketList::new();
 
@@ -849,7 +849,7 @@ mod tests {
     async fn test_build_has_hash_matches_with_hot_archive() {
         use henyey_bucket::{BucketList, HotArchiveBucketList};
         use sha2::{Digest, Sha256};
-        use stellar_xdr::curr::*;
+        use stellar_xdr::*;
 
         let mut bl = BucketList::new();
         let mut habl = HotArchiveBucketList::new();
@@ -1051,7 +1051,7 @@ mod tests {
     async fn test_quickstart_local_mode_has_hash_matches_header() {
         use henyey_bucket::{BucketList, HotArchiveBucketList};
         use sha2::{Digest, Sha256};
-        use stellar_xdr::curr::{
+        use stellar_xdr::{
             AccountEntry, AccountEntryExt, AccountId, BucketListType, LedgerEntry, LedgerEntryData,
             LedgerEntryExt, PublicKey, SequenceNumber, String32, StringM, Thresholds, Uint256,
             VecM,
@@ -1292,7 +1292,7 @@ mod tests {
 
     #[test]
     fn test_write_xdr_gz_atomic() {
-        use stellar_xdr::curr::LedgerHeaderHistoryEntry;
+        use stellar_xdr::LedgerHeaderHistoryEntry;
 
         let temp = TempDir::new().unwrap();
         let config = PublishConfig {
@@ -1390,28 +1390,26 @@ mod tests {
 
         // Create an in-memory bucket with entries, serialize to XDR bytes,
         // then create a disk-backed bucket from those bytes.
-        let entries = vec![stellar_xdr::curr::BucketEntry::Liveentry(
-            stellar_xdr::curr::LedgerEntry {
+        let entries = vec![stellar_xdr::BucketEntry::Liveentry(
+            stellar_xdr::LedgerEntry {
                 last_modified_ledger_seq: 1,
-                data: stellar_xdr::curr::LedgerEntryData::Account(
-                    stellar_xdr::curr::AccountEntry {
-                        account_id: stellar_xdr::curr::AccountId(
-                            stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
-                                stellar_xdr::curr::Uint256([1u8; 32]),
-                            ),
-                        ),
-                        balance: 100,
-                        seq_num: stellar_xdr::curr::SequenceNumber(1),
-                        num_sub_entries: 0,
-                        inflation_dest: None,
-                        flags: 0,
-                        home_domain: stellar_xdr::curr::String32::default(),
-                        thresholds: stellar_xdr::curr::Thresholds([1, 0, 0, 0]),
-                        signers: Vec::new().try_into().unwrap(),
-                        ext: stellar_xdr::curr::AccountEntryExt::V0,
-                    },
-                ),
-                ext: stellar_xdr::curr::LedgerEntryExt::V0,
+                data: stellar_xdr::LedgerEntryData::Account(stellar_xdr::AccountEntry {
+                    account_id: stellar_xdr::AccountId(
+                        stellar_xdr::PublicKey::PublicKeyTypeEd25519(stellar_xdr::Uint256(
+                            [1u8; 32],
+                        )),
+                    ),
+                    balance: 100,
+                    seq_num: stellar_xdr::SequenceNumber(1),
+                    num_sub_entries: 0,
+                    inflation_dest: None,
+                    flags: 0,
+                    home_domain: stellar_xdr::String32::default(),
+                    thresholds: stellar_xdr::Thresholds([1, 0, 0, 0]),
+                    signers: Vec::new().try_into().unwrap(),
+                    ext: stellar_xdr::AccountEntryExt::V0,
+                }),
+                ext: stellar_xdr::LedgerEntryExt::V0,
             },
         )];
         let in_memory_bucket = henyey_bucket::Bucket::from_entries(entries).unwrap();
@@ -1479,11 +1477,11 @@ mod tests {
     /// Helper: create a header with hashes matching the given tx set and result set.
     fn make_header_with_hashes(
         ledger_seq: u32,
-        prev_hash: stellar_xdr::curr::Hash,
+        prev_hash: stellar_xdr::Hash,
         tx_set: &henyey_ledger::TransactionSetVariant,
-        result_set: &stellar_xdr::curr::TransactionResultSet,
-    ) -> stellar_xdr::curr::LedgerHeader {
-        use stellar_xdr::curr::*;
+        result_set: &stellar_xdr::TransactionResultSet,
+    ) -> stellar_xdr::LedgerHeader {
+        use stellar_xdr::*;
 
         let tx_set_hash = crate::verify::compute_tx_set_hash(tx_set).unwrap();
         let result_xdr = result_set.to_xdr(Limits::none()).unwrap();
@@ -1514,11 +1512,11 @@ mod tests {
     }
 
     /// Helper: create a LedgerHeaderHistoryEntry with computed hash.
-    fn make_header_entry(header: stellar_xdr::curr::LedgerHeader) -> LedgerHeaderHistoryEntry {
-        use stellar_xdr::curr::LedgerHeaderHistoryEntryExt;
+    fn make_header_entry(header: stellar_xdr::LedgerHeader) -> LedgerHeaderHistoryEntry {
+        use stellar_xdr::LedgerHeaderHistoryEntryExt;
         let hash = henyey_ledger::compute_header_hash(&header).unwrap();
         LedgerHeaderHistoryEntry {
-            hash: stellar_xdr::curr::Hash(hash.0),
+            hash: stellar_xdr::Hash(hash.0),
             header,
             ext: LedgerHeaderHistoryEntryExt::default(),
         }
@@ -1528,16 +1526,16 @@ mod tests {
     /// Helper to construct an empty TransactionHistoryEntry and TransactionHistoryResultEntry
     /// for a header. Used only in tests for publish-side verification.
     fn make_empty_entries(
-        header: &stellar_xdr::curr::LedgerHeader,
+        header: &stellar_xdr::LedgerHeader,
     ) -> (
-        stellar_xdr::curr::TransactionHistoryEntry,
-        stellar_xdr::curr::TransactionHistoryResultEntry,
+        stellar_xdr::TransactionHistoryEntry,
+        stellar_xdr::TransactionHistoryResultEntry,
     ) {
-        use stellar_xdr::curr::{
+        use stellar_xdr::{
             TransactionHistoryEntryExt, TransactionHistoryResultEntry,
             TransactionHistoryResultEntryExt, TransactionResultSet, TransactionSet,
         };
-        let tx_history = stellar_xdr::curr::TransactionHistoryEntry {
+        let tx_history = stellar_xdr::TransactionHistoryEntry {
             ledger_seq: header.ledger_seq,
             tx_set: TransactionSet {
                 previous_ledger_hash: header.previous_ledger_hash.clone(),
@@ -1557,7 +1555,7 @@ mod tests {
 
     #[test]
     fn test_publish_checkpoint_sparse_entries() {
-        use stellar_xdr::curr::*;
+        use stellar_xdr::*;
 
         let temp = TempDir::new().unwrap();
         let manager = PublishManager::new(PublishConfig {
@@ -1662,7 +1660,7 @@ mod tests {
 
     #[test]
     fn test_publish_checkpoint_all_empty() {
-        use stellar_xdr::curr::*;
+        use stellar_xdr::*;
 
         let temp = TempDir::new().unwrap();
         let manager = PublishManager::new(PublishConfig {
@@ -1720,7 +1718,7 @@ mod tests {
 
     #[test]
     fn test_publish_checkpoint_rejects_one_sided_presence() {
-        use stellar_xdr::curr::*;
+        use stellar_xdr::*;
 
         let temp = TempDir::new().unwrap();
         let manager = PublishManager::new(PublishConfig {
@@ -1780,7 +1778,7 @@ mod tests {
 
     #[test]
     fn test_publish_checkpoint_rejects_duplicate_entries() {
-        use stellar_xdr::curr::*;
+        use stellar_xdr::*;
 
         let temp = TempDir::new().unwrap();
         let manager = PublishManager::new(PublishConfig {

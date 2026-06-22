@@ -40,9 +40,7 @@ use std::sync::{Arc, OnceLock};
 use memmap2::Mmap;
 
 use sha2::{Digest, Sha256};
-use stellar_xdr::curr::{
-    BucketEntry as XdrBucketEntry, LedgerEntryType, LedgerKey, Limits, ReadXdr,
-};
+use stellar_xdr::{BucketEntry as XdrBucketEntry, LedgerEntryType, LedgerKey, Limits, ReadXdr};
 
 use henyey_common::{BucketListDbConfig, Hash256};
 
@@ -227,17 +225,16 @@ impl Iterator for StreamingXdrEntryIterator {
             }
             self.record_count += 1;
 
-            let xdr_entry =
-                match stellar_xdr::curr::BucketEntry::from_xdr(record.body, Limits::none()) {
-                    Ok(entry) => entry,
-                    Err(e) => {
-                        self.failed = true;
-                        return Some(Err(BucketError::Serialization(format!(
-                            "Failed to parse bucket entry at offset {}: {}",
-                            record.offset, e
-                        ))));
-                    }
-                };
+            let xdr_entry = match stellar_xdr::BucketEntry::from_xdr(record.body, Limits::none()) {
+                Ok(entry) => entry,
+                Err(e) => {
+                    self.failed = true;
+                    return Some(Err(BucketError::Serialization(format!(
+                        "Failed to parse bucket entry at offset {}: {}",
+                        record.offset, e
+                    ))));
+                }
+            };
 
             // Validate sorted-unique invariant before filtering metadata
             if let Err(e) = self.validator.validate(&xdr_entry) {
@@ -801,8 +798,8 @@ impl DiskBucket {
                 format!("no XDR record at offset {}", offset),
             ))
         })?;
-        let xdr_entry = stellar_xdr::curr::BucketEntry::from_xdr(record.body, Limits::none())
-            .map_err(|e| {
+        let xdr_entry =
+            stellar_xdr::BucketEntry::from_xdr(record.body, Limits::none()).map_err(|e| {
                 BucketError::Serialization(format!(
                     "Failed to parse entry at offset {}: {}",
                     record.offset, e
@@ -842,8 +839,8 @@ impl DiskBucket {
             let Some(record) = records.next_record()? else {
                 break;
             };
-            let entry = stellar_xdr::curr::BucketEntry::from_xdr(record.body, Limits::none())
-                .map_err(|e| {
+            let entry =
+                stellar_xdr::BucketEntry::from_xdr(record.body, Limits::none()).map_err(|e| {
                     BucketError::Serialization(format!(
                         "Failed to parse entry at offset {} during page scan: {}",
                         record.offset, e
@@ -960,7 +957,7 @@ impl Iterator for DiskBucketIter {
                 return Some(Err(e));
             }
         };
-        match stellar_xdr::curr::BucketEntry::from_xdr(record.body, Limits::none()) {
+        match stellar_xdr::BucketEntry::from_xdr(record.body, Limits::none()) {
             Ok(xdr_entry) => Some(Ok(xdr_entry)),
             Err(e) => {
                 self.failed = true;
@@ -1005,7 +1002,7 @@ impl Iterator for DiskBucketOffsetIter {
             }
         };
         let total_record_size = record.next_offset - record.offset;
-        match stellar_xdr::curr::BucketEntry::from_xdr(record.body, Limits::none()) {
+        match stellar_xdr::BucketEntry::from_xdr(record.body, Limits::none()) {
             Ok(xdr_entry) => Some(Ok((xdr_entry, total_record_size))),
             Err(e) => {
                 self.failed = true;
@@ -1022,11 +1019,11 @@ impl Iterator for DiskBucketOffsetIter {
 mod tests {
     use super::*;
     use crate::error::BucketError;
-    use stellar_xdr::curr::*;
+    use stellar_xdr::*;
     use tempfile::tempdir;
 
     fn make_test_bucket_bytes() -> Vec<u8> {
-        use stellar_xdr::curr::WriteXdr;
+        use stellar_xdr::WriteXdr;
 
         let mut bytes = Vec::new();
 
@@ -1050,7 +1047,7 @@ mod tests {
             ext: LedgerEntryExt::V0,
         };
 
-        let bucket_entry = stellar_xdr::curr::BucketEntry::Liveentry(entry);
+        let bucket_entry = stellar_xdr::BucketEntry::Liveentry(entry);
         let entry_bytes = bucket_entry.to_xdr(Limits::none()).unwrap();
 
         // Write with record mark
@@ -1212,7 +1209,7 @@ mod tests {
     }
 
     fn make_multi_entry_bucket_bytes(count: usize) -> Vec<u8> {
-        use stellar_xdr::curr::WriteXdr;
+        use stellar_xdr::WriteXdr;
 
         let mut bytes = Vec::new();
 
@@ -1239,7 +1236,7 @@ mod tests {
                 ext: LedgerEntryExt::V0,
             };
 
-            let bucket_entry = stellar_xdr::curr::BucketEntry::Liveentry(entry);
+            let bucket_entry = stellar_xdr::BucketEntry::Liveentry(entry);
             let entry_bytes = bucket_entry.to_xdr(Limits::none()).unwrap();
 
             // Write with record mark
@@ -1384,7 +1381,7 @@ mod tests {
 
     /// Build raw XDR bytes for a single account entry with the given key byte.
     fn make_entry_bytes(key_byte: u8) -> Vec<u8> {
-        use stellar_xdr::curr::WriteXdr;
+        use stellar_xdr::WriteXdr;
 
         let account = AccountEntry {
             account_id: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([key_byte; 32]))),
@@ -1403,7 +1400,7 @@ mod tests {
             data: LedgerEntryData::Account(account),
             ext: LedgerEntryExt::V0,
         };
-        let bucket_entry = stellar_xdr::curr::BucketEntry::Liveentry(entry);
+        let bucket_entry = stellar_xdr::BucketEntry::Liveentry(entry);
         let entry_bytes = bucket_entry.to_xdr(Limits::none()).unwrap();
 
         let mut bytes = Vec::new();
@@ -1415,7 +1412,7 @@ mod tests {
 
     /// Build a `BucketEntry::Liveentry(account)` for the given key byte, matching
     /// the on-disk record produced by `make_entry_bytes`.
-    fn make_account_bucket_entry(key_byte: u8) -> stellar_xdr::curr::BucketEntry {
+    fn make_account_bucket_entry(key_byte: u8) -> stellar_xdr::BucketEntry {
         let account = AccountEntry {
             account_id: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([key_byte; 32]))),
             balance: 100,
@@ -1433,7 +1430,7 @@ mod tests {
             data: LedgerEntryData::Account(account),
             ext: LedgerEntryExt::V0,
         };
-        stellar_xdr::curr::BucketEntry::Liveentry(entry)
+        stellar_xdr::BucketEntry::Liveentry(entry)
     }
 
     /// Build a DiskBucket backed by a forced `DiskIndex` (via a zero
@@ -1445,7 +1442,7 @@ mod tests {
 
         // Write sorted account records to disk and collect (entry, offset) pairs.
         let mut file_bytes = Vec::new();
-        let mut entries: Vec<(stellar_xdr::curr::BucketEntry, u64)> = Vec::new();
+        let mut entries: Vec<(stellar_xdr::BucketEntry, u64)> = Vec::new();
         for key_byte in 1..=n {
             let offset = file_bytes.len() as u64;
             file_bytes.extend(make_entry_bytes(key_byte));
@@ -1575,9 +1572,9 @@ mod tests {
     }
 
     fn make_metaentry_bytes(ledger_version: u32) -> Vec<u8> {
-        use stellar_xdr::curr::{BucketMetadata, BucketMetadataExt, WriteXdr};
+        use stellar_xdr::{BucketMetadata, BucketMetadataExt, WriteXdr};
 
-        let entry = stellar_xdr::curr::BucketEntry::Metaentry(BucketMetadata {
+        let entry = stellar_xdr::BucketEntry::Metaentry(BucketMetadata {
             ledger_version,
             ext: BucketMetadataExt::V0,
         });

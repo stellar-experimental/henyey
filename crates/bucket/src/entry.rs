@@ -36,7 +36,7 @@
 use std::cmp::Ordering;
 
 use sha2::{Digest, Sha256};
-use stellar_xdr::curr::{
+use stellar_xdr::{
     BucketEntryType, Hash, LedgerEntry, LedgerEntryData, LedgerKey, LedgerKeyTtl, Limits, ReadXdr,
     WriteXdr,
 };
@@ -57,7 +57,7 @@ use crate::{BucketError, Result};
 /// | `Deadentry`  | A tombstone marking deletion                     | Shadows any older entry     |
 /// | `Initentry`  | Entry created in this merge window (CAP-0020)    | Special annihilation rules  |
 /// | `Metaentry`  | Bucket metadata (protocol version, type)         | Merged by taking max version|
-pub type BucketEntry = stellar_xdr::curr::BucketEntry;
+pub type BucketEntry = stellar_xdr::BucketEntry;
 
 /// Extension trait adding bucket-specific convenience methods to the XDR `BucketEntry`.
 pub trait BucketEntryExt {
@@ -154,7 +154,7 @@ pub(crate) fn compare_keys(a: &LedgerKey, b: &LedgerKey) -> Ordering {
 /// Returns the ledger entry type for a given ledger key.
 ///
 /// Delegates to the XDR crate's inherent `LedgerKey::discriminant()` method.
-pub(crate) fn ledger_key_type(key: &LedgerKey) -> stellar_xdr::curr::LedgerEntryType {
+pub(crate) fn ledger_key_type(key: &LedgerKey) -> stellar_xdr::LedgerEntryType {
     key.discriminant()
 }
 
@@ -162,8 +162,8 @@ pub(crate) fn ledger_key_type(key: &LedgerKey) -> stellar_xdr::curr::LedgerEntry
 ///
 /// Delegates to the XDR crate's inherent `LedgerEntryData::discriminant()` method.
 pub(crate) fn ledger_entry_data_type(
-    data: &stellar_xdr::curr::LedgerEntryData,
-) -> stellar_xdr::curr::LedgerEntryType {
+    data: &stellar_xdr::LedgerEntryData,
+) -> stellar_xdr::LedgerEntryType {
     data.discriminant()
 }
 
@@ -338,8 +338,8 @@ pub fn get_ttl_live_until(ttl_entry: &LedgerEntry) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use stellar_xdr::curr::*;
-    // Disambiguate: super::BucketEntry (type alias) vs stellar_xdr::curr::BucketEntry
+    use stellar_xdr::*;
+    // Disambiguate: super::BucketEntry (type alias) vs stellar_xdr::BucketEntry
     use super::BucketEntry;
 
     fn make_account_id(bytes: [u8; 32]) -> AccountId {

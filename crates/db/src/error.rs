@@ -47,7 +47,7 @@ pub enum DbError {
     /// Occurs when reading or writing Stellar XDR-encoded data to/from
     /// the database. This can indicate data corruption or version mismatch.
     #[error("XDR error: {0}")]
-    Xdr(#[from] stellar_xdr::curr::Error),
+    Xdr(#[from] stellar_xdr::Error),
 
     /// Requested data was not found.
     ///

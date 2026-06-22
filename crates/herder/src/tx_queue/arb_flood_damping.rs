@@ -12,7 +12,7 @@ use henyey_ledger::offer::AssetPair;
 use rand::distributions::Distribution;
 use rand::rngs::StdRng;
 use rand::SeedableRng;
-use stellar_xdr::curr::{Asset, Operation, OperationBody};
+use stellar_xdr::{Asset, Operation, OperationBody};
 
 // ---------------------------------------------------------------------------
 // Loop detection
@@ -126,7 +126,7 @@ struct AssetKey(Vec<u8>);
 
 impl AssetKey {
     fn from(asset: &Asset) -> Self {
-        use stellar_xdr::curr::{Limits, WriteXdr};
+        use stellar_xdr::{Limits, WriteXdr};
         Self(
             asset
                 .to_xdr(Limits::none())
@@ -378,16 +378,16 @@ impl Distribution<u32> for GeometricDistribution {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use stellar_xdr::curr::{
+    use stellar_xdr::{
         AlphaNum4, AssetCode4, PathPaymentStrictReceiveOp, PathPaymentStrictSendOp, Uint256, VecM,
     };
 
     fn make_asset(code: &[u8; 4]) -> Asset {
         Asset::CreditAlphanum4(AlphaNum4 {
             asset_code: AssetCode4(*code),
-            issuer: stellar_xdr::curr::AccountId(
-                stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(Uint256([0u8; 32])),
-            ),
+            issuer: stellar_xdr::AccountId(stellar_xdr::PublicKey::PublicKeyTypeEd25519(Uint256(
+                [0u8; 32],
+            ))),
         })
     }
 
@@ -401,7 +401,7 @@ mod tests {
             body: OperationBody::PathPaymentStrictReceive(PathPaymentStrictReceiveOp {
                 send_asset: send,
                 send_max: 1_000_000,
-                destination: stellar_xdr::curr::MuxedAccount::Ed25519(Uint256([0u8; 32])),
+                destination: stellar_xdr::MuxedAccount::Ed25519(Uint256([0u8; 32])),
                 dest_asset: dest,
                 dest_amount: 1,
                 path: path.try_into().unwrap_or_else(|_| VecM::default()),
@@ -415,7 +415,7 @@ mod tests {
             body: OperationBody::PathPaymentStrictSend(PathPaymentStrictSendOp {
                 send_asset: send,
                 send_amount: 1_000_000,
-                destination: stellar_xdr::curr::MuxedAccount::Ed25519(Uint256([0u8; 32])),
+                destination: stellar_xdr::MuxedAccount::Ed25519(Uint256([0u8; 32])),
                 dest_asset: dest,
                 dest_min: 1,
                 path: path.try_into().unwrap_or_else(|_| VecM::default()),

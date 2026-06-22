@@ -122,7 +122,7 @@ pub enum OverlayError {
     // ===== Wrapped Errors =====
     /// XDR serialization/deserialization error.
     #[error("XDR error: {0}")]
-    Xdr(#[from] stellar_xdr::curr::Error),
+    Xdr(#[from] stellar_xdr::Error),
 
     /// Cryptographic operation failed.
     #[error("crypto error: {0}")]

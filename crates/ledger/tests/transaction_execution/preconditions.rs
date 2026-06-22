@@ -548,7 +548,7 @@ fn test_fee_bump_result_encoding() {
         fee_source: source,
         fee: 200,
         inner_tx: FeeBumpTransactionInnerTx::Tx(inner_env),
-        ext: stellar_xdr::curr::FeeBumpTransactionExt::V0,
+        ext: stellar_xdr::FeeBumpTransactionExt::V0,
     };
 
     let envelope = TransactionEnvelope::TxFeeBump(FeeBumpTransactionEnvelope {
@@ -624,7 +624,7 @@ fn test_audit_574_fee_bump_outer_failure_is_top_level() {
         fee_source: source,
         fee: 200,
         inner_tx: FeeBumpTransactionInnerTx::Tx(inner_env),
-        ext: stellar_xdr::curr::FeeBumpTransactionExt::V0,
+        ext: stellar_xdr::FeeBumpTransactionExt::V0,
     };
 
     let envelope = TransactionEnvelope::TxFeeBump(FeeBumpTransactionEnvelope {
@@ -693,9 +693,9 @@ fn test_operation_failure_rolls_back_changes() {
 
     let op_payment = Operation {
         source_account: None,
-        body: OperationBody::Payment(stellar_xdr::curr::PaymentOp {
+        body: OperationBody::Payment(stellar_xdr::PaymentOp {
             destination: MuxedAccount::Ed25519(Uint256([9u8; 32])),
-            asset: stellar_xdr::curr::Asset::Native,
+            asset: stellar_xdr::Asset::Native,
             amount: 10,
         }),
     };
@@ -759,7 +759,7 @@ fn test_fee_bump_inner_signature_uses_low_threshold() {
 
     // Inner source: master_weight=1, low=1, medium=2, high=3
     // Master key has weight 1 which passes low (1) but fails medium (2)
-    let inner_key = LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
+    let inner_key = LedgerKey::Account(stellar_xdr::LedgerKeyAccount {
         account_id: inner_account_id.clone(),
     });
     let inner_entry = LedgerEntry {
@@ -823,7 +823,7 @@ fn test_fee_bump_inner_signature_uses_low_threshold() {
         fee_source: MuxedAccount::Ed25519(Uint256(*fee_secret.public_key().as_bytes())),
         fee: 200,
         inner_tx: FeeBumpTransactionInnerTx::Tx(inner_v1),
-        ext: stellar_xdr::curr::FeeBumpTransactionExt::V0,
+        ext: stellar_xdr::FeeBumpTransactionExt::V0,
     };
 
     let mut envelope = TransactionEnvelope::TxFeeBump(FeeBumpTransactionEnvelope {
@@ -910,7 +910,7 @@ fn test_fee_bump_outer_source_frozen_key_rejected() {
         fee_source: MuxedAccount::Ed25519(Uint256(*fee_secret.public_key().as_bytes())),
         fee: 200,
         inner_tx: FeeBumpTransactionInnerTx::Tx(inner_env),
-        ext: stellar_xdr::curr::FeeBumpTransactionExt::V0,
+        ext: stellar_xdr::FeeBumpTransactionExt::V0,
     };
 
     let mut envelope = TransactionEnvelope::TxFeeBump(FeeBumpTransactionEnvelope {
@@ -948,7 +948,7 @@ fn test_fee_bump_outer_source_frozen_key_rejected() {
         account_id: fee_account_id.clone(),
     });
     let frozen_key_bytes = fee_account_ledger_key
-        .to_xdr(stellar_xdr::curr::Limits::none())
+        .to_xdr(stellar_xdr::Limits::none())
         .unwrap();
 
     let mut context = henyey_tx::LedgerContext::new(1, 1_000, 100, 5_000_000, 26, network_id);
@@ -1003,9 +1003,9 @@ fn test_fee_bump_outer_source_frozen_bypass_allowed() {
 
     let operation = Operation {
         source_account: None,
-        body: OperationBody::Payment(stellar_xdr::curr::PaymentOp {
+        body: OperationBody::Payment(stellar_xdr::PaymentOp {
             destination: MuxedAccount::Ed25519(Uint256([98u8; 32])),
-            asset: stellar_xdr::curr::Asset::Native,
+            asset: stellar_xdr::Asset::Native,
             amount: 1_000_000,
         }),
     };
@@ -1029,7 +1029,7 @@ fn test_fee_bump_outer_source_frozen_bypass_allowed() {
         fee_source: MuxedAccount::Ed25519(Uint256(*fee_secret.public_key().as_bytes())),
         fee: 200,
         inner_tx: FeeBumpTransactionInnerTx::Tx(inner_env),
-        ext: stellar_xdr::curr::FeeBumpTransactionExt::V0,
+        ext: stellar_xdr::FeeBumpTransactionExt::V0,
     };
 
     let mut envelope = TransactionEnvelope::TxFeeBump(FeeBumpTransactionEnvelope {
@@ -1071,7 +1071,7 @@ fn test_fee_bump_outer_source_frozen_bypass_allowed() {
         account_id: fee_account_id.clone(),
     });
     let frozen_key_bytes = fee_account_ledger_key
-        .to_xdr(stellar_xdr::curr::Limits::none())
+        .to_xdr(stellar_xdr::Limits::none())
         .unwrap();
 
     let mut context = henyey_tx::LedgerContext::new(1, 1_000, 100, 5_000_000, 26, network_id);
@@ -1145,7 +1145,7 @@ fn test_inner_source_frozen_key_rejected() {
         account_id: account_id.clone(),
     });
     let frozen_key_bytes = account_ledger_key
-        .to_xdr(stellar_xdr::curr::Limits::none())
+        .to_xdr(stellar_xdr::Limits::none())
         .unwrap();
 
     let mut context = henyey_tx::LedgerContext::new(1, 1_000, 100, 5_000_000, 26, network_id);
@@ -1189,9 +1189,9 @@ fn test_inner_source_frozen_bypass_allowed() {
 
     let operation = Operation {
         source_account: None,
-        body: OperationBody::Payment(stellar_xdr::curr::PaymentOp {
+        body: OperationBody::Payment(stellar_xdr::PaymentOp {
             destination: MuxedAccount::Ed25519(Uint256([96u8; 32])),
-            asset: stellar_xdr::curr::Asset::Native,
+            asset: stellar_xdr::Asset::Native,
             amount: 1_000_000,
         }),
     };
@@ -1226,7 +1226,7 @@ fn test_inner_source_frozen_bypass_allowed() {
         account_id: account_id.clone(),
     });
     let frozen_key_bytes = account_ledger_key
-        .to_xdr(stellar_xdr::curr::Limits::none())
+        .to_xdr(stellar_xdr::Limits::none())
         .unwrap();
 
     let mut context = henyey_tx::LedgerContext::new(1, 1_000, 100, 5_000_000, 26, network_id);
@@ -1905,7 +1905,7 @@ fn test_fee_bump_outer_fee_checked_before_fee_source_load() {
 
     // Fee-bump with fee=1 (way too low, base_fee=100 * 1 op = 100 minimum)
     let fee_bump_tx = FeeBumpTransaction {
-        ext: stellar_xdr::curr::FeeBumpTransactionExt::V0,
+        ext: stellar_xdr::FeeBumpTransactionExt::V0,
         fee_source: MuxedAccount::Ed25519(Uint256(*fee_source_secret.public_key().as_bytes())),
         fee: 1, // Insufficient
         inner_tx: FeeBumpTransactionInnerTx::Tx(signed_inner),
@@ -1997,7 +1997,7 @@ fn test_fee_bump_time_bounds_checked_before_inner_source_load() {
 
     // Fee-bump with sufficient fee
     let fee_bump_tx = FeeBumpTransaction {
-        ext: stellar_xdr::curr::FeeBumpTransactionExt::V0,
+        ext: stellar_xdr::FeeBumpTransactionExt::V0,
         fee_source: MuxedAccount::Ed25519(Uint256(*fee_source_secret.public_key().as_bytes())),
         fee: 200, // Sufficient (inner fee=100, so outer must be >= inner)
         inner_tx: FeeBumpTransactionInnerTx::Tx(signed_inner),
@@ -2231,7 +2231,7 @@ fn test_audit_238_fee_bump_bad_outer_sig_before_seq_check() {
     // Inner tx has BAD seq_num (99 instead of 2) — would produce TxBadSeq if reached
     let payment_op = Operation {
         source_account: None,
-        body: OperationBody::Payment(stellar_xdr::curr::PaymentOp {
+        body: OperationBody::Payment(stellar_xdr::PaymentOp {
             destination: MuxedAccount::Ed25519(Uint256([9u8; 32])),
             asset: Asset::Native,
             amount: 1,
@@ -2263,7 +2263,7 @@ fn test_audit_238_fee_bump_bad_outer_sig_before_seq_check() {
         fee_source: MuxedAccount::Ed25519(Uint256(*fee_secret.public_key().as_bytes())),
         fee: 200,
         inner_tx: FeeBumpTransactionInnerTx::Tx(inner_v1),
-        ext: stellar_xdr::curr::FeeBumpTransactionExt::V0,
+        ext: stellar_xdr::FeeBumpTransactionExt::V0,
     };
 
     let mut envelope = TransactionEnvelope::TxFeeBump(FeeBumpTransactionEnvelope {
@@ -2325,7 +2325,7 @@ fn test_audit_238_fee_bump_good_outer_sig_bad_inner_seq() {
 
     let payment_op = Operation {
         source_account: None,
-        body: OperationBody::Payment(stellar_xdr::curr::PaymentOp {
+        body: OperationBody::Payment(stellar_xdr::PaymentOp {
             destination: MuxedAccount::Ed25519(Uint256([9u8; 32])),
             asset: Asset::Native,
             amount: 1,
@@ -2357,7 +2357,7 @@ fn test_audit_238_fee_bump_good_outer_sig_bad_inner_seq() {
         fee_source: MuxedAccount::Ed25519(Uint256(*fee_secret.public_key().as_bytes())),
         fee: 200,
         inner_tx: FeeBumpTransactionInnerTx::Tx(inner_v1),
-        ext: stellar_xdr::curr::FeeBumpTransactionExt::V0,
+        ext: stellar_xdr::FeeBumpTransactionExt::V0,
     };
 
     let mut envelope = TransactionEnvelope::TxFeeBump(FeeBumpTransactionEnvelope {
@@ -2409,7 +2409,7 @@ fn test_audit_238_fee_bump_outer_auth_uses_snapshot_not_mutated_state() {
         key: SignerKey::Ed25519(Uint256(*extra_signer_pubkey.as_bytes())),
         weight: 1,
     };
-    let fee_key = LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
+    let fee_key = LedgerKey::Account(stellar_xdr::LedgerKeyAccount {
         account_id: fee_account_id.clone(),
     });
     let fee_entry = LedgerEntry {
@@ -2490,7 +2490,7 @@ fn test_audit_238_fee_bump_outer_auth_uses_snapshot_not_mutated_state() {
     // TX2: fee-bump signed by extra_signer_secret (removed from fee source by TX1)
     let payment_op = Operation {
         source_account: None,
-        body: OperationBody::Payment(stellar_xdr::curr::PaymentOp {
+        body: OperationBody::Payment(stellar_xdr::PaymentOp {
             destination: MuxedAccount::Ed25519(Uint256([9u8; 32])),
             asset: Asset::Native,
             amount: 1,
@@ -2522,7 +2522,7 @@ fn test_audit_238_fee_bump_outer_auth_uses_snapshot_not_mutated_state() {
         fee_source: MuxedAccount::Ed25519(Uint256(*fee_secret.public_key().as_bytes())),
         fee: 200,
         inner_tx: FeeBumpTransactionInnerTx::Tx(inner_v1),
-        ext: stellar_xdr::curr::FeeBumpTransactionExt::V0,
+        ext: stellar_xdr::FeeBumpTransactionExt::V0,
     };
 
     let mut envelope = TransactionEnvelope::TxFeeBump(FeeBumpTransactionEnvelope {
@@ -2583,7 +2583,7 @@ fn test_audit_238_fee_bump_outer_auth_same_source() {
 
     let payment_op = Operation {
         source_account: None,
-        body: OperationBody::Payment(stellar_xdr::curr::PaymentOp {
+        body: OperationBody::Payment(stellar_xdr::PaymentOp {
             destination: MuxedAccount::Ed25519(Uint256([9u8; 32])),
             asset: Asset::Native,
             amount: 1,
@@ -2617,7 +2617,7 @@ fn test_audit_238_fee_bump_outer_auth_same_source() {
         fee_source: MuxedAccount::Ed25519(Uint256(*source_secret.public_key().as_bytes())),
         fee: 200,
         inner_tx: FeeBumpTransactionInnerTx::Tx(inner_v1),
-        ext: stellar_xdr::curr::FeeBumpTransactionExt::V0,
+        ext: stellar_xdr::FeeBumpTransactionExt::V0,
     };
 
     let mut envelope = TransactionEnvelope::TxFeeBump(FeeBumpTransactionEnvelope {
@@ -2658,9 +2658,7 @@ fn test_execute_transaction_rejects_over_depth_envelope() {
     // Build a deeply nested ScVal to exceed XDR depth limit of 500
     let mut val = ScVal::U32(42);
     for _ in 0..501 {
-        val = ScVal::Vec(Some(stellar_xdr::curr::ScVec(
-            vec![val].try_into().unwrap(),
-        )));
+        val = ScVal::Vec(Some(stellar_xdr::ScVec(vec![val].try_into().unwrap())));
     }
 
     let secret = SecretKey::from_seed(&[7u8; 32]);
@@ -2754,7 +2752,7 @@ fn test_execute_transaction_insufficient_available_balance_rejects() {
 
     // balance=100, num_sub_entries=1 (V0 ext). minBalance with base_reserve=25
     // is (2 + 1) * 25 = 75. Available after fee=50 is 100 - 50 - 75 = -25.
-    let key = LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
+    let key = LedgerKey::Account(stellar_xdr::LedgerKeyAccount {
         account_id: account_id.clone(),
     });
     let entry = LedgerEntry {
@@ -2780,9 +2778,9 @@ fn test_execute_transaction_insufficient_available_balance_rejects() {
 
     let operation = Operation {
         source_account: None,
-        body: OperationBody::Payment(stellar_xdr::curr::PaymentOp {
+        body: OperationBody::Payment(stellar_xdr::PaymentOp {
             destination: MuxedAccount::Ed25519(Uint256([9u8; 32])),
-            asset: stellar_xdr::curr::Asset::Native,
+            asset: stellar_xdr::Asset::Native,
             amount: 1,
         }),
     };
@@ -2844,7 +2842,7 @@ fn test_execute_transaction_insufficient_balance_via_selling_liabilities() {
     let secret = SecretKey::from_seed(&[72u8; 32]);
     let account_id: AccountId = (&secret.public_key()).into();
 
-    let key = LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
+    let key = LedgerKey::Account(stellar_xdr::LedgerKeyAccount {
         account_id: account_id.clone(),
     });
     let entry = LedgerEntry {
@@ -2876,9 +2874,9 @@ fn test_execute_transaction_insufficient_balance_via_selling_liabilities() {
 
     let operation = Operation {
         source_account: None,
-        body: OperationBody::Payment(stellar_xdr::curr::PaymentOp {
+        body: OperationBody::Payment(stellar_xdr::PaymentOp {
             destination: MuxedAccount::Ed25519(Uint256([9u8; 32])),
-            asset: stellar_xdr::curr::Asset::Native,
+            asset: stellar_xdr::Asset::Native,
             amount: 1,
         }),
     };

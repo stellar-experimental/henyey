@@ -5,7 +5,7 @@ use henyey_bucket::BucketList;
 use henyey_common::{Hash256, NetworkId};
 
 use henyey_tx::TransactionFrame;
-use stellar_xdr::curr::{LedgerHeader, ScpHistoryEntry, WriteXdr};
+use stellar_xdr::{LedgerHeader, ScpHistoryEntry, WriteXdr};
 use tracing::warn;
 
 use super::{CatchupManager, LedgerData};
@@ -27,7 +27,7 @@ impl CatchupManager {
 
                 for data in ledger_data {
                     let header = data.header();
-                    let header_xdr = header.to_xdr(stellar_xdr::curr::Limits::none())?;
+                    let header_xdr = header.to_xdr(stellar_xdr::Limits::none())?;
                     conn.store_ledger_header(header, &header_xdr)?;
 
                     // Only store tx/result entries for Present data.
@@ -58,12 +58,12 @@ impl CatchupManager {
                             .map_err(|e| DbError::Integrity(e.to_string()))?;
                         let tx_id = tx_hash.to_hex();
 
-                        let tx_body = tx.to_xdr(stellar_xdr::curr::Limits::none())?;
-                        let tx_result_xdr = tx_result.to_xdr(stellar_xdr::curr::Limits::none())?;
+                        let tx_body = tx.to_xdr(stellar_xdr::Limits::none())?;
+                        let tx_result_xdr = tx_result.to_xdr(stellar_xdr::Limits::none())?;
 
                         // Compute status from result code
                         let status = {
-                            use stellar_xdr::curr::TransactionResultCode;
+                            use stellar_xdr::TransactionResultCode;
                             let code = tx_result.result.result.discriminant();
                             if code == TransactionResultCode::TxSuccess
                                 || code == TransactionResultCode::TxFeeBumpInnerSuccess
@@ -158,7 +158,7 @@ impl CatchupManager {
         self.db
             .with_connection(|conn| {
                 use henyey_db::queries::LedgerQueries;
-                let header_xdr = header.to_xdr(stellar_xdr::curr::Limits::none())?;
+                let header_xdr = header.to_xdr(stellar_xdr::Limits::none())?;
                 conn.store_ledger_header(header, &header_xdr)?;
                 Ok(())
             })
@@ -175,9 +175,9 @@ impl CatchupManager {
     /// `getLedgers`) see entries for the replayed range. The streaming callback
     /// (if configured) writes the meta to the fd:3 pipe for captive core
     /// consumers like stellar-rpc and horizon.
-    pub(super) fn emit_meta(&self, ledger_seq: u32, meta: stellar_xdr::curr::LedgerCloseMeta) {
+    pub(super) fn emit_meta(&self, ledger_seq: u32, meta: stellar_xdr::LedgerCloseMeta) {
         // Persist to SQLite first (to_xdr borrows &self on meta, no clone needed).
-        match meta.to_xdr(stellar_xdr::curr::Limits::none()) {
+        match meta.to_xdr(stellar_xdr::Limits::none()) {
             Ok(meta_xdr) => {
                 if let Err(err) = self.db.store_ledger_close_meta(ledger_seq, &meta_xdr) {
                     warn!(
@@ -210,7 +210,7 @@ mod tests {
     use henyey_bucket::BucketManager;
     use henyey_common::protocol::LclContext;
     use henyey_db::Database;
-    use stellar_xdr::curr::{
+    use stellar_xdr::{
         Hash, LedgerHeader, Memo, MuxedAccount, Preconditions, SequenceNumber, Transaction,
         TransactionEnvelope, TransactionExt, TransactionHistoryEntry, TransactionHistoryEntryExt,
         TransactionHistoryResultEntry, TransactionHistoryResultEntryExt, TransactionResult,
@@ -415,7 +415,7 @@ mod tests {
     #[test]
     fn test_make_empty_tx_set_v20_sequential() {
         use henyey_ledger::TransactionSetVariant;
-        use stellar_xdr::curr::{GeneralizedTransactionSet, TransactionPhase};
+        use stellar_xdr::{GeneralizedTransactionSet, TransactionPhase};
 
         let lcl = LclContext::new(20, henyey_common::Hash256([7u8; 32]));
         let tx_set = make_empty_tx_set(&lcl);
@@ -440,7 +440,7 @@ mod tests {
     #[test]
     fn test_make_empty_tx_set_v22_sequential() {
         use henyey_ledger::TransactionSetVariant;
-        use stellar_xdr::curr::{GeneralizedTransactionSet, TransactionPhase};
+        use stellar_xdr::{GeneralizedTransactionSet, TransactionPhase};
 
         let lcl = LclContext::new(22, henyey_common::Hash256([5u8; 32]));
         let tx_set = make_empty_tx_set(&lcl);
@@ -460,7 +460,7 @@ mod tests {
     #[test]
     fn test_make_empty_tx_set_v23_parallel() {
         use henyey_ledger::TransactionSetVariant;
-        use stellar_xdr::curr::{GeneralizedTransactionSet, TransactionPhase};
+        use stellar_xdr::{GeneralizedTransactionSet, TransactionPhase};
 
         let lcl = LclContext::new(23, henyey_common::Hash256([9u8; 32]));
         let tx_set = make_empty_tx_set(&lcl);
@@ -722,11 +722,11 @@ mod tests {
             ledger_seq,
             ledger_version: current_protocol,
             previous_ledger_hash,
-            scp_value: stellar_xdr::curr::StellarValue {
-                tx_set_hash: stellar_xdr::curr::Hash(tx_set_hash.0),
-                close_time: stellar_xdr::curr::TimePoint(0),
+            scp_value: stellar_xdr::StellarValue {
+                tx_set_hash: stellar_xdr::Hash(tx_set_hash.0),
+                close_time: stellar_xdr::TimePoint(0),
                 upgrades: Default::default(),
-                ext: stellar_xdr::curr::StellarValueExt::Basic,
+                ext: stellar_xdr::StellarValueExt::Basic,
             },
             ..Default::default()
         }
@@ -776,7 +776,7 @@ mod tests {
         // Steady state: LCL at 20, current at 20. Generalized V0+V0.
         use crate::verify::verify_tx_set;
         use henyey_ledger::TransactionSetVariant;
-        use stellar_xdr::curr::{GeneralizedTransactionSet, TransactionPhase};
+        use stellar_xdr::{GeneralizedTransactionSet, TransactionPhase};
 
         let header = make_header_with_empty_tx_set_hash(200, 20, 20);
         let lcl = LclContext::new(20, henyey_common::Hash256(header.previous_ledger_hash.0));
@@ -798,7 +798,7 @@ mod tests {
         // Protocol boundary: LCL at 22 (Generalized V0+V0), current upgrades to 23.
         use crate::verify::verify_tx_set;
         use henyey_ledger::TransactionSetVariant;
-        use stellar_xdr::curr::{GeneralizedTransactionSet, TransactionPhase};
+        use stellar_xdr::{GeneralizedTransactionSet, TransactionPhase};
 
         let header = make_header_with_empty_tx_set_hash(300, 23, 22);
         let lcl = LclContext::new(22, henyey_common::Hash256(header.previous_ledger_hash.0));
@@ -824,7 +824,7 @@ mod tests {
         // Steady state: LCL at 23, current at 23. Generalized V0+V1 (parallel).
         use crate::verify::verify_tx_set;
         use henyey_ledger::TransactionSetVariant;
-        use stellar_xdr::curr::{GeneralizedTransactionSet, TransactionPhase};
+        use stellar_xdr::{GeneralizedTransactionSet, TransactionPhase};
 
         let header = make_header_with_empty_tx_set_hash(400, 23, 23);
         let lcl = LclContext::new(23, henyey_common::Hash256(header.previous_ledger_hash.0));
@@ -930,11 +930,11 @@ mod tests {
             ledger_seq: 2,
             ledger_version: 23,
             previous_ledger_hash: prev_hash,
-            scp_value: stellar_xdr::curr::StellarValue {
-                tx_set_hash: stellar_xdr::curr::Hash(hash_v23.0),
-                close_time: stellar_xdr::curr::TimePoint(0),
+            scp_value: stellar_xdr::StellarValue {
+                tx_set_hash: stellar_xdr::Hash(hash_v23.0),
+                close_time: stellar_xdr::TimePoint(0),
                 upgrades: Default::default(),
-                ext: stellar_xdr::curr::StellarValueExt::Basic,
+                ext: stellar_xdr::StellarValueExt::Basic,
             },
             ..Default::default()
         };

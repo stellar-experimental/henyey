@@ -44,7 +44,7 @@ pub enum Error {
     ///
     /// Occurs when serializing or deserializing Stellar XDR types fails.
     #[error("XDR error: {0}")]
-    Xdr(#[from] stellar_xdr::curr::Error),
+    Xdr(#[from] stellar_xdr::Error),
 
     /// I/O error.
     ///

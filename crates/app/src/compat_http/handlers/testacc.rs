@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 
 use henyey_common::network::NetworkId;
 use henyey_crypto::SecretKey;
-use stellar_xdr::curr::{AccountId, PublicKey, Uint256};
+use stellar_xdr::{AccountId, PublicKey, Uint256};
 
 use crate::compat_http::CompatServerState;
 

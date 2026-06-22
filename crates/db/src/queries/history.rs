@@ -11,7 +11,7 @@
 
 use henyey_common::xdr_stream::XdrOutputStream;
 use rusqlite::{params, Connection, OptionalExtension};
-use stellar_xdr::curr::{
+use stellar_xdr::{
     Limits, ReadXdr, TransactionHistoryEntry, TransactionHistoryResultEntry, WriteXdr,
 };
 
@@ -514,7 +514,7 @@ impl HistoryQueries for Connection {
 mod tests {
     use super::*;
     use rusqlite::Connection;
-    use stellar_xdr::curr::{
+    use stellar_xdr::{
         Hash, TransactionHistoryEntryExt, TransactionHistoryResultEntryExt, TransactionResultSet,
         TransactionSet, VecM,
     };

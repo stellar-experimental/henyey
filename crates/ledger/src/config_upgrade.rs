@@ -25,7 +25,7 @@ use henyey_common::protocol::{
 use henyey_common::Hash256;
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
-use stellar_xdr::curr::{
+use stellar_xdr::{
     ConfigSettingEntry, ConfigSettingId, ConfigUpgradeSet, ConfigUpgradeSetKey,
     ContractDataDurability, EncodedLedgerKey, FreezeBypassTxs, FrozenLedgerKeys,
     FrozenLedgerKeysDelta, Hash, LedgerEntry, LedgerEntryData, LedgerEntryExt, LedgerKey,
@@ -183,7 +183,7 @@ impl ConfigUpgradeSetFrame {
 
         // Extract CONTRACT_DATA
         let contract_data = match &entry.data {
-            stellar_xdr::curr::LedgerEntryData::ContractData(cd) => cd,
+            stellar_xdr::LedgerEntryData::ContractData(cd) => cd,
             _ => return Ok(None),
         };
 
@@ -252,7 +252,7 @@ impl ConfigUpgradeSetFrame {
 
     /// Get the TTL key for a CONTRACT_DATA entry.
     fn get_ttl_key(data_key: &LedgerKey) -> LedgerKey {
-        LedgerKey::Ttl(stellar_xdr::curr::LedgerKeyTtl {
+        LedgerKey::Ttl(stellar_xdr::LedgerKeyTtl {
             key_hash: Hash(Hash256::hash_xdr(data_key).0),
         })
     }
@@ -260,9 +260,7 @@ impl ConfigUpgradeSetFrame {
     /// Check if a TTL entry indicates the data is live.
     fn is_live(ttl_entry: &LedgerEntry, current_ledger: u32) -> bool {
         match &ttl_entry.data {
-            stellar_xdr::curr::LedgerEntryData::Ttl(ttl) => {
-                ttl.live_until_ledger_seq >= current_ledger
-            }
+            stellar_xdr::LedgerEntryData::Ttl(ttl) => ttl.live_until_ledger_seq >= current_ledger,
             _ => false,
         }
     }
@@ -329,7 +327,7 @@ impl ConfigUpgradeSetFrame {
         }
         for updated_entry in self.config_upgrade_set.updated_entry.iter() {
             let setting_id = updated_entry.discriminant();
-            let key = LedgerKey::ConfigSetting(stellar_xdr::curr::LedgerKeyConfigSetting {
+            let key = LedgerKey::ConfigSetting(stellar_xdr::LedgerKeyConfigSetting {
                 config_setting_id: setting_id,
             });
             let entry = ltx.get_entry(&key)?.ok_or_else(|| {
@@ -392,7 +390,7 @@ impl ConfigUpgradeSetFrame {
             }
 
             // Construct the ledger key for this config setting
-            let key = LedgerKey::ConfigSetting(stellar_xdr::curr::LedgerKeyConfigSetting {
+            let key = LedgerKey::ConfigSetting(stellar_xdr::LedgerKeyConfigSetting {
                 config_setting_id: setting_id,
             });
 
@@ -479,7 +477,7 @@ impl ConfigUpgradeSetFrame {
         ltx: &mut CloseLedgerState,
     ) -> Result<(), LedgerError> {
         // Load the base CONFIG_SETTING_FROZEN_LEDGER_KEYS entry
-        let key = LedgerKey::ConfigSetting(stellar_xdr::curr::LedgerKeyConfigSetting {
+        let key = LedgerKey::ConfigSetting(stellar_xdr::LedgerKeyConfigSetting {
             config_setting_id: ConfigSettingId::FrozenLedgerKeys,
         });
         let previous = ltx
@@ -560,7 +558,7 @@ impl ConfigUpgradeSetFrame {
         ltx: &mut CloseLedgerState,
     ) -> Result<(), LedgerError> {
         // Load the base CONFIG_SETTING_FREEZE_BYPASS_TXS entry
-        let key = LedgerKey::ConfigSetting(stellar_xdr::curr::LedgerKeyConfigSetting {
+        let key = LedgerKey::ConfigSetting(stellar_xdr::LedgerKeyConfigSetting {
             config_setting_id: ConfigSettingId::FreezeBypassTxs,
         });
         let previous = ltx
@@ -655,7 +653,7 @@ impl ConfigUpgradeSetFrame {
         };
 
         // Load the current window from the CloseLedgerState (sees prior config upgrades)
-        let window_key = LedgerKey::ConfigSetting(stellar_xdr::curr::LedgerKeyConfigSetting {
+        let window_key = LedgerKey::ConfigSetting(stellar_xdr::LedgerKeyConfigSetting {
             config_setting_id: ConfigSettingId::LiveSorobanStateSizeWindow,
         });
         let window_entry = ltx.get_entry(&window_key).map_err(|e| {
@@ -709,7 +707,7 @@ impl ConfigUpgradeSetFrame {
             "Resized LiveSorobanStateSizeWindow due to config upgrade"
         );
 
-        let new_window: stellar_xdr::curr::VecM<u64> = window_vec
+        let new_window: stellar_xdr::VecM<u64> = window_vec
             .try_into()
             .map_err(|_| LedgerError::Internal("Failed to convert window vec".to_string()))?;
 
@@ -789,10 +787,7 @@ impl ConfigUpgradeSetFrame {
     /// - V21 (before V22): VerifyEcdsaSecp256r1Sig(44) + 1 = 45
     /// - V22-V24 (before V25): Bls12381FrInv(69) + 1 = 70
     /// - V25+: Bn254FrInv(84) + 1 = 85
-    fn is_valid_cost_params(
-        params: &stellar_xdr::curr::ContractCostParams,
-        ledger_version: u32,
-    ) -> bool {
+    fn is_valid_cost_params(params: &stellar_xdr::ContractCostParams, ledger_version: u32) -> bool {
         // Determine expected number of cost types by protocol version.
         // These values come from the ContractCostType XDR enum.
         let expected_count: usize =
@@ -1038,17 +1033,17 @@ pub struct SorobanUpgradeConfig {
     /// Override for `CONFIG_SETTING_CONTRACT_COST_PARAMS_CPU_INSTRUCTIONS`.
     /// When `None`, the CPU cost-params entry is **not** included in the set
     /// (stellar-core sets `updated = false`).
-    pub cpu_cost_params: Option<stellar_xdr::curr::ContractCostParams>,
+    pub cpu_cost_params: Option<stellar_xdr::ContractCostParams>,
     /// Override for `CONFIG_SETTING_CONTRACT_COST_PARAMS_MEMORY_BYTES`.
     /// When `None`, the memory cost-params entry is **not** included.
-    pub mem_cost_params: Option<stellar_xdr::curr::ContractCostParams>,
+    pub mem_cost_params: Option<stellar_xdr::ContractCostParams>,
     /// Delta for `CONFIG_SETTING_FROZEN_LEDGER_KEYS_DELTA`. The delta settings
     /// have no stored ledger entry; the entry is appended **only** when this is
     /// `Some`.
     pub frozen_ledger_keys_delta: Option<FrozenLedgerKeysDelta>,
     /// Delta for `CONFIG_SETTING_FREEZE_BYPASS_TXS_DELTA`. Appended **only**
     /// when `Some`.
-    pub freeze_bypass_txs_delta: Option<stellar_xdr::curr::FreezeBypassTxsDelta>,
+    pub freeze_bypass_txs_delta: Option<stellar_xdr::FreezeBypassTxsDelta>,
 }
 
 /// Build the serialized `ConfigUpgradeSet` bytes for the `create_upgrade`
@@ -1167,7 +1162,7 @@ pub fn build_config_upgrade_set(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use stellar_xdr::curr::ContractId;
+    use stellar_xdr::ContractId;
 
     fn make_test_key() -> ConfigUpgradeSetKey {
         ConfigUpgradeSetKey {
@@ -1252,7 +1247,7 @@ mod tests {
     /// below the (incorrect) old Rust minimums but above the real stellar-core minimums.
     #[test]
     fn test_contract_ledger_cost_v0_accepts_stellar_core_minimum_values() {
-        use stellar_xdr::curr::ConfigSettingContractLedgerCostV0;
+        use stellar_xdr::ConfigSettingContractLedgerCostV0;
 
         // Values at the stellar-core minimum floor - must be accepted
         let cost_at_minimum =
@@ -1307,7 +1302,7 @@ mod tests {
     /// MinimumSorobanNetworkConfig floor values, not the higher initial values.
     #[test]
     fn test_all_config_settings_accept_stellar_core_minimum_values() {
-        use stellar_xdr::curr::{
+        use stellar_xdr::{
             ConfigSettingContractBandwidthV0, ConfigSettingContractComputeV0,
             ConfigSettingContractEventsV0, StateArchivalSettings,
         };
@@ -1391,8 +1386,8 @@ mod tests {
     }
 
     /// Helper to create valid cost params with the given count.
-    fn make_cost_params(count: usize) -> stellar_xdr::curr::ContractCostParams {
-        use stellar_xdr::curr::{ContractCostParamEntry, ExtensionPoint};
+    fn make_cost_params(count: usize) -> stellar_xdr::ContractCostParams {
+        use stellar_xdr::{ContractCostParamEntry, ExtensionPoint};
 
         let entries: Vec<ContractCostParamEntry> = (0..count)
             .map(|_| ContractCostParamEntry {
@@ -1401,7 +1396,7 @@ mod tests {
                 linear_term: 10,
             })
             .collect();
-        stellar_xdr::curr::ContractCostParams(entries.try_into().unwrap())
+        stellar_xdr::ContractCostParams(entries.try_into().unwrap())
     }
 
     #[test]
@@ -1447,7 +1442,7 @@ mod tests {
 
     #[test]
     fn test_cost_params_validation_negative_values_rejected() {
-        use stellar_xdr::curr::{ContractCostParamEntry, ExtensionPoint};
+        use stellar_xdr::{ContractCostParamEntry, ExtensionPoint};
 
         // Create 85 valid params for V25, then make one have negative constTerm
         let mut entries: Vec<ContractCostParamEntry> = (0..85)
@@ -1458,7 +1453,7 @@ mod tests {
             })
             .collect();
         entries[42].const_term = -1;
-        let params = stellar_xdr::curr::ContractCostParams(entries.try_into().unwrap());
+        let params = stellar_xdr::ContractCostParams(entries.try_into().unwrap());
         assert!(
             !ConfigUpgradeSetFrame::is_valid_cost_params(&params, 25),
             "Negative constTerm should be rejected"
@@ -1473,7 +1468,7 @@ mod tests {
             })
             .collect();
         entries[10].linear_term = -5;
-        let params = stellar_xdr::curr::ContractCostParams(entries.try_into().unwrap());
+        let params = stellar_xdr::ContractCostParams(entries.try_into().unwrap());
         assert!(
             !ConfigUpgradeSetFrame::is_valid_cost_params(&params, 25),
             "Negative linearTerm should be rejected"
@@ -1531,21 +1526,21 @@ mod tests {
         }
     }
 
-    fn test_account_id() -> stellar_xdr::curr::AccountId {
-        stellar_xdr::curr::AccountId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
-            stellar_xdr::curr::Uint256([42u8; 32]),
+    fn test_account_id() -> stellar_xdr::AccountId {
+        stellar_xdr::AccountId(stellar_xdr::PublicKey::PublicKeyTypeEd25519(
+            stellar_xdr::Uint256([42u8; 32]),
         ))
     }
 
-    fn test_issuer_id() -> stellar_xdr::curr::AccountId {
-        stellar_xdr::curr::AccountId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
-            stellar_xdr::curr::Uint256([99u8; 32]),
+    fn test_issuer_id() -> stellar_xdr::AccountId {
+        stellar_xdr::AccountId(stellar_xdr::PublicKey::PublicKeyTypeEd25519(
+            stellar_xdr::Uint256([99u8; 32]),
         ))
     }
 
     #[test]
     fn test_frozen_keys_delta_valid_account_key() {
-        let key = LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
+        let key = LedgerKey::Account(stellar_xdr::LedgerKeyAccount {
             account_id: test_account_id(),
         });
         let delta = make_freeze_delta(vec![encode_ledger_key(&key)]);
@@ -1573,7 +1568,7 @@ mod tests {
 
     #[test]
     fn test_frozen_keys_delta_valid_contract_code_key() {
-        let key = LedgerKey::ContractCode(stellar_xdr::curr::LedgerKeyContractCode {
+        let key = LedgerKey::ContractCode(stellar_xdr::LedgerKeyContractCode {
             hash: Hash([20u8; 32]),
         });
         let delta = make_freeze_delta(vec![encode_ledger_key(&key)]);
@@ -1586,7 +1581,7 @@ mod tests {
 
     #[test]
     fn test_frozen_keys_delta_valid_trustline_key() {
-        use stellar_xdr::curr::{AlphaNum4, AssetCode4, LedgerKeyTrustLine};
+        use stellar_xdr::{AlphaNum4, AssetCode4, LedgerKeyTrustLine};
         let key = LedgerKey::Trustline(LedgerKeyTrustLine {
             account_id: test_account_id(),
             asset: TrustLineAsset::CreditAlphanum4(AlphaNum4 {
@@ -1615,7 +1610,7 @@ mod tests {
 
     #[test]
     fn test_frozen_keys_delta_rejects_unsupported_key_type_offer() {
-        let key = LedgerKey::Offer(stellar_xdr::curr::LedgerKeyOffer {
+        let key = LedgerKey::Offer(stellar_xdr::LedgerKeyOffer {
             seller_id: test_account_id(),
             offer_id: 42,
         });
@@ -1629,11 +1624,9 @@ mod tests {
 
     #[test]
     fn test_frozen_keys_delta_rejects_unsupported_key_type_data() {
-        let key = LedgerKey::Data(stellar_xdr::curr::LedgerKeyData {
+        let key = LedgerKey::Data(stellar_xdr::LedgerKeyData {
             account_id: test_account_id(),
-            data_name: stellar_xdr::curr::String64(
-                stellar_xdr::curr::StringM::<64>::try_from("test").unwrap(),
-            ),
+            data_name: stellar_xdr::String64(stellar_xdr::StringM::<64>::try_from("test").unwrap()),
         });
         let delta = make_freeze_delta(vec![encode_ledger_key(&key)]);
         let entry = ConfigSettingEntry::FrozenLedgerKeysDelta(delta);
@@ -1645,11 +1638,10 @@ mod tests {
 
     #[test]
     fn test_freeze_bypass_delta_rejected_before_v26() {
-        let entry =
-            ConfigSettingEntry::FreezeBypassTxsDelta(stellar_xdr::curr::FreezeBypassTxsDelta {
-                add_txs: vec![].try_into().unwrap(),
-                remove_txs: vec![].try_into().unwrap(),
-            });
+        let entry = ConfigSettingEntry::FreezeBypassTxsDelta(stellar_xdr::FreezeBypassTxsDelta {
+            add_txs: vec![].try_into().unwrap(),
+            remove_txs: vec![].try_into().unwrap(),
+        });
         assert!(
             !ConfigUpgradeSetFrame::is_valid_config_setting_entry(&entry, 25),
             "FreezeBypassTxsDelta should be rejected before protocol 26"
@@ -1669,10 +1661,10 @@ mod tests {
 
     #[test]
     fn test_frozen_keys_delta_rejects_pool_share_trustline() {
-        use stellar_xdr::curr::LedgerKeyTrustLine;
+        use stellar_xdr::LedgerKeyTrustLine;
         let key = LedgerKey::Trustline(LedgerKeyTrustLine {
             account_id: test_account_id(),
-            asset: TrustLineAsset::PoolShare(stellar_xdr::curr::PoolId(Hash([50u8; 32]))),
+            asset: TrustLineAsset::PoolShare(stellar_xdr::PoolId(Hash([50u8; 32]))),
         });
         let delta = make_freeze_delta(vec![encode_ledger_key(&key)]);
         let entry = ConfigSettingEntry::FrozenLedgerKeysDelta(delta);
@@ -1684,7 +1676,7 @@ mod tests {
 
     #[test]
     fn test_frozen_keys_delta_rejects_issuer_trustline() {
-        use stellar_xdr::curr::{AlphaNum4, AssetCode4, LedgerKeyTrustLine};
+        use stellar_xdr::{AlphaNum4, AssetCode4, LedgerKeyTrustLine};
         // Create a trustline where the account is the issuer of the asset
         let issuer = test_issuer_id();
         let key = LedgerKey::Trustline(LedgerKeyTrustLine {
@@ -1704,7 +1696,7 @@ mod tests {
 
     #[test]
     fn test_frozen_keys_delta_rejects_issuer_trustline_alphanum12() {
-        use stellar_xdr::curr::{AlphaNum12, AssetCode12, LedgerKeyTrustLine};
+        use stellar_xdr::{AlphaNum12, AssetCode12, LedgerKeyTrustLine};
         let issuer = test_issuer_id();
         let key = LedgerKey::Trustline(LedgerKeyTrustLine {
             account_id: issuer.clone(),
@@ -1735,14 +1727,14 @@ mod tests {
 
     #[test]
     fn test_frozen_keys_delta_mixed_valid_and_invalid() {
-        use stellar_xdr::curr::LedgerKeyTrustLine;
+        use stellar_xdr::LedgerKeyTrustLine;
         // First key is valid (account), second is invalid (pool-share trustline)
-        let valid_key = LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
+        let valid_key = LedgerKey::Account(stellar_xdr::LedgerKeyAccount {
             account_id: test_account_id(),
         });
         let invalid_key = LedgerKey::Trustline(LedgerKeyTrustLine {
             account_id: test_account_id(),
-            asset: TrustLineAsset::PoolShare(stellar_xdr::curr::PoolId(Hash([50u8; 32]))),
+            asset: TrustLineAsset::PoolShare(stellar_xdr::PoolId(Hash([50u8; 32]))),
         });
         let delta = make_freeze_delta(vec![
             encode_ledger_key(&valid_key),
@@ -1757,7 +1749,7 @@ mod tests {
 
     #[test]
     fn test_frozen_keys_delta_rejected_before_v26() {
-        let key = LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
+        let key = LedgerKey::Account(stellar_xdr::LedgerKeyAccount {
             account_id: test_account_id(),
         });
         let delta = make_freeze_delta(vec![encode_ledger_key(&key)]);
@@ -1785,7 +1777,7 @@ mod tests {
     fn test_apply_to_errors_on_missing_config_setting() {
         use crate::close_state::CloseLedgerState;
         use crate::snapshot::{LedgerSnapshot, SnapshotHandle};
-        use stellar_xdr::curr::*;
+        use stellar_xdr::*;
 
         // Build a ConfigUpgradeSetFrame with one setting (ContractComputeV0).
         let upgrade_set = ConfigUpgradeSet {
@@ -1836,7 +1828,7 @@ mod tests {
     fn test_upgrade_needed_all_match() {
         use crate::close_state::CloseLedgerState;
         use crate::snapshot::{LedgerSnapshot, SnapshotHandle};
-        use stellar_xdr::curr::*;
+        use stellar_xdr::*;
 
         let compute_setting =
             ConfigSettingEntry::ContractComputeV0(ConfigSettingContractComputeV0 {
@@ -1884,7 +1876,7 @@ mod tests {
     fn test_upgrade_needed_one_differs() {
         use crate::close_state::CloseLedgerState;
         use crate::snapshot::{LedgerSnapshot, SnapshotHandle};
-        use stellar_xdr::curr::*;
+        use stellar_xdr::*;
 
         let proposed = ConfigSettingEntry::ContractComputeV0(ConfigSettingContractComputeV0 {
             ledger_max_instructions: 200_000_000, // different
@@ -1937,7 +1929,7 @@ mod tests {
     fn test_upgrade_needed_pre_soroban() {
         use crate::close_state::CloseLedgerState;
         use crate::snapshot::{LedgerSnapshot, SnapshotHandle};
-        use stellar_xdr::curr::*;
+        use stellar_xdr::*;
 
         let upgrade_set = ConfigUpgradeSet {
             updated_entry: vec![ConfigSettingEntry::ContractComputeV0(
@@ -1975,7 +1967,7 @@ mod tests {
     fn test_upgrade_needed_missing_entry_returns_error() {
         use crate::close_state::CloseLedgerState;
         use crate::snapshot::{LedgerSnapshot, SnapshotHandle};
-        use stellar_xdr::curr::*;
+        use stellar_xdr::*;
 
         let upgrade_set = ConfigUpgradeSet {
             updated_entry: vec![ConfigSettingEntry::ContractComputeV0(
@@ -2022,7 +2014,7 @@ mod tests {
     fn test_make_from_key_propagates_get_entry_error() {
         use crate::close_state::CloseLedgerState;
         use crate::snapshot::{LedgerSnapshot, SnapshotHandle};
-        use stellar_xdr::curr::*;
+        use stellar_xdr::*;
 
         let key = make_test_key();
 
@@ -2059,7 +2051,7 @@ mod tests {
     fn test_make_from_key_errors_on_missing_ttl() {
         use crate::close_state::CloseLedgerState;
         use crate::snapshot::{LedgerSnapshot, SnapshotHandle};
-        use stellar_xdr::curr::*;
+        use stellar_xdr::*;
 
         let key = make_test_key();
         let lk = ConfigUpgradeSetFrame::get_ledger_key(&key);
@@ -2120,7 +2112,7 @@ mod tests {
     fn test_apply_to_captures_window_resize_in_checkpoint() {
         use crate::close_state::CloseLedgerState;
         use crate::snapshot::{LedgerSnapshot, SnapshotHandle};
-        use stellar_xdr::curr::*;
+        use stellar_xdr::*;
 
         // Create a StateArchival entry that changes window sample size from 5 to 3
         let old_archival = StateArchivalSettings {
@@ -2234,7 +2226,7 @@ mod tests {
     fn test_apply_to_no_window_changes_when_size_unchanged() {
         use crate::close_state::CloseLedgerState;
         use crate::snapshot::{LedgerSnapshot, SnapshotHandle};
-        use stellar_xdr::curr::*;
+        use stellar_xdr::*;
 
         let archival = StateArchivalSettings {
             max_entry_ttl: 100,
@@ -2317,7 +2309,7 @@ mod tests {
     /// the re-emit and skip paths. Non-upgradeable and delta ids are never
     /// queried by the builder.
     fn fixture_load_entry(id: ConfigSettingId) -> Option<ConfigSettingEntry> {
-        use stellar_xdr::curr::ConfigSettingEntry as E;
+        use stellar_xdr::ConfigSettingEntry as E;
         match id {
             ConfigSettingId::ContractMaxSizeBytes => Some(E::ContractMaxSizeBytes(65_536)),
             ConfigSettingId::ContractComputeV0 => Some(E::ContractComputeV0(Default::default())),

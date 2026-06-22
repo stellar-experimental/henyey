@@ -696,7 +696,7 @@ mod tests {
     use super::*;
     use crate::archive_state::HASBucketNext;
     use henyey_bucket::{BucketEntry, HOT_ARCHIVE_BUCKET_LIST_LEVELS};
-    use stellar_xdr::curr::{BucketMetadata, BucketMetadataExt};
+    use stellar_xdr::{BucketMetadata, BucketMetadataExt};
 
     fn meta_entry(version: u32) -> BucketEntry {
         BucketEntry::Metaentry(BucketMetadata {
@@ -928,7 +928,7 @@ mod tests {
     use crate::archive_state::HistoryArchiveState;
     use henyey_bucket::BucketManager;
     use henyey_db::Database;
-    use stellar_xdr::curr::{
+    use stellar_xdr::{
         AccountEntry, AccountEntryExt, AccountId, LedgerEntry, LedgerEntryData, LedgerEntryExt,
         PublicKey, SequenceNumber, String32, Thresholds, Uint256,
     };
@@ -1053,7 +1053,7 @@ mod tests {
     /// fix.
     #[tokio::test]
     async fn test_apply_buckets_full_header_hash_identical_across_fan_out() {
-        use stellar_xdr::curr::{Hash, LedgerHeader};
+        use stellar_xdr::{Hash, LedgerHeader};
 
         // Six distinct non-empty live levels so unbounded fan-out overlaps
         // multiple concurrent restore workers (maximizes any ordering

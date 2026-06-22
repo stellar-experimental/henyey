@@ -33,7 +33,7 @@
 //! scan is out of scope — henyey's `Invariant` trait only exposes the per-op
 //! hook). Strictness: non-strict (`Invariant(false)`).
 
-use stellar_xdr::curr::{
+use stellar_xdr::{
     Asset, ContractEvent, ContractId, ContractIdPreimage, Hash, HashIdPreimage,
     HashIdPreimageContractId, LedgerEntry, LedgerEntryData, LiquidityPoolEntryBody, Operation,
     OperationResult, OperationResultTr, ScAddress, ScVal,
@@ -125,7 +125,7 @@ fn native_balance(entry: &LedgerEntry, native_sac_id: &ContractId) -> NativeBala
 /// Extracts the native-XLM balance from a `ContractData` entry, mirroring the
 /// CONTRACT_DATA branch of stellar-core's `getAssetBalance`.
 fn sac_native_balance(
-    cd: &stellar_xdr::curr::ContractDataEntry,
+    cd: &stellar_xdr::ContractDataEntry,
     native_sac_id: &ContractId,
 ) -> NativeBalance {
     // The entry must be stored under the native SAC contract address.
@@ -296,7 +296,7 @@ impl Invariant for ConservationOfLumens {
             // misleading invariant message. See #2998.
             let inflation_payouts: i64 = match op_result {
                 OperationResult::OpInner(OperationResultTr::Inflation(
-                    stellar_xdr::curr::InflationResult::Success(payouts),
+                    stellar_xdr::InflationResult::Success(payouts),
                 )) => {
                     let mut sum: i64 = 0;
                     for p in payouts.iter() {

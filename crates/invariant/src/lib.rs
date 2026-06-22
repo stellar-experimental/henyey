@@ -25,7 +25,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use stellar_xdr::curr::{
+use stellar_xdr::{
     ContractEvent, LedgerEntry, LedgerHeader, LedgerKey, Operation, OperationResult,
 };
 
@@ -525,7 +525,7 @@ mod tests {
     // Helpers
 
     fn default_header(seq: u32) -> LedgerHeader {
-        use stellar_xdr::curr::*;
+        use stellar_xdr::*;
         LedgerHeader {
             ledger_version: 24,
             previous_ledger_hash: Hash([0; 32]),
@@ -551,7 +551,7 @@ mod tests {
     }
 
     fn dummy_operation() -> Operation {
-        use stellar_xdr::curr::*;
+        use stellar_xdr::*;
         Operation {
             source_account: None,
             body: OperationBody::Inflation,
@@ -559,7 +559,7 @@ mod tests {
     }
 
     fn dummy_op_result() -> OperationResult {
-        use stellar_xdr::curr::*;
+        use stellar_xdr::*;
         OperationResult::OpInner(OperationResultTr::Inflation(InflationResult::NotTime))
     }
 }

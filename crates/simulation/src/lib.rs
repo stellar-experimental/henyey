@@ -16,7 +16,7 @@ use henyey_overlay::{
     AddPeerOutcome, ConnectionFactory, LoopbackConnectionFactory, OverlayError, PeerAddress,
     PeerId, TcpConnectionFactory,
 };
-use stellar_xdr::curr::{
+use stellar_xdr::{
     AccountId, Asset, CreateAccountOp, Memo, MuxedAccount, Operation, OperationBody, Preconditions,
     PublicKey, SequenceNumber, Transaction, TransactionEnvelope, TransactionExt,
     TransactionV1Envelope, Uint256, VecM,
@@ -1667,7 +1667,7 @@ impl Simulation {
         let destination = self.destination_for_node(&generated.destination)?;
         let operation = Operation {
             source_account: None,
-            body: OperationBody::Payment(stellar_xdr::curr::PaymentOp {
+            body: OperationBody::Payment(stellar_xdr::PaymentOp {
                 destination,
                 asset: Asset::Native,
                 amount: generated.amount,
@@ -2395,7 +2395,7 @@ mod genesis_freshness_tests {
     #[test]
     fn test_genesis_init_rejects_stale_headers_without_lcl() {
         use henyey_db::queries::LedgerQueries;
-        use stellar_xdr::curr::{
+        use stellar_xdr::{
             Hash, LedgerHeader, LedgerHeaderExt, StellarValue, StellarValueExt, TimePoint, VecM,
         };
 
@@ -2427,8 +2427,7 @@ mod genesis_freshness_tests {
             ext: LedgerHeaderExt::V0,
         };
         let header_xdr =
-            stellar_xdr::curr::WriteXdr::to_xdr(&header, stellar_xdr::curr::Limits::none())
-                .unwrap();
+            stellar_xdr::WriteXdr::to_xdr(&header, stellar_xdr::Limits::none()).unwrap();
         db.with_connection(|conn| {
             conn.store_ledger_header(&header, &header_xdr)?;
             Ok::<_, henyey_db::DbError>(())
@@ -2517,11 +2516,9 @@ mod defense_layer_tests {
                 // Clone header with ledger_seq = 5
                 let mut seeded_header = header;
                 seeded_header.ledger_seq = 5;
-                let seeded_xdr = stellar_xdr::curr::WriteXdr::to_xdr(
-                    &seeded_header,
-                    stellar_xdr::curr::Limits::none(),
-                )
-                .unwrap();
+                let seeded_xdr =
+                    stellar_xdr::WriteXdr::to_xdr(&seeded_header, stellar_xdr::Limits::none())
+                        .unwrap();
 
                 conn.store_ledger_header(&seeded_header, &seeded_xdr)
                     .expect("store seeded header");

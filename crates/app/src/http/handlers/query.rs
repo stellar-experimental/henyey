@@ -22,7 +22,7 @@ use henyey_bucket::{
     get_ttl_key, get_ttl_live_until, is_persistent_key, is_soroban_key, BucketSnapshotManager,
     SearchableBucketListSnapshot, SearchableHotArchiveBucketListSnapshot,
 };
-use stellar_xdr::curr::{HotArchiveBucketEntry, LedgerEntry, LedgerKey, Limits, ReadXdr, WriteXdr};
+use stellar_xdr::{HotArchiveBucketEntry, LedgerEntry, LedgerKey, Limits, ReadXdr, WriteXdr};
 
 use crate::http::types::query::{
     GetLedgerEntryRawResponse, GetLedgerEntryResponse, LedgerEntryResult, LedgerEntryState,

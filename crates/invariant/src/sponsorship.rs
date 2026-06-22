@@ -10,7 +10,7 @@
 
 use std::collections::HashMap;
 
-use stellar_xdr::curr::{
+use stellar_xdr::{
     AccountEntry, AccountEntryExt, AccountEntryExtensionV1Ext, AccountId, ContractEvent,
     LedgerEntry, LedgerEntryData, LedgerEntryExt, Operation, OperationResult, TrustLineAsset,
 };
@@ -368,7 +368,7 @@ mod tests {
     //!   - the trailing unmatched-residual `count != 0` error branch.
 
     use super::*;
-    use stellar_xdr::curr::{
+    use stellar_xdr::{
         AccountEntryExtensionV1, AccountEntryExtensionV2, AccountEntryExtensionV2Ext, AlphaNum4,
         Asset, AssetCode4, ClaimPredicate, ClaimableBalanceEntry, ClaimableBalanceEntryExt,
         ClaimableBalanceId, Claimant, ClaimantV0, Hash, InflationResult, LedgerEntryExtensionV1,
@@ -496,7 +496,7 @@ mod tests {
         }
     }
 
-    type VecMOrVec = stellar_xdr::curr::VecM<SponsorshipDescriptor, 20>;
+    type VecMOrVec = stellar_xdr::VecM<SponsorshipDescriptor, 20>;
 
     fn run(
         created: &[LedgerEntry],

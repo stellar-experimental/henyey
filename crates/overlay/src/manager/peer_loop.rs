@@ -17,7 +17,7 @@ use sha2::Digest;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use stellar_xdr::curr::{ErrorCode, SError, StellarMessage, StringM, Uint256};
+use stellar_xdr::{ErrorCode, SError, StellarMessage, StringM, Uint256};
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
 use tracing::{debug, info, trace, warn};
@@ -374,11 +374,11 @@ pub(super) fn send_error_and_drop(
 /// a matching hash is used to measure round-trip time.
 ///
 /// Extracted from `run_peer_loop` for testability (G4).
-fn compute_ping_hash(nanos: u128) -> stellar_xdr::curr::Uint256 {
+fn compute_ping_hash(nanos: u128) -> stellar_xdr::Uint256 {
     let mut hasher = sha2::Sha256::new();
     hasher.update(nanos.to_le_bytes());
     let result = hasher.finalize();
-    stellar_xdr::curr::Uint256(result.into())
+    stellar_xdr::Uint256(result.into())
 }
 
 /// Check if a received hash matches an outstanding ping hash.
@@ -387,10 +387,7 @@ fn compute_ping_hash(nanos: u128) -> stellar_xdr::curr::Uint256 {
 /// received `hash_bytes` matches the stored ping hash.
 ///
 /// Extracted from `run_peer_loop` ping response matching for testability (G4).
-fn is_ping_response(
-    ping_hash: Option<&stellar_xdr::curr::Uint256>,
-    hash: &stellar_xdr::curr::Uint256,
-) -> bool {
+fn is_ping_response(ping_hash: Option<&stellar_xdr::Uint256>, hash: &stellar_xdr::Uint256) -> bool {
     match ping_hash {
         Some(ph) => ph.0 == hash.0,
         None => false,
@@ -404,7 +401,7 @@ fn is_ping_response(
 /// single `check_response` call.
 struct PingTracker {
     sent_time: Option<Instant>,
-    hash: Option<stellar_xdr::curr::Uint256>,
+    hash: Option<stellar_xdr::Uint256>,
     last_rtt: Option<Duration>,
 }
 
@@ -418,7 +415,7 @@ impl PingTracker {
     }
 
     /// Record that a ping was sent with the given hash.
-    fn record_sent(&mut self, hash: stellar_xdr::curr::Uint256) {
+    fn record_sent(&mut self, hash: stellar_xdr::Uint256) {
         self.sent_time = Some(Instant::now());
         self.hash = Some(hash);
     }
@@ -428,7 +425,7 @@ impl PingTracker {
     /// the RTT if this was a match.
     fn check_response(
         &mut self,
-        response_hash: &stellar_xdr::curr::Uint256,
+        response_hash: &stellar_xdr::Uint256,
         peer_id: &PeerId,
     ) -> Option<Duration> {
         let sent = self.sent_time?;
@@ -1314,7 +1311,7 @@ impl OverlayManager {
 mod tests {
     use super::*;
     use crate::flow_control::FlowControlConfig;
-    use stellar_xdr::curr::ErrorCode;
+    use stellar_xdr::ErrorCode;
 
     #[test]
     fn test_idle_timeout_constants_match_upstream() {
@@ -1621,7 +1618,7 @@ mod tests {
 
     #[test]
     fn test_validate_incoming_peers_rules() {
-        let peers_msg = StellarMessage::Peers(stellar_xdr::curr::VecM::default());
+        let peers_msg = StellarMessage::Peers(stellar_xdr::VecM::default());
         let tx_msg = StellarMessage::GetScpState(0);
 
         assert_eq!(
@@ -1648,19 +1645,19 @@ mod tests {
             Default::default()
         )));
         assert!(should_skip_generic_routing(&StellarMessage::Auth(
-            stellar_xdr::curr::Auth { flags: 200 }
+            stellar_xdr::Auth { flags: 200 }
         )));
         assert!(should_skip_generic_routing(&StellarMessage::SendMore(
-            stellar_xdr::curr::SendMore { num_messages: 1 }
+            stellar_xdr::SendMore { num_messages: 1 }
         )));
         assert!(should_skip_generic_routing(
-            &StellarMessage::SendMoreExtended(stellar_xdr::curr::SendMoreExtended {
+            &StellarMessage::SendMoreExtended(stellar_xdr::SendMoreExtended {
                 num_messages: 1,
                 num_bytes: 1,
             })
         ));
         assert!(!should_skip_generic_routing(&StellarMessage::Peers(
-            stellar_xdr::curr::VecM::default()
+            stellar_xdr::VecM::default()
         )));
     }
 
@@ -1685,7 +1682,7 @@ mod tests {
     fn test_capacity_guard_none_drops_peer_flow() {
         // When all flood capacity is exhausted, CapacityGuard::new returns None.
         // In run_peer_loop this would trigger send_error_and_drop + break.
-        use stellar_xdr::curr::TransactionEnvelope;
+        use stellar_xdr::TransactionEnvelope;
         let config = FlowControlConfig::default();
         let fc = Arc::new(FlowControl::new(config.clone()));
 
@@ -1693,19 +1690,19 @@ mod tests {
         let mut guards = Vec::new();
         for _ in 0..config.peer_flood_reading_capacity {
             let msg = StellarMessage::Transaction(TransactionEnvelope::Tx(
-                stellar_xdr::curr::TransactionV1Envelope {
-                    tx: stellar_xdr::curr::Transaction {
-                        source_account: stellar_xdr::curr::MuxedAccount::Ed25519(
-                            stellar_xdr::curr::Uint256([0; 32]),
-                        ),
+                stellar_xdr::TransactionV1Envelope {
+                    tx: stellar_xdr::Transaction {
+                        source_account: stellar_xdr::MuxedAccount::Ed25519(stellar_xdr::Uint256(
+                            [0; 32],
+                        )),
                         fee: 100,
-                        seq_num: stellar_xdr::curr::SequenceNumber(1),
-                        cond: stellar_xdr::curr::Preconditions::None,
-                        memo: stellar_xdr::curr::Memo::None,
-                        operations: stellar_xdr::curr::VecM::default(),
-                        ext: stellar_xdr::curr::TransactionExt::V0,
+                        seq_num: stellar_xdr::SequenceNumber(1),
+                        cond: stellar_xdr::Preconditions::None,
+                        memo: stellar_xdr::Memo::None,
+                        operations: stellar_xdr::VecM::default(),
+                        ext: stellar_xdr::TransactionExt::V0,
                     },
-                    signatures: stellar_xdr::curr::VecM::default(),
+                    signatures: stellar_xdr::VecM::default(),
                 },
             ));
             match crate::flow_control::CapacityGuard::new(Arc::clone(&fc), msg) {
@@ -1716,19 +1713,19 @@ mod tests {
 
         // Next message should fail — capacity exhausted.
         let overflow_msg = StellarMessage::Transaction(TransactionEnvelope::Tx(
-            stellar_xdr::curr::TransactionV1Envelope {
-                tx: stellar_xdr::curr::Transaction {
-                    source_account: stellar_xdr::curr::MuxedAccount::Ed25519(
-                        stellar_xdr::curr::Uint256([1; 32]),
-                    ),
+            stellar_xdr::TransactionV1Envelope {
+                tx: stellar_xdr::Transaction {
+                    source_account: stellar_xdr::MuxedAccount::Ed25519(stellar_xdr::Uint256(
+                        [1; 32],
+                    )),
                     fee: 100,
-                    seq_num: stellar_xdr::curr::SequenceNumber(2),
-                    cond: stellar_xdr::curr::Preconditions::None,
-                    memo: stellar_xdr::curr::Memo::None,
-                    operations: stellar_xdr::curr::VecM::default(),
-                    ext: stellar_xdr::curr::TransactionExt::V0,
+                    seq_num: stellar_xdr::SequenceNumber(2),
+                    cond: stellar_xdr::Preconditions::None,
+                    memo: stellar_xdr::Memo::None,
+                    operations: stellar_xdr::VecM::default(),
+                    ext: stellar_xdr::TransactionExt::V0,
                 },
-                signatures: stellar_xdr::curr::VecM::default(),
+                signatures: stellar_xdr::VecM::default(),
             },
         ));
         let guard = crate::flow_control::CapacityGuard::new(Arc::clone(&fc), overflow_msg);
@@ -1758,7 +1755,7 @@ mod tests {
     fn test_capacity_guard_non_flood_always_accepted() {
         // Non-flow-controlled messages (like GetPeers) should always succeed,
         // even when flood capacity is exhausted.
-        use stellar_xdr::curr::TransactionEnvelope;
+        use stellar_xdr::TransactionEnvelope;
         let config = FlowControlConfig::default();
         let fc = Arc::new(FlowControl::new(config.clone()));
 
@@ -1766,19 +1763,19 @@ mod tests {
         let mut guards = Vec::new();
         for _ in 0..config.peer_flood_reading_capacity {
             let msg = StellarMessage::Transaction(TransactionEnvelope::Tx(
-                stellar_xdr::curr::TransactionV1Envelope {
-                    tx: stellar_xdr::curr::Transaction {
-                        source_account: stellar_xdr::curr::MuxedAccount::Ed25519(
-                            stellar_xdr::curr::Uint256([0; 32]),
-                        ),
+                stellar_xdr::TransactionV1Envelope {
+                    tx: stellar_xdr::Transaction {
+                        source_account: stellar_xdr::MuxedAccount::Ed25519(stellar_xdr::Uint256(
+                            [0; 32],
+                        )),
                         fee: 100,
-                        seq_num: stellar_xdr::curr::SequenceNumber(1),
-                        cond: stellar_xdr::curr::Preconditions::None,
-                        memo: stellar_xdr::curr::Memo::None,
-                        operations: stellar_xdr::curr::VecM::default(),
-                        ext: stellar_xdr::curr::TransactionExt::V0,
+                        seq_num: stellar_xdr::SequenceNumber(1),
+                        cond: stellar_xdr::Preconditions::None,
+                        memo: stellar_xdr::Memo::None,
+                        operations: stellar_xdr::VecM::default(),
+                        ext: stellar_xdr::TransactionExt::V0,
                     },
-                    signatures: stellar_xdr::curr::VecM::default(),
+                    signatures: stellar_xdr::VecM::default(),
                 },
             ));
             match crate::flow_control::CapacityGuard::new(Arc::clone(&fc), msg) {
@@ -1788,7 +1785,7 @@ mod tests {
         }
 
         // Non-flow-controlled message (Peers) should still be accepted.
-        let peers_msg = StellarMessage::Peers(stellar_xdr::curr::VecM::default());
+        let peers_msg = StellarMessage::Peers(stellar_xdr::VecM::default());
         let guard = crate::flow_control::CapacityGuard::new(Arc::clone(&fc), peers_msg);
         assert!(
             guard.is_some(),
@@ -1896,7 +1893,7 @@ mod tests {
 
     #[test]
     fn test_traffic_class_classification() {
-        use stellar_xdr::curr::*;
+        use stellar_xdr::*;
 
         // SCP is exempt (None)
         let scp_msg = StellarMessage::ScpMessage(ScpEnvelope {
@@ -2093,18 +2090,18 @@ mod tests {
     #[test]
     fn test_audit_016_fetch_messages_bypass_global_rate_limiter() {
         let fetch_messages = vec![
-            StellarMessage::TxSet(stellar_xdr::curr::TransactionSet {
-                previous_ledger_hash: stellar_xdr::curr::Hash([0; 32]),
-                txs: stellar_xdr::curr::VecM::default(),
+            StellarMessage::TxSet(stellar_xdr::TransactionSet {
+                previous_ledger_hash: stellar_xdr::Hash([0; 32]),
+                txs: stellar_xdr::VecM::default(),
             }),
-            StellarMessage::DontHave(stellar_xdr::curr::DontHave {
-                type_: stellar_xdr::curr::MessageType::TxSet,
-                req_hash: stellar_xdr::curr::Uint256([0; 32]),
+            StellarMessage::DontHave(stellar_xdr::DontHave {
+                type_: stellar_xdr::MessageType::TxSet,
+                req_hash: stellar_xdr::Uint256([0; 32]),
             }),
-            StellarMessage::ScpQuorumset(stellar_xdr::curr::ScpQuorumSet {
+            StellarMessage::ScpQuorumset(stellar_xdr::ScpQuorumSet {
                 threshold: 1,
-                validators: stellar_xdr::curr::VecM::default(),
-                inner_sets: stellar_xdr::curr::VecM::default(),
+                validators: stellar_xdr::VecM::default(),
+                inner_sets: stellar_xdr::VecM::default(),
             }),
         ];
 
@@ -2127,10 +2124,10 @@ mod tests {
         let recorder = PrometheusBuilder::new().build_recorder();
         let handle = recorder.handle();
 
-        let matching_hash = stellar_xdr::curr::Uint256([1u8; 32]);
-        let non_matching_hash = stellar_xdr::curr::Uint256([2u8; 32]);
-        let peer_id = PeerId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
-            stellar_xdr::curr::Uint256([0u8; 32]),
+        let matching_hash = stellar_xdr::Uint256([1u8; 32]);
+        let non_matching_hash = stellar_xdr::Uint256([2u8; 32]);
+        let peer_id = PeerId(stellar_xdr::PublicKey::PublicKeyTypeEd25519(
+            stellar_xdr::Uint256([0u8; 32]),
         ));
 
         metrics::with_local_recorder(&recorder, || {

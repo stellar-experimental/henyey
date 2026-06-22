@@ -3,7 +3,7 @@
 //! This module implements the execution logic for the RestoreFootprint operation,
 //! which restores archived Soroban contract data entries.
 
-use stellar_xdr::curr::{
+use stellar_xdr::{
     AccountId, LedgerEntry, LedgerEntryData, LedgerKey, OperationResult, OperationResultTr,
     RestoreFootprintOp, RestoreFootprintResult, RestoreFootprintResultCode, SorobanTransactionData,
     TtlEntry,
@@ -325,7 +325,7 @@ fn make_result(code: RestoreFootprintResultCode) -> OperationResult {
 mod tests {
     use super::*;
     use crate::test_utils::create_test_account_id;
-    use stellar_xdr::curr::*;
+    use stellar_xdr::*;
 
     /// Default min persistent TTL for tests (matches testnet config)
     const TEST_MIN_PERSISTENT_TTL: u32 = 120960;

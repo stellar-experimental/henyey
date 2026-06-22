@@ -3,7 +3,7 @@
 //! This module implements the execution logic for the InvokeHostFunction operation,
 //! which executes Soroban smart contract functions.
 
-use stellar_xdr::curr::{
+use stellar_xdr::{
     AccountId, ContractEvent, DiagnosticEvent, Hash, InvokeHostFunctionOp,
     InvokeHostFunctionResult, InvokeHostFunctionResultCode, InvokeHostFunctionSuccessPreImage,
     LedgerEntry, LedgerKey, OperationResult, OperationResultTr, ScVal, SorobanTransactionData,
@@ -30,19 +30,19 @@ use crate::{Result, TxError};
 /// We can't use state.get_*().is_some() because archived entries are pre-loaded
 /// into state from InMemorySorobanState before Soroban execution.
 fn key_already_created_in_delta(delta: &crate::apply::TxChangeLog, key: &LedgerKey) -> bool {
-    use stellar_xdr::curr::LedgerEntryData;
+    use stellar_xdr::LedgerEntryData;
 
     for entry in delta.created_entries() {
         let entry_key = match &entry.data {
             LedgerEntryData::ContractData(cd) => {
-                LedgerKey::ContractData(stellar_xdr::curr::LedgerKeyContractData {
+                LedgerKey::ContractData(stellar_xdr::LedgerKeyContractData {
                     contract: cd.contract.clone(),
                     key: cd.key.clone(),
                     durability: cd.durability,
                 })
             }
             LedgerEntryData::ContractCode(cc) => {
-                LedgerKey::ContractCode(stellar_xdr::curr::LedgerKeyContractCode {
+                LedgerKey::ContractCode(stellar_xdr::LedgerKeyContractCode {
                     hash: cc.hash.clone(),
                 })
             }
@@ -58,9 +58,9 @@ fn key_already_created_in_delta(delta: &crate::apply::TxChangeLog, key: &LedgerK
 /// Check if a TTL entry with the given key hash was already created in the delta.
 fn ttl_already_created_in_delta(
     delta: &crate::apply::TxChangeLog,
-    key_hash: &stellar_xdr::curr::Hash,
+    key_hash: &stellar_xdr::Hash,
 ) -> bool {
-    use stellar_xdr::curr::LedgerEntryData;
+    use stellar_xdr::LedgerEntryData;
 
     for entry in delta.created_entries() {
         if let LedgerEntryData::Ttl(ttl) = &entry.data {
@@ -411,16 +411,16 @@ impl AddReadsContext<'_> {
                 .get_contract_data(&cd_key.contract, &cd_key.key, cd_key.durability)
                 .map(|cd| LedgerEntry {
                     last_modified_ledger_seq: 0,
-                    data: stellar_xdr::curr::LedgerEntryData::ContractData(cd.clone()),
-                    ext: stellar_xdr::curr::LedgerEntryExt::V0,
+                    data: stellar_xdr::LedgerEntryData::ContractData(cd.clone()),
+                    ext: stellar_xdr::LedgerEntryExt::V0,
                 }),
             LedgerKey::ContractCode(cc_key) => {
                 self.state
                     .get_contract_code(&cc_key.hash)
                     .map(|cc| LedgerEntry {
                         last_modified_ledger_seq: 0,
-                        data: stellar_xdr::curr::LedgerEntryData::ContractCode(cc.clone()),
-                        ext: stellar_xdr::curr::LedgerEntryExt::V0,
+                        data: stellar_xdr::LedgerEntryData::ContractCode(cc.clone()),
+                        ext: stellar_xdr::LedgerEntryExt::V0,
                     })
             }
             _ => None,
@@ -729,7 +729,7 @@ fn validate_and_compute_write_bytes(
     for change in storage_changes {
         if let crate::soroban::StorageChangeKind::Modified { entry, .. } = &change.kind {
             // Skip TTL entries - their write fees are handled separately
-            if matches!(entry.data, stellar_xdr::curr::LedgerEntryData::Ttl(_)) {
+            if matches!(entry.data, stellar_xdr::LedgerEntryData::Ttl(_)) {
                 continue;
             }
             // Compute XDR size without heap allocation.
@@ -894,7 +894,7 @@ fn extract_hot_archive_restored_keys(
 fn apply_soroban_storage_changes(
     state: &mut LedgerStateManager,
     changes: &[crate::soroban::StorageChange],
-    footprint: &stellar_xdr::curr::LedgerFootprint,
+    footprint: &stellar_xdr::LedgerFootprint,
     hot_archive_restored_keys: &std::collections::HashSet<LedgerKey>,
     ttl_key_cache: Option<&crate::soroban::TtlKeyCache>,
     protocol_version: u32,
@@ -955,7 +955,7 @@ fn apply_soroban_storage_changes(
         if henyey_common::is_soroban_key(key) {
             // Soroban entries must have a corresponding TTL entry also created
             let key_hash = crate::soroban::get_or_compute_key_hash(ttl_key_cache, key);
-            let ttl_key = LedgerKey::Ttl(stellar_xdr::curr::LedgerKeyTtl { key_hash });
+            let ttl_key = LedgerKey::Ttl(stellar_xdr::LedgerKeyTtl { key_hash });
             assert!(
                 created_keys.contains(&ttl_key),
                 "Created Soroban entry {:?} missing TTL key",
@@ -1106,7 +1106,7 @@ fn apply_soroban_storage_change(
         } => {
             // Handle contract data and code entries.
             match &entry.data {
-                stellar_xdr::curr::LedgerEntryData::ContractData(cd) => {
+                stellar_xdr::LedgerEntryData::ContractData(cd) => {
                     let exists = state
                         .get_contract_data(&cd.contract, &cd.key, cd.durability)
                         .is_some();
@@ -1123,7 +1123,7 @@ fn apply_soroban_storage_change(
                         state.update_contract_data(cd.clone());
                     }
                 }
-                stellar_xdr::curr::LedgerEntryData::ContractCode(cc) => {
+                stellar_xdr::LedgerEntryData::ContractCode(cc) => {
                     let exists = state.get_contract_code(&cc.hash).is_some();
                     let already_in_delta = is_hot_archive_restore
                         && key_already_created_in_delta(state.delta(), &change.key);
@@ -1138,7 +1138,7 @@ fn apply_soroban_storage_change(
                         state.update_contract_code(cc.clone());
                     }
                 }
-                stellar_xdr::curr::LedgerEntryData::Ttl(ttl) => {
+                stellar_xdr::LedgerEntryData::Ttl(ttl) => {
                     let exists = state.get_ttl(&ttl.key_hash).is_some();
                     tracing::debug!(
                         key_hash = ?ttl.key_hash,
@@ -1150,7 +1150,7 @@ fn apply_soroban_storage_change(
                     create_or_update_ttl(state, ttl.clone(), exists);
                 }
                 // SAC (Stellar Asset Contract) can modify Account and Trustline entries
-                stellar_xdr::curr::LedgerEntryData::Account(acc) => {
+                stellar_xdr::LedgerEntryData::Account(acc) => {
                     if state.get_account(&acc.account_id).is_some() {
                         state.update_account(acc.clone());
                     } else {
@@ -1158,7 +1158,7 @@ fn apply_soroban_storage_change(
                         was_created = true;
                     }
                 }
-                stellar_xdr::curr::LedgerEntryData::Trustline(tl) => {
+                stellar_xdr::LedgerEntryData::Trustline(tl) => {
                     if state
                         .get_trustline_by_trustline_asset(&tl.account_id, &tl.asset)
                         .is_some()
@@ -1200,7 +1200,7 @@ fn apply_soroban_storage_change(
             //
             // Skip TTL emission for TTL entries themselves - they were already handled above
             // and computing key_hash of a TTL key would give the wrong hash.
-            if !matches!(entry.data, stellar_xdr::curr::LedgerEntryData::Ttl(_)) {
+            if !matches!(entry.data, stellar_xdr::LedgerEntryData::Ttl(_)) {
                 if let Some(live_until) = live_until {
                     if *live_until == 0 {
                         return was_created;
@@ -1223,7 +1223,7 @@ fn apply_soroban_storage_change(
                         // First restoration from hot archive - create TTL
                         tracing::debug!(?key_hash, live_until, "TTL emit: hot archive restore");
                         state.create_ttl(ttl);
-                        created_keys.insert(LedgerKey::Ttl(stellar_xdr::curr::LedgerKeyTtl {
+                        created_keys.insert(LedgerKey::Ttl(stellar_xdr::LedgerKeyTtl {
                             key_hash: key_hash.clone(),
                         }));
                     } else if is_hot_archive_restore && ttl_already_restored {
@@ -1247,7 +1247,7 @@ fn apply_soroban_storage_change(
                             "TTL emit: data modified, TTL extended or new"
                         );
                         if !exists {
-                            created_keys.insert(LedgerKey::Ttl(stellar_xdr::curr::LedgerKeyTtl {
+                            created_keys.insert(LedgerKey::Ttl(stellar_xdr::LedgerKeyTtl {
                                 key_hash: key_hash.clone(),
                             }));
                         }
@@ -1256,7 +1256,7 @@ fn apply_soroban_storage_change(
                         // New entry being created - emit TTL
                         tracing::debug!(?key_hash, live_until, "TTL emit: new TTL entry");
                         state.create_ttl(ttl);
-                        created_keys.insert(LedgerKey::Ttl(stellar_xdr::curr::LedgerKeyTtl {
+                        created_keys.insert(LedgerKey::Ttl(stellar_xdr::LedgerKeyTtl {
                             key_hash: key_hash.clone(),
                         }));
                     } else {
@@ -1429,7 +1429,7 @@ mod tests {
     use super::*;
     use crate::soroban::{HotArchiveLookup, OperationContext, StorageChange};
     use crate::test_utils::create_test_account_id;
-    use stellar_xdr::curr::*;
+    use stellar_xdr::*;
 
     fn create_test_context() -> LedgerContext {
         LedgerContext::testnet(1, 1000)
@@ -2012,8 +2012,8 @@ mod tests {
         };
         let hot_entry = LedgerEntry {
             last_modified_ledger_seq: 50,
-            data: stellar_xdr::curr::LedgerEntryData::ContractData(cd_entry),
-            ext: stellar_xdr::curr::LedgerEntryExt::V0,
+            data: stellar_xdr::LedgerEntryData::ContractData(cd_entry),
+            ext: stellar_xdr::LedgerEntryExt::V0,
         };
         let hot_entry_size = xdr_encoded_len(&hot_entry) as u32;
 
@@ -2033,8 +2033,7 @@ mod tests {
         }
         let hot_archive = TestHotArchive(key.clone(), hot_entry);
 
-        let account_key =
-            LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount { account_id: source });
+        let account_key = LedgerKey::Account(stellar_xdr::LedgerKeyAccount { account_id: source });
 
         let footprint = LedgerFootprint {
             read_only: vec![account_key].try_into().unwrap(),
@@ -4289,21 +4288,21 @@ mod tests {
         HotArchiveRestore,
         ContractEvent,
     ) {
-        use stellar_xdr::curr::{
+        use stellar_xdr::{
             Asset, ContractDataDurability, ContractDataEntry, ContractId, ExtensionPoint, Hash,
             LedgerEntry, LedgerEntryData, LedgerEntryExt, Limits, ScAddress, ScMap, ScMapEntry,
             ScSymbol, ScVal, ScVec, WriteXdr,
         };
 
-        let asset = Asset::CreditAlphanum4(stellar_xdr::curr::AlphaNum4 {
-            asset_code: stellar_xdr::curr::AssetCode4(*b"USDC"),
-            issuer: AccountId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
-                stellar_xdr::curr::Uint256([7u8; 32]),
+        let asset = Asset::CreditAlphanum4(stellar_xdr::AlphaNum4 {
+            asset_code: stellar_xdr::AssetCode4(*b"USDC"),
+            issuer: AccountId(stellar_xdr::PublicKey::PublicKeyTypeEd25519(
+                stellar_xdr::Uint256([7u8; 32]),
             )),
         });
 
         // Compute the SAC contract id the same way events.rs does.
-        use stellar_xdr::curr::{ContractIdPreimage, HashIdPreimage, HashIdPreimageContractId};
+        use stellar_xdr::{ContractIdPreimage, HashIdPreimage, HashIdPreimageContractId};
         let preimage = HashIdPreimage::ContractId(HashIdPreimageContractId {
             network_id: Hash::from(net.0),
             contract_id_preimage: ContractIdPreimage::Asset(asset.clone()),
@@ -4322,7 +4321,7 @@ mod tests {
             )));
             let amt = {
                 let v = amount as i128;
-                ScVal::I128(stellar_xdr::curr::Int128Parts {
+                ScVal::I128(stellar_xdr::Int128Parts {
                     hi: (v >> 64) as i64,
                     lo: v as u64,
                 })
@@ -4396,12 +4395,10 @@ mod tests {
         // event so the diagnostic-channel assertion is meaningful), plus a
         // return value.
         let host_event = ContractEvent {
-            ext: stellar_xdr::curr::ExtensionPoint::V0,
-            contract_id: Some(stellar_xdr::curr::ContractId(stellar_xdr::curr::Hash(
-                [123u8; 32],
-            ))),
-            type_: stellar_xdr::curr::ContractEventType::Contract,
-            body: stellar_xdr::curr::ContractEventBody::V0(stellar_xdr::curr::ContractEventV0 {
+            ext: stellar_xdr::ExtensionPoint::V0,
+            contract_id: Some(stellar_xdr::ContractId(stellar_xdr::Hash([123u8; 32]))),
+            type_: stellar_xdr::ContractEventType::Contract,
+            body: stellar_xdr::ContractEventBody::V0(stellar_xdr::ContractEventV0 {
                 topics: vec![ScVal::U32(999)].try_into().unwrap(),
                 data: ScVal::U32(999),
             }),

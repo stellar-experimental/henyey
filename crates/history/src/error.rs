@@ -376,7 +376,7 @@ pub enum HistoryError {
 
     /// XDR error.
     #[error("XDR error: {0}")]
-    Xdr(#[from] stellar_xdr::curr::Error),
+    Xdr(#[from] stellar_xdr::Error),
 
     /// XDR parsing error.
     #[error("XDR parsing error: {0}")]

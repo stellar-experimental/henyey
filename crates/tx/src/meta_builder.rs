@@ -29,7 +29,7 @@
 //! - V4: Modern Soroban with per-operation events and diagnostic events
 
 use henyey_common::NetworkId;
-use stellar_xdr::curr::{
+use stellar_xdr::{
     ContractEvent, ContractEventBody, ContractEventType, ContractEventV0, DiagnosticEvent,
     ExtensionPoint, LedgerEntry, LedgerEntryChange, LedgerEntryChanges, Memo, OperationMeta,
     OperationMetaV2, ScError, ScMap, ScMapEntry, ScVal, SorobanTransactionMeta,
@@ -396,7 +396,7 @@ impl OperationMetaBuilder {
         if !self.enabled {
             return;
         }
-        if let stellar_xdr::curr::LedgerEntryData::Ttl(ttl) = &entry.data {
+        if let stellar_xdr::LedgerEntryData::Ttl(ttl) = &entry.data {
             tracing::debug!(
                 key_hash = ?ttl.key_hash,
                 "OperationMetaBuilder::record_create for Ttl"
@@ -412,7 +412,7 @@ impl OperationMetaBuilder {
         if !self.enabled {
             return;
         }
-        if let stellar_xdr::curr::LedgerEntryData::Ttl(ttl) = &post_state.data {
+        if let stellar_xdr::LedgerEntryData::Ttl(ttl) = &post_state.data {
             tracing::debug!(
                 key_hash = ?ttl.key_hash,
                 "OperationMetaBuilder::record_update for Ttl"
@@ -425,7 +425,7 @@ impl OperationMetaBuilder {
     /// Record a deleted entry with its pre-state.
     ///
     /// Emits STATE followed by REMOVED changes.
-    pub fn record_delete(&mut self, key: stellar_xdr::curr::LedgerKey, pre_state: LedgerEntry) {
+    pub fn record_delete(&mut self, key: stellar_xdr::LedgerKey, pre_state: LedgerEntry) {
         if !self.enabled {
             return;
         }
@@ -949,7 +949,7 @@ use crate::scval_utils::{make_string_scval, make_symbol_scval};
 #[cfg(test)]
 mod tests {
     use super::*;
-    use stellar_xdr::curr::*;
+    use stellar_xdr::*;
 
     fn create_test_frame() -> TransactionFrame {
         let source = MuxedAccount::Ed25519(Uint256([0u8; 32]));

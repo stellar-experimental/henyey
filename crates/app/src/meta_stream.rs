@@ -26,7 +26,7 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use henyey_common::xdr_stream::XdrOutputStream;
-use stellar_xdr::curr::LedgerCloseMeta;
+use stellar_xdr::LedgerCloseMeta;
 
 use crate::config::MetadataConfig;
 
@@ -288,7 +288,7 @@ impl MetaStreamManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use stellar_xdr::curr::{LedgerCloseMetaV2, ReadXdr};
+    use stellar_xdr::{LedgerCloseMetaV2, ReadXdr};
 
     #[test]
     fn test_emit_meta_to_temp_file() {
@@ -322,7 +322,7 @@ mod tests {
             | ((data[2] as u32) << 8)
             | (data[3] as u32);
         let decoded =
-            LedgerCloseMeta::from_xdr(&data[4..4 + sz as usize], stellar_xdr::curr::Limits::none())
+            LedgerCloseMeta::from_xdr(&data[4..4 + sz as usize], stellar_xdr::Limits::none())
                 .unwrap();
         assert!(matches!(decoded, LedgerCloseMeta::V2(_)));
     }

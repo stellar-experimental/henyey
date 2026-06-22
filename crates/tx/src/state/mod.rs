@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 use parking_lot::Mutex;
-use stellar_xdr::curr::{
+use stellar_xdr::{
     AccountEntry, AccountEntryExt, AccountEntryExtensionV1, AccountEntryExtensionV1Ext,
     AccountEntryExtensionV2, AccountEntryExtensionV2Ext, AccountEntryExtensionV3, AccountId, Asset,
     ClaimableBalanceEntry, ClaimableBalanceId, ContractCodeEntry, ContractDataDurability,
@@ -1630,7 +1630,7 @@ impl LedgerStateManager {
 // ==================== Helper Functions ====================
 
 /// Convert a String64 data name to a String.
-fn data_name_to_string(name: &stellar_xdr::curr::String64) -> String {
+fn data_name_to_string(name: &stellar_xdr::String64) -> String {
     String::from_utf8_lossy(name.as_vec()).to_string()
 }
 
@@ -1758,7 +1758,7 @@ mod tests {
     use super::*;
     use crate::test_utils::create_test_account_id;
     use henyey_common::LIQUIDITY_POOL_FEE_V18;
-    use stellar_xdr::curr::*;
+    use stellar_xdr::*;
 
     /// Create a LedgerStateManager with a shared OfferStore pre-configured.
     fn new_manager_with_offers(base_reserve: i64, ledger_seq: u32) -> LedgerStateManager {
@@ -3661,7 +3661,7 @@ mod tests {
     /// (lower) TTL and compute higher rent fees.
     #[test]
     fn test_flush_ro_ttl_bumps_for_write_footprint() {
-        use stellar_xdr::curr::{
+        use stellar_xdr::{
             ContractDataDurability, LedgerKey, LedgerKeyContractData, ScAddress, ScVal,
         };
 
@@ -3711,7 +3711,7 @@ mod tests {
         // mechanism: create a real ContractData key, compute its actual hash,
         // and set up state accordingly.
         let contract_key = LedgerKey::ContractData(LedgerKeyContractData {
-            contract: ScAddress::Contract(stellar_xdr::curr::ContractId(Hash([99; 32]))),
+            contract: ScAddress::Contract(stellar_xdr::ContractId(Hash([99; 32]))),
             key: ScVal::Bool(true),
             durability: ContractDataDurability::Persistent,
         });
@@ -3719,11 +3719,9 @@ mod tests {
         // Compute the actual hash this key produces
         let actual_hash = {
             use sha2::{Digest, Sha256};
-            use stellar_xdr::curr::WriteXdr;
+            use stellar_xdr::WriteXdr;
             let mut hasher = Sha256::new();
-            let bytes = contract_key
-                .to_xdr(stellar_xdr::curr::Limits::none())
-                .unwrap();
+            let bytes = contract_key.to_xdr(stellar_xdr::Limits::none()).unwrap();
             hasher.update(&bytes);
             let result: [u8; 32] = hasher.finalize().into();
             Hash(result)
@@ -3780,7 +3778,7 @@ mod tests {
 
         // Flush with a non-Soroban key (Account)
         let account_key = LedgerKey::Account(LedgerKeyAccount {
-            account_id: AccountId(PublicKey::PublicKeyTypeEd25519(stellar_xdr::curr::Uint256(
+            account_id: AccountId(PublicKey::PublicKeyTypeEd25519(stellar_xdr::Uint256(
                 [1; 32],
             ))),
         });

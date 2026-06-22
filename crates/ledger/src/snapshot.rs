@@ -26,7 +26,7 @@ use henyey_common::Hash256;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use stellar_xdr::curr::{
+use stellar_xdr::{
     AccountEntry, AccountId, LedgerEntry, LedgerEntryData, LedgerHeader, LedgerKey, PoolId,
 };
 
@@ -140,15 +140,15 @@ impl LedgerSnapshot {
             ledger_seq,
             header: LedgerHeader {
                 ledger_version: 0,
-                previous_ledger_hash: stellar_xdr::curr::Hash([0u8; 32]),
-                scp_value: stellar_xdr::curr::StellarValue {
-                    tx_set_hash: stellar_xdr::curr::Hash([0u8; 32]),
-                    close_time: stellar_xdr::curr::TimePoint(0),
-                    upgrades: stellar_xdr::curr::VecM::default(),
-                    ext: stellar_xdr::curr::StellarValueExt::Basic,
+                previous_ledger_hash: stellar_xdr::Hash([0u8; 32]),
+                scp_value: stellar_xdr::StellarValue {
+                    tx_set_hash: stellar_xdr::Hash([0u8; 32]),
+                    close_time: stellar_xdr::TimePoint(0),
+                    upgrades: stellar_xdr::VecM::default(),
+                    ext: stellar_xdr::StellarValueExt::Basic,
                 },
-                tx_set_result_hash: stellar_xdr::curr::Hash([0u8; 32]),
-                bucket_list_hash: stellar_xdr::curr::Hash([0u8; 32]),
+                tx_set_result_hash: stellar_xdr::Hash([0u8; 32]),
+                bucket_list_hash: stellar_xdr::Hash([0u8; 32]),
                 ledger_seq,
                 total_coins: 0,
                 fee_pool: 0,
@@ -157,8 +157,8 @@ impl LedgerSnapshot {
                 base_fee: 100,
                 base_reserve: 5_000_000,
                 max_tx_set_size: 1000,
-                skip_list: std::array::from_fn(|_| stellar_xdr::curr::Hash([0u8; 32])),
-                ext: stellar_xdr::curr::LedgerHeaderExt::V0,
+                skip_list: std::array::from_fn(|_| stellar_xdr::Hash([0u8; 32])),
+                ext: stellar_xdr::LedgerHeaderExt::V0,
             },
             header_hash: Hash256::ZERO,
             entries: HashMap::new(),
@@ -216,7 +216,7 @@ impl LedgerSnapshot {
 
     /// Look up an account by ID.
     pub fn get_account(&self, account_id: &AccountId) -> Option<&AccountEntry> {
-        let key = LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
+        let key = LedgerKey::Account(stellar_xdr::LedgerKeyAccount {
             account_id: account_id.clone(),
         });
 
@@ -548,7 +548,7 @@ impl SnapshotHandle {
 
     /// Look up an account.
     pub fn get_account(&self, account_id: &AccountId) -> Result<Option<AccountEntry>> {
-        let key = LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
+        let key = LedgerKey::Account(stellar_xdr::LedgerKeyAccount {
             account_id: account_id.clone(),
         });
 
@@ -716,15 +716,15 @@ impl SnapshotBuilder {
     pub fn build_with_default_header(self) -> LedgerSnapshot {
         let header = self.header.unwrap_or_else(|| LedgerHeader {
             ledger_version: 20,
-            previous_ledger_hash: stellar_xdr::curr::Hash([0u8; 32]),
-            scp_value: stellar_xdr::curr::StellarValue {
-                tx_set_hash: stellar_xdr::curr::Hash([0u8; 32]),
-                close_time: stellar_xdr::curr::TimePoint(0),
-                upgrades: stellar_xdr::curr::VecM::default(),
-                ext: stellar_xdr::curr::StellarValueExt::Basic,
+            previous_ledger_hash: stellar_xdr::Hash([0u8; 32]),
+            scp_value: stellar_xdr::StellarValue {
+                tx_set_hash: stellar_xdr::Hash([0u8; 32]),
+                close_time: stellar_xdr::TimePoint(0),
+                upgrades: stellar_xdr::VecM::default(),
+                ext: stellar_xdr::StellarValueExt::Basic,
             },
-            tx_set_result_hash: stellar_xdr::curr::Hash([0u8; 32]),
-            bucket_list_hash: stellar_xdr::curr::Hash([0u8; 32]),
+            tx_set_result_hash: stellar_xdr::Hash([0u8; 32]),
+            bucket_list_hash: stellar_xdr::Hash([0u8; 32]),
             ledger_seq: self.ledger_seq,
             total_coins: 100_000_000_000_000_000,
             fee_pool: 0,
@@ -733,8 +733,8 @@ impl SnapshotBuilder {
             base_fee: 100,
             base_reserve: 5_000_000,
             max_tx_set_size: 1000,
-            skip_list: std::array::from_fn(|_| stellar_xdr::curr::Hash([0u8; 32])),
-            ext: stellar_xdr::curr::LedgerHeaderExt::V0,
+            skip_list: std::array::from_fn(|_| stellar_xdr::Hash([0u8; 32])),
+            ext: stellar_xdr::LedgerHeaderExt::V0,
         });
 
         LedgerSnapshot {
@@ -756,7 +756,7 @@ impl crate::EntryReader for SnapshotHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use stellar_xdr::curr::{
+    use stellar_xdr::{
         AccountEntry, AccountEntryExt, LedgerEntryExt, PublicKey, SequenceNumber, Thresholds,
         Uint256,
     };
@@ -767,7 +767,7 @@ mod tests {
 
         let account_id = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(key_bytes)));
 
-        let key = LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
+        let key = LedgerKey::Account(stellar_xdr::LedgerKeyAccount {
             account_id: account_id.clone(),
         });
 
@@ -780,9 +780,9 @@ mod tests {
                 num_sub_entries: 0,
                 inflation_dest: None,
                 flags: 0,
-                home_domain: stellar_xdr::curr::String32::default(),
+                home_domain: stellar_xdr::String32::default(),
                 thresholds: Thresholds([1, 0, 0, 0]),
-                signers: stellar_xdr::curr::VecM::default(),
+                signers: stellar_xdr::VecM::default(),
                 ext: AccountEntryExt::V0,
             }),
             ext: LedgerEntryExt::V0,

@@ -17,7 +17,7 @@
 //! The [`TxResultCode`] and [`OpResultCode`] type aliases provide typed access to
 //! XDR result codes with human-readable names.
 
-use stellar_xdr::curr::{
+use stellar_xdr::{
     OperationResult, OperationResultTr, TransactionResult, TransactionResultCode,
     TransactionResultResult,
 };
@@ -71,7 +71,7 @@ impl TxResultWrapper {
             inner: TransactionResult {
                 fee_charged: 0,
                 result: TransactionResultResult::TxSuccess(vec![].try_into().unwrap()),
-                ext: stellar_xdr::curr::TransactionResultExt::V0,
+                ext: stellar_xdr::TransactionResultExt::V0,
             },
         }
     }
@@ -172,7 +172,7 @@ impl TransactionResultCodeExt for TransactionResultCode {
 }
 
 /// Operation result code — type alias for the XDR `OperationResultCode`.
-pub type OpResultCode = stellar_xdr::curr::OperationResultCode;
+pub type OpResultCode = stellar_xdr::OperationResultCode;
 
 // ============================================================================
 // Mutable Transaction Result Types (for live execution)
@@ -333,7 +333,7 @@ impl std::error::Error for RefundableFeeError {}
 ///
 // SECURITY: error result construction uses pre-validated operation results from execution
 /// Delegates to [`TransactionResultCodeExt::to_xdr_result`].
-fn code_to_result(code: stellar_xdr::curr::TransactionResultCode) -> TransactionResultResult {
+fn code_to_result(code: stellar_xdr::TransactionResultCode) -> TransactionResultResult {
     code.to_xdr_result()
 }
 
@@ -373,39 +373,39 @@ impl MutableTransactionResult {
             inner: TransactionResult {
                 fee_charged,
                 result: TransactionResultResult::TxSuccess(vec![].try_into().unwrap()),
-                ext: stellar_xdr::curr::TransactionResultExt::V0,
+                ext: stellar_xdr::TransactionResultExt::V0,
             },
             refundable_fee_tracker: None,
         }
     }
 
     /// Create a new error result with the given code.
-    pub fn create_error(code: stellar_xdr::curr::TransactionResultCode, fee_charged: i64) -> Self {
-        use stellar_xdr::curr::TransactionResultCode::*;
+    pub fn create_error(code: stellar_xdr::TransactionResultCode, fee_charged: i64) -> Self {
+        use stellar_xdr::TransactionResultCode::*;
 
         // Fee-bump codes need special handling with InnerTransactionResultPair.
         let result = match code {
             TxFeeBumpInnerSuccess => TransactionResultResult::TxFeeBumpInnerSuccess(
-                stellar_xdr::curr::InnerTransactionResultPair {
-                    transaction_hash: stellar_xdr::curr::Hash([0u8; 32]),
-                    result: stellar_xdr::curr::InnerTransactionResult {
+                stellar_xdr::InnerTransactionResultPair {
+                    transaction_hash: stellar_xdr::Hash([0u8; 32]),
+                    result: stellar_xdr::InnerTransactionResult {
                         fee_charged: 0,
-                        result: stellar_xdr::curr::InnerTransactionResultResult::TxSuccess(
+                        result: stellar_xdr::InnerTransactionResultResult::TxSuccess(
                             vec![].try_into().unwrap(),
                         ),
-                        ext: stellar_xdr::curr::InnerTransactionResultExt::V0,
+                        ext: stellar_xdr::InnerTransactionResultExt::V0,
                     },
                 },
             ),
             TxFeeBumpInnerFailed => TransactionResultResult::TxFeeBumpInnerFailed(
-                stellar_xdr::curr::InnerTransactionResultPair {
-                    transaction_hash: stellar_xdr::curr::Hash([0u8; 32]),
-                    result: stellar_xdr::curr::InnerTransactionResult {
+                stellar_xdr::InnerTransactionResultPair {
+                    transaction_hash: stellar_xdr::Hash([0u8; 32]),
+                    result: stellar_xdr::InnerTransactionResult {
                         fee_charged: 0,
-                        result: stellar_xdr::curr::InnerTransactionResultResult::TxFailed(
+                        result: stellar_xdr::InnerTransactionResultResult::TxFailed(
                             vec![].try_into().unwrap(),
                         ),
-                        ext: stellar_xdr::curr::InnerTransactionResultExt::V0,
+                        ext: stellar_xdr::InnerTransactionResultExt::V0,
                     },
                 },
             ),
@@ -416,7 +416,7 @@ impl MutableTransactionResult {
             inner: TransactionResult {
                 fee_charged,
                 result,
-                ext: stellar_xdr::curr::TransactionResultExt::V0,
+                ext: stellar_xdr::TransactionResultExt::V0,
             },
             refundable_fee_tracker: None,
         }
@@ -427,7 +427,7 @@ impl MutableTransactionResult {
     pub fn create_success(fee_charged: i64, op_count: usize) -> Self {
         let results = vec![
             OperationResult::OpInner(OperationResultTr::Payment(
-                stellar_xdr::curr::PaymentResult::Success,
+                stellar_xdr::PaymentResult::Success,
             ));
             op_count
         ];
@@ -436,7 +436,7 @@ impl MutableTransactionResult {
             inner: TransactionResult {
                 fee_charged,
                 result: TransactionResultResult::TxSuccess(results.try_into().unwrap_or_default()),
-                ext: stellar_xdr::curr::TransactionResultExt::V0,
+                ext: stellar_xdr::TransactionResultExt::V0,
             },
             refundable_fee_tracker: None,
         }
@@ -447,7 +447,7 @@ impl MutableTransactionResult {
     // SECURITY: fee refund values validated during tx validation; overflow not possible with valid fees
     /// This also resets any consumed refundable fees (for Soroban) so that
     /// the maximum refund is returned to the fee source.
-    pub fn set_error(&mut self, code: stellar_xdr::curr::TransactionResultCode) {
+    pub fn set_error(&mut self, code: stellar_xdr::TransactionResultCode) {
         // Mirror stellar-core MutableTransactionResultBase::setError monotonicity
         // (MutableTransactionResult.cpp:148-160): an error result may only be
         // re-set to the same code (idempotent) or set from a success state —
@@ -548,7 +548,7 @@ impl MutableTransactionResult {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use stellar_xdr::curr::*;
+    use stellar_xdr::*;
 
     fn create_success_result() -> TransactionResult {
         TransactionResult {
@@ -681,7 +681,7 @@ mod tests {
         let mut result = MutableTransactionResult::new(100);
         assert!(result.is_success());
 
-        result.set_error(stellar_xdr::curr::TransactionResultCode::TxBadSeq);
+        result.set_error(stellar_xdr::TransactionResultCode::TxBadSeq);
         assert!(!result.is_success());
         assert_eq!(result.result_code(), TxResultCode::TxBadSeq);
     }
@@ -696,17 +696,17 @@ mod tests {
     #[should_panic(expected = "set_error must be monotonic")]
     fn test_set_error_rejects_error_to_different_error() {
         let mut result = MutableTransactionResult::new(100);
-        result.set_error(stellar_xdr::curr::TransactionResultCode::TxBadSeq);
+        result.set_error(stellar_xdr::TransactionResultCode::TxBadSeq);
         // Changing to a different error code must panic via the entry guard.
-        result.set_error(stellar_xdr::curr::TransactionResultCode::TxInsufficientFee);
+        result.set_error(stellar_xdr::TransactionResultCode::TxInsufficientFee);
     }
 
     #[test]
     fn test_set_error_idempotent_same_code_ok() {
         let mut result = MutableTransactionResult::new(100);
-        result.set_error(stellar_xdr::curr::TransactionResultCode::TxBadSeq);
+        result.set_error(stellar_xdr::TransactionResultCode::TxBadSeq);
         // Re-setting the same error code is idempotent and must not panic.
-        result.set_error(stellar_xdr::curr::TransactionResultCode::TxBadSeq);
+        result.set_error(stellar_xdr::TransactionResultCode::TxBadSeq);
         assert!(!result.is_success());
         assert_eq!(result.result_code(), TxResultCode::TxBadSeq);
     }
@@ -716,7 +716,7 @@ mod tests {
         let mut result = MutableTransactionResult::new(100);
         assert!(result.is_success());
         // Transitioning from a success state to an error is always allowed.
-        result.set_error(stellar_xdr::curr::TransactionResultCode::TxBadSeq);
+        result.set_error(stellar_xdr::TransactionResultCode::TxBadSeq);
         assert!(!result.is_success());
         assert_eq!(result.result_code(), TxResultCode::TxBadSeq);
     }
@@ -736,7 +736,7 @@ mod tests {
         );
 
         // Set error should reset consumed fees
-        result.set_error(stellar_xdr::curr::TransactionResultCode::TxFailed);
+        result.set_error(stellar_xdr::TransactionResultCode::TxFailed);
         assert_eq!(
             result.refundable_fee_tracker().unwrap().consumed_rent_fee(),
             0
@@ -783,7 +783,7 @@ mod tests {
     #[test]
     fn test_mutable_result_create_error() {
         let result = MutableTransactionResult::create_error(
-            stellar_xdr::curr::TransactionResultCode::TxNoAccount,
+            stellar_xdr::TransactionResultCode::TxNoAccount,
             50,
         );
         assert!(!result.is_success());
@@ -885,12 +885,12 @@ mod tests {
         let inner_result = TransactionResult {
             fee_charged: 100,
             result: TransactionResultResult::TxFeeBumpInnerSuccess(
-                stellar_xdr::curr::InnerTransactionResultPair {
-                    transaction_hash: stellar_xdr::curr::Hash([0u8; 32]),
-                    result: stellar_xdr::curr::InnerTransactionResult {
+                stellar_xdr::InnerTransactionResultPair {
+                    transaction_hash: stellar_xdr::Hash([0u8; 32]),
+                    result: stellar_xdr::InnerTransactionResult {
                         fee_charged: 50,
                         result: InnerTransactionResultResult::TxSuccess(vec![].try_into().unwrap()),
-                        ext: stellar_xdr::curr::InnerTransactionResultExt::V0,
+                        ext: stellar_xdr::InnerTransactionResultExt::V0,
                     },
                 },
             ),

@@ -20,7 +20,7 @@ use henyey_common::types::Hash256;
 use henyey_tx::envelope_utils::envelope_soroban_data;
 use henyey_tx::tx_set_xdr::{empty_soroban_phase, soroban_phase_with_stages};
 use henyey_tx::{FeeRate, InclusionFee};
-use stellar_xdr::curr::{
+use stellar_xdr::{
     DependentTxCluster, GeneralizedTransactionSet, Hash, LedgerKey, Limits,
     ParallelTxExecutionStage, TransactionEnvelope, TransactionPhase, TransactionSetV1,
     TxSetComponent, TxSetComponentTxsMaybeDiscountedFee, VecM, WriteXdr,
@@ -931,7 +931,7 @@ fn to_hashed_stages(stages: Vec<Vec<Vec<TransactionEnvelope>>>) -> Vec<Vec<Vec<H
 #[cfg(test)]
 mod tests {
     use super::*;
-    use stellar_xdr::curr::{
+    use stellar_xdr::{
         HostFunction, InvokeContractArgs, InvokeHostFunctionOp, LedgerFootprint, LedgerKey,
         LedgerKeyContractData, Memo, MuxedAccount, Operation, OperationBody, Preconditions,
         ScAddress, ScVal, SorobanResources, SorobanTransactionData, SorobanTransactionDataExt,
@@ -966,10 +966,10 @@ mod tests {
             source_account: None,
             body: OperationBody::InvokeHostFunction(InvokeHostFunctionOp {
                 host_function: HostFunction::InvokeContract(InvokeContractArgs {
-                    contract_address: ScAddress::Contract(stellar_xdr::curr::ContractId(
-                        stellar_xdr::curr::Hash([seed; 32]),
+                    contract_address: ScAddress::Contract(stellar_xdr::ContractId(
+                        stellar_xdr::Hash([seed; 32]),
                     )),
-                    function_name: stellar_xdr::curr::ScSymbol("test".try_into().unwrap()),
+                    function_name: stellar_xdr::ScSymbol("test".try_into().unwrap()),
                     args: Default::default(),
                 }),
                 auth: Default::default(),
@@ -978,7 +978,7 @@ mod tests {
         let tx = Transaction {
             source_account: source,
             fee: 1000,
-            seq_num: stellar_xdr::curr::SequenceNumber(seq),
+            seq_num: stellar_xdr::SequenceNumber(seq),
             cond: Preconditions::None,
             memo: Memo::None,
             operations: vec![invoke_op].try_into().unwrap(),
@@ -1012,11 +1012,9 @@ mod tests {
     /// Create a contract data ledger key with a unique identifier.
     fn contract_key(id: u8) -> LedgerKey {
         LedgerKey::ContractData(LedgerKeyContractData {
-            contract: ScAddress::Contract(stellar_xdr::curr::ContractId(stellar_xdr::curr::Hash(
-                [id; 32],
-            ))),
+            contract: ScAddress::Contract(stellar_xdr::ContractId(stellar_xdr::Hash([id; 32]))),
             key: ScVal::U32(id as u32),
-            durability: stellar_xdr::curr::ContractDataDurability::Persistent,
+            durability: stellar_xdr::ContractDataDurability::Persistent,
         })
     }
 
@@ -1215,7 +1213,7 @@ mod tests {
     /// the normal tx (800/1=800 rate) beats the fee-bumped tx (1000/2=500 rate).
     #[test]
     fn test_fee_bump_soroban_uses_per_op_rate() {
-        use stellar_xdr::curr::{
+        use stellar_xdr::{
             FeeBumpTransaction, FeeBumpTransactionEnvelope, FeeBumpTransactionExt,
             FeeBumpTransactionInnerTx,
         };
@@ -1261,7 +1259,7 @@ mod tests {
     /// count from a fee-bump Soroban envelope as `TransactionFrame::soroban_data`.
     #[test]
     fn test_fee_bump_instruction_extraction_matches_frame() {
-        use stellar_xdr::curr::{
+        use stellar_xdr::{
             FeeBumpTransaction, FeeBumpTransactionEnvelope, FeeBumpTransactionExt,
             FeeBumpTransactionInnerTx,
         };
@@ -1641,7 +1639,7 @@ mod tests {
         outer_fee: i64,
         resource_fee: i64,
     ) -> TransactionEnvelope {
-        use stellar_xdr::curr::{
+        use stellar_xdr::{
             FeeBumpTransaction, FeeBumpTransactionEnvelope, FeeBumpTransactionExt,
             FeeBumpTransactionInnerTx,
         };
@@ -1743,7 +1741,7 @@ mod tests {
 #[cfg(test)]
 mod stages_to_xdr_phase_tests {
     use super::*;
-    use stellar_xdr::curr::{
+    use stellar_xdr::{
         HostFunction, InvokeContractArgs, InvokeHostFunctionOp, LedgerFootprint, LedgerKey,
         LedgerKeyContractData, Memo, MuxedAccount, Operation, OperationBody, Preconditions,
         ScAddress, ScVal, SorobanResources, SorobanTransactionData, SorobanTransactionDataExt,
@@ -1775,10 +1773,10 @@ mod stages_to_xdr_phase_tests {
             source_account: None,
             body: OperationBody::InvokeHostFunction(InvokeHostFunctionOp {
                 host_function: HostFunction::InvokeContract(InvokeContractArgs {
-                    contract_address: ScAddress::Contract(stellar_xdr::curr::ContractId(
-                        stellar_xdr::curr::Hash([seed; 32]),
+                    contract_address: ScAddress::Contract(stellar_xdr::ContractId(
+                        stellar_xdr::Hash([seed; 32]),
                     )),
-                    function_name: stellar_xdr::curr::ScSymbol("test".try_into().unwrap()),
+                    function_name: stellar_xdr::ScSymbol("test".try_into().unwrap()),
                     args: Default::default(),
                 }),
                 auth: Default::default(),
@@ -1787,7 +1785,7 @@ mod stages_to_xdr_phase_tests {
         let tx = Transaction {
             source_account: source,
             fee: 1000,
-            seq_num: stellar_xdr::curr::SequenceNumber(seq),
+            seq_num: stellar_xdr::SequenceNumber(seq),
             cond: Preconditions::None,
             memo: Memo::None,
             operations: vec![invoke_op].try_into().unwrap(),
@@ -1801,11 +1799,9 @@ mod stages_to_xdr_phase_tests {
 
     fn contract_key(id: u8) -> LedgerKey {
         LedgerKey::ContractData(LedgerKeyContractData {
-            contract: ScAddress::Contract(stellar_xdr::curr::ContractId(stellar_xdr::curr::Hash(
-                [id; 32],
-            ))),
+            contract: ScAddress::Contract(stellar_xdr::ContractId(stellar_xdr::Hash([id; 32]))),
             key: ScVal::U32(id as u32),
-            durability: stellar_xdr::curr::ContractDataDurability::Persistent,
+            durability: stellar_xdr::ContractDataDurability::Persistent,
         })
     }
 
@@ -1982,8 +1978,8 @@ mod stages_to_xdr_phase_tests {
         let phase2 = stages_to_xdr_phase(to_hashed_stages(stages2), Some(100));
 
         // Both phases should produce the same XDR
-        let xdr1 = phase1.to_xdr(stellar_xdr::curr::Limits::none()).unwrap();
-        let xdr2 = phase2.to_xdr(stellar_xdr::curr::Limits::none()).unwrap();
+        let xdr1 = phase1.to_xdr(stellar_xdr::Limits::none()).unwrap();
+        let xdr2 = phase2.to_xdr(stellar_xdr::Limits::none()).unwrap();
         assert_eq!(xdr1, xdr2, "stages_to_xdr_phase should be idempotent");
     }
 
@@ -2195,7 +2191,7 @@ mod stages_to_xdr_phase_tests {
 #[cfg(test)]
 mod stellar_core_parity_tests {
     use super::*;
-    use stellar_xdr::curr::{
+    use stellar_xdr::{
         ContractDataDurability, HostFunction, InvokeContractArgs, InvokeHostFunctionOp,
         LedgerFootprint, LedgerKey, LedgerKeyContractData, Memo, MuxedAccount, Operation,
         OperationBody, Preconditions, ScAddress, ScVal, SorobanResources, SorobanTransactionData,
@@ -2217,9 +2213,7 @@ mod stellar_core_parity_tests {
             ContractDataDurability::Temporary
         };
         LedgerKey::ContractData(LedgerKeyContractData {
-            contract: ScAddress::Contract(stellar_xdr::curr::ContractId(stellar_xdr::curr::Hash(
-                [0u8; 32],
-            ))),
+            contract: ScAddress::Contract(stellar_xdr::ContractId(stellar_xdr::Hash([0u8; 32]))),
             key: ScVal::I32(id),
             durability,
         })
@@ -2269,10 +2263,10 @@ mod stellar_core_parity_tests {
             source_account: None,
             body: OperationBody::InvokeHostFunction(InvokeHostFunctionOp {
                 host_function: HostFunction::InvokeContract(InvokeContractArgs {
-                    contract_address: ScAddress::Contract(stellar_xdr::curr::ContractId(
-                        stellar_xdr::curr::Hash(source_bytes),
+                    contract_address: ScAddress::Contract(stellar_xdr::ContractId(
+                        stellar_xdr::Hash(source_bytes),
                     )),
-                    function_name: stellar_xdr::curr::ScSymbol("test".try_into().unwrap()),
+                    function_name: stellar_xdr::ScSymbol("test".try_into().unwrap()),
                     args: Default::default(),
                 }),
                 auth: Default::default(),
@@ -2283,7 +2277,7 @@ mod stellar_core_parity_tests {
         let tx = Transaction {
             source_account: source,
             fee: inclusion_fee as u32,
-            seq_num: stellar_xdr::curr::SequenceNumber(1),
+            seq_num: stellar_xdr::SequenceNumber(1),
             cond: Preconditions::None,
             memo: Memo::None,
             operations: vec![invoke_op].try_into().unwrap(),
@@ -2910,7 +2904,7 @@ mod stellar_core_parity_tests {
     /// handle fee-bump envelopes (not just `TransactionEnvelope::Tx`).
     #[test]
     fn test_extract_helpers_fee_bump_envelope() {
-        use stellar_xdr::curr::{
+        use stellar_xdr::{
             FeeBumpTransaction, FeeBumpTransactionEnvelope, FeeBumpTransactionExt,
             FeeBumpTransactionInnerTx, Limits, WriteXdr,
         };
@@ -3040,7 +3034,7 @@ mod stellar_core_parity_tests {
         use rand::rngs::StdRng;
         use rand::{Rng, SeedableRng};
         use std::collections::HashSet;
-        use stellar_xdr::curr::{Limits, ReadXdr, WriteXdr};
+        use stellar_xdr::{Limits, ReadXdr, WriteXdr};
 
         for iter in 0..10u64 {
             let seed = 42 + iter;
@@ -3232,7 +3226,7 @@ mod stellar_core_parity_tests {
             4,
         );
 
-        let stellar_xdr::curr::GeneralizedTransactionSet::V1(v1) = gen_set;
+        let stellar_xdr::GeneralizedTransactionSet::V1(v1) = gen_set;
         let soroban_phase = &v1.phases[1];
         match soroban_phase {
             TransactionPhase::V1(parallel) => {

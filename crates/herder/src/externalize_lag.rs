@@ -24,7 +24,7 @@ use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
 use henyey_scp::SlotIndex;
-use stellar_xdr::curr::{NodeId, ScpQuorumSet};
+use stellar_xdr::{NodeId, ScpQuorumSet};
 
 /// Maximum number of lag samples retained per node.
 const MAX_LAG_SAMPLES: usize = 128;
@@ -201,10 +201,10 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use stellar_xdr::curr::PublicKey;
+    use stellar_xdr::PublicKey;
 
     fn make_node(byte: u8) -> NodeId {
-        NodeId(PublicKey::PublicKeyTypeEd25519(stellar_xdr::curr::Uint256(
+        NodeId(PublicKey::PublicKeyTypeEd25519(stellar_xdr::Uint256(
             [byte; 32],
         )))
     }

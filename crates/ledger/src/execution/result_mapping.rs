@@ -40,17 +40,17 @@ pub(super) fn insufficient_refundable_fee_result(op: &Operation) -> OperationRes
     match &op.body {
         OperationBody::InvokeHostFunction(_) => {
             OperationResult::OpInner(OperationResultTr::InvokeHostFunction(
-                stellar_xdr::curr::InvokeHostFunctionResult::InsufficientRefundableFee,
+                stellar_xdr::InvokeHostFunctionResult::InsufficientRefundableFee,
             ))
         }
         OperationBody::ExtendFootprintTtl(_) => {
             OperationResult::OpInner(OperationResultTr::ExtendFootprintTtl(
-                stellar_xdr::curr::ExtendFootprintTtlResult::InsufficientRefundableFee,
+                stellar_xdr::ExtendFootprintTtlResult::InsufficientRefundableFee,
             ))
         }
         OperationBody::RestoreFootprint(_) => {
             OperationResult::OpInner(OperationResultTr::RestoreFootprint(
-                stellar_xdr::curr::RestoreFootprintResult::InsufficientRefundableFee,
+                stellar_xdr::RestoreFootprintResult::InsufficientRefundableFee,
             ))
         }
         _ => OperationResult::OpNotSupported,
@@ -170,7 +170,7 @@ pub fn build_tx_result_pair(
         };
 
         let inner_pair = InnerTransactionResultPair {
-            transaction_hash: stellar_xdr::curr::Hash(inner_hash.0),
+            transaction_hash: stellar_xdr::Hash(inner_hash.0),
             result: InnerTransactionResult {
                 fee_charged: inner_fee_charged,
                 result: inner_result,
@@ -216,7 +216,7 @@ pub fn build_tx_result_pair(
     };
 
     Ok(TransactionResultPair {
-        transaction_hash: stellar_xdr::curr::Hash(tx_hash.0),
+        transaction_hash: stellar_xdr::Hash(tx_hash.0),
         result,
     })
 }
@@ -225,7 +225,7 @@ pub fn build_tx_result_pair(
 mod tests {
     use super::*;
     use henyey_common::NetworkId;
-    use stellar_xdr::curr::{
+    use stellar_xdr::{
         CreateAccountOp, FeeBumpTransaction, FeeBumpTransactionEnvelope, FeeBumpTransactionInnerTx,
         HostFunction, InvokeHostFunctionOp, LedgerFootprint, Memo, SequenceNumber,
         SorobanResources, SorobanTransactionDataExt, Transaction, TransactionExt,
@@ -235,7 +235,7 @@ mod tests {
     /// Build a classic fee-bump TransactionFrame with configurable inner fee and op count.
     fn make_classic_fee_bump_frame(inner_fee: u32, num_ops: usize) -> TransactionFrame {
         let source = MuxedAccount::Ed25519(Uint256([0u8; 32]));
-        let destination = AccountId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(Uint256(
+        let destination = AccountId(stellar_xdr::PublicKey::PublicKeyTypeEd25519(Uint256(
             [1u8; 32],
         )));
 
@@ -267,7 +267,7 @@ mod tests {
             fee_source: source,
             fee: (inner_fee as i64) * 2,
             inner_tx: FeeBumpTransactionInnerTx::Tx(inner_env),
-            ext: stellar_xdr::curr::FeeBumpTransactionExt::V0,
+            ext: stellar_xdr::FeeBumpTransactionExt::V0,
         };
 
         let envelope = TransactionEnvelope::TxFeeBump(FeeBumpTransactionEnvelope {
@@ -286,15 +286,13 @@ mod tests {
         let operation = Operation {
             source_account: None,
             body: OperationBody::InvokeHostFunction(InvokeHostFunctionOp {
-                host_function: HostFunction::InvokeContract(
-                    stellar_xdr::curr::InvokeContractArgs {
-                        contract_address: stellar_xdr::curr::ScAddress::Contract(
-                            stellar_xdr::curr::ContractId(stellar_xdr::curr::Hash([0u8; 32])),
-                        ),
-                        function_name: stellar_xdr::curr::ScSymbol("test".try_into().unwrap()),
-                        args: VecM::default(),
-                    },
-                ),
+                host_function: HostFunction::InvokeContract(stellar_xdr::InvokeContractArgs {
+                    contract_address: stellar_xdr::ScAddress::Contract(stellar_xdr::ContractId(
+                        stellar_xdr::Hash([0u8; 32]),
+                    )),
+                    function_name: stellar_xdr::ScSymbol("test".try_into().unwrap()),
+                    args: VecM::default(),
+                }),
                 auth: VecM::default(),
             }),
         };
@@ -332,7 +330,7 @@ mod tests {
             fee_source: source,
             fee: (inner_fee as i64) * 2,
             inner_tx: FeeBumpTransactionInnerTx::Tx(inner_env),
-            ext: stellar_xdr::curr::FeeBumpTransactionExt::V0,
+            ext: stellar_xdr::FeeBumpTransactionExt::V0,
         };
 
         let envelope = TransactionEnvelope::TxFeeBump(FeeBumpTransactionEnvelope {

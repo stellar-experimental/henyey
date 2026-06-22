@@ -34,7 +34,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
-use stellar_xdr::curr::{LedgerEntry, LedgerKey, Limits, ReadXdr, WriteXdr};
+use stellar_xdr::{LedgerEntry, LedgerKey, Limits, ReadXdr, WriteXdr};
 
 use henyey_common::Hash256;
 
@@ -230,7 +230,7 @@ impl Bucket {
     pub fn from_sorted_entries(entries: Vec<BucketEntry>) -> Result<Self> {
         use crate::entry::assert_sorted_no_duplicates;
         use sha2::{Digest, Sha256};
-        use stellar_xdr::curr::{Limited, WriteXdr};
+        use stellar_xdr::{Limited, WriteXdr};
 
         assert_sorted_no_duplicates(&entries)?;
 
@@ -548,7 +548,7 @@ impl Bucket {
         );
 
         while let Some(record) = records.next_record()? {
-            match stellar_xdr::curr::BucketEntry::from_xdr(record.body, Limits::none()) {
+            match stellar_xdr::BucketEntry::from_xdr(record.body, Limits::none()) {
                 Ok(xdr_entry) => {
                     entries.push(xdr_entry);
                 }
@@ -576,7 +576,7 @@ impl Bucket {
     /// This format is used for bucket files and hash computation.
     /// Each entry is prefixed with a 4-byte mark: high bit set + 31-bit size in big-endian.
     fn serialize_entries(entries: &[BucketEntry]) -> Result<Vec<u8>> {
-        use stellar_xdr::curr::Limited;
+        use stellar_xdr::Limited;
         let mut bytes = Vec::new();
 
         for entry in entries {
@@ -1064,7 +1064,7 @@ impl Bucket {
     pub fn from_sorted_entries_with_in_memory(entries: Vec<BucketEntry>) -> Result<Self> {
         use crate::entry::assert_sorted_no_duplicates;
         use sha2::{Digest, Sha256};
-        use stellar_xdr::curr::{Limited, WriteXdr};
+        use stellar_xdr::{Limited, WriteXdr};
 
         assert_sorted_no_duplicates(&entries)?;
 
@@ -1238,7 +1238,7 @@ impl Eq for Bucket {}
 mod tests {
     use super::*;
     use crate::BucketEntry;
-    use stellar_xdr::curr::*; // Re-import to shadow XDR's BucketEntry
+    use stellar_xdr::*; // Re-import to shadow XDR's BucketEntry
 
     fn make_account_id(bytes: [u8; 32]) -> AccountId {
         AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(bytes)))
@@ -1476,7 +1476,7 @@ mod tests {
 
     #[test]
     fn test_disk_backed_bucket_with_metadata() {
-        use stellar_xdr::curr::{BucketMetadata, BucketMetadataExt};
+        use stellar_xdr::{BucketMetadata, BucketMetadataExt};
 
         // Create entries with metadata (as stellar-core buckets would have)
         let entries = vec![
@@ -1640,9 +1640,7 @@ mod tests {
 
     #[test]
     fn test_bucket_mixed_entry_types_ordering() {
-        use stellar_xdr::curr::{
-            AlphaNum4, AssetCode4, OfferEntry, TrustLineAsset, TrustLineEntry,
-        };
+        use stellar_xdr::{AlphaNum4, AssetCode4, OfferEntry, TrustLineAsset, TrustLineEntry};
 
         // Create helper functions for different entry types
         let make_offer_entry = |seller: [u8; 32], offer_id: i64| -> LedgerEntry {
@@ -1651,12 +1649,12 @@ mod tests {
                 data: LedgerEntryData::Offer(OfferEntry {
                     seller_id: make_account_id(seller),
                     offer_id: offer_id,
-                    selling: stellar_xdr::curr::Asset::Native,
-                    buying: stellar_xdr::curr::Asset::Native,
+                    selling: stellar_xdr::Asset::Native,
+                    buying: stellar_xdr::Asset::Native,
                     amount: 1000,
-                    price: stellar_xdr::curr::Price { n: 1, d: 1 },
+                    price: stellar_xdr::Price { n: 1, d: 1 },
                     flags: 0,
-                    ext: stellar_xdr::curr::OfferEntryExt::V0,
+                    ext: stellar_xdr::OfferEntryExt::V0,
                 }),
                 ext: LedgerEntryExt::V0,
             }
@@ -1674,7 +1672,7 @@ mod tests {
                     balance: 1000,
                     limit: 10000,
                     flags: 0, // No flags set
-                    ext: stellar_xdr::curr::TrustLineEntryExt::V0,
+                    ext: stellar_xdr::TrustLineEntryExt::V0,
                 }),
                 ext: LedgerEntryExt::V0,
             }
@@ -2018,7 +2016,7 @@ mod tests {
 
     #[test]
     fn test_bucket_protocol_version_in_memory_path() {
-        use stellar_xdr::curr::{BucketMetadata, BucketMetadataExt};
+        use stellar_xdr::{BucketMetadata, BucketMetadataExt};
 
         let entries = vec![
             BucketEntry::Metaentry(BucketMetadata {

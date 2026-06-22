@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use henyey_common::Hash256;
-use stellar_xdr::curr::NodeId;
+use stellar_xdr::NodeId;
 
 /// Result of a completed quorum intersection analysis.
 #[derive(Debug, Clone)]

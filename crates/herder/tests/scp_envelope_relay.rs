@@ -29,7 +29,7 @@ use henyey_crypto::SecretKey;
 use henyey_herder::scp_verify::PostVerifyReason;
 use henyey_herder::{EnvelopeState, Herder, HerderConfig, TimerManagerHandle};
 use henyey_ledger::{LedgerManager, LedgerManagerConfig};
-use stellar_xdr::curr::{
+use stellar_xdr::{
     Hash as XdrHash, LedgerCloseValueSignature, Limits, NodeId as XdrNodeId,
     PublicKey as XdrPublicKey, ScpEnvelope, ScpNomination, ScpQuorumSet, ScpStatement,
     ScpStatementPledges, Signature as XdrSignature, StellarValue, StellarValueExt, TimePoint,
@@ -54,7 +54,7 @@ const PEER_SEED: [u8; 32] = [9u8; 32];
 // ---------------------------------------------------------------------------
 
 fn make_default_lm() -> Arc<LedgerManager> {
-    use stellar_xdr::curr::{
+    use stellar_xdr::{
         Hash, LedgerHeader, LedgerHeaderExt, StellarValue as XdrStellarValue,
         StellarValueExt as XdrStellarValueExt, TimePoint as XdrTimePoint, VecM,
     };

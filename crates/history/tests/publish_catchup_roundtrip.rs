@@ -35,7 +35,7 @@ use henyey_history::{
     RemoteArchive, RemoteArchiveConfig,
 };
 use henyey_ledger::{LedgerManager, LedgerManagerConfig};
-use stellar_xdr::curr::{LedgerHeaderHistoryEntry, LedgerHeaderHistoryEntryExt};
+use stellar_xdr::{LedgerHeaderHistoryEntry, LedgerHeaderHistoryEntryExt};
 
 /// Build the deterministic single empty-bucket checkpoint and publish it into
 /// `staging_dir`. Returns `(checkpoint_seq, expected_header_hash)`.

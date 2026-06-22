@@ -34,7 +34,7 @@ use std::time::Duration;
 use henyey_common::Hash256;
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
-use stellar_xdr::curr::{LedgerEntryType, LedgerKey, Limits, PoolId, ReadXdr, WriteXdr};
+use stellar_xdr::{LedgerEntryType, LedgerKey, Limits, PoolId, ReadXdr, WriteXdr};
 use xorf::BinaryFuse16;
 
 use crate::bloom_filter::BucketBloomFilter;
@@ -127,7 +127,7 @@ impl SerializableAssetPoolIdMap {
     }
 
     fn to_asset_pool_map(&self) -> AssetPoolIdMap {
-        use stellar_xdr::curr::Hash;
+        use stellar_xdr::Hash;
         let asset_to_pools = self
             .entries
             .iter()
@@ -601,7 +601,7 @@ mod tests {
     use super::*;
     use crate::index::DEFAULT_PAGE_SIZE;
     use henyey_common::LIQUIDITY_POOL_FEE_V18;
-    use stellar_xdr::curr::*;
+    use stellar_xdr::*;
     use tempfile::tempdir;
 
     /// Create a dummy bucket file for testing and return its SHA-256 hash.
@@ -971,7 +971,7 @@ mod tests {
 
     #[test]
     fn test_save_load_with_asset_pool_map() {
-        use stellar_xdr::curr::{
+        use stellar_xdr::{
             AlphaNum4, Asset, AssetCode4, Hash, LiquidityPoolConstantProductParameters,
             LiquidityPoolEntryBody, LiquidityPoolEntryConstantProduct,
         };
@@ -992,7 +992,7 @@ mod tests {
         // Create entries with a liquidity pool
         let pool_entry = LedgerEntry {
             last_modified_ledger_seq: 1,
-            data: LedgerEntryData::LiquidityPool(stellar_xdr::curr::LiquidityPoolEntry {
+            data: LedgerEntryData::LiquidityPool(stellar_xdr::LiquidityPoolEntry {
                 liquidity_pool_id: pool_id.clone(),
                 body: LiquidityPoolEntryBody::LiquidityPoolConstantProduct(
                     LiquidityPoolEntryConstantProduct {

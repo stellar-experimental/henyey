@@ -2,7 +2,7 @@
 
 use henyey_crypto::PublicKey as CryptoPublicKey;
 use henyey_overlay::{PeerAddress, PeerId};
-use stellar_xdr::curr::LedgerUpgrade;
+use stellar_xdr::LedgerUpgrade;
 
 use super::types::{ConnectParams, UpgradeItem};
 
@@ -48,19 +48,17 @@ pub(super) fn parse_peer_id(value: &str) -> Result<PeerId, String> {
 }
 
 /// Convert a NodeId to its strkey representation.
-pub(super) fn node_id_to_strkey(node_id: &stellar_xdr::curr::NodeId) -> Option<String> {
+pub(super) fn node_id_to_strkey(node_id: &stellar_xdr::NodeId) -> Option<String> {
     match &node_id.0 {
-        stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(key) => {
-            CryptoPublicKey::from_bytes(&key.0)
-                .ok()
-                .map(|pk| pk.to_strkey())
-        }
+        stellar_xdr::PublicKey::PublicKeyTypeEd25519(key) => CryptoPublicKey::from_bytes(&key.0)
+            .ok()
+            .map(|pk| pk.to_strkey()),
     }
 }
 
 /// Convert a PeerId to its strkey representation.
 pub(crate) fn peer_id_to_strkey(peer_id: PeerId) -> Option<String> {
-    node_id_to_strkey(&stellar_xdr::curr::NodeId(peer_id.0))
+    node_id_to_strkey(&stellar_xdr::NodeId(peer_id.0))
 }
 
 /// Map a LedgerUpgrade to an UpgradeItem for JSON serialization.

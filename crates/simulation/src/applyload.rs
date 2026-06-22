@@ -22,7 +22,7 @@ use henyey_app::App;
 use henyey_common::Hash256;
 use henyey_ledger::{LedgerCloseData, LedgerClosePerf, TransactionSetVariant};
 use henyey_tx::envelope_utils::envelope_soroban_data;
-use stellar_xdr::curr::{
+use stellar_xdr::{
     ConfigSettingEntry, ContractDataDurability, ContractId, ContractIdPreimage,
     ContractIdPreimageFromAddress, ExtensionPoint, Hash, LedgerEntry, LedgerEntryData,
     LedgerEntryExt, LedgerKey, LedgerUpgrade, Limits, OperationBody, ScAddress, ScVal,
@@ -30,7 +30,7 @@ use stellar_xdr::curr::{
 };
 // `LedgerKeyContractData` is only constructed in test fixtures below.
 #[cfg(test)]
-use stellar_xdr::curr::LedgerKeyContractData;
+use stellar_xdr::LedgerKeyContractData;
 use tracing::{debug, info, warn};
 
 use crate::loadgen::{ContractInstance, TxGenerator};
@@ -69,7 +69,7 @@ fn is_soroban_envelope(env: &TransactionEnvelope) -> bool {
     let ops = match env {
         TransactionEnvelope::Tx(v1) => &v1.tx.operations,
         TransactionEnvelope::TxFeeBump(fb) => match &fb.tx.inner_tx {
-            stellar_xdr::curr::FeeBumpTransactionInnerTx::Tx(v1) => &v1.tx.operations,
+            stellar_xdr::FeeBumpTransactionInnerTx::Tx(v1) => &v1.tx.operations,
         },
         _ => return false,
     };
@@ -410,8 +410,8 @@ impl ApplyLoad {
         // Count successes/failures from the result.
         for tx_result in &result.tx_results {
             match &tx_result.result.result {
-                stellar_xdr::curr::TransactionResultResult::TxSuccess(_)
-                | stellar_xdr::curr::TransactionResultResult::TxFeeBumpInnerSuccess(_) => {
+                stellar_xdr::TransactionResultResult::TxSuccess(_)
+                | stellar_xdr::TransactionResultResult::TxFeeBumpInnerSuccess(_) => {
                     self.apply_soroban_success += 1;
                 }
                 other => {
@@ -796,7 +796,7 @@ impl ApplyLoad {
             self.app.ledger_manager().current_ledger_seq() + 1,
             self.root_account_id,
             &wasm_hash,
-            &stellar_xdr::curr::Uint256(salt.0),
+            &stellar_xdr::Uint256(salt.0),
             None,
         )?;
         self.close_ledger(vec![create_tx], Vec::new(), false)?;
@@ -842,7 +842,7 @@ impl ApplyLoad {
         let (_, create_tx) = self.tx_gen.create_sac_transaction(
             ledger_num,
             Some(self.root_account_id),
-            stellar_xdr::curr::Asset::Native,
+            stellar_xdr::Asset::Native,
             None,
         )?;
         self.close_ledger(vec![create_tx], Vec::new(), false)?;
@@ -859,7 +859,7 @@ impl ApplyLoad {
 
         // Construct the SAC ContractInstance.
         // The SAC contract ID is derived from the native asset preimage.
-        let preimage = ContractIdPreimage::Asset(stellar_xdr::curr::Asset::Native);
+        let preimage = ContractIdPreimage::Asset(stellar_xdr::Asset::Native);
         let network_passphrase = self.app.config().network.passphrase.clone();
         let sac_contract_id =
             crate::loadgen_soroban::compute_contract_id(&preimage, &network_passphrase)?;
@@ -935,12 +935,12 @@ impl ApplyLoad {
         // Prepare base live entry.
         let base_live_entry = LedgerEntry {
             last_modified_ledger_seq: 0,
-            data: LedgerEntryData::ContractData(stellar_xdr::curr::ContractDataEntry {
+            data: LedgerEntryData::ContractData(stellar_xdr::ContractDataEntry {
                 ext: ExtensionPoint::V0,
                 contract: contract_addr.clone(),
                 key: ScVal::U64(0),
                 durability: ContractDataDurability::Persistent,
-                val: ScVal::Bytes(stellar_xdr::curr::ScBytes::default()),
+                val: ScVal::Bytes(stellar_xdr::ScBytes::default()),
             }),
             ext: LedgerEntryExt::V0,
         };
@@ -1029,7 +1029,7 @@ impl ApplyLoad {
             lm.bucket_list_mut().add_batch(
                 header.ledger_seq,
                 header.ledger_version,
-                stellar_xdr::curr::BucketListType::Live,
+                stellar_xdr::BucketListType::Live,
                 Vec::new(), // init_entries
                 live_entries,
                 Vec::new(), // dead_entries
@@ -1078,7 +1078,7 @@ impl ApplyLoad {
     /// Matches stellar-core `ApplyLoad::warmAccountCache()`.
     fn warm_account_cache(&mut self) {
         // Collect account IDs and their ledger account IDs to avoid borrow conflict
-        let account_info: Vec<(u64, stellar_xdr::curr::AccountId)> = self
+        let account_info: Vec<(u64, stellar_xdr::AccountId)> = self
             .tx_gen
             .accounts()
             .iter()
@@ -1329,7 +1329,7 @@ impl ApplyLoad {
         tx_max_instructions: u64,
         ledger_max_tx_count: u32,
     ) -> Vec<ConfigSettingEntry> {
-        use stellar_xdr::curr::{
+        use stellar_xdr::{
             ConfigSettingContractBandwidthV0, ConfigSettingContractComputeV0,
             ConfigSettingContractEventsV0, ConfigSettingContractExecutionLanesV0,
             ConfigSettingContractLedgerCostV0, ConfigSettingContractParallelComputeV0,
@@ -1415,7 +1415,7 @@ impl ApplyLoad {
     /// by writing the ConfigUpgradeSet as a synthetic TEMPORARY CONTRACT_DATA
     /// entry directly into the LedgerManager's in-memory Soroban state.
     fn apply_config_upgrade_direct(&mut self, entries: Vec<ConfigSettingEntry>) -> Result<()> {
-        use stellar_xdr::curr::{ConfigUpgradeSet, ConfigUpgradeSetKey, ContractDataEntry};
+        use stellar_xdr::{ConfigUpgradeSet, ConfigUpgradeSetKey, ContractDataEntry};
 
         // Build the ConfigUpgradeSet
         let num_entries = entries.len();
@@ -1644,7 +1644,7 @@ fn generate_live_entries(
         );
         let ttl_entry = LedgerEntry {
             last_modified_ledger_seq: ledger_seq,
-            data: LedgerEntryData::Ttl(stellar_xdr::curr::TtlEntry {
+            data: LedgerEntryData::Ttl(stellar_xdr::TtlEntry {
                 key_hash: Hash(ttl_key_hash.0),
                 live_until_ledger_seq: 1_000_000_000,
             }),
@@ -1670,12 +1670,12 @@ fn generate_archived_entries(
         };
         let le = LedgerEntry {
             last_modified_ledger_seq: ledger_seq,
-            data: LedgerEntryData::ContractData(stellar_xdr::curr::ContractDataEntry {
+            data: LedgerEntryData::ContractData(stellar_xdr::ContractDataEntry {
                 ext: ExtensionPoint::V0,
                 contract: cd.contract.clone(),
                 key: cd.key.clone(),
                 durability: ContractDataDurability::Persistent,
-                val: ScVal::Bytes(stellar_xdr::curr::ScBytes::default()),
+                val: ScVal::Bytes(stellar_xdr::ScBytes::default()),
             }),
             ext: LedgerEntryExt::V0,
         };
@@ -1866,7 +1866,7 @@ mod tests {
 
     #[test]
     fn test_estimate_tx_resources_fee_bump_soroban() {
-        use stellar_xdr::curr::{
+        use stellar_xdr::{
             ContractId, FeeBumpTransaction, FeeBumpTransactionEnvelope, FeeBumpTransactionExt,
             FeeBumpTransactionInnerTx, HostFunction, InvokeContractArgs, InvokeHostFunctionOp,
             LedgerFootprint, Memo, MuxedAccount, Operation, Preconditions, ScSymbol,

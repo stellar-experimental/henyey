@@ -6,7 +6,7 @@
 use henyey_common::protocol::{
     protocol_version_is_before, PARALLEL_SOROBAN_PHASE_PROTOCOL_VERSION,
 };
-use stellar_xdr::curr::{
+use stellar_xdr::{
     AccountId, ExtendFootprintTtlOp, ExtendFootprintTtlResult, ExtendFootprintTtlResultCode,
     OperationResult, OperationResultTr, SorobanTransactionData,
 };
@@ -187,7 +187,7 @@ mod tests {
 
     use super::*;
     use crate::test_utils::create_test_account_id;
-    use stellar_xdr::curr::*;
+    use stellar_xdr::*;
 
     fn create_test_context() -> LedgerContext {
         LedgerContext::testnet(1, 1000)
@@ -651,7 +651,7 @@ mod tests {
 
         // Insert a contract code entry with enough bytes to exceed disk_read_bytes=1
         let code_entry = ContractCodeEntry {
-            ext: stellar_xdr::curr::ContractCodeEntryExt::V0,
+            ext: stellar_xdr::ContractCodeEntryExt::V0,
             hash: contract_hash.clone(),
             code: vec![0u8; 500].try_into().unwrap(),
         };
@@ -659,7 +659,7 @@ mod tests {
 
         // Insert a TTL entry that needs extending
         let key_hash = crate::soroban::compute_key_hash(&contract_key);
-        let ttl_entry = stellar_xdr::curr::TtlEntry {
+        let ttl_entry = stellar_xdr::TtlEntry {
             key_hash: key_hash.clone(),
             live_until_ledger_seq: context.sequence + 10,
         };
@@ -729,14 +729,14 @@ mod tests {
         });
 
         let code_entry = ContractCodeEntry {
-            ext: stellar_xdr::curr::ContractCodeEntryExt::V0,
+            ext: stellar_xdr::ContractCodeEntryExt::V0,
             hash: contract_hash.clone(),
             code: vec![0u8; 500].try_into().unwrap(),
         };
         state.create_contract_code(code_entry);
 
         let key_hash = crate::soroban::compute_key_hash(&contract_key);
-        let ttl_entry = stellar_xdr::curr::TtlEntry {
+        let ttl_entry = stellar_xdr::TtlEntry {
             key_hash: key_hash.clone(),
             live_until_ledger_seq: context.sequence + 10,
         };
@@ -806,7 +806,7 @@ mod tests {
 
         // Insert a contract code entry into state so the lookup succeeds
         let code_entry = ContractCodeEntry {
-            ext: stellar_xdr::curr::ContractCodeEntryExt::V0,
+            ext: stellar_xdr::ContractCodeEntryExt::V0,
             hash: contract_hash.clone(),
             code: vec![0u8; 100].try_into().unwrap(),
         };
@@ -814,7 +814,7 @@ mod tests {
 
         // Insert a TTL entry that needs extending (live_until < current + extend_to)
         let key_hash = crate::soroban::compute_key_hash(&contract_key);
-        let ttl_entry = stellar_xdr::curr::TtlEntry {
+        let ttl_entry = stellar_xdr::TtlEntry {
             key_hash: key_hash.clone(),
             live_until_ledger_seq: context.sequence + 10, // live but needs extending
         };

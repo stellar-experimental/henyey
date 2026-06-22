@@ -507,7 +507,7 @@ mod tests {
                     op_index: 0,
                     tx_hash: "aabb".to_string(),
                     contract_id: Some("CABC".to_string()),
-                    event_type: stellar_xdr::curr::ContractEventType::Contract,
+                    event_type: stellar_xdr::ContractEventType::Contract,
                     topics: vec!["t1".to_string()],
                     event_xdr: "deadbeef".to_string(),
                     in_successful_contract_call: true,

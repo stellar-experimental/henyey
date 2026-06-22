@@ -823,7 +823,7 @@ impl FutureBucket {
 mod tests {
     use super::*;
     use crate::entry::BucketEntry;
-    use stellar_xdr::curr::*;
+    use stellar_xdr::*;
 
     fn make_account_id(bytes: [u8; 32]) -> AccountId {
         AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(bytes)))

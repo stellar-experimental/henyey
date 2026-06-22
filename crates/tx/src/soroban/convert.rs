@@ -1,11 +1,12 @@
 //! Cross-version XDR byte-level conversion helpers.
 //!
-//! Henyey uses workspace XDR types (`stellar_xdr::curr`, currently v26-aligned)
+//! Henyey uses workspace XDR types (`stellar_xdr`, currently v27-aligned)
 //! as its canonical representation, but must convert to protocol-specific
-//! `soroban-env-host` types (P24, P25) for execution and rent calculation.
+//! `soroban-env-host` types (P24, P25, P26) for execution and rent calculation.
 //!
-//! The P26 host uses stellar-xdr 26.0.0 (same as workspace), so types are
-//! identical and no conversion is needed for P26.
+//! Each `soroban-env-host` pins its own XDR (P24→v24, P25→v25, P26→v26), all
+//! distinct from the workspace XDR, so byte-level conversion is required for
+//! every host version.
 //!
 //! These conversions serialize to XDR bytes and deserialize into the target
 //! version's types. This works because the wire format is compatible across
@@ -17,7 +18,8 @@
 
 use soroban_env_host_p24 as soroban_env_host24;
 use soroban_env_host_p25 as soroban_env_host25;
-use stellar_xdr::curr::{ContractCostParams, LedgerEntry, Limits, WriteXdr};
+use soroban_env_host_p26 as soroban_env_host26;
+use stellar_xdr::{ContractCostParams, LedgerEntry, Limits, WriteXdr};
 
 /// Error from cross-version XDR byte-level conversion.
 ///
@@ -126,10 +128,53 @@ pub fn try_convert_ledger_entry_to_p24(
         })
 }
 
+/// Convert workspace `ContractCostParams` to P26 `ContractCostParams`.
+pub fn try_convert_cost_params_ws_to_p26(
+    params: &ContractCostParams,
+) -> Result<soroban_env_host26::xdr::ContractCostParams, XdrConversionError> {
+    let bytes = params
+        .to_xdr(Limits::none())
+        .map_err(|e| XdrConversionError {
+            phase: "serialize",
+            type_name: "ContractCostParams",
+            source: e.into(),
+        })?;
+    use soroban_env_host26::xdr::ReadXdr as ReadXdrP26;
+    soroban_env_host26::xdr::ContractCostParams::from_xdr(
+        &bytes,
+        soroban_env_host26::xdr::Limits::none(),
+    )
+    .map_err(|e| XdrConversionError {
+        phase: "deserialize",
+        type_name: "P26 ContractCostParams",
+        source: e.into(),
+    })
+}
+
+/// Convert workspace `LedgerEntry` to P26 `LedgerEntry`.
+pub fn try_convert_ledger_entry_ws_to_p26(
+    entry: &LedgerEntry,
+) -> Result<soroban_env_host26::xdr::LedgerEntry, XdrConversionError> {
+    let bytes = entry
+        .to_xdr(Limits::none())
+        .map_err(|e| XdrConversionError {
+            phase: "serialize",
+            type_name: "LedgerEntry",
+            source: e.into(),
+        })?;
+    use soroban_env_host26::xdr::ReadXdr as ReadXdrP26;
+    soroban_env_host26::xdr::LedgerEntry::from_xdr(&bytes, soroban_env_host26::xdr::Limits::none())
+        .map_err(|e| XdrConversionError {
+            phase: "deserialize",
+            type_name: "P26 LedgerEntry",
+            source: e.into(),
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use stellar_xdr::curr::{
+    use stellar_xdr::{
         ContractCostParamEntry, ContractDataDurability, ContractDataEntry, ContractId,
         ExtensionPoint, Hash, LedgerEntryData, LedgerEntryExt, ScAddress, ScVal,
     };
@@ -193,6 +238,20 @@ mod tests {
         let entry = sample_ledger_entry();
         let p24 = try_convert_ledger_entry_to_p24(&entry).unwrap();
         assert_eq!(p24.last_modified_ledger_seq, 100);
+    }
+
+    #[test]
+    fn test_try_convert_cost_params_ws_to_p26_roundtrip() {
+        let params = sample_cost_params();
+        let p26 = try_convert_cost_params_ws_to_p26(&params).unwrap();
+        assert_eq!(p26.0.len(), 1);
+    }
+
+    #[test]
+    fn test_try_convert_ledger_entry_ws_to_p26_roundtrip() {
+        let entry = sample_ledger_entry();
+        let p26 = try_convert_ledger_entry_ws_to_p26(&entry).unwrap();
+        assert_eq!(p26.last_modified_ledger_seq, 100);
     }
 
     #[test]

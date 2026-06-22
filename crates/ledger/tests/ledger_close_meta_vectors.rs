@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use henyey_common::Hash256;
 use henyey_crypto::PublicKey;
 use serde_json::Value as JsonValue;
-use stellar_xdr::curr::{
+use stellar_xdr::{
     ExtendFootprintTtlResult, Hash, InnerTransactionResult, InnerTransactionResultExt,
     InnerTransactionResultPair, InnerTransactionResultResult, InvokeHostFunctionResult,
     LedgerCloseValueSignature, LedgerHeader, LedgerHeaderExt, LedgerHeaderHistoryEntry,

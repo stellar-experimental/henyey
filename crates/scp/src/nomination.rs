@@ -33,7 +33,7 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
-use stellar_xdr::curr::{
+use stellar_xdr::{
     NodeId, ScpEnvelope, ScpNomination, ScpQuorumSet, ScpStatement, ScpStatementPledges, Value,
 };
 
@@ -736,7 +736,7 @@ impl NominationProtocol {
 
         let mut envelope = ScpEnvelope {
             statement: statement.clone(),
-            signature: stellar_xdr::curr::Signature(Vec::new().try_into().unwrap_or_default()),
+            signature: stellar_xdr::Signature(Vec::new().try_into().unwrap_or_default()),
         };
 
         ctx.driver.sign_envelope(&mut envelope);
@@ -1225,7 +1225,7 @@ mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
-    use stellar_xdr::curr::{Hash, PublicKey, ScpBallot, Uint256};
+    use stellar_xdr::{Hash, PublicKey, ScpBallot, Uint256};
 
     /// Helper to construct a `SlotContext` from the old four-parameter pattern.
     macro_rules! ctx {
@@ -1300,7 +1300,7 @@ mod tests {
         };
         ScpEnvelope {
             statement,
-            signature: stellar_xdr::curr::Signature(Vec::new().try_into().unwrap_or_default()),
+            signature: stellar_xdr::Signature(Vec::new().try_into().unwrap_or_default()),
         }
     }
 
@@ -1769,9 +1769,9 @@ mod tests {
         let mut nom = NominationProtocol::new();
 
         // Create a prepare envelope (ballot protocol, not nomination)
-        let prep = stellar_xdr::curr::ScpStatementPrepare {
+        let prep = stellar_xdr::ScpStatementPrepare {
             quorum_set_hash: crate::quorum::hash_quorum_set(&quorum_set).into(),
-            ballot: stellar_xdr::curr::ScpBallot {
+            ballot: stellar_xdr::ScpBallot {
                 counter: 1,
                 value: make_value(&[1]),
             },
@@ -1780,14 +1780,14 @@ mod tests {
             n_c: 0,
             n_h: 0,
         };
-        let statement = stellar_xdr::curr::ScpStatement {
+        let statement = stellar_xdr::ScpStatement {
             node_id: node.clone(),
             slot_index: 1,
-            pledges: stellar_xdr::curr::ScpStatementPledges::Prepare(prep),
+            pledges: stellar_xdr::ScpStatementPledges::Prepare(prep),
         };
-        let envelope = stellar_xdr::curr::ScpEnvelope {
+        let envelope = stellar_xdr::ScpEnvelope {
             statement,
-            signature: stellar_xdr::curr::Signature(Vec::new().try_into().unwrap_or_default()),
+            signature: stellar_xdr::Signature(Vec::new().try_into().unwrap_or_default()),
         };
 
         assert!(!nom.set_state_from_envelope(&envelope));
@@ -2554,7 +2554,7 @@ mod tests {
                 slot_index: 0,
                 pledges: ScpStatementPledges::Nominate(nomination_pledge),
             },
-            signature: stellar_xdr::curr::Signature(vec![].try_into().unwrap()),
+            signature: stellar_xdr::Signature(vec![].try_into().unwrap()),
         };
         nom.latest_nominations.insert(remote_node.clone(), envelope);
 
@@ -2759,7 +2759,7 @@ mod tests {
                     accepted: vec![make_value(&[1]), make_value(&[2])].try_into().unwrap(),
                 }),
             },
-            signature: stellar_xdr::curr::Signature(Vec::new().try_into().unwrap_or_default()),
+            signature: stellar_xdr::Signature(Vec::new().try_into().unwrap_or_default()),
         };
         nom.last_envelope = Some(local_env);
 
@@ -2774,7 +2774,7 @@ mod tests {
                     accepted: vec![make_value(&[1])].try_into().unwrap(),
                 }),
             },
-            signature: stellar_xdr::curr::Signature(Vec::new().try_into().unwrap_or_default()),
+            signature: stellar_xdr::Signature(Vec::new().try_into().unwrap_or_default()),
         };
         nom.latest_nominations.insert(peer.clone(), peer_env);
 
@@ -2804,7 +2804,7 @@ mod tests {
                     accepted: vec![make_value(&[1])].try_into().unwrap(),
                 }),
             },
-            signature: stellar_xdr::curr::Signature(Vec::new().try_into().unwrap_or_default()),
+            signature: stellar_xdr::Signature(Vec::new().try_into().unwrap_or_default()),
         };
         nom.last_envelope = Some(local_env);
 
@@ -2819,7 +2819,7 @@ mod tests {
                     accepted: vec![make_value(&[2])].try_into().unwrap(),
                 }),
             },
-            signature: stellar_xdr::curr::Signature(Vec::new().try_into().unwrap_or_default()),
+            signature: stellar_xdr::Signature(Vec::new().try_into().unwrap_or_default()),
         };
         nom.latest_nominations.insert(peer.clone(), peer_env);
 
@@ -2851,7 +2851,7 @@ mod tests {
                     accepted: vec![val.clone()].try_into().unwrap(),
                 }),
             },
-            signature: stellar_xdr::curr::Signature(Vec::new().try_into().unwrap_or_default()),
+            signature: stellar_xdr::Signature(Vec::new().try_into().unwrap_or_default()),
         };
         nom.last_envelope = Some(env.clone());
 

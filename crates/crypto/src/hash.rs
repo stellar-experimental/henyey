@@ -30,7 +30,7 @@ use henyey_common::Hash256;
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
 #[cfg(test)]
-use stellar_xdr::curr::WriteXdr;
+use stellar_xdr::WriteXdr;
 
 /// Computes the SHA-256 hash of the given data.
 ///
@@ -262,8 +262,8 @@ fn hkdf(ikm: &[u8], info: &[u8]) -> [u8; 32] {
 ///
 /// The SHA-256 hash of the XDR-encoded value, or an error if encoding fails.
 #[cfg(test)]
-fn xdr_sha256<T: WriteXdr>(value: &T) -> Result<Hash256, stellar_xdr::curr::Error> {
-    let bytes = value.to_xdr(stellar_xdr::curr::Limits::none())?;
+fn xdr_sha256<T: WriteXdr>(value: &T) -> Result<Hash256, stellar_xdr::Error> {
+    let bytes = value.to_xdr(stellar_xdr::Limits::none())?;
     Ok(sha256(&bytes))
 }
 
@@ -401,7 +401,7 @@ mod tests {
 
     #[test]
     fn test_xdr_sha256() {
-        use stellar_xdr::curr::Uint256;
+        use stellar_xdr::Uint256;
 
         let value = Uint256([0u8; 32]);
         let hash = xdr_sha256(&value).unwrap();
@@ -412,10 +412,10 @@ mod tests {
 
     #[test]
     fn test_xdr_sha256_matches_direct_hash() {
-        use stellar_xdr::curr::Uint256;
+        use stellar_xdr::Uint256;
 
         let value = Uint256([42u8; 32]);
-        let xdr_bytes = value.to_xdr(stellar_xdr::curr::Limits::none()).unwrap();
+        let xdr_bytes = value.to_xdr(stellar_xdr::Limits::none()).unwrap();
 
         let sha256_hash = xdr_sha256(&value).unwrap();
         let direct_sha256 = sha256(&xdr_bytes);

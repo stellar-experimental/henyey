@@ -14,7 +14,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use stellar_xdr::curr::ErrorCode;
+use stellar_xdr::ErrorCode;
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 

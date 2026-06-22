@@ -13,7 +13,7 @@
 //! `TransactionFrame`.
 
 use henyey_common::Resource;
-use stellar_xdr::curr::{
+use stellar_xdr::{
     FeeBumpTransactionInnerTx, Operation, OperationBody, SorobanResources, SorobanTransactionData,
     TransactionEnvelope, TransactionExt, VecM,
 };
@@ -137,7 +137,7 @@ pub fn resources_from_envelope(
     if is_soroban_envelope(env) {
         let data = envelope_soroban_data(env);
         let fallback_resources = SorobanResources {
-            footprint: stellar_xdr::curr::LedgerFootprint {
+            footprint: stellar_xdr::LedgerFootprint {
                 read_only: VecM::default(),
                 read_write: VecM::default(),
             },
@@ -188,7 +188,7 @@ pub fn resources_from_envelope(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use stellar_xdr::curr::*;
+    use stellar_xdr::*;
 
     fn make_classic_v1(ops: Vec<Operation>) -> TransactionEnvelope {
         TransactionEnvelope::Tx(TransactionV1Envelope {

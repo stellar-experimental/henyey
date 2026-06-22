@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use serde::Serialize;
-use stellar_xdr::curr::{
+use stellar_xdr::{
     DiagnosticEvent, LedgerCloseMeta, LedgerHeaderHistoryEntry, LedgerKey, Limits, ReadXdr,
     TransactionMeta, TransactionResultPair, WriteXdr,
 };
@@ -724,7 +724,7 @@ impl LedgerContext {
 /// Check if XDR-encoded transaction envelope bytes represent a fee bump transaction.
 // SECURITY: XDR input pre-bounded by HTTP body size limit; Limits::none() is safe
 pub(crate) fn is_fee_bump_envelope(envelope_bytes: &[u8]) -> Result<bool, RpcXdrError> {
-    use stellar_xdr::curr::TransactionEnvelope;
+    use stellar_xdr::TransactionEnvelope;
     let env = TransactionEnvelope::from_xdr(envelope_bytes, Limits::none()).map_err(|e| {
         RpcXdrError::XdrParse {
             type_name: "TransactionEnvelope",
@@ -788,7 +788,7 @@ pub(crate) fn insert_diagnostic_events(
 /// Returns `None` if the key is not a TTL-bearing type.
 pub(crate) fn ttl_key_for_ledger_key(key: &LedgerKey) -> Option<LedgerKey> {
     if henyey_common::is_soroban_key(key) {
-        Some(LedgerKey::Ttl(stellar_xdr::curr::LedgerKeyTtl {
+        Some(LedgerKey::Ttl(stellar_xdr::LedgerKeyTtl {
             key_hash: hash_ledger_key(key),
         }))
     } else {
@@ -797,10 +797,10 @@ pub(crate) fn ttl_key_for_ledger_key(key: &LedgerKey) -> Option<LedgerKey> {
 }
 
 /// SHA-256 hash of the XDR-encoded ledger key, returned as an XDR `Hash`.
-pub(crate) fn hash_ledger_key(key: &LedgerKey) -> stellar_xdr::curr::Hash {
+pub(crate) fn hash_ledger_key(key: &LedgerKey) -> stellar_xdr::Hash {
     let xdr_bytes = key.to_xdr(Limits::none()).expect("XDR encode");
     let hash = henyey_crypto::sha256(&xdr_bytes);
-    stellar_xdr::curr::Hash(*hash.as_bytes())
+    stellar_xdr::Hash(*hash.as_bytes())
 }
 
 /// Format a Unix timestamp as an ISO 8601 UTC string (e.g. `2024-01-15T12:30:00Z`).
@@ -1059,7 +1059,7 @@ mod tests {
 
     #[test]
     fn test_extract_result_xdr_success() {
-        use stellar_xdr::curr::{
+        use stellar_xdr::{
             TransactionResult, TransactionResultExt, TransactionResultResult, WriteXdr,
         };
         let result = TransactionResult {
@@ -1068,14 +1068,13 @@ mod tests {
             ext: TransactionResultExt::V0,
         };
         let pair = TransactionResultPair {
-            transaction_hash: stellar_xdr::curr::Hash([0u8; 32]),
+            transaction_hash: stellar_xdr::Hash([0u8; 32]),
             result: result.clone(),
         };
         let bytes = pair.to_xdr(Limits::none()).unwrap();
         let extracted = extract_result_xdr(&bytes).unwrap();
         // Round-trip: the extracted bytes should parse as TransactionResult
-        let parsed =
-            stellar_xdr::curr::TransactionResult::from_xdr(&extracted, Limits::none()).unwrap();
+        let parsed = stellar_xdr::TransactionResult::from_xdr(&extracted, Limits::none()).unwrap();
         assert_eq!(parsed.fee_charged, 100);
     }
 
@@ -1089,19 +1088,15 @@ mod tests {
 
     #[test]
     fn test_is_fee_bump_envelope_non_fee_bump() {
-        use stellar_xdr::curr::{
-            Transaction, TransactionEnvelope, TransactionV1Envelope, WriteXdr,
-        };
+        use stellar_xdr::{Transaction, TransactionEnvelope, TransactionV1Envelope, WriteXdr};
         let tx = Transaction {
-            source_account: stellar_xdr::curr::MuxedAccount::Ed25519(stellar_xdr::curr::Uint256(
-                [0u8; 32],
-            )),
+            source_account: stellar_xdr::MuxedAccount::Ed25519(stellar_xdr::Uint256([0u8; 32])),
             fee: 100,
-            seq_num: stellar_xdr::curr::SequenceNumber(1),
-            cond: stellar_xdr::curr::Preconditions::None,
-            memo: stellar_xdr::curr::Memo::None,
+            seq_num: stellar_xdr::SequenceNumber(1),
+            cond: stellar_xdr::Preconditions::None,
+            memo: stellar_xdr::Memo::None,
             operations: vec![].try_into().unwrap(),
-            ext: stellar_xdr::curr::TransactionExt::V0,
+            ext: stellar_xdr::TransactionExt::V0,
         };
         let env = TransactionEnvelope::Tx(TransactionV1Envelope {
             tx,
@@ -1125,7 +1120,7 @@ mod tests {
 
     #[test]
     fn test_extract_diagnostic_events_v0_meta() {
-        use stellar_xdr::curr::{TransactionMeta, WriteXdr};
+        use stellar_xdr::{TransactionMeta, WriteXdr};
         let meta = TransactionMeta::V0(Default::default());
         let bytes = meta.to_xdr(Limits::none()).unwrap();
         assert!(extract_diagnostic_events(&bytes).unwrap().is_none());
@@ -1133,9 +1128,9 @@ mod tests {
 
     #[test]
     fn test_extract_diagnostic_events_v3_no_soroban() {
-        use stellar_xdr::curr::{TransactionMeta, TransactionMetaV3, WriteXdr};
+        use stellar_xdr::{TransactionMeta, TransactionMetaV3, WriteXdr};
         let meta = TransactionMeta::V3(TransactionMetaV3 {
-            ext: stellar_xdr::curr::ExtensionPoint::V0,
+            ext: stellar_xdr::ExtensionPoint::V0,
             tx_changes_before: Default::default(),
             operations: Default::default(),
             tx_changes_after: Default::default(),
@@ -1172,12 +1167,12 @@ mod tests {
 
     #[test]
     fn test_ttl_key_for_contract_data() {
-        let key = LedgerKey::ContractData(stellar_xdr::curr::LedgerKeyContractData {
-            contract: stellar_xdr::curr::ScAddress::Contract(stellar_xdr::curr::ContractId(
-                stellar_xdr::curr::Hash([0xAA; 32]),
-            )),
-            key: stellar_xdr::curr::ScVal::LedgerKeyContractInstance,
-            durability: stellar_xdr::curr::ContractDataDurability::Persistent,
+        let key = LedgerKey::ContractData(stellar_xdr::LedgerKeyContractData {
+            contract: stellar_xdr::ScAddress::Contract(stellar_xdr::ContractId(stellar_xdr::Hash(
+                [0xAA; 32],
+            ))),
+            key: stellar_xdr::ScVal::LedgerKeyContractInstance,
+            durability: stellar_xdr::ContractDataDurability::Persistent,
         });
         let ttl_key = ttl_key_for_ledger_key(&key);
         assert!(ttl_key.is_some());
@@ -1192,12 +1187,10 @@ mod tests {
 
     #[test]
     fn test_ttl_key_for_account() {
-        let key = LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
-            account_id: stellar_xdr::curr::AccountId(
-                stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(stellar_xdr::curr::Uint256(
-                    [1u8; 32],
-                )),
-            ),
+        let key = LedgerKey::Account(stellar_xdr::LedgerKeyAccount {
+            account_id: stellar_xdr::AccountId(stellar_xdr::PublicKey::PublicKeyTypeEd25519(
+                stellar_xdr::Uint256([1u8; 32]),
+            )),
         });
         assert!(ttl_key_for_ledger_key(&key).is_none());
     }
@@ -1614,7 +1607,7 @@ mod tests {
     /// Build a minimal `LedgerCloseMeta` with the given ledger sequence and
     /// serialize it to XDR bytes.
     fn make_lcm_bytes(seq: u32) -> Vec<u8> {
-        use stellar_xdr::curr::{
+        use stellar_xdr::{
             Hash, LedgerCloseMetaV0, LedgerHeader, LedgerHeaderExt, LedgerHeaderHistoryEntryExt,
             StellarValue, StellarValueExt, TimePoint, TransactionSet, WriteXdr,
         };

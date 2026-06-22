@@ -1,6 +1,6 @@
 //! High-level database methods for history and RPC retention data.
 
-use stellar_xdr::curr::{TransactionHistoryEntry, TransactionHistoryResultEntry};
+use stellar_xdr::{TransactionHistoryEntry, TransactionHistoryResultEntry};
 
 use crate::{pool::Database, queries, Result};
 

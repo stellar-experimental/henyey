@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
-use stellar_xdr::curr::{NodeId, ScpQuorumSet};
+use stellar_xdr::{NodeId, ScpQuorumSet};
 use tracing::warn;
 
 use henyey_common::xdr_to_bytes;

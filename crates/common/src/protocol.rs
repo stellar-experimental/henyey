@@ -286,11 +286,11 @@ pub const MASK_LEDGER_HEADER_FLAGS: u32 = 0x7;
 /// - `Flags`: protocol >= V18 and no bits outside `MASK_LEDGER_HEADER_FLAGS`
 /// - `MaxSorobanTxSetSize`: protocol >= V20
 pub fn upgrade_valid_for_apply_non_config(
-    upgrade: &stellar_xdr::curr::LedgerUpgrade,
+    upgrade: &stellar_xdr::LedgerUpgrade,
     current_version: u32,
     max_protocol_version: u32,
 ) -> bool {
-    use stellar_xdr::curr::LedgerUpgrade;
+    use stellar_xdr::LedgerUpgrade;
     match upgrade {
         LedgerUpgrade::Version(new_version) => {
             *new_version <= max_protocol_version && *new_version > current_version
@@ -326,7 +326,7 @@ pub fn upgrade_valid_for_apply_non_config(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LclContext {
     /// Hash of the LCL (becomes `previous_ledger_hash` in synthesized tx sets).
-    lcl_hash: stellar_xdr::curr::Hash,
+    lcl_hash: stellar_xdr::Hash,
     /// The LCL's protocol version (determines Classic vs Generalized format).
     protocol_version: u32,
 }
@@ -339,7 +339,7 @@ impl LclContext {
     /// provides this guarantee structurally.
     pub fn new(protocol_version: u32, lcl_hash: crate::Hash256) -> Self {
         Self {
-            lcl_hash: stellar_xdr::curr::Hash(lcl_hash.0),
+            lcl_hash: stellar_xdr::Hash(lcl_hash.0),
             protocol_version,
         }
     }
@@ -350,13 +350,13 @@ impl LclContext {
     /// and the protocol version is 0 (Classic format).
     pub fn pre_genesis() -> Self {
         Self {
-            lcl_hash: stellar_xdr::curr::Hash([0u8; 32]),
+            lcl_hash: stellar_xdr::Hash([0u8; 32]),
             protocol_version: 0,
         }
     }
 
     /// The LCL hash (used as `previous_ledger_hash` in synthesized tx sets).
-    pub fn lcl_hash(&self) -> &stellar_xdr::curr::Hash {
+    pub fn lcl_hash(&self) -> &stellar_xdr::Hash {
         &self.lcl_hash
     }
 
@@ -409,7 +409,7 @@ mod tests {
     fn test_lcl_context_pre_genesis() {
         let lcl = LclContext::pre_genesis();
         assert_eq!(lcl.protocol_version(), 0);
-        assert_eq!(lcl.lcl_hash(), &stellar_xdr::curr::Hash([0u8; 32]));
+        assert_eq!(lcl.lcl_hash(), &stellar_xdr::Hash([0u8; 32]));
     }
 
     #[test]
@@ -417,14 +417,14 @@ mod tests {
         let hash = crate::Hash256([42u8; 32]);
         let lcl = LclContext::new(23, hash);
         assert_eq!(lcl.protocol_version(), 23);
-        assert_eq!(lcl.lcl_hash(), &stellar_xdr::curr::Hash([42u8; 32]));
+        assert_eq!(lcl.lcl_hash(), &stellar_xdr::Hash([42u8; 32]));
     }
 
     // ---- upgrade_valid_for_apply_non_config -------------------------------
 
     #[test]
     fn test_upgrade_valid_version_monotonic_and_range() {
-        use stellar_xdr::curr::LedgerUpgrade;
+        use stellar_xdr::LedgerUpgrade;
         // Strictly increasing and within max → valid.
         assert!(upgrade_valid_for_apply_non_config(
             &LedgerUpgrade::Version(26),
@@ -453,7 +453,7 @@ mod tests {
 
     #[test]
     fn test_upgrade_valid_base_fee_nonzero() {
-        use stellar_xdr::curr::LedgerUpgrade;
+        use stellar_xdr::LedgerUpgrade;
         assert!(upgrade_valid_for_apply_non_config(
             &LedgerUpgrade::BaseFee(100),
             25,
@@ -468,7 +468,7 @@ mod tests {
 
     #[test]
     fn test_upgrade_valid_base_reserve_nonzero() {
-        use stellar_xdr::curr::LedgerUpgrade;
+        use stellar_xdr::LedgerUpgrade;
         assert!(upgrade_valid_for_apply_non_config(
             &LedgerUpgrade::BaseReserve(5_000_000),
             25,
@@ -483,7 +483,7 @@ mod tests {
 
     #[test]
     fn test_upgrade_valid_max_tx_set_size_always_valid() {
-        use stellar_xdr::curr::LedgerUpgrade;
+        use stellar_xdr::LedgerUpgrade;
         assert!(upgrade_valid_for_apply_non_config(
             &LedgerUpgrade::MaxTxSetSize(0),
             25,
@@ -498,7 +498,7 @@ mod tests {
 
     #[test]
     fn test_upgrade_valid_flags_mask_and_protocol() {
-        use stellar_xdr::curr::LedgerUpgrade;
+        use stellar_xdr::LedgerUpgrade;
         // Valid: within mask, protocol >= V18.
         assert!(upgrade_valid_for_apply_non_config(
             &LedgerUpgrade::Flags(MASK_LEDGER_HEADER_FLAGS),
@@ -522,7 +522,7 @@ mod tests {
 
     #[test]
     fn test_upgrade_valid_max_soroban_tx_set_size_protocol_gate() {
-        use stellar_xdr::curr::LedgerUpgrade;
+        use stellar_xdr::LedgerUpgrade;
         assert!(upgrade_valid_for_apply_non_config(
             &LedgerUpgrade::MaxSorobanTxSetSize(100),
             20,
@@ -537,7 +537,7 @@ mod tests {
 
     #[test]
     fn test_upgrade_valid_config_delegated_returns_true() {
-        use stellar_xdr::curr::{ConfigUpgradeSetKey, ContractId, Hash, LedgerUpgrade};
+        use stellar_xdr::{ConfigUpgradeSetKey, ContractId, Hash, LedgerUpgrade};
         let key = ConfigUpgradeSetKey {
             contract_id: ContractId(Hash([0u8; 32])),
             content_hash: Hash([0u8; 32]),

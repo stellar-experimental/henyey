@@ -168,8 +168,8 @@ pub fn verify_hash_from_raw_key(
 /// and `SignatureUtils::getSignedPayloadHint` in
 /// `src/transactions/SignatureUtils.cpp`.
 pub fn verify_ed25519_signed_payload(
-    sig: &stellar_xdr::curr::DecoratedSignature,
-    signed_payload: &stellar_xdr::curr::SignerKeyEd25519SignedPayload,
+    sig: &stellar_xdr::DecoratedSignature,
+    signed_payload: &stellar_xdr::SignerKeyEd25519SignedPayload,
 ) -> bool {
     // Compute expected XOR hint per stellar-core getSignedPayloadHint.
     let pubkey_hint = [
@@ -333,10 +333,10 @@ mod tests {
         payload: &[u8],
     ) -> (
         SecretKey,
-        stellar_xdr::curr::DecoratedSignature,
-        stellar_xdr::curr::SignerKeyEd25519SignedPayload,
+        stellar_xdr::DecoratedSignature,
+        stellar_xdr::SignerKeyEd25519SignedPayload,
     ) {
-        use stellar_xdr::curr::{
+        use stellar_xdr::{
             DecoratedSignature, SignatureHint, SignerKeyEd25519SignedPayload, Uint256,
         };
 
@@ -380,7 +380,7 @@ mod tests {
 
         let decorated = DecoratedSignature {
             hint: SignatureHint(xor_hint),
-            signature: stellar_xdr::curr::Signature(sig.as_bytes().try_into().unwrap()),
+            signature: stellar_xdr::Signature(sig.as_bytes().try_into().unwrap()),
         };
 
         (secret, decorated, signed_payload)
@@ -395,7 +395,7 @@ mod tests {
 
     #[test]
     fn test_verify_ed25519_signed_payload_hint_mismatch() {
-        use stellar_xdr::curr::{DecoratedSignature, SignatureHint};
+        use stellar_xdr::{DecoratedSignature, SignatureHint};
 
         let payload = b"CAP-0040 test payload";
         let (_secret, sig, signed_payload) = make_signed_payload_fixture(payload);
@@ -431,13 +431,13 @@ mod tests {
 
     #[test]
     fn test_verify_ed25519_signed_payload_invalid_signature() {
-        use stellar_xdr::curr::{DecoratedSignature, SignatureHint, Uint256};
+        use stellar_xdr::{DecoratedSignature, SignatureHint, Uint256};
 
         let secret = SecretKey::generate();
         let pubkey_bytes = *secret.public_key().as_bytes();
         let payload = b"test payload data";
 
-        let signed_payload = stellar_xdr::curr::SignerKeyEd25519SignedPayload {
+        let signed_payload = stellar_xdr::SignerKeyEd25519SignedPayload {
             ed25519: Uint256(pubkey_bytes),
             payload: payload.as_slice().try_into().unwrap(),
         };
@@ -465,21 +465,21 @@ mod tests {
 
         let bad_sig = DecoratedSignature {
             hint: SignatureHint(xor_hint),
-            signature: stellar_xdr::curr::Signature(vec![0xDE; 64].try_into().unwrap()),
+            signature: stellar_xdr::Signature(vec![0xDE; 64].try_into().unwrap()),
         };
         assert!(!verify_ed25519_signed_payload(&bad_sig, &signed_payload));
     }
 
     #[test]
     fn test_verify_ed25519_signed_payload_invalid_key() {
-        use stellar_xdr::curr::{DecoratedSignature, SignatureHint, Uint256};
+        use stellar_xdr::{DecoratedSignature, SignatureHint, Uint256};
 
         // Use y=2 which is not on curve
         let mut invalid_key = [0u8; 32];
         invalid_key[0] = 2;
         let payload = b"test payload";
 
-        let signed_payload = stellar_xdr::curr::SignerKeyEd25519SignedPayload {
+        let signed_payload = stellar_xdr::SignerKeyEd25519SignedPayload {
             ed25519: Uint256(invalid_key),
             payload: payload.as_slice().try_into().unwrap(),
         };
@@ -507,20 +507,20 @@ mod tests {
 
         let sig = DecoratedSignature {
             hint: SignatureHint(xor_hint),
-            signature: stellar_xdr::curr::Signature(vec![0xAB; 64].try_into().unwrap()),
+            signature: stellar_xdr::Signature(vec![0xAB; 64].try_into().unwrap()),
         };
         assert!(!verify_ed25519_signed_payload(&sig, &signed_payload));
     }
 
     #[test]
     fn test_verify_ed25519_signed_payload_malformed_signature_length() {
-        use stellar_xdr::curr::{DecoratedSignature, SignatureHint, Uint256};
+        use stellar_xdr::{DecoratedSignature, SignatureHint, Uint256};
 
         let secret = SecretKey::generate();
         let pubkey_bytes = *secret.public_key().as_bytes();
         let payload = b"test payload";
 
-        let signed_payload = stellar_xdr::curr::SignerKeyEd25519SignedPayload {
+        let signed_payload = stellar_xdr::SignerKeyEd25519SignedPayload {
             ed25519: Uint256(pubkey_bytes),
             payload: payload.as_slice().try_into().unwrap(),
         };
@@ -549,14 +549,14 @@ mod tests {
         // Too short (32 bytes instead of 64)
         let short_sig = DecoratedSignature {
             hint: SignatureHint(xor_hint),
-            signature: stellar_xdr::curr::Signature(vec![0xAB; 32].try_into().unwrap()),
+            signature: stellar_xdr::Signature(vec![0xAB; 32].try_into().unwrap()),
         };
         assert!(!verify_ed25519_signed_payload(&short_sig, &signed_payload));
 
         // Empty signature
         let empty_sig = DecoratedSignature {
             hint: SignatureHint(xor_hint),
-            signature: stellar_xdr::curr::Signature(vec![].try_into().unwrap()),
+            signature: stellar_xdr::Signature(vec![].try_into().unwrap()),
         };
         assert!(!verify_ed25519_signed_payload(&empty_sig, &signed_payload));
     }

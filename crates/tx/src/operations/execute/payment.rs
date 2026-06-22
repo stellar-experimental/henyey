@@ -3,7 +3,7 @@
 //! This module implements the execution logic for the Payment operation,
 //! which transfers assets between accounts.
 
-use stellar_xdr::curr::{
+use stellar_xdr::{
     AccountId, Asset, OperationResult, OperationResultTr, PathPaymentStrictReceiveOp,
     PathPaymentStrictReceiveResult, PaymentOp, PaymentResult, PaymentResultCode,
 };
@@ -117,7 +117,7 @@ mod tests {
     use crate::test_utils::{
         create_test_account_id, create_test_asset, create_test_trustline_asset,
     };
-    use stellar_xdr::curr::*;
+    use stellar_xdr::*;
 
     const AUTHORIZED_FLAG: u32 = 0x1; // TrustLineFlags::AuthorizedFlag
 

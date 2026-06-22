@@ -36,8 +36,8 @@ use henyey_common::protocol::{
 use henyey_common::{Hash256, NetworkId, Resource};
 use henyey_crypto::sha256;
 use soroban_env_host_p25::fees::TransactionResources;
-use stellar_xdr::curr::Limits;
-use stellar_xdr::curr::{
+use stellar_xdr::Limits;
+use stellar_xdr::{
     AccountId, DecoratedSignature, EnvelopeType, FeeBumpTransactionInnerTx, Hash,
     InvokeHostFunctionOp, LedgerKey, Memo, MuxedAccount, Operation, OperationBody, Preconditions,
     SorobanTransactionData, SorobanTransactionDataExt, Transaction, TransactionEnvelope,
@@ -161,7 +161,7 @@ impl TransactionFrame {
     ///
     /// For V1, returns the envelope itself. For FeeBump, returns the inner
     /// envelope from `FeeBumpTransactionInnerTx`. Returns `None` for V0.
-    fn inner_envelope(&self) -> Option<&stellar_xdr::curr::TransactionV1Envelope> {
+    fn inner_envelope(&self) -> Option<&stellar_xdr::TransactionV1Envelope> {
         match &*self.envelope {
             TransactionEnvelope::TxV0(_) => None,
             TransactionEnvelope::Tx(env) => Some(env),
@@ -485,7 +485,7 @@ impl TransactionFrame {
 
     /// Collect all keys needed for fee processing (source accounts).
     pub fn keys_for_fee_processing(&self) -> Vec<LedgerKey> {
-        use stellar_xdr::curr::LedgerKeyAccount;
+        use stellar_xdr::LedgerKeyAccount;
 
         let mut keys = vec![LedgerKey::Account(LedgerKeyAccount {
             account_id: self.source_account_id(),
@@ -505,7 +505,7 @@ impl TransactionFrame {
     /// keys that can be determined from the operation data alone.
     pub fn keys_for_apply(&self) -> std::collections::HashSet<LedgerKey> {
         use crate::operations::execute::prefetch::collect_prefetch_keys;
-        use stellar_xdr::curr::LedgerKeyAccount;
+        use stellar_xdr::LedgerKeyAccount;
 
         let mut keys = std::collections::HashSet::new();
         let source = self.inner_source_account_id();
@@ -789,7 +789,7 @@ impl TransactionFrame {
     ///
     /// Parity: TransactionFrame.cpp:358-410 (`validateHostFn`)
     pub fn validate_host_fn(&self) -> bool {
-        use stellar_xdr::curr::{ContractExecutable, ContractIdPreimage, HostFunction};
+        use stellar_xdr::{ContractExecutable, ContractIdPreimage, HostFunction};
 
         if !self.is_soroban() {
             return true;
@@ -833,12 +833,12 @@ impl TransactionFrame {
 /// Convert a MuxedAccount to AccountId.
 pub fn muxed_to_account_id(muxed: &MuxedAccount) -> AccountId {
     match muxed {
-        MuxedAccount::Ed25519(key) => AccountId(
-            stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(key.clone()),
-        ),
-        MuxedAccount::MuxedEd25519(m) => AccountId(
-            stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(m.ed25519.clone()),
-        ),
+        MuxedAccount::Ed25519(key) => {
+            AccountId(stellar_xdr::PublicKey::PublicKeyTypeEd25519(key.clone()))
+        }
+        MuxedAccount::MuxedEd25519(m) => AccountId(stellar_xdr::PublicKey::PublicKeyTypeEd25519(
+            m.ed25519.clone(),
+        )),
     }
 }
 
@@ -859,13 +859,13 @@ pub fn envelope_sequence_number(envelope: &TransactionEnvelope) -> i64 {
         TransactionEnvelope::TxV0(env) => env.tx.seq_num.0,
         TransactionEnvelope::Tx(env) => env.tx.seq_num.0,
         TransactionEnvelope::TxFeeBump(env) => match &env.tx.inner_tx {
-            stellar_xdr::curr::FeeBumpTransactionInnerTx::Tx(inner) => inner.tx.seq_num.0,
+            stellar_xdr::FeeBumpTransactionInnerTx::Tx(inner) => inner.tx.seq_num.0,
         },
     }
 }
 
 pub fn soroban_disk_read_entries(
-    resources: &stellar_xdr::curr::SorobanResources,
+    resources: &stellar_xdr::SorobanResources,
     ext: Option<&SorobanTransactionDataExt>,
     is_restore_footprint: bool,
     ledger_version: u32,
@@ -903,7 +903,7 @@ pub fn soroban_disk_read_entries(
 mod tests {
     use super::*;
     use henyey_common::ResourceType;
-    use stellar_xdr::curr::*;
+    use stellar_xdr::*;
 
     fn create_test_transaction() -> TransactionEnvelope {
         // Create a minimal valid transaction
@@ -1227,7 +1227,7 @@ mod tests {
 
         // Should be AccountId with all zeros
         match account_id.0 {
-            stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(key) => {
+            stellar_xdr::PublicKey::PublicKeyTypeEd25519(key) => {
                 assert_eq!(key.0, [0u8; 32]);
             }
         }
@@ -1252,7 +1252,7 @@ mod tests {
         let inner_source = frame.inner_source_account_id();
 
         match inner_source.0 {
-            stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(key) => {
+            stellar_xdr::PublicKey::PublicKeyTypeEd25519(key) => {
                 assert_eq!(key.0, [0u8; 32]);
             }
         }

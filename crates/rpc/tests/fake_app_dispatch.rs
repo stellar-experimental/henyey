@@ -10,7 +10,7 @@ mod common;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use henyey_herder::TxQueueResult;
 use serde_json::json;
-use stellar_xdr::curr::{
+use stellar_xdr::{
     Limits, Memo, MuxedAccount, Preconditions, SequenceNumber, Transaction, TransactionEnvelope,
     TransactionExt, TransactionV1Envelope, Uint256, WriteXdr,
 };
@@ -272,7 +272,7 @@ async fn fake_send_transaction_try_again_later() {
 
 #[tokio::test]
 async fn fake_send_transaction_invalid_with_code() {
-    use stellar_xdr::curr::TransactionResultCode;
+    use stellar_xdr::TransactionResultCode;
     let result = send_tx_with_result(TxQueueResult::Invalid(Some(
         TransactionResultCode::TxFailed,
     )))
@@ -313,7 +313,7 @@ async fn fake_send_transaction_filtered() {
 // ---------------------------------------------------------------------------
 
 use henyey_rpc::RpcAppHandle;
-use stellar_xdr::curr::{
+use stellar_xdr::{
     Hash, LedgerHeader, LedgerHeaderExt, ReadXdr, StellarValue, StellarValueExt, TimePoint,
 };
 
@@ -638,18 +638,16 @@ async fn fake_non_snapshot_methods_work_while_not_ready() {
 /// None. The handler must return internal error (-32603), not server-not-ready.
 #[tokio::test]
 async fn fake_get_ledger_entries_defensive_fallback() {
-    use stellar_xdr::curr::{LedgerKey, LedgerKeyAccount, WriteXdr};
+    use stellar_xdr::{LedgerKey, LedgerKeyAccount, WriteXdr};
 
     let h = FakeRpcTestHarness::start_default().await;
     let id = json!("gle-defensive");
 
     // Build a valid LedgerKey (Account key with zero pubkey)
     let key = LedgerKey::Account(LedgerKeyAccount {
-        account_id: stellar_xdr::curr::AccountId(
-            stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(stellar_xdr::curr::Uint256(
-                [0u8; 32],
-            )),
-        ),
+        account_id: stellar_xdr::AccountId(stellar_xdr::PublicKey::PublicKeyTypeEd25519(
+            stellar_xdr::Uint256([0u8; 32]),
+        )),
     });
     let key_b64 = BASE64.encode(key.to_xdr(Limits::none()).unwrap());
 
@@ -715,7 +713,7 @@ async fn assert_invalid_params(
 /// Build a minimal valid Soroban InvokeHostFunction envelope (Wasm upload)
 /// that passes `extract_soroban_op()`, memo validation, and structural checks.
 fn valid_soroban_tx_b64() -> String {
-    use stellar_xdr::curr::{
+    use stellar_xdr::{
         HostFunction, InvokeHostFunctionOp, LedgerFootprint, Operation, OperationBody,
         SorobanResources, SorobanTransactionData, SorobanTransactionDataExt,
     };
@@ -1154,11 +1152,11 @@ async fn fake_type_validation_get_ledger_entries() {
     .await;
 
     // keys[1] as non-string (object) — use valid base64 XDR key for keys[0]
-    use stellar_xdr::curr::{LedgerKey, LedgerKeyAccount, WriteXdr};
+    use stellar_xdr::{LedgerKey, LedgerKeyAccount, WriteXdr};
     let key = LedgerKey::Account(LedgerKeyAccount {
-        account_id: stellar_xdr::curr::AccountId(
-            stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(Uint256([0u8; 32])),
-        ),
+        account_id: stellar_xdr::AccountId(stellar_xdr::PublicKey::PublicKeyTypeEd25519(Uint256(
+            [0u8; 32],
+        ))),
     });
     let key_b64 = BASE64.encode(key.to_xdr(Limits::none()).unwrap());
     assert_invalid_params(

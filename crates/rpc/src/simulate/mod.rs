@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use soroban_env_host_p25 as soroban_host;
-use stellar_xdr::curr::{
+use stellar_xdr::{
     HostFunction, LedgerKey, Limits, OperationBody, ReadXdr, SorobanTransactionData,
     TransactionEnvelope,
 };
@@ -40,7 +40,7 @@ use response::{
 enum SorobanOp {
     InvokeHostFunction {
         host_fn: HostFunction,
-        auth: Vec<stellar_xdr::curr::SorobanAuthorizationEntry>,
+        auth: Vec<stellar_xdr::SorobanAuthorizationEntry>,
     },
     ExtendFootprintTtl {
         keys: Vec<LedgerKey>,
@@ -53,7 +53,7 @@ enum SorobanOp {
 
 struct InvokeRequest {
     host_fn: HostFunction,
-    source_account: stellar_xdr::curr::AccountId,
+    source_account: stellar_xdr::AccountId,
     ledger_info: soroban_host::LedgerInfo,
     snapshot_source: BucketListSnapshotSource,
     soroban_info: henyey_ledger::SorobanNetworkInfo,
@@ -66,21 +66,14 @@ struct InvokeRequest {
 /// Represents a single ledger entry state change from simulation.
 struct LedgerEntryDiff {
     key: LedgerKey,
-    state_before: Option<stellar_xdr::curr::LedgerEntry>,
-    state_after: Option<stellar_xdr::curr::LedgerEntry>,
+    state_before: Option<stellar_xdr::LedgerEntry>,
+    state_after: Option<stellar_xdr::LedgerEntry>,
 }
 
 /// Extract the Soroban operation, source account, and optional footprint from the envelope.
 fn extract_soroban_op(
     tx_env: &TransactionEnvelope,
-) -> Result<
-    (
-        stellar_xdr::curr::AccountId,
-        SorobanOp,
-        stellar_xdr::curr::Memo,
-    ),
-    JsonRpcError,
-> {
+) -> Result<(stellar_xdr::AccountId, SorobanOp, stellar_xdr::Memo), JsonRpcError> {
     let (source, ops, ext, memo) = match tx_env {
         TransactionEnvelope::Tx(tx) => (
             &tx.tx.source_account,
@@ -94,7 +87,7 @@ fn extract_soroban_op(
             ));
         }
         TransactionEnvelope::TxFeeBump(fb) => match &fb.tx.inner_tx {
-            stellar_xdr::curr::FeeBumpTransactionInnerTx::Tx(inner) => (
+            stellar_xdr::FeeBumpTransactionInnerTx::Tx(inner) => (
                 &inner.tx.source_account,
                 &inner.tx.operations,
                 &inner.tx.ext,
@@ -113,7 +106,7 @@ fn extract_soroban_op(
 
     match &ops[0].body {
         OperationBody::InvokeHostFunction(op) => {
-            let auth: Vec<stellar_xdr::curr::SorobanAuthorizationEntry> =
+            let auth: Vec<stellar_xdr::SorobanAuthorizationEntry> =
                 op.auth.iter().cloned().collect();
             Ok((
                 source_account,
@@ -153,8 +146,8 @@ fn extract_soroban_op(
 const MAX_MEMO_TEXT_BYTES: usize = 28;
 
 /// Validate memo (MemoText must be <= MAX_MEMO_TEXT_BYTES bytes).
-fn validate_memo(memo: &stellar_xdr::curr::Memo) -> Result<(), JsonRpcError> {
-    if let stellar_xdr::curr::Memo::Text(text) = memo {
+fn validate_memo(memo: &stellar_xdr::Memo) -> Result<(), JsonRpcError> {
+    if let stellar_xdr::Memo::Text(text) = memo {
         if text.len() > MAX_MEMO_TEXT_BYTES {
             return Err(JsonRpcError::invalid_params(format!(
                 "memo text too long: {} bytes (max {})",
@@ -166,13 +159,13 @@ fn validate_memo(memo: &stellar_xdr::curr::Memo) -> Result<(), JsonRpcError> {
     Ok(())
 }
 
-fn muxed_to_account_id(source: &stellar_xdr::curr::MuxedAccount) -> stellar_xdr::curr::AccountId {
+fn muxed_to_account_id(source: &stellar_xdr::MuxedAccount) -> stellar_xdr::AccountId {
     match source {
-        stellar_xdr::curr::MuxedAccount::Ed25519(key) => stellar_xdr::curr::AccountId(
-            stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(key.clone()),
-        ),
-        stellar_xdr::curr::MuxedAccount::MuxedEd25519(muxed) => stellar_xdr::curr::AccountId(
-            stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(muxed.ed25519.clone()),
+        stellar_xdr::MuxedAccount::Ed25519(key) => {
+            stellar_xdr::AccountId(stellar_xdr::PublicKey::PublicKeyTypeEd25519(key.clone()))
+        }
+        stellar_xdr::MuxedAccount::MuxedEd25519(muxed) => stellar_xdr::AccountId(
+            stellar_xdr::PublicKey::PublicKeyTypeEd25519(muxed.ed25519.clone()),
         ),
     }
 }
@@ -180,10 +173,10 @@ fn muxed_to_account_id(source: &stellar_xdr::curr::MuxedAccount) -> stellar_xdr:
 /// Extract the read_only + read_write keys from the SorobanTransactionData footprint
 /// embedded in the transaction envelope's ext field.
 fn extract_footprint_keys(
-    ext: &stellar_xdr::curr::TransactionExt,
+    ext: &stellar_xdr::TransactionExt,
 ) -> Result<Vec<LedgerKey>, JsonRpcError> {
     let soroban_data = match ext {
-        stellar_xdr::curr::TransactionExt::V1(data) => data,
+        stellar_xdr::TransactionExt::V1(data) => data,
         _ => {
             return Err(JsonRpcError::invalid_params(
                 "ExtendFootprintTtl/RestoreFootprint requires SorobanTransactionData in tx ext",
@@ -213,8 +206,8 @@ struct BucketEntryReader<'a>(&'a henyey_bucket::SearchableBucketListSnapshot);
 impl henyey_ledger::EntryReader for BucketEntryReader<'_> {
     fn get_entry(
         &self,
-        key: &stellar_xdr::curr::LedgerKey,
-    ) -> henyey_ledger::Result<Option<stellar_xdr::curr::LedgerEntry>> {
+        key: &stellar_xdr::LedgerKey,
+    ) -> henyey_ledger::Result<Option<stellar_xdr::LedgerEntry>> {
         Ok(self.0.load_result(key)?)
     }
 }
@@ -467,7 +460,7 @@ pub(crate) async fn handle(
 /// Resolve the effective `RecordingInvocationAuthMode` from the request parameter.
 fn resolve_auth_mode(
     auth_mode_str: &str,
-    tx_auth: &[stellar_xdr::curr::SorobanAuthorizationEntry],
+    tx_auth: &[stellar_xdr::SorobanAuthorizationEntry],
 ) -> Result<soroban_host::e2e_invoke::RecordingInvocationAuthMode, JsonRpcError> {
     use soroban_host::e2e_invoke::RecordingInvocationAuthMode;
 
@@ -580,7 +573,7 @@ async fn handle_invoke(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use stellar_xdr::curr::*;
+    use stellar_xdr::*;
 
     fn make_tx_envelope(ops: Vec<Operation>) -> TransactionEnvelope {
         let source = MuxedAccount::Ed25519(Uint256([1u8; 32]));
@@ -1144,7 +1137,7 @@ mod tests {
         fn get_entry(
             &self,
             _key: &LedgerKey,
-        ) -> henyey_ledger::Result<Option<stellar_xdr::curr::LedgerEntry>> {
+        ) -> henyey_ledger::Result<Option<stellar_xdr::LedgerEntry>> {
             Err(henyey_ledger::LedgerError::Internal(
                 "simulated I/O failure".to_string(),
             ))
@@ -1174,7 +1167,7 @@ mod tests {
         fn get_entry(
             &self,
             _key: &LedgerKey,
-        ) -> henyey_ledger::Result<Option<stellar_xdr::curr::LedgerEntry>> {
+        ) -> henyey_ledger::Result<Option<stellar_xdr::LedgerEntry>> {
             Ok(None)
         }
     }

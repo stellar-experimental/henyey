@@ -150,7 +150,7 @@ impl Database {
     /// Returns the ledger header for a given sequence number.
     ///
     /// Returns `None` if the ledger is not found.
-    pub fn get_ledger_header(&self, seq: u32) -> Result<Option<stellar_xdr::curr::LedgerHeader>> {
+    pub fn get_ledger_header(&self, seq: u32) -> Result<Option<stellar_xdr::LedgerHeader>> {
         self.with_connection(|conn| {
             use queries::LedgerQueries;
             conn.load_ledger_header(seq)
