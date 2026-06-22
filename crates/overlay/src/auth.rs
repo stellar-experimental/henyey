@@ -928,11 +928,56 @@ mod tests {
         let ctx = AuthContext::new(local_node, true);
 
         let hello = ctx.create_hello();
-        assert_eq!(hello.overlay_version, 40);
+        assert_eq!(hello.overlay_version, 41);
         assert_eq!(hello.overlay_min_version, 38);
         assert_eq!(
             hello.ledger_version,
             henyey_common::protocol::CURRENT_LEDGER_PROTOCOL_VERSION
+        );
+    }
+
+    /// Parity guard: henyey must advertise the stellar-core v27.0.0 overlay
+    /// protocol range — max 41 (`OVERLAY_PROTOCOL_VERSION`), min 38
+    /// (`OVERLAY_PROTOCOL_MIN_VERSION`). Behavior-flip test: FAILS on
+    /// origin/main (max still 40), PASSES after the bump.
+    #[test]
+    fn test_advertised_overlay_version_is_41_min_38() {
+        let secret = SecretKey::generate();
+        let local_node = LocalNode::new_testnet(secret);
+        let ctx = AuthContext::new(local_node, true);
+
+        let hello = ctx.create_hello();
+        assert_eq!(
+            hello.overlay_version, 41,
+            "advertised max overlay version must match stellar-core v27.0.0 (41)"
+        );
+        assert_eq!(
+            hello.overlay_min_version, 38,
+            "advertised min overlay version must stay 38"
+        );
+    }
+
+    /// A v27 peer advertising `[38, 41]` must negotiate successfully against
+    /// our raised ceiling, while a peer entirely above our max (`[42, 45]`)
+    /// must still be rejected.
+    #[test]
+    fn test_negotiation_with_v41_peer_succeeds() {
+        let secret = SecretKey::generate();
+        let local_node = LocalNode::new_testnet(secret);
+        let ctx = AuthContext::new(local_node.clone(), true);
+
+        // v27 peer: range [38, 41] — overlaps our [38, 41], accepted.
+        let v41_peer = make_hello_with_versions(41, 38, &local_node);
+        assert!(
+            ctx.validate_overlay_version(&v41_peer).is_ok(),
+            "a v27 peer advertising [38,41] must negotiate against our ceiling of 41"
+        );
+
+        // Peer entirely above our max: range [42, 45] — no overlap, rejected.
+        let too_new = make_hello_with_versions(45, 42, &local_node);
+        assert!(
+            ctx.validate_overlay_version(&too_new).is_err(),
+            "a peer whose min (42) exceeds our max (41) must be rejected"
         );
     }
 
@@ -1433,13 +1478,13 @@ mod tests {
 
     #[test]
     fn test_process_hello_rejects_peer_too_new() {
-        // Peer's min version is above our max (40)
+        // Peer's min version is above our max (41)
         let secret = SecretKey::generate();
         let local_node = LocalNode::new_testnet(secret);
         let mut ctx = AuthContext::new(local_node.clone(), true);
         ctx.hello_sent();
 
-        let hello = make_hello_with_versions(43, 41, &local_node);
+        let hello = make_hello_with_versions(45, 42, &local_node);
         let result = ctx.process_hello(&hello);
         assert!(result.is_err());
         assert!(
@@ -1858,10 +1903,10 @@ mod tests {
             r
         );
 
-        // Peer too new.
+        // Peer too new (min 42 is above our max of 41).
         let mut ctx = AuthContext::new(local_node.clone(), false);
         ctx.hello_sent();
-        let hello = make_hello_with_versions(43, 41, &local_node);
+        let hello = make_hello_with_versions(45, 42, &local_node);
         ctx.process_hello_phase1(&hello).unwrap();
         let r = ctx.validate_hello_post_send(&hello);
         assert!(

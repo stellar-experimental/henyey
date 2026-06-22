@@ -819,9 +819,9 @@ pub struct LocalNode {
 }
 
 const LEDGER_VERSION: u32 = henyey_common::protocol::CURRENT_LEDGER_PROTOCOL_VERSION;
-// Parity: stellar-core/src/main/Config.cpp:164-165 (v26.0.0)
-// OVERLAY_PROTOCOL_VERSION = 40, OVERLAY_PROTOCOL_MIN_VERSION = 38
-const OVERLAY_VERSION: u32 = 40;
+// Parity: stellar-core/src/main/Config.cpp:163-164 (v27.0.0)
+// OVERLAY_PROTOCOL_MIN_VERSION = 38, OVERLAY_PROTOCOL_VERSION = 41
+const OVERLAY_VERSION: u32 = 41;
 const OVERLAY_MIN_VERSION: u32 = 38;
 const DEFAULT_LISTENING_PORT: u16 = 11625;
 
