@@ -232,6 +232,22 @@ const MAX_POST_CATCHUP_RECOVERY_ATTEMPTS: u32 = 3;
 /// OUT_OF_SYNC_RECOVERY_TIMER_SECS.
 const HARD_RESET_STALL_SECS: u64 = 120;
 
+/// Wall-clock deadline (seconds) the near-tip / archive-confirmed-behind
+/// recovery condition must persist with ZERO serviceable peers before the
+/// henyey-specific bounded *wider* peer-SCP pull is allowed to fire once
+/// (#3318). Aligned with `HARD_RESET_STALL_SECS` and the #2789 wall-clock
+/// backstop: by the time the node has been stuck this long with no peer able
+/// to serve the missing slot, the steady-state 2-peer pull has demonstrably
+/// failed to converge, so one wider pull is a strict improvement over wedging.
+const NEAR_TIP_WIDEN_STALL_SECS: u64 = HARD_RESET_STALL_SECS;
+
+/// Upper bound on the fan-out of the #3318 near-tip wider peer-SCP pull. The
+/// pull targets `min(serviceable, NEAR_TIP_WIDEN_MAX_PEERS)` peers, falling
+/// back to ALL authenticated peers only when serviceable == 0 (a peer not
+/// recently *observed* externalizing may still hold the slot). Keeps the
+/// deviation from upstream's fixed 2-peer cap strictly bounded.
+const NEAR_TIP_WIDEN_MAX_PEERS: usize = 8;
+
 /// Number of consecutive Path-A ticks with NO peer-gap shrink before the
 /// count-based `recovery_exhausted` HardReset is allowed to fire again (#3204).
 /// While the verified peer gap is strictly shrinking, #3199's peer-SCP
@@ -13844,11 +13860,15 @@ mod tests {
     async fn test_near_tip_recovery_does_not_widen_when_peers_can_serve() {
         let (app, mut receivers, current_ledger) = setup_near_tip_recovery(5).await;
 
-        // Make every peer serviceable: record a recent externalized slot so
-        // peers_could_serve > 0.
+        // Make every peer serviceable: record an externalized observation AT
+        // the request watermark so `latest_ext - max_slots <= watermark` holds
+        // (latest_ext == watermark → trivially serves). Recording at
+        // current_ledger would be too HIGH relative to a low watermark and
+        // would (wrongly, for this test's intent) read as unserviceable.
+        let watermark = app.scp_state_request_ledger_seq();
         if let Some(overlay) = app.overlay().await {
             for peer in overlay.connected_peers() {
-                overlay.record_peer_externalized(&peer, current_ledger as u64);
+                overlay.record_peer_externalized(&peer, watermark as u64);
             }
         }
 

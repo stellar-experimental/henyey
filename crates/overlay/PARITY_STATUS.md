@@ -327,6 +327,7 @@ Corresponds to: `OverlayManager.h`, `OverlayManagerImpl.h`
 | `getRandomOutboundAuthenticatedPeers()` | N/A | None |
 | `getConnectedPeer()` | (via DashMap lookup) | Full |
 | `getMoreSCPState()` (bounded 2-peer pull) | `request_scp_state()` — selects up to 2 random authenticated peers | Full |
+| (no upstream analog) | `request_scp_state_widened()` — bounded wider GetScpState pull, henyey-specific recovery escape (#3318) | Deviation (see Architectural Differences) |
 | `maybeAddInboundConnection()` | (in listener accept flow) | Full |
 | `addOutboundConnection()` | (in connector flow) | Full |
 | `removePeer()` | (via peer drop) | Full |
@@ -518,6 +519,11 @@ Features not yet implemented. These ARE counted against parity %.
    - **stellar-core**: Survey response encryption handled inline in SurveyManager
    - **Rust**: Encryption/decryption handled at application layer (henyey-app) using henyey_crypto
    - **Rationale**: Separation of concerns; crypto operations belong at a higher level
+
+6. **Wider peer-SCP recovery pull (`request_scp_state_widened`, #3318)** — henyey-specific deviation
+   - **stellar-core**: `HerderImpl::getMoreSCPState()` is hard-bounded to 2 random authenticated peers (via `getRandomAuthenticatedPeers`) and NEVER widens. Out-of-sync recovery self-heals by re-selecting fresh 2 peers every 10s at the low watermark.
+   - **Rust**: The steady-state path (`request_scp_state`) is an EXACT mirror of upstream (still exactly 2 peers, full inbound+outbound authenticated set, every recovery tick). On top of that, `request_scp_state_widened()` adds ONE bounded wider GetScpState pull — driven by the app layer (`App::maybe_widen_near_tip_scp_pull`, crate:app) — that fires only when the near-tip / archive-confirmed-behind recovery loop has had ZERO serviceable peers (`peers_could_serve(watermark) == 0`) for longer than the 120s wall-clock deadline (the #2789 stuck-onset clock). Fan-out is bounded to `min(serviceable, 8)`, falling back to ALL authenticated peers when serviceable == 0; the send is non-blocking (`try_send_to`).
+   - **Rationale**: The first sustained non-self-healing production wedge (build `b90b29f7`, 06:11Z) showed that when the connected set is collectively too far behind / too thin (e.g. the thin-inbound regime of #3419), the fixed 2-peer pull re-lands on unserviceable peers forever and the node wedges (lcl frozen, recovery attempts 8→74, manual restart). The wider pull lets the node obtain the back-fill instead of requiring an operator restart. It is strictly additive, provably gated (cannot fire while any peer can serve, cannot fire before the deadline), and never alters steady-state recovery — an EXACT upstream mirror outside the wedge condition. **Operator-approved** deviation (sign-off 2026-06-22). Residual: if the peer set genuinely holds no copy of the slot, even the widened pull reaches 0 serviceable peers and the node still cannot self-serve — an inherent limit (operator-restart status quo), not a defect of this escape.
 
 ## Test Coverage
 

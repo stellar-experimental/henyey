@@ -1806,6 +1806,59 @@ impl OverlayManager {
         Ok(sent)
     }
 
+    /// Request SCP state from a *bounded-wider* set of authenticated peers.
+    ///
+    /// This is a henyey-specific recovery escape (issue #3318) — it has NO
+    /// direct upstream analog. stellar-core's `getMoreSCPState` is hard-bounded
+    /// to 2 peers and never widens. The app-layer caller fires this exactly once
+    /// per stuck episode, only after the bounded 2-peer `request_scp_state` has
+    /// repeatedly landed on peers that cannot serve the missing slot
+    /// (`peers_could_serve == 0`) AND that condition has persisted past a
+    /// wall-clock deadline. It does NOT replace `request_scp_state`, which stays
+    /// the steady-state upstream mirror.
+    ///
+    /// Selection draws from the FULL authenticated peer set (inbound + outbound),
+    /// matching `getRandomAuthenticatedPeers`, shuffles it, and sends
+    /// `GetScpState` to up to `cap` peers via the non-blocking `try_send_to`
+    /// (event-loop rule: never a blocking send). The caller is responsible for
+    /// computing `cap` (e.g. `min(serviceable, 8)`, falling back to all
+    /// authenticated peers when serviceable is 0); this method just honors the
+    /// bound over the connected set.
+    pub fn request_scp_state_widened(&self, ledger_seq: u32, cap: usize) -> Result<usize> {
+        use rand::seq::SliceRandom;
+
+        if !self.running.load(Ordering::Relaxed) {
+            return Err(OverlayError::NotStarted);
+        }
+
+        let message = StellarMessage::GetScpState(ledger_seq);
+        let mut peers = self.connected_peers();
+        if peers.is_empty() || cap == 0 {
+            return Ok(0);
+        }
+
+        // Shuffle the full authenticated set and take up to `cap`.
+        let mut rng = rand::thread_rng();
+        peers.shuffle(&mut rng);
+        let target = cap.min(peers.len());
+
+        let mut sent = 0usize;
+        for peer_id in peers.iter().take(target) {
+            match self.try_send_to(peer_id, message.clone()) {
+                Ok(()) => sent += 1,
+                Err(e) => {
+                    debug!(peer = %peer_id, error = %e, "Failed to send widened GetScpState to peer");
+                }
+            }
+        }
+
+        debug!(
+            ledger_seq,
+            sent, cap, "Sent widened GetScpState to authenticated peers (#3318 recovery escape)"
+        );
+        Ok(sent)
+    }
+
     /// Record the highest externalized SCP slot observed *via live SCP gossip*
     /// from `peer` (observability-only). Called from the app event loop at the
     /// two EXTERNALIZE-accept sites where the global externalize `fetch_max`
