@@ -265,6 +265,32 @@ Features not yet implemented. These ARE counted against parity %.
    - **Rust**: `henyey-app` owns restart/catchup policy while low-level persistence APIs live in `henyey-db`.
    - **Rationale**: The workspace factors storage concerns into a dedicated crate instead of keeping them inside the app layer.
 
+5. **Stateless fresh-genesis recovery (`src/app/catchup_impl.rs`, #3410)** — operator-approved deviation
+   - **stellar-core**: a fresh node joining a network with existing history
+     adopts archive state via `CatchupWork::downloadApplyBuckets`; a knit-to-LCL
+     disagreement is surfaced as a retryable `CatchupWork::fatalFailure()`
+     boolean, and core has no self-wipe-on-corruption mechanism at all.
+   - **Rust**: when a node's LCL is **exactly genesis** (ledger 1, i.e. no
+     committed local state), a forced recovery catchup is routed to an
+     archive-authoritative bucket-apply (effective `Minimal` depth, so
+     `CatchupRange::calculate` selects `BucketsOnly` / `BucketApplyAndReplay`
+     instead of replay-from-genesis), and a knit-to-LCL mismatch at genesis is
+     reclassified as a retryable bucket-apply (`catchup_needs_full_reset`)
+     rather than escalating to `FATAL: unrecoverable local state failure`. The
+     inter-catchup-retry backoff is also shortened at genesis (3s vs the 10s
+     steady-state cooldown) so a fresh node re-attempts the bucket-apply quickly.
+   - **Rationale**: under the SSC mixed-image mission a fresh Henyey's
+     force-bootstrapped genesis hash legitimately differs from the
+     earlier-started peers' archive history chain, so a replay-from-genesis
+     would always fail `verify_knit_to_lcl` and the resulting FATAL was a
+     cold-start crash, not real corruption (#3410). The carveout is gated
+     **strictly on `LCL == genesis`**: for `LCL > genesis` the `CatchupRange`
+     selection and the knit-to-LCL fatal classification are byte-for-byte
+     unchanged, fully preserving the #3282/#3288 terminal-wipe semantics for a
+     node that has real state to protect. Change 2 (don't-FATAL-at-genesis) is
+     additive henyey-specific robustness with no analogue or divergence for
+     core's non-genesis path.
+
 ## Test Coverage
 
 | Area | stellar-core Tests | Rust Tests | Notes |

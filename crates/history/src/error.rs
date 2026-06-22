@@ -682,6 +682,40 @@ impl HistoryError {
         )
     }
 
+    /// Returns `true` if this error is a **knit-to-LCL header-chain
+    /// disagreement** — the archive's header at/after the knit point does not
+    /// chain onto the node's last-closed-ledger header.
+    ///
+    /// Recognized variants (the four §11.2 knit-to-LCL decision-matrix
+    /// failures from `ApplyCheckpointWork::getNextLedgerCloseData`):
+    /// - [`KnitLclHashMismatch`](HistoryError::KnitLclHashMismatch) — §11.2 case 3
+    /// - [`KnitLclPredecessorHashMismatch`](HistoryError::KnitLclPredecessorHashMismatch)
+    ///   — §11.2 case 2
+    /// - [`KnitCurrentLedgerPrevHashMismatch`](HistoryError::KnitCurrentLedgerPrevHashMismatch)
+    ///   — §11.2 case 4
+    /// - [`KnitOvershot`](HistoryError::KnitOvershot) — the archive's first
+    ///   header is past the knit point
+    ///
+    /// All four are a subset of [`is_fatal_catchup_failure`] — they normally
+    /// escalate to a terminal wipe. The app layer uses this classifier to
+    /// carve out the narrow **stateless fresh-genesis** case (LCL == ledger 1,
+    /// no committed local state to protect): a knit disagreement against the
+    /// archive's earlier-started history chain there is expected, NOT local
+    /// corruption, so it is routed to an archive-authoritative bucket-apply
+    /// rebuild instead of FATAL (#3410). For `LCL > genesis` the fatal
+    /// semantics (#3282/#3288) are unchanged.
+    ///
+    /// [`is_fatal_catchup_failure`]: HistoryError::is_fatal_catchup_failure
+    pub fn is_knit_to_lcl_failure(&self) -> bool {
+        matches!(
+            self,
+            HistoryError::KnitLclHashMismatch { .. }
+                | HistoryError::KnitLclPredecessorHashMismatch { .. }
+                | HistoryError::KnitCurrentLedgerPrevHashMismatch { .. }
+                | HistoryError::KnitOvershot { .. }
+        )
+    }
+
     /// Returns `true` if this error represents a **local-vs-archive state
     /// divergence** — the local ledger state (LCL header, replayed header, or
     /// applied bucket-list) disagrees with the canonical history archive.
@@ -919,6 +953,51 @@ mod tests {
         // Negative: Other LedgerError variants are NOT hash mismatches
         let err = HistoryError::Ledger(henyey_ledger::LedgerError::Internal("bug".into()));
         assert!(!err.is_hash_mismatch());
+    }
+
+    #[test]
+    fn test_is_knit_to_lcl_failure() {
+        // Positive: all four §11.2 knit-to-LCL decision-matrix failures.
+        assert!(HistoryError::KnitLclHashMismatch {
+            expected: "aa".into(),
+            actual: "bb".into(),
+        }
+        .is_knit_to_lcl_failure());
+        assert!(HistoryError::KnitLclPredecessorHashMismatch {
+            ledger: 0,
+            expected: "aa".into(),
+            actual: "bb".into(),
+        }
+        .is_knit_to_lcl_failure());
+        assert!(HistoryError::KnitCurrentLedgerPrevHashMismatch {
+            ledger: 2,
+            expected: "aa".into(),
+            actual: "bb".into(),
+        }
+        .is_knit_to_lcl_failure());
+        assert!(HistoryError::KnitOvershot {
+            entry_seq: 64,
+            lcl_seq: 1,
+        }
+        .is_knit_to_lcl_failure());
+
+        // All four are a subset of is_fatal_catchup_failure.
+        assert!(HistoryError::KnitLclHashMismatch {
+            expected: "aa".into(),
+            actual: "bb".into(),
+        }
+        .is_fatal_catchup_failure());
+
+        // Negative: a non-knit fatal error (e.g. bucket-list verification) is
+        // NOT a knit-to-LCL failure — it stays terminal even at genesis.
+        let err = HistoryError::VerificationFailed("bucket list hash mismatch".into());
+        assert!(!err.is_knit_to_lcl_failure());
+        assert!(err.is_fatal_catchup_failure());
+
+        // Negative: a transient error is neither.
+        let err = HistoryError::ArchiveUnreachable("timeout".into());
+        assert!(!err.is_knit_to_lcl_failure());
+        assert!(!err.is_fatal_catchup_failure());
     }
 
     #[test]
