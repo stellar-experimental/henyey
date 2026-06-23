@@ -14,6 +14,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use henyey_app::metrics as app_metrics;
 use henyey_app::App;
 use henyey_common::{Hash256, NetworkId};
 use henyey_crypto::SecretKey;
@@ -21,10 +22,10 @@ use henyey_herder::TxQueueResult;
 use henyey_tx::TxResultCode;
 use stellar_xdr::{
     AccountId, Asset, ContractDataDurability, ContractId, ContractIdPreimage,
-    ContractIdPreimageFromAddress, CreateAccountOp, Hash, LedgerKey, LedgerKeyContractData, Memo,
-    MuxedAccount, Operation, OperationBody, PaymentOp, Preconditions, PublicKey, ScAddress, ScVal,
-    SequenceNumber, Transaction, TransactionEnvelope, TransactionExt, TransactionV1Envelope,
-    Uint256, VecM,
+    ContractIdPreimageFromAddress, CreateAccountOp, Hash, LedgerKey, LedgerKeyContractData, Limits,
+    Memo, MuxedAccount, Operation, OperationBody, PaymentOp, Preconditions, PublicKey, ScAddress,
+    ScVal, SequenceNumber, Transaction, TransactionEnvelope, TransactionExt, TransactionV1Envelope,
+    Uint256, VecM, WriteXdr,
 };
 use tracing::{debug, info, warn};
 
@@ -1324,6 +1325,10 @@ impl LoadGenerator {
                 return LoadResult::Failed;
             }
 
+            // One step per loop iteration (parity: stellar-core
+            // LoadGenerator::getTxPerStep() mStepMeter.Mark(), LoadGenerator.cpp:211).
+            app_metrics::LOADGEN_STEP_COUNT.increment(1);
+
             // Check if all transactions for the current phase are submitted
             if !config.are_txs_remaining() {
                 // For setup modes, transition from phase 1 (upload) to phase 2 (deploy)
@@ -1510,13 +1515,28 @@ impl LoadGenerator {
                 }
             };
 
+            // Mirror stellar-core LoadGenerator::execute() metric ordering:
+            // mark the per-mode + per-tx attempt meters BEFORE submission, then
+            // mark `txn.rejected` if the tx queue does not accept the tx. One
+            // mark per execute()-equivalent (this inner-loop iteration), which
+            // includes txBAD_SEQ retries — matching core, where submitTx()
+            // re-enters execute() on each retry (#3569).
+            mark_tx_meters(config.mode, &envelope);
+
             let result = self.tx_generator.app.submit_transaction(envelope).await;
 
             // PayPregenerated does not re-submit on failure: each tx is read
             // once from the file, so a retry would consume the *next* tx
             // (stellar-core LoadGenerator.cpp:874).
             if config.mode == LoadGenMode::PayPregenerated {
+                if !matches!(result, TxQueueResult::Added) {
+                    app_metrics::LOADGEN_TXN_REJECTED.increment(1);
+                }
                 return matches!(result, TxQueueResult::Added);
+            }
+
+            if !matches!(result, TxQueueResult::Added) {
+                app_metrics::LOADGEN_TXN_REJECTED.increment(1);
             }
 
             match result {
@@ -1999,6 +2019,98 @@ fn deterministic_rand(a: u64, b: u32) -> u64 {
 /// Used by `PayPregenerated` to mirror stellar-core's
 /// `acc->setSequenceNumber(txFrame->getSeqNum())`. Fee-bump envelopes carry the
 /// inner v1 tx's seq; v0 envelopes carry their own.
+/// Number of operations in a transaction envelope.
+fn envelope_num_operations(env: &TransactionEnvelope) -> u64 {
+    match env {
+        TransactionEnvelope::TxV0(e) => e.tx.operations.len() as u64,
+        TransactionEnvelope::Tx(e) => e.tx.operations.len() as u64,
+        TransactionEnvelope::TxFeeBump(e) => match &e.tx.inner_tx {
+            stellar_xdr::FeeBumpTransactionInnerTx::Tx(inner) => inner.tx.operations.len() as u64,
+        },
+    }
+}
+
+/// Whether the envelope carries any Soroban (`InvokeHostFunction`,
+/// `ExtendFootprintTtl`, `RestoreFootprint`) operation. Mirrors stellar-core
+/// `TransactionFrame::isSoroban()` for loadgen-meter classification purposes.
+fn envelope_is_soroban(env: &TransactionEnvelope) -> bool {
+    let ops: &[Operation] = match env {
+        TransactionEnvelope::TxV0(e) => e.tx.operations.as_slice(),
+        TransactionEnvelope::Tx(e) => e.tx.operations.as_slice(),
+        TransactionEnvelope::TxFeeBump(e) => match &e.tx.inner_tx {
+            stellar_xdr::FeeBumpTransactionInnerTx::Tx(inner) => inner.tx.operations.as_slice(),
+        },
+    };
+    ops.iter().any(|op| {
+        matches!(
+            op.body,
+            OperationBody::InvokeHostFunction(_)
+                | OperationBody::ExtendFootprintTtl(_)
+                | OperationBody::RestoreFootprint(_)
+        )
+    })
+}
+
+/// XDR byte size of an envelope. Best-effort parity with stellar-core's
+/// `xdr::xdr_argpack_size(*txf->toStellarMessage())`; we measure the envelope
+/// itself (core wraps it in a `StellarMessage`, adding a small fixed
+/// discriminant — immaterial for the `*_bytes` meters, which supercluster does
+/// not poll for completion).
+fn envelope_xdr_size(env: &TransactionEnvelope) -> u64 {
+    env.to_xdr(Limits::none())
+        .map(|b| b.len() as u64)
+        .unwrap_or(0)
+}
+
+/// Mark the loadgen per-tx meters for one generated transaction, mirroring the
+/// metric block of stellar-core `LoadGenerator::execute()` (LoadGenerator.cpp
+/// 1500-1611): per-mode meter first, then `txn.attempted` + `txn.bytes`. The
+/// caller marks `txn.rejected` afterward if the tx queue rejects the tx.
+///
+/// For `MixedClassicSoroban` (and other modes whose concrete sub-mode is only
+/// known from the built tx), classification is by inspecting the envelope —
+/// matching core's `MIXED_PREGEN_*` `isSoroban()` branch.
+fn mark_tx_meters(mode: LoadGenMode, env: &TransactionEnvelope) {
+    let xdr_size = envelope_xdr_size(env);
+    match mode {
+        LoadGenMode::Pay | LoadGenMode::PayPregenerated => {
+            app_metrics::LOADGEN_PAYMENT_SUBMITTED.increment(envelope_num_operations(env));
+            app_metrics::LOADGEN_PAYMENT_BYTES.increment(xdr_size);
+        }
+        LoadGenMode::SorobanUpload => {
+            app_metrics::LOADGEN_SOROBAN_UPLOAD.increment(1);
+        }
+        LoadGenMode::SorobanInvokeSetup => {
+            app_metrics::LOADGEN_SOROBAN_SETUP_INVOKE.increment(1);
+        }
+        LoadGenMode::SorobanUpgradeSetup => {
+            app_metrics::LOADGEN_SOROBAN_SETUP_UPGRADE.increment(1);
+        }
+        LoadGenMode::SorobanInvoke | LoadGenMode::SorobanInvokeApplyLoad => {
+            app_metrics::LOADGEN_SOROBAN_INVOKE.increment(1);
+        }
+        LoadGenMode::SorobanCreateUpgrade => {
+            app_metrics::LOADGEN_SOROBAN_CREATE_UPGRADE.increment(1);
+        }
+        LoadGenMode::MixedClassicSoroban => {
+            // Sub-mode is decided per-tx; classify by inspecting the built tx
+            // (parity: core's execute() switch on mLastMixedMode, equivalently
+            // the MIXED_PREGEN_* isSoroban() branch).
+            if envelope_is_soroban(env) {
+                app_metrics::LOADGEN_SOROBAN_INVOKE.increment(1);
+            } else {
+                app_metrics::LOADGEN_PAYMENT_SUBMITTED.increment(envelope_num_operations(env));
+                app_metrics::LOADGEN_PAYMENT_BYTES.increment(xdr_size);
+            }
+        }
+    }
+
+    // Per-tx attempt + bytes (parity: txm.mTxnAttempted.Mark() +
+    // txm.mTxnBytes.Mark(...) at the end of execute()).
+    app_metrics::LOADGEN_TXN_ATTEMPTED.increment(1);
+    app_metrics::LOADGEN_TXN_BYTES.increment(xdr_size);
+}
+
 fn envelope_seq_num(env: &TransactionEnvelope) -> i64 {
     match env {
         TransactionEnvelope::TxV0(e) => e.tx.seq_num.0,
