@@ -688,16 +688,19 @@ grep_heartbeat_lines() {
 # Prints the verdict to stdout. Returns 0 always.
 # ─────────────────────────────────────────────────────────────────────────────
 classify_path_binary_relevance() {
-  local path="$1"
+  # NOTE: must NOT be named `path` — under zsh `path` is a special array tied to
+  # $PATH, so `local path=…` would clobber the command search path for the whole
+  # function (#3581 zsh-safety sweep). Use a non-reserved name.
+  local rel_path="$1"
 
   # Empty path → fail-safe.
-  if [[ -z "$path" ]]; then
+  if [[ -z "$rel_path" ]]; then
     echo "rebuild"
     return 0
   fi
 
   # --- Allowlist: paths that never compile into the release binary. ---
-  case "$path" in
+  case "$rel_path" in
     .github/*|.claude/*|scripts/*|docs/*|metrics/*)
       echo "no-impact"; return 0 ;;
     .gitignore|.gitattributes|.gitmodules)
@@ -735,19 +738,19 @@ classify_path_binary_relevance() {
       echo "no-impact"; return 0 ;;
   esac
   # Root-level *.md (e.g. README.md, CLAUDE.md) — no slash, .md suffix.
-  if [[ "$path" != */* && "$path" == *.md ]]; then
+  if [[ "$rel_path" != */* && "$rel_path" == *.md ]]; then
     echo "no-impact"; return 0
   fi
 
   # --- crates/<crate>/tests/** : integration tests, never in --release lib/bin.
   # Matches a `tests/` directory directly under a single crate dir.
-  if [[ "$path" == crates/*/tests/* ]]; then
+  if [[ "$rel_path" == crates/*/tests/* ]]; then
     echo "test-only"; return 0
   fi
 
   # --- crates/**/src/**.rs : source that MAY be hunk-level test-only.
   # Must be a .rs file living under a `src/` directory inside crates/.
-  if [[ "$path" == crates/*/src/*.rs && "$path" == *.rs ]]; then
+  if [[ "$rel_path" == crates/*/src/*.rs && "$rel_path" == *.rs ]]; then
     echo "needs-hunk-check"; return 0
   fi
 
@@ -819,15 +822,20 @@ fi
 
 select_latest_green_deploy_target() {
   local deployed_sha="$1" origin_sha="$2"
-  local line sha status conclusion
+  # NOTE: must NOT be named `status` — under zsh `status` is a read-only special
+  # parameter (alias for $?), so `local … status …` aborts the function at the
+  # declaration before the read loop runs, yielding empty stdout. Empty stdout
+  # makes the deploy gate fail-closed to `defer-no-green`, silently deferring
+  # every deploy (#3581). Use a non-reserved name.
+  local line sha run_status conclusion
   local saw_green=0           # any completed/success record at all
   local saw_on_main=0         # any green record that is on main (ancestor of HEAD)
 
-  while IFS='|' read -r sha status conclusion; do
+  while IFS='|' read -r sha run_status conclusion; do
     # Skip blank lines.
     [[ -z "$sha" ]] && continue
     # Only completed/success records are deploy candidates.
-    [[ "$status" == "completed" && "$conclusion" == "success" ]] || continue
+    [[ "$run_status" == "completed" && "$conclusion" == "success" ]] || continue
     saw_green=1
 
     # Guardrail 1 — on main: the green sha must be an ancestor-or-equal of the
