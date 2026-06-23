@@ -290,6 +290,75 @@ mod tests {
         }
     }
 
+    /// Stub `LoadGenRunner` for testing the response-building logic without a
+    /// full `App`/`ServerState`. Reports a fixed base64 config-upgrade-set key.
+    struct StubRunner {
+        key: Option<String>,
+    }
+    impl LoadGenRunner for StubRunner {
+        fn start_load(&self, _request: LoadGenRequest) -> Result<(), String> {
+            Ok(())
+        }
+        fn stop_load(&self) {}
+        fn is_running(&self) -> bool {
+            false
+        }
+        fn config_upgrade_set_key(&self) -> Option<String> {
+            self.key.clone()
+        }
+    }
+
+    /// #3588: the `create_upgrade` response includes the top-level
+    /// `config_upgrade_set_key` (read from the runner); non-create_upgrade modes
+    /// omit it. Mirrors stellar-core `CommandHandler::generateLoad`
+    /// (CommandHandler.cpp:1488-1496).
+    ///
+    /// FAILS on main: `config_upgrade_set_key_for_response` and the trait method
+    /// `config_upgrade_set_key` do not exist.
+    #[test]
+    fn test_create_upgrade_response_includes_config_upgrade_set_key() {
+        let runner = StubRunner {
+            key: Some("EXPECTED_KEY_B64".to_string()),
+        };
+
+        // create_upgrade (all accepted spellings) → key emitted.
+        for mode in ["create_upgrade", "soroban_create_upgrade", "createupgrade"] {
+            assert_eq!(
+                config_upgrade_set_key_for_response(mode, &runner),
+                Some("EXPECTED_KEY_B64".to_string()),
+                "mode {mode} must emit the config_upgrade_set_key"
+            );
+        }
+
+        // Non-create_upgrade modes → field omitted even though the runner has a key.
+        for mode in ["pay", "soroban_upload", "soroban_invoke", "upgrade_setup"] {
+            assert_eq!(
+                config_upgrade_set_key_for_response(mode, &runner),
+                None,
+                "mode {mode} must NOT emit the config_upgrade_set_key"
+            );
+        }
+    }
+
+    /// The trait default returns `None` (a runner that cannot compute a key).
+    #[test]
+    fn test_config_upgrade_set_key_default_none() {
+        struct DefaultRunner;
+        impl LoadGenRunner for DefaultRunner {
+            fn start_load(&self, _request: LoadGenRequest) -> Result<(), String> {
+                Ok(())
+            }
+            fn stop_load(&self) {}
+            fn is_running(&self) -> bool {
+                false
+            }
+        }
+        assert_eq!(
+            config_upgrade_set_key_for_response("create_upgrade", &DefaultRunner),
+            None
+        );
+    }
+
     #[test]
     fn test_load_gen_request_from_params() {
         let params = GenerateLoadParams {

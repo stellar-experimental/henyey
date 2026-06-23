@@ -233,9 +233,27 @@ mod tests {
         let resp = GenerateLoadResponse {
             status: "ok".to_string(),
             info: None,
+            config_upgrade_set_key: None,
         };
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["status"], "ok");
         assert!(json.get("info").is_none());
+        assert!(json.get("config_upgrade_set_key").is_none());
+    }
+
+    /// #3588: only the `create_upgrade` response carries a top-level
+    /// `config_upgrade_set_key`; when present it must serialize under that
+    /// exact snake_case field name (parity: stellar-core
+    /// `CommandHandler::generateLoad`, CommandHandler.cpp:1488-1496).
+    #[test]
+    fn test_response_serialization_with_config_upgrade_set_key() {
+        let resp = GenerateLoadResponse {
+            status: "ok".to_string(),
+            info: Some("Started create_upgrade".to_string()),
+            config_upgrade_set_key: Some("AAAA-base64-key".to_string()),
+        };
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["status"], "ok");
+        assert_eq!(json["config_upgrade_set_key"], "AAAA-base64-key");
     }
 }
