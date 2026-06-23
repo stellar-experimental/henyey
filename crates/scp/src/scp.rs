@@ -332,19 +332,39 @@ impl<D: SCPDriver> SCP<D> {
 
     /// Purge slots outside the `[min_slot, max_slot]` range to free memory.
     ///
-    /// TEMPORARY (failing-test scaffold): lower-bound only — does NOT yet
-    /// honor `max_slot`. Replaced by the parity fix below.
+    /// Mirrors stellar-core's `SCP::purgeSlotsOutsideRange(minSlotIndex,
+    /// maxSlotIndex, slotToKeep)` (`SCP.cpp:73-105`): when `min_slot` is
+    /// `Some`, evict every slot `< min_slot`; when `max_slot` is `Some`,
+    /// evict every slot `> max_slot`. In BOTH sweeps `slot_to_keep` (when
+    /// `Some`) is retained even if it falls outside the range — matching
+    /// core's `maybeEraseSlot`, which advances past `slotToKeep` instead of
+    /// erasing it. A `None` bound disables that side of the sweep (core's
+    /// `std::nullopt`); a `None` `slot_to_keep` means no slot is exempt.
     pub fn purge_slots(
         &self,
         min_slot: Option<u64>,
-        _max_slot: Option<u64>,
+        max_slot: Option<u64>,
         slot_to_keep: Option<u64>,
     ) {
-        if let Some(min) = min_slot {
-            self.slots
-                .write()
-                .retain(|&slot_index, _| slot_index >= min || slot_to_keep == Some(slot_index));
+        if min_slot.is_none() && max_slot.is_none() {
+            return;
         }
+        self.slots.write().retain(|&slot_index, _| {
+            if slot_to_keep == Some(slot_index) {
+                return true;
+            }
+            if let Some(min) = min_slot {
+                if slot_index < min {
+                    return false;
+                }
+            }
+            if let Some(max) = max_slot {
+                if slot_index > max {
+                    return false;
+                }
+            }
+            true
+        });
     }
 
     /// Get the number of active slots.
