@@ -3844,6 +3844,60 @@ pub(crate) fn warn_if_slow(elapsed: std::time::Duration, op: &'static str, count
     }
 }
 
+/// Threshold above which a single consensus-tick (phase=5) sub-step is
+/// flagged as a likely stall contributor (#3582).
+///
+/// The 1-second consensus-tick arm (`consensus_interval`, coarse `phase=5`)
+/// runs a chain of synchronous-ish sub-ops — `process_externalized_slots`,
+/// `try_start_ledger_close`, `request_pending_tx_sets`,
+/// `maybe_publish_history`, `try_trigger_consensus` — at least one of which
+/// has been observed to block the event loop ~20 s while contending the
+/// SQLite write lock, blowing past the 30 s `busy_timeout` and busying the
+/// concurrent ledger-close persist write (root cause of the #3497
+/// recoverable-shutdowns).
+///
+/// The watchdog's `phase=5` label is too coarse to name the culprit. This
+/// per-sub-step threshold is deliberately set to **a few seconds** — well
+/// under the 30 s DB-lock window so it fires long before the busy, yet high
+/// enough above the sub-millisecond normal-tick cost to stay silent in
+/// steady state. The eventual offload fix (#3537-class, e.g.
+/// `spawn_blocking`) targets whichever sub-step this names in the deployed
+/// logs.
+pub(crate) const CONSENSUS_TICK_SLOW_SUBSTEP_THRESHOLD: std::time::Duration =
+    std::time::Duration::from_secs(2);
+
+/// Pure threshold predicate (#3582): is a consensus-tick sub-step's
+/// `elapsed` slow enough to flag? `>=` is load-bearing (boundary
+/// inclusive), matching [`warn_if_slow`]. Extracted so the
+/// timing/threshold decision is unit-testable without driving the event
+/// loop.
+#[inline]
+pub(crate) fn consensus_tick_substep_is_slow(elapsed: std::time::Duration) -> bool {
+    elapsed >= CONSENSUS_TICK_SLOW_SUBSTEP_THRESHOLD
+}
+
+/// Emit a `WARN` naming the consensus-tick (phase=5) sub-step and its
+/// elapsed time when it crosses [`CONSENSUS_TICK_SLOW_SUBSTEP_THRESHOLD`]
+/// (#3582). No-op on the fast path; the only cost is a `Duration`
+/// comparison, so it is behavior-preserving for the event loop.
+///
+/// `substep` identifies which sub-op stalled (e.g. `maybe_publish_history`),
+/// so the deployed node's log pinpoints the sub-step the offload fix should
+/// target. The `phase = 5` field mirrors the watchdog's coarse phase so the
+/// two log streams correlate.
+#[inline]
+pub(crate) fn warn_consensus_substep_if_slow(elapsed: std::time::Duration, substep: &'static str) {
+    if consensus_tick_substep_is_slow(elapsed) {
+        tracing::warn!(
+            phase = 5,
+            substep,
+            elapsed_ms = elapsed.as_millis() as u64,
+            "Slow consensus-tick sub-step (>= {}ms) — likely phase=5 DB-lock stall, #3582 offload target",
+            CONSENSUS_TICK_SLOW_SUBSTEP_THRESHOLD.as_millis()
+        );
+    }
+}
+
 /// Format the tiered diagnostic hint message for a watchdog freeze event.
 ///
 /// Pure function that builds the operator hint string with pre-substituted

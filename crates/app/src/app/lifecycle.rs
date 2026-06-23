@@ -1072,16 +1072,31 @@ impl App {
                         }
                     }
 
-                    // Check for externalized slots to process
+                    // Check for externalized slots to process.
+                    //
+                    // Each consensus-tick (phase=5) sub-op below is wrapped
+                    // with `Instant`-based timing + `warn_consensus_substep_if_slow`
+                    // so a deployed node names the sub-step that blocks the
+                    // event loop while contending the SQLite write lock — the
+                    // ~20s phase=5 stall that is the root cause of the #3497
+                    // recoverable-shutdowns (#3582). Instrumentation only: the
+                    // measurement is a cheap `Duration` comparison and does not
+                    // alter control flow.
                     self.set_phase(10); // 10 = process_externalized
                     if pending_catchup.is_none() {
+                        let substep_start = std::time::Instant::now();
                         if let Some(pc) = self.process_externalized_slots().await {
                             pending_catchup = Some(pc);
                         }
+                        super::warn_consensus_substep_if_slow(
+                            substep_start.elapsed(),
+                            "process_externalized_slots",
+                        );
                     }
 
                     // Start a background ledger close if one isn't already running.
                     if close_pipeline.is_idle() {
+                        let substep_start = std::time::Instant::now();
                         let next = self.try_start_ledger_close().await;
                         close_pipeline.try_start_close(next);
 
@@ -1111,16 +1126,33 @@ impl App {
                                 }
                             }
                         }
+                        // Covers try_start_ledger_close + the proactive
+                        // gap-detection request_scp_state_and_record (same
+                        // idle-close branch).
+                        super::warn_consensus_substep_if_slow(
+                            substep_start.elapsed(),
+                            "try_start_ledger_close",
+                        );
                     }
 
                     // Request any pending tx sets we need
+                    let substep_start = std::time::Instant::now();
                     self.request_pending_tx_sets().await;
+                    super::warn_consensus_substep_if_slow(
+                        substep_start.elapsed(),
+                        "request_pending_tx_sets",
+                    );
 
                     // Publish queued history checkpoints.  This is normally done
                     // from the close_pipeline completion arm, but for solo validators
                     // the select may pick the tick arm repeatedly before close completes.
                     if self.is_validator {
+                        let substep_start = std::time::Instant::now();
                         self.maybe_publish_history().await;
+                        super::warn_consensus_substep_if_slow(
+                            substep_start.elapsed(),
+                            "maybe_publish_history",
+                        );
                     }
 
                     // Safety-net trigger (#2702). The *primary* nomination
@@ -1135,7 +1167,12 @@ impl App {
                     // covers the case where a trigger timer was never armed (e.g.
                     // arming was gated out at cold start before tracking settled)
                     // — without it, a missed arm could stall ledger production.
+                    let substep_start = std::time::Instant::now();
                     self.try_trigger_consensus().await;
+                    super::warn_consensus_substep_if_slow(
+                        substep_start.elapsed(),
+                        "try_trigger_consensus",
+                    );
                 }
 
                 // Stats logging
