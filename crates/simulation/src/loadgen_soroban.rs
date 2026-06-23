@@ -27,6 +27,16 @@ use rand::Rng;
 /// for CPU and IO load generation.
 pub(crate) const LOADGEN_WASM: &[u8] = include_bytes!("../wasm/loadgen.wasm");
 
+/// The `write_bytes` test contract (soroban-test-wasms `WRITE_BYTES`), used by
+/// the config-upgrade setup. Its `write` function stores the passed bytes in a
+/// TEMPORARY `ContractData` entry keyed by `SCV_BYTES(sha256(bytes))` — exactly
+/// the `ConfigUpgradeSet` entry the create-upgrade flow then arms against.
+///
+/// Parity: stellar-core uploads `rust_bridge::get_write_bytes()` (not the
+/// loadgen contract) for the upgrade-setup path (`LoadGenerator.cpp:1184`).
+pub(crate) const WRITE_UPGRADE_BYTES_WASM: &[u8] =
+    include_bytes!("../wasm/soroban_write_upgrade_bytes_contract.wasm");
+
 // ---------------------------------------------------------------------------
 // Resource estimate constants for Soroban transaction building.
 // These are generous defaults matching stellar-core's `TxGenerator` estimates.
@@ -897,6 +907,16 @@ impl SorobanTxBuilder {
     /// Compute the SHA-256 hash of the loadgen WASM.
     pub fn loadgen_wasm_hash() -> Hash256 {
         Hash256::hash(LOADGEN_WASM)
+    }
+
+    /// Get the embedded `write_bytes` upgrade-setup contract WASM bytes.
+    pub fn write_upgrade_bytes_wasm() -> &'static [u8] {
+        WRITE_UPGRADE_BYTES_WASM
+    }
+
+    /// Compute the SHA-256 hash of the `write_bytes` upgrade-setup WASM.
+    pub fn write_upgrade_bytes_wasm_hash() -> Hash256 {
+        Hash256::hash(WRITE_UPGRADE_BYTES_WASM)
     }
 
     /// Generate random WASM bytes of approximately the given size.
@@ -1826,6 +1846,90 @@ mod tests {
         if let LedgerKey::ContractData(inst_cd) = &instance_key {
             assert_eq!(rw_cd.contract, inst_cd.contract);
         }
+    }
+
+    /// Regression for the SSC mixed-image Soroban config-upgrade wedge (part 2).
+    ///
+    /// The create_upgrade tx invokes `write(bytes)` on the deployed contract to
+    /// store the `ConfigUpgradeSet` entry. That function only exists on the
+    /// `write_bytes` contract — the loadgen contract (`do_cpu_only_work`) does
+    /// NOT export it. stellar-core uploads `get_write_bytes()` (not the loadgen
+    /// contract) for the upgrade-setup path (`LoadGenerator.cpp:1184`). If the
+    /// wrong WASM is uploaded, the `write` invoke fails at apply, the entry is
+    /// never written, and the arm is rejected ("did not resolve to a VALID
+    /// upgrade set"). This pins that the upgrade-setup WASM exports `write` and
+    /// is distinct from the loadgen contract.
+    #[test]
+    fn test_upgrade_setup_wasm_exports_write_and_differs_from_loadgen() {
+        let upgrade_wasm = SorobanTxBuilder::write_upgrade_bytes_wasm();
+
+        assert!(
+            !upgrade_wasm.is_empty(),
+            "upgrade-setup WASM must be embedded"
+        );
+        assert_ne!(
+            SorobanTxBuilder::write_upgrade_bytes_wasm_hash(),
+            SorobanTxBuilder::loadgen_wasm_hash(),
+            "upgrade-setup must use a different contract than invoke-setup"
+        );
+
+        // Parse the WASM export section (id 7) and collect exported names; assert
+        // the create_upgrade-invoked function `write` is among them, and that the
+        // loadgen contract does NOT export it (it only does `do_cpu_only_work`).
+        let up = wasm_export_names(upgrade_wasm);
+        let lg = wasm_export_names(SorobanTxBuilder::loadgen_wasm());
+        assert!(
+            up.iter().any(|n| n == "write"),
+            "upgrade-setup WASM must export `write` (got exports {up:?})"
+        );
+        assert!(
+            !lg.iter().any(|n| n == "write"),
+            "loadgen contract must NOT export `write` (got exports {lg:?})"
+        );
+    }
+
+    /// Minimal WASM export-section parser: returns the names in the export
+    /// section (section id 7). Enough to assert which functions a contract
+    /// exports without pulling in a full wasm crate.
+    fn wasm_export_names(wasm: &[u8]) -> Vec<String> {
+        fn leb(data: &[u8], pos: &mut usize) -> u32 {
+            let mut result = 0u32;
+            let mut shift = 0;
+            loop {
+                let byte = data[*pos];
+                *pos += 1;
+                result |= ((byte & 0x7f) as u32) << shift;
+                if byte & 0x80 == 0 {
+                    break;
+                }
+                shift += 7;
+            }
+            result
+        }
+        let mut names = Vec::new();
+        // magic(4) + version(4)
+        let mut pos = 8usize;
+        while pos < wasm.len() {
+            let section_id = wasm[pos];
+            pos += 1;
+            let section_len = leb(wasm, &mut pos) as usize;
+            let section_end = pos + section_len;
+            if section_id == 7 {
+                let count = leb(wasm, &mut pos);
+                for _ in 0..count {
+                    let name_len = leb(wasm, &mut pos) as usize;
+                    let name = String::from_utf8_lossy(&wasm[pos..pos + name_len]).into_owned();
+                    pos += name_len;
+                    let _kind = wasm[pos];
+                    pos += 1;
+                    let _index = leb(wasm, &mut pos);
+                    names.push(name);
+                }
+                break;
+            }
+            pos = section_end;
+        }
+        names
     }
 
     /// Regression for the SSC mixed-image Soroban config-upgrade wedge.

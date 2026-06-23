@@ -1807,9 +1807,27 @@ impl LoadGenerator {
             // SorobanInvokeSetup (it differs only in source account + single
             // instance, both configured in start()).
             LoadGenMode::SorobanInvokeSetup | LoadGenMode::SorobanUpgradeSetup => {
+                // Parity: stellar-core uploads the loadgen contract for the
+                // invoke-setup path but the `write_bytes` contract for the
+                // upgrade-setup path (`LoadGenerator.cpp:1184`). The upgrade flow
+                // invokes `write(bytes)` to store the `ConfigUpgradeSet` entry,
+                // which only the `write_bytes` contract exports — uploading the
+                // loadgen contract (only `do_cpu_only_work`) makes the
+                // create_upgrade invoke fail at apply, so the entry is never
+                // written and the upgrade never arms.
+                let (wasm, wasm_hash) = if config.mode.mode_sets_up_invoke() {
+                    (
+                        SorobanTxBuilder::loadgen_wasm(),
+                        SorobanTxBuilder::loadgen_wasm_hash(),
+                    )
+                } else {
+                    (
+                        SorobanTxBuilder::write_upgrade_bytes_wasm(),
+                        SorobanTxBuilder::write_upgrade_bytes_wasm_hash(),
+                    )
+                };
                 if config.n_wasms > 0 {
-                    // Phase 1: Upload the loadgen WASM
-                    let wasm = SorobanTxBuilder::loadgen_wasm();
+                    // Phase 1: Upload the setup WASM
                     let result = self.tx_generator.create_upload_wasm_transaction(
                         ledger_num,
                         source_account_id,
@@ -1817,7 +1835,6 @@ impl LoadGenerator {
                         config.max_fee_rate,
                     );
                     if result.is_ok() {
-                        let wasm_hash = SorobanTxBuilder::loadgen_wasm_hash();
                         self.code_key = Some(contract_code_key(&wasm_hash));
                         self.contract_overhead_bytes = wasm.len() as u64 + 160;
                         config.n_wasms = config.n_wasms.saturating_sub(1);
@@ -1825,7 +1842,6 @@ impl LoadGenerator {
                     result
                 } else {
                     // Phase 2: Deploy a contract instance
-                    let wasm_hash = SorobanTxBuilder::loadgen_wasm_hash();
                     let salt = Uint256(
                         Hash256::hash(
                             &deterministic_rand(source_account_id, ledger_num).to_le_bytes(),
