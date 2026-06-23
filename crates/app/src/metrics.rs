@@ -1001,6 +1001,62 @@ metric_catalog! {
     }
 }
 
+// ── Loadgen Prometheus → medida-compat mapping (#3572) ─────────────────
+//
+// The loadgen meters render in the Prometheus exposition with UNDERSCORE
+// names (`loadgen_run_start`, …). The stellar-core compat `/metrics` endpoint
+// — the medida JSON that supercluster's `IsLoadGenComplete` reads — needs the
+// DOTTED medida key names (`loadgen.run.start`, …). This table is the single
+// source of truth for that translation, consumed by BOTH the compat-handler's
+// `parse_loadgen_counts` (Prometheus name → count) and its JSON builder
+// (dotted key + event_type). Keep it beside the loadgen catalog so the two
+// surfaces can never re-drift.
+//
+// IMPORTANT: this is NOT `replace('_', '.')`. The soroban third components keep
+// their underscore (`loadgen.soroban.setup_invoke`, not `…setup.invoke`),
+// matching stellar-core's medida keys verbatim. Verified against
+// `src/simulation/LoadGenerator.cpp:114-1483` and `loadgen.run.start` ←
+// `main/ApplicationImpl.cpp:1156`.
+//
+// Entries: (Prometheus exposition name, dotted medida key, medida event_type).
+pub(crate) const LOADGEN_COMPAT_MAP: &[(&str, &str, &str)] = &[
+    (LOADGEN_RUN_START.0, "loadgen.run.start", "run"),
+    (LOADGEN_RUN_COMPLETE.0, "loadgen.run.complete", "run"),
+    (LOADGEN_RUN_FAILED.0, "loadgen.run.failed", "run"),
+    (
+        LOADGEN_ACCOUNT_CREATED.0,
+        "loadgen.account.created",
+        "account",
+    ),
+    (LOADGEN_TXN_ATTEMPTED.0, "loadgen.txn.attempted", "txn"),
+    (LOADGEN_TXN_REJECTED.0, "loadgen.txn.rejected", "txn"),
+    (LOADGEN_TXN_BYTES.0, "loadgen.txn.bytes", "txn"),
+    (
+        LOADGEN_PAYMENT_SUBMITTED.0,
+        "loadgen.payment.submitted",
+        "op",
+    ),
+    (LOADGEN_PAYMENT_BYTES.0, "loadgen.payment.bytes", "txn"),
+    (LOADGEN_SOROBAN_UPLOAD.0, "loadgen.soroban.upload", "txn"),
+    (LOADGEN_SOROBAN_INVOKE.0, "loadgen.soroban.invoke", "txn"),
+    (
+        LOADGEN_SOROBAN_SETUP_INVOKE.0,
+        "loadgen.soroban.setup_invoke",
+        "txn",
+    ),
+    (
+        LOADGEN_SOROBAN_SETUP_UPGRADE.0,
+        "loadgen.soroban.setup_upgrade",
+        "txn",
+    ),
+    (
+        LOADGEN_SOROBAN_CREATE_UPGRADE.0,
+        "loadgen.soroban.create_upgrade",
+        "txn",
+    ),
+    (LOADGEN_STEP_COUNT.0, "loadgen.step.count", "step"),
+];
+
 // ── Scrape-time refresh ────────────────────────────────────────────────
 
 /// Update scrape-time gauges and absolute counters from current App state.

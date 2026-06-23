@@ -747,6 +747,7 @@ mod tests {
         let state = Arc::new(CompatServerState {
             app: Arc::new(app),
             started_on: "2024-01-01T00:00:00Z".to_string(),
+            prometheus_handle: None,
             #[cfg(feature = "loadgen")]
             loadgen_state: None,
         });
