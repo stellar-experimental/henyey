@@ -692,6 +692,26 @@ impl TxGenerator {
         false
     }
 
+    /// Return `true` when every cached account's on-ledger sequence number
+    /// matches its in-memory (expected) sequence number — i.e. all submitted
+    /// transactions have been applied.
+    ///
+    /// Matches stellar-core `LoadGenerator::checkAccountSynced()`
+    /// (`src/simulation/LoadGenerator.cpp`): the loadgen is only "complete" once
+    /// the accounts it submitted from are caught up on the ledger. Read-only —
+    /// it must NOT overwrite the in-memory expected sequence number (unlike
+    /// `load_account`). An account that cannot be loaded yet (None / Err) is
+    /// treated as not-yet-synced so the caller keeps waiting.
+    pub fn check_accounts_synced(&self) -> bool {
+        for account in self.accounts.values() {
+            match self.app.load_account_sequence(&account.account_id) {
+                Ok(Some(db_seq)) if db_seq == account.sequence_number => {}
+                _ => return false,
+            }
+        }
+        true
+    }
+
     /// Build CreateAccount operations for a range of accounts.
     ///
     /// Matches stellar-core `TxGenerator::createAccounts()`.
@@ -1434,6 +1454,17 @@ impl LoadGenerator {
                         "Setup phase 1 complete, transitioning to instance deployment"
                     );
                 } else {
+                    // Parity: stellar-core does not emit `loadgen.run.complete`
+                    // on submission — it runs `waitTillComplete` until every
+                    // submitted tx is APPLIED (accounts synced) and only then
+                    // reports the run done (LoadGenerator.cpp:704-708,1345).
+                    // This matters for downstream consumers that act on
+                    // completion: e.g. SSC arms the Soroban config-settings
+                    // upgrade (`/upgrades?configupgradesetkey`) immediately after
+                    // the create-upgrade loadgen completes; if we reported "done"
+                    // on submit, the `ConfigUpgradeSet` entry would not yet be in
+                    // a closed ledger and the arm would be rejected (#3596).
+                    self.wait_till_complete().await;
                     return LoadResult::Done {
                         submitted: self.total_submitted,
                     };
@@ -1487,6 +1518,39 @@ impl LoadGenerator {
             self.total_submitted += submitted_this_step;
 
             tokio::time::sleep(step_duration).await;
+        }
+    }
+
+    /// Wait until every submitted transaction has been applied (accounts
+    /// synced) before declaring the run complete.
+    ///
+    /// Parity: stellar-core `LoadGenerator::waitTillComplete()`
+    /// (`src/simulation/LoadGenerator.cpp:1345`) polls `checkAccountSynced`
+    /// each ledger until there are no inconsistencies (all txns applied),
+    /// timing out after `TIMEOUT_NUM_LEDGERS` (20). We poll ~once per second
+    /// and bound the wait by ledger advancement so a dropped/never-applied tx
+    /// can't hang the run forever.
+    async fn wait_till_complete(&mut self) {
+        const TIMEOUT_NUM_LEDGERS: u32 = 30;
+        let start_ledger = self.tx_generator.app.current_ledger_seq();
+        loop {
+            if self.tx_generator.check_accounts_synced() {
+                return;
+            }
+            let elapsed = self
+                .tx_generator
+                .app
+                .current_ledger_seq()
+                .saturating_sub(start_ledger);
+            if elapsed >= TIMEOUT_NUM_LEDGERS {
+                warn!(
+                    timeout_ledgers = TIMEOUT_NUM_LEDGERS,
+                    "loadgen wait-till-complete timed out; some submitted txns \
+                     were not applied (likely dropped before inclusion)"
+                );
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(1000)).await;
         }
     }
 
