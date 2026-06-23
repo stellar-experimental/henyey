@@ -1067,7 +1067,8 @@ diff_is_test_only() {
 
 # ─────────────────────────────────────────────────────────────────────────────
 # classify_stuck_alive_sync NODE_STATE CURRENT_LCL AGE_SEC RPC_STATUS RSS_MB \
-#                           PROC_RESPONSIVE STATE_FILE [NOW_EPOCH]
+#                           PROC_RESPONSIVE STATE_FILE [NOW_EPOCH] \
+#                           [HEARTBEAT_AGE_SEC]
 #
 # Pure decision function for the monitor-tick remediation rung (3e):
 # "stuck-but-alive SYNC FAILURE" auto-restart (issue #3219).
@@ -1077,9 +1078,14 @@ diff_is_test_only() {
 # `unhealthy`, and RSS UNDER the OOM floor. This is the residual failure mode
 # left over after (3c) soft-fail-wipe (owns the fatal-state-wipe case) and (3b)
 # wedge (owns the UNRESPONSIVE / frozen-event-loop case). (3e) is the MIRROR of
-# (3b): (3b) fires when the admin port is dead/timed-out; (3e) requires a live,
-# answering port (PROC_RESPONSIVE=yes). The two are mutually exclusive by
-# construction, so (3e) can never poach the wedge path.
+# (3b): (3b) fires when the admin port is dead/timed-out; (3e) requires a live
+# node. Liveness is proven by EITHER the admin port answering
+# (PROC_RESPONSIVE=yes) OR — when /info is unresponsive — a `heartbeat=true` log
+# line within HEARTBEAT_ALIVE_SEC (=120s), proving the event loop still ticks
+# (#3579: the "/info-unresponsive-but-alive near-tip stall"). The two remain
+# mutually exclusive: (3b) wedge requires a stale/absent heartbeat (truly
+# frozen loop); a fresh heartbeat routes the node to (3e) instead. (3e) can
+# never poach the genuinely-wedged path.
 #
 # Band-aid for root cause #3218 (overlay SCP broadcast backpressure). The
 # max-restarts→escalate guard ensures a restart loop surfaces as `urgent`
@@ -1132,6 +1138,10 @@ classify_stuck_alive_sync() {
   local proc_responsive="$6"
   local state_file="$7"
   local now_epoch="${8:-$(date +%s)}"
+  # Optional arg 9 (#3579): seconds since the most recent `heartbeat=true` log
+  # line. Empty / "-1" / non-numeric means "unknown / no recent heartbeat". Used
+  # ONLY as a liveness fallback when /info is unresponsive (proc_responsive=no).
+  local heartbeat_age_sec="${9:-}"
 
   # Named thresholds (operator-retunable).
   local STUCK_AGE_SEC=600
@@ -1140,6 +1150,11 @@ classify_stuck_alive_sync() {
   local STUCK_COOLDOWN_SEC=900
   local STUCK_WINDOW_SEC=7200
   local MAX_STUCK_RESTARTS=3
+  # Liveness-fallback window: a heartbeat this recent proves the event loop is
+  # ticking even when /info is down. Mirrors the (3b) wedge 120s freshness gate,
+  # so a node with a stale (>120s) heartbeat is "wedged" (3b owns it), while a
+  # fresh-heartbeat node is "alive" and routes to (3e). (#3579)
+  local HEARTBEAT_ALIVE_SEC=120
 
   STUCK_ALIVE_SYNC="no"
 
@@ -1194,8 +1209,21 @@ classify_stuck_alive_sync() {
     *valid*|*synced*|*track*) : ;;   # match — continue
     *) _write_stuck_state; STUCK_ALIVE_SYNC="no"; return 0 ;;
   esac
-  # 2. Process responsive (mirror of (3b) wedge).
-  [[ "$proc_responsive" == "yes" ]] || { _write_stuck_state; STUCK_ALIVE_SYNC="no"; return 0; }
+  # 2. Process alive. Primary signal: /info answered (proc_responsive=yes,
+  #    mirror of (3b) wedge). Fallback (#3579): /info is unresponsive but a
+  #    `heartbeat=true` log line appeared within HEARTBEAT_ALIVE_SEC, proving the
+  #    event loop is still ticking — the "/info-unresponsive-but-alive" near-tip
+  #    stall. (3b) wedge keeps the truly-wedged case (no recent heartbeat); the
+  #    120s window matches (3b)'s freshness gate so the two stay mutually
+  #    exclusive (alive-via-heartbeat → here; stale/no heartbeat → wedge).
+  local proc_alive="no"
+  if [[ "$proc_responsive" == "yes" ]]; then
+    proc_alive="yes"
+  elif [[ "$heartbeat_age_sec" =~ ^[0-9]+$ ]] \
+       && [[ "$heartbeat_age_sec" -le "$HEARTBEAT_ALIVE_SEC" ]]; then
+    proc_alive="yes"
+  fi
+  [[ "$proc_alive" == "yes" ]] || { _write_stuck_state; STUCK_ALIVE_SYNC="no"; return 0; }
   # 3. RPC unhealthy.
   [[ "$rpc_status" == "unhealthy" ]] || { _write_stuck_state; STUCK_ALIVE_SYNC="no"; return 0; }
   # 4. age over threshold.
