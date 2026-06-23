@@ -131,6 +131,108 @@ struct CompatPeerInfo {
 mod tests {
     use super::*;
 
+    use axum::body::Body;
+    use http::Request;
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+
+    use crate::app::App;
+    use crate::compat_http::{build_compat_router, CompatServerState};
+
+    /// Build a `CompatServerState` backed by a real (minimal) `App` with a
+    /// tempdir database and no default peers. Returns `(TempDir, state)`; the
+    /// `TempDir` guard is returned first so it outlives the state (which holds
+    /// open DB handles).
+    async fn mk_compat_state() -> (tempfile::TempDir, Arc<CompatServerState>) {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("compat-info.db");
+        let mut config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
+        config.overlay.known_peers.clear();
+        config.is_compat_config = true;
+        let app = App::new(config).await.unwrap();
+        let state = Arc::new(CompatServerState {
+            app: Arc::new(app),
+            started_on: "2024-01-01T00:00:00Z".to_string(),
+            prometheus_handle: None,
+            #[cfg(feature = "loadgen")]
+            loadgen_state: None,
+        });
+        (dir, state)
+    }
+
+    /// Collect a JSON response body and parse it.
+    async fn body_json(response: axum::response::Response) -> serde_json::Value {
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    /// When a Soroban network config exists, the compat `/info` ledger object
+    /// carries `maxSorobanTxSetSize` equal to the ledger's max tx count
+    /// (stellar-core's OPERATIONS resource). This is what supercluster's
+    /// `GetSorobanMaxTxSetSize().Value` reads. Fails on main (field absent).
+    #[tokio::test]
+    async fn test_info_soroban_tx_set_size_present_when_soroban_config() {
+        let (_dir, state) = mk_compat_state().await;
+        state
+            .app
+            .ledger_manager()
+            .set_soroban_network_info_for_test(henyey_ledger::SorobanNetworkInfo {
+                ledger_max_tx_count: 500,
+                ..Default::default()
+            });
+        let router = build_compat_router(state);
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/info")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), http::StatusCode::OK);
+        let json = body_json(response).await;
+        assert_eq!(
+            json["info"]["ledger"]["maxSorobanTxSetSize"],
+            500,
+            "maxSorobanTxSetSize must equal ledger_max_tx_count, got: {:?}",
+            json["info"]["ledger"].get("maxSorobanTxSetSize")
+        );
+    }
+
+    /// Pre-Soroban (no network config): the key must be absent, mirroring
+    /// stellar-core's conditional emission gated on
+    /// `hasLastClosedSorobanNetworkConfig()`.
+    #[tokio::test]
+    async fn test_info_soroban_tx_set_size_absent_pre_soroban() {
+        let (_dir, state) = mk_compat_state().await;
+        let router = build_compat_router(state);
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/info")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), http::StatusCode::OK);
+        let json = body_json(response).await;
+        assert!(
+            json["info"]["ledger"].get("maxSorobanTxSetSize").is_none(),
+            "maxSorobanTxSetSize must be absent pre-soroban, got: {:?}",
+            json["info"]["ledger"].get("maxSorobanTxSetSize")
+        );
+    }
+
     /// Verify that the `/info` response JSON shape matches stellar-core.
     ///
     /// This test constructs a `CompatInfoWrapper` by hand and asserts that the

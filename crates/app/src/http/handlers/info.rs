@@ -368,6 +368,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_info_handler_soroban_tx_set_size_present() {
+        let (_dir, state) = test_server_state("abc123def456").await;
+        state
+            .app
+            .ledger_manager()
+            .set_soroban_network_info_for_test(henyey_ledger::SorobanNetworkInfo {
+                ledger_max_tx_count: 500,
+                ..Default::default()
+            });
+        let app = build_router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/info")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), http::StatusCode::OK);
+        let json = body_json(response).await;
+        assert_eq!(
+            json["ledger"]["maxSorobanTxSetSize"],
+            500,
+            "maxSorobanTxSetSize must equal ledger_max_tx_count when a soroban \
+             config exists, got: {:?}",
+            json["ledger"].get("maxSorobanTxSetSize")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_info_handler_soroban_tx_set_size_absent() {
+        // Fresh App, no soroban network config set: soroban_network_info() is
+        // None, so the key must be absent (mirrors stellar-core's conditional
+        // emission gated on hasLastClosedSorobanNetworkConfig()).
+        let (_dir, state) = test_server_state("abc123def456").await;
+        let app = build_router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/info")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), http::StatusCode::OK);
+        let json = body_json(response).await;
+        assert!(
+            json["ledger"].get("maxSorobanTxSetSize").is_none(),
+            "maxSorobanTxSetSize must be absent with no soroban config, got: {:?}",
+            json["ledger"].get("maxSorobanTxSetSize")
+        );
+    }
+
+    #[tokio::test]
     async fn test_info_handler_commit_hash_absent() {
         let (_dir, state) = test_server_state("").await;
         let app = build_router(state);
