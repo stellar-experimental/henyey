@@ -784,6 +784,13 @@ mod loadgen_runner {
             let (permit, stop_token) = LoadGenPermit::try_acquire(&self.state)
                 .ok_or_else(|| "Load generation is already running.".to_string())?;
 
+            // Mark the run-start meter once a run is actually committed (parity:
+            // stellar-core ApplicationImpl::generateLoad, ApplicationImpl.cpp:1156,
+            // which marks {"loadgen","run","start"} before driving the generator).
+            // Supercluster's IsLoadGenComplete reads loadgen_run_start ==
+            // loadgen_run_complete to detect completion (#3569).
+            henyey_app::metrics::LOADGEN_RUN_START.increment(1);
+
             let mut config = GeneratedLoadConfig {
                 mode,
                 n_accounts: request.accounts,
@@ -855,12 +862,23 @@ mod loadgen_runner {
 
                 match result {
                     henyey_simulation::LoadResult::Done { submitted } => {
+                        // Parity: LoadGenerator mLoadgenComplete.Mark()
+                        // (LoadGenerator.cpp:1384/1460). start==complete is
+                        // supercluster's Success condition (#3569).
+                        henyey_app::metrics::LOADGEN_RUN_COMPLETE.increment(1);
                         tracing::info!(submitted, "Load generation complete");
                     }
                     henyey_simulation::LoadResult::Stopped => {
+                        // Parity: LoadGenerator::stop() marks mLoadgenFail
+                        // (LoadGenerator.cpp:310). A stopped run is a failed run
+                        // from supercluster's perspective (#3569).
+                        henyey_app::metrics::LOADGEN_RUN_FAILED.increment(1);
                         tracing::info!("Load generation stopped");
                     }
                     henyey_simulation::LoadResult::Failed => {
+                        // Parity: LoadGenerator mLoadgenFail.Mark()
+                        // (LoadGenerator.cpp:565/749/1433).
+                        henyey_app::metrics::LOADGEN_RUN_FAILED.increment(1);
                         tracing::error!("Load generation failed");
                     }
                 }

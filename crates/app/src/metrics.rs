@@ -788,6 +788,48 @@ metric_catalog! {
             => "History Archive State downloads that succeeded (and passed verify_has where applicable)";
         HISTORY_DOWNLOAD_HAS_FAILURE_TOTAL = "stellar_history_download_history_archive_state_failure_total"
             => "History Archive State downloads or verifications that failed";
+
+        // ── Loadgen meters (#3569) ─────────────────────────────────────
+        //
+        // Parity with stellar-core's medida loadgen meters
+        // (src/simulation/LoadGenerator.cpp + main/ApplicationImpl.cpp:1156).
+        // Supercluster's `IsLoadGenComplete` polls `loadgen_run_start ==
+        // loadgen_run_complete` to detect henyey-driven loadgen completion, so
+        // these must render with the EXACT bare-`loadgen_` names core's medida
+        // exporter emits (no `stellar_`/`henyey_` prefix, no dot→underscore
+        // munging — the literal string IS the exposition name). Pre-registered
+        // at zero so supercluster reads NotStarted (start==0) before a run
+        // rather than a missing series.
+        LOADGEN_RUN_START = "loadgen_run_start"
+            => "Loadgen runs started (parity: ApplicationImpl::generateLoad)";
+        LOADGEN_RUN_COMPLETE = "loadgen_run_complete"
+            => "Loadgen runs completed successfully (parity: LoadGenerator mLoadgenComplete)";
+        LOADGEN_RUN_FAILED = "loadgen_run_failed"
+            => "Loadgen runs that failed or were stopped (parity: LoadGenerator mLoadgenFail)";
+        LOADGEN_ACCOUNT_CREATED = "loadgen_account_created"
+            => "Loadgen accounts created (parity: registered-at-zero; core v27 marks this test-only)";
+        LOADGEN_TXN_ATTEMPTED = "loadgen_txn_attempted"
+            => "Loadgen transactions attempted (parity: LoadGenerator mTxnAttempted)";
+        LOADGEN_TXN_REJECTED = "loadgen_txn_rejected"
+            => "Loadgen transactions rejected by the tx queue (parity: LoadGenerator mTxnRejected)";
+        LOADGEN_TXN_BYTES = "loadgen_txn_bytes"
+            => "Loadgen transaction bytes submitted (parity: LoadGenerator mTxnBytes)";
+        LOADGEN_PAYMENT_SUBMITTED = "loadgen_payment_submitted"
+            => "Loadgen native payment operations submitted (parity: LoadGenerator mNativePayment, by op count)";
+        LOADGEN_PAYMENT_BYTES = "loadgen_payment_bytes"
+            => "Loadgen native payment transaction bytes (parity: LoadGenerator mNativePaymentBytes)";
+        LOADGEN_SOROBAN_UPLOAD = "loadgen_soroban_upload"
+            => "Loadgen Soroban upload transactions (parity: LoadGenerator mSorobanUploadTxs)";
+        LOADGEN_SOROBAN_INVOKE = "loadgen_soroban_invoke"
+            => "Loadgen Soroban invoke transactions (parity: LoadGenerator mSorobanInvokeTxs)";
+        LOADGEN_SOROBAN_SETUP_INVOKE = "loadgen_soroban_setup_invoke"
+            => "Loadgen Soroban setup-invoke transactions (parity: LoadGenerator mSorobanSetupInvokeTxs)";
+        LOADGEN_SOROBAN_SETUP_UPGRADE = "loadgen_soroban_setup_upgrade"
+            => "Loadgen Soroban setup-upgrade transactions (parity: LoadGenerator mSorobanSetupUpgradeTxs)";
+        LOADGEN_SOROBAN_CREATE_UPGRADE = "loadgen_soroban_create_upgrade"
+            => "Loadgen Soroban create-upgrade transactions (parity: LoadGenerator mSorobanCreateUpgradeTxs)";
+        LOADGEN_STEP_COUNT = "loadgen_step_count"
+            => "Loadgen generate_load loop iterations (parity: LoadGenerator mStepMeter)";
     }
 
     counters_no_prereg {
@@ -1757,6 +1799,121 @@ mod tests {
                 after.contains(&format!("{} 2", NAME)),
                 "{} should render 2 after two increments, got:\n{}",
                 NAME,
+                after
+            );
+        });
+    }
+
+    /// #3569: every loadgen meter is in the catalog and pre-registered at zero,
+    /// with the exact bare-`loadgen_` Prometheus name (no prefix, no munging) so
+    /// supercluster's `IsLoadGenComplete` reads match core's medida exporter.
+    #[test]
+    fn test_loadgen_meters_in_catalog() {
+        // (typed constant, expected literal Prometheus name) pairs.
+        let expected: &[(CounterMetric, &str)] = &[
+            (LOADGEN_RUN_START, "loadgen_run_start"),
+            (LOADGEN_RUN_COMPLETE, "loadgen_run_complete"),
+            (LOADGEN_RUN_FAILED, "loadgen_run_failed"),
+            (LOADGEN_ACCOUNT_CREATED, "loadgen_account_created"),
+            (LOADGEN_TXN_ATTEMPTED, "loadgen_txn_attempted"),
+            (LOADGEN_TXN_REJECTED, "loadgen_txn_rejected"),
+            (LOADGEN_TXN_BYTES, "loadgen_txn_bytes"),
+            (LOADGEN_PAYMENT_SUBMITTED, "loadgen_payment_submitted"),
+            (LOADGEN_PAYMENT_BYTES, "loadgen_payment_bytes"),
+            (LOADGEN_SOROBAN_UPLOAD, "loadgen_soroban_upload"),
+            (LOADGEN_SOROBAN_INVOKE, "loadgen_soroban_invoke"),
+            (LOADGEN_SOROBAN_SETUP_INVOKE, "loadgen_soroban_setup_invoke"),
+            (
+                LOADGEN_SOROBAN_SETUP_UPGRADE,
+                "loadgen_soroban_setup_upgrade",
+            ),
+            (
+                LOADGEN_SOROBAN_CREATE_UPGRADE,
+                "loadgen_soroban_create_upgrade",
+            ),
+            (LOADGEN_STEP_COUNT, "loadgen_step_count"),
+        ];
+
+        for (metric, name) in expected {
+            // The literal name must carry NO domain prefix (parity: core's
+            // medida keys are bare `loadgen.*`).
+            assert!(
+                !name.starts_with("stellar_") && !name.starts_with("henyey_"),
+                "loadgen meter {} must be a bare name (no domain prefix)",
+                name
+            );
+            // Typed constant equals the expected literal.
+            assert_eq!(*metric, *name, "constant {:?} != {}", metric, name);
+            // Present in the full catalog AND pre-registered at zero so the
+            // series exists on the first scrape.
+            assert!(
+                ALL_COUNTER_NAMES.contains(name),
+                "{} missing from ALL_COUNTER_NAMES",
+                name
+            );
+            assert!(
+                ALL_PREREGISTERED_COUNTER_NAMES.contains(name),
+                "{} should be pre-registered (present-at-zero)",
+                name
+            );
+        }
+    }
+
+    /// #3569: the loadgen run lifecycle renders the supercluster Success
+    /// condition. After a run, `loadgen_run_start == loadgen_run_complete` and
+    /// `loadgen_txn_attempted` reflects the attempt count, exactly as
+    /// supercluster's `IsLoadGenComplete` / `LogLoadGenProgressTowards` read.
+    #[test]
+    fn test_loadgen_run_lifecycle_renders() {
+        const N: u64 = 7;
+        let (recorder, handle) = fresh_local_recorder();
+        metrics::with_local_recorder(&recorder, || {
+            describe_metrics();
+            register_label_series();
+
+            // First scrape: run.start is pre-registered at 0 → supercluster
+            // reads NotStarted, not a missing series.
+            let before = handle.render();
+            assert!(
+                before.contains("loadgen_run_start 0"),
+                "loadgen_run_start should be pre-registered at 0, got:\n{}",
+                before
+            );
+            assert!(
+                before.contains("# TYPE loadgen_run_start counter"),
+                "loadgen_run_start should have TYPE counter"
+            );
+
+            // Drive a run lifecycle: start, N attempts, then complete, plus one
+            // mark of each soroban.* meter and step.count.
+            LOADGEN_RUN_START.increment(1);
+            for _ in 0..N {
+                LOADGEN_TXN_ATTEMPTED.increment(1);
+            }
+            LOADGEN_SOROBAN_UPLOAD.increment(1);
+            LOADGEN_SOROBAN_INVOKE.increment(1);
+            LOADGEN_SOROBAN_SETUP_INVOKE.increment(1);
+            LOADGEN_SOROBAN_SETUP_UPGRADE.increment(1);
+            LOADGEN_SOROBAN_CREATE_UPGRADE.increment(1);
+            LOADGEN_STEP_COUNT.increment(1);
+            LOADGEN_RUN_COMPLETE.increment(1);
+
+            let after = handle.render();
+            // Supercluster Success: run.start == run.complete (both 1).
+            assert!(
+                after.contains("loadgen_run_start 1"),
+                "loadgen_run_start should be 1, got:\n{}",
+                after
+            );
+            assert!(
+                after.contains("loadgen_run_complete 1"),
+                "loadgen_run_complete should be 1 (start==complete = Success), got:\n{}",
+                after
+            );
+            assert!(
+                after.contains(&format!("loadgen_txn_attempted {}", N)),
+                "loadgen_txn_attempted should be {}, got:\n{}",
+                N,
                 after
             );
         });
