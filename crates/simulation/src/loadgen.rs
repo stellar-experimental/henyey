@@ -1477,6 +1477,18 @@ impl LoadGenerator {
                     // on submit, the `ConfigUpgradeSet` entry would not yet be in
                     // a closed ledger and the arm would be rejected (#3596).
                     self.wait_till_complete().await;
+                    // For create_upgrade, account-sync is necessary but not
+                    // sufficient: the TEMPORARY ConfigUpgradeSet ContractData
+                    // write can lag the source-account seq update in the
+                    // bucket-list snapshot, so SSC's arm (sent immediately
+                    // after completion) could miss it and reject the upgrade
+                    // (#3596 race). Additionally wait until the upgrade key is
+                    // actually RESOLVABLE via the same path the arm uses
+                    // (make_from_key + isValidForApply), so the arm always
+                    // succeeds.
+                    if config.mode == LoadGenMode::SorobanCreateUpgrade {
+                        self.wait_config_upgrade_resolvable(config).await;
+                    }
                     return LoadResult::Done {
                         submitted: self.total_submitted,
                     };
@@ -1563,6 +1575,44 @@ impl LoadGenerator {
                 return;
             }
             tokio::time::sleep(Duration::from_millis(1000)).await;
+        }
+    }
+
+    /// Wait until the `create_upgrade` ConfigUpgradeSet entry is resolvable by
+    /// the arm/nomination path (`make_from_key` + `isValidForApply`), so SSC's
+    /// `/upgrades?configupgradesetkey` arm — sent immediately after the run
+    /// completes — always finds a VALID entry. The TEMPORARY ContractData
+    /// write can lag the source-account seq in the bucket-list snapshot, so
+    /// `check_accounts_synced` returning true does not guarantee the entry is
+    /// queryable yet. Bounded by the same ledger budget as `wait_till_complete`.
+    async fn wait_config_upgrade_resolvable(&mut self, config: &GeneratedLoadConfig) {
+        const TIMEOUT_NUM_LEDGERS: u32 = 30;
+        let key = match self.get_config_upgrade_set_key(&config.soroban_upgrade_config) {
+            Ok(k) => k,
+            Err(e) => {
+                warn!(error = %e, "create_upgrade: cannot compute ConfigUpgradeSetKey to await");
+                return;
+            }
+        };
+        let start_ledger = self.tx_generator.app.current_ledger_seq();
+        loop {
+            if let Ok(true) = self.tx_generator.app.validate_config_upgrade_set_key(&key) {
+                return;
+            }
+            let elapsed = self
+                .tx_generator
+                .app
+                .current_ledger_seq()
+                .saturating_sub(start_ledger);
+            if elapsed >= TIMEOUT_NUM_LEDGERS {
+                warn!(
+                    timeout_ledgers = TIMEOUT_NUM_LEDGERS,
+                    "create_upgrade: ConfigUpgradeSet entry not resolvable before timeout; \
+                     arm may be rejected"
+                );
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
         }
     }
 
