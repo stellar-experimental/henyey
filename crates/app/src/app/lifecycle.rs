@@ -530,6 +530,17 @@ impl App {
             if select_iteration <= 5 || select_iteration % 1000 == 0 {
                 tracing::debug!(select_iteration, "Main loop: entering select!");
             }
+            // Generic per-phase loop guard (#3582). Time the whole branch
+            // dispatch; after the select! completes, the branch has already
+            // stamped its coarse `phase` via `set_phase(N)`, so reading
+            // `event_loop_phase` names exactly which branch ran. This logs
+            // whichever phase (28 peer_maintenance, 5 consensus_tick, or any
+            // other) holds up the loop > threshold — resolving the
+            // phase-number ambiguity in #3582 on the deployed node. Additive
+            // and behavior-preserving: one `Instant` + one `Duration` compare,
+            // no control-flow change. Complements the finer phase=5 sub-step
+            // WARNs below.
+            let phase_dispatch_start = std::time::Instant::now();
             tokio::select! {
                 // NOTE: Removed biased; to ensure timers get fair polling
 
@@ -1072,16 +1083,31 @@ impl App {
                         }
                     }
 
-                    // Check for externalized slots to process
+                    // Check for externalized slots to process.
+                    //
+                    // Each consensus-tick (phase=5) sub-op below is wrapped
+                    // with `Instant`-based timing + `warn_consensus_substep_if_slow`
+                    // so a deployed node names the sub-step that blocks the
+                    // event loop while contending the SQLite write lock — the
+                    // ~20s phase=5 stall that is the root cause of the #3497
+                    // recoverable-shutdowns (#3582). Instrumentation only: the
+                    // measurement is a cheap `Duration` comparison and does not
+                    // alter control flow.
                     self.set_phase(10); // 10 = process_externalized
                     if pending_catchup.is_none() {
+                        let substep_start = std::time::Instant::now();
                         if let Some(pc) = self.process_externalized_slots().await {
                             pending_catchup = Some(pc);
                         }
+                        super::warn_consensus_substep_if_slow(
+                            substep_start.elapsed(),
+                            "process_externalized_slots",
+                        );
                     }
 
                     // Start a background ledger close if one isn't already running.
                     if close_pipeline.is_idle() {
+                        let substep_start = std::time::Instant::now();
                         let next = self.try_start_ledger_close().await;
                         close_pipeline.try_start_close(next);
 
@@ -1111,16 +1137,33 @@ impl App {
                                 }
                             }
                         }
+                        // Covers try_start_ledger_close + the proactive
+                        // gap-detection request_scp_state_and_record (same
+                        // idle-close branch).
+                        super::warn_consensus_substep_if_slow(
+                            substep_start.elapsed(),
+                            "try_start_ledger_close",
+                        );
                     }
 
                     // Request any pending tx sets we need
+                    let substep_start = std::time::Instant::now();
                     self.request_pending_tx_sets().await;
+                    super::warn_consensus_substep_if_slow(
+                        substep_start.elapsed(),
+                        "request_pending_tx_sets",
+                    );
 
                     // Publish queued history checkpoints.  This is normally done
                     // from the close_pipeline completion arm, but for solo validators
                     // the select may pick the tick arm repeatedly before close completes.
                     if self.is_validator {
+                        let substep_start = std::time::Instant::now();
                         self.maybe_publish_history().await;
+                        super::warn_consensus_substep_if_slow(
+                            substep_start.elapsed(),
+                            "maybe_publish_history",
+                        );
                     }
 
                     // Safety-net trigger (#2702). The *primary* nomination
@@ -1135,7 +1178,12 @@ impl App {
                     // covers the case where a trigger timer was never armed (e.g.
                     // arming was gated out at cold start before tracking settled)
                     // — without it, a missed arm could stall ledger production.
+                    let substep_start = std::time::Instant::now();
                     self.try_trigger_consensus().await;
+                    super::warn_consensus_substep_if_slow(
+                        substep_start.elapsed(),
+                        "try_trigger_consensus",
+                    );
                 }
 
                 // Stats logging
@@ -1396,6 +1444,17 @@ impl App {
                     }
                 }
             }
+
+            // Generic per-phase guard (#3582): the branch that just ran
+            // stamped its coarse `phase`; read it back and WARN by identity
+            // (number + name) if the dispatch crossed the threshold. Covers
+            // ALL ~15 branches — including phase=28 (peer_maintenance) which
+            // #3582 names literally — so the deployed node logs whichever
+            // phase held up the loop.
+            super::warn_phase_if_slow(
+                phase_dispatch_start.elapsed(),
+                self.event_loop_phase.load(Ordering::Relaxed),
+            );
         }
 
         // Event loop has exited — stop the watchdog immediately (before

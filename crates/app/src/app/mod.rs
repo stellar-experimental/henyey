@@ -3844,6 +3844,155 @@ pub(crate) fn warn_if_slow(elapsed: std::time::Duration, op: &'static str, count
     }
 }
 
+/// Threshold above which a single consensus-tick (phase=5) sub-step is
+/// flagged as a likely stall contributor (#3582).
+///
+/// The 1-second consensus-tick arm (`consensus_interval`, coarse `phase=5`)
+/// runs a chain of synchronous-ish sub-ops — `process_externalized_slots`,
+/// `try_start_ledger_close`, `request_pending_tx_sets`,
+/// `maybe_publish_history`, `try_trigger_consensus` — at least one of which
+/// has been observed to block the event loop ~20 s while contending the
+/// SQLite write lock, blowing past the 30 s `busy_timeout` and busying the
+/// concurrent ledger-close persist write (root cause of the #3497
+/// recoverable-shutdowns).
+///
+/// The watchdog's `phase=5` label is too coarse to name the culprit. This
+/// per-sub-step threshold is deliberately set to **a few seconds** — well
+/// under the 30 s DB-lock window so it fires long before the busy, yet high
+/// enough above the sub-millisecond normal-tick cost to stay silent in
+/// steady state. The eventual offload fix (#3537-class, e.g.
+/// `spawn_blocking`) targets whichever sub-step this names in the deployed
+/// logs.
+pub(crate) const CONSENSUS_TICK_SLOW_SUBSTEP_THRESHOLD: std::time::Duration =
+    std::time::Duration::from_secs(2);
+
+/// Pure threshold predicate (#3582): is a consensus-tick sub-step's
+/// `elapsed` slow enough to flag? `>=` is load-bearing (boundary
+/// inclusive), matching [`warn_if_slow`]. Extracted so the
+/// timing/threshold decision is unit-testable without driving the event
+/// loop.
+#[inline]
+pub(crate) fn consensus_tick_substep_is_slow(elapsed: std::time::Duration) -> bool {
+    elapsed >= CONSENSUS_TICK_SLOW_SUBSTEP_THRESHOLD
+}
+
+/// Emit a `WARN` naming the consensus-tick (phase=5) sub-step and its
+/// elapsed time when it crosses [`CONSENSUS_TICK_SLOW_SUBSTEP_THRESHOLD`]
+/// (#3582). No-op on the fast path; the only cost is a `Duration`
+/// comparison, so it is behavior-preserving for the event loop.
+///
+/// `substep` identifies which sub-op stalled (e.g. `maybe_publish_history`),
+/// so the deployed node's log pinpoints the sub-step the offload fix should
+/// target. The `phase = 5` field mirrors the watchdog's coarse phase so the
+/// two log streams correlate.
+#[inline]
+pub(crate) fn warn_consensus_substep_if_slow(elapsed: std::time::Duration, substep: &'static str) {
+    if consensus_tick_substep_is_slow(elapsed) {
+        tracing::warn!(
+            phase = 5,
+            substep,
+            elapsed_ms = elapsed.as_millis() as u64,
+            "Slow consensus-tick sub-step (>= {}ms) — likely phase=5 DB-lock stall, #3582 offload target",
+            CONSENSUS_TICK_SLOW_SUBSTEP_THRESHOLD.as_millis()
+        );
+    }
+}
+
+/// Threshold above which a single top-level event-loop *phase* (one
+/// `tokio::select!` branch iteration) is flagged as a likely loop-stall
+/// contributor (#3582).
+///
+/// The consensus-tick sub-step instrumentation above narrows phase=5, but
+/// issue #3582 names `phase=28` (`peer_maintenance`) *literally* — and
+/// `maintain_peers()` can itself contend the SQLite write lock during
+/// peer-table persistence. To resolve the phase-number ambiguity
+/// definitively on the deployed node, the loop wraps the whole branch
+/// dispatch with an `Instant` and emits a WARN naming *whichever* phase
+/// (28, 5, or any other) crosses this threshold.
+///
+/// Kept identical to [`CONSENSUS_TICK_SLOW_SUBSTEP_THRESHOLD`] so the two
+/// log streams correlate: a few seconds — well under the 30 s `busy_timeout`
+/// DB-lock window, high enough above a normal sub-millisecond branch to stay
+/// silent in steady state.
+pub(crate) const EVENT_LOOP_PHASE_SLOW_THRESHOLD: std::time::Duration =
+    CONSENSUS_TICK_SLOW_SUBSTEP_THRESHOLD;
+
+/// Pure threshold predicate (#3582): is a single event-loop branch's
+/// `elapsed` slow enough to flag? `>=` is load-bearing (boundary
+/// inclusive), matching [`consensus_tick_substep_is_slow`]. Extracted so the
+/// timing/threshold decision is unit-testable without driving the loop.
+#[inline]
+pub(crate) fn event_loop_phase_is_slow(elapsed: std::time::Duration) -> bool {
+    elapsed >= EVENT_LOOP_PHASE_SLOW_THRESHOLD
+}
+
+/// Human-readable name for a coarse event-loop `phase` number (#3582).
+///
+/// The select! loop stamps a numeric `phase` per branch via
+/// [`App::set_phase`]; the watchdog prints only the number. This map mirrors
+/// the inline `// N = name` annotations at each `set_phase(N)` call so the
+/// generic per-phase guard can log the phase by identity (number + name) —
+/// in particular naming `phase=28` as `peer_maintenance`, the phase #3582
+/// calls out literally. Unknown phases fall back to `"unknown"` (never
+/// panics). Keep in sync with the `set_phase(N)` annotations in
+/// `lifecycle.rs`.
+pub(crate) fn event_loop_phase_name(phase: u64) -> &'static str {
+    match phase {
+        0 => "waiting",
+        1 => "scp_message",
+        2 => "fetch_response",
+        3 => "broadcast",
+        4 => "scp_broadcast",
+        5 => "consensus_tick",
+        6 => "pending_close",
+        10 => "process_externalized",
+        11 => "externalized_catchup",
+        13 => "maybe_buffered_catchup",
+        14 => "catchup_running",
+        15 => "pending_catchup_complete",
+        16 => "heartbeat",
+        20 => "stats",
+        21 => "tx_advert_flush",
+        22 => "tx_demand",
+        23 => "survey",
+        24 => "survey_request",
+        25 => "survey_phase",
+        26 => "scp_timeout",
+        27 => "ping",
+        28 => "peer_maintenance",
+        29 => "peer_refresh",
+        30 => "herder_cleanup",
+        31 => "scp_verifier",
+        32 => "scp_verified",
+        33 => "tx_set_gc",
+        _ => "unknown",
+    }
+}
+
+/// Emit a `WARN` identifying the event-loop phase by *number and name* and
+/// its elapsed time when a single branch dispatch crosses
+/// [`EVENT_LOOP_PHASE_SLOW_THRESHOLD`] (#3582). No-op on the fast path; the
+/// only cost is a `Duration` comparison, so it is behavior-preserving for
+/// the loop.
+///
+/// This is the generic top-level guard: whichever phase (28
+/// `peer_maintenance`, 5 `consensus_tick`, or any other) holds up the loop
+/// >threshold is logged by identity on the deployed node, resolving the
+/// phase-number ambiguity in #3582. Complements the finer-grained
+/// consensus-tick sub-step WARNs ([`warn_consensus_substep_if_slow`]).
+#[inline]
+pub(crate) fn warn_phase_if_slow(elapsed: std::time::Duration, phase: u64) {
+    if event_loop_phase_is_slow(elapsed) {
+        tracing::warn!(
+            phase,
+            phase_name = event_loop_phase_name(phase),
+            elapsed_ms = elapsed.as_millis() as u64,
+            "Slow event-loop phase (>= {}ms) — branch held up the loop, likely DB-lock stall, #3582",
+            EVENT_LOOP_PHASE_SLOW_THRESHOLD.as_millis()
+        );
+    }
+}
+
 /// Format the tiered diagnostic hint message for a watchdog freeze event.
 ///
 /// Pure function that builds the operator hint string with pre-substituted
@@ -7334,6 +7483,178 @@ mod tests {
             1,
             "threshold-equal elapsed must emit (>= comparison)"
         );
+    }
+
+    /// `consensus_tick_substep_is_slow` decision helper (#3582): the pure
+    /// threshold predicate that drives consensus-tick (phase=5) sub-step
+    /// instrumentation. Elapsed strictly below the threshold is NOT slow;
+    /// at or above the threshold IS slow (`>=`, boundary inclusive).
+    ///
+    /// This is the failing-test-first artifact for the phase=5 sub-step
+    /// timing instrumentation: the eventual offload fix (#3537-class) needs
+    /// the deployed node to name which sub-op crosses the multi-second
+    /// DB-lock window, and this predicate is what gates that emission.
+    #[test]
+    fn consensus_tick_substep_is_slow_threshold() {
+        // Well under threshold → not slow.
+        assert!(!super::consensus_tick_substep_is_slow(
+            std::time::Duration::from_millis(50)
+        ));
+        // Just under threshold → not slow.
+        assert!(!super::consensus_tick_substep_is_slow(
+            super::CONSENSUS_TICK_SLOW_SUBSTEP_THRESHOLD - std::time::Duration::from_millis(1)
+        ));
+        // Exactly at threshold → slow (>= is load-bearing).
+        assert!(super::consensus_tick_substep_is_slow(
+            super::CONSENSUS_TICK_SLOW_SUBSTEP_THRESHOLD
+        ));
+        // Above threshold (the ~20s phase=5 DB-lock stall) → slow.
+        assert!(super::consensus_tick_substep_is_slow(
+            std::time::Duration::from_secs(20)
+        ));
+    }
+
+    /// The phase=5 sub-step threshold must sit in the "a few seconds, well
+    /// under 30s" band specified by #3582: low enough to fire long before
+    /// the 30s `busy_timeout` DB-lock window, high enough to stay silent
+    /// during normal sub-millisecond ticks.
+    #[test]
+    fn consensus_tick_substep_threshold_in_band() {
+        let t = super::CONSENSUS_TICK_SLOW_SUBSTEP_THRESHOLD;
+        assert!(
+            t >= std::time::Duration::from_secs(1),
+            "threshold {t:?} too low — would be noisy on normal ticks"
+        );
+        assert!(
+            t <= std::time::Duration::from_secs(10),
+            "threshold {t:?} too high — must fire well under the 30s DB-lock window"
+        );
+    }
+
+    /// `warn_consensus_substep_if_slow` emits exactly one WARN naming the
+    /// sub-step + elapsed when slow, and is silent on the fast path. This is
+    /// what makes the deployed node reveal the culprit sub-op (#3582).
+    #[test]
+    fn warn_consensus_substep_if_slow_emits_with_substep() {
+        let sub = CapturingSubscriber::default();
+        let events = sub.events.clone();
+        tracing::subscriber::with_default(sub, || {
+            // Slow: a 20s stall on try_start_ledger_close.
+            super::warn_consensus_substep_if_slow(
+                std::time::Duration::from_secs(20),
+                "try_start_ledger_close",
+            );
+            // Fast: a 1ms request_pending_tx_sets — must stay silent.
+            super::warn_consensus_substep_if_slow(
+                std::time::Duration::from_millis(1),
+                "request_pending_tx_sets",
+            );
+        });
+        let events = events.lock().unwrap();
+        assert_eq!(events.len(), 1, "exactly one warn (only the slow sub-step)");
+        let ev = &events[0];
+        assert!(
+            ev.contains("substep=try_start_ledger_close"),
+            "substep field missing: {ev}"
+        );
+        assert!(ev.contains("phase=5"), "phase field missing: {ev}");
+        assert!(
+            ev.contains("elapsed_ms=20000"),
+            "elapsed_ms field missing/wrong: {ev}"
+        );
+        assert!(ev.contains("#3582"), "log should reference #3582: {ev}");
+    }
+
+    /// Generic per-event-loop-phase guard threshold predicate (#3582):
+    /// `event_loop_phase_is_slow` is the pure decision that gates the
+    /// top-level WARN naming *whichever* select! branch held up the loop —
+    /// resolving the phase=28-vs-phase=5 ambiguity definitively on the
+    /// deployed node. `>=` is boundary-inclusive, matching the sub-step
+    /// predicate.
+    #[test]
+    fn event_loop_phase_is_slow_threshold() {
+        // Well under threshold → not slow.
+        assert!(!super::event_loop_phase_is_slow(
+            std::time::Duration::from_millis(50)
+        ));
+        // Just under threshold → not slow.
+        assert!(!super::event_loop_phase_is_slow(
+            super::EVENT_LOOP_PHASE_SLOW_THRESHOLD - std::time::Duration::from_millis(1)
+        ));
+        // Exactly at threshold → slow (>= load-bearing).
+        assert!(super::event_loop_phase_is_slow(
+            super::EVENT_LOOP_PHASE_SLOW_THRESHOLD
+        ));
+        // Above threshold (a ~20s DB-lock stall in any branch) → slow.
+        assert!(super::event_loop_phase_is_slow(
+            std::time::Duration::from_secs(20)
+        ));
+    }
+
+    /// The generic per-phase guard threshold must match the same
+    /// "a few seconds, well under the 30s DB-lock window" band as the
+    /// consensus-tick sub-step threshold (#3582) — the two streams correlate.
+    #[test]
+    fn event_loop_phase_threshold_in_band() {
+        let t = super::EVENT_LOOP_PHASE_SLOW_THRESHOLD;
+        assert!(
+            t >= std::time::Duration::from_secs(1),
+            "threshold {t:?} too low — would be noisy on normal ticks"
+        );
+        assert!(
+            t <= std::time::Duration::from_secs(10),
+            "threshold {t:?} too high — must fire well under the 30s DB-lock window"
+        );
+    }
+
+    /// `event_loop_phase_name` must resolve every coarse phase the select!
+    /// loop stamps to a stable human-readable name — most importantly
+    /// phase=28 (`peer_maintenance`), the phase #3582 names literally. An
+    /// unknown phase falls back to `"unknown"` (never panics).
+    #[test]
+    fn event_loop_phase_name_covers_named_branches() {
+        // The phase #3582 calls out by number.
+        assert_eq!(super::event_loop_phase_name(28), "peer_maintenance");
+        // The phase the named sub-ops actually live in.
+        assert_eq!(super::event_loop_phase_name(5), "consensus_tick");
+        // A representative spread across the branch space.
+        assert_eq!(super::event_loop_phase_name(0), "waiting");
+        assert_eq!(super::event_loop_phase_name(6), "pending_close");
+        assert_eq!(super::event_loop_phase_name(16), "heartbeat");
+        assert_eq!(super::event_loop_phase_name(33), "tx_set_gc");
+        // Unknown phase → graceful fallback, no panic.
+        assert_eq!(super::event_loop_phase_name(999), "unknown");
+    }
+
+    /// `warn_phase_if_slow` emits exactly one WARN identifying the phase by
+    /// *number and name* + elapsed when the branch ran slow, and is silent
+    /// on the fast path. This is the generic guard that makes the deployed
+    /// node log whichever phase (28, 5, or any other) held up the loop —
+    /// resolving the phase-number ambiguity in #3582.
+    #[test]
+    fn warn_phase_if_slow_emits_with_phase_identity() {
+        let sub = CapturingSubscriber::default();
+        let events = sub.events.clone();
+        tracing::subscriber::with_default(sub, || {
+            // Slow: a 20s stall while in phase=28 (peer_maintenance) — the
+            // exact phase #3582 names literally.
+            super::warn_phase_if_slow(std::time::Duration::from_secs(20), 28);
+            // Fast: a 1ms phase=5 tick — must stay silent.
+            super::warn_phase_if_slow(std::time::Duration::from_millis(1), 5);
+        });
+        let events = events.lock().unwrap();
+        assert_eq!(events.len(), 1, "exactly one warn (only the slow phase)");
+        let ev = &events[0];
+        assert!(ev.contains("phase=28"), "phase number missing: {ev}");
+        assert!(
+            ev.contains("phase_name=peer_maintenance"),
+            "phase name missing: {ev}"
+        );
+        assert!(
+            ev.contains("elapsed_ms=20000"),
+            "elapsed_ms field missing/wrong: {ev}"
+        );
+        assert!(ev.contains("#3582"), "log should reference #3582: {ev}");
     }
 
     /// Test the `format_watchdog_diagnostic_hint` helper directly.
