@@ -64,6 +64,13 @@ pub(crate) async fn info_handler(State(state): State<Arc<ServerState>>) -> Json<
     let ledger = state.app.ledger_summary();
     let (pending_count, authenticated_count) = state.app.peer_counts().await;
     let quorum = state.app.quorum_info_for_info();
+    // Present only when a Soroban network config exists (protocol ≥ 20),
+    // mirroring stellar-core's `hasLastClosedSorobanNetworkConfig()` gate. The
+    // value is the ledger's max OPERATIONS resource == `ledger_max_tx_count`.
+    let max_soroban_tx_set_size = state
+        .app
+        .soroban_network_info()
+        .map(|i| i.ledger_max_tx_count);
 
     Json(InfoResponse {
         build: henyey_common::version::build_version_string(&info.version),
@@ -84,6 +91,7 @@ pub(crate) async fn info_handler(State(state): State<Arc<ServerState>>) -> Json<
             base_fee: ledger.base_fee,
             base_reserve: ledger.base_reserve,
             max_tx_set_size: ledger.max_tx_set_size,
+            max_soroban_tx_set_size,
             flags: ledger.flags,
             age: ledger.age,
         },

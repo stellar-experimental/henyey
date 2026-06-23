@@ -47,6 +47,10 @@ pub(crate) async fn compat_info_handler(
             base_fee: ledger.base_fee,
             base_reserve: ledger.base_reserve,
             max_tx_set_size: ledger.max_tx_set_size,
+            // Present only when a Soroban network config exists (protocol ≥ 20),
+            // mirroring stellar-core's `hasLastClosedSorobanNetworkConfig()` gate;
+            // value is the ledger's max OPERATIONS resource == ledger_max_tx_count.
+            max_soroban_tx_set_size: app.soroban_network_info().map(|i| i.ledger_max_tx_count),
             flags: if ledger.flags != 0 {
                 Some(ledger.flags)
             } else {
@@ -115,6 +119,14 @@ struct CompatLedgerInfo {
     base_reserve: u32,
     #[serde(rename = "maxTxSetSize")]
     max_tx_set_size: u32,
+    /// Max Soroban tx-set size (ledger's max OPERATIONS resource). Present only
+    /// when the last-closed ledger has a Soroban network config (protocol ≥ 20),
+    /// matching stellar-core `ApplicationImpl::getJsonInfo()` (lines 478-484).
+    #[serde(
+        rename = "maxSorobanTxSetSize",
+        skip_serializing_if = "Option::is_none"
+    )]
+    max_soroban_tx_set_size: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     flags: Option<u32>,
     age: u64,
@@ -254,6 +266,7 @@ mod tests {
                     base_fee: 100,
                     base_reserve: 100000000,
                     max_tx_set_size: 1000,
+                    max_soroban_tx_set_size: None,
                     flags: None,
                     age: 5,
                 },
@@ -345,6 +358,7 @@ mod tests {
                     base_fee: 100,
                     base_reserve: 100000000,
                     max_tx_set_size: 1000,
+                    max_soroban_tx_set_size: None,
                     flags: Some(3),
                     age: 0,
                 },
@@ -381,6 +395,7 @@ mod tests {
                     base_fee: 100,
                     base_reserve: 100000000,
                     max_tx_set_size: 1000,
+                    max_soroban_tx_set_size: None,
                     flags: None,
                     age: 0,
                 },
@@ -421,6 +436,7 @@ mod tests {
                     base_fee: 100,
                     base_reserve: 100000000,
                     max_tx_set_size: 1000,
+                    max_soroban_tx_set_size: None,
                     flags: None,
                     age: 0,
                 },
@@ -501,6 +517,7 @@ mod tests {
                     base_fee: 100,
                     base_reserve: 100000000,
                     max_tx_set_size: 1000,
+                    max_soroban_tx_set_size: None,
                     flags: None,
                     age: 0,
                 },
@@ -561,6 +578,7 @@ mod tests {
                     base_fee: 100,
                     base_reserve: 100000000,
                     max_tx_set_size: 1000,
+                    max_soroban_tx_set_size: None,
                     flags: None,
                     age: 0,
                 },

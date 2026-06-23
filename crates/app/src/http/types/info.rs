@@ -54,6 +54,14 @@ pub struct InfoLedgerSummary {
     pub base_fee: u32,
     pub base_reserve: u32,
     pub max_tx_set_size: u32,
+    /// Max Soroban tx-set size (ledger's max OPERATIONS resource). Present only
+    /// when the last-closed ledger has a Soroban network config (protocol ≥ 20),
+    /// mirroring stellar-core's conditional emission in `ApplicationImpl::getJsonInfo()`.
+    #[serde(
+        rename = "maxSorobanTxSetSize",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub max_soroban_tx_set_size: Option<u32>,
     pub flags: u32,
     /// Seconds since last ledger close.
     pub age: u64,
@@ -146,6 +154,7 @@ mod tests {
                 base_fee: 100,
                 base_reserve: 5000000,
                 max_tx_set_size: 1000,
+                max_soroban_tx_set_size: None,
                 flags: 0,
                 age: 5,
             },
