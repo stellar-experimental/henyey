@@ -110,6 +110,7 @@ Corresponds to: `HotArchiveBucket.h`, `HotArchiveBucketList.h`, `HotArchiveBucke
 | `fresh()` | `HotArchiveBucket::fresh()` | Full |
 | `isTombstoneEntry()` / `maybePut()` | `is_hot_archive_tombstone()` / merge helpers | Full |
 | `mergeCasesWithEqualKeys()` | `merge_hot_archive_buckets()` | Full |
+| `BucketOutputIterator` metaentry gate (`meta.ledgerVersion >= V11`) | `merge_hot_archive_buckets()` output-version gate | Full — empty-input spill (output version 0) emits NO metaentry and collapses to the empty bucket, matching core's `getBucket` empty-output path; previously emitted a `{v0,void}` meta-only bucket (`d15ebeb4…`), flipping the hot-archive hash and the header `bucketListHash` at the L16 level-1→2 spill (#3552) |
 | `bucketEntryToLoadResult()` / `convertToBucketEntry()` | `get()` / `HotArchiveBucket::fresh()` conversion | Full |
 | `countOldEntryType()` / `countNewEntryType()` / `checkProtocolLegality()` | No-ops consistent with upstream | Full |
 | `HotArchiveBucketList::addBatch()` | `HotArchiveBucketList::add_batch()` | Full |

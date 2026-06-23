@@ -1842,16 +1842,32 @@ pub fn merge_hot_archive_buckets(
     // memory for the HashMap AND a subsequent O((n+m) log(n+m)) sort.
     let mut result_entries = Vec::with_capacity(1 + curr.len() + snap.len());
 
-    // Add metadata - hot archive buckets always use V1 with BucketListType::HotArchive
-    // for Protocol 23+.
-    let mut meta = BucketMetadata {
-        ledger_version: output_version,
-        ext: BucketMetadataExt::V0,
-    };
-    if protocol_version_starts_from(output_version, ProtocolVersion::V23) {
-        meta.ext = BucketMetadataExt::V1(BucketListType::HotArchive);
+    // Emit the metaentry only when the derived output version supports it
+    // (>= V11), mirroring stellar-core's `BucketOutputIterator` constructor,
+    // which writes the METAENTRY only when `meta.ledgerVersion >=
+    // FIRST_PROTOCOL_SUPPORTING_INITENTRY_AND_METAENTRY` (V11)
+    // (BucketOutputIterator.cpp:45-72). When both inputs are empty/meta-less,
+    // `output_version` is 0 (BucketInputIterator defaults a meta-less bucket to
+    // protocol 0; BucketInputIterator.cpp:35-42) and core emits NO metaentry,
+    // so `getBucket` sees `mObjectsPut == 0` and returns an EMPTY bucket
+    // (BucketOutputIterator.cpp:182-191). Henyey previously pushed a
+    // `{ledgerVersion: 0, ext: V0}` metaentry unconditionally, producing the
+    // meta-only bucket `d15ebeb4…` where core has an empty bucket — flipping the
+    // hot-archive bucket-list hash and (via the live+hot-archive combine) the
+    // header `bucketListHash` (#3552 residual L16 divergence). Hot-archive
+    // buckets exist only at V23+, so a populated merge always uses the V1
+    // extension; the V0/no-meta branch is reachable only for the empty-input
+    // spill, which must collapse to the canonical empty bucket.
+    if protocol_version_starts_from(output_version, ProtocolVersion::V11) {
+        let mut meta = BucketMetadata {
+            ledger_version: output_version,
+            ext: BucketMetadataExt::V0,
+        };
+        if protocol_version_starts_from(output_version, ProtocolVersion::V23) {
+            meta.ext = BucketMetadataExt::V1(BucketListType::HotArchive);
+        }
+        result_entries.push(HotArchiveBucketEntry::Metaentry(meta));
     }
-    result_entries.push(HotArchiveBucketEntry::Metaentry(meta));
 
     // Sorted merge-join: iterate both iterators in lock-step.
     // Snap (newer) wins on equal keys.
@@ -1913,6 +1929,16 @@ pub fn merge_hot_archive_buckets(
                 }
             }
         }
+    }
+
+    // If the merge produced no entries at all (no metaentry because
+    // output_version < V11, and no surviving data entries), collapse to the
+    // canonical empty bucket (hash zero), mirroring stellar-core's
+    // `getBucket` empty-output path (BucketOutputIterator.cpp:182-191) rather
+    // than materializing a zero-entry bucket.
+    if result_entries.is_empty() {
+        tracing::trace!("hot_archive merge: empty result, returning empty bucket");
+        return Ok(HotArchiveBucket::empty());
     }
 
     let result = HotArchiveBucket::from_entries(result_entries)?;
