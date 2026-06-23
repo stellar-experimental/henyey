@@ -1073,6 +1073,36 @@ pub struct SorobanUpgradeConfig {
     pub ledger_max_tx_count: Option<u32>,
     /// `ledgerMaxTransactionsSizeBytes` → `ContractBandwidthV0.ledger_max_txs_size_bytes`.
     pub ledger_max_transactions_size_bytes: Option<u32>,
+
+    // --- Per-transaction limit overrides (the SSC `UpgradeSorobanTxLimits`
+    // mission sends these). Needed so large (e.g. 35 KB) soroban uploads fit
+    // the per-tx limits after the upgrade. Parity:
+    // stellar-core `getConfigUpgradeSetFromLoadConfig`.
+    /// `txMaxInstructions` → `ContractComputeV0.tx_max_instructions`.
+    pub tx_max_instructions: Option<i64>,
+    /// `txMemoryLimit` → `ContractComputeV0.tx_memory_limit`.
+    pub tx_memory_limit: Option<u32>,
+    /// `txMaxReadBytes` → `ContractLedgerCostV0.tx_max_disk_read_bytes`.
+    pub tx_max_read_bytes: Option<u32>,
+    /// `txMaxWriteBytes` → `ContractLedgerCostV0.tx_max_write_bytes`.
+    pub tx_max_write_bytes: Option<u32>,
+    /// `txMaxReadLedgerEntries` → `ContractLedgerCostV0.tx_max_disk_read_entries`.
+    pub tx_max_read_ledger_entries: Option<u32>,
+    /// `txMaxWriteLedgerEntries` → `ContractLedgerCostV0.tx_max_write_ledger_entries`.
+    pub tx_max_write_ledger_entries: Option<u32>,
+    /// `txMaxSizeBytes` → `ContractBandwidthV0.tx_max_size_bytes`.
+    pub tx_max_size_bytes: Option<u32>,
+    /// `txMaxContractEventsSizeBytes` → `ContractEventsV0.tx_max_contract_events_size_bytes`.
+    pub tx_max_contract_events_size_bytes: Option<u32>,
+    /// `maxContractSizeBytes` → `ContractMaxSizeBytes` (the entry value).
+    pub max_contract_size_bytes: Option<u32>,
+    /// `maxContractDataKeySizeBytes` → `ContractDataKeySizeBytes` (the entry value).
+    pub max_contract_data_key_size_bytes: Option<u32>,
+    /// `maxContractDataEntrySizeBytes` → `ContractDataEntrySizeBytes` (the entry value).
+    pub max_contract_data_entry_size_bytes: Option<u32>,
+    /// `txMaxFootprintSize` → `ContractLedgerCostExtV0.tx_max_footprint_entries`
+    /// (conditionally-absent setting; applied only when the live entry exists).
+    pub tx_max_footprint_entries: Option<u32>,
 }
 
 /// Build the serialized `ConfigUpgradeSet` bytes for the `create_upgrade`
@@ -1156,9 +1186,15 @@ pub fn build_config_upgrade_set(
                 // re-emitted entry. Parity: stellar-core
                 // getConfigUpgradeSetFromLoadConfig applies
                 // `upgradeCfg.ledgerMaxInstructions` (TxGenerator.cpp).
-                if let Some(v) = cfg.ledger_max_instructions {
-                    if let ConfigSettingEntry::ContractComputeV0(ref mut c) = entry {
+                if let ConfigSettingEntry::ContractComputeV0(ref mut c) = entry {
+                    if let Some(v) = cfg.ledger_max_instructions {
                         c.ledger_max_instructions = v;
+                    }
+                    if let Some(v) = cfg.tx_max_instructions {
+                        c.tx_max_instructions = v;
+                    }
+                    if let Some(v) = cfg.tx_memory_limit {
+                        c.tx_memory_limit = v;
                     }
                 }
                 true
@@ -1180,6 +1216,19 @@ pub fn build_config_upgrade_set(
                     if let Some(v) = cfg.ledger_max_write_ledger_entries {
                         c.ledger_max_write_ledger_entries = v;
                     }
+                    // Per-tx overrides (UpgradeSorobanTxLimits).
+                    if let Some(v) = cfg.tx_max_read_bytes {
+                        c.tx_max_disk_read_bytes = v;
+                    }
+                    if let Some(v) = cfg.tx_max_write_bytes {
+                        c.tx_max_write_bytes = v;
+                    }
+                    if let Some(v) = cfg.tx_max_read_ledger_entries {
+                        c.tx_max_disk_read_entries = v;
+                    }
+                    if let Some(v) = cfg.tx_max_write_ledger_entries {
+                        c.tx_max_write_ledger_entries = v;
+                    }
                 }
                 true
             }
@@ -1196,9 +1245,48 @@ pub fn build_config_upgrade_set(
             ConfigSettingId::ContractBandwidthV0 => {
                 // ledger_max_txs_size_bytes override (UpgradeSorobanLedgerLimits:
                 // ldgrmxtxsz).
-                if let Some(v) = cfg.ledger_max_transactions_size_bytes {
-                    if let ConfigSettingEntry::ContractBandwidthV0(ref mut b) = entry {
+                if let ConfigSettingEntry::ContractBandwidthV0(ref mut b) = entry {
+                    if let Some(v) = cfg.ledger_max_transactions_size_bytes {
                         b.ledger_max_txs_size_bytes = v;
+                    }
+                    if let Some(v) = cfg.tx_max_size_bytes {
+                        b.tx_max_size_bytes = v;
+                    }
+                }
+                true
+            }
+            ConfigSettingId::ContractEventsV0 => {
+                if let Some(v) = cfg.tx_max_contract_events_size_bytes {
+                    if let ConfigSettingEntry::ContractEventsV0(ref mut e) = entry {
+                        e.tx_max_contract_events_size_bytes = v;
+                    }
+                }
+                true
+            }
+            ConfigSettingId::ContractMaxSizeBytes => {
+                if let Some(v) = cfg.max_contract_size_bytes {
+                    entry = ConfigSettingEntry::ContractMaxSizeBytes(v);
+                }
+                true
+            }
+            ConfigSettingId::ContractDataKeySizeBytes => {
+                if let Some(v) = cfg.max_contract_data_key_size_bytes {
+                    entry = ConfigSettingEntry::ContractDataKeySizeBytes(v);
+                }
+                true
+            }
+            ConfigSettingId::ContractDataEntrySizeBytes => {
+                if let Some(v) = cfg.max_contract_data_entry_size_bytes {
+                    entry = ConfigSettingEntry::ContractDataEntrySizeBytes(v);
+                }
+                true
+            }
+            ConfigSettingId::ContractLedgerCostExtV0 => {
+                // Conditionally-absent: only reached when the live entry exists
+                // (skipped above otherwise). Apply the footprint-size override.
+                if let Some(v) = cfg.tx_max_footprint_entries {
+                    if let ConfigSettingEntry::ContractLedgerCostExtV0(ref mut ext) = entry {
+                        ext.tx_max_footprint_entries = v;
                     }
                 }
                 true

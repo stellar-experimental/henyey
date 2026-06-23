@@ -877,6 +877,18 @@ mod loadgen_runner {
                     ledger_max_write_ledger_entries: request.ledger_max_write_ledger_entries,
                     ledger_max_tx_count: request.ledger_max_tx_count,
                     ledger_max_transactions_size_bytes: request.ledger_max_transactions_size_bytes,
+                    tx_max_instructions: request.tx_max_instructions,
+                    tx_memory_limit: request.tx_memory_limit,
+                    tx_max_read_bytes: request.tx_max_read_bytes,
+                    tx_max_write_bytes: request.tx_max_write_bytes,
+                    tx_max_read_ledger_entries: request.tx_max_read_ledger_entries,
+                    tx_max_write_ledger_entries: request.tx_max_write_ledger_entries,
+                    tx_max_size_bytes: request.tx_max_size_bytes,
+                    tx_max_contract_events_size_bytes: request.tx_max_contract_events_size_bytes,
+                    max_contract_size_bytes: request.max_contract_size_bytes,
+                    max_contract_data_key_size_bytes: request.max_contract_data_key_size_bytes,
+                    max_contract_data_entry_size_bytes: request.max_contract_data_entry_size_bytes,
+                    tx_max_footprint_entries: request.tx_max_footprint_entries,
                     ..Default::default()
                 },
                 ..Default::default()

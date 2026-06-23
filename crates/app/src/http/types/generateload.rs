@@ -85,6 +85,32 @@ pub struct GenerateLoadParams {
     #[serde(default)]
     pub ldgrmxtxsz: Option<u32>,
 
+    /// `create_upgrade` per-tx-limit overrides (UpgradeSorobanTxLimits).
+    #[serde(default)]
+    pub txmxinstrc: Option<i64>,
+    #[serde(default)]
+    pub txmemlim: Option<u32>,
+    #[serde(default)]
+    pub txmxrdbyt: Option<u32>,
+    #[serde(default)]
+    pub txmxwrbyt: Option<u32>,
+    #[serde(default)]
+    pub txmxrdntry: Option<u32>,
+    #[serde(default)]
+    pub txmxwrntry: Option<u32>,
+    #[serde(default)]
+    pub txmxsz: Option<u32>,
+    #[serde(default)]
+    pub txmxevntsz: Option<u32>,
+    #[serde(default)]
+    pub mxcntrctsz: Option<u32>,
+    #[serde(default)]
+    pub mxcntrctkeysz: Option<u32>,
+    #[serde(default)]
+    pub mxcntrctdatasz: Option<u32>,
+    #[serde(default)]
+    pub txmxftprnt: Option<u32>,
+
     // --- Apply-load (`soroban_invoke_apply_load`) params ---
     /// Whether the node is running in overlay-only mode (gate stand-in for
     /// stellar-core's `getRunInOverlayOnlyMode`).

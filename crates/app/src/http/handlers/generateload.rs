@@ -71,6 +71,19 @@ pub struct LoadGenRequest {
     pub ledger_max_write_ledger_entries: Option<u32>,
     pub ledger_max_tx_count: Option<u32>,
     pub ledger_max_transactions_size_bytes: Option<u32>,
+    /// `create_upgrade` per-tx-limit overrides (UpgradeSorobanTxLimits).
+    pub tx_max_instructions: Option<i64>,
+    pub tx_memory_limit: Option<u32>,
+    pub tx_max_read_bytes: Option<u32>,
+    pub tx_max_write_bytes: Option<u32>,
+    pub tx_max_read_ledger_entries: Option<u32>,
+    pub tx_max_write_ledger_entries: Option<u32>,
+    pub tx_max_size_bytes: Option<u32>,
+    pub tx_max_contract_events_size_bytes: Option<u32>,
+    pub max_contract_size_bytes: Option<u32>,
+    pub max_contract_data_key_size_bytes: Option<u32>,
+    pub max_contract_data_entry_size_bytes: Option<u32>,
+    pub tx_max_footprint_entries: Option<u32>,
 }
 
 /// Parse a comma-separated list of `u32` (e.g. `"10,20,30"`), ignoring empty
@@ -135,6 +148,18 @@ impl From<GenerateLoadParams> for LoadGenRequest {
             ledger_max_write_ledger_entries: p.ldgrmxwrntry,
             ledger_max_tx_count: p.ldgrmxtxcnt,
             ledger_max_transactions_size_bytes: p.ldgrmxtxsz,
+            tx_max_instructions: p.txmxinstrc,
+            tx_memory_limit: p.txmemlim,
+            tx_max_read_bytes: p.txmxrdbyt,
+            tx_max_write_bytes: p.txmxwrbyt,
+            tx_max_read_ledger_entries: p.txmxrdntry,
+            tx_max_write_ledger_entries: p.txmxwrntry,
+            tx_max_size_bytes: p.txmxsz,
+            tx_max_contract_events_size_bytes: p.txmxevntsz,
+            max_contract_size_bytes: p.mxcntrctsz,
+            max_contract_data_key_size_bytes: p.mxcntrctkeysz,
+            max_contract_data_entry_size_bytes: p.mxcntrctdatasz,
+            tx_max_footprint_entries: p.txmxftprnt,
         }
     }
 }
