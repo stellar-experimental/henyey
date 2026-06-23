@@ -1624,6 +1624,215 @@ mod tests {
         );
     }
 
+    /// FULL-PATH (#3591): arm a `configupgradesetkey` exactly as #3589 emits
+    /// it (STANDARD-base64 of the `ConfigUpgradeSetKey` XDR), feed it through
+    /// the `/upgrades` arm decode chain into `UpgradeParameters`, build the
+    /// `config_ctx` the herder builds at nomination, and assert it RESOLVES
+    /// (not `None`) and `create_upgrades_for` emits `LedgerUpgrade::Config`.
+    ///
+    /// This proves the resolution machinery works end-to-end when the backing
+    /// `ConfigUpgradeSet` ContractData entry is present + live — written
+    /// EXACTLY as the loadgen create-upgrade tx writes it (loadgen_soroban.rs:
+    /// `content_hash = sha256(upgrade_bytes)`, same contract_id, TEMPORARY
+    /// durability, `get_ledger_key`). The existing unit tests inject the
+    /// `ConfigUpgradeContext` directly and so MISS the armed-base64-key →
+    /// `from_snapshot` resolution path; this test closes that gap.
+    ///
+    /// Not RED on `d6d36001` — the resolution chain is already correct; this
+    /// documents the full-path contract and isolates the SSC failure to a
+    /// timing/visibility sub-cause (entry not committed/visible at nominate,
+    /// TTL/durability) that the new diagnostics surface.
+    #[test]
+    fn test_config_upgrade_resolves_from_armed_base64_key_full_path() {
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        use henyey_common::Hash256;
+        use henyey_ledger::{SnapshotBuilder, SnapshotHandle};
+        use sha2::{Digest, Sha256};
+        use stellar_xdr::*;
+
+        let protocol_version = 25u32;
+        let ledger_seq = 100u32;
+
+        // The proposed upgrade differs from current → upgrade IS needed.
+        let proposed = ConfigSettingEntry::ContractComputeV0(ConfigSettingContractComputeV0 {
+            ledger_max_instructions: 250_000_000, // differs from current
+            tx_max_instructions: 10_000_000,
+            fee_rate_per_instructions_increment: 100,
+            tx_memory_limit: 50_000_000,
+        });
+        let current = ConfigSettingEntry::ContractComputeV0(ConfigSettingContractComputeV0 {
+            ledger_max_instructions: 2_500_000,
+            tx_max_instructions: 10_000_000,
+            fee_rate_per_instructions_increment: 100,
+            tx_memory_limit: 50_000_000,
+        });
+        let upgrade_set = ConfigUpgradeSet {
+            updated_entry: vec![proposed].try_into().unwrap(),
+        };
+
+        // Write the entry the way the loadgen create-upgrade tx writes it:
+        // content_hash = sha256(upgrade_set XDR); TEMPORARY ContractData; key
+        // derived via get_ledger_key (byte-identical to core getLedgerKey).
+        let upgrade_xdr = upgrade_set.to_xdr(Limits::none()).unwrap();
+        let content_hash_bytes: [u8; 32] = Sha256::digest(&upgrade_xdr).into();
+        let contract_id = Hash([1u8; 32]);
+        let key = ConfigUpgradeSetKey {
+            contract_id: ContractId(contract_id.clone()),
+            content_hash: Hash(content_hash_bytes),
+        };
+        let data_key = ConfigUpgradeSetFrame::get_ledger_key(&key);
+        let ttl_key = LedgerKey::Ttl(LedgerKeyTtl {
+            key_hash: Hash(Hash256::hash_xdr(&data_key).0),
+        });
+        let data_entry = LedgerEntry {
+            last_modified_ledger_seq: ledger_seq,
+            data: LedgerEntryData::ContractData(ContractDataEntry {
+                ext: ExtensionPoint::V0,
+                contract: ScAddress::Contract(ContractId(contract_id.clone())),
+                key: ScVal::Bytes(content_hash_bytes.to_vec().try_into().unwrap()),
+                durability: ContractDataDurability::Temporary,
+                val: ScVal::Bytes(upgrade_xdr.try_into().unwrap()),
+            }),
+            ext: LedgerEntryExt::V0,
+        };
+        let ttl_entry = LedgerEntry {
+            last_modified_ledger_seq: ledger_seq,
+            data: LedgerEntryData::Ttl(TtlEntry {
+                key_hash: Hash(Hash256::hash_xdr(&data_key).0),
+                live_until_ledger_seq: ledger_seq + 10_000,
+            }),
+            ext: LedgerEntryExt::V0,
+        };
+        let setting_key = LedgerKey::ConfigSetting(LedgerKeyConfigSetting {
+            config_setting_id: current.discriminant(),
+        });
+        let setting_entry = LedgerEntry {
+            last_modified_ledger_seq: ledger_seq,
+            data: LedgerEntryData::ConfigSetting(current.clone()),
+            ext: LedgerEntryExt::V0,
+        };
+        let header = LedgerHeader {
+            ledger_version: protocol_version,
+            ledger_seq,
+            base_fee: 100,
+            base_reserve: 5_000_000,
+            max_tx_set_size: 1000,
+            total_coins: 100_000_000_000_000_000,
+            ..Default::default()
+        };
+        let snapshot = SnapshotBuilder::new(ledger_seq)
+            .with_header(header, Hash256::ZERO)
+            .add_entry(data_key, data_entry)
+            .add_entry(ttl_key, ttl_entry)
+            .add_entry(setting_key, setting_entry)
+            .build()
+            .unwrap();
+        let handle = SnapshotHandle::new(snapshot);
+
+        // Arm the SAME way the `/upgrades` handler does: the wire string #3589
+        // emits is STANDARD-base64 of the ConfigUpgradeSetKey XDR. Decode it
+        // back through the handler's exact chain into UpgradeParameters.
+        let wire_b64 = STANDARD.encode(key.to_xdr(Limits::none()).unwrap());
+        let decoded_bytes = STANDARD.decode(&wire_b64).expect("base64 decode");
+        let decoded_key =
+            ConfigUpgradeSetKey::from_xdr(&decoded_bytes, Limits::none()).expect("xdr decode");
+        let mut params = UpgradeParameters::new(1000);
+        params.config_upgrade_set_key = Some(ConfigUpgradeSetKeyJson::from_xdr(&decoded_key));
+
+        // Build config_ctx the way the herder does at nomination
+        // (herder.rs:3612 — to_xdr() then from_snapshot()).
+        let nomination_key = params
+            .config_upgrade_set_key
+            .as_ref()
+            .unwrap()
+            .to_xdr()
+            .expect("stored key round-trips to XDR");
+        let config_ctx = ConfigUpgradeContext::from_snapshot(&handle, &nomination_key)
+            .expect("from_snapshot must not error on a live entry")
+            .expect("from_snapshot must RESOLVE the armed key (not None)");
+
+        // create_upgrades_for must emit LedgerUpgrade::Config for the key.
+        let upgrades = Upgrades::new(params);
+        let proposals = upgrades
+            .create_upgrades_for(
+                &CurrentLedgerState {
+                    close_time: 1000,
+                    protocol_version,
+                    base_fee: 100,
+                    max_tx_set_size: 1000,
+                    base_reserve: 5_000_000,
+                    flags: 0,
+                    max_soroban_tx_set_size: None,
+                },
+                Some(&config_ctx),
+            )
+            .unwrap();
+        assert_eq!(
+            proposals.len(),
+            1,
+            "expected one Config upgrade: {proposals:?}"
+        );
+        match &proposals[0] {
+            LedgerUpgrade::Config(emitted) => {
+                assert_eq!(*emitted, key, "emitted Config key must equal the armed key");
+            }
+            other => panic!("expected LedgerUpgrade::Config, got {other:?}"),
+        }
+    }
+
+    /// NEGATIVE (#3591): a truly-absent entry → `from_snapshot` returns
+    /// `Ok(None)` → `config_ctx` is `None` → `create_upgrades_for` safely
+    /// SKIPS the Config upgrade (core-faithful: an unresolved key is silently
+    /// not proposed, never a panic/error).
+    #[test]
+    fn test_config_upgrade_absent_entry_resolves_none_and_skips() {
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        use henyey_ledger::{LedgerSnapshot, SnapshotHandle};
+        use stellar_xdr::*;
+
+        let key = ConfigUpgradeSetKey {
+            contract_id: ContractId(Hash([7u8; 32])),
+            content_hash: Hash([9u8; 32]),
+        };
+
+        // Empty snapshot — the entry is genuinely absent.
+        let handle = SnapshotHandle::new(LedgerSnapshot::empty(100));
+
+        let config_ctx = ConfigUpgradeContext::from_snapshot(&handle, &key)
+            .expect("from_snapshot must not error on an absent entry");
+        assert!(
+            config_ctx.is_none(),
+            "absent entry must resolve to None (Ok(None))"
+        );
+
+        let mut params = UpgradeParameters::new(1000);
+        params.config_upgrade_set_key = Some(ConfigUpgradeSetKeyJson {
+            contract_id: STANDARD.encode(key.contract_id.0 .0),
+            content_hash: STANDARD.encode(key.content_hash.0),
+        });
+        let upgrades = Upgrades::new(params);
+        let proposals = upgrades
+            .create_upgrades_for(
+                &CurrentLedgerState {
+                    close_time: 1000,
+                    protocol_version: 25,
+                    base_fee: 100,
+                    max_tx_set_size: 1000,
+                    base_reserve: 5_000_000,
+                    flags: 0,
+                    max_soroban_tx_set_size: None,
+                },
+                config_ctx.as_ref(),
+            )
+            .unwrap();
+        assert!(
+            !proposals
+                .iter()
+                .any(|u| matches!(u, LedgerUpgrade::Config(_))),
+            "absent entry must NOT emit a Config upgrade: {proposals:?}"
+        );
+    }
+
     // ── #3300: per-variant scheduling → nomination validation ───────────
     //
     // Validates the real `create_upgrades_for` (nomination emitter) and
