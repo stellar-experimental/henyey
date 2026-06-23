@@ -18,9 +18,7 @@ use crate::app::AppState;
 use henyey_ledger::SorobanNetworkInfo;
 
 use crate::compat_http::CompatServerState;
-use crate::http::types::{
-    CompatSorobanInfoResponse, ConnectParams, DropPeerParams, SorobanInfoResponse, UnbanParams,
-};
+use crate::http::types::{ConnectParams, DropPeerParams, SorobanInfoResponse, UnbanParams};
 
 // ── Admin endpoints (plain text) ─────────────────────────────────────────
 
@@ -423,14 +421,17 @@ pub(crate) async fn compat_dumpproposedsettings_handler(
 
 /// GET /sorobaninfo
 ///
-/// Returns the stellar-rpc compat shape: a flattened **subset** of the
-/// native `/sorobaninfo` basic format wrapped under `{"info": ...}`.
+/// Matches stellar-core's `CommandHandler::sorobanInfo` exactly: a TOP-LEVEL
+/// object (no `info` wrapper) with nested `ledger`/`tx`/`state_archival`/`scp`
+/// sub-objects and flat `fee_*`/`max_contract_*`/`max_dependent_tx_clusters`
+/// scalars. supercluster's `GetSorobanInfo()` reads `.Ledger.MaxInstructions`,
+/// `.Tx.*`, `.Scp.*` at the JSON root, so any wrapper makes its JsonProvider
+/// raise `Property 'ledger' not found at ''` (#3578).
 ///
-/// All field projection — including the protocol-23 gating — flows through
-/// [`SorobanInfoResponse::from_network_info`]. The compat handler reshapes
-/// that result via [`CompatSorobanInfoResponse::from`], which is a pure
-/// data shuffle with no protocol logic. This guarantees the two handlers
-/// cannot drift on shared fields or the protocol-23 gate.
+/// The body reuses the parity-verified native projection
+/// [`SorobanInfoResponse::from_network_info`] verbatim — the same shape the
+/// native `/sorobaninfo` handler ships — so the two handlers cannot drift and
+/// the protocol-23 gate lives in exactly one place.
 pub(crate) async fn compat_sorobaninfo_handler(
     State(state): State<Arc<CompatServerState>>,
 ) -> impl IntoResponse {
@@ -446,11 +447,12 @@ pub(crate) async fn compat_sorobaninfo_handler(
 /// Build the `/sorobaninfo` compat JSON body from a live `SorobanNetworkInfo`.
 ///
 /// Pure (no `App`/state) so it is directly unit-testable. The body is the
-/// exact bytes the handler returns for the `Some` branch.
+/// exact bytes the handler returns for the `Some` branch: the native
+/// `SorobanInfoResponse` serialized directly (stellar-core's top-level
+/// nested shape, no `info` wrapper).
 fn compat_sorobaninfo_body(info: &SorobanNetworkInfo, protocol_version: u32) -> serde_json::Value {
     let native = SorobanInfoResponse::from_network_info(info, protocol_version);
-    let compat = CompatSorobanInfoResponse::from(&native);
-    serde_json::json!({ "info": compat })
+    serde_json::to_value(native).expect("SorobanInfoResponse always serializes")
 }
 
 // ── Survey endpoints (stellar-core URL paths) ───────────────────────────

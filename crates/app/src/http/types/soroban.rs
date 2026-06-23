@@ -1,9 +1,10 @@
 //! Types for Soroban-related endpoints.
 //!
 //! `SorobanInfoResponse` is the single source of truth for projecting
-//! [`henyey_ledger::SorobanNetworkInfo`] into JSON. The native handler
-//! ([`crate::http::handlers::soroban::sorobaninfo_handler`]) serializes it
-//! directly; the compat handler reshapes it via [`CompatSorobanInfoResponse`].
+//! [`henyey_ledger::SorobanNetworkInfo`] into JSON. Both the native handler
+//! ([`crate::http::handlers::soroban::sorobaninfo_handler`]) and the compat
+//! `/sorobaninfo` handler serialize it directly — the same stellar-core
+//! top-level nested shape, no wrapper.
 //!
 //! Protocol-23 gating lives in exactly one place —
 //! [`SorobanInfoResponse::from_network_info`] — and
@@ -112,11 +113,10 @@ impl SorobanInfoResponse {
     /// response.
     ///
     /// This is the **single read of `SorobanNetworkInfo`**. Both the native
-    /// handler and the compat handler must funnel through this constructor;
-    /// the compat handler then reshapes the result via
-    /// [`CompatSorobanInfoResponse::from`]. Centralizing the projection here
-    /// — and encoding the protocol-23 gating as `Some`/`None` on the
-    /// optional fields — makes cross-handler drift on shared fields and the
+    /// handler and the compat handler funnel through this constructor and
+    /// serialize the result directly. Centralizing the projection here — and
+    /// encoding the protocol-23 gating as `Some`/`None` on the optional
+    /// fields — makes cross-handler drift on shared fields and the
     /// protocol-23 gate structurally impossible.
     pub(crate) fn from_network_info(info: &SorobanNetworkInfo, protocol_version: u32) -> Self {
         let p23_or_later = protocol_version >= 23;
@@ -177,74 +177,6 @@ impl SorobanInfoResponse {
                 ballot_timeout_ms: info.ballot_timeout_initial_ms,
                 ballot_timeout_inc_ms: info.ballot_timeout_increment_ms,
             }),
-        }
-    }
-}
-
-/// Compat (stellar-rpc) `/sorobaninfo` response body.
-///
-/// This is a deliberate flattened **subset** of [`SorobanInfoResponse`] —
-/// the shape stellar-rpc consumes. It's wrapped under `{"info": ...}` by
-/// the compat handler.
-///
-/// `serde(skip_serializing_if = "Option::is_none")` on the protocol-23
-/// fields means omission is a property of the type, not a runtime
-/// conditional in the handler. The conversion
-/// `From<&SorobanInfoResponse>` is a pure data shuffle — no protocol-23
-/// logic — so the gate exists in exactly one place
-/// ([`SorobanInfoResponse::from_network_info`]) and cannot drift.
-///
-/// New fields added to `SorobanNetworkInfo` flow into the native response
-/// automatically, but appearing in compat is an explicit choice: it
-/// requires adding a field here and a line in the `From` impl. This is by
-/// design — compat is a deliberate subset of native, not an automatic
-/// mirror.
-#[derive(Serialize)]
-pub(crate) struct CompatSorobanInfoResponse {
-    pub ledger_max_instructions: i64,
-    pub tx_max_instructions: i64,
-    pub tx_memory_limit: u32,
-    pub ledger_max_read_ledger_entries: u32,
-    pub ledger_max_read_bytes: u32,
-    pub ledger_max_write_ledger_entries: u32,
-    pub ledger_max_write_bytes: u32,
-    pub ledger_max_tx_count: u32,
-    pub tx_max_size_bytes: u32,
-    pub average_bucket_list_size: u64,
-    pub bucket_list_size_snapshot_period: u32,
-    /// Protocol 23+: maximum dependent TX clusters per parallel stage.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub max_dependent_tx_clusters: Option<u32>,
-    /// Protocol 23+: maximum footprint entries per transaction.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub max_footprint_size: Option<u32>,
-    /// Protocol 23+: SCP timing settings.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub scp: Option<SorobanScpSettings>,
-}
-
-impl From<&SorobanInfoResponse> for CompatSorobanInfoResponse {
-    /// Pure data-shuffling conversion — no protocol-23 logic.
-    ///
-    /// Protocol-23 omission has already been encoded as `None` in
-    /// `SorobanInfoResponse` by [`SorobanInfoResponse::from_network_info`],
-    /// so this conversion just propagates the optionality.
-    fn from(r: &SorobanInfoResponse) -> Self {
-        Self {
-            ledger_max_instructions: r.ledger.max_instructions,
-            tx_max_instructions: r.tx.max_instructions,
-            tx_memory_limit: r.tx.memory_limit,
-            ledger_max_read_ledger_entries: r.ledger.max_read_ledger_entries,
-            ledger_max_read_bytes: r.ledger.max_read_bytes,
-            ledger_max_write_ledger_entries: r.ledger.max_write_ledger_entries,
-            ledger_max_write_bytes: r.ledger.max_write_bytes,
-            ledger_max_tx_count: r.ledger.max_tx_count,
-            tx_max_size_bytes: r.tx.max_size_bytes,
-            average_bucket_list_size: r.state_archival.average_bucket_list_size,
-            bucket_list_size_snapshot_period: r.state_archival.bucket_list_size_snapshot_period,
-            max_dependent_tx_clusters: r.max_dependent_tx_clusters,
-            max_footprint_size: r.tx.max_footprint_size,
-            scp: r.scp.clone(),
         }
     }
 }
@@ -430,7 +362,7 @@ mod tests {
         );
     }
 
-    // ── from_network_info / CompatSorobanInfoResponse tests ─────────────────
+    // ── from_network_info tests ─────────────────────────────────────────────
 
     /// Build a `SorobanNetworkInfo` with sentinel values that make
     /// field-swap regressions easy to spot. Each field gets a distinct
@@ -581,173 +513,5 @@ mod tests {
         assert_eq!(scp.nomination_timeout_inc_ms, 181);
         assert_eq!(scp.ballot_timeout_ms, 191);
         assert_eq!(scp.ballot_timeout_inc_ms, 193);
-    }
-
-    /// Verify the conversion from `SorobanInfoResponse` to the compat
-    /// shape pulls every field from the right nested path.
-    #[test]
-    fn test_compat_from_response_basic_shape() {
-        let info = sentinel_network_info();
-        let native = SorobanInfoResponse::from_network_info(&info, 23);
-        let compat = CompatSorobanInfoResponse::from(&native);
-
-        assert_eq!(
-            compat.ledger_max_instructions,
-            native.ledger.max_instructions
-        );
-        assert_eq!(compat.tx_max_instructions, native.tx.max_instructions);
-        assert_eq!(compat.tx_memory_limit, native.tx.memory_limit);
-        assert_eq!(
-            compat.ledger_max_read_ledger_entries,
-            native.ledger.max_read_ledger_entries
-        );
-        assert_eq!(compat.ledger_max_read_bytes, native.ledger.max_read_bytes);
-        assert_eq!(
-            compat.ledger_max_write_ledger_entries,
-            native.ledger.max_write_ledger_entries
-        );
-        assert_eq!(compat.ledger_max_write_bytes, native.ledger.max_write_bytes);
-        assert_eq!(compat.ledger_max_tx_count, native.ledger.max_tx_count);
-        assert_eq!(compat.tx_max_size_bytes, native.tx.max_size_bytes);
-        assert_eq!(
-            compat.average_bucket_list_size,
-            native.state_archival.average_bucket_list_size
-        );
-        assert_eq!(
-            compat.bucket_list_size_snapshot_period,
-            native.state_archival.bucket_list_size_snapshot_period
-        );
-        assert_eq!(
-            compat.max_dependent_tx_clusters,
-            native.max_dependent_tx_clusters
-        );
-        assert_eq!(compat.max_footprint_size, native.tx.max_footprint_size);
-        assert_eq!(
-            compat.scp.as_ref().map(|s| s.ledger_close_time_ms),
-            native.scp.as_ref().map(|s| s.ledger_close_time_ms)
-        );
-    }
-
-    /// `serde(skip_serializing_if)` must omit P23 fields when None and
-    /// emit them when Some.
-    #[test]
-    fn test_compat_serializes_with_p23_omission() {
-        // Pre-P23: all three optionals absent.
-        let info = sentinel_network_info();
-        let native = SorobanInfoResponse::from_network_info(&info, 22);
-        let compat = CompatSorobanInfoResponse::from(&native);
-        let json = serde_json::to_value(&compat).unwrap();
-
-        let obj = json.as_object().expect("compat must serialize as object");
-        assert!(!obj.contains_key("scp"), "scp must be absent pre-P23");
-        assert!(
-            !obj.contains_key("max_dependent_tx_clusters"),
-            "max_dependent_tx_clusters must be absent pre-P23"
-        );
-        assert!(
-            !obj.contains_key("max_footprint_size"),
-            "max_footprint_size must be absent pre-P23"
-        );
-
-        // P23+: all three present with correct values.
-        let native = SorobanInfoResponse::from_network_info(&info, 23);
-        let compat = CompatSorobanInfoResponse::from(&native);
-        let json = serde_json::to_value(&compat).unwrap();
-        assert_eq!(json["max_dependent_tx_clusters"], 199);
-        assert_eq!(json["max_footprint_size"], 211);
-        let scp = json["scp"]
-            .as_object()
-            .expect("scp must be present at P23+");
-        for key in [
-            "ledger_close_time_ms",
-            "nomination_timeout_ms",
-            "nomination_timeout_inc_ms",
-            "ballot_timeout_ms",
-            "ballot_timeout_inc_ms",
-        ] {
-            assert!(scp.contains_key(key), "compat scp missing key: {key}");
-        }
-        assert_eq!(scp.len(), 5, "unexpected extra SCP fields in compat");
-    }
-
-    /// Structural assertion: every key in the compat JSON corresponds to
-    /// the right nested path in the native JSON. This is the regression
-    /// test that #2020 needed — it locks in "compat is a strict (flattened)
-    /// subset of native" and any future drift fails the test.
-    #[test]
-    fn test_compat_is_strict_projection_of_native() {
-        let info = sentinel_network_info();
-        for protocol_version in [22u32, 23] {
-            let native_struct = SorobanInfoResponse::from_network_info(&info, protocol_version);
-            let compat_struct = CompatSorobanInfoResponse::from(&native_struct);
-            let native = serde_json::to_value(&native_struct).unwrap();
-            let compat = serde_json::to_value(&compat_struct).unwrap();
-
-            // Map: compat key -> native JSON path. This is the contract.
-            // If a key appears in compat, its value MUST equal the value at
-            // the listed native path.
-            let mappings: &[(&str, &[&str])] = &[
-                ("ledger_max_instructions", &["ledger", "max_instructions"]),
-                ("tx_max_instructions", &["tx", "max_instructions"]),
-                ("tx_memory_limit", &["tx", "memory_limit"]),
-                (
-                    "ledger_max_read_ledger_entries",
-                    &["ledger", "max_read_ledger_entries"],
-                ),
-                ("ledger_max_read_bytes", &["ledger", "max_read_bytes"]),
-                (
-                    "ledger_max_write_ledger_entries",
-                    &["ledger", "max_write_ledger_entries"],
-                ),
-                ("ledger_max_write_bytes", &["ledger", "max_write_bytes"]),
-                ("ledger_max_tx_count", &["ledger", "max_tx_count"]),
-                ("tx_max_size_bytes", &["tx", "max_size_bytes"]),
-                (
-                    "average_bucket_list_size",
-                    &["state_archival", "average_bucket_list_size"],
-                ),
-                (
-                    "bucket_list_size_snapshot_period",
-                    &["state_archival", "bucket_list_size_snapshot_period"],
-                ),
-                ("max_dependent_tx_clusters", &["max_dependent_tx_clusters"]),
-                ("max_footprint_size", &["tx", "max_footprint_size"]),
-                ("scp", &["scp"]),
-            ];
-
-            // Sanity: compat must not contain any unmapped keys. If this
-            // fails, someone added a field to CompatSorobanInfoResponse
-            // without updating this contract — and that's exactly the kind
-            // of drift this test guards against.
-            let compat_obj = compat.as_object().expect("compat must be object");
-            for key in compat_obj.keys() {
-                assert!(
-                    mappings.iter().any(|(k, _)| k == key),
-                    "compat key {key:?} missing from compat→native mapping \
-                     (P{protocol_version}). Add it to `mappings` if intentional."
-                );
-            }
-
-            // For every present compat key, value must match native path.
-            for (compat_key, native_path) in mappings {
-                let Some(compat_val) = compat_obj.get(*compat_key) else {
-                    // P22 omits the three protocol-23 fields; that's fine.
-                    continue;
-                };
-                let mut native_val = &native;
-                for seg in *native_path {
-                    native_val = native_val.get(*seg).unwrap_or_else(|| {
-                        panic!(
-                            "native path {native_path:?} missing at P{protocol_version} \
-                             — required by compat key {compat_key:?}"
-                        )
-                    });
-                }
-                assert_eq!(
-                    compat_val, native_val,
-                    "compat[{compat_key:?}] != native{native_path:?} at P{protocol_version}"
-                );
-            }
-        }
     }
 }
