@@ -187,6 +187,48 @@ test_workflow_shard_probe_contract() {
         tap_not_ok "workflow_has_testnet_core_horizon_shard" "testnet core,horizon shard not found"
     fi
 
+    # Check: local/galexie shard is soft-degated (#3563). The pinned galexie
+    # image (galexie-v26.1.0) never exports a partition against henyey
+    # Protocol 27, so test_galexie.go hangs forever and the shard times out
+    # (exit 124). The shard must mirror the testnet shard's de-gate so a
+    # TIMEOUT (exit 124/137) becomes a neutral SOFT-SKIP (exit 0) while a
+    # genuine assertion failure (exit 1) stays RED — and fast-fails in
+    # minutes (probe_timeout: 240 + step_timeout_minutes: 25) so the PR's own
+    # CI can never reproduce the ~55-min hang. This text assertion guards
+    # against a future edit silently dropping any of the three keys (which
+    # would re-red-roll `main` on the same incompat — tracked in #3565).
+    # Locate the `enable: galexie` matrix entry, then assert the three keys
+    # appear within the entry's block (the next ~6 lines, before the next
+    # matrix `- network:` entry).
+    local galexie_line
+    galexie_line=$(grep -n 'enable: galexie$' "$WORKFLOW" | head -1 | cut -d: -f1)
+    if [[ -n "$galexie_line" ]]; then
+        local galexie_block
+        galexie_block=$(sed -n "$((galexie_line)),+6p" "$WORKFLOW")
+        if echo "$galexie_block" | grep -q 'soft_on_timeout:[[:space:]]*true'; then
+            tap_ok "local_galexie_shard_soft_on_timeout"
+        else
+            tap_not_ok "local_galexie_shard_soft_on_timeout" \
+                "local/galexie matrix entry missing soft_on_timeout: true (#3563 de-gate)"
+        fi
+        if echo "$galexie_block" | grep -q 'probe_timeout:[[:space:]]*240'; then
+            tap_ok "local_galexie_shard_probe_timeout_240"
+        else
+            tap_not_ok "local_galexie_shard_probe_timeout_240" \
+                "local/galexie matrix entry missing probe_timeout: 240 (fast-fail in minutes)"
+        fi
+        if echo "$galexie_block" | grep -q 'step_timeout_minutes:[[:space:]]*25'; then
+            tap_ok "local_galexie_shard_step_timeout_minutes_25"
+        else
+            tap_not_ok "local_galexie_shard_step_timeout_minutes_25" \
+                "local/galexie matrix entry missing step_timeout_minutes: 25 (step-level fast-fail)"
+        fi
+    else
+        tap_not_ok "local_galexie_shard_soft_on_timeout" "no local/galexie shard found"
+        tap_not_ok "local_galexie_shard_probe_timeout_240" "no local/galexie shard found"
+        tap_not_ok "local_galexie_shard_step_timeout_minutes_25" "no local/galexie shard found"
+    fi
+
     # Check: artifact name includes .tar suffix (upstream contract)
     if grep -q 'image-quickstart-testing-with-pr-amd64\.tar' "$WORKFLOW"; then
         tap_ok "workflow_artifact_name_matches_upstream"
@@ -325,6 +367,66 @@ test_non_targeted_timeout_no_retry() {
         tap_ok "non_targeted_timeout_single_attempt"
     else
         tap_not_ok "non_targeted_timeout_single_attempt" "unexpected retry on non-targeted shard"
+    fi
+}
+
+# ============================================================
+# Test 5b: test_local_galexie_soft_skip_is_timeout_only (#3563)
+#
+# The local/galexie shard is soft-degated (soft_on_timeout: true) because the
+# pinned galexie image never exports a partition against henyey Protocol 27,
+# so test_galexie.go hangs and the shard times out (exit 124/137). Assert the
+# wrapper, when invoked with --soft-on-timeout on the local/galexie shard:
+#   (a) converts a TIMEOUT (exit 124) into a neutral soft-skip (exit 0) with a
+#       grep-able SOFT-SKIP marker, AND
+#   (b) keeps a GENUINE probe assertion failure (exit 1) RED (exit 1) — so a
+#       real henyey-emits-bad-meta break (galexie crash / probe assertion) is
+#       never masked by the de-gate.
+# This is the deterministic counterpart to the live Quickstart run: it proves
+# the soft-skip is TIMEOUT-ONLY for the exact local/galexie invocation.
+# (local/galexie is NOT a retryable shard, so the soft-skip fires on the
+# first-attempt non-retryable timeout sink — single attempt, no retry.)
+# ============================================================
+test_local_galexie_soft_skip_timeout_only() {
+    local diag_dir="$TMPDIR_BASE/diag-test5b"
+    mkdir -p "$diag_dir"
+
+    # (a) A probe that always times out, soft-skipped to exit 0 under the flag.
+    local timeout_probe
+    timeout_probe=$(make_probe "test5b-timeout" 0 999)
+    local soft_marker="$diag_dir/soft.log"
+    local exit_code=0
+    "$WRAPPER" --soft-on-timeout \
+        --network local --enable galexie --probe galexie \
+        --timeout 2 --diagnostics-dir "$diag_dir/timeout" \
+        -- "$timeout_probe" >"$soft_marker" 2>&1 || exit_code=$?
+
+    if [[ $exit_code -eq 0 ]]; then
+        tap_ok "local_galexie_timeout_soft_skips_to_zero"
+    else
+        tap_not_ok "local_galexie_timeout_soft_skips_to_zero" \
+            "expected soft-skip exit 0 on timeout, got $exit_code"
+    fi
+    if grep -q 'SOFT-SKIP' "$soft_marker"; then
+        tap_ok "local_galexie_timeout_emits_soft_skip_marker"
+    else
+        tap_not_ok "local_galexie_timeout_emits_soft_skip_marker" "no SOFT-SKIP marker emitted"
+    fi
+
+    # (b) A genuine assertion failure (exit 1) STAYS RED even under the flag.
+    local fail_probe
+    fail_probe=$(make_probe "test5b-fail" 1 0)
+    local fail_exit=0
+    "$WRAPPER" --soft-on-timeout \
+        --network local --enable galexie --probe galexie \
+        --timeout 10 --diagnostics-dir "$diag_dir/fail" \
+        -- "$fail_probe" >/dev/null 2>&1 || fail_exit=$?
+
+    if [[ $fail_exit -eq 1 ]]; then
+        tap_ok "local_galexie_assertion_failure_stays_red"
+    else
+        tap_not_ok "local_galexie_assertion_failure_stays_red" \
+            "expected exit 1 to stay red under --soft-on-timeout, got $fail_exit"
     fi
 }
 
@@ -1428,24 +1530,29 @@ test_workflow_testnet_shard_uses_soft_timeout_and_tight_budget() {
             "probe loop must pass --soft-on-timeout gated on the matrix soft_on_timeout value"
     fi
 
-    # Scope guard: pubnet/local shard blocks must NOT carry soft_on_timeout: true.
-    # Match only the real YAML matrix KEY (an actual `soft_on_timeout: true`
-    # line), not prose inside a `#` comment that happens to mention the flag —
-    # so strip comment lines before grepping. The testnet entry's documentation
-    # comment block precedes `- network: testnet`, so without this filter its
-    # prose would be miscounted against the local shards.
-    local pubnet_block local_blocks
+    # Scope guard: pubnet and the NON-galexie local shards must NOT carry
+    # soft_on_timeout: true. soft_on_timeout is scoped to exactly two shards —
+    # testnet/core,horizon (#3272 external-liveness flake) and local/galexie
+    # (#3563 galexie-image / Protocol-27 export incompat) — and must never
+    # broadcast to the henyey-correctness-bearing local shards (core, rpc,
+    # core,rpc,horizon) or pubnet. Match only the real YAML matrix KEY (an
+    # actual `soft_on_timeout: true` line), not prose inside a `#` comment that
+    # mentions the flag — so strip comment lines before grepping.
+    local pubnet_block non_galexie_local_blocks
     pubnet_block=$(awk '/network: pubnet/{f=1} f{print}' "$WORKFLOW" \
         | awk '/^    steps:/{exit} {print}' | grep -vE '^[[:space:]]*#')
-    # Local blocks: everything from the first matrix include up to the testnet entry.
-    local_blocks=$(awk '/include:/{f=1} f && /network: testnet/{exit} f{print}' "$WORKFLOW" \
-        | grep -vE '^[[:space:]]*#')
+    # Non-galexie local blocks: from the first matrix include up to the testnet
+    # entry, with the `enable: galexie` block (the line itself + its 3 override
+    # keys) removed so the intentional #3563 de-gate doesn't trip this guard.
+    non_galexie_local_blocks=$(awk '/include:/{f=1} f && /network: testnet/{exit} f{print}' "$WORKFLOW" \
+        | grep -vE '^[[:space:]]*#' \
+        | awk '/enable: galexie$/{skip=1} skip && /network:/ && !/enable: galexie$/{skip=0} !skip{print}')
     if ! echo "$pubnet_block" | grep -qE 'soft_on_timeout:[[:space:]]*true' \
-        && ! echo "$local_blocks" | grep -qE 'soft_on_timeout:[[:space:]]*true'; then
-        tap_ok "workflow_pubnet_local_shards_have_no_soft_flag"
+        && ! echo "$non_galexie_local_blocks" | grep -qE 'soft_on_timeout:[[:space:]]*true'; then
+        tap_ok "workflow_pubnet_nongalexie_local_shards_have_no_soft_flag"
     else
-        tap_not_ok "workflow_pubnet_local_shards_have_no_soft_flag" \
-            "soft_on_timeout must be scoped to the testnet shard only (found on pubnet/local)"
+        tap_not_ok "workflow_pubnet_nongalexie_local_shards_have_no_soft_flag" \
+            "soft_on_timeout must be scoped to testnet + local/galexie only (found on pubnet or a non-galexie local shard)"
     fi
 }
 
@@ -1685,27 +1792,43 @@ test_testnet_shard_renders_step_timeout_25_others_360() {
             "expected 25, got '$testnet_val' (renderer err: $(tr '\n' ' ' < "$TMPDIR_BASE/render-test29.err"))"
     fi
 
-    # (b) Every non-testnet shard renders the generous default (360). A shard
-    # that silently picked up a tight bound (or a default drift) turns this red.
-    local non_testnet_bad
-    non_testnet_bad=$( (echo "$rendered" | grep -vE '^testnet\|' || true) \
-        | awk -F'|' '$3 != "360" {print}' )
-    if [[ -z "$non_testnet_bad" && -n "$rendered" ]]; then
-        tap_ok "non_testnet_shards_render_generous_default_360"
+    # (a2) The local/galexie shard also renders exactly 25 (#3563 soft-degate:
+    # it carries step_timeout_minutes: 25 to fast-fail into the soft-skip in
+    # minutes, mirroring the testnet shard — see the galexie matrix comment).
+    local galexie_val
+    galexie_val=$( (echo "$rendered" | grep -E '^local\|galexie\|' || true) \
+        | head -1 | awk -F'|' '{print $3}')
+    if [[ "$galexie_val" == "25" ]]; then
+        tap_ok "local_galexie_shard_renders_step_timeout_25"
     else
-        tap_not_ok "non_testnet_shards_render_generous_default_360" \
-            "non-testnet shard(s) not at 360: ${non_testnet_bad:-<no shards rendered>}"
+        tap_not_ok "local_galexie_shard_renders_step_timeout_25" \
+            "expected 25, got '$galexie_val' (renderer err: $(tr '\n' ' ' < "$TMPDIR_BASE/render-test29.err"))"
     fi
 
-    # (c) Exactly one shard carries the tight (< 360) step timeout — the
-    # diagnostic bound must be surgically scoped, never broadcast.
+    # (b) Every OTHER shard (not testnet, not local/galexie) renders the
+    # generous default (360). A shard that silently picked up a tight bound (or
+    # a default drift) turns this red. testnet/core,horizon (#3286) and
+    # local/galexie (#3563) are the only two intentionally-tight shards.
+    local other_bad
+    other_bad=$( (echo "$rendered" | grep -vE '^testnet\||^local\|galexie\|' || true) \
+        | awk -F'|' '$3 != "360" {print}' )
+    if [[ -z "$other_bad" && -n "$rendered" ]]; then
+        tap_ok "other_shards_render_generous_default_360"
+    else
+        tap_not_ok "other_shards_render_generous_default_360" \
+            "non-tight shard(s) not at 360: ${other_bad:-<no shards rendered>}"
+    fi
+
+    # (c) Exactly two shards carry the tight (< 360) step timeout — testnet
+    # (#3286 diagnostic bound) and local/galexie (#3563 soft-degate). The tight
+    # bound must stay surgically scoped to these two, never broadcast.
     local tight_count
     tight_count=$( (echo "$rendered" || true) | awk -F'|' '$3 != "" && $3 + 0 < 360 {c++} END{print c+0}')
-    if [[ "$tight_count" == "1" ]]; then
-        tap_ok "exactly_one_shard_carries_tight_step_timeout"
+    if [[ "$tight_count" == "2" ]]; then
+        tap_ok "exactly_two_shards_carry_tight_step_timeout"
     else
-        tap_not_ok "exactly_one_shard_carries_tight_step_timeout" \
-            "expected exactly 1 shard with timeout-minutes < 360, got $tight_count"
+        tap_not_ok "exactly_two_shards_carry_tight_step_timeout" \
+            "expected exactly 2 shards (testnet + local/galexie) with timeout-minutes < 360, got $tight_count"
     fi
 }
 
@@ -1832,13 +1955,14 @@ EOF
 }
 
 # --- Run all tests ---
-tap_plan 94
+tap_plan 101
 
 test_timeout_retry_on_targeted_shard
 test_non_timeout_failure_no_retry
 test_workflow_shard_probe_contract
 test_double_timeout_fails
 test_non_targeted_timeout_no_retry
+test_local_galexie_soft_skip_timeout_only
 test_success_no_retry_artifacts
 test_upstream_contract_validation
 test_workflow_uses_upstream_run_attempt_timeout_budget
