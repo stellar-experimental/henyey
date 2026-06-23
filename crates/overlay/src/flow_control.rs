@@ -554,6 +554,12 @@ pub struct FlowControl {
     pub(crate) dropped_adverts: AtomicU64,
     /// Metrics - messages dropped from demand queue.
     pub(crate) dropped_demands: AtomicU64,
+    /// #3570 observability: monotonic count of SEND_MORE_EXTENDED grants
+    /// received from the peer. A value of 0 on an idle-dropped inbound peer is
+    /// the leading-hypothesis signal — the peer never granted us outbound
+    /// capacity, so we could not flood SCP to it and it idled out. Purely a
+    /// diagnostic counter; does not affect any flow-control decision.
+    pub(crate) send_more_received_count: AtomicU64,
 }
 
 impl FlowControl {
@@ -598,6 +604,7 @@ impl FlowControl {
             dropped_txs: AtomicU64::new(0),
             dropped_adverts: AtomicU64::new(0),
             dropped_demands: AtomicU64::new(0),
+            send_more_received_count: AtomicU64::new(0),
         }
     }
 
@@ -631,6 +638,7 @@ impl FlowControl {
             dropped_txs: AtomicU64::new(0),
             dropped_adverts: AtomicU64::new(0),
             dropped_demands: AtomicU64::new(0),
+            send_more_received_count: AtomicU64::new(0),
         }
     }
 
@@ -690,6 +698,12 @@ impl FlowControl {
     /// Release outbound capacity when receiving SEND_MORE_EXTENDED.
     pub fn maybe_release_capacity(&self, msg: &StellarMessage) {
         if let StellarMessage::SendMoreExtended(send_more) = msg {
+            // #3570 observability: count grants received from the peer. Bumped
+            // for every processed SEND_MORE_EXTENDED, independent of the
+            // capacity math below. Read only by the inbound-drop diagnostic.
+            self.send_more_received_count
+                .fetch_add(1, Ordering::Relaxed);
+
             let mut state = self.state.lock().unwrap();
 
             if let Some(start) = state.no_outbound_capacity.take() {
@@ -1094,6 +1108,15 @@ impl FlowControl {
         }
     }
 
+    /// Test-only: backdate the no-outbound-capacity timer so timeout checks see
+    /// it as stale. Used to exercise the send-mode-idle drop path without
+    /// waiting real seconds.
+    #[cfg(test)]
+    pub(crate) fn force_no_outbound_capacity_age(&self, secs: u64) {
+        let mut state = self.state.lock().unwrap();
+        state.no_outbound_capacity = Some(Instant::now() - std::time::Duration::from_secs(secs));
+    }
+
     /// Check if throttling should be applied.
     pub fn maybe_throttle_read(&self) -> bool {
         let mut state = self.state.lock().unwrap();
@@ -1144,6 +1167,7 @@ impl FlowControl {
             advert_queue_size: state.outbound_queues[MessagePriority::FloodAdvert as usize].len(),
             tx_queue_byte_count: state.tx_queue_byte_count,
             is_throttled: state.last_throttle.is_some(),
+            send_more_received_count: self.send_more_received_count.load(Ordering::Relaxed),
         }
     }
 }
@@ -1179,6 +1203,10 @@ pub struct FlowControlStats {
     pub tx_queue_byte_count: usize,
     /// Whether reading is throttled.
     pub is_throttled: bool,
+    /// #3570 observability: monotonic count of SEND_MORE_EXTENDED grants
+    /// received from the peer. 0 means the peer never granted us outbound
+    /// capacity (the leading-hypothesis signal for inbound idle-outs).
+    pub send_more_received_count: u64,
 }
 
 /// Check if a message requires flow control capacity tracking.

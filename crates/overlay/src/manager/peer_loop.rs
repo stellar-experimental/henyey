@@ -498,6 +498,9 @@ struct PeerLoopCtx<'a> {
     peer_rate_limiter: &'a mut PeerRateLimiter,
     scp_messages: &'a mut u64,
     last_write: &'a mut Instant,
+    /// #3570 observability: loop-local count of SCP envelopes henyey has
+    /// written to this peer (accumulated from SEND_MORE-triggered drains).
+    scp_written: &'a mut u64,
 }
 
 /// Read-only timing and message counters for timeout checks.
@@ -506,6 +509,61 @@ struct PeerTimingInfo {
     last_write: Instant,
     total_messages: u64,
     scp_messages: u64,
+}
+
+/// #3570 observability: which timeout fired when a peer is dropped.
+///
+/// Carried out of [`OverlayManager::check_peer_timeouts`] (which previously
+/// returned a bare `bool`) so the inbound-drop diagnostic can record the
+/// specific reason. The drop *conditions* and metric increments are unchanged
+/// — this only labels which one tripped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum IdleReason {
+    /// No read AND no write for >= PEER_TIMEOUT (30s). Matches Peer.cpp:450-451.
+    Idle,
+    /// No write for >= PEER_STRAGGLER_TIMEOUT (120s).
+    Straggler,
+    /// No outbound capacity (no SEND_MORE_EXTENDED) for >= 60s. OVERLAY_SPEC §5.6.
+    SendModeIdle,
+}
+
+impl IdleReason {
+    /// Short, low-cardinality label for the `overlay_inbound_diag` warn field.
+    fn as_str(self) -> &'static str {
+        match self {
+            IdleReason::Idle => "idle",
+            IdleReason::Straggler => "straggler",
+            IdleReason::SendModeIdle => "send_mode_idle",
+        }
+    }
+}
+
+/// #3570 observability: per-inbound-peer flow-control snapshot gathered at the
+/// idle-timeout drop, so the operator can pin WHY each inbound peer idles out.
+///
+/// All fields are reads of already-tracked state — building this struct has no
+/// effect on any drop condition, SEND_MORE grant, or flood behavior. The
+/// leading-hypothesis signature is: `idle_reason ∈ {idle, send_mode_idle}` +
+/// `send_more_received == 0` + `peer_message_capacity == 0` + `scp_written == 0`
+/// + `scp_queue_depth > 0` (we had SCP to flood but were blocked on capacity).
+#[derive(Debug, Clone)]
+pub(super) struct InboundDropDiag {
+    /// SEND_MORE_EXTENDED grants received from the peer (0 = never granted).
+    pub send_more_received: u64,
+    /// SCP envelopes henyey actually wrote to this peer over the connection.
+    pub scp_written: u64,
+    /// SCP messages still queued (had SCP to send but blocked on capacity).
+    pub scp_queue_depth: usize,
+    /// Peer's currently-granted outbound message capacity (0 = exhausted/none).
+    pub peer_message_capacity: u64,
+    /// Peer's currently-granted outbound byte capacity.
+    pub peer_bytes_capacity: u64,
+    /// Seconds since henyey last wrote to this peer.
+    pub last_write_age_secs: u64,
+    /// Seconds since henyey last read from this peer.
+    pub last_read_age_secs: u64,
+    /// Which timeout fired.
+    pub idle_reason: IdleReason,
 }
 
 /// Result from handling a received message — controls the peer loop's flow.
@@ -618,13 +676,17 @@ pub(super) fn should_skip_generic_routing(message: &StellarMessage) -> bool {
 impl OverlayManager {
     /// Check whether the peer has exceeded idle or straggler timeouts.
     ///
-    /// Returns `true` if the peer should be dropped.
+    /// Returns `Some(IdleReason)` identifying which timeout fired (and thus that
+    /// the peer should be dropped), or `None` if the peer is still live. The
+    /// drop conditions and metric increments are unchanged from the prior
+    /// `bool`-returning form; the reason is carried out solely so the #3570
+    /// inbound-drop diagnostic at the call site can label the cause.
     fn check_peer_timeouts(
         peer_id: &PeerId,
         timing: &PeerTimingInfo,
         flow_control: &FlowControl,
         metrics: &crate::metrics::OverlayMetrics,
-    ) -> bool {
+    ) -> Option<IdleReason> {
         const PEER_TIMEOUT: Duration = Duration::from_secs(30);
         const PEER_STRAGGLER_TIMEOUT: Duration = Duration::from_secs(120);
         // OVERLAY_SPEC §5.6 — drop peer if no SEND_MORE_EXTENDED for this long.
@@ -639,7 +701,7 @@ impl OverlayManager {
                 peer_id, timing.total_messages, timing.scp_messages
             );
             metrics.timeouts_idle.inc();
-            return true;
+            return Some(IdleReason::Idle);
         }
         if now.duration_since(timing.last_write) >= PEER_STRAGGLER_TIMEOUT {
             warn!(
@@ -647,7 +709,7 @@ impl OverlayManager {
                 peer_id, timing.total_messages, timing.scp_messages
             );
             metrics.timeouts_straggler.inc();
-            return true;
+            return Some(IdleReason::Straggler);
         }
         if flow_control.no_outbound_capacity_timeout(PEER_SEND_MODE_IDLE_TIMEOUT_SECS) {
             warn!(
@@ -655,9 +717,60 @@ impl OverlayManager {
                 peer_id, PEER_SEND_MODE_IDLE_TIMEOUT_SECS
             );
             metrics.timeouts_idle.inc();
-            return true;
+            return Some(IdleReason::SendModeIdle);
         }
-        false
+        None
+    }
+
+    /// #3570 observability: build the [`InboundDropDiag`] snapshot for a peer
+    /// being dropped on a timeout. Pure read of already-tracked state — this
+    /// has no effect on any drop condition, SEND_MORE grant, or flood behavior.
+    ///
+    /// `last_read`/`last_write` are the loop-local `Instant`s; `scp_written` is
+    /// the loop-local count of SCP envelopes henyey wrote to this peer.
+    fn build_inbound_drop_diag(
+        flow_control: &FlowControl,
+        last_read: Instant,
+        last_write: Instant,
+        scp_written: u64,
+        idle_reason: IdleReason,
+    ) -> InboundDropDiag {
+        let stats = flow_control.get_stats();
+        InboundDropDiag {
+            send_more_received: stats.send_more_received_count,
+            scp_written,
+            scp_queue_depth: stats.scp_queue_size,
+            peer_message_capacity: stats.peer_message_capacity,
+            peer_bytes_capacity: stats.peer_bytes_capacity,
+            last_write_age_secs: last_write.elapsed().as_secs(),
+            last_read_age_secs: last_read.elapsed().as_secs(),
+            idle_reason,
+        }
+    }
+
+    /// #3570 observability: emit the per-inbound-peer idle-drop diagnostic.
+    /// Inbound-gated, mirroring [`Self::log_inbound_drop_diag`]. Reads only
+    /// already-tracked state; does not alter control flow.
+    fn log_inbound_idle_drop_diag(peer: &Peer, peer_id: &PeerId, diag: &InboundDropDiag) {
+        if peer.direction() != ConnectionDirection::Inbound {
+            return;
+        }
+        warn!(
+            target: "overlay_inbound_diag",
+            peer_id = %peer_id,
+            addr = %peer.remote_addr(),
+            direction = "inbound",
+            authenticated = peer.is_ready(),
+            idle_reason = diag.idle_reason.as_str(),
+            send_more_received = diag.send_more_received,
+            scp_written = diag.scp_written,
+            scp_queue_depth = diag.scp_queue_depth,
+            peer_message_capacity = diag.peer_message_capacity,
+            peer_bytes_capacity = diag.peer_bytes_capacity,
+            last_write_age_secs = diag.last_write_age_secs,
+            last_read_age_secs = diag.last_read_age_secs,
+            "inbound peer dropped on idle timeout; per-peer flow-control signals recorded"
+        );
     }
 
     /// Send a ping (GetScpQuorumset with a random hash) if due and idle.
@@ -712,15 +825,15 @@ impl OverlayManager {
 
     /// Handle a received `SendMoreExtended` message: release outbound capacity
     /// and drain queued messages. Returns `Err` if the drain send fails (peer
-    /// should be dropped), `Ok(true)` if any messages were written, `Ok(false)`
-    /// otherwise.
+    /// should be dropped), or `Ok(BatchSendOutcome)` describing the drain
+    /// (whether anything was written and how many SCP envelopes).
     async fn handle_send_more_extended(
         peer: &mut Peer,
         peer_id: &PeerId,
         message: &StellarMessage,
         flow_control: &FlowControl,
         metrics: &crate::metrics::OverlayMetrics,
-    ) -> std::result::Result<bool, ()> {
+    ) -> std::result::Result<BatchSendOutcome, ()> {
         if let StellarMessage::SendMoreExtended(sme) = message {
             debug!(
                 "Peer {} sent SEND_MORE_EXTENDED: num_messages={}, num_bytes={}",
@@ -732,14 +845,17 @@ impl OverlayManager {
             }
             flow_control.maybe_release_capacity(message);
             match Self::send_flow_controlled_batch(peer, flow_control, metrics).await {
-                Ok(sent) => Ok(sent),
+                Ok(outcome) => Ok(outcome),
                 Err(e) => {
                     debug!("Failed to drain queue to {}: {}", peer_id, e);
                     Err(())
                 }
             }
         } else {
-            Ok(false)
+            Ok(BatchSendOutcome {
+                sent: false,
+                scp_written: 0,
+            })
         }
     }
 
@@ -1008,6 +1124,10 @@ impl OverlayManager {
         // Track message counts for periodic diagnostics
         let mut total_messages: u64 = 0;
         let mut scp_messages: u64 = 0;
+        // #3570 observability: SCP envelopes henyey has written to this peer
+        // (accumulated from flow-controlled batch sends). Read only by the
+        // inbound idle-drop diagnostic; affects no control flow.
+        let mut scp_written: u64 = 0;
         let mut last_stats_log = Instant::now();
 
         // Single periodic timer for ping, SendMore, and timeout checks.
@@ -1054,10 +1174,12 @@ impl OverlayManager {
                             flow_control.add_msg_and_maybe_trim_queue(m);
                             // Send whatever has capacity
                             match Self::send_flow_controlled_batch(&mut peer, &flow_control, &state.metrics).await {
-                                Ok(sent) => {
-                                    if sent {
+                                Ok(outcome) => {
+                                    if outcome.sent {
                                         last_write = Instant::now();
                                     }
+                                    // #3570 observability: accumulate SCP writes.
+                                    scp_written += outcome.scp_written;
                                 }
                                 Err(e) => {
                                     debug!("Failed to send batch to {}: {}", peer_id, e);
@@ -1128,6 +1250,7 @@ impl OverlayManager {
                                     peer_rate_limiter: &mut peer_rate_limiter,
                                     scp_messages: &mut scp_messages,
                                     last_write: &mut last_write,
+                                    scp_written: &mut scp_written,
                                 },
                                 &flow_control,
                                 &state,
@@ -1161,12 +1284,26 @@ impl OverlayManager {
 
                 // Periodic tasks: ping, timeout checks
                 _ = periodic_interval.tick() => {
-                    if Self::check_peer_timeouts(&peer_id, &PeerTimingInfo {
+                    if let Some(idle_reason) = Self::check_peer_timeouts(&peer_id, &PeerTimingInfo {
                         last_read,
                         last_write,
                         total_messages,
                         scp_messages,
                     }, &flow_control, &state.metrics) {
+                        // #3570 observability: emit the per-inbound-peer
+                        // flow-control snapshot so the operator can pin WHY this
+                        // peer idled out. Gathered BEFORE the break to avoid
+                        // borrow conflicts; reads only already-tracked state and
+                        // does not alter the drop (the `break` is unconditional
+                        // on a timeout, exactly as before).
+                        let diag = Self::build_inbound_drop_diag(
+                            &flow_control,
+                            last_read,
+                            last_write,
+                            scp_written,
+                            idle_reason,
+                        );
+                        Self::log_inbound_idle_drop_diag(&peer, &peer_id, &diag);
                         break;
                     }
 
@@ -1271,10 +1408,12 @@ impl OverlayManager {
                 )
                 .await
                 {
-                    Ok(sent) => {
-                        if sent {
+                    Ok(outcome) => {
+                        if outcome.sent {
                             *ctx.last_write = Instant::now();
                         }
+                        // #3570 observability: accumulate SCP envelopes written.
+                        *ctx.scp_written += outcome.scp_written;
                     }
                     Err(()) => return RecvAction::Break,
                 }
@@ -1318,18 +1457,22 @@ impl OverlayManager {
     /// Send queued outbound messages that have flow control capacity.
     ///
     /// Retrieves the next batch from FlowControl's priority queues,
-    /// sends each message, then cleans up sent entries. Returns true
-    /// if any messages were sent.
+    /// sends each message, then cleans up sent entries. Returns a
+    /// [`BatchSendOutcome`] reporting whether any message was sent and how many
+    /// SCP envelopes were written (the latter for the #3570 inbound-drop diag).
     pub(super) async fn send_flow_controlled_batch(
         peer: &mut Peer,
         flow_control: &FlowControl,
         metrics: &crate::metrics::OverlayMetrics,
-    ) -> crate::Result<bool> {
+    ) -> crate::Result<BatchSendOutcome> {
         use crate::flow_control::MessagePriority;
 
         let batch = flow_control.get_next_batch_to_send();
         if batch.is_empty() {
-            return Ok(false);
+            return Ok(BatchSendOutcome {
+                sent: false,
+                scp_written: 0,
+            });
         }
 
         // Group sent messages by priority for process_sent_messages
@@ -1350,9 +1493,25 @@ impl OverlayManager {
             }
         }
 
+        // #3570 observability: SCP envelopes actually written this batch. The
+        // ping path sends GetScpQuorumset (not an SCP envelope, and not routed
+        // through this batch), so it is correctly excluded.
+        let scp_written = sent_by_priority[MessagePriority::Scp as usize].len() as u64;
+
         flow_control.process_sent_messages(&sent_by_priority);
-        Ok(true)
+        Ok(BatchSendOutcome {
+            sent: true,
+            scp_written,
+        })
     }
+}
+
+/// #3570 observability: outcome of [`OverlayManager::send_flow_controlled_batch`].
+pub(super) struct BatchSendOutcome {
+    /// Whether any message was written this batch (preserves the prior `bool`).
+    pub sent: bool,
+    /// Number of SCP envelopes written this batch.
+    pub scp_written: u64,
 }
 
 #[cfg(test)]
@@ -1401,7 +1560,7 @@ mod tests {
         // #3570: check_peer_timeouts now returns Option<IdleReason> instead of
         // bool, so the idle-drop call site can carry WHICH timeout fired into
         // the diagnostic. The drop conditions themselves are unchanged.
-        use crate::flow_control::{FlowControl, FlowControlConfig};
+        use crate::flow_control::FlowControl;
         let metrics = crate::metrics::OverlayMetrics::new();
         let peer_id = PeerId::from_bytes([7u8; 32]);
         let stale = Instant::now() - Duration::from_secs(40);
@@ -1433,8 +1592,10 @@ mod tests {
         );
 
         // Fresh clocks, but no outbound capacity for >=60s → SendModeIdle.
-        // A default FlowControl has no_outbound_capacity set at construction.
+        // A default FlowControl has no_outbound_capacity set at construction;
+        // backdate it past the 60s send-mode-idle threshold.
         let fc_no_capacity = FlowControl::default();
+        fc_no_capacity.force_no_outbound_capacity_age(70);
         assert_eq!(
             OverlayManager::check_peer_timeouts(
                 &peer_id,
