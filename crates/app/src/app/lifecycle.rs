@@ -530,6 +530,17 @@ impl App {
             if select_iteration <= 5 || select_iteration % 1000 == 0 {
                 tracing::debug!(select_iteration, "Main loop: entering select!");
             }
+            // Generic per-phase loop guard (#3582). Time the whole branch
+            // dispatch; after the select! completes, the branch has already
+            // stamped its coarse `phase` via `set_phase(N)`, so reading
+            // `event_loop_phase` names exactly which branch ran. This logs
+            // whichever phase (28 peer_maintenance, 5 consensus_tick, or any
+            // other) holds up the loop > threshold — resolving the
+            // phase-number ambiguity in #3582 on the deployed node. Additive
+            // and behavior-preserving: one `Instant` + one `Duration` compare,
+            // no control-flow change. Complements the finer phase=5 sub-step
+            // WARNs below.
+            let phase_dispatch_start = std::time::Instant::now();
             tokio::select! {
                 // NOTE: Removed biased; to ensure timers get fair polling
 
@@ -1433,6 +1444,17 @@ impl App {
                     }
                 }
             }
+
+            // Generic per-phase guard (#3582): the branch that just ran
+            // stamped its coarse `phase`; read it back and WARN by identity
+            // (number + name) if the dispatch crossed the threshold. Covers
+            // ALL ~15 branches — including phase=28 (peer_maintenance) which
+            // #3582 names literally — so the deployed node logs whichever
+            // phase held up the loop.
+            super::warn_phase_if_slow(
+                phase_dispatch_start.elapsed(),
+                self.event_loop_phase.load(Ordering::Relaxed),
+            );
         }
 
         // Event loop has exited — stop the watchdog immediately (before
