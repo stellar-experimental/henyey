@@ -70,6 +70,21 @@ pub struct GenerateLoadParams {
     #[serde(default)]
     pub ldgrmxinstrc: Option<i64>,
 
+    /// `create_upgrade` ledger-limit overrides for the SSC
+    /// `UpgradeSorobanLedgerLimits` mission (wire names match stellar-core).
+    #[serde(default)]
+    pub ldgrmxrdbyt: Option<u32>,
+    #[serde(default)]
+    pub ldgrmxwrbyt: Option<u32>,
+    #[serde(default)]
+    pub ldgrmxrdntry: Option<u32>,
+    #[serde(default)]
+    pub ldgrmxwrntry: Option<u32>,
+    #[serde(default)]
+    pub ldgrmxtxcnt: Option<u32>,
+    #[serde(default)]
+    pub ldgrmxtxsz: Option<u32>,
+
     // --- Apply-load (`soroban_invoke_apply_load`) params ---
     /// Whether the node is running in overlay-only mode (gate stand-in for
     /// stellar-core's `getRunInOverlayOnlyMode`).

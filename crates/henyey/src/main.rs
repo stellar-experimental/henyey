@@ -871,6 +871,12 @@ mod loadgen_runner {
                 // UpgradeSorobanLedgerLimits mission produces a non-no-op set.
                 soroban_upgrade_config: henyey_ledger::config_upgrade::SorobanUpgradeConfig {
                     ledger_max_instructions: request.ledger_max_instructions,
+                    ledger_max_read_bytes: request.ledger_max_read_bytes,
+                    ledger_max_write_bytes: request.ledger_max_write_bytes,
+                    ledger_max_read_ledger_entries: request.ledger_max_read_ledger_entries,
+                    ledger_max_write_ledger_entries: request.ledger_max_write_ledger_entries,
+                    ledger_max_tx_count: request.ledger_max_tx_count,
+                    ledger_max_transactions_size_bytes: request.ledger_max_transactions_size_bytes,
                     ..Default::default()
                 },
                 ..Default::default()

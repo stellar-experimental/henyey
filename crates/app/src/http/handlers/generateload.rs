@@ -64,6 +64,13 @@ pub struct LoadGenRequest {
 
     /// `create_upgrade` override for `ledgerMaxInstructions` (`ldgrmxinstrc`).
     pub ledger_max_instructions: Option<i64>,
+    /// `create_upgrade` ledger-limit overrides (UpgradeSorobanLedgerLimits).
+    pub ledger_max_read_bytes: Option<u32>,
+    pub ledger_max_write_bytes: Option<u32>,
+    pub ledger_max_read_ledger_entries: Option<u32>,
+    pub ledger_max_write_ledger_entries: Option<u32>,
+    pub ledger_max_tx_count: Option<u32>,
+    pub ledger_max_transactions_size_bytes: Option<u32>,
 }
 
 /// Parse a comma-separated list of `u32` (e.g. `"10,20,30"`), ignoring empty
@@ -122,6 +129,12 @@ impl From<GenerateLoadParams> for LoadGenRequest {
                 &p.applyloadinstructionsdistribution,
             ),
             ledger_max_instructions: p.ldgrmxinstrc,
+            ledger_max_read_bytes: p.ldgrmxrdbyt,
+            ledger_max_write_bytes: p.ldgrmxwrbyt,
+            ledger_max_read_ledger_entries: p.ldgrmxrdntry,
+            ledger_max_write_ledger_entries: p.ldgrmxwrntry,
+            ledger_max_tx_count: p.ldgrmxtxcnt,
+            ledger_max_transactions_size_bytes: p.ldgrmxtxsz,
         }
     }
 }
