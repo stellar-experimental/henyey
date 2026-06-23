@@ -1787,8 +1787,14 @@ impl Herder {
             // (HerderSCPDriver.cpp:1300-1337). Without this, the checkpoint
             // slot's SCP state can be evicted and the delayed
             // send_scp_state callback (#2670) silently sends nothing (#2706).
-            self.scp
-                .purge_slots(purge_slot.saturating_sub(1), Some(last_checkpoint));
+            // No upper bound on recovery: parity with core's
+            // eraseOutsideRange(purgeSlot, std::nullopt) (HerderImpl.cpp:573) —
+            // not tracking, so future slots are retained.
+            self.scp.purge_slots(
+                Some(purge_slot.saturating_sub(1)),
+                None,
+                Some(last_checkpoint),
+            );
 
             // Purge externalized values and pending tx set requests
             self.scp_driver.purge_slots_below(purge_slot);
@@ -3183,13 +3189,29 @@ impl Herder {
         // envelopes survive the retention window.
         let keep_slot = self.get_most_recent_checkpoint_seq();
 
+        // Tracking-gated upper bound, shared by every cleanup below. Parity:
+        // stellar-core threads a single maxSlotIndex
+        // (nextConsensusLedgerIndex()+LEDGER_VALIDITY_BRACKET, only when
+        // isTracking()) through HerderSCPDriver::purgeSlotsOutsideRange,
+        // SCP::purgeSlotsOutsideRange, and PendingEnvelopes::eraseOutsideRange
+        // (HerderImpl.cpp:260-290/1362, HerderSCPDriver.cpp:1653).
+        let max_slot = if self.is_tracking() {
+            Some(self.next_consensus_ledger_index().get() + LEDGER_VALIDITY_BRACKET)
+        } else {
+            None
+        };
+
         // Clean up old SCP state, preserving the most-recent-checkpoint
         // slot so the delayed send_scp_state callback (#2670) can still
         // find it after a long apply or upon validator startup (#2706).
+        // Threads the same tracking-gated max_slot upper bound as the
+        // fetching-envelope and tx-set-cache purges below, closing the gap
+        // where the SCP slots map retained far-future slots that core's
+        // SCP::purgeSlotsOutsideRange (SCP.cpp:73-105) would evict.
         // Parity: HerderSCPDriver::purgeSlotsOutsideRange
-        // (HerderSCPDriver.cpp:1300-1337).
+        // (HerderSCPDriver.cpp:1653).
         self.scp
-            .purge_slots(slot.saturating_sub(10), Some(keep_slot));
+            .purge_slots(Some(slot.saturating_sub(10)), max_slot, Some(keep_slot));
         // Purge deferred slot tracking alongside SCP slot cleanup
         self.scp_driver
             .purge_deferred_slots(slot.saturating_sub(10));
@@ -3201,11 +3223,6 @@ impl Herder {
         let min_ledger_seq = self.get_min_ledger_seq_to_remember();
         let min_slot = if min_ledger_seq > GENESIS_LEDGER_SEQ {
             Some(min_ledger_seq)
-        } else {
-            None
-        };
-        let max_slot = if self.is_tracking() {
-            Some(self.next_consensus_ledger_index().get() + LEDGER_VALIDITY_BRACKET)
         } else {
             None
         };

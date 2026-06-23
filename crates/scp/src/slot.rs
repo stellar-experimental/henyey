@@ -1699,7 +1699,7 @@ mod tests {
         assert_eq!(scp.slot_count(), 10);
 
         // Purge slots older than 8, but keep slot 3
-        scp.purge_slots(8, Some(3));
+        scp.purge_slots(Some(8), None, Some(3));
 
         let active = scp.active_slots();
         // Should keep slots 8, 9, 10 (>= 8) and slot 3 (slot_to_keep)
@@ -1734,7 +1734,7 @@ mod tests {
         assert_eq!(scp.slot_count(), 10);
 
         // Purge slots older than 8, no slot_to_keep
-        scp.purge_slots(8, None);
+        scp.purge_slots(Some(8), None, None);
 
         let active = scp.active_slots();
         assert_eq!(active.len(), 3, "should have slots 8, 9, 10 remaining");

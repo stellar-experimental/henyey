@@ -330,18 +330,21 @@ impl<D: SCPDriver> SCP<D> {
         slot.force_externalize(value);
     }
 
-    /// Purge old slots to free memory.
+    /// Purge slots outside the `[min_slot, max_slot]` range to free memory.
     ///
-    /// Removes slots older than `max_slot_index`, but keeps `slot_to_keep`
-    /// even if it's below the threshold.
-    ///
-    /// Simplified variant of stellar-core's `SCP::purgeSlotsOutsideRange`
-    /// — only purges slots with index `< max_slot_index` (no min-bound
-    /// parameter). The full range-purge is not needed by current call sites.
-    pub fn purge_slots(&self, max_slot_index: u64, slot_to_keep: Option<u64>) {
-        self.slots.write().retain(|&slot_index, _| {
-            slot_index >= max_slot_index || slot_to_keep == Some(slot_index)
-        });
+    /// TEMPORARY (failing-test scaffold): lower-bound only — does NOT yet
+    /// honor `max_slot`. Replaced by the parity fix below.
+    pub fn purge_slots(
+        &self,
+        min_slot: Option<u64>,
+        _max_slot: Option<u64>,
+        slot_to_keep: Option<u64>,
+    ) {
+        if let Some(min) = min_slot {
+            self.slots
+                .write()
+                .retain(|&slot_index, _| slot_index >= min || slot_to_keep == Some(slot_index));
+        }
     }
 
     /// Get the number of active slots.
@@ -1436,12 +1439,90 @@ mod tests {
 
         assert_eq!(scp.slot_count(), 10);
 
-        // Purge old slots
-        scp.purge_slots(6, None);
+        // Purge old slots (lower bound only, no upper bound, no keep slot).
+        // Regression guard: the `min`-only case must remain byte-identical to
+        // the old single-bound `purge_slots` behavior.
+        scp.purge_slots(Some(6), None, None);
 
         assert_eq!(scp.slot_count(), 5);
         assert!(scp.get_externalized_value(5).is_none());
         assert!(scp.get_externalized_value(6).is_some());
+    }
+
+    /// Parity with stellar-core `SCP::purgeSlotsOutsideRange`: the `max` upper
+    /// bound must evict slots `> max` (which henyey's old lower-bound-only
+    /// `purge_slots` retained). RED on origin/main (no upper bound), GREEN
+    /// after the two-bounded fix.
+    #[test]
+    fn test_purge_slots_outside_range_evicts_above_max() {
+        let driver = Arc::new(MockDriver::bare());
+        let scp = SCP::new(make_node_id(1), true, make_empty_quorum_set(), driver);
+
+        for i in 1..=10 {
+            let value: Value = vec![i as u8].try_into().unwrap();
+            scp.force_externalize(i, value);
+        }
+        assert_eq!(scp.slot_count(), 10);
+
+        // Retain [min, max] = [3, 6]; evict {1,2} below and {7,8,9,10} above.
+        scp.purge_slots(Some(3), Some(6), None);
+
+        assert_eq!(scp.slot_count(), 4);
+        for keep in [3u64, 4, 5, 6] {
+            assert!(scp.has_slot(keep), "slot {keep} should be retained");
+        }
+        for evict in [1u64, 2, 7, 8, 9, 10] {
+            assert!(!scp.has_slot(evict), "slot {evict} should be evicted");
+        }
+    }
+
+    /// Parity with core's `maybeEraseSlot`: `slot_to_keep` survives BOTH
+    /// sweeps — including the `> max` upper sweep.
+    #[test]
+    fn test_purge_slots_outside_range_keeps_slot_to_keep_above_max() {
+        let driver = Arc::new(MockDriver::bare());
+        let scp = SCP::new(make_node_id(1), true, make_empty_quorum_set(), driver);
+
+        for i in 1..=10 {
+            let value: Value = vec![i as u8].try_into().unwrap();
+            scp.force_externalize(i, value);
+        }
+        assert_eq!(scp.slot_count(), 10);
+
+        // Retain [3, 5] plus slot_to_keep=9 even though 9 > max.
+        scp.purge_slots(Some(3), Some(5), Some(9));
+
+        for keep in [3u64, 4, 5, 9] {
+            assert!(scp.has_slot(keep), "slot {keep} should be retained");
+        }
+        for evict in [1u64, 2, 6, 7, 8, 10] {
+            assert!(!scp.has_slot(evict), "slot {evict} should be evicted");
+        }
+    }
+
+    /// Lower-bound regression: with `max = None`, NO future slot is evicted.
+    /// Preserves the recovery / not-tracking call-site semantics
+    /// (core's `eraseOutsideRange(purgeSlot, std::nullopt)`).
+    #[test]
+    fn test_purge_slots_no_max_retains_future_slots() {
+        let driver = Arc::new(MockDriver::bare());
+        let scp = SCP::new(make_node_id(1), true, make_empty_quorum_set(), driver);
+
+        for i in 1..=10 {
+            let value: Value = vec![i as u8].try_into().unwrap();
+            scp.force_externalize(i, value);
+        }
+
+        scp.purge_slots(Some(4), None, None);
+
+        // Only {1,2,3} below min are evicted; all of {4..=10} survive.
+        assert_eq!(scp.slot_count(), 7);
+        for keep in 4u64..=10 {
+            assert!(scp.has_slot(keep), "slot {keep} should be retained");
+        }
+        for evict in [1u64, 2, 3] {
+            assert!(!scp.has_slot(evict), "slot {evict} should be evicted");
+        }
     }
 
     // ==================== Tests for new parity features ====================
