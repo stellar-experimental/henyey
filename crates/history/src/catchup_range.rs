@@ -944,6 +944,62 @@ mod tests {
         );
     }
 
+    // ── Precondition Result-error regression tests (#3567) ─────────────
+    // Previously these inputs aborted the process via `assert!` in
+    // `calculate`; they must now return `Err` so the offline `catchup`
+    // CLI surfaces a graceful error instead of panicking. Mirrors
+    // stellar-core `checkCatchupPreconditions` (throws std::invalid_argument).
+
+    #[test]
+    fn test_calculate_lcl_zero_returns_err() {
+        // Direct reproduction of the issue panic: lcl == 0 reaching
+        // `calculate` aborted with "lcl 0 must be >= genesis 1".
+        let result = CatchupRange::calculate(0, 63, CatchupMode::Complete);
+        assert!(result.is_err(), "lcl == 0 must return Err, not abort");
+    }
+
+    #[test]
+    fn test_calculate_target_le_lcl_returns_err() {
+        // target <= lcl previously aborted with "target 2 must be > lcl 5".
+        let result = CatchupRange::calculate(5, 2, CatchupMode::Complete);
+        assert!(result.is_err(), "target <= lcl must return Err, not abort");
+    }
+
+    #[test]
+    fn test_calculate_target_le_genesis_returns_err() {
+        // target <= genesis previously aborted (here via "target 1 must be > lcl 1").
+        let result = CatchupRange::calculate(1, 1, CatchupMode::Complete);
+        assert!(
+            result.is_err(),
+            "target <= genesis must return Err, not abort"
+        );
+    }
+
+    #[test]
+    fn test_calculate_target_equals_first_checkpoint_ok() {
+        // The issue's target == first-checkpoint case, via the Result API:
+        // a valid range, no panic (Case 0, Complete from genesis).
+        let range = CatchupRange::calculate(1, 63, CatchupMode::Complete).unwrap();
+        assert_eq!(
+            range,
+            CatchupRange::ReplayOnly {
+                replay: LedgerRange::new(2, 62)
+            }
+        );
+    }
+
+    #[test]
+    fn test_calculate_target_past_first_checkpoint_ok() {
+        // target > first checkpoint (Complete from genesis) — valid range.
+        let range = CatchupRange::calculate(1, 127, CatchupMode::Complete).unwrap();
+        assert_eq!(
+            range,
+            CatchupRange::ReplayOnly {
+                replay: LedgerRange::new(2, 126)
+            }
+        );
+    }
+
     #[test]
     fn test_catchup_run_mode_display() {
         assert_eq!(CatchupRunMode::OfflineBasic.to_string(), "OFFLINE_BASIC");
