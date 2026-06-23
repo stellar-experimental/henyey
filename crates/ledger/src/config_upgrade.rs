@@ -163,6 +163,10 @@ impl ConfigUpgradeSetFrame {
 
         // Load the CONTRACT_DATA entry
         let Some(entry) = ltx.get_entry(&lk)? else {
+            debug!(
+                content_hash = format!("{:02x?}", &key.content_hash.0[..8]),
+                "ConfigUpgradeSet CONTRACT_DATA entry not found at computed key"
+            );
             return Ok(None);
         };
 
@@ -1030,6 +1034,14 @@ impl ConfigUpgradeSetFrame {
 /// path and is intentionally omitted.
 #[derive(Debug, Clone, Default)]
 pub struct SorobanUpgradeConfig {
+    /// Override for `ledgerMaxInstructions` in `CONFIG_SETTING_CONTRACT_COMPUTE_V0`.
+    /// When `Some`, the re-emitted ContractComputeV0 entry has its
+    /// `ledger_max_instructions` replaced with this value (the rest of the
+    /// entry is preserved). This is the field supercluster's
+    /// `UpgradeSorobanLedgerLimitsWithMultiplier` mission sets (`ldgrmxinstrc`),
+    /// so without it the create_upgrade set is a no-op and the upgrade is never
+    /// proposed. Mirrors stellar-core `SorobanUpgradeConfig::ledgerMaxInstructions`.
+    pub ledger_max_instructions: Option<i64>,
     /// Override for `CONFIG_SETTING_CONTRACT_COST_PARAMS_CPU_INSTRUCTIONS`.
     /// When `None`, the CPU cost-params entry is **not** included in the set
     /// (stellar-core sets `updated = false`).
@@ -1121,6 +1133,19 @@ pub fn build_config_upgrade_set(
 
         // Cost-params settings are only emitted when an override is supplied.
         let updated = match id {
+            ConfigSettingId::ContractComputeV0 => {
+                // Apply the ledger_max_instructions override (the SSC
+                // UpgradeSorobanLedgerLimits mission's `ldgrmxinstrc`) onto the
+                // re-emitted entry. Parity: stellar-core
+                // getConfigUpgradeSetFromLoadConfig applies
+                // `upgradeCfg.ledgerMaxInstructions` (TxGenerator.cpp).
+                if let Some(v) = cfg.ledger_max_instructions {
+                    if let ConfigSettingEntry::ContractComputeV0(ref mut c) = entry {
+                        c.ledger_max_instructions = v;
+                    }
+                }
+                true
+            }
             ConfigSettingId::ContractCostParamsCpuInstructions => {
                 if let Some(params) = &cfg.cpu_cost_params {
                     entry = ConfigSettingEntry::ContractCostParamsCpuInstructions(params.clone());
@@ -2382,6 +2407,52 @@ mod tests {
         );
     }
 
+    /// Regression for the SSC `UpgradeSorobanLedgerLimits` wedge: the mission
+    /// sends `ldgrmxinstrc` (ledgerMaxInstructions). Without applying it, the
+    /// upgrade set re-emits the *current* ContractComputeV0 unchanged → the
+    /// upgrade is a no-op → `upgrade_needed` is false → `LedgerUpgrade::Config`
+    /// is never proposed and `max_instructions` stays at genesis (the mission
+    /// hangs at `Waiting for LedgerMaxInstructions=250000000`). Assert the
+    /// override lands on the re-emitted entry and changes the serialized bytes.
+    #[test]
+    fn test_build_config_upgrade_set_applies_ledger_max_instructions_override() {
+        let find_compute = |bytes: &[u8]| -> i64 {
+            let set = ConfigUpgradeSet::from_xdr(bytes, Limits::none()).unwrap();
+            set.updated_entry
+                .iter()
+                .find_map(|e| match e {
+                    ConfigSettingEntry::ContractComputeV0(c) => Some(c.ledger_max_instructions),
+                    _ => None,
+                })
+                .expect("ContractComputeV0 must be present in the upgrade set")
+        };
+
+        let cfg = SorobanUpgradeConfig {
+            ledger_max_instructions: Some(250_000_000),
+            ..Default::default()
+        };
+        let bytes = build_config_upgrade_set(&cfg, fixture_load_entry).unwrap();
+        assert_eq!(
+            find_compute(&bytes),
+            250_000_000,
+            "ledger_max_instructions override must be applied to ContractComputeV0"
+        );
+
+        // Empty config re-emits the fixture default (0) — and the override must
+        // change the serialized bytes (hence the content hash supercluster arms).
+        let empty =
+            build_config_upgrade_set(&SorobanUpgradeConfig::default(), fixture_load_entry).unwrap();
+        assert_eq!(
+            find_compute(&empty),
+            0,
+            "default fixture value is re-emitted"
+        );
+        assert_ne!(
+            bytes, empty,
+            "the override must change the serialized ConfigUpgradeSet bytes"
+        );
+    }
+
     /// Pin the exact content hash (sha256 of the serialized `ConfigUpgradeSet`)
     /// for the deterministic fixture. This is the load-bearing parity guard for
     /// `create_upgrade`: the `ConfigUpgradeSetKey.contentHash` must match
@@ -2431,6 +2502,7 @@ mod tests {
             mem_cost_params: Some(Default::default()),
             frozen_ledger_keys_delta: Some(Default::default()),
             freeze_bypass_txs_delta: Some(Default::default()),
+            ..Default::default()
         };
         let bytes = build_config_upgrade_set(&cfg, fixture_load_entry).unwrap();
         let set = ConfigUpgradeSet::from_xdr(&bytes, Limits::none()).unwrap();

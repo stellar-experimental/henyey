@@ -62,6 +62,14 @@ pub struct GenerateLoadParams {
     #[serde(default)]
     pub preloadedtransactionsfile: Option<String>,
 
+    /// `create_upgrade` override for `ledgerMaxInstructions` in the
+    /// `CONFIG_SETTING_CONTRACT_COMPUTE_V0` upgrade entry (supercluster sends
+    /// this as `ldgrmxinstrc`). Without it the create_upgrade set is a no-op
+    /// and the Soroban config upgrade is never proposed. Mirrors stellar-core
+    /// `LoadGenerator`'s `ldgrmxinstrc` parameter.
+    #[serde(default)]
+    pub ldgrmxinstrc: Option<i64>,
+
     // --- Apply-load (`soroban_invoke_apply_load`) params ---
     /// Whether the node is running in overlay-only mode (gate stand-in for
     /// stellar-core's `getRunInOverlayOnlyMode`).

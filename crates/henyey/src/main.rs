@@ -866,6 +866,13 @@ mod loadgen_runner {
                     instructions: request.apply_load_instructions.clone(),
                 },
                 overlay_only_mode: request.overlay_only_mode,
+                // create_upgrade: carry the ledgerMaxInstructions override
+                // (`ldgrmxinstrc`) into the upgrade-set builder so the SSC
+                // UpgradeSorobanLedgerLimits mission produces a non-no-op set.
+                soroban_upgrade_config: henyey_ledger::config_upgrade::SorobanUpgradeConfig {
+                    ledger_max_instructions: request.ledger_max_instructions,
+                    ..Default::default()
+                },
                 ..Default::default()
             };
 

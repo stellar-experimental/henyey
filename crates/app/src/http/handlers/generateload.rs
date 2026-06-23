@@ -61,6 +61,9 @@ pub struct LoadGenRequest {
     pub apply_load_event_count: (Vec<u32>, Vec<u32>),
     /// `APPLY_LOAD_INSTRUCTIONS[_DISTRIBUTION]`.
     pub apply_load_instructions: (Vec<u32>, Vec<u32>),
+
+    /// `create_upgrade` override for `ledgerMaxInstructions` (`ldgrmxinstrc`).
+    pub ledger_max_instructions: Option<i64>,
 }
 
 /// Parse a comma-separated list of `u32` (e.g. `"10,20,30"`), ignoring empty
@@ -118,6 +121,7 @@ impl From<GenerateLoadParams> for LoadGenRequest {
                 &p.applyloadinstructions,
                 &p.applyloadinstructionsdistribution,
             ),
+            ledger_max_instructions: p.ldgrmxinstrc,
         }
     }
 }
