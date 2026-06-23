@@ -33,6 +33,32 @@ impl App {
         self.herder.upgrade_parameters()
     }
 
+    /// Validate a `ConfigUpgradeSetKey` for arm-time acceptance (`/upgrades`).
+    ///
+    /// Mirrors stellar-core `CommandHandler::upgrades`
+    /// (CommandHandler.cpp:634-655): resolve the key via `makeFromKey` and
+    /// require `isValidForApply == VALID`. Returns `Ok(true)` only when the
+    /// entry resolves to a frame that is `Valid`. Returns `Ok(false)` when the
+    /// entry is absent / wrong-durability / TTL-expired (`make_from_key` →
+    /// `None`) or resolves to a frame that is not `Valid`.
+    ///
+    /// The gate is `make_from_key.is_some() && is_valid_for_apply() == Valid`
+    /// ONLY — it deliberately EXCLUDES the `upgrade_needed` check, which is
+    /// nomination-time only (folding it in would wrongly reject valid no-op
+    /// upgrades, a parity divergence — see CommandHandler.cpp:647-651).
+    ///
+    /// Returns `Err` on I/O errors or invariant violations reading the ledger.
+    pub fn validate_config_upgrade_set_key(
+        &self,
+        key: &stellar_xdr::ConfigUpgradeSetKey,
+    ) -> Result<bool, henyey_ledger::LedgerError> {
+        let frame = match self.ledger_manager.get_config_upgrade_set(key)? {
+            Some(f) => f,
+            None => return Ok(false),
+        };
+        Ok(frame.is_valid_for_apply() == henyey_ledger::ConfigUpgradeValidity::Valid)
+    }
+
     /// Look up a `ConfigUpgradeSet` by key from the current ledger state.
     ///
     /// # Arguments

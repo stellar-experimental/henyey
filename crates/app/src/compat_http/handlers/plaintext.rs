@@ -321,14 +321,84 @@ pub(crate) async fn compat_upgrades_handler(
             upgrade_params.expiration_minutes = Some(v);
         }
         if let Some(key_str) = params.get("configupgradesetkey") {
-            // configupgradesetkey is a base64-encoded ConfigUpgradeSetKey XDR
+            // configupgradesetkey is a base64-encoded ConfigUpgradeSetKey XDR.
+            //
+            // Parity: stellar-core CommandHandler::upgrades
+            // (CommandHandler.cpp:634-655) decodes the key, resolves it via
+            // makeFromKey, and requires isValidForApply == VALID; on failure it
+            // returns "Error setting configUpgradeSet" and stores nothing.
+            // (We omit core's ensureProtocolVersion(SOROBAN) guard — a
+            // pre-Soroban-only minor gap, irrelevant to the P27 path.)
             use base64::{engine::general_purpose::STANDARD, Engine};
             use stellar_xdr::{ConfigUpgradeSetKey, Limits, ReadXdr};
-            if let Ok(bytes) = STANDARD.decode(key_str) {
-                if let Ok(key) = ConfigUpgradeSetKey::from_xdr(&bytes, Limits::none()) {
+
+            // The verbatim error string SSC may match on.
+            let config_err = || {
+                Json(serde_json::json!({
+                    "status": "error",
+                    "error": "Error setting configUpgradeSet",
+                }))
+                .into_response()
+            };
+
+            // (1) base64 decode — previously silent on failure.
+            let bytes = match STANDARD.decode(key_str) {
+                Ok(b) => b,
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "configupgradesetkey: base64 decode failed; rejecting arm"
+                    );
+                    return config_err();
+                }
+            };
+            // (2) XDR decode — previously silent on failure.
+            let key = match ConfigUpgradeSetKey::from_xdr(&bytes, Limits::none()) {
+                Ok(k) => k,
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "configupgradesetkey: XDR decode failed; rejecting arm"
+                    );
+                    return config_err();
+                }
+            };
+
+            // Diagnostic: arm received + decoded key (contract_id/content_hash
+            // hex). This edge was previously silent — the silence is why three
+            // #3591 investigations saw nothing.
+            tracing::info!(
+                contract_id = %hex::encode(key.contract_id.0 .0),
+                content_hash = %hex::encode(key.content_hash.0),
+                "configupgradesetkey arm received and decoded"
+            );
+
+            // (3) Resolve + validate via the ledger (makeFromKey +
+            // isValidForApply == VALID). Reject an unresolvable / invalid key
+            // exactly as core does, storing NOTHING.
+            match state.app.validate_config_upgrade_set_key(&key) {
+                Ok(true) => {
                     upgrade_params.config_upgrade_set_key = Some(
                         henyey_herder::upgrades::ConfigUpgradeSetKeyJson::from_xdr(&key),
                     );
+                }
+                Ok(false) => {
+                    tracing::warn!(
+                        contract_id = %hex::encode(key.contract_id.0 .0),
+                        content_hash = %hex::encode(key.content_hash.0),
+                        "configupgradesetkey did not resolve to a VALID upgrade \
+                         set in the live ledger; rejecting arm (parity: core \
+                         CommandHandler.cpp:653)"
+                    );
+                    return config_err();
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "configupgradesetkey: ledger error resolving key; \
+                         rejecting arm"
+                    );
+                    return config_err();
                 }
             }
         }
@@ -1069,8 +1139,19 @@ mod tests {
         (STANDARD.encode(bytes), key)
     }
 
-    /// Build the `mode=set` query param map with the full SSC parameter set.
-    fn full_ssc_set_params(config_key_b64: &str) -> std::collections::HashMap<String, String> {
+    /// Build the `mode=set` query param map with the full SSC parameter set
+    /// EXCLUDING `configupgradesetkey`.
+    ///
+    /// `configupgradesetkey` is now arm-validated (`makeFromKey +
+    /// isValidForApply`, mirroring stellar-core CommandHandler.cpp:634-655),
+    /// so a key whose backing `ConfigUpgradeSet` ContractData entry is absent
+    /// from the live ledger is REJECTED at arm time. The compat unit-test `App`
+    /// is uninitialized (no live ledger), so it cannot resolve any key — the
+    /// resolvable-accept path is exercised end-to-end in the herder crate via
+    /// `test_config_upgrade_resolves_from_armed_base64_key_full_path` (which can
+    /// build a snapshot with the backing entry), and the arm-time REJECT is
+    /// pinned by `test_upgrades_set_rejects_unresolvable_config_key` below.
+    fn full_ssc_set_params() -> std::collections::HashMap<String, String> {
         let mut m = std::collections::HashMap::new();
         m.insert("mode".into(), "set".into());
         // Unix-timestamp form (stellar-core also accepts ISO 8601; both paths
@@ -1081,7 +1162,6 @@ mod tests {
         m.insert("maxtxsetsize".into(), "2000".into());
         m.insert("protocolversion".into(), "25".into());
         m.insert("flags".into(), "1".into());
-        m.insert("configupgradesetkey".into(), config_key_b64.into());
         m.insert("maxsorobantxsetsize".into(), "50".into());
         m.insert("nominationtimeoutlimit".into(), "3".into());
         m.insert("expirationminutes".into(), "120".into());
@@ -1095,14 +1175,10 @@ mod tests {
     #[tokio::test]
     async fn test_upgrades_set_parses_full_ssc_param_set() {
         let (_dir, state) = mk_compat_state().await;
-        let (config_key_b64, expected_key) = ssc_config_upgrade_set_key();
 
-        let resp = compat_upgrades_handler(
-            State(Arc::clone(&state)),
-            Query(full_ssc_set_params(&config_key_b64)),
-        )
-        .await
-        .into_response();
+        let resp = compat_upgrades_handler(State(Arc::clone(&state)), Query(full_ssc_set_params()))
+            .await
+            .into_response();
         let json = body_json(resp).await;
         assert_eq!(json["status"], "ok", "mode=set should succeed: {json}");
 
@@ -1125,18 +1201,55 @@ mod tests {
         );
         assert_eq!(params.expiration_minutes, Some(120), "expirationminutes");
 
-        // configupgradesetkey: base64 XDR decoded back to the exact key.
-        let parsed_key = params
-            .config_upgrade_set_key
-            .as_ref()
-            .expect("configupgradesetkey must be parsed")
-            .to_xdr()
-            .expect("key round-trips to XDR");
+        state.app.shutdown();
+    }
+
+    /// `/upgrades?mode=set` with a `configupgradesetkey` whose backing
+    /// `ConfigUpgradeSet` ContractData entry is ABSENT from the live ledger is
+    /// REJECTED at arm time with the verbatim error string
+    /// `"Error setting configUpgradeSet"` and stores NOTHING.
+    ///
+    /// Parity: stellar-core `CommandHandler::upgrades`
+    /// (CommandHandler.cpp:634-655) resolves the key via `makeFromKey` and
+    /// requires `isValidForApply == VALID`; on failure it returns
+    /// `"Error setting configUpgradeSet"` and does not store the key.
+    ///
+    /// RED on `d6d36001`: the handler stored the key unconditionally and
+    /// returned `status:ok`, which is the silent-arm bug behind #3591 (the
+    /// armed key never resolved at nomination, so the config upgrade hung).
+    #[tokio::test]
+    async fn test_upgrades_set_rejects_unresolvable_config_key() {
+        let (_dir, state) = mk_compat_state().await;
+        let (config_key_b64, _expected_key) = ssc_config_upgrade_set_key();
+
+        // The compat-test App is uninitialized, so `get_config_upgrade_set`
+        // (→ `make_from_key`) finds no live entry at the armed key → reject.
+        let mut m = std::collections::HashMap::new();
+        m.insert("mode".to_string(), "set".to_string());
+        m.insert("configupgradesetkey".to_string(), config_key_b64);
+
+        let resp = compat_upgrades_handler(State(Arc::clone(&state)), Query(m))
+            .await
+            .into_response();
+        let json = body_json(resp).await;
         assert_eq!(
-            parsed_key, expected_key,
-            "configupgradesetkey must decode to the exact ConfigUpgradeSetKey"
+            json["status"], "error",
+            "unresolvable configupgradesetkey must be rejected: {json}"
+        );
+        assert_eq!(
+            json["error"], "Error setting configUpgradeSet",
+            "error string must be byte-verbatim with stellar-core"
         );
 
+        // Nothing was stored: the runtime param remains unset.
+        assert!(
+            state
+                .app
+                .runtime_upgrade_parameters()
+                .config_upgrade_set_key
+                .is_none(),
+            "rejected key must NOT be stored into runtime_upgrades"
+        );
         state.app.shutdown();
     }
 
@@ -1169,15 +1282,11 @@ mod tests {
     #[tokio::test]
     async fn test_upgrades_clear_resets_to_default() {
         let (_dir, state) = mk_compat_state().await;
-        let (config_key_b64, _key) = ssc_config_upgrade_set_key();
 
         // First set a full param set.
-        let resp = compat_upgrades_handler(
-            State(Arc::clone(&state)),
-            Query(full_ssc_set_params(&config_key_b64)),
-        )
-        .await
-        .into_response();
+        let resp = compat_upgrades_handler(State(Arc::clone(&state)), Query(full_ssc_set_params()))
+            .await
+            .into_response();
         assert_eq!(body_json(resp).await["status"], "ok");
         assert!(state
             .app
