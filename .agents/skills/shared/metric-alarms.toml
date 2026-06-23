@@ -1,0 +1,740 @@
+# Monitor-tick Alarm Catalog
+#
+# Single source of truth for all monitor-tick metric alarms.
+# Evaluated by scripts/lib/eval-alarms.py — see that file for semantics.
+#
+# This catalog serves the monitor-tick LLM skill ONLY. It is independent of
+# metrics/alerts/henyey-slo-alerts.yaml (Grafana SLO rules), which uses
+# Prometheus rate()/increase() over time windows. Threshold differences
+# between the two systems are intentional.
+#
+# See .claude/skills/shared/ALARM_SURFACES.md for the policy on alarm surface
+# ownership, overlap, and reconciliation.
+#
+# semantic_change_date: Optional ISO 8601 UTC timestamp (YYYY-MM-DDTHH:MM:SSZ)
+# per alarm. Records when the alarm's evaluation semantics last changed.
+# Setting this enables automatic invalidation of baselines whose replay window
+# (first_ts) predates the change, and invalidation of acknowledgments recorded
+# before this date. Set to the deployment date of the change or later (never
+# earlier — earlier risks missing contamination).
+#
+# Schema version — evaluator rejects unknown versions.
+schema_version = 1
+
+# ── COUNTERS ─────────────────────────────────────────────────────────────────
+
+[[alarm]]
+name = "lost-sync"
+baseline_version = 4  # bumped in #2661: clear stale baselines; alarm legitimately silent on healthy node
+semantic_change_date = "2026-05-13T20:00:00Z"  # deployed via #2642 (c45e6c80, committed 19:52 UTC)
+silence_expected = true  # healthy node should not lose sync; 0% firing is normal operation
+metric = "stellar_herder_lost_sync_total"
+kind = "counter"
+extraction = "form1"
+labels = []
+op = ">="
+threshold = 1
+severity = "SYNC"
+gates = ["warmup-2-ticks"]
+cooldown_key = "stellar_herder_lost_sync_total"
+cooldown_seconds = 3600
+filing_title = "metrics: stellar_herder_lost_sync_total — delta={value}"
+filing_search = "metrics: stellar_herder_lost_sync_total"
+summary = "Herder lost sync"
+details = "delta={value}"
+notes = "Semantic change in #2612: counter only increments on tracking timeout (parity with stellar-core mLostSync.Mark). Version bumped in #2642/#2661. silence_expected=true: a healthy node never loses sync, so 0% firing is expected — regression detector should not flag this as a regression."
+
+[[alarm]]
+name = "post-catchup-hard-reset"
+metric = "henyey_post_catchup_hard_reset_total"
+kind = "counter"
+extraction = "form1"
+labels = []
+op = ">="
+threshold = 1
+severity = "ACTION"
+gates = ["warmup-2-ticks"]
+cooldown_key = "henyey_post_catchup_hard_reset_total"
+cooldown_seconds = 7200
+filing_title = "metrics: henyey_post_catchup_hard_reset_total — delta={value}"
+filing_search = "metrics: henyey_post_catchup_hard_reset_total"
+summary = "Post-catchup hard reset detected"
+details = "delta={value}"
+notes = ""
+
+[[alarm]]
+name = "overlay-timeouts-spike"
+kind = "counter-dynamic"
+metric_sum = [
+    "stellar_overlay_timeout_idle_total",
+    "stellar_overlay_timeout_straggler_total",
+]
+extraction = "form1"
+labels = []
+multiplier = 5
+min_absolute = 5
+severity = "WARN"
+gates = ["warmup-2-ticks"]
+cooldown_key = "overlay_timeout_spike"
+cooldown_seconds = 3600
+filing_title = "metrics: overlay timeout spike — delta={value} (5x prior {prior_delta})"
+filing_search = "metrics: overlay timeout spike"
+summary = "Overlay timeout spike (5x prior tick)"
+details = "delta={value} prior_delta={prior_delta}"
+notes = ""
+
+[[alarm]]
+name = "overlay-errors-high"
+baseline_version = 2  # bumped in #2779: raise threshold 50→100 to absorb steady-state overlay churn
+semantic_change_date = "2026-05-16T00:00:00Z"
+kind = "counter"
+metric_sum = [
+    "stellar_overlay_error_read_total",
+    "stellar_overlay_error_write_total",
+]
+extraction = "form3"
+labels = []
+op = ">="
+threshold = 100
+severity = "WARN"
+gates = ["warmup-2-ticks"]
+cooldown_key = "overlay_error_total"
+cooldown_seconds = 3600
+filing_title = "metrics: overlay errors — delta={value} >= {threshold}"
+filing_search = "metrics: overlay errors"
+summary = "Overlay error count high"
+details = "delta={value} threshold={threshold}"
+notes = ""
+
+[[alarm]]
+name = "archive-cache-error"
+metric = "henyey_archive_cache_refresh_error_total"
+kind = "counter"
+extraction = "form1"
+labels = []
+op = ">="
+threshold = 1
+severity = "NONC"
+gates = []
+cooldown_key = "henyey_archive_cache_refresh_error_total"
+cooldown_seconds = 3600
+filing_title = "metrics: henyey_archive_cache_refresh_error_total — delta={value}"
+filing_search = "metrics: henyey_archive_cache_refresh_error_total"
+summary = "Archive cache refresh error"
+details = "delta={value}"
+notes = ""
+
+[[alarm]]
+name = "archive-cache-timeout"
+metric = "henyey_archive_cache_refresh_timeout_total"
+kind = "counter"
+extraction = "form1"
+labels = []
+op = ">="
+threshold = 3
+severity = "NONC"
+gates = []
+cooldown_key = "henyey_archive_cache_refresh_timeout_total"
+cooldown_seconds = 3600
+filing_title = "metrics: henyey_archive_cache_refresh_timeout_total — delta={value} >= {threshold}"
+filing_search = "metrics: henyey_archive_cache_refresh_timeout_total"
+summary = "Archive cache refresh timeouts"
+details = "delta={value} threshold={threshold}"
+notes = ""
+
+[[alarm]]
+name = "ledger-invariant-failure"
+metric = "stellar_ledger_invariant_failure_total"
+kind = "counter"
+extraction = "form1"
+labels = []
+op = ">="
+threshold = 1
+severity = "ACTION"
+gates = ["warmup-2-ticks"]
+cooldown_key = "stellar_ledger_invariant_failure_total"
+cooldown_seconds = 3600
+filing_title = "metrics: stellar_ledger_invariant_failure_total — delta={value}"
+filing_search = "metrics: stellar_ledger_invariant_failure_total"
+summary = "Ledger invariant failure detected"
+details = "delta={value}"
+notes = "Best-effort for strict invariants: counter increments before panic (crates/invariant/src/lib.rs). Process-down (Grafana rule 4) is primary for strict crashes. Reliable for non-strict."
+
+[[alarm]]
+name = "tx-internal-error"
+metric = "stellar_ledger_transaction_internal_error_total"
+kind = "counter"
+extraction = "form1"
+labels = []
+op = ">="
+threshold = 1
+severity = "ACTION"
+gates = ["warmup-2-ticks"]
+cooldown_key = "stellar_ledger_transaction_internal_error_total"
+cooldown_seconds = 3600
+filing_title = "metrics: stellar_ledger_transaction_internal_error_total — delta={value}"
+filing_search = "metrics: stellar_ledger_transaction_internal_error_total"
+summary = "Transaction internal error detected"
+details = "delta={value}"
+notes = ""
+
+# ── GAUGES ───────────────────────────────────────────────────────────────────
+
+[[alarm]]
+name = "quorum-fail-at-low"
+baseline_version = 2  # bumped in #2711: threshold tightened from <=1 to <=0 to eliminate mainnet steady-state floor false-positive (invalidates prior acks)
+semantic_change_date = "2026-05-16T00:00:00Z"  # tightened threshold per #2711 (was <=1, structurally fired at healthy mainnet floor)
+metric = "stellar_quorum_fail_at"
+kind = "gauge"
+extraction = "form1"
+labels = []
+op = "<="
+threshold = 0
+for_ticks = 3
+severity = "WARN"
+gates = ["synced-only", "validator-only", "warmup-2-ticks"]
+cooldown_key = "stellar_quorum_fail_at_low"
+cooldown_seconds = 1800
+filing_title = "metrics: stellar_quorum_fail_at — value={value} (quorum critical)"
+filing_search = "metrics: stellar_quorum_fail_at"
+summary = "Quorum fail-at critical (one drop wedges or already v-blocked)"
+details = "value={value} threshold={threshold}"
+notes = "Fires only when fail_at <= 0 (metric form excludes self; 0 means one more peer failure v-blocks consensus, or we are already v-blocked). On mainnet's standard topology (4 orgs × inner-3/outer-6 validators) the closest v-blocking set is 2 nodes, so the exclude-self metric floor is 1 even at full health (agree=21, missing=0); the previous <=1 threshold fired structurally on this steady state — see #2711. Related: #2614 (post-restart transient, handled by warmup-2-ticks gate), #2624 (real degradation with missing=1, still caught when fail_at reaches 0). Monitor-tick now collapses onto Grafana's critical tier (< 1); Grafana's separate == 1 warn tier remains for fleet-wide visibility (severity remains WARN per monitor-tick paging policy — the \"critical tier\" wording refers to Grafana's tier label, not paging severity). Short cooldown (30min) ensures repeated fail_at=0 events are not suppressed."
+# NOTE: surface mirror, NOT threshold-identical. Monitor-tick uses per-tick
+# gauge <= 0 with 3-tick persistence (critical-tier semantics); Grafana uses
+# == 1 warn / < 1 critical with 5m for-duration.
+
+[[alarm]]
+name = "peer-count-low"
+metric = "stellar_peer_count"
+kind = "gauge"
+extraction = "form1"
+labels = []
+op = "<"
+threshold = 8
+for_ticks = 1
+severity = "WARN"
+gates = ["warmup-2-ticks"]
+cooldown_key = "stellar_peer_count"
+cooldown_seconds = 3600
+filing_title = "metrics: stellar_peer_count — {value} < {threshold}"
+filing_search = "metrics: stellar_peer_count"
+summary = "Peer count below threshold"
+details = "peer_count={value} threshold={threshold}"
+notes = ""
+
+[[alarm]]
+name = "inbound-auth-low"
+metric = "stellar_overlay_inbound_authenticated"
+kind = "gauge"
+extraction = "form1"
+labels = []
+op = "<"
+threshold = 3
+for_ticks = 1
+severity = "WARN"
+gates = ["synced-only", "warmup-2-ticks"]
+cooldown_key = "stellar_overlay_inbound_authenticated"
+cooldown_seconds = 3600
+filing_title = "metrics: stellar_overlay_inbound_authenticated — {value} < {threshold}"
+filing_search = "metrics: stellar_overlay_inbound_authenticated"
+summary = "Inbound authenticated peers below threshold"
+details = "inbound_auth={value} threshold={threshold}"
+notes = "Healthy fleet has 50+ inbound. Aggregate peer_count can be >=8 from outbound while inbound starves consensus."
+
+[[alarm]]
+name = "ledger-age-high"
+metric = "stellar_ledger_age_current_seconds"
+kind = "gauge"
+extraction = "form1"
+labels = []
+op = ">"
+threshold = 30
+for_ticks = 1
+severity = "SYNC"
+gates = ["synced-only"]
+cooldown_key = "stellar_ledger_age_current_seconds"
+cooldown_seconds = 3600
+filing_title = "metrics: stellar_ledger_age_current_seconds — {value}s > {threshold}s"
+filing_search = "metrics: stellar_ledger_age_current_seconds"
+summary = "Ledger age above threshold"
+details = "ledger_age={value}s threshold={threshold}s"
+notes = ""
+
+[[alarm]]
+name = "herder-not-tracking"
+metric = "stellar_herder_state"
+kind = "gauge"
+extraction = "form1"
+labels = []
+op = "!="
+threshold = 2
+for_ticks = 1
+severity = "SYNC"
+gates = ["synced-only"]
+cooldown_key = "stellar_herder_state"
+cooldown_seconds = 3600
+filing_title = "metrics: stellar_herder_state — {value} != 2 (not tracking)"
+filing_search = "metrics: stellar_herder_state"
+summary = "Herder not in tracking state"
+details = "herder_state={value} expected=2"
+notes = ""
+
+[[alarm]]
+name = "jemalloc-frag-high"
+metric = "henyey_jemalloc_fragmentation_pct"
+kind = "gauge"
+extraction = "form1"
+labels = []
+op = ">"
+threshold = 50
+for_ticks = 2
+severity = "WARN"
+gates = ["warmup-2-ticks"]
+cooldown_key = "henyey_jemalloc_fragmentation_pct"
+cooldown_seconds = 3600
+filing_title = "metrics: henyey_jemalloc_fragmentation_pct — {value}% > {threshold}% (2 ticks)"
+filing_search = "metrics: henyey_jemalloc_fragmentation_pct"
+summary = "Jemalloc fragmentation high (sustained)"
+details = "fragmentation={value}% threshold={threshold}%"
+notes = "Post-restart frag ramps ~35-45%, settles to ~18%."
+
+[[alarm]]
+name = "scp-verify-backlog"
+metric = "henyey_scp_verify_input_backlog"
+kind = "gauge"
+extraction = "form1"
+labels = []
+op = ">"
+threshold = 100
+for_ticks = 2
+severity = "WARN"
+gates = ["validator-only"]
+cooldown_key = "henyey_scp_verify_input_backlog"
+cooldown_seconds = 3600
+filing_title = "metrics: henyey_scp_verify_input_backlog — {value} > {threshold} (2 ticks)"
+filing_search = "metrics: henyey_scp_verify_input_backlog"
+summary = "SCP verify input backlog high (sustained)"
+details = "backlog={value} threshold={threshold}"
+notes = "Single snapshots routinely spike to 100+ during slot externalize bursts and drain to 0 within seconds. Sample /metrics 5x at 2s intervals to verify before filing."
+
+[[alarm]]
+name = "scp-verifier-dead"
+metric = "henyey_scp_verifier_thread_state"
+kind = "gauge"
+extraction = "form1"
+labels = []
+op = "!="
+threshold = 0
+for_ticks = 1
+severity = "WARN"
+gates = ["validator-only"]
+cooldown_key = "henyey_scp_verifier_thread_state"
+cooldown_seconds = 3600
+filing_title = "metrics: henyey_scp_verifier_thread_state — {value} != 0"
+filing_search = "metrics: henyey_scp_verifier_thread_state"
+summary = "SCP verifier thread not running"
+details = "state={value} (0=Running, 1=Stopping, 2=Dead)"
+notes = ""
+
+[[alarm]]
+name = "pending-envelopes-high"
+metric = "stellar_herder_pending_envelopes"
+kind = "gauge"
+extraction = "form1"
+labels = []
+op = ">"
+threshold = 2000
+for_ticks = 1
+severity = "WARN"
+gates = ["validator-only"]
+cooldown_key = "stellar_herder_pending_envelopes"
+cooldown_seconds = 3600
+filing_title = "metrics: stellar_herder_pending_envelopes — {value} > {threshold}"
+filing_search = "metrics: stellar_herder_pending_envelopes"
+summary = "Pending envelopes above threshold"
+details = "pending={value} threshold={threshold}"
+notes = ""
+
+[[alarm]]
+name = "fetch-channel-deep"
+metric = "henyey_overlay_fetch_channel_depth"
+kind = "gauge"
+extraction = "form1"
+labels = []
+op = ">"
+threshold = 500
+for_ticks = 2
+severity = "WARN"
+gates = []
+cooldown_key = "henyey_overlay_fetch_channel_depth"
+cooldown_seconds = 3600
+filing_title = "metrics: henyey_overlay_fetch_channel_depth — {value} > {threshold} (2 ticks)"
+filing_search = "metrics: henyey_overlay_fetch_channel_depth"
+summary = "Overlay fetch channel depth high (sustained)"
+details = "depth={value} threshold={threshold}"
+notes = "The _max variant is a monotonic high-water mark that never resets after catchup-tail spikes — use the live gauge with persistence guard. Sample /metrics 5x at 2s intervals to verify before filing."
+
+[[alarm]]
+name = "fd-exhaustion"
+kind = "gauge-ratio"
+numerator_metric = "henyey_process_open_fds"
+numerator_extraction = "form1"
+denominator_metric = "henyey_process_max_fds"
+denominator_extraction = "form1"
+absent_denominator = "skip"
+op = ">"
+threshold = 0.85
+for_ticks = 1
+severity = "WARN"
+gates = []
+cooldown_key = "fd_exhaustion_ratio"
+cooldown_seconds = 3600
+filing_title = "metrics: fd exhaustion — open/max={value} > {threshold}"
+filing_search = "metrics: fd exhaustion"
+summary = "FD usage above 85%"
+details = "open_fds/max_fds={value} threshold={threshold}"
+notes = "henyey_process_max_fds is absent on non-Linux / RLIM_INFINITY — alarm is silently disabled."
+
+[[alarm]]
+name = "herder-drift-high"
+metric = "henyey_herder_drift_max_seconds"
+kind = "gauge"
+extraction = "form1"
+labels = []
+op = ">"
+threshold = 10
+for_ticks = 1
+severity = "NONC"
+gates = []
+cooldown_key = "henyey_herder_drift_max_seconds"
+cooldown_seconds = 3600
+filing_title = "metrics: henyey_herder_drift_max_seconds — {value}s > {threshold}s"
+filing_search = "metrics: henyey_herder_drift_max_seconds"
+summary = "Herder drift above threshold"
+details = "drift_max={value}s threshold={threshold}s"
+notes = ""
+
+[[alarm]]
+name = "scp-externalize-slow"
+metric = "stellar_scp_timing_externalized_seconds"
+kind = "gauge"
+extraction = "form1"
+labels = []
+op = ">"
+threshold = 10
+for_ticks = 1
+severity = "WARN"
+gates = ["warmup-2-ticks", "validator-only"]
+cooldown_key = "stellar_scp_timing_externalized_seconds"
+cooldown_seconds = 3600
+filing_title = "metrics: stellar_scp_timing_externalized_seconds — {value}s > {threshold}s"
+filing_search = "metrics: stellar_scp_timing_externalized_seconds"
+summary = "SCP externalize time too high"
+details = "externalize_time={value}s threshold={threshold}s"
+notes = "SLOT-CYCLE metric: first-envelope-received to self-externalize, naturally ~4-6s on mainnet 5s slots. >10s = real degradation."
+
+[[alarm]]
+name = "scp-nominate-slow"
+metric = "stellar_scp_timing_nominated_seconds"
+kind = "gauge"
+extraction = "form1"
+labels = []
+op = ">"
+threshold = 7
+for_ticks = 1
+severity = "WARN"
+gates = ["warmup-2-ticks", "validator-only"]
+cooldown_key = "stellar_scp_timing_nominated_seconds"
+cooldown_seconds = 3600
+filing_title = "metrics: stellar_scp_timing_nominated_seconds — {value}s > {threshold}s"
+filing_search = "metrics: stellar_scp_timing_nominated_seconds"
+summary = "SCP nominate time too high"
+details = "nominate_time={value}s threshold={threshold}s"
+notes = "SLOT-CYCLE metric measured from first local nomination vote to self-externalize; healthy floor ~3-5s on mainnet."
+
+# ── HISTOGRAMS ───────────────────────────────────────────────────────────────
+
+[[alarm]]
+name = "lc-handle-complete-slow"
+metric = "henyey_ledger_close_handle_complete_seconds"
+kind = "histogram-p99"
+expected_suffixes = ["_bucket", "_sum", "_count"]
+p99_threshold = 0.5
+mean_threshold = 0.5
+min_count_delta = 20
+severity = "WARN"
+gates = ["validator-only"]
+cooldown_key = "henyey_ledger_close_handle_complete_seconds"
+cooldown_seconds = 3600
+filing_title = "metrics: henyey_ledger_close_handle_complete_seconds p99 — {value}s > {threshold}s"
+filing_search = "metrics: henyey_ledger_close_handle_complete_seconds"
+summary = "Ledger close handle-complete p99 too high"
+details = "p99={p99_value}s mean={mean_value}s threshold={threshold}s"
+notes = ""
+
+[[alarm]]
+name = "lc-dispatch-to-join-slow"
+baseline_version = 2  # bumped in #2641: p99_threshold adjusted for CLOSE_CADENCE_BUCKETS (dd202bd1)
+semantic_change_date = "2026-05-13T06:00:00Z"  # deployed via #2641 (dd202bd1)
+metric = "henyey_ledger_close_dispatch_to_join_seconds"
+kind = "histogram-p99"
+expected_suffixes = ["_bucket", "_sum", "_count"]
+p99_threshold = 7.0
+mean_threshold = 5.0
+min_count_delta = 20
+severity = "WARN"
+gates = ["validator-only"]
+cooldown_key = "henyey_ledger_close_dispatch_to_join_seconds"
+cooldown_seconds = 3600
+filing_title = "metrics: henyey_ledger_close_dispatch_to_join_seconds p99 — {value}s > {threshold}s"
+filing_search = "metrics: henyey_ledger_close_dispatch_to_join_seconds"
+summary = "Ledger close dispatch-to-join p99 too high"
+details = "p99={p99_value}s mean={mean_value}s threshold={threshold}s"
+notes = "Threshold 7.0 fires at ≥8s bucket (strict >). Slot interval is ~5s; normal p99 is 5-6s. Fires indicate thread pool contention or I/O stalls."
+
+[[alarm]]
+name = "lc-post-complete-slow"
+metric = "henyey_ledger_close_post_complete_seconds"
+kind = "histogram-p99"
+expected_suffixes = ["_bucket", "_sum", "_count"]
+p99_threshold = 0.5
+mean_threshold = 0.5
+min_count_delta = 20
+severity = "WARN"
+gates = ["validator-only"]
+cooldown_key = "henyey_ledger_close_post_complete_seconds"
+cooldown_seconds = 3600
+filing_title = "metrics: henyey_ledger_close_post_complete_seconds p99 — {value}s > {threshold}s"
+filing_search = "metrics: henyey_ledger_close_post_complete_seconds"
+summary = "Ledger close post-complete p99 too high"
+details = "p99={p99_value}s mean={mean_value}s threshold={threshold}s"
+notes = ""
+
+[[alarm]]
+name = "lc-tx-exec-slow"
+metric = "henyey_ledger_close_tx_exec_seconds"
+kind = "histogram-p99"
+expected_suffixes = ["_bucket", "_sum", "_count"]
+p99_threshold = 1.0
+mean_threshold = 1.0
+min_count_delta = 20
+severity = "WARN"
+gates = ["validator-only"]
+cooldown_key = "henyey_ledger_close_tx_exec_seconds"
+cooldown_seconds = 3600
+filing_title = "metrics: henyey_ledger_close_tx_exec_seconds p99 — {value}s > {threshold}s"
+filing_search = "metrics: henyey_ledger_close_tx_exec_seconds"
+summary = "Ledger close TX exec p99 too high"
+details = "p99={p99_value}s mean={mean_value}s threshold={threshold}s"
+notes = ""
+
+[[alarm]]
+name = "lc-soroban-exec-slow"
+metric = "henyey_ledger_close_soroban_exec_seconds"
+kind = "histogram-p99"
+expected_suffixes = ["_bucket", "_sum", "_count"]
+p99_threshold = 1.0
+mean_threshold = 1.0
+min_count_delta = 20
+severity = "WARN"
+gates = ["validator-only"]
+cooldown_key = "henyey_ledger_close_soroban_exec_seconds"
+cooldown_seconds = 3600
+filing_title = "metrics: henyey_ledger_close_soroban_exec_seconds p99 — {value}s > {threshold}s"
+filing_search = "metrics: henyey_ledger_close_soroban_exec_seconds"
+summary = "Ledger close Soroban exec p99 too high"
+details = "p99={p99_value}s mean={mean_value}s threshold={threshold}s"
+notes = ""
+
+[[alarm]]
+name = "lc-commit-slow"
+metric = "henyey_ledger_close_commit_seconds"
+kind = "histogram-p99"
+expected_suffixes = ["_bucket", "_sum", "_count"]
+p99_threshold = 0.5
+mean_threshold = 0.5
+min_count_delta = 20
+severity = "WARN"
+gates = ["validator-only"]
+cooldown_key = "henyey_ledger_close_commit_seconds"
+cooldown_seconds = 3600
+filing_title = "metrics: henyey_ledger_close_commit_seconds p99 — {value}s > {threshold}s"
+filing_search = "metrics: henyey_ledger_close_commit_seconds"
+summary = "Ledger close commit p99 too high"
+details = "p99={p99_value}s mean={mean_value}s threshold={threshold}s"
+notes = ""
+
+[[alarm]]
+name = "lc-soroban-state-slow"
+metric = "henyey_ledger_close_soroban_state_seconds"
+kind = "histogram-p99"
+expected_suffixes = ["_bucket", "_sum", "_count"]
+p99_threshold = 0.5
+mean_threshold = 0.5
+min_count_delta = 20
+severity = "WARN"
+gates = ["validator-only"]
+cooldown_key = "henyey_ledger_close_soroban_state_seconds"
+cooldown_seconds = 3600
+filing_title = "metrics: henyey_ledger_close_soroban_state_seconds p99 — {value}s > {threshold}s"
+filing_search = "metrics: henyey_ledger_close_soroban_state_seconds"
+summary = "Ledger close Soroban state p99 too high"
+details = "p99={p99_value}s mean={mean_value}s threshold={threshold}s"
+notes = ""
+
+[[alarm]]
+name = "lc-complete-tx-queue-slow"
+metric = "henyey_ledger_close_complete_tx_queue_seconds"
+kind = "histogram-p99"
+expected_suffixes = ["_bucket", "_sum", "_count"]
+p99_threshold = 0.5
+mean_threshold = 0.5
+min_count_delta = 20
+severity = "WARN"
+gates = ["validator-only"]
+cooldown_key = "henyey_ledger_close_complete_tx_queue_seconds"
+cooldown_seconds = 3600
+filing_title = "metrics: henyey_ledger_close_complete_tx_queue_seconds p99 — {value}s > {threshold}s"
+filing_search = "metrics: henyey_ledger_close_complete_tx_queue_seconds"
+summary = "Ledger close complete-TX-queue p99 too high"
+details = "p99={p99_value}s mean={mean_value}s threshold={threshold}s"
+notes = ""
+
+# ── COUNTER-RATIO (ratio checks) ────────────────────────────────────────────
+
+[[alarm]]
+name = "scp-accept-rate-low"
+kind = "counter-ratio"
+numerator_sum = [
+    "henyey_scp_post_verify_total{reason=\"accepted\"}",
+    "henyey_scp_post_verify_total{reason=\"processed_directly\"}",
+]
+numerator_extraction = "form2"
+denominator = "henyey_scp_post_verify_total"
+denominator_extraction = "form2-sum-all"
+denominator_includes_numerator = true
+expected_labels = [
+    "invalid_sig", "panic", "drift_range", "drift_close_time",
+    "drift_cannot_receive", "self_message", "non_quorum", "buffered",
+    "duplicate", "too_far", "buffer_full", "processed_directly",
+    "per_slot_full", "accepted", "drift_manual_close",
+]
+ratio_op = "<"
+ratio_threshold = 0.05
+min_volume = 500
+streak_threshold = 3
+severity = "WARN"
+gates = ["synced-only", "validator-only"]
+cooldown_key = "scp_accept_rate"
+cooldown_seconds = 3600
+filing_title = "metrics: SCP accept rate — {value} < {threshold} ({streak} ticks)"
+filing_search = "metrics: SCP accept rate"
+summary = "SCP post-verify acceptance rate too low"
+details = "accept_rate={value} threshold={threshold} streak={streak}/{streak_threshold}"
+notes = "Investigate verifier thread, stale envelopes, sync state."
+
+[[alarm]]
+name = "apply-failure-ratio"
+kind = "counter-ratio"
+numerator = "stellar_ledger_apply_failure_total"
+numerator_extraction = "form1"
+denominator_sum = [
+    "stellar_ledger_apply_failure_total",
+    "stellar_ledger_apply_success_total",
+]
+denominator_extraction = "form1"
+denominator_includes_numerator = true
+ratio_op = ">"
+ratio_threshold = 0.50
+min_volume = 200
+streak_threshold = 3
+severity = "WARN"
+gates = ["synced-only", "validator-only"]
+cooldown_key = "apply_failure_ratio"
+cooldown_seconds = 3600
+filing_title = "metrics: apply failure ratio — {value} > {threshold} ({streak} ticks)"
+filing_search = "metrics: apply failure ratio"
+summary = "Transaction apply failure ratio too high"
+details = "fail_ratio={value} threshold={threshold} streak={streak}/{streak_threshold}"
+notes = "If expected bad-tx traffic (spam wave, known rejections), report as WARNING without filing."
+
+[[alarm]]
+name = "pending-too-old-ratio"
+kind = "counter-ratio"
+numerator = "stellar_herder_pending_too_old_total"
+numerator_extraction = "form1"
+denominator = "stellar_herder_pending_received_total"
+denominator_extraction = "form1"
+denominator_includes_numerator = false
+ratio_op = ">"
+ratio_threshold = 0.50
+min_volume = 100
+streak_threshold = 3
+severity = "WARN"
+gates = ["synced-only", "validator-only"]
+# pending counters are optional — if missing, only this check skips
+optional_counters = true
+cooldown_key = "pending_too_old_ratio"
+cooldown_seconds = 3600
+filing_title = "metrics: pending too-old ratio — {value} > {threshold} ({streak} ticks)"
+filing_search = "metrics: pending too-old ratio"
+summary = "Pending too-old ratio too high"
+details = "too_old_ratio={value} threshold={threshold} streak={streak}/{streak_threshold}"
+notes = "Overlay lag or stale-envelope flood. Investigate overlay peer health and slot progression."
+
+# ── COUNTER-STREAK (check 12b) ──────────────────────────────────────────────
+# Folded from .claude/skills/shared/check-12b-constants.toml
+
+[[alarm]]
+name = "recovery-stalled"
+metric = "henyey_recovery_stalled_tick_total"
+kind = "counter-streak"
+extraction = "form2"
+labels = [{ key = "reason", value = "forcing_catchup_behind" }]
+# Relaxed label validation: only forcing_catchup_behind required.
+# Other labels (backoff_active, forcing_catchup_not_behind, etc.) are
+# created dynamically on first use — may not exist on fresh nodes.
+delta_threshold = 1
+streak_threshold = 3
+burst_threshold = 10
+# Post-restart absolute-value fire (#3198). On a PID/start_ticks change (restart)
+# or a counter reset the streak baseline is re-collected and the cross-tick delta
+# machine is blind to a stall that accrued during startup/warmup. If the first
+# post-reset observation already shows an absolute value >= this threshold, fire
+# WARN once on the reset tick (independent of the 15m sync deadline). The #3197
+# episode accrued 213; a clean restart reaching real-time sync promptly accrues
+# only a handful. 0/absent disables the check.
+post_restart_absolute_threshold = 50
+baseline_version = 3  # bumped in #3222: de-double snapshot_file (metrics/ prefix removed → bare filename)
+semantic_change_date = "2026-06-07T00:00:00Z"
+severity = "WARN"
+gates = ["validator-only"]
+snapshot_file = "counter_streak_snapshot"
+cooldown_key = "henyey_recovery_stalled_tick_total{reason=\"forcing_catchup_behind\"}"
+cooldown_seconds = 7200
+filing_title = "metrics: henyey_recovery_stalled_tick_total{reason=\"forcing_catchup_behind\"} — sustained breach"
+filing_search = "metrics: henyey_recovery_stalled_tick_total{reason=\"forcing_catchup_behind\"}"
+summary = "Recovery stalled — sustained breach"
+details = "delta={value} streak={streak}/{streak_threshold}"
+notes = ""
+
+# ── GAUGE (quorum intersection) ────────────────────────────────────────────
+
+[[alarm]]
+name = "quorum-intersection-lost"
+metric = "stellar_quorum_transitive_intersection"
+kind = "gauge"
+extraction = "form1"
+labels = []
+op = "=="
+threshold = 0
+severity = "ACTION"
+gates = ["synced-only", "validator-only"]
+cooldown_key = "stellar_quorum_transitive_intersection"
+cooldown_seconds = 3600
+filing_title = "metrics: stellar_quorum_transitive_intersection — quorum intersection lost"
+filing_search = "metrics: stellar_quorum_transitive_intersection"
+summary = "Quorum intersection lost"
+details = "Network no longer enjoys transitive quorum intersection"
+notes = ""

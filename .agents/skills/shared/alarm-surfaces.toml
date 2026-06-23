@@ -1,0 +1,132 @@
+# Alarm surface classification — single source of truth.
+#
+# Maps each Grafana alert UID to its classification: either mirrored by a
+# monitor-tick alarm in metric-alarms.toml, or intentionally Grafana-only.
+#
+# See ALARM_SURFACES.md for the human-readable policy and generated tables.
+#
+# Schema invariants (enforced by tests):
+#   FILE-LOCAL:
+#     - Each toml_name is unique across all [[mirrored]] entries
+#     - Each grafana_uid list is non-empty
+#     - No Grafana UID appears in more than one entry (mirrored or grafana_only)
+#   CROSS-FILE:
+#     - Each toml_name resolves to an alarm name in metric-alarms.toml
+#     - Each grafana_uid resolves to a uid in henyey-slo-alerts.yaml
+#     - Union of all UIDs here == set of UIDs in henyey-slo-alerts.yaml
+#     - henyey-slo-alerts.yaml UIDs are themselves unique
+
+# ── Mirrored alarms (present in both surfaces) ──────────────────────────────
+
+[[mirrored]]
+alarm = "Invariant failure"
+toml_name = "ledger-invariant-failure"
+grafana_uid = ["henyey-invariant-failure"]
+monitor_tick = "counter ≥ 1, ACTION"
+grafana = "increase > 0 over 10m, critical"
+notes = "Monitor-tick best-effort for strict (panic before scrape)"
+
+[[mirrored]]
+alarm = "TX internal error"
+toml_name = "tx-internal-error"
+grafana_uid = ["henyey-tx-internal-error"]
+monitor_tick = "counter ≥ 1, ACTION"
+grafana = "rate > 0.01 over 5m, critical"
+notes = "Different detection semantics (any vs rate)"
+
+[[mirrored]]
+alarm = "Quorum fail-at"
+toml_name = "quorum-fail-at-low"
+grafana_uid = ["henyey-quorum-failat-warn", "henyey-quorum-failat-crit"]
+monitor_tick = "gauge ≤ 0, WARN, 3 ticks"
+grafana = "== 1 warn / < 1 critical, 5m"
+notes = "Monitor-tick collapses tiers onto Grafana's critical (< 1); Grafana's == 1 warn tier remains fleet-wide visibility only"
+
+[[mirrored]]
+alarm = "Post-catchup reset"
+toml_name = "post-catchup-hard-reset"
+grafana_uid = ["henyey-post-catchup-hard-reset"]
+monitor_tick = "counter ≥ 1, ACTION"
+grafana = "increase > 0 over 10m, critical"
+notes = ""
+
+[[mirrored]]
+alarm = "Recovery stalled"
+toml_name = "recovery-stalled"
+grafana_uid = ["henyey-recovery-stalled"]
+monitor_tick = "counter-streak ≥ 3, WARN"
+grafana = "increase >= 3 over 10m, warning"
+notes = ""
+
+[[mirrored]]
+alarm = "Fetch channel depth"
+toml_name = "fetch-channel-deep"
+grafana_uid = ["henyey-overlay-fetch-depth"]
+monitor_tick = "gauge > 500, WARN, 2 ticks"
+grafana = "> 128, warning, 5m"
+notes = "Different thresholds"
+
+[[mirrored]]
+alarm = "FD exhaustion"
+toml_name = "fd-exhaustion"
+grafana_uid = ["henyey-fd-exhaustion-warn", "henyey-fd-exhaustion-crit"]
+monitor_tick = "ratio > 0.85, WARN"
+grafana = "> 0.6 warn / > 0.8 crit, 5m"
+notes = "Different thresholds"
+
+[[mirrored]]
+alarm = "Ledger age"
+toml_name = "ledger-age-high"
+grafana_uid = ["henyey-ledger-age-warn", "henyey-ledger-age-crit"]
+monitor_tick = "gauge > 30, SYNC"
+grafana = "> 10 warn / > 30 crit, 5m; guards on herder_state == 2"
+notes = ""
+
+[[mirrored]]
+alarm = "Peer count"
+toml_name = "peer-count-low"
+grafana_uid = ["henyey-peer-count-warn", "henyey-peer-count-crit"]
+monitor_tick = "gauge < 8, WARN"
+grafana = "< 8 warn / < 3 crit, 5m"
+notes = ""
+
+[[mirrored]]
+alarm = "Validator not tracking"
+toml_name = "herder-not-tracking"
+grafana_uid = ["henyey-validator-not-tracking"]
+monitor_tick = "gauge != 2, SYNC"
+grafana = "!= bool 2, warning, 20m"
+notes = ""
+
+[[mirrored]]
+alarm = "Fragmentation"
+toml_name = "jemalloc-frag-high"
+grafana_uid = ["henyey-fragmentation"]
+monitor_tick = "gauge > 50, WARN, 2 ticks"
+grafana = "> 50%, warning, 15m"
+notes = "Matching thresholds"
+
+[[mirrored]]
+alarm = "Quorum intersection lost"
+toml_name = "quorum-intersection-lost"
+grafana_uid = ["henyey-quorum-intersection-lost"]
+monitor_tick = "gauge == 0, ACTION"
+grafana = "< 1, critical, 5m"
+notes = "Both surfaces per policy"
+
+# ── Grafana-only alarms (no monitor-tick counterpart) ────────────────────────
+
+[[grafana_only]]
+grafana_uid = "henyey-process-down"
+alarm = "Process Down"
+rationale = "Process-down makes in-process alarms unreachable"
+
+[[grafana_only]]
+grafana_uid = "henyey-recovery-txset-stuck"
+alarm = "Recovery TX Set Stuck"
+rationale = "No current monitor-tick action needed"
+
+[[grafana_only]]
+grafana_uid = "henyey-quorum-missing"
+alarm = "Quorum Missing Peers"
+rationale = "Fleet-level visibility needed; monitor-tick covers via quorum-fail-at-low"
