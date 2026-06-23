@@ -3283,4 +3283,64 @@ mod tests {
             err_msg
         );
     }
+
+    /// Regression for #3552 (residual L16 `bucketListHash` divergence).
+    ///
+    /// At the ledger-16 hot-archive level-1→2 spill, both merge inputs are
+    /// empty (no entries, no metaentry ⇒ `get_protocol_version()` == 0), but the
+    /// merge is invoked with the CURRENT protocol (e.g. 27) as `maxProtocolVersion`.
+    /// stellar-core's `BucketOutputIterator` gates the metaentry on
+    /// `meta.ledgerVersion >= FIRST_PROTOCOL_SUPPORTING_INITENTRY_AND_METAENTRY`
+    /// (V11) (`BucketOutputIterator.cpp:45-72`). With the derived output version
+    /// 0 (< V11) it emits NO metaentry, so `mObjectsPut == 0` ⇒ a truly EMPTY
+    /// bucket (`getBucket`, `BucketOutputIterator.cpp:182-191`).
+    ///
+    /// Henyey instead unconditionally pushed a `{ledgerVersion: 0, ext: V0}`
+    /// metaentry, producing the meta-only bucket `d15ebeb4…` where core has an
+    /// empty bucket. That flips the hot-archive bucket-list hash, which combines
+    /// with the live hash into the header `bucketListHash` ⇒ the L16 consensus
+    /// divergence (henyey `759a1bbe…` vs core `9f58962b…`).
+    ///
+    /// Pre-fix this produced a non-empty `{v0,void}` meta-only bucket
+    /// (`d15ebeb4f9249d16…`); post-fix it is the canonical empty bucket.
+    #[test]
+    fn test_hot_archive_empty_input_merge_at_v27_yields_empty_not_v0_meta() {
+        // The d15ebeb4 divergent bucket: a single `{ledgerVersion:0, ext:V0}`
+        // HOT_ARCHIVE_METAENTRY (the exact 16-byte payload captured live).
+        let v0_meta_only = HotArchiveBucket::from_entries(vec![HotArchiveBucketEntry::Metaentry(
+            BucketMetadata {
+                ledger_version: 0,
+                ext: BucketMetadataExt::V0,
+            },
+        )])
+        .unwrap();
+        let v0_meta_only_hash = v0_meta_only.hash();
+
+        // Spill of two empty hot-archive buckets at the current protocol (27),
+        // exactly as the L16 level-1→2 hot-archive spill invokes it.
+        let merged = merge_hot_archive_buckets(
+            &HotArchiveBucket::empty(),
+            &HotArchiveBucket::empty(),
+            27,
+            true,
+        )
+        .unwrap();
+
+        assert_ne!(
+            merged.hash(),
+            v0_meta_only_hash,
+            "empty-input merge must NOT produce the {{v0,void}} meta-only bucket (d15ebeb4)"
+        );
+        assert!(
+            merged.is_empty(),
+            "empty-input merge at protocol 27 must yield an EMPTY hot-archive bucket (parity \
+             with stellar-core: output version 0 < V11 ⇒ no metaentry ⇒ empty), got hash {}",
+            merged.hash().to_hex()
+        );
+        assert!(
+            merged.hash().is_zero(),
+            "empty hot-archive bucket hash must be zero, got {}",
+            merged.hash().to_hex()
+        );
+    }
 }
