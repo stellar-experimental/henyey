@@ -1397,6 +1397,157 @@ mod tests {
     }
 
     #[test]
+    fn test_check_peer_timeouts_returns_reason() {
+        // #3570: check_peer_timeouts now returns Option<IdleReason> instead of
+        // bool, so the idle-drop call site can carry WHICH timeout fired into
+        // the diagnostic. The drop conditions themselves are unchanged.
+        use crate::flow_control::{FlowControl, FlowControlConfig};
+        let metrics = crate::metrics::OverlayMetrics::new();
+        let peer_id = PeerId::from_bytes([7u8; 32]);
+        let stale = Instant::now() - Duration::from_secs(40);
+        let fresh = Instant::now();
+
+        // Both clocks stale (>30s) → Idle.
+        let fc_with_capacity = FlowControl::default();
+        // Grant capacity so the send-mode-idle path does NOT fire, isolating Idle.
+        fc_with_capacity.maybe_release_capacity(&StellarMessage::SendMoreExtended(
+            stellar_xdr::SendMoreExtended {
+                num_messages: 10,
+                num_bytes: 10_000,
+            },
+        ));
+        assert_eq!(
+            OverlayManager::check_peer_timeouts(
+                &peer_id,
+                &PeerTimingInfo {
+                    last_read: stale,
+                    last_write: stale,
+                    total_messages: 2,
+                    scp_messages: 0,
+                },
+                &fc_with_capacity,
+                &metrics,
+            ),
+            Some(IdleReason::Idle),
+            "both clocks stale with capacity → Idle"
+        );
+
+        // Fresh clocks, but no outbound capacity for >=60s → SendModeIdle.
+        // A default FlowControl has no_outbound_capacity set at construction.
+        let fc_no_capacity = FlowControl::default();
+        assert_eq!(
+            OverlayManager::check_peer_timeouts(
+                &peer_id,
+                &PeerTimingInfo {
+                    last_read: fresh,
+                    last_write: fresh,
+                    total_messages: 2,
+                    scp_messages: 0,
+                },
+                &fc_no_capacity,
+                &metrics,
+            ),
+            Some(IdleReason::SendModeIdle),
+            "fresh clocks but no capacity for >=60s → SendModeIdle"
+        );
+
+        // Everything fresh and capacity granted → None.
+        assert_eq!(
+            OverlayManager::check_peer_timeouts(
+                &peer_id,
+                &PeerTimingInfo {
+                    last_read: fresh,
+                    last_write: fresh,
+                    total_messages: 10,
+                    scp_messages: 5,
+                },
+                &fc_with_capacity,
+                &metrics,
+            ),
+            None,
+            "fresh and capacitated → no timeout"
+        );
+    }
+
+    #[test]
+    fn test_inbound_idle_drop_emits_diag_with_flow_signals() {
+        // #3570: at the idle-timeout drop, gather an InboundDropDiag from the
+        // already-tracked per-peer state so the operator can pin WHY each
+        // inbound peer idles out. The leading-hypothesis signature is:
+        // idle_reason ∈ {Idle, SendModeIdle}, send_more_received=0 (peer never
+        // granted us capacity), scp_written=0 (we wrote no SCP envelopes),
+        // scp_queue_depth>0 (we HAD SCP to send but were blocked on capacity).
+        //
+        // We assert on the RETURNED STRUCT, not on scraped log output.
+        use crate::flow_control::FlowControl;
+        use stellar_xdr::{ScpEnvelope, ScpStatement, ScpStatementPledges};
+
+        // Inbound peer that authenticated but never sent SEND_MORE_EXTENDED back:
+        // no_outbound_capacity is set, send_more_received_count stays 0.
+        let fc = FlowControl::default();
+        assert_eq!(fc.get_stats().send_more_received_count, 0);
+
+        // Enqueue an SCP flood message so the SCP queue is non-empty (we have
+        // SCP to broadcast to this peer, but no capacity to send it).
+        let scp_env = ScpEnvelope {
+            statement: ScpStatement {
+                node_id: stellar_xdr::NodeId(stellar_xdr::PublicKey::PublicKeyTypeEd25519(
+                    stellar_xdr::Uint256([0u8; 32]),
+                )),
+                slot_index: 1,
+                pledges: ScpStatementPledges::Externalize(stellar_xdr::ScpStatementExternalize {
+                    commit: stellar_xdr::ScpBallot {
+                        counter: 1,
+                        value: vec![1u8].try_into().unwrap(),
+                    },
+                    n_h: 1,
+                    commit_quorum_set_hash: stellar_xdr::Hash([0u8; 32]),
+                }),
+            },
+            signature: stellar_xdr::Signature(Vec::new().try_into().unwrap()),
+        };
+        fc.add_msg_and_maybe_trim_queue(StellarMessage::ScpMessage(scp_env));
+        assert!(
+            fc.get_stats().scp_queue_size > 0,
+            "SCP flood message should be queued"
+        );
+
+        // Idle clock advanced past PEER_TIMEOUT for both read and write.
+        let stale = Instant::now() - Duration::from_secs(40);
+
+        // No SCP envelopes were written on this connection (capacity-blocked).
+        let scp_written: u64 = 0;
+
+        let diag = OverlayManager::build_inbound_drop_diag(
+            &fc,
+            stale, // last_read
+            stale, // last_write
+            scp_written,
+            IdleReason::Idle,
+        );
+
+        assert_eq!(diag.send_more_received, 0, "peer never granted capacity");
+        assert_eq!(diag.scp_written, 0, "no SCP envelopes written");
+        assert!(diag.scp_queue_depth > 0, "had SCP queued but blocked");
+        assert_eq!(diag.peer_message_capacity, 0, "no capacity granted");
+        assert!(
+            diag.last_write_age_secs >= 40,
+            "last_write age reflects the stale clock"
+        );
+        assert!(
+            diag.last_read_age_secs >= 40,
+            "last_read age reflects the stale clock"
+        );
+        assert!(
+            matches!(
+                diag.idle_reason,
+                IdleReason::Idle | IdleReason::SendModeIdle
+            ),
+            "idle_reason in the leading-hypothesis set"
+        );
+    }
+
+    #[test]
     fn test_idle_timeout_constants_match_upstream() {
         // Verify our timeout constants match stellar-core defaults:
         // - PEER_TIMEOUT = 30 (Config.cpp:258)

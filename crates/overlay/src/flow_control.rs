@@ -1569,6 +1569,49 @@ mod tests {
     }
 
     #[test]
+    fn test_send_more_received_count_increments() {
+        // #3570 observability: a fresh FlowControl has never received a
+        // SEND_MORE_EXTENDED grant, so the count is 0. Each
+        // `maybe_release_capacity` that processes a SEND_MORE_EXTENDED bumps a
+        // monotonic counter surfaced via `get_stats()`. Non-SEND_MORE messages
+        // do not bump it. This is the leading-hypothesis signal: an inbound
+        // peer that never grants capacity (count stays 0) idles out.
+        let fc = FlowControl::default();
+        assert_eq!(
+            fc.get_stats().send_more_received_count,
+            0,
+            "fresh FlowControl reports zero SEND_MORE grants received"
+        );
+
+        let send_more = StellarMessage::SendMoreExtended(SendMoreExtended {
+            num_messages: 1,
+            num_bytes: 1,
+        });
+        fc.maybe_release_capacity(&send_more);
+        assert_eq!(
+            fc.get_stats().send_more_received_count,
+            1,
+            "one SEND_MORE_EXTENDED bumps the counter to 1"
+        );
+
+        fc.maybe_release_capacity(&send_more);
+        assert_eq!(
+            fc.get_stats().send_more_received_count,
+            2,
+            "counter is monotonic across grants"
+        );
+
+        // A non-SEND_MORE message must NOT bump the counter.
+        let tx = make_tx_message();
+        fc.maybe_release_capacity(&tx);
+        assert_eq!(
+            fc.get_stats().send_more_received_count,
+            2,
+            "non-SEND_MORE message does not bump the SEND_MORE counter"
+        );
+    }
+
+    #[test]
     fn test_no_outbound_capacity_timeout_clears_after_send_more_extended() {
         let fc = FlowControl::default();
 
