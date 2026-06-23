@@ -221,7 +221,7 @@ pub async fn run_node(config: AppConfig, options: RunOptions) -> anyhow::Result<
     let http_handle = if http_enabled {
         #[cfg_attr(not(feature = "loadgen"), allow(unused_mut))]
         let mut status_server = StatusServer::new(http_port, http_address.clone(), app.clone());
-        status_server.set_prometheus_handle(prometheus_handle);
+        status_server.set_prometheus_handle(prometheus_handle.clone());
         #[cfg(feature = "loadgen")]
         if let Some(ref factory) = options.loadgen_runner_factory {
             status_server.set_loadgen_runner(factory(app.clone()));
@@ -251,6 +251,11 @@ pub async fn run_node(config: AppConfig, options: RunOptions) -> anyhow::Result<
         #[cfg_attr(not(feature = "loadgen"), allow(unused_mut))]
         let mut compat_server =
             CompatServer::new(compat_http_port, compat_http_address.clone(), app.clone());
+        // Thread the SAME Prometheus handle into the compat server so its
+        // `/metrics` medida JSON carries the `loadgen.*` meters supercluster
+        // reads (#3572). Without this the compat endpoint reports loadgen at 0
+        // even after a run completes, and henyey-driven SSC missions hang.
+        compat_server.set_prometheus_handle(prometheus_handle.clone());
         #[cfg(feature = "loadgen")]
         if let Some(ref factory) = options.loadgen_runner_factory {
             compat_server.set_loadgen_runner(factory(app.clone()));

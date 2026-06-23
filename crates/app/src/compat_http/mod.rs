@@ -32,6 +32,10 @@ pub(crate) struct CompatServerState {
     pub app: Arc<App>,
     /// ISO 8601 UTC timestamp of when the server started.
     pub started_on: String,
+    /// Prometheus metrics handle, used by the compat `/metrics` handler to
+    /// source the `loadgen.*` meter counts from the registry (#3572). `None`
+    /// when no recorder is wired (the loadgen meters then report 0).
+    pub prometheus_handle: Option<metrics_exporter_prometheus::PrometheusHandle>,
     /// Load generation state (only present when `loadgen` feature is enabled).
     #[cfg(feature = "loadgen")]
     pub loadgen_state: Option<Arc<crate::http::handlers::generateload::GenerateLoadState>>,
@@ -145,6 +149,7 @@ pub struct CompatServer {
     port: u16,
     address: String,
     app: Arc<App>,
+    prometheus_handle: Option<metrics_exporter_prometheus::PrometheusHandle>,
     #[cfg(feature = "loadgen")]
     loadgen_state: Option<Arc<crate::http::handlers::generateload::GenerateLoadState>>,
 }
@@ -156,9 +161,20 @@ impl CompatServer {
             port,
             address,
             app,
+            prometheus_handle: None,
             #[cfg(feature = "loadgen")]
             loadgen_state: None,
         }
+    }
+
+    /// Set the Prometheus handle (must be called before `start()`).
+    ///
+    /// The compat `/metrics` handler renders this handle and parses the
+    /// `loadgen_*` counter lines so the medida JSON supercluster reads carries
+    /// the `loadgen.*` meters (#3572). Mirrors
+    /// [`crate::http::StatusServer::set_prometheus_handle`].
+    pub fn set_prometheus_handle(&mut self, handle: metrics_exporter_prometheus::PrometheusHandle) {
+        self.prometheus_handle = Some(handle);
     }
 
     /// Set the load generation backend (must be called before `start()`).
@@ -178,6 +194,7 @@ impl CompatServer {
         let state = Arc::new(CompatServerState {
             app: self.app.clone(),
             started_on,
+            prometheus_handle: self.prometheus_handle,
             #[cfg(feature = "loadgen")]
             loadgen_state: self.loadgen_state,
         });

@@ -47,7 +47,74 @@ pub(crate) async fn compat_metrics_handler(
         ledger_tx_count,
     };
 
-    Json(build_metrics_json(&scalars, compat))
+    // Source the loadgen meter counts from the Prometheus registry (where #3571
+    // increments them across henyey-bin/simulation/app). The compat medida JSON
+    // and the Prometheus render are otherwise two divergent surfaces; rendering
+    // + parsing here keeps the registry the single source of truth. When no
+    // handle is wired (library consumers, tests without a recorder), the counts
+    // default to zero — matching the pre-registered-at-zero series.
+    let loadgen = match &state.prometheus_handle {
+        Some(handle) => parse_loadgen_counts(&handle.render()),
+        None => LoadgenCounts::default(),
+    };
+
+    Json(build_metrics_json(&scalars, compat, &loadgen))
+}
+
+/// Loadgen meter counts keyed by dotted medida key (e.g. `loadgen.run.start`).
+///
+/// Populated by [`parse_loadgen_counts`] from a Prometheus render; consumed by
+/// [`build_metrics_json`] to emit medida `meter` entries. Defaults to empty
+/// (all-zero) when no Prometheus handle is available.
+#[derive(Debug, Default)]
+struct LoadgenCounts {
+    /// dotted medida key → (count, event_type)
+    by_key: std::collections::HashMap<&'static str, (u64, &'static str)>,
+}
+
+impl LoadgenCounts {
+    /// Count for a dotted medida key; 0 if absent.
+    fn count(&self, dotted_key: &str) -> u64 {
+        self.by_key.get(dotted_key).map(|(c, _)| *c).unwrap_or(0)
+    }
+}
+
+/// Parse the loadgen counter values out of a Prometheus exposition render.
+///
+/// For each `(prom_name, dotted_key, event_type)` in
+/// [`crate::metrics::LOADGEN_COMPAT_MAP`], scan the render for a bare,
+/// label-less line whose first whitespace token equals `prom_name` exactly and
+/// extract the trailing `u64` value. Exact-token matching (not `contains`)
+/// avoids prefix collisions (`loadgen_run_start` vs a hypothetical
+/// `loadgen_run_start_total`). The series are pre-registered at zero by #3571
+/// so the lines normally exist; an absent line maps to 0 (omitted from the map,
+/// surfaced as 0 by [`LoadgenCounts::count`]).
+fn parse_loadgen_counts(render: &str) -> LoadgenCounts {
+    let mut by_key = std::collections::HashMap::new();
+    for &(prom_name, dotted_key, event_type) in crate::metrics::LOADGEN_COMPAT_MAP {
+        for line in render.lines() {
+            // Skip HELP/TYPE comment lines.
+            if line.starts_with('#') {
+                continue;
+            }
+            let mut tokens = line.split_whitespace();
+            // The exposition line for a label-less counter is `<name> <value>`.
+            // Reject any line carrying labels (`<name>{...} <value>`): the bare
+            // token must equal the metric name with no `{`.
+            if tokens.next() != Some(prom_name) {
+                continue;
+            }
+            if let Some(value_tok) = tokens.next() {
+                // Prometheus renders counters as integers; parse as f64 first to
+                // tolerate a `123` or `123.0` rendering, then truncate to u64.
+                if let Ok(v) = value_tok.parse::<f64>() {
+                    by_key.insert(dotted_key, (v as u64, event_type));
+                }
+            }
+            break;
+        }
+    }
+    LoadgenCounts { by_key }
 }
 
 /// Non-metrics-registry scalar values (counters/gauges) the handler reports.
@@ -71,6 +138,7 @@ struct MetricsScalars {
 fn build_metrics_json(
     s: &MetricsScalars,
     compat: &crate::medida_compat::MedidaCompat,
+    loadgen: &LoadgenCounts,
 ) -> serde_json::Value {
     let close_timer = compat.close_timer.snapshot();
     let close_meter = compat.close_meter.snapshot();
@@ -78,7 +146,7 @@ fn build_metrics_json(
     let scp_valid = compat.scp_value_valid.snapshot();
     let scp_invalid = compat.scp_value_invalid.snapshot();
 
-    serde_json::json!({
+    let mut value = serde_json::json!({
         "metrics": {
             "ledger.ledger.close": {
                 "type": "timer",
@@ -177,7 +245,35 @@ fn build_metrics_json(
                 "count": 0
             }
         }
-    })
+    });
+
+    // Append the loadgen.* meters ADDITIVELY, sourced from the Prometheus
+    // registry via LOADGEN_COMPAT_MAP (#3572). Supercluster's IsLoadGenComplete
+    // reads `loadgen.run.start`/`loadgen.run.complete`/`loadgen.account.created`/
+    // `loadgen.txn.attempted` from this medida JSON. Each entry is a medida
+    // `meter` whose load-bearing field is `count`; the rate fields are 0.0
+    // placeholders (supercluster's MeterCountOr reads only `.count`, and its
+    // JsonProvider only needs the keys present for type inference).
+    let metrics = value["metrics"]
+        .as_object_mut()
+        .expect("metrics object is built above");
+    for &(_, dotted_key, event_type) in crate::metrics::LOADGEN_COMPAT_MAP {
+        metrics.insert(
+            dotted_key.to_string(),
+            serde_json::json!({
+                "type": "meter",
+                "count": loadgen.count(dotted_key),
+                "event_type": event_type,
+                "rate_unit": "s",
+                "mean_rate": 0.0,
+                "1_min_rate": 0.0,
+                "5_min_rate": 0.0,
+                "15_min_rate": 0.0
+            }),
+        );
+    }
+
+    value
 }
 
 #[cfg(test)]
@@ -300,8 +396,13 @@ mod tests {
         }
     }
 
-    use super::{build_metrics_json, MetricsScalars};
+    use super::{build_metrics_json, parse_loadgen_counts, LoadgenCounts, MetricsScalars};
     use crate::medida_compat::MedidaCompat;
+    use crate::metrics::{
+        describe_metrics, register_label_series, LOADGEN_ACCOUNT_CREATED, LOADGEN_RUN_COMPLETE,
+        LOADGEN_RUN_START, LOADGEN_SOROBAN_SETUP_INVOKE, LOADGEN_TXN_ATTEMPTED,
+    };
+    use metrics_exporter_prometheus::PrometheusBuilder;
 
     fn test_scalars() -> MetricsScalars {
         MetricsScalars {
@@ -335,7 +436,7 @@ mod tests {
         // Feed scp meters from cumulative snapshots (delta-marked) in the past.
         compat.feed_scp_at(120, 7, past);
 
-        let v = build_metrics_json(&test_scalars(), &compat);
+        let v = build_metrics_json(&test_scalars(), &compat, &LoadgenCounts::default());
         let m = v["metrics"].as_object().unwrap();
 
         // --- Close timer: real percentiles + rate ---
@@ -392,8 +493,8 @@ mod tests {
         assert_eq!(invalid["event_type"], "value");
         assert_eq!(invalid["count"], 7, "scp.value.invalid count is real total");
 
-        // --- Shape preserved: all 13 metrics with type+count ---
-        assert_eq!(m.len(), 13, "should still emit 13 metrics");
+        // --- Shape preserved: 13 curated + 15 loadgen.* meters (#3572) ---
+        assert_eq!(m.len(), 28, "13 curated + 15 loadgen.* meters");
         for (name, metric) in m {
             assert!(metric.get("type").is_some(), "{name} has type");
             assert!(metric.get("count").is_some(), "{name} has count");
@@ -410,7 +511,7 @@ mod tests {
     #[test]
     fn test_metrics_zero_at_startup() {
         let compat = MedidaCompat::new_for_test();
-        let v = build_metrics_json(&test_scalars(), &compat);
+        let v = build_metrics_json(&test_scalars(), &compat, &LoadgenCounts::default());
         let m = v["metrics"].as_object().unwrap();
 
         let close = &m["ledger.ledger.close"];
@@ -447,19 +548,20 @@ mod tests {
             );
         }
 
-        // Shape contract: 13 metrics, all with type+count.
-        assert_eq!(m.len(), 13);
+        // Shape contract: 13 curated + 15 loadgen.* meters, all with type+count.
+        assert_eq!(m.len(), 28);
         for (name, metric) in m {
             assert!(metric.get("type").is_some(), "{name} has type");
             assert!(metric.get("count").is_some(), "{name} has count");
         }
+        // At startup the loadgen.* meters are present at 0 (so supercluster
+        // reads NotStarted, not a missing series).
+        let lg = &m["loadgen.run.start"];
+        assert_eq!(lg["type"], "meter");
+        assert_eq!(lg["count"], 0);
+        assert_eq!(lg["event_type"], "run");
     }
-    use super::{parse_loadgen_counts, LoadgenCounts};
-    use crate::metrics::{
-        describe_metrics, register_label_series, LOADGEN_ACCOUNT_CREATED, LOADGEN_RUN_COMPLETE,
-        LOADGEN_RUN_START, LOADGEN_SOROBAN_SETUP_INVOKE, LOADGEN_TXN_ATTEMPTED,
-    };
-    use metrics_exporter_prometheus::PrometheusBuilder;
+
     /// #3572 regression: drive a synthetic loadgen lifecycle through the
     /// Prometheus registry, render + parse it, build the COMPAT medida JSON, and
     /// assert the JSON (NOT the Prometheus render) carries the `loadgen.*`
