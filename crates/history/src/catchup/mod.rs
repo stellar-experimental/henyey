@@ -871,8 +871,12 @@ impl CatchupManager {
         );
         self.progress.target_ledger = target;
 
-        // Calculate the catchup range based on mode
-        let range = CatchupRange::calculate(lcl, target, mode);
+        // Calculate the catchup range based on mode. Bad/derived input
+        // (lcl < genesis, target <= lcl, target <= genesis) surfaces as a
+        // graceful error rather than aborting the process (#3567), matching
+        // stellar-core's checkCatchupPreconditions.
+        let range = CatchupRange::calculate(lcl, target, mode)
+            .map_err(|e| HistoryError::CatchupFailed(e.to_string()))?;
         info!("Catchup range: {:?}", range);
 
         let checkpoint_seq = match &range {

@@ -164,6 +164,57 @@ impl CatchupMode {
     }
 }
 
+/// Error returned by [`CatchupRange::calculate`] when its preconditions are
+/// not met.
+///
+/// These mirror stellar-core `CatchupRange.cpp::checkCatchupPreconditions`,
+/// which throws `std::invalid_argument` for the same three checks. A throw is
+/// a recoverable, catchable error in C++, so the parity-correct Rust analog is
+/// a `Result::Err` rather than a process abort.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CatchupRangeError {
+    /// `lcl` is below the genesis ledger sequence.
+    LclBeforeGenesis {
+        /// The offending last-closed-ledger value.
+        lcl: u32,
+    },
+    /// `target` is not strictly greater than `lcl`.
+    TargetNotAfterLcl {
+        /// The requested target ledger.
+        target: u32,
+        /// The current last-closed-ledger.
+        lcl: u32,
+    },
+    /// `target` is not strictly greater than the genesis ledger sequence.
+    TargetNotAfterGenesis {
+        /// The requested target ledger.
+        target: u32,
+    },
+}
+
+impl std::fmt::Display for CatchupRangeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            // Messages preserve the original assert wording for stability.
+            CatchupRangeError::LclBeforeGenesis { lcl } => {
+                write!(f, "lcl {} must be >= genesis {}", lcl, GENESIS_LEDGER_SEQ)
+            }
+            CatchupRangeError::TargetNotAfterLcl { target, lcl } => {
+                write!(f, "target {} must be > lcl {}", target, lcl)
+            }
+            CatchupRangeError::TargetNotAfterGenesis { target } => {
+                write!(
+                    f,
+                    "target {} must be > genesis {}",
+                    target, GENESIS_LEDGER_SEQ
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for CatchupRangeError {}
+
 /// Error type for parsing CatchupMode.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParseCatchupModeError(String);
@@ -290,24 +341,28 @@ impl CatchupRange {
     /// * `target` - Target ledger to catch up to (must be > lcl)
     /// * `mode` - Catchup mode determining history depth
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if preconditions are not met.
-    pub(crate) fn calculate(lcl: u32, target: u32, mode: CatchupMode) -> Self {
-        // Validate preconditions
-        assert!(
-            lcl >= GENESIS_LEDGER_SEQ,
-            "lcl {} must be >= genesis {}",
-            lcl,
-            GENESIS_LEDGER_SEQ
-        );
-        assert!(target > lcl, "target {} must be > lcl {}", target, lcl);
-        assert!(
-            target > GENESIS_LEDGER_SEQ,
-            "target {} must be > genesis {}",
-            target,
-            GENESIS_LEDGER_SEQ
-        );
+    /// Returns [`CatchupRangeError`] if the preconditions are not met:
+    /// `lcl >= GENESIS_LEDGER_SEQ`, `target > lcl`, and
+    /// `target > GENESIS_LEDGER_SEQ`. These are recoverable errors (matching
+    /// stellar-core's `checkCatchupPreconditions`), surfaced gracefully to
+    /// callers rather than aborting the process.
+    pub(crate) fn calculate(
+        lcl: u32,
+        target: u32,
+        mode: CatchupMode,
+    ) -> Result<Self, CatchupRangeError> {
+        // Validate preconditions (parity: stellar-core checkCatchupPreconditions).
+        if lcl < GENESIS_LEDGER_SEQ {
+            return Err(CatchupRangeError::LclBeforeGenesis { lcl });
+        }
+        if target <= lcl {
+            return Err(CatchupRangeError::TargetNotAfterLcl { target, lcl });
+        }
+        if target <= GENESIS_LEDGER_SEQ {
+            return Err(CatchupRangeError::TargetNotAfterGenesis { target });
+        }
 
         let count = mode.count();
         let full_replay_count = target - lcl;
@@ -322,7 +377,7 @@ impl CatchupRange {
         // always yields full replay (CatchupRange.cpp Case 2).
         if mode == CatchupMode::Complete && lcl == GENESIS_LEDGER_SEQ {
             let replay = LedgerRange::new(lcl + 1, full_replay_count);
-            return Self::replay_only(replay);
+            return Ok(Self::replay_only(replay));
         }
 
         // Case 1: LCL is past genesis — unconditionally replay from LCL+1.
@@ -333,7 +388,7 @@ impl CatchupRange {
         // than LCL) because bucket-apply only occurs on the genesis path.
         if lcl > GENESIS_LEDGER_SEQ {
             let replay = LedgerRange::new(lcl + 1, full_replay_count);
-            return Self::replay_only(replay);
+            return Ok(Self::replay_only(replay));
         }
 
         // Remaining cases: lcl == genesis (Case 1 above handles lcl > genesis).
@@ -351,12 +406,12 @@ impl CatchupRange {
         // handled by Case 0; Recent(N)/Minimal with a large enough count converge
         // to the same full-replay result here.
         if count >= full_replay_count {
-            return Self::replay_only(full_replay);
+            return Ok(Self::replay_only(full_replay));
         }
 
         // Case 3: count=0 and target is a checkpoint, buckets only
         if count == 0 && is_checkpoint_ledger(target) {
-            return Self::buckets_only(target);
+            return Ok(Self::buckets_only(target));
         }
 
         // Calculate target start ledger (first ledger we want to replay)
@@ -366,7 +421,7 @@ impl CatchupRange {
         // Case 4: target start is in first checkpoint, full replay
         // (only when we already have post-upgrade state from a prior catchup)
         if first_in_checkpoint <= GENESIS_LEDGER_SEQ && lcl > GENESIS_LEDGER_SEQ {
-            return Self::replay_only(full_replay);
+            return Ok(Self::replay_only(full_replay));
         }
 
         // Case 4b: target start is in first checkpoint AND lcl is genesis.
@@ -377,19 +432,19 @@ impl CatchupRange {
         // to replay (the target is before that checkpoint).
         if first_in_checkpoint <= GENESIS_LEDGER_SEQ && lcl == GENESIS_LEDGER_SEQ {
             if is_checkpoint_ledger(target) {
-                return Self::buckets_only(target);
+                return Ok(Self::buckets_only(target));
             }
             // Target is before the first checkpoint. No HAS is available yet.
             // Fall back to replay from genesis — this only happens when the
             // network has fewer ledgers than a single checkpoint period.
-            return Self::replay_only(full_replay);
+            return Ok(Self::replay_only(full_replay));
         }
 
         // Case 5: apply buckets at checkpoint before target_start, then replay
         let apply_buckets_at = last_ledger_before_checkpoint_containing(target_start)
             .expect("target_start not in first checkpoint, so there must be a previous checkpoint");
         let replay = LedgerRange::new(first_in_checkpoint, target - apply_buckets_at);
-        Self::buckets_and_replay(apply_buckets_at, replay)
+        Ok(Self::buckets_and_replay(apply_buckets_at, replay))
     }
 
     /// Get the replay range, if this variant performs replay.
@@ -463,7 +518,7 @@ mod tests {
     #[test]
     fn test_case1_lcl_past_genesis_non_minimal() {
         // LCL is past genesis with non-Minimal mode — replay from LCL+1
-        let range = CatchupRange::calculate(100, 200, CatchupMode::Complete);
+        let range = CatchupRange::calculate(100, 200, CatchupMode::Complete).unwrap();
         assert_eq!(
             range,
             CatchupRange::ReplayOnly {
@@ -478,7 +533,7 @@ mod tests {
         // not download buckets. A 4-minute bucket download for a 93-ledger gap would
         // block the event loop and cause an infinite catchup loop.
         // target=127 is a checkpoint ledger, but gap=27 < threshold → replay_only.
-        let range = CatchupRange::calculate(100, 127, CatchupMode::Minimal);
+        let range = CatchupRange::calculate(100, 127, CatchupMode::Minimal).unwrap();
         assert_eq!(
             range,
             CatchupRange::ReplayOnly {
@@ -491,7 +546,7 @@ mod tests {
     fn test_minimal_lcl_past_genesis_buffered_catchup_gap() {
         // Simulate the buffered-catchup scenario: LCL=61551871, gap=93.
         // Must use replay_only, not bucket download.
-        let range = CatchupRange::calculate(61551871, 61551964, CatchupMode::Minimal);
+        let range = CatchupRange::calculate(61551871, 61551964, CatchupMode::Minimal).unwrap();
         assert_eq!(
             range,
             CatchupRange::ReplayOnly {
@@ -506,7 +561,7 @@ mod tests {
         // With stellar-core parity (Case 1), LCL > genesis always replays.
         // Previously this used bucket-download optimization; now it replays
         // the full gap to maintain INV-C15.
-        let range = CatchupRange::calculate(61529351, 61551615, CatchupMode::Minimal);
+        let range = CatchupRange::calculate(61529351, 61551615, CatchupMode::Minimal).unwrap();
         assert_eq!(
             range,
             CatchupRange::ReplayOnly {
@@ -518,7 +573,7 @@ mod tests {
     #[test]
     fn test_case2_full_replay() {
         // count >= full replay count, do full replay
-        let range = CatchupRange::calculate(1, 100, CatchupMode::Complete);
+        let range = CatchupRange::calculate(1, 100, CatchupMode::Complete).unwrap();
         assert_eq!(
             range,
             CatchupRange::ReplayOnly {
@@ -530,7 +585,7 @@ mod tests {
     #[test]
     fn test_case3_buckets_only() {
         // count=0 and target is checkpoint, buckets only
-        let range = CatchupRange::calculate(1, 127, CatchupMode::Minimal);
+        let range = CatchupRange::calculate(1, 127, CatchupMode::Minimal).unwrap();
         assert_eq!(range, CatchupRange::BucketsOnly { checkpoint: 127 });
     }
 
@@ -538,7 +593,7 @@ mod tests {
     fn test_case3_minimal_non_checkpoint() {
         // count=0 but target is NOT a checkpoint
         // This falls through to case 5: apply buckets at 63, replay 64..=100.
-        let range = CatchupRange::calculate(1, 100, CatchupMode::Minimal);
+        let range = CatchupRange::calculate(1, 100, CatchupMode::Minimal).unwrap();
         assert_eq!(
             range,
             CatchupRange::BucketApplyAndReplay {
@@ -551,7 +606,7 @@ mod tests {
     #[test]
     fn test_case4_target_in_first_checkpoint() {
         // target start is in first checkpoint, full replay
-        let range = CatchupRange::calculate(1, 50, CatchupMode::Recent(10));
+        let range = CatchupRange::calculate(1, 50, CatchupMode::Recent(10)).unwrap();
         // target_start = 50 - 10 + 1 = 41, which is in first checkpoint (0-63)
         assert_eq!(
             range,
@@ -564,7 +619,7 @@ mod tests {
     #[test]
     fn test_case5_buckets_and_replay() {
         // Apply buckets at prior checkpoint, then replay
-        let range = CatchupRange::calculate(1, 200, CatchupMode::Recent(50));
+        let range = CatchupRange::calculate(1, 200, CatchupMode::Recent(50)).unwrap();
         // target_start = 200 - 50 + 1 = 151
         // first_in_checkpoint(151) = 128
         // last_before_checkpoint(151) = 127
@@ -583,7 +638,7 @@ mod tests {
         // core consumers (galexie) receive metadata for every ledger from
         // genesis. stellar-core handles this identically (CatchupRange.cpp
         // Case 2: count=UINT32_MAX >= full_replay_count → replay_only).
-        let range = CatchupRange::calculate(1, 63, CatchupMode::Complete);
+        let range = CatchupRange::calculate(1, 63, CatchupMode::Complete).unwrap();
         assert_eq!(
             range,
             CatchupRange::ReplayOnly {
@@ -598,7 +653,7 @@ mod tests {
         // Minimal mode from genesis to a checkpoint should use bucket-apply
         // (no replay). Replaying through protocol upgrades from genesis
         // produces different state hashes than the live network.
-        let range = CatchupRange::calculate(1, 63, CatchupMode::Minimal);
+        let range = CatchupRange::calculate(1, 63, CatchupMode::Minimal).unwrap();
         assert_eq!(
             range,
             CatchupRange::BucketsOnly { checkpoint: 63 },
@@ -610,7 +665,7 @@ mod tests {
     fn test_complete_from_genesis_non_checkpoint() {
         // Complete mode from genesis to a non-checkpoint target. No HAS is
         // available, so we must replay from genesis (fallback).
-        let range = CatchupRange::calculate(1, 100, CatchupMode::Complete);
+        let range = CatchupRange::calculate(1, 100, CatchupMode::Complete).unwrap();
         assert_eq!(
             range,
             CatchupRange::ReplayOnly {
@@ -622,7 +677,7 @@ mod tests {
     #[test]
     fn test_complete_from_non_genesis() {
         // Complete mode from a non-genesis LCL should still replay.
-        let range = CatchupRange::calculate(50, 100, CatchupMode::Complete);
+        let range = CatchupRange::calculate(50, 100, CatchupMode::Complete).unwrap();
         assert_eq!(
             range,
             CatchupRange::ReplayOnly {
@@ -637,7 +692,7 @@ mod tests {
         // Per CATCHUP_SPEC §6.3 Case 2 and stellar-core calculateCatchupRange,
         // lcl == genesis with count >= fullReplayCount yields a full replay from
         // genesis+1 (no lcl guard on Case 2).
-        let range = CatchupRange::calculate(1, 63, CatchupMode::Recent(100));
+        let range = CatchupRange::calculate(1, 63, CatchupMode::Recent(100)).unwrap();
         assert_eq!(
             range,
             CatchupRange::ReplayOnly {
@@ -652,7 +707,7 @@ mod tests {
         // Case 2 regression (#3033): lcl == genesis, count (100) >= full_replay_count
         // (62) → full replay [genesis+1, target] for Recent mode, matching spec §6.3
         // and stellar-core. Pre-fix: returned BucketsOnly { checkpoint: 63 }.
-        let range = CatchupRange::calculate(1, 63, CatchupMode::Recent(100));
+        let range = CatchupRange::calculate(1, 63, CatchupMode::Recent(100)).unwrap();
         assert_eq!(
             range,
             CatchupRange::ReplayOnly {
@@ -666,7 +721,7 @@ mod tests {
         // Case 2 regression (#3033): lcl == genesis, target 127 is a checkpoint,
         // count (200) >= full_replay_count (126) → full replay [2, 126]. Pre-fix:
         // routed to Case 4b checkpoint branch returning BucketsOnly { checkpoint: 127 }.
-        let range = CatchupRange::calculate(1, 127, CatchupMode::Recent(200));
+        let range = CatchupRange::calculate(1, 127, CatchupMode::Recent(200)).unwrap();
         assert_eq!(
             range,
             CatchupRange::ReplayOnly {
@@ -680,7 +735,7 @@ mod tests {
         // Recent mode from genesis to a non-checkpoint target in the first
         // checkpoint. No HAS available, so falls back to replay from genesis
         // (only valid for very small networks < 63 ledgers).
-        let range = CatchupRange::calculate(1, 50, CatchupMode::Recent(40));
+        let range = CatchupRange::calculate(1, 50, CatchupMode::Recent(40)).unwrap();
         // target_start = 50 - 40 + 1 = 11, first_in_checkpoint(11) = 1 <= GENESIS
         // lcl == GENESIS, target is not a checkpoint -> fallback replay
         assert_eq!(
@@ -695,7 +750,7 @@ mod tests {
     fn test_case1_lcl_past_genesis_target_in_first_checkpoint() {
         // LCL > genesis, target in first checkpoint.
         // Case 1 now unconditionally replays from LCL+1 (stellar-core parity).
-        let range = CatchupRange::calculate(2, 50, CatchupMode::Recent(10));
+        let range = CatchupRange::calculate(2, 50, CatchupMode::Recent(10)).unwrap();
         assert_eq!(
             range,
             CatchupRange::ReplayOnly {
@@ -708,7 +763,7 @@ mod tests {
     fn test_recent_128_current_ledger() {
         // Typical "recent:128" catchup to a recent ledger
         let target = 843007; // A checkpoint ledger
-        let range = CatchupRange::calculate(1, target, CatchupMode::Recent(128));
+        let range = CatchupRange::calculate(1, target, CatchupMode::Recent(128)).unwrap();
 
         // target_start = 843007 - 128 + 1 = 842880
         // first_in_checkpoint(842880) = 842880 (it's at checkpoint start)
@@ -728,7 +783,7 @@ mod tests {
         // count=0 → target_start = 10001 (past first checkpoint).
         // Falls through to Case 5: bucket-apply at prior checkpoint, then replay.
         // checkpoint_start(10001) = 9984, apply_buckets_at = 9983
-        let range = CatchupRange::calculate(1, 10000, CatchupMode::Minimal);
+        let range = CatchupRange::calculate(1, 10000, CatchupMode::Minimal).unwrap();
         assert_eq!(
             range,
             CatchupRange::BucketApplyAndReplay {
@@ -743,7 +798,7 @@ mod tests {
         // Minimal mode from a non-genesis LCL with a large gap. With
         // stellar-core parity (Case 1), LCL > genesis always replays —
         // bucket-apply optimization was removed to enforce INV-C15.
-        let range = CatchupRange::calculate(50000, 70000, CatchupMode::Minimal);
+        let range = CatchupRange::calculate(50000, 70000, CatchupMode::Minimal).unwrap();
         assert_eq!(
             range,
             CatchupRange::ReplayOnly {
@@ -760,7 +815,7 @@ mod tests {
     fn test_recent_500_large_gap_replays_with_parity() {
         // Recent(500), lcl=100, target=10_000 → gap=9900.
         // With stellar-core parity, LCL > genesis always replays from LCL+1.
-        let range = CatchupRange::calculate(100, 10_000, CatchupMode::Recent(500));
+        let range = CatchupRange::calculate(100, 10_000, CatchupMode::Recent(500)).unwrap();
         assert_eq!(
             range,
             CatchupRange::ReplayOnly {
@@ -773,7 +828,7 @@ mod tests {
     fn test_recent_10000_small_gap_replays() {
         // Recent(10_000), lcl=100, target=5000 → gap=4900.
         // LCL > genesis → replay from lcl+1.
-        let range = CatchupRange::calculate(100, 5000, CatchupMode::Recent(10_000));
+        let range = CatchupRange::calculate(100, 5000, CatchupMode::Recent(10_000)).unwrap();
         assert_eq!(
             range,
             CatchupRange::ReplayOnly {
@@ -786,7 +841,8 @@ mod tests {
     fn test_recent_500_buffered_catchup_replays() {
         // Recent(500), lcl=61_551_871, target=61_551_964 → gap=93.
         // LCL > genesis → replay from lcl+1.
-        let range = CatchupRange::calculate(61_551_871, 61_551_964, CatchupMode::Recent(500));
+        let range =
+            CatchupRange::calculate(61_551_871, 61_551_964, CatchupMode::Recent(500)).unwrap();
         assert_eq!(
             range,
             CatchupRange::ReplayOnly {
@@ -799,7 +855,7 @@ mod tests {
     fn test_recent_boundary_gap_equals_n() {
         // Recent(100), lcl=100, target=200 → gap=100 = N.
         // LCL > genesis → replay from lcl+1 regardless of count.
-        let range = CatchupRange::calculate(100, 200, CatchupMode::Recent(100));
+        let range = CatchupRange::calculate(100, 200, CatchupMode::Recent(100)).unwrap();
         assert_eq!(
             range,
             CatchupRange::ReplayOnly {
@@ -813,7 +869,7 @@ mod tests {
         // Recent(99), lcl=100, target=200 → gap=100 > 99.
         // With stellar-core parity, LCL > genesis always replays from LCL+1.
         // (Previously this fell through to checkpoint download — INV-C15 violation.)
-        let range = CatchupRange::calculate(100, 200, CatchupMode::Recent(99));
+        let range = CatchupRange::calculate(100, 200, CatchupMode::Recent(99)).unwrap();
         assert_eq!(
             range,
             CatchupRange::ReplayOnly {
@@ -826,7 +882,7 @@ mod tests {
     fn test_recent_large_gap_checkpoint_target() {
         // Recent(500), lcl=100, target=10_047 (non-checkpoint) → gap > 500.
         // With stellar-core parity, LCL > genesis always replays from LCL+1.
-        let range = CatchupRange::calculate(100, 10_047, CatchupMode::Recent(500));
+        let range = CatchupRange::calculate(100, 10_047, CatchupMode::Recent(500)).unwrap();
         assert_eq!(
             range,
             CatchupRange::ReplayOnly {
@@ -839,7 +895,7 @@ mod tests {
     fn test_recent_large_gap_target_start_in_first_checkpoint() {
         // Recent(150), lcl=2, target=200 → gap=198.
         // LCL > genesis → Case 1 returns replay_only.
-        let range = CatchupRange::calculate(2, 200, CatchupMode::Recent(150));
+        let range = CatchupRange::calculate(2, 200, CatchupMode::Recent(150)).unwrap();
         assert_eq!(
             range,
             CatchupRange::ReplayOnly {
@@ -853,7 +909,7 @@ mod tests {
         // Recent(0), lcl=100, target=200 → gap=100.
         // With stellar-core parity, LCL > genesis always replays from LCL+1.
         // (Previously this fell through to checkpoint download.)
-        let range = CatchupRange::calculate(100, 200, CatchupMode::Recent(0));
+        let range = CatchupRange::calculate(100, 200, CatchupMode::Recent(0)).unwrap();
         assert_eq!(
             range,
             CatchupRange::ReplayOnly {
@@ -941,6 +997,62 @@ mod tests {
         assert_ne!(
             offline_complete_depth.run_mode,
             CatchupRunMode::OfflineComplete
+        );
+    }
+
+    // ── Precondition Result-error regression tests (#3567) ─────────────
+    // Previously these inputs aborted the process via `assert!` in
+    // `calculate`; they must now return `Err` so the offline `catchup`
+    // CLI surfaces a graceful error instead of panicking. Mirrors
+    // stellar-core `checkCatchupPreconditions` (throws std::invalid_argument).
+
+    #[test]
+    fn test_calculate_lcl_zero_returns_err() {
+        // Direct reproduction of the issue panic: lcl == 0 reaching
+        // `calculate` aborted with "lcl 0 must be >= genesis 1".
+        let result = CatchupRange::calculate(0, 63, CatchupMode::Complete);
+        assert!(result.is_err(), "lcl == 0 must return Err, not abort");
+    }
+
+    #[test]
+    fn test_calculate_target_le_lcl_returns_err() {
+        // target <= lcl previously aborted with "target 2 must be > lcl 5".
+        let result = CatchupRange::calculate(5, 2, CatchupMode::Complete);
+        assert!(result.is_err(), "target <= lcl must return Err, not abort");
+    }
+
+    #[test]
+    fn test_calculate_target_le_genesis_returns_err() {
+        // target <= genesis previously aborted (here via "target 1 must be > lcl 1").
+        let result = CatchupRange::calculate(1, 1, CatchupMode::Complete);
+        assert!(
+            result.is_err(),
+            "target <= genesis must return Err, not abort"
+        );
+    }
+
+    #[test]
+    fn test_calculate_target_equals_first_checkpoint_ok() {
+        // The issue's target == first-checkpoint case, via the Result API:
+        // a valid range, no panic (Case 0, Complete from genesis).
+        let range = CatchupRange::calculate(1, 63, CatchupMode::Complete).unwrap();
+        assert_eq!(
+            range,
+            CatchupRange::ReplayOnly {
+                replay: LedgerRange::new(2, 62)
+            }
+        );
+    }
+
+    #[test]
+    fn test_calculate_target_past_first_checkpoint_ok() {
+        // target > first checkpoint (Complete from genesis) — valid range.
+        let range = CatchupRange::calculate(1, 127, CatchupMode::Complete).unwrap();
+        assert_eq!(
+            range,
+            CatchupRange::ReplayOnly {
+                replay: LedgerRange::new(2, 126)
+            }
         );
     }
 
