@@ -33,3 +33,4 @@ tracing.workspace = true
 
 [dev-dependencies]
 serial_test = "3"
+metrics-exporter-prometheus.workspace = true
