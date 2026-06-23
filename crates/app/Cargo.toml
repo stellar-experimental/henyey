@@ -63,6 +63,12 @@ metrics-exporter-prometheus.workspace = true
 # Error handling
 anyhow.workspace = true
 thiserror.workspace = true
+# SQLite error classification: the ledger-close/catchup persist path inspects
+# the structured `rusqlite::ffi::ErrorCode` to route a transient DB-busy/locked
+# to a clean recoverable shutdown instead of a fatal abort (#3497). Naming
+# `rusqlite::Error`/`ffi::ErrorCode` requires a direct dependency since
+# `henyey-db` intentionally does not broadly re-export `rusqlite` (see #2748).
+rusqlite.workspace = true
 
 # Encoding
 hex.workspace = true

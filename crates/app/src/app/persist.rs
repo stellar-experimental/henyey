@@ -575,6 +575,148 @@ mod tests {
         // here — so we only verify classification above).
     }
 
+    /// Build a `DbError::Sqlite(SqliteFailure(ffi::Error { code, .. }, msg))`
+    /// for the given primary code, mirroring how rusqlite materializes a
+    /// SQLite error in the persist write path.
+    fn db_sqlite_error(
+        code: rusqlite::ffi::ErrorCode,
+        extended_code: std::os::raw::c_int,
+        msg: &str,
+    ) -> henyey_db::DbError {
+        henyey_db::DbError::Sqlite(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error {
+                code,
+                extended_code,
+            },
+            Some(msg.to_string()),
+        ))
+    }
+
+    /// #3497: a transient `SQLITE_BUSY`/`DatabaseBusy` ("database is locked")
+    /// at the ledger-close DB-write persist site must route to a clean
+    /// recoverable shutdown (broadcast a shutdown signal), NOT to
+    /// `std::process::abort()` — the SQLite write transaction never committed,
+    /// so the on-disk state is intact and a plain restart recovers it.
+    #[test]
+    fn transient_db_busy_persist_error_routes_to_recoverable_shutdown_3497() {
+        let (tx, mut rx) = tokio::sync::broadcast::channel(1);
+        let shutdown = RecoverableShutdownHandle::new(tx);
+
+        // extended_code 5 is documented for traceability; the gate is the
+        // primary `DatabaseBusy` code, not the extended code.
+        let busy = db_sqlite_error(
+            rusqlite::ffi::ErrorCode::DatabaseBusy,
+            5,
+            "database is locked",
+        );
+        assert!(
+            is_transient_db_busy(&busy),
+            "DatabaseBusy must be classified transient"
+        );
+
+        // handle_db_persist_error must NOT abort for a transient busy error;
+        // it must signal a clean shutdown. (If it aborted, the test process
+        // would die.)
+        handle_db_persist_error("ledger close DB write", &busy, &shutdown);
+
+        assert!(
+            rx.try_recv().is_ok(),
+            "transient DB-busy persist error must trigger a clean recoverable shutdown signal"
+        );
+    }
+
+    /// #3497: `DatabaseLocked` is the sibling transient code and must also
+    /// classify transient + route to recoverable shutdown.
+    #[test]
+    fn transient_db_locked_persist_error_is_transient_3497() {
+        let locked = db_sqlite_error(
+            rusqlite::ffi::ErrorCode::DatabaseLocked,
+            6,
+            "database table is locked",
+        );
+        assert!(
+            is_transient_db_busy(&locked),
+            "DatabaseLocked must be classified transient"
+        );
+    }
+
+    /// #3497: the ledger-close `write_fn` returns `anyhow::Result<()>`, but
+    /// `db.transaction(...)?` propagates the typed `DbError` through
+    /// `From<DbError> for anyhow::Error`, so the structured rusqlite code
+    /// survives a `downcast_ref::<DbError>()`. The anyhow-typed classifier
+    /// must recover the code and route a transient busy to recoverable
+    /// shutdown — with NO string-matching on "database is locked". Also guards
+    /// against a future `anyhow!("…{e}")` wrap erasing the type.
+    #[test]
+    fn transient_db_busy_via_anyhow_downcast_routes_to_recoverable_3497() {
+        let (tx, mut rx) = tokio::sync::broadcast::channel(1);
+        let shutdown = RecoverableShutdownHandle::new(tx);
+
+        let busy = db_sqlite_error(
+            rusqlite::ffi::ErrorCode::DatabaseBusy,
+            5,
+            "database is locked",
+        );
+        // Mirror `write_fn` `?`-propagation: typed DbError → anyhow::Error.
+        let anyhow_err: anyhow::Error = anyhow::Error::new(busy);
+        assert!(
+            is_transient_db_busy_anyhow(&anyhow_err),
+            "anyhow-wrapped DatabaseBusy must be recovered via downcast and classified transient"
+        );
+
+        handle_db_persist_error_anyhow("ledger close DB write", &anyhow_err, &shutdown);
+
+        assert!(
+            rx.try_recv().is_ok(),
+            "transient DB-busy via anyhow downcast must trigger a clean recoverable shutdown"
+        );
+    }
+
+    /// #3497 (load-bearing consensus-safety guard, mirroring
+    /// `corruption_persist_error_stays_fatal_3478`): genuine corruption /
+    /// integrity errors must NOT be classified transient — they stay on the
+    /// fatal `abort()`+wipe path. We assert the classifier branch (the
+    /// `abort()` itself is not unit-testable). The predicate must be NARROW:
+    /// only `DatabaseBusy`/`DatabaseLocked` are recoverable.
+    #[test]
+    fn corruption_db_persist_error_stays_fatal_3497() {
+        // SQLITE_CORRUPT (extended_code 11 = SQLITE_CORRUPT_VTAB) → fatal.
+        let corruption = db_sqlite_error(
+            rusqlite::ffi::ErrorCode::DatabaseCorrupt,
+            11,
+            "database disk image is malformed",
+        );
+        assert!(
+            !is_transient_db_busy(&corruption),
+            "DatabaseCorrupt must NOT be classified transient (stays fatal/abort+wipe)"
+        );
+
+        // A non-Sqlite DbError (integrity violation) → fatal.
+        let integrity = henyey_db::DbError::Integrity("bucket list hash mismatch".to_string());
+        assert!(
+            !is_transient_db_busy(&integrity),
+            "Integrity error must NOT be classified transient (stays fatal/abort+wipe)"
+        );
+
+        // Other Sqlite codes (e.g. SQLITE_IOERR) → fatal.
+        let ioerr = db_sqlite_error(
+            rusqlite::ffi::ErrorCode::SystemIoFailure,
+            266,
+            "disk I/O error",
+        );
+        assert!(
+            !is_transient_db_busy(&ioerr),
+            "SystemIoFailure must NOT be classified transient (stays fatal/abort+wipe)"
+        );
+
+        // A non-DbError anyhow error → fatal (downcast fails).
+        let other: anyhow::Error = anyhow::anyhow!("some non-db failure");
+        assert!(
+            !is_transient_db_busy_anyhow(&other),
+            "non-DbError anyhow error must NOT be classified transient (stays fatal)"
+        );
+    }
+
     fn make_header(seq: u32) -> (LedgerHeader, Vec<u8>) {
         use stellar_xdr::{LedgerHeaderExtensionV1, Limits, WriteXdr};
         let header = LedgerHeader {
