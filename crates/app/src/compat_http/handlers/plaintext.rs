@@ -321,14 +321,84 @@ pub(crate) async fn compat_upgrades_handler(
             upgrade_params.expiration_minutes = Some(v);
         }
         if let Some(key_str) = params.get("configupgradesetkey") {
-            // configupgradesetkey is a base64-encoded ConfigUpgradeSetKey XDR
+            // configupgradesetkey is a base64-encoded ConfigUpgradeSetKey XDR.
+            //
+            // Parity: stellar-core CommandHandler::upgrades
+            // (CommandHandler.cpp:634-655) decodes the key, resolves it via
+            // makeFromKey, and requires isValidForApply == VALID; on failure it
+            // returns "Error setting configUpgradeSet" and stores nothing.
+            // (We omit core's ensureProtocolVersion(SOROBAN) guard — a
+            // pre-Soroban-only minor gap, irrelevant to the P27 path.)
             use base64::{engine::general_purpose::STANDARD, Engine};
             use stellar_xdr::{ConfigUpgradeSetKey, Limits, ReadXdr};
-            if let Ok(bytes) = STANDARD.decode(key_str) {
-                if let Ok(key) = ConfigUpgradeSetKey::from_xdr(&bytes, Limits::none()) {
+
+            // The verbatim error string SSC may match on.
+            let config_err = || {
+                Json(serde_json::json!({
+                    "status": "error",
+                    "error": "Error setting configUpgradeSet",
+                }))
+                .into_response()
+            };
+
+            // (1) base64 decode — previously silent on failure.
+            let bytes = match STANDARD.decode(key_str) {
+                Ok(b) => b,
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "configupgradesetkey: base64 decode failed; rejecting arm"
+                    );
+                    return config_err();
+                }
+            };
+            // (2) XDR decode — previously silent on failure.
+            let key = match ConfigUpgradeSetKey::from_xdr(&bytes, Limits::none()) {
+                Ok(k) => k,
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "configupgradesetkey: XDR decode failed; rejecting arm"
+                    );
+                    return config_err();
+                }
+            };
+
+            // Diagnostic: arm received + decoded key (contract_id/content_hash
+            // hex). This edge was previously silent — the silence is why three
+            // #3591 investigations saw nothing.
+            tracing::info!(
+                contract_id = %hex::encode(key.contract_id.0 .0),
+                content_hash = %hex::encode(key.content_hash.0),
+                "configupgradesetkey arm received and decoded"
+            );
+
+            // (3) Resolve + validate via the ledger (makeFromKey +
+            // isValidForApply == VALID). Reject an unresolvable / invalid key
+            // exactly as core does, storing NOTHING.
+            match state.app.validate_config_upgrade_set_key(&key) {
+                Ok(true) => {
                     upgrade_params.config_upgrade_set_key = Some(
                         henyey_herder::upgrades::ConfigUpgradeSetKeyJson::from_xdr(&key),
                     );
+                }
+                Ok(false) => {
+                    tracing::warn!(
+                        contract_id = %hex::encode(key.contract_id.0 .0),
+                        content_hash = %hex::encode(key.content_hash.0),
+                        "configupgradesetkey did not resolve to a VALID upgrade \
+                         set in the live ledger; rejecting arm (parity: core \
+                         CommandHandler.cpp:653)"
+                    );
+                    return config_err();
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "configupgradesetkey: ledger error resolving key; \
+                         rejecting arm"
+                    );
+                    return config_err();
                 }
             }
         }

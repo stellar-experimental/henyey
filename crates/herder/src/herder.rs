@@ -3617,7 +3617,35 @@ impl Herder {
                 .and_then(|k| k.to_xdr().ok())
                 .and_then(
                     |key| match ConfigUpgradeContext::from_snapshot(&snap, &key) {
-                        Ok(ctx) => ctx,
+                        // Log the OUTCOME of from_snapshot (#3591). Previously
+                        // this edge logged only on Err — never on Ok(None),
+                        // whose silence is why three investigations saw nothing
+                        // while the armed key failed to resolve at nomination.
+                        Ok(Some(ctx)) => {
+                            // Steady state: debug to avoid mainnet per-nomination
+                            // spam (a config upgrade is armed on essentially
+                            // every nomination once scheduled).
+                            tracing::debug!(
+                                contract_id = %hex::encode(key.contract_id.0 .0),
+                                content_hash = %hex::encode(key.content_hash.0),
+                                "config upgrade key RESOLVED from nomination snapshot"
+                            );
+                            Some(ctx)
+                        }
+                        Ok(None) => {
+                            // Present-but-unresolved: the armed key has no live
+                            // entry in the nomination snapshot (absent / wrong
+                            // durability / TTL-expired). This is the #3591
+                            // failure signature — surface it.
+                            tracing::warn!(
+                                contract_id = %hex::encode(key.contract_id.0 .0),
+                                content_hash = %hex::encode(key.content_hash.0),
+                                "config upgrade key is armed but did NOT resolve \
+                                 in the nomination snapshot (Ok(None)); config \
+                                 upgrade will NOT be proposed"
+                            );
+                            None
+                        }
                         Err(e) => {
                             error!("Error loading config upgrade context: {e}");
                             None
