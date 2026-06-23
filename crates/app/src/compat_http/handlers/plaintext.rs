@@ -15,6 +15,8 @@ use axum::Json;
 use serde::Deserialize;
 
 use crate::app::AppState;
+use henyey_ledger::SorobanNetworkInfo;
+
 use crate::compat_http::CompatServerState;
 use crate::http::types::{
     CompatSorobanInfoResponse, ConnectParams, DropPeerParams, SorobanInfoResponse, UnbanParams,
@@ -435,12 +437,20 @@ pub(crate) async fn compat_sorobaninfo_handler(
     match state.app.soroban_network_info() {
         Some(info) => {
             let protocol_version = state.app.ledger_info().protocol_version;
-            let native = SorobanInfoResponse::from_network_info(&info, protocol_version);
-            let compat = CompatSorobanInfoResponse::from(&native);
-            Json(serde_json::json!({ "info": compat }))
+            Json(compat_sorobaninfo_body(&info, protocol_version))
         }
         None => Json(serde_json::json!({"info": "Soroban not available"})),
     }
+}
+
+/// Build the `/sorobaninfo` compat JSON body from a live `SorobanNetworkInfo`.
+///
+/// Pure (no `App`/state) so it is directly unit-testable. The body is the
+/// exact bytes the handler returns for the `Some` branch.
+fn compat_sorobaninfo_body(info: &SorobanNetworkInfo, protocol_version: u32) -> serde_json::Value {
+    let native = SorobanInfoResponse::from_network_info(info, protocol_version);
+    let compat = CompatSorobanInfoResponse::from(&native);
+    serde_json::json!({ "info": compat })
 }
 
 // ── Survey endpoints (stellar-core URL paths) ───────────────────────────
@@ -1275,97 +1285,245 @@ mod tests {
 
     // ── /sorobaninfo compat response shape tests ────────────────────────
     //
-    // These tests exercise the **production** projection chain
-    // `SorobanNetworkInfo` → `SorobanInfoResponse::from_network_info` →
-    // `CompatSorobanInfoResponse::from` → `Json({"info": ...})`. They no
-    // longer replicate JSON literals; the upstream type tests in
-    // `crates/app/src/http/types/soroban.rs` cover the value-correctness
-    // and structural-projection invariants. Here we only confirm the
-    // wire-shape envelope (`{"info": {...}}`) and the protocol-23 gate
-    // visible through serde.
+    // These tests exercise the **production** handler body builder
+    // `compat_sorobaninfo_body` — the exact bytes the `/sorobaninfo` compat
+    // handler returns. stellar-core's `CommandHandler::sorobanInfo`
+    // (CommandHandler.cpp:898-1041) returns a TOP-LEVEL object (no wrapper)
+    // with nested `ledger`/`tx`/`state_archival`/`scp` sub-objects and flat
+    // `fee_*`/`max_contract_*`/`max_dependent_tx_clusters` scalars.
+    // supercluster's `GetSorobanInfo()` reads `.Ledger.MaxInstructions`,
+    // `.Tx.*`, `.Scp.*` at the ROOT, so any `{"info": ...}` wrapper makes
+    // its JsonProvider raise `Property 'ledger' not found at ''` (#3578).
 
-    use crate::http::types::{CompatSorobanInfoResponse, SorobanInfoResponse, SorobanScpSettings};
-
-    /// Build a minimal CompatSorobanInfoResponse with explicit values
-    /// (avoids reaching into henyey_ledger from this test module).
-    fn make_compat(
-        max_dependent_tx_clusters: Option<u32>,
-        max_footprint_size: Option<u32>,
-        scp: Option<SorobanScpSettings>,
-    ) -> CompatSorobanInfoResponse {
-        CompatSorobanInfoResponse {
-            ledger_max_instructions: 100,
-            tx_max_instructions: 50,
-            tx_memory_limit: 1024,
-            ledger_max_read_ledger_entries: 10,
-            ledger_max_read_bytes: 2048,
-            ledger_max_write_ledger_entries: 5,
-            ledger_max_write_bytes: 1024,
-            ledger_max_tx_count: 100,
-            tx_max_size_bytes: 512,
-            average_bucket_list_size: 100_000_000,
-            bucket_list_size_snapshot_period: 30,
-            max_dependent_tx_clusters,
-            max_footprint_size,
-            scp,
+    /// Build a `SorobanNetworkInfo` with distinct non-zero values so a
+    /// field-swap regression is easy to spot. Mirrors the sentinel used by
+    /// the `http::types::soroban` tests.
+    fn sentinel_network_info() -> SorobanNetworkInfo {
+        SorobanNetworkInfo {
+            max_contract_size: 2,
+            max_contract_data_key_size: 3,
+            max_contract_data_entry_size: 5,
+            tx_max_instructions: 7,
+            ledger_max_instructions: 11,
+            fee_rate_per_instructions_increment: 13,
+            tx_memory_limit: 17,
+            ledger_max_read_ledger_entries: 19,
+            ledger_max_read_bytes: 23,
+            ledger_max_write_ledger_entries: 29,
+            ledger_max_write_bytes: 31,
+            tx_max_read_ledger_entries: 37,
+            tx_max_read_bytes: 41,
+            tx_max_write_ledger_entries: 43,
+            tx_max_write_bytes: 47,
+            fee_read_ledger_entry: 53,
+            fee_write_ledger_entry: 59,
+            fee_read_1kb: 61,
+            fee_write_1kb: 67,
+            fee_historical_1kb: 71,
+            tx_max_contract_events_size_bytes: 73,
+            fee_contract_events_size_1kb: 79,
+            ledger_max_tx_size_bytes: 83,
+            tx_max_size_bytes: 89,
+            fee_transaction_size_1kb: 97,
+            ledger_max_tx_count: 101,
+            max_entry_ttl: 103,
+            min_temporary_ttl: 107,
+            min_persistent_ttl: 109,
+            persistent_rent_rate_denominator: 113,
+            temp_rent_rate_denominator: 127,
+            max_entries_to_archive: 131,
+            bucketlist_size_window_sample_size: 137,
+            eviction_scan_size: 139,
+            starting_eviction_scan_level: 149,
+            average_bucket_list_size: 151,
+            state_target_size_bytes: 157,
+            rent_fee_1kb_state_size_low: 163,
+            rent_fee_1kb_state_size_high: 167,
+            state_size_rent_fee_growth_factor: 173,
+            nomination_timeout_initial_ms: 179,
+            nomination_timeout_increment_ms: 181,
+            ballot_timeout_initial_ms: 191,
+            ballot_timeout_increment_ms: 193,
+            ledger_target_close_time_ms: 197,
+            ledger_max_dependent_tx_clusters: 199,
+            tx_max_footprint_entries: 211,
         }
     }
 
-    /// Pre-P23: the `{"info": ...}` envelope contains the always-present
-    /// keys but omits the three protocol-23 fields. Asserts the wire
-    /// shape produced by the production handler path.
+    /// The compat `/sorobaninfo` body MUST match stellar-core's shape: a
+    /// top-level object (NO `info` wrapper) with nested `ledger`/`tx`
+    /// sub-objects and top-level `fee_*`/`state_archival`/`max_contract_*`/
+    /// `max_dependent_tx_clusters`/`scp`.
+    ///
+    /// FAILS on `origin/main` (handler emits `{"info": {flattened…}}` — the
+    /// root has an `info` key and no top-level `ledger`).
     #[test]
-    fn test_compat_sorobaninfo_pre_protocol_23_omits_scp_fields() {
-        let compat = make_compat(None, None, None);
-        let envelope = serde_json::json!({ "info": compat });
-        let info = envelope["info"].as_object().unwrap();
+    fn test_compat_sorobaninfo_matches_stellar_core_shape() {
+        let info = sentinel_network_info();
+        let body = compat_sorobaninfo_body(&info, 23);
+        let root = body.as_object().expect("body must be a JSON object");
 
+        // No stellar-rpc `info` wrapper — the soroban info IS the root.
         assert!(
-            !info.contains_key("scp"),
-            "scp should be absent for pre-protocol 23"
+            !root.contains_key("info"),
+            "compat body must not wrap the soroban info under an `info` key \
+             (stellar-core returns the object at the root)"
         );
+
+        // Nested `ledger` with `max_instructions`.
+        let ledger = root
+            .get("ledger")
+            .and_then(|v| v.as_object())
+            .expect("top-level `ledger` object must be present");
+        assert_eq!(ledger["max_instructions"], 11);
+
+        // Nested `tx` with the keys supercluster reads.
+        let tx = root
+            .get("tx")
+            .and_then(|v| v.as_object())
+            .expect("top-level `tx` object must be present");
+        assert_eq!(tx["max_instructions"], 7);
+        assert_eq!(tx["max_size_bytes"], 89);
+        assert_eq!(tx["memory_limit"], 17);
+
+        // Top-level flat scalars + nested objects.
+        assert_eq!(root["fee_read_1kb"], 61);
         assert!(
-            !info.contains_key("max_dependent_tx_clusters"),
-            "max_dependent_tx_clusters should be absent for pre-protocol 23"
+            root.get("state_archival")
+                .and_then(|v| v.as_object())
+                .is_some(),
+            "top-level `state_archival` object must be present"
         );
+        assert_eq!(root["max_contract_size"], 2);
+        assert_eq!(root["max_dependent_tx_clusters"], 199);
         assert!(
-            !info.contains_key("max_footprint_size"),
-            "max_footprint_size should be absent for pre-protocol 23"
-        );
-        // Always-present keys.
-        assert!(
-            info.contains_key("average_bucket_list_size"),
-            "average_bucket_list_size should always be present"
-        );
-        assert!(
-            info.contains_key("bucket_list_size_snapshot_period"),
-            "bucket_list_size_snapshot_period should always be present"
+            root.get("scp").and_then(|v| v.as_object()).is_some(),
+            "top-level `scp` object must be present at P23"
         );
     }
 
-    /// P23+: the `{"info": ...}` envelope includes the three protocol-23
-    /// fields, including the nested `scp` block with all five expected
-    /// keys.
+    /// Every accessor path supercluster's `GetSorobanInfo()` reads must
+    /// exist at the JSON root at protocol 23.
+    ///
+    /// FAILS on `origin/main` (flat keys live under the `info` wrapper, so
+    /// `ledger`/`tx`/`scp` are absent at the root).
+    #[test]
+    fn test_compat_sorobaninfo_parses_against_supercluster_sample_keys() {
+        let info = sentinel_network_info();
+        let body = compat_sorobaninfo_body(&info, 23);
+        let root = body.as_object().expect("body must be a JSON object");
+
+        let ledger = root
+            .get("ledger")
+            .and_then(|v| v.as_object())
+            .expect("`ledger` object must be present");
+        for key in [
+            "max_instructions",
+            "max_read_bytes",
+            "max_read_ledger_entries",
+            "max_write_bytes",
+            "max_write_ledger_entries",
+            "max_tx_count",
+            "max_tx_size_bytes",
+        ] {
+            assert!(ledger.contains_key(key), "ledger missing key: {key}");
+        }
+
+        let tx = root
+            .get("tx")
+            .and_then(|v| v.as_object())
+            .expect("`tx` object must be present");
+        for key in [
+            "max_instructions",
+            "max_read_bytes",
+            "max_read_ledger_entries",
+            "max_write_bytes",
+            "max_write_ledger_entries",
+            "memory_limit",
+            "max_size_bytes",
+            "max_contract_events_size_bytes",
+            "max_footprint_size",
+        ] {
+            assert!(tx.contains_key(key), "tx missing key: {key}");
+        }
+
+        for key in [
+            "max_contract_size",
+            "max_contract_data_key_size",
+            "max_contract_data_entry_size",
+            "max_dependent_tx_clusters",
+        ] {
+            assert!(root.contains_key(key), "root missing key: {key}");
+        }
+
+        let scp = root
+            .get("scp")
+            .and_then(|v| v.as_object())
+            .expect("`scp` object must be present at P23");
+        for key in [
+            "ledger_close_time_ms",
+            "nomination_timeout_ms",
+            "nomination_timeout_inc_ms",
+            "ballot_timeout_ms",
+            "ballot_timeout_inc_ms",
+        ] {
+            assert!(scp.contains_key(key), "scp missing key: {key}");
+        }
+
+        for key in [
+            "fee_rate_per_instructions_increment",
+            "fee_read_ledger_entry",
+            "fee_write_ledger_entry",
+            "fee_read_1kb",
+            "fee_write_1kb",
+            "fee_historical_1kb",
+            "fee_contract_events_size_1kb",
+            "fee_transaction_size_1kb",
+        ] {
+            assert!(root.contains_key(key), "root missing fee key: {key}");
+        }
+    }
+
+    /// Pre-P23: the P23-gated fields are omitted from the (now top-level)
+    /// shape — `tx.max_footprint_size`, top-level `scp`, and top-level
+    /// `max_dependent_tx_clusters` all absent.
+    #[test]
+    fn test_compat_sorobaninfo_pre_protocol_23_omits_scp_fields() {
+        let info = sentinel_network_info();
+        let body = compat_sorobaninfo_body(&info, 22);
+        let root = body.as_object().expect("body must be a JSON object");
+
+        assert!(
+            !root.contains_key("info"),
+            "compat body must not wrap the soroban info under an `info` key"
+        );
+        assert!(
+            !root.contains_key("scp"),
+            "scp should be absent for pre-protocol 23"
+        );
+        assert!(
+            !root.contains_key("max_dependent_tx_clusters"),
+            "max_dependent_tx_clusters should be absent for pre-protocol 23"
+        );
+        assert!(
+            root["tx"].get("max_footprint_size").is_none(),
+            "tx.max_footprint_size should be absent for pre-protocol 23"
+        );
+    }
+
+    /// P23+: the P23-gated fields are present in the top-level shape — the
+    /// nested `scp` block with all five keys, `tx.max_footprint_size`, and
+    /// top-level `max_dependent_tx_clusters`.
     #[test]
     fn test_compat_sorobaninfo_protocol_23_includes_scp_fields() {
-        let compat = make_compat(
-            Some(8),
-            Some(40),
-            Some(SorobanScpSettings {
-                ledger_close_time_ms: 5000,
-                nomination_timeout_ms: 1000,
-                nomination_timeout_inc_ms: 500,
-                ballot_timeout_ms: 1000,
-                ballot_timeout_inc_ms: 1000,
-            }),
-        );
-        let envelope = serde_json::json!({ "info": compat });
-        let info = envelope["info"].as_object().unwrap();
+        let info = sentinel_network_info();
+        let body = compat_sorobaninfo_body(&info, 23);
+        let root = body.as_object().expect("body must be a JSON object");
 
-        assert_eq!(info["max_dependent_tx_clusters"], 8);
-        assert_eq!(info["max_footprint_size"], 40);
+        assert_eq!(root["max_dependent_tx_clusters"], 199);
+        assert_eq!(root["tx"]["max_footprint_size"], 211);
 
-        let scp = info["scp"].as_object().unwrap();
+        let scp = root["scp"].as_object().unwrap();
         for key in [
             "ledger_close_time_ms",
             "nomination_timeout_ms",
@@ -1378,89 +1536,25 @@ mod tests {
         assert_eq!(scp.len(), 5, "unexpected extra SCP fields in compat");
     }
 
-    /// End-to-end: a `SorobanInfoResponse` built for P23 round-trips
-    /// through `CompatSorobanInfoResponse::from` and `serde_json::json!`
-    /// into the expected envelope, with values pulled from the right
-    /// nested paths. This is the regression test that would have caught
-    /// the kind of drift addressed by #2020 had it existed in the
-    /// original PR.
+    /// The compat handler body pulls values from the right nested paths of
+    /// the native projection (no flattening, no `info` wrapper).
     #[test]
-    fn test_compat_envelope_pulls_values_through_native_response() {
-        // Hand-build a SorobanInfoResponse so the test does not depend on
-        // henyey_ledger here (the upstream test in http::types::soroban
-        // already covers SorobanNetworkInfo → SorobanInfoResponse).
-        let scp = SorobanScpSettings {
-            ledger_close_time_ms: 5000,
-            nomination_timeout_ms: 1000,
-            nomination_timeout_inc_ms: 500,
-            ballot_timeout_ms: 1500,
-            ballot_timeout_inc_ms: 200,
-        };
-        let native = SorobanInfoResponse {
-            max_contract_size: 64_000,
-            max_contract_data_key_size: 250,
-            max_contract_data_entry_size: 65_000,
-            tx: crate::http::types::SorobanTxLimits {
-                max_instructions: 100_000_000,
-                memory_limit: 41_943_040,
-                max_read_ledger_entries: 40,
-                max_read_bytes: 200_704,
-                max_write_ledger_entries: 25,
-                max_write_bytes: 132_096,
-                max_contract_events_size_bytes: 8_198,
-                max_size_bytes: 129_024,
-                max_footprint_size: Some(60),
-            },
-            ledger: crate::http::types::SorobanLedgerLimits {
-                max_instructions: 500_000_000,
-                max_read_ledger_entries: 200,
-                max_read_bytes: 500_000,
-                max_write_ledger_entries: 125,
-                max_write_bytes: 500_000,
-                max_tx_size_bytes: 130_048,
-                max_tx_count: 100,
-            },
-            fee_rate_per_instructions_increment: 100,
-            fee_read_ledger_entry: 6250,
-            fee_write_ledger_entry: 10_000,
-            fee_read_1kb: 1786,
-            fee_write_1kb: 11_800,
-            fee_historical_1kb: 16_235,
-            fee_contract_events_size_1kb: 10_000,
-            fee_transaction_size_1kb: 1624,
-            state_archival: crate::http::types::SorobanStateArchival {
-                max_entry_ttl: 6_312_000,
-                min_temporary_ttl: 17_280,
-                min_persistent_ttl: 4096,
-                persistent_rent_rate_denominator: 5_362_408,
-                temp_rent_rate_denominator: 5_362_408,
-                max_entries_to_archive: 1000,
-                bucketlist_size_window_sample_size: 30,
-                eviction_scan_size: 100_000,
-                starting_eviction_scan_level: 7,
-                bucket_list_size_snapshot_period: 30,
-                average_bucket_list_size: 100_000_000,
-            },
-            max_dependent_tx_clusters: Some(2),
-            scp: Some(scp),
-        };
+    fn test_compat_sorobaninfo_pulls_values_through_native_response() {
+        let info = sentinel_network_info();
+        let body = compat_sorobaninfo_body(&info, 23);
+        let root = body.as_object().expect("body must be a JSON object");
 
-        let compat = CompatSorobanInfoResponse::from(&native);
-        let envelope = serde_json::json!({ "info": compat });
-
-        // Wire shape: `{"info": {...}}`
-        assert!(envelope.is_object());
-        let info = envelope["info"].as_object().expect("info must be object");
-
-        // Every flat compat key sources from the right native path.
-        assert_eq!(info["ledger_max_instructions"], 500_000_000);
-        assert_eq!(info["tx_max_instructions"], 100_000_000);
-        assert_eq!(info["tx_max_size_bytes"], 129_024);
-        assert_eq!(info["max_footprint_size"], 60);
-        assert_eq!(info["max_dependent_tx_clusters"], 2);
-        assert_eq!(info["bucket_list_size_snapshot_period"], 30);
-        assert_eq!(info["scp"]["ballot_timeout_ms"], 1500);
-        assert_eq!(info["scp"]["nomination_timeout_inc_ms"], 500);
+        assert_eq!(root["ledger"]["max_instructions"], 11);
+        assert_eq!(root["tx"]["max_instructions"], 7);
+        assert_eq!(root["tx"]["max_size_bytes"], 89);
+        assert_eq!(root["tx"]["max_footprint_size"], 211);
+        assert_eq!(root["max_dependent_tx_clusters"], 199);
+        assert_eq!(
+            root["state_archival"]["bucket_list_size_snapshot_period"],
+            137
+        );
+        assert_eq!(root["scp"]["ballot_timeout_ms"], 191);
+        assert_eq!(root["scp"]["nomination_timeout_inc_ms"], 181);
     }
 
     // ── ISO 8601 parser tests ───────────────────────────────────────────
