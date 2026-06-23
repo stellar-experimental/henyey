@@ -62,7 +62,17 @@ const TX_SUBMIT_MAX_TRIES: u32 = 10;
 /// tooling driven by Supercluster, NOT validator consensus), so the SSC
 /// henyey-majority soroban loadgen is unblocked. No hashed/serialized/consensus
 /// output is touched.
-const QUEUE_FULL_MAX_TRIES: u32 = 100;
+///
+/// Sized for the SLOW soroban drain: soroban txns are capped at
+/// `ledgerMaxTxCount` (genesis = 1) per ledger, and a ledger closes ~every
+/// 5 s, so a backed-up soroban queue drains ~1 tx / 5 s. With `STEP_MSECS =
+/// 100 ms`, 100 tries (= 10 s ≈ 2 ledgers) was too small: the post-upgrade
+/// `soroban_upload` run (200 txns) wedged a tail tx at exactly 100 tries and
+/// failed the whole run at 195/200. 6000 tries (= 600 s of paced retry per tx)
+/// comfortably outlasts the per-ledger drain for these runs while still
+/// surfacing a genuinely wedged queue (bounded, not infinite). Supercluster's
+/// own `WaitForLoadGenComplete` timeout governs the overall run.
+const QUEUE_FULL_MAX_TRIES: u32 = 6000;
 
 /// Decision for how `submit_tx` should react to a single
 /// [`TxQueueResult`]. Factored out of `submit_tx`'s inner loop as a pure
