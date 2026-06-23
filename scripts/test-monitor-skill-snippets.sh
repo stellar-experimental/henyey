@@ -10011,6 +10011,53 @@ BOARDEOF
     tap_not_ok "select_latest_green: green > MAX_DEPLOY_WALK ahead → empty + walk-exceeded (#3351)" "out='$_out6' err='$_err6'"
   fi
 
+  # ── #3581: select_latest_green_deploy_target runs under zsh ────────────────
+  # The monitor-tick deploy gate invokes this selector INLINE in the tick shell,
+  # which is zsh. Under zsh, `status` is a read-only special parameter (alias for
+  # $?), so the function's `local line sha status conclusion` aborted the function
+  # at the declaration line BEFORE the read loop, yielding empty stdout — which
+  # the gate fail-closes to `defer-no-green`, silently deferring EVERY deploy.
+  # The six bash cases above cannot catch this (the bug is zsh-specific), so this
+  # test invokes the function inside a `zsh -c` subprocess with its own hermetic
+  # ancestry oracle (green sha G on-main, 1 commit ahead of DEP) and asserts the
+  # selector returns G — i.e. it neither aborts nor mis-reports. Gated on zsh
+  # availability (matching the 20c3-zsh / 78c-zsh convention).
+  if command -v zsh >/dev/null 2>&1; then
+    local zsh_sel
+    zsh_sel=$(zsh -c '
+      emulate -L zsh
+      source "$1/scripts/lib/monitor-decisions.sh"
+      # Hermetic linear-main oracle: DEP -> G -> HEAD; G is on main, 1 ahead of DEP.
+      _order_of() {
+        case "$1" in
+          DEP)  print 0 ;;
+          G)    print 1 ;;
+          HEAD) print 2 ;;
+          *)    print "" ;;
+        esac
+      }
+      is_ancestor() {
+        local ra rb
+        ra="$(_order_of "$1")"; rb="$(_order_of "$2")"
+        [[ -n "$ra" && -n "$rb" && "$ra" -le "$rb" ]]
+      }
+      commits_ahead() {
+        local rd rs
+        rd="$(_order_of "$1")"; rs="$(_order_of "$2")"
+        if [[ -z "$rd" || -z "$rs" || "$rs" -le "$rd" ]]; then print 0; return 0; fi
+        print $(( rs - rd ))
+      }
+      printf "%s\n" "G|completed|success" | select_latest_green_deploy_target "DEP" "HEAD" 2>/dev/null
+    ' -- "$REPO_ROOT")
+    if [[ "$zsh_sel" == "G" ]]; then
+      tap_ok "select_latest_green: runs under zsh without read-only-status abort (#3581)"
+    else
+      tap_not_ok "select_latest_green: runs under zsh without read-only-status abort (#3581)" "got '$zsh_sel' (expected 'G')"
+    fi
+  else
+    tap_skip "select_latest_green: runs under zsh without read-only-status abort (#3581)" "zsh not found"
+  fi
+
   # Restore real git oracles so no later test sees the stubs.
   unset -f is_ancestor commits_ahead _order_of
 
