@@ -289,6 +289,7 @@ impl SorobanTxBuilder {
         sequence: i64,
         wasm_hash: &Hash256,
         salt: &Uint256,
+        contract_overhead_bytes: u32,
         inclusion_fee: u32,
     ) -> anyhow::Result<TransactionEnvelope> {
         let deployer_address = ScAddress::Account(stellar_xdr::AccountId(
@@ -340,7 +341,16 @@ impl SorobanTxBuilder {
                 read_write: vec![instance_key].try_into().unwrap_or_default(),
             },
             instructions: CREATE_CONTRACT_INSTRUCTIONS,
-            disk_read_bytes: CREATE_CONTRACT_READ_BYTES,
+            // Parity: stellar-core `createContractTransaction` sets
+            // `diskReadBytes = contractOverheadBytes` (TxGenerator.cpp:333),
+            // i.e. the uploaded WASM size + overhead (`mContactOverheadBytes =
+            // wasmBytes.size() + 160`, LoadGenerator.cpp:1198). The deploy reads
+            // the contract-code (WASM) entry, so the read budget must track the
+            // actual WASM size. A fixed over-estimate (the old hardcoded 5000)
+            // EXCEEDS the genesis Soroban `ledger_max_read_bytes` (3200), so the
+            // deploy tx can never fit a tx set's Soroban lane — silently wedging
+            // the root-account upgrade-setup sequence (deploy → create_upgrade).
+            disk_read_bytes: contract_overhead_bytes,
             write_bytes: CREATE_CONTRACT_WRITE_BYTES,
         };
 
@@ -1816,5 +1826,61 @@ mod tests {
         if let LedgerKey::ContractData(inst_cd) = &instance_key {
             assert_eq!(rw_cd.contract, inst_cd.contract);
         }
+    }
+
+    /// Regression for the SSC mixed-image Soroban config-upgrade wedge.
+    ///
+    /// The deploy (`create_contract`) tx reads the uploaded contract-code (WASM)
+    /// entry, so stellar-core sets `diskReadBytes = contractOverheadBytes`
+    /// (`= wasmBytes.size() + 160`, TxGenerator.cpp:333 / LoadGenerator.cpp:1198).
+    /// henyey previously hardcoded `disk_read_bytes = 5000`, which EXCEEDS the
+    /// genesis Soroban `ledger_max_read_bytes` (3200): surge pricing relaxes only
+    /// the instruction lane (not read/write bytes), so `any_greater` permanently
+    /// excludes a 5000-read-byte tx from every tx set. The deploy tx could never
+    /// be included, which (by sequence order on the shared root account) wedged
+    /// the entire upgrade-setup chain (deploy → create_upgrade), so the config
+    /// upgrade never armed/applied and `LedgerMaxInstructions` stayed at 2.5M.
+    ///
+    /// This pins the deploy tx's `disk_read_bytes` to the passed overhead and
+    /// asserts it fits under the tiny genesis read-bytes limit. The old fixed
+    /// 5000 fails the `<= GENESIS_LEDGER_MAX_READ_BYTES` assertion.
+    #[test]
+    fn test_create_contract_disk_read_bytes_tracks_overhead_and_fits_genesis() {
+        let builder = SorobanTxBuilder::new("Test SDF Network ; September 2015".to_string());
+        let source = SecretKey::from_seed(&[9u8; 32]);
+
+        // Real loadgen WASM (1739 bytes) → overhead = wasm.len() + 160.
+        let wasm = SorobanTxBuilder::loadgen_wasm();
+        let wasm_hash = SorobanTxBuilder::loadgen_wasm_hash();
+        let overhead = wasm.len() as u32 + 160;
+        let salt = Uint256([3u8; 32]);
+
+        let env = builder
+            .create_contract_tx(&source, 100, &wasm_hash, &salt, overhead, 100)
+            .unwrap();
+
+        let TransactionEnvelope::Tx(v1) = &env else {
+            panic!("expected v1 envelope");
+        };
+        let TransactionExt::V1(data) = &v1.tx.ext else {
+            panic!("expected V1 soroban ext");
+        };
+
+        // diskReadBytes must equal contractOverheadBytes (parity).
+        assert_eq!(
+            data.resources.disk_read_bytes, overhead,
+            "deploy diskReadBytes must equal contractOverheadBytes (TxGenerator.cpp:333)"
+        );
+
+        // ... and must fit under the genesis Soroban ledger read-bytes limit, or
+        // the deploy tx can never be included in a tx set's Soroban lane.
+        const GENESIS_LEDGER_MAX_READ_BYTES: u32 = 3200;
+        assert!(
+            data.resources.disk_read_bytes <= GENESIS_LEDGER_MAX_READ_BYTES,
+            "deploy diskReadBytes {} exceeds genesis ledger_max_read_bytes {} — \
+             tx would be silently excluded from every tx set (the pre-fix bug used 5000)",
+            data.resources.disk_read_bytes,
+            GENESIS_LEDGER_MAX_READ_BYTES
+        );
     }
 }

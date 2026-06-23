@@ -913,12 +913,14 @@ impl TxGenerator {
         account_id: u64,
         wasm_hash: &Hash256,
         salt: &Uint256,
+        contract_overhead_bytes: u32,
         max_fee_rate: Option<u32>,
     ) -> anyhow::Result<(u64, TransactionEnvelope)> {
         let fee = self.generate_fee(max_fee_rate, 1, account_id);
         let (sk, seq) = self.next_source_sequence(account_id, ledger_num);
         let builder = self.soroban_builder();
-        let envelope = builder.create_contract_tx(&sk, seq, wasm_hash, salt, fee)?;
+        let envelope =
+            builder.create_contract_tx(&sk, seq, wasm_hash, salt, contract_overhead_bytes, fee)?;
         Ok((account_id, envelope))
     }
 
@@ -1830,11 +1832,16 @@ impl LoadGenerator {
                         )
                         .0,
                     );
+                    // Parity: stellar-core passes `mContactOverheadBytes`
+                    // (= uploaded WASM size + 160, set in phase 1) as the
+                    // deploy tx's `diskReadBytes` (LoadGenerator.cpp:1198,1214).
+                    let contract_overhead_bytes = self.contract_overhead_bytes as u32;
                     let result = self.tx_generator.create_contract_transaction(
                         ledger_num,
                         source_account_id,
                         &wasm_hash,
                         &salt,
+                        contract_overhead_bytes,
                         config.max_fee_rate,
                     );
                     if result.is_ok() {
