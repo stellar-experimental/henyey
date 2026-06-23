@@ -45,7 +45,7 @@ cleanup  # ensure fresh state
 mkdir -p "$TEST_ROOT"
 
 # ── TAP state ────────────────────────────────────────────────────────────────
-TAP_PLAN=406
+TAP_PLAN=418
 TAP_CURRENT=0
 TAP_FAILURES=0
 
@@ -9790,6 +9790,21 @@ BOARDEOF
   else
     tap_not_ok "classify_path: stellar-specs submodule → no-impact" "got '$(_cls "stellar-specs")'"
   fi
+  # #3530: stellar-core is a parity-reference submodule (CLAUDE.md), never in the
+  # `cargo build --release -p henyey` graph — a pointer-only bump cannot change
+  # the binary. Mirror the stellar-specs arm so a submodule-pin-only commit is a
+  # skip CANDIDATE; the §10-step-2a byte-compare still independently gates the
+  # actual restart-skip.
+  if [[ "$(_cls "stellar-core")" == "no-impact" ]]; then
+    tap_ok "classify_path: stellar-core submodule → no-impact (#3530)"
+  else
+    tap_not_ok "classify_path: stellar-core submodule → no-impact (#3530)" "got '$(_cls "stellar-core")'"
+  fi
+  if [[ "$(_cls "stellar-core/src/foo")" == "no-impact" ]]; then
+    tap_ok "classify_path: stellar-core/* path → no-impact (#3530)"
+  else
+    tap_not_ok "classify_path: stellar-core/* path → no-impact (#3530)" "got '$(_cls "stellar-core/src/foo")'"
+  fi
   # Container-image files (#3307): Dockerfile / .dockerignore / *.dockerfile are
   # never read by `cargo build --release -p henyey`, so they cannot change the
   # compiled binary. Route them through no-impact so a Dockerfile-only delta hits
@@ -9862,6 +9877,142 @@ BOARDEOF
   else
     tap_not_ok "classify_path: non-.rs under crates/src → rebuild (fail-safe)" "got '$(_cls "crates/app/src/fixtures/data.json")'"
   fi
+
+  # ── #3351: select_latest_green_deploy_target ────────────────────────────────
+  # The selector picks the newest Verify-Execution-green sha that is on main,
+  # at-or-ahead of the deployed sha, and within MAX_DEPLOY_WALK commits. It is
+  # fail-closed: empty stdout (+ a stderr reason) on no valid target, so the
+  # SKILL never deploys an unvalidated binary. The git ancestry oracle is
+  # injected as overridable functions (is_ancestor / commits_ahead) so these
+  # tests are hermetic — no on-disk repo needed.
+  #
+  # Hermetic ancestry model used by the stub oracle below. We define a simple
+  # linear main history (oldest → newest):
+  #     DEP  →  G_OLD  →  G  →  HEAD
+  # plus an off-main sha (FORK) that is NOT an ancestor of HEAD, and a far-ahead
+  # green sha (FAR) used to exercise the walk bound. The stub answers ancestry
+  # from a fixed table so the selector logic is exercised without real git.
+  _order_of() {
+    # echo a monotonic rank for each known sha; unknown → empty (unresolvable).
+    case "$1" in
+      DEP)   echo 0 ;;
+      G_OLD) echo 1 ;;
+      G)     echo 2 ;;
+      HEAD)  echo 3 ;;
+      FAR)   echo 9999 ;;   # far ahead of DEP on main
+      *)     echo "" ;;     # FORK / unknown → not resolvable on main
+    esac
+  }
+  # is_ancestor A B : 0 iff A is an ancestor-or-equal of B on the linear main.
+  # FORK is off-main: never an ancestor of anything, and HEAD is never its anc.
+  is_ancestor() {
+    local a="$1" b="$2" ra rb
+    if [[ "$a" == "FORK" || "$b" == "FORK" ]]; then return 1; fi
+    ra="$(_order_of "$a")"; rb="$(_order_of "$b")"
+    [[ -n "$ra" && -n "$rb" && "$ra" -le "$rb" ]]
+  }
+  # commits_ahead DEP SHA : count of commits in DEP..SHA (reachable from SHA, not DEP).
+  commits_ahead() {
+    local dep="$1" sha="$2" rd rs
+    rd="$(_order_of "$dep")"; rs="$(_order_of "$sha")"
+    if [[ -z "$rd" || -z "$rs" ]]; then echo 0; return 0; fi
+    if [[ "$rs" -le "$rd" ]]; then echo 0; return 0; fi
+    echo $(( rs - rd ))
+  }
+
+  # Case 1: HEAD has no green Verify Execution (CI cancelled); older sha G is
+  # completed/success, on main, ahead of deployed → selector picks G.
+  _records_head_cancelled() {
+    printf '%s\n' \
+      "HEAD|completed|cancelled" \
+      "G|completed|success" \
+      "G_OLD|completed|success"
+  }
+  _sel1="$(_records_head_cancelled | select_latest_green_deploy_target "DEP" "HEAD" 2>/dev/null)"
+  if [[ "$_sel1" == "G" ]]; then
+    tap_ok "select_latest_green: picks newest green ancestor when HEAD CI cancelled (#3351)"
+  else
+    tap_not_ok "select_latest_green: picks newest green ancestor when HEAD CI cancelled (#3351)" "got '$_sel1'"
+  fi
+
+  # Case 2: no green record at all → empty stdout + reason no-green-run.
+  _records_none_green() {
+    printf '%s\n' \
+      "HEAD|completed|cancelled" \
+      "G|in_progress|" \
+      "G_OLD|completed|failure"
+  }
+  _err2="$(_records_none_green | select_latest_green_deploy_target "DEP" "HEAD" 2>&1 >/dev/null)"
+  _out2="$(_records_none_green | select_latest_green_deploy_target "DEP" "HEAD" 2>/dev/null)"
+  if [[ -z "$_out2" && "$_err2" == *"no-green-run"* ]]; then
+    tap_ok "select_latest_green: no green run → empty + reason no-green-run (#3351)"
+  else
+    tap_not_ok "select_latest_green: no green run → empty + reason no-green-run (#3351)" "out='$_out2' err='$_err2'"
+  fi
+
+  # Case 3: only green sha == deployed → up-to-date no-op (empty + green-equals-deployed),
+  # NOT a redeploy of the running sha.
+  _records_green_eq_dep() {
+    printf '%s\n' \
+      "HEAD|completed|cancelled" \
+      "DEP|completed|success"
+  }
+  _err3="$(_records_green_eq_dep | select_latest_green_deploy_target "DEP" "HEAD" 2>&1 >/dev/null)"
+  _out3="$(_records_green_eq_dep | select_latest_green_deploy_target "DEP" "HEAD" 2>/dev/null)"
+  if [[ -z "$_out3" && "$_err3" == *"green-equals-deployed"* ]]; then
+    tap_ok "select_latest_green: green == deployed → empty + green-equals-deployed (#3351)"
+  else
+    tap_not_ok "select_latest_green: green == deployed → empty + green-equals-deployed (#3351)" "out='$_out3' err='$_err3'"
+  fi
+
+  # Case 4: only green sha is BEHIND deployed (ancestor of DEP) → no backwards
+  # deploy (empty + green-behind-deployed). Deploy DEP_AHEAD where green G_OLD is
+  # behind it: deployed=G, green=G_OLD (G_OLD is an ancestor of G).
+  _records_green_behind() {
+    printf '%s\n' \
+      "HEAD|completed|cancelled" \
+      "G_OLD|completed|success"
+  }
+  _err4="$(_records_green_behind | select_latest_green_deploy_target "G" "HEAD" 2>&1 >/dev/null)"
+  _out4="$(_records_green_behind | select_latest_green_deploy_target "G" "HEAD" 2>/dev/null)"
+  if [[ -z "$_out4" && "$_err4" == *"green-behind-deployed"* ]]; then
+    tap_ok "select_latest_green: green behind deployed → empty + green-behind-deployed (#3351)"
+  else
+    tap_not_ok "select_latest_green: green behind deployed → empty + green-behind-deployed (#3351)" "out='$_out4' err='$_err4'"
+  fi
+
+  # Case 5: green sha is off-main (not an ancestor of HEAD) → skip candidate,
+  # reason green-not-on-main; with no other green → empty.
+  _records_green_offmain() {
+    printf '%s\n' \
+      "HEAD|completed|cancelled" \
+      "FORK|completed|success"
+  }
+  _err5="$(_records_green_offmain | select_latest_green_deploy_target "DEP" "HEAD" 2>&1 >/dev/null)"
+  _out5="$(_records_green_offmain | select_latest_green_deploy_target "DEP" "HEAD" 2>/dev/null)"
+  if [[ -z "$_out5" && "$_err5" == *"green-not-on-main"* ]]; then
+    tap_ok "select_latest_green: off-main green → empty + green-not-on-main (#3351)"
+  else
+    tap_not_ok "select_latest_green: off-main green → empty + green-not-on-main (#3351)" "out='$_out5' err='$_err5'"
+  fi
+
+  # Case 6: green sha exceeds MAX_DEPLOY_WALK commits ahead of deployed →
+  # reject (empty + walk-exceeded). FAR is 9999 commits ahead of DEP.
+  _records_far_green() {
+    printf '%s\n' \
+      "HEAD|completed|cancelled" \
+      "FAR|completed|success"
+  }
+  _err6="$(_records_far_green | select_latest_green_deploy_target "DEP" "FAR" 2>&1 >/dev/null)"
+  _out6="$(_records_far_green | select_latest_green_deploy_target "DEP" "FAR" 2>/dev/null)"
+  if [[ -z "$_out6" && "$_err6" == *"walk-exceeded"* ]]; then
+    tap_ok "select_latest_green: green > MAX_DEPLOY_WALK ahead → empty + walk-exceeded (#3351)"
+  else
+    tap_not_ok "select_latest_green: green > MAX_DEPLOY_WALK ahead → empty + walk-exceeded (#3351)" "out='$_out6' err='$_err6'"
+  fi
+
+  # Restore real git oracles so no later test sees the stubs.
+  unset -f is_ancestor commits_ahead _order_of
 
   # --- diff_is_test_only: hunk-level ---
   # PASS case: a src/*.rs diff whose every changed line is strictly inside a

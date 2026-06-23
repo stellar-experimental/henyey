@@ -704,6 +704,16 @@ classify_path_binary_relevance() {
       echo "no-impact"; return 0 ;;
     stellar-specs|stellar-specs/*)
       echo "no-impact"; return 0 ;;
+    # stellar-core is a parity-reference submodule (CLAUDE.md: "available as a
+    # git submodule … for parity checks"); it is NEVER in the
+    # `cargo build --release -p henyey` build graph, so a submodule-pointer bump
+    # cannot change the compiled binary. Mirror the stellar-specs arm (#3530): a
+    # `stellar-core`-pointer-only changeset becomes a skip *candidate*, while the
+    # authoritative restart-skip is still independently gated by the §10-step-2a
+    # release-binary byte-compare. So this arm can never on its own suppress a
+    # real deploy — it only lets the byte-compare carve-out fire.
+    stellar-core|stellar-core/*)
+      echo "no-impact"; return 0 ;;
     # Container-image files (#3307): never read by `cargo build --release -p
     # henyey`, so they cannot change the compiled binary. Routing them through
     # no-impact makes a Dockerfile-only delta a skip *candidate* that the
@@ -743,6 +753,136 @@ classify_path_binary_relevance() {
 
   # --- Everything else: fail-safe rebuild. ---
   echo "rebuild"
+  return 0
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# select_latest_green_deploy_target DEPLOYED_SHA ORIGIN_SHA   (issue #3351)
+#
+# Pure deploy-target selector for the monitor-tick §10 deploy gate. On a busy
+# `main` the heavyweight `CI` workflow is cancel-per-head (structurally never
+# green at HEAD) and `Verify Execution (Mainnet)` runs only on schedule /
+# workflow_dispatch — so it is green only on the specific heads that were HEAD
+# at a cron/dispatch run, never on the racing tip. The legacy "deploy origin
+# HEAD iff its CI is green" gate therefore never fires. This selector instead
+# picks the NEWEST commit whose `Verify Execution (Mainnet)` run completed
+# `success` and that is safe to deploy (operator option 3: deploy latest-green).
+#
+# Reads Verify-Execution run records on stdin, one per line, newest-first
+# (exactly the `gh run list … --json headSha,status,conclusion --jq` order):
+#     <headSha>|<status>|<conclusion>
+#
+# Prints the chosen deploy-target sha to STDOUT (empty if none), and a single
+# reason token to STDERR. Reason tokens:
+#     (sha printed)        — a valid newer green target was selected
+#     no-green-run         — no record is completed/success
+#     green-equals-deployed— newest valid green sha == deployed (up-to-date)
+#     green-behind-deployed— only green sha(s) are ancestors of deployed (no
+#                            backwards deploy)
+#     green-not-on-main    — only green sha(s) are not ancestors of ORIGIN_SHA
+#                            (off-main / force-pushed / unresolvable locally)
+#     walk-exceeded        — newest valid green sha is > MAX_DEPLOY_WALK commits
+#                            ahead of deployed (defensive staleness bound)
+#
+# FAIL-CLOSED contract (DEPLOY-SAFETY):
+#   - empty stdout  ⇒ caller MUST NOT deploy (no validated target). Never emits
+#     a sha that is unvalidated, off-main, equal-to/behind deployed, or beyond
+#     the walk bound.
+#   - the ancestry oracle is injected as the overridable shell functions
+#     `is_ancestor A B` (0 iff A is ancestor-or-equal of B) and
+#     `commits_ahead DEP SHA` (count of DEP..SHA), defaulting to git. An oracle
+#     ERROR or a sha unresolvable locally is treated as "skip THIS candidate"
+#     (reason green-not-on-main) — it never aborts the tick and never deploys.
+#   - records are consumed newest-first; the FIRST candidate satisfying every
+#     guardrail wins. `green-equals-deployed` short-circuits as up-to-date the
+#     moment the newest valid-on-main green sha is the deployed sha (so we never
+#     redeploy the running binary, and never look past it to an older green).
+#
+# Returns 0 always (the reason token + empty/non-empty stdout carry the result).
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Defensive staleness bound: refuse to jump more than this many commits in one
+# deploy, even to a green sha (guards against a weeks-lapsed schedule yielding a
+# wildly stale "green"). Single documented constant; env-overridable for tests.
+: "${MAX_DEPLOY_WALK:=200}"
+
+# Ancestry oracle (overridable for hermetic tests). Default: real git.
+# is_ancestor A B → 0 iff A is an ancestor-or-equal of B (A reachable from B).
+if ! declare -F is_ancestor >/dev/null 2>&1; then
+  is_ancestor() { git merge-base --is-ancestor "$1" "$2" 2>/dev/null; }
+fi
+# commits_ahead DEP SHA → number of commits in DEP..SHA (reachable from SHA,
+# not from DEP). Prints 0 on any error so the caller's numeric compare is safe.
+if ! declare -F commits_ahead >/dev/null 2>&1; then
+  commits_ahead() { git rev-list --count "$1".."$2" 2>/dev/null || echo 0; }
+fi
+
+select_latest_green_deploy_target() {
+  local deployed_sha="$1" origin_sha="$2"
+  local line sha status conclusion
+  local saw_green=0           # any completed/success record at all
+  local saw_on_main=0         # any green record that is on main (ancestor of HEAD)
+
+  while IFS='|' read -r sha status conclusion; do
+    # Skip blank lines.
+    [[ -z "$sha" ]] && continue
+    # Only completed/success records are deploy candidates.
+    [[ "$status" == "completed" && "$conclusion" == "success" ]] || continue
+    saw_green=1
+
+    # Guardrail 1 — on main: the green sha must be an ancestor-or-equal of the
+    # origin HEAD. An oracle error / locally-unresolvable sha lands here too
+    # (is_ancestor returns non-zero) → skip THIS candidate, never abort.
+    if ! is_ancestor "$sha" "$origin_sha"; then
+      continue
+    fi
+    saw_on_main=1
+
+    # Up-to-date: the newest valid-on-main green sha IS the deployed sha. This is
+    # a distinct, terminal outcome — report up-to-date and stop (never redeploy
+    # the running binary, never fall through to an older green).
+    if [[ "$sha" == "$deployed_sha" ]]; then
+      echo "green-equals-deployed" >&2
+      return 0
+    fi
+
+    # Guardrail 2 — not backwards: the green sha must be deployed-or-descendant.
+    # If deployed_sha is NOT an ancestor of sha, this green is behind/diverged
+    # from what's running → never deploy backwards. Skip this candidate.
+    if ! is_ancestor "$deployed_sha" "$sha"; then
+      continue
+    fi
+
+    # Guardrail 3 — walk bound: refuse a green sha more than MAX_DEPLOY_WALK
+    # commits ahead of deployed (defensive against a long-lapsed schedule).
+    local ahead
+    ahead="$(commits_ahead "$deployed_sha" "$sha")"
+    [[ "$ahead" =~ ^[0-9]+$ ]] || ahead=0
+    if (( ahead > MAX_DEPLOY_WALK )); then
+      echo "walk-exceeded" >&2
+      return 0
+    fi
+
+    # All guardrails passed — this is the newest valid green target.
+    echo "$sha"
+    return 0
+  done
+
+  # No candidate selected — emit the most specific reason. Any green sha that
+  # reached the walk-bound or up-to-date checks already returned inline above, so
+  # reaching here means every green record failed an earlier guardrail.
+  if (( saw_on_main == 1 )); then
+    # Green sha(s) exist on main but every one is an ancestor of deployed_sha
+    # (behind what's running) → no backwards deploy.
+    echo "green-behind-deployed" >&2
+  elif (( saw_green == 1 )); then
+    # Green sha(s) exist but none are ancestors of origin HEAD (off-main /
+    # force-pushed / unresolvable locally).
+    echo "green-not-on-main" >&2
+  else
+    # No completed/success record at all.
+    echo "no-green-run" >&2
+  fi
   return 0
 }
 

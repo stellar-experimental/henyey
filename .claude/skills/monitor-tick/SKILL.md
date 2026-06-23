@@ -1626,22 +1626,77 @@ fi
 
 Report `deployed_sha_status` in the tick's status line.
 
-**Gate comparison:**
+**Deploy-target selection — latest green `Verify Execution (Mainnet)` (#3351):**
+
+The deploy target is NOT `origin/main` HEAD. On a busy `main` the heavyweight
+`CI` workflow is cancel-per-head (structurally never green at HEAD), and
+`Verify Execution (Mainnet)` — the hash-parity correctness suite that catches
+consensus hash-mismatch regressions — runs only on `schedule` (daily 06:00 UTC)
++ `workflow_dispatch`, so it is green only on the specific heads that were HEAD
+at a cron/dispatch run, never on the racing tip. A "deploy HEAD iff its CI is
+green" gate therefore never fires. Per operator option 3, we deploy the
+**latest commit whose `Verify Execution (Mainnet)` run completed `success`**,
+decoupling the deploy target from the racing tip while never shipping a binary
+the parity suite has not validated.
 
 ```bash
 origin_sha=$(git rev-parse origin/main)
 
+# Query Verify-Execution runs on main, newest-first, as headSha|status|conclusion.
+# The run-level workflow `name:` is literally "Verify Execution (Mainnet)".
+ve_records=$(gh run list --repo stellar-experimental/henyey \
+  --workflow "Verify Execution (Mainnet)" --branch main --limit 30 \
+  --json headSha,status,conclusion,createdAt \
+  --jq '.[] | "\(.headSha)|\(.status)|\(.conclusion)"' 2>/dev/null)
+
+# Pure selector (scripts/lib/monitor-decisions.sh). Prints the chosen target sha
+# to stdout (empty if none) and a reason token to stderr. FAIL-CLOSED: empty
+# stdout ⇒ never deploy (no validated target). Guardrails: on-main ancestor of
+# HEAD, deployed-or-ahead (never backwards), within MAX_DEPLOY_WALK commits;
+# an oracle error / locally-unresolvable sha is a skip-this-candidate, never an
+# abort, never a deploy.
+source "$(git rev-parse --show-toplevel)/scripts/lib/monitor-decisions.sh"
+deploy_target_sha=$(printf '%s\n' "$ve_records" \
+  | select_latest_green_deploy_target "$deployed_sha" "$origin_sha" 2>/tmp/ve_reason)
+ve_reason=$(cat /tmp/ve_reason 2>/dev/null)
+```
+
+**Gate comparison** (keys on `deploy_target_sha`, NOT `origin/main` HEAD):
+
+```bash
 case "$deployed_sha_status" in
   ok|missing-fresh)
-    [ "$deployed_sha" = "$origin_sha" ] && gate_action="up-to-date" || gate_action="proceed"
+    if [ -z "$deploy_target_sha" ]; then
+      # No validated target. green-equals-deployed ⇒ up-to-date no-op;
+      # any other reason ⇒ DEFER (fail-closed — never deploy unvalidated).
+      if [ "$ve_reason" = "green-equals-deployed" ]; then
+        gate_action="up-to-date"
+      else
+        gate_action="defer-no-green"
+      fi
+    else
+      gate_action="proceed"   # deploy_target_sha is the validated target
+    fi
     ;;
   invalid)
-    gate_action="proceed-force-rebuild"
+    # Corrupt build_sha. Still require a validated target to deploy to.
+    if [ -z "$deploy_target_sha" ]; then
+      gate_action="defer-no-green"
+    else
+      gate_action="proceed-force-rebuild"
+    fi
     ;;
 esac
 ```
 
-If `gate_action="up-to-date"`: no action (already up to date).
+If `gate_action="up-to-date"`: no action (already running the latest green sha).
+
+If `gate_action="defer-no-green"`: SKIP DEPLOY this tick (fail-closed — no green
+`Verify Execution` target ahead of what's deployed). Report:
+`DEPLOY DEFERRED (no green Verify Execution target ahead of deployed ${deployed_sha:0:8}: $ve_reason)`.
+Do NOT build or restart. (This is the correct, safe behavior on a busy main
+between schedule runs: the node keeps running its last parity-validated binary
+rather than deploying an unvalidated HEAD.)
 
 Otherwise enter the deploy path:
 
@@ -1666,7 +1721,7 @@ Otherwise enter the deploy path:
    if [ "$gate_action" = "proceed-force-rebuild" ]; then
      # invalid build_sha — skip heuristic, force rebuild
      needs_rebuild="yes"
-   elif changed_paths=$(git diff --name-only "$deployed_sha" origin/main 2>/dev/null); then
+   elif changed_paths=$(git diff --name-only "$deployed_sha" "$deploy_target_sha" 2>/dev/null); then
      # ok or missing-fresh: classify every changed path. needs_rebuild stays
      # "no" only if EVERY path is provably non-binary-affecting; ANY ambiguity
      # flips to "yes" (fail-safe). skip_kind tracks the strongest skip reason
@@ -1682,7 +1737,7 @@ Otherwise enter the deploy path:
            # crates/**/src/**.rs: test-only ONLY if every changed line in THIS
            # file's diff is inside a #[cfg(test)]/mod tests region. Any ambiguity
            # (zero-context hunk, module deletion, boundary edit) → rebuild.
-           if git diff "$deployed_sha" origin/main -- "$p" | diff_is_test_only; then
+           if git diff "$deployed_sha" "$deploy_target_sha" -- "$p" | diff_is_test_only; then
              skip_kind="test-only"
            else
              needs_rebuild="yes"; break
@@ -1703,7 +1758,9 @@ Otherwise enter the deploy path:
      `.github/`, `.claude/`, `scripts/`, `docs/`, `metrics/`, root-level `*.md`
      (e.g. `README.md`, `CLAUDE.md`), root-level git metadata dotfiles
      (`.gitignore`, `.gitattributes`, `.gitmodules`), `stellar-specs` /
-     `stellar-specs/` submodule pointer changes, and container-image files
+     `stellar-specs/` and `stellar-core` / `stellar-core/` reference-submodule
+     pointer changes (parity-reference submodules per CLAUDE.md, never in the
+     `cargo build --release -p henyey` graph — #3530), and container-image files
      (`Dockerfile`, `.dockerignore`, `*.dockerfile`) — `cargo` never reads them,
      so they cannot change the compiled binary; safe ONLY because the monitor
      runs the locally-compiled `release/henyey`, not the Docker image (the
@@ -1722,7 +1779,7 @@ Otherwise enter the deploy path:
 2a. **Authoritative binary byte-compare** (only when `needs_rebuild="no"`): the
     heuristic has marked the changeset a skip CANDIDATE, but shell-based Rust
     region parsing is brittle, so it does NOT by itself authorize a skip. Build
-    `henyey` at BOTH `deployed_sha` and `origin/main` into the SAME scratch
+    `henyey` at BOTH `deployed_sha` and `deploy_target_sha` into the SAME scratch
     target dir with identical flags, then byte-compare the two produced
     binaries. Skip the rebuild+restart ONLY if the bytes are identical;
     otherwise fall through to the normal rebuild+restart path (step 3+).
@@ -1735,12 +1792,12 @@ Otherwise enter the deploy path:
       BIN_OLD="/home/tomer/data/$MONITOR_SESSION_ID/binrel-old"
       BIN_NEW="/home/tomer/data/$MONITOR_SESSION_ID/binrel-new"
       rm -rf "$CMP_TARGET"; mkdir -p "$CMP_TARGET"
-      # Build at deployed_sha, then at origin/main, into the SAME target dir.
+      # Build at deployed_sha, then at deploy_target_sha, into the SAME target dir.
       git stash --include-untracked >/dev/null 2>&1 || true
       git checkout --quiet "$deployed_sha" \
         && CARGO_TARGET_DIR="$CMP_TARGET" cargo build --release -p henyey \
         && cp "$CMP_TARGET/release/henyey" "$BIN_OLD"
-      git checkout --quiet origin/main \
+      git checkout --quiet "$deploy_target_sha" \
         && CARGO_TARGET_DIR="$CMP_TARGET" cargo build --release -p henyey \
         && cp "$CMP_TARGET/release/henyey" "$BIN_NEW"
       if [ -f "$BIN_OLD" ] && [ -f "$BIN_NEW" ] && cmp -s "$BIN_OLD" "$BIN_NEW"; then
@@ -1752,18 +1809,20 @@ Otherwise enter the deploy path:
     fi
     ```
     On a **confirmed skip** (`needs_rebuild="no"` AND `binary_identical="yes"`):
-    run `git pull --rebase` only, then advance `BUILD_SHA_FILE` to the new sha:
+    check out `deploy_target_sha` (the latest-green target, NOT HEAD), then
+    advance `BUILD_SHA_FILE` to it:
     ```bash
-    new_sha=$(git rev-parse origin/main)
+    git checkout --quiet "$deploy_target_sha"
+    new_sha="$deploy_target_sha"
     printf '%s\n' "$new_sha" > "${BUILD_SHA_FILE}.tmp"
     mv "${BUILD_SHA_FILE}.tmp" "$BUILD_SHA_FILE"
     ```
     The bytes are confirmed byte-identical, so the running binary IS the
-    origin/main binary — advancing `BUILD_SHA_FILE` is correct and fixes the
-    per-tick re-trip (the gate no longer re-evaluates this same changeset every
-    tick). Report:
-    - `DEPLOY SYNCED (test-only: binary byte-identical — pulled <N> commits, no restart)` when `skip_kind="test-only"`;
-    - `DEPLOY SYNCED (no-binary-impact: allowlisted paths only — pulled <N> commits, no restart)` when `skip_kind="no-binary-impact"`.
+    `deploy_target_sha` binary — advancing `BUILD_SHA_FILE` is correct and fixes
+    the per-tick re-trip (the gate no longer re-evaluates this same changeset
+    every tick). Report:
+    - `DEPLOY SYNCED (test-only: binary byte-identical — advanced to green ${deploy_target_sha:0:8}, no restart)` when `skip_kind="test-only"`;
+    - `DEPLOY SYNCED (no-binary-impact: allowlisted paths only — advanced to green ${deploy_target_sha:0:8}, no restart)` when `skip_kind="no-binary-impact"`.
 
     If `binary_identical="no"` (a heuristic false-positive OR a
     non-reproducible build): set `needs_rebuild="yes"` and fall through to the
@@ -1818,21 +1877,30 @@ Otherwise enter the deploy path:
    Consequence: a normal `git revert` (which adds a revert commit but leaves
    the quarantined SHA in ancestry) auto-clears the gate on the next tick.
    Operator no longer needs to manually `quarantine_remove` reverted SHAs.
-4. Check CI status on origin/main: `gh run list --branch main --limit 3 --json conclusion --jq '.[].conclusion'`.
-   If any recent run has conclusion `failure`, do NOT deploy — route the failure
-   through check (11) and wait.
-5. If all conclusions are `success` (ignore `""` for in-progress and `cancelled`):
-   `git pull --rebase`, `CARGO_TARGET_DIR=/home/tomer/data/$MONITOR_SESSION_ID/cargo-target cargo build --release -p henyey`.
-6. If build succeeds:
+4. **Deploy target is already parity-validated.** `deploy_target_sha` was
+   selected precisely because its `Verify Execution (Mainnet)` run completed
+   `success` (operator option 3). The legacy "scan origin/main `CI` conclusions
+   and defer on `failure`" gate is REMOVED from the per-head deploy signal: on a
+   busy main `CI` is cancel-per-head (never a clean `success` at HEAD), so it
+   carried no usable signal, and every commit was already branch-protection-gated
+   pre-merge. Build the validated target:
    ```bash
-   # Persist the just-built sha BEFORE Stop-PID. Atomic via tmp + mv.
-   new_sha=$(git rev-parse HEAD)
+   git checkout --quiet "$deploy_target_sha"
+   CARGO_TARGET_DIR=/home/tomer/data/$MONITOR_SESSION_ID/cargo-target \
+     cargo build --release -p henyey
+   ```
+   (Independently, check (11) still observes main CI failures for the status
+   report and alarming — it just no longer gates this deploy.)
+5. If build succeeds:
+   ```bash
+   # Persist the just-built target sha BEFORE Stop-PID. Atomic via tmp + mv.
+   new_sha="$deploy_target_sha"
    printf '%s\n' "$new_sha" > "${BUILD_SHA_FILE}.tmp"
    mv "${BUILD_SHA_FILE}.tmp" "$BUILD_SHA_FILE"
    ```
    Then: Stop-PID, Rotate-log suffix `preredeploy`, Relaunch.
-   Report: `DEPLOY — pulled <N> commits (<old-sha>..<new-sha>), rebuilt, restarted at L<ledger>`.
-7. If build fails: report `BUILD FAILED`, do NOT restart — the old binary is
+   Report: `DEPLOY — to green Verify-Execution sha ${deploy_target_sha:0:8} (${deployed_sha:0:8}..${deploy_target_sha:0:8}), N commits behind origin HEAD ${origin_sha:0:8}, rebuilt, restarted at L<ledger>`.
+6. If build fails: report `BUILD FAILED`, do NOT restart — the old binary is
    still running. Do NOT update `BUILD_SHA_FILE`. Route the build error through
    check (11).
 
