@@ -45,6 +45,96 @@ const STEP_MSECS: u64 = 100;
 /// Maximum retries on `txBAD_SEQ` before giving up.
 const TX_SUBMIT_MAX_TRIES: u32 = 10;
 
+/// Maximum retries on transient tx-queue backpressure (`QueueFull`, and
+/// `TryAgainLater` without `skip_low_fee_txs`) before giving up. Generous and
+/// finite: a genuinely wedged queue still surfaces as a run failure after the
+/// cap (bounded, not infinite masking), but a transient burst — e.g. the
+/// soroban phase-2 instance-deploy burst right after 100 phase-1 uploads —
+/// drains within a few `STEP_MSECS` intervals and the run proceeds.
+///
+/// DELIBERATE DIVERGENCE from stellar-core (#3574): core has no `QUEUE_FULL`
+/// status — a full queue returns `ADD_STATUS_TRY_AGAIN_LATER`
+/// (TransactionQueue.cpp:461), and `LoadGenerator::submitTx` with
+/// `skipLowFeeTxs == false` (which soroban setup uses, LoadGenerator.cpp:366)
+/// sets `mFailed = true` (LoadGenerator.cpp:957-963). So core does NOT retry
+/// on queue-full; it fails the run. This back-off-and-retry is an
+/// operator-directed SIM-robustness divergence (the simulation loadgen is test
+/// tooling driven by Supercluster, NOT validator consensus), so the SSC
+/// henyey-majority soroban loadgen is unblocked. No hashed/serialized/consensus
+/// output is touched.
+const QUEUE_FULL_MAX_TRIES: u32 = 100;
+
+/// Decision for how `submit_tx` should react to a single
+/// [`TxQueueResult`]. Factored out of `submit_tx`'s inner loop as a pure
+/// function ([`classify_submit_result`]) so the branching can be unit-tested
+/// deterministically without constructing a live `App` (#3574).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SubmitAction {
+    /// The tx was added to the queue — submission succeeded.
+    Accept,
+    /// `txBAD_SEQ` below the retry cap — reload the account seqnum and retry.
+    RetryBadSeq,
+    /// Low-fee / try-again under `skip_low_fee_txs` — roll back the seqnum and
+    /// skip this tx (existing behavior).
+    SkipLowFee,
+    /// Transient tx-queue backpressure below the cap — roll back the seqnum,
+    /// back off one step, and retry the SAME tx (#3574).
+    RetryQueueFull,
+    /// Unrecoverable (or cap exhausted) — fail the run.
+    Fail,
+}
+
+/// Pure decision function for `submit_tx`: given a submission `result` and the
+/// current retry counters, decide what the caller should do.
+///
+/// `bad_seq_tries` / `queue_full_tries` are the attempt counts AFTER the caller
+/// has incremented for the current result, so the caps are compared with `>=`
+/// (mirroring the original `num_tries += 1; if num_tries >= TX_SUBMIT_MAX_TRIES`
+/// ordering).
+///
+/// `QueueFull` and `TryAgainLater`-without-`skip_low_fee_txs` both map to
+/// [`SubmitAction::RetryQueueFull`] until `queue_full_tries` reaches
+/// [`QUEUE_FULL_MAX_TRIES`], then [`SubmitAction::Fail`]. This is the
+/// deliberate SIM-robustness divergence from stellar-core documented on
+/// [`QUEUE_FULL_MAX_TRIES`] (#3574). The `skip_low_fee_txs` guard wins first
+/// when the flag is set, preserving the existing skip-and-drop behavior for
+/// classic low-fee paths.
+fn classify_submit_result(
+    result: TxQueueResult,
+    queue_full_tries: u32,
+    bad_seq_tries: u32,
+    skip_low_fee_txs: bool,
+    _mode: LoadGenMode,
+) -> SubmitAction {
+    match result {
+        TxQueueResult::Added => SubmitAction::Accept,
+        TxQueueResult::Invalid(Some(TxResultCode::TxBadSeq)) => {
+            if bad_seq_tries >= TX_SUBMIT_MAX_TRIES {
+                SubmitAction::Fail
+            } else {
+                SubmitAction::RetryBadSeq
+            }
+        }
+        // `skip_low_fee_txs` path: drop low-fee / try-again txs (classic load).
+        // Matches the existing guarded arm and wins over the retry path below.
+        TxQueueResult::TryAgainLater | TxQueueResult::FeeTooLow if skip_low_fee_txs => {
+            SubmitAction::SkipLowFee
+        }
+        // Transient tx-queue backpressure (#3574): retry the same tx with a
+        // back-off until the generous cap, then surface a genuinely wedged
+        // queue as a run failure. `TryAgainLater` only reaches here when
+        // `skip_low_fee_txs` is false (the guard above wins otherwise).
+        TxQueueResult::QueueFull | TxQueueResult::TryAgainLater => {
+            if queue_full_tries >= QUEUE_FULL_MAX_TRIES {
+                SubmitAction::Fail
+            } else {
+                SubmitAction::RetryQueueFull
+            }
+        }
+        _ => SubmitAction::Fail,
+    }
+}
+
 /// Sentinel account ID for the network root account.
 const ROOT_ACCOUNT_ID: u64 = u64::MAX;
 
@@ -1490,10 +1580,20 @@ impl LoadGenerator {
     }
 
     /// Submit a single transaction, retrying on `txBAD_SEQ` up to
-    /// `TX_SUBMIT_MAX_TRIES` times.
+    /// `TX_SUBMIT_MAX_TRIES` times and on transient tx-queue backpressure
+    /// (`QueueFull`, and `TryAgainLater` without `skip_low_fee_txs`) up to
+    /// `QUEUE_FULL_MAX_TRIES` times.
     ///
     /// Dispatches to the appropriate transaction builder based on the load
-    /// generation mode. Matches stellar-core `LoadGenerator::submitTx()`.
+    /// generation mode. Matches stellar-core `LoadGenerator::submitTx()`, with
+    /// the deliberate `RetryQueueFull` divergence documented on
+    /// [`QUEUE_FULL_MAX_TRIES`] (#3574).
+    ///
+    /// The per-result decision is factored into the pure
+    /// [`classify_submit_result`] helper so it can be unit-tested
+    /// deterministically (the side effects below — seqnum rollback, async
+    /// back-off, metric marking — run over a concrete `App` and are not
+    /// straightforward to drive from a test).
     async fn submit_tx(
         &mut self,
         config: &mut GeneratedLoadConfig,
@@ -1501,6 +1601,7 @@ impl LoadGenerator {
         ledger_num: u32,
     ) -> bool {
         let mut num_tries = 0u32;
+        let mut queue_full_tries = 0u32;
 
         loop {
             // Generate the transaction based on mode
@@ -1539,18 +1640,26 @@ impl LoadGenerator {
                 app_metrics::LOADGEN_TXN_REJECTED.increment(1);
             }
 
+            // `txBAD_SEQ` and `QueueFull`/`TryAgainLater` retries each consume
+            // one attempt; bump the relevant counter BEFORE classifying so the
+            // pure helper compares against the cap (mirrors the original
+            // `num_tries += 1` before the `>=` check).
             match result {
-                TxQueueResult::Added => return true,
-                TxQueueResult::Invalid(Some(TxResultCode::TxBadSeq)) => {
-                    num_tries += 1;
-                    if num_tries >= TX_SUBMIT_MAX_TRIES {
-                        warn!(
-                            "Failed to submit tx after {} retries (txBAD_SEQ)",
-                            num_tries
-                        );
-                        self.failed = true;
-                        return false;
-                    }
+                TxQueueResult::Invalid(Some(TxResultCode::TxBadSeq)) => num_tries += 1,
+                TxQueueResult::QueueFull => queue_full_tries += 1,
+                TxQueueResult::TryAgainLater if !config.skip_low_fee_txs => queue_full_tries += 1,
+                _ => {}
+            }
+
+            match classify_submit_result(
+                result,
+                queue_full_tries,
+                num_tries,
+                config.skip_low_fee_txs,
+                config.mode,
+            ) {
+                SubmitAction::Accept => return true,
+                SubmitAction::RetryBadSeq => {
                     // Refresh sequence number from DB
                     self.tx_generator.load_account(source_account_id);
                     debug!(
@@ -1559,17 +1668,45 @@ impl LoadGenerator {
                         "Retrying after txBAD_SEQ"
                     );
                 }
-                TxQueueResult::TryAgainLater | TxQueueResult::FeeTooLow
-                    if config.skip_low_fee_txs =>
-                {
+                SubmitAction::SkipLowFee => {
                     // Roll back sequence number and skip
                     if let Some(account) = self.tx_generator.accounts.get_mut(&source_account_id) {
                         account.sequence_number -= 1;
                     }
                     return false;
                 }
-                other => {
-                    warn!("Transaction submission failed: {:?}", other);
+                SubmitAction::RetryQueueFull => {
+                    // Transient tx-queue backpressure: roll back the consumed
+                    // seqnum and retry the SAME tx after a one-step back-off.
+                    //
+                    // The seqnum rollback is LOAD-BEARING: `generate_tx`
+                    // re-consumes a seqnum (`next_sequence_number()`) on each
+                    // loop iteration, so without rolling it back the retry would
+                    // advance the seqnum and the tx would never land. Mirrors
+                    // the `SkipLowFee` rollback above. Unlike `SkipLowFee`, the
+                    // tx is NOT dropped — soroban setup txs are prerequisites
+                    // for later phases. See [`QUEUE_FULL_MAX_TRIES`] for the
+                    // deliberate divergence from stellar-core (#3574).
+                    if let Some(account) = self.tx_generator.accounts.get_mut(&source_account_id) {
+                        account.sequence_number -= 1;
+                    }
+                    debug!(
+                        tries = queue_full_tries,
+                        account = source_account_id,
+                        result = ?result,
+                        "Retrying after transient tx-queue backpressure"
+                    );
+                    // Async, non-blocking back-off — one step interval. The
+                    // enclosing `generate_load` already awaits this same
+                    // primitive every step, so this neither blocks the runtime
+                    // nor starves the loadgen task.
+                    tokio::time::sleep(Duration::from_millis(STEP_MSECS)).await;
+                }
+                SubmitAction::Fail => {
+                    warn!(
+                        "Transaction submission failed: {:?} (bad_seq_tries={}, queue_full_tries={})",
+                        result, num_tries, queue_full_tries
+                    );
                     self.failed = true;
                     return false;
                 }
@@ -2326,5 +2463,132 @@ mod tests {
         assert!(signal.load(Ordering::Relaxed));
         signal.store(false, Ordering::Relaxed);
         assert!(!signal.load(Ordering::Relaxed));
+    }
+
+    // ---------------------------------------------------------------------
+    // #3574: transient tx-queue backpressure (`QueueFull`, and `TryAgainLater`
+    // without `skip_low_fee_txs`) must back off + retry the SAME tx rather than
+    // abort the run. These tests drive the pure `classify_submit_result` helper
+    // (the decision), since `submit_tx`'s effects run over a concrete `App`.
+    // ---------------------------------------------------------------------
+
+    /// #3574 key regression: `QueueFull` below the cap must map to
+    /// `RetryQueueFull` (back off + retry), NOT `Fail` — and a subsequent
+    /// `Added` maps to `Accept`, so the run does NOT fail. FAILS on
+    /// `origin/main` (helper absent; `QueueFull` routes to the `other`/`Fail`
+    /// arm that sets `self.failed = true`).
+    #[test]
+    fn test_classify_submit_result_queue_full_retries_then_succeeds() {
+        // QueueFull, well below the cap → retry, not fail.
+        assert_eq!(
+            classify_submit_result(
+                TxQueueResult::QueueFull,
+                /* queue_full_tries */ 0,
+                /* bad_seq_tries */ 0,
+                /* skip_low_fee_txs */ false,
+                LoadGenMode::SorobanInvokeSetup,
+            ),
+            SubmitAction::RetryQueueFull,
+        );
+        // After the queue drains, the same tx is Added → Accept.
+        assert_eq!(
+            classify_submit_result(
+                TxQueueResult::Added,
+                /* queue_full_tries */ 3,
+                /* bad_seq_tries */ 0,
+                /* skip_low_fee_txs */ false,
+                LoadGenMode::SorobanInvokeSetup,
+            ),
+            SubmitAction::Accept,
+        );
+    }
+
+    /// #3574: a genuinely wedged queue still surfaces — at the cap, `QueueFull`
+    /// maps to `Fail` (bounded, not infinite masking).
+    #[test]
+    fn test_classify_submit_result_queue_full_exhausts_cap_fails() {
+        // One below the cap → still retry.
+        assert_eq!(
+            classify_submit_result(
+                TxQueueResult::QueueFull,
+                QUEUE_FULL_MAX_TRIES - 1,
+                0,
+                false,
+                LoadGenMode::SorobanInvokeSetup,
+            ),
+            SubmitAction::RetryQueueFull,
+        );
+        // At the cap → fail the run.
+        assert_eq!(
+            classify_submit_result(
+                TxQueueResult::QueueFull,
+                QUEUE_FULL_MAX_TRIES,
+                0,
+                false,
+                LoadGenMode::SorobanInvokeSetup,
+            ),
+            SubmitAction::Fail,
+        );
+    }
+
+    /// #3574: `TryAgainLater` without `skip_low_fee_txs` retries (queue
+    /// backpressure on soroban setup, where dropping the tx breaks later
+    /// phases); WITH `skip_low_fee_txs` it preserves the existing skip path.
+    #[test]
+    fn test_classify_submit_result_try_again_later_without_skip_retries() {
+        // skip_low_fee_txs == false → treat as transient backpressure, retry.
+        assert_eq!(
+            classify_submit_result(
+                TxQueueResult::TryAgainLater,
+                0,
+                0,
+                false,
+                LoadGenMode::SorobanInvokeSetup,
+            ),
+            SubmitAction::RetryQueueFull,
+        );
+        // skip_low_fee_txs == true → existing skip behavior preserved.
+        assert_eq!(
+            classify_submit_result(TxQueueResult::TryAgainLater, 0, 0, true, LoadGenMode::Pay,),
+            SubmitAction::SkipLowFee,
+        );
+        // FeeTooLow with skip → skip (unchanged).
+        assert_eq!(
+            classify_submit_result(TxQueueResult::FeeTooLow, 0, 0, true, LoadGenMode::Pay),
+            SubmitAction::SkipLowFee,
+        );
+    }
+
+    /// #3574 guards: pre-existing `TxBadSeq` retry and `Added` accept behavior
+    /// is unchanged by the new arms.
+    #[test]
+    fn test_classify_submit_result_bad_seq_and_added_unchanged() {
+        // txBAD_SEQ below the retry cap → RetryBadSeq.
+        assert_eq!(
+            classify_submit_result(
+                TxQueueResult::Invalid(Some(TxResultCode::TxBadSeq)),
+                0,
+                0,
+                false,
+                LoadGenMode::Pay,
+            ),
+            SubmitAction::RetryBadSeq,
+        );
+        // txBAD_SEQ at the retry cap → Fail.
+        assert_eq!(
+            classify_submit_result(
+                TxQueueResult::Invalid(Some(TxResultCode::TxBadSeq)),
+                0,
+                TX_SUBMIT_MAX_TRIES,
+                false,
+                LoadGenMode::Pay,
+            ),
+            SubmitAction::Fail,
+        );
+        // Added → Accept regardless of counters.
+        assert_eq!(
+            classify_submit_result(TxQueueResult::Added, 5, 5, false, LoadGenMode::Pay),
+            SubmitAction::Accept,
+        );
     }
 }
