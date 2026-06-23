@@ -152,6 +152,14 @@ pub struct GenerateLoadResponse {
     /// Additional info (e.g., error details).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub info: Option<String>,
+    /// Base64-encoded XDR-opaque `ConfigUpgradeSetKey`, emitted ONLY for a
+    /// successful `create_upgrade` run so supercluster can arm
+    /// `/upgrades?configupgradesetkey=…`. Mirrors stellar-core
+    /// `CommandHandler::generateLoad` (CommandHandler.cpp:1488-1496), which sets
+    /// `res["config_upgrade_set_key"] = decoder::encode_b64(xdr_to_opaque(key))`
+    /// only for `SOROBAN_CREATE_UPGRADE`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub config_upgrade_set_key: Option<String>,
 }
 
 #[cfg(test)]
@@ -222,6 +230,7 @@ mod tests {
         let resp = GenerateLoadResponse {
             status: "ok".to_string(),
             info: Some("Started load".to_string()),
+            config_upgrade_set_key: None,
         };
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["status"], "ok");

@@ -1881,13 +1881,28 @@ pub(crate) async fn compat_generateload_handler(
         "Started {} load generation: accounts={}, txs={}, txrate={}",
         params.mode, params.accounts, params.txs, params.txrate,
     );
+    // Capture the mode before `params` is consumed by `into()`.
+    let mode = params.mode.clone();
     let request: LoadGenRequest = params.into();
 
     match loadgen_state.runner.start_load(request) {
-        Ok(()) => Json(serde_json::json!({
-            "status": "ok",
-            "info": summary,
-        })),
+        Ok(()) => {
+            let mut obj = serde_json::json!({
+                "status": "ok",
+                "info": summary,
+            });
+            // Parity: only create_upgrade carries the armed key, so supercluster
+            // can arm /upgrades?configupgradesetkey=… (CommandHandler.cpp:1488-1496).
+            if let Some(key) =
+                crate::http::handlers::generateload::config_upgrade_set_key_for_response(
+                    &mode,
+                    loadgen_state.runner.as_ref(),
+                )
+            {
+                obj["config_upgrade_set_key"] = serde_json::Value::String(key);
+            }
+            Json(obj)
+        }
         Err(e) => Json(serde_json::json!({
             "exception": e
         })),

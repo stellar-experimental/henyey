@@ -143,6 +143,47 @@ pub trait LoadGenRunner: Send + Sync + 'static {
 
     /// Whether a load generation run is currently in progress.
     fn is_running(&self) -> bool;
+
+    /// Base64-encoded XDR-opaque `ConfigUpgradeSetKey` for the current/last
+    /// `create_upgrade` config, or `None` if it cannot be computed (e.g. no
+    /// deployed contract instance, or the backend does not support it).
+    ///
+    /// Mirrors stellar-core `LoadGenerator::getConfigUpgradeSetKey` →
+    /// `decoder::encode_b64(xdr_to_opaque(key))`. The default returns `None` so
+    /// non-simulation backends are unaffected.
+    fn config_upgrade_set_key(&self) -> Option<String> {
+        None
+    }
+}
+
+/// Build the `config_upgrade_set_key` response field for a `/generateload`
+/// run. Emits the runner's key ONLY for `create_upgrade` mode (all accepted
+/// spellings); every other mode omits it.
+///
+/// Parity: stellar-core `CommandHandler::generateLoad` (CommandHandler.cpp:1488-1496)
+/// adds `res["config_upgrade_set_key"]` only when
+/// `cfg.mode == LoadGenMode::SOROBAN_CREATE_UPGRADE`. Shared by the native and
+/// compat `/generateload` handlers so the wire shape cannot diverge.
+pub fn config_upgrade_set_key_for_response<R: LoadGenRunner + ?Sized>(
+    mode: &str,
+    runner: &R,
+) -> Option<String> {
+    if is_create_upgrade_mode(mode) {
+        runner.config_upgrade_set_key()
+    } else {
+        None
+    }
+}
+
+/// Whether `mode` selects the `SOROBAN_CREATE_UPGRADE` load-gen mode. Accepts
+/// the same spellings as the simulation backend's `parse_mode`
+/// (`create_upgrade`, `soroban_create_upgrade`, and the no-separator forms),
+/// case-insensitively.
+fn is_create_upgrade_mode(mode: &str) -> bool {
+    matches!(
+        mode.to_ascii_lowercase().as_str(),
+        "create_upgrade" | "createupgrade" | "soroban_create_upgrade" | "sorobancreateupgrade"
+    )
 }
 
 /// Shared state for load generation across requests.
@@ -172,6 +213,7 @@ pub(crate) async fn generateload_handler(
                 "Set ARTIFICIALLY_GENERATE_LOAD_FOR_TESTING=true in config to enable this endpoint."
                     .to_string(),
             ),
+            config_upgrade_set_key: None,
         });
     }
 
@@ -183,6 +225,7 @@ pub(crate) async fn generateload_handler(
                 info: Some(
                     "Load generation not available (loadgen feature not compiled in).".to_string(),
                 ),
+                config_upgrade_set_key: None,
             });
         }
     };
@@ -194,6 +237,7 @@ pub(crate) async fn generateload_handler(
         return Json(GenerateLoadResponse {
             status: "ok".to_string(),
             info: Some("Stopped load generation".to_string()),
+            config_upgrade_set_key: None,
         });
     }
 
@@ -202,6 +246,7 @@ pub(crate) async fn generateload_handler(
         return Json(GenerateLoadResponse {
             status: "error".to_string(),
             info: Some("Load generation is already running.".to_string()),
+            config_upgrade_set_key: None,
         });
     }
 
@@ -209,16 +254,25 @@ pub(crate) async fn generateload_handler(
         "Started {} load generation: accounts={}, txs={}, txrate={}",
         params.mode, params.accounts, params.txs, params.txrate,
     );
+    // Capture the mode before `params` is consumed by `into()`.
+    let mode = params.mode.clone();
     let request: LoadGenRequest = params.into();
 
     match loadgen_state.runner.start_load(request) {
         Ok(()) => Json(GenerateLoadResponse {
             status: "ok".to_string(),
             info: Some(summary),
+            // Parity: only create_upgrade carries the armed key
+            // (CommandHandler.cpp:1488-1496).
+            config_upgrade_set_key: config_upgrade_set_key_for_response(
+                &mode,
+                loadgen_state.runner.as_ref(),
+            ),
         }),
         Err(e) => Json(GenerateLoadResponse {
             status: "error".to_string(),
             info: Some(e),
+            config_upgrade_set_key: None,
         }),
     }
 }
