@@ -10058,6 +10058,49 @@ BOARDEOF
     tap_skip "select_latest_green: runs under zsh without read-only-status abort (#3581)" "zsh not found"
   fi
 
+  # ── #3592: select_latest_green ancestry-oracle fallback defined under zsh ───
+  # The selector defines fallback `is_ancestor` / `commits_ahead` git oracles
+  # guarded by an existence check. That guard used the bash-only `declare -F`,
+  # which under zsh aliases `typeset -F NAME` — declaring a FLOAT VARIABLE named
+  # NAME and returning 0. So `! declare -F is_ancestor` was false, the fallback
+  # function was NEVER defined, and the read-loop's first `is_ancestor` call hit
+  # `command not found: is_ancestor` → the candidate was dropped → every
+  # green-on-main run mis-resolved to `green-not-on-main` (a missed deploy).
+  #
+  # The #3581 case above CANNOT catch this: it pre-defines its own oracle
+  # stubs after sourcing, so the script's fallback is never exercised. This
+  # case deliberately does NOT pre-define the oracle — it relies on the
+  # script's OWN fallback (the buggy guard path), backed by a hermetic single-
+  # commit git repo so the default `git merge-base --is-ancestor` resolves. The
+  # green record's sha equals the deployed sha and is its own ancestor, so a
+  # correct gate returns `green-equals-deployed`; the buggy guard returns
+  # `green-not-on-main`. Gated on zsh + git availability.
+  if command -v zsh >/dev/null 2>&1 && command -v git >/dev/null 2>&1; then
+    local zsh_repo zsh_sha zsh_reason
+    zsh_repo="$(mktemp -d)"
+    git -C "$zsh_repo" init -q 2>/dev/null
+    git -C "$zsh_repo" -c user.name=t -c user.email=t@t commit -q --allow-empty -m init 2>/dev/null
+    zsh_sha="$(git -C "$zsh_repo" rev-parse HEAD 2>/dev/null)"
+    # Capture the reason token (stderr) from the gate, sourcing the REAL script
+    # and relying on its fallback ancestry oracle (no pre-defined stubs).
+    zsh_reason=$(zsh -c '
+      emulate -L zsh
+      cd "$2" || exit 3
+      source "$1/scripts/lib/monitor-decisions.sh"
+      printf "%s\n" "$3|completed|success" \
+        | select_latest_green_deploy_target "$3" "$3" 2>&1 >/dev/null
+    ' -- "$REPO_ROOT" "$zsh_repo" "$zsh_sha")
+    if [[ "$zsh_reason" == *"green-equals-deployed"* \
+          && "$zsh_reason" != *"command not found"* ]]; then
+      tap_ok "select_latest_green: fallback is_ancestor defined under zsh — green-on-main resolves (#3592)"
+    else
+      tap_not_ok "select_latest_green: fallback is_ancestor defined under zsh — green-on-main resolves (#3592)" "got '$zsh_reason' (expected 'green-equals-deployed')"
+    fi
+    rm -rf "$zsh_repo"
+  else
+    tap_skip "select_latest_green: fallback is_ancestor defined under zsh — green-on-main resolves (#3592)" "zsh or git not found"
+  fi
+
   # Restore real git oracles so no later test sees the stubs.
   unset -f is_ancestor commits_ahead _order_of
 
