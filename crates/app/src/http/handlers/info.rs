@@ -64,6 +64,13 @@ pub(crate) async fn info_handler(State(state): State<Arc<ServerState>>) -> Json<
     let ledger = state.app.ledger_summary();
     let (pending_count, authenticated_count) = state.app.peer_counts().await;
     let quorum = state.app.quorum_info_for_info();
+    // Present only when a Soroban network config exists (protocol ≥ 20),
+    // mirroring stellar-core's `hasLastClosedSorobanNetworkConfig()` gate. The
+    // value is the ledger's max OPERATIONS resource == `ledger_max_tx_count`.
+    let max_soroban_tx_set_size = state
+        .app
+        .soroban_network_info()
+        .map(|i| i.ledger_max_tx_count);
 
     Json(InfoResponse {
         build: henyey_common::version::build_version_string(&info.version),
@@ -84,6 +91,7 @@ pub(crate) async fn info_handler(State(state): State<Arc<ServerState>>) -> Json<
             base_fee: ledger.base_fee,
             base_reserve: ledger.base_reserve,
             max_tx_set_size: ledger.max_tx_set_size,
+            max_soroban_tx_set_size,
             flags: ledger.flags,
             age: ledger.age,
         },
@@ -365,6 +373,68 @@ mod tests {
         assert_eq!(response.status(), http::StatusCode::OK);
         let json = body_json(response).await;
         assert_eq!(json["commit_hash"], commit);
+    }
+
+    #[tokio::test]
+    async fn test_info_handler_soroban_tx_set_size_present() {
+        let (_dir, state) = test_server_state("abc123def456").await;
+        state
+            .app
+            .ledger_manager()
+            .set_soroban_network_info_for_test(henyey_ledger::SorobanNetworkInfo {
+                ledger_max_tx_count: 500,
+                ..Default::default()
+            });
+        let app = build_router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/info")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), http::StatusCode::OK);
+        let json = body_json(response).await;
+        assert_eq!(
+            json["ledger"]["maxSorobanTxSetSize"],
+            500,
+            "maxSorobanTxSetSize must equal ledger_max_tx_count when a soroban \
+             config exists, got: {:?}",
+            json["ledger"].get("maxSorobanTxSetSize")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_info_handler_soroban_tx_set_size_absent() {
+        // Fresh App, no soroban network config set: soroban_network_info() is
+        // None, so the key must be absent (mirrors stellar-core's conditional
+        // emission gated on hasLastClosedSorobanNetworkConfig()).
+        let (_dir, state) = test_server_state("abc123def456").await;
+        let app = build_router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/info")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), http::StatusCode::OK);
+        let json = body_json(response).await;
+        assert!(
+            json["ledger"].get("maxSorobanTxSetSize").is_none(),
+            "maxSorobanTxSetSize must be absent with no soroban config, got: {:?}",
+            json["ledger"].get("maxSorobanTxSetSize")
+        );
     }
 
     #[tokio::test]
