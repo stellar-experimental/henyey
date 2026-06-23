@@ -3474,6 +3474,20 @@ impl Herder {
             LedgerUpgrade::MaxSorobanTxSetSize(_) => 6,
         });
 
+        // #3588: Config upgrades were previously silent. Log (additive, no
+        // behavior change) when a LedgerUpgrade::Config is retained for
+        // nomination, so the soroban-config-upgrade path is observable.
+        if let Some(LedgerUpgrade::Config(key)) = upgrade_list
+            .iter()
+            .find(|u| matches!(u, LedgerUpgrade::Config(_)))
+        {
+            tracing::info!(
+                slot = parts.header.ledger_seq + 1,
+                content_hash = %hex::encode(key.content_hash.0),
+                "Nominating LedgerUpgrade::Config"
+            );
+        }
+
         // Parity: stellar-core logs and skips individual upgrades whose encoded
         // size exceeds UpgradeType::max_size() (HerderImpl.cpp:1572-1587).
         // The XDR encode itself should never fail for a valid LedgerUpgrade.

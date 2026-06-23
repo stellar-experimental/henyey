@@ -1786,6 +1786,52 @@ mod tests {
         );
         state.app.shutdown();
     }
+
+    /// #3588: the compat `/generateload` create_upgrade response carries a
+    /// top-level `config_upgrade_set_key` field (parity: stellar-core
+    /// `CommandHandler::generateLoad`, CommandHandler.cpp:1488-1496), so
+    /// supercluster can arm `/upgrades?configupgradesetkey=…`. Non-create_upgrade
+    /// modes omit it.
+    ///
+    /// FAILS on main: the shared helper / trait method does not exist and the
+    /// compat handler never emits the field.
+    #[cfg(feature = "loadgen")]
+    #[test]
+    fn test_compat_create_upgrade_response_includes_config_upgrade_set_key() {
+        use crate::http::handlers::generateload::{
+            config_upgrade_set_key_for_response, LoadGenRequest, LoadGenRunner,
+        };
+
+        struct StubRunner;
+        impl LoadGenRunner for StubRunner {
+            fn start_load(&self, _request: LoadGenRequest) -> Result<(), String> {
+                Ok(())
+            }
+            fn stop_load(&self) {}
+            fn is_running(&self) -> bool {
+                false
+            }
+            fn config_upgrade_set_key(&self) -> Option<String> {
+                Some("COMPAT_KEY_B64".to_string())
+            }
+        }
+
+        let runner = StubRunner;
+
+        // create_upgrade → the compat JSON includes the field at the top level.
+        let mut obj = serde_json::json!({ "status": "ok", "info": "started" });
+        if let Some(k) = config_upgrade_set_key_for_response("create_upgrade", &runner) {
+            obj["config_upgrade_set_key"] = serde_json::Value::String(k);
+        }
+        assert_eq!(obj["config_upgrade_set_key"], "COMPAT_KEY_B64");
+
+        // pay → no field.
+        let mut obj2 = serde_json::json!({ "status": "ok", "info": "started" });
+        if let Some(k) = config_upgrade_set_key_for_response("pay", &runner) {
+            obj2["config_upgrade_set_key"] = serde_json::Value::String(k);
+        }
+        assert!(obj2.get("config_upgrade_set_key").is_none());
+    }
 }
 
 // ── Load generation (feature-gated) ─────────────────────────────────────
@@ -1835,13 +1881,28 @@ pub(crate) async fn compat_generateload_handler(
         "Started {} load generation: accounts={}, txs={}, txrate={}",
         params.mode, params.accounts, params.txs, params.txrate,
     );
+    // Capture the mode before `params` is consumed by `into()`.
+    let mode = params.mode.clone();
     let request: LoadGenRequest = params.into();
 
     match loadgen_state.runner.start_load(request) {
-        Ok(()) => Json(serde_json::json!({
-            "status": "ok",
-            "info": summary,
-        })),
+        Ok(()) => {
+            let mut obj = serde_json::json!({
+                "status": "ok",
+                "info": summary,
+            });
+            // Parity: only create_upgrade carries the armed key, so supercluster
+            // can arm /upgrades?configupgradesetkey=… (CommandHandler.cpp:1488-1496).
+            if let Some(key) =
+                crate::http::handlers::generateload::config_upgrade_set_key_for_response(
+                    &mode,
+                    loadgen_state.runner.as_ref(),
+                )
+            {
+                obj["config_upgrade_set_key"] = serde_json::Value::String(key);
+            }
+            Json(obj)
+        }
         Err(e) => Json(serde_json::json!({
             "exception": e
         })),

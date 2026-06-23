@@ -234,6 +234,12 @@ mod loadgen_runner {
         /// Per-run lifecycle control: exclusivity, stop signaling, and
         /// running state in a single synchronized state machine.
         run_control: RunControl,
+        /// Base64 XDR-opaque `ConfigUpgradeSetKey` computed at the start of the
+        /// most recent `create_upgrade` run, for the `/generateload` response
+        /// (#3588). Computed from the generator's `contract_instance_keys`
+        /// snapshot BEFORE the run is spawned, so it is race-free with respect
+        /// to the spawned create_upgrade task that locks the generator.
+        last_config_upgrade_set_key: std::sync::Mutex<Option<String>>,
         /// Test-only: trigger a panic inside the spawned task.
         #[cfg(test)]
         panic_inject: AtomicBool,
@@ -245,6 +251,7 @@ mod loadgen_runner {
                 generator_tainted: AtomicBool::new(false),
                 completed_cleanly: AtomicBool::new(false),
                 run_control: RunControl::new(),
+                last_config_upgrade_set_key: std::sync::Mutex::new(None),
                 #[cfg(test)]
                 panic_inject: AtomicBool::new(false),
             }
@@ -348,6 +355,40 @@ mod loadgen_runner {
         /// it, so there are currently no deferred-unsupported modes.
         fn unsupported_mode(_mode: &str) -> Option<&'static str> {
             None
+        }
+
+        /// Compute the base64 XDR-opaque `ConfigUpgradeSetKey` for a
+        /// `create_upgrade` run from the generator's current
+        /// `contract_instance_keys`. Returns `None` if the generator does not
+        /// yet exist, the lock cannot be taken, or the key cannot be derived
+        /// (e.g. no `upgrade_setup` has run, so != 1 instance).
+        ///
+        /// Encoding mirrors stellar-core
+        /// `decoder::encode_b64(xdr::xdr_to_opaque(key))`: STANDARD base64 of
+        /// the raw XDR opaque (NOT URL-safe). Matches the `/upgrades` parse side
+        /// (`compat_http/handlers/plaintext.rs`), which decodes with
+        /// `STANDARD` + `ConfigUpgradeSetKey::from_xdr`.
+        fn compute_config_upgrade_set_key(
+            inner: &Arc<Inner>,
+            upgrade_config: &henyey_ledger::config_upgrade::SorobanUpgradeConfig,
+        ) -> Option<String> {
+            use base64::{engine::general_purpose::STANDARD, Engine};
+            use stellar_xdr::{Limits, WriteXdr};
+
+            // try_lock: no run is active when this is called (exclusivity permit
+            // held), so the generator mutex is free. If it is somehow contended,
+            // fail closed to None rather than block the async handler.
+            let guard = inner.generator.try_lock().ok()?;
+            let generator = guard.as_ref()?;
+            let key = match generator.get_config_upgrade_set_key(upgrade_config) {
+                Ok(k) => k,
+                Err(e) => {
+                    tracing::warn!(error = %e, "create_upgrade: cannot compute ConfigUpgradeSetKey");
+                    return None;
+                }
+            };
+            let bytes = key.to_xdr(Limits::none()).ok()?;
+            Some(STANDARD.encode(bytes))
         }
 
         /// Parse a mode string into a `LoadGenMode`.
@@ -828,6 +869,32 @@ mod loadgen_runner {
                 ..Default::default()
             };
 
+            // For create_upgrade, compute the ConfigUpgradeSetKey to report in
+            // the /generateload response NOW — before spawning the run — from
+            // the generator's current contract_instance_keys snapshot. This is
+            // the SAME single instance the spawned create_upgrade tx writes
+            // under (reset_soroban_state does not run for create_upgrade), so
+            // the reported key resolves to the exact written ContractData key.
+            // Computing it before spawn is race-free: no run is active (the
+            // exclusivity permit is held), so the generator mutex is free.
+            // Parity: stellar-core CommandHandler.cpp:1488-1496 computes the key
+            // right after generateLoad(cfg) returns.
+            {
+                let mut slot = self
+                    .state
+                    .last_config_upgrade_set_key
+                    .lock()
+                    .expect("last_config_upgrade_set_key mutex");
+                *slot = if mode == LoadGenMode::SorobanCreateUpgrade {
+                    Self::compute_config_upgrade_set_key(
+                        &self.inner,
+                        &config.soroban_upgrade_config,
+                    )
+                } else {
+                    None
+                };
+            }
+
             let inner = Arc::clone(&self.inner);
             let state = Arc::clone(&self.state);
 
@@ -899,6 +966,17 @@ mod loadgen_runner {
 
         fn is_running(&self) -> bool {
             self.state.run_control.is_running()
+        }
+
+        fn config_upgrade_set_key(&self) -> Option<String> {
+            // Returns the key computed at the start of the most recent
+            // create_upgrade run (#3588). The handler only consults this for
+            // create_upgrade mode (config_upgrade_set_key_for_response gates it).
+            self.state
+                .last_config_upgrade_set_key
+                .lock()
+                .expect("last_config_upgrade_set_key mutex")
+                .clone()
         }
     }
 }

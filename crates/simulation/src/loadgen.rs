@@ -21,7 +21,7 @@ use henyey_crypto::SecretKey;
 use henyey_herder::TxQueueResult;
 use henyey_tx::TxResultCode;
 use stellar_xdr::{
-    AccountId, Asset, ContractDataDurability, ContractId, ContractIdPreimage,
+    AccountId, Asset, ConfigUpgradeSetKey, ContractDataDurability, ContractId, ContractIdPreimage,
     ContractIdPreimageFromAddress, CreateAccountOp, Hash, LedgerKey, LedgerKeyContractData, Limits,
     Memo, MuxedAccount, Operation, OperationBody, PaymentOp, Preconditions, PublicKey, ScAddress,
     ScVal, SequenceNumber, Transaction, TransactionEnvelope, TransactionExt, TransactionV1Envelope,
@@ -2064,6 +2064,75 @@ impl LoadGenerator {
         &mut self.tx_generator
     }
 
+    /// Compute the `ConfigUpgradeSetKey` that a `create_upgrade` run reports so
+    /// supercluster can arm `/upgrades?configupgradesetkey=…`.
+    ///
+    /// Faithful port of stellar-core `LoadGenerator::getConfigUpgradeSetKey`
+    /// (`LoadGenerator.cpp:476-484`) + `TxGenerator::getConfigUpgradeSetKey`
+    /// (`TxGenerator.cpp:1163-1174`):
+    /// - `releaseAssert(testingKeys.size() == 1)`: requires exactly one deployed
+    ///   contract instance (from a prior `upgrade_setup` run) — else `Err`;
+    /// - `contractID = testingKeys.begin()->contractData().contract.contractId()`;
+    /// - `contentHash = sha256(getConfigUpgradeSetFromLoadConfig(cfg))`.
+    ///
+    /// The `content_hash` is derived from the SAME bytes the create_upgrade tx
+    /// writes (`build_config_upgrade_set` over the live config settings + the
+    /// request's `SorobanUpgradeConfig`), so the reported key resolves — via
+    /// `ConfigUpgradeSetFrame::get_ledger_key` — to the exact `ContractData`
+    /// key the tx persists. `reset_soroban_state` does NOT run for
+    /// `SorobanCreateUpgrade` (`loadgen.rs`), so the instance key persists from
+    /// the prior `upgrade_setup`.
+    pub fn get_config_upgrade_set_key(
+        &self,
+        upgrade_config: &henyey_ledger::config_upgrade::SorobanUpgradeConfig,
+    ) -> anyhow::Result<ConfigUpgradeSetKey> {
+        let app = Arc::clone(&self.tx_generator.app);
+        Self::config_upgrade_set_key_from(&self.contract_instance_keys, upgrade_config, |id| {
+            app.load_config_setting(id).ok().flatten()
+        })
+    }
+
+    /// Pure inner derivation of the `ConfigUpgradeSetKey` from the deployed
+    /// instance key set + the live config-setting loader. Split out so the
+    /// key-match against the written `ContractData` key is unit-testable without
+    /// a running `App`. See [`get_config_upgrade_set_key`] for parity notes.
+    pub(crate) fn config_upgrade_set_key_from(
+        instance_keys: &HashSet<LedgerKey>,
+        upgrade_config: &henyey_ledger::config_upgrade::SorobanUpgradeConfig,
+        load_entry: impl Fn(stellar_xdr::ConfigSettingId) -> Option<stellar_xdr::ConfigSettingEntry>,
+    ) -> anyhow::Result<ConfigUpgradeSetKey> {
+        // releaseAssert(testingKeys.size() == 1).
+        if instance_keys.len() != 1 {
+            anyhow::bail!(
+                "get_config_upgrade_set_key requires exactly 1 deployed contract instance \
+                 (run upgrade_setup first); got {}",
+                instance_keys.len()
+            );
+        }
+        let instance_key = instance_keys.iter().next().expect("one instance key");
+        let contract_id = match instance_key {
+            LedgerKey::ContractData(cd) => match &cd.contract {
+                ScAddress::Contract(id) => id.clone(),
+                other => {
+                    anyhow::bail!("instance key contract address is not a contract: {other:?}")
+                }
+            },
+            other => anyhow::bail!("instance key is not a CONTRACT_DATA key: {other:?}"),
+        };
+
+        // contentHash = sha256(getConfigUpgradeSetFromLoadConfig(cfg)) — the same
+        // bytes invoke_soroban_create_upgrade_tx writes.
+        let upgrade_bytes =
+            henyey_ledger::config_upgrade::build_config_upgrade_set(upgrade_config, load_entry)
+                .map_err(|e| anyhow::anyhow!("failed to build config upgrade set: {e}"))?;
+        let content_hash = Hash256::hash(&upgrade_bytes);
+
+        Ok(ConfigUpgradeSetKey {
+            contract_id,
+            content_hash: Hash(content_hash.0),
+        })
+    }
+
     // --- Legacy stateless API (backward compat) ---
 
     /// Pre-compute a load plan as a series of steps.
@@ -2288,6 +2357,132 @@ mod tests {
         let report = LoadGenerator::summarize(&steps);
         assert_eq!(report.total_steps, 4);
         assert_eq!(report.total_transactions, 12);
+    }
+
+    /// Fixture `load_entry` mirroring the one used in
+    /// `henyey_ledger::config_upgrade` tests: returns a live `ConfigSettingEntry`
+    /// for every stored id, `None` for conditionally-absent ids. Used to drive
+    /// `build_config_upgrade_set` and `config_upgrade_set_key_from` with the
+    /// same config-setting state, so the derived key is deterministic.
+    fn fixture_load_entry(
+        id: stellar_xdr::ConfigSettingId,
+    ) -> Option<stellar_xdr::ConfigSettingEntry> {
+        use stellar_xdr::ConfigSettingEntry as E;
+        use stellar_xdr::ConfigSettingId as Id;
+        match id {
+            Id::ContractMaxSizeBytes => Some(E::ContractMaxSizeBytes(65_536)),
+            Id::ContractComputeV0 => Some(E::ContractComputeV0(Default::default())),
+            Id::ContractLedgerCostV0 => Some(E::ContractLedgerCostV0(Default::default())),
+            Id::ContractHistoricalDataV0 => Some(E::ContractHistoricalDataV0(Default::default())),
+            Id::ContractEventsV0 => Some(E::ContractEventsV0(Default::default())),
+            Id::ContractBandwidthV0 => Some(E::ContractBandwidthV0(Default::default())),
+            Id::ContractCostParamsCpuInstructions => {
+                Some(E::ContractCostParamsCpuInstructions(Default::default()))
+            }
+            Id::ContractCostParamsMemoryBytes => {
+                Some(E::ContractCostParamsMemoryBytes(Default::default()))
+            }
+            Id::ContractDataKeySizeBytes => Some(E::ContractDataKeySizeBytes(250)),
+            Id::ContractDataEntrySizeBytes => Some(E::ContractDataEntrySizeBytes(65_536)),
+            Id::StateArchival => Some(E::StateArchival(Default::default())),
+            Id::ContractExecutionLanes => Some(E::ContractExecutionLanes(Default::default())),
+            // Conditionally-absent settings: simulate "not yet upgraded".
+            Id::ContractParallelComputeV0 | Id::ContractLedgerCostExtV0 | Id::ScpTiming => None,
+            // Non-upgradeable / delta ids are never queried by build_config_upgrade_set.
+            _ => None,
+        }
+    }
+
+    /// Build the single-instance `contract_instance_keys` set the same way the
+    /// `upgrade_setup` deploy phase populates it: a TEMPORARY `ContractData`
+    /// entry under the deployed contract address.
+    fn single_instance_key(contract_id: [u8; 32]) -> std::collections::HashSet<LedgerKey> {
+        let mut set = std::collections::HashSet::new();
+        set.insert(LedgerKey::ContractData(
+            stellar_xdr::LedgerKeyContractData {
+                contract: stellar_xdr::ScAddress::Contract(stellar_xdr::ContractId(
+                    stellar_xdr::Hash(contract_id),
+                )),
+                key: stellar_xdr::ScVal::LedgerKeyContractInstance,
+                durability: stellar_xdr::ContractDataDurability::Persistent,
+            },
+        ));
+        set
+    }
+
+    /// Regression test for #3588: the `ConfigUpgradeSetKey` reported by
+    /// `config_upgrade_set_key_from` (henyey's port of
+    /// `LoadGenerator::getConfigUpgradeSetKey` / `TxGenerator::getConfigUpgradeSetKey`)
+    /// must derive the SAME on-ledger `ContractData` key that the create_upgrade
+    /// tx actually writes. Both derive `content_hash = sha256(build_config_upgrade_set(..))`
+    /// and `contract_id` from the single deployed instance, so the reported key
+    /// and the written key must be byte-identical via `get_ledger_key`.
+    ///
+    /// FAILS on main: `config_upgrade_set_key_from` does not exist.
+    #[test]
+    fn test_get_config_upgrade_set_key_matches_written_entry() {
+        let contract_id = [7u8; 32];
+        let instance_keys = single_instance_key(contract_id);
+        let cfg = henyey_ledger::config_upgrade::SorobanUpgradeConfig::default();
+
+        // The key the loadgen REPORTS (to arm /upgrades).
+        let reported_key =
+            LoadGenerator::config_upgrade_set_key_from(&instance_keys, &cfg, fixture_load_entry)
+                .expect("key derivation succeeds for exactly one instance");
+
+        // The key the create_upgrade tx WRITES: ContractData{contract,
+        // SCV_BYTES(sha256(upgrade_bytes)), Temporary}, mirroring
+        // invoke_soroban_create_upgrade_tx (loadgen_soroban.rs:433-447).
+        let upgrade_bytes =
+            henyey_ledger::config_upgrade::build_config_upgrade_set(&cfg, fixture_load_entry)
+                .expect("build_config_upgrade_set");
+        let content_hash = Hash256::hash(&upgrade_bytes);
+        let written_key = LedgerKey::ContractData(stellar_xdr::LedgerKeyContractData {
+            contract: stellar_xdr::ScAddress::Contract(stellar_xdr::ContractId(stellar_xdr::Hash(
+                contract_id,
+            ))),
+            key: stellar_xdr::ScVal::Bytes(content_hash.0.to_vec().try_into().unwrap()),
+            durability: stellar_xdr::ContractDataDurability::Temporary,
+        });
+
+        // The reported key, resolved to its on-ledger ContractData key, must
+        // equal the key the tx writes.
+        let resolved = henyey_ledger::ConfigUpgradeSetFrame::get_ledger_key(&reported_key);
+        assert_eq!(
+            resolved, written_key,
+            "reported ConfigUpgradeSetKey must resolve to the ContractData key the create_upgrade tx writes"
+        );
+        // And the content hash must match sha256 of the upgrade bytes.
+        assert_eq!(reported_key.content_hash.0, content_hash.0);
+    }
+
+    /// The instance-count assert mirrors stellar-core's
+    /// `releaseAssert(testingKeys.size() == 1)`: 0 or >1 instances → Err.
+    /// FAILS on main: `config_upgrade_set_key_from` does not exist.
+    #[test]
+    fn test_get_config_upgrade_set_key_requires_exactly_one_instance() {
+        let cfg = henyey_ledger::config_upgrade::SorobanUpgradeConfig::default();
+
+        // Zero instances → Err.
+        let empty = std::collections::HashSet::new();
+        assert!(
+            LoadGenerator::config_upgrade_set_key_from(&empty, &cfg, fixture_load_entry).is_err()
+        );
+
+        // Two instances → Err.
+        let mut two = single_instance_key([1u8; 32]);
+        two.insert(LedgerKey::ContractData(
+            stellar_xdr::LedgerKeyContractData {
+                contract: stellar_xdr::ScAddress::Contract(stellar_xdr::ContractId(
+                    stellar_xdr::Hash([2u8; 32]),
+                )),
+                key: stellar_xdr::ScVal::LedgerKeyContractInstance,
+                durability: stellar_xdr::ContractDataDurability::Persistent,
+            },
+        ));
+        assert!(
+            LoadGenerator::config_upgrade_set_key_from(&two, &cfg, fixture_load_entry).is_err()
+        );
     }
 
     #[test]
