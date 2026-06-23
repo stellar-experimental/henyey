@@ -2327,4 +2327,131 @@ mod tests {
         signal.store(false, Ordering::Relaxed);
         assert!(!signal.load(Ordering::Relaxed));
     }
+
+    // ---------------------------------------------------------------------
+    // #3574: transient tx-queue backpressure (`QueueFull`, and `TryAgainLater`
+    // without `skip_low_fee_txs`) must back off + retry the SAME tx rather than
+    // abort the run. These tests drive the pure `classify_submit_result` helper
+    // (the decision), since `submit_tx`'s effects run over a concrete `App`.
+    // ---------------------------------------------------------------------
+
+    /// #3574 key regression: `QueueFull` below the cap must map to
+    /// `RetryQueueFull` (back off + retry), NOT `Fail` — and a subsequent
+    /// `Added` maps to `Accept`, so the run does NOT fail. FAILS on
+    /// `origin/main` (helper absent; `QueueFull` routes to the `other`/`Fail`
+    /// arm that sets `self.failed = true`).
+    #[test]
+    fn test_classify_submit_result_queue_full_retries_then_succeeds() {
+        // QueueFull, well below the cap → retry, not fail.
+        assert_eq!(
+            classify_submit_result(
+                TxQueueResult::QueueFull,
+                /* queue_full_tries */ 0,
+                /* bad_seq_tries */ 0,
+                /* skip_low_fee_txs */ false,
+                LoadGenMode::SorobanInvokeSetup,
+            ),
+            SubmitAction::RetryQueueFull,
+        );
+        // After the queue drains, the same tx is Added → Accept.
+        assert_eq!(
+            classify_submit_result(
+                TxQueueResult::Added,
+                /* queue_full_tries */ 3,
+                /* bad_seq_tries */ 0,
+                /* skip_low_fee_txs */ false,
+                LoadGenMode::SorobanInvokeSetup,
+            ),
+            SubmitAction::Accept,
+        );
+    }
+
+    /// #3574: a genuinely wedged queue still surfaces — at the cap, `QueueFull`
+    /// maps to `Fail` (bounded, not infinite masking).
+    #[test]
+    fn test_classify_submit_result_queue_full_exhausts_cap_fails() {
+        // One below the cap → still retry.
+        assert_eq!(
+            classify_submit_result(
+                TxQueueResult::QueueFull,
+                QUEUE_FULL_MAX_TRIES - 1,
+                0,
+                false,
+                LoadGenMode::SorobanInvokeSetup,
+            ),
+            SubmitAction::RetryQueueFull,
+        );
+        // At the cap → fail the run.
+        assert_eq!(
+            classify_submit_result(
+                TxQueueResult::QueueFull,
+                QUEUE_FULL_MAX_TRIES,
+                0,
+                false,
+                LoadGenMode::SorobanInvokeSetup,
+            ),
+            SubmitAction::Fail,
+        );
+    }
+
+    /// #3574: `TryAgainLater` without `skip_low_fee_txs` retries (queue
+    /// backpressure on soroban setup, where dropping the tx breaks later
+    /// phases); WITH `skip_low_fee_txs` it preserves the existing skip path.
+    #[test]
+    fn test_classify_submit_result_try_again_later_without_skip_retries() {
+        // skip_low_fee_txs == false → treat as transient backpressure, retry.
+        assert_eq!(
+            classify_submit_result(
+                TxQueueResult::TryAgainLater,
+                0,
+                0,
+                false,
+                LoadGenMode::SorobanInvokeSetup,
+            ),
+            SubmitAction::RetryQueueFull,
+        );
+        // skip_low_fee_txs == true → existing skip behavior preserved.
+        assert_eq!(
+            classify_submit_result(TxQueueResult::TryAgainLater, 0, 0, true, LoadGenMode::Pay,),
+            SubmitAction::SkipLowFee,
+        );
+        // FeeTooLow with skip → skip (unchanged).
+        assert_eq!(
+            classify_submit_result(TxQueueResult::FeeTooLow, 0, 0, true, LoadGenMode::Pay),
+            SubmitAction::SkipLowFee,
+        );
+    }
+
+    /// #3574 guards: pre-existing `TxBadSeq` retry and `Added` accept behavior
+    /// is unchanged by the new arms.
+    #[test]
+    fn test_classify_submit_result_bad_seq_and_added_unchanged() {
+        // txBAD_SEQ below the retry cap → RetryBadSeq.
+        assert_eq!(
+            classify_submit_result(
+                TxQueueResult::Invalid(Some(TxResultCode::TxBadSeq)),
+                0,
+                0,
+                false,
+                LoadGenMode::Pay,
+            ),
+            SubmitAction::RetryBadSeq,
+        );
+        // txBAD_SEQ at the retry cap → Fail.
+        assert_eq!(
+            classify_submit_result(
+                TxQueueResult::Invalid(Some(TxResultCode::TxBadSeq)),
+                0,
+                TX_SUBMIT_MAX_TRIES,
+                false,
+                LoadGenMode::Pay,
+            ),
+            SubmitAction::Fail,
+        );
+        // Added → Accept regardless of counters.
+        assert_eq!(
+            classify_submit_result(TxQueueResult::Added, 5, 5, false, LoadGenMode::Pay),
+            SubmitAction::Accept,
+        );
+    }
 }
