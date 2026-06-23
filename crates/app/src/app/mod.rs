@@ -7336,6 +7336,86 @@ mod tests {
         );
     }
 
+    /// `consensus_tick_substep_is_slow` decision helper (#3582): the pure
+    /// threshold predicate that drives consensus-tick (phase=5) sub-step
+    /// instrumentation. Elapsed strictly below the threshold is NOT slow;
+    /// at or above the threshold IS slow (`>=`, boundary inclusive).
+    ///
+    /// This is the failing-test-first artifact for the phase=5 sub-step
+    /// timing instrumentation: the eventual offload fix (#3537-class) needs
+    /// the deployed node to name which sub-op crosses the multi-second
+    /// DB-lock window, and this predicate is what gates that emission.
+    #[test]
+    fn consensus_tick_substep_is_slow_threshold() {
+        // Well under threshold → not slow.
+        assert!(!super::consensus_tick_substep_is_slow(
+            std::time::Duration::from_millis(50)
+        ));
+        // Just under threshold → not slow.
+        assert!(!super::consensus_tick_substep_is_slow(
+            super::CONSENSUS_TICK_SLOW_SUBSTEP_THRESHOLD - std::time::Duration::from_millis(1)
+        ));
+        // Exactly at threshold → slow (>= is load-bearing).
+        assert!(super::consensus_tick_substep_is_slow(
+            super::CONSENSUS_TICK_SLOW_SUBSTEP_THRESHOLD
+        ));
+        // Above threshold (the ~20s phase=5 DB-lock stall) → slow.
+        assert!(super::consensus_tick_substep_is_slow(
+            std::time::Duration::from_secs(20)
+        ));
+    }
+
+    /// The phase=5 sub-step threshold must sit in the "a few seconds, well
+    /// under 30s" band specified by #3582: low enough to fire long before
+    /// the 30s `busy_timeout` DB-lock window, high enough to stay silent
+    /// during normal sub-millisecond ticks.
+    #[test]
+    fn consensus_tick_substep_threshold_in_band() {
+        let t = super::CONSENSUS_TICK_SLOW_SUBSTEP_THRESHOLD;
+        assert!(
+            t >= std::time::Duration::from_secs(1),
+            "threshold {t:?} too low — would be noisy on normal ticks"
+        );
+        assert!(
+            t <= std::time::Duration::from_secs(10),
+            "threshold {t:?} too high — must fire well under the 30s DB-lock window"
+        );
+    }
+
+    /// `warn_consensus_substep_if_slow` emits exactly one WARN naming the
+    /// sub-step + elapsed when slow, and is silent on the fast path. This is
+    /// what makes the deployed node reveal the culprit sub-op (#3582).
+    #[test]
+    fn warn_consensus_substep_if_slow_emits_with_substep() {
+        let sub = CapturingSubscriber::default();
+        let events = sub.events.clone();
+        tracing::subscriber::with_default(sub, || {
+            // Slow: a 20s stall on try_start_ledger_close.
+            super::warn_consensus_substep_if_slow(
+                std::time::Duration::from_secs(20),
+                "try_start_ledger_close",
+            );
+            // Fast: a 1ms request_pending_tx_sets — must stay silent.
+            super::warn_consensus_substep_if_slow(
+                std::time::Duration::from_millis(1),
+                "request_pending_tx_sets",
+            );
+        });
+        let events = events.lock().unwrap();
+        assert_eq!(events.len(), 1, "exactly one warn (only the slow sub-step)");
+        let ev = &events[0];
+        assert!(
+            ev.contains("substep=try_start_ledger_close"),
+            "substep field missing: {ev}"
+        );
+        assert!(ev.contains("phase=5"), "phase field missing: {ev}");
+        assert!(
+            ev.contains("elapsed_ms=20000"),
+            "elapsed_ms field missing/wrong: {ev}"
+        );
+        assert!(ev.contains("#3582"), "log should reference #3582: {ev}");
+    }
+
     /// Test the `format_watchdog_diagnostic_hint` helper directly.
     ///
     /// Verifies that the hint text includes:
