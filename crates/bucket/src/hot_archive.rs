@@ -1842,16 +1842,32 @@ pub fn merge_hot_archive_buckets(
     // memory for the HashMap AND a subsequent O((n+m) log(n+m)) sort.
     let mut result_entries = Vec::with_capacity(1 + curr.len() + snap.len());
 
-    // Add metadata - hot archive buckets always use V1 with BucketListType::HotArchive
-    // for Protocol 23+.
-    let mut meta = BucketMetadata {
-        ledger_version: output_version,
-        ext: BucketMetadataExt::V0,
-    };
-    if protocol_version_starts_from(output_version, ProtocolVersion::V23) {
-        meta.ext = BucketMetadataExt::V1(BucketListType::HotArchive);
+    // Emit the metaentry only when the derived output version supports it
+    // (>= V11), mirroring stellar-core's `BucketOutputIterator` constructor,
+    // which writes the METAENTRY only when `meta.ledgerVersion >=
+    // FIRST_PROTOCOL_SUPPORTING_INITENTRY_AND_METAENTRY` (V11)
+    // (BucketOutputIterator.cpp:45-72). When both inputs are empty/meta-less,
+    // `output_version` is 0 (BucketInputIterator defaults a meta-less bucket to
+    // protocol 0; BucketInputIterator.cpp:35-42) and core emits NO metaentry,
+    // so `getBucket` sees `mObjectsPut == 0` and returns an EMPTY bucket
+    // (BucketOutputIterator.cpp:182-191). Henyey previously pushed a
+    // `{ledgerVersion: 0, ext: V0}` metaentry unconditionally, producing the
+    // meta-only bucket `d15ebeb4…` where core has an empty bucket — flipping the
+    // hot-archive bucket-list hash and (via the live+hot-archive combine) the
+    // header `bucketListHash` (#3552 residual L16 divergence). Hot-archive
+    // buckets exist only at V23+, so a populated merge always uses the V1
+    // extension; the V0/no-meta branch is reachable only for the empty-input
+    // spill, which must collapse to the canonical empty bucket.
+    if protocol_version_starts_from(output_version, ProtocolVersion::V11) {
+        let mut meta = BucketMetadata {
+            ledger_version: output_version,
+            ext: BucketMetadataExt::V0,
+        };
+        if protocol_version_starts_from(output_version, ProtocolVersion::V23) {
+            meta.ext = BucketMetadataExt::V1(BucketListType::HotArchive);
+        }
+        result_entries.push(HotArchiveBucketEntry::Metaentry(meta));
     }
-    result_entries.push(HotArchiveBucketEntry::Metaentry(meta));
 
     // Sorted merge-join: iterate both iterators in lock-step.
     // Snap (newer) wins on equal keys.
@@ -1913,6 +1929,16 @@ pub fn merge_hot_archive_buckets(
                 }
             }
         }
+    }
+
+    // If the merge produced no entries at all (no metaentry because
+    // output_version < V11, and no surviving data entries), collapse to the
+    // canonical empty bucket (hash zero), mirroring stellar-core's
+    // `getBucket` empty-output path (BucketOutputIterator.cpp:182-191) rather
+    // than materializing a zero-entry bucket.
+    if result_entries.is_empty() {
+        tracing::trace!("hot_archive merge: empty result, returning empty bucket");
+        return Ok(HotArchiveBucket::empty());
     }
 
     let result = HotArchiveBucket::from_entries(result_entries)?;
@@ -3281,6 +3307,66 @@ mod tests {
             err_msg.contains("metadata entry found after keyed entries"),
             "got: {}",
             err_msg
+        );
+    }
+
+    /// Regression for #3552 (residual L16 `bucketListHash` divergence).
+    ///
+    /// At the ledger-16 hot-archive level-1→2 spill, both merge inputs are
+    /// empty (no entries, no metaentry ⇒ `get_protocol_version()` == 0), but the
+    /// merge is invoked with the CURRENT protocol (e.g. 27) as `maxProtocolVersion`.
+    /// stellar-core's `BucketOutputIterator` gates the metaentry on
+    /// `meta.ledgerVersion >= FIRST_PROTOCOL_SUPPORTING_INITENTRY_AND_METAENTRY`
+    /// (V11) (`BucketOutputIterator.cpp:45-72`). With the derived output version
+    /// 0 (< V11) it emits NO metaentry, so `mObjectsPut == 0` ⇒ a truly EMPTY
+    /// bucket (`getBucket`, `BucketOutputIterator.cpp:182-191`).
+    ///
+    /// Henyey instead unconditionally pushed a `{ledgerVersion: 0, ext: V0}`
+    /// metaentry, producing the meta-only bucket `d15ebeb4…` where core has an
+    /// empty bucket. That flips the hot-archive bucket-list hash, which combines
+    /// with the live hash into the header `bucketListHash` ⇒ the L16 consensus
+    /// divergence (henyey `759a1bbe…` vs core `9f58962b…`).
+    ///
+    /// Pre-fix this produced a non-empty `{v0,void}` meta-only bucket
+    /// (`d15ebeb4f9249d16…`); post-fix it is the canonical empty bucket.
+    #[test]
+    fn test_hot_archive_empty_input_merge_at_v27_yields_empty_not_v0_meta() {
+        // The d15ebeb4 divergent bucket: a single `{ledgerVersion:0, ext:V0}`
+        // HOT_ARCHIVE_METAENTRY (the exact 16-byte payload captured live).
+        let v0_meta_only = HotArchiveBucket::from_entries(vec![HotArchiveBucketEntry::Metaentry(
+            BucketMetadata {
+                ledger_version: 0,
+                ext: BucketMetadataExt::V0,
+            },
+        )])
+        .unwrap();
+        let v0_meta_only_hash = v0_meta_only.hash();
+
+        // Spill of two empty hot-archive buckets at the current protocol (27),
+        // exactly as the L16 level-1→2 hot-archive spill invokes it.
+        let merged = merge_hot_archive_buckets(
+            &HotArchiveBucket::empty(),
+            &HotArchiveBucket::empty(),
+            27,
+            true,
+        )
+        .unwrap();
+
+        assert_ne!(
+            merged.hash(),
+            v0_meta_only_hash,
+            "empty-input merge must NOT produce the {{v0,void}} meta-only bucket (d15ebeb4)"
+        );
+        assert!(
+            merged.is_empty(),
+            "empty-input merge at protocol 27 must yield an EMPTY hot-archive bucket (parity \
+             with stellar-core: output version 0 < V11 ⇒ no metaentry ⇒ empty), got hash {}",
+            merged.hash().to_hex()
+        );
+        assert!(
+            merged.hash().is_zero(),
+            "empty hot-archive bucket hash must be zero, got {}",
+            merged.hash().to_hex()
         );
     }
 }
