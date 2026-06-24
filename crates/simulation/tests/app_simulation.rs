@@ -1062,13 +1062,18 @@ async fn test_core3_restart_rejoin_over_tcp() {
     // 60s timeout: post-restart catchup can be slow on CI runners.
     wait_for_app_ledger_close(&sim, 3, 1, Duration::from_secs(60)).await;
 
-    // Verify SCP envelopes traversed the pump_scp_intake pipeline during recovery.
-    // restart_node() creates a fresh App with zero counters, so any positive
-    // total proves the intake pipeline worked.
-    assert_scp_intake_reached(&sim.app("node0").expect("node0 for post-check"), "node0");
-
     // Now advance all nodes to ledger 4.
     manual_close_until(&sim, 4, 1, Duration::from_secs(60)).await;
+
+    // Verify SCP envelopes traversed the pump_scp_intake pipeline post-restart.
+    // restart_node() creates a fresh App with zero counters, so any positive
+    // total proves the intake pipeline worked. Checked AFTER closing ledger 4:
+    // with restored-Externalize completion (#3595) node0 can close ledger 3
+    // directly from its own persisted, SCP-externalized slot without any live
+    // intake, so the pre-ledger-4 checkpoint is no longer a reliable witness of
+    // intake; closing ledger 4 requires node0's live SCP participation, which
+    // unconditionally exercises the intake pipeline.
+    assert_scp_intake_reached(&sim.app("node0").expect("node0 for post-check"), "node0");
 
     sim.stop_all_nodes()
         .await
@@ -1139,13 +1144,18 @@ async fn test_core3_restart_rejoin_over_loopback() {
     // 60s timeout: post-restart catchup can be slow on CI runners.
     wait_for_app_ledger_close(&sim, 3, 1, Duration::from_secs(60)).await;
 
-    // Verify SCP envelopes traversed the pump_scp_intake pipeline during recovery.
-    // restart_node() creates a fresh App with zero counters, so any positive
-    // total proves the intake pipeline worked.
-    assert_scp_intake_reached(&sim.app("node0").expect("node0 for post-check"), "node0");
-
     // Now advance all nodes to ledger 4.
     manual_close_until(&sim, 4, 1, Duration::from_secs(60)).await;
+
+    // Verify SCP envelopes traversed the pump_scp_intake pipeline post-restart.
+    // restart_node() creates a fresh App with zero counters, so any positive
+    // total proves the intake pipeline worked. Checked AFTER closing ledger 4:
+    // with restored-Externalize completion (#3595) node0 can close ledger 3
+    // directly from its own persisted, SCP-externalized slot without any live
+    // intake, so the pre-ledger-4 checkpoint is no longer a reliable witness of
+    // intake; closing ledger 4 requires node0's live SCP participation, which
+    // unconditionally exercises the intake pipeline.
+    assert_scp_intake_reached(&sim.app("node0").expect("node0 for post-check"), "node0");
 
     sim.stop_all_nodes()
         .await
