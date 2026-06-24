@@ -1615,30 +1615,6 @@ impl LoadGenerator {
         }
     }
 
-    /// Wait until every submitted transaction has been applied (accounts
-    /// synced) — and, for Soroban setup modes, until the deployed contract
-    /// code + instance entries actually exist on-ledger — before declaring the
-    /// run complete.
-    ///
-    /// Parity: stellar-core `LoadGenerator::waitTillComplete()`
-    /// (`src/simulation/LoadGenerator.cpp:1345`) gates completion on BOTH
-    /// `checkAccountSynced().empty()` AND `checkSorobanStateSynced(cfg).empty()`
-    /// each ledger, timing out after `TIMEOUT_NUM_LEDGERS`. The Soroban-state
-    /// gate is load-bearing for the create_upgrade flow (#3602): under the
-    /// genesis `MinimumSorobanNetworkConfig` (`ledgerMaxTxCount = 1`,
-    /// `ledgerMaxInstructions = 2_500_000`) the upgrade-setup `create_contract`
-    /// deploy competes for the single per-ledger Soroban slot and can be
-    /// surge-excluded for several ledgers. Account-sync alone returns as soon
-    /// as the source seq advances (a *failed* apply still bumps the seq), so
-    /// without the state gate the run could report "complete" while the
-    /// contract instance was never created — the subsequent `create_upgrade`
-    /// then writes nothing resolvable and the SSC arm hangs. We poll ~once per
-    /// second and bound the wait by ledger advancement.
-    ///
-    /// On timeout with the Soroban state still unsynced (setup modes), the run
-    /// is marked failed — parity with stellar-core `emitFailure` — so the
-    /// mission fails fast and is retried, rather than silently proceeding to a
-    /// create_upgrade that can never resolve.
     /// Wait until the uploaded setup wasm (`code_key`) exists on-ledger before
     /// deploying contract instances that reference it by hash.
     ///
@@ -1675,6 +1651,30 @@ impl LoadGenerator {
         }
     }
 
+    /// Wait until every submitted transaction has been applied (accounts
+    /// synced) — and, for Soroban setup modes, until the deployed contract
+    /// code + instance entries actually exist on-ledger — before declaring the
+    /// run complete.
+    ///
+    /// Parity: stellar-core `LoadGenerator::waitTillComplete()`
+    /// (`src/simulation/LoadGenerator.cpp:1345`) gates completion on BOTH
+    /// `checkAccountSynced().empty()` AND `checkSorobanStateSynced(cfg).empty()`
+    /// each ledger, timing out after `TIMEOUT_NUM_LEDGERS`. The Soroban-state
+    /// gate is load-bearing for the create_upgrade flow (#3602): under the
+    /// genesis `MinimumSorobanNetworkConfig` (`ledgerMaxTxCount = 1`,
+    /// `ledgerMaxInstructions = 2_500_000`) the upgrade-setup `create_contract`
+    /// deploy competes for the single per-ledger Soroban slot and can be
+    /// surge-excluded for several ledgers. Account-sync alone returns as soon
+    /// as the source seq advances (a *failed* apply still bumps the seq), so
+    /// without the state gate the run could report "complete" while the
+    /// contract instance was never created — the subsequent `create_upgrade`
+    /// then writes nothing resolvable and the SSC arm hangs. We poll ~once per
+    /// second and bound the wait by ledger advancement.
+    ///
+    /// On timeout with the Soroban state still unsynced (setup modes), the run
+    /// is marked failed — parity with stellar-core `emitFailure` — so the
+    /// mission fails fast and is retried, rather than silently proceeding to a
+    /// create_upgrade that can never resolve.
     async fn wait_till_complete(&mut self, config: &GeneratedLoadConfig) {
         const TIMEOUT_NUM_LEDGERS: u32 = 30;
         let check_soroban = config.mode.is_soroban_setup();
