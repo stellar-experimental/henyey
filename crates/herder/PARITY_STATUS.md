@@ -150,16 +150,42 @@ of two intentional, architecture-forced adaptations (NOT upstream parity):
    rejects superseding live envelopes — `ballot/mod.rs:854`). This is the
    regression guard for the consensus stall that closed PR #2797.
 
-2. **Live-envelope replay is currently gated OFF**
-   (`Herder::RESTORE_LIVE_ENVELOPE_REPLAY == false`). #2769 ships the
-   dependency hydration (decode + cache the referenced tx-sets and quorum-sets
-   for retained `slot > lcl` envelopes) and the transitive-quorum rebuild, but
-   does NOT replay the future-slot envelopes via `set_state_from_envelope`,
-   because doing so reproduces the PR #2797 stall (the simulation restart suite
-   `test_core3_restart_rejoin_over_loopback` stalls ~4/5 runs with replay on,
-   and is deterministically green with it off). Re-enabling live replay is
-   tracked by #3555 (allow a restored ballot slot to be superseded by a later
-   network EXTERNALIZE); once that lands the flag flips to `true`.
+2. **Live-envelope replay is enabled with a proactive restore-time
+   externalization completion** (`Herder::RESTORE_LIVE_ENVELOPE_REPLAY == true`,
+   re-enabled in #3595). Beyond the dependency hydration (decode + cache the
+   referenced tx-sets and quorum-sets) and transitive-quorum rebuild, restore
+   replays the future-slot envelopes via `set_state_from_envelope`. Replaying a
+   restored **Externalize** installs the ballot in `phase=Externalize` and
+   records the externalized value but — exactly like core's
+   `BallotProtocol::setStateFromEnvelope` (`BallotProtocol.cpp:1898-1910`, which
+   sets `mLastEnvelope=mLastEnvelopeEmit` and does NOT call `valueExternalized`)
+   — does NOT itself close the ledger. The matching network EXTERNALIZE for that
+   slot is then accepted-but-silent (value-match → `EnvelopeState::Valid` →
+   herder `Duplicate`), so without an explicit completion node0 would wedge at
+   `phase=Externalize` with LCL stuck (the PR #2797 / #3595 restart-rejoin
+   stall). The fix is **not** ballot supersession: after the replay loop,
+   restore drives `complete_externalization(slot)` for the **distinct** restored
+   slot satisfying `slot == lcl + 1` **and** `scp.is_slot_externalized(slot)` —
+   the faithful henyey analog of core's `HerderImpl::processExternalized →
+   mLedgerManager.valueExternalized` (`HerderImpl.cpp:311-396`), reached from
+   `restoreSCPState` (`HerderImpl.cpp:2239`). This publishes `latest_externalized`
+   and the app's `out_of_sync_recovery` loop closes ledger `lcl+1`.
+
+   **Trigger-point divergence (intentional).** Core reaches that terminal for a
+   restored slot via its recovery/catchup machinery
+   (`setTrackingSCPState`+`processSCPQueue`+`outOfSyncRecovery`/`getMoreSCPState`,
+   then catchup advancing LCL); henyey triggers it directly from the restore
+   hook. The end-state is identical (LCL → `lcl+1`) and the terminal call is the
+   same — only the trigger site differs. The proactive close is required because
+   henyey's 3-node restart-rejoin simulation has no history archive to catch up
+   from. The `slot == lcl+1` gate mirrors core's "only the next-to-close slot
+   applies immediately" invariant; higher restored slots wait for their
+   predecessor, and restored Prepare/Confirm slots are not externalized so the
+   completion is a no-op for them (never force-closed). The SCP layer itself is
+   byte-faithful (`setStateFromEnvelope`/`sendLatestEnvelope`/slot ctor verified)
+   and is NOT modified. Gated on the simulation restart suite
+   `test_core3_restart_rejoin_over_{loopback,tcp}` staying green across ≥10
+   consecutive runs (the race the gate PR #2797 lacked).
 
    The restore-time quorum-tracker rebuild follows upstream's
    local-node-preserving closure shape (`PendingEnvelopes.cpp:924-955`): the

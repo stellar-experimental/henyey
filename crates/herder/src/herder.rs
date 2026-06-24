@@ -899,21 +899,22 @@ impl Herder {
     /// and the transitive-quorum rebuild ONLY, and the live-envelope replay is
     /// deferred.
     ///
-    /// **Currently GATED OFF.** Re-injecting even a future-slot local envelope
-    /// pins henyey's SCP ballot machine in its restored phase (e.g.
-    /// `Externalize`) so the restored node emits nothing and cannot follow a
-    /// later network ballot for that slot — reproducing the consensus stall
-    /// that closed PR #2797. With replay enabled the simulation restart test
-    /// `test_core3_restart_rejoin_over_loopback` stalls in ~4 of 5 runs (node0
-    /// stuck `ballot_phase=Externalize, scp_sent=0` while peers stay in
-    /// `Prepare`); with replay gated off the same suite is deterministically
-    /// green. The plan's mechanical gate (≥5 green sim runs to ship live
-    /// replay) therefore selects the gated-off variant. Re-enabling is tracked
-    /// by the SCP ballot-supersession follow-up referenced in
-    /// `crates/herder/PARITY_STATUS.md`'s `[^restore-scp]` footnote; once SCP
-    /// can supersede a restored ballot from a later network EXTERNALIZE, flip
-    /// this to `true` and the existing replay path + tests re-activate.
-    const RESTORE_LIVE_ENVELOPE_REPLAY: bool = false;
+    /// **Enabled** (re-enabled for #3595). Replaying a restored future-slot
+    /// **Externalize** installs the ballot in `phase=Externalize` and records
+    /// the externalized value, but `set_state_from_envelope` (by parity with
+    /// core's `BallotProtocol::setStateFromEnvelope`) does NOT itself close the
+    /// ledger — and the matching network EXTERNALIZE is then accepted-but-silent
+    /// (value-match → `EnvelopeState::Valid` → herder `Duplicate`), so node0
+    /// would wedge at `phase=Externalize` with LCL stuck (the #2797 stall,
+    /// re-investigated under #3595). The faithful fix is NOT ballot
+    /// supersession: instead `restore_persisted_scp_state` drives the restored,
+    /// SCP-externalized next-to-close slot (`slot == lcl+1`) through the same
+    /// `complete_externalization` terminal the live path uses — the analog of
+    /// core's `processExternalized → mLedgerManager.valueExternalized`. With
+    /// that completion in place the simulation restart test
+    /// `test_core3_restart_rejoin_over_loopback` is green across ≥10 consecutive
+    /// runs. See `crates/herder/PARITY_STATUS.md`'s `[^restore-scp]` footnote.
+    const RESTORE_LIVE_ENVELOPE_REPLAY: bool = true;
 
     /// Restore persisted SCP state at startup. Hydrates the tx-sets and
     /// quorum-sets referenced by retained **future-slot** (`slot > lcl`) local
@@ -1060,12 +1061,10 @@ impl Herder {
         }
 
         // --- SCP envelope replay (parity: Slot::setStateFromEnvelope,
-        // Slot.cpp:61-88). Only future slots reach here. GATED: see
-        // `RESTORE_LIVE_ENVELOPE_REPLAY` — replaying a restored ballot stalls
-        // SCP (the PR #2797 regression), so this is deferred to the
-        // ballot-supersession follow-up. Dependency hydration above still runs
-        // so the node can immediately validate the future slot once it hears
-        // the corresponding live envelopes from peers. ---
+        // Slot.cpp:61-88). Only future slots reach here. Gated on
+        // `RESTORE_LIVE_ENVELOPE_REPLAY` (now enabled). Dependency hydration
+        // above runs unconditionally so the node can immediately validate the
+        // future slot. ---
         let mut replayed = 0usize;
         if Self::RESTORE_LIVE_ENVELOPE_REPLAY {
             for env in &future_envelopes {
@@ -1078,12 +1077,75 @@ impl Herder {
                     );
                 }
             }
+
+            // --- Drive the restored next-to-close externalized slot to the
+            // ledger-close terminal (parity: HerderImpl::restoreSCPState →
+            // processExternalized → mLedgerManager.valueExternalized,
+            // HerderImpl.cpp:2239/311-396). `set_state_from_envelope` installs a
+            // restored Externalize as `phase=Externalize` and records the
+            // externalized value in the ballot, but — exactly like core's
+            // `BallotProtocol::setStateFromEnvelope` — does NOT itself close the
+            // ledger. The subsequent network EXTERNALIZE for that slot is then
+            // accepted-but-silent (value-match → `EnvelopeState::Valid` → herder
+            // `Duplicate`), so without an explicit completion node0 wedges at
+            // `phase=Externalize` with LCL stuck (the #3595 restart-rejoin
+            // stall). Core escapes via its recovery/catchup machinery
+            // rediscovering the externalized slot; the 3-node restart-rejoin sim
+            // has no history archive, so we proactively drive the same terminal
+            // here.
+            //
+            // Mirror the EXACT live externalize sequence (the path
+            // `process_scp_envelope` takes when SCP newly externalizes a slot,
+            // see the `is_slot_externalized` block above): request the tx-set,
+            // `record_externalized` the value (so the app's
+            // `process_externalized_slots` / `out_of_sync_recovery` close
+            // pipeline can find it — `complete_externalization` alone only
+            // publishes `latest_externalized` and would otherwise leave the
+            // value unrecorded), `cleanup_externalized`, then
+            // `complete_externalization`.
+            //
+            // Iterate the DISTINCT restored slots (restore can install both a
+            // Nominate and an Externalize for the same slot — dedupe so the
+            // completion fires once per slot). Gate strictly on
+            // `slot == lcl + 1` (only the next-to-close slot applies
+            // immediately, matching core's "only next-to-close applies now"
+            // invariant — higher restored slots wait for their predecessor) AND
+            // `is_slot_externalized(slot)` (restored Prepare/Confirm slots are
+            // not externalized → no-op, so they are never force-closed).
+            let mut completed_slots: std::collections::BTreeSet<u64> =
+                std::collections::BTreeSet::new();
+            for env in &future_envelopes {
+                let slot = env.statement.slot_index;
+                if slot != lcl + 1 {
+                    continue;
+                }
+                if !completed_slots.insert(slot) {
+                    continue;
+                }
+                if !self.scp.is_slot_externalized(slot) {
+                    continue;
+                }
+                let Some(value) = self.scp.get_externalized_value(slot) else {
+                    continue;
+                };
+                debug!(
+                    slot,
+                    "restore: driving externalization for restored next-to-close externalized slot"
+                );
+                // Request the tx-set so the close pipeline can hydrate it.
+                if let Ok(sv) = StellarValue::from_xdr(&value.0, Limits::none()) {
+                    self.scp_driver.request_tx_set(sv.tx_set_hash.into(), slot);
+                }
+                self.scp_driver.record_externalized(slot, value, None);
+                self.scp_driver
+                    .cleanup_externalized(self.config.max_externalized_slots);
+                self.complete_externalization(slot);
+            }
         } else {
             debug!(
                 lcl,
                 deferred = future_envelopes.len(),
-                "restore: live-envelope replay gated off (PR #2797 stall guard); \
-                 hydrated dependencies only"
+                "restore: live-envelope replay gated off; hydrated dependencies only"
             );
         }
 
