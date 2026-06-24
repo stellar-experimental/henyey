@@ -723,6 +723,33 @@ define_wasm_compilation_context!(
     HostErrorP27
 );
 
+/// Whether to withhold the persistent module cache from this host function's
+/// `invoke_host_function` call.
+///
+/// Passing the module cache makes the host compile (to native) any module it
+/// encounters that isn't already cached, and charges that compile cost against
+/// the transaction's instruction budget. For `UploadContractWasm` this adds the
+/// full Wasm native-compile cost (~1.5M instructions for a tiny contract) on top
+/// of parsing, which under the genesis `MinimumSorobanNetworkConfig`
+/// (`txMaxInstructions = 2_500_000`) pushes the upload over budget and fails it
+/// with `ResourceLimitExceeded` — non-deterministically, depending on whether
+/// the module happened to already be cached (#3602).
+///
+/// An upload does not execute contract code, so it has no need of the cache; the
+/// module is compiled (un-metered) by the ledger-close module-cache warming
+/// (`addAnyContractsToModuleCache` parity) for the *next* ledger's deploy/invoke.
+/// stellar-core's uploads are not charged this compile cost. Withholding the
+/// cache here makes upload metering deterministic and parity-correct.
+///
+/// Execution paths (`InvokeContract`, and `CreateContract`/`CreateContractV2`
+/// which read or run the referenced code) keep the cache.
+pub(crate) fn upload_skips_module_cache(host_function: &stellar_xdr::HostFunction) -> bool {
+    matches!(
+        host_function,
+        stellar_xdr::HostFunction::UploadContractWasm(_)
+    )
+}
+
 /// Execute a Soroban host function with an optional pre-populated module cache.
 ///
 /// This is the same as `execute_host_function` but accepts an optional persistent
@@ -1214,16 +1241,32 @@ fn execute_host_function_p24(
         "P24",
     )?;
 
-    // Use existing module cache — it must always be provided.
-    let module_cache = existing_cache
-        .unwrap_or_else(|| {
-            panic!(
-                "P24: Module cache is not available — this is a bug. \
-                The persistent module cache should always be initialized before TX execution."
-            )
-        })
-        .clone();
-    let module_cache = Some(module_cache);
+    // Reusable module cache (CAP-0062): passing it to invoke_host_function makes
+    // the host compile the *uploaded* module into the cache on a miss, charging
+    // the ~1.5M-instruction native-compile cost against upload_wasm metering.
+    // Under the genesis MinimumSorobanNetworkConfig (txMaxInstructions =
+    // 2_500_000) that pushes the write_bytes upload over budget (~3.2M > 2.5M),
+    // failing it with ResourceLimitExceeded — non-deterministically, depending on
+    // whether the module was already cached from a prior attempt (#3602). Uploads
+    // do not execute the contract, so the cache must not factor into upload
+    // metering (stellar-core meters them without this charge). Skip the cache for
+    // the non-executing host functions (UploadContractWasm, CreateContract) so
+    // metering is deterministic and within budget. InvokeContract and
+    // CreateContractV2 (constructor) still execute code, so they keep the cache.
+    let module_cache = if upload_skips_module_cache(host_function) {
+        None
+    } else {
+        Some(
+            existing_cache
+                .unwrap_or_else(|| {
+                    panic!(
+                        "P24: Module cache is not available — this is a bug. \
+                        The persistent module cache should always be initialized before TX execution."
+                    )
+                })
+                .clone(),
+        )
+    };
 
     // ── Encode inputs and call non-typed invoke_host_function() ──
     let inputs = encode_invocation_inputs(host_function, soroban_data, source, auth_entries)?;
@@ -1463,16 +1506,32 @@ fn execute_host_function_p25(
         "P25",
     )?;
 
-    // Use existing module cache — it must always be provided.
-    let module_cache = existing_cache
-        .unwrap_or_else(|| {
-            panic!(
-                "P25: Module cache is not available — this is a bug. \
-                The persistent module cache should always be initialized before TX execution."
-            )
-        })
-        .clone();
-    let module_cache = Some(module_cache);
+    // Reusable module cache (CAP-0062): passing it to invoke_host_function makes
+    // the host compile the *uploaded* module into the cache on a miss, charging
+    // the ~1.5M-instruction native-compile cost against upload_wasm metering.
+    // Under the genesis MinimumSorobanNetworkConfig (txMaxInstructions =
+    // 2_500_000) that pushes the write_bytes upload over budget (~3.2M > 2.5M),
+    // failing it with ResourceLimitExceeded — non-deterministically, depending on
+    // whether the module was already cached from a prior attempt (#3602). Uploads
+    // do not execute the contract, so the cache must not factor into upload
+    // metering (stellar-core meters them without this charge). Skip the cache for
+    // the non-executing host functions (UploadContractWasm, CreateContract) so
+    // metering is deterministic and within budget. InvokeContract and
+    // CreateContractV2 (constructor) still execute code, so they keep the cache.
+    let module_cache = if upload_skips_module_cache(host_function) {
+        None
+    } else {
+        Some(
+            existing_cache
+                .unwrap_or_else(|| {
+                    panic!(
+                        "P25: Module cache is not available — this is a bug. \
+                        The persistent module cache should always be initialized before TX execution."
+                    )
+                })
+                .clone(),
+        )
+    };
 
     // ── Encode inputs and call non-typed invoke_host_function() ──
     // All budget metering (ValDeser for inputs, ValSer for outputs) is handled
@@ -1857,16 +1916,32 @@ fn execute_host_function_p26(
         "P26",
     )?;
 
-    // Use existing module cache — it must always be provided.
-    let module_cache = existing_cache
-        .unwrap_or_else(|| {
-            panic!(
-                "P26: Module cache is not available — this is a bug. \
-                The persistent module cache should always be initialized before TX execution."
-            )
-        })
-        .clone();
-    let module_cache = Some(module_cache);
+    // Reusable module cache (CAP-0062): passing it to invoke_host_function makes
+    // the host compile the *uploaded* module into the cache on a miss, charging
+    // the ~1.5M-instruction native-compile cost against upload_wasm metering.
+    // Under the genesis MinimumSorobanNetworkConfig (txMaxInstructions =
+    // 2_500_000) that pushes the write_bytes upload over budget (~3.2M > 2.5M),
+    // failing it with ResourceLimitExceeded — non-deterministically, depending on
+    // whether the module was already cached from a prior attempt (#3602). Uploads
+    // do not execute the contract, so the cache must not factor into upload
+    // metering (stellar-core meters them without this charge). Skip the cache for
+    // the non-executing host functions (UploadContractWasm, CreateContract) so
+    // metering is deterministic and within budget. InvokeContract and
+    // CreateContractV2 (constructor) still execute code, so they keep the cache.
+    let module_cache = if upload_skips_module_cache(host_function) {
+        None
+    } else {
+        Some(
+            existing_cache
+                .unwrap_or_else(|| {
+                    panic!(
+                        "P26: Module cache is not available — this is a bug. \
+                        The persistent module cache should always be initialized before TX execution."
+                    )
+                })
+                .clone(),
+        )
+    };
 
     // ── Encode inputs and call non-typed invoke_host_function() ──
     let inputs = encode_invocation_inputs(host_function, soroban_data, source, auth_entries)?;
@@ -2109,16 +2184,32 @@ fn execute_host_function_p27(
         "P27",
     )?;
 
-    // Use existing module cache — it must always be provided.
-    let module_cache = existing_cache
-        .unwrap_or_else(|| {
-            panic!(
-                "P27: Module cache is not available — this is a bug. \
-                The persistent module cache should always be initialized before TX execution."
-            )
-        })
-        .clone();
-    let module_cache = Some(module_cache);
+    // Reusable module cache (CAP-0062): passing it to invoke_host_function makes
+    // the host compile the *uploaded* module into the cache on a miss, charging
+    // the ~1.5M-instruction native-compile cost against upload_wasm metering.
+    // Under the genesis MinimumSorobanNetworkConfig (txMaxInstructions =
+    // 2_500_000) that pushes the write_bytes upload over budget (~3.2M > 2.5M),
+    // failing it with ResourceLimitExceeded — non-deterministically, depending on
+    // whether the module was already cached from a prior attempt (#3602). Uploads
+    // do not execute the contract, so the cache must not factor into upload
+    // metering (stellar-core meters them without this charge). Skip the cache for
+    // the non-executing host functions (UploadContractWasm, CreateContract) so
+    // metering is deterministic and within budget. InvokeContract and
+    // CreateContractV2 (constructor) still execute code, so they keep the cache.
+    let module_cache = if upload_skips_module_cache(host_function) {
+        None
+    } else {
+        Some(
+            existing_cache
+                .unwrap_or_else(|| {
+                    panic!(
+                        "P27: Module cache is not available — this is a bug. \
+                        The persistent module cache should always be initialized before TX execution."
+                    )
+                })
+                .clone(),
+        )
+    };
 
     // ── Encode inputs and call non-typed invoke_host_function() ──
     let inputs = encode_invocation_inputs(host_function, soroban_data, source, auth_entries)?;
@@ -2274,6 +2365,49 @@ mod tests {
         });
         let hash = compute_key_hash(&key);
         assert_ne!(hash.0, [0u8; 32]);
+    }
+
+    /// #3602: the persistent module cache is withheld only from
+    /// `UploadContractWasm` (so the upload is metered parse-only, not
+    /// parse+native-compile, fitting the genesis txMaxInstructions budget).
+    /// Execution paths keep the cache.
+    #[test]
+    fn test_upload_skips_module_cache() {
+        use stellar_xdr::{
+            ContractIdPreimage, ContractIdPreimageFromAddress, CreateContractArgs,
+            CreateContractArgsV2, Hash, HostFunction, InvokeContractArgs, ScAddress, ScSymbol,
+            ScVal, Uint256,
+        };
+
+        // Upload: cache withheld.
+        assert!(upload_skips_module_cache(
+            &HostFunction::UploadContractWasm(vec![0u8; 8].try_into().unwrap())
+        ));
+
+        // Invoke: cache kept (executes the contract).
+        let invoke = HostFunction::InvokeContract(InvokeContractArgs {
+            contract_address: ScAddress::Contract(stellar_xdr::ContractId(Hash([1u8; 32]))),
+            function_name: ScSymbol("f".try_into().unwrap()),
+            args: Vec::new().try_into().unwrap(),
+        });
+        assert!(!upload_skips_module_cache(&invoke));
+
+        // CreateContract / V2: cache kept (reads/runs the referenced code).
+        let preimage = ContractIdPreimage::Address(ContractIdPreimageFromAddress {
+            address: ScAddress::Contract(stellar_xdr::ContractId(Hash([2u8; 32]))),
+            salt: Uint256([0u8; 32]),
+        });
+        let create = HostFunction::CreateContract(CreateContractArgs {
+            contract_id_preimage: preimage.clone(),
+            executable: stellar_xdr::ContractExecutable::Wasm(Hash([3u8; 32])),
+        });
+        assert!(!upload_skips_module_cache(&create));
+        let create_v2 = HostFunction::CreateContractV2(CreateContractArgsV2 {
+            contract_id_preimage: preimage,
+            executable: stellar_xdr::ContractExecutable::Wasm(Hash([3u8; 32])),
+            constructor_args: vec![ScVal::Void].try_into().unwrap(),
+        });
+        assert!(!upload_skips_module_cache(&create_v2));
     }
 
     /// V27 protocol routes to a P27 module cache; V26 still routes to P26.
