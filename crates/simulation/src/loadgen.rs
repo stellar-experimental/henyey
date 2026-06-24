@@ -1515,10 +1515,22 @@ impl LoadGenerator {
                         config.n_wasms == 0,
                         "Expected all wasms to be uploaded before transitioning to phase 2"
                     );
+                    // Parity: stellar-core does not deploy instances until the
+                    // uploaded wasms are VERIFIED on-ledger — "waitTillFinished
+                    // will set nTxs for instances once wasms have been verified"
+                    // (LoadGenerator.cpp:360-362). The deploy (create_contract)
+                    // references the uploaded wasm by hash; under the genesis
+                    // 1-soroban-tx-per-ledger limit the deploy can otherwise win
+                    // its ledger slot before the upload applies and fail with
+                    // Storage(MissingValue) (code not found), leaving the
+                    // instance uncreated (soroban_synced=false) and the
+                    // create_upgrade unable to resolve (#3602 residual flake).
+                    self.wait_setup_code_applied().await;
                     config.n_txs = config.n_instances;
                     info!(
                         n_instances = config.n_instances,
-                        "Setup phase 1 complete, transitioning to instance deployment"
+                        "Setup phase 1 complete (wasm verified on-ledger), \
+                         transitioning to instance deployment"
                     );
                 } else {
                     // Parity: stellar-core does not emit `loadgen.run.complete`
@@ -1600,6 +1612,42 @@ impl LoadGenerator {
             self.total_submitted += submitted_this_step;
 
             tokio::time::sleep(step_duration).await;
+        }
+    }
+
+    /// Wait until the uploaded setup wasm (`code_key`) exists on-ledger before
+    /// deploying contract instances that reference it by hash.
+    ///
+    /// Parity: stellar-core's loadgen verifies uploaded wasms before setting
+    /// `nTxs` for the instance-deploy phase (`LoadGenerator.cpp:360-362`).
+    /// Without this gate, the `create_contract` deploy can be included before
+    /// the upload applies (under the genesis 1-soroban-tx-per-ledger limit) and
+    /// fail with `Storage(MissingValue)`. Bounded by ledger advancement so a
+    /// never-applied upload can't hang the run.
+    async fn wait_setup_code_applied(&mut self) {
+        const TIMEOUT_NUM_LEDGERS: u32 = 30;
+        let Some(code_key) = self.code_key.clone() else {
+            return;
+        };
+        let start_ledger = self.tx_generator.app.current_ledger_seq();
+        loop {
+            if matches!(self.tx_generator.app.has_ledger_entry(&code_key), Ok(true)) {
+                return;
+            }
+            let elapsed = self
+                .tx_generator
+                .app
+                .current_ledger_seq()
+                .saturating_sub(start_ledger);
+            if elapsed >= TIMEOUT_NUM_LEDGERS {
+                warn!(
+                    timeout_ledgers = TIMEOUT_NUM_LEDGERS,
+                    "setup: uploaded wasm not on-ledger before deploy timeout; \
+                     deploy may fail with MissingValue"
+                );
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
         }
     }
 
