@@ -754,13 +754,45 @@ impl TxGenerator {
     /// `load_account`). An account that cannot be loaded yet (None / Err) is
     /// treated as not-yet-synced so the caller keeps waiting.
     pub fn check_accounts_synced(&self) -> bool {
-        for account in self.accounts.values() {
-            match self.app.load_account_sequence(&account.account_id) {
-                Ok(Some(db_seq)) if db_seq == account.sequence_number => {}
+        Self::accounts_synced_with(self.accounts.values(), |id| {
+            self.app.load_account_sequence(id).ok().flatten()
+        })
+    }
+
+    /// Pure core of [`check_accounts_synced`]: `true` when every account's
+    /// in-memory (expected) sequence number equals its on-ledger sequence
+    /// number, as reported by `load_seq` (returns `None` when the account
+    /// can't be loaded yet — treated as not-yet-synced). Factored out so the
+    /// cross-run synced semantics can be unit-tested without a live `App`.
+    fn accounts_synced_with<'a, F>(
+        accounts: impl Iterator<Item = &'a TestAccount>,
+        load_seq: F,
+    ) -> bool
+    where
+        F: Fn(&AccountId) -> Option<i64>,
+    {
+        for account in accounts {
+            match load_seq(&account.account_id) {
+                Some(db_seq) if db_seq == account.sequence_number => {}
                 _ => return false,
             }
         }
         true
+    }
+
+    /// Clear the per-account sequence-number cache.
+    ///
+    /// Parity port of stellar-core `TxGenerator::reset()`
+    /// (`src/simulation/TxGenerator.cpp`), which `LoadGenerator::reset()` calls
+    /// before every run. The cache holds each account's *expected* (in-memory)
+    /// sequence number; carrying it across independent loadgen runs poisons
+    /// [`check_accounts_synced`] — a later run would keep inspecting a prior
+    /// run's accounts, whose expected seq may never match the ledger (e.g. a
+    /// tx that was submitted but dropped on queue overflow left the cached seq
+    /// permanently ahead of on-ledger), so `wait_till_complete` times out even
+    /// though the current run's own accounts are fully applied.
+    pub fn reset(&mut self) {
+        self.accounts.clear();
     }
 
     /// Build CreateAccount operations for a range of accounts.
@@ -1339,14 +1371,40 @@ impl LoadGenerator {
     /// assignment of deployed contract instances to accounts.
     ///
     /// Matches stellar-core `LoadGenerator::start()`.
+    /// Reset all per-run account state before starting a new load run.
+    ///
+    /// Parity port of stellar-core `LoadGenerator::reset()`
+    /// (`src/simulation/LoadGenerator.cpp`): clears the available/in-use account
+    /// pools, the invoke contract-instance map, and — via `TxGenerator::reset()`
+    /// — the per-account sequence-number cache.
+    ///
+    /// Clearing the seq cache between runs is required for parity. A single
+    /// `LoadGenerator` instance is reused across every `/generateload` run (it
+    /// holds the Soroban deploy state across upgrade-setup → create_upgrade), so
+    /// without this reset the cache accumulates every prior run's accounts.
+    /// [`check_accounts_synced`] then keeps inspecting them, and any account
+    /// left with an expected seq ahead of the ledger (a tx dropped on queue
+    /// overflow under heavy load) makes a later run — even create_upgrade with a
+    /// single tx — time out in `wait_till_complete` despite its own accounts
+    /// being fully applied.
+    ///
+    /// Soroban deploy state (`code_key` / `contract_instance_keys`) is
+    /// intentionally NOT cleared here so the create_upgrade run can consume the
+    /// contract deployed by the preceding upgrade-setup run; setup modes clear
+    /// it separately via [`reset_soroban_state`](Self::reset_soroban_state).
+    pub fn reset(&mut self) {
+        self.accounts_available.clear();
+        self.accounts_in_use.clear();
+        self.contract_instances.clear();
+        self.tx_generator.reset();
+    }
+
     fn start(&mut self, config: &mut GeneratedLoadConfig) {
         self.start_time = Some(Instant::now());
         self.total_submitted = 0;
         self.last_second = 0;
         self.failed = false;
-        self.accounts_available.clear();
-        self.accounts_in_use.clear();
-        self.contract_instances.clear();
+        self.reset();
 
         // Overlay-only gate (LoadGenerator.cpp:293): SOROBAN_INVOKE_APPLY_LOAD
         // may only run in overlay-only mode. stellar-core resets + throws; we
@@ -2875,6 +2933,58 @@ mod tests {
             &instances,
             |_| true
         ));
+    }
+
+    /// Regression for the cross-run account-cache poisoning that made every
+    /// henyey loadgen run after the first time out `wait_till_complete`.
+    ///
+    /// A single `LoadGenerator` is reused across runs, so `TxGenerator::accounts`
+    /// accumulated every prior run's accounts. If any carried an expected
+    /// sequence number ahead of the ledger (e.g. a tx dropped on queue overflow
+    /// under heavy load), `check_accounts_synced` stayed false forever — a later
+    /// run (e.g. create_upgrade with a single tx) timed out even though its own
+    /// account was fully applied. stellar-core avoids this by calling
+    /// `mTxGenerator.reset()` in `LoadGenerator::reset()` before each run.
+    #[test]
+    fn test_account_cache_reset_clears_cross_run_poisoning() {
+        // Prior run's account: cached/expected seq 42, but only seq 10 ever
+        // applied on-ledger (later txs dropped) → permanently unsynced.
+        let mut prior = TestAccount::from_name("TestAccount-prior", 0);
+        prior.sequence_number = 42;
+        // Current run's account: cached seq 7, fully applied on-ledger.
+        let current = TestAccount::from_name("TestAccount-current", 7);
+
+        let prior_id = prior.account_id.clone();
+        let current_id = current.account_id.clone();
+        let ledger_seq = move |id: &AccountId| -> Option<i64> {
+            if *id == prior_id {
+                Some(10)
+            } else if *id == current_id {
+                Some(7)
+            } else {
+                None
+            }
+        };
+
+        // With the prior run's account still cached, the current run is NEVER
+        // reported synced — the poisoning that timed out wait_till_complete.
+        let mut accounts: BTreeMap<u64, TestAccount> = BTreeMap::new();
+        accounts.insert(0, prior);
+        accounts.insert(1, current.clone());
+        assert!(
+            !TxGenerator::accounts_synced_with(accounts.values(), &ledger_seq),
+            "a stale prior-run account must poison the synced check (pre-reset state)"
+        );
+
+        // reset() (parity with TxGenerator::reset()) drops every cached account.
+        // After it, only the current run's (applied) account is re-cached → the
+        // run is reported synced and wait_till_complete completes promptly.
+        accounts.clear();
+        accounts.insert(1, current);
+        assert!(
+            TxGenerator::accounts_synced_with(accounts.values(), &ledger_seq),
+            "after reset, only the current run's applied account remains → synced"
+        );
     }
 
     #[test]

@@ -7,7 +7,7 @@ use henyey_crypto::SecretKey;
 use henyey_herder::scp_verify::PostVerifyReason;
 use henyey_simulation::{
     poll_until, CrashScope, GeneratedLoadConfig, LoadGenerator, LoadStep, PollOutcome, Simulation,
-    SimulationMode, Topologies,
+    SimulationMode, TestAccount, Topologies,
 };
 use serial_test::serial;
 
@@ -772,6 +772,76 @@ async fn test_load_account_sequence_finds_root_account() {
     assert!(
         seq_final.is_some(),
         "load_account_sequence must find root account after several ledger closes (bug #2357)"
+    );
+
+    sim.stop_all_nodes().await.expect("stop nodes");
+}
+
+/// Regression: `LoadGenerator::reset()` must clear the per-account sequence
+/// cache between runs, matching stellar-core's `mTxGenerator.reset()`.
+///
+/// A single `LoadGenerator` is reused across every `/generateload` run. Without
+/// the reset the cache carries every prior run's accounts forever; any left
+/// with an expected seq ahead of the ledger (a tx dropped on queue overflow
+/// under heavy load) keeps `check_accounts_synced` false for all later runs, so
+/// each subsequent run times out in `wait_till_complete` even though its own
+/// accounts are fully applied — the henyey-majority slowdown.
+///
+/// FAILS on main: `LoadGenerator::reset()` does not exist and `start()` never
+/// clears the seq cache.
+#[tokio::test]
+#[serial]
+async fn test_loadgen_reset_clears_account_seq_cache() {
+    let mut sim = Simulation::with_network(
+        SimulationMode::OverLoopback,
+        "Test SDF Network ; September 2015",
+    );
+
+    let seed = Hash256::hash(b"LOADGEN_RESET_NODE");
+    let secret = SecretKey::from_seed(&seed.0);
+    let quorum_set = QuorumSetConfig {
+        threshold_percent: 100,
+        validators: vec![secret.public_key().to_strkey()],
+        inner_sets: Vec::new(),
+    };
+    sim.add_app_node("node0", secret, quorum_set);
+    sim.start_all_nodes().await;
+    wait_for_app_state(&sim, "node0", AppState::Validating, Duration::from_secs(10)).await;
+    let app = sim.app("node0").expect("running app node");
+
+    let mut lg = LoadGenerator::new(app, "Test SDF Network ; September 2015".to_string());
+
+    // Residue from a prior run: an account whose cached expected seq (999) is
+    // far ahead of anything on-ledger (it isn't even funded), exactly the
+    // dropped-tx residue that poisons check_accounts_synced.
+    let sk = SecretKey::from_seed(&Hash256::hash(b"LOADGEN_RESET_POISON").0);
+    let pk = sk.public_key();
+    let account_id = stellar_xdr::AccountId(stellar_xdr::PublicKey::PublicKeyTypeEd25519(
+        stellar_xdr::Uint256(*pk.as_bytes()),
+    ));
+    let poisoned = TestAccount {
+        secret_key: sk,
+        account_id,
+        sequence_number: 999,
+    };
+    lg.tx_generator_mut().accounts_mut().insert(123, poisoned);
+
+    assert_eq!(lg.tx_generator().accounts().len(), 1);
+    assert!(
+        !lg.tx_generator().check_accounts_synced(),
+        "a stale, never-applied prior-run account must read as not-synced"
+    );
+
+    // reset() (called by start() before every run) must drop the cached account.
+    lg.reset();
+
+    assert!(
+        lg.tx_generator().accounts().is_empty(),
+        "reset() must clear the per-account seq cache (parity with mTxGenerator.reset())"
+    );
+    assert!(
+        lg.tx_generator().check_accounts_synced(),
+        "an empty seq cache is trivially synced, so a fresh run completes promptly"
     );
 
     sim.stop_all_nodes().await.expect("stop nodes");
