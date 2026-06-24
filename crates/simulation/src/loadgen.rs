@@ -62,7 +62,17 @@ const TX_SUBMIT_MAX_TRIES: u32 = 10;
 /// tooling driven by Supercluster, NOT validator consensus), so the SSC
 /// henyey-majority soroban loadgen is unblocked. No hashed/serialized/consensus
 /// output is touched.
-const QUEUE_FULL_MAX_TRIES: u32 = 100;
+///
+/// Sized for the SLOW soroban drain: soroban txns are capped at
+/// `ledgerMaxTxCount` (genesis = 1) per ledger, and a ledger closes ~every
+/// 5 s, so a backed-up soroban queue drains ~1 tx / 5 s. With `STEP_MSECS =
+/// 100 ms`, 100 tries (= 10 s ≈ 2 ledgers) was too small: the post-upgrade
+/// `soroban_upload` run (200 txns) wedged a tail tx at exactly 100 tries and
+/// failed the whole run at 195/200. 6000 tries (= 600 s of paced retry per tx)
+/// comfortably outlasts the per-ledger drain for these runs while still
+/// surfacing a genuinely wedged queue (bounded, not infinite). Supercluster's
+/// own `WaitForLoadGenComplete` timeout governs the overall run.
+const QUEUE_FULL_MAX_TRIES: u32 = 6000;
 
 /// Decision for how `submit_tx` should react to a single
 /// [`TxQueueResult`]. Factored out of `submit_tx`'s inner loop as a pure
@@ -104,6 +114,7 @@ fn classify_submit_result(
     queue_full_tries: u32,
     bad_seq_tries: u32,
     skip_low_fee_txs: bool,
+    queue_full_max_tries: u32,
     _mode: LoadGenMode,
 ) -> SubmitAction {
     match result {
@@ -125,7 +136,7 @@ fn classify_submit_result(
         // queue as a run failure. `TryAgainLater` only reaches here when
         // `skip_low_fee_txs` is false (the guard above wins otherwise).
         TxQueueResult::QueueFull | TxQueueResult::TryAgainLater => {
-            if queue_full_tries >= QUEUE_FULL_MAX_TRIES {
+            if queue_full_tries >= queue_full_max_tries {
                 SubmitAction::Fail
             } else {
                 SubmitAction::RetryQueueFull
@@ -422,6 +433,13 @@ pub struct GeneratedLoadConfig {
     pub max_fee_rate: Option<u32>,
     /// Whether to skip transactions rejected for low fee instead of failing.
     pub skip_low_fee_txs: bool,
+    /// Maximum number of paced retries on transient tx-queue backpressure
+    /// (`QueueFull`, and `TryAgainLater` without `skip_low_fee_txs`) before a
+    /// tx surfaces as a run failure. Defaults to [`QUEUE_FULL_MAX_TRIES`]
+    /// (6000), the production/SSC value sized for the slow soroban drain
+    /// (#3574). Tests that intentionally saturate the queue set this low so
+    /// the bounded retry completes in seconds instead of minutes (#3600).
+    pub queue_full_max_tries: u32,
     /// Spike interval in seconds (0 = no spikes). Every `spike_interval`
     /// seconds, an additional burst of `spike_size` transactions is injected.
     ///
@@ -483,6 +501,7 @@ impl Default for GeneratedLoadConfig {
             tx_rate: 10,
             max_fee_rate: None,
             skip_low_fee_txs: false,
+            queue_full_max_tries: QUEUE_FULL_MAX_TRIES,
             spike_interval: 0,
             spike_size: 0,
             n_instances: 0,
@@ -692,6 +711,26 @@ impl TxGenerator {
         false
     }
 
+    /// Return `true` when every cached account's on-ledger sequence number
+    /// matches its in-memory (expected) sequence number — i.e. all submitted
+    /// transactions have been applied.
+    ///
+    /// Matches stellar-core `LoadGenerator::checkAccountSynced()`
+    /// (`src/simulation/LoadGenerator.cpp`): the loadgen is only "complete" once
+    /// the accounts it submitted from are caught up on the ledger. Read-only —
+    /// it must NOT overwrite the in-memory expected sequence number (unlike
+    /// `load_account`). An account that cannot be loaded yet (None / Err) is
+    /// treated as not-yet-synced so the caller keeps waiting.
+    pub fn check_accounts_synced(&self) -> bool {
+        for account in self.accounts.values() {
+            match self.app.load_account_sequence(&account.account_id) {
+                Ok(Some(db_seq)) if db_seq == account.sequence_number => {}
+                _ => return false,
+            }
+        }
+        true
+    }
+
     /// Build CreateAccount operations for a range of accounts.
     ///
     /// Matches stellar-core `TxGenerator::createAccounts()`.
@@ -893,12 +932,14 @@ impl TxGenerator {
         account_id: u64,
         wasm_hash: &Hash256,
         salt: &Uint256,
+        contract_overhead_bytes: u32,
         max_fee_rate: Option<u32>,
     ) -> anyhow::Result<(u64, TransactionEnvelope)> {
         let fee = self.generate_fee(max_fee_rate, 1, account_id);
         let (sk, seq) = self.next_source_sequence(account_id, ledger_num);
         let builder = self.soroban_builder();
-        let envelope = builder.create_contract_tx(&sk, seq, wasm_hash, salt, fee)?;
+        let envelope =
+            builder.create_contract_tx(&sk, seq, wasm_hash, salt, contract_overhead_bytes, fee)?;
         Ok((account_id, envelope))
     }
 
@@ -1434,6 +1475,29 @@ impl LoadGenerator {
                         "Setup phase 1 complete, transitioning to instance deployment"
                     );
                 } else {
+                    // Parity: stellar-core does not emit `loadgen.run.complete`
+                    // on submission — it runs `waitTillComplete` until every
+                    // submitted tx is APPLIED (accounts synced) and only then
+                    // reports the run done (LoadGenerator.cpp:704-708,1345).
+                    // This matters for downstream consumers that act on
+                    // completion: e.g. SSC arms the Soroban config-settings
+                    // upgrade (`/upgrades?configupgradesetkey`) immediately after
+                    // the create-upgrade loadgen completes; if we reported "done"
+                    // on submit, the `ConfigUpgradeSet` entry would not yet be in
+                    // a closed ledger and the arm would be rejected (#3596).
+                    self.wait_till_complete().await;
+                    // For create_upgrade, account-sync is necessary but not
+                    // sufficient: the TEMPORARY ConfigUpgradeSet ContractData
+                    // write can lag the source-account seq update in the
+                    // bucket-list snapshot, so SSC's arm (sent immediately
+                    // after completion) could miss it and reject the upgrade
+                    // (#3596 race). Additionally wait until the upgrade key is
+                    // actually RESOLVABLE via the same path the arm uses
+                    // (make_from_key + isValidForApply), so the arm always
+                    // succeeds.
+                    if config.mode == LoadGenMode::SorobanCreateUpgrade {
+                        self.wait_config_upgrade_resolvable(config).await;
+                    }
                     return LoadResult::Done {
                         submitted: self.total_submitted,
                     };
@@ -1487,6 +1551,77 @@ impl LoadGenerator {
             self.total_submitted += submitted_this_step;
 
             tokio::time::sleep(step_duration).await;
+        }
+    }
+
+    /// Wait until every submitted transaction has been applied (accounts
+    /// synced) before declaring the run complete.
+    ///
+    /// Parity: stellar-core `LoadGenerator::waitTillComplete()`
+    /// (`src/simulation/LoadGenerator.cpp:1345`) polls `checkAccountSynced`
+    /// each ledger until there are no inconsistencies (all txns applied),
+    /// timing out after `TIMEOUT_NUM_LEDGERS` (20). We poll ~once per second
+    /// and bound the wait by ledger advancement so a dropped/never-applied tx
+    /// can't hang the run forever.
+    async fn wait_till_complete(&mut self) {
+        const TIMEOUT_NUM_LEDGERS: u32 = 30;
+        let start_ledger = self.tx_generator.app.current_ledger_seq();
+        loop {
+            if self.tx_generator.check_accounts_synced() {
+                return;
+            }
+            let elapsed = self
+                .tx_generator
+                .app
+                .current_ledger_seq()
+                .saturating_sub(start_ledger);
+            if elapsed >= TIMEOUT_NUM_LEDGERS {
+                warn!(
+                    timeout_ledgers = TIMEOUT_NUM_LEDGERS,
+                    "loadgen wait-till-complete timed out; some submitted txns \
+                     were not applied (likely dropped before inclusion)"
+                );
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(1000)).await;
+        }
+    }
+
+    /// Wait until the `create_upgrade` ConfigUpgradeSet entry is resolvable by
+    /// the arm/nomination path (`make_from_key` + `isValidForApply`), so SSC's
+    /// `/upgrades?configupgradesetkey` arm — sent immediately after the run
+    /// completes — always finds a VALID entry. The TEMPORARY ContractData
+    /// write can lag the source-account seq in the bucket-list snapshot, so
+    /// `check_accounts_synced` returning true does not guarantee the entry is
+    /// queryable yet. Bounded by the same ledger budget as `wait_till_complete`.
+    async fn wait_config_upgrade_resolvable(&mut self, config: &GeneratedLoadConfig) {
+        const TIMEOUT_NUM_LEDGERS: u32 = 30;
+        let key = match self.get_config_upgrade_set_key(&config.soroban_upgrade_config) {
+            Ok(k) => k,
+            Err(e) => {
+                warn!(error = %e, "create_upgrade: cannot compute ConfigUpgradeSetKey to await");
+                return;
+            }
+        };
+        let start_ledger = self.tx_generator.app.current_ledger_seq();
+        loop {
+            if let Ok(true) = self.tx_generator.app.validate_config_upgrade_set_key(&key) {
+                return;
+            }
+            let elapsed = self
+                .tx_generator
+                .app
+                .current_ledger_seq()
+                .saturating_sub(start_ledger);
+            if elapsed >= TIMEOUT_NUM_LEDGERS {
+                warn!(
+                    timeout_ledgers = TIMEOUT_NUM_LEDGERS,
+                    "create_upgrade: ConfigUpgradeSet entry not resolvable before timeout; \
+                     arm may be rejected"
+                );
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
         }
     }
 
@@ -1656,6 +1791,7 @@ impl LoadGenerator {
                 queue_full_tries,
                 num_tries,
                 config.skip_low_fee_txs,
+                config.queue_full_max_tries,
                 config.mode,
             ) {
                 SubmitAction::Accept => return true,
@@ -1741,9 +1877,27 @@ impl LoadGenerator {
             // SorobanInvokeSetup (it differs only in source account + single
             // instance, both configured in start()).
             LoadGenMode::SorobanInvokeSetup | LoadGenMode::SorobanUpgradeSetup => {
+                // Parity: stellar-core uploads the loadgen contract for the
+                // invoke-setup path but the `write_bytes` contract for the
+                // upgrade-setup path (`LoadGenerator.cpp:1184`). The upgrade flow
+                // invokes `write(bytes)` to store the `ConfigUpgradeSet` entry,
+                // which only the `write_bytes` contract exports — uploading the
+                // loadgen contract (only `do_cpu_only_work`) makes the
+                // create_upgrade invoke fail at apply, so the entry is never
+                // written and the upgrade never arms.
+                let (wasm, wasm_hash) = if config.mode.mode_sets_up_invoke() {
+                    (
+                        SorobanTxBuilder::loadgen_wasm(),
+                        SorobanTxBuilder::loadgen_wasm_hash(),
+                    )
+                } else {
+                    (
+                        SorobanTxBuilder::write_upgrade_bytes_wasm(),
+                        SorobanTxBuilder::write_upgrade_bytes_wasm_hash(),
+                    )
+                };
                 if config.n_wasms > 0 {
-                    // Phase 1: Upload the loadgen WASM
-                    let wasm = SorobanTxBuilder::loadgen_wasm();
+                    // Phase 1: Upload the setup WASM
                     let result = self.tx_generator.create_upload_wasm_transaction(
                         ledger_num,
                         source_account_id,
@@ -1751,7 +1905,6 @@ impl LoadGenerator {
                         config.max_fee_rate,
                     );
                     if result.is_ok() {
-                        let wasm_hash = SorobanTxBuilder::loadgen_wasm_hash();
                         self.code_key = Some(contract_code_key(&wasm_hash));
                         self.contract_overhead_bytes = wasm.len() as u64 + 160;
                         config.n_wasms = config.n_wasms.saturating_sub(1);
@@ -1759,18 +1912,22 @@ impl LoadGenerator {
                     result
                 } else {
                     // Phase 2: Deploy a contract instance
-                    let wasm_hash = SorobanTxBuilder::loadgen_wasm_hash();
                     let salt = Uint256(
                         Hash256::hash(
                             &deterministic_rand(source_account_id, ledger_num).to_le_bytes(),
                         )
                         .0,
                     );
+                    // Parity: stellar-core passes `mContactOverheadBytes`
+                    // (= uploaded WASM size + 160, set in phase 1) as the
+                    // deploy tx's `diskReadBytes` (LoadGenerator.cpp:1198,1214).
+                    let contract_overhead_bytes = self.contract_overhead_bytes as u32;
                     let result = self.tx_generator.create_contract_transaction(
                         ledger_num,
                         source_account_id,
                         &wasm_hash,
                         &salt,
+                        contract_overhead_bytes,
                         config.max_fee_rate,
                     );
                     if result.is_ok() {
@@ -2681,6 +2838,7 @@ mod tests {
                 /* queue_full_tries */ 0,
                 /* bad_seq_tries */ 0,
                 /* skip_low_fee_txs */ false,
+                /* queue_full_max_tries */ QUEUE_FULL_MAX_TRIES,
                 LoadGenMode::SorobanInvokeSetup,
             ),
             SubmitAction::RetryQueueFull,
@@ -2692,6 +2850,7 @@ mod tests {
                 /* queue_full_tries */ 3,
                 /* bad_seq_tries */ 0,
                 /* skip_low_fee_txs */ false,
+                /* queue_full_max_tries */ QUEUE_FULL_MAX_TRIES,
                 LoadGenMode::SorobanInvokeSetup,
             ),
             SubmitAction::Accept,
@@ -2709,6 +2868,7 @@ mod tests {
                 QUEUE_FULL_MAX_TRIES - 1,
                 0,
                 false,
+                QUEUE_FULL_MAX_TRIES,
                 LoadGenMode::SorobanInvokeSetup,
             ),
             SubmitAction::RetryQueueFull,
@@ -2720,6 +2880,7 @@ mod tests {
                 QUEUE_FULL_MAX_TRIES,
                 0,
                 false,
+                QUEUE_FULL_MAX_TRIES,
                 LoadGenMode::SorobanInvokeSetup,
             ),
             SubmitAction::Fail,
@@ -2738,18 +2899,33 @@ mod tests {
                 0,
                 0,
                 false,
+                QUEUE_FULL_MAX_TRIES,
                 LoadGenMode::SorobanInvokeSetup,
             ),
             SubmitAction::RetryQueueFull,
         );
         // skip_low_fee_txs == true → existing skip behavior preserved.
         assert_eq!(
-            classify_submit_result(TxQueueResult::TryAgainLater, 0, 0, true, LoadGenMode::Pay,),
+            classify_submit_result(
+                TxQueueResult::TryAgainLater,
+                0,
+                0,
+                true,
+                QUEUE_FULL_MAX_TRIES,
+                LoadGenMode::Pay,
+            ),
             SubmitAction::SkipLowFee,
         );
         // FeeTooLow with skip → skip (unchanged).
         assert_eq!(
-            classify_submit_result(TxQueueResult::FeeTooLow, 0, 0, true, LoadGenMode::Pay),
+            classify_submit_result(
+                TxQueueResult::FeeTooLow,
+                0,
+                0,
+                true,
+                QUEUE_FULL_MAX_TRIES,
+                LoadGenMode::Pay,
+            ),
             SubmitAction::SkipLowFee,
         );
     }
@@ -2765,6 +2941,7 @@ mod tests {
                 0,
                 0,
                 false,
+                QUEUE_FULL_MAX_TRIES,
                 LoadGenMode::Pay,
             ),
             SubmitAction::RetryBadSeq,
@@ -2776,13 +2953,21 @@ mod tests {
                 0,
                 TX_SUBMIT_MAX_TRIES,
                 false,
+                QUEUE_FULL_MAX_TRIES,
                 LoadGenMode::Pay,
             ),
             SubmitAction::Fail,
         );
         // Added → Accept regardless of counters.
         assert_eq!(
-            classify_submit_result(TxQueueResult::Added, 5, 5, false, LoadGenMode::Pay),
+            classify_submit_result(
+                TxQueueResult::Added,
+                5,
+                5,
+                false,
+                QUEUE_FULL_MAX_TRIES,
+                LoadGenMode::Pay,
+            ),
             SubmitAction::Accept,
         );
     }

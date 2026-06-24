@@ -866,6 +866,31 @@ mod loadgen_runner {
                     instructions: request.apply_load_instructions.clone(),
                 },
                 overlay_only_mode: request.overlay_only_mode,
+                // create_upgrade: carry the ledgerMaxInstructions override
+                // (`ldgrmxinstrc`) into the upgrade-set builder so the SSC
+                // UpgradeSorobanLedgerLimits mission produces a non-no-op set.
+                soroban_upgrade_config: henyey_ledger::config_upgrade::SorobanUpgradeConfig {
+                    ledger_max_instructions: request.ledger_max_instructions,
+                    ledger_max_read_bytes: request.ledger_max_read_bytes,
+                    ledger_max_write_bytes: request.ledger_max_write_bytes,
+                    ledger_max_read_ledger_entries: request.ledger_max_read_ledger_entries,
+                    ledger_max_write_ledger_entries: request.ledger_max_write_ledger_entries,
+                    ledger_max_tx_count: request.ledger_max_tx_count,
+                    ledger_max_transactions_size_bytes: request.ledger_max_transactions_size_bytes,
+                    tx_max_instructions: request.tx_max_instructions,
+                    tx_memory_limit: request.tx_memory_limit,
+                    tx_max_read_bytes: request.tx_max_read_bytes,
+                    tx_max_write_bytes: request.tx_max_write_bytes,
+                    tx_max_read_ledger_entries: request.tx_max_read_ledger_entries,
+                    tx_max_write_ledger_entries: request.tx_max_write_ledger_entries,
+                    tx_max_size_bytes: request.tx_max_size_bytes,
+                    tx_max_contract_events_size_bytes: request.tx_max_contract_events_size_bytes,
+                    max_contract_size_bytes: request.max_contract_size_bytes,
+                    max_contract_data_key_size_bytes: request.max_contract_data_key_size_bytes,
+                    max_contract_data_entry_size_bytes: request.max_contract_data_entry_size_bytes,
+                    tx_max_footprint_entries: request.tx_max_footprint_entries,
+                    ..Default::default()
+                },
                 ..Default::default()
             };
 

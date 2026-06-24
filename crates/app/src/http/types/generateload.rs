@@ -62,6 +62,55 @@ pub struct GenerateLoadParams {
     #[serde(default)]
     pub preloadedtransactionsfile: Option<String>,
 
+    /// `create_upgrade` override for `ledgerMaxInstructions` in the
+    /// `CONFIG_SETTING_CONTRACT_COMPUTE_V0` upgrade entry (supercluster sends
+    /// this as `ldgrmxinstrc`). Without it the create_upgrade set is a no-op
+    /// and the Soroban config upgrade is never proposed. Mirrors stellar-core
+    /// `LoadGenerator`'s `ldgrmxinstrc` parameter.
+    #[serde(default)]
+    pub ldgrmxinstrc: Option<i64>,
+
+    /// `create_upgrade` ledger-limit overrides for the SSC
+    /// `UpgradeSorobanLedgerLimits` mission (wire names match stellar-core).
+    #[serde(default)]
+    pub ldgrmxrdbyt: Option<u32>,
+    #[serde(default)]
+    pub ldgrmxwrbyt: Option<u32>,
+    #[serde(default)]
+    pub ldgrmxrdntry: Option<u32>,
+    #[serde(default)]
+    pub ldgrmxwrntry: Option<u32>,
+    #[serde(default)]
+    pub ldgrmxtxcnt: Option<u32>,
+    #[serde(default)]
+    pub ldgrmxtxsz: Option<u32>,
+
+    /// `create_upgrade` per-tx-limit overrides (UpgradeSorobanTxLimits).
+    #[serde(default)]
+    pub txmxinstrc: Option<i64>,
+    #[serde(default)]
+    pub txmemlim: Option<u32>,
+    #[serde(default)]
+    pub txmxrdbyt: Option<u32>,
+    #[serde(default)]
+    pub txmxwrbyt: Option<u32>,
+    #[serde(default)]
+    pub txmxrdntry: Option<u32>,
+    #[serde(default)]
+    pub txmxwrntry: Option<u32>,
+    #[serde(default)]
+    pub txmxsz: Option<u32>,
+    #[serde(default)]
+    pub txmxevntsz: Option<u32>,
+    #[serde(default)]
+    pub mxcntrctsz: Option<u32>,
+    #[serde(default)]
+    pub mxcntrctkeysz: Option<u32>,
+    #[serde(default)]
+    pub mxcntrctdatasz: Option<u32>,
+    #[serde(default)]
+    pub txmxftprnt: Option<u32>,
+
     // --- Apply-load (`soroban_invoke_apply_load`) params ---
     /// Whether the node is running in overlay-only mode (gate stand-in for
     /// stellar-core's `getRunInOverlayOnlyMode`).

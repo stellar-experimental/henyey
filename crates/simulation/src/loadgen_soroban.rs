@@ -27,6 +27,16 @@ use rand::Rng;
 /// for CPU and IO load generation.
 pub(crate) const LOADGEN_WASM: &[u8] = include_bytes!("../wasm/loadgen.wasm");
 
+/// The `write_bytes` test contract (soroban-test-wasms `WRITE_BYTES`), used by
+/// the config-upgrade setup. Its `write` function stores the passed bytes in a
+/// TEMPORARY `ContractData` entry keyed by `SCV_BYTES(sha256(bytes))` — exactly
+/// the `ConfigUpgradeSet` entry the create-upgrade flow then arms against.
+///
+/// Parity: stellar-core uploads `rust_bridge::get_write_bytes()` (not the
+/// loadgen contract) for the upgrade-setup path (`LoadGenerator.cpp:1184`).
+pub(crate) const WRITE_UPGRADE_BYTES_WASM: &[u8] =
+    include_bytes!("../wasm/soroban_write_upgrade_bytes_contract.wasm");
+
 // ---------------------------------------------------------------------------
 // Resource estimate constants for Soroban transaction building.
 // These are generous defaults matching stellar-core's `TxGenerator` estimates.
@@ -289,6 +299,7 @@ impl SorobanTxBuilder {
         sequence: i64,
         wasm_hash: &Hash256,
         salt: &Uint256,
+        contract_overhead_bytes: u32,
         inclusion_fee: u32,
     ) -> anyhow::Result<TransactionEnvelope> {
         let deployer_address = ScAddress::Account(stellar_xdr::AccountId(
@@ -340,7 +351,16 @@ impl SorobanTxBuilder {
                 read_write: vec![instance_key].try_into().unwrap_or_default(),
             },
             instructions: CREATE_CONTRACT_INSTRUCTIONS,
-            disk_read_bytes: CREATE_CONTRACT_READ_BYTES,
+            // Parity: stellar-core `createContractTransaction` sets
+            // `diskReadBytes = contractOverheadBytes` (TxGenerator.cpp:333),
+            // i.e. the uploaded WASM size + overhead (`mContactOverheadBytes =
+            // wasmBytes.size() + 160`, LoadGenerator.cpp:1198). The deploy reads
+            // the contract-code (WASM) entry, so the read budget must track the
+            // actual WASM size. A fixed over-estimate (the old hardcoded 5000)
+            // EXCEEDS the genesis Soroban `ledger_max_read_bytes` (3200), so the
+            // deploy tx can never fit a tx set's Soroban lane — silently wedging
+            // the root-account upgrade-setup sequence (deploy → create_upgrade).
+            disk_read_bytes: contract_overhead_bytes,
             write_bytes: CREATE_CONTRACT_WRITE_BYTES,
         };
 
@@ -887,6 +907,16 @@ impl SorobanTxBuilder {
     /// Compute the SHA-256 hash of the loadgen WASM.
     pub fn loadgen_wasm_hash() -> Hash256 {
         Hash256::hash(LOADGEN_WASM)
+    }
+
+    /// Get the embedded `write_bytes` upgrade-setup contract WASM bytes.
+    pub fn write_upgrade_bytes_wasm() -> &'static [u8] {
+        WRITE_UPGRADE_BYTES_WASM
+    }
+
+    /// Compute the SHA-256 hash of the `write_bytes` upgrade-setup WASM.
+    pub fn write_upgrade_bytes_wasm_hash() -> Hash256 {
+        Hash256::hash(WRITE_UPGRADE_BYTES_WASM)
     }
 
     /// Generate random WASM bytes of approximately the given size.
@@ -1816,5 +1846,145 @@ mod tests {
         if let LedgerKey::ContractData(inst_cd) = &instance_key {
             assert_eq!(rw_cd.contract, inst_cd.contract);
         }
+    }
+
+    /// Regression for the SSC mixed-image Soroban config-upgrade wedge (part 2).
+    ///
+    /// The create_upgrade tx invokes `write(bytes)` on the deployed contract to
+    /// store the `ConfigUpgradeSet` entry. That function only exists on the
+    /// `write_bytes` contract — the loadgen contract (`do_cpu_only_work`) does
+    /// NOT export it. stellar-core uploads `get_write_bytes()` (not the loadgen
+    /// contract) for the upgrade-setup path (`LoadGenerator.cpp:1184`). If the
+    /// wrong WASM is uploaded, the `write` invoke fails at apply, the entry is
+    /// never written, and the arm is rejected ("did not resolve to a VALID
+    /// upgrade set"). This pins that the upgrade-setup WASM exports `write` and
+    /// is distinct from the loadgen contract.
+    #[test]
+    fn test_upgrade_setup_wasm_exports_write_and_differs_from_loadgen() {
+        let upgrade_wasm = SorobanTxBuilder::write_upgrade_bytes_wasm();
+
+        assert!(
+            !upgrade_wasm.is_empty(),
+            "upgrade-setup WASM must be embedded"
+        );
+        assert_ne!(
+            SorobanTxBuilder::write_upgrade_bytes_wasm_hash(),
+            SorobanTxBuilder::loadgen_wasm_hash(),
+            "upgrade-setup must use a different contract than invoke-setup"
+        );
+
+        // Parse the WASM export section (id 7) and collect exported names; assert
+        // the create_upgrade-invoked function `write` is among them, and that the
+        // loadgen contract does NOT export it (it only does `do_cpu_only_work`).
+        let up = wasm_export_names(upgrade_wasm);
+        let lg = wasm_export_names(SorobanTxBuilder::loadgen_wasm());
+        assert!(
+            up.iter().any(|n| n == "write"),
+            "upgrade-setup WASM must export `write` (got exports {up:?})"
+        );
+        assert!(
+            !lg.iter().any(|n| n == "write"),
+            "loadgen contract must NOT export `write` (got exports {lg:?})"
+        );
+    }
+
+    /// Minimal WASM export-section parser: returns the names in the export
+    /// section (section id 7). Enough to assert which functions a contract
+    /// exports without pulling in a full wasm crate.
+    fn wasm_export_names(wasm: &[u8]) -> Vec<String> {
+        fn leb(data: &[u8], pos: &mut usize) -> u32 {
+            let mut result = 0u32;
+            let mut shift = 0;
+            loop {
+                let byte = data[*pos];
+                *pos += 1;
+                result |= ((byte & 0x7f) as u32) << shift;
+                if byte & 0x80 == 0 {
+                    break;
+                }
+                shift += 7;
+            }
+            result
+        }
+        let mut names = Vec::new();
+        // magic(4) + version(4)
+        let mut pos = 8usize;
+        while pos < wasm.len() {
+            let section_id = wasm[pos];
+            pos += 1;
+            let section_len = leb(wasm, &mut pos) as usize;
+            let section_end = pos + section_len;
+            if section_id == 7 {
+                let count = leb(wasm, &mut pos);
+                for _ in 0..count {
+                    let name_len = leb(wasm, &mut pos) as usize;
+                    let name = String::from_utf8_lossy(&wasm[pos..pos + name_len]).into_owned();
+                    pos += name_len;
+                    let _kind = wasm[pos];
+                    pos += 1;
+                    let _index = leb(wasm, &mut pos);
+                    names.push(name);
+                }
+                break;
+            }
+            pos = section_end;
+        }
+        names
+    }
+
+    /// Regression for the SSC mixed-image Soroban config-upgrade wedge.
+    ///
+    /// The deploy (`create_contract`) tx reads the uploaded contract-code (WASM)
+    /// entry, so stellar-core sets `diskReadBytes = contractOverheadBytes`
+    /// (`= wasmBytes.size() + 160`, TxGenerator.cpp:333 / LoadGenerator.cpp:1198).
+    /// henyey previously hardcoded `disk_read_bytes = 5000`, which EXCEEDS the
+    /// genesis Soroban `ledger_max_read_bytes` (3200): surge pricing relaxes only
+    /// the instruction lane (not read/write bytes), so `any_greater` permanently
+    /// excludes a 5000-read-byte tx from every tx set. The deploy tx could never
+    /// be included, which (by sequence order on the shared root account) wedged
+    /// the entire upgrade-setup chain (deploy → create_upgrade), so the config
+    /// upgrade never armed/applied and `LedgerMaxInstructions` stayed at 2.5M.
+    ///
+    /// This pins the deploy tx's `disk_read_bytes` to the passed overhead and
+    /// asserts it fits under the tiny genesis read-bytes limit. The old fixed
+    /// 5000 fails the `<= GENESIS_LEDGER_MAX_READ_BYTES` assertion.
+    #[test]
+    fn test_create_contract_disk_read_bytes_tracks_overhead_and_fits_genesis() {
+        let builder = SorobanTxBuilder::new("Test SDF Network ; September 2015".to_string());
+        let source = SecretKey::from_seed(&[9u8; 32]);
+
+        // Real loadgen WASM (1739 bytes) → overhead = wasm.len() + 160.
+        let wasm = SorobanTxBuilder::loadgen_wasm();
+        let wasm_hash = SorobanTxBuilder::loadgen_wasm_hash();
+        let overhead = wasm.len() as u32 + 160;
+        let salt = Uint256([3u8; 32]);
+
+        let env = builder
+            .create_contract_tx(&source, 100, &wasm_hash, &salt, overhead, 100)
+            .unwrap();
+
+        let TransactionEnvelope::Tx(v1) = &env else {
+            panic!("expected v1 envelope");
+        };
+        let TransactionExt::V1(data) = &v1.tx.ext else {
+            panic!("expected V1 soroban ext");
+        };
+
+        // diskReadBytes must equal contractOverheadBytes (parity).
+        assert_eq!(
+            data.resources.disk_read_bytes, overhead,
+            "deploy diskReadBytes must equal contractOverheadBytes (TxGenerator.cpp:333)"
+        );
+
+        // ... and must fit under the genesis Soroban ledger read-bytes limit, or
+        // the deploy tx can never be included in a tx set's Soroban lane.
+        const GENESIS_LEDGER_MAX_READ_BYTES: u32 = 3200;
+        assert!(
+            data.resources.disk_read_bytes <= GENESIS_LEDGER_MAX_READ_BYTES,
+            "deploy diskReadBytes {} exceeds genesis ledger_max_read_bytes {} — \
+             tx would be silently excluded from every tx set (the pre-fix bug used 5000)",
+            data.resources.disk_read_bytes,
+            GENESIS_LEDGER_MAX_READ_BYTES
+        );
     }
 }

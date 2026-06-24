@@ -163,6 +163,10 @@ impl ConfigUpgradeSetFrame {
 
         // Load the CONTRACT_DATA entry
         let Some(entry) = ltx.get_entry(&lk)? else {
+            debug!(
+                content_hash = format!("{:02x?}", &key.content_hash.0[..8]),
+                "ConfigUpgradeSet CONTRACT_DATA entry not found at computed key"
+            );
             return Ok(None);
         };
 
@@ -1030,6 +1034,14 @@ impl ConfigUpgradeSetFrame {
 /// path and is intentionally omitted.
 #[derive(Debug, Clone, Default)]
 pub struct SorobanUpgradeConfig {
+    /// Override for `ledgerMaxInstructions` in `CONFIG_SETTING_CONTRACT_COMPUTE_V0`.
+    /// When `Some`, the re-emitted ContractComputeV0 entry has its
+    /// `ledger_max_instructions` replaced with this value (the rest of the
+    /// entry is preserved). This is the field supercluster's
+    /// `UpgradeSorobanLedgerLimitsWithMultiplier` mission sets (`ldgrmxinstrc`),
+    /// so without it the create_upgrade set is a no-op and the upgrade is never
+    /// proposed. Mirrors stellar-core `SorobanUpgradeConfig::ledgerMaxInstructions`.
+    pub ledger_max_instructions: Option<i64>,
     /// Override for `CONFIG_SETTING_CONTRACT_COST_PARAMS_CPU_INSTRUCTIONS`.
     /// When `None`, the CPU cost-params entry is **not** included in the set
     /// (stellar-core sets `updated = false`).
@@ -1044,6 +1056,53 @@ pub struct SorobanUpgradeConfig {
     /// Delta for `CONFIG_SETTING_FREEZE_BYPASS_TXS_DELTA`. Appended **only**
     /// when `Some`.
     pub freeze_bypass_txs_delta: Option<stellar_xdr::FreezeBypassTxsDelta>,
+
+    // --- Ledger-wide limit overrides (the SSC `UpgradeSorobanLedgerLimits`
+    // mission sends these). Each, when `Some`, replaces the named field on the
+    // re-emitted entry; the rest of the entry is preserved. Parity:
+    // stellar-core `getConfigUpgradeSetFromLoadConfig`.
+    /// `ledgerMaxReadBytes` → `ContractLedgerCostV0.ledger_max_disk_read_bytes`.
+    pub ledger_max_read_bytes: Option<u32>,
+    /// `ledgerMaxWriteBytes` → `ContractLedgerCostV0.ledger_max_write_bytes`.
+    pub ledger_max_write_bytes: Option<u32>,
+    /// `ledgerMaxReadLedgerEntries` → `ContractLedgerCostV0.ledger_max_disk_read_entries`.
+    pub ledger_max_read_ledger_entries: Option<u32>,
+    /// `ledgerMaxWriteLedgerEntries` → `ContractLedgerCostV0.ledger_max_write_ledger_entries`.
+    pub ledger_max_write_ledger_entries: Option<u32>,
+    /// `ledgerMaxTxCount` → `ContractExecutionLanes.ledger_max_tx_count`.
+    pub ledger_max_tx_count: Option<u32>,
+    /// `ledgerMaxTransactionsSizeBytes` → `ContractBandwidthV0.ledger_max_txs_size_bytes`.
+    pub ledger_max_transactions_size_bytes: Option<u32>,
+
+    // --- Per-transaction limit overrides (the SSC `UpgradeSorobanTxLimits`
+    // mission sends these). Needed so large (e.g. 35 KB) soroban uploads fit
+    // the per-tx limits after the upgrade. Parity:
+    // stellar-core `getConfigUpgradeSetFromLoadConfig`.
+    /// `txMaxInstructions` → `ContractComputeV0.tx_max_instructions`.
+    pub tx_max_instructions: Option<i64>,
+    /// `txMemoryLimit` → `ContractComputeV0.tx_memory_limit`.
+    pub tx_memory_limit: Option<u32>,
+    /// `txMaxReadBytes` → `ContractLedgerCostV0.tx_max_disk_read_bytes`.
+    pub tx_max_read_bytes: Option<u32>,
+    /// `txMaxWriteBytes` → `ContractLedgerCostV0.tx_max_write_bytes`.
+    pub tx_max_write_bytes: Option<u32>,
+    /// `txMaxReadLedgerEntries` → `ContractLedgerCostV0.tx_max_disk_read_entries`.
+    pub tx_max_read_ledger_entries: Option<u32>,
+    /// `txMaxWriteLedgerEntries` → `ContractLedgerCostV0.tx_max_write_ledger_entries`.
+    pub tx_max_write_ledger_entries: Option<u32>,
+    /// `txMaxSizeBytes` → `ContractBandwidthV0.tx_max_size_bytes`.
+    pub tx_max_size_bytes: Option<u32>,
+    /// `txMaxContractEventsSizeBytes` → `ContractEventsV0.tx_max_contract_events_size_bytes`.
+    pub tx_max_contract_events_size_bytes: Option<u32>,
+    /// `maxContractSizeBytes` → `ContractMaxSizeBytes` (the entry value).
+    pub max_contract_size_bytes: Option<u32>,
+    /// `maxContractDataKeySizeBytes` → `ContractDataKeySizeBytes` (the entry value).
+    pub max_contract_data_key_size_bytes: Option<u32>,
+    /// `maxContractDataEntrySizeBytes` → `ContractDataEntrySizeBytes` (the entry value).
+    pub max_contract_data_entry_size_bytes: Option<u32>,
+    /// `txMaxFootprintSize` → `ContractLedgerCostExtV0.tx_max_footprint_entries`
+    /// (conditionally-absent setting; applied only when the live entry exists).
+    pub tx_max_footprint_entries: Option<u32>,
 }
 
 /// Build the serialized `ConfigUpgradeSet` bytes for the `create_upgrade`
@@ -1121,6 +1180,117 @@ pub fn build_config_upgrade_set(
 
         // Cost-params settings are only emitted when an override is supplied.
         let updated = match id {
+            ConfigSettingId::ContractComputeV0 => {
+                // Apply the ledger_max_instructions override (the SSC
+                // UpgradeSorobanLedgerLimits mission's `ldgrmxinstrc`) onto the
+                // re-emitted entry. Parity: stellar-core
+                // getConfigUpgradeSetFromLoadConfig applies
+                // `upgradeCfg.ledgerMaxInstructions` (TxGenerator.cpp).
+                if let ConfigSettingEntry::ContractComputeV0(ref mut c) = entry {
+                    if let Some(v) = cfg.ledger_max_instructions {
+                        c.ledger_max_instructions = v;
+                    }
+                    if let Some(v) = cfg.tx_max_instructions {
+                        c.tx_max_instructions = v;
+                    }
+                    if let Some(v) = cfg.tx_memory_limit {
+                        c.tx_memory_limit = v;
+                    }
+                }
+                true
+            }
+            ConfigSettingId::ContractLedgerCostV0 => {
+                // ledger-wide read/write byte + entry-count overrides
+                // (UpgradeSorobanLedgerLimits: ldgrmxrdbyt/ldgrmxwrbyt/
+                // ldgrmxrdntry/ldgrmxwrntry).
+                if let ConfigSettingEntry::ContractLedgerCostV0(ref mut c) = entry {
+                    if let Some(v) = cfg.ledger_max_read_bytes {
+                        c.ledger_max_disk_read_bytes = v;
+                    }
+                    if let Some(v) = cfg.ledger_max_write_bytes {
+                        c.ledger_max_write_bytes = v;
+                    }
+                    if let Some(v) = cfg.ledger_max_read_ledger_entries {
+                        c.ledger_max_disk_read_entries = v;
+                    }
+                    if let Some(v) = cfg.ledger_max_write_ledger_entries {
+                        c.ledger_max_write_ledger_entries = v;
+                    }
+                    // Per-tx overrides (UpgradeSorobanTxLimits).
+                    if let Some(v) = cfg.tx_max_read_bytes {
+                        c.tx_max_disk_read_bytes = v;
+                    }
+                    if let Some(v) = cfg.tx_max_write_bytes {
+                        c.tx_max_write_bytes = v;
+                    }
+                    if let Some(v) = cfg.tx_max_read_ledger_entries {
+                        c.tx_max_disk_read_entries = v;
+                    }
+                    if let Some(v) = cfg.tx_max_write_ledger_entries {
+                        c.tx_max_write_ledger_entries = v;
+                    }
+                }
+                true
+            }
+            ConfigSettingId::ContractExecutionLanes => {
+                // ledger_max_tx_count override (UpgradeSorobanLedgerLimits:
+                // ldgrmxtxcnt).
+                if let Some(v) = cfg.ledger_max_tx_count {
+                    if let ConfigSettingEntry::ContractExecutionLanes(ref mut l) = entry {
+                        l.ledger_max_tx_count = v;
+                    }
+                }
+                true
+            }
+            ConfigSettingId::ContractBandwidthV0 => {
+                // ledger_max_txs_size_bytes override (UpgradeSorobanLedgerLimits:
+                // ldgrmxtxsz).
+                if let ConfigSettingEntry::ContractBandwidthV0(ref mut b) = entry {
+                    if let Some(v) = cfg.ledger_max_transactions_size_bytes {
+                        b.ledger_max_txs_size_bytes = v;
+                    }
+                    if let Some(v) = cfg.tx_max_size_bytes {
+                        b.tx_max_size_bytes = v;
+                    }
+                }
+                true
+            }
+            ConfigSettingId::ContractEventsV0 => {
+                if let Some(v) = cfg.tx_max_contract_events_size_bytes {
+                    if let ConfigSettingEntry::ContractEventsV0(ref mut e) = entry {
+                        e.tx_max_contract_events_size_bytes = v;
+                    }
+                }
+                true
+            }
+            ConfigSettingId::ContractMaxSizeBytes => {
+                if let Some(v) = cfg.max_contract_size_bytes {
+                    entry = ConfigSettingEntry::ContractMaxSizeBytes(v);
+                }
+                true
+            }
+            ConfigSettingId::ContractDataKeySizeBytes => {
+                if let Some(v) = cfg.max_contract_data_key_size_bytes {
+                    entry = ConfigSettingEntry::ContractDataKeySizeBytes(v);
+                }
+                true
+            }
+            ConfigSettingId::ContractDataEntrySizeBytes => {
+                if let Some(v) = cfg.max_contract_data_entry_size_bytes {
+                    entry = ConfigSettingEntry::ContractDataEntrySizeBytes(v);
+                }
+                true
+            }
+            ConfigSettingId::ContractLedgerCostExtV0 => {
+                // Conditionally-absent: only reached when the live entry exists
+                // (skipped above otherwise). Apply the footprint-size override.
+                if let Some(v) = cfg.tx_max_footprint_entries {
+                    if let ConfigSettingEntry::ContractLedgerCostExtV0(ref mut ext) = entry {
+                        ext.tx_max_footprint_entries = v;
+                    }
+                }
+                true
+            }
             ConfigSettingId::ContractCostParamsCpuInstructions => {
                 if let Some(params) = &cfg.cpu_cost_params {
                     entry = ConfigSettingEntry::ContractCostParamsCpuInstructions(params.clone());
@@ -2382,6 +2552,96 @@ mod tests {
         );
     }
 
+    /// Regression for the SSC `UpgradeSorobanLedgerLimits` wedge: the mission
+    /// sends `ldgrmxinstrc` (ledgerMaxInstructions). Without applying it, the
+    /// upgrade set re-emits the *current* ContractComputeV0 unchanged → the
+    /// upgrade is a no-op → `upgrade_needed` is false → `LedgerUpgrade::Config`
+    /// is never proposed and `max_instructions` stays at genesis (the mission
+    /// hangs at `Waiting for LedgerMaxInstructions=250000000`). Assert the
+    /// override lands on the re-emitted entry and changes the serialized bytes.
+    #[test]
+    fn test_build_config_upgrade_set_applies_ledger_max_instructions_override() {
+        let find_compute = |bytes: &[u8]| -> i64 {
+            let set = ConfigUpgradeSet::from_xdr(bytes, Limits::none()).unwrap();
+            set.updated_entry
+                .iter()
+                .find_map(|e| match e {
+                    ConfigSettingEntry::ContractComputeV0(c) => Some(c.ledger_max_instructions),
+                    _ => None,
+                })
+                .expect("ContractComputeV0 must be present in the upgrade set")
+        };
+
+        let cfg = SorobanUpgradeConfig {
+            ledger_max_instructions: Some(250_000_000),
+            ..Default::default()
+        };
+        let bytes = build_config_upgrade_set(&cfg, fixture_load_entry).unwrap();
+        assert_eq!(
+            find_compute(&bytes),
+            250_000_000,
+            "ledger_max_instructions override must be applied to ContractComputeV0"
+        );
+
+        // Empty config re-emits the fixture default (0) — and the override must
+        // change the serialized bytes (hence the content hash supercluster arms).
+        let empty =
+            build_config_upgrade_set(&SorobanUpgradeConfig::default(), fixture_load_entry).unwrap();
+        assert_eq!(
+            find_compute(&empty),
+            0,
+            "default fixture value is re-emitted"
+        );
+        assert_ne!(
+            bytes, empty,
+            "the override must change the serialized ConfigUpgradeSet bytes"
+        );
+    }
+
+    /// The `UpgradeSorobanLedgerLimits` mission sends SEVEN ledger-wide limit
+    /// overrides (×multiplier), not just instructions. Assert each lands on the
+    /// correct re-emitted config-setting entry; without these, the post-upgrade
+    /// soroban_upload load is surge-excluded (write/read bytes still at genesis).
+    #[test]
+    fn test_build_config_upgrade_set_applies_all_ledger_limit_overrides() {
+        let cfg = SorobanUpgradeConfig {
+            ledger_max_instructions: Some(250_000_000),
+            ledger_max_read_bytes: Some(320_000),
+            ledger_max_write_bytes: Some(320_000),
+            ledger_max_read_ledger_entries: Some(300),
+            ledger_max_write_ledger_entries: Some(200),
+            ledger_max_tx_count: Some(100),
+            ledger_max_transactions_size_bytes: Some(1_000_000),
+            ..Default::default()
+        };
+        let set = ConfigUpgradeSet::from_xdr(
+            &build_config_upgrade_set(&cfg, fixture_load_entry).unwrap(),
+            Limits::none(),
+        )
+        .unwrap();
+
+        for e in set.updated_entry.iter() {
+            match e {
+                ConfigSettingEntry::ContractComputeV0(c) => {
+                    assert_eq!(c.ledger_max_instructions, 250_000_000);
+                }
+                ConfigSettingEntry::ContractLedgerCostV0(c) => {
+                    assert_eq!(c.ledger_max_disk_read_bytes, 320_000);
+                    assert_eq!(c.ledger_max_write_bytes, 320_000);
+                    assert_eq!(c.ledger_max_disk_read_entries, 300);
+                    assert_eq!(c.ledger_max_write_ledger_entries, 200);
+                }
+                ConfigSettingEntry::ContractExecutionLanes(l) => {
+                    assert_eq!(l.ledger_max_tx_count, 100);
+                }
+                ConfigSettingEntry::ContractBandwidthV0(b) => {
+                    assert_eq!(b.ledger_max_txs_size_bytes, 1_000_000);
+                }
+                _ => {}
+            }
+        }
+    }
+
     /// Pin the exact content hash (sha256 of the serialized `ConfigUpgradeSet`)
     /// for the deterministic fixture. This is the load-bearing parity guard for
     /// `create_upgrade`: the `ConfigUpgradeSetKey.contentHash` must match
@@ -2431,6 +2691,7 @@ mod tests {
             mem_cost_params: Some(Default::default()),
             frozen_ledger_keys_delta: Some(Default::default()),
             freeze_bypass_txs_delta: Some(Default::default()),
+            ..Default::default()
         };
         let bytes = build_config_upgrade_set(&cfg, fixture_load_entry).unwrap();
         let set = ConfigUpgradeSet::from_xdr(&bytes, Limits::none()).unwrap();

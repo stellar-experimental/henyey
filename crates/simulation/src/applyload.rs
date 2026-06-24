@@ -792,11 +792,15 @@ impl ApplyLoad {
         // Deploy contract instance.
         let wasm_hash = Hash256::hash(wasm);
         let salt = Hash256::hash(b"Load contract");
+        // Parity: deploy tx `diskReadBytes = contractOverheadBytes`
+        // (= WASM size + 160, TxGenerator.cpp:333 / LoadGenerator.cpp:1198).
+        let contract_overhead_bytes = wasm.len() as u32 + 160;
         let (_, create_tx) = self.tx_gen.create_contract_transaction(
             self.app.ledger_manager().current_ledger_seq() + 1,
             self.root_account_id,
             &wasm_hash,
             &stellar_xdr::Uint256(salt.0),
+            contract_overhead_bytes,
             None,
         )?;
         self.close_ledger(vec![create_tx], Vec::new(), false)?;
