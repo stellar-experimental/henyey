@@ -14,7 +14,7 @@
 //! delta-based (`>=`) assertions to stay robust against other simulation tests
 //! sharing the same recorder.
 
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
@@ -219,18 +219,41 @@ async fn test_generate_load_increments_loadgen_meters() {
         offset: 0,
         n_txs: N_ACCOUNTS as u32,
         tx_rate: 100,
+        // Bound the transient-backpressure retry so a saturated queue can't
+        // wedge this test for the full production retry budget (6000 paced
+        // tries ≈ 10+ min). The production/SSC default stays at
+        // QUEUE_FULL_MAX_TRIES; here a tiny cap keeps the run to seconds while
+        // still exercising the same Pay-mode submit path and meters (#3600).
+        queue_full_max_tries: 5,
         ..Default::default()
     };
 
     let stop = AtomicBool::new(false);
     let sim_for_close = &sim;
+    // Keep closing ledgers until the run signals completion via `run_done`.
+    // `generate_load` no longer returns on submission — it calls
+    // `wait_till_complete`, which polls until the submitted accounts sync and
+    // is bounded ONLY by ledger advancement (#3601, commit 186ba676). So the
+    // closer must keep advancing ledgers for the whole run; if it stopped
+    // early (the old fixed `0..20` loop) the run could never sync and would
+    // hang forever waiting for closes that never come (#3600). A generous
+    // ceiling bounds the closer so a genuinely stuck run still terminates.
+    let run_done = AtomicBool::new(false);
+    let run_done_ref = &run_done;
     let closer = async {
-        for _ in 0..20 {
+        for _ in 0..400 {
+            if run_done_ref.load(Ordering::Relaxed) {
+                break;
+            }
             tokio::time::sleep(Duration::from_millis(150)).await;
             let _ = sim_for_close.manual_close_app_node("node0").await;
         }
     };
-    let run = generator.generate_load(&mut config, &stop);
+    let run = async {
+        let r = generator.generate_load(&mut config, &stop).await;
+        run_done_ref.store(true, Ordering::Relaxed);
+        r
+    };
 
     let (result, _) = tokio::join!(run, closer);
 

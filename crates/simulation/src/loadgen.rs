@@ -114,6 +114,7 @@ fn classify_submit_result(
     queue_full_tries: u32,
     bad_seq_tries: u32,
     skip_low_fee_txs: bool,
+    queue_full_max_tries: u32,
     _mode: LoadGenMode,
 ) -> SubmitAction {
     match result {
@@ -135,7 +136,7 @@ fn classify_submit_result(
         // queue as a run failure. `TryAgainLater` only reaches here when
         // `skip_low_fee_txs` is false (the guard above wins otherwise).
         TxQueueResult::QueueFull | TxQueueResult::TryAgainLater => {
-            if queue_full_tries >= QUEUE_FULL_MAX_TRIES {
+            if queue_full_tries >= queue_full_max_tries {
                 SubmitAction::Fail
             } else {
                 SubmitAction::RetryQueueFull
@@ -432,6 +433,13 @@ pub struct GeneratedLoadConfig {
     pub max_fee_rate: Option<u32>,
     /// Whether to skip transactions rejected for low fee instead of failing.
     pub skip_low_fee_txs: bool,
+    /// Maximum number of paced retries on transient tx-queue backpressure
+    /// (`QueueFull`, and `TryAgainLater` without `skip_low_fee_txs`) before a
+    /// tx surfaces as a run failure. Defaults to [`QUEUE_FULL_MAX_TRIES`]
+    /// (6000), the production/SSC value sized for the slow soroban drain
+    /// (#3574). Tests that intentionally saturate the queue set this low so
+    /// the bounded retry completes in seconds instead of minutes (#3600).
+    pub queue_full_max_tries: u32,
     /// Spike interval in seconds (0 = no spikes). Every `spike_interval`
     /// seconds, an additional burst of `spike_size` transactions is injected.
     ///
@@ -493,6 +501,7 @@ impl Default for GeneratedLoadConfig {
             tx_rate: 10,
             max_fee_rate: None,
             skip_low_fee_txs: false,
+            queue_full_max_tries: QUEUE_FULL_MAX_TRIES,
             spike_interval: 0,
             spike_size: 0,
             n_instances: 0,
@@ -1782,6 +1791,7 @@ impl LoadGenerator {
                 queue_full_tries,
                 num_tries,
                 config.skip_low_fee_txs,
+                config.queue_full_max_tries,
                 config.mode,
             ) {
                 SubmitAction::Accept => return true,
@@ -2828,6 +2838,7 @@ mod tests {
                 /* queue_full_tries */ 0,
                 /* bad_seq_tries */ 0,
                 /* skip_low_fee_txs */ false,
+                /* queue_full_max_tries */ QUEUE_FULL_MAX_TRIES,
                 LoadGenMode::SorobanInvokeSetup,
             ),
             SubmitAction::RetryQueueFull,
@@ -2839,6 +2850,7 @@ mod tests {
                 /* queue_full_tries */ 3,
                 /* bad_seq_tries */ 0,
                 /* skip_low_fee_txs */ false,
+                /* queue_full_max_tries */ QUEUE_FULL_MAX_TRIES,
                 LoadGenMode::SorobanInvokeSetup,
             ),
             SubmitAction::Accept,
@@ -2856,6 +2868,7 @@ mod tests {
                 QUEUE_FULL_MAX_TRIES - 1,
                 0,
                 false,
+                QUEUE_FULL_MAX_TRIES,
                 LoadGenMode::SorobanInvokeSetup,
             ),
             SubmitAction::RetryQueueFull,
@@ -2867,6 +2880,7 @@ mod tests {
                 QUEUE_FULL_MAX_TRIES,
                 0,
                 false,
+                QUEUE_FULL_MAX_TRIES,
                 LoadGenMode::SorobanInvokeSetup,
             ),
             SubmitAction::Fail,
@@ -2885,18 +2899,33 @@ mod tests {
                 0,
                 0,
                 false,
+                QUEUE_FULL_MAX_TRIES,
                 LoadGenMode::SorobanInvokeSetup,
             ),
             SubmitAction::RetryQueueFull,
         );
         // skip_low_fee_txs == true → existing skip behavior preserved.
         assert_eq!(
-            classify_submit_result(TxQueueResult::TryAgainLater, 0, 0, true, LoadGenMode::Pay,),
+            classify_submit_result(
+                TxQueueResult::TryAgainLater,
+                0,
+                0,
+                true,
+                QUEUE_FULL_MAX_TRIES,
+                LoadGenMode::Pay,
+            ),
             SubmitAction::SkipLowFee,
         );
         // FeeTooLow with skip → skip (unchanged).
         assert_eq!(
-            classify_submit_result(TxQueueResult::FeeTooLow, 0, 0, true, LoadGenMode::Pay),
+            classify_submit_result(
+                TxQueueResult::FeeTooLow,
+                0,
+                0,
+                true,
+                QUEUE_FULL_MAX_TRIES,
+                LoadGenMode::Pay,
+            ),
             SubmitAction::SkipLowFee,
         );
     }
@@ -2912,6 +2941,7 @@ mod tests {
                 0,
                 0,
                 false,
+                QUEUE_FULL_MAX_TRIES,
                 LoadGenMode::Pay,
             ),
             SubmitAction::RetryBadSeq,
@@ -2923,13 +2953,21 @@ mod tests {
                 0,
                 TX_SUBMIT_MAX_TRIES,
                 false,
+                QUEUE_FULL_MAX_TRIES,
                 LoadGenMode::Pay,
             ),
             SubmitAction::Fail,
         );
         // Added → Accept regardless of counters.
         assert_eq!(
-            classify_submit_result(TxQueueResult::Added, 5, 5, false, LoadGenMode::Pay),
+            classify_submit_result(
+                TxQueueResult::Added,
+                5,
+                5,
+                false,
+                QUEUE_FULL_MAX_TRIES,
+                LoadGenMode::Pay,
+            ),
             SubmitAction::Accept,
         );
     }
