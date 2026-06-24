@@ -721,6 +721,20 @@ pub struct TestingConfig {
     /// Maps to stellar-core's `RUN_STANDALONE`.
     #[serde(default)]
     pub run_standalone: bool,
+
+    /// WASM byte-size values sampled for `SorobanUpload` load (the random WASMs
+    /// uploaded by `soroban_random_wasm_transaction`). Maps to stellar-core's
+    /// `LOADGEN_WASM_BYTES_FOR_TESTING`; paired weights are
+    /// [`Self::loadgen_wasm_bytes_distribution`]. When empty, the loadgen falls
+    /// back to its built-in default size (parity with core's `DEFAULT_WASM_BYTES`).
+    #[serde(default)]
+    pub loadgen_wasm_bytes: Vec<u32>,
+
+    /// Sampling weights paired with [`Self::loadgen_wasm_bytes`]. Maps to
+    /// stellar-core's `LOADGEN_WASM_BYTES_DISTRIBUTION_FOR_TESTING`. When empty
+    /// or mismatched in length, the values are sampled uniformly.
+    #[serde(default)]
+    pub loadgen_wasm_bytes_distribution: Vec<u32>,
 }
 
 impl TestingConfig {
@@ -750,6 +764,8 @@ impl Default for TestingConfig {
             testing_upgrade_reserve: default_testing_upgrade_reserve(),
             testing_upgrade_max_tx_set_size: default_testing_upgrade_max_tx_set_size(),
             run_standalone: false,
+            loadgen_wasm_bytes: Vec::new(),
+            loadgen_wasm_bytes_distribution: Vec::new(),
         }
     }
 }
