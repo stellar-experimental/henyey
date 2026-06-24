@@ -899,21 +899,22 @@ impl Herder {
     /// and the transitive-quorum rebuild ONLY, and the live-envelope replay is
     /// deferred.
     ///
-    /// **Currently GATED OFF.** Re-injecting even a future-slot local envelope
-    /// pins henyey's SCP ballot machine in its restored phase (e.g.
-    /// `Externalize`) so the restored node emits nothing and cannot follow a
-    /// later network ballot for that slot — reproducing the consensus stall
-    /// that closed PR #2797. With replay enabled the simulation restart test
-    /// `test_core3_restart_rejoin_over_loopback` stalls in ~4 of 5 runs (node0
-    /// stuck `ballot_phase=Externalize, scp_sent=0` while peers stay in
-    /// `Prepare`); with replay gated off the same suite is deterministically
-    /// green. The plan's mechanical gate (≥5 green sim runs to ship live
-    /// replay) therefore selects the gated-off variant. Re-enabling is tracked
-    /// by the SCP ballot-supersession follow-up referenced in
-    /// `crates/herder/PARITY_STATUS.md`'s `[^restore-scp]` footnote; once SCP
-    /// can supersede a restored ballot from a later network EXTERNALIZE, flip
-    /// this to `true` and the existing replay path + tests re-activate.
-    const RESTORE_LIVE_ENVELOPE_REPLAY: bool = false;
+    /// **Enabled** (re-enabled for #3595). Replaying a restored future-slot
+    /// **Externalize** installs the ballot in `phase=Externalize` and records
+    /// the externalized value, but `set_state_from_envelope` (by parity with
+    /// core's `BallotProtocol::setStateFromEnvelope`) does NOT itself close the
+    /// ledger — and the matching network EXTERNALIZE is then accepted-but-silent
+    /// (value-match → `EnvelopeState::Valid` → herder `Duplicate`), so node0
+    /// would wedge at `phase=Externalize` with LCL stuck (the #2797 stall,
+    /// re-investigated under #3595). The faithful fix is NOT ballot
+    /// supersession: instead `restore_persisted_scp_state` drives the restored,
+    /// SCP-externalized next-to-close slot (`slot == lcl+1`) through the same
+    /// `complete_externalization` terminal the live path uses — the analog of
+    /// core's `processExternalized → mLedgerManager.valueExternalized`. With
+    /// that completion in place the simulation restart test
+    /// `test_core3_restart_rejoin_over_loopback` is green across ≥10 consecutive
+    /// runs. See `crates/herder/PARITY_STATUS.md`'s `[^restore-scp]` footnote.
+    const RESTORE_LIVE_ENVELOPE_REPLAY: bool = true;
 
     /// Restore persisted SCP state at startup. Hydrates the tx-sets and
     /// quorum-sets referenced by retained **future-slot** (`slot > lcl`) local
@@ -1060,12 +1061,10 @@ impl Herder {
         }
 
         // --- SCP envelope replay (parity: Slot::setStateFromEnvelope,
-        // Slot.cpp:61-88). Only future slots reach here. GATED: see
-        // `RESTORE_LIVE_ENVELOPE_REPLAY` — replaying a restored ballot stalls
-        // SCP (the PR #2797 regression), so this is deferred to the
-        // ballot-supersession follow-up. Dependency hydration above still runs
-        // so the node can immediately validate the future slot once it hears
-        // the corresponding live envelopes from peers. ---
+        // Slot.cpp:61-88). Only future slots reach here. Gated on
+        // `RESTORE_LIVE_ENVELOPE_REPLAY` (now enabled). Dependency hydration
+        // above runs unconditionally so the node can immediately validate the
+        // future slot. ---
         let mut replayed = 0usize;
         if Self::RESTORE_LIVE_ENVELOPE_REPLAY {
             for env in &future_envelopes {
@@ -1078,12 +1077,75 @@ impl Herder {
                     );
                 }
             }
+
+            // --- Drive the restored next-to-close externalized slot to the
+            // ledger-close terminal (parity: HerderImpl::restoreSCPState →
+            // processExternalized → mLedgerManager.valueExternalized,
+            // HerderImpl.cpp:2239/311-396). `set_state_from_envelope` installs a
+            // restored Externalize as `phase=Externalize` and records the
+            // externalized value in the ballot, but — exactly like core's
+            // `BallotProtocol::setStateFromEnvelope` — does NOT itself close the
+            // ledger. The subsequent network EXTERNALIZE for that slot is then
+            // accepted-but-silent (value-match → `EnvelopeState::Valid` → herder
+            // `Duplicate`), so without an explicit completion node0 wedges at
+            // `phase=Externalize` with LCL stuck (the #3595 restart-rejoin
+            // stall). Core escapes via its recovery/catchup machinery
+            // rediscovering the externalized slot; the 3-node restart-rejoin sim
+            // has no history archive, so we proactively drive the same terminal
+            // here.
+            //
+            // Mirror the EXACT live externalize sequence (the path
+            // `process_scp_envelope` takes when SCP newly externalizes a slot,
+            // see the `is_slot_externalized` block above): request the tx-set,
+            // `record_externalized` the value (so the app's
+            // `process_externalized_slots` / `out_of_sync_recovery` close
+            // pipeline can find it — `complete_externalization` alone only
+            // publishes `latest_externalized` and would otherwise leave the
+            // value unrecorded), `cleanup_externalized`, then
+            // `complete_externalization`.
+            //
+            // Iterate the DISTINCT restored slots (restore can install both a
+            // Nominate and an Externalize for the same slot — dedupe so the
+            // completion fires once per slot). Gate strictly on
+            // `slot == lcl + 1` (only the next-to-close slot applies
+            // immediately, matching core's "only next-to-close applies now"
+            // invariant — higher restored slots wait for their predecessor) AND
+            // `is_slot_externalized(slot)` (restored Prepare/Confirm slots are
+            // not externalized → no-op, so they are never force-closed).
+            let mut completed_slots: std::collections::BTreeSet<u64> =
+                std::collections::BTreeSet::new();
+            for env in &future_envelopes {
+                let slot = env.statement.slot_index;
+                if slot != lcl + 1 {
+                    continue;
+                }
+                if !completed_slots.insert(slot) {
+                    continue;
+                }
+                if !self.scp.is_slot_externalized(slot) {
+                    continue;
+                }
+                let Some(value) = self.scp.get_externalized_value(slot) else {
+                    continue;
+                };
+                debug!(
+                    slot,
+                    "restore: driving externalization for restored next-to-close externalized slot"
+                );
+                // Request the tx-set so the close pipeline can hydrate it.
+                if let Ok(sv) = StellarValue::from_xdr(&value.0, Limits::none()) {
+                    self.scp_driver.request_tx_set(sv.tx_set_hash.into(), slot);
+                }
+                self.scp_driver.record_externalized(slot, value, None);
+                self.scp_driver
+                    .cleanup_externalized(self.config.max_externalized_slots);
+                self.complete_externalization(slot);
+            }
         } else {
             debug!(
                 lcl,
                 deferred = future_envelopes.len(),
-                "restore: live-envelope replay gated off (PR #2797 stall guard); \
-                 hydrated dependencies only"
+                "restore: live-envelope replay gated off; hydrated dependencies only"
             );
         }
 
@@ -9919,6 +9981,226 @@ mod tests {
             quorum_set_hash,
             quorum_set,
         )
+    }
+
+    /// Build the StellarValue + its referenced deps for a restore test
+    /// envelope: returns `(value, tx_set_hash, stored_tx_set_bytes,
+    /// quorum_set_hash, quorum_set)`. Shared by the Externalize / Prepare
+    /// helpers below so they reference identical deps to the Nominate helper.
+    fn make_restore_value_with_deps(
+        herder: &Herder,
+        secret: &SecretKey,
+    ) -> (
+        Value,
+        stellar_xdr::Hash,
+        Vec<u8>,
+        stellar_xdr::Hash,
+        ScpQuorumSet,
+    ) {
+        use stellar_xdr::WriteXdr;
+
+        let lcl_hash = herder.scp_driver.current_header_hash();
+        let tx_set = TransactionSet::new(lcl_hash, Vec::new());
+        let tx_set_hash = stellar_xdr::Hash(tx_set.hash().0);
+        let stored_bytes = tx_set
+            .to_xdr_stored_set()
+            .to_xdr(Limits::none())
+            .expect("encode StoredTransactionSet");
+
+        let close_time = TimePoint(1);
+        let network_id = herder.scp_driver.network_id();
+        let mut sign_data = network_id.0.to_vec();
+        sign_data.extend_from_slice(&EnvelopeType::Scpvalue.to_xdr(Limits::none()).expect("xdr"));
+        sign_data.extend_from_slice(&tx_set_hash.to_xdr(Limits::none()).expect("xdr"));
+        sign_data.extend_from_slice(&close_time.to_xdr(Limits::none()).expect("xdr"));
+        let value_sig = secret.sign(&sign_data);
+
+        let value_node_id = XdrNodeId(stellar_xdr::PublicKey::PublicKeyTypeEd25519(
+            stellar_xdr::Uint256(*secret.public_key().as_bytes()),
+        ));
+        let stellar_value = StellarValue {
+            tx_set_hash: tx_set_hash.clone(),
+            close_time,
+            upgrades: vec![].try_into().unwrap(),
+            ext: StellarValueExt::Signed(LedgerCloseValueSignature {
+                node_id: value_node_id,
+                signature: stellar_xdr::Signature(
+                    value_sig.0.to_vec().try_into().unwrap_or_default(),
+                ),
+            }),
+        };
+        let value = Value(
+            stellar_value
+                .to_xdr(Limits::none())
+                .unwrap()
+                .try_into()
+                .unwrap(),
+        );
+
+        let quorum_set = herder
+            .scp_driver
+            .get_local_quorum_set()
+            .expect("validator herder must have a local quorum set");
+        let quorum_set_hash = stellar_xdr::Hash(henyey_scp::hash_quorum_set(&quorum_set).0);
+
+        (
+            value,
+            tx_set_hash,
+            stored_bytes,
+            quorum_set_hash,
+            quorum_set,
+        )
+    }
+
+    /// Construct a signed EXTERNALIZE envelope from `secret` for `slot`,
+    /// referencing a freshly built tx set + the local quorum set. Mirrors the
+    /// shape of `make_local_nominate_with_deps` but pledges Externalize, so a
+    /// replay via `set_state_from_envelope` pins the slot to `phase=Externalize`
+    /// and records the externalized value (`is_slot_externalized == true`).
+    fn make_local_externalize_with_deps(
+        herder: &Herder,
+        secret: &SecretKey,
+        slot: u64,
+    ) -> (
+        ScpEnvelope,
+        stellar_xdr::Hash,
+        Vec<u8>,
+        stellar_xdr::Hash,
+        ScpQuorumSet,
+    ) {
+        let (value, tx_set_hash, stored_bytes, quorum_set_hash, quorum_set) =
+            make_restore_value_with_deps(herder, secret);
+
+        let node_id = XdrNodeId(stellar_xdr::PublicKey::PublicKeyTypeEd25519(
+            stellar_xdr::Uint256(*secret.public_key().as_bytes()),
+        ));
+        let statement = ScpStatement {
+            node_id,
+            slot_index: slot,
+            pledges: ScpStatementPledges::Externalize(ScpStatementExternalize {
+                commit: ScpBallot { counter: 1, value },
+                n_h: 1,
+                commit_quorum_set_hash: quorum_set_hash.clone(),
+            }),
+        };
+
+        let envelope = sign_statement(&statement, herder, secret);
+        (
+            envelope,
+            tx_set_hash,
+            stored_bytes,
+            quorum_set_hash,
+            quorum_set,
+        )
+    }
+
+    /// Construct a signed PREPARE envelope from `secret` for `slot`. A restored
+    /// Prepare slot is NOT externalized, so the restore-completion path must
+    /// leave `latest_externalized` untouched.
+    fn make_local_prepare_with_deps(
+        herder: &Herder,
+        secret: &SecretKey,
+        slot: u64,
+    ) -> (
+        ScpEnvelope,
+        stellar_xdr::Hash,
+        Vec<u8>,
+        stellar_xdr::Hash,
+        ScpQuorumSet,
+    ) {
+        let (value, tx_set_hash, stored_bytes, quorum_set_hash, quorum_set) =
+            make_restore_value_with_deps(herder, secret);
+
+        let node_id = XdrNodeId(stellar_xdr::PublicKey::PublicKeyTypeEd25519(
+            stellar_xdr::Uint256(*secret.public_key().as_bytes()),
+        ));
+        let statement = ScpStatement {
+            node_id,
+            slot_index: slot,
+            pledges: ScpStatementPledges::Prepare(ScpStatementPrepare {
+                quorum_set_hash: quorum_set_hash.clone(),
+                ballot: ScpBallot { counter: 1, value },
+                prepared: None,
+                prepared_prime: None,
+                n_c: 0,
+                n_h: 0,
+            }),
+        };
+
+        let envelope = sign_statement(&statement, herder, secret);
+        (
+            envelope,
+            tx_set_hash,
+            stored_bytes,
+            quorum_set_hash,
+            quorum_set,
+        )
+    }
+
+    #[test]
+    fn test_restore_externalized_next_slot_drives_ledger_close() {
+        // Positive: a restored `lcl+1` EXTERNALIZE envelope must drive
+        // `complete_externalization`, so `latest_externalized_slot()` advances
+        // to `lcl+1`. On `origin/main` (before the restore-completion fix) the
+        // restore installs the Externalize ballot but never calls
+        // `complete_externalization`, so `latest_externalized_slot()` stays
+        // `None` and node0 wedges (the #3595 restart-rejoin stall).
+        let lcl = 100u64;
+        let (herder, secret) = make_restore_validator_herder();
+        let manager = Arc::new(crate::persistence::ScpPersistenceManager::in_memory());
+        assert!(herder.set_scp_persistence(Arc::clone(&manager)).is_ok());
+
+        let (env, tx_hash, tx_bytes, qs_hash, qs) =
+            make_local_externalize_with_deps(&herder, &secret, lcl + 1);
+        manager
+            .persist_scp_state(lcl + 1, &[env], &[(tx_hash, tx_bytes)], &[(qs_hash, qs)])
+            .expect("persist");
+
+        herder.bootstrap(lcl as u32);
+        herder.restore_persisted_scp_state(lcl);
+
+        // The restored Externalize for the next-to-close slot must reach the
+        // ledger-close terminal: SCP reports the slot externalized, and the
+        // restore hook drives `complete_externalization`, publishing it.
+        assert!(
+            herder.scp.is_slot_externalized(lcl + 1),
+            "restored Externalize must mark slot lcl+1 externalized in SCP"
+        );
+        assert_eq!(
+            herder.latest_externalized_slot(),
+            Some(lcl + 1),
+            "restore must drive complete_externalization for the externalized lcl+1 slot"
+        );
+    }
+
+    #[test]
+    fn test_restore_prepare_next_slot_does_not_publish_externalized() {
+        // Negative: a restored `lcl+1` PREPARE (not externalized) must NOT
+        // publish `latest_externalized` — guards the `is_slot_externalized`
+        // condition so we never force-close a slot that hasn't externalized.
+        let lcl = 100u64;
+        let (herder, secret) = make_restore_validator_herder();
+        let manager = Arc::new(crate::persistence::ScpPersistenceManager::in_memory());
+        assert!(herder.set_scp_persistence(Arc::clone(&manager)).is_ok());
+
+        let (env, tx_hash, tx_bytes, qs_hash, qs) =
+            make_local_prepare_with_deps(&herder, &secret, lcl + 1);
+        manager
+            .persist_scp_state(lcl + 1, &[env], &[(tx_hash, tx_bytes)], &[(qs_hash, qs)])
+            .expect("persist");
+
+        herder.bootstrap(lcl as u32);
+        herder.restore_persisted_scp_state(lcl);
+
+        assert!(
+            !herder.scp.is_slot_externalized(lcl + 1),
+            "a restored Prepare must not be externalized"
+        );
+        assert_eq!(
+            herder.latest_externalized_slot(),
+            None,
+            "restore must NOT publish latest_externalized for a non-externalized slot"
+        );
     }
 
     #[test]
