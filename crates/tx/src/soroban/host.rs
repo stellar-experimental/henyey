@@ -723,6 +723,39 @@ define_wasm_compilation_context!(
     HostErrorP27
 );
 
+/// Whether to withhold the persistent module cache from this host function's
+/// `invoke_host_function` call.
+///
+/// Invariant preserved: an `UploadContractWasm` must be metered purely on
+/// parsing, never on module compilation — matching how stellar-core meters
+/// uploads. An upload does not execute contract code; the module is compiled
+/// (un-metered) by the ledger-close module-cache warming
+/// (`addAnyContractsToModuleCache` parity) for the *next* ledger's deploy/invoke.
+///
+/// Note: in the pinned soroban-env the upload path (`upload_contract_wasm`)
+/// parses with a throwaway engine and never consults `module_cache`, so
+/// withholding it here is currently a **metering no-op** — verified equivalent
+/// to passing `Some(cache)` (same instructions, output, footprint, refund,
+/// events). It is withheld anyway as a defensive parity guard: it documents that
+/// uploads have no need of the cache and ensures upload metering can never become
+/// dependent on cache state (e.g. a future/compile-on-miss env would otherwise
+/// charge the native-compile cost — ~1.5M instructions for a tiny contract —
+/// against the genesis `MinimumSorobanNetworkConfig` `txMaxInstructions =
+/// 2_500_000` budget). The load-bearing fix for the #3602 flake is the loadgen
+/// completion gate (`LoadGenerator::wait_till_complete`); this guard is the
+/// accompanying parity hardening.
+///
+/// Only `UploadContractWasm` is withheld. Execution paths — `InvokeContract`,
+/// and `CreateContract`/`CreateContractV2` which read or run the referenced
+/// code — keep the cache; withholding it from those would itself diverge from
+/// stellar-core, which passes the populated cache to every host function.
+pub(crate) fn upload_skips_module_cache(host_function: &stellar_xdr::HostFunction) -> bool {
+    matches!(
+        host_function,
+        stellar_xdr::HostFunction::UploadContractWasm(_)
+    )
+}
+
 /// Execute a Soroban host function with an optional pre-populated module cache.
 ///
 /// This is the same as `execute_host_function` but accepts an optional persistent
@@ -1214,16 +1247,24 @@ fn execute_host_function_p24(
         "P24",
     )?;
 
-    // Use existing module cache — it must always be provided.
-    let module_cache = existing_cache
-        .unwrap_or_else(|| {
-            panic!(
-                "P24: Module cache is not available — this is a bug. \
-                The persistent module cache should always be initialized before TX execution."
-            )
-        })
-        .clone();
-    let module_cache = Some(module_cache);
+    // Module cache: withheld from UploadContractWasm only, so an upload is
+    // metered parse-only and never on compilation (see
+    // `upload_skips_module_cache` for the parity rationale; verified inert in the
+    // pinned env, kept as a defensive guard). All executing paths keep the cache.
+    let module_cache = if upload_skips_module_cache(host_function) {
+        None
+    } else {
+        Some(
+            existing_cache
+                .unwrap_or_else(|| {
+                    panic!(
+                        "P24: Module cache is not available — this is a bug. \
+                        The persistent module cache should always be initialized before TX execution."
+                    )
+                })
+                .clone(),
+        )
+    };
 
     // ── Encode inputs and call non-typed invoke_host_function() ──
     let inputs = encode_invocation_inputs(host_function, soroban_data, source, auth_entries)?;
@@ -1463,16 +1504,24 @@ fn execute_host_function_p25(
         "P25",
     )?;
 
-    // Use existing module cache — it must always be provided.
-    let module_cache = existing_cache
-        .unwrap_or_else(|| {
-            panic!(
-                "P25: Module cache is not available — this is a bug. \
-                The persistent module cache should always be initialized before TX execution."
-            )
-        })
-        .clone();
-    let module_cache = Some(module_cache);
+    // Module cache: withheld from UploadContractWasm only, so an upload is
+    // metered parse-only and never on compilation (see
+    // `upload_skips_module_cache` for the parity rationale; verified inert in the
+    // pinned env, kept as a defensive guard). All executing paths keep the cache.
+    let module_cache = if upload_skips_module_cache(host_function) {
+        None
+    } else {
+        Some(
+            existing_cache
+                .unwrap_or_else(|| {
+                    panic!(
+                        "P25: Module cache is not available — this is a bug. \
+                        The persistent module cache should always be initialized before TX execution."
+                    )
+                })
+                .clone(),
+        )
+    };
 
     // ── Encode inputs and call non-typed invoke_host_function() ──
     // All budget metering (ValDeser for inputs, ValSer for outputs) is handled
@@ -1857,16 +1906,24 @@ fn execute_host_function_p26(
         "P26",
     )?;
 
-    // Use existing module cache — it must always be provided.
-    let module_cache = existing_cache
-        .unwrap_or_else(|| {
-            panic!(
-                "P26: Module cache is not available — this is a bug. \
-                The persistent module cache should always be initialized before TX execution."
-            )
-        })
-        .clone();
-    let module_cache = Some(module_cache);
+    // Module cache: withheld from UploadContractWasm only, so an upload is
+    // metered parse-only and never on compilation (see
+    // `upload_skips_module_cache` for the parity rationale; verified inert in the
+    // pinned env, kept as a defensive guard). All executing paths keep the cache.
+    let module_cache = if upload_skips_module_cache(host_function) {
+        None
+    } else {
+        Some(
+            existing_cache
+                .unwrap_or_else(|| {
+                    panic!(
+                        "P26: Module cache is not available — this is a bug. \
+                        The persistent module cache should always be initialized before TX execution."
+                    )
+                })
+                .clone(),
+        )
+    };
 
     // ── Encode inputs and call non-typed invoke_host_function() ──
     let inputs = encode_invocation_inputs(host_function, soroban_data, source, auth_entries)?;
@@ -2109,16 +2166,24 @@ fn execute_host_function_p27(
         "P27",
     )?;
 
-    // Use existing module cache — it must always be provided.
-    let module_cache = existing_cache
-        .unwrap_or_else(|| {
-            panic!(
-                "P27: Module cache is not available — this is a bug. \
-                The persistent module cache should always be initialized before TX execution."
-            )
-        })
-        .clone();
-    let module_cache = Some(module_cache);
+    // Module cache: withheld from UploadContractWasm only, so an upload is
+    // metered parse-only and never on compilation (see
+    // `upload_skips_module_cache` for the parity rationale; verified inert in the
+    // pinned env, kept as a defensive guard). All executing paths keep the cache.
+    let module_cache = if upload_skips_module_cache(host_function) {
+        None
+    } else {
+        Some(
+            existing_cache
+                .unwrap_or_else(|| {
+                    panic!(
+                        "P27: Module cache is not available — this is a bug. \
+                        The persistent module cache should always be initialized before TX execution."
+                    )
+                })
+                .clone(),
+        )
+    };
 
     // ── Encode inputs and call non-typed invoke_host_function() ──
     let inputs = encode_invocation_inputs(host_function, soroban_data, source, auth_entries)?;
@@ -2274,6 +2339,49 @@ mod tests {
         });
         let hash = compute_key_hash(&key);
         assert_ne!(hash.0, [0u8; 32]);
+    }
+
+    /// #3602: the persistent module cache is withheld only from
+    /// `UploadContractWasm` (so the upload is metered parse-only, not
+    /// parse+native-compile, fitting the genesis txMaxInstructions budget).
+    /// Execution paths keep the cache.
+    #[test]
+    fn test_upload_skips_module_cache() {
+        use stellar_xdr::{
+            ContractIdPreimage, ContractIdPreimageFromAddress, CreateContractArgs,
+            CreateContractArgsV2, Hash, HostFunction, InvokeContractArgs, ScAddress, ScSymbol,
+            ScVal, Uint256,
+        };
+
+        // Upload: cache withheld.
+        assert!(upload_skips_module_cache(
+            &HostFunction::UploadContractWasm(vec![0u8; 8].try_into().unwrap())
+        ));
+
+        // Invoke: cache kept (executes the contract).
+        let invoke = HostFunction::InvokeContract(InvokeContractArgs {
+            contract_address: ScAddress::Contract(stellar_xdr::ContractId(Hash([1u8; 32]))),
+            function_name: ScSymbol("f".try_into().unwrap()),
+            args: Vec::new().try_into().unwrap(),
+        });
+        assert!(!upload_skips_module_cache(&invoke));
+
+        // CreateContract / V2: cache kept (reads/runs the referenced code).
+        let preimage = ContractIdPreimage::Address(ContractIdPreimageFromAddress {
+            address: ScAddress::Contract(stellar_xdr::ContractId(Hash([2u8; 32]))),
+            salt: Uint256([0u8; 32]),
+        });
+        let create = HostFunction::CreateContract(CreateContractArgs {
+            contract_id_preimage: preimage.clone(),
+            executable: stellar_xdr::ContractExecutable::Wasm(Hash([3u8; 32])),
+        });
+        assert!(!upload_skips_module_cache(&create));
+        let create_v2 = HostFunction::CreateContractV2(CreateContractArgsV2 {
+            contract_id_preimage: preimage,
+            executable: stellar_xdr::ContractExecutable::Wasm(Hash([3u8; 32])),
+            constructor_args: vec![ScVal::Void].try_into().unwrap(),
+        });
+        assert!(!upload_skips_module_cache(&create_v2));
     }
 
     /// V27 protocol routes to a P27 module cache; V26 still routes to P26.

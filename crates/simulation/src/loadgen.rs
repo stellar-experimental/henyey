@@ -1485,7 +1485,10 @@ impl LoadGenerator {
                     // the create-upgrade loadgen completes; if we reported "done"
                     // on submit, the `ConfigUpgradeSet` entry would not yet be in
                     // a closed ledger and the arm would be rejected (#3596).
-                    self.wait_till_complete().await;
+                    self.wait_till_complete(config).await;
+                    if self.failed {
+                        return LoadResult::Failed;
+                    }
                     // For create_upgrade, account-sync is necessary but not
                     // sufficient: the TEMPORARY ConfigUpgradeSet ContractData
                     // write can lag the source-account seq update in the
@@ -1555,19 +1558,37 @@ impl LoadGenerator {
     }
 
     /// Wait until every submitted transaction has been applied (accounts
-    /// synced) before declaring the run complete.
+    /// synced) — and, for Soroban setup modes, until the deployed contract
+    /// code + instance entries actually exist on-ledger — before declaring the
+    /// run complete.
     ///
     /// Parity: stellar-core `LoadGenerator::waitTillComplete()`
-    /// (`src/simulation/LoadGenerator.cpp:1345`) polls `checkAccountSynced`
-    /// each ledger until there are no inconsistencies (all txns applied),
-    /// timing out after `TIMEOUT_NUM_LEDGERS` (20). We poll ~once per second
-    /// and bound the wait by ledger advancement so a dropped/never-applied tx
-    /// can't hang the run forever.
-    async fn wait_till_complete(&mut self) {
+    /// (`src/simulation/LoadGenerator.cpp:1345`) gates completion on BOTH
+    /// `checkAccountSynced().empty()` AND `checkSorobanStateSynced(cfg).empty()`
+    /// each ledger, timing out after `TIMEOUT_NUM_LEDGERS`. The Soroban-state
+    /// gate is load-bearing for the create_upgrade flow (#3602): under the
+    /// genesis `MinimumSorobanNetworkConfig` (`ledgerMaxTxCount = 1`,
+    /// `ledgerMaxInstructions = 2_500_000`) the upgrade-setup `create_contract`
+    /// deploy competes for the single per-ledger Soroban slot and can be
+    /// surge-excluded for several ledgers. Account-sync alone returns as soon
+    /// as the source seq advances (a *failed* apply still bumps the seq), so
+    /// without the state gate the run could report "complete" while the
+    /// contract instance was never created — the subsequent `create_upgrade`
+    /// then writes nothing resolvable and the SSC arm hangs. We poll ~once per
+    /// second and bound the wait by ledger advancement.
+    ///
+    /// On timeout with the Soroban state still unsynced (setup modes), the run
+    /// is marked failed — parity with stellar-core `emitFailure` — so the
+    /// mission fails fast and is retried, rather than silently proceeding to a
+    /// create_upgrade that can never resolve.
+    async fn wait_till_complete(&mut self, config: &GeneratedLoadConfig) {
         const TIMEOUT_NUM_LEDGERS: u32 = 30;
+        let check_soroban = config.mode.is_soroban_setup();
         let start_ledger = self.tx_generator.app.current_ledger_seq();
         loop {
-            if self.tx_generator.check_accounts_synced() {
+            let accounts_synced = self.tx_generator.check_accounts_synced();
+            let soroban_synced = !check_soroban || self.soroban_state_synced();
+            if accounts_synced && soroban_synced {
                 return;
             }
             let elapsed = self
@@ -1578,13 +1599,61 @@ impl LoadGenerator {
             if elapsed >= TIMEOUT_NUM_LEDGERS {
                 warn!(
                     timeout_ledgers = TIMEOUT_NUM_LEDGERS,
+                    accounts_synced,
+                    soroban_synced,
                     "loadgen wait-till-complete timed out; some submitted txns \
                      were not applied (likely dropped before inclusion)"
                 );
+                // Parity: emitFailure(!sorobanIsDone). A setup run whose
+                // contract code/instance never materialized must fail — a
+                // downstream create_upgrade built against the missing instance
+                // would never produce a resolvable ConfigUpgradeSet entry.
+                if check_soroban && !soroban_synced {
+                    self.failed = true;
+                }
                 return;
             }
             tokio::time::sleep(Duration::from_millis(1000)).await;
         }
+    }
+
+    /// Whether the Soroban setup's deployed code + contract-instance entries
+    /// exist on-ledger.
+    ///
+    /// Parity: stellar-core `LoadGenerator::checkSorobanStateSynced()`
+    /// (`src/simulation/LoadGenerator.cpp:1259`), which loads every
+    /// `mContractInstanceKeys` entry plus `mCodeKey` and reports those still
+    /// missing. Here we require the code key and every recorded contract
+    /// instance key to be present in the live ledger. (The `config.n_instances`
+    /// counter is decremented during deployment, so we check the accumulated
+    /// `contract_instance_keys` set directly rather than the counter.)
+    fn soroban_state_synced(&self) -> bool {
+        Self::soroban_state_synced_inner(
+            self.code_key.as_ref(),
+            &self.contract_instance_keys,
+            |key| matches!(self.tx_generator.app.has_ledger_entry(key), Ok(true)),
+        )
+    }
+
+    /// Pure decision for [`Self::soroban_state_synced`], split out so the
+    /// completion gate can be unit-tested without a live `App`. Returns `true`
+    /// iff the code key exists, at least one instance was deployed, and every
+    /// recorded instance key exists (per the `entry_present` probe).
+    pub(crate) fn soroban_state_synced_inner(
+        code_key: Option<&LedgerKey>,
+        instance_keys: &HashSet<LedgerKey>,
+        entry_present: impl Fn(&LedgerKey) -> bool,
+    ) -> bool {
+        let Some(code_key) = code_key else {
+            // No code uploaded yet — setup is not complete.
+            return false;
+        };
+        if !entry_present(code_key) {
+            return false;
+        }
+        // At least one instance must have been deployed, and all recorded
+        // instance keys must exist on-ledger.
+        !instance_keys.is_empty() && instance_keys.iter().all(entry_present)
     }
 
     /// Wait until the `create_upgrade` ConfigUpgradeSet entry is resolvable by
@@ -2640,6 +2709,59 @@ mod tests {
         assert!(
             LoadGenerator::config_upgrade_set_key_from(&two, &cfg, fixture_load_entry).is_err()
         );
+    }
+
+    /// #3602 regression: the Soroban-setup completion gate must require BOTH
+    /// the uploaded code key AND every deployed instance key to actually exist
+    /// on-ledger — not merely that the source account's sequence advanced. The
+    /// flake was the loadgen reporting setup "complete" (account-synced) while
+    /// the `create_contract` deploy never materialized the instance, then
+    /// running `create_upgrade` against the missing instance (which can never
+    /// produce a resolvable ConfigUpgradeSet entry).
+    #[test]
+    fn test_soroban_state_synced_inner_gating() {
+        let code_key = LedgerKey::ContractCode(stellar_xdr::LedgerKeyContractCode {
+            hash: stellar_xdr::Hash([5u8; 32]),
+        });
+        let instances = single_instance_key([9u8; 32]);
+        let inst_key = instances.iter().next().unwrap().clone();
+
+        // No code uploaded yet → not synced.
+        assert!(!LoadGenerator::soroban_state_synced_inner(
+            None,
+            &instances,
+            |_| true
+        ));
+
+        // Code present but no instance deployed → not synced.
+        let empty = std::collections::HashSet::new();
+        assert!(!LoadGenerator::soroban_state_synced_inner(
+            Some(&code_key),
+            &empty,
+            |_| true
+        ));
+
+        // Code key not yet on-ledger (upload didn't materialize) → not synced.
+        assert!(!LoadGenerator::soroban_state_synced_inner(
+            Some(&code_key),
+            &instances,
+            |k| k != &code_key
+        ));
+
+        // Instance not on-ledger (the #3602 failure: deploy never created it)
+        // → not synced, even though code exists.
+        assert!(!LoadGenerator::soroban_state_synced_inner(
+            Some(&code_key),
+            &instances,
+            |k| k != &inst_key
+        ));
+
+        // Code + instance both present on-ledger → synced.
+        assert!(LoadGenerator::soroban_state_synced_inner(
+            Some(&code_key),
+            &instances,
+            |_| true
+        ));
     }
 
     #[test]
