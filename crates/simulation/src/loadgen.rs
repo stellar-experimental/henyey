@@ -155,6 +155,38 @@ const DEFAULT_WASM_SIZE: usize = 35_000;
 /// Default inclusion fee for Soroban transactions.
 const DEFAULT_SOROBAN_INCLUSION_FEE: u32 = 100;
 
+/// Sample a `SorobanUpload` WASM size from `values`, weighted by `weights`.
+///
+/// Parity with stellar-core's `sampleDiscrete(LOADGEN_WASM_BYTES_FOR_TESTING,
+/// LOADGEN_WASM_BYTES_DISTRIBUTION_FOR_TESTING, DEFAULT_WASM_BYTES)`
+/// (TxGenerator.cpp:1647): empty `values` → `default`; a single value is used
+/// directly; otherwise pick weighted by `weights`, falling back to uniform when
+/// `weights` doesn't line up with `values`. `seed` makes the choice
+/// deterministic per (account, ledger).
+fn sample_wasm_size(values: &[u32], weights: &[u32], default: usize, seed: u64) -> usize {
+    match values {
+        [] => default,
+        [single] => *single as usize,
+        _ => {
+            let weighted = weights.len() == values.len() && weights.iter().any(|&w| w > 0);
+            if weighted {
+                let total: u64 = weights.iter().map(|&w| u64::from(w)).sum();
+                let mut pick = seed % total;
+                for (v, &w) in values.iter().zip(weights.iter()) {
+                    let w = u64::from(w);
+                    if pick < w {
+                        return *v as usize;
+                    }
+                    pick -= w;
+                }
+                values[values.len() - 1] as usize
+            } else {
+                values[(seed % values.len() as u64) as usize] as usize
+            }
+        }
+    }
+}
+
 /// Base CPU instruction budget for contract invocations.
 const INVOKE_BASE_INSTRUCTIONS: u32 = 2_000_000;
 
@@ -897,9 +929,23 @@ impl TxGenerator {
         account_id: u64,
         inclusion_fee: u32,
     ) -> anyhow::Result<(u64, TransactionEnvelope)> {
-        let wasm_size = DEFAULT_WASM_SIZE;
-        let wasm =
-            SorobanTxBuilder::random_wasm(wasm_size, deterministic_rand(account_id, ledger_num));
+        // Parity: stellar-core sizes each random upload by sampling
+        // LOADGEN_WASM_BYTES_FOR_TESTING (weighted by
+        // LOADGEN_WASM_BYTES_DISTRIBUTION_FOR_TESTING), falling back to
+        // DEFAULT_WASM_BYTES when unset (TxGenerator.cpp:1647). Honoring the
+        // config lets missions that don't raise the per-tx limits
+        // (`WithSmallLoadgenOptions` → 1 KB) keep uploads within the genesis
+        // `maxContractSizeBytes`; previously we hardcoded ~35 KB, which forced
+        // those missions to additionally raise the Soroban per-tx limits.
+        let seed = deterministic_rand(account_id, ledger_num);
+        let testing = &self.app.config().testing;
+        let wasm_size = sample_wasm_size(
+            &testing.loadgen_wasm_bytes,
+            &testing.loadgen_wasm_bytes_distribution,
+            DEFAULT_WASM_SIZE,
+            seed,
+        );
+        let wasm = SorobanTxBuilder::random_wasm(wasm_size, seed);
         let (sk, seq) = self.next_source_sequence(account_id, ledger_num);
         let builder = self.soroban_builder();
         let envelope = builder.upload_wasm_tx(&sk, seq, &wasm, inclusion_fee)?;
@@ -2709,6 +2755,25 @@ mod tests {
         assert!(
             LoadGenerator::config_upgrade_set_key_from(&two, &cfg, fixture_load_entry).is_err()
         );
+    }
+
+    /// Parity: upload size sampling honors LOADGEN_WASM_BYTES_FOR_TESTING.
+    #[test]
+    fn test_sample_wasm_size() {
+        // Empty values → default (core's DEFAULT_WASM_BYTES fallback).
+        assert_eq!(sample_wasm_size(&[], &[], 35_000, 123), 35_000);
+        // Single value is used directly regardless of seed.
+        assert_eq!(sample_wasm_size(&[1024], &[1], 35_000, 0), 1024);
+        assert_eq!(sample_wasm_size(&[1024], &[], 35_000, 999), 1024);
+        // Weighted: weight 0 on the first means it's never picked.
+        for seed in 0..10u64 {
+            assert_eq!(sample_wasm_size(&[100, 200], &[0, 1], 35_000, seed), 200);
+        }
+        // Mismatched weights → uniform over values (both reachable).
+        let picks: std::collections::HashSet<usize> = (0..8u64)
+            .map(|s| sample_wasm_size(&[10, 20], &[], 35_000, s))
+            .collect();
+        assert!(picks.contains(&10) && picks.contains(&20));
     }
 
     /// #3602 regression: the Soroban-setup completion gate must require BOTH

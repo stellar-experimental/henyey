@@ -83,6 +83,8 @@ const SUPPORTED_KEYS: &[&str] = &[
     "TESTING_UPGRADE_RESERVE",
     "TESTING_UPGRADE_MAX_TX_SET_SIZE",
     "RUN_STANDALONE",
+    "LOADGEN_WASM_BYTES_FOR_TESTING",
+    "LOADGEN_WASM_BYTES_DISTRIBUTION_FOR_TESTING",
     // Sub-tables (handled structurally)
     "HISTORY",
     "VALIDATORS",
@@ -661,6 +663,15 @@ pub fn translate_stellar_core_config(raw: &toml::Value) -> anyhow::Result<AppCon
     }
     if let Some(v) = get_bool(table, "RUN_STANDALONE") {
         config.testing.run_standalone = v;
+    }
+    // SorobanUpload WASM sizing (parity: stellar-core samples the upload size
+    // from LOADGEN_WASM_BYTES_FOR_TESTING weighted by
+    // LOADGEN_WASM_BYTES_DISTRIBUTION_FOR_TESTING; absent → built-in default).
+    if let Some(v) = get_u32_array(table, "LOADGEN_WASM_BYTES_FOR_TESTING") {
+        config.testing.loadgen_wasm_bytes = v;
+    }
+    if let Some(v) = get_u32_array(table, "LOADGEN_WASM_BYTES_DISTRIBUTION_FOR_TESTING") {
+        config.testing.loadgen_wasm_bytes_distribution = v;
     }
 
     // --- Ignored keys (accepted silently for compatibility) ---
@@ -1278,6 +1289,25 @@ fn get_u32(table: &toml::map::Map<String, toml::Value>, key: &str) -> Option<u32
             None
         }
     }
+}
+
+/// Read a TOML array of non-negative integers as `Vec<u32>`. Returns `None`
+/// if the key is absent or not an array; elements that aren't u32-representable
+/// integers are skipped with a warning.
+fn get_u32_array(table: &toml::map::Map<String, toml::Value>, key: &str) -> Option<Vec<u32>> {
+    let arr = table.get(key)?.as_array()?;
+    let mut out = Vec::with_capacity(arr.len());
+    for elem in arr {
+        match elem.as_integer().and_then(|i| u32::try_from(i).ok()) {
+            Some(v) => out.push(v),
+            None => tracing::warn!(
+                key,
+                element = %elem,
+                "Compat config array element is not a u32; skipping"
+            ),
+        }
+    }
+    Some(out)
 }
 
 fn get_usize(table: &toml::map::Map<String, toml::Value>, key: &str) -> Option<usize> {
