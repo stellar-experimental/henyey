@@ -1,0 +1,52 @@
+name: Build and test
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  complete:
+
+    runs-on: ubuntu-24.04
+
+    steps:
+    - uses: actions/checkout@v2
+    - name: Setup k3s
+      uses: debianmaster/actions-k3s@master
+      with:
+        version: 'v1.23.17-k3s1'
+    - name: Setup nginx-ingress
+      run: |
+        kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/controller-v1.5.1/deploy/static/provider/cloud/deploy.yaml
+        kubectl wait --namespace ingress-nginx --for=condition=ready pod --selector=app.kubernetes.io/component=controller --timeout=120s
+    - name: Setup .NET SDK 8
+      uses: actions/setup-dotnet@v1
+      with:
+        dotnet-version: '8.0.x'
+    - name: Install dependencies
+      run: dotnet restore
+    - name: Install tool dependencies
+      run: dotnet tool restore
+    - name: Check formatting
+      run: dotnet tool run fantomas --check --recurse src
+    - name: Build
+      run: dotnet build --configuration Release --no-restore
+    - name: Test
+      run: dotnet test --no-restore --verbosity normal
+    - name: Run BootAndSync mission
+      run: dotnet run --project src/App/App.fsproj --configuration Release -- mission BootAndSync --image stellar/stellar-core:stable --kubeconfig $KUBECONFIG --namespace default --ingress-class nginx --ingress-internal-domain local --ingress-external-host localhost --uneven-sched
+    # Exercise the pod-exec HTTP transport (--core-http-via-pod-exec) with no
+    # resolvable ingress host: the ingress host falls back to <nonce>.local,
+    # which does not resolve from the runner. If any core HTTP access leaked
+    # back to the ingress, this run would fail with a name-resolution error, so
+    # a green run proves all access goes through pod exec. This mirrors an
+    # out-of-cluster runner (e.g. Namespace/nsc k3s). See issue #399.
+    - name: Run BootAndSync mission via pod-exec
+      run: dotnet run --project src/App/App.fsproj --configuration Release -- mission BootAndSync --image stellar/stellar-core:stable --kubeconfig $KUBECONFIG --namespace default --ingress-class nginx --ingress-internal-domain local --core-http-via-pod-exec --uneven-sched
+    - uses: actions/upload-artifact@v4
+      with:
+        name: destination
+        path: destination/
+        retention-days: 30

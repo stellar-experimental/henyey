@@ -1,0 +1,59 @@
+redis:
+  hostname: "" # to be set by the mission
+  port: 6379
+  job_queue: "ranges"
+  success_queue: "succeeded"
+  failed_queue: "failed"
+  progress_queue: "in_progress"
+  metrics: "metrics"
+  job_owners: "job_owners"
+  resources:
+    requests:
+      cpu: "100m"
+      memory: "100Mi"
+
+worker:
+  stellar_core_image: "stellar/stellar-core:latest"
+  replicas: 5
+  requireNodeLabels: []
+  avoidNodeLabels: []
+  tolerateNodeTaints: []
+  asanOptions: "quarantine_size_mb=1:malloc_context_size=5:alloc_dealloc_mismatch=0"
+  resources: # resources below are left empty on purpose, they are read and overridden from `StellarKubeCfg.fs`
+    requests:
+      cpu: ""
+      memory: ""
+      ephemeral_storage: ""
+    limits:
+      cpu: ""
+      memory: ""
+      ephemeral_storage: ""
+  historyGetCommandCore001:
+    "curl -sf http://history.stellar.org/prd/core-live/core_live_001/{0} -o {1}"
+  historyGetCommandCore002:
+    "curl -sf http://history.stellar.org/prd/core-live/core_live_002/{0} -o {1}"
+  historyGetCommandCore003:
+    "curl -sf http://history.stellar.org/prd/core-live/core_live_003/{0} -o {1}"
+
+monitor:
+  ingress_class_name: "ingress-private"
+  hostname: "" # to be set by the mission
+  path: "/default/(.*)"
+  logging_interval_seconds: 300
+  logging_level: "INFO" # 'DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'
+  resources:
+    requests:
+      cpu: "100m"
+      memory: "100Mi"
+
+range_generator:
+  strategy: "uniform" # "uniform" or "logarithmic"
+  params:
+    starting_ledger: 0
+    latest_ledger_num: 100000
+    overlap_ledgers: 320
+    uniform_ledgers_per_job: 16000 # only for strategy="uniform"
+    logarithmic_floor_ledgers: 16000 # only for strategy="logarithmic"
+
+service_account:
+  annotations: []

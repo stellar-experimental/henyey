@@ -1,0 +1,111 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+  </PropertyGroup>
+  <PropertyGroup Condition=" '$(Configuration)|$(Platform)' == 'Debug|AnyCPU' " />
+  <PropertyGroup Condition=" '$(Configuration)|$(Platform)' == 'Release|AnyCPU' ">
+    <DebugSymbols>true</DebugSymbols>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="PubnetData.fs" />
+    <Compile Include="Logging.fs" />
+    <Compile Include="ScriptUtils.fs" />
+    <Compile Include="ApiRateLimit.fs" />
+    <Compile Include="PollRetry.fs" />
+    <Compile Include="StellarShellCmd.fs" />
+    <Compile Include="StellarCoreSet.fs" />
+    <Compile Include="StellarDestination.fs" />
+    <Compile Include="StellarMissionContext.fs" />
+    <Compile Include="StellarNetworkCfg.fs" />
+    <Compile Include="StellarCoreCfg.fs" />
+    <Compile Include="StellarCorePeer.fs" />
+    <Compile Include="StellarCoreHTTP.fs" />
+    <Compile Include="StellarTransaction.fs" />
+    <Compile Include="StellarNetworkDelays.fs" />
+    <Compile Include="StellarNetworkData.fs" />
+    <Compile Include="StellarKubeSpecs.fs" />
+    <Compile Include="StellarNamespaceContent.fs" />
+    <Compile Include="StellarFormation.fs" />
+    <Compile Include="StellarRemoteCommandExec.fs" />
+    <Compile Include="StellarDataDump.fs" />
+    <Compile Include="BenchmarkDaemonSet.fs" />
+    <Compile Include="StellarStatefulSets.fs" />
+    <Compile Include="StellarJobExec.fs" />
+    <Compile Include="StellarSupercluster.fs" />
+    <Compile Include="StellarOrphanSweep.fs" />
+    <Compile Include="MaxTPSTest.fs" />
+    <Compile Include="MissionCatchupHelpers.fs" />
+    <Compile Include="MissionBootAndSync.fs" />
+    <Compile Include="MissionSimplePayment.fs" />
+    <Compile Include="MissionComplexTopology.fs" />
+    <Compile Include="MissionLoadGeneration.fs" />
+    <Compile Include="MissionEmitMeta.fs" />
+    <Compile Include="MissionLoadGenerationWithSpikes.fs" />
+    <Compile Include="MissionLoadGenerationWithTxSetLimit.fs" />
+    <Compile Include="MissionHistoryGenerateAndCatchup.fs" />
+    <Compile Include="MissionHistoryPubnetMinimumCatchup.fs" />
+    <Compile Include="MissionSimulatePubnetMixedLoad.fs" />
+    <Compile Include="MissionPubnetNetworkLimitsBench.fs" />
+    <Compile Include="MissionSlowNodesNetwork.fs" />
+    <Compile Include="MissionMaxTPSClassic.fs" />
+    <Compile Include="MissionHistoryPubnetRecentCatchup.fs" />
+    <Compile Include="MissionHistoryPubnetParallelCatchup.fs" />
+    <Compile Include="MissionHistoryPubnetCompleteCatchup.fs" />
+    <Compile Include="MissionHistoryPubnetParallelCatchupExtrawide.fs" />
+    <Compile Include="MissionHistoryPubnetParallelCatchupV2.fs" />
+    <Compile Include="MissionHistoryPubnetPerformance.fs" />
+    <Compile Include="MissionHistoryTestnetCompleteCatchup.fs" />
+    <Compile Include="MissionHistoryTestnetRecentCatchup.fs" />
+    <Compile Include="MissionHistoryTestnetMinimumCatchup.fs" />
+    <Compile Include="MissionHistoryTestnetParallelCatchup.fs" />
+    <Compile Include="MissionHistoryTestnetPerformance.fs" />
+    <Compile Include="MissionMixedImageLoadGeneration.fs" />
+    <Compile Include="MissionMixedImageNetworkSurvey.fs" />
+    <Compile Include="MissionMixedNominationLeaderElection.fs" />
+    <Compile Include="MissionVersionMixConsensus.fs" />
+    <Compile Include="MissionSorobanLoadGeneration.fs" />
+    <Compile Include="MissionSorobanConfigUpgrades.fs" />
+    <Compile Include="MissionSorobanInvokeHostLoad.fs" />
+    <Compile Include="MissionSorobanCatchupWithPrevAndCurr.fs" />
+    <Compile Include="MissionVersionNewCatchupToOld.fs" />
+    <Compile Include="MissionVersionOldCatchupToNew.fs" />
+    <Compile Include="MissionProtocolUpgradeTestnet.fs" />
+    <Compile Include="MissionProtocolUpgradePubnet.fs" />
+    <Compile Include="MissionProtocolUpgradeWithLoad.fs" />
+    <Compile Include="MissionDatabaseInplaceUpgrade.fs" />
+    <Compile Include="MissionAcceptanceUnitTests.fs" />
+    <Compile Include="MissionMaxTPSMixed.fs" />
+    <Compile Include="MissionUpgradeSCPSettings.fs" />
+    <Compile Include="MissionUpgradeTxClusters.fs" />
+    <Compile Include="MissionValidatorSetup.fs" />
+    <Compile Include="MinBlockTimeTest.fs" />
+    <Compile Include="MissionMinBlockTimeClassic.fs" />
+    <Compile Include="MissionMinBlockTimeMixed.fs" />
+    <Compile Include="StellarMission.fs" />
+  </ItemGroup>
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Rest.ClientRuntime" Version="2.3.24" />
+    <PackageReference Include="FSharp.Data" Version="4.1.1" />
+    <PackageReference Include="KubernetesClient" Version="15.0.1" />
+    <PackageReference Include="Nett" Version="0.15.0" />
+    <PackageReference Include="Serilog" Version="2.10.0" />
+    <PackageReference Include="Serilog.Sinks.Console" Version="3.1.1" />
+    <PackageReference Include="Serilog.Sinks.File" Version="4.1.0" />
+    <PackageReference Include="stellar-dotnet-sdk" Version="10.0.0" />
+    <PackageReference Include="Newtonsoft.Json" Version="13.0.3" />
+    <PackageReference Include="YamlDotNet" Version="16.3.0" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\CSLibrary\CSLibrary.csproj" />
+  </ItemGroup>
+  <ItemGroup>
+    <Content Include="..\scripts\**\*.sh">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <Link>scripts\%(RecursiveDir)%(Filename)%(Extension)</Link>
+    </Content>
+    <Content Include="..\scripts\**\*.py">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <Link>scripts\%(RecursiveDir)%(Filename)%(Extension)</Link>
+    </Content>
+  </ItemGroup>
+</Project>
