@@ -1,0 +1,23 @@
+# IDE directories and editors
+*~
+*.swp
+**/.vscode/*
+**/venv/**
+**/logs/**
+/.vs
+.DS_Store
+
+# build artifacts
+/src/**/obj
+/src/**/bin
+
+# run artifacts
+**/destination
+
+
+.fake
+.ionide
+.idea
+
+# crash dumps from in-place mission runs
+core.*

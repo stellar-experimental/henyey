@@ -1,0 +1,154 @@
+[
+{
+   "info" : {
+      "build" : "v11.0.0",
+      "history_failure_rate" : "0",
+      "ledger" : {
+         "age" : 0,
+         "baseFee" : 100,
+         "baseReserve" : 100000000,
+         "closeTime" : 1556153967,
+         "hash" : "b7f80a1e1915a18cb053710a1ffe19a8fb77f84391b523a9f22c8d8771f2df9e",
+         "maxTxSetSize" : 100,
+         "num" : 14,
+         "version" : 0
+      },
+      "network" : "Private test network 'ssc-3ad18bbb4cef'",
+      "peers" : {
+         "authenticated_count" : 4,
+         "pending_count" : 0
+      },
+      "protocol_version" : 11,
+      "quorum" : {
+         "node" : "GD3CX",
+         "qset" : {
+            "agree" : 1,
+            "delayed" : 0,
+            "disagree" : 0,
+            "fail_at" : 1,
+            "hash" : "47f9b3",
+            "ledger" : 463,
+            "missing" : 0,
+            "phase" : "EXTERNALIZE",
+            "validated" : false
+         },
+         "transitive" : {
+            "critical" : [
+               [ "ssc-6d7df4ef0078-peer-complete1-0" ]
+            ],
+            "intersection" : true,
+            "last_check_ledger" : 460,
+            "node_count" : 3
+         }
+      },
+      "startedOn" : "2019-04-25T00:58:21Z",
+      "state" : "Synced!"
+   }
+},
+{
+   "info" : {
+      "build" : "v12.0.0rc1-5-gec62e52",
+      "history_failure_rate" : "0",
+      "ledger" : {
+         "age" : 1568932345,
+         "baseFee" : 100,
+         "baseReserve" : 100000000,
+         "closeTime" : 0,
+         "hash" : "93bed95c7893b7c1b37a1f143c0521cebd0b911ac8d9ac840fa5e2f64676e38b",
+         "maxTxSetSize" : 100,
+         "num" : 1,
+         "version" : 0
+      },
+      "network" : "Private test network 'ssc-6d7df4ef0078'",
+      "peers" : {
+         "authenticated_count" : 6,
+         "pending_count" : 0
+      },
+      "protocol_version" : 12,
+      "quorum" : {
+         "node" : "GD3CX",
+         "qset" : {
+            "agree" : 1,
+            "delayed" : 0,
+            "disagree" : 0,
+            "fail_at" : 1,
+            "hash" : "47f9b3",
+            "ledger" : 463,
+            "missing" : 0,
+            "phase" : "EXTERNALIZE",
+            "validated" : false
+         },
+         "transitive" : {
+            "critical" : [
+               [ "ssc-6d7df4ef0078-peer-complete1-0" ]
+            ],
+            "intersection" : true,
+            "last_check_ledger" : 460,
+            "node_count" : 3
+         }
+      },
+      "startedOn" : "2019-09-19T22:31:20Z",
+      "state" : "Catching up",
+      "status" : [ "Catching up: Waiting for trigger ledger: 464/513, ETA: 245s" ]
+   }
+},
+{
+   "info" : {
+      "build" : "v12.0.0rc1-5-gec62e52",
+      "history_failure_rate" : "0",
+      "ledger" : {
+         "age" : 1568932625,
+         "baseFee" : 100,
+         "baseReserve" : 100000000,
+         "closeTime" : 0,
+         "hash" : "93bed95c7893b7c1b37a1f143c0521cebd0b911ac8d9ac840fa5e2f64676e38b",
+         "maxTxSetSize" : 100,
+         "num" : 1,
+         "version" : 0
+      },
+      "network" : "Private test network 'ssc-6d7df4ef0078'",
+      "peers" : {
+         "authenticated_count" : 7,
+         "pending_count" : 0
+      },
+      "protocol_version" : 12,
+      "quorum" : {
+         "node" : "GCUI2",
+         "qset" : null
+      },
+      "startedOn" : "2019-09-19T22:36:47Z",
+      "state" : "Joining SCP"
+   }
+},
+{
+   "info" : {
+      "build" : "v20.0.0rc2-225-gded55f2bd-dirty",
+      "ledger" : {
+         "age" : 86352,
+         "baseFee" : 100,
+         "baseReserve" : 5000000,
+         "closeTime" : 1700517209,
+         "hash" : "6cf31bc389b380b6127db89be6528248f7deb83882200b5389e2602f2a91f306",
+         "maxSorobanTxSetSize" : 30,
+         "maxTxSetSize" : 105,
+         "num" : 2622079,
+         "version" : 20
+      },
+      "network" : "Test SDF Network ; September 2015",
+      "peers" : {
+         "authenticated_count" : 4,
+         "pending_count" : 2
+      },
+      "protocol_version" : 21,
+      "quorum" : {
+         "node" : "self",
+         "qset" : {
+            "cost" : 0,
+            "lag_ms" : null
+         }
+      },
+      "startedOn" : "2023-11-21T21:52:33Z",
+      "state" : "Connected"
+   }
+}
+]
