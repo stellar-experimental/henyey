@@ -1086,6 +1086,15 @@ impl App {
             self.herder.ledger_close_duration(),
         );
 
+        // Seed the classic queue ops capacity from the restored header's
+        // `maxTxSetSize` so admission tracks the live capacity from the very
+        // first ledger, before the first post-restore close runs (#3612).
+        self.herder.tx_queue().update_classic_queue_capacity(
+            header
+                .max_tx_set_size
+                .saturating_mul(POOL_LEDGER_MULTIPLIER),
+        );
+
         // Seed Soroban per-tx limits and dynamic resource limits from network config.
         if let Some(soroban_info) = self.soroban_network_info() {
             self.herder.tx_queue().set_soroban_limits(SorobanTxLimits {
@@ -2769,6 +2778,17 @@ impl App {
             if let Some(s) = selection_limit {
                 herder.tx_queue().update_soroban_selection_limits(s);
             }
+
+            // Re-derive the classic queue ops capacity from the live ledger
+            // header's `maxTxSetSize` so the limiter tracks `UpgradeMaxTxSetSize`.
+            // Parity: stellar-core `TxQueueLimiter::reset` rebuilds capacity from
+            // `maxScaledLedgerResources(false) = maxTxSetSize * mPoolLedgerMultiplier`
+            // every ledger close (#3612). Henyey froze this at app construction.
+            herder.tx_queue().update_classic_queue_capacity(
+                result_header
+                    .max_tx_set_size
+                    .saturating_mul(POOL_LEDGER_MULTIPLIER),
+            );
 
             let shift_result = herder.tx_queue().shift();
             crate::metrics::CLOSE_TX_QUEUE_SHIFT_UPDATE_SECONDS

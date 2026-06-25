@@ -1256,6 +1256,13 @@ impl EvictionThresholds {
     fn reset_soroban(&self) {
         self.soroban_lane_fees.write().clear();
     }
+
+    /// Reset only the global ops eviction threshold. Used when the classic ops
+    /// capacity changes (#3612) so a stale fee floor computed against the old
+    /// capacity does not reject admissions under the new one.
+    fn reset_global_ops(&self) {
+        *self.global_fees.write() = None;
+    }
 }
 
 /// ## Lock Ordering (MUST be followed by all methods)
@@ -1312,6 +1319,18 @@ pub struct TransactionQueue {
     /// Separate from queue-admission limits which apply
     /// `SOROBAN_TRANSACTION_QUEUE_SIZE_MULTIPLIER` (2x).
     dynamic_selection_soroban_resources: RwLock<Option<Resource>>,
+    /// Dynamic classic queue ops capacity (already scaled by
+    /// POOL_LEDGER_MULTIPLIER), re-derived from the live ledger header's
+    /// `maxTxSetSize` on every ledger close. Takes precedence over the
+    /// construction-time `config.max_queue_ops` / `config.max_size`.
+    ///
+    /// Parity: stellar-core `TxQueueLimiter::reset(ledgerVersion)` rebuilds the
+    /// classic generic-lane capacity from `maxScaledLedgerResources(false)` =
+    /// `maxLedgerResources(false) * mPoolLedgerMultiplier`
+    /// (`TxQueueLimiter.cpp:61,244`), reading the live `maxTxSetSize` each close.
+    /// Henyey froze the capacity at app construction, so `UpgradeMaxTxSetSize`
+    /// was never tracked. See #3612.
+    dynamic_max_queue_ops: RwLock<Option<u32>>,
     /// Arbitrage flood damper. Acquired after `store` lock in `broadcast_with_visitor`
     /// and `shift()`. Cleared by `shift()`, preserved by `reset_and_rebuild()`.
     arb_damper: parking_lot::Mutex<arb_flood_damping::ArbitrageFloodDamper>,
@@ -1384,6 +1403,7 @@ impl TransactionQueue {
             skip_fee_balance_check: std::sync::atomic::AtomicBool::new(false),
             dynamic_queue_soroban_resources: RwLock::new(None),
             dynamic_selection_soroban_resources: RwLock::new(None),
+            dynamic_max_queue_ops: RwLock::new(None),
             arb_damper: parking_lot::Mutex::new(arb_damper),
             arb_tx_seen: std::sync::atomic::AtomicU64::new(0),
             arb_tx_dropped: std::sync::atomic::AtomicU64::new(0),
@@ -1475,6 +1495,52 @@ impl TransactionQueue {
             dynamic.clone()
         } else {
             self.config.max_queue_soroban_resources.clone()
+        }
+    }
+
+    /// Update the classic queue ops capacity from the live ledger header.
+    ///
+    /// `scaled_max_queue_ops` is the live `maxTxSetSize` already multiplied by
+    /// the pool ledger multiplier (the caller scales, mirroring how
+    /// [`update_soroban_resource_limits`](Self::update_soroban_resource_limits)
+    /// receives a pre-scaled `Resource`). Called on every ledger close so the
+    /// classic limiter tracks `UpgradeMaxTxSetSize`.
+    ///
+    /// Parity: stellar-core `TxQueueLimiter::reset(ledgerVersion)` rebuilds the
+    /// generic-lane capacity from `maxScaledLedgerResources(false)`
+    /// (`TxQueueLimiter.cpp:244`), which reads the live `maxTxSetSize` and scales
+    /// by `mPoolLedgerMultiplier`. The persistent global-ops eviction queue is
+    /// rebuilt lazily with the new limit, and the stale global-ops fee floor is
+    /// cleared so it cannot reject admissions against the old capacity. See #3612.
+    pub fn update_classic_queue_capacity(&self, scaled_max_queue_ops: u32) {
+        *self.dynamic_max_queue_ops.write() = Some(scaled_max_queue_ops);
+        // Drop the persistent global-ops queue so it rebuilds with the new
+        // limit on the next admission, and clear the stale global fee floor.
+        self.store.write().global_ops_queue = None;
+        self.eviction_thresholds.reset_global_ops();
+    }
+
+    /// Return the effective classic queue ops capacity.
+    ///
+    /// Prefers the dynamic value (re-derived from the live `maxTxSetSize` each
+    /// ledger close via [`update_classic_queue_capacity`](Self::update_classic_queue_capacity))
+    /// over the construction-time `config.max_queue_ops`. Returns `None` only
+    /// when neither is configured (classic ops gate disabled). See #3612.
+    pub fn effective_max_queue_ops(&self) -> Option<u32> {
+        let dynamic = *self.dynamic_max_queue_ops.read();
+        dynamic.or(self.config.max_queue_ops)
+    }
+
+    /// Return the effective classic queue tx-count cap.
+    ///
+    /// Tracks the live `maxTxSetSize` (scaled) when a dynamic capacity is set,
+    /// falling back to the construction-time `config.max_size`. Keeps the
+    /// tx-count guard consistent with the ops capacity after an
+    /// `UpgradeMaxTxSetSize`. See #3612.
+    pub fn effective_max_size(&self) -> usize {
+        match *self.dynamic_max_queue_ops.read() {
+            Some(ops) => ops as usize,
+            None => self.config.max_size,
         }
     }
 
@@ -1969,7 +2035,7 @@ impl TransactionQueue {
             lane_fees[GENERIC_LANE].as_ref(),
             &queued.fee_rate,
         ));
-        if self.config.max_queue_ops.is_some() {
+        if self.effective_max_queue_ops().is_some() {
             min_fee = min_fee.max(min_inclusion_fee_to_beat(
                 global_fee.as_ref(),
                 &queued.fee_rate,
@@ -2017,7 +2083,7 @@ impl TransactionQueue {
             }
         }
 
-        if self.config.max_queue_ops.is_some() {
+        if self.effective_max_queue_ops().is_some() {
             let global_fee = *self.eviction_thresholds.global_fees.read();
             if min_inclusion_fee_to_beat(global_fee.as_ref(), &candidate.queued.fee_rate) > 0 {
                 return Err(TxQueueResult::FeeTooLow);
@@ -2123,7 +2189,7 @@ impl TransactionQueue {
             }
         }
 
-        if let Some(limit) = self.config.max_queue_ops {
+        if let Some(limit) = self.effective_max_queue_ops() {
             store.ensure_global_ops_queue(limit as i64, candidate.ledger_version);
             let exclusion = build_eviction_exclusion(
                 store.global_ops_queue.as_ref().unwrap(),
@@ -2457,7 +2523,7 @@ impl TransactionQueue {
         ledger_version: u32,
     ) -> std::result::Result<(), TxQueueResult> {
         let effective_len = store.len().saturating_sub(pending_eviction_count);
-        if effective_len < self.config.max_size {
+        if effective_len < self.effective_max_size() {
             return Ok(());
         }
 
