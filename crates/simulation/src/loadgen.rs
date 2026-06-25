@@ -131,6 +131,16 @@ fn classify_submit_result(
         TxQueueResult::TryAgainLater | TxQueueResult::FeeTooLow if skip_low_fee_txs => {
             SubmitAction::SkipLowFee
         }
+        // A banned tx cannot be re-added for `ban_depth` ledgers. stellar-core's
+        // canAdd returns ADD_STATUS_TRY_AGAIN_LATER for this (TransactionQueue.cpp
+        // :327); the loadgen's correct response is to skip and roll back the
+        // seqnum (re-submitting the same — deterministic — tx would just hit the
+        // ban again until it expires). The account is re-selected on a later
+        // step and, once the ban lifts (or its prior tx applies), proceeds. This
+        // pairs with the #3611 seq refresh: after a tx ages out and is banned,
+        // the refresh regenerates the SAME tx, so banned must be a skip, not a
+        // hard failure.
+        TxQueueResult::Banned => SubmitAction::SkipLowFee,
         // Transient tx-queue backpressure (#3574): retry the same tx with a
         // back-off until the generous cap, then surface a genuinely wedged
         // queue as a run failure. `TryAgainLater` only reaches here when
@@ -741,6 +751,30 @@ impl TxGenerator {
             }
         }
         false
+    }
+
+    /// Refresh a cached account's sequence number from the ledger before
+    /// generating a transaction for it, unless running in overlay-only mode.
+    ///
+    /// Parity port of stellar-core `TxGenerator::maybeLoadAccountSequenceNumber`
+    /// (`src/simulation/TxGenerator.cpp`): in overlay-only mode the on-disk
+    /// seqnums stay frozen at genesis while the local counter is authoritative,
+    /// so the reload is skipped; otherwise the on-ledger seqnum is reloaded.
+    ///
+    /// Required for #3611. Under sustained load a tx can be discarded from the
+    /// tx queue without applying — it ages out at `pending_depth` (4) ledgers
+    /// and is auto-banned (`TransactionQueue::shift`, matching stellar-core).
+    /// The account is then no longer pending, so the loadgen re-selects it, but
+    /// its cached in-memory seq is still ahead of on-ledger. Without this
+    /// refresh the next tx is generated with a *gapped* seq (> on-ledger + 1),
+    /// which tx-set selection can never include (it only selects a contiguous
+    /// run from on-ledger + 1). Those gapped txns accumulate, the account never
+    /// syncs, and `wait_till_complete` burns its full timeout. Reloading the
+    /// on-ledger seq first regenerates the tx at the correct next seq.
+    pub fn maybe_load_account_sequence_number(&mut self, account_id: u64, overlay_only_mode: bool) {
+        if !overlay_only_mode {
+            self.load_account(account_id);
+        }
     }
 
     /// Return `true` when every cached account's on-ledger sequence number
@@ -1958,6 +1992,16 @@ impl LoadGenerator {
     ) -> bool {
         let mut num_tries = 0u32;
         let mut queue_full_tries = 0u32;
+
+        // Parity: stellar-core refreshes the source account's on-ledger
+        // sequence number before building each loadgen tx
+        // (TxGenerator::maybeLoadAccountSequenceNumber). This heals the seq gap
+        // that otherwise forms when a prior tx for this account was discarded
+        // from the queue (aged-out/banned at pending_depth ledgers under load)
+        // without applying — see the method docs and #3611. No-op for accounts
+        // not yet cached (the first tx loads its seq via find_account).
+        self.tx_generator
+            .maybe_load_account_sequence_number(source_account_id, config.overlay_only_mode);
 
         loop {
             // Generate the transaction based on mode
@@ -3200,6 +3244,30 @@ mod tests {
             ),
             SubmitAction::Accept,
         );
+    }
+
+    /// #3611: a `Banned` result must map to `SkipLowFee` (skip + seqnum
+    /// rollback), NOT `Fail`. After the #3611 seq refresh regenerates a tx whose
+    /// prior copy aged out and was banned, re-submitting the same deterministic
+    /// tx hits the ban; the run must skip it (the account proceeds once the ban
+    /// lifts) rather than abort. Independent of `skip_low_fee_txs` and the
+    /// retry caps. FAILS on origin/main (Banned routes to the `_ => Fail` arm).
+    #[test]
+    fn test_classify_submit_result_banned_skips_not_fails() {
+        for skip_low_fee in [true, false] {
+            assert_eq!(
+                classify_submit_result(
+                    TxQueueResult::Banned,
+                    /* queue_full_tries */ 0,
+                    /* bad_seq_tries */ 0,
+                    skip_low_fee,
+                    QUEUE_FULL_MAX_TRIES,
+                    LoadGenMode::Pay,
+                ),
+                SubmitAction::SkipLowFee,
+                "Banned must skip (rollback), not fail (skip_low_fee_txs={skip_low_fee})"
+            );
+        }
     }
 
     /// #3574: a genuinely wedged queue still surfaces — at the cap, `QueueFull`

@@ -847,6 +847,91 @@ async fn test_loadgen_reset_clears_account_seq_cache() {
     sim.stop_all_nodes().await.expect("stop nodes");
 }
 
+/// Regression for #3611: the loadgen must refresh an account's on-ledger
+/// sequence number before generating a tx (parity with stellar-core's
+/// `TxGenerator::maybeLoadAccountSequenceNumber`), so a seq gap left by a tx
+/// that was discarded from the queue without applying is healed instead of
+/// producing an unselectable gapped tx.
+///
+/// FAILS on main: `maybe_load_account_sequence_number` does not exist and the
+/// loadgen trusts its cached in-memory seq.
+#[tokio::test]
+#[serial]
+async fn test_loadgen_reloads_account_seq_before_tx() {
+    let mut sim = Simulation::with_network(
+        SimulationMode::OverLoopback,
+        "Test SDF Network ; September 2015",
+    );
+
+    let seed = Hash256::hash(b"LOADGEN_RELOAD_SEQ_NODE");
+    let secret = SecretKey::from_seed(&seed.0);
+    let quorum_set = QuorumSetConfig {
+        threshold_percent: 100,
+        validators: vec![secret.public_key().to_strkey()],
+        inner_sets: Vec::new(),
+    };
+    sim.add_app_node("node0", secret, quorum_set);
+    sim.start_all_nodes().await;
+    wait_for_app_state(&sim, "node0", AppState::Validating, Duration::from_secs(10)).await;
+    let app = sim.app("node0").expect("running app node");
+
+    // The genesis root account exists on-ledger at a known (low) seq.
+    let network_id = henyey_common::NetworkId::from_passphrase("Test SDF Network ; September 2015");
+    let root_sk = henyey_crypto::SecretKey::from_seed(network_id.as_bytes());
+    let root_pk = root_sk.public_key();
+    let root_aid = stellar_xdr::AccountId(stellar_xdr::PublicKey::PublicKeyTypeEd25519(
+        stellar_xdr::Uint256(*root_pk.as_bytes()),
+    ));
+    let on_ledger = app
+        .load_account_sequence(&root_aid)
+        .expect("load root seq")
+        .expect("root account exists");
+
+    let mut lg = LoadGenerator::new(app, "Test SDF Network ; September 2015".to_string());
+
+    // Cache the root account under a numeric id with an in-memory seq far AHEAD
+    // of on-ledger — exactly the residue of a tx that was queued (seq advanced)
+    // then discarded without applying.
+    let ahead = on_ledger + 1000;
+    lg.tx_generator_mut().accounts_mut().insert(
+        7,
+        TestAccount {
+            secret_key: root_sk,
+            account_id: root_aid,
+            sequence_number: ahead,
+        },
+    );
+
+    // Overlay-only mode: seqnums are frozen, so the cached value is left ahead.
+    lg.tx_generator_mut()
+        .maybe_load_account_sequence_number(7, true);
+    assert_eq!(
+        lg.tx_generator()
+            .accounts()
+            .get(&7)
+            .unwrap()
+            .sequence_number,
+        ahead,
+        "overlay-only mode must NOT reload the sequence number"
+    );
+
+    // Normal mode: the on-ledger seq is reloaded, healing the gap so the next
+    // generated tx is at on-ledger + 1 rather than a gapped, unselectable seq.
+    lg.tx_generator_mut()
+        .maybe_load_account_sequence_number(7, false);
+    assert_eq!(
+        lg.tx_generator()
+            .accounts()
+            .get(&7)
+            .unwrap()
+            .sequence_number,
+        on_ledger,
+        "normal mode must reload the on-ledger sequence number (heals the gap)"
+    );
+
+    sim.stop_all_nodes().await.expect("stop nodes");
+}
+
 /// Regression test for #2357 with a pair topology: App::load_account_sequence
 /// must return the root account's sequence number, not Ok(None).
 #[tokio::test]
