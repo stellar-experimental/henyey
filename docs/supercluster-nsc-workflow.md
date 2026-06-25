@@ -2,7 +2,7 @@
 
 **Date**: 2026-06-16
 **Verified against**: `nsc` `v0.0.522` (commit `30461801`, internal api 160), workspace `StellarDevelopmentFoundation`, registry `nscr.io/k4jkul01t5rr0`.
-**Companion doc**: [`docs/supercluster-feasibility.md`](./supercluster-feasibility.md) (the Phase 0–4 feasibility/execution plan this runbook operationalizes).
+**Companion docs**: [`docs/supercluster-feasibility.md`](./supercluster-feasibility.md) (the Phase 0–4 feasibility/execution plan this runbook operationalizes), [`docs/supercluster-henyey-mixed-mission.md`](./supercluster-henyey-mixed-mission.md) (running a mixed-image mission + the BUILD_TESTS core-image prerequisite), and [`../vendor/supercluster/VENDOR.md`](../vendor/supercluster/VENDOR.md) (the harness is vendored in-tree at `vendor/supercluster/`; provenance + heavy-load runbook).
 
 This is an operator runbook for the [Namespace](https://namespace.so) CLI (`nsc`) covering the build/publish/launch surface that Stellar Supercluster (SSC) missions consume. Every command block below was executed live during authoring and the captured output is real (not fabricated). Where a step belongs to the long-lived mission run rather than the nsc plumbing, it is explicitly marked.
 

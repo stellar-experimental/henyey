@@ -120,6 +120,17 @@ cargo test -p henyey-scp
 
 See [docs/testing.md](docs/testing.md) for the full testing guide including CI pipeline details, debugging failures, and the test matrix.
 
+### Mixed-image interop (henyey ↔ stellar-core)
+
+End-to-end interop is exercised with the Stellar Supercluster harness, vendored
+in-tree at [`vendor/supercluster/`](vendor/supercluster/). See
+[`docs/supercluster-henyey-mixed-mission.md`](docs/supercluster-henyey-mixed-mission.md)
+for running a mixed-image mission (and the BUILD_TESTS core-image prerequisite),
+[`docs/supercluster-nsc-workflow.md`](docs/supercluster-nsc-workflow.md) for the
+`nsc` build/publish/provision workflow, and
+[`vendor/supercluster/VENDOR.md`](vendor/supercluster/VENDOR.md) for the harness
+provenance and heavy-load runbook.
+
 ## Run
 
 ### Full Node Mode (Testnet)
