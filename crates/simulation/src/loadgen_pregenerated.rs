@@ -15,9 +15,48 @@
 //! internal offset. This matches stellar-core's behavior where the open file
 //! stream's position persists across load-generation steps.
 
+use std::io::Write;
 use std::path::Path;
 
-use stellar_xdr::{Limits, ReadXdr, TransactionEnvelope};
+use stellar_xdr::{Limits, ReadXdr, TransactionEnvelope, WriteXdr};
+
+/// RFC 4506 record-marking high-bit flag for the last fragment of a record.
+const LAST_FRAGMENT_FLAG: u32 = 0x8000_0000;
+/// Mask for the lower 31 bits that carry the fragment length.
+const FRAGMENT_LEN_MASK: u32 = 0x7FFF_FFFF;
+
+/// Build the 4-byte big-endian record mark for a *single, last* fragment of
+/// `len` bytes.
+///
+/// Mirrors stellar-core `XDROutputFileStream::writeOne` (`XDRStream.h:483`):
+/// the high bit of the high byte is set to flag the last fragment, and the
+/// lower 31 bits carry the byte length, big-endian.
+///
+/// This is the single source of truth for the framing — both [`write_one`]
+/// and [`PregeneratedTxReader::read_one`] go through it, so the writer and
+/// reader can never drift.
+fn record_mark(len: usize) -> [u8; 4] {
+    debug_assert!(
+        (len as u64) < LAST_FRAGMENT_FLAG as u64,
+        "record fragment length must fit in 31 bits"
+    );
+    ((len as u32) | LAST_FRAGMENT_FLAG).to_be_bytes()
+}
+
+/// Write a single `TransactionEnvelope` as one record-marked, single-fragment
+/// record: a 4-byte big-endian record mark (`xdr_len | 0x8000_0000`) followed
+/// by the marshaled XDR bytes.
+///
+/// Mirrors stellar-core `XDROutputFileStream::writeOne`. The bytes produced
+/// here are read back identically by [`PregeneratedTxReader::read_one`].
+pub fn write_one(out: &mut impl Write, env: &TransactionEnvelope) -> anyhow::Result<()> {
+    let bytes = env
+        .to_xdr(Limits::none())
+        .map_err(|e| anyhow::anyhow!("failed to encode TransactionEnvelope: {e}"))?;
+    out.write_all(&record_mark(bytes.len()))?;
+    out.write_all(&bytes)?;
+    Ok(())
+}
 
 /// Stateful reader over a record-marked file of `TransactionEnvelope`s.
 pub struct PregeneratedTxReader {
@@ -68,8 +107,8 @@ impl PregeneratedTxReader {
             ]);
             self.offset += 4;
 
-            let last_fragment = (mark & 0x8000_0000) != 0;
-            let frag_len = (mark & 0x7FFF_FFFF) as usize;
+            let last_fragment = (mark & LAST_FRAGMENT_FLAG) != 0;
+            let frag_len = (mark & FRAGMENT_LEN_MASK) as usize;
 
             if self.offset + frag_len > self.data.len() {
                 anyhow::bail!(
@@ -128,11 +167,12 @@ mod tests {
         })
     }
 
-    /// Wrap a single XDR blob in one record mark (last-fragment set).
-    fn record_mark(bytes: &[u8]) -> Vec<u8> {
+    /// Wrap a single XDR blob in one record mark (last-fragment set), reusing
+    /// the production [`super::record_mark`] framing so tests cannot diverge
+    /// from the writer/reader.
+    fn record_marked(bytes: &[u8]) -> Vec<u8> {
         let mut out = Vec::new();
-        let mark = (bytes.len() as u32) | 0x8000_0000;
-        out.extend_from_slice(&mark.to_be_bytes());
+        out.extend_from_slice(&super::record_mark(bytes.len()));
         out.extend_from_slice(bytes);
         out
     }
@@ -142,7 +182,7 @@ mod tests {
         let envs = [make_env(10), make_env(20), make_env(30)];
         let mut file = Vec::new();
         for e in &envs {
-            file.extend_from_slice(&record_mark(&e.to_xdr(Limits::none()).unwrap()));
+            file.extend_from_slice(&record_marked(&e.to_xdr(Limits::none()).unwrap()));
         }
 
         let mut reader = PregeneratedTxReader::from_bytes(file);
@@ -194,5 +234,31 @@ mod tests {
         let mut reader = PregeneratedTxReader::from_bytes(file);
         let got = reader.read_one().unwrap().expect("envelope present");
         assert_eq!(got, env);
+    }
+
+    #[test]
+    fn write_one_roundtrips_through_reader() {
+        let envs = [make_env(1), make_env(2), make_env(3)];
+
+        // Write each envelope with the production writer.
+        let mut file = Vec::new();
+        for e in &envs {
+            write_one(&mut file, e).unwrap();
+        }
+
+        // The leading 4 bytes of the first record must be the single-fragment
+        // mark `0x8000_0000 | xdr_len`.
+        let xdr_len = envs[0].to_xdr(Limits::none()).unwrap().len() as u32;
+        let mark = u32::from_be_bytes([file[0], file[1], file[2], file[3]]);
+        assert_eq!(mark, 0x8000_0000 | xdr_len);
+        assert_ne!(mark & 0x8000_0000, 0, "last-fragment bit must be set");
+
+        // Read them all back via the reader — identical, in order.
+        let mut reader = PregeneratedTxReader::from_bytes(file);
+        for expected in &envs {
+            let got = reader.read_one().unwrap().expect("envelope present");
+            assert_eq!(&got, expected);
+        }
+        assert!(reader.read_one().unwrap().is_none());
     }
 }

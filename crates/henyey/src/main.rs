@@ -1467,6 +1467,33 @@ enum Commands {
         iterations: u32,
     },
 
+    /// Pre-generate a record-marked file of payment transactions for load tests
+    ///
+    /// Bootstraps a standalone genesis network and writes `--count` 1-stroop
+    /// native payment transactions, round-robining the source account over
+    /// `--accounts` test accounts (offset by `--offset`). The output file is
+    /// consumed by the `PayPregenerated` load mode / Supercluster missions.
+    ///
+    /// Mirrors stellar-core's `gen-load-txs` / `runGenerateSyntheticLoad`.
+    #[command(name = "pregenerate-loadgen-txs")]
+    PregenerateLoadgenTxs {
+        /// Output file path for the record-marked transaction stream
+        #[arg(long, default_value = "stellar-load-transactions.xdr")]
+        output_file: PathBuf,
+
+        /// Number of transactions to generate (default: 1000)
+        #[arg(long, default_value = "1000")]
+        count: u32,
+
+        /// Number of test accounts to round-robin over (default: 100)
+        #[arg(long, default_value = "100")]
+        accounts: u32,
+
+        /// Offset added to each round-robin account index (default: 0)
+        #[arg(long, default_value = "0")]
+        offset: u32,
+    },
+
     /// Compare a checkpoint between two history archives
     ///
     /// Downloads checkpoint data (HAS, ledger headers, transactions, results)
@@ -1736,6 +1763,24 @@ async fn main() -> anyhow::Result<()> {
                     clusters,
                     tx_count,
                     iterations,
+                },
+            )
+            .await
+        }
+
+        Commands::PregenerateLoadgenTxs {
+            output_file,
+            count,
+            accounts,
+            offset,
+        } => {
+            cmd_pregenerate_loadgen_txs(
+                config,
+                PregenerateLoadgenOptions {
+                    output_file,
+                    count,
+                    accounts,
+                    offset,
                 },
             )
             .await
@@ -2225,6 +2270,106 @@ enum CliApplyLoadMode {
     LedgerLimits,
     MaxSacTps,
     SingleShot,
+}
+
+/// Options for the `pregenerate-loadgen-txs` command.
+struct PregenerateLoadgenOptions {
+    output_file: PathBuf,
+    count: u32,
+    accounts: u32,
+    offset: u32,
+}
+
+/// `pregenerate-loadgen-txs` command handler.
+///
+/// Bootstraps a standalone genesis network (mirroring `cmd_apply_load`) and
+/// writes a record-marked file of payment transactions consumable by the
+/// `PayPregenerated` load mode.
+///
+/// Parity port of stellar-core `runGenerateSyntheticLoad`
+/// (`CommandLine.cpp:1972`) → `generateTransactions` (`TestUtils.cpp:486`).
+async fn cmd_pregenerate_loadgen_txs(
+    mut config: AppConfig,
+    opts: PregenerateLoadgenOptions,
+) -> anyhow::Result<()> {
+    use henyey_simulation::TxGenerator;
+
+    if opts.accounts == 0 {
+        anyhow::bail!("Number of accounts must be greater than 0");
+    }
+
+    // Configure for standalone operation — the node never connects to peers or
+    // runs consensus; it only bootstraps a genesis ledger to load account
+    // sequences from. Mirrors cmd_apply_load.
+    config.node.manual_close = true;
+    config.node.is_validator = true;
+    config.testing.run_standalone = true;
+    config.http.enabled = false;
+    config.compat_http.enabled = false;
+
+    // Ensure the referenced test accounts (TestAccount-0 .. offset+accounts-1)
+    // exist at genesis with valid sequence numbers, so `find_account` loads
+    // their real seqs from the DB instead of falling back to the synthetic
+    // (ledger << 32) seq (which would make the generated txns invalid on apply).
+    let required_accounts = opts
+        .offset
+        .checked_add(opts.accounts)
+        .ok_or_else(|| anyhow::anyhow!("offset + accounts overflows u32"))?;
+    config.testing.genesis_test_account_count = config
+        .testing
+        .genesis_test_account_count
+        .max(required_accounts);
+
+    // Generate an ephemeral node seed (required for validators).
+    if config.node.node_seed.is_none() {
+        let ephemeral = henyey_crypto::SecretKey::generate();
+        config.node.node_seed = Some(ephemeral.to_strkey());
+    }
+
+    // Use a temporary directory for the database and buckets.
+    let data_dir = tempfile::tempdir()?;
+    config.database.path = data_dir.path().join("pregenerate.db");
+    config.buckets.directory = data_dir.path().join("buckets");
+    std::fs::create_dir_all(&config.buckets.directory)?;
+
+    let network_passphrase = config.network.passphrase.clone();
+
+    // Initialize the genesis ledger in the temporary database.
+    henyey_simulation::initialize_genesis_ledger(&config, &network_passphrase)?;
+
+    // Create the application and bootstrap from the genesis DB.
+    let app = std::sync::Arc::new(henyey_app::App::new(config).await?);
+    app.set_self_arc().await;
+    app.bootstrap_from_db().await?;
+
+    if let Some(parent) = opts.output_file.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+
+    println!(
+        "pregenerate-loadgen-txs: generating {} transactions using {} accounts (offset {}) -> {}",
+        opts.count,
+        opts.accounts,
+        opts.offset,
+        opts.output_file.display()
+    );
+
+    let mut txgen = TxGenerator::new(app, network_passphrase);
+    txgen.generate_payment_txs_to_file(
+        &opts.output_file,
+        opts.count,
+        opts.accounts,
+        opts.offset,
+    )?;
+
+    println!(
+        "Generated {} transactions in {}",
+        opts.count,
+        opts.output_file.display()
+    );
+    Ok(())
 }
 
 async fn cmd_apply_load(mut config: AppConfig, opts: ApplyLoadOptions) -> anyhow::Result<()> {
@@ -4057,6 +4202,56 @@ mod tests {
                 assert_eq!(path, PathBuf::from("foo.json"));
             }
             _ => panic!("Expected check-quorum-intersection command"),
+        }
+    }
+
+    #[test]
+    fn test_parse_pregenerate_defaults() {
+        // Bare subcommand: all args take their stellar-core-matching defaults.
+        let cli = Cli::parse_from(["rs-stellar-core", "pregenerate-loadgen-txs"]);
+        match cli.command {
+            Commands::PregenerateLoadgenTxs {
+                output_file,
+                count,
+                accounts,
+                offset,
+            } => {
+                assert_eq!(output_file, PathBuf::from("stellar-load-transactions.xdr"));
+                assert_eq!(count, 1000);
+                assert_eq!(accounts, 100);
+                assert_eq!(offset, 0);
+            }
+            _ => panic!("Expected pregenerate-loadgen-txs command"),
+        }
+    }
+
+    #[test]
+    fn test_parse_pregenerate_overrides() {
+        let cli = Cli::parse_from([
+            "rs-stellar-core",
+            "pregenerate-loadgen-txs",
+            "--output-file",
+            "out.xdr",
+            "--count",
+            "5",
+            "--accounts",
+            "3",
+            "--offset",
+            "7",
+        ]);
+        match cli.command {
+            Commands::PregenerateLoadgenTxs {
+                output_file,
+                count,
+                accounts,
+                offset,
+            } => {
+                assert_eq!(output_file, PathBuf::from("out.xdr"));
+                assert_eq!(count, 5);
+                assert_eq!(accounts, 3);
+                assert_eq!(offset, 7);
+            }
+            _ => panic!("Expected pregenerate-loadgen-txs command"),
         }
     }
 

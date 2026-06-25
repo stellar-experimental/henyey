@@ -16,7 +16,7 @@
 | Key and ID helpers | Full | `convert-id` and seed generation both exist |
 | Quorum intersection analysis | Partial | V1 JSON check only; SAT solver path absent |
 | Settings upgrade transactions | Partial | Command exists, but helper behavior diverges in details |
-| Load and benchmark tooling | Partial | `apply-load` exists; `pregenerate-loadgen-txs` absent |
+| Load and benchmark tooling | Full | `apply-load` and `pregenerate-loadgen-txs` both implemented |
 | XDR inspection and signing tools | None | `print-xdr`, `dump-xdr`, `sign-transaction` absent |
 | Diagnostic maintenance commands | None | Bucket, archival, asset-supply diagnostics absent |
 | History/reporting extras | None | Publish-queue and last-checkpoint reporting absent |
@@ -93,7 +93,7 @@ Corresponds to: `CommandLine.cpp`, `dumpxdr.h`
 | `runPrintPublishQueue()` | -- | None |
 | `runReportLastHistoryCheckpoint()` | -- | None |
 | `runReplayDebugMeta()` | -- | None |
-| `runGenerateSyntheticLoad()` (`pregenerate-loadgen-txs`) | -- | None |
+| `runGenerateSyntheticLoad()` (`pregenerate-loadgen-txs`) | Yes | Full |
 | `runCalculateAssetSupply()` | -- | None |
 | `runMergeBucketList()` | -- | None |
 | `runDumpStateArchivalStatistics()` | -- | None |
@@ -134,7 +134,6 @@ Features not yet implemented. These ARE counted against parity %.
 | `runMergeBucketList()` / `runDumpStateArchivalStatistics()` / `runCalculateAssetSupply()` / `diagBucketStats()` | Low | Diagnostic maintenance commands are still missing |
 | `runPrintPublishQueue()` / `runReportLastHistoryCheckpoint()` | Low | Archive/reporting helper commands are not implemented |
 | `runReplayDebugMeta()` | Low | No local debug-meta replay path |
-| `runGenerateSyntheticLoad()` (`pregenerate-loadgen-txs`) | Low | No standalone transaction pre-generation command |
 
 ## Architectural Differences
 
