@@ -26,7 +26,7 @@
 
 use crate::config::{
     AppConfig, CompatHttpConfig, CompatQuorumSafety, DatabaseConfig, FailureSafety,
-    HistoryArchiveEntry, ValidationThresholdLevel,
+    HistoryArchiveEntry, QuorumSetConfig, ValidationThresholdLevel,
 };
 use henyey_herder::{ValidatorEntryInfo, ValidatorQuality, ValidatorWeightConfig};
 use henyey_overlay::PeerAddress;
@@ -561,13 +561,32 @@ pub fn translate_stellar_core_config(raw: &toml::Value) -> anyhow::Result<AppCon
         }
     }
 
-    // Build ValidatorWeightConfig when on the auto-generated quorum set path
-    // (not manual [QUORUM_SET]) and validators have quality/home_domain data.
-    // Matches stellar-core: setValidatorWeightConfig is only called on the
-    // auto-generated qset path (Config.cpp:2110).
+    // Build ValidatorWeightConfig + auto-generated hierarchical quorum set when
+    // on the auto-generated quorum set path (not manual [QUORUM_SET]) and
+    // validators have quality/home_domain data. Matches stellar-core:
+    // setValidatorWeightConfig + generateQuorumSet are only run on the
+    // auto-generated qset path (Config.cpp:2102-2110).
+    //
+    // The validator+self `entries` list is assembled ONCE (core adds self via
+    // addSelfToValidators before both setValidatorWeightConfig and
+    // generateQuorumSet) and fed to both the weight config and the qset
+    // generator.
     if config.node.is_validator && !validator_entries.is_empty() && !has_manual_quorum_set {
-        config.validator_weight_config =
-            build_validator_weight_config(&config, &validator_entries, &domain_quality_map)?;
+        if let Some(entries) =
+            assemble_validator_entries(&config, &validator_entries, &domain_quality_map)?
+        {
+            config.validator_weight_config = match ValidatorWeightConfig::new(&entries) {
+                Ok(vwc) => Some(vwc),
+                Err(e) => anyhow::bail!("Invalid ValidatorWeightConfig: {}", e),
+            };
+            // Fully REPLACE the quorum set with the generated hierarchical one.
+            // The flat `config.node.quorum_set.validators = validator_keys`
+            // assignment above must NOT survive on this path: the generated top
+            // set has no direct validators (only inner_sets), and a stale flat
+            // validators list would corrupt `to_xdr`'s threshold total
+            // (total = validators.len() + inner_sets.len()).
+            config.node.quorum_set = generate_quorum_set(&entries)?;
+        }
     }
 
     // --- Old-style [QUORUM_SET] (used by quickstart local mode) ---
@@ -587,48 +606,11 @@ pub fn translate_stellar_core_config(raw: &toml::Value) -> anyhow::Result<AppCon
         let qs_table = qs_val.as_table().ok_or_else(|| {
             anyhow::anyhow!("QUORUM_SET: expected table, got {}", qs_val.type_str())
         })?;
-        if let Some(raw_validators) = get_string_array(qs_table, "VALIDATORS")
-            .map_err(|e| anyhow::anyhow!("[QUORUM_SET] {e}"))?
-        {
-            let mut keys: Vec<String> = Vec::new();
-            for s in &raw_validators {
-                if s == "$self" {
-                    // "$self" refers to the node's own key — resolve it from NODE_SEED
-                    let seed_str = config.node.node_seed.as_ref().ok_or_else(|| {
-                        anyhow::anyhow!("Cannot resolve $self in [QUORUM_SET]: NODE_SEED not set")
-                    })?;
-                    let secret = henyey_crypto::SecretKey::from_strkey(seed_str).map_err(|e| {
-                        anyhow::anyhow!(
-                            "Cannot resolve $self in [QUORUM_SET]: invalid NODE_SEED: {}",
-                            e
-                        )
-                    })?;
-                    keys.push(secret.public_key().to_strkey());
-                } else {
-                    // stellar-core format: "$PUBKEY $NAME" (key+name space-separated).
-                    // Split on whitespace and keep only the first token (the public key).
-                    let key = s.split_whitespace().next().unwrap_or(s);
-                    keys.push(key.to_string());
-                }
-            }
-            // [QUORUM_SET] always overrides [[VALIDATORS]]-generated quorum set.
-            config.node.quorum_set.validators = keys;
-        }
-        // Parse THRESHOLD_PERCENT and apply it to the quorum set config.
-        // stellar-core default is 67 if not specified.
-        if let Some(tp) = qs_table
-            .get("THRESHOLD_PERCENT")
-            .and_then(|v| v.as_integer())
-        {
-            if (1..=100).contains(&tp) {
-                config.node.quorum_set.threshold_percent = tp as u32;
-            } else {
-                tracing::warn!(
-                    threshold_percent = tp,
-                    "THRESHOLD_PERCENT must be between 1 and 100, using default"
-                );
-            }
-        }
+        // [QUORUM_SET] always overrides any [[VALIDATORS]]-generated quorum set.
+        // Recursively parse nested [QUORUM_SET.subN] subtables, mirroring
+        // stellar-core's Config::loadQset (Config.cpp:571).
+        config.node.quorum_set = load_qset(qs_table, 0, config.node.node_seed.as_deref())
+            .map_err(|e| anyhow::anyhow!("[QUORUM_SET] {e}"))?;
     }
 
     // --- Testing keys ---
@@ -712,11 +694,17 @@ pub fn translate_stellar_core_config(raw: &toml::Value) -> anyhow::Result<AppCon
     // auto-generated set unless UNSAFE_QUORUM=true (Config.cpp:2087-2099).
     if has_validators_section && has_manual_quorum_set {
         if let Some(ref auto_qset) = auto_generated_qset {
-            // Compare in declaration order (no sorting). stellar-core compares
-            // serialized qset strings which are order-sensitive
-            // (Config.cpp:2087-2099).
-            let sets_differ = auto_qset.validators != config.node.quorum_set.validators
-                || auto_qset.threshold_percent != config.node.quorum_set.threshold_percent;
+            // stellar-core compares the serialized (normalized) qset strings
+            // (Config.cpp:2087-2099). Both the auto-generated and manual sets are
+            // now potentially hierarchical, so compare their normalized XDR forms
+            // (`to_xdr` applies normalize_quorum_set) rather than flat fields — a
+            // structurally-identical manual qset must not spuriously trip the
+            // override guard. If either fails to serialize, treat them as
+            // differing (the manual set will be re-validated downstream anyway).
+            let sets_differ = match (auto_qset.to_xdr(), config.node.quorum_set.to_xdr()) {
+                (Ok(a), Ok(b)) => a != b,
+                _ => true,
+            };
 
             if sets_differ && !unsafe_quorum {
                 anyhow::bail!(
@@ -914,10 +902,13 @@ fn classify_keys(table: &toml::map::Map<String, toml::Value>) -> Result<Unrecogn
     }
 
     // Sub-table: [QUORUM_SET]
+    // Any table-valued key that isn't THRESHOLD_PERCENT/VALIDATORS is a nested
+    // inner set (regardless of name — `sub0`, `sub1`, …), matching stellar-core
+    // `Config::loadQset`. Only a non-recognized SCALAR key is a likely typo.
     let qs_recognized: HashSet<&str> = QUORUM_SET_KEYS.iter().copied().collect();
     if let Some(qs_table) = get_table_strict(table, "QUORUM_SET")? {
-        for key in qs_table.keys() {
-            if !qs_recognized.contains(key.as_str()) {
+        for (key, value) in qs_table {
+            if !qs_recognized.contains(key.as_str()) && !value.is_table() {
                 result.quorum_set_unknown.push(key.clone());
             }
         }
@@ -987,18 +978,24 @@ fn parse_home_domains(
     Ok(map)
 }
 
-/// Build a `ValidatorWeightConfig` from parsed validator entries and domain→quality map.
+/// Assemble the validator+self `(NodeId, ValidatorEntryInfo)` list from parsed
+/// validator entries and the domain→quality map.
 ///
 /// Resolves each validator's quality from either inline QUALITY or the
 /// [[HOME_DOMAINS]] map. Adds a self-entry when the node is a validator.
 ///
+/// This is the single source of truth fed to BOTH `ValidatorWeightConfig::new`
+/// and `generate_quorum_set` — mirroring stellar-core, which runs
+/// `addSelfToValidators` once and then passes the resulting list to both
+/// `setValidatorWeightConfig` and `generateQuorumSet` (Config.cpp:2102-2110).
+///
 /// Returns `Ok(None)` if validators don't have quality/home_domain data
 /// (e.g., captive-core configs without [[HOME_DOMAINS]]).
-fn build_validator_weight_config(
+fn assemble_validator_entries(
     config: &AppConfig,
     validator_entries: &[(String, String, Option<String>, Option<String>)], // (pubkey, name, home_domain, quality)
     domain_quality_map: &HashMap<String, ValidatorQuality>,
-) -> anyhow::Result<Option<ValidatorWeightConfig>> {
+) -> anyhow::Result<Option<Vec<(stellar_xdr::NodeId, ValidatorEntryInfo)>>> {
     use stellar_xdr::NodeId;
 
     let mut entries: Vec<(NodeId, ValidatorEntryInfo)> = Vec::new();
@@ -1096,10 +1093,223 @@ fn build_validator_weight_config(
         return Ok(None);
     }
 
+    Ok(Some(entries))
+}
+
+/// Test-only wrapper preserving the historical `build_validator_weight_config`
+/// surface (assemble entries, then build the weight config). Production now
+/// assembles the entries once via `assemble_validator_entries` and feeds them to
+/// both `ValidatorWeightConfig::new` and `generate_quorum_set`.
+#[cfg(test)]
+fn build_validator_weight_config(
+    config: &AppConfig,
+    validator_entries: &[(String, String, Option<String>, Option<String>)],
+    domain_quality_map: &HashMap<String, ValidatorQuality>,
+) -> anyhow::Result<Option<ValidatorWeightConfig>> {
+    let Some(entries) = assemble_validator_entries(config, validator_entries, domain_quality_map)?
+    else {
+        return Ok(None);
+    };
     match ValidatorWeightConfig::new(&entries) {
         Ok(vwc) => Ok(Some(vwc)),
         Err(e) => anyhow::bail!("Invalid ValidatorWeightConfig: {}", e),
     }
+}
+
+/// Generate a hierarchical per-home-domain/quality quorum set from the
+/// validator+self entries list.
+///
+/// Faithful port of stellar-core's `Config::generateQuorumSet`
+/// (Config.cpp:2692): sort by quality DESC then home_domain ASC, recurse from
+/// CRITICAL via `generate_quorum_set_helper`. `normalize_quorum_set` (the port
+/// of core's `normalizeQSet`) is applied later by `QuorumSetConfig::to_xdr`, so
+/// it is intentionally NOT applied here (the config form is the pre-normalized
+/// hierarchy; normalization happens at XDR-conversion time).
+fn generate_quorum_set(
+    entries: &[(stellar_xdr::NodeId, ValidatorEntryInfo)],
+) -> anyhow::Result<QuorumSetConfig> {
+    let mut todo: Vec<&(stellar_xdr::NodeId, ValidatorEntryInfo)> = entries.iter().collect();
+    // Sort by quality DESC, home_domain ASC (Config.cpp:2698-2710).
+    todo.sort_by(|l, r| {
+        r.1.quality
+            .cmp(&l.1.quality)
+            .then_with(|| l.1.home_domain.cmp(&r.1.home_domain))
+    });
+    generate_quorum_set_helper(&todo, ValidatorQuality::Critical)
+}
+
+/// Recursive helper mirroring `Config::generateQuorumSetHelper`
+/// (Config.cpp:2632).
+///
+/// `slice` is sorted quality-DESC, home_domain-ASC. Groups consecutive
+/// same-home-domain validators at `cur_quality` into one SIMPLE_MAJORITY (51%)
+/// inner set; HIGH/CRITICAL domains require ≥3 validators. When lower-quality
+/// validators remain, recurses (rejecting non-descending quality) and appends
+/// the result as a nested inner set. The returned set encodes ALL_REQUIRED
+/// (100%) if `cur_quality` is CRITICAL, else BYZANTINE_FAULT_TOLERANCE (67%).
+fn generate_quorum_set_helper(
+    slice: &[&(stellar_xdr::NodeId, ValidatorEntryInfo)],
+    cur_quality: ValidatorQuality,
+) -> anyhow::Result<QuorumSetConfig> {
+    let mut ret = QuorumSetConfig {
+        threshold_percent: 0,
+        validators: Vec::new(),
+        inner_sets: Vec::new(),
+    };
+
+    let mut i = 0;
+    while i < slice.len() && slice[i].1.quality == cur_quality {
+        // Group consecutive validators sharing this validator's home domain.
+        let domain = &slice[i].1.home_domain;
+        let mut inner_validators: Vec<String> = Vec::new();
+        let mut j = i;
+        while j < slice.len() && &slice[j].1.home_domain == domain {
+            if slice[j].1.quality != slice[i].1.quality {
+                anyhow::bail!(
+                    "Validators '{}' and '{}' must have same quality",
+                    slice[i].1.name,
+                    slice[j].1.name
+                );
+            }
+            inner_validators.push(node_id_to_strkey(&slice[j].0));
+            j += 1;
+        }
+        if inner_validators.len() < 3
+            && (slice[i].1.quality == ValidatorQuality::High
+                || slice[i].1.quality == ValidatorQuality::Critical)
+        {
+            anyhow::bail!(
+                "Critical and High quality validators for '{}' must have redundancy of at least 3",
+                domain
+            );
+        }
+        // Per-domain inner set: SIMPLE_MAJORITY (51%). With no inner sets this
+        // reproduces core's computeDefaultThreshold(SIMPLE_MAJORITY) count.
+        ret.inner_sets.push(QuorumSetConfig {
+            threshold_percent: 51,
+            validators: inner_validators,
+            inner_sets: Vec::new(),
+        });
+        i = j;
+    }
+
+    if i < slice.len() {
+        if slice[i].1.quality > cur_quality {
+            anyhow::bail!(
+                "invalid validator quality for '{}' (must be ascending)",
+                slice[i].1.name
+            );
+        }
+        let low_q = generate_quorum_set_helper(&slice[i..], slice[i].1.quality)?;
+        ret.inner_sets.push(low_q);
+    }
+
+    // Top threshold: ALL_REQUIRED (100%) for the CRITICAL tier, else
+    // BYZANTINE_FAULT_TOLERANCE (67%).
+    ret.threshold_percent = if cur_quality == ValidatorQuality::Critical {
+        100
+    } else {
+        67
+    };
+
+    Ok(ret)
+}
+
+/// Encode a NodeId as its G... strkey (the form `QuorumSetConfig` stores).
+fn node_id_to_strkey(node_id: &stellar_xdr::NodeId) -> String {
+    let stellar_xdr::NodeId(stellar_xdr::PublicKey::PublicKeyTypeEd25519(stellar_xdr::Uint256(
+        bytes,
+    ))) = node_id;
+    // A 32-byte Ed25519 public key is always strkey-encodable.
+    stellar_strkey::ed25519::PublicKey(*bytes).to_string()
+}
+
+/// Recursively parse a `[QUORUM_SET]` (or nested `[QUORUM_SET.subN]`) table into
+/// a `QuorumSetConfig`.
+///
+/// Faithful port of stellar-core's `Config::loadQset` (Config.cpp:571):
+/// - default `THRESHOLD_PERCENT` is 67 (overridable, must be in 1..=100);
+/// - `VALIDATORS` entries are parsed with `parseNodeID` semantics — the first
+///   whitespace-delimited token is the key (so `"G... bd-0"` ⇒ `G...`), and
+///   `$self` resolves to the node's own key from `NODE_SEED`;
+/// - ANY other table-valued key (regardless of name — `sub0`, `sub1`, …) is an
+///   inner set, parsed at `level + 1`;
+/// - nesting deeper than `MAXIMUM_QUORUM_NESTING_LEVEL` (4) is rejected.
+fn load_qset(
+    table: &toml::map::Map<String, toml::Value>,
+    level: u32,
+    node_seed: Option<&str>,
+) -> anyhow::Result<QuorumSetConfig> {
+    // MAXIMUM_QUORUM_NESTING_LEVEL = 4 (QuorumSetUtils.cpp:16).
+    const MAXIMUM_QUORUM_NESTING_LEVEL: u32 = 4;
+    if level > MAXIMUM_QUORUM_NESTING_LEVEL {
+        anyhow::bail!("too many levels in quorum set");
+    }
+
+    let mut threshold_percent: u32 = 67;
+    let mut validators: Vec<String> = Vec::new();
+    let mut inner_sets: Vec<QuorumSetConfig> = Vec::new();
+
+    for (key, value) in table {
+        match key.as_str() {
+            "THRESHOLD_PERCENT" => {
+                let tp = value
+                    .as_integer()
+                    .ok_or_else(|| anyhow::anyhow!("invalid THRESHOLD_PERCENT"))?;
+                if tp <= 0 || tp > 100 {
+                    anyhow::bail!("invalid THRESHOLD_PERCENT");
+                }
+                threshold_percent = tp as u32;
+            }
+            "VALIDATORS" => {
+                let raw = get_string_array(table, "VALIDATORS")
+                    .map_err(|e| anyhow::anyhow!("{e}"))?
+                    .ok_or_else(|| anyhow::anyhow!("VALIDATORS must be an array of strings"))?;
+                for s in &raw {
+                    if s == "$self" {
+                        // "$self" refers to the node's own key — resolve from NODE_SEED.
+                        let seed_str = node_seed.ok_or_else(|| {
+                            anyhow::anyhow!("Cannot resolve $self: NODE_SEED not set")
+                        })?;
+                        let secret =
+                            henyey_crypto::SecretKey::from_strkey(seed_str).map_err(|e| {
+                                anyhow::anyhow!("Cannot resolve $self: invalid NODE_SEED: {}", e)
+                            })?;
+                        validators.push(secret.public_key().to_strkey());
+                    } else {
+                        // parseNodeID semantics: `iss >> nodestr` keeps only the
+                        // first whitespace-delimited token (the public key),
+                        // dropping any trailing common-name suffix.
+                        let token = s.split_whitespace().next().unwrap_or(s);
+                        validators.push(token.to_string());
+                    }
+                }
+            }
+            // Any other key MUST be an inner set (a subtable), regardless of its
+            // name — matching core's `else { /* must be a subset */ }` branch.
+            _ => {
+                let sub_table = value.as_table().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "invalid quorum set, should be a group while parsing '{}'",
+                        key
+                    )
+                })?;
+                let inner = load_qset(sub_table, level + 1, node_seed)
+                    .map_err(|e| anyhow::anyhow!("{e} while parsing '{}'", key))?;
+                inner_sets.push(inner);
+            }
+        }
+    }
+
+    if validators.is_empty() && inner_sets.is_empty() {
+        anyhow::bail!("invalid quorum set definition");
+    }
+
+    Ok(QuorumSetConfig {
+        threshold_percent,
+        validators,
+        inner_sets,
+    })
 }
 
 /// Parse a public key string into a NodeId.
@@ -2505,8 +2715,11 @@ mod tests {
         // --- Quorum: the listed [[VALIDATORS]] are exactly the 3 stellar-core
         // peers; henyey's own key is added automatically (NOT listed in its own
         // [[VALIDATORS]], mirroring stellar-core's addSelfToValidators which
-        // never dedups, Config.cpp:869-898). So the auto-generated quorum-set
-        // key list holds the 3 distinct core keys...
+        // never dedups, Config.cpp:869-898). The auto path now builds a
+        // hierarchical quorum set (generateQuorumSet): all 4 keys are leaves of
+        // the per-home-domain inner set, not flat top-level validators. Collect
+        // the leaf validators of the NORMALIZED to_xdr() output (the artifact
+        // that feeds SCP) and assert the 3 core keys + self appear there.
         let henyey_self_key = henyey_crypto::SecretKey::from_strkey(
             "SDQVDISRYN2JXBS7ICL7QJAEKB3HWBJFP2QECXG7GZICAHBK4UNJCWK2",
         )
@@ -2518,24 +2731,39 @@ mod tests {
             "GCUCJTIYXSOXKBSNFGNFWW5MUQ54HKRPGJUTQFJ5RQXZXNOLNXYDHRAP",
             "GC2V2EFSXN6SQTWVYA5EPJPBWWIMSD2XQNKUOHGEKB535AQE2I6IXV2Z",
         ];
-        let validators = &config.node.quorum_set.validators;
+        // Recursively collect all leaf node ids from a config quorum set.
+        fn collect_leaf_keys(qset: &QuorumSetConfig, out: &mut Vec<String>) {
+            out.extend(qset.validators.iter().cloned());
+            for inner in &qset.inner_sets {
+                collect_leaf_keys(inner, out);
+            }
+        }
+        let mut all_keys = Vec::new();
+        collect_leaf_keys(&config.node.quorum_set, &mut all_keys);
+        // Top-level generated qset has NO direct validators (only inner sets).
+        assert!(
+            config.node.quorum_set.validators.is_empty(),
+            "auto path must leave top-level validators empty, got: {:?}",
+            config.node.quorum_set.validators
+        );
         assert_eq!(
-            validators.len(),
-            3,
-            "expected the 3 listed stellar-core validators, got {}: {:?}",
-            validators.len(),
-            validators
+            all_keys.len(),
+            4,
+            "expected 3 core keys + auto-added self as quorum leaves, got {}: {:?}",
+            all_keys.len(),
+            all_keys
         );
         for core_key in core_keys {
             assert!(
-                validators.contains(&core_key.to_string()),
+                all_keys.contains(&core_key.to_string()),
                 "quorum must contain stellar-core key {core_key}"
             );
         }
-        // henyey does NOT list itself in [[VALIDATORS]] (no duplicate self).
+        // henyey's own key IS auto-added (as a quorum leaf) but is NOT listed in
+        // its own [[VALIDATORS]] section.
         assert!(
-            !validators.contains(&henyey_self_key),
-            "henyey must not list its own key in [[VALIDATORS]] (self is auto-added)"
+            all_keys.contains(&henyey_self_key),
+            "auto-added self key must appear as a quorum leaf"
         );
 
         // ...and the FULL 4-node quorum (3 core + auto-added self) materializes
@@ -4536,11 +4764,13 @@ NODE_SEED="SBXTJSLKQ2VZUEQNYU5EC6ZGQOONCX3JCFBK57R56YLYMUW76B2FMCJH self"
     }
 
     #[test]
-    fn test_quorum_set_empty_validators_overrides() {
-        // With [[VALIDATORS]] present AND [QUORUM_SET] VALIDATORS = [], the
-        // manual override should clear the auto-generated validator list.
-        // Before the fix, `if !keys.is_empty()` would skip the override,
-        // preserving the auto-generated quorum set from [[VALIDATORS]].
+    fn test_quorum_set_empty_validators_rejected() {
+        // A [QUORUM_SET] with VALIDATORS = [] and no inner sets is an empty
+        // quorum-set definition. stellar-core's Config::loadQset rejects this
+        // with "invalid quorum set definition" (Config.cpp:640-644). henyey's
+        // recursive load_qset mirrors that rejection exactly, rather than
+        // silently producing an empty validator list (the prior, non-core
+        // behavior).
         let toml: toml::Value = toml::from_str(
             r#"
             NETWORK_PASSPHRASE = "Standalone Network ; February 2017"
@@ -4560,11 +4790,10 @@ NODE_SEED="SBXTJSLKQ2VZUEQNYU5EC6ZGQOONCX3JCFBK57R56YLYMUW76B2FMCJH self"
             "#,
         )
         .unwrap();
-        let config = translate_stellar_core_config(&toml).unwrap();
+        let err = translate_stellar_core_config(&toml).unwrap_err();
         assert!(
-            config.node.quorum_set.validators.is_empty(),
-            "expected empty validators after VALIDATORS = [], got: {:?}",
-            config.node.quorum_set.validators
+            err.to_string().contains("invalid quorum set definition"),
+            "expected core-parity empty-qset rejection, got: {err}"
         );
     }
 
@@ -4899,10 +5128,16 @@ NODE_SEED="SBXTJSLKQ2VZUEQNYU5EC6ZGQOONCX3JCFBK57R56YLYMUW76B2FMCJH self"
 
     #[test]
     fn test_auto_qset_quality_tier_nesting() {
-        // HIGH (3 orgs x 3 vals) over MEDIUM (2 orgs x 2 vals) over LOW (1 org x
-        // 2 vals). Self joins a HIGH org. Top inner_sets = 3 HIGH org sets + 1
-        // nested set; nested = 2 MEDIUM org sets + 1 nested set; innermost = 1
-        // LOW org set (with 2 vals so no singleton collapse).
+        // HIGH (3 orgs x 3 vals) over MEDIUM (2 orgs x 2 vals) over LOW (2 orgs x
+        // 2 vals). Self joins a HIGH org. The tier wrappers must survive
+        // normalization: a LOW tier with a SINGLE org would collapse (threshold
+        // 1, one inner set) into its parent, so LOW is pinned to 2 orgs (likewise
+        // MEDIUM) — exactly the singleton-collapse caveat from the plan.
+        //
+        // After normalization:
+        //   top = 3 HIGH org sets + 1 MEDIUM-tier wrapper (4 inner sets)
+        //   MEDIUM-tier = 2 MEDIUM org sets + 1 LOW-tier wrapper (3 inner sets)
+        //   LOW-tier = 2 LOW org sets (2 inner sets, all org-level)
         let toml_str = build_auto_qset_toml(
             &[
                 ("h1", "HIGH", &[1, 2, 3]),
@@ -4911,6 +5146,7 @@ NODE_SEED="SBXTJSLKQ2VZUEQNYU5EC6ZGQOONCX3JCFBK57R56YLYMUW76B2FMCJH self"
                 ("m1", "MEDIUM", &[10, 11]),
                 ("m2", "MEDIUM", &[12, 13]),
                 ("l1", "LOW", &[14, 15]),
+                ("l2", "LOW", &[16, 17]),
             ],
             100,
             "h1",
@@ -4942,32 +5178,51 @@ NODE_SEED="SBXTJSLKQ2VZUEQNYU5EC6ZGQOONCX3JCFBK57R56YLYMUW76B2FMCJH self"
             .iter()
             .find(|s| !s.inner_sets.is_empty())
             .expect("a nested LOW-tier set must exist");
-        // LOW tier: just the single LOW org set.
-        assert_eq!(low_tier.inner_sets.len(), 1, "1 LOW org set");
-        assert_eq!(
-            low_tier.inner_sets[0].validators.len(),
-            2,
-            "LOW org has 2 validators (no singleton collapse)"
-        );
+        // LOW tier: 2 LOW org sets (each org-level, validators only).
+        assert_eq!(low_tier.inner_sets.len(), 2, "2 LOW org sets");
+        for org in low_tier.inner_sets.iter() {
+            assert_eq!(
+                org.validators.len(),
+                2,
+                "each LOW org has 2 validators (no singleton collapse)"
+            );
+            assert!(org.inner_sets.is_empty(), "LOW org sets are leaves");
+        }
     }
 
     #[test]
     fn test_auto_qset_ascending_quality_error() {
-        // Two validators in the same home domain with different qualities is a
-        // "must have same quality" error (handled via HOME_DOMAINS providing one
-        // quality per domain; inline mismatch can't happen). Instead exercise the
-        // genuine core path: a validator whose quality is higher than the current
-        // recursion tier cannot occur after sort, but a same-domain quality
-        // mismatch does. We test same-domain same-quality enforcement by giving a
-        // domain two validators where one carries an inline QUALITY that differs.
-        //
-        // The reachable error in henyey's model: a HIGH domain with <3 validators.
-        // Ascending-quality is structurally prevented by the quality-DESC sort, so
-        // we assert the redundancy guard here and cover nesting separately.
-        let toml_str = build_auto_qset_toml(&[("bd", "HIGH", &[1, 2])], 100, "bd");
-        let val: toml::Value = toml::from_str(&toml_str).unwrap();
-        let result = translate_stellar_core_config(&val);
-        assert!(result.is_err(), "HIGH domain with <3 validators must error");
+        // The ascending-quality guard fires when, mid-recursion, a validator's
+        // quality exceeds the current tier. The config-driven path always sorts
+        // quality-DESC first, so to exercise this branch we call
+        // generate_quorum_set_helper directly with a deliberately MIS-ordered
+        // slice (a LOW entry followed by a HIGH entry), reproducing core's
+        // "(must be ascending)" throw in generateQuorumSetHelper.
+        use stellar_xdr::{NodeId, PublicKey, Uint256};
+        let mk = |seed: u8, domain: &str, q: ValidatorQuality| {
+            let pk = henyey_crypto::SecretKey::from_seed(&[seed; 32]).public_key();
+            (
+                NodeId(PublicKey::PublicKeyTypeEd25519(Uint256(*pk.as_bytes()))),
+                ValidatorEntryInfo {
+                    name: format!("v{seed}"),
+                    home_domain: domain.to_string(),
+                    quality: q,
+                },
+            )
+        };
+        let low = mk(1, "lo", ValidatorQuality::Low);
+        let high = mk(2, "hi", ValidatorQuality::High);
+        // Slice ordered LOW-then-HIGH while recursing at LOW: the HIGH element's
+        // quality > cur_quality triggers the ascending-quality error.
+        let slice = vec![&low, &high];
+        let result = generate_quorum_set_helper(&slice, ValidatorQuality::Low);
+        let err = result
+            .expect_err("ascending quality must error")
+            .to_string();
+        assert!(
+            err.contains("ascending"),
+            "expected ascending-quality error, got: {err}"
+        );
     }
 
     #[test]

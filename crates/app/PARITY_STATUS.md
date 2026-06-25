@@ -90,6 +90,8 @@ Corresponds to: `Config.h`
 | network, overlay, history, maintenance, metadata, diagnostics, query fields | `AppConfig` sub-structs | Full |
 | `FORCE_SCP`, `MANUAL_CLOSE`, `CATCHUP_COMPLETE`, `CATCHUP_RECENT` | native fields in `AppConfig` | Full |
 | stellar-core flat config parsing | `translate_stellar_core_config()` | Full |
+| `generateQuorumSet()` / `generateQuorumSetHelper()` / `computeDefaultThreshold()` | `generate_quorum_set()` / `generate_quorum_set_helper()` in `compat_config.rs` — hierarchical per-home-domain/quality auto-qset (sort quality-DESC/domain-ASC, SIMPLE_MAJORITY per-domain inner sets, BFT/ALL_REQUIRED top, HIGH/CRITICAL≥3 + ascending-quality guards). Thresholds encoded as percents (51/67/100) and converted via `QuorumSetConfig::to_xdr` (`1+(n*p−1)/100`), byte-identical to core for tier-1 sizes (n≤50 SM / n≤102 BFT). | Full |
+| `loadQset()` (nested `[QUORUM_SET.subN]`) | `load_qset()` in `compat_config.rs` — recursive, default 67%, `parseNodeID` first-token node parsing, any table-valued key = inner set, level>4 rejection, empty-qset rejection | Full |
 | `PREFERRED_PEER_KEYS`, `PREFERRED_PEERS_ONLY` | Translated via strict helpers in compat config; passed to overlay | Full |
 | `INVARIANT_CHECKS`, `INVARIANT_EXTRA_CHECKS`, `STATE_SNAPSHOT_INVARIANT_LEDGER_FREQUENCY` | Validated in compat translation; non-default values of the two security-relevant keys are rejected (no InvariantManager subsystem in henyey). The frequency tuning knob is silently accepted as known-but-unsupported. | Partial |
 | testing knobs (`ARTIFICIALLY_*`, `LOADGEN_*`, `APPLY_LOAD_*`) | small supported subset only | Partial |
