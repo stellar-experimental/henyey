@@ -1364,13 +1364,6 @@ impl LoadGenerator {
         }
     }
 
-    /// Initialize the account pool for a load generation run.
-    ///
-    /// Populates `accounts_available` with account IDs `[offset, offset + n_accounts)`.
-    /// For Soroban invoke modes, builds the `contract_instances` map via round-robin
-    /// assignment of deployed contract instances to accounts.
-    ///
-    /// Matches stellar-core `LoadGenerator::start()`.
     /// Reset all per-run account state before starting a new load run.
     ///
     /// Parity port of stellar-core `LoadGenerator::reset()`
@@ -1399,6 +1392,13 @@ impl LoadGenerator {
         self.tx_generator.reset();
     }
 
+    /// Initialize the account pool for a load generation run.
+    ///
+    /// Populates `accounts_available` with account IDs `[offset, offset + n_accounts)`.
+    /// For Soroban invoke modes, builds the `contract_instances` map via round-robin
+    /// assignment of deployed contract instances to accounts.
+    ///
+    /// Matches stellar-core `LoadGenerator::start()`.
     fn start(&mut self, config: &mut GeneratedLoadConfig) {
         self.start_time = Some(Instant::now());
         self.total_submitted = 0;
