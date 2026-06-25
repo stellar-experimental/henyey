@@ -934,6 +934,47 @@ impl TxGenerator {
         Ok((source_id, envelope))
     }
 
+    /// Generate `count` 1-stroop native payment transactions, round-robining
+    /// the source account over `accounts` (offset by `offset`), and write them
+    /// to `path` as a record-marked XDR file consumable by
+    /// [`crate::PregeneratedTxReader`] / the `PayPregenerated` load mode.
+    ///
+    /// 1:1 port of stellar-core `generateTransactions` (`TestUtils.cpp:486`):
+    /// removes any existing output file, errors if `accounts == 0`, then for
+    /// `i in 0..count` builds a payment from source `(i % accounts) + offset`
+    /// via [`Self::payment_transaction`] (amount hardcoded to 1, no max fee
+    /// rate) and writes each envelope through the shared record-mark writer.
+    pub fn generate_payment_txs_to_file(
+        &mut self,
+        path: &std::path::Path,
+        count: u32,
+        accounts: u32,
+        offset: u32,
+    ) -> anyhow::Result<()> {
+        if accounts == 0 {
+            anyhow::bail!("Number of accounts must be greater than 0");
+        }
+
+        // Match core ordering: remove the existing file before (re)writing.
+        let _ = std::fs::remove_file(path);
+
+        let file = std::fs::File::create(path)
+            .map_err(|e| anyhow::anyhow!("failed to create output file {path:?}: {e}"))?;
+        let mut writer = std::io::BufWriter::new(file);
+
+        for i in 0..count {
+            let source_account_id = (i % accounts) as u64 + offset as u64;
+            // ledger_num = 0 mirrors core's `paymentTransaction(..., 0, ...)`.
+            let (_source, env) =
+                self.payment_transaction(accounts, offset, 0, source_account_id, None)?;
+            crate::loadgen_pregenerated::write_one(&mut writer, &env)?;
+        }
+
+        use std::io::Write;
+        writer.flush()?;
+        Ok(())
+    }
+
     /// Build and sign a `TransactionEnvelope` from a source account and
     /// operations.
     ///

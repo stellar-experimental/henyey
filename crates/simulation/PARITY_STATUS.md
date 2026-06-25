@@ -80,7 +80,7 @@ Corresponds to: scoped deterministic load-generation API.
 | Classic payment load | `LoadGenerator`, `TxGenerator::payment_transaction()` | Full |
 | Soroban upload/setup/invoke load | `LoadGenerator`, `SorobanTxBuilder` | Full |
 | Upgrade-setup / create-upgrade load (#3297) | `SorobanUpgradeSetup`/`SorobanCreateUpgrade`, `invoke_soroban_create_upgrade_tx`, `config_upgrade::build_config_upgrade_set` | Full |
-| Pregenerated payment load (#3297) | `PayPregenerated`, `PregeneratedTxReader` | Full |
+| Pregenerated payment load (#3297, #3620) | `PayPregenerated`, `PregeneratedTxReader` (replay); `TxGenerator::generate_payment_txs_to_file` + `write_one` (generator, port of `generateTransactions`) | Full |
 | `soroban_invoke_apply_load` (V2 invoke + APPLY_LOAD config) | `SorobanInvokeApplyLoad`, `TxGenerator::invoke_soroban_load_transaction_v2`, `SorobanTxBuilder::invoke_soroban_apply_load_tx`, `LoadGenApplyLoadConfig`, `sample_discrete`, `get_key_for_archived_entry`, overlay-only gate (#3309) | Full (autorestore dormant: `pre_populated_archived_entries=0`, mirroring stellar-core; bucket prepopulation harness out of scope) |
 | Account pool, retries, and reports | `TestAccount`, `LoadReport`, `LoadResult` | Full |
 | End-to-end load scenario breadth | selected tests and helpers | Partial |
@@ -103,7 +103,6 @@ Features excluded by design. These are NOT counted against parity %.
 | Shared manually stepped virtual clock | Lightweight nodes advance explicitly; app-backed nodes run on tokio |
 | Simulation-local overlay subclasses | Loopback and TCP transports live in `henyey-overlay` |
 | Upgrade-contract workflow for config changes | Apply-load injects config upgrades directly for benchmark isolation |
-| Pregenerated transaction-file replay | Current harness focuses on generated deterministic load |
 | Mainnet/live network execution | Integration simulation is local and deterministic |
 
 ## Gaps
