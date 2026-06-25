@@ -140,9 +140,14 @@ let UpgradeCoreResourceRequirements : V1ResourceRequirements =
     makeResourceRequirements 1000 256 4000 14000
 
 let SmallTestCoreResourceRequirements : V1ResourceRequirements =
-    // When running most missions, there are few core nodes, so each
-    // gets 0.1 vCPUs with bursting to 1vCPU and 256MB RAM guaranteed.
-    makeResourceRequirements 100 256 1000 256
+    // Vendored-fork tuning for henyey mixed-image runs on Namespace (nsc)
+    // single-node ~8GB clusters. Upstream's 256MB *limit* OOM-kills the henyey
+    // image under the heavy mixed-image profile (20k genesis accounts + sustained
+    // load). Keep the memory *request* low (512MB) so three core pods still
+    // schedule on one 8GB node, but raise the *limit* to 2.5GB so the henyey
+    // working set doesn't get OOM-killed (limits oversubscribe; only the
+    // loadgen-driver node spikes). CPU: 0.25 vCPU guaranteed, burst to 3.
+    makeResourceRequirements 250 512 3000 2560
 
 let MediumTestCoreResourceRequirements : V1ResourceRequirements =
     // About 2x more resources than for small tests, 0.2 vCPU/512 MB,

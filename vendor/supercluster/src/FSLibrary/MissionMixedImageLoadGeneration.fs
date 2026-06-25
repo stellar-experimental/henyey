@@ -70,6 +70,10 @@ let mixedImageLoadGeneration (oldImageNodeCount: int) (context: MissionContext) 
 
     let context =
         { context.WithSmallLoadgenOptions with
+              // SmallTestResources is tuned in this vendored fork (512MB req /
+              // 2.5GB limit) so the henyey image is not OOM-killed under the
+              // heavy mixed-image profile on nsc 8GB nodes. See StellarKubeSpecs
+              // SmallTestCoreResourceRequirements and VENDOR.md.
               coreResources = SmallTestResources
               numAccounts = context.numAccounts
               numTxs = context.numTxs

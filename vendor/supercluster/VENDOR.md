@@ -37,7 +37,35 @@ and is reproducible without a separate fork.
      henyey-majority at 20k accts / 50k txs vs ~5 min light).
 
 Used to validate the henyey create_upgrade / loadgen fixes (#3601, #3602,
-#3604, #3606, #3607).
+#3604, #3606, #3607, #3609/#3610, #3613, #3614).
+
+## Running the heavy mixed-image A/B (runbook)
+
+To reproduce the core-majority vs henyey-majority comparison on Namespace (nsc):
+
+- **Resources:** the mission uses `SmallTestResources`, retuned in this fork to
+  512MB request / 2.5GB limit. Upstream's 256MB limit OOM-kills the henyey image
+  under heavy load; the low request keeps three core pods schedulable on one
+  ~8GB nsc node. (See `StellarKubeSpecs.SmallTestCoreResourceRequirements`.)
+- **Pre-fund accounts at genesis** with `--genesis-test-account-count <N>` (e.g.
+  `20000`, matching `--num-accounts`). Without it the loadgen's account-creation
+  step is unreliable against the BUILD_TESTS core image on these clusters
+  (core's loadgen aborts `"Account <id> must exist in the DB"`; henyey's fails
+  `TxNoAccount`). Genesis pre-funding skips creation and goes straight to the
+  payment/soroban runs.
+- **Tx-rate matters — pick a *sustainable* rate.** The network's per-ledger
+  apply ceiling is `max_tx_set_size / ledger_close_time` ≈ `1000 / 5.4s` ≈
+  **185 tx/s**. `--tx-rate 250` *over-drives* the network (queue backlog ages
+  out → loadgen accounts left unsynced → run-1 `wait_till_complete` timeouts on
+  BOTH images; see henyey #3611/#3612). Use `--tx-rate 150` for a representative
+  run: at a sustainable rate henyey-majority matches core-majority (~10.5 min,
+  0 run-1 timeouts). Only use 250 to deliberately exercise over-capacity
+  behavior.
+- **Example (per composition):**
+  `--num-accounts 20000 --num-txs 50000 --tx-rate 150 --genesis-test-account-count 20000`,
+  run `MixedImageLoadGenerationWithOldImageMajority` (2c1h, core-majority) and
+  `MixedImageLoadGenerationWithNewImageMajority` (1c2h, henyey-majority) with
+  `--core-http-via-pod-exec --image <henyey> --old-image <core BUILD_TESTS>`.
 
 ## Updating
 
