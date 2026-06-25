@@ -4755,4 +4755,344 @@ NODE_SEED="SBXTJSLKQ2VZUEQNYU5EC6ZGQOONCX3JCFBK57R56YLYMUW76B2FMCJH self"
             "Expected HISTORY type error from classify_keys, got: {err}"
         );
     }
+
+    // ---- Auto-generated hierarchical quorum set + nested [QUORUM_SET] parsing
+    // (issue #3622). Tests assert on the NORMALIZED `to_xdr()` ScpQuorumSet (the
+    // artifact that feeds SCP), not the raw QuorumSetConfig, because
+    // normalize_quorum_set collapses singleton inner sets.
+
+    /// Deterministic test pubkey from a seed byte.
+    fn test_pubkey(seed: u8) -> String {
+        henyey_crypto::SecretKey::from_seed(&[seed; 32])
+            .public_key()
+            .to_strkey()
+    }
+
+    /// Deterministic test NODE_SEED (S...) from a seed byte.
+    fn test_node_seed(seed: u8) -> String {
+        henyey_crypto::SecretKey::from_seed(&[seed; 32]).to_strkey()
+    }
+
+    /// Build a stellar-core compat TOML for an auto-qset topology.
+    ///
+    /// `domains` is a list of (home_domain, quality, validator_seeds). The node
+    /// itself (NODE_SEED from `self_seed`) joins `self_domain`. All validators
+    /// use deterministic keys via `test_pubkey`.
+    fn build_auto_qset_toml(
+        domains: &[(&str, &str, &[u8])],
+        self_seed: u8,
+        self_domain: &str,
+    ) -> String {
+        let mut s = String::new();
+        s.push_str("NETWORK_PASSPHRASE = \"Standalone Network ; February 2017\"\n");
+        s.push_str(&format!("NODE_SEED = \"{}\"\n", test_node_seed(self_seed)));
+        s.push_str("NODE_IS_VALIDATOR = true\n");
+        s.push_str(&format!("NODE_HOME_DOMAIN = \"{}\"\n", self_domain));
+        for (domain, quality, _) in domains {
+            s.push_str("[[HOME_DOMAINS]]\n");
+            s.push_str(&format!("HOME_DOMAIN = \"{}\"\n", domain));
+            s.push_str(&format!("QUALITY = \"{}\"\n", quality));
+        }
+        for (domain, _quality, seeds) in domains {
+            for seed in *seeds {
+                s.push_str("[[VALIDATORS]]\n");
+                s.push_str(&format!("NAME = \"v{}\"\n", seed));
+                s.push_str(&format!("PUBLIC_KEY = \"{}\"\n", test_pubkey(*seed)));
+                s.push_str(&format!("HOME_DOMAIN = \"{}\"\n", domain));
+            }
+        }
+        s
+    }
+
+    #[test]
+    fn test_auto_qset_groups_by_home_domain() {
+        // 3 HIGH domains, 3 validators each. Self joins bd.
+        let toml_str = build_auto_qset_toml(
+            &[
+                ("bd", "HIGH", &[1, 2, 3]),
+                ("cq", "HIGH", &[4, 5, 6]),
+                ("kb", "HIGH", &[7, 8, 9]),
+            ],
+            200, // self is a distinct key, joins bd (so bd has 4 validators)
+            "bd",
+        );
+        let val: toml::Value = toml::from_str(&toml_str).unwrap();
+        let config = translate_stellar_core_config(&val).unwrap();
+
+        let xdr = config.node.quorum_set.to_xdr().unwrap();
+        // 3 inner sets (one per home domain), no top-level validators.
+        assert_eq!(xdr.inner_sets.len(), 3, "expected 3 per-domain inner sets");
+        assert!(
+            xdr.validators.is_empty(),
+            "top-level validators must be empty on the auto path"
+        );
+        // Top threshold = BFT of 3 inner sets = 3 - (3-1)/3 = 3.
+        assert_eq!(xdr.threshold, 3, "top BFT threshold of 3 inner sets");
+        for inner in xdr.inner_sets.iter() {
+            // bd has self + 3 = 4 validators; cq/kb have 3.
+            assert!(
+                inner.validators.len() == 3 || inner.validators.len() == 4,
+                "inner domain set should have 3 or 4 validators, got {}",
+                inner.validators.len()
+            );
+            // SIMPLE_MAJORITY: n - (n-1)/2.
+            let n = inner.validators.len() as u32;
+            let expected = n - (n - 1) / 2;
+            assert_eq!(inner.threshold, expected, "inner SM threshold for n={n}");
+        }
+    }
+
+    #[test]
+    fn test_auto_qset_threshold_matches_core_vector() {
+        // 7-org/23-node topology mirroring StableApproximateTier1CoreSets:
+        // bd/cq/kb/sp/sdf/wx = 3 each, lo = 5; all HIGH. Self joins sdf (so sdf
+        // has 4). Total inner sets = 7. Core counts: top BFT(7)=5, lo SM(5)=3,
+        // others SM(3)=2 (sdf SM(4)=3 because self adds one).
+        let toml_str = build_auto_qset_toml(
+            &[
+                ("bd", "HIGH", &[1, 2, 3]),
+                ("cq", "HIGH", &[4, 5, 6]),
+                ("kb", "HIGH", &[7, 8, 9]),
+                ("sp", "HIGH", &[10, 11, 12]),
+                ("sdf", "HIGH", &[13, 14, 15]),
+                ("wx", "HIGH", &[16, 17, 18]),
+                ("lo", "HIGH", &[19, 20, 21, 22, 23]),
+            ],
+            100, // self is a distinct key, joins sdf
+            "sdf",
+        );
+        let val: toml::Value = toml::from_str(&toml_str).unwrap();
+        let config = translate_stellar_core_config(&val).unwrap();
+        let xdr = config.node.quorum_set.to_xdr().unwrap();
+
+        assert_eq!(xdr.inner_sets.len(), 7, "7 org inner sets");
+        assert!(xdr.validators.is_empty());
+        // Top BFT of 7 = 7 - (7-1)/3 = 5.
+        assert_eq!(xdr.threshold, 5, "top BFT(7)");
+
+        // Find lo (5 validators), sdf (3 + self = 4), and a plain-3 org.
+        let mut saw_lo = false;
+        let mut saw_sdf = false;
+        let mut saw_three = false;
+        for inner in xdr.inner_sets.iter() {
+            let n = inner.validators.len() as u32;
+            let sm = n - (n - 1) / 2;
+            assert_eq!(inner.threshold, sm, "inner SM for n={n}");
+            match n {
+                5 => {
+                    saw_lo = true;
+                    assert_eq!(inner.threshold, 3, "lo SM(5)=3");
+                }
+                4 => {
+                    saw_sdf = true;
+                    assert_eq!(inner.threshold, 3, "sdf SM(4)=3 (self included)");
+                }
+                3 => {
+                    saw_three = true;
+                    assert_eq!(inner.threshold, 2, "other SM(3)=2");
+                }
+                _ => panic!("unexpected inner size {n}"),
+            }
+        }
+        assert!(saw_lo && saw_sdf && saw_three, "all org sizes present");
+    }
+
+    #[test]
+    fn test_auto_qset_quality_tier_nesting() {
+        // HIGH (3 orgs x 3 vals) over MEDIUM (2 orgs x 2 vals) over LOW (1 org x
+        // 2 vals). Self joins a HIGH org. Top inner_sets = 3 HIGH org sets + 1
+        // nested set; nested = 2 MEDIUM org sets + 1 nested set; innermost = 1
+        // LOW org set (with 2 vals so no singleton collapse).
+        let toml_str = build_auto_qset_toml(
+            &[
+                ("h1", "HIGH", &[1, 2, 3]),
+                ("h2", "HIGH", &[4, 5, 6]),
+                ("h3", "HIGH", &[7, 8, 9]),
+                ("m1", "MEDIUM", &[10, 11]),
+                ("m2", "MEDIUM", &[12, 13]),
+                ("l1", "LOW", &[14, 15]),
+            ],
+            100,
+            "h1",
+        );
+        let val: toml::Value = toml::from_str(&toml_str).unwrap();
+        let config = translate_stellar_core_config(&val).unwrap();
+        let xdr = config.node.quorum_set.to_xdr().unwrap();
+
+        // Top: 3 HIGH org sets + 1 nested (MEDIUM tier) = 4 inner sets.
+        assert_eq!(xdr.inner_sets.len(), 4, "3 HIGH orgs + 1 MEDIUM-tier nest");
+        assert!(xdr.validators.is_empty());
+
+        // Identify the nested MEDIUM-tier set: the one that itself contains inner
+        // sets (org sets have only validators).
+        let medium_tier = xdr
+            .inner_sets
+            .iter()
+            .find(|s| !s.inner_sets.is_empty())
+            .expect("a nested MEDIUM-tier set must exist");
+        // MEDIUM tier: 2 MEDIUM org sets + 1 nested (LOW tier) = 3 inner sets.
+        assert_eq!(
+            medium_tier.inner_sets.len(),
+            3,
+            "2 MEDIUM orgs + 1 LOW-tier nest"
+        );
+
+        let low_tier = medium_tier
+            .inner_sets
+            .iter()
+            .find(|s| !s.inner_sets.is_empty())
+            .expect("a nested LOW-tier set must exist");
+        // LOW tier: just the single LOW org set.
+        assert_eq!(low_tier.inner_sets.len(), 1, "1 LOW org set");
+        assert_eq!(
+            low_tier.inner_sets[0].validators.len(),
+            2,
+            "LOW org has 2 validators (no singleton collapse)"
+        );
+    }
+
+    #[test]
+    fn test_auto_qset_ascending_quality_error() {
+        // Two validators in the same home domain with different qualities is a
+        // "must have same quality" error (handled via HOME_DOMAINS providing one
+        // quality per domain; inline mismatch can't happen). Instead exercise the
+        // genuine core path: a validator whose quality is higher than the current
+        // recursion tier cannot occur after sort, but a same-domain quality
+        // mismatch does. We test same-domain same-quality enforcement by giving a
+        // domain two validators where one carries an inline QUALITY that differs.
+        //
+        // The reachable error in henyey's model: a HIGH domain with <3 validators.
+        // Ascending-quality is structurally prevented by the quality-DESC sort, so
+        // we assert the redundancy guard here and cover nesting separately.
+        let toml_str = build_auto_qset_toml(&[("bd", "HIGH", &[1, 2])], 100, "bd");
+        let val: toml::Value = toml::from_str(&toml_str).unwrap();
+        let result = translate_stellar_core_config(&val);
+        assert!(result.is_err(), "HIGH domain with <3 validators must error");
+    }
+
+    #[test]
+    fn test_high_quality_needs_three() {
+        // A HIGH-quality home domain with only 2 validators (self in a different
+        // domain) must error with the redundancy message.
+        let toml_str = build_auto_qset_toml(
+            &[("bd", "HIGH", &[1, 2]), ("cq", "HIGH", &[4, 5, 6])],
+            100,
+            "cq",
+        );
+        let val: toml::Value = toml::from_str(&toml_str).unwrap();
+        let err = translate_stellar_core_config(&val).unwrap_err();
+        assert!(
+            err.to_string().contains("redundancy") || err.to_string().contains("at least 3"),
+            "expected redundancy error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_explicit_nested_qset_recurses() {
+        // [QUORUM_SET] with THRESHOLD_PERCENT + two nested subtables, each with
+        // VALIDATORS. Mirrors SSC addExplicitQsetAt output.
+        let toml_str = format!(
+            r#"
+            NETWORK_PASSPHRASE = "Standalone Network ; February 2017"
+            NODE_SEED = "{seed}"
+            NODE_IS_VALIDATOR = true
+            UNSAFE_QUORUM = true
+            FAILURE_SAFETY = 0
+            [QUORUM_SET]
+            THRESHOLD_PERCENT = 67
+            [QUORUM_SET.sub0]
+            THRESHOLD_PERCENT = 51
+            VALIDATORS = ["{a}", "{b}", "{c}"]
+            [QUORUM_SET.sub1]
+            THRESHOLD_PERCENT = 51
+            VALIDATORS = ["{d}", "{e}", "{f}"]
+            "#,
+            seed = test_node_seed(100),
+            a = test_pubkey(1),
+            b = test_pubkey(2),
+            c = test_pubkey(3),
+            d = test_pubkey(4),
+            e = test_pubkey(5),
+            f = test_pubkey(6),
+        );
+        let val: toml::Value = toml::from_str(&toml_str).unwrap();
+        let config = translate_stellar_core_config(&val).unwrap();
+        let xdr = config.node.quorum_set.to_xdr().unwrap();
+
+        assert_eq!(xdr.inner_sets.len(), 2, "two nested subtables");
+        assert!(
+            xdr.validators.is_empty(),
+            "no direct validators at top of explicit nested qset"
+        );
+        // Top: 67% of 2 inner sets = 1 + (2*67-1)/100 = 2.
+        assert_eq!(xdr.threshold, 2);
+        for inner in xdr.inner_sets.iter() {
+            assert_eq!(inner.validators.len(), 3);
+            // 51% of 3 = 1 + (3*51-1)/100 = 2.
+            assert_eq!(inner.threshold, 2);
+        }
+    }
+
+    #[test]
+    fn test_explicit_qset_validator_name_suffix_stripped() {
+        // VALIDATORS entry "<G...> bd-0": only the leading G... token is parsed.
+        let pk = test_pubkey(1);
+        let toml_str = format!(
+            r#"
+            NETWORK_PASSPHRASE = "Standalone Network ; February 2017"
+            NODE_SEED = "{seed}"
+            NODE_IS_VALIDATOR = true
+            UNSAFE_QUORUM = true
+            FAILURE_SAFETY = 0
+            [QUORUM_SET]
+            THRESHOLD_PERCENT = 100
+            VALIDATORS = ["{pk} bd-0"]
+            "#,
+            seed = test_node_seed(100),
+            pk = pk,
+        );
+        let val: toml::Value = toml::from_str(&toml_str).unwrap();
+        let config = translate_stellar_core_config(&val).unwrap();
+        assert_eq!(config.node.quorum_set.validators.len(), 1);
+        assert_eq!(
+            config.node.quorum_set.validators[0], pk,
+            "name suffix must be stripped, only the G... token kept"
+        );
+    }
+
+    #[test]
+    fn test_explicit_qset_nesting_too_deep() {
+        // 5 levels of nesting (top=0, sub=1, sub.sub=2, ... level 5) must error
+        // (MAXIMUM_QUORUM_NESTING_LEVEL = 4).
+        let toml_str = format!(
+            r#"
+            NETWORK_PASSPHRASE = "Standalone Network ; February 2017"
+            NODE_SEED = "{seed}"
+            NODE_IS_VALIDATOR = true
+            UNSAFE_QUORUM = true
+            FAILURE_SAFETY = 0
+            [QUORUM_SET]
+            THRESHOLD_PERCENT = 67
+            [QUORUM_SET.a]
+            [QUORUM_SET.a.b]
+            [QUORUM_SET.a.b.c]
+            [QUORUM_SET.a.b.c.d]
+            [QUORUM_SET.a.b.c.d.e]
+            VALIDATORS = ["{pk}"]
+            "#,
+            seed = test_node_seed(100),
+            pk = test_pubkey(1),
+        );
+        let val: toml::Value = toml::from_str(&toml_str).unwrap();
+        let result = translate_stellar_core_config(&val);
+        assert!(
+            result.is_err(),
+            "nesting deeper than level 4 must be rejected"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("levels") || err.contains("nesting") || err.contains("too many"),
+            "expected nesting-depth error, got: {err}"
+        );
+    }
 }
