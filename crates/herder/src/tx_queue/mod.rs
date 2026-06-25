@@ -5627,6 +5627,43 @@ mod tests {
         assert_eq!(eff, dynamic_limit);
     }
 
+    /// Regression for #3612: the classic queue's effective ops/size capacity
+    /// must track the live `maxTxSetSize` (scaled by POOL_LEDGER_MULTIPLIER and
+    /// applied via `update_classic_queue_capacity`) on every ledger close,
+    /// mirroring stellar-core `TxQueueLimiter::reset` rebuilding capacity from
+    /// `maxScaledLedgerResources`. Before the fix the capacity is frozen at the
+    /// construction value and ignores `UpgradeMaxTxSetSize`.
+    #[test]
+    fn test_classic_queue_capacity_tracks_live_max_tx_set_size() {
+        // Construction-time capacity: maxTxSetSize=50, multiplier=2 → 100 ops.
+        const MULT: u32 = 2;
+        let initial_ops = 50 * MULT;
+        let config = TxQueueConfig {
+            max_size: initial_ops as usize,
+            max_queue_ops: Some(initial_ops),
+            ..Default::default()
+        };
+        let queue = TransactionQueue::new(config);
+
+        // Before any per-ledger update, the effective capacity is the
+        // construction-time value.
+        assert_eq!(queue.effective_max_queue_ops(), Some(initial_ops));
+        assert_eq!(queue.effective_max_size(), initial_ops as usize);
+
+        // UpgradeMaxTxSetSize raises maxTxSetSize 50 → 200; the per-ledger-close
+        // reset must grow the effective capacity to 200 * MULT = 400 ops.
+        let upgraded_ops = 200 * MULT;
+        queue.update_classic_queue_capacity(upgraded_ops);
+        assert_eq!(queue.effective_max_queue_ops(), Some(upgraded_ops));
+        assert_eq!(queue.effective_max_size(), upgraded_ops as usize);
+
+        // A downgrade 200 → 50 must shrink the capacity symmetrically.
+        let downgraded_ops = 50 * MULT;
+        queue.update_classic_queue_capacity(downgraded_ops);
+        assert_eq!(queue.effective_max_queue_ops(), Some(downgraded_ops));
+        assert_eq!(queue.effective_max_size(), downgraded_ops as usize);
+    }
+
     /// Without static config, effective returns None until dynamic update.
     #[test]
     fn test_effective_queue_soroban_resources_none_without_config() {
