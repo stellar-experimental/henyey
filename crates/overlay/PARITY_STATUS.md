@@ -101,8 +101,8 @@ Corresponds to: `FlowControl.h`, `FlowControlCapacity.h`
 | `getMessagePriority()` | `MessagePriority::from_message()` | Full |
 | `isSendMoreValid()` | `is_send_more_valid()` | Full |
 | `beginMessageProcessing()` | `begin_message_processing()` | Full |
-| `endMessageProcessing()` | `end_message_processing()` | Full |
-| `canRead()` | `can_read()` | Full |
+| `endMessageProcessing()` | `end_message_processing()` (released at consumer-drain via `FlowControlRelease`, #3625 Phase 1) | Full |
+| `canRead()` | `can_read()` (defined; read-side socket throttle wiring deferred to #3642) | Partial |
 | `noOutboundCapacityTimeout()` | `no_outbound_capacity_timeout()` | Full |
 | `getFlowControlJsonInfo()` | `get_stats()` | Full |
 | `setPeerID()` | `set_peer_id()` | Full |
@@ -528,7 +528,8 @@ Features not yet implemented. These ARE counted against parity %.
 7. **Bounded SCP ingest channel (`scp_message_tx`/`scp_message_rx`, #3623)** — henyey-specific approximation of core's inbound flow control
    - **stellar-core**: Processes SCP synchronously on the main thread under a bounded inbound flow-control capacity (`FlowControlMessageCapacity::canRead`, `Peer::recvMessage` → `recvSCPMessage`). A sending peer cannot exceed the receiver's negotiated inbound capacity, and capacity is only released as messages are consumed — so when the main loop stalls, peers stop being granted send-more and back off. There is **no unbounded async queue** between overlay receive and herder processing.
    - **Rust**: SCP envelopes cross from the peer-receive path to the main event loop over a dedicated `tokio::sync::mpsc` channel. This channel is **bounded** at `SCP_CHANNEL_CAPACITY` (8192). On overflow the overlay side `try_send`s and **drops** the envelope (counted in `messages_dropped`) rather than blocking the peer path. Dropped SCP is recoverable: peers re-flood every slot and the event loop's gap-detection + `SyncRecoveryManager` backfill missing state via `GetScpState`.
-   - **Rationale**: Originally an `mpsc::unbounded_channel`, which had no core analog. When the event loop stalled (#3582, post-catchup SQLite write-lock contention), ~24 validators flooded ~100+ envelopes/slot with nothing draining, growing RSS ~4 GB/min until OOM-kill — a fatal restart loop (#3623). The fixed-capacity drop-on-full channel achieves the essential property core guarantees (bounded inbound memory) without changing which envelopes are *processed*, moving henyey toward parity. It is a count-based approximation of core's credit-based `FlowControlMessageCapacity`; a faithful credit-based byte-bounded port is the tracked follow-up **#3625**.
+   - **Rationale**: Originally an `mpsc::unbounded_channel`, which had no core analog. When the event loop stalled (#3582, post-catchup SQLite write-lock contention), ~24 validators flooded ~100+ envelopes/slot with nothing draining, growing RSS ~4 GB/min until OOM-kill — a fatal restart loop (#3623). The fixed-capacity drop-on-full channel achieves the essential property core guarantees (bounded inbound memory) without changing which envelopes are *processed*, moving henyey toward parity.
+   - **#3625 Phase 1 (drain-gated SEND_MORE)**: SEND_MORE credit is now released on **consumer drain**, not channel enqueue. The per-peer `begin_message_processing` capacity lock taken on the peer-receive task is carried as a `FlowControlRelease` token on the SCP-routed `OverlayMessage`; `end_message_processing` fires (and a `SEND_MORE_EXTENDED` is granted at the 40-message / byte batch boundary) only when the app event-loop consumer drains the envelope (`pump_scp_intake`). A stalled consumer therefore stops granting SEND_MORE, back-pressuring senders that honor outbound capacity — matching core's "release per processed message" model. The release is idempotent and fires on every drain/drop path (including the #3623 drop-on-full backstop, which is **retained as defense-in-depth**), so inbound credit never leaks. Remaining gaps: read-side `can_read()` socket throttle = **#3642** (Phase 2); tx/byte-capacity coupling + outbound straggler timeout + retiring the #3623 drop backstop = **#3643** (Phase 3).
 
 ## Test Coverage
 

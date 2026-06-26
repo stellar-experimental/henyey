@@ -501,6 +501,10 @@ struct PeerLoopCtx<'a> {
     /// #3570 observability: loop-local count of SCP envelopes henyey has
     /// written to this peer (accumulated from SEND_MORE-triggered drains).
     scp_written: &'a mut u64,
+    /// Clone of this peer's outbound sender. Attached to the drain-gated
+    /// flow-control release token (#3625) so the app SCP consumer can enqueue
+    /// the `SEND_MORE_EXTENDED` grant back to this peer at the batch boundary.
+    outbound_tx: &'a mpsc::Sender<OutboundMessage>,
 }
 
 /// Read-only timing and message counters for timeout checks.
@@ -870,6 +874,14 @@ impl OverlayManager {
         ctx: &mut PeerLoopCtx<'_>,
         state: &SharedPeerState,
         is_validator: bool,
+        // #3625: drain-gated release token for the SCP path. `Some` only when
+        // `message` is an SCP envelope. If routing drops the message early
+        // (rate-limit, watcher-shed, not-synced, etc.) the token is simply
+        // dropped here, which releases the held capacity immediately — matching
+        // stellar-core, where a dropped message releases its capacity right
+        // away. On the SCP routing path the token is moved onto the
+        // `OverlayMessage` so the release defers to consumer-drain time.
+        mut flow_release: Option<super::FlowControlRelease>,
     ) -> Option<bool> {
         // Parity: shouldAbort (Peer.cpp:1157-1160) — skip message processing
         // if the overlay is shutting down.
@@ -1026,11 +1038,15 @@ impl OverlayManager {
             log_fetch_message(message, peer_id, ctx.ping);
         }
 
-        // Forward to subscribers.
+        // Forward to subscribers. For SCP, the drain-gated release token
+        // (#3625) rides on the moved copy of the message into the dedicated SCP
+        // channel; `route_to_subscribers` releases it immediately if the
+        // bounded channel is full (drop-on-full), so capacity never leaks.
         let overlay_msg = OverlayMessage {
             from_peer: peer_id.clone(),
             message: message.clone(),
             received_at: Instant::now(),
+            flow_release: flow_release.take(),
         };
         let is_scp = state.route_to_subscribers(overlay_msg);
         Some(is_scp)
@@ -1101,6 +1117,7 @@ impl OverlayManager {
         peer_id: PeerId,
         mut peer: Peer,
         mut outbound_rx: mpsc::Receiver<OutboundMessage>,
+        outbound_tx: mpsc::Sender<OutboundMessage>,
         flow_control: Arc<FlowControl>,
         state: SharedPeerState,
     ) -> DropInitiator {
@@ -1251,6 +1268,7 @@ impl OverlayManager {
                                     scp_messages: &mut scp_messages,
                                     last_write: &mut last_write,
                                     scp_written: &mut scp_written,
+                                    outbound_tx: &outbound_tx,
                                 },
                                 &flow_control,
                                 &state,
@@ -1421,9 +1439,39 @@ impl OverlayManager {
             _ => {}
         }
 
+        // #3625 — drain-gated SEND_MORE. For SCP envelopes, transfer the
+        // capacity-release obligation from the inline `finish()` to a
+        // `FlowControlRelease` token that rides on the routed `OverlayMessage`
+        // and fires `end_message_processing` only when the app event-loop
+        // consumer actually drains the envelope. This keeps a stalled consumer
+        // from granting SEND_MORE at channel-enqueue time (the bug: a wedged
+        // event loop kept crediting senders until #3626's drop-on-full fired).
+        //
+        // Non-SCP messages are processed synchronously on this peer task (as in
+        // stellar-core), so their capacity is released inline via `finish()`
+        // immediately after routing — unchanged behavior.
+        let is_scp_message = matches!(message, StellarMessage::ScpMessage(_));
+        // For SCP, disarm the guard into a release token (deferred release).
+        // For non-SCP, keep the guard to `finish()` inline below.
+        let mut capacity_guard = Some(capacity_guard);
+        let scp_release = if is_scp_message {
+            let (fc, msg) = capacity_guard.take().unwrap().disarm();
+            Some(super::FlowControlRelease::new(
+                fc,
+                msg,
+                ctx.outbound_tx.clone(),
+                Arc::clone(&state.metrics),
+            ))
+        } else {
+            None
+        };
+
         // Route message through filtering and dispatch.
-        // `None` signals the peer should be dropped.
-        match Self::route_received_message(&message, peer_id, ctx, state, is_validator) {
+        // `None` signals the peer should be dropped. The SCP release token is
+        // moved in; routing attaches it to the `OverlayMessage` (deferred
+        // release) or, on an early drop, lets it drop here (immediate release).
+        match Self::route_received_message(&message, peer_id, ctx, state, is_validator, scp_release)
+        {
             None => return RecvAction::Break,
             Some(is_scp) => {
                 if is_scp {
@@ -1432,22 +1480,29 @@ impl OverlayManager {
             }
         }
 
-        // Flow control: finish guard to get send-more capacity.
-        let send_more_cap = capacity_guard.finish();
-        if send_more_cap.should_send() && ctx.peer.is_connected() {
-            if let Err(e) = ctx
-                .peer
-                .send_more_extended(
-                    send_more_cap.num_flood_messages as u32,
-                    send_more_cap.num_flood_bytes as u32,
-                )
-                .await
-            {
-                debug!("Failed to send SendMoreExtended to peer={}: {}", peer_id, e);
-                state.metrics.errors_write.inc();
-            } else {
-                state.metrics.messages_written.inc();
-                *ctx.last_write = Instant::now();
+        // Non-SCP flow control: release capacity inline and send SEND_MORE now
+        // (synchronous processing on the peer task). For SCP, capacity_guard
+        // was disarmed above and released via the token at consumer drain.
+        if !is_scp_message {
+            let send_more_cap = capacity_guard
+                .take()
+                .expect("non-SCP guard present")
+                .finish();
+            if send_more_cap.should_send() && ctx.peer.is_connected() {
+                if let Err(e) = ctx
+                    .peer
+                    .send_more_extended(
+                        send_more_cap.num_flood_messages as u32,
+                        send_more_cap.num_flood_bytes as u32,
+                    )
+                    .await
+                {
+                    debug!("Failed to send SendMoreExtended to peer={}: {}", peer_id, e);
+                    state.metrics.errors_write.inc();
+                } else {
+                    state.metrics.messages_written.inc();
+                    *ctx.last_write = Instant::now();
+                }
             }
         }
 
@@ -2555,5 +2610,187 @@ mod tests {
                 output,
             );
         });
+    }
+
+    // --- #3625: drain-gated inbound flow-control (SEND_MORE release timing) ---
+
+    /// Build a distinct SCP envelope `StellarMessage` keyed by `slot_index`.
+    fn scp_flood_msg(slot_index: u64) -> StellarMessage {
+        use stellar_xdr::*;
+        StellarMessage::ScpMessage(ScpEnvelope {
+            statement: ScpStatement {
+                node_id: NodeId(PublicKey::PublicKeyTypeEd25519(Uint256([0; 32]))),
+                slot_index,
+                pledges: ScpStatementPledges::Externalize(ScpStatementExternalize {
+                    commit: ScpBallot {
+                        counter: 1,
+                        value: vec![].try_into().unwrap(),
+                    },
+                    n_h: 1,
+                    commit_quorum_set_hash: Hash([0; 32]),
+                }),
+            },
+            signature: vec![].try_into().unwrap(),
+        })
+    }
+
+    /// Count `SEND_MORE_EXTENDED` messages currently queued on a peer outbound
+    /// receiver, draining it in the process.
+    fn drain_send_more_extended(
+        rx: &mut mpsc::Receiver<crate::manager::OutboundMessage>,
+    ) -> Vec<stellar_xdr::SendMoreExtended> {
+        let mut out = Vec::new();
+        while let Ok(m) = rx.try_recv() {
+            if let crate::manager::OutboundMessage::Send(StellarMessage::SendMoreExtended(sme)) = m
+            {
+                out.push(sme);
+            }
+        }
+        out
+    }
+
+    /// The released SCP credit drives `end_message_processing` exactly once,
+    /// even if the token is explicitly released and then dropped — no
+    /// double-release. The per-peer flood counter returns to baseline.
+    #[test]
+    fn test_release_token_fires_end_message_processing_once() {
+        let config = FlowControlConfig::default();
+        let batch = config.flow_control_send_more_batch_size; // 40
+        let fc = Arc::new(crate::flow_control::FlowControl::new(config));
+        let (tx, mut rx) = mpsc::channel::<crate::manager::OutboundMessage>(64);
+        let metrics = Arc::new(crate::metrics::OverlayMetrics::new());
+
+        // Lock capacity for one SCP message (mirrors begin_message_processing on
+        // the peer task), then hand the release obligation to the token.
+        let msg = scp_flood_msg(1);
+        assert!(fc.begin_message_processing(&msg));
+        let mut token =
+            crate::manager::FlowControlRelease::new(Arc::clone(&fc), msg, tx, Arc::clone(&metrics));
+
+        // First release fires end_message_processing (flood_data_processed -> 1).
+        token.release();
+        let after_first = fc.test_flood_data_processed();
+        assert_eq!(
+            after_first, 1,
+            "first release must process exactly one flood message"
+        );
+
+        // Second release (and the subsequent Drop) must be no-ops.
+        token.release();
+        drop(token);
+        assert_eq!(
+            fc.test_flood_data_processed(),
+            after_first,
+            "release must be idempotent — no double end_message_processing"
+        );
+
+        // A single message is far below the 40-batch boundary, so no SEND_MORE.
+        assert!(
+            drain_send_more_extended(&mut rx).is_empty(),
+            "no SEND_MORE_EXTENDED below the {}-message batch boundary",
+            batch
+        );
+    }
+
+    /// Routing >= one full batch of SCP messages through `route_to_subscribers`
+    /// with the SCP consumer NEVER draining must NOT grant any
+    /// `SEND_MORE_EXTENDED` to the peer. On origin/main, credit was released at
+    /// channel-enqueue time, so this FAILS (a batch's worth of grants appear).
+    #[tokio::test]
+    async fn test_send_more_withheld_while_scp_consumer_stalls() {
+        let config = FlowControlConfig::default();
+        let batch = config.flow_control_send_more_batch_size; // 40
+        let fc = Arc::new(crate::flow_control::FlowControl::new(config));
+        let (tx, mut rx) = mpsc::channel::<crate::manager::OutboundMessage>(256);
+        let metrics = Arc::new(crate::metrics::OverlayMetrics::new());
+
+        let (shared, _scp_rx) = crate::manager::tests::shared_state_with_scp_receiver();
+
+        // Route a full batch of SCP messages, each carrying a release token, but
+        // NEVER drain `_scp_rx` (the stalled-consumer condition). The tokens
+        // therefore never release, so no SEND_MORE_EXTENDED is granted.
+        for slot in 0..batch {
+            let msg = scp_flood_msg(slot);
+            assert!(fc.begin_message_processing(&msg));
+            let token = crate::manager::FlowControlRelease::new(
+                Arc::clone(&fc),
+                msg.clone(),
+                tx.clone(),
+                Arc::clone(&metrics),
+            );
+            let mut overlay_msg = crate::manager::OverlayMessage::new(
+                crate::PeerId::from_bytes([7u8; 32]),
+                msg,
+                Instant::now(),
+            );
+            overlay_msg.flow_release = Some(token);
+            shared.route_to_subscribers(overlay_msg);
+        }
+
+        let grants = drain_send_more_extended(&mut rx);
+        assert!(
+            grants.is_empty(),
+            "a stalled SCP consumer must not be granted SEND_MORE_EXTENDED \
+             (got {} grants); credit must be released at drain, not enqueue",
+            grants.len()
+        );
+    }
+
+    /// After the consumer drains and releases the tokens, exactly one
+    /// `SEND_MORE_EXTENDED` is granted per 40-message batch, carrying the batch
+    /// message count.
+    #[tokio::test]
+    async fn test_send_more_granted_after_consumer_drains() {
+        let config = FlowControlConfig::default();
+        let batch = config.flow_control_send_more_batch_size; // 40
+        let fc = Arc::new(crate::flow_control::FlowControl::new(config));
+        let (tx, mut rx) = mpsc::channel::<crate::manager::OutboundMessage>(256);
+        let metrics = Arc::new(crate::metrics::OverlayMetrics::new());
+
+        let (shared, mut scp_rx) = crate::manager::tests::shared_state_with_scp_receiver();
+
+        // Route exactly one batch of token-bearing SCP messages.
+        for slot in 0..batch {
+            let msg = scp_flood_msg(slot);
+            assert!(fc.begin_message_processing(&msg));
+            let token = crate::manager::FlowControlRelease::new(
+                Arc::clone(&fc),
+                msg.clone(),
+                tx.clone(),
+                Arc::clone(&metrics),
+            );
+            let mut overlay_msg = crate::manager::OverlayMessage::new(
+                crate::PeerId::from_bytes([7u8; 32]),
+                msg,
+                Instant::now(),
+            );
+            overlay_msg.flow_release = Some(token);
+            shared.route_to_subscribers(overlay_msg);
+        }
+
+        // No grant yet — nothing drained.
+        assert!(drain_send_more_extended(&mut rx).is_empty());
+
+        // The consumer drains the channel and releases each token (mirrors
+        // pump_scp_intake taking + dropping the token).
+        let mut drained = 0u64;
+        while let Ok(mut overlay_msg) = scp_rx.try_recv() {
+            let _release = overlay_msg.take_flow_release();
+            // _release drops here, firing end_message_processing.
+            drained += 1;
+        }
+        assert_eq!(drained, batch, "consumer should drain the whole batch");
+
+        let grants = drain_send_more_extended(&mut rx);
+        assert_eq!(
+            grants.len(),
+            1,
+            "exactly one SEND_MORE_EXTENDED per {}-message batch",
+            batch
+        );
+        assert_eq!(
+            grants[0].num_messages as u64, batch,
+            "the grant must request the full batch of flood messages"
+        );
     }
 }

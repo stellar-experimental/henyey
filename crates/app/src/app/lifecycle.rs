@@ -2345,12 +2345,26 @@ impl App {
     /// Envelopes the pre-filter rejects never reach the worker.
     pub(super) async fn pump_scp_intake(
         &self,
-        scp_msg: OverlayMessage,
+        mut scp_msg: OverlayMessage,
         verified_rx: &mut tokio::sync::mpsc::UnboundedReceiver<
             henyey_herder::scp_verify::VerifiedEnvelope,
         >,
     ) {
         use henyey_herder::scp_verify::{PipelinedIntake, PreFilter};
+
+        // #3625 — drain-gated inbound flow control. Take the SCP message's
+        // `FlowControlRelease` token; it is released (firing the peer's
+        // `end_message_processing` and, at the 40-message / byte batch
+        // boundary, a `SEND_MORE_EXTENDED` grant) when `_flow_release` drops at
+        // the end of this consumer-side handler — i.e. only AFTER the envelope
+        // has been drained from the bounded channel and handed to the verify
+        // worker / herder. A stalled event loop never reaches here, so it never
+        // grants SEND_MORE, back-pressuring senders. The `Drop`-based release
+        // also covers every early-return path below (dedup reject, worker dead,
+        // non-SCP) so the held inbound credit can never leak. This is the only
+        // app-side touch for Phase 1; it applies to all three SCP drain sites
+        // (the `recv()` arm and both `try_recv` drains), which all route here.
+        let _flow_release = scp_msg.take_flow_release();
 
         // Phase 31 marks time spent in this helper: pre-filtering, reserving
         // verifier-queue capacity (the backpressure park point), and draining
@@ -2996,11 +3010,11 @@ mod scp_dedup_pipeline_tests {
     fn make_overlay_scp_msg(envelope: ScpEnvelope) -> OverlayMessage {
         let peer_id =
             henyey_overlay::PeerId(XdrPublicKey::PublicKeyTypeEd25519(Uint256([0xAA; 32])));
-        OverlayMessage {
-            from_peer: peer_id,
-            message: StellarMessage::ScpMessage(envelope),
-            received_at: std::time::Instant::now(),
-        }
+        OverlayMessage::new(
+            peer_id,
+            StellarMessage::ScpMessage(envelope),
+            std::time::Instant::now(),
+        )
     }
 
     fn make_test_envelope(slot: u64, close_time: u64) -> ScpEnvelope {
@@ -3055,6 +3069,61 @@ mod scp_dedup_pipeline_tests {
         // Second call: tombstone cleaned, re-inserts. No dedup rejection.
         app.pump_scp_intake(msg, &mut verified_rx).await;
         assert_eq!(app.scp_scheduled.dedup_count(), 0, "no dedup rejections");
+    }
+
+    /// #3625 (app-side consumer touch): when the SCP consumer drains a
+    /// token-bearing `OverlayMessage` via `pump_scp_intake`, the attached
+    /// `FlowControlRelease` fires `end_message_processing`. Draining a full
+    /// 40-message batch (sharing one `FlowControl`) therefore yields exactly one
+    /// `SEND_MORE_EXTENDED` grant for the batch — proving the credit is released
+    /// at consumer-drain time (not enqueue), and that the release fires on every
+    /// drain path including the herder-Booting pre-filter-reject path.
+    #[tokio::test]
+    async fn test_scp_consumer_drain_releases_flow_control_credit() {
+        use henyey_overlay::{FlowControl, FlowControlConfig};
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-drain-release.db");
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
+        let app = App::new(config).await.unwrap();
+        let mut verified_rx = app.herder.take_verified_rx().expect("take verified_rx");
+
+        let fc_config = FlowControlConfig::default();
+        let batch = fc_config.flow_control_send_more_batch_size; // 40
+        let flow_control = Arc::new(FlowControl::new(fc_config));
+
+        // Observer channel for granted SEND_MORE_EXTENDED num_messages.
+        let (grant_tx, grant_rx) = std::sync::mpsc::channel::<u32>();
+
+        // Drain a full batch of DISTINCT token-bearing SCP messages. The herder
+        // is in Booting → pre-filter rejects, but the flow-control token still
+        // releases at the end of pump_scp_intake (Drop on every path).
+        for slot in 0..batch as u64 {
+            let envelope = make_test_envelope(1000 + slot, 2_000_000_000);
+            let mut msg = make_overlay_scp_msg(envelope);
+            msg.attach_test_flow_release(Arc::clone(&flow_control), grant_tx.clone());
+            app.pump_scp_intake(msg, &mut verified_rx).await;
+            // Let the grant-observer forwarding task run.
+            tokio::task::yield_now().await;
+        }
+        // Allow the final forwarding task to deliver before asserting.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        drop(grant_tx);
+
+        let grants: Vec<u32> = grant_rx.try_iter().collect();
+        assert_eq!(
+            grants.len(),
+            1,
+            "draining a {batch}-message batch via the SCP consumer must grant \
+             exactly one SEND_MORE_EXTENDED (got {grants:?})"
+        );
+        assert_eq!(
+            grants[0] as u64, batch as u64,
+            "the grant must request the full batch of flood messages"
+        );
     }
 
     /// Pipeline test: pump_scp_intake dedup works end-to-end with dispatch.

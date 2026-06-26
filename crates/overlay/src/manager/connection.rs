@@ -29,6 +29,11 @@ use tokio::task::JoinHandle;
 /// Result of a successful `try_register_peer` call.
 pub(super) struct RegisterResult {
     pub outbound_rx: mpsc::Receiver<OutboundMessage>,
+    /// Clone of this peer's outbound sender, handed to `run_peer_loop` so the
+    /// drain-gated flow-control release token (#3625) can enqueue
+    /// `SEND_MORE_EXTENDED` grants back to the peer once the SCP consumer
+    /// drains the envelope.
+    pub outbound_tx: mpsc::Sender<OutboundMessage>,
     pub flow_control: Arc<FlowControl>,
     pub generation: u64,
     pub replaced: Option<ReplacedPeer>,
@@ -247,6 +252,9 @@ impl OverlayManager {
         initial_byte_grant: u32,
     ) -> std::result::Result<RegisterResult, OverlayError> {
         let (outbound_tx, outbound_rx) = mpsc::channel(shared.outbound_channel_capacity);
+        // Clone the sender for run_peer_loop's drain-gated SEND_MORE release
+        // (#3625); the original is moved into the PeerHandle below.
+        let outbound_tx_for_loop = outbound_tx.clone();
         let stats = peer.stats();
         let flow_control = Arc::new(FlowControl::with_scp_callback(
             FlowControlConfig {
@@ -339,6 +347,7 @@ impl OverlayManager {
         }
         Ok(RegisterResult {
             outbound_rx,
+            outbound_tx: outbound_tx_for_loop,
             flow_control,
             generation,
             replaced,
@@ -511,6 +520,7 @@ impl OverlayManager {
             peer_id.clone(),
             peer,
             register_result.outbound_rx,
+            register_result.outbound_tx,
             register_result.flow_control,
             shared.clone(),
         )
@@ -801,6 +811,7 @@ impl OverlayManager {
             peer_id.clone(),
             peer,
             register_result.outbound_rx,
+            register_result.outbound_tx,
             register_result.flow_control,
             shared.clone(),
         )
@@ -1158,6 +1169,7 @@ pub(super) async fn connect_to_explicit_peer(
             peer_id_clone.clone(),
             peer,
             register_result.outbound_rx,
+            register_result.outbound_tx,
             register_result.flow_control,
             shared_clone.clone(),
         )
