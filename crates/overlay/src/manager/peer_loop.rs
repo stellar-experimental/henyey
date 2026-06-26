@@ -1152,6 +1152,19 @@ impl OverlayManager {
         let mut periodic_interval = tokio::time::interval(Duration::from_secs(1));
         let mut ticks_since_ping: u32 = 0;
 
+        // #3642 Phase 2 — read-side socket throttle resume wake. When inbound
+        // total reading capacity is exhausted the `peer.recv()` select arm below
+        // is disabled (its `if flow_control.can_read()` precondition is false),
+        // back-pressuring the sender at the TCP window exactly as stellar-core's
+        // "don't reschedule the read" does (`TCPPeer::maybeThrottleRead`). The
+        // throttle is lifted by the SCP consumer draining a full reading-capacity
+        // batch: each SCP `FlowControlRelease` carries a clone of this `Notify`
+        // and, on the batch-completing release, fires it (after `stop_throttling`)
+        // — the async equivalent of core's `scheduleRead`. The 1s
+        // `periodic_interval` tick re-evaluates the loop as a backstop so a lost
+        // wake can never wedge a peer for more than ~1s.
+        let read_resume = Arc::new(tokio::sync::Notify::new());
+
         // OVERLAY_SPEC §9.4: Track whether we've received a PEERS message
         // from this peer. At most one is allowed; duplicates cause a drop.
         let mut received_peers = false;
@@ -1232,8 +1245,18 @@ impl OverlayManager {
                     }
                 }
 
-                // Receive from network (no mutex — peer is owned)
-                result = peer.recv() => {
+                // Receive from network (no mutex — peer is owned).
+                //
+                // #3642 Phase 2: gate this arm on `flow_control.can_read()`
+                // (= inbound total reading capacity > 0). tokio does not poll a
+                // select branch whose `if`-precondition is false, so a throttled
+                // peer simply stops pulling bytes — NO busy-spin — until the SCP
+                // consumer drains a full batch and the resume `Notify` re-enables
+                // the loop. The outbound-send and periodic arms stay enabled, so
+                // the task remains live (can still send, ping, time out). Mirrors
+                // stellar-core `TCPPeer::maybeThrottleRead` declining to schedule
+                // the next read while `!canRead()` (`TCPPeer.cpp:620/770`).
+                result = peer.recv(), if flow_control.can_read() => {
                     match result {
                         Ok(Some(message)) => {
                             last_read = Instant::now();
@@ -1273,6 +1296,7 @@ impl OverlayManager {
                                 &flow_control,
                                 &state,
                                 is_validator,
+                                &read_resume,
                             ).await;
 
                             metrics::histogram!(
@@ -1283,6 +1307,15 @@ impl OverlayManager {
                             if matches!(action, RecvAction::Break) {
                                 break;
                             }
+
+                            // #3642 Phase 2: arm the read throttle if this message
+                            // exhausted inbound total reading capacity (records
+                            // `last_throttle` only when `!can_read()`). Mirrors
+                            // stellar-core's post-`recvMessage` `maybeThrottleRead`
+                            // (`TCPPeer.cpp:620/770`). On the next loop iteration
+                            // the gated `peer.recv()` arm is disabled until the
+                            // consumer-drain resume fires.
+                            flow_control.maybe_throttle_read();
                         }
                         Ok(None) => {
                             info!("Peer {} loop exiting: connection closed by remote (total_msgs={}, scp_msgs={})", peer_id, total_messages, scp_messages);
@@ -1334,6 +1367,16 @@ impl OverlayManager {
                         Self::maybe_log_peer_stats(&peer_id, total_messages, scp_messages, &ping, &mut last_stats_log);
                     }
                 }
+
+                // #3642 Phase 2: read-resume wake. Fired by an SCP
+                // `FlowControlRelease` (carrying a clone of `read_resume`) on the
+                // drain that completes a full reading-capacity batch, after
+                // `stop_throttling()` has cleared the throttle. The arm body does
+                // nothing: re-entering the `select!` re-evaluates the
+                // `if flow_control.can_read()` precondition on the `peer.recv()`
+                // arm, which is now true, so reading resumes. Async equivalent of
+                // stellar-core `Peer::scheduleRead` (`Peer.cpp:313-333`).
+                _ = read_resume.notified() => {}
             }
         }
 
@@ -1355,6 +1398,10 @@ impl OverlayManager {
         flow_control: &Arc<FlowControl>,
         state: &SharedPeerState,
         is_validator: bool,
+        // #3642 Phase 2: the peer's read-resume wake, threaded into each SCP
+        // `FlowControlRelease` so the consumer-drain release can lift the read
+        // throttle. Overlay-internal — the app consumer never sees it.
+        read_resume: &Arc<tokio::sync::Notify>,
     ) -> RecvAction {
         let msg_type = helpers::message_type_name(&message);
         trace!("Processing message_type={} from {}", msg_type, peer_id);
@@ -1456,12 +1503,18 @@ impl OverlayManager {
         let mut capacity_guard = Some(capacity_guard);
         let scp_release = if is_scp_message {
             let (fc, msg) = capacity_guard.take().unwrap().disarm();
-            Some(super::FlowControlRelease::new(
-                fc,
-                msg,
-                ctx.outbound_tx.clone(),
-                Arc::clone(&state.metrics),
-            ))
+            // #3642 Phase 2: thread the read-resume `Notify` into the token so
+            // the consumer-drain release can lift the read throttle and wake the
+            // peer loop's gated `peer.recv()` arm.
+            Some(
+                super::FlowControlRelease::new(
+                    fc,
+                    msg,
+                    ctx.outbound_tx.clone(),
+                    Arc::clone(&state.metrics),
+                )
+                .with_resume_notify(Arc::clone(read_resume)),
+            )
         } else {
             None
         };
@@ -2791,6 +2844,237 @@ mod tests {
         assert_eq!(
             grants[0].num_messages as u64, batch,
             "the grant must request the full batch of flood messages"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // #3642 — Phase 2: read-side socket throttle wired into the per-peer loop.
+    //
+    // These exercise the `can_read()` gate the `peer.recv()` select arm keys on
+    // and the consumer-drain `Notify` resume path that lifts the throttle.
+    // Mirror stellar-core `TCPPeer::maybeThrottleRead` (TCPPeer.cpp:620/770) and
+    // `Peer.cpp:313-333` (`stopThrottling`+`scheduleRead` gated on
+    // `isThrottled() && numTotalMessages > 0`).
+    // ---------------------------------------------------------------------
+
+    /// Build a `FlowControlConfig` with a small total reading capacity so a
+    /// handful of un-drained SCP envelopes exhaust it (the 201-batch scaled down
+    /// for the test). The flood batch is kept >= the reading capacity so the
+    /// resume gate is driven purely by the total-message track, isolating the
+    /// `num_total_messages` reschedule condition.
+    fn small_capacity_config(reading_capacity: u64) -> FlowControlConfig {
+        FlowControlConfig {
+            peer_reading_capacity: reading_capacity,
+            // Keep flood batch larger than reading capacity so the flood
+            // SEND_MORE boundary never fires first and the only resume trigger
+            // is the total-message batch (matches the 201>40 production ratio
+            // not being relied on here — we want the total track to drive).
+            flow_control_send_more_batch_size: reading_capacity + 10,
+            peer_flood_reading_capacity: reading_capacity + 10,
+            ..FlowControlConfig::default()
+        }
+    }
+
+    /// #3642 test 1 — read throttles when total reading capacity is exhausted.
+    ///
+    /// Lock capacity for `reading_capacity` SCP messages via
+    /// `begin_message_processing` WITHOUT releasing (consumer stalled). The total
+    /// capacity track hits 0, so `can_read()` (the predicate the `peer.recv()`
+    /// select arm is gated on) is false and `maybe_throttle_read()` arms the
+    /// throttle. This is the gate the wiring keys on.
+    #[test]
+    fn test_read_throttles_when_total_capacity_exhausted() {
+        let cap = 4u64;
+        let fc = Arc::new(crate::flow_control::FlowControl::new(
+            small_capacity_config(cap),
+        ));
+
+        // Plenty of capacity at the start.
+        assert!(fc.can_read(), "fresh peer can read");
+        assert!(
+            !fc.maybe_throttle_read(),
+            "no throttle while capacity remains"
+        );
+
+        // Lock capacity for a full reading batch without ever releasing.
+        for slot in 0..cap {
+            assert!(
+                fc.begin_message_processing(&scp_flood_msg(slot)),
+                "capacity should be available for message {slot}"
+            );
+        }
+
+        // Total capacity is now 0 → the recv-arm gate must be closed.
+        assert!(
+            !fc.can_read(),
+            "total reading capacity exhausted → can_read() false (recv arm disabled)"
+        );
+        // maybe_throttle_read records the throttle and reports it engaged.
+        assert!(
+            fc.maybe_throttle_read(),
+            "maybe_throttle_read arms the throttle when can_read() is false"
+        );
+        assert!(fc.is_throttled(), "peer is now throttled");
+    }
+
+    /// #3642 test 2 — the no-deadlock recovery centerpiece. After the consumer
+    /// drains a full reading-capacity batch, the throttle lifts (Notify fires,
+    /// `is_throttled()` false, `can_read()` true) WITHOUT any further socket
+    /// read. Proves recovery is driven by consumer drain alone.
+    #[tokio::test]
+    async fn test_throttle_lifts_and_read_resumes_after_consumer_drains() {
+        let cap = 4u64;
+        let fc = Arc::new(crate::flow_control::FlowControl::new(
+            small_capacity_config(cap),
+        ));
+        let (tx, _rx) = mpsc::channel::<crate::manager::OutboundMessage>(64);
+        let metrics = Arc::new(crate::metrics::OverlayMetrics::new());
+        let notify = Arc::new(tokio::sync::Notify::new());
+
+        // Exhaust capacity by locking a full batch into release tokens (the
+        // consumer-stalled state) and arm the throttle.
+        let mut tokens = Vec::new();
+        for slot in 0..cap {
+            let msg = scp_flood_msg(slot);
+            assert!(fc.begin_message_processing(&msg));
+            tokens.push(
+                crate::manager::FlowControlRelease::new(
+                    Arc::clone(&fc),
+                    msg,
+                    tx.clone(),
+                    Arc::clone(&metrics),
+                )
+                .with_resume_notify(Arc::clone(&notify)),
+            );
+        }
+        assert!(fc.maybe_throttle_read(), "throttle armed at exhaustion");
+        assert!(!fc.can_read(), "throttled: recv arm disabled");
+        assert!(fc.is_throttled());
+
+        // The select-arm wake: a clone of the per-peer Notify. It must NOT be
+        // already-notified before the drain.
+        let notified = notify.notified();
+        tokio::pin!(notified);
+        assert!(
+            futures::poll!(notified.as_mut()).is_pending(),
+            "Notify must not fire before the consumer drains a full batch"
+        );
+
+        // Consumer drains the whole batch (drops every token) — the ONLY action,
+        // no socket read occurs.
+        tokens.clear();
+
+        // Throttle lifted via the drain-release path.
+        assert!(
+            !fc.is_throttled(),
+            "stop_throttling() ran on the batch refill"
+        );
+        assert!(fc.can_read(), "capacity restored → recv arm re-enabled");
+        // The peer-loop wake fired.
+        assert!(
+            futures::poll!(notified.as_mut()).is_ready(),
+            "consumer drain must fire the resume Notify (core scheduleRead equivalent)"
+        );
+    }
+
+    /// #3642 test 3 — self-wedge invariant: the fetch backfill path is never
+    /// flow-controlled, so it is never throttled and a throttled SCP socket
+    /// cannot starve the fetch the consumer depends on.
+    #[test]
+    fn test_throttle_does_not_block_fetch_path() {
+        use crate::flow_control::is_flow_controlled_message;
+
+        // The fetch responses SCP backfill depends on. These ride the separate
+        // unbounded fetch_response channel and are excluded from flow control.
+        let txset = StellarMessage::TxSet(stellar_xdr::TransactionSet {
+            previous_ledger_hash: stellar_xdr::Hash([0; 32]),
+            txs: stellar_xdr::VecM::default(),
+        });
+        let gen_txset = StellarMessage::GeneralizedTxSet(
+            stellar_xdr::GeneralizedTransactionSet::V1(stellar_xdr::TransactionSetV1 {
+                previous_ledger_hash: stellar_xdr::Hash([0; 32]),
+                phases: stellar_xdr::VecM::default(),
+            }),
+        );
+        let qset = StellarMessage::ScpQuorumset(stellar_xdr::ScpQuorumSet {
+            threshold: 1,
+            validators: stellar_xdr::VecM::default(),
+            inner_sets: stellar_xdr::VecM::default(),
+        });
+        let dont_have = StellarMessage::DontHave(stellar_xdr::DontHave {
+            type_: stellar_xdr::MessageType::TxSet,
+            req_hash: stellar_xdr::Uint256([0; 32]),
+        });
+
+        for msg in [&txset, &gen_txset, &qset, &dont_have] {
+            assert!(
+                !is_flow_controlled_message(msg),
+                "fetch-path message must NOT be flow-controlled (it rides the \
+                 unbounded fetch_response channel and is never throttled): {:?}",
+                helpers::message_type_name(msg)
+            );
+        }
+
+        // And the messages that ARE flow-controlled (and therefore throttleable)
+        // are exactly the flood set — fetch responses are excluded.
+        assert!(is_flow_controlled_message(&scp_flood_msg(0)));
+    }
+
+    /// #3642 test 4 — reschedule only on a full total batch (Peer.cpp:314 gate:
+    /// `numTotalMessages > 0`, set only at the 201st drain). A partial drain that
+    /// does not complete a reading batch must NOT lift the throttle or fire the
+    /// Notify.
+    #[tokio::test]
+    async fn test_reschedule_only_on_full_total_batch() {
+        let cap = 4u64;
+        let fc = Arc::new(crate::flow_control::FlowControl::new(
+            small_capacity_config(cap),
+        ));
+        let (tx, _rx) = mpsc::channel::<crate::manager::OutboundMessage>(64);
+        let metrics = Arc::new(crate::metrics::OverlayMetrics::new());
+        let notify = Arc::new(tokio::sync::Notify::new());
+
+        let mut tokens = Vec::new();
+        for slot in 0..cap {
+            let msg = scp_flood_msg(slot);
+            assert!(fc.begin_message_processing(&msg));
+            tokens.push(
+                crate::manager::FlowControlRelease::new(
+                    Arc::clone(&fc),
+                    msg,
+                    tx.clone(),
+                    Arc::clone(&metrics),
+                )
+                .with_resume_notify(Arc::clone(&notify)),
+            );
+        }
+        assert!(fc.maybe_throttle_read());
+
+        let notified = notify.notified();
+        tokio::pin!(notified);
+
+        // Drain all but one — the total batch is NOT complete, so no reschedule.
+        for _ in 0..(cap - 1) {
+            tokens.remove(0); // drop one token → one end_message_processing
+            assert!(
+                fc.is_throttled(),
+                "partial drain must not lift the throttle (numTotalMessages == 0)"
+            );
+            assert!(
+                futures::poll!(notified.as_mut()).is_pending(),
+                "Notify must not fire on a partial-batch drain"
+            );
+        }
+
+        // Drop the last token → completes the reading batch → reschedule fires.
+        tokens.clear();
+        assert!(
+            !fc.is_throttled(),
+            "the batch-completing drain lifts the throttle (numTotalMessages > 0)"
+        );
+        assert!(
+            futures::poll!(notified.as_mut()).is_ready(),
+            "the batch-completing drain fires the resume Notify exactly once"
         );
     }
 }

@@ -412,6 +412,17 @@ pub struct FlowControlRelease {
     outbound_tx: mpsc::Sender<OutboundMessage>,
     /// Shared overlay metrics, for the drop-on-full grant counter.
     metrics: Arc<OverlayMetrics>,
+    /// #3642 Phase 2: the per-peer read-resume wake. `Some` only on tokens
+    /// minted on a peer task (via [`FlowControlRelease::with_resume_notify`]);
+    /// `None` for cross-crate / test-seam tokens. When the read socket is
+    /// throttled (`FlowControl::is_throttled`) and this release completes a full
+    /// reading-capacity batch (`SendMoreCapacity::num_total_messages > 0`),
+    /// `release()` calls `stop_throttling()` and fires this `Notify`, re-enabling
+    /// the peer loop's `if can_read()`-gated `peer.recv()` select arm. This is
+    /// the async equivalent of stellar-core `Peer::endMessageProcessing` →
+    /// `stopThrottling()` + `scheduleRead()` gated on
+    /// `isThrottled() && numTotalMessages > 0` (`Peer.cpp:313-333`).
+    resume_notify: Option<Arc<tokio::sync::Notify>>,
 }
 
 impl FlowControlRelease {
@@ -427,7 +438,20 @@ impl FlowControlRelease {
             message: Some(message),
             outbound_tx,
             metrics,
+            resume_notify: None,
         }
+    }
+
+    /// #3642 Phase 2: attach the per-peer read-resume `Notify`.
+    ///
+    /// Called only by the peer task (`run_peer_loop`) when minting an SCP
+    /// release token, threading in the peer's own `Notify`. The `crates/app`
+    /// SCP consumer never constructs this — it only drops the token, which (via
+    /// `release()`) drives both the SEND_MORE grant and, now, the read-resume.
+    /// Keeping the `Notify` peer-side preserves the overlay-only footprint.
+    pub(super) fn with_resume_notify(mut self, notify: Arc<tokio::sync::Notify>) -> Self {
+        self.resume_notify = Some(notify);
+        self
     }
 
     /// Release the held capacity exactly once.
@@ -441,6 +465,26 @@ impl FlowControlRelease {
             return;
         };
         let cap = self.flow_control.end_message_processing(&msg);
+
+        // #3642 Phase 2 — read-resume. `end_message_processing` returns
+        // `num_total_messages > 0` exactly once per full reading-capacity batch
+        // (`FlowControl.cpp` resets the counter at the boundary). When the read
+        // socket is throttled and a batch just completed, lift the throttle and
+        // wake the peer loop so its `if can_read()`-gated `peer.recv()` arm
+        // re-enables. Mirrors core `Peer::endMessageProcessing` →
+        // `stopThrottling()` + `scheduleRead()` gated on
+        // `isThrottled() && numTotalMessages > 0` (`Peer.cpp:313-333`). The
+        // resume is driven purely by consumer drain (this token dropping),
+        // never by reading more — the no-deadlock invariant (#3642). The
+        // 1s `periodic_interval` tick in `run_peer_loop` is a backstop should a
+        // wake ever be missed.
+        if cap.num_total_messages > 0 && self.flow_control.is_throttled() {
+            self.flow_control.stop_throttling();
+            if let Some(notify) = &self.resume_notify {
+                notify.notify_one();
+            }
+        }
+
         if !cap.should_send() {
             return;
         }
