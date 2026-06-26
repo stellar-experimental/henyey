@@ -90,9 +90,12 @@ Evaluate the fix along these dimensions:
 - **Side effects**: Could the fix change behavior in any code path other than
   the one it targets? Check all callers of modified functions and all consumers
   of modified types.
-- **Parity**: If the fix touches protocol, consensus, or ledger logic, verify
-  that the fixed behavior matches stellar-core. Read the corresponding
-  stellar-core code to confirm.
+- **Parity**: If the fix changes the **observable / interop surface** defined in
+  `docs/PARITY.md` (hashes, result/meta XDR, SCP/overlay wire, archive format,
+  HTTP/RPC/CLI, crypto), verify the fixed behavior matches stellar-core — read
+  the corresponding stellar-core code to confirm. Internal-only changes
+  (architecture, utilities, metrics, logging, performance) with identical
+  observable output are not parity concerns.
 
 Classify the fix:
 - **SOUND**: Correctly addresses the root cause with no concerns.
@@ -214,7 +217,7 @@ not justify a type-system overhaul.
 - **Correctness**: Does it address the root cause?
 - **Design fit**: Is it consistent with the system's design?
 - **Edge cases**: Any cases not covered?
-- **Parity**: Does it maintain stellar-core parity? (if applicable)
+- **Parity**: Does it preserve the observable/interop surface (`docs/PARITY.md`)? (if applicable)
 - **Side effects**: Any unintended behavioral changes?
 - **Verdict**: SOUND / CONCERNS / INCOMPLETE / WRONG — summary
 

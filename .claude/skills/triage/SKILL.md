@@ -101,7 +101,7 @@ If ALL of these hold:
 
 - Size estimate is **XS**.
 - Single-file change.
-- No protocol / consensus / parity implications (does not touch `crates/scp/`, `crates/herder/`, `crates/ledger/`, `crates/tx/`, `crates/overlay/`).
+- No observable-surface / interop implications (does not touch `crates/scp/`, `crates/herder/`, `crates/ledger/`, `crates/tx/`, `crates/overlay/` — the crates that own the observable surface defined in `docs/PARITY.md`).
 - Test impact is obvious (no new test file needed, or one assertion in an existing test).
 
 Then mark the issue trivial. Post a `## Triage Report` comment with the structure below, including an `## Implementation Notes` section that names the exact file path and the precise change. `/do` will use these notes as the plan and skip `/plan` entirely.

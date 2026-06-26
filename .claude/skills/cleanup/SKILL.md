@@ -208,7 +208,12 @@ Set `parity_relevant: false` on all Lane B findings.
 
 ### Lane C — Structure & dead code (parity-filtered)
 
-Apply the parity filter from the PARITY_STATUS.md File Mapping table (Stage 1):
+Apply the parity filter from the PARITY_STATUS.md File Mapping table (Stage 1).
+The filter protects the **observable / interop surface** (`docs/PARITY.md`), not
+internal structure: a refactor that produces identical observable output (same
+hashes, result/meta XDR, wire bytes, archive format, API responses) is allowed
+even on a parity-mapped file. The suppressions below exist only because those
+structural shapes often mirror upstream — they are not a blanket freeze.
 
 - If the file appears in the File Mapping table → set `parity_mapped_file` to
   the cpp counterpart and `parity_relevant: true`.
@@ -304,8 +309,10 @@ finding. Each returns exactly one verdict:
 
 - **`confirmed`** — finding is real, the proposed fix is feasible, no
   parity or behavior risk.
-- **`parity-risk`** — touches a parity-mapped section in a way that would
-  diverge from stellar-core. Reject.
+- **`parity-risk`** — touches a parity-mapped section in a way that could change
+  the observable / interop surface (`docs/PARITY.md`) — hashes, result/meta XDR,
+  wire bytes, archive format, API responses. Reject. (Internal-only refactors
+  with identical observable output are not parity-risk.)
 - **`behavior-change`** — the fix is correctness-significant, not pure
   cleanup. Route to `/code-review` instead.
 - **`infeasible`** — borrow checker, lifetimes, Send/Sync, or other

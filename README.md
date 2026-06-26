@@ -494,6 +494,8 @@ henyey/
 
 ## Crate Overview
 
+Parity % measures observable-surface coverage against upstream, not internal sameness — see [docs/PARITY.md](docs/PARITY.md).
+
 ### Core Infrastructure
 
 | Crate | Purpose | Parity |
@@ -549,7 +551,7 @@ This implementation intentionally limits scope:
 |------------|-----------|
 | **Protocol 24+ only** | Focus on current protocol behavior |
 | **SQLite-only** | Simplicity over PostgreSQL support |
-| **Deterministic** | Observable behavior must match stellar-core |
+| **Deterministic** | Observable surface (hashes, XDR, wire, API) must match stellar-core; internal design, metrics, perf may differ — see [docs/PARITY.md](docs/PARITY.md) |
 
 ## Development
 
@@ -589,7 +591,7 @@ RUST_LOG=henyey_scp=debug,henyey_herder=debug ./target/release/henyey ...
 
 ## Contributing
 
-- Keep behavior deterministic and aligned with stellar-core v25.x
+- Keep the observable surface aligned with stellar-core (see [docs/PARITY.md](docs/PARITY.md)); internal architecture, metrics, and performance may differ
 - Add or update tests when behavior changes
 - Update crate READMEs when modifying subsystem behavior
 - Run `cargo fmt --all -- --check`, `cargo clippy --all -- -D warnings`, and focused tests for touched crates before committing

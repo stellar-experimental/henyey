@@ -272,7 +272,7 @@ Inspect the PR's changed files:
 gh pr diff $PR_NUM --repo stellar-experimental/henyey --name-only
 ```
 
-If any path matches one of these prefixes, the PR is **parity-critical** — Reviewer B uses parity lens:
+If any path matches one of these prefixes, the PR is **parity-critical** — Reviewer B uses parity lens. These crates own the observable/interop surface defined in `docs/PARITY.md`:
 
 - `crates/scp/`
 - `crates/herder/`
@@ -424,12 +424,19 @@ Post via `gh pr comment $PR_NUM --repo stellar-experimental/henyey --body-file <
 **If parity-critical:**
 
 > Invoke /spec-adhere style audit on PR #$PR_NUM in stellar-experimental/henyey.
-> Focus on: does the change match stellar-core's behavior on this path?
-> Consult the `stellar-core/` submodule for the matching C++ implementation.
-> Identify any divergence in semantics, edge cases, or sequencing. Post your
-> verdict as a single PR-level comment via `gh pr comment`, headed
-> `## 🔍 Reviewer: Parity`, with `**Verdict:**` on its own line. Reviewer A
-> is doing correctness; you focus only on parity.
+> Focus on parity as defined in `docs/PARITY.md`: does the change preserve the
+> **observable / interop surface** — ledger/bucket hashes, transaction result &
+> meta XDR, SCP/overlay wire bytes, history archive format, HTTP/RPC/CLI
+> contracts, crypto outputs? Consult the `stellar-core/` submodule for the
+> matching C++ implementation. Raise a CHANGES_REQUESTED concern **only** for a
+> divergence in bytes that cross the network, land in an archive, or appear in
+> hashes/XDR/API responses — i.e. something a peer, Horizon, stellar-rpc, or an
+> archive consumer could observe. Differences in internal architecture, helper
+> utilities, metrics, logging, admin/debug endpoints, or performance are
+> explicitly allowed — do NOT flag them as parity concerns. Post your verdict as
+> a single PR-level comment via `gh pr comment`, headed `## 🔍 Reviewer: Parity`,
+> with `**Verdict:**` on its own line. Reviewer A is doing correctness; you
+> focus only on observable-surface parity.
 >
 > **Cycle-awareness (same discipline as Reviewer A):** Before writing your
 > review, fetch your own prior comments via

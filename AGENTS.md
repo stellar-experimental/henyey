@@ -28,8 +28,8 @@ This codebase is under heavy construction. Don't be afraid to make significant c
 
 ## Determinism & Parity
 
-- Any observable behavior must be deterministic and identical to stellar-core (v25.x / p25).
-- Align behavior by comparing against stellar-core test vectors and edge cases; do not introduce new semantics.
+- Parity has two tiers (see `docs/PARITY.md` for the full definition). The **observable / interop surface MUST match** stellar-core: ledger/bucket hashes, transaction result & meta XDR, SCP/overlay wire bytes, history archive format, HTTP/RPC/CLI contracts, and crypto outputs. You **MAY deviate freely** on internal architecture, helper utilities, metrics, logging, admin/debug endpoints, and performance.
+- Behavior on the observable surface must be deterministic; do not introduce new *observable* semantics. Internal redesigns are welcome — compare against stellar-core test vectors and edge cases for the observable surface.
 - For protocol or consensus behavior, consult `stellar-core/` to mirror upstream decisions and sequencing.
 - Update the relevant crate's `PARITY_STATUS.md` and the parity column in the main `README.md` Crate Overview when implementing or removing functionality that affects stellar-core parity.
 
