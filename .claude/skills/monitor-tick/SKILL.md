@@ -839,22 +839,51 @@ PROC_RESPONSIVE=$([ -n "$INFO_BODY" ] && echo yes || echo no)
 NODE_STATE=$(printf '%s' "$INFO_BODY" | grep -oP '"state"\s*:\s*"\K[^"]+' | head -1)
 # CURRENT_LCL: local last-closed-ledger number (from /info `ledger.num`).
 CURRENT_LCL=$(printf '%s' "$INFO_BODY" | grep -oP '"num"\s*:\s*\K[0-9]+' | head -1)
+# HEARTBEAT_AGE_SEC (#3579): seconds since the most recent `heartbeat=true` log
+# line. Liveness fallback for the "/info-unresponsive-but-alive near-tip stall":
+# when /info is empty (PROC_RESPONSIVE=no) but the event loop is still ticking,
+# a recent heartbeat (<=120s) proves the node is alive so (3e) can still fire on
+# the frozen-lcl/unhealthy/age signature instead of falling through every gate.
+# Pulled from monitor.log via grep_heartbeat_lines (the shared detector). Left
+# empty when no heartbeat is found (→ "unknown", fallback inert).
+HEARTBEAT_LINE=$(grep_heartbeat_lines "$LOG" 1 2>/dev/null)
+HEARTBEAT_AGE_SEC=""
+if [ -n "$HEARTBEAT_LINE" ]; then
+  HB_TS=$(printf '%s' "$HEARTBEAT_LINE" | grep -oP '\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}' | head -1)
+  if [ -n "$HB_TS" ]; then
+    HB_EPOCH=$(date -d "$HB_TS" +%s 2>/dev/null)
+    [ -n "$HB_EPOCH" ] && HEARTBEAT_AGE_SEC=$(( $(date +%s) - HB_EPOCH ))
+  fi
+fi
+# When /info is empty, fall back to the heartbeat line for NODE_STATE/CURRENT_LCL
+# (the issue's "pull lcl from the latest heartbeat `ledger=`" guidance). Heartbeat
+# implies the validator is up and validating, so default NODE_STATE to "Synced!"
+# (state-gate-passing) and pull lcl from `ledger=<n>`; RPC `latestLedger` is the
+# secondary source. Both stay empty if neither is available (gate fails closed).
+if [ "$PROC_RESPONSIVE" = "no" ] && [ -n "$HEARTBEAT_LINE" ]; then
+  [ -z "$NODE_STATE" ] && NODE_STATE="Synced!"
+  [ -z "$CURRENT_LCL" ] && CURRENT_LCL=$(printf '%s' "$HEARTBEAT_LINE" | grep -oP 'ledger[=:]\s*\K[0-9]+' | head -1)
+fi
 # AGE_SEC: RPC getHealth wall-clock `age` (the check-(2) staleness signal).
 # RPC_STATUS: "healthy" | "unhealthy" from validator-mode getHealth.
 # RSS_MB: the RSS measured in check (4) (reused; OOM gate owns RSS-over-floor).
 STUCK_STATE_FILE="/home/tomer/data/$MONITOR_SESSION_ID/metrics/stuck_restart_state"
 mkdir -p "$(dirname "$STUCK_STATE_FILE")"
 classify_stuck_alive_sync "$NODE_STATE" "$CURRENT_LCL" "$AGE_SEC" "$RPC_STATUS" \
-  "$RSS_MB" "$PROC_RESPONSIVE" "$STUCK_STATE_FILE"
+  "$RSS_MB" "$PROC_RESPONSIVE" "$STUCK_STATE_FILE" "$(date +%s)" "$HEARTBEAT_AGE_SEC"
 ```
 
 `classify_stuck_alive_sync` sets `STUCK_ALIVE_SYNC`. It is `yes` only when ALL
 six hold: state matches `valid|synced|track` (case-insensitive substring; never
-`Catching up`/`Booting`); `PROC_RESPONSIVE=yes`; `RPC_STATUS=unhealthy`;
-`AGE_SEC > 600`; frozen-lcl wall-clock dwell `>= 600s` (cadence-independent,
-mirroring check (2)'s `<ledger>|<ts>` STUCK idiom — fires at ~10 min of freeze
-regardless of tick spacing); and `RSS_MB < 16384`. Thresholds are named
-constants at the top of the function for operator retuning. Guards: a **900s
+`Catching up`/`Booting`); the node is **alive** — `PROC_RESPONSIVE=yes` OR (when
+/info is unresponsive) a `heartbeat=true` line within `HEARTBEAT_AGE_SEC <= 120s`
+(#3579 the "/info-unresponsive-but-alive near-tip stall"; a stale/absent
+heartbeat stays the (3b) wedge case, keeping the two mutually exclusive);
+`RPC_STATUS=unhealthy`; `AGE_SEC > 600`; frozen-lcl wall-clock dwell `>= 600s`
+(cadence-independent, mirroring check (2)'s `<ledger>|<ts>` STUCK idiom — fires
+at ~10 min of freeze regardless of tick spacing); and `RSS_MB < 16384`.
+Thresholds are named constants at the top of the function for operator retuning.
+Guards: a **900s
 cooldown** (`NOW - last_restart < 900` → `cooldown`, no restart this tick) and a
 **max-3-restarts / 2h** guard (`>= 3` restarts in a 7200s rolling window →
 `escalate`, no restart).

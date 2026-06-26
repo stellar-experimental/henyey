@@ -2029,6 +2029,96 @@ PYEOF
       "(3e) rung not wired in monitor-tick/SKILL.md"
   fi
 
+  # ════════════════════════════════════════════════════════════════════════════
+  # classify_stuck_alive_sync — /info-unresponsive-but-alive fallback (T63l–T63o)
+  # Source: scripts/lib/monitor-decisions.sh — (3e) liveness gate widening (#3579)
+  #
+  # Extra (optional) positional arg 9: HEARTBEAT_AGE_SEC — seconds since the last
+  # `heartbeat=true` log line (empty/-1 = unknown/none). When /info is down
+  # (PROC_RESPONSIVE=no) but a heartbeat appeared within ~120s, the node is alive
+  # (event loop ticking) and (3e) must STILL be able to fire on the near-tip-stall
+  # signature. (3b) wedge keeps the truly-wedged case (no recent heartbeat).
+  #
+  # Contract: classify_stuck_alive_sync NODE_STATE CURRENT_LCL AGE_SEC RPC_STATUS \
+  #             RSS_MB PROC_RESPONSIVE STATE_FILE [NOW_EPOCH] [HEARTBEAT_AGE_SEC]
+  # ════════════════════════════════════════════════════════════════════════════
+
+  # ── Test 63l: /info unresponsive + recent heartbeat (60s) → yes ────────────
+  # The exact #3579 signature: alive (heartbeat 60s ago) but /info empty, lcl
+  # frozen 700s, age 700, unhealthy, RSS under floor. (3e) MUST now fire.
+  # RED on origin/main (PROC_RESPONSIVE=no → condition 2 fails → "no").
+  local sa_l="$sa_dir/l.state"
+  _sa_seed "$sa_l" 55000000 700
+  classify_stuck_alive_sync "Synced!" 55000000 700 "unhealthy" 10240 "no" "$sa_l" "$NOW_SA" 60
+  if [[ "$STUCK_ALIVE_SYNC" == "yes" ]]; then
+    tap_ok "stuck-alive: /info unresponsive + recent heartbeat (60s) near-tip stall → yes (#3579)"
+  else
+    tap_not_ok "stuck-alive: /info unresponsive + recent heartbeat near-tip stall → yes (#3579)" \
+      "got STUCK_ALIVE_SYNC=$STUCK_ALIVE_SYNC"
+  fi
+
+  # ── Test 63m: /info unresponsive + NO recent heartbeat (180s) → no ─────────
+  # Truly wedged (event loop not ticking) — (3b) wedge owns this, NOT (3e).
+  # Guards against (3e) poaching the wedge path via the new fallback.
+  local sa_m="$sa_dir/m.state"
+  _sa_seed "$sa_m" 55000000 700
+  classify_stuck_alive_sync "Synced!" 55000000 700 "unhealthy" 10240 "no" "$sa_m" "$NOW_SA" 180
+  if [[ "$STUCK_ALIVE_SYNC" == "no" ]]; then
+    tap_ok "stuck-alive: /info unresponsive + stale heartbeat (180s>120s) → no (3b wedge owns it)"
+  else
+    tap_not_ok "stuck-alive: /info unresponsive + stale heartbeat → no (3b wedge owns it)" \
+      "got STUCK_ALIVE_SYNC=$STUCK_ALIVE_SYNC"
+  fi
+
+  # ── Test 63n: /info unresponsive + recent heartbeat but RPC healthy → no ───
+  # False-positive guard: a healthy node whose /info is just flaky must NOT be
+  # restarted. RPC healthy + low age means it is making progress.
+  local sa_n="$sa_dir/n.state"
+  _sa_seed "$sa_n" 55000000 4
+  classify_stuck_alive_sync "Synced!" 55000000 4 "healthy" 10240 "no" "$sa_n" "$NOW_SA" 30
+  if [[ "$STUCK_ALIVE_SYNC" == "no" ]]; then
+    tap_ok "stuck-alive: /info unresponsive + heartbeat-alive but RPC healthy → no (false-positive guard)"
+  else
+    tap_not_ok "stuck-alive: /info unresponsive + heartbeat-alive but RPC healthy → no" \
+      "got STUCK_ALIVE_SYNC=$STUCK_ALIVE_SYNC"
+  fi
+
+  # ── Test 63o: /info unresponsive + no heartbeat info (omitted arg) → no ────
+  # Backward compatibility: when arg 9 is omitted (legacy callers) and /info is
+  # down, the fallback has no signal → (3e) must not fire (unchanged behavior).
+  local sa_o="$sa_dir/o.state"
+  _sa_seed "$sa_o" 55000000 700
+  classify_stuck_alive_sync "Synced!" 55000000 700 "unhealthy" 10240 "no" "$sa_o" "$NOW_SA"
+  if [[ "$STUCK_ALIVE_SYNC" == "no" ]]; then
+    tap_ok "stuck-alive: /info unresponsive + no heartbeat arg → no (backward-compat, unchanged)"
+  else
+    tap_not_ok "stuck-alive: /info unresponsive + no heartbeat arg → no (backward-compat)" \
+      "got STUCK_ALIVE_SYNC=$STUCK_ALIVE_SYNC"
+  fi
+
+  # ── Test 63p: heartbeat-fallback fires identically under zsh ───────────────
+  # The monitor runs under zsh; the new fallback must not rely on bash-only
+  # builtins or zsh-reserved vars (status/path/argv/options). Exercise the
+  # #3579 yes-case in a `zsh -c` subshell (mirror of T20c3-zsh).
+  if command -v zsh >/dev/null 2>&1; then
+    local sa_p="$sa_dir/p.state"
+    _sa_seed "$sa_p" 55000000 700
+    local zsh_sa_out
+    zsh_sa_out=$(zsh -c '
+      source "$1/scripts/lib/monitor-decisions.sh"
+      classify_stuck_alive_sync "Synced!" 55000000 700 "unhealthy" 10240 "no" "$2" 1700000000 60
+      printf "%s" "$STUCK_ALIVE_SYNC"
+    ' -- "$REPO_ROOT" "$sa_p" 2>&1)
+    if [[ "$zsh_sa_out" == "yes" ]]; then
+      tap_ok "stuck-alive: /info unresponsive + recent heartbeat near-tip stall → yes under zsh (#3579)"
+    else
+      tap_not_ok "stuck-alive: /info unresponsive + recent heartbeat near-tip stall → yes under zsh (#3579)" \
+        "got: '$zsh_sa_out'"
+    fi
+  else
+    tap_skip "stuck-alive: heartbeat-fallback under zsh (#3579)" "zsh not found"
+  fi
+
   # ── Test 64: Tick history capture uses quoted heredoc + datetime.now ────────
   # Structural assertion scoped to the fenced code block in "Tick history capture".
   local tick_hist_block
