@@ -219,6 +219,53 @@ fn pay_pregenerated_reject_fails(result: &TxQueueResult) -> bool {
     !matches!(result, TxQueueResult::Added)
 }
 
+/// Decision for one poll iteration of [`LoadGenerator::wait_till_complete`].
+/// Factored out as a pure function ([`wait_till_complete_decision`]) so the
+/// timeout→fail branch can be unit-tested deterministically without
+/// constructing a live `App` (#3639 follow-up to #3631 / PR #3636).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WaitAction {
+    /// Accounts (and Soroban state, when checked) are synced — the run
+    /// completed successfully; return without failing.
+    Complete,
+    /// Still unsynced but the ledger budget is not yet exhausted — sleep and
+    /// poll again.
+    KeepWaiting,
+    /// The ledger budget is exhausted while still unsynced — some submitted
+    /// txns were never applied, so the run MUST fail.
+    Fail,
+}
+
+/// Pure decision function for `wait_till_complete`: given the current sync
+/// state and whether the ledger budget has been exhausted, decide what the
+/// poll loop should do.
+///
+/// Parity: stellar-core `waitTillComplete` marks `mLoadgenFail`
+/// UNCONDITIONALLY on the 30-ledger timeout via `emitFailure(!sorobanIsDone)`
+/// (`LoadGenerator.cpp:1399-1404` calls emitFailure; `:1430-1433` marks the
+/// fail meter regardless of the arg). The completion branch (`accounts_synced
+/// && soroban_synced`) returns first, so [`WaitAction::Fail`] is reached only
+/// when something is still unsynced AND the budget is exhausted — for the
+/// classic Pay/PayPregenerated path too, not just soroban setup. This mirrors
+/// the merged #3636 inline logic byte-for-byte: `if accounts_synced &&
+/// soroban_synced { return }` then `if elapsed >= TIMEOUT { self.failed =
+/// true; return }` else sleep+loop. `soroban_synced` is `true` whenever the
+/// caller is not checking Soroban state (`!check_soroban`), so the classic
+/// path's outcome depends solely on `accounts_synced` + `timed_out`. (#3639)
+fn wait_till_complete_decision(
+    accounts_synced: bool,
+    soroban_synced: bool,
+    timed_out: bool,
+) -> WaitAction {
+    if accounts_synced && soroban_synced {
+        WaitAction::Complete
+    } else if timed_out {
+        WaitAction::Fail
+    } else {
+        WaitAction::KeepWaiting
+    }
+}
+
 /// Sentinel account ID for the network root account.
 const ROOT_ACCOUNT_ID: u64 = u64::MAX;
 
@@ -1896,40 +1943,45 @@ impl LoadGenerator {
         loop {
             let accounts_synced = self.tx_generator.check_accounts_synced();
             let soroban_synced = !check_soroban || self.soroban_state_synced();
-            if accounts_synced && soroban_synced {
-                return;
-            }
             let elapsed = self
                 .tx_generator
                 .app
                 .current_ledger_seq()
                 .saturating_sub(start_ledger);
-            if elapsed >= TIMEOUT_NUM_LEDGERS {
-                warn!(
-                    timeout_ledgers = TIMEOUT_NUM_LEDGERS,
-                    accounts_synced,
-                    soroban_synced,
-                    "loadgen wait-till-complete timed out; some submitted txns \
-                     were not applied (likely dropped before inclusion)"
-                );
-                // Parity: stellar-core `waitTillComplete` marks `mLoadgenFail`
-                // UNCONDITIONALLY on timeout via `emitFailure(!sorobanIsDone)`
-                // (`LoadGenerator.cpp:1399-1404` calls emitFailure; `:1430-1433`
-                // marks the fail meter regardless of the arg — the arg only
-                // controls whether soroban state is reset). We reach this branch
-                // only when accounts (or soroban state) are still unsynced, i.e.
-                // some submitted txns were never applied, so the run MUST fail —
-                // for the classic Pay/PayPregenerated path too, not just soroban.
-                // Previously henyey only failed the soroban-setup path, so a
-                // classic max-TPS step whose txns never landed (ledgers closing
-                // empty under over-rate) still reported run-complete = success,
-                // inflating the measured ceiling far past the real one (a
-                // 23-node single-VM run "passed" 2753 tx/s with >90% empty
-                // ledgers while core honestly failed at ~1531). (#3631)
-                self.failed = true;
-                return;
+            let timed_out = elapsed >= TIMEOUT_NUM_LEDGERS;
+            match wait_till_complete_decision(accounts_synced, soroban_synced, timed_out) {
+                WaitAction::Complete => return,
+                WaitAction::Fail => {
+                    warn!(
+                        timeout_ledgers = TIMEOUT_NUM_LEDGERS,
+                        accounts_synced,
+                        soroban_synced,
+                        "loadgen wait-till-complete timed out; some submitted txns \
+                         were not applied (likely dropped before inclusion)"
+                    );
+                    // Parity: stellar-core `waitTillComplete` marks
+                    // `mLoadgenFail` UNCONDITIONALLY on timeout via
+                    // `emitFailure(!sorobanIsDone)` (`LoadGenerator.cpp:1399-1404`
+                    // calls emitFailure; `:1430-1433` marks the fail meter
+                    // regardless of the arg — the arg only controls whether
+                    // soroban state is reset). We reach this branch only when
+                    // accounts (or soroban state) are still unsynced, i.e. some
+                    // submitted txns were never applied, so the run MUST fail —
+                    // for the classic Pay/PayPregenerated path too, not just
+                    // soroban. Previously henyey only failed the soroban-setup
+                    // path, so a classic max-TPS step whose txns never landed
+                    // (ledgers closing empty under over-rate) still reported
+                    // run-complete = success, inflating the measured ceiling far
+                    // past the real one (a 23-node single-VM run "passed" 2753
+                    // tx/s with >90% empty ledgers while core honestly failed at
+                    // ~1531). (#3631)
+                    self.failed = true;
+                    return;
+                }
+                WaitAction::KeepWaiting => {
+                    tokio::time::sleep(Duration::from_millis(1000)).await;
+                }
             }
-            tokio::time::sleep(Duration::from_millis(1000)).await;
         }
     }
 
@@ -3644,5 +3696,89 @@ mod tests {
         )));
         // Added is the only accepted result — does NOT fail the run.
         assert!(!pay_pregenerated_reject_fails(&TxQueueResult::Added));
+    }
+
+    // ---------------------------------------------------------------------
+    // #3639: the classic Pay/PayPregenerated path must FAIL the run on the
+    // 30-ledger `wait_till_complete` timeout (parity with stellar-core's
+    // unconditional `emitFailure`), not silently report success. These tests
+    // drive the pure `wait_till_complete_decision` helper (the decision),
+    // since the loop awaits a real `App`. FAILS on origin/main: the helper
+    // does not exist (the decision was set inline and required a full App to
+    // drive), so the test references an unresolved function and fails to
+    // compile — guarding against re-introduction of the pre-#3636 silent
+    // success.
+    // ---------------------------------------------------------------------
+
+    /// #3631 / PR #3636 key regression: classic path (`check_soroban ==
+    /// false`, so `soroban_synced` is always `true`) with accounts still
+    /// unsynced AND the ledger budget exhausted → `Fail`. This is the bug the
+    /// timeout fix restored: a max-TPS step whose txns never landed must fail,
+    /// not report run-complete.
+    #[test]
+    fn test_wait_till_complete_classic_timeout_unsynced_fails() {
+        // Classic path: soroban_synced is forced true (`!check_soroban`).
+        // Accounts unsynced + timed out → must fail.
+        assert_eq!(
+            wait_till_complete_decision(
+                /* accounts_synced */ false, /* soroban_synced */ true,
+                /* timed_out */ true,
+            ),
+            WaitAction::Fail,
+        );
+    }
+
+    /// A genuinely-completed classic run (accounts synced) returns `Complete`
+    /// and never reaches the fail branch — even if the budget happens to be
+    /// exhausted on the same poll, the completion check wins first (mirrors
+    /// the inline `if accounts_synced && soroban_synced { return }` ordering).
+    #[test]
+    fn test_wait_till_complete_classic_synced_completes_not_fails() {
+        // Completed before timeout → Complete (no fail).
+        assert_eq!(
+            wait_till_complete_decision(true, true, false),
+            WaitAction::Complete,
+        );
+        // Completion wins over an exhausted budget on the same poll.
+        assert_eq!(
+            wait_till_complete_decision(true, true, true),
+            WaitAction::Complete,
+        );
+    }
+
+    /// Still unsynced but within the ledger budget → keep polling (no fail
+    /// yet). Confirms the helper does not fail prematurely on the classic
+    /// path before the timeout elapses.
+    #[test]
+    fn test_wait_till_complete_unsynced_within_budget_keeps_waiting() {
+        // Classic path, accounts not yet synced, budget remaining.
+        assert_eq!(
+            wait_till_complete_decision(false, true, false),
+            WaitAction::KeepWaiting,
+        );
+        // Soroban-setup path, soroban state not yet synced, budget remaining.
+        assert_eq!(
+            wait_till_complete_decision(true, false, false),
+            WaitAction::KeepWaiting,
+        );
+    }
+
+    /// Soroban-setup path semantics preserved (#3636): a timeout with the
+    /// Soroban state still unsynced → `Fail` (was the only failing path
+    /// before #3636, and remains failing after). Accounts-synced-but-soroban-
+    /// unsynced is the canonical setup-timeout case.
+    #[test]
+    fn test_wait_till_complete_soroban_timeout_unsynced_fails() {
+        // Soroban setup: accounts may be synced, but the contract instance /
+        // code is not on-ledger yet; timing out here must fail.
+        assert_eq!(
+            wait_till_complete_decision(true, false, true),
+            WaitAction::Fail,
+        );
+        // Both unsynced + timed out → fail as well.
+        assert_eq!(
+            wait_till_complete_decision(false, false, true),
+            WaitAction::Fail,
+        );
     }
 }
