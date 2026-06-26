@@ -5730,6 +5730,174 @@ mod tests {
         assert_eq!(queue.effective_max_size(), downgraded_ops as usize);
     }
 
+    /// End-to-end admission test for #3615 (follow-up to #3612 / PR #3614).
+    ///
+    /// The getter-only sibling test
+    /// (`test_classic_queue_capacity_tracks_live_max_tx_set_size`) asserts that
+    /// `effective_max_queue_ops` / `effective_max_size` reflect the dynamic
+    /// capacity, but does not drive transactions THROUGH the rewired admission
+    /// gates. This test exercises the actual `try_add` admission/eviction path
+    /// to confirm that:
+    ///
+    ///   - at the OLD (lower) cap, a tx beyond capacity is REJECTED;
+    ///   - after an `UpgradeMaxTxSetSize` (applied via
+    ///     `update_classic_queue_capacity`), the SAME tx is now ACCEPTED, with
+    ///     no eviction — i.e. the dynamically-grown capacity is honored by the
+    ///     gate, not just the getter;
+    ///   - after a symmetric downgrade, admission again REJECTS above the new
+    ///     lower cap.
+    ///
+    /// Parity: capacity = `maxTxSetSize * POOL_LEDGER_MULTIPLIER`, mirroring the
+    /// production caller in `app/src/app/ledger_close.rs`, which passes
+    /// `header.max_tx_set_size.saturating_mul(POOL_LEDGER_MULTIPLIER)` into
+    /// `update_classic_queue_capacity` on every ledger close. Uses single-op
+    /// classic txs so the op count equals the tx count, making the global-ops
+    /// gate the load-bearing limiter. All admitted txs share the same fee and
+    /// use distinct source accounts, so capacity — not fee-based eviction — is
+    /// the variable under test (an equal-fee tx against a full queue cannot
+    /// displace an incumbent, so any growth in admissions is attributable to the
+    /// raised capacity alone).
+    #[test]
+    fn test_classic_queue_admission_respects_dynamic_capacity() {
+        // POOL_LEDGER_MULTIPLIER is 2 (see #3612 wiring); mirror it here so the
+        // scaled capacity matches the production caller.
+        const MULT: u32 = 2;
+        // maxTxSetSize = 2 → scaled cap = 4 ops. `max_size` is set high so the
+        // construction-time tx-count gate never bites; the global-ops gate (the
+        // one #3614 rewired to track the live cap) is the limiter. `min_fee_per_op`
+        // = 0 so the fee gate is permissive — admission is governed purely by
+        // capacity here.
+        let initial_cap = 2 * MULT; // 4
+        let config = TxQueueConfig {
+            max_queue_ops: Some(initial_cap),
+            max_size: 64,
+            min_fee_per_op: 0,
+            ..Default::default()
+        };
+        let queue = TransactionQueue::new(config);
+
+        // Every admitted tx is a single-op classic payment with the SAME fee,
+        // from a DISTINCT source account (distinct sources dodge the per-account
+        // one-tx limit; equal fees mean an over-cap tx cannot evict an incumbent).
+        let same_fee = 1_000u32;
+        let make = |seed: u8| {
+            let mut env = make_test_envelope(same_fee, 1);
+            set_source(&mut env, seed);
+            env
+        };
+
+        // --- Phase 1: fill to the OLD cap, then a beyond-cap tx is REJECTED. ---
+        for seed in 0..initial_cap as u8 {
+            assert_eq!(
+                queue.try_add(make(seed + 1)),
+                TxQueueResult::Added,
+                "tx {} should fit within the initial cap of {} ops",
+                seed,
+                initial_cap
+            );
+        }
+        assert_eq!(queue.len(), initial_cap as usize);
+
+        // The (cap+1)-th equal-fee tx cannot be admitted: the global-ops queue is
+        // full and an equal fee cannot displace an incumbent. Assert it is NOT
+        // admitted and the queue did not grow past the old cap.
+        let over_cap_env = make(200);
+        let over_cap_hash = full_hash(&over_cap_env);
+        let rejected = queue.try_add(over_cap_env);
+        assert_ne!(
+            rejected,
+            TxQueueResult::Added,
+            "admission must reject beyond the OLD cap (got {:?})",
+            rejected
+        );
+        assert!(!queue.contains(&over_cap_hash));
+        assert_eq!(queue.len(), initial_cap as usize);
+
+        // --- Phase 2: UpgradeMaxTxSetSize raises maxTxSetSize 2 → 8; the per-
+        // ledger-close reset grows the scaled cap to 8 * MULT = 16 ops. The SAME
+        // over-cap tx must now be ADMITTED (capacity grew; no eviction needed). ---
+        let upgraded_cap = 8 * MULT; // 16
+        queue.update_classic_queue_capacity(upgraded_cap);
+        assert_eq!(queue.effective_max_queue_ops(), Some(upgraded_cap));
+
+        let upgrade_env = make(200);
+        let upgrade_hash = full_hash(&upgrade_env);
+        assert_eq!(
+            queue.try_add(upgrade_env),
+            TxQueueResult::Added,
+            "after upgrade the over-old-cap tx must be admitted"
+        );
+        assert!(queue.contains(&upgrade_hash));
+        // No incumbent was evicted: the queue grew from old-cap to old-cap+1.
+        assert_eq!(queue.len(), initial_cap as usize + 1);
+
+        // Keep filling up to the NEW cap to prove the gate honors the full raised
+        // capacity, not just one extra slot.
+        let mut next_seed = initial_cap as u8 + 1; // sources used so far: 1..=cap, plus 200
+        while queue.len() < upgraded_cap as usize {
+            assert_eq!(
+                queue.try_add(make(next_seed)),
+                TxQueueResult::Added,
+                "tx should fit within the upgraded cap of {} ops",
+                upgraded_cap
+            );
+            next_seed += 1;
+        }
+        assert_eq!(queue.len(), upgraded_cap as usize);
+
+        // At the new cap, a further equal-fee tx is rejected again.
+        let over_new_env = make(201);
+        let over_new_hash = full_hash(&over_new_env);
+        let rejected_at_new = queue.try_add(over_new_env);
+        assert_ne!(
+            rejected_at_new,
+            TxQueueResult::Added,
+            "admission must reject beyond the UPGRADED cap (got {:?})",
+            rejected_at_new
+        );
+        assert!(!queue.contains(&over_new_hash));
+        assert_eq!(queue.len(), upgraded_cap as usize);
+
+        // --- Phase 3: downgrade. A fresh queue at the lower cap must reject
+        // admissions above that lower cap — the symmetric shrink path. (We use a
+        // fresh queue so the assertion is about admission, not about whether a
+        // downgrade retroactively evicts already-queued txs, which stellar-core
+        // handles lazily on the next admission/selection.) ---
+        let downgraded_cap = MULT; // 1 * MULT = 2
+        let config2 = TxQueueConfig {
+            max_queue_ops: Some(initial_cap),
+            max_size: 64,
+            min_fee_per_op: 0,
+            ..Default::default()
+        };
+        let queue2 = TransactionQueue::new(config2);
+        queue2.update_classic_queue_capacity(downgraded_cap);
+        assert_eq!(queue2.effective_max_queue_ops(), Some(downgraded_cap));
+
+        for seed in 0..downgraded_cap as u8 {
+            assert_eq!(
+                queue2.try_add(make(seed + 1)),
+                TxQueueResult::Added,
+                "tx {} should fit within the downgraded cap of {} ops",
+                seed,
+                downgraded_cap
+            );
+        }
+        assert_eq!(queue2.len(), downgraded_cap as usize);
+
+        let over_down_env = make(202);
+        let over_down_hash = full_hash(&over_down_env);
+        let rejected_down = queue2.try_add(over_down_env);
+        assert_ne!(
+            rejected_down,
+            TxQueueResult::Added,
+            "admission must reject beyond the DOWNGRADED cap (got {:?})",
+            rejected_down
+        );
+        assert!(!queue2.contains(&over_down_hash));
+        assert_eq!(queue2.len(), downgraded_cap as usize);
+    }
+
     /// Without static config, effective returns None until dynamic update.
     #[test]
     fn test_effective_queue_soroban_resources_none_without_config() {
