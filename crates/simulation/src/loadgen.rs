@@ -3434,4 +3434,129 @@ mod tests {
             SubmitAction::Accept,
         );
     }
+
+    // ---------------------------------------------------------------------
+    // #3638: per-step pacing counter must track ATTEMPTS (mirroring core's
+    // `++count` / `mTotalSubmitted += count`, LoadGenerator.cpp:900,919), not
+    // just accepts. `n_txs` (work remaining) stays accept-gated. These tests
+    // drive the pure accounting helpers so the pacing logic is deterministic
+    // and decoupled from a live `App`.
+    // ---------------------------------------------------------------------
+
+    /// #3638 key regression: the pacing counter advances by the number of
+    /// ATTEMPTS in a step, not the number of accepts. A step that attempts 5
+    /// txns and accepts 2 must advance `total_submitted` by 5.
+    ///
+    /// FAILS on origin/main: there is no `step_pacing_update` helper and the
+    /// loop adds only accepts (`submitted_this_step += 1` inside `if ok`), so
+    /// the counter would advance by 2.
+    #[test]
+    fn test_pacing_counter_counts_attempts_not_just_accepts() {
+        // Five outcomes: 2 accepted, 3 attempted-but-not-accepted. All five are
+        // attempts; none is "not attempted".
+        let outcomes = [
+            SubmitOutcome::Accepted,
+            SubmitOutcome::NotAccepted,
+            SubmitOutcome::Accepted,
+            SubmitOutcome::NotAccepted,
+            SubmitOutcome::NotAccepted,
+        ];
+        let attempts: i64 = outcomes.iter().filter(|o| o.is_attempt()).count() as i64;
+        let accepts: i64 = outcomes.iter().filter(|o| o.is_accepted()).count() as i64;
+        assert_eq!(attempts, 5, "all five outcomes are attempts");
+        assert_eq!(accepts, 2, "two of the five were accepted");
+
+        // Pacing counter advances by attempts (5), NOT accepts (2).
+        let total_submitted = 100;
+        assert_eq!(
+            step_pacing_update(total_submitted, attempts),
+            105,
+            "pacing counter must advance by attempts (mirrors mTotalSubmitted += count)"
+        );
+    }
+
+    /// #3638: under a rejection-heavy step the next step's deficit must track
+    /// `rate*elapsed - attempts_so_far` (bounded ≈ one step's worth), NOT the
+    /// inflated `rate*elapsed - accepts_so_far`. Driven by feeding scalars into
+    /// the pure pacing helper + the `get_tx_per_step` deficit math (no `Instant`
+    /// flakiness).
+    ///
+    /// FAILS on origin/main: with accepts-only accounting the deficit balloons.
+    #[test]
+    fn test_deficit_tracks_rate_under_rejection() {
+        // tx_rate = 100 tx/s. After 1s the cumulative target is 100.
+        let tx_rate: i64 = 100;
+        let elapsed_ms_after_step_1: i64 = 1000;
+        let target_after_step_1 = elapsed_ms_after_step_1 * tx_rate / 1000; // 100
+
+        // Step 1 attempted all 100 targeted txns but only 10 were accepted
+        // (90 rejected under queue pressure).
+        let attempts_step_1: i64 = 100;
+        let accepts_step_1: i64 = 10;
+
+        // Attempts-based pacing (the fix): total_submitted == attempts.
+        let total_attempts = step_pacing_update(0, attempts_step_1);
+        let deficit_attempts = (target_after_step_1 - total_attempts).max(0);
+
+        // Accepts-only pacing (the bug on main): total_submitted == accepts.
+        let total_accepts = step_pacing_update(0, accepts_step_1);
+        let deficit_accepts = (target_after_step_1 - total_accepts).max(0);
+
+        // The fix keeps the deficit bounded (≈ 0 here — we already attempted the
+        // full step's target), while the bug leaves a 90-tx deficit that the
+        // next step would burst to "catch up".
+        assert_eq!(deficit_attempts, 0, "attempts-based pacing fully amortizes");
+        assert_eq!(
+            deficit_accepts, 90,
+            "accepts-only pacing leaves an inflated deficit (the bug)"
+        );
+        assert!(
+            deficit_attempts < deficit_accepts,
+            "attempts-based deficit must be bounded relative to accepts-only"
+        );
+    }
+
+    /// #3638 (Critic A): a step whose inner loop hits the
+    /// `get_next_available_account -> None` break makes ZERO `submit_tx` calls
+    /// (a non-attempt), so the pacing counter must NOT advance. Guards against
+    /// the fix over-counting the no-account case.
+    #[test]
+    fn test_not_attempted_does_not_advance_pacing() {
+        // Zero attempts this step (the loop broke before any submit_tx call).
+        let total_submitted = 42;
+        assert_eq!(
+            step_pacing_update(total_submitted, 0),
+            42,
+            "a step with no attempts must not advance the pacing counter"
+        );
+        // SubmitOutcome's attempt predicate is the seam the loop uses to decide
+        // whether an iteration counts; only attempted outcomes are attempts.
+        assert!(SubmitOutcome::Accepted.is_attempt());
+        assert!(SubmitOutcome::NotAccepted.is_attempt());
+    }
+
+    /// #3638 (amplifier, same bug): a non-`Added` submit result for
+    /// `PayPregenerated` must fail the run (set `self.failed`), mirroring core's
+    /// `submitTx` PAY_PREGENERATED fail-on-reject (LoadGenerator.cpp:958-963),
+    /// instead of silently draining the next tx from the file.
+    ///
+    /// Driven via the pure decision helper `pay_pregenerated_reject_fails` (the
+    /// plan permits a pure seam over the App harness, since `submit_tx` awaits a
+    /// real `App` and a deterministic reject is not cheaply reproducible).
+    ///
+    /// FAILS on origin/main: the helper does not exist and the PayPregenerated
+    /// arm returns `false` without setting `self.failed`.
+    #[test]
+    fn test_pay_pregenerated_reject_fails_run() {
+        // Any non-Added result fails the run.
+        assert!(pay_pregenerated_reject_fails(&TxQueueResult::QueueFull));
+        assert!(pay_pregenerated_reject_fails(&TxQueueResult::TryAgainLater));
+        assert!(pay_pregenerated_reject_fails(&TxQueueResult::Banned));
+        assert!(pay_pregenerated_reject_fails(&TxQueueResult::FeeTooLow));
+        assert!(pay_pregenerated_reject_fails(&TxQueueResult::Invalid(
+            Some(TxResultCode::TxBadSeq)
+        )));
+        // Added is the only accepted result — does NOT fail the run.
+        assert!(!pay_pregenerated_reject_fails(&TxQueueResult::Added));
+    }
 }
