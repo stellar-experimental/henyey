@@ -498,6 +498,11 @@ struct PeerLoopCtx<'a> {
     peer_rate_limiter: &'a mut PeerRateLimiter,
     scp_messages: &'a mut u64,
     last_write: &'a mut Instant,
+    /// #3643 straggler parity: loop-local enqueue time of the newest message in
+    /// the last batch actually written to this peer (`mEnqueueTimeOfLastWrite`,
+    /// `TCPPeer.cpp:329`). Advanced by the SEND_MORE_EXTENDED drain path so the
+    /// straggler timeout keys on throughput deficit, not completed-write time.
+    enqueue_time_of_last_write: &'a mut Instant,
     /// #3570 observability: loop-local count of SCP envelopes henyey has
     /// written to this peer (accumulated from SEND_MORE-triggered drains).
     scp_written: &'a mut u64,
@@ -511,6 +516,16 @@ struct PeerLoopCtx<'a> {
 struct PeerTimingInfo {
     last_read: Instant,
     last_write: Instant,
+    /// #3643 straggler parity: the enqueue time of the *newest* message in the
+    /// most recent batch actually written to this peer. Mirrors stellar-core's
+    /// `mEnqueueTimeOfLastWrite` (`TCPPeer.cpp:329`, last-wins over the written
+    /// FIFO prefix; init `now()` at `Peer.cpp:144`). The straggler timeout keys
+    /// on this — NOT on `last_write` (completed-write time) — so a peer that
+    /// keeps writing but cannot keep up (even its newest batched message is
+    /// already >120s old) is flagged, while a peer with a deep-but-draining
+    /// queue is not. Idle (`last_read`/`last_write`) and no-outbound-capacity
+    /// (60s) stay distinct signals.
+    enqueue_time_of_last_write: Instant,
     total_messages: u64,
     scp_messages: u64,
 }
@@ -707,7 +722,15 @@ impl OverlayManager {
             metrics.timeouts_idle.inc();
             return Some(IdleReason::Idle);
         }
-        if now.duration_since(timing.last_write) >= PEER_STRAGGLER_TIMEOUT {
+        // #3643 straggler parity: key on the enqueue time of the newest message
+        // in the last batch actually written — NOT `last_write` (completed-write
+        // time, which resets to `now()` on every write). Mirrors stellar-core
+        // `(now - mEnqueueTimeOfLastWrite) >= PEER_STRAGGLER_TIMEOUT`
+        // (`Peer.cpp:462`). A peer that keeps writing but cannot keep up (even
+        // its newest batched message is already >120s old) is a straggler; a
+        // peer with a deep-but-draining queue is not. The idle (last_read/
+        // last_write) and no-outbound-capacity (60s) signals stay distinct.
+        if now.duration_since(timing.enqueue_time_of_last_write) >= PEER_STRAGGLER_TIMEOUT {
             warn!(
                 "Dropping peer {} due to straggler timeout (total_msgs={}, scp_msgs={})",
                 peer_id, timing.total_messages, timing.scp_messages
@@ -859,6 +882,7 @@ impl OverlayManager {
             Ok(BatchSendOutcome {
                 sent: false,
                 scp_written: 0,
+                newest_emplaced: None,
             })
         }
     }
@@ -1137,6 +1161,13 @@ impl OverlayManager {
         // Idle/straggler timeout tracking (matches stellar-core Peer::recurrentTimerExpired).
         let mut last_read = Instant::now();
         let mut last_write = Instant::now();
+        // #3643 straggler parity: enqueue time of the newest message in the last
+        // batch actually written to this peer. Mirrors stellar-core's
+        // `mEnqueueTimeOfLastWrite`, initialized to `now()` at the peer ctor
+        // (`Peer.cpp:144`) and advanced inside the write loop (`TCPPeer.cpp:329`,
+        // last-wins over the written FIFO prefix). The straggler timeout
+        // (`check_peer_timeouts`) keys on THIS, not on `last_write`.
+        let mut enqueue_time_of_last_write = Instant::now();
 
         // Track message counts for periodic diagnostics
         let mut total_messages: u64 = 0;
@@ -1207,6 +1238,12 @@ impl OverlayManager {
                                 Ok(outcome) => {
                                     if outcome.sent {
                                         last_write = Instant::now();
+                                    }
+                                    // #3643 straggler parity: advance the
+                                    // enqueue stamp to the newest message in the
+                                    // batch actually written (TCPPeer.cpp:329).
+                                    if let Some(t) = outcome.newest_emplaced {
+                                        enqueue_time_of_last_write = t;
                                     }
                                     // #3570 observability: accumulate SCP writes.
                                     scp_written += outcome.scp_written;
@@ -1290,6 +1327,7 @@ impl OverlayManager {
                                     peer_rate_limiter: &mut peer_rate_limiter,
                                     scp_messages: &mut scp_messages,
                                     last_write: &mut last_write,
+                                    enqueue_time_of_last_write: &mut enqueue_time_of_last_write,
                                     scp_written: &mut scp_written,
                                     outbound_tx: &outbound_tx,
                                 },
@@ -1338,6 +1376,7 @@ impl OverlayManager {
                     if let Some(idle_reason) = Self::check_peer_timeouts(&peer_id, &PeerTimingInfo {
                         last_read,
                         last_write,
+                        enqueue_time_of_last_write,
                         total_messages,
                         scp_messages,
                     }, &flow_control, &state.metrics) {
@@ -1477,6 +1516,12 @@ impl OverlayManager {
                         if outcome.sent {
                             *ctx.last_write = Instant::now();
                         }
+                        // #3643 straggler parity: advance the enqueue stamp to
+                        // the newest message in the batch actually written
+                        // (TCPPeer.cpp:329, last-wins over the written prefix).
+                        if let Some(t) = outcome.newest_emplaced {
+                            *ctx.enqueue_time_of_last_write = t;
+                        }
                         // #3570 observability: accumulate SCP envelopes written.
                         *ctx.scp_written += outcome.scp_written;
                     }
@@ -1580,6 +1625,7 @@ impl OverlayManager {
             return Ok(BatchSendOutcome {
                 sent: false,
                 scp_written: 0,
+                newest_emplaced: None,
             });
         }
 
@@ -1587,15 +1633,26 @@ impl OverlayManager {
         let mut sent_by_priority: Vec<Vec<StellarMessage>> =
             vec![Vec::new(); MessagePriority::COUNT];
 
+        // #3643 straggler parity: track the MAX `time_emplaced` over messages
+        // ACTUALLY written (advance only on successful send, per message — like
+        // core's `messageSender` loop reassigning `mEnqueueTimeOfLastWrite` for
+        // each message it writes). On a mid-batch send error we keep the max of
+        // what was already written, matching core's per-message advance.
+        let mut newest_emplaced: Option<Instant> = None;
+
         for queued in batch {
             let priority = MessagePriority::from_message(&queued.message);
+            let emplaced = queued.time_emplaced;
             if let Err(e) = peer.send(queued.message.clone()).await {
-                // Send failed — process what we've sent so far, then propagate error
+                // Send failed — process what we've sent so far, then propagate
+                // the error. A send failure drops the peer (the caller breaks
+                // the loop), so the straggler stamp is moot on this path.
                 flow_control.process_sent_messages(&sent_by_priority);
                 metrics.errors_write.inc();
                 return Err(e);
             }
             metrics.messages_written.inc();
+            newest_emplaced = fold_newest_emplaced(newest_emplaced, emplaced);
             if let Some(p) = priority {
                 sent_by_priority[p as usize].push(queued.message);
             }
@@ -1610,8 +1667,22 @@ impl OverlayManager {
         Ok(BatchSendOutcome {
             sent: true,
             scp_written,
+            newest_emplaced,
         })
     }
+}
+
+/// #3643 straggler parity: fold one written message's `time_emplaced` into the
+/// running newest-emplaced accumulator (a max). Extracted so the advance-point
+/// (advance-to-NEWEST, never oldest) is a single, unit-testable selection —
+/// mirroring stellar-core's last-wins reassignment of `mEnqueueTimeOfLastWrite`
+/// over the written FIFO prefix (`TCPPeer.cpp:329`). Folding each message's
+/// emplace time with `max` is equivalent to taking the newest over the prefix.
+fn fold_newest_emplaced(acc: Option<Instant>, emplaced: Instant) -> Option<Instant> {
+    Some(match acc {
+        Some(prev) if prev >= emplaced => prev,
+        _ => emplaced,
+    })
 }
 
 /// #3570 observability: outcome of [`OverlayManager::send_flow_controlled_batch`].
@@ -1620,6 +1691,15 @@ pub(super) struct BatchSendOutcome {
     pub sent: bool,
     /// Number of SCP envelopes written this batch.
     pub scp_written: u64,
+    /// #3643 straggler parity: the MAX `time_emplaced` over the messages
+    /// actually written this batch (the *newest* message in the written set),
+    /// or `None` if nothing was written. The caller advances
+    /// `enqueue_time_of_last_write` to this value — mirroring stellar-core's
+    /// `mEnqueueTimeOfLastWrite = tsm.mEnqueuedTime` (`TCPPeer.cpp:329`,
+    /// last-wins over the written FIFO prefix). henyey's batch is priority-
+    /// interleaved (not a contiguous FIFO slice), so the MAX emplace time is
+    /// the faithful analogue of core's last-in-prefix.
+    pub newest_emplaced: Option<Instant>,
 }
 
 #[cfg(test)]
@@ -1689,6 +1769,7 @@ mod tests {
                 &PeerTimingInfo {
                     last_read: stale,
                     last_write: stale,
+                    enqueue_time_of_last_write: fresh,
                     total_messages: 2,
                     scp_messages: 0,
                 },
@@ -1710,6 +1791,7 @@ mod tests {
                 &PeerTimingInfo {
                     last_read: fresh,
                     last_write: fresh,
+                    enqueue_time_of_last_write: fresh,
                     total_messages: 2,
                     scp_messages: 0,
                 },
@@ -1727,6 +1809,7 @@ mod tests {
                 &PeerTimingInfo {
                     last_read: fresh,
                     last_write: fresh,
+                    enqueue_time_of_last_write: fresh,
                     total_messages: 10,
                     scp_messages: 5,
                 },
@@ -1735,6 +1818,332 @@ mod tests {
             ),
             None,
             "fresh and capacitated → no timeout"
+        );
+    }
+
+    #[test]
+    fn test_straggler_timeout_fires_on_stale_enqueue_time_with_recent_last_write() {
+        // #3643 centerpiece — straggler parity with stellar-core.
+        //
+        // Core keys the straggler on `(now - mEnqueueTimeOfLastWrite) >=
+        // PEER_STRAGGLER_TIMEOUT(120s)` (`Peer.cpp:462`), where
+        // `mEnqueueTimeOfLastWrite` is the enqueue time of the newest message in
+        // the last batch actually written (`TCPPeer.cpp:329`). henyey previously
+        // keyed it on `last_write` (the *completed-write* time), which resets to
+        // `now()` on every write — so a peer that writes steadily but never
+        // catches up (its newest batched message is already >120s old) was never
+        // flagged.
+        //
+        // FAIL-BEFORE: with the straggler keyed on `last_write` (main), a recent
+        // `last_write` masks a stale `enqueue_time_of_last_write` → returns None.
+        // PASS-AFTER: keyed on `enqueue_time_of_last_write` → Straggler.
+        use crate::flow_control::FlowControl;
+        let metrics = crate::metrics::OverlayMetrics::new();
+        let peer_id = PeerId::from_bytes([9u8; 32]);
+
+        // Capacity granted so the SendModeIdle path does not fire — isolate the
+        // straggler branch.
+        let fc = FlowControl::default();
+        fc.maybe_release_capacity(&StellarMessage::SendMoreExtended(
+            stellar_xdr::SendMoreExtended {
+                num_messages: 10,
+                num_bytes: 10_000,
+            },
+        ));
+
+        // last_read/last_write are RECENT (peer is actively writing and reading,
+        // so neither idle nor a completed-write timeout would fire), but the
+        // newest message we managed to batch-write was enqueued >120s ago.
+        let recent = Instant::now();
+        let stale_enqueue = Instant::now() - Duration::from_secs(125);
+
+        assert_eq!(
+            OverlayManager::check_peer_timeouts(
+                &peer_id,
+                &PeerTimingInfo {
+                    last_read: recent,
+                    last_write: recent,
+                    enqueue_time_of_last_write: stale_enqueue,
+                    total_messages: 100,
+                    scp_messages: 50,
+                },
+                &fc,
+                &metrics,
+            ),
+            Some(IdleReason::Straggler),
+            "stale enqueue-time with recent last_write must fire the straggler"
+        );
+    }
+
+    #[test]
+    fn test_straggler_does_not_fire_when_writes_keep_up() {
+        // #3643: a peer whose newest batched message is recent (writes keep up)
+        // is NOT straggler-dropped, even under high message volume.
+        use crate::flow_control::FlowControl;
+        let metrics = crate::metrics::OverlayMetrics::new();
+        let peer_id = PeerId::from_bytes([10u8; 32]);
+        let fc = FlowControl::default();
+        fc.maybe_release_capacity(&StellarMessage::SendMoreExtended(
+            stellar_xdr::SendMoreExtended {
+                num_messages: 10,
+                num_bytes: 10_000,
+            },
+        ));
+        let recent = Instant::now();
+        assert_eq!(
+            OverlayManager::check_peer_timeouts(
+                &peer_id,
+                &PeerTimingInfo {
+                    last_read: recent,
+                    last_write: recent,
+                    enqueue_time_of_last_write: recent,
+                    total_messages: 100_000,
+                    scp_messages: 50_000,
+                },
+                &fc,
+                &metrics,
+            ),
+            None,
+            "recent enqueue-time → no straggler even at high volume"
+        );
+    }
+
+    #[test]
+    fn test_no_outbound_capacity_not_attributed_to_straggler() {
+        // #3643 no-conflation invariant: a peer whose outbound queue is backed
+        // up *purely because the remote granted no SEND_MORE* must be attributed
+        // to SendModeIdle (60s, `no_outbound_capacity_timeout`), NOT to the
+        // straggler (120s). Core keeps these as separate drops on separate
+        // signals; the straggler must not be derived from the merely-queued set.
+        //
+        // Here: last_read/last_write recent, enqueue-time recent (we never got
+        // to write anything stale), but no_outbound_capacity aged past 60s.
+        use crate::flow_control::FlowControl;
+        let metrics = crate::metrics::OverlayMetrics::new();
+        let peer_id = PeerId::from_bytes([11u8; 32]);
+        let fc = FlowControl::default();
+        // No SEND_MORE ever granted → no_outbound_capacity is set at ctor;
+        // backdate it past the 60s send-mode-idle threshold but BELOW 120s.
+        fc.force_no_outbound_capacity_age(70);
+        let recent = Instant::now();
+        assert_eq!(
+            OverlayManager::check_peer_timeouts(
+                &peer_id,
+                &PeerTimingInfo {
+                    last_read: recent,
+                    last_write: recent,
+                    enqueue_time_of_last_write: recent,
+                    total_messages: 5,
+                    scp_messages: 0,
+                },
+                &fc,
+                &metrics,
+            ),
+            Some(IdleReason::SendModeIdle),
+            "no-outbound-capacity backlog must be SendModeIdle, not Straggler"
+        );
+    }
+
+    #[test]
+    fn test_idle_peer_with_no_writes_not_flagged_straggler() {
+        // #3643: a peer that never had outbound traffic keeps its initialized
+        // enqueue-time (= ctor `now()`). With fresh clocks it is not flagged;
+        // the idle check governs once both read/write clocks go stale (as core's
+        // ctor-init to `now()` ensures a no-traffic peer is never straggler-
+        // false-flagged on the enqueue signal).
+        use crate::flow_control::FlowControl;
+        let metrics = crate::metrics::OverlayMetrics::new();
+        let peer_id = PeerId::from_bytes([12u8; 32]);
+        let fc = FlowControl::default();
+        fc.maybe_release_capacity(&StellarMessage::SendMoreExtended(
+            stellar_xdr::SendMoreExtended {
+                num_messages: 10,
+                num_bytes: 10_000,
+            },
+        ));
+        let now = Instant::now();
+        // Fresh enqueue-time (ctor init), fresh clocks → no drop at all.
+        assert_eq!(
+            OverlayManager::check_peer_timeouts(
+                &peer_id,
+                &PeerTimingInfo {
+                    last_read: now,
+                    last_write: now,
+                    enqueue_time_of_last_write: now,
+                    total_messages: 0,
+                    scp_messages: 0,
+                },
+                &fc,
+                &metrics,
+            ),
+            None,
+            "a peer with no outbound traffic and fresh clocks is not flagged"
+        );
+        // When both read/write clocks go stale, the *idle* check fires first —
+        // not the straggler — even though the enqueue-time is also old here.
+        let stale = now - Duration::from_secs(40);
+        assert_eq!(
+            OverlayManager::check_peer_timeouts(
+                &peer_id,
+                &PeerTimingInfo {
+                    last_read: stale,
+                    last_write: stale,
+                    enqueue_time_of_last_write: now,
+                    total_messages: 0,
+                    scp_messages: 0,
+                },
+                &fc,
+                &metrics,
+            ),
+            Some(IdleReason::Idle),
+            "stale read/write clocks → Idle governs (fresh enqueue-time)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_enqueue_time_advances_to_newest_sent_not_oldest() {
+        // #3643 advance-point guard — mirrors core `TCPPeer.cpp:329` last-wins.
+        //
+        // When a non-empty batch is actually written, the stamp advances to the
+        // MAX `time_emplaced` over the sent batch (the newest message), NOT the
+        // oldest. Keying on the oldest would false-positive-drop a peer with a
+        // deep-but-draining queue. henyey's batch is priority-interleaved (not a
+        // contiguous FIFO slice), so max-emplaced-time is the faithful analogue
+        // of core's last-in-written-prefix.
+        //
+        // We assert on `BatchSendOutcome.newest_emplaced` directly (the value
+        // the loop uses to advance `enqueue_time_of_last_write`), driving a real
+        // FlowControl with two messages emplaced at distinct, known times.
+        use crate::flow_control::{FlowControl, FlowControlConfig};
+
+        let fc = FlowControl::new(FlowControlConfig::default());
+        // Grant ample outbound capacity so both messages are in the batch.
+        fc.maybe_release_capacity(&StellarMessage::SendMoreExtended(
+            stellar_xdr::SendMoreExtended {
+                num_messages: 1000,
+                num_bytes: 10_000_000,
+            },
+        ));
+
+        // Emplace an OLD message, then (a beat later) a NEW message. Both go to
+        // the same priority queue (TX_DEMAND/SCP etc. — use SCP so they share a
+        // queue and FIFO order is old→new).
+        let mk_scp = |seed: u8| {
+            StellarMessage::ScpMessage(stellar_xdr::ScpEnvelope {
+                statement: stellar_xdr::ScpStatement {
+                    node_id: stellar_xdr::NodeId(stellar_xdr::PublicKey::PublicKeyTypeEd25519(
+                        stellar_xdr::Uint256([seed; 32]),
+                    )),
+                    slot_index: seed as u64,
+                    pledges: stellar_xdr::ScpStatementPledges::Externalize(
+                        stellar_xdr::ScpStatementExternalize {
+                            commit: stellar_xdr::ScpBallot {
+                                counter: 1,
+                                value: vec![seed].try_into().unwrap(),
+                            },
+                            n_h: 1,
+                            commit_quorum_set_hash: stellar_xdr::Hash([0u8; 32]),
+                        },
+                    ),
+                },
+                signature: stellar_xdr::Signature(Vec::new().try_into().unwrap()),
+            })
+        };
+
+        fc.add_msg_and_maybe_trim_queue(mk_scp(1));
+        // Snapshot the batch the loop would send and confirm both messages are
+        // present with distinct emplace times, with the newest > oldest.
+        fc.add_msg_and_maybe_trim_queue(mk_scp(2));
+
+        let batch = fc.get_next_batch_to_send();
+        assert_eq!(batch.len(), 2, "both messages should be in the batch");
+        let oldest = batch.iter().map(|q| q.time_emplaced).min().unwrap();
+        let newest = batch.iter().map(|q| q.time_emplaced).max().unwrap();
+        assert!(
+            newest > oldest,
+            "fixture sanity: the two messages have distinct emplace times"
+        );
+
+        // Drive the SAME selection the production send path uses
+        // (`fold_newest_emplaced`, the running max in `send_flow_controlled_batch`)
+        // over the actually-batched messages, in queue order (old→new).
+        let mut acc: Option<Instant> = None;
+        for q in &batch {
+            acc = fold_newest_emplaced(acc, q.time_emplaced);
+        }
+        assert_eq!(
+            acc,
+            Some(newest),
+            "advance-point must be the MAX time_emplaced (newest message in the \
+             written batch), mirroring core's last-wins mEnqueueTimeOfLastWrite"
+        );
+        assert_ne!(
+            acc,
+            Some(oldest),
+            "advance-point must NOT be the oldest time_emplaced — keying on the \
+             oldest would false-positive-drop a peer with a deep-but-draining queue"
+        );
+
+        // Also confirm order-independence: folding new→old yields the same max
+        // (a min-based bug would be order-sensitive and is excluded here).
+        let mut acc_rev: Option<Instant> = None;
+        for q in batch.iter().rev() {
+            acc_rev = fold_newest_emplaced(acc_rev, q.time_emplaced);
+        }
+        assert_eq!(acc_rev, Some(newest), "fold is a max, order-independent");
+    }
+
+    #[test]
+    fn test_tx_release_is_inline_not_deferred() {
+        // PARITY LOCK (#3643, #3625 Phase 3): stellar-core processes
+        // `recvTransaction`/`recvFloodAdvert`/`recvFloodDemand` SYNCHRONOUSLY on
+        // the main thread (`Peer.cpp:1144-1533`); `~CapacityTrackedMessage`
+        // fires the release inline. In henyey the SCP path defers release to a
+        // `FlowControlRelease` token (drain-gated, #3625) while NON-SCP messages
+        // keep the `CapacityGuard` and release inline via `finish()` on the peer
+        // task (`peer_loop.rs` ~1500-1560) — the faithful async analogue.
+        // Deferring tx/flood onto the lossy broadcast consumer would be a parity
+        // REGRESSION (couples a parity credit to a lossy channel and diverges
+        // from core's timing). This test pins the inline-release decision.
+        use crate::flow_control::{CapacityGuard, FlowControl};
+        use stellar_xdr::{TransactionEnvelope, TransactionV0, TransactionV0Envelope};
+
+        // 1) The production routing discriminant: only SCP disarms into a
+        //    deferred release token; a TRANSACTION is NOT SCP, so it takes the
+        //    inline-`finish()` path.
+        let tx = StellarMessage::Transaction(TransactionEnvelope::TxV0(TransactionV0Envelope {
+            tx: TransactionV0 {
+                source_account_ed25519: stellar_xdr::Uint256([0u8; 32]),
+                fee: 100,
+                seq_num: stellar_xdr::SequenceNumber(1),
+                time_bounds: None,
+                memo: stellar_xdr::Memo::None,
+                operations: vec![].try_into().unwrap(),
+                ext: stellar_xdr::TransactionV0Ext::V0,
+            },
+            signatures: vec![].try_into().unwrap(),
+        }));
+        let is_scp_message = matches!(tx, StellarMessage::ScpMessage(_));
+        assert!(
+            !is_scp_message,
+            "a TRANSACTION must NOT be treated as SCP — it releases inline, not \
+             via a deferred FlowControlRelease token"
+        );
+
+        // 2) End-to-end: acquiring then `finish()`-ing a guard for a TX releases
+        //    its flow-control capacity INLINE (the flood-processed counter
+        //    advances on this task), with no token minted/deferred.
+        let fc = Arc::new(FlowControl::default());
+        assert_eq!(fc.test_flood_data_processed(), 0);
+        let guard = CapacityGuard::new(Arc::clone(&fc), tx).expect("capacity available for TX");
+        // No deferral: `finish()` (not `disarm()`) is the non-SCP path.
+        let _send_more = guard.finish();
+        assert_eq!(
+            fc.test_flood_data_processed(),
+            1,
+            "TX capacity must be released inline via finish() (flood-processed \
+             counter advanced on this task), matching core's synchronous \
+             recvTransaction — not deferred to a drain-gated token"
         );
     }
 

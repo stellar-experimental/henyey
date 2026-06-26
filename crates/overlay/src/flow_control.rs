@@ -2333,4 +2333,47 @@ mod tests {
             );
         }
     }
+
+    // ── #3643 parity-lock: byte-capacity `can_read` is unconditionally true ──
+
+    #[test]
+    fn test_byte_capacity_can_read_always_true() {
+        // PARITY LOCK (#3643, #3625 Phase 3): stellar-core's
+        // `FlowControlByteCapacity::canRead()` is
+        // `releaseAssert(!mCapacity.mTotalCapacity); return true;`
+        // (`FlowControlCapacity.cpp:92-95`) — the byte track has NO total
+        // capacity and NEVER gates reads. henyey's `new_bytes` sets
+        // `total_capacity: None` and `can_read()` returns `unwrap_or(true)`
+        // (`flow_control.rs:334-345, 425-427`). This is correct parity, not a
+        // gap: read gating is the MESSAGE track's job only. This test guards
+        // against a future refactor wrongly introducing a byte read-gate (which
+        // would diverge from core).
+        let byte_cap = FlowControlCapacity::new_bytes(100_000);
+        assert!(
+            byte_cap.can_read(),
+            "byte-capacity can_read must be true on a fresh byte track"
+        );
+
+        // Drain ALL byte flood capacity via local locks — `can_read` must STILL
+        // be true, because the byte track has no total_capacity to gate on.
+        let mut byte_cap = FlowControlCapacity::new_bytes(100_000);
+        let tx = make_tx_message();
+        // Lock until flood capacity is below a single message's resource count.
+        let per_msg = byte_cap.get_msg_resource_count(&tx).max(1);
+        let mut locked = 0u64;
+        while byte_cap.can_lock_local_capacity(&tx) && locked < 100_000 {
+            byte_cap.lock_local_capacity(&tx);
+            locked += per_msg;
+        }
+        assert!(
+            byte_cap.can_read(),
+            "byte-capacity can_read must remain true even with flood capacity \
+             fully locked — the byte track has no total_capacity and never gates \
+             reads (parity with FlowControlByteCapacity::canRead)"
+        );
+        assert!(
+            byte_cap.capacity.total_capacity.is_none(),
+            "byte track must have no total_capacity (parity invariant)"
+        );
+    }
 }
