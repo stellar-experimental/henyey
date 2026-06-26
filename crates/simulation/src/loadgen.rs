@@ -156,6 +156,69 @@ fn classify_submit_result(
     }
 }
 
+/// Outcome of an *attempted* transaction submission (one inner-loop iteration
+/// of `generate_load` that actually called [`LoadGenerator::submit_tx`]).
+///
+/// The third, implicit outcome — **not attempted** — is the inner loop breaking
+/// before `submit_tx` is ever called (e.g. `get_next_available_account`
+/// returned `None`). A not-attempted iteration produces no `SubmitOutcome` and
+/// never advances the pacing counter.
+///
+/// #3638: stellar-core's `generateLoad` bumps its pacing counter (`++count`,
+/// then `mTotalSubmitted += count`, LoadGenerator.cpp:900,919) once per
+/// *attempt* regardless of acceptance, while only decrementing the work-
+/// remaining count (`--cfg.nTxs`, line 874) on *acceptance*. Henyey must match:
+/// the pacing counter advances on every attempt (`Accepted` or `NotAccepted`),
+/// `config.n_txs` decrements only on `Accepted`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SubmitOutcome {
+    /// The tx was added to the queue — counts as an attempt AND an accept.
+    Accepted,
+    /// The tx was attempted but the queue did not accept it (classic reject,
+    /// `SkipLowFee`, banned, or — for `PayPregenerated` — a fail-the-run
+    /// reject). Counts as an attempt but NOT an accept.
+    NotAccepted,
+}
+
+impl SubmitOutcome {
+    /// Whether this outcome counts as a pacing **attempt** (advances
+    /// `total_submitted`). Both variants are attempts; the non-attempt case
+    /// never produces a `SubmitOutcome` (the loop breaks before `submit_tx`).
+    fn is_attempt(self) -> bool {
+        matches!(self, SubmitOutcome::Accepted | SubmitOutcome::NotAccepted)
+    }
+
+    /// Whether the tx was accepted into the queue (decrements `n_txs`).
+    fn is_accepted(self) -> bool {
+        matches!(self, SubmitOutcome::Accepted)
+    }
+}
+
+/// Pure pacing-counter update: advance the cumulative `total_submitted`
+/// (pacing) counter by the number of submission *attempts* made in a step.
+///
+/// #3638 parity: mirrors stellar-core's `mTotalSubmitted += count`
+/// (LoadGenerator.cpp:919) where `count` is the per-step attempt tally
+/// (`++count` per submitted tx, line 900) — NOT the accept tally. Feeding this
+/// the attempt count keeps `get_tx_per_step`'s deficit (`target -
+/// total_submitted`) amortizing correctly under queue rejection instead of
+/// ballooning and bursting on the next step.
+fn step_pacing_update(total_submitted: i64, attempts_this_step: i64) -> i64 {
+    total_submitted + attempts_this_step
+}
+
+/// Pure decision: whether a `PayPregenerated` submission result must FAIL the
+/// run.
+///
+/// #3638 parity: stellar-core's `submitTx` sets `mFailed = true` and aborts on
+/// any non-PENDING result for `PAY_PREGENERATED` (LoadGenerator.cpp:958-963) —
+/// each pregenerated tx is read once from the file, so re-submitting would
+/// consume the *next* tx and silently over-drain the file. Only `Added`
+/// (accepted) keeps the run alive.
+fn pay_pregenerated_reject_fails(result: &TxQueueResult) -> bool {
+    !matches!(result, TxQueueResult::Added)
+}
+
 /// Sentinel account ID for the network root account.
 const ROOT_ACCOUNT_ID: u64 = u64::MAX;
 
@@ -1713,7 +1776,13 @@ impl LoadGenerator {
 
             // Submit transactions for this step
             let ledger_num = self.tx_generator.app.current_ledger_seq();
-            let mut submitted_this_step = 0i64;
+            // #3638: count ATTEMPTS, not accepts. The pacing counter
+            // (`total_submitted`) advances per attempt to mirror stellar-core's
+            // `++count` / `mTotalSubmitted += count` (LoadGenerator.cpp:900,
+            // 919), so `get_tx_per_step`'s deficit amortizes under rejection
+            // instead of bursting. `config.n_txs` (work remaining) still
+            // decrements only on accept (core's `--cfg.nTxs`, line 874).
+            let mut attempts_this_step = 0i64;
             for _ in 0..txs_this_step {
                 if config.n_txs == 0 {
                     break;
@@ -1728,21 +1797,33 @@ impl LoadGenerator {
                     match self.get_next_available_account(ledger_num) {
                         Some(id) => id,
                         None => {
+                            // Not-attempted: no `submit_tx` call, so the pacing
+                            // counter must NOT advance for this iteration
+                            // (core's `++count` is only after a submit).
                             debug!("No available accounts, waiting for cleanup");
                             break;
                         }
                     }
                 };
 
-                let ok = self.submit_tx(config, source_id, ledger_num).await;
-                if ok {
+                // Every reached `submit_tx` call is an attempt — both
+                // `Accepted` and `NotAccepted` advance pacing; only `Accepted`
+                // decrements the work-remaining count.
+                let outcome = self.submit_tx(config, source_id, ledger_num).await;
+                if outcome.is_attempt() {
+                    attempts_this_step += 1;
+                }
+                if outcome.is_accepted() {
                     config.n_txs = config.n_txs.saturating_sub(1);
-                    submitted_this_step += 1;
                 } else if self.failed {
+                    // Fold this attempt into the pacing counter before bailing
+                    // so the accounting stays consistent on the failure path.
+                    self.total_submitted =
+                        step_pacing_update(self.total_submitted, attempts_this_step);
                     return LoadResult::Failed;
                 }
             }
-            self.total_submitted += submitted_this_step;
+            self.total_submitted = step_pacing_update(self.total_submitted, attempts_this_step);
 
             tokio::time::sleep(step_duration).await;
         }
@@ -2038,7 +2119,7 @@ impl LoadGenerator {
         config: &mut GeneratedLoadConfig,
         source_account_id: u64,
         ledger_num: u32,
-    ) -> bool {
+    ) -> SubmitOutcome {
         let mut num_tries = 0u32;
         let mut queue_full_tries = 0u32;
 
@@ -2061,7 +2142,7 @@ impl LoadGenerator {
                 Err(e) => {
                     warn!("Failed to build tx (mode={:?}): {}", config.mode, e);
                     self.failed = true;
-                    return false;
+                    return SubmitOutcome::NotAccepted;
                 }
             };
 
@@ -2077,12 +2158,17 @@ impl LoadGenerator {
 
             // PayPregenerated does not re-submit on failure: each tx is read
             // once from the file, so a retry would consume the *next* tx
-            // (stellar-core LoadGenerator.cpp:874).
+            // (stellar-core LoadGenerator.cpp:874). A reject FAILS the run
+            // (mirroring core's `submitTx` mFailed+abort, LoadGenerator.cpp:
+            // 958-963) instead of silently draining the next tx from the file
+            // (#3638).
             if config.mode == LoadGenMode::PayPregenerated {
-                if !matches!(result, TxQueueResult::Added) {
+                if pay_pregenerated_reject_fails(&result) {
                     app_metrics::LOADGEN_TXN_REJECTED.increment(1.0);
+                    self.failed = true;
+                    return SubmitOutcome::NotAccepted;
                 }
-                return matches!(result, TxQueueResult::Added);
+                return SubmitOutcome::Accepted;
             }
 
             if !matches!(result, TxQueueResult::Added) {
@@ -2108,7 +2194,7 @@ impl LoadGenerator {
                 config.queue_full_max_tries,
                 config.mode,
             ) {
-                SubmitAction::Accept => return true,
+                SubmitAction::Accept => return SubmitOutcome::Accepted,
                 SubmitAction::RetryBadSeq => {
                     // Refresh sequence number from DB
                     self.tx_generator.load_account(source_account_id);
@@ -2123,7 +2209,7 @@ impl LoadGenerator {
                     if let Some(account) = self.tx_generator.accounts.get_mut(&source_account_id) {
                         account.sequence_number -= 1;
                     }
-                    return false;
+                    return SubmitOutcome::NotAccepted;
                 }
                 SubmitAction::RetryQueueFull => {
                     // Transient tx-queue backpressure: roll back the consumed
@@ -2158,7 +2244,7 @@ impl LoadGenerator {
                         result, num_tries, queue_full_tries
                     );
                     self.failed = true;
-                    return false;
+                    return SubmitOutcome::NotAccepted;
                 }
             }
         }
