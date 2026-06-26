@@ -58,6 +58,8 @@ const SUPPORTED_KEYS: &[&str] = &[
     "QUERY_SNAPSHOT_LEDGERS",
     "QUERY_THREAD_POOL_SIZE",
     "PEER_PORT",
+    "TARGET_PEER_CONNECTIONS",
+    "MAX_ADDITIONAL_PEER_CONNECTIONS",
     "KNOWN_PEERS",
     "PREFERRED_PEERS",
     "PREFERRED_PEER_KEYS",
@@ -116,8 +118,6 @@ const UNSUPPORTED_KNOWN_KEYS: &[&str] = &[
     "EXPERIMENTAL_BUCKETLIST_DB",
     "EXPERIMENTAL_BUCKETLIST_DB_INDEX_PAGE_SIZE_EXPONENT",
     "EXPERIMENTAL_BUCKETLIST_DB_INDEX_CUTOFF",
-    "TARGET_PEER_CONNECTIONS",
-    "MAX_ADDITIONAL_PEER_CONNECTIONS",
     "MAX_PENDING_CONNECTIONS",
     "PEER_AUTHENTICATION_TIMEOUT",
     "PEER_TIMEOUT",
@@ -291,6 +291,21 @@ pub fn translate_stellar_core_config(raw: &toml::Value) -> anyhow::Result<AppCon
             );
         }
         config.overlay.peer_port = port;
+    }
+    // TARGET_PEER_CONNECTIONS / MAX_ADDITIONAL_PEER_CONNECTIONS — match stellar-core
+    // overlay sizing. Core sizes its outbound authenticated accept cap to
+    // TARGET_PEER_CONNECTIONS and its inbound authenticated accept cap to
+    // MAX_ADDITIONAL_PEER_CONNECTIONS alone (OverlayManagerImpl.cpp:319-323; the cap is
+    // enforced in acceptAuthenticatedPeer as mAuthenticated.size() < mMaxAuthenticatedCount).
+    // The TARGET+ADDITIONAL sum (Config.cpp:2204-2205) is totalAuthenticatedConnections,
+    // used only for fd/pending-connection budgeting — it is NOT the inbound accept limit.
+    // Without this, henyey kept its defaults (8 outbound) and could not form meshes >16 nodes.
+    if let Some(target) = get_usize(table, "TARGET_PEER_CONNECTIONS") {
+        config.overlay.max_outbound_peers = target;
+        config.overlay.target_outbound_peers = target;
+    }
+    if let Some(additional) = get_usize(table, "MAX_ADDITIONAL_PEER_CONNECTIONS") {
+        config.overlay.max_inbound_peers = additional;
     }
     if let Some(peers) = get_string_array(table, "KNOWN_PEERS")
         .map_err(|e| anyhow::anyhow!("Compat config error: {}", e))?
@@ -4795,6 +4810,74 @@ NODE_SEED="SBXTJSLKQ2VZUEQNYU5EC6ZGQOONCX3JCFBK57R56YLYMUW76B2FMCJH self"
             err.to_string().contains("invalid quorum set definition"),
             "expected core-parity empty-qset rejection, got: {err}"
         );
+    }
+
+    #[test]
+    fn test_peer_connection_limits_both_keys() {
+        // #3628: both keys present. stellar-core sizes mOutboundPeers to
+        // TARGET_PEER_CONNECTIONS and mInboundPeers to MAX_ADDITIONAL_PEER_CONNECTIONS
+        // alone (OverlayManagerImpl.cpp:319-323). The TARGET+ADDITIONAL sum
+        // (Config.cpp:2204-2205) is totalAuthenticatedConnections, used only for
+        // fd/pending budgeting — NOT the inbound accept cap.
+        let config = translate(
+            r#"
+            NETWORK_PASSPHRASE = "Test SDF Network ; September 2015"
+            TARGET_PEER_CONNECTIONS = 16
+            MAX_ADDITIONAL_PEER_CONNECTIONS = 48
+            "#,
+        )
+        .unwrap();
+        assert_eq!(config.overlay.max_outbound_peers, 16);
+        assert_eq!(config.overlay.target_outbound_peers, 16);
+        // Inbound == MAX_ADDITIONAL alone (48), NOT TARGET+ADDITIONAL (64).
+        assert_eq!(config.overlay.max_inbound_peers, 48);
+    }
+
+    #[test]
+    fn test_peer_connection_limits_defaults_when_absent() {
+        // #3628 regression guard: with neither key set, henyey's overlay defaults
+        // must be preserved (out=8, in=64, target=8).
+        let config = translate(
+            r#"
+            NETWORK_PASSPHRASE = "Test SDF Network ; September 2015"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(config.overlay.max_outbound_peers, 8);
+        assert_eq!(config.overlay.max_inbound_peers, 64);
+        assert_eq!(config.overlay.target_outbound_peers, 8);
+    }
+
+    #[test]
+    fn test_peer_connection_limits_additional_only() {
+        // MAX_ADDITIONAL_PEER_CONNECTIONS set without TARGET_PEER_CONNECTIONS:
+        // inbound becomes the configured value, outbound/target stay at defaults.
+        let config = translate(
+            r#"
+            NETWORK_PASSPHRASE = "Test SDF Network ; September 2015"
+            MAX_ADDITIONAL_PEER_CONNECTIONS = 100
+            "#,
+        )
+        .unwrap();
+        assert_eq!(config.overlay.max_inbound_peers, 100);
+        assert_eq!(config.overlay.max_outbound_peers, 8);
+        assert_eq!(config.overlay.target_outbound_peers, 8);
+    }
+
+    #[test]
+    fn test_peer_connection_limits_target_only() {
+        // TARGET_PEER_CONNECTIONS set without MAX_ADDITIONAL_PEER_CONNECTIONS:
+        // outbound/target become the configured value, inbound stays at default 64.
+        let config = translate(
+            r#"
+            NETWORK_PASSPHRASE = "Test SDF Network ; September 2015"
+            TARGET_PEER_CONNECTIONS = 20
+            "#,
+        )
+        .unwrap();
+        assert_eq!(config.overlay.max_outbound_peers, 20);
+        assert_eq!(config.overlay.target_outbound_peers, 20);
+        assert_eq!(config.overlay.max_inbound_peers, 64);
     }
 
     #[test]
