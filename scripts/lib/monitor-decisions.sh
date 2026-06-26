@@ -811,12 +811,20 @@ classify_path_binary_relevance() {
 
 # Ancestry oracle (overridable for hermetic tests). Default: real git.
 # is_ancestor A B → 0 iff A is an ancestor-or-equal of B (A reachable from B).
-if ! declare -F is_ancestor >/dev/null 2>&1; then
+# NOTE: the existence guard MUST use the POSIX-portable `command -v`, NOT the
+# bash-only `declare -F`. Under zsh `declare` aliases `typeset`, so
+# `typeset -F is_ancestor` declares a FLOAT VARIABLE named is_ancestor and
+# returns 0 — the `! declare -F …` guard is then false, the fallback function
+# is NEVER defined, and the read loop hits `command not found: is_ancestor`,
+# mis-resolving every green-on-main run to `green-not-on-main` (#3592). Same
+# zsh-vs-bash class as the `status` reserved-var bug fixed in #3581.
+if ! command -v is_ancestor >/dev/null 2>&1; then
   is_ancestor() { git merge-base --is-ancestor "$1" "$2" 2>/dev/null; }
 fi
 # commits_ahead DEP SHA → number of commits in DEP..SHA (reachable from SHA,
 # not from DEP). Prints 0 on any error so the caller's numeric compare is safe.
-if ! declare -F commits_ahead >/dev/null 2>&1; then
+# Guarded with `command -v` (portable) — see the is_ancestor note above (#3592).
+if ! command -v commits_ahead >/dev/null 2>&1; then
   commits_ahead() { git rev-list --count "$1".."$2" 2>/dev/null || echo 0; }
 fi
 
