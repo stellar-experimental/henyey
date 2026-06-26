@@ -260,6 +260,16 @@ pub struct OverlayMetrics {
     pub messages_dropped: Counter,
     /// Messages broadcast to all peers.
     pub messages_broadcast: Counter,
+    /// Fetch-response/-request messages dropped because the bounded fetch
+    /// intake channel ([`crate::FETCH_CHANNEL_CAPACITY`]) was full while the
+    /// event loop was wedged (#3661). Recoverable: re-requested by the
+    /// periodic `request_pending_tx_sets()` tick + ItemFetcher retry.
+    pub fetch_messages_dropped: Counter,
+    /// Catchup-cache fan-out messages dropped because the bounded catchup
+    /// channel ([`crate::CATCHUP_CHANNEL_CAPACITY`]) was full while the cache
+    /// task was not draining (#3661). Recoverable: the cache is pre-warm only;
+    /// re-fetched/re-flooded after the catchup→Tracking handoff.
+    pub catchup_messages_dropped: Counter,
 
     // ===== Byte Metrics =====
     /// Bytes read from peers (wire-level: `AuthenticatedMessage` XDR body, excluding the
@@ -425,6 +435,8 @@ impl OverlayMetrics {
             messages_written: self.messages_written.get(),
             messages_dropped: self.messages_dropped.get(),
             messages_broadcast: self.messages_broadcast.get(),
+            fetch_messages_dropped: self.fetch_messages_dropped.get(),
+            catchup_messages_dropped: self.catchup_messages_dropped.get(),
 
             // Byte metrics
             bytes_read: self.bytes_read.get(),
@@ -509,6 +521,8 @@ impl OverlayMetrics {
             &self.messages_written,
             &self.messages_dropped,
             &self.messages_broadcast,
+            &self.fetch_messages_dropped,
+            &self.catchup_messages_dropped,
             &self.bytes_read,
             &self.bytes_written,
             &self.async_read,
@@ -570,6 +584,10 @@ pub struct OverlayMetricsSnapshot {
     pub messages_written: u64,
     pub messages_dropped: u64,
     pub messages_broadcast: u64,
+    /// Fetch intake channel drops (#3661).
+    pub fetch_messages_dropped: u64,
+    /// Catchup-cache channel drops (#3661).
+    pub catchup_messages_dropped: u64,
 
     // Byte metrics
     pub bytes_read: u64,
