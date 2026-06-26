@@ -2789,21 +2789,57 @@ CANNED
     esac
   }
 
-  # ── Test 78f — bundled commit + surviving benign hunk + resolved-on-main → CLEAR
-  # FAILS on origin/main today (no `resolved` parsing → blocked_active, the
-  # tick-199 bug); PASSES after the resolved short-circuit lands.
+  # VE-green oracle stub (#3632). The resolved-token auto-clear in
+  # check_quarantine_active now ALSO requires the fix sha be VE-green, not just
+  # merged. We shadow the overridable `quarantine_resolved_is_ve_green` oracle so
+  # the predicate is driven by `$_Q_VE_GREEN_RC` (0 = a fix-containing sha passed
+  # `Verify Execution (Mainnet)`; 1 = merged-but-not-yet-VE-green). The merge
+  # (ancestry) side stays driven by `$_Q_RESOLVED_RC` via `_q_resolved_git`. The
+  # two are orthogonal, exactly mirroring the merge-vs-VE-green split the gate now
+  # enforces. Default 0 so the pre-#3632 "merged ⇒ clear" tests stay green when
+  # they intend a fully-resolved (merged + VE-green) fix.
+  _q_resolved_ve_green() { return "${_Q_VE_GREEN_RC:-0}"; }
+
+  # ── Test 78f — bundled commit + surviving benign hunk + resolved-on-main +
+  #   VE-green → CLEAR. FAILS on origin/main pre-#3256 (no `resolved` parsing →
+  #   blocked_active, the tick-199 bug); PASSES once the resolved short-circuit
+  #   lands. Post-#3632 the fix must ALSO be VE-green (_Q_VE_GREEN_RC=0).
   printf '%s regression #3238 resolved:%s\n' "$sha1" "$sha2" > "$qdir/resolved_clear.txt"
   _Q_RESOLVED_RC=0
+  _Q_VE_GREEN_RC=0
   git() { _q_resolved_git "$@"; }
+  quarantine_resolved_is_ve_green() { _q_resolved_ve_green "$@"; }
   local rc78f=0
   check_quarantine_active "$qdir/resolved_clear.txt" || rc78f=$?
-  unset -f git
-  unset _Q_RESOLVED_RC
+  unset -f git quarantine_resolved_is_ve_green
+  unset _Q_RESOLVED_RC _Q_VE_GREEN_RC
   if [[ $rc78f -eq 1 && "$QUARANTINE_STATUS" == "clear" && -z "$QUARANTINED_MATCH" ]]; then
-    tap_ok "quarantine-active: bundled commit + resolved-on-main auto-clears (#3256)"
+    tap_ok "quarantine-active: bundled commit + resolved-on-main + VE-green auto-clears (#3256, #3632)"
   else
-    tap_not_ok "quarantine-active: bundled commit + resolved-on-main auto-clears (#3256)" \
+    tap_not_ok "quarantine-active: bundled commit + resolved-on-main + VE-green auto-clears (#3256, #3632)" \
       "rc=$rc78f status=$QUARANTINE_STATUS match=$QUARANTINED_MATCH"
+  fi
+
+  # ── Test 78f2 — REGRESSION FOR #3632: resolved fix is MERGED (on main) but NOT
+  #   yet VE-green → must stay BLOCKED. This is the exact #3632 hazard: clearing
+  #   on merge alone let the deploy gate ship the latest VE-green sha, which is
+  #   still a PRE-FIX commit. FAILS on origin/main today (merge-only clear →
+  #   QUARANTINE_STATUS=clear); PASSES after the VE-green gate lands (the
+  #   merged-but-not-VE-green fix falls through to the per-hunk BLOCK).
+  printf '%s regression #3238 resolved:%s\n' "$sha1" "$sha2" > "$qdir/resolved_merged_not_vegreen.txt"
+  _Q_RESOLVED_RC=0    # fix IS merged (ancestor of origin/main)
+  _Q_VE_GREEN_RC=1    # fix is NOT yet VE-green
+  git() { _q_resolved_git "$@"; }
+  quarantine_resolved_is_ve_green() { _q_resolved_ve_green "$@"; }
+  local rc78f2=0
+  check_quarantine_active "$qdir/resolved_merged_not_vegreen.txt" || rc78f2=$?
+  unset -f git quarantine_resolved_is_ve_green
+  unset _Q_RESOLVED_RC _Q_VE_GREEN_RC
+  if [[ $rc78f2 -eq 0 && "$QUARANTINE_STATUS" == "blocked_active" && "$QUARANTINED_MATCH" == "$sha1" ]]; then
+    tap_ok "quarantine-active: resolved merged but NOT VE-green stays blocked (#3632)"
+  else
+    tap_not_ok "quarantine-active: resolved merged but NOT VE-green stays blocked (#3632)" \
+      "rc=$rc78f2 status=$QUARANTINE_STATUS match=$QUARANTINED_MATCH"
   fi
 
   # ── Test 78g — resolved-SHA NOT yet on main → stays blocked (fail-safe) ─────
@@ -3011,13 +3047,16 @@ CANNED
   parse_quarantine_file "$qdir/autostamp_e2e.txt"
   local stamped78s="$QUARANTINE_RESOLVED"
   # Now the gate: sha1 ancestor + benign hunk present (partial), but resolved
-  # sha2 is on main → CLEAR. Reuse the resolved-aware git mock (sha2 merged).
+  # sha2 is on main AND VE-green → CLEAR. Reuse the resolved-aware git mock
+  # (sha2 merged) + the VE-green oracle stub (#3632, sha2 VE-green).
   _Q_RESOLVED_RC=0
+  _Q_VE_GREEN_RC=0
   git() { _q_resolved_git "$@"; }
+  quarantine_resolved_is_ve_green() { _q_resolved_ve_green "$@"; }
   local rc78s=0
   check_quarantine_active "$qdir/autostamp_e2e.txt" || rc78s=$?
-  unset -f git
-  unset _Q_RESOLVED_RC
+  unset -f git quarantine_resolved_is_ve_green
+  unset _Q_RESOLVED_RC _Q_VE_GREEN_RC
   unset _GH_PR_FOR_ISSUE _GH_PR_STATE _GH_PR_MERGESHA
   if [[ "$stamped78s" == "$sha2" && $rc78s -eq 1 && "$QUARANTINE_STATUS" == "clear" && -z "$QUARANTINED_MATCH" ]]; then
     tap_ok "quarantine-autostamp: reason #N + merged PR → stamps resolved:<sha>, gate auto-clears (#3258→#3260)"

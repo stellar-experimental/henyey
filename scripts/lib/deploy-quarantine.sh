@@ -14,9 +14,11 @@
 #   - Remaining fields: optional free-text reason (single line)
 #   - An optional `resolved:<40-hex>` token MAY appear anywhere in the reason
 #     (token-boundary-anchored). It records the fix commit that resolves the
-#     quarantine: once that fix SHA is an ancestor of origin/main, the entry
-#     auto-clears (see check_quarantine_active). Additive — absent on legacy
-#     entries, which keep the per-hunk content-check as their backstop.
+#     quarantine: once that fix SHA is an ancestor of origin/main (MERGED) AND
+#     is VE-green (a fix-containing sha has passed `Verify Execution (Mainnet)`,
+#     so it is an actual deploy target — #3632), the entry auto-clears (see
+#     check_quarantine_active). Additive — absent on legacy entries, which keep
+#     the per-hunk content-check as their backstop.
 #   - Lines starting with # (after optional whitespace) are comments
 #   - Blank/whitespace-only lines are skipped
 #   - CRLF is stripped during parsing
@@ -268,6 +270,80 @@ _quarantine_any_hunk_present() {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
+# quarantine_resolved_is_ve_green SHA   (issue #3632)
+#
+# VE-green oracle for the resolved-token auto-clear in check_quarantine_active.
+# Returns 0 iff SHA (or one of its descendants that is on main) is itself a
+# VALID DEPLOY TARGET — i.e. has a `success` `Verify Execution (Mainnet)` run.
+# Returns non-zero (1) when no such run exists or on any gh/parse error.
+#
+# WHY THIS EXISTS: a resolved-token records the fix PR's MERGE commit. On a busy
+# `main` that merge lands long before the daily `Verify Execution (Mainnet)`
+# cron validates it. The old auto-clear (`merge-base --is-ancestor <fix> main`)
+# cleared the quarantine the instant the fix MERGED — but the deploy gate
+# (`select_latest_green_deploy_target`) ships the LATEST VE-green sha, which in
+# that window is still a PRE-FIX commit. Clearing on merge therefore green-lit
+# shipping a binary that does NOT contain the fix (#3632). Gating the clear on
+# the fix being VE-green mirrors the selector's own notion of "deployable" so
+# the quarantine only lifts once a fix-containing sha is actually a deploy
+# target.
+#
+# The "(or a descendant on main)" allowance: VE runs on whatever sha was HEAD at
+# the cron, which is usually a DESCENDANT of the fix merge, not the merge commit
+# itself. A green VE on any on-main descendant of <fix> proves a fix-containing
+# binary passed VE, so it satisfies the clear. We therefore accept a `success`
+# VE run whose headSha is <fix> OR has <fix> as an ancestor (and is itself on
+# main). Cross-shell ancestry uses the same `is_ancestor` oracle convention as
+# monitor-decisions.sh.
+#
+# OVERRIDABLE FOR TESTS: like monitor-decisions.sh's `is_ancestor`, this is a
+# hermetic injection point. Tests define `quarantine_resolved_is_ve_green`
+# before sourcing (or shadow it) to drive the predicate without touching gh.
+# The `command -v` guard (NOT bash-only `declare -F`) keeps the default-define
+# correct under zsh, where `declare` aliases `typeset` (#3592).
+#
+# FAIL-SAFE: any uncertainty (no green VE run, gh/network/parse error, no
+# locally-resolvable ancestry) returns non-zero → the caller does NOT clear and
+# falls through to the per-hunk content-check (BLOCK backstop). A false
+# "not-VE-green" only delays a deploy (recoverable); a false "VE-green" would
+# clear a quarantine for a not-yet-verified fix (the #3632 hazard).
+# ─────────────────────────────────────────────────────────────────────────────
+if ! command -v quarantine_resolved_is_ve_green >/dev/null 2>&1; then
+  quarantine_resolved_is_ve_green() {
+    local fix_sha="$1"
+    [[ "$fix_sha" =~ ^[0-9a-f]{40}$ ]] || return 1
+    local repo="${QUARANTINE_GH_REPO:-stellar-experimental/henyey}"
+
+    # Pull recent successful `Verify Execution (Mainnet)` head SHAs (newest
+    # first). The workflow `name:` is literally "Verify Execution (Mainnet)".
+    # `--jq` keeps only completed/success records and emits their headSha, one
+    # per line. Any gh/network error → empty → fail-safe non-zero below.
+    local ve_heads
+    ve_heads="$(gh run list --repo "$repo" \
+                  --workflow "Verify Execution (Mainnet)" --branch main --limit 30 \
+                  --json headSha,status,conclusion \
+                  --jq '.[] | select(.status=="completed" and .conclusion=="success") | .headSha' \
+                2>/dev/null)" || return 1
+    [[ -z "$ve_heads" ]] && return 1
+
+    # A green VE on <fix> itself, or on any on-main DESCENDANT of <fix>, proves
+    # a fix-containing binary passed VE. `is_ancestor <fix> <ve_head>` is 0 when
+    # ve_head == fix or ve_head is a descendant. We require ve_head be on main
+    # too (ancestor of origin/main HEAD) so a stale/off-main green never counts.
+    local ve_head
+    while IFS= read -r ve_head; do
+      [[ "$ve_head" =~ ^[0-9a-f]{40}$ ]] || continue
+      if git merge-base --is-ancestor "$fix_sha" "$ve_head" 2>/dev/null \
+         && git merge-base --is-ancestor "$ve_head" origin/main 2>/dev/null; then
+        return 0
+      fi
+    done <<< "$ve_heads"
+
+    return 1
+  }
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
 # check_quarantine_active QUARANTINE_FILE
 #
 # Read-only + git subprocess. Determines if any quarantined SHA's *content*
@@ -283,21 +359,31 @@ _quarantine_any_hunk_present() {
 #
 # Algorithm per entry:
 #   1. If SHA is NOT an ancestor of origin/main → not deployed, skip.
-#   2. resolved-SHA auto-clear (#3256): if the entry carries a valid
-#      `resolved:<fix-sha>` token, the fix SHA is NOT the entry's own SHA
-#      (self-resolution guard), and that fix SHA is an ancestor of origin/main
-#      (`git merge-base --is-ancestor` → 0), the fix has genuinely landed →
-#      CLEAR this entry (skip the content-check). This is the ONLY way an
-#      annotated bundled-commit quarantine auto-clears while benign hunks of
-#      the same commit are intentionally retained (the tick-199 false-block:
+#   2. resolved-SHA auto-clear (#3256, VE-green-gated for #3632): if the entry
+#      carries a valid `resolved:<fix-sha>` token, the fix SHA is NOT the
+#      entry's own SHA (self-resolution guard), that fix SHA is an ancestor of
+#      origin/main (`git merge-base --is-ancestor` → 0, i.e. the fix MERGED),
+#      AND the fix is VE-green (`quarantine_resolved_is_ve_green` → 0: a
+#      fix-containing sha has a `success` `Verify Execution (Mainnet)` run, so
+#      it is an actual deploy target), the fix has genuinely landed AND is
+#      deployable → CLEAR this entry (skip the content-check). This is the ONLY
+#      way an annotated bundled-commit quarantine auto-clears while benign hunks
+#      of the same commit are intentionally retained (the tick-199 false-block:
 #      #3238 bundled a harmful `retain:false` hunk removed by #3251 with benign
 #      hunks kept on main; the per-hunk check below stays BLOCKED forever
 #      because the benign hunks legitimately reverse-apply). An operator/
-#      automation stamps `resolved:` once; the gate auto-clears on merge.
+#      automation stamps `resolved:` once; the gate auto-clears once the fix is
+#      both merged and VE-green.
+#      WHY VE-GREEN (#3632): the deploy gate ships the LATEST VE-green sha, not
+#      origin HEAD. On a busy main a fix MERGES long before the daily VE cron
+#      validates it; in that window the latest VE-green sha is still a PRE-FIX
+#      commit, so clearing on merge alone let the gate ship the pre-fix binary —
+#      the exact deploy the hold existed to prevent.
 #      FAIL-SAFE: a missing token, self-resolution, a not-yet-merged fix
-#      (`--is-ancestor` → 1), OR a git error on the resolved-ancestry check
-#      (rc>=128) all FALL THROUGH to the per-hunk content-check below — the
-#      resolved path can only CLEAR, never relax the existing backstop.
+#      (`--is-ancestor` → 1), a git error on the resolved-ancestry check
+#      (rc>=128), OR a merged-but-not-yet-VE-green fix all FALL THROUGH to the
+#      per-hunk content-check below — the resolved path can only CLEAR, never
+#      relax the existing backstop.
 #   3. If the entry was not auto-cleared by step 2 → split its diff
 #      (`git diff sha^..sha`) into per-hunk patches and reverse-apply-check
 #      EACH hunk independently (`_quarantine_any_hunk_present`). The entry is
@@ -380,21 +466,35 @@ check_quarantine_active() {
       continue
     fi
 
-    # Step 2: resolved-SHA auto-clear (#3256). If this entry carries a valid
-    # `resolved:<fix-sha>` that is NOT its own SHA (self-resolution guard) and
-    # the fix SHA is an ancestor of origin/main, the fix has genuinely landed
-    # → CLEAR this entry. Every uncertain case (no token, self-resolution,
-    # not-yet-merged, git error) FALLS THROUGH to the per-hunk content-check
-    # below — the resolved path can only clear, never weaken the backstop.
+    # Step 2: resolved-SHA auto-clear (#3256, tightened for #3632). If this
+    # entry carries a valid `resolved:<fix-sha>` that is NOT its own SHA
+    # (self-resolution guard), the fix SHA is an ancestor of origin/main (the
+    # fix has MERGED), AND the fix is VE-green (a fix-containing sha has passed
+    # `Verify Execution (Mainnet)` → is an actual deploy target) → CLEAR this
+    # entry. Every uncertain case (no token, self-resolution, not-yet-merged,
+    # git error, OR merged-but-not-yet-VE-green) FALLS THROUGH to the per-hunk
+    # content-check below — the resolved path can only clear, never weaken the
+    # backstop.
+    #
+    # WHY VE-GREEN AND NOT MERGE (#3632): the deploy gate ships the LATEST
+    # VE-green sha (`select_latest_green_deploy_target`), not origin HEAD. On a
+    # busy main the fix MERGES long before the daily VE cron validates it; in
+    # that window the latest VE-green sha is still a PRE-FIX commit. Clearing on
+    # merge alone let the gate ship that pre-fix binary — the exact deploy the
+    # hold existed to prevent. Requiring VE-green mirrors the selector's own
+    # notion of "deployable", so the quarantine lifts only once a fix-containing
+    # sha is actually a deploy target.
     if [[ "$resolved" =~ ^[0-9a-f]{40}$ && "$resolved" != "$sha" ]]; then
       resolved_rc=0
       git merge-base --is-ancestor "$resolved" origin/main 2>/dev/null || resolved_rc=$?
-      if [[ "$resolved_rc" -eq 0 ]]; then
-        # Fix commit is on main → the quarantine is resolved → CLEAR.
+      if [[ "$resolved_rc" -eq 0 ]] && quarantine_resolved_is_ve_green "$resolved"; then
+        # Fix commit is on main AND VE-green → the quarantine is resolved →
+        # CLEAR. (Merged-but-not-yet-VE-green falls through to BLOCK below.)
         continue
       fi
-      # resolved_rc == 1 (fix not yet merged) OR rc>=128 (git error): do NOT
-      # clear — fall through to the per-hunk content-check (fail-closed).
+      # resolved_rc == 1 (fix not yet merged), rc>=128 (git error), OR merged
+      # but not yet VE-green (#3632): do NOT clear — fall through to the
+      # per-hunk content-check (fail-closed).
     fi
 
     # Step 3: per-hunk content check. The SHA is an ancestor; ask whether ANY
