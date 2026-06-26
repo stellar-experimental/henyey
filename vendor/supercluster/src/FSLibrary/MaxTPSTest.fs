@@ -16,6 +16,22 @@ open StellarNetworkData
 open StellarStatefulSets
 open StellarSupercluster
 
+// Per-step load-window multiplier: the number of txns offered in a step is
+// `txrate * multiplier`, so the loadgen offers for ~`multiplier` seconds
+// regardless of the rate. Default 1000 (~16.7 min, the canonical sustained
+// window). Override via the SSC_MAXTPS_TXS_MULTIPLIER env var for fast
+// short-probe iteration (e.g. 60 ≈ 1 min/step, which tracks the canonical
+// ceiling within ~2%). Test-harness tooling only — does not affect any
+// observable node behavior. Mirrors the SSC_LOADGEN_FASTFAIL_LEDGERS knob in
+// StellarStatefulSets.fs.
+let maxTpsTxsMultiplier : int =
+    match System.Environment.GetEnvironmentVariable "SSC_MAXTPS_TXS_MULTIPLIER" with
+    | null -> 1000
+    | s ->
+        match System.Int32.TryParse s with
+        | true, n when n > 0 -> n
+        | _ -> 1000
+
 // Get the maximum value from a distribution. Returns `None` if `distribution`
 // is the empty list
 let maxDistributionValue (distribution: (int * int) list) =
@@ -268,8 +284,10 @@ let maxTPSTest (context: MissionContext) (baseLoadGen: LoadGen) (setupCfg: LoadG
                         let loadGen =
                             { baseLoadGen with
                                   accounts = numAccounts
-                                  // Roughly 15 min of load
-                                  txs = middle * 1000
+                                  // Offer window ≈ `maxTpsTxsMultiplier` seconds
+                                  // (default 1000 ≈ 16.7 min; env-overridable for
+                                  // short-probe iteration — see maxTpsTxsMultiplier).
+                                  txs = middle * maxTpsTxsMultiplier
                                   txrate = middle }
 
                         formation.RunMultiLoadgen loadGenNodes loadGen
