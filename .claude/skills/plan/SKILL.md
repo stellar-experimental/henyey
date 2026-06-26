@@ -53,7 +53,7 @@ Then explore the codebase to ground your plan:
 
 - Read the relevant crate's source files: at least the module-level docs, the function you'd be changing, and the surrounding context.
 - Read the most relevant existing tests in `crates/<crate>/tests/` to understand the testing patterns.
-- If the issue is parity-critical (touches `crates/scp/`, `crates/herder/`, `crates/ledger/`, `crates/tx/`, `crates/overlay/`), read the matching stellar-core code via the `stellar-core/` submodule.
+- If the issue is parity-critical (touches `crates/scp/`, `crates/herder/`, `crates/ledger/`, `crates/tx/`, `crates/overlay/` — the crates that own the observable/interop surface defined in `docs/PARITY.md`), read the matching stellar-core code via the `stellar-core/` submodule.
 
 Then post the draft:
 
@@ -77,8 +77,12 @@ control flow changes. Reference specific functions by name where appropriate.>
 - **Existing tests preserved**: explicit list of relevant existing tests that must keep passing (especially when refactoring touches shared code). These should be in `cargo test -p henyey-<crate>` and verified pre-/post- by `/do`.
 
 **Parity considerations:**
-<If parity-critical: which stellar-core function/file matches, what semantics
-must be preserved. If not parity-critical: write "n/a — non-parity path".>
+<Parity = the observable/interop surface in `docs/PARITY.md` (hashes, result/meta
+XDR, SCP/overlay wire, archive format, HTTP/RPC/CLI, crypto). If the plan changes
+that surface: which stellar-core function/file matches and what observable
+semantics must be preserved. If the change is internal-only (architecture,
+utilities, metrics, logging, admin endpoints, perf — same observable output),
+write "n/a — does not change the observable surface".>
 
 **Risks:**
 <Known unknowns, edge cases, things that might bite at review time. Be honest.>
@@ -198,12 +202,18 @@ Run three lens passes in sequence (correctness / parity / scope), each as its ow
 
 ### Critic B — Parity
 
-> Same setup as Critic A, but evaluate ONLY: does the plan match stellar-core's
-> behavior on this code path? Consult the stellar-core/ submodule. Identify the
-> matching stellar-core function(s). Compare semantics. Flag any divergence as
-> REVISE-MAJOR. If the plan is for a non-parity path (e.g. tooling, docs), say
-> so and APPROVE. Post as `## 🔍 Critic B (parity) — Round 1` with the same
-> structure as Critic A.
+> Same setup as Critic A, but evaluate ONLY parity as defined in
+> `docs/PARITY.md`: does the plan preserve the **observable / interop surface**
+> (ledger/bucket hashes, transaction result & meta XDR, SCP/overlay wire bytes,
+> history archive format, HTTP/RPC/CLI contracts, crypto outputs)? Consult the
+> stellar-core/ submodule and identify the matching function(s) only when the
+> plan touches that surface. Flag a divergence as REVISE-MAJOR **only** if it
+> changes the observable surface or breaks interop. Differences in internal
+> architecture, helper utilities, metrics, logging, admin/debug endpoints, or
+> performance are explicitly allowed — do NOT flag them as parity concerns
+> (other lenses cover correctness/scope). If the plan does not change the
+> observable surface, say so and APPROVE. Post as `## 🔍 Critic B (parity) —
+> Round 1` with the same structure as Critic A.
 
 ### Critic C — Scope
 

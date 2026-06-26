@@ -27,7 +27,8 @@ every MUST / SHALL / MUST NOT / SHALL NOT statement, every
 protocol-version branch, and every error-code mapping is checked.
 This is the inverse of `/spec-from-core` and complements
 `/parity-check` (which compares Rust against C++ headers, not
-against the specs).
+against the specs). Both serve the observable / interop parity
+contract defined in `docs/PARITY.md`.
 
 ## Spec ↔ Crate Mapping
 

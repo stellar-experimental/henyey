@@ -80,9 +80,16 @@ test file.
 
 ### Step 5: Compute Parity
 
+Parity measures **observable-surface coverage** (`docs/PARITY.md`), not internal
+sameness. An item is a "gap" only if it affects the observable / interop surface
+(hashes, result/meta XDR, SCP/overlay wire, archive format, HTTP/RPC/CLI, crypto)
+and is missing or partial. An internal helper implemented differently but
+producing the same observable output is NOT a gap — record it under
+Architectural Differences.
+
 Count the functions/components from Step 3:
 - `implemented` = items marked Full
-- `gaps` = items marked None or Partial that are NOT intentional omissions
+- `gaps` = items marked None or Partial that affect the observable surface and are NOT intentional omissions
 - `omissions` = items deliberately excluded with documented rationale
 
 Parity % = `implemented / (implemented + gaps)` (omissions excluded from
@@ -222,6 +229,8 @@ transaction replay statistics, etc.
 - Must include a concrete rationale for each omission.
 - Common rationales: "SQLite only", "sequential execution only",
   "handled by <other crate>", "deprecated in protocol 23+".
+- A surface listed here must not be part of the observable / interop contract
+  (`docs/PARITY.md`); if it is, it is a real gap, not an omission.
 
 ### Gaps
 - Priority levels: High (blocks correctness), Medium (affects completeness),
@@ -231,6 +240,8 @@ transaction replay statistics, etc.
 ### Architectural Differences
 - Numbered list. Each item has stellar-core approach, Rust approach, and
   rationale.
+- These are divergeable-surface differences (`docs/PARITY.md`) — expected, and
+  never counted as gaps.
 - Focus on differences that affect how someone reads or maintains the code.
 - Do not list trivial language differences (e.g., "C++ uses classes, Rust
   uses structs").
