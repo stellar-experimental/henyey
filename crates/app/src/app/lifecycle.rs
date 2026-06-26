@@ -346,12 +346,24 @@ impl App {
             }
         };
 
-        let mut scp_message_rx = match scp_message_rx {
-            Some(rx) => rx,
+        // The dummy fallback path is only taken when there is no overlay
+        // (degraded/test mode). Use a bounded channel to match the production
+        // SCP receiver type ([`henyey_overlay::SCP_CHANNEL_CAPACITY`]); the
+        // capacity is irrelevant here since nothing ever sends on `_dummy_scp_tx`.
+        // We retain the sender for the lifetime of `run()` (`_dummy_scp_tx`) so
+        // the channel never closes: a closed `mpsc::Receiver` yields
+        // `recv() == None`, which under the `Some(scp_msg) = …recv()` select arm
+        // would leave the arm permanently disabled (matching the prior unbounded
+        // behavior where `_tx` was likewise kept implicitly). Keeping the sender
+        // alive preserves "this arm stays pending forever" rather than ever
+        // observing a spurious close.
+        let (mut scp_message_rx, _dummy_scp_tx) = match scp_message_rx {
+            Some(rx) => (rx, None),
             None => {
-                // Create a dummy receiver that never receives
-                let (_tx, rx) = tokio::sync::mpsc::unbounded_channel::<OverlayMessage>();
-                rx
+                let (tx, rx) = tokio::sync::mpsc::channel::<OverlayMessage>(
+                    henyey_overlay::SCP_CHANNEL_CAPACITY,
+                );
+                (rx, Some(tx))
             }
         };
 
@@ -2917,6 +2929,46 @@ mod pump_tests {
         let drained = App::drain_verified_bounded(&mut rx, 32, |_ve| async {}).await;
         assert_eq!(drained, 5);
         assert_eq!(rx.len(), 0);
+    }
+}
+
+/// Companion regression coverage for #3623: the SCP-intake channel the event
+/// loop wires up via `OverlayManager::subscribe_scp()` must be a BOUNDED
+/// `tokio::sync::mpsc::Receiver` with a finite capacity, so a stalled loop
+/// cannot accumulate SCP envelopes without limit and OOM the validator. The
+/// primary mechanism reproduction lives in
+/// `henyey_overlay::manager::tests::test_scp_channel_bounded_drops_when_receiver_stalled`;
+/// this is the lighter-weight app-boundary check that the wiring is bounded.
+#[cfg(test)]
+mod scp_intake_bound_tests {
+    use henyey_overlay::{LocalNode, OverlayConfig, OverlayManager, SCP_CHANNEL_CAPACITY};
+
+    /// The receiver returned to the event loop is the bounded type with a
+    /// finite max capacity equal to `SCP_CHANNEL_CAPACITY`. On origin/main the
+    /// channel is `unbounded_channel()`, whose `Receiver` has no `max_capacity`
+    /// at all — so the bounded type itself is the assertion.
+    #[tokio::test]
+    async fn test_scp_intake_channel_is_bounded() {
+        let secret = henyey_crypto::SecretKey::generate();
+        let manager =
+            OverlayManager::new(OverlayConfig::default(), LocalNode::new_testnet(secret)).unwrap();
+
+        let rx = manager
+            .subscribe_scp()
+            .await
+            .expect("first subscribe_scp() returns the receiver");
+
+        // A bounded `mpsc::Receiver` exposes a finite `max_capacity`. An
+        // unbounded receiver does not have this method — so this both asserts
+        // the value and pins the bounded type.
+        assert_eq!(
+            rx.max_capacity(),
+            SCP_CHANNEL_CAPACITY,
+            "SCP intake channel must be bounded at SCP_CHANNEL_CAPACITY"
+        );
+
+        // Finite, non-zero — a flood without draining can never exceed this.
+        assert!(rx.max_capacity() > 0 && rx.max_capacity() <= SCP_CHANNEL_CAPACITY);
     }
 }
 

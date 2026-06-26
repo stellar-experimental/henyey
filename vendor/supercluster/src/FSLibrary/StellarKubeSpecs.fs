@@ -597,9 +597,9 @@ type NetworkCfg with
                 runCoreIf
                     true
                     [| "pregenerate-loadgen-txs"
-                       "--count " + txs.ToString()
-                       "--accounts " + accounts.ToString()
-                       "--offset " + offset.ToString() |]
+                       "--count"; txs.ToString()
+                       "--accounts"; accounts.ToString()
+                       "--offset"; offset.ToString() |]
 
         let initialCatchup = runCoreIf init.initialCatchup [| "catchup"; "current/0" |]
 

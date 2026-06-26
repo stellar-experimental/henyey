@@ -108,7 +108,10 @@ pub use loopback::LoopbackConnectionFactory;
 #[cfg(feature = "test-utils")]
 #[doc(hidden)]
 pub use manager::TestPeerReceiver;
-pub use manager::{AddPeerOutcome, OverlayManager, OverlayMessage, OverlayStats, PeerSnapshot};
+pub use manager::{
+    AddPeerOutcome, OverlayManager, OverlayMessage, OverlayStats, PeerSnapshot,
+    SCP_CHANNEL_CAPACITY,
+};
 pub use metrics::{Counter, OverlayMessageKind, OverlayMetrics, OverlayMetricsSnapshot};
 pub use peer::{Peer, PeerInfo, PeerState, PeerStats, PeerStatsSnapshot};
 pub use peer_manager::{
