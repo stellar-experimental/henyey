@@ -1117,6 +1117,13 @@ impl FlowControl {
         state.no_outbound_capacity = Some(Instant::now() - std::time::Duration::from_secs(secs));
     }
 
+    /// Test-only: read the current flood-message processed counter. Used by the
+    /// #3625 drain-gated SEND_MORE tests to assert exactly-once release.
+    #[cfg(test)]
+    pub(crate) fn test_flood_data_processed(&self) -> u64 {
+        self.state.lock().unwrap().flood_data_processed
+    }
+
     /// Check if throttling should be applied.
     pub fn maybe_throttle_read(&self) -> bool {
         let mut state = self.state.lock().unwrap();
@@ -1269,6 +1276,19 @@ impl CapacityGuard {
         // Take the message so Drop becomes a no-op.
         let msg = self.message.take().expect("finish called twice");
         self.flow_control.end_message_processing(&msg)
+    }
+
+    /// Disarm the guard, transferring the release obligation to the caller.
+    ///
+    /// Returns the `(Arc<FlowControl>, StellarMessage)` the caller needs to
+    /// release capacity LATER (e.g. via a [`crate::manager::FlowControlRelease`]
+    /// token released at consumer-drain time, #3625). Unlike [`Self::finish`],
+    /// this does NOT call `end_message_processing` now — the caller becomes
+    /// responsible for releasing exactly once. After disarming, the guard's
+    /// `Drop` is a no-op (the message has been taken).
+    pub(crate) fn disarm(mut self) -> (Arc<FlowControl>, StellarMessage) {
+        let msg = self.message.take().expect("disarm called after finish");
+        (Arc::clone(&self.flow_control), msg)
     }
 }
 

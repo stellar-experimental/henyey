@@ -372,8 +372,111 @@ impl KnownPeerSet {
     }
 }
 
+/// Drain-gated inbound flow-control credit release token (#3625, Phase 1).
+///
+/// Carried on the SCP-routed [`OverlayMessage`]. On the peer-receive task,
+/// `begin_message_processing` already locked local capacity for the SCP
+/// message (via [`CapacityGuard`]). Instead of releasing that capacity at
+/// channel-*enqueue* time (which let a stalled event-loop consumer keep
+/// granting `SEND_MORE_EXTENDED` until the #3626 bounded-channel backstop
+/// dropped messages), the release is deferred to the moment the app event-loop
+/// consumer actually *drains* the envelope.
+///
+/// When [`FlowControlRelease::release`] (or `Drop`) fires, it calls
+/// `FlowControl::end_message_processing` **exactly once** and, if the
+/// 40-message / byte batch threshold is met, enqueues the resulting
+/// `SEND_MORE_EXTENDED` to the peer's outbound channel (non-blocking
+/// `try_send`, drop-on-full per the existing pattern). A stalled consumer
+/// therefore never releases ⇒ never grants ⇒ senders honoring outbound
+/// capacity stop ⇒ the bounded buffer no longer fills.
+///
+/// **Leak-safety:** the release MUST fire even if the message is dropped
+/// without being processed (the #3626 drop-on-full path, or a shutdown
+/// discard). Otherwise local capacity leaks and the peer is permanently
+/// starved-by-omission. `Drop` covers every such path; the `Option` guard
+/// makes the release idempotent so an explicit `release()` followed by `Drop`
+/// fires `end_message_processing` only once.
+///
+/// Mirrors stellar-core `FlowControl::endMessageProcessing`
+/// (`FlowControl.cpp:303-329`) — capacity is always *released* per processed
+/// message; back-pressure comes from the *timing* of the release, not from
+/// withholding capacity. The read-side socket throttle (`can_read`) is
+/// deferred to Phase 2 (#3642).
+pub struct FlowControlRelease {
+    flow_control: Arc<FlowControl>,
+    /// The SCP message whose capacity this token releases. `Some` until the
+    /// release fires; taken to `None` to enforce exactly-once semantics.
+    message: Option<StellarMessage>,
+    /// The peer's outbound channel — used to enqueue the `SEND_MORE_EXTENDED`
+    /// grant when the batch threshold is reached.
+    outbound_tx: mpsc::Sender<OutboundMessage>,
+    /// Shared overlay metrics, for the drop-on-full grant counter.
+    metrics: Arc<OverlayMetrics>,
+}
+
+impl FlowControlRelease {
+    /// Build a release token for a flow-controlled (SCP) message.
+    pub(super) fn new(
+        flow_control: Arc<FlowControl>,
+        message: StellarMessage,
+        outbound_tx: mpsc::Sender<OutboundMessage>,
+        metrics: Arc<OverlayMetrics>,
+    ) -> Self {
+        Self {
+            flow_control,
+            message: Some(message),
+            outbound_tx,
+            metrics,
+        }
+    }
+
+    /// Release the held capacity exactly once.
+    ///
+    /// Calls `end_message_processing` and, if a `SEND_MORE_EXTENDED` grant is
+    /// due (40-message or byte batch reached, or the total-message reading
+    /// capacity refill), enqueues it to the peer. Idempotent: a second call
+    /// (or `Drop` after an explicit call) is a no-op.
+    fn release(&mut self) {
+        let Some(msg) = self.message.take() else {
+            return;
+        };
+        let cap = self.flow_control.end_message_processing(&msg);
+        if !cap.should_send() {
+            return;
+        }
+        let send_more = StellarMessage::SendMoreExtended(stellar_xdr::SendMoreExtended {
+            num_messages: cap.num_flood_messages as u32,
+            num_bytes: cap.num_flood_bytes as u32,
+        });
+        // Non-blocking send: never block the consumer event loop on a full
+        // per-peer outbound channel. On a full channel the grant is dropped and
+        // counted; the peer re-derives capacity from the next batch (the
+        // outbound straggler timeout in #3643 covers the pathological case).
+        if self
+            .outbound_tx
+            .try_send(OutboundMessage::Send(send_more))
+            .is_err()
+        {
+            self.metrics.messages_dropped.add(1);
+        }
+    }
+}
+
+impl Drop for FlowControlRelease {
+    fn drop(&mut self) {
+        // Covers the dropped-without-processing paths (drop-on-full backstop,
+        // shutdown discard) so capacity never leaks.
+        self.release();
+    }
+}
+
 /// An overlay message received from a peer, ready for dispatch to subscribers.
-#[derive(Clone)]
+///
+/// `Clone` deliberately does NOT clone any attached [`FlowControlRelease`]
+/// token: the token represents the single, exactly-once obligation to release
+/// the SCP message's flow-control credit. It rides only on the one copy that is
+/// *moved* into the dedicated SCP channel (in `route_to_subscribers`); clones
+/// sent to other subscribers (extra-subscribers, broadcast) carry no token.
 pub struct OverlayMessage {
     /// The peer that sent this message.
     pub from_peer: PeerId,
@@ -381,6 +484,89 @@ pub struct OverlayMessage {
     pub message: StellarMessage,
     /// When the message was received from the peer (before broadcast channel delivery).
     pub received_at: std::time::Instant,
+    /// Drain-gated inbound flow-control release token (#3625). `Some` only on
+    /// the single SCP-routed copy that reaches the app consumer; released when
+    /// that consumer drains the envelope. Never cloned (see the `Clone` impl).
+    pub(crate) flow_release: Option<FlowControlRelease>,
+}
+
+impl Clone for OverlayMessage {
+    fn clone(&self) -> Self {
+        Self {
+            from_peer: self.from_peer.clone(),
+            message: self.message.clone(),
+            received_at: self.received_at,
+            // The release obligation is never duplicated.
+            flow_release: None,
+        }
+    }
+}
+
+impl OverlayMessage {
+    /// Construct an overlay message with no flow-control release token.
+    ///
+    /// This is the cross-crate constructor (the `flow_release` field is
+    /// `pub(crate)` to overlay). Production SCP routing attaches a token via
+    /// the field directly inside the overlay crate; all other callers (and
+    /// tests in other crates) get a tokenless message.
+    pub fn new(
+        from_peer: PeerId,
+        message: StellarMessage,
+        received_at: std::time::Instant,
+    ) -> Self {
+        Self {
+            from_peer,
+            message,
+            received_at,
+            flow_release: None,
+        }
+    }
+
+    /// Take the attached flow-control release token, if any, leaving `None`.
+    ///
+    /// The app SCP consumer calls this after draining the envelope so the held
+    /// inbound credit is released (and a `SEND_MORE_EXTENDED` granted at the
+    /// batch boundary) only once the message has actually been consumed.
+    pub fn take_flow_release(&mut self) -> Option<FlowControlRelease> {
+        self.flow_release.take()
+    }
+
+    /// Test-only seam (#3625): attach a fresh drain-gated flow-control release
+    /// token to this message, sharing `flow_control` so a batch of messages
+    /// released through the same `FlowControl` triggers a `SEND_MORE_EXTENDED`
+    /// grant at the 40-message boundary. The returned channel observes the
+    /// `num_messages` of any granted `SEND_MORE_EXTENDED`. Used by the app-crate
+    /// consumer-release test (cross-crate, hence `pub`/`doc(hidden)`).
+    #[doc(hidden)]
+    pub fn attach_test_flow_release(
+        &mut self,
+        flow_control: std::sync::Arc<crate::flow_control::FlowControl>,
+        grant_observer: std::sync::mpsc::Sender<u32>,
+    ) {
+        // Lock capacity for this message (mirrors begin_message_processing on
+        // the peer task) so the deferred release has something to release.
+        assert!(
+            flow_control.begin_message_processing(&self.message),
+            "test flow control rejected message (no capacity)"
+        );
+        // Bridge the per-peer outbound channel to the simple grant observer:
+        // a tiny task forwards any granted SEND_MORE_EXTENDED's num_messages.
+        let (tx, mut rx) = mpsc::channel::<OutboundMessage>(64);
+        tokio::spawn(async move {
+            while let Some(m) = rx.recv().await {
+                if let OutboundMessage::Send(StellarMessage::SendMoreExtended(sme)) = m {
+                    let _ = grant_observer.send(sme.num_messages);
+                }
+            }
+        });
+        let metrics = std::sync::Arc::new(OverlayMetrics::new());
+        self.flow_release = Some(FlowControlRelease::new(
+            flow_control,
+            self.message.clone(),
+            tx,
+            metrics,
+        ));
+    }
 }
 
 /// A snapshot of a connected peer's info and statistics.
@@ -725,30 +911,14 @@ impl SharedPeerState {
         );
         let is_dedicated = is_scp || is_fetch_response || is_fetch_request;
 
-        if is_scp {
-            // Non-blocking send: the channel is bounded ([`SCP_CHANNEL_CAPACITY`])
-            // to prevent unbounded RSS growth when the event loop stalls (#3623).
-            // On a full channel we DROP the envelope rather than `.await` —
-            // blocking the peer-receive path is its own event-loop hazard. The
-            // drop is recoverable (peers re-flood; gap-detection + GetScpState
-            // backfill) and counted in `messages_dropped` so it is observable.
-            match self.scp_message_tx.try_send(msg.clone()) {
-                Ok(()) => {}
-                Err(mpsc::error::TrySendError::Full(_)) => {
-                    self.metrics.messages_dropped.add(1);
-                    debug!(
-                        "SCP channel full (cap {}); dropping envelope from peer {} (recoverable: peers re-flood)",
-                        SCP_CHANNEL_CAPACITY, msg.from_peer
-                    );
-                }
-                Err(mpsc::error::TrySendError::Closed(_)) => {
-                    error!(
-                        "SCP channel send FAILED for peer {}: channel closed",
-                        msg.from_peer
-                    );
-                }
-            }
-        }
+        // NOTE on ordering (#3625): the SCP send is deferred to the END of this
+        // function so we can MOVE the token-bearing `msg` into the dedicated SCP
+        // channel rather than cloning it. The drain-gated `FlowControlRelease`
+        // token rides only on that single moved copy; the extra-subscriber and
+        // broadcast clones are tokenless (see `OverlayMessage`'s `Clone` impl).
+        // If the bounded SCP channel is full, the dropped `msg` carries its
+        // token to `Drop`, releasing the held capacity immediately so credit
+        // never leaks on the drop-on-full backstop path.
 
         if is_fetch_response || is_fetch_request {
             if let Err(e) = self.fetch_response_tx.send(msg.clone()) {
@@ -793,6 +963,37 @@ impl SharedPeerState {
 
         if !is_dedicated {
             let _ = self.message_tx.send(msg);
+            return is_scp;
+        }
+
+        if is_scp {
+            // Non-blocking send: the channel is bounded ([`SCP_CHANNEL_CAPACITY`])
+            // to prevent unbounded RSS growth when the event loop stalls (#3623).
+            // On a full channel we DROP the envelope rather than `.await` —
+            // blocking the peer-receive path is its own event-loop hazard. The
+            // drop is recoverable (peers re-flood; gap-detection + GetScpState
+            // backfill) and counted in `messages_dropped` so it is observable.
+            //
+            // #3625: `msg` is MOVED here (no clone) so its drain-gated
+            // `FlowControlRelease` token reaches the app consumer; on a full
+            // channel the dropped `msg` releases its held capacity via `Drop`.
+            let from_peer = msg.from_peer.clone();
+            match self.scp_message_tx.try_send(msg) {
+                Ok(()) => {}
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    self.metrics.messages_dropped.add(1);
+                    debug!(
+                        "SCP channel full (cap {}); dropping envelope from peer {} (recoverable: peers re-flood)",
+                        SCP_CHANNEL_CAPACITY, from_peer
+                    );
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    error!(
+                        "SCP channel send FAILED for peer {}: channel closed",
+                        from_peer
+                    );
+                }
+            }
         }
 
         is_scp
@@ -2247,7 +2448,7 @@ impl OverlayManager {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use henyey_crypto::SecretKey;
 
@@ -3252,11 +3453,8 @@ mod tests {
         ];
 
         for msg in &request_msgs {
-            let overlay_msg = OverlayMessage {
-                from_peer: peer_id.clone(),
-                message: msg.clone(),
-                received_at: std::time::Instant::now(),
-            };
+            let overlay_msg =
+                OverlayMessage::new(peer_id.clone(), msg.clone(), std::time::Instant::now());
             shared.route_to_subscribers(overlay_msg);
         }
 
@@ -3370,11 +3568,7 @@ mod tests {
         ];
         variants
             .into_iter()
-            .map(|m| OverlayMessage {
-                from_peer: peer.clone(),
-                message: m,
-                received_at: std::time::Instant::now(),
-            })
+            .map(|m| OverlayMessage::new(peer.clone(), m, std::time::Instant::now()))
             .collect()
     }
 
@@ -4174,7 +4368,7 @@ mod tests {
     /// channel, returning both the state and the receiver end so a test can
     /// simulate a stalled event loop by never draining the receiver. Mirrors
     /// `OverlayManager::new`'s SCP-channel construction.
-    fn shared_state_with_scp_receiver(
+    pub(crate) fn shared_state_with_scp_receiver(
     ) -> (SharedPeerState, tokio::sync::mpsc::Receiver<OverlayMessage>) {
         let (message_tx, _) = tokio::sync::broadcast::channel(BROADCAST_CHANNEL_SIZE);
         let (scp_message_tx, scp_message_rx) = tokio::sync::mpsc::channel(SCP_CHANNEL_CAPACITY);
@@ -4227,9 +4421,9 @@ mod tests {
 
     fn make_scp_msg(slot_index: u64) -> OverlayMessage {
         use stellar_xdr::*;
-        OverlayMessage {
-            from_peer: PeerId::from_bytes([7u8; 32]),
-            message: StellarMessage::ScpMessage(ScpEnvelope {
+        OverlayMessage::new(
+            PeerId::from_bytes([7u8; 32]),
+            StellarMessage::ScpMessage(ScpEnvelope {
                 statement: ScpStatement {
                     node_id: NodeId(PublicKey::PublicKeyTypeEd25519(Uint256([0; 32]))),
                     slot_index,
@@ -4244,8 +4438,8 @@ mod tests {
                 },
                 signature: vec![].try_into().unwrap(),
             }),
-            received_at: std::time::Instant::now(),
-        }
+            std::time::Instant::now(),
+        )
     }
 
     /// Regression test for #3623 (fatal OOM restart-loop).
