@@ -1831,13 +1831,21 @@ impl LoadGenerator {
                     "loadgen wait-till-complete timed out; some submitted txns \
                      were not applied (likely dropped before inclusion)"
                 );
-                // Parity: emitFailure(!sorobanIsDone). A setup run whose
-                // contract code/instance never materialized must fail — a
-                // downstream create_upgrade built against the missing instance
-                // would never produce a resolvable ConfigUpgradeSet entry.
-                if check_soroban && !soroban_synced {
-                    self.failed = true;
-                }
+                // Parity: stellar-core `waitTillComplete` marks `mLoadgenFail`
+                // UNCONDITIONALLY on timeout via `emitFailure(!sorobanIsDone)`
+                // (`LoadGenerator.cpp:1399-1404` calls emitFailure; `:1430-1433`
+                // marks the fail meter regardless of the arg — the arg only
+                // controls whether soroban state is reset). We reach this branch
+                // only when accounts (or soroban state) are still unsynced, i.e.
+                // some submitted txns were never applied, so the run MUST fail —
+                // for the classic Pay/PayPregenerated path too, not just soroban.
+                // Previously henyey only failed the soroban-setup path, so a
+                // classic max-TPS step whose txns never landed (ledgers closing
+                // empty under over-rate) still reported run-complete = success,
+                // inflating the measured ceiling far past the real one (a
+                // 23-node single-VM run "passed" 2753 tx/s with >90% empty
+                // ledgers while core honestly failed at ~1531). (#3631)
+                self.failed = true;
                 return;
             }
             tokio::time::sleep(Duration::from_millis(1000)).await;

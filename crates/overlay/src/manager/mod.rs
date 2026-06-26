@@ -77,6 +77,33 @@ const MAX_KNOWN_PEERS: usize = 1000;
 /// mainnet traffic bursts from multiple peers.
 const BROADCAST_CHANNEL_SIZE: usize = 4096;
 
+/// Bounded capacity of the dedicated overlay→event-loop SCP ingest channel
+/// (`scp_message_tx`/`scp_message_rx`).
+///
+/// This channel carries SCP envelopes from the peer-receive path to the main
+/// event loop. It MUST be bounded: when the event loop stalls (e.g. on the
+/// post-catchup SQLite write-lock contention tracked in #3582), ~24 tier-1
+/// validators flood ~100+ SCP envelopes/slot with nothing draining the
+/// channel. An unbounded channel grows RSS ~4 GB/min until the validator is
+/// OOM-killed, producing a fatal restart loop (#3623).
+///
+/// Sizing: 8192 covers tens of seconds of a healthy multi-validator flood
+/// (~100+ envelopes/slot, ~5s slots) so that under normal jitter and short
+/// stalls the channel stays near-empty and drops effectively never happen —
+/// the loop drains far faster than the flood arrives. The hard cap on
+/// retained envelopes is 8192; with typical SCP envelopes well under ~1 KB the
+/// worst-case retained memory is on the order of a few MB, versus the
+/// unbounded growth to ~37.5 GB observed in #3623.
+///
+/// On overflow the overlay side `try_send`s and DROPS the envelope (bumping
+/// `messages_dropped`) rather than blocking — blocking the peer-receive path
+/// is its own event-loop hazard. Dropping SCP is recoverable: peers re-flood
+/// every slot, and the event loop's gap-detection + `SyncRecoveryManager`
+/// backfill missing state via `GetScpState`. This count-based bound mirrors
+/// stellar-core's bounded inbound `FlowControlMessageCapacity`; a strict
+/// credit-based byte bound is the follow-up tracked in #3625.
+pub const SCP_CHANNEL_CAPACITY: usize = 8192;
+
 /// Maximum number of peer addresses included in a single PEERS message.
 ///
 /// Matches stellar-core's limit of 50 addresses per Peers message
@@ -554,7 +581,7 @@ pub(super) struct SharedPeerState {
     pub(super) flood_gate: Arc<FloodGate>,
     pub(super) running: Arc<AtomicBool>,
     pub(super) message_tx: broadcast::Sender<OverlayMessage>,
-    pub(super) scp_message_tx: mpsc::UnboundedSender<OverlayMessage>,
+    pub(super) scp_message_tx: mpsc::Sender<OverlayMessage>,
     pub(super) fetch_response_tx: mpsc::UnboundedSender<OverlayMessage>,
     pub(super) peer_handles: Arc<RwLock<Vec<JoinHandle<()>>>>,
     pub(super) advertised_outbound_peers: Arc<RwLock<Vec<PeerAddress>>>,
@@ -699,8 +726,27 @@ impl SharedPeerState {
         let is_dedicated = is_scp || is_fetch_response || is_fetch_request;
 
         if is_scp {
-            if let Err(e) = self.scp_message_tx.send(msg.clone()) {
-                error!("SCP channel send FAILED for peer {}: {}", msg.from_peer, e);
+            // Non-blocking send: the channel is bounded ([`SCP_CHANNEL_CAPACITY`])
+            // to prevent unbounded RSS growth when the event loop stalls (#3623).
+            // On a full channel we DROP the envelope rather than `.await` —
+            // blocking the peer-receive path is its own event-loop hazard. The
+            // drop is recoverable (peers re-flood; gap-detection + GetScpState
+            // backfill) and counted in `messages_dropped` so it is observable.
+            match self.scp_message_tx.try_send(msg.clone()) {
+                Ok(()) => {}
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    self.metrics.messages_dropped.add(1);
+                    debug!(
+                        "SCP channel full (cap {}); dropping envelope from peer {} (recoverable: peers re-flood)",
+                        SCP_CHANNEL_CAPACITY, msg.from_peer
+                    );
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    error!(
+                        "SCP channel send FAILED for peer {}: channel closed",
+                        msg.from_peer
+                    );
+                }
             }
         }
 
@@ -831,13 +877,18 @@ pub struct OverlayManager {
     /// disconnect (see `SharedPeerState::cleanup_peer`) so the map tracks only
     /// live peers. See issue #3270.
     pub(super) peer_latest_externalized: Arc<DashMap<PeerId, AtomicU64>>,
-    /// Dedicated unbounded channel for SCP messages.
-    /// SCP messages are consensus-critical and must never be dropped.
-    /// Mainnet generates ~24 validators * multiple SCP rounds per slot,
-    /// which can overwhelm bounded channels during catchup.
-    pub(super) scp_message_tx: mpsc::UnboundedSender<OverlayMessage>,
+    /// Dedicated bounded channel for SCP messages (capacity
+    /// [`SCP_CHANNEL_CAPACITY`]).
+    ///
+    /// SCP is consensus-critical, but the channel MUST be bounded: a stalled
+    /// event loop (#3582) leaves nothing draining while ~24 validators flood
+    /// ~100+ envelopes/slot, and an unbounded channel grows RSS until the
+    /// validator is OOM-killed (#3623). On overflow the send side drops the
+    /// envelope (recoverable — peers re-flood and `GetScpState` backfills),
+    /// mirroring stellar-core's bounded inbound flow-control capacity.
+    pub(super) scp_message_tx: mpsc::Sender<OverlayMessage>,
     /// Receiver end of the SCP channel. Taken once via `subscribe_scp()`.
-    scp_message_rx: Arc<TokioMutex<Option<mpsc::UnboundedReceiver<OverlayMessage>>>>,
+    scp_message_rx: Arc<TokioMutex<Option<mpsc::Receiver<OverlayMessage>>>>,
     /// Dedicated unbounded channel for fetch response messages.
     /// Routes GeneralizedTxSet, TxSet, DontHave, ScpQuorumset, GetScpState,
     /// GetScpQuorumset, and GetTxSet through a never-drop channel, matching
@@ -946,7 +997,7 @@ impl OverlayManager {
         // channels, so the broadcast channel only carries remaining message types.
         let (message_tx, _) = broadcast::channel(BROADCAST_CHANNEL_SIZE);
         let (shutdown_tx, _) = broadcast::channel(1);
-        let (scp_message_tx, scp_message_rx) = mpsc::unbounded_channel();
+        let (scp_message_tx, scp_message_rx) = mpsc::channel(SCP_CHANNEL_CAPACITY);
         let (fetch_response_tx, fetch_response_rx) = mpsc::unbounded_channel();
         let preferred_peers = Arc::new(RwLock::new(PreferredPeerSet::from_config(
             config.preferred_peers.clone(),
@@ -1510,13 +1561,16 @@ impl OverlayManager {
 
     /// Subscribe to the dedicated SCP message channel.
     ///
-    /// Unlike the broadcast channel, SCP messages delivered through this channel
-    /// are never dropped due to overflow. This ensures that SCP EXTERNALIZE
-    /// messages are always received even during high mainnet traffic.
+    /// Unlike the lossy broadcast channel, this dedicated channel preserves
+    /// SCP messages under normal load. It is bounded ([`SCP_CHANNEL_CAPACITY`])
+    /// so that a stalled consumer cannot grow memory without limit (#3623);
+    /// over-capacity envelopes are dropped at the send side and recovered via
+    /// peer re-flood + `GetScpState` backfill. Steady-state the loop drains far
+    /// faster than the flood arrives, so the channel stays near-empty.
     ///
     /// Can only be called once (takes ownership of the receiver). Returns `None`
     /// if already called.
-    pub async fn subscribe_scp(&self) -> Option<mpsc::UnboundedReceiver<OverlayMessage>> {
+    pub async fn subscribe_scp(&self) -> Option<mpsc::Receiver<OverlayMessage>> {
         self.scp_message_rx.lock().await.take()
     }
 
@@ -2616,7 +2670,7 @@ mod tests {
     /// Build a minimal SharedPeerState for testing preferred-peer eviction.
     fn test_shared_state(preferred: Vec<PeerAddress>) -> SharedPeerState {
         let (message_tx, _) = tokio::sync::broadcast::channel(1);
-        let (scp_message_tx, _) = tokio::sync::mpsc::unbounded_channel();
+        let (scp_message_tx, _scp_rx) = tokio::sync::mpsc::channel(SCP_CHANNEL_CAPACITY);
         let (fetch_response_tx, _) = tokio::sync::mpsc::unbounded_channel();
         SharedPeerState {
             peers: Arc::new(DashMap::new()),
@@ -3142,7 +3196,7 @@ mod tests {
     async fn test_fetch_requests_routed_to_dedicated_channel() {
         let (message_tx, _) = tokio::sync::broadcast::channel(64);
         let mut broadcast_rx = message_tx.subscribe();
-        let (scp_message_tx, _scp_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (scp_message_tx, _scp_rx) = tokio::sync::mpsc::channel(SCP_CHANNEL_CAPACITY);
         let (fetch_response_tx, mut fetch_rx) = tokio::sync::mpsc::unbounded_channel();
 
         let shared = SharedPeerState {
@@ -3240,7 +3294,7 @@ mod tests {
     ) {
         let (message_tx, _) = tokio::sync::broadcast::channel(1024);
         let broadcast_rx = message_tx.subscribe();
-        let (scp_message_tx, _scp_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (scp_message_tx, _scp_rx) = tokio::sync::mpsc::channel(SCP_CHANNEL_CAPACITY);
         let (fetch_response_tx, fetch_rx) = tokio::sync::mpsc::unbounded_channel();
         let shared = SharedPeerState {
             peers: Arc::new(DashMap::new()),
@@ -3942,7 +3996,7 @@ mod tests {
     fn test_admission_rejects_non_preferred_under_strict_mode() {
         use crate::connection::ConnectionDirection;
         let (message_tx, _) = broadcast::channel(16);
-        let (scp_tx, _scp_rx) = mpsc::unbounded_channel();
+        let (scp_tx, _scp_rx) = mpsc::channel(SCP_CHANNEL_CAPACITY);
         let (fetch_tx, _fetch_rx) = mpsc::unbounded_channel();
 
         let shared = SharedPeerState {
@@ -4013,7 +4067,7 @@ mod tests {
     fn test_admission_accepts_key_preferred_under_strict_mode() {
         use crate::connection::ConnectionDirection;
         let (message_tx, _) = broadcast::channel(16);
-        let (scp_tx, _scp_rx) = mpsc::unbounded_channel();
+        let (scp_tx, _scp_rx) = mpsc::channel(SCP_CHANNEL_CAPACITY);
         let (fetch_tx, _fetch_rx) = mpsc::unbounded_channel();
 
         let preferred_key = PeerId::from_bytes([42u8; 32]);
@@ -4114,6 +4168,130 @@ mod tests {
             },
         );
         outbound_rx
+    }
+
+    /// Build a `SharedPeerState` wired with the production-shaped SCP ingest
+    /// channel, returning both the state and the receiver end so a test can
+    /// simulate a stalled event loop by never draining the receiver. Mirrors
+    /// `OverlayManager::new`'s SCP-channel construction.
+    fn shared_state_with_scp_receiver(
+    ) -> (SharedPeerState, tokio::sync::mpsc::Receiver<OverlayMessage>) {
+        let (message_tx, _) = tokio::sync::broadcast::channel(BROADCAST_CHANNEL_SIZE);
+        let (scp_message_tx, scp_message_rx) = tokio::sync::mpsc::channel(SCP_CHANNEL_CAPACITY);
+        let (fetch_response_tx, _) = tokio::sync::mpsc::unbounded_channel();
+        let shared = SharedPeerState {
+            peers: Arc::new(DashMap::new()),
+            flood_gate: Arc::new(FloodGate::new()),
+            running: Arc::new(AtomicBool::new(true)),
+            message_tx,
+            scp_message_tx,
+            fetch_response_tx,
+            peer_handles: Arc::new(RwLock::new(Vec::new())),
+            advertised_outbound_peers: Arc::new(RwLock::new(Vec::new())),
+            advertised_inbound_peers: Arc::new(RwLock::new(Vec::new())),
+            added_authenticated_peers: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            dropped_authenticated_peers: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            banned_peers: Arc::new(RwLock::new(HashSet::new())),
+            peer_info_cache: Arc::new(DashMap::new()),
+            peer_latest_externalized: Arc::new(DashMap::new()),
+            last_closed_ledger: Arc::new(AtomicU32::new(0)),
+            scp_callback: None,
+            is_validator: false,
+            peer_event_tx: None,
+            extra_subscribers: Arc::new(RwLock::new(Vec::new())),
+            is_tracking: Arc::new(AtomicBool::new(true)),
+            is_synced: Arc::new(AtomicBool::new(true)),
+            pending_connections: PendingConnections::new(),
+            preferred_peers: Arc::new(RwLock::new(PreferredPeerSet::from_config(
+                Vec::new(),
+                HashSet::new(),
+            ))),
+            preferred_peers_only: false,
+            admission_state: Arc::new(Mutex::new(AdmissionState::default())),
+            fetch_channel_depth: Arc::new(AtomicI64::new(0)),
+            fetch_channel_depth_max: Arc::new(AtomicI64::new(0)),
+            metrics: Arc::new(OverlayMetrics::new()),
+            query_rate_limit_window_secs: Arc::new(AtomicU64::new(60)),
+            max_tx_size_bytes: Arc::new(AtomicU32::new(
+                crate::flow_control::DEFAULT_MAX_TX_SIZE_BYTES,
+            )),
+            flow_control_bytes_config: FlowControlBytesConfig::default(),
+            peer_flood_reading_capacity: 200,
+            outbound_channel_capacity: 256,
+            dial_cooldowns: Arc::new(DashMap::new()),
+            local_peer_id: PeerId::from_bytes([0u8; 32]),
+            next_peer_generation: Arc::new(AtomicU64::new(0)),
+        };
+        (shared, scp_message_rx)
+    }
+
+    fn make_scp_msg(slot_index: u64) -> OverlayMessage {
+        use stellar_xdr::*;
+        OverlayMessage {
+            from_peer: PeerId::from_bytes([7u8; 32]),
+            message: StellarMessage::ScpMessage(ScpEnvelope {
+                statement: ScpStatement {
+                    node_id: NodeId(PublicKey::PublicKeyTypeEd25519(Uint256([0; 32]))),
+                    slot_index,
+                    pledges: ScpStatementPledges::Externalize(ScpStatementExternalize {
+                        commit: ScpBallot {
+                            counter: 1,
+                            value: vec![].try_into().unwrap(),
+                        },
+                        n_h: 1,
+                        commit_quorum_set_hash: Hash([0; 32]),
+                    }),
+                },
+                signature: vec![].try_into().unwrap(),
+            }),
+            received_at: std::time::Instant::now(),
+        }
+    }
+
+    /// Regression test for #3623 (fatal OOM restart-loop).
+    ///
+    /// Simulates a stalled event loop by taking the SCP ingest receiver and
+    /// NEVER draining it, then flooding `SCP_CHANNEL_CAPACITY + N` SCP
+    /// envelopes through the same send path the peer-receive code uses
+    /// (`route_to_subscribers`, mod.rs:702).
+    ///
+    /// On origin/main the SCP channel is `mpsc::unbounded_channel()`, so all
+    /// `CAPACITY + N` envelopes enqueue (`rx.len() == CAPACITY + N`) and
+    /// `messages_dropped == 0` — the exact unbounded-growth mechanism that
+    /// OOM-kills the validator. This test therefore FAILS on origin/main.
+    ///
+    /// After the fix (bounded `mpsc::channel(SCP_CHANNEL_CAPACITY)` +
+    /// `try_send` drop-on-full), the channel never exceeds the capacity and
+    /// the overflow is counted in `messages_dropped`, so this test PASSES.
+    #[tokio::test]
+    async fn test_scp_channel_bounded_drops_when_receiver_stalled() {
+        const OVERFLOW: usize = 256;
+        let (shared, rx) = shared_state_with_scp_receiver();
+
+        // Simulate the stalled event loop: hold the receiver, never drain it.
+        // Flood more than the channel can hold.
+        for slot in 0..(SCP_CHANNEL_CAPACITY + OVERFLOW) as u64 {
+            shared.route_to_subscribers(make_scp_msg(slot));
+        }
+
+        // (a) The channel must never retain more than its capacity — this is
+        // the bound that prevents unbounded RSS growth / OOM.
+        assert!(
+            rx.len() <= SCP_CHANNEL_CAPACITY,
+            "bounded SCP channel must hold at most {} items, held {}",
+            SCP_CHANNEL_CAPACITY,
+            rx.len()
+        );
+
+        // (b) The over-capacity envelopes must have been dropped and counted,
+        // not silently lost.
+        let metrics = shared.metrics.snapshot();
+        assert!(
+            metrics.messages_dropped >= OVERFLOW as u64,
+            "expected >= {} dropped SCP envelopes, got {}",
+            OVERFLOW,
+            metrics.messages_dropped
+        );
     }
 
     fn make_hello_msg() -> StellarMessage {

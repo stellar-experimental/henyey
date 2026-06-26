@@ -2581,7 +2581,8 @@ mod tests {
             use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64};
 
             let (message_tx, _) = tokio::sync::broadcast::channel(1);
-            let (scp_message_tx, _) = tokio::sync::mpsc::unbounded_channel();
+            let (scp_message_tx, _scp_rx) =
+                tokio::sync::mpsc::channel(crate::manager::SCP_CHANNEL_CAPACITY);
             let (fetch_response_tx, _) = tokio::sync::mpsc::unbounded_channel();
             SharedPeerState {
                 peers: Arc::new(DashMap::new()),
