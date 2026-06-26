@@ -917,19 +917,23 @@ eval_memory_guardrail "$RSS_MB" "$AVAIL_MB" "${MONITOR_HOST_RAM_GB:-61}" \
 When the verdict is `restart`: Stop-PID, Rotate-log suffix `crashed`, Relaunch.
 
 **(5) Disk** — `df -h /home/tomer/data | tail -1`. If usage > 85%, flag LOW DISK.
-Then keep the 3 most recent rotated archives per category (the ISO 8601
-timestamp suffix sorts lexicographically, so `sort -r` gives newest-first;
-use `find -printf` not shell glob to survive zsh `NO_NOMATCH`):
+Then keep the 3 most recent rotated archives **per category, by mtime**, via the
+shared `prune_rotated_logs` helper (`scripts/lib/monitor-decisions.sh`, sourced
+at skill init). The helper discovers every `monitor.log.<category>-*` category
+present on disk — including legacy/other suffixes (`predeploy`, `coldcatchup`,
+`stopped`, `prerestart`, `freshstart`, …), not just a hardcoded
+`preredeploy/crashed/stuck/frozen` list — and orders retention by **mtime**, not
+by lexical filename. mtime ordering is correct even when an infixed variant such
+as `monitor.log.crashed-knit2lcl-20260615T192932Z` would otherwise sort its `k`
+ahead of a bare `crashed-20260623T…` under `sort -r` and wrongly retain the OLD
+log (#3616). It uses `find -printf` (not a shell glob) so it survives zsh
+`NO_NOMATCH`:
 
 ```bash
 logs_dir=/home/tomer/data/$MONITOR_SESSION_ID/logs
-[ -d "$logs_dir" ] && for pat in preredeploy crashed stuck frozen; do
-  find "$logs_dir" -maxdepth 1 -type f -name "monitor.log.$pat-*" \
-    -printf '%f\n' 2>/dev/null | sort -r | tail -n +4 \
-    | while read -r f; do rm -f "$logs_dir/$f"; done
-done
+prune_rotated_logs "$logs_dir" 3   # keeps newest 3 per category by mtime; sets PRUNED_LOG_COUNT
 ```
-Report how many files were removed if any.
+Report how many files were removed (`PRUNED_LOG_COUNT`) if any.
 
 **(6) Session disk** — `du -sh /home/tomer/data/$MONITOR_SESSION_ID/`
 and `du -sh /home/tomer/data/mainnet/`. If combined > 200 GB, flag SESSION DISK HIGH.
@@ -1336,6 +1340,13 @@ eval_result=$(python3 scripts/lib/eval-alarms.py \
    - Apply the cooldown + filing workflow below (§Firing alerts).
    - For alarms with `notes`, apply the investigation guidance before filing
      (e.g., "Sample /metrics 5x at 2s intervals to verify before filing").
+   - **Banner contribution by severity (#3653):** a firing **WARN/SYNC** alarm
+     flips the MONITOR banner to WARNING (or escalates per the Output rules); a
+     firing **NONC** alarm does **NOT** flip the banner — it is still reported on
+     the `metrics:` line and filed/commented as `Non-critical:`, but the banner
+     stays OK on its account. This keeps a known-benign chronic NONC condition
+     (e.g. `inbound-auth-low`) from pinning the banner to WARNING every tick
+     while a genuine WARN escalation (e.g. `inbound-auth-critical`) still surfaces.
 4. Check stderr (evaluator telemetry) for `series_matched=0` lines — these
    indicate dead alarms that need investigation.
 
@@ -2169,9 +2180,17 @@ The `wipe:` line is present when `SESSION_WIPED=yes` or `MAINNET_WIPED=yes`
 (or both). Format per the wipe-state composition table above. When neither
 fires, omit the line entirely.
 
-Use WARNING for threshold breaches. Use ACTION when a corrective action was
-taken (restart, deploy, filed a new issue, commented on an existing issue,
-session-wipe recovery). Use OFFLINE when the node cannot be recovered in
+Use WARNING for threshold breaches **of WARN/SYNC tier**. A firing **NONC-tier**
+alarm (e.g. `inbound-auth-low`, see #3653) does **NOT** flip the banner to
+WARNING: it is reported on the `metrics:` line and filed/commented as
+`Non-critical:` per the Bug Filing Workflow, but the banner stays at the level
+set by the WARN/SYNC/ACTION/OFFLINE signals only. This prevents a known-benign,
+chronically-firing, consensus-non-impacting condition from pinning the banner to
+WARNING on ~90% of ticks (alarm fatigue) while still surfacing it. A genuine
+escalation (e.g. zero authenticated inbound → `inbound-auth-critical`, WARN) is
+its own WARN-tier alarm and DOES flip the banner. Use ACTION when a corrective
+action was taken (restart, deploy, filed a new issue, commented on an existing
+issue, session-wipe recovery). Use OFFLINE when the node cannot be recovered in
 this tick (e.g., rebuild failed after session wipe).
 Use SYNC FAILURE (not WARNING) when the node has exceeded the active sync
 deadline (15m populated / 20m fresh-start / 60m crash-recovery) but is not closing ledgers in

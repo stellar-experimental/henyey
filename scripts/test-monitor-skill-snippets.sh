@@ -45,7 +45,7 @@ cleanup  # ensure fresh state
 mkdir -p "$TEST_ROOT"
 
 # ── TAP state ────────────────────────────────────────────────────────────────
-TAP_PLAN=418
+TAP_PLAN=431
 TAP_CURRENT=0
 TAP_FAILURES=0
 
@@ -1369,6 +1369,107 @@ run_tests() {
   else
     tap_not_ok "crash-detect: mtime tie-break → lexicographic-last path" \
       "LATEST=$CRASH_LATEST_FILE MISMATCH=$CRASH_HASH_MISMATCH"
+  fi
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # prune_rotated_logs tests (#3616) — rotated-log retention by mtime, all cats
+  # Source: scripts/lib/monitor-decisions.sh — prune_rotated_logs
+  # mock_rotated_log LOGS_DIR FULL_SUFFIX MTIME_EPOCH (suffix incl. category)
+  # ════════════════════════════════════════════════════════════════════════════
+  mock_rotated_log() {
+    local logs_dir="$1" suffix="$2" mtime_epoch="$3"
+    mkdir -p "$logs_dir"
+    printf 'log\n' > "$logs_dir/monitor.log.$suffix"
+    touch -d "@$mtime_epoch" "$logs_dir/monitor.log.$suffix"
+  }
+
+  # ── Test 33a: Legacy categories ARE pruned (predeploy/coldcatchup/...) ──────
+  # On origin/main only preredeploy/crashed/stuck/frozen were covered, so these
+  # legacy categories accumulated unbounded (#3616). 5 predeploy → keep 3.
+  local lp1="$TEST_ROOT/prune-legacy/logs"
+  local i
+  for i in 1 2 3 4 5; do
+    mock_rotated_log "$lp1" "predeploy-2026060${i}T120000Z" $((NOW_EPOCH - 6000 + i*100))
+  done
+  mock_rotated_log "$lp1" "coldcatchup-a" $((NOW_EPOCH - 5000))
+  mock_rotated_log "$lp1" "stopped-a"     $((NOW_EPOCH - 5000))
+  prune_rotated_logs "$lp1" 3
+  local pre_kept
+  pre_kept=$(find "$lp1" -name 'monitor.log.predeploy-*' | wc -l | tr -d ' ')
+  if [[ "$pre_kept" -eq 3 && "$PRUNED_LOG_COUNT" -eq 2 \
+        && -f "$lp1/monitor.log.coldcatchup-a" && -f "$lp1/monitor.log.stopped-a" ]]; then
+    tap_ok "prune-logs: legacy 'predeploy' pruned to newest 3 (legacy categories covered)"
+  else
+    tap_not_ok "prune-logs: legacy 'predeploy' pruned to newest 3 (legacy categories covered)" \
+      "pre_kept=$pre_kept removed=$PRUNED_LOG_COUNT"
+  fi
+
+  # ── Test 33b: mtime ordering keeps RECENT, drops OLD infix variant ─────────
+  # crashed-knit2lcl-* sorts its 'k' ahead of bare crashed-2026… under sort -r,
+  # which on origin/main retained the OLD logs and deleted recent ones (#3616).
+  local lp2="$TEST_ROOT/prune-mtime/logs"
+  mock_rotated_log "$lp2" "crashed-knit2lcl-20260615T192932Z" $((NOW_EPOCH - 900000))  # OLD
+  mock_rotated_log "$lp2" "crashed-knit2lcl-20260602T133013Z" $((NOW_EPOCH - 990000))  # OLDER
+  mock_rotated_log "$lp2" "crashed-20260623T212302Z"          $((NOW_EPOCH - 100))     # RECENT
+  mock_rotated_log "$lp2" "crashed-20260623T203607Z"          $((NOW_EPOCH - 200))     # RECENT
+  mock_rotated_log "$lp2" "crashed-20260623T134735Z"          $((NOW_EPOCH - 300))     # RECENT
+  prune_rotated_logs "$lp2" 3
+  if [[ -f "$lp2/monitor.log.crashed-20260623T212302Z" \
+        && -f "$lp2/monitor.log.crashed-20260623T203607Z" \
+        && -f "$lp2/monitor.log.crashed-20260623T134735Z" \
+        && ! -f "$lp2/monitor.log.crashed-knit2lcl-20260615T192932Z" \
+        && ! -f "$lp2/monitor.log.crashed-knit2lcl-20260602T133013Z" \
+        && "$PRUNED_LOG_COUNT" -eq 2 ]]; then
+    tap_ok "prune-logs: mtime ordering keeps recent crashed, drops old knit2lcl infix"
+  else
+    tap_not_ok "prune-logs: mtime ordering keeps recent crashed, drops old knit2lcl infix" \
+      "removed=$PRUNED_LOG_COUNT files=$(ls "$lp2" | tr '\n' ',')"
+  fi
+
+  # ── Test 33c: Under-keep category untouched; covered category pruned ───────
+  local lp3="$TEST_ROOT/prune-mixed/logs"
+  mock_rotated_log "$lp3" "frozen-a" $((NOW_EPOCH - 100))
+  mock_rotated_log "$lp3" "frozen-b" $((NOW_EPOCH - 200))
+  mock_rotated_log "$lp3" "preredeploy-coldD-20260601T000000Z" $((NOW_EPOCH - 300))
+  mock_rotated_log "$lp3" "preredeploy-coldF-20260601T000100Z" $((NOW_EPOCH - 400))
+  mock_rotated_log "$lp3" "preredeploy-20260601T000200Z"       $((NOW_EPOCH - 500))
+  mock_rotated_log "$lp3" "preredeploy-20260601T000300Z"       $((NOW_EPOCH - 600))
+  prune_rotated_logs "$lp3" 3
+  local frozen_kept prered_kept
+  frozen_kept=$(find "$lp3" -name 'monitor.log.frozen-*' | wc -l | tr -d ' ')
+  prered_kept=$(find "$lp3" -name 'monitor.log.preredeploy-*' | wc -l | tr -d ' ')
+  if [[ "$frozen_kept" -eq 2 && "$prered_kept" -eq 3 && "$PRUNED_LOG_COUNT" -eq 1 ]]; then
+    tap_ok "prune-logs: under-keep 'frozen' kept whole; 'preredeploy-*' (incl. infix) pruned to 3"
+  else
+    tap_not_ok "prune-logs: under-keep 'frozen' kept whole; 'preredeploy-*' (incl. infix) pruned to 3" \
+      "frozen=$frozen_kept prered=$prered_kept removed=$PRUNED_LOG_COUNT"
+  fi
+
+  # ── Test 33d: Missing dir → no-op, count 0 ─────────────────────────────────
+  prune_rotated_logs "$TEST_ROOT/prune-missing/nope" 3
+  if [[ "$PRUNED_LOG_COUNT" -eq 0 ]]; then
+    tap_ok "prune-logs: missing dir → no-op (count 0)"
+  else
+    tap_not_ok "prune-logs: missing dir → no-op (count 0)" "removed=$PRUNED_LOG_COUNT"
+  fi
+
+  # ── Test 33e: Empty dir → no-op, count 0 ───────────────────────────────────
+  local lp5="$TEST_ROOT/prune-empty/logs"; mkdir -p "$lp5"
+  prune_rotated_logs "$lp5" 3
+  if [[ "$PRUNED_LOG_COUNT" -eq 0 ]]; then
+    tap_ok "prune-logs: empty dir → no-op (count 0)"
+  else
+    tap_not_ok "prune-logs: empty dir → no-op (count 0)" "removed=$PRUNED_LOG_COUNT"
+  fi
+
+  # ── Test 33f: SKILL.md calls prune_rotated_logs (not the old for-pat loop) ──
+  local prune_tick_file="$REPO_ROOT/.claude/skills/monitor-tick/SKILL.md"
+  if grep -q 'prune_rotated_logs' "$prune_tick_file" \
+     && ! grep -q 'for pat in preredeploy crashed stuck frozen' "$prune_tick_file"; then
+    tap_ok "prune-logs: SKILL.md uses prune_rotated_logs helper (no hardcoded for-pat loop)"
+  else
+    tap_not_ok "prune-logs: SKILL.md uses prune_rotated_logs helper (no hardcoded for-pat loop)" \
+      "tick_file must call prune_rotated_logs and drop the 'for pat in preredeploy crashed stuck frozen' loop"
   fi
 
   # ── Heartbeat helper tests ─────────────────────────────────────────────────
