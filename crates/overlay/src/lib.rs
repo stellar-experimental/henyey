@@ -110,7 +110,7 @@ pub use loopback::LoopbackConnectionFactory;
 pub use manager::TestPeerReceiver;
 pub use manager::{
     AddPeerOutcome, OverlayManager, OverlayMessage, OverlayStats, PeerSnapshot,
-    SCP_CHANNEL_CAPACITY,
+    CATCHUP_CHANNEL_CAPACITY, FETCH_CHANNEL_CAPACITY, SCP_CHANNEL_CAPACITY,
 };
 pub use metrics::{Counter, OverlayMessageKind, OverlayMetrics, OverlayMetricsSnapshot};
 pub use peer::{Peer, PeerInfo, PeerState, PeerStats, PeerStatsSnapshot};

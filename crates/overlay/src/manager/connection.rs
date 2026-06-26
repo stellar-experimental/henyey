@@ -2595,7 +2595,7 @@ mod tests {
             let (message_tx, _) = tokio::sync::broadcast::channel(1);
             let (scp_message_tx, _scp_rx) =
                 tokio::sync::mpsc::channel(crate::manager::SCP_CHANNEL_CAPACITY);
-            let (fetch_response_tx, _) = tokio::sync::mpsc::unbounded_channel();
+            let (fetch_response_tx, _) = tokio::sync::mpsc::channel(crate::FETCH_CHANNEL_CAPACITY);
             SharedPeerState {
                 peers: Arc::new(DashMap::new()),
                 flood_gate: Arc::new(crate::flood::FloodGate::new()),

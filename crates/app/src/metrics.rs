@@ -653,6 +653,10 @@ metric_catalog! {
             => "Total overlay messages written to peers";
         OVERLAY_MESSAGE_BROADCAST_TOTAL = "stellar_overlay_message_broadcast_total"
             => "Total overlay messages broadcast to all peers";
+        OVERLAY_FETCH_MESSAGES_DROPPED_TOTAL = "henyey_overlay_fetch_messages_dropped_total"
+            => "Total fetch-response/-request messages dropped on the bounded fetch intake channel when full (#3661)";
+        OVERLAY_CATCHUP_MESSAGES_DROPPED_TOTAL = "henyey_overlay_catchup_messages_dropped_total"
+            => "Total catchup-cache fan-out messages dropped on the bounded catchup channel when full (#3661)";
         OVERLAY_ERROR_READ_TOTAL = "stellar_overlay_error_read_total"
             => "Total overlay read errors";
         OVERLAY_ERROR_WRITE_TOTAL = "stellar_overlay_error_write_total"
@@ -1197,6 +1201,8 @@ pub(crate) async fn refresh_gauges(state: &ServerState) {
         OVERLAY_MESSAGE_READ_TOTAL.absolute(ov.messages_read);
         OVERLAY_MESSAGE_WRITE_TOTAL.absolute(ov.messages_written);
         OVERLAY_MESSAGE_BROADCAST_TOTAL.absolute(ov.messages_broadcast);
+        OVERLAY_FETCH_MESSAGES_DROPPED_TOTAL.absolute(ov.fetch_messages_dropped);
+        OVERLAY_CATCHUP_MESSAGES_DROPPED_TOTAL.absolute(ov.catchup_messages_dropped);
         OVERLAY_ERROR_READ_TOTAL.absolute(ov.errors_read);
         OVERLAY_ERROR_WRITE_TOTAL.absolute(ov.errors_write);
         OVERLAY_TIMEOUT_IDLE_TOTAL.absolute(ov.timeouts_idle);

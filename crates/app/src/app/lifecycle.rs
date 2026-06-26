@@ -378,8 +378,12 @@ impl App {
         let mut fetch_response_rx = match fetch_response_rx {
             Some(rx) => rx,
             None => {
-                // Create a dummy receiver that never receives
-                let (_tx, rx) = tokio::sync::mpsc::unbounded_channel::<OverlayMessage>();
+                // Create a dummy receiver that never receives. Bounded to match
+                // the real fetch channel type (#3661); capacity is irrelevant
+                // since `_tx` is dropped immediately so the channel is closed.
+                let (_tx, rx) = tokio::sync::mpsc::channel::<OverlayMessage>(
+                    henyey_overlay::FETCH_CHANNEL_CAPACITY,
+                );
                 rx
             }
         };

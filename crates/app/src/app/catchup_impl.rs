@@ -1213,7 +1213,7 @@ impl App {
     /// EXTERNALIZE or GeneralizedTxSet messages are lost during catchup.
     async fn cache_messages_during_catchup_impl(
         &self,
-        mut message_rx: tokio::sync::mpsc::UnboundedReceiver<OverlayMessage>,
+        mut message_rx: tokio::sync::mpsc::Receiver<OverlayMessage>,
     ) {
         use std::collections::HashSet;
         use stellar_xdr::{Limits, ScpStatementPledges};

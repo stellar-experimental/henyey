@@ -104,6 +104,54 @@ const BROADCAST_CHANNEL_SIZE: usize = 4096;
 /// credit-based byte bound is the follow-up tracked in #3625.
 pub const SCP_CHANNEL_CAPACITY: usize = 8192;
 
+/// Bound on the dedicated **fetch-response/-request** intake channel
+/// (`fetch_response_tx` → event-loop `fetch_response_rx`).
+///
+/// This channel carries `GeneralizedTxSet`/`TxSet` responses (and the
+/// `GetTxSet`/`GetScpState`/`GetScpQuorumset` requests we answer), each of
+/// which may be a full **multi-MB** tx-set. On `origin/main` it was an
+/// `mpsc::unbounded_channel()`: when the catchup→Tracking handoff stalls the
+/// event loop (#3582 SQLite write-lock contention) the consumer at
+/// `lifecycle.rs` stops draining while 24 tier-1 validators keep feeding
+/// tx-sets, so RSS grows ~5.4 GB/min until the validator is OOM-killed
+/// (#3623/#3661). #3626 bounded the *SCP* intake channel but not this one.
+///
+/// Sizing: 1024 full tx-sets is a generous backlog for normal jitter and
+/// short stalls (the loop drains far faster than fetch responses arrive) while
+/// keeping the hard retained-memory cap bounded (vs. the 8→41 GB unbounded
+/// growth in #3661). On overflow we `try_send` and DROP the message rather
+/// than blocking the peer-receive path. Dropping a fetch response is
+/// recoverable: the tx-set stays in `TxSetTracker.pending` and is re-requested
+/// by the periodic `request_pending_tx_sets()` tick (lifecycle.rs) + ItemFetcher
+/// retry. Fetch messages are NOT flow-controlled (excluded from
+/// `is_flow_controlled_message`) and the enqueued copy is a tokenless `clone`
+/// (see `OverlayMessage`'s `Clone`), so dropping never touches SEND_MORE credit.
+/// Mirrors stellar-core's bounded overlay→herder model
+/// (`FlowControlMessageCapacity` / `PEER_FLOOD_READING_CAPACITY`;
+/// `TXSET_CACHE_SIZE`=10000; `MAX_SLOTS_TO_REMEMBER`=12).
+pub const FETCH_CHANNEL_CAPACITY: usize = 1024;
+
+/// Bound on the **catchup-cache** fan-out channel created by
+/// `subscribe_catchup()` (→ off-loop `cache_messages_during_catchup_impl`).
+///
+/// This channel fans out `ScpMessage`/`GeneralizedTxSet`/`TxSet`/`ScpQuorumset`
+/// (again up to multi-MB tx-sets) to the pre-warm catchup cache task. On
+/// `origin/main` it was an `mpsc::unbounded_channel()` whose consumer's
+/// `abort()` is gated on the event loop reaching `pending_catchup completed`
+/// (`lifecycle.rs`). When the handoff stalls, the abort never fires and the
+/// cache task may stop draining, so this channel is the second unbounded
+/// tx-set accumulator behind the #3661 OOM.
+///
+/// Sizing: 1024, same rationale as [`FETCH_CHANNEL_CAPACITY`]. On overflow we
+/// `try_send` and DROP. Dropping is recoverable: the catchup cache is a
+/// *pre-warm* only — the task itself registers missing tx-sets as pending and
+/// re-broadcasts `GetTxSet`, dropped EXTERNALIZE envelopes are re-flooded by
+/// peers every slot, and after the handoff the main loop re-fetches anything
+/// still in `TxSetTracker.pending`. The fan-out copy is a tokenless `clone`,
+/// so dropping never interacts with flow-control credit. Same bounded-overlay
+/// model as [`FETCH_CHANNEL_CAPACITY`].
+pub const CATCHUP_CHANNEL_CAPACITY: usize = 1024;
+
 /// Maximum number of peer addresses included in a single PEERS message.
 ///
 /// Matches stellar-core's limit of 50 addresses per Peers message
@@ -812,7 +860,9 @@ pub(super) struct SharedPeerState {
     pub(super) running: Arc<AtomicBool>,
     pub(super) message_tx: broadcast::Sender<OverlayMessage>,
     pub(super) scp_message_tx: mpsc::Sender<OverlayMessage>,
-    pub(super) fetch_response_tx: mpsc::UnboundedSender<OverlayMessage>,
+    /// Bounded ([`FETCH_CHANNEL_CAPACITY`]) so a wedged event loop cannot grow
+    /// RSS unbounded via accumulated multi-MB tx-sets (#3661). Drops on full.
+    pub(super) fetch_response_tx: mpsc::Sender<OverlayMessage>,
     pub(super) peer_handles: Arc<RwLock<Vec<JoinHandle<()>>>>,
     pub(super) advertised_outbound_peers: Arc<RwLock<Vec<PeerAddress>>>,
     pub(super) advertised_inbound_peers: Arc<RwLock<Vec<PeerAddress>>>,
@@ -831,7 +881,7 @@ pub(super) struct SharedPeerState {
     pub(super) scp_callback: Option<Arc<dyn ScpQueueCallback>>,
     pub(super) is_validator: bool,
     pub(super) peer_event_tx: Option<mpsc::Sender<PeerEvent>>,
-    pub(super) extra_subscribers: Arc<RwLock<Vec<mpsc::UnboundedSender<OverlayMessage>>>>,
+    pub(super) extra_subscribers: Arc<RwLock<Vec<mpsc::Sender<OverlayMessage>>>>,
     /// Whether the node is tracking consensus (set by the herder/app layer).
     /// When false, the overlay may drop random peers to try new connections.
     pub(super) is_tracking: Arc<AtomicBool>,
@@ -965,28 +1015,50 @@ impl SharedPeerState {
         // never leaks on the drop-on-full backstop path.
 
         if is_fetch_response || is_fetch_request {
-            if let Err(e) = self.fetch_response_tx.send(msg.clone()) {
-                error!(
-                    "Fetch channel send FAILED for peer {}: {}",
-                    msg.from_peer, e
-                );
-            } else {
-                // Issue #1741: account for the enqueue on the send side so the
-                // depth gauge reflects backlog even when the event loop is
-                // wedged (which is the exact failure mode the metric is meant
-                // to diagnose).
-                let new_depth = self.fetch_channel_depth.fetch_add(1, Ordering::Relaxed) + 1;
-                let mut prev = self.fetch_channel_depth_max.load(Ordering::Relaxed);
-                while new_depth > prev {
-                    match self.fetch_channel_depth_max.compare_exchange_weak(
-                        prev,
-                        new_depth,
-                        Ordering::Relaxed,
-                        Ordering::Relaxed,
-                    ) {
-                        Ok(_) => break,
-                        Err(observed) => prev = observed,
+            // Non-blocking send: the channel is bounded ([`FETCH_CHANNEL_CAPACITY`])
+            // to prevent unbounded RSS growth when the event loop stalls during the
+            // catchup→Tracking handoff (#3661). Each fetch response can be a full
+            // multi-MB tx-set, so an unbounded backlog grows RSS ~5.4 GB/min → OOM.
+            // On a full channel we DROP rather than `.await` — blocking the
+            // peer-receive path is its own event-loop hazard. The drop is
+            // recoverable: the tx-set stays in `TxSetTracker.pending` and is
+            // re-requested by the periodic `request_pending_tx_sets()` tick +
+            // ItemFetcher retry. Fetch messages are NOT flow-controlled and the
+            // enqueued copy is a tokenless `clone` (see `OverlayMessage::clone`),
+            // so dropping never touches SEND_MORE credit.
+            match self.fetch_response_tx.try_send(msg.clone()) {
+                Ok(()) => {
+                    // Issue #1741: account for the enqueue on the send side so the
+                    // depth gauge reflects backlog even when the event loop is
+                    // wedged (which is the exact failure mode the metric is meant
+                    // to diagnose).
+                    let new_depth = self.fetch_channel_depth.fetch_add(1, Ordering::Relaxed) + 1;
+                    let mut prev = self.fetch_channel_depth_max.load(Ordering::Relaxed);
+                    while new_depth > prev {
+                        match self.fetch_channel_depth_max.compare_exchange_weak(
+                            prev,
+                            new_depth,
+                            Ordering::Relaxed,
+                            Ordering::Relaxed,
+                        ) {
+                            Ok(_) => break,
+                            Err(observed) => prev = observed,
+                        }
                     }
+                }
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    self.metrics.fetch_messages_dropped.add(1);
+                    self.metrics.messages_dropped.add(1);
+                    debug!(
+                        "Fetch channel full (cap {}); dropping fetch message from peer {} (recoverable: re-requested by request_pending_tx_sets)",
+                        FETCH_CHANNEL_CAPACITY, msg.from_peer
+                    );
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    error!(
+                        "Fetch channel send FAILED for peer {}: channel closed",
+                        msg.from_peer
+                    );
                 }
             }
         }
@@ -1001,7 +1073,23 @@ impl SharedPeerState {
         ) {
             let subs = self.extra_subscribers.read();
             for sub in subs.iter() {
-                let _ = sub.send(msg.clone());
+                // Non-blocking send on the bounded ([`CATCHUP_CHANNEL_CAPACITY`])
+                // catchup-cache fan-out. The consumer is aborted only at the
+                // catchup→Tracking handoff; if that stalls (#3582) an unbounded
+                // channel accumulates multi-MB tx-sets → OOM (#3661). On full we
+                // DROP and count: the cache is pre-warm, so dropped tx-sets are
+                // re-fetched (the task re-broadcasts `GetTxSet`, peers re-flood
+                // EXTERNALIZE, and the post-handoff loop re-fetches pending). The
+                // fan-out copy is a tokenless `clone`, so no flow-control credit
+                // interaction.
+                match sub.try_send(msg.clone()) {
+                    Ok(()) => {}
+                    Err(mpsc::error::TrySendError::Full(_)) => {
+                        self.metrics.catchup_messages_dropped.add(1);
+                        self.metrics.messages_dropped.add(1);
+                    }
+                    Err(mpsc::error::TrySendError::Closed(_)) => {}
+                }
             }
         }
 
@@ -1134,18 +1222,20 @@ pub struct OverlayManager {
     pub(super) scp_message_tx: mpsc::Sender<OverlayMessage>,
     /// Receiver end of the SCP channel. Taken once via `subscribe_scp()`.
     scp_message_rx: Arc<TokioMutex<Option<mpsc::Receiver<OverlayMessage>>>>,
-    /// Dedicated unbounded channel for fetch response messages.
-    /// Routes GeneralizedTxSet, TxSet, DontHave, ScpQuorumset, GetScpState,
-    /// GetScpQuorumset, and GetTxSet through a never-drop channel, matching
-    /// stellar-core's synchronous IO-loop dispatch. Depth is exposed via
-    /// `henyey_overlay_fetch_channel_depth` gauges for operator visibility.
-    pub(super) fetch_response_tx: mpsc::UnboundedSender<OverlayMessage>,
+    /// Dedicated **bounded** ([`FETCH_CHANNEL_CAPACITY`]) channel for fetch
+    /// response messages. Routes GeneralizedTxSet, TxSet, DontHave, ScpQuorumset,
+    /// GetScpState, GetScpQuorumset, and GetTxSet to the event loop. Bounded so a
+    /// wedged loop cannot accumulate multi-MB tx-sets to OOM (#3661); over-capacity
+    /// messages are `try_send`-dropped (recoverable via `request_pending_tx_sets()`
+    /// re-request) and counted in `metrics.fetch_messages_dropped`. Depth is exposed
+    /// via `henyey_overlay_fetch_channel_depth` gauges for operator visibility.
+    pub(super) fetch_response_tx: mpsc::Sender<OverlayMessage>,
     /// Receiver end of the fetch response channel. Taken once via `subscribe_fetch_responses()`.
-    fetch_response_rx: Arc<TokioMutex<Option<mpsc::UnboundedReceiver<OverlayMessage>>>>,
+    fetch_response_rx: Arc<TokioMutex<Option<mpsc::Receiver<OverlayMessage>>>>,
     /// Dynamic extra subscribers for catchup-critical messages (SCP + TxSet).
     /// Created on demand via `subscribe_catchup()` and cleaned up when dropped.
     /// Uses parking_lot::RwLock for minimal contention in the hot path (read-heavy).
-    pub(super) extra_subscribers: Arc<RwLock<Vec<mpsc::UnboundedSender<OverlayMessage>>>>,
+    pub(super) extra_subscribers: Arc<RwLock<Vec<mpsc::Sender<OverlayMessage>>>>,
     /// Last closed ledger sequence, used for flood record cleanup.
     pub(super) last_closed_ledger: Arc<AtomicU32>,
     /// Optional callback for intelligent SCP queue trimming.
@@ -1243,7 +1333,7 @@ impl OverlayManager {
         let (message_tx, _) = broadcast::channel(BROADCAST_CHANNEL_SIZE);
         let (shutdown_tx, _) = broadcast::channel(1);
         let (scp_message_tx, scp_message_rx) = mpsc::channel(SCP_CHANNEL_CAPACITY);
-        let (fetch_response_tx, fetch_response_rx) = mpsc::unbounded_channel();
+        let (fetch_response_tx, fetch_response_rx) = mpsc::channel(FETCH_CHANNEL_CAPACITY);
         let preferred_peers = Arc::new(RwLock::new(PreferredPeerSet::from_config(
             config.preferred_peers.clone(),
             config.preferred_peer_keys.clone(),
@@ -1829,23 +1919,27 @@ impl OverlayManager {
     ///
     /// Can only be called once (takes ownership of the receiver). Returns `None`
     /// if already called.
-    pub async fn subscribe_fetch_responses(
-        &self,
-    ) -> Option<mpsc::UnboundedReceiver<OverlayMessage>> {
+    pub async fn subscribe_fetch_responses(&self) -> Option<mpsc::Receiver<OverlayMessage>> {
         self.fetch_response_rx.lock().await.take()
     }
 
     /// Subscribe to catchup-critical messages (SCP + TxSet) via a dedicated mpsc channel.
     ///
     /// Unlike `subscribe()` which uses a broadcast channel that drops messages on overflow,
-    /// this creates an unbounded mpsc channel that never loses messages. The channel is
-    /// automatically cleaned up when the receiver is dropped.
+    /// this creates a **bounded** ([`CATCHUP_CHANNEL_CAPACITY`]) mpsc channel. Bounding is
+    /// required because the consumer (`cache_messages_during_catchup_impl`) is aborted only
+    /// when the event loop reaches the catchup→Tracking handoff; if that handoff stalls
+    /// (#3582) an unbounded channel accumulates multi-MB tx-sets until the validator OOMs
+    /// (#3661). Over-capacity messages are `try_send`-dropped and counted in
+    /// `metrics.catchup_messages_dropped`. The channel is automatically cleaned up when the
+    /// receiver is dropped.
     ///
-    /// Used by the catchup message cacher to ensure no EXTERNALIZE or GeneralizedTxSet
-    /// messages are lost during the catchup period.
+    /// Dropping is recoverable: the cache is a pre-warm — the task re-broadcasts `GetTxSet`
+    /// for missing tx-sets, dropped EXTERNALIZE envelopes are re-flooded by peers each slot,
+    /// and after the handoff the main loop re-fetches anything still in `TxSetTracker.pending`.
     // SECURITY: subscriber count bounded by internal callers; no external input
-    pub fn subscribe_catchup(&self) -> mpsc::UnboundedReceiver<OverlayMessage> {
-        let (tx, rx) = mpsc::unbounded_channel();
+    pub fn subscribe_catchup(&self) -> mpsc::Receiver<OverlayMessage> {
+        let (tx, rx) = mpsc::channel(CATCHUP_CHANNEL_CAPACITY);
         let mut subs = self.extra_subscribers.write();
         // Clean up any closed subscribers while we have the write lock
         subs.retain(|s| !s.is_closed());
@@ -2951,7 +3045,7 @@ pub(crate) mod tests {
     fn test_shared_state(preferred: Vec<PeerAddress>) -> SharedPeerState {
         let (message_tx, _) = tokio::sync::broadcast::channel(1);
         let (scp_message_tx, _scp_rx) = tokio::sync::mpsc::channel(SCP_CHANNEL_CAPACITY);
-        let (fetch_response_tx, _) = tokio::sync::mpsc::unbounded_channel();
+        let (fetch_response_tx, _) = tokio::sync::mpsc::channel(FETCH_CHANNEL_CAPACITY);
         SharedPeerState {
             peers: Arc::new(DashMap::new()),
             flood_gate: Arc::new(FloodGate::new()),
@@ -3477,7 +3571,7 @@ pub(crate) mod tests {
         let (message_tx, _) = tokio::sync::broadcast::channel(64);
         let mut broadcast_rx = message_tx.subscribe();
         let (scp_message_tx, _scp_rx) = tokio::sync::mpsc::channel(SCP_CHANNEL_CAPACITY);
-        let (fetch_response_tx, mut fetch_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (fetch_response_tx, mut fetch_rx) = tokio::sync::mpsc::channel(FETCH_CHANNEL_CAPACITY);
 
         let shared = SharedPeerState {
             peers: Arc::new(DashMap::new()),
@@ -3567,12 +3661,12 @@ pub(crate) mod tests {
     fn make_routing_shared_state() -> (
         SharedPeerState,
         tokio::sync::broadcast::Receiver<OverlayMessage>,
-        tokio::sync::mpsc::UnboundedReceiver<OverlayMessage>,
+        tokio::sync::mpsc::Receiver<OverlayMessage>,
     ) {
         let (message_tx, _) = tokio::sync::broadcast::channel(1024);
         let broadcast_rx = message_tx.subscribe();
         let (scp_message_tx, _scp_rx) = tokio::sync::mpsc::channel(SCP_CHANNEL_CAPACITY);
-        let (fetch_response_tx, fetch_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (fetch_response_tx, fetch_rx) = tokio::sync::mpsc::channel(FETCH_CHANNEL_CAPACITY);
         let shared = SharedPeerState {
             peers: Arc::new(DashMap::new()),
             flood_gate: Arc::new(FloodGate::new()),
@@ -3665,20 +3759,23 @@ pub(crate) mod tests {
         }
     }
 
-    /// Issue #1741 regression: the fetch channel must be unbounded so that a
-    /// lagging app loop never drops SCP fetch traffic. Push 10_000 messages
-    /// across all 7 fetch variants while the receiver is parked, then drain
-    /// and assert per-variant counts. This test would fail under the old
-    /// bounded (4096) `try_send` implementation.
+    /// Issue #1741 + #3661 regression: every fetch variant must route to the
+    /// dedicated fetch channel (not the lossy broadcast), and that channel must
+    /// hold up to its full capacity without dropping under a parked receiver —
+    /// but it is now **bounded** ([`FETCH_CHANNEL_CAPACITY`]) rather than
+    /// unbounded, so it cannot grow RSS without limit (#3661). Push exactly
+    /// `FETCH_CHANNEL_CAPACITY` messages across all 7 fetch variants while the
+    /// receiver is parked, then drain and assert all survive with matching
+    /// per-variant counts (no drops at/below capacity).
     #[tokio::test]
-    async fn fetch_channel_unbounded_all_variants() {
+    async fn fetch_channel_all_variants_within_capacity() {
         let (shared, _broadcast_rx, mut fetch_rx) = make_routing_shared_state();
         let peer = PeerId::from_bytes([7u8; 32]);
         let variants = all_fetch_variant_messages(&peer);
         let variant_count = variants.len();
         assert_eq!(variant_count, 7, "expected 7 fetch variants");
 
-        const TOTAL: usize = 10_000;
+        const TOTAL: usize = FETCH_CHANNEL_CAPACITY;
         let mut sent_counts: std::collections::HashMap<&'static str, usize> =
             std::collections::HashMap::new();
         for i in 0..TOTAL {
@@ -3698,13 +3795,15 @@ pub(crate) mod tests {
         }
         assert_eq!(
             drained, TOTAL,
-            "all {} messages must survive — unbounded channel never drops",
+            "all {} messages at/below capacity must survive without drops",
             TOTAL
         );
         assert_eq!(
             sent_counts, received_counts,
             "per-variant counts must match"
         );
+        // No drops occurred at/below capacity.
+        assert_eq!(shared.metrics.snapshot().fetch_messages_dropped, 0);
     }
 
     /// Each of the 7 fetch variants must be routed exclusively to the
@@ -4270,7 +4369,7 @@ pub(crate) mod tests {
         use crate::connection::ConnectionDirection;
         let (message_tx, _) = broadcast::channel(16);
         let (scp_tx, _scp_rx) = mpsc::channel(SCP_CHANNEL_CAPACITY);
-        let (fetch_tx, _fetch_rx) = mpsc::unbounded_channel();
+        let (fetch_tx, _fetch_rx) = mpsc::channel(FETCH_CHANNEL_CAPACITY);
 
         let shared = SharedPeerState {
             peers: Arc::new(DashMap::new()),
@@ -4341,7 +4440,7 @@ pub(crate) mod tests {
         use crate::connection::ConnectionDirection;
         let (message_tx, _) = broadcast::channel(16);
         let (scp_tx, _scp_rx) = mpsc::channel(SCP_CHANNEL_CAPACITY);
-        let (fetch_tx, _fetch_rx) = mpsc::unbounded_channel();
+        let (fetch_tx, _fetch_rx) = mpsc::channel(FETCH_CHANNEL_CAPACITY);
 
         let preferred_key = PeerId::from_bytes([42u8; 32]);
         let mut keys = HashSet::new();
@@ -4451,7 +4550,7 @@ pub(crate) mod tests {
     ) -> (SharedPeerState, tokio::sync::mpsc::Receiver<OverlayMessage>) {
         let (message_tx, _) = tokio::sync::broadcast::channel(BROADCAST_CHANNEL_SIZE);
         let (scp_message_tx, scp_message_rx) = tokio::sync::mpsc::channel(SCP_CHANNEL_CAPACITY);
-        let (fetch_response_tx, _) = tokio::sync::mpsc::unbounded_channel();
+        let (fetch_response_tx, _) = tokio::sync::mpsc::channel(FETCH_CHANNEL_CAPACITY);
         let shared = SharedPeerState {
             peers: Arc::new(DashMap::new()),
             flood_gate: Arc::new(FloodGate::new()),
@@ -4496,6 +4595,30 @@ pub(crate) mod tests {
             next_peer_generation: Arc::new(AtomicU64::new(0)),
         };
         (shared, scp_message_rx)
+    }
+
+    /// Build a `SharedPeerState` wired with bounded fetch + catchup channels so
+    /// regression tests for #3661 can simulate a stalled event loop / aborted
+    /// catchup-cache task by never draining the returned receivers.
+    ///
+    /// Returns `(shared, fetch_rx, catchup_rx)` where both receivers are at
+    /// their production capacities ([`FETCH_CHANNEL_CAPACITY`] /
+    /// [`CATCHUP_CHANNEL_CAPACITY`]). The catchup receiver is registered as an
+    /// `extra_subscribers` entry, exactly as `subscribe_catchup()` does.
+    pub(crate) fn shared_state_for_3661() -> (
+        SharedPeerState,
+        tokio::sync::mpsc::Receiver<OverlayMessage>,
+        tokio::sync::mpsc::Receiver<OverlayMessage>,
+    ) {
+        let (shared, _scp_rx) = shared_state_with_scp_receiver();
+        let (fetch_tx, fetch_rx) = tokio::sync::mpsc::channel(FETCH_CHANNEL_CAPACITY);
+        let (catchup_tx, catchup_rx) = tokio::sync::mpsc::channel(CATCHUP_CHANNEL_CAPACITY);
+        // Replace the parked fetch sender with one whose receiver we hold, and
+        // register the catchup subscriber the way `subscribe_catchup()` would.
+        let mut shared = shared;
+        shared.fetch_response_tx = fetch_tx;
+        shared.extra_subscribers.write().push(catchup_tx);
+        (shared, fetch_rx, catchup_rx)
     }
 
     fn make_scp_msg(slot_index: u64) -> OverlayMessage {
@@ -4564,6 +4687,126 @@ pub(crate) mod tests {
             "expected >= {} dropped SCP envelopes, got {}",
             OVERFLOW,
             metrics.messages_dropped
+        );
+    }
+
+    /// A `GeneralizedTxSet` overlay message (an `is_fetch_response` that also
+    /// fans out to `extra_subscribers`), used to drive both #3661 channels.
+    fn make_generalized_txset_msg() -> OverlayMessage {
+        use stellar_xdr::*;
+        OverlayMessage::new(
+            PeerId::from_bytes([9u8; 32]),
+            StellarMessage::GeneralizedTxSet(GeneralizedTransactionSet::V1(TransactionSetV1 {
+                previous_ledger_hash: Hash([0; 32]),
+                phases: vec![].try_into().unwrap(),
+            })),
+            std::time::Instant::now(),
+        )
+    }
+
+    /// Regression test for #3661 (fatal OOM-on-restart): the **fetch intake**
+    /// channel must be bounded and drop-on-full.
+    ///
+    /// Simulates a stalled event loop by holding the fetch receiver and never
+    /// draining it, then flooding `FETCH_CHANNEL_CAPACITY + N` full-tx-set
+    /// fetch responses through the production send path (`route_to_subscribers`).
+    ///
+    /// On origin/main the fetch channel is `mpsc::unbounded_channel()` fed via a
+    /// non-dropping `.send()`, so all `CAPACITY + N` messages enqueue
+    /// (`rx.len() == CAPACITY + N`) and nothing is dropped — the exact
+    /// unbounded multi-MB-tx-set growth that OOM-kills the validator. This test
+    /// therefore FAILS on origin/main and PASSES after the bounded + `try_send`
+    /// drop-on-full fix.
+    #[tokio::test]
+    async fn test_fetch_channel_bounded_drops_when_receiver_stalled() {
+        const OVERFLOW: usize = 256;
+        let (shared, fetch_rx, _catchup_rx) = shared_state_for_3661();
+
+        // Stalled event loop: hold the fetch receiver, never drain it.
+        for _ in 0..(FETCH_CHANNEL_CAPACITY + OVERFLOW) {
+            shared.route_to_subscribers(make_generalized_txset_msg());
+        }
+
+        // (a) The bounded channel must never retain more than its capacity.
+        assert!(
+            fetch_rx.len() <= FETCH_CHANNEL_CAPACITY,
+            "bounded fetch channel must hold at most {} items, held {}",
+            FETCH_CHANNEL_CAPACITY,
+            fetch_rx.len()
+        );
+
+        // (b) The over-capacity messages must be dropped and counted.
+        let metrics = shared.metrics.snapshot();
+        assert!(
+            metrics.fetch_messages_dropped >= OVERFLOW as u64,
+            "expected >= {} dropped fetch messages, got {}",
+            OVERFLOW,
+            metrics.fetch_messages_dropped
+        );
+    }
+
+    /// Regression test for #3661: the **catchup-cache** fan-out channel
+    /// (`subscribe_catchup()`) must be bounded and drop-on-full.
+    ///
+    /// Simulates an aborted/stalled catchup-cache task by registering a catchup
+    /// subscriber and never draining it, then flooding
+    /// `CATCHUP_CHANNEL_CAPACITY + N` full-tx-set messages through the
+    /// production fan-out. On origin/main the per-subscriber channel is
+    /// `mpsc::unbounded_channel()` fed via non-dropping `.send()`, so all
+    /// messages enqueue and nothing drops (FAILS); after the fix the channel is
+    /// capped and overflow is counted (PASSES).
+    #[tokio::test]
+    async fn test_catchup_channel_bounded_drops_when_receiver_stalled() {
+        const OVERFLOW: usize = 256;
+        let (shared, _fetch_rx, catchup_rx) = shared_state_for_3661();
+
+        for _ in 0..(CATCHUP_CHANNEL_CAPACITY + OVERFLOW) {
+            shared.route_to_subscribers(make_generalized_txset_msg());
+        }
+
+        assert!(
+            catchup_rx.len() <= CATCHUP_CHANNEL_CAPACITY,
+            "bounded catchup channel must hold at most {} items, held {}",
+            CATCHUP_CHANNEL_CAPACITY,
+            catchup_rx.len()
+        );
+
+        let metrics = shared.metrics.snapshot();
+        assert!(
+            metrics.catchup_messages_dropped >= OVERFLOW as u64,
+            "expected >= {} dropped catchup messages, got {}",
+            OVERFLOW,
+            metrics.catchup_messages_dropped
+        );
+    }
+
+    /// App-boundary type-pin (#3661): both overlay→app fetch/catchup channel
+    /// constructors must hand back **bounded** receivers (a `max_capacity()`
+    /// equal to the named cap), not unbounded ones. If a future refactor
+    /// reverts either channel to `unbounded_channel()` this fails to compile
+    /// (no `max_capacity`) or trips the capacity assertion.
+    #[tokio::test]
+    async fn test_overlay_fetch_catchup_channels_are_bounded() {
+        let config = OverlayConfig::default();
+        let secret = SecretKey::generate();
+        let local_node = LocalNode::new_testnet(secret);
+        let manager = OverlayManager::new(config, local_node).unwrap();
+
+        let fetch_rx = manager
+            .subscribe_fetch_responses()
+            .await
+            .expect("fetch receiver available once");
+        assert_eq!(
+            fetch_rx.max_capacity(),
+            FETCH_CHANNEL_CAPACITY,
+            "fetch intake channel must be bounded at FETCH_CHANNEL_CAPACITY"
+        );
+
+        let catchup_rx = manager.subscribe_catchup();
+        assert_eq!(
+            catchup_rx.max_capacity(),
+            CATCHUP_CHANNEL_CAPACITY,
+            "catchup-cache channel must be bounded at CATCHUP_CHANNEL_CAPACITY"
         );
     }
 
