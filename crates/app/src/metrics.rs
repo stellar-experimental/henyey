@@ -511,6 +511,58 @@ metric_catalog! {
         // restore + catchup window that the `% 64` ledger-close report misses.
         STARTUP_PEAK_ANON_RSS_MB = "henyey_startup_peak_anon_rss_mb"
             => "Peak anonymous RSS (MB) observed during startup restore + catchup";
+
+        // ── Loadgen meters (#3569, reset on clearmetrics #3630) ────────
+        //
+        // Parity with stellar-core's medida loadgen meters
+        // (src/simulation/LoadGenerator.cpp + main/ApplicationImpl.cpp:1156).
+        // Supercluster's `IsLoadGenComplete` polls `loadgen_run_start ==
+        // loadgen_run_complete` to detect henyey-driven loadgen completion, so
+        // these must render with the EXACT bare-`loadgen_` names core's medida
+        // exporter emits (no `stellar_`/`henyey_` prefix, no dot→underscore
+        // munging — the literal string IS the exposition name). Pre-registered
+        // at zero so supercluster reads NotStarted (start==0) before a run
+        // rather than a missing series.
+        //
+        // These are GAUGES, not counters: stellar-core's `clearMetrics`
+        // (`MetricResetter`, ApplicationImpl.cpp:1375) truly resets the medida
+        // meters between Supercluster max-TPS / min-block-time binary-search
+        // steps, and the Prometheus exporter only renders a true `0` for a value
+        // it can `set` (gauge `swap`) — a monotonic counter's `absolute(0)` is
+        // `fetch_max(0)`, a no-op that leaves the accumulated value (#3630).
+        // Supercluster reads the numeric value via the compat `/metrics` JSON
+        // (`LOADGEN_COMPAT_MAP` → `count`), which is type-agnostic, so the
+        // counter→gauge exposition change is invisible to the consumer.
+        LOADGEN_RUN_START = "loadgen_run_start"
+            => "Loadgen runs started (parity: ApplicationImpl::generateLoad)";
+        LOADGEN_RUN_COMPLETE = "loadgen_run_complete"
+            => "Loadgen runs completed successfully (parity: LoadGenerator mLoadgenComplete)";
+        LOADGEN_RUN_FAILED = "loadgen_run_failed"
+            => "Loadgen runs that failed or were stopped (parity: LoadGenerator mLoadgenFail)";
+        LOADGEN_ACCOUNT_CREATED = "loadgen_account_created"
+            => "Loadgen accounts created (parity: registered-at-zero; core v27 marks this test-only)";
+        LOADGEN_TXN_ATTEMPTED = "loadgen_txn_attempted"
+            => "Loadgen transactions attempted (parity: LoadGenerator mTxnAttempted)";
+        LOADGEN_TXN_REJECTED = "loadgen_txn_rejected"
+            => "Loadgen transactions rejected by the tx queue (parity: LoadGenerator mTxnRejected)";
+        LOADGEN_TXN_BYTES = "loadgen_txn_bytes"
+            => "Loadgen transaction bytes submitted (parity: LoadGenerator mTxnBytes)";
+        LOADGEN_PAYMENT_SUBMITTED = "loadgen_payment_submitted"
+            => "Loadgen native payment operations submitted (parity: LoadGenerator mNativePayment, by op count)";
+        LOADGEN_PAYMENT_BYTES = "loadgen_payment_bytes"
+            => "Loadgen native payment transaction bytes (parity: LoadGenerator mNativePaymentBytes)";
+        LOADGEN_SOROBAN_UPLOAD = "loadgen_soroban_upload"
+            => "Loadgen Soroban upload transactions (parity: LoadGenerator mSorobanUploadTxs)";
+        LOADGEN_SOROBAN_INVOKE = "loadgen_soroban_invoke"
+            => "Loadgen Soroban invoke transactions (parity: LoadGenerator mSorobanInvokeTxs)";
+        LOADGEN_SOROBAN_SETUP_INVOKE = "loadgen_soroban_setup_invoke"
+            => "Loadgen Soroban setup-invoke transactions (parity: LoadGenerator mSorobanSetupInvokeTxs)";
+        LOADGEN_SOROBAN_SETUP_UPGRADE = "loadgen_soroban_setup_upgrade"
+            => "Loadgen Soroban setup-upgrade transactions (parity: LoadGenerator mSorobanSetupUpgradeTxs)";
+        LOADGEN_SOROBAN_CREATE_UPGRADE = "loadgen_soroban_create_upgrade"
+            => "Loadgen Soroban create-upgrade transactions (parity: LoadGenerator mSorobanCreateUpgradeTxs)";
+        LOADGEN_STEP_COUNT = "loadgen_step_count"
+            => "Loadgen generate_load loop iterations (parity: LoadGenerator mStepMeter)";
     }
 
     gauges_no_prereg {
@@ -788,48 +840,6 @@ metric_catalog! {
             => "History Archive State downloads that succeeded (and passed verify_has where applicable)";
         HISTORY_DOWNLOAD_HAS_FAILURE_TOTAL = "stellar_history_download_history_archive_state_failure_total"
             => "History Archive State downloads or verifications that failed";
-
-        // ── Loadgen meters (#3569) ─────────────────────────────────────
-        //
-        // Parity with stellar-core's medida loadgen meters
-        // (src/simulation/LoadGenerator.cpp + main/ApplicationImpl.cpp:1156).
-        // Supercluster's `IsLoadGenComplete` polls `loadgen_run_start ==
-        // loadgen_run_complete` to detect henyey-driven loadgen completion, so
-        // these must render with the EXACT bare-`loadgen_` names core's medida
-        // exporter emits (no `stellar_`/`henyey_` prefix, no dot→underscore
-        // munging — the literal string IS the exposition name). Pre-registered
-        // at zero so supercluster reads NotStarted (start==0) before a run
-        // rather than a missing series.
-        LOADGEN_RUN_START = "loadgen_run_start"
-            => "Loadgen runs started (parity: ApplicationImpl::generateLoad)";
-        LOADGEN_RUN_COMPLETE = "loadgen_run_complete"
-            => "Loadgen runs completed successfully (parity: LoadGenerator mLoadgenComplete)";
-        LOADGEN_RUN_FAILED = "loadgen_run_failed"
-            => "Loadgen runs that failed or were stopped (parity: LoadGenerator mLoadgenFail)";
-        LOADGEN_ACCOUNT_CREATED = "loadgen_account_created"
-            => "Loadgen accounts created (parity: registered-at-zero; core v27 marks this test-only)";
-        LOADGEN_TXN_ATTEMPTED = "loadgen_txn_attempted"
-            => "Loadgen transactions attempted (parity: LoadGenerator mTxnAttempted)";
-        LOADGEN_TXN_REJECTED = "loadgen_txn_rejected"
-            => "Loadgen transactions rejected by the tx queue (parity: LoadGenerator mTxnRejected)";
-        LOADGEN_TXN_BYTES = "loadgen_txn_bytes"
-            => "Loadgen transaction bytes submitted (parity: LoadGenerator mTxnBytes)";
-        LOADGEN_PAYMENT_SUBMITTED = "loadgen_payment_submitted"
-            => "Loadgen native payment operations submitted (parity: LoadGenerator mNativePayment, by op count)";
-        LOADGEN_PAYMENT_BYTES = "loadgen_payment_bytes"
-            => "Loadgen native payment transaction bytes (parity: LoadGenerator mNativePaymentBytes)";
-        LOADGEN_SOROBAN_UPLOAD = "loadgen_soroban_upload"
-            => "Loadgen Soroban upload transactions (parity: LoadGenerator mSorobanUploadTxs)";
-        LOADGEN_SOROBAN_INVOKE = "loadgen_soroban_invoke"
-            => "Loadgen Soroban invoke transactions (parity: LoadGenerator mSorobanInvokeTxs)";
-        LOADGEN_SOROBAN_SETUP_INVOKE = "loadgen_soroban_setup_invoke"
-            => "Loadgen Soroban setup-invoke transactions (parity: LoadGenerator mSorobanSetupInvokeTxs)";
-        LOADGEN_SOROBAN_SETUP_UPGRADE = "loadgen_soroban_setup_upgrade"
-            => "Loadgen Soroban setup-upgrade transactions (parity: LoadGenerator mSorobanSetupUpgradeTxs)";
-        LOADGEN_SOROBAN_CREATE_UPGRADE = "loadgen_soroban_create_upgrade"
-            => "Loadgen Soroban create-upgrade transactions (parity: LoadGenerator mSorobanCreateUpgradeTxs)";
-        LOADGEN_STEP_COUNT = "loadgen_step_count"
-            => "Loadgen generate_load loop iterations (parity: LoadGenerator mStepMeter)";
     }
 
     counters_no_prereg {
@@ -1062,7 +1072,7 @@ pub(crate) const LOADGEN_COMPAT_MAP: &[(&str, &str, &str)] = &[
 /// Single source of truth for the set of meters reset by [`reset_loadgen_meters`]
 /// on `clearmetrics` (#3630). Must stay in sync with the `loadgen_*` entries in
 /// the catalog and with [`LOADGEN_COMPAT_MAP`].
-pub const LOADGEN_METERS: &[CounterMetric] = &[
+pub const LOADGEN_METERS: &[GaugeMetric] = &[
     LOADGEN_RUN_START,
     LOADGEN_RUN_COMPLETE,
     LOADGEN_RUN_FAILED,
@@ -1671,7 +1681,10 @@ pub fn install_recorder() -> PrometheusHandle {
 /// Invoked from the `clearmetrics` HTTP path only (see `App::clear_metrics`).
 pub fn reset_loadgen_meters() {
     for m in LOADGEN_METERS {
-        m.absolute(0);
+        // Gauge `set` is a true `swap` (renders the exact value), unlike a
+        // counter's `absolute` = `fetch_max`, which cannot lower a non-zero
+        // counter and was the #3630 no-op.
+        m.set(0.0);
     }
 }
 
@@ -1906,7 +1919,7 @@ mod tests {
     #[test]
     fn test_loadgen_meters_in_catalog() {
         // (typed constant, expected literal Prometheus name) pairs.
-        let expected: &[(CounterMetric, &str)] = &[
+        let expected: &[(GaugeMetric, &str)] = &[
             (LOADGEN_RUN_START, "loadgen_run_start"),
             (LOADGEN_RUN_COMPLETE, "loadgen_run_complete"),
             (LOADGEN_RUN_FAILED, "loadgen_run_failed"),
@@ -1943,12 +1956,13 @@ mod tests {
             // Present in the full catalog AND pre-registered at zero so the
             // series exists on the first scrape.
             assert!(
-                ALL_COUNTER_NAMES.contains(name),
-                "{} missing from ALL_COUNTER_NAMES",
+                ALL_GAUGE_NAMES.contains(name),
+                "{} missing from ALL_GAUGE_NAMES (loadgen meters are resettable \
+                 gauges, #3630)",
                 name
             );
             assert!(
-                ALL_PREREGISTERED_COUNTER_NAMES.contains(name),
+                ALL_PREREGISTERED_GAUGE_NAMES.contains(name),
                 "{} should be pre-registered (present-at-zero)",
                 name
             );
@@ -1976,23 +1990,23 @@ mod tests {
                 before
             );
             assert!(
-                before.contains("# TYPE loadgen_run_start counter"),
-                "loadgen_run_start should have TYPE counter"
+                before.contains("# TYPE loadgen_run_start gauge"),
+                "loadgen_run_start should have TYPE gauge (resettable on clearmetrics, #3630)"
             );
 
             // Drive a run lifecycle: start, N attempts, then complete, plus one
             // mark of each soroban.* meter and step.count.
-            LOADGEN_RUN_START.increment(1);
+            LOADGEN_RUN_START.increment(1.0);
             for _ in 0..N {
-                LOADGEN_TXN_ATTEMPTED.increment(1);
+                LOADGEN_TXN_ATTEMPTED.increment(1.0);
             }
-            LOADGEN_SOROBAN_UPLOAD.increment(1);
-            LOADGEN_SOROBAN_INVOKE.increment(1);
-            LOADGEN_SOROBAN_SETUP_INVOKE.increment(1);
-            LOADGEN_SOROBAN_SETUP_UPGRADE.increment(1);
-            LOADGEN_SOROBAN_CREATE_UPGRADE.increment(1);
-            LOADGEN_STEP_COUNT.increment(1);
-            LOADGEN_RUN_COMPLETE.increment(1);
+            LOADGEN_SOROBAN_UPLOAD.increment(1.0);
+            LOADGEN_SOROBAN_INVOKE.increment(1.0);
+            LOADGEN_SOROBAN_SETUP_INVOKE.increment(1.0);
+            LOADGEN_SOROBAN_SETUP_UPGRADE.increment(1.0);
+            LOADGEN_SOROBAN_CREATE_UPGRADE.increment(1.0);
+            LOADGEN_STEP_COUNT.increment(1.0);
+            LOADGEN_RUN_COMPLETE.increment(1.0);
 
             let after = handle.render();
             // Supercluster Success: run.start == run.complete (both 1).
@@ -2031,10 +2045,10 @@ mod tests {
             // Accumulate a non-zero value on every loadgen meter — the exact
             // scenario #3630 describes after a Supercluster step.
             for _ in 0..N {
-                LOADGEN_TXN_ATTEMPTED.increment(1);
+                LOADGEN_TXN_ATTEMPTED.increment(1.0);
             }
             for m in LOADGEN_METERS {
-                m.increment(1);
+                m.increment(1.0);
             }
 
             let before = handle.render();

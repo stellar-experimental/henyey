@@ -577,14 +577,14 @@ mod tests {
             describe_metrics();
             register_label_series();
             // Synthetic run lifecycle: start, accounts, attempts, complete.
-            LOADGEN_RUN_START.increment(1);
+            LOADGEN_RUN_START.increment(1.0);
             for _ in 0..ACCOUNTS {
-                LOADGEN_ACCOUNT_CREATED.increment(1);
+                LOADGEN_ACCOUNT_CREATED.increment(1.0);
             }
             for _ in 0..ATTEMPTED {
-                LOADGEN_TXN_ATTEMPTED.increment(1);
+                LOADGEN_TXN_ATTEMPTED.increment(1.0);
             }
-            LOADGEN_RUN_COMPLETE.increment(1);
+            LOADGEN_RUN_COMPLETE.increment(1.0);
             handle.render()
         });
 
@@ -685,8 +685,8 @@ some_unrelated_metric 7\n";
         let render = metrics::with_local_recorder(&recorder, || {
             describe_metrics();
             register_label_series();
-            LOADGEN_RUN_START.increment(1);
-            LOADGEN_RUN_COMPLETE.increment(1);
+            LOADGEN_RUN_START.increment(1.0);
+            LOADGEN_RUN_COMPLETE.increment(1.0);
             handle.render()
         });
 

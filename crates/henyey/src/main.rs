@@ -830,7 +830,7 @@ mod loadgen_runner {
             // which marks {"loadgen","run","start"} before driving the generator).
             // Supercluster's IsLoadGenComplete reads loadgen_run_start ==
             // loadgen_run_complete to detect completion (#3569).
-            henyey_app::metrics::LOADGEN_RUN_START.increment(1);
+            henyey_app::metrics::LOADGEN_RUN_START.increment(1.0);
 
             let mut config = GeneratedLoadConfig {
                 mode,
@@ -957,20 +957,20 @@ mod loadgen_runner {
                         // Parity: LoadGenerator mLoadgenComplete.Mark()
                         // (LoadGenerator.cpp:1384/1460). start==complete is
                         // supercluster's Success condition (#3569).
-                        henyey_app::metrics::LOADGEN_RUN_COMPLETE.increment(1);
+                        henyey_app::metrics::LOADGEN_RUN_COMPLETE.increment(1.0);
                         tracing::info!(submitted, "Load generation complete");
                     }
                     henyey_simulation::LoadResult::Stopped => {
                         // Parity: LoadGenerator::stop() marks mLoadgenFail
                         // (LoadGenerator.cpp:310). A stopped run is a failed run
                         // from supercluster's perspective (#3569).
-                        henyey_app::metrics::LOADGEN_RUN_FAILED.increment(1);
+                        henyey_app::metrics::LOADGEN_RUN_FAILED.increment(1.0);
                         tracing::info!("Load generation stopped");
                     }
                     henyey_simulation::LoadResult::Failed => {
                         // Parity: LoadGenerator mLoadgenFail.Mark()
                         // (LoadGenerator.cpp:565/749/1433).
-                        henyey_app::metrics::LOADGEN_RUN_FAILED.increment(1);
+                        henyey_app::metrics::LOADGEN_RUN_FAILED.increment(1.0);
                         tracing::error!("Load generation failed");
                     }
                 }
