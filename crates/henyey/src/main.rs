@@ -815,11 +815,10 @@ mod loadgen_runner {
                 )
             })?;
 
-            // PayPregenerated requires a transactions file (LoadGenerator.cpp:526).
-            if mode == LoadGenMode::PayPregenerated && request.preloaded_transactions_file.is_none()
-            {
-                return Err("PAY_PREGENERATED mode requires preloadedTransactionsFile".to_string());
-            }
+            // PayPregenerated reads from a transactions file. stellar-core defaults this
+            // path to the file written by `pregenerate-loadgen-txs` when the generateload
+            // request omits it (Supercluster relies on that default), so default it here
+            // too rather than erroring (#3629).
 
             // Atomic exclusivity gate with coupled stop-token creation.
             let (permit, stop_token) = LoadGenPermit::try_acquire(&self.state)
@@ -849,10 +848,21 @@ mod loadgen_runner {
                 n_instances: request.instances,
                 n_wasms: request.wasms,
                 min_soroban_percent_success: request.min_percent_success,
-                preloaded_transactions_file: request
-                    .preloaded_transactions_file
-                    .as_ref()
-                    .map(std::path::PathBuf::from),
+                preloaded_transactions_file: if mode == LoadGenMode::PayPregenerated {
+                    // Default to the path `pregenerate-loadgen-txs` writes (matches
+                    // stellar-core), so SSC's file-less PayPregenerated request works.
+                    Some(std::path::PathBuf::from(
+                        request
+                            .preloaded_transactions_file
+                            .clone()
+                            .unwrap_or_else(|| "stellar-load-transactions.xdr".to_string()),
+                    ))
+                } else {
+                    request
+                        .preloaded_transactions_file
+                        .as_ref()
+                        .map(std::path::PathBuf::from)
+                },
                 apply_load: LoadGenApplyLoadConfig {
                     bl_batch_size: request.apply_load_bl_batch_size,
                     bl_simulated_ledgers: request.apply_load_bl_simulated_ledgers,
