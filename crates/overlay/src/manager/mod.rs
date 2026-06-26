@@ -2506,6 +2506,41 @@ pub(crate) mod tests {
         assert!(manager.is_ok());
     }
 
+    #[test]
+    fn test_scp_channel_aggregate_can_exceed_cap_so_backstop_retained() {
+        // #3643 / #3649 KEEP-DECISION (documents WHY the #3626 backstop stays).
+        //
+        // The #3626 bounded SCP channel (8192) + try_send-drop-on-full is an
+        // intentional aggregate backstop with NO stellar-core equivalent (core
+        // processes inbound per-peer SYNCHRONOUSLY, so it has no aggregate
+        // inbound channel to bound). #3625 Phase 2 added a per-peer read
+        // throttle bounding in-flight envelopes to PEER_READING_CAPACITY (201)
+        // PER PEER — but it does NOT bound the AGGREGATE across all peers.
+        //
+        // Worst-case aggregate in-flight = max_peers × PEER_READING_CAPACITY.
+        // On mainnet max_inbound_peers=64 + max_outbound_peers≤20 = 84 peers:
+        //   84 × 201 = 16_884 > 8_192 (SCP_CHANNEL_CAPACITY).
+        //
+        // Because the aggregate EXCEEDS the channel cap, retiring the backstop
+        // (= unbounding scp_message_tx) could let a wedged consumer hold ~16.9k
+        // token-bearing envelopes — a regression versus the hard 8192 cap the
+        // deployed validator relies on against the #3582 stall / #3623 OOM. So
+        // the backstop is KEPT; retirement is operator-gated in #3649. This
+        // assertion encodes the number so any future retirement must confront it.
+        const MAX_PEERS: u64 = 64 + 20; // max_inbound + max_outbound (mainnet)
+        let per_peer = crate::flow_control::FlowControlConfig::default().peer_reading_capacity;
+        assert_eq!(per_peer, 201, "PEER_READING_CAPACITY parity (stellar-core)");
+        let worst_case_aggregate = MAX_PEERS * per_peer;
+        assert_eq!(worst_case_aggregate, 16_884, "84 × 201 = 16_884");
+        assert!(
+            worst_case_aggregate > SCP_CHANNEL_CAPACITY as u64,
+            "aggregate worst-case in-flight ({worst_case_aggregate}) exceeds the \
+             SCP channel cap ({SCP_CHANNEL_CAPACITY}); the per-peer throttle does \
+             NOT bound the aggregate, so the #3626 backstop must be retained \
+             (retirement gated to #3649)"
+        );
+    }
+
     #[tokio::test]
     async fn test_overlay_stats() {
         let config = OverlayConfig::default();
