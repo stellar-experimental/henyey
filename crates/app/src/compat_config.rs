@@ -293,17 +293,19 @@ pub fn translate_stellar_core_config(raw: &toml::Value) -> anyhow::Result<AppCon
         config.overlay.peer_port = port;
     }
     // TARGET_PEER_CONNECTIONS / MAX_ADDITIONAL_PEER_CONNECTIONS — match stellar-core
-    // overlay sizing. Core maintains up to TARGET_PEER_CONNECTIONS outbound and accepts
-    // up to TARGET_PEER_CONNECTIONS + MAX_ADDITIONAL_PEER_CONNECTIONS inbound. Without
-    // this, henyey kept its defaults (8 outbound) and could not form meshes >16 nodes.
-    let target_peer_connections = get_usize(table, "TARGET_PEER_CONNECTIONS");
-    if let Some(target) = target_peer_connections {
+    // overlay sizing. Core sizes its outbound authenticated accept cap to
+    // TARGET_PEER_CONNECTIONS and its inbound authenticated accept cap to
+    // MAX_ADDITIONAL_PEER_CONNECTIONS alone (OverlayManagerImpl.cpp:319-323; the cap is
+    // enforced in acceptAuthenticatedPeer as mAuthenticated.size() < mMaxAuthenticatedCount).
+    // The TARGET+ADDITIONAL sum (Config.cpp:2204-2205) is totalAuthenticatedConnections,
+    // used only for fd/pending-connection budgeting — it is NOT the inbound accept limit.
+    // Without this, henyey kept its defaults (8 outbound) and could not form meshes >16 nodes.
+    if let Some(target) = get_usize(table, "TARGET_PEER_CONNECTIONS") {
         config.overlay.max_outbound_peers = target;
         config.overlay.target_outbound_peers = target;
     }
     if let Some(additional) = get_usize(table, "MAX_ADDITIONAL_PEER_CONNECTIONS") {
-        let target = target_peer_connections.unwrap_or(config.overlay.target_outbound_peers);
-        config.overlay.max_inbound_peers = target + additional;
+        config.overlay.max_inbound_peers = additional;
     }
     if let Some(peers) = get_string_array(table, "KNOWN_PEERS")
         .map_err(|e| anyhow::anyhow!("Compat config error: {}", e))?
