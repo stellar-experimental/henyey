@@ -92,3 +92,57 @@ Five drop-in/parity bugs were found and fixed to make henyey runnable and honest
 ## Baseline statement
 
 **As of 2026-06-26, on a single nsc 32x64 VM under canonical MissionMaxTPSClassic, stellar-core sustains 1533 tx/s and henyey sustains 196 tx/s (~7.8× gap).** Henyey's figure is a lower bound pending #3638. Use these as the reference point for tracking henyey's throughput progress toward core parity.
+
+---
+
+## #3638 pacing-fix re-test (2026-06-26)
+
+After the loadgen pacing fix (#3638, merged via PR #3644 "Pace loadgen on submit attempts, fail run on PayPregenerated reject") landed on `main`, we rebuilt henyey (`nscr.io/k4jkul01t5rr0/henyey:ssc-fix6`, latest `origin/main`) and re-ran on a fresh nsc 32×64 VM.
+
+**Headline:** henyey max **196 → 221 tx/s (+12.8%)**. Core unchanged at 1533, so the gap narrows from ~7.8× to **~6.9×**.
+
+The pacing fix did what it should: at every step the loadgen now submits at the offered rate (no more ~6.7× over-submission runaway), so failures are honest apply-side failures rather than submission-side blowups. But the lift is modest — the **dominant limiter is apply-side / consensus throughput, not loadgen pacing**. Henyey simply cannot absorb more than ~221 tx/s on this topology regardless of how the load is offered.
+
+### Method note
+
+Step 200 was first confirmed under the canonical profile (`middle*1000`, ~16.7 min), then — since the short-probe (`middle*300`, ~5 min/step) tracked canonical within ~2% in the original baseline (core 1531 short vs 1533 canonical) — the rest of the search used the quick short-probe over `[200,1600]` for speed. Same VM, topology, flags (`--install-network-delay false`, `--core-http-via-pod-exec`, PayPregenerated, genesis 23000).
+
+### Per-step results — converged at **221**
+
+| tx rate | result |
+|--------:|--------|
+| 200 | ✅ pass (canonical) |
+| 221 | ✅ pass |
+| 226 | ❌ fail |
+| 232 | ❌ fail |
+| 243 | ❌ fail |
+| 287 | ❌ fail |
+| 375 | ❌ fail |
+| 550 | ❌ fail |
+| 900 | ❌ fail |
+
+**Henyey post-#3638 max = 221 tx/s.**
+
+### Fast-fail timing (for shortening future test runs)
+
+Per-step wall-clock was very stable and reveals where time is wasted:
+
+| step type | duration | structure |
+|-----------|----------|-----------|
+| **passing** | **~5.5 min** | ~5 min load window, completes promptly |
+| **failing** | **~7.5 min** | ~5 min load window **+ ~2.5 min completion-wait tail** before the verdict |
+
+Measured failing steps: 900 → 7m32s, 550 → 7m30s, 375 → 7m27s, 287 → 7m30s, 243 → 7m31s, 232 → 7m26s. Passing 221 → 5m39s.
+
+Two structural facts:
+
+1. **The load window is fixed-duration.** With `txs = rate × N`, the loadgen offers for `rate×N / rate = N` seconds regardless of the rate — so every step pays the same ~5 min offer window. Raising the rate does *not* shorten the step.
+2. **Failures surface only at the very end.** A failing step offers its full load, the applied counter plateaus at "100% submitted", then the loadgen waits ~2.5 min for on-ledger completion, times out, and only then reports failure (which the harness sees on its next poll).
+
+But the failure is **apply-side and visible early**: when the offered rate exceeds capacity, applied-transactions-per-ledger falls below the offered rate within a few ledger closes (~15–30 s). A **fast-fail signal that watches applied-per-ledger vs offered rate** (or ledger fill % vs expected) could abort a doomed step in well under a minute instead of ~7.5 min.
+
+Cheapest immediate win: **cut the ~2.5 min completion-wait tail** on failing steps — it is pure dead time after the offer window, and on a binary search dominated by failures (7 of 9 steps here) it accounts for ~17 min of the ~75 min run. A true early-abort on the apply-divergence signal would save far more (most of the 5 min offer window too).
+
+### Caveats (unchanged)
+
+Single contended VM, no network delay — not pubnet-representative. The 221 figure is now a *clean* apply-side ceiling (no longer depressed by #3638), and the remaining ~6.9× gap to core is the real serial/consensus throughput work to investigate.
