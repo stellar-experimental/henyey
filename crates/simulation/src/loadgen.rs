@@ -1637,7 +1637,7 @@ impl LoadGenerator {
 
             // One step per loop iteration (parity: stellar-core
             // LoadGenerator::getTxPerStep() mStepMeter.Mark(), LoadGenerator.cpp:211).
-            app_metrics::LOADGEN_STEP_COUNT.increment(1);
+            app_metrics::LOADGEN_STEP_COUNT.increment(1.0);
 
             // Check if all transactions for the current phase are submitted
             if !config.are_txs_remaining() {
@@ -2080,13 +2080,13 @@ impl LoadGenerator {
             // (stellar-core LoadGenerator.cpp:874).
             if config.mode == LoadGenMode::PayPregenerated {
                 if !matches!(result, TxQueueResult::Added) {
-                    app_metrics::LOADGEN_TXN_REJECTED.increment(1);
+                    app_metrics::LOADGEN_TXN_REJECTED.increment(1.0);
                 }
                 return matches!(result, TxQueueResult::Added);
             }
 
             if !matches!(result, TxQueueResult::Added) {
-                app_metrics::LOADGEN_TXN_REJECTED.increment(1);
+                app_metrics::LOADGEN_TXN_REJECTED.increment(1.0);
             }
 
             // `txBAD_SEQ` and `QueueFull`/`TryAgainLater` retries each consume
@@ -2751,41 +2751,42 @@ fn mark_tx_meters(mode: LoadGenMode, env: &TransactionEnvelope) {
     let xdr_size = envelope_xdr_size(env);
     match mode {
         LoadGenMode::Pay | LoadGenMode::PayPregenerated => {
-            app_metrics::LOADGEN_PAYMENT_SUBMITTED.increment(envelope_num_operations(env));
-            app_metrics::LOADGEN_PAYMENT_BYTES.increment(xdr_size);
+            app_metrics::LOADGEN_PAYMENT_SUBMITTED.increment(envelope_num_operations(env) as f64);
+            app_metrics::LOADGEN_PAYMENT_BYTES.increment(xdr_size as f64);
         }
         LoadGenMode::SorobanUpload => {
-            app_metrics::LOADGEN_SOROBAN_UPLOAD.increment(1);
+            app_metrics::LOADGEN_SOROBAN_UPLOAD.increment(1.0);
         }
         LoadGenMode::SorobanInvokeSetup => {
-            app_metrics::LOADGEN_SOROBAN_SETUP_INVOKE.increment(1);
+            app_metrics::LOADGEN_SOROBAN_SETUP_INVOKE.increment(1.0);
         }
         LoadGenMode::SorobanUpgradeSetup => {
-            app_metrics::LOADGEN_SOROBAN_SETUP_UPGRADE.increment(1);
+            app_metrics::LOADGEN_SOROBAN_SETUP_UPGRADE.increment(1.0);
         }
         LoadGenMode::SorobanInvoke | LoadGenMode::SorobanInvokeApplyLoad => {
-            app_metrics::LOADGEN_SOROBAN_INVOKE.increment(1);
+            app_metrics::LOADGEN_SOROBAN_INVOKE.increment(1.0);
         }
         LoadGenMode::SorobanCreateUpgrade => {
-            app_metrics::LOADGEN_SOROBAN_CREATE_UPGRADE.increment(1);
+            app_metrics::LOADGEN_SOROBAN_CREATE_UPGRADE.increment(1.0);
         }
         LoadGenMode::MixedClassicSoroban => {
             // Sub-mode is decided per-tx; classify by inspecting the built tx
             // (parity: core's execute() switch on mLastMixedMode, equivalently
             // the MIXED_PREGEN_* isSoroban() branch).
             if envelope_is_soroban(env) {
-                app_metrics::LOADGEN_SOROBAN_INVOKE.increment(1);
+                app_metrics::LOADGEN_SOROBAN_INVOKE.increment(1.0);
             } else {
-                app_metrics::LOADGEN_PAYMENT_SUBMITTED.increment(envelope_num_operations(env));
-                app_metrics::LOADGEN_PAYMENT_BYTES.increment(xdr_size);
+                app_metrics::LOADGEN_PAYMENT_SUBMITTED
+                    .increment(envelope_num_operations(env) as f64);
+                app_metrics::LOADGEN_PAYMENT_BYTES.increment(xdr_size as f64);
             }
         }
     }
 
     // Per-tx attempt + bytes (parity: txm.mTxnAttempted.Mark() +
     // txm.mTxnBytes.Mark(...) at the end of execute()).
-    app_metrics::LOADGEN_TXN_ATTEMPTED.increment(1);
-    app_metrics::LOADGEN_TXN_BYTES.increment(xdr_size);
+    app_metrics::LOADGEN_TXN_ATTEMPTED.increment(1.0);
+    app_metrics::LOADGEN_TXN_BYTES.increment(xdr_size as f64);
 }
 
 fn envelope_seq_num(env: &TransactionEnvelope) -> i64 {

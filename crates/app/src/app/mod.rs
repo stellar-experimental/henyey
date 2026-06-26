@@ -2831,9 +2831,19 @@ impl App {
         } else {
             tracing::info!(domain = %domain, "Clearing metrics for domain");
         }
-        // Note: Prometheus-style metrics don't have a clear operation.
-        // The metrics are scraped externally and typically reset on node restart.
-        // We log the request for operational visibility and parity with stellar-core.
+        // Most Prometheus-style counters are scraped externally and reset on
+        // node restart, so a general clear is a no-op. The loadgen counters are
+        // the exception: stellar-core's medida meters are resettable, and
+        // Supercluster's max-TPS / min-block-time binary search calls
+        // `clearmetrics` before EVERY step and then reads the loadgen meters per
+        // run. Without resetting them here, (a) the `loadgen_txn_attempted`
+        // progress counter accumulates across steps (misleading X/Y display),
+        // and (b) `loadgen_run_failed` from a failed step lingers, so every
+        // subsequent step's `IsLoadGenComplete` reads Failure and the search
+        // converges wrong. Reset the loadgen domain to match core. (#3630)
+        if domain.is_empty() || domain.eq_ignore_ascii_case("loadgen") {
+            crate::metrics::reset_loadgen_meters();
+        }
     }
 
     /// Perform manual database maintenance.
