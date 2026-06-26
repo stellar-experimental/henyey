@@ -260,7 +260,14 @@ impl LedgerCloseFinalizer {
 }
 
 /// Type alias for the boxed persist write function.
-type PersistWriteFn = Box<dyn FnOnce(&Database) -> anyhow::Result<()> + Send>;
+///
+/// `Fn` (not `FnOnce`) so the ledger-close commit can be re-invoked by the
+/// bounded retry-with-backoff on a transient SQLite busy (#3640). The
+/// production closure (`move |db| data.serialize_and_write_to_db(db)`) only
+/// borrows its captured `data` via `&self`, so it is naturally re-callable; the
+/// underlying commit is a single atomic SQLite transaction (all-or-nothing), so
+/// re-running it after a busy that never committed is safe.
+type PersistWriteFn = Box<dyn Fn(&Database) -> anyhow::Result<()> + Send>;
 
 /// Describes the work to be done by a persist task.
 ///
@@ -330,10 +337,18 @@ impl PersistJob {
             } => {
                 flush_bucket_persist_sync(&ledger_manager, &shutdown);
 
-                if let Err(e) = data.write_to_db(&db) {
-                    // #3497: a transient SQLite busy/locked routes to a clean
-                    // recoverable shutdown (no wipe); everything else aborts.
-                    handle_db_persist_error("catchup DB write", &e, &shutdown);
+                // #3640: bounded retry-with-backoff around the commit so a
+                // *transient* SQLite busy/locked is retried briefly before
+                // escalating. #3497: a persistent transient busy still routes
+                // to a clean recoverable shutdown (no wipe); a non-transient
+                // error aborts immediately (no retry consumed).
+                if let PersistOutcome::Fatal(e) = commit_with_busy_retry(
+                    "catchup DB write",
+                    || data.write_to_db(&db),
+                    is_transient_db_busy,
+                    &shutdown,
+                ) {
+                    fatal_persist_error("catchup DB write", &e);
                 }
 
                 tracing::info!(ledger_seq, "Catchup persist completed");
@@ -361,12 +376,20 @@ impl PersistJob {
                 // the single atomic SQLite transaction that co-writes header,
                 // HAS, and LCL (the INV-L13 agreement guarantee). Ordering is
                 // unchanged by #3066; this comment is traceability only.
-                if let Err(e) = write_fn(&db) {
-                    // #3497: `write_fn` returns anyhow, but `db.transaction(..)?`
-                    // preserves the typed `DbError` through `From`, so a transient
-                    // SQLite busy/locked is recoverable via downcast → clean,
-                    // no-wipe shutdown; everything else aborts (unchanged).
-                    handle_db_persist_error_anyhow("ledger close DB write", &e, &shutdown);
+                // #3640: bounded retry-with-backoff around the commit (see
+                // `commit_with_busy_retry`). #3497: `write_fn` returns anyhow,
+                // but `db.transaction(..)?` preserves the typed `DbError`
+                // through `From`, so a transient SQLite busy/locked is
+                // recoverable via downcast → retry, then clean no-wipe shutdown
+                // on budget exhaustion; a non-transient error aborts (unchanged,
+                // no retry consumed).
+                if let PersistOutcome::Fatal(e) = commit_with_busy_retry(
+                    "ledger close DB write",
+                    || write_fn(&db),
+                    is_transient_db_busy_anyhow,
+                    &shutdown,
+                ) {
+                    fatal_persist_error("ledger close DB write", &e);
                 }
 
                 // LedgerCloseMeta for RPC (non-fatal).
@@ -546,35 +569,169 @@ fn is_transient_db_busy_anyhow(error: &anyhow::Error) -> bool {
         .is_some_and(is_transient_db_busy)
 }
 
-/// Route a typed-`DbError` persist failure to the correct shutdown path (#3497).
+/// Bounded retry policy for a consensus-critical persist DB commit (#3640).
 ///
-/// A transient SQLite busy/locked ([`is_transient_db_busy`]) → clean,
-/// no-wipe recoverable shutdown (the txn never committed; restart recovers).
-/// Everything else → the unchanged fatal `abort()`+wipe path. This is the
-/// DB-write sibling of [`handle_persist_error`] (the #3478 bucket-IO split).
-fn handle_db_persist_error(
-    context: &str,
-    error: &henyey_db::DbError,
-    shutdown: &RecoverableShutdownHandle,
-) {
-    if is_transient_db_busy(error) {
-        shutdown.trigger(context, error);
-    } else {
-        fatal_persist_error(context, error);
+/// Total attempts: 1 initial + 3 retries = `MAX_PERSIST_ATTEMPTS`.
+const MAX_PERSIST_ATTEMPTS: u32 = 4;
+
+/// Backoff sleeps *between* attempts (so `MAX_PERSIST_ATTEMPTS - 1` entries).
+/// 50ms / 200ms / 500ms — total added backoff ≈ 0.75s in the persistent case.
+const PERSIST_RETRY_BACKOFF: [std::time::Duration; (MAX_PERSIST_ATTEMPTS - 1) as usize] = [
+    std::time::Duration::from_millis(50),
+    std::time::Duration::from_millis(200),
+    std::time::Duration::from_millis(500),
+];
+
+/// Outcome of [`commit_with_busy_retry`] — lets the caller route the
+/// non-transient (fatal) case to [`fatal_persist_error`] WITHOUT the retry
+/// helper itself calling `abort()`, which keeps the loop unit-testable.
+#[derive(Debug)]
+enum PersistOutcome<E> {
+    /// The commit succeeded (possibly after one or more retries).
+    Survived,
+    /// A transient busy persisted past the retry bound; the recoverable
+    /// shutdown was already signalled by this helper.
+    RecoverableShutdown,
+    /// The error is NOT a transient busy — the caller must route this to
+    /// [`fatal_persist_error`] (the helper never aborts).
+    Fatal(E),
+}
+
+/// Render the SQLite extended error code from a typed [`henyey_db::DbError`],
+/// for the retry/shutdown diagnostic log line (#3640). Distinguishes
+/// `SQLITE_BUSY` (5) / `SQLITE_BUSY_SNAPSHOT` (517) / `SQLITE_LOCKED` (6) so the
+/// next incident captures the exact class. Returns `None` for non-SQLite errors.
+fn sqlite_extended_code(error: &henyey_db::DbError) -> Option<i32> {
+    match error {
+        henyey_db::DbError::Sqlite(rusqlite::Error::SqliteFailure(e, _)) => Some(e.extended_code),
+        _ => None,
     }
 }
 
-/// `&anyhow::Error` sibling of [`handle_db_persist_error`] for the ledger-close
-/// write path, whose `write_fn` returns `anyhow::Result<()>` (#3497).
-fn handle_db_persist_error_anyhow(
+/// `anyhow` sibling of [`sqlite_extended_code`] (ledger-close `write_fn` path).
+fn sqlite_extended_code_anyhow(error: &anyhow::Error) -> Option<i32> {
+    error
+        .downcast_ref::<henyey_db::DbError>()
+        .and_then(sqlite_extended_code)
+}
+
+/// Bounded retry-with-backoff around a consensus-critical persist DB commit
+/// (#3640).
+///
+/// A *transient* `SQLITE_BUSY`/`database is locked` on the ledger-close (or
+/// catchup) commit must not instantly halt the node: this wrapper retries the
+/// commit up to [`MAX_PERSIST_ATTEMPTS`] times with [`PERSIST_RETRY_BACKOFF`]
+/// sleeps before falling back to the existing clean recoverable shutdown
+/// (#3497, no wipe). Classification is delegated to `is_transient` (the
+/// existing [`is_transient_db_busy`] / [`is_transient_db_busy_anyhow`] gates),
+/// so genuine corruption can NEVER be retried into a wipe-deferral — a
+/// non-transient error short-circuits to [`PersistOutcome::Fatal`] after a
+/// single attempt for the caller to route to [`fatal_persist_error`].
+///
+/// ## Threading / latency
+///
+/// The ONLY caller is [`PersistJob::run_blocking`], which runs on the
+/// `spawn_blocking` persist thread (`spawn_persist_task`), NOT the event loop —
+/// so the blocking `std::thread::sleep` backoff is safe and never freezes the
+/// `select!` loop. The next ledger close is already gated on persist
+/// completion, so the small added latency only delays the (already-failing)
+/// close; it reorders nothing.
+///
+/// Each attempt internally waits up to SQLite `busy_timeout=30s`, so a transient
+/// spike that clears in <1s succeeds on attempt 2 with ~50ms added (the common
+/// case). A *persistent* busy stalls ≈ 4×30s + 0.75s ≈ 120s before the clean
+/// shutdown — the deliberate, accepted worst case (the node was going to shut
+/// down anyway; we trade ≤2min for surviving the far-more-common transient
+/// spike). This effective tolerance (~120s) is intentionally far beyond
+/// stellar-core's single 10s `busy_timeout` window: henyey is deliberately more
+/// graceful (core simply crashes on busy_timeout exhaustion) and this divergence
+/// is consensus-neutral (it changes only failure-handling).
+///
+/// ## Deliberate exclusion
+///
+/// Only the two persist commits that gate consensus continuation
+/// (ledger-close + catchup) are retried. The publish-queue dequeue
+/// (`remove_publish`, warn-only) and the SCP tx-set purge (best-effort) are
+/// intentionally NOT retried — they do not halt consensus.
+fn commit_with_busy_retry<E: std::fmt::Display>(
     context: &str,
-    error: &anyhow::Error,
+    mut attempt: impl FnMut() -> Result<(), E>,
+    is_transient: impl Fn(&E) -> bool,
     shutdown: &RecoverableShutdownHandle,
-) {
-    if is_transient_db_busy_anyhow(error) {
-        shutdown.trigger(context, error);
-    } else {
-        fatal_persist_error(context, error);
+) -> PersistOutcome<E>
+where
+    E: ExtendedSqliteCode,
+{
+    for n in 1..=MAX_PERSIST_ATTEMPTS {
+        match attempt() {
+            Ok(()) => {
+                if n > 1 {
+                    tracing::info!(
+                        context,
+                        attempt = n,
+                        "Persist DB commit succeeded after retrying a transient SQLite busy"
+                    );
+                }
+                return PersistOutcome::Survived;
+            }
+            Err(e) => {
+                if !is_transient(&e) {
+                    // Non-transient (corruption/integrity/non-free-space IO):
+                    // never retried — hand back to the caller for the fatal path.
+                    return PersistOutcome::Fatal(e);
+                }
+                if n < MAX_PERSIST_ATTEMPTS {
+                    crate::metrics::DB_BUSY_RETRY_TOTAL.increment(1);
+                    let backoff = PERSIST_RETRY_BACKOFF[(n - 1) as usize];
+                    tracing::warn!(
+                        context,
+                        attempt = n,
+                        max_attempts = MAX_PERSIST_ATTEMPTS,
+                        extended_code = e.extended_sqlite_code(),
+                        backoff_ms = backoff.as_millis() as u64,
+                        error = %e,
+                        "Transient SQLite busy on persist DB commit; retrying after backoff"
+                    );
+                    std::thread::sleep(backoff);
+                } else {
+                    // Budget exhausted on a persistent busy → existing clean
+                    // recoverable shutdown (no wipe). Log the extended error
+                    // code (BUSY 5 / BUSY_SNAPSHOT 517 / LOCKED 6) for
+                    // next-incident diagnosis (#3640).
+                    tracing::error!(
+                        context,
+                        attempts = MAX_PERSIST_ATTEMPTS,
+                        extended_code = e.extended_sqlite_code(),
+                        error = %e,
+                        "Persistent SQLite busy on persist DB commit after exhausting \
+                         the bounded retry budget; escalating to recoverable shutdown"
+                    );
+                    shutdown.trigger(context, &e);
+                    return PersistOutcome::RecoverableShutdown;
+                }
+            }
+        }
+    }
+    // Unreachable: the loop always returns inside the final iteration.
+    unreachable!("retry loop must return within MAX_PERSIST_ATTEMPTS");
+}
+
+/// Lets [`commit_with_busy_retry`] render the SQLite extended error code
+/// uniformly across the typed-`DbError` and `anyhow` commit paths.
+trait ExtendedSqliteCode {
+    /// The SQLite extended error code, or `-1` if not a SQLite error.
+    fn extended_sqlite_code(&self) -> i32;
+}
+
+impl ExtendedSqliteCode for henyey_db::DbError {
+    fn extended_sqlite_code(&self) -> i32 {
+        sqlite_extended_code(self).unwrap_or(-1)
+    }
+}
+
+impl ExtendedSqliteCode for anyhow::Error {
+    fn extended_sqlite_code(&self) -> i32 {
+        sqlite_extended_code_anyhow(self).unwrap_or(-1)
     }
 }
 
@@ -699,11 +856,24 @@ mod tests {
             "DatabaseBusy must be classified transient"
         );
 
-        // handle_db_persist_error must NOT abort for a transient busy error;
-        // it must signal a clean shutdown. (If it aborted, the test process
+        // The retry helper must NOT abort for a transient busy error; on a
+        // persistent busy it must escalate to a clean recoverable shutdown
+        // after exhausting the retry budget. (If it aborted, the test process
         // would die.)
-        handle_db_persist_error("ledger close DB write", &busy, &shutdown);
+        let outcome = commit_with_busy_retry(
+            "ledger close DB write",
+            || {
+                Err(db_sqlite_error(
+                    rusqlite::ffi::ErrorCode::DatabaseBusy,
+                    5,
+                    "database is locked",
+                ))
+            },
+            is_transient_db_busy,
+            &shutdown,
+        );
 
+        assert!(matches!(outcome, PersistOutcome::RecoverableShutdown));
         assert!(
             rx.try_recv().is_ok(),
             "transient DB-busy persist error must trigger a clean recoverable shutdown signal"
@@ -749,8 +919,20 @@ mod tests {
             "anyhow-wrapped DatabaseBusy must be recovered via downcast and classified transient"
         );
 
-        handle_db_persist_error_anyhow("ledger close DB write", &anyhow_err, &shutdown);
+        let outcome = commit_with_busy_retry(
+            "ledger close DB write",
+            || -> Result<(), anyhow::Error> {
+                Err(anyhow::Error::new(db_sqlite_error(
+                    rusqlite::ffi::ErrorCode::DatabaseBusy,
+                    5,
+                    "database is locked",
+                )))
+            },
+            is_transient_db_busy_anyhow,
+            &shutdown,
+        );
 
+        assert!(matches!(outcome, PersistOutcome::RecoverableShutdown));
         assert!(
             rx.try_recv().is_ok(),
             "transient DB-busy via anyhow downcast must trigger a clean recoverable shutdown"
@@ -799,6 +981,169 @@ mod tests {
         assert!(
             !is_transient_db_busy_anyhow(&other),
             "non-DbError anyhow error must NOT be classified transient (stays fatal)"
+        );
+    }
+
+    use std::cell::Cell;
+
+    /// #3640 (1): a transient `SQLITE_BUSY` that clears within the retry
+    /// window must cause the persist commit to RETRY and SURVIVE — no
+    /// shutdown signal is sent. FAILS on `origin/main`: no retry helper
+    /// exists, so the first BUSY routes straight to `shutdown.trigger`.
+    #[test]
+    fn transient_db_busy_retries_then_survives_3640() {
+        let (tx, mut rx) = tokio::sync::broadcast::channel(1);
+        let shutdown = RecoverableShutdownHandle::new(tx);
+
+        // Busy on attempt 1 and 2, Ok on attempt 3.
+        let calls = Cell::new(0u32);
+        let attempt = || {
+            let n = calls.get() + 1;
+            calls.set(n);
+            if n < 3 {
+                Err(db_sqlite_error(
+                    rusqlite::ffi::ErrorCode::DatabaseBusy,
+                    5,
+                    "database is locked",
+                ))
+            } else {
+                Ok(())
+            }
+        };
+
+        let outcome = commit_with_busy_retry(
+            "test ledger close DB write",
+            attempt,
+            is_transient_db_busy,
+            &shutdown,
+        );
+
+        assert!(
+            matches!(outcome, PersistOutcome::Survived),
+            "a transient busy that clears in-window must survive"
+        );
+        assert_eq!(calls.get(), 3, "must retry until the busy clears (3 calls)");
+        assert!(
+            rx.try_recv().is_err(),
+            "no recoverable-shutdown signal must be sent when the retry succeeds"
+        );
+    }
+
+    /// #3640 (4): the anyhow-typed path (ledger-close `write_fn` arm) must
+    /// also retry a transient busy and survive. FAILS on main (no helper).
+    #[test]
+    fn transient_db_busy_via_anyhow_retries_then_survives_3640() {
+        let (tx, mut rx) = tokio::sync::broadcast::channel(1);
+        let shutdown = RecoverableShutdownHandle::new(tx);
+
+        let calls = Cell::new(0u32);
+        let attempt = || -> Result<(), anyhow::Error> {
+            let n = calls.get() + 1;
+            calls.set(n);
+            if n < 2 {
+                Err(anyhow::Error::new(db_sqlite_error(
+                    rusqlite::ffi::ErrorCode::DatabaseBusy,
+                    5,
+                    "database is locked",
+                )))
+            } else {
+                Ok(())
+            }
+        };
+
+        let outcome = commit_with_busy_retry(
+            "test ledger close DB write (anyhow)",
+            attempt,
+            is_transient_db_busy_anyhow,
+            &shutdown,
+        );
+
+        assert!(matches!(outcome, PersistOutcome::Survived));
+        assert_eq!(calls.get(), 2, "must retry once then succeed");
+        assert!(rx.try_recv().is_err(), "no shutdown signal on success");
+    }
+
+    /// #3640 (2): a PERSISTENT busy that never clears must exhaust the
+    /// bounded retry budget (`MAX_PERSIST_ATTEMPTS` calls), then escalate to
+    /// the existing clean recoverable shutdown — NOT the fatal/abort path.
+    /// FAILS on main (no attempt-bound concept exists).
+    #[test]
+    fn transient_db_busy_exhausts_retries_then_recoverable_shutdown_3640() {
+        let (tx, mut rx) = tokio::sync::broadcast::channel(1);
+        let shutdown = RecoverableShutdownHandle::new(tx);
+
+        let calls = Cell::new(0u32);
+        let attempt = || {
+            calls.set(calls.get() + 1);
+            Err(db_sqlite_error(
+                rusqlite::ffi::ErrorCode::DatabaseBusy,
+                5,
+                "database is locked",
+            ))
+        };
+
+        let outcome = commit_with_busy_retry(
+            "test ledger close DB write",
+            attempt,
+            is_transient_db_busy,
+            &shutdown,
+        );
+
+        assert!(
+            matches!(outcome, PersistOutcome::RecoverableShutdown),
+            "a persistent busy past the bound must escalate to recoverable shutdown"
+        );
+        assert_eq!(
+            calls.get(),
+            MAX_PERSIST_ATTEMPTS,
+            "must try exactly MAX_PERSIST_ATTEMPTS times before escalating"
+        );
+        assert!(
+            rx.try_recv().is_ok(),
+            "a recoverable-shutdown signal must be sent after the budget is exhausted"
+        );
+    }
+
+    /// #3640 (3): a NON-transient DB error (corruption/integrity) must NOT
+    /// consume any retry — it is classified non-transient and returns the
+    /// `Fatal` outcome after exactly ONE call, for the caller to route to
+    /// `fatal_persist_error`. The test asserts on call-count + outcome
+    /// WITHOUT invoking the real `fatal_persist_error` (which would abort),
+    /// mirroring `corruption_db_persist_error_stays_fatal_3497`.
+    #[test]
+    fn non_transient_db_error_does_not_retry_3640() {
+        let (tx, mut rx) = tokio::sync::broadcast::channel(1);
+        let shutdown = RecoverableShutdownHandle::new(tx);
+
+        let calls = Cell::new(0u32);
+        let attempt = || {
+            calls.set(calls.get() + 1);
+            Err(db_sqlite_error(
+                rusqlite::ffi::ErrorCode::DatabaseCorrupt,
+                11,
+                "database disk image is malformed",
+            ))
+        };
+
+        let outcome = commit_with_busy_retry(
+            "test ledger close DB write",
+            attempt,
+            is_transient_db_busy,
+            &shutdown,
+        );
+
+        match outcome {
+            PersistOutcome::Fatal(_) => {}
+            other => panic!("non-transient error must yield Fatal, got {other:?}"),
+        }
+        assert_eq!(
+            calls.get(),
+            1,
+            "a non-transient error must NOT consume any retry (exactly one call)"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "no recoverable-shutdown signal must be sent for a non-transient (fatal) error"
         );
     }
 
