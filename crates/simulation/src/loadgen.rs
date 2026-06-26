@@ -74,6 +74,16 @@ const TX_SUBMIT_MAX_TRIES: u32 = 10;
 /// own `WaitForLoadGenComplete` timeout governs the overall run.
 const QUEUE_FULL_MAX_TRIES: u32 = 6000;
 
+/// Ledger budget for `wait_till_complete`: after the loadgen has submitted all
+/// its txns, it waits this many ledgers for them to apply on-ledger before
+/// declaring the run failed.
+///
+/// PARITY: must match stellar-core `LoadGenerator::TIMEOUT_NUM_LEDGERS`
+/// (`LoadGenerator.cpp:73` = 20 in v27.0.0). henyey previously used 30, which
+/// inflated the completion-wait tail of every failing max-TPS step by ~50%
+/// (10 extra ledgers ≈ 50 s at a ~5 s close time) and diverged from core (#3656).
+const WAIT_TILL_COMPLETE_TIMEOUT_NUM_LEDGERS: u32 = 20;
+
 /// Decision for how `submit_tx` should react to a single
 /// [`TxQueueResult`]. Factored out of `submit_tx`'s inner loop as a pure
 /// function ([`classify_submit_result`]) so the branching can be unit-tested
@@ -241,7 +251,7 @@ enum WaitAction {
 /// poll loop should do.
 ///
 /// Parity: stellar-core `waitTillComplete` marks `mLoadgenFail`
-/// UNCONDITIONALLY on the 30-ledger timeout via `emitFailure(!sorobanIsDone)`
+/// UNCONDITIONALLY on the 20-ledger timeout via `emitFailure(!sorobanIsDone)`
 /// (`LoadGenerator.cpp:1399-1404` calls emitFailure; `:1430-1433` marks the
 /// fail meter regardless of the arg). The completion branch (`accounts_synced
 /// && soroban_synced`) returns first, so [`WaitAction::Fail`] is reached only
@@ -1920,7 +1930,8 @@ impl LoadGenerator {
     /// Parity: stellar-core `LoadGenerator::waitTillComplete()`
     /// (`src/simulation/LoadGenerator.cpp:1345`) gates completion on BOTH
     /// `checkAccountSynced().empty()` AND `checkSorobanStateSynced(cfg).empty()`
-    /// each ledger, timing out after `TIMEOUT_NUM_LEDGERS`. The Soroban-state
+    /// each ledger, timing out after `WAIT_TILL_COMPLETE_TIMEOUT_NUM_LEDGERS`.
+    /// The Soroban-state
     /// gate is load-bearing for the create_upgrade flow (#3602): under the
     /// genesis `MinimumSorobanNetworkConfig` (`ledgerMaxTxCount = 1`,
     /// `ledgerMaxInstructions = 2_500_000`) the upgrade-setup `create_contract`
@@ -1937,7 +1948,6 @@ impl LoadGenerator {
     /// mission fails fast and is retried, rather than silently proceeding to a
     /// create_upgrade that can never resolve.
     async fn wait_till_complete(&mut self, config: &GeneratedLoadConfig) {
-        const TIMEOUT_NUM_LEDGERS: u32 = 30;
         let check_soroban = config.mode.is_soroban_setup();
         let start_ledger = self.tx_generator.app.current_ledger_seq();
         loop {
@@ -1948,12 +1958,12 @@ impl LoadGenerator {
                 .app
                 .current_ledger_seq()
                 .saturating_sub(start_ledger);
-            let timed_out = elapsed >= TIMEOUT_NUM_LEDGERS;
+            let timed_out = elapsed >= WAIT_TILL_COMPLETE_TIMEOUT_NUM_LEDGERS;
             match wait_till_complete_decision(accounts_synced, soroban_synced, timed_out) {
                 WaitAction::Complete => return,
                 WaitAction::Fail => {
                     warn!(
-                        timeout_ledgers = TIMEOUT_NUM_LEDGERS,
+                        timeout_ledgers = WAIT_TILL_COMPLETE_TIMEOUT_NUM_LEDGERS,
                         accounts_synced,
                         soroban_synced,
                         "loadgen wait-till-complete timed out; some submitted txns \
@@ -3700,7 +3710,7 @@ mod tests {
 
     // ---------------------------------------------------------------------
     // #3639: the classic Pay/PayPregenerated path must FAIL the run on the
-    // 30-ledger `wait_till_complete` timeout (parity with stellar-core's
+    // 20-ledger `wait_till_complete` timeout (parity with stellar-core's
     // unconditional `emitFailure`), not silently report success. These tests
     // drive the pure `wait_till_complete_decision` helper (the decision),
     // since the loop awaits a real `App`. FAILS on origin/main: the helper
@@ -3779,6 +3789,21 @@ mod tests {
         assert_eq!(
             wait_till_complete_decision(false, false, true),
             WaitAction::Fail,
+        );
+    }
+
+    /// #3656 parity guard: the `wait_till_complete` ledger budget MUST equal
+    /// stellar-core's `LoadGenerator::TIMEOUT_NUM_LEDGERS = 20`
+    /// (`LoadGenerator.cpp:73`, v27.0.0). henyey previously hardcoded 30, which
+    /// diverged from core and inflated the completion-wait tail of every failing
+    /// max-TPS step by ~50%. This assertion FAILS at 30 and guards against
+    /// re-introducing a non-parity value.
+    #[test]
+    fn test_wait_till_complete_timeout_matches_core_parity() {
+        assert_eq!(
+            WAIT_TILL_COMPLETE_TIMEOUT_NUM_LEDGERS, 20,
+            "wait_till_complete ledger budget must match stellar-core \
+             TIMEOUT_NUM_LEDGERS = 20 (LoadGenerator.cpp:73)"
         );
     }
 }
