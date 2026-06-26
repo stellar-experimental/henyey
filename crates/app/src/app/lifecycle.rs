@@ -1757,6 +1757,10 @@ impl App {
                         self.record_tx_pull_latency(tx_hash, &msg.from_peer).await;
                         // No explicit advert enqueue — flush_tx_adverts() reads
                         // the herder queue in priority order each flood period.
+                        // This matches stellar-core: TransactionQueue::broadcast(false)
+                        // on receipt does NOT broadcast immediately, it only arms the
+                        // flood timer ("don't do anything right away, wait for the
+                        // timer"); the actual flood is the periodic broadcast(true).
                     }
                     henyey_herder::TxQueueResult::Duplicate => {
                         self.record_tx_pull_latency(tx_hash, &msg.from_peer).await;
