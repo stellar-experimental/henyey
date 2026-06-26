@@ -1152,6 +1152,19 @@ impl OverlayManager {
         let mut periodic_interval = tokio::time::interval(Duration::from_secs(1));
         let mut ticks_since_ping: u32 = 0;
 
+        // #3642 Phase 2 — read-side socket throttle resume wake. When inbound
+        // total reading capacity is exhausted the `peer.recv()` select arm below
+        // is disabled (its `if flow_control.can_read()` precondition is false),
+        // back-pressuring the sender at the TCP window exactly as stellar-core's
+        // "don't reschedule the read" does (`TCPPeer::maybeThrottleRead`). The
+        // throttle is lifted by the SCP consumer draining a full reading-capacity
+        // batch: each SCP `FlowControlRelease` carries a clone of this `Notify`
+        // and, on the batch-completing release, fires it (after `stop_throttling`)
+        // — the async equivalent of core's `scheduleRead`. The 1s
+        // `periodic_interval` tick re-evaluates the loop as a backstop so a lost
+        // wake can never wedge a peer for more than ~1s.
+        let read_resume = Arc::new(tokio::sync::Notify::new());
+
         // OVERLAY_SPEC §9.4: Track whether we've received a PEERS message
         // from this peer. At most one is allowed; duplicates cause a drop.
         let mut received_peers = false;
@@ -1232,8 +1245,18 @@ impl OverlayManager {
                     }
                 }
 
-                // Receive from network (no mutex — peer is owned)
-                result = peer.recv() => {
+                // Receive from network (no mutex — peer is owned).
+                //
+                // #3642 Phase 2: gate this arm on `flow_control.can_read()`
+                // (= inbound total reading capacity > 0). tokio does not poll a
+                // select branch whose `if`-precondition is false, so a throttled
+                // peer simply stops pulling bytes — NO busy-spin — until the SCP
+                // consumer drains a full batch and the resume `Notify` re-enables
+                // the loop. The outbound-send and periodic arms stay enabled, so
+                // the task remains live (can still send, ping, time out). Mirrors
+                // stellar-core `TCPPeer::maybeThrottleRead` declining to schedule
+                // the next read while `!canRead()` (`TCPPeer.cpp:620/770`).
+                result = peer.recv(), if flow_control.can_read() => {
                     match result {
                         Ok(Some(message)) => {
                             last_read = Instant::now();
@@ -1273,6 +1296,7 @@ impl OverlayManager {
                                 &flow_control,
                                 &state,
                                 is_validator,
+                                &read_resume,
                             ).await;
 
                             metrics::histogram!(
@@ -1283,6 +1307,15 @@ impl OverlayManager {
                             if matches!(action, RecvAction::Break) {
                                 break;
                             }
+
+                            // #3642 Phase 2: arm the read throttle if this message
+                            // exhausted inbound total reading capacity (records
+                            // `last_throttle` only when `!can_read()`). Mirrors
+                            // stellar-core's post-`recvMessage` `maybeThrottleRead`
+                            // (`TCPPeer.cpp:620/770`). On the next loop iteration
+                            // the gated `peer.recv()` arm is disabled until the
+                            // consumer-drain resume fires.
+                            flow_control.maybe_throttle_read();
                         }
                         Ok(None) => {
                             info!("Peer {} loop exiting: connection closed by remote (total_msgs={}, scp_msgs={})", peer_id, total_messages, scp_messages);
@@ -1334,6 +1367,16 @@ impl OverlayManager {
                         Self::maybe_log_peer_stats(&peer_id, total_messages, scp_messages, &ping, &mut last_stats_log);
                     }
                 }
+
+                // #3642 Phase 2: read-resume wake. Fired by an SCP
+                // `FlowControlRelease` (carrying a clone of `read_resume`) on the
+                // drain that completes a full reading-capacity batch, after
+                // `stop_throttling()` has cleared the throttle. The arm body does
+                // nothing: re-entering the `select!` re-evaluates the
+                // `if flow_control.can_read()` precondition on the `peer.recv()`
+                // arm, which is now true, so reading resumes. Async equivalent of
+                // stellar-core `Peer::scheduleRead` (`Peer.cpp:313-333`).
+                _ = read_resume.notified() => {}
             }
         }
 
@@ -1355,6 +1398,10 @@ impl OverlayManager {
         flow_control: &Arc<FlowControl>,
         state: &SharedPeerState,
         is_validator: bool,
+        // #3642 Phase 2: the peer's read-resume wake, threaded into each SCP
+        // `FlowControlRelease` so the consumer-drain release can lift the read
+        // throttle. Overlay-internal — the app consumer never sees it.
+        read_resume: &Arc<tokio::sync::Notify>,
     ) -> RecvAction {
         let msg_type = helpers::message_type_name(&message);
         trace!("Processing message_type={} from {}", msg_type, peer_id);
@@ -1456,12 +1503,18 @@ impl OverlayManager {
         let mut capacity_guard = Some(capacity_guard);
         let scp_release = if is_scp_message {
             let (fc, msg) = capacity_guard.take().unwrap().disarm();
-            Some(super::FlowControlRelease::new(
-                fc,
-                msg,
-                ctx.outbound_tx.clone(),
-                Arc::clone(&state.metrics),
-            ))
+            // #3642 Phase 2: thread the read-resume `Notify` into the token so
+            // the consumer-drain release can lift the read throttle and wake the
+            // peer loop's gated `peer.recv()` arm.
+            Some(
+                super::FlowControlRelease::new(
+                    fc,
+                    msg,
+                    ctx.outbound_tx.clone(),
+                    Arc::clone(&state.metrics),
+                )
+                .with_resume_notify(Arc::clone(read_resume)),
+            )
         } else {
             None
         };
