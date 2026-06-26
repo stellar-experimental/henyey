@@ -146,3 +146,38 @@ Cheapest immediate win: **cut the ~2.5 min completion-wait tail** on failing ste
 ### Caveats (unchanged)
 
 Single contended VM, no network delay — not pubnet-representative. The 221 figure is now a *clean* apply-side ceiling (no longer depressed by #3638), and the remaining ~6.9× gap to core is the real serial/consensus throughput work to investigate.
+
+---
+
+## Short-duration (`middle*60`) cross-check (2026-06-26)
+
+To test whether a much shorter load window finds the same ceiling, we re-ran henyey (`ssc-fix6`) on a fresh nsc 32×64 VM with the per-step load cut from `middle*300` (5-min offer window) to **`middle*60`** (60-second offer window), searching `[100,300]`.
+
+**Result: short-duration max = 225 tx/s vs sustained max = 221 tx/s — agreement within ~2%.** The whole search took **~21 min vs ~75 min** for the 5-min config.
+
+The short window reproduces the ceiling well, with a **slight upward bias**: at `middle*60`, rate 225 passes; in the sustained `middle*300` run, 226 *failed* and the max was 221. A 60-second burst can clear a rate that 5 minutes of sustained pressure cannot — so short windows read ~2% optimistic.
+
+### Per-step results — converged at **225**
+
+| tx rate | result | step duration |
+|--------:|--------|--------------:|
+| 200 | ✅ pass | 1m31s |
+| 225 | ✅ pass | 1m27s |
+| 231 | ❌ fail | 3m31s |
+| 237 | ❌ fail | 3m30s |
+| 250 | ❌ fail | 3m35s |
+
+### Step-duration breakdown — and why failing steps stay slow
+
+The load (offer) window scales with the multiplier: `txs = rate × N` ⇒ offer duration = `N` seconds, independent of rate. So `middle*60` offers for ~60 s vs ~300 s for `middle*300`. But a **fixed ~150 s completion-wait timeout** sits on top of every *failing* step: once the loadgen has submitted all txns (counter hits 100%), it waits for them to apply on-ledger; at an over-capacity rate they never fully apply, so it waits out the timeout before reporting failure.
+
+| | pass | fail | structure |
+|---|------|------|-----------|
+| `middle*300` | ~5.5 min | ~7.5 min | ~5 min offer + ~2.5 min fixed tail |
+| `middle*60`  | ~1.5 min | ~3.5 min | ~1 min offer + ~2.5 min fixed tail |
+
+Cutting the window shrinks passing steps directly (5.5→1.5 min) but failing steps much less (7.5→3.5 min), because the ~150 s tail is constant. At short windows that tail **dominates** failing-step cost — reinforcing the fast-fail recommendation above: abort on apply-vs-offer divergence (visible in ~15–30 s) rather than waiting out the completion timeout.
+
+### Conclusion
+
+A ~1-minute load window is a **valid fast approximation** of the MaxTPS ceiling — ~3–4× faster end-to-end, agreeing within ~2% — suitable for quick regression/iteration. It carries a small (~2%) upward bias, so use a sustained (`middle*300`+) window when the precise ceiling matters. The biggest remaining time sink at short windows is the fixed completion-wait timeout on failing steps, not the load itself.
