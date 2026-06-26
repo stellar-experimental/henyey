@@ -22,8 +22,32 @@ Parse `$ARGUMENTS`:
 Iteratively raise henyey's classic-payment max TPS (measured by Supercluster
 `MissionMaxTPSClassic` on a single nsc 32×64 VM) toward `$TARGET`. One hypothesis
 per iteration: instrument → change → prove parity → measure → accept/reject →
-document → regenerate hypotheses. Run autonomously; do not pause for approval
-between iterations.
+document → regenerate hypotheses.
+
+## Autonomy contract (read first)
+
+This is a **long-running autonomous loop. It does NOT stop for operator
+intervention.** Concretely:
+
+- **Never ask the operator a question and never pause for approval/confirmation.**
+  Do not end a turn with "want me to continue?", "should I proceed?", or any
+  request for direction. The only things that end the run are the **Stop
+  conditions** below. If you find yourself about to ask — instead, pick the
+  highest-value next iteration and run it.
+- **Running out of *surgical* ideas is NOT a stop condition.** If no clean
+  >5% parity-safe code lever is currently identifiable, that means your next
+  iteration is a **deeper diagnostic** (add metrics → add logs → profile under
+  load → core-vs-henyey comparison — see the *Diagnosis escalation ladder*),
+  which will produce one. Keep going until a Stop condition fires.
+- **Drive yourself across the long steps.** Image builds (~12 min) and mission
+  runs (~10 min) are long; launch them in the background and use `ScheduleWakeup`
+  to resume. The run-doc is your durable state — write enough to it each step
+  that any resume can continue without operator input. Operator messages may
+  arrive, but you must never *wait* for them.
+- **Keep the instance alive for the whole run.** Provision ONE nsc instance and
+  reuse it across every iteration. Do NOT tear it down between iterations or to
+  "pause" — only at a true Stop condition (extend its duration if it nears
+  expiry, or re-provision if it died).
 
 Baseline context (see `docs/maxtps-baseline.md`): henyey ≈ 221–225 tx/s vs
 stellar-core ≈ 1533 on this rig. The limiter is apply/consensus-side, **not**
@@ -41,11 +65,25 @@ Start diagnostic.
    logging, internal architecture, and performance optimizations are explicitly
    divergeable — that's your working room. If a change alters anything observable,
    it is rejected regardless of speedup.
-2. **Minimal scope + proof** — one mechanism per iteration, smallest diff that
-   tests the hypothesis. A change is kept only if it is *proven* to give a
-   meaningful gain (>5%, below).
-3. **Efficiency** — short probes, narrow bands, one reused instance. Never launch
-   a long/wide run without a specific reason.
+2. **One hypothesis per iteration + proof** — test exactly one mechanism at a
+   time so the measured Δ is attributable, and keep a change only if it is
+   *proven* to give a meaningful gain (>5%, below).
+   - **Big swings are welcome.** The *change* can be as large and ambitious as
+     the diagnosed bottleneck warrants — reworking a data structure, the
+     flooding/queue path, a hot loop across crate boundaries, etc. Do **not**
+     abandon a real, well-diagnosed bottleneck just because the fix isn't a
+     one-liner; that's a normal optimization, not a reason to stop. Ambition/diff
+     size is **not** limited.
+   - **Commits stay minimal/atomic.** "Minimal scope" applies to *commits*, not
+     ambition: each commit is the smallest coherent unit. Don't bundle unrelated
+     changes; split incidental instrumentation, refactors, and the behavior
+     change into separate atomic commits where reasonable; one accepted
+     optimization = one focused PR (a large but cohesive change is fine as one
+     commit — just don't lump multiple mechanisms together).
+3. **Efficiency** — short probes, narrow bands, one reused instance. "Be
+   efficient" governs *load runs* (don't launch long/wide missions needlessly) —
+   it does **not** discourage image rebuilds for instrumentation or code changes;
+   those are the expected per-iteration cost.
 
 ## Accept / reject bar
 
@@ -55,11 +93,36 @@ Start diagnostic.
 - Otherwise **reject**: revert the behavior change. Keep instrumentation only if
   it is parity-safe and diagnostically useful.
 
-## Stop conditions (any one ends the run)
+## Stop conditions (the ONLY things that end the run)
 
-- `current_best ≥ $TARGET` (success), or
-- iterations reached `$MAX_ITERS`, or
-- no `pending` hypotheses remain (exhausted).
+End the run **only** when one of these is true — never otherwise (in particular,
+never because you're unsure, lack a surgical lever, or want operator input):
+
+1. `current_best ≥ $TARGET` (success), or
+2. completed `$MAX_ITERS` iterations (count **every** iteration, diagnostic or
+   code-change), or
+3. a hard infra limit you cannot work around (e.g. nsc quota exhausted and
+   re-provision fails, or the registry/cluster is down after retries).
+
+"Exhausted all optimizations" is **not** a separate early stop: as long as
+iterations remain under the cap, there is always a next iteration — if no code
+lever is ready, the next iteration is a deeper diagnostic (see ladder). The loop
+runs to the cap (or target) by construction.
+
+### Diagnosis escalation ladder (use when no >5% code lever is ready)
+Each rung is a valid iteration; climb it until a concrete, diagnosed,
+parity-safe lever emerges, then implement+measure it:
+1. **Scrape existing meters** (`/metrics`, `/info`) at passing and failing rates.
+2. **Add metrics** (`crates/app/src/metrics.rs` catalog + refresh) for the
+   suspected subsystem.
+3. **Add targeted logs** (e.g. `tracing::info!(target:"maxtps_diag", …)`) on the
+   hot path to capture per-round/per-tx detail; revert noisy logs after capture.
+4. **Profile under load** (uftrace — see `perf-optimize-uftrace` +
+   `docs/perf-hypotheses-uftrace.md`) to get function-level hot spots.
+5. **Core-vs-henyey comparison**: run stellar-core at matched rates and compare
+   the same signals to localize henyey's specific deficiency.
+A diagnosed bottleneck that needs a substantial (non-surgical) change is still a
+lever — implement it (constraint 2), don't stop.
 
 ---
 
@@ -291,7 +354,14 @@ release `App.dll`; the env vars `SSC_MAXTPS_TXS_MULTIPLIER` / `SSC_LOADGEN_FASTF
 are read by the harness process, so export them when invoking.)
 
 ## Guardrails recap
+- **Autonomous: never stop to ask the operator.** End only on a Stop condition
+  (target / `$MAX_ITERS` / hard infra limit) — not on uncertainty or lack of a
+  surgical lever. Out of code levers ⇒ run the next diagnostic rung, don't stop.
 - Parity surface is sacred (`docs/PARITY.md`); metrics/internal/perf are free.
-- One hypothesis, smallest diff, >5% to keep, PR per accepted change.
-- One reused instance; short probes; narrow bands; stop at target or `$MAX_ITERS`.
-- Always tear the instance down at the end (it costs money while alive).
+- One hypothesis per iteration for clean attribution; **big swings welcome**
+  (ambition/diff size unlimited) but keep **commits atomic/minimal** — one
+  accepted optimization = one focused PR; proven >5% to keep.
+- One reused instance kept alive for the whole run; short probes; narrow bands.
+- Self-drive across long build/run steps via background tasks + `ScheduleWakeup`;
+  run-doc is resumable state.
+- Tear the instance down **only at the end** (it costs money while alive).
