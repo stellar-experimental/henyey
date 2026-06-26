@@ -93,6 +93,33 @@ Start diagnostic.
 - Otherwise **reject**: revert the behavior change. Keep instrumentation only if
   it is parity-safe and diagnostically useful.
 
+## Hypothesis prioritization — target henyey↔core *divergences*
+
+The goal is to close henyey's gap to stellar-core, so prioritize levers that fix
+where **henyey's implementation differs from core**, not knobs core shares.
+
+- **DEPRIORITIZE: tuning config values that are identical to stellar-core.** If a
+  knob has the same default/semantics in core (e.g. `FLOOD_TX_PERIOD_MS`,
+  `maxTxSetSize`), changing it does not close the gap — core could set the same
+  value and gain the same amount, and a fair core-vs-henyey comparison would tune
+  both. Such a finding is at most a documented *operational tuning*, not a henyey
+  improvement; note it and move on. Do not spend multiple iterations sweeping
+  variants of a shared config value.
+- **PRIORITIZE: places where henyey diverges from core in implementation** — the
+  data structures, algorithms, concurrency, and hot-path code henyey wrote
+  differently. That is where henyey-specific inefficiency (and real gap-closing)
+  lives. Find them via:
+  - code comments flagging divergence (grep the hot path for `DIVERGENCE`,
+    `differs`, `unlike stellar-core`, `parity`, `TODO`/`HACK`/`slow`);
+  - each crate's `PARITY_STATUS.md` and the `stellar-core/` submodule (compare
+    henyey's implementation against the upstream `.cpp`/`.h` for the same module);
+  - profiling under load (uftrace) to see where henyey spends time that core
+    would not.
+- When a lever IS a shared config value but the *measurement* is still useful as
+  a diagnostic (e.g. it proves the bottleneck is flood supply), keep the
+  knowledge but pivot the actual fix to the henyey-specific implementation that
+  makes that path slower than core's.
+
 ## Stop conditions (the ONLY things that end the run)
 
 End the run **only** when one of these is true — never otherwise (in particular,
@@ -358,6 +385,10 @@ are read by the harness process, so export them when invoking.)
   (target / `$MAX_ITERS` / hard infra limit) — not on uncertainty or lack of a
   surgical lever. Out of code levers ⇒ run the next diagnostic rung, don't stop.
 - Parity surface is sacred (`docs/PARITY.md`); metrics/internal/perf are free.
+- **Chase henyey↔core divergences, not shared config.** Tuning a knob identical
+  to core doesn't close the gap (core could match it); spend iterations on the
+  implementation henyey wrote differently. Use code-comment greps, `PARITY_STATUS.md`,
+  and the `stellar-core/` submodule to find them.
 - One hypothesis per iteration for clean attribution; **big swings welcome**
   (ambition/diff size unlimited) but keep **commits atomic/minimal** — one
   accepted optimization = one focused PR; proven >5% to keep.
