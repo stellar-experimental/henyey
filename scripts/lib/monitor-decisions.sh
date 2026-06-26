@@ -1267,3 +1267,76 @@ classify_stuck_alive_sync() {
   STUCK_ALIVE_SYNC="yes"
   return 0
 }
+
+# ─────────────────────────────────────────────────────────────────────────────
+# prune_rotated_logs LOGS_DIR [KEEP_PER_CATEGORY]
+#
+# Rotated-log retention for monitor-tick check (5). Keeps the newest
+# KEEP_PER_CATEGORY (default 3) `monitor.log.<category>-*` archives per
+# category and deletes the rest, where the *category* is the suffix word
+# between `monitor.log.` and the first `-` (e.g. `crashed`, `preredeploy`,
+# `predeploy`, `coldcatchup`, `stopped`, `prerestart`, `freshstart`).
+#
+# Two fixes over the previous hardcoded `for pat in preredeploy crashed stuck
+# frozen` + `sort -r` (filename) loop (#3616):
+#   1. ALL categories are covered — legacy/other suffixes (`predeploy`,
+#      `coldcatchup`, `stopped`, `prerestart`, `freshstart`, …) are discovered
+#      from the files on disk, not from a hardcoded list, so they no longer
+#      accumulate unbounded.
+#   2. Retention is by **mtime**, not by lexical filename. An infixed variant
+#      such as `monitor.log.crashed-knit2lcl-20260615T192932Z` sorts its 'k'
+#      ahead of a bare `crashed-20260623T…` under `sort -r`, which retained the
+#      OLD logs and deleted the recent ones. mtime ordering keeps the newest.
+#
+# Arguments:
+#   LOGS_DIR           - directory containing monitor.log.<category>-* archives
+#   KEEP_PER_CATEGORY  - newest-N to keep per category (default 3)
+#
+# Sets globals:
+#   PRUNED_LOG_COUNT - number of files removed (0 if none / dir missing)
+#
+# Returns: 0 always (no-op on a missing dir or empty category set).
+# Portability: GNU find -printf, GNU sort, GNU sed -E, Bash 4+.
+# ─────────────────────────────────────────────────────────────────────────────
+prune_rotated_logs() {
+  local logs_dir="$1"
+  local keep="${2:-3}"
+
+  PRUNED_LOG_COUNT=0
+
+  [[ -d "$logs_dir" ]] || return 0
+  [[ "$keep" =~ ^[0-9]+$ ]] || keep=3
+
+  # Enumerate every rotated archive as: <mtime-epoch> <category> <path>
+  # category = first '-'-delimited token after the literal `monitor.log.` prefix.
+  # find -printf survives zsh NO_NOMATCH (no shell glob) and gives us mtime.
+  local rows
+  rows=$(find "$logs_dir" -maxdepth 1 -type f -name 'monitor.log.*-*' \
+           -printf '%T@ %f\n' 2>/dev/null)
+  [[ -z "$rows" ]] && return 0
+
+  # Build category list and, per category, sort newest-first by mtime, then
+  # delete everything past the keep-th entry.
+  local categories
+  categories=$(printf '%s\n' "$rows" \
+    | sed -E 's/^[0-9.]+ monitor\.log\.([^-]+)-.*$/\1/' \
+    | sort -u)
+
+  local cat line fname removed=0
+  while IFS= read -r cat; do
+    [[ -n "$cat" ]] || continue
+    # mtime descending; ties broken by filename descending for determinism.
+    # tail -n +<keep+1> drops the newest `keep`, leaving the surplus to delete.
+    while IFS= read -r line; do
+      [[ -n "$line" ]] || continue
+      fname="${line#* }"
+      rm -f "$logs_dir/$fname" 2>/dev/null && removed=$(( removed + 1 ))
+    done < <(printf '%s\n' "$rows" \
+               | grep -E " monitor\\.log\\.${cat}-" \
+               | sort -t' ' -k1,1rn -k2,2r \
+               | tail -n +$(( keep + 1 )))
+  done <<< "$categories"
+
+  PRUNED_LOG_COUNT="$removed"
+  return 0
+}

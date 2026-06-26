@@ -225,6 +225,8 @@ notes = ""
 
 [[alarm]]
 name = "inbound-auth-low"
+baseline_version = 2  # bumped in #3653: severity WARN→NONC. The < 3 chronic floor is structurally expected on firewall-limited hosts (non-standard peer_port, AWS SG only exposes 8009 — #1935) and is consensus-non-impacting (the host reaches all quorum orgs via outbound preferred_peers). Demoting to NONC keeps it reported/filed as Non-critical without pinning the banner to WARNING on ~90% of ticks (#3653); genuine isolation still escalates via inbound-auth-critical below.
+semantic_change_date = "2026-06-26T00:00:00Z"  # severity demotion WARN→NONC per #3653
 metric = "stellar_overlay_inbound_authenticated"
 kind = "gauge"
 extraction = "form1"
@@ -232,7 +234,7 @@ labels = []
 op = "<"
 threshold = 3
 for_ticks = 1
-severity = "WARN"
+severity = "NONC"
 gates = ["synced-only", "warmup-2-ticks"]
 cooldown_key = "stellar_overlay_inbound_authenticated"
 cooldown_seconds = 3600
@@ -240,7 +242,32 @@ filing_title = "metrics: stellar_overlay_inbound_authenticated — {value} < {th
 filing_search = "metrics: stellar_overlay_inbound_authenticated"
 summary = "Inbound authenticated peers below threshold"
 details = "inbound_auth={value} threshold={threshold}"
-notes = "Healthy fleet has 50+ inbound. Aggregate peer_count can be >=8 from outbound while inbound starves consensus."
+notes = "Healthy fleet has 50+ inbound. Aggregate peer_count can be >=8 from outbound while inbound starves consensus. NONC (not WARN) since #3653: on this firewall-limited host (#1935) a < 3 floor is structurally expected and consensus-non-impacting (outbound reaches all quorum orgs); it is reported/filed as Non-critical but does not flip the banner. A WORSE breach — zero authenticated inbound (genuine isolation) — still escalates to WARNING via the inbound-auth-critical alarm below."
+
+# Escalation tier for inbound-auth-low (#3653): zero authenticated inbound is a
+# genuine isolation signal (not the benign < 3 chronic floor), so it keeps WARN
+# and flips the banner. Shares the stellar_overlay_inbound_authenticated metric
+# with inbound-auth-low; allow_duplicate_cooldown is set because the two tiers
+# intentionally key off the same metric with distinct cooldown keys.
+[[alarm]]
+name = "inbound-auth-critical"
+metric = "stellar_overlay_inbound_authenticated"
+kind = "gauge"
+extraction = "form1"
+labels = []
+op = "<"
+threshold = 1
+for_ticks = 1
+severity = "WARN"
+gates = ["synced-only", "warmup-2-ticks"]
+cooldown_key = "stellar_overlay_inbound_authenticated_critical"
+allow_duplicate_cooldown = true
+cooldown_seconds = 3600
+filing_title = "metrics: stellar_overlay_inbound_authenticated — {value} < {threshold} (zero inbound)"
+filing_search = "metrics: stellar_overlay_inbound_authenticated"
+summary = "Zero authenticated inbound peers (genuine isolation)"
+details = "inbound_auth={value} threshold={threshold}"
+notes = "Escalation tier for inbound-auth-low (#3653). Fires only at zero authenticated inbound — a genuine isolation signal distinct from the benign < 3 chronic floor — and stays WARN so it flips the banner. The benign < 3 floor is handled (NONC, banner-neutral) by inbound-auth-low above."
 
 [[alarm]]
 name = "ledger-age-high"
