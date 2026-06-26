@@ -475,6 +475,33 @@ type StellarFormation with
         for (peer, peerSpecificLoadgen, offset) in peerLoadGens do
             LogInfo "Loadgen: %s with offset %d" (peer.GenerateLoad peerSpecificLoadgen) offset
 
+        // Opt-in harness-side fast-fail. Once every peer has SUBMITTED its full
+        // tx count, the only remaining work is on-ledger application. If the run
+        // has not completed within SSC_LOADGEN_FASTFAIL_LEDGERS additional
+        // ledger closes, the offered rate exceeds apply capacity, so abort early
+        // instead of waiting out the node-side wait-till-complete budget
+        // (stellar-core LoadGenerator::TIMEOUT_NUM_LEDGERS = 20). This keeps the
+        // node loadgen byte-identical to core — it is purely a harness-side
+        // early-abort that turns a doomed step's fixed completion-wait tail
+        // (~20 ledgers ≈ 100s) into ~K ledgers, which matters on failure-
+        // dominated binary searches (e.g. MaxTPSClassic). Unset or <=0 preserves
+        // the default behavior (wait for the node to self-report).
+        let fastFailLedgers =
+            match System.Environment.GetEnvironmentVariable "SSC_LOADGEN_FASTFAIL_LEDGERS" with
+            | null -> 0
+            | s ->
+                match System.Int32.TryParse s with
+                | true, n -> n
+                | _ -> 0
+
+        let mutable submitDoneLedger: int option = None
+
+        let allLoadSubmitted () =
+            List.forall
+                (fun (peer: Peer, loadGen: LoadGen, _) ->
+                    (MeterCountOr 0 (peer.GetMetrics().LoadgenTxnAttempted)) >= loadGen.txs)
+                peerLoadGens
+
         while List.exists
                   (fun (peer: Peer, _, _) ->
                       not (peer.IsLoadGenComplete() = Success || peer.IsLoadGenComplete() = Failure))
@@ -491,6 +518,30 @@ type StellarFormation with
                     LogInfo "%s  loadgen: %s" (peer.ShortName.ToString()) (peer.StopLoadGen())
 
                 failwith "Loadgen failed!"
+
+            // Harness-side fast-fail: arm once all load is submitted, then bound
+            // the post-submission application wait by ledger advancement.
+            if fastFailLedgers > 0 then
+                let (probePeer, _, _) = List.head peerLoadGens
+
+                match submitDoneLedger with
+                | None ->
+                    if allLoadSubmitted () then
+                        let lg = probePeer.GetLedgerNum()
+                        submitDoneLedger <- Some lg
+
+                        LogInfo
+                            "Fast-fail armed: all load submitted by ledger %d; requiring run completion within %d ledgers"
+                            lg
+                            fastFailLedgers
+                | Some startLedger ->
+                    if probePeer.GetLedgerNum() - startLedger >= fastFailLedgers then
+                        for (peer, _, _) in peerLoadGens do
+                            LogInfo "%s  loadgen: %s" (peer.ShortName.ToString()) (peer.StopLoadGen())
+
+                        failwithf
+                            "Loadgen fast-fail: load submitted but run not complete within %d ledgers (offered rate exceeds apply capacity)"
+                            fastFailLedgers
 
         // Final check after the loop completes
         if List.exists (fun (peer: Peer, _, _) -> peer.IsLoadGenComplete() = Failure) peerLoadGens then
