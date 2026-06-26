@@ -137,6 +137,7 @@ use henyey_common::deterministic_seed;
 // ---------------------------------------------------------------------------
 
 mod loadgen_runner {
+    use std::path::PathBuf;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
 
@@ -145,6 +146,11 @@ mod loadgen_runner {
         GeneratedLoadConfig, LoadGenApplyLoadConfig, LoadGenMode, LoadGenerator,
     };
     use tokio::sync::Mutex;
+
+    /// Default preloaded-transactions file for `PayPregenerated`, matching
+    /// stellar-core's `LOADGEN_PREGENERATED_TRANSACTIONS_FILE` (`Config.cpp:187`)
+    /// and the file `pregenerate-loadgen-txs` writes by default.
+    const DEFAULT_PREGENERATED_TRANSACTIONS_FILE: &str = "stellar-load-transactions.xdr";
 
     /// Centralized per-run lifecycle control with atomic state transitions.
     ///
@@ -421,6 +427,25 @@ mod loadgen_runner {
                     Some(LoadGenMode::SorobanInvokeApplyLoad)
                 }
                 _ => None,
+            }
+        }
+
+        /// Resolve the preloaded-transactions file path for a load-gen request.
+        ///
+        /// `PayPregenerated` reads transactions from a file. stellar-core defaults
+        /// this path to the file written by `pregenerate-loadgen-txs`
+        /// (`Config.cpp:187`, `CommandHandler.cpp:1452`) when the generateload
+        /// request omits it — Supercluster relies on that default — so we default
+        /// it here too rather than erroring (#3629). An explicitly-requested file
+        /// always wins. For every other mode the requested value passes through
+        /// unchanged (no default applied).
+        fn resolve_preloaded_path(mode: LoadGenMode, requested: Option<&str>) -> Option<PathBuf> {
+            if mode == LoadGenMode::PayPregenerated {
+                Some(PathBuf::from(
+                    requested.unwrap_or(DEFAULT_PREGENERATED_TRANSACTIONS_FILE),
+                ))
+            } else {
+                requested.map(PathBuf::from)
             }
         }
     }
@@ -788,6 +813,52 @@ mod loadgen_runner {
                 "token after abnormal exit must be unsignaled"
             );
         }
+
+        // #3629: PayPregenerated with no file must default to the
+        // pregenerate-loadgen-txs output path (matching stellar-core), rather
+        // than erroring. Before the fix, an omitted file errored out; now it
+        // resolves to `stellar-load-transactions.xdr`.
+        #[test]
+        fn test_resolve_preloaded_path_pregenerated_omitted_defaults() {
+            assert_eq!(
+                SimulationLoadGenRunner::resolve_preloaded_path(LoadGenMode::PayPregenerated, None),
+                Some(PathBuf::from("stellar-load-transactions.xdr")),
+                "PayPregenerated with no file must default to stellar-load-transactions.xdr"
+            );
+        }
+
+        // An explicitly-requested file always wins for PayPregenerated; the
+        // default does not override it.
+        #[test]
+        fn test_resolve_preloaded_path_pregenerated_explicit_wins() {
+            assert_eq!(
+                SimulationLoadGenRunner::resolve_preloaded_path(
+                    LoadGenMode::PayPregenerated,
+                    Some("custom-txs.xdr")
+                ),
+                Some(PathBuf::from("custom-txs.xdr")),
+                "explicit preloadedTransactionsFile must win over the default"
+            );
+        }
+
+        // Non-pregenerated modes are unaffected: an omitted file stays `None`
+        // (no default applied), and an explicit file passes through unchanged.
+        #[test]
+        fn test_resolve_preloaded_path_non_pregenerated_passthrough() {
+            assert_eq!(
+                SimulationLoadGenRunner::resolve_preloaded_path(LoadGenMode::Pay, None),
+                None,
+                "non-pregenerated mode with no file must stay None (no default)"
+            );
+            assert_eq!(
+                SimulationLoadGenRunner::resolve_preloaded_path(
+                    LoadGenMode::Pay,
+                    Some("explicit.xdr")
+                ),
+                Some(PathBuf::from("explicit.xdr")),
+                "non-pregenerated mode must pass an explicit file through unchanged"
+            );
+        }
     }
 
     impl LoadGenRunner for SimulationLoadGenRunner {
@@ -815,11 +886,8 @@ mod loadgen_runner {
                 )
             })?;
 
-            // PayPregenerated requires a transactions file (LoadGenerator.cpp:526).
-            if mode == LoadGenMode::PayPregenerated && request.preloaded_transactions_file.is_none()
-            {
-                return Err("PAY_PREGENERATED mode requires preloadedTransactionsFile".to_string());
-            }
+            // The preloaded-transactions file path is resolved below via
+            // `resolve_preloaded_path` (defaults for PayPregenerated, #3629).
 
             // Atomic exclusivity gate with coupled stop-token creation.
             let (permit, stop_token) = LoadGenPermit::try_acquire(&self.state)
@@ -849,10 +917,10 @@ mod loadgen_runner {
                 n_instances: request.instances,
                 n_wasms: request.wasms,
                 min_soroban_percent_success: request.min_percent_success,
-                preloaded_transactions_file: request
-                    .preloaded_transactions_file
-                    .as_ref()
-                    .map(std::path::PathBuf::from),
+                preloaded_transactions_file: Self::resolve_preloaded_path(
+                    mode,
+                    request.preloaded_transactions_file.as_deref(),
+                ),
                 apply_load: LoadGenApplyLoadConfig {
                     bl_batch_size: request.apply_load_bl_batch_size,
                     bl_simulated_ledgers: request.apply_load_bl_simulated_ledgers,
