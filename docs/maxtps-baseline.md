@@ -181,3 +181,21 @@ Cutting the window shrinks passing steps directly (5.5→1.5 min) but failing st
 ### Conclusion
 
 A ~1-minute load window is a **valid fast approximation** of the MaxTPS ceiling — ~3–4× faster end-to-end, agreeing within ~2% — suitable for quick regression/iteration. It carries a small (~2%) upward bias, so use a sustained (`middle*300`+) window when the precise ceiling matters. The biggest remaining time sink at short windows is the fixed completion-wait timeout on failing steps, not the load itself.
+
+---
+
+## Tuning: `flood_tx_period_ms` (maxtps-optimize 2026-06-26)
+
+Setting **`overlay.flood_tx_period_ms = 100`** (default 200) raises henyey's classic
+max-TPS by **~11%** on this rig: a same-instance A/B measured **222 tx/s at 200 ms
+vs 246 tx/s at 100 ms** (short-probe). henyey's ceiling is supply-side — nodes
+nominate fuller tx sets than the SCP-agreed set because tx-flood propagation is
+uneven under load; flushing tx adverts twice as often lets nodes converge on a
+fuller shared pending set, so the agreed/applied set grows.
+
+It is **already a config knob** (no source change); the default stays the
+stellar-core-pinned 200. It is **parity-safe**: `FLOOD_TX_PERIOD_MS` is operator
+config in stellar-core too, so a henyey node at 100 ms is byte-indistinguishable
+from a core node at 100 ms. For a fair core-vs-henyey comparison, set the same
+value on both. See `docs/maxtps-optimization/2026-06-26-target1000.md` for the
+full run.
