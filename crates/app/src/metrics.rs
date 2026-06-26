@@ -1057,6 +1057,29 @@ pub(crate) const LOADGEN_COMPAT_MAP: &[(&str, &str, &str)] = &[
     (LOADGEN_STEP_COUNT.0, "loadgen.step.count", "step"),
 ];
 
+/// The full loadgen meter catalog, in catalog order.
+///
+/// Single source of truth for the set of meters reset by [`reset_loadgen_meters`]
+/// on `clearmetrics` (#3630). Must stay in sync with the `loadgen_*` entries in
+/// the catalog and with [`LOADGEN_COMPAT_MAP`].
+pub const LOADGEN_METERS: &[CounterMetric] = &[
+    LOADGEN_RUN_START,
+    LOADGEN_RUN_COMPLETE,
+    LOADGEN_RUN_FAILED,
+    LOADGEN_ACCOUNT_CREATED,
+    LOADGEN_TXN_ATTEMPTED,
+    LOADGEN_TXN_REJECTED,
+    LOADGEN_TXN_BYTES,
+    LOADGEN_PAYMENT_SUBMITTED,
+    LOADGEN_PAYMENT_BYTES,
+    LOADGEN_SOROBAN_UPLOAD,
+    LOADGEN_SOROBAN_INVOKE,
+    LOADGEN_SOROBAN_SETUP_INVOKE,
+    LOADGEN_SOROBAN_SETUP_UPGRADE,
+    LOADGEN_SOROBAN_CREATE_UPGRADE,
+    LOADGEN_STEP_COUNT,
+];
+
 // ── Scrape-time refresh ────────────────────────────────────────────────
 
 /// Update scrape-time gauges and absolute counters from current App state.
@@ -1635,6 +1658,23 @@ pub fn install_recorder() -> PrometheusHandle {
     handle
 }
 
+/// Reset the loadgen-domain meters to zero (#3630).
+///
+/// stellar-core's `ApplicationImpl::clearMetrics` runs a `MetricResetter` over
+/// the requested domain, and medida meters genuinely reset to 0. Supercluster's
+/// max-TPS / min-block-time binary search calls `clearmetrics` before every step
+/// and then reads the loadgen meters per run, so without a real reset the
+/// `loadgen_txn_attempted` progress counter accumulates across steps and a stale
+/// `loadgen_run_failed` from a prior step makes every subsequent
+/// `IsLoadGenComplete` read Failure — converging the search wrong.
+///
+/// Invoked from the `clearmetrics` HTTP path only (see `App::clear_metrics`).
+pub fn reset_loadgen_meters() {
+    for m in LOADGEN_METERS {
+        m.absolute(0);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1970,6 +2010,63 @@ mod tests {
                 after.contains(&format!("loadgen_txn_attempted {}", N)),
                 "loadgen_txn_attempted should be {}, got:\n{}",
                 N,
+                after
+            );
+        });
+    }
+
+    /// #3630 regression: `clearmetrics` must drive the loadgen meters back to a
+    /// rendered `0`, mirroring stellar-core's `MetricResetter`. This asserts the
+    /// RENDERED Prometheus value (not just the setter), because the prior fix
+    /// (`CounterMetric::absolute(0)` = `AtomicU64::fetch_max(0)`) was a no-op on
+    /// any non-zero counter and still rendered the accumulated value.
+    #[test]
+    fn test_clear_loadgen_meters_resets_to_zero_rendered() {
+        const N: u64 = 42;
+        let (recorder, handle) = fresh_local_recorder();
+        metrics::with_local_recorder(&recorder, || {
+            describe_metrics();
+            register_label_series();
+
+            // Accumulate a non-zero value on every loadgen meter — the exact
+            // scenario #3630 describes after a Supercluster step.
+            for _ in 0..N {
+                LOADGEN_TXN_ATTEMPTED.increment(1);
+            }
+            for m in LOADGEN_METERS {
+                m.increment(1);
+            }
+
+            let before = handle.render();
+            assert!(
+                before.contains(&format!("loadgen_txn_attempted {}", N + 1)),
+                "precondition: loadgen_txn_attempted should be {}, got:\n{}",
+                N + 1,
+                before
+            );
+
+            // The clearmetrics reset path.
+            reset_loadgen_meters();
+
+            // Every loadgen meter must render exactly 0 afterwards. Match the
+            // full exposition line (`<name> 0`) so a leftover `<name> 43` fails.
+            let after = handle.render();
+            for &(prom_name, _, _) in LOADGEN_COMPAT_MAP {
+                let zero_line = format!("{} 0", prom_name);
+                let rendered = after
+                    .lines()
+                    .find(|l| l.starts_with(prom_name) && !l.starts_with('#'))
+                    .unwrap_or("<missing>");
+                assert_eq!(
+                    rendered, zero_line,
+                    "{} should render `{}` after reset_loadgen_meters(), got line `{}`\nfull:\n{}",
+                    prom_name, zero_line, rendered, after
+                );
+            }
+            // Spot-check the meter from #3630 explicitly.
+            assert!(
+                after.contains("loadgen_txn_attempted 0"),
+                "loadgen_txn_attempted must be 0 after clearmetrics, got:\n{}",
                 after
             );
         });
