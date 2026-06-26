@@ -22,6 +22,21 @@ const BUSY_TIMEOUT_MS: u32 = 30_000;
 /// SQLite cache size in kibibytes (negative value = KiB for PRAGMA cache_size).
 const CACHE_SIZE_KIB: i32 = -64_000;
 
+/// WAL auto-checkpoint threshold in pages.
+///
+/// Parity with `stellar-core/src/database/Database.cpp:169` (`PRAGMA
+/// wal_autocheckpoint = 10000`). The SQLite default is 1000; henyey left it
+/// unset (= default 1000) until #3640. A smaller threshold fires in-line WAL
+/// checkpoints more often, and a checkpoint's `fsync` can stall for seconds on
+/// a co-tenant-saturated nvme, contributing to ledger-close commit latency and
+/// transient `SQLITE_BUSY`. Raising it to 10000 reduces checkpoint frequency to
+/// match stellar-core.
+///
+/// Only this pragma is matched to stellar-core here; the other core/henyey
+/// pragma differences (`cache_size`, `mmap_size`, `temp_store`, `foreign_keys`)
+/// are pre-existing and deliberately left divergent (#3640).
+const WAL_AUTOCHECKPOINT_PAGES: u32 = 10_000;
+
 /// Applies the per-connection SQLite PRAGMAs shared by the file-backed and
 /// in-memory open paths.
 ///
@@ -35,8 +50,9 @@ fn init_connection_pragmas(conn: &mut rusqlite::Connection) -> rusqlite::Result<
          PRAGMA synchronous = FULL;\
          PRAGMA foreign_keys = ON;\
          PRAGMA cache_size = {};\
+         PRAGMA wal_autocheckpoint = {};\
          PRAGMA temp_store = MEMORY;",
-        BUSY_TIMEOUT_MS, CACHE_SIZE_KIB
+        BUSY_TIMEOUT_MS, CACHE_SIZE_KIB, WAL_AUTOCHECKPOINT_PAGES
     ))
 }
 
@@ -224,6 +240,32 @@ mod tests {
                 .unwrap();
             assert_eq!(busy, BUSY_TIMEOUT_MS);
 
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    /// #3640: every pooled connection must read back
+    /// `PRAGMA wal_autocheckpoint = 10000` (parity with
+    /// `stellar-core/src/database/Database.cpp:169`; the SQLite default is
+    /// 1000). Setting it via the `with_init` callback proves the pragma
+    /// reaches every connection drawn from the pool — including the
+    /// ledger-close write connection — which is what reduces in-line
+    /// WAL-checkpoint contention frequency. Asserting on a file-backed DB
+    /// (the production path) because `wal_autocheckpoint` is a WAL-mode
+    /// pragma.
+    #[test]
+    fn wal_autocheckpoint_pragma_applied_to_pooled_connection_3640() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Database::open(tmp.path().join("test.db")).unwrap();
+        db.with_connection(|conn| {
+            let autockpt: i64 = conn
+                .pragma_query_value(None, "wal_autocheckpoint", |r| r.get(0))
+                .unwrap();
+            assert_eq!(
+                autockpt, WAL_AUTOCHECKPOINT_PAGES as i64,
+                "wal_autocheckpoint must be 10000 (parity with stellar-core)"
+            );
             Ok(())
         })
         .unwrap();

@@ -589,6 +589,10 @@ metric_catalog! {
             => "Total GetScpState (SCP state) re-request attempts sent to peers \
                 (one per request attempt, including attempts where 0 peers were \
                 reachable); see issue #3270";
+        DB_BUSY_RETRY_TOTAL = "henyey_db_busy_retry_total"
+            => "Total bounded retries of a consensus-critical persist DB commit \
+                after a transient SQLITE_BUSY/LOCKED, before escalating to a \
+                clean recoverable shutdown; see issue #3640";
 
         // SCP/herder counters.
         SCP_ENVELOPE_EMIT_TOTAL = "stellar_scp_envelope_emit_total"
