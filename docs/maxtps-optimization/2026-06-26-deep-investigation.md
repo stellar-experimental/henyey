@@ -53,3 +53,30 @@ The remaining lever is **intra-round propagation completeness / SCP nomination t
 
 The parallel-validation change is **parity-exact and a genuine 16× validation speedup** (exploits the idle cores; helps catchup/sync and higher-limit networks), but it is **not a max-TPS win** and is therefore rejected against the >5% maxtps bar. Kept on branch `maxtps/opt-c66d03b4` as a standalone perf optimization for separate consideration.
 
+## Core baseline comparison (same rig, instance `ml0bf06bdq43k`)
+
+Ran stellar-core (`stellar-core-testing@sha256:bc1de6bc…`) through MaxTPSClassic at the rates henyey *fails*:
+
+- **Core PASSES 500, 600, and 650 tx/s** (henyey caps at ~238).
+- At rate 600, core: applied **~3000–3200 tx/ledger** (`ledger.transaction.count` mean 3010, 99% 3228), close duration ~83 ms, cadence ~5 s → ~600 tx/s, **eff ≈ 1**.
+- `overlay.flood.tx-pull-latency` **mean 17 ms / median 14.6 ms / 99% 78 ms**; `overlay.demand.timeout = 0`; `scp.timing.nominated` ~166–222 ms; `scp.timing.ballot-blocked-on-txset = 0`; `herder.pending-txs.count = 35994`.
+
+So **core's cadence is also ~5 s** (confirming the gap is *bigger agreed sets*, not faster cadence) and core's intra-round tx propagation **completes** (17 ms pull latency, zero demand timeouts), letting it agree on ~3000-tx sets at 600 tx/s with eff≈1. henyey's eff drops below 1 above ~238.
+
+### Divergences found, and the decisive one
+
+The core comparison surfaced several config keys henyey's compat layer silently ignored that Supercluster/core set:
+1. **`FLOOD_DEMAND_PERIOD_MS=100`** — henyey didn't map it → ran at default 200 (2× slower demand). **Fixed** (commit `6765988d`; also maps `FLOOD_DEMAND_BACKOFF_DELAY_MS`; defaults unchanged 200/500 = core parity). **Measured: max 240 vs 238 — no max-TPS change.** Demand cadence is not the gate.
+2. **`TRANSACTION_QUEUE_SIZE_MULTIPLIER_FOR_TESTING=3`** — henyey hardcodes 2 (minor; both large).
+3. **`EXPERIMENTAL_BACKGROUND_TX_SIG_VERIFICATION=true`** — unmapped.
+4. **`EXPERIMENTAL_TX_BATCH_MAX_SIZE=500` — tx-batching. THE decisive one.**
+
+**The decisive finding: tx-batching is `#ifdef BUILD_TESTS`-only in stellar-core.** `TxDemandsManager::recvTxDemand` fulfils a demand by sending **individual** `tx->toStellarMessage()` (TxDemandsManager.cpp:344) — *except* under `#ifdef BUILD_TESTS` with `EXPERIMENTAL_TX_BATCH_MAX_SIZE>0`, where it packs up to 500 txs into one `TX_SET`-typed message with sentinel `previousLedgerHash=TX_BATCH_HASH` (`OverlayManager::createTxBatch`, only treated as flood under `#ifdef BUILD_TESTS`). The MaxTPSClassic benchmark runs the **BUILD_TESTS** core image (`stellar-core-testing`), so its core nodes batch tx-flooding ≤500×; **production core floods individual tx messages — exactly like henyey.**
+
+### Conclusion
+
+A large part of the measured henyey-vs-core max-TPS gap on this benchmark is **core's BUILD_TESTS-only tx-batching**, a test-harness optimization production core does not have. henyey (production code) floods individually like production core. Two targeted parity-safe henyey fixes (parallel validation `ccec4c3b`, demand-period mapping `6765988d`) are correct but max-TPS-neutral, consistent with the gate being **message volume** (which only batching addresses) rather than per-op speed. 
+
+**Implication:** closing the *benchmark* gap would require giving henyey an equivalent (test-only / experimental) tx-batching path — benchmark-matching, not a v27 production-parity requirement (production core lacks it too). Whether to add a test/experimental feature to production code to match the benchmark is a product decision. This echoes the broader maxtps lesson: this benchmark contains core-favoring test-harness artifacts (cf. the earlier `wait_till_complete`/pacing measurement bugs).
+
+
