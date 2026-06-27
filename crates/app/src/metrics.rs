@@ -676,6 +676,14 @@ metric_catalog! {
         OVERLAY_ASYNC_WRITE_TOTAL = "stellar_overlay_async_write_total"
             => "Total successful send I/O operations";
 
+        // Tx-demand timeout: a tx demand went unfulfilled past the retry delay
+        // and was re-issued to a peer. Mirrors stellar-core's
+        // `overlay.demand.timeout`. Recorded by string in
+        // `app::tx_flooding::run_tx_demands`; cataloged here for HELP/TYPE +
+        // pre-registration (same pattern as the tx-pull-latency histogram).
+        OVERLAY_DEMAND_TIMEOUT_TOTAL = "stellar_overlay_demand_timeout_total"
+            => "Total tx demands re-issued after a prior demand timed out";
+
         // Stage F.1: Overlay connection lifecycle counters (issue #2236).
         OVERLAY_INBOUND_ATTEMPT_TOTAL = "stellar_overlay_inbound_attempt_total"
             => "Total inbound connection accepts (TCP listener.accept() Ok)";
@@ -2249,7 +2257,6 @@ mod tests {
             "stellar_overlay_authenticated_peers",
             "stellar_overlay_flood_demanded_total",
             "stellar_overlay_flood_fulfilled_total",
-            "stellar_overlay_demand_timeout_total",
             "stellar_overlay_connection_latency_us_sum",
             "stellar_overlay_connection_latency_us_count",
             "stellar_overlay_tx_pull_latency_us_sum",
@@ -2262,6 +2269,14 @@ mod tests {
                 name
             );
         }
+
+        // demand-timeout now HAS a producer (app::tx_flooding::run_tx_demands)
+        // and is cataloged, so it must be registered/described.
+        assert!(
+            output.contains("# HELP stellar_overlay_demand_timeout_total"),
+            "stellar_overlay_demand_timeout_total should be registered now that it \
+             has a producer"
+        );
     }
 
     #[test]

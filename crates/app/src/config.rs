@@ -54,6 +54,9 @@
 //! - `RS_STELLAR_CORE_NETWORK_PASSPHRASE` - Network passphrase
 //! - `RS_STELLAR_CORE_DATABASE_PATH` - Database file path
 //! - `RS_STELLAR_CORE_LOG_LEVEL` - Log level (trace, debug, info, warn, error)
+//! - `RS_STELLAR_CORE_NATIVE_METRICS_PORT` - Enable the native Prometheus
+//!   `/metrics` server on this port (distinct from the compat HTTP port), so the
+//!   full registry (overlay/SCP metrics) is reachable; unset = disabled.
 
 use anyhow::Context;
 use henyey_common::BucketListDbConfig;
@@ -2021,6 +2024,7 @@ impl AppConfig {
     /// - RS_STELLAR_CORE_NETWORK_PASSPHRASE
     /// - RS_STELLAR_CORE_DATABASE_PATH
     /// - RS_STELLAR_CORE_OVERLAY_PEER_PORT
+    /// - RS_STELLAR_CORE_NATIVE_METRICS_PORT
     pub fn from_file_with_env(path: impl AsRef<Path>) -> anyhow::Result<Self> {
         let mut config = Self::from_file(path)?;
         config.apply_env_overrides()?;
@@ -2094,6 +2098,39 @@ impl AppConfig {
                      must be a valid u16 (0–65535)"
                 )
             })?;
+        }
+
+        // Native Prometheus metrics server override.
+        //
+        // When set to a nonzero u16, (re-)enable the native henyey HTTP server on
+        // that port so the full Prometheus registry — including overlay/SCP
+        // metrics omitted from the stellar-core-compat medida `/metrics` — is
+        // reachable. This is needed because `translate_stellar_core_config`
+        // disables the native server whenever `HTTP_PORT` is set (the compat
+        // server takes that port), which is always the case under Supercluster.
+        // Env overrides apply *after* compat translation, so this re-enables it.
+        // Errors on a collision with the compat port (two servers cannot share a
+        // port). Unset ⇒ behavior unchanged. Metrics endpoints are divergeable
+        // (`docs/PARITY.md`).
+        if let Some(val) = lookup("RS_STELLAR_CORE_NATIVE_METRICS_PORT")? {
+            let port = val.parse::<u16>().with_context(|| {
+                format!(
+                    "RS_STELLAR_CORE_NATIVE_METRICS_PORT: invalid port '{val}', \
+                     must be a valid u16 (0–65535)"
+                )
+            })?;
+            if port != 0 {
+                if self.compat_http.enabled && port == self.compat_http.port {
+                    anyhow::bail!(
+                        "RS_STELLAR_CORE_NATIVE_METRICS_PORT ({port}) must differ \
+                         from the compat HTTP port ({})",
+                        self.compat_http.port
+                    );
+                }
+                self.http.enabled = true;
+                self.http.port = port;
+                self.http.address = "127.0.0.1".to_string();
+            }
         }
 
         // Logging overrides
@@ -4855,6 +4892,74 @@ name = "test"
             msg.contains("RS_STELLAR_CORE_OVERLAY_PEER_PORT"),
             "error should mention the env var name: {msg}"
         );
+    }
+
+    #[test]
+    fn test_env_override_native_metrics_port_enables_native_server() {
+        // Simulate a Supercluster deployment: compat on 11626, native disabled
+        // (as translate_stellar_core_config leaves it when HTTP_PORT is set).
+        // The env override must re-enable the native server on the distinct port.
+        let mut config = AppConfig::default();
+        config.http.enabled = false;
+        config.compat_http.enabled = true;
+        config.compat_http.port = 11626;
+        config
+            .apply_env_overrides_from(map_lookup(HashMap::from([(
+                "RS_STELLAR_CORE_NATIVE_METRICS_PORT",
+                "11628",
+            )])))
+            .unwrap();
+        assert!(config.http.enabled, "native server should be re-enabled");
+        assert_eq!(config.http.port, 11628);
+        assert_eq!(config.http.address, "127.0.0.1");
+        // Compat server is untouched.
+        assert!(config.compat_http.enabled);
+        assert_eq!(config.compat_http.port, 11626);
+    }
+
+    #[test]
+    fn test_env_override_native_metrics_port_collision_errors() {
+        let mut config = AppConfig::default();
+        config.compat_http.enabled = true;
+        config.compat_http.port = 11626;
+        let err = config
+            .apply_env_overrides_from(map_lookup(HashMap::from([(
+                "RS_STELLAR_CORE_NATIVE_METRICS_PORT",
+                "11626",
+            )])))
+            .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("RS_STELLAR_CORE_NATIVE_METRICS_PORT"),
+            "error should mention the env var name: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_env_override_native_metrics_port_invalid_errors() {
+        let mut config = AppConfig::default();
+        let err = config
+            .apply_env_overrides_from(map_lookup(HashMap::from([(
+                "RS_STELLAR_CORE_NATIVE_METRICS_PORT",
+                "abc",
+            )])))
+            .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("RS_STELLAR_CORE_NATIVE_METRICS_PORT"));
+    }
+
+    #[test]
+    fn test_env_override_native_metrics_port_zero_noop() {
+        // 0 = explicit "off": leave the native server as-is (disabled here).
+        let mut config = AppConfig::default();
+        config.http.enabled = false;
+        config
+            .apply_env_overrides_from(map_lookup(HashMap::from([(
+                "RS_STELLAR_CORE_NATIVE_METRICS_PORT",
+                "0",
+            )])))
+            .unwrap();
+        assert!(!config.http.enabled, "port 0 should not enable the server");
     }
 
     #[test]

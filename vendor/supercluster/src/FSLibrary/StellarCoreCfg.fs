@@ -20,6 +20,12 @@ open StellarDotnetSdk.Accounts
 module CfgVal =
     let httpPort = 11626
     let prometheusExporterPort = 9473
+    // henyey-only: native Prometheus /metrics server port (distinct from
+    // httpPort, which the compat medida server occupies). Set via the
+    // RS_STELLAR_CORE_NATIVE_METRICS_PORT env var so the full registry
+    // (overlay/SCP metrics) is reachable via pod-exec. Real stellar-core
+    // ignores this env var.
+    let henyeyNativeMetricsPort = 11628
     let labels = Map.ofSeq [ "app", "stellar-core" ]
     let labelSelector = "app = stellar-core"
     let stellarCoreBinPath = "stellar-core"
