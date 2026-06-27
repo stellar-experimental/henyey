@@ -79,4 +79,20 @@ A large part of the measured henyey-vs-core max-TPS gap on this benchmark is **c
 
 **Implication:** closing the *benchmark* gap would require giving henyey an equivalent (test-only / experimental) tx-batching path — benchmark-matching, not a v27 production-parity requirement (production core lacks it too). Whether to add a test/experimental feature to production code to match the benchmark is a product decision. This echoes the broader maxtps lesson: this benchmark contains core-favoring test-harness artifacts (cf. the earlier `wait_till_complete`/pacing measurement bugs).
 
+## CORRECTION + definitive disproof of the batching hypothesis
+
+Two errors in the section above, both caught and corrected by measurement:
+
+1. **Core was NOT batching in the comparison.** I claimed the gap was core's BUILD_TESTS tx-batching, but my own core metrics showed `overlay.flood.tx-batch-size` **count = 0** — core fulfilled demands with individual tx messages. And `MissionMaxTPSClassic` does **not** set `runForMaxTps`, so the deployed config has **none** of those knobs (verified on-pod: no `EXPERIMENTAL_TX_BATCH_MAX_SIZE`, no `FLOOD_DEMAND_PERIOD_MS`). The benchmark compares **default-config** core (≥650 tx/s here) vs **default-config** henyey (~238), both flooding individually.
+
+2. **Batching does not help henyey either.** I implemented tx-batching anyway and ran a controlled test: patched Supercluster to force `EXPERIMENTAL_TX_BATCH_MAX_SIZE=500` on all nodes (verified present in the deployed cfg) and re-ran. **henyey max = 215** — no improvement over the ~238 baseline (slightly lower, within noise). So tx-batching is **not** the lever, in either direction. The tx-batching commit was **reverted** (`1a6ff055`); the Supercluster patch was reverted.
+
+### Net conclusion
+
+The henyey↔core max-TPS gap on this benchmark is a **default-behavior** difference: at the same ~5 s cadence and idle CPU, core's intra-round tx propagation **completes** (agrees on ~3000-tx sets, eff≈1) while henyey's does not (eff<1 above ~238). It is **not** CPU, apply speed, cadence, tx-set validation speed, demand cadence, *or* tx-batching — all measured and ruled out. The precise remaining cause is in henyey's default overlay/consensus propagation efficiency and was not pinned: henyey's detailed overlay metrics (`stellar_overlay_tx_pull_latency_seconds`, demand timeouts) are not reachable in the Supercluster deployment (the compat `/metrics` on :11626 returns a curated medida-JSON without them; the native prometheus port collides on :11626), which blocked the final henyey-vs-core pull-latency comparison.
+
+### Kept (genuine parity-correctness fixes, max-TPS-neutral here)
+- `ccec4c3b` — parallelize per-tx tx-set validation (parity-exact, ~16× faster validation; useful for catchup/high-limit, not a maxtps win).
+- `6765988d` — honor `FLOOD_DEMAND_PERIOD_MS`/`FLOOD_DEMAND_BACKOFF_DELAY_MS` compat config (real bug: henyey ignored config keys core honors; defaults unchanged = parity).
+
 
