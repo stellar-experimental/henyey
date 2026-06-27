@@ -98,6 +98,8 @@ const SUPPORTED_KEYS: &[&str] = &[
     "FLOOD_ARB_TX_DAMPING_FACTOR",
     "FLOOD_TX_PERIOD_MS",
     "FLOOD_ADVERT_PERIOD_MS",
+    "FLOOD_DEMAND_PERIOD_MS",
+    "FLOOD_DEMAND_BACKOFF_DELAY_MS",
     "FAILURE_SAFETY",
     "UNSAFE_QUORUM",
     "SURVEYOR_KEYS",
@@ -367,6 +369,28 @@ pub fn translate_stellar_core_config(raw: &toml::Value) -> anyhow::Result<AppCon
         } else {
             tracing::warn!(
                 key = "FLOOD_ADVERT_PERIOD_MS",
+                value = v,
+                "Compat config key value must be >= 1"
+            );
+        }
+    }
+    if let Some(v) = get_i64(table, "FLOOD_DEMAND_PERIOD_MS") {
+        if v >= 1 {
+            config.overlay.flood_demand_period_ms = v as u64;
+        } else {
+            tracing::warn!(
+                key = "FLOOD_DEMAND_PERIOD_MS",
+                value = v,
+                "Compat config key value must be >= 1"
+            );
+        }
+    }
+    if let Some(v) = get_i64(table, "FLOOD_DEMAND_BACKOFF_DELAY_MS") {
+        if v >= 1 {
+            config.overlay.flood_demand_backoff_delay_ms = v as u64;
+        } else {
+            tracing::warn!(
+                key = "FLOOD_DEMAND_BACKOFF_DELAY_MS",
                 value = v,
                 "Compat config key value must be >= 1"
             );
@@ -3330,6 +3354,36 @@ FLOOD_TX_PERIOD_MS=300
         let raw: toml::Value = toml::from_str(toml_str).unwrap();
         let config = translate_stellar_core_config(&raw).unwrap();
         assert_eq!(config.overlay.flood_tx_period_ms, 300);
+    }
+
+    #[test]
+    fn test_flood_demand_period_ms_parsed() {
+        // Parity: stellar-core honors FLOOD_DEMAND_PERIOD_MS; henyey must too
+        // (Supercluster sets it to 100 for max-TPS, where the default 200 would
+        // halve the tx-pull cadence and slow intra-round propagation).
+        let toml_str = r#"
+NETWORK_PASSPHRASE="Test SDF Network ; September 2015"
+NODE_SEED="SBXTJSLKQ2VZUEQNYU5EC6ZGQOONCX3JCFBK57R56YLYMUW76B2FMCJH self"
+FLOOD_DEMAND_PERIOD_MS=100
+FLOOD_DEMAND_BACKOFF_DELAY_MS=1000
+"#;
+        let raw: toml::Value = toml::from_str(toml_str).unwrap();
+        let config = translate_stellar_core_config(&raw).unwrap();
+        assert_eq!(config.overlay.flood_demand_period_ms, 100);
+        assert_eq!(config.overlay.flood_demand_backoff_delay_ms, 1000);
+    }
+
+    #[test]
+    fn test_flood_demand_period_ms_default() {
+        let toml_str = r#"
+NETWORK_PASSPHRASE="Test SDF Network ; September 2015"
+NODE_SEED="SBXTJSLKQ2VZUEQNYU5EC6ZGQOONCX3JCFBK57R56YLYMUW76B2FMCJH self"
+"#;
+        let raw: toml::Value = toml::from_str(toml_str).unwrap();
+        let config = translate_stellar_core_config(&raw).unwrap();
+        // Defaults match stellar-core (FLOOD_DEMAND_PERIOD_MS=200, backoff=500).
+        assert_eq!(config.overlay.flood_demand_period_ms, 200);
+        assert_eq!(config.overlay.flood_demand_backoff_delay_ms, 500);
     }
 
     #[test]
