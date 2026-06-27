@@ -7,6 +7,24 @@ const TX_ADVERT_VECTOR_MAX_SIZE: usize = 1000;
 const TX_DEMAND_VECTOR_MAX_SIZE: usize = 1000;
 const MAX_FLOOD_RESOURCE: usize = u32::MAX as usize;
 
+/// Sentinel `previousLedgerHash` (32 bytes of `0x01`) marking a `TX_SET`-typed
+/// message as a *batch* of individually-flooded transactions rather than a real
+/// transaction set. Byte-identical to stellar-core's `TX_BATCH_HASH`
+/// (`OverlayManagerImpl.cpp`), so the wire format matches when batching is
+/// enabled via `experimental_tx_batch_max_size`.
+pub(crate) const TX_BATCH_HASH: [u8; 32] = [0x01; 32];
+
+/// Build a batched flood message carrying `txs` as a `TX_SET` with the
+/// [`TX_BATCH_HASH`] sentinel (stellar-core's `OverlayManager::createTxBatch`).
+fn build_tx_batch_message(txs: Vec<stellar_xdr::TransactionEnvelope>) -> StellarMessage {
+    StellarMessage::TxSet(stellar_xdr::TransactionSet {
+        previous_ledger_hash: stellar_xdr::Hash(TX_BATCH_HASH),
+        txs: txs
+            .try_into()
+            .expect("tx batch size exceeds TransactionSet capacity"),
+    })
+}
+
 // Flood-rate and flood-period parity constants.
 //
 // These mirror the fixed defaults stellar-core assigns in `Config.cpp`
@@ -706,25 +724,64 @@ impl App {
         // Match stellar-core: only send Transaction messages for found hashes.
         // Do NOT send DontHave for unfulfilled demands — stellar-core just
         // logs/meters misses without any outbound response.
+        // When `experimental_tx_batch_max_size > 0`, coalesce the demanded txs
+        // into `TX_SET`-typed batch messages (≤ batch_max each) instead of one
+        // `Transaction` message per tx — matching stellar-core's
+        // EXPERIMENTAL_TX_BATCH_MAX_SIZE path and cutting per-tx message
+        // overhead under load. `0` (default) preserves individual sends.
+        let batch_max = self.config.overlay.experimental_tx_batch_max_size;
         let mut sent = 0u32;
         let mut dropped = 0u32;
         let mut banned = 0u32;
         let mut unknown = 0u32;
+        let mut batch: Vec<stellar_xdr::TransactionEnvelope> = Vec::new();
         for hash in demand.tx_hashes.0.iter() {
             let hash256 = Hash256::from(hash.clone());
             if let Some(tx) = self.herder.tx_queue().get(&hash256) {
-                match overlay.try_send_to(peer_id, StellarMessage::Transaction(tx.into_envelope()))
-                {
-                    Ok(()) => sent += 1,
-                    Err(_) => {
-                        dropped += 1;
-                        break; // Channel full — stop sending to this peer
+                let env = tx.into_envelope();
+                if batch_max > 0 {
+                    batch.push(env);
+                    if batch.len() >= batch_max {
+                        let n = batch.len() as u32;
+                        if overlay
+                            .try_send_to(
+                                peer_id,
+                                build_tx_batch_message(std::mem::take(&mut batch)),
+                            )
+                            .is_ok()
+                        {
+                            sent += n;
+                        } else {
+                            dropped += 1;
+                            break; // Channel full — stop sending to this peer
+                        }
+                    }
+                } else {
+                    match overlay.try_send_to(peer_id, StellarMessage::Transaction(env)) {
+                        Ok(()) => sent += 1,
+                        Err(_) => {
+                            dropped += 1;
+                            break; // Channel full — stop sending to this peer
+                        }
                     }
                 }
             } else if self.herder.tx_queue().is_banned(&hash256) {
                 banned += 1;
             } else {
                 unknown += 1;
+            }
+        }
+        // Flush any trailing partial batch (only reached on normal loop end —
+        // a channel-full break leaves `batch` empty via `mem::take`).
+        if !batch.is_empty() {
+            let n = batch.len() as u32;
+            if overlay
+                .try_send_to(peer_id, build_tx_batch_message(batch))
+                .is_ok()
+            {
+                sent += n;
+            } else {
+                dropped += 1;
             }
         }
         if sent > 0 || dropped > 0 || banned > 0 || unknown > 0 {
@@ -1366,6 +1423,26 @@ mod tests {
 
     fn ms(v: u64) -> Duration {
         Duration::from_millis(v)
+    }
+
+    #[test]
+    fn test_tx_batch_hash_matches_core_sentinel() {
+        // stellar-core's TX_BATCH_HASH is 32 bytes of 0x01.
+        assert_eq!(TX_BATCH_HASH, [0x01u8; 32]);
+    }
+
+    #[test]
+    fn test_build_tx_batch_message_wraps_txs_with_sentinel() {
+        let txs = vec![make_envelope(100, 1), make_envelope(200, 1)];
+        let msg = build_tx_batch_message(txs.clone());
+        match msg {
+            StellarMessage::TxSet(set) => {
+                assert_eq!(set.previous_ledger_hash.0, TX_BATCH_HASH);
+                assert_eq!(set.txs.len(), 2);
+                assert_eq!(set.txs.to_vec(), txs);
+            }
+            other => panic!("expected TxSet batch, got {other:?}"),
+        }
     }
 
     #[test]

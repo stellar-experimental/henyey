@@ -1720,6 +1720,34 @@ impl App {
         *self.self_arc.write().await = Arc::downgrade(self);
     }
 
+    /// Ingest a single flood-delivered transaction (from an individual
+    /// `Transaction` message or a batched tx message) into the herder queue.
+    /// Mirrors stellar-core's per-tx handling: forget the flood record on
+    /// terminal results and record pull latency on accept/duplicate.
+    async fn ingest_flooded_transaction(
+        &self,
+        tx_env: stellar_xdr::TransactionEnvelope,
+        from_peer: &henyey_overlay::PeerId,
+    ) {
+        let tx_hash = Hash256::hash_xdr(&tx_env);
+        let flood_msg_hash =
+            henyey_overlay::compute_message_hash(&StellarMessage::Transaction(tx_env.clone()));
+        let result = self.herder.receive_transaction(tx_env);
+        // Parity: OverlayManagerImpl.cpp:1231-1236 — forgetFloodedMsg for any
+        // result that is not PENDING or DUPLICATE.
+        if should_forget_tx_flood_record(&result) {
+            if let Some(overlay) = self.overlay().await {
+                overlay.forget_flooded_msg(&flood_msg_hash);
+            }
+        }
+        if matches!(
+            result,
+            henyey_herder::TxQueueResult::Added | henyey_herder::TxQueueResult::Duplicate
+        ) {
+            self.record_tx_pull_latency(tx_hash, from_peer).await;
+        }
+    }
+
     /// Handle a message from the overlay network.
     async fn handle_overlay_message(&self, msg: OverlayMessage) {
         match msg.message {
@@ -1739,49 +1767,8 @@ impl App {
             }
 
             StellarMessage::Transaction(tx_env) => {
-                let tx_hash = Hash256::hash_xdr(&tx_env);
-                let flood_msg_hash = henyey_overlay::compute_message_hash(
-                    &StellarMessage::Transaction(tx_env.clone()),
-                );
-                let result = self.herder.receive_transaction(tx_env);
-                // Parity: OverlayManagerImpl.cpp:1231-1236 — forgetFloodedMsg
-                // for any result that is not PENDING or DUPLICATE.
-                if should_forget_tx_flood_record(&result) {
-                    if let Some(overlay) = self.overlay().await {
-                        overlay.forget_flooded_msg(&flood_msg_hash);
-                    }
-                }
-                match result {
-                    henyey_herder::TxQueueResult::Added => {
-                        tracing::debug!(peer = %msg.from_peer, "Transaction added to queue");
-                        self.record_tx_pull_latency(tx_hash, &msg.from_peer).await;
-                        // No explicit advert enqueue — flush_tx_adverts() reads
-                        // the herder queue in priority order each flood period.
-                    }
-                    henyey_herder::TxQueueResult::Duplicate => {
-                        self.record_tx_pull_latency(tx_hash, &msg.from_peer).await;
-                    }
-                    henyey_herder::TxQueueResult::QueueFull => {
-                        // Aggregate count emitted per ledger close in Herder::ledger_closed()
-                    }
-                    henyey_herder::TxQueueResult::FeeTooLow => {
-                        tracing::debug!("Transaction fee too low, rejected");
-                    }
-                    henyey_herder::TxQueueResult::Invalid(code) => {
-                        tracing::debug!(?code, "Invalid transaction rejected");
-                    }
-                    henyey_herder::TxQueueResult::Banned => {
-                        tracing::debug!("Transaction from banned source rejected");
-                    }
-                    henyey_herder::TxQueueResult::Filtered => {
-                        tracing::debug!("Transaction filtered by operation type");
-                    }
-                    henyey_herder::TxQueueResult::TryAgainLater => {
-                        tracing::debug!(
-                            "Transaction rejected: account already has pending transaction"
-                        );
-                    }
-                }
+                self.ingest_flooded_transaction(tx_env, &msg.from_peer)
+                    .await;
             }
 
             StellarMessage::FloodAdvert(advert) => {
@@ -1906,20 +1893,35 @@ impl App {
             }
 
             StellarMessage::TxSet(tx_set) => {
-                // Compute hash for logging
-                let computed_hash =
-                    match stellar_xdr::WriteXdr::to_xdr(&tx_set, stellar_xdr::Limits::none()) {
-                        Ok(xdr_bytes) => format!("{}", henyey_common::Hash256::hash(&xdr_bytes)),
-                        Err(e) => format!("<encoding failed: {e}>"),
-                    };
-                tracing::info!(
-                    peer = %msg.from_peer,
-                    computed_hash = %computed_hash,
-                    prev_ledger = hex::encode(tx_set.previous_ledger_hash.0),
-                    tx_count = tx_set.txs.len(),
-                    "APP: Received TxSet from overlay"
-                );
-                self.handle_tx_set(tx_set).await;
+                // A TX_SET with the sentinel previous-ledger-hash is a *batch* of
+                // individually-flooded transactions (stellar-core's tx-batch
+                // path), not a real tx-set: unpack and ingest each tx as if it
+                // had arrived as its own `Transaction` message.
+                if tx_set.previous_ledger_hash.0 == crate::app::tx_flooding::TX_BATCH_HASH {
+                    let n = tx_set.txs.len();
+                    for tx_env in tx_set.txs.to_vec() {
+                        self.ingest_flooded_transaction(tx_env, &msg.from_peer)
+                            .await;
+                    }
+                    tracing::debug!(peer = %msg.from_peer, tx_count = n, "Ingested tx batch");
+                } else {
+                    // Compute hash for logging
+                    let computed_hash =
+                        match stellar_xdr::WriteXdr::to_xdr(&tx_set, stellar_xdr::Limits::none()) {
+                            Ok(xdr_bytes) => {
+                                format!("{}", henyey_common::Hash256::hash(&xdr_bytes))
+                            }
+                            Err(e) => format!("<encoding failed: {e}>"),
+                        };
+                    tracing::info!(
+                        peer = %msg.from_peer,
+                        computed_hash = %computed_hash,
+                        prev_ledger = hex::encode(tx_set.previous_ledger_hash.0),
+                        tx_count = tx_set.txs.len(),
+                        "APP: Received TxSet from overlay"
+                    );
+                    self.handle_tx_set(tx_set).await;
+                }
             }
 
             StellarMessage::GeneralizedTxSet(gen_tx_set) => {
