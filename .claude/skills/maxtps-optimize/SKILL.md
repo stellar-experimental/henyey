@@ -112,7 +112,18 @@ runs to the cap (or target) by construction.
 ### Diagnosis escalation ladder (use when no >5% code lever is ready)
 Each rung is a valid iteration; climb it until a concrete, diagnosed,
 parity-safe lever emerges, then implement+measure it:
-1. **Scrape existing meters** (`/metrics`, `/info`) at passing and failing rates.
+1. **Scrape existing meters** at passing and failing rates. Two endpoints (via
+   `nsc kubectl <inst> exec <pod> -c stellar-core-run -- curl -s localhost:<port>/...`):
+   - `:11626` `/metrics` (compat **medida JSON**, `/info`) — curated core-compat
+     set (ledger close, tx count, etc.); this is what Supercluster itself reads.
+   - `:11628` `/metrics` (native **Prometheus** registry) — the FULL set incl. the
+     overlay/SCP propagation metrics absent from the medida JSON:
+     `stellar_overlay_tx_pull_latency_seconds` (mean = `_sum`/`_count`),
+     `stellar_overlay_demand_timeout_total`, `stellar_scp_timing_nominated_*`.
+     Enabled in SSC via the `RS_STELLAR_CORE_NATIVE_METRICS_PORT` env var
+     (Supercluster sets `11628`; see `StellarKubeSpecs.fs`). Use this for the
+     henyey-vs-core propagation comparison (core's overlay metrics are in its
+     medida `:11626` JSON, e.g. `overlay.flood.tx-pull-latency`).
 2. **Add metrics** (`crates/app/src/metrics.rs` catalog + refresh) for the
    suspected subsystem.
 3. **Add targeted logs** (e.g. `tracing::info!(target:"maxtps_diag", …)`) on the
