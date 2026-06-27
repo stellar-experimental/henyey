@@ -100,7 +100,6 @@ const SUPPORTED_KEYS: &[&str] = &[
     "FLOOD_ADVERT_PERIOD_MS",
     "FLOOD_DEMAND_PERIOD_MS",
     "FLOOD_DEMAND_BACKOFF_DELAY_MS",
-    "EXPERIMENTAL_TX_BATCH_MAX_SIZE",
     "FAILURE_SAFETY",
     "UNSAFE_QUORUM",
     "SURVEYOR_KEYS",
@@ -394,17 +393,6 @@ pub fn translate_stellar_core_config(raw: &toml::Value) -> anyhow::Result<AppCon
                 key = "FLOOD_DEMAND_BACKOFF_DELAY_MS",
                 value = v,
                 "Compat config key value must be >= 1"
-            );
-        }
-    }
-    if let Some(v) = get_i64(table, "EXPERIMENTAL_TX_BATCH_MAX_SIZE") {
-        if v >= 0 {
-            config.overlay.experimental_tx_batch_max_size = v as usize;
-        } else {
-            tracing::warn!(
-                key = "EXPERIMENTAL_TX_BATCH_MAX_SIZE",
-                value = v,
-                "Compat config key value must be >= 0"
             );
         }
     }
@@ -3383,30 +3371,6 @@ FLOOD_DEMAND_BACKOFF_DELAY_MS=1000
         let config = translate_stellar_core_config(&raw).unwrap();
         assert_eq!(config.overlay.flood_demand_period_ms, 100);
         assert_eq!(config.overlay.flood_demand_backoff_delay_ms, 1000);
-    }
-
-    #[test]
-    fn test_experimental_tx_batch_max_size_parsed() {
-        let toml_str = r#"
-NETWORK_PASSPHRASE="Test SDF Network ; September 2015"
-NODE_SEED="SBXTJSLKQ2VZUEQNYU5EC6ZGQOONCX3JCFBK57R56YLYMUW76B2FMCJH self"
-EXPERIMENTAL_TX_BATCH_MAX_SIZE=500
-"#;
-        let raw: toml::Value = toml::from_str(toml_str).unwrap();
-        let config = translate_stellar_core_config(&raw).unwrap();
-        assert_eq!(config.overlay.experimental_tx_batch_max_size, 500);
-    }
-
-    #[test]
-    fn test_experimental_tx_batch_max_size_default_disabled() {
-        let toml_str = r#"
-NETWORK_PASSPHRASE="Test SDF Network ; September 2015"
-NODE_SEED="SBXTJSLKQ2VZUEQNYU5EC6ZGQOONCX3JCFBK57R56YLYMUW76B2FMCJH self"
-"#;
-        let raw: toml::Value = toml::from_str(toml_str).unwrap();
-        let config = translate_stellar_core_config(&raw).unwrap();
-        // Default 0 = disabled (individual sends), matching production stellar-core.
-        assert_eq!(config.overlay.experimental_tx_batch_max_size, 0);
     }
 
     #[test]

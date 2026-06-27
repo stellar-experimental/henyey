@@ -1203,16 +1203,6 @@ pub struct OverlayConfig {
     #[serde(default = "default_peer_max_failures")]
     pub peer_max_failures: u32,
 
-    /// Maximum number of transactions packed into a single batched flood
-    /// message when fulfilling a demand. `0` (default) disables batching —
-    /// each demanded tx is sent as an individual `Transaction` message, which
-    /// matches production stellar-core. Matches stellar-core's
-    /// `EXPERIMENTAL_TX_BATCH_MAX_SIZE` (a BUILD_TESTS-only knob there); when
-    /// set, demand responses are coalesced into `TX_SET`-typed batch messages
-    /// (sentinel `previousLedgerHash`), reducing per-tx message overhead.
-    #[serde(default)]
-    pub experimental_tx_batch_max_size: usize,
-
     /// Arbitrage flood damping: number of unconditional broadcasts per asset
     /// pair per ledger. Set to `-1` to disable. Default `5`.
     /// Matches stellar-core `FLOOD_ARB_TX_BASE_ALLOWANCE`.
@@ -1264,7 +1254,6 @@ impl Default for OverlayConfig {
             flood_tx_period_ms: default_flood_tx_period_ms(),
             flood_demand_backoff_delay_ms: default_flood_demand_backoff_delay_ms(),
             peer_max_failures: default_peer_max_failures(),
-            experimental_tx_batch_max_size: 0,
             flood_arb_tx_base_allowance: default_flood_arb_tx_base_allowance(),
             flood_arb_tx_damping_factor: default_flood_arb_tx_damping_factor(),
             peer_flood_reading_capacity_bytes: 0,
