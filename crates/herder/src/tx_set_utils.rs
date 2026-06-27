@@ -917,6 +917,57 @@ pub fn get_invalid_hashed_tx_list(
     )
 }
 
+/// Outcome of the independent per-transaction pass-1 validation. Carries the
+/// fee contribution for valid txs so the cross-tx `account_fee_map` can be
+/// accumulated deterministically after a (possibly parallel) validation pass.
+enum Pass1Outcome {
+    /// Transaction failed pass-1 validation.
+    Invalid,
+    /// Transaction is valid and a fee balance provider is present.
+    Valid {
+        fee_source: AccountId,
+        full_fee: i64,
+    },
+    /// Transaction is valid but no fee provider — no fee accumulation needed.
+    ValidNoFee,
+}
+
+/// Run the independent pass-1 validation closure over `txs`, in parallel across
+/// the available cores for large sets and serially for small ones.
+///
+/// The closure must be pure w.r.t. shared state (it only reads the validation
+/// context and the `Send + Sync` ledger-state providers), so results depend only
+/// on the input transaction — order-independent. Results are returned in input
+/// order, so the caller's serial merge is deterministic and parity-preserving.
+fn parallel_validate_pass1(
+    txs: &[HashedTx],
+    outcome_of: &(impl Fn(&HashedTx) -> Pass1Outcome + Sync),
+) -> Vec<Pass1Outcome> {
+    // Below this size the thread-spawn overhead outweighs the work.
+    const PARALLEL_THRESHOLD: usize = 96;
+    if txs.len() < PARALLEL_THRESHOLD {
+        return txs.iter().map(outcome_of).collect();
+    }
+    let n_threads = std::thread::available_parallelism()
+        .map(|v| v.get())
+        .unwrap_or(1)
+        .clamp(1, 16);
+    if n_threads <= 1 {
+        return txs.iter().map(outcome_of).collect();
+    }
+    let chunk_size = txs.len().div_ceil(n_threads);
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = txs
+            .chunks(chunk_size)
+            .map(|chunk| scope.spawn(move || chunk.iter().map(outcome_of).collect::<Vec<_>>()))
+            .collect();
+        handles
+            .into_iter()
+            .flat_map(|h| h.join().expect("tx-set validation worker panicked"))
+            .collect()
+    })
+}
+
 /// Private core: validates transactions and returns invalid ones with hashes.
 ///
 /// Accepts pre-hashed transactions. In pass 1, caches `fee_source_id` from the
@@ -946,7 +997,16 @@ fn get_invalid_hashed_core(
     // Pass-1 fee_source cache: avoids TransactionFrame construction in pass 2.
     let mut fee_source_cache: HashMap<Hash256, AccountId> = HashMap::new();
 
-    for htx in txs {
+    // Pass-1 per-tx validation is independent across transactions: a generalized
+    // tx-set forbids multiple txs per source account (checked upstream), so there
+    // are no intra-set sequence or fee dependencies in this pass. The per-tx
+    // stateful validation (account load + signature verification) is the
+    // consensus-path bottleneck under high load while CPU sits idle, so we run it
+    // across the available cores. Outcomes are merged below in deterministic tx
+    // order, so the returned invalid set and accumulated `account_fee_map` are
+    // identical to the serial computation — observable consensus output is
+    // unchanged (parity-preserving). See docs/maxtps-optimization/.
+    let outcome_of = |htx: &HashedTx| -> Pass1Outcome {
         let frame = TransactionFrame::with_network(htx.envelope.clone(), ctx.network_id);
 
         // Stateless structural + per-op validation (shared with queue admission).
@@ -958,56 +1018,68 @@ fn get_invalid_hashed_core(
         )
         .is_err()
         {
-            seen_invalid.insert(htx.hash);
-            invalid_txs.push(htx.clone());
-            continue;
+            return Pass1Outcome::Invalid;
         }
 
         // Per-op structural validation (isOpSupported + doCheckValid).
         // This is stateless and always runs, even when account_provider is None.
         if !validate_ops_structure(&frame, ctx.protocol_version, ctx.ledger_flags) {
-            seen_invalid.insert(htx.hash);
-            invalid_txs.push(htx.clone());
-            continue;
+            return Pass1Outcome::Invalid;
         }
 
         // Validate with upper bound close time (catches max_time violations).
-        let upper_result = validate_basic(&frame, &upper_ledger_ctx);
-
-        if upper_result.is_err() {
-            seen_invalid.insert(htx.hash);
-            invalid_txs.push(htx.clone());
-            continue;
+        if validate_basic(&frame, &upper_ledger_ctx).is_err() {
+            return Pass1Outcome::Invalid;
         }
 
         // If offsets differ, also validate with lower bound close time.
         if need_lower_check {
             let lower_ledger_ctx = ctx.to_ledger_context(lower_close_time);
             if validate_basic(&frame, &lower_ledger_ctx).is_err() {
-                seen_invalid.insert(htx.hash);
-                invalid_txs.push(htx.clone());
-                continue;
+                return Pass1Outcome::Invalid;
             }
         }
 
         // Stateful validation: sequence, auth, and signature checks.
         if let Some(provider) = account_provider {
             if !validate_tx_for_tx_set(&frame, ctx, lower_close_time, provider) {
-                seen_invalid.insert(htx.hash);
-                invalid_txs.push(htx.clone());
-                continue;
+                return Pass1Outcome::Invalid;
             }
         }
 
-        // Transaction passed basic validation — accumulate fee for fee source.
+        // Transaction passed basic validation — record fee for fee source.
         if fee_balance_provider.is_some() {
-            let fee_source = frame.fee_source_account_id();
-            let full_fee = frame.total_fee().as_i64();
-            let entry = account_fee_map.entry(fee_source.clone()).or_insert(0i64);
-            // Saturating add to avoid overflow (matches stellar-core).
-            *entry = entry.saturating_add(full_fee);
-            // Cache fee_source for pass-2 lookup.
-            fee_source_cache.insert(htx.hash, fee_source);
+            Pass1Outcome::Valid {
+                fee_source: frame.fee_source_account_id(),
+                full_fee: frame.total_fee().as_i64(),
+            }
+        } else {
+            Pass1Outcome::ValidNoFee
+        }
+    };
+
+    let outcomes = parallel_validate_pass1(txs, &outcome_of);
+
+    // Deterministic serial merge in tx order: produces a byte-identical result to
+    // the previous serial loop (invalid set membership and fee-map sums are
+    // order-independent / commutative).
+    for (htx, outcome) in txs.iter().zip(outcomes) {
+        match outcome {
+            Pass1Outcome::Invalid => {
+                seen_invalid.insert(htx.hash);
+                invalid_txs.push(htx.clone());
+            }
+            Pass1Outcome::ValidNoFee => {}
+            Pass1Outcome::Valid {
+                fee_source,
+                full_fee,
+            } => {
+                let entry = account_fee_map.entry(fee_source.clone()).or_insert(0i64);
+                // Saturating add to avoid overflow (matches stellar-core).
+                *entry = entry.saturating_add(full_fee);
+                // Cache fee_source for pass-2 lookup.
+                fee_source_cache.insert(htx.hash, fee_source);
+            }
         }
     }
 
