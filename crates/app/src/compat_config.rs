@@ -3382,6 +3382,50 @@ FLOOD_ADVERT_PERIOD_MS=-1
         assert_eq!(config.overlay.flood_advert_period_ms, 100);
     }
 
+    #[test]
+    fn test_flood_demand_period_ms_parsed() {
+        let toml_str = r#"
+NETWORK_PASSPHRASE="Test SDF Network ; September 2015"
+NODE_SEED="SBXTJSLKQ2VZUEQNYU5EC6ZGQOONCX3JCFBK57R56YLYMUW76B2FMCJH self"
+FLOOD_DEMAND_PERIOD_MS=350
+FLOOD_DEMAND_BACKOFF_DELAY_MS=750
+"#;
+        let raw: toml::Value = toml::from_str(toml_str).unwrap();
+        let config = translate_stellar_core_config(&raw).unwrap();
+        assert_eq!(config.overlay.flood_demand_period_ms, 350);
+        assert_eq!(config.overlay.flood_demand_backoff_delay_ms, 750);
+    }
+
+    #[test]
+    fn test_flood_demand_period_ms_default() {
+        let toml_str = r#"
+NETWORK_PASSPHRASE="Test SDF Network ; September 2015"
+NODE_SEED="SBXTJSLKQ2VZUEQNYU5EC6ZGQOONCX3JCFBK57R56YLYMUW76B2FMCJH self"
+"#;
+        let raw: toml::Value = toml::from_str(toml_str).unwrap();
+        let config = translate_stellar_core_config(&raw).unwrap();
+        // Absent keys must preserve the henyey defaults, which match
+        // stellar-core (FLOOD_DEMAND_PERIOD_MS=200, FLOOD_DEMAND_BACKOFF_DELAY_MS=500).
+        assert_eq!(config.overlay.flood_demand_period_ms, 200);
+        assert_eq!(config.overlay.flood_demand_backoff_delay_ms, 500);
+    }
+
+    #[test]
+    fn test_flood_demand_period_ms_invalid_preserves_default() {
+        let toml_str = r#"
+NETWORK_PASSPHRASE="Test SDF Network ; September 2015"
+NODE_SEED="SBXTJSLKQ2VZUEQNYU5EC6ZGQOONCX3JCFBK57R56YLYMUW76B2FMCJH self"
+FLOOD_DEMAND_PERIOD_MS=0
+FLOOD_DEMAND_BACKOFF_DELAY_MS=-1
+"#;
+        let raw: toml::Value = toml::from_str(toml_str).unwrap();
+        let config = translate_stellar_core_config(&raw).unwrap();
+        // stellar-core parses both with readInt<int>(item, 1) (minimum 1), so
+        // values below 1 are invalid and the defaults are preserved.
+        assert_eq!(config.overlay.flood_demand_period_ms, 200);
+        assert_eq!(config.overlay.flood_demand_backoff_delay_ms, 500);
+    }
+
     // --- PEER_FLOOD_READING_CAPACITY_BYTES / FLOW_CONTROL_SEND_MORE_BATCH_SIZE_BYTES ---
 
     #[test]
