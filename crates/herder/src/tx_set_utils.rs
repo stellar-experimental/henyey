@@ -5445,4 +5445,186 @@ mod tests {
         let wrong_hash = Hash256::hash_xdr(&make_valid_envelope(200, 2));
         HashedTx::from_prehashed(wrong_hash, Arc::new(envelope));
     }
+
+    // --- Parallel pass-1 determinism / parity (issue #3673) ---
+
+    /// Build a mixed tx-set large enough to exercise multiple parallel chunks:
+    /// a deterministic interleaving of valid, structurally-invalid (low fee),
+    /// time-expired, and bad-ledger-bounds txs, plus a fee-source group whose
+    /// cumulative fee straddles the available balance. Returns the hashed txs,
+    /// an account provider, and a fee-balance provider.
+    fn make_parity_fixture(
+        n: usize,
+    ) -> (Vec<HashedTx>, MockAccountProvider, MockFeeBalanceProvider) {
+        let mut accounts = MockAccountProvider::new();
+        let mut fees = MockFeeBalanceProvider::new();
+        let mut envelopes: Vec<TransactionEnvelope> = Vec::new();
+
+        // A shared fee source group: several valid txs from distinct source
+        // accounts but... in this fixture each tx has a distinct source, so the
+        // fee map keys are per-source. We seed balances so some are affordable
+        // and some are not, exercising pass-2 across chunk boundaries.
+        for i in 0..n {
+            let env = match i % 4 {
+                0 => {
+                    // Valid tx from a distinct, funded source.
+                    let mut key = [0u8; 32];
+                    key[0] = 0xA0;
+                    key[1] = (i & 0xff) as u8;
+                    key[2] = ((i >> 8) & 0xff) as u8;
+                    accounts.add_account(key, 0); // seq 0 -> tx seq 1 valid
+                    fees.set_balance(key, 1_000_000);
+                    make_envelope_with_source(key, 200, 1)
+                }
+                1 => make_low_fee_envelope(i as i64 + 1), // structurally invalid
+                2 => make_expired_time_envelope(i as i64 + 1), // time invalid
+                _ => {
+                    // Valid-structure tx whose source can't pay the fee.
+                    let mut key = [0u8; 32];
+                    key[0] = 0xB0;
+                    key[1] = (i & 0xff) as u8;
+                    key[2] = ((i >> 8) & 0xff) as u8;
+                    accounts.add_account(key, 0);
+                    fees.set_balance(key, 50); // < fee 200 -> can't pay
+                    make_envelope_with_source(key, 200, 1)
+                }
+            };
+            envelopes.push(env);
+        }
+
+        let hashed: Vec<HashedTx> = envelopes.into_iter().map(HashedTx::new).collect();
+        (hashed, accounts, fees)
+    }
+
+    /// The parallel pass-1 path must produce a byte-identical invalid-hash list
+    /// (in the same order) AND identical fee map to the serial oracle, for every
+    /// input. Running it many times would expose any reliance on thread
+    /// completion order (a non-deterministic merge would intermittently reorder
+    /// the invalid list or mis-accumulate the fee map).
+    #[test]
+    fn test_parallel_pass1_matches_serial_oracle() {
+        let ctx = test_context();
+        let bounds = CloseTimeBounds::exact();
+
+        for n in [0usize, 1, 2, 5, 17, 64, 257] {
+            let (hashed, accounts, fees) = make_parity_fixture(n);
+
+            // Serial oracle.
+            let mut serial_fee_map: HashMap<AccountId, i64> = HashMap::new();
+            let serial = get_invalid_hashed_core_serial(
+                &hashed,
+                &ctx,
+                &bounds,
+                Some(&fees),
+                Some(&accounts),
+                &mut serial_fee_map,
+            );
+            let serial_hashes: Vec<Hash256> = serial.iter().map(|h| h.hash()).collect();
+
+            // Run the parallel path repeatedly to catch completion-order reliance.
+            for run in 0..16 {
+                let mut par_fee_map: HashMap<AccountId, i64> = HashMap::new();
+                let par = get_invalid_hashed_core_parallel(
+                    &hashed,
+                    &ctx,
+                    &bounds,
+                    Some(&fees),
+                    Some(&accounts),
+                    &mut par_fee_map,
+                );
+                let par_hashes: Vec<Hash256> = par.iter().map(|h| h.hash()).collect();
+
+                assert_eq!(
+                    par_hashes, serial_hashes,
+                    "n={n} run={run}: parallel invalid-hash list (and order) must equal serial oracle"
+                );
+                assert_eq!(
+                    par_fee_map, serial_fee_map,
+                    "n={n} run={run}: parallel fee map must equal serial oracle"
+                );
+            }
+        }
+    }
+
+    /// The public dispatcher (which chooses serial vs parallel by size) must
+    /// always equal the serial oracle, regardless of the chunking threshold.
+    #[test]
+    fn test_public_core_matches_serial_oracle() {
+        let ctx = test_context();
+        let bounds = CloseTimeBounds::exact();
+
+        for n in [0usize, 3, 64, 300] {
+            let (hashed, accounts, fees) = make_parity_fixture(n);
+
+            let mut oracle_map: HashMap<AccountId, i64> = HashMap::new();
+            let oracle = get_invalid_hashed_core_serial(
+                &hashed,
+                &ctx,
+                &bounds,
+                Some(&fees),
+                Some(&accounts),
+                &mut oracle_map,
+            );
+            let oracle_hashes: Vec<Hash256> = oracle.iter().map(|h| h.hash()).collect();
+
+            let mut pub_map: HashMap<AccountId, i64> = HashMap::new();
+            let actual = get_invalid_hashed_core(
+                &hashed,
+                &ctx,
+                &bounds,
+                Some(&fees),
+                Some(&accounts),
+                &mut pub_map,
+            );
+            let actual_hashes: Vec<Hash256> = actual.iter().map(|h| h.hash()).collect();
+
+            assert_eq!(
+                actual_hashes, oracle_hashes,
+                "n={n}: public core must match serial oracle"
+            );
+            assert_eq!(
+                pub_map, oracle_map,
+                "n={n}: public core fee map must match serial oracle"
+            );
+        }
+    }
+
+    /// Cross-phase fee map carry-over (V26+) must be preserved by the parallel
+    /// path: a pre-populated fee map entry must be added to, not overwritten.
+    #[test]
+    fn test_parallel_preserves_prepopulated_fee_map() {
+        let ctx = test_context();
+        let bounds = CloseTimeBounds::exact();
+        let (hashed, accounts, fees) = make_parity_fixture(64);
+
+        let prior_key = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([0xC0; 32])));
+
+        let mut serial_map: HashMap<AccountId, i64> = HashMap::new();
+        serial_map.insert(prior_key.clone(), 777);
+        let _ = get_invalid_hashed_core_serial(
+            &hashed,
+            &ctx,
+            &bounds,
+            Some(&fees),
+            Some(&accounts),
+            &mut serial_map,
+        );
+
+        let mut par_map: HashMap<AccountId, i64> = HashMap::new();
+        par_map.insert(prior_key.clone(), 777);
+        let _ = get_invalid_hashed_core_parallel(
+            &hashed,
+            &ctx,
+            &bounds,
+            Some(&fees),
+            Some(&accounts),
+            &mut par_map,
+        );
+
+        assert_eq!(
+            par_map, serial_map,
+            "parallel path must preserve and extend a pre-populated fee map identically to serial"
+        );
+        assert_eq!(par_map.get(&prior_key).copied(), Some(777));
+    }
 }
