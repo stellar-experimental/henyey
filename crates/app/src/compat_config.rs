@@ -98,6 +98,8 @@ const SUPPORTED_KEYS: &[&str] = &[
     "FLOOD_ARB_TX_DAMPING_FACTOR",
     "FLOOD_TX_PERIOD_MS",
     "FLOOD_ADVERT_PERIOD_MS",
+    "FLOOD_DEMAND_PERIOD_MS",
+    "FLOOD_DEMAND_BACKOFF_DELAY_MS",
     "FAILURE_SAFETY",
     "UNSAFE_QUORUM",
     "SURVEYOR_KEYS",
@@ -367,6 +369,31 @@ pub fn translate_stellar_core_config(raw: &toml::Value) -> anyhow::Result<AppCon
         } else {
             tracing::warn!(
                 key = "FLOOD_ADVERT_PERIOD_MS",
+                value = v,
+                "Compat config key value must be >= 1"
+            );
+        }
+    }
+    // stellar-core parses FLOOD_DEMAND_PERIOD_MS / FLOOD_DEMAND_BACKOFF_DELAY_MS
+    // with readInt<int>(item, 1) (minimum 1); values below 1 are rejected
+    // (Config.cpp:1427-1441). Mirror that bound and fall back to the default.
+    if let Some(v) = get_i64(table, "FLOOD_DEMAND_PERIOD_MS") {
+        if v >= 1 {
+            config.overlay.flood_demand_period_ms = v as u64;
+        } else {
+            tracing::warn!(
+                key = "FLOOD_DEMAND_PERIOD_MS",
+                value = v,
+                "Compat config key value must be >= 1"
+            );
+        }
+    }
+    if let Some(v) = get_i64(table, "FLOOD_DEMAND_BACKOFF_DELAY_MS") {
+        if v >= 1 {
+            config.overlay.flood_demand_backoff_delay_ms = v as u64;
+        } else {
+            tracing::warn!(
+                key = "FLOOD_DEMAND_BACKOFF_DELAY_MS",
                 value = v,
                 "Compat config key value must be >= 1"
             );
