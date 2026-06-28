@@ -684,6 +684,21 @@ metric_catalog! {
         OVERLAY_DEMAND_TIMEOUT_TOTAL = "stellar_overlay_demand_timeout_total"
             => "Total tx demands re-issued after a prior demand timed out";
 
+        // [maxtps_diag] Fulfiller-side demand outcomes (why a demand we receive
+        // is/ isn't answered). Recorded by string in app::tx_flooding.
+        OVERLAY_DEMAND_FULFILLED_TOTAL = "stellar_overlay_demand_fulfilled_total"
+            => "Total demanded txs we answered (sent the tx)";
+        OVERLAY_DEMAND_UNFULFILLED_DROPPED_TOTAL = "stellar_overlay_demand_unfulfilled_dropped_total"
+            => "Total demanded txs not answered because the peer outbound channel was full";
+        OVERLAY_DEMAND_UNFULFILLED_BANNED_TOTAL = "stellar_overlay_demand_unfulfilled_banned_total"
+            => "Total demanded txs not answered because the tx is banned";
+        OVERLAY_DEMAND_UNFULFILLED_UNKNOWN_TOTAL = "stellar_overlay_demand_unfulfilled_unknown_total"
+            => "Total demanded txs not answered because the hash is not in our queue";
+        // [maxtps_diag] Flood messages (TX) dropped by the lossy broadcast
+        // receive channel when the event loop falls behind under load.
+        OVERLAY_BROADCAST_LAGGED_DROPPED_TOTAL = "stellar_overlay_broadcast_lagged_dropped_total"
+            => "Total flood messages dropped due to broadcast-channel lag on receive";
+
         // Stage F.1: Overlay connection lifecycle counters (issue #2236).
         OVERLAY_INBOUND_ATTEMPT_TOTAL = "stellar_overlay_inbound_attempt_total"
             => "Total inbound connection accepts (TCP listener.accept() Ok)";

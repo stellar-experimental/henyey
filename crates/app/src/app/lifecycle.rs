@@ -982,6 +982,13 @@ impl App {
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                             // Only non-critical messages (TX floods) flow through the
                             // broadcast channel now, so lag is expected under load.
+                            // [maxtps_diag] Count dropped flood messages — under load
+                            // these are demanded txs the node never receives, forcing
+                            // re-demands (stellar_overlay_demand_timeout_total) and
+                            // leaving the agreed set short. Core never drops flooded
+                            // txs (flow-controlled per-peer queues).
+                            metrics::counter!("stellar_overlay_broadcast_lagged_dropped_total")
+                                .increment(n);
                             tracing::debug!(skipped = n, "Overlay broadcast receiver lagged (non-critical messages only)");
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => {

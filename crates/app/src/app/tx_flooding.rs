@@ -738,6 +738,18 @@ impl App {
             }
         }
         if sent > 0 || dropped > 0 || banned > 0 || unknown > 0 {
+            // [maxtps_diag] Fulfiller-side demand outcome counters — pinpoint why
+            // demands go unfulfilled (driving the demander's re-demand /
+            // demand-timeout). `unknown` = hash not in our queue when demanded
+            // (advert/include race); `dropped` = peer outbound channel full.
+            // stellar-core fulfils ~100% (overlay.flood.unfulfilled-*=0).
+            metrics::counter!("stellar_overlay_demand_fulfilled_total").increment(sent as u64);
+            metrics::counter!("stellar_overlay_demand_unfulfilled_dropped_total")
+                .increment(dropped as u64);
+            metrics::counter!("stellar_overlay_demand_unfulfilled_banned_total")
+                .increment(banned as u64);
+            metrics::counter!("stellar_overlay_demand_unfulfilled_unknown_total")
+                .increment(unknown as u64);
             tracing::debug!(
                 peer = %peer_id,
                 sent,
