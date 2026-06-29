@@ -104,6 +104,39 @@ broadcast bulk-drain, demand congestion-cascade, queue-size cap (queue never hit
   loop — move flood advert/demand/fulfill to dedicated worker task(s)/threads (large change).
 - Instance tobbhan629hpo torn down.
 
+## Iteration 8 — REWORK: dedicated flood-scheduler task (in progress)
+
+Root confirmed in code: the tx-advert-flush (100ms) and tx-demand (200ms) cycles were
+`select!` branches in the main event loop (lifecycle.rs), serialized with the heavy
+consensus-tick branch (SCP+fetch drains + ledger-close orchestration). `select!` runs one
+branch to completion before re-polling, so under load the flood timers fired late AND blocked
+message handling while running → flood cadence throttled → acquisition capped ~300-500/s.
+(Consistent with iter-4: bulk-drain of inbound messages didn't help because the cap was the
+flood-cycle CADENCE, not message draining.)
+
+CHANGE: `App::run_flood_scheduler(self: Arc<Self>)` (tx_flooding.rs) runs advert-flush +
+demand cycles on their own tokio intervals in a dedicated task, spawned in run_cmd.rs
+concurrent with the main loop, aborted on shutdown. Removed the two branches + interval decls
+from the main `select!`. Parity-safe: identical advert/demand wire messages/content + same
+is_tracking gate; only scheduling/rate is decoupled (perf/internal). Added maxtps_flood_tick
+log (actual advert period) to confirm on-time ticking. Compiles clean; flood unit tests passed (1135, 0 fail).
+
+**Iter 8 result: REFUTED — the rework gave NO throughput gain.** Max stayed ~219 (300/400
+still fail). The dedicated flood task's `maxtps_flood_tick` measured **avg_advert_period =
+198-199 ms = on-time** (nominal `flood_tx_period` 200 ms). So the flood timers fire promptly
+on the dedicated task, yet acquisition is unchanged (queue ~1,549, fill ~45%). Therefore
+**flood-timer serialization on the main loop was NOT the cap** — the consensus tick was not
+actually delaying the flood timers. 6th hypothesis refuted by measurement. REVERTED the rework
+(parity-clean + 1135 tests passed, but no benefit and it adds a concurrency surface; kept the
+diagnostic logging). Instance d9ro0uln49v7u torn down.
+
+**Where the wall stands:** acquisition caps ~290/s/node via a *clean, on-time* flood cycle;
+each node is only learning about / demanding ~290/s of the ~396/s its peers originate. The
+next unmeasured question is **advert RECEIVE rate** (are ~100/s of adverts not reaching the
+node, or being deduped/delayed?) — the demand cycle ticks on-time and isn't demand-size-capped,
+so it can only be that fewer unique missing txs are *visible* to demand each cycle. That is the
+next diagnostic if the effort continues.
+
 ## Iteration 5 result — flood DELIVERY decomposed: re-demand storm
 
 Per-node load-window rates (rate 425): advert ~4000/s (free), demand_recv ~420/s,
