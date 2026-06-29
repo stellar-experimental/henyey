@@ -983,6 +983,9 @@ impl App {
                             // Only non-critical messages (TX floods) flow through the
                             // broadcast channel now, so lag is expected under load.
                             tracing::debug!(skipped = n, "Overlay broadcast receiver lagged (non-critical messages only)");
+                            // maxtps diagnostic: flooded messages (incl. fulfilled txs)
+                            // silently dropped here — a flood-loss path under load.
+                            tracing::info!(target: "maxtps_diag", lagged_dropped = n, "maxtps_lagged");
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                             tracing::info!("Overlay broadcast channel closed");

@@ -373,6 +373,10 @@ impl App {
                     }
                     Err(e) => {
                         tracing::debug!(peer = %peer_id, error = %e, "Failed to send tx advert batch");
+                        // maxtps diagnostic: advert send failed (peer outbound full)
+                        // — these hashes are re-tried next period, but a high rate
+                        // indicates outbound backpressure dropping advert delivery.
+                        flood_rate!("advert_send_err", chunk.len());
                         // Don't mark — will retry next period.
                     }
                 }
@@ -560,7 +564,9 @@ impl App {
             };
             if now.duration_since(entry.first_demanded) >= max_retention {
                 if !entry.latency_recorded {
-                    tracing::debug!(hash = %hash.to_hex(), "Abandoned tx demand");
+                    // maxtps diagnostic: a demanded tx never fulfilled within
+                    // retention → never acquired on this node (a flood-loss path).
+                    tracing::info!(target: "maxtps_diag", "maxtps_demand_abandoned");
                 }
                 pending.pop_front();
                 history.remove(&hash);

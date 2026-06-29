@@ -913,6 +913,29 @@ impl TxGenerator {
         })
     }
 
+    /// maxtps diagnostic: characterize which accounts are unsynced and by how much.
+    /// Returns (total_accounts, unsynced_count, sample of (expected_seq, on_chain_seq)).
+    /// Used at wait-till-complete failure to localize the ~1-3% non-inclusion tail.
+    pub fn diagnose_unsynced(&self) -> (usize, usize, Vec<(i64, i64)>) {
+        let mut total = 0usize;
+        let mut unsynced = 0usize;
+        let mut sample = Vec::new();
+        for account in self.accounts.values() {
+            total += 1;
+            let db = self.app.load_account_sequence(&account.account_id).ok().flatten();
+            match db {
+                Some(s) if s == account.sequence_number => {}
+                other => {
+                    unsynced += 1;
+                    if sample.len() < 12 {
+                        sample.push((account.sequence_number, other.unwrap_or(-1)));
+                    }
+                }
+            }
+        }
+        (total, unsynced, sample)
+    }
+
     /// Pure core of [`check_accounts_synced`]: `true` when every account's
     /// in-memory (expected) sequence number equals its on-ledger sequence
     /// number, as reported by `load_seq` (returns `None` when the account
@@ -1962,6 +1985,15 @@ impl LoadGenerator {
             match wait_till_complete_decision(accounts_synced, soroban_synced, timed_out) {
                 WaitAction::Complete => return,
                 WaitAction::Fail => {
+                    // maxtps diagnostic: characterize the unsynced-account tail.
+                    let (total, unsynced, sample) = self.tx_generator.diagnose_unsynced();
+                    warn!(
+                        target: "maxtps_diag",
+                        total_accounts = total,
+                        unsynced_accounts = unsynced,
+                        sample_expected_vs_onchain = ?sample,
+                        "maxtps_unsynced"
+                    );
                     warn!(
                         timeout_ledgers = WAIT_TILL_COMPLETE_TIMEOUT_NUM_LEDGERS,
                         accounts_synced,

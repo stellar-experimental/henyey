@@ -2891,10 +2891,28 @@ impl App {
                         "Shifted transaction ban queue"
                     );
                 }
+                // maxtps diagnostic: per-ledger tx-queue age-out count (the direct
+                // loss measure — txns never included within pending_depth ledgers,
+                // removed/banned, stranding loadgen accounts).
+                if shift_result.evicted_due_to_age > 0 {
+                    tracing::info!(
+                        target: "maxtps_diag",
+                        aged_out = shift_result.evicted_due_to_age,
+                        "maxtps_ageout"
+                    );
+                }
                 if invalid_banned > 0 {
                     tracing::debug!(
                         count = invalid_banned,
                         "Banned invalid queued txs after ledger close"
+                    );
+                    // maxtps diagnostic: pending txns re-validated as invalid at
+                    // close and banned (an Added-then-removed loss path — candidate
+                    // for the ~1-3% stranded first-txns).
+                    tracing::info!(
+                        target: "maxtps_diag",
+                        invalid_banned,
+                        "maxtps_invalid_banned"
                     );
                 }
                 // Re-mark all surviving transactions for flooding. Matches

@@ -2419,6 +2419,13 @@ impl TransactionQueue {
             store.remove(&evicted.hash, ledger_version);
         }
         if !pending_eviction_list.is_empty() {
+            // maxtps diagnostic: txns evicted+banned at admission to make room
+            // (an Added-then-removed loss path).
+            tracing::info!(
+                target: "maxtps_diag",
+                evicted_at_admission = pending_eviction_list.len(),
+                "maxtps_admit_evict"
+            );
             // Lock order: account_states → banned → seen (canonical order
             // within the store scope — see TransactionQueue doc comment).
             let mut account_states = self.account_states.write();
@@ -2438,6 +2445,9 @@ impl TransactionQueue {
 
         // Handle fee-bump replacement if applicable
         if let Some(ref old_tx) = replaced_tx {
+            // maxtps diagnostic: an existing queued tx replaced by a new one
+            // (Added-then-removed loss path if the replaced tx never applied).
+            tracing::info!(target: "maxtps_diag", "maxtps_replace");
             // Remove the old transaction from store
             store.remove(&old_tx.hash, ledger_version);
 
