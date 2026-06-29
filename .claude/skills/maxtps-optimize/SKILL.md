@@ -220,7 +220,22 @@ For each measurement (baseline and per-iteration):
    (`k4jkul01t5rr0` is the workspace registry; confirm with `nsc workspace describe`
    if a push 401s.)
 2. **Clear pods** between runs: `nsc kubectl "$INST" -n default delete statefulset --all`, wait until 0 pods.
-3. **Run the short-probe** with a narrow band around `current_best`:
+3. **SCREEN FIRST at the accept threshold (single step, fast go/no-go).** Before
+   the full search, run ONE step at `SCREEN = ceil(current_best * 1.05)` — the
+   exact bar a change must clear to be accepted. Force a single step by setting a
+   band whose first midpoint is `SCREEN` and whose width is just over the
+   threshold, e.g. `TX_RATE = SCREEN-7`, `MAX_TX_RATE = SCREEN+8`
+   (`NUM_PREGEN = MAX_TX_RATE*65`), same `SSC_MAXTPS_TXS_MULTIPLIER=60`
+   `SSC_LOADGEN_FASTFAIL_LEDGERS=10`. Read the first verdict:
+   - **`SCREEN` FAILS** → the change cannot clear +5% → **reject immediately**,
+     skip the full search. Cost: ~1 failing step (~2 min) instead of a full
+     ~10-min mission. This is the common case and the main time saver.
+   - **`SCREEN` PASSES** → promising → proceed to the full narrow-band search
+     (step 4) to quantify the new `current_best` and confirm the gain.
+   Always screen before a full mission; never run a full search for a change that
+   can't even clear the threshold step.
+4. **Run the full short-probe** (only if the screen passed) with a narrow band
+   around `current_best`:
    - `LO = current_best` (a known-pass floor), `HI = ceil(min($TARGET, current_best*1.3))`.
    - `NUM_PREGEN = HI * 65` (cover the largest step's `HI*60` offered txns + headroom).
    ```
@@ -230,10 +245,10 @@ For each measurement (baseline and per-iteration):
    ./run_mission.sh "nscr.io/k4jkul01t5rr0/henyey:opt-$SID-<label>" opt-<label> \
      > "$RUN/mission-<label>.log" 2>&1 &
    ```
-4. **Parse** the result: `grep "Found max tx rate" "$RUN/mission-<label>.log"`.
+5. **Parse** the result: `grep "Found max tx rate" "$RUN/mission-<label>.log"`.
    Failing steps abort early via the `Loadgen fast-fail:` path (~1–2 min);
    passing steps ~1–1.5 min. A full narrow search is typically <15 min.
-5. **Health**: between polls, `nsc ssh "$INST" -- sh -c 'uptime; free -h | grep Mem; df -h / | tail -1'`
+6. **Health**: between polls, `nsc ssh "$INST" -- sh -c 'uptime; free -h | grep Mem; df -h / | tail -1'`
    (flag sustained load >28, mem-available <5Gi, disk >85%).
 
 Why this is the chosen methodology (validated this session, see
@@ -373,6 +388,8 @@ are read by the harness process, so export them when invoking.)
   (ambition/diff size unlimited) but keep **commits atomic/minimal** — one
   accepted optimization = one focused PR; proven >5% to keep.
 - One reused instance kept alive for the whole run; short probes; narrow bands.
+- **Screen before you search**: one step at `current_best*1.05`; if it fails,
+  reject the change there (no full mission). Only full-search promising changes.
 - Self-drive across long build/run steps via background tasks + `ScheduleWakeup`;
   run-doc is resumable state.
 - Tear the instance down **only at the end** (it costs money while alive).
