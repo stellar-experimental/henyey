@@ -2210,8 +2210,20 @@ impl LoadGenerator {
         // from the queue (aged-out/banned at pending_depth ledgers under load)
         // without applying — see the method docs and #3611. No-op for accounts
         // not yet cached (the first tx loads its seq via find_account).
-        self.tx_generator
-            .maybe_load_account_sequence_number(source_account_id, config.overlay_only_mode);
+        //
+        // Skip for PayPregenerated: those txns are read pre-signed from the file
+        // with authoritative sequence numbers (set on the real source account in
+        // `generate_tx`), and `source_account_id` here is the sentinel 0 — so
+        // reloading would repeatedly overwrite account 0's cached seq with its
+        // on-ledger value, which lags any in-flight tx and leaves account 0
+        // reading as on-chain-AHEAD-of-expected (a false `check_accounts_synced`
+        // failure that caps the measured ceiling). Parity: stellar-core reloads
+        // only in the generate path; `readTransactionFromFile` never calls
+        // `maybeLoadAccountSequenceNumber`.
+        if config.mode != LoadGenMode::PayPregenerated {
+            self.tx_generator
+                .maybe_load_account_sequence_number(source_account_id, config.overlay_only_mode);
+        }
 
         loop {
             // Generate the transaction based on mode
