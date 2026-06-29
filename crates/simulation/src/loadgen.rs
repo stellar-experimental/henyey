@@ -1587,6 +1587,13 @@ impl LoadGenerator {
         self.tx_generator.reset();
     }
 
+    /// Number of pregenerated transactions consumed from the file so far.
+    /// Exposed for tests asserting cross-run alignment with the persistent
+    /// reader (see the PayPregenerated note in `start`).
+    pub fn curr_preloaded(&self) -> u64 {
+        self.curr_preloaded
+    }
+
     /// Initialize the account pool for a load generation run.
     ///
     /// Populates `accounts_available` with account IDs `[offset, offset + n_accounts)`.
@@ -1660,7 +1667,18 @@ impl LoadGenerator {
         // PayPregenerated: open the transactions file, preload accounts. No
         // account-pool allocation (the source accounts come from the file).
         if config.mode == LoadGenMode::PayPregenerated {
-            self.curr_preloaded = 0;
+            // Do NOT reset `curr_preloaded` here. The preloaded reader is opened
+            // once (below) and read sequentially across every `/generateload`
+            // run (e.g. each step of the MaxTPSClassic binary search reuses the
+            // same network and file). `curr_preloaded` is the round-robin account
+            // index (`curr_preloaded % n_accounts`) and MUST stay aligned with
+            // the reader's file position; resetting it to 0 while the reader
+            // continues from a later position misattributes each tx to the wrong
+            // account, so the loadgen tracks the wrong account's expected seq and
+            // `check_accounts_synced` falsely reports on-chain AHEAD of expected
+            // (capping/destabilizing the measured ceiling). Parity: stellar-core
+            // `mCurrPreloadedTransaction` is initialized once and never reset in
+            // `LoadGenerator::reset()` (LoadGenerator.cpp).
             if self.preloaded_reader.is_none() {
                 let path = config
                     .preloaded_transactions_file

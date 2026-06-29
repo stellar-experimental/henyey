@@ -296,3 +296,113 @@ async fn test_generate_load_increments_loadgen_meters() {
 
     sim.stop_all_nodes().await.expect("stop standalone node");
 }
+
+/// Regression: across consecutive `generate_load` runs (each MaxTPSClassic
+/// binary-search step reuses the same network + pregenerated file), the
+/// PayPregenerated reader is opened once and read sequentially, so
+/// `curr_preloaded` (the round-robin account index `curr_preloaded % n`) MUST
+/// persist across runs to stay aligned with the reader's file position.
+///
+/// Previously `start()` reset `curr_preloaded` to 0 each run while the reader
+/// continued from a later position; a non-K-aligned step boundary then
+/// misattributed each tx to the wrong account, so the loadgen tracked the wrong
+/// account's expected seq and `check_accounts_synced` falsely reported on-chain
+/// AHEAD of expected — capping/destabilizing the measured max-TPS ceiling.
+/// Parity: stellar-core `mCurrPreloadedTransaction` is never reset in `reset()`.
+///
+/// FAILS on the buggy code: after step 2 `curr_preloaded` is 4 (reset+4) not 10,
+/// and accounts are not synced.
+#[tokio::test]
+#[serial]
+async fn pregenerated_curr_preloaded_persists_across_runs() {
+    use henyey_simulation::TxGenerator;
+
+    let mut sim = Simulation::with_network(SimulationMode::OverTcp, NETWORK_PASSPHRASE);
+    let seed = Hash256::hash(b"PREGEN_CURR_PRELOADED");
+    let secret = SecretKey::from_seed(&seed.0);
+    let quorum_set = henyey_app::config::QuorumSetConfig {
+        threshold_percent: 100,
+        validators: vec![secret.public_key().to_strkey()],
+        inner_sets: Vec::new(),
+    };
+    sim.add_app_node("node0", secret, quorum_set);
+    sim.start_all_nodes().await;
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        if let Some(app) = sim.app("node0") {
+            if app.state().await == henyey_app::AppState::Validating {
+                break;
+            }
+        }
+        assert!(std::time::Instant::now() < deadline, "node0 not Validating");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let app = sim.app("node0").expect("node0 app exists");
+
+    const K: u64 = 8;
+    fund_loadgen_accounts(&sim, &app, K, 1_000_000_000).await;
+
+    // Pregenerated file (round-robin over the K funded accounts).
+    let dir = std::env::temp_dir().join(format!("pregen-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let out = dir.join("txs.xdr");
+    {
+        let mut txgen = TxGenerator::new(Arc::clone(&app), NETWORK_PASSPHRASE.to_string());
+        txgen
+            .generate_payment_txs_to_file(&out, 64, K as u32, 0)
+            .expect("generate pregenerated file");
+    }
+
+    let mut lg = LoadGenerator::new(Arc::clone(&app), NETWORK_PASSPHRASE.to_string());
+    let mk = |n_txs: u32| GeneratedLoadConfig {
+        mode: LoadGenMode::PayPregenerated,
+        n_accounts: K as u32,
+        offset: 0,
+        n_txs,
+        tx_rate: 100,
+        queue_full_max_tries: 5,
+        preloaded_transactions_file: Some(out.clone()),
+        ..Default::default()
+    };
+
+    let run_done = AtomicBool::new(false);
+    let run_done_ref = &run_done;
+    let sim_ref = &sim;
+    let closer = async {
+        for _ in 0..800 {
+            if run_done_ref.load(Ordering::Relaxed) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let _ = sim_ref.manual_close_app_node("node0").await;
+        }
+    };
+    let work = async {
+        let stop = AtomicBool::new(false);
+        // Step 1: 6 txns (NOT a multiple of K, so a reset would misalign).
+        let mut c1 = mk(6);
+        lg.generate_load(&mut c1, &stop).await;
+        let curr1 = lg.curr_preloaded();
+        // Step 2: 4 more; the reader is at position 6.
+        let mut c2 = mk(4);
+        lg.generate_load(&mut c2, &stop).await;
+        let curr2 = lg.curr_preloaded();
+        run_done_ref.store(true, Ordering::Relaxed);
+        (curr1, curr2)
+    };
+    let ((curr1, curr2), _) = tokio::join!(work, closer);
+
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // curr_preloaded must persist across runs (parity with core
+    // mCurrPreloadedTransaction). The reader is read sequentially across both
+    // runs, so after reading 6 then 4 it is at 10. The bug reset it to 0 at the
+    // start of run 2 (-> 4), misaligning the round-robin account attribution.
+    assert_eq!(curr1, 6, "step 1 consumes 6 pregenerated txns");
+    assert_eq!(
+        curr2, 10,
+        "curr_preloaded must persist across runs; got {curr2} \
+         (bug resets each run -> 4, misattributing accounts)"
+    );
+}
