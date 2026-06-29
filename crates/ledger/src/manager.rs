@@ -2550,6 +2550,27 @@ impl LedgerManager {
             "create_snapshot sub-timings"
         );
 
+        // maxtps diagnostic: windowed average create_snapshot cost + call rate
+        // (parity-irrelevant). Localizes per-tx admission snapshot cost under load.
+        {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static SNAP_COUNT: AtomicU64 = AtomicU64::new(0);
+            static SNAP_TOTAL_US: AtomicU64 = AtomicU64::new(0);
+            let this_us = fn_start.elapsed().as_micros() as u64;
+            let n = SNAP_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+            let tot = SNAP_TOTAL_US.fetch_add(this_us, Ordering::Relaxed) + this_us;
+            if n % 4096 == 0 {
+                tracing::info!(
+                    target: "maxtps_diag",
+                    window = 4096u64,
+                    avg_us = tot / n,
+                    "maxtps_snapshot_avg"
+                );
+                SNAP_COUNT.store(0, Ordering::Relaxed);
+                SNAP_TOTAL_US.store(0, Ordering::Relaxed);
+            }
+        }
+
         Ok(handle)
     }
 
@@ -6360,6 +6381,33 @@ impl LedgerCloseContext<'_> {
             meta_us,
             tx_count = self.stats.tx_count,
             "Ledger close timing"
+        );
+
+        // maxtps diagnostic: one info line per close with fill + close-phase
+        // breakdown so the close/apply path can be localized under load.
+        // Metrics/logging only — parity-irrelevant (see docs/PARITY.md).
+        info!(
+            target: "maxtps_diag",
+            ledger_seq = new_header.ledger_seq,
+            tx_count = self.stats.tx_count,
+            max_tx_set_size = new_header.max_tx_set_size,
+            total_us,
+            begin_close_us = self.timing_begin_close_us,
+            tx_exec_us = self.timing_tx_exec_us,
+            classic_exec_us = self.timing_classic_exec_us,
+            prepare_us = self.timing_prepare_us,
+            executor_setup_us = self.timing_executor_setup_us,
+            fee_pre_deduct_us = self.timing_fee_pre_deduct_us,
+            post_exec_us = self.timing_post_exec_us,
+            commit_setup_us,
+            bucket_lock_wait_us,
+            eviction_us,
+            add_batch_us,
+            hot_archive_us,
+            header_us,
+            commit_close_us,
+            meta_us,
+            "maxtps_close"
         );
 
         // Periodic memory report (every 64 ledgers, ~5 minutes)

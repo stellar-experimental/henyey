@@ -180,6 +180,27 @@ impl TransactionQueue {
             classic_limited,
         } = self.select_transactions_with_starting_seq(max_ops, starting_seq, protocol_version);
 
+        // maxtps diagnostic: tx-set fill decomposition (parity-irrelevant logging).
+        // selected vs queue_len vs max_ops + *_limited flags localizes whether the
+        // per-ledger fill cap is supply (queue) or selection (surge/lane limits).
+        {
+            let build_kind = match &build_ctx {
+                BuildContext::Nomination(_) => "nom",
+                BuildContext::Queue => "queue",
+            };
+            tracing::info!(
+                target: "maxtps_diag",
+                build_kind,
+                selected = transactions.len(),
+                queue_len = self.len(),
+                max_ops,
+                classic_limited,
+                dex_limited,
+                soroban_limited,
+                "maxtps_nominate"
+            );
+        }
+
         // Classify into classic/soroban using envelope helpers (no TransactionFrame).
         let mut classic_txs = Vec::new();
         let mut soroban_txs = Vec::new();

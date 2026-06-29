@@ -7,6 +7,23 @@ const TX_ADVERT_VECTOR_MAX_SIZE: usize = 1000;
 const TX_DEMAND_VECTOR_MAX_SIZE: usize = 1000;
 const MAX_FLOOD_RESOURCE: usize = u32::MAX as usize;
 
+// maxtps diagnostic: windowed flood-pipeline item-rate counter (parity-irrelevant
+// logging). Each call site gets its own block-local statics. Logs once per ~8192
+// accumulated items with the cumulative item count; the per-second rate is derived
+// from the wall-clock delta between consecutive log lines.
+macro_rules! flood_rate {
+    ($kind:expr, $add:expr) => {{
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static ITEMS: AtomicU64 = AtomicU64::new(0);
+        let add = $add as u64;
+        let total = ITEMS.fetch_add(add, Ordering::Relaxed) + add;
+        if total >= 8192 {
+            tracing::info!(target: "maxtps_diag", kind = $kind, items = total, "maxtps_flood");
+            ITEMS.store(0, Ordering::Relaxed);
+        }
+    }};
+}
+
 // Flood-rate and flood-period parity constants.
 //
 // These mirror the fixed defaults stellar-core assigns in `Config.cpp`
@@ -345,6 +362,7 @@ impl App {
                 let advert = FloodAdvert { tx_hashes };
                 match overlay.try_send_to(peer_id, StellarMessage::FloodAdvert(advert)) {
                     Ok(()) => {
+                        flood_rate!("advert", chunk.len());
                         // Mark as sent only after successful send.
                         let mut adverts_by_peer = self.tx_adverts_by_peer.write().await;
                         if let Some(adverts) = adverts_by_peer.get_mut(peer_id) {
@@ -611,6 +629,14 @@ impl App {
                         };
                         match self.demand_status(hash, peer_id, now, &history) {
                             DemandStatus::Demand => {
+                                flood_rate!(
+                                    if history.contains_key(&hash) {
+                                        "demand_retry"
+                                    } else {
+                                        "demand_new"
+                                    },
+                                    1
+                                );
                                 demand.push(hash);
                                 let entry = history.entry(hash).or_insert_with(|| {
                                     pending.push_back(hash);
@@ -650,6 +676,7 @@ impl App {
         }
 
         for (peer_id, hashes) in to_send {
+            let demand_count = hashes.len();
             let tx_hashes = match TxDemandVector::try_from(
                 hashes.into_iter().map(Hash::from).collect::<Vec<_>>(),
             ) {
@@ -662,6 +689,8 @@ impl App {
             let demand = FloodDemand { tx_hashes };
             if let Err(e) = overlay.try_send_to(&peer_id, StellarMessage::FloodDemand(demand)) {
                 tracing::warn!(peer = %peer_id, error = %e, "Failed to send flood demand");
+            } else {
+                flood_rate!("demand_sent", demand_count);
             }
         }
     }
@@ -728,6 +757,9 @@ impl App {
             }
         }
         if sent > 0 || dropped > 0 || banned > 0 || unknown > 0 {
+            flood_rate!("fulfill", sent);
+            flood_rate!("fulfill_dropped", dropped);
+            flood_rate!("demand_recv", demand.tx_hashes.0.len());
             tracing::debug!(
                 peer = %peer_id,
                 sent,

@@ -49,12 +49,20 @@ intervention.** Concretely:
   "pause" — only at a true Stop condition (extend its duration if it nears
   expiry, or re-provision if it died).
 
-Baseline context (see `docs/maxtps-baseline.md`): henyey ≈ 221–225 tx/s vs
-stellar-core ≈ 1533 on this rig. The limiter is apply/consensus-side, **not**
-loadgen and **not** raw CPU — ledgers close ~27–49% full with idle CPU and
-occasional `NodeLostSyncException` near capacity. So the ceiling is most likely
-*upstream of execution* (tx dissemination / nomination / admission per ledger).
-Start diagnostic.
+Baseline context (see `docs/maxtps-baseline.md`): henyey ≈ 221–250 tx/s vs
+stellar-core ≈ 1531–1533 on this rig — a **confirmed, substantive ~6–7× gap**
+(both numbers are true binary-searched maxima with recorded failures above them;
+verified by adversarial audit 2026-06-28). The limiter is apply/consensus-side,
+**not** loadgen and **not** raw CPU — ledgers close ~27–49% full with idle CPU and
+`NodeLostSyncException` collapse as henyey is pushed to 250–400. **Already
+exonerated — do NOT re-litigate these:** tx dissemination/overlay (pull 5–7ms,
+zero broadcast drops, ~100% demand fulfillment), nomination (nominator takes the
+whole queue, no cap), and SCP agreement (agreed ≈ nominated ≈ queue) are all
+**proven healthy** at the rates measured. The real bottleneck is therefore the
+**un-instrumented apply/consensus path under load** — what makes `applied <
+offered` and then collapses into `NodeLostSync` somewhere in 250–400. That is the
+target. Start by instrumenting the ledger-close / apply / sync-state path under
+near-ceiling load (not the overlay/nomination path — that's done).
 
 ## Hard constraints (non-negotiable)
 
@@ -84,6 +92,24 @@ Start diagnostic.
    efficient" governs *load runs* (don't launch long/wide missions needlessly) —
    it does **not** discourage image rebuilds for instrumentation or code changes;
    those are the expected per-iteration cost.
+4. **Measurement integrity** — a number is only real if the run **recorded a
+   failure above it**. This is the rule whose absence produced a false "near-parity"
+   conclusion in a prior run (it compared an extrapolation against a band-floor);
+   never repeat it:
+   - **A "max" requires a recorded `Run failed at tx rate X` above the passing
+     step.** If the binary-search band was capped and the top step *passed*
+     (`Run succeeded`), you found a band-floor, **not** a ceiling — the true max is
+     higher and unknown. Re-run with a higher `--max-tx-rate` before quoting it.
+   - **Never quote an extrapolated-from-failure number.** "Failed at 300/340/400 →
+     max ≈ 400" is invalid; that max is *below* the lowest failing step. henyey's
+     max is whatever step actually **passed**, full stop.
+   - **Comparisons must be apples-to-apples**: same regime (canonical vs
+     short-probe), same image build path, both sides binary-searched to genuine
+     failure. Comparing core's untested band-floor to henyey's extrapolated ceiling
+     (or core-canonical to henyey-short-probe) is a goalpost move — forbidden.
+   - When reporting a gap, state both raw maxima, the regime each came from, and
+     that each had a recorded failure above it. If you can't, the number isn't
+     ready to report.
 
 ## Accept / reject bar
 
@@ -112,7 +138,18 @@ runs to the cap (or target) by construction.
 ### Diagnosis escalation ladder (use when no >5% code lever is ready)
 Each rung is a valid iteration; climb it until a concrete, diagnosed,
 parity-safe lever emerges, then implement+measure it:
-1. **Scrape existing meters** (`/metrics`, `/info`) at passing and failing rates.
+1. **Scrape existing meters** at passing and failing rates. Two endpoints (via
+   `nsc kubectl <inst> exec <pod> -c stellar-core-run -- curl -s localhost:<port>/...`):
+   - `:11626` `/metrics` (compat **medida JSON**, `/info`) — curated core-compat
+     set (ledger close, tx count, etc.); this is what Supercluster itself reads.
+   - `:11628` `/metrics` (native **Prometheus** registry) — the FULL set incl. the
+     overlay/SCP propagation metrics absent from the medida JSON:
+     `stellar_overlay_tx_pull_latency_seconds` (mean = `_sum`/`_count`),
+     `stellar_overlay_demand_timeout_total`, `stellar_scp_timing_nominated_*`.
+     Enabled in SSC via the `RS_STELLAR_CORE_NATIVE_METRICS_PORT` env var
+     (Supercluster sets `11628`; see `StellarKubeSpecs.fs`). Use this for the
+     henyey-vs-core propagation comparison (core's overlay metrics are in its
+     medida `:11626` JSON, e.g. `overlay.flood.tx-pull-latency`).
 2. **Add metrics** (`crates/app/src/metrics.rs` catalog + refresh) for the
    suspected subsystem.
 3. **Add targeted logs** (e.g. `tracing::info!(target:"maxtps_diag", …)`) on the
@@ -273,26 +310,32 @@ so the next iteration measures on top of it.
 
 ## Seeded hypothesis backlog
 
-Order is deliberate — diagnose before optimizing, because CPU is idle and ledgers
-are under-filled (the cap is unlikely to be execution speed).
+Re-ranked 2026-06-28 after the overlay/nomination/agreement path was proven
+healthy and exonerated. The cap is **apply/consensus-side under load** (idle CPU,
+ledgers 27–49% full, `NodeLostSync` collapse at 250–400). Do NOT re-spend
+iterations on dissemination/nomination/agreement — that's done.
 
-1. **(diagnostic, do first)** Ledger-fill instrumentation: per-ledger
-   txns-applied, nominated tx-set size, and tx-queue/flood depth. Determines
-   whether the cap is admission/nomination (consensus-side) or apply-side, and
-   reframes the rest of the backlog.
-2. **Tx admission / flood flow-control**: how many txs are admitted and flooded
-   per ledger (`crates/overlay`, `crates/herder`; cf. #3575 backpressure, #3614
-   live `maxTxSetSize`). Prime suspect given idle CPU + partial ledgers.
-3. **`NodeLostSyncException` near capacity**: per-node apply-duration vs
-   ledger-close time and sync state; a node that can't apply within the close
-   window drops sync and caps the whole network.
-4. **Ledger-close cadence**: phase-timer breakdown (timers already in
-   `crates/app/src/metrics.rs`, recorded in `ledger_close.rs`) — is a commit /
-   persist / bucket phase stretching close time under load?
-5. **(deprioritized) Per-tx serial apply overhead**: `run_transactions_on_executor`
-   and the per-tx `snapshot_delta` clone in `crates/ledger/src/execution/tx_set.rs`
-   — only pursue if instrumentation shows `classic_exec` actually dominates close
-   time.
+1. **(diagnostic, do first)** Apply/close-path + sync-state instrumentation under
+   near-ceiling load: per-ledger apply wall-time vs close-cadence budget, the
+   close phase-timer breakdown (commit / persist / bucket-apply / event-emit), and
+   the **sync-state transitions** that precede `NodeLostSyncException`. Goal:
+   pinpoint *which* phase stretches as offered rate climbs from 225→400 and *what*
+   trips a node out of sync. This reframes the rest of the list.
+2. **`NodeLostSyncException` collapse (prime suspect)**: a node whose
+   apply+close can't finish within the consensus close window drops sync, which
+   caps the whole network — find the per-node duration that crosses the budget and
+   why (serial apply? a phase that's O(txs)? lock contention?). cf. #3 below.
+3. **Per-tx serial apply overhead**: `run_transactions_on_executor` and the per-tx
+   `snapshot_delta` clone in `crates/ledger/src/execution/tx_set.rs` — now
+   **upgraded from deprioritized**: with overlay exonerated and CPU idle, serial
+   apply is a leading candidate for the close-window overrun. Confirm via #1 that
+   `classic_exec` dominates close time, then attack it (parallel/batched apply,
+   delta-clone elimination — big swings allowed, parity-exact).
+4. **Ledger-close cadence**: commit/persist/bucket phase stretching close time
+   under load (timers in `crates/app/src/metrics.rs`, recorded in `ledger_close.rs`).
+5. **(exonerated — do not pursue)** Tx admission / flood flow-control, overlay
+   dissemination, nomination, SCP agreement: all measured healthy. Only revisit if
+   #1's data contradicts that.
 
 Regenerate and re-rank from each iteration's measurements; do not treat this list
 as fixed.

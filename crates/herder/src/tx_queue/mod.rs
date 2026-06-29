@@ -2226,6 +2226,31 @@ impl TransactionQueue {
 
     /// Try to add a transaction to the queue.
     pub fn try_add(&self, envelope: TransactionEnvelope) -> TxQueueResult {
+        // maxtps diagnostic: windowed average total try_add (admission) cost,
+        // recorded on every return path via Drop (parity-irrelevant logging).
+        struct AdmitTimer(std::time::Instant);
+        impl Drop for AdmitTimer {
+            fn drop(&mut self) {
+                use std::sync::atomic::{AtomicU64, Ordering};
+                static ADM_COUNT: AtomicU64 = AtomicU64::new(0);
+                static ADM_TOTAL_US: AtomicU64 = AtomicU64::new(0);
+                let us = self.0.elapsed().as_micros() as u64;
+                let n = ADM_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+                let tot = ADM_TOTAL_US.fetch_add(us, Ordering::Relaxed) + us;
+                if n % 4096 == 0 {
+                    tracing::info!(
+                        target: "maxtps_diag",
+                        window = 4096u64,
+                        avg_us = tot / n,
+                        "maxtps_admit_avg"
+                    );
+                    ADM_COUNT.store(0, Ordering::Relaxed);
+                    ADM_TOTAL_US.store(0, Ordering::Relaxed);
+                }
+            }
+        }
+        let _admit_timer = AdmitTimer(std::time::Instant::now());
+
         // Pre-compute values needed by both the early cross-type guard and
         // the later account-limit / admission logic, avoiding redundant
         // allocations on this hot path.

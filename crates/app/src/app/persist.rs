@@ -370,7 +370,9 @@ impl PersistJob {
                 // durable on disk first. (The publish-queue enqueue itself, the
                 // §4.11 Step 1 "queue checkpoint", is co-transactional inside
                 // `write_fn` — see `LedgerPersistInputs::serialize_and_write_to_db`.)
+                let flush_start = std::time::Instant::now();
                 flush_hot_archive_and_buckets_sync(&ledger_manager, &bucket_dir, &shutdown);
+                let flush_us = flush_start.elapsed().as_micros() as u64;
 
                 // LEDGER_SPEC §4.11 Step 2 (#3066): "commit LedgerTxn". This is
                 // the single atomic SQLite transaction that co-writes header,
@@ -383,6 +385,7 @@ impl PersistJob {
                 // recoverable via downcast → retry, then clean no-wipe shutdown
                 // on budget exhaustion; a non-transient error aborts (unchanged,
                 // no retry consumed).
+                let commit_start = std::time::Instant::now();
                 if let PersistOutcome::Fatal(e) = commit_with_busy_retry(
                     "ledger close DB write",
                     || write_fn(&db),
@@ -391,6 +394,7 @@ impl PersistJob {
                 ) {
                     fatal_persist_error("ledger close DB write", &e);
                 }
+                let commit_us = commit_start.elapsed().as_micros() as u64;
 
                 // LedgerCloseMeta for RPC (non-fatal).
                 if let Some(meta) = meta_xdr {
@@ -403,8 +407,18 @@ impl PersistJob {
                     }
                 }
 
+                let persist_us = persist_start.elapsed().as_micros() as u64;
                 crate::metrics::PERSIST_LEDGER_CLOSE_SECONDS
                     .record(persist_start.elapsed().as_secs_f64());
+                // maxtps diagnostic: persist breakdown (parity-irrelevant logging).
+                tracing::info!(
+                    target: "maxtps_diag",
+                    ledger_seq,
+                    persist_us,
+                    flush_us,
+                    commit_us,
+                    "maxtps_persist"
+                );
             }
         }
     }
