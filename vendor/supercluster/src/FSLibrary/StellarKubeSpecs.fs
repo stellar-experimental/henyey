@@ -302,6 +302,11 @@ let CoreContainerForCommand
             value = defaultArg asanOptions CfgVal.asanOptionsEnvVarDefaultValue
         )
 
+    // henyey-only: expose the native Prometheus registry on a distinct port for
+    // overlay/SCP metric scraping. Real stellar-core ignores the unknown env var.
+    let henyeyMetricsEnvVar =
+        V1EnvVar(name = "RS_STELLAR_CORE_NATIVE_METRICS_PORT", value = string CfgVal.henyeyNativeMetricsPort)
+
     let cfgWords = cfgFileArgs configOpt MainCoreContainer
     let containerName = CfgVal.stellarCoreContainerName (Array.get command 0)
 
@@ -340,7 +345,7 @@ let CoreContainerForCommand
         image = imageName,
         command = [| "/bin/sh" |],
         args = [| "-x"; "-c"; allCmdsAndCleanup.ToString() |],
-        env = [| peerNameEnvVar; asanOptionsEnvVar |],
+        env = [| peerNameEnvVar; asanOptionsEnvVar; henyeyMetricsEnvVar |],
         resources = res,
         securityContext = V1SecurityContext(capabilities = V1Capabilities(add = [| "NET_ADMIN" |])),
         volumeMounts = CoreContainerVolumeMounts peerOrJobNames configOpt

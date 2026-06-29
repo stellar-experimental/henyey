@@ -1,5 +1,41 @@
 # Max-TPS bottleneck diagnosis: overlay flood acquisition throughput
 
+> ## ⚠️ SUPERSEDED CONCLUSION (2026-06-29, later same day) — READ FIRST
+>
+> The "flood acquisition throughput cap (~290/s)" conclusion below was the SYMPTOM,
+> not the cause. A no-fast-fail run (full 20-ledger budget) overturned it:
+>
+> - **Henyey's real throughput is ~400 tx/s, NOT 219.** At rate 400 it APPLIED
+>   23,204 of 24,000 offered txns (96.7%), with ledgers filling to ~2,000 txns
+>   (full fill) and sustaining ~340-418/s for 9+ consecutive ledgers. Apply, flood,
+>   and consensus genuinely handle ~400/s. The real gap to core (1492) is **~3.7×,
+>   not 6.8×.**
+> - The "~290/s acquisition cap" was an artifact of measuring only at rates ≤275
+>   (fast-fail killed higher rates in 1-2 steps): `flood_unique_recv` simply TRACKS
+>   the offered rate (it reached 361/s at rate 400). Overlay is healthy — 22 peers,
+>   <5ms pull latency (faster than core's 44ms), queue not size-capped.
+> - **The measured "max 219" is a LOADGEN-COMPLETION ARTIFACT.** Under load >~250,
+>   ~3% of submitted txns are not included within `pending_depth=4` ledgers and are
+>   aged out by `TransactionQueue::shift()` (auto-ban + remove). Because loadgen txns
+>   are per-account SEQUENCES, a few aged-out txns strand their accounts
+>   (`accounts_synced=false`) → wait-till-complete times out → "Loadgen failed!" →
+>   the binary search records ~219 as the max.
+> - **`pending_depth=4` MATCHES stellar-core exactly** (`TRANSACTION_QUEUE_TIMEOUT_LEDGERS=4`),
+>   so the age-out is parity-correct. The real root is a **~3% tx-propagation/nomination
+>   tail under load**: a small fraction of txns don't reach a proposer's agreed tx-set
+>   within 4 ledgers (core achieves ~100% within 4 even at 1492). Ruled out as the
+>   cause: per-peer rate limiter (traffic ≪ limit at the failing rate), submission
+>   rejection (`loadgen.txn.rejected=0`), queue size cap, snapshot/admission cost,
+>   flood-timer scheduling, broadcast-drain.
+> - **Tooling re-landed:** the `:11628` native-Prometheus plumbing (PR #3674) was
+>   re-applied (config.rs `RS_STELLAR_CORE_NATIVE_METRICS_PORT` + SSC injection),
+>   giving clean per-node flood/herder meters.
+> - **Open root-cause:** why the ~3% don't propagate/combine into the agreed tx-set
+>   within 4 ledgers (likely SCP nomination candidate-combination or a flood tail).
+>   Needs distributed txn-lifecycle tracing. NOTE: the herder `pending_evicted/too_old`
+>   counters are cataloged but UNWIRED (read 0) — wiring them would expose the age-out
+>   rate directly.
+
 **Status:** diagnosis complete (2026-06-29). **Outcome:** the henyey-vs-stellar-core
 classic-payment max-TPS gap is real (~6-7×) and localized — *entirely* — to overlay
 **flood acquisition throughput**. Apply, persist, admission, nomination, SCP timing,

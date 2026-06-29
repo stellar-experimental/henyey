@@ -2096,6 +2096,32 @@ impl AppConfig {
             })?;
         }
 
+        // maxtps diagnostic: re-enable the native Prometheus HTTP server on a
+        // distinct port so the full overlay/SCP registry is scrapeable even when
+        // compat-config disabled the native server (it sets http.enabled=false
+        // whenever HTTP_PORT is present, as Supercluster always sets). henyey-only;
+        // real stellar-core ignores the unknown env var. Runs after compat
+        // translation so it cleanly overrides http.enabled=false.
+        if let Some(val) = lookup("RS_STELLAR_CORE_NATIVE_METRICS_PORT")? {
+            let port = val.parse::<u16>().with_context(|| {
+                format!(
+                    "RS_STELLAR_CORE_NATIVE_METRICS_PORT: invalid port '{val}', \
+                     must be a valid u16 (0–65535)"
+                )
+            })?;
+            if port != 0 {
+                if self.compat_http.enabled && self.compat_http.port == port {
+                    anyhow::bail!(
+                        "RS_STELLAR_CORE_NATIVE_METRICS_PORT {port} collides with \
+                         compat_http.port {port}"
+                    );
+                }
+                self.http.enabled = true;
+                self.http.port = port;
+                self.http.address = "127.0.0.1".to_string();
+            }
+        }
+
         // Logging overrides
         if let Some(val) = lookup("RS_STELLAR_CORE_LOG_LEVEL")? {
             self.logging.level = val;
