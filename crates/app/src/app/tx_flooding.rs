@@ -612,6 +612,12 @@ impl App {
                         match self.demand_status(hash, peer_id, now, &history) {
                             DemandStatus::Demand => {
                                 demand.push(hash);
+                                // An existing history entry means this hash was
+                                // demanded before and its prior demand(s) went
+                                // unfulfilled past the retry delay — i.e. a
+                                // timeout-driven re-demand. Mirrors stellar-core's
+                                // `overlay.demand.timeout` meter.
+                                let is_redemand = history.contains_key(&hash);
                                 let entry = history.entry(hash).or_insert_with(|| {
                                     pending.push_back(hash);
                                     TxDemandHistory {
@@ -623,6 +629,10 @@ impl App {
                                 });
                                 entry.peers.insert(peer_id.clone(), now);
                                 entry.last_demanded = now;
+                                if is_redemand {
+                                    metrics::counter!("stellar_overlay_demand_timeout_total")
+                                        .increment(1);
+                                }
                                 added_new = true;
                                 any_new_demand = true;
                             }
@@ -728,6 +738,18 @@ impl App {
             }
         }
         if sent > 0 || dropped > 0 || banned > 0 || unknown > 0 {
+            // [maxtps_diag] Fulfiller-side demand outcome counters — pinpoint why
+            // demands go unfulfilled (driving the demander's re-demand /
+            // demand-timeout). `unknown` = hash not in our queue when demanded
+            // (advert/include race); `dropped` = peer outbound channel full.
+            // stellar-core fulfils ~100% (overlay.flood.unfulfilled-*=0).
+            metrics::counter!("stellar_overlay_demand_fulfilled_total").increment(sent as u64);
+            metrics::counter!("stellar_overlay_demand_unfulfilled_dropped_total")
+                .increment(dropped as u64);
+            metrics::counter!("stellar_overlay_demand_unfulfilled_banned_total")
+                .increment(banned as u64);
+            metrics::counter!("stellar_overlay_demand_unfulfilled_unknown_total")
+                .increment(unknown as u64);
             tracing::debug!(
                 peer = %peer_id,
                 sent,
@@ -1366,6 +1388,58 @@ mod tests {
 
     fn ms(v: u64) -> Duration {
         Duration::from_millis(v)
+    }
+
+    /// `demand_status` returns `Demand` for a first demand and again — after the
+    /// retry delay — for a re-demand, which is the timeout-driven path that
+    /// increments `stellar_overlay_demand_timeout_total` in `run_tx_demands`.
+    #[tokio::test]
+    async fn test_demand_status_redemand_after_retry_delay() {
+        use std::collections::HashMap;
+        use std::time::Instant;
+
+        let (_dir, app) = create_test_app_with_overlay().await;
+        let peer_a = make_peer_id(1);
+        let peer_b = make_peer_id(2);
+        // A hash that is NOT in the tx queue (so it isn't Discarded).
+        let hash = Hash256::from_bytes([0x11; 32]);
+
+        // No history → first demand (not a timeout; counter would NOT fire).
+        let empty: HashMap<Hash256, TxDemandHistory> = HashMap::new();
+        assert!(matches!(
+            app.demand_status(hash, &peer_a, Instant::now(), &empty),
+            DemandStatus::Demand
+        ));
+
+        // Prior demand from peer_a at t0.
+        let t0 = Instant::now();
+        let mut history: HashMap<Hash256, TxDemandHistory> = HashMap::new();
+        let mut peers = HashMap::new();
+        peers.insert(peer_a.clone(), t0);
+        history.insert(
+            hash,
+            TxDemandHistory {
+                first_demanded: t0,
+                last_demanded: t0,
+                peers,
+                latency_recorded: false,
+            },
+        );
+
+        // Before the retry delay elapses → RetryLater (no re-demand).
+        assert!(matches!(
+            app.demand_status(hash, &peer_b, t0, &history),
+            DemandStatus::RetryLater
+        ));
+
+        // After the retry delay → Demand. In `run_tx_demands` this is the branch
+        // where `history.contains_key(&hash)` is true, so the demand-timeout
+        // counter is incremented.
+        let later = t0 + app.retry_delay_demand(1) + Duration::from_millis(1);
+        assert!(matches!(
+            app.demand_status(hash, &peer_b, later, &history),
+            DemandStatus::Demand
+        ));
     }
 
     #[test]
