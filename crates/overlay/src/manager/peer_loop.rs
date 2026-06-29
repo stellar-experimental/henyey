@@ -205,14 +205,29 @@ struct PeerRateLimiter {
     pub dropped_aggregate: u64,
 }
 
-/// Default per-peer aggregate message budget per second.
-pub(crate) const DEFAULT_PEER_RATE_LIMIT: u32 = 200;
-/// Default per-peer tx + demand sub-budget per second.
-const DEFAULT_TX_DEMAND_LIMIT: u32 = 150;
-/// Default per-peer advert sub-budget per second.
-const DEFAULT_ADVERT_LIMIT: u32 = 50;
+// maxtps (#flood-coverage-gap): these per-peer limits are a COARSE Sybil/DoS
+// backstop ONLY — the real per-peer flood backpressure is flow control
+// (SEND_MORE / `peer_flood_reading_capacity`), exactly as in stellar-core (which
+// has NO per-peer message-count limiter). The previous values (200/150/50)
+// hard-dropped legitimate flood under load: at >~250 classic tx/s the fulfill +
+// demand traffic concentrates on the peers holding demanded txns and exceeds
+// 150 TxAndDemand/s, so the limiter silently dropped fulfills/demands → those
+// txns never reached the peer → coverage gap → the tx aged out of the queue at
+// pending_depth=4 (never nominated) → loadgen accounts stranded → run failed.
+// That capped the measured MaxTPSClassic ceiling at ~219 even though apply/flood
+// throughput is ~400+/s. The limits are raised far above any legitimate
+// per-peer flood rate (flow control + the global flood-gate still protect) so
+// the limiter never drops legitimate traffic; it only catches a peer flooding
+// orders of magnitude beyond the network's tx capacity.
+/// Default per-peer aggregate message budget per second (coarse Sybil backstop).
+pub(crate) const DEFAULT_PEER_RATE_LIMIT: u32 = 12000;
+/// Default per-peer tx + demand sub-budget per second (coarse Sybil backstop;
+/// flow control is the real flood bound).
+const DEFAULT_TX_DEMAND_LIMIT: u32 = 10000;
+/// Default per-peer advert sub-budget per second (coarse Sybil backstop).
+const DEFAULT_ADVERT_LIMIT: u32 = 4000;
 /// Default per-peer control/fetch reserved minimum per second.
-const DEFAULT_CONTROL_FETCH_LIMIT: u32 = 20;
+const DEFAULT_CONTROL_FETCH_LIMIT: u32 = 500;
 
 impl PeerRateLimiter {
     fn new() -> Self {
@@ -988,6 +1003,14 @@ impl OverlayManager {
                 debug!(
                     "Dropping {} from {}: per-peer rate limit exceeded ({:?})",
                     msg_type, peer_id, traffic_class
+                );
+                // maxtps diagnostic: the henyey-specific per-peer rate limiter
+                // dropped a flood message. Dropped adverts/demands → coverage gaps
+                // → txns never reach this peer → age-out (candidate root cause).
+                tracing::info!(
+                    target: "maxtps_diag",
+                    class = ?traffic_class,
+                    "maxtps_ratelimit_drop"
                 );
                 return Some(false);
             }
@@ -2914,6 +2937,26 @@ mod tests {
             limiter.allow(TrafficClass::Advert),
             "advert should have own budget"
         );
+    }
+
+    #[test]
+    fn test_peer_rate_limiter_allows_high_tps_flood() {
+        // Regression (#flood-coverage-gap): under high classic-tx load a single
+        // peer's legitimate flood (fulfills + demands concentrating on the holder
+        // of demanded txns) far exceeds the old 150/s TxAndDemand limit. Dropping
+        // those messages caused coverage gaps → tx age-out at pending_depth=4 →
+        // stranded loadgen accounts → MaxTPSClassic measured-ceiling pinned at
+        // ~219 despite ~400+/s real apply/flood throughput. Flow control (not this
+        // limiter) is the real per-peer flood backpressure, so a high legitimate
+        // per-peer rate MUST NOT be hard-dropped here. (Would fail at the old
+        // DEFAULT_TX_DEMAND_LIMIT=150.)
+        let mut limiter = PeerRateLimiter::new();
+        for i in 0..5000u32 {
+            assert!(
+                limiter.allow(TrafficClass::TxAndDemand),
+                "legitimate high-TPS flood must not be rate-limited (dropped at {i})"
+            );
+        }
     }
 
     #[test]
