@@ -1632,9 +1632,20 @@ impl Herder {
         }
     }
 
-    /// Get the maximum size of a transaction set (ops).
+    /// Get the maximum size of a transaction set (ops) from the LIVE ledger.
+    ///
+    /// Mirrors stellar-core `LedgerManager::getLastMaxTxSetSizeOps()`. This reads
+    /// the current (last-closed) ledger header, NOT static config, because
+    /// `maxTxSetSize` can be raised via `LedgerUpgrade::MaxTxSetSize` after
+    /// genesis. The previous config-based value went stale after an upgrade and
+    /// under-provisioned the transaction-flood budget (~2.4× too small under the
+    /// maxTPS mission's upgrade), causing flood-queue starvation: a few
+    /// locally-submitted txns were never advertised, aged out, stranded their
+    /// account, and failed the whole loadgen step via the all-or-nothing
+    /// completion check. Only flood/advert/demand sizing consumes this; tx-set
+    /// construction already uses the live header value.
     pub fn max_tx_set_size(&self) -> usize {
-        self.config.max_tx_set_size
+        self.ledger_manager.last_max_tx_set_size_ops()
     }
 
     /// Get the maximum queue size in ops for demand sizing.

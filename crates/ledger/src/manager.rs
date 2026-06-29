@@ -1617,6 +1617,28 @@ impl LedgerManager {
         self.state.read().header.clone()
     }
 
+    /// Live max tx-set size in ops, from the current (last-closed) ledger header.
+    ///
+    /// Mirrors stellar-core `LedgerManager::getLastMaxTxSetSizeOps()`: reads the
+    /// LCL header's `maxTxSetSize`. For protocol >= 11 that field is already an
+    /// ops count and is returned as-is; for the (henyey-unsupported) pre-v11
+    /// regime it would be `n * MAX_OPS_PER_TX`. henyey is protocol 24+ only, so
+    /// the pre-v11 branch is unreachable but kept for parity clarity.
+    ///
+    /// This MUST be read live rather than from static config: maxTxSetSize can be
+    /// raised via a `LedgerUpgrade::MaxTxSetSize`, and consumers such as the
+    /// transaction-flood budget (`compute_flood_ops_budget`) must track the
+    /// upgraded value or they under-provision and starve flooding under load.
+    pub fn last_max_tx_set_size_ops(&self) -> usize {
+        let state = self.state.read();
+        let n = state.header.max_tx_set_size as usize;
+        if state.header.ledger_version >= 11 {
+            n
+        } else {
+            n * 100 // MAX_OPS_PER_TX (pre-v11 only; unreachable on protocol 24+)
+        }
+    }
+
     /// Get the current header hash.
     pub fn current_header_hash(&self) -> Hash256 {
         self.state.read().header_hash
@@ -8140,6 +8162,46 @@ mod tests {
         for skip in &header.skip_list {
             assert_eq!(*skip, Hash([0u8; 32]));
         }
+    }
+
+    /// Regression: `last_max_tx_set_size_ops()` must reflect the LIVE ledger
+    /// header `maxTxSetSize`, not a static genesis value. Previously the flood
+    /// budget read static config; after a `LedgerUpgrade::MaxTxSetSize` raised
+    /// the on-chain limit, the stale config under-provisioned the budget ~2.4×
+    /// and starved transaction flooding (txns aged out un-advertised, stranding
+    /// accounts and failing maxTPS steps). Mirrors stellar-core
+    /// `getLastMaxTxSetSizeOps()` (protocol >= 11 returns the field as-is).
+    #[test]
+    fn test_last_max_tx_set_size_ops_tracks_live_header() {
+        use henyey_common::protocol::CURRENT_LEDGER_PROTOCOL_VERSION;
+
+        let manager = LedgerManager::new(
+            "Test SDF Network ; September 2015".to_string(),
+            LedgerManagerConfig {
+                validate_bucket_hash: false,
+                ..Default::default()
+            },
+        );
+
+        // Baseline: a protocol-24 header with the genesis-sized limit.
+        let mut header = manager.current_header();
+        header.ledger_version = CURRENT_LEDGER_PROTOCOL_VERSION;
+        header.max_tx_set_size = 100;
+        manager.set_header_for_test(header.clone(), Hash256::ZERO);
+        assert_eq!(
+            manager.last_max_tx_set_size_ops(),
+            100,
+            "must report the live header value (protocol >= 11: as-is)"
+        );
+
+        // Simulate a MaxTxSetSize upgrade raising the on-chain limit to 2500.
+        header.max_tx_set_size = 2500;
+        manager.set_header_for_test(header, Hash256::ZERO);
+        assert_eq!(
+            manager.last_max_tx_set_size_ops(),
+            2500,
+            "must track the upgraded header value, not stale config"
+        );
     }
 
     /// Parity: LedgerTests.cpp:15 "cannot close ledger with unsupported ledger version"
