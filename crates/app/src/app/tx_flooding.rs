@@ -327,6 +327,14 @@ impl App {
             ?dex_ops_budget,
             "Flushing tx adverts (priority-ordered)"
         );
+        tracing::info!(
+            target: "maxtps_diag",
+            ops_used,
+            ops_budget,
+            queue_len = self.herder.tx_queue().len(),
+            new_adverts = per_peer.values().map(|v| v.len()).sum::<usize>(),
+            "maxtps_flood_flush"
+        );
 
         // Update carry-over from remaining budget (capped).
         self.broadcast_op_carryover.store(

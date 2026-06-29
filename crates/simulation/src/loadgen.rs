@@ -922,7 +922,11 @@ impl TxGenerator {
         let mut sample = Vec::new();
         for account in self.accounts.values() {
             total += 1;
-            let db = self.app.load_account_sequence(&account.account_id).ok().flatten();
+            let db = self
+                .app
+                .load_account_sequence(&account.account_id)
+                .ok()
+                .flatten();
             match db {
                 Some(s) if s == account.sequence_number => {}
                 other => {
@@ -1683,7 +1687,7 @@ impl LoadGenerator {
         // PayPregenerated: open the transactions file, preload accounts. No
         // account-pool allocation (the source accounts come from the file).
         if config.mode == LoadGenMode::PayPregenerated {
-            self.curr_preloaded = 0;
+            // #3683: do not reset curr_preloaded (persist across runs; parity w/ core).
             if self.preloaded_reader.is_none() {
                 let path = config
                     .preloaded_transactions_file
@@ -2224,8 +2228,17 @@ impl LoadGenerator {
         // from the queue (aged-out/banned at pending_depth ledgers under load)
         // without applying — see the method docs and #3611. No-op for accounts
         // not yet cached (the first tx loads its seq via find_account).
-        self.tx_generator
-            .maybe_load_account_sequence_number(source_account_id, config.overlay_only_mode);
+        //
+        // Skip for PayPregenerated: those txns are read pre-signed from the file
+        // with authoritative seqs (set on the real source account in generate_tx),
+        // and `source_account_id` here is the sentinel 0, so reloading would
+        // corrupt account 0's cached seq (it would lag in-flight txns -> false
+        // on-chain-AHEAD unsynced). Parity: core only reloads in the generate
+        // path; `readTransactionFromFile` does not call maybeLoadAccountSequenceNumber.
+        if config.mode != LoadGenMode::PayPregenerated {
+            self.tx_generator
+                .maybe_load_account_sequence_number(source_account_id, config.overlay_only_mode);
+        }
 
         loop {
             // Generate the transaction based on mode

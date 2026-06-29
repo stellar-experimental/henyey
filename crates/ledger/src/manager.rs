@@ -1617,6 +1617,17 @@ impl LedgerManager {
         self.state.read().header.clone()
     }
 
+    /// Live max tx-set size in ops (#3679; mirrors core getLastMaxTxSetSizeOps).
+    pub fn last_max_tx_set_size_ops(&self) -> usize {
+        let state = self.state.read();
+        let n = state.header.max_tx_set_size as usize;
+        if state.header.ledger_version >= 11 {
+            n
+        } else {
+            n * 100
+        }
+    }
+
     /// Get the current header hash.
     pub fn current_header_hash(&self) -> Hash256 {
         self.state.read().header_hash

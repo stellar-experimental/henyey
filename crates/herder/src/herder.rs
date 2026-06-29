@@ -1632,9 +1632,10 @@ impl Herder {
         }
     }
 
-    /// Get the maximum size of a transaction set (ops).
+    /// Get the maximum size of a transaction set (ops) from the LIVE ledger.
+    /// (#3679 flood-budget fix; mirrors core getLastMaxTxSetSizeOps)
     pub fn max_tx_set_size(&self) -> usize {
-        self.config.max_tx_set_size
+        self.ledger_manager.last_max_tx_set_size_ops()
     }
 
     /// Get the maximum queue size in ops for demand sizing.
