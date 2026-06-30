@@ -190,7 +190,10 @@ instrumentation immediately surfaced the real bug — NOT in the SCP path but in
   trigger; the 1 s maintenance tick backstops gated cases. Regression test
   `test_trigger_event_does_not_rearm_same_slot_spin` (fails pre-fix: 1 spurious self-perpetuating
   trigger).
-- **Measurement: 1305 → 1410 tx/s (+8.0%, short-probe).** Post-fix trigger-fire count = exactly
+- **Measurement: 1305 → 1410 tx/s (+8.0%, short-probe).** Verified with a controlled clean A/B (both
+  images from current `origin/main`, no instrumentation, same instance): clean-base 1350 → clean-fix
+  1437 = **+6.4%** (consistent; the 1305 baseline predated #3690 + carried diag logging). Post-fix
+  trigger-fire count = exactly
   1/ledger; trigger fires punctually (fire-lateness mean ~1.3 ms → **H2 ruled out**). Nomination
   convergence at sustainable rates dropped from bimodal 46/300–1000 ms to **~30–60 ms median**; the
   residual p75–p95 tail correlates 1:1 with the over-capacity probe steps (slots 14–22 = the failing
