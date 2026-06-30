@@ -84,9 +84,35 @@ quorum-accepted; round counter at ballot start) to see whether round-1 genuinely
 specific node/leader lags. Eliminating the slow tail ≈ cadence 5.5→~5.1 s ≈ **+8%** (→ ~1400), still
 gated by the 5 s close-time target (network parameter, shared with core).
 
+## Slow-nomination deep-dive (2026-06-30, hypotheses tested on cloud)
+
+The cadence overhead = **slow SCP round-1 nomination convergence on ~half the ledgers**
+(per-slot median nom_round: ~46 ms for the fast half, 300–1000 ms for the slow half;
+network-wide — every node shows the same ~30% >300 ms). Decisively NARROWED by eliminating:
+- **Loadgen leader** (the in-process loadgen node leading the round): REFUTED — slow ledgers
+  have a loadgen (*-0) leader 48% vs fast 55% (no correlation; the 7/23≈30% match was coincidence).
+- **Timeout escalation**: REFUTED for the majority — 24/30 slow ledgers stay in round 1 (slow
+  *convergence*, not the 1000 ms round-1 timeout); only 6/30 escalate to round ≥2.
+- **Per-node random tx-set seed → divergent nominations**: REFUTED — stellar-core also uses
+  `rand_uniform` for the surge-pricing seed (SurgePricingUtils.cpp), so divergent per-node tx-sets
+  are normal for both impls.
+- **CPU / single-thread / message-processing**: REFUTED — no thread >46%, recv_message ~0 ms,
+  apply overlaps the wait.
+
+So: round-1 nomination takes 300–1000 ms to reach quorum on ~half the ledgers on a fast local
+cluster (--install-network-delay false), despite fast per-message processing — a subtle SCP
+convergence-dynamics question (likely multi-round re-voting as higher-priority leader values arrive,
+and/or close-time/ctValidityOffset acceptance gating). This is the well-scoped next step: trace the
+per-message nomination flow (leader emit → vote → accept-nominate quorum → confirm → ballot) on a
+slow slot to see where the 300–1000 ms is spent. Instrumentation added (throwaway branch): maxtps_
+nom_round (scp_driver.rs record_ballot_start), maxtps_nom_leaders (nomination.rs), maxtps_setup_decomp
++ maxtps_build_decomp.
+
 ## Summary
 - Baseline → current: 462 → ~1300 tx/s (4 PRs accepted: #3679, #3682, #3683, #3684); measurement
   is now trustworthy (the artifacts were the big wins).
-- Bottleneck fully localized: cadence-bound; the controllable ~0.5 s overhead is the bimodal
-  slow-nomination tail (~30% of ledgers, 400–866 ms). Not resource-bound, not loss, not apply.
-- Next: root-cause the slow-nomination third (contention vs SCP round timing) and eliminate it (~+8%).
+- Bottleneck fully localized: cadence-bound (5.5 s/ledger vs 5 s target, ~95% idle); the controllable
+  ~0.5 s overhead is slow SCP round-1 nomination convergence on ~half the ledgers (300–1000 ms vs
+  46 ms). Not resource-bound, not loss, not apply, not loadgen, not seed-divergence, not timeout.
+- Next (well-scoped): trace per-message nomination convergence on a slow slot to find why round-1
+  takes 300–1000 ms; eliminating it ≈ +8% (→ ~1400), still gated by the 5 s close-time target.
