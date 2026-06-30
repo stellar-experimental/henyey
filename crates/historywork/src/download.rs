@@ -166,11 +166,46 @@ async fn download_and_save_bucket(
         BucketDownloadFailure::Verify(format!("bucket {hash} hash mismatch: {err}"))
     })?;
 
-    atomic_write_bytes(bucket_path, &data).map_err(|e| {
-        BucketDownloadFailure::Persist(format!("failed to save bucket {hash} to disk: {e}"))
-    })?;
+    // Persist off the tokio worker thread. `atomic_write_bytes` issues blocking
+    // `fsync` calls (file + parent dir); running them inline on the worker that
+    // polls this future starves the scheduler when up to
+    // `MAX_CONCURRENT_DOWNLOADS` (16) of these futures are fanned out via
+    // `.buffer_unordered`. See #3686. `data` has no post-write use here, so the
+    // owned `Vec<u8>` + `PathBuf` move cleanly into the blocking closure.
+    persist_bucket_to_disk(bucket_path.to_path_buf(), data)
+        .await
+        .map_err(|e| {
+            BucketDownloadFailure::Persist(format!("failed to save bucket {hash} to disk: {e}"))
+        })?;
 
     Ok(())
+}
+
+/// Persist downloaded bucket bytes to disk off the tokio worker thread.
+///
+/// `atomic_write_bytes` performs blocking `fsync` (both the temp file and the
+/// parent directory) for crash durability. When invoked directly from an async
+/// fn polled on a tokio worker thread — and fanned out up to
+/// `MAX_CONCURRENT_DOWNLOADS`-wide via `.buffer_unordered` — these fsyncs block
+/// the worker threads and starve the runtime under disk pressure (#3686). This
+/// helper moves the write onto the blocking pool via
+/// [`henyey_common::spawn_blocking_logged`], freeing the worker to keep polling
+/// overlay/RPC/timer tasks.
+///
+/// A `JoinError` (closure panic) and the inner [`std::io::Error`] are flattened
+/// into a single `io::Result`, preserving the caller's existing error contract
+/// (the error is stringified into `BucketDownloadFailure::Persist`).
+pub async fn persist_bucket_to_disk(bucket_path: PathBuf, data: Vec<u8>) -> std::io::Result<()> {
+    match henyey_common::spawn_blocking_logged("download-save-bucket", move || {
+        atomic_write_bytes(&bucket_path, &data)
+    })
+    .await
+    {
+        Ok(inner) => inner,
+        Err(join_err) => Err(std::io::Error::other(format!(
+            "persist task failed: {join_err}"
+        ))),
+    }
 }
 
 #[async_trait]

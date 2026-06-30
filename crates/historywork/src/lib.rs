@@ -98,6 +98,7 @@ use stellar_xdr::{
 };
 
 pub use builder::{HistoryWorkBuilder, HistoryWorkIds};
+pub use download::persist_bucket_to_disk;
 
 // ============================================================================
 // Shared State Types
