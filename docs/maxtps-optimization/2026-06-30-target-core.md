@@ -125,6 +125,52 @@ re-emit → accept-nominate quorum → confirm → ballot — to find where the 
 compare round-trip count + per-hop latency against stellar-core. Instrumentation on throwaway branch:
 maxtps_nom_round, maxtps_nom_leaders, maxtps_setup_decomp, maxtps_build_decomp, maxtps_txset_validate.
 
+## Adversarial-architect hypotheses (2026-06-30) — NEW leads, not yet tested
+
+KEY REFRAME (challenges elimination #4): "no thread >46% CPU" does NOT rule out the event loop —
+it measures CPU *saturation*, not tokio `select!` *scheduling/queuing latency*. An arm can wait many
+ms to be selected while the core is <50% busy. "Every work-unit is fast yet wall-clock isn't" is the
+SIGNATURE of scheduling/cross-task-round-trip latency, not of genuine SCP message work. Ranked:
+
+- **H1 (top): inbound SCP is drained one-envelope-per-`select!`-iteration through a NON-biased outer
+  select, competing with the saturated tx-flood arm, plus a cross-task verify-worker round-trip.**
+  lifecycle.rs:852 (one-per-iter SCP recv), :938 (flood arm; outer select NOT `biased;`), :2353-2495
+  (`pump_scp_intake` ships envelope to verify worker and returns; result comes back via verified_rx).
+  tokio select picks a uniformly-random ready arm; under flood the SCP arms lose coin-flips → ms of
+  scheduling wait per envelope × 22 peers. BIMODAL because flood pressure + envelope size both scale
+  with tx-set size, which is network-deterministic per slot → same ~30% slots slow on all nodes.
+  TEST: (a) histogram received_at→entry-to-process_verified per envelope; (b) **decisive A/B: add
+  `biased;` to the outer select with consensus arms above message_rx, re-run**; (c) count loop
+  iterations + flood-arm wins between first-emit and ballot-start. FIX: biased select / batch-drain
+  the scp recv arm / verify inline on sig-cache hit (skip the worker round-trip).
+- **H2: trigger feedback loop.** consensus.rs:438-441 arms next nomination at `prepare_start(N-1) +
+  expected_close` (Instant-relative, not absolute grid) → a slow slot pushes the next trigger late;
+  jitter accumulates, can produce a 2-cycle oscillation (matches "~half slow" better than 30%).
+  TEST (do FIRST, disambiguates everything): log absolute wall-clocks per slot — timer-armed,
+  timer-fired, first-self-emit, ballot-start. `armed_delay=fired-armed`, `convergence=ballot-fired`.
+  Late `fired` vs LCL_close+5s ⇒ H2; on-grid `fired` + inflated `convergence` ⇒ H1/H3/H4.
+  FIX: anchor trigger to absolute `lcl_close_time + expected_close`, not local prepare_start Instant.
+- **H3: verify-worker `reserve().await` (lifecycle.rs:2431) parks the WHOLE event loop** when the
+  bounded verify queue is full → stalls trigger/ballot delivery. Co-varies with tx-set size + 22-peer
+  burst. TEST (free): bucket existing phase-31 time + verify-queue-depth by fast/slow slot.
+- **H4: outbound `scp_envelope` channel (cap 100, mod.rs:1437) drained one-per-iter at :998 with
+  `.await` locks (scp_latency/survey_state at :1009/:1013) on the broadcast path** → throttles our
+  own re-emit cascade (nomination.rs:807-811) → peers see our votes late → slow quorum. TEST: gauge
+  channel depth + emit→broadcast latency on slow slots. FIX: drain-to-exhaustion / locks off hot path.
+- **H5 (challenges #3): divergent tx-sets exist for both, but henyey may take more WALL-CLOCK per
+  adopt-revote round** (each adoption gated on H1/H4 delivery) even if round COUNT matches core.
+  TEST: count adopt-revote rounds per slot vs core; same count → delivery bug (H1/H4), higher count →
+  priority-hash divergence (get_node_priority / get_node_weight).
+- **H6 (challenges #2's "round-1" claim): `update_round_leaders` bumps `self.round` in a
+  leader-growth loop (nomination.rs:1111) WITHOUT a timeout** — "round==1" instrumentation may hide a
+  round-1 leader-set recompute cost. TEST: log max_leader_count + round_leaders.len() + growth-bump
+  count per slot.
+- **H7 (framing): plot per-slot trigger→ballot as a TIME SERIES, not a histogram.** Oscillation
+  (period ~2) ⇒ H2; uncorrelated ~30% spikes ⇒ load-driven H1/H3/H4. One log + one plot picks the family.
+
+Recommended cheap iteration order: H2/H7 absolute-clock time-series FIRST (decides direction) →
+H1 `biased;` A/B (one-line, parity-safe) → H3 free metric correlation → H4 → H5.
+
 ## Summary
 - Baseline → current: 462 → ~1300 tx/s (4 PRs accepted: #3679, #3682, #3683, #3684); measurement
   is now trustworthy (the artifacts were the big wins).
