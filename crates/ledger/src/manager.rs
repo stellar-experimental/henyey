@@ -1523,6 +1523,17 @@ pub struct LedgerManager {
     #[cfg(any(test, feature = "test-utils"))]
     snapshot_count: std::sync::atomic::AtomicU64,
 
+    /// Test-only interpose hook fired inside `begin_close()` between the
+    /// single outer `state.read()` and the `create_snapshot_locked()` call.
+    ///
+    /// Used by the #3685 deadlock regression test to deterministically wedge a
+    /// concurrent `reset()` writer into the gap that previously triggered a
+    /// recursive read-lock acquisition. Behind `test-utils` so production
+    /// builds pay nothing and contain no hook branch.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[allow(clippy::type_complexity)]
+    begin_close_interpose: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
+
     /// Optional invariant manager for runtime integrity checks.
     /// Shared with all executors created by this manager.
     invariant_manager: Option<Arc<henyey_invariant::InvariantManager>>,
@@ -1569,6 +1580,8 @@ impl LedgerManager {
             finished_merges: None,
             #[cfg(any(test, feature = "test-utils"))]
             snapshot_count: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(any(test, feature = "test-utils"))]
+            begin_close_interpose: Mutex::new(None),
             invariant_manager: None,
             last_close_wall_time: Mutex::new(std::time::Instant::now()),
         }
@@ -1600,6 +1613,14 @@ impl LedgerManager {
     pub fn test_snapshot_count(&self) -> u64 {
         self.snapshot_count
             .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Test-only: install a hook fired inside `begin_close()` between the
+    /// single outer `state.read()` and the `create_snapshot_locked()` call.
+    /// Used by the #3685 deadlock regression test. See `begin_close_interpose`.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn set_begin_close_interpose(&self, hook: Box<dyn Fn() + Send + Sync>) {
+        *self.begin_close_interpose.lock() = Some(hook);
     }
 
     /// Check if the ledger has been initialized.
@@ -2349,7 +2370,25 @@ impl LedgerManager {
             });
         }
 
-        // Create snapshot of current state for reading during close
+        // Test-only interpose hook: fired exactly once between the single
+        // outer `state.read()` above and the `create_snapshot_locked()` call
+        // below. The #3685 regression test installs it to wedge a concurrent
+        // `reset()` writer into this exact gap. Compiled out of production.
+        #[cfg(any(test, feature = "test-utils"))]
+        {
+            let hook = self.begin_close_interpose.lock().take();
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
+
+        // Create snapshot of current state for reading during close.
+        //
+        // Reuse the single outer `state` read guard acquired at the top of
+        // this function rather than calling the public `create_snapshot()`
+        // wrapper (which would take a SECOND, recursive `state.read()`). A
+        // recursive read on the writer-fair non-reentrant `parking_lot::RwLock`
+        // deadlocks if a `reset()` writer parks between the two reads (#3685).
         let snapshot = self.create_snapshot()?;
 
         let mut upgrade_ctx = UpgradeContext::new(state.header.ledger_version);
@@ -2400,6 +2439,29 @@ impl LedgerManager {
     /// The snapshot includes a lookup function for entries not in the cache,
     /// which queries the bucket list for the entry.
     pub fn create_snapshot(&self) -> Result<SnapshotHandle> {
+        // Thin wrapper: acquire the state read lock exactly once and delegate.
+        // Callers that already hold an outer `state` read guard (e.g.
+        // `begin_close()`) must call `create_snapshot_locked()` directly to
+        // avoid a recursive `parking_lot::RwLock` read that can deadlock vs a
+        // concurrent `reset()` writer (#3685).
+        let state = self.state.read();
+        self.create_snapshot_locked(&state)
+    }
+
+    /// Build a `SnapshotHandle` using a caller-provided `state` read guard.
+    ///
+    /// This holds the entire body of `create_snapshot()` but takes the state
+    /// guard by reference instead of re-acquiring `self.state.read()`. This
+    /// lets `begin_close()` — which already holds a single outer `state`
+    /// read guard — construct the snapshot without a second (recursive)
+    /// acquisition. A recursive read on `parking_lot::RwLock` (writer-fair,
+    /// non-reentrant) can permanently wedge close-vs-catchup if a `reset()`
+    /// writer parks between the two reads (#3685).
+    ///
+    /// The `#[cfg]`-gated `snapshot_count` increment lives here (the shared
+    /// path) so the per-snapshot count is unchanged across both callers
+    /// (#1759).
+    fn create_snapshot_locked(&self, state: &LedgerState) -> Result<SnapshotHandle> {
         let fn_start = std::time::Instant::now();
 
         #[cfg(any(test, feature = "test-utils"))]
@@ -2408,7 +2470,6 @@ impl LedgerManager {
 
         // --- Sub-timer: state read + LedgerSnapshot construction ---
         let t0 = std::time::Instant::now();
-        let state = self.state.read();
 
         // Guard: reject snapshots when the ledger manager has not been
         // initialized (or has been reset for catchup).  Without this check,
@@ -2470,10 +2531,10 @@ impl LedgerManager {
         });
         let bucket_list_snapshot_elapsed = t2.elapsed();
 
-        // Drop state read guard — no longer needed after LedgerSnapshot and
-        // BucketListSnapshot construction. Avoids extending the lock hold
-        // through closure building and the debug log below.
-        drop(state);
+        // No `drop(state)` here: `state` is a borrowed `&LedgerState`, not an
+        // owned guard. The owner of the read guard (the public
+        // `create_snapshot()` wrapper or `begin_close()`) releases it when it
+        // returns. Nothing below this point reads `state`.
 
         // --- Sub-timer: closure building + SnapshotHandle assembly ---
         let t3 = std::time::Instant::now();
@@ -10409,6 +10470,129 @@ mod tests {
                 format!("Err({})", result.err().unwrap())
             }
         );
+    }
+
+    /// Regression test for #3685: `begin_close()` must not deadlock against a
+    /// concurrent `reset()`.
+    ///
+    /// Before the fix, `begin_close()` held `state.read()` (read#1) and then
+    /// called `create_snapshot()`, which took a SECOND `state.read()` (read#2).
+    /// On the writer-fair, non-reentrant `parking_lot::RwLock`, if a `reset()`
+    /// writer parks between read#1 and read#2, read#2 queues *behind* the
+    /// writer while read#1 is still held — a permanent 3-way wedge (node
+    /// freeze). The fix threads `begin_close`'s single outer guard into
+    /// `create_snapshot_locked(&state)`, so the close path acquires `state`
+    /// exactly once and there is no second acquisition to park.
+    ///
+    /// The test uses a cfg-gated interpose hook fired inside `begin_close()`
+    /// between read#1 and the `create_snapshot_locked` call:
+    ///   T1 runs `begin_close()`. When the hook fires, it signals "read#1
+    ///   held", then blocks until the test releases it. The test, on that
+    ///   signal, spawns T2 = `reset()` (which parks on `state.write()` behind
+    ///   read#1), waits a bounded interval to let the writer enqueue, then
+    ///   releases the hook so T1 proceeds. A `recv_timeout(5s)` watchdog
+    ///   `panic!`s on no progress, so BUGGY code FAILS (not hangs) the suite.
+    ///
+    /// NOTE (fail-on-main demonstration): the interpose hook is itself new
+    /// code, so this exact test cannot run against pristine `origin/main`.
+    /// The fail-on-buggy-code property was demonstrated by temporarily
+    /// reverting ONLY the one-line call-site swap (`create_snapshot_locked`
+    /// → `create_snapshot`) while keeping the hook + test: that intermediate
+    /// state deadlocks and the watchdog fires. With the swap applied, it
+    /// passes.
+    #[test]
+    fn test_begin_close_does_not_deadlock_with_concurrent_reset() {
+        use henyey_common::protocol::CURRENT_LEDGER_PROTOCOL_VERSION;
+        use std::sync::mpsc;
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        // Build and initialize a manager at the current protocol version so
+        // begin_close passes its version/sequence/prev-hash checks.
+        let manager = Arc::new(LedgerManager::new(
+            "Test SDF Network ; September 2015".to_string(),
+            LedgerManagerConfig {
+                validate_bucket_hash: false,
+                ..Default::default()
+            },
+        ));
+
+        let mut header = create_genesis_header();
+        header.ledger_seq = 1;
+        header.ledger_version = CURRENT_LEDGER_PROTOCOL_VERSION;
+        let header_hash = crate::compute_header_hash(&header).expect("hash");
+        manager
+            .initialize(
+                new_bl_with_config(),
+                henyey_bucket::HotArchiveBucketList::new(),
+                header.clone(),
+                header_hash,
+            )
+            .expect("initialization should succeed");
+
+        // Channels coordinating the three actors (test thread, T1, T2).
+        // hook_held: hook fired → read#1 is held, T1 is parked in the gap.
+        let (hook_held_tx, hook_held_rx) = mpsc::channel::<()>();
+        // hook_release: test → hook, allow T1 to proceed to create_snapshot_locked.
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        // t1_done: T1 → test, begin_close returned (watchdog target).
+        let (t1_done_tx, t1_done_rx) = mpsc::channel::<()>();
+
+        // Wrap the single-shot release receiver so the (Fn, not FnMut) hook can
+        // consume from it. The hook fires exactly once per begin_close.
+        let release_rx = std::sync::Mutex::new(release_rx);
+        manager.set_begin_close_interpose(Box::new(move || {
+            // Signal that read#1 is held and we are inside the gap.
+            let _ = hook_held_tx.send(());
+            // Block until the test releases us (after T2's writer has parked).
+            let _ = release_rx.lock().unwrap().recv();
+        }));
+
+        // T1: run begin_close. close_data is for ledger_seq 2 (header is at 1).
+        let m1 = Arc::clone(&manager);
+        let t1 = std::thread::spawn(move || {
+            let close_data = LedgerCloseData::new(
+                2,
+                TransactionSetVariant::Classic(TransactionSet {
+                    previous_ledger_hash: header_hash.into(),
+                    txs: VecM::default(),
+                }),
+                1,
+                header_hash,
+            );
+            // Hold the context briefly then drop it; we only care that
+            // begin_close returns (made forward progress without deadlock).
+            let _ctx = m1.begin_close(close_data);
+            let _ = t1_done_tx.send(());
+        });
+
+        // Wait until T1 is parked in the gap holding read#1.
+        hook_held_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("hook should fire (begin_close reached the interpose gap)");
+
+        // T2: a concurrent catchup reset(), which takes state.write() and thus
+        // parks behind T1's held read#1.
+        let m2 = Arc::clone(&manager);
+        let t2 = std::thread::spawn(move || {
+            m2.reset();
+        });
+
+        // Give T2's writer time to enqueue on the RwLock so that, on buggy
+        // code, T1's second (recursive) read would park BEHIND it.
+        std::thread::sleep(Duration::from_millis(100));
+
+        // Release T1 so it proceeds from the gap to create_snapshot_locked.
+        release_tx.send(()).expect("release hook");
+
+        // Watchdog: buggy code never lets T1 finish → fail loudly, do not hang.
+        t1_done_rx.recv_timeout(Duration::from_secs(5)).expect(
+            "deadlock: begin_close made no progress within 5s \
+             (recursive state.read() parked behind reset()'s writer — #3685)",
+        );
+
+        t1.join().expect("T1 panicked");
+        t2.join().expect("T2 panicked");
     }
 
     /// Rejects initialize when the bucket list hash (pre-hot-archive path) does
