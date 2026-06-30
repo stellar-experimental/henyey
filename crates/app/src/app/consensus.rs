@@ -1529,11 +1529,18 @@ impl App {
             self.consensus_trigger_timer_fires
                 .fetch_add(1, Ordering::Relaxed);
             self.try_trigger_consensus().await;
-            // Re-arm the trigger for the following slot so the event-driven
-            // schedule continues even if this attempt did not (yet) externalize
-            // (e.g. multi-node nomination still in flight, or a gated skip).
-            // setup_trigger_next_ledger is idempotent w.r.t. the per-slot timer.
-            self.setup_trigger_next_ledger().await;
+            // Single-shot per ledger (parity: stellar-core arms mTriggerTimer
+            // only from `lastClosedLedgerIncreased`). We deliberately do NOT
+            // re-arm here. While a slot is still being nominated, LCL has not
+            // advanced, so `next_slot` is unchanged and `prepare_start(last) +
+            // expectedClose` is already in the past — a re-arm would compute
+            // `delay == 0` and the timer would fire again immediately, spinning
+            // at hundreds of Hz for the whole nomination→externalize window and
+            // starving the event loop that services inbound SCP envelopes
+            // (maxtps: slow/bimodal nomination convergence). The next trigger is
+            // armed by the post-close path (`setup_trigger_next_ledger` after a
+            // ledger closes); the 1-second maintenance-tick
+            // `try_trigger_consensus` backstops any gated/never-armed case.
             // Signal the caller to pump the close pipeline for a possible
             // self-externalized slot (see the doc comment).
             return true;
@@ -2609,6 +2616,66 @@ mod tests {
             .expect("expected re-delivered nomination timer event");
         assert_eq!(redelivered.slot, future_slot);
         assert_eq!(redelivered.timer_type, henyey_herder::TimerType::Nomination);
+    }
+
+    /// Regression (maxtps): handling a `TriggerNextLedger` timer event must NOT
+    /// re-arm another `TriggerNextLedger` timer for the *same* slot. The
+    /// trigger timer is single-shot per ledger (parity: stellar-core arms it
+    /// only from `lastClosedLedgerIncreased`); the post-close path is the sole
+    /// re-arm site.
+    ///
+    /// Pre-fix bug: `handle_scp_timer_event` re-armed unconditionally after
+    /// every trigger fire. While a slot is still being nominated (LCL has not
+    /// advanced, so `next_slot` is unchanged and `prepare_start(last) + 5s` is
+    /// already in the past), the re-arm computed `delay == 0`, so the timer
+    /// fired again immediately — a ~hundreds-of-Hz busy-loop that ran for the
+    /// entire nomination→externalize window of every ledger, starving the
+    /// event loop that services inbound SCP envelopes (slow/bimodal
+    /// convergence). This test bootstraps that exact precondition (cold start,
+    /// `prepare_start(LCL) == None` → trigger-time gate open, solo node does not
+    /// externalize without the event loop, so LCL stays put) and asserts no
+    /// self-perpetuating trigger event is re-delivered.
+    #[tokio::test(start_paused = true)]
+    async fn test_trigger_event_does_not_rearm_same_slot_spin() {
+        let (_dir, app) = mk_validator_app().await;
+
+        // LCL 1 → tracking, next slot 2. prepare_start(1) is None on cold start,
+        // so try_trigger_consensus's trigger-time gate is open and the re-arm
+        // (pre-fix) would compute delay 0 for slot 2 — the spin precondition.
+        app.herder.bootstrap(1);
+        assert!(app.herder.is_tracking());
+        assert!(app.herder.prepare_start(1).is_none());
+
+        // Deliver one TriggerNextLedger event for the current next slot.
+        let event = super::super::scp_timer_bridge::ScpTimerEvent {
+            slot: 2,
+            timer_type: henyey_herder::TimerType::TriggerNextLedger,
+            epoch: app.scp_timer_epoch.load(Ordering::Acquire),
+        };
+        app.handle_scp_timer_event(event).await;
+
+        // Let the timer manager process any scheduled command and (pre-fix) fire
+        // the zero-delay re-arm back into scp_timer_rx.
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+
+        // No self-perpetuating TriggerNextLedger event must have been delivered.
+        // Pre-fix: the delay-0 re-arm fires immediately and delivers one here
+        // (and would do so forever) → this assertion FAILS. Post-fix: the
+        // handler does not re-arm, so nothing is delivered.
+        let mut rx = app.scp_timer_rx.lock().await;
+        let mut spurious_triggers = 0;
+        while let Ok(ev) = rx.try_recv() {
+            if ev.timer_type == henyey_herder::TimerType::TriggerNextLedger {
+                spurious_triggers += 1;
+            }
+        }
+        assert_eq!(
+            spurious_triggers, 0,
+            "handling a TriggerNextLedger event must not re-arm a same-slot \
+             trigger (busy-loop regression)"
+        );
     }
 
     /// End-to-end: future-slot ballot timer while tracking is re-armed at
