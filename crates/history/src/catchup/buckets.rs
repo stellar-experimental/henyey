@@ -350,6 +350,14 @@ impl CatchupManager {
             // Save XDR data to disk first, then build the disk-backed bucket by
             // streaming through the file. This avoids holding the full file in memory
             // while also building the index — critical for multi-GB buckets on mainnet.
+            //
+            // NOTE (#3686): this `atomic_write_bytes` runs under
+            // `block_on_async`/`block_in_place` (synchronous context, not a
+            // tokio-worker-polled async fn), so it is intentionally NOT wrapped
+            // in `spawn_blocking` — the worker is already released via
+            // `block_in_place`. Only the async `.buffer_unordered` download
+            // call sites (historywork/download.rs, catchup/download.rs) need the
+            // off-worker wrap.
             if let Err(e) = atomic_write_bytes(&bucket_path, &xdr_data) {
                 if !was_preloaded {
                     // Persistence failure on the freshly-downloaded path is a
@@ -508,6 +516,12 @@ impl CatchupManager {
             let hot_archive_bucket_cache: Mutex<HashMap<Hash256, HotArchiveBucket>> =
                 Mutex::new(HashMap::new());
 
+            // NOTE (#3686): the `atomic_write_bytes` calls inside this closure
+            // (and the live-bucket loader above) run synchronously under the
+            // `apply_buckets` `block_in_place` region — not on a tokio worker
+            // polling an async fn — so they are intentionally NOT
+            // `spawn_blocking`-wrapped. Only the async `.buffer_unordered`
+            // download call sites need the off-worker wrap.
             let load_hot_archive_bucket =
                 |hash: &Hash256| -> henyey_bucket::Result<HotArchiveBucket> {
                     // Short-circuit sentinel hashes (zero hash → empty bucket)

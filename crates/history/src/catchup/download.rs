@@ -239,8 +239,30 @@ impl CatchupManager {
                                     );
                                     continue;
                                 }
-                                // Save to disk atomically
-                                if let Err(e) = atomic_write_bytes(&bucket_path, &data) {
+                                // Save to disk atomically, off the tokio worker
+                                // thread. `atomic_write_bytes` issues blocking
+                                // `fsync` calls; running them inline on the
+                                // worker that polls this future starves the
+                                // runtime when up to MAX_CONCURRENT_DOWNLOADS
+                                // (16) of these futures are fanned out via
+                                // `.buffer_unordered` under disk pressure
+                                // (#3686). Capture `data.len()` BEFORE moving
+                                // `data` into the blocking closure (the
+                                // `debug!` below still needs it).
+                                let nbytes = data.len();
+                                let write_path = bucket_path.clone();
+                                let write_res = match henyey_common::spawn_blocking_logged(
+                                    "catchup-save-bucket",
+                                    move || atomic_write_bytes(&write_path, &data),
+                                )
+                                .await
+                                {
+                                    Ok(inner) => inner.map_err(|e| e.to_string()),
+                                    Err(join_err) => {
+                                        Err(format!("persist task failed: {join_err}"))
+                                    }
+                                };
+                                if let Err(e) = write_res {
                                     warn!("Failed to save bucket {} to disk: {}", hash, e);
                                     continue;
                                 }
@@ -250,7 +272,7 @@ impl CatchupManager {
                                 if count % PROGRESS_REPORT_INTERVAL == 0 || count == total_to_download as u32 {
                                     info!("Downloaded {}/{} buckets", count, total_to_download);
                                 }
-                                debug!("Pre-downloaded bucket {} ({} bytes)", hash, data.len());
+                                debug!("Pre-downloaded bucket {} ({} bytes)", hash, nbytes);
                                 return Ok(archive.name().to_owned());
                             }
                             Err(e) => {
