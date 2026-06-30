@@ -201,6 +201,34 @@ instrumentation immediately surfaced the real bug — NOT in the SCP path but in
 - **H3/H4/H5/H6 were alternative explanations for the same now-resolved symptom** → no longer needed.
   H7 time-series confirmed the slow window is a single contiguous over-rate probe, not oscillation.
 
+## Remaining architect hypotheses — evaluated post-fix (2026-06-30)
+
+With the spin fixed, convergence is ~30–60 ms median at sustainable rates. H3–H6 were all competing
+explanations for the slow convergence the spin actually caused, so they are now largely moot. Verdicts
+after code inspection + stellar-core parity check:
+
+- **H2 (late trigger): RULED OUT.** Post-fix `maxtps_trigger_fire` lateness mean ~1.3 ms — the timer
+  fires punctually; the trigger is not late.
+- **H3 (`reserve().await` parks the event loop): real pattern, latent only.** `pump_scp_intake` does
+  run inline in the main `select!` (lifecycle.rs:866), so a full verify-input queue *could* park the
+  loop — but the biased branch drains verified output meanwhile, and with the 250k sig-verify cache the
+  worker keeps up, so the queue does not fill in steady state. De-inlining the pump is a non-trivial,
+  parity-sensitive refactor (more complex, not a simplification) with no measured win → no PR.
+- **H4 (metric locks on the outbound broadcast path): minor, no win.** The `scp_envelope` arm takes two
+  async `RwLock` writes (`scp_latency`, `survey_state`, both metrics) before `overlay.broadcast()`.
+  Pure lock overhead is ~µs vs the 30–60 ms convergence; not a throttle now. Moving them off-path is a
+  refactor, not a clear simplification, and unmeasured → no PR.
+- **H5 (more wall-clock per adopt-revote round): moot.** Fast ~1-round-trip convergence (30–60 ms)
+  shows henyey is not doing excess nomination rounds; this was a symptom of the spin.
+- **H6 (`update_round_leaders` bumps `self.round` without timeout): PARITY-CORRECT.** stellar-core does
+  the same `mRoundNumber++` inside `updateRoundLeaders` (NominationProtocol.cpp:295), mirrored at
+  nomination.rs:1122. Not a bug → no change.
+- **H7 (time-series framing): used.** Confirmed the slow window is a single contiguous over-capacity
+  probe step, not a period-2 oscillation.
+
+Net: the trigger busy-loop (H1 family) was the single root cause; none of H3–H6 warrant a PR (ruled
+out / parity-correct / latent-only with no measured gain and no code simplification).
+
 ## Summary
 - Baseline → current: 462 → **1410 tx/s** (5 PRs: #3679, #3682, #3683, #3684, **#3691**). henyey is
   now ≈92% of core's ~1531 on the same rig (was 84%).
