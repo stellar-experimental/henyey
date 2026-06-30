@@ -2361,6 +2361,15 @@ impl App {
                 overlay.handle_max_tx_size_increase(increase).await;
             }
         }
+        // #3681: refresh the live per-ledger maxTxSetSize (ops) the overlay
+        // flow-control uses for outbound-queue trimming. Refreshed on the same
+        // ledger-state-change events as max_tx_size_bytes (startup, catchup,
+        // each close) since both derive from the last-closed-ledger header.
+        // Mirrors stellar-core's FlowControl reading getLastMaxTxSetSizeOps().
+        let ops = self.ledger_manager.last_max_tx_set_size_ops() as u32;
+        if let Some(overlay) = self.overlay().await {
+            overlay.set_max_tx_set_size_ops(ops);
+        }
     }
 
     // ---------------------------------------------------------------

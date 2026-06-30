@@ -256,7 +256,7 @@ impl OverlayManager {
         // (#3625); the original is moved into the PeerHandle below.
         let outbound_tx_for_loop = outbound_tx.clone();
         let stats = peer.stats();
-        let flow_control = Arc::new(FlowControl::with_scp_callback(
+        let flow_control = Arc::new(FlowControl::with_scp_callback_and_live_max_ops(
             FlowControlConfig {
                 flow_control_bytes_batch_size: shared.flow_control_bytes_config.bytes_batch()
                     as u64,
@@ -265,6 +265,9 @@ impl OverlayManager {
             },
             initial_byte_grant,
             shared.scp_callback.clone(),
+            // #3681: share the live per-ledger maxTxSetSize so the outbound-queue
+            // trim tracks the last-closed-ledger limit, not the static default.
+            Arc::clone(&shared.max_tx_set_size_ops),
         ));
         flow_control.set_peer_id(peer_id.clone());
         let generation = shared.next_peer_generation.fetch_add(1, Ordering::Relaxed);
@@ -2632,6 +2635,7 @@ mod tests {
                 max_tx_size_bytes: Arc::new(AtomicU32::new(
                     crate::flow_control::DEFAULT_MAX_TX_SIZE_BYTES,
                 )),
+                max_tx_set_size_ops: Arc::new(AtomicU32::new(10000)),
                 flow_control_bytes_config: FlowControlBytesConfig::default(),
                 peer_flood_reading_capacity: 200,
                 outbound_channel_capacity: 256,

@@ -917,6 +917,11 @@ pub(super) struct SharedPeerState {
     /// (same `Arc<AtomicU32>`) so the overlay can dynamically compute the
     /// initial byte grant for new peers via `FlowControlBytesConfig::bytes_total`.
     pub(super) max_tx_size_bytes: Arc<AtomicU32>,
+    /// Live per-ledger `maxTxSetSize` (ops). The app layer updates this on each
+    /// ledger close via [`OverlayManager::set_max_tx_set_size_ops`]; the same
+    /// `Arc<AtomicU32>` is shared into each peer's `FlowControl` so the
+    /// outbound-queue trim tracks the live limit, not a static default (#3681).
+    pub(super) max_tx_set_size_ops: Arc<AtomicU32>,
     /// Flow control byte parameters (initial grant and batch size).
     /// Immutable after initialization — no atomic needed.
     pub(super) flow_control_bytes_config: FlowControlBytesConfig,
@@ -1275,6 +1280,9 @@ pub struct OverlayManager {
     /// via the same `Arc<AtomicU32>` so the overlay reads the latest value
     /// when computing initial byte grants for new peers.
     pub(super) max_tx_size_bytes: Arc<AtomicU32>,
+    /// Live per-ledger `maxTxSetSize` (ops), shared into each peer's
+    /// `FlowControl` for the outbound-queue trim limit (#3681).
+    pub(super) max_tx_set_size_ops: Arc<AtomicU32>,
     /// Cached local address the listener is bound to (set by `start_listener()`).
     listen_addr: Option<SocketAddr>,
     /// Cooldown map preventing immediate re-dial after a connection drops.
@@ -1391,6 +1399,11 @@ impl OverlayManager {
             metrics: Arc::new(OverlayMetrics::new()),
             query_rate_limit_window_secs: Arc::new(AtomicU64::new(60)),
             max_tx_size_bytes,
+            // #3681: seeded to the static default; the app overwrites it with the
+            // live last-closed-ledger `maxTxSetSize` at startup and each close.
+            max_tx_set_size_ops: Arc::new(AtomicU32::new(
+                crate::flow_control::FlowControlConfig::default().max_tx_set_size_ops,
+            )),
             listen_addr: None,
             dial_cooldowns: Arc::new(DashMap::new()),
             next_peer_generation: Arc::new(AtomicU64::new(0)),
@@ -1430,6 +1443,7 @@ impl OverlayManager {
             metrics: Arc::clone(&self.metrics),
             query_rate_limit_window_secs: Arc::clone(&self.query_rate_limit_window_secs),
             max_tx_size_bytes: Arc::clone(&self.max_tx_size_bytes),
+            max_tx_set_size_ops: Arc::clone(&self.max_tx_set_size_ops),
             flow_control_bytes_config: self.config.flow_control_bytes_config,
             peer_flood_reading_capacity: self.config.peer_flood_reading_capacity,
             outbound_channel_capacity: self.connection_factory.outbound_channel_capacity(),
@@ -1996,6 +2010,15 @@ impl OverlayManager {
     pub fn set_query_rate_limit_window(&self, window: Duration) {
         self.query_rate_limit_window_secs
             .store(window.as_secs(), Ordering::Relaxed);
+    }
+
+    /// Update the live per-ledger `maxTxSetSize` (ops) used by every peer's
+    /// `FlowControl` outbound-queue trim (#3681). The app layer calls this at
+    /// startup and after each ledger close with
+    /// `LedgerManager::last_max_tx_set_size_ops()`. Mirrors stellar-core's
+    /// `FlowControl` reading `getLedgerManager().getLastMaxTxSetSizeOps()`.
+    pub fn set_max_tx_set_size_ops(&self, ops: u32) {
+        self.max_tx_set_size_ops.store(ops, Ordering::Relaxed);
     }
 
     /// Returns whether the node is currently tracking consensus.
@@ -3082,6 +3105,7 @@ pub(crate) mod tests {
             max_tx_size_bytes: Arc::new(AtomicU32::new(
                 crate::flow_control::DEFAULT_MAX_TX_SIZE_BYTES,
             )),
+            max_tx_set_size_ops: Arc::new(AtomicU32::new(10000)),
             flow_control_bytes_config: FlowControlBytesConfig::default(),
             peer_flood_reading_capacity: 200,
             outbound_channel_capacity: 256,
@@ -3609,6 +3633,7 @@ pub(crate) mod tests {
             max_tx_size_bytes: Arc::new(AtomicU32::new(
                 crate::flow_control::DEFAULT_MAX_TX_SIZE_BYTES,
             )),
+            max_tx_set_size_ops: Arc::new(AtomicU32::new(10000)),
             flow_control_bytes_config: FlowControlBytesConfig::default(),
             peer_flood_reading_capacity: 200,
             outbound_channel_capacity: 256,
@@ -3703,6 +3728,7 @@ pub(crate) mod tests {
             max_tx_size_bytes: Arc::new(AtomicU32::new(
                 crate::flow_control::DEFAULT_MAX_TX_SIZE_BYTES,
             )),
+            max_tx_set_size_ops: Arc::new(AtomicU32::new(10000)),
             flow_control_bytes_config: FlowControlBytesConfig::default(),
             peer_flood_reading_capacity: 200,
             outbound_channel_capacity: 256,
@@ -4407,6 +4433,7 @@ pub(crate) mod tests {
             max_tx_size_bytes: Arc::new(AtomicU32::new(
                 crate::flow_control::DEFAULT_MAX_TX_SIZE_BYTES,
             )),
+            max_tx_set_size_ops: Arc::new(AtomicU32::new(10000)),
             flow_control_bytes_config: FlowControlBytesConfig::default(),
             peer_flood_reading_capacity: 200,
             outbound_channel_capacity: 256,
@@ -4479,6 +4506,7 @@ pub(crate) mod tests {
             max_tx_size_bytes: Arc::new(AtomicU32::new(
                 crate::flow_control::DEFAULT_MAX_TX_SIZE_BYTES,
             )),
+            max_tx_set_size_ops: Arc::new(AtomicU32::new(10000)),
             flow_control_bytes_config: FlowControlBytesConfig::default(),
             peer_flood_reading_capacity: 200,
             outbound_channel_capacity: 256,
@@ -4587,6 +4615,7 @@ pub(crate) mod tests {
             max_tx_size_bytes: Arc::new(AtomicU32::new(
                 crate::flow_control::DEFAULT_MAX_TX_SIZE_BYTES,
             )),
+            max_tx_set_size_ops: Arc::new(AtomicU32::new(10000)),
             flow_control_bytes_config: FlowControlBytesConfig::default(),
             peer_flood_reading_capacity: 200,
             outbound_channel_capacity: 256,

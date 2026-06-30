@@ -25,7 +25,7 @@
 
 use crate::{OverlayError, PeerId, Result};
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use stellar_xdr::{StellarMessage, WriteXdr};
@@ -542,6 +542,14 @@ impl FlowControlState {
 pub struct FlowControl {
     /// Configuration.
     config: FlowControlConfig,
+    /// Live per-ledger `maxTxSetSize` (ops), used as the outbound-queue trim
+    /// limit. Shared `Arc<AtomicU32>` with the app layer (#3681), refreshed on
+    /// each ledger close from `LedgerManager::last_max_tx_set_size_ops()` —
+    /// mirroring stellar-core's `FlowControl` reading
+    /// `getLedgerManager().getLastMaxTxSetSizeOps()` per enqueue
+    /// (`FlowControl.cpp:479`) rather than a static config value. Seeded from
+    /// `config.max_tx_set_size_ops` when no shared handle is injected (tests).
+    live_max_tx_set_size_ops: Arc<AtomicU32>,
     /// Protected state.
     state: Mutex<FlowControlState>,
     /// Optional callback for intelligent SCP queue trimming.
@@ -581,6 +589,29 @@ impl FlowControl {
         initial_bytes_capacity: u32,
         scp_callback: Option<Arc<dyn ScpQueueCallback>>,
     ) -> Self {
+        // No shared handle: seed a private live value from the static config so
+        // existing callers (and tests that set `config.max_tx_set_size_ops`)
+        // behave exactly as before.
+        let live = Arc::new(AtomicU32::new(config.max_tx_set_size_ops));
+        Self::with_scp_callback_and_live_max_ops(
+            config,
+            initial_bytes_capacity,
+            scp_callback,
+            live,
+        )
+    }
+
+    /// Like [`with_scp_callback`] but with a caller-provided shared
+    /// `Arc<AtomicU32>` for the live per-ledger `maxTxSetSize` (ops). The
+    /// production overlay passes the app-shared atomic here (#3681) so the
+    /// outbound-queue trim tracks the live ledger limit rather than a static
+    /// config default.
+    pub fn with_scp_callback_and_live_max_ops(
+        config: FlowControlConfig,
+        initial_bytes_capacity: u32,
+        scp_callback: Option<Arc<dyn ScpQueueCallback>>,
+        live_max_tx_set_size_ops: Arc<AtomicU32>,
+    ) -> Self {
         let initial_bytes_capacity = initial_bytes_capacity as u64;
 
         Self {
@@ -599,6 +630,7 @@ impl FlowControl {
                 peer_id: None,
             }),
             config,
+            live_max_tx_set_size_ops,
             scp_callback,
             dropped_scp: AtomicU64::new(0),
             dropped_txs: AtomicU64::new(0),
@@ -617,6 +649,7 @@ impl FlowControl {
     /// Create a FlowControl with a custom initial byte capacity (test only).
     #[cfg(test)]
     fn with_byte_capacity(config: FlowControlConfig, byte_capacity: u64) -> Self {
+        let live_max_tx_set_size_ops = Arc::new(AtomicU32::new(config.max_tx_set_size_ops));
         Self {
             state: Mutex::new(FlowControlState {
                 message_capacity: FlowControlCapacity::new_message(&config),
@@ -633,6 +666,7 @@ impl FlowControl {
                 peer_id: None,
             }),
             config,
+            live_max_tx_set_size_ops,
             scp_callback: None,
             dropped_scp: AtomicU64::new(0),
             dropped_txs: AtomicU64::new(0),
@@ -764,8 +798,12 @@ impl FlowControl {
             being_sent: false,
         });
 
-        // Trim queue if over limits
-        let limit = self.config.max_tx_set_size_ops as usize;
+        // Trim queue if over limits. Use the LIVE per-ledger maxTxSetSize (ops),
+        // refreshed from the last-closed-ledger header (#3681), rather than the
+        // static `config.max_tx_set_size_ops` default — matching stellar-core's
+        // `getLastMaxTxSetSizeOps()`. A stale static cap below the live limit
+        // would over-trim the outbound flood/SCP/advert queues.
+        let limit = self.live_max_tx_set_size_ops.load(Ordering::Relaxed) as usize;
         let mut dropped = 0usize;
 
         match priority {
@@ -1793,6 +1831,56 @@ mod tests {
         // Queue should have been trimmed
         let stats = fc.get_stats();
         assert!(stats.tx_queue_size <= 5 || stats.tx_queue_size == 0);
+    }
+
+    /// Regression (#3681): the outbound tx-queue trim must use the LIVE
+    /// per-ledger `maxTxSetSize` (ops), not the static `config.max_tx_set_size_ops`.
+    /// When the live limit (e.g. 15000 in the network) exceeds the static
+    /// default (10000), the static cap would over-trim and drop flood txs that
+    /// core would keep. Here: static config cap = 5, live = 10; enqueue 8.
+    /// - Pre-fix (reads config=5): 8 > 5 → entire queue cleared → size 0.
+    /// - Post-fix (reads live=10): 8 < 10 → nothing trimmed → size 8.
+    #[test]
+    fn test_tx_trim_uses_live_max_tx_set_size_ops_3681() {
+        let mut config = FlowControlConfig::default();
+        config.max_tx_set_size_ops = 5; // stale static cap (pre-fix trim point)
+        config.outbound_tx_queue_byte_limit = 100_000_000; // don't trim on bytes
+
+        let live = Arc::new(AtomicU32::new(10)); // live ledger limit > static
+        let fc = FlowControl::with_scp_callback_and_live_max_ops(
+            config,
+            INITIAL_PEER_FLOOD_READING_CAPACITY_BYTES,
+            None,
+            Arc::clone(&live),
+        );
+
+        let send_more = StellarMessage::SendMoreExtended(SendMoreExtended {
+            num_messages: 1000,
+            num_bytes: 10_000_000,
+        });
+        fc.maybe_release_capacity(&send_more);
+
+        // Enqueue 8 tx messages: above the static cap (5), below the live cap (10).
+        for _ in 0..8 {
+            fc.add_msg_and_maybe_trim_queue(make_tx_message());
+        }
+
+        let stats = fc.get_stats();
+        assert_eq!(
+            stats.tx_queue_size, 8,
+            "trim must honor the live maxTxSetSize (10), not the static config (5)"
+        );
+
+        // Sanity: dropping the live limit below the queue length triggers the
+        // clear-on-overflow trim. Queue is at 8; set live=8 and add one more →
+        // 9 > 8 → the whole tx queue is cleared.
+        live.store(8, Ordering::Relaxed);
+        fc.add_msg_and_maybe_trim_queue(make_tx_message());
+        assert_eq!(
+            fc.get_stats().tx_queue_size,
+            0,
+            "exceeding the live limit must trigger the clear-on-overflow trim"
+        );
     }
 
     fn make_scp_message_at_slot(slot: u64) -> StellarMessage {
