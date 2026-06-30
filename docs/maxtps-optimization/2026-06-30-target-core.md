@@ -229,6 +229,44 @@ after code inspection + stellar-core parity check:
 Net: the trigger busy-loop (H1 family) was the single root cause; none of H3–H6 warrant a PR (ruled
 out / parity-correct / latent-only with no measured gain and no code simplification).
 
+## 2nd adversarial round + H7 ceiling decomposition + persist A/B (2026-06-30, instance j02eh72amr380)
+
+A second adversarial architect attacked the "no resource exhausted / apply overlaps the wait" framing
+and (correctly) noted the close pipeline is **single-flight** (`close_pipeline.rs`: a new close can't
+start until the prior persist completes) and classic apply is a **single serial loop** (tx_set.rs:171)
+— so <46% aggregate CPU is one saturated critical thread, not spare capacity. It predicted the floor
+is `convergence + apply + persist` (load-dependent) and ranked SQLite-persist hypotheses first.
+
+**H7 ceiling decomposition** (existing `maxtps_close`/`maxtps_persist` logs, passing 1430 vs failing 1455):
+
+| phase (ms, median) | 1430 PASS | 1455 FAIL |
+|---|--:|--:|
+| apply (tx_exec) | 178 | 174 |
+| bucket add_batch | 9.5 | 10.3 |
+| close-side commit/meta/header | ~0 | ~0 |
+| **persist total** | **386** | **796** |
+| ↳ **DB commit** | **227** | **522** |
+| cadence | 5.83 s | 5.98 s |
+
+Persist DB-commit was the biggest single cost and *doubled* under load at flat tx_count (~7800) — the
+signature of fsync/WAL-contention, pointing at SQLite `synchronous=FULL`.
+
+**H1 test — `synchronous=NORMAL` + `mmap_size` (REJECTED).** Mechanism confirmed: commit 227→160 ms,
+persist 386→254 ms. But controlled same-instance A/B: **FULL 1492 vs NORMAL+mmap 1481 — no gain**
+(marginally lower, within noise). Reverted. **Conclusion: persist OVERLAPS the inter-ledger 5 s wait
+and is NOT on the binding critical path** — cutting it doesn't move max TPS. This *refutes* the 2nd
+architect's central thesis (and confirms the original "apply/persist overlaps the wait" was right). The
+single-flight pipeline (apply+persist ≈ 0.5 s) has ~10× headroom against the 5 s cadence, so its speed
+doesn't bind. By the same logic the remaining persist/apply hypotheses (H2 overlap-persist, H3 XDR-off-txn,
+H4 bucket, H5 per-tx) are all **moot** for max TPS.
+
+**What actually binds:** the tx-set cap (`max_tx_set_size`=15000) is NOT binding either — fill peaks at
+~67% (max ~10098 txns/ledger, loaded median ~8000). The ceiling is the **sustained applied-txns-per-ledger
+vs offered load** (loadgen "not complete within 10 ledgers"): at ~1500 tx/s the offered backlog can't fully
+drain in the completion window. With apply/persist/cap all ruled out, the residual lever (if any) is in
+**tx dissemination / queue-fill / flooding throughput across the 23 nodes**, or load-stretched cadence —
+NOT the close pipeline. henyey on this (faster) instance = **1492** vs core ~1531 (~97.5%).
+
 ## Summary
 - Baseline → current: 462 → **1410 tx/s** (5 PRs: #3679, #3682, #3683, #3684, **#3691**). henyey is
   now ≈92% of core's ~1531 on the same rig (was 84%).
