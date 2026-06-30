@@ -123,6 +123,43 @@ where
     *slot = Some(tokio::task::spawn_blocking(work));
 }
 
+/// Offload one round of peer maintenance (phase=28) off the main `tokio::select!`
+/// event loop into a coalesced, fire-and-not-awaited background task.
+///
+/// The phase=28 arm previously did `self.maintain_peers().await` *inside* the
+/// `select!` body. A `select!` does not poll its other branches while the chosen
+/// arm's future is awaiting, so that await blocked the entire loop. `maintain_peers`
+/// first awaits `db_blocking("remove-failed-peers", …)`, whose pooled connection
+/// has `PRAGMA busy_timeout = 30000`; under SQLite write-lock contention the
+/// `DELETE FROM peers …` retries for up to 30 s — and the arm *also* awaits a 20 s
+/// bounded reconnect phase. Both stalled the loop, starving SCP → lost sync
+/// (#3689, recurrence of #3582 despite the #3598 fix being present).
+///
+/// This mirrors `dispatch_tx_set_gc` exactly: a loop-local in-flight `JoinHandle`
+/// guard keeps runs strictly serial (skip this tick if a prior round is still
+/// running — the timer's `MissedTickBehavior::Skip` only coalesces ticks, not
+/// in-flight tasks), otherwise `tokio::spawn` the maintenance future and store the
+/// handle. The future is `Send` (`maintain_peers` holds only `tokio::sync` async
+/// guards + `Arc<OverlayManager>` across awaits — no `Rc`/`RefCell`/std-sync guard).
+///
+/// `slot` is the loop-local in-flight handle. The handle is fire-and-not-awaited:
+/// peer maintenance is idempotent (`remove_peers_with_failures` is a single
+/// `DELETE FROM peers WHERE numfailures >= ?`) and periodic, so a skipped tick
+/// simply re-runs next interval, and on shutdown the loop `abort()`s any in-flight
+/// handle (harmless — the only side effects are the idempotent DELETE and
+/// best-effort reconnects). This bounds the loop's time in phase=28 to a
+/// `tokio::spawn` (sub-millisecond) regardless of DB-lock or reconnect contention.
+fn dispatch_peer_maintenance<F>(work: F, slot: &mut Option<tokio::task::JoinHandle<()>>)
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    // Serial cadence: skip if a prior maintenance round is still running.
+    if slot.as_ref().is_some_and(|h| !h.is_finished()) {
+        return;
+    }
+    *slot = Some(tokio::spawn(work));
+}
+
 /// Whether a transaction queue result requires removal of the FloodGate record,
 /// allowing re-delivery to be treated as new.
 ///
@@ -444,6 +481,14 @@ impl App {
         // keeps purges strictly serial (skip a tick if the prior purge is still
         // running) and is aborted on shutdown. See `dispatch_tx_set_gc`.
         let mut tx_set_gc_task: Option<tokio::task::JoinHandle<()>> = None;
+        // Loop-local in-flight handle for offloaded peer maintenance (phase=28,
+        // #3689). `maintain_peers` awaits `db_blocking("remove-failed-peers")`
+        // (busy_timeout up to 30s under write-lock contention) plus a 20s
+        // reconnect; running it inline inside the `select!` arm froze the loop and
+        // dropped the validator out of sync. It is offloaded via
+        // `dispatch_peer_maintenance`, which keeps rounds strictly serial (skip a
+        // tick if a prior round is still running) and is aborted on shutdown.
+        let mut peer_maintenance_task: Option<tokio::task::JoinHandle<()>> = None;
 
         // Get mutable access to SCP envelope receiver
         let mut scp_rx = self.scp_envelope_rx.lock().await;
@@ -1282,10 +1327,28 @@ impl App {
                     self.send_peer_pings().await;
                 }
 
-                // Peer maintenance - reconnect if peer count drops too low
+                // Peer maintenance - reconnect if peer count drops too low.
+                // Offloaded off the event loop (#3689): `maintain_peers` awaits
+                // `db_blocking("remove-failed-peers")` (busy_timeout up to 30s
+                // under SQLite write-lock contention) and a 20s reconnect, both
+                // of which previously froze the whole `select!` loop, starving
+                // SCP and dropping the validator out of sync (recurrence of
+                // #3582 despite the #3598 fix). `set_phase(28)` stays on the loop
+                // thread so the watchdog phase label is preserved; the work runs
+                // on a detached, coalesced task via `dispatch_peer_maintenance`.
                 _ = peer_maintenance_interval.tick() => {
                     self.set_phase(28); // 28 = peer_maintenance
-                    self.maintain_peers().await;
+                    // Upgrade the self Weak into an owned Arc for the detached
+                    // task (same mechanism as spawn_catchup/start_sync_recovery).
+                    // Skip this tick if upgrade fails (shutting down / test App
+                    // that never called set_self_arc).
+                    let app = self.self_arc.read().await.upgrade();
+                    if let Some(app) = app {
+                        dispatch_peer_maintenance(
+                            async move { app.maintain_peers().await },
+                            &mut peer_maintenance_task,
+                        );
+                    }
                 }
 
                 // Refresh known peers from config + SQLite cache
@@ -1332,6 +1395,13 @@ impl App {
                     // process is exiting; a skipped purge simply re-runs next
                     // interval on the next startup.
                     if let Some(h) = tx_set_gc_task.take() {
+                        h.abort();
+                    }
+                    // Abort any in-flight peer maintenance round (#3689). Its
+                    // only side effects are an idempotent `DELETE FROM peers …`
+                    // and best-effort reconnects, so an abort mid-flight is
+                    // harmless — a skipped round simply re-runs on next startup.
+                    if let Some(h) = peer_maintenance_task.take() {
                         h.abort();
                     }
                     break;
@@ -3989,7 +4059,7 @@ mod tx_set_gc_offload_tests {
     //! `spawn_blocking` behind a loop-local in-flight guard so the loop arm
     //! returns promptly and purges stay strictly serial (mirroring
     //! stellar-core's serial reschedule cadence).
-    use super::dispatch_tx_set_gc;
+    use super::{dispatch_peer_maintenance, dispatch_tx_set_gc};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Barrier};
     use std::thread::ThreadId;
@@ -4114,5 +4184,238 @@ mod tx_set_gc_offload_tests {
             1,
             "expected exactly one purge to run (second tick coalesced by guard)"
         );
+    }
+
+    // --- #3689: dispatch_peer_maintenance (phase=28 offload) ------------------
+    //
+    // Before #3689 the phase=28 arm did `self.maintain_peers().await` inline on
+    // the event-loop thread. Under SQLite write-lock contention the inner
+    // `db_blocking("remove-failed-peers")` retries up to busy_timeout=30s, and
+    // the arm also awaits a 20s reconnect — both froze the loop, starving SCP →
+    // lost sync. These tests cover the offload helper's public contract
+    // (prompt return, off-thread, serial-coalesce), mirroring the
+    // `dispatch_tx_set_gc` tests above.
+
+    /// The dispatch must return promptly (loop not blocked) and the maintenance
+    /// future must run on a DIFFERENT thread than the dispatcher (the event-loop
+    /// thread).
+    ///
+    /// Fails on `origin/main`: there is no dispatcher — the arm awaits
+    /// `maintain_peers()` inline, so the caller would block for the full barrier
+    /// and the work would run on the dispatcher thread.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_peer_maintenance_runs_off_event_loop_thread() {
+        let dispatcher_tid = std::thread::current().id();
+        let work_tid: Arc<std::sync::Mutex<Option<ThreadId>>> =
+            Arc::new(std::sync::Mutex::new(None));
+        // Barrier of 2: the maintenance future blocks until the test releases it,
+        // so it is guaranteed still-running while we assert prompt return.
+        let barrier = Arc::new(Barrier::new(2));
+
+        let mut slot: Option<JoinHandle<()>> = None;
+        let work_tid_c = Arc::clone(&work_tid);
+        let barrier_c = Arc::clone(&barrier);
+
+        let start = Instant::now();
+        dispatch_peer_maintenance(
+            async move {
+                *work_tid_c.lock().unwrap() = Some(std::thread::current().id());
+                // Block on a blocking barrier to simulate a slow contended
+                // maintenance round. If this ran inline on the dispatcher
+                // thread, the dispatch call below would not return.
+                barrier_c.wait();
+            },
+            &mut slot,
+        );
+        let dispatch_elapsed = start.elapsed();
+
+        // (1) Dispatch returned promptly — the event loop was not blocked.
+        assert!(
+            dispatch_elapsed < Duration::from_millis(100),
+            "dispatch_peer_maintenance blocked the caller for {:?} (expected <100ms); \
+             peer maintenance was not offloaded off the event-loop thread",
+            dispatch_elapsed
+        );
+
+        // Release the maintenance future and let the spawned task complete.
+        barrier.wait();
+        let handle = slot.take().expect("dispatch should have stored a handle");
+        handle
+            .await
+            .expect("spawned maintenance task should complete");
+
+        // (2) The work ran on a different thread than the dispatcher.
+        let observed = work_tid
+            .lock()
+            .unwrap()
+            .expect("work should have recorded a thread id");
+        assert_ne!(
+            observed, dispatcher_tid,
+            "maintenance ran on the dispatcher (event-loop) thread; expected a spawned task thread"
+        );
+    }
+
+    /// A second dispatch while the first maintenance round is still in-flight
+    /// must NOT spawn a second concurrent round (serial in-flight guard), so two
+    /// detached rounds never race the peer table / overlay connection pool.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_peer_maintenance_serial_no_overlap() {
+        let running = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let total = Arc::new(AtomicUsize::new(0));
+        // Barrier of 2: test + first round. The first round holds here so it is
+        // unambiguously still-running when the second dispatch is attempted.
+        let barrier = Arc::new(Barrier::new(2));
+
+        let mut slot: Option<JoinHandle<()>> = None;
+
+        let make_work = || {
+            let running = Arc::clone(&running);
+            let peak = Arc::clone(&peak);
+            let total = Arc::clone(&total);
+            let barrier = Arc::clone(&barrier);
+            async move {
+                total.fetch_add(1, Ordering::SeqCst);
+                let cur = running.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(cur, Ordering::SeqCst);
+                barrier.wait();
+                running.fetch_sub(1, Ordering::SeqCst);
+            }
+        };
+
+        // First dispatch: spawns and starts running (blocks on the barrier).
+        dispatch_peer_maintenance(make_work(), &mut slot);
+        // Wait until the first round is observably running before the 2nd tick.
+        let spin_start = Instant::now();
+        while running.load(Ordering::SeqCst) == 0 {
+            assert!(
+                spin_start.elapsed() < Duration::from_secs(5),
+                "first maintenance round never started"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        // Second dispatch while the first is still in-flight: must be skipped.
+        dispatch_peer_maintenance(make_work(), &mut slot);
+
+        // Give a skipped-or-spawned second task a moment to (not) start.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            peak.load(Ordering::SeqCst),
+            1,
+            "a second maintenance round ran concurrently with the first; in-flight guard failed"
+        );
+
+        // Release the first round and let it finish.
+        barrier.wait();
+        let handle = slot.take().expect("a handle should be stored");
+        handle
+            .await
+            .expect("first maintenance round should complete");
+
+        // Exactly one round ran in total — the second tick was coalesced.
+        assert_eq!(
+            total.load(Ordering::SeqCst),
+            1,
+            "expected exactly one maintenance round to run (second tick coalesced by guard)"
+        );
+    }
+
+    /// Regression for #3689: a contended SQLite write lock must NOT stall the
+    /// dispatch (and therefore the event loop). We hold a long-lived
+    /// `BEGIN IMMEDIATE` write transaction on the app's DB from a SECOND rusqlite
+    /// connection, then drive the REAL phase=28 path
+    /// (`dispatch_peer_maintenance(app.maintain_peers())`) and assert the
+    /// dispatch returns well under the 30s busy_timeout — inside a 2s watchdog so
+    /// a regressed inline-await build FAILS via timeout rather than hanging ~30s.
+    ///
+    /// Pre-#3689 the arm awaited `maintain_peers()` inline: `remove-failed-peers`
+    /// would contend with the held lock and retry up to busy_timeout=30s, so the
+    /// caller blocked ~30s and the 2s watchdog would trip → FAIL. After the
+    /// offload the dispatch returns immediately (the contention is absorbed by
+    /// the detached task) → PASS.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_contended_peer_maintenance_does_not_stall_loop() {
+        use crate::App;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("peer-maint-contention.db");
+        let mut config = crate::config::ConfigBuilder::new()
+            .database_path(&db_path)
+            .build();
+        // Hermetic: no overlay peers / no network so maintain_peers only touches
+        // the `peers` table DELETE then returns (peer_count below threshold path
+        // still only does brief overlay-lock work; no real connects in tests).
+        config.is_compat_config = true;
+        config.overlay.known_peers = vec![];
+        config.overlay.target_outbound_peers = 0;
+        config.overlay.max_outbound_peers = 0;
+        let app = Arc::new(App::new(config).await.expect("build App"));
+
+        // Resolve the actual on-disk DB file the app opened. App::new may append
+        // a fixed filename or normalize the path; glob the temp dir for the .db.
+        let app_db_file = {
+            let mut found = db_path.clone();
+            if !found.exists() {
+                for entry in std::fs::read_dir(dir.path()).expect("read temp dir") {
+                    let p = entry.expect("dir entry").path();
+                    if p.extension().map(|e| e == "db").unwrap_or(false) {
+                        found = p;
+                        break;
+                    }
+                }
+            }
+            found
+        };
+
+        // Second connection holds a write lock for the duration via BEGIN
+        // IMMEDIATE (acquires the RESERVED lock immediately). A short busy_timeout
+        // here just avoids the holder itself blocking on open.
+        let holder = rusqlite::Connection::open(&app_db_file).expect("open holder conn");
+        holder
+            .busy_timeout(Duration::from_millis(100))
+            .expect("set holder busy_timeout");
+        holder
+            .execute_batch(
+                "BEGIN IMMEDIATE; CREATE TABLE IF NOT EXISTS _lk(x); INSERT INTO _lk VALUES (1);",
+            )
+            .expect("acquire write lock via BEGIN IMMEDIATE");
+
+        // Drive the real phase=28 dispatch: spawn app.maintain_peers() via the
+        // offload helper and assert the DISPATCH returns promptly even though the
+        // write lock is held (the detached task absorbs the busy_timeout retry).
+        let mut slot: Option<JoinHandle<()>> = None;
+        let app_for_task = Arc::clone(&app);
+
+        let dispatch_fut = async {
+            let start = Instant::now();
+            dispatch_peer_maintenance(
+                async move { app_for_task.maintain_peers().await },
+                &mut slot,
+            );
+            start.elapsed()
+        };
+
+        let dispatch_elapsed = tokio::time::timeout(Duration::from_secs(2), dispatch_fut)
+            .await
+            .expect(
+                "dispatch_peer_maintenance did not return within the 2s watchdog — the \
+                 contended write lock stalled the caller (event loop); phase=28 was \
+                 not offloaded (regression of #3689)",
+            );
+
+        assert!(
+            dispatch_elapsed < Duration::from_millis(500),
+            "dispatch_peer_maintenance blocked the caller for {:?} (expected <500ms) while \
+             the DB write lock was contended; the busy_timeout retry was not offloaded",
+            dispatch_elapsed
+        );
+
+        // Release the lock so the detached maintenance task can complete, then
+        // reap the handle to avoid leaking the task into other tests.
+        drop(holder);
+        if let Some(h) = slot.take() {
+            let _ = tokio::time::timeout(Duration::from_secs(35), h).await;
+        }
     }
 }
