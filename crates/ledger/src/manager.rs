@@ -2389,7 +2389,7 @@ impl LedgerManager {
         // wrapper (which would take a SECOND, recursive `state.read()`). A
         // recursive read on the writer-fair non-reentrant `parking_lot::RwLock`
         // deadlocks if a `reset()` writer parks between the two reads (#3685).
-        let snapshot = self.create_snapshot()?;
+        let snapshot = self.create_snapshot_locked(&state)?;
 
         let mut upgrade_ctx = UpgradeContext::new(state.header.ledger_version);
         for upgrade in &close_data.upgrades {
