@@ -190,13 +190,44 @@ instrumentation immediately surfaced the real bug — NOT in the SCP path but in
   trigger; the 1 s maintenance tick backstops gated cases. Regression test
   `test_trigger_event_does_not_rearm_same_slot_spin` (fails pre-fix: 1 spurious self-perpetuating
   trigger).
-- **Measurement: 1305 → 1410 tx/s (+8.0%, short-probe).** Post-fix trigger-fire count = exactly
+- **Measurement: 1305 → 1410 tx/s (+8.0%, short-probe).** Verified with a controlled clean A/B (both
+  images from current `origin/main`, no instrumentation, same instance): clean-base 1350 → clean-fix
+  1437 = **+6.4%** (consistent; the 1305 baseline predated #3690 + carried diag logging). Post-fix
+  trigger-fire count = exactly
   1/ledger; trigger fires punctually (fire-lateness mean ~1.3 ms → **H2 ruled out**). Nomination
   convergence at sustainable rates dropped from bimodal 46/300–1000 ms to **~30–60 ms median**; the
   residual p75–p95 tail correlates 1:1 with the over-capacity probe steps (slots 14–22 = the failing
   1440 step), i.e. expected stall when binary-search pushes past capacity, not a steady-state defect.
 - **H3/H4/H5/H6 were alternative explanations for the same now-resolved symptom** → no longer needed.
   H7 time-series confirmed the slow window is a single contiguous over-rate probe, not oscillation.
+
+## Remaining architect hypotheses — evaluated post-fix (2026-06-30)
+
+With the spin fixed, convergence is ~30–60 ms median at sustainable rates. H3–H6 were all competing
+explanations for the slow convergence the spin actually caused, so they are now largely moot. Verdicts
+after code inspection + stellar-core parity check:
+
+- **H2 (late trigger): RULED OUT.** Post-fix `maxtps_trigger_fire` lateness mean ~1.3 ms — the timer
+  fires punctually; the trigger is not late.
+- **H3 (`reserve().await` parks the event loop): real pattern, latent only.** `pump_scp_intake` does
+  run inline in the main `select!` (lifecycle.rs:866), so a full verify-input queue *could* park the
+  loop — but the biased branch drains verified output meanwhile, and with the 250k sig-verify cache the
+  worker keeps up, so the queue does not fill in steady state. De-inlining the pump is a non-trivial,
+  parity-sensitive refactor (more complex, not a simplification) with no measured win → no PR.
+- **H4 (metric locks on the outbound broadcast path): minor, no win.** The `scp_envelope` arm takes two
+  async `RwLock` writes (`scp_latency`, `survey_state`, both metrics) before `overlay.broadcast()`.
+  Pure lock overhead is ~µs vs the 30–60 ms convergence; not a throttle now. Moving them off-path is a
+  refactor, not a clear simplification, and unmeasured → no PR.
+- **H5 (more wall-clock per adopt-revote round): moot.** Fast ~1-round-trip convergence (30–60 ms)
+  shows henyey is not doing excess nomination rounds; this was a symptom of the spin.
+- **H6 (`update_round_leaders` bumps `self.round` without timeout): PARITY-CORRECT.** stellar-core does
+  the same `mRoundNumber++` inside `updateRoundLeaders` (NominationProtocol.cpp:295), mirrored at
+  nomination.rs:1122. Not a bug → no change.
+- **H7 (time-series framing): used.** Confirmed the slow window is a single contiguous over-capacity
+  probe step, not a period-2 oscillation.
+
+Net: the trigger busy-loop (H1 family) was the single root cause; none of H3–H6 warrant a PR (ruled
+out / parity-correct / latent-only with no measured gain and no code simplification).
 
 ## Summary
 - Baseline → current: 462 → **1410 tx/s** (5 PRs: #3679, #3682, #3683, #3684, **#3691**). henyey is
