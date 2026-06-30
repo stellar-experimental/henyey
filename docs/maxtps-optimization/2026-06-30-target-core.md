@@ -100,13 +100,30 @@ network-wide — every node shows the same ~30% >300 ms). Decisively NARROWED by
   apply overlaps the wait.
 
 So: round-1 nomination takes 300–1000 ms to reach quorum on ~half the ledgers on a fast local
-cluster (--install-network-delay false), despite fast per-message processing — a subtle SCP
-convergence-dynamics question (likely multi-round re-voting as higher-priority leader values arrive,
-and/or close-time/ctValidityOffset acceptance gating). This is the well-scoped next step: trace the
-per-message nomination flow (leader emit → vote → accept-nominate quorum → confirm → ballot) on a
-slow slot to see where the 300–1000 ms is spent. Instrumentation added (throwaway branch): maxtps_
-nom_round (scp_driver.rs record_ballot_start), maxtps_nom_leaders (nomination.rs), maxtps_setup_decomp
-+ maxtps_build_decomp.
+cluster (--install-network-delay false), despite fast per-message processing.
+
+### Additional eliminations (2026-06-30, round 2)
+- **Tx-set validation cost**: measured `maxtps_txset_validate` = ~46 ms median / 69 ms for big sets
+  (>2000 tx), and only ~0.5–1 validations per node per ledger (906 total / 23 nodes / ~70 ledgers).
+  So validation contributes ~40–70 ms/ledger, NOT the 300–1000 ms. REFUTED as the dominant cost.
+- **Redundant signature re-verification**: REFUTED — henyey HAS a global ed25519 sig-verify cache
+  (`crates/crypto/src/signature.rs`, 250_000 entries, == core's `gVerifySigCache`), far larger than
+  the maxtps working set, so sig checks during nomination-validate are cache hits, not re-verifies.
+- **SCP queued behind tx-flood**: REFUTED — inbound SCP envelopes use a DEDICATED overlay channel;
+  the shared flood `message_rx` arm explicitly skips `ScpMessage` (lifecycle.rs:935–945).
+
+ALL measurable work-units are ruled out (build 30 ms, setup 11 ms, validation 69 ms×~1, sig cached;
+no thread >46%, recv ~0 ms). The 300–1000 ms slow round-1 convergence on ~half the ledgers is
+therefore genuine SCP nomination message round-trip / convergence dynamics (multi-round adopt-and-
+revote as higher-priority leader values propagate, and/or outbound emit latency through the
+one-per-iteration `scp_envelope` broadcast arm), not a single fixable work-unit. Both henyey and core
+do divergent-tx-set nomination; core converges faster for a still-unidentified reason.
+
+NEXT (deep, fresh-context): trace a single slow slot's nomination envelopes end-to-end with
+timestamps — self emit → broadcast (scp_envelope arm) → peer recv (dedicated SCP channel) → process →
+re-emit → accept-nominate quorum → confirm → ballot — to find where the 300–1000 ms accrues, and
+compare round-trip count + per-hop latency against stellar-core. Instrumentation on throwaway branch:
+maxtps_nom_round, maxtps_nom_leaders, maxtps_setup_decomp, maxtps_build_decomp, maxtps_txset_validate.
 
 ## Summary
 - Baseline → current: 462 → ~1300 tx/s (4 PRs accepted: #3679, #3682, #3683, #3684); measurement
