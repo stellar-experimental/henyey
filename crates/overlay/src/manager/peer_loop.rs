@@ -1652,32 +1652,30 @@ impl OverlayManager {
             });
         }
 
-        // Group sent messages by priority for process_sent_messages
+        // #3643 straggler parity: track the MAX `time_emplaced` over messages
+        // ACTUALLY written. maxtps (T2): the batch is now written as a SINGLE
+        // coalesced `send_batch` (one syscall/segment for the whole batch)
+        // instead of one write per message, so the send is all-or-nothing:
+        // either every message goes out (advance to the batch max) or none does
+        // (error → peer dropped by caller, stamp moot).
+        let messages: Vec<StellarMessage> = batch.iter().map(|q| q.message.clone()).collect();
+        let newest_emplaced: Option<Instant> = batch
+            .iter()
+            .fold(None, |acc, q| fold_newest_emplaced(acc, q.time_emplaced));
+
+        if let Err(e) = peer.send_batch(&messages).await {
+            // Nothing was sent (single write_all); drop with no partial stamp.
+            metrics.errors_write.inc();
+            return Err(e);
+        }
+
+        // Group the sent messages by priority for process_sent_messages.
         let mut sent_by_priority: Vec<Vec<StellarMessage>> =
             vec![Vec::new(); MessagePriority::COUNT];
-
-        // #3643 straggler parity: track the MAX `time_emplaced` over messages
-        // ACTUALLY written (advance only on successful send, per message — like
-        // core's `messageSender` loop reassigning `mEnqueueTimeOfLastWrite` for
-        // each message it writes). On a mid-batch send error we keep the max of
-        // what was already written, matching core's per-message advance.
-        let mut newest_emplaced: Option<Instant> = None;
-
-        for queued in batch {
-            let priority = MessagePriority::from_message(&queued.message);
-            let emplaced = queued.time_emplaced;
-            if let Err(e) = peer.send(queued.message.clone()).await {
-                // Send failed — process what we've sent so far, then propagate
-                // the error. A send failure drops the peer (the caller breaks
-                // the loop), so the straggler stamp is moot on this path.
-                flow_control.process_sent_messages(&sent_by_priority);
-                metrics.errors_write.inc();
-                return Err(e);
-            }
+        for msg in messages {
             metrics.messages_written.inc();
-            newest_emplaced = fold_newest_emplaced(newest_emplaced, emplaced);
-            if let Some(p) = priority {
-                sent_by_priority[p as usize].push(queued.message);
+            if let Some(p) = MessagePriority::from_message(&msg) {
+                sent_by_priority[p as usize].push(msg);
             }
         }
 

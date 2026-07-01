@@ -229,6 +229,44 @@ impl Connection {
         }
     }
 
+    /// maxtps (T2): write a pre-concatenated buffer of already length-prefixed,
+    /// encoded messages in a SINGLE `write_all`. This coalesces what the
+    /// per-message [`send`] path would otherwise issue as one syscall + (with
+    /// TCP_NODELAY) one TCP segment per message. The bytes on the wire are
+    /// byte-for-byte identical — each message is still `[len(4)|xdr_body]` in
+    /// order; TCP is a stream, so only the grouping into syscalls/segments
+    /// changes. Observable-surface-safe.
+    pub async fn send_encoded_batch(&mut self, buf: &[u8]) -> Result<()> {
+        if self.closed {
+            return Err(OverlayError::PeerDisconnected(
+                "connection closed".to_string(),
+            ));
+        }
+        if buf.is_empty() {
+            return Ok(());
+        }
+        const SEND_TIMEOUT_SECS: u64 = 10;
+        match timeout(
+            Duration::from_secs(SEND_TIMEOUT_SECS),
+            self.framed.get_mut().write_all(buf),
+        )
+        .await
+        {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => {
+                self.closed = true;
+                Err(OverlayError::Io(e))
+            }
+            Err(_) => {
+                self.closed = true;
+                Err(OverlayError::ConnectionTimeout(format!(
+                    "send timeout after {}s to {}",
+                    SEND_TIMEOUT_SECS, self.remote_addr
+                )))
+            }
+        }
+    }
+
     /// Receives the next message from the peer.
     ///
     /// Returns `Ok(None)` if the connection was closed cleanly by the peer.
