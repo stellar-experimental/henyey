@@ -383,6 +383,46 @@ advantage; at 5 s both implementations are wall-clock-bound and effectively tied
 - **T7 broadcast batch-drain**: amortizes event-loop wakeups on the flood-ingest path. Parity-safe, 0 gain.
 - Both are latency/efficiency hygiene, not maxtps levers; land only if desired on their own merits.
 
+## Probe-window dependence — the short probe OVER-REPORTS sustainable TPS (2026-07-01)
+
+Question raised: does the 5-min probe give the same max as the 1-min short probe? If a rate holds for
+1 min it "should" hold for 5 min. **It does not** — and the reason is a measurement-methodology effect,
+proven from code, not a henyey performance bug.
+
+**Measured (healthy instance, multiplier=300 ≈ 5-min offer window):** the long-probe binary search FAILED
+at 1360, 1280, and 1240 — with the 1280 and 1240 steps running **~3.7 min then failing** — vs the
+short-probe (multiplier=60 ≈ 1-min) max of ~1446–1510. So the 5-min sustainable max is **<1240, ≥17%
+below** the 1-min number. (Exact long-probe asymptote not pinned — search failed all the way down; only a
+lower bound established.)
+
+**Root cause (from code — definitive):** the max-TPS pass criterion is that AFTER the loadgen finishes
+submitting its offer window, **all** submitted txns must be applied within a **fixed 20-ledger budget**
+(`WAIT_TILL_COMPLETE_TIMEOUT_NUM_LEDGERS`, a stellar-core parity constant; `loadgen.rs:85,1995-2048`).
+The offer window length = `txrate × multiplier` ≈ `multiplier` seconds (`MaxTPSTest.fs:19-28`) — 60 s
+short vs 300 s long. At any offer rate R above the node's true steady-state drain rate D, backlog
+accumulates at (R−D) and reaches **(R−D) × window** by submission-end, then must clear within the fixed
+~20-ledger (~100 s) budget. Because the backlog grows with window length while the clearing budget is
+fixed, a longer window necessarily fails at a lower R. As window → ∞, the passing rate → **D** (the true
+sustainable drain). The observed "~3.7 min then fail" = submission finished + the 20-ledger wait-complete
+timeout tripped, exactly as the model predicts (not a mid-run collapse).
+
+**Implications:**
+- "Holding 1 min" is **burst absorption**, not steady state: a short burst's backlog clears within 20
+  ledgers; a 5× longer burst's does not. The honest *sustainable* throughput is the long-window asymptote
+  (≈ D, ≤1240 and falling with window), NOT the short-probe ~1490.
+- **Not a henyey bug and not fixable in henyey code** — it's inherent to the test definition (window ×
+  fixed budget) and identical in stellar-core (core's ~1531 was also short-probe). **Relative A/B results
+  in this doc remain valid** (same window both sides — e.g. the #3691 +6.4%); only the *absolute* numbers
+  are burst-inflated by ~20%.
+- **Measurement "fix" (not code):** to report true sustainable TPS, use a long window (multiplier ≥ 300)
+  or scale the completion budget with the window. The short probe stays useful as a fast relative metric
+  but overstates absolute sustainable throughput. (NOTE: contradicts the skill's "short-probe reproduces
+  the canonical ceiling within ~2%" claim — the real over-report is ≥17%.)
+- **Open nuance:** whether D itself is perfectly flat vs. slightly degrades over a sustained run (a small
+  fixable inefficiency) was not empirically closed (repeated cloud-infra failures). The code mechanism
+  fully explains the observation with a *flat* D, so the parsimonious conclusion is "measurement artifact,
+  no degradation bug"; a clean sustained drain-rate-vs-time series would confirm.
+
 ## Summary
 - Baseline → final: 462 → **~1446-1510 tx/s** (~95-98% of core's ~1531 on the same rig; was 84%).
   Landed fixes: **#3691** (trigger busy-loop, +6.4%, the sole real maxtps win) on top of the measurement
