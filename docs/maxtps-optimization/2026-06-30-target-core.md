@@ -306,6 +306,42 @@ hurt perf; test before landing. (Contrast #3679, the merged sibling on the herde
 The bottleneck hunt continues toward the dissemination/flooding path and ultimately RAW NETWORKING —
 we only stop when pod-to-pod bandwidth / TCP / kernel-network on the single 32-core host is proven the wall.
 
+## T5 dissemination-timing A/B — REFUTED (aggressive timing *hurts*) (2026-07-01)
+
+The SSC maxtps harness sets, in the *core* cfg (translated into henyey via compat_config), during the
+test: `FLOOD_DEMAND_PERIOD_MS=100`, `FLOOD_DEMAND_BACKOFF_DELAY_MS=1000` (advert period → henyey default
+100). The 1000 ms demand backoff looked like a latency source. Since raw net has ~100-1000× headroom
+(T8), henyey can afford to flood far more aggressively. Tested by editing only the SSC harness cfg
+(parity-irrelevant test tooling), same henyey image, controlled same-instance A/B:
+
+| dissemination timing | max tx/s |
+|---|--:|
+| default (advert 100, demand 100, backoff 1000) | **1493** |
+| aggressive (advert 50, demand 50, backoff 100) | **1438** |
+
+**Aggressive timing REGRESSED −3.7%.** So dissemination latency is NOT tuning-fixable — faster/more-frequent
+flooding gives no gain and slightly hurts. Reverted the SSC edit.
+
+**The regression is itself the clue → T7 (per-message wakeup/channel overhead).** More flood messages
+made it *worse* while raw bytes/segments stayed 100-1000× under the wall — the cost of a flood message is
+not on the wire, it's the **tokio task-wakeup + bounded-channel crossing + per-message `select!` iteration**
+on the ingest/egress path (peer task → route_to_subscribers mpsc → app handler, and back). That is the
+"fast work-units, idle CPU%, slow wall-clock" signature, and it is the last unrefuted application lever.
+
+## Bottleneck status after exhaustive elimination
+
+Every identified lever tested. FIXED: trigger busy-loop (#3691, the one real win, +6.4%). REFUTED with
+measurement: loadgen offer (T1), tx-set selection/surge (T6), advert-flood budget (T3), flow-control trim
+value (#3681, regresses), apply+persist close pipeline (SQLite A/B), tx-set cap, SCP convergence (post-fix
+~30-60 ms), per-message write coalescing (T2), dissemination timing (T5), and **raw networking (T8, the
+mandate's terminal condition — ~950× byte / ~150× pps headroom, definitively not the wall).**
+
+henyey ≈ **1493-1510** vs core ≈ **1531** on the same rig = **~97-98%**, now within the ~2-3% instance/run
+measurement noise. The remaining sub-noise gap has **no identified single cause**; the only unrefuted
+second-order signal is T7 (event-loop wakeup/channel overhead under high message volume, evidenced by
+aggressive flooding regressing). The fundamental cap is the shared 5 s cadence (a parity constraint) ×
+the txns/ledger the 23-node consensus can agree-and-apply — henyey sits at ~97-98% of core there.
+
 ## Summary
 - Baseline → current: 462 → **1410 tx/s** (5 PRs: #3679, #3682, #3683, #3684, **#3691**). henyey is
   now ≈92% of core's ~1531 on the same rig (was 84%).
