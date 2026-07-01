@@ -836,6 +836,53 @@ impl Peer {
         Ok(())
     }
 
+    /// maxtps (T2): send a batch of messages in a SINGLE coalesced write.
+    /// Wraps + encodes each message in order (preserving the auth sequence),
+    /// concatenates them, and issues one `Connection::send_encoded_batch` —
+    /// collapsing N syscalls/TCP-segments into one. Per-message metrics/stats
+    /// are applied after a successful write. On error nothing was sent (the
+    /// whole buffer is one `write_all`), and the peer is dropped by the caller.
+    pub async fn send_batch(&mut self, messages: &[StellarMessage]) -> Result<()> {
+        if self.state != PeerState::Authenticated {
+            return Err(OverlayError::PeerDisconnected(
+                "not authenticated".to_string(),
+            ));
+        }
+        if messages.is_empty() {
+            return Ok(());
+        }
+
+        let mut buf: Vec<u8> = Vec::new();
+        let mut kinds = Vec::with_capacity(messages.len());
+        let mut total_body_size = 0u64;
+        let mut total_wire_size = 0u64;
+        for message in messages {
+            let kind = OverlayMessageKind::from_stellar_message(message);
+            self.last_sent_msg_type = helpers::message_type_name(message);
+            total_body_size += msg_body_size(message);
+            let auth_msg = self.auth.wrap_message(message.clone())?;
+            let encoded = crate::codec::MessageCodec::encode_message(&auth_msg)?;
+            total_wire_size += (encoded.len() - 4) as u64;
+            buf.extend_from_slice(&encoded);
+            kinds.push(kind);
+        }
+
+        self.connection.send_encoded_batch(&buf).await?;
+
+        for kind in kinds {
+            self.metrics.record_send(kind);
+        }
+        self.metrics.bytes_written.add(total_wire_size);
+        self.metrics.async_write.inc();
+        self.stats
+            .messages_sent
+            .fetch_add(messages.len() as u64, Ordering::Relaxed);
+        self.stats
+            .bytes_sent
+            .fetch_add(total_body_size, Ordering::Relaxed);
+        Ok(())
+    }
+
     /// Receive a message from this peer.
     pub async fn recv(&mut self) -> Result<Option<StellarMessage>> {
         if self.state != PeerState::Authenticated {
