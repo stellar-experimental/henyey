@@ -52,6 +52,7 @@
 pub mod asset;
 pub mod checked_types;
 pub mod config;
+pub mod db_write_ctx;
 pub mod error;
 pub mod fs_utils;
 pub mod header_validation;
@@ -78,6 +79,7 @@ pub mod xdr_stream;
 // Re-export key types at crate root for convenience
 pub use asset::LIQUIDITY_POOL_FEE_V18;
 pub use config::{BucketListDbConfig, Config};
+pub use db_write_ctx::{WriteCtxGuard, LONG_WRITE_HOLD_WARN};
 pub use error::{Error, Result};
 pub use ledger_type_utils::*;
 pub use meta::*;

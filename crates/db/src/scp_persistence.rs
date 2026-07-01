@@ -118,6 +118,12 @@ impl SqliteScpPersistence {
         // entire read-then-delete sequence — blocks concurrent `save_tx_set`
         // / `save_scp_state` on other pool connections so we cannot delete a
         // tx-set that a writer is in the middle of registering. See #2770.
+        //
+        // Instrument the hold: this BEGIN IMMEDIATE spans full-table reads of
+        // `storestate`, so a long hold here is a prime `database is locked`
+        // suspect during near-tip back-fill (#3702). Instrumentation only —
+        // no change to the txn scope acquired above.
+        let _write_ctx = henyey_common::WriteCtxGuard::new("scp-persist-purge");
         self.db
             .transaction_immediate(|tx| tx.purge_unreferenced_tx_sets_atomic())
             .map_err(Self::map_error)

@@ -185,6 +185,14 @@ impl LedgerPersistInputs {
             .to_json()
             .map_err(|e| anyhow::anyhow!("Failed to serialize HAS: {}", e))?;
 
+        // Instrument the WAL write-lock hold for this close persist so a long
+        // hold is self-naming in the logs (#3702). Instrumentation only — the
+        // transaction scope below is unchanged.
+        let _write_ctx = henyey_common::WriteCtxGuard::new(format!(
+            "ledger-close-persist seq={}",
+            self.header.ledger_seq
+        ));
+
         db.transaction(|conn| {
             conn.store_ledger_header(&self.header, &header_xdr)?;
             conn.store_tx_history_entry(self.header.ledger_seq, &self.tx_history_entry)?;
