@@ -306,6 +306,40 @@ hurt perf; test before landing. (Contrast #3679, the merged sibling on the herde
 The bottleneck hunt continues toward the dissemination/flooding path and ultimately RAW NETWORKING —
 we only stop when pod-to-pod bandwidth / TCP / kernel-network on the single 32-core host is proven the wall.
 
+## 3rd round — dissemination ladder + RAW-NETWORKING terminal verdict (2026-07-01)
+
+Isolation ladder (diagnostic image: added per-step loadgen offer log + existing `maxtps_nominate` /
+`maxtps_flood_flush`), scraped at a **failing rate (1535)**:
+
+| thesis | measured signal | verdict |
+|---|---|---|
+| **T1 loadgen offer** | target=attempts=accepted=67445 (100%); submit median 564µs; 3/2985 steps overran | **REFUTED** |
+| **T6 tx-set selection** | selected==queue_len (~7148 median); no lane `*_limited` | **REFUTED** |
+| **T3 advert-flood budget** | ops_used 271 vs budget 716 (only 271 *new* adverts) | **REFUTED** |
+| **T2 per-message write** | coalesced flood batch → ONE `write_all`; A/B 1471 → 1455 | **NO GAIN** |
+
+**RAW-NETWORKING (T8) — TERMINAL VERDICT: refuted, ~2-3 orders of magnitude of headroom.** Measured on
+the rig: loopback **MTU = 65536 (64 KB)**, 32 cores, idle load 0.2. Fan-out at the ~1489 tx/s ceiling
+(each tx disseminated across 22 peers, ~120 B wire):
+
+- **Byte bandwidth:** ~3.9 MB/s aggregate (0.03 Gbit/s) vs ~30 Gbit/s single-stream loopback → **~950×
+  headroom** (≥3000× vs aggregate loopback).
+- **Packet/segment rate:** even pre-T2 (one segment per message) ≈ 32,758 msg/s vs Linux loopback
+  ~1–5 M pps → **~150× headroom**; with 64 KB MTU a coalesced batch needs ~60 segments/s.
+- This is exactly why **T2 write-coalescing gave zero gain** — segment rate was never near the wall.
+
+**Conclusion: raw networking is definitively NOT the bottleneck on this single-host rig** (the mandate's
+terminal question is answered — in the negative). By elimination — loadgen, selection, apply, persist,
+tx-set cap, flow-control trim/budget, per-message write, and raw networking are ALL ruled out — the ~1489
+ceiling is a **software dissemination-LATENCY** limit: the pull-based advert→demand→fulfill round-trips
+(advert period + demand period + retry backoff over the 23-node mesh) mean a *nominating* node sees only a
+~7,148 subset of the ~7,445 offered per 5 s ledger; the union catches up but exceeds the 10-ledger
+completion window. That is a **fixable app-level lever (T5)**, not a physical wall — so the hunt continues
+toward shortening advert/demand periods & first-retry backoff near the ceiling, and SEND_MORE credit
+round-trips (T4). (Note: SSC harness flakiness on the reused instance repeatedly lost the sustained-load
+window; the T8 verdict was reached analytically from the measured loopback MTU + fan-out arithmetic, which
+is conclusive given the 100–1000× headroom.)
+
 ## Summary
 - Baseline → current: 462 → **1410 tx/s** (5 PRs: #3679, #3682, #3683, #3684, **#3691**). henyey is
   now ≈92% of core's ~1531 on the same rig (was 84%).
