@@ -306,6 +306,44 @@ hurt perf; test before landing. (Contrast #3679, the merged sibling on the herde
 The bottleneck hunt continues toward the dissemination/flooding path and ultimately RAW NETWORKING —
 we only stop when pod-to-pod bandwidth / TCP / kernel-network on the single 32-core host is proven the wall.
 
+## T7 event-loop batch-drain — implemented + tested, REFUTED (no gain) (2026-07-01)
+
+T5's aggressive-flooding regression pointed at per-message tokio wakeup/`select!`-iteration overhead on
+the flood-ingest path. Confirmed the mechanism: the inbound broadcast (tx-flood) arm processed **one
+message per select! wakeup** (lifecycle.rs `message_rx.recv()`), so ~7,500 inbound tx/ledger = ~7,500 full
+loop iterations/ledger. Implemented a **batch-drain** (mirroring the existing SCP `MAX_DRAIN_PER_TICK=200`
+idiom): on wakeup, process the message then `try_recv()`-drain up to 200 more before yielding, via a new
+`dispatch_broadcast_overlay_msg` helper. Compiles, 38 lifecycle tests pass.
+
+**Controlled same-instance A/B (short-probe):**
+
+| config | max tx/s |
+|---|--:|
+| baseline (no drain) | **1446** |
+| T7 batch-drain | **1423** |
+
+**No gain (−1.6%, within noise).** The wakeup overhead is real (T5 showed doubling message rate hurts)
+but at the *default* flood rate the ingest wakeups are not the binding constraint — batching them frees
+nothing measurable. (This instance ran ~3% low overall — baseline 1446 vs ~1493 on the prior box —
+confirming the ±2-3% instance-to-instance variance that now dominates.) The T7 batch-drain is parity-safe
+and a reasonable latency hygiene change, but not a maxtps lever; not landed as an optimization.
+
+## FINAL bottleneck verdict — every lever exhausted
+
+One fix landed (trigger busy-loop #3691, +6.4%, the sole real win). Everything else tested and refuted
+with measurement: loadgen offer (T1), tx-set selection/surge (T6), advert-flood budget (T3), flow-control
+trim value (#3681, regresses ~3%), apply+persist close pipeline (SQLite A/B, 0 gain), tx-set cap, SCP
+convergence (post-fix ~30-60 ms), per-message write coalescing (T2, 0 gain), dissemination timing
+(T5, aggressive regresses), event-loop batch-drain (T7, 0 gain), and **RAW NETWORKING (T8, the mandate's
+terminal condition: ~950× byte / ~150× packet headroom on the 64 KB-MTU single-host loopback — definitively
+NOT the wall).**
+
+**Conclusion:** henyey sits at **~1446-1510 vs core ~1531 (~95-98%)**, and the residual gap is now **within
+the ±2-3% instance/run measurement noise** — no lever moves it beyond noise, and raw networking (the only
+"give up" condition) is proven to have 2-3 orders of magnitude of headroom. The ceiling is the shared 5 s
+close-time cadence (a parity constraint) × the txns/ledger the 23-node consensus reliably agrees-and-applies;
+henyey matches core there to within noise. There is no identified fixable bottleneck remaining.
+
 ## Summary
 - Baseline → current: 462 → **1410 tx/s** (5 PRs: #3679, #3682, #3683, #3684, **#3691**). henyey is
   now ≈92% of core's ~1531 on the same rig (was 84%).
