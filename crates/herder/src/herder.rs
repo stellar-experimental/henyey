@@ -3638,6 +3638,7 @@ impl Herder {
             // all observe the same ledger state. Consolidation eliminates the
             // race where a concurrent commit_close() could advance the ledger
             // between the old multi-snapshot reads.
+            let _ts_snap = std::time::Instant::now();
             let snap = match self.ledger_manager.create_snapshot() {
                 Ok(s) => s,
                 Err(e) => {
@@ -3652,6 +3653,8 @@ impl Herder {
                     return None;
                 }
             };
+            let snapshot_us = _ts_snap.elapsed().as_micros() as u64;
+            let _ts_frozen = std::time::Instant::now();
 
             let header = snap.header().clone();
             let lcl_ct = header.scp_value.close_time.0;
@@ -3681,8 +3684,13 @@ impl Herder {
                 }
             };
 
+            let frozen_us = _ts_frozen.elapsed().as_micros() as u64;
+            let _ts_seqmap = std::time::Instant::now();
+
             // Build seq map from the snapshot (borrows).
             let seq = self.build_starting_seq_map(&snap, ledger_seq);
+            let seqmap_us = _ts_seqmap.elapsed().as_micros() as u64;
+            let _ts_cfg = std::time::Instant::now();
 
             // Config upgrade context from the same snapshot (borrows).
             // ConfigUpgradeContext::from_snapshot clones the snapshot
@@ -3732,6 +3740,16 @@ impl Herder {
                         }
                     },
                 );
+
+            let cfgctx_us = _ts_cfg.elapsed().as_micros() as u64;
+            tracing::info!(
+                target: "maxtps_diag",
+                snapshot_us,
+                frozen_us,
+                seqmap_us,
+                cfgctx_us,
+                "maxtps_setup_decomp"
+            );
 
             // SnapshotProviders takes ownership of the snapshot.
             let sp = crate::tx_queue::SnapshotProviders::new(snap);

@@ -2542,6 +2542,7 @@ impl TransactionQueue {
 
         store.insert(queued, ledger_version);
         self.seen.write().insert(hash);
+        tracing::info!(target: "maxtps_txtrace", h = %hash.to_hex(), "add");
 
         TxQueueResult::Added
     }
@@ -2958,6 +2959,7 @@ impl TransactionQueue {
 
             // Ban the applied tx hash
             let applied_hash = Hash256::hash_xdr(envelope);
+            tracing::info!(target: "maxtps_txtrace", h = %applied_hash.to_hex(), "applied");
             if let Some(newest) = banned.back_mut() {
                 newest.insert(applied_hash);
             }
@@ -3051,6 +3053,7 @@ impl TransactionQueue {
                         newest.insert(queued_tx.hash);
                     }
                     // Remove from store and track for seen cleanup
+                    tracing::info!(target: "maxtps_txtrace", h = %queued_tx.hash.to_hex(), "ageout");
                     store.remove(&queued_tx.hash, ledger_version);
                     evicted_hashes.push(queued_tx.hash);
 

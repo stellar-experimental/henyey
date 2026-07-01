@@ -939,45 +939,31 @@ impl App {
                     self.set_phase(3); // 3 = broadcast
                     match msg {
                         Ok(overlay_msg) => {
-                            // Skip SCP messages from broadcast channel — they are already
-                            // handled via the dedicated SCP channel above.
-                            if matches!(overlay_msg.message, StellarMessage::ScpMessage(_)) {
-                                continue;
+                            self.dispatch_broadcast_overlay_msg(overlay_msg).await;
+                            // maxtps T7: batch-drain further queued flood messages
+                            // in this single wakeup, up to a budget, to amortize
+                            // the per-message task-wakeup + select! iteration cost
+                            // (the flood-ingest bottleneck is scheduling, not the
+                            // wire). Bounded so we don't starve the higher-priority
+                            // arms (SCP has its own dedicated channel + drain).
+                            let mut drained: usize = 0;
+                            loop {
+                                match message_rx.try_recv() {
+                                    Ok(m) => {
+                                        self.dispatch_broadcast_overlay_msg(m).await;
+                                        drained += 1;
+                                        if drained >= MAX_DRAIN_PER_TICK {
+                                            break;
+                                        }
+                                    }
+                                    Err(tokio::sync::broadcast::error::TryRecvError::Empty) => break,
+                                    Err(tokio::sync::broadcast::error::TryRecvError::Closed) => break,
+                                    Err(tokio::sync::broadcast::error::TryRecvError::Lagged(n)) => {
+                                        tracing::info!(target: "maxtps_diag", lagged_dropped = n, "maxtps_lagged");
+                                        // keep draining after a lag skip-ahead
+                                    }
+                                }
                             }
-                            // Skip fetch response and request messages from broadcast channel —
-                            // they are handled via the dedicated fetch channel above.
-                            if matches!(
-                                overlay_msg.message,
-                                StellarMessage::GeneralizedTxSet(_)
-                                    | StellarMessage::TxSet(_)
-                                    | StellarMessage::DontHave(_)
-                                    | StellarMessage::ScpQuorumset(_)
-                                    | StellarMessage::GetScpState(_)
-                                    | StellarMessage::GetScpQuorumset(_)
-                                    | StellarMessage::GetTxSet(_)
-                            ) {
-                                continue;
-                            }
-                            let delivery_latency = overlay_msg.received_at.elapsed();
-                            let msg_type = match &overlay_msg.message {
-                                StellarMessage::ScpMessage(_) => "SCP",
-                                StellarMessage::Transaction(_) => "TX",
-                                StellarMessage::TxSet(_) => "TxSet",
-                                StellarMessage::GeneralizedTxSet(_) => {
-                                    tracing::debug!(latency_ms = delivery_latency.as_millis(), "Overlay delivery latency for GeneralizedTxSet");
-                                    "GeneralizedTxSet"
-                                },
-                                StellarMessage::ScpQuorumset(_) => {
-                                    tracing::debug!(latency_ms = delivery_latency.as_millis(), "Overlay delivery latency for ScpQuorumset");
-                                    "ScpQuorumset"
-                                },
-                                StellarMessage::GetTxSet(_) => "GetTxSet",
-                                StellarMessage::Hello(_) => "Hello",
-                                StellarMessage::Peers(_) => "Peers",
-                                _ => "Other",
-                            };
-                            tracing::debug!(msg_type, latency_ms = delivery_latency.as_millis(), "Received overlay message");
-                            self.handle_overlay_message(overlay_msg).await;
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                             // Only non-critical messages (TX floods) flow through the
@@ -1721,6 +1707,32 @@ impl App {
     /// Must be called after wrapping App in Arc.
     pub async fn set_self_arc(self: &Arc<Self>) {
         *self.self_arc.write().await = Arc::downgrade(self);
+    }
+
+    /// Dispatch one broadcast-channel overlay message (maxtps T7).
+    ///
+    /// Skips messages that have dedicated channels (SCP + fetch request/response
+    /// are handled via `scp_message_rx` / `fetch_response_rx`); everything else
+    /// goes to [`handle_overlay_message`]. Factored out of the broadcast
+    /// `select!` arm so it can batch-drain many flood messages per wakeup —
+    /// amortizing the per-message task-wakeup + `select!` iteration cost that
+    /// dominates the flood-ingest path at high tx rates (raw bytes/segments are
+    /// ~100-1000x under the wall; the cost is scheduling, not the wire).
+    async fn dispatch_broadcast_overlay_msg(&self, overlay_msg: OverlayMessage) {
+        if matches!(
+            overlay_msg.message,
+            StellarMessage::ScpMessage(_)
+                | StellarMessage::GeneralizedTxSet(_)
+                | StellarMessage::TxSet(_)
+                | StellarMessage::DontHave(_)
+                | StellarMessage::ScpQuorumset(_)
+                | StellarMessage::GetScpState(_)
+                | StellarMessage::GetScpQuorumset(_)
+                | StellarMessage::GetTxSet(_)
+        ) {
+            return;
+        }
+        self.handle_overlay_message(overlay_msg).await;
     }
 
     /// Handle a message from the overlay network.

@@ -173,12 +173,15 @@ impl TransactionQueue {
             }
         };
 
+        let _bt_select = std::time::Instant::now();
         let SelectedTxs {
             transactions,
             soroban_limited,
             dex_limited,
             classic_limited,
         } = self.select_transactions_with_starting_seq(max_ops, starting_seq, protocol_version);
+        let select_us = _bt_select.elapsed().as_micros() as u64;
+        let _bt_rest = std::time::Instant::now();
 
         // maxtps diagnostic: tx-set fill decomposition (parity-irrelevant logging).
         // selected vs queue_len vs max_ops + *_limited flags localizes whether the
@@ -240,6 +243,7 @@ impl TransactionQueue {
         let account_ref: Option<&dyn AccountProvider> =
             override_account_provider.or(queue_account.as_deref());
 
+        let _bt_trim = std::time::Instant::now();
         let (classic_txs, mut soroban_txs) = if fee_ref.is_some() || account_ref.is_some() {
             let ctx = trim_ctx.expect("trim_ctx always Some");
             let close_time_bounds = crate::tx_set_utils::CloseTimeBounds::with_offsets(
@@ -257,6 +261,8 @@ impl TransactionQueue {
         } else {
             (classic_txs, soroban_txs)
         };
+        let trim_us = _bt_trim.elapsed().as_micros() as u64;
+        let _bt_build = std::time::Instant::now();
 
         sort_hashed_txs(&mut soroban_txs);
 
@@ -282,7 +288,18 @@ impl TransactionQueue {
                 .unwrap_or_default(),
         });
 
-        TransactionSet::new_generalized(gen_tx_set)
+        let ts = TransactionSet::new_generalized(gen_tx_set);
+        let build_hash_us = _bt_build.elapsed().as_micros() as u64;
+        let rest_us = _bt_rest.elapsed().as_micros() as u64;
+        tracing::info!(
+            target: "maxtps_diag",
+            select_us,
+            trim_us,
+            build_hash_us,
+            rest_us,
+            "maxtps_build_decomp"
+        );
+        ts
     }
 
     #[cfg(test)]

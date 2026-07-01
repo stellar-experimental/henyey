@@ -171,11 +171,108 @@ SIGNATURE of scheduling/cross-task-round-trip latency, not of genuine SCP messag
 Recommended cheap iteration order: H2/H7 absolute-clock time-series FIRST (decides direction) →
 H1 `biased;` A/B (one-line, parity-safe) → H3 free metric correlation → H4 → H5.
 
+## RESOLVED (2026-06-30): the trigger busy-loop — root cause of slow convergence (PR #3691)
+
+Ran the H2/H7 disambiguator first (per-slot wall-clocks: timer-armed/fired/first-emit/ballot). The
+instrumentation immediately surfaced the real bug — NOT in the SCP path but in the **trigger timer**:
+
+- **`maxtps_trigger_fire` fired ~25,000×/ledger/node** on slots being nominated (all `late_us≈0`).
+- Mechanism: `handle_scp_timer_event` (consensus.rs ~1531) re-armed the `TriggerNextLedger` timer
+  **unconditionally after every fire**. While a slot is still nominating, LCL hasn't advanced, so
+  `next_slot` is unchanged and `prepare_start(last)+expectedClose` is already in the past → re-arm
+  computes `delay==0` → fires immediately → re-arms → **busy-loop at ~hundreds of Hz for the entire
+  nomination→externalize window of every ledger**. Each spin = a bridge-channel event + main-loop
+  `select!` wakeup + a `spawn_blocking(trigger_next_ledger)` taking herder locks. This starved the
+  single event loop servicing inbound SCP envelopes — exactly the H1 "scheduling/queuing latency"
+  mechanism, just sourced from a self-inflicted timer spin rather than the flood arm.
+- **Fix: single-shot trigger per ledger** (parity: stellar-core arms `mTriggerTimer` only from
+  `lastClosedLedgerIncreased`). Removed the unconditional re-arm; the post-close path arms the next
+  trigger; the 1 s maintenance tick backstops gated cases. Regression test
+  `test_trigger_event_does_not_rearm_same_slot_spin` (fails pre-fix: 1 spurious self-perpetuating
+  trigger).
+- **Measurement: 1305 → 1410 tx/s (+8.0%, short-probe).** Verified with a controlled clean A/B (both
+  images from current `origin/main`, no instrumentation, same instance): clean-base 1350 → clean-fix
+  1437 = **+6.4%** (consistent; the 1305 baseline predated #3690 + carried diag logging). Post-fix
+  trigger-fire count = exactly
+  1/ledger; trigger fires punctually (fire-lateness mean ~1.3 ms → **H2 ruled out**). Nomination
+  convergence at sustainable rates dropped from bimodal 46/300–1000 ms to **~30–60 ms median**; the
+  residual p75–p95 tail correlates 1:1 with the over-capacity probe steps (slots 14–22 = the failing
+  1440 step), i.e. expected stall when binary-search pushes past capacity, not a steady-state defect.
+- **H3/H4/H5/H6 were alternative explanations for the same now-resolved symptom** → no longer needed.
+  H7 time-series confirmed the slow window is a single contiguous over-rate probe, not oscillation.
+
+## Remaining architect hypotheses — evaluated post-fix (2026-06-30)
+
+With the spin fixed, convergence is ~30–60 ms median at sustainable rates. H3–H6 were all competing
+explanations for the slow convergence the spin actually caused, so they are now largely moot. Verdicts
+after code inspection + stellar-core parity check:
+
+- **H2 (late trigger): RULED OUT.** Post-fix `maxtps_trigger_fire` lateness mean ~1.3 ms — the timer
+  fires punctually; the trigger is not late.
+- **H3 (`reserve().await` parks the event loop): real pattern, latent only.** `pump_scp_intake` does
+  run inline in the main `select!` (lifecycle.rs:866), so a full verify-input queue *could* park the
+  loop — but the biased branch drains verified output meanwhile, and with the 250k sig-verify cache the
+  worker keeps up, so the queue does not fill in steady state. De-inlining the pump is a non-trivial,
+  parity-sensitive refactor (more complex, not a simplification) with no measured win → no PR.
+- **H4 (metric locks on the outbound broadcast path): minor, no win.** The `scp_envelope` arm takes two
+  async `RwLock` writes (`scp_latency`, `survey_state`, both metrics) before `overlay.broadcast()`.
+  Pure lock overhead is ~µs vs the 30–60 ms convergence; not a throttle now. Moving them off-path is a
+  refactor, not a clear simplification, and unmeasured → no PR.
+- **H5 (more wall-clock per adopt-revote round): moot.** Fast ~1-round-trip convergence (30–60 ms)
+  shows henyey is not doing excess nomination rounds; this was a symptom of the spin.
+- **H6 (`update_round_leaders` bumps `self.round` without timeout): PARITY-CORRECT.** stellar-core does
+  the same `mRoundNumber++` inside `updateRoundLeaders` (NominationProtocol.cpp:295), mirrored at
+  nomination.rs:1122. Not a bug → no change.
+- **H7 (time-series framing): used.** Confirmed the slow window is a single contiguous over-capacity
+  probe step, not a period-2 oscillation.
+
+Net: the trigger busy-loop (H1 family) was the single root cause; none of H3–H6 warrant a PR (ruled
+out / parity-correct / latent-only with no measured gain and no code simplification).
+
+## 2nd adversarial round + H7 ceiling decomposition + persist A/B (2026-06-30, instance j02eh72amr380)
+
+A second adversarial architect attacked the "no resource exhausted / apply overlaps the wait" framing
+and (correctly) noted the close pipeline is **single-flight** (`close_pipeline.rs`: a new close can't
+start until the prior persist completes) and classic apply is a **single serial loop** (tx_set.rs:171)
+— so <46% aggregate CPU is one saturated critical thread, not spare capacity. It predicted the floor
+is `convergence + apply + persist` (load-dependent) and ranked SQLite-persist hypotheses first.
+
+**H7 ceiling decomposition** (existing `maxtps_close`/`maxtps_persist` logs, passing 1430 vs failing 1455):
+
+| phase (ms, median) | 1430 PASS | 1455 FAIL |
+|---|--:|--:|
+| apply (tx_exec) | 178 | 174 |
+| bucket add_batch | 9.5 | 10.3 |
+| close-side commit/meta/header | ~0 | ~0 |
+| **persist total** | **386** | **796** |
+| ↳ **DB commit** | **227** | **522** |
+| cadence | 5.83 s | 5.98 s |
+
+Persist DB-commit was the biggest single cost and *doubled* under load at flat tx_count (~7800) — the
+signature of fsync/WAL-contention, pointing at SQLite `synchronous=FULL`.
+
+**H1 test — `synchronous=NORMAL` + `mmap_size` (REJECTED).** Mechanism confirmed: commit 227→160 ms,
+persist 386→254 ms. But controlled same-instance A/B: **FULL 1492 vs NORMAL+mmap 1481 — no gain**
+(marginally lower, within noise). Reverted. **Conclusion: persist OVERLAPS the inter-ledger 5 s wait
+and is NOT on the binding critical path** — cutting it doesn't move max TPS. This *refutes* the 2nd
+architect's central thesis (and confirms the original "apply/persist overlaps the wait" was right). The
+single-flight pipeline (apply+persist ≈ 0.5 s) has ~10× headroom against the 5 s cadence, so its speed
+doesn't bind. By the same logic the remaining persist/apply hypotheses (H2 overlap-persist, H3 XDR-off-txn,
+H4 bucket, H5 per-tx) are all **moot** for max TPS.
+
+**What actually binds:** the tx-set cap (`max_tx_set_size`=15000) is NOT binding either — fill peaks at
+~67% (max ~10098 txns/ledger, loaded median ~8000). The ceiling is the **sustained applied-txns-per-ledger
+vs offered load** (loadgen "not complete within 10 ledgers"): at ~1500 tx/s the offered backlog can't fully
+drain in the completion window. With apply/persist/cap all ruled out, the residual lever (if any) is in
+**tx dissemination / queue-fill / flooding throughput across the 23 nodes**, or load-stretched cadence —
+NOT the close pipeline. henyey on this (faster) instance = **1492** vs core ~1531 (~97.5%).
+
 ## Summary
-- Baseline → current: 462 → ~1300 tx/s (4 PRs accepted: #3679, #3682, #3683, #3684); measurement
-  is now trustworthy (the artifacts were the big wins).
-- Bottleneck fully localized: cadence-bound (5.5 s/ledger vs 5 s target, ~95% idle); the controllable
-  ~0.5 s overhead is slow SCP round-1 nomination convergence on ~half the ledgers (300–1000 ms vs
-  46 ms). Not resource-bound, not loss, not apply, not loadgen, not seed-divergence, not timeout.
-- Next (well-scoped): trace per-message nomination convergence on a slow slot to find why round-1
-  takes 300–1000 ms; eliminating it ≈ +8% (→ ~1400), still gated by the 5 s close-time target.
+- Baseline → current: 462 → **1410 tx/s** (5 PRs: #3679, #3682, #3683, #3684, **#3691**). henyey is
+  now ≈92% of core's ~1531 on the same rig (was 84%).
+- The slow/bimodal SCP nomination convergence — the entire residual "controllable ~0.5 s overhead" —
+  was the trigger busy-loop, now fixed. At sustainable rates convergence is ~30–60 ms.
+- Remaining gap to core (~1410 vs ~1531) is the txns/ledger ceiling under the shared 5 s close-time
+  target (~95% idle CPU); no identified single-bug cause, not a saturated resource. henyey's
+  tokio-concurrency advantage stays masked by the 5 s cadence and would surface only at shorter close
+  times where per-ledger processing speed dominates over wall-clock waiting.

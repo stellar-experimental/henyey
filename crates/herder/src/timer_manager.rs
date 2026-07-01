@@ -559,14 +559,28 @@ impl<C: TimerCallback> TimerManager<C> {
             .timers
             .iter()
             .filter(|(_, t)| t.expires_at <= now)
-            .map(|(k, t)| (*k, t.timer_type, t.slot, t.epoch))
+            .map(|(k, t)| (*k, t.timer_type, t.slot, t.epoch, t.expires_at))
             .collect();
 
         // Remove and fire
-        for (key, timer_type, slot, epoch) in expired {
+        for (key, timer_type, slot, epoch, expires_at) in expired {
             self.timers.remove(&key);
 
             trace!(slot, timer_type = ?timer_type, epoch, "Firing timer");
+
+            // maxtps H2: timer-fire lateness = how late the tokio event loop
+            // dispatched this callback vs its scheduled deadline. Large values
+            // on the trigger timer indicate a late-trigger (event-loop starved)
+            // rather than slow nomination convergence.
+            if matches!(timer_type, TimerType::TriggerNextLedger) {
+                let late_us = now.saturating_duration_since(expires_at).as_micros();
+                let wall_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis())
+                    .unwrap_or(0);
+                tracing::info!(target: "maxtps_diag", slot, late_us, wall_ms,
+                    "maxtps_trigger_fire");
+            }
 
             match timer_type {
                 TimerType::Nomination => {

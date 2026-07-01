@@ -810,6 +810,13 @@ impl ScpDriver {
             return cached;
         }
 
+        // maxtps diagnostic: validating a peer/own nominated tx-set is a cache
+        // MISS — it runs full check_valid (XDR + sig + seq + fee for every tx).
+        // Time it + size it to see if cumulative per-slot validation explains the
+        // slow round-1 nomination tail. Parity-irrelevant logging.
+        let _bt_validate = std::time::Instant::now();
+        let _tx_set_len = tx_set.len();
+
         let network_id = NetworkId(self.network_id);
 
         // prepare_for_apply validates XDR structure, fees, sort order, dedup
@@ -879,6 +886,13 @@ impl ScpDriver {
         };
 
         self.tx_tracker.store_valid(cache_key, result);
+        tracing::info!(
+            target: "maxtps_diag",
+            validate_us = _bt_validate.elapsed().as_micros() as u64,
+            tx_set_len = _tx_set_len,
+            valid = result,
+            "maxtps_txset_validate"
+        );
         result
     }
 
@@ -1169,9 +1183,27 @@ impl ScpDriver {
     pub fn record_ballot_start(&self, slot: SlotIndex) {
         let mut map = self.slot_timing.write();
         let state = map.entry(slot).or_default();
-        state
-            .ballot_start
-            .get_or_insert_with(std::time::Instant::now);
+        let was_unset = state.ballot_start.is_none();
+        let bs = *state.ballot_start.get_or_insert_with(std::time::Instant::now);
+        // maxtps diagnostic: nomination-round duration (trigger/first-seen → ballot
+        // start). This is the SCP nomination convergence time, the dominant
+        // controllable component of the inter-ledger cadence beyond the close-time
+        // target. Logged once per slot. Parity-irrelevant.
+        if was_unset {
+            if let Some(fs) = state.first_seen {
+                let wall_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis())
+                    .unwrap_or(0);
+                tracing::info!(
+                    target: "maxtps_diag",
+                    slot,
+                    nom_round_us = bs.saturating_duration_since(fs).as_micros() as u64,
+                    wall_ms,
+                    "maxtps_nom_round"
+                );
+            }
+        }
     }
 
     /// Get the ballot start instant for a slot.

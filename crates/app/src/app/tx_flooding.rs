@@ -1396,6 +1396,7 @@ fn collect_adverts_for_peers(
             }
         }
         if new_to_any_peer {
+            tracing::info!(target: "maxtps_txtrace", h = %candidate.hash.to_hex(), "advert");
             BroadcastVisitResult::Processed
         } else {
             BroadcastVisitResult::Skipped

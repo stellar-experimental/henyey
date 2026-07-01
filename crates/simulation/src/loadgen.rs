@@ -1867,6 +1867,8 @@ impl LoadGenerator {
             // instead of bursting. `config.n_txs` (work remaining) still
             // decrements only on accept (core's `--cfg.nTxs`, line 874).
             let mut attempts_this_step = 0i64;
+            let mut accepted_this_step = 0i64;
+            let step_submit_start = std::time::Instant::now();
             for _ in 0..txs_this_step {
                 if config.n_txs == 0 {
                     break;
@@ -1899,6 +1901,7 @@ impl LoadGenerator {
                 }
                 if outcome.is_accepted() {
                     config.n_txs = config.n_txs.saturating_sub(1);
+                    accepted_this_step += 1;
                 } else if self.failed {
                     // Fold this attempt into the pacing counter before bailing
                     // so the accounting stays consistent on the failure path.
@@ -1908,6 +1911,21 @@ impl LoadGenerator {
                 }
             }
             self.total_submitted = step_pacing_update(self.total_submitted, attempts_this_step);
+
+            // maxtps T1: per-step offer-rate diagnostic. If submit_us >= STEP_MSECS
+            // the serial submit loop overran its budget → the loadgen cannot offer
+            // at the target rate (offer-side supply cap). deficit = how far behind
+            // the cumulative target we are. accepted < attempts ⇒ queue rejecting.
+            let submit_us = step_submit_start.elapsed().as_micros() as u64;
+            tracing::info!(
+                target: "maxtps_diag",
+                target_this_step = txs_this_step,
+                attempts = attempts_this_step,
+                accepted = accepted_this_step,
+                submit_us,
+                total_submitted = self.total_submitted,
+                "maxtps_offer"
+            );
 
             tokio::time::sleep(step_duration).await;
         }

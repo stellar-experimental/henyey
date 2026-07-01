@@ -438,6 +438,19 @@ impl NominationProtocol {
         // Update round leaders
         self.update_round_leaders(ctx, prev_value);
 
+        // maxtps diagnostic: per-node leadership for this nomination round, so the
+        // slow-nomination tail can be correlated with whether the round leader is a
+        // loadgen node (which may nominate late, stalling network-wide round-1
+        // convergence). Parity-irrelevant logging.
+        tracing::info!(
+            target: "maxtps_diag",
+            slot = ctx.slot_index,
+            round = self.round,
+            is_local_leader = self.round_leaders.contains(ctx.local_node_id),
+            num_leaders = self.round_leaders.len(),
+            "maxtps_nom_leaders"
+        );
+
         let mut updated = self.adopt_leader_values(ctx);
         let voted = self.vote_as_leader(ctx, &value);
         updated = voted || updated;
@@ -820,6 +833,17 @@ impl NominationProtocol {
         if is_newer {
             self.last_envelope = Some(envelope.clone());
             if self.fully_validated && self.last_envelope_emit.as_ref() != Some(&envelope) {
+                // maxtps H1/H4: wall-clock of this node's FIRST nomination emit
+                // for the slot. Splits convergence into (trigger->emit = build)
+                // vs (emit->ballot = network round-trip + scheduling). Once/slot.
+                if self.last_envelope_emit.is_none() {
+                    let wall_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis())
+                        .unwrap_or(0);
+                    tracing::info!(target: "maxtps_diag",
+                        slot = ctx.slot_index, wall_ms, "maxtps_first_emit");
+                }
                 self.last_envelope_emit = Some(envelope.clone());
                 ctx.driver.emit_envelope(&envelope);
             }
