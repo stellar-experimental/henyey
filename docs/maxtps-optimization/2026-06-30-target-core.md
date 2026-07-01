@@ -306,6 +306,35 @@ hurt perf; test before landing. (Contrast #3679, the merged sibling on the herde
 The bottleneck hunt continues toward the dissemination/flooding path and ultimately RAW NETWORKING —
 we only stop when pod-to-pod bandwidth / TCP / kernel-network on the single 32-core host is proven the wall.
 
+## 3rd adversarial round — the dissemination isolation ladder (2026-07-01)
+
+Standing mandate: only conclude "done" when RAW NETWORKING is positively the wall. A 3rd architect produced
+an isolation ladder from "is it the loadgen?" down to raw networking; key insight: **byte bandwidth is a red
+herring** (~8 MB/s tx bodies vs GB/s single-host loopback); the only plausible raw-net wall is
+packets/segments-per-second + softirq, and **T2 (one syscall+segment per flood message) must be eliminated
+before a raw-net verdict**. Executed with a diagnostic image (per-step loadgen offer log added +
+existing `maxtps_nominate`/`maxtps_flood_flush`), scraped at a **failing rate (1535)**:
+
+| thesis | measured signal | verdict |
+|---|---|---|
+| **T1 loadgen offer** | target=attempts=accepted=67445 (100%), submit median 564µs, 3/2985 steps overran 100ms | **REFUTED** — loadgen offers the full rate |
+| **T6 tx-set selection** | selected==queue_len (~7148 median), no lane `*_limited` | **REFUTED** — includes the whole queue |
+| **T3 advert-flood budget** | ops_used 271 vs budget 716 (only 271 *new* adverts) | **REFUTED** — not budget-bound |
+| **T2 per-message write** | coalesced flood batch into ONE `write_all` (Peer::send_batch / Connection::send_encoded_batch); A/B 1471 → 1455 | **NO GAIN** — segment/syscall rate is NOT the wall |
+
+**Localization:** the bottleneck is **dissemination COMPLETENESS**, not any single resource. At the ceiling each
+node offers/accepts the full ~7,445 tx/ledger locally, but a *nominating* node's queue holds only ~7,148 (a
+*subset*) — the flood backlog reaches 13,017 — so not all offered txns reach the nominator within one 5 s
+ledger; the union catches up across ledgers but exceeds the 10-ledger completion window → "not complete in 10
+ledgers." This is a pull-based **advert→demand→fulfill round-trip LATENCY** characteristic (T5), NOT bandwidth,
+NOT segment-rate (T2 refuted), NOT selection/budget/apply/persist/cap.
+
+**Implication for the mandate:** T2 giving zero gain is strong evidence raw-network segment-rate is *not* the
+wall — but the terminal direct measurement (softirq/`ss -ti`/`nstat` vs loopback `iperf3` at the ceiling) is
+still owed to positively confirm/refute T8. (First T8 attempt lost its instance mid-run; re-running.)
+Remaining live theses: **T5 (pull-latency)**, **T4 (SEND_MORE credit round-trips)**, **T8 (raw net, terminal)**.
+The T2 write-coalescing (parity-safe, no gain here) is retained on branch `fix/3681`-adjacent WIP, unmerged.
+
 ## Summary
 - Baseline → current: 462 → **1410 tx/s** (5 PRs: #3679, #3682, #3683, #3684, **#3691**). henyey is
   now ≈92% of core's ~1531 on the same rig (was 84%).
