@@ -526,6 +526,11 @@ impl ScpPersistenceManager {
             state.add_quorum_set(quorum_set)?;
         }
 
+        // Instrument the WAL write-lock hold so a long persist is self-naming
+        // in the logs (#3702). Instrumentation only — no txn-scope change.
+        let _write_ctx =
+            henyey_common::WriteCtxGuard::new(format!("scp-persist-write slot={slot}"));
+
         // Save transaction sets
         for (hash, tx_set) in tx_sets {
             if !self.storage.has_tx_set(hash)? {

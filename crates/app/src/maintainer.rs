@@ -191,8 +191,7 @@ impl Maintainer {
             );
         }
 
-        let mut interval = tokio::time::interval(self.config.period);
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut interval = build_maintenance_interval(self.config.period);
 
         loop {
             tokio::select! {
@@ -293,6 +292,26 @@ impl Maintainer {
     }
 }
 
+/// Build the periodic maintenance interval.
+///
+/// Unlike `tokio::time::interval`, whose first `tick()` resolves
+/// **immediately** (firing a full 50k-row DELETE maintenance cycle at
+/// startup), this uses `interval_at(now + period, period)` so the first
+/// maintenance runs one full `period` in. This keeps the maintainer's write
+/// burst from coinciding with the startup near-tip back-fill on the
+/// restore-from-disk path, where per-slot `scp-persist-{slot}` purge txns +
+/// back-to-back per-ledger close persists already contend for SQLite's single
+/// WAL writer (see #3702).
+///
+/// This shifts only **when** periodic pruning first runs — the period value,
+/// missed-tick behavior, and all pruning semantics are unchanged. There is no
+/// consensus/hash/ledger effect (maintenance cadence only).
+fn build_maintenance_interval(period: Duration) -> tokio::time::Interval {
+    let mut interval = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    interval
+}
+
 /// Core maintenance logic shared between `App::perform_maintenance` and `Maintainer`.
 ///
 /// Deletes old data from the database to prevent unbounded growth.
@@ -318,6 +337,11 @@ pub fn run_maintenance(
     rpc_retention_window: Option<u32>,
     count: u32,
 ) {
+    // Instrument the WAL write-lock hold for the maintenance delete burst so a
+    // long hold is self-naming in the logs (#3702). Instrumentation only — the
+    // delete sequence and its transaction boundaries below are unchanged.
+    let _write_ctx = henyey_common::WriteCtxGuard::new("maintenance-delete");
+
     // Evict stale publish queue entries when publishing is enabled.
     // Fail closed: on any DB error, keep the original min_queued to avoid
     // over-pruning.
@@ -419,6 +443,69 @@ pub fn run_maintenance(
 mod tests {
     use super::*;
     use tokio::sync::watch;
+
+    /// Regression test for #3702: the maintainer's first maintenance cycle
+    /// must NOT fire immediately at startup.
+    ///
+    /// `tokio::time::interval(period)` resolves its first `tick()` immediately,
+    /// which would fire the 50k-row DELETE maintenance burst right as the node
+    /// enters the live loop — colliding with the startup near-tip back-fill on
+    /// the restore-from-disk path and pinning SQLite's single WAL writer.
+    ///
+    /// This asserts that the first `tick()` of the interval built by
+    /// `build_maintenance_interval` resolves only after ~`period` elapses.
+    /// Written against the factored helper so it is deterministic under
+    /// tokio's virtual clock. It FAILS on `tokio::time::interval` (immediate
+    /// first tick) and PASSES with the `interval_at(now + period, period)`
+    /// construction. The `assert_first_tick_immediate` sibling documents the
+    /// pre-fix behavior it guards against.
+    #[tokio::test(start_paused = true)]
+    async fn test_maintenance_first_tick_is_delayed() {
+        let period = Duration::from_secs(4 * 60 * 60);
+        let mut interval = build_maintenance_interval(period);
+
+        // The first tick must NOT be ready immediately. With virtual time
+        // paused, a `select!` biased to a zero-duration timer proves the
+        // interval's first tick is not already resolved at t=0.
+        tokio::select! {
+            biased;
+            _ = interval.tick() => {
+                panic!("maintenance first tick fired immediately at startup (#3702)");
+            }
+            _ = tokio::time::sleep(Duration::ZERO) => {}
+        }
+
+        // Advancing to just before `period` still must not fire.
+        tokio::time::advance(period - Duration::from_secs(1)).await;
+        tokio::select! {
+            biased;
+            _ = interval.tick() => {
+                panic!("maintenance first tick fired before one full period elapsed");
+            }
+            _ = tokio::time::sleep(Duration::ZERO) => {}
+        }
+
+        // After a full period has elapsed, the first tick fires.
+        tokio::time::advance(Duration::from_secs(1)).await;
+        interval.tick().await;
+    }
+
+    /// Sanity check documenting the pre-fix hazard: `tokio::time::interval`
+    /// (used on origin/main before #3702) fires its first tick immediately.
+    /// This is the exact behavior `build_maintenance_interval` avoids.
+    #[tokio::test(start_paused = true)]
+    async fn test_bare_interval_first_tick_is_immediate() {
+        let period = Duration::from_secs(4 * 60 * 60);
+        let mut interval = tokio::time::interval(period);
+        // First tick of a bare interval resolves immediately with no time advance.
+        tokio::select! {
+            biased;
+            _ = interval.tick() => {}
+            _ = tokio::time::sleep(Duration::ZERO) => {
+                panic!("expected bare interval first tick to be immediate");
+            }
+        }
+    }
 
     #[test]
     fn test_maintenance_config_default() {

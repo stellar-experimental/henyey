@@ -1720,7 +1720,17 @@ impl App {
         tokio::task::spawn_blocking(move || {
             while let Some(event) = peer_event_rx.blocking_recv() {
                 if let Err(err) = update_peer_record(&db, event) {
-                    tracing::warn!(?err, "Failed to update peer record");
+                    // This writer is the classic `database is locked` victim
+                    // when another connection pins SQLite's single WAL write
+                    // lock past the busy-timeout (#3702). Tag it with
+                    // `db_write_ctx` so it correlates in log aggregation with
+                    // the holder-side `WriteCtxGuard` events that name the
+                    // long-holding writer.
+                    tracing::warn!(
+                        db_write_ctx = "peer-record-update",
+                        ?err,
+                        "Failed to update peer record"
+                    );
                 }
             }
         });
