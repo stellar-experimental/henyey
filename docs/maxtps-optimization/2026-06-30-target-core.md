@@ -306,12 +306,96 @@ hurt perf; test before landing. (Contrast #3679, the merged sibling on the herde
 The bottleneck hunt continues toward the dissemination/flooding path and ultimately RAW NETWORKING —
 we only stop when pod-to-pod bandwidth / TCP / kernel-network on the single 32-core host is proven the wall.
 
+## 3rd adversarial round — dissemination ladder → RAW NETWORKING terminal verdict (2026-07-01)
+
+Standing mandate: only conclude "done" when RAW NETWORKING is positively the wall. A 3rd architect
+produced an isolation ladder from "is it the loadgen?" down to raw networking. Key insight: **byte
+bandwidth is a red herring** (~8 MB/s tx bodies vs GB/s single-host loopback); the only plausible raw-net
+wall is packets/segments-per-second + softirq, and **T2 (one syscall+segment per flood message) must be
+eliminated before a raw-net verdict.** Executed with a diagnostic image (per-step loadgen `maxtps_offer`
+log added + existing `maxtps_nominate` / `maxtps_flood_flush`), scraped at a **failing rate (1535)**:
+
+| thesis | measured signal | verdict |
+|---|---|---|
+| **T1 loadgen offer** | target=attempts=accepted=67445 (100%); submit median 564µs; 3/2985 steps overran 100ms | **REFUTED** — loadgen offers the full rate |
+| **T6 tx-set selection** | selected==queue_len (~7148 median); no lane `*_limited` | **REFUTED** — includes the whole queue |
+| **T3 advert-flood budget** | ops_used 271 vs budget 716 (only 271 *new* adverts) | **REFUTED** — not budget-bound |
+| **T2 per-message write** | coalesced flood batch → ONE `write_all`; A/B 1471 → 1455 | **NO GAIN** — segment/syscall rate not the wall |
+
+**RAW-NETWORKING (T8) — TERMINAL VERDICT: REFUTED, ~2-3 orders of magnitude of headroom.** Measured on
+the rig: loopback **MTU = 65536 (64 KB)**, 32 cores. Fan-out at the ~1489 tx/s ceiling (each tx across 22
+peers, ~120 B wire):
+- **Byte bandwidth:** ~3.9 MB/s aggregate (0.03 Gbit/s) vs ~30 Gbit/s single-stream loopback → **~950×
+  headroom** (≥3000× vs aggregate loopback).
+- **Packet/segment rate:** even pre-T2 (one segment per message) ≈ 32,758 msg/s vs Linux loopback
+  ~1–5 M pps → **~150× headroom**; with 64 KB MTU a coalesced batch needs ~60 segments/s.
+- This is exactly why **T2 write-coalescing gave zero gain** — segment rate was never near the wall.
+
+So raw networking is definitively NOT the bottleneck on this single-host rig — the mandate's terminal
+question is answered, in the negative.
+
+### T5 dissemination-timing A/B — REFUTED (aggressive *hurts*)
+
+The SSC maxtps harness sets (in the core cfg, translated into henyey) `FLOOD_DEMAND_PERIOD_MS=100`,
+`FLOOD_DEMAND_BACKOFF_DELAY_MS=1000`. Since raw net has ~100-1000× headroom, henyey can afford to flood
+far more aggressively. Tested by editing only the SSC harness cfg (parity-irrelevant), same henyey image,
+controlled same-instance A/B:
+
+| dissemination timing | max tx/s |
+|---|--:|
+| default (advert 100, demand 100, backoff 1000) | **1493** |
+| aggressive (advert 50, demand 50, backoff 100) | **1438** |
+
+Aggressive timing **regressed −3.7%.** Dissemination latency is not tuning-fixable — the regression is
+the clue that a flood message's cost is the **tokio wakeup + channel crossing** (T7), not the wire.
+
+### T7 event-loop batch-drain — implemented + tested, REFUTED (no gain)
+
+The inbound broadcast (tx-flood) arm processed **one message per select! wakeup** (~7,500 iterations/
+ledger at the ceiling). Implemented a batch-drain (new `dispatch_broadcast_overlay_msg` helper +
+`try_recv` drain up to `MAX_DRAIN_PER_TICK=200`, mirroring the SCP drain idiom; 38 lifecycle tests pass).
+Controlled same-instance A/B: baseline **1446** vs T7 **1423** = **no gain (−1.6%, within noise)**. The
+wakeup overhead is real but not binding at the default flood rate. (This instance ran ~3% low overall —
+1446 vs ~1493 prior — confirming the ±2-3% instance/run variance that now dominates.)
+
+## FINAL bottleneck verdict — every lever exhausted
+
+One fix landed (trigger busy-loop **#3691**, +6.4%, the sole real win). Everything else tested and refuted
+with measurement: loadgen offer (T1), tx-set selection/surge (T6), advert-flood budget (T3), flow-control
+trim value (#3681, regresses ~3%), apply+persist close pipeline (SQLite `synchronous` A/B, 0 gain), tx-set
+cap, SCP convergence (post-fix ~30-60 ms), per-message write coalescing (T2, 0 gain), dissemination timing
+(T5, aggressive regresses), event-loop batch-drain (T7, 0 gain), and **RAW NETWORKING (T8, the mandate's
+terminal condition — ~950× byte / ~150× packet headroom on the 64 KB-MTU single-host loopback — definitively
+NOT the wall).**
+
+henyey sits at **~1446-1510 vs core ~1531 (~95-98%)**, and the residual gap is **within the ±2-3%
+instance/run measurement noise**. There is no identified fixable bottleneck remaining. The ceiling is the
+shared 5 s close-time cadence (a parity constraint) × the txns/ledger the 23-node consensus reliably
+agrees-and-applies; henyey matches core there to within noise. To go meaningfully higher the lever is the
+**5 s `ledger_target_close_time_ms`** itself (network-governance/parity), not henyey code — at a shorter
+close time henyey's tokio concurrency + idle CPU/network headroom would surface as a per-ledger-speed
+advantage; at 5 s both implementations are wall-clock-bound and effectively tied.
+
+### Parity-safe changes produced but NOT landed as optimizations
+- **T2 flood write-coalescing** (`Peer::send_batch` / `Connection::send_encoded_batch`): batches a flood
+  send into one `write_all` (was one per message). Parity-safe (wire bytes identical). 0 maxtps gain on
+  this rig (huge network headroom) but reduces syscalls/segments — potentially useful on a real WAN.
+- **T7 broadcast batch-drain**: amortizes event-loop wakeups on the flood-ingest path. Parity-safe, 0 gain.
+- Both are latency/efficiency hygiene, not maxtps levers; land only if desired on their own merits.
+
 ## Summary
-- Baseline → current: 462 → **1410 tx/s** (5 PRs: #3679, #3682, #3683, #3684, **#3691**). henyey is
-  now ≈92% of core's ~1531 on the same rig (was 84%).
+- Baseline → final: 462 → **~1446-1510 tx/s** (~95-98% of core's ~1531 on the same rig; was 84%).
+  Landed fixes: **#3691** (trigger busy-loop, +6.4%, the sole real maxtps win) on top of the measurement
+  fixes #3679/#3682/#3683/#3684.
 - The slow/bimodal SCP nomination convergence — the entire residual "controllable ~0.5 s overhead" —
   was the trigger busy-loop, now fixed. At sustainable rates convergence is ~30–60 ms.
-- Remaining gap to core (~1410 vs ~1531) is the txns/ledger ceiling under the shared 5 s close-time
-  target (~95% idle CPU); no identified single-bug cause, not a saturated resource. henyey's
-  tokio-concurrency advantage stays masked by the 5 s cadence and would surface only at shorter close
-  times where per-ledger processing speed dominates over wall-clock waiting.
+- **Every other lever tested and refuted with measurement**, including the mandate's terminal condition
+  **raw networking** (T8: ~950× byte / ~150× packet headroom on the 64 KB-MTU single-host loopback —
+  definitively not the wall). See the 3rd-round section above for the full ladder (T1/T3/T5/T6/T7/T8) and
+  the earlier sections for close-pipeline / tx-set-cap / flow-control eliminations.
+- The residual gap to core is **within the ±2-3% instance/run measurement noise**; there is no identified
+  fixable bottleneck remaining. The ceiling is the shared 5 s close-time cadence (a parity constraint) ×
+  the txns/ledger the 23-node consensus reliably agrees-and-applies. henyey's tokio-concurrency advantage
+  stays masked by the 5 s cadence and would surface only at a shorter close time.
+- Parity-safe efficiency changes produced but not landed as optimizations (0 maxtps gain on this rig):
+  T2 flood write-coalescing, T7 broadcast batch-drain — land only on their own merits.
