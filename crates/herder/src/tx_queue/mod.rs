@@ -1319,6 +1319,24 @@ pub struct TransactionQueue {
     /// Separate from queue-admission limits which apply
     /// `SOROBAN_TRANSACTION_QUEUE_SIZE_MULTIPLIER` (2x).
     dynamic_selection_soroban_resources: RwLock<Option<Resource>>,
+    /// Dynamic ledger-wide max Soroban instructions, re-derived from the live
+    /// LCL `SorobanNetworkConfig` (ContractComputeV0) on every ledger close.
+    /// Takes precedence over the construction-time `config.ledger_max_instructions`.
+    ///
+    /// Parity: stellar-core builds the parallel Soroban phase from the LIVE
+    /// config via `getLastClosedSorobanNetworkConfig().ledgerMaxInstructions()`
+    /// (`TxSetFrame.cpp:606-608`, `ParallelTxSetBuilder.cpp`). Henyey froze this
+    /// at app construction (prod default 0), so `use_parallel` was never enabled
+    /// after a Soroban ConfigUpgrade. See #3680.
+    dynamic_ledger_max_instructions: RwLock<Option<i64>>,
+    /// Dynamic ledger-wide max dependent tx clusters per stage, re-derived from
+    /// the live LCL `SorobanNetworkConfig` (ContractParallelComputeV0) on every
+    /// ledger close. Takes precedence over
+    /// `config.ledger_max_dependent_tx_clusters`.
+    ///
+    /// Parity: stellar-core reads this live via
+    /// `ledgerMaxDependentTxClusters()`. See #3680.
+    dynamic_ledger_max_dependent_tx_clusters: RwLock<Option<u32>>,
     /// Dynamic classic queue ops capacity (already scaled by
     /// POOL_LEDGER_MULTIPLIER), re-derived from the live ledger header's
     /// `maxTxSetSize` on every ledger close. Takes precedence over the
@@ -1403,6 +1421,8 @@ impl TransactionQueue {
             skip_fee_balance_check: std::sync::atomic::AtomicBool::new(false),
             dynamic_queue_soroban_resources: RwLock::new(None),
             dynamic_selection_soroban_resources: RwLock::new(None),
+            dynamic_ledger_max_instructions: RwLock::new(None),
+            dynamic_ledger_max_dependent_tx_clusters: RwLock::new(None),
             dynamic_max_queue_ops: RwLock::new(None),
             arb_damper: parking_lot::Mutex::new(arb_damper),
             arb_tx_seen: std::sync::atomic::AtomicU64::new(0),
@@ -1485,6 +1505,39 @@ impl TransactionQueue {
         } else {
             self.config.max_soroban_resources.clone()
         }
+    }
+
+    /// Update the ledger-wide parallel-Soroban phase limits from the live LCL
+    /// `SorobanNetworkConfig`. Called on every ledger close alongside
+    /// `update_soroban_selection_limits`.
+    ///
+    /// Parity: stellar-core builds the surge-priced parallel Soroban phase from
+    /// the live config (`getLastClosedSorobanNetworkConfig()`), reading
+    /// `ledgerMaxInstructions()` and `ledgerMaxDependentTxClusters()` each close
+    /// (`TxSetFrame.cpp:606-608`). Without this refresh henyey's `use_parallel`
+    /// gate stayed at the construction-time default (0/0) and never built a
+    /// parallel phase after a Soroban ConfigUpgrade. See #3680.
+    pub fn update_soroban_parallel_limits(&self, ledger_max_instructions: i64, clusters: u32) {
+        *self.dynamic_ledger_max_instructions.write() = Some(ledger_max_instructions);
+        *self.dynamic_ledger_max_dependent_tx_clusters.write() = Some(clusters);
+    }
+
+    /// Effective ledger-wide max Soroban instructions for parallel-phase
+    /// building. Prefers the dynamic value (refreshed from live LCL config each
+    /// close) over the construction-time config.
+    pub fn effective_ledger_max_instructions(&self) -> i64 {
+        self.dynamic_ledger_max_instructions
+            .read()
+            .unwrap_or(self.config.ledger_max_instructions)
+    }
+
+    /// Effective ledger-wide max dependent tx clusters per stage for
+    /// parallel-phase building. Prefers the dynamic value (refreshed from live
+    /// LCL config each close) over the construction-time config.
+    pub fn effective_ledger_max_dependent_tx_clusters(&self) -> u32 {
+        self.dynamic_ledger_max_dependent_tx_clusters
+            .read()
+            .unwrap_or(self.config.ledger_max_dependent_tx_clusters)
     }
 
     /// Return the effective Soroban resource limits for queue admission.
@@ -9312,6 +9365,115 @@ mod resource_limit_parity_tests {
             .flat_map(|stage| stage.0.iter())
             .flat_map(|cluster| cluster.0.iter())
             .count()
+    }
+
+    /// #3680 regression: the parallel-Soroban tx-set builder must read the LIVE
+    /// LCL SorobanNetworkConfig limits (refreshed via
+    /// `update_soroban_parallel_limits` on ledger close), NOT a `TxQueueConfig`
+    /// frozen at construction.
+    ///
+    /// In production the app constructs `TxQueueConfig` with
+    /// `ledger_max_instructions = 0` / `ledger_max_dependent_tx_clusters = 0`
+    /// (the `..Default::default()` values), so the `use_parallel` gate was
+    /// permanently false and henyey never built a parallel Soroban phase after a
+    /// Soroban ConfigUpgrade raised the live limits.
+    ///
+    /// Parity: stellar-core builds the surge-priced parallel Soroban phase from
+    /// `getLastClosedSorobanNetworkConfig()` (`TxSetFrame.cpp:606-608`), reading
+    /// `ledgerMaxInstructions()` / `ledgerMaxDependentTxClusters()` live.
+    ///
+    /// This test builds a queue whose *config* parallel limits are 0/0 (prod
+    /// default) and then drives a ledger-close-style refresh with raised live
+    /// limits. Pre-fix the phase collapses to a single sequential cluster;
+    /// post-fix it fans out into multiple parallel clusters.
+    #[test]
+    fn test_parallel_soroban_limits_use_live_config_not_frozen_3680() {
+        // Config parallel limits are the production defaults (0/0): parallel
+        // building is disabled at construction time.
+        let config = TxQueueConfig {
+            max_size: 1000,
+            ledger_max_instructions: 0,
+            ledger_max_dependent_tx_clusters: 0,
+            soroban_phase_min_stage_count: STAGE_COUNT,
+            soroban_phase_max_stage_count: STAGE_COUNT,
+            validate_signatures: false,
+            validate_bounds: false,
+            max_soroban_bytes: None,
+            ..Default::default()
+        };
+        assert_eq!(config.ledger_max_instructions, 0);
+        assert_eq!(config.ledger_max_dependent_tx_clusters, 0);
+
+        let queue = TransactionQueue::new(config);
+        queue.update_soroban_selection_limits(default_soroban_limits());
+        queue.update_validation_context(
+            0,
+            0,
+            PROTOCOL_VERSION,
+            100,
+            5_000_000,
+            0,
+            std::time::Duration::from_secs(5),
+        );
+        queue.set_skip_fee_balance_check(true);
+
+        // Simulate a ledger close carrying the LIVE (raised) Soroban limits,
+        // exactly as `App::update_herder_soroban_limits` does on every close.
+        queue.update_soroban_parallel_limits(LEDGER_MAX_INSTRUCTIONS, CLUSTER_COUNT);
+
+        // Effective accessors must now report the LIVE values, overriding the
+        // frozen 0/0 config.
+        assert_eq!(
+            queue.effective_ledger_max_instructions(),
+            LEDGER_MAX_INSTRUCTIONS
+        );
+        assert_eq!(
+            queue.effective_ledger_max_dependent_tx_clusters(),
+            CLUSTER_COUNT
+        );
+
+        // Add 32 Soroban txs, each using an equal slice of the per-stage
+        // instruction budget so they fan out across all clusters/stages.
+        let total_txs = (STAGE_COUNT * CLUSTER_COUNT) as i32;
+        let per_tx_instructions = (LEDGER_MAX_INSTRUCTIONS as u32) / (STAGE_COUNT * CLUSTER_COUNT);
+        let mut account_id = 0u32;
+        for i in 0..total_txs {
+            let tx = make_resource_limit_tx(
+                &mut account_id,
+                per_tx_instructions,
+                &[4 * i, 4 * i + 1],
+                &[4 * i + 2, 4 * i + 3],
+                100 + i as i64,
+                100, // small read bytes — not the bottleneck
+                100,
+            );
+            assert_eq!(queue.try_add(tx), TxQueueResult::Added, "tx {} added", i);
+        }
+
+        let tx_set = queue.build_generalized_tx_set(Hash256::ZERO, 1000);
+        let gen_tx_set = tx_set.generalized_tx_set().unwrap().clone();
+        let component = extract_soroban_phase(&gen_tx_set);
+
+        // All 32 txs must survive regardless of path.
+        assert_eq!(count_soroban_txs(&gen_tx_set), total_txs as usize);
+
+        // The load-bearing assertion: with the live limits applied, the phase
+        // must be PARALLEL — multiple clusters within a stage. Pre-fix (frozen
+        // 0/0 config) the else-branch produced a single cluster holding every
+        // tx, so the max cluster count per stage would be 1.
+        let max_clusters_per_stage = component
+            .execution_stages
+            .iter()
+            .map(|stage| stage.0.len())
+            .max()
+            .unwrap_or(0);
+        assert!(
+            max_clusters_per_stage > 1,
+            "expected a parallel Soroban phase (>1 cluster per stage) once live \
+             limits are applied, got {} cluster(s) — the builder is still reading \
+             the frozen 0/0 TxQueueConfig instead of the live LCL config (#3680)",
+            max_clusters_per_stage
+        );
     }
 
     /// Run a resource-limit scenario: create 32 TXs, add to queue, build tx set,

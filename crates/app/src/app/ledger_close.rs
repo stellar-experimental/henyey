@@ -1145,6 +1145,15 @@ impl App {
         self.herder
             .tx_queue()
             .update_soroban_selection_limits(selection_limit);
+
+        // Refresh the parallel-Soroban phase limits from the live LCL config so
+        // the tx-set builder's `use_parallel` gate and per-stage limits track
+        // Soroban ConfigUpgrades. Parity: stellar-core reads these live from
+        // getLastClosedSorobanNetworkConfig() (#3680).
+        self.herder.tx_queue().update_soroban_parallel_limits(
+            info.ledger_max_instructions,
+            info.ledger_max_dependent_tx_clusters,
+        );
     }
 
     /// Restore checkpoint state on startup (crash recovery).
@@ -2717,6 +2726,16 @@ impl App {
                 }
                 None => (None, None),
             };
+            // Live parallel-Soroban phase limits (ledger-wide instructions and
+            // dependent-cluster count) for the tx-set builder's `use_parallel`
+            // gate. Parity: stellar-core reads these from the live
+            // getLastClosedSorobanNetworkConfig() (#3680).
+            let parallel_limits = soroban_info.as_ref().map(|info| {
+                (
+                    info.ledger_max_instructions,
+                    info.ledger_max_dependent_tx_clusters,
+                )
+            });
 
             // Compute upper-bound close-time offset (stellar-core parity).
             // Reading `wall_now` inside the closure instead of on the event
@@ -2777,6 +2796,11 @@ impl App {
             }
             if let Some(s) = selection_limit {
                 herder.tx_queue().update_soroban_selection_limits(s);
+            }
+            if let Some((instructions, clusters)) = parallel_limits {
+                herder
+                    .tx_queue()
+                    .update_soroban_parallel_limits(instructions, clusters);
             }
 
             // Re-derive the classic queue ops capacity from the live ledger

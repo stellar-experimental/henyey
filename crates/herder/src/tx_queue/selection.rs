@@ -251,8 +251,14 @@ impl TransactionQueue {
         // This fixes #1477 (stale base fee after trim) and #1494 (missing
         // hadTxNotFittingLane feedback). stellar-core computes base fee after
         // building the parallel phase using computeLaneBaseFee().
-        let (soroban_phase, _soroban_base_fee) =
-            build_soroban_phase_with_base_fee(soroban_txs, soroban_limited, base_fee, &self.config);
+        let (soroban_phase, _soroban_base_fee) = build_soroban_phase_with_base_fee(
+            soroban_txs,
+            soroban_limited,
+            base_fee,
+            &self.config,
+            self.effective_ledger_max_instructions(),
+            self.effective_ledger_max_dependent_tx_clusters(),
+        );
 
         let gen_tx_set = GeneralizedTransactionSet::V1(stellar_xdr::TransactionSetV1 {
             previous_ledger_hash: stellar_xdr::Hash(previous_ledger_hash.0),
@@ -448,8 +454,12 @@ impl TransactionQueue {
         // the surge pricing config. Relax the instruction limit so surge pricing
         // doesn't prematurely reject transactions that could fit across stages.
         // Mirrors stellar-core TxSetFrame.cpp:513-524.
-        let use_parallel = self.config.ledger_max_instructions > 0
-            && self.config.ledger_max_dependent_tx_clusters > 0
+        // Read the ledger-wide parallel limits from the LIVE LCL Soroban config
+        // (refreshed each close), not the frozen construction-time config.
+        // Mirrors stellar-core, which builds the parallel Soroban phase from
+        // getLastClosedSorobanNetworkConfig(). See #3680.
+        let use_parallel = self.effective_ledger_max_instructions() > 0
+            && self.effective_ledger_max_dependent_tx_clusters() > 0
             && self.config.soroban_phase_max_stage_count > 0;
         if use_parallel {
             if let Some(limit) = soroban_limit.as_mut() {
@@ -584,6 +594,8 @@ fn build_soroban_phase_with_base_fee(
     soroban_limited: bool,
     ledger_base_fee: i64,
     config: &super::TxQueueConfig,
+    ledger_max_instructions: i64,
+    ledger_max_dependent_tx_clusters: u32,
 ) -> (stellar_xdr::TransactionPhase, Option<i64>) {
     use stellar_xdr::{DependentTxCluster, ParallelTxExecutionStage, TransactionEnvelope};
 
@@ -591,16 +603,20 @@ fn build_soroban_phase_with_base_fee(
         return empty_soroban_phase_pair();
     }
 
-    let use_parallel = config.ledger_max_instructions > 0
-        && config.ledger_max_dependent_tx_clusters > 0
+    // Parallel-phase gating and limits come from the LIVE LCL Soroban config
+    // (passed in by the caller), not the frozen construction-time config. Only
+    // the min/max stage counts are static Config values in stellar-core
+    // (Config.cpp:339-340), so those still come from `config`. See #3680.
+    let use_parallel = ledger_max_instructions > 0
+        && ledger_max_dependent_tx_clusters > 0
         && config.soroban_phase_max_stage_count > 0;
 
     if use_parallel {
         let (stages, had_tx_not_fitting) =
             crate::parallel_tx_set_builder::build_parallel_soroban_phase(
                 soroban_txs,
-                config.ledger_max_instructions,
-                config.ledger_max_dependent_tx_clusters,
+                ledger_max_instructions,
+                ledger_max_dependent_tx_clusters,
                 config.soroban_phase_min_stage_count,
                 config.soroban_phase_max_stage_count,
             );
