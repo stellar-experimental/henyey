@@ -267,6 +267,45 @@ drain in the completion window. With apply/persist/cap all ruled out, the residu
 **tx dissemination / queue-fill / flooding throughput across the 23 nodes**, or load-stretched cadence —
 NOT the close pipeline. henyey on this (faster) instance = **1492** vs core ~1531 (~97.5%).
 
+## #3681 flow-control live-maxTxSetSize trim — implemented, tested, REJECTED (regresses ~3%)
+
+Hypothesis (dissemination angle): the overlay outbound-queue trim uses a static
+`config.max_tx_set_size_ops=10000` (`flow_control.rs`) instead of the live last-closed-ledger
+`maxTxSetSize`; since the maxtps network runs `maxTxSetSize=15000 > 10000`, the static cap might
+over-trim and throttle tx dissemination. Sibling of the merged #3679 (herder flood budget).
+
+**Implemented** (branch `fix/3681-flowcontrol-live-maxtxset`, NOT merged): shared `Arc<AtomicU32>`
+`max_tx_set_size_ops` app→`OverlayManager`→`SharedPeerState`→`FlowControl`, refreshed on
+startup/catchup/each close from `last_max_tx_set_size_ops()` (mirrors `max_tx_size_bytes`); the trim
+reads it live (matching core's `getLastMaxTxSetSizeOps()`). Regression test passes.
+
+**Controlled A/B (nsc 32×64, short-probe, interleaved to control run-order) — it REGRESSES:**
+
+| run | image | max tx/s |
+|---|---|--:|
+| 1 | base (static 10000) | 1489 |
+| 2 | #3681 (live 15000) | 1444 |
+| 3 | base (static 10000) | 1510 |
+| 4 | #3681 (live 15000) | 1455 |
+
+base mean **1500** vs #3681 mean **~1452** = **−3.3%**, non-overlapping (base min 1489 > #3681 max 1455);
+instance was stable/improving across runs, so not run-order drift.
+
+**Why it regresses (two findings):** (1) At the ~1500 ceiling, txns/ledger ≈ 7,445 — *below* both 10000
+and 15000 — so the trim was never the dissemination cap (the earlier "fill peaks ~10,098 ≈ 10,000"
+correlation was coincidence). (2) Raising the clear-on-overflow trim limit lets per-peer outbound queues
+grow 50% larger before load-shedding; at the ceiling, holding more backlog instead of shedding earlier
+makes the node *less* responsive → lower sustainable throughput. Static 10000 sheds earlier, performs better.
+
+**Verdict: keep static 10000; do NOT land #3681.** Flow-control queue sizing is DIVERGEABLE
+(overlay-internal, not observable bytes), so henyey need not match core's live value here — and the static
+value is the better-performing tuned choice. Lesson: a parity-hygiene change on a divergeable knob can
+hurt perf; test before landing. (Contrast #3679, the merged sibling on the herder flood budget, which helped.)
+
+**Next (per standing mandate):** the close pipeline, tx-set cap, and flow-control trim are all ruled out.
+The bottleneck hunt continues toward the dissemination/flooding path and ultimately RAW NETWORKING —
+we only stop when pod-to-pod bandwidth / TCP / kernel-network on the single 32-core host is proven the wall.
+
 ## Summary
 - Baseline → current: 462 → **1410 tx/s** (5 PRs: #3679, #3682, #3683, #3684, **#3691**). henyey is
   now ≈92% of core's ~1531 on the same rig (was 84%).
