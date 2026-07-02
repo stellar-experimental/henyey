@@ -243,11 +243,8 @@ impl App {
             let last_slot = current_ledger as u64;
             let last_ballot_start = self.herder.prepare_start(last_slot);
             let now_instant = std::time::Instant::now();
-            // Early-trigger compensation (kept in lock-step with
-            // `setup_trigger_next_ledger`, see rationale there).
-            let comp = self.trigger_overhead_compensation(expected_close);
             let trigger_time = match last_ballot_start {
-                Some(ballot_start) => ballot_start + expected_close - comp,
+                Some(ballot_start) => ballot_start + expected_close,
                 None => now_instant,
             };
             if trigger_time > now_instant {
@@ -419,24 +416,6 @@ impl App {
         self.setup_trigger_next_ledger().await;
     }
 
-    /// Early-trigger compensation: the tracked per-slot nomination overhead
-    /// (tx-set build + SCP convergence), clamped to `expected_close / 5`
-    /// (1 s at the 5 s target — the round-1 nomination timeout) so a single
-    /// outlier observation can never pull the trigger drastically early.
-    /// Subtracted from the trigger instant by BOTH trigger sites
-    /// (`setup_trigger_next_ledger` and the `try_trigger_consensus` gate) so
-    /// the timer and the safety-net always agree on timing. Returns 0 until
-    /// the first slot completes nomination.
-    fn trigger_overhead_compensation(
-        &self,
-        expected_close: std::time::Duration,
-    ) -> std::time::Duration {
-        self.herder
-            .nomination_overhead_estimate()
-            .unwrap_or_default()
-            .min(expected_close / 5)
-    }
-
     pub(super) async fn setup_trigger_next_ledger(&self) {
         // Parity: MANUAL_CLOSE skips arming the trigger timer.
         if self.config.node.manual_close {
@@ -453,24 +432,21 @@ impl App {
 
         // Compute the trigger instant exactly as `try_trigger_consensus` does
         // (kept in lock-step so the timer and the safety-net agree on timing).
+        //
+        // NOTE (maxtps iteration 2, 2026-07-02, REJECTED experiment): arming
+        // this trigger EARLY by the measured nomination overhead (EWMA of
+        // trigger→ballot-start) does work mechanically — loaded cadence drops
+        // from ~5.5 s to ~4.95 s (+17% ledger rate) — but does NOT raise the
+        // max-TPS ceiling: ledgers arrive proportionally emptier and the
+        // loadgen's per-account inclusion-latency guillotine does not relax
+        // (measured max 1460-1470 vs 1487 baseline). Do not re-attempt without
+        // a mechanism that raises per-WALL-SECOND drain, not ledger rate.
+        // See docs/maxtps-optimization/2026-07-02-target2000.md iteration 2.
         let expected_close = self.herder.ledger_close_duration();
         let last_slot = current_ledger as u64;
         let now_instant = std::time::Instant::now();
-        // DIVERGENCE (performance, internal scheduling — not on the observable
-        // parity surface): stellar-core arms the trigger at
-        // `prepareStart + expectedClose` and only THEN builds the tx set and
-        // runs SCP nomination, so its real ledger cadence is
-        // `expectedClose + build + convergence` (~5.5 s at a 5 s target under
-        // load — it undershoots the network's declared close-time target by
-        // ~10%). henyey compensates: the trigger is armed EARLY by the EWMA of
-        // the measured overhead, so ballot starts land on the declared
-        // `expectedClose` grid. Wire bytes, close-time values, and tx-set
-        // semantics are unchanged; only the moment we start nominating moves.
-        // The compensation is clamped to expectedClose/2 as a safety bound and
-        // is 0 until the first slot completes (cold start = core behavior).
-        let comp = self.trigger_overhead_compensation(expected_close);
         let trigger_time = match self.herder.prepare_start(last_slot) {
-            Some(ballot_start) => ballot_start + expected_close - comp,
+            Some(ballot_start) => ballot_start + expected_close,
             None => now_instant,
         };
         // Base delay from prepareStart + expectedClose, clamped to "now".
@@ -494,7 +470,6 @@ impl App {
         tracing::debug!(
             next_slot,
             delay_ms = delay.as_millis(),
-            comp_ms = comp.as_millis(),
             ct_offset_secs,
             "Armed event-driven consensus trigger timer (setupTriggerNextLedger)"
         );

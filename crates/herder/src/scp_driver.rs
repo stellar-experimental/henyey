@@ -533,22 +533,6 @@ pub struct ScpDriver {
     test_clock: Arc<AtomicU64>,
     /// Per-slot timing for metrics (first-seen, nomination start, ballot start).
     slot_timing: RwLock<HashMap<SlotIndex, SlotTimingState>>,
-    /// EWMA (milliseconds) of the per-slot nomination overhead — the time from
-    /// a slot's first activity (`first_seen`, stamped when our trigger runs or
-    /// the first peer nomination arrives, whichever is earlier) to its ballot
-    /// start. This is the [5 s wait]→[ballot start] serialization cost:
-    /// tx-set build + SCP nomination convergence.
-    ///
-    /// Consumed by the app layer's `setup_trigger_next_ledger` to arm the next
-    /// consensus trigger EARLY by this amount, so ballot starts land on the
-    /// network's declared `expectedLedgerCloseTime` grid instead of
-    /// `expectedClose + overhead` (DIVERGENCE from stellar-core, which
-    /// serializes the overhead after the full wait and therefore closes
-    /// ledgers ~10% slower than the declared target under load; trigger
-    /// *scheduling* is internal timing, not on the observable parity surface).
-    ///
-    /// `0` = no estimate yet (updates store `max(1)` to disambiguate).
-    nom_overhead_ewma_ms: std::sync::atomic::AtomicU64,
     /// Timing snapshot for the highest externalized slot (monotonically updated).
     last_externalize_timing: RwLock<Option<ExternalizeTimingSnapshot>>,
     /// Externalize lag tracker for per-node lag statistics.
@@ -659,7 +643,6 @@ impl ScpDriver {
             tracking_state,
             test_clock: Arc::new(AtomicU64::new(0)),
             slot_timing: RwLock::new(HashMap::new()),
-            nom_overhead_ewma_ms: std::sync::atomic::AtomicU64::new(0),
             last_externalize_timing: RwLock::new(None),
             externalize_lag: RwLock::new(ExternalizeLagTracker::new()),
             deferred_slots: Mutex::new(HashMap::new()),
@@ -1189,47 +1172,10 @@ impl ScpDriver {
         if state.ballot_start.is_none() {
             // [maxtps_cad] nomination converged → ballot protocol begins.
             tracing::info!(target: "maxtps_cad", slot, "ballot");
-            // Fold this slot's nomination overhead (first activity → ballot
-            // start) into the EWMA consumed by the early-trigger scheduler
-            // (see `nom_overhead_ewma_ms`). Outliers ≥ 5 s are skipped: those
-            // are stalled/catchup slots, not steady-state overhead, and would
-            // poison the estimate.
-            if let Some(fs) = state.first_seen {
-                let overhead_ms = fs.elapsed().as_millis() as u64;
-                const OUTLIER_MS: u64 = 5_000;
-                if overhead_ms < OUTLIER_MS {
-                    use std::sync::atomic::Ordering;
-                    let prev = self.nom_overhead_ewma_ms.load(Ordering::Relaxed);
-                    // Asymmetric tracker: jump UP to a larger observation
-                    // immediately (load onset must be compensated within one
-                    // slot — a slow ramp leaves several ledgers running at the
-                    // uncompensated ~5.5 s cadence), decay DOWN with alpha=1/4
-                    // (a few idle slots after a burst briefly over-compensate,
-                    // which only closes ledgers marginally faster than the
-                    // declared target until the estimate settles).
-                    let next = if prev == 0 || overhead_ms > prev {
-                        overhead_ms
-                    } else {
-                        (3 * prev + overhead_ms) / 4
-                    };
-                    self.nom_overhead_ewma_ms
-                        .store(next.max(1), Ordering::Relaxed);
-                }
-            }
         }
         state
             .ballot_start
             .get_or_insert_with(std::time::Instant::now);
-    }
-
-    /// Current EWMA estimate of the per-slot nomination overhead (first
-    /// activity → ballot start): tx-set build + SCP nomination convergence.
-    /// `None` until the first slot completes nomination.
-    pub fn nomination_overhead_estimate(&self) -> Option<std::time::Duration> {
-        let ms = self
-            .nom_overhead_ewma_ms
-            .load(std::sync::atomic::Ordering::Relaxed);
-        (ms > 0).then(|| std::time::Duration::from_millis(ms))
     }
 
     /// Get the ballot start instant for a slot.
@@ -4396,54 +4342,6 @@ mod tests {
         assert!(!externalized.contains_key(&5));
         assert!(externalized.contains_key(&6));
         assert!(externalized.contains_key(&10));
-    }
-
-    /// The early-trigger EWMA (`nom_overhead_ewma_ms`) seeds on the first
-    /// slot that reaches ballot start and converges toward subsequent
-    /// observations (alpha = 1/4). Slots without a `first_seen` stamp (pure
-    /// catchup) must NOT update the estimate.
-    #[test]
-    fn test_nomination_overhead_ewma() {
-        let driver = make_test_driver();
-
-        // No estimate before any slot completes nomination.
-        assert!(driver.nomination_overhead_estimate().is_none());
-
-        // Ballot start WITHOUT slot activity (catchup path): still no estimate.
-        driver.record_ballot_start(99);
-        assert!(
-            driver.nomination_overhead_estimate().is_none(),
-            "slot without first_seen must not seed the EWMA"
-        );
-
-        // Normal flow: activity → ballot start seeds the estimate.
-        driver.record_slot_activity(100);
-        std::thread::sleep(std::time::Duration::from_millis(2));
-        driver.record_ballot_start(100);
-        let e1 = driver
-            .nomination_overhead_estimate()
-            .expect("estimate seeded after first nominated slot");
-        assert!(e1 >= std::time::Duration::from_millis(1));
-        assert!(
-            e1 < std::time::Duration::from_secs(5),
-            "outlier guard bound"
-        );
-
-        // A second slot folds in with alpha=1/4: the estimate stays within
-        // the envelope of the two observations.
-        driver.record_slot_activity(101);
-        std::thread::sleep(std::time::Duration::from_millis(10));
-        driver.record_ballot_start(101);
-        let e2 = driver.nomination_overhead_estimate().expect("still Some");
-        assert!(e2 >= e1, "EWMA must move toward the larger observation");
-        assert!(
-            e2 < std::time::Duration::from_millis(100),
-            "EWMA must stay near the observations, got {e2:?}"
-        );
-
-        // Re-recording ballot start for an already-stamped slot is a no-op.
-        driver.record_ballot_start(100);
-        assert_eq!(driver.nomination_overhead_estimate(), Some(e2));
     }
 
     #[test]
