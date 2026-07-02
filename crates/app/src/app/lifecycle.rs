@@ -908,6 +908,19 @@ impl App {
                         latency_ms = scp_msg.received_at.elapsed().as_millis(),
                         "SCP message arrived via dedicated channel"
                     );
+                    // [maxtps_scp] time spent queued in the dedicated SCP
+                    // channel before the event loop picked it up (slow-only).
+                    {
+                        let intake_ms = scp_msg.received_at.elapsed().as_millis() as u64;
+                        if intake_ms > 50 {
+                            tracing::info!(
+                                target: "maxtps_scp",
+                                slot = scp_slot,
+                                intake_ms,
+                                "slow_intake"
+                            );
+                        }
+                    }
                     self.pump_scp_intake(scp_msg, &mut verified_rx).await;
                     // After processing an SCP message (which may buffer an
                     // EXTERNALIZE), kick off a buffered close if none is running.
@@ -2608,6 +2621,24 @@ impl App {
             .fetch_add(verify_latency_us, Ordering::Relaxed);
         self.scp_verify_latency_count
             .fetch_add(1, Ordering::Relaxed);
+
+        // [maxtps_scp] full-pipeline latency for one SCP envelope: overlay
+        // recv → dedicated channel → intake → verify worker → this dispatch.
+        // Only slow envelopes are logged (bounds volume); used to attribute
+        // the nomination-convergence tail (slow slots) to pipeline queueing
+        // vs fetch service time. Parity-irrelevant logging.
+        if let Some(recv_at) = ve.intake.received_at() {
+            let total_ms = recv_at.elapsed().as_millis() as u64;
+            if total_ms > 50 {
+                tracing::info!(
+                    target: "maxtps_scp",
+                    slot,
+                    total_ms,
+                    verify_us = verify_latency_us,
+                    "slow_pipeline"
+                );
+            }
+        }
 
         // SCP latency bookkeeping.
         //

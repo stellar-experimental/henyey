@@ -843,6 +843,20 @@ impl App {
             "Processing GeneralizedTxSet"
         );
 
+        // [maxtps_fetch] tx-set fetch service latency: first GetTxSet request
+        // sent → GeneralizedTxSet received. Logged once per fetched set.
+        {
+            let map = self.tx_set_last_request.read().await;
+            if let Some(state) = map.get(&hash) {
+                tracing::info!(
+                    target: "maxtps_fetch",
+                    elapsed_ms = state.first_requested.elapsed().as_millis() as u64,
+                    tx_count = internal_tx_set.len(),
+                    "got"
+                );
+            }
+        }
+
         // Time-wrapped (#1759 diagnostics): acquires
         // `Herder::scp_driver.needs_tx_set`'s internal
         // parking_lot::RwLock on every inbound GeneralizedTxSet.
