@@ -1561,6 +1561,18 @@ impl App {
                 phase_dispatch_start.elapsed(),
                 self.event_loop_phase.load(Ordering::Relaxed),
             );
+            // [maxtps_loop] accumulate per-phase busy time for the stats-tick
+            // dump (which arm occupies the event loop under load).
+            {
+                let ph = self.event_loop_phase.load(Ordering::Relaxed) as usize;
+                if ph < self.phase_time_us.len() {
+                    self.phase_time_us[ph].fetch_add(
+                        phase_dispatch_start.elapsed().as_micros() as u64,
+                        Ordering::Relaxed,
+                    );
+                    self.phase_count[ph].fetch_add(1, Ordering::Relaxed);
+                }
+            }
         }
 
         // Event loop has exited — stop the watchdog immediately (before
@@ -2054,6 +2066,44 @@ impl App {
 
     /// Log current stats.
     async fn log_stats(&self) {
+        // [maxtps_loop] drain + dump per-phase event-loop busy time since the
+        // last stats tick; one line listing phases with >50 ms accumulated.
+        {
+            let mut parts: Vec<String> = Vec::new();
+            let mut total_ms = 0u64;
+            for ph in 0..self.phase_time_us.len() {
+                let us = self.phase_time_us[ph].swap(0, Ordering::Relaxed);
+                let n = self.phase_count[ph].swap(0, Ordering::Relaxed);
+                let ms = us / 1000;
+                total_ms += ms;
+                if ms > 50 {
+                    parts.push(format!(
+                        "{}={}ms/{}",
+                        super::event_loop_phase_name(ph as u64),
+                        ms,
+                        n
+                    ));
+                }
+            }
+            if !parts.is_empty() {
+                parts.sort_by_key(|p| {
+                    std::cmp::Reverse(
+                        p.split('=')
+                            .nth(1)
+                            .and_then(|v| v.split("ms").next())
+                            .and_then(|v| v.parse::<u64>().ok())
+                            .unwrap_or(0),
+                    )
+                });
+                tracing::info!(
+                    target: "maxtps_loop",
+                    total_busy_ms = total_ms,
+                    breakdown = parts.join(" "),
+                    "loop_busy"
+                );
+            }
+        }
+
         let stats = self.herder.stats();
         let ledger = self.current_ledger_seq();
 

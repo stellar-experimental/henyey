@@ -1042,6 +1042,12 @@ pub struct App {
     ///        32=scp_verified (draining verified envelopes),
     ///        33=tx_set_gc (purge unreferenced persisted tx sets)
     event_loop_phase: Arc<AtomicU64>,
+    /// [maxtps_loop] cumulative busy time (µs) and dispatch count per
+    /// event-loop phase (indexed by the coarse phase code, see
+    /// `WATCHDOG_PHASE_LEGEND`). Accumulated after every select-arm dispatch;
+    /// drained and logged by the stats tick. Diagnostic only.
+    phase_time_us: Arc<[AtomicU64; 40]>,
+    phase_count: Arc<[AtomicU64; 40]>,
 
     /// Fine-grained sub-phase code for pinpointing a stall inside a
     /// coarse phase. See [`phase`](super::phase) for the `PHASE_6_*`
@@ -1617,6 +1623,8 @@ impl App {
             watchdog_shutdown: Arc::new(AtomicBool::new(false)),
             watchdog_condvar: Arc::new((std::sync::Mutex::new(()), std::sync::Condvar::new())),
             event_loop_phase: Arc::new(AtomicU64::new(0)),
+            phase_time_us: Arc::new(std::array::from_fn(|_| AtomicU64::new(0))),
+            phase_count: Arc::new(std::array::from_fn(|_| AtomicU64::new(0))),
             event_loop_phase_sub: Arc::new(AtomicU32::new(0)),
         })
     }
