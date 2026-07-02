@@ -46,8 +46,20 @@ impl HerderState {
     }
 
     /// Check if the herder is in a state where it can receive transactions.
+    ///
+    /// Includes `Syncing` (sustain fix): stellar-core's
+    /// `HerderImpl::recvTransaction` never gates on tracking state — it always
+    /// forwards to the queue. henyey previously required `Tracking`, so a
+    /// momentary Tracking→Syncing blip (e.g. a slow slot or connection churn)
+    /// made in-flight submissions fail with `TryAgainLater`; for
+    /// `PAY_PREGENERATED` load generation ANY non-Added result aborts the run
+    /// (parity #3638), which capped sustained-load tests ~20% below the burst
+    /// ceiling. Only `Booting` still defers: the ledger manager may not be
+    /// initialized yet, and the queue would reject with `txINTERNAL_ERROR`
+    /// (aborting well-behaved clients such as friendbot) instead of a
+    /// retryable signal.
     pub fn can_receive_transactions(&self) -> bool {
-        matches!(self, HerderState::Tracking)
+        matches!(self, HerderState::Syncing | HerderState::Tracking)
     }
 
     /// Check if the herder is fully synchronized with the network.
@@ -112,7 +124,9 @@ mod tests {
         let syncing = state.next_state().unwrap();
         assert!(syncing.is_syncing());
         assert!(syncing.can_receive_scp());
-        assert!(!syncing.can_receive_transactions());
+        // Sustain fix: Syncing forwards transactions to the queue (core
+        // parity — recvTransaction never gates on tracking state).
+        assert!(syncing.can_receive_transactions());
 
         let tracking = syncing.next_state().unwrap();
         assert!(tracking.is_tracking());

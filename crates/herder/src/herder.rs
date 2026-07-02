@@ -5748,6 +5748,27 @@ mod tests {
         );
     }
 
+    /// Sustain fix: a momentary Tracking→Syncing blip must NOT bounce
+    /// submissions at the herder gate — stellar-core's `recvTransaction`
+    /// always forwards to the queue regardless of tracking state. (For
+    /// `PAY_PREGENERATED` loadgen, a bounced submission aborts the whole run,
+    /// parity #3638.) Only `Booting` still defers.
+    #[test]
+    fn test_receive_transaction_while_syncing_forwards_to_queue() {
+        let herder = make_test_herder();
+        herder.set_state(HerderState::Syncing);
+        assert!(herder.state().can_receive_transactions());
+
+        // With an empty queue there is no account-pending conflict, so any
+        // TryAgainLater could only come from the (removed) state gate.
+        let result = herder.receive_transaction(make_minimal_tx_envelope());
+        assert!(
+            !matches!(result, TxQueueResult::TryAgainLater),
+            "Syncing must forward to the queue, not bounce at the state gate; got {:?}",
+            result
+        );
+    }
+
     /// Parity: when the herder is Tracking and the queue already has a pending
     /// tx from a source, submitting an opposite-type tx from the same source
     /// must return TryAgainLater (stellar-core HerderImpl.cpp:627-645).

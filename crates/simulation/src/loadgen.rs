@@ -2232,7 +2232,18 @@ impl LoadGenerator {
             let envelope = match tx_result {
                 Ok((_source_id, env)) => env,
                 Err(e) => {
-                    warn!("Failed to build tx (mode={:?}): {}", config.mode, e);
+                    // [maxtps_ban] the OTHER run-fatal path besides the submit
+                    // reject: tx generation failed (pregenerated-file reader
+                    // error, account lookup, etc.). Under the sustain
+                    // investigation, post-fix mid-submission deaths were
+                    // silent at the submit-reject site — tag this one too.
+                    tracing::warn!(
+                        target: "maxtps_ban",
+                        error = %e,
+                        mode = ?config.mode,
+                        source_account_id,
+                        "generate_tx fatal error — failing the run"
+                    );
                     self.failed = true;
                     return SubmitOutcome::NotAccepted;
                 }
@@ -2246,6 +2257,9 @@ impl LoadGenerator {
             // re-enters execute() on each retry (#3569).
             mark_tx_meters(config.mode, &envelope);
 
+            // [maxtps_ban] capture identifying details before the envelope is
+            // consumed, for the fatal-reject diagnostic below.
+            let diag_seq = envelope_seq_num(&envelope);
             let result = self.tx_generator.app.submit_transaction(envelope).await;
 
             // PayPregenerated does not re-submit on failure: each tx is read
@@ -2256,6 +2270,18 @@ impl LoadGenerator {
             // (#3638).
             if config.mode == LoadGenMode::PayPregenerated {
                 if pay_pregenerated_reject_fails(&result) {
+                    // [maxtps_ban] THE run-fatal reject (parity #3638: any
+                    // non-Added result aborts a PayPregenerated run). Under the
+                    // sustained-load investigation runs died mid-submission
+                    // with no visible cause — log the queue verdict that killed
+                    // the run.
+                    tracing::warn!(
+                        target: "maxtps_ban",
+                        result = ?result,
+                        source_account_id,
+                        tx_seq = diag_seq,
+                        "pay_pregenerated fatal reject — failing the run"
+                    );
                     app_metrics::LOADGEN_TXN_REJECTED.increment(1.0);
                     self.failed = true;
                     return SubmitOutcome::NotAccepted;
