@@ -1393,15 +1393,36 @@ fn collect_adverts_for_peers(
     });
 
     // Phase 2 (no store lock): per-peer dedup against the advert history.
+    // Candidates already advertised to EVERY peer get their budget REFUNDED
+    // (sustain fix): after a peer reconnect, `rebroadcast()` re-marks the
+    // whole queue for flooding, and without the refund those already-seen
+    // candidates consumed the ops budget for several consecutive periods,
+    // starving adverts for NEW txs — a stranded new tx misses ~4 ledgers,
+    // its account's next submission gets TryAgainLater, and a
+    // PayPregenerated load-run insta-fails (parity #3638). The refund lands
+    // in the carryover, so the next 200 ms period drains the backlog with
+    // compounded budget. Net budget accounting matches the pre-split
+    // single-pass semantics (seen-by-all == Skipped == budget-neutral).
     let mut per_peer: HashMap<henyey_overlay::PeerId, Vec<Hash256>> = HashMap::new();
     for candidate in &candidates {
+        let mut new_to_any_peer = false;
         for peer_id in peer_ids {
             if let Some(adverts) = adverts_by_peer.get(peer_id) {
                 if !adverts.seen_advert(&candidate.hash) {
+                    new_to_any_peer = true;
                     per_peer
                         .entry(peer_id.clone())
                         .or_default()
                         .push(candidate.hash);
+                }
+            }
+        }
+        if !new_to_any_peer {
+            let ops = candidate.op_count as usize;
+            budget.ops_remaining = budget.ops_remaining.saturating_add(ops);
+            if candidate.is_dex {
+                if let Some(dex) = budget.dex_ops_remaining.as_mut() {
+                    *dex = dex.saturating_add(ops);
                 }
             }
         }
@@ -1805,13 +1826,12 @@ mod tests {
         let per_peer = collect_adverts_for_peers(&queue, &mut budget, &peer_ids, &adverts);
 
         assert!(per_peer.is_empty(), "no peer should receive a known tx");
-        // maxtps iter 8: the drain phase consumes budget for every candidate
-        // (including all-peers-seen ones) so the per-peer advert-history
-        // checks can run OUTSIDE the tx-queue store lock. See
-        // collect_adverts_for_peers for the rationale + headroom analysis.
+        // Sustain fix: the two-phase collector REFUNDS budget for candidates
+        // already advertised to every peer, restoring the original
+        // budget-neutral semantics (see collect_adverts_for_peers phase 2).
         assert_eq!(
-            budget.ops_remaining, 9,
-            "drained candidate consumes budget even when all peers know it"
+            budget.ops_remaining, 10,
+            "budget must be unchanged (seen-by-all is budget-neutral via refund)"
         );
     }
 
@@ -1888,13 +1908,9 @@ mod tests {
 
         let _per_peer = collect_adverts_for_peers(&queue, &mut budget, &peer_ids, &adverts);
 
-        // maxtps iter 8: both drained candidates consume budget (the per-peer
-        // seen-check moved outside the store lock, so the drain can no longer
-        // distinguish known-to-all txs). Carryover absorbs the difference.
-        assert_eq!(
-            budget.ops_remaining, 8,
-            "both drained candidates consume budget"
-        );
+        // Sustain fix: tx_known is refunded (seen by the only peer), tx_new
+        // consumed — net matches the original single-pass semantics.
+        assert_eq!(budget.ops_remaining, 9, "only tx_new should consume budget");
     }
 
     #[test]
@@ -1922,16 +1938,15 @@ mod tests {
         let per_peer = collect_adverts_for_peers(&queue, &mut budget, &peer_ids, &adverts);
 
         assert!(per_peer.is_empty(), "known DEX tx should not be advertised");
-        // maxtps iter 8: the drain consumes budget for the known DEX tx too
-        // (seen-checks moved outside the store lock).
+        // Sustain fix: the known DEX tx is refunded on both budgets.
         assert_eq!(
-            budget.ops_remaining, 9,
-            "drained DEX tx consumes generic budget"
+            budget.ops_remaining, 10,
+            "generic budget untouched (refund)"
         );
         assert_eq!(
             budget.dex_ops_remaining,
-            Some(4),
-            "drained DEX tx consumes DEX budget"
+            Some(5),
+            "DEX budget untouched (refund)"
         );
     }
 
