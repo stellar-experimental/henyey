@@ -480,7 +480,7 @@ impl OverlayManager {
                 }
             }
 
-            if Self::has_outbound_connection_to(&shared.peer_info_cache, addr) {
+            if Self::has_connection_to(&shared.peer_info_cache, addr) {
                 continue;
             }
 
@@ -552,7 +552,7 @@ impl OverlayManager {
                 }
             }
 
-            if Self::has_outbound_connection_to(&shared.peer_info_cache, addr) {
+            if Self::has_connection_to(&shared.peer_info_cache, addr) {
                 continue;
             }
 
@@ -696,7 +696,7 @@ impl OverlayManager {
 
             // Re-check under the loop: an earlier promotion in this tick may
             // have created the outbound connection we're about to dial.
-            if Self::has_outbound_connection_to(&shared.peer_info_cache, addr) {
+            if Self::has_connection_to(&shared.peer_info_cache, addr) {
                 continue;
             }
 
@@ -965,8 +965,19 @@ mod tests {
 
     // ---- §10.4 promote-inbound tests ----
 
+    /// DIVERGENCE from stellar-core (deliberate, sustained-load fix): core's
+    /// promotion pass re-dials live inbound peers to convert them to
+    /// outbound, protected by the peer-DB dial backoff (minutes) and by
+    /// never replacing an authenticated connection. henyey's promotion
+    /// re-dialed every few seconds and its mutual-dial tie-break could
+    /// REPLACE the healthy connection, producing constant handshake churn
+    /// (2294 reject/drop events per node per mission vs core's 6) and a
+    /// sustained-TPS collapse (~1087 vs core's 1522). Until promotion is
+    /// reintroduced with core-style backoff + reject-newcomer semantics, the
+    /// pre-dial filter (`has_connection_to`, any direction) suppresses
+    /// dialing peers we are already connected to.
     #[tokio::test]
-    async fn test_promote_inbound_dials_inbound_peer_address() {
+    async fn test_promote_inbound_does_not_redial_live_inbound_peer() {
         let factory = Arc::new(RecordingConnectionFactory::default());
         let manager = OverlayManager::new_with_connection_factory(
             OverlayConfig::default(),
@@ -987,11 +998,9 @@ mod tests {
         OverlayManager::promote_inbound_peers(1, &manager.outbound_pool, &shared, &ctx).await;
 
         let dialed = factory.dialed();
-        assert_eq!(dialed.len(), 1, "should dial exactly the one inbound peer");
-        assert_eq!(
-            dialed[0],
-            "10.0.0.5:11625".parse::<SocketAddr>().unwrap(),
-            "should dial the inbound peer's advertised listening address"
+        assert!(
+            dialed.is_empty(),
+            "must NOT re-dial a live inbound peer (was the churn engine); got {dialed:?}"
         );
     }
 
