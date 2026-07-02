@@ -1604,6 +1604,14 @@ impl Herder {
         self.scp_driver.prepare_start(slot)
     }
 
+    /// EWMA estimate of the per-slot nomination overhead (trigger/first
+    /// activity → ballot start). Used by the app layer to arm the consensus
+    /// trigger early so ballot starts track the declared close-time target
+    /// (see `ScpDriver::nom_overhead_ewma_ms` for the divergence rationale).
+    pub fn nomination_overhead_estimate(&self) -> Option<std::time::Duration> {
+        self.scp_driver.nomination_overhead_estimate()
+    }
+
     /// Get the LCL close time from the current ledger header.
     pub fn lcl_close_time(&self) -> u64 {
         self.ledger_manager.current_header().scp_value.close_time.0
@@ -2955,6 +2963,11 @@ impl Herder {
 
         // Record when we first started processing this slot (for timing metrics).
         self.scp_driver.record_slot_activity(slot);
+
+        // [maxtps_cad] per-slot cadence decomposition stamp: trigger accepted →
+        // tx-set build begins. Joined offline (by slot) with the nominate /
+        // ballot / externalize / close stamps. Parity-irrelevant logging.
+        tracing::info!(target: "maxtps_cad", slot, "trig");
 
         let t0 = std::time::Instant::now();
 
