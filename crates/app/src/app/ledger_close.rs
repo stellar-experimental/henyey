@@ -2522,6 +2522,19 @@ impl App {
             );
             if !is_success {
                 failed_hashes.push(Hash256::hash_xdr(tx));
+                // [maxtps_ban] failed-at-apply txs get banned post-close; under
+                // the sustained-load investigation these bans exploded (~20k/min)
+                // and poisoned live accounts. Log the result-code discriminant
+                // (sampled: first 3 per close) to attribute the failure mode.
+                if failed_hashes.len() <= 3 {
+                    tracing::info!(
+                        target: "maxtps_ban",
+                        ledger_seq = pending.ledger_seq,
+                        result = format!("{:?}", tx_result.result.result).chars().take(60).collect::<String>(),
+                        seq_num,
+                        "failed_apply"
+                    );
+                }
             }
         }
         timer.mark("build_persist_inputs_ms");
@@ -2779,9 +2792,13 @@ impl App {
                 close_time,
             );
             if !failed_hashes_for_ban.is_empty() {
-                tracing::debug!(
+                // [maxtps_ban] info-level so the sustain investigation can see
+                // per-close ban volume by site (site 1 = failed at apply).
+                tracing::info!(
+                    target: "maxtps_ban",
+                    ledger_seq,
                     failed_count = failed_hashes_for_ban.len(),
-                    "Banning failed transactions"
+                    "ban_site1_failed_apply"
                 );
                 herder.tx_queue().ban(&failed_hashes_for_ban);
             }
@@ -2898,6 +2915,13 @@ impl App {
                     let invalid_hashes: Vec<Hash256> =
                         invalid.iter().map(|htx| htx.hash()).collect();
                     invalid_banned = invalid_hashes.len();
+                    // [maxtps_ban] site 2 = queued txs stateful-invalid after close.
+                    tracing::info!(
+                        target: "maxtps_ban",
+                        ledger_seq,
+                        invalid_banned,
+                        "ban_site2_revalidation"
+                    );
                     herder.tx_queue().ban(&invalid_hashes);
                 }
                 crate::metrics::CLOSE_TX_QUEUE_INVALIDATION_SECONDS

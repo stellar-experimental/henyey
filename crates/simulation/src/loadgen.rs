@@ -2256,6 +2256,16 @@ impl LoadGenerator {
             // (#3638).
             if config.mode == LoadGenMode::PayPregenerated {
                 if pay_pregenerated_reject_fails(&result) {
+                    // [maxtps_ban] THE run-fatal reject (parity #3638: any
+                    // non-Added result aborts a PayPregenerated run). Under the
+                    // sustained-load investigation runs died mid-submission
+                    // with no visible cause — log the queue verdict that killed
+                    // the run.
+                    tracing::warn!(
+                        target: "maxtps_ban",
+                        result = ?result,
+                        "pay_pregenerated fatal reject — failing the run"
+                    );
                     app_metrics::LOADGEN_TXN_REJECTED.increment(1.0);
                     self.failed = true;
                     return SubmitOutcome::NotAccepted;
