@@ -1779,6 +1779,24 @@ impl LoadGenerator {
                 self.contract_instances.insert(account_id, instance);
             }
         }
+
+        // Re-anchor the pacing clock AFTER setup (sustained-load root fix).
+        // Opening the pregenerated tx file (~55 MB at 5-minute probe sizes)
+        // and preloading thousands of account sequences above can take many
+        // seconds. `start_time` was stamped at the TOP of this function, so
+        // `get_tx_per_step` saw a huge initial deficit and fired an onset
+        // burst of setup_delay × tx_rate transactions. The pregenerated file
+        // is strict round-robin over n_accounts (same-account gap =
+        // n_accounts txs ≈ 18-20 s at max-TPS rates); a burst larger than
+        // that gap submits an account's next tx while its previous one is
+        // still pending (age 0) → TryAgainLater → a PayPregenerated run
+        // insta-fails (#3638). This single artifact produced henyey's entire
+        // measured burst-vs-sustained gap (5-min probes died at ≥ ~1280 tx/s
+        // network-wide = the rate where the burst first spans the account
+        // gap, while stellar-core — whose setup happens before its clock
+        // matters — sustained 1522). The rate contract applies to the
+        // SUBMISSION period, not to setup.
+        self.start_time = Some(Instant::now());
     }
 
     /// Run load generation: submit transactions at the configured rate.
