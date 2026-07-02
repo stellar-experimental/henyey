@@ -1546,15 +1546,21 @@ impl App {
                 phase_dispatch_start.elapsed(),
                 self.event_loop_phase.load(Ordering::Relaxed),
             );
-            // [maxtps_loop] accumulate per-phase busy time for the stats-tick
-            // dump (which arm occupies the event loop under load).
+            // [maxtps_loop] accumulate per-phase BODY time for the stats-tick
+            // dump (which arm occupies the event loop under load). Measured
+            // from the arm's `set_phase` stamp — NOT from the loop top — so
+            // the select-wait is excluded (the first version attributed idle
+            // waits to whichever arm fired next, misattributing up to 60% of
+            // a window). Capped at the whole-iteration elapsed in case the
+            // fired arm never stamped a phase (stale stamp guard).
             {
                 let ph = self.event_loop_phase.load(Ordering::Relaxed) as usize;
                 if ph < self.phase_time_us.len() {
-                    self.phase_time_us[ph].fetch_add(
-                        phase_dispatch_start.elapsed().as_micros() as u64,
-                        Ordering::Relaxed,
-                    );
+                    let now_ns = self.start_instant.elapsed().as_nanos() as u64;
+                    let entered = self.phase_entered_ns.load(Ordering::Relaxed);
+                    let body_us = now_ns.saturating_sub(entered) / 1_000;
+                    let iter_us = phase_dispatch_start.elapsed().as_micros() as u64;
+                    self.phase_time_us[ph].fetch_add(body_us.min(iter_us), Ordering::Relaxed);
                     self.phase_count[ph].fetch_add(1, Ordering::Relaxed);
                 }
             }

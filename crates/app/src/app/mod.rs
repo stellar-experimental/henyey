@@ -1050,6 +1050,12 @@ pub struct App {
     /// drained and logged by the stats tick. Diagnostic only.
     phase_time_us: Arc<[AtomicU64; 40]>,
     phase_count: Arc<[AtomicU64; 40]>,
+    /// [maxtps_loop] nanoseconds since `start_instant` when the current
+    /// event-loop arm stamped its phase (written by `set_phase`). Lets the
+    /// loop-bottom accounting measure the arm BODY only, excluding the
+    /// select-wait (the first accounting version attributed idle waits to
+    /// whichever arm fired next, which misattributed up to 60% of a window).
+    phase_entered_ns: Arc<AtomicU64>,
 
     /// Fine-grained sub-phase code for pinpointing a stall inside a
     /// coarse phase. See [`phase`](super::phase) for the `PHASE_6_*`
@@ -1627,6 +1633,7 @@ impl App {
             event_loop_phase: Arc::new(AtomicU64::new(0)),
             phase_time_us: Arc::new(std::array::from_fn(|_| AtomicU64::new(0))),
             phase_count: Arc::new(std::array::from_fn(|_| AtomicU64::new(0))),
+            phase_entered_ns: Arc::new(AtomicU64::new(0)),
             event_loop_phase_sub: Arc::new(AtomicU32::new(0)),
         })
     }
@@ -3535,6 +3542,11 @@ impl App {
     fn set_phase(&self, phase: u64) {
         self.event_loop_phase.store(phase, Ordering::Relaxed);
         self.event_loop_phase_sub.store(0, Ordering::Relaxed);
+        // [maxtps_loop] stamp arm-body start for body-only accounting.
+        self.phase_entered_ns.store(
+            self.start_instant.elapsed().as_nanos() as u64,
+            Ordering::Relaxed,
+        );
     }
 
     /// Stamp the fine-grained sub-phase. Read alongside
