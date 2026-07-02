@@ -220,7 +220,19 @@ impl App {
     }
 
     pub(super) async fn send_peer_pings(&self) {
-        const PING_TIMEOUT: Duration = Duration::from_secs(60);
+        // Outstanding-ping expiry. MUST be well under the 30 s peer idle-drop
+        // timeout (peer_loop PEER_TIMEOUT, core parity): with the 5 s ping
+        // interval, a ping whose reply is lost (e.g. the fulfiller's DontHave
+        // dropped on a full outbound channel during a burst) previously
+        // silenced the pair for 60 s — no further pings are sent while one is
+        // outstanding — so BOTH sides aged past the 30 s idle timeout and
+        // dropped the connection. At network boot this produced a mass drop
+        // wave ~30 s before load start, and the reconnect storm overlapped
+        // the first loaded ledgers (maxtps iter 10; observed as
+        // "All peers exhausted for tx set", NodeLostSyncException, and
+        // multi-second nomination stalls near the max-TPS ceiling).
+        // 10 s keeps at most ~15 s between writes on a healthy link.
+        const PING_TIMEOUT: Duration = Duration::from_secs(10);
 
         // Phase 1: Collect snapshots (no long-lived lock needed).
         let snapshots = {
