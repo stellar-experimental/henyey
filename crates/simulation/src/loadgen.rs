@@ -2232,7 +2232,18 @@ impl LoadGenerator {
             let envelope = match tx_result {
                 Ok((_source_id, env)) => env,
                 Err(e) => {
-                    warn!("Failed to build tx (mode={:?}): {}", config.mode, e);
+                    // [maxtps_ban] the OTHER run-fatal path besides the submit
+                    // reject: tx generation failed (pregenerated-file reader
+                    // error, account lookup, etc.). Under the sustain
+                    // investigation, post-fix mid-submission deaths were
+                    // silent at the submit-reject site — tag this one too.
+                    tracing::warn!(
+                        target: "maxtps_ban",
+                        error = %e,
+                        mode = ?config.mode,
+                        source_account_id,
+                        "generate_tx fatal error — failing the run"
+                    );
                     self.failed = true;
                     return SubmitOutcome::NotAccepted;
                 }
