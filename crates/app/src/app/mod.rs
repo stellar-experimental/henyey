@@ -2240,6 +2240,16 @@ impl App {
     /// Returns `Err(NotInitialized)` if the ledger manager has not been
     /// initialized yet (or was reset for catchup).
     /// Used by the simulation LoadGenerator to refresh cached sequence numbers.
+    /// [maxtps_ban] Forensic passthrough: the tx queue's pending (hash, seq,
+    /// age) for an account, if any. See
+    /// `TransactionQueue::account_pending_info`.
+    pub fn debug_account_pending(
+        &self,
+        account_id: &stellar_xdr::AccountId,
+    ) -> Option<(henyey_common::Hash256, i64, u32)> {
+        self.herder.tx_queue().account_pending_info(account_id)
+    }
+
     pub fn load_account_sequence(
         &self,
         account_id: &stellar_xdr::AccountId,

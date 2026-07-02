@@ -101,12 +101,19 @@ pub enum TxQueueResult {
 }
 
 /// Result of the shift() operation after ledger close.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ShiftResult {
     /// Number of transactions that were unbanned (reached end of ban period).
     pub unbanned_count: usize,
     /// Number of transactions that were auto-banned due to age (pending too long).
     pub evicted_due_to_age: usize,
+    /// Pending transactions that reached age 2 this shift (sustained-load
+    /// wedge fix): the caller pushes their full bodies to all peers, so a tx
+    /// whose advert/demand/response was lost anywhere recovers within one
+    /// ledger instead of wedging until its account's next submission collides
+    /// (fatal for PayPregenerated load runs, #3638). Rare by construction —
+    /// only txs that missed 2 consecutive ledgers.
+    pub reflooded_txs: Vec<TransactionEnvelope>,
 }
 
 const MAX_TX_SET_ALLOWANCE_BYTES: u32 = 10 * 1024 * 1024;
@@ -3055,6 +3062,7 @@ impl TransactionQueue {
         // Collect fee releases to apply after iteration (to avoid borrow conflicts)
         let mut fee_releases: Vec<(Vec<u8>, u64, bool)> = Vec::new(); // (key, fee, is_soroban)
         let mut evicted_hashes: Vec<Hash256> = Vec::new();
+        let mut reflooded_txs: Vec<TransactionEnvelope> = Vec::new();
 
         // Process account states: increment age, auto-ban stale transactions
         for (account_key, state) in account_states.iter_mut() {
@@ -3076,6 +3084,13 @@ impl TransactionQueue {
                 // Exactly-once per age level (fires on the 2→ transition).
                 if state.age == 2 {
                     store.flood_queue.mark_for_flood(queued_tx, ledger_version);
+                    // Also hand the full envelope to the caller for a DIRECT
+                    // push to every peer: re-advertising alone cannot recover
+                    // a tx whose original advert was recorded as sent but
+                    // whose demand/response was lost — the per-peer advert
+                    // history suppresses the re-advert. A pushed body
+                    // recovers any dissemination hole within one ledger.
+                    reflooded_txs.push((*queued_tx.envelope).clone());
                     metrics::counter!("stellar_herder_tx_reflooded_total").increment(1);
                 }
 
@@ -3154,6 +3169,7 @@ impl TransactionQueue {
         ShiftResult {
             unbanned_count,
             evicted_due_to_age,
+            reflooded_txs,
         }
     }
 
@@ -3208,6 +3224,18 @@ impl TransactionQueue {
     }
 
     /// Get the total number of currently banned transactions.
+    /// [maxtps_ban] Forensic lookup: the pending transaction (hash, seq, age)
+    /// for `account_id`'s seq-source state, if any. Used by the loadgen's
+    /// fatal-reject diagnostic to distinguish a genuinely wedged pending tx
+    /// (old age) from a bookkeeping leak (on-ledger seq already caught up).
+    pub fn account_pending_info(&self, account_id: &AccountId) -> Option<(Hash256, i64, u32)> {
+        let key = account_key_from_account_id(account_id);
+        let states = self.account_states.read();
+        let state = states.get(&key)?;
+        let tx = state.transaction.as_ref()?;
+        Some((tx.hash, envelope_sequence_number(&tx.envelope), state.age))
+    }
+
     pub fn banned_count(&self) -> usize {
         let banned = self.banned_transactions.read();
         banned.iter().map(|s| s.len()).sum()
