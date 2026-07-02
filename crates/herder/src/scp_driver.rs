@@ -809,6 +809,35 @@ impl ScpDriver {
         if let Some(cached) = self.tx_tracker.check_valid(&cache_key) {
             return cached;
         }
+        // [maxtps_nom] Cache miss: the first full content validation of a
+        // candidate tx set happens on the nomination critical path — time it.
+        let validate_start = std::time::Instant::now();
+        let result = self.check_and_cache_tx_set_valid_uncached(
+            tx_set,
+            lcl_hash,
+            close_time_offset,
+            cache_key,
+        );
+        let validate_ms = validate_start.elapsed().as_millis() as u64;
+        if validate_ms >= 10 {
+            tracing::info!(
+                target: "maxtps_nom",
+                validate_ms,
+                tx_count = tx_set.len(),
+                "tx-set full validation (cache miss)"
+            );
+        }
+        result
+    }
+
+    fn check_and_cache_tx_set_valid_uncached(
+        &self,
+        tx_set: &crate::tx_queue::TransactionSet,
+        lcl_hash: Hash256,
+        close_time_offset: u64,
+        cache_key: (Hash256, Hash256, u64),
+    ) -> bool {
+        let _ = lcl_hash;
 
         let network_id = NetworkId(self.network_id);
 
@@ -3956,6 +3985,18 @@ impl SCPDriver for HerderScpCallback {
     }
 
     fn emit_envelope(&self, envelope: &ScpEnvelope) {
+        // [maxtps_nom] Own NOMINATE emissions: timing of these relative to the
+        // consensus trigger localizes nomination-round stalls (vote emission
+        // vs. vote propagation vs. tx-set validation).
+        if let stellar_xdr::ScpStatementPledges::Nominate(nom) = &envelope.statement.pledges {
+            tracing::info!(
+                target: "maxtps_nom",
+                slot = envelope.statement.slot_index,
+                votes = nom.votes.len(),
+                accepted = nom.accepted.len(),
+                "emit nominate"
+            );
+        }
         self.driver.emit(envelope.clone());
     }
 

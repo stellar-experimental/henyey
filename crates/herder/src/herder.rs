@@ -4478,8 +4478,22 @@ impl Herder {
         // We `await` the JoinHandle before returning: callers rely on
         // externalization state populated inside the drain (e.g.
         // `try_close_slot_directly(slot)`).
-        self.drain_ready_envelopes_blocking("envelope drain after receive_tx_set")
+        let drain_start = std::time::Instant::now();
+        let drained = self
+            .drain_ready_envelopes_blocking("envelope drain after receive_tx_set")
             .await;
+        let drain_ms = drain_start.elapsed().as_millis() as u64;
+        if drained > 0 || drain_ms >= 10 {
+            // [maxtps_nom] Envelopes released by this tx-set arrival and how
+            // long the drain took — the leader's NOMINATE typically waits here.
+            tracing::info!(
+                target: "maxtps_nom",
+                drained,
+                drain_ms,
+                hash = %hash,
+                "envelope drain after tx-set receive"
+            );
+        }
         timer.mark("process_ready_spawn_blocking_ms");
 
         timer.finish("herder.receive_tx_set");
