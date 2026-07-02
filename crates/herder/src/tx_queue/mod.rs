@@ -3062,6 +3062,23 @@ impl TransactionQueue {
             if let Some(ref queued_tx) = state.transaction {
                 state.age += 1;
 
+                // Sustain fix: re-mark a pending tx for flooding when it has
+                // aged 2 ledgers without applying. A tx is erased from the
+                // flood queue the first time it is advertised; if that advert
+                // was lost (peer outbound overflow, connection churn) the tx
+                // is stranded on this node — it only applies when THIS node's
+                // nomination candidate wins (~1/23 ledgers on the 23-node
+                // maxtps topology, ≈2 minutes), by which time its account's
+                // next submission collides with the pending tx
+                // (TryAgainLater) and a PayPregenerated load-run insta-fails.
+                // Re-marking is cheap and precise: the per-peer advert history
+                // ensures only peers that never received the advert get it.
+                // Exactly-once per age level (fires on the 2→ transition).
+                if state.age == 2 {
+                    store.flood_queue.mark_for_flood(queued_tx, ledger_version);
+                    metrics::counter!("stellar_herder_tx_reflooded_total").increment(1);
+                }
+
                 // Auto-ban at pending_depth
                 if state.age >= self.pending_depth {
                     // Add to banned set
@@ -10801,6 +10818,46 @@ mod broadcast_visitor_tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].hash, Hash256::hash_xdr(&tx1));
         assert_eq!(budget.ops_remaining, 0);
+    }
+
+    /// Sustain fix: a pending tx that ages 2 ledgers without applying is
+    /// re-marked for flooding by `shift()` — exactly once, on the 2→
+    /// transition — so a tx whose first advert was lost is not stranded on
+    /// the submitting node until the 4-ledger auto-ban.
+    #[test]
+    fn test_shift_refloods_pending_tx_at_age_two() {
+        let config = TxQueueConfig {
+            max_size: 10,
+            ..Default::default()
+        };
+        let queue = TransactionQueue::new(config);
+
+        let mut tx = make_test_envelope(100, 1);
+        set_source(&mut tx, 1);
+        let hash = Hash256::hash_xdr(&tx);
+        assert_eq!(queue.try_add(tx), TxQueueResult::Added);
+
+        // First broadcast drains the flood queue (advert sent, entry erased).
+        let (entries, _) = visit_all_processed(&queue, 100, None);
+        assert_eq!(entries.len(), 1, "initial flood visit sees the tx");
+        let (entries, _) = visit_all_processed(&queue, 100, None);
+        assert!(entries.is_empty(), "flood queue drained after first visit");
+
+        // Age 1: not re-flooded yet.
+        queue.shift();
+        let (entries, _) = visit_all_processed(&queue, 100, None);
+        assert!(entries.is_empty(), "age 1 must not re-flood");
+
+        // Age 2: re-marked for flooding.
+        queue.shift();
+        let (entries, _) = visit_all_processed(&queue, 100, None);
+        assert_eq!(entries.len(), 1, "age 2 must re-flood the pending tx");
+        assert_eq!(entries[0].hash, hash);
+
+        // Age 3: fires only once (2→ transition), no repeat.
+        queue.shift();
+        let (entries, _) = visit_all_processed(&queue, 100, None);
+        assert!(entries.is_empty(), "re-flood fires exactly once at age 2");
     }
 
     #[test]
