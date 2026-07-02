@@ -2246,6 +2246,9 @@ impl LoadGenerator {
             // re-enters execute() on each retry (#3569).
             mark_tx_meters(config.mode, &envelope);
 
+            // [maxtps_ban] capture identifying details before the envelope is
+            // consumed, for the fatal-reject diagnostic below.
+            let diag_seq = envelope_seq_num(&envelope);
             let result = self.tx_generator.app.submit_transaction(envelope).await;
 
             // PayPregenerated does not re-submit on failure: each tx is read
@@ -2264,6 +2267,8 @@ impl LoadGenerator {
                     tracing::warn!(
                         target: "maxtps_ban",
                         result = ?result,
+                        source_account_id,
+                        tx_seq = diag_seq,
                         "pay_pregenerated fatal reject — failing the run"
                     );
                     app_metrics::LOADGEN_TXN_REJECTED.increment(1.0);
