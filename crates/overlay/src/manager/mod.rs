@@ -261,7 +261,7 @@ impl PreferredPeerSet {
     ///
     /// After DNS resolution, resolved entries have canonical IP addresses,
     /// eliminating hostname/IP aliasing in `retry_after` and
-    /// `has_outbound_connection_to`. Peers that failed DNS resolution are
+    /// `has_connection_to`. Peers that failed DNS resolution are
     /// omitted from dialing (they will be retried on the next DNS cycle).
     pub(super) fn shuffled_dial_entries(&self, rng: &mut impl Rng) -> Vec<PeerAddress> {
         if self.resolved.is_empty() {
@@ -1826,16 +1826,27 @@ impl OverlayManager {
         info.address == addr
     }
 
-    pub(super) fn has_outbound_connection_to(
+    /// True if ANY live connection (inbound or outbound) matches `addr`.
+    ///
+    /// Used as the pre-dial filter by the connection tick. This MUST consider
+    /// both directions (parity: stellar-core `getConnectedPeer(address)`
+    /// searches the inbound AND outbound authenticated maps before
+    /// `connectTo`): after a mutual-dial tie-break, the lower-node-id side of
+    /// a pair keeps an INBOUND connection — with an outbound-only filter it
+    /// re-dialed that peer forever, and every re-dial raced the handshake
+    /// path, occasionally REPLACING the healthy connection via the tie-break
+    /// and leaving the replaced socket to idle out (30 s) and reset the
+    /// remote. Measured on MissionMaxTPSClassic: 2294 reject/drop/reset
+    /// events per node per mission vs stellar-core's 6, and a sustained
+    /// (5-min-window) ceiling of ~1087 tx/s vs core's 1522 on identical
+    /// hardware. Inbound connections are full-duplex peers; there is nothing
+    /// to gain by dialing them again.
+    pub(super) fn has_connection_to(
         peer_info_cache: &DashMap<PeerId, PeerInfo>,
         addr: &PeerAddress,
     ) -> bool {
         peer_info_cache.iter().any(|entry| {
             let info = entry.value();
-            // Only consider outbound connections (we called them)
-            if !info.direction.we_called_remote() {
-                return false;
-            }
             Self::peer_info_matches_address(info, addr)
         })
     }
